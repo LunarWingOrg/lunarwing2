@@ -176,6 +176,80 @@ assert_not_contains "disabled OpenRC main drops backend ordering" "$OPENRC_MAIN"
 assert_not_contains "disabled OpenRC main drops backend need" "$OPENRC_MAIN_CONF" "lunarwing-weechat-${TENANT}"
 assert_not_contains "disabled OpenRC main drops relay barrier" "$OPENRC_MAIN" "$RELAY_ENV_EXEC"
 
+echo "=== OpenRC renderer interpreter resolution (WI#415) ==="
+# The relay prefix and the weechat/darkirc adapter command defaults bake the
+# one canonical interpreter spelling from the shared PATH-independent
+# resolver, never the calling process's PATH.
+write_weechat_flag true
+render_tenant_openrc_units "$TENANT" >/dev/null
+canonical_py="$(PATH=/usr/local/bin:/usr/bin:/bin type -P python3)"
+if [[ -z "$canonical_py" ]]; then
+  fail "no canonical python3 resolves under /usr/local/bin:/usr/bin:/bin"
+else
+assert_contains "OpenRC adapter bakes the canonical python3" \
+  "$OPENRC_ADAPTER" ": \"\${adapter_command:=$canonical_py}\""
+assert_contains "OpenRC main relay prefix bakes the canonical python3" \
+  "$OPENRC_MAIN" "-- $canonical_py $RELAY_ENV_EXEC --env-file "
+
+# A caller PATH that shadows python3 (venv, pyenv, /usr/local/bin) must not
+# move the spelling in any rendered unit.
+mkdir -p "$FIXTURE/pyshadow"
+ln -s "$canonical_py" "$FIXTURE/pyshadow/python3"
+cp "$OPENRC_MAIN" "$FIXTURE/main-before-shadow"
+cp "$OPENRC_ADAPTER" "$FIXTURE/adapter-before-shadow"
+( _OPENRC_PROXY_PYTHON3_RESOLVED=""
+  _OPENRC_PROXY_PYTHON3_RESOLVED_FROM=$'\001'
+  PATH="$FIXTURE/pyshadow:$PATH"
+  render_tenant_openrc_units "$TENANT" >/dev/null ) \
+  || fail "shadow-PATH tenant render failed"
+if cmp -s "$FIXTURE/main-before-shadow" "$OPENRC_MAIN" \
+  && cmp -s "$FIXTURE/adapter-before-shadow" "$OPENRC_ADAPTER"; then
+  pass "shadow-PATH tenant render is byte-identical"
+else
+  fail "shadow-PATH tenant render is byte-identical"
+fi
+
+# The darkirc adapter default takes the same canonical spelling.
+tenant_darkirc_enabled() { return 0; }
+render_tenant_openrc_units "$TENANT" >/dev/null
+DARKIRC_ADAPTER="$OPENRC_INITD_DIR/lunarwing-darkirc-adapter-${TENANT}"
+assert_file "darkirc adapter rendered" "$DARKIRC_ADAPTER"
+assert_contains "OpenRC darkirc adapter bakes the canonical python3" \
+  "$DARKIRC_ADAPTER" ": \"\${darkirc_adapter_command:=$canonical_py}\""
+cp "$DARKIRC_ADAPTER" "$FIXTURE/darkirc-adapter-before-shadow"
+( _OPENRC_PROXY_PYTHON3_RESOLVED=""
+  _OPENRC_PROXY_PYTHON3_RESOLVED_FROM=$'\001'
+  PATH="$FIXTURE/pyshadow:$PATH"
+  render_tenant_openrc_units "$TENANT" >/dev/null ) \
+  || fail "shadow-PATH darkirc render failed"
+if cmp -s "$FIXTURE/darkirc-adapter-before-shadow" "$DARKIRC_ADAPTER"; then
+  pass "shadow-PATH darkirc adapter render is byte-identical"
+else
+  fail "shadow-PATH darkirc adapter render is byte-identical"
+fi
+tenant_darkirc_enabled() { return 1; }
+
+# An unresolvable interpreter fails the tenant render closed when a rendered
+# unit needs python3, and is never consulted when none does.
+if ( _OPENRC_PROXY_PYTHON3_RESOLVED=""
+     _OPENRC_PROXY_PYTHON3_RESOLVED_FROM=$'\001'
+     LUNARWING_MT_PROXY_PYTHON3='relative/python3'
+     render_tenant_openrc_units "$TENANT" >/dev/null 2>&1 ); then
+  fail "unresolvable interpreter fails the tenant render closed"
+else
+  pass "unresolvable interpreter fails the tenant render closed"
+fi
+write_weechat_flag false
+if ( _OPENRC_PROXY_PYTHON3_RESOLVED=""
+     _OPENRC_PROXY_PYTHON3_RESOLVED_FROM=$'\001'
+     LUNARWING_MT_PROXY_PYTHON3='relative/python3'
+     render_tenant_openrc_units "$TENANT" >/dev/null 2>&1 ); then
+  pass "python3-free tenants render without a resolvable interpreter"
+else
+  fail "python3-free tenants render without a resolvable interpreter"
+fi
+fi
+
 echo "=== strict systemd lifecycle ==="
 write_weechat_flag true
 # Function comes from sourced mt-admin later in ShellCheck's composed parse.
