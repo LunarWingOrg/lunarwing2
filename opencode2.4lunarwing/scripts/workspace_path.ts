@@ -1,4 +1,4 @@
-import { closeSync, constants, existsSync, mkdirSync, openSync, realpathSync } from "node:fs"
+import { closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, realpathSync, statSync } from "node:fs"
 import { isAbsolute, relative, resolve } from "node:path"
 
 export function expandWorkspacePath(path: string, workspaceRoot: string): string {
@@ -8,20 +8,28 @@ export function expandWorkspacePath(path: string, workspaceRoot: string): string
   return `${workspaceRoot}/${path}`
 }
 
+// A relative() result escapes its base only when it is exactly ".." or
+// starts with "../" — an in-root component may itself start with ".." (e.g.
+// a directory named "..foo") and must not be misclassified as an escape
+// (WI#375 DS-5).
+function escapesRoot(fromBase: string): boolean {
+  return fromBase === ".." || fromBase.startsWith("../") || isAbsolute(fromBase)
+}
+
 export function resolveWorkspacePath(path: string, workspaceRoot: string): string {
   const canonicalRoot = realpathSync(resolve(workspaceRoot))
   const expanded = expandWorkspacePath(path, canonicalRoot)
   const candidate = realpathSync(resolve(isAbsolute(expanded) ? expanded : resolve(canonicalRoot, expanded)))
   const fromRoot = relative(canonicalRoot, candidate)
-  if (fromRoot === "" || (!fromRoot.startsWith("..") && !isAbsolute(fromRoot))) return candidate
+  if (fromRoot === "" || !escapesRoot(fromRoot)) return candidate
   throw new Error(`Workspace path escapes WORKSPACE_ROOT: ${path}`)
 }
 
 export function workspacePathsOverlap(left: string, right: string): boolean {
   const fromLeft = relative(left, right)
-  if (fromLeft === "" || (!fromLeft.startsWith("..") && !isAbsolute(fromLeft))) return true
+  if (fromLeft === "" || !escapesRoot(fromLeft)) return true
   const fromRight = relative(right, left)
-  return fromRight === "" || (!fromRight.startsWith("..") && !isAbsolute(fromRight))
+  return fromRight === "" || !escapesRoot(fromRight)
 }
 
 // Name the failing component (the raw error only names the /proc/self/fd
@@ -78,7 +86,17 @@ export function resolveTaskWorkspace(
       closeSync(fd)
       fd = next
     }
-    return resolveWorkspacePath(path, root)
+    const resolved = resolveWorkspacePath(path, root)
+    // DS-1: the descriptor walk and the re-resolved path must name the same
+    // directory — a dev/ino mismatch means an in-root redirect raced the
+    // walk. Thrown without an errno so the caller reports it under the
+    // transient wording and the supervisor re-walks on the retry.
+    const walked = fstatSync(fd)
+    const landed = statSync(resolved)
+    if (walked.dev !== landed.dev || walked.ino !== landed.ino) {
+      throw new Error(`resolved path changed during bootstrap: ${path}`)
+    }
+    return resolved
   } catch (error) {
     const message = String(error)
     const code = (error as NodeJS.ErrnoException).code

@@ -843,6 +843,19 @@ WORKER_TS_LANE_SCRIPTS = {
             "./node_modules/.bin/tsc --noEmit -p scripts/tsconfig.json",
         ),
     ),
+    # WI#375 DR-3: the opencode2 bridge's dependency-free TS suites (the
+    # executor suite needs the image's built @opencode/client and stays
+    # image-gated). Same shape as worker-opencode-ts: digest-tied bun image,
+    # lint runner tags, no extends.
+    "worker-opencode2-ts": (
+        "$CI_BUN_IMAGE",
+        (
+            "cd opencode2.4lunarwing",
+            "bun scripts/path_expand_test.ts",
+            "bun scripts/task_prompt_test.ts",
+            "bun scripts/opencode_result_test.ts",
+        ),
+    ),
 }
 
 # MR !1647 review HP-1: environment variables (including parallel matrices)
@@ -938,7 +951,7 @@ def validate_lane_environment_routes(merged: dict, errors: list[str]) -> None:
         if bypass:
             errors.append(
                 f"top-level variables must not set {bypass}; global variables "
-                "reach both worker TS lanes (GLOBAL_VARIABLE_ALLOWLIST)"
+                "reach the pinned worker lanes (GLOBAL_VARIABLE_ALLOWLIST)"
             )
     for name, expected in EXPECTED_RUNNER_TAGS.items():
         value = top_variables.get(name) if isinstance(top_variables, dict) else None
@@ -958,7 +971,7 @@ def validate_lane_environment_routes(merged: dict, errors: list[str]) -> None:
     ):
         errors.append(
             "workflow:rules must not set variables; they become pipeline-wide "
-            "variables that reach both worker TS lanes"
+            "variables that reach the pinned worker lanes"
         )
 
 
@@ -1035,6 +1048,108 @@ def validate_worker_ts_lanes(merged: dict, errors: list[str]) -> None:
                 f"{job_name} script must be exactly the pinned commands "
                 f"{list(expected_script)!r} (got {script!r})"
             )
+
+
+# WI#375 DR-3: the pebble worker's Rust suite runs in the worker-pebble-rust
+# MR lane, no longer gated only at the protected image build. The lane
+# extends .rust-job for the toolchain bootstrap and pull-only cache instead
+# of carrying a digest-tied image variable, so it gets its own pin in the
+# shape of validate_worker_ts_lanes: the extends-resolved job must still run
+# on merge_request_event (the HE-1 exact-predicate first-rule gate), resolve
+# to the $CI_RUST_IMAGE image and rust runner tag, and run exactly the
+# pinned script; the job's own keys are limited to the wiring keys so a
+# job-level before_script/after_script (replacing the audited bootstrap),
+# image/tags override, variables, hooks, or a parallel matrix is refused.
+# The same holds at the template level (MR !1669 review IK-8): the resolved
+# job may carry only the audited .rust-job keys, and its inherited
+# before_script must equal the pinned bootstrap line for line.
+PEBBLE_RUST_LANE_JOB_KEYS = frozenset({
+    "stage", "needs", "extends", "rules", "script", "allow_failure", "when",
+})
+# Keys allowed to survive extends resolution (the .rust-job template keys
+# plus the job's own wiring keys), and the exact inherited bootstrap: a
+# template-level variables/hooks/inherit/parallel entry or a before_script
+# `exit 0` would hollow the lane out just like a job-level override (MR
+# !1669 review IK-8). A deliberate change to .rust-job's bootstrap must
+# update PEBBLE_RUST_LANE_BEFORE_SCRIPT in the same commit.
+PEBBLE_RUST_LANE_EFFECTIVE_KEYS = PEBBLE_RUST_LANE_JOB_KEYS | frozenset({
+    "image", "tags", "before_script", "after_script", "cache",
+})
+PEBBLE_RUST_LANE_BEFORE_SCRIPT = (
+    'df -h "$CI_PROJECT_DIR"',
+    "bash .gitlab/scripts/bootstrap-rust.sh",
+    "bash .gitlab/scripts/bootstrap-sccache.sh",
+)
+PEBBLE_RUST_LANE_SCRIPT = (
+    "bash .gitlab/scripts/cargo-ci.sh test -j2 --locked "
+    "--manifest-path ../pebble4lunarwing/Cargo.toml",
+)
+
+
+def validate_pebble_rust_lane(merged: dict, errors: list[str]) -> None:
+    job = merged.get("worker-pebble-rust")
+    if not isinstance(job, dict):
+        errors.append("worker-pebble-rust job missing")
+        return
+    if job.get("extends") != ".rust-job":
+        errors.append(
+            "worker-pebble-rust must extend .rust-job (the pinned rust "
+            "toolchain bootstrap and pull-only cache template)"
+        )
+    unexpected = sorted(set(job) - PEBBLE_RUST_LANE_JOB_KEYS)
+    if unexpected:
+        errors.append(
+            f"worker-pebble-rust must not set job keys {unexpected}; "
+            "job-level variables, parallel matrices, hooks or a "
+            "before_script/after_script can bypass the pinned script"
+        )
+    effective = resolve_extends(job, merged)
+    if effective.get(EXTENDS_TRUNCATED_KEY):
+        errors.append(
+            f"worker-pebble-rust extends chain exceeds the validation depth "
+            f"budget ({EXTENDS_DEPTH_BUDGET}); refusing to certify a "
+            "partially resolved job"
+        )
+    inherited = sorted(
+        set(effective) - PEBBLE_RUST_LANE_EFFECTIVE_KEYS - {EXTENDS_TRUNCATED_KEY}
+    )
+    if inherited:
+        errors.append(
+            f"worker-pebble-rust must not inherit job keys {inherited}; "
+            "template-level variables, hooks, inherit or parallel can bypass "
+            "the pinned script"
+        )
+    before_script = effective.get("before_script")
+    if not isinstance(before_script, list) or [
+        str(line) for line in before_script
+    ] != list(PEBBLE_RUST_LANE_BEFORE_SCRIPT):
+        errors.append(
+            "worker-pebble-rust before_script must be exactly the pinned "
+            f".rust-job bootstrap {list(PEBBLE_RUST_LANE_BEFORE_SCRIPT)!r}"
+        )
+    if image_name(effective.get("image")) != "$CI_RUST_IMAGE":
+        errors.append("worker-pebble-rust must resolve to the $CI_RUST_IMAGE image")
+    if effective.get("tags") != ["$CI_RUST_RUNNER_TAG"]:
+        errors.append(
+            "worker-pebble-rust tags must be exactly ['$CI_RUST_RUNNER_TAG']"
+        )
+    rules = effective.get("rules")
+    if isinstance(rules, list) and any(
+        isinstance(rule, dict) and "variables" in rule for rule in rules
+    ):
+        errors.append(
+            "worker-pebble-rust rules must not set variables; "
+            "rules:variables reach the pinned script on the pipelines that "
+            "rule matches"
+        )
+    if not lane_runs_on_merge_requests(job, merged):
+        errors.append("worker-pebble-rust must run on merge_request_event")
+    script = effective.get("script")
+    if not isinstance(script, list) or [str(line) for line in script] != list(PEBBLE_RUST_LANE_SCRIPT):
+        errors.append(
+            "worker-pebble-rust script must be exactly the pinned commands "
+            f"{list(PEBBLE_RUST_LANE_SCRIPT)!r} (got {script!r})"
+        )
 
 
 def validate_cavepony_version(merged: dict, errors: list[str]) -> None:
@@ -1534,9 +1649,71 @@ def validate_deliverables_manifest(merged: dict, errors: list[str]) -> None:
         )
 
 
+def cross_check_image_digest(
+    variables: dict[str, str],
+    name: str,
+    dockerfile: pathlib.Path,
+    from_package: str,
+    display: str,
+    errors: list[str],
+) -> None:
+    """A CI lane image must test with the same content the worker image
+    builds and runs with (MR !1552 review ER-5). Fail closed: a missing
+    Dockerfile, an unpinned/malformed FROM, or no matching FROM at all must
+    not silently dissolve the tie this check exists to enforce (MR !1566
+    review EZ-3)."""
+    match = DIGEST_PATTERN.search(variables.get(name, ""))
+    if not match:
+        return
+    if not dockerfile.is_file():
+        errors.append(
+            f"{display} missing; cannot cross-check {name} against its "
+            f"{from_package} FROM digest(s)"
+        )
+        return
+    dockerfile_text = dockerfile.read_text(encoding="utf-8")
+    # Tie every FROM whose repository's last path segment is the package's
+    # (any registry or namespace: `docker.io/node`, a mirror path and a bare
+    # `node` all count), followed by a tag/digest/whitespace boundary so a
+    # `nodejs`-style name does not stand in for the pinned package (MR !1669
+    # review IK-1: the previous full-repository match left `docker.io/node`
+    # and mirror-path spellings untied).
+    repository = re.escape(from_package.rsplit("/", 1)[-1])
+    from_lines = [
+        line.strip()
+        for line in dockerfile_text.splitlines()
+        if re.match(
+            rf"^\s*(?i:FROM)\s+(?:--platform=\S+\s+)?(?:\S*/)?{repository}[:@\s]",
+            line,
+        )
+    ]
+    if not from_lines:
+        errors.append(
+            f"{display} has no {from_package} FROM line; cannot cross-check {name}"
+        )
+    dockerfile_digests = set()
+    for from_line in from_lines:
+        digest_match = re.search(r"@sha256:([0-9a-f]{64})(?![0-9a-fA-F])", from_line)
+        if digest_match:
+            dockerfile_digests.add(digest_match.group(1))
+        else:
+            errors.append(
+                f"{display} {from_package} FROM is not pinned "
+                f"to a 64-char lowercase sha256 digest: {from_line!r}"
+            )
+    if dockerfile_digests and dockerfile_digests != {match.group(1)}:
+        errors.append(
+            f"{name} digest must match the {from_package} digest(s) in {display}"
+        )
+
+
 def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors: list[str]) -> None:
     trust_sensitive = (
-        "CI_LINT_IMAGE", "CI_RUST_IMAGE", "CI_GITLEAKS_IMAGE", "CI_BUN_IMAGE", "CI_NODE_IMAGE"
+        "CI_LINT_IMAGE",
+        "CI_RUST_IMAGE",
+        "CI_GITLEAKS_IMAGE",
+        "CI_BUN_IMAGE",
+        "CI_NODE_IMAGE",
     )
     for name in trust_sensitive:
         value = variables.get(name, "")
@@ -1545,86 +1722,24 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
         elif not IMAGE_PATTERN.search(value):
             errors.append(f"{name}={value!r} is not digest-pinned")
 
-    # The worker-opencode-ts lane must test with the same bun content the
-    # worker image builds and runs with (MR !1552 review ER-5). Fail closed:
-    # a missing Dockerfile, an unpinned/malformed oven/bun FROM, or no
-    # oven/bun FROM at all must not silently dissolve the tie this check
-    # exists to enforce (MR !1566 review EZ-3).
-    bun_match = DIGEST_PATTERN.search(variables.get("CI_BUN_IMAGE", ""))
-    if bun_match:
-        if not OPENCODE_DOCKERFILE.is_file():
-            errors.append(
-                "opencode4lunarwing/Dockerfile missing; cannot cross-check "
-                "CI_BUN_IMAGE against its oven/bun FROM digest(s)"
-            )
-        else:
-            dockerfile_text = OPENCODE_DOCKERFILE.read_text(encoding="utf-8")
-            bun_from_lines = [
-                line.strip()
-                for line in dockerfile_text.splitlines()
-                if re.match(r"^\s*(?i:FROM)\s+(?:--platform=\S+\s+)?\S*oven/bun", line)
-            ]
-            if not bun_from_lines:
-                errors.append(
-                    "opencode4lunarwing/Dockerfile has no oven/bun FROM line; "
-                    "cannot cross-check CI_BUN_IMAGE"
-                )
-            dockerfile_bun_digests = set()
-            for from_line in bun_from_lines:
-                digest_match = re.search(r"@sha256:([0-9a-f]{64})(?![0-9a-fA-F])", from_line)
-                if digest_match:
-                    dockerfile_bun_digests.add(digest_match.group(1))
-                else:
-                    errors.append(
-                        "opencode4lunarwing/Dockerfile oven/bun FROM is not pinned "
-                        "to a 64-char lowercase sha256 digest: "
-                        f"{from_line!r}"
-                    )
-            if dockerfile_bun_digests and dockerfile_bun_digests != {bun_match.group(1)}:
-                errors.append(
-                    "CI_BUN_IMAGE digest must match the oven/bun digest(s) in "
-                    "opencode4lunarwing/Dockerfile"
-                )
-
-    # The worker-kimi-ts lane must test with the same node content the worker
-    # image builds and runs with (MR !1590 review GB-2). Fail closed like the
-    # bun tie above: a missing Dockerfile, an unpinned/malformed node FROM, or
-    # no node FROM at all must not silently dissolve the tie.
-    node_match = DIGEST_PATTERN.search(variables.get("CI_NODE_IMAGE", ""))
-    if node_match:
-        if not KIMI_DOCKERFILE.is_file():
-            errors.append(
-                "kimicode4lunarwing/Dockerfile missing; cannot cross-check "
-                "CI_NODE_IMAGE against its node FROM digest(s)"
-            )
-        else:
-            dockerfile_text = KIMI_DOCKERFILE.read_text(encoding="utf-8")
-            node_from_lines = [
-                line.strip()
-                for line in dockerfile_text.splitlines()
-                if re.match(r"^\s*(?i:FROM)\s+(?:--platform=\S+\s+)?\S*/node[:@]", line)
-            ]
-            if not node_from_lines:
-                errors.append(
-                    "kimicode4lunarwing/Dockerfile has no node FROM line; "
-                    "cannot cross-check CI_NODE_IMAGE"
-                )
-            dockerfile_node_digests = set()
-            for from_line in node_from_lines:
-                digest_match = re.search(r"@sha256:([0-9a-f]{64})(?![0-9a-fA-F])", from_line)
-                if digest_match:
-                    dockerfile_node_digests.add(digest_match.group(1))
-                else:
-                    errors.append(
-                        "kimicode4lunarwing/Dockerfile node FROM is not pinned "
-                        "to a 64-char lowercase sha256 digest: "
-                        f"{from_line!r}"
-                    )
-            if dockerfile_node_digests and dockerfile_node_digests != {node_match.group(1)}:
-                errors.append(
-                    "CI_NODE_IMAGE digest must match the node digest(s) in "
-                    "kimicode4lunarwing/Dockerfile"
-                )
+    # The worker-opencode-ts and worker-opencode2-ts lanes must test with the
+    # same bun content the worker images build and run with (MR !1552 review
+    # ER-5; the opencode2 tie was added after MR !1669 review IK-2 found the
+    # lane's image untied).
+    cross_check_image_digest(
+        variables, "CI_BUN_IMAGE", OPENCODE_DOCKERFILE, "oven/bun",
+        "opencode4lunarwing/Dockerfile", errors,
+    )
+    cross_check_image_digest(
+        variables, "CI_BUN_IMAGE", OPENCODE2_DOCKERFILE, "oven/bun",
+        "opencode2.4lunarwing/Dockerfile", errors,
+    )
+    # The worker-kimi-ts lane must test with the same node content the kimi
+    # worker image builds and runs with (MR !1590 review GB-2).
+    cross_check_image_digest(
+        variables, "CI_NODE_IMAGE", KIMI_DOCKERFILE, "library/node",
+        "kimicode4lunarwing/Dockerfile", errors,
+    )
 
     # The worker-kimi-ts lane installs its python3 apt prerequisite inside
     # the bare node image; it must come from the same pinned Debian snapshot
@@ -1915,6 +2030,7 @@ def main() -> int:
     validate_satellite_advisory_sweep(merged_config, errors)
     validate_advisory_gates_not_optional(merged_config, errors)
     validate_worker_ts_lanes(merged_config, errors)
+    validate_pebble_rust_lane(merged_config, errors)
     validate_cache_trust(merged_config, errors)
     validate_worker_versions(errors)
     validate_worker_input_manifest(errors)
