@@ -649,6 +649,21 @@ echoes, splice re-checks, Range/206 handling) are recorded in
 `ic/src/NETWORK_SECURITY.md`, and the pre-existing channel-host class is
 filed as WI#408. WI#395 was closed on 2026-10-16.
 
+The transfer-coding half of that refusal was then closed out (WI#419, fix
+in-tree pending maintainer acceptance). The opaque-coding check now reads
+**every** `Content-Encoding`/`Transfer-Encoding` field (comma-split,
+case-insensitive, fail-closed on unreadable values), and a
+transfer-coding-only body counts as inspectable only when hyper would
+actually de-chunk it — the last token of the last `Transfer-Encoding` field
+is `chunked` **and** exactly one `chunked` token appears across all fields.
+Shapes whose framing hyper keeps (`chunked,` with a trailing comma, a
+trailing empty field, `chunked, chunked`, or two `chunked` fields over a
+double-chunked body) are refused as opaque, so a credential echo split
+across chunk boundaries can no longer reach the container unscrubbed. The
+two accepted leftovers are filed: WI#429 (empty-body over-refusal — HEAD or
+304 responses carrying an opaque coding token still get 502) and WI#430
+(the analogous retained-framing gap in the WASM guest wrapper).
+
 ### Self-Heal Backoff Cap (WI#377)
 
 `lunarwing-self-heal.sh`'s `compute_backoff()` honoured a custom
