@@ -251,8 +251,12 @@ rotate_tenant_pg_password() {
     || die "could not safely write $secret_file"
 
   # ... and replace DATABASE_URL without reopening a tenant-writable temp as root.
+  # WI#390 (IY-3): the replace must be fatal too — under a suppressed-errexit
+  # caller an unchecked refusal would report "Rotated" while DATABASE_URL still
+  # carries the old password.
   _tenant_env_replace "$name" "$envf" DATABASE_URL \
-    "postgres://lunarwing:${new_pw}@127.0.0.1:${pg_port}/lunarwing"
+    "postgres://lunarwing:${new_pw}@127.0.0.1:${pg_port}/lunarwing" \
+    || die "could not safely update DATABASE_URL in $envf (pg.secret already holds the new password; re-run rotate-pg-password)"
 
   say "Rotated PostgreSQL password for tenant '$name'."
   say "IMPORTANT: the running daemon still holds the old credential — restart to apply:"

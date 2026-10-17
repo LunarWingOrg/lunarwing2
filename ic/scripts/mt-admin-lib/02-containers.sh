@@ -488,15 +488,18 @@ write_tenant_voice_env() {
   enabled="$(jq -r --arg name "$name" '.tenants[$name].enable_voice // false' "$PORTS_REGISTRY" 2>/dev/null)"
   [[ "$enabled" == true ]] || enabled=false
 
-  _env_set "$env_path" VOICE_ENABLED "$enabled"
-  _voice_env_set_default "$env_path" VOICE_AUTH_TOKEN "$token"
-  _env_set "$env_path" VOICE_ALLOW_UNAUTHENTICATED false
-  _env_set "$env_path" VOICE_BIND_HOST 0.0.0.0
-  _env_set "$env_path" VOICE_PORT "$VOICE_SIDECAR_INTERNAL_PORT"
-  _env_set "$env_path" VOICE_HEALTH_PORT "$VOICE_SIDECAR_HEALTH_PORT"
-  _env_set "$env_path" VOICE_MODEL_DIR /models
-  _env_set "$env_path" VOICE_AUTO_DOWNLOAD false
-  _env_set "$env_path" VOICE_REQUIRE_STT true
+  # WI#390 (IY-3): every commit is fail-closed — a refused tenant-side write
+  # must fail the writer (add_tenant's `|| die` otherwise never fires) instead
+  # of being swallowed by the trailing printf.
+  _env_set "$env_path" VOICE_ENABLED "$enabled" || return 1
+  _voice_env_set_default "$env_path" VOICE_AUTH_TOKEN "$token" || return 1
+  _env_set "$env_path" VOICE_ALLOW_UNAUTHENTICATED false || return 1
+  _env_set "$env_path" VOICE_BIND_HOST 0.0.0.0 || return 1
+  _env_set "$env_path" VOICE_PORT "$VOICE_SIDECAR_INTERNAL_PORT" || return 1
+  _env_set "$env_path" VOICE_HEALTH_PORT "$VOICE_SIDECAR_HEALTH_PORT" || return 1
+  _env_set "$env_path" VOICE_MODEL_DIR /models || return 1
+  _env_set "$env_path" VOICE_AUTO_DOWNLOAD false || return 1
+  _env_set "$env_path" VOICE_REQUIRE_STT true || return 1
 
   for setting in \
     'VOICE_STT_ENGINE|whisper' \
@@ -518,7 +521,7 @@ write_tenant_voice_env() {
     'ORT_NUM_THREADS|4'; do
     key="${setting%%|*}"
     value="${setting#*|}"
-    _voice_env_set_default "$env_path" "$key" "$value"
+    _voice_env_set_default "$env_path" "$key" "$value" || return 1
   done
   # WI#390: no trailing root chmod/chown — every _env_set commit above already
   # lands voice.env tenant-owned at mode 600 through the tenant-side atomic
