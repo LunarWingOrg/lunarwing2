@@ -603,22 +603,21 @@ configure_weechat_relay() {  # <tenant>
   fi
 
   # Temp directory as a sibling of the target (same filesystem for atomic rename).
+  # Both directories are created AS the tenant: a root mkdir/chown here would
+  # follow a symlink the tenant planted at ~/.config (WI#416).
   local config_parent temp_home
   config_parent="$(dirname "$target_home")"
-  if ! mkdir -p "$config_parent" || ! chown "$tenant:$tenant" "$config_parent"; then
+  if ! sudo -u "$tenant" mkdir -p "$config_parent"; then
     printf 'error: unable to prepare WeeChat config parent: %s\n' "$config_parent" >&2
     return 1
   fi
-  temp_home="$(mktemp -d "${config_parent}/.weechat-bootstrap.XXXXXX")" || {
+  temp_home="$(sudo -u "$tenant" mktemp -d "${config_parent}/.weechat-bootstrap.XXXXXX")" || {
     printf 'error: unable to create WeeChat bootstrap directory under %s\n' "$config_parent" >&2
     return 1
   }
 
   (
     trap '[[ -n "${temp_home:-}" && -d "$temp_home" ]] && rm -rf -- "$temp_home"' EXIT
-    if ! chown "$tenant:$tenant" "$temp_home"; then
-      return 1
-    fi
 
     # Generate via WeeChat one-shot.
     if ! _weechat_generate_relay_config "$tenant" "$temp_home" "$relay_port" "$lunarwing_env"; then
@@ -649,10 +648,11 @@ configure_weechat_relay() {  # <tenant>
     return $rc
   fi
 
-  if ! chown -R "$tenant:$tenant" "$target_home"; then
-    printf 'error: unable to set WeeChat config ownership: %s\n' "$target_home" >&2
-    return 1
-  fi
+  # No root chown of the promoted tree: the parent dir, the bootstrap temp and
+  # the generated config were all created as the tenant, so the promoted tree
+  # is already tenant-owned. A root chown -R here would resolve through the
+  # tenant-controlled ~/.config and, after a post-promote symlink swap, hand a
+  # victim's tree to the tenant (WI#416, !1709 run-143 JN-1).
   say "WeeChat relay configured for tenant '$tenant' (port $relay_port, loopback)"
 }
 
@@ -752,8 +752,17 @@ prepare_relay_start_barrier() {  # <tenant>
     || die "missing or unsafe tenant env directory"
   lock="$dir/.relay-start.lock"
   if [[ ! -e "$lock" && ! -L "$lock" ]]; then
-    (umask 077; set -o noclobber; : >"$lock") || return 1
-    chown "$name:$name" "$lock" || return 1
+    # Create the lock as the tenant: a root-side noclobber redirect drops
+    # O_EXCL for a non-regular target, and the follow-up root chown would
+    # follow a symlink the tenant swaps in (WI#416). Tenant-side creation
+    # makes the lock tenant-owned at birth; the checks below still verify it.
+    local -a drop=(sudo -u "$name")
+    [[ "$(id -un)" != "$name" ]] || drop=()
+    "${drop[@]}" env -i PATH="/usr/bin:/bin" bash -c '
+      umask 077
+      set -o noclobber
+      : >"$1"
+    ' _ "$lock" || return 1
   fi
   [[ -f "$lock" && ! -L "$lock" && "$(stat -c '%h:%a' "$lock")" == 1:600 ]] \
     || die "unsafe relay start lock"
@@ -2509,9 +2518,11 @@ provision_tenant_ssh_key() {
 
   # Stage the private key for upload (mode 0600, tenant-owned).
   # Deleted by upload_tenant_ssh_key after the daemon ingests it.
+  # The tenant-side cp creates the file tenant-owned, so no root chown is
+  # needed; a root chown here would follow a symlink swapped in by the tenant
+  # (WI#416).
   sudo -u "$name" cp "$key_path" "$staged_key"
   sudo -u "$name" chmod 600 "$staged_key"
-  chown "$name:$name" "$staged_key"
   say "staged SSH private key for upload to secrets store"
 }
 
