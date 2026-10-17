@@ -186,33 +186,96 @@ impl ChannelStoreData {
     /// Display output, so any error from an injected-URL request will
     /// contain the raw credential unless we scrub it.
     ///
-    /// Scrubs raw, URL-encoded, and Base64-encoded forms of each secret
-    /// to prevent exfiltration via encoded representations in error strings.
+    /// Scrubs the raw spelling plus both encoded spellings of each secret
+    /// (WI#408): `urlencoding::encode` and the `application/x-www-form-urlencoded`
+    /// form produced by `query_pairs_mut` query-param injection. The two
+    /// encoders differ for space, `~` and `*`, so scrubbing only one leaves
+    /// the other intact in an echo.
     fn redact_credentials(&self, text: &str) -> String {
         let mut result = text.to_string();
         for (name, value) in &self.credentials {
             if !value.is_empty() {
                 let tag = format!("[REDACTED:{}]", name);
                 result = result.replace(value, &tag);
-                // Also redact URL-encoded form (covers secrets in query strings)
-                let encoded = urlencoding::encode(value);
-                if encoded != *value {
-                    result = result.replace(encoded.as_ref(), &tag);
-                }
+                result = replace_encoded_spellings(&result, value, &tag);
             }
         }
         for cred in &self.host_credentials {
             if !cred.secret_value.is_empty() {
                 let tag = "[REDACTED:host_credential]";
                 result = result.replace(&cred.secret_value, tag);
-                // Also redact URL-encoded form (covers secrets injected as query params)
-                let encoded = urlencoding::encode(&cred.secret_value);
-                if encoded.as_ref() != cred.secret_value {
-                    result = result.replace(encoded.as_ref(), tag);
-                }
+                result = replace_encoded_spellings(&result, &cred.secret_value, tag);
             }
         }
         result
+    }
+
+    /// Byte-level credential scrub for response bodies (WI#408): bodies are
+    /// not guaranteed UTF-8, so the raw and both encoded spellings are
+    /// replaced at the byte level rather than through lossy string
+    /// conversion.
+    fn redact_credential_bytes(&self, mut bytes: Vec<u8>) -> Vec<u8> {
+        for (name, value) in &self.credentials {
+            if !value.is_empty() {
+                let marker = format!("[REDACTED:{name}]").into_bytes();
+                scrub_secret_bytes(&mut bytes, value, &marker);
+            }
+        }
+        for cred in &self.host_credentials {
+            if !cred.secret_value.is_empty() {
+                scrub_secret_bytes(
+                    &mut bytes,
+                    &cred.secret_value,
+                    b"[REDACTED:host_credential]",
+                );
+            }
+        }
+        bytes
+    }
+
+    /// Redact credentials from a serialized headers map at the field level
+    /// (WI#408): a secret containing `"` or `\` is JSON-escaped in the
+    /// serialized form, so string-level replacement can miss it, and a blind
+    /// string replace could even produce invalid JSON. Parsing first and
+    /// redacting each name and value keeps the output valid for any secret
+    /// bytes.
+    fn redact_headers_json(&self, headers_json: &str) -> String {
+        let Ok(map) = serde_json::from_str::<HashMap<String, String>>(headers_json) else {
+            return self.redact_credentials(headers_json);
+        };
+        let redacted: HashMap<String, String> = map
+            .into_iter()
+            .map(|(name, value)| {
+                (
+                    self.redact_credentials(&name),
+                    self.redact_credentials(&value),
+                )
+            })
+            .collect();
+        serde_json::to_string(&redacted).unwrap_or_else(|_| self.redact_credentials(headers_json))
+    }
+
+    /// Apply the guest-facing redaction to one HTTP exchange outcome
+    /// (WI#408). Called once at the trait boundary so early validator
+    /// errors — which run on the injected URL and can quote injected values
+    /// in deny reasons — response headers — which can echo the form-encoded
+    /// query-param credential through a redirect `Location` — and response
+    /// bodies — which echo the redirect target URL on common 3xx edges —
+    /// are covered alongside send errors. Headers are redacted per field
+    /// before serialization so JSON-escaping cannot hide a secret
+    /// containing `"` or `\`.
+    fn redact_http_outcome_for_guest(
+        &self,
+        outcome: Result<lunarwing::agent::channel_host::HttpResponse, String>,
+    ) -> Result<lunarwing::agent::channel_host::HttpResponse, String> {
+        match outcome {
+            Ok(mut resp) => {
+                resp.body = self.redact_credential_bytes(std::mem::take(&mut resp.body));
+                resp.headers_json = self.redact_headers_json(&resp.headers_json);
+                Ok(resp)
+            }
+            Err(e) => Err(self.redact_credentials(&e)),
+        }
     }
 
     /// Inject pre-resolved host credentials into the request.
@@ -248,51 +311,21 @@ impl ChannelStoreData {
                     }
                     *url = parsed_url.to_string();
                 } else {
-                    tracing::warn!(url = %url, "Could not parse URL to inject query parameters; skipping injection");
+                    // The URL may already carry another credential's injected
+                    // query params from an earlier loop iteration (WI#408).
+                    tracing::warn!(url = %self.redact_credentials(url), "Could not parse URL to inject query parameters; skipping injection");
                 }
             }
         }
     }
-}
 
-// Implement WasiView to provide WASI context and resource table
-impl WasiView for ChannelStoreData {
-    fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiCtxView {
-            ctx: &mut self.wasi,
-            table: &mut self.table,
-        }
-    }
-}
-
-// Implement the generated Host trait for channel-host interface
-impl lunarwing::agent::channel_host::Host for ChannelStoreData {
-    fn log(&mut self, level: lunarwing::agent::channel_host::LogLevel, message: String) {
-        let log_level = match level {
-            lunarwing::agent::channel_host::LogLevel::Trace => LogLevel::Trace,
-            lunarwing::agent::channel_host::LogLevel::Debug => LogLevel::Debug,
-            lunarwing::agent::channel_host::LogLevel::Info => LogLevel::Info,
-            lunarwing::agent::channel_host::LogLevel::Warn => LogLevel::Warn,
-            lunarwing::agent::channel_host::LogLevel::Error => LogLevel::Error,
-        };
-        let _ = self.host_state.log(log_level, message);
-    }
-
-    fn now_millis(&mut self) -> u64 {
-        self.host_state.now_millis()
-    }
-
-    fn workspace_read(&mut self, path: String) -> Option<String> {
-        self.host_state.workspace_read(&path).ok().flatten()
-    }
-
-    fn workspace_write(&mut self, path: String, content: String) -> Result<(), String> {
-        self.host_state
-            .workspace_write(&path, content)
-            .map_err(|e| e.to_string())
-    }
-
-    fn http_request(
+    /// Unredacted HTTP exchange implementation; the trait method applies
+    /// [`ChannelStoreData::redact_http_outcome_for_guest`] over the outcome
+    /// (WI#408). Nothing here logs guest-visible data carrying injected
+    /// credentials: validator errors propagate to the boundary for redaction
+    /// before logging, send errors strip the URL, and the response body is
+    /// only logged (redacted) by the caller.
+    fn http_request_inner(
         &mut self,
         method: String,
         url: String,
@@ -314,19 +347,16 @@ impl lunarwing::agent::channel_host::Host for ChannelStoreData {
         let url_changed = injected_url != url;
         tracing::info!(url_changed = url_changed, "URL after credential injection");
 
-        // Check if HTTP is allowed for this URL
+        // Check if HTTP is allowed for this URL. The deny reason can quote
+        // the injected URL; it is redacted at the trait boundary (WI#408).
         self.host_state
             .check_http_allowed(&injected_url, &method)
-            .map_err(|e| {
-                tracing::error!(error = %e, "HTTP not allowed");
-                format!("HTTP not allowed: {}", e)
-            })?;
+            .map_err(|e| format!("HTTP not allowed: {}", e))?;
 
         // Record the request for rate limiting
-        self.host_state.record_http_request().map_err(|e| {
-            tracing::error!(error = %e, "Rate limit exceeded");
-            format!("Rate limit exceeded: {}", e)
-        })?;
+        self.host_state
+            .record_http_request()
+            .map_err(|e| format!("Rate limit exceeded: {}", e))?;
 
         // Parse headers and inject credentials into header values
         // This allows patterns like "Authorization": "Bearer {BOT_TOKEN}"
@@ -398,7 +428,7 @@ impl lunarwing::agent::channel_host::Host for ChannelStoreData {
             );
         }
         let rt = self.http_runtime.as_ref().expect("just initialized");
-        let result = rt.block_on(async {
+        rt.block_on(async {
             let client = reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
@@ -428,6 +458,11 @@ impl lunarwing::agent::channel_host::Host for ChannelStoreData {
             let timeout_ms = timeout_ms.unwrap_or(30_000).min(300_000) as u64;
             let timeout = std::time::Duration::from_millis(timeout_ms);
             let response = request.timeout(timeout).send().await.map_err(|e| {
+                // reqwest's Display appends the full URL (`... for url (...)`);
+                // for a query-param credential injection that URL carries the
+                // encoded secret, so it is stripped before walking the chain.
+                // The boundary redaction remains a second layer (WI#408).
+                let e = e.without_url();
                 // Walk the full error chain so we get the actual root cause
                 // (DNS, TLS, connection refused, etc.) instead of just
                 // "error sending request for url (...)".
@@ -481,16 +516,6 @@ impl lunarwing::agent::channel_host::Host for ChannelStoreData {
                 "HTTP response received"
             );
 
-            // Log response body for debugging (truncated at char boundary)
-            if let Ok(body_str) = std::str::from_utf8(&body) {
-                let truncated = if body_str.chars().count() > 500 {
-                    format!("{}...", body_str.chars().take(500).collect::<String>())
-                } else {
-                    body_str.to_string()
-                };
-                tracing::debug!(body = %truncated, "Response body");
-            }
-
             // Leak detection on response body (best-effort).
             if let Ok(body_str) = std::str::from_utf8(&body)
                 && !should_skip_response_leak_scan(&url)
@@ -505,23 +530,83 @@ impl lunarwing::agent::channel_host::Host for ChannelStoreData {
                 headers_json,
                 body,
             })
-        });
+        })
+    }
+}
 
-        // Scrub credential values from error messages before logging or returning
-        // to WASM. reqwest::Error includes the full URL (with injected credentials)
-        // in its Display output.
-        let result = result.map_err(|e| self.redact_credentials(&e));
+// Implement WasiView to provide WASI context and resource table
+impl WasiView for ChannelStoreData {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
+    }
+}
 
-        match &result {
+// Implement the generated Host trait for channel-host interface
+impl lunarwing::agent::channel_host::Host for ChannelStoreData {
+    fn log(&mut self, level: lunarwing::agent::channel_host::LogLevel, message: String) {
+        let log_level = match level {
+            lunarwing::agent::channel_host::LogLevel::Trace => LogLevel::Trace,
+            lunarwing::agent::channel_host::LogLevel::Debug => LogLevel::Debug,
+            lunarwing::agent::channel_host::LogLevel::Info => LogLevel::Info,
+            lunarwing::agent::channel_host::LogLevel::Warn => LogLevel::Warn,
+            lunarwing::agent::channel_host::LogLevel::Error => LogLevel::Error,
+        };
+        let _ = self.host_state.log(log_level, message);
+    }
+
+    fn now_millis(&mut self) -> u64 {
+        self.host_state.now_millis()
+    }
+
+    fn workspace_read(&mut self, path: String) -> Option<String> {
+        self.host_state.workspace_read(&path).ok().flatten()
+    }
+
+    fn workspace_write(&mut self, path: String, content: String) -> Result<(), String> {
+        self.host_state
+            .workspace_write(&path, content)
+            .map_err(|e| e.to_string())
+    }
+
+    fn http_request(
+        &mut self,
+        method: String,
+        url: String,
+        headers_json: String,
+        body: Option<Vec<u8>>,
+        timeout_ms: Option<u32>,
+    ) -> Result<lunarwing::agent::channel_host::HttpResponse, String> {
+        // WI#408: single redaction point for everything the guest sees. Early
+        // validator errors run on the injected URL and can quote injected
+        // values in deny reasons; response headers can echo the form-encoded
+        // query-param credential via a redirect `Location`; response bodies
+        // echo the redirect target URL on common 3xx edges.
+        let outcome = self.http_request_inner(method, url, headers_json, body, timeout_ms);
+        let outcome = self.redact_http_outcome_for_guest(outcome);
+
+        match &outcome {
             Ok(resp) => {
                 tracing::info!(status = resp.status, "http_request completed successfully");
+                // The body was scrubbed above; only the redacted form may be
+                // logged, never the raw upstream body (WI#408).
+                if let Ok(body_str) = std::str::from_utf8(&resp.body) {
+                    let truncated = if body_str.chars().count() > 500 {
+                        format!("{}...", body_str.chars().take(500).collect::<String>())
+                    } else {
+                        body_str.to_string()
+                    };
+                    tracing::debug!(body = %truncated, "Response body (redacted)");
+                }
             }
             Err(e) => {
                 tracing::error!(error = %e, "http_request failed");
             }
         }
 
-        result
+        outcome
     }
 
     fn secret_exists(&mut self, name: String) -> bool {
@@ -3531,6 +3616,62 @@ impl HttpResponse {
 /// Extract the hostname from a URL string.
 ///
 /// Returns `None` for malformed URLs or non-HTTP(S) schemes.
+/// The `application/x-www-form-urlencoded` spelling of a secret, matching
+/// what `query_pairs_mut().append_pair()` produces when host query-param
+/// credentials are injected (WI#408). It differs from
+/// `urlencoding::encode` for space (`+` vs `%20`), `~` (`%7E` vs `~`) and
+/// `*` (`*` vs `%2A`), so an echo of the injected URL can carry this form.
+fn form_encode_secret(secret: &str) -> String {
+    url::form_urlencoded::byte_serialize(secret.as_bytes()).collect()
+}
+
+/// Replace both encoded spellings of a secret in text (WI#408): the
+/// `urlencoding::encode` form and the form (`query_pairs_mut`) form.
+fn replace_encoded_spellings(text: &str, secret: &str, tag: &str) -> String {
+    let mut result = text.to_string();
+    for encoded in [
+        urlencoding::encode(secret).to_string(),
+        form_encode_secret(secret),
+    ] {
+        if encoded != secret {
+            result = result.replace(encoded.as_str(), tag);
+        }
+    }
+    result
+}
+
+/// Byte-level scrub of every spelling of `secret` (WI#408): response bodies
+/// are not guaranteed UTF-8, so string-level replacement cannot be used.
+fn scrub_secret_bytes(bytes: &mut Vec<u8>, secret: &str, marker: &[u8]) {
+    replace_all_bytes(bytes, secret.as_bytes(), marker);
+    for encoded in [
+        urlencoding::encode(secret).to_string(),
+        form_encode_secret(secret),
+    ] {
+        if encoded != secret {
+            replace_all_bytes(bytes, encoded.as_bytes(), marker);
+        }
+    }
+}
+
+/// Replace every occurrence of `needle` in `haystack` with `marker`, at the
+/// byte level (WI#408 — response bodies are not guaranteed UTF-8, so
+/// string-level replacement cannot be used on them).
+fn replace_all_bytes(haystack: &mut Vec<u8>, needle: &[u8], marker: &[u8]) {
+    if needle.is_empty() {
+        return;
+    }
+    let mut search_from = 0;
+    while let Some(offset) = haystack[search_from..]
+        .windows(needle.len())
+        .position(|window| window == needle)
+    {
+        let at = search_from + offset;
+        haystack.splice(at..at + needle.len(), marker.iter().copied());
+        search_from = at + marker.len();
+    }
+}
+
 fn extract_host_from_url(url: &str) -> Option<String> {
     let parsed = url::Url::parse(url).ok()?;
     if !matches!(parsed.scheme(), "http" | "https") {
@@ -6151,6 +6292,314 @@ mod tests {
         assert_eq!(
             mime_from_extension("/home/user/.lunarwing/screenshot.png"),
             "image/png"
+        );
+    }
+
+    /// WI#408 finding 1: host query credentials are injected with
+    /// `query_pairs_mut().append_pair` (form spelling) but redaction used to
+    /// scrub only the `urlencoding::encode` spelling. The encoders differ
+    /// for space, `~` and `*`, so an echo of the injected URL survived
+    /// redaction. Both spellings (plus raw) are now scrubbed for placeholder
+    /// and host credentials alike.
+    #[test]
+    fn channel_redaction_scrubs_form_urlencoded_spelling() {
+        use super::{ChannelStoreData, ResolvedHostCredential, form_encode_secret};
+        use std::sync::Arc;
+
+        const SECRET: &str = "chan red~act*";
+        let form = form_encode_secret(SECRET);
+        let encoded = urlencoding::encode(SECRET).to_string();
+        assert_eq!(form, "chan+red%7Eact*", "form spelling precondition");
+        assert_eq!(encoded, "chan%20red~act%2A", "urlencoding precondition");
+        assert_ne!(form, encoded, "precondition: the encoders differ");
+
+        let text = format!("failed for url (https://api.example.com/d?k={form}&j={encoded})");
+
+        // Placeholder credentials.
+        let mut credentials = HashMap::new();
+        credentials.insert("API_TOKEN".to_string(), SECRET.to_string());
+        let store_data = ChannelStoreData::new(
+            1024 * 1024,
+            "test",
+            ChannelCapabilities::for_channel("test"),
+            credentials,
+            Vec::new(),
+            Arc::new(PairingStore::new()),
+        );
+        let redacted = store_data.redact_credentials(&text);
+        assert!(!redacted.contains(SECRET), "{redacted}");
+        assert!(!redacted.contains(&form), "{redacted}");
+        assert!(!redacted.contains(&encoded), "{redacted}");
+        assert!(redacted.contains("[REDACTED:API_TOKEN]"), "{redacted}");
+
+        // Host credentials.
+        let host_credentials = vec![ResolvedHostCredential {
+            host_patterns: vec!["api.example.com".to_string()],
+            headers: HashMap::new(),
+            query_params: HashMap::new(),
+            secret_value: SECRET.to_string(),
+        }];
+        let store_data = ChannelStoreData::new(
+            1024 * 1024,
+            "test",
+            ChannelCapabilities::for_channel("test"),
+            HashMap::new(),
+            host_credentials,
+            Arc::new(PairingStore::new()),
+        );
+        let redacted = store_data.redact_credentials(&text);
+        assert!(!redacted.contains(&form), "{redacted}");
+        assert!(!redacted.contains(&encoded), "{redacted}");
+        assert!(
+            redacted.contains("[REDACTED:host_credential]"),
+            "{redacted}"
+        );
+    }
+
+    /// WI#408 findings 2/3/4: the trait boundary applies one redaction over
+    /// the whole guest-visible outcome — validator errors quoting injected
+    /// values, response headers echoing the credential (a redirect
+    /// `Location`), and response bodies echoing it are all scrubbed, the
+    /// body at the byte level. The secret contains a double quote:
+    /// serialized into `headers_json` it is JSON-escaped, so only per-field
+    /// header redaction catches the raw echo.
+    #[test]
+    fn channel_guest_outcome_redaction_covers_validator_errors_headers_and_body() {
+        use super::{ChannelStoreData, ResolvedHostCredential, form_encode_secret};
+        use std::sync::Arc;
+
+        const SECRET: &str = "chanhdr\"7c8d9e~* +/==";
+        let host_credentials = vec![ResolvedHostCredential {
+            host_patterns: vec!["api.example.com".to_string()],
+            headers: HashMap::new(),
+            query_params: HashMap::new(),
+            secret_value: SECRET.to_string(),
+        }];
+        let store_data = ChannelStoreData::new(
+            1024 * 1024,
+            "test",
+            ChannelCapabilities::for_channel("test"),
+            HashMap::new(),
+            host_credentials,
+            Arc::new(PairingStore::new()),
+        );
+
+        // A deny reason quoting the injected URL (form spelling).
+        let form = form_encode_secret(SECRET);
+        let encoded = urlencoding::encode(SECRET).to_string();
+        let deny = format!(
+            "HTTP not allowed: HTTP request not allowed: InvalidUrl(https://api.example.com/d?api_key={form})"
+        );
+        let err_text = store_data
+            .redact_http_outcome_for_guest(Err(deny))
+            .unwrap_err();
+        assert!(!err_text.contains("chanhdr"), "{err_text}");
+        assert!(!err_text.contains(&form), "{err_text}");
+        assert!(
+            err_text.contains("[REDACTED:host_credential]"),
+            "{err_text}"
+        );
+
+        // Response headers echoing raw + form spellings; body echoing all three.
+        let mut headers = HashMap::new();
+        headers.insert(
+            "location".to_string(),
+            format!("https://example.test/d?api_key={form}"),
+        );
+        headers.insert("x-auth-echo".to_string(), format!("Bearer {SECRET}"));
+        let headers_json = serde_json::to_string(&headers).expect("test headers serialize");
+        let body = format!(
+            "<a href=\"https://example.test/d?api_key={form}\">Found</a> raw={SECRET} enc={encoded}"
+        )
+        .into_bytes();
+        let resp = super::lunarwing::agent::channel_host::HttpResponse {
+            status: 302,
+            headers_json,
+            body,
+        };
+        let redacted = store_data.redact_http_outcome_for_guest(Ok(resp)).unwrap();
+
+        assert!(
+            !redacted.headers_json.contains("chanhdr"),
+            "{}",
+            redacted.headers_json
+        );
+        assert!(
+            !redacted.headers_json.contains(&form),
+            "{}",
+            redacted.headers_json
+        );
+        assert!(
+            !redacted.headers_json.contains(&encoded),
+            "{}",
+            redacted.headers_json
+        );
+        assert!(
+            redacted.headers_json.contains("[REDACTED:host_credential]"),
+            "{}",
+            redacted.headers_json
+        );
+
+        let body = String::from_utf8_lossy(&redacted.body).to_string();
+        assert!(!body.contains("chanhdr"), "{body}");
+        assert!(!body.contains(&form), "{body}");
+        assert!(!body.contains(&encoded), "{body}");
+        assert!(body.contains("[REDACTED:host_credential]"), "{body}");
+    }
+
+    /// WI#408 findings 2/4: the trait-boundary redaction call itself is
+    /// pinned — the other tests call the helper directly, so removing the
+    /// `redact_http_outcome_for_guest` call from `Host::http_request` would
+    /// pass them. A placeholder injected into the URL *path* is quoted
+    /// verbatim in the allowlist deny reason (`PathNotAllowed` carries the
+    /// normalized path), so a real denied request must come back redacted,
+    /// and the deny path must not log the injected URL.
+    #[test]
+    #[traced_test]
+    fn channel_guest_http_request_redacts_validator_error_at_trait_boundary() {
+        use super::lunarwing::agent::channel_host::Host as _;
+        use super::{ChannelStoreData, ResolvedHostCredential};
+        use crate::tools::wasm::{EndpointPattern, HttpCapability};
+        use std::sync::Arc;
+
+        const SECRET: &str = "chanpathsecret4k3l2m";
+        let mut credentials = HashMap::new();
+        credentials.insert("API_TOKEN".to_string(), SECRET.to_string());
+        let mut capabilities = ChannelCapabilities::for_channel("test");
+        capabilities.tool_capabilities.http = Some(HttpCapability::new(vec![
+            EndpointPattern::host("api.example.com").with_path_prefix("/allowed/"),
+        ]));
+        let host_credentials: Vec<ResolvedHostCredential> = Vec::new();
+        let mut store_data = ChannelStoreData::new(
+            1024 * 1024,
+            "test",
+            capabilities,
+            credentials,
+            host_credentials,
+            Arc::new(PairingStore::new()),
+        );
+
+        // The placeholder lands in the path; the deny reason quotes it.
+        let url = "https://api.example.com/{API_TOKEN}/d".to_string();
+        let err = store_data
+            .http_request("GET".to_string(), url, "{}".to_string(), None, None)
+            .unwrap_err();
+        assert!(
+            err.contains("HTTP not allowed"),
+            "expected an allowlist denial: {err}"
+        );
+        assert!(!err.contains(SECRET), "{err}");
+        assert!(err.contains("[REDACTED:API_TOKEN]"), "{err}");
+        assert!(
+            !logs_contain(SECRET),
+            "the deny path must not log the injected URL"
+        );
+    }
+
+    /// WI#408 findings 3/4 (end to end): a real upstream echoing the
+    /// form-encoded query credential and a raw `Bearer` credential hands
+    /// both to the guest unless the success path is redacted. The response
+    /// headers and body must come back scrubbed of the raw, form and
+    /// urlencoding spellings, with the redaction marker present (proving
+    /// the echo existed and was replaced). Driven through the real
+    /// `Host::http_request` trait method against a real TCP upstream.
+    #[tokio::test]
+    async fn channel_guest_http_request_redacts_echoed_credential_in_headers_and_body() {
+        use super::lunarwing::agent::channel_host::Host as _;
+        use super::{ChannelStoreData, ResolvedHostCredential, form_encode_secret};
+        use crate::tools::wasm::{EndpointPattern, HttpCapability};
+        use std::sync::Arc;
+
+        const SECRET: &str = "chan echo~star*+/==";
+
+        let app = Router::new().route(
+            "/echo",
+            get(|uri: axum::http::Uri| async move {
+                let query = uri.query().unwrap_or("").to_string();
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    "x-auth-echo",
+                    format!("Bearer {SECRET}")
+                        .parse()
+                        .expect("test header value"),
+                );
+                headers.insert(
+                    "location",
+                    format!("https://example.test/mapped?{query}")
+                        .parse()
+                        .expect("test header value"),
+                );
+                (StatusCode::OK, headers, format!("you called /echo?{query}"))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind echo upstream");
+        let address = listener
+            .local_addr()
+            .expect("Missing echo upstream address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("Echo upstream failed");
+        });
+
+        let mut query_params = HashMap::new();
+        query_params.insert("api_key".to_string(), SECRET.to_string());
+        let host_credentials = vec![ResolvedHostCredential {
+            host_patterns: vec!["127.0.0.1".to_string()],
+            headers: HashMap::new(),
+            query_params,
+            secret_value: SECRET.to_string(),
+        }];
+        let mut capabilities = ChannelCapabilities::for_channel("test");
+        capabilities.tool_capabilities.http =
+            Some(HttpCapability::new(vec![EndpointPattern::host(
+                "127.0.0.1",
+            )]));
+        let mut store_data = ChannelStoreData::new(
+            1024 * 1024,
+            "test",
+            capabilities,
+            HashMap::new(),
+            host_credentials,
+            Arc::new(PairingStore::new()),
+        );
+
+        let url = format!("http://{address}/echo");
+        let resp = tokio::task::spawn_blocking(move || {
+            store_data.http_request("GET".to_string(), url, "{}".to_string(), None, None)
+        })
+        .await
+        .expect("spawn_blocking panicked")
+        .expect("http_request should succeed against the echo upstream");
+        server.abort();
+
+        assert_eq!(resp.status, 200);
+        let form = form_encode_secret(SECRET);
+        let encoded = urlencoding::encode(SECRET).to_string();
+        assert_ne!(form, encoded, "precondition: the encoders differ");
+
+        let body = String::from_utf8_lossy(&resp.body).to_string();
+        assert!(!body.contains(SECRET), "{body}");
+        assert!(!body.contains(&form), "{body}");
+        assert!(!body.contains(&encoded), "{body}");
+        assert!(
+            body.contains("[REDACTED:host_credential]"),
+            "the echoed query credential should have been replaced: {body}"
+        );
+
+        assert!(!resp.headers_json.contains(SECRET), "{}", resp.headers_json);
+        assert!(!resp.headers_json.contains(&form), "{}", resp.headers_json);
+        assert!(
+            !resp.headers_json.contains(&encoded),
+            "{}",
+            resp.headers_json
+        );
+        assert!(
+            resp.headers_json.contains("[REDACTED:host_credential]"),
+            "{}",
+            resp.headers_json
         );
     }
 }

@@ -586,6 +586,33 @@ WASM tools execute HTTP requests through the host runtime, subject to:
    **Reference:** `src/tools/wasm/wrapper.rs` —
    `StoreData::redact_http_outcome_for_guest`
 
+### WASM Channel Host HTTP Requests
+
+The WASM **channel** host (`src/channels/wasm/wrapper.rs`) applies the same
+one-boundary redaction (WI#408): everything the channel guest sees from one
+HTTP exchange passes through
+`ChannelStoreData::redact_http_outcome_for_guest` at the
+`Host::http_request` trait boundary — send errors (URL stripped via
+`without_url()`), early validator errors that quote the injected URL,
+response headers (redacted per field before serialization, so JSON-escaped
+secrets are caught), and response bodies (byte-level). The deny path no
+longer logs the injected URL, and the response-body debug log shows only
+the redacted form.
+
+One deliberate difference from the tool wrapper: the channel host injects
+query credentials with `query_pairs_mut().append_pair` — the
+`application/x-www-form-urlencoded` spelling, which differs from
+`urlencoding::encode` for space, `~` and `*` — so redaction scrubs the raw
+spelling plus **both** encoded spellings of every secret.
+
+Residual, recorded on WI#408: the channel host does not force
+`accept-encoding: identity` on credential-injected exchanges (the tool
+wrapper's refusal), so a guest that successfully negotiates a compressed
+response receives opaque bytes the body scrub cannot inspect.
+
+**Reference:** `src/channels/wasm/wrapper.rs` —
+`ChannelStoreData::redact_http_outcome_for_guest`
+
 ### Daemon Log Scrubbing and `/tenant-logs` (WI#287)
 
 **Decision: scrub at write time (option A), and give the sandbox only the
