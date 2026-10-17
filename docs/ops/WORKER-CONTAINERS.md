@@ -119,8 +119,12 @@ endpoint as a `mode = "cron"` entry — give a cron mission its own
 container. Two cron entries pointing at the same container likewise
 share one authority domain (one mission's tick can borrow the other's
 `cron.tool_allowlist` through another tick's relay socket, concurrent
-or later — a leftover process can wait for it); the
-code does not detect or prevent that pairing — tracked as WI#396. (The manager also strips the worker-level list of a non-cron
+or later — a leftover process can wait for it), so the manager now
+detects that pairing at load (WI#396): cron entries are grouped by
+normalized endpoint key, and when a shared listener's entries carry
+*differing* `cron.tool_allowlist` grants the manager strips every cron
+grant on that listener with an `error!` (fail closed); identical grants
+are the same authority on both sides and stay, with a `warn!`. (The manager also strips the worker-level list of a non-cron
 entry whose endpoint shares a cron entry's container. The comparison uses
 a normalized endpoint key — loopback spellings folded into one class,
 host lowercased, scheme-default port applied, path and query ignored —

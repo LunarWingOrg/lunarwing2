@@ -304,6 +304,9 @@ pub struct CronWorkerConfig {
     /// manager load (one container = one authority domain), so this is the
     /// ONLY proxy authority a cron worker container holds — ordinary
     /// dispatches to it get no proxied tools either.
+    /// WI#396: when two cron entries share one endpoint listener with
+    /// differing lists, the manager strips every list on that listener at
+    /// load (fail closed); identical lists stay with a `warn!`.
     /// Serialized only when non-empty (MR !1549 EF-6): `CronWorkerConfig` is
     /// `deny_unknown_fields`, so an older binary rejects any config carrying
     /// this field at all — write-backs must not introduce
