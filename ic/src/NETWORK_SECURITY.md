@@ -427,12 +427,16 @@ re-frames), and refuses — with 502 — a body whose coding it cannot inspect
 checked — a duplicate field cannot hide a coding behind an `identity`
 first field — with each comma-joined token checked individually; only
 `identity` content codings and a single `chunked` transfer coding that
-hyper removes (the last element of the last field) pass — `chunked,`, a
-trailing empty field, a repeated `chunked`, or `chunked` beside any other
-coding leave chunk framing in the body and are refused — and an unreadable
-coding value is refused
-too. Unlike
-headers, the body scrub matches only the raw and form-encoded spellings
+hyper removes (the last element of the last field) pass. `chunked,` or a
+trailing empty field leave chunk framing intact; repeated `chunked` can
+leave an inner layer. These are refused, and any other transfer-coding
+token (`gzip`, `identity`, `chunked;x=1`) is refused regardless of whether
+hyper removes the framing. An unreadable coding value is refused too.
+The proxy currently applies this check even to empty bodies: HEAD/304 with
+`Content-Encoding: gzip` and HEAD/204 with `Transfer-Encoding: chunked,`
+are over-refused with 502. The empty-body exemption is deferred to
+[WI#429](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/429).
+Unlike headers, the body scrub matches only the raw and form-encoded spellings
 exactly; re-encoded body echoes (e.g. a double-encoded `redirect_to`
 parameter carried inside a 3xx body) are not detected — a recorded
 residual on WI#395. Range/If-Range requests are forwarded, so an upstream
@@ -574,9 +578,13 @@ WASM tools execute HTTP requests through the host runtime, subject to:
    every `TE` offer. A **non-empty** response with any non-identity
    `Content-Encoding` or non-chunked `Transfer-Encoding` token is refused —
    the guest could otherwise decode an echoed credential itself. Hyper
-   removes chunk framing, so `chunked` alone is inspectable. Empty bodies
-   (including HEAD/204/304 responses) are exempt from this encoding refusal;
-   ordinary exchanges keep the guest's own headers and answer.
+   removes a single `chunked` layer when the last token of the last field
+   is `chunked`. The wrapper still accepts trailing-empty and repeated
+   `chunked` forms whose framing may remain and hide a split echo from the
+   byte scrub; this gap is tracked separately in
+   [WI#430](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/430).
+   Empty bodies (including HEAD/204/304 responses) are exempt from this
+   encoding refusal; ordinary exchanges keep the guest's own headers and answer.
    Duplicate response fields are comma-joined before the encoding check,
    including on the interceptor path; `Set-Cookie` retains its existing
    last-value behavior because the guest string-map ABI cannot represent

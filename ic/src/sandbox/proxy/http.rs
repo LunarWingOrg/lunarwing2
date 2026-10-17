@@ -691,13 +691,14 @@ fn forward_scrubbed_headers(
 /// cannot byte-scrub (WI#395 run-111 HA-2, WI#419 KH-1, run-137 IV-1).
 /// Missing, empty and `identity` content codings are inspectable, and so
 /// is a single `chunked` transfer coding that hyper removes (the last
-/// element of the last field). `chunked,`, a trailing empty field, a
-/// repeated `chunked`, or `chunked` beside any other coding leave chunk
-/// framing in the body, so those are opaque too. Every `Content-Encoding`
-/// / `Transfer-Encoding` field is checked — a duplicate field cannot hide
-/// a coding behind an `identity` first field — with each comma-separated
-/// token checked individually, and an unreadable value counts as opaque
-/// rather than fail-open.
+/// element of the last field). `chunked,` or a trailing empty field leave
+/// chunk framing in the body; repeated `chunked` can leave an inner layer.
+/// Any other transfer-coding token (`gzip`, `identity`, `chunked;x=1`) is
+/// refused regardless of whether hyper removes the framing. Every
+/// `Content-Encoding` / `Transfer-Encoding` field is checked — a duplicate
+/// field cannot hide a coding behind an `identity` first field — with each
+/// comma-separated token checked individually, and an unreadable value
+/// counts as opaque rather than fail-open.
 fn response_body_coding_is_opaque(headers: &http::HeaderMap) -> bool {
     fn field_is_opaque(value: &http::HeaderValue, allowed: &str) -> bool {
         match value.to_str() {
@@ -723,9 +724,9 @@ fn response_body_coding_is_opaque(headers: &http::HeaderMap) -> bool {
         return true;
     }
     // hyper removes exactly one chunked layer, and only when the last list
-    // element of the last field is `chunked`; `chunked,`, a trailing empty
-    // field, or a repeated `chunked` leave chunk framing in the body
-    // (run-137 IV-1).
+    // element of the last field is `chunked`; `chunked,` or a trailing empty
+    // field leave framing intact, and repeated `chunked` can leave an inner
+    // layer (run-137 IV-1).
     let hyper_dechunks = last
         .to_str()
         .ok()
@@ -1480,6 +1481,7 @@ mod tests {
             &[("transfer-encoding", "chunked")][..],
             &[("transfer-encoding", "Chunked")][..],
             &[("transfer-encoding", ",chunked")][..],
+            &[("transfer-encoding", ", chunked")][..],
             &[("transfer-encoding", ""), ("transfer-encoding", "chunked")][..],
         ] {
             assert!(
@@ -1817,8 +1819,8 @@ mod tests {
     /// shapes leave chunk framing in the body, so a credential echo split
     /// across chunks is not byte-scrubbed. On a credential-injected exchange
     /// each must answer 502 with neither half forwarded; the single-layer
-    /// `chunked`/`Chunked`/`,chunked` shapes that hyper does de-chunk must
-    /// still give 200 with `[REDACTED]`.
+    /// `chunked`/`Chunked`/`,chunked`/` , chunked` shapes that hyper does
+    /// de-chunk must give 200 with exactly `echo=[REDACTED];end` (JD-1/JD-3).
     #[tokio::test]
     #[traced_test]
     async fn proxy_credential_exchange_refuses_chunk_framing_hyper_keeps() {
@@ -1961,16 +1963,18 @@ mod tests {
             upstream_task.abort();
         }
 
-        // Single-layer shapes that hyper removes → 200 with [REDACTED].
+        // Single-layer shapes that hyper removes → 200 with the exact scrubbed body.
         for (te_header, label) in [
             ("chunked", "plain chunked"),
             ("Chunked", "Chunked"),
             (",chunked", "leading-comma chunked"),
+            (" , chunked", "whitespace leading-comma chunked"),
         ] {
             let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let upstream_port = upstream.local_addr().unwrap().port();
-            let body_text = format!("echo={SECRET};end");
-            let answer = chunked_response(te_header, &[body_text.as_bytes()]);
+            // Split the echo across two chunks: the scrub can only match it
+            // if hyper really removed the framing (run-141 JD-1).
+            let answer = chunked_response(te_header, &[ECHO_HALF1, ECHO_HALF2]);
             let upstream_task = tokio::spawn(async move {
                 loop {
                     let Ok((mut conn, _)) = upstream.accept().await else {
@@ -2020,9 +2024,10 @@ mod tests {
 
             let text = String::from_utf8_lossy(&response);
             assert!(text.starts_with("HTTP/1.1 200"), "{label}: {text}");
-            assert!(
-                text.contains("[REDACTED]"),
-                "{label}: echo not scrubbed: {text}"
+            assert_eq!(
+                text.split_once("\r\n\r\n").unwrap().1,
+                "echo=[REDACTED];end",
+                "{label}: chunk framing kept or echo not scrubbed: {text}"
             );
             assert!(
                 !text.contains(SECRET_STEM),
