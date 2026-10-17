@@ -493,6 +493,34 @@ with a critical health report (empty service metrics, so self-heal gains no
 restart target) and a self-heal page through `escalate_service`. The
 migration-window guarantee no longer depends on arming-time state.
 
+### mt-admin Tenant-Env Root Boundary (WI#390)
+
+The WI#376 follow-up audit found mt-admin running as root still reading
+tenant-owned env files through tenant-writable, symlinkable paths — and in
+places writing them with root `cat >` + `chown`. The converted family now
+takes one root-private `_snapshot_tenant_env` snapshot per file via
+`tenant_cat` (a foreign 0600 env in a 0700 dir is unreadable to the
+tenant-side read, so a cross-tenant symlink dies with "could not read … as
+tenant" instead of leaking), with every value and presence read pointed at
+the snapshot while tenant-side writers re-read the live file at commit
+time. The conversion covers the coordination/lunarwing/bridge/vision/voice
+env writers, the worker base-URL backfill, and the four `configure-*`
+functions; the 28 pipe-form append/sed sites and the `add_tenant` writer
+calls now `die` on a refused tenant-side write instead of printing "added
+…" and carrying on, and the external-worker timeout/auth-token upgrade
+helpers stage root-private and commit through the atomic tenant writer
+(existing-config symlink targets refuse with the contract's rc 2 — the
+ancestor-walk no longer aborts the process first). The pebble workspace is
+created as the tenant with symlink/foreign ownership refused and tightened
+to 0700 (0777 was never load-bearing — the image runs as the tenant uid on
+rootless podman), closing the inotify symlink-swap vector at render time.
+WI#390 itself stays open pending maintainer acceptance; the remaining
+residue is filed: WI#416 (root chown/chmod and root mktemp in other
+tenant-writable paths), WI#422 (rootful pebble bind sources are
+re-resolved at every container start), and WI#423 (the last root
+reads/writes — `tenant_pg_password`, `resolve_worker_auth_token`,
+study-notes mount sources).
+
 ### opencode v1 Crash-Line Enrichment (WI#374)
 
 WI#374 was filed against opencode2 and diagnosed as the v1 lane
