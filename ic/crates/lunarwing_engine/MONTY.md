@@ -57,6 +57,24 @@ These are injected by the LunarWing executor, not by Monty:
 - `globals()` / `locals()` — returns dict of known tool names
 - All tool functions (web_search, http, time, etc.)
 
+### Auto-import pre-injection (WI#364)
+Each MontyRun is block-scoped — imports do not carry across code blocks. When
+LLM-generated code references `asyncio.`, `json.`, `re.`, `math.`,
+`datetime.`, or `sys.` without a matching `import` in the same block, the
+LunarWing executor prepends the missing `import` statement before the code
+reaches Monty (`ic/crates/lunarwing_engine/src/executor/scripting.rs`,
+`inject_missing_imports`). Explicit imports take precedence — the helper only
+adds imports that the code itself does not already provide. Two guards keep the
+injection safe: a name the block calls as a bare function (`json(...)`, the
+builtin tool) is never injected (it would rebind the tool's name to the
+module), and only imports that bind the bare module name count as existing
+(`from module import x` and `import module as alias` do not suppress
+injection). Reported error positions are shifted back to the model's own
+block, so line numbers and byte ranges in tracebacks stay truthful. This is
+the orchestrator-level (Level 1.5) mitigation for the recurring
+asyncio-NameError pattern documented in WI#364; prompt-level rules alone had
+saturated.
+
 ## Upgrade Changelog
 
 | Date | Pin | Notable changes |
