@@ -509,7 +509,8 @@ tenant" instead of leaking), with every value and presence read pointed at
 the snapshot while tenant-side writers re-read the live file at commit
 time. The conversion covers the coordination/lunarwing/bridge/vision/voice
 env writers, the worker base-URL backfill, and the four `configure-*`
-functions; the 28 pipe-form append/sed sites and the `add_tenant` writer
+functions; the pipe-form append/sed sites (28 in env generation plus the
+knowledge-seed arm) and the `add_tenant` writer
 calls now `die` on a refused tenant-side write instead of printing "added
 …" and carrying on, and the external-worker timeout/auth-token upgrade
 helpers stage root-private and commit through the atomic tenant writer
