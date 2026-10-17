@@ -150,7 +150,8 @@ const CREDENTIAL_KEY_SUBSTRINGS: &[&str] = &[
 /// `inside`, `consider`; `passenger`, `passport`, `bypass`), so they match
 /// only as a whole word of the key or at the end of one (`sid`, `x_sid`,
 /// `AccountSid`, `connect.sid`, `callsid`; `pass`, `db_pass`, `smtpPass`,
-/// `rootpass`). Run-131 IM-2.
+/// `rootpass`). Trailing ASCII digits are ignored (`pass1`, `sid2`).
+/// Run-131 IM-2 / run-137 JA-1.
 const CREDENTIAL_KEY_WORDS: &[&str] = &["sid", "pass"];
 
 /// Ordinary words that end in a [`CREDENTIAL_KEY_WORDS`] entry.
@@ -172,8 +173,8 @@ const CREDENTIAL_KEY_WORD_EXCEPTIONS: &[&str] = &[
 /// `client_secret`, `private_key`, `refresh_token`, `apiKey`, `jwt`,
 /// `session_id`, `ssh_key`, and fullwidth `ａｐｉ＿ｋｅｙ` all match.
 /// Additionally, the short names in [`CREDENTIAL_KEY_WORDS`] match as a
-/// whole word of the key or at the end of one, minus
-/// [`CREDENTIAL_KEY_WORD_EXCEPTIONS`] (run-131 IM-2).
+/// whole word of the key or at the end of one after trimming trailing ASCII
+/// digits, minus [`CREDENTIAL_KEY_WORD_EXCEPTIONS`] (run-131 IM-2 / JA-1).
 pub fn is_credential_param_key(key: &str) -> bool {
     let folded: Vec<char> = key.chars().map(fold_fullwidth_latin).collect();
     let normalized: String = folded
@@ -186,10 +187,11 @@ pub fn is_credential_param_key(key: &str) -> bool {
         .iter()
         .any(|sub| normalized.contains(sub))
         || key_words(&folded).iter().any(|word| {
-            !CREDENTIAL_KEY_WORD_EXCEPTIONS.contains(&word.as_str())
+            let stem = word.trim_end_matches(|c: char| c.is_ascii_digit());
+            !CREDENTIAL_KEY_WORD_EXCEPTIONS.contains(&stem)
                 && CREDENTIAL_KEY_WORDS
                     .iter()
-                    .any(|short| word.ends_with(short))
+                    .any(|short| stem.ends_with(short))
         })
 }
 
@@ -746,6 +748,28 @@ mod tests {
             "side_effects_hint",
             "encompass",
         ] {
+            assert!(!is_credential_param_key(key), "'{key}' must not match");
+        }
+    }
+
+    #[test]
+    fn credential_param_key_short_names_ignore_a_trailing_counter() {
+        // JA-1: numbered password/session fields still carry credentials.
+        // WordPress forms use pass1/pass2 for password and confirmation.
+        for key in [
+            "pass1",
+            "pass2",
+            "pass12",
+            "pass1-text",
+            "smtp_pass2",
+            "sid2",
+            "Sid1",
+            "x_sid_2",
+            "ｓｉｄ２",
+        ] {
+            assert!(is_credential_param_key(key), "'{key}' must match");
+        }
+        for key in ["side2", "bypass2", "Compass3", "passenger1"] {
             assert!(!is_credential_param_key(key), "'{key}' must not match");
         }
     }
