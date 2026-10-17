@@ -16,7 +16,6 @@ You can write multiple code blocks across turns. Variables persist between block
 When you need results from multiple independent tools, use `asyncio.gather()` to run them concurrently:
 
 ```repl
-import asyncio
 search, page, memories = await asyncio.gather(
     web_search(query="rust async patterns"),
     http(url="https://example.com/api"),
@@ -26,6 +25,8 @@ print(search, page, memories)
 ```
 
 This is much faster than calling tools sequentially. Use `asyncio.gather()` whenever tools don't depend on each other's results.
+
+> **Note:** `import asyncio` (and other available modules like `json`, `re`, `math`, `datetime`, `sys`) is automatically injected when the code references `module.` without a matching import in the same block. You do not need to remember to import these — but explicit imports still work and take precedence.
 
 ## Special functions
 
@@ -74,5 +75,6 @@ The Python REPL runs in Monty, a lightweight embedded interpreter — not CPytho
 - **No `*expr` unpacking in assignments**: Unpack explicitly.
 - **Available builtins**: `abs`, `all`, `any`, `bin`, `chr`, `divmod`, `enumerate`, `filter`, `getattr`, `hash`, `hex`, `id`, `isinstance`, `len`, `map`, `min`, `max`, `next`, `oct`, `ord`, `pow`, `print`, `repr`, `reversed`, `round`, `sorted`, `sum`, `type`, `zip`.
 - **Available modules**: `asyncio`, `datetime`, `json`, `math`, `re`, `sys`, `os.path`, `typing` (limited).
+- **Auto-imported modules**: `asyncio`, `json`, `re`, `math`, `datetime`, `sys` are automatically imported when the code references `module.` without a matching import in the same block (WI#364). Explicit imports still work and take precedence.
 - **String methods, list methods, dict methods**: All work normally.
 - For dates, use `import datetime`. For JSON, use `import json` or work with dicts directly (tool results are already Python objects). For CSV parsing, split strings manually. For HTTP, use `await http()`.
