@@ -741,7 +741,9 @@ Wasmtime/WASI 36.0.18 — see Crate Security Re-Audit). The
 untouched by the sweep, then upgraded separately for the rustls advisories
 with its Dockerfile digest refreshed. External worker pins: kimi-code
 advanced to 2.2.0; opencode v1.18.25 and the Pebble upstream ref are
-unchanged; opencode2's v2.0.26 bump remains gated per WI#357.
+unchanged; opencode2 stays v2.0.24 — the WI#357 gate was lifted on
+2026-10-17 and the upgrade (now targeting v2.0.32) is pending as its own
+task.
 
 A crates.io mass-yank forced one late major bump (WI#417, closed
 2026-10-16): every `zip` release below 9.0.3 was yanked on 2026-10-16
