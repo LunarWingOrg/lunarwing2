@@ -2232,6 +2232,17 @@ tenant_cat() {  # <tenant> <file>
   fi
 }
 
+# chmod as the tenant: chmod follows symlinks, so running it as root on a
+# tenant-writable path could change an attacker-chosen file's mode (WI#390).
+tenant_chmod() {  # <tenant> <mode> <file>
+  local name="$1" mode="$2" path="$3"
+  if [[ "$(id -un)" == "$name" ]]; then
+    chmod "$mode" -- "$path"
+  else
+    sudo -u "$name" chmod "$mode" -- "$path"
+  fi
+}
+
 patch_ssh_tool_allowlist() {
   local name="$1" caps_path hosts_json
   caps_path="$(tenant_state_dir "$name")/tools/ssh-tool.capabilities.json"
@@ -2369,9 +2380,11 @@ provision_tenant_ssh_key() {
 
   # Stage the private key for upload (mode 0600, tenant-owned).
   # Deleted by upload_tenant_ssh_key after the daemon ingests it.
+  # The tenant-side cp creates the file tenant-owned, so no root chown is
+  # needed; a root chown here would follow a symlink swapped in by the tenant
+  # (WI#416).
   sudo -u "$name" cp "$key_path" "$staged_key"
   sudo -u "$name" chmod 600 "$staged_key"
-  chown "$name:$name" "$staged_key"
   say "staged SSH private key for upload to secrets store"
 }
 
