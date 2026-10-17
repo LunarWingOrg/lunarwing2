@@ -1,11 +1,14 @@
 [advisories]
 # WI#360 (2026-10-17): unsound is a separate cargo-deny 0.20.2 scope whose
 # default is "workspace" (direct deps of workspace members only). With that
-# default, transitive unsound advisories never fire in any gate. Set "all" so
-# the ic and satellite sweeps see every unsound finding, including atty
-# (RUSTSEC-2021-0145, Windows-only unaligned read, reached transitively via
-# the vendored libsignal-protocol dev-dep env_logger 0.6.2). The entry is
-# explicitly ignored below with its own clearing owner.
+# default, transitive unsound advisories never fire in any gate. Set "all"
+# so every unsound finding must now be fixed, or accepted with an ID ignore
+# plus a [bans] restriction that limits the acceptance to the specific
+# crate and graph position it applies to — including atty
+# (RUSTSEC-2021-0145, Windows-only unaligned read, reached transitively
+# via the vendored libsignal-protocol dev-dep env_logger 0.6.2). The entry
+# is explicitly ignored below with its own clearing owner and a [bans]
+# restriction limiting atty to env_logger and env_logger to libsignal-protocol.
 unmaintained = "workspace"
 unsound = "all"
 yanked = "deny"
@@ -144,11 +147,15 @@ ignore = [
     # production edge. Production-graph absence is enforced by
     # .gitlab/scripts/check-lockfile-only-advisories.sh (atty, no-dev mode,
     # RUSTSEC-2021-0145): it fails if atty ever resolves into a non-dev
-    # build graph and goes stale if the pin leaves the lockfile.
+    # build graph and goes stale if the pin leaves the lockfile. The
+    # [bans] section limits the acceptance to this exact graph position
+    # (atty only under env_logger, env_logger <0.10.0 only under the
+    # vendored libsignal-protocol).
     # Clearing owner: WI#367 (libsignal-protocol dev-dep chain port; same
-    # owner as failure/rental above — the same vendored-wrapper port
-    # removes env_logger 0.6.2 and with it atty).
-    { id = "RUSTSEC-2021-0145", reason = "atty 0.2.14 unsound (Windows-only unaligned read, no patched release); dev-graph only via vendored libsignal-protocol dev-dep env_logger 0.6.2; production-graph absence enforced by check-lockfile-only-advisories.sh no-dev; clearing owner WI#367" },
+    # owner as failure/rental above — clearing also drops the env_logger
+    # 0.6.2 dev-dep edge, which removes atty from the lock; the JH-2
+    # review extends WI#367's summary and acceptance criteria to atty).
+    { id = "RUSTSEC-2021-0145", reason = "atty 0.2.14 unsound (Windows-only unaligned read, no patched release); dev-graph only via vendored libsignal-protocol dev-dep env_logger 0.6.2; production-graph absence enforced by check-lockfile-only-advisories.sh no-dev; [bans] restricts atty to env_logger and env_logger <0.10.0 to libsignal-protocol; clearing owner WI#367" },
 ]
 
 [licenses]
@@ -198,6 +205,14 @@ deny = [
     { name = "rustls-webpki", version = ">0.102.8, <0.103.0" },
     # Only libsql may depend directly on this legacy TLS-chain root.
     { name = "hyper-rustls", version = "=0.25.0", wrappers = ["libsql"] },
+    # WI#360 (JH-1): the RUSTSEC-2021-0145 ignore is keyed by ID, so it would
+    # also accept atty in any other root or graph position. Only the vendored
+    # libsignal-protocol dev-dep env_logger 0.6.2 may pull it. Per the
+    # crates.io index only env_logger 0.5.2–0.9.3 depends on atty, so
+    # "<0.10.0" covers every atty-pulling release; the older pre-0.5.2
+    # releases are banned too, which fails closed.
+    { name = "atty", wrappers = ["env_logger"] },
+    { name = "env_logger", version = "<0.10.0", wrappers = ["libsignal-protocol"] },
 ]
 
 [sources]
