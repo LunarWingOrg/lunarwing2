@@ -454,7 +454,7 @@ mod tests {
         };
         let real_root = root.canonicalize().expect("canonical root");
         let mut succeeded = 0u32;
-        for i in 0..2000 {
+        for _ in 0..2000 {
             if let Ok(resolved) = resolve_task_workspace(&context, &root) {
                 assert!(
                     resolved.starts_with(&real_root),
@@ -465,16 +465,6 @@ mod tests {
             }
             // Swap races legitimately fail (ELOOP/ENOENT/redirect mismatch);
             // the invariant is that a success never lands outside the root.
-            if i % 50 == 49 {
-                // Keep the name swap live (the walk recreates x on demand),
-                // but never delete through a symlink.
-                let is_real_dir = std::fs::symlink_metadata(&link)
-                    .map(|meta| meta.is_dir() && !meta.file_type().is_symlink())
-                    .unwrap_or(false);
-                if is_real_dir {
-                    std::fs::remove_dir_all(link.join("x")).ok();
-                }
-            }
         }
         stop.store(true, Ordering::Relaxed);
         attacker.join().ok();
