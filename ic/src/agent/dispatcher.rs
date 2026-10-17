@@ -1081,7 +1081,13 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
 
         // Handle approval if a tool needed it
         if let Some((approval_idx, tc, tool, allow_always)) = approval_needed {
-            let display_params = redact_params(&tc.arguments, tool.sensitive_params());
+            // Run-131 IM-1: the v1 approval prompt is the same display surface as
+            // the v2 gate prompt (WI#392 FI-5); http declares no sensitive_params.
+            let display_params = crate::tools::redact_display_params(
+                &tc.name,
+                &tc.arguments,
+                tool.sensitive_params(),
+            );
             let pending = PendingApproval {
                 request_id: Uuid::new_v4(),
                 tool_name: tc.name.clone(),
@@ -2191,6 +2197,97 @@ mod tests {
                 cache_creation_input_tokens: 0,
             })
         }
+    }
+
+    /// Run-131 IM-1: an LLM that calls `http` with a manual credential.
+    struct HttpCredentialCallProvider;
+
+    #[async_trait]
+    impl LlmProvider for HttpCredentialCallProvider {
+        fn model_name(&self) -> &str {
+            "http-credential-call"
+        }
+
+        fn cost_per_token(&self) -> (Decimal, Decimal) {
+            (Decimal::ZERO, Decimal::ZERO)
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, crate::error::LlmError> {
+            Ok(CompletionResponse {
+                content: "done".to_string(),
+                input_tokens: 0,
+                output_tokens: 1,
+                finish_reason: FinishReason::Stop,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })
+        }
+
+        async fn complete_with_tools(
+            &self,
+            _request: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, crate::error::LlmError> {
+            Ok(ToolCompletionResponse {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: crate::llm::generate_tool_call_id(0, 0),
+                    name: "http".to_string(),
+                    arguments: serde_json::json!({
+                        "method": "GET",
+                        "url": "https://api.example.com/v1?api_key=v1-query-secret&page=2",
+                        "headers": {"Authorization": "Bearer v1-header-secret"},
+                    }),
+                    reasoning: None,
+                }],
+                input_tokens: 0,
+                output_tokens: 1,
+                finish_reason: FinishReason::ToolUse,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn v1_http_approval_display_redacts_credentials() {
+        use crate::channels::IncomingMessage;
+        use crate::llm::ChatMessage;
+        use tokio::sync::Mutex;
+
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register_sync(Arc::new(crate::tools::builtin::HttpTool::new()));
+        let agent = make_test_agent_with_runtime(tools, Arc::new(HttpCredentialCallProvider));
+        let session = Arc::new(Mutex::new(Session::new("test-user")));
+        let thread_id = {
+            let mut sess = session.lock().await;
+            sess.create_thread().id
+        };
+        let message = IncomingMessage::new("test", "test-user", "call the api");
+        let result = agent
+            .run_agentic_loop(
+                &message,
+                session,
+                thread_id,
+                vec![ChatMessage::user("call the api")],
+            )
+            .await
+            .expect("loop runs");
+        let super::AgenticLoopResult::NeedApproval { pending } = result else {
+            panic!("a credential-bearing http call must need approval");
+        };
+        // Execution keeps the real parameters...
+        assert_eq!(
+            pending.parameters["headers"]["Authorization"],
+            "Bearer v1-header-secret"
+        );
+        // ...while the approval prompt copy is redacted.
+        let shown = pending.display_parameters.to_string();
+        assert!(!shown.contains("v1-header-secret"), "{shown}");
+        assert!(!shown.contains("v1-query-secret"), "{shown}");
+        assert!(shown.contains("page=2"), "{shown}");
     }
 
     #[tokio::test]

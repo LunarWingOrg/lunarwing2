@@ -446,7 +446,9 @@ impl StatusUpdate {
     ///
     /// On failure, serializes the tool's input parameters as pretty JSON after
     /// replacing any keys listed in the tool's `sensitive_params()` with
-    /// `"[REDACTED]"`. On success, no parameters or error are included.
+    /// `"[REDACTED]"` (plus the shared http-surface redaction for
+    /// `http`/`web_fetch`, which declare no sensitive params — run-131 IM-1).
+    /// On success, no parameters or error are included.
     ///
     /// Pass the resolved `Tool` reference (if available) so this method can
     /// query `sensitive_params()` directly — callers don't need to manage the
@@ -459,16 +461,19 @@ impl StatusUpdate {
     ) -> Self {
         let success = result.is_ok();
         let sensitive = tool.map(|t| t.sensitive_params()).unwrap_or(&[]);
+        // Run-131 IM-1: http declares no sensitive_params, so the failure
+        // status needs the shared http-surface redaction too (WI#392 FI-5).
+        let parameters = if !success {
+            let safe = crate::tools::redact_display_params(&name, params, sensitive);
+            Some(serde_json::to_string_pretty(&safe).unwrap_or_else(|_| safe.to_string()))
+        } else {
+            None
+        };
         Self::ToolCompleted {
             name,
             success,
             error: result.as_ref().err().map(|e| e.to_string()),
-            parameters: if !success {
-                let safe = crate::tools::redact_params(params, sensitive);
-                Some(serde_json::to_string_pretty(&safe).unwrap_or_else(|_| safe.to_string()))
-            } else {
-                None
-            },
+            parameters,
         }
     }
 }
@@ -616,6 +621,36 @@ mod tests {
         fn sensitive_params(&self) -> &[&str] {
             &["value"]
         }
+    }
+
+    #[test]
+    fn tool_completed_redacts_http_credentials_on_failure() {
+        // Run-131 IM-1: http declares no sensitive_params; the v1 failure
+        // status must still not echo the Authorization header or URL key.
+        let params = serde_json::json!({
+            "method": "GET",
+            "url": "https://api.example.com/x?api_key=status-query-secret",
+            "headers": {"Authorization": "Bearer status-header-secret"},
+        });
+        let err: Result<String, crate::error::Error> =
+            Err(crate::error::ToolError::ExecutionFailed {
+                name: "http".into(),
+                reason: "timeout".into(),
+            }
+            .into());
+        let tool = crate::tools::builtin::HttpTool::new();
+        let status = StatusUpdate::tool_completed(
+            "http".into(),
+            &err,
+            &params,
+            Some(&tool as &dyn crate::tools::Tool),
+        );
+        let StatusUpdate::ToolCompleted { parameters, .. } = &status else {
+            panic!("expected ToolCompleted");
+        };
+        let shown = parameters.as_deref().expect("failure shows parameters");
+        assert!(!shown.contains("status-query-secret"), "{shown}");
+        assert!(!shown.contains("status-header-secret"), "{shown}");
     }
 
     #[test]

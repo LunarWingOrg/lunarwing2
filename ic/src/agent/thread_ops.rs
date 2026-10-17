@@ -23,7 +23,7 @@ use crate::context::JobContext;
 use crate::error::Error;
 use crate::llm::{ChatMessage, ToolCall};
 use crate::tools::permissions::PermissionState;
-use crate::tools::redact_params;
+use crate::tools::redact_display_params;
 
 const FORGED_THREAD_ID_ERROR: &str = "Invalid or unauthorized thread ID.";
 
@@ -1849,7 +1849,11 @@ impl Agent {
                     request_id: Uuid::new_v4(),
                     tool_name: tc.name.clone(),
                     parameters: tc.arguments.clone(),
-                    display_parameters: redact_params(&tc.arguments, tool.sensitive_params()),
+                    display_parameters: redact_display_params(
+                        &tc.name,
+                        &tc.arguments,
+                        tool.sensitive_params(),
+                    ),
                     description: self
                         .tools()
                         .approval_description(

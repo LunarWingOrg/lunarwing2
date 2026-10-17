@@ -8,11 +8,10 @@
 # (cargo-deny-check.sh, check-satellite-advisories.sh) run
 # --workspace --all-features with the same ID-keyed ignores, so a regression
 # that pulls the legacy chain back into default builds — restoring libsql's
-# "remote" feature, or a new dependency on hyper-rustls 0.25 — stays
-# invisible while every gate is green and the deny.toml reason strings
-# ("default builds cleared by feature gate") silently become false. Every
-# shipped build path uses default features, so this default-graph pin is the
-# regression alarm for the whole mitigation.
+# "remote" feature — is invisible to the ID-keyed ignores and the deny.toml
+# reason strings ("default builds cleared by feature gate") become false.
+# WI#418 bans now restrict other versions/parents, while this guard checks
+# the accepted pins' default-feature reachability and shipped build flags.
 #
 # Contract per entry:
 #   * The vulnerable version pin must still exist in ic/Cargo.lock: the
@@ -83,6 +82,25 @@ for root in "${lock_roots[@]}"; do
             failed=1
         fi
     done
+done
+
+# WI#418 condition 1 (IS-2): shipped builds must not enable the opt-in chain.
+# This textual tripwire cannot resolve variable indirection; the build paths
+# and their effective flags must also be reviewed at every release.
+shipped_builds=(
+    "ic/Dockerfile"
+    "ic/Dockerfile.worker"
+    "ic/scripts/mt-admin-lib/05-tenant-build.sh"
+    "scripts/build-lunarwing.sh"
+)
+for build in "${shipped_builds[@]}"; do
+    if [[ ! -f "$repo_root/$build" ]]; then
+        echo "ERROR: shipped build path $build is missing; update the WI#418 condition-1 list." >&2
+        failed=1
+    elif grep -n -E 'libsql-remote-replica|--all-features' "$repo_root/$build" >&2; then
+        echo "ERROR: $build enables the opt-in libsql-remote-replica chain (WI#418 condition 1)." >&2
+        failed=1
+    fi
 done
 
 if ((failed)); then

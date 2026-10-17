@@ -11,6 +11,8 @@ that regression because every deny gate queries --workspace --all-features
 These tests drive the real script with stub git/taskset/cargo shims: safe
 resolved graphs pass, unsafe graphs and failed resolution fail closed, and
 missing pins fail as stale. Both roots must use their vendored, locked graph.
+WI#418 also pins the shipped build commands: a clean default graph cannot
+detect a build explicitly enabling the opt-in chain.
 """
 
 import os
@@ -24,6 +26,12 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / ".gitlab" / "scripts" / "check-default-graph-advisories.sh"
+SHIPPED_BUILDS = (
+    "ic/Dockerfile",
+    "ic/Dockerfile.worker",
+    "ic/scripts/mt-admin-lib/05-tenant-build.sh",
+    "scripts/build-lunarwing.sh",
+)
 
 LOCK_TEMPLATE = """version = 4
 [[package]]
@@ -88,6 +96,10 @@ class DefaultGraphAdvisoryGuardTests(unittest.TestCase):
             shim = bin_dir / name
             shim.write_text(text, encoding="utf-8")
             shim.chmod(shim.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        for build in SHIPPED_BUILDS:
+            path = self.root / build
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("cargo build --release --bin lunarwing\n", encoding="utf-8")
 
     def write_ic_lock(self, entries):
         (self.root / "ic" / "Cargo.lock").write_text(
@@ -142,6 +154,41 @@ class DefaultGraphAdvisoryGuardTests(unittest.TestCase):
             self.assertIn(f"--manifest-path {cwd}/Cargo.toml", args)
             self.assertNotIn("--all-features", args)
             self.assertNotIn("--no-default-features", args)
+
+    def test_shipped_build_enabling_the_opt_in_feature_fails(self):
+        # IS-2: both default graphs remain clean while a shipped build opts
+        # in explicitly, either by feature name or via --all-features.
+        self.real_ic_lock_pins()
+        for build in SHIPPED_BUILDS:
+            for flag in ("--features libsql-remote-replica", "--all-features"):
+                with self.subTest(build=build, flag=flag):
+                    path = self.root / build
+                    clean = path.read_text(encoding="utf-8")
+                    try:
+                        path.write_text(
+                            f"cargo build --release --bin lunarwing {flag}\n", encoding="utf-8"
+                        )
+                        result = self.run_guard()
+                    finally:
+                        path.write_text(clean, encoding="utf-8")
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn(build, result.stderr)
+                    self.assertIn("WI#418 condition 1", result.stderr)
+
+    def test_missing_shipped_build_path_fails(self):
+        self.real_ic_lock_pins()
+        for build in SHIPPED_BUILDS:
+            with self.subTest(build=build):
+                path = self.root / build
+                clean = path.read_text(encoding="utf-8")
+                try:
+                    path.unlink()
+                    result = self.run_guard()
+                finally:
+                    path.write_text(clean, encoding="utf-8")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(build, result.stderr)
+                self.assertIn("condition-1 list", result.stderr)
 
     def test_legacy_chain_in_default_graph_fails(self):
         # The CZ-1 regression: something re-enables libsql's remote surface

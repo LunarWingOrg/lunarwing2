@@ -1502,7 +1502,10 @@ impl EffectBridgeAdapter {
         }
 
         let redacted_params = if let Some(tool) = self.tools.get(lookup_name).await {
-            crate::tools::redact_params(&parameters, tool.sensitive_params())
+            // WI#392 (FI-5): http/web_fetch declare no sensitive_params, so
+            // the hook payload also needs the shared http-surface redaction
+            // (credential headers, URL query credentials, body credentials).
+            crate::tools::redact_display_params(lookup_name, &parameters, tool.sensitive_params())
         } else {
             parameters.clone()
         };
@@ -5788,6 +5791,92 @@ FINAL(("callable" if info["callable"] else "not-callable") + "|" + missions[0]["
         assert!(!hook_params.to_string().contains("super-secret-value"));
         assert!(!hook_params.to_string().contains("super-secret-2"));
         assert_eq!(hook_params["name"], "hooky");
+    }
+
+    /// WI#392 (FI-5): the http tool declares no sensitive_params, so without
+    /// the shared http-surface redaction the `ToolCall` hook payload carried
+    /// raw `Authorization` headers and `?api_key=…` URLs.
+    struct FakeHttpTool;
+
+    #[async_trait]
+    impl Tool for FakeHttpTool {
+        fn name(&self) -> &str {
+            "http"
+        }
+
+        fn description(&self) -> &str {
+            "test double for the http surface"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &JobContext,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::success(
+                serde_json::json!({"ok": true}),
+                std::time::Duration::from_millis(1),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn http_hooks_run_with_credentials_redacted() {
+        let hooks = Arc::new(HookRegistry::default());
+        let probe = Arc::new(MissionHookProbe::default());
+        hooks.register(probe.clone()).await;
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(FakeHttpTool)).await;
+        let adapter = EffectBridgeAdapter::new(
+            tools,
+            Arc::new(SafetyLayer::new(&lunarwing_safety::SafetyConfig {
+                max_output_length: 10_000,
+                injection_check_enabled: false,
+            })),
+            hooks,
+        );
+
+        let params = serde_json::json!({
+            "method": "GET",
+            "url": "https://api.example.com/data?api_key=hook-secret&page=2",
+            "headers": {"Authorization": "Bearer hook-header-secret", "Accept": "text/html"},
+        });
+        let result = adapter
+            .execute_action(
+                "http",
+                params,
+                &lease(),
+                &exec_ctx(lunarwing_engine::ThreadId::new(), None),
+            )
+            .await
+            .expect("http executes");
+        assert!(!result.is_error);
+
+        let seen = probe.seen.lock().expect("probe lock");
+        let (tool_name, hook_params) = seen
+            .iter()
+            .find(|(name, _)| name == "http")
+            .expect("the hook saw the http call");
+        assert_eq!(tool_name, "http");
+        let serialized = hook_params.to_string();
+        assert!(
+            !serialized.contains("hook-secret"),
+            "url credential leaked: {serialized}"
+        );
+        assert!(
+            !serialized.contains("hook-header-secret"),
+            "header credential leaked: {serialized}"
+        );
+        assert_eq!(hook_params["headers"]["Authorization"], "[REDACTED]");
+        assert_eq!(hook_params["headers"]["Accept"], "text/html");
+        assert!(
+            hook_params["url"].as_str().expect("url").contains("page=2"),
+            "safe query param dropped: {serialized}"
+        );
     }
 
     #[tokio::test]

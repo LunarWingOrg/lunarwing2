@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Advisory sweep over EVERY manifest root with a committed Cargo.lock.
+# Advisory and bans sweep over EVERY manifest root with a committed Cargo.lock.
 #
 # The main cargo-deny job (.gitlab/scripts/cargo-deny-check.sh) gates the ic
 # workspace. This sweep makes the release-audit claim "every committed
@@ -10,9 +10,11 @@
 # unix-socket-client) and the root-level workers/sidecars alike. A new
 # satellite root is picked up automatically; removing one shrinks the sweep.
 #
-# Scope is `check advisories` only: bans/licenses/sources policy is owned by
-# the ic workspace gate. The manifest-less pebble4lunarwing/upstream lock is
-# skipped here; its reviewed override delta is gated by
+# Scope includes advisories and bans (WI#418 IS-1): the ID-keyed ignores
+# require the same version/parent restrictions in every manifest root.
+# Licenses/sources policy stays with the ic workspace gate. The manifest-less
+# pebble4lunarwing/upstream lock is skipped here; its reviewed override delta
+# is gated by
 # pebble4lunarwing/scripts/verify_upstream_lock.py.
 set -euo pipefail
 
@@ -44,7 +46,7 @@ while IFS= read -r lock; do
         --manifest-path "$repo_root/$root/Cargo.toml" \
         --config "$config_file" \
         --workspace --all-features \
-        check advisories --hide-inclusion-graph 2>&1) || {
+        check advisories bans --hide-inclusion-graph 2>&1) || {
         echo "FAIL $root"
         echo "$out" | tail -n 20
         failed=1

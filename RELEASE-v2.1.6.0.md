@@ -335,9 +335,12 @@ one unsound notice, and two unmaintained notices** (eleven IDs) ship
 accepted via `ic/deny.toml`, each with recorded exposure and a clearing
 owner (rsa rides WI#368; `failure`/`rental` ride WI#367; the seven libsql
 0.6.0 legacy-chain acceptances — four rustls-webpki 0.102, the h2 0.3.27
-pin, and the rustls 0.22.4 pair — ride WI#418, filed because the WI#331
-mitigation decision and the WI#409 acceptance record both closed without
-clearing the chain). After the WI#331 gate, exactly one vulnerability (rsa
+pin, and the rustls 0.22.4 pair — ride WI#418, whose standing decision
+record `docs/ops/v2.1.6.0_WI418_LIBSQL_LEGACY_CHAIN.md` (2026-10-16)
+adopts the WI#331 feature gate as the long-term mitigation after
+re-confirming upstream — libsql 0.10.0 went stable 2026-10-13 and still
+pins hyper-rustls ^0.25 — so a bump still clears nothing). After the
+WI#331 gate, exactly one vulnerability (rsa
 via russh) compiles into default builds; the webpki/h2 chain and the
 accepted rustls 0.22.4 advisories are opt-in only. No unaccounted advisory
 exists in any committed lockfile.
@@ -820,7 +823,10 @@ default builds (clearing tracked as WI#368); the rustls-webpki 0.102 /
 h2 0.3 chain and the accepted rustls 0.22.4 pair (RUSTSEC-2026-0346/0349)
 exist only in opt-in `libsql-remote-replica` builds, and their clearing is
 owned by WI#418 — the WI#331 mitigation decision and the WI#409 acceptance
-record are both closed without the chain being cleared.
+record are both closed without the chain being cleared, so the open WI#418
+standing decision record (`docs/ops/v2.1.6.0_WI418_LIBSQL_LEGACY_CHAIN.md`,
+2026-10-16) re-homes the seven acceptances, adopts the feature gate as the
+long-term mitigation, and owns their per-release re-verification.
 
 **Known issues / open at release.** Reconciled per item in
 `docs/ops/v2.1.6.0_OPEN_WORK_ITEMS_STATUS.md`, a 2026-10-14 01:05Z snapshot
