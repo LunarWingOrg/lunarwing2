@@ -817,12 +817,12 @@
     - **AC 3 (tenant, rebuilt image):** real job driven end-to-end (gateway `POST /api/chat/send` → agent `create_job` → approval gate approved via `/api/chat/approval` → WSS bridge → kimi-code 2.2.0 in the deployed container). For request observation without touching the remote gateway host, the verification run pointed `KIMI_BASE_URL` at a host-side transparent forwarder in front of the same gateway (`host.containers.internal:13099` → `192.168.1.157:3000`, bodies unchanged); endpoint restored to the direct gateway and the worker recreated afterwards (final runtime config re-verified). On the wire: `POST /openai/v1/chat/completions`, UA `kimi-code-cli/2.2.0`, model `tensorzero::function_name::FrontierCODEK`, `reasoning_effort` set, **`"max_tokens": 131072`** — the key the promoted image omits; the CLI's own session wire log agrees (`llm.request maxTokens=131072`). Response HTTP 200, 845,444 bytes streamed over 178.5 s, `outputTokens=2095`, completed normally; job output a complete, untruncated 1,447-word essay ending in a proper conclusion; job state `completed`. Benign observation recorded on the WI: one 30 s WI#324 MCP tool-proxy init timeout on worker boot; the turn still ran with `toolCount=25` and completed.
 58. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/396
 59. [x] (S) note for me to go over all reserved items and older notes
-60. [x] (S) reservist
-61. [x] (S) reservist
-62. [x] (S) reservist
-63. [x] (S) reservist
-64. [x] (S) reservist
-65. [x] (S) reservist
+60. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/360
+61. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/361
+62. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/363
+63. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/364
+64. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/369
+65. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/371
 66. [x] (S) reservist
 67. [x] (S) reservist
 68. [x] (S) reservist
