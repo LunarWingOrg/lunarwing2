@@ -356,6 +356,23 @@ impl ChannelStoreData {
             "WASM http_request called"
         );
 
+        // A placeholder value with '#' or an ASCII control character cannot
+        // be substituted into a URL intact: the WHATWG parser cuts the URL at
+        // '#' and drops tab and newline, so the upstream receives (and can
+        // echo) a piece of the secret that no needle matches. Such a
+        // substitution never delivered the credential intact, so refusing it
+        // loses nothing (WI#408, run-143 JQ).
+        let unsafe_in_url = self.credentials.iter().any(|(name, value)| {
+            url.contains(&format!("{{{name}}}"))
+                && value.chars().any(|c| c == '#' || c.is_ascii_control())
+        });
+        if unsafe_in_url {
+            return Err(
+                "HTTP not allowed: a credential placeholder value cannot be placed in a URL"
+                    .to_string(),
+            );
+        }
+
         // Inject credentials into URL (e.g., replace {XMPP_PASSWORD} with actual token)
         let injected_url = self.inject_credentials(&url, "url");
 
@@ -364,11 +381,23 @@ impl ChannelStoreData {
         tracing::info!(url_changed = url_changed, "URL after credential injection");
         self.last_http_exchange_had_credentials = url_changed;
 
-        // Check if HTTP is allowed for this URL. The deny reason can quote
-        // the injected URL; it is redacted at the trait boundary (WI#408).
-        self.host_state
-            .check_http_allowed(&injected_url, &method)
-            .map_err(|e| format!("HTTP not allowed: {}", e))?;
+        // Check if HTTP is allowed for this URL. The deny reason quotes
+        // parsed URL parts (percent-decoded, Debug-escaped, cut at '#' or
+        // '?', host lowercased), which are spellings of an injected
+        // placeholder that no needle matches. When a placeholder was
+        // injected, the reason is taken from the guest's own URL instead
+        // (WI#408, run-143 JQ).
+        if let Err(reason) = self.host_state.check_http_allowed(&injected_url, &method) {
+            let reason = if url_changed {
+                self.host_state
+                    .check_http_allowed(&url, &method)
+                    .err()
+                    .unwrap_or_else(|| "URL with injected credentials is not allowed".to_string())
+            } else {
+                reason
+            };
+            return Err(format!("HTTP not allowed: {}", reason));
+        }
 
         // Record the request for rate limiting
         self.host_state
@@ -526,7 +555,7 @@ impl ChannelStoreData {
             let body = response
                 .bytes()
                 .await
-                .map_err(|e| format!("Failed to read response body: {}", e))?;
+                .map_err(|e| format!("Failed to read response body: {}", e.without_url()))?;
             if body.len() > max_response {
                 return Err(format!(
                     "Response body too large: {} bytes exceeds limit of {} bytes",
@@ -3679,6 +3708,14 @@ fn encoded_spellings(secret: &str) -> Vec<String> {
         parsed.set_path(secret);
         out.push(parsed.path().trim_start_matches('/').to_string());
     }
+    // An upstream that parses a raw-substituted query placeholder reads '+'
+    // as a space and decodes %XX escapes; echoing the parsed value gives
+    // these spellings (run-143 JQ).
+    for candidate in [secret.replace('+', " "), secret.to_string()] {
+        if let Ok(decoded) = urlencoding::decode(&candidate) {
+            out.push(decoded.into_owned());
+        }
+    }
     out.retain(|spelling| !spelling.is_empty() && spelling != secret);
     out.sort();
     out.dedup();
@@ -3738,24 +3775,39 @@ fn guest_response_headers(headers: &reqwest::header::HeaderMap) -> HashMap<Strin
 }
 
 /// True when response headers are unreadable or declare an opaque body
-/// coding: Content-Encoding allows only identity, Transfer-Encoding only
-/// chunked (hyper removes that framing).
+/// coding: Content-Encoding allows only identity, and Transfer-Encoding
+/// passes only when hyper removes the framing (see
+/// `transfer_coding_keeps_framing`).
 fn guest_body_encoding_is_opaque(headers_json: &str) -> bool {
     let Ok(map) = serde_json::from_str::<HashMap<String, String>>(headers_json) else {
         return true;
     };
     map.iter().any(|(name, value)| {
-        let allowed = if name.eq_ignore_ascii_case("content-encoding") {
-            "identity"
+        if name.eq_ignore_ascii_case("content-encoding") {
+            value.split(',').any(|token| {
+                !token.trim().is_empty() && !token.trim().eq_ignore_ascii_case("identity")
+            })
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
-            "chunked"
+            transfer_coding_keeps_framing(value)
         } else {
-            return false;
-        };
-        value
-            .split(',')
-            .any(|token| !token.trim().is_empty() && !token.trim().eq_ignore_ascii_case(allowed))
+            false
+        }
     })
+}
+
+/// hyper removes exactly one chunked layer, and only when the last list
+/// element of the last Transfer-Encoding field is `chunked`. The guest map
+/// comma-joins the fields in order, so the same rule applies to the joined
+/// value: anything but exactly one `chunked` token in last position leaves
+/// chunk framing or a coding in the body, which can split an echoed
+/// credential past the byte scrub (WI#419 IV-1 parity, run-143 JQ).
+fn transfer_coding_keeps_framing(value: &str) -> bool {
+    let tokens: Vec<&str> = value.split(',').map(str::trim).collect();
+    let non_empty = tokens.iter().filter(|token| !token.is_empty()).count();
+    let last_is_chunked = tokens
+        .last()
+        .is_some_and(|token| token.eq_ignore_ascii_case("chunked"));
+    !(non_empty == 1 && last_is_chunked)
 }
 
 /// Byte-level scrub of every spelling of `secret` (WI#408): response bodies
@@ -6613,7 +6665,10 @@ mod tests {
             "expected an allowlist denial: {err}"
         );
         assert!(!err.contains(SECRET), "{err}");
-        assert!(err.contains("[REDACTED:API_TOKEN]"), "{err}");
+        assert!(
+            err.contains("{API_TOKEN}"),
+            "the deny reason names the placeholder, not the secret: {err}"
+        );
         assert!(
             !logs_contain(SECRET),
             "the deny path must not log the injected URL"
@@ -6962,5 +7017,413 @@ mod tests {
         assert!(needles.contains(&"plainsecret"), "{needles:?}");
         assert!(needles.contains(&basic_token.as_str()), "{needles:?}");
         assert!(!needles.contains(&"abc"), "{needles:?}");
+    }
+    /// Run-143 JQ pins: a raw loopback upstream answers with chosen framing,
+    /// and the injected credential must never reach the guest-facing outcome.
+    mod credential_echo_pins {
+        use std::collections::HashMap;
+        use std::io::{Read, Write};
+        use std::net::{SocketAddr, TcpListener};
+        use std::sync::{Arc, Mutex};
+
+        use super::super::lunarwing::agent::channel_host::Host as _;
+        use super::super::{ChannelStoreData, ResolvedHostCredential, form_encode_secret};
+        use crate::channels::wasm::capabilities::ChannelCapabilities;
+        use crate::pairing::PairingStore;
+        use crate::tools::wasm::{EndpointPattern, HttpCapability};
+
+        const SECRET: &str = "pin~sec*ret+/==Q7";
+
+        fn crlf() -> String {
+            String::from_utf8(vec![13, 10]).expect("ascii")
+        }
+
+        /// Serves `answers` in order, one per connection; records request heads.
+        fn serve(answers: Vec<Vec<u8>>) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let heads = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&heads);
+            std::thread::spawn(move || {
+                for answer in answers {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        return;
+                    };
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(&[13, 10, 13, 10]) {
+                        match stream.read(&mut byte) {
+                            Ok(1) => head.push(byte[0]),
+                            _ => break,
+                        }
+                    }
+                    recorded
+                        .lock()
+                        .expect("lock")
+                        .push(String::from_utf8_lossy(&head).to_string());
+                    let _ = stream.write_all(&answer);
+                    let _ = stream.shutdown(std::net::Shutdown::Write);
+                }
+            });
+            (addr, heads)
+        }
+
+        /// One chunked layer over `parts` (the upstream's own framing).
+        fn chunked(parts: &[&str]) -> String {
+            let nl = crlf();
+            let mut out = String::new();
+            for part in parts {
+                out.push_str(&format!("{:x}{nl}{part}{nl}", part.len()));
+            }
+            out.push_str(&format!("0{nl}{nl}"));
+            out
+        }
+
+        fn response(status: &str, header_lines: &[&str], body: &str) -> Vec<u8> {
+            let nl = crlf();
+            let mut text = format!("HTTP/1.1 {status}{nl}Connection: close{nl}");
+            for line in header_lines {
+                text.push_str(&format!("{line}{nl}"));
+            }
+            text.push_str(&nl);
+            text.push_str(body);
+            text.into_bytes()
+        }
+
+        fn store(credentials: HashMap<String, String>, host_credential: bool) -> ChannelStoreData {
+            let mut query_params = HashMap::new();
+            query_params.insert("api_key".to_string(), SECRET.to_string());
+            let host_credentials = if host_credential {
+                vec![ResolvedHostCredential {
+                    host_patterns: vec!["127.0.0.1".to_string()],
+                    headers: HashMap::new(),
+                    query_params,
+                    secret_value: SECRET.to_string(),
+                }]
+            } else {
+                Vec::new()
+            };
+            let mut capabilities = ChannelCapabilities::for_channel("test");
+            capabilities.tool_capabilities.http = Some(HttpCapability::new(vec![
+                EndpointPattern::host("127.0.0.1"),
+                EndpointPattern::host("localhost"),
+                EndpointPattern::host("api.example.com").with_path_prefix("/allowed/"),
+            ]));
+            ChannelStoreData::new(
+                1024 * 1024,
+                "test",
+                capabilities,
+                credentials,
+                host_credentials,
+                Arc::new(PairingStore::new()),
+            )
+        }
+
+        fn placeholder(value: &str) -> HashMap<String, String> {
+            let mut credentials = HashMap::new();
+            credentials.insert("API_TOKEN".to_string(), value.to_string());
+            credentials
+        }
+
+        /// IO-1: every credential source (host credential, URL placeholder,
+        /// header placeholder) sends exactly one `accept-encoding: identity`
+        /// and no `te`; an ordinary exchange keeps the guest's own header.
+        #[test]
+        fn credentialed_requests_offer_identity_only() {
+            let ok = response("200 OK", &["Content-Length: 2"], "ok");
+            let (addr, heads) = serve(vec![ok.clone(), ok.clone(), ok.clone(), ok]);
+            let guest = r#"{"Accept-Encoding":"gzip","te":"trailers"}"#;
+            let port = addr.port();
+            let runs = [
+                (
+                    store(HashMap::new(), true),
+                    format!("http://127.0.0.1:{port}/a"),
+                    guest.to_string(),
+                ),
+                (
+                    store(placeholder("pin-url-1"), false),
+                    format!("http://localhost:{port}/a?k={{API_TOKEN}}"),
+                    guest.to_string(),
+                ),
+                (
+                    store(placeholder("pin-hdr-1"), false),
+                    format!("http://localhost:{port}/a"),
+                    r#"{"Accept-Encoding":"gzip","te":"trailers","X-Token":"{API_TOKEN}"}"#
+                        .to_string(),
+                ),
+                (
+                    store(HashMap::new(), true),
+                    format!("http://localhost:{port}/a"),
+                    guest.to_string(),
+                ),
+            ];
+            for (mut store, url, headers) in runs {
+                assert!(
+                    store
+                        .http_request("GET".to_string(), url, headers, None, Some(5000))
+                        .is_ok()
+                );
+            }
+            let heads = heads.lock().expect("lock").clone();
+            let field = |head: &str, name: &str| -> Vec<String> {
+                head.lines()
+                    .filter(|l| {
+                        l.split_once(':')
+                            .is_some_and(|(n, _)| n.trim().eq_ignore_ascii_case(name))
+                    })
+                    .map(|l| l.to_ascii_lowercase())
+                    .collect()
+            };
+            for head in &heads[..3] {
+                assert_eq!(
+                    field(head, "accept-encoding"),
+                    vec!["accept-encoding: identity".to_string()],
+                    "{head}"
+                );
+                assert!(field(head, "te").is_empty(), "{head}");
+            }
+            assert_eq!(
+                field(&heads[3], "accept-encoding"),
+                vec!["accept-encoding: gzip".to_string()],
+                "{}",
+                heads[3]
+            );
+        }
+
+        /// IO-1 + framing: encoded bodies and every chunk framing hyper does
+        /// not fully remove are refused on a credentialed exchange; a single
+        /// `chunked` layer is de-chunked and scrubbed.
+        #[test]
+        fn credentialed_opaque_or_framed_bodies_are_refused() {
+            let form = form_encode_secret(SECRET);
+            let (half1, half2) = form.split_at(form.len() / 2);
+            let echo1 = format!("echo={half1}");
+            let echo2 = format!("{half2};end");
+            let ok = "200 OK";
+            let one = chunked(&[&echo1, &echo2]);
+            let two = chunked(&[&one]);
+            let refused: Vec<(&str, Vec<u8>)> = vec![
+                (
+                    "gzip",
+                    response(ok, &["Content-Encoding: gzip", "Content-Length: 4"], "abcd"),
+                ),
+                (
+                    "identity, gzip",
+                    response(
+                        ok,
+                        &["Content-Encoding: identity, gzip", "Content-Length: 4"],
+                        "abcd",
+                    ),
+                ),
+                (
+                    "gzip then identity fields",
+                    response(
+                        ok,
+                        &[
+                            "Content-Encoding: gzip",
+                            "Content-Encoding: identity",
+                            "Content-Length: 4",
+                        ],
+                        "abcd",
+                    ),
+                ),
+                (
+                    "gzip, chunked",
+                    response(
+                        ok,
+                        &["Transfer-Encoding: gzip, chunked"],
+                        &chunked(&["abcd"]),
+                    ),
+                ),
+                (
+                    "chunked,",
+                    response(ok, &["Transfer-Encoding: chunked,"], &one),
+                ),
+                (
+                    "chunked, chunked",
+                    response(ok, &["Transfer-Encoding: chunked, chunked"], &two),
+                ),
+                (
+                    "two chunked fields",
+                    response(
+                        ok,
+                        &["Transfer-Encoding: chunked", "Transfer-Encoding: chunked"],
+                        &two,
+                    ),
+                ),
+                (
+                    "chunked + empty field",
+                    response(
+                        ok,
+                        &["Transfer-Encoding: chunked", "Transfer-Encoding: "],
+                        &one,
+                    ),
+                ),
+            ];
+            let mut nonutf8 = response(ok, &["Content-Length: 4"], "abcd");
+            let at = nonutf8
+                .windows(2)
+                .position(|w| w == [13, 10])
+                .expect("status line")
+                + 2;
+            let mut field = b"Content-Encoding: gzip".to_vec();
+            field.extend_from_slice(&[0xff, 13, 10]);
+            nonutf8.splice(at..at, field);
+            let mut answers: Vec<Vec<u8>> = refused.iter().map(|(_, a)| a.clone()).collect();
+            answers.push(nonutf8);
+            answers.push(response(ok, &["Transfer-Encoding: chunked"], &one));
+            answers.push(response(
+                ok,
+                &["Content-Encoding: gzip", "Content-Length: 0"],
+                "",
+            ));
+            let (addr, _) = serve(answers);
+            let mut labels: Vec<&str> = refused.iter().map(|(l, _)| *l).collect();
+            labels.push("non-UTF-8 content-encoding");
+            for label in labels {
+                let outcome = store(HashMap::new(), true).http_request(
+                    "GET".to_string(),
+                    format!("http://{addr}/r"),
+                    "{}".to_string(),
+                    None,
+                    Some(5000),
+                );
+                match outcome {
+                    Err(e) => assert!(
+                        e.contains("encoded body cannot be inspected"),
+                        "{label}: {e}"
+                    ),
+                    Ok(resp) => panic!(
+                        "{label}: delivered {:?}",
+                        String::from_utf8_lossy(&resp.body)
+                    ),
+                }
+            }
+            let resp = store(HashMap::new(), true)
+                .http_request(
+                    "GET".to_string(),
+                    format!("http://{addr}/r"),
+                    "{}".to_string(),
+                    None,
+                    Some(5000),
+                )
+                .expect("single chunked layer is inspectable");
+            assert_eq!(
+                String::from_utf8_lossy(&resp.body),
+                "echo=[REDACTED:host_credential];end"
+            );
+            // An empty body carries nothing to inspect, whatever its coding.
+            let resp = store(HashMap::new(), true)
+                .http_request(
+                    "GET".to_string(),
+                    format!("http://{addr}/r"),
+                    "{}".to_string(),
+                    None,
+                    Some(5000),
+                )
+                .expect("empty body is exempt");
+            assert!(resp.body.is_empty());
+        }
+
+        /// IO-2: a redirect is returned to the guest, never followed.
+        #[test]
+        fn redirects_are_returned_not_followed() {
+            let (sink, sink_heads) =
+                serve(vec![response("200 OK", &["Content-Length: 4"], "sink")]);
+            let location = format!("Location: http://localhost:{}/sink", sink.port());
+            let (addr, _) = serve(vec![response(
+                "302 Found",
+                &["Content-Length: 0", &location],
+                "",
+            )]);
+            let resp = store(HashMap::new(), true)
+                .http_request(
+                    "GET".to_string(),
+                    format!("http://{addr}/r"),
+                    "{}".to_string(),
+                    None,
+                    Some(5000),
+                )
+                .expect("3xx returned");
+            assert_eq!(resp.status, 302);
+            assert!(
+                sink_heads.lock().expect("lock").is_empty(),
+                "redirect followed"
+            );
+        }
+
+        /// The allowlist deny reason must not quote a placeholder value in a
+        /// parsed spelling (Debug-escaped quote, decoded escape, cut at '#').
+        #[test]
+        fn deny_reason_does_not_quote_placeholder_value() {
+            let quoted = format!("pin{}quo7e", '"');
+            for (value, derived) in [(quoted.as_str(), "quo7e"), ("pin%41pct9", "Apct9")] {
+                let outcome = store(placeholder(value), false).http_request(
+                    "GET".to_string(),
+                    "https://api.example.com/denied/{API_TOKEN}/x".to_string(),
+                    "{}".to_string(),
+                    None,
+                    Some(2000),
+                );
+                let Err(err) = outcome else {
+                    panic!("{value}: allowed")
+                };
+                assert!(!err.contains(derived), "{value}: {err}");
+                assert!(err.contains("{API_TOKEN}"), "{value}: {err}");
+            }
+        }
+
+        /// '#' or a control character in a URL placeholder value would send
+        /// (and let the upstream echo) only part of the secret.
+        #[test]
+        fn url_placeholder_value_that_cannot_survive_parsing_is_refused() {
+            let outcome = store(placeholder("pinpre7#tail"), false).http_request(
+                "GET".to_string(),
+                "http://127.0.0.1:9/x?k={API_TOKEN}".to_string(),
+                "{}".to_string(),
+                None,
+                Some(2000),
+            );
+            let Err(err) = outcome else { panic!("sent") };
+            assert!(err.contains("cannot be placed in a URL"), "{err}");
+        }
+
+        /// Body-read errors carry no URL (reqwest attaches it on decode).
+        #[test]
+        fn body_read_error_carries_no_url() {
+            let (addr, _) = serve(vec![response(
+                "200 OK",
+                &["Content-Length: 100000"],
+                "short",
+            )]);
+            let outcome = store(HashMap::new(), true).http_request(
+                "GET".to_string(),
+                format!("http://{addr}/r"),
+                "{}".to_string(),
+                None,
+                Some(5000),
+            );
+            let Err(err) = outcome else {
+                panic!("truncated body delivered")
+            };
+            assert!(err.contains("Failed to read response body"), "{err}");
+            assert!(!err.contains("for url"), "{err}");
+        }
+
+        /// Parsed-query spellings: an upstream reads '+' as a space and
+        /// decodes escapes in a raw-substituted query placeholder.
+        #[test]
+        fn encoded_spellings_cover_parsed_query_forms() {
+            let spellings = super::super::encoded_spellings("pin+b64/x%41==");
+            assert!(
+                spellings.contains(&"pin b64/xA==".to_string()),
+                "{spellings:?}"
+            );
+            let url_parser = super::super::encoded_spellings("P@ss word!");
+            assert!(
+                url_parser.contains(&"P@ss%20word!".to_string()),
+                "{url_parser:?}"
+            );
+        }
     }
 }
