@@ -267,14 +267,17 @@ the prime suspect, and the fix is the same normalization in the offending
   `kimicode4lunarwing/Dockerfile` (fail-closed, like the bun tie). The tie
   follows the FROM repository's last path segment, so `docker.io/node`, a
   mirror path and the bare `node` spelling are all cross-checked while a
-  `nodejs`-style name still fails closed (MR !1669 review IK-1). The
+  `nodejs`-style name still fails closed (MR !1669 review IK-1). The tie is
+  line-based: a FROM split by a line continuation, or a `FROM ${VAR}` whose
+  `ARG` default drifted, is untied — the same textual-limit class the apt
+  source rules record below (MR !1691 run-137 review IX-6). The
   real-CLI contract lane (`kimi_cli_contract_test`) self-skips here — the
   image carries no kimi binary — so the protected candidate image build
   remains the only place that contract is asserted against the real CLI.
   Like the opencode lane, the script is pinned line-for-line by
   `validate_config.py` (`WORKER_TS_LANE_SCRIPTS`, MR !1644 review HN-5):
   any script edit must update the tuple in the same commit.
-  Both worker TS lanes also have an allowlist of job keywords after
+  The pinned worker TS lanes also have an allowlist of job keywords after
   `extends` resolution (`WORKER_TS_LANE_KEYS`, MR !1647 review HP-1) and
   require exactly `tags: ["$CI_LINT_RUNNER_TAG"]`. Job-level `variables`,
   `parallel` matrices and `hooks` are refused, including inherited entries:
@@ -381,7 +384,15 @@ the prime suspect, and the fix is the same normalization in the offending
   extends-resolved job may carry only the audited `.rust-job` keys, and its
   inherited `before_script` must equal the pinned bootstrap line for line —
   a template `variables`/`hooks`/`inherit`/`parallel` entry or an `exit 0`
-  appended to the shared bootstrap would otherwise hollow the lane out. Any
+  appended to the shared bootstrap would otherwise hollow the lane out. The
+  image value is pinned whole (MR !1691 review IX-1): an inherited
+  `.rust-job` image `entrypoint` (or any other image key) fails the lane,
+  not just a changed image name. Every worker lane must also declare
+  `needs: []` exactly (MR !1691 review IX-2): without it a later-stage lane
+  receives every earlier-stage job's artifacts and dotenv variables, which
+  outrank the allowlisted YAML variables (`NODE_OPTIONS`/`BUN_OPTIONS`/
+  `CARGO_TARGET_<triple>_RUNNER` would turn the pinned tests into no-ops).
+  Any
   script edit must update `PEBBLE_RUST_LANE_SCRIPT` (and a deliberate
   bootstrap change `PEBBLE_RUST_LANE_BEFORE_SCRIPT`) in the same commit.
 - Default and all-feature `cargo check` jobs plus `--tests` compilation for
