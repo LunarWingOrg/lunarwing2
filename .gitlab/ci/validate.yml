@@ -96,7 +96,8 @@ worker-opencode-ts:
 # not the live deb.debian.org mirror. The
 # real-CLI contract lane (kimi_cli_contract_test) self-skips here — no kimi
 # binary — and the protected image build remains the only place it executes
-# against the real CLI.
+# against the real CLI. (MR !1618 review GV-5: the closed !1614 also added a
+# worker-kimi-ts job; this is the single definition the re-attempt reuses.)
 worker-kimi-ts:
   stage: validate
   needs: []
@@ -127,6 +128,44 @@ worker-kimi-ts:
     - npm ci --ignore-scripts
     - npx tsc -p tsconfig.json
     - npm test
+
+# WI#375 DR-3: the opencode2 bridge's dependency-free TS suites previously
+# gated only at the (protected) worker image build. The executor suite needs
+# the image's built @opencode/client and stays image-gated. Pinned by
+# validate_config.py like the other worker TS lanes (WORKER_TS_LANE_SCRIPTS).
+worker-opencode2-ts:
+  stage: validate
+  needs: []
+  image:
+    name: "$CI_BUN_IMAGE"
+    entrypoint: [""]
+  tags:
+    - "$CI_LINT_RUNNER_TAG"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$/ && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
+  script:
+    - cd opencode2.4lunarwing
+    - bun scripts/path_expand_test.ts
+    - bun scripts/task_prompt_test.ts
+    - bun scripts/opencode_result_test.ts
+
+# WI#375 DR-3: pebble's Rust suite previously gated only at the (protected)
+# worker image build (`cargo test --locked` in the Dockerfile). Pinned by
+# validate_config.py (validate_pebble_rust_lane).
+worker-pebble-rust:
+  extends: .rust-job
+  stage: validate
+  needs: []
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$/ && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
+  script:
+    - bash .gitlab/scripts/cargo-ci.sh test -j2 --locked --manifest-path ../pebble4lunarwing/Cargo.toml
 
 rustfmt:
   extends: .rust-job
