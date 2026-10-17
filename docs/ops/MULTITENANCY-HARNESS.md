@@ -27,6 +27,7 @@ may invoke Cargo to six CPUs and six jobs:
 cd ic
 export LUNARWING_TEST_PROFILE=release
 export CARGO_BUILD_JOBS=6
+export LUNARWING_TEST_TENSORZERO_URL='http://<gateway-host>:3000'  # required (WI#402)
 
 scripts/lunarwing-xmpp-test-env.sh mt-init
 taskset -c 0-5 scripts/lunarwing-xmpp-test-env.sh build
@@ -102,6 +103,7 @@ docker pull pgvector/pgvector:pg16
 cd ic
 export LUNARWING_TEST_PROFILE=release
 export CARGO_BUILD_JOBS=6
+export LUNARWING_TEST_TENSORZERO_URL='http://<gateway-host>:3000'  # required (WI#402)
 scripts/lunarwing-xmpp-test-env.sh mt-init
 scripts/lunarwing-xmpp-test-env.sh build
 scripts/lunarwing-xmpp-test-env.sh mt-up  # renders and loads tenant-scoped plists

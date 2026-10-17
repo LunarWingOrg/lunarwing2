@@ -126,6 +126,7 @@ Environment:
   LUNARWING_TEST_KEEP_BRIDGE=1   keeps smoke-test bridge running
 
 Quick start:
+  export LUNARWING_TEST_TENSORZERO_URL=http://<gateway-host>:3000   # required (WI#402)
   scripts/lunarwing-xmpp-test-env.sh init
   scripts/lunarwing-xmpp-test-env.sh build --with-wasm
   scripts/lunarwing-xmpp-test-env.sh install-wasm

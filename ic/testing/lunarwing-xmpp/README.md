@@ -53,8 +53,10 @@ scripts/lunarwing-xmpp-test-env.sh init
 Keep that `LUNARWING_TEST_ROOT` exported for later commands in the same shell.
 If you open a new shell, export it again before using the harness. The
 TensorZero URL is baked into `env/proxy.env` at `init` and read back from
-there, so the export is only needed again if you delete the env or want to
-change it (`TENSORZERO_URL` is honored as a fallback name).
+there, so the export is only needed again if you delete the env or to override
+it for one session — edit `env/proxy.env` to change it for good; an exported
+knob overrides the baked value only while it stays exported, and `proxy.env`
+is never rewritten (`TENSORZERO_URL` is honored as a fallback name).
 
 ## 2. Inspect the Generated Files
 
