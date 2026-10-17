@@ -1032,6 +1032,17 @@ def validate_worker_ts_lanes(merged: dict, errors: list[str]) -> None:
             errors.append(f"{job_name} must not override its image entrypoint")
         if effective.get("before_script"):
             errors.append(f"{job_name} must not set a before_script")
+        # MR !1691 run-137 review IX-2: lane_runs_on_merge_requests refuses a
+        # non-empty needs but accepts a missing one, and GitLab hands a
+        # lane without needs (or dependencies) every earlier-stage job's
+        # artifacts and dotenv variables — which outrank the YAML variables
+        # GLOBAL_VARIABLE_ALLOWLIST guards (NODE_OPTIONS/BUN_OPTIONS turn the
+        # pinned test commands into no-ops).
+        if effective.get("needs") != []:
+            errors.append(
+                f"{job_name} must declare needs: [] so no artifacts or dotenv "
+                "variables from other jobs reach the pinned script"
+            )
         rules = effective.get("rules")
         if isinstance(rules, list) and any(
             isinstance(rule, dict) and "variables" in rule for rule in rules
@@ -1127,8 +1138,24 @@ def validate_pebble_rust_lane(merged: dict, errors: list[str]) -> None:
             "worker-pebble-rust before_script must be exactly the pinned "
             f".rust-job bootstrap {list(PEBBLE_RUST_LANE_BEFORE_SCRIPT)!r}"
         )
-    if image_name(effective.get("image")) != "$CI_RUST_IMAGE":
-        errors.append("worker-pebble-rust must resolve to the $CI_RUST_IMAGE image")
+    # MR !1691 run-137 review IX-1: the .rust-job image is a bare name. An
+    # inherited entrypoint (or any other image key) can skip the job script
+    # just like the TS lanes' entrypoint override (MR !1627 review HE-2),
+    # so pin the whole value, not just image_name().
+    if effective.get("image") not in ("$CI_RUST_IMAGE", {"name": "$CI_RUST_IMAGE"}):
+        errors.append(
+            "worker-pebble-rust must resolve to exactly the $CI_RUST_IMAGE "
+            "image (no entrypoint or other image keys)"
+        )
+    # MR !1691 run-137 review IX-2: a lane without needs: [] in a later stage
+    # receives every earlier-stage job's artifacts and dotenv variables
+    # (CARGO_TARGET_<triple>_RUNNER=true turns cargo test into a no-op that
+    # exits 0).
+    if effective.get("needs") != []:
+        errors.append(
+            "worker-pebble-rust must declare needs: [] so no artifacts or "
+            "dotenv variables from other jobs reach the pinned script"
+        )
     if effective.get("tags") != ["$CI_RUST_RUNNER_TAG"]:
         errors.append(
             "worker-pebble-rust tags must be exactly ['$CI_RUST_RUNNER_TAG']"
