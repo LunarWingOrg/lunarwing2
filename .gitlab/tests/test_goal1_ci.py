@@ -549,6 +549,14 @@ class BunImageTieTests(unittest.TestCase):
             f"FROM docker.io/library/node:22-bookworm-slim@sha256:{self.OTHER_DIGEST} AS builder\n",
             encoding="utf-8",
         )
+        # Sibling fixture: the opencode2 bun tie (MR !1669 review IK-2) also
+        # runs here; patch it too so the tests never read the real file
+        # (whose digest happens to equal BUN_DIGEST and would pass silently).
+        self.opencode2_dockerfile = self.root / "Dockerfile.opencode2"
+        self.opencode2_dockerfile.write_text(
+            f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST} AS builder\n",
+            encoding="utf-8",
+        )
         pin = f"docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST}"
         self.variables = {
             "CI_LINT_IMAGE": f"docker.io/library/python:3.12@sha256:{self.OTHER_DIGEST}",
@@ -575,6 +583,7 @@ class BunImageTieTests(unittest.TestCase):
         with mock.patch.multiple(
             config,
             OPENCODE_DOCKERFILE=self.dockerfile,
+            OPENCODE2_DOCKERFILE=self.opencode2_dockerfile,
             KIMI_DOCKERFILE=self.kimi_dockerfile,
         ):
             config.validate_ci_tool_image_pins(self.merged, self.variables, errors)
@@ -601,6 +610,21 @@ class BunImageTieTests(unittest.TestCase):
             f"FROM docker.io/oven/bun:debian@sha256:{self.OTHER_DIGEST} AS runtime\n"
         )
         self.assertTrue(any("CI_BUN_IMAGE digest must match" in error for error in self.errors()))
+
+    def test_opencode2_bun_drift_is_caught(self):
+        # MR !1669 review IK-2: the worker-opencode2-ts lane runs on
+        # CI_BUN_IMAGE, so the opencode2 Dockerfile's bun digest must be
+        # cross-checked too.
+        self.opencode2_dockerfile.write_text(
+            f"FROM docker.io/oven/bun:debian@sha256:{self.OTHER_DIGEST} AS builder\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            any(
+                "CI_BUN_IMAGE digest must match" in error and "opencode2.4lunarwing" in error
+                for error in self.errors()
+            )
+        )
 
     def test_missing_dockerfile_is_caught(self):
         self.assertTrue(any("Dockerfile missing" in error for error in self.errors()))
@@ -641,6 +665,13 @@ class NodeImageTieTests(unittest.TestCase):
             f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST} AS builder\n",
             encoding="utf-8",
         )
+        # Sibling fixture: the opencode2 bun tie (MR !1669 review IK-2) also
+        # runs here; patch it too so the tests never read the real file.
+        self.opencode2_dockerfile = self.root / "Dockerfile.opencode2"
+        self.opencode2_dockerfile.write_text(
+            f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST} AS builder\n",
+            encoding="utf-8",
+        )
         self.variables = {
             "CI_LINT_IMAGE": f"docker.io/library/python:3.12@sha256:{self.OTHER_DIGEST}",
             "CI_RUST_IMAGE": f"docker.io/library/rust:1.96.1@sha256:{self.OTHER_DIGEST}",
@@ -668,6 +699,7 @@ class NodeImageTieTests(unittest.TestCase):
         with mock.patch.multiple(
             config,
             OPENCODE_DOCKERFILE=self.opencode_dockerfile,
+            OPENCODE2_DOCKERFILE=self.opencode2_dockerfile,
             KIMI_DOCKERFILE=self.dockerfile,
         ):
             config.validate_ci_tool_image_pins(self.merged, self.variables, errors)
@@ -712,18 +744,37 @@ class NodeImageTieTests(unittest.TestCase):
         )
         self.assertTrue(any("CI_NODE_IMAGE digest must match" in error for error in self.errors()))
 
+    def test_short_form_and_mirror_node_from_are_tied(self):
+        # MR !1669 review IK-1: the tie follows the repository's last path
+        # segment, so a drifted runtime stage is caught however the node
+        # image is spelled — docker.io/node, a mirror path, or bare node.
+        for runtime_from in (
+            f"FROM docker.io/node:22-bookworm-slim@sha256:{self.OTHER_DIGEST} AS runtime\n",
+            f"FROM registry.example/mirror/node:22-bookworm-slim@sha256:{self.OTHER_DIGEST} AS runtime\n",
+            f"FROM node:22-bookworm-slim@sha256:{self.OTHER_DIGEST} AS runtime\n",
+        ):
+            with self.subTest(runtime_from=runtime_from):
+                self.write_dockerfile(
+                    f"FROM docker.io/library/node:22-bookworm-slim@sha256:{self.NODE_DIGEST} AS builder\n"
+                    + runtime_from
+                )
+                self.assertTrue(
+                    any("CI_NODE_IMAGE digest must match" in error for error in self.errors()),
+                    self.errors(),
+                )
+
     def test_missing_dockerfile_is_caught(self):
         self.assertTrue(any("Dockerfile missing" in error for error in self.errors()))
 
     def test_no_node_from_is_caught(self):
         self.write_dockerfile(f"FROM docker.io/library/python:3.12@sha256:{self.OTHER_DIGEST}\n")
-        self.assertTrue(any("no node FROM" in error for error in self.errors()))
+        self.assertTrue(any("no library/node FROM" in error for error in self.errors()))
 
     def test_nodejs_named_from_is_caught(self):
         # A non-node image whose name merely starts with "node" must fail
-        # closed as "no node FROM line", not silently match the tie.
+        # closed as "no library/node FROM line", not silently match the tie.
         self.write_dockerfile(f"FROM docker.io/library/nodejs:24@sha256:{self.NODE_DIGEST}\n")
-        self.assertTrue(any("no node FROM" in error for error in self.errors()))
+        self.assertTrue(any("no library/node FROM" in error for error in self.errors()))
 
     def test_tag_only_node_from_is_caught(self):
         self.write_dockerfile("FROM docker.io/library/node:22-bookworm-slim AS builder\n")
@@ -759,6 +810,13 @@ class DebianSnapshotTieTests(unittest.TestCase):
             f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST} AS builder\n",
             encoding="utf-8",
         )
+        # Sibling fixture: the opencode2 bun tie (MR !1669 review IK-2) also
+        # runs here; patch it too so the tests never read the real file.
+        self.opencode2_dockerfile = self.root / "Dockerfile.opencode2"
+        self.opencode2_dockerfile.write_text(
+            f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST} AS builder\n",
+            encoding="utf-8",
+        )
         self.variables = {
             "CI_LINT_IMAGE": f"docker.io/library/python:3.12@sha256:{self.OTHER_DIGEST}",
             "CI_RUST_IMAGE": f"docker.io/library/rust:1.96.1@sha256:{self.OTHER_DIGEST}",
@@ -787,6 +845,7 @@ class DebianSnapshotTieTests(unittest.TestCase):
         with mock.patch.multiple(
             config,
             OPENCODE_DOCKERFILE=self.opencode_dockerfile,
+            OPENCODE2_DOCKERFILE=self.opencode2_dockerfile,
             KIMI_DOCKERFILE=self.dockerfile,
         ):
             config.validate_ci_tool_image_pins(self.merged, self.variables, errors)
@@ -1510,7 +1569,7 @@ class CacheTrustTests(unittest.TestCase):
 
 
 class WorkerTsLaneTests(unittest.TestCase):
-    """MR !1601 review GH-2: both worker TS lanes must be pinned — existence,
+    """MR !1601 review GH-2: the worker TS lanes must be pinned — existence,
     the merge_request_event rule, the tied image variable, and (MR !1644
     review HN-5) the exact script, taken from config.WORKER_TS_LANE_SCRIPTS
     so the fixtures always match the pinned tuple; the real-tree binding is
@@ -1542,11 +1601,11 @@ class WorkerTsLaneTests(unittest.TestCase):
         return values
 
     def merged(self) -> dict:
-        return {
-            "variables": self.variables(),
-            "worker-kimi-ts": self.lane("worker-kimi-ts"),
-            "worker-opencode-ts": self.lane("worker-opencode-ts"),
-        }
+        # Every pinned TS lane gets the same fixture shape, so the per-lane
+        # loops below cover a newly pinned lane without a test edit.
+        merged = {name: self.lane(name) for name in config.WORKER_TS_LANE_SCRIPTS}
+        merged["variables"] = self.variables()
+        return merged
 
     def errors(self, merged: dict) -> list[str]:
         errors: list[str] = []
@@ -1555,6 +1614,23 @@ class WorkerTsLaneTests(unittest.TestCase):
 
     def test_valid_shape_passes(self):
         self.assertEqual(self.errors(self.merged()), [])
+
+    def test_missing_needs_is_caught(self):
+        # IX-2 (MR !1691 run-137): a lane moved to a later stage without
+        # needs: [] receives every earlier-stage job's dotenv variables
+        # (NODE_OPTIONS, BUN_OPTIONS) and artifacts.
+        for job_name in config.WORKER_TS_LANE_SCRIPTS:
+            with self.subTest(job=job_name):
+                merged = self.merged()
+                del merged[job_name]["needs"]
+                merged[job_name]["stage"] = "check"
+                self.assertTrue(
+                    any(
+                        job_name in error and "needs: []" in error
+                        for error in self.errors(merged)
+                    ),
+                    self.errors(merged),
+                )
 
     def test_job_level_execution_overrides_are_caught(self):
         # HP-1: the script can remain byte-identical while its environment
@@ -1662,6 +1738,11 @@ class WorkerTsLaneTests(unittest.TestCase):
         merged = self.merged()
         del merged["worker-opencode-ts"]
         self.assertTrue(any("worker-opencode-ts job missing" in error for error in self.errors(merged)))
+
+    def test_missing_opencode2_lane_is_caught(self):
+        merged = self.merged()
+        del merged["worker-opencode2-ts"]
+        self.assertTrue(any("worker-opencode2-ts job missing" in error for error in self.errors(merged)))
 
     def test_never_rules_are_caught(self):
         merged = self.merged()
@@ -2489,6 +2570,178 @@ class WorkerTsLaneTests(unittest.TestCase):
             effective["image"], {"name": "$CI_NODE_IMAGE", "entrypoint": ["/bin/sh"]}
         )
         self.assertTrue(any("entrypoint" in error for error in self.errors(merged)))
+
+
+class PebbleRustLaneTests(unittest.TestCase):
+    """WI#375 DR-3: the worker-pebble-rust lane (pebble's Rust suite in MR
+    pipelines) is pinned by config.validate_pebble_rust_lane — existence,
+    the .rust-job extends, the merge_request_event rule, the resolved
+    $CI_RUST_IMAGE image and rust runner tag, and the exact script from
+    config.PEBBLE_RUST_LANE_SCRIPT; the real-tree binding is main() running
+    the validator over the checked-in validate.yml."""
+
+    RUST_JOB = {
+        "image": {"name": "$CI_RUST_IMAGE"},
+        "tags": ["$CI_RUST_RUNNER_TAG"],
+        "before_script": [
+            'df -h "$CI_PROJECT_DIR"',
+            "bash .gitlab/scripts/bootstrap-rust.sh",
+            "bash .gitlab/scripts/bootstrap-sccache.sh",
+        ],
+    }
+
+    def merged(self) -> dict:
+        return {
+            ".rust-job": copy.deepcopy(self.RUST_JOB),
+            "worker-pebble-rust": {
+                "extends": ".rust-job",
+                "stage": "validate",
+                "needs": [],
+                "rules": [
+                    {"if": '$CI_PIPELINE_SOURCE == "merge_request_event"'},
+                    {"if": '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH'},
+                    {"when": "never"},
+                ],
+                "script": list(config.PEBBLE_RUST_LANE_SCRIPT),
+            },
+        }
+
+    def errors(self, merged: dict) -> list[str]:
+        errors: list[str] = []
+        config.validate_pebble_rust_lane(merged, errors)
+        return errors
+
+    def test_valid_shape_passes(self):
+        self.assertEqual(self.errors(self.merged()), [])
+
+    def test_real_lane_matches_the_pin(self):
+        # The pinned tuple must equal the checked-in validate.yml lane, so a
+        # lane edit without a tuple update fails here (and in ci-config via
+        # main()). The real .rust-job template comes from defaults.yml.
+        merged = {}
+        for include in config.EXPECTED_INCLUDES:
+            merged.update(config.load_yaml(ROOT / include.lstrip("/")))
+        self.assertEqual(self.errors(merged), [])
+
+    def test_missing_lane_is_caught(self):
+        merged = self.merged()
+        del merged["worker-pebble-rust"]
+        self.assertTrue(any("worker-pebble-rust job missing" in error for error in self.errors(merged)))
+
+    def test_not_extending_rust_job_is_caught(self):
+        for override in ({}, [], ".other-template"):
+            with self.subTest(override=override):
+                merged = self.merged()
+                if override:
+                    merged["worker-pebble-rust"]["extends"] = override
+                else:
+                    del merged["worker-pebble-rust"]["extends"]
+                self.assertTrue(any(
+                    "must extend .rust-job" in error for error in self.errors(merged)
+                ))
+
+    def test_job_level_keys_are_caught(self):
+        # A job-level before_script/after_script replaces the audited
+        # .rust-job bootstrap; variables/hooks/parallel bypass the pinned
+        # script without touching it.
+        for key, value in (
+            ("variables", {"CARGO_TERM_COLOR": "never"}),
+            ("hooks", {"pre_get_sources_script": ["true"]}),
+            ("parallel", {"matrix": [{"CARGO_TERM_COLOR": ["never"]}]}),
+            ("before_script", ["true"]),
+            ("after_script", ["true"]),
+            ("image", {"name": "$CI_RUST_IMAGE"}),
+            ("tags", ["$CI_RUST_RUNNER_TAG"]),
+        ):
+            with self.subTest(key=key):
+                merged = self.merged()
+                merged["worker-pebble-rust"][key] = value
+                self.assertTrue(any(
+                    f"must not set job keys ['{key}']" in error for error in self.errors(merged)
+                ))
+
+    def test_template_image_drift_is_caught(self):
+        merged = self.merged()
+        merged[".rust-job"]["image"] = {"name": "$CI_BUN_IMAGE"}
+        self.assertTrue(any("CI_RUST_IMAGE" in error for error in self.errors(merged)))
+
+    def test_template_image_entrypoint_is_caught(self):
+        # IX-1 (MR !1691 run-137): an entrypoint inherited from .rust-job can
+        # end the job before the pinned script runs, with the image name
+        # unchanged.
+        merged = self.merged()
+        merged[".rust-job"]["image"]["entrypoint"] = ["/bin/true"]
+        self.assertTrue(any("CI_RUST_IMAGE" in error for error in self.errors(merged)))
+
+    def test_missing_needs_is_caught(self):
+        # IX-2 (MR !1691 run-137): without needs: [] a later-stage lane
+        # inherits every earlier-stage dotenv report (variables) and
+        # artifact.
+        merged = self.merged()
+        del merged["worker-pebble-rust"]["needs"]
+        merged["worker-pebble-rust"]["stage"] = "check"
+        self.assertTrue(any("needs: []" in error for error in self.errors(merged)))
+
+    def test_template_tag_drift_is_caught(self):
+        merged = self.merged()
+        merged[".rust-job"]["tags"] = ["$CI_LINT_RUNNER_TAG"]
+        self.assertTrue(any("CI_RUST_RUNNER_TAG" in error for error in self.errors(merged)))
+
+    def test_template_bootstrap_exit_0_is_caught(self):
+        # MR !1669 review IK-8: .rust-job is shared — an `exit 0` appended to
+        # its before_script ends the job green before the pinned script runs.
+        merged = self.merged()
+        merged[".rust-job"]["before_script"].append("exit 0")
+        self.assertTrue(any("before_script" in error for error in self.errors(merged)))
+
+    def test_template_level_bypass_keys_are_caught(self):
+        # MR !1669 review IK-8: template-level variables/hooks/inherit/
+        # parallel survive extends resolution and bypass the pinned script.
+        for key, value in (
+            ("variables", {"RUSTC_WRAPPER": "/bin/true"}),
+            ("hooks", {"pre_get_sources_script": ["echo x"]}),
+            ("inherit", {"variables": False}),
+            ("parallel", {"matrix": [{"RUSTFLAGS": ["--cfg x"]}]}),
+        ):
+            with self.subTest(key=key):
+                merged = self.merged()
+                merged[".rust-job"][key] = value
+                self.assertTrue(
+                    any(f"'{key}'" in error for error in self.errors(merged)),
+                    self.errors(merged),
+                )
+
+    def test_never_rules_are_caught(self):
+        merged = self.merged()
+        merged["worker-pebble-rust"]["rules"] = [{"when": "never"}]
+        self.assertTrue(any("merge_request_event" in error for error in self.errors(merged)))
+
+    def test_rules_variables_are_caught(self):
+        merged = self.merged()
+        merged["worker-pebble-rust"]["rules"][0]["variables"] = {"RUSTFLAGS": ""}
+        self.assertTrue(any("rules must not set variables" in error for error in self.errors(merged)))
+
+    def test_prepended_exit_0_is_caught(self):
+        merged = self.merged()
+        merged["worker-pebble-rust"]["script"] = (
+            ["exit 0"] + merged["worker-pebble-rust"]["script"]
+        )
+        self.assertTrue(any("exactly the pinned commands" in error for error in self.errors(merged)))
+
+    def test_dropped_locked_flag_is_caught(self):
+        merged = self.merged()
+        merged["worker-pebble-rust"]["script"] = [
+            command.replace(" --locked", "")
+            for command in merged["worker-pebble-rust"]["script"]
+        ]
+        self.assertTrue(any("exactly the pinned commands" in error for error in self.errors(merged)))
+
+    def test_main_runs_the_pebble_lane_validator(self):
+        # Same class as the GV-2 pin for the TS lanes: deleting the main()
+        # call must not pass the suite.
+        with mock.patch.object(config, "validate_pebble_rust_lane") as lane_check:
+            self.assertEqual(config.main(), 0)
+        lane_check.assert_called_once()
 
 
 if __name__ == "__main__":

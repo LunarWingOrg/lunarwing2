@@ -412,8 +412,14 @@ write_tenant_vision_env() {
   local env_dir env_path
   env_dir="$(tenant_env_dir "$name")"
   env_path="$env_dir/vision.env"
+  # WI#390 (review IG-1): the preserved token comes from ONE snapshot read as
+  # the tenant — root resolving the live tenant-writable path would follow a
+  # cross-tenant symlink and this render would write the other tenant's
+  # LUNARWING_AUTH_TOKEN into this tenant's vision.env.
+  local vision_snapshot
+  _snapshot_tenant_env "$name" "$env_path" vision_snapshot
   local token
-  token="$(_env_existing "$env_path" LUNARWING_AUTH_TOKEN)"
+  token="$(_env_existing "$vision_snapshot" LUNARWING_AUTH_TOKEN)"
   token="${token:-$(generate_token)}"
   # Resolve VL backend URL: explicit override wins, else fleet default.
   # Empty (LUNARWING_MT_VL_URL= and DEFAULT_VL_URL unset) = no VL line written;
@@ -421,25 +427,29 @@ write_tenant_vision_env() {
   local vl_url
   vl_url="${LUNARWING_MT_VL_URL:-$DEFAULT_VL_URL}"
   mkdir -p "$env_dir"
-  (
-    umask 077
-    if [[ -n "$vl_url" ]]; then
-      cat >"$env_path" <<ENVEOF
+  # WI#390: write as the tenant through the atomic writer — root never opens
+  # vision.env inside the tenant-writable env dir, so a pre-placed or raced
+  # symlink there cannot redirect the write onto an attacker-chosen path. The
+  # explicit returns keep the refusal fatal even when errexit is suppressed
+  # (e.g. a caller's || fallback list).
+  local rc=0
+  if [[ -n "$vl_url" ]]; then
+    cat <<ENVEOF | write_tenant_file_atomic "$name" "$env_path" 600 || rc=1
 LUNARWING_AUTH_TOKEN=$token
 OCR_PORT=$VISION_SIDECAR_INTERNAL_PORT
 OCR_HEALTH_PORT=$VISION_SIDECAR_HEALTH_PORT
 VL_URL=$vl_url
 VL_MODEL=qwen3-vl
 ENVEOF
-    else
-      cat >"$env_path" <<ENVEOF
+  else
+    cat <<ENVEOF | write_tenant_file_atomic "$name" "$env_path" 600 || rc=1
 LUNARWING_AUTH_TOKEN=$token
 OCR_PORT=$VISION_SIDECAR_INTERNAL_PORT
 OCR_HEALTH_PORT=$VISION_SIDECAR_HEALTH_PORT
 ENVEOF
-    fi
-  )
-  chown "$name:$name" "$env_path"
+  fi
+  rm -f -- "$vision_snapshot"
+  [[ "$rc" -eq 0 ]] || return 1
   printf '%s' "$token"
 }
 
@@ -453,26 +463,43 @@ write_tenant_voice_env() {
   env_dir="$(tenant_env_dir "$name")"
   env_path="$env_dir/voice.env"
   mkdir -p "$env_dir"
-  if [[ ! -e "$env_path" ]]; then
-    (umask 077; : >"$env_path")
-  elif [[ ! -f "$env_path" || -L "$env_path" ]]; then
-    die "unsafe LunarVoice environment file: $env_path"
+  # WI#390: create as the tenant through the atomic writer; a raced or
+  # pre-placed symlink (including a dangling one, which -e alone misses) can no
+  # longer make root truncate or create an attacker-chosen path.
+  if [[ -e "$env_path" || -L "$env_path" ]]; then
+    [[ -f "$env_path" && ! -L "$env_path" ]] \
+      || die "unsafe LunarVoice environment file: $env_path"
+  else
+    write_tenant_file_atomic "$name" "$env_path" 600 </dev/null \
+      || die "could not create LunarVoice environment file: $env_path"
   fi
 
-  token="$(_env_existing "$env_path" VOICE_AUTH_TOKEN)"
+  # WI#390 (review IG-1): the preserved token comes from ONE snapshot read as
+  # the tenant, taken after the symlink refusal above — root resolving the
+  # live tenant-writable path in the window before the _env_set commits would
+  # follow a cross-tenant swap and write the other tenant's VOICE_AUTH_TOKEN
+  # into this tenant's voice.env. The per-key presence checks below carry no
+  # value across, and every commit re-validates the live path tenant-side.
+  local voice_snapshot
+  _snapshot_tenant_env "$name" "$env_path" voice_snapshot
+  token="$(_env_existing "$voice_snapshot" VOICE_AUTH_TOKEN)"
+  rm -f -- "$voice_snapshot"
   token="${token:-$(generate_token)}"
   enabled="$(jq -r --arg name "$name" '.tenants[$name].enable_voice // false' "$PORTS_REGISTRY" 2>/dev/null)"
   [[ "$enabled" == true ]] || enabled=false
 
-  _env_set "$env_path" VOICE_ENABLED "$enabled"
-  _voice_env_set_default "$env_path" VOICE_AUTH_TOKEN "$token"
-  _env_set "$env_path" VOICE_ALLOW_UNAUTHENTICATED false
-  _env_set "$env_path" VOICE_BIND_HOST 0.0.0.0
-  _env_set "$env_path" VOICE_PORT "$VOICE_SIDECAR_INTERNAL_PORT"
-  _env_set "$env_path" VOICE_HEALTH_PORT "$VOICE_SIDECAR_HEALTH_PORT"
-  _env_set "$env_path" VOICE_MODEL_DIR /models
-  _env_set "$env_path" VOICE_AUTO_DOWNLOAD false
-  _env_set "$env_path" VOICE_REQUIRE_STT true
+  # WI#390 (IY-3): every commit is fail-closed — a refused tenant-side write
+  # must fail the writer (add_tenant's `|| die` otherwise never fires) instead
+  # of being swallowed by the trailing printf.
+  _env_set "$env_path" VOICE_ENABLED "$enabled" || return 1
+  _voice_env_set_default "$env_path" VOICE_AUTH_TOKEN "$token" || return 1
+  _env_set "$env_path" VOICE_ALLOW_UNAUTHENTICATED false || return 1
+  _env_set "$env_path" VOICE_BIND_HOST 0.0.0.0 || return 1
+  _env_set "$env_path" VOICE_PORT "$VOICE_SIDECAR_INTERNAL_PORT" || return 1
+  _env_set "$env_path" VOICE_HEALTH_PORT "$VOICE_SIDECAR_HEALTH_PORT" || return 1
+  _env_set "$env_path" VOICE_MODEL_DIR /models || return 1
+  _env_set "$env_path" VOICE_AUTO_DOWNLOAD false || return 1
+  _env_set "$env_path" VOICE_REQUIRE_STT true || return 1
 
   for setting in \
     'VOICE_STT_ENGINE|whisper' \
@@ -494,10 +521,12 @@ write_tenant_voice_env() {
     'ORT_NUM_THREADS|4'; do
     key="${setting%%|*}"
     value="${setting#*|}"
-    _voice_env_set_default "$env_path" "$key" "$value"
+    _voice_env_set_default "$env_path" "$key" "$value" || return 1
   done
-  chmod 0600 "$env_path"
-  chown "$name:$name" "$env_path"
+  # WI#390: no trailing root chmod/chown — every _env_set commit above already
+  # lands voice.env tenant-owned at mode 600 through the tenant-side atomic
+  # writer, and root chmod/chown on the tenant path would follow a symlink
+  # swapped into place.
   printf '%s' "$token"
 }
 

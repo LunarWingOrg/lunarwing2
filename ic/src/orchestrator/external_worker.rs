@@ -623,6 +623,112 @@ pub struct ExternalWorkerManager {
     pub(crate) cron_owner_id: std::sync::RwLock<Option<String>>,
 }
 
+/// Cron entries grouped by normalized endpoint-listener key
+/// (`endpoint_container_key`), keeping only keys shared by two or more
+/// distinct entries (WI#396). An entry whose own endpoints alias each other
+/// folds to one name per key and is not a share.
+fn shared_cron_listener_groups(
+    workers: &HashMap<String, ExternalWorkerConfig>,
+) -> Vec<(String, Vec<String>)> {
+    let mut names_by_key: HashMap<String, Vec<String>> = HashMap::new();
+    for config in workers.values() {
+        if !config.is_cron() {
+            continue;
+        }
+        for endpoint in config.endpoints() {
+            let names = names_by_key
+                .entry(endpoint_container_key(&endpoint.url))
+                .or_default();
+            if !names.contains(&config.name) {
+                names.push(config.name.clone());
+            }
+        }
+    }
+    names_by_key
+        .into_iter()
+        .filter(|(_, names)| names.len() > 1)
+        .map(|(key, mut names)| {
+            names.sort();
+            (key, names)
+        })
+        .collect()
+}
+
+/// The effective cron-tick grant set of an entry, sorted and deduplicated —
+/// the authority the WI#396 shared-listener comparison keys on.
+fn canonical_cron_grants(config: &ExternalWorkerConfig) -> Vec<String> {
+    let mut list = config
+        .cron
+        .as_ref()
+        .map(|cron| cron.tool_allowlist.clone())
+        .unwrap_or_default();
+    list.sort();
+    list.dedup();
+    list
+}
+
+/// WI#396: two cron entries can point at the same worker container while
+/// carrying *different* `cron.tool_allowlist` grants — the shared-endpoint
+/// strip in `ExternalWorkerManager::new` skips cron entries (it strips only
+/// non-cron entries sharing a cron entry's listener) and settings
+/// resolution deduplicates only mission ids, so nothing else flags the
+/// pairing. One container is one authority domain (MR !1549 EF-1): mission
+/// B's tick can borrow mission A's grants through A's relay socket —
+/// concurrent with A's tick, or later (a leftover process can wait for the
+/// next task's socket). Fail closed: when a listener key's cron entries
+/// carry differing grants, strip every cron grant on that key (the `error!`
+/// names the entries). Identical grants on a shared key are the same
+/// authority on both sides and stay, with a `warn!`.
+fn strip_conflicting_shared_cron_grants(workers: &mut HashMap<String, ExternalWorkerConfig>) {
+    let mut strip = Vec::new();
+    for (key, names) in shared_cron_listener_groups(workers) {
+        let quoted = names
+            .iter()
+            .map(|name| format!("'{name}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let reference = workers
+            .get(&names[0])
+            .map(canonical_cron_grants)
+            .unwrap_or_default();
+        let identical = names[1..].iter().all(|name| {
+            workers
+                .get(name)
+                .map(canonical_cron_grants)
+                .unwrap_or_default()
+                == reference
+        });
+        if identical {
+            tracing::warn!(
+                "External cron workers {quoted} share the endpoint listener '{key}' with \
+                 identical cron.tool_allowlist grants (compared by host and port; path and \
+                 query are ignored); keeping them — the authority is the same on both sides — \
+                 but one container still mixes the missions' concurrency and job-event \
+                 accounting. Give each cron mission its own container (WI#396)"
+            );
+        } else {
+            tracing::error!(
+                "External cron workers {quoted} share the endpoint listener '{key}' (compared \
+                 by host and port; path and query are ignored) but carry differing \
+                 cron.tool_allowlist grants; stripping every cron grant on the shared listener \
+                 — one container is one authority domain, so a tick of one mission could \
+                 otherwise borrow another mission's grants through that mission's relay \
+                 socket, concurrent or later (a leftover process can wait for it). Give each \
+                 cron mission its own container (WI#396)"
+            );
+            strip.extend(names);
+        }
+    }
+    for name in strip {
+        if let Some(cron) = workers
+            .get_mut(&name)
+            .and_then(|config| config.cron.as_mut())
+        {
+            cron.tool_allowlist = Vec::new();
+        }
+    }
+}
+
 impl ExternalWorkerManager {
     pub fn new(configs: Vec<ExternalWorkerConfig>) -> Self {
         let mut load_balancers = HashMap::new();
@@ -734,6 +840,11 @@ impl ExternalWorkerManager {
                 }
             }
         }
+
+        // WI#396: cron entries sharing one container with differing cron
+        // grants — detect and fail closed (the EV-1 strip above skips cron
+        // entries, and settings resolution dedups only mission ids).
+        strip_conflicting_shared_cron_grants(&mut workers);
 
         if !workers.is_empty() {
             tracing::info!(
@@ -1343,6 +1454,15 @@ impl ExternalWorkerManager {
     pub async fn cancel_task(&self, job_id: Uuid) -> bool {
         self.cancel_task_with_reason(job_id, CancelReason::User)
             .await
+    }
+
+    /// Test hook: the cancel reason signalled on an active handle, if any.
+    #[cfg(test)]
+    pub(crate) async fn cancel_reason_for_test(&self, job_id: Uuid) -> Option<CancelReason> {
+        let handles = self.active_handles.read().await;
+        handles
+            .get(&job_id)
+            .and_then(|handle| *handle.cancel_tx.borrow())
     }
 
     /// Cancel with an explicit reason (WI#325): the persisted record and
@@ -4503,6 +4623,119 @@ mod tests {
         assert_ne!(endpoint_container_key("ws://127.0.0.1:10/ws/agent"), cron);
         // An unparseable URL keeps only its exact raw string as the key.
         assert_eq!(endpoint_container_key("not a url"), "not a url");
+    }
+
+    /// Cron-mode worker fixture for the WI#396 shared-listener tests: the
+    /// manager's load-time grouping keys on the normalized endpoint and the
+    /// sanitized `cron.tool_allowlist`.
+    fn cron_test_config(name: &str, url: &str, grants: &[&str]) -> ExternalWorkerConfig {
+        ExternalWorkerConfig {
+            mode: crate::config::ExternalWorkerMode::Cron,
+            cron: Some(crate::config::CronWorkerConfig {
+                schedule: "0 15 10 * * *".to_string(),
+                goal: "Watch the herd".to_string(),
+                mission_id: Some(format!("{name}-mission")),
+                heartbeat_timeout_secs: Some(300),
+                tick_timeout_ms: Some(60_000),
+                max_reentries: Some(2),
+                allow_subminute_schedule: None,
+                project_dir: None,
+                timezone: None,
+                tool_allowlist: grants.iter().map(|grant| grant.to_string()).collect(),
+            }),
+            ..ExternalWorkerConfig::test_config(name, url)
+        }
+    }
+
+    fn loaded_cron_grants(mgr: &ExternalWorkerManager, name: &str) -> Vec<String> {
+        mgr.workers[name]
+            .cron
+            .as_ref()
+            .map(|cron| cron.tool_allowlist.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn shared_cron_endpoint_with_differing_grants_is_stripped_at_load() {
+        // WI#396: two cron entries sharing one endpoint listener (here
+        // re-spelled: localhost vs 127.0.0.1 folds to the same normalized
+        // key, and the differing paths are ignored) while carrying
+        // DIFFERENT cron.tool_allowlist grants — one mission's tick could
+        // borrow the other's grants through that mission's relay socket, so
+        // the manager fails closed and strips every cron grant on the
+        // shared listener.
+        let mgr = ExternalWorkerManager::new(vec![
+            cron_test_config("cron-a", "ws://127.0.0.1:9/ws/a", &["memory_read"]),
+            cron_test_config("cron-b", "ws://localhost:9/ws/b", &["knowledge_search"]),
+            // Control: a third cron entry on its own listener is untouched.
+            cron_test_config("cron-c", "ws://127.0.0.1:10/ws/c", &["memory_read"]),
+        ]);
+        for name in ["cron-a", "cron-b"] {
+            assert!(
+                loaded_cron_grants(&mgr, name).is_empty(),
+                "differing grants on a shared listener must be stripped: {name}"
+            );
+        }
+        assert_eq!(
+            loaded_cron_grants(&mgr, "cron-c"),
+            vec!["memory_read".to_string()],
+            "a cron entry on its own listener keeps its grant"
+        );
+    }
+
+    #[test]
+    fn shared_cron_endpoint_with_identical_grants_survives_at_load() {
+        // WI#396: identical grants on a shared listener are the same
+        // authority on both sides, so they stay (with a warn!). Order and
+        // duplicates are not authority — compare as sets.
+        let mgr = ExternalWorkerManager::new(vec![
+            cron_test_config(
+                "cron-a",
+                "ws://127.0.0.1:9/ws/a",
+                &["memory_read", "knowledge_search"],
+            ),
+            cron_test_config(
+                "cron-b",
+                "ws://localhost:9/ws/b",
+                &["knowledge_search", "memory_read", "knowledge_search"],
+            ),
+        ]);
+        for name in ["cron-a", "cron-b"] {
+            let mut grants = loaded_cron_grants(&mgr, name);
+            grants.sort();
+            grants.dedup();
+            assert_eq!(
+                grants,
+                vec!["knowledge_search".to_string(), "memory_read".to_string()],
+                "identical grants on a shared listener must survive: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_cron_endpoint_self_alias_is_not_flagged() {
+        // WI#396: one cron entry whose own endpoint list aliases itself
+        // (localhost vs 127.0.0.1 on the same port) is not a share — the
+        // grouping dedups entry names per key.
+        let mut config = cron_test_config("cron-a", "ws://127.0.0.1:9/ws/a", &["memory_read"]);
+        config.endpoints = vec![
+            crate::config::WorkerEndpoint {
+                url: "ws://127.0.0.1:9/ws/a".to_string(),
+                auth_token: None,
+                weight: None,
+            },
+            crate::config::WorkerEndpoint {
+                url: "ws://localhost:9/ws/b".to_string(),
+                auth_token: None,
+                weight: None,
+            },
+        ];
+        let mgr = ExternalWorkerManager::new(vec![config]);
+        assert_eq!(
+            loaded_cron_grants(&mgr, "cron-a"),
+            vec!["memory_read".to_string()],
+            "a self-aliasing cron entry keeps its grant"
+        );
     }
 
     #[test]

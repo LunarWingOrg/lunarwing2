@@ -366,7 +366,17 @@ write_tenant_file_atomic() {  # <tenant> <file> [mode] [private|owned-parent]
   [[ "$(id -un)" != "$name" ]] || drop=()
   [[ "$mode" =~ ^[0-7]{3,4}$ ]] || die "invalid tenant file mode"
   [[ "$parent_policy" == private || "$parent_policy" == owned-parent ]] || return 1
-  darkirc_path_components_safe "$target" || die "unsafe tenant file path: $target"
+  # Walk the ANCESTOR components here (a symlinked or non-absolute parent path
+  # is a hard die — the caller's target directory shape is already hostile).
+  # The final component's own symlink check belongs to the tenant-side writer's
+  # `! -L` refusal (exit 73) so callers holding a failure contract (rc 2 in the
+  # worker-config upgrade helpers, || die elsewhere) see a refusal instead of a
+  # bare process abort (WI#390, review IG-3).
+  local target_parent="${target%/*}"
+  [[ "$target" == /* && "$target_parent" != "$target" && -n "$target_parent" ]] \
+    || die "unsafe tenant file path: $target"
+  darkirc_path_components_safe "$target_parent" \
+    || die "unsafe tenant file path: $target"
   "${drop[@]}" env -i PATH="/usr/bin:/bin" \
     TARGET_PATH="$target" TARGET_MODE="$mode" PARENT_POLICY="$parent_policy" bash -c '
       set -euo pipefail
@@ -397,6 +407,66 @@ write_tenant_file_atomic() {  # <tenant> <file> [mode] [private|owned-parent]
       mv -T -f -- "$tmp" "$target"
       trap - EXIT
     '
+}
+
+# Append complete lines (stdin) to a tenant-owned env file without root ever
+# opening the tenant-writable path (WI#390): the current content is staged out
+# (read as the tenant), the new lines land on the staged copy, and the result
+# is committed through the tenant-side atomic writer. A pre-placed or raced
+# symlink at the destination cannot redirect the write.
+_tenant_env_append() {  # <tenant> <env_file> — new lines on stdin
+  local name="$1" path="$2" staged rc=1
+  staged="$(mktemp)" || return 1
+  if tenant_cat "$name" "$path" >"$staged" \
+    && cat >>"$staged" \
+    && write_tenant_file_atomic "$name" "$path" 600 <"$staged"; then
+    rc=0
+  fi
+  rm -f -- "$staged"
+  return "$rc"
+}
+
+# Apply one sed expression in place to a tenant-owned env file without root
+# ever opening the tenant-writable path (WI#390). GNU sed -i follows symlinks,
+# so running it as root directly on the tenant path would rewrite an
+# attacker-chosen file; the expression is applied to the staged copy instead.
+_tenant_env_sed() {  # <tenant> <env_file> <sed-expression>
+  local name="$1" path="$2" expr="$3" staged rc=1
+  staged="$(mktemp)" || return 1
+  if tenant_cat "$name" "$path" >"$staged" \
+    && sed -i -e "$expr" -- "$staged" \
+    && write_tenant_file_atomic "$name" "$path" 600 <"$staged"; then
+    rc=0
+  fi
+  rm -f -- "$staged"
+  return "$rc"
+}
+
+# Read-side counterpart of the tenant-side writers (WI#390, review IG-1): root
+# must never resolve a tenant-writable path for its VALUE reads either. A
+# symlink present for the read window hands root another tenant's env, and the
+# patch/render then writes those values (COORD_ADMIN_TOKEN, GATEWAY_AUTH_TOKEN,
+# SECRETS_MASTER_KEY, XMPP_PASSWORD, KIMI_API_KEY, …) back into the tenant's
+# own file. Snapshot the file once AS THE TENANT — a foreign 0600 file in a
+# 0700 dir is unreadable to the tenant-side read, so a cross-tenant symlink
+# dies here instead of leaking — and point every value/presence read at the
+# root-private snapshot. The tenant-side writers still re-read the live file at
+# commit time, so a post-snapshot swap fails closed there. A missing path
+# snapshots as empty (first-render shape); an unreadable or dangling one dies.
+# The result is delivered through a nameref (never a command substitution) so
+# the die stays fatal under a caller's suppressed errexit. The caller must rm
+# the snapshot on every path that does not die first.
+_snapshot_tenant_env() {  # <tenant> <env_file> <out_var>
+  local name="$1" path="$2" snapshot
+  local -n _snapshot_out="$3"
+  snapshot="$(mktemp)" || die "could not snapshot $path"
+  if [[ -e "$path" || -L "$path" ]]; then
+    if ! tenant_cat "$name" "$path" >"$snapshot"; then
+      rm -f -- "$snapshot"
+      die "could not read $path as tenant '$name'"
+    fi
+  fi
+  _snapshot_out="$snapshot"
 }
 
 _quote_env_value() {  # <one-line value>
@@ -1020,6 +1090,27 @@ write_tenant_lunarwing_env() {
   state_dir="$(tenant_state_dir "$name")"
   run_dir="$(tenant_run_dir "$name")"
 
+  # WI#390 (review IG-1): every existing-value read below comes from ONE
+  # root-private snapshot per file, taken as the tenant — never from root
+  # resolving the live tenant-writable path. A cross-tenant symlink present
+  # for the read window is unreadable to the tenant-side cat and dies here;
+  # without the snapshot, root's reads would follow it and this render would
+  # write the other tenant's GATEWAY_AUTH_TOKEN / SECRETS_MASTER_KEY /
+  # XMPP_PASSWORD / KIMI_API_KEY / … back into this tenant's env. vision.env
+  # and voice.env are the same tenant-writable class (their tokens are carried
+  # into this render) and are snapshotted the same way. The commit at the end
+  # still re-validates the live path in write_tenant_file_atomic, so a
+  # post-snapshot swap fails closed there. resolve_tenant_xmpp_jid above runs
+  # before the snapshot by design: XMPP_JID is a non-secret identifier, and a
+  # foreign symlink dies on this snapshot before any value is rendered.
+  # Known exception (WI#423): tenant_pg_password below still root-reads
+  # pg.secret/lunarwing.env through the live path; that residue is tracked
+  # there rather than claimed covered by this snapshot.
+  local env_snapshot vision_snapshot voice_snapshot
+  _snapshot_tenant_env "$name" "$path" env_snapshot
+  _snapshot_tenant_env "$name" "$(tenant_env_dir "$name")/vision.env" vision_snapshot
+  _snapshot_tenant_env "$name" "$(tenant_env_dir "$name")/voice.env" voice_snapshot
+
   # Idempotent on re-run (F4-A/F4-B): PRESERVE existing secrets when lunarwing.env
   # already exists. Regenerating SECRETS_MASTER_KEY would permanently orphan the
   # tenant's encrypted DB secrets (it is the AES-256-GCM vault key); rotating the
@@ -1030,47 +1121,47 @@ write_tenant_lunarwing_env() {
   local coord_knowledge_share coord_knowledge_publish coord_knowledge_publishers coord_knowledge_max_per_hour coord_knowledge_global_max_per_hour coord_knowledge_min_chars
   local study_notes_home study_notes_state_home study_notes_allow_write knowledge_seed_flag
   local knowledge_sync_enabled knowledge_sync_cadence knowledge_sync_max_records knowledge_sync_max_bytes
-  gateway_token="$(_env_existing "$path" GATEWAY_AUTH_TOKEN)";   gateway_token="${gateway_token:-$(generate_token)}"
+  gateway_token="$(_env_existing "$env_snapshot" GATEWAY_AUTH_TOKEN)";   gateway_token="${gateway_token:-$(generate_token)}"
   # Per-worker credential for the external-worker WebSocket handshake. External
   # workers run `WS_ROLE=server` and validate an inbound bearer on the upgrade;
   # the daemon presents the same value as `auth_token`. This must NOT be the
   # gateway bearer: the worker never calls the gateway API, and the value is
   # readable via `podman inspect` / tenant-readable unit files, so reusing the
   # gateway token handed a contained lane the tenant's full API surface (WI#205).
-  worker_token="$(_env_existing "$path" WORKER_AUTH_TOKEN)";     worker_token="${worker_token:-$(generate_token)}"
-  bridge_token="$(_env_existing "$path" XMPP_BRIDGE_TOKEN)";     bridge_token="${bridge_token:-$(generate_token | cut -c1-32)}"
-  relay_password="$(_env_existing "$path" RELAY_PASSWORD)";      relay_password="${relay_password:-$(generate_token | cut -c1-32)}"
-  secrets_key="$(_env_existing "$path" SECRETS_MASTER_KEY)";     secrets_key="${secrets_key:-$(generate_token)}"
-  webhook_secret="$(_env_existing "$path" HTTP_WEBHOOK_SECRET)"; webhook_secret="${webhook_secret:-$(generate_token)}"
-  ssh_api_token="$(_env_existing "$path" SSH_API_TOKEN)";       ssh_api_token="${ssh_api_token:-$(generate_token)}"
-  coord_enabled="$(_env_existing "$path" COORD_ENABLED)"; coord_enabled="${coord_enabled:-false}"
-  coord_agent_id="$(_env_existing "$path" COORD_AGENT_ID)"; coord_agent_id="${coord_agent_id:-$name}"
-  coord_agent_aliases="$(_env_existing "$path" COORD_AGENT_ALIASES)"
-  coord_responder_roster="$(_env_existing "$path" COORD_RESPONDER_ROSTER)"
-  coord_channels="$(_env_existing "$path" COORD_CHANNELS)"
-  coord_knowledge_share="$(_env_existing "$path" COORD_KNOWLEDGE_SHARE)"; coord_knowledge_share="${coord_knowledge_share:-false}"
-  coord_knowledge_publish="$(_env_existing "$path" COORD_KNOWLEDGE_PUBLISH)"; coord_knowledge_publish="${coord_knowledge_publish:-false}"
-  coord_knowledge_publishers="$(_env_existing "$path" COORD_KNOWLEDGE_PUBLISHERS)"; coord_knowledge_publishers="${coord_knowledge_publishers:-}"
-  coord_knowledge_max_per_hour="$(_env_existing "$path" COORD_KNOWLEDGE_MAX_PER_HOUR)"; coord_knowledge_max_per_hour="${coord_knowledge_max_per_hour:-30}"
-  coord_knowledge_global_max_per_hour="$(_env_existing "$path" COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR)"; coord_knowledge_global_max_per_hour="${coord_knowledge_global_max_per_hour:-300}"
-  coord_knowledge_min_chars="$(_env_existing "$path" COORD_KNOWLEDGE_MIN_CHARS)"; coord_knowledge_min_chars="${coord_knowledge_min_chars:-12}"
-  coord_admin_users="$(_env_existing "$path" COORD_ADMIN_USERS)"
-  coord_admin_token="$(_env_existing "$path" COORD_ADMIN_TOKEN)"; coord_admin_token="${coord_admin_token:-$(generate_token)}"
-  coord_admin_port="$(_env_existing "$path" COORD_ADMIN_PORT)"
+  worker_token="$(_env_existing "$env_snapshot" WORKER_AUTH_TOKEN)";     worker_token="${worker_token:-$(generate_token)}"
+  bridge_token="$(_env_existing "$env_snapshot" XMPP_BRIDGE_TOKEN)";     bridge_token="${bridge_token:-$(generate_token | cut -c1-32)}"
+  relay_password="$(_env_existing "$env_snapshot" RELAY_PASSWORD)";      relay_password="${relay_password:-$(generate_token | cut -c1-32)}"
+  secrets_key="$(_env_existing "$env_snapshot" SECRETS_MASTER_KEY)";     secrets_key="${secrets_key:-$(generate_token)}"
+  webhook_secret="$(_env_existing "$env_snapshot" HTTP_WEBHOOK_SECRET)"; webhook_secret="${webhook_secret:-$(generate_token)}"
+  ssh_api_token="$(_env_existing "$env_snapshot" SSH_API_TOKEN)";       ssh_api_token="${ssh_api_token:-$(generate_token)}"
+  coord_enabled="$(_env_existing "$env_snapshot" COORD_ENABLED)"; coord_enabled="${coord_enabled:-false}"
+  coord_agent_id="$(_env_existing "$env_snapshot" COORD_AGENT_ID)"; coord_agent_id="${coord_agent_id:-$name}"
+  coord_agent_aliases="$(_env_existing "$env_snapshot" COORD_AGENT_ALIASES)"
+  coord_responder_roster="$(_env_existing "$env_snapshot" COORD_RESPONDER_ROSTER)"
+  coord_channels="$(_env_existing "$env_snapshot" COORD_CHANNELS)"
+  coord_knowledge_share="$(_env_existing "$env_snapshot" COORD_KNOWLEDGE_SHARE)"; coord_knowledge_share="${coord_knowledge_share:-false}"
+  coord_knowledge_publish="$(_env_existing "$env_snapshot" COORD_KNOWLEDGE_PUBLISH)"; coord_knowledge_publish="${coord_knowledge_publish:-false}"
+  coord_knowledge_publishers="$(_env_existing "$env_snapshot" COORD_KNOWLEDGE_PUBLISHERS)"; coord_knowledge_publishers="${coord_knowledge_publishers:-}"
+  coord_knowledge_max_per_hour="$(_env_existing "$env_snapshot" COORD_KNOWLEDGE_MAX_PER_HOUR)"; coord_knowledge_max_per_hour="${coord_knowledge_max_per_hour:-30}"
+  coord_knowledge_global_max_per_hour="$(_env_existing "$env_snapshot" COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR)"; coord_knowledge_global_max_per_hour="${coord_knowledge_global_max_per_hour:-300}"
+  coord_knowledge_min_chars="$(_env_existing "$env_snapshot" COORD_KNOWLEDGE_MIN_CHARS)"; coord_knowledge_min_chars="${coord_knowledge_min_chars:-12}"
+  coord_admin_users="$(_env_existing "$env_snapshot" COORD_ADMIN_USERS)"
+  coord_admin_token="$(_env_existing "$env_snapshot" COORD_ADMIN_TOKEN)"; coord_admin_token="${coord_admin_token:-$(generate_token)}"
+  coord_admin_port="$(_env_existing "$env_snapshot" COORD_ADMIN_PORT)"
   if [[ -z "$coord_admin_port" ]]; then
     coord_admin_port="$(ports_get "$name" coord_admin || true)"
     [[ -n "$coord_admin_port" ]] || die "coordination admin port missing for tenant '$name'"
   fi
   if tenant_darkirc_enabled "$name"; then
-    darkirc_adapter_secret="$(_env_existing "$path" DARKIRC_ADAPTER_SECRET)"
+    darkirc_adapter_secret="$(_env_existing "$env_snapshot" DARKIRC_ADAPTER_SECRET)"
   fi
   # XMPP password: an explicit --xmpp-password wins; else preserve an existing one;
   # else mint a fresh one (first-time provision).
-  [[ -n "$xmpp_password" ]] || { xmpp_password="$(_env_existing "$path" XMPP_PASSWORD)"; xmpp_password="${xmpp_password:-$(generate_token | cut -c1-32)}"; }
-  [[ -n "$opencode_model" ]]    || opencode_model="$(_env_existing "$path" OPENCODE_MODEL)"
-  [[ -n "$kimi_model" ]]        || kimi_model="$(_env_existing "$path" KIMI_MODEL)"
-  [[ -n "$kimi_api_key" ]]      || kimi_api_key="$(_env_existing "$path" KIMI_API_KEY)"
-  [[ -n "$opencode2_model" ]]    || opencode2_model="$(_env_existing "$path" OPENCODE2_MODEL)"
+  [[ -n "$xmpp_password" ]] || { xmpp_password="$(_env_existing "$env_snapshot" XMPP_PASSWORD)"; xmpp_password="${xmpp_password:-$(generate_token | cut -c1-32)}"; }
+  [[ -n "$opencode_model" ]]    || opencode_model="$(_env_existing "$env_snapshot" OPENCODE_MODEL)"
+  [[ -n "$kimi_model" ]]        || kimi_model="$(_env_existing "$env_snapshot" KIMI_MODEL)"
+  [[ -n "$kimi_api_key" ]]      || kimi_api_key="$(_env_existing "$env_snapshot" KIMI_API_KEY)"
+  [[ -n "$opencode2_model" ]]    || opencode2_model="$(_env_existing "$env_snapshot" OPENCODE2_MODEL)"
   # WI#330: the worker images ship a placeholder LLM endpoint their entrypoints
   # refuse to run, so an unset worker base URL can no longer fall through to a
   # baked default. Each worker URL resolves as: explicit per-worker flag >
@@ -1079,26 +1170,26 @@ write_tenant_lunarwing_env() {
   local worker_llm_base_default
   worker_llm_base_default="$(derive_worker_llm_base_url "$llm_base_url" "$tensorzero_url" || true)"
   local opencode_base_url_source kimi_base_url_source opencode2_base_url_source
-  _resolve_worker_base_url "$path" OPENCODE_BASE_URL "$opencode_base_url" "$worker_llm_base_default" opencode_base_url opencode_base_url_source
-  _resolve_worker_base_url "$path" KIMI_BASE_URL "$kimi_base_url" "$worker_llm_base_default" kimi_base_url kimi_base_url_source
-  _resolve_worker_base_url "$path" OPENCODE2_BASE_URL "$opencode2_base_url" "$worker_llm_base_default" opencode2_base_url opencode2_base_url_source
+  _resolve_worker_base_url "$env_snapshot" OPENCODE_BASE_URL "$opencode_base_url" "$worker_llm_base_default" opencode_base_url opencode_base_url_source
+  _resolve_worker_base_url "$env_snapshot" KIMI_BASE_URL "$kimi_base_url" "$worker_llm_base_default" kimi_base_url kimi_base_url_source
+  _resolve_worker_base_url "$env_snapshot" OPENCODE2_BASE_URL "$opencode2_base_url" "$worker_llm_base_default" opencode2_base_url opencode2_base_url_source
   _require_enabled_worker_url "$name" opencode OPENCODE_BASE_URL "$opencode_base_url"
   _require_enabled_worker_url "$name" kimi KIMI_BASE_URL "$kimi_base_url"
   _require_enabled_worker_url "$name" opencode2 OPENCODE2_BASE_URL "$opencode2_base_url"
-  study_notes_home="$(_env_existing "$path" LW2STUDYMCP_HOME)"
-  study_notes_state_home="$(_env_existing "$path" LW2STUDYMCP_STATE_HOME)"
-  study_notes_allow_write="$(_env_existing "$path" LW2STUDYMCP_ALLOW_WRITE)"
+  study_notes_home="$(_env_existing "$env_snapshot" LW2STUDYMCP_HOME)"
+  study_notes_state_home="$(_env_existing "$env_snapshot" LW2STUDYMCP_STATE_HOME)"
+  study_notes_allow_write="$(_env_existing "$env_snapshot" LW2STUDYMCP_ALLOW_WRITE)"
   # One-shot knowledge seed: carry the flag only when it already exists (set
   # solely on the add-tenant path), so upgraded pre-seed tenants stay unarmed.
-  knowledge_seed_flag="$(_env_existing "$path" KNOWLEDGE_SEED_FROM_STUDY_MCP)"
-  knowledge_sync_enabled="$(_env_existing "$path" KNOWLEDGE_SYNC_ENABLED)"
-  knowledge_sync_cadence="$(_env_existing "$path" KNOWLEDGE_SYNC_CADENCE_HOURS)"
-  knowledge_sync_max_records="$(_env_existing "$path" KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN)"
-  knowledge_sync_max_bytes="$(_env_existing "$path" KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN)"
+  knowledge_seed_flag="$(_env_existing "$env_snapshot" KNOWLEDGE_SEED_FROM_STUDY_MCP)"
+  knowledge_sync_enabled="$(_env_existing "$env_snapshot" KNOWLEDGE_SYNC_ENABLED)"
+  knowledge_sync_cadence="$(_env_existing "$env_snapshot" KNOWLEDGE_SYNC_CADENCE_HOURS)"
+  knowledge_sync_max_records="$(_env_existing "$env_snapshot" KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN)"
+  knowledge_sync_max_bytes="$(_env_existing "$env_snapshot" KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN)"
   local vision_mode vision_external_url vision_token_existing
   vision_mode="$(tenant_vision_mode "$name")"
   vision_external_url="$(tenant_vision_external_url "$name")"
-  vision_token_existing="$(_env_existing "$path" VISION_AUTH_TOKEN)"
+  vision_token_existing="$(_env_existing "$env_snapshot" VISION_AUTH_TOKEN)"
   if [[ "$vision_mode" == external ]]; then
     vision_external_url="$(_normalize_external_vision_url "$vision_external_url")" \
       || die "stored external LunarVision URL is invalid for tenant '$name'"
@@ -1107,21 +1198,21 @@ write_tenant_lunarwing_env() {
   fi
 
   local transcription_enabled transcription_provider transcription_model voice_enabled
-  voice_enabled="$(_env_existing "$(tenant_env_dir "$name")/voice.env" VOICE_ENABLED)"
+  voice_enabled="$(_env_existing "$voice_snapshot" VOICE_ENABLED)"
   voice_enabled="${voice_enabled:-false}"
-  transcription_enabled="$(_env_existing "$path" TRANSCRIPTION_ENABLED)"
+  transcription_enabled="$(_env_existing "$env_snapshot" TRANSCRIPTION_ENABLED)"
   transcription_enabled="${transcription_enabled:-$voice_enabled}"
-  transcription_provider="$(_env_existing "$path" TRANSCRIPTION_PROVIDER)"
+  transcription_provider="$(_env_existing "$env_snapshot" TRANSCRIPTION_PROVIDER)"
   transcription_provider="${transcription_provider:-lunarvoice}"
-  transcription_model="$(_env_existing "$path" TRANSCRIPTION_MODEL)"
+  transcription_model="$(_env_existing "$env_snapshot" TRANSCRIPTION_MODEL)"
   transcription_model="${transcription_model:-whisper-tiny}"
   # LLM circuit breaker: fleet defaults (open after 5 fully-retried failures,
   # probe again after 15s — WI#239). These are tunables, so preserve an
   # operator's per-tenant override across re-provision rather than clobbering
   # it.
   local cb_threshold cb_recovery
-  cb_threshold="$(_env_existing "$path" LLM_CIRCUIT_BREAKER_THRESHOLD)";  cb_threshold="${cb_threshold:-5}"
-  cb_recovery="$(_env_existing "$path" LLM_CIRCUIT_BREAKER_RECOVERY_SECS)"; cb_recovery="${cb_recovery:-15}"
+  cb_threshold="$(_env_existing "$env_snapshot" LLM_CIRCUIT_BREAKER_THRESHOLD)";  cb_threshold="${cb_threshold:-5}"
+  cb_recovery="$(_env_existing "$env_snapshot" LLM_CIRCUIT_BREAKER_RECOVERY_SECS)"; cb_recovery="${cb_recovery:-15}"
   # Stable + migration-safe; resolved before the heredoc so it can read an
   # existing DATABASE_URL (preserving an already-initialised DB's password).
   pg_password="$(tenant_pg_password "$name")"
@@ -1147,22 +1238,22 @@ write_tenant_lunarwing_env() {
   if [[ -n "$llm_model" ]]; then
     llm_model_effective="$llm_model"
   else
-    llm_model_effective="$(_env_existing "$path" LLM_MODEL)"
+    llm_model_effective="$(_env_existing "$env_snapshot" LLM_MODEL)"
     llm_model_effective="${llm_model_effective:-tensorzero::function_name::lunarwing}"
   fi
   if [[ -n "$gateway_host" ]]; then
     gateway_host_effective="$gateway_host"
   else
-    gateway_host_effective="$(_env_existing "$path" GATEWAY_HOST)"
+    gateway_host_effective="$(_env_existing "$env_snapshot" GATEWAY_HOST)"
     gateway_host_effective="${gateway_host_effective:-127.0.0.1}"
   fi
-  mascot_enabled="$(_env_existing "$path" MASCOT_ENABLED)"
+  mascot_enabled="$(_env_existing "$env_snapshot" MASCOT_ENABLED)"
   mascot_enabled="${mascot_enabled:-false}"
   if [[ -n "$xmpp_allow_from" ]]; then
     xmpp_allow_from_effective="$(build_xmpp_allow_from "$xmpp_jid" "$xmpp_allow_from")"
   else
     # Preserve an existing list; allow the local user to DM on first write.
-    xmpp_allow_from_effective="$(_env_existing "$path" XMPP_ALLOW_FROM)"
+    xmpp_allow_from_effective="$(_env_existing "$env_snapshot" XMPP_ALLOW_FROM)"
     xmpp_allow_from_effective="${xmpp_allow_from_effective:-user@xmpp.localhost}"
   fi
 
@@ -1171,12 +1262,12 @@ write_tenant_lunarwing_env() {
   # across upgrade/rebuild/re-render — never clobber an operator's setting;
   # only a first write (or an absent key) falls back to the defaults.
   local engine_v2 engine_v2_channels orchestrator_self_modify
-  engine_v2="$(_env_existing "$path" ENGINE_V2)"; engine_v2="${engine_v2:-true}"
-  engine_v2_channels="$(_env_existing "$path" ENGINE_V2_CHANNELS)"
+  engine_v2="$(_env_existing "$env_snapshot" ENGINE_V2)"; engine_v2="${engine_v2:-true}"
+  engine_v2_channels="$(_env_existing "$env_snapshot" ENGINE_V2_CHANNELS)"
   engine_v2_channels="${engine_v2_channels:-xmpp,weechat,darkirc}"
   # WI#282: new tenants opt into stored orchestrator and prompt-overlay updates.
   # Preserve an explicit operator opt-out across add-tenant re-renders.
-  orchestrator_self_modify="$(_env_existing "$path" ORCHESTRATOR_SELF_MODIFY)"
+  orchestrator_self_modify="$(_env_existing "$env_snapshot" ORCHESTRATOR_SELF_MODIFY)"
   orchestrator_self_modify="${orchestrator_self_modify:-true}"
 
   # Sandbox egress (WI#154): multi-tenant hosts run worker WSS ports, tenant
@@ -1187,7 +1278,7 @@ write_tenant_lunarwing_env() {
   # SANDBOX_NETWORK=proxy is preserved on re-render (explicit opt-in for
   # tenants that genuinely need allowlisted web access).
   local sandbox_network
-  sandbox_network="$(_env_existing "$path" SANDBOX_NETWORK)"
+  sandbox_network="$(_env_existing "$env_snapshot" SANDBOX_NETWORK)"
   sandbox_network="${sandbox_network:-none}"
 
   # Generic sandbox defaults (WI#223): MT tenants pin the runtime and image so
@@ -1199,16 +1290,16 @@ write_tenant_lunarwing_env() {
   # re-render; the daemon still falls back podman->docker when SANDBOX_RUNTIME
   # names a binary the host lacks.
   local sandbox_runtime sandbox_image sandbox_auto_pull
-  sandbox_runtime="$(_env_existing "$path" SANDBOX_RUNTIME)"
+  sandbox_runtime="$(_env_existing "$env_snapshot" SANDBOX_RUNTIME)"
   sandbox_runtime="${sandbox_runtime:-podman}"
-  sandbox_image="$(_env_existing "$path" SANDBOX_IMAGE)"
+  sandbox_image="$(_env_existing "$env_snapshot" SANDBOX_IMAGE)"
   sandbox_image="${sandbox_image:-lunarwing-sandbox:latest}"
-  sandbox_auto_pull="$(_env_existing "$path" SANDBOX_AUTO_PULL)"
+  sandbox_auto_pull="$(_env_existing "$env_snapshot" SANDBOX_AUTO_PULL)"
   sandbox_auto_pull="${sandbox_auto_pull:-false}"
   # Sandbox-visible daemon log (WI#287): info caps the copy at INFO; an
   # operator-set off or debug is preserved on re-render.
   local sandbox_tenant_logs
-  sandbox_tenant_logs="$(_env_existing "$path" SANDBOX_TENANT_LOGS)"
+  sandbox_tenant_logs="$(_env_existing "$env_snapshot" SANDBOX_TENANT_LOGS)"
   sandbox_tenant_logs="${sandbox_tenant_logs:-info}"
 
   # Sensible new-tenant defaults (WI#239): each of these is written into the
@@ -1221,40 +1312,44 @@ write_tenant_lunarwing_env() {
   local sandbox_policy sandbox_allow_full_access
   local engine_v2_model_recovery_attempts engine_v2_model_recovery_total_attempts engine_v2_tool_async_timeout_secs
   local skill_self_improvement skill_prune_quarantine_days reflex_compiler_enabled
-  llm_turn_budget="$(_env_existing "$path" LLM_TURN_BUDGET_SECS)";                llm_turn_budget="${llm_turn_budget:-599}"
-  llm_request_timeout="$(_env_existing "$path" LLM_REQUEST_TIMEOUT_SECS)";        llm_request_timeout="${llm_request_timeout:-2599}"
-  allow_local_tools="$(_env_existing "$path" ALLOW_LOCAL_TOOLS)";                 allow_local_tools="${allow_local_tools:-false}"
+  llm_turn_budget="$(_env_existing "$env_snapshot" LLM_TURN_BUDGET_SECS)";                llm_turn_budget="${llm_turn_budget:-599}"
+  llm_request_timeout="$(_env_existing "$env_snapshot" LLM_REQUEST_TIMEOUT_SECS)";        llm_request_timeout="${llm_request_timeout:-2599}"
+  allow_local_tools="$(_env_existing "$env_snapshot" ALLOW_LOCAL_TOOLS)";                 allow_local_tools="${allow_local_tools:-false}"
   # Migrate the legacy key on re-render, but prefer the canonical setting when
   # both exist. Only write the canonical key so an operator override survives.
-  auto_approve_tools="$(_env_existing "$path" AGENT_AUTO_APPROVE_TOOLS)"
+  auto_approve_tools="$(_env_existing "$env_snapshot" AGENT_AUTO_APPROVE_TOOLS)"
   if [[ -z "$auto_approve_tools" ]]; then
-    auto_approve_tools="$(_env_existing "$path" AUTO_APPROVE_TOOLS)"
+    auto_approve_tools="$(_env_existing "$env_snapshot" AUTO_APPROVE_TOOLS)"
   fi
   auto_approve_tools="${auto_approve_tools:-false}"
-  agent_max_tool_iterations="$(_env_existing "$path" AGENT_MAX_TOOL_ITERATIONS)"; agent_max_tool_iterations="${agent_max_tool_iterations:-99}"
-  sandbox_policy="$(_env_existing "$path" SANDBOX_POLICY)";                       sandbox_policy="${sandbox_policy:-workspace_write}"
-  sandbox_allow_full_access="$(_env_existing "$path" SANDBOX_ALLOW_FULL_ACCESS)"; sandbox_allow_full_access="${sandbox_allow_full_access:-false}"
-  engine_v2_model_recovery_attempts="$(_env_existing "$path" ENGINE_V2_MODEL_RECOVERY_ATTEMPTS)"
+  agent_max_tool_iterations="$(_env_existing "$env_snapshot" AGENT_MAX_TOOL_ITERATIONS)"; agent_max_tool_iterations="${agent_max_tool_iterations:-99}"
+  sandbox_policy="$(_env_existing "$env_snapshot" SANDBOX_POLICY)";                       sandbox_policy="${sandbox_policy:-workspace_write}"
+  sandbox_allow_full_access="$(_env_existing "$env_snapshot" SANDBOX_ALLOW_FULL_ACCESS)"; sandbox_allow_full_access="${sandbox_allow_full_access:-false}"
+  engine_v2_model_recovery_attempts="$(_env_existing "$env_snapshot" ENGINE_V2_MODEL_RECOVERY_ATTEMPTS)"
   engine_v2_model_recovery_attempts="${engine_v2_model_recovery_attempts:-2}"
-  engine_v2_model_recovery_total_attempts="$(_env_existing "$path" ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS)"
+  engine_v2_model_recovery_total_attempts="$(_env_existing "$env_snapshot" ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS)"
   engine_v2_model_recovery_total_attempts="${engine_v2_model_recovery_total_attempts:-2}"
-  engine_v2_max_output_tokens="$(_env_existing "$path" ENGINE_V2_MAX_OUTPUT_TOKENS)"
+  engine_v2_max_output_tokens="$(_env_existing "$env_snapshot" ENGINE_V2_MAX_OUTPUT_TOKENS)"
   engine_v2_max_output_tokens="${engine_v2_max_output_tokens:-8192}"
-  engine_v2_tool_async_timeout_secs="$(_env_existing "$path" ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS)"
+  engine_v2_tool_async_timeout_secs="$(_env_existing "$env_snapshot" ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS)"
   engine_v2_tool_async_timeout_secs="${engine_v2_tool_async_timeout_secs:-7999}"
-  skill_self_improvement="$(_env_existing "$path" SKILL_SELF_IMPROVEMENT)";       skill_self_improvement="${skill_self_improvement:-true}"
-  skill_prune_quarantine_days="$(_env_existing "$path" SKILL_PRUNE_QUARANTINE_DAYS)"
+  skill_self_improvement="$(_env_existing "$env_snapshot" SKILL_SELF_IMPROVEMENT)";       skill_self_improvement="${skill_self_improvement:-true}"
+  skill_prune_quarantine_days="$(_env_existing "$env_snapshot" SKILL_PRUNE_QUARANTINE_DAYS)"
   skill_prune_quarantine_days="${skill_prune_quarantine_days:-15}"
-  reflex_compiler_enabled="$(_env_existing "$path" REFLEX_COMPILER_ENABLED)";     reflex_compiler_enabled="${reflex_compiler_enabled:-false}"
+  reflex_compiler_enabled="$(_env_existing "$env_snapshot" REFLEX_COMPILER_ENABLED)";     reflex_compiler_enabled="${reflex_compiler_enabled:-false}"
   # WI#291: operator cap on tool-calling rounds per lightweight routine run.
   # The daemon default (3) left a digest routine no round for its final send.
   local routines_lightweight_max_iterations
-  routines_lightweight_max_iterations="$(_env_existing "$path" ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS)"
+  routines_lightweight_max_iterations="$(_env_existing "$env_snapshot" ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS)"
   routines_lightweight_max_iterations="${routines_lightweight_max_iterations:-6}"
 
-  (
-    umask 077
-    cat >"$path" <<ENVEOF
+  # WI#390: stage the full render in a root-private file, then commit it
+  # through the tenant-side atomic writer. Root never opens lunarwing.env
+  # inside the tenant-writable env dir, so a pre-placed or raced symlink there
+  # cannot redirect the write onto an attacker-chosen path.
+  local staged_env
+  staged_env="$(mktemp)" || die "could not stage the env render for tenant '$name'"
+  cat >"$staged_env" <<ENVEOF
 LUNARWING_BASE_DIR=$state_dir
 LUNARWING_SOCKET=$run_dir/lunarwing.sock
 
@@ -1475,13 +1570,12 @@ ONBOARD_COMPLETED=true
 HEARTBEAT_ENABLED=false
 RUST_LOG=lunarwing=info
 ENVEOF
-  )
   if tenant_darkirc_enabled "$name"; then
     local darkirc_adapter_port
     darkirc_adapter_port="$(ports_get "$name" darkirc_adapter)" || true
     darkirc_adapter_secret="${darkirc_adapter_secret:-$(generate_token | cut -c1-32)}"
     printf '\nDARKIRC_ADAPTER_URL=http://127.0.0.1:%s\nDARKIRC_ADAPTER_SECRET=%s\n' \
-      "$darkirc_adapter_port" "$darkirc_adapter_secret" >> "$path"
+      "$darkirc_adapter_port" "$darkirc_adapter_secret" >> "$staged_env"
   fi
 
   # LunarVision: preserve an operator-selected external HTTPS instance across
@@ -1493,12 +1587,12 @@ ENVEOF
     vision_token="$vision_token_existing"
   else
     vision_service_url="http://127.0.0.1:${vision_port}"
-    vision_token="$(_env_existing "$(tenant_env_dir "$name")/vision.env" LUNARWING_AUTH_TOKEN)"
+    vision_token="$(_env_existing "$vision_snapshot" LUNARWING_AUTH_TOKEN)"
     vision_token="${vision_token:-$(generate_token)}"
   fi
   if [[ -n "$vision_port" ]]; then
     printf '\nVISION_SERVICE_URL=%s\nVISION_AUTH_TOKEN=%s\n' \
-      "$vision_service_url" "$(_quote_env_value "$vision_token")" >> "$path"
+      "$vision_service_url" "$(_quote_env_value "$vision_token")" >> "$staged_env"
   fi
   # LunarVoice is provisioned but disabled until explicitly enabled. Preserve
   # any operator-selected cloud transcription provider on re-render. The
@@ -1509,60 +1603,64 @@ ENVEOF
   local voice_port voice_token voice_max_tts_secs voice_req_timeout
   voice_port="$(ports_get "$name" voice_service)" || true
   if [[ -n "$voice_port" ]]; then
-    voice_token="$(_env_existing "$(tenant_env_dir "$name")/voice.env" VOICE_AUTH_TOKEN)"
+    voice_token="$(_env_existing "$voice_snapshot" VOICE_AUTH_TOKEN)"
     voice_token="${voice_token:-$(generate_token)}"
-    voice_max_tts_secs="$(_env_existing "$(tenant_env_dir "$name")/voice.env" VOICE_MAX_TTS_AUDIO_SECS)"
+    voice_max_tts_secs="$(_env_existing "$voice_snapshot" VOICE_MAX_TTS_AUDIO_SECS)"
     voice_max_tts_secs="${voice_max_tts_secs:-300}"
-    voice_req_timeout="$(_env_existing "$(tenant_env_dir "$name")/voice.env" VOICE_REQUEST_TIMEOUT_SECS)"
+    voice_req_timeout="$(_env_existing "$voice_snapshot" VOICE_REQUEST_TIMEOUT_SECS)"
     voice_req_timeout="${voice_req_timeout:-120}"
     printf '\nVOICE_SERVICE_URL=http://127.0.0.1:%s\nVOICE_AUTH_TOKEN=%s\nVOICE_MAX_TTS_AUDIO_SECS=%s\nVOICE_REQUEST_TIMEOUT_SECS=%s\n' \
-      "$voice_port" "$voice_token" "$voice_max_tts_secs" "$voice_req_timeout" >> "$path"
+      "$voice_port" "$voice_token" "$voice_max_tts_secs" "$voice_req_timeout" >> "$staged_env"
     printf 'TRANSCRIPTION_ENABLED=%s\nTRANSCRIPTION_PROVIDER=%s\nTRANSCRIPTION_MODEL=%s\n' \
-      "$transcription_enabled" "$transcription_provider" "$transcription_model" >> "$path"
+      "$transcription_enabled" "$transcription_provider" "$transcription_model" >> "$staged_env"
   fi
-  [[ -n "$opencode_model" ]]    && printf '\nOPENCODE_MODEL=%s\n'    "$opencode_model"     >> "$path"
+  [[ -n "$opencode_model" ]]    && printf '\nOPENCODE_MODEL=%s\n'    "$opencode_model"     >> "$staged_env"
   # WI#330: worker base URLs are operator/tenant-supplied, so quote them like
   # the other validated values. An inherited value carries a SOURCE marker so
   # the next render re-derives it and export-tenant does not carry it as a
   # custom override; explicit/operator values carry no marker.
   if [[ -n "$opencode_base_url" ]]; then
-    printf 'OPENCODE_BASE_URL=%s\n' "$(_quote_env_value "$opencode_base_url")" >> "$path"
+    printf 'OPENCODE_BASE_URL=%s\n' "$(_quote_env_value "$opencode_base_url")" >> "$staged_env"
     [[ "$opencode_base_url_source" != "inherited" ]] \
-      || printf 'OPENCODE_BASE_URL_SOURCE=inherited\n' >> "$path"
+      || printf 'OPENCODE_BASE_URL_SOURCE=inherited\n' >> "$staged_env"
   fi
-  [[ -n "$kimi_model" ]]        && printf '\nKIMI_MODEL=%s\n'        "$kimi_model"        >> "$path"
+  [[ -n "$kimi_model" ]]        && printf '\nKIMI_MODEL=%s\n'        "$kimi_model"        >> "$staged_env"
   if [[ -n "$kimi_base_url" ]]; then
-    printf 'KIMI_BASE_URL=%s\n' "$(_quote_env_value "$kimi_base_url")" >> "$path"
+    printf 'KIMI_BASE_URL=%s\n' "$(_quote_env_value "$kimi_base_url")" >> "$staged_env"
     [[ "$kimi_base_url_source" != "inherited" ]] \
-      || printf 'KIMI_BASE_URL_SOURCE=inherited\n' >> "$path"
+      || printf 'KIMI_BASE_URL_SOURCE=inherited\n' >> "$staged_env"
   fi
   [[ -n "$kimi_api_key" ]] \
-    && printf 'KIMI_API_KEY=%s\n' "$(_quote_env_value "$kimi_api_key")" >> "$path"
-  [[ -n "$opencode2_model" ]]    && printf '\nOPENCODE2_MODEL=%s\n'    "$opencode2_model"     >> "$path"
+    && printf 'KIMI_API_KEY=%s\n' "$(_quote_env_value "$kimi_api_key")" >> "$staged_env"
+  [[ -n "$opencode2_model" ]]    && printf '\nOPENCODE2_MODEL=%s\n'    "$opencode2_model"     >> "$staged_env"
   if [[ -n "$opencode2_base_url" ]]; then
-    printf 'OPENCODE2_BASE_URL=%s\n' "$(_quote_env_value "$opencode2_base_url")" >> "$path"
+    printf 'OPENCODE2_BASE_URL=%s\n' "$(_quote_env_value "$opencode2_base_url")" >> "$staged_env"
     [[ "$opencode2_base_url_source" != "inherited" ]] \
-      || printf 'OPENCODE2_BASE_URL_SOURCE=inherited\n' >> "$path"
+      || printf 'OPENCODE2_BASE_URL_SOURCE=inherited\n' >> "$staged_env"
   fi
   if [[ -n "$study_notes_home" ]]; then
     printf '\n# Shared LunarWing Study Notes MCP\nLW2STUDYMCP_HOME=%s\n' \
-      "$study_notes_home" >> "$path"
+      "$study_notes_home" >> "$staged_env"
     [[ -z "$study_notes_state_home" ]] \
-      || printf 'LW2STUDYMCP_STATE_HOME=%s\n' "$study_notes_state_home" >> "$path"
+      || printf 'LW2STUDYMCP_STATE_HOME=%s\n' "$study_notes_state_home" >> "$staged_env"
     [[ -z "$study_notes_allow_write" ]] \
-      || printf 'LW2STUDYMCP_ALLOW_WRITE=%s\n' "$study_notes_allow_write" >> "$path"
+      || printf 'LW2STUDYMCP_ALLOW_WRITE=%s\n' "$study_notes_allow_write" >> "$staged_env"
     [[ -z "$knowledge_seed_flag" ]] \
-      || printf 'KNOWLEDGE_SEED_FROM_STUDY_MCP=%s\n' "$knowledge_seed_flag" >> "$path"
+      || printf 'KNOWLEDGE_SEED_FROM_STUDY_MCP=%s\n' "$knowledge_seed_flag" >> "$staged_env"
     [[ -z "$knowledge_sync_enabled" ]] \
-      || printf 'KNOWLEDGE_SYNC_ENABLED=%s\n' "$knowledge_sync_enabled" >> "$path"
+      || printf 'KNOWLEDGE_SYNC_ENABLED=%s\n' "$knowledge_sync_enabled" >> "$staged_env"
     [[ -z "$knowledge_sync_cadence" ]] \
-      || printf 'KNOWLEDGE_SYNC_CADENCE_HOURS=%s\n' "$knowledge_sync_cadence" >> "$path"
+      || printf 'KNOWLEDGE_SYNC_CADENCE_HOURS=%s\n' "$knowledge_sync_cadence" >> "$staged_env"
     [[ -z "$knowledge_sync_max_records" ]] \
-      || printf 'KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN=%s\n' "$knowledge_sync_max_records" >> "$path"
+      || printf 'KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN=%s\n' "$knowledge_sync_max_records" >> "$staged_env"
     [[ -z "$knowledge_sync_max_bytes" ]] \
-      || printf 'KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN=%s\n' "$knowledge_sync_max_bytes" >> "$path"
+      || printf 'KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN=%s\n' "$knowledge_sync_max_bytes" >> "$staged_env"
   fi
-  chown "$name:$name" "$path"
+  if ! write_tenant_file_atomic "$name" "$path" 600 <"$staged_env"; then
+    rm -f -- "$staged_env" "$env_snapshot" "$vision_snapshot" "$voice_snapshot"
+    die "could not safely write tenant env: $path"
+  fi
+  rm -f -- "$staged_env" "$env_snapshot" "$vision_snapshot" "$voice_snapshot"
   say "wrote: $path"
 }
 
@@ -1581,11 +1679,18 @@ write_tenant_bridge_env() {
 
   local state_dir bridge_token
   state_dir="$(tenant_state_dir "$name")"
-  bridge_token="$(_read_env_value "$(tenant_env_dir "$name")/lunarwing.env" XMPP_BRIDGE_TOKEN)"
+  # WI#390 (review IG-1): XMPP_BRIDGE_TOKEN / XMPP_PASSWORD / XMPP_ALLOW_FROM
+  # come from one snapshot of lunarwing.env read as the tenant — root
+  # resolving the live tenant-writable path would follow a cross-tenant
+  # symlink and this writer would then render the other tenant's XMPP
+  # credentials into this tenant's bridge env.
+  local lunarwing_snapshot
+  _snapshot_tenant_env "$name" "$(tenant_env_dir "$name")/lunarwing.env" lunarwing_snapshot
+  bridge_token="$(_read_env_value "$lunarwing_snapshot" XMPP_BRIDGE_TOKEN)"
   [[ -n "$bridge_token" ]] || bridge_token="$(generate_token | cut -c1-32)"
 
   local xmpp_pass_val
-  xmpp_pass_val="$(_read_env_value "$(tenant_env_dir "$name")/lunarwing.env" XMPP_PASSWORD)"
+  xmpp_pass_val="$(_read_env_value "$lunarwing_snapshot" XMPP_PASSWORD)"
   [[ -n "$xmpp_pass_val" ]] || xmpp_pass_val="${xmpp_password:-$(generate_token | cut -c1-32)}"
 
   # Idempotent XMPP allow-from JSON: an explicit flag wins; else re-derive from
@@ -1596,15 +1701,16 @@ write_tenant_bridge_env() {
     xmpp_allow_from_json_effective="$(build_xmpp_allow_from_json "$xmpp_jid" "$xmpp_allow_from")"
   else
     local daemon_csv
-    daemon_csv="$(_read_env_value "$(tenant_env_dir "$name")/lunarwing.env" XMPP_ALLOW_FROM)"
+    daemon_csv="$(_read_env_value "$lunarwing_snapshot" XMPP_ALLOW_FROM)"
     # Do not prepend the agent JID: the daemon list may deliberately contain
     # only user@xmpp.localhost (or a custom operator-set allowlist).
     xmpp_allow_from_json_effective="$(build_xmpp_allow_from_json "" "${daemon_csv:-user@xmpp.localhost}")"
   fi
 
-  (
-    umask 077
-    cat >"$path" <<ENVEOF
+  # WI#390: write as the tenant through the atomic writer — root never opens
+  # xmpp-bridge.env inside the tenant-writable env dir (see proxy.env). The
+  # explicit || die keeps the refusal fatal even when errexit is suppressed.
+  cat <<ENVEOF | write_tenant_file_atomic "$name" "$path" 600 || { rm -f -- "$lunarwing_snapshot"; die "could not safely write $path"; }
 LUNARWING_BASE_DIR=$state_dir
 IRONCLAW_BASE_DIR=$state_dir
 XMPP_BRIDGE_BIND=127.0.0.1:${bridge_port}
@@ -1624,8 +1730,7 @@ XMPP_ALLOW_PLAINTEXT_FALLBACK=true
 XMPP_RESOURCE=$name
 XMPP_BRIDGE_WAIT_SECONDS=15
 ENVEOF
-  )
-  chown "$name:$name" "$path"
+  rm -f -- "$lunarwing_snapshot"
   say "wrote: $path"
 }
 
@@ -1637,15 +1742,16 @@ write_tenant_proxy_env() {
   path="$(tenant_env_dir "$name")/proxy.env"
   proxy_port="$(ports_get "$name" proxy)"
 
-  (
-    umask 077
-    cat >"$path" <<ENVEOF
+  # WI#390: write as the tenant through the atomic writer — root never opens
+  # proxy.env inside the tenant-writable env dir, so a pre-placed or raced
+  # symlink there cannot redirect the write onto an attacker-chosen path.
+  # The explicit || die keeps the refusal fatal even when errexit is suppressed
+  # (e.g. the whole call sits inside an if-condition).
+  cat <<ENVEOF | write_tenant_file_atomic "$name" "$path" 600 || die "could not safely write $path"
 PROXY_PORT=$proxy_port
 PROXY_BIND=127.0.0.1
 TENSORZERO_URL=$tensorzero_url
 ENVEOF
-  )
-  chown "$name:$name" "$path"
   say "wrote: $path"
 }
 
@@ -1665,16 +1771,23 @@ write_tenant_darkirc_adapter_env() {
     || die "could not safely read DarkIRC adapter secret for tenant '$name'"
   [[ -n "$adapter_secret" ]] || adapter_secret="$(generate_token | cut -c1-32)"
 
+  # WI#390 (review IG-4): stage the render root-private and commit through the
+  # tenant-side atomic writer with a fatal refusal — the previous pipe form
+  # ignored a writer refusal (and both callers ignored the function's return),
+  # so a symlinked target failed open under the lifecycle lock's suppressed
+  # errexit. Staging also honours the writer contract: a fallible producer
+  # never pipes straight in.
+  local staged rc=0
+  staged="$(mktemp)" || die "could not stage the DarkIRC adapter env for tenant '$name'"
   if [[ -f "$TEMPLATES_DIR/darkirc-adapter.env.template" ]]; then
     render_template_content \
       "darkirc-adapter.env.template" \
       "TENANT_NAME=$name" \
       "DARKIRC_IRC_PORT=$darkirc_irc_port" \
       "DARKIRC_ADAPTER_PORT=$adapter_port" \
-      "ADAPTER_SECRET=$adapter_secret" \
-      | write_tenant_file_atomic "$name" "$path" 600
+      "ADAPTER_SECRET=$adapter_secret" >"$staged" || rc=1
   else
-    cat <<ENVEOF | write_tenant_file_atomic "$name" "$path" 600
+    cat >"$staged" <<ENVEOF
 DARKIRC_HOST=127.0.0.1
 DARKIRC_PORT=$darkirc_irc_port
 DARKIRC_NICK=${name}-bridge
@@ -1686,6 +1799,11 @@ ADAPTER_SECRET=$adapter_secret
 ADAPTER_LOG_LEVEL=INFO
 ENVEOF
   fi
+  if [[ "$rc" -eq 0 ]]; then
+    write_tenant_file_atomic "$name" "$path" 600 <"$staged" || rc=1
+  fi
+  rm -f -- "$staged"
+  [[ "$rc" -eq 0 ]] || die "could not safely write the DarkIRC adapter env for tenant '$name'"
   say "wrote: $path"
   if [[ "$lock_owned" == "true" ]]; then
     darkirc_writer_unlock
@@ -2157,14 +2275,22 @@ ensure_ssh_config() {
     return 0
   fi
 
+  sudo -u "$name" mkdir -p "$state_dir"
+
+  # WI#390: stage the current content (read as the tenant), extend the staged
+  # copy as root, and commit through the tenant-side atomic writer — root never
+  # opens the tenant-writable config.toml for writing.
+  local staged_cfg
+  staged_cfg="$(mktemp)" || return 1
+  if [[ -f "$config_path" ]] \
+    && ! tenant_cat "$name" "$config_path" >"$staged_cfg"; then
+    rm -f -- "$staged_cfg"
+    return 1
+  fi
   # Create config.toml with a header if it doesn't exist yet (same pattern as
   # ensure_external_worker_config). APPEND only — never truncate.
-  if [[ ! -f "$config_path" ]]; then
-    sudo -u "$name" mkdir -p "$state_dir"
-    (
-      umask 077
-      printf '# LunarWing tenant configuration (auto-generated by lunarwing-mt-admin.sh).\n'
-    ) >"$config_path"
+  if [[ ! -s "$staged_cfg" ]]; then
+    printf '# LunarWing tenant configuration (auto-generated by lunarwing-mt-admin.sh).\n' >>"$staged_cfg"
   fi
 
   # Append the SSH host block. This is valid TOML because [[ssh.hosts]] is an
@@ -2178,10 +2304,13 @@ ensure_ssh_config() {
     printf 'user = "%s"\n' "$ssh_user"
     printf 'key_type = "ed25519"\n'
     printf 'host_key_mode = "AcceptFirst"\n'
-  } >>"$config_path"
+  } >>"$staged_cfg"
 
-  chown "$name:$name" "$config_path"
-  chmod 600 "$config_path"
+  if ! write_tenant_file_atomic "$name" "$config_path" 600 owned-parent <"$staged_cfg"; then
+    rm -f -- "$staged_cfg"
+    return 1
+  fi
+  rm -f -- "$staged_cfg"
   say "wrote SSH host config to $config_path (host=$ssh_host user=$ssh_user)"
 }
 
@@ -2229,6 +2358,17 @@ tenant_cat() {  # <tenant> <file>
     cat -- "$path"
   else
     sudo -u "$name" cat -- "$path"
+  fi
+}
+
+# chmod as the tenant: chmod follows symlinks, so running it as root on a
+# tenant-writable path could change an attacker-chosen file's mode (WI#390).
+tenant_chmod() {  # <tenant> <mode> <file>
+  local name="$1" mode="$2" path="$3"
+  if [[ "$(id -un)" == "$name" ]]; then
+    chmod "$mode" -- "$path"
+  else
+    sudo -u "$name" chmod "$mode" -- "$path"
   fi
 }
 
@@ -2568,76 +2708,89 @@ upload_tenant_brave_search_secret() {
 patch_tenant_coordination_env() {
   local name="$1" env_path="$2"
   local coord_admin_port coord_admin_token
-  chmod 0600 "$env_path"
-  coord_admin_port="$(_env_existing "$env_path" COORD_ADMIN_PORT)"
+  # Mode-harden before any edit can fail — a mid-backfill die must not
+  # leave the env world-readable. Done as the tenant: chmod follows
+  # symlinks, so a root chmod here could rewrite an attacker-chosen
+  # file's mode (WI#390).
+  tenant_chmod "$name" 0600 "$env_path"
+  # WI#390 (review IG-1): every value/presence read below comes from ONE
+  # snapshot taken as the tenant — never from root resolving the live
+  # tenant-writable path. A cross-tenant symlink present for the read window
+  # is unreadable to the tenant-side cat and dies here; without the snapshot,
+  # root's reads would follow it and the appends below would write the other
+  # tenant's COORD_ADMIN_TOKEN/COORD_ADMIN_PORT into this tenant's env.
+  local env_snapshot
+  _snapshot_tenant_env "$name" "$env_path" env_snapshot
+  coord_admin_port="$(_env_existing "$env_snapshot" COORD_ADMIN_PORT)"
   if [[ -z "$coord_admin_port" ]]; then
     coord_admin_port="$(ports_get "$name" coord_admin || true)"
     [[ -n "$coord_admin_port" ]] || die "coordination admin port missing for tenant '$name'"
   fi
-  coord_admin_token="$(_env_existing "$env_path" COORD_ADMIN_TOKEN)"
+  coord_admin_token="$(_env_existing "$env_snapshot" COORD_ADMIN_TOKEN)"
   [[ -n "$coord_admin_token" ]] || coord_admin_token="$(generate_token)"
-  if ! grep -q '^COORD_ENABLED=' "$env_path"; then
-    printf '\n# Multi-agent coordination (disabled until channels are configured explicitly)\nCOORD_ENABLED=false\n' >>"$env_path"
+  if ! grep -q '^COORD_ENABLED=' "$env_snapshot"; then
+    printf '\n# Multi-agent coordination (disabled until channels are configured explicitly)\nCOORD_ENABLED=false\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_ENABLED=false to $env_path"
   fi
-  if ! grep -q '^COORD_AGENT_ID=' "$env_path"; then
-    printf 'COORD_AGENT_ID=%s\n' "$name" >>"$env_path"
+  if ! grep -q '^COORD_AGENT_ID=' "$env_snapshot"; then
+    printf 'COORD_AGENT_ID=%s\n' "$name" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_AGENT_ID=$name to $env_path"
   fi
-  if ! grep -q '^COORD_CHANNELS=' "$env_path"; then
-    printf 'COORD_CHANNELS=\n' >>"$env_path"
+  if ! grep -q '^COORD_CHANNELS=' "$env_snapshot"; then
+    printf 'COORD_CHANNELS=\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_CHANNELS to $env_path"
   fi
-  if ! grep -q '^COORD_AGENT_ALIASES=' "$env_path"; then
-    printf 'COORD_AGENT_ALIASES=\n' >>"$env_path"
+  if ! grep -q '^COORD_AGENT_ALIASES=' "$env_snapshot"; then
+    printf 'COORD_AGENT_ALIASES=\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_AGENT_ALIASES to $env_path"
   fi
-  if ! grep -q '^COORD_RESPONDER_ROSTER=' "$env_path"; then
-    printf 'COORD_RESPONDER_ROSTER=\n' >>"$env_path"
+  if ! grep -q '^COORD_RESPONDER_ROSTER=' "$env_snapshot"; then
+    printf 'COORD_RESPONDER_ROSTER=\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_RESPONDER_ROSTER to $env_path"
   fi
-  if ! grep -q '^COORD_KNOWLEDGE_SHARE=' "$env_path"; then
-    printf 'COORD_KNOWLEDGE_SHARE=false\n' >>"$env_path"
+  if ! grep -q '^COORD_KNOWLEDGE_SHARE=' "$env_snapshot"; then
+    printf 'COORD_KNOWLEDGE_SHARE=false\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_KNOWLEDGE_SHARE=false to $env_path"
   fi
-  if ! grep -q '^COORD_KNOWLEDGE_PUBLISH=' "$env_path"; then
-    printf 'COORD_KNOWLEDGE_PUBLISH=false\n' >>"$env_path"
+  if ! grep -q '^COORD_KNOWLEDGE_PUBLISH=' "$env_snapshot"; then
+    printf 'COORD_KNOWLEDGE_PUBLISH=false\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_KNOWLEDGE_PUBLISH=false to $env_path"
   fi
-  if ! grep -q '^COORD_KNOWLEDGE_PUBLISHERS=' "$env_path"; then
-    printf 'COORD_KNOWLEDGE_PUBLISHERS=\n' >>"$env_path"
+  if ! grep -q '^COORD_KNOWLEDGE_PUBLISHERS=' "$env_snapshot"; then
+    printf 'COORD_KNOWLEDGE_PUBLISHERS=\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_KNOWLEDGE_PUBLISHERS= (empty allowlist) to $env_path"
   fi
-  if ! grep -q '^COORD_KNOWLEDGE_MAX_PER_HOUR=' "$env_path"; then
-    printf 'COORD_KNOWLEDGE_MAX_PER_HOUR=30\n' >>"$env_path"
+  if ! grep -q '^COORD_KNOWLEDGE_MAX_PER_HOUR=' "$env_snapshot"; then
+    printf 'COORD_KNOWLEDGE_MAX_PER_HOUR=30\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_KNOWLEDGE_MAX_PER_HOUR=30 to $env_path"
   fi
-  if ! grep -q '^COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR=' "$env_path"; then
-    printf 'COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR=300\n' >>"$env_path"
+  if ! grep -q '^COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR=' "$env_snapshot"; then
+    printf 'COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR=300\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR=300 to $env_path"
   fi
-  if ! grep -q '^COORD_KNOWLEDGE_MIN_CHARS=' "$env_path"; then
-    printf 'COORD_KNOWLEDGE_MIN_CHARS=12\n' >>"$env_path"
+  if ! grep -q '^COORD_KNOWLEDGE_MIN_CHARS=' "$env_snapshot"; then
+    printf 'COORD_KNOWLEDGE_MIN_CHARS=12\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_KNOWLEDGE_MIN_CHARS=12 to $env_path"
   fi
-  if ! grep -q '^COORD_ADMIN_USERS=' "$env_path"; then
-    printf 'COORD_ADMIN_USERS=\n' >>"$env_path"
+  if ! grep -q '^COORD_ADMIN_USERS=' "$env_snapshot"; then
+    printf 'COORD_ADMIN_USERS=\n' | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_ADMIN_USERS to $env_path"
   fi
-  if grep -q '^COORD_ADMIN_TOKEN=$' "$env_path"; then
-    sed -i "s/^COORD_ADMIN_TOKEN=$/COORD_ADMIN_TOKEN=$coord_admin_token/" "$env_path"
+  if grep -q '^COORD_ADMIN_TOKEN=$' "$env_snapshot"; then
+    _tenant_env_sed "$name" "$env_path" "s/^COORD_ADMIN_TOKEN=$/COORD_ADMIN_TOKEN=$coord_admin_token/" || die "could not safely update $env_path"
     say "repaired empty COORD_ADMIN_TOKEN in $env_path"
-  elif ! grep -q '^COORD_ADMIN_TOKEN=' "$env_path"; then
-    printf 'COORD_ADMIN_TOKEN=%s\n' "$coord_admin_token" >>"$env_path"
+  elif ! grep -q '^COORD_ADMIN_TOKEN=' "$env_snapshot"; then
+    printf 'COORD_ADMIN_TOKEN=%s\n' "$coord_admin_token" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_ADMIN_TOKEN to $env_path"
   fi
-  if grep -q '^COORD_ADMIN_PORT=$' "$env_path"; then
-    sed -i "s/^COORD_ADMIN_PORT=$/COORD_ADMIN_PORT=$coord_admin_port/" "$env_path"
+  if grep -q '^COORD_ADMIN_PORT=$' "$env_snapshot"; then
+    _tenant_env_sed "$name" "$env_path" "s/^COORD_ADMIN_PORT=$/COORD_ADMIN_PORT=$coord_admin_port/" || die "could not safely update $env_path"
     say "repaired empty COORD_ADMIN_PORT=$coord_admin_port in $env_path"
-  elif ! grep -q '^COORD_ADMIN_PORT=' "$env_path"; then
-    printf 'COORD_ADMIN_PORT=%s\n' "$coord_admin_port" >>"$env_path"
+  elif ! grep -q '^COORD_ADMIN_PORT=' "$env_snapshot"; then
+    printf 'COORD_ADMIN_PORT=%s\n' "$coord_admin_port" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added COORD_ADMIN_PORT=$coord_admin_port to $env_path"
   fi
+  rm -f -- "$env_snapshot"
 }
 
 # WI#330: backfill the LLM base URL of every ENABLED external worker whose
@@ -2654,21 +2807,32 @@ backfill_tenant_worker_base_urls() {  # <tenant>
   local env_path proxy_env llm_base_url tensorzero_url derived
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
   [[ -f "$env_path" ]] || die "env file not found: $env_path"
-  llm_base_url="$(_read_env_value "$env_path" LLM_BASE_URL)"
+  # WI#390 (review IG-1): endpoint values are read from tenant-side snapshots,
+  # never from root resolving the tenant-writable paths — a cross-tenant
+  # symlink present for the read window is unreadable to the tenant-side cat
+  # and dies instead of writing another tenant's endpoints into this env.
+  local env_snapshot proxy_snapshot
+  _snapshot_tenant_env "$name" "$env_path" env_snapshot
+  llm_base_url="$(_read_env_value "$env_snapshot" LLM_BASE_URL)"
   tensorzero_url=""
   proxy_env="$(tenant_env_dir "$name")/proxy.env"
-  [[ ! -f "$proxy_env" ]] || tensorzero_url="$(_read_env_value "$proxy_env" TENSORZERO_URL)"
+  proxy_snapshot=""
+  if [[ -e "$proxy_env" || -L "$proxy_env" ]]; then
+    _snapshot_tenant_env "$name" "$proxy_env" proxy_snapshot
+    tensorzero_url="$(_read_env_value "$proxy_snapshot" TENSORZERO_URL)"
+  fi
   derived="$(derive_worker_llm_base_url "$llm_base_url" "$tensorzero_url" || true)"
   local worker key
   for worker in opencode kimi opencode2; do
     key="$(printf '%s_BASE_URL' "${worker^^}")"
     tenant_worker_enabled "$name" "$worker" || continue
-    [[ -z "$(_read_env_value "$env_path" "$key")" ]] || continue
+    [[ -z "$(_read_env_value "$env_snapshot" "$key")" ]] || continue
     [[ -n "$derived" ]] \
-      || die "tenant '$name' has the $worker worker enabled but no container-reachable LLM endpoint to inherit (LLM_BASE_URL is unset/loopback and proxy.env has no usable TENSORZERO_URL). Set one explicitly: $0 configure-$worker $name --base-url <url>"
-    printf '%s=%s\n%s_SOURCE=inherited\n' "$key" "$(_quote_env_value "$derived")" "$key" >>"$env_path"
+      || { rm -f -- "$env_snapshot" ${proxy_snapshot:+"$proxy_snapshot"}; die "tenant '$name' has the $worker worker enabled but no container-reachable LLM endpoint to inherit (LLM_BASE_URL is unset/loopback and proxy.env has no usable TENSORZERO_URL). Set one explicitly: $0 configure-$worker $name --base-url <url>"; }
+    printf '%s=%s\n%s_SOURCE=inherited\n' "$key" "$(_quote_env_value "$derived")" "$key" | _tenant_env_append "$name" "$env_path" || { rm -f -- "$env_snapshot" ${proxy_snapshot:+"$proxy_snapshot"}; die "could not safely update $env_path"; }
     say "added $key (inherited from the tenant's LLM endpoint) to $env_path"
   done
+  rm -f -- "$env_snapshot" ${proxy_snapshot:+"$proxy_snapshot"}
 }
 
 patch_tenant_env() {
@@ -2688,7 +2852,7 @@ patch_tenant_env() {
   if grep -q '^LUNARWING_OWNER_ID=' "$env_path"; then
     say "LUNARWING_OWNER_ID already set in $env_path (skipping)"
   else
-    printf '\n# Runtime identity (DB scope — must match tenant name)\nLUNARWING_OWNER_ID=%s\n' "$name" >>"$env_path"
+    printf '\n# Runtime identity (DB scope — must match tenant name)\nLUNARWING_OWNER_ID=%s\n' "$name" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added LUNARWING_OWNER_ID=$name to $env_path"
     # Auto-migrate existing DB data from 'default' scope to the tenant's scope
     # so the daemon doesn't lose access to conversations, memory, and settings.
@@ -2704,7 +2868,7 @@ patch_tenant_env() {
   if grep -q '^ORCHESTRATOR_PORT=' "$env_path"; then
     say "ORCHESTRATOR_PORT already set in $env_path (skipping)"
   else
-    printf '\n# Orchestrator (sandbox container callback)\nORCHESTRATOR_PORT=%s\n' "$orchestrator_port" >>"$env_path"
+    printf '\n# Orchestrator (sandbox container callback)\nORCHESTRATOR_PORT=%s\n' "$orchestrator_port" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
     say "added ORCHESTRATOR_PORT=$orchestrator_port to $env_path"
   fi
 
@@ -2714,7 +2878,7 @@ patch_tenant_env() {
     if grep -q '^PEBBLE_WSS_PORT=' "$env_path"; then
       say "PEBBLE_WSS_PORT already set in $env_path (skipping)"
     else
-      printf '\n# Pebble worker (WebSocket port for agent communication)\nPEBBLE_WSS_PORT=%s\n' "$pebble_wss_port" >>"$env_path"
+      printf '\n# Pebble worker (WebSocket port for agent communication)\nPEBBLE_WSS_PORT=%s\n' "$pebble_wss_port" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
       say "added PEBBLE_WSS_PORT=$pebble_wss_port to $env_path"
     fi
   fi
@@ -2725,7 +2889,7 @@ patch_tenant_env() {
     if grep -q '^OPENCODE_WSS_PORT=' "$env_path"; then
       say "OPENCODE_WSS_PORT already set in $env_path (skipping)"
     else
-      printf '\n# Opencode worker (WebSocket port for agent communication)\nOPENCODE_WSS_PORT=%s\n' "$opencode_wss_port" >>"$env_path"
+      printf '\n# Opencode worker (WebSocket port for agent communication)\nOPENCODE_WSS_PORT=%s\n' "$opencode_wss_port" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
       say "added OPENCODE_WSS_PORT=$opencode_wss_port to $env_path"
     fi
   fi
@@ -2736,7 +2900,7 @@ patch_tenant_env() {
     if grep -q '^KIMI_WSS_PORT=' "$env_path"; then
       say "KIMI_WSS_PORT already set in $env_path (skipping)"
     else
-      printf '\n# Kimi worker (WebSocket port for agent communication)\nKIMI_WSS_PORT=%s\n' "$kimi_wss_port" >>"$env_path"
+      printf '\n# Kimi worker (WebSocket port for agent communication)\nKIMI_WSS_PORT=%s\n' "$kimi_wss_port" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
       say "added KIMI_WSS_PORT=$kimi_wss_port to $env_path"
     fi
   fi
@@ -2747,7 +2911,7 @@ patch_tenant_env() {
     if grep -q '^OPENCODE2_WSS_PORT=' "$env_path"; then
       say "OPENCODE2_WSS_PORT already set in $env_path (skipping)"
     else
-      printf '\n# OpenCode 2 worker (WebSocket port for agent communication)\nOPENCODE2_WSS_PORT=%s\n' "$opencode2_wss_port" >>"$env_path"
+      printf '\n# OpenCode 2 worker (WebSocket port for agent communication)\nOPENCODE2_WSS_PORT=%s\n' "$opencode2_wss_port" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
       say "added OPENCODE2_WSS_PORT=$opencode2_wss_port to $env_path"
     fi
   fi
@@ -2758,7 +2922,7 @@ patch_tenant_env() {
     if grep -q '^WEECHAT_ADAPTER_PORT=' "$env_path"; then
       say "WEECHAT_ADAPTER_PORT already set in $env_path (skipping)"
     else
-      printf '\n# WeeChat adapter (local HTTP adapter bridging WeeChat WS relay to WASM)\nWEECHAT_ADAPTER_PORT=%s\n' "$weechat_adapter_port" >>"$env_path"
+      printf '\n# WeeChat adapter (local HTTP adapter bridging WeeChat WS relay to WASM)\nWEECHAT_ADAPTER_PORT=%s\n' "$weechat_adapter_port" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
       say "added WEECHAT_ADAPTER_PORT=$weechat_adapter_port to $env_path"
     fi
     # WS_ADAPTER_URL is the full adapter URL consumed by the in-process WASM
@@ -2767,7 +2931,7 @@ patch_tenant_env() {
     if grep -q '^WS_ADAPTER_URL=' "$env_path"; then
       say "WS_ADAPTER_URL already set in $env_path (skipping)"
     else
-      printf 'WS_ADAPTER_URL=http://127.0.0.1:%s\n' "$weechat_adapter_port" >>"$env_path"
+      printf 'WS_ADAPTER_URL=http://127.0.0.1:%s\n' "$weechat_adapter_port" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
       say "added WS_ADAPTER_URL=http://127.0.0.1:$weechat_adapter_port to $env_path"
     fi
   fi
@@ -2778,7 +2942,7 @@ patch_tenant_env() {
     if grep -q '^RELAY_URL=' "$env_path"; then
       say "RELAY_URL already set in $env_path (skipping)"
     else
-      printf '\n# WeeChat relay URL consumed by the in-process WASM channel\nRELAY_URL=http://127.0.0.1:%s\n' "$weechat_port" >>"$env_path"
+      printf '\n# WeeChat relay URL consumed by the in-process WASM channel\nRELAY_URL=http://127.0.0.1:%s\n' "$weechat_port" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
       say "added RELAY_URL=http://127.0.0.1:$weechat_port to $env_path"
     fi
   fi
@@ -2792,7 +2956,7 @@ patch_tenant_env() {
       if grep -q '^DARKIRC_ADAPTER_URL=' "$env_path"; then
         say "DARKIRC_ADAPTER_URL already set in $env_path (skipping)"
       else
-        printf '\nDARKIRC_ADAPTER_URL=http://127.0.0.1:%s\n' "$darkirc_adapter_port" >>"$env_path"
+        printf '\nDARKIRC_ADAPTER_URL=http://127.0.0.1:%s\n' "$darkirc_adapter_port" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
         say "added DARKIRC_ADAPTER_URL=http://127.0.0.1:$darkirc_adapter_port to $env_path"
       fi
       if grep -q '^DARKIRC_ADAPTER_SECRET=' "$env_path"; then
@@ -2800,10 +2964,11 @@ patch_tenant_env() {
       else
         local darkirc_adapter_secret
         darkirc_adapter_secret="$(generate_token | cut -c1-32)"
-        printf 'DARKIRC_ADAPTER_SECRET=%s\n' "$darkirc_adapter_secret" >>"$env_path"
+        printf 'DARKIRC_ADAPTER_SECRET=%s\n' "$darkirc_adapter_secret" | _tenant_env_append "$name" "$env_path" || die "could not safely update $env_path"
         say "added DARKIRC_ADAPTER_SECRET to $env_path"
       fi
-      write_tenant_darkirc_adapter_env "$name"
+      write_tenant_darkirc_adapter_env "$name" \
+        || die "could not safely write the DarkIRC adapter env for tenant '$name'"
       if ports_get "$name" darkirc_irc >/dev/null 2>&1; then
         generate_darkirc_config "$name"
       fi
@@ -2816,11 +2981,18 @@ patch_tenant_env() {
 
   # Wire supported external workers into config.toml so
   # existing tenants get create_job(mode: ...) routing without a hand-edited
-  # config file.
-  ensure_external_worker_config "$name" "pebble" "pebble_wss"
-  ensure_external_worker_config "$name" "opencode" "opencode_wss"
-  ensure_external_worker_config "$name" "kimi" "kimi_wss"
-  ensure_external_worker_config "$name" "opencode2" "opencode2_wss"
+  # config file. WI#390 (review HH-2): a refused tenant-side write must abort
+  # the patch here — under the lifecycle lock's suppressed errexit an
+  # unchecked non-zero return would be swallowed and the tenant would start
+  # without its worker config.
+  ensure_external_worker_config "$name" "pebble" "pebble_wss" \
+    || die "could not safely write the pebble external-worker config for tenant '$name'"
+  ensure_external_worker_config "$name" "opencode" "opencode_wss" \
+    || die "could not safely write the opencode external-worker config for tenant '$name'"
+  ensure_external_worker_config "$name" "kimi" "kimi_wss" \
+    || die "could not safely write the kimi external-worker config for tenant '$name'"
+  ensure_external_worker_config "$name" "opencode2" "opencode2_wss" \
+    || die "could not safely write the opencode2 external-worker config for tenant '$name'"
 }
 
 extract_host_from_url() {
@@ -2841,12 +3013,19 @@ write_tenant_gotify_config() {
 
   sudo -u "$name" mkdir -p "$config_dir"
   gotify_url="$(printf '%s' "$gotify_url" | sed 's|/$||')"
+  # WI#390: commit through the tenant-side atomic writer — root never opens
+  # gotify.json inside the tenant-writable state tree. The writer's mode 600
+  # also hardens the previous umask-dependent 0644. The explicit returns keep
+  # the refusal fatal even when errexit is suppressed by the caller's context.
   if [[ -n "$gotify_title" ]]; then
-    printf '{"url": "%s", "title": "%s"}\n' "$gotify_url" "$gotify_title" >"$config_path"
+    printf '{"url": "%s", "title": "%s"}\n' "$gotify_url" "$gotify_title" \
+      | write_tenant_file_atomic "$name" "$config_path" 600 owned-parent \
+      || return 1
   else
-    printf '{"url": "%s"}\n' "$gotify_url" >"$config_path"
+    printf '{"url": "%s"}\n' "$gotify_url" \
+      | write_tenant_file_atomic "$name" "$config_path" 600 owned-parent \
+      || return 1
   fi
-  chown "$name:$name" "$config_path"
   say "wrote: $config_path"
 }
 

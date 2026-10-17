@@ -163,4 +163,23 @@ rotate_tenant_pg_password "$name" >/dev/null
 grep -q '^PRESERVE=yes$' "$env_file"
 grep -q '^DATABASE_URL=postgres://lunarwing:0123456789abcdef0123456789abcdef@127.0.0.1:10003/lunarwing$' "$env_file"
 [[ "$(<"$fixture/env/pg.secret")" == 0123456789abcdef0123456789abcdef ]]
+
+# WI#390 (IY-3): the rotation's DATABASE_URL replace must be fatal — a
+# hard-linked lunarwing.env (link count > 1, refused by the tenant-side
+# replace) must abort the rotation naming DATABASE_URL instead of reporting
+# "Rotated" with pg.secret and the env diverged.
+printf 'DATABASE_URL=postgres://lunarwing:oldpw@127.0.0.1:10003/lunarwing\nPRESERVE=yes\n' >"$env_file"
+chmod 600 "$env_file"
+ln "$env_file" "$env_file.hardlink"
+if rotate_err="$(rotate_tenant_pg_password "$name" 2>&1 >/dev/null)"; then
+  echo 'FAIL: rotation accepted a hard-linked lunarwing.env' >&2
+  exit 1
+fi
+[[ "$rotate_err" == *DATABASE_URL* ]] \
+  || { echo "FAIL: rotation refusal did not name DATABASE_URL: $rotate_err" >&2; exit 1; }
+grep -q '^DATABASE_URL=postgres://lunarwing:oldpw@127.0.0.1:10003/lunarwing$' "$env_file" \
+  || { echo 'FAIL: refused rotation rewrote DATABASE_URL' >&2; exit 1; }
+grep -q '^PRESERVE=yes$' "$env_file" \
+  || { echo 'FAIL: refused rotation dropped unrelated keys' >&2; exit 1; }
+rm -f "$env_file.hardlink"
 printf 'PASS: tenant capability and secret rewrites reject unsafe paths\n'

@@ -601,6 +601,29 @@ else
 fi
 assert_eq "$(_env_existing "$env_dir/lunarwing.env" TRANSCRIPTION_PROVIDER)" openai "remove retains restored provider"
 
+# WI#390 (IY-3): the voice writer must fail closed when a tenant-side replace
+# refuses. A hard-linked voice.env has link count > 1, which
+# _tenant_env_replace refuses; pre-fix the writer swallowed the refusal and
+# returned 0 (the trailing printf), so add_tenant's `|| die` could never fire.
+cat >"$env_dir/voice.env" <<'ENV'
+VOICE_ENABLED=false
+VOICE_AUTH_TOKEN=stable-token
+ENV
+chmod 0600 "$env_dir/voice.env"
+ln "$env_dir/voice.env" "$env_dir/voice.env.hardlink"
+if ( write_tenant_voice_env alpha >/dev/null ) 2>/dev/null; then
+  bad "voice writer fails on a hard-linked voice.env" "returned 0"
+else
+  ok "voice writer fails on a hard-linked voice.env"
+fi
+assert_eq "$(stat -c %h -- "$env_dir/voice.env")" 2 "hard-linked voice.env left in place"
+rm -f "$env_dir/voice.env.hardlink"
+# Clean control: with the extra link removed the writer succeeds again.
+write_tenant_voice_env alpha >/dev/null
+assert_eq "$(_env_existing "$env_dir/voice.env" VOICE_AUTH_TOKEN)" stable-token \
+  "clean voice.env rewrite succeeds after the refusal"
+rm -f "$env_dir/voice.env"
+
 help_text="$(usage)"
 for command_name in install-voice configure-voice activate-voice deactivate-voice remove-voice; do
   assert_has="$command_name"

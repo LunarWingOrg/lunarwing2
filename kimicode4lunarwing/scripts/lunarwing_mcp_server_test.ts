@@ -5,7 +5,10 @@
  * proxy env pointed at a fake bridge IPC relay, and asserts the MCP-facing
  * behavior: initialize handshake, tools/list mapping (hub `parameters` ->
  * MCP `inputSchema`), tools/call success/denied/error mapping, and the
- * zero-tools fallback when the proxy env is absent.
+ * zero-tools fallback when the proxy env is absent. The final test drives
+ * the real shim through the real ToolProxyRelay to a mock hub (the run-84
+ * full-path gap): every other surface scripts one side of the shim<->relay
+ * IPC contract, so only that test fails when the two drift apart.
  */
 
 import assert from "node:assert/strict"
@@ -16,6 +19,9 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { after, before, test } from "node:test"
+
+import { createEnvelope } from "./lunarwing_runtime.js"
+import { ToolProxyRelay } from "./lunarwing_tool_proxy.js"
 
 const shimPath = fileURLToPath(new URL("./lunarwing_mcp_server.js", import.meta.url))
 
@@ -364,5 +370,144 @@ test("a line crossing the cap together with its newline takes the in-loop path (
     assert.deepEqual(errors.map((reply) => (reply.error as { code: number }).code), [-32600])
   } finally {
     shim.kill()
+  }
+})
+
+/** Mock hub end of the control channel: records the WS frames the relay
+ * emits; replies are injected through the relay's handleHubFrame. */
+class CapturingHubSocket {
+  readonly sent: string[] = []
+  send(data: string): void {
+    this.sent.push(data)
+  }
+}
+
+/** Poll until the relay has emitted `count` hub frames (the shim's relay
+ * request is asynchronous, so a fixed sleep can race the IPC round-trip). */
+async function waitForFrames(hub: CapturingHubSocket, count: number): Promise<void> {
+  const deadline = Date.now() + 5_000
+  while (hub.sent.length < count) {
+    if (Date.now() > deadline) {
+      throw new Error(`relay emitted ${hub.sent.length} hub frames, expected ${count}`)
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+}
+
+test("the real shim drives the real relay to a hub (run-84 full-path gap)", async () => {
+  // Run-84 gap, open since MR !1561: the bridge full-path test uses a mock
+  // kimi that speaks raw IPC in place of the shim, and every other test in
+  // this file scripts a fake relay — so nothing pinned the real shim against
+  // the real ToolProxyRelay. Here the shim child runs with its proxy env
+  // pointed at a real per-task relay socket; the hub side is a capturing
+  // mock whose tool_catalog/tool_result replies are injected through the
+  // relay's handleHubFrame, exactly as the bridge routes them.
+  const previousProxyDir = process.env.LUNARWING_TOOL_PROXY_DIR
+  process.env.LUNARWING_TOOL_PROXY_DIR = workDir
+  const relay = new ToolProxyRelay()
+  const hub = new CapturingHubSocket()
+  const handle = await relay.startTask("shim-relay-task", hub)
+  assert.ok(handle, "the real relay must start its per-task socket")
+  const shim = startShim({
+    LUNARWING_TOOL_PROXY_SOCKET: handle.socketPath,
+    LUNARWING_TASK_ID: "shim-relay-task",
+  })
+  try {
+    // initialize is answered locally by the shim: no relay traffic.
+    const init = await rpc(shim, {
+      jsonrpc: "2.0",
+      id: 11,
+      method: "initialize",
+      params: { protocolVersion: "2025-06-18" },
+    })
+    assert.equal((init.result as Record<string, unknown>).protocolVersion, "2025-06-18")
+    assert.equal(hub.sent.length, 0)
+
+    // tools/list: shim IPC {op:list} -> relay tool_list frame -> catalog reply.
+    const listPromise = rpc(shim, { jsonrpc: "2.0", id: 12, method: "tools/list" })
+    await waitForFrames(hub, 1)
+    const listFrame = JSON.parse(hub.sent[0]) as { type: string; payload: Record<string, unknown> }
+    assert.equal(listFrame.type, "tool_list")
+    assert.equal(listFrame.payload.task_id, "shim-relay-task")
+    const routedCatalog = relay.handleHubFrame(
+      hub,
+      createEnvelope("tool_catalog", {
+        tools: [{
+          name: "memory_read",
+          description: "Read a workspace file",
+          parameters: { type: "object", properties: { path: { type: "string" } } },
+        }],
+      }),
+    )
+    assert.equal(routedCatalog, true, "the catalog reply must route to the shim's list waiter")
+    const list = await listPromise
+    const tools = (list.result as { tools: Array<Record<string, unknown>> }).tools
+    assert.equal(tools.length, 1)
+    assert.equal(tools[0].name, "memory_read")
+    assert.deepEqual(tools[0].inputSchema, {
+      type: "object",
+      properties: { path: { type: "string" } },
+    })
+
+    // tools/call: shim IPC {op:call} -> relay tool_call frame -> result reply.
+    const callPromise = rpc(shim, {
+      jsonrpc: "2.0",
+      id: 13,
+      method: "tools/call",
+      params: { name: "memory_read", arguments: { path: "notes/x.md" } },
+    })
+    await waitForFrames(hub, 2)
+    const callFrame = JSON.parse(hub.sent[1]) as { type: string; payload: Record<string, unknown> }
+    assert.equal(callFrame.type, "tool_call")
+    assert.equal(callFrame.payload.task_id, "shim-relay-task")
+    assert.equal(callFrame.payload.name, "memory_read")
+    assert.deepEqual(callFrame.payload.arguments, { path: "notes/x.md" })
+    assert.match(String(callFrame.payload.call_id), /^[A-Za-z0-9_-]{1,128}$/)
+    const routedResult = relay.handleHubFrame(
+      hub,
+      createEnvelope("tool_result", {
+        call_id: callFrame.payload.call_id,
+        status: "success",
+        output: "proxied-contents",
+        error: null,
+      }),
+    )
+    assert.equal(routedResult, true, "the result reply must route by call_id")
+    const called = await callPromise
+    const callResult = called.result as { content: Array<{ text: string }>; isError?: boolean }
+    assert.equal(callResult.isError, false)
+    assert.equal(callResult.content[0].text, "proxied-contents")
+
+    // A hub denial travels the same path and surfaces as an MCP tool error.
+    const deniedPromise = rpc(shim, {
+      jsonrpc: "2.0",
+      id: 14,
+      method: "tools/call",
+      params: { name: "shell", arguments: {} },
+    })
+    await waitForFrames(hub, 3)
+    const deniedFrame = JSON.parse(hub.sent[2]) as { payload: Record<string, unknown> }
+    assert.equal(deniedFrame.payload.name, "shell")
+    relay.handleHubFrame(
+      hub,
+      createEnvelope("tool_result", {
+        call_id: deniedFrame.payload.call_id,
+        status: "denied",
+        output: "",
+        error: "tool 'shell' is not in worker 'kimi' tool_allowlist (deny-by-default)",
+      }),
+    )
+    const denied = await deniedPromise
+    const deniedResult = denied.result as { content: Array<{ text: string }>; isError?: boolean }
+    assert.equal(deniedResult.isError, true)
+    assert.match(deniedResult.content[0].text, /tool_allowlist/)
+  } finally {
+    shim.kill()
+    handle.close()
+    if (previousProxyDir === undefined) {
+      delete process.env.LUNARWING_TOOL_PROXY_DIR
+    } else {
+      process.env.LUNARWING_TOOL_PROXY_DIR = previousProxyDir
+    }
   }
 })
