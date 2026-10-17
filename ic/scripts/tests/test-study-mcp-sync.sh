@@ -316,7 +316,7 @@ grep -Fq 'provision_tenant_study_mcp "$name" "$study_mcp_home"' \
 # and carried forward — never introduced — by env regeneration.
 grep -Fq 'arm_tenant_knowledge_seed "$name"' \
   "$SCRIPT_DIR/mt-admin-lib/09-worker-config.sh"
-grep -Fq 'knowledge_seed_flag="$(_env_existing "$path" KNOWLEDGE_SEED_FROM_STUDY_MCP)"' \
-  "$SCRIPT_DIR/mt-admin-lib/06-env-generation.sh"
+grep -Fq 'knowledge_seed_flag="$(_env_existing "$env_snapshot" KNOWLEDGE_SEED_FROM_STUDY_MCP)"' \
+  "$SCRIPT_DIR/mt-admin-lib/06-env-generation.sh" || { echo 'FAIL: env render no longer carries KNOWLEDGE_SEED_FROM_STUDY_MCP from the snapshot' >&2; exit 1; }
 
 printf 'Study MCP sync tests passed\n'

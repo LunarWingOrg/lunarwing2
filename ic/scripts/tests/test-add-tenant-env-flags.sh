@@ -114,6 +114,26 @@ generate_token()          { echo "token-fixture-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 say()                     { :; }          # silence
 chown()                   { :; }          # no-op (running as non-root in tests)
 
+# WI#390: the env writers commit through the tenant-side atomic writer, which
+# drops privileges with sudo -u <tenant>. This harness's tenant does not exist
+# as an account, so map the fixture tenant onto the invoking user (the fixture
+# env dir is owned by that user at mode 700, satisfying every tenant-side
+# ownership/privacy check) and let sudo -u invocations run directly.
+sudo() {
+  [[ "${1:-}" == "-u" ]] || return 1
+  shift 2
+  "$@"
+}
+tenant_cat() { cat -- "$2"; }
+original_writer="$(declare -f write_tenant_file_atomic)"
+eval "${original_writer/write_tenant_file_atomic ()/original_write_tenant_file_atomic ()}"
+write_tenant_file_atomic() {
+  local name="$1"
+  shift
+  [[ "$name" != fixture-tenant ]] || name="$(id -un)"
+  original_write_tenant_file_atomic "$name" "$@"
+}
+
 run_writer() {  # <args...> — invokes write_tenant_lunarwing_env, prints the file
   rm -f "$MT_FIXTURE/env/lunarwing.env"
   write_tenant_lunarwing_env "$@"
@@ -766,6 +786,430 @@ assert_eq "resolver: stored wins over default" \
   "$(resolve_tenant_xmpp_jid fixture-tenant "")" "stored@xmpp.sobe.world"
 assert_eq "resolver: explicit wins over stored" \
   "$(resolve_tenant_xmpp_jid fixture-tenant "cli@xmpp.example.net")" "cli@xmpp.example.net"
+
+echo "=== WI#390: env writers refuse symlinked/foreign targets ==="
+
+# A pre-placed symlink at the destination must never be followed: the write
+# fails closed and the attacker-chosen target keeps its content.
+sensitive="$MT_FIXTURE/sensitive-target"
+printf 'DO-NOT-TRUNCATE\n' >"$sensitive"
+
+ln -s "$sensitive" "$MT_FIXTURE/env/proxy.env"
+if ( write_tenant_proxy_env fixture-tenant ) >/dev/null 2>&1; then
+  echo "  FAIL: proxy env writer followed a symlinked target"; failures=$((failures + 1))
+else
+  assert_eq "proxy.env symlink refusal preserves target" "$(cat "$sensitive")" "DO-NOT-TRUNCATE"
+fi
+assert_eq "proxy.env symlink left in place" \
+  "$(if [[ -L "$MT_FIXTURE/env/proxy.env" ]]; then echo symlink; else echo replaced; fi)" "symlink"
+
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+ln -s "$sensitive" "$MT_FIXTURE/env/lunarwing.env"
+if ( write_tenant_lunarwing_env fixture-tenant ) >/dev/null 2>&1; then
+  echo "  FAIL: lunarwing env writer followed a symlinked target"; failures=$((failures + 1))
+else
+  assert_eq "lunarwing.env symlink refusal preserves target" "$(cat "$sensitive")" "DO-NOT-TRUNCATE"
+fi
+
+rm -f "$MT_FIXTURE/env/xmpp-bridge.env"
+ln -s "$sensitive" "$MT_FIXTURE/env/xmpp-bridge.env"
+if ( write_tenant_bridge_env fixture-tenant ) >/dev/null 2>&1; then
+  echo "  FAIL: bridge env writer followed a symlinked target"; failures=$((failures + 1))
+else
+  assert_eq "xmpp-bridge.env symlink refusal preserves target" "$(cat "$sensitive")" "DO-NOT-TRUNCATE"
+fi
+
+# A dangling symlink (target absent) must not be created/truncated either.
+rm -f "$MT_FIXTURE/env/proxy.env"
+ln -s "$MT_FIXTURE/env/.dangling-target" "$MT_FIXTURE/env/proxy.env"
+if ( write_tenant_proxy_env fixture-tenant ) >/dev/null 2>&1; then
+  echo "  FAIL: proxy env writer created a dangling symlink's target"; failures=$((failures + 1))
+else
+  echo "  PASS: proxy env writer refuses a dangling symlink"
+fi
+if [[ -e "$MT_FIXTURE/env/.dangling-target" ]]; then
+  echo "  FAIL: dangling symlink target was created"; failures=$((failures + 1))
+fi
+
+# The append helper fails closed on a symlinked target too, and round-trips a
+# clean one through the tenant-side atomic writer.
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+printf 'LLM_BASE_URL=http://direct:9000/v1\n' >"$MT_FIXTURE/env/lunarwing.env"
+chmod 600 "$MT_FIXTURE/env/lunarwing.env"
+if ( _tenant_env_append fixture-tenant "$MT_FIXTURE/env/lunarwing.env" <<< 'PIN_OK=1' ); then
+  assert_eq "_tenant_env_append round-trips through the atomic writer" "$(envval PIN_OK)" "1"
+else
+  echo "  FAIL: _tenant_env_append refused a clean target"; failures=$((failures + 1))
+fi
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+ln -s "$sensitive" "$MT_FIXTURE/env/lunarwing.env"
+if ( printf 'EVIL=1\n' | _tenant_env_append fixture-tenant "$MT_FIXTURE/env/lunarwing.env" ) >/dev/null 2>&1; then
+  echo "  FAIL: _tenant_env_append followed a symlinked target"; failures=$((failures + 1))
+else
+  assert_eq "_tenant_env_append symlink refusal preserves target" "$(cat "$sensitive")" "DO-NOT-TRUNCATE"
+fi
+
+# Leave no symlinks behind: later sections rewrite these fixtures with plain
+# redirects, which would follow them.
+rm -f "$MT_FIXTURE/env/lunarwing.env" "$MT_FIXTURE/env/xmpp-bridge.env" "$MT_FIXTURE/env/proxy.env"
+
+echo "=== WI#390 (HH-5): 02-containers/09-worker-config symlink pins ==="
+
+# 02-containers.sh: the vision env writer must refuse a symlinked vision.env
+# (previously nothing in this harness pinned anything in 02-containers.sh).
+ln -s "$sensitive" "$MT_FIXTURE/env/vision.env"
+if ( write_tenant_vision_env fixture-tenant ) >/dev/null 2>&1; then
+  echo "  FAIL: vision env writer followed a symlinked target"; failures=$((failures + 1))
+else
+  assert_eq "vision.env symlink refusal preserves target" "$(cat "$sensitive")" "DO-NOT-TRUNCATE"
+fi
+rm -f "$MT_FIXTURE/env/vision.env"
+
+# 09-worker-config.sh: the external-worker config writer must refuse a
+# symlinked config.toml in the tenant state dir.
+printf 'WORKER_AUTH_TOKEN=fixture-worker-token\n' >"$MT_FIXTURE/env/lunarwing.env"
+chmod 600 "$MT_FIXTURE/env/lunarwing.env"
+ln -s "$sensitive" "$MT_FIXTURE/state/config.toml"
+if ( ensure_external_worker_config fixture-tenant pebble pebble_wss ) >/dev/null 2>&1; then
+  echo "  FAIL: external-worker config writer followed a symlinked target"; failures=$((failures + 1))
+else
+  assert_eq "config.toml symlink refusal preserves target" "$(cat "$sensitive")" "DO-NOT-TRUNCATE"
+fi
+rm -f "$MT_FIXTURE/state/config.toml"
+# Clean control: a plain absent config.toml gets the worker block, proving the
+# refusal above came from the symlink and not from an unrelated early failure.
+if ( ensure_external_worker_config fixture-tenant pebble pebble_wss ) >/dev/null 2>&1; then
+  assert_eq "external-worker config written for a clean target" \
+    "$(grep -c 'name = "pebble"' "$MT_FIXTURE/state/config.toml")" "1"
+else
+  echo "  FAIL: external-worker config refused a clean target"; failures=$((failures + 1))
+fi
+rm -f "$MT_FIXTURE/state/config.toml"
+
+# 09-worker-config.sh (HH-4): prepare_pebble_workspace must refuse a symlinked
+# workspace and leave it in place — no root chown/chmod may follow it. The
+# helper resolves the tenant uid, so run it as the invoking user (the harness's
+# fixture-tenant is not a real account; tenant_lw_root is stubbed anyway).
+hh4_tenant="$(id -un)"
+mkdir -p "$MT_FIXTURE/real-workspace-victim"
+ln -s "$MT_FIXTURE/real-workspace-victim" "$MT_FIXTURE/pebble-workspace"
+if ( prepare_pebble_workspace "$hh4_tenant" ) >/dev/null 2>&1; then
+  echo "  FAIL: prepare_pebble_workspace accepted a symlinked workspace"; failures=$((failures + 1))
+else
+  echo "  PASS: prepare_pebble_workspace refuses a symlinked workspace"
+fi
+assert_eq "pebble workspace symlink left in place" \
+  "$(if [[ -L "$MT_FIXTURE/pebble-workspace" ]]; then echo symlink; else echo replaced; fi)" "symlink"
+rm -f "$MT_FIXTURE/pebble-workspace"
+# Clean control: an absent workspace is created tenant-private (0700, no 0777).
+ws_out="$(prepare_pebble_workspace "$hh4_tenant")" || ws_out=""
+assert_eq "pebble workspace created at the tenant path" "$ws_out" "$MT_FIXTURE/pebble-workspace"
+assert_eq "pebble workspace is tenant-private (0700)" \
+  "$(stat -c %a "$MT_FIXTURE/pebble-workspace")" "700"
+
+echo "=== WI#390 (HH-2): refused pipe-form write aborts under suppressed errexit ==="
+
+# Production runs add_tenant/upgrade_tenant through the lifecycle lock as
+# `"$@" || result=$?`, which disables errexit for the whole body: a refused
+# _tenant_env_append must rely on its `|| die` to abort. With lunarwing.env
+# symlinked away, patch_tenant_coordination_env's first append is refused; the
+# die must fire BEFORE the matching "added ..." say and make the body non-zero
+# (dropping the || die lets every append fail open and the body complete).
+# Pre-populate every coordination key except COORD_CHANNELS, so the ONLY write
+# patch_tenant_coordination_env attempts is the COORD_CHANNELS append — the pin
+# is then sensitive to a dropped || die on that site (the function otherwise
+# dies on its first append and never reaches a later mutated one).
+cat >"$sensitive" <<'SENS'
+DO-NOT-TRUNCATE
+COORD_ENABLED=false
+COORD_AGENT_ID=fixture-tenant
+COORD_AGENT_ALIASES=
+COORD_RESPONDER_ROSTER=
+COORD_KNOWLEDGE_SHARE=false
+COORD_KNOWLEDGE_PUBLISH=false
+COORD_KNOWLEDGE_PUBLISHERS=
+COORD_KNOWLEDGE_MAX_PER_HOUR=30
+COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR=300
+COORD_KNOWLEDGE_MIN_CHARS=12
+COORD_ADMIN_USERS=
+COORD_ADMIN_TOKEN=fixture-token
+COORD_ADMIN_PORT=20009
+SENS
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+ln -s "$sensitive" "$MT_FIXTURE/env/lunarwing.env"
+: >"$MT_FIXTURE/say.log"
+real_say="$(declare -f say)"
+say() { printf '%s\n' "$*" >>"$MT_FIXTURE/say.log"; }
+hh2_result=0
+( patch_tenant_coordination_env fixture-tenant "$MT_FIXTURE/env/lunarwing.env" ) >/dev/null 2>&1 \
+  || hh2_result=$?
+eval "$real_say"
+if [[ "$hh2_result" -eq 0 ]]; then
+  echo "  FAIL: refused pipe-form write returned 0 under suppressed errexit"; failures=$((failures + 1))
+elif grep -q 'COORD_CHANNELS' "$MT_FIXTURE/say.log"; then
+  echo "  FAIL: body printed 'added COORD_CHANNELS' past a refused pipe-form write under suppressed errexit"
+  failures=$((failures + 1))
+else
+  echo "  PASS: refused pipe-form write aborts the body under suppressed errexit"
+fi
+assert_eq "suppressed-errexit refusal preserves symlink target" "$(head -1 "$sensitive")" "DO-NOT-TRUNCATE"
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+
+echo "=== WI#390 (IG-1): env value reads come from a tenant-side snapshot ==="
+
+# The render/patch/backfill functions must take their value reads from ONE
+# snapshot read as the tenant, so a lunarwing.env symlinked at a foreign env
+# for the read window dies at the snapshot instead of carrying the foreign
+# values into the tenant's own files. The tenant_cat stub below emulates the
+# cross-tenant permission boundary (a foreign 0600 env in a 0700 dir is
+# unreadable to the tenant-side read) by refusing any read through a symlink.
+# On the pre-fix shape each case either returns 0 (coordination: every key
+# present in the victim, nothing to append) or dies later with a different
+# message ("could not safely ..."), so the "could not read ... as tenant"
+# assertion fails when the snapshot is reverted to root reads.
+ig1_victim="$MT_FIXTURE/victim.env"
+cat >"$ig1_victim" <<'EOF'
+COORD_ENABLED=false
+COORD_AGENT_ID=victim-tenant
+COORD_CHANNELS=
+COORD_AGENT_ALIASES=
+COORD_RESPONDER_ROSTER=
+COORD_KNOWLEDGE_SHARE=false
+COORD_KNOWLEDGE_PUBLISH=false
+COORD_KNOWLEDGE_PUBLISHERS=
+COORD_KNOWLEDGE_MAX_PER_HOUR=30
+COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR=300
+COORD_KNOWLEDGE_MIN_CHARS=12
+COORD_ADMIN_USERS=
+COORD_ADMIN_TOKEN=B-SECRET-COORD-ADMIN-TOKEN
+COORD_ADMIN_PORT=20555
+GATEWAY_AUTH_TOKEN=B-SECRET-GATEWAY-TOKEN
+LLM_BASE_URL=http://b-llm:9000/v1
+EOF
+ig1_victim_before="$(cat "$ig1_victim")"
+# shellcheck disable=SC2317  # invoked indirectly via the tenant_cat stub
+ig1_deny_tenant_cat() {  # deny reads through a symlink (foreign-target stand-in)
+  [[ ! -L "$2" ]] || return 1
+  cat -- "$2"
+}
+tenant_cat() { ig1_deny_tenant_cat "$@"; }
+
+# 1) coordination patch: dies at the snapshot read, before any append/sed.
+ln -s "$ig1_victim" "$MT_FIXTURE/env/lunarwing.env"
+: >"$MT_FIXTURE/say.log"
+real_say="$(declare -f say)"
+say() { printf '%s\n' "$*" >>"$MT_FIXTURE/say.log"; }
+ig1_rc=0
+ig1_err="$( ( patch_tenant_coordination_env fixture-tenant "$MT_FIXTURE/env/lunarwing.env" ) 2>&1 )" || ig1_rc=$?
+eval "$real_say"
+if [[ "$ig1_rc" -eq 0 ]]; then
+  echo "  FAIL: coordination patch read a foreign-linked env without dying"; failures=$((failures + 1))
+elif [[ "$ig1_err" != *"could not read $MT_FIXTURE/env/lunarwing.env as tenant 'fixture-tenant'"* ]]; then
+  echo "  FAIL: coordination patch died without the tenant-read refusal: $ig1_err"; failures=$((failures + 1))
+else
+  echo "  PASS: coordination patch dies at the tenant-side snapshot read"
+fi
+assert_eq "coordination refusal wrote nothing" "$(wc -l <"$MT_FIXTURE/say.log")" "0"
+assert_eq "coordination refusal leaves the foreign env untouched" "$(cat "$ig1_victim")" "$ig1_victim_before"
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+
+# 2) full render (add-tenant re-run shape): same refusal before any write.
+ln -s "$ig1_victim" "$MT_FIXTURE/env/lunarwing.env"
+ig1_rc=0
+ig1_err="$( ( write_tenant_lunarwing_env fixture-tenant ) 2>&1 )" || ig1_rc=$?
+if [[ "$ig1_rc" -eq 0 ]]; then
+  echo "  FAIL: env render read a foreign-linked env without dying"; failures=$((failures + 1))
+elif [[ "$ig1_err" != *"could not read $MT_FIXTURE/env/lunarwing.env as tenant 'fixture-tenant'"* ]]; then
+  echo "  FAIL: env render died without the tenant-read refusal: $ig1_err"; failures=$((failures + 1))
+else
+  echo "  PASS: env render dies at the tenant-side snapshot read"
+fi
+assert_eq "render refusal leaves the foreign env untouched" "$(cat "$ig1_victim")" "$ig1_victim_before"
+assert_eq "render refusal leaves the symlink in place" \
+  "$(if [[ -L "$MT_FIXTURE/env/lunarwing.env" ]]; then echo symlink; else echo replaced; fi)" "symlink"
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+
+# 3) WI#330 backfill: same refusal before any append.
+ln -s "$ig1_victim" "$MT_FIXTURE/env/lunarwing.env"
+ig1_rc=0
+ig1_err="$( ( backfill_tenant_worker_base_urls fixture-tenant ) 2>&1 )" || ig1_rc=$?
+if [[ "$ig1_rc" -eq 0 ]]; then
+  echo "  FAIL: worker-URL backfill read a foreign-linked env without dying"; failures=$((failures + 1))
+elif [[ "$ig1_err" != *"could not read $MT_FIXTURE/env/lunarwing.env as tenant 'fixture-tenant'"* ]]; then
+  echo "  FAIL: backfill died without the tenant-read refusal: $ig1_err"; failures=$((failures + 1))
+else
+  echo "  PASS: backfill dies at the tenant-side snapshot read"
+fi
+assert_eq "backfill refusal leaves the foreign env untouched" "$(cat "$ig1_victim")" "$ig1_victim_before"
+rm -f "$MT_FIXTURE/env/lunarwing.env" "$ig1_victim"
+
+# Restore the harness's plain pass-through cat for the remaining sections.
+tenant_cat() { cat -- "$2"; }
+
+echo "=== WI#390 (IG-3): HH-3 upgrade helpers refuse a symlinked existing config ==="
+
+# The HH-3 conversion made the fresh-config branch's refusal explicit; the
+# existing-config branch had no pin. A symlinked config.toml must fail with
+# the contract's failure code (2) and leave the redirect target untouched —
+# the tenant-side atomic writer refuses it at commit time. The redirect
+# target carries a legacy pebble worker block so each helper's awk pass
+# reaches the commit (a block-free target exits the no-change path first).
+printf 'WORKER_AUTH_TOKEN=fixture-worker-token\n' >"$MT_FIXTURE/env/lunarwing.env"
+chmod 600 "$MT_FIXTURE/env/lunarwing.env"
+mk_ig3_target() {  # <path>
+  cat >"$1" <<'EOF'
+[[sandbox.external_workers]]
+name = "pebble"
+url = "ws://127.0.0.1:10008/ws/agent"
+timeout_ms = 300000
+auth_token = "stale-token"
+EOF
+}
+
+mk_ig3_target "$sensitive"
+ln -s "$sensitive" "$MT_FIXTURE/state/config.toml"
+ig3_rc=0
+( upgrade_external_worker_timeout fixture-tenant pebble "$MT_FIXTURE/state/config.toml" ) >/dev/null 2>&1 || ig3_rc=$?
+assert_eq "timeout upgrade on a symlinked config returns 2" "$ig3_rc" "2"
+assert_eq "timeout upgrade refusal preserves the redirect target" \
+  "$(grep -c 'timeout_ms = 300000' "$sensitive")" "1"
+
+mk_ig3_target "$sensitive"
+ig3_rc=0
+( upgrade_external_worker_auth_token fixture-tenant pebble "$MT_FIXTURE/state/config.toml" "$MT_FIXTURE/env/lunarwing.env" ) >/dev/null 2>&1 || ig3_rc=$?
+assert_eq "auth-token upgrade on a symlinked config returns 2" "$ig3_rc" "2"
+assert_eq "auth-token upgrade refusal preserves the redirect target" \
+  "$(grep -c 'auth_token = "stale-token"' "$sensitive")" "1"
+assert_eq "upgrade refusals leave the symlink in place" \
+  "$(if [[ -L "$MT_FIXTURE/state/config.toml" ]]; then echo symlink; else echo replaced; fi)" "symlink"
+rm -f "$MT_FIXTURE/state/config.toml"
+
+# Clean controls: the same content as a REGULAR config.toml upgrades in place,
+# so the refusals above came from the symlink, not the fixture content.
+mk_ig3_target "$MT_FIXTURE/state/config.toml"
+ig3_rc=0
+( upgrade_external_worker_timeout fixture-tenant pebble "$MT_FIXTURE/state/config.toml" ) >/dev/null 2>&1 || ig3_rc=$?
+assert_eq "timeout upgrade on a clean config succeeds" "$ig3_rc" "0"
+assert_eq "clean timeout upgrade applied" \
+  "$(grep -c 'timeout_ms = 3600000' "$MT_FIXTURE/state/config.toml")" "1"
+ig3_rc=0
+( upgrade_external_worker_auth_token fixture-tenant pebble "$MT_FIXTURE/state/config.toml" "$MT_FIXTURE/env/lunarwing.env" ) >/dev/null 2>&1 || ig3_rc=$?
+assert_eq "auth-token upgrade on a clean config succeeds" "$ig3_rc" "0"
+assert_eq "clean auth-token upgrade applied" \
+  "$(grep -c 'auth_token = "fixture-worker-token"' "$MT_FIXTURE/state/config.toml")" "1"
+rm -f "$MT_FIXTURE/state/config.toml"
+
+echo "=== WI#390 (IG-4): darkirc adapter env write fails closed ==="
+
+# The writer used to pipe straight into the tenant-side atomic writer with no
+# || die, and both callers ignored the return. A symlinked target must now
+# abort the function; a clean target still renders through the template.
+# read_tenant_env_value is stubbed to a plain read: its own tenant-side safety
+# checks are unchanged by this pin and the dev-VM shell's startup banner
+# pollutes captured stdout otherwise (CI's bash is clean).
+ig4_lock_saved="$DARKIRC_WRITER_LOCK_HELD"
+DARKIRC_WRITER_LOCK_HELD=true   # skip the root-owned flock in the fixture
+ig4_real_reader="$(declare -f read_tenant_env_value)"
+read_tenant_env_value() { _read_env_value "$2" "$3"; }
+printf 'DO-NOT-TRUNCATE\n' >"$sensitive"
+printf 'DARKIRC_ADAPTER_SECRET=fixture-secret\n' >"$MT_FIXTURE/env/lunarwing.env"
+chmod 600 "$MT_FIXTURE/env/lunarwing.env"
+ln -s "$sensitive" "$MT_FIXTURE/env/darkirc-adapter.env"
+ig4_rc=0
+( write_tenant_darkirc_adapter_env fixture-tenant ) >/dev/null 2>&1 || ig4_rc=$?
+if [[ "$ig4_rc" -eq 0 ]]; then
+  echo "  FAIL: darkirc adapter env write followed a symlinked target"; failures=$((failures + 1))
+else
+  echo "  PASS: darkirc adapter env write refuses a symlinked target"
+fi
+assert_eq "darkirc refusal preserves the redirect target" "$(cat "$sensitive")" "DO-NOT-TRUNCATE"
+rm -f "$MT_FIXTURE/env/darkirc-adapter.env"
+ig4_rc=0
+( write_tenant_darkirc_adapter_env fixture-tenant ) >/dev/null 2>&1 || ig4_rc=$?
+assert_eq "darkirc adapter env writes for a clean target" "$ig4_rc" "0"
+assert_eq "darkirc clean write carries the preserved secret" \
+  "$(grep -c '^ADAPTER_SECRET=fixture-secret$' "$MT_FIXTURE/env/darkirc-adapter.env")" "1"
+eval "$ig4_real_reader"
+DARKIRC_WRITER_LOCK_HELD="$ig4_lock_saved"
+rm -f "$MT_FIXTURE/env/darkirc-adapter.env" "$MT_FIXTURE/env/lunarwing.env"
+
+echo "=== WI#390 (IY-4): configure-* value reads come from a tenant-side snapshot ==="
+
+# The run-130 pass converted the configure-* WRITES but left the READS on the
+# root path (_read_env_value / grep -v against the live lunarwing.env). With
+# lunarwing.env symlinked away (the IG-1 deny stub), each of the four
+# functions must die at the tenant-side snapshot read before writing
+# anything. On the pre-fix shape the reads succeed as root and the refusal
+# comes later from the atomic writer with a different message, so the
+# "could not read ... as tenant" assertion fails when a function's snapshot
+# conversion is reverted.
+iy4_victim="$MT_FIXTURE/iy4-victim.env"
+printf 'GATEWAY_AUTH_TOKEN=B-SECRET-GATEWAY-TOKEN\n' >"$iy4_victim"
+iy4_victim_before="$(cat "$iy4_victim")"
+iy4_real_registry="$(declare -f tenant_exists_in_registry)"
+iy4_real_ctr="$(declare -f _ctr)"
+iy4_real_vsh="$(declare -f validate_study_notes_home)"
+iy4_real_isns="$(declare -f initialize_study_notes_state)"
+iy4_real_vsnta="$(declare -f validate_study_notes_tenant_access)"
+tenant_exists_in_registry() { :; }
+_ctr() { return 1; }
+validate_study_notes_home() { :; }
+initialize_study_notes_state() { :; }
+validate_study_notes_tenant_access() { :; }
+selinuxenabled() { return 1; }  # skip the chcon block in the fixture
+tenant_cat() { ig1_deny_tenant_cat "$@"; }
+
+for iy4_fn in configure_opencode configure_opencode2 configure_kimi; do
+  ln -s "$iy4_victim" "$MT_FIXTURE/env/lunarwing.env"
+  iy4_rc=0
+  iy4_err="$( ( "$iy4_fn" fixture-tenant "iy4-model" "" ) 2>&1 )" || iy4_rc=$?
+  if [[ "$iy4_rc" -eq 0 ]]; then
+    echo "  FAIL: $iy4_fn read a foreign-linked env without dying"; failures=$((failures + 1))
+  elif [[ "$iy4_err" != *"could not read $MT_FIXTURE/env/lunarwing.env as tenant 'fixture-tenant'"* ]]; then
+    echo "  FAIL: $iy4_fn died without the tenant-read refusal: $iy4_err"; failures=$((failures + 1))
+  else
+    echo "  PASS: $iy4_fn dies at the tenant-side snapshot read"
+  fi
+  assert_eq "$iy4_fn refusal leaves the foreign env untouched" \
+    "$(cat "$iy4_victim")" "$iy4_victim_before"
+  rm -f "$MT_FIXTURE/env/lunarwing.env"
+done
+
+ln -s "$iy4_victim" "$MT_FIXTURE/env/lunarwing.env"
+iy4_rc=0
+iy4_err="$( ( configure_study_mcp fixture-tenant /srv/lunarwing/lw2studymcp false ) 2>&1 )" || iy4_rc=$?
+if [[ "$iy4_rc" -eq 0 ]]; then
+  echo "  FAIL: configure_study_mcp read a foreign-linked env without dying"; failures=$((failures + 1))
+elif [[ "$iy4_err" != *"could not read $MT_FIXTURE/env/lunarwing.env as tenant 'fixture-tenant'"* ]]; then
+  echo "  FAIL: configure_study_mcp died without the tenant-read refusal: $iy4_err"; failures=$((failures + 1))
+else
+  echo "  PASS: configure_study_mcp dies at the tenant-side snapshot read"
+fi
+assert_eq "configure_study_mcp refusal leaves the foreign env untouched" \
+  "$(cat "$iy4_victim")" "$iy4_victim_before"
+rm -f "$MT_FIXTURE/env/lunarwing.env" "$iy4_victim"
+
+# Clean controls: a plain lunarwing.env still renders — untouched keys are
+# kept from the snapshot and the new values are written through.
+tenant_cat() { cat -- "$2"; }
+printf 'GATEWAY_AUTH_TOKEN=keep-me\nOPENCODE_MODEL=old-model\n' >"$MT_FIXTURE/env/lunarwing.env"
+chmod 600 "$MT_FIXTURE/env/lunarwing.env"
+configure_opencode fixture-tenant "new-model" ""
+assert_eq "configure_opencode writes the new model" "$(envval OPENCODE_MODEL)" "new-model"
+assert_eq "configure_opencode keeps untouched keys" "$(envval GATEWAY_AUTH_TOKEN)" "keep-me"
+configure_study_mcp fixture-tenant /srv/lunarwing/lw2studymcp false
+assert_eq "configure_study_mcp keeps untouched keys" "$(envval GATEWAY_AUTH_TOKEN)" "keep-me"
+assert_eq "configure_study_mcp writes the study home" \
+  "$(envval LW2STUDYMCP_HOME)" "/srv/lunarwing/lw2studymcp"
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+
+# Restore the stubbed helpers for the remaining sections.
+eval "$iy4_real_registry"
+eval "$iy4_real_ctr"
+eval "$iy4_real_vsh"
+eval "$iy4_real_isns"
+eval "$iy4_real_vsnta"
+unset -f selinuxenabled
 
 echo "=== write_tenant_bridge_env fixture tests ==="
 
