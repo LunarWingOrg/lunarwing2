@@ -194,8 +194,12 @@ sudo LUNARWING_WATCHDOG_SCHEDULER=hourly scripts/install-lunarwing-watchdog.sh
 For non-interactive prep, use:
 
 ```bash
-scripts/setup-instance.sh --database postgres --database-url 'postgres://user:pass@host:5432/db'
+scripts/setup-instance.sh --database postgres --database-url 'postgres://user:pass@host:5432/db' \
+  --llm-base-url 'http://127.0.0.1:3002/v1'
 ```
+
+Since WI#402 the script carries no built-in LLM endpoint default: `--llm-base-url`
+is required, and a run without it exits with guidance before any file is written.
 
 The setup script can also preseed the most common runtime identity and secrets
 values:
@@ -205,6 +209,7 @@ scripts/setup-instance.sh \
   --base-dir /srv/lunarwing \
   --database postgres \
   --database-url 'postgres://user:pass@host:5432/db' \
+  --llm-base-url 'http://127.0.0.1:3002/v1' \
   --agent-name lunarwing \
   --gateway-token 'replace-me-gateway-token' \
   --secrets-master-key '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'

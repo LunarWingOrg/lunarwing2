@@ -30,7 +30,9 @@ BASE_DIR="${LUNARWING_BASE_DIR:-${IRONCLAW_BASE_DIR:-${HOME}/.ironclaw}}"
 DATABASE_KIND="libsql"
 DATABASE_URL=""
 LIBSQL_PATH=""
-LLM_BASE_URL="http://192.168.1.157:3002/v1"
+# WI#402: no built-in endpoint default — --llm-base-url is required (the old
+# developer-LAN default was silently wrong on every other host).
+LLM_BASE_URL=""
 LLM_MODEL="tensorzero::function_name::lunarwing"
 LLM_BACKEND="openai_compatible"
 AGENT_NAME="lunarwing"
@@ -59,7 +61,8 @@ Options:
   --database KIND            postgres or libsql. Default: libsql
   --database-url URL         Required when --database postgres
   --libsql-path PATH         libSQL database path. Default: <base-dir>/lunarwing.db
-  --llm-base-url URL         Default: http://192.168.1.157:3002/v1
+  --llm-base-url URL         Required. Your TensorZero/OpenAI-compatible endpoint,
+                             e.g. http://127.0.0.1:3002/v1 for the local proxy
   --llm-model MODEL          Default: tensorzero::function_name::lunarwing
   --llm-api-key KEY          Optional. Use "unneeded" for placeholder-only endpoints
   --gateway-token TOKEN      Optional. Writes GATEWAY_AUTH_TOKEN to .env
@@ -77,12 +80,14 @@ Examples:
   scripts/setup-instance.sh \
     --base-dir /srv/lunarwing \
     --database postgres \
-    --database-url 'postgres://user:pass@db:5432/lunarwing'
+    --database-url 'postgres://user:pass@db:5432/lunarwing' \
+    --llm-base-url 'http://127.0.0.1:3002/v1'
 
   scripts/setup-instance.sh \
     --base-dir /srv/lunarwing-dev \
     --database libsql \
     --libsql-path /srv/lunarwing-dev/lunarwing.db \
+    --llm-base-url 'http://127.0.0.1:3002/v1' \
     --gateway-token 'replace-me-gateway-token' \
     --secrets-master-key '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' \
     --run-onboard
@@ -433,6 +438,10 @@ esac
 
 if [[ "$DATABASE_KIND" == "postgres" && -z "$DATABASE_URL" ]]; then
   die "--database postgres requires --database-url 'postgres://user:pass@host:5432/dbname'"
+fi
+
+if [[ -z "$LLM_BASE_URL" ]]; then
+  die "--llm-base-url is required (no built-in default since WI#402) — pass your TensorZero/OpenAI-compatible endpoint, e.g. --llm-base-url 'http://127.0.0.1:3002/v1' for the local proxy"
 fi
 
 if [[ "$DATABASE_KIND" == "libsql" && -z "$LIBSQL_PATH" ]]; then

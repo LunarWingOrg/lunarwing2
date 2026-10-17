@@ -25,7 +25,10 @@ LIBSQL_PATH="${LUNARWING_TEST_LIBSQL_PATH:-$STATE_DIR/lunarwing.db}"
 # TensorZero proxy
 PROXY_PORT="${LUNARWING_TEST_PROXY_PORT:-3002}"
 PROXY_BIND="${LUNARWING_TEST_PROXY_BIND:-127.0.0.1}"
-TENSORZERO_URL="${LUNARWING_TEST_TENSORZERO_URL:-http://192.168.1.157:3000}"
+# WI#402: no built-in endpoint default — set LUNARWING_TEST_TENSORZERO_URL (or
+# TENSORZERO_URL); bring-up dies with guidance when neither is set and no
+# existing env/proxy.env value can be reused.
+TENSORZERO_URL="${LUNARWING_TEST_TENSORZERO_URL:-${TENSORZERO_URL:-}}"
 ENABLE_PROXY="${LUNARWING_TEST_ENABLE_PROXY:-true}"
 
 # LunarWing service ports
@@ -102,7 +105,9 @@ Environment:
 
   LUNARWING_TEST_PROXY_PORT      default: 3002
   LUNARWING_TEST_PROXY_BIND      default: 127.0.0.1
-  LUNARWING_TEST_TENSORZERO_URL  default: http://192.168.1.157:3000
+  LUNARWING_TEST_TENSORZERO_URL  upstream TensorZero gateway, e.g. http://<host>:3000
+                                 (required at init/bring-up since WI#402; TENSORZERO_URL
+                                 is honored as a fallback, then an existing proxy.env value)
 
   LUNARWING_TEST_GATEWAY_PORT    default: 8765
   LUNARWING_TEST_HTTP_PORT       default: 9098
@@ -222,6 +227,26 @@ env_value_from_file() {
       exit
     }
   ' "$path"
+}
+
+# WI#402: fill TENSORZERO_URL from an existing proxy.env when neither
+# LUNARWING_TEST_TENSORZERO_URL nor TENSORZERO_URL is set, so previously
+# initialized roots keep working without re-exporting the knob.
+resolve_tensorzero_url() {
+  if [[ -z "$TENSORZERO_URL" ]]; then
+    local from_file
+    from_file="$(env_value_from_file "$ENV_DIR/proxy.env" "TENSORZERO_URL" 2>/dev/null || true)"
+    if [[ -n "$from_file" ]]; then
+      TENSORZERO_URL="$from_file"
+    fi
+  fi
+}
+
+require_tensorzero_url() {
+  resolve_tensorzero_url
+  if [[ -z "$TENSORZERO_URL" ]]; then
+    die "no TensorZero gateway configured (no built-in default since WI#402) — set LUNARWING_TEST_TENSORZERO_URL (or TENSORZERO_URL), e.g. LUNARWING_TEST_TENSORZERO_URL=http://<gateway-host>:3000"
+  fi
 }
 
 shared_xmpp_jid() {
@@ -416,6 +441,11 @@ write_lunarwing_env_if_missing() {
     return 0
   fi
 
+  # The direct-gateway branch below bakes $TENSORZERO_URL into LLM_BASE_URL.
+  if [[ "$ENABLE_PROXY" != "true" ]]; then
+    require_tensorzero_url
+  fi
+
   local gateway_token
   gateway_token="$(generate_token)"
 
@@ -500,6 +530,9 @@ write_proxy_env_if_missing() {
     return 0
   fi
 
+  # proxy.env bakes the upstream URL; never write an empty one.
+  require_tensorzero_url
+
   (
     umask 077
     {
@@ -546,6 +579,7 @@ write_bridge_env_if_missing() {
 }
 
 init_env() {
+  require_tensorzero_url
   init_dirs
   write_lunarwing_env_if_missing
   write_bridge_env_if_missing
@@ -787,6 +821,7 @@ wait_for_proxy() {
 
 start_proxy() {
   ensure_env
+  require_tensorzero_url
   require_cmd python3
   require_cmd curl
   local bin
@@ -1479,6 +1514,7 @@ proxy_service_name() {
 
 render_systemd() {
   ensure_env
+  require_tensorzero_url
   local main_service bridge_service proxy_service
   local lunarwing_unit bridge_unit proxy_unit
   main_service="$(lunarwing_service_name)"
@@ -1618,6 +1654,7 @@ PLIST
 
 render_launchd() {
   ensure_env
+  require_tensorzero_url
   # Derive a safe tenant id from the last path component of TEST_ROOT.
   # Single-tenant default ("lunarwing-xmpp-test") → no suffix.
   # MT roots ("lunarwing-mt-a") → suffix ".mt-a".
@@ -1788,9 +1825,14 @@ doctor() {
   fi
 
   # TensorZero gateway
-  local tz_code
-  tz_code="$(curl -sS -o /dev/null -w '%{http_code}' "$TENSORZERO_URL/status" 2>/dev/null || true)"
-  say "TensorZero gateway ($TENSORZERO_URL): HTTP $tz_code"
+  resolve_tensorzero_url
+  if [[ -n "$TENSORZERO_URL" ]]; then
+    local tz_code
+    tz_code="$(curl -sS -o /dev/null -w '%{http_code}' "$TENSORZERO_URL/status" 2>/dev/null || true)"
+    say "TensorZero gateway ($TENSORZERO_URL): HTTP $tz_code"
+  else
+    say "TensorZero gateway: NOT CONFIGURED (set LUNARWING_TEST_TENSORZERO_URL or TENSORZERO_URL — no built-in default since WI#402)"
+  fi
 
   say ""
   say "=== WASM artifacts ==="
