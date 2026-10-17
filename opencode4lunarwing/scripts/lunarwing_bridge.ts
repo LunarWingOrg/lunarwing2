@@ -32,6 +32,7 @@ process.on("unhandledRejection", (reason) => {
 import { executeTask } from "./opencode_task_executor"
 import type { OpencodeClient } from "@opencode-ai/sdk/v2/client"
 import { resolveTaskWorkspace } from "./workspace_path"
+import { ToolProxyRelay, type TaskProxyHandle } from "./lunarwing_tool_proxy"
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -52,6 +53,11 @@ type ActiveTask = { controller: AbortController; socket: BridgeSocket; workspace
 
 const activeTasks = new Map<string, ActiveTask>()
 const activeWorkspaces = new Map<string, string>()
+
+// WI#324 worker-side bridge: per-task unix sockets that the in-task opencode
+// plugin (lunarwing_tool_plugin.ts, loaded by the serve process) uses to
+// reach the hub's tool_call/tool_list frames.
+const toolProxyRelay = new ToolProxyRelay()
 
 // WI#328 runtime control channel: queued `task_prompt` follow-ups per running
 // task. The executor drains a task's queue at turn boundaries (session idle),
@@ -113,6 +119,12 @@ async function handleMessage(data: string, ws: BridgeSocket): Promise<void> {
 
       case "task_prompt":
         handleTaskPrompt(envelope.payload, ws)
+        break
+
+      case "tool_result":
+      case "tool_catalog":
+        // WI#324: hub replies to this worker's tool_call / tool_list frames.
+        toolProxyRelay.handleHubFrame(ws, envelope)
         break
 
       case "ping":
@@ -190,7 +202,16 @@ async function handleTaskRequest(
   const promptQueue: FollowupQueue = { prompts: [], closed: false, seenSeqs: new Set() }
   activePromptQueues.set(request.task_id, promptQueue)
 
+  // WI#324: give the task's serve-side plugin a local tool-proxy socket so it
+  // can reach the hub over this connection. A listen/fs failure never fails
+  // the task — it just runs without LunarWing tools (hub stays
+  // deny-by-default). startTask runs INSIDE the try (MR !1549 EF-2) so an
+  // unexpected throw still hits the finally below and the concurrency slot,
+  // workspace lock and prompt queue are released. Keep startTask/closeTask
+  // throw-free (pinned by the relay's EF-2 tests).
+  let toolProxy: TaskProxyHandle | null = null
   try {
+    toolProxy = await toolProxyRelay.startTask(request.task_id, ws)
     await executeTask(
       request,
       (progress) => {
@@ -207,6 +228,7 @@ async function handleTaskRequest(
       promptQueue,
     )
   } finally {
+    toolProxy?.close()
     activeTasks.delete(request.task_id)
     activePromptQueues.delete(request.task_id)
     if (activeWorkspaces.get(workspace) === request.task_id) activeWorkspaces.delete(workspace)
@@ -378,6 +400,7 @@ function startServer(): void {
       },
       close(ws, code, reason) {
         abortSocketTasks(ws)
+        toolProxyRelay.dropHubSocket(ws)
         connectionCount--
         updateState(connectionCount > 0)
         console.log(`[bridge] agent disconnected: ${code} ${reason} (${connectionCount} active)`)
@@ -434,6 +457,7 @@ async function startClient(): Promise<void> {
 
       ws.addEventListener("close", (event) => {
         abortSocketTasks(bridgeSocket)
+        toolProxyRelay.dropHubSocket(bridgeSocket)
         console.log(`[bridge] disconnected from hub: ${event.code} ${event.reason}`)
         updateState(false)
         scheduleReconnect()
@@ -467,7 +491,7 @@ async function startClient(): Promise<void> {
 // listener roles only start when this file is the entrypoint, so importing
 // it in a test does not bind a port.
 
-export { handleCancel, handleMessage, handleTaskRequest, handleTaskPrompt, sendReady, activePromptQueues, activeTasks }
+export { handleCancel, handleMessage, handleTaskRequest, handleTaskPrompt, sendReady, activePromptQueues, activeTasks, toolProxyRelay }
 
 // tsc has no type for Bun's import.meta.main; the cast keeps `tsc --noEmit`
 // clean without pulling in Bun types.
