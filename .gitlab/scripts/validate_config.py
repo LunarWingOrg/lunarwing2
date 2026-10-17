@@ -480,7 +480,7 @@ def validate_satellite_advisory_sweep(merged: dict, errors: list[str]) -> None:
         "ls-files",
         "ic/deny.toml",
         "--workspace --all-features",
-        "check advisories",
+        "check advisories bans",
     )
     for fragment in required_fragments:
         if fragment not in text:

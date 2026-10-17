@@ -246,11 +246,13 @@ class SatelliteAdvisorySweepTests(unittest.TestCase):
 
     def test_wrapper_losing_guards_is_rejected(self):
         contract = {"satellite-advisory-sweep": {"script": ["bash .gitlab/scripts/check-satellite-advisories.sh"]}}
-        for fragment in ("ls-files", "ic/deny.toml", "--workspace --all-features", "check advisories"):
+        for fragment in ("ls-files", "ic/deny.toml", "--workspace --all-features", "check advisories bans"):
             with self.subTest(fragment=fragment):
                 text = SWEEP.read_text(encoding="utf-8")
                 self.assertIn(fragment, text)
-                self.wrapper.write_text(text.replace(fragment, ""), encoding="utf-8")
+                # IS-1: retaining advisories while dropping bans must fail.
+                replacement = "check advisories" if fragment == "check advisories bans" else ""
+                self.wrapper.write_text(text.replace(fragment, replacement), encoding="utf-8")
                 self.assertTrue(any(fragment in error for error in self.errors(contract)))
                 self.wrapper.write_text(text, encoding="utf-8")
 
