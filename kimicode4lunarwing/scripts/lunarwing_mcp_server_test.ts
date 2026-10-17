@@ -402,6 +402,7 @@ test("the real shim drives the real relay to a hub (run-84 full-path gap)", asyn
   // pointed at a real per-task relay socket; the hub side is a capturing
   // mock whose tool_catalog/tool_result replies are injected through the
   // relay's handleHubFrame, exactly as the bridge routes them.
+  const previousProxyDir = process.env.LUNARWING_TOOL_PROXY_DIR
   process.env.LUNARWING_TOOL_PROXY_DIR = workDir
   const relay = new ToolProxyRelay()
   const hub = new CapturingHubSocket()
@@ -503,6 +504,10 @@ test("the real shim drives the real relay to a hub (run-84 full-path gap)", asyn
   } finally {
     shim.kill()
     handle.close()
-    delete process.env.LUNARWING_TOOL_PROXY_DIR
+    if (previousProxyDir === undefined) {
+      delete process.env.LUNARWING_TOOL_PROXY_DIR
+    } else {
+      process.env.LUNARWING_TOOL_PROXY_DIR = previousProxyDir
+    }
   }
 })
