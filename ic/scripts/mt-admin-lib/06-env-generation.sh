@@ -533,22 +533,21 @@ configure_weechat_relay() {  # <tenant>
   fi
 
   # Temp directory as a sibling of the target (same filesystem for atomic rename).
+  # Both directories are created AS the tenant: a root mkdir/chown here would
+  # follow a symlink the tenant planted at ~/.config (WI#416).
   local config_parent temp_home
   config_parent="$(dirname "$target_home")"
-  if ! mkdir -p "$config_parent" || ! chown "$tenant:$tenant" "$config_parent"; then
+  if ! sudo -u "$tenant" mkdir -p "$config_parent"; then
     printf 'error: unable to prepare WeeChat config parent: %s\n' "$config_parent" >&2
     return 1
   fi
-  temp_home="$(mktemp -d "${config_parent}/.weechat-bootstrap.XXXXXX")" || {
+  temp_home="$(sudo -u "$tenant" mktemp -d "${config_parent}/.weechat-bootstrap.XXXXXX")" || {
     printf 'error: unable to create WeeChat bootstrap directory under %s\n' "$config_parent" >&2
     return 1
   }
 
   (
     trap '[[ -n "${temp_home:-}" && -d "$temp_home" ]] && rm -rf -- "$temp_home"' EXIT
-    if ! chown "$tenant:$tenant" "$temp_home"; then
-      return 1
-    fi
 
     # Generate via WeeChat one-shot.
     if ! _weechat_generate_relay_config "$tenant" "$temp_home" "$relay_port" "$lunarwing_env"; then
@@ -682,8 +681,17 @@ prepare_relay_start_barrier() {  # <tenant>
     || die "missing or unsafe tenant env directory"
   lock="$dir/.relay-start.lock"
   if [[ ! -e "$lock" && ! -L "$lock" ]]; then
-    (umask 077; set -o noclobber; : >"$lock") || return 1
-    chown "$name:$name" "$lock" || return 1
+    # Create the lock as the tenant: a root-side noclobber redirect drops
+    # O_EXCL for a non-regular target, and the follow-up root chown would
+    # follow a symlink the tenant swaps in (WI#416). Tenant-side creation
+    # makes the lock tenant-owned at birth; the checks below still verify it.
+    local -a drop=(sudo -u "$name")
+    [[ "$(id -un)" != "$name" ]] || drop=()
+    "${drop[@]}" env -i PATH="/usr/bin:/bin" bash -c '
+      umask 077
+      set -o noclobber
+      : >"$1"
+    ' _ "$lock" || return 1
   fi
   [[ -f "$lock" && ! -L "$lock" && "$(stat -c '%h:%a' "$lock")" == 1:600 ]] \
     || die "unsafe relay start lock"
