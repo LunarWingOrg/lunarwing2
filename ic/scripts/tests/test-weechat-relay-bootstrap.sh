@@ -747,6 +747,167 @@ fi
 assert_eq "promotion race preserves competing target" \
   "$(<"$race_target/sentinel")" "preserve-race-winner"
 unset -f mv
+echo "=== WI#416 tenant-drop pins (!1709 run-143 JN-2) ==="
+
+# Force the tenant-drop path and record every sudo/chown invocation, proving
+# that (A) a pre-planted symlink at the relay start lock is refused, (B) the
+# lock is created AS the tenant and lands 1:600, and (C) configure_weechat_relay
+# creates the config parent and the bootstrap temp via tenant drops with no
+# root mkdir/chown/mktemp anywhere in the run.
+wi416_sudo_log="$MT_FIXTURE/wi416-sudo.log"
+: >"$wi416_sudo_log"
+
+# Record + execute: strip the drop options, then run the command directly.
+sudo() {
+  printf 'sudo' >>"$wi416_sudo_log"
+  printf ' %s' "$@" >>"$wi416_sudo_log"
+  printf '\n' >>"$wi416_sudo_log"
+  while [[ "${1:-}" == --preserve-env=* ]]; do shift; done
+  if [[ "${1:-}" == "-u" ]]; then shift 2; fi
+  "$@"
+}
+
+# Log-only chown: any root chown in the tested paths shows up here.
+chown() {
+  printf 'chown' >>"$wi416_sudo_log"
+  printf ' %s' "$@" >>"$wi416_sudo_log"
+  printf '\n' >>"$wi416_sudo_log"
+}
+
+# Pretend to be root so prepare_relay_start_barrier takes the sudo drop path.
+id() {
+  if [[ "${1:-}" == "-un" ]]; then echo root; else command id "$@"; fi
+}
+
+# install(1) -o/-g cannot chown as non-root; emulate the two call shapes used
+# by prepare_relay_start_barrier without the ownership change.
+install() {
+  local mode="" is_dir=false
+  local -a args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -d) is_dir=true; shift ;;
+      -o|-g) shift 2 ;;
+      -m) mode="$2"; shift 2 ;;
+      -*) shift ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  if $is_dir; then
+    local d
+    for d in ${args[@]+"${args[@]}"}; do
+      mkdir -p "$d" || return 1
+      [[ -z "$mode" ]] || chmod "$mode" "$d" || return 1
+    done
+  else
+    local last=$((${#args[@]} - 1)) i
+    for ((i = 0; i < last; i++)); do
+      cp "${args[$i]}" "${args[$last]}" || return 1
+      [[ -z "$mode" ]] || chmod "$mode" "${args[$last]}" || return 1
+    done
+  fi
+}
+
+# Fixture files are owned by the harness user; report uid/gid as root so the
+# root-only ownership assertions in prepare_relay_start_barrier hold. Link
+# counts and modes stay real. (Tenant-side inner scripts run through
+# env -i PATH=... and see the real stat, not this stub.)
+stat() {
+  if [[ "${1:-}" == "-c" ]]; then
+    local fmt="$2" path="$3"
+    case "$fmt" in
+      *%u:%g:%a*) printf '0:0:%s\n' "$(command stat -c %a -- "$path")" ;;
+      *%u*) echo 0 ;;
+      *) command stat -c "$fmt" -- "$path" ;;
+    esac
+  else
+    command stat "$@"
+  fi
+}
+
+# Point the launcher install at fixture paths (the real source ships beside
+# the admin script and already satisfies the regular-file checks).
+# Consumed by the sourced prepare_relay_start_barrier body.
+# shellcheck disable=SC2034
+RELAY_ENV_EXEC="$MT_FIXTURE/libexec/lunarwing-relay-env-exec"
+
+# (A) A pre-planted symlink at the lock must be refused.
+barrier_tenant="cw-barrier-symlink"
+barrier_env_dir="$(tenant_env_dir "$barrier_tenant")"
+mkdir -p "$barrier_env_dir"
+chmod 700 "$barrier_env_dir"
+ln -s "$MT_FIXTURE/wi416-swap-target" "$barrier_env_dir/.relay-start.lock"
+barrier_err="$MT_FIXTURE/wi416-barrier.err"
+if ( prepare_relay_start_barrier "$barrier_tenant" ) >/dev/null 2>"$barrier_err"; then
+  echo "  FAIL: pre-planted symlink at relay start lock must be refused"
+  failures=$((failures + 1))
+elif grep -q 'unsafe relay start lock' "$barrier_err"; then
+  echo "  PASS: pre-planted symlink at relay start lock refused"
+else
+  echo "  FAIL: symlink refusal did not come from the lock safety check"
+  failures=$((failures + 1))
+fi
+assert_ok "planted symlink left in place" test -L "$barrier_env_dir/.relay-start.lock"
+
+# (B) A fresh lock is created via the tenant drop and lands 1:600.
+barrier_tenant="cw-barrier-create"
+barrier_env_dir="$(tenant_env_dir "$barrier_tenant")"
+mkdir -p "$barrier_env_dir"
+chmod 700 "$barrier_env_dir"
+: >"$wi416_sudo_log"
+if ( prepare_relay_start_barrier "$barrier_tenant" ) >/dev/null 2>&1; then
+  echo "  PASS: relay start lock creation succeeds"
+else
+  echo "  FAIL: relay start lock creation failed"
+  failures=$((failures + 1))
+fi
+assert_ok "relay start lock is a regular file" test -f "$barrier_env_dir/.relay-start.lock"
+assert_eq "relay start lock lands 1:600" \
+  "$(command stat -c '%h:%a' "$barrier_env_dir/.relay-start.lock")" "1:600"
+if grep -qF "sudo -u $barrier_tenant env -i PATH=/usr/bin:/bin bash -c" "$wi416_sudo_log"; then
+  echo "  PASS: relay start lock created via tenant drop"
+else
+  echo "  FAIL: relay start lock was not created via the tenant drop"
+  echo "        sudo log: $(<"$wi416_sudo_log")"
+  failures=$((failures + 1))
+fi
+
+# The id/install/stat stubs belong to the barrier pins only.
+unset -f id install stat
+
+# (C) configure_weechat_relay creates the config parent and the bootstrap
+# temp via tenant drops; no root mkdir/chown/mktemp anywhere in the run.
+drop_tenant="cw-config-drop"
+mkdir -p "$(tenant_home "$drop_tenant")"
+write_fixture_env "$drop_tenant"
+rm -rf "$WEECHAT_CALL_DIR"
+mkdir -p "$WEECHAT_CALL_DIR"
+: >"$wi416_sudo_log"
+configure_weechat_relay "$drop_tenant" >/dev/null
+assert_ok "drop-path target dir created" test -d "$(tenant_weechat_home "$drop_tenant")"
+if grep -qF "sudo -u $drop_tenant mkdir -p $(tenant_home "$drop_tenant")/.config" "$wi416_sudo_log"; then
+  echo "  PASS: WeeChat config parent created via tenant drop"
+else
+  echo "  FAIL: WeeChat config parent was not created via the tenant drop"
+  failures=$((failures + 1))
+fi
+if grep -qE "sudo -u ${drop_tenant} mktemp -d .*/\.config/\.weechat-bootstrap\." "$wi416_sudo_log"; then
+  echo "  PASS: bootstrap temp created via tenant drop"
+else
+  echo "  FAIL: bootstrap temp was not created via the tenant drop"
+  failures=$((failures + 1))
+fi
+assert_fail "no root chown anywhere in configure_weechat_relay (JN-1)" \
+  grep -qE '^chown' "$wi416_sudo_log"
+
+# Restore the harness's original non-logging stubs for any later tests.
+chown() { :; }
+sudo() {
+  while [[ "${1:-}" == --preserve-env=* ]]; do shift; done
+  if [[ "${1:-}" == "-u" ]]; then shift 2; fi
+  "$@"
+}
+
 
 # ── Todo 3: CLI dispatch and add_tenant wiring ───────────────────────────────
 echo "=== CLI dispatch smoke check ==="
