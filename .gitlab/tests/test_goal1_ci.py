@@ -1615,6 +1615,23 @@ class WorkerTsLaneTests(unittest.TestCase):
     def test_valid_shape_passes(self):
         self.assertEqual(self.errors(self.merged()), [])
 
+    def test_missing_needs_is_caught(self):
+        # IX-2 (MR !1691 run-137): a lane moved to a later stage without
+        # needs: [] receives every earlier-stage job's dotenv variables
+        # (NODE_OPTIONS, BUN_OPTIONS) and artifacts.
+        for job_name in config.WORKER_TS_LANE_SCRIPTS:
+            with self.subTest(job=job_name):
+                merged = self.merged()
+                del merged[job_name]["needs"]
+                merged[job_name]["stage"] = "check"
+                self.assertTrue(
+                    any(
+                        job_name in error and "needs: []" in error
+                        for error in self.errors(merged)
+                    ),
+                    self.errors(merged),
+                )
+
     def test_job_level_execution_overrides_are_caught(self):
         # HP-1: the script can remain byte-identical while its environment
         # skips tests, exits Node immediately, or replaces npm's shell.
@@ -2647,6 +2664,23 @@ class PebbleRustLaneTests(unittest.TestCase):
         merged = self.merged()
         merged[".rust-job"]["image"] = {"name": "$CI_BUN_IMAGE"}
         self.assertTrue(any("CI_RUST_IMAGE" in error for error in self.errors(merged)))
+
+    def test_template_image_entrypoint_is_caught(self):
+        # IX-1 (MR !1691 run-137): an entrypoint inherited from .rust-job can
+        # end the job before the pinned script runs, with the image name
+        # unchanged.
+        merged = self.merged()
+        merged[".rust-job"]["image"]["entrypoint"] = ["/bin/true"]
+        self.assertTrue(any("CI_RUST_IMAGE" in error for error in self.errors(merged)))
+
+    def test_missing_needs_is_caught(self):
+        # IX-2 (MR !1691 run-137): without needs: [] a later-stage lane
+        # inherits every earlier-stage dotenv report (variables) and
+        # artifact.
+        merged = self.merged()
+        del merged["worker-pebble-rust"]["needs"]
+        merged["worker-pebble-rust"]["stage"] = "check"
+        self.assertTrue(any("needs: []" in error for error in self.errors(merged)))
 
     def test_template_tag_drift_is_caught(self):
         merged = self.merged()
