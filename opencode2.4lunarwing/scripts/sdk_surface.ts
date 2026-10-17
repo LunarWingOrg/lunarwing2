@@ -169,8 +169,10 @@ export function blankCommentsAndStrings(source: string): {
   }
 
   const scanTemplate = () => {
-    const start = i
-    i++ // opening backtick
+    // Blank the template TEXT segments but leave ${}-expression code intact:
+    // a call inside a template expression is a real call site (WI#369).
+    let segmentStart = i // opening backtick
+    i++
     while (i < n) {
       const c = source[i]!
       if (c === "\\") {
@@ -179,17 +181,20 @@ export function blankCommentsAndStrings(source: string): {
       }
       if (c === "`") {
         i++
-        break
+        blank(segmentStart, i)
+        return
       }
       if (c === "$" && source[i + 1] === "{") {
+        blank(segmentStart, i)
         i += 2
         scanCode(true) // returns positioned AT the matching '}'
         i++
+        segmentStart = i
         continue
       }
       i++
     }
-    blank(start, Math.min(i, n))
+    blank(segmentStart, Math.min(i, n))
   }
 
   const scanCode = (inTemplateExpression: boolean): void => {
