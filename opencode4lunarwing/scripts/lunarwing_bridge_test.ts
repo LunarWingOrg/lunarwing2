@@ -19,6 +19,7 @@ import {
   activePromptQueues,
   activeTasks,
   handleCancel,
+  handleHubSocketClosed,
   handleMessage,
   handleTaskRequest,
   handleTaskPrompt,
@@ -386,6 +387,29 @@ async function waitForFrame(frames: SentFrame[], type: string): Promise<SentFram
     if (hit) return hit
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${type}`)
     await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+}
+
+// JU-3: a closed hub socket must drop the relay's pending map for that socket
+// and fail the task's in-flight call at once — not through the later closeTask
+// (which leaves an EF-9 leak and an EV-4 gap for a request arriving between the
+// close and teardown). Pins the `dropHubSocket` call in each close handler.
+{
+  const a = fakeSocket()
+  const handle = await toolProxyRelay.startTask("hub-close-drop", a.socket)
+  assert.ok(handle)
+  try {
+    const parked = ipcCall(handle.socketPath, { op: "call", call_id: "c-drop", name: "memory_read", arguments: {} })
+    await waitForFrame(a.frames, "tool_call")
+    handleHubSocketClosed(a.socket)
+    const reply = await bounded(parked)
+    assert.match(String(reply.error), /hub connection closed/)
+    const sentBefore = a.frames.length
+    const late = await bounded(ipcCall(handle.socketPath, { op: "call", call_id: "c-late", name: "memory_read", arguments: {} }))
+    assert.match(String(late.error), /hub connection closed/)
+    assert.equal(a.frames.length, sentBefore, "nothing is sent into the closed hub socket")
+  } finally {
+    handle.close()
   }
 }
 

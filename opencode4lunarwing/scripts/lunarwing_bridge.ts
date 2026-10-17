@@ -81,6 +81,21 @@ function abortSocketTasks(socket: BridgeSocket): void {
   }
 }
 
+/**
+ * A hub control socket closed. Fail every in-flight task on it and drop the
+ * relay's pending map for that socket, so reconnects never accumulate stale
+ * pending state AND a request that arrives between the close and the task's
+ * teardown is sent into the dead socket (JU-3; the kimi lane pins the same
+ * with its spawned-bridge test). Without `dropHubSocket`, the aborted task's
+ * `finally` still fails its waiter later through `closeTask`, but the dead
+ * socket's pending map stays in `pendingBySocket` for the process lifetime —
+ * the EF-9 leak — and the close-to-teardown window leaves an EV-4 gap.
+ */
+export function handleHubSocketClosed(socket: BridgeSocket): void {
+  abortSocketTasks(socket)
+  toolProxyRelay.dropHubSocket(socket)
+}
+
 // ── Message Handling ──────────────────────────────────────────────────────────
 
 function sendReady(ws: BridgeSocket): void {
@@ -399,8 +414,7 @@ function startServer(): void {
         await handleMessage(data, ws)
       },
       close(ws, code, reason) {
-        abortSocketTasks(ws)
-        toolProxyRelay.dropHubSocket(ws)
+        handleHubSocketClosed(ws)
         connectionCount--
         updateState(connectionCount > 0)
         console.log(`[bridge] agent disconnected: ${code} ${reason} (${connectionCount} active)`)
@@ -456,8 +470,7 @@ async function startClient(): Promise<void> {
       })
 
       ws.addEventListener("close", (event) => {
-        abortSocketTasks(bridgeSocket)
-        toolProxyRelay.dropHubSocket(bridgeSocket)
+        handleHubSocketClosed(bridgeSocket)
         console.log(`[bridge] disconnected from hub: ${event.code} ${event.reason}`)
         updateState(false)
         scheduleReconnect()

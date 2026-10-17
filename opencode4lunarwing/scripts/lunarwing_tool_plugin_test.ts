@@ -37,7 +37,10 @@ class FakeHubSocket {
 }
 
 /** Stub of the plugin host's SDK client: titles per session id. */
-function stubClient(titles: Record<string, string | undefined>): SessionTitleClient & { calls: number } {
+function stubClient(
+  titles: Record<string, string | undefined>,
+  parents: Record<string, string | undefined> = {},
+): SessionTitleClient & { calls: number } {
   const state = {
     calls: 0,
     session: {
@@ -45,7 +48,7 @@ function stubClient(titles: Record<string, string | undefined>): SessionTitleCli
         state.calls++
         const title = titles[options.path.id]
         if (title === undefined) throw new Error("404: session not found")
-        return { data: { title } }
+        return { data: { title, parentID: parents[options.path.id] } }
       },
     },
   }
@@ -143,6 +146,7 @@ const relay = new ToolProxyRelay()
 
     const pending = assert.rejects(
       tools.lunarwing_memory_write!.execute({ content: "x", target: "MEMORY.md" }, context),
+      /not in this worker's tool_allowlist/,
     )
     await settle()
     const callId = hub.lastFrame().payload.call_id as string
@@ -156,10 +160,7 @@ const relay = new ToolProxyRelay()
         error: "tool 'memory_write' is not in this worker's tool_allowlist",
       }),
     )
-    await pending.catch((err: unknown) => {
-      assert.ok(err instanceof Error)
-      assert.match(err.message, /not in this worker's tool_allowlist/)
-    })
+    await pending
   } finally {
     handle.close()
   }
@@ -208,6 +209,37 @@ const relay = new ToolProxyRelay()
   // Not cached: a lookup that fails may be retried (serve hiccup vs a session
   // that will never qualify — only successful resolutions are pinned).
   assert.equal(cache.has("ses_empty"), false)
+}
+
+// ── JU-1: subagent children resolve through their root session's title ───────
+{
+  const titles = {
+    "ses_root": "lunarwing-opencode-job-root",
+    "ses_child": "check the study notes (@general subagent)",
+    "ses_grandchild": "lunarwing-opencode-job-forged (@general subagent)",
+    "ses_missing-parent": "orphan (@general subagent)",
+  }
+  const parents = {
+    "ses_child": "ses_root",
+    "ses_grandchild": "ses_child",
+    "ses_missing-parent": "ses_absent",
+  }
+  const client = stubClient(titles, parents)
+  const cache = new Map<string, string | null>()
+
+  // A child resolves to its root's task binding, not its own subagent title.
+  assert.equal(await resolveTaskId(client, cache, "ses_child"), "job-root")
+  // A grandchild whose own title is a forged task prefix still resolves to
+  // the root: the binding is on the root session, not a child that happened
+  // to inherit the title. (For a child, non-zero parent wins over the title.)
+  assert.equal(await resolveTaskId(client, cache, "ses_grandchild"), "job-root")
+  // A missing parent (404) yields null, never a crash or a wrong binding.
+  assert.equal(await resolveTaskId(client, cache, "ses_missing-parent"), null)
+
+  // A parent cycle is refused (never loops forever).
+  const cycleTitle = { a: "lunarwing-opencode-job-cycle", b: "no-title" }
+  const cycle = stubClient(cycleTitle, { a: "b", b: "a" })
+  assert.equal(await resolveTaskId(cycle, new Map(), "a"), null)
 }
 
 // ── a task whose relay never started fails the call, never hangs ─────────────

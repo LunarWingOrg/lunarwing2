@@ -11,9 +11,10 @@
  * and local servers inherit the serve process env). Instead this plugin
  * registers the WI#324 phase-1 tools statically; each tool's execute()
  * receives the calling session's id, resolves the session title
- * (`lunarwing-opencode-<task_id>`, set by the bridge's executor) through the
- * plugin host's authenticated client, and relays the call over the per-task
- * unix socket the bridge created (lunarwing_tool_proxy.ts).
+ * (`lunarwing-opencode-<task_id>`, set by the bridge's executor; subagent
+ * children walk up to their root session) through the plugin host's
+ * authenticated client, and relays the call over the per-task unix socket the
+ * bridge created (lunarwing_tool_proxy.ts).
  *
  * Security notes:
  * - The hub stays authoritative: the allowlist, phase-1 capability set and
@@ -58,7 +59,9 @@ function requestTimeoutMs(): number {
 /** The slice of the plugin host's SDK client this plugin uses. */
 export interface SessionTitleClient {
   session: {
-    get(options: { path: { id: string } }): Promise<{ data?: { title?: unknown } | undefined }>
+    get(
+      options: { path: { id: string } },
+    ): Promise<{ data?: { title?: unknown; parentID?: unknown } | undefined }>
   }
 }
 
@@ -136,11 +139,17 @@ function relayCall(socketPath: string, request: Record<string, unknown>): Promis
 /**
  * Resolve the session's LunarWing task id from its title, through the plugin
  * host's authenticated client. Returns null for sessions the bridge did not
- * dispatch. Successful resolutions are cached for the process lifetime —
- * session ids are unique and never reused, and pinning the FIRST observed
- * title means a task renaming its own session mid-run cannot redirect its
- * tool calls onto another task's socket.
+ * dispatch. A subagent runs in a child session titled
+ * `<description> (@<agent> subagent)` (opencode's `task` tool), so the real
+ * task binding is on the root session reached by walking `parentID`. The walk
+ * is hop-bounded and adds no authority: a child with a forged `parentID` is no
+ * stronger than a forged title (JU-1). Successful resolutions are cached for
+ * the process lifetime — session ids are unique and never reused, and pinning
+ * the FIRST observed title means a task renaming its own session mid-run
+ * cannot redirect its tool calls onto another task's socket.
  */
+const MAX_PARENT_HOPS = 8
+
 export async function resolveTaskId(
   client: SessionTitleClient,
   cache: Map<string, string | null>,
@@ -150,8 +159,21 @@ export async function resolveTaskId(
   if (cached !== undefined) return cached
   let title: unknown
   try {
-    const response = await client.session.get({ path: { id: sessionID } })
-    title = response.data?.title
+    // Walk the parent chain to the root session, whose title carries the task
+    // binding; a child's own title is `<description> (@agent subagent)`.
+    let id = sessionID
+    let data: { title?: unknown; parentID?: unknown } | undefined
+    for (let hop = 0; ; hop++) {
+      data = (await client.session.get({ path: { id } })).data
+      const parent = data?.parentID
+      if (typeof parent === "string" && parent.length > 0) {
+        if (hop >= MAX_PARENT_HOPS) return null
+        id = parent
+        continue
+      }
+      break
+    }
+    title = data?.title
   } catch {
     return null
   }
