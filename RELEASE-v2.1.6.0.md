@@ -347,8 +347,12 @@ re-confirming upstream — libsql 0.10.0 went stable 2026-10-13 and still
 pins hyper-rustls ^0.25 — so a bump still clears nothing). After the
 WI#331 gate, exactly one vulnerability (rsa
 via russh) compiles into default builds; the webpki/h2 chain and the
-accepted rustls 0.22.4 advisories are opt-in only. No unaccounted advisory
-exists in any committed lockfile.
+accepted rustls 0.22.4 advisories are opt-in only. Every pre-modern
+h2/rustls/webpki version except the exact accepted pins is now banned in
+`ic/deny.toml` (hyper-rustls 0.25.0 is permitted only with libsql as its
+direct parent), and the satellite advisory sweep checks bans as well as
+advisories, so a newer-but-still-legacy release cannot slip in unreviewed.
+No unaccounted advisory exists in any committed lockfile.
 
 Two security upgrades landed late in the cycle on top of the semver sweep:
 
@@ -712,8 +716,8 @@ gateway/voice, DarkIRC adapter, contributor onboarding, ENGINE-V2,
 self-heal and harness docs — with stale anchors repaired and the WI#376
 operator instructions corrected to the real refusal behavior). A new
 point-in-time audit, `docs/ops/v2.1.6.0_OPEN_WORK_ITEMS_STATUS.md` (a
-2026-10-14 01:05Z snapshot — work items filed after it, WI#402 through
-WI#415, postdate it), reconciles every open work item by release label and
+2026-10-14 01:05Z snapshot — work items filed after it, WI#402 onward, now
+through WI#430, postdate it), reconciles every open work item by release label and
 feeds the known-issues list below.
 
 ### Dependency Sweep and Vendor Refresh
@@ -887,20 +891,23 @@ long-term mitigation, and owns their per-release re-verification.
 
 **Known issues / open at release.** Reconciled per item in
 `docs/ops/v2.1.6.0_OPEN_WORK_ITEMS_STATUS.md`, a 2026-10-14 01:05Z snapshot
-(work items filed after it — WI#402 through WI#415 — postdate the audit):
+(work items filed after it — WI#402 onward, now through WI#430 — postdate the audit):
 WI#397 (`high` — sb&kumo findings); the cross-cron shared-container borrow
-WI#396; the goals-open items WI#375, WI#390, WI#392, WI#402, and WI#408;
+WI#396; the goals-open items WI#375, WI#402, and WI#408;
 WI#415 (the OpenRC weechat/relay/adapter/darkirc renderers still bake
-caller-PATH `python3`); and the advisory-clearing owners WI#418, WI#367,
+caller-PATH `python3`); the mt-admin root-boundary residue WI#416, WI#422,
+and WI#423; the sandbox-proxy leftovers WI#429 and WI#430; and the
+advisory-clearing owners WI#418, WI#367,
 and WI#368. Still open from this cycle's merged work: WI#324
-(opencode/opencode2/pebble worker-side bridges and real-worker acceptance
-evidence), WI#357 (the opencode2 v2.0.26 bump stays gated), and WI#412
-(pending maintainer acceptance). WI#400 tracks real worker credential
+(opencode/opencode2/pebble worker-side bridges; first kimi real-worker
+evidence landed 2026-10-16 on the soarin test tenant), and WI#390, WI#412,
+and WI#419 (all three pending maintainer acceptance). WI#400 tracks real worker credential
 isolation beyond the WI#373 hygiene strips. The five test-build field
 reports (WI#366, WI#372, WI#385, WI#398, WI#399) and the WI#359/WI#373
 triage items were closed on 2026-10-14; WI#336, WI#356, WI#376, WI#377,
 WI#380, WI#393, WI#395, WI#410, WI#411, and WI#417 closed during final
-review (2026-10-13 through 2026-10-16).
+review (2026-10-13 through 2026-10-16); and WI#357 and WI#392 closed on
+2026-10-17.
 
 **Deployment boundaries.** The onboarding web app remains a trusted local
 console without user accounts or TLS: retain loopback binding and use an
