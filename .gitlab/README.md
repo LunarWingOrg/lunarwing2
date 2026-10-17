@@ -598,6 +598,11 @@ verifying the release archive. A matching `--version` string is not trusted.
 Rejected cached binaries are removed before downloading, and a failed binary
 check removes the installation so `after_script` cannot execute it. Verified
 cache hits stay offline; rejected entries require a verified download (IU-2).
+Both Rust templates also use this helper's `--show-stats` mode in
+`after_script`: it rechecks the same binary pin before execution, removes
+rejected entries, and skips missing binaries without downloading. This
+protects telemetry even if an earlier bootstrap step fails before the normal
+sccache verification runs (IZ-1).
 
 **Compiler-cache trust limit (IU-3):** the binary pin does not authenticate
 compiled objects in `.ci-cache/sccache/`. The checked-in pipeline permits

@@ -11,6 +11,8 @@ import tarfile
 import tempfile
 import unittest
 
+import yaml
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 BOOTSTRAP = ROOT / ".gitlab/scripts/bootstrap-sccache.sh"
@@ -84,9 +86,9 @@ exit 2
         self.cached.write_bytes(binary)
         self.cached.chmod(0o755 if executable else 0o644)
 
-    def run_bootstrap(self):
+    def run_bootstrap(self, *args):
         return subprocess.run(
-            ["bash", str(self.script)], env=self.env, text=True,
+            ["bash", str(self.script), *args], env=self.env, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
         )
 
@@ -147,6 +149,66 @@ exit 2
         self.assertNotEqual(result.returncode, 0)
         self.assert_payload_not_run()
         self.assertFalse(self.cached.exists())
+
+    def test_stats_runs_only_the_verified_binary_without_downloading(self):
+        self.cache(TRUSTED_BINARY)
+        result = self.run_bootstrap("--show-stats")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / "trusted-runs").read_text(), "--show-stats\n")
+        self.assertFalse((self.root / "downloaded").exists())
+
+    def test_stats_rejects_payload_without_downloading(self):
+        self.cache(POISONED_BINARY)
+        result = self.run_bootstrap("--show-stats")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_payload_not_run()
+        self.assertFalse(self.cached.exists())
+        self.assertFalse((self.root / "downloaded").exists())
+
+    def test_stats_skips_missing_binary_without_downloading(self):
+        result = self.run_bootstrap("--show-stats")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.cached.exists())
+        self.assertFalse((self.root / "downloaded").exists())
+
+    def test_after_script_cannot_run_payload_when_earlier_bootstrap_fails(self):
+        defaults = yaml.safe_load((ROOT / ".gitlab/ci/defaults.yml").read_text())
+        for template in (".rust-job", ".rust-msrv-job"):
+            for failed_step in ("df", "toolchain"):
+                with self.subTest(template=template, failed_step=failed_step):
+                    # No spaces here: the old unquoted after_script command
+                    # must be able to execute its payload in the negative control.
+                    project = self.root / f"runner-{template}-{failed_step}"
+                    scripts = project / ".gitlab/scripts"
+                    scripts.mkdir(parents=True)
+                    (scripts / "bootstrap-sccache.sh").write_text(self.script.read_text())
+                    for bootstrap in ("bootstrap-rust.sh", "bootstrap-msrv.sh"):
+                        (scripts / bootstrap).write_text("#!/usr/bin/env bash\nexit 1\n")
+                    cached = project / ".ci-cache/bin/sccache"
+                    cached.parent.mkdir(parents=True)
+                    cached.write_bytes(POISONED_BINARY)
+                    cached.chmod(0o755)
+                    env = dict(
+                        self.env, CI_PROJECT_DIR=str(project), FIXTURE=str(project),
+                        SCCACHE_DIR=str(project / ".ci-cache/sccache"),
+                    )
+                    before = list(defaults[template]["before_script"])
+                    if failed_step == "df":
+                        before[0] = "false"
+                    result = subprocess.run(
+                        ["bash", "-e", "-c", "\n".join(before)], cwd=project, env=env,
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    # GitLab runs after_script in a fresh shell on script_failure.
+                    result = subprocess.run(
+                        ["bash", "-e", "-c", "\n".join(defaults[template]["after_script"])],
+                        cwd=project, env=env, capture_output=True, text=True, timeout=10,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse((project / "payload-ran").exists())
+                    self.assertFalse((project / "downloaded").exists())
+                    self.assertFalse(cached.exists())
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 # Nothing is installed on the runner host — the binary lives in the
 # project-local .ci-cache and the job containers download it fresh
 # (cache-hit makes this a no-op on repeat runs).
+# --show-stats verifies the cached binary and reports telemetry without downloading.
 set -euo pipefail
 
 SCCACHE_VERSION="0.17.0"
@@ -16,12 +17,20 @@ sccache_bin="$bin_dir/sccache"
 # IU-2: cache contents are untrusted; asking for --version executes them.
 # Verify bytes before any execution, even on a cache hit.
 if [[ -x "$sccache_bin" ]] && echo "$SCCACHE_BIN_SHA256  $sccache_bin" | sha256sum --check --status; then
+    if [[ "${1:-}" == "--show-stats" ]]; then
+        exec "$sccache_bin" --show-stats
+    fi
     exit 0
 fi
 
 # after_script still runs when bootstrap fails. Remove a rejected binary
 # before downloading so a network/checksum failure cannot leave it executable.
 rm -f -- "$sccache_bin"
+# IZ-1: after_script can run before bootstrap ever reaches this helper.
+# Verify independently, and skip telemetry for missing/rejected binaries.
+if [[ "${1:-}" == "--show-stats" ]]; then
+    exit 0
+fi
 mkdir -p "$bin_dir"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
