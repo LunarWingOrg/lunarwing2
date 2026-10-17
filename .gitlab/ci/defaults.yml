@@ -87,7 +87,8 @@ variables:
   after_script:
     - df -h "$CI_PROJECT_DIR"
     - du -sh "$CI_PROJECT_DIR/ic/target" "$SCCACHE_DIR" 2>/dev/null || true
-    - ${CI_PROJECT_DIR}/.ci-cache/bin/sccache --show-stats || true
+    # IZ-1: earlier bootstrap steps may have failed before verifying sccache.
+    - bash .gitlab/scripts/bootstrap-sccache.sh --show-stats || true
   cache:
     # Validation jobs are always pull-only; dedicated protected jobs refresh
     # cache archives without exposing a policy variable to pipeline overrides.
@@ -122,7 +123,7 @@ variables:
   after_script:
     - df -h "$CI_PROJECT_DIR"
     - du -sh "$CI_PROJECT_DIR/ic/target" "$SCCACHE_DIR" 2>/dev/null || true
-    - ${CI_PROJECT_DIR}/.ci-cache/bin/sccache --show-stats || true
+    - bash .gitlab/scripts/bootstrap-sccache.sh --show-stats || true
     - mv ic/rust-toolchain.toml.disabled ic/rust-toolchain.toml || true
   cache:
     - key:

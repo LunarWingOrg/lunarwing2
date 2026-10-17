@@ -90,8 +90,15 @@ VARIABLE_REF_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][
 
 
 def load_yaml(path: pathlib.Path) -> dict:
-    with path.open(encoding="utf-8") as stream:
-        loaded = yaml.safe_load(stream)
+    try:
+        with path.open(encoding="utf-8") as stream:
+            loaded = yaml.safe_load(stream)
+    except yaml.YAMLError as error:
+        # MR !1647 review HP-5: custom tags such as `!reference` make
+        # yaml.safe_load raise a ConstructorError — fail closed with a clean
+        # one-line error (via cli()), not a traceback.
+        detail = getattr(error, "problem", None) or str(error).splitlines()[0]
+        raise ValueError(f"{path.relative_to(ROOT)}: cannot parse YAML: {detail}") from None
     if not isinstance(loaded, dict):
         raise ValueError(f"{path.relative_to(ROOT)} must contain a YAML mapping")
     return loaded
@@ -451,6 +458,188 @@ def validate_cargo_deny_gate(merged: dict, errors: list[str]) -> None:
             errors.append(f"cargo-deny-check.sh lost its {fragment} guard")
 
 
+# MR !1665 review IF-1: the release audit's advisory gates. Each must
+# exist, carry exactly .full-validation-context's rules and the pinned
+# runner tag, and set no job-level `when` — one rule-level
+# `allow_failure: true` (GitLab's documented rules:allow_failure), a
+# `rules: [{when: never}]` replacement, or a retag makes a gate optional,
+# unreachable, or rerouted while every script pin stays green.
+ADVISORY_GATE_JOBS = (
+    "cargo-deny",
+    "satellite-advisory-sweep",
+    "lockfile-only-advisory-guard",
+    "default-graph-advisory-guard",
+)
+
+# Run-135 IP-1 (MR !1680 review): a gate that never runs its checker is as
+# optional as an allow_failure one. `exit 0` before the wrapper (job or
+# template before_script, or the script itself), `|| true`, or an echoed
+# wrapper name all kept the mention-only pins green, so each gate's effective
+# script and bootstrap are pinned exactly and only these keys may survive
+# extends resolution. A deliberate change edits these tuples in the same
+# commit.
+ADVISORY_GATE_SCRIPTS = {
+    "cargo-deny": [
+        "bash .gitlab/scripts/install-cargo-deny.sh",
+        "bash .gitlab/scripts/cargo-deny-check.sh",
+    ],
+    "satellite-advisory-sweep": [
+        "bash .gitlab/scripts/install-cargo-deny.sh",
+        "bash .gitlab/scripts/check-satellite-advisories.sh",
+    ],
+    "lockfile-only-advisory-guard": [
+        "bash .gitlab/scripts/check-lockfile-only-advisories.sh",
+    ],
+    "default-graph-advisory-guard": [
+        "bash .gitlab/scripts/check-default-graph-advisories.sh",
+    ],
+}
+ADVISORY_GATE_BEFORE_SCRIPT = [
+    'df -h "$CI_PROJECT_DIR"',
+    "bash .gitlab/scripts/bootstrap-rust.sh",
+    "bash .gitlab/scripts/bootstrap-sccache.sh",
+]
+ADVISORY_GATE_EFFECTIVE_KEYS = frozenset({
+    "after_script", "before_script", "cache", "image", "needs", "rules",
+    "script", "stage", "tags",
+})
+
+# Run-137 IU-1: artifacts can replace checkers or supply dotenv variables
+# outside GLOBAL_VARIABLE_ALLOWLIST. Pin the allowed inputs as well as keys:
+# no upstream artifacts or dotenv, exactly the Rust image and pull-only caches.
+ADVISORY_GATE_PINNED_VALUES = {
+    "image": {"name": "$CI_RUST_IMAGE"},
+    "needs": [{"job": "cargo-metadata", "artifacts": False}],
+    "cache": [
+        {
+            "key": {"prefix": "rust-1.96.1-dependencies", "files": ["ic/Cargo.lock"]},
+            "paths": [
+                ".ci-cache/cargo/registry/index/",
+                ".ci-cache/cargo/registry/cache/",
+                ".ci-cache/cargo/git/db/",
+            ],
+            "policy": "pull",
+        },
+        {
+            "key": "rust-1.96.1-sccache",
+            "paths": [".ci-cache/bin/", ".ci-cache/sccache/"],
+            "policy": "pull",
+        },
+    ],
+}
+
+
+def validate_advisory_gates_not_optional(merged: dict, errors: list[str]) -> None:
+    """The release audit's advisory gates must not be allowed to fail.
+
+    MR !1658 review IA-9: a root-file (or direct) job-level
+    `allow_failure: true` turns a red advisory gate advisory-only with a
+    one-line diff, and the gates' own script pins here do not notice.
+    MR !1665 review IF-1: the same holds one level down — a rule-level
+    `allow_failure`, a replaced rules list (even `rules: [{when: never}]`),
+    a job-level `when`, or a missing job each leaves the guard green while
+    the gate cannot block, so each gate must exist and its extends-resolved
+    rules must be exactly .full-validation-context's. The template's own
+    rules may carry only `if` (plus the final `when: never`), so the
+    equality check cannot inherit a hollowed-out template. The resolved
+    tags must be exactly ['$CI_RUST_RUNNER_TAG'] (IF-2): a retagged gate
+    runs on an unpinned runner. secret-history is deliberately
+    allow_failure while historical findings are triaged and is NOT in this
+    set — making another gate optional must stay as visible as that marked
+    exception. Any non-false allow_failure value (including the exit_codes
+    hash form) counts.
+
+    MR !1665 review IF-2: the EXPECTED_RUNNER_TAGS pin in
+    validate_lane_environment_routes covers only the merged top-level
+    value; a job-level (or rule-level) `variables:` entry overrides it for
+    that job and reroutes the pinned jobs while the top-level pin stays
+    green, so no job may name a runner tag variable in any variables
+    scope.
+
+    MR !1680 review IP-1 (run-135): a gate that never runs its checker is
+    as optional as an allow_failure one, and the checks above did not see
+    it — `exit 0` as the first script line or in the job's (or the shared
+    .rust-job template's) before_script, `|| true` on the wrapper, or an
+    `echo` of the wrapper name all kept the mention-only pins green. Each
+    gate's effective script and bootstrap are therefore pinned exactly
+    (ADVISORY_GATE_SCRIPTS / ADVISORY_GATE_BEFORE_SCRIPT), and only
+    ADVISORY_GATE_EFFECTIVE_KEYS may survive extends resolution —
+    job-level variables, hooks, inherit, parallel or timeout can hollow
+    out a gate just as well."""
+    template = resolve_extends(merged.get(".full-validation-context"), merged)
+    template_rules = template.get("rules")
+    if not isinstance(template_rules, list) or not template_rules:
+        errors.append(".full-validation-context must define rules")
+        template_rules = None
+    else:
+        for rule in template_rules:
+            if not isinstance(rule, dict) or not (
+                set(rule) == {"if"} or rule == {"when": "never"}
+            ):
+                errors.append(
+                    ".full-validation-context rules may carry only `if` (and a "
+                    f"final `when: never`): {rule!r}"
+                )
+    for job_name in ADVISORY_GATE_JOBS:
+        job = merged.get(job_name)
+        if not isinstance(job, dict):
+            errors.append(
+                f"{job_name} is missing; every release-audit advisory gate "
+                "must exist"
+            )
+            continue
+        effective = resolve_extends(job, merged)
+        if effective.get("allow_failure"):
+            errors.append(
+                f"{job_name} must not set allow_failure; an advisory gate whose "
+                "failure is optional cannot gate the release audit"
+            )
+        if "when" in effective:
+            errors.append(f"{job_name} must not set a job-level when")
+        if template_rules is not None and effective.get("rules") != template_rules:
+            errors.append(
+                f"{job_name} rules must be exactly .full-validation-context's "
+                "(no rule-level allow_failure, when or variables)"
+            )
+        if effective.get("tags") != ["$CI_RUST_RUNNER_TAG"]:
+            errors.append(f"{job_name} tags must be exactly ['$CI_RUST_RUNNER_TAG']")
+        if effective.get("script") != ADVISORY_GATE_SCRIPTS[job_name]:
+            errors.append(
+                f"{job_name} script must be exactly {ADVISORY_GATE_SCRIPTS[job_name]!r}"
+            )
+        if effective.get("before_script") != ADVISORY_GATE_BEFORE_SCRIPT:
+            errors.append(
+                f"{job_name} before_script must be exactly the pinned .rust-job "
+                f"bootstrap {ADVISORY_GATE_BEFORE_SCRIPT!r}"
+            )
+        for key, expected in ADVISORY_GATE_PINNED_VALUES.items():
+            if effective.get(key) != expected:
+                errors.append(f"{job_name} {key} must be exactly {expected!r}")
+        unexpected = sorted(set(effective) - ADVISORY_GATE_EFFECTIVE_KEYS)
+        if unexpected:
+            errors.append(
+                f"{job_name} must not carry job keys {unexpected}; variables, "
+                "hooks, inherit, parallel or timeout can hollow out a gate"
+            )
+    for job_name, job in merged.items():  # IF-2: runner-tag variables at job or rule level
+        if not isinstance(job, dict) or job_name.startswith("."):
+            continue
+        effective = resolve_extends(job, merged)
+        scopes = [effective.get("variables")]
+        rules = effective.get("rules")
+        if isinstance(rules, list):
+            scopes.extend(rule.get("variables") for rule in rules if isinstance(rule, dict))
+        for scope in scopes:
+            if isinstance(scope, dict) and any(
+                name in EXPECTED_RUNNER_TAGS for name in scope
+            ):
+                errors.append(
+                    f"{job_name} must not override a runner tag variable; "
+                    "EXPECTED_RUNNER_TAGS pins the routing for every job"
+                )
+                break
+
+
 def validate_satellite_advisory_sweep(merged: dict, errors: list[str]) -> None:
     """The satellite sweep keeps the release audit reproducible (A5).
 
@@ -634,7 +823,7 @@ WORKER_TS_LANE_SCRIPTS = {
         (
             "rm -f /etc/apt/sources.list.d/debian.sources",
             "printf '%s\\n' \"deb http://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm main\" \"deb http://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm-updates main\" \"deb http://snapshot.debian.org/archive/debian-security/${CI_DEBIAN_SNAPSHOT}/ bookworm-security main\" > /etc/apt/sources.list",
-            "apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update && apt-get install -y --no-install-recommends python3",
+            "apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install -y --no-install-recommends python3",
             "cd kimicode4lunarwing/scripts",
             "npm ci --ignore-scripts",
             "npx tsc -p tsconfig.json",
@@ -682,6 +871,17 @@ GLOBAL_VARIABLE_ALLOWLIST = frozenset({
     "SCCACHE_CACHE_SIZE", "SCCACHE_DIR",
 })
 
+# MR !1658 review IA-9: the worker TS lanes (and every lint/rust job)
+# select their runner through these tag variables. A root-file or
+# later-include override reroutes the pinned jobs to a different runner
+# while the tags lists and the variables allowlist stay clean, so the
+# resolved values are pinned here; a deliberate runner change edits
+# defaults.yml and this table in the same commit.
+EXPECTED_RUNNER_TAGS = {
+    "CI_LINT_RUNNER_TAG": "lint",
+    "CI_RUST_RUNNER_TAG": "rust-x86_64",
+}
+
 
 def lane_bypass_variable(name: object) -> bool:
     """True for variables that can neutralise a worker TS lane's pinned
@@ -712,7 +912,10 @@ def validate_lane_environment_routes(merged: dict, errors: list[str]) -> None:
     `workflow:rules` variables become pipeline-wide variables (overriding
     same-named globals) on the pipelines the rule matches, so a NODE_OPTIONS
     or an unpinned CI_NODE_IMAGE there bypasses both the script pin and the
-    digest pins while the global `variables:` block stays clean."""
+    digest pins while the global `variables:` block stays clean. The runner
+    tag variables must also resolve to their pinned values (MR !1658 review
+    IA-9): an override reroutes the lanes to another runner with the tags
+    lists themselves untouched."""
     default_block = merged.get("default")
     if isinstance(default_block, dict):
         for key in ("before_script", "hooks"):
@@ -736,6 +939,17 @@ def validate_lane_environment_routes(merged: dict, errors: list[str]) -> None:
             errors.append(
                 f"top-level variables must not set {bypass}; global variables "
                 "reach both worker TS lanes (GLOBAL_VARIABLE_ALLOWLIST)"
+            )
+    for name, expected in EXPECTED_RUNNER_TAGS.items():
+        value = top_variables.get(name) if isinstance(top_variables, dict) else None
+        if isinstance(value, dict):  # GitLab's hash form (value:/description:)
+            value = value.get("value")
+        if value != expected:
+            errors.append(
+                f"top-level {name} must be {expected!r} (got {value!r}); the "
+                "runner tag variables route the worker TS lanes and every "
+                "pinned job to their runner, so an override must update "
+                "EXPECTED_RUNNER_TAGS in the same commit (MR !1658 review IA-9)"
             )
     workflow = merged.get("workflow")
     workflow_rules = workflow.get("rules") if isinstance(workflow, dict) else None
@@ -862,52 +1076,68 @@ def cache_policies(job: object) -> list[str]:
     return [str(entry.get("policy", "pull-push")) for entry in entries if isinstance(entry, dict)]
 
 
-def validate_cache_trust(merged: dict, defaults: dict, errors: list[str]) -> None:
+CACHE_REFRESH_CONDITION = (
+    '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH '
+    '&& $CI_COMMIT_REF_PROTECTED == "true"'
+)
+
+
+def validate_cache_trust(merged: dict, errors: list[str]) -> None:
+    """IU-3: validation jobs only read caches; one protected push job writes.
+
+    Check the merged, extends-resolved jobs, including push-only, implicit
+    pull-push and variable policies. A substring in the writer's rule is not
+    sufficient: an OR branch could also enable it in an MR pipeline.
+    """
     for template_name in (".python-job", ".rust-job", ".rust-msrv-job"):
-        policies = cache_policies(defaults.get(template_name))
+        policies = cache_policies(resolve_extends(merged.get(template_name), merged))
         if not policies or any(policy != "pull" for policy in policies):
             errors.append(f"{template_name} validation caches must be fixed pull-only")
 
-    writers = {
-        name
-        for name, job in merged.items()
-        if isinstance(job, dict) and "pull-push" in cache_policies(job)
-    }
-    if writers != {"rust-cache-refresh"}:
-        errors.append(f"unexpected writable cache jobs: {sorted(writers)}")
-    refresh = merged.get("rust-cache-refresh", {})
-    active_rules = [
-        rule
-        for rule in refresh.get("rules", [])
-        if isinstance(rule, dict) and rule.get("when") != "never"
-    ] if isinstance(refresh, dict) else []
-    if len(active_rules) != 1:
-        errors.append("rust-cache-refresh must have one active rule")
-    else:
-        condition = str(active_rules[0].get("if", ""))
-        required = (
-            'CI_PIPELINE_SOURCE == "push"',
-            "CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH",
-            'CI_COMMIT_REF_PROTECTED == "true"',
-        )
-        if any(fragment not in condition for fragment in required):
-            errors.append("rust-cache-refresh must require a protected default-branch push")
-        # Exactly one default-feature check per context, while retaining the
-        # literal pull-only cache policy on untrusted validation jobs.
-        check = merged.get("rust-check-default", {})
-        if check.get("rules") != [
-            {"if": condition, "when": "never"}, {"when": "on_success"}
-        ]:
-            errors.append("rust-check-default must complement the protected cache writer")
-        if check.get("script") != refresh.get("script"):
-            errors.append("the cache writer must perform the same default-feature check")
-        if refresh.get("needs") != ["cargo-metadata"]:
-            errors.append("rust-cache-refresh must check directly after cargo-metadata")
-        for name in ("rust-test-lib", "cavepony-wasm"):
-            needs = merged.get(name, {}).get("needs", [])
-            for producer in ("rust-check-default", "rust-cache-refresh"):
-                if {"job": producer, "artifacts": False, "optional": True} not in needs:
-                    errors.append(f"{name} must wait for whichever default check is present")
+    if merged.get("cache"):
+        errors.append("top-level cache is not allowed; declare caches on job templates")
+    for name, job in merged.items():
+        if not isinstance(job, dict):
+            continue
+        effective = resolve_extends(job, merged)
+        if effective.get(EXTENDS_TRUNCATED_KEY):
+            errors.append(f"{name} cache trust cannot validate a truncated extends chain")
+        if name != "rust-cache-refresh" and any(
+            policy != "pull" for policy in cache_policies(effective)
+        ):
+            errors.append(f"{name} validation caches must be fixed pull-only")
+        cache = effective.get("cache", [])
+        entries = cache if isinstance(cache, list) else [cache]
+        if any(
+            isinstance(entry, dict) and entry.get("unprotect", False) is not False
+            for entry in entries
+        ):
+            errors.append(f"{name} must not use cache:unprotect; keep protected caches separate")
+
+    refresh = resolve_extends(merged.get("rust-cache-refresh"), merged)
+    policies = cache_policies(refresh)
+    if not policies or any(policy != "pull-push" for policy in policies):
+        errors.append("rust-cache-refresh must declare fixed pull-push caches")
+    if refresh.get("rules") != [{"if": CACHE_REFRESH_CONDITION}, {"when": "never"}]:
+        errors.append("rust-cache-refresh rules must be exactly the protected default-branch push gate")
+    if refresh.get("variables"):
+        errors.append("rust-cache-refresh must not override variables used by its protected push gate")
+    # Exactly one default-feature check per context, while retaining the
+    # literal pull-only cache policy on untrusted validation jobs.
+    check = resolve_extends(merged.get("rust-check-default"), merged)
+    if check.get("rules") != [
+        {"if": CACHE_REFRESH_CONDITION, "when": "never"}, {"when": "on_success"}
+    ]:
+        errors.append("rust-check-default must complement the protected cache writer")
+    if check.get("script") != refresh.get("script"):
+        errors.append("the cache writer must perform the same default-feature check")
+    if refresh.get("needs") != ["cargo-metadata"]:
+        errors.append("rust-cache-refresh must check directly after cargo-metadata")
+    for name in ("rust-test-lib", "cavepony-wasm"):
+        needs = resolve_extends(merged.get(name), merged).get("needs", [])
+        for producer in ("rust-check-default", "rust-cache-refresh"):
+            if {"job": producer, "artifacts": False, "optional": True} not in needs:
+                errors.append(f"{name} must wait for whichever default check is present")
 
 
 def extract_arg_default(text: str, arg: str) -> str | None:
@@ -983,16 +1213,38 @@ def validate_worker_versions(errors: list[str]) -> None:
                 f"Dockerfile {label} canonical declaration"
             )
 
-    # MR !1627 review HE-7: passing DEBIAN_SNAPSHOT as a build-arg here
-    # would override the Dockerfile default at image build time, silently
-    # detaching the CI_DEBIAN_SNAPSHOT tie (which binds only the Dockerfile
+    # MR !1627 review HE-7, broadened by MR !1644 review HN-7: a
+    # DEBIAN_SNAPSHOT build-arg or env override at image build time silently
+    # detaches the CI_DEBIAN_SNAPSHOT tie (which binds only the Dockerfile
     # ARG default) from the snapshot the published image really builds with.
-    kimi_block = blocks.get("kimi")
-    if kimi_block is not None and "DEBIAN_SNAPSHOT=" in kimi_block:
-        errors.append(
-            "build-worker-image.sh kimi block must not pass DEBIAN_SNAPSHOT as a "
-            "build arg; the CI_DEBIAN_SNAPSHOT tie binds the Dockerfile ARG default"
-        )
+    # The guard covered one case block of one file; it now refuses the token
+    # in every worker-image build entrypoint — the whole
+    # build-worker-image.sh (shared post-case build_args and build_image()
+    # included), mt-admin's tenant build, the harness compose file, and the
+    # kimi worker's own docker-compose.yml, whose build.args take the same
+    # override (MR !1665 review IF-3).
+    for label, path in (
+        ("build-worker-image.sh", WORKER_BUILD_SCRIPT),
+        (
+            "ic/scripts/mt-admin-lib/05-tenant-build.sh",
+            ROOT / "ic" / "scripts" / "mt-admin-lib" / "05-tenant-build.sh",
+        ),
+        ("tests/docker-compose.test.yml", ROOT / "tests" / "docker-compose.test.yml"),
+        (
+            "kimicode4lunarwing/docker-compose.yml",
+            ROOT / "kimicode4lunarwing" / "docker-compose.yml",
+        ),
+    ):
+        if not path.is_file():
+            errors.append(
+                f"{label} missing; cannot guard against a DEBIAN_SNAPSHOT build override"
+            )
+        elif "DEBIAN_SNAPSHOT" in path.read_text(encoding="utf-8"):
+            errors.append(
+                f"{label} must not reference DEBIAN_SNAPSHOT; a build-arg or env "
+                "override at image build time would detach the CI_DEBIAN_SNAPSHOT "
+                "tie from the Dockerfile ARG default"
+            )
 
     for worker, label, dockerfile_text, arg_name in canonical_pins:
         if arg_name not in ("OPENCODE_REF", "PEBBLE_REF"):
@@ -1384,7 +1636,15 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
     # (MR !1627 review HE-3), and every snapshot.debian.org URL in the
     # Dockerfile must reference ${DEBIAN_SNAPSHOT} itself — a hardcoded
     # timestamp or a renamed variable would detach the tie from what the
-    # image actually builds with.
+    # image actually builds with. The tie must also see the variants that
+    # steer the build around the ARG (MR !1644 review HN-6): every line
+    # mentioning DEBIAN_SNAPSHOT must be a plain ARG declaration or carry
+    # the token inside a snapshot URL (an ENV after the ARG wins over it, a
+    # RUN-level shell assignment re-points the RUN's URLs, a multi-name ARG
+    # hides from the valued-ARG match, and shell substitution is not a
+    # literal reference), and every apt `deb` source line must point at
+    # snapshot.debian.org, so a builder moved back to the live mirror is
+    # caught too. The host match is case-insensitive in both rules.
     snapshot = variables.get("CI_DEBIAN_SNAPSHOT", "")
     if not re.fullmatch(r"\d{8}T\d{6}Z", snapshot):
         errors.append(
@@ -1417,7 +1677,7 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
         hardcoded_snapshots = [
             stamp
             for stamp in re.findall(
-                r"snapshot\.debian\.org/archive/[^/\s\"']+/([^/\s\"']+)/",
+                r"(?i:snapshot\.debian\.org)/archive/[^/\s\"']+/([^/\s\"']+)/",
                 dockerfile_text,
             )
             if stamp != "${DEBIAN_SNAPSHOT}"
@@ -1427,6 +1687,62 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
                 "kimicode4lunarwing/Dockerfile snapshot.debian.org URLs must use "
                 "${DEBIAN_SNAPSHOT}, not a hardcoded or renamed value: "
                 f"{hardcoded_snapshots}"
+            )
+        # MR !1644 review HN-6: every DEBIAN_SNAPSHOT mention must be a
+        # plain ARG declaration or a literal ${DEBIAN_SNAPSHOT} inside a
+        # snapshot URL; every apt deb source must be a snapshot URL.
+        snapshot_arg_line = re.compile(r"^\s*(?i:ARG)\s+DEBIAN_SNAPSHOT(?:=\S+)?\s*$")
+        snapshot_url_reference = re.compile(
+            r"(?i:snapshot\.debian\.org)/archive/[^/\s\"']+/\$\{DEBIAN_SNAPSHOT\}(?:[/\s]|$)"
+        )
+        stray_references = [
+            line.strip()
+            for line in dockerfile_text.splitlines()
+            if "DEBIAN_SNAPSHOT" in line
+            and not snapshot_arg_line.match(line)
+            and not snapshot_url_reference.search(line)
+        ]
+        if stray_references:
+            errors.append(
+                "kimicode4lunarwing/Dockerfile DEBIAN_SNAPSHOT references must be "
+                "ARG declarations or ${DEBIAN_SNAPSHOT} snapshot URLs: "
+                f"{stray_references}"
+            )
+        # Run-135 IP-2 (MR !1680 review; after MR !1665 review IF-3): every
+        # apt source on a line must be a snapshot source, not just one of
+        # them (a line-level check let one RUN line add a live mirror beside
+        # a snapshot one). Any URL scheme counts (apt's mirror+http,
+        # tor+https, file:), the type and field names are matched
+        # case-insensitively, a literal printf newline or tab separates
+        # tokens, and every URI of a deb822 URIs: field is checked.
+        bs = chr(92)
+        quotes = chr(34) + chr(39)
+        sep = f"(?:{bs}s|{bs}{bs}t)+"
+        boundary = f"(?:^|[{quotes}{bs}s]|{bs}{bs}[nt])"
+        one_line_source = re.compile(
+            f"{boundary}deb(?:-src)?{sep}(?:{bs}[[^{bs}]]*{bs}]{sep})?"
+            f"([a-z][a-z0-9+.-]*:{bs}S*)",
+            re.IGNORECASE,
+        )
+        deb822_uris = re.compile(f"{boundary}URIs:([^{quotes}]*)", re.IGNORECASE)
+        snapshot_uri = re.compile(
+            f"https?://snapshot{bs}.debian{bs}.org/archive/", re.IGNORECASE
+        )
+
+        def live_sources(line: str) -> list[str]:
+            uris = [found.group(1) for found in one_line_source.finditer(line)]
+            for found in deb822_uris.finditer(line):
+                value = found.group(1).split(bs + "n")[0].replace(bs + "t", " ")
+                uris.extend(value.split() or [""])
+            return [uri for uri in uris if not snapshot_uri.match(uri)]
+
+        non_snapshot_sources = [
+            line.strip() for line in dockerfile_text.splitlines() if live_sources(line)
+        ]
+        if non_snapshot_sources:
+            errors.append(
+                "kimicode4lunarwing/Dockerfile apt deb sources must use "
+                f"snapshot.debian.org: {non_snapshot_sources}"
             )
 
     literal_images = {
@@ -1597,8 +1913,9 @@ def main() -> int:
     validate_cavepony_version(merged_config, errors)
     validate_cargo_deny_gate(merged_config, errors)
     validate_satellite_advisory_sweep(merged_config, errors)
+    validate_advisory_gates_not_optional(merged_config, errors)
     validate_worker_ts_lanes(merged_config, errors)
-    validate_cache_trust(merged_config, defaults, errors)
+    validate_cache_trust(merged_config, errors)
     validate_worker_versions(errors)
     validate_worker_input_manifest(errors)
     validate_deliverables_manifest(merged_config, errors)
@@ -1718,5 +2035,16 @@ def main() -> int:
     return 0
 
 
+def cli() -> int:
+    """main() plus one clean error path for unreadable/unsupported YAML
+    (MR !1647 review HP-5): a ValueError from load_yaml reports the file and
+    the parser's problem on one ERROR line instead of a traceback."""
+    try:
+        return main()
+    except ValueError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli())

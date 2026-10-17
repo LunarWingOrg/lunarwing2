@@ -257,8 +257,9 @@ the prime suspect, and the fix is the same normalization in the offending
   whose config section embeds python3 heredocs — from the pinned
   `CI_DEBIAN_SNAPSHOT` archive (tied to the Dockerfile `ARG DEBIAN_SNAPSHOT`
   by `validate_config.py`), not the live deb.debian.org mirror. That archive
-  is a best-effort, throttled service, so the lane's `apt-get update` runs
-  with `Acquire::Retries=5`/`Acquire::http::Timeout=60`; a snapshot outage
+  is a best-effort, throttled service, so the lane's `apt-get update` and
+  `apt-get install` both run with
+  `Acquire::Retries=5`/`Acquire::http::Timeout=60`; a snapshot outage
   still fails this required lane until the service recovers (retry the job).
   Runs on every MR/branch
   push and protected release tag on the digest-pinned `CI_NODE_IMAGE`, which
@@ -294,7 +295,65 @@ the prime suspect, and the fix is the same normalization in the offending
   that do not themselves `include` anything, because nested or conditional
   includes are merged by GitLab but invisible here. `extends` chains resolve
   up to a depth budget of 11; a longer chain or a cycle fails closed instead
-  of being certified from the keys visible at truncation.
+  of being certified from the keys visible at truncation. The runner tag
+  variables' values are pinned too (`EXPECTED_RUNNER_TAGS`, MR !1658 review
+  IA-9): an override of `CI_LINT_RUNNER_TAG`/`CI_RUST_RUNNER_TAG` reroutes
+  the pinned jobs to another runner with the `tags:` lists untouched, so a
+  deliberate runner change edits `defaults.yml` and the validator table in
+  the same commit — and no job may name a runner tag variable in a job-level
+  or rule-level `variables:` block either, since that overrides the pinned
+  value for just that job (MR !1665 review IF-2). The release audit's
+  advisory gates (`cargo-deny`, `satellite-advisory-sweep`,
+  `lockfile-only-advisory-guard`, `default-graph-advisory-guard`) must not
+  be `allow_failure` at any level: each gate must exist, carry exactly
+  `.full-validation-context`'s rules (whose entries may carry only `if`,
+  plus the final `when: never`), set no job-level `when`, and run on exactly
+  the pinned runner tag — a rule-level `allow_failure`, a replaced rules
+  list, a deleted gate, or a retag all fail the same way (MR !1665 review
+  IF-1). Each gate's extends-resolved `script` and `before_script` are
+  pinned exactly too, and only a fixed key set (`after_script`,
+  `before_script`, `cache`, `image`, `needs`, `rules`, `script`, `stage`,
+  `tags`) may survive extends resolution — a gate that never runs its
+  checker (`exit 0` in the script or the job's or `.rust-job`'s
+  `before_script`, `|| true` on the wrapper, an echoed wrapper name) is as
+  optional as an `allow_failure` one, and job-level `variables`, `hooks`,
+  `inherit`, `parallel` or `timeout` can hollow it out just as well, so a
+  deliberate gate or `.rust-job` bootstrap change updates the pinned tuples
+  in the same commit (MR !1680 review IP-1). The allowed inputs are also
+  pinned by `ADVISORY_GATE_PINNED_VALUES`: the `$CI_RUST_IMAGE` image, the
+  exact pull-only Rust caches, and only `cargo-metadata` with
+  `artifacts: false` — blocking both checkout-overwriting artifacts and
+  higher-precedence dotenv variables from upstream jobs (MR !1688, IU-1).
+  `secret-history` is the marked, deliberate exception while
+  historical findings are triaged. Three limits of the YAML validator
+  remain, by design: it cannot see repo files the pinned scripts still
+  honour — a project `.npmrc`, a `bunfig.toml` `preload`, or the
+  `package.json` `test` script in the worker script directories stay trust
+  surface reviewed in the diff, not pinned here (MR !1658 review IA-9);
+  project-, group- or pipeline-level overrides of the `CI_*` variables
+  themselves are allowed (the `defaults.yml` comment documents mirroring
+  the pinned images to the project registry for Docker Hub quota) and
+  invisible to a static tie (MR !1644 review HN-7); and a `sed`-style
+  rewrite of the stamp inside `/etc/apt/sources.list` that never names
+  `DEBIAN_SNAPSHOT` — or a source URL built from variables — is invisible
+  to any line-based rule (MR !1665 review IF-4, MR !1680 review IP-2); the
+  structural backstop would be an in-image assertion after the apt step,
+  which runs only at the protected image build. What the tie does cover is every in-repo build entrypoint: a
+  `DEBIAN_SNAPSHOT` build-arg or env reference in `build-worker-image.sh`,
+  mt-admin's `05-tenant-build.sh`, `tests/docker-compose.test.yml`, or
+  `kimicode4lunarwing/docker-compose.yml` is refused, and every
+  `DEBIAN_SNAPSHOT` mention in `kimicode4lunarwing/Dockerfile` must be a
+  plain `ARG` declaration or a `${DEBIAN_SNAPSHOT}` snapshot URL, with every
+  apt source URI on every line — `deb`/`deb-src` with or without a
+  bracketed options list under any apt URL scheme (`http(s)`,
+  `mirror+http`, `tor+https`, `file:`), and every URI of a deb822 `URIs:`
+  field — matched case-insensitively (printf-escaped separators included)
+  and pointing at snapshot.debian.org, so one line carrying a snapshot
+  source beside a live mirror fails too (MR !1644
+  review HN-6, broadened by MR !1665 review IF-3 and MR !1680 review IP-2).
+  YAML the validator cannot parse at all (e.g. a `!reference` tag, which
+  `yaml.safe_load` rejects) fails closed with a clean one-line error naming
+  the file, not a traceback (MR !1647 review HP-5).
 - Default and all-feature `cargo check` jobs plus `--tests` compilation for
   PostgreSQL-only and libSQL-only feature shapes.
 - Workspace library tests, hermetic libSQL tests, and a non-skipping PostgreSQL
@@ -533,6 +592,33 @@ without allowing merge-request jobs to write caches. Rust jobs report
 before/after disk use, target/cache sizes, and sccache statistics. Cache only
 the dependency paths declared in `defaults.yml`; do not add `target/`, tenant
 data, environment files, or credentials.
+
+The cache policy validator checks merged, extends-resolved definitions:
+validation caches must have literal `policy: pull` (including inherited and
+default caches), `cache:unprotect` is forbidden, and the sole writer's rules
+must match the protected default-branch push predicate exactly, with no
+job-variable overrides. Push-only, implicit `pull-push`, variable policies,
+and an extra MR condition on the writer are refused (MR !1688, IU-3).
+
+`bootstrap-sccache.sh` verifies the pinned SHA256 of the sccache **binary**
+before accepting a cache hit or executing a new installation, in addition to
+verifying the release archive. A matching `--version` string is not trusted.
+Rejected cached binaries are removed before downloading, and a failed binary
+check removes the installation so `after_script` cannot execute it. Verified
+cache hits stay offline; rejected entries require a verified download (IU-2).
+Both Rust templates also use this helper's `--show-stats` mode in
+`after_script`: it rechecks the same binary pin before execution, removes
+rejected entries, and skips missing binaries without downloading. This
+protects telemetry even if an earlier bootstrap step fails before the normal
+sccache verification runs (IZ-1).
+
+**Compiler-cache trust limit (IU-3):** the binary pin does not authenticate
+compiled objects in `.ci-cache/sccache/`. The checked-in pipeline permits
+writes only from `rust-cache-refresh` on protected default-branch pushes;
+MRs and unprotected target branches read only. This still trusts the cache
+backend, protected writers, and GitLab's separate protected/non-protected
+cache setting above, which the YAML validator cannot verify. Discard caches
+produced under weaker policies before relying on cached test results.
 
 ### Worker scheduling and pipeline latency
 
