@@ -483,6 +483,7 @@ ADVISORY_GATE_SCRIPTS = {
     "cargo-deny": [
         "bash .gitlab/scripts/install-cargo-deny.sh",
         "bash .gitlab/scripts/cargo-deny-check.sh",
+        "python3 .gitlab/scripts/check_deny_toml_owners.py",
     ],
     "satellite-advisory-sweep": [
         "bash .gitlab/scripts/install-cargo-deny.sh",
@@ -2202,6 +2203,7 @@ def main() -> int:
     validate_cargo_deny_gate(merged_config, errors)
     validate_satellite_advisory_sweep(merged_config, errors)
     validate_advisory_gates_not_optional(merged_config, errors)
+    validate_deny_toml_advisories(errors)
     validate_worker_ts_lanes(merged_config, errors)
     validate_pebble_rust_lane(merged_config, errors)
     validate_cache_trust(merged_config, errors)
