@@ -105,6 +105,10 @@ struct ChannelStoreData {
     /// Dedicated tokio runtime for HTTP requests, lazily initialized.
     /// Reused across multiple `http_request` calls within one execution.
     http_runtime: Option<tokio::runtime::Runtime>,
+    /// Whether the most recent exchange had a credential injected
+    /// (placeholder or host credential); scopes the identity-encoding
+    /// request and the opaque-body refusal (HJ-1/HQ-2 parity).
+    last_http_exchange_had_credentials: bool,
 }
 
 impl ChannelStoreData {
@@ -128,6 +132,7 @@ impl ChannelStoreData {
             host_credentials,
             pairing_store,
             http_runtime: None,
+            last_http_exchange_had_credentials: false,
         }
     }
 
@@ -201,10 +206,10 @@ impl ChannelStoreData {
             }
         }
         for cred in &self.host_credentials {
-            if !cred.secret_value.is_empty() {
-                let tag = "[REDACTED:host_credential]";
-                result = result.replace(&cred.secret_value, tag);
-                result = replace_encoded_spellings(&result, &cred.secret_value, tag);
+            let tag = "[REDACTED:host_credential]";
+            for needle in host_credential_needles(cred) {
+                result = result.replace(needle, tag);
+                result = replace_encoded_spellings(&result, needle, tag);
             }
         }
         result
@@ -222,12 +227,8 @@ impl ChannelStoreData {
             }
         }
         for cred in &self.host_credentials {
-            if !cred.secret_value.is_empty() {
-                scrub_secret_bytes(
-                    &mut bytes,
-                    &cred.secret_value,
-                    b"[REDACTED:host_credential]",
-                );
+            for needle in host_credential_needles(cred) {
+                scrub_secret_bytes(&mut bytes, needle, b"[REDACTED:host_credential]");
             }
         }
         bytes
@@ -270,6 +271,18 @@ impl ChannelStoreData {
     ) -> Result<lunarwing::agent::channel_host::HttpResponse, String> {
         match outcome {
             Ok(mut resp) => {
+                if self.last_http_exchange_had_credentials
+                    && !resp.body.is_empty()
+                    && guest_body_encoding_is_opaque(&resp.headers_json)
+                {
+                    tracing::warn!(
+                        "WASM channel http_request: refused encoded response body that cannot be scrubbed for echoed credentials"
+                    );
+                    return Err(
+                        "HTTP response refused: encoded body cannot be inspected for echoed credentials"
+                            .to_string(),
+                    );
+                }
                 resp.body = self.redact_credential_bytes(std::mem::take(&mut resp.body));
                 resp.headers_json = self.redact_headers_json(&resp.headers_json);
                 Ok(resp)
@@ -287,7 +300,8 @@ impl ChannelStoreData {
         url_host: &str,
         headers: &mut HashMap<String, String>,
         url: &mut String,
-    ) {
+    ) -> bool {
+        let mut applied = false;
         for cred in &self.host_credentials {
             let matches = cred
                 .host_patterns
@@ -297,6 +311,7 @@ impl ChannelStoreData {
             if !matches {
                 continue;
             }
+            applied = true;
 
             // Merge injected headers (host credentials take precedence)
             for (key, value) in &cred.headers {
@@ -317,6 +332,7 @@ impl ChannelStoreData {
                 }
             }
         }
+        applied
     }
 
     /// Unredacted HTTP exchange implementation; the trait method applies
@@ -346,6 +362,7 @@ impl ChannelStoreData {
         // Log whether injection happened (without revealing the token)
         let url_changed = injected_url != url;
         tracing::info!(url_changed = url_changed, "URL after credential injection");
+        self.last_http_exchange_had_credentials = url_changed;
 
         // Check if HTTP is allowed for this URL. The deny reason can quote
         // the injected URL; it is redacted at the trait boundary (WI#408).
@@ -363,15 +380,16 @@ impl ChannelStoreData {
         let raw_headers: std::collections::HashMap<String, String> =
             serde_json::from_str(&headers_json).unwrap_or_default();
 
+        let mut header_placeholder_injected = false;
         let mut headers: std::collections::HashMap<String, String> = raw_headers
             .into_iter()
             .map(|(k, v)| {
-                (
-                    k.clone(),
-                    self.inject_credentials(&v, &format!("header:{}", k)),
-                )
+                let injected = self.inject_credentials(&v, &format!("header:{}", k));
+                header_placeholder_injected |= injected != v;
+                (k, injected)
             })
             .collect();
+        self.last_http_exchange_had_credentials |= header_placeholder_injected;
 
         let headers_changed = headers
             .values()
@@ -401,7 +419,19 @@ impl ChannelStoreData {
         // Inject pre-resolved host credentials (Bearer tokens, API keys, etc.)
         // after the leak scan so host-injected secrets don't trigger false positives.
         if let Some(host) = extract_host_from_url(&url) {
-            self.inject_host_credentials(&host, &mut headers, &mut url);
+            self.last_http_exchange_had_credentials |=
+                self.inject_host_credentials(&host, &mut headers, &mut url);
+        }
+
+        // HJ-1/HQ-2 parity with the tool wrapper: a credential-injected
+        // exchange asks for identity only (every guest spelling replaced)
+        // and offers no transfer codings; opaque answers are refused at the
+        // boundary.
+        if self.last_http_exchange_had_credentials {
+            headers.retain(|k, _| {
+                !k.eq_ignore_ascii_case("accept-encoding") && !k.eq_ignore_ascii_case("te")
+            });
+            headers.insert("accept-encoding".to_string(), "identity".to_string());
         }
 
         // Get the max response size from capabilities (default 10MB).
@@ -429,8 +459,12 @@ impl ChannelStoreData {
         }
         let rt = self.http_runtime.as_ref().expect("just initialized");
         rt.block_on(async {
+            // Never follow redirects: reqwest's default policy keeps custom
+            // credential headers across hosts and skips the allowlist; the
+            // 3xx is returned to the guest (redacted) like the tool wrapper.
             let client = reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 
@@ -476,15 +510,7 @@ impl ChannelStoreData {
             })?;
 
             let status = response.status().as_u16();
-            let response_headers: std::collections::HashMap<String, String> = response
-                .headers()
-                .iter()
-                .filter_map(|(k, v)| {
-                    v.to_str()
-                        .ok()
-                        .map(|v| (k.as_str().to_string(), v.to_string()))
-                })
-                .collect();
+            let response_headers = guest_response_headers(response.headers());
             let headers_json = serde_json::to_string(&response_headers).unwrap_or_default();
 
             // Enforce max response body size to prevent memory exhaustion.
@@ -3613,9 +3639,6 @@ impl HttpResponse {
     }
 }
 
-/// Extract the hostname from a URL string.
-///
-/// Returns `None` for malformed URLs or non-HTTP(S) schemes.
 /// The `application/x-www-form-urlencoded` spelling of a secret, matching
 /// what `query_pairs_mut().append_pair()` produces when host query-param
 /// credentials are injected (WI#408). It differs from
@@ -3625,32 +3648,122 @@ fn form_encode_secret(secret: &str) -> String {
     url::form_urlencoded::byte_serialize(secret.as_bytes()).collect()
 }
 
-/// Replace both encoded spellings of a secret in text (WI#408): the
-/// `urlencoding::encode` form and the form (`query_pairs_mut`) form.
+/// Replace every encoded spelling of a secret in text (WI#408): the
+/// `urlencoding::encode` form, the form (`query_pairs_mut`) form, and the
+/// URL-parser spellings (IO-3).
 fn replace_encoded_spellings(text: &str, secret: &str, tag: &str) -> String {
     let mut result = text.to_string();
-    for encoded in [
-        urlencoding::encode(secret).to_string(),
-        form_encode_secret(secret),
-    ] {
-        if encoded != secret {
-            result = result.replace(encoded.as_str(), tag);
-        }
+    for encoded in encoded_spellings(secret) {
+        result = result.replace(encoded.as_str(), tag);
     }
     result
+}
+
+/// Every non-raw spelling the host itself can put on the wire for `secret`:
+/// `urlencoding::encode`, the form spelling (`append_pair` query injection)
+/// and the WHATWG URL parser spellings a placeholder substituted raw into a
+/// URL path or query takes when reqwest re-parses the injected URL. Empty
+/// and raw-identical spellings are dropped (an empty needle would match
+/// everywhere).
+fn encoded_spellings(secret: &str) -> Vec<String> {
+    let mut out = vec![
+        urlencoding::encode(secret).to_string(),
+        form_encode_secret(secret),
+    ];
+    if let Ok(mut parsed) = url::Url::parse("http://redaction.invalid/") {
+        parsed.set_query(Some(secret));
+        if let Some(query) = parsed.query() {
+            out.push(query.to_string());
+        }
+        parsed.set_query(None);
+        parsed.set_path(secret);
+        out.push(parsed.path().trim_start_matches('/').to_string());
+    }
+    out.retain(|spelling| !spelling.is_empty() && spelling != secret);
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Needles for one host credential: the raw secret plus the credential
+/// token of every injected header value (the Basic-auth base64 of
+/// `user:secret` never contains the raw secret).
+fn host_credential_needles(cred: &ResolvedHostCredential) -> Vec<&str> {
+    let mut needles = Vec::new();
+    if !cred.secret_value.is_empty() {
+        needles.push(cred.secret_value.as_str());
+    }
+    for value in cred.headers.values() {
+        if let Some((_, token)) = value.split_once(' ') {
+            let token = token.trim();
+            if token.len() >= 8 && token != cred.secret_value && !token.contains(&cred.secret_value)
+            {
+                needles.push(token);
+            }
+        }
+    }
+    needles
+}
+
+/// Preserve every list-valued response field (HQ-1 parity); Set-Cookie
+/// keeps last-value behaviour because it cannot be comma-joined.
+fn append_guest_response_header(headers: &mut HashMap<String, String>, name: &str, value: &str) {
+    let name = name.to_ascii_lowercase();
+    if name == "set-cookie" {
+        headers.insert(name, value.to_string());
+        return;
+    }
+    headers
+        .entry(name)
+        .and_modify(|previous| {
+            previous.push_str(", ");
+            previous.push_str(value);
+        })
+        .or_insert_with(|| value.to_string());
+}
+
+/// Collect response headers for the guest; unreadable coding values stay
+/// visible as an opaque sentinel so the encoding check fails closed.
+fn guest_response_headers(headers: &reqwest::header::HeaderMap) -> HashMap<String, String> {
+    let mut collected = HashMap::new();
+    for (name, value) in headers {
+        let value = match value.to_str() {
+            Ok(value) => value,
+            Err(_) if name == "content-encoding" || name == "transfer-encoding" => "opaque-invalid",
+            Err(_) => continue,
+        };
+        append_guest_response_header(&mut collected, name.as_str(), value);
+    }
+    collected
+}
+
+/// True when response headers are unreadable or declare an opaque body
+/// coding: Content-Encoding allows only identity, Transfer-Encoding only
+/// chunked (hyper removes that framing).
+fn guest_body_encoding_is_opaque(headers_json: &str) -> bool {
+    let Ok(map) = serde_json::from_str::<HashMap<String, String>>(headers_json) else {
+        return true;
+    };
+    map.iter().any(|(name, value)| {
+        let allowed = if name.eq_ignore_ascii_case("content-encoding") {
+            "identity"
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            "chunked"
+        } else {
+            return false;
+        };
+        value
+            .split(',')
+            .any(|token| !token.trim().is_empty() && !token.trim().eq_ignore_ascii_case(allowed))
+    })
 }
 
 /// Byte-level scrub of every spelling of `secret` (WI#408): response bodies
 /// are not guaranteed UTF-8, so string-level replacement cannot be used.
 fn scrub_secret_bytes(bytes: &mut Vec<u8>, secret: &str, marker: &[u8]) {
     replace_all_bytes(bytes, secret.as_bytes(), marker);
-    for encoded in [
-        urlencoding::encode(secret).to_string(),
-        form_encode_secret(secret),
-    ] {
-        if encoded != secret {
-            replace_all_bytes(bytes, encoded.as_bytes(), marker);
-        }
+    for encoded in encoded_spellings(secret) {
+        replace_all_bytes(bytes, encoded.as_bytes(), marker);
     }
 }
 
@@ -3658,20 +3771,31 @@ fn scrub_secret_bytes(bytes: &mut Vec<u8>, secret: &str, marker: &[u8]) {
 /// byte level (WI#408 — response bodies are not guaranteed UTF-8, so
 /// string-level replacement cannot be used on them).
 fn replace_all_bytes(haystack: &mut Vec<u8>, needle: &[u8], marker: &[u8]) {
-    if needle.is_empty() {
+    if needle.is_empty() || haystack.len() < needle.len() {
         return;
     }
-    let mut search_from = 0;
-    while let Some(offset) = haystack[search_from..]
-        .windows(needle.len())
-        .position(|window| window == needle)
-    {
-        let at = search_from + offset;
-        haystack.splice(at..at + needle.len(), marker.iter().copied());
-        search_from = at + marker.len();
+    // One pass into a fresh buffer: splicing in place is O(body x matches).
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut i = 0;
+    let mut changed = false;
+    while i < haystack.len() {
+        if haystack[i..].starts_with(needle) {
+            out.extend_from_slice(marker);
+            i += needle.len();
+            changed = true;
+        } else {
+            out.push(haystack[i]);
+            i += 1;
+        }
+    }
+    if changed {
+        *haystack = out;
     }
 }
 
+/// Extract the hostname from a URL string.
+///
+/// Returns `None` for malformed URLs or non-HTTP(S) schemes.
 fn extract_host_from_url(url: &str) -> Option<String> {
     let parsed = url::Url::parse(url).ok()?;
     if !matches!(parsed.scheme(), "http" | "https") {
@@ -6601,5 +6725,130 @@ mod tests {
             "{}",
             resp.headers_json
         );
+    }
+
+    /// IO-6 pin: the success path must not log the injected credential
+    /// (kills the "re-add the raw response-body debug log" mutant). Runs
+    /// synchronously on the test thread so `traced_test` sees the host's
+    /// events.
+    #[test]
+    #[traced_test]
+    fn channel_guest_http_request_success_path_logs_no_credential() {
+        use super::lunarwing::agent::channel_host::Host as _;
+        use super::{ChannelStoreData, ResolvedHostCredential, form_encode_secret};
+        use crate::tools::wasm::{EndpointPattern, HttpCapability};
+        use std::sync::Arc;
+
+        const SECRET: &str = "chan log~star*+/==";
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("upstream runtime");
+            rt.block_on(async move {
+                let app = Router::new().route(
+                    "/echo",
+                    get(|uri: axum::http::Uri| async move {
+                        format!("you called /echo?{}", uri.query().unwrap_or(""))
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind upstream");
+                addr_tx
+                    .send(listener.local_addr().expect("upstream addr"))
+                    .expect("send addr");
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = stop_rx.await;
+                    })
+                    .await
+                    .expect("upstream serve");
+            });
+        });
+        let address = addr_rx.recv().expect("upstream address");
+
+        let mut query_params = HashMap::new();
+        query_params.insert("api_key".to_string(), SECRET.to_string());
+        let host_credentials = vec![ResolvedHostCredential {
+            host_patterns: vec!["127.0.0.1".to_string()],
+            headers: HashMap::new(),
+            query_params,
+            secret_value: SECRET.to_string(),
+        }];
+        let mut capabilities = ChannelCapabilities::for_channel("test");
+        capabilities.tool_capabilities.http =
+            Some(HttpCapability::new(vec![EndpointPattern::host("127.0.0.1")]));
+        let mut store_data = ChannelStoreData::new(
+            1024 * 1024,
+            "test",
+            capabilities,
+            HashMap::new(),
+            host_credentials,
+            Arc::new(PairingStore::new()),
+        );
+        let resp = store_data
+            .http_request(
+                "GET".to_string(),
+                format!("http://{address}/echo"),
+                "{}".to_string(),
+                None,
+                None,
+            )
+            .expect("echo upstream");
+        let _ = stop_tx.send(());
+        server.join().expect("upstream thread");
+
+        let body = String::from_utf8_lossy(&resp.body).to_string();
+        assert!(body.contains("[REDACTED:host_credential]"), "{body}");
+        assert!(
+            logs_contain("Response body (redacted)"),
+            "debug log captured"
+        );
+        assert!(
+            !logs_contain(&form_encode_secret(SECRET)),
+            "form spelling logged"
+        );
+        assert!(!logs_contain(SECRET), "raw secret logged");
+    }
+
+    /// IO-6 pin: send errors carry no URL (kills the "drop `without_url()`"
+    /// mutant). A placeholder secret in the URL path takes the URL parser's
+    /// spelling (`P@ss%20word!`), which the boundary redaction does not
+    /// know, so `without_url()` is the layer covering it.
+    #[test]
+    fn channel_guest_send_error_strips_url() {
+        use super::lunarwing::agent::channel_host::Host as _;
+        use super::ChannelStoreData;
+        use crate::tools::wasm::{EndpointPattern, HttpCapability};
+        use std::sync::Arc;
+
+        let mut credentials = HashMap::new();
+        credentials.insert("API_TOKEN".to_string(), "P@ss word!".to_string());
+        let mut capabilities = ChannelCapabilities::for_channel("test");
+        capabilities.tool_capabilities.http =
+            Some(HttpCapability::new(vec![EndpointPattern::host("127.0.0.1")]));
+        let mut store_data = ChannelStoreData::new(
+            1024 * 1024,
+            "test",
+            capabilities,
+            credentials,
+            Vec::new(),
+            Arc::new(PairingStore::new()),
+        );
+        let err = store_data
+            .http_request(
+                "GET".to_string(),
+                "http://127.0.0.1:1/x/{API_TOKEN}".to_string(),
+                "{}".to_string(),
+                None,
+                Some(2000),
+            )
+            .unwrap_err();
+        assert!(err.contains("HTTP request failed"), "{err}");
+        assert!(!err.contains("for url"), "{err}");
+        assert!(!err.contains("P@ss"), "{err}");
     }
 }

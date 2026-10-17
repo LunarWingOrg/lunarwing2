@@ -595,20 +595,46 @@ HTTP exchange passes through
 `Host::http_request` trait boundary — send errors (URL stripped via
 `without_url()`), early validator errors that quote the injected URL,
 response headers (redacted per field before serialization, so JSON-escaped
-secrets are caught), and response bodies (byte-level). The deny path no
-longer logs the injected URL, and the response-body debug log shows only
-the redacted form.
+secrets in **headers** are caught), and response bodies (byte-level). The
+deny path no longer logs the injected URL, and the response-body debug log
+shows only the redacted form.
 
 One deliberate difference from the tool wrapper: the channel host injects
 query credentials with `query_pairs_mut().append_pair` — the
 `application/x-www-form-urlencoded` spelling, which differs from
 `urlencoding::encode` for space, `~` and `*` — so redaction scrubs the raw
-spelling plus **both** encoded spellings of every secret.
+spelling plus every encoded spelling the host itself can put on the wire:
+`urlencoding::encode`, the form spelling, the WHATWG URL-parser spellings a
+placeholder substituted raw into a URL path or query takes when reqwest
+re-parses the injected URL, and the credential token of every injected
+header value (the Basic-auth `base64(user:secret)` token never contains the
+raw secret).
 
-Residual, recorded on WI#408: the channel host does not force
-`accept-encoding: identity` on credential-injected exchanges (the tool
-wrapper's refusal), so a guest that successfully negotiates a compressed
-response receives opaque bytes the body scrub cannot inspect.
+As in the tool wrapper (HJ-1/HQ-1/HQ-2 parity): a credential-injected
+exchange (placeholder URL/header or host credential applied) sends exactly
+one `accept-encoding: identity` (replacing every guest spelling) and
+removes every `TE` offer; a **non-empty** response whose `Content-Encoding`
+carries any non-identity token or whose `Transfer-Encoding` carries any
+non-`chunked` token is refused at the boundary ("encoded body cannot be
+inspected"). Duplicate response fields are comma-joined before the check
+(`Set-Cookie` keeps last-value behaviour — it cannot be comma-joined),
+unreadable coding values become an opaque sentinel, and malformed
+`headers_json` fails closed. Ordinary exchanges keep the guest's own
+encoding and answer. The client never follows redirects
+(`redirect::Policy::none()`): reqwest's default policy forwards custom
+credential headers to the redirect target and would bypass the HTTP
+allowlist, so the guest receives the (redacted) 3xx instead.
+
+Residuals, recorded on WI#408: re-encoded echo spellings in the **body**
+are not detected (a JSON-escaped echo, or a lowercase-hex encoding of the
+secret, reaches the guest — headers are parsed per field, bodies are
+byte-scrubbed only); Range/If-Range requests are not stripped and a 206
+partial body is not refused, so an echo split across range requests
+reassembles; there is no private-IP rejection (`reject_private_ip` exists
+only in the tool wrapper); the response body is fully buffered
+(`.bytes()`) before the size check rather than read through the tool
+wrapper's capped collector, so an oversized answer costs the buffer before
+it is refused.
 
 **Reference:** `src/channels/wasm/wrapper.rs` —
 `ChannelStoreData::redact_http_outcome_for_guest`
