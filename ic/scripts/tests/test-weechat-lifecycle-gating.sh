@@ -233,7 +233,7 @@ tenant_darkirc_enabled() { return 1; }
 # unit needs python3, and is never consulted when none does.
 if ( _OPENRC_PROXY_PYTHON3_RESOLVED=""
      _OPENRC_PROXY_PYTHON3_RESOLVED_FROM=$'\001'
-     LUNARWING_MT_PROXY_PYTHON3='relative/python3'
+     LUNARWING_MT_PROXY_PYTHON3='relative/python3' \
      render_tenant_openrc_units "$TENANT" >/dev/null 2>&1 ); then
   fail "unresolvable interpreter fails the tenant render closed"
 else
@@ -242,7 +242,7 @@ fi
 write_weechat_flag false
 if ( _OPENRC_PROXY_PYTHON3_RESOLVED=""
      _OPENRC_PROXY_PYTHON3_RESOLVED_FROM=$'\001'
-     LUNARWING_MT_PROXY_PYTHON3='relative/python3'
+     LUNARWING_MT_PROXY_PYTHON3='relative/python3' \
      render_tenant_openrc_units "$TENANT" >/dev/null 2>&1 ); then
   pass "python3-free tenants render without a resolvable interpreter"
 else
