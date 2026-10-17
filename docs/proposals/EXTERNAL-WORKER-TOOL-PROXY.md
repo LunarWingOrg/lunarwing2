@@ -208,9 +208,13 @@ tool_allowlist = ["memory_read", "memory_write", "knowledge_search",
   cron mission its own container. Two cron entries pointing at the same
   container likewise share one authority domain (one mission's tick can
   borrow the other's `cron.tool_allowlist` through another tick's relay
-  socket, concurrent or later — a leftover process can wait for it);
-  the code does not detect or prevent that pairing —
-  tracked as WI#396 (MR !1582 review FT-3). The manager additionally strips the
+  socket, concurrent or later — a leftover process can wait for it), so
+  the manager now detects that pairing at load (WI#396, MR !1582 review
+  FT-3): cron entries are grouped by normalized endpoint key, and when a
+  shared listener's entries carry *differing* `cron.tool_allowlist`
+  grants the manager strips every cron grant on that listener with an
+  `error!` (fail closed); identical grants are the same authority on
+  both sides and stay, with a `warn!`. The manager additionally strips the
   worker-level list of a non-cron entry whose endpoint shares a cron
   entry's container (MR !1561 EV-1). The comparison uses a normalized
   endpoint key (MR !1571 review FE-1): loopback spellings fold into one
