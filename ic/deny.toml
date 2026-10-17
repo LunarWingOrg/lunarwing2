@@ -1,5 +1,13 @@
 [advisories]
+# WI#360 (2026-10-17): unsound is a separate cargo-deny 0.20.2 scope whose
+# default is "workspace" (direct deps of workspace members only). With that
+# default, transitive unsound advisories never fire in any gate. Set "all" so
+# the ic and satellite sweeps see every unsound finding, including atty
+# (RUSTSEC-2021-0145, Windows-only unaligned read, reached transitively via
+# the vendored libsignal-protocol dev-dep env_logger 0.6.2). The entry is
+# explicitly ignored below with its own clearing owner.
 unmaintained = "workspace"
+unsound = "all"
 yanked = "deny"
 ignore = [
     # Baseline accepted advisories re-verified against upstream 2026-10-10
@@ -124,6 +132,23 @@ ignore = [
     # porting the vendored wrapper off rental, same follow-up as failure.
     # Clearing owner: WI#367 (split out of WI#331).
     { id = "RUSTSEC-2021-0134", reason = "rental unmaintained (informational, no vulnerability); vendored libsignal-protocol crypto-openssl feature; visible only in the --workspace --all-features graph; clearing owner WI#367, decision record WI#331 (accepted 2026-10-03, re-verified 2026-10-10)" },
+
+    # atty — unsound (WI#360, 2026-10-17). Invisible to every gate while
+    # unsound kept its "workspace" default: atty is a transitive dep only
+    # (env_logger 0.6.2 -> atty 0.2.14), and the default scope reports
+    # advisories only for direct workspace deps. Widening unsound to "all"
+    # surfaces it, so it needs an explicit acceptance here. The crate is
+    # Windows-only vulnerable (unaligned read on the console handle) and
+    # has no patched release; it reaches ic/Cargo.lock solely as a dev-dep
+    # of the vendored libsignal-protocol workspace member, never a
+    # production edge. Production-graph absence is enforced by
+    # .gitlab/scripts/check-lockfile-only-advisories.sh (atty, no-dev mode,
+    # RUSTSEC-2021-0145): it fails if atty ever resolves into a non-dev
+    # build graph and goes stale if the pin leaves the lockfile.
+    # Clearing owner: WI#367 (libsignal-protocol dev-dep chain port; same
+    # owner as failure/rental above — the same vendored-wrapper port
+    # removes env_logger 0.6.2 and with it atty).
+    { id = "RUSTSEC-2021-0145", reason = "atty 0.2.14 unsound (Windows-only unaligned read, no patched release); dev-graph only via vendored libsignal-protocol dev-dep env_logger 0.6.2; production-graph absence enforced by check-lockfile-only-advisories.sh no-dev; clearing owner WI#367" },
 ]
 
 [licenses]
