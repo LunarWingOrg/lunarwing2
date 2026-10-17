@@ -4,7 +4,9 @@
 #   - ic/scripts/setup-instance.sh         (--llm-base-url required)
 #   - ic/scripts/lunarwing-xmpp-test-env.sh (init/bring-up requires
 #     LUNARWING_TEST_TENSORZERO_URL or TENSORZERO_URL, or an existing
-#     proxy.env value; doctor reports NOT CONFIGURED instead of dying)
+#     proxy.env value; render-systemd/render-launchd/start-proxy guard sites
+#     pinned incl. the valueless-existing-proxy.env path; doctor reports
+#     NOT CONFIGURED instead of dying)
 #   - ic/scripts/lunarwing_toolcall_diag.py (--host required; the historical
 #     dev-LAN gateway only via an explicit --default)
 # No docker, network, or cargo needed — argument/write-path behavior only.
@@ -127,6 +129,56 @@ out="$(env -u LUNARWING_TEST_TENSORZERO_URL -u TENSORZERO_URL \
 rc=$?
 assert_exit "doctor does not die without the knob" "0" "$rc"
 assert_contains "doctor reports the gateway as not configured" "$out" "NOT CONFIGURED"
+
+echo "=== lunarwing-xmpp-test-env.sh: bring-up guard sites pinned (WI#402 IH-2) ==="
+
+# render-systemd on a fresh root with no knob must die, and ensure_env must
+# not leave a valueless proxy.env behind — the proxy.env-absence assertion
+# kills a write_proxy_env_if_missing guard removal (the render's own require
+# would still die, but only after the bad file exists).
+ROOT_D="$WORK/env-d"
+out="$(env -u LUNARWING_TEST_TENSORZERO_URL -u TENSORZERO_URL \
+  LUNARWING_TEST_ROOT="$ROOT_D" bash "$TEST_ENV" render-systemd 2>&1)"
+rc=$?
+assert_exit "render-systemd dies with no knob on a fresh root" "1" "$rc"
+assert_contains "render-systemd refusal names the knob" "$out" "LUNARWING_TEST_TENSORZERO_URL"
+assert_absent "render-systemd leaves no valueless proxy.env" "$ROOT_D/env/proxy.env"
+assert_absent "render-systemd writes no proxy unit on refusal" \
+  "$ROOT_D/systemd/lunarwing-proxy-test.service"
+
+# render-launchd: same bring-up guard shape on the macOS lane.
+ROOT_E="$WORK/env-e"
+out="$(env -u LUNARWING_TEST_TENSORZERO_URL -u TENSORZERO_URL \
+  LUNARWING_TEST_ROOT="$ROOT_E" bash "$TEST_ENV" render-launchd 2>&1)"
+rc=$?
+assert_exit "render-launchd dies with no knob on a fresh root" "1" "$rc"
+assert_absent "render-launchd leaves no valueless proxy.env" "$ROOT_E/env/proxy.env"
+
+# render-systemd with an existing but valueless proxy.env (legacy/hand-edited
+# root): ensure_env skips the write, so only the render's own require refuses.
+ROOT_F="$WORK/env-f"
+mkdir -p "$ROOT_F/env"
+printf 'PROXY_PORT=3002\nPROXY_BIND=127.0.0.1\n' >"$ROOT_F/env/proxy.env"
+out="$(env -u LUNARWING_TEST_TENSORZERO_URL -u TENSORZERO_URL \
+  LUNARWING_TEST_ROOT="$ROOT_F" bash "$TEST_ENV" render-systemd 2>&1)"
+rc=$?
+assert_exit "render-systemd dies on a valueless existing proxy.env" "1" "$rc"
+assert_contains "valueless-proxy.env render refusal names the knob" "$out" "LUNARWING_TEST_TENSORZERO_URL"
+assert_absent "no proxy unit on the valueless-proxy.env refusal" \
+  "$ROOT_F/systemd/lunarwing-proxy-test.service"
+
+# start-proxy with an existing but valueless proxy.env: ensure_env skips the
+# write, so only start_proxy's own require refuses (pins the M5 guard site).
+ROOT_G="$WORK/env-g"
+mkdir -p "$ROOT_G/env"
+printf 'PROXY_PORT=13992\nPROXY_BIND=127.0.0.1\n' >"$ROOT_G/env/proxy.env"
+out="$(env -u LUNARWING_TEST_TENSORZERO_URL -u TENSORZERO_URL \
+  LUNARWING_TEST_ROOT="$ROOT_G" LUNARWING_TEST_PROXY_PORT=13992 \
+  bash "$TEST_ENV" start-proxy 2>&1)"
+rc=$?
+assert_exit "start-proxy dies on a valueless existing proxy.env" "1" "$rc"
+assert_contains "start-proxy refusal names the knob" "$out" "LUNARWING_TEST_TENSORZERO_URL"
+assert_absent "start-proxy leaves no pid file on refusal" "$ROOT_G/run/proxy.pid"
 
 if grep -qF '192.168.1.157' "$TEST_ENV"; then
   fail "lunarwing-xmpp-test-env.sh source pin" "dev-LAN literal still present"
