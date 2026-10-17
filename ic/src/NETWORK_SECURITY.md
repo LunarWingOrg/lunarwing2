@@ -425,9 +425,12 @@ byte-scrubs the body, drops the stale upstream `Content-Length` (hyper
 re-frames), and refuses — with 502 — a body whose coding it cannot inspect
 (WI#419): every `Content-Encoding` and `Transfer-Encoding` field is
 checked — a duplicate field cannot hide a coding behind an `identity`
-first field — with each comma-joined token checked individually, and only
-`identity` content codings and `chunked` transfer codings (hyper removes
-that framing but no other) pass; an unreadable coding value is refused
+first field — with each comma-joined token checked individually; only
+`identity` content codings and a single `chunked` transfer coding that
+hyper removes (the last element of the last field) pass — `chunked,`, a
+trailing empty field, a repeated `chunked`, or `chunked` beside any other
+coding leave chunk framing in the body and are refused — and an unreadable
+coding value is refused
 too. Unlike
 headers, the body scrub matches only the raw and form-encoded spellings
 exactly; re-encoded body echoes (e.g. a double-encoded `redirect_to`

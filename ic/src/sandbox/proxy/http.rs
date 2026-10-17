@@ -688,13 +688,16 @@ fn forward_scrubbed_headers(
 }
 
 /// True when the upstream response body is encoded in a way the proxy
-/// cannot byte-scrub (WI#395 run-111 HA-2, WI#419 KH-1). Missing, empty
-/// and `identity` content codings are inspectable, and so are `chunked`
-/// transfer codings (hyper removes that framing but no other). Every
-/// `Content-Encoding` / `Transfer-Encoding` field is checked — a duplicate
-/// field cannot hide a coding behind an `identity` first field — with each
-/// comma-separated token checked individually, and an unreadable value
-/// counts as opaque rather than fail-open.
+/// cannot byte-scrub (WI#395 run-111 HA-2, WI#419 KH-1, run-137 IV-1).
+/// Missing, empty and `identity` content codings are inspectable, and so
+/// is a single `chunked` transfer coding that hyper removes (the last
+/// element of the last field). `chunked,`, a trailing empty field, a
+/// repeated `chunked`, or `chunked` beside any other coding leave chunk
+/// framing in the body, so those are opaque too. Every `Content-Encoding`
+/// / `Transfer-Encoding` field is checked — a duplicate field cannot hide
+/// a coding behind an `identity` first field — with each comma-separated
+/// token checked individually, and an unreadable value counts as opaque
+/// rather than fail-open.
 fn response_body_coding_is_opaque(headers: &http::HeaderMap) -> bool {
     fn field_is_opaque(value: &http::HeaderValue, allowed: &str) -> bool {
         match value.to_str() {
@@ -705,14 +708,35 @@ fn response_body_coding_is_opaque(headers: &http::HeaderMap) -> bool {
             Err(_) => true,
         }
     }
-    headers
+    if headers
         .get_all("content-encoding")
         .iter()
         .any(|v| field_is_opaque(v, "identity"))
-        || headers
-            .get_all("transfer-encoding")
-            .iter()
-            .any(|v| field_is_opaque(v, "chunked"))
+    {
+        return true;
+    }
+    let transfer = headers.get_all("transfer-encoding");
+    let Some(last) = transfer.iter().next_back() else {
+        return false;
+    };
+    if transfer.iter().any(|v| field_is_opaque(v, "chunked")) {
+        return true;
+    }
+    // hyper removes exactly one chunked layer, and only when the last list
+    // element of the last field is `chunked`; `chunked,`, a trailing empty
+    // field, or a repeated `chunked` leave chunk framing in the body
+    // (run-137 IV-1).
+    let hyper_dechunks = last
+        .to_str()
+        .ok()
+        .and_then(|v| v.rsplit(',').next())
+        .is_some_and(|t| t.trim().eq_ignore_ascii_case("chunked"));
+    let chunked_tokens: usize = transfer
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(|v| v.split(',').filter(|t| !t.trim().is_empty()).count())
+        .sum();
+    !(hyper_dechunks && chunked_tokens == 1)
 }
 
 /// Percent-decode `%XX` escapes for one round; `+` is optionally read as a
@@ -1431,6 +1455,39 @@ mod tests {
             );
         }
 
+        // Run-137 IV-1: hyper removes exactly one chunked layer, and only
+        // when the last list element of the last field is `chunked`. These
+        // spellings leave chunk framing in the body, so the echo scrub
+        // could not match them — they must count as opaque.
+        for pairs in [
+            &[("transfer-encoding", "chunked,")][..],
+            &[("transfer-encoding", "chunked"), ("transfer-encoding", "")][..],
+            &[("transfer-encoding", "chunked, chunked")][..],
+            &[
+                ("transfer-encoding", "chunked"),
+                ("transfer-encoding", "chunked"),
+            ][..],
+        ] {
+            assert!(
+                response_body_coding_is_opaque(&with_codings(pairs)),
+                "{pairs:?}"
+            );
+        }
+        // A single `chunked` coding that hyper removes is inspectable,
+        // including case and leading-comma variants whose last element is
+        // still `chunked`.
+        for pairs in [
+            &[("transfer-encoding", "chunked")][..],
+            &[("transfer-encoding", "Chunked")][..],
+            &[("transfer-encoding", ",chunked")][..],
+            &[("transfer-encoding", ""), ("transfer-encoding", "chunked")][..],
+        ] {
+            assert!(
+                !response_body_coding_is_opaque(&with_codings(pairs)),
+                "{pairs:?}"
+            );
+        }
+
         // An unreadable value is opaque, even beside an identity field.
         let mut headers = HeaderMap::new();
         headers.append(
@@ -1439,6 +1496,25 @@ mod tests {
         );
         headers.append("content-encoding", HeaderValue::from_static("identity"));
         assert!(response_body_coding_is_opaque(&headers));
+
+        // An unreadable Transfer-Encoding is opaque too (the fail-open
+        // shape for the transfer check). An empty or whitespace-only TE
+        // field carries no coding, but hyper will not de-chunk it either,
+        // so it counts as opaque (fail-closed, run-137 IV-1).
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "transfer-encoding",
+            HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        assert!(response_body_coding_is_opaque(&headers));
+        assert!(response_body_coding_is_opaque(&with_codings(&[(
+            "transfer-encoding",
+            ""
+        ),])));
+        assert!(response_body_coding_is_opaque(&with_codings(&[(
+            "transfer-encoding",
+            "  "
+        ),])));
     }
 
     /// WI#395 (run-114 HJ-3): pin the forced-identity request and the
@@ -1734,6 +1810,235 @@ mod tests {
 
         proxy.stop().await;
         upstream_task.abort();
+    }
+
+    /// Run-137 IV-1: hyper removes exactly one `chunked` layer, and only
+    /// when the last list element of the last field is `chunked`. These
+    /// shapes leave chunk framing in the body, so a credential echo split
+    /// across chunks is not byte-scrubbed. On a credential-injected exchange
+    /// each must answer 502 with neither half forwarded; the single-layer
+    /// `chunked`/`Chunked`/`,chunked` shapes that hyper does de-chunk must
+    /// still give 200 with `[REDACTED]`.
+    #[tokio::test]
+    #[traced_test]
+    async fn proxy_credential_exchange_refuses_chunk_framing_hyper_keeps() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const SECRET: &str = "qp-iv1-chunked-3a7b9c+/==";
+        const SECRET_STEM: &str = "qp-iv1-chunked-3a7b9c";
+        // Split the echo across two chunks: first chunk has the first half
+        // of the encoded secret, second chunk has the rest.
+        const ECHO_HALF1: &[u8] = b"echo=qp-iv1-chunked-3a7b9c";
+        const ECHO_HALF2: &[u8] = b"%2B%2F%3D%3D;end";
+
+        fn chunked_response(te_header: &str, body_parts: &[&[u8]]) -> Vec<u8> {
+            let mut out = format!(
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: {te_header}\r\n\r\n"
+            )
+            .into_bytes();
+            for part in body_parts {
+                out.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+                out.extend_from_slice(part);
+                out.extend_from_slice(b"\r\n");
+            }
+            out.extend_from_slice(b"0\r\n\r\n");
+            out
+        }
+
+        // Shapes that leave chunk framing in the body → 502, no echo.
+        let opaque_answers: Vec<(String, Vec<u8>)> = vec![
+            (
+                "chunked,".to_string(),
+                chunked_response("chunked,", &[ECHO_HALF1, ECHO_HALF2]),
+            ),
+            (
+                "chunked, chunked".to_string(),
+                chunked_response("chunked, chunked", &[ECHO_HALF1, ECHO_HALF2]),
+            ),
+        ];
+        // Two-field `chunked` + empty → 502.
+        let two_field = {
+            let mut out =
+                b"HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n".to_vec();
+            out.extend_from_slice(b"Transfer-Encoding: \r\n\r\n");
+            out.extend_from_slice(format!("{:x}\r\n", ECHO_HALF1.len()).as_bytes());
+            out.extend_from_slice(ECHO_HALF1);
+            out.extend_from_slice(b"\r\n");
+            out.extend_from_slice(format!("{:x}\r\n", ECHO_HALF2.len()).as_bytes());
+            out.extend_from_slice(ECHO_HALF2);
+            out.extend_from_slice(b"\r\n0\r\n\r\n");
+            out
+        };
+        // Two-field `chunked` + `chunked` (double-chunked) → 502.
+        let double_chunked = {
+            let mut out =
+                b"HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n".to_vec();
+            out.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
+            // Inner chunk wraps the echo in chunk framing.
+            let inner = {
+                let mut i = Vec::new();
+                i.extend_from_slice(format!("{:x}\r\n", ECHO_HALF1.len()).as_bytes());
+                i.extend_from_slice(ECHO_HALF1);
+                i.extend_from_slice(b"\r\n");
+                i.extend_from_slice(format!("{:x}\r\n", ECHO_HALF2.len()).as_bytes());
+                i.extend_from_slice(ECHO_HALF2);
+                i.extend_from_slice(b"\r\n0\r\n\r\n");
+                i
+            };
+            out.extend_from_slice(format!("{:x}\r\n", inner.len()).as_bytes());
+            out.extend_from_slice(&inner);
+            out.extend_from_slice(b"\r\n0\r\n\r\n");
+            out
+        };
+
+        let mut opaque_answers = opaque_answers;
+        opaque_answers.push(("chunked+empty".to_string(), two_field));
+        opaque_answers.push(("chunked+chunked".to_string(), double_chunked));
+
+        for (label, answer) in &opaque_answers {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream_port = upstream.local_addr().unwrap().port();
+            let answer = answer.clone();
+            let upstream_task = tokio::spawn(async move {
+                loop {
+                    let Ok((mut conn, _)) = upstream.accept().await else {
+                        return;
+                    };
+                    let answer = answer.clone();
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 8192];
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            conn.read(&mut buf),
+                        )
+                        .await;
+                        let _ = conn.write_all(&answer).await;
+                    });
+                }
+            });
+
+            let allowlist = DomainAllowlist::new(&["127.0.0.1".to_string()]);
+            let mappings = vec![CredentialMapping {
+                secret_name: "QP_TOKEN".to_string(),
+                location: CredentialLocation::QueryParam {
+                    name: "api_key".to_string(),
+                },
+                host_patterns: vec!["127.0.0.1".to_string()],
+                path_patterns: Vec::new(),
+                optional: false,
+            }];
+            let decider = Arc::new(DefaultPolicyDecider::new(allowlist, mappings));
+            let resolver = Arc::new(FixedCredentialResolver(SECRET.to_string()));
+            let proxy = HttpProxy::new(decider, resolver);
+            let addr = proxy.start(0).await.unwrap();
+
+            let request = format!(
+                "GET http://127.0.0.1:{upstream_port}/mapped HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+            );
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client.write_all(request.as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                client.read_to_end(&mut response),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+            let text = String::from_utf8_lossy(&response);
+            assert!(text.starts_with("HTTP/1.1 502"), "{label}: {text}");
+            assert!(
+                !text.contains(SECRET_STEM) && !text.contains("api_key="),
+                "{label}: injected credential leaked into the 502: {text}"
+            );
+            assert!(
+                !text.contains("echo=") && !text.contains(";end"),
+                "{label}: chunk framing leaked into the 502: {text}"
+            );
+
+            proxy.stop().await;
+            upstream_task.abort();
+        }
+
+        // Single-layer shapes that hyper removes → 200 with [REDACTED].
+        for (te_header, label) in [
+            ("chunked", "plain chunked"),
+            ("Chunked", "Chunked"),
+            (",chunked", "leading-comma chunked"),
+        ] {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream_port = upstream.local_addr().unwrap().port();
+            let body_text = format!("echo={SECRET};end");
+            let answer = chunked_response(te_header, &[body_text.as_bytes()]);
+            let upstream_task = tokio::spawn(async move {
+                loop {
+                    let Ok((mut conn, _)) = upstream.accept().await else {
+                        return;
+                    };
+                    let answer = answer.clone();
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 8192];
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            conn.read(&mut buf),
+                        )
+                        .await;
+                        let _ = conn.write_all(&answer).await;
+                    });
+                }
+            });
+
+            let allowlist = DomainAllowlist::new(&["127.0.0.1".to_string()]);
+            let mappings = vec![CredentialMapping {
+                secret_name: "QP_TOKEN".to_string(),
+                location: CredentialLocation::QueryParam {
+                    name: "api_key".to_string(),
+                },
+                host_patterns: vec!["127.0.0.1".to_string()],
+                path_patterns: Vec::new(),
+                optional: false,
+            }];
+            let decider = Arc::new(DefaultPolicyDecider::new(allowlist, mappings));
+            let resolver = Arc::new(FixedCredentialResolver(SECRET.to_string()));
+            let proxy = HttpProxy::new(decider, resolver);
+            let addr = proxy.start(0).await.unwrap();
+
+            let request = format!(
+                "GET http://127.0.0.1:{upstream_port}/mapped HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+            );
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client.write_all(request.as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                client.read_to_end(&mut response),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+            let text = String::from_utf8_lossy(&response);
+            assert!(text.starts_with("HTTP/1.1 200"), "{label}: {text}");
+            assert!(
+                text.contains("[REDACTED]"),
+                "{label}: echo not scrubbed: {text}"
+            );
+            assert!(
+                !text.contains(SECRET_STEM),
+                "{label}: secret survived scrub: {text}"
+            );
+
+            proxy.stop().await;
+            upstream_task.abort();
+        }
+        assert!(logs_contain(
+            "refused content-encoded response body that cannot be scrubbed"
+        ));
+        assert!(
+            !logs_contain(SECRET_STEM) && !logs_contain("api_key="),
+            "injected credential leaked into the proxy log"
+        );
     }
 
     /// WI#395 (run-111 HA-6): a body-read error (upstream promises
