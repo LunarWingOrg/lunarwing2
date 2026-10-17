@@ -6851,4 +6851,108 @@ mod tests {
         assert!(!err.contains("for url"), "{err}");
         assert!(!err.contains("P@ss"), "{err}");
     }
+
+    /// IO-1 refusal core: `guest_body_encoding_is_opaque` fails closed on
+    /// malformed JSON, any non-identity content coding, any non-chunked
+    /// transfer coding, and comma-joined duplicate fields carrying one
+    /// opaque value; identity and chunked (hyper strips that framing) pass.
+    #[test]
+    fn channel_guest_body_encoding_is_opaque_covers_codings_and_duplicates() {
+        use super::guest_body_encoding_is_opaque;
+
+        assert!(!guest_body_encoding_is_opaque("{}"));
+        assert!(!guest_body_encoding_is_opaque(
+            r#"{"content-encoding":"identity"}"#
+        ));
+        assert!(!guest_body_encoding_is_opaque(
+            r#"{"transfer-encoding":"chunked"}"#
+        ));
+        assert!(!guest_body_encoding_is_opaque(
+            r#"{"content-encoding":"identity, identity"}"#
+        ));
+        assert!(guest_body_encoding_is_opaque("not json"));
+        assert!(guest_body_encoding_is_opaque(
+            r#"{"content-encoding":"gzip"}"#
+        ));
+        assert!(guest_body_encoding_is_opaque(
+            r#"{"Content-Encoding":"GZip"}"#
+        ));
+        assert!(guest_body_encoding_is_opaque(
+            r#"{"content-encoding":"identity, gzip"}"#
+        ));
+        assert!(guest_body_encoding_is_opaque(
+            r#"{"transfer-encoding":"gzip, chunked"}"#
+        ));
+        assert!(guest_body_encoding_is_opaque(
+            r#"{"transfer-encoding":"opaque-invalid"}"#
+        ));
+    }
+
+    /// IO-1 collection shape: duplicate response fields are comma-joined
+    /// (so the encoding check sees every value), names are lowercased, and
+    /// Set-Cookie keeps last-value behaviour.
+    #[test]
+    fn channel_guest_response_headers_comma_join_duplicates() {
+        use super::guest_response_headers;
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.append("content-encoding", "identity".parse().expect("hv"));
+        headers.append("Content-Encoding", "gzip".parse().expect("hv"));
+        headers.append("set-cookie", "a=1".parse().expect("hv"));
+        headers.append("Set-Cookie", "b=2".parse().expect("hv"));
+        headers.append("x-one", "x".parse().expect("hv"));
+        let collected = guest_response_headers(&headers);
+        assert_eq!(
+            collected.get("content-encoding").map(String::as_str),
+            Some("identity, gzip")
+        );
+        assert_eq!(collected.get("set-cookie").map(String::as_str), Some("b=2"));
+        assert_eq!(collected.get("x-one").map(String::as_str), Some("x"));
+    }
+
+    /// IO-3 spellings: the scrubbed set covers the urlencoding form, the
+    /// form (`append_pair`) form, and the WHATWG URL parser spellings a raw
+    /// placeholder takes in a query or path position — and never contains
+    /// the raw spelling itself or an empty string.
+    #[test]
+    fn channel_encoded_spellings_cover_url_parser_forms() {
+        use super::encoded_spellings;
+
+        let spellings = encoded_spellings("P@ss word!");
+        assert!(spellings.contains(&"P%40ss%20word%21".to_string()), "{spellings:?}");
+        assert!(spellings.contains(&"P%40ss+word%21".to_string()), "{spellings:?}");
+        assert!(!spellings.iter().any(|s| s.is_empty()), "{spellings:?}");
+        assert!(
+            !spellings.contains(&"P@ss word!".to_string()),
+            "{spellings:?}"
+        );
+    }
+
+    /// IO-3 needles: the Basic-auth base64 token of an injected header is
+    /// scrubbed alongside the raw secret; trivially short or
+    /// secret-containing tokens are not used as needles.
+    #[test]
+    fn channel_host_credential_needles_include_header_tokens() {
+        use super::{ResolvedHostCredential, host_credential_needles};
+
+        let mut headers = HashMap::new();
+        headers.insert(
+            "Authorization".to_string(),
+            "Basic cGxhaW46dzNlImNoYXQvcHctMDEyMw==".to_string(),
+        );
+        headers.insert("X-Short".to_string(), "Bearer abc".to_string());
+        let cred = ResolvedHostCredential {
+            host_patterns: vec!["example.test".to_string()],
+            headers,
+            query_params: HashMap::new(),
+            secret_value: "plainsecret".to_string(),
+        };
+        let needles = host_credential_needles(&cred);
+        assert!(needles.contains(&"plainsecret"), "{needles:?}");
+        assert!(
+            needles.contains(&"cGxhaW46dzNlImNoYXQvcHctMDEyMw=="),
+            "{needles:?}"
+        );
+        assert!(!needles.contains(&"abc"), "{needles:?}");
+    }
 }
