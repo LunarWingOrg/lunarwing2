@@ -608,8 +608,9 @@ The WASM **channel** host (`src/channels/wasm/wrapper.rs`) applies the same
 one-boundary redaction (WI#408): everything the channel guest sees from one
 HTTP exchange passes through
 `ChannelStoreData::redact_http_outcome_for_guest` at the
-`Host::http_request` trait boundary — send errors (URL stripped via
-`without_url()`), early validator errors that quote the injected URL,
+`Host::http_request` trait boundary — send and body-read errors (URL
+stripped via `without_url()`), early validator errors that quote the
+injected URL,
 response headers (redacted per field before serialization, so JSON-escaped
 secrets in **headers** are caught), and response bodies (byte-level). The
 deny path no longer logs the injected URL, and the response-body debug log
@@ -622,17 +623,31 @@ query credentials with `query_pairs_mut().append_pair` — the
 spelling plus every encoded spelling the host itself can put on the wire:
 `urlencoding::encode`, the form spelling, the WHATWG URL-parser spellings a
 placeholder substituted raw into a URL path or query takes when reqwest
-re-parses the injected URL, and the credential token of every injected
-header value (the Basic-auth `base64(user:secret)` token never contains the
-raw secret).
+re-parses the injected URL, the upstream-parsed spellings of a raw query
+placeholder (`+` read as a space, `%XX` escapes decoded), and the
+credential token of every injected header value (the Basic-auth
+`base64(user:secret)` token never contains the raw secret). Two further
+placeholder rules keep parsed spellings of the secret out of guest-visible
+text: a URL placeholder whose value contains `#` or an ASCII control
+character is refused before injection (the WHATWG parser cuts the URL at
+`#` and drops tab/newline, so such a substitution never delivered the
+credential intact), and when a placeholder was injected the allowlist deny
+reason is computed from the guest's own URL (naming `{PLACEHOLDER}`),
+because a reason computed from the injected URL would quote parsed URL
+parts — percent-decoded, Debug-escaped, cut at `#`/`?` — in spellings no
+needle matches.
 
 As in the tool wrapper (HJ-1/HQ-1/HQ-2 parity): a credential-injected
 exchange (placeholder URL/header or host credential applied) sends exactly
 one `accept-encoding: identity` (replacing every guest spelling) and
 removes every `TE` offer; a **non-empty** response whose `Content-Encoding`
-carries any non-identity token or whose `Transfer-Encoding` carries any
-non-`chunked` token is refused at the boundary ("encoded body cannot be
-inspected"). Duplicate response fields are comma-joined before the check
+carries any non-identity token or whose `Transfer-Encoding` keeps framing
+is refused at the boundary ("encoded body cannot be inspected"). Only a
+single `chunked` coding that hyper removes (the last element of the
+comma-joined value) is inspectable; `chunked,`, a trailing empty field,
+repeated `chunked` fields, and `gzip, chunked` all leave framing or a
+coding in the body and are refused. Duplicate response fields are
+comma-joined before the check
 (`Set-Cookie` keeps last-value behaviour — it cannot be comma-joined),
 unreadable coding values become an opaque sentinel, and malformed
 `headers_json` fails closed. Ordinary exchanges keep the guest's own
