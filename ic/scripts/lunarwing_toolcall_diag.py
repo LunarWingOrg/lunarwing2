@@ -12,8 +12,12 @@ definitions modeled after OpenClaw built-ins, then classifies each response:
   - ERROR            : request failed or returned an unexpected shape
 
 Prints a per-variant summary at the end.
+
+Usage: lunarwing_toolcall_diag.py --host <gateway-host> [--port 3000]
+       lunarwing_toolcall_diag.py --default   # historical dev-LAN gateway
 """
 
+import argparse
 import json
 import re
 import sys
@@ -26,7 +30,9 @@ from urllib.error import URLError, HTTPError
 # CONFIGURATION
 # ============================================================================
 
-GATEWAY_HOST = "192.168.1.157"
+# Historical developer-LAN gateway (WI#402): used only when --default is
+# passed explicitly. Otherwise --host is required.
+DEFAULT_GATEWAY_HOST = "192.168.1.157"
 GATEWAY_PORT = 3000
 FUNCTION_NAME = "kageho"
 NUM_ITERATIONS = 40          # bump higher to hit low-weight variants
@@ -204,8 +210,40 @@ def send_inference(gateway_url: str) -> dict:
         return json.loads(resp.read().decode())
 
 
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Diagnose native tool-call handling across lunarwing entrypoint variants.",
+    )
+    parser.add_argument(
+        "--host",
+        help="TensorZero gateway host (required unless --default is given)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=GATEWAY_PORT,
+        help="TensorZero gateway port (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--default",
+        action="store_true",
+        help=f"use the historical dev-LAN gateway {DEFAULT_GATEWAY_HOST}:{GATEWAY_PORT} (explicit opt-in)",
+    )
+    args = parser.parse_args(argv)
+    if args.host and args.default:
+        parser.error("--host and --default are mutually exclusive")
+    if not args.host and not args.default:
+        parser.error(
+            "--host is required (no built-in default since WI#402; "
+            f"pass --default to use the historical dev-LAN gateway {DEFAULT_GATEWAY_HOST})"
+        )
+    return args
+
+
 def main():
-    gateway_url = f"http://{GATEWAY_HOST}:{GATEWAY_PORT}/inference"
+    args = parse_args()
+    gateway_host = DEFAULT_GATEWAY_HOST if args.default else args.host
+    gateway_url = f"http://{gateway_host}:{args.port}/inference"
 
     print(f"lunarwing tool-call diagnostic")
     print(f"gateway:    {gateway_url}")

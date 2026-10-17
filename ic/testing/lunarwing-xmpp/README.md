@@ -27,6 +27,13 @@ The harness is cross-platform. Single-tenant `up`/`down` uses direct PID managem
 
 ## 1. Pick a Test Root
 
+First, point the harness at your TensorZero gateway — there is no built-in
+default (WI#402); `init`/`up` fail with guidance when it is unset:
+
+```bash
+export LUNARWING_TEST_TENSORZERO_URL="http://<gateway-host>:3000"
+```
+
 Use the default `/tmp` root for throwaway tests:
 
 ```bash
@@ -44,7 +51,10 @@ scripts/lunarwing-xmpp-test-env.sh init
 ```
 
 Keep that `LUNARWING_TEST_ROOT` exported for later commands in the same shell.
-If you open a new shell, export it again before using the harness.
+If you open a new shell, export it again before using the harness. The
+TensorZero URL is baked into `env/proxy.env` at `init` and read back from
+there, so the export is only needed again if you delete the env or want to
+change it (`TENSORZERO_URL` is honored as a fallback name).
 
 ## 2. Inspect the Generated Files
 
@@ -143,6 +153,7 @@ export GATEWAY_TOKEN='replace-me-gateway-token'
 export BRIDGE_TOKEN='replace-me-bridge-token'
 export XMPP_PASSWORD='replace-me-xmpp-password'
 export LLM_API_KEY='unneeded'
+export LUNARWING_TEST_TENSORZERO_URL='http://<gateway-host>:3000'
 
 # Linux (systemd): stop and remove old units
 systemctl --user stop lunarwing-test.service xmpp-bridge-test.service lunarwing-proxy-test.service 2>/dev/null || true
