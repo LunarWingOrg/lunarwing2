@@ -619,9 +619,10 @@ load_all_envs() {
 
 ensure_env() {
   init_dirs
+  # WI#402: proxy.env first, so a missing TensorZero URL refuses before any other env file is generated.
+  write_proxy_env_if_missing
   write_lunarwing_env_if_missing
   write_bridge_env_if_missing
-  write_proxy_env_if_missing
 }
 
 bridge_base() {

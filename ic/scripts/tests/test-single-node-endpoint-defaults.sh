@@ -19,7 +19,7 @@ TEST_ENV="$IC_DIR/scripts/lunarwing-xmpp-test-env.sh"
 DIAG="$IC_DIR/scripts/lunarwing_toolcall_diag.py"
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'if [[ -f "$WORK/env-g/run/proxy.pid" ]]; then kill "$(cat "$WORK/env-g/run/proxy.pid")" 2>/dev/null; fi; rm -rf "$WORK"' EXIT
 
 failures=0
 
@@ -180,6 +180,47 @@ assert_exit "start-proxy dies on a valueless existing proxy.env" "1" "$rc"
 assert_contains "start-proxy refusal names the knob" "$out" "LUNARWING_TEST_TENSORZERO_URL"
 assert_absent "start-proxy leaves no pid file on refusal" "$ROOT_G/run/proxy.pid"
 
+# render-launchd over a valueless existing proxy.env: only render_launchd's
+# own require can refuse (ensure_env skips the proxy.env write).
+ROOT_H="$WORK/env-h"
+mkdir -p "$ROOT_H/env"
+{ echo "PROXY_PORT=3002"; echo "PROXY_BIND=127.0.0.1"; } >"$ROOT_H/env/proxy.env"
+out="$(env -u LUNARWING_TEST_TENSORZERO_URL -u TENSORZERO_URL LUNARWING_TEST_ROOT="$ROOT_H" bash "$TEST_ENV" render-launchd 2>&1)"
+rc=$?
+assert_exit "render-launchd dies on a valueless existing proxy.env" "1" "$rc"
+if compgen -G "$ROOT_H/launchd/"*.plist >/dev/null; then
+  fail "no launchd plists on the valueless-proxy.env refusal" "plist written under $ROOT_H/launchd"
+else
+  pass "no launchd plists on the valueless-proxy.env refusal"
+fi
+
+# Direct-gateway mode (ENABLE_PROXY=false) bakes the URL into the daemon's
+# LLM_BASE_URL, and lunarwing.env is never rewritten once it exists. With a
+# valueless existing proxy.env only that writer's own require can refuse.
+ROOT_I="$WORK/env-i"
+mkdir -p "$ROOT_I/env"
+{ echo "PROXY_PORT=3002"; echo "PROXY_BIND=127.0.0.1"; } >"$ROOT_I/env/proxy.env"
+out="$(env -u LUNARWING_TEST_TENSORZERO_URL -u TENSORZERO_URL LUNARWING_TEST_ROOT="$ROOT_I" LUNARWING_TEST_ENABLE_PROXY=false bash "$TEST_ENV" render-systemd 2>&1)"
+rc=$?
+assert_exit "direct-gateway render-systemd dies with no knob" "1" "$rc"
+assert_absent "direct-gateway refusal bakes no lunarwing.env" "$ROOT_I/env/lunarwing.env"
+ROOT_J="$WORK/env-j"
+out="$(env -u TENSORZERO_URL LUNARWING_TEST_ROOT="$ROOT_J" LUNARWING_TEST_ENABLE_PROXY=false LUNARWING_TEST_TENSORZERO_URL="http://direct.test:3000" bash "$TEST_ENV" init 2>&1)"
+rc=$?
+assert_exit "direct-gateway init succeeds with the knob" "0" "$rc"
+assert_file_contains "direct-gateway lunarwing.env bakes the given URL" "$ROOT_J/env/lunarwing.env" "LLM_BASE_URL=http://direct.test:3000/openai/v1"
+
+# Precedence: LUNARWING_TEST_TENSORZERO_URL, then TENSORZERO_URL, then the
+# baked proxy.env value (ROOT_A baked http://tz.test:3000 above).
+out="$(LUNARWING_TEST_ROOT="$ROOT_A" LUNARWING_TEST_TENSORZERO_URL="http://first.test:3000" TENSORZERO_URL="http://second.test:3000" bash "$TEST_ENV" render-systemd 2>&1)"
+rc=$?
+assert_exit "render-systemd on an initialized root with both knobs" "0" "$rc"
+assert_file_contains "LUNARWING_TEST_TENSORZERO_URL wins over TENSORZERO_URL and proxy.env" "$ROOT_A/systemd/lunarwing-proxy-test.service" "tensorzero http://first.test:3000"
+out="$(env -u LUNARWING_TEST_TENSORZERO_URL LUNARWING_TEST_ROOT="$ROOT_A" TENSORZERO_URL="http://second.test:3000" bash "$TEST_ENV" render-systemd 2>&1)"
+rc=$?
+assert_exit "render-systemd on an initialized root with TENSORZERO_URL" "0" "$rc"
+assert_file_contains "TENSORZERO_URL wins over the baked proxy.env value" "$ROOT_A/systemd/lunarwing-proxy-test.service" "tensorzero http://second.test:3000"
+
 if grep -qF '192.168.1.157' "$TEST_ENV"; then
   fail "lunarwing-xmpp-test-env.sh source pin" "dev-LAN literal still present"
 else
@@ -193,7 +234,7 @@ rc=$?
 assert_exit "diag dies without --host" "2" "$rc"
 assert_contains "error names --host" "$out" "--host is required"
 
-out="$(python3 "$DIAG" --host x --default 2>&1)"
+out="$(timeout 20 python3 "$DIAG" --host x --default 2>&1)"
 rc=$?
 assert_exit "diag rejects --host with --default" "2" "$rc"
 assert_contains "error names the conflict" "$out" "mutually exclusive"
