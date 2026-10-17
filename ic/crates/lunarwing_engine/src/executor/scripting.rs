@@ -236,6 +236,167 @@ fn build_context_inputs(
     (names, values)
 }
 
+// ── Auto-import pre-injection (WI#364) ──────────────────────
+
+/// Standard library modules available in Monty that the CodeAct preamble
+/// advertises. When LLM-generated code references `module.` without a matching
+/// `import module` in the same block, Monty raises `NameError` because each
+/// `MontyRun` is block-scoped — imports do not carry across blocks. Prompt-level
+/// mitigation has a saturation point (three+ documented occurrences across
+/// threads #12, #16, #22), so the orchestrator pre-injects missing imports
+/// before the code reaches Monty (WI#364 Option 1).
+const AUTO_INJECT_MODULES: &[&str] = &["asyncio", "json", "re", "math", "datetime", "sys"];
+
+/// Check whether `code` already imports `module` in a way that binds the bare
+/// name `module` at module scope.
+///
+/// Only `import module` / `import module.submodule` count: `from module import
+/// x` binds `x` and `import module as alias` binds `alias`, so neither makes a
+/// later `module.` reference resolvable (run-143 JL-3). A comment line like
+/// `# import asyncio` is not a real import, so the scan strips `#`-comment
+/// tails before matching.
+fn already_imports(code: &str, module: &str) -> bool {
+    for line in code.lines() {
+        let stripped = line.split('#').next().unwrap_or(line).trim();
+        if let Some(targets) = stripped.strip_prefix("import ") {
+            // Multi-name form: `import json, re, sys` (Monty supports
+            // multi-module imports).
+            for target in targets.split(',') {
+                let mut words = target.split_whitespace();
+                let name = words.next().unwrap_or("");
+                let binds_module = match (words.next(), words.next()) {
+                    // `import module as alias` binds `alias`, not `module`.
+                    (Some("as"), Some(alias)) => alias == module,
+                    _ => name == module || name.starts_with(&format!("{module}.")),
+                };
+                if binds_module {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Check whether `code` references `module.` as a dotted access (e.g.
+/// `asyncio.gather`, `json.loads`). The `.` must immediately follow the
+/// module name, and the byte before the name must be a word boundary, to
+/// avoid matching substrings inside longer identifiers.
+fn references_module(code: &str, module: &str) -> bool {
+    let bytes = code.as_bytes();
+    let mut remaining: &str = code;
+    while let Some(found) = remaining.find(module) {
+        let pos = code.len() - remaining.len() + found;
+        remaining = &remaining[found + module.len()..];
+        // Word boundary before the match (checked against the whole code so
+        // a skipped match does not reset it — run-143 JL-4).
+        let before = pos > 0 && {
+            let prev = bytes[pos - 1];
+            prev.is_ascii_alphanumeric() || prev == b'_'
+        };
+        if before {
+            continue;
+        }
+        // The character after must be '.'.
+        if bytes.get(pos + module.len()) == Some(&b'.') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `code` calls `name` as a bare function (`json(...)`).
+///
+/// The builtin `json` tool is called that way; an injected `import json` would
+/// rebind the name from the tool to the module and break the call, so such a
+/// block gets no injection for that name (run-143 JL-1).
+fn calls_bare_name(code: &str, name: &str) -> bool {
+    let bytes = code.as_bytes();
+    let mut remaining: &str = code;
+    while let Some(found) = remaining.find(name) {
+        let pos = code.len() - remaining.len() + found;
+        remaining = &remaining[found + name.len()..];
+        let attached = pos > 0 && {
+            let prev = bytes[pos - 1];
+            prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'.' || !prev.is_ascii()
+        };
+        if !attached && remaining.trim_start().starts_with('(') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Prepend `import` statements for available Monty stdlib modules that the
+/// code references via dotted access but does not itself import.
+///
+/// This removes the burden of import hygiene from the LLM: if the model writes
+/// `asyncio.gather(...)` without `import asyncio`, the host injects it before
+/// execution. Each injected line is a plain `import <module>` so it is visible
+/// in tracebacks and does not change the semantics of already-imported modules.
+/// Only the six Monty-available modules documented in the CodeAct preamble are
+/// candidates (WI#364). A name the block calls as a bare function (`json(...)`,
+/// the builtin tool) is never injected — that would rebind the tool's name to
+/// the module (run-143 JL-1).
+///
+/// Known limitation (accepted): the scan is a line/boundary matcher, not a
+/// full Python parser. `module.` inside a string literal triggers a harmless
+/// extra `import`, and an `import module` inside a `def` does not make the
+/// name resolvable at the top level (and does not suppress injection).
+fn inject_missing_imports(code: &str) -> String {
+    let mut to_inject: Vec<&str> = Vec::new();
+    for &module in AUTO_INJECT_MODULES {
+        if references_module(code, module)
+            && !already_imports(code, module)
+            && !calls_bare_name(code, module)
+        {
+            to_inject.push(module);
+        }
+    }
+    if to_inject.is_empty() {
+        return code.to_string();
+    }
+    let prefix: String = to_inject
+        .iter()
+        .map(|m| format!("import {m}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{prefix}\n{code}")
+}
+
+/// WI#364 JL-2: Monty reports positions in the prepared code, which carries
+/// the auto-import prefix in front of the model's block. Subtract `by` from
+/// the number that follows each `mark` in `text` (with `range`, also from the
+/// `..N` end that follows it) so errors point at the model's own block.
+fn shift_numbers_after(text: &str, mark: &str, by: usize, range: bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find(mark) {
+        let (head, tail) = rest.split_at(pos + mark.len());
+        out.push_str(head);
+        rest = push_shifted_number(&mut out, tail, by);
+        if range && let Some(end) = rest.strip_prefix("..") {
+            out.push_str("..");
+            rest = push_shifted_number(&mut out, end, by);
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Push the first run of ASCII digits in `text` as a number decremented by
+/// `by`, then return the remainder of the text. Non-digits or numbers smaller
+/// than `by` are written unchanged.
+fn push_shifted_number<'a>(out: &mut String, text: &'a str, by: usize) -> &'a str {
+    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+    let (number, after) = text.split_at(digits);
+    match number.parse::<usize>() {
+        Ok(n) if n >= by => out.push_str(&(n - by).to_string()),
+        _ => out.push_str(number),
+    }
+    after
+}
+
 // ── Main execution function ─────────────────────────────────
 
 /// Execute a Python code block using Monty.
@@ -340,6 +501,70 @@ pub async fn execute_code_with_skills(
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_code_with_skills_and_action_limit(
+    code: &str,
+    thread: &Thread,
+    llm: &Arc<dyn LlmBackend>,
+    effects: &Arc<dyn EffectExecutor>,
+    leases: &LeaseManager,
+    policy: &PolicyEngine,
+    context: &ThreadExecutionContext,
+    capability_policies: &[crate::types::capability::PolicyRule],
+    persisted_state: &serde_json::Value,
+    skill_snippet_names: &[String],
+    store: Option<&Arc<dyn crate::traits::store::Store>>,
+    action_limit: usize,
+) -> Result<CodeExecutionResult, EngineError> {
+    // WI#364: pre-inject `import` statements for available Monty stdlib
+    // modules that the code references but does not itself import. Each
+    // MontyRun is block-scoped, so a bare `asyncio.gather(...)` without a
+    // same-block import raises NameError; the prompt-level rule saturated
+    // across threads #12/#16/#22, so the host removes the burden.
+    let prepared_code = inject_missing_imports(code);
+    let prefix_len = prepared_code.len().saturating_sub(code.len());
+    let injected_lines = prepared_code[..prefix_len].lines().count();
+
+    let mut result = execute_prepared_code(
+        &prepared_code,
+        thread,
+        llm,
+        effects,
+        leases,
+        policy,
+        context,
+        capability_policies,
+        persisted_state,
+        skill_snippet_names,
+        store,
+        action_limit,
+    )
+    .await?;
+
+    // JL-2: Monty reports positions in the prepared code, which carries the
+    // auto-import prefix in front of the model's block. Subtract the injected
+    // line count from line numbers and the prefix length from byte ranges so
+    // errors point at the model's own block. Only the executor-appended error
+    // tail carries Monty frames; output the block printed itself is untouched.
+    if injected_lines > 0 && result.had_error {
+        if let Some(start) = result.stdout.rfind("Traceback (most recent call last):") {
+            let tail = &result.stdout[start..];
+            let tail = shift_numbers_after(tail, r#"File "step.py", line "#, injected_lines, false);
+            let tail = shift_numbers_after(&tail, "at byte range ", prefix_len, true);
+            result.stdout.truncate(start);
+            result.stdout.push_str(&tail);
+        } else if let Some(start) = result.stdout.find("SyntaxError: ") {
+            let tail = &result.stdout[start..];
+            let tail = shift_numbers_after(tail, r#"File "step.py", line "#, injected_lines, false);
+            let tail = shift_numbers_after(&tail, "at byte range ", prefix_len, true);
+            result.stdout.truncate(start);
+            result.stdout.push_str(&tail);
+        }
+    }
+
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_prepared_code(
     code: &str,
     thread: &Thread,
     llm: &Arc<dyn LlmBackend>,
