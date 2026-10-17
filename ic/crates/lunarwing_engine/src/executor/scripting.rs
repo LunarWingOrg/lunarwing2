@@ -4334,7 +4334,10 @@ FINAL(str(results[0]))
     #[test]
     fn inject_missing_imports_respects_the_leading_word_boundary() {
         // JL-4: a name preceded by an identifier character must not match.
-        assert_eq!(inject_missing_imports("my_asyncio.gather(1)"), "my_asyncio.gather(1)");
+        assert_eq!(
+            inject_missing_imports("my_asyncio.gather(1)"),
+            "my_asyncio.gather(1)"
+        );
     }
 
     #[test]
@@ -4371,7 +4374,10 @@ FINAL(str(results[0]))
         // not get an injected `import json` — it would rebind the name.
         let code = "data = await json(operation=\"parse\", data=\"{}\")\nFINAL(str(data))";
         let injected = inject_missing_imports(code);
-        assert_eq!(injected, code, "json tool call should suppress json injection");
+        assert_eq!(
+            injected, code,
+            "json tool call should suppress json injection"
+        );
     }
 
     #[tokio::test]
@@ -4437,10 +4443,7 @@ FINAL(str(data))"#;
         // JL-2: a runtime error and a SyntaxError, both on line 2 of the block;
         // the parser's byte range must be relative to the block too.
         for (code, expected) in [
-            (
-                "x = json.dumps([1])\ny = 1 / 0",
-                "ZeroDivisionError",
-            ),
+            ("x = json.dumps([1])\ny = 1 / 0", "ZeroDivisionError"),
             (
                 "results = await asyncio.gather()\nif x",
                 "byte range 37..37",
