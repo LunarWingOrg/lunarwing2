@@ -2,6 +2,7 @@
 """Regression checks for the required gates that failed in pipeline #4679."""
 
 import copy
+import datetime
 import hashlib
 import importlib.util
 import io
@@ -2489,6 +2490,73 @@ class WorkerTsLaneTests(unittest.TestCase):
             effective["image"], {"name": "$CI_NODE_IMAGE", "entrypoint": ["/bin/sh"]}
         )
         self.assertTrue(any("entrypoint" in error for error in self.errors(merged)))
+
+
+class TrivyIgnoreTests(unittest.TestCase):
+    """WI#361: .gitlab/trivy-ignore entries must use Trivy's real `exp:`
+    syntax — `getExpirationDate` (pkg/result/ignore.go) only CutPrefix's
+    `exp:`, so the former `expiring:` lines were permanent suppressions —
+    and no entry may expire more than six months out."""
+
+    TODAY = datetime.date(2026, 10, 17)
+    VALID = "CVE-2025-7458 exp:2027-04-17"
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.ignore = pathlib.Path(temporary.name) / "trivy-ignore"
+
+    def errors(self, text: str | None) -> list[str]:
+        if text is not None:
+            self.ignore.write_text(text, encoding="utf-8")
+        errors = []
+        with mock.patch.object(config, "TRIVY_IGNORE", self.ignore):
+            config.validate_trivy_ignore(errors, today=self.TODAY)
+        return errors
+
+    def test_valid_file_passes(self):
+        text = (
+            "# header comment\n"
+            "\n"
+            "# rationale comment\n"
+            f"{self.VALID}\n"
+            "CVE-2026-60002 exp:2027-04-17\n"
+        )
+        self.assertEqual(self.errors(text), [])
+
+    def test_expiring_spelling_is_caught(self):
+        # The exact WI#361 defect shape: parses silently as no expiry.
+        errors = self.errors("CVE-2026-13221 expiring:2027-03-06\n")
+        self.assertTrue(any("must match" in error for error in errors))
+
+    def test_bare_cve_is_caught(self):
+        errors = self.errors("CVE-2025-7458\n")
+        self.assertTrue(any("must match" in error for error in errors))
+
+    def test_extra_field_is_caught(self):
+        errors = self.errors(f"{self.VALID} # trailing note\n")
+        self.assertTrue(any("must match" in error for error in errors))
+
+    def test_impossible_date_is_caught(self):
+        errors = self.errors("CVE-2025-7458 exp:2027-13-40\n")
+        self.assertTrue(any("not a real calendar date" in error for error in errors))
+
+    def test_far_future_expiry_is_caught(self):
+        errors = self.errors("CVE-2025-7458 exp:2027-04-18\n")
+        self.assertTrue(any("more than" in error and "months out" in error for error in errors))
+
+    def test_horizon_edge_passes(self):
+        # Exactly six calendar months out is still allowed.
+        self.assertEqual(self.errors("CVE-2025-7458 exp:2027-04-17\n"), [])
+
+    def test_missing_file_fails_closed(self):
+        errors = self.errors(None)
+        self.assertTrue(any("missing" in error for error in errors))
+
+    def test_real_repo_file_passes(self):
+        errors = []
+        config.validate_trivy_ignore(errors, today=self.TODAY)
+        self.assertEqual(errors, [])
 
 
 if __name__ == "__main__":
