@@ -1,10 +1,10 @@
 # Release Notes for LunarWing v2.1.6.0
 
-**DRAFT — pre-release; content reflects the v2.1.6.0 tree as of 2026-10-16 and may grow before the tag is cut.**
+**DRAFT — pre-release; content reflects the v2.1.6.0 tree as of 2026-10-17 and may grow before the tag is cut.**
 
 ## Codename: Tsuno (角, つの): The Horns
 
-**Release date:** TBD (drafted 2026-10-16)
+**Release date:** TBD (drafted 2026-10-16, revised 2026-10-17)
 
 > Not raised in anger,
 > but set and sure all the same —
@@ -148,10 +148,12 @@ previous compatibility baseline.
   model-chosen secret, or zero its daily budget.
 - **kimi-code 2.2.0.** The kimi worker advances to
   `@moonshot-ai/kimi-code` 2.2.0 with the contract lane verified against
-  the real 2.2.0 binary (host run; the in-image gate runs on the next
-  protected candidate build), plus new environment scrubs
-  (`KIMI_CODE_TRUST_WORKSPACE`, WI#411) and a pinned `max_output_size` for
-  the FrontierCODEK model (WI#412).
+  the real 2.2.0 binary (host run, then verified in-image on a tenant-built
+  worker image; the protected-pipeline candidate gate remains), plus new
+  environment scrubs (`KIMI_CODE_TRUST_WORKSPACE`, WI#411) and a pinned
+  `max_output_size` for the FrontierCODEK model (WI#412 — verified offline
+  and on a live tenant: `max_tokens: 131072` on the wire, a long
+  thinking-model response untruncated).
 
 ## Compatibility
 
@@ -212,9 +214,11 @@ The **kimi** lane ships the worker-side bridge: `lunarwing_tool_proxy.ts`
 socket; task close fails in-flight calls) plus `lunarwing_mcp_server.ts` (a
 thin stdio MCP server registered in `$KIMI_CODE_HOME/mcp.json`), giving the
 agent a native `mcp__lunarwing__*` tool surface. The opencode, opencode2,
-and pebble worker-side bridges remain open, and real-worker acceptance
-evidence waits on the rebuilt kimi image (protected-pipeline/deploy gate) —
-**WI#324 remains open**. Design doc:
+and pebble worker-side bridges remain open. Real kimi jobs now complete
+end-to-end on tenants running images rebuilt from this tree (the item-72
+validation tenant and the WI#412 AC3 run), and the formal AC1/AC2
+tool-proxy round-trip acceptance still rides the protected-pipeline/deploy
+gate — **WI#324 remains open**. Design doc:
 `docs/proposals/EXTERNAL-WORKER-TOOL-PROXY.md`.
 
 ### Cron Missions on External Workers (WI#325)
@@ -339,7 +343,13 @@ pin, and the rustls 0.22.4 pair — ride WI#418, whose standing decision
 record `docs/ops/v2.1.6.0_WI418_LIBSQL_LEGACY_CHAIN.md` (2026-10-16)
 adopts the WI#331 feature gate as the long-term mitigation after
 re-confirming upstream — libsql 0.10.0 went stable 2026-10-13 and still
-pins hyper-rustls ^0.25 — so a bump still clears nothing). After the
+pins hyper-rustls ^0.25 — so a bump still clears nothing). The seven
+legacy-chain acceptances are additionally boxed in by version bans: every
+pre-modern webpki/h2/rustls release except the exact accepted pins is
+denied, hyper-rustls 0.25.0 is permitted only with libsql as its direct
+parent, the satellite sweep checks bans as well as advisories, and the
+default-graph guard also checks the four shipped daemon build paths for
+stray `libsql-remote-replica`/`--all-features` flags. After the
 WI#331 gate, exactly one vulnerability (rsa
 via russh) compiles into default builds; the webpki/h2 chain and the
 accepted rustls 0.22.4 advisories are opt-in only. No unaccounted advisory
@@ -416,9 +426,16 @@ Run-spawning mission verbs share an aggregate per-user rate bucket (60/min,
 refused call spends no tokens. `max_threads_per_day` saturates at
 `u32::MAX` instead of wrapping, and same-secret create dedup reports
 `webhook_secret_applied: false` without becoming a secret-equality oracle.
-WI#359 was closed on 2026-10-14; its remaining residuals (approval
-`display_parameters`, the http `ToolCall` hook payload, predicate depth,
-and the non-agent stop path) ride WI#392.
+WI#359 was closed on 2026-10-14; its remaining residuals ride WI#392,
+whose in-tree follow-up also landed this cycle: the v1 approval/resume
+prompts and failure status now route through the same redaction
+composition (closing the approval `display_parameters` gap), `sid`/`pass`
+match only as whole words or word ends (no more `bypass_cache`/`side`
+collateral), JSON-string tool arguments are redacted, and numbered
+credential keys (`pass1`, `sid2`, …) are covered. The hook/debug-log sites
+stay raw by design (they feed execution), and the non-agent stop path
+stays carried on WI#359; WI#392 remains open pending maintainer
+acceptance.
 
 ### Credential Redaction on HTTP Surfaces (WI#359)
 
@@ -628,13 +645,18 @@ The kimi external worker advances to `@moonshot-ai/kimi-code` **2.2.0**
 (npm `latest` at bump time; the contract lane — stream-json
 print mode, option conflicts, the WI#206 PreToolUse guard table, the WI#324
 MCP handshake — was verified 4/4 against the real 2.2.0 binary in a host
-run; the in-image gate runs on the next protected candidate build). On top of
+run, and the 2.2.0 pin plus both fixes below were then verified in-image on
+a tenant-built worker image; the protected-pipeline candidate gate remains).
+On top of
 the bump, the executor and entrypoint now also scrub
 `KIMI_CODE_TRUST_WORKSPACE` from task environments alongside the existing
 guard variables (WI#411), and the lane config pins `max_output_size =
 131072` on the FrontierCODEK model with a TOML-parsing CI pin, restoring
-the request cap the 2.1.1 line sent (WI#412; verified offline: every
-captured `chat/completions` request carries `max_tokens: 131072`). Both
+the request cap the 2.1.1 line sent (WI#412; verified offline — every
+captured `chat/completions` request carries `max_tokens: 131072` — and then
+on a live tenant running the rebuilt image: `max_tokens: 131072` on the
+wire and a long thinking-model response completed untruncated; WI#412
+itself stays open pending maintainer acceptance). Both
 fixes reach tenants only with a rebuilt/promoted kimi image — see Upgrade
 Notes.
 
@@ -649,6 +671,25 @@ kimi 2.2.0 image stayed in service without the WI#411/WI#412 fixes).
 mt-admin builds are also traceable: every `build-*-worker` stamps
 `org.opencontainers.image.revision` (the checkout HEAD, `-dirty`, or
 `unknown` outside git), as CI builds already did.
+
+### Full-Stack Tenant Validation
+
+The release tree was validated end-to-end on a live multi-tenant OpenRC
+host (item 72, 2026-10-16; report `docs/ops/ITEM72_TEST_TENANT_SOARIN.md`):
+a fresh tenant provisioned with the kimi, opencode2, and pebble workers on
+full fat toolchain images plus the complete WASM channel/tool suite, left
+running for inspection. Verified live there: WI#330 worker URL inheritance
+(`*_SOURCE=inherited` markers), the WI#357 `worker-listeners` audit clean
+on all three workers, the approval-gate pending flow, and the WI#410
+OpenRC safe-unit contract inside the fleet health run. Real jobs ran
+end-to-end through the gateway → agent → bridge → container path on the
+kimi (image built past `766b7c91e`; the 2.2.0 pin, the
+`max_output_size = 131072` pin, and the WI#411 scrub verified in-image) and
+opencode2 lanes, and the pebble lane dispatched/executed/forwarded
+(failing only on its unset operator LLM key). The validation also shipped
+one portability fix: mt-admin now stages `rustup-init` under `$HOME/tmp`
+so tenants on hosts with a noexec `/tmp` no longer silently skip the WASM
+toolchain install.
 
 ### Documentation and Open-Item Audit Passes
 
@@ -799,8 +840,10 @@ are recorded in the audit doc's 2026-10-16 follow-up.
 
 **Worker proxy scope.** Only the kimi lane ships the worker-side tool-proxy
 bridge in this release; opencode/opencode2/pebble workers have no
-`mcp__lunarwing__*` surface yet. Real-worker acceptance evidence for the
-kimi lane rides the protected image pipeline. The tool grant is ambient for
+`mcp__lunarwing__*` surface yet. Real kimi jobs complete end-to-end on
+tenants running images rebuilt from this tree (item 72; the WI#412 AC3
+run); the formal AC1/AC2 tool-proxy round-trip acceptance still rides the
+protected image pipeline. The tool grant is ambient for
 every process in the task (untrusted repo scripts can call the relay), and
 workspace `.mcp.json` files can shadow the `lunarwing` entry — the hub
 stays authoritative on the capability set. `memory_read` grants disclose
@@ -836,9 +879,10 @@ WI#396; the goals-open items WI#375, WI#390, WI#392, WI#402, and WI#408;
 WI#415 (the OpenRC weechat/relay/adapter/darkirc renderers still bake
 caller-PATH `python3`); and the advisory-clearing owners WI#418, WI#367,
 and WI#368. Still open from this cycle's merged work: WI#324
-(opencode/opencode2/pebble worker-side bridges and real-worker acceptance
-evidence), WI#357 (the opencode2 v2.0.26 bump stays gated), and WI#412
-(pending maintainer acceptance). WI#400 tracks real worker credential
+(opencode/opencode2/pebble worker-side bridges and the formal AC1/AC2
+tool-proxy acceptance evidence — real kimi jobs already complete on
+tenant-built images), WI#357 (the opencode2 v2.0.26 bump stays gated), and
+WI#412 (pending maintainer acceptance). WI#400 tracks real worker credential
 isolation beyond the WI#373 hygiene strips. The five test-build field
 reports (WI#366, WI#372, WI#385, WI#398, WI#399) and the WI#359/WI#373
 triage items were closed on 2026-10-14; WI#336, WI#356, WI#376, WI#377,
