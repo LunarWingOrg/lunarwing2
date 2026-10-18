@@ -659,6 +659,28 @@ assert.ok(contextPromptArgs[1].signal instanceof AbortSignal)
   }
 }
 
+// !1746 review KL-1/KL-2: v2.0.32's built-in Code Mode session_move and
+// session_rename carry no permission check of their own
+// (packages/core/src/tool/plugin/opencode.ts). session_rename rewrites any
+// session title — the WI#324 task binding — and session_move re-roots the
+// session so the KG-2 external_directory confinement never fires. Both must
+// be wholly denied so they are dropped from the tool snapshot.
+{
+  const rulesetSdk = makeSdk({})
+  await runTask(rulesetSdk.sdk)
+  const createInput = rulesetSdk.createArgs[0] as [
+    { permissions?: Array<{ action: string; resource: string; effect: string }> },
+  ]
+  const rules = createInput[0].permissions ?? []
+  for (const action of ["opencode_session_move", "opencode_session_rename"]) {
+    const matching = rules.filter((rule) => rule.action === action || rule.action === "*")
+    const last = matching[matching.length - 1]
+    assert.ok(last, `session ruleset must carry a rule for ${action}`)
+    assert.equal(last.resource, "*", `${action} deny must cover every resource`)
+    assert.equal(last.effect, "deny", `${action} must be wholly denied`)
+  }
+}
+
 
 // !1735 review KG-2 / !1699 JE-1: upstream v2.0.32 dropped the v2.0.24
 // `external_directory * ask` build-agent default, so workspace-external
