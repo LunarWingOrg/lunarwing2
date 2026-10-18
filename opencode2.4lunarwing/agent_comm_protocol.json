@@ -53,6 +53,22 @@
           "prompt":  "string — TEXT directive only; validated daemon-side (16 KiB cap, no NUL bytes)",
           "done":    "boolean — true signals 'no more prompts coming, wrap up cleanly'"
         }
+      },
+      "tool_result": {
+        "description": "Agent → Worker: WI#324 reply to a tool_call. Routed by the bridge relay to the in-task plugin call by call_id.",
+        "payload": {
+          "call_id": "string — echoed from tool_call",
+          "status":  "string — success | error | denied",
+          "output":  "string — sanitized tool result (pretty JSON)",
+          "error":   "string | null — sanitized reason for error/denied"
+        }
+      },
+      "tool_catalog": {
+        "description": "Agent → Worker: WI#324 reply to tool_list. Contains exactly the tools this worker may call (allowlist + phase-1 gates applied).",
+        "payload": {
+          "tools": "array of { name, description, parameters (JSON schema) } — empty array on failure",
+          "error": "string — present alongside tools: [] on failure (fail-closed)"
+        }
       }
     },
 
@@ -78,6 +94,21 @@
       "pong": {
         "description": "Worker → Agent: keep-alive reply",
         "payload": {}
+      },
+      "tool_call": {
+        "description": "Worker → Agent: WI#324 proxied tool invocation, emitted by the bridge relay for the in-task plugin. task_id must equal the job this connection serves; frames over 256 KiB are rejected with error.",
+        "payload": {
+          "task_id":   "string — the active job id (required, binding)",
+          "call_id":   "string — worker-chosen correlation id [A-Za-z0-9_-]{1,128}",
+          "name":      "string — allowlisted tool name",
+          "arguments": "object | null — tool arguments"
+        }
+      },
+      "tool_list": {
+        "description": "Worker → Agent: WI#324 request for the callable tool catalog. Payload { task_id } from this worker's relay (task_id optional hub-side, must equal the job id when present). Shares the per-job 100 control-frame budget with tool_call.",
+        "payload": {
+          "task_id": "string — the active job id"
+        }
       },
       "ready": {
         "description": "Worker → Agent: sent once on connect to signal readiness",
