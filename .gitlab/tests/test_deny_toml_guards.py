@@ -269,6 +269,44 @@ class DenyTomlNoGitFallbackTests(unittest.TestCase):
         self.assertEqual(len(errors), 1, errors)
         self.assertIn("git ls-files failed", errors[0])
 
+    def test_citation_through_a_directory_symlink_fails_without_git(self):
+        # git mode lists a directory symlink itself, never the paths beneath
+        # it (e.g. ic/channels-src/darkirc -> ../../darkirc_channel_for_lunarwing/
+        # darkirc), so the fallback must refuse such citations even when the
+        # target resolves inside the checkout (run-161 KN-2). A symlink at
+        # the final component stays accepted because git lists leaf symlinks.
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = pathlib.Path(temporary.name)
+        (root / "ic" / "src").mkdir(parents=True)
+        (root / "ic" / "src" / "main.rs").write_text("", encoding="utf-8")
+        (root / "docs" / "ops").mkdir(parents=True)
+        (root / "docs" / "ops" / "EXISTS.md").write_text("x", encoding="utf-8")
+        (root / "ic" / "realdir").mkdir()
+        (root / "ic" / "realdir" / "file.md").write_text("x", encoding="utf-8")
+        (root / "ic" / "linkdir").symlink_to("realdir", target_is_directory=True)
+        (root / "ic" / "realfile.md").write_text("x", encoding="utf-8")
+        (root / "ic" / "leaf.md").symlink_to("realfile.md")
+        (root / ".gitlab").mkdir()
+        (root / ".gitlab" / "README.md").write_text(
+            DenyTomlAdvisoryGuardTests.README_OK, encoding="utf-8"
+        )
+        deny = (
+            DenyTomlAdvisoryGuardTests.DENY_OK
+            + "# through a directory symlink: ic/linkdir/file.md"
+            + chr(10)
+            + "# leaf symlink: ic/leaf.md"
+            + chr(10)
+            + "# plain file: ic/realfile.md"
+            + chr(10)
+        )
+        (root / "ic" / "deny.toml").write_text(deny, encoding="utf-8")
+        errors: list[str] = []
+        with mock.patch.object(config, "ROOT", root), self.no_git():
+            config.validate_deny_toml_advisories(errors)
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("ic/linkdir/file.md", errors[0])
+
 
 class DenyTomlMainWiringTests(unittest.TestCase):
     """The ci-config lane runs validate_config.py's main(), so the offline

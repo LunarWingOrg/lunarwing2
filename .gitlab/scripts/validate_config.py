@@ -703,12 +703,20 @@ def check_cited_paths(
 ) -> None:
     for path in sorted(extract_repo_paths(text, top_levels)):
         if tracked is None:
-            # git ls-files never lists `..` segments or paths through a
-            # symlink, so neither may the fallback: a citation must stay
-            # inside the checkout to count as present (run-157 KF-1).
+            # git ls-files never lists `..` segments or paths beneath a
+            # directory symlink (it lists the link itself), so neither may
+            # the fallback, and a citation must also stay inside the
+            # checkout to count as present (run-157 KF-1, run-161 KN-2).
+            # A symlink at the final component is fine: git lists leaf
+            # symlinks, so the walk stops before the last part.
             candidate = ROOT / path
+            parts = pathlib.PurePosixPath(path).parts
             present = (
-                ".." not in pathlib.PurePosixPath(path).parts
+                ".." not in parts
+                and not any(
+                    ROOT.joinpath(*parts[:i]).is_symlink()
+                    for i in range(1, len(parts))
+                )
                 and candidate.exists()
                 and candidate.resolve().is_relative_to(ROOT.resolve())
             )
@@ -740,9 +748,11 @@ def validate_deny_toml_advisories(errors: list[str], tracked: set[str] | None = 
     .gitlab/README.md must be a tracked path. The tracked-file truth comes
     from `git ls-files`; in an image without a git binary (the ci-config
     lint image ships none) it falls back to checkout existence, restricted to
-    citations that stay inside the checkout (no `..` segments, no symlink
-    escapes) because git mode can never list those — the same truth in CI
-    because the runner checks out a clean tree.
+    citations git mode could list: no `..` segments, no path components
+    beneath a directory symlink (git lists the link itself, never the paths
+    beneath it — a symlink at the final component is fine because git lists
+    leaf symlinks), and no symlink escapes out of the checkout — the same
+    truth in CI because the runner checks out a clean tree.
     """
     deny_path = ROOT / "ic" / "deny.toml"
     try:
