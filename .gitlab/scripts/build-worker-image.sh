@@ -236,7 +236,7 @@ build_image_with_retry() {
             sleep "$_bwr_delay"
             _bwr_attempt=$((_bwr_attempt + 1))
         else
-            echo "registry push attempt $_bwr_attempt/4 failed (exit $_bwr_status); not retrying" >&2
+            echo "image build attempt $_bwr_attempt/4 failed (exit $_bwr_status); not retrying" >&2
             rm -f "$push_attempt_log" "$push_attempt_rc"
             return "$_bwr_status"
         fi
