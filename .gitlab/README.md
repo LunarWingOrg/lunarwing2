@@ -517,6 +517,11 @@ the prime suspect, and the fix is the same normalization in the offending
   Agents must not reopen a clearing-owner work item that a maintainer closed:
   report the red gate on the MR or the work item and leave re-pointing or
   reopening to the maintainer.
+  Only a maintainer creates or names a clearing owner; agents re-point to an
+  owner the maintainer named — an agent filing a fresh owner to turn the gate
+  green would reproduce the reopen behavior this rule exists against, so the
+  gate is not satisfiable by a new agent-filed work item (MR !1748 run-161
+  KN-1: the maintainer declined the agent-filed umbrella WI#439).
   Both checks carry unit tests under `.gitlab/tests` (stubbed fetch for the
   online half), also registered in the `python-unit` suite.
 <!-- deny-toml-guard-section:end -->
