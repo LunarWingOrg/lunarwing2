@@ -186,7 +186,9 @@ async function settle(ms = 100): Promise<void> {
     // JU-4: the frame pre-check on its own — a request line just UNDER the IPC
     // line cap whose serialized tool_call frame crosses the hub budget once the
     // envelope adds id/type/timestamp/task_id. Without the relay-side frame
-    // check this reaches the hub, which rejects the frame and fails the job.
+    // check this reaches the hub, which answers with a tool_result carrying
+    // call_id "" (ic/src/orchestrator/external_worker.rs) that the relay cannot
+    // route, so the caller waits out the relay timeout instead of failing fast.
     const nearCap = { op: "call", call_id: "c3", name: "memory_write", arguments: { content: "" } }
     const baseLine = Buffer.byteLength(JSON.stringify(nearCap))
     nearCap.arguments.content = "x".repeat(TOOL_CALL_FRAME_CAP_BYTES - 64 - baseLine)
@@ -210,9 +212,10 @@ async function settle(ms = 100): Promise<void> {
     assert.equal(notJson.ok, false)
     assert.equal(hub.sent.length, 0)
   } finally {
-    // KE-1 (MR !1733 run-156): on a failure path the socket must still close —
-    // an open task-3 server keeps the process alive and collaterally fails the
-    // later EF-2 blocks under a relay regression.
+    // KE-1 (MR !1733 run-156): keep the socket close on the failure path too.
+    // These suites are plain bun scripts, so the process ends at the first
+    // failed assertion either way — the finally is hygiene (no open server
+    // left behind on a passing or failing run), matching the other lanes.
     handle.close()
   }
 }
@@ -328,6 +331,15 @@ async function settle(ms = 100): Promise<void> {
     const response = await responsePromise
     assert.equal(response.ok, true)
     assert.match(String(response.error), /hub connection closed/)
+    // KL-5: the pending map is freed — a late frame for the dropped call id is
+    // unroutable, not matched against a lingering waiter entry.
+    assert.equal(
+      relay.handleHubFrame(
+        hub,
+        createEnvelope("tool_result", { call_id: "call-drop", status: "success", output: "late" }),
+      ),
+      false,
+    )
     // A second drop is a no-op — the entry is gone, not lingering empty.
     relay.dropHubSocket(hub)
   } finally {

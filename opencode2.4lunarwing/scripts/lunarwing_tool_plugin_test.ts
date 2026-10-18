@@ -48,6 +48,8 @@ function stubClient(
     session: {
       get: async (input: { sessionID: string }) => {
         state.calls++
+        // KL-4: a runaway parent walk must fail fast, not spin forever.
+        if (state.calls > 64) throw new Error("runaway parent walk")
         const title = titles[input.sessionID]
         if (title === undefined) throw new Error("404: session not found")
         return { title, parentID: parents[input.sessionID] }
@@ -169,6 +171,8 @@ const relay = new ToolProxyRelay()
     const frame = hub.lastFrame()
     assert.equal(frame.type, "tool_call")
     assert.equal(frame.payload.task_id, "job-setup")
+    assert.equal(frame.payload.name, "memory_read")
+    assert.deepEqual(frame.payload.arguments, { path: "notes/x.md" })
     relay.handleHubFrame(
       hub,
       createEnvelope("tool_result", {
@@ -240,6 +244,37 @@ const relay = new ToolProxyRelay()
         status: "denied",
         output: "",
         error: "tool 'memory_write' is not in this worker's tool_allowlist",
+      }),
+    )
+    await pending
+  } finally {
+    handle.close()
+  }
+}
+
+// ── a non-denied hub error is a tool error too, never a silent success (KL-3) ─
+{
+  const hub = new FakeHubSocket()
+  const handle = await relay.startTask("job-error", hub)
+  assert.ok(handle)
+  try {
+    const client = stubClient({ "ses_err": "lunarwing-opencode2-job-error" })
+    const tools = createProxyTools(client)
+    const context: ProxyToolContext = { sessionID: "ses_err" }
+
+    const pending = assert.rejects(
+      tools.lunarwing_knowledge_search!.execute({ query: "x" }, context),
+      /knowledge store unavailable/,
+    )
+    await settle()
+    const callId = hub.lastFrame().payload.call_id as string
+    relay.handleHubFrame(
+      hub,
+      createEnvelope("tool_result", {
+        call_id: callId,
+        status: "error",
+        output: "",
+        error: "knowledge store unavailable",
       }),
     )
     await pending
@@ -322,6 +357,8 @@ const relay = new ToolProxyRelay()
   const cycleTitle = { a: "lunarwing-opencode2-job-cycle", b: "no-title" }
   const cycle = stubClient(cycleTitle, { a: "b", b: "a" })
   assert.equal(await resolveTaskId(cycle, new Map(), "a"), null)
+  // KL-4: the walk is hop-bounded — MAX_PARENT_HOPS (8) plus the first lookup.
+  assert.ok(cycle.calls <= 9, `the parent walk is hop-bounded (${cycle.calls} lookups)`)
 }
 
 // ── a task whose relay never started fails the call, never hangs ─────────────
