@@ -2909,6 +2909,12 @@ class TrivyGateInputTests(unittest.TestCase):
         )
         self.assertEqual(self.errors(merged), [])
 
+    def test_main_runs_the_gate_input_validator(self):
+        # GV-2 precedent: deleting the main() call must not pass the suite.
+        with mock.patch.object(config, "validate_trivy_gate_inputs") as gate_check:
+            self.assertEqual(config.main(), 0)
+        gate_check.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
