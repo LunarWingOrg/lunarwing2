@@ -811,7 +811,24 @@ also binds the list to the executor itself — it extracts the real
 unlisted swallowed call passed both gates; `mockMethodPaths` flattens at any
 nesting depth; and the build gate additionally asserts every bridge event
 name is still a literal in the pinned `@opencode` client/schema/protocol
-source shipped in the image.)
+source shipped in the image. 2026-10-17, WI#369
+(DF-1/DF-2/DF-4 + CY-2/CY-3 residues): the event gate now asserts each
+bridge event name is a member literal of the pinned generated `V2Event`
+union (`EventSubscribeOutput = V2Event`, what `event.subscribe` actually
+yields) instead of a corpus-wide substring — a literal surviving only in
+the v1 compat schema no longer counts; the source extractors run on
+comment/string-blanked text (prose can no longer cause misleading
+mismatches), bind optional-call/non-null/cast receivers and the Yoda event
+form, and scan every non-test `scripts/*.ts`; the self-test additionally
+wraps the mock in a recording Proxy so every client leaf path the suite
+actually touches (alias, cast, bracket, destructure, optional-call no-op,
+helper parameter of any name) must be declared in the list; the mock now
+also emits `session.idle` and `session.execution.interrupted`; committed
+negative tests pin the recursive mock flatten and fail if either build-gate
+assertion loop is removed; and the builder stage runs `tsgo --noEmit` over
+the SDK-facing scripts against the pinned generated types
+(`scripts/tsconfig.sdk-surface.json`), covering call argument and event
+payload shapes (the old CY-2 residue).)
 
 Verified host-side with bun: the executor self-test passes against the real
 client shape and fails with the pre-fix executor; the build-time assertion

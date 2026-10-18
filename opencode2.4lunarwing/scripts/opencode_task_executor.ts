@@ -18,7 +18,7 @@
  *  - Cancellation calls session.interrupt (v1 used session.abort).
  */
 
-import { OpenCode, type OpenCodeClient } from "@opencode/client/promise"
+import { OpenCode, type OpenCodeClient, type OpenCodeEvent } from "@opencode/client/promise"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
@@ -142,19 +142,39 @@ function sessionPermissions(): Array<{ action: string; resource: string; effect:
   ]
 }
 
-interface V2EventLike {
-  type: string
-  data?: Record<string, unknown>
-}
+// The pinned generated V2Event union (EventSubscribeOutput) re-exported by
+// the promise client as OpenCodeEvent. Typing the event stream with it lets
+// the builder-stage tsgo gate reject an event.type comparison against a
+// non-member literal in any syntax (===, ==, switch case) and a payload
+// field the pinned schema no longer declares (WI#369 JR-1). The reads below
+// stay defensive at runtime (optional chaining, typeof checks): the mock in
+// the self-test and the real server share these types, but the transport is
+// SSE JSON — a malformed payload must degrade, not throw.
+type V2EventLike = OpenCodeEvent
+type SettledEvent = Extract<
+  V2EventLike,
+  {
+    type:
+      | "session.execution.succeeded"
+      | "session.execution.failed"
+      | "session.execution.interrupted"
+      | "session.idle"
+  }
+>
+type FailureEvent = Extract<V2EventLike, { type: "session.execution.failed" | "session.tool.failed" }>
+type BridgeEvent =
+  | SettledEvent
+  | Extract<
+      V2EventLike,
+      { type: "permission.asked" | "session.text.delta" | "session.tool.success" | "session.tool.failed" }
+    >
 
-function eventSessionID(event: V2EventLike): string | undefined {
-  const data = event.data
-  if (!data || typeof data !== "object") return undefined
-  const value = (data as { sessionID?: unknown }).sessionID
+function eventSessionID(event: BridgeEvent): string | undefined {
+  const value: unknown = event.data?.sessionID
   return typeof value === "string" ? value : undefined
 }
 
-function isPromptSettled(event: V2EventLike): boolean {
+function isPromptSettled(event: V2EventLike): event is SettledEvent {
   return (
     event.type === "session.execution.succeeded" ||
     event.type === "session.execution.failed" ||
@@ -163,8 +183,8 @@ function isPromptSettled(event: V2EventLike): boolean {
   )
 }
 
-function eventErrorMessage(event: V2EventLike): string {
-  const error = (event.data as { error?: unknown } | undefined)?.error
+function eventErrorMessage(event: FailureEvent): string {
+  const error: unknown = event.data?.error
   return error ? opencodeErrorMessage(error) : ""
 }
 
@@ -325,13 +345,13 @@ export async function executeTask(
         }
         if (next.kind === "prompt_error") break
         if (next.result.done) break
-        const event = next.result.value as V2EventLike
+        const event: V2EventLike = next.result.value
 
         if (event.type === "permission.asked") {
           if (eventSessionID(event) !== sessionID) continue
           // Reject anything not granted by the session allow-policy above.
           deniedPermissions++
-          const requestID = (event.data as { id?: unknown } | undefined)?.id
+          const requestID: unknown = event.data?.id
           if (typeof requestID === "string") {
             await waitForStop(
               sdk.permission.reply(
@@ -349,7 +369,7 @@ export async function executeTask(
 
         if (event.type === "session.text.delta") {
           if (eventSessionID(event) !== sessionID) continue
-          const delta = (event.data as { delta?: unknown } | undefined)?.delta
+          const delta: unknown = event.data?.delta
           if (typeof delta === "string" && delta) {
             output += delta
             emitProgress(delta)
@@ -359,7 +379,7 @@ export async function executeTask(
 
         if (event.type === "session.tool.success" || event.type === "session.tool.failed") {
           if (eventSessionID(event) !== sessionID) continue
-          const toolID = (event.data as { id?: unknown } | undefined)?.id
+          const toolID: unknown = event.data?.id
           const toolName =
             typeof toolID === "string" && toolID.includes("/") ? toolID.split("/").pop() : toolID
           if (event.type === "session.tool.failed") {
