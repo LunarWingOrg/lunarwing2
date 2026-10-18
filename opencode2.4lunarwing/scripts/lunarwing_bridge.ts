@@ -398,7 +398,7 @@ async function startClient(): Promise<void> {
 // only start when this file is the entrypoint, so importing it in a test does
 // not bind a port.
 
-export { handleCancel, handleHubSocketClosed, handleMessage, handleTaskRequest, sendReady, activeTasks, toolProxyRelay }
+export { handleCancel, handleMessage, handleTaskRequest, sendReady, activeTasks, toolProxyRelay }
 
 // Bun's import.meta.main has no shared type; the cast keeps type checkers
 // clean without pulling in Bun types.
