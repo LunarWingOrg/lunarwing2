@@ -154,9 +154,10 @@ previous compatibility baseline.
 - **kimi-code 2.2.0.** The kimi worker advances to
   `@moonshot-ai/kimi-code` 2.2.0 with the contract lane verified against
   the real 2.2.0 binary (host run; the in-image gate runs on the next
-  protected candidate build), plus new environment scrubs
-  (`KIMI_CODE_TRUST_WORKSPACE`, WI#411) and a pinned `max_output_size` for
-  the FrontierCODEK model (WI#412).
+  protected candidate build — on a rebuilt image the wire now carries
+  `max_tokens: 131072`, verified end to end on a live tenant), plus new
+  environment scrubs (`KIMI_CODE_TRUST_WORKSPACE`, WI#411) and a pinned
+  `max_output_size` for the FrontierCODEK model (WI#412).
 
 ## Compatibility
 
@@ -229,9 +230,12 @@ a serve-process plugin registered in `config/opencode.json` that statically
 exposes the phase-1 tools and resolves the calling session's task id from
 its `lunarwing-opencode-<task_id>` title), running in the new
 `worker-opencode-ts` CI lane and the image-build gate. The opencode2 and
-pebble worker-side bridges remain open, and real-worker acceptance
-evidence waits on the rebuilt kimi image (protected-pipeline/deploy gate) —
-**WI#324 remains open**. Design doc:
+pebble worker-side bridges remain open. Real-job evidence on images built
+from this tree exists for the kimi lane (a full gateway → approval →
+dispatch → completion run on a test tenant); the opencode lane's plugin
+ships only with its rebuilt image and its lane remains frozen at v1.18.25
+pending the WI#333 bump-or-retire decision, so its real-job evidence is
+still deploy-gated — **WI#324 remains open**. Design doc:
 `docs/proposals/EXTERNAL-WORKER-TOOL-PROXY.md`.
 
 ### Cron Missions on External Workers (WI#325)
@@ -241,7 +245,8 @@ schedule drives ticks, each tick runs as a real job with inline
 `job_events`, and a lapse triggers cancel → terminal-wait → backoff
 re-entry. Heartbeat watchdog, persisted pause state and tick counter
 (surviving daemon restarts), and a circuit breaker round out the loop; the
-breaker count itself is not durable (WI#371).
+breaker count is now durable too (WI#371 — see the durability section
+below).
 
 The `cron_mission` LLM tool and owner-authenticated `GET/POST
 /api/workers/{worker}/cron` routes manage missions; the tool is on the
@@ -807,8 +812,10 @@ the bump, the executor and entrypoint now also scrub
 `KIMI_CODE_TRUST_WORKSPACE` from task environments alongside the existing
 guard variables (WI#411), and the lane config pins `max_output_size =
 131072` on the FrontierCODEK model with a TOML-parsing CI pin, restoring
-the request cap the 2.1.1 line sent (WI#412; verified offline: every
-captured `chat/completions` request carries `max_tokens: 131072`). Both
+the request cap the 2.1.1 line sent (WI#412; verified on the wire against
+a rebuilt image on a live tenant — every captured `chat/completions`
+request carries `max_tokens: 131072`, streaming a complete untruncated
+answer). Both
 fixes reach tenants only with a rebuilt/promoted kimi image — see Upgrade
 Notes.
 
@@ -991,9 +998,12 @@ are recorded in the audit doc's 2026-10-16 follow-up.
 **Worker proxy scope.** The kimi and opencode lanes ship the worker-side
 tool-proxy bridge in this release (an MCP shim for kimi, a serve-process
 plugin for opencode); opencode2/pebble workers have no
-`mcp__lunarwing__*`-equivalent surface yet. Real-worker acceptance evidence
-for the kimi lane rides the protected image pipeline (the opencode plugin
-likewise ships only with its rebuilt image). The tool grant is ambient for
+`mcp__lunarwing__*`-equivalent surface yet. Real-job evidence for the kimi
+lane exists on a test tenant with an image built from this
+tree; production acceptance still rides the protected image pipeline, and
+the opencode plugin ships only with its rebuilt image (its lane stays
+frozen at v1.18.25 pending the WI#333 decision). The tool
+grant is ambient for
 every process in the task (untrusted repo scripts can call the relay), and
 workspace `.mcp.json` files can shadow the `lunarwing` entry — the hub
 stays authoritative on the capability set. `memory_read` grants disclose
@@ -1027,22 +1037,26 @@ Security Re-Audit).
 **Known issues / open at release.** Reconciled per item in
 `docs/ops/v2.1.6.0_OPEN_WORK_ITEMS_STATUS.md`, a 2026-10-14 01:05Z snapshot
 (work items filed after it — WI#402 through WI#415 — postdate the audit):
-WI#397 (`high` — sb&kumo findings); the goals-open items WI#375, WI#390,
-and WI#392; and the advisory-clearing owners WI#418, WI#367,
+WI#397 (`high` — sb&kumo findings); the goals-open items WI#375
+(cron-mission harness items), WI#390 and WI#392 (both implemented
+in-tree; see mt-admin Tenant-Ownership Hardening and the WI#359 sections);
+and the advisory-clearing owners WI#418, WI#367,
 and WI#368. Landed since the snapshot: WI#396 (differing-grant cron
 entries sharing one container are now detected and stripped at load),
 WI#402 (no silent unreachable defaults in single-node bring-up — required
 knobs die with guidance), WI#408 (channel WASM host credential redaction
 at the trait boundary), and WI#415 (the OpenRC weechat/relay/adapter/
 darkirc renderers bake the canonical PATH-independent python3); all four
-stay open for maintainer acceptance, as does WI#416 (three of its six
+stay open for maintainer acceptance, as do WI#416 (three of its six
 root-ownership sites addressed: `configure_weechat_relay`'s trailing
-`chown -R`, the relay start lock, and the SSH key staging). Still open
+`chown -R`, the relay start lock, and the SSH key staging) and the
+sandbox-proxy residuals WI#429/WI#430. Still open
 from this cycle's merged work: WI#324
 (opencode2/pebble worker-side bridges and real-worker acceptance
 evidence), WI#357 (the opencode2 v2.0.32 bump rides its guards; the
 deferred egress allowlist stays WI#424), and WI#412
-(pending maintainer acceptance). WI#400 tracks real worker credential
+(AC3 wire evidence captured on a rebuilt image; pending maintainer
+acceptance). WI#400 tracks real worker credential
 isolation beyond the WI#373 hygiene strips. The five test-build field
 reports (WI#366, WI#372, WI#385, WI#398, WI#399) and the WI#359/WI#373
 triage items were closed on 2026-10-14; WI#336, WI#356, WI#376, WI#377,
