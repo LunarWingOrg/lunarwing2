@@ -497,8 +497,10 @@ the prime suspect, and the fix is the same normalization in the offending
   `ic/deny.toml` and by this marker-delimited section
   (`deny-toml-guard-section:begin`/`end`) to be tracked (`git ls-files`; in
   the git-less ci-config image, present inside the checkout — citations with
-  `..` segments or symlink escapes are refused there too, matching what git
-  mode can list) — bare
+  `..` segments, symlink escapes, or a directory-symlink component are
+  refused there too, matching what git mode can list (git lists the link
+  itself, never the paths beneath it; a leaf-symlink citation stays
+  accepted)) — bare
   filenames without a repo-relative path and `file:line` anchors are the
   documented out-of-scope limits. The cargo-deny job's final script step,
   `python3 .gitlab/scripts/check_deny_toml_owners.py`, resolves each distinct
