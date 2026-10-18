@@ -43,6 +43,18 @@ RUN printf '%s' "${OPENCODE_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
 WORKDIR /build/opencode
 RUN bun install --frozen-lockfile && bun pm cache rm
 
+# WI#369 compile-time SDK gate: typecheck the bridge's SDK-facing scripts
+# against THIS build's pinned generated @opencode/client types — call
+# argument and event payload shapes (the CY-2 residue the runtime-stage
+# sdk_surface_assert.ts existence/membership gate cannot see). A pinned-SDK
+# argument or payload rename now fails the image build here instead of at
+# runtime. tsgo ships in the monorepo's pinned devDependencies
+# (@typescript/native-preview, see bun.lock) so no new fetch is introduced;
+# --noEmit writes nothing into the layer.
+COPY scripts/ /build/lunarwing/scripts/
+RUN /build/opencode/node_modules/.bin/tsgo --noEmit \
+      -p /build/lunarwing/scripts/tsconfig.sdk-surface.json
+
 WORKDIR /build/opencode/packages/client
 # The bridge imports @opencode/client (promise API) from THIS build's output.
 # Do not hide its errors; the runtime-stage import assertion below turns a
@@ -294,13 +306,20 @@ RUN install -D -m 0755 /app/scripts/opencode-exposure-guard.sh /usr/local/bin/op
 # the worker depends on. scripts/sdk_surface_assert.ts constructs a client
 # (pure construction — no server contact) and asserts typeof for every method
 # path the bridge calls, plus asserts every event name the bridge matches on
-# is still a literal in the pinned @opencode source shipped above — both
-# driven by the one committed list in scripts/sdk_surface.ts that the
-# executor self-test also binds to the executor's real call sites and event
-# literals (WI#329) — so upstream SDK drift like WI#320 F7
+# is still a member literal of the pinned generated V2Event union shipped
+# above (EventSubscribeOutput = V2Event is what event.subscribe yields; a
+# literal surviving only in the v1 compat schema no longer counts — WI#369
+# DF-2). Both checks are driven by the one committed list in
+# scripts/sdk_surface.ts, which the executor self-test binds three ways: to
+# the injected mock, to the call sites / event literals extracted from every
+# non-test scripts/*.ts source, and — behaviourally, via a recording Proxy
+# over the mock — to every client leaf path the suite actually touches
+# (WI#329, WI#369 DF-1). Upstream SDK drift like WI#320 F7
 # (session.message.list / session.permission.reply do not exist; both are
-# top-level groups) or an event rename fails the image build instead of
-# dying at runtime (WI#303).
+# top-level groups) or an event rename in the v2 union fails the image build
+# instead of dying at runtime (WI#303). Call argument and event payload
+# shapes are covered separately at the builder stage by the tsgo --noEmit
+# gate (WI#369, see tsconfig.sdk-surface.json).
 #
 # Build-time self-tests run under a throwaway HOME rooted in the trap-cleaned
 # TMPDIR: OpenCode 2 appends a timestamped, randomly-IDed line to
@@ -341,6 +360,8 @@ RUN set -eu; \
     && bun scripts/path_expand_test.ts \
     && bun scripts/opencode_result_test.ts \
     && bun scripts/opencode_task_executor_test.ts \
+    && bun scripts/sdk_surface_test.ts \
+    && bun scripts/sdk_surface_assert_test.ts \
     && python3 scripts/prepare_reproducible_build_test.py \
     && python3 scripts/study_notes_config_test.py \
     && python3 scripts/exposure_policy_assert_test.py \
