@@ -63,6 +63,13 @@
  *   config lives in the model-writable $WORKSPACE_ROOT/.opencode/opencode2.json
  *   next to the auto-discovered .opencode/plugin(s) directories); the hub
  *   stays authoritative either way.
+ * - v2.0.32's built-in Code Mode session_rename could rewrite the bound
+ *   title directly (KL-1: a descriptive self-rename loses the task's tools;
+ *   renaming to another task's title rebinds onto that task's hub connection
+ *   and grant set), and session_move re-roots the session past the
+ *   external_directory confinement (KL-2). The lane's session ruleset
+ *   wholly denies both (opencode_task_executor.ts sessionPermissions), so
+ *   they never reach the model's tool snapshot.
  */
 
 import { connect, type Socket } from "node:net"

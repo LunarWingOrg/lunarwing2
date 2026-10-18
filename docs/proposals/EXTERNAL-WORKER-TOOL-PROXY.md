@@ -503,7 +503,17 @@ plugin, but on v2's rewritten plugin API — the v1 file-plugin shape
   relays the call over that task's proxy socket. First-title-wins caching,
   the hop-bounded `parentID` walk to the root session (belt-and-suspenders —
   this lane denies the `subagent` permission), and the JU-5 "not an isolation
-  boundary" semantics all match the opencode lane.
+  boundary" semantics all match the opencode lane. v2.0.32 additionally ships
+  built-in Code Mode `session_move`/`session_rename` tools with no
+  permission check of their own (`packages/core/src/tool/plugin/opencode.ts`):
+  `session_rename` could rewrite the bound title directly (a descriptive
+  self-rename loses the task's tools; renaming to another task's title
+  rebinds onto that task's hub connection, grant set and call budget —
+  KL-1), and `session_move` re-roots the session so the lane's
+  `external_directory * ask` confinement never fires (KL-2). The executor's
+  session ruleset wholly denies both (`opencode_session_move` /
+  `opencode_session_rename` on resource `*`), so they are dropped from the
+  model's tool snapshot.
 - Tool `input` schemas are plain JSON Schema (an accepted `Tool.ValueSchema`
   form): the core runtime type-checks declared properties and enforces
   `required`, while undeclared properties pass through preserved (verified
