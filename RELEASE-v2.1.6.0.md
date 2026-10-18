@@ -1,10 +1,10 @@
 # Release Notes for LunarWing v2.1.6.0
 
-**DRAFT — pre-release; content reflects the v2.1.6.0 tree as of 2026-10-16 and may grow before the tag is cut.**
+**DRAFT — pre-release; content reflects the v2.1.6.0 tree as of 2026-10-18 and may grow before the tag is cut.**
 
 ## Codename: Tsuno (角, つの): The Horns
 
-**Release date:** TBD (drafted 2026-10-16)
+**Release date:** TBD (drafted 2026-10-16; refreshed 2026-10-18)
 
 > Not raised in anger,
 > but set and sure all the same —
@@ -66,7 +66,8 @@ previous compatibility baseline.
   boundary denies proxied writes to identity, config, memory-bootstrap,
   daily-log, and `engine/**` files. The kimi worker lane ships the first
   worker-side bridge: an in-image MCP shim gives the agent a native
-  `mcp__lunarwing__*` surface (opencode/opencode2/pebble lanes pending).
+  `mcp__lunarwing__*` surface; the opencode lane ships a serve-process
+  plugin over the same relay (opencode2/pebble lanes pending).
 - **Cron missions on external workers (WI#325).** A mission supervisor owns
   the tick chain: heartbeat watchdog, lapse → cancel → terminal-wait →
   backoff re-entry, persisted pause/tick counters, inline `job_events`, and
@@ -77,10 +78,13 @@ previous compatibility baseline.
   classification on both host and bridge sides.
 - **One container, one authority domain.** A cron worker's worker-level
   `tool_allowlist` is stripped at load — a tick can no longer borrow an
-  interactive job's grant through a same-uid relay socket — and any non-cron
-  entry sharing a cron entry's endpoint (compared by normalized host:port)
-  is stripped too. Operator guidance: give each cron mission its own
-  container.
+  interactive job's grant through a same-uid relay socket — any non-cron
+  entry sharing a cron entry's endpoint (compared by normalized
+  host:port) is stripped too, and two cron entries sharing one container
+  with *differing* `cron.tool_allowlist` grants are now detected at load
+  and fail closed: every cron grant on that shared listener is stripped
+  with an `error!` (identical grants stay, with a warn). Operator
+  guidance: give each cron mission its own container.
 - **Mission webhook hardening (WI#352, WI#359).** A legacy mission stored
   with an empty webhook secret can never authenticate a fire; create/update
   reject unpresentable secrets; the single-owner webhook-path rule is
@@ -205,14 +209,26 @@ The same strip applies to any non-cron entry sharing a cron entry's
 endpoint, compared by normalized container key (lowercased host, loopback
 spellings folded, scheme-default ports applied, path/query ignored — one
 host:port that path-routes several containers strips all of them, failing
-closed).
+closed). Two *cron* entries sharing one container with differing
+`cron.tool_allowlist` grants are detected by the same normalized listener
+key and fail closed (WI#396): every cron grant on the shared listener is
+stripped, because one container is one authority domain — a tick of one
+mission could otherwise borrow another mission's grants through that
+mission's relay socket, concurrent or later (a leftover process can wait
+for the next task's socket). Identical grants on a shared listener stay,
+with a warning.
 
 The **kimi** lane ships the worker-side bridge: `lunarwing_tool_proxy.ts`
 (a per-task relay; replies routed by call_id scoped to the owning hub
 socket; task close fails in-flight calls) plus `lunarwing_mcp_server.ts` (a
 thin stdio MCP server registered in `$KIMI_CODE_HOME/mcp.json`), giving the
-agent a native `mcp__lunarwing__*` tool surface. The opencode, opencode2,
-and pebble worker-side bridges remain open, and real-worker acceptance
+agent a native `mcp__lunarwing__*` tool surface. The **opencode** lane now
+ships its worker-side bridge too (the same relay ported to the v1 SDK, plus
+a serve-process plugin registered in `config/opencode.json` that statically
+exposes the phase-1 tools and resolves the calling session's task id from
+its `lunarwing-opencode-<task_id>` title), running in the new
+`worker-opencode-ts` CI lane and the image-build gate. The opencode2 and
+pebble worker-side bridges remain open, and real-worker acceptance
 evidence waits on the rebuilt kimi image (protected-pipeline/deploy gate) —
 **WI#324 remains open**. Design doc:
 `docs/proposals/EXTERNAL-WORKER-TOOL-PROXY.md`.
@@ -242,10 +258,33 @@ non-owners get one uniform `CronMissionNotOwned`. Tick links have a
 host-imposed four-hour maximum matching Kimi's default cap.
 
 **WI#325 is closed**; audio capture was scoped out at close-out. Residuals
-ride WI#370 (retention/list visibility, event-outcome FK coverage), WI#371
-(read-failure pause safety, durable breaker count), WI#375 (remaining
-harness items), and the cross-cron shared-container borrow WI#396. Design
+ride WI#370 (retention/list visibility, event-outcome FK coverage), WI#375
+(remaining harness items), and WI#396 (the cross-cron shared-container
+pairing — now detected and failed closed; see the One Container, One
+Authority Domain sections). The WI#371 residual (read-failure pause
+safety, durable breaker count) is implemented in this cycle; see Cron
+Mission Control Durability below. Design
 doc: `docs/proposals/EXTERNAL-WORKER-CRON-MODE.md`.
+
+### Cron Mission Control Durability (WI#371)
+
+Mission control state is now honest across faults. A control-state read
+or parse failure (or a failed legacy pause-key read) starts the mission
+**paused** with an actionable `durability_error` naming the fault and the
+remedy — never a silently-resumed mission over unreadable state; the
+legacy `cron-mission:<id>:paused` key remains a read-only fallback so
+pre-WI#371 pauses stay paused. The pause flag and the
+`consecutive_abandoned` breaker counter share one atomic settings row
+(`cron-mission:<id>:control`, single write as the atomic unit), so the
+counter persists on every abandon and the trip lands pause+count in one
+write; the legacy key is never rewritten. Control writes retry with
+bounded exponential backoff, and exhaustion never claims success:
+`durability_error` surfaces through the HTTP route (`"durable": false`)
+and the `cron_mission` tool, and `cron_paused`/`cron_resumed` audit rows
+carry a `durable` flag. A backend-agnostic fault-injection test decorator
+pins absent/malformed/failed-read distinction, retry-then-success,
+exhaustion, and the restart-surviving breaker chain. WI#371 stays open
+for maintainer acceptance; the in-tree work is complete.
 
 ### Harness Event Redaction Hardening (WI#326)
 
@@ -331,9 +370,10 @@ graph free of the legacy chain at both build roots.
 
 The v2.1.6.0 audit (`docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md`) is a
 risk-acceptance record, not a clean bill: **eight vulnerability advisories,
-one unsound notice, and two unmaintained notices** (eleven IDs) ship
-accepted via `ic/deny.toml`, each with recorded exposure and a clearing
-owner (rsa rides WI#368; `failure`/`rental` ride WI#367; the seven libsql
+two unsound notices (`failure`, `atty`), and two unmaintained notices**
+(twelve IDs) ship accepted via `ic/deny.toml`, each with recorded exposure
+and a clearing owner (rsa rides WI#368; `failure`/`rental`/`atty` ride
+WI#367; the seven libsql
 0.6.0 legacy-chain acceptances — four rustls-webpki 0.102, the h2 0.3.27
 pin, and the rustls 0.22.4 pair — ride WI#418, whose standing decision
 record `docs/ops/v2.1.6.0_WI418_LIBSQL_LEGACY_CHAIN.md` (2026-10-16)
@@ -344,6 +384,17 @@ WI#331 gate, exactly one vulnerability (rsa
 via russh) compiles into default builds; the webpki/h2 chain and the
 accepted rustls 0.22.4 advisories are opt-in only. No unaccounted advisory
 exists in any committed lockfile.
+
+Late in the cycle the `unsound` advisory scope was widened to `"all"`
+(WI#360): cargo-deny's default workspace scope never surfaced transitive
+unsound advisories, so `atty` 0.2.14 (RUSTSEC-2021-0145, Windows-only
+unaligned read, no patched release) was invisible to every gate. It is now
+accepted with a recorded exposure (dev-graph only, via the vendored
+libsignal-protocol's `env_logger` 0.6.2 dev-dep; never a production edge)
+and `[bans]` restrictions limiting the acceptance to that exact graph
+position (`atty` only under `env_logger`, `env_logger <0.10.0` only under
+the vendored `libsignal-protocol`); a lockfile-only guard fails if `atty`
+ever resolves into a non-dev build graph. Clearing rides WI#367.
 
 Two security upgrades landed late in the cycle on top of the semver sweep:
 
@@ -360,8 +411,9 @@ Two security upgrades landed late in the cycle on top of the semver sweep:
   Rebuild **and restart** the daemon and XMPP bridge to deploy it.
 
 Verification for both is recorded in `docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md`
-(October 14 update, pipeline 5710 addendum, and the October 16 zip-yank
-follow-up described under Dependency Sweep below).
+(October 14 update, pipeline 5710 addendum, the October 16 zip-yank
+follow-up described under Dependency Sweep below, and the October 17
+`unsound = "all"` widening follow-up described above).
 
 ### Pending-Gate Lifecycle (WI#332)
 
@@ -803,10 +855,12 @@ are recorded in the audit doc's 2026-10-16 follow-up.
 
 ### Security, Deployment, and Release Limitations
 
-**Worker proxy scope.** Only the kimi lane ships the worker-side tool-proxy
-bridge in this release; opencode/opencode2/pebble workers have no
-`mcp__lunarwing__*` surface yet. Real-worker acceptance evidence for the
-kimi lane rides the protected image pipeline. The tool grant is ambient for
+**Worker proxy scope.** The kimi and opencode lanes ship the worker-side
+tool-proxy bridge in this release (an MCP shim for kimi, a serve-process
+plugin for opencode); opencode2/pebble workers have no
+`mcp__lunarwing__*`-equivalent surface yet. Real-worker acceptance evidence
+for the kimi lane rides the protected image pipeline (the opencode plugin
+likewise ships only with its rebuilt image). The tool grant is ambient for
 every process in the task (untrusted repo scripts can call the relay), and
 workspace `.mcp.json` files can shadow the `lunarwing` entry — the hub
 stays authoritative on the capability set. `memory_read` grants disclose
@@ -822,8 +876,8 @@ crashes inside `opencode serve` before any model call (WI#333); the new
 log enrichment surfaces its crash lines in job records, but the lane
 decision (bump or retire, planned for v2.1.7.0) is unchanged.
 
-**Accepted advisories.** Eight vulnerability advisories, one unsound
-notice, and two unmaintained notices (eleven IDs) ship accepted — see
+**Accepted advisories.** Eight vulnerability advisories, two unsound
+notices, and two unmaintained notices (twelve IDs) ship accepted — see
 `docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md`. Only rsa (via russh) compiles into
 default builds (clearing tracked as WI#368); the rustls-webpki 0.102 /
 h2 0.3 chain and the accepted rustls 0.22.4 pair (RUSTSEC-2026-0346/0349)
@@ -832,24 +886,37 @@ owned by WI#418 — the WI#331 mitigation decision and the WI#409 acceptance
 record are both closed without the chain being cleared, so the open WI#418
 standing decision record (`docs/ops/v2.1.6.0_WI418_LIBSQL_LEGACY_CHAIN.md`,
 2026-10-16) re-homes the seven acceptances, adopts the feature gate as the
-long-term mitigation, and owns their per-release re-verification.
+long-term mitigation, and owns their per-release re-verification. The
+twelfth acceptance — `atty` (RUSTSEC-2021-0145), surfaced by the WI#360
+`unsound = "all"` widening — is dev-graph only and rides WI#367 (see Crate
+Security Re-Audit).
 
 **Known issues / open at release.** Reconciled per item in
 `docs/ops/v2.1.6.0_OPEN_WORK_ITEMS_STATUS.md`, a 2026-10-14 01:05Z snapshot
 (work items filed after it — WI#402 through WI#415 — postdate the audit):
-WI#397 (`high` — sb&kumo findings); the cross-cron shared-container borrow
-WI#396; the goals-open items WI#375, WI#390, WI#392, WI#402, and WI#408;
-WI#415 (the OpenRC weechat/relay/adapter/darkirc renderers still bake
-caller-PATH `python3`); and the advisory-clearing owners WI#418, WI#367,
-and WI#368. Still open from this cycle's merged work: WI#324
-(opencode/opencode2/pebble worker-side bridges and real-worker acceptance
-evidence), WI#357 (the opencode2 v2.0.26 bump stays gated), and WI#412
+WI#397 (`high` — sb&kumo findings); the goals-open items WI#375, WI#390,
+and WI#392; and the advisory-clearing owners WI#418, WI#367,
+and WI#368. Landed since the snapshot: WI#396 (differing-grant cron
+entries sharing one container are now detected and stripped at load),
+WI#402 (no silent unreachable defaults in single-node bring-up — required
+knobs die with guidance), WI#408 (channel WASM host credential redaction
+at the trait boundary), and WI#415 (the OpenRC weechat/relay/adapter/
+darkirc renderers bake the canonical PATH-independent python3); all four
+stay open for maintainer acceptance, as does WI#416 (three of its six
+root-ownership sites addressed: `configure_weechat_relay`'s trailing
+`chown -R`, the relay start lock, and the SSH key staging). Still open
+from this cycle's merged work: WI#324
+(opencode2/pebble worker-side bridges and real-worker acceptance
+evidence), WI#357 (the opencode2 v2.0.32 bump rides its guards; the
+deferred egress allowlist stays WI#424), and WI#412
 (pending maintainer acceptance). WI#400 tracks real worker credential
 isolation beyond the WI#373 hygiene strips. The five test-build field
 reports (WI#366, WI#372, WI#385, WI#398, WI#399) and the WI#359/WI#373
 triage items were closed on 2026-10-14; WI#336, WI#356, WI#376, WI#377,
 WI#380, WI#393, WI#395, WI#410, WI#411, and WI#417 closed during final
-review (2026-10-13 through 2026-10-16).
+review (2026-10-13 through 2026-10-16). WI#402, WI#408, WI#415, WI#416,
+WI#419, WI#360, WI#364, and the WI#371 durability work landed after the
+snapshot (2026-10-17 through 2026-10-18).
 
 **Deployment boundaries.** The onboarding web app remains a trusted local
 console without user accounts or TLS: retain loopback binding and use an
