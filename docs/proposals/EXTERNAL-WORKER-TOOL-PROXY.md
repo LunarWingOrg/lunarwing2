@@ -440,10 +440,23 @@ against the pinned opencode source, `packages/opencode/src/mcp/index.ts` @
   spelling). Each tool's `execute()` receives the calling session's id,
   resolves the session title (`lunarwing-opencode-<task_id>`, set by the
   executor) through the plugin host's authenticated client, and relays the
-  call over that task's proxy socket. Successful resolutions are cached for
-  the process lifetime — session ids are unique, and pinning the FIRST
-  observed title means a task renaming its own session mid-run cannot
-  redirect its calls onto another task's socket. Sessions without the task
+  call over that task's proxy socket. Subagent sessions (titled
+  `<description> (@<agent> subagent)` by opencode's `task` tool) resolve
+  through the root session's title by walking `parentID`, bounded at 8 hops
+  (JU-1). Successful resolutions are cached for the process lifetime —
+  session ids are unique, and caching the FIRST observed title stops a
+  mid-run rename after the first call from moving that session's calls.
+  This is not an isolation boundary (JU-5): any process in the container
+  can rename a session before its first call, create a session with another
+  task's title — or a `parentID` pointing at another task's root session —
+  over the loopback serve API, or connect to another task's socket
+  directly. All of these stay inside the container's single grant (EF-1)
+  and change only which job a call is attributed to. As with the kimi
+  loader (EF-10), workspace content under `.opencode/` can shadow or
+  disable the plugin: the effective config, including the plugin entry,
+  lives in the model-writable `$WORKSPACE_ROOT/.opencode/opencode.json`,
+  next to the auto-loaded `.opencode/plugin(s)` and `.opencode/tool(s)`
+  directories; the hub stays authoritative. Sessions without the task
   title prefix (cli/acp modes, interactive use) get a clean error.
 - The tools are dependency-free plain `{description, args, execute}`
   definitions (the registry's non-zod path, which passes call arguments

@@ -108,10 +108,17 @@ The opencode worker image ships the same relay in its
 servers per project Instance with the serve process's frozen environment,
 so a per-task socket env cannot reach an MCP child. The plugin statically
 registers the phase-1 tools as `lunarwing_<name>`; each call resolves the
-session's task id from its title (`lunarwing-opencode-<task_id>`) through
-the plugin host's authenticated client (first-title-wins cached) and relays
-over the task's socket. The static tools are visible even without a grant —
-ungranted calls return the hub's denial as a tool error. The opencode2 and
+session's task id from its title (`lunarwing-opencode-<task_id>`, with
+subagent child sessions resolved through the root session via `parentID`)
+through the plugin host's authenticated client (first-title-wins cached) and
+relays over the task's socket. The static tools are visible even without a
+grant — ungranted calls return the hub's denial as a tool error. The
+first-title-wins cache is not an isolation boundary: any process in the
+container can rename a session before its first call, create a session with
+another task's title or `parentID` over the loopback serve API, or connect
+to another task's socket directly — all of these stay inside the
+container's single hub-enforced grant and change only which job a call is
+attributed to. The opencode2 and
 pebble lanes do not have the bridge yet; see
 [`docs/proposals/EXTERNAL-WORKER-TOOL-PROXY.md`](../proposals/EXTERNAL-WORKER-TOOL-PROXY.md)
 for the wire contract.
