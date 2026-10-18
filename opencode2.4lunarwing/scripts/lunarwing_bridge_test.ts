@@ -14,10 +14,12 @@
  */
 
 import assert from "node:assert/strict"
+import { spawnSync } from "node:child_process"
 import { mkdtempSync, rmSync } from "node:fs"
 import { connect, type Socket } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { fileURLToPath } from "node:url"
 import type { OpenCodeClient } from "@opencode/client/promise"
 
 // WI#324: every handleTaskRequest in this file starts a per-task relay socket
@@ -42,6 +44,7 @@ const {
 } = await import("./lunarwing_bridge.ts")
 const { taskSocketPath } = await import("./lunarwing_tool_proxy.ts")
 const { createEnvelope } = await import("./lunarwing_runtime.ts")
+const { resolveTaskId: resolvePluginTaskId } = await import("./lunarwing_tool_plugin/index.ts")
 
 type BridgeSocketLike = { send(data: string): void }
 
@@ -69,7 +72,9 @@ function fakeSocket(): { socket: BridgeSocketLike; frames: SentFrame[] } {
 async function bounded<T>(promise: Promise<T>, ms = 5_000): Promise<T> {
   return Promise.race([
     promise,
-    new Promise<T>((_, reject) => setTimeout(() => reject(new Error("timed out")), ms)),
+    // KL-12: unref the timeout so a settled race never keeps the process alive
+    // (the suite's tail was the full 5 s of the last unreffed timer).
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error("timed out")), ms).unref()),
   ])
 }
 
@@ -94,6 +99,7 @@ function controlledSdk() {
   const created = new Promise<void>((resolve) => {
     resolveCreated = resolve
   })
+  const createArgs: unknown[] = []
   const iterator = {
     next: async (): Promise<IteratorResult<unknown>> => {
       for (;;) {
@@ -108,7 +114,8 @@ function controlledSdk() {
   }
   const sdk = {
     session: {
-      create: async () => {
+      create: async (...args: unknown[]) => {
+        createArgs.push(args)
         resolveCreated?.()
         return { id: "session-1" }
       },
@@ -131,7 +138,7 @@ function controlledSdk() {
     resolvePrompt?.()
     pushEvent({ type: "session.execution.succeeded", data: { sessionID: "session-1" } })
   }
-  return { sdk: sdk as unknown as OpenCodeClient, created, finish }
+  return { sdk: sdk as unknown as OpenCodeClient, created, createArgs, finish }
 }
 
 function ipcCall(socketPath: string, request: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -288,6 +295,38 @@ function registerTask(socket: BridgeSocketLike): { taskId: string; controller: A
     0,
     "the finally closes the task's relay socket",
   )
+
+  // KL-6: the executor's session.create title is the cross-file contract the
+  // serve-side plugin binds on — the plugin's own parser must map the captured
+  // title straight back to the task id.
+  const createInput = mock.createArgs[0] as [{ title?: unknown }]
+  const title = createInput[0]?.title
+  assert.equal(title, `lunarwing-opencode2-${taskId}`)
+  assert.equal(
+    await resolvePluginTaskId(
+      { session: { get: async () => ({ title, parentID: undefined }) } },
+      new Map(),
+      "session-1",
+    ),
+    taskId,
+  )
+}
+
+// KL-7: the entrypoint guard must refuse an unknown WS_ROLE (exit 1, stderr
+// names the role). An inverted/absent guard passes every import-time suite
+// while shipping a worker that never binds a listener.
+{
+  const child = spawnSync(
+    process.execPath,
+    ["run", fileURLToPath(new URL("./lunarwing_bridge.ts", import.meta.url))],
+    {
+      env: { ...process.env, WS_ROLE: "lw-selftest-unknown-role" },
+      encoding: "utf8",
+      timeout: 20_000,
+    },
+  )
+  assert.equal(child.status, 1, `expected exit 1, got status ${child.status} (stderr: ${child.stderr})`)
+  assert.match(child.stderr, /unknown WS_ROLE/)
 }
 
 if (savedProxyDir === undefined) delete process.env.LUNARWING_TOOL_PROXY_DIR

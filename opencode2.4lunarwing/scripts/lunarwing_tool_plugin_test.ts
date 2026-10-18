@@ -12,7 +12,7 @@
  */
 
 import assert from "node:assert/strict"
-import { mkdtempSync, rmSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -369,6 +369,34 @@ const relay = new ToolProxyRelay()
     tools.lunarwing_memory_read!.execute({ path: "notes/x.md" }, { sessionID: "ses_3" }),
   )
   assert.match(message, /lunarwing proxy: tool proxy socket error/)
+}
+
+// ── KL-6: cross-file wiring contracts (config registration + title format) ──
+{
+  // The plugin only ships if the mounted config registers the directory, and
+  // the binding only works if the executor's session-title format matches this
+  // plugin's parser — two cross-file contracts no other block pins (KL-6).
+  const config = JSON.parse(
+    readFileSync(new URL("../config/opencode2.json", import.meta.url), "utf8"),
+  ) as { plugins?: unknown }
+  assert.ok(
+    Array.isArray(config.plugins) && config.plugins.includes("/app/scripts/lunarwing_tool_plugin"),
+    "config/opencode2.json must register the plugin directory by absolute path",
+  )
+  assert.ok(
+    existsSync(new URL("./lunarwing_tool_plugin/index.ts", import.meta.url)),
+    "the plugin entrypoint must exist at scripts/lunarwing_tool_plugin/index.ts",
+  )
+  const executorSource = readFileSync(new URL("./opencode_task_executor.ts", import.meta.url), "utf8")
+  assert.ok(
+    executorSource.includes("lunarwing-opencode2-${request.task_id}"),
+    "the executor must title sessions lunarwing-opencode2-<task_id>",
+  )
+  // The parser maps the executor's title back to the task id.
+  assert.equal(
+    await resolveTaskId(stubClient({ ses_x: "lunarwing-opencode2-job-xyz" }), new Map(), "ses_x"),
+    "job-xyz",
+  )
 }
 
 if (savedProxyDir === undefined) delete process.env.LUNARWING_TOOL_PROXY_DIR
