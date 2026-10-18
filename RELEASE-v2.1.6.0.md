@@ -205,7 +205,12 @@ The same strip applies to any non-cron entry sharing a cron entry's
 endpoint, compared by normalized container key (lowercased host, loopback
 spellings folded, scheme-default ports applied, path/query ignored — one
 host:port that path-routes several containers strips all of them, failing
-closed).
+closed). Two cron entries sharing one container are likewise detected
+(WI#396, closed): grouped by the same normalized key, differing
+`cron.tool_allowlist` sets strip every cron grant on the shared listener
+with an `error!` (identical sets stay, with a `warn!`) — one container is
+one authority domain, so one mission's tick could otherwise borrow the
+other's grants through its relay socket, concurrent or later.
 
 The **kimi** lane ships the worker-side bridge: `lunarwing_tool_proxy.ts`
 (a per-task relay; replies routed by call_id scoped to the owning hub
@@ -243,8 +248,9 @@ host-imposed four-hour maximum matching Kimi's default cap.
 
 **WI#325 is closed**; audio capture was scoped out at close-out. Residuals
 ride WI#370 (retention/list visibility, event-outcome FK coverage), WI#371
-(read-failure pause safety, durable breaker count), WI#375 (remaining
-harness items), and the cross-cron shared-container borrow WI#396. Design
+(read-failure pause safety, durable breaker count), and WI#375 (remaining
+harness items); the cross-cron shared-container borrow WI#396 is closed
+(see the External-Worker Tool Proxy section). Design
 doc: `docs/proposals/EXTERNAL-WORKER-CRON-MODE.md`.
 
 ### Harness Event Redaction Hardening (WI#326)
@@ -837,19 +843,19 @@ long-term mitigation, and owns their per-release re-verification.
 **Known issues / open at release.** Reconciled per item in
 `docs/ops/v2.1.6.0_OPEN_WORK_ITEMS_STATUS.md`, a 2026-10-14 01:05Z snapshot
 (work items filed after it — WI#402 through WI#415 — postdate the audit):
-WI#397 (`high` — sb&kumo findings); the cross-cron shared-container borrow
-WI#396; the goals-open items WI#375, WI#390, WI#392, WI#402, and WI#408;
-WI#415 (the OpenRC weechat/relay/adapter/darkirc renderers still bake
-caller-PATH `python3`); and the advisory-clearing owners WI#418, WI#367,
-and WI#368. Still open from this cycle's merged work: WI#324
-(opencode/opencode2/pebble worker-side bridges and real-worker acceptance
-evidence), WI#357 (the opencode2 v2.0.26 bump stays gated), and WI#412
-(pending maintainer acceptance). WI#400 tracks real worker credential
-isolation beyond the WI#373 hygiene strips. The five test-build field
-reports (WI#366, WI#372, WI#385, WI#398, WI#399) and the WI#359/WI#373
-triage items were closed on 2026-10-14; WI#336, WI#356, WI#376, WI#377,
-WI#380, WI#393, WI#395, WI#410, WI#411, and WI#417 closed during final
-review (2026-10-13 through 2026-10-16).
+WI#397 (`high` — sb&kumo findings); the goals-open items WI#375, WI#390,
+WI#392, WI#402, and WI#408; WI#415 (the OpenRC weechat/relay/adapter/darkirc
+renderers still bake caller-PATH `python3`); and the advisory-clearing
+owners WI#418, WI#367, and WI#368. Still open from this cycle's merged
+work: WI#324 (opencode/opencode2/pebble worker-side bridges and
+real-worker acceptance evidence), WI#357 (the opencode2 v2.0.26 bump
+stays gated), and WI#412 (pending maintainer acceptance). WI#400 tracks
+real worker credential isolation beyond the WI#373 hygiene strips. The
+five test-build field reports (WI#366, WI#372, WI#385, WI#398, WI#399)
+and the WI#359/WI#373 triage items were closed on 2026-10-14; WI#336,
+WI#356, WI#376, WI#377, WI#380, WI#393, WI#395, WI#396 (the cross-cron
+shared-container borrow — detection merged in !1710), WI#410, WI#411,
+and WI#417 closed during final review (2026-10-13 through 2026-10-16).
 
 **Deployment boundaries.** The onboarding web app remains a trusted local
 console without user accounts or TLS: retain loopback binding and use an
