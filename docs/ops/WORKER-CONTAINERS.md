@@ -143,7 +143,11 @@ detects that pairing at load (WI#396): cron entries are grouped by
 normalized endpoint key, and when a shared listener's entries carry
 *differing* `cron.tool_allowlist` grants the manager strips every cron
 grant on that listener with an `error!` (fail closed); identical grants
-are the same authority on both sides and stay, with a `warn!`. (The manager also strips the worker-level list of a non-cron
+are the same authority on both sides and stay, with a `warn!`. The
+strip is a single pass: an entry stripped for one listener can still,
+on another listener it shares with identical-grant entries, borrow a
+grant equal to its own configured list — no mission gains authority
+beyond its configuration. (The manager also strips the worker-level list of a non-cron
 entry whose endpoint shares a cron entry's container. The comparison uses
 a normalized endpoint key — loopback spellings folded into one class,
 host lowercased, scheme-default port applied, path and query ignored —

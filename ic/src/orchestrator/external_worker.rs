@@ -4724,7 +4724,9 @@ mod tests {
     fn shared_cron_endpoint_self_alias_is_not_flagged() {
         // WI#396: one cron entry whose own endpoint list aliases itself
         // (localhost vs 127.0.0.1 on the same port) is not a share — the
-        // grouping dedups entry names per key.
+        // grouping dedups entry names per key (run-143 JO-1: without that
+        // dedup this test's grouping assertion fails — the entry pairs with
+        // itself as "identical" and only a spurious warn! differs).
         let mut config = cron_test_config("cron-a", "ws://127.0.0.1:9/ws/a", &["memory_read"]);
         config.endpoints = vec![
             crate::config::WorkerEndpoint {
@@ -4738,11 +4740,64 @@ mod tests {
                 weight: None,
             },
         ];
-        let mgr = ExternalWorkerManager::new(vec![config]);
+        let workers = HashMap::from([("cron-a".to_string(), config)]);
+        assert!(
+            shared_cron_listener_groups(&workers).is_empty(),
+            "a self-aliasing cron entry must not form a shared listener group"
+        );
+        let mgr = ExternalWorkerManager::new(workers.into_values().collect());
         assert_eq!(
             loaded_cron_grants(&mgr, "cron-a"),
             vec!["memory_read".to_string()],
             "a self-aliasing cron entry keeps its grant"
+        );
+    }
+
+    #[test]
+    fn shared_cron_listener_on_a_second_endpoint_is_stripped() {
+        // Run-143 JO-1 (mutant M9): a multi-endpoint entry shares the
+        // listener through its SECOND endpoint — grouping only the first
+        // endpoint would pass the other WI#396 pins and reopen the borrow.
+        let mut a = cron_test_config("cron-a", "ws://127.0.0.1:9/ws/a", &["memory_read"]);
+        a.endpoints = vec![
+            crate::config::WorkerEndpoint {
+                url: "ws://127.0.0.1:9/ws/a".to_string(),
+                auth_token: None,
+                weight: None,
+            },
+            crate::config::WorkerEndpoint {
+                url: "ws://127.0.0.1:11/ws/a2".to_string(),
+                auth_token: None,
+                weight: None,
+            },
+        ];
+        let b = cron_test_config("cron-b", "ws://localhost:11/ws/b", &["knowledge_search"]);
+        let mgr = ExternalWorkerManager::new(vec![a, b]);
+        for name in ["cron-a", "cron-b"] {
+            assert!(
+                loaded_cron_grants(&mgr, name).is_empty(),
+                "second-endpoint share must be stripped: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_cron_listener_with_an_empty_grant_neighbour_is_stripped() {
+        // Run-143 JO-1 (mutant M11): a mission added WITHOUT grants on an
+        // existing mission's container is the most likely real-world pairing;
+        // its ticks can still reach the granted mission's relay socket, so
+        // an empty list next to a granted one counts as differing.
+        let mgr = ExternalWorkerManager::new(vec![
+            cron_test_config("cron-a", "ws://127.0.0.1:9/ws/a", &["memory_read"]),
+            cron_test_config("cron-b", "ws://localhost:9/ws/b", &[]),
+        ]);
+        assert!(
+            loaded_cron_grants(&mgr, "cron-a").is_empty(),
+            "an empty-grant neighbour must strip the granted entry"
+        );
+        assert!(
+            loaded_cron_grants(&mgr, "cron-b").is_empty(),
+            "the grantless neighbour stays grantless"
         );
     }
 
