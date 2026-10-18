@@ -506,9 +506,14 @@ the prime suspect, and the fix is the same normalization in the offending
   the anonymous single-issue endpoint serves only issue-type items (WI#274
   precedent) — or was deleted; transient outages/5xx/429 retry three times
   with 5s/10s backoff and then fail closed, because a check that warns on
-  outage silently stops checking (the index-failure silence class). The
+  outage silently stops checking (the index-failure silence class); a fully
+  unreachable API costs up to about 3.5 minutes per named owner (three 60s
+  attempts plus backoff) before the job fails. The
   expected maintenance step when closing an owner WI: re-point the
   `ic/deny.toml` reasons to the new open owner FIRST, then close the old one.
+  Agents must not reopen a clearing-owner work item that a maintainer closed:
+  report the red gate on the MR or the work item and leave re-pointing or
+  reopening to the maintainer.
   Both checks carry unit tests under `.gitlab/tests` (stubbed fetch for the
   online half), also registered in the `python-unit` suite.
 <!-- deny-toml-guard-section:end -->

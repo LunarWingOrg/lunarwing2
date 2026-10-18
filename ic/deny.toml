@@ -42,7 +42,10 @@ ignore = [
     # cargo-deny job runs .gitlab/scripts/check_deny_toml_owners.py, which
     # hard-fails when a named owner is closed (or is a task-type work item,
     # which 404s on the anonymous issue API). Closing an owner WI requires
-    # re-pointing its reasons to the new open owner first.
+    # re-pointing its reasons to the new open owner first. Agents must not
+    # reopen a clearing-owner work item that a maintainer closed: report the
+    # red gate on the MR or the work item and leave re-pointing or reopening
+    # to the maintainer.
 
     # rustls-webpki 0.102.8 chain via libsql 0.6.0 -> hyper-rustls 0.25.0 ->
     # rustls 0.22.4. Re-verified 2026-10-16 (WI#418): libsql 0.10.0 went
