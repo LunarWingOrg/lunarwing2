@@ -182,7 +182,48 @@ publication default:
 
 ## 7. Live-tenant evidence
 
-<!-- filled in after the temporary test tenant run on this branch -->
+Temporary test tenant **spitfire** (WI#273 list name, non-animal — exempt
+from the animal-name teardown routine), provisioned on this Gentoo/OpenRC
+host 2026-10-18 with `--with-opencode2`, port block 10020-10029
+(`opencode2_wss` 51020), LLM endpoint `http://100.88.232.146:3000/openai/v1`
+(NetBird TensorZero; `OPENCODE2_BASE_URL` inherited per WI#330). The tenant
+clone tracks this branch (`aj/kimi-71-20261018-0601` @ `4db886f7b`), so the
+exercised image is this bump.
+
+- Image: `lunarwing-worker-opencode2:latest` built from the tenant clone
+  (`mt-admin build-tenant spitfire --with-opencode2`, BUILD_EXIT=0); the
+  standalone pre-build from this checkout (`mt-admin build-opencode2-worker`)
+  also passed with every in-image gate green — compile-out stub applied
+  (`importers use: ['ensure', 'hostname', 'run']`), binary marker scan clean,
+  `opencode --version` asserted `opencode v2.0.32`, all embedded self-tests
+  ran, leak tripwires clean, final `--image-filesystem` assert passed.
+- Container boot state: `service.json` = `{"disabled": true}`;
+  `$XDG_DATA_HOME` contains only `opencode` — **no `opentunnel` identity**
+  created; in-container `opencode --version` → `opencode v2.0.32` (via the
+  wrapper).
+- Wrapper refusals live in the running container:
+  `opencode service set remote true` → exit 77 refused;
+  `opencode pair --remote --yes` → exit 77 refused.
+- WI#357 audit: `mt-admin worker-listeners spitfire` → **clean**, before and
+  after the job (only the expected bridge-WS 51020 + health 8443 binds, all
+  published host-loopback only).
+- Real job, full path (gateway chat → LLM loop → `create_job` → approval
+  gate → resume → orchestrator WS dial → bridge → v2.0.32 executor →
+  `job_events` → assistant reply): job `cbf1c213-2d35-4f5a-a25c-e5031f3f9efa`
+  — bridge `success (6183ms)`; `job_events` stream
+  `OC2` + `_WORKER_OK` deltas, result `{"content": "Completed:
+  OC2_WORKER_OK"}`; the assistant relayed job id, status `completed`, output
+  `OC2_WORKER_OK`. The approval gate parked the `create_job` call exactly as
+  designed (pending gate observed in `state/pending-gates.json`, resumed with
+  `action=always`).
+- Post-job exposure state unchanged: `service.json` still
+  `{"disabled": true}`, still no `opentunnel` dir, listeners still clean.
+
+Caveats carried from item 72's A7: `/api/chat/history` mislabels the
+in-flight turn as `Failed` while the engine has it gated/Running — cosmetic,
+pre-existing, reproduced here. The tenant is **left running**
+(boot-persistent under OpenRC) for maintainer inspection; decommission with
+`sudo bash ic/scripts/lunarwing-mt-admin.sh remove-tenant spitfire --purge`.
 
 ## 8. Bottom line
 
