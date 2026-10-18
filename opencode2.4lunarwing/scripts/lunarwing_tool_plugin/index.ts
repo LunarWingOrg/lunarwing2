@@ -75,7 +75,7 @@
 import { connect, type Socket } from "node:net"
 import { randomUUID } from "node:crypto"
 
-import { taskSocketPath } from "../lunarwing_tool_proxy.ts"
+import { taskSocketPath, TOOL_CALL_FRAME_CAP_BYTES } from "../lunarwing_tool_proxy.ts"
 
 /** Matches the session title the bridge's executor sets (opencode_task_executor.ts). */
 const TASK_TITLE_PREFIX = "lunarwing-opencode2-"
@@ -262,12 +262,21 @@ export function createProxyTools(client: SessionTitleClient): Record<string, Pro
         "lunarwing proxy: this session was not dispatched by LunarWing; tenant tools are unavailable",
       )
     }
-    const reply = await relayCall(taskSocketPath(taskId), {
+    const request = {
       op: "call",
       call_id: randomUUID(),
       name,
       arguments: args,
-    })
+    }
+    // KL-8: fail an over-budget call locally with a readable reason. Without
+    // this pre-check the relay answers and then destroys the socket while the
+    // plugin is still writing, so the model sees a bare EPIPE.
+    if (Buffer.byteLength(JSON.stringify(request), "utf8") > TOOL_CALL_FRAME_CAP_BYTES) {
+      throw new Error(
+        `lunarwing proxy: arguments exceed the ${TOOL_CALL_FRAME_CAP_BYTES}-byte tool_call budget; split the content`,
+      )
+    }
+    const reply = await relayCall(taskSocketPath(taskId), request)
     if (!reply.ok) {
       throw new Error(`lunarwing proxy: ${reply.error ?? "relay failure"}`)
     }

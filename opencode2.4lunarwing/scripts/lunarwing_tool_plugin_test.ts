@@ -283,9 +283,12 @@ const relay = new ToolProxyRelay()
   }
 }
 
-// ── sessions the bridge did not dispatch get a clean error, no hub traffic ───
+// ── sessions the bridge did not dispatch get a clean error, no relay task ────
 {
-  const hub = new FakeHubSocket()
+  // KL-12: these sessions never resolve to a task id, so the plugin throws
+  // before it could compute or touch a task socket — pin that no relay task
+  // exists rather than a fake hub socket nothing could write to.
+  const tasksBefore = relay.activeTaskCount
   const client = stubClient({
     "ses_interactive": "untitled",
     "ses_gone": undefined,
@@ -307,7 +310,29 @@ const relay = new ToolProxyRelay()
   )
   assert.match(noSession, /no session context/)
 
-  assert.equal(hub.sent.length, 0, "no task binding must mean no hub traffic")
+  assert.equal(relay.activeTaskCount, tasksBefore, "no task binding must create no relay task")
+}
+
+// ── KL-8: an over-budget call fails locally with a readable reason ───────────
+{
+  const hub = new FakeHubSocket()
+  const handle = await relay.startTask("job-oversized", hub)
+  assert.ok(handle)
+  try {
+    const client = stubClient({ "ses_big": "lunarwing-opencode2-job-oversized" })
+    const tools = createProxyTools(client)
+    const pending = assert.rejects(
+      tools.lunarwing_memory_write!.execute(
+        { content: "x".repeat(3 * 1024 * 1024), target: "MEMORY.md" },
+        { sessionID: "ses_big" },
+      ),
+      /exceed the \d+-byte tool_call budget/,
+    )
+    await pending
+    assert.equal(hub.sent.length, 0, "an over-budget call never reaches the hub")
+  } finally {
+    handle.close()
+  }
 }
 
 // ── task resolution: prefix rules, caching, first-title-wins ─────────────────
