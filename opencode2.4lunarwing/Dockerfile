@@ -1,11 +1,11 @@
-# v2.0.24 resolves to this reviewed commit. Both must move together.
+# v2.0.32 resolves to this reviewed commit (WI#427). Both must move together.
 # OpenCode 2 is beta in practice (upstream's own migration doc: "server and
 # plugin APIs may continue to change"). This lane is deliberately SEPARATE
 # from the proven v1 worker (opencode4lunarwing, pinned v1.18.25) so tenants
 # opt into v2 explicitly — see docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md.
 # Re-bump only after re-verifying the bridge against the v2 server API.
-ARG OPENCODE_VERSION=v2.0.24
-ARG OPENCODE_REF=e7a34f09bfd9134dfade5a8ddb843f7030bc9a69
+ARG OPENCODE_VERSION=v2.0.32
+ARG OPENCODE_REF=843a6c514e606b436a7fe713422ace0a93ad3d61
 ARG DEBIAN_SNAPSHOT=20260906T000000Z
 ARG SOURCE_REVISION=unknown
 
@@ -56,9 +56,9 @@ COPY scripts/compile_out_remote_tunnel.py /build/compile_out_remote_tunnel.py
 # executable. Fail closed if the pinned upstream build options have drifted.
 RUN python3 /build/prepare_reproducible_build.py script/build.ts
 # WI#357 control 8: compile the OpenTunnel remote-access client out, fail
-# closed. v2.0.24 has no tunnel (guard passes with nothing to stub); when a
-# future bump lands v2.0.26+'s remote-tunnel.ts the guard replaces it with a
-# refusing stub, and if upstream moves/renames the module or extends its
+# closed. WI#427 deliberately crosses the v2.0.26 boundary: v2.0.32's
+# remote-tunnel.ts is replaced with a refusing stub. If upstream
+# moves/renames the module or extends its
 # export surface the build fails instead of silently shipping the tunnel.
 RUN python3 /build/compile_out_remote_tunnel.py /build/opencode
 # Build only the native platform target (mirrors the v1 worker's --single
@@ -98,6 +98,25 @@ ARG WITH_TOOLCHAINS=false
 ARG OPENCODE_VERSION
 ARG OPENCODE_REF
 ENV OPENCODE_IMAGE_REF="${OPENCODE_VERSION}@${OPENCODE_REF}"
+# !1735 review KG-3 / !1699 JE-3: the updater's readPolicy() reads only
+# config.json/opencode.json/opencode.jsonc in the global config dir and never
+# reads OPENCODE_CONFIG, so the lane config's "update": "disable" pin never
+# reaches it — the effective policy was the default "notify" and the TUI's
+# background check GETs opencode.ai. This kill switch is what upstream
+# actually honours (updater.ts inspect() gate). The manual
+# `opencode upgrade`/`update` command is NOT covered by this switch — the
+# wrapper refuses it (KG-1/JE-2).
+ENV OPENCODE_DISABLE_AUTOUPDATE=1
+# !1735 review KG-3 / !1699 JE-3: the updater's readPolicy() reads only
+# config.json/opencode.json(openc) in the global config dir (updater.ts) and
+# never reads OPENCODE_CONFIG, so the lane config's "update": "disable" pin
+# never reaches it — the effective policy was the default "notify" and the
+# interactive TUI's background check still GETs opencode.ai. This kill
+# switch is what upstream actually honours (updater.ts inspect() gate), so
+# the background update check is disabled at the source. The manual
+# `opencode upgrade`/`update` command is NOT covered by this switch — the
+# wrapper refuses it (KG-1/JE-2).
+ENV OPENCODE_DISABLE_AUTOUPDATE=1
 
 # WI#357 run-106 GJ-3(a): sha256 of the checkout's
 # scripts/opencode-exposure-guard.sh, passed by build-worker-image.sh and

@@ -28,7 +28,7 @@ When in doubt about where a change belongs, read [`AGENTS.md`](../../AGENTS.md) 
 
 ## 2. What's hot lava right now (freeze status)
 
-**Current state (updated 2026-10-15, target release 2.1.6.0):**
+**Current state (updated 2026-10-18, target release 2.1.6.0):**
 
 - v2.1.5.0 (Bungei Fukkō) shipped 2026-10-10: recovery paths and honest
   failure messages, the workspace daily-log backup gate, the routine/mission
@@ -39,8 +39,9 @@ When in doubt about where a change belongs, read [`AGENTS.md`](../../AGENTS.md) 
 - The v2.1.6.0 pre-release checklist is being worked through
   (`docs/ops/AGENT_GOALS_2.1.6.0.md`). The crate/pin state already moved
   (all LunarWing crates at 2.1.6 per checklist item #1; kimi worker 2.2.0
-  per item #4; opencode2 stays v2.0.24 — the v2.0.26 bump is gated off per
-  checklist item #2, WI#357). Landed this cycle: the external-worker
+  per item #4; opencode2 moves to v2.0.32 under the maintainer-approved
+  WI#427, with WI#357's tunnel compile-out and exposure guards retained;
+  see `docs/ops/WORKER-CONTAINERS.md` for verification and rollout). Landed this cycle: the external-worker
   control channel (WI#328), external-worker cron mode (WI#325), the
   harness as an optional external worker (WI#326), worker LLM endpoint
   handling (WI#330), the libSQL remote-replica feature gate (WI#331),
