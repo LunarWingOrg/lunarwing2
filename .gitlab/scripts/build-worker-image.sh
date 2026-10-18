@@ -51,10 +51,14 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         # the wrapper is installed over the binary path, the assert runs
         # against the lane + built binary, and the compile-out patch runs
         # against the upstream checkout; their self-tests execute in-image.
+        # Also covers the WI#369 SDK-surface gate files and the WI#324
+        # tool-proxy relay/plugin/bridge sources plus every bun suite the
+        # Dockerfile self-test chain executes (KL-13).
         input_files='opencode2.4lunarwing/Dockerfile
 opencode2.4lunarwing/entrypoint.sh
 opencode2.4lunarwing/scripts/prepare_reproducible_build.py
 opencode2.4lunarwing/scripts/path_expand_test.ts
+opencode2.4lunarwing/scripts/opencode_result_test.ts
 opencode2.4lunarwing/scripts/sdk_surface.ts
 opencode2.4lunarwing/scripts/sdk_surface_assert.ts
 opencode2.4lunarwing/scripts/sdk_surface_test.ts
@@ -63,6 +67,13 @@ opencode2.4lunarwing/scripts/tsconfig.sdk-surface.json
 opencode2.4lunarwing/scripts/gate-env.d.ts
 opencode2.4lunarwing/scripts/opencode_task_executor.ts
 opencode2.4lunarwing/scripts/opencode_task_executor_test.ts
+opencode2.4lunarwing/scripts/lunarwing_runtime.ts
+opencode2.4lunarwing/scripts/lunarwing_bridge.ts
+opencode2.4lunarwing/scripts/lunarwing_bridge_test.ts
+opencode2.4lunarwing/scripts/lunarwing_tool_proxy.ts
+opencode2.4lunarwing/scripts/lunarwing_tool_proxy_test.ts
+opencode2.4lunarwing/scripts/lunarwing_tool_plugin/index.ts
+opencode2.4lunarwing/scripts/lunarwing_tool_plugin_test.ts
 opencode2.4lunarwing/scripts/opencode-exposure-guard.sh
 opencode2.4lunarwing/scripts/exposure_policy_assert.py
 opencode2.4lunarwing/scripts/exposure_policy_assert_test.py

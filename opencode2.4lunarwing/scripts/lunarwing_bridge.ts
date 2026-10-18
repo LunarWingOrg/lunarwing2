@@ -25,7 +25,9 @@ process.on("unhandledRejection", (reason) => {
   console.error("[bridge] unhandledRejection (surviving):", reason)
 })
 import { executeTask } from "./opencode_task_executor"
-import type { OpenCodeClient } from "@opencode/client/promise"
+// The SDK type for the test seam only, derived from executeTask so this
+// file (outside the WI#369 tsgo gate) never references the client package.
+type OpenCodeClient = NonNullable<Parameters<typeof executeTask>[4]>
 import { resolveTaskWorkspace, workspacePathsOverlap } from "./workspace_path"
 import { ToolProxyRelay, type TaskProxyHandle } from "./lunarwing_tool_proxy.ts"
 
