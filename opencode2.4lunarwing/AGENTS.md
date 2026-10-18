@@ -109,7 +109,7 @@ and WI#424's egress allowlist remain open; see the bump record.
 
 ## Key Files (this policy)
 
-- `scripts/opencode-exposure-guard.sh` — installed as `/usr/local/bin/opencode`; scans every argv token for `service`/`pair`/`--service`/non-loopback `--hostname` (naive-use guard).
+- `scripts/opencode-exposure-guard.sh` — installed as `/usr/local/bin/opencode`; scans every argv token for `service`/`pair`/`upgrade`/`update`/`--service`/non-loopback `--hostname` (naive-use guard).
 - `scripts/exposure_policy_assert.py` — shared static policy checker (image build + CI guard); `--image-filesystem` also checks installed ownership and modes and (v2, run-103 GD-2 + run-106 GJ-3) verifies the installed wrapper: `/usr/local/bin/opencode` must be the byte-identical, root-owned, non-group-writable, executable guard that build-time `PATH` resolves to, with the real binary re-scanned for tunnel markers, no `LUNARWING_REAL_OPENCODE` retarget at build time, and the installed digest matching the `LUNARWING_WRAPPER_SHA256` build-arg anchor (computed from the checkout by `build-worker-image.sh` and mt-admin's `build_opencode2_worker`; missing or mismatched fails the build).
 - `scripts/entrypoint_config_test.py` — non-root startup configuration regression tests using a 0444 baked config, including repeat boots, HOME/XDG/`OPENCODE_CONFIG_DIR` service defaults, and agent plants (FIFO/dir/symlink) at the reset path.
 - `scripts/compile_out_remote_tunnel.py` — fail-closed build patch that compiles the OpenTunnel client out; drift scan over `packages/{cli,server,schema,core}/src` (ts+tsx, any quoted `@opentunnel/*` specifier, all workspace manifests).

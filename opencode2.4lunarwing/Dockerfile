@@ -98,6 +98,25 @@ ARG WITH_TOOLCHAINS=false
 ARG OPENCODE_VERSION
 ARG OPENCODE_REF
 ENV OPENCODE_IMAGE_REF="${OPENCODE_VERSION}@${OPENCODE_REF}"
+# !1735 review KG-3 / !1699 JE-3: the updater's readPolicy() reads only
+# config.json/opencode.json/opencode.jsonc in the global config dir and never
+# reads OPENCODE_CONFIG, so the lane config's "update": "disable" pin never
+# reaches it — the effective policy was the default "notify" and the TUI's
+# background check GETs opencode.ai. This kill switch is what upstream
+# actually honours (updater.ts inspect() gate). The manual
+# `opencode upgrade`/`update` command is NOT covered by this switch — the
+# wrapper refuses it (KG-1/JE-2).
+ENV OPENCODE_DISABLE_AUTOUPDATE=1
+# !1735 review KG-3 / !1699 JE-3: the updater's readPolicy() reads only
+# config.json/opencode.json(openc) in the global config dir (updater.ts) and
+# never reads OPENCODE_CONFIG, so the lane config's "update": "disable" pin
+# never reaches it — the effective policy was the default "notify" and the
+# interactive TUI's background check still GETs opencode.ai. This kill
+# switch is what upstream actually honours (updater.ts inspect() gate), so
+# the background update check is disabled at the source. The manual
+# `opencode upgrade`/`update` command is NOT covered by this switch — the
+# wrapper refuses it (KG-1/JE-2).
+ENV OPENCODE_DISABLE_AUTOUPDATE=1
 
 # WI#357 run-106 GJ-3(a): sha256 of the checkout's
 # scripts/opencode-exposure-guard.sh, passed by build-worker-image.sh and

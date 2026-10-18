@@ -67,10 +67,14 @@ workspace work.
 | Worker env overrides | `OPENCODE_MODEL` / `OPENCODE_BASE_URL` | `OPENCODE2_MODEL` / `OPENCODE2_BASE_URL` |
 
 WI#427 approves this pin at `843a6c514e606b436a7fe713422ace0a93ad3d61`.
-The build compiles OpenTunnel out; the wrapper refuses service/pairing and
-non-loopback serving, and sharing/self-update stay disabled. See
-`docs/ops/WORKER-CONTAINERS.md` for the bump review, verification and rollout
-record, including the open WI#369 SDK-gate and WI#424 egress follow-ups.
+The build compiles OpenTunnel out; the wrapper refuses service/pairing,
+self-upgrade (`upgrade`/`update`), and non-loopback serving, and sharing
+stays disabled. The lane config's `update: "disable"` pin is not honored by
+the updater itself (it reads only the global config dir), so the image
+also carries `OPENCODE_DISABLE_AUTOUPDATE=1` to silence the background
+check. See `docs/ops/WORKER-CONTAINERS.md` for the bump review, verification
+and rollout record, including the open WI#369 SDK-gate and WI#424 egress
+follow-ups.
 
 ## Do not configure both lanes on one tenant during the transition
 

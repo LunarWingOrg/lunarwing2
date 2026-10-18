@@ -247,18 +247,25 @@ Enforced controls (opencode2 lane unless noted):
    `serve` still uses its loopback hostname and per-boot password. These layers
    are naive-use guards: the agent can rewrite its live service config or
    invoke the real binary directly.
-3. **Session sharing pinned off.** `"share": "disabled"` in both
+3. **Session sharing pinned off; auto-update silenced.** `"share": "disabled"` in both
    `opencode2.4lunarwing/config/opencode2.json` and
    `opencode4lunarwing/config/opencode.json` (v1 schema supports it at
-   v1.18.25), plus `"update": "disable"` in the v2 lane so an upstream
-   default flip cannot re-enable publication or replace the pinned binary.
-   The config tree and boot files (`entrypoint.sh`, `health_server.py`,
-   `agent_comm_protocol.json`) are root-owned and read-only in the image,
-   including deployments that restart the same container filesystem. The
-   entrypoint re-derives the default runtime config from the baked source at
-   every boot. An override copy gets owner-write permission before the config
-   writers run; the baked source stays read-only. Live runtime/project configs
-   and operator-selected `OPENCODE_CONFIG` remain untrusted and mutable.
+   v1.18.25), plus `"update": "disable"` in the v2 lane config so an upstream
+   default flip cannot re-enable publication. **The `update` pin does not
+   reach the updater** (run-158 KG-3 / !1699 JE-3): the updater's
+   `readPolicy()` reads only the global config dir, never `OPENCODE_CONFIG`.
+   `OPENCODE_DISABLE_AUTOUPDATE=1` in the image env is the switch the updater
+   actually honours — it silences the background check — and the wrapper
+   refuses the manual `upgrade`/`update` command (KG-1/JE-2), so neither the
+   background nor the naive-use manual self-update path replaces the pinned
+   binary with an upstream build. The config tree and boot files
+   (`entrypoint.sh`, `health_server.py`, `agent_comm_protocol.json`) are
+   root-owned and read-only in the image, including deployments that restart
+   the same container filesystem. The entrypoint re-derives the default
+   runtime config from the baked source at every boot. An override copy gets
+   owner-write permission before the config writers run; the baked source
+   stays read-only. Live runtime/project configs and operator-selected
+   `OPENCODE_CONFIG` remain untrusted and mutable.
 4. **CI guard.** `.gitlab/scripts/check-worker-exposure-policy.sh` (job
    `worker-exposure-policy-guard`, security stage) asserts the pins, the
    ruleset ordering, the wrapper (every-token scan), the Dockerfile wiring
@@ -835,7 +842,7 @@ v2.0.32 clone on this branch):
 | Foreground serve, pairing addresses, remote URL advertisement; web-UI archive/compression changes | Keep explicit loopback serve and per-boot Basic auth. `serve --service` and non-loopback `--hostname` stay refused. Server-backed CLI commands still default to private servers via the boot-time `disabled: true` reset. |
 | Session sharing / publication | `share: "disabled"` remains valid in `packages/schema/src/config.ts`; no additional publication switch was introduced. Keep the baked config and startup protections. |
 | Remote MCP: capability negotiation, query-parameter compatibility and numeric timeouts (`fbf5f164`, `7b5f1bd9`, `a448d5b9`) | Existing explicitly configured outbound MCP clients remain supported. No new worker listener or automatic sharing default; these are not an egress boundary. |
-| Auto-update: WinGet support and install-method detection changes (`d46588fe`, `e5a557ef`, `707de583`, `47e5e715`), embedded release highlights | `update: "disable"` remains valid; no new auto-update key. Keep the pin and root-owned binary. WinGet is outside this Linux image; manual upgrade remains distinct from the disabled automatic policy. |
+| Auto-update: WinGet support and install-method detection changes (`d46588fe`, `e5a557ef`, `707de583`, `47e5e715`), embedded release highlights | `update: "disable"` remains a valid config literal, but it does not reach the updater (`readPolicy()` reads only the global config dir, never `OPENCODE_CONFIG` — run-158 KG-3). `OPENCODE_DISABLE_AUTOUPDATE=1` in the image env silences the background check (the switch the updater actually honours), and the wrapper refuses the manual `upgrade`/`update` command (KG-1) — including `upgrade --method curl`, which would install an unpinned tunnel-capable upstream build at `$HOME/.opencode/bin`. Keep the pin and root-owned binary. WinGet is outside this Linux image. |
 | Experimental voice API (`packages/core/src/voice.ts`, `protocol/src/groups/voice.ts`) | Adds authenticated outbound voice-session creation using caller-supplied input and provider credentials, not another listener. The bridge does not call it or provision voice credentials; no startup publication is enabled. WI#424 remains the boundary work for arbitrary outbound use. |
 | External provider credentials and top-level integration/tool policies | Azure CLI credentials become external references and policy support is additive. No new exposure config is enabled by this lane; existing tool denies remain in force. |
 
@@ -875,7 +882,7 @@ V2-union proof. Goals item 64 remains open.
   (`df42032e6c15…`, revision `4db886f7b…` — digest differs only by the
   source-revision label).
 - **Real tenant job (item 71):** temporary test tenant `spitfire` (WI#273
-  name, non-animal) provisioned on this Gentoo/OpenRC host with
+  name, non-animal) provisioned on this host (Arch Linux, systemd 262) with
   `--with-opencode2`, running this branch. Job
   `cbf1c213-2d35-4f5a-a25c-e5031f3f9efa` drove the full path (gateway chat →
   LLM loop → `create_job` → approval gate → resume → WS dispatch → v2.0.32

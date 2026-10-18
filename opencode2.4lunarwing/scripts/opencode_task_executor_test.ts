@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
+import { tmpdir } from "node:os"
 
 import type { OpenCodeClient } from "@opencode/client/promise"
 
@@ -593,6 +594,78 @@ assert.ok(contextPromptArgs[1].signal instanceof AbortSignal)
       `session ruleset must deny shell "*opencode ${subcommand} *" after the allow rule`,
     )
   }
+}
+
+// !1735 review KG-2 / !1699 JE-1: upstream v2.0.32 dropped the v2.0.24
+// `external_directory * ask` build-agent default, so workspace-external
+// paths went from ask→rejected to silently allowed. The session ruleset must
+// restore it: model upstream's findLast evaluation over the build-agent
+// defaults (v2.0.32 ships only `* allow` plus the .env asks) followed by the
+// session rules, and require ask for sensitive outside-workspace paths while
+// keeping the server's own tool-output/shell/tmp scratch directories allowed.
+{
+  const rulesetSdk = makeSdk({})
+  await runTask(rulesetSdk.sdk)
+  const createInput = rulesetSdk.createArgs[0] as [
+    { permissions?: Array<{ action: string; resource: string; effect: string }> },
+  ]
+  const sessionRules = createInput[0].permissions ?? []
+  // v2.0.32 build-agent defaults at the pin (packages/schema/src/agent.ts):
+  // tool allow-alls plus the .env asks — no external_directory rule remains.
+  const buildAgentDefaults: Array<{ action: string; resource: string; effect: string }> = [
+    { action: "read", resource: "file:///*", effect: "allow" },
+    { action: "shell", resource: "*", effect: "allow" },
+    { action: "webfetch", resource: "file:///*", effect: "allow" },
+    { action: "edit", resource: ".env", effect: "ask" },
+  ]
+  const wildcardMatch = (pattern: string, value: string): boolean =>
+    new RegExp(
+      `^${pattern
+        .split("*")
+        .map((segment) => segment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+        .join(".*")}$`,
+    ).test(value)
+  const evaluate = (action: string, resource: string): string => {
+    const matching = [...buildAgentDefaults, ...sessionRules].filter(
+      (rule) => rule.action === action && wildcardMatch(rule.resource, resource),
+    )
+    return matching.length > 0 ? matching[matching.length - 1]!.effect : "allow"
+  }
+
+  const home = process.env.HOME ?? "/home/opencode2"
+  const scratchRoots = [
+    `${home}/.local/share/opencode/tool-output`,
+    `${home}/.local/share/opencode/shell`,
+    `${tmpdir()}/opencode`,
+  ]
+  for (const path of [
+    `${home}/.ssh/authorized_keys`,
+    "/proc/1/environ",
+    `${home}/.config/opencode/service.json`,
+  ]) {
+    assert.equal(
+      evaluate("external_directory", path),
+      "ask",
+      `external_directory must require ask for outside-workspace ${path}`,
+    )
+  }
+  for (const root of scratchRoots) {
+    const sample = `${root}/session-1/attempt.log`
+    assert.equal(
+      evaluate("external_directory", sample),
+      "allow",
+      `external_directory must stay allowed for the server's scratch ${sample}`,
+    )
+  }
+  // The bridge cannot answer ask prompts, so the ask effect is a practical
+  // deny: it surfaces as permission.asked (the executor auto-denies), not a
+  // silent success.
+  assert.ok(
+    sessionRules.some(
+      (rule) => rule.action === "external_directory" && rule.resource === "*" && rule.effect === "ask",
+    ),
+    "session ruleset must carry the external_directory * ask fallback",
+  )
 }
 
 console.log("opencode2 task executor self-check passed")

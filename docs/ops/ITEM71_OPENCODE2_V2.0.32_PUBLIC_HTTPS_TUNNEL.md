@@ -93,6 +93,16 @@ the opencode2 worker breaks that in a specific, bad way:
   operator's infrastructure (blind to plaintext, but not blind to metadata:
   connection timing, visitor IPs at the relay, device identity anchored in
   the hosted zone).
+- **Self-upgrade re-imports the tunnel (run-158 KG-1 / !1699 JE-2).** The
+  `upgrade` command (alias `update`) is first-class at the pin; with
+  `--method curl` it downloads and runs `https://opencode.ai/v2/install`,
+  installing the latest *unpinned* upstream release — OpenTunnel compiled in
+  — at `$HOME/.opencode/bin/opencode`, outside the wrapper and the
+  compile-out guard. Neither the lane's `update: "disable"` pin nor
+  `OPENCODE_DISABLE_AUTOUPDATE` gates the *manual* command (the kill switch
+  gates only the background check). The wrapper refuses `upgrade`/`update`
+  outright; with open egress a compromised agent can still fetch an upstream
+  binary by hand (see §4).
 - **Anonymous, durable device identity in agent-writable storage.**
   `$XDG_DATA_HOME/opentunnel` is owned by the agent uid; the identity survives
   opencode restarts and is shared with any other SDK consumer on the machine.
@@ -108,11 +118,11 @@ the opencode2 worker breaks that in a specific, bad way:
 | # | Control | State at v2.0.32 (this branch) |
 |---|---|---|
 | 8 | **Compile-out** (`scripts/compile_out_remote_tunnel.py`, builder stage) | `remote-tunnel.ts` is replaced with a fail-closed stub (`run`/`ensure` die; `hostname` reports none). **Verified against the real pinned tree on 2026-10-18**: guard stubbed the module, importers use exactly `run`/`ensure`/`hostname`, no quoted `@opentunnel/*` specifier survives anywhere under `packages/{cli,server,schema,core}/src`. Drift (module moved, new export in use, leftover import) fails the build. The declared `@opentunnel/client` dep remains in the upstream frozen lockfile but imports nothing; the runtime-stage **binary marker scan** (`exposure_policy_assert.py --binary`) is the backstop that proves it is not bundled. |
-| 2 | **Wrapper** (`opencode-exposure-guard.sh` as `/usr/local/bin/opencode`) | Every-argv-token scan refuses `service`, `pair`, `--service`, and non-loopback `--hostname`. Test suite extended on this branch to lock refusal of `pair --remote`, `pair --remote --yes`, and `--print-logs pair --remote -y` (39/39 pass). |
+| 2 | **Wrapper** (`opencode-exposure-guard.sh` as `/usr/local/bin/opencode`) | Every-argv-token scan refuses `service`, `pair`, `--service`, `upgrade`/`update` (self-upgrade), and non-loopback `--hostname`. Test suite extended on this branch to lock refusal of `pair --remote`, `pair --remote --yes`, `--print-logs pair --remote -y`, and `opencode upgrade --method curl` (run-158 KG-1 / !1699 JE-2). |
 | — | **Boot reset** (`entrypoint.sh:32-33`) | Every boot removes any planted `service.json` (FIFO/dir/symlink safe) and rewrites `{"disabled": true}`, discarding a planted `remote.route` and `remoteAccepted` — the v2.0.32 field shapes are now planted by `entrypoint_config_test.py` and the boot suite passes (7/7). |
-| — | **Config pins** (`config/opencode2.json`, root-owned read-only) | `share: "disabled"` and `update: "disable"` re-verified as valid schema literals in the pinned `packages/schema/src/config.ts` (lines 39, 42). Session sharing/publication stays off; self-update stays off. |
-| 2b | **Bridge permission denies** | `sessionPermissions()` in `opencode_task_executor.ts` denies shell forms of `opencode service/pair/serve` (ordering after the allow-all rule preserved). |
-| 5 | **Ownership/mode + wrapper digest anchor** | `LUNARWING_WRAPPER_SHA256` build-arg anchor compared by the in-image `--image-filesystem` assert; guard files root-owned read-only. |
+| — | **Config pins** (`config/opencode2.json`, root-owned read-only) | `share: "disabled"` and `update: "disable"` re-verified as valid schema literals in the pinned `packages/schema/src/config.ts` (lines 39, 42). Session sharing/publication stays off. **The `update` pin is not honored by the updater itself** (run-158 KG-3 / !1699 JE-3): the updater's `readPolicy()` reads only `config.json`/`opencode.json`/`opencode.jsonc` in the global config dir and never `OPENCODE_CONFIG`, so the lane config never reaches it. The image env carries `OPENCODE_DISABLE_AUTOUPDATE=1` — the switch the updater actually honours — and the wrapper refuses the manual `upgrade`/`update` command (KG-1). |
+| 2b | **Bridge permission denies** | `sessionPermissions()` in `opencode_task_executor.ts` denies shell forms of `opencode service/pair/serve` (ordering after the allow-all rule preserved) and restores the `external_directory * ask` confinement v2.0.32 dropped upstream (run-158 KG-2 / !1699 JE-1): outside-workspace paths surface as `permission.asked` — auto-denied by the headless bridge — while the server's own tool-output/shell/tmp scratch directories stay allowed. |
+| 5 | **Ownership/mode + wrapper digest anchor** | `LUNARWING_WRAPPER_SHA256` build-arg anchor compared by the in-image `--image-filesystem` assert; `OPENCODE_DISABLE_AUTOUPDATE=1` asserted in the image env (KG-3); guard files root-owned read-only. |
 | 9 | **Live listener audit** | `mt-admin worker-listeners <tenant>` still runs on the tenant (see §5 caveat: it cannot see an *outbound* tunnel — it catches non-loopback *binds*, e.g. a direct `serve --hostname 0.0.0.0`). |
 | — | **SDK gate** (WI#329) | `sdk_surface_assert.ts` executed locally against the pinned v2.0.32 client/schema/protocol source: 6 bridge methods present, 2 known-stale paths absent, all 8 bridge event names present. |
 
@@ -126,8 +136,10 @@ agent**, unchanged in kind from the !1490 gate record:
 - `service.json` is agent-writable between boots; the reset is per-boot.
 - With open egress, a compromised agent can download a stock upstream opencode
   or run `@opentunnel/client` directly under bun and establish the tunnel
-  anyway — no in-image control can stop that. **Only the deferred egress
-  allowlist (now tracked as WI#424 for 2.1.7.0) is a real boundary**, and it
+  anyway — no in-image control can stop that. The wrapper refuses the
+  `upgrade`/`update` command, but the same egress lets the agent fetch and
+  exec the upstream binary by hand. **Only the deferred egress allowlist
+  (now tracked as WI#424 for 2.1.7.0) is a real boundary**, and it
   remains unimplemented. The WI#427 crossing was approved explicitly on this
   basis.
 - WI#369's SDK-gate blind spots (syntax-based call binding, corpus event
@@ -150,8 +162,12 @@ publication default:
 - **Remote MCP**: capability negotiation / query-param compatibility / numeric
   timeouts — outbound client behavior for explicitly configured MCP servers
   only.
-- **Auto-update**: WinGet support and install-method detection (Windows-only;
-  N/A in this Linux image). `update: "disable"` still honored.
+- **Auto-update: WinGet support and install-method detection (Windows-only;
+  N/A in this Linux image). `update: "disable"` in the lane config is NOT
+  honored by the updater (KG-3/JE-3: it reads only the global config dir).
+  `OPENCODE_DISABLE_AUTOUPDATE=1` in the image env silences the background
+  check; the manual `upgrade`/`update` command is refused by the wrapper
+  (KG-1/JE-2).**
 - **Provider credentials**: Azure CLI credentials become external references;
   additive policy support. No new exposure config enabled by this lane.
 
@@ -183,8 +199,9 @@ publication default:
 ## 7. Live-tenant evidence
 
 Temporary test tenant **spitfire** (WI#273 list name, non-animal — exempt
-from the animal-name teardown routine), provisioned on this Gentoo/OpenRC
-host 2026-10-18 with `--with-opencode2`, port block 10020-10029
+from the animal-name teardown routine), provisioned on this host
+(Arch Linux, systemd 262) 2026-10-18 with `--with-opencode2`, port block
+10020-10029
 (`opencode2_wss` 51020), LLM endpoint `http://100.88.232.146:3000/openai/v1`
 (NetBird TensorZero; `OPENCODE2_BASE_URL` inherited per WI#330). The tenant
 clone tracks this branch (`aj/kimi-71-20261018-0601` @ `4db886f7b`), so the
@@ -222,7 +239,7 @@ exercised image is this bump.
 Caveats carried from item 72's A7: `/api/chat/history` mislabels the
 in-flight turn as `Failed` while the engine has it gated/Running — cosmetic,
 pre-existing, reproduced here. The tenant is **left running**
-(boot-persistent under OpenRC) for maintainer inspection; decommission with
+(boot-persistent under systemd) for maintainer inspection; decommission with
 `sudo bash ic/scripts/lunarwing-mt-admin.sh remove-tenant spitfire --purge`.
 
 ## 8. Bottom line
