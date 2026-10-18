@@ -116,8 +116,12 @@ start_pre() {
 INITEOF
 }
 
-# The one python3 spelling both the renderer and the safe-unit contract use
-# (WI#393 HF-1). The unit's interpreter slot must not depend on the calling
+# The one python3 spelling the proxy renderer and the safe-unit contract use
+# (WI#393 HF-1) — and, since WI#415, the spelling the weechat, relay,
+# weechat-adapter and darkirc-adapter OpenRC renderers in
+# mt-admin-lib/08-units-openrc.sh bake into their units, so every
+# OpenRC-rendered python3 reference on a host shares one canonical spelling.
+# The unit's interpreter slot must not depend on the calling
 # process's PATH: root login shells, sudo's secure_path, the onboarder's
 # .venv and pyenv shims all resolve python3 differently, and a unit rendered
 # under one spelling but checked under another is refused fleet-wide while

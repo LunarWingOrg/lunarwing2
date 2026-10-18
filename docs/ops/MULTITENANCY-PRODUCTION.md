@@ -623,7 +623,15 @@ PATH-independent helper — the
 `python3` under `/usr/local/bin:/usr/bin:/bin`, allowlisted to plain path
 characters — so the two cannot drift apart and the calling process's PATH
 (a venv, sudo's `secure_path`, a pyenv shim) cannot flip a verdict or
-ping-pong the units between spellings. The override lives only in the
+ping-pong the units between spellings. Since WI#415 the same resolver also
+supplies the interpreter spelling baked by the weechat, relay,
+weechat-adapter and darkirc-adapter OpenRC renderers, so every
+OpenRC-rendered python3 reference on a host shares the canonical spelling,
+the override governs all of them at once, and a render with no resolvable
+interpreter fails closed. Those units have no equality checker, so a unit
+rendered before WI#415 keeps whatever spelling the caller's PATH produced
+until the next re-render (add-tenant, `render-units`, `upgrade-tenant`).
+The override lives only in the
 calling process's environment and nothing persists it: `sudo` under
 `env_reset` strips it, cron and timer launchers start without it, and the
 onboarder (run via sudo) never sees it — any guarded mt-admin call made
