@@ -3,6 +3,7 @@
   "model": "tensorzero/tensorzero::function_name::lunarwing",
   "share": "disabled",
   "update": "disable",
+  "plugins": ["/app/scripts/lunarwing_tool_plugin"],
   "permissions": [
     { "action": "shell", "resource": "*opencode service *", "effect": "deny" },
     { "action": "shell", "resource": "*opencode pair *", "effect": "deny" },
