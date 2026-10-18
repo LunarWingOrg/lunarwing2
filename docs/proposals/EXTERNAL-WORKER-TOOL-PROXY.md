@@ -215,7 +215,11 @@ tool_allowlist = ["memory_read", "memory_write", "knowledge_search",
   shared listener's entries carry *differing* `cron.tool_allowlist`
   grants the manager strips every cron grant on that listener with an
   `error!` (fail closed); identical grants are the same authority on
-  both sides and stay, with a `warn!`. The manager additionally strips the
+  both sides and stay, with a `warn!`. The strip is a single pass: an
+  entry stripped for one listener can still, on another listener it
+  shares with identical-grant entries, borrow a grant equal to its own
+  configured list — no mission gains authority beyond its
+  configuration. The manager additionally strips the
   worker-level list of a non-cron entry whose endpoint shares a cron
   entry's container (MR !1561 EV-1). The comparison uses a normalized
   endpoint key (MR !1571 review FE-1): loopback spellings fold into one
