@@ -221,6 +221,15 @@ rc=$?
 assert_exit "render-systemd on an initialized root with TENSORZERO_URL" "0" "$rc"
 assert_file_contains "TENSORZERO_URL wins over the baked proxy.env value" "$ROOT_A/systemd/lunarwing-proxy-test.service" "tensorzero http://second.test:3000"
 
+# JV-1: proxy.env is written first in ensure_env (JK-3), so a fresh-root
+# refusal generates no other env file (no fresh tokens or keys left behind).
+ROOT_K="$WORK/env-k"
+out="$(env -u LUNARWING_TEST_TENSORZERO_URL -u TENSORZERO_URL LUNARWING_TEST_ROOT="$ROOT_K" bash "$TEST_ENV" render-systemd 2>&1)"
+rc=$?
+assert_exit "fresh-root render-systemd dies with no knob" "1" "$rc"
+assert_absent "fresh-root refusal generates no lunarwing.env" "$ROOT_K/env/lunarwing.env"
+assert_absent "fresh-root refusal generates no xmpp-bridge.env" "$ROOT_K/env/xmpp-bridge.env"
+
 if grep -qF '192.168.1.157' "$TEST_ENV"; then
   fail "lunarwing-xmpp-test-env.sh source pin" "dev-LAN literal still present"
 else
