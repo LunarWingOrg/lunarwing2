@@ -7,7 +7,7 @@
 # this worker. Re-bump only after both are fixed upstream.
 ARG OPENCODE_VERSION=v1.18.25
 ARG OPENCODE_REF=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
-ARG DEBIAN_SNAPSHOT=20260906T000000Z
+ARG DEBIAN_SNAPSHOT=20261017T082437Z
 ARG SOURCE_REVISION=unknown
 
 # ──────────────────────

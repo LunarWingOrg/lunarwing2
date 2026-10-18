@@ -1,26 +1,47 @@
 # Trivy ignore list for the worker-image scan gate (`.worker-scan` in
-# `.gitlab/ci/containers.yml`). Every entry must carry a rationale and an
-# `expiring:` date — expired entries stop being ignored and the scan gate
-# fails again until the finding is re-reviewed. Verified against the
-# 20260906T000000Z Debian snapshot builds on 2026-09-06; all six CVEs report
-# no fix in Debian for the pinned toolchains (Trivy FixedVersion "-").
-# Reviewed: 2026-09-06, MR adding the worker scan-gate ignore policy.
-
-# perl is a hard dependency of git (`git Depends: perl`) and every worker
-# runtime ships git; removing perl removes git.
-CVE-2026-13221 expiring:2027-03-06
-CVE-2026-42496 expiring:2027-03-06
-CVE-2026-8376 expiring:2027-03-06
+# `.gitlab/ci/containers.yml`). Every entry must carry a rationale (in the
+# comment block above it) and an expiry date in Trivy's own syntax:
+# `CVE-....-.... exp:YYYY-MM-DD` (exactly one space, lowercase `exp:`).
+# Trivy's plain ignore-file parser (`pkg/result/ignore.go`,
+# `getExpirationDate`) only recognises the `exp:` prefix and drops an entry
+# once that date passes (`Prune`), so expired entries stop being ignored and
+# the scan gate fails again until the finding is re-reviewed. `expiring:` is
+# NOT Trivy syntax: before WI#361 every entry here used it, the parser found
+# no `exp:` field, and all six suppressions silently never expired. The
+# `ci-config` validator (`validate_trivy_ignore` in
+# `.gitlab/scripts/validate_config.py`) now rejects any non-comment line that
+# does not match this syntax and any expiry more than six months out.
+#
+# Re-verified 2026-10-17 against the pinned 20261017T082437Z Debian snapshot
+# and the Debian security tracker (WI#361 fix item 3):
+# - The three perl CVEs previously suppressed here (CVE-2026-13221,
+#   CVE-2026-42496, CVE-2026-8376) are FIXED at this snapshot
+#   (bookworm-security perl 5.36.0-7+deb12u4, DLA-4821-1; trixie
+#   5.40.1-6+deb13u1) and are no longer listed.
+# - bookworm (kimi, pebble images) still ships vulnerable libsqlite3-0
+#   3.40.1-2+deb12u2 and zlib1g 1:1.2.13.dfsg-1; trixie (opencode,
+#   opencode2 images) ships the fixed 3.46.1-7+deb13u2 and
+#   1:1.3.dfsg+really1.3.1-1.
+# - openssh-client is still vulnerable in BOTH distros (bookworm
+#   1:9.2p1-2+deb12u10, trixie 1:10.0p1-7+deb13u4).
 
 # libpython3.11-stdlib -> libsqlite3-0: python3's sqlite3 stdlib module.
 # opencode scripts/study_notes_config.py imports sqlite3 and is exercised by
-# a build-time test gate. Revisit when the next-gen study-notes config lands.
-CVE-2025-7458 expiring:2027-03-06
+# a build-time test gate. Still needed for the bookworm images (kimi,
+# pebble); trixie ships the fixed 3.46.1-7+deb13u2, so this entry is inert
+# for opencode/opencode2. Revisit when the next-gen study-notes config lands.
+CVE-2025-7458 exp:2027-04-17
 
 # openssh-client is required for git+ssh worker operation (CVE-2026-60002 is
-# a client-side UAF during host key re-exchange).
-CVE-2026-60002 expiring:2027-03-06
+# a client-side UAF during host key re-exchange). Still vulnerable in both
+# bookworm and trixie at the 20261017T082437Z snapshot, so all four worker
+# images need this entry.
+CVE-2026-60002 exp:2027-04-17
 
-# zlib1g CVE-2023-45853 affects the minizip code path Debian does not ship;
-# wontfix upstream. git itself Depends: zlib1g.
-CVE-2023-45853 expiring:2027-03-06
+# zlib1g CVE-2023-45853 affects the minizip code path Debian's zlib1g does
+# not ship; wontfix upstream. git itself Depends: zlib1g. Still needed for
+# the bookworm images (kimi, pebble: zlib 1:1.2.13.dfsg-1 vulnerable);
+# trixie's zlib 1:1.3.dfsg+really1.3.1-1 is fixed, so this entry is inert
+# for opencode/opencode2. (bookworm's separate minizip package is fixed at
+# 1.1-8+deb12u1; the suppression covers zlib1g only.)
+CVE-2023-45853 exp:2027-04-17

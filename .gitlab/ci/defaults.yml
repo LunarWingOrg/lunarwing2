@@ -44,7 +44,7 @@ variables:
   # CI_DEBIAN_SNAPSHOT must stay equal to the valued ARG DEBIAN_SNAPSHOT in
   # kimicode4lunarwing/Dockerfile (enforced by validate_config.py); the
   # worker-kimi-ts lane installs its python3 prerequisite from this snapshot.
-  CI_DEBIAN_SNAPSHOT: "20260906T000000Z"
+  CI_DEBIAN_SNAPSHOT: "20261017T082437Z"
   # The runner contract reserves 40 GiB after checkout. Keep the compiler cache
   # below 30% of that budget so target files and registry archives have room.
   RUSTC_WRAPPER: "$CI_PROJECT_DIR/.ci-cache/bin/sccache"
