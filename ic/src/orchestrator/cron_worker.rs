@@ -2560,4 +2560,251 @@ mod tests {
             job_mode: "external:mock".to_string(),
         }
     }
+
+    /// WI#371: an ABSENT control row loads the defaults with no fault; a
+    /// well-formed row round-trips pause + breaker counter; a malformed row
+    /// fails CLOSED (paused + actionable error); the legacy `paused` key is a
+    /// read-only fallback while no control row exists — and its own
+    /// read/parse failures fail closed too.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn load_mission_state_distinguishes_absent_failed_and_malformed() {
+        let (db, _dir) = crate::testing::test_db().await;
+        let control = control_state_key("pr-digest");
+        let legacy = paused_key("pr-digest");
+
+        // Absent: defaults, no fault.
+        let state = load_mission_state(Some(&db), "owner", "pr-digest").await;
+        assert!(!state.paused);
+        assert_eq!(state.consecutive_abandoned, 0);
+        assert!(state.durability_error.is_none());
+
+        // Well-formed row: both fields round-trip.
+        db.set_setting("owner", &control, &serde_json::json!({"paused": true, "consecutive_abandoned": 2}))
+            .await
+            .unwrap(); // safety: test
+        let state = load_mission_state(Some(&db), "owner", "pr-digest").await;
+        assert!(state.paused);
+        assert_eq!(state.consecutive_abandoned, 2);
+        assert!(state.durability_error.is_none());
+
+        // Malformed row: fail closed with an actionable error.
+        db.set_setting("owner", &control, &serde_json::json!({"paused": "yes"}))
+            .await
+            .unwrap(); // safety: test
+        let state = load_mission_state(Some(&db), "owner", "pr-digest").await;
+        assert!(state.paused, "malformed control state must fail closed");
+        assert_eq!(state.consecutive_abandoned, 0);
+        assert!(
+            state
+                .durability_error
+                .as_deref()
+                .expect("fault recorded") // safety: test
+                .contains("malformed")
+        );
+
+        // No control row: the legacy pause flag still applies.
+        db.delete_setting("owner", &control).await.unwrap(); // safety: test
+        db.set_setting("owner", &legacy, &serde_json::json!(true))
+            .await
+            .unwrap(); // safety: test
+        let state = load_mission_state(Some(&db), "owner", "pr-digest").await;
+        assert!(state.paused, "legacy paused flag must still apply");
+        assert_eq!(state.consecutive_abandoned, 0);
+        assert!(state.durability_error.is_none());
+
+        // A malformed legacy flag fails closed as well.
+        db.set_setting("owner", &legacy, &serde_json::json!("not-a-bool"))
+            .await
+            .unwrap(); // safety: test
+        let state = load_mission_state(Some(&db), "owner", "pr-digest").await;
+        assert!(state.paused);
+        assert!(
+            state
+                .durability_error
+                .as_deref()
+                .expect("fault recorded") // safety: test
+                .contains("legacy cron pause flag is malformed")
+        );
+    }
+
+    /// WI#371: a settings-store READ failure starts the mission paused with
+    /// the fault recorded (never a silent resume), and a healed store loads
+    /// cleanly again.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn load_mission_state_fails_closed_on_read_error() {
+        use crate::db::recording::FaultingSettingsDb;
+
+        let (inner, _dir) = crate::testing::test_db().await;
+        let faulting = Arc::new(FaultingSettingsDb::new(inner, "cron-mission:"));
+        faulting.set_fail_reads(true);
+        let db: Arc<dyn Database> = faulting.clone();
+
+        let state = load_mission_state(Some(&db), "owner", "pr-digest").await;
+        assert!(state.paused, "a failed control read must fail closed");
+        assert!(
+            state
+                .durability_error
+                .as_deref()
+                .expect("fault recorded") // safety: test
+                .contains("failed to read cron mission control state")
+        );
+
+        faulting.set_fail_reads(false);
+        let state = load_mission_state(Some(&db), "owner", "pr-digest").await;
+        assert!(!state.paused);
+        assert!(state.durability_error.is_none());
+    }
+
+    /// WI#371: control-state writes retry with bounded backoff — two injected
+    /// failures then a success persists the row and clears the sticky fault.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn persist_control_state_retries_then_succeeds_and_clears_the_error() {
+        use crate::db::recording::FaultingSettingsDb;
+
+        let (inner, _dir) = crate::testing::test_db().await;
+        let faulting = Arc::new(FaultingSettingsDb::new(inner, "cron-mission:pr-digest:control"));
+        let db: Arc<dyn Database> = faulting.clone();
+        let manager = Arc::new(ExternalWorkerManager::new(vec![]).with_store(db.clone()));
+        let worker = ExternalWorkerConfig::default();
+        let cron = test_cron();
+        let last = Arc::new(std::sync::Mutex::new(None));
+        let ctx = test_ctx(&manager, &worker, &cron, &last);
+        let mut state = MissionState {
+            tick_index: 7,
+            consecutive_abandoned: 2,
+            paused: true,
+            durability_error: Some("stale fault".to_string()),
+        };
+
+        faulting.fail_next_writes(2);
+        persist_control_state(&ctx, &mut state).await;
+        assert_eq!(
+            faulting.write_attempts().len(),
+            3,
+            "two injected failures + one success"
+        );
+        assert!(state.durability_error.is_none());
+        let row = db
+            .get_setting("owner", "cron-mission:pr-digest:control")
+            .await
+            .unwrap() // safety: test
+            .expect("control row persisted"); // safety: test
+        assert_eq!(
+            row,
+            serde_json::json!({"paused": true, "consecutive_abandoned": 2})
+        );
+    }
+
+    /// WI#371: a store that keeps failing exhausts the bounded retry budget
+    /// and the state records the durability fault instead of claiming success.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn persist_control_state_exhaustion_is_reported_on_the_state() {
+        use crate::db::recording::FaultingSettingsDb;
+
+        let (inner, _dir) = crate::testing::test_db().await;
+        let faulting = Arc::new(FaultingSettingsDb::new(inner, "cron-mission:pr-digest:control"));
+        let db: Arc<dyn Database> = faulting.clone();
+        let manager = Arc::new(ExternalWorkerManager::new(vec![]).with_store(db));
+        let worker = ExternalWorkerConfig::default();
+        let cron = test_cron();
+        let last = Arc::new(std::sync::Mutex::new(None));
+        let ctx = test_ctx(&manager, &worker, &cron, &last);
+        let mut state = MissionState::default();
+
+        faulting.fail_next_writes(10);
+        persist_control_state(&ctx, &mut state).await;
+        assert_eq!(
+            faulting.write_attempts().len(),
+            PERSIST_MAX_ATTEMPTS as usize,
+            "bounded retries must stop at the budget"
+        );
+        assert!(
+            state
+                .durability_error
+                .as_deref()
+                .expect("durability fault recorded") // safety: test
+                .contains("could not be persisted")
+        );
+    }
+
+    /// WI#371: the breaker counter and the trip share one atomic settings row
+    /// — every abandon persists the counter, the trip persists paused+count in
+    /// the same write, and a resolved tick durably resets the counter.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn after_tick_persists_breaker_progress_trip_and_reset_atomically() {
+        let (db, _dir) = crate::testing::test_db().await;
+        let manager = Arc::new(ExternalWorkerManager::new(vec![]).with_store(db.clone()));
+        let worker = ExternalWorkerConfig::default();
+        let cron = test_cron();
+        let last = Arc::new(std::sync::Mutex::new(None));
+        let ctx = test_ctx(&manager, &worker, &cron, &last);
+        let pause = Arc::new(AtomicBool::new(false));
+        let mut state = MissionState::default();
+        let key = control_state_key("pr-digest");
+
+        for expected in 1..CIRCUIT_BREAKER_THRESHOLD {
+            after_tick(
+                &ctx,
+                &mut state,
+                &pause,
+                TickEnd::Abandoned {
+                    job_id: Uuid::new_v4(),
+                    reason: "x".to_string(),
+                },
+            )
+            .await;
+            assert!(!state.paused);
+            let row = db
+                .get_setting("owner", &key)
+                .await
+                .unwrap() // safety: test
+                .expect("control row persisted"); // safety: test
+            assert_eq!(
+                row,
+                serde_json::json!({"paused": false, "consecutive_abandoned": expected}),
+                "every abandon must durably persist the counter"
+            );
+        }
+
+        after_tick(
+            &ctx,
+            &mut state,
+            &pause,
+            TickEnd::Abandoned {
+                job_id: Uuid::new_v4(),
+                reason: "final".to_string(),
+            },
+        )
+        .await;
+        assert!(state.paused, "breaker must trip at the threshold");
+        let row = db
+            .get_setting("owner", &key)
+            .await
+            .unwrap() // safety: test
+            .expect("control row persisted"); // safety: test
+        assert_eq!(
+            row,
+            serde_json::json!({"paused": true, "consecutive_abandoned": CIRCUIT_BREAKER_THRESHOLD}),
+            "the trip and the counter must land in one atomic write"
+        );
+
+        // A resolved tick durably resets the counter (the mission stays
+        // paused — only an owner resume clears that).
+        after_tick(&ctx, &mut state, &pause, TickEnd::Resolved).await;
+        let row = db
+            .get_setting("owner", &key)
+            .await
+            .unwrap() // safety: test
+            .expect("control row persisted"); // safety: test
+        assert_eq!(
+            row,
+            serde_json::json!({"paused": true, "consecutive_abandoned": 0}),
+            "a resolved tick must durably reset the counter"
+        );
+    }
 }

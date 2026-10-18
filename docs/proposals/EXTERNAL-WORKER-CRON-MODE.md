@@ -223,7 +223,13 @@ full session log is retrievable by reading the per-tick jobs' `job_events`
 - **Runaway guards (CU-2)** — config validation (above), exponential backoff,
   and a **circuit breaker**: after 3 consecutive abandoned ticks the mission
   pauses itself, persists the pause (restart-safe), and surfaces it via
-  `job_events` (`cron_paused`) and SSE.
+  `job_events` (`cron_paused`) and SSE. WI#371: the pause flag and the
+  consecutive-abandon counter share one atomic settings row
+  (`cron-mission:<id>:control`), so the trip and the count land in one write;
+  the counter is also persisted on every abandon and durably reset on an
+  owner resume or a resolved tick, and a control-state read/parse failure at
+  startup starts the mission paused (fail-closed) with the fault reported on
+  the mission status instead of silently resuming.
 - **Runtime stop (CU-2)** — the owner-gated `cron_mission` tool
   (`pause`/`resume`/`status`, owner-gated with AskEachTime and an explicit
   autonomous denylist, stricter than `cancel_job`). `cancel_job` ends only the current link;
@@ -346,7 +352,11 @@ full session log is retrievable by reading the per-tick jobs' `job_events`
 `POST /api/workers/{worker}/cron` accepts `{"action":"pause"}` or
 `{"action":"resume"}` (also `status`). Responses contain `action` and
 `mission` (`mission_id`, `worker_name`, `paused`, `tick_index`,
-`consecutive_abandoned`). Mutations enqueue the command and then read status,
+`consecutive_abandoned`, and WI#371's `durability_error`) plus a top-level
+`durable` flag (`mission.durability_error == null`): when `durable` is false
+the applied state is live but could not be persisted after bounded retries —
+a restart would lose it — so the caller is told rather than shown a false
+success. Mutations enqueue the command and then read status,
 so a 200 reflects the applied command. If the command was accepted by the
 supervisor queue but not confirmed within the 10-second bound, the response is
 `202 Accepted` with `queued: true` — re-query status before retrying
@@ -395,10 +405,20 @@ curl --fail -H "Authorization: Bearer $GATEWAY_AUTH_TOKEN" \
   test-only manual-fire wording corrected. A mission can still consume one
   parallel slot per active link for up to 4h × (1 + max_reentries) per tick.
 - **Deferred as permitted by the review:** [WI#371](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/371)
-  owns DN-5 (fail-open state reads, pause-write retries/acknowledgements, and
-  durable breaker counters); WI#370 owns DN-7 and remaining DO-4 (retention,
-  complete persisted outcome matrix and PostgreSQL FK CI coverage). Pause writes
-  are currently best-effort, and the abandon counter currently resets on restart.
+  owned DN-5 (fail-open state reads, pause-write retries/acknowledgements, and
+  durable breaker counters) — **landed for v2.1.6.0**: control-state reads
+  fail closed (paused + actionable `durability_error`), pause/resume/breaker
+  writes retry with bounded backoff and report exhaustion on the mission
+  status (HTTP `durable: false` / tool `durability_error`) instead of
+  claiming success, and the breaker counter is durable across restarts
+  (fault-injection coverage: read failures, write retry/exhaustion, and
+  restart after 1/2/3 abandoned ticks). WI#370 owns DN-7 and remaining DO-4 (retention,
+  complete persisted outcome matrix and PostgreSQL FK CI coverage). Rollback
+  note: the control state moved from the legacy `cron-mission:<id>:paused`
+  key to the combined `cron-mission:<id>:control` row; the legacy key is
+  still read as a fallback but never written, so a downgrade would not see
+  pauses written by this build (write both keys if a downgrade must keep
+  pause durability).
 
 ## Files
 
