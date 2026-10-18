@@ -125,16 +125,24 @@ export interface StringSpan {
  * Handles line/block comments, single/double quotes with escapes, and
  * template literals with ${}-nested code (which is scanned as code: a call
  * inside a template expression still counts). Regex literals are not
- * specially tokenized; none of the scanned bridge sources contain a regex
- * whose body holds a quote or a comment opener (such a regex would only
- * over-blank, which fails closed).
+ * tokenized — a regex whose body holds a quote or a comment opener would
+ * desynchronize the scan (its body looks like unterminated code, hiding
+ * whatever follows), so the scan counts those unterminated runs and
+ * returns them; the sdk_surface_test guard asserts zero on every scanned
+ * bridge source (WI#369 JR-3).
  */
 export function blankCommentsAndStrings(source: string): {
   blanked: string
   strings: StringSpan[]
+  /** Scan desynchronizations: quoted/template literals the scan could not
+   * close before end-of-line or end-of-input (typically a regex literal
+   * whose body contains a quote). Non-zero means the blanked text cannot be
+   * trusted and the caller must fail closed. */
+  unterminated: number
 } {
   const blanked = source.split("")
   const strings: StringSpan[] = []
+  let unterminated = 0
   const blank = (from: number, to: number) => {
     for (let k = from; k < to; k++) if (blanked[k] !== "\n") blanked[k] = " "
   }
@@ -163,6 +171,7 @@ export function blankCommentsAndStrings(source: string): {
       value += c
       i++
     }
+    if (!terminated) unterminated++
     const end = Math.min(i, n)
     blank(start, end)
     if (terminated && clean) strings.push({ start, end, value })
@@ -194,6 +203,7 @@ export function blankCommentsAndStrings(source: string): {
       }
       i++
     }
+    unterminated++
     blank(segmentStart, Math.min(i, n))
   }
 
@@ -234,7 +244,7 @@ export function blankCommentsAndStrings(source: string): {
   }
 
   scanCode(false)
-  return { blanked: blanked.join(""), strings }
+  return { blanked: blanked.join(""), strings, unterminated }
 }
 
 /**
@@ -386,7 +396,10 @@ export function parseV2EventTypes(typesSource: string): {
       problems.push(`V2Event member ${member} has no top-level type field — generator format drift?`)
       continue
     }
-    const literal = /^"([^"]+)"$/.exec(typeField[1]!.trim())
+    // RegExp constructor, not a regex literal: a regex literal whose body
+    // holds a quote desynchronizes blankCommentsAndStrings (JR-3), and this
+    // file is itself a scanned bridge source.
+    const literal = new RegExp('^"([^"]+)"$').exec(typeField[1]!.trim())
     if (!literal) {
       dynamicMembers.push(member)
       continue
