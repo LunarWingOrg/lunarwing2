@@ -132,9 +132,9 @@ worker-kimi-ts:
     - npm test
 
 # WI#375 DR-3: the opencode2 bridge's dependency-free TS suites previously
-# gated only at the (protected) worker image build. The executor suite needs
-# the image's built @opencode/client and stays image-gated. Pinned by
-# validate_config.py like the other worker TS lanes (WORKER_TS_LANE_SCRIPTS).
+# gated only at the (protected) worker image build. The executor and bridge
+# suites need the image's built @opencode/client and stay image-gated. Pinned
+# by validate_config.py like the other worker TS lanes (WORKER_TS_LANE_SCRIPTS).
 worker-opencode2-ts:
   stage: validate
   needs: []
@@ -153,6 +153,8 @@ worker-opencode2-ts:
     - bun scripts/path_expand_test.ts
     - bun scripts/task_prompt_test.ts
     - bun scripts/opencode_result_test.ts
+    - bun scripts/lunarwing_tool_proxy_test.ts
+    - bun scripts/lunarwing_tool_plugin_test.ts
 
 # WI#375 DR-3: pebble's Rust suite previously gated only at the (protected)
 # worker image build (`cargo test --locked` in the Dockerfile). Pinned by

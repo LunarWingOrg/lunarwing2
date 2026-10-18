@@ -341,6 +341,9 @@ RUN set -eu; \
     && bun scripts/path_expand_test.ts \
     && bun scripts/opencode_result_test.ts \
     && bun scripts/opencode_task_executor_test.ts \
+    && bun scripts/lunarwing_tool_proxy_test.ts \
+    && bun scripts/lunarwing_tool_plugin_test.ts \
+    && bun scripts/lunarwing_bridge_test.ts \
     && python3 scripts/prepare_reproducible_build_test.py \
     && python3 scripts/study_notes_config_test.py \
     && python3 scripts/exposure_policy_assert_test.py \
