@@ -183,6 +183,22 @@ try {
     failOutput.includes('"session.idle"'),
     `the event loop must name the event missing from the union:\n${failOutput}`,
   )
+  // JR-4: each failure class must fail the build ON ITS OWN. The combined
+  // fixture above fails both at once, so a CLI that prints a FATAL line but
+  // forgets to set the failed flag for just one class still passed. A
+  // method-only or event-only drift must exit 1 by itself.
+  const methodOnly = runGate(badClientModule, goodTypes)
+  assert.equal(
+    methodOnly.status,
+    1,
+    `a missing bridge method alone must fail the build, got ${methodOnly.status}`,
+  )
+  const eventOnly = runGate(goodClientModule, badTypes)
+  assert.equal(
+    eventOnly.status,
+    1,
+    `an event missing from the union alone must fail the build, got ${eventOnly.status}`,
+  )
 } finally {
   rmSync(fixtureDir, { recursive: true, force: true })
 }
