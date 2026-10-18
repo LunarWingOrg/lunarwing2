@@ -2763,7 +2763,7 @@ impl Tool for CronMissionTool {
                 "action": {
                     "type": "string",
                     "enum": ["pause", "resume", "status"],
-                    "description": "pause: stop future ticks until resumed; resume: clear the pause and reset the circuit breaker; status: report mission state"
+                    "description": "pause: stop future ticks until resumed; resume: clear the pause and reset the circuit breaker; status: report mission state. The returned mission's durability_error is null when the state is durable; a string means the last state read/write failed and a restart could lose it (WI#371)."
                 },
                 "worker": {
                     "type": "string",

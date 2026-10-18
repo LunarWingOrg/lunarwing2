@@ -38,6 +38,60 @@ export function parseEnvelope(data: string): Envelope | null {
   }
 }
 
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+}
+
+export function utf8ByteLength(value: string): number {
+  return Buffer.byteLength(value, "utf8")
+}
+
+export function truncateUtf8(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value, "utf8")
+  if (bytes.length <= maxBytes) return value
+  let end = Math.max(0, maxBytes)
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end--
+  return bytes.subarray(0, end).toString("utf8")
+}
+
+/**
+ * Serialize an envelope, shrinking the large free-text fields when the frame
+ * exceeds the peer's bound. Throws when even a fully truncated payload cannot
+ * fit — callers pre-check bounded payloads so this never fires for them.
+ * Shared with the WI#324 tool-proxy relay (256 KiB tool_call cap).
+ */
+export function serializeEnvelopeWithinLimit(envelope: Envelope, maxBytes: number): string {
+  const limited: Envelope = { ...envelope, payload: { ...envelope.payload } }
+  let serialized = JSON.stringify(limited)
+  if (utf8ByteLength(serialized) <= maxBytes) return serialized
+
+  for (const field of ["output", "delta", "error"] as const) {
+    const value = limited.payload[field]
+    if (typeof value !== "string") continue
+    let low = 0
+    let high = utf8ByteLength(value)
+    let best = ""
+    while (low <= high) {
+      const middle = Math.floor((low + high) / 2)
+      const candidate = truncateUtf8(value, middle)
+      limited.payload[field] = candidate
+      const encoded = JSON.stringify(limited)
+      if (utf8ByteLength(encoded) <= maxBytes) {
+        best = candidate
+        serialized = encoded
+        low = middle + 1
+      } else {
+        high = middle - 1
+      }
+    }
+    limited.payload[field] = best
+    serialized = JSON.stringify(limited)
+    if (utf8ByteLength(serialized) <= maxBytes) return serialized
+  }
+
+  throw new Error(`WebSocket envelope exceeds ${maxBytes} bytes`)
+}
+
 // ── Message Types ─────────────────────────────────────────────────────────────
 
 export interface TaskContext {

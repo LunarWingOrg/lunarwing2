@@ -10,6 +10,8 @@ Persistent container worker for upstream opencode. The WebSocket bridge is TypeS
 - `scripts/opencode_task_executor.ts` — Task execution via opencode SDK. Controls session creation, permissions, event streaming.
 - `scripts/lunarwing_runtime.ts` — Shared types and envelope helpers. Keep in sync with `agent_comm_protocol.json`.
 - `scripts/opencode_result.ts` — Result/error extraction and the serve-log enrichment (`withServeLogDetail`): reads serve's structured log (`$XDG_DATA_HOME|~/.local/share/opencode/log/opencode.log`, or `OPENCODE_SERVE_LOG`; empty disables) to attach the root cause to generic "Unexpected server error" job failures. Path is frozen at module load.
+- `scripts/lunarwing_tool_proxy.ts` — WI#324 worker-side relay: per-task unix socket that turns the in-task plugin's requests into `tool_call`/`tool_list` hub frames and routes replies back by call id. Same wire contract as the kimi lane's relay.
+- `scripts/lunarwing_tool_plugin.ts` — WI#324 opencode plugin (registered in `config/opencode.json`) that statically exposes the phase-1 tools to the serve process. opencode owns MCP servers per project Instance with frozen env, so instead of an MCP shim each tool's `execute()` resolves the calling session's task id from its title (`lunarwing-opencode-<task_id>`) via the plugin host's authenticated client and relays over the per-task socket. Dependency-free on purpose (the runtime image ships only `@opencode-ai/sdk`).
 - `entrypoint.sh` — Startup orchestration. Three modes: websocket, cli, acp.
 - `config/opencode.json` — Mounted into container; controls LLM provider, plugins, MCP servers.
 

@@ -523,6 +523,14 @@ pub struct CronMissionStatus {
     pub paused: bool,
     pub tick_index: u64,
     pub consecutive_abandoned: u32,
+    /// Sticky durability fault (WI#371): set when the mission's control-state
+    /// read failed at startup (the mission started paused, fail-closed) or
+    /// the last bounded-retry control-state write was exhausted — in both
+    /// cases the reported state is NOT durable across a restart. Cleared by
+    /// the next successful write. Control callers must surface this instead
+    /// of treating an applied pause/resume as persisted.
+    #[serde(default)]
+    pub durability_error: Option<String>,
 }
 
 /// Owner-scoped control channel registration for one cron mission (WI#325).

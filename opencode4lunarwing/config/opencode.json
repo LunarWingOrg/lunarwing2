@@ -7,7 +7,8 @@
     "opencode-caveman",
     "opencode-agent-skills",
     "envsitter-guard",
-    "opentmux"
+    "opentmux",
+    "/app/scripts/lunarwing_tool_plugin.ts"
   ],
   "provider": {
     "tensorzero": {

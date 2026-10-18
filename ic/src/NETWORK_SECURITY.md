@@ -77,9 +77,14 @@ the mutation may already be applied or still queued, so re-query status
 before retrying (pause/resume are idempotent; a repeated resume resets the
 circuit breaker again and writes a duplicate audit row). 504 means the
 command never entered the queue. Lifecycle audit rows record the origin
-(`owner_api` here versus `owner_tool` for the `cron_mission` LLM tool).
-The route works independently of Engine V1/V2 and creates no tool/worker
-credential bypass. See `handlers/cron_workers.rs` and the cron-mode design doc.
+(`owner_api` here versus `owner_tool` for the `cron_mission` LLM tool) and a
+`durable` flag (WI#371): pause/resume state writes retry with bounded
+backoff, and a write that exhausts its budget is reported on the mission
+status (`durability_error`, top-level `durable: false` on this route) instead
+of being claimed as durable — a 200 with `durable: false` means the applied
+state would be lost on restart. The route works independently of Engine V1/V2
+and creates no tool/worker credential bypass. See `handlers/cron_workers.rs`
+and the cron-mode design doc.
 
 ### Unauthenticated Routes
 

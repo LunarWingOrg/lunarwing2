@@ -39,6 +39,13 @@
 //!   per-tick jobs' events.
 //! - **Durable tick counter** — the tick index is persisted per mission in
 //!   the DB-backed settings store, so it does not restart at 1 on every boot.
+//! - **Fail-closed control state (WI#371)** — the pause flag and the
+//!   circuit-breaker counter share one atomic settings row
+//!   (`cron-mission:<id>:control`), written with bounded-retry backoff. A
+//!   control-state read/parse failure starts the mission paused with an
+//!   actionable error, and a write that exhausts its retries is surfaced on
+//!   `CronMissionStatus.durability_error` instead of being claimed as
+//!   durable.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -86,6 +93,17 @@ const MAX_BUSY_RETRIES: u32 = 5;
 
 /// Consecutive abandoned ticks before the circuit breaker pauses the mission.
 const CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
+
+/// Total attempts (initial + retries) for one control-state write (WI#371):
+/// a transient settings-store error must not silently strand an owner pause
+/// or a breaker trip, and a permanently failing store must not stall the
+/// supervisor loop. With the base backoff below the worst-case added delay is
+/// ~700 ms.
+const PERSIST_MAX_ATTEMPTS: u32 = 4;
+
+/// Base delay for the exponential backoff between control-state write
+/// attempts (100 ms, 200 ms, 400 ms between the four attempts).
+const PERSIST_RETRY_BASE: Duration = Duration::from_millis(100);
 
 /// Worker-reported markers that a dispatch rejection is a workspace-busy /
 /// concurrency collision, not a mission failure (MR !1522 DE-2/DE-5): the
@@ -171,6 +189,12 @@ struct MissionState {
     tick_index: u64,
     consecutive_abandoned: u32,
     paused: bool,
+    /// Sticky record of the last control-state durability fault (WI#371): a
+    /// failed read at startup (the mission started paused, fail-closed) or a
+    /// bounded-retry write exhaustion. Cleared by the next successful write;
+    /// surfaced in `CronMissionStatus.durability_error` so control callers
+    /// are told the state is not durable instead of assuming success.
+    durability_error: Option<String>,
 }
 
 /// Bundles the invariant parameters of one tick so dispatch/watch helpers
@@ -451,7 +475,14 @@ async fn run_cron_mission(
     // Shared with the in-flight tick chain: an owner pause stops further
     // re-entries at the next link boundary, not only after the chain ends.
     let pause_flag = Arc::new(AtomicBool::new(state.paused));
-    if state.paused {
+    if let Some(fault) = state.durability_error.as_deref() {
+        tracing::error!(
+            worker = %worker.name,
+            %mission_id,
+            "Cron mission control state could not be read; mission starts \
+             paused (fail-closed, WI#371): {fault}"
+        );
+    } else if state.paused {
         tracing::info!(
             worker = %worker.name,
             %mission_id,
@@ -661,6 +692,7 @@ fn reply_status(
         paused: state.paused,
         tick_index: state.tick_index,
         consecutive_abandoned: state.consecutive_abandoned,
+        durability_error: state.durability_error.clone(),
     });
 }
 
@@ -676,14 +708,16 @@ async fn apply_owner_pause(
 ) {
     state.paused = true;
     pause_flag.store(true, Ordering::SeqCst);
-    persist_paused(ctx.manager, ctx.owner_id, ctx.mission_id, true).await;
-    tracing::info!(worker = %ctx.worker.name, mission_id = %ctx.mission_id, "Cron mission paused by owner");
+    persist_control_state(ctx, state).await;
+    let durable = state.durability_error.is_none();
+    tracing::info!(worker = %ctx.worker.name, mission_id = %ctx.mission_id, durable, "Cron mission paused by owner");
     record_lifecycle_event(
         ctx,
         "cron_paused",
         serde_json::json!({
             "mission_id": ctx.mission_id,
             "origin": origin.as_str(),
+            "durable": durable,
         }),
         format!("cron mission {} paused by owner", ctx.mission_id),
     )
@@ -700,14 +734,16 @@ async fn apply_owner_resume(
     state.paused = false;
     state.consecutive_abandoned = 0;
     pause_flag.store(false, Ordering::SeqCst);
-    persist_paused(ctx.manager, ctx.owner_id, ctx.mission_id, false).await;
-    tracing::info!(worker = %ctx.worker.name, mission_id = %ctx.mission_id, "Cron mission resumed by owner");
+    persist_control_state(ctx, state).await;
+    let durable = state.durability_error.is_none();
+    tracing::info!(worker = %ctx.worker.name, mission_id = %ctx.mission_id, durable, "Cron mission resumed by owner");
     record_lifecycle_event(
         ctx,
         "cron_resumed",
         serde_json::json!({
             "mission_id": ctx.mission_id,
             "origin": origin.as_str(),
+            "durable": durable,
         }),
         format!("cron mission {} resumed by owner", ctx.mission_id),
     )
@@ -748,7 +784,10 @@ fn last_tick_job(ctx: &TickCtx<'_>) -> Option<Uuid> {
 
 /// Update circuit-breaker state after a tick resolves; trips into a
 /// persisted pause after `CIRCUIT_BREAKER_THRESHOLD` consecutive abandons.
-/// Busy/capacity skips leave the breaker untouched (MR !1522 DE-2).
+/// Busy/capacity skips leave the breaker untouched (MR !1522 DE-2). The
+/// counter and the pause flag live in one atomic settings row (WI#371): the
+/// increment/trip is one write, and a resolved tick durably resets a
+/// non-zero counter so a restart cannot resurrect stale abandons.
 async fn after_tick(
     ctx: &TickCtx<'_>,
     state: &mut MissionState,
@@ -756,7 +795,12 @@ async fn after_tick(
     end: TickEnd,
 ) {
     match end {
-        TickEnd::Resolved => state.consecutive_abandoned = 0,
+        TickEnd::Resolved => {
+            if state.consecutive_abandoned != 0 {
+                state.consecutive_abandoned = 0;
+                persist_control_state(ctx, state).await;
+            }
+        }
         // Ordinary busy/capacity contention must not trip the breaker
         // (MR !1522 DE-2): the mission simply retries at the next fire.
         TickEnd::SkippedBusy => {}
@@ -765,11 +809,15 @@ async fn after_tick(
             if state.consecutive_abandoned >= CIRCUIT_BREAKER_THRESHOLD {
                 state.paused = true;
                 pause_flag.store(true, Ordering::SeqCst);
-                persist_paused(ctx.manager, ctx.owner_id, ctx.mission_id, true).await;
+            }
+            persist_control_state(ctx, state).await;
+            if state.paused {
+                let durable = state.durability_error.is_none();
                 tracing::error!(
                     worker = %ctx.worker.name,
                     mission_id = %ctx.mission_id,
                     consecutive_abandoned = state.consecutive_abandoned,
+                    durable,
                     "Cron mission circuit breaker tripped; mission paused until owner resumes"
                 );
                 persist_cron_event(
@@ -782,6 +830,7 @@ async fn after_tick(
                         "consecutive_abandoned": state.consecutive_abandoned,
                         "last_abandon_reason": reason,
                         "schedule": ctx.cron.schedule,
+                        "durable": durable,
                     }),
                 )
                 .await;
@@ -1684,9 +1733,139 @@ fn tick_counter_key(mission_id: &str) -> String {
     format!("cron-mission:{mission_id}:tick-index")
 }
 
-/// Settings-store key for the persisted per-mission pause flag.
+/// Settings-store key for the persisted per-mission pause flag. Legacy,
+/// read-only fallback (WI#371): superseded by the combined control-state row,
+/// but a mission paused before the control row existed must stay paused.
 fn paused_key(mission_id: &str) -> String {
     format!("cron-mission:{mission_id}:paused")
+}
+
+/// Settings-store key for the atomic per-mission control-state row (WI#371):
+/// `{"paused": bool, "consecutive_abandoned": u32}`. Pause and breaker live
+/// in ONE row so a single `set_setting` is the atomic unit of update; the
+/// mission supervisor is the row's only writer (owner commands are serialized
+/// through its command channel), so no compare-and-set is needed.
+fn control_state_key(mission_id: &str) -> String {
+    format!("cron-mission:{mission_id}:control")
+}
+
+/// Load durable mission state (tick counter + control state) from the
+/// DB-backed settings store so a restart neither resets the tick index nor
+/// silently resumes a paused mission.
+///
+/// WI#371 fail-closed contract: a control-state read or parse FAILURE starts
+/// the mission paused with an actionable `durability_error` — a transient DB
+/// error must never resume an owner/breaker-paused mission. An ABSENT row
+/// (mission never paused) is not an error and loads the defaults; the legacy
+/// `paused` key is honored as a read-only fallback when no control row exists.
+/// The tick counter stays lenient by design: a lost counter only reuses an
+/// index after a restart and never double-fires a tick.
+async fn load_mission_state(
+    store: Option<&Arc<dyn Database>>,
+    owner_id: &str,
+    mission_id: &str,
+) -> MissionState {
+    let Some(db) = store else {
+        return MissionState::default();
+    };
+    let tick_index = match db.get_setting(owner_id, &tick_counter_key(mission_id)).await {
+        Ok(Some(value)) => value.as_u64().unwrap_or_else(|| {
+            tracing::warn!(%mission_id, "Cron tick counter is not an unsigned integer; restarting at 0");
+            0
+        }),
+        Ok(None) => 0,
+        Err(error) => {
+            tracing::warn!(%mission_id, "Failed to read cron tick counter (restarting at 0; a reused index never double-fires): {error}");
+            0
+        }
+    };
+    match db
+        .get_setting(owner_id, &control_state_key(mission_id))
+        .await
+    {
+        Ok(Some(value)) => match parse_control_state(&value) {
+            Some((paused, consecutive_abandoned)) => MissionState {
+                tick_index,
+                consecutive_abandoned,
+                paused,
+                durability_error: None,
+            },
+            None => MissionState {
+                tick_index,
+                ..fail_closed_state(format!(
+                    "cron mission control state is malformed ({value}); \
+                     started paused — pause/resume the mission to rewrite the row"
+                ))
+            },
+        },
+        Ok(None) => load_legacy_pause(db, owner_id, mission_id, tick_index).await,
+        Err(error) => MissionState {
+            tick_index,
+            ..fail_closed_state(format!(
+                "failed to read cron mission control state: {error}; \
+                 started paused — check settings-store health"
+            ))
+        },
+    }
+}
+
+/// A fail-closed control state: paused, breaker counter unknown (start at 0;
+/// if the mission is genuinely failing the breaker simply re-trips), with the
+/// actionable fault recorded for status reporting.
+fn fail_closed_state(detail: String) -> MissionState {
+    MissionState {
+        tick_index: 0,
+        consecutive_abandoned: 0,
+        paused: true,
+        durability_error: Some(detail),
+    }
+}
+
+/// Parse the atomic control-state row; `None` means malformed (fail closed).
+fn parse_control_state(value: &serde_json::Value) -> Option<(bool, u32)> {
+    let paused = value.get("paused")?.as_bool()?;
+    let counter = value.get("consecutive_abandoned")?.as_u64()?;
+    Some((paused, u32::try_from(counter).ok()?))
+}
+
+/// Read-only fallback for missions paused before the combined control-state
+/// row existed (WI#371): the legacy `paused` key still applies when no
+/// control row exists. A read/parse failure here fails closed just like the
+/// control row.
+async fn load_legacy_pause(
+    db: &Arc<dyn Database>,
+    owner_id: &str,
+    mission_id: &str,
+    tick_index: u64,
+) -> MissionState {
+    match db.get_setting(owner_id, &paused_key(mission_id)).await {
+        Ok(Some(value)) => match value.as_bool() {
+            Some(paused) => MissionState {
+                tick_index,
+                consecutive_abandoned: 0,
+                paused,
+                durability_error: None,
+            },
+            None => MissionState {
+                tick_index,
+                ..fail_closed_state(format!(
+                    "legacy cron pause flag is malformed ({value}); \
+                     started paused — pause/resume the mission to rewrite it"
+                ))
+            },
+        },
+        Ok(None) => MissionState {
+            tick_index,
+            ..MissionState::default()
+        },
+        Err(error) => MissionState {
+            tick_index,
+            ..fail_closed_state(format!(
+                "failed to read legacy cron pause flag: {error}; \
+                 started paused — check settings-store health"
+            ))
+        },
+    }
 }
 
 async fn remember_tick_job(ctx: &TickCtx<'_>, job_id: Uuid) {
@@ -1728,38 +1907,6 @@ async fn load_last_tick_job(
         .then_some(id)
 }
 
-/// Load durable mission state (tick counter + pause flag) from the
-/// DB-backed settings store so a restart neither resets the tick index nor
-/// silently resumes an owner-paused mission.
-async fn load_mission_state(
-    store: Option<&Arc<dyn Database>>,
-    owner_id: &str,
-    mission_id: &str,
-) -> MissionState {
-    let Some(db) = store else {
-        return MissionState::default();
-    };
-    let tick_index = db
-        .get_setting(owner_id, &tick_counter_key(mission_id))
-        .await
-        .ok()
-        .flatten()
-        .and_then(|value| value.as_u64())
-        .unwrap_or(0);
-    let paused = db
-        .get_setting(owner_id, &paused_key(mission_id))
-        .await
-        .ok()
-        .flatten()
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-    MissionState {
-        tick_index,
-        consecutive_abandoned: 0,
-        paused,
-    }
-}
-
 /// Persist the per-mission tick counter (best-effort; a lost write only
 /// reuses an index after a restart, never double-fires a tick).
 async fn persist_tick_counter(
@@ -1783,26 +1930,56 @@ async fn persist_tick_counter(
     }
 }
 
-/// Persist the per-mission pause flag so owner pauses and circuit-breaker
-/// trips survive daemon restarts.
-async fn persist_paused(
-    manager: &ExternalWorkerManager,
-    owner_id: &str,
-    mission_id: &str,
-    paused: bool,
-) {
-    let Some(db) = manager.store_handle() else {
+/// Persist the atomic per-mission control-state row (pause flag + breaker
+/// counter) so owner pauses, circuit-breaker trips, and breaker-counter
+/// progress survive daemon restarts (WI#371).
+///
+/// Writes retry with bounded exponential backoff. Success clears any sticky
+/// `durability_error` on the state; exhaustion records it there instead, so
+/// control callers (status replies, and through them the HTTP route and the
+/// `cron_mission` tool) are told the applied state is NOT durable rather
+/// than the supervisor claiming success.
+async fn persist_control_state(ctx: &TickCtx<'_>, state: &mut MissionState) {
+    let Some(db) = ctx.manager.store_handle() else {
         return;
     };
-    if let Err(error) = db
-        .set_setting(
-            owner_id,
-            &paused_key(mission_id),
-            &serde_json::json!(paused),
-        )
-        .await
-    {
-        tracing::warn!(%mission_id, "Failed to persist cron pause flag: {error}");
+    let key = control_state_key(ctx.mission_id);
+    let value = serde_json::json!({
+        "paused": state.paused,
+        "consecutive_abandoned": state.consecutive_abandoned,
+    });
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match db.set_setting(ctx.owner_id, &key, &value).await {
+            Ok(()) => {
+                state.durability_error = None;
+                return;
+            }
+            Err(error) if attempt < PERSIST_MAX_ATTEMPTS => {
+                let backoff = PERSIST_RETRY_BASE * 2u32.saturating_pow(attempt - 1);
+                tracing::warn!(
+                    mission_id = %ctx.mission_id,
+                    "Failed to persist cron control state (attempt \
+                     {attempt}/{PERSIST_MAX_ATTEMPTS}, retrying in {backoff:?}): {error}"
+                );
+                tokio::time::sleep(backoff).await;
+            }
+            Err(error) => {
+                let detail = format!(
+                    "cron mission control state was applied live but could not be \
+                     persisted after {PERSIST_MAX_ATTEMPTS} attempts; a restart would \
+                     lose it: {error}"
+                );
+                tracing::error!(
+                    worker = %ctx.worker.name,
+                    mission_id = %ctx.mission_id,
+                    "{detail}"
+                );
+                state.durability_error = Some(detail);
+                return;
+            }
+        }
     }
 }
 
@@ -2382,5 +2559,262 @@ mod tests {
             credential_grants_json: "[]".to_string(),
             job_mode: "external:mock".to_string(),
         }
+    }
+
+    /// WI#371: an ABSENT control row loads the defaults with no fault; a
+    /// well-formed row round-trips pause + breaker counter; a malformed row
+    /// fails CLOSED (paused + actionable error); the legacy `paused` key is a
+    /// read-only fallback while no control row exists — and its own
+    /// read/parse failures fail closed too.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn load_mission_state_distinguishes_absent_failed_and_malformed() {
+        let (db, _dir) = crate::testing::test_db().await;
+        let control = control_state_key("pr-digest");
+        let legacy = paused_key("pr-digest");
+
+        // Absent: defaults, no fault.
+        let state = load_mission_state(Some(&db), "owner", "pr-digest").await;
+        assert!(!state.paused);
+        assert_eq!(state.consecutive_abandoned, 0);
+        assert!(state.durability_error.is_none());
+
+        // Well-formed row: both fields round-trip.
+        db.set_setting(
+            "owner",
+            &control,
+            &serde_json::json!({"paused": true, "consecutive_abandoned": 2}),
+        )
+        .await
+        .unwrap(); // safety: test
+        let state = load_mission_state(Some(&db), "owner", "pr-digest").await;
+        assert!(state.paused);
+        assert_eq!(state.consecutive_abandoned, 2);
+        assert!(state.durability_error.is_none());
+
+        // Malformed row: fail closed with an actionable error.
+        db.set_setting("owner", &control, &serde_json::json!({"paused": "yes"}))
+            .await
+            .unwrap(); // safety: test
+        let state = load_mission_state(Some(&db), "owner", "pr-digest").await;
+        assert!(state.paused, "malformed control state must fail closed");
+        assert_eq!(state.consecutive_abandoned, 0);
+        assert!(
+            state
+                .durability_error
+                .as_deref()
+                .expect("fault recorded") // safety: test
+                .contains("malformed")
+        );
+
+        // No control row: the legacy pause flag still applies.
+        db.delete_setting("owner", &control).await.unwrap(); // safety: test
+        db.set_setting("owner", &legacy, &serde_json::json!(true))
+            .await
+            .unwrap(); // safety: test
+        let state = load_mission_state(Some(&db), "owner", "pr-digest").await;
+        assert!(state.paused, "legacy paused flag must still apply");
+        assert_eq!(state.consecutive_abandoned, 0);
+        assert!(state.durability_error.is_none());
+
+        // A malformed legacy flag fails closed as well.
+        db.set_setting("owner", &legacy, &serde_json::json!("not-a-bool"))
+            .await
+            .unwrap(); // safety: test
+        let state = load_mission_state(Some(&db), "owner", "pr-digest").await;
+        assert!(state.paused);
+        assert!(
+            state
+                .durability_error
+                .as_deref()
+                .expect("fault recorded") // safety: test
+                .contains("legacy cron pause flag is malformed")
+        );
+    }
+
+    /// WI#371: a settings-store READ failure starts the mission paused with
+    /// the fault recorded (never a silent resume), and a healed store loads
+    /// cleanly again.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn load_mission_state_fails_closed_on_read_error() {
+        use crate::db::recording::FaultingSettingsDb;
+
+        let (inner, _dir) = crate::testing::test_db().await;
+        let faulting = Arc::new(FaultingSettingsDb::new(inner, "cron-mission:"));
+        faulting.set_fail_reads(true);
+        let db: Arc<dyn Database> = faulting.clone();
+
+        let state = load_mission_state(Some(&db), "owner", "pr-digest").await;
+        assert!(state.paused, "a failed control read must fail closed");
+        assert!(
+            state
+                .durability_error
+                .as_deref()
+                .expect("fault recorded") // safety: test
+                .contains("failed to read cron mission control state")
+        );
+
+        faulting.set_fail_reads(false);
+        let state = load_mission_state(Some(&db), "owner", "pr-digest").await;
+        assert!(!state.paused);
+        assert!(state.durability_error.is_none());
+    }
+
+    /// WI#371: control-state writes retry with bounded backoff — two injected
+    /// failures then a success persists the row and clears the sticky fault.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn persist_control_state_retries_then_succeeds_and_clears_the_error() {
+        use crate::db::recording::FaultingSettingsDb;
+
+        let (inner, _dir) = crate::testing::test_db().await;
+        let faulting = Arc::new(FaultingSettingsDb::new(
+            inner,
+            "cron-mission:pr-digest:control",
+        ));
+        let db: Arc<dyn Database> = faulting.clone();
+        let manager = Arc::new(ExternalWorkerManager::new(vec![]).with_store(db.clone()));
+        let worker = ExternalWorkerConfig::default();
+        let cron = test_cron();
+        let last = Arc::new(std::sync::Mutex::new(None));
+        let ctx = test_ctx(&manager, &worker, &cron, &last);
+        let mut state = MissionState {
+            tick_index: 7,
+            consecutive_abandoned: 2,
+            paused: true,
+            durability_error: Some("stale fault".to_string()),
+        };
+
+        faulting.fail_next_writes(2);
+        persist_control_state(&ctx, &mut state).await;
+        assert_eq!(
+            faulting.write_attempts().len(),
+            3,
+            "two injected failures + one success"
+        );
+        assert!(state.durability_error.is_none());
+        let row = db
+            .get_setting("owner", "cron-mission:pr-digest:control")
+            .await
+            .unwrap() // safety: test
+            .expect("control row persisted"); // safety: test
+        assert_eq!(
+            row,
+            serde_json::json!({"paused": true, "consecutive_abandoned": 2})
+        );
+    }
+
+    /// WI#371: a store that keeps failing exhausts the bounded retry budget
+    /// and the state records the durability fault instead of claiming success.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn persist_control_state_exhaustion_is_reported_on_the_state() {
+        use crate::db::recording::FaultingSettingsDb;
+
+        let (inner, _dir) = crate::testing::test_db().await;
+        let faulting = Arc::new(FaultingSettingsDb::new(
+            inner,
+            "cron-mission:pr-digest:control",
+        ));
+        let db: Arc<dyn Database> = faulting.clone();
+        let manager = Arc::new(ExternalWorkerManager::new(vec![]).with_store(db));
+        let worker = ExternalWorkerConfig::default();
+        let cron = test_cron();
+        let last = Arc::new(std::sync::Mutex::new(None));
+        let ctx = test_ctx(&manager, &worker, &cron, &last);
+        let mut state = MissionState::default();
+
+        faulting.fail_next_writes(10);
+        persist_control_state(&ctx, &mut state).await;
+        assert_eq!(
+            faulting.write_attempts().len(),
+            PERSIST_MAX_ATTEMPTS as usize,
+            "bounded retries must stop at the budget"
+        );
+        assert!(
+            state
+                .durability_error
+                .as_deref()
+                .expect("durability fault recorded") // safety: test
+                .contains("could not be persisted")
+        );
+    }
+
+    /// WI#371: the breaker counter and the trip share one atomic settings row
+    /// — every abandon persists the counter, the trip persists paused+count in
+    /// the same write, and a resolved tick durably resets the counter.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn after_tick_persists_breaker_progress_trip_and_reset_atomically() {
+        let (db, _dir) = crate::testing::test_db().await;
+        let manager = Arc::new(ExternalWorkerManager::new(vec![]).with_store(db.clone()));
+        let worker = ExternalWorkerConfig::default();
+        let cron = test_cron();
+        let last = Arc::new(std::sync::Mutex::new(None));
+        let ctx = test_ctx(&manager, &worker, &cron, &last);
+        let pause = Arc::new(AtomicBool::new(false));
+        let mut state = MissionState::default();
+        let key = control_state_key("pr-digest");
+
+        for expected in 1..CIRCUIT_BREAKER_THRESHOLD {
+            after_tick(
+                &ctx,
+                &mut state,
+                &pause,
+                TickEnd::Abandoned {
+                    job_id: Uuid::new_v4(),
+                    reason: "x".to_string(),
+                },
+            )
+            .await;
+            assert!(!state.paused);
+            let row = db
+                .get_setting("owner", &key)
+                .await
+                .unwrap() // safety: test
+                .expect("control row persisted"); // safety: test
+            assert_eq!(
+                row,
+                serde_json::json!({"paused": false, "consecutive_abandoned": expected}),
+                "every abandon must durably persist the counter"
+            );
+        }
+
+        after_tick(
+            &ctx,
+            &mut state,
+            &pause,
+            TickEnd::Abandoned {
+                job_id: Uuid::new_v4(),
+                reason: "final".to_string(),
+            },
+        )
+        .await;
+        assert!(state.paused, "breaker must trip at the threshold");
+        let row = db
+            .get_setting("owner", &key)
+            .await
+            .unwrap() // safety: test
+            .expect("control row persisted"); // safety: test
+        assert_eq!(
+            row,
+            serde_json::json!({"paused": true, "consecutive_abandoned": CIRCUIT_BREAKER_THRESHOLD}),
+            "the trip and the counter must land in one atomic write"
+        );
+
+        // A resolved tick durably resets the counter (the mission stays
+        // paused — only an owner resume clears that).
+        after_tick(&ctx, &mut state, &pause, TickEnd::Resolved).await;
+        let row = db
+            .get_setting("owner", &key)
+            .await
+            .unwrap() // safety: test
+            .expect("control row persisted"); // safety: test
+        assert_eq!(
+            row,
+            serde_json::json!({"paused": true, "consecutive_abandoned": 0}),
+            "a resolved tick must durably reset the counter"
+        );
     }
 }

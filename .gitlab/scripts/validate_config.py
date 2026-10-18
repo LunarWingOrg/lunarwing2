@@ -839,6 +839,8 @@ WORKER_TS_LANE_SCRIPTS = {
             "bun scripts/opencode_result_test.ts",
             "bun scripts/task_prompt_test.ts",
             "bun scripts/lunarwing_bridge_test.ts",
+            "bun scripts/lunarwing_tool_proxy_test.ts",
+            "bun scripts/lunarwing_tool_plugin_test.ts",
             "bun scripts/opencode_task_executor_test.ts",
             "./node_modules/.bin/tsc --noEmit -p scripts/tsconfig.json",
         ),

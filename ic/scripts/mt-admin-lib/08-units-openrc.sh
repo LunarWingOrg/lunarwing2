@@ -265,6 +265,17 @@ _render_weechat_openrc_unit() {  # <tenant> <out_file>
   local start_helper stop_helper
   start_helper="$(tenant_lw_root "$name")/ic/scripts/lunarwing-weechat-start.sh"
   stop_helper="$(tenant_lw_root "$name")/ic/scripts/lunarwing-weechat-stop.sh"
+  # WI#415: bake the canonical interpreter from the shared PATH-independent
+  # resolver (the proxy contract's _openrc_proxy_python3), never the calling
+  # process's PATH — a render under a venv, pyenv shim or sudo secure_path
+  # must not leak a non-canonical python3 spelling into the unit. The
+  # allowlisted result carries no shell syntax, so it is safe inside the
+  # single-quoted tmux argument below. Fail closed when nothing resolves.
+  local weechat_python3
+  weechat_python3="$(_openrc_proxy_python3)" || {
+    say "cannot render weechat OpenRC unit for $name: no python3 interpreter resolves (set LUNARWING_MT_PROXY_PYTHON3 or install python3 under /usr/local/bin:/usr/bin:/bin)" >&2
+    return 1
+  }
   cat >"$out_file" <<INITEOF
 #!/sbin/openrc-run
 
@@ -287,7 +298,7 @@ description="WeeChat IRC client ($name)"
 : "\${weechat_stop_helper:=$stop_helper}"
 
 command="\${weechat_openrc_env_exec}"
-command_args="--env-file \${weechat_env_file} -- \${weechat_command} -L weechat-${name} new-session -d -s weechat '$(command -v python3) $RELAY_ENV_EXEC --env-file \${weechat_env_file} -- \${weechat_start_helper} --weechat-bin \${weechat_binary} --weechat-home \${weechat_home}'"
+command_args="--env-file \${weechat_env_file} -- \${weechat_command} -L weechat-${name} new-session -d -s weechat '$weechat_python3 $RELAY_ENV_EXEC --env-file \${weechat_env_file} -- \${weechat_start_helper} --weechat-bin \${weechat_binary} --weechat-home \${weechat_home}'"
 command_user="\${weechat_user}:\${weechat_group}"
 pidfile="\${weechat_pidfile}"
 required_files="\${weechat_openrc_env_exec} \${weechat_command} \${weechat_binary} \${weechat_start_helper} \${weechat_env_file}"
@@ -307,7 +318,7 @@ start() {
         --exec "\${weechat_openrc_env_exec}" -- \\
         --env-file "\${weechat_env_file}" -- "\${weechat_command}" \\
         -L weechat-${name} new-session -d -s weechat \
-        "$(command -v python3) $RELAY_ENV_EXEC --env-file \${weechat_env_file} -- \${weechat_start_helper} --weechat-bin \${weechat_binary} --weechat-home \${weechat_home}"
+        "$weechat_python3 $RELAY_ENV_EXEC --env-file \${weechat_env_file} -- \${weechat_start_helper} --weechat-bin \${weechat_binary} --weechat-home \${weechat_home}"
     start_rc=\$?
     if [ "\${start_rc}" -eq 0 ]; then
         # tmux new-session -d returns immediately and the real work runs in the
@@ -749,10 +760,24 @@ render_tenant_openrc_units() {
   ws_adapter_dir="$(dirname "$ws_adapter_path")"
   local weechat_enabled=false
   tenant_weechat_enabled "$name" && weechat_enabled=true
+  # WI#415: the weechat relay prefix and the weechat/darkirc adapter command
+  # defaults below bake one canonical python3 spelling from the shared
+  # PATH-independent resolver (the proxy contract's _openrc_proxy_python3),
+  # never the calling process's PATH — a render under a venv, pyenv shim or
+  # sudo secure_path must not leak a non-canonical interpreter into these
+  # units. Resolved only when a rendered unit needs it, so tenants with
+  # neither service keep rendering on hosts without a resolvable python3.
+  local openrc_python3=""
+  if [[ "$weechat_enabled" == true ]] || tenant_darkirc_enabled "$name"; then
+    openrc_python3="$(_openrc_proxy_python3)" || {
+      say "cannot render OpenRC units for $name: no python3 interpreter resolves (set LUNARWING_MT_PROXY_PYTHON3 or install python3 under /usr/local/bin:/usr/bin:/bin)" >&2
+      return 1
+    }
+  fi
   local relay_exec_prefix=""
   if [[ "$weechat_enabled" == true ]]; then
     prepare_relay_start_barrier "$name" || return 1
-    relay_exec_prefix="$(command -v python3) $RELAY_ENV_EXEC --env-file $env_dir/lunarwing.env -- "
+    relay_exec_prefix="$openrc_python3 $RELAY_ENV_EXEC --env-file $env_dir/lunarwing.env -- "
   fi
 
   local darkirc_rc_after=""
@@ -1222,7 +1247,7 @@ INITEOF
 
   if [[ "$weechat_enabled" == "true" ]]; then
     # ── WeeChat init script (tmux-based) ──
-    _render_weechat_openrc_unit "$name" "$OPENRC_INITD_DIR/lunarwing-weechat-${name}"
+    _render_weechat_openrc_unit "$name" "$OPENRC_INITD_DIR/lunarwing-weechat-${name}" || return 1
 
     # WeeChat WS adapter init script
     cat >"$OPENRC_INITD_DIR/lunarwing-weechat-adapter-${name}" <<INITEOF
@@ -1230,7 +1255,7 @@ INITEOF
 
 description="LunarWing WeeChat WS adapter ($name)"
 
-: "\${adapter_command:=$(command -v python3)}"
+: "\${adapter_command:=$openrc_python3}"
 : "\${adapter_args:=$ws_adapter_path}"
 : "\${adapter_user:=$name}"
 : "\${adapter_group:=$name}"
@@ -1298,7 +1323,7 @@ INITEOF
 
 description="LunarWing DarkIRC adapter ($name)"
 
-: "\${darkirc_adapter_command:=$(command -v python3)}"
+: "\${darkirc_adapter_command:=$openrc_python3}"
 : "\${darkirc_adapter_args:=$darkirc_adapter_path}"
 : "\${darkirc_adapter_user:=$name}"
 : "\${darkirc_adapter_group:=$name}"
