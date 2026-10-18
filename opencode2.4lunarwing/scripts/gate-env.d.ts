@@ -42,11 +42,17 @@ declare module "node:fs" {
   }
   export function closeSync(fd: number): void
   export function existsSync(path: string): boolean
+  export function fstatSync(fd: number): { dev: number; ino: number }
   export function mkdirSync(path: string): void
   export function openSync(path: string, flags: number): number
   export function realpathSync(path: string): string
   export function readFileSync(path: string, encoding: string): string
+  export function statSync(path: string): { dev: number; ino: number }
   export function writeFileSync(path: string, data: string): void
+}
+
+declare module "node:os" {
+  export function tmpdir(): string
 }
 
 declare module "node:path" {
