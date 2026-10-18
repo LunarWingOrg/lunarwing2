@@ -386,7 +386,8 @@ impl FaultingSettingsDb {
 
     /// Program the next `count` prefixed writes to fail before one succeeds.
     pub fn fail_next_writes(&self, count: u32) {
-        self.remaining_write_failures.store(count, Ordering::Relaxed);
+        self.remaining_write_failures
+            .store(count, Ordering::Relaxed);
     }
 
     /// Prefixed `set_setting` keys attempted so far, in order.
@@ -620,9 +621,13 @@ mod tests {
                 "programmed write failure must fire"
             );
         }
-        db.set_setting("owner", "cron-mission:m:control", &serde_json::json!({"paused": true}))
-            .await
-            .expect("write succeeds once the programmed failures are spent"); // safety: test
+        db.set_setting(
+            "owner",
+            "cron-mission:m:control",
+            &serde_json::json!({"paused": true}),
+        )
+        .await
+        .expect("write succeeds once the programmed failures are spent"); // safety: test
         assert_eq!(
             db.write_attempts(),
             vec![

@@ -5205,7 +5205,10 @@ async fn cron_tick_with_failing_job_persistence_never_dispatches() {
 fn spawn_stored_cron_manager_daily(
     db: &Arc<dyn Database>,
     url: &str,
-) -> (Arc<ExternalWorkerManager>, tokio::sync::broadcast::Sender<()>) {
+) -> (
+    Arc<ExternalWorkerManager>,
+    tokio::sync::broadcast::Sender<()>,
+) {
     let context_manager = Arc::new(ContextManager::new(16));
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(16);
     let mgr = Arc::new(
@@ -5459,7 +5462,10 @@ async fn cron_breaker_counter_survives_restart_between_abandons() {
         .cron_mission_status("mock", "owner-1")
         .await
         .expect("status after restart"); // safety: test
-    assert!(status.paused, "the tripped breaker must survive the restart");
+    assert!(
+        status.paused,
+        "the tripped breaker must survive the restart"
+    );
     assert_eq!(status.consecutive_abandoned, 3);
     assert!(status.durability_error.is_none());
     let _ = shutdown.send(());

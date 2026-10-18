@@ -475,7 +475,7 @@ async fn run_cron_mission(
     // Shared with the in-flight tick chain: an owner pause stops further
     // re-entries at the next link boundary, not only after the chain ends.
     let pause_flag = Arc::new(AtomicBool::new(state.paused));
-    if let Some(fault) = state.durability_error.clone() {
+    if let Some(fault) = state.durability_error.as_deref() {
         tracing::error!(
             worker = %worker.name,
             %mission_id,
@@ -2580,9 +2580,13 @@ mod tests {
         assert!(state.durability_error.is_none());
 
         // Well-formed row: both fields round-trip.
-        db.set_setting("owner", &control, &serde_json::json!({"paused": true, "consecutive_abandoned": 2}))
-            .await
-            .unwrap(); // safety: test
+        db.set_setting(
+            "owner",
+            &control,
+            &serde_json::json!({"paused": true, "consecutive_abandoned": 2}),
+        )
+        .await
+        .unwrap(); // safety: test
         let state = load_mission_state(Some(&db), "owner", "pr-digest").await;
         assert!(state.paused);
         assert_eq!(state.consecutive_abandoned, 2);
@@ -2665,7 +2669,10 @@ mod tests {
         use crate::db::recording::FaultingSettingsDb;
 
         let (inner, _dir) = crate::testing::test_db().await;
-        let faulting = Arc::new(FaultingSettingsDb::new(inner, "cron-mission:pr-digest:control"));
+        let faulting = Arc::new(FaultingSettingsDb::new(
+            inner,
+            "cron-mission:pr-digest:control",
+        ));
         let db: Arc<dyn Database> = faulting.clone();
         let manager = Arc::new(ExternalWorkerManager::new(vec![]).with_store(db.clone()));
         let worker = ExternalWorkerConfig::default();
@@ -2706,7 +2713,10 @@ mod tests {
         use crate::db::recording::FaultingSettingsDb;
 
         let (inner, _dir) = crate::testing::test_db().await;
-        let faulting = Arc::new(FaultingSettingsDb::new(inner, "cron-mission:pr-digest:control"));
+        let faulting = Arc::new(FaultingSettingsDb::new(
+            inner,
+            "cron-mission:pr-digest:control",
+        ));
         let db: Arc<dyn Database> = faulting.clone();
         let manager = Arc::new(ExternalWorkerManager::new(vec![]).with_store(db));
         let worker = ExternalWorkerConfig::default();
