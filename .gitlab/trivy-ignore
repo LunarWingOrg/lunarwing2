@@ -3,9 +3,9 @@
 # comment block above it) and an expiry date in Trivy's own syntax:
 # `CVE-....-.... exp:YYYY-MM-DD` (exactly one space, lowercase `exp:`).
 # Trivy's plain ignore-file parser (`pkg/result/ignore.go`,
-# `getExpirationDate`) only recognises the `exp:` prefix and drops an entry
-# once that date passes (`Prune`), so expired entries stop being ignored and
-# the scan gate fails again until the finding is re-reviewed. `expiring:` is
+# `getExpirationDate`) only recognises the `exp:` prefix and stops
+# suppressing an entry on its date (00:00 UTC, `Prune`), so expired entries
+# fail the scan gate again until the finding is re-reviewed. `expiring:` is
 # NOT Trivy syntax: before WI#361 every entry here used it, the parser found
 # no `exp:` field, and all six suppressions silently never expired. The
 # `ci-config` validator (`validate_trivy_ignore` in
