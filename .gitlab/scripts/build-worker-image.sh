@@ -197,6 +197,52 @@ metadata_digest() {
     awk -F'"' '/"containerimage.digest"/ { print $4; exit }' "$1"
 }
 
+# Bounded retry for transient registry-auth push flakes. BuildKit fetches a
+# jwt/auth token per push, and several worker candidates pushing at once trip
+# GitLab's 429 rate limit at the very last step — pipeline 5984 lost the
+# opencode, opencode2 and kimi candidates (and, by cascade, their scans) to
+# one such burst. The build is deterministic and the retry reuses the layer
+# cache, so only the narrow observed transient signature is retried; a
+# genuine build failure exits on the first attempt. The publication jobs keep
+# their pinned `retry: 0` (no blind whole-job re-run) — this retry fires only
+# inside the job and only on the rate-limit signature.
+push_attempt_log="$CI_PROJECT_DIR/.worker-push-attempt.log"
+push_attempt_rc="$CI_PROJECT_DIR/.worker-push-attempt.rc"
+
+transient_push_failure() {
+    grep -qE 'failed to fetch oauth token|429 Too Many Requests' "$push_attempt_log"
+}
+
+build_image_with_retry() {
+    _bwr_ref=$1
+    _bwr_meta=$2
+    _bwr_clean=$3
+    _bwr_attempt=1
+    while [ "$_bwr_attempt" -le 4 ]; do
+        : > "$push_attempt_rc"
+        # tee keeps the build streaming into the job trace; the brace group
+        # records build_image's real exit status because the pipeline's own
+        # exit status is tee's (no pipefail in POSIX sh).
+        { build_image "$_bwr_ref" "$_bwr_meta" "$_bwr_clean" 2>&1 ||
+            printf '%s\n' "$?" > "$push_attempt_rc"; } | tee "$push_attempt_log"
+        if [ ! -s "$push_attempt_rc" ]; then
+            rm -f "$push_attempt_log" "$push_attempt_rc"
+            return 0
+        fi
+        IFS= read -r _bwr_status < "$push_attempt_rc"
+        if [ "$_bwr_attempt" -lt 4 ] && transient_push_failure; then
+            _bwr_delay=$((_bwr_attempt * 30))
+            echo "registry push attempt $_bwr_attempt/4 hit a transient registry-auth error; retrying in ${_bwr_delay}s" >&2
+            sleep "$_bwr_delay"
+            _bwr_attempt=$((_bwr_attempt + 1))
+        else
+            echo "registry push attempt $_bwr_attempt/4 failed (exit $_bwr_status); not retrying" >&2
+            rm -f "$push_attempt_log" "$push_attempt_rc"
+            return "$_bwr_status"
+        fi
+    done
+}
+
 # Best-effort layer-level diagnosis for a candidate/rebuild digest mismatch
 # (work item #177): fetch both manifests from the project registry with the
 # job's registry credentials, then report whether the divergence is in the
@@ -270,14 +316,14 @@ print_reproducibility_diagnosis() {
     return 0
 }
 
-build_image "$candidate_ref" "$metadata_file" false
+build_image_with_retry "$candidate_ref" "$metadata_file" false
 digest=$(metadata_digest "$metadata_file")
 case "$digest" in
     sha256:????????????????????????????????????????????????????????????????) ;;
     *) echo "BuildKit did not report a valid image digest" >&2; exit 1 ;;
 esac
 
-build_image "$rebuild_ref" "$rebuild_metadata_file" true
+build_image_with_retry "$rebuild_ref" "$rebuild_metadata_file" true
 rebuild_digest=$(metadata_digest "$rebuild_metadata_file")
 if [ "$rebuild_digest" != "$digest" ]; then
     echo "clean rebuild digest mismatch: $rebuild_digest != $digest" >&2
