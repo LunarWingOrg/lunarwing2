@@ -153,6 +153,8 @@ worker-opencode2-ts:
     - bun scripts/path_expand_test.ts
     - bun scripts/task_prompt_test.ts
     - bun scripts/opencode_result_test.ts
+    - bun scripts/sdk_surface_test.ts
+    - bun scripts/sdk_surface_assert_test.ts
 
 # WI#375 DR-3: pebble's Rust suite previously gated only at the (protected)
 # worker image build (`cargo test --locked` in the Dockerfile). Pinned by

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { readFileSync } from "node:fs"
+import { readdirSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 
 import type { OpenCodeClient } from "@opencode/client/promise"
@@ -12,9 +12,18 @@ import {
   STALE_SDK_METHODS,
   extractEventTypes,
   extractSdkCallPaths,
+  findUndeclaredSdkPaths,
   mockMethodPaths,
+  recordingSdkProxy,
   resolveMethod,
 } from "./sdk_surface.ts"
+
+/**
+ * Every client leaf path this suite touches through the recordingSdkProxy
+ * wrap in makeSdk — asserted against BRIDGE_SDK_METHODS at the end of this
+ * file (WI#369 DF-1).
+ */
+const accessedSdkPaths = new Set<string>()
 
 interface MockOptions {
   events?: unknown[]
@@ -59,7 +68,7 @@ function makeSdk(options: MockOptions = {}) {
   // permission replies are TOP-LEVEL groups (message.list returns a
   // paginated { data, cursor } envelope); session.message only has get and
   // there is no session.permission at all (WI#320 F7 / WI#303).
-  const sdk = {
+  const rawSdk = {
     session: {
       create: async (...args: unknown[]) => {
         captureSignal(args)
@@ -145,8 +154,16 @@ function makeSdk(options: MockOptions = {}) {
     },
   } as unknown as OpenCodeClient
 
+  // WI#369 DF-1: bind calls BEHAVIOURALLY, not by text. Every leaf path the
+  // executor reaches through this mock — whatever the syntax (alias, cast,
+  // bracket, destructuring, optional-call no-op, helper parameter of any
+  // name) — is recorded into accessedSdkPaths and asserted against
+  // BRIDGE_SDK_METHODS at the end of this file.
+  const sdk = recordingSdkProxy(rawSdk, accessedSdkPaths)
+
   return {
     sdk,
+    rawSdk,
     interruptCount: () => interruptCount,
     permissionReplyCount: () => permissionReplies,
     messageListCount: () => messageListCalls,
@@ -157,32 +174,50 @@ function makeSdk(options: MockOptions = {}) {
   }
 }
 
-// Three-way binding (WI#329, !1512 CY-1/CY-2): the shared sdk_surface.ts
-// lists must match BOTH the injected mock AND the executor source's real
-// call sites / event literals — and the image-build gate
-// (sdk_surface_assert.ts) asserts the same lists against the real pinned
-// client, so list, mock, bridge, and pinned SDK cannot drift apart. A
-// bridge call added without updating the list fails here (this is the
-// WI#320 F7 class: a non-existent method whose TypeError a fallback
-// swallows); a mock path that drifted from the list or a stale path
-// sneaking onto the mock fails here too.
+// Three-way binding (WI#329, !1512 CY-1/CY-2, hardened per WI#369): the
+// shared sdk_surface.ts lists must match BOTH the injected mock AND the real
+// call sites / event literals extracted from every non-test scripts/*.ts
+// source — and the image-build gate (sdk_surface_assert.ts) asserts the same
+// lists against the pinned client and its generated V2Event union. The text
+// extractors bind by syntax — widened to optional calls, non-null
+// assertions, (sdk as …) casts and the Yoda event form, with comments and
+// string contents blanked first so prose can no longer produce misleading
+// mismatches. What syntax cannot see — aliases, destructuring, bracket
+// access, helper parameters of another name — is bound BEHAVIOURALLY by the
+// recordingSdkProxy wrap in makeSdk, asserted at the end of this file. A
+// bridge call added without updating the list fails here (the WI#320 F7
+// class: a non-existent method whose TypeError a fallback swallows); a mock
+// path that drifted from the list or a stale path sneaking onto the mock
+// fails here too.
 {
-  const surface = mockMethodPaths(makeSdk().sdk)
+  const surface = mockMethodPaths(makeSdk().rawSdk)
   assert.deepEqual(surface, [...BRIDGE_SDK_METHODS].sort())
   for (const path of STALE_SDK_METHODS) {
-    assert.equal(resolveMethod(makeSdk().sdk, path), undefined, `mock exposes stale path ${path}`)
+    assert.equal(resolveMethod(makeSdk().rawSdk, path), undefined, `mock exposes stale path ${path}`)
   }
 
-  const executorSource = readFileSync(new URL("./opencode_task_executor.ts", import.meta.url), "utf8")
+  const bridgeSources = readdirSync(new URL(".", import.meta.url))
+    .filter((name) => name.endsWith(".ts") && !name.endsWith("_test.ts"))
+    .map((name) => readFileSync(new URL(`./${name}`, import.meta.url), "utf8"))
+  const callPaths = new Set<string>()
+  const eventNames = new Set<string>()
+  for (const source of bridgeSources) {
+    for (const path of extractSdkCallPaths(source)) callPaths.add(path)
+    for (const name of extractEventTypes(source)) eventNames.add(name)
+  }
   assert.deepEqual(
-    extractSdkCallPaths(executorSource),
+    [...callPaths].sort(),
     [...BRIDGE_SDK_METHODS].sort(),
-    "executor sdk.*(...) call sites differ from BRIDGE_SDK_METHODS — update sdk_surface.ts",
+    "bridge sdk.*(...) call sites in non-test scripts/*.ts differ from BRIDGE_SDK_METHODS — " +
+      "ADD any new bridge call path to BRIDGE_SDK_METHODS in sdk_surface.ts " +
+      "(never delete entries to force a pass; that reopens the WI#320 F7 drift class)",
   )
   assert.deepEqual(
-    extractEventTypes(executorSource),
+    [...eventNames].sort(),
     [...BRIDGE_SDK_EVENTS].sort(),
-    "executor event.type literals differ from BRIDGE_SDK_EVENTS — update sdk_surface.ts",
+    "bridge event.type literals in non-test scripts/*.ts differ from BRIDGE_SDK_EVENTS — " +
+      "ADD any new event name the bridge matches on to BRIDGE_SDK_EVENTS in sdk_surface.ts " +
+      "(never delete entries to force a pass; that reopens the silent-hang drift class)",
   )
 }
 
@@ -297,6 +332,34 @@ const streamed = await runTask(
 )
 assert.equal(streamed.status, "success")
 assert.equal(streamed.output, "streamed output")
+
+// session.idle and session.execution.interrupted settle a prompt the same
+// way session.execution.succeeded does — BRIDGE_SDK_EVENTS members the mock
+// previously never emitted, so no behavioural test backstopped them
+// (WI#369).
+const idleSettled = await runTask(
+  makeSdk({
+    events: [
+      { type: "session.text.delta", data: { sessionID: "session-1", delta: "idle output" } },
+      { type: "session.idle", data: { sessionID: "session-1" } },
+    ],
+    messages: [],
+  }).sdk,
+)
+assert.equal(idleSettled.status, "success")
+assert.equal(idleSettled.output, "idle output")
+
+const interruptedSettled = await runTask(
+  makeSdk({
+    events: [
+      { type: "session.text.delta", data: { sessionID: "session-1", delta: "partial answer" } },
+      { type: "session.execution.interrupted", data: { sessionID: "session-1" } },
+    ],
+    messages: [],
+  }).sdk,
+)
+assert.equal(interruptedSettled.status, "success")
+assert.equal(interruptedSettled.output, "partial answer")
 
 const toolEvents = makeSdk({
   events: [
@@ -596,6 +659,7 @@ assert.ok(contextPromptArgs[1].signal instanceof AbortSignal)
   }
 }
 
+
 // !1735 review KG-2 / !1699 JE-1: upstream v2.0.32 dropped the v2.0.24
 // `external_directory * ask` build-agent default, so workspace-external
 // paths went from ask→rejected to silently allowed. The session ruleset must
@@ -667,5 +731,26 @@ assert.ok(contextPromptArgs[1].signal instanceof AbortSignal)
     "session ruleset must carry the external_directory * ask fallback",
   )
 }
+
+// WI#369 DF-1: every client leaf path this suite touched — through any
+// alias, cast, bracket access, destructuring, optional-call no-op, or helper
+// parameter of any name — must be declared in BRIDGE_SDK_METHODS. An
+// undeclared path here is the WI#320 F7 class caught behaviourally.
+assert.deepEqual(
+  findUndeclaredSdkPaths(accessedSdkPaths),
+  [],
+  "the suite touched client paths missing from BRIDGE_SDK_METHODS — " +
+    "ADD them to BRIDGE_SDK_METHODS in sdk_surface.ts " +
+    "(never narrow the suite to force a pass)",
+)
+// JR-4: the suite must touch EXACTLY the declared surface — otherwise
+// removing the recordingSdkProxy wrap in makeSdk (const sdk = rawSdk)
+// passes silently and the behavioural gate goes hollow. The deepEqual above
+// catches undeclared paths; this one catches a proxy that records nothing.
+assert.deepEqual(
+  [...accessedSdkPaths].sort(),
+  [...BRIDGE_SDK_METHODS].sort(),
+  "the recording proxy did not see every BRIDGE_SDK_METHODS path - makeSdk must wrap the mock in recordingSdkProxy",
+)
 
 console.log("opencode2 task executor self-check passed")

@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "//": [
+    "WI#369: compile-time gate for the bridge's SDK-facing scripts against the",
+    "PINNED generated @opencode/client types of the image's own opencode build —",
+    "covers call argument and event payload shapes (the CY-2 residue that the",
+    "runtime-stage sdk_surface_assert.ts existence/membership gate cannot).",
+    "Runs in the Dockerfile builder stage after bun install, with the monorepo",
+    "at ../../opencode relative to this file. Includes every non-test script",
+    "that imports @opencode/client plus its local import closure;",
+    "lunarwing_bridge.ts has no @opencode imports and is intentionally out of",
+    "scope (its Bun-specific APIs are not SDK surface)."
+  ],
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    "types": [],
+    "strict": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "skipLibCheck": true,
+    "paths": {
+      "@opencode/client": ["../../opencode/packages/client/src/promise/index.ts"],
+      "@opencode/client/promise": ["../../opencode/packages/client/src/promise/index.ts"],
+      "@opencode/client/*": ["../../opencode/packages/client/src/*"],
+      "@opencode/schema": ["../../opencode/packages/schema/src/index.ts"],
+      "@opencode/schema/*": ["../../opencode/packages/schema/src/*"],
+      "@opencode/protocol": ["../../opencode/packages/protocol/src/index.ts"],
+      "@opencode/protocol/*": ["../../opencode/packages/protocol/src/*"]
+    }
+  },
+  "include": [
+    "./gate-env.d.ts",
+    "./lunarwing_runtime.ts",
+    "./opencode_result.ts",
+    "./opencode_task_executor.ts",
+    "./sdk_surface.ts",
+    "./sdk_surface_assert.ts",
+    "./workspace_path.ts"
+  ]
+}

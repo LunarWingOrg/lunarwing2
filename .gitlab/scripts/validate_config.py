@@ -856,6 +856,8 @@ WORKER_TS_LANE_SCRIPTS = {
             "bun scripts/path_expand_test.ts",
             "bun scripts/task_prompt_test.ts",
             "bun scripts/opencode_result_test.ts",
+            "bun scripts/sdk_surface_test.ts",
+            "bun scripts/sdk_surface_assert_test.ts",
         ),
     ),
 }
