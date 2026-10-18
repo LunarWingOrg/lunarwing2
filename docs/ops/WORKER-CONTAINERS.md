@@ -118,8 +118,17 @@ container can rename a session before its first call, create a session with
 another task's title or `parentID` over the loopback serve API, or connect
 to another task's socket directly — all of these stay inside the
 container's single hub-enforced grant and change only which job a call is
-attributed to. The opencode2 and
-pebble lanes do not have the bridge yet; see
+attributed to. The opencode2 worker image ships the same relay plus a v2
+serve-process plugin (`scripts/lunarwing_tool_plugin/index.ts`, a directory
+plugin registered by absolute path in `config/opencode2.json`'s `plugins`
+array — v2 drops configured plugin file paths): the v2 promise plugin API
+registers the phase-1 tools via `ctx.tool.transform` as direct
+(`codemode: false`) tools with plain JSON Schema inputs, each `execute()`
+resolves the calling session's task id from its title
+(`lunarwing-opencode2-<task_id>`) through the plugin context's in-process
+session API, and relays over the task's socket with the same
+first-title-wins caching and the same "not an isolation boundary" limits.
+The pebble lane does not have the bridge yet; see
 [`docs/proposals/EXTERNAL-WORKER-TOOL-PROXY.md`](../proposals/EXTERNAL-WORKER-TOOL-PROXY.md)
 for the wire contract.
 

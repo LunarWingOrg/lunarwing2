@@ -12,7 +12,9 @@ internal opencode headless server.
 
 ## Key Files
 
-- `scripts/lunarwing_bridge.ts` — The WebSocket server/client. Changes here affect protocol behavior.
+- `scripts/lunarwing_bridge.ts` — The WebSocket server/client. Changes here affect protocol behavior. Starts/stops the WI#324 per-task tool-proxy relay around each task and routes hub `tool_result`/`tool_catalog` frames to it.
+- `scripts/lunarwing_tool_proxy.ts` — WI#324 bridge-side relay: per-task unix socket the serve-side plugin connects to, translating its NDJSON IPC into `tool_list`/`tool_call` hub frames (256 KiB frame cap, `[A-Za-z0-9_-]{1,128}` identifiers, never-throw task lifecycle).
+- `scripts/lunarwing_tool_plugin/index.ts` — WI#324 v2 serve-process plugin (directory plugin registered by absolute path in `config/opencode2.json`'s `plugins` array; v2 drops configured plugin *file* paths). Statically registers the phase-1 `lunarwing_*` tools via the v2 promise API (`{id, setup}` default export, `ctx.tool.transform`, `codemode: false`, plain JSON Schema inputs) and relays each call over the session's task socket. Dependency-free on purpose — the runtime image ships no `@opencode/plugin`/`effect` for it to import.
 - `scripts/opencode_task_executor.ts` — Task execution via the v2 client SDK. Controls session creation, permissions, event streaming.
 - `scripts/sdk_surface.ts` — Canonical list of the `@opencode/client` method paths the bridge calls and the event `type` literals it matches (WI#329). It drives the image-build gate (`scripts/sdk_surface_assert.ts`, run from the Dockerfile) and the executor self-test, which binds it to BOTH the mock and the executor's real call sites/event literals extracted from source — update this list whenever the bridge calls a new client method or matches a new event.
 - `scripts/lunarwing_runtime.ts` — Shared types and envelope helpers. Keep in sync with `agent_comm_protocol.json`.
@@ -46,8 +48,12 @@ workers.
   ignores the lane config. Provider `package` is the plain npm name
   (`@ai-sdk/openai-compatible`, mapped to v2's bundled provider) — an `ai:`
   prefix fails with `Unsupported URL Type "ai:"`.
-- v1 plugins are NOT ported yet. Re-add deliberately after the lane proves
-  itself.
+- v1 plugins do not load on v2 — the v1 file-plugin shape (`{id, server}`)
+  does not exist there. The WI#324 tool proxy is the one deliberate
+  exception, re-implemented on the v2 promise plugin API as
+  `scripts/lunarwing_tool_plugin/` (a directory plugin; see the design doc
+  `docs/proposals/EXTERNAL-WORKER-TOOL-PROXY.md`). Re-add anything else
+  deliberately after the lane proves itself.
 
 ## Build Notes
 
