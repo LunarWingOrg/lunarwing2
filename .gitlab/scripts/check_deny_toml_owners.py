@@ -49,7 +49,7 @@ ISSUE_API = "https://git.lunarwing.org/api/v4/projects/lunarwing%2Flunarwing2/is
 # (the drift is pinned by OwnerPatternDriftTests in
 # .gitlab/tests/test_deny_toml_guards.py).
 OWNER_PATTERN = re.compile(r"clearing owner:?\s*WI#(\d+)", re.IGNORECASE)
-TIMEOUT_SECONDS = 30
+TIMEOUT_SECONDS = 60
 ATTEMPTS = 3
 BACKOFF_SECONDS = (5, 10)
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
