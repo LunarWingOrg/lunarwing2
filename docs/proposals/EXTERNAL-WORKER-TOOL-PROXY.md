@@ -614,18 +614,24 @@ cross-thread coordination (KV + advisory locks) is also still open.
   capturing tool editor, registered-execute relay round-trip), plus the
   full-path bridge test with a mock v2 SDK. The relay and plugin suites are
   dependency-free and run in the MR `worker-opencode2-ts` lane; the bridge
-  suite imports the executor's `@opencode/client/promise` and is image-gated
-  with the executor suite. Not covered locally: the plugin's load inside a
-  real `opencode serve` v2 (needs the rebuilt image — the deploy gate).
+  suite is image-gated with the executor suite. The plugin's load inside a
+  real `opencode serve` v2 was covered by the MR !1746 run-160 review
+  (2026-10-18): the pinned worker image (v2.0.32) with the MR's `scripts/`
+  mounted loaded the plugin, offered the `lunarwing_*` set as direct tools,
+  and relayed a scripted `memory_read` to the hub and back — under
+  `--network=none`.
 
 Open acceptance items: AC1 with a **real** worker (hub-side evidence uses
 mock sockets with real memory tools; worker-side evidence uses a mock CLI
 against the real bridge/relay) and AC2 (`knowledge_search` real hits
 through the proxy). Both need a rebuilt kimi worker image and a live
 tenant, which is the protected-pipeline/deploy gate, not an MR-pipeline
-lane; the opencode and opencode2 lanes additionally need their rebuilt
-images so the plugins ship in `/app/scripts/`. The pebble worker-side
-bridge is also open. WI#324 stays open until those land.
+lane — and a rebuilt image alone yields only denials, because mt-admin
+never renders a worker `tool_allowlist` into tenant config, so the tenant
+must also be configured with the grant. The opencode and opencode2 lanes
+additionally need their rebuilt images so the plugins ship in
+`/app/scripts/`. The pebble worker-side bridge is also open. WI#324 stays
+open until those land.
 
 ## Land-order note (MR !1540 review #7716)
 

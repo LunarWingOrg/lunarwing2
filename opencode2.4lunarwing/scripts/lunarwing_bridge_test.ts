@@ -178,9 +178,10 @@ async function waitForFrame(frames: SentFrame[], type: string): Promise<SentFram
 // JU-3: a closed hub socket must drop the relay's pending map for that socket
 // and fail the task's in-flight call at once — not through the later closeTask
 // (which leaves an EF-9 leak and an EV-4 gap for a request arriving between the
-// close and teardown). Pins `dropHubSocket` inside `handleHubSocketClosed`; the
-// call in each close handler is covered only by a spawned-bridge test like the
-// kimi lane's.
+// close and teardown). Pins `dropHubSocket` inside `handleHubSocketClosed`. The
+// call in each close handler is pinned only in the kimi lane's spawned-bridge
+// tests; this lane has none (KL-9, optional per the KB-2 precedent) — a spawned
+// bridge here would run the real executor, which needs a live opencode serve.
 {
   const a = fakeSocket()
   const handle = await toolProxyRelay.startTask("hub-close-drop", a.socket)
