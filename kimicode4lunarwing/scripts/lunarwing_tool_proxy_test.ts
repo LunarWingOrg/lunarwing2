@@ -171,6 +171,25 @@ test("invalid identifiers and oversized frames are rejected locally", async () =
   assert.equal(oversized.ok, false)
   assert.match(String(oversized.error), /256|budget|exceeds/)
 
+  // JU-4: the frame pre-check on its own — a request line just UNDER the IPC
+  // line cap whose serialized tool_call frame crosses the hub budget once the
+  // envelope adds id/type/timestamp/task_id. Without the relay-side frame
+  // check this reaches the hub, which rejects the frame and fails the job.
+  const nearCap = { op: "call", call_id: "c3", name: "memory_write", arguments: { content: "" } }
+  const baseLine = Buffer.byteLength(JSON.stringify(nearCap))
+  nearCap.arguments.content = "x".repeat(TOOL_CALL_FRAME_CAP_BYTES - 64 - baseLine)
+  assert.ok(Buffer.byteLength(JSON.stringify(nearCap)) <= TOOL_CALL_FRAME_CAP_BYTES)
+  const wouldBe = createEnvelope("tool_call", {
+    task_id: "task-3",
+    call_id: "c3",
+    name: "memory_write",
+    arguments: nearCap.arguments,
+  })
+  assert.ok(Buffer.byteLength(JSON.stringify(wouldBe)) > TOOL_CALL_FRAME_CAP_BYTES)
+  const overFrame = await ipcRequest(handle.socketPath, nearCap)
+  assert.equal(overFrame.ok, false)
+  assert.match(String(overFrame.error), /byte hub budget/)
+
   // Nothing reached the hub for any of these.
   assert.equal(hub.sent.length, 0)
 
