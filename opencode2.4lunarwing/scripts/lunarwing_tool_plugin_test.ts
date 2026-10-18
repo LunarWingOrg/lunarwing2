@@ -220,6 +220,36 @@ const relay = new ToolProxyRelay()
   }
 }
 
+// ── KL-10: the legacy lunarwing_gitlab-tool spelling reaches the hub as gitlab-tool ──
+{
+  const hub = new FakeHubSocket()
+  const handle = await relay.startTask("job-legacy", hub)
+  assert.ok(handle)
+  try {
+    const client = stubClient({ "ses_legacy": "lunarwing-opencode2-job-legacy" })
+    const tools = createProxyTools(client)
+    const pending = tools["lunarwing_gitlab-tool"]!.execute(
+      { action: "get_issue", arguments: { id: 1 } },
+      { sessionID: "ses_legacy" },
+    )
+    await settle()
+    const frame = hub.lastFrame()
+    assert.equal(frame.payload.name, "gitlab-tool")
+    relay.handleHubFrame(
+      hub,
+      createEnvelope("tool_result", {
+        call_id: frame.payload.call_id as string,
+        status: "success",
+        output: "{}",
+        error: null,
+      }),
+    )
+    await pending
+  } finally {
+    handle.close()
+  }
+}
+
 // ── denied/error replies surface as tool errors carrying the hub's reason ────
 {
   const hub = new FakeHubSocket()

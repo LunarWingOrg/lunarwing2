@@ -272,6 +272,34 @@ async function settle(ms = 100): Promise<void> {
   assert.equal(typeof response.error, "string")
 }
 
+// ── KL-10: closeTask(A) must not fail task B's in-flight call on the same hub socket ──
+{
+  const hub = new FakeHubSocket()
+  const handleA = await relay.startTask("task-close-a", hub)
+  const handleB = await relay.startTask("task-close-b", hub)
+  assert.ok(handleA)
+  assert.ok(handleB)
+  try {
+    const pendingB = ipcRequest(handleB.socketPath, {
+      op: "call",
+      call_id: "call-b-survives",
+      name: "memory_read",
+      arguments: {},
+    })
+    await settle()
+    handleA.close()
+    relay.handleHubFrame(
+      hub,
+      createEnvelope("tool_result", { call_id: "call-b-survives", status: "success", output: "still live" }),
+    )
+    const responseB = await pendingB
+    assert.equal(responseB.ok, true)
+    assert.equal(responseB.output, "still live")
+  } finally {
+    handleB.close()
+  }
+}
+
 // ── EF-2: startTask returns null instead of throwing on a sabotaged dir ──────
 {
   // MR !1549 EF-2: the proxy dir is a same-uid shared /tmp tree — a task
