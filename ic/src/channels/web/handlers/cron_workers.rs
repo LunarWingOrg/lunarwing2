@@ -116,12 +116,18 @@ async fn control(
             }
         };
     // Phase 2: the status reply is queued behind the mutation, so it reflects
-    // the applied command rather than merely acknowledging its enqueue.
+    // the applied command rather than merely acknowledging its enqueue. The
+    // mission's `durability_error` (WI#371) tells the caller whether the
+    // applied state is actually durable across a restart; surface it
+    // top-level as `durable` so a failed persist can never look like success.
     match tokio::time::timeout_at(deadline, manager.cron_mission_status(worker, user_id)).await {
-        Ok(Ok(status)) => Ok((
-            StatusCode::OK,
-            Json(serde_json::json!({"action": action, "mission": status})),
-        )),
+        Ok(Ok(status)) => {
+            let durable = status.durability_error.is_none();
+            Ok((
+                StatusCode::OK,
+                Json(serde_json::json!({"action": action, "mission": status, "durable": durable})),
+            ))
+        }
         Ok(Err(error)) => Err(command_error(error)),
         Err(_) if enqueued => {
             // DQ-4: the command was accepted by the queue but not confirmed in

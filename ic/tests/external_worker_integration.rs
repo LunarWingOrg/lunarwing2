@@ -5199,6 +5199,278 @@ async fn cron_tick_with_failing_job_persistence_never_dispatches() {
     let _ = shutdown.send(());
 }
 
+/// WI#371: a store-backed cron manager on a DAILY schedule — no scheduled
+/// tick can fire during the test, so only manual fires/commands drive state.
+#[cfg(feature = "libsql")]
+fn spawn_stored_cron_manager_daily(
+    db: &Arc<dyn Database>,
+    url: &str,
+) -> (
+    Arc<ExternalWorkerManager>,
+    tokio::sync::broadcast::Sender<()>,
+) {
+    let context_manager = Arc::new(ContextManager::new(16));
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(16);
+    let mgr = Arc::new(
+        ExternalWorkerManager::new(vec![cron_config_with_schedule(url, "0 15 10 * * *", 30, 0)])
+            .with_event_deps(event_tx, Arc::clone(&context_manager))
+            .with_store(db.clone()),
+    );
+    let (shutdown, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    mgr.spawn_cron_supervisors("owner-1", shutdown_rx);
+    (mgr, shutdown)
+}
+
+/// WI#371: wait until the persisted atomic control-state row reads exactly as
+/// expected — the durable-state assertion for the restart/write tests.
+#[cfg(feature = "libsql")]
+async fn await_control_row(db: &Arc<dyn Database>, paused: bool, consecutive_abandoned: u32) {
+    let expected = serde_json::json!({
+        "paused": paused,
+        "consecutive_abandoned": consecutive_abandoned,
+    });
+    timeout(TEST_BOUND, async {
+        loop {
+            if let Ok(Some(row)) = db
+                .get_setting("owner-1", "cron-mission:test-mission:control")
+                .await
+                && row == expected
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("control row never reached the expected durable state");
+}
+
+/// WI#371 AC1: a settings-store READ failure starts the mission paused with
+/// the actionable fault on its status — never a silent resume — and no tick
+/// fires. Healing the store lets the owner's resume become durable again.
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn cron_state_read_failure_starts_paused_and_recovers_on_resume() {
+    use lunarwing::db::Database;
+    use lunarwing::db::libsql::LibSqlBackend;
+    use lunarwing::db::recording::FaultingSettingsDb;
+
+    let temp_dir = tempfile::tempdir().expect("temp dir"); // safety: test
+    let backend = LibSqlBackend::new_local(&temp_dir.path().join("cron-read-fail.db"))
+        .await
+        .expect("test db"); // safety: test
+    backend.run_migrations().await.expect("migrations"); // safety: test
+    let faulting = Arc::new(FaultingSettingsDb::new(
+        Arc::new(backend) as Arc<dyn Database>,
+        "cron-mission:",
+    ));
+    faulting.set_fail_reads(true);
+    let db: Arc<dyn Database> = faulting.clone();
+
+    let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::Capture {
+        requests: request_tx,
+    })
+    .await;
+
+    let (mgr, shutdown) = restart_cron_manager(&db, &url);
+
+    // Fail-closed: paused with the fault reported on the status reply.
+    let status = mgr
+        .cron_mission_status("mock", "owner-1")
+        .await
+        .expect("status"); // safety: test
+    assert!(
+        status.paused,
+        "a control-state read failure must start the mission paused"
+    );
+    let fault = status
+        .durability_error
+        .as_deref()
+        .expect("the read fault must be reported on the status"); // safety: test
+    assert!(
+        fault.contains("failed to read cron mission control state"),
+        "the fault must be actionable, got: {fault}"
+    );
+    // The schedule fires every second; a fail-closed mission must never fire.
+    assert!(
+        timeout(Duration::from_secs(3), request_rx.recv())
+            .await
+            .is_err(),
+        "a fail-closed mission dispatched a tick"
+    );
+
+    // Heal the reads; the owner's resume persists and clears the fault.
+    faulting.set_fail_reads(false);
+    mgr.resume_cron_mission("mock", "owner-1", CronCommandOrigin::OwnerTool)
+        .await
+        .expect("resume"); // safety: test
+    timeout(TEST_BOUND, async {
+        loop {
+            let status = mgr
+                .cron_mission_status("mock", "owner-1")
+                .await
+                .expect("status"); // safety: test
+            if !status.paused && status.durability_error.is_none() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("resume never became durable");
+    let _ = shutdown.send(());
+}
+
+/// WI#371 AC3/AC4: a pause whose control-state write exhausts its bounded
+/// retries is applied live but REPORTED as not durable (never claimed as
+/// persisted); after the store heals, the owner's resume is durable again.
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn cron_pause_write_exhaustion_is_reported_to_control_callers() {
+    use lunarwing::db::Database;
+    use lunarwing::db::libsql::LibSqlBackend;
+    use lunarwing::db::recording::FaultingSettingsDb;
+
+    let temp_dir = tempfile::tempdir().expect("temp dir"); // safety: test
+    let backend = LibSqlBackend::new_local(&temp_dir.path().join("cron-write-fail.db"))
+        .await
+        .expect("test db"); // safety: test
+    backend.run_migrations().await.expect("migrations"); // safety: test
+    let faulting = Arc::new(FaultingSettingsDb::new(
+        Arc::new(backend) as Arc<dyn Database>,
+        "cron-mission:test-mission:control",
+    ));
+    let db: Arc<dyn Database> = faulting.clone();
+
+    let (request_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::Capture {
+        requests: request_tx,
+    })
+    .await;
+    // Daily schedule: no scheduled tick can spend the injected write budget.
+    let (mgr, shutdown) = spawn_stored_cron_manager_daily(&db, &url);
+
+    faulting.fail_next_writes(10);
+    mgr.pause_cron_mission("mock", "owner-1", CronCommandOrigin::OwnerTool)
+        .await
+        .expect("pause"); // safety: test
+    timeout(TEST_BOUND, async {
+        loop {
+            let status = mgr
+                .cron_mission_status("mock", "owner-1")
+                .await
+                .expect("status"); // safety: test
+            if status.paused && status.durability_error.is_some() {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the exhausted pause write was never reported");
+    // PERSIST_MAX_ATTEMPTS (cron_worker.rs): initial + 3 bounded retries.
+    assert_eq!(
+        faulting.write_attempts().len(),
+        4,
+        "the write must stop at the bounded retry budget: {:?}",
+        faulting.write_attempts()
+    );
+    assert!(
+        db.get_setting("owner-1", "cron-mission:test-mission:control")
+            .await
+            .expect("read") // safety: test
+            .is_none(),
+        "an exhausted write must not leave a persisted row claiming success"
+    );
+
+    // Heal the store; the owner's resume writes durably and clears the fault.
+    faulting.fail_next_writes(0);
+    mgr.resume_cron_mission("mock", "owner-1", CronCommandOrigin::OwnerTool)
+        .await
+        .expect("resume"); // safety: test
+    timeout(TEST_BOUND, async {
+        loop {
+            let status = mgr
+                .cron_mission_status("mock", "owner-1")
+                .await
+                .expect("status"); // safety: test
+            if !status.paused && status.durability_error.is_none() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("resume never became durable");
+    await_control_row(&db, false, 0).await;
+    let _ = shutdown.send(());
+}
+
+/// WI#371 AC2/AC4: the consecutive-abandon counter is durable across
+/// supervisor restarts — restart after 1 and 2 abandoned ticks resumes the
+/// count, the 3rd abandon trips the breaker into a persisted pause, and a
+/// further restart still shows the tripped state.
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn cron_breaker_counter_survives_restart_between_abandons() {
+    use lunarwing::db::Database;
+    use lunarwing::db::libsql::LibSqlBackend;
+
+    let temp_dir = tempfile::tempdir().expect("temp dir"); // safety: test
+    let backend = LibSqlBackend::new_local(&temp_dir.path().join("cron-breaker-restart.db"))
+        .await
+        .expect("test db"); // safety: test
+    backend.run_migrations().await.expect("migrations"); // safety: test
+    let db: Arc<dyn Database> = Arc::new(backend);
+
+    let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::CaptureFail {
+        requests: request_tx,
+        error: "timeout_ms must be an integer between 1 and 14400000".to_string(),
+    })
+    .await;
+
+    for expected in 1..=3u32 {
+        let (mgr, shutdown) = spawn_stored_cron_manager_daily(&db, &url);
+        timeout(TEST_BOUND, mgr.fire_cron_tick_now("mock", "owner-1"))
+            .await
+            .expect("tick timed out")
+            .expect("tick errored");
+        let request = timeout(TEST_BOUND, request_rx.recv())
+            .await
+            .expect("dispatch timed out")
+            .expect("dispatch captured");
+        assert_eq!(request["payload"]["context"]["cron_tick"]["chain_index"], 0);
+        // The abandon is recorded in the atomic control row (durable proof),
+        // and the live status agrees.
+        await_control_row(&db, expected >= 3, expected).await;
+        let status = mgr
+            .cron_mission_status("mock", "owner-1")
+            .await
+            .expect("status"); // safety: test
+        assert_eq!(status.consecutive_abandoned, expected);
+        assert_eq!(status.paused, expected >= 3);
+        assert!(status.durability_error.is_none());
+        let _ = shutdown.send(());
+        drop(mgr);
+    }
+
+    // One more restart: the tripped breaker and its counter are both durable.
+    let (mgr, shutdown) = spawn_stored_cron_manager_daily(&db, &url);
+    let status = mgr
+        .cron_mission_status("mock", "owner-1")
+        .await
+        .expect("status after restart"); // safety: test
+    assert!(
+        status.paused,
+        "the tripped breaker must survive the restart"
+    );
+    assert_eq!(status.consecutive_abandoned, 3);
+    assert!(status.durability_error.is_none());
+    let _ = shutdown.send(());
+}
+
 #[cfg(feature = "libsql")]
 async fn assert_cron_gateway_auth(client: &reqwest::Client, addr: std::net::SocketAddr) {
     let url = format!("http://{addr}/api/workers/mock/cron");
@@ -5252,6 +5524,8 @@ async fn assert_cron_gateway_auth(client: &reqwest::Client, addr: std::net::Sock
 
 /// DN-3: recovery uses the authenticated gateway independently of either LLM
 /// engine. No chat turn or model/tool invocation participates in this route.
+/// WI#371: the seeded legacy `paused` flag still applies (read-only fallback),
+/// and mutations are asserted against the atomic `control` row.
 #[cfg(feature = "libsql")]
 #[tokio::test]
 async fn cron_gateway_recovers_persisted_pause_and_rejects_nonowners() {
@@ -5319,6 +5593,7 @@ async fn cron_gateway_recovers_persisted_pause_and_rejects_nonowners() {
         .unwrap();
     let url = format!("http://{addr}/api/workers/mock/cron");
     assert_cron_gateway_auth(&client, addr).await;
+    // WI#371: the legacy seed still pauses the mission (read-only fallback).
     assert!(
         mgr.cron_mission_status("mock", "owner-1")
             .await
@@ -5347,11 +5622,29 @@ async fn cron_gateway_recovers_persisted_pause_and_rejects_nonowners() {
         assert_eq!(body["action"], action);
         assert_eq!(body["mission"]["paused"], paused);
         assert_eq!(body["mission"]["worker_name"], "mock");
+        // WI#371: a healthy store means the applied state is durable.
+        assert_eq!(body["durable"], true);
+        assert_eq!(body["mission"]["durability_error"], serde_json::Value::Null);
+        // WI#371: durable state lives in the atomic control row; the seeded
+        // legacy key is a read-only fallback and is never rewritten. A status
+        // query writes nothing.
+        let expected_row = if action == "status" {
+            None
+        } else {
+            Some(serde_json::json!({"paused": paused, "consecutive_abandoned": 0}))
+        };
+        assert_eq!(
+            db.get_setting("owner-1", "cron-mission:test-mission:control")
+                .await
+                .unwrap(),
+            expected_row
+        );
         assert_eq!(
             db.get_setting("owner-1", "cron-mission:test-mission:paused")
                 .await
                 .unwrap(),
-            Some(serde_json::json!(paused))
+            Some(serde_json::json!(true)),
+            "the legacy key is read-only under the WI#371 contract"
         );
     }
     let _ = shutdown.send(());

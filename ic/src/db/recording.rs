@@ -1,11 +1,18 @@
-//! Recording `Database` decorator for tests (WI#375 DR-2).
+//! Test-support `Database` decorators.
 //!
-//! `job_events.job_id` has a foreign key to `agent_jobs`, so a test that
-//! sabotages the job table cannot prove the supervisor never even TRIED to
-//! write an event for an unfired job: the FK makes the write fail
-//! indistinguishably. `RecordingDb` wraps a real backend, delegates every
-//! call, and records each `save_job_event` attempt before forwarding it, so
-//! tests assert on attempts rather than surviving rows.
+//! `RecordingDb` (WI#375 DR-2): `job_events.job_id` has a foreign key to
+//! `agent_jobs`, so a test that sabotages the job table cannot prove the
+//! supervisor never even TRIED to write an event for an unfired job: the FK
+//! makes the write fail indistinguishably. `RecordingDb` wraps a real
+//! backend, delegates every call, and records each `save_job_event` attempt
+//! before forwarding it, so tests assert on attempts rather than surviving
+//! rows.
+//!
+//! `FaultingSettingsDb` (WI#371): delegates every call except `get_setting`
+//! / `set_setting` for keys under one configured prefix, where reads can be
+//! failed outright and writes can be failed a programmed number of times
+//! before one succeeds. Every prefixed write attempt is recorded so tests
+//! assert on retry counts, not just surviving rows.
 //!
 //! Test-support only; integration tests in `ic/tests/` import the crate as a
 //! regular dependency, so this module is always compiled (same shape as
@@ -18,6 +25,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -149,12 +157,19 @@ impl Database for RecordingDb {
 }
 
 macro_rules! delegate_database {
-    ($($trait:ident { $( $name:ident (&self $(, $arg:ident : $ty:ty)* $(,)?) -> $ret:ty ; )* } )*) => {
+    // Fan the same trait list out to each listed decorator type (a flat
+    // two-dimensional repetition cannot mix the type and trait variables).
+    ([$ty:ident $(, $rest:ident)* $(,)?] $($body:tt)*) => {
+        delegate_database!(@impl $ty; $($body)*);
+        delegate_database!([$($rest),*] $($body)*);
+    };
+    ([] $($body:tt)*) => {};
+    (@impl $ty:ident; $($trait:ident { $( $name:ident (&self $(, $arg:ident : $argty:ty)* $(,)?) -> $ret:ty ; )* } )*) => {
         $(
             #[async_trait]
-            impl $trait for RecordingDb {
+            impl $trait for $ty {
                 $(
-                    async fn $name(&self $(, $arg: $ty)*) -> $ret {
+                    async fn $name(&self $(, $arg: $argty)*) -> $ret {
                         self.inner.$name($($arg),*).await
                     }
                 )*
@@ -163,7 +178,10 @@ macro_rules! delegate_database {
     };
 }
 
-delegate_database! {
+// SandboxStore and SettingsStore stay out of the shared list: RecordingDb
+// overrides `save_job_event` (hand-written above) and FaultingSettingsDb
+// overrides the prefixed `get_setting`/`set_setting` (hand-written below).
+delegate_database! {[RecordingDb, FaultingSettingsDb]
     ConversationStore {
         create_conversation( &self, channel: &str, user_id: &str, thread_id: Option<&str>, ) -> Result<Uuid, DatabaseError>;
         touch_conversation(&self, id: Uuid) -> Result<(), DatabaseError>;
@@ -234,18 +252,6 @@ delegate_database! {
         increment_repair_attempts(&self, tool_name: &str) -> Result<(), DatabaseError>;
         record_tool_success(&self, tool_name: &str) -> Result<(), DatabaseError>;
         reset_tool_repair_attempts(&self) -> Result<u64, DatabaseError>;
-    }
-
-    SettingsStore {
-        get_setting( &self, user_id: &str, key: &str, ) -> Result<Option<serde_json::Value>, DatabaseError>;
-        get_setting_full( &self, user_id: &str, key: &str, ) -> Result<Option<SettingRow>, DatabaseError>;
-        set_setting( &self, user_id: &str, key: &str, value: &serde_json::Value, ) -> Result<(), DatabaseError>;
-        compare_and_set_setting( &self, user_id: &str, key: &str, expected: Option<&serde_json::Value>, value: &serde_json::Value, ) -> Result<bool, DatabaseError>;
-        delete_setting(&self, user_id: &str, key: &str) -> Result<bool, DatabaseError>;
-        list_settings(&self, user_id: &str) -> Result<Vec<SettingRow>, DatabaseError>;
-        get_all_settings( &self, user_id: &str, ) -> Result<HashMap<String, serde_json::Value>, DatabaseError>;
-        set_all_settings( &self, user_id: &str, settings: &HashMap<String, serde_json::Value>, ) -> Result<(), DatabaseError>;
-        has_settings(&self, user_id: &str) -> Result<bool, DatabaseError>;
     }
 
     WorkspaceStore {
@@ -330,6 +336,232 @@ delegate_database! {
     }
 }
 
+// RecordingDb delegates the settings surface outright; FaultingSettingsDb's
+// hand-written SettingsStore below injects the prefixed faults instead.
+delegate_database! {[RecordingDb]
+    SettingsStore {
+        get_setting( &self, user_id: &str, key: &str, ) -> Result<Option<serde_json::Value>, DatabaseError>;
+        get_setting_full( &self, user_id: &str, key: &str, ) -> Result<Option<SettingRow>, DatabaseError>;
+        set_setting( &self, user_id: &str, key: &str, value: &serde_json::Value, ) -> Result<(), DatabaseError>;
+        compare_and_set_setting( &self, user_id: &str, key: &str, expected: Option<&serde_json::Value>, value: &serde_json::Value, ) -> Result<bool, DatabaseError>;
+        delete_setting(&self, user_id: &str, key: &str) -> Result<bool, DatabaseError>;
+        list_settings(&self, user_id: &str) -> Result<Vec<SettingRow>, DatabaseError>;
+        get_all_settings( &self, user_id: &str, ) -> Result<HashMap<String, serde_json::Value>, DatabaseError>;
+        set_all_settings( &self, user_id: &str, settings: &HashMap<String, serde_json::Value>, ) -> Result<(), DatabaseError>;
+        has_settings(&self, user_id: &str) -> Result<bool, DatabaseError>;
+    }
+}
+
+/// Settings-scoped fault-injecting `Database` decorator for tests (WI#371).
+///
+/// Delegates every call except `get_setting`/`set_setting` for keys under one
+/// configured prefix: reads can be failed outright, and writes can be failed
+/// a programmed number of times before one is forwarded. Every prefixed write
+/// attempt is recorded, so retry behavior is asserted on attempts rather than
+/// on surviving rows. Works over any backend behind the shared trait.
+pub struct FaultingSettingsDb {
+    inner: Arc<dyn Database>,
+    key_prefix: String,
+    fail_reads: AtomicBool,
+    remaining_write_failures: AtomicU32,
+    write_attempts: std::sync::Mutex<Vec<String>>,
+}
+
+impl FaultingSettingsDb {
+    /// Wrap `inner`; only keys starting with `key_prefix` can be faulted.
+    pub fn new(inner: Arc<dyn Database>, key_prefix: impl Into<String>) -> Self {
+        Self {
+            inner,
+            key_prefix: key_prefix.into(),
+            fail_reads: AtomicBool::new(false),
+            remaining_write_failures: AtomicU32::new(0),
+            write_attempts: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Toggle read failures for prefixed keys.
+    pub fn set_fail_reads(&self, fail: bool) {
+        self.fail_reads.store(fail, Ordering::Relaxed);
+    }
+
+    /// Program the next `count` prefixed writes to fail before one succeeds.
+    pub fn fail_next_writes(&self, count: u32) {
+        self.remaining_write_failures
+            .store(count, Ordering::Relaxed);
+    }
+
+    /// Prefixed `set_setting` keys attempted so far, in order.
+    pub fn write_attempts(&self) -> Vec<String> {
+        self.write_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn read_fault(&self, key: &str) -> Option<DatabaseError> {
+        (self.fail_reads.load(Ordering::Relaxed) && key.starts_with(&self.key_prefix))
+            .then(|| DatabaseError::Query(format!("injected settings read failure for {key}")))
+    }
+}
+
+#[async_trait]
+impl Database for FaultingSettingsDb {
+    async fn run_migrations(&self) -> Result<(), DatabaseError> {
+        self.inner.run_migrations().await
+    }
+}
+
+#[async_trait]
+impl SettingsStore for FaultingSettingsDb {
+    async fn get_setting(
+        &self,
+        user_id: &str,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>, DatabaseError> {
+        if let Some(fault) = self.read_fault(key) {
+            return Err(fault);
+        }
+        self.inner.get_setting(user_id, key).await
+    }
+    async fn get_setting_full(
+        &self,
+        user_id: &str,
+        key: &str,
+    ) -> Result<Option<SettingRow>, DatabaseError> {
+        self.inner.get_setting_full(user_id, key).await
+    }
+    async fn set_setting(
+        &self,
+        user_id: &str,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> Result<(), DatabaseError> {
+        if key.starts_with(&self.key_prefix) {
+            self.write_attempts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(key.to_string());
+            let remaining = self.remaining_write_failures.load(Ordering::Relaxed);
+            if remaining > 0 {
+                self.remaining_write_failures
+                    .store(remaining - 1, Ordering::Relaxed);
+                return Err(DatabaseError::Query(format!(
+                    "injected settings write failure for {key}"
+                )));
+            }
+        }
+        self.inner.set_setting(user_id, key, value).await
+    }
+    async fn compare_and_set_setting(
+        &self,
+        user_id: &str,
+        key: &str,
+        expected: Option<&serde_json::Value>,
+        value: &serde_json::Value,
+    ) -> Result<bool, DatabaseError> {
+        self.inner
+            .compare_and_set_setting(user_id, key, expected, value)
+            .await
+    }
+    async fn delete_setting(&self, user_id: &str, key: &str) -> Result<bool, DatabaseError> {
+        self.inner.delete_setting(user_id, key).await
+    }
+    async fn list_settings(&self, user_id: &str) -> Result<Vec<SettingRow>, DatabaseError> {
+        self.inner.list_settings(user_id).await
+    }
+    async fn get_all_settings(
+        &self,
+        user_id: &str,
+    ) -> Result<HashMap<String, serde_json::Value>, DatabaseError> {
+        self.inner.get_all_settings(user_id).await
+    }
+    async fn set_all_settings(
+        &self,
+        user_id: &str,
+        settings: &HashMap<String, serde_json::Value>,
+    ) -> Result<(), DatabaseError> {
+        self.inner.set_all_settings(user_id, settings).await
+    }
+    async fn has_settings(&self, user_id: &str) -> Result<bool, DatabaseError> {
+        self.inner.has_settings(user_id).await
+    }
+}
+
+/// Pure delegation — FaultingSettingsDb only faults the settings surface.
+#[async_trait]
+impl SandboxStore for FaultingSettingsDb {
+    async fn save_sandbox_job(&self, job: &SandboxJobRecord) -> Result<(), DatabaseError> {
+        self.inner.save_sandbox_job(job).await
+    }
+    async fn get_sandbox_job(&self, id: Uuid) -> Result<Option<SandboxJobRecord>, DatabaseError> {
+        self.inner.get_sandbox_job(id).await
+    }
+    async fn list_sandbox_jobs(&self) -> Result<Vec<SandboxJobRecord>, DatabaseError> {
+        self.inner.list_sandbox_jobs().await
+    }
+    async fn update_sandbox_job_status(
+        &self,
+        id: Uuid,
+        status: &str,
+        success: Option<bool>,
+        message: Option<&str>,
+        started_at: Option<DateTime<Utc>>,
+        completed_at: Option<DateTime<Utc>>,
+    ) -> Result<(), DatabaseError> {
+        self.inner
+            .update_sandbox_job_status(id, status, success, message, started_at, completed_at)
+            .await
+    }
+    async fn cleanup_stale_sandbox_jobs(&self) -> Result<u64, DatabaseError> {
+        self.inner.cleanup_stale_sandbox_jobs().await
+    }
+    async fn sandbox_job_summary(&self) -> Result<SandboxJobSummary, DatabaseError> {
+        self.inner.sandbox_job_summary().await
+    }
+    async fn list_sandbox_jobs_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<SandboxJobRecord>, DatabaseError> {
+        self.inner.list_sandbox_jobs_for_user(user_id).await
+    }
+    async fn sandbox_job_summary_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<SandboxJobSummary, DatabaseError> {
+        self.inner.sandbox_job_summary_for_user(user_id).await
+    }
+    async fn sandbox_job_belongs_to_user(
+        &self,
+        job_id: Uuid,
+        user_id: &str,
+    ) -> Result<bool, DatabaseError> {
+        self.inner
+            .sandbox_job_belongs_to_user(job_id, user_id)
+            .await
+    }
+    async fn update_sandbox_job_mode(&self, id: Uuid, mode: &str) -> Result<(), DatabaseError> {
+        self.inner.update_sandbox_job_mode(id, mode).await
+    }
+    async fn get_sandbox_job_mode(&self, id: Uuid) -> Result<Option<String>, DatabaseError> {
+        self.inner.get_sandbox_job_mode(id).await
+    }
+    async fn save_job_event(
+        &self,
+        job_id: Uuid,
+        event_type: &str,
+        data: &serde_json::Value,
+    ) -> Result<(), DatabaseError> {
+        self.inner.save_job_event(job_id, event_type, data).await
+    }
+    async fn list_job_events(
+        &self,
+        job_id: Uuid,
+        limit: Option<i64>,
+    ) -> Result<Vec<JobEventRecord>, DatabaseError> {
+        self.inner.list_job_events(job_id, limit).await
+    }
+}
+
 #[cfg(all(test, feature = "libsql"))]
 mod tests {
     use super::*;
@@ -350,6 +582,66 @@ mod tests {
         assert_eq!(
             recording.job_event_attempts(),
             vec![(orphan, "cron_reentry".to_string())]
+        );
+    }
+
+    /// WI#371: the decorator faults only prefixed keys, counts the programmed
+    /// write failures down, and records every prefixed write attempt.
+    #[tokio::test]
+    async fn faulting_settings_db_faults_only_prefixed_keys() {
+        let (inner, _dir) = crate::testing::test_db().await;
+        let db = FaultingSettingsDb::new(inner, "cron-mission:");
+
+        // Unprefixed keys are never faulted.
+        db.set_setting("owner", "other:key", &serde_json::json!(1))
+            .await
+            .expect("unprefixed write must delegate"); // safety: test
+
+        db.set_fail_reads(true);
+        assert!(
+            db.get_setting("owner", "cron-mission:m:control")
+                .await
+                .is_err(),
+            "prefixed read must fail while reads are faulted"
+        );
+        assert!(
+            db.get_setting("owner", "other:key")
+                .await
+                .expect("unprefixed read must delegate") // safety: test
+                .is_some()
+        );
+        db.set_fail_reads(false);
+
+        db.fail_next_writes(2);
+        for _ in 0..2 {
+            assert!(
+                db.set_setting("owner", "cron-mission:m:control", &serde_json::json!({}))
+                    .await
+                    .is_err(),
+                "programmed write failure must fire"
+            );
+        }
+        db.set_setting(
+            "owner",
+            "cron-mission:m:control",
+            &serde_json::json!({"paused": true}),
+        )
+        .await
+        .expect("write succeeds once the programmed failures are spent"); // safety: test
+        assert_eq!(
+            db.write_attempts(),
+            vec![
+                "cron-mission:m:control".to_string(),
+                "cron-mission:m:control".to_string(),
+                "cron-mission:m:control".to_string(),
+            ]
+        );
+        assert_eq!(
+            db.get_setting("owner", "cron-mission:m:control")
+                .await
+                .expect("readback") // safety: test
+                .expect("row present"), // safety: test
+            serde_json::json!({"paused": true})
         );
     }
 }
