@@ -703,7 +703,15 @@ def check_cited_paths(
 ) -> None:
     for path in sorted(extract_repo_paths(text, top_levels)):
         if tracked is None:
-            present = (ROOT / path).exists()
+            # git ls-files never lists `..` segments or paths through a
+            # symlink, so neither may the fallback: a citation must stay
+            # inside the checkout to count as present (run-157 KF-1).
+            candidate = ROOT / path
+            present = (
+                ".." not in pathlib.PurePosixPath(path).parts
+                and candidate.exists()
+                and candidate.resolve().is_relative_to(ROOT.resolve())
+            )
         else:
             present = path in tracked or any(
                 entry.startswith(path + "/") for entry in tracked
@@ -731,8 +739,10 @@ def validate_deny_toml_advisories(errors: list[str], tracked: set[str] | None = 
     strings) and in the marker-delimited cargo-deny section of
     .gitlab/README.md must be a tracked path. The tracked-file truth comes
     from `git ls-files`; in an image without a git binary (the ci-config
-    lint image ships none) it falls back to checkout existence, which is the
-    same truth in CI because the runner checks out a clean tree.
+    lint image ships none) it falls back to checkout existence, restricted to
+    citations that stay inside the checkout (no `..` segments, no symlink
+    escapes) because git mode can never list those — the same truth in CI
+    because the runner checks out a clean tree.
     """
     deny_path = ROOT / "ic" / "deny.toml"
     try:

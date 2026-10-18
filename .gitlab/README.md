@@ -495,7 +495,10 @@ the prime suspect, and the fix is the same normalization in the offending
   `[advisories].ignore` entry to be a table whose non-empty reason names a
   `clearing owner WI#N`, and requires every repo-relative path cited by
   `ic/deny.toml` and by this marker-delimited section
-  (`deny-toml-guard-section:begin`/`end`) to exist in `git ls-files` — bare
+  (`deny-toml-guard-section:begin`/`end`) to be tracked (`git ls-files`; in
+  the git-less ci-config image, present inside the checkout — citations with
+  `..` segments or symlink escapes are refused there too, matching what git
+  mode can list) — bare
   filenames without a repo-relative path and `file:line` anchors are the
   documented out-of-scope limits. The cargo-deny job's final script step,
   `python3 .gitlab/scripts/check_deny_toml_owners.py`, resolves each distinct

@@ -219,6 +219,56 @@ class DenyTomlNoGitFallbackTests(unittest.TestCase):
         self.assertEqual(len(errors), 1, errors)
         self.assertIn("docs/ops/GONE.md", errors[0])
 
+    def test_citation_escaping_the_checkout_fails_without_git(self):
+        # git mode refuses all three citations (none is a tracked path); the
+        # fallback must not accept them just because the target exists
+        # (run-157 KF-1).
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        outer = pathlib.Path(temporary.name)
+        (outer / "outside.md").write_text("x", encoding="utf-8")
+        root = outer / "repo"
+        (root / "ic" / "src").mkdir(parents=True)
+        (root / "ic" / "src" / "main.rs").write_text("", encoding="utf-8")
+        (root / "docs" / "ops").mkdir(parents=True)
+        (root / "docs" / "ops" / "EXISTS.md").write_text("x", encoding="utf-8")
+        (root / "docs" / "escape").symlink_to(outer, target_is_directory=True)
+        (root / ".gitlab").mkdir()
+        (root / ".gitlab" / "README.md").write_text(
+            DenyTomlAdvisoryGuardTests.README_OK, encoding="utf-8"
+        )
+        deny = (
+            DenyTomlAdvisoryGuardTests.DENY_OK
+            + "# traversal: ic/../../outside.md"
+            + chr(10)
+            + "# symlink: docs/escape/outside.md"
+            + chr(10)
+            + "# in-repo traversal: ic/../ic/src/main.rs"
+            + chr(10)
+        )
+        (root / "ic" / "deny.toml").write_text(deny, encoding="utf-8")
+        errors: list[str] = []
+        with mock.patch.object(config, "ROOT", root), self.no_git():
+            config.validate_deny_toml_advisories(errors)
+        self.assertEqual(len(errors), 3, errors)
+        joined = chr(10).join(errors)
+        self.assertIn("ic/../../outside.md", joined)
+        self.assertIn("docs/escape/outside.md", joined)
+        self.assertIn("ic/../ic/src/main.rs", joined)
+
+    def test_git_failure_is_an_error_not_a_fallback(self):
+        # A `git ls-files` that fails while git is present (for example,
+        # dubious ownership) is an error, not a silent fallback (run-157
+        # KF-2, mutant M5).
+        failed = config.subprocess.CompletedProcess(
+            ["git", "ls-files"], 128, "", "fatal: not a git repository"
+        )
+        errors: list[str] = []
+        with mock.patch.object(config.subprocess, "run", return_value=failed):
+            config.validate_deny_toml_advisories(errors)
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("git ls-files failed", errors[0])
+
 
 class DenyTomlMainWiringTests(unittest.TestCase):
     """The ci-config lane runs validate_config.py's main(), so the offline
