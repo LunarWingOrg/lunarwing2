@@ -11,6 +11,7 @@ the suite also runs in python-unit.
 """
 
 import importlib.util
+import io
 import json
 import pathlib
 import tempfile
@@ -176,6 +177,69 @@ ignore = [
         # The fixture comments carry opencode/opencode2/pebble, 2026-0098/0099
         # and WI#331/WI#409-shaped fragments; none may be flagged.
         self.assertEqual(self.ok(), [])
+
+
+class DenyTomlNoGitFallbackTests(unittest.TestCase):
+    """The ci-config lint image (python:3.12-slim) ships no git binary, so
+    `git ls-files` raises FileNotFoundError there (pipeline 5929, job
+    117472). The guard must fall back to checkout existence, not crash."""
+
+    def no_git(self):
+        return mock.patch.object(
+            config.subprocess, "run", side_effect=FileNotFoundError("git")
+        )
+
+    def test_real_tree_passes_without_git(self):
+        errors: list[str] = []
+        with self.no_git():
+            config.validate_deny_toml_advisories(errors)
+        self.assertEqual(errors, [])
+
+    def test_missing_path_still_fails_without_git(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = pathlib.Path(temporary.name)
+        (root / "docs" / "ops").mkdir(parents=True)
+        (root / "docs" / "ops" / "EXISTS.md").write_text("x", encoding="utf-8")
+        (root / "ic" / "src").mkdir(parents=True)
+        (root / "ic" / "src" / "main.rs").write_text("", encoding="utf-8")
+        (root / ".gitlab").mkdir()
+        (root / ".gitlab" / "README.md").write_text(
+            DenyTomlAdvisoryGuardTests.README_OK, encoding="utf-8"
+        )
+        deny = (
+            DenyTomlAdvisoryGuardTests.DENY_OK
+            + "# stale citation: docs/ops/GONE.md"
+            + chr(10)
+        )
+        (root / "ic" / "deny.toml").write_text(deny, encoding="utf-8")
+        errors: list[str] = []
+        with mock.patch.object(config, "ROOT", root), self.no_git():
+            config.validate_deny_toml_advisories(errors)
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("docs/ops/GONE.md", errors[0])
+
+
+class DenyTomlMainWiringTests(unittest.TestCase):
+    """The ci-config lane runs validate_config.py's main(), so the offline
+    guard only protects anything while main() calls it."""
+
+    def test_main_runs_the_deny_toml_guard(self):
+        calls = []
+
+        def record(errors, tracked=None):
+            calls.append(tracked)
+            errors.append("WI#363 wiring probe")
+
+        with (
+            mock.patch.object(
+                config, "validate_deny_toml_advisories", side_effect=record
+            ),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            self.assertEqual(config.main(), 1)
+        self.assertEqual(calls, [None])
+        self.assertIn("WI#363 wiring probe", stderr.getvalue())
 
 
 class DenyTomlOwnerCheckTests(unittest.TestCase):
