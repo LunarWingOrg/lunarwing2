@@ -144,60 +144,65 @@ test("invalid identifiers and oversized frames are rejected locally", async () =
   const hub = new FakeHubSocket()
   const handle = await relay.startTask("task-3", hub)
   assert.ok(handle)
+  try {
+    const badName = await ipcRequest(handle.socketPath, {
+      op: "call",
+      call_id: "c1",
+      name: "memory read",
+      arguments: {},
+    })
+    assert.equal(badName.ok, false)
+    assert.match(String(badName.error), /name/)
 
-  const badName = await ipcRequest(handle.socketPath, {
-    op: "call",
-    call_id: "c1",
-    name: "memory read",
-    arguments: {},
-  })
-  assert.equal(badName.ok, false)
-  assert.match(String(badName.error), /name/)
+    const badCallId = await ipcRequest(handle.socketPath, {
+      op: "call",
+      call_id: "has spaces",
+      name: "memory_read",
+      arguments: {},
+    })
+    assert.equal(badCallId.ok, false)
 
-  const badCallId = await ipcRequest(handle.socketPath, {
-    op: "call",
-    call_id: "has spaces",
-    name: "memory_read",
-    arguments: {},
-  })
-  assert.equal(badCallId.ok, false)
+    const oversized = await ipcRequest(handle.socketPath, {
+      op: "call",
+      call_id: "c2",
+      name: "memory_write",
+      arguments: { content: "x".repeat(TOOL_CALL_FRAME_CAP_BYTES) },
+    })
+    assert.equal(oversized.ok, false)
+    assert.match(String(oversized.error), /256|budget|exceeds/)
 
-  const oversized = await ipcRequest(handle.socketPath, {
-    op: "call",
-    call_id: "c2",
-    name: "memory_write",
-    arguments: { content: "x".repeat(TOOL_CALL_FRAME_CAP_BYTES) },
-  })
-  assert.equal(oversized.ok, false)
-  assert.match(String(oversized.error), /256|budget|exceeds/)
+    // JU-4: the frame pre-check on its own — a request line just UNDER the IPC
+    // line cap whose serialized tool_call frame crosses the hub budget once the
+    // envelope adds id/type/timestamp/task_id. Without the relay-side frame
+    // check this reaches the hub, which rejects the frame and fails the job.
+    const nearCap = { op: "call", call_id: "c3", name: "memory_write", arguments: { content: "" } }
+    const baseLine = Buffer.byteLength(JSON.stringify(nearCap))
+    nearCap.arguments.content = "x".repeat(TOOL_CALL_FRAME_CAP_BYTES - 64 - baseLine)
+    assert.ok(Buffer.byteLength(JSON.stringify(nearCap)) <= TOOL_CALL_FRAME_CAP_BYTES)
+    const wouldBe = createEnvelope("tool_call", {
+      task_id: "task-3",
+      call_id: "c3",
+      name: "memory_write",
+      arguments: nearCap.arguments,
+    })
+    assert.ok(Buffer.byteLength(JSON.stringify(wouldBe)) > TOOL_CALL_FRAME_CAP_BYTES)
+    const overFrame = await ipcRequest(handle.socketPath, nearCap)
+    assert.equal(overFrame.ok, false)
+    assert.match(String(overFrame.error), /byte hub budget/)
 
-  // JU-4: the frame pre-check on its own — a request line just UNDER the IPC
-  // line cap whose serialized tool_call frame crosses the hub budget once the
-  // envelope adds id/type/timestamp/task_id. Without the relay-side frame
-  // check this reaches the hub, which rejects the frame and fails the job.
-  const nearCap = { op: "call", call_id: "c3", name: "memory_write", arguments: { content: "" } }
-  const baseLine = Buffer.byteLength(JSON.stringify(nearCap))
-  nearCap.arguments.content = "x".repeat(TOOL_CALL_FRAME_CAP_BYTES - 64 - baseLine)
-  assert.ok(Buffer.byteLength(JSON.stringify(nearCap)) <= TOOL_CALL_FRAME_CAP_BYTES)
-  const wouldBe = createEnvelope("tool_call", {
-    task_id: "task-3",
-    call_id: "c3",
-    name: "memory_write",
-    arguments: nearCap.arguments,
-  })
-  assert.ok(Buffer.byteLength(JSON.stringify(wouldBe)) > TOOL_CALL_FRAME_CAP_BYTES)
-  const overFrame = await ipcRequest(handle.socketPath, nearCap)
-  assert.equal(overFrame.ok, false)
-  assert.match(String(overFrame.error), /byte hub budget/)
+    // Nothing reached the hub for any of these.
+    assert.equal(hub.sent.length, 0)
 
-  // Nothing reached the hub for any of these.
-  assert.equal(hub.sent.length, 0)
-
-  const notJson = await ipcRequest(handle.socketPath, {})
-  // op missing -> explicit error, still no hub traffic
-  assert.equal(notJson.ok, false)
-  assert.equal(hub.sent.length, 0)
-  handle.close()
+    const notJson = await ipcRequest(handle.socketPath, {})
+    // op missing -> explicit error, still no hub traffic
+    assert.equal(notJson.ok, false)
+    assert.equal(hub.sent.length, 0)
+  } finally {
+    // KE-1: close the task socket even when an assertion throws — an open
+    // task-3 socket hangs the test file's process and fails the later EF-2
+    // tests, turning one relay regression into a lane timeout.
+    handle.close()
+  }
 })
 
 test("hub-frame routing is scoped to the owning socket", async () => {
