@@ -235,6 +235,8 @@ RUN test "$(/usr/local/bin/opencode --version)" = "${OPENCODE_VERSION}" \
     && bun scripts/opencode_result_test.ts \
     && bun scripts/opencode_task_executor_test.ts \
     && bun scripts/lunarwing_bridge_test.ts \
+    && bun scripts/lunarwing_tool_proxy_test.ts \
+    && bun scripts/lunarwing_tool_plugin_test.ts \
     && python3 scripts/study_notes_config_test.py
 
 # ── XDG directories for opencode state ────────────────────────

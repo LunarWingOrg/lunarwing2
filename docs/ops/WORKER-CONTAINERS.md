@@ -99,8 +99,20 @@ frames on the existing hub WebSocket. Tools appear to the agent as
 `mcp__lunarwing__<name>`; the hub stays deny-by-default until the worker's
 `tool_allowlist` (or `cron.tool_allowlist` for tick jobs — MR !1506 CQ-10)
 grants phase-1 names. `LUNARWING_TOOL_PROXY_TIMEOUT_MS` bounds one proxied
-call (default 300000, capped 900000). The opencode/opencode2/pebble lanes do
-not have the bridge yet; see
+call (default 300000, capped 900000).
+
+The opencode worker image ships the same relay in its
+`scripts/lunarwing_bridge.ts`, but the in-task half is an opencode plugin
+(`scripts/lunarwing_tool_plugin.ts`, registered by absolute path in
+`config/opencode.json`) rather than an MCP shim: `opencode serve` owns MCP
+servers per project Instance with the serve process's frozen environment,
+so a per-task socket env cannot reach an MCP child. The plugin statically
+registers the phase-1 tools as `lunarwing_<name>`; each call resolves the
+session's task id from its title (`lunarwing-opencode-<task_id>`) through
+the plugin host's authenticated client (first-title-wins cached) and relays
+over the task's socket. The static tools are visible even without a grant —
+ungranted calls return the hub's denial as a tool error. The opencode2 and
+pebble lanes do not have the bridge yet; see
 [`docs/proposals/EXTERNAL-WORKER-TOOL-PROXY.md`](../proposals/EXTERNAL-WORKER-TOOL-PROXY.md)
 for the wire contract.
 

@@ -3,9 +3,10 @@
 Status: **partial**, hardened per the MR !1506 (CQ-1..CQ-9),
 MR !1521 (DD-1..DD-10), MR !1533 (DP-1..DP-6), and MR !1540 (DX-1..DX-6)
 reviews. The hub side is merged; the worker-side bridge (design item 2) is
-implemented for the **kimi** worker lane. Real-worker acceptance (AC1/AC2
+implemented for the **kimi** worker lane (MCP shim) and the **opencode**
+worker lane (serve-process plugin). Real-worker acceptance (AC1/AC2
 against a live tenant with a rebuilt worker image) and the
-opencode/opencode2/pebble lanes remain open. Cron-mode tick authority is
+opencode2/pebble lanes remain open. Cron-mode tick authority is
 split out per MR !1506 CQ-10 (`cron.tool_allowlist`).
 
 ## What this is
@@ -362,7 +363,7 @@ Plus a structured tracing line per completed call.
   safety validation as in-process calls, and every worker-controlled field is
   bounded before persistence or logging.
 
-## Worker-side contract (kimi lane implemented)
+## Worker-side contract (kimi and opencode lanes implemented)
 
 A worker opts in by sending `tool_list` after `ready`, then issuing
 `tool_call` frames (with `task_id` set to the job id from `task_request`)
@@ -421,9 +422,43 @@ as the WI's thin stdio MCP server, giving the worker agent a native
   (user-level, so no workspace trust prompt), write-if-absent so operators
   can disable or replace the entry.
 
-The opencode/opencode2/pebble lanes have no bridge yet; the same pattern
+The **opencode** lane implements the same wire contract with a different
+in-task mechanism, because the kimi shim shape does not translate: `opencode
+serve` is one long-lived process for every session and owns MCP servers per
+project *Instance* with the serve process's frozen environment (verified
+against the pinned opencode source, `packages/opencode/src/mcp/index.ts` @
+`cb7d8b2f`), so no per-task socket env can reach an MCP child. Instead:
+
+- `opencode4lunarwing/scripts/lunarwing_tool_proxy.ts` — the same
+  bridge-side relay (identical IPC shapes, bounds, and never-throw
+  lifecycle). The bridge starts/stops it around `executeTask` and routes
+  `tool_result`/`tool_catalog` frames to it, exactly like the kimi lane.
+- `opencode4lunarwing/scripts/lunarwing_tool_plugin.ts` — an opencode v1
+  file plugin (registered by absolute path in `config/opencode.json`) that
+  statically registers the phase-1 tools (`lunarwing_memory_read`, …,
+  `lunarwing_gitlab_tool`, plus the legacy `lunarwing_gitlab-tool`
+  spelling). Each tool's `execute()` receives the calling session's id,
+  resolves the session title (`lunarwing-opencode-<task_id>`, set by the
+  executor) through the plugin host's authenticated client, and relays the
+  call over that task's proxy socket. Successful resolutions are cached for
+  the process lifetime — session ids are unique, and pinning the FIRST
+  observed title means a task renaming its own session mid-run cannot
+  redirect its calls onto another task's socket. Sessions without the task
+  title prefix (cli/acp modes, interactive use) get a clean error.
+- The tools are dependency-free plain `{description, args, execute}`
+  definitions (the registry's non-zod path, which passes call arguments
+  through unvalidated), so the runtime image needs no `@opencode-ai/plugin`
+  or zod. Only hub-REQUIRED arguments are declared — the registry marks
+  every declared property required — with optional arguments documented in
+  the description text; the hub's schema validation stays authoritative.
+- Unlike the kimi lane's filtered `tools/list`, the static set is visible
+  whether or not the worker has the grant; an ungranted call returns a tool
+  error carrying the hub's denial reason (the hub stays deny-by-default and
+  authoritative either way).
+
+The opencode2/pebble lanes have no bridge yet; the same pattern
 applies (their `lunarwing_bridge.ts` equivalents need the relay + frame
-routing, plus an MCP/registration mechanism per lane). Phase 2 hub-mediated
+routing, plus a registration mechanism per lane). Phase 2 hub-mediated
 cross-thread coordination (KV + advisory locks) is also still open.
 
 ## Tests
@@ -486,13 +521,27 @@ cross-thread coordination (KV + advisory locks) is also still open.
   `notifications/initialized` → `tools/list` over newline-delimited JSON-RPC,
   and the shim's `list` op reached the relay socket.
 
+- `opencode4lunarwing` (worker side, bun): relay unit tests (same suite as
+  the kimi lane), plugin tests (the static surface is exactly the phase-1
+  set with hub-required args only; happy-path relay with the title-resolved
+  task id; denied → thrown tool error carrying the hub's reason;
+  non-dispatched sessions error with zero hub traffic; first-title-wins
+  caching), and a full-path bridge test: the real `handleTaskRequest` wiring
+  (mock SDK) holds the task's relay socket live, an IPC call reaches the hub
+  socket as a `tool_call`, `tool_result`/`tool_catalog` replies through the
+  real `handleMessage` routing resolve the IPC callers, and the task's
+  `finally` leaves zero relay tasks. Not covered locally: the plugin's load
+  inside a real `opencode serve` (the image build gate runs the suites; the
+  serve-side plugin registration needs the rebuilt image — the deploy gate).
+
 Open acceptance items: AC1 with a **real** worker (hub-side evidence uses
 mock sockets with real memory tools; worker-side evidence uses a mock CLI
 against the real bridge/relay) and AC2 (`knowledge_search` real hits
 through the proxy). Both need a rebuilt kimi worker image and a live
 tenant, which is the protected-pipeline/deploy gate, not an MR-pipeline
-lane. The opencode/opencode2/pebble worker-side bridges are also open.
-WI#324 stays open until those land.
+lane; the opencode lane additionally needs its rebuilt image so the plugin
+ships in `/app/scripts/`. The opencode2/pebble worker-side bridges are
+also open. WI#324 stays open until those land.
 
 ## Land-order note (MR !1540 review #7716)
 
