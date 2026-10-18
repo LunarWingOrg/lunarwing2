@@ -8,6 +8,7 @@
  */
 
 import assert from "node:assert/strict"
+import { readdirSync, readFileSync } from "node:fs"
 
 import {
   BRIDGE_SDK_EVENTS,
@@ -270,7 +271,62 @@ import {
   )
 }
 
+// ── blankCommentsAndStrings: scan desynchronization is counted (JR-3) ────
+// A regex literal whose body holds a quote (the pre-JR-3 sdk_surface.ts had
+// one itself) makes the scanner treat the rest of the line as an
+// unterminated string — the blanked text then hides real code. Such runs
+// must be COUNTED so callers can fail closed, never silently trusted.
+{
+  const { unterminated } = blankCommentsAndStrings('const r = /"^([^"]+)"$/.exec(x)\nsdk.session.create(a)')
+  assert.ok(unterminated > 0, "a quote inside a regex body must count as unterminated")
+  const clean = blankCommentsAndStrings('const s = "ok"\nsdk.session.create(a)')
+  assert.equal(clean.unterminated, 0, "ordinary code must report zero unterminated runs")
+  const eolQuote = blankCommentsAndStrings('const s = "unterminated\nsdk.session.create(a)')
+  assert.ok(eolQuote.unterminated > 0, "a quote broken at end-of-line must count as unterminated")
+  const openTemplate = blankCommentsAndStrings("const t = `open template\nmore text")
+  assert.ok(openTemplate.unterminated > 0, "an unterminated template must count")
+}
+
 // Every bridge event name must be sane input for the union gate.
 assert.ok(BRIDGE_SDK_EVENTS.length > 0 && BRIDGE_SDK_METHODS.length > 0)
+
+// ── tsgo gate coverage (WI#369 JR-2): every SDK-facing script is ─────────
+// type-checked, none opts out of type checking, and the blanker tokenized
+// it fully. Kills the three all-layer mutants: an untested-branch helper
+// typed `any`, a // @ts-ignore on such a branch, and a gated include list
+// that silently stops covering a script that imports @opencode/client.
+{
+  const dir = new URL(".", import.meta.url)
+  const tsconfig = JSON.parse(
+    readFileSync(new URL("./tsconfig.sdk-surface.json", dir), "utf8"),
+  ) as { include: string[] }
+  const gated = new Set(tsconfig.include.map((entry) => entry.replace("./", "")))
+  const scripts = readdirSync(dir).filter(
+    (name) => name.endsWith(".ts") && !name.endsWith("_test.ts") && !name.endsWith(".d.ts"),
+  )
+  for (const name of scripts) {
+    const source = readFileSync(new URL(`./${name}`, dir), "utf8")
+    const { blanked, unterminated } = blankCommentsAndStrings(source)
+    assert.equal(
+      unterminated,
+      0,
+      `${name}: unterminated string or template after blanking (a regex literal?) - the extractors cannot read this file`,
+    )
+    if (source.includes("@opencode/client")) {
+      assert.ok(
+        gated.has(name),
+        `${name} references @opencode/client but is not in tsconfig.sdk-surface.json include - the tsgo gate does not type-check it`,
+      )
+    }
+    if (!gated.has(name)) continue
+    for (const directive of ["@ts-ignore", "@ts-expect-error", "@ts-nocheck"]) {
+      assert.ok(!source.includes(directive), `${name}: ${directive} hides SDK drift from the tsgo gate`)
+    }
+    assert.ok(
+      !blanked.split(/[^A-Za-z0-9_$]+/).includes("any"),
+      `${name}: an explicit any hides SDK drift from the tsgo gate - use the generated client types or unknown`,
+    )
+  }
+}
 
 console.log("sdk_surface unit pins passed")
