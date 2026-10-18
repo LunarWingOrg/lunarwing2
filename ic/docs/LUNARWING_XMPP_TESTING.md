@@ -16,6 +16,7 @@ The goal is to test in layers:
 From the repo's `ic/` directory:
 
 ```bash
+export LUNARWING_TEST_TENSORZERO_URL='http://<gateway-host>:3000'  # required (WI#402)
 scripts/lunarwing-xmpp-test-env.sh init
 scripts/lunarwing-xmpp-test-env.sh build
 scripts/lunarwing-xmpp-test-env.sh smoke
