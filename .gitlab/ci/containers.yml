@@ -69,7 +69,10 @@
     - set -a; . ./worker-image.env; set +a
     - test -n "$WORKER_IMAGE_REF" && test -n "$WORKER_IMAGE_DIGEST"
     - trivy image --format template --template "@/contrib/gitlab.tpl" --output gl-container-scanning-report.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
-    - trivy image --ignorefile "$CI_PROJECT_DIR/.gitlab/trivy-ignore" --exit-code 1 --severity CRITICAL --format json --output worker-vulnerabilities.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
+    # --config /dev/null: trivy otherwise loads trivy.yaml from its working
+    # directory (the checkout), which can set ignore-unfixed and hide every
+    # unfixed CRITICAL with no expiry (WI#361).
+    - trivy image --config /dev/null --ignorefile "$CI_PROJECT_DIR/.gitlab/trivy-ignore" --exit-code 1 --severity CRITICAL --format json --output worker-vulnerabilities.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
     - trivy image --format cyclonedx --output worker-sbom.cdx.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
   artifacts:
     when: always

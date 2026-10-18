@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+import calendar
+import datetime
 import fnmatch
 import hashlib
 import json
@@ -25,6 +27,14 @@ KIMI_CLI_LOCK = ROOT / "kimicode4lunarwing" / "kimi-cli" / "package-lock.json"
 PEBBLE_DOCKERFILE = ROOT / "pebble4lunarwing" / "Dockerfile"
 WORKER_BUILD_SCRIPT = ROOT / ".gitlab" / "scripts" / "build-worker-image.sh"
 DELIVERABLES = ROOT / ".gitlab" / "deliverables.json"
+TRIVY_IGNORE = ROOT / ".gitlab" / "trivy-ignore"
+TRIVY_IGNORE_ENTRY = re.compile(r"^CVE-\d{4}-\d{4,} exp:\d{4}-\d{2}-\d{2}$")
+TRIVY_IGNORE_MAX_EXPIRY_MONTHS = 6
+TRIVY_GATE_COMMAND = (
+    'trivy image --config /dev/null --ignorefile "$CI_PROJECT_DIR/.gitlab/trivy-ignore" '
+    "--exit-code 1 --severity CRITICAL "
+)
+TRIVY_SCAN_VARIABLES = {"TRIVY_CACHE_DIR", "TRIVY_NO_PROGRESS", "TRIVY_PASSWORD", "TRIVY_USERNAME"}
 DELIVERABLE_STATUSES = {"production", "experimental", "fixture", "mirror", "retired", "staging"}
 DELIVERABLE_REQUIRED_KEYS = ("name", "status", "owner", "manifest", "lockfile", "targets", "ci", "triggers")
 EXPECTED_RUST_VERSION = "1.96.1"
@@ -1212,6 +1222,100 @@ def validate_cavepony_version(merged: dict, errors: list[str]) -> None:
             errors.append(f"{relative} Cavepony version {actual!r} != CI expectation {expected!r}")
 
 
+def expiry_horizon(today: datetime.date, months: int) -> datetime.date:
+    """Calendar `months` after `today`, clamped to the target month's last
+    day — the furthest expiry a trivy-ignore entry may carry (WI#361)."""
+    month_index = today.year * 12 + today.month - 1 + months
+    year, month = divmod(month_index, 12)
+    day = min(today.day, calendar.monthrange(year, month + 1)[1])
+    return datetime.date(year, month + 1, day)
+
+
+def validate_trivy_ignore(errors: list[str], today: datetime.date | None = None) -> None:
+    """WI#361: every non-comment line of .gitlab/trivy-ignore must be
+    `CVE-<id> exp:YYYY-MM-DD`. Trivy's plain ignore-file parser
+    (pkg/result/ignore.go getExpirationDate) only recognises the `exp:`
+    prefix, so the former `expiring:` spelling silently made every
+    suppression permanent — `expired` entries are what make the worker-scan
+    gate fail again for re-review. Also reject a syntactically valid but
+    non-calendar date, and any expiry more than six months out, so a
+    far-future date cannot stand in for re-verification against the current
+    Debian snapshot. Fails closed when the file is missing: the worker-scan
+    job passes it to `trivy image --ignorefile --exit-code 1`."""
+    if not TRIVY_IGNORE.is_file():
+        errors.append(".gitlab/trivy-ignore missing; the worker-scan gate references it")
+        return
+    today = today or datetime.date.today()
+    horizon = expiry_horizon(today, TRIVY_IGNORE_MAX_EXPIRY_MONTHS)
+    for lineno, line in enumerate(
+        TRIVY_IGNORE.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if not TRIVY_IGNORE_ENTRY.fullmatch(stripped):
+            errors.append(
+                f".gitlab/trivy-ignore:{lineno} must match "
+                f"'CVE-<id> exp:YYYY-MM-DD' (Trivy only parses the exp: prefix): "
+                f"{stripped!r}"
+            )
+            continue
+        expiry_text = stripped.rsplit("exp:", 1)[1]
+        try:
+            expiry = datetime.date.fromisoformat(expiry_text)
+        except ValueError:
+            errors.append(
+                f".gitlab/trivy-ignore:{lineno} expiry {expiry_text!r} "
+                "is not a real calendar date"
+            )
+            continue
+        if expiry > horizon:
+            errors.append(
+                f".gitlab/trivy-ignore:{lineno} expiry {expiry} is more than "
+                f"{TRIVY_IGNORE_MAX_EXPIRY_MONTHS} months out (beyond {horizon}); "
+                "re-verify the finding against the current Debian snapshot instead"
+            )
+
+
+def validate_trivy_gate_inputs(merged: dict, errors: list[str]) -> None:
+    """WI#361 (run-143 JP-1): the ignore-file guard only holds if the gate
+    reads nothing else. trivy also loads trivy.yaml from its working
+    directory (the checkout) and TRIVY_* environment variables; either can
+    set ignore-unfixed (or vex, skip-dirs, ...) and hide every unfixed
+    CRITICAL with no expiry. Pin the gate command and allowlist TRIVY_*
+    variables in every place GitLab can set them for a scan job."""
+    scan = merged.get(".worker-scan")
+    scan = scan if isinstance(scan, dict) else {}
+    script = scan.get("script", [])
+    script = [script] if isinstance(script, str) else script
+    if not any(isinstance(line, str) and line.startswith(TRIVY_GATE_COMMAND) for line in script):
+        errors.append(
+            ".worker-scan must run the CRITICAL gate as " + repr(TRIVY_GATE_COMMAND.strip())
+        )
+    sources = [("top-level variables", merged.get("variables"))]
+    workflow = merged.get("workflow")
+    if isinstance(workflow, dict):
+        for rule in workflow.get("rules", []) or []:
+            if isinstance(rule, dict):
+                sources.append(("workflow rule variables", rule.get("variables")))
+    for name, job in merged.items():
+        if not isinstance(job, dict) or not (name == ".worker-scan" or extends_template(job, ".worker-scan")):
+            continue
+        sources.append((name + " variables", job.get("variables")))
+        for rule in job.get("rules", []) or []:
+            if isinstance(rule, dict):
+                sources.append((name + " rule variables", rule.get("variables")))
+    for label, variables in sources:
+        if not isinstance(variables, dict):
+            continue
+        for key in variables:
+            if str(key).upper().startswith("TRIVY_") and key not in TRIVY_SCAN_VARIABLES:
+                errors.append(
+                    f"{label} set {key}; only {sorted(TRIVY_SCAN_VARIABLES)} "
+                    "may reach the worker-scan trivy run"
+                )
+
+
 def cache_policies(job: object) -> list[str]:
     if not isinstance(job, dict):
         return []
@@ -2063,6 +2167,8 @@ def main() -> int:
     validate_cache_trust(merged_config, errors)
     validate_worker_versions(errors)
     validate_worker_input_manifest(errors)
+    validate_trivy_ignore(errors)
+    validate_trivy_gate_inputs(merged_config, errors)
     validate_deliverables_manifest(merged_config, errors)
     validate_ci_tool_image_pins(merged_config, merged_variables, errors)
     rust_image = extract_rust_image(defaults, ".rust-job", merged_variables)
