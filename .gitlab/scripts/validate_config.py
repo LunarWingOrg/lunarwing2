@@ -660,12 +660,18 @@ README_DENY_GUARD_BEGIN = "<!-- deny-toml-guard-section:begin -->"
 README_DENY_GUARD_END = "<!-- deny-toml-guard-section:end -->"
 
 
-def collect_tracked_paths() -> set[str]:
+def collect_tracked_paths() -> set[str] | None:
     """The tracked-file truth for citation checks (`git ls-files`): a glob
-    would also see untracked scratch files in a dirty checkout."""
-    result = subprocess.run(
-        ["git", "ls-files"], cwd=ROOT, capture_output=True, text=True, check=False
-    )
+    would also see untracked scratch files in a dirty checkout. Returns None
+    when there is no git binary at all (the ci-config lint image ships
+    none); the caller then falls back to checkout existence, which is the
+    same truth in CI because the runner checks out a clean tree."""
+    try:
+        result = subprocess.run(
+            ["git", "ls-files"], cwd=ROOT, capture_output=True, text=True, check=False
+        )
+    except FileNotFoundError:
+        return None
     if result.returncode != 0:
         raise RuntimeError(f"git ls-files failed: {result.stderr.strip()}")
     return set(result.stdout.splitlines())
@@ -693,14 +699,24 @@ def extract_repo_paths(text: str, top_levels: set[str]) -> set[str]:
 
 
 def check_cited_paths(
-    label: str, text: str, tracked: set[str], top_levels: set[str], errors: list[str]
+    label: str, text: str, tracked: set[str] | None, top_levels: set[str], errors: list[str]
 ) -> None:
     for path in sorted(extract_repo_paths(text, top_levels)):
-        if path in tracked or any(entry.startswith(path + "/") for entry in tracked):
+        if tracked is None:
+            present = (ROOT / path).exists()
+        else:
+            present = path in tracked or any(
+                entry.startswith(path + "/") for entry in tracked
+            )
+        if present:
             continue
+        where = (
+            "present in the checkout"
+            if tracked is None
+            else "a tracked path (git ls-files)"
+        )
         errors.append(
-            f"{label} cites {path}, which is not a tracked path (git ls-files); "
-            "fix or remove the citation"
+            f"{label} cites {path}, which is not {where}; fix or remove the citation"
         )
 
 
@@ -713,7 +729,10 @@ def validate_deny_toml_advisories(errors: list[str], tracked: set[str] | None = 
     historical records would otherwise slip through unchecked. Every
     repo-relative path cited anywhere in ic/deny.toml (comments and reason
     strings) and in the marker-delimited cargo-deny section of
-    .gitlab/README.md must be a tracked path.
+    .gitlab/README.md must be a tracked path. The tracked-file truth comes
+    from `git ls-files`; in an image without a git binary (the ci-config
+    lint image ships none) it falls back to checkout existence, which is the
+    same truth in CI because the runner checks out a clean tree.
     """
     deny_path = ROOT / "ic" / "deny.toml"
     try:
@@ -780,7 +799,10 @@ def validate_deny_toml_advisories(errors: list[str], tracked: set[str] | None = 
         except RuntimeError as error:
             errors.append(str(error))
             return
-    top_levels = {entry.split("/", 1)[0] for entry in tracked}
+    if tracked is None:
+        top_levels = {entry.name for entry in ROOT.iterdir() if entry.name != ".git"}
+    else:
+        top_levels = {entry.split("/", 1)[0] for entry in tracked}
     check_cited_paths("ic/deny.toml", deny_text, tracked, top_levels, errors)
     check_cited_paths(
         ".gitlab/README.md cargo-deny section", section, tracked, top_levels, errors
