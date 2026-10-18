@@ -57,6 +57,10 @@ opencode2.4lunarwing/scripts/prepare_reproducible_build.py
 opencode2.4lunarwing/scripts/path_expand_test.ts
 opencode2.4lunarwing/scripts/sdk_surface.ts
 opencode2.4lunarwing/scripts/sdk_surface_assert.ts
+opencode2.4lunarwing/scripts/sdk_surface_test.ts
+opencode2.4lunarwing/scripts/sdk_surface_assert_test.ts
+opencode2.4lunarwing/scripts/tsconfig.sdk-surface.json
+opencode2.4lunarwing/scripts/gate-env.d.ts
 opencode2.4lunarwing/scripts/opencode_task_executor.ts
 opencode2.4lunarwing/scripts/opencode_task_executor_test.ts
 opencode2.4lunarwing/scripts/opencode-exposure-guard.sh
