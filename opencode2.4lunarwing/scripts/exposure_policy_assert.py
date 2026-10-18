@@ -219,6 +219,7 @@ def check_wrapper(lane: pathlib.Path) -> None:
         ('for arg in "$@"', "scan every argv token"),
         ("service) refuse", "refuse the 'service' subcommand"),
         ("pair) refuse", "refuse the 'pair' subcommand"),
+        ("upgrade | update) refuse", "refuse the self-upgrade subcommand and its alias"),
         ("--service | --service=*) refuse", "refuse the --service flag"),
         ('--hostname=*) is_loopback', "check every --hostname=value occurrence"),
         ('[ "$want_host" = 0 ]', "refuse a dangling --hostname"),
@@ -342,6 +343,14 @@ def check_installed_wrapper(
         fail(f"installed wrapper {wrapper_path} digest {installed_digest} does not "
              f"match the LUNARWING_WRAPPER_SHA256 build-arg anchor — rewritten "
              "together with the in-image reference (run-106 GJ-3a)")
+        return
+    # !1735 review KG-3 / !1699 JE-3: the updater ignores the lane config's
+    # "update": "disable" pin (it reads only the global config dir, never
+    # OPENCODE_CONFIG), so the image env must carry the kill switch the
+    # updater actually honours (updater.ts inspect() gate).
+    if os.environ.get("OPENCODE_DISABLE_AUTOUPDATE") != "1":
+        fail("OPENCODE_DISABLE_AUTOUPDATE=1 must be set in the image environment — "
+             "the updater ignores the lane config's update pin")
         return
     # Run-106 GJ-3(b): the wrapper honours LUNARWING_REAL_OPENCODE over the
     # default binary path, so an ENV pointing it elsewhere would exec that

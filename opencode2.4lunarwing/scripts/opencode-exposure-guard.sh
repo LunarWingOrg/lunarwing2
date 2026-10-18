@@ -58,6 +58,7 @@ for arg in "$@"; do
   case "$arg" in
     service) refuse "service" "explicit service commands are disabled by the worker wrapper" ;;
     pair) refuse "pair" "pairing links are disabled in LunarWing worker images" ;;
+    upgrade | update) refuse "$arg" "self-upgrade would install an unpinned upstream build outside the compile-out guard" ;;
     --service | --service=*) refuse "serve --service" "explicit service commands are disabled by the worker wrapper" ;;
     --hostname) want_host=1 ;;
     --hostname=*) is_loopback "${arg#--hostname=}" || refuse "--hostname ${arg#--hostname=}" "the worker's opencode server must bind loopback only" ;;

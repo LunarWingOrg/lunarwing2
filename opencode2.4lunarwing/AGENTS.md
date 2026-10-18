@@ -3,7 +3,7 @@
 ## What This Is
 
 Persistent container worker for upstream OpenCode **2** (the `v2` line, pinned
-v2.0.24). This is a separate worker lane from `opencode4lunarwing/` (the proven
+v2.0.32). This is a separate worker lane from `opencode4lunarwing/` (the proven
 v1 worker, pinned v1.18.25) per
 `docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md`. Tenants opt in explicitly; v1
 stays the default until v2 earns trust. The WebSocket bridge is
@@ -100,14 +100,16 @@ build with the default root HOME.
 Workers must never self-expose; LunarWing owns every public path through the
 daemon's tunnel. See `docs/ops/WORKER-CONTAINERS.md` → "Worker exposure
 policy" for the full control set, the !1490 gate record, and the bump
-checklist. This lane pins v2.0.24: v2.0.26 bundles OpenTunnel remote access
-(hosted relay, no self-host option). A bump past v2.0.24 is deliberate-only:
-the compile-out guard stubs `remote-tunnel.ts` at build time, and CI + the
-build assertions fail if the tunnel survives.
+checklist. This lane pins v2.0.32 under the maintainer-approved WI#427:
+v2.0.26 introduced OpenTunnel remote access (hosted relay, no self-host
+option). The compile-out guard stubs `remote-tunnel.ts` at build time,
+re-verified against v2.0.32, and CI + the build assertions fail if the tunnel
+survives. Future bumps remain deliberate-only. WI#369's SDK-gate blind spots
+and WI#424's egress allowlist remain open; see the bump record.
 
 ## Key Files (this policy)
 
-- `scripts/opencode-exposure-guard.sh` — installed as `/usr/local/bin/opencode`; scans every argv token for `service`/`pair`/`--service`/non-loopback `--hostname` (naive-use guard).
+- `scripts/opencode-exposure-guard.sh` — installed as `/usr/local/bin/opencode`; scans every argv token for `service`/`pair`/`upgrade`/`update`/`--service`/non-loopback `--hostname` (naive-use guard).
 - `scripts/exposure_policy_assert.py` — shared static policy checker (image build + CI guard); `--image-filesystem` also checks installed ownership and modes and (v2, run-103 GD-2 + run-106 GJ-3) verifies the installed wrapper: `/usr/local/bin/opencode` must be the byte-identical, root-owned, non-group-writable, executable guard that build-time `PATH` resolves to, with the real binary re-scanned for tunnel markers, no `LUNARWING_REAL_OPENCODE` retarget at build time, and the installed digest matching the `LUNARWING_WRAPPER_SHA256` build-arg anchor (computed from the checkout by `build-worker-image.sh` and mt-admin's `build_opencode2_worker`; missing or mismatched fails the build).
 - `scripts/entrypoint_config_test.py` — non-root startup configuration regression tests using a 0444 baked config, including repeat boots, HOME/XDG/`OPENCODE_CONFIG_DIR` service defaults, and agent plants (FIFO/dir/symlink) at the reset path.
 - `scripts/compile_out_remote_tunnel.py` — fail-closed build patch that compiles the OpenTunnel client out; drift scan over `packages/{cli,server,schema,core}/src` (ts+tsx, any quoted `@opentunnel/*` specifier, all workspace manifests).

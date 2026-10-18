@@ -2,7 +2,7 @@
 """Self-test for compile_out_remote_tunnel.py (WI#357 control 8).
 
 Builds synthetic upstream trees for the three pin shapes: predating the
-tunnel (v2.0.24), carrying it (v2.0.26 shape), and drifted (module moved,
+tunnel (historical v2.0.24), carrying it (v2.0.32 shape), and drifted (module moved,
 or a new RemoteTunnel export in use). The guard must pass the first, stub
 the second, and fail closed on every drift shape.
 """
@@ -24,6 +24,7 @@ MODULE = "packages/cli/src/services/remote-tunnel.ts"
 REAL_MODULE = (
     'export * as RemoteTunnel from "./remote-tunnel"\n'
     'import type { OpenTunnelError } from "@opentunnel/client/effect"\n'
+    'const load = () => import("@opentunnel/client/effect")\n'
     "export const run = 1\nexport const ensure = 1\nexport const hostname = 1\n"
 )
 
@@ -48,9 +49,9 @@ def write_tree(root: pathlib.Path, *, with_tunnel: bool) -> None:
             "yield* Effect.forkScoped(RemoteTunnel.run({ route, target, onURL }))\n",
             encoding="utf-8",
         )
-        (root / "packages/cli/src/commands").mkdir(parents=True, exist_ok=True)
-        (root / "packages/cli/src/commands/pair.ts").write_text(
-            'import { RemoteTunnel } from "../services/remote-tunnel"\n'
+        (root / "packages/cli/src/commands/handlers").mkdir(parents=True, exist_ok=True)
+        (root / "packages/cli/src/commands/handlers/pair.ts").write_text(
+            'import { RemoteTunnel } from "../../services/remote-tunnel"\n'
             "const h = yield* RemoteTunnel.hostname(route)\n",
             encoding="utf-8",
         )

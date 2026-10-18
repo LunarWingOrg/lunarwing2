@@ -144,9 +144,13 @@ function relayCall(socketPath: string, request: Record<string, unknown>): Promis
  * task binding is on the root session reached by walking `parentID`. The walk
  * is hop-bounded and adds no authority: a child with a forged `parentID` is no
  * stronger than a forged title (JU-1). Successful resolutions are cached for
- * the process lifetime — session ids are unique and never reused, and pinning
- * the FIRST observed title means a task renaming its own session mid-run
- * cannot redirect its tool calls onto another task's socket.
+ * the process lifetime — session ids are unique and never reused, and caching
+ * the FIRST observed title stops a mid-run rename after the first call from
+ * moving that session's calls. Caching is not an isolation boundary (JU-5): a
+ * rename before the first call, a session created over the loopback serve API
+ * with another task's title or `parentID`, or a direct connection to another
+ * task's socket all stay within the container's single hub-enforced grant and
+ * change only which job a call is attributed to.
  */
 const MAX_PARENT_HOPS = 8
 

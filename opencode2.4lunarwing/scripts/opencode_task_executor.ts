@@ -19,6 +19,8 @@
  */
 
 import { OpenCode, type OpenCodeClient } from "@opencode/client/promise"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import {
   buildTaskPrompt,
   type TaskRequest,
@@ -109,7 +111,7 @@ export type ResultCallback = (result: TaskResult) => void
 // whitespace/quote-obfuscated command text, and the real binary stays
 // directly executable by the agent uid — the boundary against a
 // compromised agent is the egress allowlist (WI#357 control 1, deferred).
-function sessionPermissions(): Array<{ action: string; resource: string; effect: "allow" | "deny" }> {
+function sessionPermissions(): Array<{ action: string; resource: string; effect: "allow" | "deny" | "ask" }> {
   return [
     { action: "edit", resource: "*", effect: "allow" },
     { action: "write", resource: "*", effect: "allow" },
@@ -121,6 +123,19 @@ function sessionPermissions(): Array<{ action: string; resource: string; effect:
     { action: "webfetch", resource: "*", effect: "allow" },
     { action: "question", resource: "*", effect: "deny" },
     { action: "subagent", resource: "*", effect: "deny" },
+    // !1735 review KG-2 / !1699 JE-1: upstream v2.0.32 dropped the
+    // `external_directory * ask` default that v2.0.24 carried, so reads and
+    // writes outside the workspace (e.g. $HOME/.ssh, /proc/1, the global
+    // config dir holding service.json) went from ask→rejected-by-bridge to
+    // silently allowed. Restore the confinement: the ask effect is rejected
+    // by the headless bridge (no interactive answerer), so it behaves as a
+    // deny in practice while staying forward-compatible if the bridge ever
+    // gains a prompt channel. The three allow rules keep the tool-output,
+    // shell and tmp/opencode directories the server writes to working.
+    { action: "external_directory", resource: "*", effect: "ask" },
+    { action: "external_directory", resource: "*/opencode/tool-output/*", effect: "allow" },
+    { action: "external_directory", resource: "*/opencode/shell/*", effect: "allow" },
+    { action: "external_directory", resource: `${join(tmpdir(), "opencode")}/*`, effect: "allow" },
     { action: "shell", resource: "*opencode service *", effect: "deny" },
     { action: "shell", resource: "*opencode pair *", effect: "deny" },
     { action: "shell", resource: "*opencode serve *", effect: "deny" },

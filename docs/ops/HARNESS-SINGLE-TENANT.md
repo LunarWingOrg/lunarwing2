@@ -23,6 +23,7 @@ run the build through `taskset` and cap Cargo jobs as shown below.
 cd ic
 export LUNARWING_TEST_PROFILE=release
 export CARGO_BUILD_JOBS=6
+export LUNARWING_TEST_TENSORZERO_URL='http://<gateway-host>:3000'  # required (WI#402)
 
 # 1. Create isolated env, state, run, and log dirs
 scripts/lunarwing-xmpp-test-env.sh init

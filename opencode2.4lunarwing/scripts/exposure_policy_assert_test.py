@@ -274,9 +274,35 @@ class ExposureGuardWrapperTests(unittest.TestCase):
         self.assertIn("refused 'opencode service'", result.stderr)
 
     def test_pair_refused(self) -> None:
-        result = self.run_wrapper("pair")
-        self.assertEqual(result.returncode, 77)
-        self.assertIn("refused 'opencode pair'", result.stderr)
+        # WI#427: v2.0.32 can enable remote access via pair --remote --yes
+        # (or -y), including in non-interactive sessions. Refuse all forms.
+        for form in (
+            ("pair",),
+            ("pair", "--remote"),
+            ("pair", "--remote", "--yes"),
+            ("--print-logs", "pair", "--remote", "-y"),
+        ):
+            with self.subTest(form=form):
+                result = self.run_wrapper(*form)
+                self.assertEqual(result.returncode, 77)
+                self.assertIn("refused 'opencode pair'", result.stderr)
+
+    def test_self_upgrade_refused(self) -> None:
+        # !1735 review KG-1 / !1699 JE-2: `opencode upgrade --method curl`
+        # (alias `update`) downloads and runs https://opencode.ai/v2/install,
+        # which puts an unmodified, tunnel-capable release at
+        # $HOME/.opencode/bin/opencode — outside the wrapper and the
+        # compile-out guard. Refuse the subcommand and its alias.
+        for form in (
+            ("upgrade",),
+            ("update",),
+            ("upgrade", "--method", "curl"),
+            ("--print-logs", "update", "-m", "curl", "2.0.40"),
+        ):
+            with self.subTest(form=form):
+                result = self.run_wrapper(*form)
+                self.assertEqual(result.returncode, 77, (form, result.stderr))
+                self.assertIn("self-upgrade", result.stderr)
 
     def test_leading_global_flag_bypass_forms_refused(self) -> None:
         # run-79 EI-2 / run-84 EU-2: the v2 CLI takes global/root flags before
@@ -394,9 +420,12 @@ class InstalledWrapperTests(unittest.TestCase):
         # Run-106 GJ-3(a): the build passes the checkout's wrapper digest as
         # the LUNARWING_WRAPPER_SHA256 build arg; the fixture stands in for
         # the checkout with the lane's committed wrapper bytes.
+        # KG-3: the image env carries the autoupdate kill switch; default the
+        # fixture to the shipped shape so existing tests don't trip it.
         environ = {
             "PATH": os.pathsep.join(str(p) for p in path),
             "LUNARWING_WRAPPER_SHA256": hashlib.sha256(WRAPPER.read_bytes()).hexdigest(),
+            "OPENCODE_DISABLE_AUTOUPDATE": "1",
         }
         if env:
             environ.update(env)
@@ -502,6 +531,21 @@ class InstalledWrapperTests(unittest.TestCase):
         failures = self.check(self.bin_dir, env={"LUNARWING_WRAPPER_SHA256": ""})
         self.assertEqual(len(failures), 1, failures)
         self.assertIn("missing", failures[0])
+
+    def test_missing_autoupdate_kill_switch_fails(self) -> None:
+        # !1735 review KG-3 / !1699 JE-3: the updater ignores the lane
+        # config's "update": "disable" pin (readPolicy reads only the global
+        # config dir, never OPENCODE_CONFIG), so the image env must carry
+        # the kill switch the updater actually honours. Without it the
+        # interactive TUI's background check GETs opencode.ai/update/api/...
+        # An empty value and an unset key both trip the != "1" guard.
+        for missing in ("",):
+            with self.subTest(missing=missing):
+                failures = self.check(
+                    self.bin_dir, env={"OPENCODE_DISABLE_AUTOUPDATE": missing}
+                )
+                self.assertEqual(len(failures), 1, failures)
+                self.assertIn("OPENCODE_DISABLE_AUTOUPDATE", failures[0])
 
     def test_image_filesystem_path_wires_the_check_in(self) -> None:
         # The scenarios above call the function directly (GD-3: the image

@@ -84,9 +84,10 @@ function abortSocketTasks(socket: BridgeSocket): void {
 /**
  * A hub control socket closed. Fail every in-flight task on it and drop the
  * relay's pending map for that socket, so reconnects never accumulate stale
- * pending state AND a request that arrives between the close and the task's
- * teardown is sent into the dead socket (JU-3; the kimi lane pins the same
- * with its spawned-bridge test). Without `dropHubSocket`, the aborted task's
+ * pending state and a request that arrives between the close and the task's
+ * teardown is never sent into the dead socket (JU-3; the kimi lane pins the
+ * same with its spawned-bridge test). Without `dropHubSocket`, the aborted
+ * task's
  * `finally` still fails its waiter later through `closeTask`, but the dead
  * socket's pending map stays in `pendingBySocket` for the process lifetime —
  * the EF-9 leak — and the close-to-teardown window leaves an EV-4 gap.
