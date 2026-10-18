@@ -274,9 +274,18 @@ class ExposureGuardWrapperTests(unittest.TestCase):
         self.assertIn("refused 'opencode service'", result.stderr)
 
     def test_pair_refused(self) -> None:
-        result = self.run_wrapper("pair")
-        self.assertEqual(result.returncode, 77)
-        self.assertIn("refused 'opencode pair'", result.stderr)
+        # WI#427: v2.0.32 can enable remote access via pair --remote --yes
+        # (or -y), including in non-interactive sessions. Refuse all forms.
+        for form in (
+            ("pair",),
+            ("pair", "--remote"),
+            ("pair", "--remote", "--yes"),
+            ("--print-logs", "pair", "--remote", "-y"),
+        ):
+            with self.subTest(form=form):
+                result = self.run_wrapper(*form)
+                self.assertEqual(result.returncode, 77)
+                self.assertIn("refused 'opencode pair'", result.stderr)
 
     def test_leading_global_flag_bypass_forms_refused(self) -> None:
         # run-79 EI-2 / run-84 EU-2: the v2 CLI takes global/root flags before
