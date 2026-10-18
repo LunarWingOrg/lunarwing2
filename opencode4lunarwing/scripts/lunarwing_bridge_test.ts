@@ -393,7 +393,9 @@ async function waitForFrame(frames: SentFrame[], type: string): Promise<SentFram
 // JU-3: a closed hub socket must drop the relay's pending map for that socket
 // and fail the task's in-flight call at once — not through the later closeTask
 // (which leaves an EF-9 leak and an EV-4 gap for a request arriving between the
-// close and teardown). Pins the `dropHubSocket` call in each close handler.
+// close and teardown). Pins `dropHubSocket` inside `handleHubSocketClosed`; the
+// call in each close handler is covered only by a spawned-bridge test like the
+// kimi lane's.
 {
   const a = fakeSocket()
   const handle = await toolProxyRelay.startTask("hub-close-drop", a.socket)
@@ -411,6 +413,23 @@ async function waitForFrame(frames: SentFrame[], type: string): Promise<SentFram
   } finally {
     handle.close()
   }
+}
+
+// KB-1 (JU-3 follow-up): a closed hub socket also cancels the tasks it owns,
+// and only those — the abortSocketTasks half of handleHubSocketClosed. Dropping
+// the abort (B6) leaves a task spending model turns for a hub that is gone;
+// dropping the ownership check (B8) lets one connection's close cancel tasks
+// owned by another, against the DW-8 rule.
+{
+  const a = fakeSocket()
+  const b = fakeSocket()
+  const mine = registerTask(a.socket)
+  const other = registerTask(b.socket)
+  handleHubSocketClosed(a.socket)
+  assert.equal(mine.controller.signal.aborted, true, "the closed socket's task is cancelled")
+  assert.equal(other.controller.signal.aborted, false, "another socket's task keeps running")
+  cleanup(mine.taskId)
+  cleanup(other.taskId)
 }
 
 {
