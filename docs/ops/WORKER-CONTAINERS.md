@@ -195,13 +195,15 @@ path routes it through the daemon's tunnel. The only legitimate instruction
 channel into a worker is the daemon's job dispatch → the in-container bridge
 → the worker's agent API on loopback.
 
-This policy is why the opencode2 lane is pinned at **v2.0.24**: v2.0.26
+This policy originally held the opencode2 lane at **v2.0.24**: v2.0.26
 bundles OpenTunnel remote access (`packages/cli/src/services/remote-tunnel.ts`,
 `@opentunnel/client` → hosted relay `opentunnel.xyz`, no self-host option,
 anonymous device identity in the agent-writable `$XDG_DATA_HOME/opentunnel`),
 plus `opencode service set remote true` and `opencode pair` surfaces. !1490
-(v2.0.26 bump) must not merge while the guards below are the only thing
-between a prompt-injected task and a public remote-control channel.
+(v2.0.26 bump) was closed. **WI#427 (2026-10-17) records the maintainer's
+completed analysis and approval to cross that boundary at v2.0.32**, through
+the existing compile-out, wrapper, config and image assertions. See the
+v2.0.32 bump entry below for the source review and verification status.
 
 **Gate record for !1490 (run-79 EI-2):** the in-image layers below (ruleset,
 wrapper, config pins, compile-out) are **naive-use guards, not a boundary**
@@ -210,12 +212,13 @@ binary stays directly executable by the agent uid, and with egress open a
 compromised agent can fetch an upstream opencode (tunnel included) or run
 `@opentunnel/client` under bun against the loopback server, whatever the
 pin. **Only control 1 (the egress allowlist) holds against a compromised
-agent**; until it lands, a bump past v2.0.24 crosses on compile-out plus
-config alone.
+agent**. The maintainer-approved WI#427 bump deliberately crosses on
+compile-out plus config alone; it does not turn the in-image guards into
+an egress boundary. Control 1 remains open as **WI#424 for 2.1.7.0**.
 
 Enforced controls (opencode2 lane unless noted):
 
-1. **Egress allowlist (DEFERRED, maintainer's call per WI#357):** mt-admin
+1. **Egress allowlist (DEFERRED to WI#424, 2.1.7.0; maintainer's call):** mt-admin
    restricting worker egress to the configured LLM endpoint + git hosts.
    Not yet implemented; it is the only control that also covers future
    phone-home features and `webfetch`/shell exfiltration, and the only one
@@ -366,10 +369,10 @@ Enforced controls (opencode2 lane unless noted):
    runtime `PATH` `opencode` need not hit the wrapper; the entrypoint is
    unaffected (absolute `OPENCODE_BIN`) and the wrapper remains a
    naive-use guard.
-6. **Runtime smoke (DEFERRED to WI#345):** live `service.json`/`opentunnel`
-   dir/listener assertions against a running container belong to the WI#345
-   runtime-smoke suite, which does not exist yet. Control 9 covers the
-   listener half on live tenants.
+6. **Runtime smoke (automated suite DEFERRED to WI#424, 2.1.7.0):** live
+   `service.json`/`opentunnel` dir/listener assertions against a running
+   container are required manually for WI#427 until that suite exists.
+   Control 9 covers the listener half on live tenants.
 7. **Bump checklist (REQUIRED for every worker version bump).** The bump
    entry in this file must record the upstream features that add network
    exposure or outbound publication — tunnels, pairing, sharing, remote MCP,
@@ -378,9 +381,10 @@ Enforced controls (opencode2 lane unless noted):
    these guards cover the *shipped binary*; against a compromised agent
    only control 1 makes the crossing safe (see the gate record above).
 8. **Compile the tunnel out.** `scripts/compile_out_remote_tunnel.py` runs
-   in the builder stage: at v2.0.24 it verifies there is no tunnel surface;
-   at v2.0.26+ it replaces `remote-tunnel.ts` with a fail-closed stub
-   (verified against the real v2.0.26 tree: importers use exactly
+   in the builder stage: the historical v2.0.24 path verifies there is no
+   tunnel surface; at the current v2.0.32 pin it replaces `remote-tunnel.ts`
+   with a fail-closed stub (re-verified against the real v2.0.32 tree for
+   WI#427: importers still use exactly
    `run`/`ensure`/`hostname`). Drift detection scans
    `packages/{cli,server,schema,core}/src` (`*.ts` and `*.tsx`), matches
    any quoted `@opentunnel/*` specifier (static, dynamic `import()`,
@@ -413,8 +417,8 @@ Enforced controls (opencode2 lane unless noted):
 **!1570 deployment note:** rebuild the worker image and recreate existing
 opencode2 containers through mt-admin to receive the protected boot files.
 Restarting a container on an older image does not apply the new ownership or
-startup logic. !1490 remains gated at v2.0.24; the service-config reset is not
-an egress boundary.
+startup logic. !1490 was closed; WI#427 now authorizes the v2.0.32 crossing.
+The service-config reset is not an egress boundary.
 
 Control 11 audit of the other lanes (2026-10-12, against pinned sources;
 re-checked 2026-10-13):
@@ -577,8 +581,8 @@ issue above); v2 is opt-in per tenant until upstream's
 tenant during the transition (agent routing confusion — plan §5).
 
 **Dockerfile:** `opencode2.4lunarwing/Dockerfile` — pinned to
-**v2.0.24** at reviewed full commit
-`e7a34f09bfd9134dfade5a8ddb843f7030bc9a69`; the v2 bridge uses
+**v2.0.32** at reviewed full commit
+`843a6c514e606b436a7fe713422ace0a93ad3d61` (WI#427); the v2 bridge uses
 `@opencode/client` (promise API) instead of `@opencode-ai/sdk`, and the
 v2 config file is `config/opencode2.json` (`providers` map,
 `settings.baseURL`, `package`). Container UID/GID is **10003**
