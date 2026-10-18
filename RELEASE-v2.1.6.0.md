@@ -137,8 +137,9 @@ previous compatibility baseline.
   naive-use guards and build-time controls — an argv-scanning `opencode`
   wrapper, root-owned read-only scripts/config, the OpenTunnel compile-out,
   a byte-identity wrapper anchor, a BuildKit-faithful Dockerfile guard, and
-  the host-side `mt-admin worker-listeners` audit — while the opencode2
-  v2.0.26 bump stays gated.
+  the host-side `mt-admin worker-listeners` audit — and opencode2 advances
+  to **v2.0.32** under the maintainer-approved WI#427, verified on a live
+  test tenant through the full job path.
 - **Credential echoes scrubbed in the sandbox proxy (WI#395).** Injected
   credentials can no longer ride back out through forwarded response
   headers (raw, form-encoded, re-encoded, or JSON-escaped spellings),
@@ -484,7 +485,13 @@ are recursively credential-redacted before re-serialization. reqwest error
 text is stripped of the full request URL, closing a query-injection leak
 through unknown key names. `summarize_params` skips credential-keyed values
 generically, so `ToolStarted`/`ToolCompleted` summaries and persisted
-`params_summary` never carry them.
+`params_summary` never carry them. A late follow-up (2026-10-17) extends
+the shared credential-key matcher to numbered fields: a trailing ASCII
+digit counter on each folded word (`pass1`, `smtp_pass2`, `sid2` —
+multi-digit, separator, and fullwidth forms included) is trimmed before
+the short-name and exception checks, so numbered password/session keys
+are redacted like their unnumbered forms while ordinary keys
+(`side2`, `bypass2`, `Compass3`, `passenger1`) stay untouched.
 
 ### Pebble Toolchain Anchors and Build Smoke Gate (WI#334)
 
@@ -539,6 +546,20 @@ every tick, before any `rc-service` invocation, via the shared
 with a critical health report (empty service metrics, so self-heal gains no
 restart target) and a self-heal page through `escalate_service`. The
 migration-window guarantee no longer depends on arming-time state.
+
+The canonical interpreter resolver now covers the weechat and darkirc
+renderers too (WI#415, landed 2026-10-17): the five remaining OpenRC render
+sites that baked the caller's `$(command -v python3)` (the weechat tmux
+`command_args`, the weechat `start()`, the weechat relay `relay_exec_prefix`,
+the weechat `adapter_command` default, and the darkirc `darkirc_adapter_command`
+default) route through the shared `_openrc_proxy_python3` — the same
+PATH-independent resolver the proxy contract uses (`type -P` under the fixed
+`/usr/local/bin:/usr/bin:/bin`, with the `LUNARWING_MT_PROXY_PYTHON3`
+override). `_render_weechat_openrc_unit` resolves once up front and fails
+the render closed when nothing resolves; tenant renders resolve lazily, so
+python3-free tenants with neither service render unchanged. WI#415 stays
+open for maintainer acceptance; the systemd renderer's equivalent
+caller-PATH sites remain out of its scope.
 
 ### opencode v1 Crash-Line Enrichment (WI#374)
 
@@ -646,9 +667,18 @@ agent — only the deferred egress allowlist (control 1) is; the automated
 runtime-smoke suite is likewise deferred to WI#424 for 2.1.7.0. WI#427
 records the maintainer's explicit approval to advance opencode2 to
 **v2.0.32** through these guards; !1490 remains closed. The bump proceeds
-with WI#369's SDK-gate blind spots still open. Protected candidate/scan
-verification and tenant rollout remain acceptance gates; see the v2.0.32
-record in `docs/ops/WORKER-CONTAINERS.md`.
+with WI#369's SDK-gate blind spots still open. The v2.0.32 pin (from
+2.0.24) is verified on a live temporary tenant: a real job ran end to end
+(gateway chat → LLM loop → `create_job` → approval gate → resume → WS
+dispatch → the v2.0.32 executor) to a normal completion, with pre/post
+exposure checks clean (`service.json` disabled, no OpenTunnel identity
+dir, the wrapper refusing remote-service/pair shapes, and
+`worker-listeners` reporting nothing) — see
+`docs/ops/ITEM71_OPENCODE2_V2.0.32_PUBLIC_HTTPS_TUNNEL.md` for the
+security write-up of upstream's Public HTTPS Tunnel feature (architecture,
+threat model, control set, residual risks) and the v2.0.32 record in
+`docs/ops/WORKER-CONTAINERS.md`. Protected candidate/scan
+verification remains the promotion acceptance for production tenants.
 
 ### Sandbox Proxy Credential-Echo Scrubbing (WI#395)
 
@@ -666,8 +696,46 @@ uninspectable body is never forwarded blind. The WASM guest HTTP wrapper
 applies one guest-facing redaction over the whole outcome, covering
 validator errors that quote the injected URL. Residuals (re-encoded body
 echoes, splice re-checks, Range/206 handling) are recorded in
-`ic/src/NETWORK_SECURITY.md`, and the pre-existing channel-host class is
-filed as WI#408. WI#395 was closed on 2026-10-16.
+`ic/src/NETWORK_SECURITY.md`. WI#395 was closed on 2026-10-16.
+
+The coding-opacity rule was then tightened to hyper's exact de-chunking
+behavior (WI#419, landed 2026-10-17): hyper removes exactly one chunked
+layer, and only when the last comma token of the last `Transfer-Encoding`
+field is `chunked` — so `chunked,` (trailing comma), `chunked` followed by
+an empty field, `chunked, chunked`, and double-chunked bodies all reach
+the echo scrub with their framing intact. A transfer-coding-only body is
+inspectable now only when it has exactly one `chunked` token in last
+position; every other shape — including unreadable or empty
+`Transfer-Encoding` fields — is opaque and refused, and the refusal covers
+retained-framing spellings regardless of whether hyper de-chunks them.
+Known residuals from the same review are filed as WI#429 (the proxy's
+empty-body over-refusal: HEAD/304/204 plus retained framings still give
+502) and WI#430 (the analogous gap in the WASM tool wrapper's
+`guest_body_encoding_is_opaque`); both remain open. WI#419 itself stays
+open for maintainer acceptance.
+
+### Channel WASM Host Credential Redaction (WI#408)
+
+The channel-host side of the same class is closed at the trait boundary
+(WI#408, landed 2026-10-17). Channel WASM host functions that inject
+credentials (`http_request` URL placeholders, query credentials, header
+credentials) now scrub every echo spelling on the way back to the guest:
+raw, `urlencoding::encode`, and form (`query_pairs_mut`) spellings —
+including the upstream-parsed query forms (`+` read as a space, `%XX`
+escapes decoded) — plus JSON-escaped spellings in `headers_json` and
+byte-level body scrubbing. One guest-facing redaction at the trait
+boundary covers success and error outcomes alike, so allowlist deny
+reasons, leak-scan previews, and send errors no longer quote the injected
+URL or its parts; body-read errors strip the URL too. Deny reasons are
+computed from the guest's own URL, and a placeholder value that cannot
+survive parsing (containing `#` or an ASCII control character) is
+refused before injection. Credentialed channel exchanges force
+`Accept-Encoding: identity`, are never followed across redirects, and
+refuse opaque or retained-framed bodies (the same hyper-exact
+transfer-coding rule as WI#419). The pins run the real host functions
+against live loopback upstreams, and a redaction wrapper verified in-tree
+carries all 12 WASM extensions on a live tenant. WI#408 stays open for
+maintainer acceptance.
 
 ### Self-Heal Backoff Cap (WI#377)
 
@@ -677,6 +745,56 @@ short-cut expanded `${max:-3600}` before the variable existed, silently
 ignoring the cap exactly in the deep-retry regime. The declarations and
 numeric validation now sit above the short-cut, which returns the real cap;
 an invalid cap warns and yields 0 like the ≤20 path.
+
+### Single-Node Endpoint Defaults Removed (WI#402)
+
+The deprecated `setup-instance.sh` and the XMPP test-env harness no longer
+carry built-in LLM/TensorZero endpoint defaults: `setup-instance.sh`
+requires `--llm-base-url` (dying with guidance before any file is
+written), and `lunarwing-xmpp-test-env.sh` resolves the TensorZero
+gateway from `LUNARWING_TEST_TENSORZERO_URL` or `TENSORZERO_URL` —
+refusing at every bake/use point (init, fresh `proxy.env`, the
+`ENABLE_PROXY=false` daemon env, proxy start, unit renders) when neither
+knob is set, while previously initialized roots keep working through the
+value baked in their `proxy.env`. A fresh-root refusal leaves no `env/`
+files behind (no fresh tokens or keys from a failed bring-up), and
+`doctor` diagnoses the missing knob instead of probing an empty URL.
+`lunarwing_toolcall_diag.py` takes its gateway host from `--host` —
+required unless `--default` explicitly opts into the historical LAN
+address. WI#402 stays open for maintainer acceptance.
+
+### Engine Auto-Import Pre-Injection (WI#364)
+
+Monty code blocks generated by the LLM no longer fail on missing stdlib
+imports: the orchestrator pre-injects `import <module>` for any dotted
+reference (`module.`) to the six Monty-available stdlib modules
+(`asyncio`, `json`, `re`, `math`, `datetime`, `sys`) that is referenced,
+not already imported, and not called as a bare function (the builtin
+`json` tool keeps working). Wired into the single choke point every
+LLM-generated block passes through before execution — direct CodeAct
+steps, orchestrator `__execute_code_step__` calls, and `rlm_query`
+children alike — with explicit imports taking precedence, comment tails
+and `from`/alias bindings respected, and injected imports never shifting
+reported error line numbers. Import-clean code executes byte-identically;
+the scan is a boundary matcher, not a full parser (documented limitations
+in the helper docstring and MONTY.md).
+
+### mt-admin Tenant-Ownership Hardening (WI#390, WI#416)
+
+Two hardening passes landed in the mt-admin modules. WI#390: the four
+`configure_*` functions (`configure_opencode`, `configure_opencode2`,
+`configure_kimi`, `configure_study_mcp`) read the tenant `lunarwing.env`
+through a root-private tenant-side snapshot instead of reading the file
+as root — a tenant-symlinked env can no longer redirect a root read —
+and `upgrade-tenant` refuses to commit refused writes. WI#416 (partial —
+three of its six named sites): the trailing root `chown -R` in
+`configure_weechat_relay` is gone (the promoted tree is already
+tenant-owned; after a symlink swap that chown would have recursively
+chowned a victim tenant's WeeChat home), the relay start lock is created
+via a tenant-side `noclobber` drop, and the SSH key staging drops its
+redundant root chown. The remaining WI#416 sites (the `chmod 2770`
+workspace prep, the add-tenant re-run env chmod, the study-seed root
+mktemp) stay open. Both WIs stay open for maintainer acceptance.
 
 ### Kimi Worker 2.2.0 and Environment/Config Pins (WI#411, WI#412)
 
@@ -739,7 +857,8 @@ Wasmtime/WASI 36.0.18 — see Crate Security Re-Audit). The
 untouched by the sweep, then upgraded separately for the rustls advisories
 with its Dockerfile digest refreshed. External worker pins: kimi-code
 advanced to 2.2.0; opencode v1.18.25 and the Pebble upstream ref are
-unchanged; opencode2's v2.0.26 bump remains gated per WI#357.
+unchanged; opencode2 advances v2.0.24 → v2.0.32 per WI#427 (OpenTunnel
+compiled out; see Worker Exposure Policy).
 
 A crates.io mass-yank forced one late major bump (WI#417, closed
 2026-10-16): every `zip` release below 9.0.3 was yanked on 2026-10-16
@@ -798,19 +917,21 @@ are recorded in the audit doc's 2026-10-16 follow-up.
    `scripts/build-lunarwing.sh`, `ic/Dockerfile`, `ic/Dockerfile.worker`)
    uses default features, so shipped binaries fail loudly rather than
    silently diverging; mt-admin currently exposes no opt-in feature knob.
-4. **Rebuild and promote the worker images.** The WI#324 kimi tool-proxy
-   bridge, the WI#325 cron bootstrap, the WI#328 control channel, the
-   WI#330 placeholder guards, the WI#373 credential strips, and the
+4. **Rebuild and promote the worker images.** The WI#324 kimi and opencode
+   tool-proxy bridges, the WI#325 cron bootstrap, the WI#328 control channel,
+   the WI#330 placeholder guards, the WI#373 credential strips, and the
    WI#411/WI#412 kimi env/config pins all ship in the worker images.
    Rebuild all four worker images (`build-<worker>-worker` or
    `build-tenant --with-<worker>`), promote each through the normal
    candidate → scan → promotion path, then `restart-tenant` each tenant.
    The version pins alone are not the content: the opencode2 image carries
    the WI#357 exposure controls and the WI#329 SDK gate, the opencode image
-   carries the WI#374 crash-line enrichment and the WI#373 credential
-   strip, and the pebble image carries WI#334 and the reviewed-lock rustls
+   carries the WI#374 crash-line enrichment, the WI#373 credential strip,
+   and the WI#324 serve-process plugin, and the pebble image carries
+   WI#334 and the reviewed-lock rustls
    upgrade — opencode stays v1.18.25, while opencode2 advances to v2.0.32
-   under WI#427. Skipping those rebuilds leaves WI#357 undeployed. Preserve
+   under WI#427. Skipping those rebuilds leaves WI#357 undeployed and the
+   opencode tool proxy unsurfaced. Preserve
    opencode2 state before the first new-version boot: upstream migrates its
    database, so rolling back the image alone is not a verified rollback.
    kimi-code is upgraded to **2.2.0** (an earlier 2.2.0 image promoted
@@ -837,7 +958,12 @@ are recorded in the audit doc's 2026-10-16 follow-up.
    worker get no proxied tools. Never point a `tool_allowlist`-bearing
    entry at the same endpoint as a `mode = "cron"` entry — the shared
    endpoint is stripped (normalized host:port comparison, fails closed) —
-   and give each cron mission its own container.
+   and give each cron mission its own container: two cron entries sharing
+   one container with *differing* `cron.tool_allowlist` grants are now
+   detected at load and every cron grant on that listener is stripped
+   (identical grants stay, with a warning). A control-state read failure
+   now starts the affected mission paused with a `durability_error`
+   instead of resuming it blind (WI#371); resolve the fault and resume.
 7. **Daily-log backup cap refusals are classified (WI#335).** A replace
    that would exceed the daily-log backup generations now fails with
    `NotAuthorized` (previously a transient-looking execution error): an
@@ -852,6 +978,13 @@ are recorded in the audit doc's 2026-10-16 follow-up.
    per-thread stamps and owed-outcome notices resolve; a `2.1.5.0 →
    2.1.6.0` upgrade emits no spurious "re-armed" notices for healthy retry
    markers.
+10. **Single-node harness defaults are gone (WI#402).** `setup-instance.sh`
+   (already deprecated behind `LUNARWING_ONBOARD_LEGACY_OK=1`) now
+   requires `--llm-base-url`, and the XMPP test-env harness requires
+   `LUNARWING_TEST_TENSORZERO_URL` (or `TENSORZERO_URL`) — previously
+   initialized roots keep their baked `proxy.env` value, but fresh
+   bring-ups die with guidance instead of silently dialing the historical
+   LAN default. Pass an explicit endpoint.
 
 ### Security, Deployment, and Release Limitations
 
