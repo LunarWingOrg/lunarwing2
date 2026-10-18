@@ -86,11 +86,11 @@ function abortSocketTasks(socket: BridgeSocket): void {
  * relay's pending map for that socket, so reconnects never accumulate stale
  * pending state and a request that arrives between the close and the task's
  * teardown is never sent into the dead socket (JU-3; the kimi lane pins the
- * same with its spawned-bridge test). Without `dropHubSocket`, the aborted
- * task's
- * `finally` still fails its waiter later through `closeTask`, but the dead
- * socket's pending map stays in `pendingBySocket` for the process lifetime —
- * the EF-9 leak — and the close-to-teardown window leaves an EV-4 gap.
+ * same with its spawned-bridge test). Without `dropHubSocket`, the
+ * aborted task's `finally` still fails its waiter later through
+ * `closeTask`, but the dead socket's pending map stays in
+ * `pendingBySocket` for the process lifetime — the EF-9 leak — and the
+ * close-to-teardown window leaves an EV-4 gap.
  */
 export function handleHubSocketClosed(socket: BridgeSocket): void {
   abortSocketTasks(socket)
