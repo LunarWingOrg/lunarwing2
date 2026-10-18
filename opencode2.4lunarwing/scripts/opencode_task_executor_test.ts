@@ -743,5 +743,14 @@ assert.deepEqual(
     "ADD them to BRIDGE_SDK_METHODS in sdk_surface.ts " +
     "(never narrow the suite to force a pass)",
 )
+// JR-4: the suite must touch EXACTLY the declared surface — otherwise
+// removing the recordingSdkProxy wrap in makeSdk (const sdk = rawSdk)
+// passes silently and the behavioural gate goes hollow. The deepEqual above
+// catches undeclared paths; this one catches a proxy that records nothing.
+assert.deepEqual(
+  [...accessedSdkPaths].sort(),
+  [...BRIDGE_SDK_METHODS].sort(),
+  "the recording proxy did not see every BRIDGE_SDK_METHODS path - makeSdk must wrap the mock in recordingSdkProxy",
+)
 
 console.log("opencode2 task executor self-check passed")
