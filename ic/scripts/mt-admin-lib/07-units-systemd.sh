@@ -535,6 +535,10 @@ EOF
       printf 'UserNS=%s\n' "$KIMI_USERNS"
     elif [[ "$worker" == "opencode2" ]]; then
       printf 'UserNS=%s\n' "$OPENCODE2_USERNS"
+    elif [[ "$worker" == "pebble" ]]; then
+      # WI#400: pebble tasks run under a uid separate from the bridge;
+      # keep-id binds that task uid to the tenant account.
+      printf 'UserNS=%s\n' "$PEBBLE_USERNS"
     fi
     # WI#206: the kimi lane gets no SSH-agent socket and no privilege
     # escalation — it is an auto-approved headless task executor, and a

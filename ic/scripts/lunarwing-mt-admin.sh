@@ -182,7 +182,16 @@ OPENCODE2_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE2_USERNS};ssh-agent-dir-ro"
 
 # The pebble lane mounts the SSH agent directory like the other non-kimi
 # workers; bump the contract to recreate existing containers with RW mounts.
-PEBBLE_ROOTLESS_LAUNCH_CONTRACT="ssh-agent-dir-ro"
+# WI#400: pebble tasks now run under a uid separate from the bridge
+# (container root). keep-id binds the task uid to the tenant account, so
+# workspace writes stay tenant-owned on the host and the SSH-agent socket
+# stays reachable by tasks; the bridge's container-root identity moves into
+# the subuid range. Adding userns= bumps the contract, force-recreating
+# existing pebble containers (whose tasks ran as container root).
+PEBBLE_CONTAINER_UID="10004"
+PEBBLE_CONTAINER_GID="10004"
+PEBBLE_USERNS="keep-id:uid=${PEBBLE_CONTAINER_UID},gid=${PEBBLE_CONTAINER_GID}"
+PEBBLE_ROOTLESS_LAUNCH_CONTRACT="userns=${PEBBLE_USERNS};ssh-agent-dir-ro"
 
 # ── Library sourcing ─────────────────────────────────────────────────────────
 #

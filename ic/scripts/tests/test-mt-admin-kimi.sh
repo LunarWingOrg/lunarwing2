@@ -339,8 +339,8 @@ assert_contains "$ROOT_SCRIPT" 'OPENCODE_ROOTLESS_LAUNCH_CONTRACT="userns=${OPEN
   'opencode rootless launch contract records the read-only SSH mount'
 assert_contains "$ROOT_SCRIPT" 'OPENCODE2_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE2_USERNS};ssh-agent-dir-ro"' \
   'opencode2 rootless launch contract records the read-only SSH mount'
-assert_contains "$ROOT_SCRIPT" 'PEBBLE_ROOTLESS_LAUNCH_CONTRACT="ssh-agent-dir-ro"' \
-  'pebble launch contract records the read-only SSH mount'
+assert_contains "$ROOT_SCRIPT" 'PEBBLE_ROOTLESS_LAUNCH_CONTRACT="userns=${PEBBLE_USERNS};ssh-agent-dir-ro"' \
+  'pebble launch contract records the WI#400 task-uid userns + read-only SSH mount'
 assert_contains "$WORKER_LIB" 'local opencode_launch_contract="ssh-agent-dir-ro"' \
   'rootful opencode includes the SSH mount in its launch contract'
 assert_contains "$WORKER_LIB" 'local launch_contract="ssh-agent-dir-ro"' \
