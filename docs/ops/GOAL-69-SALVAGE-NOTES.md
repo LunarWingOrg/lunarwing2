@@ -22,3 +22,12 @@ Potentially salvageable prior work (use only if the review's asks align):
   Inspect with `git stash show -p stash@{0}`; do NOT blind-restore.
 
 Mirrors: Hermes skill `kimi-goal-69-salvage` + mem0 (tag goal-69).
+
+**OUTCOME (2026-10-19, SweetieBot, branch `sweetiebot/kimi-69-20261019-1505`):**
+goal 69 completed. The salvage branch was merged (one executor.rs conflict,
+hand-resolved) and every run-166 LD finding (LD-1..LD-17) addressed
+in-tree; see the item-69 DONE trail in AGENT_GOALS_2.1.6.0.md for the
+per-finding record and the verification matrix. The stash was inspected
+and salvaged selectively (the token-layout harness test and the LD-10
+shape informed the final resolver, which landed as the reviewer's
+testable-arguments prototype instead of the stashed self-exec form).
