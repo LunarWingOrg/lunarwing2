@@ -9,6 +9,10 @@ cargo-deny:
   script:
     - bash .gitlab/scripts/install-cargo-deny.sh
     - bash .gitlab/scripts/cargo-deny-check.sh
+    # WI#363: hard-fail when a deny.toml clearing-owner WI is no longer open
+    # (this job already fetches the advisory DB over the network; the GitLab
+    # work-item API is reachable per the egress contract in .gitlab/README.md).
+    - python3 .gitlab/scripts/check_deny_toml_owners.py
 
 # Makes the release audit's "every committed lockfile is clean" claim
 # reproducible in CI: the same pinned cargo-deny over every manifest root
