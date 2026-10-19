@@ -257,7 +257,9 @@ Manages OS users, port allocation, per-tenant services, and builds.
 Commands:
   add-tenant <name> [options]      Create user, allocate ports, clone repo,
                                    generate env, render and install services
-    --docker-group                 Add user to docker/podman group
+    --docker-group                 Add user to docker/podman group (opt-in:
+                                   not needed for rootless podman; only to
+                                   reach a shared rootful daemon socket)
     --xmpp-jid <jid>              XMPP JID for this tenant
     --xmpp-password <pass>        XMPP password (generated if omitted)
     --llm-api-key <key>            API key for the LLM backend provider
