@@ -136,6 +136,7 @@ cat >"$(tenant_env_dir test)/lunarwing.env" <<EOF
 GATEWAY_AUTH_TOKEN=test-token
 LLM_API_KEY=test-key
 EOF
+chmod 600 "$(tenant_env_dir test)/lunarwing.env"
 provision_tenant_study_mcp test ""
 grep -Fqx "LW2STUDYMCP_HOME=$STUDY_NOTES_DEFAULT_HOME" "$(tenant_env_dir test)/lunarwing.env"
 if grep -q '^LW2STUDYMCP_ALLOW_WRITE=' "$(tenant_env_dir test)/lunarwing.env"; then
@@ -159,6 +160,7 @@ GATEWAY_AUTH_TOKEN=test-token
 LLM_API_KEY=test-key
 KNOWLEDGE_SEED_FROM_STUDY_MCP=0
 EOF
+chmod 600 "$(tenant_env_dir test3)/lunarwing.env"
 provision_tenant_study_mcp test3 ""
 grep -Fqx 'KNOWLEDGE_SEED_FROM_STUDY_MCP=0' "$(tenant_env_dir test3)/lunarwing.env"
 [[ "$(grep -c '^KNOWLEDGE_SEED_FROM_STUDY_MCP=' "$(tenant_env_dir test3)/lunarwing.env")" -eq 1 ]]
@@ -171,6 +173,7 @@ cat >"$(tenant_env_dir test4)/lunarwing.env" <<EOF
 GATEWAY_AUTH_TOKEN=test-token
 LLM_API_KEY=test-key
 EOF
+chmod 600 "$(tenant_env_dir test4)/lunarwing.env"
 configure_study_mcp test4 "$STUDY_NOTES_DEFAULT_HOME" false ""
 grep -Fqx "LW2STUDYMCP_HOME=$STUDY_NOTES_DEFAULT_HOME" "$(tenant_env_dir test4)/lunarwing.env"
 if grep -q '^KNOWLEDGE_SEED_FROM_STUDY_MCP=' "$(tenant_env_dir test4)/lunarwing.env"; then
@@ -235,6 +238,7 @@ cat >"$(tenant_env_dir test2)/lunarwing.env" <<EOF
 GATEWAY_AUTH_TOKEN=test-token
 LLM_API_KEY=test-key
 EOF
+chmod 600 "$(tenant_env_dir test2)/lunarwing.env"
 if provision_tenant_study_mcp test2 "$fixture/not-git" 2>/dev/null; then
   printf 'Study Notes auto-configuration unexpectedly accepted a non-git home\n' >&2
   exit 1

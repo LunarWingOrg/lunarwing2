@@ -51,6 +51,15 @@ _wait_tenant_gateway() { return 0; }
 
 say() { printf '%s\n' "$*" >>"${stub_dir}/say.log"; }
 
+# WI#390 harness convention: the fixture tenant is not a real account, so run
+# the tenant-side privilege drop directly as the invoking user (the fixture env
+# dir is owned by that user at mode 700, satisfying the tenant-side checks).
+sudo() {
+  [[ "${1:-}" == "-u" ]] || return 1
+  shift 2
+  "$@"
+}
+
 curl() {
   local this_n arg_fd
   this_n="$(ls "${stub_dir}"/curl_body.*.txt 2>/dev/null | wc -l)"
@@ -85,6 +94,7 @@ reset_curl_recordings() {
 write_fixture_env() {
   local secret="$1" token="$2"
   mkdir -p "${stub_dir}/env"
+  chmod 700 "${stub_dir}/env"
   {
     printf 'GATEWAY_AUTH_TOKEN=%s\n' "$token"
     printf 'DARKIRC_ADAPTER_SECRET=%s\n' "$secret"

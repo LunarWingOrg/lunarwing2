@@ -171,19 +171,27 @@ _deregister_worker_unit() {
 # and never exposes the full gateway bearer to `podman inspect` or the
 # tenant-readable unit file. The gateway-bearer substitution is kept ONLY as a
 # last resort for read-only/unwritable env files, and is always loudly warned.
-resolve_worker_auth_token() {
-  local env_path="$1" token
-  token="$(_read_env_value "$env_path" WORKER_AUTH_TOKEN)"
+#
+# WI#423: both value reads go through read_tenant_env_value — root never
+# resolves the tenant-writable env path itself, so a symlink swap cannot leak
+# another tenant's worker (or gateway) bearer into this tenant's quadlet /
+# `podman inspect` / config.toml. An unsafe path refuses loudly instead of
+# falling back: the fallback read would traverse the same hostile path.
+resolve_worker_auth_token() {  # <tenant> <env_path>
+  local name="$1" env_path="$2" token fresh
+  token="$(read_tenant_env_value "$name" "$env_path" WORKER_AUTH_TOKEN)" \
+    || die "could not safely read WORKER_AUTH_TOKEN from $env_path as tenant '$name'"
   if [[ -n "$token" ]]; then
     printf '%s' "$token"
     return 0
   fi
 
   # Mint and persist the scoped token. Preserve the tenant's ownership when
-  # replacing the file: mt-admin runs as root, and a root-owned 0600 replacement
-  # cannot be read by the tenant's systemd user services.
+  # replacing the file: _env_set commits through the tenant-side writer for a
+  # tenant-owned env dir (the create_tenant_user shape), so a root-owned 0600
+  # replacement — unreadable by the tenant's systemd user services — is never
+  # produced.
   if [[ -w "$env_path" ]]; then
-    local fresh
     fresh="$(generate_token)"
     if [[ -n "$fresh" ]]; then
       if _env_set "$env_path" WORKER_AUTH_TOKEN "$fresh"; then
@@ -196,7 +204,8 @@ resolve_worker_auth_token() {
 
   # Last resort: fail open ONLY after an explicit, loud warning. Never silent.
   echo "WARNING: could not persist WORKER_AUTH_TOKEN for $env_path; falling back to GATEWAY_AUTH_TOKEN (WI#210 mitigations do NOT apply to this worker until the env file is written)." >&2
-  token="$(_read_env_value "$env_path" GATEWAY_AUTH_TOKEN)"
+  token="$(read_tenant_env_value "$name" "$env_path" GATEWAY_AUTH_TOKEN)" \
+    || die "could not safely read GATEWAY_AUTH_TOKEN from $env_path as tenant '$name'"
   printf '%s' "$token"
 }
 
@@ -207,7 +216,7 @@ resolve_worker_auth_token() {
 upgrade_external_worker_auth_token() {
   local name="$1" worker="$2" config_path="$3" env_path="$4"
   local awk_status staged_in staged_out new_token
-  new_token="$(resolve_worker_auth_token "$env_path")"
+  new_token="$(resolve_worker_auth_token "$name" "$env_path")"
   [[ -n "$new_token" ]] || return 1
 
   # WI#390 (review HH-3): never mktemp+redirect+chown as root inside the
@@ -437,7 +446,7 @@ ensure_external_worker_config() {
   # AGENT_AUTH_TOKEN will be; tenants provisioned before WORKER_AUTH_TOKEN
   # existed fall back to the gateway bearer until their next lifecycle pass
   # migrates both sides together.
-  auth_token="$(resolve_worker_auth_token "$env_path")"
+  auth_token="$(resolve_worker_auth_token "$name" "$env_path")"
 
   # add-tenant runs before the daemon ever starts, so config.toml usually does
   # not exist yet — create it with a header. Appending a fresh
@@ -1307,19 +1316,26 @@ start_tenant_opencode() {
 
     local env_flags=()
     if [[ -f "$tenant_env_path" ]]; then
+      # WI#423: these values cross into `podman inspect` — take them from one
+      # tenant-side snapshot (the scoped-token resolver does its own per-key
+      # tenant-side read) so a symlinked lunarwing.env cannot leak another
+      # tenant's LLM key into this worker's container.
+      local env_snapshot
+      _snapshot_tenant_env "$name" "$tenant_env_path" env_snapshot
       local agent_token
-      agent_token="$(resolve_worker_auth_token "$tenant_env_path")"
+      agent_token="$(resolve_worker_auth_token "$name" "$tenant_env_path")"
       [[ -n "$agent_token" ]] && env_flags+=(-e "AGENT_AUTH_TOKEN=$agent_token")
 
       local llm_api_key
-      llm_api_key="$(_read_env_value "$tenant_env_path" LLM_API_KEY)"
+      llm_api_key="$(_read_env_value "$env_snapshot" LLM_API_KEY)"
       [[ -n "$llm_api_key" ]] && env_flags+=(-e "TENSORZERO_API_KEY=$llm_api_key")
 
       local opencode_model opencode_base_url
-      opencode_model="$(_read_env_value "$tenant_env_path" OPENCODE_MODEL)"
+      opencode_model="$(_read_env_value "$env_snapshot" OPENCODE_MODEL)"
       [[ -n "$opencode_model" ]] && env_flags+=(-e "OPENCODE_MODEL=$opencode_model")
-      opencode_base_url="$(_read_env_value "$tenant_env_path" OPENCODE_BASE_URL)"
+      opencode_base_url="$(_read_env_value "$env_snapshot" OPENCODE_BASE_URL)"
       [[ -n "$opencode_base_url" ]] && env_flags+=(-e "OPENCODE_BASE_URL=$opencode_base_url")
+      rm -f -- "$env_snapshot"
     fi
 
     if [[ -f "$opencode_env_path" ]]; then
@@ -1518,19 +1534,24 @@ start_tenant_opencode2() {
 
     local -a env_flags=()
     if [[ -f "$tenant_env_path" ]]; then
+      # WI#423: same tenant-side snapshot as the opencode lane — the LLM key
+      # and model values land in `podman inspect` for this container.
+      local env_snapshot
+      _snapshot_tenant_env "$name" "$tenant_env_path" env_snapshot
       local agent_token
-      agent_token="$(resolve_worker_auth_token "$tenant_env_path")"
+      agent_token="$(resolve_worker_auth_token "$name" "$tenant_env_path")"
       [[ -n "$agent_token" ]] && env_flags+=(-e "AGENT_AUTH_TOKEN=$agent_token")
 
       local llm_api_key
-      llm_api_key="$(_read_env_value "$tenant_env_path" LLM_API_KEY)"
+      llm_api_key="$(_read_env_value "$env_snapshot" LLM_API_KEY)"
       [[ -n "$llm_api_key" ]] && env_flags+=(-e "TENSORZERO_API_KEY=$llm_api_key")
 
       local oc2_model oc2_base_url
-      oc2_model="$(_read_env_value "$tenant_env_path" OPENCODE2_MODEL)"
+      oc2_model="$(_read_env_value "$env_snapshot" OPENCODE2_MODEL)"
       [[ -n "$oc2_model" ]] && env_flags+=(-e "OPENCODE2_MODEL=$oc2_model")
-      oc2_base_url="$(_read_env_value "$tenant_env_path" OPENCODE2_BASE_URL)"
+      oc2_base_url="$(_read_env_value "$env_snapshot" OPENCODE2_BASE_URL)"
       [[ -n "$oc2_base_url" ]] && env_flags+=(-e "OPENCODE2_BASE_URL=$oc2_base_url")
+      rm -f -- "$env_snapshot"
     fi
 
     if [[ -f "$worker_env_path" ]]; then
@@ -1695,7 +1716,7 @@ write_kimi_runtime_env() {
       [[ -z "$value" ]] || printf '%s=%s\n' "$key" "$value"
     done
 
-    value="$(resolve_worker_auth_token "$source_path")" || exit 1
+    value="$(resolve_worker_auth_token "$name" "$source_path")" || exit 1
     [[ -n "$value" ]] \
       || die "Kimi worker requires WORKER_AUTH_TOKEN (or GATEWAY_AUTH_TOKEN)"
     # Worker bridge expects AGENT_AUTH_TOKEN, not the daemon's env variable name.
@@ -2023,7 +2044,7 @@ start_tenant_pebble() {
     local env_flags=()
     if [[ -f "$tenant_env_path" ]]; then
       local agent_token
-      agent_token="$(resolve_worker_auth_token "$tenant_env_path")"
+      agent_token="$(resolve_worker_auth_token "$name" "$tenant_env_path")"
       [[ -n "$agent_token" ]] && env_flags+=(-e "AGENT_AUTH_TOKEN=$agent_token")
     fi
 

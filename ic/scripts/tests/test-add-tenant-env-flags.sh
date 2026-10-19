@@ -101,6 +101,8 @@ ports_get() {  # <name> <service>
 }
 
 # Stub tenant_pg_password, tenant_darkirc_enabled, generate_token, say, chown.
+# The real tenant_pg_password definition is kept for the WI#423 pins below.
+REAL_TENANT_PG_PASSWORD_DEF="$(declare -f tenant_pg_password)"
 tenant_pg_password()      { echo "pgpass-fixture"; }
 DARKIRC_FIXTURE_ENABLED=false
 tenant_darkirc_enabled()  { [[ "$DARKIRC_FIXTURE_ENABLED" == "true" ]]; }
@@ -671,6 +673,7 @@ echo "=== coordination env backfill tests ==="
 cat >"$MT_FIXTURE/env/lunarwing.env" <<'EOF'
 LUNARWING_OWNER_ID=fixture-tenant
 EOF
+chmod 600 "$MT_FIXTURE/env/lunarwing.env"
 patch_tenant_coordination_env fixture-tenant "$MT_FIXTURE/env/lunarwing.env"
 assert_eq "backfill coordination disabled" "$(envval COORD_ENABLED)" "false"
 assert_eq "backfill coordination agent ID" "$(envval COORD_AGENT_ID)" "fixture-tenant"
@@ -782,6 +785,7 @@ rm -f "$MT_FIXTURE/env/lunarwing.env"
 assert_eq "resolver: no file -> default" \
   "$(resolve_tenant_xmpp_jid fixture-tenant "")" "fixture-tenant@xmpp.localhost"
 printf 'XMPP_JID=stored@xmpp.sobe.world\n' >"$MT_FIXTURE/env/lunarwing.env"
+chmod 600 "$MT_FIXTURE/env/lunarwing.env"
 assert_eq "resolver: stored wins over default" \
   "$(resolve_tenant_xmpp_jid fixture-tenant "")" "stored@xmpp.sobe.world"
 assert_eq "resolver: explicit wins over stored" \
@@ -1219,6 +1223,7 @@ cat > "$MT_FIXTURE/env/lunarwing.env" <<E
 XMPP_BRIDGE_TOKEN=bridge-tok-fixture
 XMPP_PASSWORD=xmpp-pass-fixture
 E
+chmod 600 "$MT_FIXTURE/env/lunarwing.env"
 
 run_bridge_writer() {  # <xmpp_allow_from_extras>
   rm -f "$MT_FIXTURE/env/xmpp-bridge.env"
@@ -1360,6 +1365,7 @@ JSON
 cat >"$MT_FIXTURE/env/lunarwing.env" <<'EOF'
 LLM_BASE_URL=http://127.0.0.1:10004/v1
 EOF
+chmod 600 "$MT_FIXTURE/env/lunarwing.env"
 cat >"$MT_FIXTURE/env/proxy.env" <<'EOF'
 TENSORZERO_URL=http://tz-upstream:3030
 EOF
@@ -1379,6 +1385,7 @@ cat >"$MT_FIXTURE/env/lunarwing.env" <<'EOF'
 LLM_BASE_URL=http://direct:9000/v1
 OPENCODE_BASE_URL=http://operator-set:4100/v1
 EOF
+chmod 600 "$MT_FIXTURE/env/lunarwing.env"
 backfill_tenant_worker_base_urls fixture-tenant
 assert_eq "backfill: operator-set opencode preserved" \
   "$(envval OPENCODE_BASE_URL)" "http://operator-set:4100/v1"
@@ -1389,6 +1396,7 @@ assert_eq "backfill: kimi inherits direct LLM_BASE_URL" \
 cat >"$MT_FIXTURE/env/lunarwing.env" <<'EOF'
 LLM_BASE_URL=http://127.0.0.1:10004/v1
 EOF
+chmod 600 "$MT_FIXTURE/env/lunarwing.env"
 rm -f "$MT_FIXTURE/env/proxy.env"
 if (backfill_tenant_worker_base_urls fixture-tenant) >/dev/null 2>&1; then
   echo "  FAIL: backfill succeeded with no derivable endpoint"; failures=$((failures + 1))
@@ -1498,6 +1506,164 @@ if echo "$batch_dispatch_output" | grep -q 'unknown flag: --no-weechat-bootstrap
 else
   echo "  PASS: add-tenants accepts --no-weechat-bootstrap"
 fi
+
+echo "=== WI#423: pg password, worker token, study-notes reads stay tenant-side ==="
+
+# The IG-1 pattern: a tenant-side read must never resolve a symlinked env
+# path. The tenant_cat stub emulates the cross-tenant permission boundary (a
+# foreign 0600 env is unreadable to the tenant-side cat) by refusing reads
+# through a symlink; reverting any fixed function to a root read of the live
+# path makes its pin below fail.
+eval "$REAL_TENANT_PG_PASSWORD_DEF"
+wi423_victim="$MT_FIXTURE/wi423-victim.env"
+wi423_deny_tenant_cat() {  # deny reads through a symlink (foreign-target stand-in)
+  [[ ! -L "$2" ]] || return 1
+  cat -- "$2"
+}
+
+# 1) tenant_pg_password: an existing pg.secret read must come from the
+#    tenant-side snapshot — a foreign symlink dies there, the victim keeps its
+#    password, and nothing is written.
+printf 'FOREIGN-PG-PASSWORD\n' >"$wi423_victim"
+chmod 600 "$wi423_victim"
+wi423_victim_before="$(cat "$wi423_victim")"
+tenant_cat() { wi423_deny_tenant_cat "$@"; }
+rm -f "$MT_FIXTURE/env/pg.secret" "$MT_FIXTURE/env/lunarwing.env"
+ln -s "$wi423_victim" "$MT_FIXTURE/env/pg.secret"
+wi423_rc=0
+wi423_err="$( ( tenant_pg_password fixture-tenant ) 2>&1 )" || wi423_rc=$?
+if [[ "$wi423_rc" -eq 0 ]]; then
+  echo "  FAIL: tenant_pg_password read a foreign-linked pg.secret without dying"; failures=$((failures + 1))
+elif [[ "$wi423_err" != *"could not read $MT_FIXTURE/env/pg.secret as tenant 'fixture-tenant'"* ]]; then
+  echo "  FAIL: tenant_pg_password died without the tenant-read refusal: $wi423_err"; failures=$((failures + 1))
+else
+  echo "  PASS: tenant_pg_password dies at the tenant-side pg.secret snapshot"
+fi
+assert_eq "pg.secret refusal leaves the foreign file untouched" "$(cat "$wi423_victim")" "$wi423_victim_before"
+assert_eq "pg.secret refusal leaves the symlink in place" \
+  "$(if [[ -L "$MT_FIXTURE/env/pg.secret" ]]; then echo symlink; else echo replaced; fi)" "symlink"
+
+# 2) tenant_pg_password: a dangling symlink at pg.secret (fresh-tenant mint
+#    shape) dies before any write — root never creates the redirect target.
+rm -f "$MT_FIXTURE/env/pg.secret"
+ln -s "$MT_FIXTURE/wi423-no-such-target" "$MT_FIXTURE/env/pg.secret"
+wi423_rc=0
+( tenant_pg_password fixture-tenant ) >/dev/null 2>&1 || wi423_rc=$?
+if [[ "$wi423_rc" -eq 0 ]]; then
+  echo "  FAIL: tenant_pg_password minted through a dangling pg.secret symlink"; failures=$((failures + 1))
+else
+  echo "  PASS: tenant_pg_password mint refuses a symlinked pg.secret"
+fi
+assert_eq "symlinked pg.secret redirect target was never created" \
+  "$(if [[ -e "$MT_FIXTURE/wi423-no-such-target" ]]; then echo created; else echo absent; fi)" "absent"
+
+# 2b) the mint write itself commits through the tenant-side atomic writer.
+#     The snapshot reads are neutralized (a read that found nothing), so the
+#     pre-placed symlink at pg.secret is only seen at COMMIT time — the exact
+#     WI#390 original shape this WI closes. Root truncating writes make this
+#     pin fail with a zero exit and a truncated victim.
+wi423_real_snapshot="$(declare -f _snapshot_tenant_env)"
+_snapshot_tenant_env() {  # <tenant> <env_file> <out_var> — empty snapshot stub
+  local -n wi423_snap_out="$3"
+  # shellcheck disable=SC2034  # nameref write is the whole point of the stub
+  wi423_snap_out="$(mktemp)"
+}
+printf 'DO-NOT-TRUNCATE\n' >"$wi423_victim"
+rm -f "$MT_FIXTURE/env/pg.secret" "$MT_FIXTURE/env/lunarwing.env"
+ln -s "$wi423_victim" "$MT_FIXTURE/env/pg.secret"
+wi423_rc=0
+wi423_err="$( ( tenant_pg_password fixture-tenant ) 2>&1 )" || wi423_rc=$?
+if [[ "$wi423_rc" -eq 0 ]]; then
+  echo "  FAIL: tenant_pg_password minted through a symlinked pg.secret at commit time"; failures=$((failures + 1))
+elif [[ "$wi423_err" != *"could not safely write $MT_FIXTURE/env/pg.secret"* ]]; then
+  echo "  FAIL: mint died without the atomic-writer refusal: $wi423_err"; failures=$((failures + 1))
+else
+  echo "  PASS: mint commit refuses a symlinked pg.secret"
+fi
+assert_eq "mint refusal preserves the redirect target" "$(cat "$wi423_victim")" "DO-NOT-TRUNCATE"
+wi423_victim_before="$(cat "$wi423_victim")"
+eval "$wi423_real_snapshot"
+
+# 3) tenant_pg_password: the DATABASE_URL migration value comes from a
+#    tenant-side snapshot of lunarwing.env, and the mint commits through the
+#    tenant-side atomic writer (0600, tenant-owned shape).
+rm -f "$MT_FIXTURE/env/pg.secret" "$MT_FIXTURE/env/lunarwing.env"
+printf 'DATABASE_URL=postgres://lunarwing:migration-pw@127.0.0.1:10003/lunarwing\n' \
+  >"$MT_FIXTURE/env/lunarwing.env"
+chmod 600 "$MT_FIXTURE/env/lunarwing.env"
+assert_eq "migration password preserved from lunarwing.env" \
+  "$(tenant_pg_password fixture-tenant)" "migration-pw"
+assert_eq "minted pg.secret carries the preserved password" \
+  "$(cat "$MT_FIXTURE/env/pg.secret")" "migration-pw"
+assert_eq "minted pg.secret has the private mode" "$(stat -c %a "$MT_FIXTURE/env/pg.secret")" "600"
+# and the foreign-linked lunarwing.env shape dies before any pg.secret write
+rm -f "$MT_FIXTURE/env/pg.secret" "$MT_FIXTURE/env/lunarwing.env"
+ln -s "$wi423_victim" "$MT_FIXTURE/env/lunarwing.env"
+wi423_rc=0
+wi423_err="$( ( tenant_pg_password fixture-tenant ) 2>&1 )" || wi423_rc=$?
+if [[ "$wi423_rc" -eq 0 ]]; then
+  echo "  FAIL: tenant_pg_password read a foreign-linked lunarwing.env without dying"; failures=$((failures + 1))
+elif [[ "$wi423_err" != *"could not read $MT_FIXTURE/env/lunarwing.env as tenant 'fixture-tenant'"* ]]; then
+  echo "  FAIL: tenant_pg_password died without the lunarwing.env tenant-read refusal: $wi423_err"; failures=$((failures + 1))
+else
+  echo "  PASS: tenant_pg_password dies at the tenant-side lunarwing.env snapshot"
+fi
+assert_eq "lunarwing.env refusal wrote no pg.secret" \
+  "$(if [[ -e "$MT_FIXTURE/env/pg.secret" ]]; then echo written; else echo absent; fi)" "absent"
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+
+# 4) resolve_worker_auth_token reads WORKER_AUTH_TOKEN / GATEWAY_AUTH_TOKEN
+#    through the tenant-side per-key reader and takes the tenant name.
+tenant_cat() { cat -- "$2"; }   # plain reads for the clean-path controls
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+printf 'WORKER_AUTH_TOKEN=scoped-fixture-token\n' >"$MT_FIXTURE/env/lunarwing.env"
+chmod 600 "$MT_FIXTURE/env/lunarwing.env"
+assert_eq "resolver returns the scoped worker token" \
+  "$(resolve_worker_auth_token fixture-tenant "$MT_FIXTURE/env/lunarwing.env")" "scoped-fixture-token"
+# mint shape: missing key on a writable env is generated and persisted
+printf 'GATEWAY_AUTH_TOKEN=gateway-fixture-token\n' >"$MT_FIXTURE/env/lunarwing.env"
+chmod 600 "$MT_FIXTURE/env/lunarwing.env"
+wi423_minted="$(resolve_worker_auth_token fixture-tenant "$MT_FIXTURE/env/lunarwing.env" 2>/dev/null)"
+if [[ -n "$wi423_minted" && "$wi423_minted" == "$(grep '^WORKER_AUTH_TOKEN=' "$MT_FIXTURE/env/lunarwing.env" | cut -d= -f2-)" ]]; then
+  echo "  PASS: resolver mints and persists the scoped token"
+else
+  echo "  FAIL: resolver did not persist the minted scoped token"; failures=$((failures + 1))
+fi
+# refusal shape: a symlinked env path dies instead of leaking/falling back
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+ln -s "$wi423_victim" "$MT_FIXTURE/env/lunarwing.env"
+wi423_rc=0
+wi423_err="$( ( resolve_worker_auth_token fixture-tenant "$MT_FIXTURE/env/lunarwing.env" ) 2>&1 )" || wi423_rc=$?
+if [[ "$wi423_rc" -eq 0 ]]; then
+  echo "  FAIL: resolver read a foreign-linked env without dying"; failures=$((failures + 1))
+elif [[ "$wi423_err" != *"unsafe tenant env path: $MT_FIXTURE/env/lunarwing.env"* \
+  && "$wi423_err" != *"could not safely read WORKER_AUTH_TOKEN"* ]]; then
+  echo "  FAIL: resolver died without the tenant-side refusal: $wi423_err"; failures=$((failures + 1))
+else
+  echo "  PASS: resolver refuses a foreign-linked env path"
+fi
+
+# 5) study-notes mount sources and the preserved JID read tenant-side: the
+#    same symlinked env path refuses for the trio and the JID resolver.
+wi423_rc=0
+wi423_err="$( ( tenant_study_notes_home fixture-tenant ) 2>&1 )" || wi423_rc=$?
+if [[ "$wi423_rc" -eq 0 ]]; then
+  echo "  FAIL: study-notes home read a foreign-linked env without refusing"; failures=$((failures + 1))
+else
+  echo "  PASS: study-notes home read refuses a foreign-linked env"
+fi
+wi423_rc=0
+wi423_err="$( ( resolve_tenant_xmpp_jid fixture-tenant "" ) 2>&1 )" || wi423_rc=$?
+if [[ "$wi423_rc" -eq 0 ]]; then
+  echo "  FAIL: JID resolver read a foreign-linked env without dying"; failures=$((failures + 1))
+else
+  echo "  PASS: JID resolver refuses a foreign-linked env loudly"
+fi
+assert_eq "WI#423 refusals leave the foreign env untouched" "$(cat "$wi423_victim")" "$wi423_victim_before"
+rm -f "$MT_FIXTURE/env/lunarwing.env" "$wi423_victim"
+
+# Restore the env-writer stub shape the earlier sections rely on.
+tenant_pg_password()      { echo "pgpass-fixture"; }
 
 echo ""
 if [[ "$failures" -eq 0 ]]; then

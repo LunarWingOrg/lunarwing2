@@ -334,26 +334,51 @@ tenant_worker_openrc_stop_requested() {
 # keeps working; only brand-new tenants get a fresh random password. Use
 # `rotate-pg-password` to deliberately move an existing tenant onto a random one.
 # Never logged (repo rule).
+#
+# WI#423: root never resolves the tenant-writable env paths here. Both value
+# reads (pg.secret, the DATABASE_URL line of lunarwing.env) come from ONE
+# root-private snapshot per file taken as the tenant — a cross-tenant symlink
+# present for the read window is unreadable to the tenant-side cat and dies at
+# the snapshot instead of handing this render the other tenant's PG password.
+# The mint write commits through the tenant-side atomic writer, so a pre-placed
+# symlink at pg.secret can no longer redirect a root truncating write (the
+# original WI#390 shape). An existing-but-unreadable-as-tenant pg.secret
+# refuses loudly: such a file is unreadable to the tenant daemon too.
 tenant_pg_password() {
-  local name="$1" f envf existing pw
+  local name="$1" f envf existing pw secret_snapshot env_snapshot
   f="$(tenant_env_dir "$name")/pg.secret"
-  if [[ -s "$f" ]]; then
-    cat "$f"   # callers use $(...), which strips the trailing newline
+  envf="$(tenant_env_dir "$name")/lunarwing.env"
+
+  _snapshot_tenant_env "$name" "$f" secret_snapshot
+  pw="$(_pg_secret_from_snapshot "$secret_snapshot")" \
+    || { rm -f -- "$secret_snapshot"; return 1; }
+  rm -f -- "$secret_snapshot"
+  if [[ -n "$pw" ]]; then
+    printf '%s\n' "$pw"
     return 0
   fi
-  envf="$(tenant_env_dir "$name")/lunarwing.env"
-  if [[ -f "$envf" ]]; then
-    existing="$(sed -n 's#^DATABASE_URL=postgres://lunarwing:\([^@]*\)@.*#\1#p' "$envf" | head -1)"
-  fi
+
+  _snapshot_tenant_env "$name" "$envf" env_snapshot
+  existing="$(sed -n 's#^DATABASE_URL=postgres://lunarwing:\([^@]*\)@.*#\1#p' "$env_snapshot" | head -1)"
+  rm -f -- "$env_snapshot"
   if [[ -n "${existing:-}" ]]; then
     pw="$existing"                       # preserve an already-initialised DB's password
   else
     pw="$(generate_token | cut -c1-32)"  # fresh tenant → random 128-bit hex
   fi
-  mkdir -p "$(dirname "$f")"
-  ( umask 077; printf '%s\n' "$pw" > "$f" )
-  chown "$name:$name" "$f" 2>/dev/null || true
+  printf '%s\n' "$pw" | write_tenant_file_atomic "$name" "$f" 600 \
+    || die "could not safely write $f as tenant '$name' (unsafe path shape; WI#423)"
   printf '%s\n' "$pw"
+}
+
+# Read the single password line out of a root-private pg.secret snapshot.
+# Callers use $(...), which strips the trailing newline. A file carrying more
+# than one line is not a shape mt-admin ever wrote — refuse it.
+_pg_secret_from_snapshot() {  # <snapshot file>
+  local lines
+  lines="$(grep -c . -- "$1" 2>/dev/null)" || lines=0
+  [[ "$lines" -le 1 ]] || return 1
+  printf '%s' "$(<"$1")"
 }
 
 # ── Template rendering ────────────────────────

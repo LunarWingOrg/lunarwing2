@@ -87,6 +87,9 @@ OPENCODE_MODEL=final-model
 OPENCODE_BASE_URL=http://stale.example
 OPENCODE_BASE_URL=http://final.example
 EOF
+# WI#423: the study-notes/worker value reads go through the tenant-side
+# reader, which refuses group/other-readable env files — production shape.
+chmod 600 "$(tenant_env_dir test)/lunarwing.env"
 
 # Failed seeding must leave no partial final or staging directory.
 failed_state="$(tenant_state_dir test)/failed-study-notes"
