@@ -327,7 +327,10 @@ def _configure_network(config: TenantConfig) -> None:
         default=config.gateway_host,
     )
     config.docker_group = _q_confirm(
-        "Add tenant user to docker/podman group?", default=config.docker_group
+        "Add tenant user to docker/podman group? "
+        "(not needed for rootless podman; only to reach a shared "
+        "rootful daemon socket)",
+        default=config.docker_group,
     )
 
 

@@ -184,6 +184,20 @@ OPENCODE2_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE2_USERNS};ssh-agent-dir-ro"
 # workers; bump the contract to recreate existing containers with RW mounts.
 PEBBLE_ROOTLESS_LAUNCH_CONTRACT="ssh-agent-dir-ro"
 
+# WI#422 (run-164 KY-1): on rootless podman the pebble container runs as the
+# tenant uid already (container root maps to the invoking tenant), so a
+# workspace symlink swap grants nothing the tenant could not already reach.
+# On rootful hosts (docker, or LUNARWING_MT_ROOTLESS=false) the image has no
+# USER and ran as host root — the container runtime re-resolves the
+# /workspace bind source at EVERY start, so a tenant who swaps
+# ~/lunarwing/pebble-workspace for a symlink redirects host-root writes
+# through their own pebble tasks. The rootful lane now launches with
+# `--user <tenant uid>:<gid>` plus `--security-opt no-new-privileges`
+# (start_tenant_pebble); this distinct base contract forces start-tenant to
+# recreate every pre-fix root-running container once, on its next
+# start-tenant.
+PEBBLE_ROOTFUL_LAUNCH_CONTRACT="tenant-uid-user;workspace-toolchain-home;no-new-privileges"
+
 # ── Library sourcing ─────────────────────────────────────────────────────────
 #
 # mt-admin is split into sourced libraries under mt-admin-lib/ (structure kept
@@ -257,7 +271,9 @@ Manages OS users, port allocation, per-tenant services, and builds.
 Commands:
   add-tenant <name> [options]      Create user, allocate ports, clone repo,
                                    generate env, render and install services
-    --docker-group                 Add user to docker/podman group
+    --docker-group                 Add user to docker/podman group (opt-in:
+                                   not needed for rootless podman; only to
+                                   reach a shared rootful daemon socket)
     --xmpp-jid <jid>              XMPP JID for this tenant
     --xmpp-password <pass>        XMPP password (generated if omitted)
     --llm-api-key <key>            API key for the LLM backend provider

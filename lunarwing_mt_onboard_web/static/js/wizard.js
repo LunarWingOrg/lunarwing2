@@ -73,7 +73,7 @@
   // -- Provision (multi-step) ----------------------------------------------
   function mountProvision(host, opts) {
     const data = {
-      name: '', gateway_host: '127.0.0.1', docker_group: true,
+      name: '', gateway_host: '127.0.0.1', docker_group: false,
       enable_darkirc: false,
       xmpp_enabled: false, xmpp_jid: '', xmpp_password: '', xmpp_allow_from: '',
       gotify_enabled: false, gotify_url: '', gotify_title: '',
@@ -149,7 +149,7 @@
         placeholder: 'sphinx', hint: 'lowercase alphanumeric + hyphens',
       }));
       b.appendChild(textField(data, 'gateway_host', 'Gateway bind host/IP', { placeholder: '127.0.0.1' }));
-      b.appendChild(checkField(data, 'docker_group', 'Add tenant user to docker/podman group'));
+      b.appendChild(checkField(data, 'docker_group', 'Add tenant user to docker/podman group (not needed for rootless podman; only for a shared rootful daemon socket)'));
     }
 
     function stepChannels(b) {
@@ -390,7 +390,7 @@
       workers.appendChild(checkField(data, 'with_toolchains', 'Include worker toolchains'));
       workers.appendChild(checkField(data, 'with_pebble', 'Build pebble worker'));
       workers.appendChild(checkField(data, 'with_vision', 'Restore LunarVision'));
-      workers.appendChild(checkField(data, 'docker_group', 'Add tenant user to docker/podman group'));
+      workers.appendChild(checkField(data, 'docker_group', 'Add tenant user to docker/podman group (not needed for rootless podman)'));
       b.appendChild(workers);
       b.appendChild(textField(data, 'owner_scope', 'Legacy owner scope (optional)', {}));
     }, 'Run import', Object.assign(

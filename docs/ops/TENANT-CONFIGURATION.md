@@ -654,7 +654,6 @@ tail -20 /home/<tenant>/lunarwing/logs/lunarwing.log
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh add-tenant myagent \
-  --docker-group \
   --llm-api-key sk-your-key \
   --tensorzero-url http://your-tz-host:3000/openai/v1 \
   --xmpp-jid myagent@xmpp.example.com \

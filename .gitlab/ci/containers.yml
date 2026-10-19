@@ -48,6 +48,17 @@
     - container-build
   stage: containers
   timeout: 2h
+  # Bounded auto-retry for transient scan flakes: pipeline 5263's
+  # worker-opencode-scan was SIGKILLed (exit 137) by the runner host mid
+  # SBOM call after both gates had already passed, and every such failure
+  # needed a manual re-run. The scan is read-only (it publishes nothing)
+  # and re-verifies the same immutable digest, so one automatic re-run
+  # cannot promote anything a fresh manual run could not; a real CRITICAL
+  # finding fails every attempt the same way. The publication jobs keep
+  # their pinned retry: 0 — only the scan retries.
+  retry:
+    max: 1
+    when: [always]
   variables:
     TRIVY_CACHE_DIR: "$CI_PROJECT_DIR/.trivy-cache"
     TRIVY_NO_PROGRESS: "true"

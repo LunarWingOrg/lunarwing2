@@ -58,7 +58,9 @@ Options (all also settable via the matching ENV var):
                             there is no built-in default anymore)
   --tensorzero-url <url>    Upstream TensorZero URL (WI#330: no built-in default)
   --gotify-url <url>        custom Gotify URL            (default: none)
-  --[no-]docker-group       add user to docker group     (default: on)
+  --[no-]docker-group       add user to docker group     (default: off —
+                            not needed for rootless podman; only to reach a
+                            shared rootful daemon socket)
   --[no-]pebble             build pebble worker image    (default: on)
   --[no-]wasm               build + install all WASM channels/tools (default: on)
   --[no-]ensure-toolchain   install cargo-component for the tenant if missing (default: on)
@@ -80,7 +82,9 @@ LLM_API_KEY="${LLM_API_KEY:-}"
 LLM_BASE_URL="${LLM_BASE_URL:-}"
 TENSORZERO_URL="${TENSORZERO_URL:-}"
 GOTIFY_URL="${GOTIFY_URL:-}"
-DOCKER_GROUP="${DOCKER_GROUP:-true}"
+# WI#389: rootless podman (the MT default runtime) needs no docker group
+# membership, so the tenant user is NOT added by default.
+DOCKER_GROUP="${DOCKER_GROUP:-false}"
 WITH_PEBBLE="${WITH_PEBBLE:-true}"
 WITH_WASM="${WITH_WASM:-true}"
 ENSURE_WASM_TOOLCHAIN="${ENSURE_WASM_TOOLCHAIN:-true}"

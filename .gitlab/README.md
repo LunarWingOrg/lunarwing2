@@ -260,6 +260,53 @@ before assuming real nondeterminism; directory mtimes of install prefixes are
 the prime suspect, and the fix is the same normalization in the offending
 `RUN`.
 
+## worker candidate apt fetches (snapshot.debian.org flake)
+
+Symptom — a `worker-*-candidate` fails inside BuildKit with:
+
+```
+#8 ERROR: process "/bin/sh -c ... apt-get ... install -y --no-install-recommends
+  python3 make g++ ca-certificates; ..." did not complete successfully: exit code: 100
+```
+
+and the trace shows `Get:`/`Err:` lines against `snapshot.debian.org` that
+stop partway (pipeline 4140 lost `worker-kimi-candidate` to one such fetch;
+the downstream scan then failed on the missing-`worker-image.env` guard. Not
+this class: pipeline 4149's three candidate attempts all failed the same
+builder-stage `npm test` deterministically — a test failure at that commit,
+not a dropped fetch).
+
+Root cause: the worker images install every Debian package from the pinned
+`snapshot.debian.org` archive — the same best-effort, throttled service the
+`worker-kimi-ts` lane provisions from — but the Dockerfile `apt-get` calls
+carried no retry options, so a single dropped fetch failed a multi-hour
+candidate. Since 2026-10-19 every `apt-get update`/`apt-get install` in all
+four worker Dockerfiles (kimi, opencode, opencode2, pebble) runs with
+`Acquire::Retries=5`/`Acquire::http::Timeout=60`, the same options the lane
+has used since the HE-4/HN-8 hardening. A full snapshot outage still fails
+the build until the service recovers (retry the job).
+
+## worker scan transient kills (exit 137)
+
+Symptom — a `worker-*-scan` fails with `ERROR: Job failed: exit code 137`
+(SIGKILL) after the CRITICAL gate already passed, with
+`worker-sbom.cdx.json: no matching files` in the artifact upload (pipeline
+5263's `worker-opencode-scan` was killed mid SBOM call by the runner host;
+`worker-vulnerabilities.json` had finished uploading, the
+`gl-container-scanning-report.json` upload was terminated by the kill).
+
+Root cause: runner-host memory pressure killing the trivy container — the
+same OOM class as the Rust runner section above, arriving through the scan
+job. Since 2026-10-19 the `.worker-scan` template auto-retries once
+(`retry: {max: 1, when: [always]}`): the scan is read-only (it publishes
+nothing) and re-verifies the same immutable candidate digest, so one
+automatic re-run cannot promote anything a fresh manual run could not, and a
+real CRITICAL finding fails every attempt the same way. The retry policy is
+pinned by value in `validate_config.py` (`WORKER_SCAN_PINNED_VALUES`); the
+candidate and promotion jobs keep their pinned `retry: 0`. If a scan fails
+all attempts with exit 137, treat it as host memory pressure: check that
+host's concurrent builds before retrying manually.
+
 ## Required jobs
 
 - CI composition, shell syntax, shellcheck, Python syntax, registry JSON, version

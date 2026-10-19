@@ -47,7 +47,7 @@ Fix any `[FAIL]` items before proceeding.
 Add all tenants at once. Names are comma-separated and will be lowercased automatically.
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenants "Ruffles,Miyuki,Sparkie,Starforce" --docker-group
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenants "Ruffles,Miyuki,Sparkie,Starforce"
 ```
 
 > **Optional services are explicit selections.** Add `--enable-proxy` or
@@ -233,7 +233,7 @@ Run `sudo scripts/lunarwing-mt-admin.sh doctor` to verify all dependencies.
 cd /path/to/lunarwing/ic
 
 # Add a tenant (creates user, allocates ports, clones repo, generates env, starts PG)
-sudo scripts/lunarwing-mt-admin.sh add-tenant ruffles --docker-group
+sudo scripts/lunarwing-mt-admin.sh add-tenant ruffles
 
 # Build binaries for the tenant (flock-serialized, OOM-safe)
 sudo scripts/lunarwing-mt-admin.sh build-tenant ruffles
@@ -255,7 +255,7 @@ sudo scripts/lunarwing-mt-admin.sh tokens ruffles
 
 ```bash
 # Add four tenants in one command
-sudo scripts/lunarwing-mt-admin.sh add-tenants "Ruffles,Miyuki,Sparkie,Starforce" --docker-group
+sudo scripts/lunarwing-mt-admin.sh add-tenants "Ruffles,Miyuki,Sparkie,Starforce"
 
 # Build all tenants sequentially
 sudo scripts/lunarwing-mt-admin.sh build-all
@@ -849,7 +849,9 @@ backup, migration, DarkIRC, and configuration subcommand.
 add-tenant <name> [options]      Create user, allocate ports, clone repo,
                                  generate env, render and install services
 add-tenants <names> [options]    Apply the same options to comma-separated names
-  --docker-group                 Add user to docker/podman group
+  --docker-group                 Add user to docker/podman group (opt-in:
+                                 not needed for rootless podman; only to
+                                 reach a shared rootful daemon socket)
   --enable-proxy                 Provision the optional TensorZero proxy
   --enable-darkirc               Provision DarkIRC daemon and adapter
   --with-pebble                  Select Pebble for these tenants
@@ -1016,7 +1018,8 @@ sudo -u <tenant> -H bash -c '. "$HOME/.cargo/env" 2>/dev/null || export PATH="$H
 
 ### Tenant user can't access Docker
 
-- Verify group membership: `id <tenant>`
+- Rootless podman needs no group membership — `--docker-group` is only for tenants that must reach a shared rootful daemon socket, and it is never added by default
+- Verify group membership after an explicit opt-in: `id <tenant>`
 - User may need to log out and back in after being added to the docker group
 - For Podman rootless, ensure `subuid`/`subgid` ranges are allocated: `grep <tenant> /etc/subuid`
 
