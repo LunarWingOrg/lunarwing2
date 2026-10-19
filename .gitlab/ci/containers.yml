@@ -68,12 +68,18 @@
       fi
     - set -a; . ./worker-image.env; set +a
     - test -n "$WORKER_IMAGE_REF" && test -n "$WORKER_IMAGE_DIGEST"
-    - trivy image --format template --template "@/contrib/gitlab.tpl" --output gl-container-scanning-report.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
+    # TRIVY_CACHE_DIR is inside the checkout, and trivy reuses any DB there
+    # whose metadata says it is fresh: start from an empty cache so neither a
+    # committed .trivy-cache nor a DB fetched by an earlier call can stand in
+    # for the real one. Every call takes --config /dev/null, because the
+    # first call fills the cache the gate then reuses (MR !1750 review).
+    - rm -rf "$TRIVY_CACHE_DIR"
+    - trivy image --config /dev/null --format template --template "@/contrib/gitlab.tpl" --output gl-container-scanning-report.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
     # --config /dev/null: trivy otherwise loads trivy.yaml from its working
     # directory (the checkout), which can set ignore-unfixed and hide every
     # unfixed CRITICAL with no expiry (WI#361).
     - trivy image --config /dev/null --ignorefile "$CI_PROJECT_DIR/.gitlab/trivy-ignore" --exit-code 1 --severity CRITICAL --format json --output worker-vulnerabilities.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
-    - trivy image --format cyclonedx --output worker-sbom.cdx.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
+    - trivy image --config /dev/null --format cyclonedx --output worker-sbom.cdx.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
   artifacts:
     when: always
     expire_in: 30 days

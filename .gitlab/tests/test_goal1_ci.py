@@ -2788,9 +2788,13 @@ class TrivyIgnoreTests(unittest.TestCase):
 
     def test_non_cve_id_is_caught(self):
         # Plain-file IDs apply to every scanner (vuln, secret, misconfig,
-        # license); only CVE IDs belong here (run-143 JP-2).
-        errors = self.errors("GHSA-abcd-efgh-ijkl exp:2027-04-17\n")
-        self.assertTrue(any("must match" in error for error in errors))
+        # license); only CVE IDs belong here (run-143 JP-2). The second ID
+        # has CVE-shaped digits, so a regex that only relaxes the prefix
+        # (GO-, PYSEC-, RUSTSEC-) is caught too (MR !1750 review).
+        for entry in ("GHSA-abcd-efgh-ijkl exp:2027-04-17", "RUSTSEC-2026-0001 exp:2027-04-17"):
+            with self.subTest(entry):
+                errors = self.errors(entry + chr(10))
+                self.assertTrue(any("must match" in error for error in errors))
 
     def test_extra_field_is_caught(self):
         errors = self.errors(f"{self.VALID} # trailing note\n")
@@ -2852,10 +2856,6 @@ class TrivyGateInputTests(unittest.TestCase):
         config.validate_trivy_gate_inputs(merged, errors)
         return errors
 
-    def scan_job(self):
-        job = copy.deepcopy(self.merged[".worker-scan"])
-        return job
-
     def test_real_tree_passes(self):
         self.assertEqual(self.errors(self.merged), [])
 
@@ -2884,12 +2884,15 @@ class TrivyGateInputTests(unittest.TestCase):
         self.assertTrue(any(f"{job} variables set TRIVY_IGNORE_UNFIXED" in error for error in self.errors(merged)))
 
     def test_trivy_variable_in_scan_job_rule_is_caught(self):
-        merged = copy.deepcopy(self.merged)
-        job = ".worker-scan"
-        rules = merged[job].get("rules", [])
-        self.assertTrue(rules)
-        rules[0]["variables"] = dict(rules[0].get("variables", {}), TRIVY_IGNORE_UNFIXED="true")
-        self.assertTrue(any(f"{job} rule variables set TRIVY_IGNORE_UNFIXED" in error for error in self.errors(merged)))
+        # A job's own rules replace the template's, so the job case is not
+        # the template case (MR !1750 review).
+        for job in (".worker-scan", "worker-kimi-scan"):
+            with self.subTest(job):
+                merged = copy.deepcopy(self.merged)
+                rules = copy.deepcopy(merged[".worker-scan"]["rules"])
+                rules[0]["variables"] = {"TRIVY_IGNORE_UNFIXED": "true"}
+                merged[job]["rules"] = rules
+                self.assertTrue(any(f"{job} rule variables set TRIVY_IGNORE_UNFIXED" in error for error in self.errors(merged)))
 
     def test_trivy_variable_in_workflow_rule_is_caught(self):
         merged = copy.deepcopy(self.merged)
@@ -2902,12 +2905,124 @@ class TrivyGateInputTests(unittest.TestCase):
         merged["variables"] = dict(merged.get("variables", {}), TRIVY_IGNORE_UNFIXED="true")
         self.assertTrue(any("top-level variables set TRIVY_IGNORE_UNFIXED" in error for error in self.errors(merged)))
 
-    def test_allowlisted_trivy_variable_passes(self):
+    def test_allowlisted_trivy_variable_value_is_pinned(self):
+        # The cache dir decides which vulnerability DB the gate trusts, so
+        # an allowlisted key is pinned by value too (MR !1750 review).
         merged = copy.deepcopy(self.merged)
         merged[".worker-scan"]["variables"] = dict(
             merged[".worker-scan"].get("variables", {}), TRIVY_CACHE_DIR="/tmp/trivy"
         )
-        self.assertEqual(self.errors(merged), [])
+        self.assertTrue(any(".worker-scan variables must be exactly" in error for error in self.errors(merged)))
+
+    def test_gate_line_suffix_or_extra_line_is_caught(self):
+        # MR !1750 review: the startswith() pin let every one of these pass,
+        # and each makes trivy (or the job) exit 0 on an unfixed CRITICAL.
+        script = list(config.WORKER_SCAN_SCRIPT)
+        gate = next(
+            index for index, line in enumerate(script)
+            if line.startswith(config.TRIVY_GATE_COMMAND)
+        )
+        cases = {
+            "--ignore-unfixed": script[:gate] + [script[gate] + " --ignore-unfixed"] + script[gate + 1:],
+            "--exit-code 0": script[:gate] + [script[gate] + " --exit-code 0"] + script[gate + 1:],
+            "or-true": script[:gate] + [script[gate] + " || true"] + script[gate + 1:],
+            "exit-0-first": script[:gate] + ["exit 0"] + script[gate:],
+            "export": script[:gate] + ["export TRIVY_IGNORE_UNFIXED=true"] + script[gate:],
+        }
+        for label, mutated in cases.items():
+            with self.subTest(label):
+                merged = copy.deepcopy(self.merged)
+                merged[".worker-scan"]["script"] = mutated
+                self.assertTrue(any(".worker-scan must run the CRITICAL gate" in error for error in self.errors(merged)))
+
+    def test_every_trivy_call_ignores_checkout_config_and_cache(self):
+        # The first trivy call fills the cache the gate reuses, and a
+        # committed .trivy-cache DB with a future NextUpdate is never
+        # re-downloaded (MR !1750 review).
+        for label, line in (
+            ("report call config", next(line for line in config.WORKER_SCAN_SCRIPT if "gitlab.tpl" in line)),
+            ("cache reset", 'rm -rf "$TRIVY_CACHE_DIR"'),
+        ):
+            with self.subTest(label):
+                merged = copy.deepcopy(self.merged)
+                script = merged[".worker-scan"]["script"]
+                index = script.index(line)
+                if label == "cache reset":
+                    del script[index]
+                else:
+                    script[index] = line.replace("--config /dev/null ", "")
+                self.assertTrue(any("must run the CRITICAL gate" in error for error in self.errors(merged)))
+
+    def test_scan_job_may_only_wire_extends_and_needs(self):
+        # GitLab replaces the template's script and merges variables from
+        # the job, and a job allow_failure applies when the tag rule sets
+        # none; the template-only view saw none of them (MR !1750 review).
+        overrides = {
+            "script": ["echo skipped"],
+            "before_script": ["export TRIVY_IGNORE_UNFIXED=true"],
+            "after_script": ["cp clean.json worker-vulnerabilities.json"],
+            "allow_failure": True,
+            "variables": {"PATH": "$CI_PROJECT_DIR/fakebin:/usr/bin:/bin"},
+            "image": {"name": "docker.io/aquasec/trivy:0.74.0@sha256:" + "0" * 64, "entrypoint": [""]},
+            "timeout": "1h",
+        }
+        for key, value in overrides.items():
+            with self.subTest(key):
+                merged = copy.deepcopy(self.merged)
+                merged["worker-kimi-scan"][key] = value
+                self.assertTrue(any(
+                    f"worker-kimi-scan must not set job keys ['{key}']" in error
+                    for error in self.errors(merged)
+                ))
+
+    def test_scan_job_image_override_is_caught_by_value(self):
+        merged = copy.deepcopy(self.merged)
+        merged["worker-kimi-scan"]["image"] = {"name": "docker.io/aquasec/trivy:0.74.0@sha256:" + "0" * 64, "entrypoint": [""]}
+        self.assertTrue(any("worker-kimi-scan image must be exactly" in error for error in self.errors(merged)))
+
+    def test_second_extends_parent_is_caught(self):
+        for label, parent in (
+            ("variables", {"variables": {"TRIVY_IGNORE_UNFIXED": "true"}}),
+            ("harmless", {"timeout": "1h"}),
+        ):
+            with self.subTest(label):
+                merged = copy.deepcopy(self.merged)
+                merged[".scan-tuning"] = parent
+                merged["worker-kimi-scan"]["extends"] = [".worker-scan", ".scan-tuning"]
+                self.assertTrue(any("worker-kimi-scan must extend exactly .worker-scan" in error for error in self.errors(merged)))
+
+    def test_template_hooks_and_allow_failure_are_caught(self):
+        for key, value in (
+            ("before_script", ["export TRIVY_IGNORE_UNFIXED=true"]),
+            ("after_script", ["true"]),
+            ("allow_failure", True),
+            ("hooks", {"pre_get_sources_script": ["true"]}),
+        ):
+            with self.subTest(key):
+                merged = copy.deepcopy(self.merged)
+                merged[".worker-scan"][key] = value
+                self.assertTrue(any(f".worker-scan must not carry job keys ['{key}']" in error for error in self.errors(merged)))
+
+    def test_template_extends_is_caught(self):
+        merged = copy.deepcopy(self.merged)
+        merged[".scan-base"] = {"timeout": "1h"}
+        merged[".worker-scan"]["extends"] = ".scan-base"
+        self.assertTrue(any(".worker-scan must not set ['extends']" in error for error in self.errors(merged)))
+
+    def test_release_tag_rule_cannot_be_advisory(self):
+        for key, value in (("allow_failure", True), ("when", "manual"), ("variables", {"X": "1"})):
+            with self.subTest(key):
+                merged = copy.deepcopy(self.merged)
+                rule = next(rule for rule in merged[".worker-scan"]["rules"] if "CI_COMMIT_TAG" in rule.get("if", ""))
+                rule[key] = value
+                self.assertTrue(any("release-tag rule carrying only `if`" in error for error in self.errors(merged)))
+
+    def test_rule_variables_are_refused(self):
+        # Any rules:variables entry (PATH as well as TRIVY_*) reaches the gate.
+        merged = copy.deepcopy(self.merged)
+        rule = next(rule for rule in merged[".worker-scan"]["rules"] if "CI_DEFAULT_BRANCH" in rule.get("if", ""))
+        rule["variables"] = {"PATH": "/x"}
+        self.assertTrue(any(".worker-scan rules must not set variables" in error for error in self.errors(merged)))
 
     def test_main_runs_the_gate_input_validator(self):
         # GV-2 precedent: deleting the main() call must not pass the suite.

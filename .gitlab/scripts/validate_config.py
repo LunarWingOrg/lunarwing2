@@ -35,6 +35,49 @@ TRIVY_GATE_COMMAND = (
     "--exit-code 1 --severity CRITICAL "
 )
 TRIVY_SCAN_VARIABLES = {"TRIVY_CACHE_DIR", "TRIVY_NO_PROGRESS", "TRIVY_PASSWORD", "TRIVY_USERNAME"}
+# MR !1750 review (run 162): the run-143 JP-1 prototype pinned only a prefix
+# of one gate line and read only the template's own script and variables. A
+# suffix (--ignore-unfixed, --exit-code 0, || true), an earlier `exit 0` or
+# `export TRIVY_...` line, a before_script, a scan job's own script,
+# variables or allow_failure, or a second extends parent all kept it green.
+# Every scan job's extends-resolved script and inputs are pinned exactly, and
+# the jobs may add only their needs wiring. A deliberate change edits these
+# constants in the same commit.
+WORKER_SCAN_SCRIPT = [
+    """if [ ! -f ./worker-image.env ]; then
+  echo "ERROR: worker-image.env is missing — the candidate job for this worker failed or did not publish an image." >&2
+  echo "       Finish the matching worker-*-candidate job successfully before retrying this scan." >&2
+  exit 1
+fi
+""",
+    "set -a; . ./worker-image.env; set +a",
+    'test -n "$WORKER_IMAGE_REF" && test -n "$WORKER_IMAGE_DIGEST"',
+    'rm -rf "$TRIVY_CACHE_DIR"',
+    'trivy image --config /dev/null --format template --template "@/contrib/gitlab.tpl" '
+    '--output gl-container-scanning-report.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"',
+    TRIVY_GATE_COMMAND
+    + '--format json --output worker-vulnerabilities.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"',
+    'trivy image --config /dev/null --format cyclonedx --output worker-sbom.cdx.json '
+    '"$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"',
+]
+WORKER_SCAN_PINNED_VALUES = {
+    "image": {
+        "name": "docker.io/aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969",
+        "entrypoint": [""],
+    },
+    "tags": ["container-build"],
+    "variables": {
+        "TRIVY_CACHE_DIR": "$CI_PROJECT_DIR/.trivy-cache",
+        "TRIVY_NO_PROGRESS": "true",
+        "TRIVY_PASSWORD": "$CI_REGISTRY_PASSWORD",
+        "TRIVY_USERNAME": "$CI_REGISTRY_USER",
+    },
+}
+WORKER_SCAN_EFFECTIVE_KEYS = frozenset({
+    "artifacts", "image", "needs", "rules", "script", "stage", "tags",
+    "timeout", "variables",
+})
+WORKER_SCAN_JOB_KEYS = frozenset({"extends", "needs"})
 DELIVERABLE_STATUSES = {"production", "experimental", "fixture", "mirror", "retired", "staging"}
 DELIVERABLE_REQUIRED_KEYS = ("name", "status", "owner", "manifest", "lockfile", "targets", "ci", "triggers")
 EXPECTED_RUST_VERSION = "1.96.1"
@@ -1286,14 +1329,7 @@ def validate_trivy_gate_inputs(merged: dict, errors: list[str]) -> None:
     set ignore-unfixed (or vex, skip-dirs, ...) and hide every unfixed
     CRITICAL with no expiry. Pin the gate command and allowlist TRIVY_*
     variables in every place GitLab can set them for a scan job."""
-    scan = merged.get(".worker-scan")
-    scan = scan if isinstance(scan, dict) else {}
-    script = scan.get("script", [])
-    script = [script] if isinstance(script, str) else script
-    if not any(isinstance(line, str) and line.startswith(TRIVY_GATE_COMMAND) for line in script):
-        errors.append(
-            ".worker-scan must run the CRITICAL gate as " + repr(TRIVY_GATE_COMMAND.strip())
-        )
+    validate_worker_scan_pins(merged, errors)
     sources = [("top-level variables", merged.get("variables"))]
     workflow = merged.get("workflow")
     if isinstance(workflow, dict):
@@ -1316,6 +1352,64 @@ def validate_trivy_gate_inputs(merged: dict, errors: list[str]) -> None:
                     f"{label} set {key}; only {sorted(TRIVY_SCAN_VARIABLES)} "
                     "may reach the worker-scan trivy run"
                 )
+
+
+def validate_worker_scan_shape(name: str, effective: dict, errors: list[str]) -> None:
+    unexpected = sorted(set(effective) - WORKER_SCAN_EFFECTIVE_KEYS)
+    if unexpected:
+        errors.append(
+            f"{name} must not carry job keys {unexpected}; hooks, before_script, "
+            "after_script, allow_failure, when or inherit can hollow out the gate"
+        )
+    if effective.get("script") != WORKER_SCAN_SCRIPT:
+        errors.append(
+            f"{name} must run the CRITICAL gate inside exactly WORKER_SCAN_SCRIPT "
+            f"(gate line {TRIVY_GATE_COMMAND.strip()!r} ...)"
+        )
+    for key, expected in WORKER_SCAN_PINNED_VALUES.items():
+        if effective.get(key) != expected:
+            errors.append(f"{name} {key} must be exactly {expected!r}")
+    rules = effective.get("rules")
+    rules = rules if isinstance(rules, list) else []
+    if any(isinstance(rule, dict) and "variables" in rule for rule in rules):
+        errors.append(f"{name} rules must not set variables; they reach the trivy gate")
+    tag_rules = [
+        rule for rule in rules
+        if isinstance(rule, dict) and "CI_COMMIT_TAG" in str(rule.get("if", ""))
+    ]
+    if len(tag_rules) != 1 or set(tag_rules[0]) != {"if"}:
+        errors.append(
+            f"{name} needs exactly one release-tag rule carrying only `if`; a rule "
+            "allow_failure or when there makes the release gate advisory"
+        )
+
+
+def validate_worker_scan_pins(merged: dict, errors: list[str]) -> None:
+    """MR !1750 review (run 162): pin the scan template and every
+    worker-*-scan job by their extends-resolved view, the way
+    validate_advisory_gates_not_optional pins the advisory gates."""
+    template = merged.get(".worker-scan")
+    if not isinstance(template, dict):
+        errors.append(".worker-scan template missing")
+        return
+    own = sorted(set(template) - WORKER_SCAN_EFFECTIVE_KEYS)
+    if own:
+        errors.append(f".worker-scan must not set {own}")
+    validate_worker_scan_shape(".worker-scan", resolve_extends(template, merged), errors)
+    for worker in WORKER_NAMES:
+        name = f"worker-{worker}-scan"
+        job = merged.get(name)
+        if not isinstance(job, dict):
+            continue  # validate_worker_publication reports the missing job
+        own = sorted(set(job) - WORKER_SCAN_JOB_KEYS)
+        if own:
+            errors.append(
+                f"{name} must not set job keys {own}; only extends and needs may "
+                "differ from .worker-scan"
+            )
+        if job.get("extends") not in (".worker-scan", [".worker-scan"]):
+            errors.append(f"{name} must extend exactly .worker-scan and nothing else")
+        validate_worker_scan_shape(name, resolve_extends(job, merged), errors)
 
 
 def cache_policies(job: object) -> list[str]:

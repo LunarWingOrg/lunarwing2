@@ -503,11 +503,16 @@ date in Trivy's own syntax (`CVE-… exp:YYYY-MM-DD`, one entry per line) in
 prefix and stops suppressing an entry on its date (00:00 UTC), so expired
 entries fail the scan gate again until the finding is re-reviewed (WI#361:
 the earlier `expiring:` spelling was never Trivy syntax, so those entries
-silently never expired). The scan runs with `--config /dev/null`, so neither
-a checkout-root `trivy.yaml` nor any un-allowlisted `TRIVY_*` variable can
-hide an unfixed CRITICAL behind `ignore-unfixed`. `validate_config.py`
-rejects any non-comment line in another shape and any expiry more than six
-months out.
+silently never expired). Every trivy call in the scan runs with
+`--config /dev/null` from an emptied `TRIVY_CACHE_DIR`, and
+`validate_config.py` pins the scan template's script, image, tags and
+variables exactly and lets the `worker-*-scan` jobs add only `needs`, so a
+checkout-root `trivy.yaml`, a committed `.trivy-cache` database, or a
+`TRIVY_*` variable in the committed CI YAML cannot hide a CRITICAL.
+Variables set outside the YAML (project or group CI/CD settings,
+`git push -o ci.variable`, runner configuration) are not visible to the
+validator. `validate_config.py` also rejects any non-comment line in another
+shape and any expiry more than six months out.
 
 `skip-version-check` is inert unless a maintainer also supplies
 `ALLOW_VERSION_CHECK_SKIP=1`; commit messages cannot bypass version policy.
