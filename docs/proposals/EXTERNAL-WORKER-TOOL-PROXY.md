@@ -4,10 +4,11 @@ Status: **partial**, hardened per the MR !1506 (CQ-1..CQ-9),
 MR !1521 (DD-1..DD-10), MR !1533 (DP-1..DP-6), and MR !1540 (DX-1..DX-6)
 reviews. The hub side is merged; the worker-side bridge (design item 2) is
 implemented for the **kimi** worker lane (MCP shim), the **opencode**
-worker lane (v1 serve-process plugin), and the **opencode2** worker lane
-(v2 serve-process plugin). Real-worker acceptance (AC1/AC2
-against a live tenant with a rebuilt worker image) and the
-pebble lane remain open. Cron-mode tick authority is
+worker lane (v1 serve-process plugin), the **opencode2** worker lane
+(v2 serve-process plugin), and the **pebble** worker lane (MCP shim in the
+Rust bridge binary). Real-worker acceptance (AC1/AC2
+against a live tenant with a rebuilt worker image) remains open.
+Cron-mode tick authority is
 split out per MR !1506 CQ-10 (`cron.tool_allowlist`).
 
 ## What this is
@@ -368,7 +369,7 @@ Plus a structured tracing line per completed call.
   safety validation as in-process calls, and every worker-controlled field is
   bounded before persistence or logging.
 
-## Worker-side contract (kimi, opencode and opencode2 lanes implemented)
+## Worker-side contract (kimi, opencode, opencode2 and pebble lanes implemented)
 
 A worker opts in by sending `tool_list` after `ready`, then issuing
 `tool_call` frames (with `task_id` set to the job id from `task_request`)
@@ -530,9 +531,52 @@ plugin, but on v2's rewritten plugin API — the v1 file-plugin shape
   auto-discovers `.opencode/plugin(s)` directories next to it. The hub
   stays authoritative either way.
 
-The pebble lane has no bridge yet; the same pattern applies (its
-`lunarwing_bridge.ts` equivalent needs the relay + frame routing, plus a
-registration mechanism). Phase 2 hub-mediated
+The **pebble** lane implements the same wire contract in Rust, inside the
+`pebble4lunarwing` bridge binary — the kimi MCP-shim shape translates
+directly because pebble discovers stdio MCP servers from
+`$PEBBLE_CONFIG_HOME/settings.json` (`mcpServers`), spawns a fresh child
+for tool discovery at each `pebble prompt` start and another for each tool
+call, and passes its process env through to MCP
+children (verified against the pinned upstream
+`crates/runtime/src/mcp_stdio.rs`: the spawn overlays the configured `env`
+map on the inherited environment — there is no `env_clear`):
+
+- `pebble4lunarwing/src/tool_proxy.rs` — the same bridge-side relay
+  (identical IPC shapes, identifier bounds, locally pre-checked 256 KiB
+  `tool_call` frame cap, EF-2 never-throw lifecycle, EF-9/EV-4
+  fail-fast-on-hub-close). Because this lane's bridge serves one hub
+  connection per accepted socket, the kimi relay's per-socket pending map
+  collapses to one pending table per connection; `drop_hub` on connection
+  close is the EV-4 equivalent. The socket-path suffix hash is FNV-1a
+  (dependency-free; not a security boundary — the proxy dir is a same-uid
+  shared /tmp tree, EF-1/EF-2). Over-cap IPC lines are discarded to their
+  terminating newline before the told-off reply is written, and every reply
+  is followed by a drain to EOF, so closing can never RST the reply away.
+- `pebble4lunarwing/src/mcp_shim.rs` — the same thin stdio MCP server as
+  the kimi lane (`pebble4lunarwing mcp-shim` subcommand): `initialize`,
+  `ping`, `tools/list`, `tools/call` over newline-delimited JSON-RPC, hub
+  `parameters` mapped to MCP `inputSchema`, denied/error surfaced as MCP
+  tool errors carrying the hub's sanitized reason, zero tools advertised
+  without the proxy env, and the EV-3 1 MiB stdin line cap with
+  discard-to-newline and edge-based id recovery (in UTF-8 bytes, strictly
+  tighter than the kimi lane's UTF-16 code units for non-ASCII).
+- Registration is baked into the image: `config/settings.json` installs to
+  `/etc/lunarwing/pebble/settings.json` (root-owned, mode 0444; this does
+  not protect it from task code, which runs as container root until
+  WI#400, and pebble keeps its own state files in this directory) and
+  `ENV PEBBLE_CONFIG_HOME=/etc/lunarwing/pebble` points pebble's
+  user-scope config discovery at it. The bridge's executor injects
+  `LUNARWING_TASK_ID` / `LUNARWING_TOOL_PROXY_SOCKET` into the pebble child
+  AFTER task-supplied env so they cannot be shadowed, and both keys join
+  `AGENT_AUTH_TOKEN` in the reserved set stripped from inherited and
+  task-supplied env (the WI#373 pattern), so a task can neither inherit a
+  stale socket path nor forge one when the relay is down. Pebble also
+  merges project-scope `.pebble/settings.json` from the task workspace
+  (model-writable), so workspace content can shadow or disable the
+  `lunarwing` entry — same exposure class as the kimi lane's loader
+  (EF-10); the hub stays authoritative.
+
+Phase 2 hub-mediated
 cross-thread coordination (KV + advisory locks) is also still open.
 
 ## Tests
@@ -621,6 +665,28 @@ cross-thread coordination (KV + advisory locks) is also still open.
   and relayed a scripted `memory_read` to the hub and back — under
   `--network=none`.
 
+- `pebble4lunarwing` (worker side, Rust; the `worker-pebble-rust` MR lane
+  runs the whole suite, as does the image build's `cargo test --locked`
+  gate): relay unit tests over real unix sockets (socket-path sanitization,
+  `tool_call`/`tool_list` frame shapes with the task binding, call-id
+  routing, denied/error pass-through, identifier and 256 KiB frame-budget
+  local rejects with zero hub traffic, duplicate task/call-id/catalog
+  refusal, `close_task` failing in-flight calls, `drop_hub` failing waiters
+  and refusing new requests fast, unroutable replies ignored), shim tests
+  (initialize echo + 64-char version fallback, ping, notifications silent,
+  catalog→`inputSchema` mapping, success/denied/error/transport mapping,
+  no-proxy zero-tools and isError paths, the 1 MiB line gate with EV-3
+  edge-based id recovery in both orders), the run-84-gap analog (the real
+  shim handler drives the real relay over a real unix socket to a fake
+  hub), an executor env pin (issued proxy env wins over task forgeries;
+  reserved keys dropped when the relay is down), and two bridge pins: the
+  dispatch-level relay-slot lifecycle and a real-WebSocket read-loop
+  routing test (`task_request` in, `tool_call` out, `tool_result` back,
+  shim reply resolved, then cancel). Not covered locally (deploy-gated):
+  the shim's registration inside a real `pebble prompt` run and
+  real-worker AC1/AC2 evidence need the rebuilt pebble image on a live
+  tenant.
+
 Open acceptance items: AC1 with a **real** worker (hub-side evidence uses
 mock sockets with real memory tools; worker-side evidence uses a mock CLI
 against the real bridge/relay) and AC2 (`knowledge_search` real hits
@@ -628,9 +694,9 @@ through the proxy). Both need a rebuilt kimi worker image and a live
 tenant, which is the protected-pipeline/deploy gate, not an MR-pipeline
 lane — and a rebuilt image alone yields only denials, because mt-admin
 never renders a worker `tool_allowlist` into tenant config, so the tenant
-must also be configured with the grant. The opencode and opencode2 lanes
-additionally need their rebuilt images so the plugins ship in
-`/app/scripts/`. The pebble worker-side bridge is also open. WI#324 stays
+must also be configured with the grant. The opencode, opencode2 and pebble
+lanes additionally need their rebuilt images so the plugin/shim
+registration ships in the image. WI#324 stays
 open until those land.
 
 ## Land-order note (MR !1540 review #7716)

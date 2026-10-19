@@ -68,7 +68,8 @@ previous compatibility baseline.
   worker-side bridge: an in-image MCP shim gives the agent a native
   `mcp__lunarwing__*` surface. The opencode and opencode2 lanes ship
   serve-process plugins exposing the same phase-1 set as direct
-  `lunarwing_*` tools; the pebble lane's worker-side bridge remains open.
+  `lunarwing_*` tools, and the pebble lane ships the same MCP shim shape
+  inside its Rust bridge binary.
 - **Cron missions on external workers (WI#325).** A mission supervisor owns
   the tick chain: heartbeat watchdog, lapse → cancel → terminal-wait →
   backoff re-entry, persisted pause/tick counters, inline `job_events`, and
@@ -224,7 +225,8 @@ plugins (`lunarwing_tool_plugin`) exposing the phase-1 set as direct
 `lunarwing_*` tools; the opencode2 lane additionally denies upstream's
 unchecked built-in `session_move`/`session_rename` tools so they cannot
 rewrite the title-based task binding or the external-directory confinement.
-The pebble worker-side bridge remains open, and real-worker acceptance
+The pebble lane ships the same relay plus an in-image stdio MCP shim inside
+its Rust bridge binary (`pebble4lunarwing mcp-shim`). Real-worker acceptance
 evidence waits on the rebuilt worker images (protected-pipeline/deploy
 gate) — **WI#324 remains open**. Design doc:
 `docs/proposals/EXTERNAL-WORKER-TOOL-PROXY.md`.
@@ -521,7 +523,8 @@ The `AGENT_AUTH_TOKEN` bridge credential no longer rides into spawned task
 processes in any worker lane: kimi deletes it after all env merges, the
 opencode/opencode2 entrypoints run `opencode serve` under
 `env -u AGENT_AUTH_TOKEN` (the separately exec'd bridge keeps its copy),
-pebble rebuilds the child env from scratch (`env_clear` + an allowlist),
+pebble rebuilds the child env from scratch (`env_clear`, then the bridge's
+own environment minus the three reserved keys),
 and all six one-shot exec sites (`cli`/`acp` modes) strip it too.
 Task-supplied env entries reusing the key are dropped with a warning.
 
@@ -769,7 +772,9 @@ are recorded in the audit doc's 2026-10-16 follow-up.
    The version pins alone are not the content: the opencode2 image carries
    the WI#357 exposure controls and the WI#329 SDK gate, the opencode image
    carries the WI#374 crash-line enrichment and the WI#373 credential
-   strip, and the pebble image carries WI#334 and the reviewed-lock rustls
+   strip, and the pebble image carries WI#334, the WI#324 MCP shim
+   registration (`PEBBLE_CONFIG_HOME=/etc/lunarwing/pebble`), and the
+   reviewed-lock rustls
    upgrade — opencode stays v1.18.25, while opencode2 advances to v2.0.32
    under WI#427. Skipping those rebuilds leaves WI#357 undeployed. Preserve
    opencode2 state before the first new-version boot: upstream migrates its
@@ -819,11 +824,14 @@ are recorded in the audit doc's 2026-10-16 follow-up.
 **Worker proxy scope.** The kimi lane ships the worker-side tool-proxy
 bridge (an MCP shim) in this release, and the opencode and opencode2 lanes
 ship serve-process plugins exposing the same phase-1 set as direct
-`lunarwing_*` tools; the pebble worker has no such surface yet. Real-worker
-acceptance evidence for every lane rides the protected image pipeline. The
+`lunarwing_*` tools; the pebble lane ships the same MCP shim shape inside
+its Rust bridge binary. The
 tool grant is ambient for every process in the task (untrusted repo scripts
 can call the relay), workspace `.mcp.json` files can shadow the kimi shim's
-`lunarwing` entry, and workspace `.opencode/` content can shadow or disable
+`lunarwing` entry, workspace `.pebble/settings.json` and
+`.pebble/settings.local.json` entries named `lunarwing` can replace or
+disable the pebble shim (a malformed one fails the task), and workspace
+`.opencode/` content can shadow or disable
 the opencode/opencode2 plugins — the hub stays authoritative on the
 capability set. `memory_read` grants disclose workspace content to
 egress-enabled workers; see
@@ -857,8 +865,9 @@ WI#397 (`high` — sb&kumo findings); the goals-open items WI#375, WI#390,
 WI#392, WI#402, and WI#408; WI#415 (the OpenRC weechat/relay/adapter/darkirc
 renderers still bake caller-PATH `python3`); and the advisory-clearing
 owners WI#418, WI#367, and WI#368. Still open from this cycle's merged
-work: WI#324 (the pebble worker-side bridge, plus real-worker acceptance
-evidence for every lane once the worker images are rebuilt), WI#357 (the
+work: WI#324 (real-worker acceptance
+evidence for every lane once the worker images are rebuilt, plus the
+mt-admin `tool_allowlist` render gap), WI#357 (the
 opencode2 v2.0.26 bump stays gated), and WI#412 (pending maintainer
 acceptance). WI#400 tracks
 real worker credential isolation beyond the WI#373 hygiene strips. The
