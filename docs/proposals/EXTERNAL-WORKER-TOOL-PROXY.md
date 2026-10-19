@@ -142,9 +142,12 @@ tool_allowlist = ["memory_read", "memory_write", "knowledge_search",
   it writes (or clears) the worker-level key in the tenant's `config.toml`,
   accepts only names inside the phase-1 set below (a grant the daemon would
   strip at load is refused there, not silently deny-only), refuses
-  `mode = "cron"` entries (their worker-level list is stripped at load — the
-  tick authority is `cron.tool_allowlist`), and requires a tenant-daemon
-  restart to take effect.
+  `mode = "cron"` entries and entries that share a cron worker's endpoint
+  (their worker-level list is stripped at load — the tick authority is
+  `cron.tool_allowlist`), edits the config as parsed TOML (a multi-line
+  `tool_allowlist`, the shape the daemon's own settings write-back produces,
+  is replaced as a whole and the result is re-parsed before it is committed),
+  and requires a tenant-daemon restart to take effect.
 - Exact tool names only. **There is no `"*"` wildcard** (MR !1506 CQ-1): a
   wildcard on an untrusted container is a full tenant-admin grant.
 - At manager load the allowlist is sanitized, with each dropped entry logged:
