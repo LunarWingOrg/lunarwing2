@@ -1684,7 +1684,10 @@ prepare_pebble_workspace() {  # <tenant> — prints the workspace dir
     # Rootful runtime: no keep-id, so the in-container task uid
     # (PEBBLE_CONTAINER_UID, WI#400) is a bare host uid and the workspace
     # must carry it. -h keeps chown from ever dereferencing a planted
-    # symlink during the recursive pass.
+    # symlink during the recursive pass. KW-5 (run-164): that bare host uid
+    # is a CONSTANT shared by every tenant's pebble lane, so rootful
+    # multi-tenant pebble is unsupported until the per-tenant-uid design
+    # lands (WI#422) — single-tenant rootful keeps the split and works.
     chown -R -h "${PEBBLE_CONTAINER_UID}:${PEBBLE_CONTAINER_GID}" "$workspace_dir" || return 1
   fi
   printf '%s\n' "$workspace_dir"

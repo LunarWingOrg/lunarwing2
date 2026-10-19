@@ -27,8 +27,9 @@ does not block) and get it back. The strip blocks the *accidental* routes —
 env dumps into transcripts, logs, and LLM context, which is how WI#373 was
 observed — and is the same trust posture as the authority-domain rule below
 (one container = one uid = one authority domain). Real isolation (credential
-out of the container env; tasks under a separate uid from the bridge) is
-tracked as WI#400.
+out of the container env; tasks under a separate uid from the bridge)
+landed as **WI#400** for the kimi/opencode/pebble lanes — see the
+"Task-uid split (WI#400)" subsection below.
 
 Each lane enforces the strip at its task-process boundary:
 
@@ -55,14 +56,72 @@ Each lane enforces the strip at its task-process boundary:
   replaces PID 1 and no long-lived carrier process remains.
 
 Residual, deliberate (run-98 FY-1): the strip does **not** hide the token
-from task code that goes looking for it — `/proc/1/environ` and the bridge
-process's environ still contain it in every lane except pebble `cli` (see
-the env-hygiene paragraph above and the authority-domain section below;
-isolation is WI#400). The OpenCode serve password
+from task code that goes looking for it — in lanes without the WI#400 split
+(opencode2 today; every lane's pre-WI#400 image), `/proc/1/environ` and the
+bridge process's environ still contain it (see the env-hygiene paragraph
+above and the authority-domain section below). The OpenCode serve password
 (`OPENCODE_SERVER_PASSWORD`) is necessarily present in the serve process env —
 the server enforces it itself, and task code already runs inside that trust
 boundary. The LLM provider keys (`KIMI_API_KEY`, `TENSORZERO_API_KEY`, …) are
 deliberately *not* stripped: task execution needs them.
+
+### Task-uid split (WI#400)
+
+The kimi, opencode and pebble lanes now implement WI#400's real isolation:
+
+- **Credential out of the environment.** The container entrypoint (root)
+  writes the hub token to `/run/lunarwing/agent_auth_token` (directory
+  `0700` root, file `0400` root), unsets `AGENT_AUTH_TOKEN`, and exports
+  only `AGENT_AUTH_TOKEN_FILE`; the bridge reads the file. Nothing
+  long-lived carries the token in its environment any more.
+- **Tasks under a separate uid.** The bridge stays container root; every
+  spawned task process (and opencode's `serve`, which hosts task code) drops
+  to the image's task uid/gid via
+  `setpriv --reuid --regid --clear-groups --ambient-caps=-all --inh-caps=-all
+  --no-new-privs` (both capability clearances and `no_new_privs` are
+  mandatory: without them the task keeps ambient SETUID/SETGID or regains
+  privilege through a setuid/file-capability binary). `/proc/1/environ`,
+  the bridge's environ, and the token file all give the task uid EACCES.
+  Kimi task-side setup (`entrypoint-task-setup.sh`) runs as the task uid —
+  never as root — because everything it writes (`~/.gitconfig`, `~/.ssh`,
+  `$KIMI_CODE_HOME`) is task state.
+- **Trimmed root bridge.** The worker containers run with
+  `--cap-drop=ALL --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER
+  --cap-add=KILL --cap-add=SETUID --cap-add=SETGID` plus
+  `--security-opt no-new-privileges` (both the imperative `_ctr run` paths
+  and the Quadlet `PodmanArgs`; the contracts record `cap-trim` so existing
+  containers force-recreate). The bridge needs exactly: CHOWN for the
+  relay-socket/cron-leaf handoff, SETUID/SETGID for the drop, KILL for
+  timeout/cancel of task-uid children, and DAC_OVERRIDE/FOWNER for cron
+  workspace creation and mode management inside the task-owned workspace
+  root (on keep-id rootless, the workspace presents as task-owned 2770).
+- **Cron workspace ownership.** The cron bootstrap (`create_cron_workspace`
+  / the TS `resolveTaskWorkspace`) runs in the root bridge, so a freshly
+  created project-dir leaf is `fchown`'d to the task identity through the
+  `O_DIRECTORY|O_NOFOLLOW` descriptor the walk already holds; a
+  pre-existing leaf is never re-chowned.
+- **Tool-proxy socket directory.** The relay's socket directory stays
+  root-owned `0711`; only the per-task socket is chowned to the task
+  identity, so task code can connect but cannot rename or delete entries in
+  the directory.
+- **opencode2 is NOT migrated** (its image still runs `USER 10003:10003`
+  and mt-admin's image-user guard continues to require exactly that); it
+  gets its own lane migration, like the pebble split here.
+
+**Rootful multi-tenant pebble limitation (run-164 KW-5):** on rootful
+runtimes there is no user namespace, so the pebble task uid (10004) is a
+bare host uid shared by every tenant's pebble lane, and
+`prepare_pebble_workspace` chowns each tenant's workspace to that shared
+uid. A container escape from one tenant's pebble lane would then land on
+write access to every tenant's pebble workspace. Rootful **multi-tenant**
+pebble is therefore unsupported until the per-tenant-uid design lands —
+tracked as WI#422 (which also owns the rootful bind-source re-resolution
+issue); on rootful single-tenant hosts the split still applies and still
+isolates task code from the bridge. Rootless podman keep-id is unaffected:
+the task uid maps to the owning tenant account.
+
+Note: pebble already ran its bridge as root before WI#400; for that lane
+the split changes the task side, not the bridge side.
 
 ## WebSocket message limits
 
