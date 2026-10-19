@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
-"""WI#363: fail the cargo-deny job when an ic/deny.toml clearing owner closes.
+"""WI#363: fail CI when an ic/deny.toml clearing owner closes.
 
 Every [advisories].ignore entry in ic/deny.toml must name a "clearing owner
 WI#N" in its reason — the offline half (validate_deny_toml_advisories in
 validate_config.py) requires the reference at ci-config time. This guard is the
-online half and runs as the final cargo-deny script step, in the job that
-already fetches the RustSec advisory DB over the network: each distinct named
-owner is resolved through the anonymous GitLab issue API and must be
-state == "opened".
+online half and runs as the pinned script of its own cargo-deny-owners job
+(run-164 KV-1c: keeping it out of cargo-deny means a red cargo-deny always
+means a real advisory finding, instead of the owner red and an advisory red
+sharing one badge): each distinct named owner is resolved through the
+anonymous GitLab issue API and must be state == "opened".
 
-Failure mode (deliberate, WI#363): HARD failure. The moment a named owner WI
-closes, every full-validation pipeline goes red — that visibility is the point
-(the 2.1.5.0 reasons named WI#304/#305/#306, which were closed without the
-migrations landing, and nobody noticed until a review; on 2026-10-17 a bulk
-close orphaned WI#418/WI#368 the same way). Merging is not CI-gated on this
-project, so the red gate is a signal, not a block. The maintenance step when
-closing an owner WI: re-point the ic/deny.toml reasons to the new open owner
-first (see .gitlab/README.md).
+Failure mode (deliberate, WI#363): this script exits nonzero on any failure
+— the moment a named owner WI closes, the job goes red naming the WI and
+its advisory IDs (the 2.1.5.0 reasons named WI#304/#305/#306, which were
+closed without the migrations landing, and nobody noticed until a review;
+on 2026-10-17 a bulk close orphaned WI#418/WI#368 the same way). While no
+open clearing owner exists (maintainer decision pending, WI#363 note
+#10157), the job carries allow_failure: WI#363's documented "warns" mode —
+the red stays visible as a warning without drowning the advisory signal,
+and only a maintainer removes allow_failure (hard mode) or names owners.
+Merging is not CI-gated on this project, so the signal is visibility, not
+a block. The maintenance step when closing an owner WI: re-point the
+ic/deny.toml reasons to the new open owner first (see .gitlab/README.md).
 
 Anonymous reads work on this public project for ISSUE-type work items.
 Task-type work items 404 on the anonymous single-issue endpoint (WI#274
@@ -156,8 +161,10 @@ def check_owners(
             if state != "opened":
                 errors.append(
                     f"WI#{number} is {state!r}, not open, and is the named clearing "
-                    f"owner of {ids}. Closing the owner WI requires re-pointing the "
-                    "ic/deny.toml reasons to an open work item (see .gitlab/README.md)."
+                    f"owner of {ids}. Only a maintainer names a replacement owner: "
+                    "report this red gate on the MR or on WI#363 and re-point the "
+                    "ic/deny.toml reasons only to an owner the maintainer named; do not "
+                    "file or reopen an owner work item (see .gitlab/README.md)."
                 )
             continue
         if last_error is None:
@@ -170,9 +177,9 @@ def check_owners(
         else:
             errors.append(
                 f"could not confirm WI#{number} is open after {attempts} attempts: "
-                f"{last_error}. Failing closed (the cargo-deny job already depends "
-                "on the network for the advisory DB); on a git.lunarwing.org "
-                f"outage, retry the job. Named by: {ids}."
+                f"{last_error}. Failing closed (an unreachable check must not pass "
+                "silently); on a git.lunarwing.org outage, retry the job. "
+                f"Named by: {ids}."
             )
     return errors
 

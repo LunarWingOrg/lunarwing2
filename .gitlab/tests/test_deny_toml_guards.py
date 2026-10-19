@@ -4,10 +4,10 @@
 Offline half: validate_config.validate_deny_toml_advisories (ci-config lane)
 requires every [advisories].ignore reason to name a "clearing owner WI#N" and
 every cited repo-relative path to be tracked. Online half:
-check_deny_toml_owners (the cargo-deny job's final script step) requires each
-named owner to be an open issue-type work item — tested here with a stubbed
-fetch, no network. Registered in .gitlab/scripts/python_tests.py as well, so
-the suite also runs in python-unit.
+check_deny_toml_owners (the pinned script of its own cargo-deny-owners job,
+run-164 KV-1c) requires each named owner to be an open issue-type work item —
+tested here with a stubbed fetch, no network. Registered in
+.gitlab/scripts/python_tests.py as well, so the suite also runs in python-unit.
 """
 
 import importlib.util
@@ -380,6 +380,11 @@ ignore = [
         self.assertIn("WI#331", errors[0])
         self.assertIn("'closed'", errors[0])
         self.assertIn("RUSTSEC-0000-0003", errors[0])
+        # The CI message is what an agent reads when the gate goes red: it must
+        # send the fix to the maintainer, not invite a fresh owner work item
+        # (MR !1758 review KV-2; the WI#331 -> WI#367/#368/#418 -> WI#439 loop).
+        self.assertIn("Only a maintainer names a replacement owner", errors[0])
+        self.assertNotIn("to an open work item", errors[0])
 
     def test_404_fails_with_task_type_message_and_is_not_retried(self):
         calls = []
@@ -477,15 +482,35 @@ class FetchIssueStateTests(unittest.TestCase):
 
 
 class DenyOwnerWiringTests(unittest.TestCase):
-    """The cargo-deny job runs the owner check, and the exact-script pin in
-    validate_config.py (ADVISORY_GATE_SCRIPTS, MR !1680 review IP-1) matches
-    the checked-in job — the WI#363 'required fragments' wiring."""
+    """The owner check runs in its own cargo-deny-owners job (run-164 KV-1c:
+    a red cargo-deny must always mean a real advisory finding), the exact
+    script pins in validate_config.py (ADVISORY_GATE_SCRIPTS, MR !1680
+    review IP-1; OWNER_GATE_SCRIPT, MR !1758 run-164 KV-1) match the
+    checked-in jobs, and the warn-mode allow_failure stays the maintainer's
+    documented choice — the WI#363 'required fragments' wiring."""
 
-    def test_cargo_deny_job_runs_the_owner_check_and_matches_the_pin(self):
+    def test_owner_gate_job_runs_the_owner_check_and_matches_the_pin(self):
+        security = config.load_yaml(ROOT / ".gitlab" / "ci" / "security.yml")
+        job = security["cargo-deny-owners"]
+        self.assertEqual(job["script"], ["python3 .gitlab/scripts/check_deny_toml_owners.py"])
+        self.assertEqual(job["script"], config.OWNER_GATE_SCRIPT)
+
+    def test_cargo_deny_job_carries_advisories_only(self):
+        # KV-1: the owner check must NOT ride cargo-deny — while no open
+        # clearing owner exists, an in-job owner red and a real advisory red
+        # would be the same badge, hiding new advisories.
         security = config.load_yaml(ROOT / ".gitlab" / "ci" / "security.yml")
         script = security["cargo-deny"]["script"]
-        self.assertIn("python3 .gitlab/scripts/check_deny_toml_owners.py", script)
+        self.assertNotIn("python3 .gitlab/scripts/check_deny_toml_owners.py", script)
         self.assertEqual(script, config.ADVISORY_GATE_SCRIPTS["cargo-deny"])
+
+    def test_owner_gate_allow_failure_is_the_documented_warn_mode(self):
+        # WI#363's acceptance criteria permit "fails (or warns, if that is the
+        # documented choice)". allow_failure: true is that documented choice
+        # while the maintainer's owner decision pends (WI#363 note #10157);
+        # validate_deny_owner_gate permits this key and nothing else extra.
+        security = config.load_yaml(ROOT / ".gitlab" / "ci" / "security.yml")
+        self.assertIs(security["cargo-deny-owners"].get("allow_failure"), True)
 
     def test_owner_check_script_is_stdlib_only(self):
         # The .rust-job image installs bare python3 (bootstrap-rust.sh); the
