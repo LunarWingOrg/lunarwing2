@@ -171,19 +171,27 @@ _deregister_worker_unit() {
 # and never exposes the full gateway bearer to `podman inspect` or the
 # tenant-readable unit file. The gateway-bearer substitution is kept ONLY as a
 # last resort for read-only/unwritable env files, and is always loudly warned.
-resolve_worker_auth_token() {
-  local env_path="$1" token
-  token="$(_read_env_value "$env_path" WORKER_AUTH_TOKEN)"
+#
+# WI#423: both value reads go through read_tenant_env_value — root never
+# resolves the tenant-writable env path itself, so a symlink swap cannot leak
+# another tenant's worker (or gateway) bearer into this tenant's quadlet /
+# `podman inspect` / config.toml. An unsafe path refuses loudly instead of
+# falling back: the fallback read would traverse the same hostile path.
+resolve_worker_auth_token() {  # <tenant> <env_path>
+  local name="$1" env_path="$2" token fresh
+  token="$(read_tenant_env_value "$name" "$env_path" WORKER_AUTH_TOKEN)" \
+    || die "could not safely read WORKER_AUTH_TOKEN from $env_path as tenant '$name'"
   if [[ -n "$token" ]]; then
     printf '%s' "$token"
     return 0
   fi
 
   # Mint and persist the scoped token. Preserve the tenant's ownership when
-  # replacing the file: mt-admin runs as root, and a root-owned 0600 replacement
-  # cannot be read by the tenant's systemd user services.
+  # replacing the file: _env_set commits through the tenant-side writer for a
+  # tenant-owned env dir (the create_tenant_user shape), so a root-owned 0600
+  # replacement — unreadable by the tenant's systemd user services — is never
+  # produced.
   if [[ -w "$env_path" ]]; then
-    local fresh
     fresh="$(generate_token)"
     if [[ -n "$fresh" ]]; then
       if _env_set "$env_path" WORKER_AUTH_TOKEN "$fresh"; then
@@ -196,7 +204,14 @@ resolve_worker_auth_token() {
 
   # Last resort: fail open ONLY after an explicit, loud warning. Never silent.
   echo "WARNING: could not persist WORKER_AUTH_TOKEN for $env_path; falling back to GATEWAY_AUTH_TOKEN (WI#210 mitigations do NOT apply to this worker until the env file is written)." >&2
-  token="$(_read_env_value "$env_path" GATEWAY_AUTH_TOKEN)"
+  token="$(read_tenant_env_value "$name" "$env_path" GATEWAY_AUTH_TOKEN)" \
+    || die "could not safely read GATEWAY_AUTH_TOKEN from $env_path as tenant '$name'"
+  # Run-166 LF-7: an empty read here (e.g. an untraversable ancestor that the
+  # reader could not distinguish from absence before its ancestor walk) must
+  # not become "success with no token" — the callers would start the worker
+  # with AGENT_AUTH_TOKEN absent and its loopback bridge would accept
+  # unauthenticated peers. An empty credential is a hard failure.
+  [[ -n "$token" ]] || die "no worker credential available in $env_path for tenant '$name'"
   printf '%s' "$token"
 }
 
@@ -207,7 +222,13 @@ resolve_worker_auth_token() {
 upgrade_external_worker_auth_token() {
   local name="$1" worker="$2" config_path="$3" env_path="$4"
   local awk_status staged_in staged_out new_token
-  new_token="$(resolve_worker_auth_token "$env_path")"
+  # Run-166 LF-2: the resolver's die only exits the $(...) subshell; a plain
+  # assignment under suppressed errexit would continue with an empty token and
+  # the `[[ -n ]] || return 1` below would misreport the refusal as "no change
+  # needed". Report it as the failure leg of the 0/1/2 contract.
+  if ! new_token="$(resolve_worker_auth_token "$name" "$env_path")"; then
+    return 2
+  fi
   [[ -n "$new_token" ]] || return 1
 
   # WI#390 (review HH-3): never mktemp+redirect+chown as root inside the
@@ -436,8 +457,12 @@ ensure_external_worker_config() {
   # the value can never drift from what the worker container's
   # AGENT_AUTH_TOKEN will be; tenants provisioned before WORKER_AUTH_TOKEN
   # existed fall back to the gateway bearer until their next lifecycle pass
-  # migrates both sides together.
-  auth_token="$(resolve_worker_auth_token "$env_path")"
+  # migrates both sides together. Run-166 LF-2: a resolver refusal is fatal —
+  # a config.toml without the credential would run the worker bridge with
+  # auth disabled on its loopback port.
+  if ! auth_token="$(resolve_worker_auth_token "$name" "$env_path")"; then
+    return 1
+  fi
 
   # add-tenant runs before the daemon ever starts, so config.toml usually does
   # not exist yet — create it with a header. Appending a fresh
@@ -1461,19 +1486,33 @@ start_tenant_opencode() {
 
     local env_flags=()
     if [[ -f "$tenant_env_path" ]]; then
+      # WI#423: these values cross into `podman inspect` — take them from one
+      # tenant-side snapshot (the scoped-token resolver does its own per-key
+      # tenant-side read) so a symlinked lunarwing.env cannot leak another
+      # tenant's LLM key into this worker's container.
+      local env_snapshot
+      _snapshot_tenant_env "$name" "$tenant_env_path" env_snapshot
       local agent_token
-      agent_token="$(resolve_worker_auth_token "$tenant_env_path")"
+      # Run-166 LF-2: a resolver refusal is fatal — without this check the
+      # subshell die would leave agent_token empty, the env flag would be
+      # dropped, and the opencode bridge would run with auth disabled on its
+      # loopback port. The snapshot is released before dying.
+      if ! agent_token="$(resolve_worker_auth_token "$name" "$tenant_env_path")"; then
+        rm -f -- "$env_snapshot"
+        die "could not resolve the scoped worker credential for tenant '$name'"
+      fi
       [[ -n "$agent_token" ]] && env_flags+=(-e "AGENT_AUTH_TOKEN=$agent_token")
 
       local llm_api_key
-      llm_api_key="$(_read_env_value "$tenant_env_path" LLM_API_KEY)"
+      llm_api_key="$(_read_env_value "$env_snapshot" LLM_API_KEY)"
       [[ -n "$llm_api_key" ]] && env_flags+=(-e "TENSORZERO_API_KEY=$llm_api_key")
 
       local opencode_model opencode_base_url
-      opencode_model="$(_read_env_value "$tenant_env_path" OPENCODE_MODEL)"
+      opencode_model="$(_read_env_value "$env_snapshot" OPENCODE_MODEL)"
       [[ -n "$opencode_model" ]] && env_flags+=(-e "OPENCODE_MODEL=$opencode_model")
-      opencode_base_url="$(_read_env_value "$tenant_env_path" OPENCODE_BASE_URL)"
+      opencode_base_url="$(_read_env_value "$env_snapshot" OPENCODE_BASE_URL)"
       [[ -n "$opencode_base_url" ]] && env_flags+=(-e "OPENCODE_BASE_URL=$opencode_base_url")
+      rm -f -- "$env_snapshot"
     fi
 
     if [[ -f "$opencode_env_path" ]]; then
@@ -1672,19 +1711,29 @@ start_tenant_opencode2() {
 
     local -a env_flags=()
     if [[ -f "$tenant_env_path" ]]; then
+      # WI#423: same tenant-side snapshot as the opencode lane — the LLM key
+      # and model values land in `podman inspect` for this container.
+      local env_snapshot
+      _snapshot_tenant_env "$name" "$tenant_env_path" env_snapshot
       local agent_token
-      agent_token="$(resolve_worker_auth_token "$tenant_env_path")"
+      # Run-166 LF-2: same fail-closed shape as the opencode lane above —
+      # refuse instead of starting the bridge without its credential.
+      if ! agent_token="$(resolve_worker_auth_token "$name" "$tenant_env_path")"; then
+        rm -f -- "$env_snapshot"
+        die "could not resolve the scoped worker credential for tenant '$name'"
+      fi
       [[ -n "$agent_token" ]] && env_flags+=(-e "AGENT_AUTH_TOKEN=$agent_token")
 
       local llm_api_key
-      llm_api_key="$(_read_env_value "$tenant_env_path" LLM_API_KEY)"
+      llm_api_key="$(_read_env_value "$env_snapshot" LLM_API_KEY)"
       [[ -n "$llm_api_key" ]] && env_flags+=(-e "TENSORZERO_API_KEY=$llm_api_key")
 
       local oc2_model oc2_base_url
-      oc2_model="$(_read_env_value "$tenant_env_path" OPENCODE2_MODEL)"
+      oc2_model="$(_read_env_value "$env_snapshot" OPENCODE2_MODEL)"
       [[ -n "$oc2_model" ]] && env_flags+=(-e "OPENCODE2_MODEL=$oc2_model")
-      oc2_base_url="$(_read_env_value "$tenant_env_path" OPENCODE2_BASE_URL)"
+      oc2_base_url="$(_read_env_value "$env_snapshot" OPENCODE2_BASE_URL)"
       [[ -n "$oc2_base_url" ]] && env_flags+=(-e "OPENCODE2_BASE_URL=$oc2_base_url")
+      rm -f -- "$env_snapshot"
     fi
 
     if [[ -f "$worker_env_path" ]]; then
@@ -1796,12 +1845,14 @@ prepare_worker_workspace() {
 # only at container CREATE/render time — podman/docker re-resolves the bind
 # source at EVERY container start, and neither the existing-container branch
 # nor the OpenRC unit's start re-runs this check, so a tenant who swaps the
-# directory for a symlink afterwards still redirects the mount. On rootless
-# podman the container runs as the tenant uid, so the redirect grants nothing
-# the tenant could not already reach; on rootful hosts (docker default, or
-# LUNARWING_MT_ROOTLESS=false) the pebble image has no USER and runs as host
-# root with --restart unless-stopped — closing that lane needs either a
-# tenant-uid --user or a root-owned bind parent, tracked in WI#422.
+# directory for a symlink afterwards still redirects the mount. WI#422 closed
+# the escalation that remained: on rootless podman the container runs as the
+# tenant uid, so the redirect grants nothing the tenant could not already
+# reach; on rootful hosts (docker default, or LUNARWING_MT_ROOTLESS=false)
+# start_tenant_pebble now launches with `--user <tenant uid>:<gid>`
+# (PEBBLE_ROOTFUL_LAUNCH_CONTRACT force-recreates pre-fix root-running
+# containers), so a redirected bind only ever exposes what the tenant account
+# itself can already reach.
 # The pebble workspace is tenant-owned 0700; 0777 was never load-bearing.
 prepare_pebble_workspace() {  # <tenant> — prints the workspace dir
   local name="$1" lw_root workspace_dir
@@ -1849,7 +1900,7 @@ write_kimi_runtime_env() {
       [[ -z "$value" ]] || printf '%s=%s\n' "$key" "$value"
     done
 
-    value="$(resolve_worker_auth_token "$source_path")" || exit 1
+    value="$(resolve_worker_auth_token "$name" "$source_path")" || exit 1
     [[ -n "$value" ]] \
       || die "Kimi worker requires WORKER_AUTH_TOKEN (or GATEWAY_AUTH_TOKEN)"
     # Worker bridge expects AGENT_AUTH_TOKEN, not the daemon's env variable name.
@@ -2109,9 +2160,16 @@ start_tenant_pebble() {
     return 0
   fi
   # Pin the tenant-store image ID into the container contract: a rebuilt image
-  # must force-recreate the container (_worker_launch_contract).
+  # must force-recreate the container (_worker_launch_contract). WI#422: the
+  # rootful base contract differs from the rootless one so every pre-fix
+  # root-running container is recreated once on its next start-tenant, picking
+  # up the tenant-uid --user launch below.
   local pebble_launch_contract
-  pebble_launch_contract="$(_worker_launch_contract "$name" lunarwing-worker-pebble:latest "$PEBBLE_ROOTLESS_LAUNCH_CONTRACT")"
+  if [[ "$MT_ROOTLESS" == "true" ]]; then
+    pebble_launch_contract="$(_worker_launch_contract "$name" lunarwing-worker-pebble:latest "$PEBBLE_ROOTLESS_LAUNCH_CONTRACT")"
+  else
+    pebble_launch_contract="$(_worker_launch_contract "$name" lunarwing-worker-pebble:latest "$PEBBLE_ROOTFUL_LAUNCH_CONTRACT")"
+  fi
 
   # systemd + rootless podman: Quadlet .container owns the lifecycle (the unit's
   # [Container] spec creates+runs it), so skip the imperative `_ctr run` below.
@@ -2177,7 +2235,11 @@ start_tenant_pebble() {
     local env_flags=()
     if [[ -f "$tenant_env_path" ]]; then
       local agent_token
-      agent_token="$(resolve_worker_auth_token "$tenant_env_path")"
+      # Run-166 LF-2: fail closed — the pebble bridge runs with auth disabled
+      # when AGENT_AUTH_TOKEN is absent (bridge.rs treats empty as disabled).
+      if ! agent_token="$(resolve_worker_auth_token "$name" "$tenant_env_path")"; then
+        die "could not resolve the scoped worker credential for tenant '$name'"
+      fi
       [[ -n "$agent_token" ]] && env_flags+=(-e "AGENT_AUTH_TOKEN=$agent_token")
     fi
 
@@ -2210,9 +2272,40 @@ start_tenant_pebble() {
     local ssh_agent_dir
     ssh_agent_dir="$(tenant_run_dir "$name")/ssh-agent"
     ssh_mount=(-v "${ssh_agent_dir}:/tmp/ssh-agent:ro,z" -e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock)
+    # WI#422 (run-164 KY-1): rootful pebble runs as the tenant uid:gid. The
+    # image has no USER, so without --user the container (and its
+    # --restart unless-stopped resurrects) runs as host root while the runtime
+    # re-resolves the /workspace bind source at every start — a tenant who
+    # swaps ~/lunarwing/pebble-workspace for a symlink redirects host-root
+    # writes through their own pebble tasks. The numeric tenant uid has no
+    # in-image passwd entry, and the fat image bakes root-owned toolchain
+    # homes (GOPATH=/root/go; cargo needs a writable CARGO_HOME), so HOME and
+    # the toolchain caches are anchored inside the tenant-owned /workspace
+    # mount — login shells pick the same values up through the image's
+    # /etc/profile.d/toolchain snippet, which defers to preset env.
+    # no-new-privileges (run-167 LH-2): the image ships Debian's standard
+    # setuid set; once the container is non-root, closing the setuid/file-cap
+    # route back to container root is what makes the uid drop one-way.
+    local -a pebble_user_args=()
+    if [[ "$MT_ROOTLESS" != "true" ]]; then
+      local pebble_tenant_uid pebble_tenant_gid
+      pebble_tenant_uid="$(id -u "$name")" \
+        || die "cannot resolve uid for tenant '$name' (rootful pebble launch)"
+      pebble_tenant_gid="$(id -g "$name")" \
+        || die "cannot resolve gid for tenant '$name' (rootful pebble launch)"
+      pebble_user_args=(
+        --user "${pebble_tenant_uid}:${pebble_tenant_gid}"
+        --security-opt no-new-privileges
+        -e HOME=/workspace
+        -e GOPATH=/workspace/go
+        -e GOCACHE=/workspace/.cache/go-build
+        -e CARGO_HOME=/workspace/.cargo
+      )
+    fi
     _ctr "$name" run -d \
       --name "$container_name" \
       "${healthcheck_args[@]}" \
+      "${pebble_user_args[@]}" \
       -e LUNARWING_WORKER_ID="worker-pebble-${name}" \
       -e WS_PORT="$wss_port" \
       -e HEALTH_PORT="8443" \

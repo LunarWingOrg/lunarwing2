@@ -390,6 +390,42 @@ EOF
 LIFECYCLE_LIB="$(dirname "$MT_ADMIN")/mt-admin-lib/04-tenant-lifecycle.sh"
 assert_contains "$LIFECYCLE_LIB" 'opencode2-*' 'tenant-name guard reserves the opencode2- prefix'
 
+# ── run-166 LF-2: a resolver refusal must abort, not render tokenless ────────
+# A lunarwing.env shape the tenant-side reader rejects (0640 — a restore or a
+# hand edit) made the !1771 head render the unit/config with AGENT_AUTH_TOKEN
+# absent: the resolver's die only exits the $(...) subshell, and production
+# runs the render under the lifecycle lock's suppressed errexit. Model that
+# wrapper (set +e) and require the refusal to be fatal at every call site.
+chmod 0640 "$env_file"
+rm -f "$fixture/quadlets/lunarwing-opencode2-root.container"
+lf2_rc=0
+( set +e; render_worker_quadlet root opencode2 8443 ) >/dev/null 2>&1 || lf2_rc=$?
+if [[ "$lf2_rc" -eq 0 ]]; then
+  fail 'quadlet render continued past a refused worker credential'
+else
+  pass 'quadlet render aborts on a refused worker credential'
+fi
+if [[ -e "$fixture/quadlets/lunarwing-opencode2-root.container" ]]; then
+  fail 'quadlet was written without the scoped worker credential'
+else
+  pass 'no tokenless quadlet is left behind'
+fi
+
+rm -f "$fixture/state/config.toml"
+lf2_rc=0
+( set +e; ensure_external_worker_config root opencode2 opencode2_wss ) >/dev/null 2>&1 || lf2_rc=$?
+if [[ "$lf2_rc" -eq 0 ]]; then
+  fail 'fresh worker config continued past a refused worker credential'
+else
+  pass 'fresh worker config aborts on a refused worker credential'
+fi
+if [[ -e "$fixture/state/config.toml" ]]; then
+  fail 'daemon config was written without the scoped worker credential'
+else
+  pass 'no tokenless daemon config is left behind'
+fi
+chmod 0600 "$env_file"
+
 echo ""
 if [[ "$failures" -eq 0 ]]; then
   echo "RESULT: all opencode2 mt-admin tests passed"

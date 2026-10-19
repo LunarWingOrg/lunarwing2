@@ -958,7 +958,11 @@ configure_tenant_vision_local() {
   [[ -f "$env_path" && ! -L "$env_path" ]] \
     || die "tenant LunarWing environment missing or unsafe"
   [[ -f "$vision_env" && ! -L "$vision_env" ]] || write_tenant_vision_env "$name" >/dev/null
-  token="$(_env_existing "$vision_env" LUNARWING_AUTH_TOKEN)"
+  # WI#423: the token is presented on a loopback port — read it as the
+  # tenant so a symlink swap cannot activate this tenant's vision sidecar
+  # with another tenant's bearer.
+  token="$(read_tenant_env_value "$name" "$vision_env" LUNARWING_AUTH_TOKEN)" \
+    || die "could not safely read LUNARWING_AUTH_TOKEN from $vision_env as tenant '$name'"
   [[ -n "$token" ]] || die "local LunarVision token is missing"
   vision_port="$(ports_get "$name" vision_service)" || true
   _vision_port_valid "$vision_port" || die "local LunarVision service port is invalid"
@@ -1281,7 +1285,10 @@ configure_voice() {
   if [[ "$enabled" == true ]]; then
     voice_models_ready "$name" || die "verified STT models missing under $VOICE_MODELS_DIR"
   fi
-  token="$(_env_existing "$voice_env" VOICE_AUTH_TOKEN)"
+  # WI#423: same class as the vision activation token — presented on a
+  # loopback port, so the read goes through the tenant-side per-key reader.
+  token="$(read_tenant_env_value "$name" "$voice_env" VOICE_AUTH_TOKEN)" \
+    || die "could not safely read VOICE_AUTH_TOKEN from $voice_env as tenant '$name'"
   [[ -n "$token" ]] || die "LunarVoice bearer token is missing"
   stt_model="$(_env_existing "$voice_env" VOICE_STT_MODEL)"
   stt_model="${stt_model:-whisper-tiny}"
