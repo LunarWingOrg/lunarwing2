@@ -2980,6 +2980,35 @@ class TrivyGateInputTests(unittest.TestCase):
         merged["worker-kimi-scan"]["image"] = {"name": "docker.io/aquasec/trivy:0.74.0@sha256:" + "0" * 64, "entrypoint": [""]}
         self.assertTrue(any("worker-kimi-scan image must be exactly" in error for error in self.errors(merged)))
 
+    def test_scan_retry_pin_is_enforced(self):
+        # Item 70: the bounded scan auto-retry (transient runner kills like
+        # pipeline 5263's exit-137 SIGKILL mid SBOM) is a deliberate policy,
+        # so it is pinned by value like the image and tags.
+        mutations = {
+            "removed": lambda template: template.pop("retry"),
+            "wider": lambda template: template.update(retry={"max": 2, "when": ["always"]}),
+            "narrower": lambda template: template.update(
+                retry={"max": 1, "when": ["runner_system_failure"]}
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label):
+                merged = copy.deepcopy(self.merged)
+                mutate(merged[".worker-scan"])
+                self.assertTrue(any(
+                    ".worker-scan retry must be exactly" in error
+                    for error in self.errors(merged)
+                ))
+
+    def test_scan_job_retry_override_is_caught(self):
+        # A job-level retry would replace the template policy wholesale.
+        merged = copy.deepcopy(self.merged)
+        merged["worker-kimi-scan"]["retry"] = {"max": 5}
+        self.assertTrue(any(
+            "worker-kimi-scan must not set job keys ['retry']" in error
+            for error in self.errors(merged)
+        ))
+
     def test_second_extends_parent_is_caught(self):
         for label, parent in (
             ("variables", {"variables": {"TRIVY_IGNORE_UNFIXED": "true"}}),
