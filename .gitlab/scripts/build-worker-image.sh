@@ -116,6 +116,7 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         # must join this list in the same commit (validate_config.py enforces it).
         input_files='kimicode4lunarwing/Dockerfile
 kimicode4lunarwing/entrypoint.sh
+kimicode4lunarwing/entrypoint-task-setup.sh
 kimicode4lunarwing/health_server.py
 kimicode4lunarwing/agent_comm_protocol.json
 kimicode4lunarwing/config/config.toml
@@ -142,6 +143,8 @@ kimicode4lunarwing/scripts/lunarwing_tool_proxy.ts
 kimicode4lunarwing/scripts/lunarwing_tool_proxy_test.ts
 kimicode4lunarwing/scripts/path_expand_test.ts
 kimicode4lunarwing/scripts/smoke_test.ts
+kimicode4lunarwing/scripts/task_identity.ts
+kimicode4lunarwing/scripts/task_identity_test.ts
 kimicode4lunarwing/scripts/task_prompt_test.ts
 kimicode4lunarwing/scripts/workspace_path.ts'
         source_ref=2.2.0
