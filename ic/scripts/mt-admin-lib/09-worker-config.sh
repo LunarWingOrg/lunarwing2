@@ -1696,6 +1696,14 @@ prepare_pebble_workspace() {  # <tenant> — prints the workspace dir
     # is a CONSTANT shared by every tenant's pebble lane, so rootful
     # multi-tenant pebble is unsupported until the per-tenant-uid design
     # lands (WI#422) — single-tenant rootful keeps the split and works.
+    # LD-14: say so at runtime when another tenant already has a pebble
+    # workspace, instead of only in the docs.
+    local sibling
+    for sibling in "$(dirname "$lw_root")"/*/lunarwing/pebble-workspace; do
+      if [[ -e "$sibling" && "$sibling" != "$workspace_dir" ]]; then
+        say "WARNING: rootful pebble workspace also exists at $sibling — rootful multi-tenant pebble is unsupported (WI#400 KW-5/WI#422)"
+      fi
+    done
     chown -R -h "${PEBBLE_CONTAINER_UID}:${PEBBLE_CONTAINER_GID}" "$workspace_dir" || return 1
   fi
   printf '%s\n' "$workspace_dir"
