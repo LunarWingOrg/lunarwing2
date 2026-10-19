@@ -360,7 +360,14 @@ the prime suspect, and the fix is the same normalization in the offending
   `artifacts: false` — blocking both checkout-overwriting artifacts and
   higher-precedence dotenv variables from upstream jobs (MR !1688, IU-1).
   `secret-history` is the marked, deliberate exception while
-  historical findings are triaged. Three limits of the YAML validator
+  historical findings are triaged. The WI#363 owner job
+  `cargo-deny-owners` is pinned separately by
+  `validate_deny_owner_gate` (existence, exact script, template rules,
+  tag, bootstrap, inputs) and is the one other job allowed
+  `allow_failure` — WI#363's documented warn mode while the maintainer's
+  owner decision pends (MR !1758 run-164 KV-1c); every other hollowing
+  shape is refused exactly as for the four advisory gates. Three limits of
+  the YAML validator
   remain, by design: it cannot see repo files the pinned scripts still
   honour — a project `.npmrc`, a `bunfig.toml` `preload`, or the
   `package.json` `test` script in the worker script directories stay trust
