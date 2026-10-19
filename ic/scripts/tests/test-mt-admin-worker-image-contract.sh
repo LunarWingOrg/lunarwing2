@@ -225,6 +225,20 @@ for worker in kimi opencode opencode2 pebble; do
   quadlet_scenario "$worker"
 done
 
+# WI#423 (run-171, the merge with !1784): the rootful create path below is the
+# one scenario in this harness that reaches the tenant-side credential reader,
+# which drops to the tenant with `sudo -u`. The fixture tenant is not a real
+# account (and CI runs no-new-privileges), so the drop maps onto the invoking
+# user, and the fixture env takes the production shape the tenant-side checks
+# demand: 0700 dir, 0600 file, the scoped worker credential present.
+sudo() {
+  if [[ "${1:-}" == "-u" ]]; then shift 2; fi
+  command "$@"
+}
+chmod 700 "$fixture/env"
+chmod 600 "$env_file"
+printf 'WORKER_AUTH_TOKEN=fixture-worker\n' >>"$env_file"
+
 # ── WI#422: rootful pebble launches as the tenant uid ───────────────────────
 # The fixture tenant has no passwd entry, so `id` is shadowed for exactly the
 # two lookups the lane makes (everything else falls through to the real

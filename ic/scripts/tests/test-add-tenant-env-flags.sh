@@ -1792,8 +1792,12 @@ rm -rf "$lf7_root"
 rm -f "$MT_FIXTURE/env/lunarwing.env"
 printf 'GATEWAY_AUTH_TOKEN=\n' >"$MT_FIXTURE/env/lunarwing.env"
 chmod 400 "$MT_FIXTURE/env/lunarwing.env"
+# Run-171 LS-1: the 0400 mode blocks the mint only for an unprivileged
+# runner. Root (CI's shell-harnesses job) can write a 0400 file, so the
+# resolver would mint a token and succeed; stub the mint out so the
+# last-resort branch is what runs, whoever the invoking user is.
 lf7_rc=0
-lf7_err="$( ( resolve_worker_auth_token fixture-tenant "$MT_FIXTURE/env/lunarwing.env" ) 2>&1 )" || lf7_rc=$?
+lf7_err="$( ( _env_set() { return 1; }; resolve_worker_auth_token fixture-tenant "$MT_FIXTURE/env/lunarwing.env" ) 2>&1 )" || lf7_rc=$?
 if [[ "$lf7_rc" -eq 0 ]]; then
   echo "  FAIL: resolver returned success with an empty credential"; failures=$((failures + 1))
 elif [[ "$lf7_err" != *"no worker credential available"* ]]; then
