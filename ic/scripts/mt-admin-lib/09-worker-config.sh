@@ -543,29 +543,13 @@ EXTERNAL_WORKER_PROXY_TOOLS="memory_read memory_write knowledge_search knowledge
 
 set_external_worker_tool_allowlist() {  # <tenant> <worker> <csv|none>
   local name="$1" worker="$2" tools_arg="$3"
-  local config_path staged_in staged_out awk_status tool joined tools_line=""
+  local config_path staged_in staged_out edit_status tool tools_csv=""
   name="$(sanitize_name "$name")"
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
   require_worker_name "$worker"
+  require_cmd python3
 
-  config_path="$(tenant_state_dir "$name")/config.toml"
-  [[ -f "$config_path" ]] \
-    || die "no tenant config at $config_path (provision the tenant first)"
-  grep -q "name = \"$worker\"" "$config_path" 2>/dev/null \
-    || die "external worker '$worker' is not configured in $config_path (enable the worker first)"
-
-  # A cron-mode entry never keeps a worker-level list; refuse the write rather
-  # than recording standing authority the manager strips at load.
-  if awk -v worker="$worker" '
-    /^\[\[sandbox\.external_workers\]\][[:space:]]*$/ { in_block = 1; target = 0; next }
-    /^\[/ { in_block = 0; next }
-    in_block && $0 == "name = \"" worker "\"" { target = 1 }
-    in_block && target && $0 ~ /^mode[[:space:]]*=[[:space:]]*"cron"/ { found = 1; exit }
-    END { exit found ? 0 : 1 }
-  ' "$config_path"; then
-    die "worker '$worker' is mode = \"cron\": its worker-level tool_allowlist is stripped at load; grant cron.tool_allowlist on the mission instead (MR !1549 EF-1)"
-  fi
-
+  # Validate the request before anything touches the tenant tree.
   local -a tools=()
   if [[ "$tools_arg" != "none" ]]; then
     IFS=',' read -r -a tools <<<"$tools_arg"
@@ -580,94 +564,197 @@ set_external_worker_tool_allowlist() {  # <tenant> <worker> <csv|none>
       [[ " ${seen[*]-} " != *" $tool "* ]] || die "duplicate tool '$tool' in the grant"
       seen+=("$tool")
     done
-    joined="$(printf '"%s", ' "${tools[@]}")"
-    joined="${joined%, }"
-    tools_line="tool_allowlist = [$joined]"
+    tools_csv="$(IFS=,; printf '%s' "${tools[*]}")"
   fi
 
-  # WI#390: stage root-private outside the tenant-writable state dir (read as
-  # the tenant) and commit through the tenant-side atomic writer — same shape
-  # as upgrade_external_worker_auth_token.
+  # WI#390 (run-171 LM-2): stage the config AS THE TENANT before any check
+  # reads it — root never resolves the tenant-writable path itself, so a
+  # symlink planted there cannot feed root a file of the tenant's choosing.
+  # A missing, symlinked or foreign-owned config fails here, as the tenant.
+  config_path="$(tenant_state_dir "$name")/config.toml"
   staged_in="$(mktemp)" || return 2
-  if ! tenant_cat "$name" "$config_path" >"$staged_in"; then
+  if ! tenant_cat "$name" "$config_path" >"$staged_in" 2>/dev/null; then
     rm -f -- "$staged_in"
-    return 2
+    die "could not read the tenant config $config_path as tenant '$name' (provision the tenant first; a symlinked or foreign-owned config is refused)"
   fi
   staged_out="$(mktemp)" || { rm -f -- "$staged_in"; return 2; }
 
-  if awk \
-    -v worker="$worker" \
-    -v want="${tools_line:-}" '
-      # Two-pass shape over the same file (pass 1 classifies, pass 2 emits):
-      # replacing or inserting the key in one pass risks a duplicate ahead of
-      # an existing entry, which TOML rejects as a repeated key.
-      FNR == NR {
-        if ($0 ~ /^\[\[sandbox\.external_workers\]\][[:space:]]*$/) {
-          in_block = 1; target = 0; next
-        }
-        if ($0 ~ /^\[/) { in_block = 0; target = 0; next }
-        if (in_block && $0 == "name = \"" worker "\"") { target = 1; next }
-        if (!(in_block && target)) next
-        if (want != "" && $0 == want) { satisfied = 1 }
-        if ($0 ~ /^tool_allowlist[[:space:]]*=/) { has_list = 1 }
-        next
-      }
-      {
-        if ($0 ~ /^\[\[sandbox\.external_workers\]\][[:space:]]*$/) {
-          in_block = 1; target = 0; print; next
-        }
-        if ($0 ~ /^\[/) { in_block = 0; target = 0; print; next }
-        if (in_block && $0 == "name = \"" worker "\"") { target = 1; print; next }
-        if (in_block && target) {
-          if ($0 ~ /^tool_allowlist[[:space:]]*=/) {
-            # Replace the first list line; heal a duplicated key by dropping
-            # later copies instead of emitting the key twice.
-            if (!replaced) {
-              replaced = 1; changed = 1
-              if (want != "") { print want }
-            }
-            next
-          }
-          if (want != "" && !has_list && !done_ins && $0 ~ /^(timeout_ms|url)[[:space:]]*=/) {
-            print
-            print want
-            done_ins = 1
-            changed = 1
-            next
-          }
-        }
-        print
-      }
-      END {
-        if (satisfied) exit 42
-        if (!has_list && want == "") exit 42
-        if (!changed) exit 43
-      }
-    ' "$staged_in" "$staged_in" >"$staged_out"; then
-    if ! write_tenant_file_atomic "$name" "$config_path" 600 owned-parent <"$staged_out"; then
+  # Run-171 LM-1/LM-3: the edit runs on parsed TOML. The staged config is
+  # parsed before the edit (the worker entry must exist once, must not be
+  # mode = "cron", and must not share its endpoint with a cron worker, whose
+  # worker-level list the daemon strips at load) and after it (the result
+  # must parse and equal the input except for this entry's tool_allowlist).
+  # The existing array is replaced as a whole span, so the multi-line shape
+  # the daemon's own save_toml writes is handled instead of being torn.
+  edit_status=0
+  python3 - "$worker" "$tools_csv" "$staged_in" "$staged_out" <<'PY' || edit_status=$?
+import copy
+import json
+import re
+import sys
+import tomllib
+
+worker, tools_csv, src, dst = sys.argv[1:5]
+want = tools_csv.split(",") if tools_csv else None  # None clears the grant
+
+
+def refuse(message):
+    print(message, file=sys.stderr)
+    sys.exit(3)
+
+
+with open(src, encoding="utf-8") as handle:
+    text = handle.read()
+try:
+    before = tomllib.loads(text)
+except tomllib.TOMLDecodeError as exc:
+    refuse(f"the tenant config is not valid TOML ({exc}); repair it before changing a grant")
+
+workers = before.get("sandbox", {}).get("external_workers")
+if not isinstance(workers, list):
+    refuse(f"external worker '{worker}' is not configured in the tenant config (enable the worker first)")
+matches = [i for i, w in enumerate(workers) if isinstance(w, dict) and w.get("name") == worker]
+if not matches:
+    refuse(f"external worker '{worker}' is not configured in the tenant config (enable the worker first)")
+if len(matches) > 1:
+    refuse(f"external worker '{worker}' appears {len(matches)} times in the tenant config; repair it before changing a grant")
+idx = matches[0]
+target = workers[idx]
+if target.get("mode") == "cron":
+    refuse(f"worker '{worker}' is mode = \"cron\": its worker-level tool_allowlist is stripped at load; grant cron.tool_allowlist on the mission instead (MR !1549 EF-1)")
+url = target.get("url")
+for other in workers:
+    if other is target or not isinstance(other, dict):
+        continue
+    if other.get("mode") == "cron" and url is not None and other.get("url") == url:
+        refuse(f"worker '{worker}' shares its endpoint {url} with the cron-mode worker '{other.get('name', '?')}': a worker-level tool_allowlist there is stripped at load (MR !1561 EV-1); give the cron mission its own container")
+current = target.get("tool_allowlist")
+if (want is None and current is None) or (want is not None and current == want):
+    sys.exit(42)
+
+lines = text.splitlines(keepends=True)
+header_re = re.compile(r"^\s*\[\[\s*sandbox\.external_workers\s*\]\]\s*(#.*)?$")
+table_re = re.compile(r"^\s*\[")
+key_re = re.compile(r"^\s*tool_allowlist\s*=")
+headers = [i for i, line in enumerate(lines) if header_re.match(line)]
+if len(headers) != len(workers):
+    refuse("could not map the external worker entries onto the config text; edit the file by hand")
+start = headers[idx] + 1
+end = len(lines)
+for j in range(start, len(lines)):
+    if table_re.match(lines[j]):
+        end = j
+        break
+body = range(start, end)
+
+
+def array_end(first):
+    """Index of the line on which the array that starts on line `first` closes."""
+    depth = 0
+    seen_open = False
+    in_basic = in_literal = escape = False
+    for j in range(first, end):
+        line = lines[j]
+        k = line.index("=") + 1 if j == first else 0
+        while k < len(line):
+            char = line[k]
+            if in_basic:
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == '"':
+                    in_basic = False
+            elif in_literal:
+                if char == "'":
+                    in_literal = False
+            elif char == "#":
+                break
+            elif char == '"':
+                in_basic = True
+            elif char == "'":
+                in_literal = True
+            elif char == "[":
+                depth += 1
+                seen_open = True
+            elif char == "]":
+                depth -= 1
+                if seen_open and depth == 0:
+                    return j
+            k += 1
+    refuse("the existing tool_allowlist array does not close inside its worker entry; repair the config by hand")
+
+
+new_line = None
+if want is not None:
+    new_line = "tool_allowlist = [" + ", ".join(json.dumps(t) for t in want) + "]\n"
+key_lines = [j for j in body if key_re.match(lines[j])]
+if key_lines:
+    first = key_lines[0]
+    last = array_end(first)
+    lines[first:last + 1] = [new_line] if new_line else []
+else:
+    anchor = None
+    for pattern in (r"^\s*timeout_ms\s*=", r"^\s*url\s*=", r"^\s*name\s*="):
+        found = [j for j in body if re.match(pattern, lines[j])]
+        if found:
+            anchor = found[0]
+            break
+    if anchor is None:
+        refuse(f"could not find a line to anchor tool_allowlist on in the '{worker}' entry; edit the file by hand")
+    if not lines[anchor].endswith("\n"):
+        lines[anchor] += "\n"
+    lines.insert(anchor + 1, new_line)
+
+result = "".join(lines)
+try:
+    after = tomllib.loads(result)
+except tomllib.TOMLDecodeError as exc:
+    refuse(f"the edited config would not be valid TOML ({exc}); nothing written")
+expected = copy.deepcopy(before)
+entry = expected["sandbox"]["external_workers"][idx]
+if want is None:
+    entry.pop("tool_allowlist", None)
+else:
+    entry["tool_allowlist"] = list(want)
+if after != expected:
+    refuse("the edited config differs from the intended change outside this worker's tool_allowlist; nothing written")
+with open(dst, "w", encoding="utf-8") as handle:
+    handle.write(result)
+PY
+
+  case "$edit_status" in
+    0)
+      if ! write_tenant_file_atomic "$name" "$config_path" 600 owned-parent <"$staged_out"; then
+        rm -f -- "$staged_in" "$staged_out"
+        return 2
+      fi
       rm -f -- "$staged_in" "$staged_out"
-      return 2
-    fi
-    rm -f -- "$staged_in" "$staged_out"
-    if [[ -n "$tools_line" ]]; then
-      say "proxied tool grant applied for '$worker' (${#tools[@]} tool(s)); restart the tenant daemon to load it (restart-tenant $name)"
-    else
-      say "proxied tool grant cleared for '$worker' (deny-by-default restored); restart the tenant daemon to load it (restart-tenant $name)"
-    fi
-    return 0
-  else
-    awk_status=$?
-    rm -f -- "$staged_in" "$staged_out"
-    if [[ "$awk_status" -eq 42 ]]; then
-      if [[ -n "$tools_line" ]]; then
+      if [[ -n "$tools_csv" ]]; then
+        say "proxied tool grant applied for '$worker' (${#tools[@]} tool(s)); restart the tenant daemon to load it (restart-tenant $name)"
+      else
+        say "proxied tool grant cleared for '$worker' (deny-by-default restored); restart the tenant daemon to load it (restart-tenant $name)"
+      fi
+      return 0
+      ;;
+    42)
+      rm -f -- "$staged_in" "$staged_out"
+      if [[ -n "$tools_csv" ]]; then
         say "worker '$worker' already carries exactly this tool_allowlist (no change)"
       else
         say "worker '$worker' carries no tool_allowlist (no change)"
       fi
       return 0
-    fi
-    return 2
-  fi
+      ;;
+    3)
+      rm -f -- "$staged_in" "$staged_out"
+      die "configure-worker-tools refused the change for worker '$worker' (see above); the tenant config was not modified"
+      ;;
+    *)
+      rm -f -- "$staged_in" "$staged_out"
+      die "configure-worker-tools: the config editor failed (exit $edit_status); the tenant config was not modified"
+      ;;
+  esac
 }
 
 # Remove one external-worker array entry plus any nested child tables. Preserve
