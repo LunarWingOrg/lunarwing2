@@ -1642,12 +1642,14 @@ prepare_worker_workspace() {
 # only at container CREATE/render time — podman/docker re-resolves the bind
 # source at EVERY container start, and neither the existing-container branch
 # nor the OpenRC unit's start re-runs this check, so a tenant who swaps the
-# directory for a symlink afterwards still redirects the mount. On rootless
-# podman the container runs as the tenant uid, so the redirect grants nothing
-# the tenant could not already reach; on rootful hosts (docker default, or
-# LUNARWING_MT_ROOTLESS=false) the pebble image has no USER and runs as host
-# root with --restart unless-stopped — closing that lane needs either a
-# tenant-uid --user or a root-owned bind parent, tracked in WI#422.
+# directory for a symlink afterwards still redirects the mount. WI#422 closed
+# the escalation that remained: on rootless podman the container runs as the
+# tenant uid, so the redirect grants nothing the tenant could not already
+# reach; on rootful hosts (docker default, or LUNARWING_MT_ROOTLESS=false)
+# start_tenant_pebble now launches with `--user <tenant uid>:<gid>`
+# (PEBBLE_ROOTFUL_LAUNCH_CONTRACT force-recreates pre-fix root-running
+# containers), so a redirected bind only ever exposes what the tenant account
+# itself can already reach.
 # The pebble workspace is tenant-owned 0700; 0777 was never load-bearing.
 prepare_pebble_workspace() {  # <tenant> — prints the workspace dir
   local name="$1" lw_root workspace_dir
@@ -1955,9 +1957,16 @@ start_tenant_pebble() {
     return 0
   fi
   # Pin the tenant-store image ID into the container contract: a rebuilt image
-  # must force-recreate the container (_worker_launch_contract).
+  # must force-recreate the container (_worker_launch_contract). WI#422: the
+  # rootful base contract differs from the rootless one so every pre-fix
+  # root-running container is recreated once on its next start-tenant, picking
+  # up the tenant-uid --user launch below.
   local pebble_launch_contract
-  pebble_launch_contract="$(_worker_launch_contract "$name" lunarwing-worker-pebble:latest "$PEBBLE_ROOTLESS_LAUNCH_CONTRACT")"
+  if [[ "$MT_ROOTLESS" == "true" ]]; then
+    pebble_launch_contract="$(_worker_launch_contract "$name" lunarwing-worker-pebble:latest "$PEBBLE_ROOTLESS_LAUNCH_CONTRACT")"
+  else
+    pebble_launch_contract="$(_worker_launch_contract "$name" lunarwing-worker-pebble:latest "$PEBBLE_ROOTFUL_LAUNCH_CONTRACT")"
+  fi
 
   # systemd + rootless podman: Quadlet .container owns the lifecycle (the unit's
   # [Container] spec creates+runs it), so skip the imperative `_ctr run` below.
@@ -2056,9 +2065,36 @@ start_tenant_pebble() {
     local ssh_agent_dir
     ssh_agent_dir="$(tenant_run_dir "$name")/ssh-agent"
     ssh_mount=(-v "${ssh_agent_dir}:/tmp/ssh-agent:ro,z" -e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock)
+    # WI#422 (run-164 KY-1): rootful pebble runs as the tenant uid:gid. The
+    # image has no USER, so without --user the container (and its
+    # --restart unless-stopped resurrects) runs as host root while the runtime
+    # re-resolves the /workspace bind source at every start — a tenant who
+    # swaps ~/lunarwing/pebble-workspace for a symlink redirects host-root
+    # writes through their own pebble tasks. The numeric tenant uid has no
+    # in-image passwd entry, and the fat image bakes root-owned toolchain
+    # homes (GOPATH=/root/go; cargo needs a writable CARGO_HOME), so HOME and
+    # the toolchain caches are anchored inside the tenant-owned /workspace
+    # mount — login shells pick the same values up through the image's
+    # /etc/profile.d/toolchain snippet, which defers to preset env.
+    local -a pebble_user_args=()
+    if [[ "$MT_ROOTLESS" != "true" ]]; then
+      local pebble_tenant_uid pebble_tenant_gid
+      pebble_tenant_uid="$(id -u "$name")" \
+        || die "cannot resolve uid for tenant '$name' (rootful pebble launch)"
+      pebble_tenant_gid="$(id -g "$name")" \
+        || die "cannot resolve gid for tenant '$name' (rootful pebble launch)"
+      pebble_user_args=(
+        --user "${pebble_tenant_uid}:${pebble_tenant_gid}"
+        -e HOME=/workspace
+        -e GOPATH=/workspace/go
+        -e GOCACHE=/workspace/.cache/go-build
+        -e CARGO_HOME=/workspace/.cargo
+      )
+    fi
     _ctr "$name" run -d \
       --name "$container_name" \
       "${healthcheck_args[@]}" \
+      "${pebble_user_args[@]}" \
       -e LUNARWING_WORKER_ID="worker-pebble-${name}" \
       -e WS_PORT="$wss_port" \
       -e HEALTH_PORT="8443" \
