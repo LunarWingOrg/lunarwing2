@@ -183,6 +183,16 @@ OPENCODE2_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE2_USERNS};ssh-agent-dir-ro"
 # The pebble lane mounts the SSH agent directory like the other non-kimi
 # workers; bump the contract to recreate existing containers with RW mounts.
 PEBBLE_ROOTLESS_LAUNCH_CONTRACT="ssh-agent-dir-ro"
+# WI#422: the pebble image has no USER, so on rootful runtimes (docker, or
+# LUNARWING_MT_ROOTLESS=false) the container ran as host root — and since the
+# runtime re-resolves the /workspace bind source at every container start, a
+# tenant who swapped the workspace for a symlink got host-root writes to the
+# target. start_tenant_pebble now passes --user <tenant uid:gid> in rootful
+# mode (the workspace owner, verified by prepare_pebble_workspace). The
+# distinct rootful marker force-recreates pre-fix root-running containers on
+# the next start-tenant; rootless podman (container root maps to the tenant
+# uid) keeps the original contract.
+PEBBLE_ROOTFUL_LAUNCH_CONTRACT="user=tenant;ssh-agent-dir-ro"
 
 # ── Library sourcing ─────────────────────────────────────────────────────────
 #
