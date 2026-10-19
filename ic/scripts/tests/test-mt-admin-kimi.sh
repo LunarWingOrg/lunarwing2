@@ -119,6 +119,17 @@ for lane in opencode opencode2 pebble; do
   assert_not_contains "$worker_quadlet" 'Volume='"$fixture"'/run/ssh-agent:/tmp/ssh-agent:z' \
     "$lane quadlet does not mount the agent directory read-write"
 done
+# WI#400 run-164 KW-2: the root-bridge lanes (opencode, pebble) get the same
+# container-level no-new-privileges kimi carries; the unmigrated opencode2
+# lane is deliberately excluded (KW-1).
+for lane in opencode pebble; do
+  assert_contains "$fixture/quadlets/lunarwing-${lane}-root.container" \
+    'PodmanArgs=--security-opt=no-new-privileges' \
+    "$lane quadlet sets no-new-privileges (WI#400 KW-2)"
+done
+assert_not_contains "$fixture/quadlets/lunarwing-opencode2-root.container" \
+  'no-new-privileges' \
+  'opencode2 quadlet stays off no-new-privileges until its own WI#400 migration'
 # Quadlet's full-file hash must also notice the mount policy change.
 legacy_quadlet="$fixture/quadlets/legacy-rw.container"
 sed 's#ssh-agent:ro,z#ssh-agent:z#' "$worker_quadlet" > "$legacy_quadlet"
@@ -328,6 +339,23 @@ for lane in opencode opencode2 pebble; do
     fail "$lane imperative launch missing the read-only ssh-agent directory mount"
   fi
 done
+# WI#400 run-164 KW-2: opencode and pebble imperative launches set
+# no-new-privileges like kimi's; opencode2 stays off it until its lane
+# migrates (KW-1).
+for lane in opencode pebble; do
+  LANE_BLOCK="$(awk "/^start_tenant_${lane}\\(\\)/,/^stop_tenant_${lane}\\(\\)/" "$WORKER_LIB")"
+  if grep -Fq -- '--security-opt no-new-privileges' <<<"$LANE_BLOCK"; then
+    pass "$lane imperative launch sets no-new-privileges (WI#400 KW-2)"
+  else
+    fail "$lane imperative launch missing no-new-privileges (WI#400 KW-2)"
+  fi
+done
+OPENCODE2_BLOCK="$(awk '/^start_tenant_opencode2\(\)/,/^stop_tenant_opencode2\(\)/' "$WORKER_LIB")"
+if grep -Fq -- '--security-opt no-new-privileges' <<<"$OPENCODE2_BLOCK"; then
+  fail 'opencode2 imperative launch picked up no-new-privileges before its WI#400 migration'
+else
+  pass 'opencode2 imperative launch unchanged by WI#400 (KW-1)'
+fi
 # The launch contract must carry the policy change so existing containers
 # force-recreate instead of surviving with the old mount.
 ROOT_SCRIPT="$(dirname "$MT_ADMIN")/lunarwing-mt-admin.sh"
@@ -335,12 +363,12 @@ assert_contains "$ROOT_SCRIPT" 'KIMI_ROOTLESS_LAUNCH_CONTRACT="userns=${KIMI_USE
   'kimi launch contract records the WI#206 policy change'
 # Contract changes recreate old RW-mount containers on rootless AND rootful
 # imperative lanes. Quadlet recreations hash the rendered Volume= line.
-assert_contains "$ROOT_SCRIPT" 'OPENCODE_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE_USERNS};ssh-agent-dir-ro"' \
-  'opencode rootless launch contract records the read-only SSH mount'
+assert_contains "$ROOT_SCRIPT" 'OPENCODE_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE_USERNS};ssh-agent-dir-ro;no-new-privileges"' \
+  'opencode rootless launch contract records the read-only SSH mount and WI#400 no-new-privileges'
 assert_contains "$ROOT_SCRIPT" 'OPENCODE2_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE2_USERNS};ssh-agent-dir-ro"' \
   'opencode2 rootless launch contract records the read-only SSH mount'
-assert_contains "$ROOT_SCRIPT" 'PEBBLE_ROOTLESS_LAUNCH_CONTRACT="userns=${PEBBLE_USERNS};ssh-agent-dir-ro"' \
-  'pebble launch contract records the WI#400 task-uid userns + read-only SSH mount'
+assert_contains "$ROOT_SCRIPT" 'PEBBLE_ROOTLESS_LAUNCH_CONTRACT="userns=${PEBBLE_USERNS};ssh-agent-dir-ro;no-new-privileges"' \
+  'pebble launch contract records the WI#400 task-uid userns, read-only SSH mount, and no-new-privileges'
 assert_contains "$WORKER_LIB" 'local opencode_launch_contract="ssh-agent-dir-ro"' \
   'rootful opencode includes the SSH mount in its launch contract'
 assert_contains "$WORKER_LIB" 'local launch_contract="ssh-agent-dir-ro"' \

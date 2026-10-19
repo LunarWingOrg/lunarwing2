@@ -27,16 +27,19 @@ test("taskIdentity: non-numeric ids fail closed", () => {
   delete process.env.KIMI_TASK_GID
 })
 
-test("taskSetprivArgv: exact flag sequence, cap-clearing pair mandatory (WI#400)", () => {
+test("taskSetprivArgv: exact flag sequence, cap-clearing pair + no-new-privs mandatory (WI#400)", () => {
   // setpriv(1) preserves capabilities across the uid change unless the
   // ambient/inheritable sets are cleared — a task keeping ambient
   // SETUID/SETGID could regain the bridge uid (run-98 FY-1 prototype).
+  // --no-new-privs keeps the dropped task from regaining privilege through a
+  // setuid or file-capability binary in the image (run-164 KW-2).
   assert.deepEqual(taskSetprivArgv({ uid: 10002, gid: 10002 }), [
     "--reuid=10002",
     "--regid=10002",
     "--clear-groups",
     "--ambient-caps=-all",
     "--inh-caps=-all",
+    "--no-new-privs",
     "--",
   ])
 })

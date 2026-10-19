@@ -160,7 +160,11 @@ OPENCODE_USERNS="keep-id:uid=${OPENCODE_CONTAINER_UID},gid=${OPENCODE_CONTAINER_
 # ssh-agent-dir-ro: keep the restart-safe directory mount, but make it
 # read-only so workers cannot unlink/rebind the host agent socket (WI#226).
 # Bumping the contract recreates imperative containers still using RW mounts.
-OPENCODE_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE_USERNS};ssh-agent-dir-ro"
+# no-new-privileges (WI#400 run-164 KW-2): with the WI#400 root bridge, the
+# container-level setting keeps setuid/file-capability binaries from handing
+# privilege back to task code; recording it bumps the contract so existing
+# containers force-recreate onto the setting.
+OPENCODE_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE_USERNS};ssh-agent-dir-ro;no-new-privileges"
 
 KIMI_CONTAINER_UID="10002"
 KIMI_CONTAINER_GID="10002"
@@ -188,10 +192,14 @@ OPENCODE2_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE2_USERNS};ssh-agent-dir-ro"
 # stays reachable by tasks; the bridge's container-root identity moves into
 # the subuid range. Adding userns= bumps the contract, force-recreating
 # existing pebble containers (whose tasks ran as container root).
+# no-new-privileges (WI#400 run-164 KW-2): with the root bridge, the
+# container-level setting keeps setuid/file-capability binaries from handing
+# privilege back to task code; recording it bumps the contract so existing
+# containers force-recreate onto the setting.
 PEBBLE_CONTAINER_UID="10004"
 PEBBLE_CONTAINER_GID="10004"
 PEBBLE_USERNS="keep-id:uid=${PEBBLE_CONTAINER_UID},gid=${PEBBLE_CONTAINER_GID}"
-PEBBLE_ROOTLESS_LAUNCH_CONTRACT="userns=${PEBBLE_USERNS};ssh-agent-dir-ro"
+PEBBLE_ROOTLESS_LAUNCH_CONTRACT="userns=${PEBBLE_USERNS};ssh-agent-dir-ro;no-new-privileges"
 
 # ── Library sourcing ─────────────────────────────────────────────────────────
 #

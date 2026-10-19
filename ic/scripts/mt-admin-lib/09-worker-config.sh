@@ -1366,6 +1366,7 @@ start_tenant_opencode() {
       --name "$container_name" \
       "${healthcheck_args[@]}" \
       "${opencode_userns_args[@]}" \
+      --security-opt no-new-privileges \
       -e LUNARWING_WORKER_ID="worker-opencode-${name}" \
       -e WS_PORT="$wss_port" \
       -e HEALTH_PORT="8443" \
@@ -2073,6 +2074,7 @@ start_tenant_pebble() {
       --name "$container_name" \
       "${healthcheck_args[@]}" \
       "${pebble_userns_args[@]}" \
+      --security-opt no-new-privileges \
       -e LUNARWING_WORKER_ID="worker-pebble-${name}" \
       -e WS_PORT="$wss_port" \
       -e HEALTH_PORT="8443" \

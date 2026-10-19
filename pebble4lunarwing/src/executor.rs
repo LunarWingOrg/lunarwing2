@@ -197,8 +197,10 @@ fn spawn_pebble(
     // setpriv wraps the pebble argv; --ambient-caps=-all and --inh-caps=-all
     // are mandatory — without them setpriv preserves capabilities across
     // the uid change and the task could regain the bridge uid (run-98 FY-1
-    // prototype finding). The env assembled below is passed to setpriv and
-    // inherited by the task unchanged.
+    // prototype finding) — and --no-new-privs is mandatory too (run-164
+    // KW-2): without it a setuid or file-capability binary in the image
+    // would let task code regain privilege. The env assembled below is
+    // passed to setpriv and inherited by the task unchanged.
     let task_ids = task_ids_from_env()?;
     let mut program = std::ffi::OsString::from(&config.pebble_bin);
     let mut argv: Vec<std::ffi::OsString> =
@@ -211,6 +213,7 @@ fn spawn_pebble(
             "--clear-groups".to_string(),
             "--ambient-caps=-all".to_string(),
             "--inh-caps=-all".to_string(),
+            "--no-new-privs".to_string(),
             "--".to_string(),
         ]
         .into_iter()
@@ -968,9 +971,9 @@ mod tests {
         );
         assert!(
             text.contains(
-                "<--reuid=10004><--regid=10004><--clear-groups><--ambient-caps=-all><--inh-caps=-all><--><pebble><--output-format><json>"
+                "<--reuid=10004><--regid=10004><--clear-groups><--ambient-caps=-all><--inh-caps=-all><--no-new-privs><--><pebble><--output-format><json>"
             ),
-            "setpriv flags missing or out of order — the cap-clearing pair is mandatory (WI#400): {text}"
+            "setpriv flags missing or out of order — the cap-clearing pair and --no-new-privs are mandatory (WI#400, run-164 KW-2): {text}"
         );
     }
 }

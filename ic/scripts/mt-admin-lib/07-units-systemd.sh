@@ -560,6 +560,14 @@ EOF
       # host socket; :z shares its SELinux label across the worker lanes.
       printf 'Volume=%s:/tmp/ssh-agent:ro,z\n' "$ssh_agent_dir"
       printf 'Environment=SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock\n'
+      # WI#400 run-164 KW-2: the WI#400 root-bridge lanes get the same
+      # container-level no-new-privileges kimi has carried since WI#206 —
+      # with a root bridge, the setting keeps setuid/file-capability
+      # binaries from handing privilege back to task code. opencode2 is NOT
+      # a WI#400 root-bridge lane yet, so it is deliberately excluded.
+      case "$worker" in
+        opencode|pebble) printf 'PodmanArgs=--security-opt=no-new-privileges\n' ;;
+      esac
     fi
     # Publish the per-tenant dedicated health port (v8) -> container's 8443, so
     # the host self-heal pipeline can probe the worker directly. Container still

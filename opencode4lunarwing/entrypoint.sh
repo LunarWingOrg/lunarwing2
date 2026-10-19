@@ -46,8 +46,10 @@ fi
 
 # setpriv flags: the cap-clearing pair is mandatory — setpriv(1) preserves
 # capabilities across the uid change otherwise, and the task could regain
-# the bridge uid (run-98 FY-1 prototype finding).
-SETPRIV_FLAGS=(--reuid="$OPENCODE_TASK_UID" --regid="$OPENCODE_TASK_GID" --clear-groups --ambient-caps=-all --inh-caps=-all)
+# the bridge uid (run-98 FY-1 prototype finding). --no-new-privs is
+# mandatory too (run-164 KW-2): without it a setuid or file-capability
+# binary in the image would let task code regain privilege.
+SETPRIV_FLAGS=(--reuid="$OPENCODE_TASK_UID" --regid="$OPENCODE_TASK_GID" --clear-groups --ambient-caps=-all --inh-caps=-all --no-new-privs)
 
 # as_task CMD [ARGS...] — run a command as the task uid with the task home;
 # direct exec when already unprivileged (host-side dev runs).

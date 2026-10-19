@@ -29,7 +29,9 @@ export function taskIdentity(): TaskIdentity | null {
 /** setpriv argv prefix for the pinned task identity. The two cap-clearing
  * flags are mandatory: setpriv(1) preserves capabilities across the uid
  * change otherwise, and the task could regain the bridge uid (run-98 FY-1
- * prototype finding). */
+ * prototype finding). --no-new-privs is mandatory too (run-164 KW-2): it
+ * keeps the dropped task from ever regaining privilege through a setuid or
+ * file-capability binary in the image. */
 export function taskSetprivArgv(identity: TaskIdentity): string[] {
   return [
     `--reuid=${identity.uid}`,
@@ -37,6 +39,7 @@ export function taskSetprivArgv(identity: TaskIdentity): string[] {
     "--clear-groups",
     "--ambient-caps=-all",
     "--inh-caps=-all",
+    "--no-new-privs",
     "--",
   ]
 }
