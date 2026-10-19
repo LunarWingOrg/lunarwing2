@@ -62,8 +62,9 @@ fn baked_registration_matches_the_image_layout() {
     assert_eq!(entry["type"], "stdio");
     assert_eq!(entry["command"], "/usr/local/bin/pebble4lunarwing");
     assert_eq!(entry["args"], serde_json::json!(["mcp-shim"]));
-    let dockerfile = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Dockerfile"))
-        .expect("read Dockerfile");
+    let dockerfile =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Dockerfile"))
+            .expect("read Dockerfile");
     for needle in [
         "COPY --from=builder /build/bridge/target/release/pebble4lunarwing /usr/local/bin/pebble4lunarwing",
         "COPY pebble4lunarwing/config/settings.json /etc/lunarwing/pebble/settings.json",
@@ -85,7 +86,11 @@ fn without_the_proxy_env_the_shim_speaks_only_json_rpc_and_offers_nothing() {
             r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#,
         ],
     );
-    assert_eq!(replies.len(), 4, "one reply per request, none for the notification: {replies:?}");
+    assert_eq!(
+        replies.len(),
+        4,
+        "one reply per request, none for the notification: {replies:?}"
+    );
     assert!(replies.iter().all(|reply| reply["jsonrpc"] == "2.0"));
     assert_eq!(replies[0]["id"], 1);
     assert_eq!(replies[0]["result"]["protocolVersion"], "2025-03-26");
@@ -93,14 +98,20 @@ fn without_the_proxy_env_the_shim_speaks_only_json_rpc_and_offers_nothing() {
     assert_eq!(replies[1]["result"]["tools"], serde_json::json!([]));
     assert_eq!(replies[2]["error"]["code"], -32700);
     assert_eq!(replies[3]["id"], 3);
-    assert!(stderr.contains("advertising zero tools"), "the notice goes to stderr: {stderr}");
+    assert!(
+        stderr.contains("advertising zero tools"),
+        "the notice goes to stderr: {stderr}"
+    );
 }
 
 #[test]
 fn an_unreachable_relay_yields_no_tools_and_a_tool_error() {
     let (replies, _) = shim_exchange(
         &[
-            ("LUNARWING_TOOL_PROXY_SOCKET", "/nonexistent/lunarwing-proxy.sock"),
+            (
+                "LUNARWING_TOOL_PROXY_SOCKET",
+                "/nonexistent/lunarwing-proxy.sock",
+            ),
             ("LUNARWING_TASK_ID", "task-x"),
         ],
         &[
