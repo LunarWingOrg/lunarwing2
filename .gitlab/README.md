@@ -205,6 +205,35 @@ free space on that host (prune dangling images/build cache), then re-run the
 candidate job — the scan can only succeed after a candidate publishes
 `worker-image.env`.
 
+## worker candidate push 429 (registry auth rate limit)
+
+Symptom — a `worker-*-candidate` fails at the very last BuildKit step with:
+
+```
+ERROR: failed to push registry.git.lunarwing.org/...: failed to authorize:
+failed to fetch oauth token: unexpected status from POST request to
+https://git.lunarwing.org/jwt/auth: 429 Too Many Requests: Retry later
+```
+
+and every downstream `worker-*-scan` then fails on the missing
+`worker-image.env` guard (pipeline #5984 lost the opencode, opencode2 and
+kimi candidates plus their scans to one burst while all four candidates
+pushed at once; every job went green on retry).
+
+This is GitLab rate-limiting the registry auth realm when several candidates
+fetch push tokens concurrently. Since 2026-10-18
+`.gitlab/scripts/build-worker-image.sh` wraps both image pushes (candidate
+and clean rebuild) in a bounded retry — up to 4 attempts with 30s/60s/90s
+backoff — that fires only on this transient signature
+(`failed to fetch oauth token` / `429 Too Many Requests`); the build is
+deterministic and the retry reuses the layer cache, so only the push is
+re-executed, and a genuine build failure still exits on the first attempt.
+The publication jobs keep their pinned `retry: 0` (no blind whole-job
+re-run); the retry contract is pinned by hermetic stubbed tests in
+`.gitlab/tests/test_worker_build_args.py`. If a candidate still fails after
+all four attempts, wait a few minutes and re-run the job manually — the scan
+follows once a candidate publishes `worker-image.env`.
+
 ## worker-kimi digest mismatch (directory mtime flake)
 
 Symptom — `worker-kimi-candidate` fails with:
