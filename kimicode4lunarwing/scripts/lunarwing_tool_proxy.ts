@@ -22,7 +22,7 @@
  */
 
 import { createServer, type Server, type Socket } from "node:net"
-import { chownSync, mkdirSync, rmSync } from "node:fs"
+import { chmodSync, chownSync, mkdirSync, rmSync } from "node:fs"
 import { createHash } from "node:crypto"
 import { dirname, join } from "node:path"
 
@@ -99,7 +99,7 @@ export class ToolProxyRelay {
     if (this.tasks.has(taskId)) return null
     const socketPath = taskSocketPath(taskId)
     try {
-      mkdirSync(dirname(socketPath), { recursive: true, mode: 0o700 })
+      mkdirSync(dirname(socketPath), { recursive: true, mode: 0o711 })
       // A stale socket file from a crashed earlier task would make listen()
       // fail with EADDRINUSE; remove it (the path is hash-bound to this task).
       rmSync(socketPath, { force: true })
@@ -129,10 +129,12 @@ export class ToolProxyRelay {
     })
     if (!started) return null
     this.tasks.set(taskId, task)
-    // WI#400: the bridge runs as container root, so the dir (0700) and the
-    // socket are root-owned and the task uid could neither traverse nor
-    // connect. Hand both to the pinned task identity; root keeps full
-    // access via DAC override, and no third uid can reach the socket.
+    // WI#400: the bridge runs as container root, so the socket is
+    // root-owned and the task uid could not connect to it. Hand the
+    // per-task SOCKET to the pinned task identity, but keep the DIRECTORY
+    // root-owned 0711 (run-164 KW-6): the task uid can traverse it and
+    // reach its own socket, but can never rename, delete, or plant entries
+    // in a directory the root bridge keeps writing per-task sockets into.
     let identity: TaskIdentity | null = null
     try {
       identity = taskIdentity()
@@ -150,7 +152,11 @@ export class ToolProxyRelay {
     if (identity && typeof process.getuid === "function" && process.getuid() === 0) {
       try {
         chownSync(socketPath, identity.uid, identity.gid)
-        chownSync(dirname(socketPath), identity.uid, identity.gid)
+        // Re-assert the directory contract on every task start: a leftover
+        // task-owned directory from an older shape (or manual probing)
+        // returns to root-owned 0711.
+        chownSync(dirname(socketPath), 0, 0)
+        chmodSync(dirname(socketPath), 0o711)
       } catch (err) {
         console.error(
           `[tool-proxy] task ${taskId}: proxy chown failed (task runs without tools):`,
