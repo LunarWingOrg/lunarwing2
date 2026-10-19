@@ -1,5 +1,5 @@
-//! tool_proxy.rs — bridge-side relay for the WI#324 worker tool proxy
-//! (pebble lane, ported from kimicode4lunarwing/scripts/lunarwing_tool_proxy.ts).
+//! `tool_proxy.rs` — bridge-side relay for the WI#324 worker tool proxy
+//! (pebble lane, ported from `kimicode4lunarwing/scripts/lunarwing_tool_proxy.ts`).
 //!
 //! Owns a per-task unix-domain socket that the in-task stdio MCP shim
 //! (`mcp_shim.rs`, spawned by `pebble` via the registered `mcpServers`
@@ -9,21 +9,21 @@
 //! hub connection and are routed back to the waiting shim by call id.
 //!
 //! IPC request shapes (one JSON object per line):
-//!   {"op": "list"}
-//!   {"op": "call", "call_id": "<ident>", "name": "<tool>", "arguments": {...}}
+//!   `{"op": "list"}`
+//!   `{"op": "call", "call_id": "<ident>", "name": "<tool>", "arguments": {...}}`
 //! IPC response shapes (one line, then the relay half-closes):
-//!   {"ok": true, "tools": [...]}                    (list)
-//!   {"ok": true, "status", "output", "error"}       (call)
-//!   {"ok": false, "error": "<reason>"}              (any failure)
+//!   `{"ok": true, "tools": [...]}`                    (list)
+//!   `{"ok": true, "status", "output", "error"}`       (call)
+//!   `{"ok": false, "error": "<reason>"}`              (any failure)
 //!
-//! Bounds mirror the hub (external_worker.rs): a serialized tool_call frame
-//! must fit 256 KiB; name/call_id are [A-Za-z0-9_-]{1,128}. The relay
-//! pre-checks the frame size so an oversized call gets a clean local error
-//! instead of a hub-side frame rejection that fails the whole job.
+//! Bounds mirror the hub (`external_worker.rs`): a serialized `tool_call`
+//! frame must fit 256 KiB; name/`call_id` are `[A-Za-z0-9_-]{1,128}`. The
+//! relay pre-checks the frame size so an oversized call gets a clean local
+//! error instead of a hub-side frame rejection that fails the whole job.
 //!
 //! One relay exists per hub connection (the pebble bridge serves one daemon
 //! connection at a time per accepted socket), so the kimi lane's
-//! pendingBySocket map collapses to a single pending table scoped by the
+//! `pendingBySocket` map collapses to a single pending table scoped by the
 //! connection's lifetime; `drop_hub` on connection close is the EV-4/EF-9
 //! equivalent.
 
@@ -41,9 +41,9 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 
 use crate::protocol::{self, Envelope};
 
-/// Keep in sync with MAX_TOOL_CALL_FRAME_BYTES in
-/// ic/src/orchestrator/external_worker.rs and TOOL_CALL_FRAME_CAP_BYTES in
-/// kimicode4lunarwing/scripts/lunarwing_tool_proxy.ts.
+/// Keep in sync with `MAX_TOOL_CALL_FRAME_BYTES` in
+/// `ic/src/orchestrator/external_worker.rs` and `TOOL_CALL_FRAME_CAP_BYTES`
+/// in `kimicode4lunarwing/scripts/lunarwing_tool_proxy.ts`.
 pub const TOOL_CALL_FRAME_CAP_BYTES: usize = 256 * 1024;
 /// IPC line cap: a request line larger than this can never fit the WS frame
 /// cap, so the connection is told off and the line is dropped.
@@ -73,7 +73,7 @@ fn proxy_timeout_from_env() -> Duration {
 }
 
 /// Directory the per-task sockets live in. Overridable for tests and for
-/// operators via LUNARWING_TOOL_PROXY_DIR; kept short because unix socket
+/// operators via `LUNARWING_TOOL_PROXY_DIR`; kept short because unix socket
 /// paths cap at ~108 bytes.
 #[must_use]
 pub fn tool_proxy_dir() -> PathBuf {
@@ -122,10 +122,6 @@ pub fn task_socket_path_in(dir: &Path, task_id: &str) -> PathBuf {
     dir.join(format!("{safe}-{:016x}.sock", fnv1a_64(task_id.as_bytes())))
 }
 
-pub fn task_socket_path(task_id: &str) -> PathBuf {
-    task_socket_path_in(&tool_proxy_dir(), task_id)
-}
-
 /// Environment the task's MCP shim needs, for injection into the pebble
 /// child AFTER task-supplied env so it cannot be shadowed.
 #[must_use]
@@ -164,9 +160,9 @@ pub struct TaskProxyHandle {
 }
 
 /// One relay per hub connection. Tracks pending hub replies (the hub's
-/// tool_result/tool_catalog frames carry call_id but no task_id, so routing
-/// is scoped by the connection the reply arrived on) and one IPC server per
-/// active task.
+/// `tool_result`/`tool_catalog` frames carry `call_id` but no `task_id`, so
+/// routing is scoped by the connection the reply arrived on) and one IPC
+/// server per active task.
 pub struct ToolProxyRelay {
     core: Arc<RelayCore>,
     tasks: Mutex<HashMap<String, TaskProxy>>,
@@ -234,7 +230,7 @@ impl ToolProxyRelay {
         Some(TaskProxyHandle { socket_path })
     }
 
-    /// Route an inbound hub frame (tool_result / tool_catalog) to its
+    /// Route an inbound hub frame (`tool_result` / `tool_catalog`) to its
     /// waiter. Returns true when the frame was consumed.
     pub async fn handle_hub_frame(&self, envelope: &Envelope) -> bool {
         if !envelope.payload.is_object() {
@@ -347,7 +343,7 @@ impl Default for ToolProxyRelay {
 
 /// mkdir -p the parent dir (0o700) and remove a stale socket file from a
 /// crashed earlier task (the path is hash-bound to this task, so a leftover
-/// would make bind() fail with EADDRINUSE).
+/// would make `bind()` fail with `EADDRINUSE`).
 fn prepare_socket_path(socket_path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     if let Some(parent) = socket_path.parent() {
@@ -369,17 +365,15 @@ async fn accept_loop(
     timeout: Duration,
 ) {
     loop {
-        match listener.accept().await {
-            Ok((mut conn, _)) => {
-                let conn_core = Arc::clone(&core);
-                let conn_out = out_tx.clone();
-                let conn_task = task_id.clone();
-                tokio::spawn(async move {
-                    handle_ipc_conn(&mut conn, conn_core, conn_out, conn_task, timeout).await;
-                });
-            }
-            Err(_) => break,
-        }
+        let Ok((mut conn, _)) = listener.accept().await else {
+            break;
+        };
+        let conn_core = Arc::clone(&core);
+        let conn_out = out_tx.clone();
+        let conn_task = task_id.clone();
+        tokio::spawn(async move {
+            handle_ipc_conn(&mut conn, conn_core, conn_out, conn_task, timeout).await;
+        });
     }
 }
 
@@ -400,7 +394,7 @@ async fn handle_ipc_conn(
 ) {
     const OVER_CAP: &str = "request line exceeds the 256 KiB frame budget";
     let mut buffer: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 65_536];
+    let mut chunk = vec![0u8; 65_536].into_boxed_slice();
     let mut discarding = false;
     loop {
         if let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
@@ -439,7 +433,7 @@ async fn respond_and_drain(conn: &mut UnixStream, response: Value) {
             let _ = conn.shutdown().await;
         }
     }
-    let mut sink = [0u8; 65_536];
+    let mut sink = vec![0u8; 65_536].into_boxed_slice();
     loop {
         match conn.read(&mut sink).await {
             Ok(0) | Err(_) => break,
@@ -535,8 +529,16 @@ async fn handle_call(
             "tool_call frame exceeds the {TOOL_CALL_FRAME_CAP_BYTES}-byte hub budget"
         )});
     }
-    match send_and_wait(core, out_tx, call_id.to_string(), task_id, false, serialized, timeout)
-        .await
+    match send_and_wait(
+        core,
+        out_tx,
+        call_id.to_string(),
+        task_id,
+        false,
+        serialized,
+        timeout,
+    )
+    .await
     {
         Some(payload) => {
             let status = payload
@@ -551,9 +553,10 @@ async fn handle_call(
     }
 }
 
-/// Park a waiter and send the frame. Resolves Some(payload) with the hub's
-/// reply payload (including the error payloads synthesized by close_task /
-/// drop_hub), or None on duplicate key, send failure, or timeout.
+/// Park a waiter and send the frame. Resolves `Some(payload)` with the
+/// hub's reply payload (including the error payloads synthesized by
+/// `close_task` / `drop_hub`), or `None` on duplicate key, send failure, or
+/// timeout.
 async fn send_and_wait(
     core: &Arc<RelayCore>,
     out_tx: &Outbound,
@@ -606,17 +609,18 @@ mod tests {
 
     fn test_dir() -> PathBuf {
         let unique = TEMP_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "pebble-tool-proxy-{}-{unique}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("pebble-tool-proxy-{}-{unique}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create proxy test dir");
         dir
     }
 
     fn test_relay() -> (ToolProxyRelay, PathBuf) {
         let dir = test_dir();
-        (ToolProxyRelay::with_overrides(dir.clone(), Duration::from_secs(5)), dir)
+        (
+            ToolProxyRelay::with_overrides(dir.clone(), Duration::from_secs(5)),
+            dir,
+        )
     }
 
     fn fake_hub() -> (Outbound, mpsc::UnboundedReceiver<Message>) {
@@ -657,7 +661,10 @@ mod tests {
         let path = task_socket_path_in(dir, "task/with..bad chars");
         let name = path.file_name().unwrap().to_str().unwrap();
         assert!(!name.contains('/'));
-        assert!(name.ends_with(".sock"));
+        assert_eq!(
+            Path::new(name).extension().and_then(|e| e.to_str()),
+            Some("sock")
+        );
         assert!(path.to_str().unwrap().len() <= 108);
         assert_eq!(path, task_socket_path_in(dir, "task/with..bad chars"));
         assert_ne!(path, task_socket_path_in(dir, "task/with..bad chars2"));
@@ -693,10 +700,12 @@ mod tests {
         assert_eq!(frame.msg_type, "tool_list");
         assert_eq!(frame.payload["task_id"], "task-list");
         assert!(
-            relay.handle_hub_frame(&protocol::create_envelope(
-                "tool_catalog",
-                json!({"tools": [{"name": "memory_read"}]}),
-            )).await
+            relay
+                .handle_hub_frame(&protocol::create_envelope(
+                    "tool_catalog",
+                    json!({"tools": [{"name": "memory_read"}]}),
+                ))
+                .await
         );
         let reply = client.await.expect("client joins");
         assert_eq!(reply["ok"], true);
@@ -751,8 +760,11 @@ mod tests {
         let client = tokio::spawn({
             let socket = handle.socket_path.clone();
             async move {
-                ipc_request(&socket, &json!({"op": "call", "call_id": "c-2", "name": "shell"}))
-                    .await
+                ipc_request(
+                    &socket,
+                    &json!({"op": "call", "call_id": "c-2", "name": "shell"}),
+                )
+                .await
             }
         });
         let frame = next_hub_frame(&mut out_rx).await;
@@ -817,8 +829,11 @@ mod tests {
         let client = tokio::spawn({
             let socket = handle.socket_path.clone();
             async move {
-                ipc_request(&socket, &json!({"op": "call", "call_id": "c-3", "name": "memory_read"}))
-                    .await
+                ipc_request(
+                    &socket,
+                    &json!({"op": "call", "call_id": "c-3", "name": "memory_read"}),
+                )
+                .await
             }
         });
         let _frame = next_hub_frame(&mut out_rx).await;
@@ -840,14 +855,20 @@ mod tests {
         let client = tokio::spawn({
             let socket = handle.socket_path.clone();
             async move {
-                ipc_request(&socket, &json!({"op": "call", "call_id": "c-4", "name": "memory_read"}))
-                    .await
+                ipc_request(
+                    &socket,
+                    &json!({"op": "call", "call_id": "c-4", "name": "memory_read"}),
+                )
+                .await
             }
         });
         let _frame = next_hub_frame(&mut out_rx).await;
         relay.drop_hub().await;
         let reply = client.await.expect("client joins");
-        assert_eq!(reply["error"], "hub connection closed before the tool reply arrived");
+        assert_eq!(
+            reply["error"],
+            "hub connection closed before the tool reply arrived"
+        );
         // EV-4: a later request on the still-open task IPC fails at once.
         let reply = ipc_request(
             &handle.socket_path,
@@ -855,7 +876,10 @@ mod tests {
         )
         .await;
         assert_eq!(reply["ok"], false);
-        assert_eq!(reply["error"], "hub connection closed before the tool reply arrived");
+        assert_eq!(
+            reply["error"],
+            "hub connection closed before the tool reply arrived"
+        );
         relay.close_task("task-drop").await;
         std::fs::remove_dir_all(dir).ok();
     }
@@ -874,12 +898,18 @@ mod tests {
     async fn duplicate_call_id_and_catalog_requests_are_refused() {
         let (relay, dir) = test_relay();
         let (out_tx, mut out_rx) = fake_hub();
-        let handle = relay.start_task("task-dupcall", out_tx).await.expect("task");
+        let handle = relay
+            .start_task("task-dupcall", out_tx)
+            .await
+            .expect("task");
         let first = tokio::spawn({
             let socket = handle.socket_path.clone();
             async move {
-                ipc_request(&socket, &json!({"op": "call", "call_id": "c-6", "name": "memory_read"}))
-                    .await
+                ipc_request(
+                    &socket,
+                    &json!({"op": "call", "call_id": "c-6", "name": "memory_read"}),
+                )
+                .await
             }
         });
         let _frame = next_hub_frame(&mut out_rx).await;
@@ -899,22 +929,28 @@ mod tests {
 
     #[tokio::test]
     async fn tool_result_for_an_unknown_call_id_is_unroutable() {
-        let (relay, _dir) = test_relay();
+        let (relay, dir) = test_relay();
         assert!(
-            !relay.handle_hub_frame(&protocol::create_envelope(
-                "tool_result",
-                json!({"call_id": "nobody", "status": "success"}),
-            )).await
+            !relay
+                .handle_hub_frame(&protocol::create_envelope(
+                    "tool_result",
+                    json!({"call_id": "nobody", "status": "success"}),
+                ))
+                .await
         );
         assert!(
-            !relay.handle_hub_frame(&protocol::create_envelope(
-                "tool_catalog",
-                json!({"tools": []}),
-            )).await
+            !relay
+                .handle_hub_frame(&protocol::create_envelope(
+                    "tool_catalog",
+                    json!({"tools": []}),
+                ))
+                .await
         );
         assert!(
-            !relay.handle_hub_frame(&protocol::create_envelope("task_request", json!({}))).await
+            !relay
+                .handle_hub_frame(&protocol::create_envelope("task_request", json!({})))
+                .await
         );
-        std::fs::remove_dir_all(_dir).ok();
+        std::fs::remove_dir_all(dir).ok();
     }
 }

@@ -1,13 +1,13 @@
-//! mcp_shim.rs — thin stdio MCP server exposing the tenant's allowlisted
-//! LunarWing tools (WI#324 design item 2) to `pebble` (pebble lane, ported
-//! from kimicode4lunarwing/scripts/lunarwing_mcp_server.ts).
+//! `mcp_shim.rs` — thin stdio MCP server exposing the tenant's allowlisted
+//! hub tools (WI#324 design item 2) to `pebble` (pebble lane, ported
+//! from `kimicode4lunarwing/scripts/lunarwing_mcp_server.ts`).
 //!
 //! Pebble spawns this process per task session via the `mcpServers.lunarwing`
 //! entry in the baked `$PEBBLE_CONFIG_HOME/settings.json` and speaks MCP over
 //! stdio (newline-delimited JSON-RPC 2.0). Each request is relayed over the
-//! per-task unix socket the bridge created (LUNARWING_TOOL_PROXY_SOCKET),
-//! tagged with the job id (LUNARWING_TASK_ID); the bridge's tool-proxy relay
-//! forwards it as a tool_list / tool_call frame on the hub WebSocket and
+//! per-task unix socket the bridge created (`LUNARWING_TOOL_PROXY_SOCKET`),
+//! tagged with the job id (`LUNARWING_TASK_ID`); the bridge's tool-proxy relay
+//! forwards it as a `tool_list` / `tool_call` frame on the hub WebSocket and
 //! routes the reply back.
 //!
 //! Without the proxy env (cli mode, non-task runs) the server stays
@@ -15,7 +15,7 @@
 //! without a `tool_allowlist` grant either way.
 //!
 //! Tool surface: whatever the hub grants the worker (deny-by-default).
-//! MCP clients see them as mcp__lunarwing__<name>.
+//! MCP clients see them as `mcp__lunarwing__<name>`.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -60,10 +60,11 @@ fn request_timeout_from_env() -> Duration {
 }
 
 /// Where the per-task relay lives, from the env the bridge's executor
-/// injects into the pebble process (inherited by this MCP child).
+/// injects into the pebble process (inherited by this MCP child). The task
+/// id is required to be present (the relay socket is bound to it) but is
+/// not read back: the per-task socket is the binding.
 pub struct ShimConfig {
     pub socket_path: String,
-    pub task_id: String,
     pub timeout: Duration,
 }
 
@@ -77,7 +78,6 @@ impl ShimConfig {
         }
         Some(Self {
             socket_path,
-            task_id,
             timeout: request_timeout_from_env(),
         })
     }
@@ -114,10 +114,7 @@ impl RelayReply {
                 .get("output")
                 .and_then(Value::as_str)
                 .map(String::from),
-            error: value
-                .get("error")
-                .and_then(Value::as_str)
-                .map(String::from),
+            error: value.get("error").and_then(Value::as_str).map(String::from),
         }
     }
 }
@@ -125,10 +122,7 @@ impl RelayReply {
 /// The relay the shim forwards through; abstracted so tests can drive
 /// `handle_request` with a fake or with the real `tool_proxy` relay.
 pub(crate) trait Relay: Send + Sync {
-    fn request(
-        &self,
-        req: Value,
-    ) -> Pin<Box<dyn Future<Output = RelayReply> + Send + '_>>;
+    fn request(&self, req: Value) -> Pin<Box<dyn Future<Output = RelayReply> + Send + '_>>;
 }
 
 /// One relay request over a fresh IPC connection (NDJSON, a single line
@@ -138,10 +132,7 @@ struct UnixRelay<'a> {
 }
 
 impl Relay for UnixRelay<'_> {
-    fn request(
-        &self,
-        req: Value,
-    ) -> Pin<Box<dyn Future<Output = RelayReply> + Send + '_>> {
+    fn request(&self, req: Value) -> Pin<Box<dyn Future<Output = RelayReply> + Send + '_>> {
         Box::pin(relay_request(self.config, req))
     }
 }
@@ -158,7 +149,7 @@ async fn relay_request(config: &ShimConfig, request: Value) -> RelayReply {
             .await
             .map_err(|e| format!("tool proxy socket error: {e}"))?;
         let mut buf = Vec::new();
-        let mut chunk = [0u8; 65_536];
+        let mut chunk = vec![0u8; 65_536].into_boxed_slice();
         loop {
             if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                 let text = String::from_utf8_lossy(&buf[..pos]).trim().to_string();
@@ -175,13 +166,11 @@ async fn relay_request(config: &ShimConfig, request: Value) -> RelayReply {
     match tokio::time::timeout(config.timeout, exchange).await {
         Ok(Ok(reply)) => RelayReply::parse(&reply),
         Ok(Err(message)) => RelayReply::failed(message),
-        Err(_) => RelayReply::failed(format!(
-            "tool proxy request timed out after {timeout_ms}ms"
-        )),
+        Err(_) => RelayReply::failed(format!("tool proxy request timed out after {timeout_ms}ms")),
     }
 }
 
-fn result_response(id: &Value, result: Value) -> Value {
+fn result_response(id: &Value, result: &Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
 
@@ -216,7 +205,7 @@ pub async fn handle_request(request: &Value, relay: Option<&dyn Relay>) -> Optio
             };
             Some(result_response(
                 &id,
-                json!({
+                &json!({
                     "protocolVersion": version,
                     "capabilities": {"tools": {}},
                     "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
@@ -228,7 +217,7 @@ pub async fn handle_request(request: &Value, relay: Option<&dyn Relay>) -> Optio
             if is_notification {
                 None
             } else {
-                Some(result_response(&id, json!({})))
+                Some(result_response(&id, &json!({})))
             }
         }
         "tools/list" => Some(handle_tools_list(&id, relay).await),
@@ -238,7 +227,11 @@ pub async fn handle_request(request: &Value, relay: Option<&dyn Relay>) -> Optio
                 None
             } else {
                 let shown: String = other.chars().take(64).collect();
-                Some(error_response(&id, -32601, format!("method not supported: {shown}")))
+                Some(error_response(
+                    &id,
+                    -32601,
+                    format!("method not supported: {shown}"),
+                ))
             }
         }
     }
@@ -253,7 +246,7 @@ async fn handle_tools_list(id: &Value, relay: Option<&dyn Relay>) -> Value {
         // A proxy that is absent/misconfigured must not wedge the client:
         // an empty catalog is the safe answer (deny-by-default hub-side
         // anyway).
-        return result_response(id, json!({"tools": []}));
+        return result_response(id, &json!({"tools": []}));
     }
     let tools: Vec<Value> = reply
         .tools
@@ -274,7 +267,7 @@ async fn handle_tools_list(id: &Value, relay: Option<&dyn Relay>) -> Value {
             }))
         })
         .collect();
-    result_response(id, json!({"tools": tools}))
+    result_response(id, &json!({"tools": tools}))
 }
 
 async fn handle_tools_call(id: &Value, request: &Value, relay: Option<&dyn Relay>) -> Value {
@@ -283,7 +276,10 @@ async fn handle_tools_call(id: &Value, request: &Value, relay: Option<&dyn Relay
     if name.is_empty() {
         return error_response(id, -32602, "tools/call requires a name");
     }
-    let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     let reply = match relay {
         Some(relay) => {
             relay
@@ -298,13 +294,15 @@ async fn handle_tools_call(id: &Value, request: &Value, relay: Option<&dyn Relay
         None => RelayReply::failed("tool proxy is not configured for this task"),
     };
     if !reply.ok {
-        let text = reply.error.unwrap_or_else(|| "tool proxy failure".to_string());
+        let text = reply
+            .error
+            .unwrap_or_else(|| "tool proxy failure".to_string());
         return tool_error_result(id, &text);
     }
     if reply.status.as_deref() == Some("success") {
         return result_response(
             id,
-            json!({
+            &json!({
                 "content": [{"type": "text", "text": reply.output.unwrap_or_default()}],
                 "isError": false,
             }),
@@ -323,7 +321,7 @@ async fn handle_tools_call(id: &Value, request: &Value, relay: Option<&dyn Relay
 fn tool_error_result(id: &Value, text: &str) -> Value {
     result_response(
         id,
-        json!({
+        &json!({
             "content": [{"type": "text", "text": text}],
             "isError": true,
         }),
@@ -469,7 +467,7 @@ fn recover_request_id_from_edges(head: &[u8], tail: &[u8]) -> Option<Value> {
     };
     if let Some(rest) = head_trim.strip_prefix(HEAD_MARKER) {
         if let Some((id, used)) = parse_id_at(rest) {
-            if matches!(rest.get(used), Some(b',') | Some(b'}')) {
+            if matches!(rest.get(used), Some(b',' | b'}')) {
                 return Some(id);
             }
         }
@@ -518,7 +516,7 @@ pub async fn run() {
     let mut gate = LineGate::new();
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
-    let mut chunk = [0u8; 65_536];
+    let mut chunk = vec![0u8; 65_536].into_boxed_slice();
     loop {
         match stdin.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
@@ -563,10 +561,7 @@ mod tests {
     }
 
     impl Relay for FakeRelay {
-        fn request(
-            &self,
-            req: Value,
-        ) -> Pin<Box<dyn Future<Output = RelayReply> + Send + '_>> {
+        fn request(&self, req: Value) -> Pin<Box<dyn Future<Output = RelayReply> + Send + '_>> {
             self.seen.lock().unwrap().push(req);
             let reply = self.reply.clone();
             Box::pin(async move { reply })
@@ -621,7 +616,9 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(reply["result"], json!({}));
-        assert!(handle_request(&json!({"method": "ping"}), None).await.is_none());
+        assert!(handle_request(&json!({"method": "ping"}), None)
+            .await
+            .is_none());
 
         let reply = handle_request(&json!({"id": 8, "method": "resources/list"}), None)
             .await
@@ -654,7 +651,10 @@ mod tests {
         assert_eq!(tools[0]["name"], "memory_read");
         assert_eq!(tools[0]["inputSchema"]["type"], "object");
         assert_eq!(tools[1]["description"], "");
-        assert_eq!(tools[1]["inputSchema"], json!({"type": "object", "properties": {}}));
+        assert_eq!(
+            tools[1]["inputSchema"],
+            json!({"type": "object", "properties": {}})
+        );
     }
 
     #[tokio::test]
@@ -688,13 +688,14 @@ mod tests {
         .expect("response");
         assert_eq!(reply["result"]["isError"], false);
         assert_eq!(reply["result"]["content"][0]["text"], "the value");
-        let seen = relay.seen.lock().unwrap();
-        assert_eq!(seen[0]["op"], "call");
-        assert_eq!(seen[0]["name"], "memory_read");
-        assert_eq!(seen[0]["arguments"]["path"], "x");
-        let call_id = seen[0]["call_id"].as_str().unwrap();
-        assert!(!call_id.is_empty() && call_id.len() <= 128);
-        drop(seen);
+        {
+            let seen = relay.seen.lock().unwrap();
+            assert_eq!(seen[0]["op"], "call");
+            assert_eq!(seen[0]["name"], "memory_read");
+            assert_eq!(seen[0]["arguments"]["path"], "x");
+            let call_id = seen[0]["call_id"].as_str().unwrap();
+            assert!(!call_id.is_empty() && call_id.len() <= 128);
+        }
 
         // denied → isError carrying the hub's reason verbatim
         let relay = fake(RelayReply {
@@ -710,7 +711,10 @@ mod tests {
         .await
         .expect("response");
         assert_eq!(reply["result"]["isError"], true);
-        assert_eq!(reply["result"]["content"][0]["text"], "not in tool_allowlist");
+        assert_eq!(
+            reply["result"]["content"][0]["text"],
+            "not in tool_allowlist"
+        );
 
         // error status with only an output body
         let relay = fake(RelayReply {
@@ -773,7 +777,7 @@ mod tests {
         assert_eq!(events.len(), 2);
         match &events[0] {
             GateEvent::Line(text) => assert_eq!(text, "{\"a\":1}"),
-            _ => panic!("expected a line"),
+            GateEvent::Reject { .. } => panic!("expected a line"),
         }
     }
 
@@ -781,14 +785,16 @@ mod tests {
     fn line_gate_rejects_oversized_lines_once_with_recovered_id() {
         let mut gate = LineGate::new();
         // Over-long, newline-terminated in one chunk: id from the head.
-        let mut big = String::from("{\"jsonrpc\":\"2.0\",\"id\":41,\"method\":\"tools/call\",\"params\":{\"x\":\"");
+        let mut big = String::from(
+            "{\"jsonrpc\":\"2.0\",\"id\":41,\"method\":\"tools/call\",\"params\":{\"x\":\"",
+        );
         big.push_str(&"y".repeat(MAX_STDIN_LINE_BYTES));
         big.push_str("\"}}\n");
         let events = gate.feed(big.as_bytes());
         assert_eq!(events.len(), 1);
         match &events[0] {
             GateEvent::Reject { id } => assert_eq!(*id, Some(Value::from(41))),
-            _ => panic!("expected a reject"),
+            GateEvent::Line(_) => panic!("expected a reject"),
         }
         // The next line parses fresh.
         let events = gate.feed(b"{\"ok\":true}\n");
@@ -809,7 +815,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         match &events[0] {
             GateEvent::Reject { id } => assert_eq!(*id, Some(Value::from("abc"))),
-            _ => panic!("expected a reject"),
+            GateEvent::Line(_) => panic!("expected a reject"),
         }
     }
 
@@ -831,20 +837,16 @@ mod tests {
 
     /// The run-84-gap analog: the real shim handler drives the real relay
     /// over a real unix socket, emitting a hub frame that is answered
-    /// through handle_hub_frame.
+    /// through `handle_hub_frame`.
     #[tokio::test]
     async fn real_shim_drives_the_real_relay_to_a_hub() {
-        let dir = std::env::temp_dir().join(format!(
-            "pebble-shim-fullpath-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("pebble-shim-fullpath-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let relay = tool_proxy::ToolProxyRelay::with_overrides(dir.clone(), Duration::from_secs(5));
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
         let handle = relay.start_task("task-full", out_tx).await.expect("task");
         let config = ShimConfig {
             socket_path: handle.socket_path.to_string_lossy().into_owned(),
-            task_id: "task-full".to_string(),
             timeout: Duration::from_secs(5),
         };
         let unix = UnixRelay { config: &config };

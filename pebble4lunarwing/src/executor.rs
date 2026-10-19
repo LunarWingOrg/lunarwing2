@@ -7,6 +7,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use crate::protocol::{self, Envelope};
+use crate::tool_proxy;
 
 const MAX_HISTORY_MESSAGES: usize = 50;
 const MAX_HISTORY_MESSAGE_CHARS: usize = 10_000;
@@ -26,15 +27,31 @@ const UNTRUSTED_HISTORY_END: &str = "--- END UNTRUSTED CONVERSATION HISTORY ---"
 /// mints and persists a scoped token on the first lifecycle pass.
 const BRIDGE_AUTH_ENV_KEY: &str = "AGENT_AUTH_TOKEN";
 
-/// Bridge env rebuilt for a spawned task minus the bridge's own credentials
-/// (WI#373). Everything else is preserved — PATH, locale and the PEBBLE_*
-/// provider variables the task legitimately needs.
-fn strip_bridge_credentials(
+/// Bridge-owned env keys a task process must never inherit or supply
+/// itself. The handshake token is stripped outright (WI#373); the WI#324
+/// proxy keys are set by the bridge per task (AFTER task-supplied env, so
+/// they cannot be shadowed) — a task pointing its shim at another task's
+/// relay socket would only borrow authority the container already shares
+/// (EF-1), but the strip keeps attribution honest: proxied calls are
+/// recorded against the job the hub connection serves.
+const BRIDGE_RESERVED_ENV_KEYS: [&str; 3] = [
+    BRIDGE_AUTH_ENV_KEY,
+    tool_proxy::TASK_ID_ENV,
+    tool_proxy::PROXY_SOCKET_ENV,
+];
+
+/// Bridge env rebuilt for a spawned task minus the bridge's reserved keys
+/// (WI#373/WI#324). Everything else is preserved — PATH, locale and the
+/// PEBBLE_* provider variables the task legitimately needs.
+fn strip_bridge_reserved_env(
     env: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
-    let denied = std::ffi::OsStr::new(BRIDGE_AUTH_ENV_KEY);
     env.into_iter()
-        .filter(|(key, _)| key.as_os_str() != denied)
+        .filter(|(key, _)| {
+            !BRIDGE_RESERVED_ENV_KEYS
+                .iter()
+                .any(|reserved| key.as_os_str() == *reserved)
+        })
         .collect()
 }
 
@@ -55,11 +72,12 @@ pub async fn run_task(
     request: &protocol::TaskRequest,
     event_tx: mpsc::UnboundedSender<ExecutorEvent>,
     cancel_rx: tokio::sync::oneshot::Receiver<()>,
+    proxy_env: Option<&[(String, String); 2]>,
 ) {
     let start = Instant::now();
     let timeout_ms = request.timeout_ms.unwrap_or(protocol::DEFAULT_TIMEOUT_MS);
 
-    let mut child = match spawn_pebble(config, request) {
+    let mut child = match spawn_pebble(config, request, proxy_env) {
         Ok(child) => {
             eprintln!(
                 "[exec] {}: spawned pebble pid={:?}",
@@ -128,6 +146,7 @@ pub async fn run_task(
 fn spawn_pebble(
     config: &ExecutorConfig,
     request: &protocol::TaskRequest,
+    proxy_env: Option<&[(String, String); 2]>,
 ) -> Result<tokio::process::Child, std::io::Error> {
     let requested_dir = request
         .context
@@ -158,21 +177,32 @@ fn spawn_pebble(
 
     // WI#373: the child env is rebuilt from the bridge env with the
     // handshake credential dropped — plain inheritance would leak it into
-    // every task — and task-supplied env cannot re-inject it.
+    // every task — and task-supplied env cannot re-inject it. The WI#324
+    // proxy keys are likewise reserved: the bridge sets them per task after
+    // task-supplied env, so a task can neither inherit a stale socket path
+    // nor shadow the one the bridge issued.
     cmd.env_clear();
-    cmd.envs(strip_bridge_credentials(std::env::vars_os()));
+    cmd.envs(strip_bridge_reserved_env(std::env::vars_os()));
     for (key, value) in &request.context.environment {
-        if key.as_str() == BRIDGE_AUTH_ENV_KEY {
-            // A credential grant (or forged task entry) reusing the bridge's
-            // own handshake key is dropped; say so instead of letting the
+        if BRIDGE_RESERVED_ENV_KEYS
+            .iter()
+            .any(|reserved| *reserved == key)
+        {
+            // A credential grant (or forged task entry) reusing a
+            // bridge-reserved key is dropped; say so instead of letting the
             // value vanish silently (run-98 FY-5).
             eprintln!(
-                "[exec] {}: dropped task-supplied env entry {BRIDGE_AUTH_ENV_KEY}: reserved for the bridge handshake (WI#373)",
+                "[exec] {}: dropped task-supplied env entry {key}: reserved for the bridge (WI#373/WI#324)",
                 request.task_id
             );
             continue;
         }
         cmd.env(key, value);
+    }
+    if let Some(pairs) = proxy_env {
+        for (key, value) in pairs {
+            cmd.env(key, value);
+        }
     }
 
     cmd.spawn()
@@ -608,7 +638,7 @@ mod tests {
         // The escape check runs before the pebble binary is resolved or
         // spawned, so confinement fails closed even though the binary itself
         // would not resolve.
-        let err = spawn_pebble(&config, &req).expect_err("must reject escaping project_dir");
+        let err = spawn_pebble(&config, &req, None).expect_err("must reject escaping project_dir");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(
             err.to_string()
@@ -621,19 +651,24 @@ mod tests {
     }
 
     #[test]
-    fn strip_bridge_credentials_drops_only_the_handshake_token() {
-        let kept = strip_bridge_credentials([
+    fn strip_bridge_reserved_env_drops_exactly_the_reserved_keys() {
+        let kept = strip_bridge_reserved_env([
             ("PATH".into(), "/usr/bin".into()),
             ("PEBBLE_API_KEY".into(), "llm-key".into()),
             ("AGENT_AUTH_TOKEN".into(), "bridge-secret".into()),
+            ("LUNARWING_TASK_ID".into(), "stale-task".into()),
+            (
+                "LUNARWING_TOOL_PROXY_SOCKET".into(),
+                "/tmp/stale.sock".into(),
+            ),
             ("agent_auth_token".into(), "case-variant".into()),
         ]);
         let names: Vec<&str> = kept
             .iter()
             .map(|(key, _)| key.to_str().expect("utf-8 key"))
             .collect();
-        // Exact-key match only: the credential is dropped, unrelated keys
-        // (including case variants) are preserved.
+        // Exact-key match only: the reserved keys are dropped, unrelated
+        // keys (including case variants) are preserved.
         assert_eq!(names, ["PATH", "PEBBLE_API_KEY", "agent_auth_token"]);
     }
 
@@ -725,7 +760,7 @@ mod tests {
             "forged-by-task".to_string(),
         )]);
 
-        let child = spawn_pebble(&config, &req).expect("spawn probe stub");
+        let child = spawn_pebble(&config, &req, None).expect("spawn probe stub");
         let out = child
             .wait_with_output()
             .await
@@ -738,6 +773,72 @@ mod tests {
         );
 
         std::fs::remove_file(&stub).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// WI#324: the bridge's per-task proxy env lands in the pebble child
+    /// AFTER task-supplied env, so a task can neither shadow the issued
+    /// socket path nor supply the proxy keys when the relay is down. The
+    /// probe stub prints the two reserved keys as seen by the task process.
+    #[tokio::test]
+    async fn proxy_env_is_applied_after_task_supplied_values() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let prefix = format!("pebble-proxy-env-{}-{unique}", std::process::id());
+        let root = std::env::temp_dir().join(prefix);
+        std::fs::create_dir_all(&root).expect("create root");
+        let stub = root.join("pebble-env-probe.sh");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\necho \"TASK_ID=${LUNARWING_TASK_ID-UNSET}\"\necho \"SOCK=${LUNARWING_TOOL_PROXY_SOCKET-UNSET}\"\n",
+        )
+        .expect("write probe stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("make probe stub executable");
+
+        let config = ExecutorConfig {
+            pebble_bin: stub.to_str().expect("utf-8 stub path").to_string(),
+            model: "m".to_string(),
+            permission_mode: "danger-full-access".to_string(),
+            workspace_root: root.to_str().expect("utf-8 root").to_string(),
+        };
+
+        // Relay up: the issued values win over the task-supplied forgeries.
+        let mut req = request("probe env", vec![]);
+        req.context.environment = HashMap::from([
+            ("LUNARWING_TASK_ID".to_string(), "forged-task".to_string()),
+            (
+                "LUNARWING_TOOL_PROXY_SOCKET".to_string(),
+                "/tmp/forged.sock".to_string(),
+            ),
+        ]);
+        let proxy_env = tool_proxy::proxy_env_for_task(
+            "task-real",
+            std::path::Path::new("/tmp/lunarwing-tool-proxy/real.sock"),
+        );
+        let child = spawn_pebble(&config, &req, Some(&proxy_env)).expect("spawn probe");
+        let out = child.wait_with_output().await.expect("probe completes");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains("TASK_ID=task-real"),
+            "issued task id must win: {text}"
+        );
+        assert!(
+            text.contains("SOCK=/tmp/lunarwing-tool-proxy/real.sock"),
+            "issued socket path must win: {text}"
+        );
+        assert!(!text.contains("forged"), "task forgery must not: {text}");
+
+        // Relay down: task-supplied proxy keys are dropped outright.
+        let child = spawn_pebble(&config, &req, None).expect("spawn probe");
+        let out = child.wait_with_output().await.expect("probe completes");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains("TASK_ID=UNSET") && text.contains("SOCK=UNSET"),
+            "task-supplied proxy keys must be dropped when the relay is down: {text}"
+        );
+
         std::fs::remove_dir_all(&root).ok();
     }
 }
