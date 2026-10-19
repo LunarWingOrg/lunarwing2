@@ -206,6 +206,12 @@ resolve_worker_auth_token() {  # <tenant> <env_path>
   echo "WARNING: could not persist WORKER_AUTH_TOKEN for $env_path; falling back to GATEWAY_AUTH_TOKEN (WI#210 mitigations do NOT apply to this worker until the env file is written)." >&2
   token="$(read_tenant_env_value "$name" "$env_path" GATEWAY_AUTH_TOKEN)" \
     || die "could not safely read GATEWAY_AUTH_TOKEN from $env_path as tenant '$name'"
+  # Run-166 LF-7: an empty read here (e.g. an untraversable ancestor that the
+  # reader could not distinguish from absence before its ancestor walk) must
+  # not become "success with no token" — the callers would start the worker
+  # with AGENT_AUTH_TOKEN absent and its loopback bridge would accept
+  # unauthenticated peers. An empty credential is a hard failure.
+  [[ -n "$token" ]] || die "no worker credential available in $env_path for tenant '$name'"
   printf '%s' "$token"
 }
 
@@ -216,7 +222,13 @@ resolve_worker_auth_token() {  # <tenant> <env_path>
 upgrade_external_worker_auth_token() {
   local name="$1" worker="$2" config_path="$3" env_path="$4"
   local awk_status staged_in staged_out new_token
-  new_token="$(resolve_worker_auth_token "$name" "$env_path")"
+  # Run-166 LF-2: the resolver's die only exits the $(...) subshell; a plain
+  # assignment under suppressed errexit would continue with an empty token and
+  # the `[[ -n ]] || return 1` below would misreport the refusal as "no change
+  # needed". Report it as the failure leg of the 0/1/2 contract.
+  if ! new_token="$(resolve_worker_auth_token "$name" "$env_path")"; then
+    return 2
+  fi
   [[ -n "$new_token" ]] || return 1
 
   # WI#390 (review HH-3): never mktemp+redirect+chown as root inside the
@@ -445,8 +457,12 @@ ensure_external_worker_config() {
   # the value can never drift from what the worker container's
   # AGENT_AUTH_TOKEN will be; tenants provisioned before WORKER_AUTH_TOKEN
   # existed fall back to the gateway bearer until their next lifecycle pass
-  # migrates both sides together.
-  auth_token="$(resolve_worker_auth_token "$name" "$env_path")"
+  # migrates both sides together. Run-166 LF-2: a resolver refusal is fatal —
+  # a config.toml without the credential would run the worker bridge with
+  # auth disabled on its loopback port.
+  if ! auth_token="$(resolve_worker_auth_token "$name" "$env_path")"; then
+    return 1
+  fi
 
   # add-tenant runs before the daemon ever starts, so config.toml usually does
   # not exist yet — create it with a header. Appending a fresh
@@ -1323,7 +1339,14 @@ start_tenant_opencode() {
       local env_snapshot
       _snapshot_tenant_env "$name" "$tenant_env_path" env_snapshot
       local agent_token
-      agent_token="$(resolve_worker_auth_token "$name" "$tenant_env_path")"
+      # Run-166 LF-2: a resolver refusal is fatal — without this check the
+      # subshell die would leave agent_token empty, the env flag would be
+      # dropped, and the opencode bridge would run with auth disabled on its
+      # loopback port. The snapshot is released before dying.
+      if ! agent_token="$(resolve_worker_auth_token "$name" "$tenant_env_path")"; then
+        rm -f -- "$env_snapshot"
+        die "could not resolve the scoped worker credential for tenant '$name'"
+      fi
       [[ -n "$agent_token" ]] && env_flags+=(-e "AGENT_AUTH_TOKEN=$agent_token")
 
       local llm_api_key
@@ -1539,7 +1562,12 @@ start_tenant_opencode2() {
       local env_snapshot
       _snapshot_tenant_env "$name" "$tenant_env_path" env_snapshot
       local agent_token
-      agent_token="$(resolve_worker_auth_token "$name" "$tenant_env_path")"
+      # Run-166 LF-2: same fail-closed shape as the opencode lane above —
+      # refuse instead of starting the bridge without its credential.
+      if ! agent_token="$(resolve_worker_auth_token "$name" "$tenant_env_path")"; then
+        rm -f -- "$env_snapshot"
+        die "could not resolve the scoped worker credential for tenant '$name'"
+      fi
       [[ -n "$agent_token" ]] && env_flags+=(-e "AGENT_AUTH_TOKEN=$agent_token")
 
       local llm_api_key
@@ -2044,7 +2072,11 @@ start_tenant_pebble() {
     local env_flags=()
     if [[ -f "$tenant_env_path" ]]; then
       local agent_token
-      agent_token="$(resolve_worker_auth_token "$name" "$tenant_env_path")"
+      # Run-166 LF-2: fail closed — the pebble bridge runs with auth disabled
+      # when AGENT_AUTH_TOKEN is absent (bridge.rs treats empty as disabled).
+      if ! agent_token="$(resolve_worker_auth_token "$name" "$tenant_env_path")"; then
+        die "could not resolve the scoped worker credential for tenant '$name'"
+      fi
       [[ -n "$agent_token" ]] && env_flags+=(-e "AGENT_AUTH_TOKEN=$agent_token")
     fi
 

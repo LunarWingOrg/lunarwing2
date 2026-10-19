@@ -380,7 +380,11 @@ render_pg_quadlet() {
   local qdir pg_port pg_password
   qdir="$(tenant_quadlet_dir "$name")"
   pg_port="$(ports_get "$name" postgres)"
-  pg_password="$(tenant_pg_password "$name")"   # inlined into the 0600 tenant-owned .container
+  # Run-166 LF-3: a resolver refusal is fatal — an empty password inlined
+  # into the 0600 .container would break the tenant's database at start.
+  if ! pg_password="$(tenant_pg_password "$name")"; then
+    die "could not resolve the PostgreSQL password for tenant '$name'"
+  fi
   mkdir -p "$qdir"
   cat >"$qdir/lunarwing-pg-${name}.container" <<EOF
 [Unit]
@@ -462,7 +466,13 @@ render_worker_quadlet() {
   # resolver reads per-key as the tenant and the plain keys come from ONE
   # tenant-side snapshot, so a symlinked lunarwing.env cannot render another
   # tenant's LLM key or model into this unit.
-  agent_token="$(resolve_worker_auth_token "$name" "$tenant_env_path")"
+  # Run-166 LF-2: the resolver's die only exits the $(...) subshell, and under
+  # the lifecycle lock's "$@ || result=$?" errexit is suppressed — a plain
+  # assignment would render the unit with AGENT_AUTH_TOKEN absent, i.e. a
+  # worker whose loopback bridge accepts unauthenticated peers. Refuse.
+  if ! agent_token="$(resolve_worker_auth_token "$name" "$tenant_env_path")"; then
+    die "could not resolve the scoped worker credential for tenant '$name'"
+  fi
   _snapshot_tenant_env "$name" "$tenant_env_path" env_snapshot
   tz_key="$(_read_env_value "$env_snapshot" LLM_API_KEY)"
   # systemd treats % as a unit specifier; escape so a token containing % survives.

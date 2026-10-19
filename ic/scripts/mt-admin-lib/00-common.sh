@@ -350,8 +350,10 @@ tenant_pg_password() {
   envf="$(tenant_env_dir "$name")/lunarwing.env"
 
   _snapshot_tenant_env "$name" "$f" secret_snapshot
-  pw="$(_pg_secret_from_snapshot "$secret_snapshot")" \
-    || { rm -f -- "$secret_snapshot"; return 1; }
+  if ! pw="$(_pg_secret_from_snapshot "$secret_snapshot")"; then
+    rm -f -- "$secret_snapshot"
+    die "pg.secret for tenant '$name' is not a single password line: $f"
+  fi
   rm -f -- "$secret_snapshot"
   if [[ -n "$pw" ]]; then
     printf '%s\n' "$pw"
@@ -373,12 +375,14 @@ tenant_pg_password() {
 
 # Read the single password line out of a root-private pg.secret snapshot.
 # Callers use $(...), which strips the trailing newline. A file carrying more
-# than one line is not a shape mt-admin ever wrote — refuse it.
+# than one line — or any control character at all, which also catches a
+# leading blank line the old `grep -c .` count let through — is not a shape
+# mt-admin ever wrote: refuse it (run-166 LF-3).
 _pg_secret_from_snapshot() {  # <snapshot file>
-  local lines
-  lines="$(grep -c . -- "$1" 2>/dev/null)" || lines=0
-  [[ "$lines" -le 1 ]] || return 1
-  printf '%s' "$(<"$1")"
+  local value
+  value="$(<"$1")"
+  [[ "$value" != *[[:cntrl:]]* ]] || return 1
+  printf '%s' "$value"
 }
 
 # ── Template rendering ────────────────────────
