@@ -2,6 +2,7 @@ mod bridge;
 mod executor;
 mod health;
 mod protocol;
+mod tool_proxy;
 mod workspace_path;
 
 use std::net::SocketAddr;
