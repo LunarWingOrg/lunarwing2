@@ -165,6 +165,12 @@ case "$MODE" in
     # back to the bridge's own homedir — point it at the serve process's log.
     export OPENCODE_SERVE_LOG="${OPENCODE_SERVE_LOG-${XDG_DATA_HOME:-/home/opencode/.local/share}/opencode/log/opencode.log}"
 
+    # WI#400 (run-170 LP-1): the bridge is container root, and bun loads
+    # bunfig.toml preloads and .env from its working directory. Never start
+    # it from the task-writable workspace: a task-planted bunfig.toml would
+    # run as root at the next container start and read the hub credential.
+    # /app is root-owned (LD-2); the bridge takes WORKSPACE_ROOT from env.
+    cd /app
     exec bun run /app/scripts/lunarwing_bridge.ts
     ;;
 

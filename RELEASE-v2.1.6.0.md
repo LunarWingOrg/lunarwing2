@@ -875,8 +875,9 @@ WI#392, WI#402, and WI#408; WI#415 (the OpenRC weechat/relay/adapter/darkirc
 renderers still bake caller-PATH `python3`); and the advisory-clearing
 owners WI#418, WI#367, and WI#368. Still open from this cycle's merged
 work: WI#324 (real-worker acceptance
-evidence for every lane once the worker images are rebuilt, plus the
-mt-admin `tool_allowlist` render gap), WI#357 (the
+evidence for every lane once the worker images are rebuilt; the mt-admin
+`tool_allowlist` render gap closed with the `configure-worker-tools`
+surface), WI#357 (the
 opencode2 v2.0.26 bump stays gated), and WI#412 (pending maintainer
 acceptance). WI#400's implementation landed this cycle (token file
 handoff + task-uid split on kimi/opencode/pebble); what stays open is its

@@ -380,7 +380,11 @@ render_pg_quadlet() {
   local qdir pg_port pg_password
   qdir="$(tenant_quadlet_dir "$name")"
   pg_port="$(ports_get "$name" postgres)"
-  pg_password="$(tenant_pg_password "$name")"   # inlined into the 0600 tenant-owned .container
+  # Run-166 LF-3: a resolver refusal is fatal — an empty password inlined
+  # into the 0600 .container would break the tenant's database at start.
+  if ! pg_password="$(tenant_pg_password "$name")"; then
+    die "could not resolve the PostgreSQL password for tenant '$name'"
+  fi
   mkdir -p "$qdir"
   cat >"$qdir/lunarwing-pg-${name}.container" <<EOF
 [Unit]
@@ -454,12 +458,23 @@ render_worker_quadlet() {
   [[ "$worker" != "kimi" ]] || health_path="ready"
   mkdir -p "$qdir"
 
-  local agent_token tz_key
+  local agent_token tz_key env_snapshot
   # Scoped worker credential (WI#205): the worker is the WS server and this is
   # the only secret it validates. Never the gateway bearer — the value lands in
   # a tenant-readable 0600 unit and in `podman inspect`.
-  agent_token="$(resolve_worker_auth_token "$tenant_env_path")"
-  tz_key="$(_read_env_value "$tenant_env_path" LLM_API_KEY)"
+  # WI#423: every value below crosses into the tenant-readable unit — the
+  # resolver reads per-key as the tenant and the plain keys come from ONE
+  # tenant-side snapshot, so a symlinked lunarwing.env cannot render another
+  # tenant's LLM key or model into this unit.
+  # Run-166 LF-2: the resolver's die only exits the $(...) subshell, and under
+  # the lifecycle lock's "$@ || result=$?" errexit is suppressed — a plain
+  # assignment would render the unit with AGENT_AUTH_TOKEN absent, i.e. a
+  # worker whose loopback bridge accepts unauthenticated peers. Refuse.
+  if ! agent_token="$(resolve_worker_auth_token "$name" "$tenant_env_path")"; then
+    die "could not resolve the scoped worker credential for tenant '$name'"
+  fi
+  _snapshot_tenant_env "$name" "$tenant_env_path" env_snapshot
+  tz_key="$(_read_env_value "$env_snapshot" LLM_API_KEY)"
   # systemd treats % as a unit specifier; escape so a token containing % survives.
   agent_token="${agent_token//%/%%}"
   tz_key="${tz_key//%/%%}"
@@ -597,15 +612,16 @@ EOF
       || printf 'Environment=AGENT_AUTH_TOKEN=%s\n' "$agent_token"
     [[ "$worker" == "opencode" || "$worker" == "opencode2" ]] && [[ -n "$tz_key" ]] && printf 'Environment=TENSORZERO_API_KEY=%s\n' "$tz_key"
     local oc_model oc_base_url
-    oc_model="$(_read_env_value "$tenant_env_path" OPENCODE_MODEL)"
-    oc_base_url="$(_read_env_value "$tenant_env_path" OPENCODE_BASE_URL)"
+    oc_model="$(_read_env_value "$env_snapshot" OPENCODE_MODEL)"
+    oc_base_url="$(_read_env_value "$env_snapshot" OPENCODE_BASE_URL)"
     [[ "$worker" == "opencode" && -n "$oc_model" ]] && printf 'Environment=OPENCODE_MODEL=%s\n' "$oc_model"
     [[ "$worker" == "opencode" && -n "$oc_base_url" ]] && printf 'Environment=OPENCODE_BASE_URL=%s\n' "$oc_base_url"
     local oc2_model oc2_base_url
-    oc2_model="$(_read_env_value "$tenant_env_path" OPENCODE2_MODEL)"
-    oc2_base_url="$(_read_env_value "$tenant_env_path" OPENCODE2_BASE_URL)"
+    oc2_model="$(_read_env_value "$env_snapshot" OPENCODE2_MODEL)"
+    oc2_base_url="$(_read_env_value "$env_snapshot" OPENCODE2_BASE_URL)"
     [[ "$worker" == "opencode2" && -n "$oc2_model" ]] && printf 'Environment=OPENCODE2_MODEL=%s\n' "$oc2_model"
     [[ "$worker" == "opencode2" && -n "$oc2_base_url" ]] && printf 'Environment=OPENCODE2_BASE_URL=%s\n' "$oc2_base_url"
+    rm -f -- "$env_snapshot"
     if [[ -n "$runtime_env_path" ]]; then
       printf '# RuntimeEnvHash=%s\n' "$runtime_env_hash"
       printf 'EnvironmentFile=%s\n' "$runtime_env_path"

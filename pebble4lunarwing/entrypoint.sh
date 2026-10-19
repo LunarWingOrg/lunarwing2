@@ -7,8 +7,11 @@ PEBBLE_MODE="${PEBBLE_MODE:-websocket}"
 # rootless podman keep-id a USER-less image would land the whole entrypoint
 # on the task uid — the same uid every task drops to — and the credential
 # split would be a no-op (task-owned token file, readable bridge environ).
-# Refuse that shape instead of running without the boundary.
-if [ "$PEBBLE_MODE" = "websocket" ] && [ -n "${PEBBLE_TASK_UID:-}" ] && [ "$(id -u)" != "0" ]; then
+# Refuse that shape instead of running without the boundary. The explicit
+# `inherit` pair is the one sanctioned non-root shape: the rootful
+# tenant-uid launch (WI#422) runs the whole container as the tenant and
+# mt-admin says so; there is no split on that lane by design.
+if [ "$PEBBLE_MODE" = "websocket" ] && [ -n "${PEBBLE_TASK_UID:-}" ] && [ "${PEBBLE_TASK_UID}" != "inherit" ] && [ "$(id -u)" != "0" ]; then
   echo "[entrypoint] refusing to start: running as uid $(id -u); the bridge must be container root (image USER 0:0) so tasks can drop to ${PEBBLE_TASK_UID}" >&2
   exit 1
 fi
@@ -16,12 +19,17 @@ fi
 # WI#400: move the hub-handshake credential out of the process environment
 # before any long-lived process is spawned. It lands in a root-only file
 # the bridge reads at startup (AGENT_AUTH_TOKEN_FILE); the bridge and every
-# task spawned from here carry an environment without it. PID 1 keeps the
-# original container env (/proc/1/environ is captured at exec time), but
-# PID 1 runs as root while every task runs as PEBBLE_TASK_UID, so a
-# task-side read is EACCES — see docs/ops/WORKER-CONTAINERS.md.
+# task spawned from here carry an environment without it. PID 1 execs into
+# the bridge, so /proc/1/environ is the bridge's token-free environment,
+# and the file is 0400 root while every task runs as PEBBLE_TASK_UID, so a
+# task-side read of either is EACCES — see docs/ops/WORKER-CONTAINERS.md.
+# With the `inherit` pair (the rootful tenant-uid launch, WI#422) there is
+# no split and no root to own a file: the credential stays in the
+# environment, the pre-WI#400 shape on that lane.
 LUNARWING_TOKEN_DIR="${LUNARWING_TOKEN_DIR:-/run/lunarwing}"
-if [ -n "${AGENT_AUTH_TOKEN:-}" ]; then
+if [ -n "${AGENT_AUTH_TOKEN:-}" ] && [ "${PEBBLE_TASK_UID:-}" = "inherit" ]; then
+  echo "[entrypoint] PEBBLE_TASK_UID=inherit: no privilege split on this lane (uid $(id -u)); the hub credential stays in the environment"
+elif [ -n "${AGENT_AUTH_TOKEN:-}" ]; then
   install -d -m 0700 "$LUNARWING_TOKEN_DIR"
   _token_tmp="$LUNARWING_TOKEN_DIR/.agent_auth_token.$$"
   ( umask 0177; printf '%s' "$AGENT_AUTH_TOKEN" > "$_token_tmp" )

@@ -69,14 +69,24 @@ fn strip_bridge_reserved_env(
 /// (and PID 1's) environ gives it EACCES. The image pins the identity via
 /// `PEBBLE_TASK_UID`/`PEBBLE_TASK_GID`; both unset means "no split"
 /// (host-side dev runs and self-exec tests, where the bridge is
-/// unprivileged anyway). Exactly one set is a configuration error and fails
-/// the spawn closed. pub(crate) so the cron workspace bootstrap can hand a
-/// freshly created leaf directory to the same identity (run-164 KW-4).
+/// unprivileged anyway). Both set to `inherit` also means "no split", by
+/// design: the rootful tenant-uid launch (WI#422) runs the whole container
+/// as the tenant, and mt-admin passes the pair explicitly so the bridge can
+/// tell that lane from a rootless keep-id launch that merely started as the
+/// task uid (LD-8). Exactly one set, or `inherit` on one side only, is a
+/// configuration error and fails the spawn closed. pub(crate) so the cron
+/// workspace bootstrap can hand a freshly created leaf directory to the same
+/// identity (run-164 KW-4).
 pub(crate) fn task_ids_from_env() -> Result<Option<(u32, u32)>, std::io::Error> {
     let uid = std::env::var("PEBBLE_TASK_UID").ok();
     let gid = std::env::var("PEBBLE_TASK_GID").ok();
     match (uid, gid) {
         (None, None) => Ok(None),
+        (Some(uid), Some(gid)) if uid == "inherit" && gid == "inherit" => Ok(None),
+        (Some(uid), Some(gid)) if uid == "inherit" || gid == "inherit" => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "PEBBLE_TASK_UID/PEBBLE_TASK_GID: `inherit` must be set for both ids or neither",
+        )),
         (Some(uid), Some(gid)) => {
             let parse = |value: String, key: &str| {
                 value.parse::<u32>().map_err(|_| {
@@ -855,6 +865,9 @@ mod tests {
                     ("garbage", Some("abc"), Some("10004")),
                     ("zero-uid", Some("0"), Some("10004")),
                     ("zero-gid", Some("10004"), Some("0")),
+                    ("inherit", Some("inherit"), Some("inherit")),
+                    ("inherit-uid-only", Some("inherit"), Some("10004")),
+                    ("inherit-gid-only", Some("10004"), Some("inherit")),
                 ] {
                     let exe = std::env::current_exe().expect("test binary path");
                     let mut cmd = std::process::Command::new(exe);
@@ -887,6 +900,18 @@ mod tests {
                 assert!(
                     error.to_string().contains("must be non-zero"),
                     "zero id must fail with the no-op wording, got: {error}"
+                );
+            }
+            Some("inherit") => {
+                // WI#422 rootful launch: the explicit pair means "run tasks as
+                // the bridge identity" and is not a split.
+                assert_eq!(task_ids_from_env().expect("inherit pair is valid"), None);
+            }
+            Some("inherit-uid-only" | "inherit-gid-only") => {
+                let error = task_ids_from_env().expect_err("mixed inherit must refuse");
+                assert!(
+                    error.to_string().contains("both ids or neither"),
+                    "mixed inherit must fail with the pairing wording, got: {error}"
                 );
             }
             Some("uid-only" | "gid-only" | "garbage") => {

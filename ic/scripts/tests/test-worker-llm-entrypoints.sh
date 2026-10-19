@@ -272,8 +272,12 @@ def run_websocket_startup(worker):
         )
         serve_stub.chmod(0o755)
         bun_stub = bin_dir / "bun"
+        # WI#400 LP-1: bun loads bunfig.toml/.env from its cwd, so the root
+        # bridge must be started from /app, never from the task workspace.
+        bridge_cwd = root / "bridge-cwd.txt"
         bun_stub.write_text(
             "#!/bin/sh\n"
+            f"pwd > {bridge_cwd}\n"
             f"if [ -n \"$AGENT_AUTH_TOKEN\" ]; then echo PRESENT > {bridge_mark};"
             "elif [ -n \"$AGENT_AUTH_TOKEN_FILE\" ] && [ \"$(cat"
             " \"$AGENT_AUTH_TOKEN_FILE\" 2>/dev/null)\" = bridge-secret-64hex ];"
@@ -282,7 +286,7 @@ def run_websocket_startup(worker):
             "exit 0\n"
         )
         bun_stub.chmod(0o755)
-        script = entrypoint.replace("/app/", str(app) + "/")
+        script = entrypoint.replace("/app/", str(app) + "/").replace("cd /app\n", f"cd {app}\n")
         for user in ("opencode", "kimi"):
             script = script.replace(f"/home/{user}/", str(home) + "/")
         env = {
@@ -307,6 +311,10 @@ def run_websocket_startup(worker):
             f"{worker}: stubs did not run: {result.stderr}"
         assert serve_mark.read_text().strip() == "ABSENT", \
             f"{worker}: hub-handshake token reached the serve process env (WI#373)"
+        if worker == "opencode":  # opencode2's bridge is not root (USER 10003), so cwd is not a boundary there
+            assert bridge_cwd.exists() and \
+                Path(bridge_cwd.read_text().strip()).resolve() == app.resolve(), \
+                f"{worker}: the bridge must be exec-ed from /app, not the workspace (WI#400 LP-1): {bridge_cwd.read_text() if bridge_cwd.exists() else 'no cwd mark'}"
         assert bridge_mark.read_text().strip() == "PRESENT", \
             f"{worker}: bridge lost its handshake credential (WI#373/WI#400 env-or-file)"
 
@@ -561,6 +569,52 @@ def run_task_drop_argv(worker):
             f"{worker} setpriv argv missing mandatory flags (WI#400 KW-2/LD-7): {argv}"
 
 
+def run_pebble_websocket_inherit():
+    """WI#400 x WI#422 (run-171): the rootful tenant-uid launch passes
+    PEBBLE_TASK_UID/GID=inherit. That is the one sanctioned non-root shape:
+    the websocket entrypoint must start (no LD-8 refusal), must NOT stage a
+    root-only credential file (there is no root to own it), and must hand
+    the bridge the credential in its environment, pointer-free."""
+    entrypoint = (repo / "pebble4lunarwing" / "entrypoint.sh").read_text()
+    with temp_root("pebble-wsinh-") as temp:
+        root = Path(temp)
+        bin_dir = execable_dir(root)
+        token_dir = root / "token"
+        mark = root / "bridge-env.txt"
+        id_stub = bin_dir / "id"
+        id_stub.write_text("#!/bin/sh\necho 1042\n")
+        id_stub.chmod(0o755)
+        bridge_stub = bin_dir / "pebble4lunarwing"
+        bridge_stub.write_text(
+            "#!/bin/sh\n"
+            "{ echo \"token=${AGENT_AUTH_TOKEN:-unset}\"; "
+            "echo \"file=${AGENT_AUTH_TOKEN_FILE:-unset}\"; } > " + str(mark) + "\n"
+            "exit 0\n"
+        )
+        bridge_stub.chmod(0o755)
+        hand_tree(root)
+        hand_tree(bin_dir)
+        result = subprocess.run(
+            ["bash", "-s"],
+            input=entrypoint, text=True,
+            env={"PATH": f"{bin_dir}:{os.environ['PATH']}",
+                 "HOME": str(root), "TMPDIR": temp,
+                 "PEBBLE_MODE": "websocket",
+                 "PEBBLE_TASK_UID": "inherit",
+                 "PEBBLE_TASK_GID": "inherit",
+                 "LUNARWING_TOKEN_DIR": str(token_dir),
+                 "AGENT_AUTH_TOKEN": "bridge-secret-64hex"},
+            capture_output=True, timeout=60, **as_ci_user())
+        assert result.returncode == 0, \
+            f"pebble websocket entrypoint refused the inherit pair as a non-root bridge: {result.stderr}"
+        assert "no privilege split" in result.stdout, \
+            f"inherit launch must say there is no split on this lane: {result.stdout}"
+        assert not token_dir.exists(), \
+            "inherit launch must not stage a credential file (no root to own it)"
+        lines = mark.read_text().splitlines()
+        assert lines == ["token=bridge-secret-64hex", "file=unset"], \
+            f"inherit launch must hand the bridge the credential in env, pointer-free: {lines}"
+
 def run_pebble_websocket_refusal():
     """WI#400 LD-8: when the bridge itself runs as the task uid (the rootless
     keep-id + USER-less-image failure mode), the websocket entrypoint must
@@ -641,4 +695,6 @@ if os.geteuid() == 0:
         print(f"PASS: {worker} cli one-shot drops through setpriv with the mandatory flags (WI#400 KW-2/LD-7, root)")
 run_pebble_websocket_refusal()
 print("PASS: pebble websocket entrypoint refuses to run as the task uid (WI#400 LD-8)")
+run_pebble_websocket_inherit()
+print("PASS: pebble websocket entrypoint accepts the rootful inherit pair and keeps the credential in env (WI#400 x WI#422)")
 PY

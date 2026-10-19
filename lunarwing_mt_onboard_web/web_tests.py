@@ -95,6 +95,18 @@ class ModelMappingTests(unittest.TestCase):
         cfg = req.to_tenant_config()
         self.assertFalse(cfg.no_weechat_bootstrap)
 
+    def test_provision_docker_group_defaults_false(self) -> None:
+        """WI#389: rootless podman needs no group; opting in is deliberate."""
+        req = ProvisionRequest(name="sphinx")
+        self.assertFalse(req.docker_group)
+        cfg = req.to_tenant_config()
+        self.assertFalse(cfg.docker_group)
+
+    def test_provision_docker_group_opt_in_is_forwarded(self) -> None:
+        req = ProvisionRequest(name="sphinx", docker_group=True)
+        cfg = req.to_tenant_config()
+        self.assertTrue(cfg.docker_group)
+
     def test_upgrade_and_export_mappers(self) -> None:
         u = UpgradeRequest(
             tenant="griffin",

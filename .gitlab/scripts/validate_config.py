@@ -66,6 +66,11 @@ WORKER_SCAN_PINNED_VALUES = {
         "entrypoint": [""],
     },
     "tags": ["container-build"],
+    # Pinned with the retry itself (item 70): the bounded scan auto-retry is
+    # deliberate — transient runner kills (pipeline 5263's exit-137 SIGKILL
+    # mid SBOM) must not require a manual re-run of a read-only job — and a
+    # wider or narrower policy needs the same reviewed tuple update.
+    "retry": {"max": 1, "when": ["always"]},
     "variables": {
         "TRIVY_CACHE_DIR": "$CI_PROJECT_DIR/.trivy-cache",
         "TRIVY_NO_PROGRESS": "true",
@@ -74,8 +79,8 @@ WORKER_SCAN_PINNED_VALUES = {
     },
 }
 WORKER_SCAN_EFFECTIVE_KEYS = frozenset({
-    "artifacts", "image", "needs", "rules", "script", "stage", "tags",
-    "timeout", "variables",
+    "artifacts", "image", "needs", "retry", "rules", "script", "stage",
+    "tags", "timeout", "variables",
 })
 WORKER_SCAN_JOB_KEYS = frozenset({"extends", "needs"})
 DELIVERABLE_STATUSES = {"production", "experimental", "fixture", "mirror", "retired", "staging"}

@@ -260,6 +260,148 @@ for lane in kimicode4lunarwing opencode4lunarwing pebble4lunarwing; do
   fi
 done
 
+# WI#400 (run-170 LP-1): the opencode bridge is container root and bun loads
+# bunfig.toml/.env from its working directory, so the entrypoint must leave
+# the task-writable workspace before exec-ing the bridge.
+oc_entrypoint="$HARNESS_REPO_ROOT/opencode4lunarwing/entrypoint.sh"
+if awk '
+  /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+  /^[[:space:]]*exec bun run \/app\/scripts\/lunarwing_bridge\.ts/ { found = 1; if (prev ~ /^[[:space:]]*cd \/app[[:space:]]*$/) ok = 1 }
+  { prev = $0 }
+  END { exit (found && ok) ? 0 : 1 }
+' "$oc_entrypoint"; then
+  pass 'opencode entrypoint: the bridge is exec-ed from the root-owned /app, not the workspace (WI#400 LP-1)'
+else
+  fail 'opencode entrypoint: exec bun run of the bridge must be preceded by cd /app (WI#400 LP-1)'
+fi
+
+# WI#423 (run-171, the merge with !1784): the rootful create path below is the
+# one scenario in this harness that reaches the tenant-side credential reader,
+# which drops to the tenant with `sudo -u`. The fixture tenant is not a real
+# account (and CI runs no-new-privileges), so the drop maps onto the invoking
+# user, and the fixture env takes the production shape the tenant-side checks
+# demand: 0700 dir, 0600 file, the scoped worker credential present.
+sudo() {
+  if [[ "${1:-}" == "-u" ]]; then shift 2; fi
+  command "$@"
+}
+chmod 700 "$fixture/env"
+chmod 600 "$env_file"
+printf 'WORKER_AUTH_TOKEN=fixture-worker\n' >>"$env_file"
+
+# ── WI#422: rootful pebble launches as the tenant uid ───────────────────────
+# The fixture tenant has no passwd entry, so `id` is shadowed for exactly the
+# two lookups the lane makes (everything else falls through to the real
+# binary) and the workspace prep is stubbed to a fixture path — the create
+# path under test is the `_ctr run` invocation, not the workspace handling
+# (pinned separately by the WI#390 tests).
+id() {
+  case "$*" in
+    '-u alice') printf '1042\n' ;;
+    '-g alice') printf '1042\n' ;;
+    *) command id "$@" ;;
+  esac
+}
+prepare_pebble_workspace() { printf '%s/pebble-workspace\n' "$fixture"; }
+ensure_container_runtime() {
+  # shellcheck disable=SC2034  # read by the sourced lane functions
+  CONTAINER_RT="docker"
+  # shellcheck disable=SC2034
+  MT_ROOTLESS="false"
+}
+use_init openrc
+TRACK_EXISTENCE="true"
+CONTAINER_EXISTS="true"
+command rm -rf "$(_hash_dir alice)"
+IMAGE_ID="sha256:aaaa"
+
+if [[ "$PEBBLE_ROOTFUL_LAUNCH_CONTRACT" != "$PEBBLE_ROOTLESS_LAUNCH_CONTRACT" ]]; then
+  pass 'pebble contract: the rootful base contract differs from the rootless one'
+else
+  fail 'pebble contract: rootful and rootless base contracts are identical (no forced recreate of root-running containers)'
+fi
+
+# A pre-fix rootful container was stored under the rootless base contract
+# (the old lane used one contract in every mode): the distinct rootful base
+# must force exactly one recreate, and the replacement must launch as the
+# tenant uid:gid with the toolchain env anchored inside /workspace.
+_store_container_hash alice lunarwing-pebble-alice "$env_file" \
+  "$(_worker_launch_contract alice lunarwing-worker-pebble:latest "$PEBBLE_ROOTLESS_LAUNCH_CONTRACT")"
+CALLS=()
+start_tenant_pebble alice
+assert_call "ctr:alice rm -f lunarwing-pebble-alice" 'rootful pebble: pre-fix root-running container is force-recreated'
+if has_call_like "ctr:alice run -d --name lunarwing-pebble-alice --user 1042:1042 * lunarwing-worker-pebble:latest"; then
+  pass 'rootful pebble: fresh container launches with --user <tenant uid>:<gid>'
+else
+  fail 'rootful pebble: fresh container launches with --user <tenant uid>:<gid>'
+fi
+# LH-2 (run-167): the uid drop is one-way — no setuid/file-cap route back to
+# container root (the image ships Debian's standard setuid set).
+if has_call_like "ctr:alice run -d --name lunarwing-pebble-alice *--security-opt no-new-privileges * lunarwing-worker-pebble:latest"; then
+  pass 'rootful pebble: run carries --security-opt no-new-privileges'
+else
+  fail 'rootful pebble: run carries --security-opt no-new-privileges'
+fi
+# WI#400 x WI#422 (run-167 LH-1 / run-170 LP-2): the rootful container runs
+# as the tenant uid, so the bridge is told explicitly to run tasks as its own
+# identity (no split), and keep-id is a rootless-only mapping.
+for env_pin in '-e HOME=/workspace' '-e GOPATH=/workspace/go' \
+               '-e GOCACHE=/workspace/.cache/go-build' '-e CARGO_HOME=/workspace/.cargo' \
+               '-e PEBBLE_TASK_UID=inherit' '-e PEBBLE_TASK_GID=inherit'; do
+  if has_call_like "ctr:alice run -d --name lunarwing-pebble-alice *${env_pin} * lunarwing-worker-pebble:latest"; then
+    pass "rootful pebble: run carries ${env_pin}"
+  else
+    fail "rootful pebble: run carries ${env_pin}"
+  fi
+done
+
+if has_call_like "ctr:alice run -d --name lunarwing-pebble-alice *--userns * lunarwing-worker-pebble:latest"; then
+  fail 'rootful pebble: run must not pass --userns (keep-id is a rootless mapping)'
+else
+  pass 'rootful pebble: run does not pass --userns'
+fi
+
+# The recreate stores the rootful contract, so a second start-tenant on the
+# same image is quiet — the recreate is one-time, not per start.
+CALLS=()
+start_tenant_pebble alice
+assert_no_call "ctr:alice rm -f lunarwing-pebble-alice" 'rootful pebble: hash stored by the tenant-uid create keeps the next start quiet'
+
+# Rootless stays untouched: no --user (it would fight the rootless mapping)
+# and no workspace-anchored env overrides on that path.
+ensure_container_runtime() {
+  # shellcheck disable=SC2034  # read by the sourced lane functions
+  CONTAINER_RT="podman"
+  # shellcheck disable=SC2034
+  MT_ROOTLESS="true"
+}
+command rm -rf "$(_hash_dir alice)"
+CALLS=()
+start_tenant_pebble alice
+if has_call_like "ctr:alice run -d --name lunarwing-pebble-alice *--user * lunarwing-worker-pebble:latest"; then
+  fail 'rootless pebble: run must not pass --user'
+else
+  pass 'rootless pebble: run does not pass --user'
+fi
+if has_call_like "ctr:alice run -d --name lunarwing-pebble-alice *-e HOME=/workspace * lunarwing-worker-pebble:latest"; then
+  fail 'rootless pebble: run must not override the toolchain env'
+else
+  pass 'rootless pebble: run does not override the toolchain env'
+fi
+if has_call_like "ctr:alice run -d --name lunarwing-pebble-alice *-e PEBBLE_TASK_UID=* lunarwing-worker-pebble:latest"; then
+  fail 'rootless pebble: run must not override the image task identity (the keep-id split stays on)'
+else
+  pass 'rootless pebble: run keeps the image task identity (keep-id split)'
+fi
+if has_call_like "ctr:alice run -d --name lunarwing-pebble-alice *--userns keep-id:uid=10004,gid=10004 * lunarwing-worker-pebble:latest"; then
+  pass 'rootless pebble: run carries the keep-id userns mapping'
+else
+  fail 'rootless pebble: run carries the keep-id userns mapping (WI#400)'
+fi
+unset -f id prepare_pebble_workspace
+TRACK_EXISTENCE="false"
+CONTAINER_EXISTS="true"
+
 # ── SOURCE_REVISION stamping ─────────────────────────────────────────────────
 repo="$fixture/src"
 for dir in kimicode4lunarwing opencode4lunarwing opencode2.4lunarwing/scripts pebble4lunarwing; do

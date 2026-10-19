@@ -21,9 +21,10 @@ surface).
 What follows is **env hygiene, not a confidentiality boundary** (MR !1586
 run-98 FY-1): the token still lives in the environment of long-lived
 processes that run as the task's own uid — tini (PID 1), the entrypoint
-shell, `health_server.py`, and the bridge (pebble runs as root) — so task
-code can simply read `/proc/1/environ` (same-uid ptrace-read, which Yama
-does not block) and get it back. The strip blocks the *accidental* routes —
+shell, `health_server.py`, and the bridge (pebble runs as root in-container
+on rootless hosts, and as the tenant uid on rootful hosts since WI#422) —
+so task code can simply read `/proc/1/environ` (same-uid ptrace-read, which
+Yama does not block) and get it back. The strip blocks the *accidental* routes —
 env dumps into transcripts, logs, and LLM context, which is how WI#373 was
 observed — and is the same trust posture as the authority-domain rule below
 (one container = one uid = one authority domain). Real isolation (credential
@@ -67,7 +68,11 @@ deliberately *not* stripped: task execution needs them.
 
 ### Task-uid split (WI#400)
 
-The kimi, opencode and pebble lanes now implement WI#400's real isolation:
+The kimi, opencode and pebble lanes now implement WI#400's real isolation on
+rootless podman (the multi-tenant default). The rootful pebble launch is the
+one exception: it runs the whole container as the tenant uid with no
+bridge/task split, by design — see the rootful paragraph at the end of this
+section and "Launch identity (WI#422)" further down.
 
 - **Credential out of the environment.** The container entrypoint (root)
   writes the hub token to `/run/lunarwing/agent_auth_token` (directory
@@ -82,6 +87,12 @@ The kimi, opencode and pebble lanes now implement WI#400's real isolation:
   mandatory: without them the task keeps ambient SETUID/SETGID or regains
   privilege through a setuid/file-capability binary). `/proc/1/environ`,
   the bridge's environ, and the token file all give the task uid EACCES.
+  The opencode bridge is exec-ed from the root-owned `/app`, never from the
+  task-writable workspace: bun loads `bunfig.toml` preloads and `.env` from
+  its working directory, so a task-planted file there would otherwise run
+  as root at the next container start (run-170 LP-1). The opencode bridge's
+  credential resolver fails closed when the file pointer is set but the
+  file is unreadable or empty (run-170 LP-4), like the kimi and pebble ones.
   Kimi task-side setup (`entrypoint-task-setup.sh`) runs as the task uid —
   never as root — because everything it writes (`~/.gitconfig`, `~/.ssh`,
   `$KIMI_CODE_HOME`) is task state.
@@ -110,8 +121,12 @@ The kimi, opencode and pebble lanes now implement WI#400's real isolation:
 - **Tool-proxy socket directory.** The relay's socket directory stays
   root-owned `0711` — traversable by the task uid so its shim can connect,
   but neither listable nor writable, so task code cannot discover, rename,
-  delete, or plant entries among the root bridge's sockets. A symlinked or
-  foreign-owned directory is refused instead of followed. Only the
+  delete, or plant entries among the root bridge's sockets. A symlinked
+  directory is refused instead of followed on every lane (the TS relays
+  check with `lstat` and re-assert ownership through an `O_NOFOLLOW`
+  directory descriptor, run-170 LP-5; pebble also refuses a foreign-owned
+  directory, while the TS relays return a leftover task-owned one to root
+  `0711`). Only the
   per-task socket is handed to the task identity (mode `0600`, right after
   bind and before the task spawns); with no identity pinned (host dev runs
   and tests) the socket is left untouched.
@@ -119,30 +134,38 @@ The kimi, opencode and pebble lanes now implement WI#400's real isolation:
   and mt-admin's image-user guard continues to require exactly that); it
   gets its own lane migration, like the pebble split here.
 
-**Rootful multi-tenant pebble limitation (run-164 KW-5):** on rootful
-runtimes there is no user namespace, so the pebble task uid (10004) is a
-bare host uid shared by every tenant's pebble lane, and
-`prepare_pebble_workspace` chowns each tenant's workspace to that shared
-uid. A container escape from one tenant's pebble lane would then land on
-write access to every tenant's pebble workspace. Rootful **multi-tenant**
-pebble is therefore unsupported until the per-tenant-uid design lands —
-tracked as WI#422 (which also owns the rootful bind-source re-resolution
-issue); on rootful single-tenant hosts the split still applies and still
-isolates task code from the bridge — including across recreates: once a
-create has handed the workspace to the task uid, later creates accept that
-owner (run-166 LD-9). Rootless podman keep-id is unaffected on the task
-side (the task uid maps to the owning tenant account), and the bridge side
-is pinned by the image: the pebble image now sets `USER 0:0` like kimi and
-opencode, because under keep-id a USER-less image would start the entrypoint
-and bridge as the keep-id uid — the same uid every task drops to — making
-the split a no-op (run-166 LD-8). mt-admin's image-user guard requires
-`0:0` for pebble, and the websocket entrypoint plus the executor both
-refuse to run when the bridge lands on the task uid.
+**Rootful pebble (run-164 KW-5, resolved by WI#422):** on rootful
+runtimes there is no user namespace, so an in-container task uid (10004)
+would be a bare host uid shared by every tenant's pebble lane, and a
+container escape from one tenant's lane would land on write access to every
+tenant's pebble workspace. That design is retired: rootful pebble now runs
+the whole container as the tenant's own uid (`--user`, "Launch identity
+(WI#422)" below) with `PEBBLE_TASK_UID=inherit` and
+`PEBBLE_TASK_GID=inherit`, so each tenant's lane is its own host identity
+and the workspace stays tenant-owned — `prepare_pebble_workspace` never
+chowns it, and a workspace an older create had handed to a task uid is
+refused rather than accepted (the run-166 LD-9 acceptance went away with
+the handoff). The trade-off is explicit: there is no bridge/task split on
+rootful hosts. Task code shares the bridge's identity and environment, so
+the credential boundary WI#400 provides exists on the rootless lane only.
+The entrypoint and the executor accept the `inherit` pair as that declared
+shared-identity launch (a mixed pair fails closed) and keep refusing an
+undeclared one. Rootless podman keep-id is unaffected on the task side (the
+task uid maps to the owning tenant account), and the bridge side is pinned
+by the image: the pebble image now sets `USER 0:0` like kimi and opencode,
+because under keep-id a USER-less image would start the entrypoint and
+bridge as the keep-id uid — the same uid every task drops to — making the
+split a no-op (run-166 LD-8). mt-admin's image-user guard requires `0:0`
+for pebble, and the websocket entrypoint plus the executor both refuse to
+run when the bridge lands on the task uid without the `inherit`
+declaration.
 
 Note: before WI#400 the pebble image set no `USER`, so under rootless
 keep-id the bridge ran as the tenant uid (not root) even though the
 rootful path looked root-like; with `USER 0:0` the bridge side is now
-uniformly container root on every runtime.
+container root wherever nothing overrides it — the rootful pebble launch
+does override it with `--user <tenant uid>` (WI#422), which is why that lane
+declares `PEBBLE_TASK_UID=inherit` instead of a split.
 
 ## WebSocket message limits
 
@@ -178,8 +201,12 @@ translates MCP `tools/list` / `tools/call` into `tool_list` / `tool_call`
 frames on the existing hub WebSocket. Tools appear to the agent as
 `mcp__lunarwing__<name>`; the hub stays deny-by-default until the worker's
 `tool_allowlist` (or `cron.tool_allowlist` for tick jobs — MR !1506 CQ-10)
-grants phase-1 names. `LUNARWING_TOOL_PROXY_TIMEOUT_MS` bounds one proxied
-call (default 300000, capped 900000).
+grants phase-1 names. On multi-tenant hosts the grant is rendered by
+`lunarwing-mt-admin.sh configure-worker-tools <tenant> <worker> <tools|none>`
+(it validates against the daemon's phase-1 set, refuses `mode = "cron"`
+entries, and needs `restart-tenant` to load; editing `config.toml` by hand
+works on single-node installs). `LUNARWING_TOOL_PROXY_TIMEOUT_MS` bounds one
+proxied call (default 300000, capped 900000).
 
 The opencode worker image ships the same relay in its
 `scripts/lunarwing_bridge.ts`, but the in-task half is an opencode plugin
@@ -673,6 +700,10 @@ sudo ic/scripts/lunarwing-mt-admin.sh build-pebble-worker
 ```
 
 Persistent worker mode (`PEBBLE_MODE=websocket`). Requires `AGENT_AUTH_TOKEN` for WebSocket auth and optionally `NANOGPT_API_KEY` for the underlying NanoGPT backend (configure per-tenant via `configure-pebble <name> --nanogpt-api-key <key>`). Upstream Pebble v0.5.0 is fetched by its reviewed full commit, both Cargo builds use committed lockfiles, and base images/package indexes/toolchain downloads are pinned. See `pebble4lunarwing/` for details.
+
+Launch identity (WI#422): the image sets `USER 0:0` (WI#400 LD-8, so without an override the container is root), and the runtime re-resolves the `/workspace` bind source at every container start, so whoever the container runs as owns the escalation surface of a tenant-swapped workspace symlink. On rootless podman the bridge runs as in-container root, which maps to the invoking tenant uid — a redirected bind grants nothing the tenant could not already reach. On rootful hosts (docker, or `LUNARWING_MT_ROOTLESS=false`) `start-tenant pebble` therefore launches with `--user <tenant uid>:<gid>` plus `--security-opt no-new-privileges` (the image ships Debian's standard setuid set; with the container non-root the option closes the setuid/file-capability route back to container root, making the uid drop one-way), with `HOME`, `GOPATH`, `GOCACHE`, and `CARGO_HOME` anchored inside the tenant-owned `/workspace` mount (the numeric uid has no in-image passwd entry, and the fat image's `/root/go` and read-only `/usr/local/cargo` are unusable for caches); the distinct `PEBBLE_ROOTFUL_LAUNCH_CONTRACT` (now `tenant-uid-user;workspace-toolchain-home;no-new-privileges;task-uid-inherit`) force-recreates containers created under an older rootful shape once on their next start-tenant. The OpenRC worker unit only `podman start`s the container mt-admin created, so the create-time `--user` is what it runs. One runtime difference on the rootful path: podman synthesizes a passwd entry for `--user` (so `git` can auto-detect an identity), docker does not — `git commit` inside a docker-rootful task therefore fails with "unable to auto-detect email address" until the workspace carries a git identity (a `/workspace/.gitconfig` with `user.name`/`user.email` is enough); `HOME` is set explicitly, so nothing else depends on the missing entry (the image has `git` but no `ssh`).
+
+This is the rootful pebble identity model, and WI#400's bridge/task uid split applies to the rootless lane only. The two are reconciled (run-167 LH-1, run-170 LP-2): on rootful hosts mt-admin passes `-e PEBBLE_TASK_UID=inherit -e PEBBLE_TASK_GID=inherit`, which tells the bridge to run tasks as its own (tenant) identity — no `setpriv`, no root-only credential file (the credential stays in the container environment, the pre-WI#400 shape on this lane), no socket handoff — while the workspace stays tenant-owned (no task-uid `chown`). The pair is distinct from the image's numeric pins (the rootless keep-id split) and from the empty value (fail-closed), so the bridge still refuses a rootless keep-id launch that merely started as the task uid (LD-8). On rootless podman the image runs as container root under `--userns keep-id:uid=10004,gid=10004` and every task drops to 10004 through `setpriv`; both shapes are pinned in `test-mt-admin-worker-image-contract.sh`.
 
 In the fat (`--with-toolchains`) image the Rust/Go toolchains are anchored against the `/etc/profile` PATH reset in upstream pebble's `/bin/sh -lc` task shell (WI#334): an `/etc/profile.d` snippet plus real-binary `/usr/local/bin` symlinks and a `rustup` wrapper keep `cargo`/`go` on PATH after the reset, proven at build time in both the real spawn mode and a fully sanitised shell, and re-probed by the smoke script at the end of every fat mt-admin build (which targets a candidate tag and re-tags `:latest` only after the probe passes, using the build's own container runtime and `--pull=never`). Re-check any built image or running worker with `pebble4lunarwing/scripts/smoke-task-shell-toolchain.sh image [ref]` / `container <name>`; see `docs/ops/PEBBLE-WORKER.md` "Task-Shell Toolchain PATH".
 

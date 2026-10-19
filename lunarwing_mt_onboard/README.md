@@ -260,13 +260,16 @@ unittest.TextTestRunner(verbosity=2).run(
 
 ## Configuration file format
 
-`TenantConfig` JSON example:
+`TenantConfig` JSON example (`docker_group` defaults to `false`: rootless
+podman needs no group membership, so adding the tenant user to the
+docker/podman group is a deliberate opt-in — only useful to reach a shared
+rootful daemon socket):
 
 ```json
 {
   "name": "ruffles",
   "gateway_host": "127.0.0.1",
-  "docker_group": true,
+  "docker_group": false,
   "enable_darkirc": false,
   "xmpp_enabled": true,
   "xmpp_jid": "ruffles@xmpp.localhost",

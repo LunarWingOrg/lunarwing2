@@ -549,7 +549,8 @@ add_tenant() {
 
   # Resolve after sanitize_name so a preserved/default JID keys off the real name.
   local xmpp_jid_prev
-  xmpp_jid_prev="$(_env_existing "$(tenant_env_dir "$name")/lunarwing.env" XMPP_JID)"
+  xmpp_jid_prev="$(read_tenant_env_value "$name" "$(tenant_env_dir "$name")/lunarwing.env" XMPP_JID)" \
+    || die "could not safely read XMPP_JID from $(tenant_env_dir "$name")/lunarwing.env as tenant '$name'"
   xmpp_jid="$(resolve_tenant_xmpp_jid "$name" "$xmpp_jid")"
 
   say "=== Adding tenant: $name ==="
@@ -619,7 +620,11 @@ add_tenant() {
   local weechat_bootstrap_ok="configured"
   if [[ "$WEECHAT_BOOTSTRAP_OPT_OUT" == "true" ]]; then
     local relay_password
-    relay_password="$(_read_env_value "$(tenant_env_dir "$name")/lunarwing.env" RELAY_PASSWORD)"
+    # WI#423: tenant-side read. This bootstrap is deliberately non-fatal, so
+    # an unsafe path degrades to "credential env setup failed" like any other
+    # setup miss instead of aborting add-tenant.
+    relay_password="$(read_tenant_env_value "$name" "$(tenant_env_dir "$name")/lunarwing.env" RELAY_PASSWORD)" \
+      || relay_password=""
     if [[ -n "$relay_password" ]] && _write_weechat_env "$name" "$relay_password"; then
       weechat_bootstrap_ok="disabled (--no-weechat-bootstrap)"
     else
@@ -885,7 +890,7 @@ _wait_tenant_gateway() {
   local name="$1" env_path gateway_port gateway_token auth_header i=0
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
   gateway_port="$(ports_get "$name" gateway)"
-  gateway_token="$(_read_env_value "$env_path" GATEWAY_AUTH_TOKEN)"
+  gateway_token="$(read_tenant_env_value "$name" "$env_path" GATEWAY_AUTH_TOKEN)" || return 1
   [[ -n "$gateway_token" ]] || return 1
   auth_header="Authorization: Bearer ${gateway_token}"
   while ! curl -sf --max-time 2 \
@@ -2228,7 +2233,9 @@ coord_doctor() {
   # --- Live bridge status (authenticated loopback, non-secret) ---------------
   local bridge_port bridge_token
   bridge_port="$(ports_get "$name" bridge)"
-  bridge_token="$(_read_env_value "$bridge_env" XMPP_BRIDGE_TOKEN)"
+  # WI#423: tenant-side read; a refusal reads as absent so the doctor warns
+  # "cannot query bridge status" instead of aborting the diagnostics run.
+  bridge_token="$(read_tenant_env_value "$name" "$bridge_env" XMPP_BRIDGE_TOKEN)" || bridge_token=""
   say ""
   if [[ -n "$bridge_token" ]] && [[ -n "$bridge_port" ]]; then
     local status configured_rooms rooms_with_presence
@@ -2264,8 +2271,8 @@ coord_doctor() {
 
   # --- Coord admin knowledge counters (optional, non-secret) -----------------
   local admin_port admin_token
-  admin_port="$(_read_env_value "$daemon_env" COORD_ADMIN_PORT)"
-  admin_token="$(_read_env_value "$daemon_env" COORD_ADMIN_TOKEN)"
+  admin_port="$(read_tenant_env_value "$name" "$daemon_env" COORD_ADMIN_PORT)" || admin_port=""
+  admin_token="$(read_tenant_env_value "$name" "$daemon_env" COORD_ADMIN_TOKEN)" || admin_token=""
   say ""
   if [[ -n "$admin_token" ]] && [[ -n "$admin_port" ]]; then
     local kstatus
