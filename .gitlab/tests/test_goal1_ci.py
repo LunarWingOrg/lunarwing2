@@ -1496,6 +1496,23 @@ class DenyOwnerGateTests(unittest.TestCase):
         del merged[config.OWNER_GATE_JOB]["allow_failure"]
         self.assertEqual(self.errors(merged), [])
 
+    def test_allow_failure_value_form_is_caught(self):
+        # Run-166 LE-2: allow_failure is the one permitted extra key and its
+        # value is pinned to the two documented modes — True (warn) or
+        # absent (hard). The exit_codes hash form was the one mutant that
+        # survived the run-166 validator sweep.
+        for value in ({"exit_codes": [1]}, False, "true"):
+            with self.subTest(value=value):
+                merged = self.merged()
+                merged[config.OWNER_GATE_JOB]["allow_failure"] = value
+                self.assertTrue(
+                    any(
+                        "allow_failure must be exactly true" in error
+                        for error in self.errors(merged)
+                    ),
+                    f"allow_failure={value!r} produced no value-pin error",
+                )
+
     def test_deleted_job_is_caught(self):
         merged = self.merged()
         del merged[config.OWNER_GATE_JOB]

@@ -717,9 +717,10 @@ def validate_deny_owner_gate(merged: dict, errors: list[str]) -> None:
     gates it may set allow_failure — WI#363's documented "warns" mode while
     the maintainer's owner decision is pending (WI#363 note #10157); the
     script itself still exits 1 naming the closed WIs and advisory IDs, and
-    only a maintainer removes allow_failure (hard mode) or names owners.
-    Everything else that hollows a job (job-level when, extra keys,
-    variables/hooks/parallel) is refused exactly as for the advisory gates."""
+    only a maintainer names owners and then removes allow_failure in the
+    same change (run-166 LE-1). Everything else that hollows a job
+    (job-level when, extra keys, variables/hooks/parallel) is refused
+    exactly as for the advisory gates."""
     job = merged.get(OWNER_GATE_JOB)
     if not isinstance(job, dict):
         errors.append(
@@ -757,6 +758,17 @@ def validate_deny_owner_gate(merged: dict, errors: list[str]) -> None:
         errors.append(
             f"{OWNER_GATE_JOB} must not carry job keys {unexpected}; variables, "
             "hooks, inherit, parallel or timeout can hollow out a gate"
+        )
+    # Run-166 LE-2: allow_failure is the one permitted extra key, and its
+    # value is pinned to the two documented modes — True (warn mode) or
+    # absent (hard mode). The exit_codes hash form passed the key check and
+    # would let a non-1 exit (a crash) fail while the designed warn signal
+    # stays optional in a way the docs do not describe.
+    if "allow_failure" in effective and effective["allow_failure"] is not True:
+        errors.append(
+            f"{OWNER_GATE_JOB} allow_failure must be exactly true (the "
+            "documented warn mode) or absent (hard mode); other value "
+            "forms such as exit_codes are not documented modes"
         )
 
 
