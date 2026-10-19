@@ -90,25 +90,34 @@ fn create_cron_workspace(path: &str, workspace_root: &Path) -> io::Result<PathBu
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
             .open(path)
     };
-    // WI#400 run-164 KW-4: the bridge runs as root while the cron task runs
-    // under the separate task uid, so a freshly created leaf would stay
-    // root-owned and the task could not write its own project dir. Track
-    // whether THIS walk created the leaf; a pre-existing path is never
-    // chowned. Resolve the task identity up front: a half-set
-    // PEBBLE_TASK_UID/GID pair is a configuration error and fails closed
-    // before any directory is created.
+    // WI#400 run-164 KW-4 + LD-12: the bridge runs as root while the cron
+    // task runs under the separate task uid, so every directory THIS walk
+    // creates (intermediates and leaf alike) must be handed to the task
+    // identity — a root-owned intermediate blocks sibling creation under
+    // it. Pre-existing components are never recorded (never re-chowned).
+    // Resolve the task identity up front: a half-set PEBBLE_TASK_UID/GID
+    // pair is a configuration error and fails closed before any directory
+    // is created.
     let task_ids = crate::executor::task_ids_from_env()?;
     let mut parent = open_dir(&root)?;
     let parts: Vec<&str> = path.split('/').collect();
-    let mut leaf_created = false;
-    for (index, part) in parts.iter().enumerate() {
+    let mut created: Vec<std::fs::File> = Vec::new();
+    for part in &parts {
         let child = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd())).join(part);
+        let mut made = false;
         match create_dir(&child) {
-            Ok(()) => leaf_created = index == parts.len() - 1,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => leaf_created = false,
+            Ok(()) => made = true,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(annotate_component(part, error)),
         }
-        parent = open_dir(&child).map_err(|error| annotate_component(part, error))?;
+        let opened = open_dir(&child).map_err(|error| annotate_component(part, error))?;
+        if made {
+            let held = opened
+                .try_clone()
+                .map_err(|error| annotate_component(part, error))?;
+            created.push(held);
+        }
+        parent = opened;
     }
     let resolved = resolve_workspace_path(path, &root)?;
     // WI#375 DS-1: the descriptor walk and the re-resolved path must name
@@ -126,15 +135,16 @@ fn create_cron_workspace(path: &str, workspace_root: &Path) -> io::Result<PathBu
             ));
         }
     }
-    // KW-4: hand the newly created leaf to the task identity through the
-    // O_DIRECTORY|O_NOFOLLOW descriptor the walk still holds — no path
-    // re-resolution, no symlink window. The bridge is root, so the fchown
+    // KW-4/LD-12: hand every directory this walk created to the task
+    // identity through the held O_DIRECTORY|O_NOFOLLOW descriptors — no
+    // path re-resolution, no symlink window, and a pre-existing component
+    // (never recorded) keeps its owner. The bridge is root, so the fchown
     // cannot fail there; if it ever does (an unprivileged host run with the
-    // identity pinned), fail closed rather than leave a root-owned leaf the
-    // task cannot write.
-    if leaf_created {
-        if let Some((task_uid, task_gid)) = task_ids {
-            std::os::unix::fs::fchown(&parent, Some(task_uid), Some(task_gid))?;
+    // identity pinned), fail closed rather than leave a root-owned
+    // directory the task cannot write.
+    if let Some((task_uid, task_gid)) = task_ids {
+        for held in &created {
+            std::os::unix::fs::fchown(held, Some(task_uid), Some(task_gid))?;
         }
     }
     Ok(resolved)
@@ -623,8 +633,20 @@ mod tests {
             .expect("numeric task gid");
 
         let root = temp_root("cron-kw4");
+        // LD-12 shape: a pre-existing component plus a created intermediate
+        // and leaf. As root the pre-existing dir is chowned to a third uid so
+        // "never re-chowned" is observable; unprivileged it already carries
+        // this process's uid (same as the "self" task id, so only the root
+        // child distinguishes it — the root lane is the pin).
+        let pre = root.join("pre");
+        std::fs::create_dir(&pre).expect("create pre-existing component");
+        let self_is_root = root.metadata().expect("root metadata").uid() == 0;
+        if self_is_root {
+            std::os::unix::fs::chown(&pre, Some(65534), Some(65534))
+                .expect("chown pre-existing marker");
+        }
         let context = crate::protocol::TaskContext {
-            project_dir: Some("missions/kw4".to_string()),
+            project_dir: Some("pre/missions/kw4".to_string()),
             cron_tick: Some(serde_json::json!({"event":"cron.tick"})),
             ..Default::default()
         };
@@ -645,10 +667,33 @@ mod tests {
             let landed = mission.metadata().expect("leaf metadata");
             assert_eq!(landed.uid(), task_uid, "new leaf must be task-owned");
             assert_eq!(landed.gid(), task_gid, "new leaf must be task-group-owned");
+            // LD-12: the created INTERMEDIATE is task-owned too, or the task
+            // cannot create siblings under it.
+            let intermediate = pre.join("missions");
+            let inter_meta = intermediate.metadata().expect("intermediate metadata");
+            assert_eq!(
+                inter_meta.uid(),
+                task_uid,
+                "created intermediate must be task-owned"
+            );
+            // A pre-existing component is never re-chowned: the root child
+            // pinned it to 65534; unprivileged it keeps this process's uid.
+            let pre_meta = pre.metadata().expect("pre-existing metadata");
+            let expected_pre = if self_is_root { 65534 } else { self_uid };
+            assert_eq!(
+                pre_meta.uid(),
+                expected_pre,
+                "pre-existing component must keep its owner"
+            );
             // A pre-existing leaf is never re-chowned: the second tick takes
             // the AlreadyExists path and leaves the identity untouched.
             let again = resolve_task_workspace(&context, &root).expect("second tick succeeds");
             assert_eq!(again, mission);
+            assert_eq!(
+                pre.metadata().expect("pre-existing metadata").uid(),
+                expected_pre,
+                "second tick must not re-chown the pre-existing component"
+            );
         }
         std::fs::remove_dir_all(root).ok();
     }
