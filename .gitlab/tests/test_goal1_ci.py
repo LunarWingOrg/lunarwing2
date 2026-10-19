@@ -1453,6 +1453,113 @@ class AdvisoryGateOptionalTests(unittest.TestCase):
         self.assertIn("cargo-deny must not set allow_failure", stderr.getvalue())
 
 
+class DenyOwnerGateTests(unittest.TestCase):
+    """MR !1758 run-164 KV-1c: the WI#363 owner check rides its own
+    cargo-deny-owners job so cargo-deny stays green or red on advisories
+    alone. The job is pinned like an advisory gate (existence, exact script,
+    template rules, pinned tag/bootstrap/inputs) with one permitted extra:
+    allow_failure — WI#363's documented "warns" mode while the maintainer's
+    owner decision pends (WI#363 note #10157)."""
+
+    def merged(self) -> dict:
+        return {
+            ".rust-job": {
+                "tags": ["$CI_RUST_RUNNER_TAG"],
+                "before_script": list(config.ADVISORY_GATE_BEFORE_SCRIPT),
+                "image": copy.deepcopy(config.ADVISORY_GATE_PINNED_VALUES["image"]),
+                "cache": copy.deepcopy(config.ADVISORY_GATE_PINNED_VALUES["cache"]),
+            },
+            ".full-validation-context": {
+                "rules": [{"if": "$CI_COMMIT_BRANCH"}, {"when": "never"}]
+            },
+            config.OWNER_GATE_JOB: {
+                "extends": [".rust-job", ".full-validation-context"],
+                "script": list(config.OWNER_GATE_SCRIPT),
+                "needs": copy.deepcopy(config.ADVISORY_GATE_PINNED_VALUES["needs"]),
+                "allow_failure": True,
+            },
+        }
+
+    def errors(self, merged: dict) -> list[str]:
+        errors: list[str] = []
+        config.validate_deny_owner_gate(merged, errors)
+        return errors
+
+    def test_real_shape_passes(self):
+        self.assertEqual(self.errors(self.merged()), [])
+
+    def test_hard_mode_without_allow_failure_also_passes(self):
+        # Removing allow_failure is the maintainer's hard-mode choice: the
+        # guard stays on and gets stricter, so the validator must not refuse
+        # it (only hollowing shapes are refused).
+        merged = self.merged()
+        del merged[config.OWNER_GATE_JOB]["allow_failure"]
+        self.assertEqual(self.errors(merged), [])
+
+    def test_deleted_job_is_caught(self):
+        merged = self.merged()
+        del merged[config.OWNER_GATE_JOB]
+        self.assertTrue(any(
+            f"{config.OWNER_GATE_JOB} is missing" in error
+            for error in self.errors(merged)
+        ))
+
+    def test_hollowed_or_drifted_shapes_are_caught(self):
+        shapes = {
+            "script hollowed with exit 0": lambda m: m[config.OWNER_GATE_JOB].update(
+                {"script": ["exit 0"]}
+            ),
+            "script dropped": lambda m: m[config.OWNER_GATE_JOB].pop("script"),
+            "job-level when": lambda m: m[config.OWNER_GATE_JOB].update(
+                {"when": "manual"}
+            ),
+            "rules replaced": lambda m: m[config.OWNER_GATE_JOB].update(
+                {"rules": [{"when": "never"}]}
+            ),
+            "retagged": lambda m: m[config.OWNER_GATE_JOB].update(
+                {"tags": ["untrusted-shell"]}
+            ),
+            "extra job key": lambda m: m[config.OWNER_GATE_JOB].update(
+                {"variables": {"CI_RUST_RUNNER_TAG": "untrusted-shell"}}
+            ),
+            "needs rerouted": lambda m: m[config.OWNER_GATE_JOB].update(
+                {"needs": ["hollow-prep"]}
+            ),
+        }
+        for shape, mutate in shapes.items():
+            with self.subTest(shape=shape):
+                merged = self.merged()
+                mutate(merged)
+                self.assertTrue(
+                    self.errors(merged),
+                    f"{shape} produced no error",
+                )
+
+    def test_cargo_deny_script_carries_advisories_only(self):
+        # The KV-1 core: the owner check must not ride cargo-deny, where an
+        # owner red and a real advisory red are the same badge.
+        self.assertNotIn(
+            "check_deny_toml_owners.py", "\n".join(config.ADVISORY_GATE_SCRIPTS["cargo-deny"])
+        )
+
+    def test_real_tree_passes_and_main_runs_the_validator(self):
+        # GV-2 precedent: direct-call tests above cannot see main() wiring
+        # being deleted (run-164 applied the same standard to this prototype).
+        merged = {}
+        for include in config.EXPECTED_INCLUDES:
+            merged = config.merge_ci_hashes(
+                merged, config.load_yaml(ROOT / include.lstrip("/"))
+            )
+        merged = config.merge_ci_hashes(merged, config.load_yaml(config.ROOT_CONFIG))
+        self.assertEqual(self.errors(merged), [])
+        original_validate = config.validate_deny_owner_gate
+        with mock.patch.object(
+            config, "validate_deny_owner_gate", side_effect=original_validate
+        ) as spy:
+            self.assertEqual(config.main(), 0)
+        spy.assert_called_once()
+
+
 class CacheTrustTests(unittest.TestCase):
     """IU-3: exercise cache policy against the actual merged CI definitions."""
 
