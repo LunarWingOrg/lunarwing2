@@ -11,12 +11,13 @@
  */
 
 import assert from "node:assert/strict"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs"
 import { connect, type Socket } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import { createEnvelope } from "./lunarwing_runtime.ts"
+import { readBridgeAuthToken } from "./bridge_auth.ts"
 import {
   taskSocketPath,
   TOOL_CALL_FRAME_CAP_BYTES,
@@ -361,6 +362,73 @@ async function settle(ms = 100): Promise<void> {
   assert.notEqual(a, b)
   assert.ok(!a.includes(".."))
   assert.ok(!b.includes("\n"))
+}
+
+// ── KW-6: the relay creates the proxy dir bridge-owned 0711 — a task uid can
+// traverse it and reach its own (chowned) socket, but can never rename,
+// delete, or plant entries in it. The chown half runs only as root with a
+// pinned identity (in-image); the directory mode is pinned at creation on
+// every run. Point the relay at a NOT-yet-existing subdir so creation (and
+// its mode) is the relay's own work.
+{
+  const sub = join(workDir, "kw6-proxy")
+  process.env.LUNARWING_TOOL_PROXY_DIR = sub
+  try {
+    const hub = new FakeHubSocket()
+    const handle = await relay.startTask("task-kw6", hub)
+    assert.ok(handle, "task proxy should start")
+    assert.equal(statSync(sub).mode & 0o777, 0o711)
+    handle!.close()
+  } finally {
+    process.env.LUNARWING_TOOL_PROXY_DIR = workDir
+    rmSync(sub, { recursive: true, force: true })
+  }
+}
+
+// ── WI#400 LP-5: a symlink planted at the proxy dir path is refused, never
+// followed. The relay reports "task runs without tools" (startTask → null)
+// and the link target is left exactly as it was.
+{
+  const victim = join(workDir, "lp5-victim")
+  mkdirSync(victim, { mode: 0o700 })
+  const link = join(workDir, "lp5-proxy-link")
+  symlinkSync(victim, link)
+  process.env.LUNARWING_TOOL_PROXY_DIR = link
+  try {
+    const hub = new FakeHubSocket()
+    const handle = await relay.startTask("task-lp5", hub)
+    assert.equal(handle, null, "a symlinked proxy dir must be refused")
+    assert.deepEqual(readdirSync(victim), [], "the link target must stay untouched")
+    assert.equal(statSync(victim).mode & 0o777, 0o700, "the link target's mode must stay untouched")
+  } finally {
+    process.env.LUNARWING_TOOL_PROXY_DIR = workDir
+    rmSync(link, { force: true })
+    rmSync(victim, { recursive: true, force: true })
+  }
+}
+
+// ── WI#400 LP-4: the bridge's credential resolver fails closed when the
+// entrypoint's file pointer is set but yields no token (the env var is unset
+// by then, so the old fall-through started the server with auth disabled).
+{
+  const authDir = mkdtempSync(join(tmpdir(), "oc-bridge-auth-"))
+  try {
+    const good = join(authDir, "token")
+    writeFileSync(good, "hub-bearer\r\n", { mode: 0o400 })
+    assert.equal(readBridgeAuthToken({ AGENT_AUTH_TOKEN_FILE: good, AGENT_AUTH_TOKEN: "env-token" }), "hub-bearer", "the file wins over the env and only trailing CR/LF is trimmed")
+    const spaced = join(authDir, "spaced")
+    writeFileSync(spaced, " hub bearer ")
+    assert.equal(readBridgeAuthToken({ AGENT_AUTH_TOKEN_FILE: spaced }), " hub bearer ", "inner and leading whitespace are kept")
+    const empty = join(authDir, "empty")
+    writeFileSync(empty, "\n")
+    assert.throws(() => readBridgeAuthToken({ AGENT_AUTH_TOKEN_FILE: empty, AGENT_AUTH_TOKEN: "env-token" }), /holds no token/, "an empty file must not fall through to the env")
+    assert.throws(() => readBridgeAuthToken({ AGENT_AUTH_TOKEN_FILE: join(authDir, "missing"), AGENT_AUTH_TOKEN: "env-token" }), /cannot read AGENT_AUTH_TOKEN_FILE/, "a missing file must not fall through to the env")
+    assert.equal(readBridgeAuthToken({ AGENT_AUTH_TOKEN: "env-token" }), "env-token", "without the pointer the env is the dev fallback")
+    assert.equal(readBridgeAuthToken({}), "", "without pointer and env the token is empty (dev mode)")
+    assert.ok(existsSync(good))
+  } finally {
+    rmSync(authDir, { recursive: true, force: true })
+  }
 }
 
 restoreEnv()

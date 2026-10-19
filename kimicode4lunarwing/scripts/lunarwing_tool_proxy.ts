@@ -22,10 +22,11 @@
  */
 
 import { createServer, type Server, type Socket } from "node:net"
-import { mkdirSync, rmSync } from "node:fs"
+import { chmodSync, chownSync, closeSync, constants, fchmodSync, fchownSync, lstatSync, mkdirSync, openSync, rmSync } from "node:fs"
 import { createHash } from "node:crypto"
 import { dirname, join } from "node:path"
 
+import { taskIdentity, type TaskIdentity } from "./task_identity.js"
 import {
   createEnvelope,
   isRecord,
@@ -51,6 +52,21 @@ function proxyTimeoutMs(): number {
 
 export function toolProxyDir(): string {
   return process.env.LUNARWING_TOOL_PROXY_DIR || "/tmp/lunarwing-tool-proxy"
+}
+
+/** WI#400 (run-170 LP-5): the proxy directory is operated on by the root
+ * bridge; a symlink or non-directory at its path is refused instead of
+ * followed. A missing path is fine (the relay creates it). */
+export function refuseSymlinkedProxyDir(dir: string): void {
+  let st
+  try {
+    st = lstatSync(dir)
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return
+    throw err
+  }
+  if (st.isSymbolicLink()) throw new Error(`proxy dir ${dir} is a symlink (refused, WI#400 LP-5)`)
+  if (!st.isDirectory()) throw new Error(`proxy dir ${dir} is not a directory (refused, WI#400 LP-5)`)
 }
 
 /** Filesystem-safe per-task socket path. Task ids come from the hub but are
@@ -98,7 +114,12 @@ export class ToolProxyRelay {
     if (this.tasks.has(taskId)) return null
     const socketPath = taskSocketPath(taskId)
     try {
-      mkdirSync(dirname(socketPath), { recursive: true, mode: 0o700 })
+      // WI#400 (run-170 LP-5): the root bridge creates, chowns and chmods this
+      // directory. A symlink planted at the path (shared /tmp, a task uid can
+      // pre-create it) must be refused, never followed.
+      refuseSymlinkedProxyDir(dirname(socketPath))
+      mkdirSync(dirname(socketPath), { recursive: true, mode: 0o711 })
+      refuseSymlinkedProxyDir(dirname(socketPath))
       // A stale socket file from a crashed earlier task would make listen()
       // fail with EADDRINUSE; remove it (the path is hash-bound to this task).
       rmSync(socketPath, { force: true })
@@ -128,6 +149,50 @@ export class ToolProxyRelay {
     })
     if (!started) return null
     this.tasks.set(taskId, task)
+    // WI#400: the bridge runs as container root, so the socket is
+    // root-owned and the task uid could not connect to it. Hand the
+    // per-task SOCKET to the pinned task identity, but keep the DIRECTORY
+    // root-owned 0711 (run-164 KW-6): the task uid can traverse it and
+    // reach its own socket, but can never rename, delete, or plant entries
+    // in a directory the root bridge keeps writing per-task sockets into.
+    let identity: TaskIdentity | null = null
+    try {
+      identity = taskIdentity()
+    } catch (err) {
+      // A half-pinned identity is a configuration error; the executor's own
+      // taskIdentity() call fails the spawn closed — here the task just
+      // runs without tools.
+      console.error(
+        `[tool-proxy] task ${taskId}: task identity error (task runs without tools):`,
+        err instanceof Error ? err.message : err,
+      )
+      this.closeTask(taskId)
+      return null
+    }
+    if (identity && typeof process.getuid === "function" && process.getuid() === 0) {
+      try {
+        chownSync(socketPath, identity.uid, identity.gid)
+        // Re-assert the directory contract on every task start: a leftover
+        // task-owned directory from an older shape (or manual probing)
+        // returns to root-owned 0711.
+        // The ownership re-assert runs on an O_NOFOLLOW directory descriptor,
+        // so a symlink swapped in after the check above cannot redirect it.
+        const dirFd = openSync(dirname(socketPath), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
+        try {
+          fchownSync(dirFd, 0, 0)
+          fchmodSync(dirFd, 0o711)
+        } finally {
+          closeSync(dirFd)
+        }
+      } catch (err) {
+        console.error(
+          `[tool-proxy] task ${taskId}: proxy chown failed (task runs without tools):`,
+          err instanceof Error ? err.message : err,
+        )
+        this.closeTask(taskId)
+        return null
+      }
+    }
     return {
       socketPath,
       close: () => this.closeTask(taskId),

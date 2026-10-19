@@ -380,7 +380,11 @@ render_pg_quadlet() {
   local qdir pg_port pg_password
   qdir="$(tenant_quadlet_dir "$name")"
   pg_port="$(ports_get "$name" postgres)"
-  pg_password="$(tenant_pg_password "$name")"   # inlined into the 0600 tenant-owned .container
+  # Run-166 LF-3: a resolver refusal is fatal — an empty password inlined
+  # into the 0600 .container would break the tenant's database at start.
+  if ! pg_password="$(tenant_pg_password "$name")"; then
+    die "could not resolve the PostgreSQL password for tenant '$name'"
+  fi
   mkdir -p "$qdir"
   cat >"$qdir/lunarwing-pg-${name}.container" <<EOF
 [Unit]
@@ -454,12 +458,23 @@ render_worker_quadlet() {
   [[ "$worker" != "kimi" ]] || health_path="ready"
   mkdir -p "$qdir"
 
-  local agent_token tz_key
+  local agent_token tz_key env_snapshot
   # Scoped worker credential (WI#205): the worker is the WS server and this is
   # the only secret it validates. Never the gateway bearer — the value lands in
   # a tenant-readable 0600 unit and in `podman inspect`.
-  agent_token="$(resolve_worker_auth_token "$tenant_env_path")"
-  tz_key="$(_read_env_value "$tenant_env_path" LLM_API_KEY)"
+  # WI#423: every value below crosses into the tenant-readable unit — the
+  # resolver reads per-key as the tenant and the plain keys come from ONE
+  # tenant-side snapshot, so a symlinked lunarwing.env cannot render another
+  # tenant's LLM key or model into this unit.
+  # Run-166 LF-2: the resolver's die only exits the $(...) subshell, and under
+  # the lifecycle lock's "$@ || result=$?" errexit is suppressed — a plain
+  # assignment would render the unit with AGENT_AUTH_TOKEN absent, i.e. a
+  # worker whose loopback bridge accepts unauthenticated peers. Refuse.
+  if ! agent_token="$(resolve_worker_auth_token "$name" "$tenant_env_path")"; then
+    die "could not resolve the scoped worker credential for tenant '$name'"
+  fi
+  _snapshot_tenant_env "$name" "$tenant_env_path" env_snapshot
+  tz_key="$(_read_env_value "$env_snapshot" LLM_API_KEY)"
   # systemd treats % as a unit specifier; escape so a token containing % survives.
   agent_token="${agent_token//%/%%}"
   tz_key="${tz_key//%/%%}"
@@ -535,6 +550,10 @@ EOF
       printf 'UserNS=%s\n' "$KIMI_USERNS"
     elif [[ "$worker" == "opencode2" ]]; then
       printf 'UserNS=%s\n' "$OPENCODE2_USERNS"
+    elif [[ "$worker" == "pebble" ]]; then
+      # WI#400: pebble tasks run under a uid separate from the bridge;
+      # keep-id binds that task uid to the tenant account.
+      printf 'UserNS=%s\n' "$PEBBLE_USERNS"
     fi
     # WI#206: the kimi lane gets no SSH-agent socket and no privilege
     # escalation — it is an auto-approved headless task executor, and a
@@ -545,7 +564,7 @@ EOF
       # ("unsupported key 'SecurityOpt' in group 'Container'"), so the unit is
       # never created and the worker is unreachable (connection refused). Use
       # the spelling the other quadlets in this file already use.
-      printf 'PodmanArgs=--security-opt=no-new-privileges\n'
+      printf 'PodmanArgs=--security-opt=no-new-privileges --cap-drop=ALL --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER --cap-add=KILL --cap-add=SETUID --cap-add=SETGID\n'
     else
       # SSH agent DIRECTORY mount + env (always included — the daemon creates
       # the socket at startup; if SSH isn't configured, the socket won't exist
@@ -556,6 +575,22 @@ EOF
       # host socket; :z shares its SELinux label across the worker lanes.
       printf 'Volume=%s:/tmp/ssh-agent:ro,z\n' "$ssh_agent_dir"
       printf 'Environment=SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock\n'
+      # WI#400 run-164 KW-2: the WI#400 root-bridge lanes get the same
+      # container-level no-new-privileges kimi has carried since WI#206 —
+      # with a root bridge, the setting keeps setuid/file-capability
+      # binaries from handing privilege back to task code. opencode2 is NOT
+      # a WI#400 root-bridge lane yet, so it is deliberately excluded.
+      # KW-3: the same lanes' root bridge also runs with the default
+      # capability set otherwise — on rootful runtimes that is host root.
+      # Trim to the set the bridge actually uses: CHOWN (relay-socket and
+      # cron-leaf handoff to the task uid), SETUID/SETGID (the setpriv task
+      # drop), KILL (timeout/cancel kills of the task-uid children),
+      # DAC_OVERRIDE+FOWNER (cron workspace creation and mode management
+      # inside the task-owned workspace root; without them the bridge's own
+      # mkdir/chmod there fails).
+      case "$worker" in
+        opencode|pebble) printf 'PodmanArgs=--security-opt=no-new-privileges --cap-drop=ALL --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER --cap-add=KILL --cap-add=SETUID --cap-add=SETGID\n' ;;
+      esac
     fi
     # Publish the per-tenant dedicated health port (v8) -> container's 8443, so
     # the host self-heal pipeline can probe the worker directly. Container still
@@ -577,15 +612,16 @@ EOF
       || printf 'Environment=AGENT_AUTH_TOKEN=%s\n' "$agent_token"
     [[ "$worker" == "opencode" || "$worker" == "opencode2" ]] && [[ -n "$tz_key" ]] && printf 'Environment=TENSORZERO_API_KEY=%s\n' "$tz_key"
     local oc_model oc_base_url
-    oc_model="$(_read_env_value "$tenant_env_path" OPENCODE_MODEL)"
-    oc_base_url="$(_read_env_value "$tenant_env_path" OPENCODE_BASE_URL)"
+    oc_model="$(_read_env_value "$env_snapshot" OPENCODE_MODEL)"
+    oc_base_url="$(_read_env_value "$env_snapshot" OPENCODE_BASE_URL)"
     [[ "$worker" == "opencode" && -n "$oc_model" ]] && printf 'Environment=OPENCODE_MODEL=%s\n' "$oc_model"
     [[ "$worker" == "opencode" && -n "$oc_base_url" ]] && printf 'Environment=OPENCODE_BASE_URL=%s\n' "$oc_base_url"
     local oc2_model oc2_base_url
-    oc2_model="$(_read_env_value "$tenant_env_path" OPENCODE2_MODEL)"
-    oc2_base_url="$(_read_env_value "$tenant_env_path" OPENCODE2_BASE_URL)"
+    oc2_model="$(_read_env_value "$env_snapshot" OPENCODE2_MODEL)"
+    oc2_base_url="$(_read_env_value "$env_snapshot" OPENCODE2_BASE_URL)"
     [[ "$worker" == "opencode2" && -n "$oc2_model" ]] && printf 'Environment=OPENCODE2_MODEL=%s\n' "$oc2_model"
     [[ "$worker" == "opencode2" && -n "$oc2_base_url" ]] && printf 'Environment=OPENCODE2_BASE_URL=%s\n' "$oc2_base_url"
+    rm -f -- "$env_snapshot"
     if [[ -n "$runtime_env_path" ]]; then
       printf '# RuntimeEnvHash=%s\n' "$runtime_env_hash"
       printf 'EnvironmentFile=%s\n' "$runtime_env_path"

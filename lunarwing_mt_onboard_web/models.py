@@ -31,7 +31,9 @@ class ProvisionRequest(RequestModel):
 
     name: str = ""
     gateway_host: str = "127.0.0.1"
-    docker_group: bool = True
+    # WI#389: rootless podman needs no group membership; opting the tenant
+    # user into the docker/podman group is a deliberate choice, not a default.
+    docker_group: bool = False
     enable_darkirc: bool = False
     xmpp_enabled: bool = False
     xmpp_jid: str = ""

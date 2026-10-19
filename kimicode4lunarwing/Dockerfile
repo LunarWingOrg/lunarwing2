@@ -19,8 +19,8 @@ RUN set -eu; \
       "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm-updates main" \
       "deb http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ bookworm-security main" \
       > /etc/apt/sources.list; \
-    apt-get -o Acquire::Check-Valid-Until=false update; \
-    apt-get install -y --no-install-recommends \
+    apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update; \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install -y --no-install-recommends \
       python3 make g++ ca-certificates; \
     rm -rf /var/lib/apt/lists/* \
       /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache
@@ -30,6 +30,10 @@ COPY scripts/*.ts ./scripts/
 # entrypoint_config_test.js reads ../entrypoint.sh — ship it in the build
 # stage so the in-build test gate validates the actual shipped entrypoint.
 COPY entrypoint.sh /build/entrypoint.sh
+# WI#400: entrypoint_config_test.js also reads ../entrypoint-task-setup.sh
+# (the config section moved there); ship it beside entrypoint.sh so the
+# in-build npm test gate validates the actual shipped setup script.
+COPY entrypoint-task-setup.sh /build/entrypoint-task-setup.sh
 # WI#206 fixtures: the headless-guard tests read /build/hooks/ and
 # /build/config/ during the in-build npm test gate (same builder-stage
 # pattern as entrypoint.sh above). Without these COPYs the 7 new
@@ -81,8 +85,8 @@ RUN set -eu; \
       "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm-updates main" \
       "deb http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ bookworm-security main" \
       > /etc/apt/sources.list; \
-    apt-get -o Acquire::Check-Valid-Until=false update; \
-    apt-get install -y --no-install-recommends \
+    apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update; \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install -y --no-install-recommends \
       tini \
       python3 \
       python3-pip \
@@ -101,8 +105,8 @@ RUN set -eu; \
 # Toolchain packages: only when WITH_TOOLCHAINS=true.
 RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
       set -eu; \
-      apt-get -o Acquire::Check-Valid-Until=false update; \
-      apt-get install -y --no-install-recommends \
+      apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update; \
+      apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install -y --no-install-recommends \
         python3-dev \
         build-essential \
         gcc \
@@ -182,6 +186,10 @@ ENV GOROOT=/usr/local/go \
 # Keep IDs synchronized with ic/scripts/lunarwing-mt-admin.sh. Rootless Podman
 # maps the tenant's host identity onto these IDs so private read-only mounts
 # remain accessible without making state world-readable.
+# WI#400: this is the TASK identity only — the container starts as root (see
+# USER below), the bridge runs as root and drops every spawned task to this
+# uid/gid via setpriv (flags pinned by taskSetprivArgv + the executor
+# self-test), so the bridge's and PID 1's environ are EACCES to task code.
 RUN groupadd --gid 10002 kimi \
     && useradd --uid 10002 --gid 10002 -m -d /home/kimi kimi
 
@@ -189,11 +197,14 @@ RUN groupadd --gid 10002 kimi \
 WORKDIR /app
 
 COPY --from=builder /build/scripts/ /app/scripts/
-COPY --chown=kimi:kimi entrypoint.sh health_server.py agent_comm_protocol.json ./
-COPY --chown=kimi:kimi config/ ./config/
-COPY --chown=kimi:kimi hooks/ ./hooks/
+# WI#400 LD-2: /app files stay root-owned — container root executes these,
+# so they must not be writable by the task uid the bridge drops to.
+COPY entrypoint.sh entrypoint-task-setup.sh health_server.py agent_comm_protocol.json ./
+COPY config/ ./config/
+COPY hooks/ ./hooks/
 
-RUN chmod +x /app/entrypoint.sh /app/health_server.py
+RUN chmod +x /app/entrypoint.sh /app/entrypoint-task-setup.sh /app/health_server.py \
+    && command -v setpriv >/dev/null
 
 # ── Kimi Code CLI ─────────────────────────────────────────────────────────────
 # npm ci verifies every bridge and CLI dependency against committed integrity
@@ -228,9 +239,9 @@ RUN mkdir -p /home/kimi/.kimi-code \
     && chown -R kimi:kimi /home/kimi /workspace /var/log/lunarwing /app/results
 
 # WI#206: the baked policy (guard config + PreToolUse hook) must not be
-# editable by the runtime user — the worker runs as kimi, so dropping write
+# editable by the runtime user — tasks run as kimi, so dropping write
 # access means a task inside the container cannot strip its own guard.
-RUN chmod -R a-w /app/config /app/hooks && chmod a-w /app/entrypoint.sh
+RUN chmod -R a-w /app/config /app/hooks && chmod a-w /app/entrypoint.sh /app/entrypoint-task-setup.sh
 
 # ── ports ──────────────────────
 EXPOSE 8443
@@ -240,7 +251,13 @@ EXPOSE 9090
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD curl -sf http://127.0.0.1:8443/ready || exit 1
 
-USER 10002:10002
+# WI#400: root entrypoint — the launcher drops every task-side process to
+# the kimi uid (10002) itself; the WebSocket bridge stays root so it can
+# drop privileges per spawned task. Task identity is pinned for both the
+# launcher and the bridge executor.
+ENV KIMI_TASK_UID=10002 \
+    KIMI_TASK_GID=10002
+USER 0:0
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
 CMD ["--mode", "websocket"]

@@ -115,6 +115,7 @@ write_fixture_env() {  # <tenant>
   cat >"$env_dir/lunarwing.env" <<ENV
 RELAY_PASSWORD=$FIXTURE_PASSWORD
 ENV
+  chmod 600 "$env_dir/lunarwing.env"
 }
 
 # ── Tests: pure helpers ──────────────────────────────────────────────────────
@@ -982,6 +983,15 @@ write_tenant_lunarwing_env() {
   chmod 0700 "$(tenant_env_dir "$1")"
   printf 'SANDBOX_IMAGE=%s\n' "${sandbox_image_fixture:-lunarwing-sandbox:latest}" \
     >"$(tenant_env_dir "$1")/lunarwing.env"
+  # WI#423: the weechat bootstrap reads RELAY_PASSWORD through the real
+  # tenant-side reader (no _read_env_value stub at that layer anymore), so the
+  # fixture env must carry the credential it used to fake via the stub.
+  printf 'RELAY_PASSWORD=fixture-relay-password\n' \
+    >>"$(tenant_env_dir "$1")/lunarwing.env"
+  # WI#423: the real add_tenant reads this file through the tenant-side
+  # reader, which refuses group/other-readable env files — write the
+  # production 0600 shape.
+  chmod 0600 "$(tenant_env_dir "$1")/lunarwing.env"
 }
 write_tenant_bridge_env() { :; }
 write_tenant_gotify_config() { :; }

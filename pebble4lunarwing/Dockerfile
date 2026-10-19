@@ -13,8 +13,8 @@ RUN set -eu; \
       "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm-updates main" \
       "deb http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ bookworm-security main" \
       > /etc/apt/sources.list; \
-    apt-get -o Acquire::Check-Valid-Until=false update; \
-    apt-get install -y --no-install-recommends git python3; \
+    apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update; \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install -y --no-install-recommends git python3; \
     rm -rf /var/lib/apt/lists/* \
       /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache
 
@@ -73,8 +73,8 @@ RUN set -eu; \
       "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm-updates main" \
       "deb http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ bookworm-security main" \
       > /etc/apt/sources.list; \
-    apt-get -o Acquire::Check-Valid-Until=false update; \
-    apt-get install -y --no-install-recommends ca-certificates git curl; \
+    apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update; \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install -y --no-install-recommends ca-certificates git curl; \
     rm -rf /var/lib/apt/lists/* \
       /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache
 
@@ -82,8 +82,8 @@ RUN set -eu; \
 # worker's list so all external workers expose the same dev-tool surface.
 RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
       set -eu; \
-      apt-get -o Acquire::Check-Valid-Until=false update; \
-      apt-get install -y --no-install-recommends \
+      apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update; \
+      apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install -y --no-install-recommends \
         python3-dev \
         build-essential \
         gcc \
@@ -214,9 +214,11 @@ COPY pebble4lunarwing/entrypoint.sh /usr/local/bin/entrypoint.sh
 # LUNARWING_TOOL_PROXY_SOCKET / LUNARWING_TASK_ID from the env the bridge's
 # executor injects into the pebble process (pebble passes its env through
 # to MCP children); without them (cli mode, relay setup failure) it
-# advertises zero tools. Baked root-owned 0444 in a 0555 directory.
-# Unlike the other lanes, this does not protect it from task code: pebble
-# tasks run as container root until WI#400.
+# advertises zero tools. Baked root-owned 0444 in a 0555 directory. WI#400:
+# with tasks dropped to PEBBLE_TASK_UID this now DOES protect it from task
+# code; the flip side is that pebble's own state writes into its config
+# home fail (documented in WORKER-CONTAINERS.md — model state is not
+# persisted under the split).
 COPY pebble4lunarwing/config/settings.json /etc/lunarwing/pebble/settings.json
 RUN chmod 0555 /etc/lunarwing/pebble && chmod 0444 /etc/lunarwing/pebble/settings.json
 
@@ -224,6 +226,21 @@ RUN /usr/local/bin/pebble --version && \
     test -x /usr/local/bin/pebble4lunarwing && \
     test -x /usr/local/bin/entrypoint.sh
 RUN mkdir -p /workspace && chmod 777 /workspace
+
+# WI#400: task identity, separate from the bridge (which runs as container
+# root). The bridge drops every spawned task to this uid/gid via setpriv
+# (flags pinned by the executor self-test), so the bridge's and PID 1's
+# environ are EACCES to task code. mt-admin maps this uid to the tenant
+# account (PEBBLE_USERNS keep-id), so workspace writes land tenant-owned
+# on the host exactly as before. setpriv must exist in the base image —
+# fail the build if a base bump ever drops it.
+RUN groupadd --gid 10004 pebbletask \
+    && useradd --uid 10004 --gid 10004 -m -d /home/pebbletask pebbletask \
+    && mkdir -p /home/pebbletask/go \
+    && chown -R pebbletask:pebbletask /home/pebbletask \
+    && command -v setpriv >/dev/null
+ENV PEBBLE_TASK_UID=10004 \
+    PEBBLE_TASK_GID=10004
 
 ENV PEBBLE_BIN=/usr/local/bin/pebble \
     PEBBLE_MODE=websocket \
@@ -236,5 +253,14 @@ EXPOSE 9090 8443
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD curl -sf http://127.0.0.1:8443/health || exit 1
+
+# WI#400 LD-8: pin the bridge to container root. Under rootless podman
+# keep-id (the default multi-tenant deployment) an image with no USER would
+# start the entrypoint and bridge as the keep-id uid — the SAME uid every
+# task drops to — making the whole split a no-op (the token file would be
+# task-owned and /proc/self/environ readable by task code). USER 0:0 wins
+# over keep-id, the bridge runs as root, and the entrypoint/executor refuse
+# to run the websocket lane if they ever land on the task uid instead.
+USER 0:0
 
 ENTRYPOINT ["entrypoint.sh"]

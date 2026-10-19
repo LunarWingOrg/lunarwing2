@@ -107,16 +107,22 @@ validate_study_notes_state_home() {  # <absolute state path>
     || die "Study Notes notes directory must not be a symlink"
 }
 
+# WI#423: these values feed quadlet `Volume=` mount sources for the worker
+# containers — a swapped read could mount another tenant's study-notes
+# checkout into this tenant's worker, so they come from the tenant-side
+# per-key reader (symlink/ownership/link-count/mode checks as the tenant).
+# An absent env file reads as empty (no mount); an unsafe path refuses, and
+# the render/start callers abort fail-closed on that refusal.
 tenant_study_notes_home() {  # <tenant>
-  _env_existing "$(tenant_env_dir "$1")/lunarwing.env" LW2STUDYMCP_HOME
+  read_tenant_env_value "$1" "$(tenant_env_dir "$1")/lunarwing.env" LW2STUDYMCP_HOME
 }
 
 tenant_study_notes_state_home() {  # <tenant>
-  _env_existing "$(tenant_env_dir "$1")/lunarwing.env" LW2STUDYMCP_STATE_HOME
+  read_tenant_env_value "$1" "$(tenant_env_dir "$1")/lunarwing.env" LW2STUDYMCP_STATE_HOME
 }
 
 tenant_study_notes_allow_write() {  # <tenant>
-  _env_existing "$(tenant_env_dir "$1")/lunarwing.env" LW2STUDYMCP_ALLOW_WRITE
+  read_tenant_env_value "$1" "$(tenant_env_dir "$1")/lunarwing.env" LW2STUDYMCP_ALLOW_WRITE
 }
 
 study_notes_write_enabled() {  # <raw boolean>
@@ -226,7 +232,12 @@ resolve_tenant_xmpp_jid() {  # <name> [explicit_jid]
     return 0
   fi
   local existing
-  existing="$(_env_existing "$(tenant_env_dir "$name")/lunarwing.env" XMPP_JID)"
+  # WI#423: read through the tenant-side per-key reader. An unsafe live path
+  # refuses loudly instead of silently resetting the JID to xmpp.localhost
+  # (which would repoint a live tenant's bridge); an absent file still reads
+  # as empty so first provisioning keeps its default.
+  existing="$(read_tenant_env_value "$name" "$(tenant_env_dir "$name")/lunarwing.env" XMPP_JID)" \
+    || die "could not safely read XMPP_JID from $(tenant_env_dir "$name")/lunarwing.env as tenant '$name'"
   printf '%s\n' "${existing:-$name@xmpp.localhost}"
 }
 
@@ -310,18 +321,46 @@ _read_env_value() {  # <file> <KEY>
 
 # Read one value without opening tenant-controlled paths as root. The tenant-side
 # process rejects unsafe ownership, permissions, symlinks, and shared hard links.
+# The inner bash runs with --norc --noprofile: stdout is the value transport, so
+# a host whose bash sources a banner-printing rc even for -c shells (the dev VM)
+# must not be able to corrupt the captured value (WI#423 widened this helper's
+# reach from the kimi lane to most env reads).
 read_tenant_env_value() {  # <tenant> <file> <KEY>
   local name="$1" target="$2" key="$3" value
   local -a drop=(sudo -u "$name")
   [[ "$(id -un)" != "$name" ]] || drop=()
   [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || die "invalid tenant env key"
   darkirc_path_components_safe "$target" || die "unsafe tenant env path: $target"
+  # First add_tenant pass: the target does not exist yet AND the tenant
+  # account has not been created (create_tenant_user runs later), so the
+  # tenant-side sudo below could only fail on the unknown account. That shape
+  # reads as absent (run-166 LF-1) — an existing target without an account is
+  # not this path and still refuses at the sudo boundary.
+  if [[ ! -e "$target" && ! -L "$target" ]] && ! id -u -- "$name" >/dev/null 2>&1; then
+    return 0
+  fi
   value="$("${drop[@]}" env -i PATH="/usr/bin:/bin" \
-    TARGET_PATH="$target" TARGET_KEY="$key" bash -c '
+    TARGET_PATH="$target" TARGET_KEY="$key" bash --norc --noprofile -c '
       set -euo pipefail
       target="$TARGET_PATH"
       parent="${target%/*}"
       uid="$(id -u)"
+      # A parent that does not exist at all means nothing was provisioned yet
+      # (the first add_tenant pass reads before create_tenant_user makes the
+      # env dir): read as absent. But -e cannot tell ENOENT from EACCES on an
+      # untraversable ancestor, so before treating the parent as absent, walk
+      # up to the deepest VISIBLE ancestor and require it to be a searchable,
+      # non-symlink directory — otherwise the absence is not provable and the
+      # read refuses (run-166 LF-7; this is the fail-open path an empty-value
+      # refusal elsewhere would otherwise miss).
+      if [[ ! -e "$parent" && ! -L "$parent" ]]; then
+        probe="${parent%/*}"
+        while [[ -n "$probe" && "$probe" != "/" && ! -e "$probe" && ! -L "$probe" ]]; do
+          probe="${probe%/*}"
+        done
+        [[ -z "$probe" || ( -d "$probe" && ! -L "$probe" && -x "$probe" ) ]] || exit 73
+        exit 0
+      fi
       [[ -d "$parent" && ! -L "$parent" ]] || exit 73
       parent_owner="$(stat -c %u "$parent" 2>/dev/null || printf -- -1)"
       parent_mode="$(stat -c %a "$parent" 2>/dev/null || true)"
@@ -529,7 +568,10 @@ _weechat_validate_relay_config() {  # <dir> <port> <plaintext_password>
 _weechat_generate_relay_config() {  # <tenant> <temp_dir> <port> <lunarwing_env>
   local tenant="$1" temp_dir="$2" relay_port="$3" lunarwing_env="$4"
   local relay_password weechat_bin
-  relay_password="$(_read_env_value "$lunarwing_env" RELAY_PASSWORD)"
+  # WI#423: tenant-side per-key read — the value is passed to a WeeChat run as
+  # the tenant, so a symlink swap must refuse rather than hand it the other
+  # tenant's relay credential.
+  relay_password="$(read_tenant_env_value "$tenant" "$lunarwing_env" RELAY_PASSWORD)" || return 1
   [[ -n "$relay_password" ]] || return 1
   weechat_bin="$(command -v weechat 2>/dev/null || true)"
   if [[ -z "$weechat_bin" ]]; then
@@ -568,7 +610,8 @@ configure_weechat_relay() {  # <tenant>
     printf 'error: tenant env file not found: %s\n' "$lunarwing_env" >&2
     return 1
   fi
-  relay_password="$(_read_env_value "$lunarwing_env" RELAY_PASSWORD)"
+  relay_password="$(read_tenant_env_value "$tenant" "$lunarwing_env" RELAY_PASSWORD)" \
+    || { printf 'error: could not safely read RELAY_PASSWORD from %s as tenant %q\n' "$lunarwing_env" "$tenant" >&2; return 1; }
   if [[ -z "$relay_password" ]]; then
     printf 'error: RELAY_PASSWORD missing from %s\n' "$lunarwing_env" >&2
     return 1
@@ -1109,12 +1152,14 @@ write_tenant_lunarwing_env() {
   # and voice.env are the same tenant-writable class (their tokens are carried
   # into this render) and are snapshotted the same way. The commit at the end
   # still re-validates the live path in write_tenant_file_atomic, so a
-  # post-snapshot swap fails closed there. resolve_tenant_xmpp_jid above runs
-  # before the snapshot by design: XMPP_JID is a non-secret identifier, and a
-  # foreign symlink dies on this snapshot before any value is rendered.
-  # Known exception (WI#423): tenant_pg_password below still root-reads
-  # pg.secret/lunarwing.env through the live path; that residue is tracked
-  # there rather than claimed covered by this snapshot.
+  # post-snapshot swap fails closed there. resolve_tenant_xmpp_jid above no
+  # longer touches the live path either (WI#423): XMPP_JID comes from the
+  # tenant-side per-key reader, and a foreign symlink refuses loudly there
+  # before any value is rendered.
+  # WI#423: tenant_pg_password below also reads pg.secret/lunarwing.env
+  # through its own tenant-side snapshots and commits through the tenant-side
+  # atomic writer — no root resolution of the live paths remains in this
+  # render.
   local env_snapshot vision_snapshot voice_snapshot
   _snapshot_tenant_env "$name" "$path" env_snapshot
   _snapshot_tenant_env "$name" "$(tenant_env_dir "$name")/vision.env" vision_snapshot
@@ -1224,7 +1269,11 @@ write_tenant_lunarwing_env() {
   cb_recovery="$(_env_existing "$env_snapshot" LLM_CIRCUIT_BREAKER_RECOVERY_SECS)"; cb_recovery="${cb_recovery:-15}"
   # Stable + migration-safe; resolved before the heredoc so it can read an
   # existing DATABASE_URL (preserving an already-initialised DB's password).
-  pg_password="$(tenant_pg_password "$name")"
+  # Run-166 LF-3: a refusal must be fatal — an empty password rendered into
+  # DATABASE_URL would brick the tenant's DB connection at first start.
+  if ! pg_password="$(tenant_pg_password "$name")"; then
+    die "could not resolve the PostgreSQL password for tenant '$name'"
+  fi
 
   # LLM endpoint the daemon's OpenAI-compatible client dials. When the proxy is
   # enabled, defaults to this tenant's local TensorZero proxy. When disabled,
@@ -2511,7 +2560,14 @@ provision_tenant_ssh_key() {
   local authorized_keys="$ssh_dir/authorized_keys"
   sudo -u "$name" touch "$authorized_keys"
   sudo -u "$name" chmod 600 "$authorized_keys"
-  if ! sudo -u "$name" grep -qF "$(cat "$pubkey_path" 2>/dev/null)" "$authorized_keys" 2>/dev/null; then
+  # WI#423 (run-171 LS-3): read the public key as the tenant and hand it to
+  # grep on stdin. A root `cat` would follow a tenant-planted symlink, and a
+  # command-line argument is visible to every local user through /proc.
+  local pubkey_line
+  if ! pubkey_line="$(tenant_cat "$name" "$pubkey_path" 2>/dev/null)" || [[ -z "$pubkey_line" ]]; then
+    die "cannot read the public key $pubkey_path as tenant '$name'"
+  fi
+  if ! printf '%s\n' "$pubkey_line" | sudo -u "$name" grep -qF -f - "$authorized_keys" 2>/dev/null; then
     sudo -u "$name" bash -c "cat '$pubkey_path' >> '$authorized_keys'"
     say "added public key to authorized_keys for $name"
   fi
@@ -2549,7 +2605,9 @@ ensure_ssh_api_token() {
 
 tenant_ssh_api_token_present() {
   local name="$1"
-  [[ -n "$(_read_env_value "$(tenant_env_dir "$name")/lunarwing.env" SSH_API_TOKEN)" ]]
+  # WI#423: tenant-side read; an unsafe path reads as absent so the caller
+  # regenerates the credential through the tenant-side _env_set writer.
+  [[ -n "$(read_tenant_env_value "$name" "$(tenant_env_dir "$name")/lunarwing.env" SSH_API_TOKEN)" ]]
 }
 
 # Upload the staged SSH private key to the secrets store via the gateway's SSH
@@ -2564,9 +2622,16 @@ upload_tenant_ssh_key() {
 
   http_port="$(ports_get "$name" http)"
   staged_key="$(tenant_env_dir "$name")/ssh_key_staged"
-  ssh_api_token="$(_read_env_value "$(tenant_env_dir "$name")/lunarwing.env" SSH_API_TOKEN)"
 
   [[ -f "$staged_key" ]] || { say "no staged SSH key for $name (skipping upload)"; return 0; }
+  # WI#423 (run-166 LF-4): the bearer crosses into an Authorization header —
+  # read it through the tenant-side per-key reader, not a root _read_env_value
+  # of the live path. A refusal (symlinked/foreign-owned env shape) is fatal
+  # for the upload; the staged key stays for the next pass.
+  if ! ssh_api_token="$(read_tenant_env_value "$name" "$(tenant_env_dir "$name")/lunarwing.env" SSH_API_TOKEN)"; then
+    say "ERROR: could not safely read SSH_API_TOKEN for tenant '$name'; staged key not uploaded" >&2
+    return 1
+  fi
   if [[ -z "$ssh_api_token" ]]; then
     say "ERROR: SSH_API_TOKEN missing for tenant '$name'; staged key not uploaded" >&2
     return 1
@@ -2576,24 +2641,44 @@ upload_tenant_ssh_key() {
   # anonymous config FD for both readiness and upload requests.
   local auth_header="Authorization: Bearer ${ssh_api_token}"
 
+  # WI#423 (run-171 LS-2): the staged key sits in the tenant-writable env
+  # dir, so root must not open it directly — a symlink planted there would
+  # hand any root-readable file to the tenant's own daemon. Snapshot it AS
+  # THE TENANT (tenant_cat refuses what the tenant cannot read) into a
+  # root-private temp file before probing the gateway, feed jq from that
+  # copy, and remove the copy on every path.
+  local key_snapshot upload_result upload_rc=0
+  key_snapshot="$(mktemp)" || { say "ERROR: cannot create the SSH key snapshot; staged key not uploaded" >&2; return 1; }
+  if ! tenant_cat "$name" "$staged_key" >"$key_snapshot" 2>/dev/null; then
+    rm -f -- "$key_snapshot"
+    say "ERROR: could not safely read the staged SSH key for tenant '$name' as the tenant; staged key not uploaded" >&2
+    return 1
+  fi
+  if [[ ! -s "$key_snapshot" ]]; then
+    rm -f -- "$key_snapshot"
+    say "ERROR: staged SSH key for tenant '$name' is empty; staged key not uploaded" >&2
+    return 1
+  fi
+
   # Wait for the gateway to be reachable (it may still be starting up).
   local i=0
   while ! curl -sf --max-time 2 \
       -K <(printf 'header = "%s"\n' "$auth_header") \
       "http://127.0.0.1:${http_port}/agent/status" >/dev/null 2>&1; do
     i=$((i + 1))
-    [[ $i -lt 15 ]] || { say "WARNING: authenticated SSH API not reachable on port $http_port after repeated probes; SSH key not uploaded" >&2; return 1; }
+    [[ $i -lt 15 ]] || { rm -f -- "$key_snapshot"; say "WARNING: authenticated SSH API not reachable on port $http_port after repeated probes; SSH key not uploaded" >&2; return 1; }
     sleep 2
   done
 
   # Upload the key via the SSH API. The key data is sent as a JSON string
   # (base64 not needed — the API accepts raw PEM/OpenSSH format).
-  local upload_result
-  if ! upload_result="$(jq -n --rawfile key "$staged_key" '{key_data: $key}' | \
+  upload_result="$(jq -n --rawfile key "$key_snapshot" '{key_data: $key}' | \
     curl -sf -X POST "http://127.0.0.1:${http_port}/hosts/${ssh_host}/key" \
       -H "Content-Type: application/json" \
       -K <(printf 'header = "%s"\n' "$auth_header") \
-      -d @- 2>/dev/null)"; then
+      -d @- 2>/dev/null)" || upload_rc=$?
+  rm -f -- "$key_snapshot"
+  if [[ "$upload_rc" -ne 0 ]]; then
     say "ERROR: SSH key upload request failed; staged key remains at $staged_key" >&2
     return 1
   fi
@@ -2628,11 +2713,13 @@ upload_tenant_darkirc_secret() {
 
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
 
-  darkirc_adapter_secret="$(_read_env_value "$env_path" DARKIRC_ADAPTER_SECRET)"
+  darkirc_adapter_secret="$(read_tenant_env_value "$name" "$env_path" DARKIRC_ADAPTER_SECRET)" \
+    || { say "WARNING: could not safely read DARKIRC_ADAPTER_SECRET from $env_path; not uploaded (upload manually via the API)" >&2; return 1; }
   # The secret is optional — nothing to upload if it is not set.
   [[ -n "$darkirc_adapter_secret" ]] || return 0
 
-  gateway_token="$(_read_env_value "$env_path" GATEWAY_AUTH_TOKEN)"
+  gateway_token="$(read_tenant_env_value "$name" "$env_path" GATEWAY_AUTH_TOKEN)" \
+    || { say "WARNING: could not safely read GATEWAY_AUTH_TOKEN from $env_path; DarkIRC adapter secret not uploaded (upload manually via the API)" >&2; return 1; }
   if [[ -z "$gateway_token" ]]; then
     say "WARNING: GATEWAY_AUTH_TOKEN not found in $env_path; DarkIRC adapter secret not uploaded (upload manually via the API)" >&2
     return 1
@@ -2686,7 +2773,8 @@ upload_tenant_brave_search_secret() {
   brave_key="${BRAVE_SEARCH_API_KEY:-${BRAVE_API_KEY:-}}"
   [[ -n "$brave_key" ]] || return 0
 
-  gateway_token="$(_read_env_value "$(tenant_env_dir "$name")/lunarwing.env" GATEWAY_AUTH_TOKEN)"
+  gateway_token="$(read_tenant_env_value "$name" "$(tenant_env_dir "$name")/lunarwing.env" GATEWAY_AUTH_TOKEN)" \
+    || { say "WARNING: could not safely read GATEWAY_AUTH_TOKEN for tenant $name; Brave key not uploaded (upload manually via the API)" >&2; return 1; }
   if [[ -z "$gateway_token" ]]; then
     say "WARNING: GATEWAY_AUTH_TOKEN not found for tenant $name; Brave key not uploaded (upload manually via the API)" >&2
     return 1

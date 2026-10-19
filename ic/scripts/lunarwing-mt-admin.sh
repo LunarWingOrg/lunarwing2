@@ -160,15 +160,23 @@ OPENCODE_USERNS="keep-id:uid=${OPENCODE_CONTAINER_UID},gid=${OPENCODE_CONTAINER_
 # ssh-agent-dir-ro: keep the restart-safe directory mount, but make it
 # read-only so workers cannot unlink/rebind the host agent socket (WI#226).
 # Bumping the contract recreates imperative containers still using RW mounts.
-OPENCODE_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE_USERNS};ssh-agent-dir-ro"
+# no-new-privileges (WI#400 run-164 KW-2): with the WI#400 root bridge, the
+# container-level setting keeps setuid/file-capability binaries from handing
+# privilege back to task code; recording it bumps the contract so existing
+# containers force-recreate onto the setting. cap-trim (KW-3): the bridge
+# also runs with --cap-drop=ALL plus only CHOWN/DAC_OVERRIDE/FOWNER/KILL/
+# SETUID/SETGID instead of the default capability set.
+OPENCODE_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE_USERNS};ssh-agent-dir-ro;no-new-privileges;cap-trim"
 
 KIMI_CONTAINER_UID="10002"
 KIMI_CONTAINER_GID="10002"
 KIMI_USERNS="keep-id:uid=${KIMI_CONTAINER_UID},gid=${KIMI_CONTAINER_GID}"
 # WI#206: the kimi lane dropped the SSH-agent mount and gained
 # no-new-privileges; bumping the contract force-recreates existing containers
-# that still carry the socket mount.
-KIMI_ROOTLESS_LAUNCH_CONTRACT="userns=${KIMI_USERNS};no-ssh-agent;no-new-privileges"
+# that still carry the socket mount. cap-trim (WI#400 run-164 KW-3): the root
+# bridge runs with --cap-drop=ALL plus only CHOWN/DAC_OVERRIDE/FOWNER/KILL/
+# SETUID/SETGID instead of the default capability set.
+KIMI_ROOTLESS_LAUNCH_CONTRACT="userns=${KIMI_USERNS};no-ssh-agent;no-new-privileges;cap-trim"
 
 # OpenCode 2 worker lane (docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md).
 # Distinct UID so opencode (10001) and opencode2 (10003) on one tenant keep
@@ -182,7 +190,38 @@ OPENCODE2_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE2_USERNS};ssh-agent-dir-ro"
 
 # The pebble lane mounts the SSH agent directory like the other non-kimi
 # workers; bump the contract to recreate existing containers with RW mounts.
-PEBBLE_ROOTLESS_LAUNCH_CONTRACT="ssh-agent-dir-ro"
+# WI#400: pebble tasks now run under a uid separate from the bridge
+# (container root). keep-id binds the task uid to the tenant account, so
+# workspace writes stay tenant-owned on the host and the SSH-agent socket
+# stays reachable by tasks; the bridge's container-root identity moves into
+# the subuid range. Adding userns= bumps the contract, force-recreating
+# existing pebble containers (whose tasks ran as container root).
+# no-new-privileges (WI#400 run-164 KW-2): with the root bridge, the
+# container-level setting keeps setuid/file-capability binaries from handing
+# privilege back to task code; recording it bumps the contract so existing
+# containers force-recreate onto the setting. cap-trim (KW-3): the bridge
+# also runs with --cap-drop=ALL plus only CHOWN/DAC_OVERRIDE/FOWNER/KILL/
+# SETUID/SETGID instead of the default capability set.
+PEBBLE_CONTAINER_UID="10004"
+PEBBLE_CONTAINER_GID="10004"
+PEBBLE_USERNS="keep-id:uid=${PEBBLE_CONTAINER_UID},gid=${PEBBLE_CONTAINER_GID}"
+PEBBLE_ROOTLESS_LAUNCH_CONTRACT="userns=${PEBBLE_USERNS};ssh-agent-dir-ro;no-new-privileges;cap-trim"
+
+# WI#422 (run-164 KY-1): on rootless podman the pebble container runs as the
+# tenant uid already (container root maps to the invoking tenant), so a
+# workspace symlink swap grants nothing the tenant could not already reach.
+# On rootful hosts (docker, or LUNARWING_MT_ROOTLESS=false) the image has no
+# USER and ran as host root — the container runtime re-resolves the
+# /workspace bind source at EVERY start, so a tenant who swaps
+# ~/lunarwing/pebble-workspace for a symlink redirects host-root writes
+# through their own pebble tasks. The rootful lane now launches with
+# `--user <tenant uid>:<gid>` plus `--security-opt no-new-privileges`
+# (start_tenant_pebble), and passes PEBBLE_TASK_UID/GID=inherit so the bridge
+# runs tasks as its own (tenant) identity instead of the image's numeric
+# split (WI#400 x WI#422); this distinct base contract forces start-tenant
+# to recreate every container created under an older rootful shape once, on
+# its next start-tenant.
+PEBBLE_ROOTFUL_LAUNCH_CONTRACT="tenant-uid-user;workspace-toolchain-home;no-new-privileges;task-uid-inherit"
 
 # ── Library sourcing ─────────────────────────────────────────────────────────
 #
@@ -257,7 +296,9 @@ Manages OS users, port allocation, per-tenant services, and builds.
 Commands:
   add-tenant <name> [options]      Create user, allocate ports, clone repo,
                                    generate env, render and install services
-    --docker-group                 Add user to docker/podman group
+    --docker-group                 Add user to docker/podman group (opt-in:
+                                   not needed for rootless podman; only to
+                                   reach a shared rootful daemon socket)
     --xmpp-jid <jid>              XMPP JID for this tenant
     --xmpp-password <pass>        XMPP password (generated if omitted)
     --llm-api-key <key>            API key for the LLM backend provider
@@ -478,6 +519,21 @@ Commands:
     --base-url <url>               Kimi API base URL (KIMI_BASE_URL; full URL)
     --api-key-file <path>          Read Kimi API key from a file, never argv
                                    (restart the worker after: stop-tenant && start-tenant)
+
+  configure-worker-tools <name> <worker> <tools|none>
+                                   Set the WI#324 proxied-tool grant
+                                   (tool_allowlist) for one external worker
+                                   (pebble|opencode|kimi|opencode2) in the
+                                   tenant config. Deny-by-default otherwise.
+                                   <tools> is a comma-separated list from the
+                                   phase-1 set: memory_read, memory_write,
+                                   knowledge_search, knowledge_submit_note,
+                                   knowledge_get_topic, gitlab_tool (prefer over
+                                   legacy gitlab-tool). 'none' clears the grant.
+                                   Refused on mode="cron" workers (grant
+                                   cron.tool_allowlist on the mission instead).
+                                   Restart the tenant daemon to load it
+                                   (restart-tenant <name>).
 
   configure-study-mcp <name>       Configure lw2studymcp for LunarWing and
     [--home <absolute-path>]       its opencode worker using a shared host checkout
@@ -1400,6 +1456,12 @@ main() {
       done
       [[ -n "$name" ]] || die "usage: configure-kimi <name> [--model <model>] [--base-url <url>] [--api-key-file <path>]"
       configure_kimi "$name" "$kimi_model" "$kimi_base_url" "$kimi_api_key"
+      ;;
+
+    configure-worker-tools)
+      require_root
+      [[ $# -eq 3 ]] || die "usage: configure-worker-tools <name> <pebble|opencode|kimi|opencode2> <tools|none>"
+      set_external_worker_tool_allowlist "$1" "$2" "$3"
       ;;
 
     configure-study-mcp)

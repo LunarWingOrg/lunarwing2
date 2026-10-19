@@ -41,9 +41,12 @@ Create the target with the desired identity and feature flags. For example:
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <tenant> \
-  --docker-group \
   --xmpp-jid '<existing-or-new-jid>'
 ```
+
+The docker/podman group is never added by default: rootless podman (the MT
+runtime) needs no group membership. Pass `--docker-group` in the command above
+only if this tenant must reach a shared rootful daemon socket.
 
 MT admin allocates the primary and extended port registry entries, creates the tenant user and rootless PostgreSQL service, and renders the correct systemd-user or OpenRC services. Do not copy the old guide's abbreviated port table; query the current registry or run:
 

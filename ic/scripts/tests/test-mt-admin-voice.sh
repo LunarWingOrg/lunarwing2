@@ -54,6 +54,13 @@ mkdir -p "$VOICE_MODELS_DIR"
 hash64=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 chown() { :; }  # No root in the test harness; tenant users do not exist.
 tenant_cat() { cat -- "$2"; }
+# WI#390 harness convention: map the fixture tenant's privilege drops onto the
+# invoking user (fixture env dir is owned by that user at mode 700).
+sudo() {
+  [[ "${1:-}" == "-u" ]] || return 1
+  shift 2
+  "$@"
+}
 original_writer="$(declare -f write_tenant_file_atomic)"
 eval "${original_writer/write_tenant_file_atomic ()/original_write_tenant_file_atomic ()}"
 write_tenant_file_atomic() {

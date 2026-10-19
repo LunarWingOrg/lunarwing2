@@ -3,13 +3,13 @@
 ## Official LunarWing2 Roadmap:
 | Feature | Target |
 |---------|--------|
-| LunarVision Polish | v2.1.7.0 |
-| Other Polish | v2.1.7.0 |
+| Other Polish & Fixes | v2.1.7.0 |
 | Further Podman Sandbox refinements, improvements, and proper tunnel networking support | v2.1.8.0 |
 | Part two of Mission Improvements with enhanced metric evaluations and external worker adjacent looping | v2.1.8.0 |
 | Introduction of new external worker, LunarDepth | v2.1.8.0 |
 | Beta for Desktop/Mobile companion applications for LunarWing (first alpha version should be available by 2.1.6.0) | v2.1.8.0 |
 | Lightweight external workers and external worker loops with timers | v2.1.8.0 |
+| LunarVision Polish | v2.1.9.0 |
 | DarkIRC key manager & DarkIRC Channel Polishing | v2.2.0.0 |
 | Part 2 of planned overhaul of some LLM engine functionality | v2.2.0.0 |
 | LunarVoice Two Way Voice Communication Full Completion and dedicated multi-agent server support | v2.2.0.0 |

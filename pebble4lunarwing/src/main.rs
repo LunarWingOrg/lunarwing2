@@ -18,7 +18,15 @@ async fn main() {
         return;
     }
 
-    let config = bridge::BridgeConfig::from_env();
+    let config = match bridge::BridgeConfig::from_env() {
+        Ok(config) => config,
+        Err(e) => {
+            // KW-8/LD-10: a broken AGENT_AUTH_TOKEN_FILE must stop startup —
+            // never come up with no bearer check.
+            eprintln!("[pebble4lunarwing] refusing to start: {e}");
+            std::process::exit(1);
+        }
+    };
     eprintln!(
         "[pebble4lunarwing] worker_id={} version={}",
         config.worker_id,

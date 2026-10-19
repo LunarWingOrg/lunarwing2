@@ -29,8 +29,8 @@ RUN set -eu; \
       "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie-updates main" \
       "deb http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ trixie-security main" \
       > /etc/apt/sources.list; \
-    apt-get -o Acquire::Check-Valid-Until=false update; \
-    apt-get install -y --no-install-recommends \
+    apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update; \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install -y --no-install-recommends \
       git python3 make g++ ca-certificates; \
     rm -rf /var/lib/apt/lists/* \
       /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache
@@ -107,8 +107,8 @@ RUN set -eu; \
       "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie-updates main" \
       "deb http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ trixie-security main" \
       > /etc/apt/sources.list; \
-    apt-get -o Acquire::Check-Valid-Until=false update; \
-    apt-get install -y --no-install-recommends \
+    apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update; \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install -y --no-install-recommends \
       tini \
       python3 \
       python3-pip \
@@ -127,8 +127,8 @@ RUN set -eu; \
 # Toolchain packages: only when WITH_TOOLCHAINS=true.
 RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
       set -eu; \
-      apt-get -o Acquire::Check-Valid-Until=false update; \
-      apt-get install -y --no-install-recommends \
+      apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update; \
+      apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install -y --no-install-recommends \
         python3-dev \
         build-essential \
         gcc \
@@ -208,6 +208,10 @@ ENV GOROOT=/usr/local/go \
 # Keep IDs synchronized with ic/scripts/lunarwing-mt-admin.sh. Rootless Podman
 # maps the tenant's host identity onto these IDs so private read-only mounts
 # remain accessible without making Study Notes state world-readable.
+# WI#400: this is the TASK identity only — the container starts as root (see
+# USER below); the serve process (which runs all task code) and every
+# one-shot process drop to this uid/gid via setpriv, while the bridge stays
+# root, so the bridge's and PID 1's environ are EACCES to task code.
 RUN groupadd --gid 10001 opencode \
     && useradd --uid 10001 --gid 10001 -m -d /home/opencode opencode
 
@@ -217,11 +221,14 @@ WORKDIR /app
 COPY --from=builder /out/bin/opencode /usr/local/bin/opencode
 COPY --from=builder /out/sdk /app/node_modules/@opencode-ai/sdk
 
-COPY --chown=opencode:opencode entrypoint.sh health_server.py agent_comm_protocol.json ./
-COPY --chown=opencode:opencode scripts/ ./scripts/
-COPY --chown=opencode:opencode config/ ./config/
+# WI#400 LD-2: /app files stay root-owned — container root executes these,
+# so they must not be writable by the task uid the bridge drops to.
+COPY entrypoint.sh entrypoint-task-setup.sh health_server.py agent_comm_protocol.json ./
+COPY scripts/ ./scripts/
+COPY config/ ./config/
 
-RUN chmod +x /app/entrypoint.sh /app/health_server.py
+RUN chmod +x /app/entrypoint.sh /app/entrypoint-task-setup.sh /app/health_server.py \
+    && command -v setpriv >/dev/null
 
 # Fail the BUILD (not container startup) if the bridge's SDK import can't
 # resolve — the SDK build above is best-effort, so verify the exact
@@ -255,7 +262,14 @@ EXPOSE 9090
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD curl -sf http://127.0.0.1:8443/health || exit 1
 
-USER 10001:10001
+# WI#400: root entrypoint — the launcher drops the serve process and every
+# one-shot process to the opencode uid (10001) itself; the WebSocket bridge
+# stays root so its per-task resources (tool-proxy sockets) can be handed
+# to the task identity. Task identity is pinned for the launcher and the
+# bridge relay.
+ENV OPENCODE_TASK_UID=10001 \
+    OPENCODE_TASK_GID=10001
+USER 0:0
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
 CMD ["--mode", "websocket"]

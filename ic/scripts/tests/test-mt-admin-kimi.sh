@@ -96,6 +96,277 @@ assert_contains "$fixture/state/config.toml" 'timeout_ms = 3600000' \
   'other worker lanes retain one-hour timeout'
 assert_contains "$fixture/state/config.toml" 'timeout_ms = 14400000' \
   'repeated provisioning preserves Kimi timeout'
+
+# WI#324 KL-15(a): configure-worker-tools renders the proxied-tool grant into
+# the tenant's daemon config — the surface a rebuilt worker image was missing
+# (deny-by-default left every proxied call refused with no way to opt in).
+CFG="$fixture/state/config.toml"
+WORKER_BLOCK() {  # <worker> — prints that worker's block body from its name line
+  local worker="$1"
+  awk -v w="$worker" '
+    /^\[\[sandbox\.external_workers\]\][[:space:]]*$/ { if (emit) emit = 0; inblk = 1; next }
+    /^\[/ { inblk = 0; emit = 0; next }
+    inblk && $0 == "name = \"" w "\"" { emit = 1; print; next }
+    emit { print }
+  ' "$CFG"
+}
+KIMI_BLOCK() { WORKER_BLOCK kimi; }
+OPENCODE_BLOCK() { WORKER_BLOCK opencode; }
+
+set_external_worker_tool_allowlist root kimi "memory_read,memory_write"
+if grep -Fq 'tool_allowlist = ["memory_read", "memory_write"]' <<<"$(KIMI_BLOCK)"; then
+  pass 'worker tool grant lands inside the kimi block'
+else
+  fail 'worker tool grant missing from the kimi block'
+fi
+if grep -Fq 'tool_allowlist' <<<"$(OPENCODE_BLOCK)"; then
+  fail 'worker tool grant leaked into another worker block'
+else
+  pass 'worker tool grant stays scoped to the named worker'
+fi
+if [[ "$(grep -c '^tool_allowlist = ' "$CFG")" -eq 1 ]]; then
+  pass 'grant insert produces exactly one tool_allowlist key'
+else
+  fail 'grant insert produced the wrong key count'
+fi
+
+set_external_worker_tool_allowlist root kimi "memory_read,memory_write"
+if [[ "$(grep -c '^tool_allowlist = ' "$CFG")" -eq 1 ]] \
+  && grep -Fq 'tool_allowlist = ["memory_read", "memory_write"]' <<<"$(KIMI_BLOCK)"; then
+  pass 're-running the same grant is idempotent'
+else
+  fail 're-running the same grant duplicated or changed the key'
+fi
+
+set_external_worker_tool_allowlist root kimi "gitlab_tool,knowledge_search"
+grep -Fq 'tool_allowlist = ["gitlab_tool", "knowledge_search"]' <<<"$(KIMI_BLOCK)" \
+  && pass 'changing the grant rewrites the existing key' \
+  || fail 'changing the grant did not rewrite the key'
+
+if ( set_external_worker_tool_allowlist root kimi none ) >/dev/null 2>&1 \
+  && ! grep -Fq 'tool_allowlist' "$CFG"; then
+  pass "clearing with 'none' removes the grant (deny-by-default restored)"
+else
+  fail "clearing with 'none' left a tool_allowlist behind"
+fi
+if ( set_external_worker_tool_allowlist root kimi none ) >/dev/null 2>&1 \
+  && ! grep -Fq 'tool_allowlist' "$CFG"; then
+  pass "clearing an absent grant is a no-op"
+else
+  fail "clearing an absent grant misbehaved"
+fi
+
+if ( set_external_worker_tool_allowlist root kimi "shell" ) >/dev/null 2>&1; then
+  fail 'non-phase-1 tool name was accepted'
+else
+  pass 'non-phase-1 tool name is refused'
+fi
+grep -Fq 'tool_allowlist' "$CFG" \
+  && fail 'refused grant still wrote a key' \
+  || pass 'refused grant leaves config untouched'
+if ( set_external_worker_tool_allowlist root kimi "memory_read,memory_read" ) >/dev/null 2>&1; then
+  fail 'duplicate tool entry was accepted'
+else
+  pass 'duplicate tool entry is refused'
+fi
+if ( set_external_worker_tool_allowlist root nanocode "memory_read" ) >/dev/null 2>&1; then
+  fail 'unknown worker name was accepted'
+else
+  pass 'unknown worker name is refused'
+fi
+
+# A cron-mode worker never keeps a worker-level list (stripped at load,
+# MR !1549 EF-1) — the command must refuse the grant outright.
+cron_dir="$fixture/cron-state"
+real_tenant_state_dir() { printf '%s/state\n' "$fixture"; }
+tenant_state_dir() { printf '%s\n' "$cron_dir"; }
+mkdir -p "$cron_dir"
+cat >"$cron_dir/config.toml" <<'EOF'
+[[sandbox.external_workers]]
+name = "kimi"
+url = "ws://127.0.0.1:12001/ws/agent"
+mode = "cron"
+EOF
+if ( set_external_worker_tool_allowlist root kimi "memory_read" ) >/dev/null 2>&1; then
+  fail 'cron-mode worker accepted a worker-level grant'
+else
+  pass 'cron-mode worker refuses a worker-level grant'
+fi
+grep -Fq 'tool_allowlist' "$cron_dir/config.toml" \
+  && fail 'refused cron grant still wrote a key' \
+  || pass 'refused cron grant leaves config untouched'
+# Minimal block without timeout_ms: the grant inserts after the url line.
+cat >"$cron_dir/config.toml" <<'EOF'
+[[sandbox.external_workers]]
+name = "kimi"
+url = "ws://127.0.0.1:12001/ws/agent"
+EOF
+set_external_worker_tool_allowlist root kimi "knowledge_get_topic"
+if awk 'found_url && /^tool_allowlist = \["knowledge_get_topic"\]$/ {ok=1} /^url = /{found_url=1} END{exit ok?0:1}' \
+  "$cron_dir/config.toml"; then
+  pass 'grant inserts after url when timeout_ms is absent'
+else
+  fail 'grant insert without timeout_ms misplaced'
+fi
+
+# Run-171 (note #10468) LM-1..LM-4: the grant editor runs on parsed TOML.
+kimi_list_json() {  # prints the kimi entry's tool_allowlist as JSON, or "absent"
+  python3 - "$1" <<'PY'
+import json, sys, tomllib
+with open(sys.argv[1], "rb") as handle:
+    data = tomllib.load(handle)
+for entry in data.get("sandbox", {}).get("external_workers", []):
+    if entry.get("name") == "kimi":
+        print(json.dumps(entry.get("tool_allowlist", "absent")))
+        break
+PY
+}
+toml_parses() { python3 -c 'import sys, tomllib; tomllib.load(open(sys.argv[1], "rb"))' "$1" 2>/dev/null; }
+write_save_toml_shape() {  # the daemon's settings write-back puts each element on its own line
+  cat >"$cron_dir/config.toml" <<'EOF'
+[[sandbox.external_workers]]
+name = "kimi"
+url = "ws://127.0.0.1:12001/ws/agent"
+timeout_ms = 3600000
+tool_allowlist = [
+    "memory_read",
+    "memory_write",
+]
+
+[[sandbox.external_workers]]
+name = "opencode"
+url = "ws://127.0.0.1:11001/ws/agent"
+timeout_ms = 3600000
+tool_allowlist = [
+    "knowledge_search",
+]
+EOF
+}
+# LM-1: replace on the save_toml shape.
+write_save_toml_shape
+( set_external_worker_tool_allowlist root kimi "knowledge_search" ) && lm1_rc=0 || lm1_rc=$?
+if [[ "$lm1_rc" -eq 0 && "$(grep -c '^tool_allowlist' "$cron_dir/config.toml")" -eq 2 ]] \
+  && grep -Fqx 'tool_allowlist = ["knowledge_search"]' "$cron_dir/config.toml" \
+  && ! grep -Fq '    "memory_read",' "$cron_dir/config.toml"; then
+  pass 'multi-line grant (save_toml shape) is replaced as a whole'
+else
+  fail 'multi-line grant (save_toml shape) left orphan lines or lost the key'
+fi
+toml_parses "$cron_dir/config.toml" && pass 'replaced config is valid TOML' || fail 'replaced config is not valid TOML'
+[[ "$(kimi_list_json "$cron_dir/config.toml")" == '["knowledge_search"]' ]] \
+  && pass 'parsed kimi grant equals the request' || fail 'parsed kimi grant differs from the request'
+grep -Fq '    "knowledge_search",' "$cron_dir/config.toml" \
+  && pass 'other worker entries are untouched by the replace' || fail 'the replace touched another worker entry'
+# LM-1: clear on the save_toml shape.
+write_save_toml_shape
+( set_external_worker_tool_allowlist root kimi none ) && lm1_rc=0 || lm1_rc=$?
+if [[ "$lm1_rc" -eq 0 && "$(grep -c '^tool_allowlist' "$cron_dir/config.toml")" -eq 1 ]] \
+  && ! grep -Fq '    "memory_read",' "$cron_dir/config.toml" \
+  && [[ "$(kimi_list_json "$cron_dir/config.toml")" == '"absent"' ]]; then
+  pass 'multi-line grant (save_toml shape) is removed as a whole'
+else
+  fail 'clearing a multi-line grant left orphan lines'
+fi
+toml_parses "$cron_dir/config.toml" && pass 'cleared config is valid TOML' || fail 'cleared config is not valid TOML'
+# LM-1: the design doc's two-line shape.
+cat >"$cron_dir/config.toml" <<'EOF'
+[[sandbox.external_workers]]
+name = "kimi"
+url = "ws://127.0.0.1:12001/ws/agent"
+tool_allowlist = ["memory_read", "memory_write", "knowledge_search",
+                  "knowledge_submit_note", "knowledge_get_topic", "gitlab_tool"]
+EOF
+( set_external_worker_tool_allowlist root kimi "memory_read" ) && lm1_rc=0 || lm1_rc=$?
+[[ "$lm1_rc" -eq 0 ]] && toml_parses "$cron_dir/config.toml" && [[ "$(kimi_list_json "$cron_dir/config.toml")" == '["memory_read"]' ]] \
+  && pass 'two-line grant (design-doc shape) is replaced as a whole' || fail 'two-line grant (design-doc shape) was torn'
+# LM-3: mode = "cron" ahead of the name line is still refused.
+cat >"$cron_dir/config.toml" <<'EOF'
+[[sandbox.external_workers]]
+mode = "cron"
+name = "kimi"
+url = "ws://127.0.0.1:12001/ws/agent"
+EOF
+cp "$cron_dir/config.toml" "$fixture/lm3-before.toml"
+lm3_out="$( ( set_external_worker_tool_allowlist root kimi "memory_read" ) 2>&1 )" && lm3_rc=0 || lm3_rc=$?
+[[ "$lm3_rc" -ne 0 && "$lm3_out" == *'mode = "cron"'* ]] \
+  && pass 'cron-mode worker is refused whatever the key order' || fail "cron-mode worker with mode before name was accepted: [$lm3_out]"
+cmp -s "$cron_dir/config.toml" "$fixture/lm3-before.toml" && pass 'refused cron (key order) leaves config untouched' || fail 'refused cron (key order) modified the config'
+# LM-3: a non-cron entry sharing a cron worker's endpoint is refused (EV-1).
+cat >"$cron_dir/config.toml" <<'EOF'
+[[sandbox.external_workers]]
+name = "kimi"
+url = "ws://127.0.0.1:12001/ws/agent"
+
+[[sandbox.external_workers]]
+name = "opencode2"
+url = "ws://127.0.0.1:12001/ws/agent"
+mode = "cron"
+EOF
+cp "$cron_dir/config.toml" "$fixture/lm3b-before.toml"
+lm3_out="$( ( set_external_worker_tool_allowlist root kimi "memory_read" ) 2>&1 )" && lm3_rc=0 || lm3_rc=$?
+[[ "$lm3_rc" -ne 0 && "$lm3_out" == *'shares its endpoint'* ]] \
+  && pass 'shared cron endpoint is refused' || fail "shared cron endpoint was accepted: [$lm3_out]"
+cmp -s "$cron_dir/config.toml" "$fixture/lm3b-before.toml" && pass 'refused shared endpoint leaves config untouched' || fail 'refused shared endpoint modified the config'
+# LM-4: a worker named only outside [[sandbox.external_workers]] dies with a message.
+cat >"$cron_dir/config.toml" <<'EOF'
+[[mcp_servers]]
+name = "kimi"
+url = "http://127.0.0.1:1/"
+EOF
+lm4_out="$( ( set_external_worker_tool_allowlist root kimi "memory_read" ) 2>&1 )" && lm4_rc=0 || lm4_rc=$?
+[[ "$lm4_rc" -ne 0 && "$lm4_out" == *'is not configured'* ]] \
+  && pass 'worker named only in another table is refused with a message' || fail "worker in another table: rc=$lm4_rc out=[$lm4_out]"
+printf 'this = is = not toml\n' >"$cron_dir/config.toml"
+lm4_out="$( ( set_external_worker_tool_allowlist root kimi "memory_read" ) 2>&1 )" && lm4_rc=0 || lm4_rc=$?
+[[ "$lm4_rc" -ne 0 && "$lm4_out" == *'not valid TOML'* ]] \
+  && pass 'an invalid config is refused with a message' || fail "invalid config: rc=$lm4_rc out=[$lm4_out]"
+# LM-2: the config is staged as the tenant before any check reads it. A
+# symlinked config the tenant cannot read (modelled by a tenant_cat that
+# denies symlinks — the invoking user may be root) is refused up front; no
+# root-side grep/awk ever saw the target.
+lm2_orig_tenant_cat="$(declare -f tenant_cat)"
+tenant_cat() { if [[ -L "$2" ]]; then return 1; fi; cat -- "$2"; }
+# The link target names a DIFFERENT worker: a root-side grep of the live path
+# would wrongly report "not configured", the tenant-side staging refuses first.
+printf '[[sandbox.external_workers]]\nname = "opencode"\nurl = "ws://127.0.0.1:1/ws/agent"\n' >"$fixture/lm2-foreign.toml"
+rm -f "$cron_dir/config.toml"
+ln -s "$fixture/lm2-foreign.toml" "$cron_dir/config.toml"
+lm2_out="$( ( set_external_worker_tool_allowlist root kimi "memory_read" ) 2>&1 )" && lm2_rc=0 || lm2_rc=$?
+if [[ "$lm2_rc" -ne 0 && "$lm2_out" == *'could not read the tenant config'* && "$lm2_out" != *'is not configured'* ]]; then
+  pass 'symlinked config is refused at the tenant-side staging, before any check'
+else
+  fail "symlinked config: rc=$lm2_rc out=[$lm2_out]"
+fi
+grep -Fq 'tool_allowlist' "$fixture/lm2-foreign.toml" && fail 'symlinked config refusal wrote through the link' || pass 'symlinked config refusal leaves the link target untouched'
+rm -f "$cron_dir/config.toml"
+eval "$lm2_orig_tenant_cat"
+tenant_state_dir() { real_tenant_state_dir; }
+
+# CLI surface: exact-arity dispatch and forwarding. The harness may run as a
+# non-root account here; the dispatcher's require_root is stubbed for these
+# forwarding checks only (the library calls above exercise the function body
+# directly, as every other configure-* test in this file does).
+require_root() { :; }
+set_external_worker_tool_allowlist() { CAPTURED_TOOLS="$*"; }
+CAPTURED_TOOLS=''
+main configure-worker-tools root kimi none
+if [[ "$CAPTURED_TOOLS" == 'root kimi none' ]]; then
+  pass 'configure-worker-tools forwards tenant, worker, and list'
+else
+  fail "configure-worker-tools forwarded wrong args: [$CAPTURED_TOOLS]"
+fi
+if ( main configure-worker-tools root kimi ) >/dev/null 2>&1; then
+  fail 'configure-worker-tools accepted a missing list argument'
+else
+  pass 'configure-worker-tools enforces its arity'
+fi
+help_output_tools="$(usage)"
+if [[ "$help_output_tools" == *'configure-worker-tools'* ]]; then
+  pass 'help documents configure-worker-tools'
+else
+  fail 'help omits configure-worker-tools'
+fi
+
 MT_ROOTLESS=true
 render_worker_quadlet root kimi 8443
 quadlet="$fixture/quadlets/lunarwing-kimi-root.container"
@@ -106,6 +377,12 @@ assert_contains "$quadlet" "EnvironmentFile=$fixture/env/kimi-runtime.env" 'syst
 assert_not_contains "$quadlet" 'ssh-agent.sock' 'systemd Kimi quadlet has no SSH agent mount (WI#206)'
 assert_not_contains "$quadlet" 'SSH_AUTH_SOCK' 'systemd Kimi quadlet has no SSH_AUTH_SOCK env (WI#206)'
 assert_contains "$quadlet" 'PodmanArgs=--security-opt=no-new-privileges' 'systemd Kimi quadlet sets no-new-privileges (WI#206)'
+assert_contains "$quadlet" '--cap-drop=ALL' 'systemd Kimi quadlet drops all capabilities (WI#400 KW-3)'
+assert_contains "$quadlet" '--cap-add=SETUID' 'systemd Kimi quadlet keeps SETUID for the setpriv task drop (WI#400 KW-3)'
+assert_contains "$quadlet" '--cap-add=SETGID' 'systemd Kimi quadlet keeps SETGID for the setpriv task drop (WI#400 KW-3)'
+assert_contains "$quadlet" '--cap-add=CHOWN' 'systemd Kimi quadlet keeps CHOWN for the task-uid handoff (WI#400 KW-3)'
+assert_contains "$quadlet" '--cap-add=KILL' 'systemd Kimi quadlet keeps KILL for task cancel/timeout (WI#400 KW-3)'
+assert_contains "$quadlet" '--cap-add=DAC_OVERRIDE' 'systemd Kimi quadlet keeps DAC_OVERRIDE for cron workspace creation (WI#400 KW-3/KW-4)'
 assert_not_contains "$quadlet" 'SecurityOpt=' 'systemd Kimi quadlet avoids unsupported SecurityOpt key'
 # Non-kimi lanes mount only the socket directory (restart-safe), read-only so
 # a compromised worker cannot unlink/rebind the host agent socket (WI#226).
@@ -119,6 +396,23 @@ for lane in opencode opencode2 pebble; do
   assert_not_contains "$worker_quadlet" 'Volume='"$fixture"'/run/ssh-agent:/tmp/ssh-agent:z' \
     "$lane quadlet does not mount the agent directory read-write"
 done
+# WI#400 run-164 KW-2: the root-bridge lanes (opencode, pebble) get the same
+# container-level no-new-privileges kimi carries; the unmigrated opencode2
+# lane is deliberately excluded (KW-1). LD-7: pin the FULL trimmed set on
+# the Quadlet PodmanArgs — a single dropped cap must fail the pin.
+KW3_QUADLET_ARGS='PodmanArgs=--security-opt=no-new-privileges --cap-drop=ALL --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER --cap-add=KILL --cap-add=SETUID --cap-add=SETGID'
+assert_contains "$quadlet" "$KW3_QUADLET_ARGS" 'systemd Kimi quadlet carries the exact WI#400 capability trim (KW-3/LD-7)'
+for lane in opencode pebble; do
+  assert_contains "$fixture/quadlets/lunarwing-${lane}-root.container" \
+    "$KW3_QUADLET_ARGS" \
+    "$lane quadlet carries the exact WI#400 capability trim (KW-3/LD-7)"
+done
+assert_not_contains "$fixture/quadlets/lunarwing-opencode2-root.container" \
+  'no-new-privileges' \
+  'opencode2 quadlet stays off no-new-privileges until its own WI#400 migration'
+assert_not_contains "$fixture/quadlets/lunarwing-opencode2-root.container" \
+  '--cap-drop' \
+  'opencode2 quadlet stays off the WI#400 capability trim until its migration'
 # Quadlet's full-file hash must also notice the mount policy change.
 legacy_quadlet="$fixture/quadlets/legacy-rw.container"
 sed 's#ssh-agent:ro,z#ssh-agent:z#' "$worker_quadlet" > "$legacy_quadlet"
@@ -317,6 +611,18 @@ if grep -Fq -- '--security-opt no-new-privileges' <<<"$KIMI_BLOCK"; then
 else
   fail 'kimi imperative launch missing no-new-privileges (WI#206)'
 fi
+# WI#400 KW-3/LD-7: the root-bridge lanes run the bridge with a trimmed
+# capability set instead of the default root set. The FULL string is pinned:
+# a dropped KILL or DAC_OVERRIDE would otherwise only show in production.
+KW3_CAP_TRIM='--cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add KILL --cap-add SETUID --cap-add SETGID'
+for lane in kimi opencode pebble; do
+  LANE_BLOCK="$(awk "/^start_tenant_${lane}\\(\\)/,/^stop_tenant_${lane}\\(\\)/" "$WORKER_LIB")"
+  if grep -Fq -- "$KW3_CAP_TRIM" <<<"$LANE_BLOCK"; then
+    pass "$lane imperative launch runs the exact WI#400 capability trim (KW-3/LD-7)"
+  else
+    fail "$lane imperative launch missing the exact WI#400 capability trim (KW-3/LD-7)"
+  fi
+done
 # The non-kimi imperative lanes mount the directory read-only, preserving
 # daemon restart recovery while blocking worker-side socket replacement.
 for lane in opencode opencode2 pebble; do
@@ -328,21 +634,38 @@ for lane in opencode opencode2 pebble; do
     fail "$lane imperative launch missing the read-only ssh-agent directory mount"
   fi
 done
+# WI#400 run-164 KW-2: opencode and pebble imperative launches set
+# no-new-privileges like kimi's; opencode2 stays off it until its lane
+# migrates (KW-1).
+for lane in opencode pebble; do
+  LANE_BLOCK="$(awk "/^start_tenant_${lane}\\(\\)/,/^stop_tenant_${lane}\\(\\)/" "$WORKER_LIB")"
+  if grep -Fq -- '--security-opt no-new-privileges' <<<"$LANE_BLOCK"; then
+    pass "$lane imperative launch sets no-new-privileges (WI#400 KW-2)"
+  else
+    fail "$lane imperative launch missing no-new-privileges (WI#400 KW-2)"
+  fi
+done
+OPENCODE2_BLOCK="$(awk '/^start_tenant_opencode2\(\)/,/^stop_tenant_opencode2\(\)/' "$WORKER_LIB")"
+if grep -Fq -- '--security-opt no-new-privileges' <<<"$OPENCODE2_BLOCK"; then
+  fail 'opencode2 imperative launch picked up no-new-privileges before its WI#400 migration'
+else
+  pass 'opencode2 imperative launch unchanged by WI#400 (KW-1)'
+fi
 # The launch contract must carry the policy change so existing containers
 # force-recreate instead of surviving with the old mount.
 ROOT_SCRIPT="$(dirname "$MT_ADMIN")/lunarwing-mt-admin.sh"
-assert_contains "$ROOT_SCRIPT" 'KIMI_ROOTLESS_LAUNCH_CONTRACT="userns=${KIMI_USERNS};no-ssh-agent;no-new-privileges"' \
-  'kimi launch contract records the WI#206 policy change'
+assert_contains "$ROOT_SCRIPT" 'KIMI_ROOTLESS_LAUNCH_CONTRACT="userns=${KIMI_USERNS};no-ssh-agent;no-new-privileges;cap-trim"' \
+  'kimi launch contract records the WI#206 policy change and the WI#400 cap-trim'
 # Contract changes recreate old RW-mount containers on rootless AND rootful
 # imperative lanes. Quadlet recreations hash the rendered Volume= line.
-assert_contains "$ROOT_SCRIPT" 'OPENCODE_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE_USERNS};ssh-agent-dir-ro"' \
-  'opencode rootless launch contract records the read-only SSH mount'
+assert_contains "$ROOT_SCRIPT" 'OPENCODE_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE_USERNS};ssh-agent-dir-ro;no-new-privileges;cap-trim"' \
+  'opencode rootless launch contract records the read-only SSH mount, WI#400 no-new-privileges, and cap-trim'
 assert_contains "$ROOT_SCRIPT" 'OPENCODE2_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE2_USERNS};ssh-agent-dir-ro"' \
   'opencode2 rootless launch contract records the read-only SSH mount'
-assert_contains "$ROOT_SCRIPT" 'PEBBLE_ROOTLESS_LAUNCH_CONTRACT="ssh-agent-dir-ro"' \
-  'pebble launch contract records the read-only SSH mount'
-assert_contains "$WORKER_LIB" 'local opencode_launch_contract="ssh-agent-dir-ro"' \
-  'rootful opencode includes the SSH mount in its launch contract'
+assert_contains "$ROOT_SCRIPT" 'PEBBLE_ROOTLESS_LAUNCH_CONTRACT="userns=${PEBBLE_USERNS};ssh-agent-dir-ro;no-new-privileges;cap-trim"' \
+  'pebble launch contract records the WI#400 task-uid userns, read-only SSH mount, no-new-privileges, and cap-trim'
+assert_contains "$WORKER_LIB" 'local opencode_launch_contract="ssh-agent-dir-ro;cap-trim"' \
+  'rootful opencode includes the SSH mount and the WI#400 cap-trim in its launch contract'
 assert_contains "$WORKER_LIB" 'local launch_contract="ssh-agent-dir-ro"' \
   'rootful opencode2 includes the SSH mount in its launch contract'
 

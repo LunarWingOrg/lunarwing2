@@ -29,11 +29,12 @@ def run_config(worker, overrides=None, mounted=False, custom=None):
     entrypoint = (source / "entrypoint.sh").read_text()
     boundary = "# ── always start the health server"
     assert boundary in entrypoint, f"{worker}: startup boundary changed"
-    with tempfile.TemporaryDirectory(prefix=f"{worker}-llm-") as temp:
+    with temp_root(f"{worker}-llm-") as temp:
         root = Path(temp)
         home, app, workspace = root / "home", root / "app", root / "workspace"
         for path in (home, app / "config", workspace):
             path.mkdir(parents=True)
+        stage_setup(source, app, home)
         baked = (source / "config" / filename).read_text()
         placeholder = f"http://set-{worker}-base-url.invalid/openai/v1"
         if worker != "kimi":
@@ -56,8 +57,9 @@ def run_config(worker, overrides=None, mounted=False, custom=None):
         script = entrypoint.split(boundary, 1)[0].replace("/app/", str(app) + "/")
         for user in ("opencode", "kimi"):
             script = script.replace(f"/home/{user}/", str(home) + "/")
+        hand_tree(root)
         result = subprocess.run(["bash"], input=script, text=True, env=env,
-                                capture_output=True, timeout=15)
+                                capture_output=True, timeout=15, **as_ci_user())
         target = (home / ".kimi-code/config.toml" if worker == "kimi"
                   else workspace / ".opencode" / filename)
         generated = target.read_text() if target.exists() else ""
@@ -84,6 +86,108 @@ def free_port():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
+
+
+# WI#400: the worker entrypoints are root launchers that hand task-side setup
+# to entrypoint-task-setup.sh (staged beside entrypoint.sh with the same path
+# relocation). When the harness itself runs as root (the CI shape), the
+# setup script refuses root by design, so the scratch tree is handed to an
+# unprivileged uid and every entrypoint runs as that uid — the same
+# unprivileged branch the entrypoints take on host dev runs.
+SETUP_RUN_ID = 65534
+
+def as_ci_user():
+    """subprocess kwargs dropping to the unprivileged uid when run as root."""
+    if os.geteuid() == 0:
+        return {"user": SETUP_RUN_ID, "group": SETUP_RUN_ID, "extra_groups": []}
+    return {}
+
+
+_exec_temp_base = None
+
+
+def _probe_exec(directory):
+    """True when an executable stub runs from directory — probed AS the
+    unprivileged uid when the harness is root, because the WI#400 entrypoint
+    and its task-setup script then exec from inside the chosen tree."""
+    probe = directory / f".exec-probe-{os.getpid()}.sh"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        probe.write_text("#!/bin/sh\nexit 0\n")
+        probe.chmod(0o755)
+        return subprocess.run([str(probe)], capture_output=True,
+                              timeout=15, **as_ci_user()).returncode == 0
+    except OSError:
+        return False
+    finally:
+        probe.unlink(missing_ok=True)
+
+
+def temp_root(prefix):
+    """A TemporaryDirectory rooted where scripts can actually EXECUTE.
+    Dev VMs may mount /tmp noexec and the WI#400 entrypoints exec their
+    task-setup script from inside the temp tree; probe the system temp dir
+    first (the CI shape is unchanged), then /var/tmp, then a per-run base
+    under $HOME that is removed at exit. When the harness runs as root the
+    probe drops to the same unprivileged uid the entrypoints run as, so a
+    0700 $HOME (e.g. /root) can never be chosen for a dropped run."""
+    global _exec_temp_base
+    if _exec_temp_base is None:
+        import atexit
+        import shutil
+        system = Path(tempfile.gettempdir())
+        if _probe_exec(system):
+            _exec_temp_base = system
+        else:
+            for candidate in (Path("/var/tmp"),
+                              Path(os.environ.get("HOME", "")) / f".worker-entrypoint-tmp-{os.getpid()}"):
+                if str(candidate) in ("", "/") or not candidate.parent.exists():
+                    continue
+                if _probe_exec(candidate):
+                    if candidate == Path("/var/tmp"):
+                        _exec_temp_base = candidate
+                    else:
+                        atexit.register(shutil.rmtree, candidate, ignore_errors=True)
+                        _exec_temp_base = candidate
+                    break
+            else:
+                raise AssertionError(
+                    "no executable directory found for the WI#400 entrypoint temp trees")
+    return tempfile.TemporaryDirectory(
+        prefix=prefix,
+        dir=None if _exec_temp_base == Path(tempfile.gettempdir()) else _exec_temp_base,
+    )
+
+
+def hand_tree(path):
+    """Recursively hand a scratch tree to the unprivileged uid (root only)."""
+    if os.geteuid() != 0:
+        return
+    for dirpath, dirnames, filenames in os.walk(path):
+        for name in dirnames + filenames:
+            try:
+                os.chown(os.path.join(dirpath, name), SETUP_RUN_ID, SETUP_RUN_ID,
+                         follow_symlinks=False)
+            except OSError:
+                pass
+    try:
+        os.chown(path, SETUP_RUN_ID, SETUP_RUN_ID)
+    except OSError:
+        pass
+
+
+def stage_setup(source, app, home):
+    """Stage entrypoint-task-setup.sh (WI#400) with the entrypoint's own
+    /app/ and /home/<user>/ relocation applied to its text."""
+    setup = source / "entrypoint-task-setup.sh"
+    if not setup.exists():
+        return
+    text = setup.read_text().replace("/app/", str(app) + "/")
+    for user in ("opencode", "kimi"):
+        text = text.replace(f"/home/{user}/", str(home) + "/")
+    target = app / "entrypoint-task-setup.sh"
+    target.write_text(text)
+    target.chmod(0o755)
 
 
 def execable_dir(root):
@@ -130,12 +234,13 @@ def run_websocket_startup(worker):
     entrypoint = (source / "entrypoint.sh").read_text()
     boundary = "# ── always start the health server"
     assert boundary in entrypoint, f"{worker}: startup boundary changed"
-    with tempfile.TemporaryDirectory(prefix=f"{worker}-ws373-") as temp:
+    with temp_root(f"{worker}-ws373-") as temp:
         root = Path(temp)
         home, app, workspace = root / "home", root / "app", root / "workspace"
         bin_dir = execable_dir(root)
         for path in (home, app / "config", workspace / ".opencode"):
             path.mkdir(parents=True)
+        stage_setup(source, app, home)
         baked = (source / "config" / filename).read_text()
         placeholder = f"http://set-{worker}-base-url.invalid/openai/v1"
         if worker != "kimi":
@@ -167,14 +272,21 @@ def run_websocket_startup(worker):
         )
         serve_stub.chmod(0o755)
         bun_stub = bin_dir / "bun"
+        # WI#400 LP-1: bun loads bunfig.toml/.env from its cwd, so the root
+        # bridge must be started from /app, never from the task workspace.
+        bridge_cwd = root / "bridge-cwd.txt"
         bun_stub.write_text(
             "#!/bin/sh\n"
+            f"pwd > {bridge_cwd}\n"
             f"if [ -n \"$AGENT_AUTH_TOKEN\" ]; then echo PRESENT > {bridge_mark};"
+            "elif [ -n \"$AGENT_AUTH_TOKEN_FILE\" ] && [ \"$(cat"
+            " \"$AGENT_AUTH_TOKEN_FILE\" 2>/dev/null)\" = bridge-secret-64hex ];"
+            f" then echo PRESENT > {bridge_mark};"
             f" else echo ABSENT > {bridge_mark}; fi\n"
             "exit 0\n"
         )
         bun_stub.chmod(0o755)
-        script = entrypoint.replace("/app/", str(app) + "/")
+        script = entrypoint.replace("/app/", str(app) + "/").replace("cd /app\n", f"cd {app}\n")
         for user in ("opencode", "kimi"):
             script = script.replace(f"/home/{user}/", str(home) + "/")
         env = {
@@ -187,17 +299,24 @@ def run_websocket_startup(worker):
             "OPENCODE_SERVE_HOST": "127.0.0.1",
             "HEALTH_PORT": str(health_port),
             "WS_STATE_FILE": str(root / "ws-state.json"),
+            "LUNARWING_TOKEN_DIR": str(root / "run-lunarwing"),
             "AGENT_AUTH_TOKEN": "bridge-secret-64hex",
         }
+        hand_tree(root)
+        hand_tree(bin_dir)
         result = subprocess.run(["bash"], input=script, text=True, env=env,
-                                capture_output=True, timeout=60)
+                                capture_output=True, timeout=60, **as_ci_user())
         assert result.returncode == 0, f"{worker}: entrypoint failed: {result.stderr}"
         assert serve_mark.exists() and bridge_mark.exists(), \
             f"{worker}: stubs did not run: {result.stderr}"
         assert serve_mark.read_text().strip() == "ABSENT", \
             f"{worker}: hub-handshake token reached the serve process env (WI#373)"
+        if worker == "opencode":  # opencode2's bridge is not root (USER 10003), so cwd is not a boundary there
+            assert bridge_cwd.exists() and \
+                Path(bridge_cwd.read_text().strip()).resolve() == app.resolve(), \
+                f"{worker}: the bridge must be exec-ed from /app, not the workspace (WI#400 LP-1): {bridge_cwd.read_text() if bridge_cwd.exists() else 'no cwd mark'}"
         assert bridge_mark.read_text().strip() == "PRESENT", \
-            f"{worker}: bridge lost its handshake credential (WI#373)"
+            f"{worker}: bridge lost its handshake credential (WI#373/WI#400 env-or-file)"
 
 
 def run_oneshot_startup(worker, mode):
@@ -207,12 +326,13 @@ def run_oneshot_startup(worker, mode):
     directory, filename = workers[worker]
     source = repo / directory
     entrypoint = (source / "entrypoint.sh").read_text()
-    with tempfile.TemporaryDirectory(prefix=f"{worker}-cli373-") as temp:
+    with temp_root(f"{worker}-cli373-") as temp:
         root = Path(temp)
         home, app, workspace = root / "home", root / "app", root / "workspace"
         bin_dir = execable_dir(root)
         for path in (home, app / "config", workspace / ".opencode"):
             path.mkdir(parents=True)
+        stage_setup(source, app, home)
         baked = (source / "config" / filename).read_text()
         placeholder = f"http://set-{worker}-base-url.invalid/openai/v1"
         if worker != "kimi":
@@ -241,14 +361,17 @@ def run_oneshot_startup(worker, mode):
             f"{worker.upper()}_BASE_URL": endpoint,
             "HEALTH_PORT": str(free_port()),
             "WS_STATE_FILE": str(root / "ws-state.json"),
+            "LUNARWING_TOKEN_DIR": str(root / "run-lunarwing"),
             "AGENT_AUTH_TOKEN": "bridge-secret-64hex",
         }
         if worker != "kimi":
             env["OPENCODE_BIN"] = str(stub)
         env["KIMI_MODE" if worker == "kimi" else "OPENCODE_MODE"] = mode
+        hand_tree(root)
+        hand_tree(bin_dir)
         result = subprocess.run(["bash", "-s", "--", "probe prompt"],
                                 input=script, text=True, env=env,
-                                capture_output=True, timeout=60)
+                                capture_output=True, timeout=60, **as_ci_user())
         assert result.returncode == 0, \
             f"{worker} {mode}: entrypoint failed: {result.stderr}"
         assert mark.exists(), f"{worker} {mode}: stub did not run: {result.stderr}"
@@ -260,7 +383,7 @@ def run_pebble_cli_startup():
     """WI#373 (pebble cli mode): same one-shot boundary; the pebble process
     must not inherit the hub-handshake credential."""
     entrypoint = (repo / "pebble4lunarwing" / "entrypoint.sh").read_text()
-    with tempfile.TemporaryDirectory(prefix="pebble-cli373-") as temp:
+    with temp_root("pebble-cli373-") as temp:
         root = Path(temp)
         bin_dir = execable_dir(root)
         mark = root / "pebble-cli-env.txt"
@@ -272,18 +395,253 @@ def run_pebble_cli_startup():
             "exit 0\n"
         )
         stub.chmod(0o755)
+        hand_tree(root)
+        hand_tree(bin_dir)
         result = subprocess.run(
             ["bash", "-s", "--", "probe prompt"],
             input=entrypoint, text=True,
             env={"PATH": f"{bin_dir}:{os.environ['PATH']}",
                  "HOME": str(root), "TMPDIR": temp,
                  "PEBBLE_MODE": "cli",
+                 "LUNARWING_TOKEN_DIR": str(root / "run-lunarwing"),
                  "AGENT_AUTH_TOKEN": "bridge-secret-64hex"},
-            capture_output=True, timeout=60)
+            capture_output=True, timeout=60, **as_ci_user())
         assert result.returncode == 0, f"pebble cli: entrypoint failed: {result.stderr}"
         assert mark.exists(), f"pebble cli: stub did not run: {result.stderr}"
         assert mark.read_text().strip() == "ABSENT", \
             "pebble cli: hub-handshake token reached the one-shot task env (WI#373)"
+
+
+def run_pebble_token_layout():
+    """WI#400 KW-7c/LD-13: the pebble entrypoint's credential handoff layout
+    — 0700 directory, 0400 file holding exactly the token, and BOTH
+    AGENT_AUTH_TOKEN and AGENT_AUTH_TOKEN_FILE absent from the task env.
+    (The in-container owner is root; ownership is asserted in-image — modes
+    and stripping are pinned here.)"""
+    import stat as statmod
+    entrypoint = (repo / "pebble4lunarwing" / "entrypoint.sh").read_text()
+    with temp_root("pebble-token400-") as temp:
+        root = Path(temp)
+        bin_dir = execable_dir(root)
+        token_dir = root / "token"
+        mark = root / "task-env.txt"
+        stub = bin_dir / "pebble"
+        stub.write_text(
+            "#!/bin/sh\n"
+            "{ echo \"token=${AGENT_AUTH_TOKEN:-unset}\"; "
+            "echo \"file=${AGENT_AUTH_TOKEN_FILE:-unset}\"; } > " + str(mark) + "\n"
+            "exit 0\n"
+        )
+        stub.chmod(0o755)
+        hand_tree(root)
+        hand_tree(bin_dir)
+        result = subprocess.run(
+            ["bash", "-s", "--", "probe prompt"],
+            input=entrypoint, text=True,
+            env={"PATH": f"{bin_dir}:{os.environ['PATH']}",
+                 "HOME": str(root), "TMPDIR": temp,
+                 "PEBBLE_MODE": "cli",
+                 "LUNARWING_TOKEN_DIR": str(token_dir),
+                 "AGENT_AUTH_TOKEN": "bridge-secret-64hex"},
+            capture_output=True, timeout=60, **as_ci_user())
+        assert result.returncode == 0, f"pebble token layout: entrypoint failed: {result.stderr}"
+        token_file = token_dir / "agent_auth_token"
+        assert token_dir.is_dir(), "token directory not created"
+        assert statmod.S_IMODE(token_dir.stat().st_mode) == 0o700, \
+            f"token directory mode {oct(statmod.S_IMODE(token_dir.stat().st_mode))} != 0o700"
+        assert token_file.is_file(), "token file not created"
+        assert statmod.S_IMODE(token_file.stat().st_mode) == 0o400, \
+            f"token file mode {oct(statmod.S_IMODE(token_file.stat().st_mode))} != 0o400"
+        assert token_file.read_text() == "bridge-secret-64hex", \
+            "token file content must be exactly the credential"
+        lines = mark.read_text().splitlines()
+        assert lines == ["token=unset", "file=unset"], \
+            f"task env must lose both the credential and its file pointer: {lines}"
+
+
+def run_pebble_cli_drop_argv():
+    """WI#400 KW-7c/LD-13: with the identity pinned and the harness running as
+    root (the CI shape), the cli one-shot must exec setpriv with the exact
+    privilege-dropping flags before pebble. Unprivileged hosts cannot take
+    the root branch, so the pin is root-only."""
+    if os.geteuid() != 0:
+        return
+    entrypoint = (repo / "pebble4lunarwing" / "entrypoint.sh").read_text()
+    with temp_root("pebble-clidrop-") as temp:
+        root = Path(temp)
+        bin_dir = execable_dir(root)
+        mark = root / "drop-argv.txt"
+        stub = bin_dir / "pebble"
+        stub.write_text("#!/bin/sh\necho RAN_PEBBLE > " + str(mark) + "\nexit 0\n")
+        stub.chmod(0o755)
+        setpriv_stub = bin_dir / "setpriv"
+        setpriv_stub.write_text(
+            "#!/bin/sh\nprintf '<%s>' \"$@\" > " + str(mark) + "\nprintf '\\n' >> " + str(mark) + "\nexit 0\n"
+        )
+        setpriv_stub.chmod(0o755)
+        hand_tree(root)
+        hand_tree(bin_dir)
+        result = subprocess.run(
+            ["bash", "-s", "--", "probe prompt"],
+            input=entrypoint, text=True,
+            env={"PATH": f"{bin_dir}:{os.environ['PATH']}",
+                 "HOME": str(root), "TMPDIR": temp,
+                 "PEBBLE_MODE": "cli",
+                 "LUNARWING_TOKEN_DIR": str(root / "run-lunarwing"),
+                 "PEBBLE_TASK_UID": "10004",
+                 "PEBBLE_TASK_GID": "10004"},
+            capture_output=True, timeout=60)
+        assert result.returncode == 0, f"pebble cli drop: entrypoint failed: {result.stderr}"
+        argv = mark.read_text().strip()
+        assert argv == (
+            "<--reuid=10004><--regid=10004><--clear-groups>"
+            "<--ambient-caps=-all><--inh-caps=-all><--no-new-privs><-->"
+            "<env><-u><AGENT_AUTH_TOKEN><-u><AGENT_AUTH_TOKEN_FILE>"
+            "<pebble><--permission-mode><danger-full-access>"
+            "<--model><openai/gpt-5.2><--output-format><text><probe prompt>"
+        ), f"setpriv argv missing mandatory flags (WI#400 KW-2/LD-13): {argv}"
+
+
+def run_task_drop_argv(worker):
+    """WI#400 KW-2/LD-7: with the harness running as root (the CI shape), the
+    kimi and opencode cli one-shots must exec setpriv with the exact
+    privilege-dropping flags (the cap-clearing pair AND --no-new-privs)
+    before the task binary. Unprivileged hosts cannot take the root branch,
+    so the pin is root-only."""
+    if os.geteuid() != 0:
+        return
+    directory, filename = workers[worker]
+    source = repo / directory
+    entrypoint = (source / "entrypoint.sh").read_text()
+    user = "kimi" if worker == "kimi" else "opencode"
+    task_uid = {"kimi": "10002", "opencode": "10001"}[worker]
+    with temp_root(f"{worker}-dropargv-") as temp:
+        root = Path(temp)
+        bin_dir = execable_dir(root)
+        mark = root / "drop-argv.txt"
+        task_stub = bin_dir / user
+        task_stub.write_text("#!/bin/sh\necho RAN_TASK > " + str(mark) + "\nexit 0\n")
+        task_stub.chmod(0o755)
+        setpriv_stub = bin_dir / "setpriv"
+        setpriv_stub.write_text(
+            "#!/bin/sh\nprintf '<%s>' \"$@\" > " + str(mark) + "\nprintf '\\n' >> " + str(mark) + "\nexit 0\n"
+        )
+        setpriv_stub.chmod(0o755)
+        hand_tree(root)
+        hand_tree(bin_dir)
+        env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "HOME": str(root / "home"), "TMPDIR": temp,
+            "WORKSPACE_ROOT": str(root / "workspace"),
+            "LUNARWING_TOKEN_DIR": str(root / "run-lunarwing"),
+            f"{worker.upper()}_MODE": "cli",
+            **({"OPENCODE_BIN": str(task_stub)} if worker != "kimi" else {}),
+        }
+        (root / "home").mkdir()
+        (root / "workspace").mkdir()
+        (root / "app" / "config").mkdir(parents=True)
+        result = subprocess.run(
+            ["bash", "-s", "--", "probe prompt"],
+            input=entrypoint.replace("/app/", str(root / "app") + "/"),
+            text=True, env=env, capture_output=True, timeout=60)
+        assert result.returncode == 0, f"{worker} drop: entrypoint failed: {result.stderr}"
+        argv = mark.read_text().strip()
+        # The kimi/opencode SETPRIV_FLAGS arrays carry no bare `--`
+        # separator (unlike pebble's entrypoint); the flags end at
+        # --no-new-privs and the env command follows directly.
+        flags = (
+            f"<--reuid={task_uid}><--regid={task_uid}><--clear-groups>"
+            "<--ambient-caps=-all><--inh-caps=-all><--no-new-privs>"
+        )
+        if worker == "kimi":
+            expected = flags + (
+                "<env><HOME=/home/kimi><-u><AGENT_AUTH_TOKEN>"
+                "<-u><AGENT_AUTH_TOKEN_FILE>"
+                "<kimi><-p><probe prompt><--output-format><stream-json>"
+            )
+        else:
+            expected = flags + (
+                "<env><HOME=/home/opencode><-u><AGENT_AUTH_TOKEN>"
+                "<-u><AGENT_AUTH_TOKEN_FILE>"
+                f"<{task_stub}><run><probe prompt>"
+            )
+        assert argv == expected, \
+            f"{worker} setpriv argv missing mandatory flags (WI#400 KW-2/LD-7): {argv}"
+
+
+def run_pebble_websocket_inherit():
+    """WI#400 x WI#422 (run-171): the rootful tenant-uid launch passes
+    PEBBLE_TASK_UID/GID=inherit. That is the one sanctioned non-root shape:
+    the websocket entrypoint must start (no LD-8 refusal), must NOT stage a
+    root-only credential file (there is no root to own it), and must hand
+    the bridge the credential in its environment, pointer-free."""
+    entrypoint = (repo / "pebble4lunarwing" / "entrypoint.sh").read_text()
+    with temp_root("pebble-wsinh-") as temp:
+        root = Path(temp)
+        bin_dir = execable_dir(root)
+        token_dir = root / "token"
+        mark = root / "bridge-env.txt"
+        id_stub = bin_dir / "id"
+        id_stub.write_text("#!/bin/sh\necho 1042\n")
+        id_stub.chmod(0o755)
+        bridge_stub = bin_dir / "pebble4lunarwing"
+        bridge_stub.write_text(
+            "#!/bin/sh\n"
+            "{ echo \"token=${AGENT_AUTH_TOKEN:-unset}\"; "
+            "echo \"file=${AGENT_AUTH_TOKEN_FILE:-unset}\"; } > " + str(mark) + "\n"
+            "exit 0\n"
+        )
+        bridge_stub.chmod(0o755)
+        hand_tree(root)
+        hand_tree(bin_dir)
+        result = subprocess.run(
+            ["bash", "-s"],
+            input=entrypoint, text=True,
+            env={"PATH": f"{bin_dir}:{os.environ['PATH']}",
+                 "HOME": str(root), "TMPDIR": temp,
+                 "PEBBLE_MODE": "websocket",
+                 "PEBBLE_TASK_UID": "inherit",
+                 "PEBBLE_TASK_GID": "inherit",
+                 "LUNARWING_TOKEN_DIR": str(token_dir),
+                 "AGENT_AUTH_TOKEN": "bridge-secret-64hex"},
+            capture_output=True, timeout=60, **as_ci_user())
+        assert result.returncode == 0, \
+            f"pebble websocket entrypoint refused the inherit pair as a non-root bridge: {result.stderr}"
+        assert "no privilege split" in result.stdout, \
+            f"inherit launch must say there is no split on this lane: {result.stdout}"
+        assert not token_dir.exists(), \
+            "inherit launch must not stage a credential file (no root to own it)"
+        lines = mark.read_text().splitlines()
+        assert lines == ["token=bridge-secret-64hex", "file=unset"], \
+            f"inherit launch must hand the bridge the credential in env, pointer-free: {lines}"
+
+def run_pebble_websocket_refusal():
+    """WI#400 LD-8: when the bridge itself runs as the task uid (the rootless
+    keep-id + USER-less-image failure mode), the websocket entrypoint must
+    refuse to start. An `id` stub reports the task uid, so the pin works
+    whatever uid the harness itself runs as."""
+    entrypoint = (repo / "pebble4lunarwing" / "entrypoint.sh").read_text()
+    with temp_root("pebble-wsref-") as temp:
+        root = Path(temp)
+        bin_dir = execable_dir(root)
+        id_stub = bin_dir / "id"
+        id_stub.write_text("#!/bin/sh\necho 10004\n")
+        id_stub.chmod(0o755)
+        hand_tree(root)
+        hand_tree(bin_dir)
+        result = subprocess.run(
+            ["bash", "-s"],
+            input=entrypoint, text=True,
+            env={"PATH": f"{bin_dir}:{os.environ['PATH']}",
+                 "HOME": str(root), "TMPDIR": temp,
+                 "PEBBLE_MODE": "websocket",
+                 "PEBBLE_TASK_UID": "10004",
+                 "PEBBLE_TASK_GID": "10004"},
+            capture_output=True, timeout=60, **as_ci_user())
+        assert result.returncode != 0, \
+            "pebble websocket entrypoint accepted running as the task uid (WI#400 LD-8)"
+        assert "refusing to start" in result.stderr and "container root" in result.stderr, \
+            f"refusal must explain the root-bridge requirement: {result.stderr}"
 
 
 for worker in workers:
@@ -327,4 +685,16 @@ for worker in ("kimi", "opencode", "opencode2"):
         print(f"PASS: {worker} {mode} one-shot runs without the hub-handshake token (WI#373)")
 run_pebble_cli_startup()
 print("PASS: pebble cli one-shot runs without the hub-handshake token (WI#373)")
+run_pebble_token_layout()
+print("PASS: pebble entrypoint token handoff layout is 0700/0400 and fully stripped (WI#400 KW-7c)")
+if os.geteuid() == 0:
+    run_pebble_cli_drop_argv()
+    print("PASS: pebble cli one-shot drops through setpriv with the mandatory flags (WI#400 KW-2/LD-13, root)")
+    for worker in ("kimi", "opencode"):
+        run_task_drop_argv(worker)
+        print(f"PASS: {worker} cli one-shot drops through setpriv with the mandatory flags (WI#400 KW-2/LD-7, root)")
+run_pebble_websocket_refusal()
+print("PASS: pebble websocket entrypoint refuses to run as the task uid (WI#400 LD-8)")
+run_pebble_websocket_inherit()
+print("PASS: pebble websocket entrypoint accepts the rootful inherit pair and keeps the credential in env (WI#400 x WI#422)")
 PY
