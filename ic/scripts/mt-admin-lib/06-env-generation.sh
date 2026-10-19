@@ -321,6 +321,10 @@ _read_env_value() {  # <file> <KEY>
 
 # Read one value without opening tenant-controlled paths as root. The tenant-side
 # process rejects unsafe ownership, permissions, symlinks, and shared hard links.
+# The inner bash runs with --norc --noprofile: stdout is the value transport, so
+# a host whose bash sources a banner-printing rc even for -c shells (the dev VM)
+# must not be able to corrupt the captured value (WI#423 widened this helper's
+# reach from the kimi lane to most env reads).
 read_tenant_env_value() {  # <tenant> <file> <KEY>
   local name="$1" target="$2" key="$3" value
   local -a drop=(sudo -u "$name")
@@ -328,11 +332,16 @@ read_tenant_env_value() {  # <tenant> <file> <KEY>
   [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || die "invalid tenant env key"
   darkirc_path_components_safe "$target" || die "unsafe tenant env path: $target"
   value="$("${drop[@]}" env -i PATH="/usr/bin:/bin" \
-    TARGET_PATH="$target" TARGET_KEY="$key" bash -c '
+    TARGET_PATH="$target" TARGET_KEY="$key" bash --norc --noprofile -c '
       set -euo pipefail
       target="$TARGET_PATH"
       parent="${target%/*}"
       uid="$(id -u)"
+      # A parent that does not exist at all means nothing was provisioned yet
+      # (the first add_tenant pass reads before create_tenant_user makes the
+      # env dir): read as absent. A parent that EXISTS in any shape other than
+      # a non-symlink directory still refuses (WI#423).
+      [[ -e "$parent" || -L "$parent" ]] || exit 0
       [[ -d "$parent" && ! -L "$parent" ]] || exit 73
       parent_owner="$(stat -c %u "$parent" 2>/dev/null || printf -- -1)"
       parent_mode="$(stat -c %a "$parent" 2>/dev/null || true)"

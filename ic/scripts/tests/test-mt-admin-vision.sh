@@ -90,6 +90,13 @@ fi
 tenant_home() { printf '%s/home/%s' "$ROOT" "$1"; }
 tenant_env_dir() { printf '%s/home/%s/lunarwing/env' "$ROOT" "$1"; }
 tenant_cat() { cat -- "$2"; }
+# WI#390 harness convention: map the fixture tenant's privilege drops onto the
+# invoking user (fixture env dir is owned by that user at mode 700).
+sudo() {
+  [[ "${1:-}" == "-u" ]] || return 1
+  shift 2
+  "$@"
+}
 original_writer="$(declare -f write_tenant_file_atomic)"
 eval "${original_writer/write_tenant_file_atomic ()/original_write_tenant_file_atomic ()}"
 write_tenant_file_atomic() {
@@ -115,6 +122,9 @@ mkdir -p "$(tenant_env_dir alpha)" "$ROOT/init.d"
 chmod 700 "$(tenant_env_dir alpha)"
 printf '%s\n' 'LUNARWING_AUTH_TOKEN=test-only-token' 'OCR_PORT=8088' 'OCR_HEALTH_PORT=8089' \
   >"$(tenant_env_dir alpha)/vision.env"
+# WI#423: the activation-token read goes through the tenant-side reader, which
+# refuses group/other-readable env files — write the production 0600 shape.
+chmod 600 "$(tenant_env_dir alpha)/vision.env"
 OPENRC_INITD_DIR="$ROOT/init.d"
 # shellcheck disable=SC2034  # Consumed by sourced mt-admin functions.
 CONTAINER_RT=podman

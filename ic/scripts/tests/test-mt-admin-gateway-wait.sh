@@ -48,7 +48,17 @@ assert() {
 gateway_wait_fails() { ! _wait_tenant_gateway fixture; }
 
 mkdir -p "$fixture_dir/env"
+chmod 700 "$fixture_dir/env"
 printf 'GATEWAY_AUTH_TOKEN=%s\n' "$fixture_token" >"$fixture_dir/env/lunarwing.env"
+chmod 600 "$fixture_dir/env/lunarwing.env"
+# WI#390 harness convention: the fixture tenant is not a real account, so run
+# the tenant-side privilege drop directly as the invoking user (the fixture env
+# dir is owned by that user at mode 700, satisfying the tenant-side checks).
+sudo() {
+  [[ "${1:-}" == "-u" ]] || return 1
+  shift 2
+  "$@"
+}
 
 assert 'authenticated gateway probe succeeds' _wait_tenant_gateway fixture
 assert 'gateway port and status route used' grep -q \

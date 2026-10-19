@@ -671,6 +671,7 @@ echo "=== coordination env backfill tests ==="
 cat >"$MT_FIXTURE/env/lunarwing.env" <<'EOF'
 LUNARWING_OWNER_ID=fixture-tenant
 EOF
+chmod 600 "$MT_FIXTURE/env/lunarwing.env"
 patch_tenant_coordination_env fixture-tenant "$MT_FIXTURE/env/lunarwing.env"
 assert_eq "backfill coordination disabled" "$(envval COORD_ENABLED)" "false"
 assert_eq "backfill coordination agent ID" "$(envval COORD_AGENT_ID)" "fixture-tenant"
@@ -782,6 +783,7 @@ rm -f "$MT_FIXTURE/env/lunarwing.env"
 assert_eq "resolver: no file -> default" \
   "$(resolve_tenant_xmpp_jid fixture-tenant "")" "fixture-tenant@xmpp.localhost"
 printf 'XMPP_JID=stored@xmpp.sobe.world\n' >"$MT_FIXTURE/env/lunarwing.env"
+chmod 600 "$MT_FIXTURE/env/lunarwing.env"
 assert_eq "resolver: stored wins over default" \
   "$(resolve_tenant_xmpp_jid fixture-tenant "")" "stored@xmpp.sobe.world"
 assert_eq "resolver: explicit wins over stored" \
@@ -1219,6 +1221,7 @@ cat > "$MT_FIXTURE/env/lunarwing.env" <<E
 XMPP_BRIDGE_TOKEN=bridge-tok-fixture
 XMPP_PASSWORD=xmpp-pass-fixture
 E
+chmod 600 "$MT_FIXTURE/env/lunarwing.env"
 
 run_bridge_writer() {  # <xmpp_allow_from_extras>
   rm -f "$MT_FIXTURE/env/xmpp-bridge.env"
@@ -1360,6 +1363,7 @@ JSON
 cat >"$MT_FIXTURE/env/lunarwing.env" <<'EOF'
 LLM_BASE_URL=http://127.0.0.1:10004/v1
 EOF
+chmod 600 "$MT_FIXTURE/env/lunarwing.env"
 cat >"$MT_FIXTURE/env/proxy.env" <<'EOF'
 TENSORZERO_URL=http://tz-upstream:3030
 EOF
@@ -1379,6 +1383,7 @@ cat >"$MT_FIXTURE/env/lunarwing.env" <<'EOF'
 LLM_BASE_URL=http://direct:9000/v1
 OPENCODE_BASE_URL=http://operator-set:4100/v1
 EOF
+chmod 600 "$MT_FIXTURE/env/lunarwing.env"
 backfill_tenant_worker_base_urls fixture-tenant
 assert_eq "backfill: operator-set opencode preserved" \
   "$(envval OPENCODE_BASE_URL)" "http://operator-set:4100/v1"
@@ -1389,6 +1394,7 @@ assert_eq "backfill: kimi inherits direct LLM_BASE_URL" \
 cat >"$MT_FIXTURE/env/lunarwing.env" <<'EOF'
 LLM_BASE_URL=http://127.0.0.1:10004/v1
 EOF
+chmod 600 "$MT_FIXTURE/env/lunarwing.env"
 rm -f "$MT_FIXTURE/env/proxy.env"
 if (backfill_tenant_worker_base_urls fixture-tenant) >/dev/null 2>&1; then
   echo "  FAIL: backfill succeeded with no derivable endpoint"; failures=$((failures + 1))
