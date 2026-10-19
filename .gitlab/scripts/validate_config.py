@@ -899,9 +899,9 @@ WORKER_TS_LANE_SCRIPTS = {
         ),
     ),
     # WI#375 DR-3: the opencode2 bridge's dependency-free TS suites (the
-    # executor suite needs the image's built @opencode/client and stays
-    # image-gated). Same shape as worker-opencode-ts: digest-tied bun image,
-    # lint runner tags, no extends.
+    # executor and bridge suites need the image's built @opencode/client and
+    # stay image-gated). Same shape as worker-opencode-ts: digest-tied bun
+    # image, lint runner tags, no extends.
     "worker-opencode2-ts": (
         "$CI_BUN_IMAGE",
         (
@@ -911,6 +911,8 @@ WORKER_TS_LANE_SCRIPTS = {
             "bun scripts/opencode_result_test.ts",
             "bun scripts/sdk_surface_test.ts",
             "bun scripts/sdk_surface_assert_test.ts",
+            "bun scripts/lunarwing_tool_proxy_test.ts",
+            "bun scripts/lunarwing_tool_plugin_test.ts",
         ),
     ),
 }

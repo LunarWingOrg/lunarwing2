@@ -66,7 +66,9 @@ previous compatibility baseline.
   boundary denies proxied writes to identity, config, memory-bootstrap,
   daily-log, and `engine/**` files. The kimi worker lane ships the first
   worker-side bridge: an in-image MCP shim gives the agent a native
-  `mcp__lunarwing__*` surface (opencode/opencode2/pebble lanes pending).
+  `mcp__lunarwing__*` surface. The opencode and opencode2 lanes ship
+  serve-process plugins exposing the same phase-1 set as direct
+  `lunarwing_*` tools; the pebble lane's worker-side bridge remains open.
 - **Cron missions on external workers (WI#325).** A mission supervisor owns
   the tick chain: heartbeat watchdog, lapse → cancel → terminal-wait →
   backoff re-entry, persisted pause/tick counters, inline `job_events`, and
@@ -216,10 +218,15 @@ The **kimi** lane ships the worker-side bridge: `lunarwing_tool_proxy.ts`
 (a per-task relay; replies routed by call_id scoped to the owning hub
 socket; task close fails in-flight calls) plus `lunarwing_mcp_server.ts` (a
 thin stdio MCP server registered in `$KIMI_CODE_HOME/mcp.json`), giving the
-agent a native `mcp__lunarwing__*` tool surface. The opencode, opencode2,
-and pebble worker-side bridges remain open, and real-worker acceptance
-evidence waits on the rebuilt kimi image (protected-pipeline/deploy gate) —
-**WI#324 remains open**. Design doc:
+agent a native `mcp__lunarwing__*` tool surface. The **opencode** and
+**opencode2** lanes ship the same bridge-side relay plus serve-process
+plugins (`lunarwing_tool_plugin`) exposing the phase-1 set as direct
+`lunarwing_*` tools; the opencode2 lane additionally denies upstream's
+unchecked built-in `session_move`/`session_rename` tools so they cannot
+rewrite the title-based task binding or the external-directory confinement.
+The pebble worker-side bridge remains open, and real-worker acceptance
+evidence waits on the rebuilt worker images (protected-pipeline/deploy
+gate) — **WI#324 remains open**. Design doc:
 `docs/proposals/EXTERNAL-WORKER-TOOL-PROXY.md`.
 
 ### Cron Missions on External Workers (WI#325)
@@ -809,14 +816,17 @@ are recorded in the audit doc's 2026-10-16 follow-up.
 
 ### Security, Deployment, and Release Limitations
 
-**Worker proxy scope.** Only the kimi lane ships the worker-side tool-proxy
-bridge in this release; opencode/opencode2/pebble workers have no
-`mcp__lunarwing__*` surface yet. Real-worker acceptance evidence for the
-kimi lane rides the protected image pipeline. The tool grant is ambient for
-every process in the task (untrusted repo scripts can call the relay), and
-workspace `.mcp.json` files can shadow the `lunarwing` entry — the hub
-stays authoritative on the capability set. `memory_read` grants disclose
-workspace content to egress-enabled workers; see
+**Worker proxy scope.** The kimi lane ships the worker-side tool-proxy
+bridge (an MCP shim) in this release, and the opencode and opencode2 lanes
+ship serve-process plugins exposing the same phase-1 set as direct
+`lunarwing_*` tools; the pebble worker has no such surface yet. Real-worker
+acceptance evidence for every lane rides the protected image pipeline. The
+tool grant is ambient for every process in the task (untrusted repo scripts
+can call the relay), workspace `.mcp.json` files can shadow the kimi shim's
+`lunarwing` entry, and workspace `.opencode/` content can shadow or disable
+the opencode/opencode2 plugins — the hub stays authoritative on the
+capability set. `memory_read` grants disclose workspace content to
+egress-enabled workers; see
 `docs/proposals/EXTERNAL-WORKER-TOOL-PROXY.md` and
 `docs/ops/WORKER-CONTAINERS.md`.
 
@@ -847,9 +857,10 @@ WI#397 (`high` — sb&kumo findings); the goals-open items WI#375, WI#390,
 WI#392, WI#402, and WI#408; WI#415 (the OpenRC weechat/relay/adapter/darkirc
 renderers still bake caller-PATH `python3`); and the advisory-clearing
 owners WI#418, WI#367, and WI#368. Still open from this cycle's merged
-work: WI#324 (opencode/opencode2/pebble worker-side bridges and
-real-worker acceptance evidence), WI#357 (the opencode2 v2.0.26 bump
-stays gated), and WI#412 (pending maintainer acceptance). WI#400 tracks
+work: WI#324 (the pebble worker-side bridge, plus real-worker acceptance
+evidence for every lane once the worker images are rebuilt), WI#357 (the
+opencode2 v2.0.26 bump stays gated), and WI#412 (pending maintainer
+acceptance). WI#400 tracks
 real worker credential isolation beyond the WI#373 hygiene strips. The
 five test-build field reports (WI#366, WI#372, WI#385, WI#398, WI#399)
 and the WI#359/WI#373 triage items were closed on 2026-10-14; WI#336,

@@ -25,7 +25,11 @@ process.on("unhandledRejection", (reason) => {
   console.error("[bridge] unhandledRejection (surviving):", reason)
 })
 import { executeTask } from "./opencode_task_executor"
+// The SDK type for the test seam only, derived from executeTask so this
+// file (outside the WI#369 tsgo gate) never references the client package.
+type OpenCodeClient = NonNullable<Parameters<typeof executeTask>[4]>
 import { resolveTaskWorkspace, workspacePathsOverlap } from "./workspace_path"
+import { ToolProxyRelay, type TaskProxyHandle } from "./lunarwing_tool_proxy.ts"
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -47,6 +51,10 @@ type ActiveTask = { controller: AbortController; socket: BridgeSocket; workspace
 const activeTasks = new Map<string, ActiveTask>()
 const activeWorkspaces = new Map<string, string>()
 
+// WI#324: one tool-proxy relay per bridge process (per-task IPC servers and
+// per-hub-socket pending maps).
+const toolProxyRelay = new ToolProxyRelay()
+
 function taskWorkspace(request: TaskRequest): string {
   return resolveTaskWorkspace(request.context, WORKSPACE_ROOT)
 }
@@ -57,6 +65,22 @@ function abortSocketTasks(socket: BridgeSocket): void {
     console.warn(`[bridge] task ${taskID}: connection closed; cancelling`)
     task.controller.abort()
   }
+}
+
+/**
+ * A hub control socket closed. Fail every in-flight task on it and drop the
+ * relay's pending map for that socket, so reconnects never accumulate stale
+ * pending state and a request that arrives between the close and the task's
+ * teardown is never sent into the dead socket (JU-3; the kimi lane pins the
+ * same with its spawned-bridge test). Without `dropHubSocket`, the aborted
+ * task's `finally` still fails its waiter later through `closeTask`, but the
+ * dead socket's pending map stays in `pendingBySocket` for the process
+ * lifetime — the EF-9 leak — and the close-to-teardown window leaves an EV-4
+ * gap.
+ */
+export function handleHubSocketClosed(socket: BridgeSocket): void {
+  abortSocketTasks(socket)
+  toolProxyRelay.dropHubSocket(socket)
 }
 
 // ── Message Handling ──────────────────────────────────────────────────────────
@@ -91,6 +115,12 @@ async function handleMessage(data: string, ws: BridgeSocket): Promise<void> {
         handleCancel(envelope.payload as { task_id: string })
         break
 
+      case "tool_result":
+      case "tool_catalog":
+        // WI#324: hub replies to this worker's tool_call / tool_list frames.
+        toolProxyRelay.handleHubFrame(ws, envelope)
+        break
+
       case "ping":
         ws.send(JSON.stringify(createEnvelope("pong", {})))
         break
@@ -106,6 +136,7 @@ async function handleMessage(data: string, ws: BridgeSocket): Promise<void> {
 async function handleTaskRequest(
   request: TaskRequest,
   ws: BridgeSocket,
+  sdkOverride?: OpenCodeClient,
 ): Promise<void> {
   if (!request.task_id || !request.prompt) {
     const errMsg = createEnvelope("task_result", {
@@ -171,7 +202,16 @@ async function handleTaskRequest(
   activeTasks.set(request.task_id, { controller, socket: ws, workspace })
   activeWorkspaces.set(workspace, request.task_id)
 
+  // WI#324: give the task's serve-side plugin a local tool-proxy socket so it
+  // can reach the hub over this connection. A listen/fs failure never fails
+  // the task — it just runs without LunarWing tools (hub stays
+  // deny-by-default). startTask runs INSIDE the try (MR !1549 EF-2) so an
+  // unexpected throw still hits the finally below and the concurrency slot
+  // and workspace lock are released. Keep startTask/closeTask throw-free
+  // (pinned by the relay's EF-2 tests).
+  let toolProxy: TaskProxyHandle | null = null
   try {
+    toolProxy = await toolProxyRelay.startTask(request.task_id, ws)
     await executeTask(
       request,
       (progress) => {
@@ -184,8 +224,10 @@ async function handleTaskRequest(
         console.log(`[bridge] task ${request.task_id}: ${result.status} (${result.duration_ms}ms)`)
       },
       controller.signal,
+      sdkOverride,
     )
   } finally {
+    toolProxy?.close()
     activeTasks.delete(request.task_id)
     if (activeWorkspaces.get(workspace) === request.task_id) activeWorkspaces.delete(workspace)
   }
@@ -268,7 +310,7 @@ function startServer(): void {
         await handleMessage(data, ws)
       },
       close(ws, code, reason) {
-        abortSocketTasks(ws)
+        handleHubSocketClosed(ws)
         connectionCount--
         updateState(connectionCount > 0)
         console.log(`[bridge] agent disconnected: ${code} ${reason} (${connectionCount} active)`)
@@ -324,7 +366,7 @@ async function startClient(): Promise<void> {
       })
 
       ws.addEventListener("close", (event) => {
-        abortSocketTasks(bridgeSocket)
+        handleHubSocketClosed(bridgeSocket)
         console.log(`[bridge] disconnected from hub: ${event.code} ${event.reason}`)
         updateState(false)
         scheduleReconnect()
@@ -353,12 +395,24 @@ async function startClient(): Promise<void> {
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
+//
+// Exported for the self-test (lunarwing_bridge_test.ts); the listener roles
+// only start when this file is the entrypoint, so importing it in a test does
+// not bind a port.
 
-if (WS_ROLE === "server") {
-  startServer()
-} else if (WS_ROLE === "client") {
-  startClient()
-} else {
-  console.error(`[bridge] unknown WS_ROLE: ${WS_ROLE}`)
-  process.exit(1)
+export { handleCancel, handleMessage, handleTaskRequest, sendReady, activeTasks, toolProxyRelay }
+
+// Bun's import.meta.main has no shared type; the cast keeps type checkers
+// clean without pulling in Bun types.
+const isEntrypoint = (import.meta as unknown as { main?: boolean }).main === true
+
+if (isEntrypoint) {
+  if (WS_ROLE === "server") {
+    startServer()
+  } else if (WS_ROLE === "client") {
+    startClient()
+  } else {
+    console.error(`[bridge] unknown WS_ROLE: ${WS_ROLE}`)
+    process.exit(1)
+  }
 }
