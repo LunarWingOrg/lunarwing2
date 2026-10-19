@@ -129,6 +129,23 @@ sudo ic/scripts/lunarwing-mt-admin.sh configure-kimi ruffles \
 This upserts `KIMI_MODEL`, `KIMI_BASE_URL`, and `KIMI_API_KEY` into the tenant's
 mode-0600 `lunarwing.env`; restart that worker after changing its settings.
 
+To grant a worker the WI#324 proxied tool path (tenant `memory_*` /
+`knowledge_*` / `gitlab_tool` via the hub; deny-by-default otherwise), set its
+phase-1 grant explicitly — this is the approval boundary, so it is never
+rendered implicitly:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh configure-worker-tools ruffles kimi \
+  memory_read,memory_write,knowledge_search
+sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant ruffles   # daemon loads config.toml at boot
+```
+
+`none` clears the grant back to deny-by-default. Only the phase-1 names are
+accepted (`memory_read`, `memory_write`, `knowledge_search`,
+`knowledge_submit_note`, `knowledge_get_topic`, `gitlab_tool`), `mode = "cron"`
+workers are refused (tick authority is `cron.tool_allowlist` on the mission),
+and `gitlab_tool` is preferred over the legacy `gitlab-tool` spelling.
+
 ### Step 4: Start services
 
 ```bash
@@ -884,6 +901,7 @@ configure-pebble <name>          Set Pebble API key/model
 configure-opencode <name>        Set OpenCode model/base URL
 configure-opencode2 <name>       Set OpenCode 2 model/base URL
 configure-kimi <name>            Set Kimi model/base URL/API key file
+configure-worker-tools <n> <w>   Set/clear a worker's proxied tool grant
 
 start-tenant <name>              Start core and selected optional services
 stop-tenant <name>               Stop all tenant services
