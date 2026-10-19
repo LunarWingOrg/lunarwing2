@@ -192,10 +192,11 @@ PEBBLE_ROOTLESS_LAUNCH_CONTRACT="ssh-agent-dir-ro"
 # /workspace bind source at EVERY start, so a tenant who swaps
 # ~/lunarwing/pebble-workspace for a symlink redirects host-root writes
 # through their own pebble tasks. The rootful lane now launches with
-# `--user <tenant uid>:<gid>` (start_tenant_pebble); this distinct base
-# contract forces start-tenant to recreate every pre-fix root-running
-# container once, on its next start-tenant.
-PEBBLE_ROOTFUL_LAUNCH_CONTRACT="tenant-uid-user;workspace-toolchain-home"
+# `--user <tenant uid>:<gid>` plus `--security-opt no-new-privileges`
+# (start_tenant_pebble); this distinct base contract forces start-tenant to
+# recreate every pre-fix root-running container once, on its next
+# start-tenant.
+PEBBLE_ROOTFUL_LAUNCH_CONTRACT="tenant-uid-user;workspace-toolchain-home;no-new-privileges"
 
 # ── Library sourcing ─────────────────────────────────────────────────────────
 #
