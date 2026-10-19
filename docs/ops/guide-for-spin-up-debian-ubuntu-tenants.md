@@ -78,7 +78,7 @@ systemd **user** units. This example also selects Pebble for the tenant:
 
 ```bash
 sudo LUNARWING_SERVICE_MANAGER=systemd LUNARWING_CONTAINER_RUNTIME=podman \
-  ic/scripts/lunarwing-mt-admin.sh add-tenant luna1 --docker-group --with-pebble
+  ic/scripts/lunarwing-mt-admin.sh add-tenant luna1 --with-pebble
 ```
 
 Important boolean flags include `--enable-proxy`, `--enable-darkirc`,

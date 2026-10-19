@@ -73,6 +73,7 @@ Worth knowing before you provision:
 
 - The gateway binds to `127.0.0.1` by default.
 - New tenants enable Engine V2, SSH support, health checks, build, and start. DarkIRC, Gotify, external workers, and optional toolchains stay off until selected.
+- Tenant users are **not** added to the docker/podman group: rootless podman (the multi-tenant default runtime) needs no group membership. Opting in (`--docker-group` / the console checkbox) is only for a tenant that must reach a shared rootful daemon socket — access to an unrestricted root-run daemon is host-equivalent.
 - Blank XMPP fields assign `<tenant>@xmpp.localhost` and provision the bridge automatically.
 - The onboarding server is a privileged local console for one trusted operator: no user accounts, no TLS. Keep it on loopback with token auth (real mode refuses non-loopback binding), use an SSH tunnel for remote admin, and treat session URLs and audit files as credentials.
 
