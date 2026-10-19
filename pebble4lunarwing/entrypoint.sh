@@ -3,6 +3,16 @@ set -euo pipefail
 
 PEBBLE_MODE="${PEBBLE_MODE:-websocket}"
 
+# WI#400 LD-8: the bridge must run as container root (image USER 0:0). On
+# rootless podman keep-id a USER-less image would land the whole entrypoint
+# on the task uid — the same uid every task drops to — and the credential
+# split would be a no-op (task-owned token file, readable bridge environ).
+# Refuse that shape instead of running without the boundary.
+if [ "$PEBBLE_MODE" = "websocket" ] && [ -n "${PEBBLE_TASK_UID:-}" ] && [ "$(id -u)" != "0" ]; then
+  echo "[entrypoint] refusing to start: running as uid $(id -u); the bridge must be container root (image USER 0:0) so tasks can drop to ${PEBBLE_TASK_UID}" >&2
+  exit 1
+fi
+
 # WI#400: move the hub-handshake credential out of the process environment
 # before any long-lived process is spawned. It lands in a root-only file
 # the bridge reads at startup (AGENT_AUTH_TOKEN_FILE); the bridge and every

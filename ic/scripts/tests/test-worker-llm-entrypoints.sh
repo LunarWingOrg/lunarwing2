@@ -404,6 +404,125 @@ def run_pebble_cli_startup():
             "pebble cli: hub-handshake token reached the one-shot task env (WI#373)"
 
 
+def run_pebble_token_layout():
+    """WI#400 KW-7c/LD-13: the pebble entrypoint's credential handoff layout
+    — 0700 directory, 0400 file holding exactly the token, and BOTH
+    AGENT_AUTH_TOKEN and AGENT_AUTH_TOKEN_FILE absent from the task env.
+    (The in-container owner is root; ownership is asserted in-image — modes
+    and stripping are pinned here.)"""
+    import stat as statmod
+    entrypoint = (repo / "pebble4lunarwing" / "entrypoint.sh").read_text()
+    with temp_root("pebble-token400-") as temp:
+        root = Path(temp)
+        bin_dir = execable_dir(root)
+        token_dir = root / "token"
+        mark = root / "task-env.txt"
+        stub = bin_dir / "pebble"
+        stub.write_text(
+            "#!/bin/sh\n"
+            "{ echo \"token=${AGENT_AUTH_TOKEN:-unset}\"; "
+            "echo \"file=${AGENT_AUTH_TOKEN_FILE:-unset}\"; } > " + str(mark) + "\n"
+            "exit 0\n"
+        )
+        stub.chmod(0o755)
+        hand_tree(root)
+        hand_tree(bin_dir)
+        result = subprocess.run(
+            ["bash", "-s", "--", "probe prompt"],
+            input=entrypoint, text=True,
+            env={"PATH": f"{bin_dir}:{os.environ['PATH']}",
+                 "HOME": str(root), "TMPDIR": temp,
+                 "PEBBLE_MODE": "cli",
+                 "LUNARWING_TOKEN_DIR": str(token_dir),
+                 "AGENT_AUTH_TOKEN": "bridge-secret-64hex"},
+            capture_output=True, timeout=60, **as_ci_user())
+        assert result.returncode == 0, f"pebble token layout: entrypoint failed: {result.stderr}"
+        token_file = token_dir / "agent_auth_token"
+        assert token_dir.is_dir(), "token directory not created"
+        assert statmod.S_IMODE(token_dir.stat().st_mode) == 0o700, \
+            f"token directory mode {oct(statmod.S_IMODE(token_dir.stat().st_mode))} != 0o700"
+        assert token_file.is_file(), "token file not created"
+        assert statmod.S_IMODE(token_file.stat().st_mode) == 0o400, \
+            f"token file mode {oct(statmod.S_IMODE(token_file.stat().st_mode))} != 0o400"
+        assert token_file.read_text() == "bridge-secret-64hex", \
+            "token file content must be exactly the credential"
+        lines = mark.read_text().splitlines()
+        assert lines == ["token=unset", "file=unset"], \
+            f"task env must lose both the credential and its file pointer: {lines}"
+
+
+def run_pebble_cli_drop_argv():
+    """WI#400 KW-7c/LD-13: with the identity pinned and the harness running as
+    root (the CI shape), the cli one-shot must exec setpriv with the exact
+    privilege-dropping flags before pebble. Unprivileged hosts cannot take
+    the root branch, so the pin is root-only."""
+    if os.geteuid() != 0:
+        return
+    entrypoint = (repo / "pebble4lunarwing" / "entrypoint.sh").read_text()
+    with temp_root("pebble-clidrop-") as temp:
+        root = Path(temp)
+        bin_dir = execable_dir(root)
+        mark = root / "drop-argv.txt"
+        stub = bin_dir / "pebble"
+        stub.write_text("#!/bin/sh\necho RAN_PEBBLE > " + str(mark) + "\nexit 0\n")
+        stub.chmod(0o755)
+        setpriv_stub = bin_dir / "setpriv"
+        setpriv_stub.write_text(
+            "#!/bin/sh\nprintf '<%s>' \"$@\" > " + str(mark) + "\nprintf '\\n' >> " + str(mark) + "\nexit 0\n"
+        )
+        setpriv_stub.chmod(0o755)
+        hand_tree(root)
+        hand_tree(bin_dir)
+        result = subprocess.run(
+            ["bash", "-s", "--", "probe prompt"],
+            input=entrypoint, text=True,
+            env={"PATH": f"{bin_dir}:{os.environ['PATH']}",
+                 "HOME": str(root), "TMPDIR": temp,
+                 "PEBBLE_MODE": "cli",
+                 "LUNARWING_TOKEN_DIR": str(root / "run-lunarwing"),
+                 "PEBBLE_TASK_UID": "10004",
+                 "PEBBLE_TASK_GID": "10004"},
+            capture_output=True, timeout=60)
+        assert result.returncode == 0, f"pebble cli drop: entrypoint failed: {result.stderr}"
+        argv = mark.read_text().strip()
+        assert argv == (
+            "<--reuid=10004><--regid=10004><--clear-groups>"
+            "<--ambient-caps=-all><--inh-caps=-all><--no-new-privs><-->"
+            "<env><-u><AGENT_AUTH_TOKEN><-u><AGENT_AUTH_TOKEN_FILE>"
+            "<pebble><--permission-mode><danger-full-access>"
+            "<--model><openai/gpt-5.2><--output-format><text><probe prompt>"
+        ), f"setpriv argv missing mandatory flags (WI#400 KW-2/LD-13): {argv}"
+
+
+def run_pebble_websocket_refusal():
+    """WI#400 LD-8: when the bridge itself runs as the task uid (the rootless
+    keep-id + USER-less-image failure mode), the websocket entrypoint must
+    refuse to start. An `id` stub reports the task uid, so the pin works
+    whatever uid the harness itself runs as."""
+    entrypoint = (repo / "pebble4lunarwing" / "entrypoint.sh").read_text()
+    with temp_root("pebble-wsref-") as temp:
+        root = Path(temp)
+        bin_dir = execable_dir(root)
+        id_stub = bin_dir / "id"
+        id_stub.write_text("#!/bin/sh\necho 10004\n")
+        id_stub.chmod(0o755)
+        hand_tree(root)
+        hand_tree(bin_dir)
+        result = subprocess.run(
+            ["bash", "-s"],
+            input=entrypoint, text=True,
+            env={"PATH": f"{bin_dir}:{os.environ['PATH']}",
+                 "HOME": str(root), "TMPDIR": temp,
+                 "PEBBLE_MODE": "websocket",
+                 "PEBBLE_TASK_UID": "10004",
+                 "PEBBLE_TASK_GID": "10004"},
+            capture_output=True, timeout=60, **as_ci_user())
+        assert result.returncode != 0, \
+            "pebble websocket entrypoint accepted running as the task uid (WI#400 LD-8)"
+        assert "refusing to start" in result.stderr and "container root" in result.stderr, \
+            f"refusal must explain the root-bridge requirement: {result.stderr}"
+
+
 for worker in workers:
     key = f"{worker.upper()}_BASE_URL"
     for label, overrides in (
@@ -445,4 +564,11 @@ for worker in ("kimi", "opencode", "opencode2"):
         print(f"PASS: {worker} {mode} one-shot runs without the hub-handshake token (WI#373)")
 run_pebble_cli_startup()
 print("PASS: pebble cli one-shot runs without the hub-handshake token (WI#373)")
+run_pebble_token_layout()
+print("PASS: pebble entrypoint token handoff layout is 0700/0400 and fully stripped (WI#400 KW-7c)")
+if os.geteuid() == 0:
+    run_pebble_cli_drop_argv()
+    print("PASS: pebble cli one-shot drops through setpriv with the mandatory flags (WI#400 KW-2/LD-13, root)")
+run_pebble_websocket_refusal()
+print("PASS: pebble websocket entrypoint refuses to run as the task uid (WI#400 LD-8)")
 PY
