@@ -208,6 +208,138 @@ if awk 'found_url && /^tool_allowlist = \["knowledge_get_topic"\]$/ {ok=1} /^url
 else
   fail 'grant insert without timeout_ms misplaced'
 fi
+
+# Run-171 (note #10468) LM-1..LM-4: the grant editor runs on parsed TOML.
+kimi_list_json() {  # prints the kimi entry's tool_allowlist as JSON, or "absent"
+  python3 - "$1" <<'PY'
+import json, sys, tomllib
+with open(sys.argv[1], "rb") as handle:
+    data = tomllib.load(handle)
+for entry in data.get("sandbox", {}).get("external_workers", []):
+    if entry.get("name") == "kimi":
+        print(json.dumps(entry.get("tool_allowlist", "absent")))
+        break
+PY
+}
+toml_parses() { python3 -c 'import sys, tomllib; tomllib.load(open(sys.argv[1], "rb"))' "$1" 2>/dev/null; }
+write_save_toml_shape() {  # the daemon's settings write-back puts each element on its own line
+  cat >"$cron_dir/config.toml" <<'EOF'
+[[sandbox.external_workers]]
+name = "kimi"
+url = "ws://127.0.0.1:12001/ws/agent"
+timeout_ms = 3600000
+tool_allowlist = [
+    "memory_read",
+    "memory_write",
+]
+
+[[sandbox.external_workers]]
+name = "opencode"
+url = "ws://127.0.0.1:11001/ws/agent"
+timeout_ms = 3600000
+tool_allowlist = [
+    "knowledge_search",
+]
+EOF
+}
+# LM-1: replace on the save_toml shape.
+write_save_toml_shape
+( set_external_worker_tool_allowlist root kimi "knowledge_search" ) && lm1_rc=0 || lm1_rc=$?
+if [[ "$lm1_rc" -eq 0 && "$(grep -c '^tool_allowlist' "$cron_dir/config.toml")" -eq 2 ]] \
+  && grep -Fqx 'tool_allowlist = ["knowledge_search"]' "$cron_dir/config.toml" \
+  && ! grep -Fq '    "memory_read",' "$cron_dir/config.toml"; then
+  pass 'multi-line grant (save_toml shape) is replaced as a whole'
+else
+  fail 'multi-line grant (save_toml shape) left orphan lines or lost the key'
+fi
+toml_parses "$cron_dir/config.toml" && pass 'replaced config is valid TOML' || fail 'replaced config is not valid TOML'
+[[ "$(kimi_list_json "$cron_dir/config.toml")" == '["knowledge_search"]' ]] \
+  && pass 'parsed kimi grant equals the request' || fail 'parsed kimi grant differs from the request'
+grep -Fq '    "knowledge_search",' "$cron_dir/config.toml" \
+  && pass 'other worker entries are untouched by the replace' || fail 'the replace touched another worker entry'
+# LM-1: clear on the save_toml shape.
+write_save_toml_shape
+( set_external_worker_tool_allowlist root kimi none ) && lm1_rc=0 || lm1_rc=$?
+if [[ "$lm1_rc" -eq 0 && "$(grep -c '^tool_allowlist' "$cron_dir/config.toml")" -eq 1 ]] \
+  && ! grep -Fq '    "memory_read",' "$cron_dir/config.toml" \
+  && [[ "$(kimi_list_json "$cron_dir/config.toml")" == '"absent"' ]]; then
+  pass 'multi-line grant (save_toml shape) is removed as a whole'
+else
+  fail 'clearing a multi-line grant left orphan lines'
+fi
+toml_parses "$cron_dir/config.toml" && pass 'cleared config is valid TOML' || fail 'cleared config is not valid TOML'
+# LM-1: the design doc's two-line shape.
+cat >"$cron_dir/config.toml" <<'EOF'
+[[sandbox.external_workers]]
+name = "kimi"
+url = "ws://127.0.0.1:12001/ws/agent"
+tool_allowlist = ["memory_read", "memory_write", "knowledge_search",
+                  "knowledge_submit_note", "knowledge_get_topic", "gitlab_tool"]
+EOF
+( set_external_worker_tool_allowlist root kimi "memory_read" ) && lm1_rc=0 || lm1_rc=$?
+[[ "$lm1_rc" -eq 0 ]] && toml_parses "$cron_dir/config.toml" && [[ "$(kimi_list_json "$cron_dir/config.toml")" == '["memory_read"]' ]] \
+  && pass 'two-line grant (design-doc shape) is replaced as a whole' || fail 'two-line grant (design-doc shape) was torn'
+# LM-3: mode = "cron" ahead of the name line is still refused.
+cat >"$cron_dir/config.toml" <<'EOF'
+[[sandbox.external_workers]]
+mode = "cron"
+name = "kimi"
+url = "ws://127.0.0.1:12001/ws/agent"
+EOF
+cp "$cron_dir/config.toml" "$fixture/lm3-before.toml"
+lm3_out="$( ( set_external_worker_tool_allowlist root kimi "memory_read" ) 2>&1 )" && lm3_rc=0 || lm3_rc=$?
+[[ "$lm3_rc" -ne 0 && "$lm3_out" == *'mode = "cron"'* ]] \
+  && pass 'cron-mode worker is refused whatever the key order' || fail "cron-mode worker with mode before name was accepted: [$lm3_out]"
+cmp -s "$cron_dir/config.toml" "$fixture/lm3-before.toml" && pass 'refused cron (key order) leaves config untouched' || fail 'refused cron (key order) modified the config'
+# LM-3: a non-cron entry sharing a cron worker's endpoint is refused (EV-1).
+cat >"$cron_dir/config.toml" <<'EOF'
+[[sandbox.external_workers]]
+name = "kimi"
+url = "ws://127.0.0.1:12001/ws/agent"
+
+[[sandbox.external_workers]]
+name = "opencode2"
+url = "ws://127.0.0.1:12001/ws/agent"
+mode = "cron"
+EOF
+cp "$cron_dir/config.toml" "$fixture/lm3b-before.toml"
+lm3_out="$( ( set_external_worker_tool_allowlist root kimi "memory_read" ) 2>&1 )" && lm3_rc=0 || lm3_rc=$?
+[[ "$lm3_rc" -ne 0 && "$lm3_out" == *'shares its endpoint'* ]] \
+  && pass 'shared cron endpoint is refused' || fail "shared cron endpoint was accepted: [$lm3_out]"
+cmp -s "$cron_dir/config.toml" "$fixture/lm3b-before.toml" && pass 'refused shared endpoint leaves config untouched' || fail 'refused shared endpoint modified the config'
+# LM-4: a worker named only outside [[sandbox.external_workers]] dies with a message.
+cat >"$cron_dir/config.toml" <<'EOF'
+[[mcp_servers]]
+name = "kimi"
+url = "http://127.0.0.1:1/"
+EOF
+lm4_out="$( ( set_external_worker_tool_allowlist root kimi "memory_read" ) 2>&1 )" && lm4_rc=0 || lm4_rc=$?
+[[ "$lm4_rc" -ne 0 && "$lm4_out" == *'is not configured'* ]] \
+  && pass 'worker named only in another table is refused with a message' || fail "worker in another table: rc=$lm4_rc out=[$lm4_out]"
+printf 'this = is = not toml\n' >"$cron_dir/config.toml"
+lm4_out="$( ( set_external_worker_tool_allowlist root kimi "memory_read" ) 2>&1 )" && lm4_rc=0 || lm4_rc=$?
+[[ "$lm4_rc" -ne 0 && "$lm4_out" == *'not valid TOML'* ]] \
+  && pass 'an invalid config is refused with a message' || fail "invalid config: rc=$lm4_rc out=[$lm4_out]"
+# LM-2: the config is staged as the tenant before any check reads it. A
+# symlinked config the tenant cannot read (modelled by a tenant_cat that
+# denies symlinks — the invoking user may be root) is refused up front; no
+# root-side grep/awk ever saw the target.
+lm2_orig_tenant_cat="$(declare -f tenant_cat)"
+tenant_cat() { if [[ -L "$2" ]]; then return 1; fi; cat -- "$2"; }
+# The link target names a DIFFERENT worker: a root-side grep of the live path
+# would wrongly report "not configured", the tenant-side staging refuses first.
+printf '[[sandbox.external_workers]]\nname = "opencode"\nurl = "ws://127.0.0.1:1/ws/agent"\n' >"$fixture/lm2-foreign.toml"
+rm -f "$cron_dir/config.toml"
+ln -s "$fixture/lm2-foreign.toml" "$cron_dir/config.toml"
+lm2_out="$( ( set_external_worker_tool_allowlist root kimi "memory_read" ) 2>&1 )" && lm2_rc=0 || lm2_rc=$?
+if [[ "$lm2_rc" -ne 0 && "$lm2_out" == *'could not read the tenant config'* && "$lm2_out" != *'is not configured'* ]]; then
+  pass 'symlinked config is refused at the tenant-side staging, before any check'
+else
+  fail "symlinked config: rc=$lm2_rc out=[$lm2_out]"
+fi
+grep -Fq 'tool_allowlist' "$fixture/lm2-foreign.toml" && fail 'symlinked config refusal wrote through the link' || pass 'symlinked config refusal leaves the link target untouched'
+rm -f "$cron_dir/config.toml"
+eval "$lm2_orig_tenant_cat"
 tenant_state_dir() { real_tenant_state_dir; }
 
 # CLI surface: exact-arity dispatch and forwarding. The harness may run as a
