@@ -27,7 +27,7 @@
 //! connection's lifetime; `drop_hub` on connection close is the EV-4/EF-9
 //! equivalent.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -141,8 +141,20 @@ struct PendingWaiter {
     reply: oneshot::Sender<Value>,
 }
 
+/// Waiters plus the set of tasks whose IPC server is still open. Both live
+/// under one lock so a request can never park a waiter for a task that
+/// `close_task` has already swept (the kimi lane's `task.closed` gate).
+#[derive(Default)]
+struct PendingTable {
+    waiters: HashMap<String, PendingWaiter>,
+    live: HashSet<String>,
+}
+
+const TASK_ENDED: &str = "task has ended";
+const HUB_CLOSED: &str = "hub connection closed before the tool reply arrived";
+
 struct RelayCore {
-    pending: Mutex<HashMap<String, PendingWaiter>>,
+    pending: Mutex<PendingTable>,
     /// EV-4: once the hub connection is gone it stays gone — a request
     /// arriving on a still-open task IPC server fails at once instead of
     /// re-creating pending state and waiting out the relay timeout.
@@ -173,13 +185,18 @@ pub struct ToolProxyRelay {
 impl ToolProxyRelay {
     /// Production constructor: directory and timeout from the environment.
     pub fn new() -> Self {
-        Self::with_overrides(tool_proxy_dir(), proxy_timeout_from_env())
+        Self::in_dir(tool_proxy_dir())
+    }
+
+    /// A relay whose sockets live in `dir`, with the timeout from the env.
+    pub fn in_dir(dir: PathBuf) -> Self {
+        Self::with_overrides(dir, proxy_timeout_from_env())
     }
 
     pub fn with_overrides(dir: PathBuf, timeout: Duration) -> Self {
         Self {
             core: Arc::new(RelayCore {
-                pending: Mutex::new(HashMap::new()),
+                pending: Mutex::new(PendingTable::default()),
                 hub_open: AtomicBool::new(true),
             }),
             tasks: Mutex::new(HashMap::new()),
@@ -212,6 +229,12 @@ impl ToolProxyRelay {
                 return None;
             }
         };
+        self.core
+            .pending
+            .lock()
+            .await
+            .live
+            .insert(task_id.to_string());
         let accept_loop = tokio::spawn(accept_loop(
             listener,
             Arc::clone(&self.core),
@@ -245,9 +268,9 @@ impl ToolProxyRelay {
                     .unwrap_or("");
                 let waiter = {
                     let mut pending = self.core.pending.lock().await;
-                    let routable = matches!(pending.get(call_id), Some(w) if !w.is_catalog);
+                    let routable = matches!(pending.waiters.get(call_id), Some(w) if !w.is_catalog);
                     if routable {
-                        pending.remove(call_id)
+                        pending.waiters.remove(call_id)
                     } else {
                         None
                     }
@@ -262,10 +285,11 @@ impl ToolProxyRelay {
                 let waiter = {
                     let mut pending = self.core.pending.lock().await;
                     let key = pending
+                        .waiters
                         .iter()
                         .find(|(_, waiter)| waiter.is_catalog)
                         .map(|(key, _)| key.clone());
-                    key.and_then(|key| pending.remove(&key))
+                    key.and_then(|key| pending.waiters.remove(&key))
                 };
                 let Some(waiter) = waiter else { return false };
                 let _ = waiter.reply.send(envelope.payload.clone());
@@ -294,17 +318,19 @@ impl ToolProxyRelay {
                 eprintln!("[tool-proxy] task {task_id}: socket cleanup failed: {e}");
             }
         }
-        let keys: Vec<String> = {
-            let pending = self.core.pending.lock().await;
-            pending
-                .iter()
-                .filter(|(_, waiter)| waiter.task_id == task_id)
-                .map(|(key, _)| key.clone())
-                .collect()
-        };
+        // Mark the task ended and sweep its waiters under ONE lock: a request
+        // still arriving on a connection accepted before the close is then
+        // refused instead of reaching the hub for an ended task.
         let mut pending = self.core.pending.lock().await;
+        pending.live.remove(task_id);
+        let keys: Vec<String> = pending
+            .waiters
+            .iter()
+            .filter(|(_, waiter)| waiter.task_id == task_id)
+            .map(|(key, _)| key.clone())
+            .collect();
         for key in keys {
-            if let Some(waiter) = pending.remove(&key) {
+            if let Some(waiter) = pending.waiters.remove(&key) {
                 let _ = waiter
                     .reply
                     .send(json!({"error": "task ended before the tool reply arrived"}));
@@ -319,7 +345,7 @@ impl ToolProxyRelay {
         self.core.hub_open.store(false, Ordering::SeqCst);
         let drained: Vec<PendingWaiter> = {
             let mut pending = self.core.pending.lock().await;
-            pending.drain().map(|(_, waiter)| waiter).collect()
+            pending.waiters.drain().map(|(_, waiter)| waiter).collect()
         };
         for waiter in drained {
             let _ = waiter
@@ -456,8 +482,11 @@ async fn handle_ipc_line(
     let Some(op) = request.get("op").and_then(Value::as_str) else {
         return json!({"ok": false, "error": "request must be an object with an op field"});
     };
+    if !core.pending.lock().await.live.contains(task_id) {
+        return json!({"ok": false, "error": TASK_ENDED});
+    }
     if !core.hub_open.load(Ordering::SeqCst) {
-        return json!({"ok": false, "error": "hub connection closed before the tool reply arrived"});
+        return json!({"ok": false, "error": HUB_CLOSED});
     }
     match op {
         "list" => handle_list(core, out_tx, task_id, timeout).await,
@@ -566,17 +595,22 @@ async fn send_and_wait(
     serialized: String,
     timeout: Duration,
 ) -> Option<Value> {
-    if !core.hub_open.load(Ordering::SeqCst) {
-        return Some(json!({"error": "hub connection closed before the tool reply arrived"}));
-    }
     let (tx, rx) = oneshot::channel();
     {
         let mut pending = core.pending.lock().await;
-        if pending.contains_key(&key) {
+        // Re-checked under the lock that close_task / drop_hub sweep with,
+        // so no waiter can be parked after its sweep ran.
+        if !core.hub_open.load(Ordering::SeqCst) {
+            return Some(json!({"error": HUB_CLOSED}));
+        }
+        if !pending.live.contains(task_id) {
+            return Some(json!({"error": TASK_ENDED}));
+        }
+        if pending.waiters.contains_key(&key) {
             // Duplicate call_id in flight; the shim must not reuse ids.
             return None;
         }
-        pending.insert(
+        pending.waiters.insert(
             key.clone(),
             PendingWaiter {
                 task_id: task_id.to_string(),
@@ -586,7 +620,7 @@ async fn send_and_wait(
         );
     }
     if out_tx.send(Message::Text(serialized.into())).is_err() {
-        core.pending.lock().await.remove(&key);
+        core.pending.lock().await.waiters.remove(&key);
         eprintln!("[tool-proxy] hub send failed");
         return None;
     }
@@ -594,7 +628,7 @@ async fn send_and_wait(
         Ok(Ok(payload)) => Some(payload),
         Ok(Err(_)) => None, // sender dropped without a resolve
         Err(_) => {
-            core.pending.lock().await.remove(&key);
+            core.pending.lock().await.waiters.remove(&key);
             None
         }
     }
@@ -952,5 +986,174 @@ mod tests {
                 .await
         );
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    const NEWLINE: u8 = 10;
+
+    /// LB-1: a connection accepted before `close_task` must not carry a
+    /// request to the hub after the task ended (kimi `task.closed` parity).
+    #[tokio::test]
+    async fn requests_on_connections_accepted_before_close_are_refused() {
+        let (relay, dir) = test_relay();
+        let (out_tx, mut out_rx) = fake_hub();
+        let handle = relay.start_task("task-late", out_tx).await.expect("task");
+        let mut conn = UnixStream::connect(&handle.socket_path)
+            .await
+            .expect("connect");
+        let line = serde_json::to_string(
+            &json!({"op": "call", "call_id": "late-1", "name": "memory_read"}),
+        )
+        .expect("serialize");
+        conn.write_all(line.as_bytes()).await.expect("write line");
+        // Let the accept loop hand the connection to its handler, which now
+        // waits for the terminating newline.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        relay.close_task("task-late").await;
+        conn.write_all(&[NEWLINE]).await.expect("write newline");
+        let mut reply = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), conn.read_to_end(&mut reply))
+            .await
+            .expect("refused at once, not after the relay timeout")
+            .expect("read reply");
+        let reply: Value =
+            serde_json::from_str(String::from_utf8(reply).expect("utf-8").trim()).expect("json");
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["error"], "task has ended");
+        assert!(out_rx.try_recv().is_err(), "no hub frame for an ended task");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// KL-10 analog: closing one task fails only that task's calls, and a
+    /// late reply for a call failed by the close is not routed.
+    #[tokio::test]
+    async fn close_task_fails_only_its_own_calls() {
+        let (relay, dir) = test_relay();
+        let (out_tx, mut out_rx) = fake_hub();
+        let a = relay.start_task("task-a", out_tx.clone()).await.expect("a");
+        let b = relay.start_task("task-b", out_tx).await.expect("b");
+        let call = |socket: PathBuf, id: &'static str| {
+            tokio::spawn(async move {
+                ipc_request(
+                    &socket,
+                    &json!({"op": "call", "call_id": id, "name": "memory_read"}),
+                )
+                .await
+            })
+        };
+        let call_a = call(a.socket_path.clone(), "a-1");
+        let _ = next_hub_frame(&mut out_rx).await;
+        let call_b = call(b.socket_path.clone(), "b-1");
+        let _ = next_hub_frame(&mut out_rx).await;
+        relay.close_task("task-a").await;
+        let reply_a = call_a.await.expect("a joins");
+        assert_eq!(reply_a["error"], "task ended before the tool reply arrived");
+        let late_a = protocol::create_envelope(
+            "tool_result",
+            json!({"call_id": "a-1", "status": "success", "output": "late"}),
+        );
+        assert!(
+            !relay.handle_hub_frame(&late_a).await,
+            "late reply after close is unroutable"
+        );
+        let reply_b = protocol::create_envelope(
+            "tool_result",
+            json!({"call_id": "b-1", "status": "success", "output": "still-b", "error": null}),
+        );
+        assert!(
+            relay.handle_hub_frame(&reply_b).await,
+            "the other task's call is still parked"
+        );
+        assert_eq!(call_b.await.expect("b joins")["output"], "still-b");
+        relay.close_task("task-b").await;
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The request timeout frees the call id (no pending leak) and a reply
+    /// arriving after the timeout is not routed.
+    #[tokio::test]
+    async fn timed_out_call_frees_its_id_and_ignores_the_late_reply() {
+        let dir = test_dir();
+        let relay = ToolProxyRelay::with_overrides(dir.clone(), Duration::from_millis(200));
+        let (out_tx, mut out_rx) = fake_hub();
+        let handle = relay.start_task("task-slow", out_tx).await.expect("task");
+        let request = json!({"op": "call", "call_id": "slow-1", "name": "memory_read"});
+        let reply = ipc_request(&handle.socket_path, &request).await;
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["error"], "tool_result wait failed or timed out");
+        let _ = next_hub_frame(&mut out_rx).await;
+        let late = protocol::create_envelope(
+            "tool_result",
+            json!({"call_id": "slow-1", "status": "success", "output": "late"}),
+        );
+        assert!(
+            !relay.handle_hub_frame(&late).await,
+            "late reply after timeout is unroutable"
+        );
+        // The id is free again: the retry reaches the hub.
+        let reply = ipc_request(&handle.socket_path, &request).await;
+        assert_eq!(reply["error"], "tool_result wait failed or timed out");
+        assert_eq!(
+            next_hub_frame(&mut out_rx).await.payload["call_id"],
+            "slow-1"
+        );
+        relay.close_task("task-slow").await;
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// JU-4/KL-8 analog: the frame budget is checked on the serialized
+    /// `tool_call` envelope, not on the IPC line. A line just under the line
+    /// cap becomes an over-budget frame and must get the frame-only error;
+    /// an over-long line gets the line-cap error. Neither reaches the hub.
+    #[tokio::test]
+    async fn frame_budget_is_enforced_on_the_frame_not_the_line() {
+        let (relay, dir) = test_relay();
+        let (out_tx, mut out_rx) = fake_hub();
+        let handle = relay.start_task("task-budget", out_tx).await.expect("task");
+        let shaped = |fill: usize| {
+            json!({"op": "call", "call_id": "c", "name": "memory_read",
+                   "arguments": {"x": "y".repeat(fill)}})
+        };
+        let base = serde_json::to_string(&shaped(0)).expect("serialize").len();
+        let request = shaped(MAX_IPC_LINE_BYTES - 32 - base);
+        assert_eq!(
+            serde_json::to_string(&request).expect("serialize").len(),
+            MAX_IPC_LINE_BYTES - 32
+        );
+        let reply = ipc_request(&handle.socket_path, &request).await;
+        assert_eq!(reply["ok"], false);
+        assert_eq!(
+            reply["error"],
+            format!("tool_call frame exceeds the {TOOL_CALL_FRAME_CAP_BYTES}-byte hub budget")
+        );
+        let reply = ipc_request(&handle.socket_path, &shaped(MAX_IPC_LINE_BYTES)).await;
+        assert_eq!(
+            reply["error"],
+            "request line exceeds the 256 KiB frame budget"
+        );
+        assert!(out_rx.try_recv().is_err(), "nothing reached the hub");
+        relay.close_task("task-budget").await;
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// EF-2: a sabotaged proxy dir degrades the task to tool-less instead of
+    /// failing it, and teardown never fails on a sabotaged socket path.
+    #[tokio::test]
+    async fn sabotaged_proxy_paths_never_fail_start_or_close() {
+        let base = test_dir();
+        let not_a_dir = base.join("not-a-dir");
+        std::fs::write(&not_a_dir, b"x").expect("write file");
+        let relay = ToolProxyRelay::with_overrides(not_a_dir, Duration::from_secs(5));
+        let (out_tx, _rx) = fake_hub();
+        assert!(relay.start_task("task-sab", out_tx.clone()).await.is_none());
+        relay.close_task("task-sab").await;
+
+        let (relay, dir) = test_relay();
+        let handle = relay.start_task("task-sab2", out_tx).await.expect("task");
+        std::fs::remove_file(&handle.socket_path).expect("remove socket");
+        std::fs::create_dir(&handle.socket_path).expect("plant a directory");
+        relay.close_task("task-sab2").await;
+        assert_eq!(relay.active_task_count().await, 0);
+        std::fs::remove_dir_all(dir).ok();
+        std::fs::remove_dir_all(base).ok();
     }
 }

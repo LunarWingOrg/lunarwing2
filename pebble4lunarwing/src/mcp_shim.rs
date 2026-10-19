@@ -883,4 +883,89 @@ mod tests {
         relay.close_task("task-full").await;
         std::fs::remove_dir_all(dir).ok();
     }
+
+    const NEWLINE: u8 = 10;
+
+    fn reject_ids(gate: &mut LineGate, chunks: &[&[u8]]) -> Vec<Option<Value>> {
+        let mut ids = Vec::new();
+        for chunk in chunks {
+            for event in gate.feed(chunk) {
+                match event {
+                    GateEvent::Reject { id } => ids.push(id),
+                    GateEvent::Line(text) => panic!("expected only rejects, got {text}"),
+                }
+            }
+        }
+        ids
+    }
+
+    /// FE-2: the model controls the arguments, keys included. A planted
+    /// top-level-looking marker at the start or at the end of the arguments
+    /// must never be answered; only a top-level edge id is recovered. Runs
+    /// both gate paths: the in-loop path (line and newline in one chunk) and
+    /// the discard path (newline in a later chunk).
+    #[test]
+    fn oversized_lines_never_answer_a_planted_nested_id() {
+        let pad = "y".repeat(MAX_STDIN_LINE_BYTES);
+        let planted_head = format!(
+            r#"{{"method":"tools/call","params":{{"arguments":{{"jsonrpc":"2.0","id":99,"pad":"{pad}"}}}},"jsonrpc":"2.0","id":42}}"#
+        );
+        let planted_tail = format!(
+            r#"{{"id":43,"method":"tools/call","params":{{"arguments":{{"pad":"{pad}","jsonrpc":"2.0","id":98}}}}}}"#
+        );
+        let both_tail = format!(
+            r#"{{"method":"tools/call","params":{{"arguments":{{"pad":"{pad}","jsonrpc":"2.0","id":97}}}},"jsonrpc":"2.0","id":44}}"#
+        );
+        let newline = [NEWLINE];
+        for line in [&planted_head, &planted_tail, &both_tail] {
+            let mut joined = line.as_bytes().to_vec();
+            joined.push(NEWLINE);
+            let in_loop = reject_ids(&mut LineGate::new(), &[&joined]);
+            let discard = reject_ids(&mut LineGate::new(), &[line.as_bytes(), &newline]);
+            assert_eq!(in_loop, discard, "both gate paths agree");
+        }
+        let ids: Vec<Option<Value>> = [&planted_head, &planted_tail, &both_tail]
+            .iter()
+            .flat_map(|line| {
+                let mut joined = line.as_bytes().to_vec();
+                joined.push(NEWLINE);
+                reject_ids(&mut LineGate::new(), &[&joined])
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![Some(Value::from(42)), None, Some(Value::from(44))]
+        );
+    }
+
+    /// EF-9: an unterminated line never grows the gate past the cap.
+    #[test]
+    fn line_gate_never_buffers_past_the_cap() {
+        let mut gate = LineGate::new();
+        let chunk = vec![b'z'; 64 * 1024];
+        for _ in 0..40 {
+            assert!(gate.feed(&chunk).is_empty());
+            assert!(gate.buffer.len() <= MAX_STDIN_LINE_BYTES + chunk.len());
+        }
+        assert!(gate.discard_head.is_some(), "the line is being discarded");
+    }
+
+    /// KL-3 analog: a non-denied hub error is an MCP tool error.
+    #[tokio::test]
+    async fn error_status_is_a_tool_error_even_with_an_output_body() {
+        let relay = fake(RelayReply {
+            ok: true,
+            status: Some("error".to_string()),
+            output: Some("boom".to_string()),
+            ..RelayReply::default()
+        });
+        let reply = handle_request(
+            &json!({"id": 12, "method": "tools/call", "params": {"name": "memory_read"}}),
+            Some(&relay),
+        )
+        .await
+        .expect("response");
+        assert_eq!(reply["result"]["isError"], true);
+        assert_eq!(reply["result"]["content"][0]["text"], "boom");
+    }
 }

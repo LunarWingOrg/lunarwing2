@@ -70,6 +70,9 @@ pub struct BridgeConfig {
     pub model: String,
     pub permission_mode: String,
     pub workspace_root: String,
+    /// Where this bridge's per-task relay sockets live
+    /// (`LUNARWING_TOOL_PROXY_DIR`, default `/tmp/lunarwing-tool-proxy`).
+    pub tool_proxy_dir: std::path::PathBuf,
 }
 
 /// Outbound envelopes for one WebSocket connection, drained by the writer
@@ -91,6 +94,7 @@ impl BridgeConfig {
             model: env_or("PEBBLE_MODEL", "openai/gpt-5.2"),
             permission_mode: env_or("PEBBLE_PERMISSION_MODE", "danger-full-access"),
             workspace_root: env_or("WORKSPACE_ROOT", "/workspace"),
+            tool_proxy_dir: tool_proxy::tool_proxy_dir(),
         }
     }
 }
@@ -157,7 +161,7 @@ async fn handle_connection(
     // WI#324: one tool-proxy relay per hub connection. Inbound
     // tool_result/tool_catalog frames route to its waiters; when the
     // connection closes the relay fails every pending call fast (EF-9/EV-4).
-    let relay = Arc::new(ToolProxyRelay::new());
+    let relay = Arc::new(ToolProxyRelay::in_dir(config.tool_proxy_dir.clone()));
 
     // Outbound envelopes are funneled through a channel so spawned task
     // handlers never touch the sink: one writer task drains it while the
@@ -581,7 +585,18 @@ mod tests {
             model: "m".to_string(),
             permission_mode: "default".to_string(),
             workspace_root: workspace_root_str(),
+            tool_proxy_dir: unique_proxy_dir(),
         }
+    }
+
+    /// A per-test relay dir, so tests never touch the shared default
+    /// `/tmp/lunarwing-tool-proxy` (short name: unix socket paths cap at
+    /// about 108 bytes).
+    fn unique_proxy_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static PROXY_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = PROXY_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("pbp-{}-{unique}", std::process::id()))
     }
 
     fn test_relay() -> (Arc<ToolProxyRelay>, PathBuf) {
@@ -1038,6 +1053,7 @@ mod tests {
         };
         let state = crate::health::WorkerState::new(&config.worker_id);
         let registry = Arc::new(WorkspaceRegistry::new());
+        let proxy_dir = config.tool_proxy_dir.clone();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
@@ -1084,8 +1100,7 @@ mod tests {
 
         // The connection's relay lives in the default proxy dir; the task id
         // namespaces the socket file.
-        let socket_path =
-            crate::tool_proxy::task_socket_path_in(&crate::tool_proxy::tool_proxy_dir(), &task_id);
+        let socket_path = crate::tool_proxy::task_socket_path_in(&proxy_dir, &task_id);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while !socket_path.exists() {
             assert!(
@@ -1132,5 +1147,132 @@ mod tests {
         drop(ws);
         server.await.expect("server joins");
         std::fs::remove_dir_all(&config.workspace_root).ok();
+    }
+
+    /// M24 pin: the bridge hands the issued relay slot to the pebble child.
+    /// The stub prints the two proxy keys; the task output must carry the
+    /// slot's real socket path and the task id.
+    #[tokio::test]
+    async fn dispatched_pebble_sees_the_issued_proxy_env() {
+        let root = test_config();
+        let stub = Path::new(&root.workspace_root).join("pebble-env-stub.sh");
+        let script = r#"#!/bin/sh
+echo "SOCK=$LUNARWING_TOOL_PROXY_SOCKET"
+echo "TASK=$LUNARWING_TASK_ID"
+"#;
+        std::fs::write(&stub, script).expect("write stub");
+        std::fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod stub");
+        let config = BridgeConfig {
+            pebble_bin: stub.to_str().expect("utf-8 stub").to_string(),
+            ..root
+        };
+        let registry = Arc::new(WorkspaceRegistry::new());
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (relay, relay_dir) = test_relay();
+        dispatch_task(
+            request_envelope("task-env", None),
+            &config,
+            &out_tx,
+            &cancels,
+            &registry,
+            &relay,
+        )
+        .await;
+        let result = read_until(&mut out_rx, "task_result").await;
+        let output = result.payload["output"]
+            .as_str()
+            .expect("output")
+            .to_string();
+        let socket = crate::tool_proxy::task_socket_path_in(&relay_dir, "task-env");
+        assert!(
+            output.contains(&format!("SOCK={}", socket.display())),
+            "the child must see the issued socket: {output}"
+        );
+        assert!(
+            output.contains("TASK=task-env"),
+            "the child must see the task id: {output}"
+        );
+        std::fs::remove_dir_all(&relay_dir).ok();
+        std::fs::remove_dir_all(&config.workspace_root).ok();
+    }
+
+    /// JU-3/KL-9 analog: the read loop's `drop_hub` call site. A hub that
+    /// goes away mid-call must fail the parked IPC call at once, not after
+    /// the relay timeout (300 s by default for the connection's relay).
+    #[tokio::test]
+    async fn hub_close_fails_a_parked_call_over_a_real_connection() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let root = test_config();
+        let stub = sleeping_pebble_stub(Path::new(&root.workspace_root));
+        let config = BridgeConfig {
+            pebble_bin: stub,
+            ..root
+        };
+        let state = crate::health::WorkerState::new(&config.worker_id);
+        let registry = Arc::new(WorkspaceRegistry::new());
+        let proxy_dir = config.tool_proxy_dir.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let workspace_root = config.workspace_root.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let _ = handle_connection(stream, &config, &state, &registry).await;
+        });
+        let stream = TcpStream::connect(addr).await.expect("connect");
+        let mut request = format!("ws://{addr}/ws/agent")
+            .into_client_request()
+            .expect("client request");
+        request.headers_mut().insert(
+            "sec-websocket-protocol",
+            tokio_tungstenite::tungstenite::http::HeaderValue::from_static("lunarwing-agent-v1"),
+        );
+        let (mut ws, _) = tokio_tungstenite::client_async(request, stream)
+            .await
+            .expect("ws handshake");
+        let _ = ws_read_until(&mut ws, "ready", 5).await;
+        let task_id = format!("ws-drop-{}", std::process::id());
+        let request_env = protocol::create_envelope(
+            "task_request",
+            protocol::TaskRequest {
+                task_id: task_id.clone(),
+                prompt: "work".to_string(),
+                context: protocol::TaskContext::default(),
+                timeout_ms: Some(30_000),
+            },
+        );
+        ws_send_envelope(&mut ws, &request_env).await;
+        let socket_path = crate::tool_proxy::task_socket_path_in(&proxy_dir, &task_id);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !socket_path.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "relay socket never appeared"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let client = tokio::spawn({
+            let socket_path = socket_path.clone();
+            async move {
+                ipc_call(
+                    &socket_path,
+                    &serde_json::json!({"op": "call", "call_id": "drop-1", "name": "memory_read"}),
+                )
+                .await
+            }
+        });
+        let _ = ws_read_until(&mut ws, "tool_call", 5).await;
+        // The hub goes away without answering.
+        drop(ws);
+        let reply = client.await.expect("client joins");
+        assert_eq!(
+            reply["error"],
+            "hub connection closed before the tool reply arrived"
+        );
+        server.abort();
+        std::fs::remove_dir_all(&workspace_root).ok();
     }
 }
