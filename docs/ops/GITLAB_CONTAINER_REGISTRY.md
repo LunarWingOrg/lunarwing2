@@ -152,7 +152,7 @@ Leave request buffering off.
 | Step | Jobs | Contract |
 |---|---|---|
 | Candidate | `worker-{pebble,opencode,kimi}-candidate` | Rootless BuildKit pushes a unique `<full-sha>-<pipeline>-<job>` tag, then performs one uncached rebuild and requires the same digest |
-| Verify | `worker-*-scan` | Trivy scans that exact digest for critical findings and emits a CycloneDX SBOM; the gate honors `.gitlab/trivy-ignore`, where every ignored CVE carries a rationale and an `expiring:` date — expired entries stop being ignored and the scan fails |
+| Verify | `worker-*-scan` | Trivy scans that exact digest for critical findings and emits a CycloneDX SBOM; the gate honors `.gitlab/trivy-ignore`, where every ignored CVE carries a rationale and an `exp:YYYY-MM-DD` date (Trivy's parser only recognises the `exp:` prefix and stops suppressing on its date) — expired entries stop being ignored and the scan fails |
 | Promote | `worker-*-promote` | A serialized, non-interruptible job copies the tested manifest to immutable `vX.Y.Z.W[-rcN]-<worker>` without rebuilding |
 
 Details:

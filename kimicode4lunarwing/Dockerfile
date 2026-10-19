@@ -1,7 +1,7 @@
 # Keep release inputs immutable: the CLI version is cross-checked against the
 # committed npm lock, and package indexes come from one Debian snapshot.
 ARG KIMI_CODE_VERSION=2.2.0
-ARG DEBIAN_SNAPSHOT=20260906T000000Z
+ARG DEBIAN_SNAPSHOT=20261017T082437Z
 ARG SOURCE_REVISION=unknown
 
 # ──────────────────────────────
