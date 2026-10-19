@@ -271,6 +271,13 @@ if has_call_like "ctr:alice run -d --name lunarwing-pebble-alice --user 1042:104
 else
   fail 'rootful pebble: fresh container launches with --user <tenant uid>:<gid>'
 fi
+# LH-2 (run-167): the uid drop is one-way — no setuid/file-cap route back to
+# container root (the image ships Debian's standard setuid set).
+if has_call_like "ctr:alice run -d --name lunarwing-pebble-alice *--security-opt no-new-privileges * lunarwing-worker-pebble:latest"; then
+  pass 'rootful pebble: run carries --security-opt no-new-privileges'
+else
+  fail 'rootful pebble: run carries --security-opt no-new-privileges'
+fi
 for env_pin in '-e HOME=/workspace' '-e GOPATH=/workspace/go' \
                '-e GOCACHE=/workspace/.cache/go-build' '-e CARGO_HOME=/workspace/.cargo'; do
   if has_call_like "ctr:alice run -d --name lunarwing-pebble-alice *${env_pin} * lunarwing-worker-pebble:latest"; then
