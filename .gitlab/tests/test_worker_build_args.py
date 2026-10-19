@@ -27,10 +27,12 @@ class WorkerBuildArgsTests(unittest.TestCase):
         # Match the slim ci-config tool surface; neither git nor awk is
         # installed there. Keep the PATH closed so this cannot contact a real
         # builder or registry even if the production script changes.
-        for name in ("sh", "sha256sum", "cut", "tr", "base64", "mkdir"):
+        for name in ("sh", "sha256sum", "cut", "tr", "base64", "mkdir", "grep", "tee", "rm"):
             tool = shutil.which(name)
             self.assertIsNotNone(tool, f"required tool {name!r} not found")
             (self.bin / name).symlink_to(tool)
+        # The retry backoff must not slow the hermetic suite.
+        self.write_shim("sleep", "#!/bin/sh\nexit 0\n")
         self.log = self.root / "build-calls.jsonl"
         self.script = self.root / SCRIPT.name
         shutil.copy(SCRIPT, self.script)
@@ -47,6 +49,10 @@ import sys
 with open(sys.argv[-1]) as source:
     print(json.load(source)["containerimage.digest"])
 """)
+        # BUILDCTL_MODE steers failure injection: "ok" always publishes,
+        # "fail_once" fails only the first call with the pipeline-5984
+        # registry-auth 429, "fail_always" always fails with it, and
+        # "fail_compile" always fails with a genuine build error.
         self.write_shim("buildctl-daemonless.sh", f"""#!{sys.executable}
 import json
 import os
@@ -55,6 +61,17 @@ import sys
 args = sys.argv[1:]
 with open(os.environ["BUILD_CALLS"], "a") as log:
     log.write(json.dumps(args) + "\\n")
+state = pathlib.Path(os.environ["BUILDCTL_STATE"])
+count = int(state.read_text().strip()) + 1 if state.exists() else 1
+state.write_text(str(count))
+mode = os.environ.get("BUILDCTL_MODE", "ok")
+if mode == "fail_always" or (mode == "fail_once" and count == 1):
+    print("#33 [auth] registry.invalid/example/worker/worker-opencode2:pull,push token for registry.invalid", file=sys.stderr)
+    print("ERROR: failed to push registry.invalid/example/worker/worker-opencode2:tag: failed to authorize: failed to fetch oauth token: unexpected status from POST request to https://git.lunarwing.invalid/jwt/auth: 429 Too Many Requests: Retry later", file=sys.stderr)
+    sys.exit(1)
+if mode == "fail_compile":
+    print("ERROR: failed to solve: process \\"/bin/sh -c make\\" did not complete successfully: exit code: 2", file=sys.stderr)
+    sys.exit(1)
 metadata = pathlib.Path(args[args.index("--metadata-file") + 1])
 metadata.write_text(json.dumps({{"containerimage.digest": "sha256:" + "0" * 64}}))
 """)
@@ -63,6 +80,7 @@ metadata.write_text(json.dumps({{"containerimage.digest": "sha256:" + "0" * 64}}
             "PATH": str(self.bin),
             "HOME": str(self.root / "home"),
             "BUILD_CALLS": str(self.log),
+            "BUILDCTL_STATE": str(self.root / "buildctl-count"),
             "CI_COMMIT_SHA": "1" * 40,
             "CI_JOB_ID": "2",
             "CI_PIPELINE_ID": "3",
@@ -126,6 +144,38 @@ metadata.write_text(json.dumps({{"containerimage.digest": "sha256:" + "0" * 64}}
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("invalid wrapper sha256", result.stderr)
                 self.assertFalse(self.log.exists())
+
+    def test_transient_registry_auth_push_failure_is_retried(self):
+        # Pipeline 5984: a jwt/auth 429 at the push step must not fail the job.
+        self.env["BUILDCTL_MODE"] = "fail_once"
+        result = self.run_build()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        # Candidate attempt (failed push) + candidate retry + clean rebuild.
+        self.assertEqual(len(calls), 3)
+        self.assertNotIn("--no-cache", calls[0])
+        self.assertNotIn("--no-cache", calls[1])
+        self.assertIn("--no-cache", calls[2])
+        self.assertIn("transient registry-auth error", result.stderr)
+
+    def test_persistent_transient_failure_exhausts_retries(self):
+        self.env["BUILDCTL_MODE"] = "fail_always"
+        result = self.run_build()
+        self.assertNotEqual(result.returncode, 0)
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        # Initial attempt plus three retries; the clean rebuild never runs.
+        self.assertEqual(len(calls), 4)
+        for args in calls:
+            self.assertNotIn("--no-cache", args)
+        self.assertIn("not retrying", result.stderr)
+
+    def test_non_transient_build_failure_is_not_retried(self):
+        self.env["BUILDCTL_MODE"] = "fail_compile"
+        result = self.run_build()
+        self.assertNotEqual(result.returncode, 0)
+        calls = self.log.read_text().splitlines()
+        self.assertEqual(len(calls), 1)
+        self.assertIn("not retrying", result.stderr)
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@
 # Re-bump only after re-verifying the bridge against the v2 server API.
 ARG OPENCODE_VERSION=v2.0.32
 ARG OPENCODE_REF=843a6c514e606b436a7fe713422ace0a93ad3d61
-ARG DEBIAN_SNAPSHOT=20260906T000000Z
+ARG DEBIAN_SNAPSHOT=20261017T082437Z
 ARG SOURCE_REVISION=unknown
 
 # ──────────────────────
@@ -362,6 +362,9 @@ RUN set -eu; \
     && bun scripts/opencode_task_executor_test.ts \
     && bun scripts/sdk_surface_test.ts \
     && bun scripts/sdk_surface_assert_test.ts \
+    && bun scripts/lunarwing_tool_proxy_test.ts \
+    && bun scripts/lunarwing_tool_plugin_test.ts \
+    && bun scripts/lunarwing_bridge_test.ts \
     && python3 scripts/prepare_reproducible_build_test.py \
     && python3 scripts/study_notes_config_test.py \
     && python3 scripts/exposure_policy_assert_test.py \

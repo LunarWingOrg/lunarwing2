@@ -205,6 +205,35 @@ free space on that host (prune dangling images/build cache), then re-run the
 candidate job — the scan can only succeed after a candidate publishes
 `worker-image.env`.
 
+## worker candidate push 429 (registry auth rate limit)
+
+Symptom — a `worker-*-candidate` fails at the very last BuildKit step with:
+
+```
+ERROR: failed to push registry.git.lunarwing.org/...: failed to authorize:
+failed to fetch oauth token: unexpected status from POST request to
+https://git.lunarwing.org/jwt/auth: 429 Too Many Requests: Retry later
+```
+
+and every downstream `worker-*-scan` then fails on the missing
+`worker-image.env` guard (pipeline #5984 lost the opencode, opencode2 and
+kimi candidates plus their scans to one burst while all four candidates
+pushed at once; every job went green on retry).
+
+This is GitLab rate-limiting the registry auth realm when several candidates
+fetch push tokens concurrently. Since 2026-10-18
+`.gitlab/scripts/build-worker-image.sh` wraps both image pushes (candidate
+and clean rebuild) in a bounded retry — up to 4 attempts with 30s/60s/90s
+backoff — that fires only on this transient signature
+(`failed to fetch oauth token` / `429 Too Many Requests`); the build is
+deterministic and the retry reuses the layer cache, so only the push is
+re-executed, and a genuine build failure still exits on the first attempt.
+The publication jobs keep their pinned `retry: 0` (no blind whole-job
+re-run); the retry contract is pinned by hermetic stubbed tests in
+`.gitlab/tests/test_worker_build_args.py`. If a candidate still fails after
+all four attempts, wait a few minutes and re-run the job manually — the scan
+follows once a candidate publishes `worker-image.env`.
+
 ## worker-kimi digest mismatch (directory mtime flake)
 
 Symptom — `worker-kimi-candidate` fails with:
@@ -496,10 +525,23 @@ the prime suspect, and the fix is the same normalization in the offending
 
 Known false-positive Gitleaks findings are listed by exact fingerprint in
 `/.gitleaksignore`. Broad path or rule exclusions are forbidden. Worker-image
-CRITICAL findings that Debian will not fix for the pinned toolchain
-dependencies are listed by exact CVE with rationale and expiry in
-`.gitlab/trivy-ignore`; expired entries stop being ignored and fail the
-scan gate again.
+CRITICAL findings that Debian has not fixed for the pinned toolchain
+dependencies are listed by exact CVE with a rationale comment and an expiry
+date in Trivy's own syntax (`CVE-… exp:YYYY-MM-DD`, one entry per line) in
+`.gitlab/trivy-ignore`. Trivy's ignore-file parser only recognises the `exp:`
+prefix and stops suppressing an entry on its date (00:00 UTC), so expired
+entries fail the scan gate again until the finding is re-reviewed (WI#361:
+the earlier `expiring:` spelling was never Trivy syntax, so those entries
+silently never expired). Every trivy call in the scan runs with
+`--config /dev/null` from an emptied `TRIVY_CACHE_DIR`, and
+`validate_config.py` pins the scan template's script, image, tags and
+variables exactly and lets the `worker-*-scan` jobs add only `needs`, so a
+checkout-root `trivy.yaml`, a committed `.trivy-cache` database, or a
+`TRIVY_*` variable in the committed CI YAML cannot hide a CRITICAL.
+Variables set outside the YAML (project or group CI/CD settings,
+`git push -o ci.variable`, runner configuration) are not visible to the
+validator. `validate_config.py` also rejects any non-comment line in another
+shape and any expiry more than six months out.
 
 `skip-version-check` is inert unless a maintainer also supplies
 `ALLOW_VERSION_CHECK_SKIP=1`; commit messages cannot bypass version policy.

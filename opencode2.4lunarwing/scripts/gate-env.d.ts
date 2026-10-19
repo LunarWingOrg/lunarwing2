@@ -21,8 +21,16 @@ declare const process: {
   exit(code?: number): never
 }
 
+interface GateBuffer {
+  readonly length: number
+  readonly [index: number]: number
+  subarray(start?: number, end?: number): GateBuffer
+  toString(encoding?: string): string
+}
+
 declare const Buffer: {
-  from(input: string): { toString(encoding: string): string }
+  from(input: string, encoding?: string): GateBuffer
+  byteLength(input: string, encoding?: string): number
 }
 
 declare module "crypto" {

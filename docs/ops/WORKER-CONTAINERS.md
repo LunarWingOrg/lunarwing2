@@ -118,8 +118,17 @@ container can rename a session before its first call, create a session with
 another task's title or `parentID` over the loopback serve API, or connect
 to another task's socket directly — all of these stay inside the
 container's single hub-enforced grant and change only which job a call is
-attributed to. The opencode2 and
-pebble lanes do not have the bridge yet; see
+attributed to. The opencode2 worker image ships the same relay plus a v2
+serve-process plugin (`scripts/lunarwing_tool_plugin/index.ts`, a directory
+plugin registered by absolute path in `config/opencode2.json`'s `plugins`
+array — v2 drops configured plugin file paths): the v2 promise plugin API
+registers the phase-1 tools via `ctx.tool.transform` as direct
+(`codemode: false`) tools with plain JSON Schema inputs, each `execute()`
+resolves the calling session's task id from its title
+(`lunarwing-opencode2-<task_id>`) through the plugin context's in-process
+session API, and relays over the task's socket with the same
+first-title-wins caching and the same "not an isolation boundary" limits.
+The pebble lane does not have the bridge yet; see
 [`docs/proposals/EXTERNAL-WORKER-TOOL-PROXY.md`](../proposals/EXTERNAL-WORKER-TOOL-PROXY.md)
 for the wire contract.
 
@@ -891,6 +900,11 @@ checked reproducibility patch applies unchanged.
 permitted by WI#427 gate 6. The existing gate still uses syntax-based call
 binding and corpus-wide event-literal matching; it is not a type/payload or
 V2-union proof. Goals item 64 remains open.
+**(Superseded 2026-10-18, item 64:** WI#369 landed on this tree — the builder
+stage now runs a `tsgo --noEmit` gate over the SDK-facing scripts against the
+pinned generated client types, and `sdk_surface_assert.ts` asserts the eight
+bridge event names against the pinned `V2Event` union. The Gentoo
+build/rollout recorded below ran through that strengthened gate.)
 
 **Verification (this branch, 2026-10-18):**
 
@@ -919,6 +933,30 @@ V2-union proof. Goals item 64 remains open.
   `opentunnel` identity dir, wrapper refuses `service set remote true` and
   `pair --remote --yes` (exit 77), `worker-listeners spitfire` clean. Full
   security writeup: `docs/ops/ITEM71_OPENCODE2_V2.0.32_PUBLIC_HTTPS_TUNNEL.md`.
+- **Gentoo rollout + real jobs (item 66, 2026-10-18, host: Gentoo/OpenRC):**
+  fat image rebuilt from this tree into the admin store
+  (`2ee1fe9c9f3e…`, revision `01f3e69aa…`) via
+  `mt-admin build-opencode2-worker --with-toolchains` — builder tsgo gate,
+  compile-out stub, in-image `sdk_surface_assert` (6 methods present, 2
+  stale absent, 8 event names in the pinned `V2Event` union), all TS/Python
+  self-tests, binary marker scan and image-filesystem assert green — then
+  `restart-tenant` recreated both Gentoo opencode2 containers
+  (`_ensure_tenant_image` save|load + contract-hash recreate, the !1663
+  path). `soarin` job `c66fc949-96ae-4aeb-ab20-7f4e8d262b2b` →
+  `result {"content": "Completed: … exact stdout: OC2_WORKER_OK"}`
+  (bridge `success (19886ms)`); `scootaloo` job
+  `953f47bb-817f-4e40-9dfb-48de6ee1613d` →
+  `result {"content": "Completed: OC2_WORKER_OK"}` (bridge
+  `success (28704ms)`, approval-gate `action=always` path exercised).
+  Exposure checks on both tenants, before and after the jobs: in-container
+  `opencode --version` = `opencode v2.0.32`, `service.json` =
+  `{"disabled": true}`, no `opentunnel` identity dir, wrapper refuses
+  `service set remote true` / `pair --remote --yes` / non-loopback
+  `serve --hostname` (exit 77), `worker-listeners <tenant>` clean.
+  scootaloo's lane was found unconfigured (no `OPENCODE2_BASE_URL`;
+  pre-dates the WI#330 inheritance) — fixed with
+  `configure-opencode2 scootaloo --base-url <tenant LLM endpoint>` before
+  its job.
 
 **Remaining acceptance / rollout:** protected `worker-opencode2-candidate`
 (including the uncached whole-image digest comparison) and
@@ -928,7 +966,9 @@ an MR pipeline or local build does not satisfy those gates. Roll out via
 opencode2 worker containers. Verify no remote service config or OpenTunnel
 identity, effective sharing disabled, wrapper refusal of
 `service set remote true`, and `worker-listeners <tenant>` clean before
-driving jobs.
+driving jobs. (Done 2026-10-18 for the Gentoo host's tenants `soarin` and
+`scootaloo` — see the item-66 rollout bullet above; the Arch host's item-71
+tenant `spitfire` ran the same checks at provisioning time.)
 
 **Rollback:** preserve each tenant's worker state before its first v2.0.32
 boot. Upstream adds the `project.time_archived` column and migrates Azure

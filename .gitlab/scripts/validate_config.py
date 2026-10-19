@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+import calendar
+import datetime
 import fnmatch
 import hashlib
 import json
@@ -25,6 +27,57 @@ KIMI_CLI_LOCK = ROOT / "kimicode4lunarwing" / "kimi-cli" / "package-lock.json"
 PEBBLE_DOCKERFILE = ROOT / "pebble4lunarwing" / "Dockerfile"
 WORKER_BUILD_SCRIPT = ROOT / ".gitlab" / "scripts" / "build-worker-image.sh"
 DELIVERABLES = ROOT / ".gitlab" / "deliverables.json"
+TRIVY_IGNORE = ROOT / ".gitlab" / "trivy-ignore"
+TRIVY_IGNORE_ENTRY = re.compile(r"^CVE-\d{4}-\d{4,} exp:\d{4}-\d{2}-\d{2}$")
+TRIVY_IGNORE_MAX_EXPIRY_MONTHS = 6
+TRIVY_GATE_COMMAND = (
+    'trivy image --config /dev/null --ignorefile "$CI_PROJECT_DIR/.gitlab/trivy-ignore" '
+    "--exit-code 1 --severity CRITICAL "
+)
+TRIVY_SCAN_VARIABLES = {"TRIVY_CACHE_DIR", "TRIVY_NO_PROGRESS", "TRIVY_PASSWORD", "TRIVY_USERNAME"}
+# MR !1750 review (run 162): the run-143 JP-1 prototype pinned only a prefix
+# of one gate line and read only the template's own script and variables. A
+# suffix (--ignore-unfixed, --exit-code 0, || true), an earlier `exit 0` or
+# `export TRIVY_...` line, a before_script, a scan job's own script,
+# variables or allow_failure, or a second extends parent all kept it green.
+# Every scan job's extends-resolved script and inputs are pinned exactly, and
+# the jobs may add only their needs wiring. A deliberate change edits these
+# constants in the same commit.
+WORKER_SCAN_SCRIPT = [
+    """if [ ! -f ./worker-image.env ]; then
+  echo "ERROR: worker-image.env is missing — the candidate job for this worker failed or did not publish an image." >&2
+  echo "       Finish the matching worker-*-candidate job successfully before retrying this scan." >&2
+  exit 1
+fi
+""",
+    "set -a; . ./worker-image.env; set +a",
+    'test -n "$WORKER_IMAGE_REF" && test -n "$WORKER_IMAGE_DIGEST"',
+    'rm -rf "$TRIVY_CACHE_DIR"',
+    'trivy image --config /dev/null --format template --template "@/contrib/gitlab.tpl" '
+    '--output gl-container-scanning-report.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"',
+    TRIVY_GATE_COMMAND
+    + '--format json --output worker-vulnerabilities.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"',
+    'trivy image --config /dev/null --format cyclonedx --output worker-sbom.cdx.json '
+    '"$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"',
+]
+WORKER_SCAN_PINNED_VALUES = {
+    "image": {
+        "name": "docker.io/aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969",
+        "entrypoint": [""],
+    },
+    "tags": ["container-build"],
+    "variables": {
+        "TRIVY_CACHE_DIR": "$CI_PROJECT_DIR/.trivy-cache",
+        "TRIVY_NO_PROGRESS": "true",
+        "TRIVY_PASSWORD": "$CI_REGISTRY_PASSWORD",
+        "TRIVY_USERNAME": "$CI_REGISTRY_USER",
+    },
+}
+WORKER_SCAN_EFFECTIVE_KEYS = frozenset({
+    "artifacts", "image", "needs", "rules", "script", "stage", "tags",
+    "timeout", "variables",
+})
+WORKER_SCAN_JOB_KEYS = frozenset({"extends", "needs"})
 DELIVERABLE_STATUSES = {"production", "experimental", "fixture", "mirror", "retired", "staging"}
 DELIVERABLE_REQUIRED_KEYS = ("name", "status", "owner", "manifest", "lockfile", "targets", "ci", "triggers")
 EXPECTED_RUST_VERSION = "1.96.1"
@@ -846,9 +899,9 @@ WORKER_TS_LANE_SCRIPTS = {
         ),
     ),
     # WI#375 DR-3: the opencode2 bridge's dependency-free TS suites (the
-    # executor suite needs the image's built @opencode/client and stays
-    # image-gated). Same shape as worker-opencode-ts: digest-tied bun image,
-    # lint runner tags, no extends.
+    # executor and bridge suites need the image's built @opencode/client and
+    # stay image-gated). Same shape as worker-opencode-ts: digest-tied bun
+    # image, lint runner tags, no extends.
     "worker-opencode2-ts": (
         "$CI_BUN_IMAGE",
         (
@@ -858,6 +911,8 @@ WORKER_TS_LANE_SCRIPTS = {
             "bun scripts/opencode_result_test.ts",
             "bun scripts/sdk_surface_test.ts",
             "bun scripts/sdk_surface_assert_test.ts",
+            "bun scripts/lunarwing_tool_proxy_test.ts",
+            "bun scripts/lunarwing_tool_plugin_test.ts",
         ),
     ),
 }
@@ -1212,6 +1267,151 @@ def validate_cavepony_version(merged: dict, errors: list[str]) -> None:
     for relative, actual in versions.items():
         if actual != [expected]:
             errors.append(f"{relative} Cavepony version {actual!r} != CI expectation {expected!r}")
+
+
+def expiry_horizon(today: datetime.date, months: int) -> datetime.date:
+    """Calendar `months` after `today`, clamped to the target month's last
+    day — the furthest expiry a trivy-ignore entry may carry (WI#361)."""
+    month_index = today.year * 12 + today.month - 1 + months
+    year, month = divmod(month_index, 12)
+    day = min(today.day, calendar.monthrange(year, month + 1)[1])
+    return datetime.date(year, month + 1, day)
+
+
+def validate_trivy_ignore(errors: list[str], today: datetime.date | None = None) -> None:
+    """WI#361: every non-comment line of .gitlab/trivy-ignore must be
+    `CVE-<id> exp:YYYY-MM-DD`. Trivy's plain ignore-file parser
+    (pkg/result/ignore.go getExpirationDate) only recognises the `exp:`
+    prefix, so the former `expiring:` spelling silently made every
+    suppression permanent — `expired` entries are what make the worker-scan
+    gate fail again for re-review. Also reject a syntactically valid but
+    non-calendar date, and any expiry more than six months out, so a
+    far-future date cannot stand in for re-verification against the current
+    Debian snapshot. Fails closed when the file is missing: the worker-scan
+    job passes it to `trivy image --ignorefile --exit-code 1`."""
+    if not TRIVY_IGNORE.is_file():
+        errors.append(".gitlab/trivy-ignore missing; the worker-scan gate references it")
+        return
+    today = today or datetime.date.today()
+    horizon = expiry_horizon(today, TRIVY_IGNORE_MAX_EXPIRY_MONTHS)
+    for lineno, line in enumerate(
+        TRIVY_IGNORE.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if not TRIVY_IGNORE_ENTRY.fullmatch(stripped):
+            errors.append(
+                f".gitlab/trivy-ignore:{lineno} must match "
+                f"'CVE-<id> exp:YYYY-MM-DD' (Trivy only parses the exp: prefix): "
+                f"{stripped!r}"
+            )
+            continue
+        expiry_text = stripped.rsplit("exp:", 1)[1]
+        try:
+            expiry = datetime.date.fromisoformat(expiry_text)
+        except ValueError:
+            errors.append(
+                f".gitlab/trivy-ignore:{lineno} expiry {expiry_text!r} "
+                "is not a real calendar date"
+            )
+            continue
+        if expiry > horizon:
+            errors.append(
+                f".gitlab/trivy-ignore:{lineno} expiry {expiry} is more than "
+                f"{TRIVY_IGNORE_MAX_EXPIRY_MONTHS} months out (beyond {horizon}); "
+                "re-verify the finding against the current Debian snapshot instead"
+            )
+
+
+def validate_trivy_gate_inputs(merged: dict, errors: list[str]) -> None:
+    """WI#361 (run-143 JP-1): the ignore-file guard only holds if the gate
+    reads nothing else. trivy also loads trivy.yaml from its working
+    directory (the checkout) and TRIVY_* environment variables; either can
+    set ignore-unfixed (or vex, skip-dirs, ...) and hide every unfixed
+    CRITICAL with no expiry. Pin the gate command and allowlist TRIVY_*
+    variables in every place GitLab can set them for a scan job."""
+    validate_worker_scan_pins(merged, errors)
+    sources = [("top-level variables", merged.get("variables"))]
+    workflow = merged.get("workflow")
+    if isinstance(workflow, dict):
+        for rule in workflow.get("rules", []) or []:
+            if isinstance(rule, dict):
+                sources.append(("workflow rule variables", rule.get("variables")))
+    for name, job in merged.items():
+        if not isinstance(job, dict) or not (name == ".worker-scan" or extends_template(job, ".worker-scan")):
+            continue
+        sources.append((name + " variables", job.get("variables")))
+        for rule in job.get("rules", []) or []:
+            if isinstance(rule, dict):
+                sources.append((name + " rule variables", rule.get("variables")))
+    for label, variables in sources:
+        if not isinstance(variables, dict):
+            continue
+        for key in variables:
+            if str(key).upper().startswith("TRIVY_") and key not in TRIVY_SCAN_VARIABLES:
+                errors.append(
+                    f"{label} set {key}; only {sorted(TRIVY_SCAN_VARIABLES)} "
+                    "may reach the worker-scan trivy run"
+                )
+
+
+def validate_worker_scan_shape(name: str, effective: dict, errors: list[str]) -> None:
+    unexpected = sorted(set(effective) - WORKER_SCAN_EFFECTIVE_KEYS)
+    if unexpected:
+        errors.append(
+            f"{name} must not carry job keys {unexpected}; hooks, before_script, "
+            "after_script, allow_failure, when or inherit can hollow out the gate"
+        )
+    if effective.get("script") != WORKER_SCAN_SCRIPT:
+        errors.append(
+            f"{name} must run the CRITICAL gate inside exactly WORKER_SCAN_SCRIPT "
+            f"(gate line {TRIVY_GATE_COMMAND.strip()!r} ...)"
+        )
+    for key, expected in WORKER_SCAN_PINNED_VALUES.items():
+        if effective.get(key) != expected:
+            errors.append(f"{name} {key} must be exactly {expected!r}")
+    rules = effective.get("rules")
+    rules = rules if isinstance(rules, list) else []
+    if any(isinstance(rule, dict) and "variables" in rule for rule in rules):
+        errors.append(f"{name} rules must not set variables; they reach the trivy gate")
+    tag_rules = [
+        rule for rule in rules
+        if isinstance(rule, dict) and "CI_COMMIT_TAG" in str(rule.get("if", ""))
+    ]
+    if len(tag_rules) != 1 or set(tag_rules[0]) != {"if"}:
+        errors.append(
+            f"{name} needs exactly one release-tag rule carrying only `if`; a rule "
+            "allow_failure or when there makes the release gate advisory"
+        )
+
+
+def validate_worker_scan_pins(merged: dict, errors: list[str]) -> None:
+    """MR !1750 review (run 162): pin the scan template and every
+    worker-*-scan job by their extends-resolved view, the way
+    validate_advisory_gates_not_optional pins the advisory gates."""
+    template = merged.get(".worker-scan")
+    if not isinstance(template, dict):
+        errors.append(".worker-scan template missing")
+        return
+    own = sorted(set(template) - WORKER_SCAN_EFFECTIVE_KEYS)
+    if own:
+        errors.append(f".worker-scan must not set {own}")
+    validate_worker_scan_shape(".worker-scan", resolve_extends(template, merged), errors)
+    for worker in WORKER_NAMES:
+        name = f"worker-{worker}-scan"
+        job = merged.get(name)
+        if not isinstance(job, dict):
+            continue  # validate_worker_publication reports the missing job
+        own = sorted(set(job) - WORKER_SCAN_JOB_KEYS)
+        if own:
+            errors.append(
+                f"{name} must not set job keys {own}; only extends and needs may "
+                "differ from .worker-scan"
+            )
+        if job.get("extends") not in (".worker-scan", [".worker-scan"]):
+            errors.append(f"{name} must extend exactly .worker-scan and nothing else")
+        validate_worker_scan_shape(name, resolve_extends(job, merged), errors)
 
 
 def cache_policies(job: object) -> list[str]:
@@ -2065,6 +2265,8 @@ def main() -> int:
     validate_cache_trust(merged_config, errors)
     validate_worker_versions(errors)
     validate_worker_input_manifest(errors)
+    validate_trivy_ignore(errors)
+    validate_trivy_gate_inputs(merged_config, errors)
     validate_deliverables_manifest(merged_config, errors)
     validate_ci_tool_image_pins(merged_config, merged_variables, errors)
     rust_image = extract_rust_image(defaults, ".rust-job", merged_variables)
