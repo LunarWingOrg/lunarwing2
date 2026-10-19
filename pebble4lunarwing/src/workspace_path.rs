@@ -594,6 +594,10 @@ mod tests {
             for marker in ["self", "foreign"] {
                 let (uid, gid) = if marker == "foreign" {
                     (own_uid + 1000, own_gid + 1000)
+                } else if own_uid == 0 {
+                    // LD-14: id 0 is refused as a task identity, so the root
+                    // "self" phase uses a stand-in unprivileged uid instead.
+                    (65534, 65534)
                 } else {
                     (own_uid, own_gid)
                 };
@@ -641,8 +645,13 @@ mod tests {
         let pre = root.join("pre");
         std::fs::create_dir(&pre).expect("create pre-existing component");
         let self_is_root = root.metadata().expect("root metadata").uid() == 0;
+        let self_uid = root.metadata().expect("root metadata").uid();
+        // Third uid, distinct from both the root bridge (0) and the root
+        // "self" task stand-in (65534), so "never re-chowned" stays
+        // observable in every phase.
+        let pre_marker_uid: u32 = if self_is_root { 65533 } else { self_uid };
         if self_is_root {
-            std::os::unix::fs::chown(&pre, Some(65534), Some(65534))
+            std::os::unix::fs::chown(&pre, Some(pre_marker_uid), Some(pre_marker_uid))
                 .expect("chown pre-existing marker");
         }
         let context = crate::protocol::TaskContext {
@@ -651,7 +660,6 @@ mod tests {
             ..Default::default()
         };
         let outcome = resolve_task_workspace(&context, &root);
-        let self_uid = root.metadata().expect("root metadata").uid();
         if foreign && self_uid != 0 {
             // Unprivileged: the fchown to a foreign uid must fail (EPERM),
             // proving the handoff was attempted; PermissionDenied classifies
@@ -679,7 +687,7 @@ mod tests {
             // A pre-existing component is never re-chowned: the root child
             // pinned it to 65534; unprivileged it keeps this process's uid.
             let pre_meta = pre.metadata().expect("pre-existing metadata");
-            let expected_pre = if self_is_root { 65534 } else { self_uid };
+            let expected_pre = pre_marker_uid;
             assert_eq!(
                 pre_meta.uid(),
                 expected_pre,

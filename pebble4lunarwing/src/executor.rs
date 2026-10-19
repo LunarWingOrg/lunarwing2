@@ -1,3 +1,4 @@
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Instant;
@@ -85,10 +86,18 @@ pub(crate) fn task_ids_from_env() -> Result<Option<(u32, u32)>, std::io::Error> 
                     )
                 })
             };
-            Ok(Some((
-                parse(uid, "PEBBLE_TASK_UID")?,
-                parse(gid, "PEBBLE_TASK_GID")?,
-            )))
+            let task_uid = parse(uid, "PEBBLE_TASK_UID")?;
+            let task_gid = parse(gid, "PEBBLE_TASK_GID")?;
+            // LD-14: id 0 would make the drop a no-op while every caller
+            // keeps treating the split as active — refuse it. The value is
+            // image ENV, not task env, so this is a misconfiguration gate.
+            if task_uid == 0 || task_gid == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "PEBBLE_TASK_UID/PEBBLE_TASK_GID must be non-zero (a zero id would make the privilege drop a no-op)",
+                ));
+            }
+            Ok(Some((task_uid, task_gid)))
         }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -185,6 +194,24 @@ pub async fn run_task(
     let _ = event_tx.send(ExecutorEvent::Result(result));
 }
 
+/// LD-11: locate setpriv through the bridge's own PATH, never the child's.
+/// The child env is task-influenced and is applied to the command below; a
+/// bare program name would be resolved through whatever PATH the task
+/// supplied, letting task code substitute its own "setpriv" for the drop.
+fn resolve_setpriv_path() -> Result<std::ffi::OsString, std::io::Error> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join("setpriv");
+        if candidate.is_file() {
+            return Ok(candidate.into_os_string());
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "setpriv not found on the bridge PATH (WI#400 LD-11)",
+    ))
+}
+
 fn spawn_pebble(
     config: &ExecutorConfig,
     request: &protocol::TaskRequest,
@@ -220,6 +247,30 @@ fn spawn_pebble(
     // would let task code regain privilege. The env assembled below is
     // passed to setpriv and inherited by the task unchanged.
     let task_ids = task_ids_from_env()?;
+    if let Some((task_uid, _)) = task_ids {
+        // LD-8: refuse to spawn without a privilege split. If the bridge
+        // itself landed on the task uid (rootless keep-id with a USER-less
+        // image), the credential isolation WI#400 promises is absent: the
+        // task could read the bridge's environ and the token file. The
+        // owner of /proc/self is this process's uid (the crate forbids
+        // unsafe code, so libc::geteuid is not an option).
+        let bridge_uid = std::fs::metadata("/proc/self")
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("cannot stat /proc/self for the bridge uid: {error}"),
+                )
+            })?
+            .uid();
+        if bridge_uid == task_uid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "bridge runs as the task uid ({task_uid}); refusing to spawn without a privilege split (WI#400 LD-8)"
+                ),
+            ));
+        }
+    }
     let mut program = std::ffi::OsString::from(&config.pebble_bin);
     let mut argv: Vec<std::ffi::OsString> =
         pebble_args.iter().map(std::ffi::OsString::from).collect();
@@ -239,7 +290,9 @@ fn spawn_pebble(
         .collect();
         wrapped.push(program);
         wrapped.extend(argv);
-        program = std::ffi::OsString::from("setpriv");
+        // LD-11: resolve setpriv from the bridge's OWN PATH — a bare name
+        // is looked up through the child env, which is task-influenced.
+        program = resolve_setpriv_path()?;
         argv = wrapped;
     }
     let mut cmd = Command::new(program);
@@ -279,6 +332,19 @@ fn spawn_pebble(
             // value vanish silently (run-98 FY-5).
             eprintln!(
                 "[exec] {}: dropped task-supplied env entry {key}: reserved for the bridge (WI#373/WI#324/WI#400)",
+                request.task_id
+            );
+            continue;
+        }
+        // LD-11: in split mode the child env reaches the still-root setpriv
+        // process; loader/interpreter variables there would let task code
+        // run code as root before the drop. The daemon already denylists
+        // these for worker env — the bridge must not depend on that.
+        if task_ids.is_some()
+            && (key.starts_with("LD_") || key == "GCONV_PATH" || key == "GLIBC_TUNABLES")
+        {
+            eprintln!(
+                "[exec] {}: dropped task-supplied env entry {key}: loader variable refused before the privilege drop (WI#400 LD-11)",
                 request.task_id
             );
             continue;
@@ -779,6 +845,8 @@ mod tests {
                     ("uid-only", Some("10004"), None),
                     ("gid-only", None, Some("10004")),
                     ("garbage", Some("abc"), Some("10004")),
+                    ("zero-uid", Some("0"), Some("10004")),
+                    ("zero-gid", Some("10004"), Some("0")),
                 ] {
                     let exe = std::env::current_exe().expect("test binary path");
                     let mut cmd = std::process::Command::new(exe);
@@ -805,6 +873,14 @@ mod tests {
                 task_ids_from_env().expect("both ids set"),
                 Some((10004, 10004))
             ),
+            Some("zero-uid" | "zero-gid") => {
+                // LD-14: a zero id would make the privilege drop a no-op.
+                let error = task_ids_from_env().expect_err("must refuse this shape");
+                assert!(
+                    error.to_string().contains("must be non-zero"),
+                    "zero id must fail with the no-op wording, got: {error}"
+                );
+            }
             Some("uid-only" | "gid-only" | "garbage") => {
                 assert!(task_ids_from_env().is_err());
             }
@@ -926,9 +1002,15 @@ mod tests {
         static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
         let unique = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let prefix = format!("pebble-proxy-env-{}-{unique}", std::process::id());
-        let root = std::env::temp_dir().join(prefix);
+        let root = std::env::temp_dir().join(format!("{prefix}-root"));
         std::fs::create_dir_all(&root).expect("create root");
-        let stub = root.join("pebble-env-probe.sh");
+        // The probe stub must be executable: dev VMs may mount /tmp noexec.
+        let exe_dir = std::env::current_exe()
+            .expect("test binary path")
+            .parent()
+            .expect("exe directory")
+            .to_path_buf();
+        let stub = exe_dir.join(format!("{prefix}-probe.sh"));
         std::fs::write(
             &stub,
             "#!/bin/sh\necho \"TASK_ID=${LUNARWING_TASK_ID-UNSET}\"\necho \"SOCK=${LUNARWING_TOOL_PROXY_SOCKET-UNSET}\"\n",
@@ -979,6 +1061,7 @@ mod tests {
             "task-supplied proxy keys must be dropped when the relay is down: {text}"
         );
 
+        std::fs::remove_file(&stub).ok();
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1076,5 +1159,201 @@ mod tests {
             ),
             "setpriv flags missing or out of order — the cap-clearing pair and --no-new-privs are mandatory (WI#400, run-164 KW-2): {text}"
         );
+        assert!(
+            !text.contains("<setpriv>"),
+            "setpriv must be resolved to an absolute path from the bridge PATH, not a bare name (WI#400 LD-11): {text}"
+        );
+    }
+
+    // WI#400 LD-8: when the bridge itself runs as the task uid (the rootless
+    // keep-id + USER-less-image failure mode), the executor must refuse to
+    // spawn at all — there is no privilege split, so the credential boundary
+    // this item promises does not exist. Runs as its own child so the env can
+    // carry PEBBLE_TASK_UID pinned to this process's own uid (discovered from
+    // a probe directory's owner; the crate forbids unsafe code).
+    #[tokio::test]
+    async fn spawn_refuses_when_the_bridge_runs_as_the_task_uid() {
+        const CHILD_MARKER: &str = "PEBBLE_WI400_LD8_CHILD";
+        const TEST_PATH: &str = "executor::tests::spawn_refuses_when_the_bridge_runs_as_the_task_uid";
+
+        let exe_dir = std::env::current_exe()
+            .expect("test binary path")
+            .parent()
+            .expect("exe directory")
+            .to_path_buf();
+        let probe = exe_dir.join("pebble-wi400-ld8-selfid");
+        let root = exe_dir.join("pebble-wi400-ld8-root");
+
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::create_dir(&probe).expect("create self-id probe");
+            let own_uid = probe.metadata().expect("probe metadata").uid();
+            let own_gid = probe.metadata().expect("probe metadata").gid();
+            std::fs::remove_dir_all(&probe).ok();
+            let exe = std::env::current_exe().expect("test binary path");
+            // The child must run AS the task uid so the refusal fires. As
+            // root the probe uid is 0 (refused by LD-14 before the shared-
+            // identity check), so the re-exec drops to a stand-in unprivileged
+            // uid through the same setpriv flags production uses (present in
+            // both image stages); unprivileged hosts re-exec plainly.
+            if own_uid == 0 {
+                // The dropped child cannot create directories under the
+                // root-owned exe dir: stage its workspace root and hand it
+                // over first.
+                std::fs::create_dir_all(&root).expect("stage workspace root");
+                std::os::unix::fs::chown(&root, Some(65534), Some(65534))
+                    .expect("hand workspace root to the dropped child");
+                let out = std::process::Command::new("setpriv")
+                    .arg("--reuid=65534")
+                    .arg("--regid=65534")
+                    .arg("--clear-groups")
+                    .arg("--ambient-caps=-all")
+                    .arg("--inh-caps=-all")
+                    .arg("--no-new-privs")
+                    .arg("--")
+                    .arg(&exe)
+                    .args(["--exact", TEST_PATH, "--nocapture"])
+                    .env(CHILD_MARKER, "1")
+                    .env("PEBBLE_TASK_UID", "65534")
+                    .env("PEBBLE_TASK_GID", "65534")
+                    .output()
+                    .expect("re-exec test binary through setpriv");
+                let text = String::from_utf8_lossy(&out.stdout);
+                let stderr_text = String::from_utf8_lossy(&out.stderr);
+                assert!(
+                    out.status.success(),
+                    "child phase failed:\nstdout: {text}\nstderr: {stderr_text}"
+                );
+                assert!(
+                    text.contains("test result: ok. 1 passed"),
+                    "child phase ran no tests (drifted TEST_PATH?):\nstdout: {text}\nstderr: {stderr_text}"
+                );
+                std::fs::remove_dir_all(&root).ok();
+                return;
+            }
+            let out = std::process::Command::new(&exe)
+                .args(["--exact", TEST_PATH, "--nocapture"])
+                .env(CHILD_MARKER, "1")
+                .env("PEBBLE_TASK_UID", own_uid.to_string())
+                .env("PEBBLE_TASK_GID", own_gid.to_string())
+                .output()
+                .expect("re-exec test binary");
+            let text = String::from_utf8_lossy(&out.stdout);
+            let stderr_text = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success(),
+                "child phase failed:\nstdout: {text}\nstderr: {stderr_text}"
+            );
+            assert!(
+                text.contains("test result: ok. 1 passed"),
+                "child phase ran no tests (drifted TEST_PATH?):\nstdout: {text}\nstderr: {stderr_text}"
+            );
+            std::fs::remove_dir_all(&root).ok();
+            return;
+        }
+
+        // Child: the task id equals this process's uid — spawn must fail
+        // closed BEFORE any process is created.
+        let config = ExecutorConfig {
+            pebble_bin: "pebble".to_string(),
+            model: "m".to_string(),
+            permission_mode: "danger-full-access".to_string(),
+            workspace_root: root.to_str().expect("utf-8 root").to_string(),
+        };
+        std::fs::create_dir_all(&root).expect("create workspace root");
+        let req = request("must refuse", vec![]);
+        let error = spawn_pebble(&config, &req, None).expect_err("shared identity must refuse");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to spawn without a privilege split"),
+            "unexpected error: {error}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // WI#400 LD-11: in split mode, task-supplied loader/interpreter variables
+    // must never reach the still-root setpriv process. The probe stub prints
+    // whether LD_PRELOAD survived into its env.
+    #[tokio::test]
+    async fn split_mode_drops_task_supplied_loader_variables() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let prefix = format!("pebble-ld11-{}-{unique}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{prefix}-root"));
+        // The stub must be executable: dev VMs may mount /tmp noexec, and
+        // spawn_pebble resolves setpriv to this stub from PATH.
+        let exe_dir = std::env::current_exe()
+            .expect("test binary path")
+            .parent()
+            .expect("exe directory")
+            .to_path_buf();
+        let stub_dir = exe_dir.join(format!("{prefix}-bin"));
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::create_dir_all(&stub_dir).expect("create stub dir");
+        // A setpriv stand-in that echoes the variable; the child env is only
+        // loader-scrubbed in split mode, which the marker below pins without
+        // needing real privileges.
+        let stub = stub_dir.join("setpriv");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nprintf 'LD_PRELOAD=%s\\n' \"${LD_PRELOAD:-unset}\"\nprintf 'GCONV=%s\\n' \"${GCONV_PATH:-unset}\"\n",
+        )
+        .expect("write stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("make stub executable");
+
+        const CHILD_MARKER: &str = "PEBBLE_WI400_LD11_CHILD";
+        const TEST_PATH: &str = "executor::tests::split_mode_drops_task_supplied_loader_variables";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let exe = std::env::current_exe().expect("test binary path");
+            let out = std::process::Command::new(exe)
+                .args(["--exact", TEST_PATH, "--nocapture"])
+                .env(CHILD_MARKER, "1")
+                .env(
+                    "PATH",
+                    format!("{}:{}", stub_dir.display(), std::env::var("PATH").expect("PATH set")),
+                )
+                .env("PEBBLE_TASK_UID", "10004")
+                .env("PEBBLE_TASK_GID", "10004")
+                .output()
+                .expect("re-exec test binary");
+            let text = String::from_utf8_lossy(&out.stdout);
+            let stderr_text = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success(),
+                "child phase failed:\nstdout: {text}\nstderr: {stderr_text}"
+            );
+            assert!(
+                text.contains("test result: ok. 1 passed"),
+                "child phase ran no tests (drifted TEST_PATH?):\nstdout: {text}\nstderr: {stderr_text}"
+            );
+            std::fs::remove_dir_all(&root).ok();
+            std::fs::remove_dir_all(&stub_dir).ok();
+            return;
+        }
+
+        let config = ExecutorConfig {
+            pebble_bin: "pebble".to_string(),
+            model: "m".to_string(),
+            permission_mode: "danger-full-access".to_string(),
+            workspace_root: root.to_str().expect("utf-8 root").to_string(),
+        };
+        let mut req = request("loader drop", vec![]);
+        req.context.environment = HashMap::from([
+            ("LD_PRELOAD".to_string(), "/evil.so".to_string()),
+            ("GCONV_PATH".to_string(), "/evil".to_string()),
+        ]);
+        let child = spawn_pebble(&config, &req, None).expect("spawn setpriv stub");
+        let out = child.wait_with_output().await.expect("stub completes");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains("LD_PRELOAD=unset") && text.contains("GCONV=unset"),
+            "task-supplied loader variables reached the root-side drop process (WI#400 LD-11): {text}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&stub_dir).ok();
     }
 }
