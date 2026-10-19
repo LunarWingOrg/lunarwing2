@@ -491,6 +491,159 @@ HDR
   say "wrote $worker external-worker config to $config_path (ws://127.0.0.1:$wss_port/ws/agent)"
 }
 
+# ── Worker proxied-tool grant (WI#324, KL-15(a)) ──────────────────────────────
+#
+# The daemon's tool proxy is deny-by-default: a `[[sandbox.external_workers]]`
+# entry without `tool_allowlist` rejects every proxied `tool_call`. mt-admin
+# never rendered the key, so a rebuilt worker image alone yielded only denials
+# on multi-tenant hosts — the operator had no surface to make the explicit
+# grant the design requires. This helper is that surface: it writes (or
+# clears) the worker-level `tool_allowlist` for one already-provisioned
+# worker entry in the tenant's config.toml.
+#
+# Validation is deliberately narrow: only names inside the daemon's WI#324
+# phase-1 capability set (`PROXY_TOOL_ALLOWLIST` in
+# ic/src/orchestrator/external_worker.rs) are accepted. The manager drops any
+# other entry at load, so a broader grant would be a lying config — refuse it
+# here where the operator sees it, not as silent denials on a live worker.
+# Cron-mode workers are refused outright: their worker-level list is stripped
+# at load (MR !1549 EF-1, one container = one authority domain); tick
+# authority belongs to `cron.tool_allowlist`, which the daemon-side mission
+# configuration owns — not this command.
+
+# Mirrors PROXY_TOOL_ALLOWLIST (ic/src/orchestrator/external_worker.rs):
+# the positive phase-1 set plus the legacy gitlab spelling the daemon keeps.
+# Prefer gitlab_tool: it also resolves a tool registered as gitlab-tool.
+EXTERNAL_WORKER_PROXY_TOOLS="memory_read memory_write knowledge_search knowledge_submit_note knowledge_get_topic gitlab_tool gitlab-tool"
+
+set_external_worker_tool_allowlist() {  # <tenant> <worker> <csv|none>
+  local name="$1" worker="$2" tools_arg="$3"
+  local config_path staged_in staged_out awk_status tool joined tools_line
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  require_worker_name "$worker"
+
+  config_path="$(tenant_state_dir "$name")/config.toml"
+  [[ -f "$config_path" ]] \
+    || die "no tenant config at $config_path (provision the tenant first)"
+  grep -q "name = \"$worker\"" "$config_path" 2>/dev/null \
+    || die "external worker '$worker' is not configured in $config_path (enable the worker first)"
+
+  # A cron-mode entry never keeps a worker-level list; refuse the write rather
+  # than recording standing authority the manager strips at load.
+  if awk -v worker="$worker" '
+    /^\[\[sandbox\.external_workers\]\][[:space:]]*$/ { in_block = 1; target = 0; next }
+    /^\[/ { in_block = 0; next }
+    in_block && $0 == "name = \"" worker "\"" { target = 1 }
+    in_block && target && $0 ~ /^mode[[:space:]]*=[[:space:]]*"cron"/ { found = 1; exit }
+    END { exit found ? 0 : 1 }
+  ' "$config_path"; then
+    die "worker '$worker' is mode = \"cron\": its worker-level tool_allowlist is stripped at load; grant cron.tool_allowlist on the mission instead (MR !1549 EF-1)"
+  fi
+
+  local -a tools=()
+  if [[ "$tools_arg" != "none" ]]; then
+    IFS=',' read -r -a tools <<<"$tools_arg"
+    [[ "${#tools[@]}" -gt 0 && -n "${tools[0]}" ]] \
+      || die "configure-worker-tools: pass a comma-separated tool list or 'none'"
+    for tool in "${tools[@]}"; do
+      [[ " $EXTERNAL_WORKER_PROXY_TOOLS " == *" $tool "* ]] \
+        || die "tool '$tool' is outside the WI#324 phase-1 proxied set (allowed: $(echo "$EXTERNAL_WORKER_PROXY_TOOLS" | tr ' ' ','))"
+    done
+    local -a seen=()
+    for tool in "${tools[@]}"; do
+      [[ " ${seen[*]-} " != *" $tool "* ]] || die "duplicate tool '$tool' in the grant"
+      seen+=("$tool")
+    done
+    joined="$(printf '%s, ' "${tools[@]}")"
+    joined="${joined%, }"
+    tools_line="tool_allowlist = [\"$joined\"]"
+  fi
+
+  # WI#390: stage root-private outside the tenant-writable state dir (read as
+  # the tenant) and commit through the tenant-side atomic writer — same shape
+  # as upgrade_external_worker_auth_token.
+  staged_in="$(mktemp)" || return 2
+  if ! tenant_cat "$name" "$config_path" >"$staged_in"; then
+    rm -f -- "$staged_in"
+    return 2
+  fi
+  staged_out="$(mktemp)" || { rm -f -- "$staged_in"; return 2; }
+
+  if awk \
+    -v worker="$worker" \
+    -v want="${tools_line:-}" '
+      # Two-pass shape over the same file (pass 1 classifies, pass 2 emits):
+      # replacing or inserting the key in one pass risks a duplicate ahead of
+      # an existing entry, which TOML rejects as a repeated key.
+      FNR == NR {
+        if ($0 ~ /^\[\[sandbox\.external_workers\]\][[:space:]]*$/) {
+          in_block = 1; target = 0; next
+        }
+        if ($0 ~ /^\[/) { in_block = 0; target = 0; next }
+        if (in_block && $0 == "name = \"" worker "\"") { target = 1; next }
+        if (!(in_block && target)) next
+        if (want != "" && $0 == want) { satisfied = 1 }
+        if ($0 ~ /^tool_allowlist[[:space:]]*=/) { has_list = 1 }
+        next
+      }
+      {
+        if ($0 ~ /^\[\[sandbox\.external_workers\]\][[:space:]]*$/) {
+          in_block = 1; target = 0; print; next
+        }
+        if ($0 ~ /^\[/) { in_block = 0; target = 0; print; next }
+        if (in_block && $0 == "name = \"" worker "\"") { target = 1; print; next }
+        if (in_block && target) {
+          if ($0 ~ /^tool_allowlist[[:space:]]*=/) {
+            # Replace the first list line; heal a duplicated key by dropping
+            # later copies instead of emitting the key twice.
+            if (!replaced) {
+              replaced = 1; changed = 1
+              if (want != "") { print want }
+            }
+            next
+          }
+          if (want != "" && !has_list && $0 ~ /^(timeout_ms|url)[[:space:]]*=/) {
+            print
+            print want
+            changed = 1
+            next
+          }
+        }
+        print
+      }
+      END {
+        if (satisfied) exit 42
+        if (!has_list && want == "") exit 42
+        if (!changed) exit 43
+      }
+    ' "$staged_in" "$staged_in" >"$staged_out"; then
+    if ! write_tenant_file_atomic "$name" "$config_path" 600 owned-parent <"$staged_out"; then
+      rm -f -- "$staged_in" "$staged_out"
+      return 2
+    fi
+    rm -f -- "$staged_in" "$staged_out"
+    if [[ -n "$tools_line" ]]; then
+      say "proxied tool grant applied for '$worker' (${#tools[@]} tool(s)); restart the tenant daemon to load it (restart-tenant $name)"
+    else
+      say "proxied tool grant cleared for '$worker' (deny-by-default restored); restart the tenant daemon to load it (restart-tenant $name)"
+    fi
+    return 0
+  else
+    awk_status=$?
+    rm -f -- "$staged_in" "$staged_out"
+    if [[ "$awk_status" -eq 42 ]]; then
+      if [[ -n "$tools_line" ]]; then
+        say "worker '$worker' already carries exactly this tool_allowlist (no change)"
+      else
+        say "worker '$worker' carries no tool_allowlist (no change)"
+      fi
+      return 0
+    fi
+    return 2
+  fi
+}
+
 # Remove one external-worker array entry plus any nested child tables. Preserve
 # unrelated TOML text/comments, validate before and after, and retain one secure
 # rollback copy. Returns success when no Nanocode entry exists.
