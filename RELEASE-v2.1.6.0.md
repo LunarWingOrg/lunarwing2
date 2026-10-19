@@ -1,10 +1,10 @@
 # Release Notes for LunarWing v2.1.6.0
 
-**DRAFT — pre-release; content reflects the v2.1.6.0 tree as of 2026-10-18 and may grow before the tag is cut.**
+**DRAFT — pre-release; content reflects the v2.1.6.0 tree as of 2026-10-19 and may grow before the tag is cut.**
 
 ## Codename: Tsuno (角, つの): The Horns
 
-**Release date:** TBD (drafted 2026-10-16; refreshed 2026-10-18)
+**Release date:** TBD (drafted 2026-10-16; refreshed 2026-10-19)
 
 > Not raised in anger,
 > but set and sure all the same —
@@ -142,7 +142,7 @@ previous compatibility baseline.
   the host-side `mt-admin worker-listeners` audit — and opencode2 advances
   to **v2.0.32** under the maintainer-approved WI#427 (protected
   candidate/scan green; real jobs completed on the Gentoo/OpenRC tenants
-  soarin and scootaloo; WI#427 is still open).
+  soarin and scootaloo; WI#427 was closed on 2026-10-19).
 - **Credential echoes scrubbed in the sandbox proxy (WI#395).** Injected
   credentials can no longer ride back out through forwarded response
   headers (raw, form-encoded, re-encoded, or JSON-escaped spellings),
@@ -699,7 +699,7 @@ records the maintainer's explicit approval to advance opencode2 to
 approved while WI#369's SDK-gate blind spots were open; the WI#369 gates
 landed later in the cycle (see opencode2 SDK Surface Pinning) and passed
 the protected `worker-opencode2-candidate` and `worker-opencode2-scan` jobs
-on master pipeline 5984, and WI#369 itself is still open. A real job ran
+on master pipeline 5984, and WI#369 was closed on 2026-10-19. A real job ran
 end to end on the temporary systemd tenant spitfire (gateway chat → LLM
 loop →
 `create_job` → approval gate → resume → WS dispatch → the v2.0.32 executor)
@@ -713,7 +713,7 @@ protected `worker-opencode2-candidate` and `worker-opencode2-scan` jobs on
 master pipeline 5955, and the Gentoo/OpenRC rollout has since run:
 `restart-tenant soarin`/`restart-tenant scootaloo` recreated both containers
 on an image built from `01f3e69aa`, and real jobs completed on the v2.0.32
-executor on both tenants; WI#427 stays open for maintainer acceptance.
+executor on both tenants. WI#427 was closed on 2026-10-19.
 See `docs/ops/ITEM71_OPENCODE2_V2.0.32_PUBLIC_HTTPS_TUNNEL.md` for the
 security write-up of upstream's Public HTTPS Tunnel feature (architecture,
 threat model, control set, residual risks) and the v2.0.32 record in
@@ -916,7 +916,10 @@ untouched by the sweep, then upgraded separately for the rustls advisories
 with its Dockerfile digest refreshed. External worker pins: kimi-code
 advanced to 2.2.0; opencode v1.18.25 and the Pebble upstream ref are
 unchanged; opencode2 advances v2.0.24 → v2.0.32 per WI#427 (OpenTunnel
-compiled out; see Worker Exposure Policy).
+compiled out; see Worker Exposure Policy). All four worker Dockerfiles and
+the CI `CI_DEBIAN_SNAPSHOT` moved from the 20260906T000000Z to the
+20261017T082437Z Debian snapshot, which carries the Debian-fixed perl
+(WI#361).
 
 A crates.io mass-yank forced one late major bump (WI#417, closed
 2026-10-16): every `zip` release below 9.0.3 was yanked on 2026-10-16
@@ -992,9 +995,13 @@ are recorded in the audit doc's 2026-10-16 follow-up.
    WI#334, the WI#324 MCP shim registration
    (`PEBBLE_CONFIG_HOME=/etc/lunarwing/pebble`), and the reviewed-lock
    rustls
-   upgrade — opencode stays v1.18.25, while opencode2 advances to v2.0.32
-   under WI#427. Skipping those rebuilds leaves WI#357 undeployed and the
-   opencode and opencode2 tool proxies unsurfaced. Preserve
+   upgrade; all four images also move to the 20261017T082437Z Debian
+   snapshot, which ships the fixed perl for the three CVEs
+   `.gitlab/trivy-ignore` no longer suppresses (WI#361) — opencode stays
+   v1.18.25, while opencode2 advances to v2.0.32
+   under WI#427. Skipping those rebuilds leaves WI#357 undeployed, the
+   three WI#361 perl CVEs in the running images, and the opencode,
+   opencode2 and pebble tool proxies unsurfaced. Preserve
    opencode2 state before the first new-version boot: upstream migrates its
    database, so rolling back the image alone is not a verified rollback.
    kimi-code is upgraded to **2.2.0** (an earlier 2.2.0 image promoted
@@ -1092,10 +1099,15 @@ log enrichment surfaces its crash lines in job records, but the lane
 decision (bump or retire, planned for v2.1.7.0) is unchanged.
 
 **CI rate limits.** HTTP 429s from GitLab's registry auth (`/jwt/auth`)
-and from the `get_sources` repository fetch hit master pipelines:
+and from the `get_sources` repository fetch hit CI pipelines:
 worker-image pushes now retry the registry-auth 429 (up to four attempts,
 `.gitlab/scripts/build-worker-image.sh`), but `get_sources` 429s still
-need a manual job retry, and no work item owns the rate limits.
+need a manual job retry (most recently the `shellcheck` job on
+release-target pipeline 6002), and no work item owns the rate limits. The
+WI#375 DS-1 cron-bootstrap race tests also fail intermittently on loaded
+shared runners ("race window never hit within the time budget": the
+harness check, not the security assertion) and pass on retry; that flake
+is tracked as WI#444.
 
 **Accepted advisories.** Eight vulnerability advisories, two unsound
 notices, and two unmaintained notices (twelve IDs) ship accepted — see
@@ -1117,21 +1129,16 @@ release; WI#363, the CI guard that would require one, is still open.
 **Known issues / open at release.** Reconciled per item in
 `docs/ops/v2.1.6.0_OPEN_WORK_ITEMS_STATUS.md`, a 2026-10-14 01:05Z snapshot
 (work items filed after it, WI#402 and later, postdate the audit), and
-re-checked against the tracker on 2026-10-18. Open at release: WI#397
+re-checked against the tracker on 2026-10-19. Open at release: WI#397
 (`high` — sb&kumo findings); WI#324 (real-worker acceptance evidence for
 every lane once the worker images are rebuilt and a worker `tool_allowlist`
-is configured, plus the mt-admin `tool_allowlist` render gap); WI#427 (the
-opencode2 v2.0.32 bump: Gentoo/OpenRC rollout evidence is recorded for
-soarin and scootaloo, and the item awaits maintainer acceptance); WI#422
+is configured, plus the mt-admin `tool_allowlist` render gap); WI#422
 (security: on rootful hosts the pebble bind source is re-resolved at every
 container start, so a tenant symlink swap can redirect host-root writes);
 WI#423 (security: mt-admin's remaining root reads/writes of
 tenant-writable env paths); WI#389 (security: both onboarding paths add
 the tenant user to the container runtime's group by default, which is
-root-equivalent on Docker hosts); WI#361 (the worker-image Trivy gate:
-fixed, and the protected candidate/scan and rebuilt-image SBOM evidence
-exists on master pipeline 6007; the item awaits maintainer acceptance);
-WI#388 (the fleet-wide OpenRC proxy-unit neutralization for WI#376,
+root-equivalent on Docker hosts); WI#388 (the fleet-wide OpenRC proxy-unit neutralization for WI#376,
 Upgrade Note 2, is still an open rollout item); WI#429 (the sandbox
 proxy's empty-body over-refusal) and WI#430 (the WASM tool wrapper's
 retained-framing gap); WI#363 (the `ic/deny.toml` open-owner guard — see
@@ -1142,7 +1149,7 @@ four WI#408 channel-host residuals), all three planned for v2.1.7.0; and
 WI#436 (v2.1.7.0 triage of the test-tenant failures — its first item, one
 failing note failing every hourly knowledge refresh and leaving
 `knowledge: critical`, is live in this release). The residual owners named
-in the sections above (WI#322, WI#333, WI#369, WI#370, WI#383, WI#386,
+in the sections above (WI#322, WI#333, WI#370, WI#383, WI#386,
 WI#387, WI#394) are open too, and WI#400 tracks real worker credential
 isolation beyond the WI#373 hygiene strips. Filed late and planned for
 v2.1.7.0, but live in this release: WI#440 (`generate_token` falls back to
@@ -1168,7 +1175,16 @@ the `add-tenant` re-run `chmod 0700` of the tenant env directory, and the
 study-seed root `mktemp -d` unconverted; and WI#438 with the standalone
 TensorZero proxies under `tensorzero-proxy-configurations/` still
 defaulting to developer-LAN endpoints (no shipped path uses those
-defaults: mt-admin's proxy units pass the upstream explicitly).
+defaults: mt-admin's proxy units pass the upstream explicitly). WI#369
+(the opencode2 SDK-surface gate blind spots; the widened gates are
+described under opencode2 SDK Surface Pinning), WI#427 (the opencode2
+v2.0.32 bump; its Gentoo/OpenRC rollout is recorded under Worker Exposure
+Policy), and WI#361 (the worker-image Trivy gate: `.gitlab/trivy-ignore`
+now uses Trivy's `exp:` expiry syntax, enforced by the `ci-config`
+validator, the three Debian-fixed perl CVEs are no longer suppressed, and
+all four worker images moved to the 20261017T082437Z Debian snapshot; the
+rebuilt images' SBOMs on master pipeline 6007 show the fixed perl) were
+closed on 2026-10-19, without notes.
 
 **Deployment boundaries.** The onboarding web app remains a trusted local
 console without user accounts or TLS: retain loopback binding and use an
