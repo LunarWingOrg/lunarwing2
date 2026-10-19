@@ -1235,9 +1235,9 @@ start_tenant_opencode() {
   image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
     lunarwing-worker-opencode:latest 2>/dev/null || true)"
   case "$image_user" in
-    "$OPENCODE_CONTAINER_UID"|"$OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID") ;;
+    "0:0"|"0") ;;
     *)
-      die "opencode worker image has user '${image_user:-unset}', expected $OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID; rebuild it"
+      die "opencode worker image has user '${image_user:-unset}', expected 0:0 (WI#400 root entrypoint; serve/tasks drop to $OPENCODE_CONTAINER_UID); rebuild it"
       ;;
   esac
 
@@ -1448,9 +1448,9 @@ start_tenant_opencode2() {
   image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
     lunarwing-worker-opencode2:latest 2>/dev/null || true)"
   case "$image_user" in
-    "$OPENCODE2_CONTAINER_UID"|"$OPENCODE2_CONTAINER_UID:$OPENCODE2_CONTAINER_GID") ;;
+    "0:0"|"0") ;;
     *)
-      die "opencode2 worker image has user '${image_user:-unset}', expected $OPENCODE2_CONTAINER_UID:$OPENCODE2_CONTAINER_GID; rebuild it"
+      die "opencode2 worker image has user '${image_user:-unset}', expected 0:0 (WI#400 root entrypoint; serve/tasks drop to $OPENCODE2_CONTAINER_UID); rebuild it"
       ;;
   esac
 
@@ -1676,6 +1676,13 @@ prepare_pebble_workspace() {  # <tenant> — prints the workspace dir
   # chmod as the tenant: chmod follows symlinks, and root has no business
   # touching a mode under a tenant-writable parent (WI#390).
   tenant_chmod "$name" 0700 "$workspace_dir" || return 1
+  if [[ "$MT_ROOTLESS" != "true" ]]; then
+    # Rootful runtime: no keep-id, so the in-container task uid
+    # (PEBBLE_CONTAINER_UID, WI#400) is a bare host uid and the workspace
+    # must carry it. -h keeps chown from ever dereferencing a planted
+    # symlink during the recursive pass.
+    chown -R -h "${PEBBLE_CONTAINER_UID}:${PEBBLE_CONTAINER_GID}" "$workspace_dir" || return 1
+  fi
   printf '%s\n' "$workspace_dir"
 }
 
@@ -1796,9 +1803,9 @@ start_tenant_kimi() {
   image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
     lunarwing-worker-kimi:latest 2>/dev/null || true)"
   case "$image_user" in
-    "$KIMI_CONTAINER_UID"|"$KIMI_CONTAINER_UID:$KIMI_CONTAINER_GID") ;;
+    "0:0"|"0") ;;
     *)
-      die "kimi worker image has user '${image_user:-unset}', expected $KIMI_CONTAINER_UID:$KIMI_CONTAINER_GID; rebuild it"
+      die "kimi worker image has user '${image_user:-unset}', expected 0:0 (WI#400 root entrypoint; tasks drop to $KIMI_CONTAINER_UID); rebuild it"
       ;;
   esac
 
@@ -2056,9 +2063,16 @@ start_tenant_pebble() {
     local ssh_agent_dir
     ssh_agent_dir="$(tenant_run_dir "$name")/ssh-agent"
     ssh_mount=(-v "${ssh_agent_dir}:/tmp/ssh-agent:ro,z" -e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock)
+    # WI#400: keep-id binds the in-container task uid to the tenant account
+    # (bridge stays container root; tasks drop via setpriv).
+    local -a pebble_userns_args=()
+    if [[ "$CONTAINER_RT" == "podman" && "$MT_ROOTLESS" == "true" ]]; then
+      pebble_userns_args=(--userns "$PEBBLE_USERNS")
+    fi
     _ctr "$name" run -d \
       --name "$container_name" \
       "${healthcheck_args[@]}" \
+      "${pebble_userns_args[@]}" \
       -e LUNARWING_WORKER_ID="worker-pebble-${name}" \
       -e WS_PORT="$wss_port" \
       -e HEALTH_PORT="8443" \

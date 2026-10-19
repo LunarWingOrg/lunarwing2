@@ -123,8 +123,10 @@ base_contract() {  # <worker>: the rootless-podman base contract the lane uses
   esac
 }
 image_user_for() {  # <worker>: what the lane's image-user guard expects
-  local uid_var="${1^^}_CONTAINER_UID" gid_var="${1^^}_CONTAINER_GID"
-  printf '%s:%s' "${!uid_var:-}" "${!gid_var:-}"
+  # WI#400: the guarded lanes (kimi/opencode/opencode2) expect the root
+  # entrypoint user; the pebble lane has no image-user guard, so any value
+  # passes it.
+  printf '0:0'
 }
 use_init() {  # <systemd|openrc>
   local init="$1"
