@@ -23,6 +23,15 @@ ports_get() {
 generate_token() { printf '%s\n' "$fixture_token"; }
 sleep() { :; }
 say() { printf '%s\n' "$*" >>"$fixture_dir/messages.log"; }
+# WI#423 (run-166 LF-4): the upload now reads SSH_API_TOKEN through the
+# tenant-side per-key reader, which drops privileges with sudo -u <tenant>.
+# The fixture tenant is not a real account (and CI runs no-new-privileges), so
+# map the drop onto the invoking user — the fixture env dir is 0700 and the env
+# 0600, both owned by that user, satisfying every tenant-side check.
+sudo() {
+  if [[ "${1:-}" == "-u" ]]; then shift 2; fi
+  command "$@"
+}
 
 curl() {
   local args="$*" config_fd="" arg
@@ -93,6 +102,7 @@ assert_not_contains() {
 env_path="$fixture_dir/env/lunarwing.env"
 staged_key="$fixture_dir/env/ssh_key_staged"
 mkdir -p "$fixture_dir/env"
+chmod 700 "$fixture_dir/env"
 
 printf 'GATEWAY_AUTH_TOKEN=preserved\n' >"$env_path"
 chmod 0640 "$env_path"
@@ -106,6 +116,9 @@ ensure_ssh_api_token fixture
 assert_eq 'existing final token is preserved' "$(_read_env_value "$env_path" SSH_API_TOKEN)" 'existing-token'
 assert_eq 'existing token is not duplicated' "$(grep -c '^SSH_API_TOKEN=' "$env_path")" '2'
 
+# WI#423: the upload's tenant-side reader demands the production shape
+# (0600 env inside the 0700 dir) before the upload section runs.
+chmod 0600 "$env_path"
 _env_set "$env_path" SSH_API_TOKEN "$fixture_token"
 printf '%s\n' "$fixture_key" >"$staged_key"
 chmod 0600 "$staged_key"
@@ -153,6 +166,35 @@ assert_eq 'missing token fails closed' "$rv" '1'
 assert_file_absent 'missing token performs no readiness request' "$fixture_dir/readiness.args"
 assert_file_absent 'missing token performs no upload request' "$fixture_dir/upload.args"
 assert_file_exists 'missing token retains staged key' "$staged_key"
+
+# WI#423 (run-166 LF-4): the upload bearer must come from the tenant-side
+# reader — a lunarwing.env symlinked at a foreign env used to be read as root,
+# handing the OTHER file's SSH_API_TOKEN to this tenant's loopback gateway as
+# the bearer. The tenant-side reader refuses the symlinked path; the upload
+# fails closed, nothing is sent, and the staged key waits for the next pass.
+lf4_victim="$fixture_dir/lf4-victim.env"
+printf 'SSH_API_TOKEN=foreign-tenant-bearer\n' >"$lf4_victim"
+chmod 0600 "$lf4_victim"
+lf4_victim_before="$(cat "$lf4_victim")"
+mv "$env_path" "$fixture_dir/lf4-real.env"
+ln -s "$lf4_victim" "$env_path"
+rm -f "$fixture_dir/readiness.args" "$fixture_dir/upload.args" "$fixture_dir/messages.log"
+printf '%s\n' "$fixture_key" >"$staged_key"
+rv=0
+upload_tenant_ssh_key fixture || rv=$?
+assert_eq 'symlinked env fails closed' "$rv" '1'
+if grep -q 'could not safely read SSH_API_TOKEN' "$fixture_dir/messages.log" 2>/dev/null; then
+  printf 'PASS: symlink refusal names the unreadable credential\n'
+else
+  printf 'FAIL: symlink refusal does not name the unreadable credential\n'
+  failures=$((failures + 1))
+fi
+assert_file_absent 'symlinked env performs no readiness request' "$fixture_dir/readiness.args"
+assert_file_absent 'symlinked env performs no upload request' "$fixture_dir/upload.args"
+assert_file_exists 'symlinked env retains staged key' "$staged_key"
+assert_eq 'symlink refusal leaves the foreign env untouched' "$(cat "$lf4_victim")" "$lf4_victim_before"
+rm -f "$env_path"
+mv "$fixture_dir/lf4-real.env" "$env_path"
 
 if [[ "$failures" -ne 0 ]]; then
   printf 'RESULT: %d failure(s)\n' "$failures"
