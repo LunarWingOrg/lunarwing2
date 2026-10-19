@@ -137,6 +137,14 @@ tool_allowlist = ["memory_read", "memory_write", "knowledge_search",
 ```
 
 - Empty or absent (the default) rejects **every** `tool_call`.
+- On multi-tenant hosts the operator surface is
+  `lunarwing-mt-admin.sh configure-worker-tools <tenant> <worker> <tools|none>`:
+  it writes (or clears) the worker-level key in the tenant's `config.toml`,
+  accepts only names inside the phase-1 set below (a grant the daemon would
+  strip at load is refused there, not silently deny-only), refuses
+  `mode = "cron"` entries (their worker-level list is stripped at load — the
+  tick authority is `cron.tool_allowlist`), and requires a tenant-daemon
+  restart to take effect.
 - Exact tool names only. **There is no `"*"` wildcard** (MR !1506 CQ-1): a
   wildcard on an untrusted container is a full tenant-admin grant.
 - At manager load the allowlist is sanitized, with each dropped entry logged:
@@ -692,9 +700,11 @@ mock sockets with real memory tools; worker-side evidence uses a mock CLI
 against the real bridge/relay) and AC2 (`knowledge_search` real hits
 through the proxy). Both need a rebuilt kimi worker image and a live
 tenant, which is the protected-pipeline/deploy gate, not an MR-pipeline
-lane — and a rebuilt image alone yields only denials, because mt-admin
-never renders a worker `tool_allowlist` into tenant config, so the tenant
-must also be configured with the grant. The opencode, opencode2 and pebble
+lane. The mt-admin render gap (KL-15(a)) is closed: `configure-worker-tools`
+writes the worker-level `tool_allowlist` into tenant config, so a live
+tenant can carry the grant before the acceptance run — the remaining need
+is the rebuilt images plus that explicit per-worker grant. The opencode,
+opencode2 and pebble
 lanes additionally need their rebuilt images so the plugin/shim
 registration ships in the image. WI#324 stays
 open until those land.

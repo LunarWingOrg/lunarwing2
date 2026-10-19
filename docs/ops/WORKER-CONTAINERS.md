@@ -98,8 +98,12 @@ translates MCP `tools/list` / `tools/call` into `tool_list` / `tool_call`
 frames on the existing hub WebSocket. Tools appear to the agent as
 `mcp__lunarwing__<name>`; the hub stays deny-by-default until the worker's
 `tool_allowlist` (or `cron.tool_allowlist` for tick jobs — MR !1506 CQ-10)
-grants phase-1 names. `LUNARWING_TOOL_PROXY_TIMEOUT_MS` bounds one proxied
-call (default 300000, capped 900000).
+grants phase-1 names. On multi-tenant hosts the grant is rendered by
+`lunarwing-mt-admin.sh configure-worker-tools <tenant> <worker> <tools|none>`
+(it validates against the daemon's phase-1 set, refuses `mode = "cron"`
+entries, and needs `restart-tenant` to load; editing `config.toml` by hand
+works on single-node installs). `LUNARWING_TOOL_PROXY_TIMEOUT_MS` bounds one
+proxied call (default 300000, capped 900000).
 
 The opencode worker image ships the same relay in its
 `scripts/lunarwing_bridge.ts`, but the in-task half is an opencode plugin
