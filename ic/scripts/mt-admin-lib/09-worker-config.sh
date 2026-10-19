@@ -2076,6 +2076,9 @@ start_tenant_pebble() {
     # the toolchain caches are anchored inside the tenant-owned /workspace
     # mount — login shells pick the same values up through the image's
     # /etc/profile.d/toolchain snippet, which defers to preset env.
+    # no-new-privileges (run-167 LH-2): the image ships Debian's standard
+    # setuid set; once the container is non-root, closing the setuid/file-cap
+    # route back to container root is what makes the uid drop one-way.
     local -a pebble_user_args=()
     if [[ "$MT_ROOTLESS" != "true" ]]; then
       local pebble_tenant_uid pebble_tenant_gid
@@ -2085,6 +2088,7 @@ start_tenant_pebble() {
         || die "cannot resolve gid for tenant '$name' (rootful pebble launch)"
       pebble_user_args=(
         --user "${pebble_tenant_uid}:${pebble_tenant_gid}"
+        --security-opt no-new-privileges
         -e HOME=/workspace
         -e GOPATH=/workspace/go
         -e GOCACHE=/workspace/.cache/go-build
