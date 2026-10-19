@@ -80,20 +80,23 @@ pub struct BridgeConfig {
 type Outbound = mpsc::UnboundedSender<Message>;
 
 impl BridgeConfig {
-    pub fn from_env() -> Self {
-        Self {
+    pub fn from_env() -> Result<Self, String> {
+        Ok(Self {
             bind_host: env_or("WS_BIND_HOST", "0.0.0.0"),
             ws_port: env_or("WS_PORT", "9090").parse().unwrap_or(9090),
             ws_path: env_or("WS_PATH", "/ws/agent"),
             health_port: env_or("HEALTH_PORT", "8443").parse().unwrap_or(8443),
-            auth_token: read_bridge_auth_token(),
+            auth_token: resolve_bridge_auth_token(
+                std::env::var_os("AGENT_AUTH_TOKEN_FILE"),
+                std::env::var("AGENT_AUTH_TOKEN").ok(),
+            )?,
             worker_id: env_or("LUNARWING_WORKER_ID", "worker-pebble-01"),
             pebble_bin: env_or("PEBBLE_BIN", "pebble"),
             model: env_or("PEBBLE_MODEL", "openai/gpt-5.2"),
             permission_mode: env_or("PEBBLE_PERMISSION_MODE", "danger-full-access"),
             workspace_root: env_or("WORKSPACE_ROOT", "/workspace"),
             tool_proxy_dir: tool_proxy::tool_proxy_dir(),
-        }
+        })
     }
 }
 
@@ -106,28 +109,31 @@ fn env_or(key: &str, default: &str) -> String {
 /// (`AGENT_AUTH_TOKEN_FILE`) before spawning the bridge, so no long-lived
 /// process a task can inspect carries it in its environ. The env var stays
 /// as a fallback for dev launches that inject the token directly.
-fn read_bridge_auth_token() -> Option<String> {
-    if let Some(path) = std::env::var_os("AGENT_AUTH_TOKEN_FILE") {
-        match std::fs::read_to_string(&path) {
-            Ok(contents) => {
-                let token = contents.trim_end_matches(['\r', '\n']).to_string();
-                if !token.is_empty() {
-                    return Some(token);
-                }
-                eprintln!(
-                    "[bridge] AGENT_AUTH_TOKEN_FILE {} is empty",
-                    path.to_string_lossy()
-                );
-            }
-            Err(e) => eprintln!(
-                "[bridge] cannot read AGENT_AUTH_TOKEN_FILE {}: {e}",
-                path.to_string_lossy()
-            ),
+///
+/// KW-8/LD-10: with the file pointer set, a failed or empty read is a
+/// STARTUP ERROR — the entrypoint has already unset `AGENT_AUTH_TOKEN`, so
+/// falling back would silently start with no bearer check
+/// (`auth = disabled`). Inputs are arguments so the policy is testable
+/// without touching the process environment.
+fn resolve_bridge_auth_token(
+    token_file: Option<std::ffi::OsString>,
+    env_token: Option<String>,
+) -> Result<Option<String>, String> {
+    if let Some(path) = token_file {
+        let shown = path.to_string_lossy().into_owned();
+        let contents = std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read AGENT_AUTH_TOKEN_FILE {shown}: {e}"))?;
+        // Trim trailing CR/LF only (byte values 13 and 10) — the token
+        // itself may contain any other whitespace.
+        let token = contents
+            .trim_end_matches(|c: char| c == char::from(13u8) || c == char::from(10u8))
+            .to_string();
+        if token.is_empty() {
+            return Err(format!("AGENT_AUTH_TOKEN_FILE {shown} holds no token"));
         }
+        return Ok(Some(token));
     }
-    std::env::var("AGENT_AUTH_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
+    Ok(env_token.filter(|t| !t.is_empty()))
 }
 
 pub async fn run(
@@ -498,6 +504,92 @@ fn send_result(out_tx: &Outbound, envelope: &Envelope) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KW-8/LD-10: the hub-handshake credential resolves fail-closed. The
+    /// file wins over the env var, only a trailing CR/LF is trimmed, an
+    /// empty/newline-only/missing file is a startup error (never a silent
+    /// fallback to the already-unset env, which would disable the bearer
+    /// check), and with no file pointer the dev env fallback still works.
+    #[test]
+    fn bridge_auth_token_file_is_preferred_and_fails_closed() {
+        let dir = std::env::temp_dir().join(format!(
+            "pb-ld10-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+
+        let good = dir.join("good");
+        std::fs::write(&good, "file-token\n").expect("write token file");
+        // The file wins over a populated env var.
+        assert_eq!(
+            resolve_bridge_auth_token(
+                Some(good.clone().into_os_string()),
+                Some("env-token".to_string()),
+            )
+            .expect("file read"),
+            Some("file-token".to_string())
+        );
+        // Only trailing CR/LF is trimmed; interior and other whitespace
+        // survives (the token itself may contain spaces).
+        let crlf = dir.join("crlf");
+        std::fs::write(&crlf, "tok\r\n\n").expect("write crlf token");
+        assert_eq!(
+            resolve_bridge_auth_token(Some(crlf.into_os_string()), None)
+                .expect("trimmed read"),
+            Some("tok".to_string())
+        );
+        let interior = dir.join("interior");
+        std::fs::write(&interior, "a b\tc\n").expect("write interior token");
+        assert_eq!(
+            resolve_bridge_auth_token(Some(interior.into_os_string()), None)
+                .expect("interior whitespace kept"),
+            Some("a b\tc".to_string())
+        );
+
+        // An empty or newline-only file is an error.
+        let empty = dir.join("empty");
+        std::fs::write(&empty, "").expect("write empty file");
+        let error = resolve_bridge_auth_token(Some(empty.into_os_string()), Some("env".into()))
+            .expect_err("empty file must fail");
+        assert!(error.contains("holds no token"), "unexpected error: {error}");
+        let newline = dir.join("newline");
+        std::fs::write(&newline, "\r\n\n").expect("write newline-only file");
+        assert!(resolve_bridge_auth_token(Some(newline.into_os_string()), None).is_err());
+
+        // A missing file is an error even with the env fallback populated.
+        let missing = dir.join("missing");
+        let error = resolve_bridge_auth_token(
+            Some(missing.into_os_string()),
+            Some("env-token".to_string()),
+        )
+        .expect_err("unreadable file must fail");
+        assert!(
+            error.contains("cannot read AGENT_AUTH_TOKEN_FILE"),
+            "error names the file pointer: {error}"
+        );
+
+        // With no file pointer, the dev env fallback still works (and an
+        // empty env var means no auth, as before).
+        assert_eq!(
+            resolve_bridge_auth_token(None, Some("env-token".to_string()))
+                .expect("env fallback"),
+            Some("env-token".to_string())
+        );
+        assert_eq!(
+            resolve_bridge_auth_token(None, Some(String::new())).expect("empty env"),
+            None
+        );
+        assert_eq!(
+            resolve_bridge_auth_token(None, None).expect("nothing set"),
+            None
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[tokio::test]
     async fn registry_rejects_overlapping_workspaces_and_frees_on_unregister() {
