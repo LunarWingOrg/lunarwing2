@@ -695,8 +695,9 @@ records the maintainer's explicit approval to advance opencode2 to
 approved while WI#369's SDK-gate blind spots were open; the WI#369 gates
 landed later in the cycle (see opencode2 SDK Surface Pinning) and passed
 the protected `worker-opencode2-candidate` and `worker-opencode2-scan` jobs
-on master pipeline 5984, and WI#369 itself is still open. A real job ran end to end
-on the temporary systemd tenant spitfire (gateway chat → LLM loop →
+on master pipeline 5984, and WI#369 itself is still open. A real job ran
+end to end on the temporary systemd tenant spitfire (gateway chat → LLM
+loop →
 `create_job` → approval gate → resume → WS dispatch → the v2.0.32 executor)
 to a normal completion, with pre/post exposure checks clean (`service.json`
 disabled, no OpenTunnel identity dir, the wrapper refusing
