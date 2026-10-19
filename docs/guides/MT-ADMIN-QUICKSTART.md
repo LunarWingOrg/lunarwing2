@@ -77,12 +77,15 @@ Do not install Python packages into an externally managed system interpreter wit
 Run the script from the checkout and branch that the tenant should follow:
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --docker-group
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles
 ```
 
 Useful opt-ins and opt-outs include:
 
 ```bash
+# Add the tenant user to the docker/podman group (explicit opt-in — see note)
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --docker-group
+
 # Enable the per-tenant TensorZero proxy (upstream is REQUIRED — see below)
 sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --enable-proxy \
   --tensorzero-url https://tensorzero.internal.example:7070
@@ -97,6 +100,13 @@ sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --with-study-mcp
 # Skip automatic WeeChat relay bootstrap
 sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --no-weechat-bootstrap
 ```
+
+`--docker-group` exists for one case only: a tenant that must reach a shared
+**rootful** container daemon socket (for example a root Docker daemon's
+`/var/run/docker.sock` — access to an unrestricted root-run daemon is
+host-equivalent, so it is never added by default). Rootless podman, the
+multi-tenant default runtime, needs no group membership at all; sandbox and
+worker containers run fine without it.
 
 Since v2.1.6.0 (WI#330) `add-tenant` requires an explicit tenant LLM endpoint
 and there is **no built-in default**: pass `--tensorzero-url <url>` (or set the

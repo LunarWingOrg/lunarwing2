@@ -45,7 +45,9 @@ class TenantConfig:
     name: str = ""
     gateway_host: str = "127.0.0.1"
     gateway_port: int = 0
-    docker_group: bool = True
+    # WI#389: rootless podman (the MT default runtime) needs no group
+    # membership, so opting in must be a deliberate choice, never the default.
+    docker_group: bool = False
     enable_darkirc: bool = False
     xmpp_enabled: bool = False
     xmpp_jid: str = ""
@@ -117,7 +119,7 @@ class TenantConfig:
             name=data.get("name", ""),
             gateway_host=data.get("gateway_host", "127.0.0.1"),
             gateway_port=data.get("gateway_port", 0),
-            docker_group=data.get("docker_group", True),
+            docker_group=data.get("docker_group", False),
             enable_darkirc=data.get("enable_darkirc", False),
             xmpp_enabled=data.get("xmpp_enabled", False),
             xmpp_jid=data.get("xmpp_jid", ""),

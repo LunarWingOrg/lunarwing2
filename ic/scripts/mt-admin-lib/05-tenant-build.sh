@@ -206,7 +206,10 @@ create_tenant_user() {
     local group_name="$CONTAINER_RT"
     if getent group "$group_name" >/dev/null 2>&1; then
       usermod -aG "$group_name" "$name"
-      say "added $name to $group_name group"
+      # WI#389: rootless podman needs no group membership — this opt-in only
+      # matters when the tenant must reach a shared rootful daemon socket
+      # (access to an unrestricted root-run daemon is host-equivalent).
+      say "added $name to $group_name group (not needed for rootless podman; only for shared rootful daemon access)"
     else
       say "WARNING: group '$group_name' does not exist; skipping"
     fi
