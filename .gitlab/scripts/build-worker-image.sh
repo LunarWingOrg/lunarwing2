@@ -25,6 +25,7 @@ case "$1" in
         # whole bridge src tree; the runtime stage COPYs entrypoint.sh and
         # the WI#324 MCP registration config.
         input_files='pebble4lunarwing/Dockerfile
+pebble4lunarwing/Cargo.toml
 pebble4lunarwing/Cargo.lock
 pebble4lunarwing/entrypoint.sh
 pebble4lunarwing/config/settings.json
