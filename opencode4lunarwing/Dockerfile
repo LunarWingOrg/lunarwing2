@@ -221,9 +221,11 @@ WORKDIR /app
 COPY --from=builder /out/bin/opencode /usr/local/bin/opencode
 COPY --from=builder /out/sdk /app/node_modules/@opencode-ai/sdk
 
-COPY --chown=opencode:opencode entrypoint.sh entrypoint-task-setup.sh health_server.py agent_comm_protocol.json ./
-COPY --chown=opencode:opencode scripts/ ./scripts/
-COPY --chown=opencode:opencode config/ ./config/
+# WI#400 LD-2: /app files stay root-owned — container root executes these,
+# so they must not be writable by the task uid the bridge drops to.
+COPY entrypoint.sh entrypoint-task-setup.sh health_server.py agent_comm_protocol.json ./
+COPY scripts/ ./scripts/
+COPY config/ ./config/
 
 RUN chmod +x /app/entrypoint.sh /app/entrypoint-task-setup.sh /app/health_server.py \
     && command -v setpriv >/dev/null

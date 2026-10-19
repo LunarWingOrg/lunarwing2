@@ -13,6 +13,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# mt-admin redefines SCRIPT_DIR when sourced below, so capture the repo root
+# (this file lives at <repo>/ic/scripts/tests/) before that happens.
+HARNESS_REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 MT_ADMIN="$SCRIPT_DIR/../lunarwing-mt-admin.sh"
 # shellcheck source=../lunarwing-mt-admin.sh
 source "$MT_ADMIN"
@@ -233,6 +236,29 @@ quadlet_scenario() {  # <worker>
 }
 for worker in kimi opencode opencode2 pebble; do
   quadlet_scenario "$worker"
+done
+
+# ── WI#400 LD-2: /app files must stay root-owned in the USER 0:0 lanes ───────
+# Container root executes the /app entrypoint, scripts and config, so files
+# the task uid can rewrite would run task-authored code as root on the next
+# container start (restart policy, daemon restart, health restart). A
+# COPY --chown=<task user> hands the tree over at build time — refuse it.
+for lane in kimicode4lunarwing opencode4lunarwing; do
+  dockerfile="$HARNESS_REPO_ROOT/$lane/Dockerfile"
+  if [[ ! -f "$dockerfile" ]]; then
+    fail "$lane Dockerfile missing (WI#400 LD-2 pin)"
+    continue
+  fi
+  if grep -Eq '^COPY --chown=' "$dockerfile"; then
+    fail "$lane: COPY --chown hands /app files to the task uid (WI#400 LD-2)"
+  else
+    pass "$lane: COPYed /app files stay root-owned (WI#400 LD-2)"
+  fi
+  if grep -Eq '^USER 0:0[[:space:]]*$' "$dockerfile"; then
+    pass "$lane: Dockerfile pins the root bridge user (WI#400)"
+  else
+    fail "$lane: Dockerfile must set USER 0:0 for the root bridge (WI#400)"
+  fi
 done
 
 # ── SOURCE_REVISION stamping ─────────────────────────────────────────────────

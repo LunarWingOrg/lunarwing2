@@ -197,9 +197,11 @@ RUN groupadd --gid 10002 kimi \
 WORKDIR /app
 
 COPY --from=builder /build/scripts/ /app/scripts/
-COPY --chown=kimi:kimi entrypoint.sh entrypoint-task-setup.sh health_server.py agent_comm_protocol.json ./
-COPY --chown=kimi:kimi config/ ./config/
-COPY --chown=kimi:kimi hooks/ ./hooks/
+# WI#400 LD-2: /app files stay root-owned — container root executes these,
+# so they must not be writable by the task uid the bridge drops to.
+COPY entrypoint.sh entrypoint-task-setup.sh health_server.py agent_comm_protocol.json ./
+COPY config/ ./config/
+COPY hooks/ ./hooks/
 
 RUN chmod +x /app/entrypoint.sh /app/entrypoint-task-setup.sh /app/health_server.py \
     && command -v setpriv >/dev/null
