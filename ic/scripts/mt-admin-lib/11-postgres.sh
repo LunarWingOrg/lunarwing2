@@ -138,10 +138,18 @@ start_tenant_postgres() {
     # the per-tenant secret never lands on the container-runtime argv (readable in
     # /proc/<pid>/cmdline by other local users). Removed right after creation; the
     # Quadlet path keeps it in its own 0600 unit file for the same reason.
-    local pg_init_env
+    local pg_init_env pg_init_pw
     pg_init_env="$(tenant_env_dir "$name")/.pg-init.env"
-    ( umask 077; printf 'POSTGRES_PASSWORD=%s\n' "$(tenant_pg_password "$name")" >"$pg_init_env" )
-    chown "$name:$name" "$pg_init_env" 2>/dev/null || true
+    # WI#423 (run-166 LF-5): this was the last root `umask 077; printf >` plus
+    # root `chown` inside the tenant-writable env dir — a pre-placed symlink
+    # at .pg-init.env redirected both. Resolve the password fail-closed and
+    # commit through the tenant-side atomic writer, exactly like pg.secret.
+    if ! pg_init_pw="$(tenant_pg_password "$name")"; then
+      die "could not resolve the PostgreSQL password for tenant '$name'"
+    fi
+    if ! write_tenant_file_atomic "$name" "$pg_init_env" 600 <<<"POSTGRES_PASSWORD=$pg_init_pw"; then
+      die "could not safely write $pg_init_env as tenant '$name'"
+    fi
     # O2: don't let a pg CREATE failure abort the whole provision (set -e). The F2
     # gate already downgrades a slow-readiness race to warn+continue; mirror that
     # for the create call (and the start above) so a transient runtime hiccup
