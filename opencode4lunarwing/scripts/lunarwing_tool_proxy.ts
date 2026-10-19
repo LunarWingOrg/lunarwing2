@@ -32,10 +32,11 @@
  */
 
 import { createServer, type Server, type Socket } from "node:net"
-import { mkdirSync, rmSync } from "node:fs"
+import { chownSync, mkdirSync, rmSync } from "node:fs"
 import { createHash } from "node:crypto"
 import { dirname, join } from "node:path"
 
+import { taskIdentity, type TaskIdentity } from "./task_identity.js"
 import {
   createEnvelope,
   isRecord,
@@ -139,6 +140,34 @@ export class ToolProxyRelay {
     })
     if (!started) return null
     this.tasks.set(taskId, task)
+    // WI#400: the bridge runs as container root, so the dir (0700) and the
+    // socket are root-owned and the task uid could neither traverse nor
+    // connect. Hand both to the pinned task identity; root keeps full
+    // access via DAC override, and no third uid can reach the socket.
+    let identity: TaskIdentity | null = null
+    try {
+      identity = taskIdentity()
+    } catch (err) {
+      console.error(
+        `[tool-proxy] task ${taskId}: task identity error (task runs without tools):`,
+        err instanceof Error ? err.message : err,
+      )
+      this.closeTask(taskId)
+      return null
+    }
+    if (identity && typeof process.getuid === "function" && process.getuid() === 0) {
+      try {
+        chownSync(socketPath, identity.uid, identity.gid)
+        chownSync(dirname(socketPath), identity.uid, identity.gid)
+      } catch (err) {
+        console.error(
+          `[tool-proxy] task ${taskId}: proxy chown failed (task runs without tools):`,
+          err instanceof Error ? err.message : err,
+        )
+        this.closeTask(taskId)
+        return null
+      }
+    }
     return {
       socketPath,
       close: () => this.closeTask(taskId),

@@ -1235,9 +1235,9 @@ start_tenant_opencode() {
   image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
     lunarwing-worker-opencode:latest 2>/dev/null || true)"
   case "$image_user" in
-    "$OPENCODE_CONTAINER_UID"|"$OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID") ;;
+    "0:0"|"0") ;;
     *)
-      die "opencode worker image has user '${image_user:-unset}', expected $OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID; rebuild it"
+      die "opencode worker image has user '${image_user:-unset}', expected 0:0 (WI#400 root entrypoint; serve/tasks drop to $OPENCODE_CONTAINER_UID); rebuild it"
       ;;
   esac
 
@@ -1448,9 +1448,9 @@ start_tenant_opencode2() {
   image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
     lunarwing-worker-opencode2:latest 2>/dev/null || true)"
   case "$image_user" in
-    "$OPENCODE2_CONTAINER_UID"|"$OPENCODE2_CONTAINER_UID:$OPENCODE2_CONTAINER_GID") ;;
+    "0:0"|"0") ;;
     *)
-      die "opencode2 worker image has user '${image_user:-unset}', expected $OPENCODE2_CONTAINER_UID:$OPENCODE2_CONTAINER_GID; rebuild it"
+      die "opencode2 worker image has user '${image_user:-unset}', expected 0:0 (WI#400 root entrypoint; serve/tasks drop to $OPENCODE2_CONTAINER_UID); rebuild it"
       ;;
   esac
 
@@ -1803,9 +1803,9 @@ start_tenant_kimi() {
   image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
     lunarwing-worker-kimi:latest 2>/dev/null || true)"
   case "$image_user" in
-    "$KIMI_CONTAINER_UID"|"$KIMI_CONTAINER_UID:$KIMI_CONTAINER_GID") ;;
+    "0:0"|"0") ;;
     *)
-      die "kimi worker image has user '${image_user:-unset}', expected $KIMI_CONTAINER_UID:$KIMI_CONTAINER_GID; rebuild it"
+      die "kimi worker image has user '${image_user:-unset}', expected 0:0 (WI#400 root entrypoint; tasks drop to $KIMI_CONTAINER_UID); rebuild it"
       ;;
   esac
 
