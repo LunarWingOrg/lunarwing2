@@ -494,6 +494,73 @@ def run_pebble_cli_drop_argv():
         ), f"setpriv argv missing mandatory flags (WI#400 KW-2/LD-13): {argv}"
 
 
+def run_task_drop_argv(worker):
+    """WI#400 KW-2/LD-7: with the harness running as root (the CI shape), the
+    kimi and opencode cli one-shots must exec setpriv with the exact
+    privilege-dropping flags (the cap-clearing pair AND --no-new-privs)
+    before the task binary. Unprivileged hosts cannot take the root branch,
+    so the pin is root-only."""
+    if os.geteuid() != 0:
+        return
+    directory, filename = workers[worker]
+    source = repo / directory
+    entrypoint = (source / "entrypoint.sh").read_text()
+    user = "kimi" if worker == "kimi" else "opencode"
+    task_uid = {"kimi": "10002", "opencode": "10001"}[worker]
+    with temp_root(f"{worker}-dropargv-") as temp:
+        root = Path(temp)
+        bin_dir = execable_dir(root)
+        mark = root / "drop-argv.txt"
+        task_stub = bin_dir / user
+        task_stub.write_text("#!/bin/sh\necho RAN_TASK > " + str(mark) + "\nexit 0\n")
+        task_stub.chmod(0o755)
+        setpriv_stub = bin_dir / "setpriv"
+        setpriv_stub.write_text(
+            "#!/bin/sh\nprintf '<%s>' \"$@\" > " + str(mark) + "\nprintf '\\n' >> " + str(mark) + "\nexit 0\n"
+        )
+        setpriv_stub.chmod(0o755)
+        hand_tree(root)
+        hand_tree(bin_dir)
+        env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "HOME": str(root / "home"), "TMPDIR": temp,
+            "WORKSPACE_ROOT": str(root / "workspace"),
+            "LUNARWING_TOKEN_DIR": str(root / "run-lunarwing"),
+            f"{worker.upper()}_MODE": "cli",
+            **({"OPENCODE_BIN": str(task_stub)} if worker != "kimi" else {}),
+        }
+        (root / "home").mkdir()
+        (root / "workspace").mkdir()
+        (root / "app" / "config").mkdir(parents=True)
+        result = subprocess.run(
+            ["bash", "-s", "--", "probe prompt"],
+            input=entrypoint.replace("/app/", str(root / "app") + "/"),
+            text=True, env=env, capture_output=True, timeout=60)
+        assert result.returncode == 0, f"{worker} drop: entrypoint failed: {result.stderr}"
+        argv = mark.read_text().strip()
+        # The kimi/opencode SETPRIV_FLAGS arrays carry no bare `--`
+        # separator (unlike pebble's entrypoint); the flags end at
+        # --no-new-privs and the env command follows directly.
+        flags = (
+            f"<--reuid={task_uid}><--regid={task_uid}><--clear-groups>"
+            "<--ambient-caps=-all><--inh-caps=-all><--no-new-privs>"
+        )
+        if worker == "kimi":
+            expected = flags + (
+                "<env><HOME=/home/kimi><-u><AGENT_AUTH_TOKEN>"
+                "<-u><AGENT_AUTH_TOKEN_FILE>"
+                "<kimi><-p><probe prompt><--output-format><stream-json>"
+            )
+        else:
+            expected = flags + (
+                "<env><HOME=/home/opencode><-u><AGENT_AUTH_TOKEN>"
+                "<-u><AGENT_AUTH_TOKEN_FILE>"
+                f"<{task_stub}><run><probe prompt>"
+            )
+        assert argv == expected, \
+            f"{worker} setpriv argv missing mandatory flags (WI#400 KW-2/LD-7): {argv}"
+
+
 def run_pebble_websocket_refusal():
     """WI#400 LD-8: when the bridge itself runs as the task uid (the rootless
     keep-id + USER-less-image failure mode), the websocket entrypoint must
@@ -569,6 +636,9 @@ print("PASS: pebble entrypoint token handoff layout is 0700/0400 and fully strip
 if os.geteuid() == 0:
     run_pebble_cli_drop_argv()
     print("PASS: pebble cli one-shot drops through setpriv with the mandatory flags (WI#400 KW-2/LD-13, root)")
+    for worker in ("kimi", "opencode"):
+        run_task_drop_argv(worker)
+        print(f"PASS: {worker} cli one-shot drops through setpriv with the mandatory flags (WI#400 KW-2/LD-7, root)")
 run_pebble_websocket_refusal()
 print("PASS: pebble websocket entrypoint refuses to run as the task uid (WI#400 LD-8)")
 PY

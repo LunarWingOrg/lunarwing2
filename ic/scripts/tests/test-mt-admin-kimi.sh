@@ -127,17 +127,14 @@ for lane in opencode opencode2 pebble; do
 done
 # WI#400 run-164 KW-2: the root-bridge lanes (opencode, pebble) get the same
 # container-level no-new-privileges kimi carries; the unmigrated opencode2
-# lane is deliberately excluded (KW-1).
+# lane is deliberately excluded (KW-1). LD-7: pin the FULL trimmed set on
+# the Quadlet PodmanArgs — a single dropped cap must fail the pin.
+KW3_QUADLET_ARGS='PodmanArgs=--security-opt=no-new-privileges --cap-drop=ALL --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER --cap-add=KILL --cap-add=SETUID --cap-add=SETGID'
+assert_contains "$quadlet" "$KW3_QUADLET_ARGS" 'systemd Kimi quadlet carries the exact WI#400 capability trim (KW-3/LD-7)'
 for lane in opencode pebble; do
   assert_contains "$fixture/quadlets/lunarwing-${lane}-root.container" \
-    'PodmanArgs=--security-opt=no-new-privileges' \
-    "$lane quadlet sets no-new-privileges (WI#400 KW-2)"
-  assert_contains "$fixture/quadlets/lunarwing-${lane}-root.container" \
-    '--cap-drop=ALL' \
-    "$lane quadlet drops all capabilities (WI#400 KW-3)"
-  assert_contains "$fixture/quadlets/lunarwing-${lane}-root.container" \
-    '--cap-add=SETUID' \
-    "$lane quadlet keeps SETUID for the setpriv task drop (WI#400 KW-3)"
+    "$KW3_QUADLET_ARGS" \
+    "$lane quadlet carries the exact WI#400 capability trim (KW-3/LD-7)"
 done
 assert_not_contains "$fixture/quadlets/lunarwing-opencode2-root.container" \
   'no-new-privileges' \
@@ -343,17 +340,16 @@ if grep -Fq -- '--security-opt no-new-privileges' <<<"$KIMI_BLOCK"; then
 else
   fail 'kimi imperative launch missing no-new-privileges (WI#206)'
 fi
-# WI#400 KW-3: the root-bridge lanes run the bridge with a trimmed
-# capability set instead of the default root set.
+# WI#400 KW-3/LD-7: the root-bridge lanes run the bridge with a trimmed
+# capability set instead of the default root set. The FULL string is pinned:
+# a dropped KILL or DAC_OVERRIDE would otherwise only show in production.
+KW3_CAP_TRIM='--cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add KILL --cap-add SETUID --cap-add SETGID'
 for lane in kimi opencode pebble; do
   LANE_BLOCK="$(awk "/^start_tenant_${lane}\\(\\)/,/^stop_tenant_${lane}\\(\\)/" "$WORKER_LIB")"
-  if grep -Fq -- '--cap-drop ALL' <<<"$LANE_BLOCK" \
-    && grep -Fq -- '--cap-add CHOWN' <<<"$LANE_BLOCK" \
-    && grep -Fq -- '--cap-add SETUID' <<<"$LANE_BLOCK" \
-    && grep -Fq -- '--cap-add SETGID' <<<"$LANE_BLOCK"; then
-    pass "$lane imperative launch runs the WI#400 capability trim (KW-3)"
+  if grep -Fq -- "$KW3_CAP_TRIM" <<<"$LANE_BLOCK"; then
+    pass "$lane imperative launch runs the exact WI#400 capability trim (KW-3/LD-7)"
   else
-    fail "$lane imperative launch missing the WI#400 capability trim (KW-3)"
+    fail "$lane imperative launch missing the exact WI#400 capability trim (KW-3/LD-7)"
   fi
 done
 # The non-kimi imperative lanes mount the directory read-only, preserving
