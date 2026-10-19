@@ -7,7 +7,7 @@
  */
 
 import assert from "node:assert/strict"
-import { chownSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { chownSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs"
 import { connect, type Socket } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -253,6 +253,29 @@ test("closing a task fails its in-flight calls", async () => {
   assert.equal(response.ok, true)
   // The relay synthesizes an error payload so the shim never hangs.
   assert.equal(typeof response.error, "string")
+})
+
+test("a symlinked proxy dir is refused, never followed (WI#400 LP-5)", async () => {
+  const base = mkdtempSync(join(tmpdir(), "tool-proxy-lp5-"))
+  const victim = join(base, "victim")
+  mkdirSync(victim, { mode: 0o700 })
+  const link = join(base, "proxy-link")
+  symlinkSync(victim, link)
+  const prevDir = process.env.LUNARWING_TOOL_PROXY_DIR
+  process.env.LUNARWING_TOOL_PROXY_DIR = link
+  const linkRelay = new ToolProxyRelay()
+  const hub = new FakeHubSocket()
+  try {
+    const handle = await linkRelay.startTask("task-lp5", hub)
+    assert.equal(handle, null, "a symlinked proxy dir must be refused (task runs without tools)")
+    assert.deepEqual(readdirSync(victim), [], "the link target must stay untouched")
+    assert.equal(statSync(victim).mode & 0o777, 0o700, "the link target's mode must stay untouched")
+  } finally {
+    await linkRelay.closeTask("task-lp5")
+    if (prevDir === undefined) delete process.env.LUNARWING_TOOL_PROXY_DIR
+    else process.env.LUNARWING_TOOL_PROXY_DIR = prevDir
+    rmSync(base, { recursive: true, force: true })
+  }
 })
 
 test("proxy dir re-asserts root-owned 0711 and only the socket belongs to the task uid (WI#400 KW-6/LD-7, root)", async () => {

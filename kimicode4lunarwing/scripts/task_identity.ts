@@ -6,6 +6,9 @@
  * dev runs and the bridge test suite, where the bridge is unprivileged
  * anyway). Exactly one set is a configuration error and fails closed.
  */
+import { accessSync, constants as fsConstants, statSync } from "node:fs"
+import { delimiter, isAbsolute, join } from "node:path"
+
 export interface TaskIdentity {
   uid: number
   gid: number
@@ -42,4 +45,37 @@ export function taskSetprivArgv(identity: TaskIdentity): string[] {
     "--no-new-privs",
     "--",
   ]
+}
+
+/** WI#400 LD-11/LP-6: the privilege-dropping helper runs as root BEFORE the
+ * drop, so it must be looked up on the bridge's own PATH — never resolved
+ * through the child environment, which carries task-supplied values. Only
+ * absolute PATH entries are considered. */
+export function resolveFromBridgePath(name: string, pathEnv: string | undefined = process.env.PATH): string {
+  for (const dir of (pathEnv ?? "").split(delimiter)) {
+    if (!dir || !isAbsolute(dir)) continue
+    const candidate = join(dir, name)
+    try {
+      if (!statSync(candidate).isFile()) continue
+      accessSync(candidate, fsConstants.X_OK)
+      return candidate
+    } catch {
+      continue
+    }
+  }
+  throw new Error(`${name} not found on the bridge PATH (WI#400 LD-11)`)
+}
+
+/** WI#400 LD-11/LP-6: variables the dynamic loader and glibc honour BEFORE
+ * the drop; a task-supplied value would run inside the still-root setpriv.
+ * Removes them in place and returns the keys that were dropped. */
+export function dropLoaderEnv(env: NodeJS.ProcessEnv): string[] {
+  const dropped: string[] = []
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("LD_") || key === "GCONV_PATH" || key === "GLIBC_TUNABLES") {
+      delete env[key]
+      dropped.push(key)
+    }
+  }
+  return dropped.sort()
 }

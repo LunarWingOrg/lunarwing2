@@ -29,7 +29,7 @@ import {
 process.on("unhandledRejection", (reason) => {
   console.error("[bridge] unhandledRejection (surviving):", reason)
 })
-import { readFileSync } from "node:fs"
+import { readBridgeAuthToken } from "./bridge_auth"
 import { executeTask } from "./opencode_task_executor"
 import type { OpencodeClient } from "@opencode-ai/sdk/v2/client"
 import { resolveTaskWorkspace } from "./workspace_path"
@@ -37,33 +37,16 @@ import { ToolProxyRelay, type TaskProxyHandle } from "./lunarwing_tool_proxy"
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
-// WI#400: the entrypoint moves the hub-handshake credential out of the
-// process environment into a root-only file (AGENT_AUTH_TOKEN_FILE) before
-// spawning the bridge, so no long-lived process a task can inspect carries
-// it in its environ. The env var stays as a dev-launch fallback.
-function readBridgeAuthToken(): string {
-  const tokenFile = process.env.AGENT_AUTH_TOKEN_FILE
-  if (tokenFile) {
-    try {
-      const contents = readFileSync(tokenFile, "utf8").replace(/[\r\n]+$/, "")
-      if (contents) return contents
-      console.error(`[bridge] AGENT_AUTH_TOKEN_FILE ${tokenFile} is empty`)
-    } catch (err) {
-      console.error(
-        `[bridge] cannot read AGENT_AUTH_TOKEN_FILE ${tokenFile}:`,
-        err instanceof Error ? err.message : err,
-      )
-    }
-  }
-  return process.env.AGENT_AUTH_TOKEN || ""
-}
+// WI#400: the hub-handshake credential comes from the root-only file the
+// entrypoint staged (AGENT_AUTH_TOKEN_FILE); see bridge_auth.ts. A set
+// pointer that yields no token is a startup error (run-170 LP-4).
 
 const WS_ROLE = process.env.WS_ROLE || "server"
 const WS_BIND_HOST = process.env.WS_BIND_HOST || "0.0.0.0"
 const WS_PORT = parseInt(process.env.WS_PORT || "9090", 10)
 const WS_PATH = process.env.WS_PATH || "/ws/agent"
 const WS_URL = process.env.WS_URL || ""
-const AGENT_AUTH_TOKEN = readBridgeAuthToken()
+const AGENT_AUTH_TOKEN = readBridgeAuthToken(process.env)
 const RECONNECT_MS = parseInt(process.env.RECONNECT_MS || "3000", 10)
 const PING_INTERVAL_MS = parseInt(process.env.PING_INTERVAL_MS || "20000", 10)
 const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || "/workspace"

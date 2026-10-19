@@ -8,7 +8,7 @@
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
 
-import { taskIdentity, taskSetprivArgv } from "./task_identity.js"
+import { dropLoaderEnv, resolveFromBridgePath, taskIdentity, taskSetprivArgv } from "./task_identity.js"
 import {
   buildTaskPrompt,
   isRecord,
@@ -345,7 +345,16 @@ export async function executeTask(
     if (identity) {
       if (env.HOME === "/root") env.HOME = "/home/kimi"
       if (env.GOPATH === "/root/go") env.GOPATH = "/home/kimi/go"
-      spawnBin = "setpriv"
+      // WI#400 LD-11/LP-6: setpriv comes from the bridge's OWN PATH (a bare
+      // name would be looked up through the child env), and the loader
+      // variables a task could supply are dropped before the still-root
+      // setpriv honours them.
+      spawnBin = resolveFromBridgePath("setpriv")
+      for (const key of dropLoaderEnv(env)) {
+        console.warn(
+          `[kimi executor] dropped task env entry ${key} for task ${request.task_id}: loader variables never reach the privilege drop (WI#400 LD-11)`
+        )
+      }
       spawnArgs = [...taskSetprivArgv(identity), kimiBin(), ...args]
     }
 
