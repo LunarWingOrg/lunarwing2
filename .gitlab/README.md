@@ -525,10 +525,23 @@ the prime suspect, and the fix is the same normalization in the offending
 
 Known false-positive Gitleaks findings are listed by exact fingerprint in
 `/.gitleaksignore`. Broad path or rule exclusions are forbidden. Worker-image
-CRITICAL findings that Debian will not fix for the pinned toolchain
-dependencies are listed by exact CVE with rationale and expiry in
-`.gitlab/trivy-ignore`; expired entries stop being ignored and fail the
-scan gate again.
+CRITICAL findings that Debian has not fixed for the pinned toolchain
+dependencies are listed by exact CVE with a rationale comment and an expiry
+date in Trivy's own syntax (`CVE-… exp:YYYY-MM-DD`, one entry per line) in
+`.gitlab/trivy-ignore`. Trivy's ignore-file parser only recognises the `exp:`
+prefix and stops suppressing an entry on its date (00:00 UTC), so expired
+entries fail the scan gate again until the finding is re-reviewed (WI#361:
+the earlier `expiring:` spelling was never Trivy syntax, so those entries
+silently never expired). Every trivy call in the scan runs with
+`--config /dev/null` from an emptied `TRIVY_CACHE_DIR`, and
+`validate_config.py` pins the scan template's script, image, tags and
+variables exactly and lets the `worker-*-scan` jobs add only `needs`, so a
+checkout-root `trivy.yaml`, a committed `.trivy-cache` database, or a
+`TRIVY_*` variable in the committed CI YAML cannot hide a CRITICAL.
+Variables set outside the YAML (project or group CI/CD settings,
+`git push -o ci.variable`, runner configuration) are not visible to the
+validator. `validate_config.py` also rejects any non-comment line in another
+shape and any expiry more than six months out.
 
 `skip-version-check` is inert unless a maintainer also supplies
 `ALLOW_VERSION_CHECK_SKIP=1`; commit messages cannot bypass version policy.
