@@ -29,11 +29,12 @@ def run_config(worker, overrides=None, mounted=False, custom=None):
     entrypoint = (source / "entrypoint.sh").read_text()
     boundary = "# ── always start the health server"
     assert boundary in entrypoint, f"{worker}: startup boundary changed"
-    with tempfile.TemporaryDirectory(prefix=f"{worker}-llm-") as temp:
+    with temp_root(f"{worker}-llm-") as temp:
         root = Path(temp)
         home, app, workspace = root / "home", root / "app", root / "workspace"
         for path in (home, app / "config", workspace):
             path.mkdir(parents=True)
+        stage_setup(source, app, home)
         baked = (source / "config" / filename).read_text()
         placeholder = f"http://set-{worker}-base-url.invalid/openai/v1"
         if worker != "kimi":
@@ -56,8 +57,9 @@ def run_config(worker, overrides=None, mounted=False, custom=None):
         script = entrypoint.split(boundary, 1)[0].replace("/app/", str(app) + "/")
         for user in ("opencode", "kimi"):
             script = script.replace(f"/home/{user}/", str(home) + "/")
+        hand_tree(root)
         result = subprocess.run(["bash"], input=script, text=True, env=env,
-                                capture_output=True, timeout=15)
+                                capture_output=True, timeout=15, **as_ci_user())
         target = (home / ".kimi-code/config.toml" if worker == "kimi"
                   else workspace / ".opencode" / filename)
         generated = target.read_text() if target.exists() else ""
@@ -84,6 +86,108 @@ def free_port():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
+
+
+# WI#400: the worker entrypoints are root launchers that hand task-side setup
+# to entrypoint-task-setup.sh (staged beside entrypoint.sh with the same path
+# relocation). When the harness itself runs as root (the CI shape), the
+# setup script refuses root by design, so the scratch tree is handed to an
+# unprivileged uid and every entrypoint runs as that uid — the same
+# unprivileged branch the entrypoints take on host dev runs.
+SETUP_RUN_ID = 65534
+
+def as_ci_user():
+    """subprocess kwargs dropping to the unprivileged uid when run as root."""
+    if os.geteuid() == 0:
+        return {"user": SETUP_RUN_ID, "group": SETUP_RUN_ID, "extra_groups": []}
+    return {}
+
+
+_exec_temp_base = None
+
+
+def _probe_exec(directory):
+    """True when an executable stub runs from directory — probed AS the
+    unprivileged uid when the harness is root, because the WI#400 entrypoint
+    and its task-setup script then exec from inside the chosen tree."""
+    probe = directory / f".exec-probe-{os.getpid()}.sh"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        probe.write_text("#!/bin/sh\nexit 0\n")
+        probe.chmod(0o755)
+        return subprocess.run([str(probe)], capture_output=True,
+                              timeout=15, **as_ci_user()).returncode == 0
+    except OSError:
+        return False
+    finally:
+        probe.unlink(missing_ok=True)
+
+
+def temp_root(prefix):
+    """A TemporaryDirectory rooted where scripts can actually EXECUTE.
+    Dev VMs may mount /tmp noexec and the WI#400 entrypoints exec their
+    task-setup script from inside the temp tree; probe the system temp dir
+    first (the CI shape is unchanged), then /var/tmp, then a per-run base
+    under $HOME that is removed at exit. When the harness runs as root the
+    probe drops to the same unprivileged uid the entrypoints run as, so a
+    0700 $HOME (e.g. /root) can never be chosen for a dropped run."""
+    global _exec_temp_base
+    if _exec_temp_base is None:
+        import atexit
+        import shutil
+        system = Path(tempfile.gettempdir())
+        if _probe_exec(system):
+            _exec_temp_base = system
+        else:
+            for candidate in (Path("/var/tmp"),
+                              Path(os.environ.get("HOME", "")) / f".worker-entrypoint-tmp-{os.getpid()}"):
+                if str(candidate) in ("", "/") or not candidate.parent.exists():
+                    continue
+                if _probe_exec(candidate):
+                    if candidate == Path("/var/tmp"):
+                        _exec_temp_base = candidate
+                    else:
+                        atexit.register(shutil.rmtree, candidate, ignore_errors=True)
+                        _exec_temp_base = candidate
+                    break
+            else:
+                raise AssertionError(
+                    "no executable directory found for the WI#400 entrypoint temp trees")
+    return tempfile.TemporaryDirectory(
+        prefix=prefix,
+        dir=None if _exec_temp_base == Path(tempfile.gettempdir()) else _exec_temp_base,
+    )
+
+
+def hand_tree(path):
+    """Recursively hand a scratch tree to the unprivileged uid (root only)."""
+    if os.geteuid() != 0:
+        return
+    for dirpath, dirnames, filenames in os.walk(path):
+        for name in dirnames + filenames:
+            try:
+                os.chown(os.path.join(dirpath, name), SETUP_RUN_ID, SETUP_RUN_ID,
+                         follow_symlinks=False)
+            except OSError:
+                pass
+    try:
+        os.chown(path, SETUP_RUN_ID, SETUP_RUN_ID)
+    except OSError:
+        pass
+
+
+def stage_setup(source, app, home):
+    """Stage entrypoint-task-setup.sh (WI#400) with the entrypoint's own
+    /app/ and /home/<user>/ relocation applied to its text."""
+    setup = source / "entrypoint-task-setup.sh"
+    if not setup.exists():
+        return
+    text = setup.read_text().replace("/app/", str(app) + "/")
+    for user in ("opencode", "kimi"):
+        text = text.replace(f"/home/{user}/", str(home) + "/")
+    target = app / "entrypoint-task-setup.sh"
+    target.write_text(text)
+    target.chmod(0o755)
 
 
 def execable_dir(root):
@@ -130,12 +234,13 @@ def run_websocket_startup(worker):
     entrypoint = (source / "entrypoint.sh").read_text()
     boundary = "# ── always start the health server"
     assert boundary in entrypoint, f"{worker}: startup boundary changed"
-    with tempfile.TemporaryDirectory(prefix=f"{worker}-ws373-") as temp:
+    with temp_root(f"{worker}-ws373-") as temp:
         root = Path(temp)
         home, app, workspace = root / "home", root / "app", root / "workspace"
         bin_dir = execable_dir(root)
         for path in (home, app / "config", workspace / ".opencode"):
             path.mkdir(parents=True)
+        stage_setup(source, app, home)
         baked = (source / "config" / filename).read_text()
         placeholder = f"http://set-{worker}-base-url.invalid/openai/v1"
         if worker != "kimi":
@@ -170,6 +275,9 @@ def run_websocket_startup(worker):
         bun_stub.write_text(
             "#!/bin/sh\n"
             f"if [ -n \"$AGENT_AUTH_TOKEN\" ]; then echo PRESENT > {bridge_mark};"
+            "elif [ -n \"$AGENT_AUTH_TOKEN_FILE\" ] && [ \"$(cat"
+            " \"$AGENT_AUTH_TOKEN_FILE\" 2>/dev/null)\" = bridge-secret-64hex ];"
+            f" then echo PRESENT > {bridge_mark};"
             f" else echo ABSENT > {bridge_mark}; fi\n"
             "exit 0\n"
         )
@@ -187,17 +295,20 @@ def run_websocket_startup(worker):
             "OPENCODE_SERVE_HOST": "127.0.0.1",
             "HEALTH_PORT": str(health_port),
             "WS_STATE_FILE": str(root / "ws-state.json"),
+            "LUNARWING_TOKEN_DIR": str(root / "run-lunarwing"),
             "AGENT_AUTH_TOKEN": "bridge-secret-64hex",
         }
+        hand_tree(root)
+        hand_tree(bin_dir)
         result = subprocess.run(["bash"], input=script, text=True, env=env,
-                                capture_output=True, timeout=60)
+                                capture_output=True, timeout=60, **as_ci_user())
         assert result.returncode == 0, f"{worker}: entrypoint failed: {result.stderr}"
         assert serve_mark.exists() and bridge_mark.exists(), \
             f"{worker}: stubs did not run: {result.stderr}"
         assert serve_mark.read_text().strip() == "ABSENT", \
             f"{worker}: hub-handshake token reached the serve process env (WI#373)"
         assert bridge_mark.read_text().strip() == "PRESENT", \
-            f"{worker}: bridge lost its handshake credential (WI#373)"
+            f"{worker}: bridge lost its handshake credential (WI#373/WI#400 env-or-file)"
 
 
 def run_oneshot_startup(worker, mode):
@@ -207,12 +318,13 @@ def run_oneshot_startup(worker, mode):
     directory, filename = workers[worker]
     source = repo / directory
     entrypoint = (source / "entrypoint.sh").read_text()
-    with tempfile.TemporaryDirectory(prefix=f"{worker}-cli373-") as temp:
+    with temp_root(f"{worker}-cli373-") as temp:
         root = Path(temp)
         home, app, workspace = root / "home", root / "app", root / "workspace"
         bin_dir = execable_dir(root)
         for path in (home, app / "config", workspace / ".opencode"):
             path.mkdir(parents=True)
+        stage_setup(source, app, home)
         baked = (source / "config" / filename).read_text()
         placeholder = f"http://set-{worker}-base-url.invalid/openai/v1"
         if worker != "kimi":
@@ -241,14 +353,17 @@ def run_oneshot_startup(worker, mode):
             f"{worker.upper()}_BASE_URL": endpoint,
             "HEALTH_PORT": str(free_port()),
             "WS_STATE_FILE": str(root / "ws-state.json"),
+            "LUNARWING_TOKEN_DIR": str(root / "run-lunarwing"),
             "AGENT_AUTH_TOKEN": "bridge-secret-64hex",
         }
         if worker != "kimi":
             env["OPENCODE_BIN"] = str(stub)
         env["KIMI_MODE" if worker == "kimi" else "OPENCODE_MODE"] = mode
+        hand_tree(root)
+        hand_tree(bin_dir)
         result = subprocess.run(["bash", "-s", "--", "probe prompt"],
                                 input=script, text=True, env=env,
-                                capture_output=True, timeout=60)
+                                capture_output=True, timeout=60, **as_ci_user())
         assert result.returncode == 0, \
             f"{worker} {mode}: entrypoint failed: {result.stderr}"
         assert mark.exists(), f"{worker} {mode}: stub did not run: {result.stderr}"
@@ -260,7 +375,7 @@ def run_pebble_cli_startup():
     """WI#373 (pebble cli mode): same one-shot boundary; the pebble process
     must not inherit the hub-handshake credential."""
     entrypoint = (repo / "pebble4lunarwing" / "entrypoint.sh").read_text()
-    with tempfile.TemporaryDirectory(prefix="pebble-cli373-") as temp:
+    with temp_root("pebble-cli373-") as temp:
         root = Path(temp)
         bin_dir = execable_dir(root)
         mark = root / "pebble-cli-env.txt"
@@ -272,14 +387,17 @@ def run_pebble_cli_startup():
             "exit 0\n"
         )
         stub.chmod(0o755)
+        hand_tree(root)
+        hand_tree(bin_dir)
         result = subprocess.run(
             ["bash", "-s", "--", "probe prompt"],
             input=entrypoint, text=True,
             env={"PATH": f"{bin_dir}:{os.environ['PATH']}",
                  "HOME": str(root), "TMPDIR": temp,
                  "PEBBLE_MODE": "cli",
+                 "LUNARWING_TOKEN_DIR": str(root / "run-lunarwing"),
                  "AGENT_AUTH_TOKEN": "bridge-secret-64hex"},
-            capture_output=True, timeout=60)
+            capture_output=True, timeout=60, **as_ci_user())
         assert result.returncode == 0, f"pebble cli: entrypoint failed: {result.stderr}"
         assert mark.exists(), f"pebble cli: stub did not run: {result.stderr}"
         assert mark.read_text().strip() == "ABSENT", \
