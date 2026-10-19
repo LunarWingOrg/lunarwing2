@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { execFileSync, spawn } from "node:child_process"
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -50,6 +50,53 @@ try {
 } finally {
   rmSync(root, { recursive: true, force: true })
   rmSync(outside, { recursive: true, force: true })
+}
+
+// WI#400 run-164 KW-4: the bridge runs as root while the cron task runs
+// under the separate task uid; a freshly created leaf must be fchowned to
+// the task identity or the task cannot write its own project dir. fchown to
+// the process's own ids is permitted unprivileged, so this runs on dev hosts
+// and in-image alike.
+{
+  const uid = process.getuid!()
+  const gid = process.getgid!()
+  process.env.OPENCODE_TASK_UID = String(uid)
+  process.env.OPENCODE_TASK_GID = String(gid)
+  const kw4Root = mkdtempSync(join(tmpdir(), "oc-cron-kw4-"))
+  try {
+    const context = { project_dir: "missions/kw4", cron_tick: { event: "cron.tick" } }
+    const dir = resolveTaskWorkspace(context, kw4Root)
+    const landed = statSync(dir)
+    assert.equal(landed.uid, uid, "new leaf must be owned by the task uid")
+    assert.equal(landed.gid, gid, "new leaf must be owned by the task gid")
+    // A pre-existing leaf is never re-chowned: the second tick takes the
+    // EEXIST path and leaves the identity untouched.
+    assert.equal(resolveTaskWorkspace(context, kw4Root), dir)
+  } finally {
+    delete process.env.OPENCODE_TASK_UID
+    delete process.env.OPENCODE_TASK_GID
+    rmSync(kw4Root, { recursive: true, force: true })
+  }
+}
+
+// The non-vacuous half: without the KW-4 fchown this bootstrap would succeed
+// silently. Unprivileged, the handoff to a foreign uid must fail (EPERM →
+// permanent "Invalid" wording). In-image the gate runs as root, where the
+// same handoff legitimately succeeds (covered by the previous block).
+if (process.getuid!() !== 0) {
+  process.env.OPENCODE_TASK_UID = String(process.getuid!() + 1000)
+  process.env.OPENCODE_TASK_GID = String(process.getgid!() + 1000)
+  const kw4ForeignRoot = mkdtempSync(join(tmpdir(), "oc-cron-kw4-foreign-"))
+  try {
+    assert.throws(
+      () => resolveTaskWorkspace({ project_dir: "missions/kw4", cron_tick: { event: "cron.tick" } }, kw4ForeignRoot),
+      /Invalid workspace path/,
+    )
+  } finally {
+    delete process.env.OPENCODE_TASK_UID
+    delete process.env.OPENCODE_TASK_GID
+    rmSync(kw4ForeignRoot, { recursive: true, force: true })
+  }
 }
 
 // WI#375 DS-3: bounded swap race — an attacker process swaps the parent

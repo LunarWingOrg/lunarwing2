@@ -54,8 +54,9 @@ fn strip_bridge_credentials(
 /// `PEBBLE_TASK_UID`/`PEBBLE_TASK_GID`; both unset means "no split"
 /// (host-side dev runs and self-exec tests, where the bridge is
 /// unprivileged anyway). Exactly one set is a configuration error and fails
-/// the spawn closed.
-fn task_ids_from_env() -> Result<Option<(u32, u32)>, std::io::Error> {
+/// the spawn closed. pub(crate) so the cron workspace bootstrap can hand a
+/// freshly created leaf directory to the same identity (run-164 KW-4).
+pub(crate) fn task_ids_from_env() -> Result<Option<(u32, u32)>, std::io::Error> {
     let uid = std::env::var("PEBBLE_TASK_UID").ok();
     let gid = std::env::var("PEBBLE_TASK_GID").ok();
     match (uid, gid) {
