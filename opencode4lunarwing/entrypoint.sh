@@ -160,6 +160,10 @@ case "$MODE" in
     export WS_ROLE
     export WS_STATE_FILE
     export WORKSPACE_ROOT
+    # WI#400 LD-5: the bridge runs as root (HOME=/root) while serve runs with
+    # HOME=/home/opencode, so the serve-log enrichment (WI#374) must not fall
+    # back to the bridge's own homedir — point it at the serve process's log.
+    export OPENCODE_SERVE_LOG="${OPENCODE_SERVE_LOG-${XDG_DATA_HOME:-/home/opencode/.local/share}/opencode/log/opencode.log}"
 
     exec bun run /app/scripts/lunarwing_bridge.ts
     ;;
