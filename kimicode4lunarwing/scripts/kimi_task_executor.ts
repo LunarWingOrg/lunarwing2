@@ -8,6 +8,7 @@
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
 
+import { taskIdentity, taskSetprivArgv } from "./task_identity.js"
 import {
   buildTaskPrompt,
   isRecord,
@@ -318,6 +319,14 @@ export async function executeTask(
       )
     }
     delete env.AGENT_AUTH_TOKEN
+    // WI#400: the credential now lives in a root-only file the bridge reads;
+    // the pointer is stripped alongside the token itself.
+    if (Object.hasOwn(request.context?.environment ?? {}, "AGENT_AUTH_TOKEN_FILE")) {
+      console.warn(
+        `[kimi executor] dropped task-supplied env entry AGENT_AUTH_TOKEN_FILE for task ${request.task_id}: reserved for the bridge handshake (WI#400)`,
+      )
+    }
+    delete env.AGENT_AUTH_TOKEN_FILE
     const kimiHome = kimiCodeHome()
     if (kimiHome) {
       env.KIMI_CODE_HOME = kimiHome
@@ -326,7 +335,21 @@ export async function executeTask(
     env.KIMI_CODE_NO_AUTO_UPDATE = env.KIMI_CODE_NO_AUTO_UPDATE || "1"
     env.KIMI_DISABLE_TELEMETRY = env.KIMI_DISABLE_TELEMETRY || "1"
 
-    proc = spawn(kimiBin(), args, {
+    // WI#400: the bridge runs as container root; task code runs under the
+    // pinned task uid (separate from the bridge) via a setpriv wrapper, so
+    // the bridge's and PID 1's environ are EACCES to it. Root's HOME/GOPATH
+    // are unreadable to the task uid and retargeted at the task home.
+    const identity = taskIdentity()
+    let spawnBin = kimiBin()
+    let spawnArgs = args
+    if (identity) {
+      if (env.HOME === "/root") env.HOME = "/home/kimi"
+      if (env.GOPATH === "/root/go") env.GOPATH = "/home/kimi/go"
+      spawnBin = "setpriv"
+      spawnArgs = [...taskSetprivArgv(identity), kimiBin(), ...args]
+    }
+
+    proc = spawn(spawnBin, spawnArgs, {
       cwd: workDir,
       env,
       stdio: ["pipe", "pipe", "pipe"],

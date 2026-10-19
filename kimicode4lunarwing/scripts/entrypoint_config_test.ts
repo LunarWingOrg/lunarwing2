@@ -8,7 +8,12 @@ import { test } from "node:test"
 
 const entrypointPath = fileURLToPath(new URL("../entrypoint.sh", import.meta.url))
 const entrypoint = readFileSync(entrypointPath, "utf8")
-const configSectionEnd = entrypoint.indexOf("# ── always start the health server")
+// WI#400: the entrypoint split into a root launcher (entrypoint.sh) and the
+// task-side setup (entrypoint-task-setup.sh, run as the task uid). The
+// config-materialization section lives in the setup script and runs whole.
+const setupPath = fileURLToPath(new URL("../entrypoint-task-setup.sh", import.meta.url))
+const setupScript = readFileSync(setupPath, "utf8")
+const configSectionEnd = setupScript.length
 
 test("baked Kimi defaults use the placeholder provider endpoint (WI#330)", () => {
   const config = readFileSync(fileURLToPath(new URL("../config/config.toml", import.meta.url)), "utf8")
@@ -34,7 +39,7 @@ base_url = "https://old.invalid"
 api_key = ""
 `)
 
-  const result = spawnSync("bash", ["-c", entrypoint.slice(0, configSectionEnd)], {
+  const result = spawnSync("bash", ["-c", setupScript.slice(0, configSectionEnd)], {
     encoding: "utf8",
     env: {
       ...process.env,
@@ -53,7 +58,7 @@ api_key = ""
   assert.equal(statSync(target).mode & 0o777, 0o600)
 
   writeFileSync(source, "invalid = [toml")
-  const invalidResult = spawnSync("bash", ["-c", entrypoint.slice(0, configSectionEnd)], {
+  const invalidResult = spawnSync("bash", ["-c", setupScript.slice(0, configSectionEnd)], {
     encoding: "utf8",
     env: { ...process.env, KIMI_CODE_HOME: home, KIMI_CONFIG_SOURCE: source },
   })
@@ -75,7 +80,7 @@ test("entrypoint accepts a missing Kimi API key", () => {
   delete env.KIMI_API_KEY
   delete env.TENSORZERO_API_KEY
 
-  const result = spawnSync("bash", ["-c", entrypoint.slice(0, configSectionEnd)], {
+  const result = spawnSync("bash", ["-c", setupScript.slice(0, configSectionEnd)], {
     encoding: "utf8",
     env,
   })
@@ -107,7 +112,7 @@ max_output_size = 131072
 capabilities = ["tool_use"]
 `)
 
-  const result = spawnSync("bash", ["-c", entrypoint.slice(0, configSectionEnd)], {
+  const result = spawnSync("bash", ["-c", setupScript.slice(0, configSectionEnd)], {
     encoding: "utf8",
     env: {
       ...process.env,
@@ -171,8 +176,31 @@ test("entrypoint unsets the workspace-trust switch beside the guard switch in bo
 
 test("entrypoint CLI mode forces print and stream-json", () => {
   // WI#373: the strip must stay in front of the exec — the one-shot prompt
-  // runs untrusted agent code and must not inherit AGENT_AUTH_TOKEN.
-  assert.match(entrypoint, /exec env -u AGENT_AUTH_TOKEN kimi -p "\$\*" --output-format stream-json/)
+  // runs untrusted agent code and must not inherit AGENT_AUTH_TOKEN. WI#400:
+  // the credential-file pointer is stripped alongside, and the one-shot runs
+  // as the task uid via setpriv with the mandatory cap-clearing flags.
+  assert.match(entrypoint, /SETPRIV_FLAGS=\(--reuid="\$KIMI_TASK_UID" --regid="\$KIMI_TASK_GID" --clear-groups --ambient-caps=-all --inh-caps=-all\)/)
+  assert.match(entrypoint, /exec setpriv "\$\{SETPRIV_FLAGS\[@\]\}"/)
+  assert.match(entrypoint, /env HOME=\/home\/kimi -u AGENT_AUTH_TOKEN -u AGENT_AUTH_TOKEN_FILE \\?\n?\s*kimi -p "\$\*" --output-format stream-json/)
+})
+
+test("entrypoint moves the hub credential into a root-only file before spawning (WI#400)", () => {
+  // The handoff must come before any long-lived spawn: root-only 0700 dir,
+  // 0400 file, env scrubbed, and the bridge pointed at the file instead.
+  assert.match(entrypoint, /install -d -m 0700 "\$LUNARWING_TOKEN_DIR"/)
+  assert.match(entrypoint, /chmod 0400 "\$_token_tmp"/)
+  assert.match(entrypoint, /unset AGENT_AUTH_TOKEN/)
+  assert.match(entrypoint, /export AGENT_AUTH_TOKEN_FILE="\$LUNARWING_TOKEN_DIR\/agent_auth_token"/)
+  const handoffAt = entrypoint.indexOf("unset AGENT_AUTH_TOKEN")
+  const bridgeAt = entrypoint.indexOf("node /app/scripts/lunarwing_bridge.js")
+  assert.ok(handoffAt > 0 && bridgeAt > handoffAt, "credential handoff must precede the bridge spawn")
+})
+
+test("task-side setup refuses to run as root (WI#400)", () => {
+  assert.match(setupScript, /entrypoint-task-setup\.sh runs as the task uid only \(WI#400\)/)
+  // Setup writes task-owned state, so the launcher must invoke it as the
+  // task uid, never directly.
+  assert.match(entrypoint, /as_task \/app\/entrypoint-task-setup\.sh/)
 })
 
 test("entrypoint rejects missing config source instead of reusing stale config", () => {
@@ -183,7 +211,7 @@ test("entrypoint rejects missing config source instead of reusing stale config",
   mkdirSync(home)
   writeFileSync(stale, 'api_key = "stale-secret"\n', { mode: 0o600 })
 
-  const result = spawnSync("bash", ["-c", entrypoint.slice(0, configSectionEnd)], {
+  const result = spawnSync("bash", ["-c", setupScript.slice(0, configSectionEnd)], {
     encoding: "utf8",
     env: {
       ...process.env,
@@ -216,7 +244,7 @@ api_key = "k"
 dangerous_command_guard = false
 `)
 
-  const hardened = spawnSync("bash", ["-c", entrypoint.slice(0, configSectionEnd)], {
+  const hardened = spawnSync("bash", ["-c", setupScript.slice(0, configSectionEnd)], {
     encoding: "utf8",
     env: { ...process.env, KIMI_CODE_HOME: home, KIMI_CONFIG_SOURCE: source },
   })
@@ -233,7 +261,7 @@ type = "openai"
 base_url = "http://127.0.0.1:1/v1"
 api_key = "k"
 `)
-  const noPolicy = spawnSync("bash", ["-c", entrypoint.slice(0, configSectionEnd)], {
+  const noPolicy = spawnSync("bash", ["-c", setupScript.slice(0, configSectionEnd)], {
     encoding: "utf8",
     env: { ...process.env, KIMI_CODE_HOME: home, KIMI_CONFIG_SOURCE: source },
   })
@@ -249,7 +277,7 @@ api_key = "k"
     source,
     readFileSync(fileURLToPath(new URL("../config/config.toml", import.meta.url)), "utf8"),
   )
-  const ok = spawnSync("bash", ["-c", entrypoint.slice(0, configSectionEnd)], {
+  const ok = spawnSync("bash", ["-c", setupScript.slice(0, configSectionEnd)], {
     encoding: "utf8",
     env: {
       ...process.env,
@@ -283,7 +311,7 @@ test("entrypoint refuses to run the baked placeholder base_url (WI#330)", () => 
   }
   delete env.KIMI_BASE_URL
 
-  const refused = spawnSync("bash", ["-c", entrypoint.slice(0, configSectionEnd)], {
+  const refused = spawnSync("bash", ["-c", setupScript.slice(0, configSectionEnd)], {
     encoding: "utf8",
     env,
   })
@@ -292,7 +320,7 @@ test("entrypoint refuses to run the baked placeholder base_url (WI#330)", () => 
 
   // A whitespace-only KIMI_BASE_URL is NOT an override: the placeholder must
   // survive and the guard must still fire (whitespace bypass regression).
-  const whitespace = spawnSync("bash", ["-c", entrypoint.slice(0, configSectionEnd)], {
+  const whitespace = spawnSync("bash", ["-c", setupScript.slice(0, configSectionEnd)], {
     encoding: "utf8",
     env: { ...env, KIMI_BASE_URL: "  " },
   })
@@ -308,7 +336,7 @@ type = "openai"
 base_url = "http://127.0.0.1:1/v1"
 api_key = "k"
 `)
-  const custom = spawnSync("bash", ["-c", entrypoint.slice(0, configSectionEnd)], {
+  const custom = spawnSync("bash", ["-c", setupScript.slice(0, configSectionEnd)], {
     encoding: "utf8",
     env,
   })
