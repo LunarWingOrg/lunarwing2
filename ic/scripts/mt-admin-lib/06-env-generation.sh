@@ -2560,7 +2560,14 @@ provision_tenant_ssh_key() {
   local authorized_keys="$ssh_dir/authorized_keys"
   sudo -u "$name" touch "$authorized_keys"
   sudo -u "$name" chmod 600 "$authorized_keys"
-  if ! sudo -u "$name" grep -qF "$(cat "$pubkey_path" 2>/dev/null)" "$authorized_keys" 2>/dev/null; then
+  # WI#423 (run-171 LS-3): read the public key as the tenant and hand it to
+  # grep on stdin. A root `cat` would follow a tenant-planted symlink, and a
+  # command-line argument is visible to every local user through /proc.
+  local pubkey_line
+  if ! pubkey_line="$(tenant_cat "$name" "$pubkey_path" 2>/dev/null)" || [[ -z "$pubkey_line" ]]; then
+    die "cannot read the public key $pubkey_path as tenant '$name'"
+  fi
+  if ! printf '%s\n' "$pubkey_line" | sudo -u "$name" grep -qF -f - "$authorized_keys" 2>/dev/null; then
     sudo -u "$name" bash -c "cat '$pubkey_path' >> '$authorized_keys'"
     say "added public key to authorized_keys for $name"
   fi
@@ -2634,24 +2641,44 @@ upload_tenant_ssh_key() {
   # anonymous config FD for both readiness and upload requests.
   local auth_header="Authorization: Bearer ${ssh_api_token}"
 
+  # WI#423 (run-171 LS-2): the staged key sits in the tenant-writable env
+  # dir, so root must not open it directly — a symlink planted there would
+  # hand any root-readable file to the tenant's own daemon. Snapshot it AS
+  # THE TENANT (tenant_cat refuses what the tenant cannot read) into a
+  # root-private temp file before probing the gateway, feed jq from that
+  # copy, and remove the copy on every path.
+  local key_snapshot upload_result upload_rc=0
+  key_snapshot="$(mktemp)" || { say "ERROR: cannot create the SSH key snapshot; staged key not uploaded" >&2; return 1; }
+  if ! tenant_cat "$name" "$staged_key" >"$key_snapshot" 2>/dev/null; then
+    rm -f -- "$key_snapshot"
+    say "ERROR: could not safely read the staged SSH key for tenant '$name' as the tenant; staged key not uploaded" >&2
+    return 1
+  fi
+  if [[ ! -s "$key_snapshot" ]]; then
+    rm -f -- "$key_snapshot"
+    say "ERROR: staged SSH key for tenant '$name' is empty; staged key not uploaded" >&2
+    return 1
+  fi
+
   # Wait for the gateway to be reachable (it may still be starting up).
   local i=0
   while ! curl -sf --max-time 2 \
       -K <(printf 'header = "%s"\n' "$auth_header") \
       "http://127.0.0.1:${http_port}/agent/status" >/dev/null 2>&1; do
     i=$((i + 1))
-    [[ $i -lt 15 ]] || { say "WARNING: authenticated SSH API not reachable on port $http_port after repeated probes; SSH key not uploaded" >&2; return 1; }
+    [[ $i -lt 15 ]] || { rm -f -- "$key_snapshot"; say "WARNING: authenticated SSH API not reachable on port $http_port after repeated probes; SSH key not uploaded" >&2; return 1; }
     sleep 2
   done
 
   # Upload the key via the SSH API. The key data is sent as a JSON string
   # (base64 not needed — the API accepts raw PEM/OpenSSH format).
-  local upload_result
-  if ! upload_result="$(jq -n --rawfile key "$staged_key" '{key_data: $key}' | \
+  upload_result="$(jq -n --rawfile key "$key_snapshot" '{key_data: $key}' | \
     curl -sf -X POST "http://127.0.0.1:${http_port}/hosts/${ssh_host}/key" \
       -H "Content-Type: application/json" \
       -K <(printf 'header = "%s"\n' "$auth_header") \
-      -d @- 2>/dev/null)"; then
+      -d @- 2>/dev/null)" || upload_rc=$?
+  rm -f -- "$key_snapshot"
+  if [[ "$upload_rc" -ne 0 ]]; then
     say "ERROR: SSH key upload request failed; staged key remains at $staged_key" >&2
     return 1
   fi

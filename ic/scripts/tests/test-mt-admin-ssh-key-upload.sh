@@ -196,6 +196,100 @@ assert_eq 'symlink refusal leaves the foreign env untouched' "$(cat "$lf4_victim
 rm -f "$env_path"
 mv "$fixture_dir/lf4-real.env" "$env_path"
 
+# WI#423 (run-171 LS-2): the staged key itself used to be read by root
+# (`jq --rawfile` on the tenant-writable path). A symlink planted at
+# env/ssh_key_staged would hand any root-readable file to the tenant's own
+# daemon. The key is now snapshotted AS THE TENANT: what the tenant cannot
+# read is refused, nothing is sent, and the root-private snapshot never
+# outlives the call. The tenant-side refusal is modelled by a tenant_cat that
+# denies reads through a symlink (the invoking user may be root here).
+ls2_orig_tenant_cat="$(declare -f tenant_cat)"
+ls2_tenant_cat() {
+  if [[ -L "$2" ]]; then
+    printf 'cat: %s: Permission denied\n' "$2" >&2
+    return 1
+  fi
+  cat -- "$2"
+}
+tenant_cat() { ls2_tenant_cat "$@"; }
+ls2_tmp="$fixture_dir/ls2-tmp"
+mkdir -p "$ls2_tmp"
+ls2_victim="$fixture_dir/ls2-root-only.key"
+ls2_secret='root-only-secret-material'
+_env_set "$env_path" SSH_API_TOKEN "$fixture_token"
+printf '%s\n' "$ls2_secret" >"$ls2_victim"
+chmod 0600 "$ls2_victim"
+rm -f "$staged_key" "$fixture_dir/readiness.args" "$fixture_dir/upload.args" "$fixture_dir/upload.body" "$fixture_dir/messages.log"
+ln -s "$ls2_victim" "$staged_key"
+upload_response='{"success":true}'
+upload_status=0
+rv=0
+TMPDIR="$ls2_tmp" upload_tenant_ssh_key fixture || rv=$?
+assert_eq 'symlinked staged key fails closed' "$rv" '1'
+if grep -q 'could not safely read the staged SSH key' "$fixture_dir/messages.log" 2>/dev/null; then
+  printf 'PASS: staged-key refusal names the unreadable key\n'
+else
+  printf 'FAIL: staged-key refusal does not name the unreadable key\n'
+  failures=$((failures + 1))
+fi
+assert_file_absent 'symlinked staged key performs no readiness request' "$fixture_dir/readiness.args"
+assert_file_absent 'symlinked staged key performs no upload request' "$fixture_dir/upload.args"
+assert_not_contains 'root-only file never reaches the upload body' "$fixture_dir/upload.body" "$ls2_secret"
+if [[ -L "$staged_key" ]]; then
+  printf 'PASS: symlinked staged key is left in place\n'
+else
+  printf 'FAIL: symlinked staged key was removed or replaced\n'
+  failures=$((failures + 1))
+fi
+assert_eq 'refusal leaves no key snapshot behind' "$(find "$ls2_tmp" -mindepth 1 | wc -l)" '0'
+# Control: a staged key the tenant can read still uploads, and the snapshot
+# is gone afterwards.
+rm -f "$staged_key"
+printf '%s\n' "$fixture_key" >"$staged_key"
+chmod 0600 "$staged_key"
+rv=0
+TMPDIR="$ls2_tmp" upload_tenant_ssh_key fixture || rv=$?
+assert_eq 'readable staged key still uploads' "$rv" '0'
+assert_eq 'uploaded payload comes from the tenant-side snapshot' "$(jq -r .key_data "$fixture_dir/upload.body")" "$fixture_key"
+assert_eq 'successful upload leaves no key snapshot behind' "$(find "$ls2_tmp" -mindepth 1 | wc -l)" '0'
+
+# WI#423 (run-171 LS-3): provision_tenant_ssh_key used to `cat` the tenant's
+# public key as root into a grep argument — a symlink at ~/.ssh/*.pub would
+# leak any root-readable file into a command line every local user can read.
+# The key is now read as the tenant (the same denying tenant_cat models a
+# target the tenant cannot read) and matched on stdin.
+tenant_home() { printf '%s/home' "$fixture_dir"; }
+ls3_ssh="$fixture_dir/home/.ssh"
+mkdir -p "$ls3_ssh"
+chmod 700 "$ls3_ssh"
+printf 'dummy-private-key\n' >"$ls3_ssh/id_ed25519_lunarwing"
+chmod 600 "$ls3_ssh/id_ed25519_lunarwing"
+ls3_victim="$fixture_dir/ls3-root-only.pub"
+printf 'ssh-ed25519 AAAAROOTONLY root-only-line\n' >"$ls3_victim"
+ln -s "$ls3_victim" "$ls3_ssh/id_ed25519_lunarwing.pub"
+rm -f "$staged_key" "$fixture_dir/messages.log"
+rv=0
+ls3_err="$( ( provision_tenant_ssh_key fixture ) 2>&1 )" || rv=$?
+assert_eq 'symlinked public key fails closed' "$rv" '1'
+if [[ "$ls3_err" == *"cannot read the public key"* ]]; then
+  printf 'PASS: public-key refusal names the unreadable key\n'
+else
+  printf 'FAIL: public-key refusal does not name the unreadable key: %s\n' "$ls3_err"
+  failures=$((failures + 1))
+fi
+assert_not_contains 'root-only line never reaches authorized_keys' "$ls3_ssh/authorized_keys" 'root-only-line'
+assert_file_absent 'symlinked public key stages no private key' "$staged_key"
+# Control: a readable public key is appended once and stays single.
+rm -f "$ls3_ssh/id_ed25519_lunarwing.pub"
+ls3_line='ssh-ed25519 AAAATESTKEY lunarwing-ssh-harness-fixture'
+printf '%s\n' "$ls3_line" >"$ls3_ssh/id_ed25519_lunarwing.pub"
+provision_tenant_ssh_key fixture
+provision_tenant_ssh_key fixture
+assert_eq 'readable public key is authorized exactly once' "$(grep -cF "$ls3_line" "$ls3_ssh/authorized_keys")" '1'
+assert_eq 'readable public key stages the private key' "$(cat "$staged_key")" 'dummy-private-key'
+rm -f "$staged_key"
+eval "$ls2_orig_tenant_cat"
+
 if [[ "$failures" -ne 0 ]]; then
   printf 'RESULT: %d failure(s)\n' "$failures"
   exit 1
