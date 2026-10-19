@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "lunarwing": {
+      "type": "stdio",
+      "command": "/usr/local/bin/pebble4lunarwing",
+      "args": ["mcp-shim"]
+    }
+  }
+}

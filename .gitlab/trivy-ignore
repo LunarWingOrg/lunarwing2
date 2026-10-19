@@ -20,16 +20,18 @@
 #   5.40.1-6+deb13u1) and are no longer listed.
 # - bookworm (kimi, pebble images) still ships vulnerable libsqlite3-0
 #   3.40.1-2+deb12u2 and zlib1g 1:1.2.13.dfsg-1; trixie (opencode,
-#   opencode2 images) ships the fixed 3.46.1-7+deb13u2 and
-#   1:1.3.dfsg+really1.3.1-1.
+#   opencode2 images) is unaffected (libsqlite3-0 3.46.1-7+deb13u1 in the
+#   built-image SBOMs, CVE-2025-7458 fixed in sqlite3 3.42.0; zlib
+#   1:1.3.dfsg+really1.3.1-1).
 # - openssh-client is still vulnerable in BOTH distros (bookworm
 #   1:9.2p1-2+deb12u10, trixie 1:10.0p1-7+deb13u4).
 
 # libpython3.11-stdlib -> libsqlite3-0: python3's sqlite3 stdlib module.
 # opencode scripts/study_notes_config.py imports sqlite3 and is exercised by
 # a build-time test gate. Still needed for the bookworm images (kimi,
-# pebble); trixie ships the fixed 3.46.1-7+deb13u2, so this entry is inert
-# for opencode/opencode2. Revisit when the next-gen study-notes config lands.
+# pebble); trixie's 3.46.1 is unaffected (fixed in 3.42.0), so this entry is
+# inert for opencode/opencode2. Revisit when the next-gen study-notes config
+# lands.
 CVE-2025-7458 exp:2027-04-17
 
 # openssh-client is required for git+ssh worker operation (CVE-2026-60002 is

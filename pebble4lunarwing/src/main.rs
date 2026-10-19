@@ -1,7 +1,9 @@
 mod bridge;
 mod executor;
 mod health;
+mod mcp_shim;
 mod protocol;
+mod tool_proxy;
 mod workspace_path;
 
 use std::net::SocketAddr;
@@ -9,6 +11,13 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
+    // WI#324: `pebble4lunarwing mcp-shim` is the stdio MCP server the pebble
+    // CLI spawns per task via the baked mcpServers.lunarwing registration.
+    if std::env::args().nth(1).as_deref() == Some("mcp-shim") {
+        mcp_shim::run().await;
+        return;
+    }
+
     let config = bridge::BridgeConfig::from_env();
     eprintln!(
         "[pebble4lunarwing] worker_id={} version={}",
