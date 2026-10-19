@@ -532,9 +532,18 @@ This is **hygiene, not a confidentiality boundary**: the token remains in
 the environment of same-uid long-lived processes (PID 1, the entrypoint
 shell, the health server, the bridge), so `cat /proc/1/environ` hands it
 back — only pebble `cli`, which exec-replaces PID 1, is total. WI#373 was
-closed on 2026-10-14; real isolation (fd or root-only file handoff,
-separate task uid) remains WI#400. Worker images must be rebuilt for the
-strips to reach live tenants.
+closed on 2026-10-14. WI#400's real isolation then landed for the
+kimi/opencode/pebble lanes on rootless podman (the rootful pebble launch
+instead runs the whole container as the tenant uid with no split, WI#422):
+the entrypoint moves the hub token into a
+root-only `0400` file (out of every process environment), the bridge stays
+container root behind a trimmed capability set, and every task process
+drops to a separate task uid via `setpriv --clear-groups
+--ambient-caps=-all --inh-caps=-all --no-new-privs` — so `/proc/1/environ`,
+the bridge environ and the token file all give task code EACCES. The
+opencode2 lane is deliberately not migrated (its image keeps the task uid
+directly). Worker images must be rebuilt for the strips and the split to
+reach live tenants.
 
 ### Daily-Log Backup Cap Fail-Closed (WI#335)
 
@@ -838,8 +847,12 @@ egress-enabled workers; see
 `docs/proposals/EXTERNAL-WORKER-TOOL-PROXY.md` and
 `docs/ops/WORKER-CONTAINERS.md`.
 
-**Worker credential hygiene.** The WI#373 strips are env hygiene, not
-isolation (see the section above); WI#400 tracks the real boundary.
+**Worker credential isolation.** The WI#373 strips are env hygiene; the
+real boundary is WI#400 (root-only token file handoff plus the task-uid
+split, above) — in-tree for kimi/opencode/pebble on rootless podman (the
+rootful pebble launch has no split: it runs as the tenant uid, WI#422), with
+real-worker acceptance riding the rebuilt images like every other worker
+change.
 
 **Known-broken lane.** The opencode **v1** worker lane (v1.18.25) still
 crashes inside `opencode serve` before any model call (WI#333); the new
@@ -870,8 +883,11 @@ evidence for every lane once the worker images are rebuilt; the mt-admin
 `tool_allowlist` render gap closed with the `configure-worker-tools`
 surface), WI#357 (the
 opencode2 v2.0.26 bump stays gated), and WI#412 (pending maintainer
-acceptance). WI#400 tracks
-real worker credential isolation beyond the WI#373 hygiene strips. The
+acceptance). WI#400's implementation landed this cycle (token file
+handoff + task-uid split on kimi/opencode/pebble, rootless lanes; the
+rootful pebble launch has no split by design); what stays open is its
+real-worker acceptance on rebuilt images and the opencode2 lane's own
+migration. The
 five test-build field reports (WI#366, WI#372, WI#385, WI#398, WI#399)
 and the WI#359/WI#373 triage items were closed on 2026-10-14; WI#336,
 WI#356, WI#376, WI#377, WI#380, WI#393, WI#395, WI#396 (the cross-cron

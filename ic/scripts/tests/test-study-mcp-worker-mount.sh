@@ -46,7 +46,9 @@ ensure_container_runtime() { :; }
 _ensure_tenant_image() { return 0; }
 ensure_init_system() { INIT_SYSTEM="openrc"; }
 _register_worker_unit() { :; }
-container_image_user="$OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID"
+# WI#400: the opencode lane runs a root entrypoint (image USER 0:0) whose
+# serve/tasks drop to the task uid, so the stubbed image user is 0:0.
+container_image_user="0:0"
 _ctr() {
   printf '%s\n' "$*" >> "$ctr_calls"
   if [[ "$2" == "image" && "$3" == "inspect" ]]; then
@@ -254,15 +256,19 @@ fi
 dockerfile="$SCRIPT_DIR/../../opencode4lunarwing/Dockerfile"
 grep -Fq "groupadd --gid $OPENCODE_CONTAINER_GID opencode" "$dockerfile"
 grep -Fq "useradd --uid $OPENCODE_CONTAINER_UID --gid $OPENCODE_CONTAINER_GID" "$dockerfile"
-grep -Fq "USER $OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID" "$dockerfile"
+# WI#400: the bridge runs as container root and drops tasks to the task uid.
+grep -Eq '^ENV OPENCODE_TASK_UID=' "$dockerfile"
+grep -Eq '^    OPENCODE_TASK_GID=' "$dockerfile"
+grep -Eq '^USER 0:0[[:space:]]*$' "$dockerfile"
 
-container_image_user="999:999"
+# The pre-WI#400 image user (the task uid directly) must now be refused.
+container_image_user="10001:10001"
 : > "$ctr_calls"
 if stale_output="$(start_tenant_opencode test 2>&1)"; then
   printf 'OpenCode worker accepted stale image user contract\n' >&2
   exit 1
 fi
-if [[ "$stale_output" != *"expected $OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID; rebuild it"* ]]; then
+if [[ "$stale_output" != *"expected 0:0 (WI#400 root entrypoint; serve/tasks drop to $OPENCODE_CONTAINER_UID); rebuild it"* ]]; then
   printf 'OpenCode stale image error omitted rebuild instruction\n' >&2
   exit 1
 fi
@@ -272,7 +278,7 @@ if grep -Fq -- ' run -d ' "$ctr_calls"; then
 fi
 
 # A rebuilt image must escape any StartLimitBurst lockout left by old failures.
-container_image_user="$OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID"
+container_image_user="0:0"
 CONTAINER_RT="podman"
 # Override consumed by sourced worker startup.
 # shellcheck disable=SC2034

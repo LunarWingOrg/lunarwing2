@@ -90,15 +90,34 @@ fn create_cron_workspace(path: &str, workspace_root: &Path) -> io::Result<PathBu
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
             .open(path)
     };
+    // WI#400 run-164 KW-4 + LD-12: the bridge runs as root while the cron
+    // task runs under the separate task uid, so every directory THIS walk
+    // creates (intermediates and leaf alike) must be handed to the task
+    // identity — a root-owned intermediate blocks sibling creation under
+    // it. Pre-existing components are never recorded (never re-chowned).
+    // Resolve the task identity up front: a half-set PEBBLE_TASK_UID/GID
+    // pair is a configuration error and fails closed before any directory
+    // is created.
+    let task_ids = crate::executor::task_ids_from_env()?;
     let mut parent = open_dir(&root)?;
-    for part in path.split('/') {
+    let parts: Vec<&str> = path.split('/').collect();
+    let mut created: Vec<std::fs::File> = Vec::new();
+    for part in &parts {
         let child = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd())).join(part);
+        let mut made = false;
         match create_dir(&child) {
-            Ok(()) => {}
+            Ok(()) => made = true,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(annotate_component(part, error)),
         }
-        parent = open_dir(&child).map_err(|error| annotate_component(part, error))?;
+        let opened = open_dir(&child).map_err(|error| annotate_component(part, error))?;
+        if made {
+            let held = opened
+                .try_clone()
+                .map_err(|error| annotate_component(part, error))?;
+            created.push(held);
+        }
+        parent = opened;
     }
     let resolved = resolve_workspace_path(path, &root)?;
     // WI#375 DS-1: the descriptor walk and the re-resolved path must name
@@ -114,6 +133,18 @@ fn create_cron_workspace(path: &str, workspace_root: &Path) -> io::Result<PathBu
                 io::ErrorKind::NotFound,
                 format!("resolved path changed during bootstrap for '{path}'"),
             ));
+        }
+    }
+    // KW-4/LD-12: hand every directory this walk created to the task
+    // identity through the held O_DIRECTORY|O_NOFOLLOW descriptors — no
+    // path re-resolution, no symlink window, and a pre-existing component
+    // (never recorded) keeps its owner. The bridge is root, so the fchown
+    // cannot fail there; if it ever does (an unprivileged host run with the
+    // identity pinned), fail closed rather than leave a root-owned
+    // directory the task cannot write.
+    if let Some((task_uid, task_gid)) = task_ids {
+        for held in &created {
+            std::os::unix::fs::fchown(held, Some(task_uid), Some(task_gid))?;
         }
     }
     Ok(resolved)
@@ -544,6 +575,161 @@ mod tests {
                 "DS-1 race window never hit within the time budget (harness liveness only; no redirect was returned)"
             );
         }
+    }
+
+    /// WI#400 run-164 KW-4: a cron tick whose leaf the bootstrap just created
+    /// must be handed to the task identity (the bridge is root; the task
+    /// writes there). Runs as its own child test process so the env can
+    /// carry the identity shape (the crate forbids unsafe code, so
+    /// `std::env::set_var` is not an option). Both halves are non-vacuous:
+    /// unprivileged, a FOREIGN id must fail with `PermissionDenied` (without
+    /// the fchown it would silently succeed); as root (the in-image gate),
+    /// the same shape must succeed and the leaf must carry the foreign uid.
+    /// Re-exec this test binary as a child with `PEBBLE_TASK_UID/GID` pinned
+    /// to `drop_ids` and the marker set, and require exactly one test to
+    /// pass in the child (the shared parent-phase shape of the WI#400
+    /// identity tests).
+    fn rerun_as_child_with_ids(
+        exe: &std::path::Path,
+        child_marker: &str,
+        marker: &str,
+        test_path: &str,
+        drop_ids: (u32, u32),
+    ) {
+        let out = std::process::Command::new(exe)
+            .args(["--exact", test_path, "--nocapture"])
+            .env(child_marker, marker)
+            .env("PEBBLE_TASK_UID", drop_ids.0.to_string())
+            .env("PEBBLE_TASK_GID", drop_ids.1.to_string())
+            .output()
+            .expect("re-exec test binary");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let stderr_text = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "child phase {marker} failed:\nstdout: {text}\nstderr: {stderr_text}"
+        );
+        assert!(
+            text.contains("test result: ok. 1 passed"),
+            "child phase {marker} ran no tests (drifted test path?):\nstdout: {text}\nstderr: {stderr_text}"
+        );
+    }
+
+    #[test]
+    fn cron_bootstrap_hands_new_leaf_to_the_task_identity() {
+        use std::os::unix::fs::MetadataExt;
+
+        const CHILD_MARKER: &str = "PEBBLE_WI400_KW4_CHILD";
+        const TEST_PATH: &str =
+            "workspace_path::tests::cron_bootstrap_hands_new_leaf_to_the_task_identity";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            // The crate forbids unsafe code (libc::geteuid is unsafe), so
+            // self-identity comes from a directory this process creates:
+            // its owner/group are this process's euid/egid.
+            let probe = temp_root("cron-kw4-selfid");
+            let meta = probe.metadata().expect("self-id probe metadata");
+            let own_ids = (meta.uid(), meta.gid());
+            std::fs::remove_dir_all(&probe).ok();
+            let exe = std::env::current_exe().expect("test binary path");
+            for marker in ["self", "foreign"] {
+                let drop_ids = if marker == "foreign" {
+                    (own_ids.0 + 1000, own_ids.1 + 1000)
+                } else if own_ids.0 == 0 {
+                    // LD-14: id 0 is refused as a task identity, so the root
+                    // "self" phase uses a stand-in unprivileged uid instead.
+                    (65534, 65534)
+                } else {
+                    own_ids
+                };
+                rerun_as_child_with_ids(&exe, CHILD_MARKER, marker, TEST_PATH, drop_ids);
+            }
+            return;
+        }
+
+        // Child phase: the task identity arrived via env from the parent.
+        let foreign = std::env::var_os(CHILD_MARKER)
+            .as_deref()
+            .and_then(|v| v.to_str())
+            == Some("foreign");
+        let ids: (u32, u32) = (
+            std::env::var("PEBBLE_TASK_UID")
+                .expect("task uid in child env")
+                .parse()
+                .expect("numeric task uid"),
+            std::env::var("PEBBLE_TASK_GID")
+                .expect("task gid in child env")
+                .parse()
+                .expect("numeric task gid"),
+        );
+
+        let root = temp_root("cron-kw4");
+        // LD-12 shape: a pre-existing component plus a created intermediate
+        // and leaf. As root the pre-existing dir is chowned to a third uid so
+        // "never re-chowned" is observable; unprivileged it already carries
+        // this process's uid (same as the "self" task id, so only the root
+        // child distinguishes it — the root lane is the pin).
+        let pre = root.join("pre");
+        std::fs::create_dir(&pre).expect("create pre-existing component");
+        let self_is_root = root.metadata().expect("root metadata").uid() == 0;
+        let self_uid = root.metadata().expect("root metadata").uid();
+        // Third uid, distinct from both the root bridge (0) and the root
+        // "self" task stand-in (65534), so "never re-chowned" stays
+        // observable in every phase.
+        let pre_marker_uid: u32 = if self_is_root { 65533 } else { self_uid };
+        if self_is_root {
+            std::os::unix::fs::chown(&pre, Some(pre_marker_uid), Some(pre_marker_uid))
+                .expect("chown pre-existing marker");
+        }
+        let context = crate::protocol::TaskContext {
+            project_dir: Some("pre/missions/kw4".to_string()),
+            cron_tick: Some(serde_json::json!({"event":"cron.tick"})),
+            ..Default::default()
+        };
+        let outcome = resolve_task_workspace(&context, &root);
+        if foreign && self_uid != 0 {
+            // Unprivileged: the fchown to a foreign uid must fail (EPERM),
+            // proving the handoff was attempted; PermissionDenied classifies
+            // permanent, so the wrapper uses the Invalid wording (DS-2).
+            let error = outcome.expect_err("foreign uid handoff must fail unprivileged");
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(
+                error.to_string().contains("Invalid workspace path"),
+                "foreign handoff must classify permanent, got: {error}"
+            );
+        } else {
+            let mission = outcome.expect("bootstrap succeeds");
+            let landed = mission.metadata().expect("leaf metadata");
+            assert_eq!(landed.uid(), ids.0, "new leaf must be task-owned");
+            assert_eq!(landed.gid(), ids.1, "new leaf must be task-group-owned");
+            // LD-12: the created INTERMEDIATE is task-owned too, or the task
+            // cannot create siblings under it.
+            let intermediate = pre.join("missions");
+            let inter_meta = intermediate.metadata().expect("intermediate metadata");
+            assert_eq!(
+                inter_meta.uid(),
+                ids.0,
+                "created intermediate must be task-owned"
+            );
+            // A pre-existing component is never re-chowned: the root child
+            // pinned it to 65534; unprivileged it keeps this process's uid.
+            let pre_meta = pre.metadata().expect("pre-existing metadata");
+            let expected_pre = pre_marker_uid;
+            assert_eq!(
+                pre_meta.uid(),
+                expected_pre,
+                "pre-existing component must keep its owner"
+            );
+            // A pre-existing leaf is never re-chowned: the second tick takes
+            // the AlreadyExists path and leaves the identity untouched.
+            let again = resolve_task_workspace(&context, &root).expect("second tick succeeds");
+            assert_eq!(again, mission);
+            assert_eq!(
+                pre.metadata().expect("pre-existing metadata").uid(),
+                expected_pre,
+                "second tick must not re-chown the pre-existing component"
+            );
+        }
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

@@ -1469,8 +1469,10 @@ start_tenant_opencode() {
   local name="$1"
   ensure_container_runtime
 
-  # Record the mount policy even for rootful/OpenRC imperative containers.
-  local opencode_launch_contract="ssh-agent-dir-ro"
+  # Record the mount/policy shape even for rootful/OpenRC imperative
+  # containers; cap-trim records the WI#400 KW-3 capability trim so existing
+  # containers force-recreate onto it.
+  local opencode_launch_contract="ssh-agent-dir-ro;cap-trim"
   local -a opencode_userns_args=()
   if [[ "$CONTAINER_RT" == "podman" && "$MT_ROOTLESS" == "true" ]]; then
     opencode_launch_contract="$OPENCODE_ROOTLESS_LAUNCH_CONTRACT"
@@ -1501,9 +1503,9 @@ start_tenant_opencode() {
   image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
     lunarwing-worker-opencode:latest 2>/dev/null || true)"
   case "$image_user" in
-    "$OPENCODE_CONTAINER_UID"|"$OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID") ;;
+    "0:0"|"0") ;;
     *)
-      die "opencode worker image has user '${image_user:-unset}', expected $OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID; rebuild it"
+      die "opencode worker image has user '${image_user:-unset}', expected 0:0 (WI#400 root entrypoint; serve/tasks drop to $OPENCODE_CONTAINER_UID); rebuild it"
       ;;
   esac
 
@@ -1646,6 +1648,8 @@ start_tenant_opencode() {
       --name "$container_name" \
       "${healthcheck_args[@]}" \
       "${opencode_userns_args[@]}" \
+      --security-opt no-new-privileges \
+      --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add KILL --cap-add SETUID --cap-add SETGID \
       -e LUNARWING_WORKER_ID="worker-opencode-${name}" \
       -e WS_PORT="$wss_port" \
       -e HEALTH_PORT="8443" \
@@ -2060,7 +2064,9 @@ start_tenant_kimi() {
   local name="$1"
   ensure_container_runtime
 
-  local kimi_launch_contract=""
+  # cap-trim records the WI#400 KW-3 capability trim so existing rootful
+  # containers force-recreate onto it.
+  local kimi_launch_contract="cap-trim"
   local -a kimi_userns_args=()
   if [[ "$CONTAINER_RT" == "podman" && "$MT_ROOTLESS" == "true" ]]; then
     kimi_launch_contract="$KIMI_ROOTLESS_LAUNCH_CONTRACT"
@@ -2088,9 +2094,9 @@ start_tenant_kimi() {
   image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
     lunarwing-worker-kimi:latest 2>/dev/null || true)"
   case "$image_user" in
-    "$KIMI_CONTAINER_UID"|"$KIMI_CONTAINER_UID:$KIMI_CONTAINER_GID") ;;
+    "0:0"|"0") ;;
     *)
-      die "kimi worker image has user '${image_user:-unset}', expected $KIMI_CONTAINER_UID:$KIMI_CONTAINER_GID; rebuild it"
+      die "kimi worker image has user '${image_user:-unset}', expected 0:0 (WI#400 root entrypoint; tasks drop to $KIMI_CONTAINER_UID); rebuild it"
       ;;
   esac
 
@@ -2180,6 +2186,7 @@ start_tenant_kimi() {
       "${healthcheck_args[@]}" \
       "${kimi_userns_args[@]}" \
       --security-opt no-new-privileges \
+      --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add KILL --cap-add SETUID --cap-add SETGID \
       -e LUNARWING_WORKER_ID="worker-kimi-${name}" \
       -e WS_PORT="$wss_port" \
       -e HEALTH_PORT="8443" \
@@ -2257,6 +2264,18 @@ start_tenant_pebble() {
   else
     pebble_launch_contract="$(_worker_launch_contract "$name" lunarwing-worker-pebble:latest "$PEBBLE_ROOTFUL_LAUNCH_CONTRACT")"
   fi
+  # WI#400 LD-8: the pebble bridge must run as container root (image USER
+  # 0:0) — under rootless keep-id an image without USER starts the bridge
+  # as the task uid and the credential split is a no-op.
+  local image_user
+  image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
+    lunarwing-worker-pebble:latest 2>/dev/null || true)"
+  case "$image_user" in
+    "0:0"|"0") ;;
+    *)
+      die "pebble worker image has user '${image_user:-unset}', expected 0:0 (WI#400 root bridge; tasks drop to $PEBBLE_CONTAINER_UID); rebuild it"
+      ;;
+  esac
 
   # systemd + rootless podman: Quadlet .container owns the lifecycle (the unit's
   # [Container] spec creates+runs it), so skip the imperative `_ctr run` below.
@@ -2359,9 +2378,15 @@ start_tenant_pebble() {
     local ssh_agent_dir
     ssh_agent_dir="$(tenant_run_dir "$name")/ssh-agent"
     ssh_mount=(-v "${ssh_agent_dir}:/tmp/ssh-agent:ro,z" -e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock)
+    # WI#400: keep-id binds the in-container task uid to the tenant account
+    # (bridge stays container root; tasks drop via setpriv).
+    local -a pebble_userns_args=()
+    if [[ "$CONTAINER_RT" == "podman" && "$MT_ROOTLESS" == "true" ]]; then
+      pebble_userns_args=(--userns "$PEBBLE_USERNS")
+    fi
     # WI#422 (run-164 KY-1): rootful pebble runs as the tenant uid:gid. The
-    # image has no USER, so without --user the container (and its
-    # --restart unless-stopped resurrects) runs as host root while the runtime
+    # image pins USER 0:0 (WI#400 LD-8), so without --user the container (and
+    # its --restart unless-stopped resurrects) runs as host root while the runtime
     # re-resolves the /workspace bind source at every start — a tenant who
     # swaps ~/lunarwing/pebble-workspace for a symlink redirects host-root
     # writes through their own pebble tasks. The numeric tenant uid has no
@@ -2370,9 +2395,7 @@ start_tenant_pebble() {
     # the toolchain caches are anchored inside the tenant-owned /workspace
     # mount — login shells pick the same values up through the image's
     # /etc/profile.d/toolchain snippet, which defers to preset env.
-    # no-new-privileges (run-167 LH-2): the image ships Debian's standard
-    # setuid set; once the container is non-root, closing the setuid/file-cap
-    # route back to container root is what makes the uid drop one-way.
+    # no-new-privileges (run-167 LH-2) is on the run line for both lanes.
     local -a pebble_user_args=()
     if [[ "$MT_ROOTLESS" != "true" ]]; then
       local pebble_tenant_uid pebble_tenant_gid
@@ -2382,17 +2405,28 @@ start_tenant_pebble() {
         || die "cannot resolve gid for tenant '$name' (rootful pebble launch)"
       pebble_user_args=(
         --user "${pebble_tenant_uid}:${pebble_tenant_gid}"
-        --security-opt no-new-privileges
         -e HOME=/workspace
         -e GOPATH=/workspace/go
         -e GOCACHE=/workspace/.cache/go-build
         -e CARGO_HOME=/workspace/.cargo
+        # WI#400 x WI#422 (run-167 LH-1 / run-170 LP-2): the container runs as
+        # the tenant uid, so there is no privilege split on this lane. The
+        # explicit `inherit` pair tells the bridge to run tasks as its own
+        # identity by design; it is distinct from the image's numeric pins
+        # (rootless keep-id split) and from the empty value (fail-closed),
+        # so the bridge can still refuse a rootless keep-id launch that
+        # happened to start as the task uid (LD-8).
+        -e PEBBLE_TASK_UID=inherit
+        -e PEBBLE_TASK_GID=inherit
       )
     fi
     _ctr "$name" run -d \
       --name "$container_name" \
       "${healthcheck_args[@]}" \
+      "${pebble_userns_args[@]}" \
       "${pebble_user_args[@]}" \
+      --security-opt no-new-privileges \
+      --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add KILL --cap-add SETUID --cap-add SETGID \
       -e LUNARWING_WORKER_ID="worker-pebble-${name}" \
       -e WS_PORT="$wss_port" \
       -e HEALTH_PORT="8443" \

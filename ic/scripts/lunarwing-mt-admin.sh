@@ -160,15 +160,23 @@ OPENCODE_USERNS="keep-id:uid=${OPENCODE_CONTAINER_UID},gid=${OPENCODE_CONTAINER_
 # ssh-agent-dir-ro: keep the restart-safe directory mount, but make it
 # read-only so workers cannot unlink/rebind the host agent socket (WI#226).
 # Bumping the contract recreates imperative containers still using RW mounts.
-OPENCODE_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE_USERNS};ssh-agent-dir-ro"
+# no-new-privileges (WI#400 run-164 KW-2): with the WI#400 root bridge, the
+# container-level setting keeps setuid/file-capability binaries from handing
+# privilege back to task code; recording it bumps the contract so existing
+# containers force-recreate onto the setting. cap-trim (KW-3): the bridge
+# also runs with --cap-drop=ALL plus only CHOWN/DAC_OVERRIDE/FOWNER/KILL/
+# SETUID/SETGID instead of the default capability set.
+OPENCODE_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE_USERNS};ssh-agent-dir-ro;no-new-privileges;cap-trim"
 
 KIMI_CONTAINER_UID="10002"
 KIMI_CONTAINER_GID="10002"
 KIMI_USERNS="keep-id:uid=${KIMI_CONTAINER_UID},gid=${KIMI_CONTAINER_GID}"
 # WI#206: the kimi lane dropped the SSH-agent mount and gained
 # no-new-privileges; bumping the contract force-recreates existing containers
-# that still carry the socket mount.
-KIMI_ROOTLESS_LAUNCH_CONTRACT="userns=${KIMI_USERNS};no-ssh-agent;no-new-privileges"
+# that still carry the socket mount. cap-trim (WI#400 run-164 KW-3): the root
+# bridge runs with --cap-drop=ALL plus only CHOWN/DAC_OVERRIDE/FOWNER/KILL/
+# SETUID/SETGID instead of the default capability set.
+KIMI_ROOTLESS_LAUNCH_CONTRACT="userns=${KIMI_USERNS};no-ssh-agent;no-new-privileges;cap-trim"
 
 # OpenCode 2 worker lane (docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md).
 # Distinct UID so opencode (10001) and opencode2 (10003) on one tenant keep
@@ -182,7 +190,22 @@ OPENCODE2_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE2_USERNS};ssh-agent-dir-ro"
 
 # The pebble lane mounts the SSH agent directory like the other non-kimi
 # workers; bump the contract to recreate existing containers with RW mounts.
-PEBBLE_ROOTLESS_LAUNCH_CONTRACT="ssh-agent-dir-ro"
+# WI#400: pebble tasks now run under a uid separate from the bridge
+# (container root). keep-id binds the task uid to the tenant account, so
+# workspace writes stay tenant-owned on the host and the SSH-agent socket
+# stays reachable by tasks; the bridge's container-root identity moves into
+# the subuid range. Adding userns= bumps the contract, force-recreating
+# existing pebble containers (whose tasks ran as container root).
+# no-new-privileges (WI#400 run-164 KW-2): with the root bridge, the
+# container-level setting keeps setuid/file-capability binaries from handing
+# privilege back to task code; recording it bumps the contract so existing
+# containers force-recreate onto the setting. cap-trim (KW-3): the bridge
+# also runs with --cap-drop=ALL plus only CHOWN/DAC_OVERRIDE/FOWNER/KILL/
+# SETUID/SETGID instead of the default capability set.
+PEBBLE_CONTAINER_UID="10004"
+PEBBLE_CONTAINER_GID="10004"
+PEBBLE_USERNS="keep-id:uid=${PEBBLE_CONTAINER_UID},gid=${PEBBLE_CONTAINER_GID}"
+PEBBLE_ROOTLESS_LAUNCH_CONTRACT="userns=${PEBBLE_USERNS};ssh-agent-dir-ro;no-new-privileges;cap-trim"
 
 # WI#422 (run-164 KY-1): on rootless podman the pebble container runs as the
 # tenant uid already (container root maps to the invoking tenant), so a
@@ -193,10 +216,12 @@ PEBBLE_ROOTLESS_LAUNCH_CONTRACT="ssh-agent-dir-ro"
 # ~/lunarwing/pebble-workspace for a symlink redirects host-root writes
 # through their own pebble tasks. The rootful lane now launches with
 # `--user <tenant uid>:<gid>` plus `--security-opt no-new-privileges`
-# (start_tenant_pebble); this distinct base contract forces start-tenant to
-# recreate every pre-fix root-running container once, on its next
-# start-tenant.
-PEBBLE_ROOTFUL_LAUNCH_CONTRACT="tenant-uid-user;workspace-toolchain-home;no-new-privileges"
+# (start_tenant_pebble), and passes PEBBLE_TASK_UID/GID=inherit so the bridge
+# runs tasks as its own (tenant) identity instead of the image's numeric
+# split (WI#400 x WI#422); this distinct base contract forces start-tenant
+# to recreate every container created under an older rootful shape once, on
+# its next start-tenant.
+PEBBLE_ROOTFUL_LAUNCH_CONTRACT="tenant-uid-user;workspace-toolchain-home;no-new-privileges;task-uid-inherit"
 
 # ── Library sourcing ─────────────────────────────────────────────────────────
 #

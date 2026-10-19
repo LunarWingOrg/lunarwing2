@@ -7,7 +7,7 @@
  */
 
 import assert from "node:assert/strict"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { chownSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs"
 import { connect, type Socket } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -255,6 +255,67 @@ test("closing a task fails its in-flight calls", async () => {
   assert.equal(typeof response.error, "string")
 })
 
+test("a symlinked proxy dir is refused, never followed (WI#400 LP-5)", async () => {
+  const base = mkdtempSync(join(tmpdir(), "tool-proxy-lp5-"))
+  const victim = join(base, "victim")
+  mkdirSync(victim, { mode: 0o700 })
+  const link = join(base, "proxy-link")
+  symlinkSync(victim, link)
+  const prevDir = process.env.LUNARWING_TOOL_PROXY_DIR
+  process.env.LUNARWING_TOOL_PROXY_DIR = link
+  const linkRelay = new ToolProxyRelay()
+  const hub = new FakeHubSocket()
+  try {
+    const handle = await linkRelay.startTask("task-lp5", hub)
+    assert.equal(handle, null, "a symlinked proxy dir must be refused (task runs without tools)")
+    assert.deepEqual(readdirSync(victim), [], "the link target must stay untouched")
+    assert.equal(statSync(victim).mode & 0o777, 0o700, "the link target's mode must stay untouched")
+  } finally {
+    await linkRelay.closeTask("task-lp5")
+    if (prevDir === undefined) delete process.env.LUNARWING_TOOL_PROXY_DIR
+    else process.env.LUNARWING_TOOL_PROXY_DIR = prevDir
+    rmSync(base, { recursive: true, force: true })
+  }
+})
+
+test("proxy dir re-asserts root-owned 0711 and only the socket belongs to the task uid (WI#400 KW-6/LD-7, root)", async () => {
+  // Root-only: the handoff targets a foreign uid, so only the root shape
+  // (the CI lane and the in-image npm test gate) can observe ownership. A
+  // leftover TASK-OWNED proxy directory from an older shape must return to
+  // root-owned 0711, and only the per-task socket may belong to the task
+  // uid — otherwise task code could rename/delete/plant entries among the
+  // root bridge's sockets.
+  if (process.getuid!() !== 0) return
+  const dir = mkdtempSync(join(tmpdir(), "tool-proxy-kw6-"))
+  chownSync(dir, 65534, 65534)
+  const prevDir = process.env.LUNARWING_TOOL_PROXY_DIR
+  const prevUid = process.env.KIMI_TASK_UID
+  const prevGid = process.env.KIMI_TASK_GID
+  process.env.LUNARWING_TOOL_PROXY_DIR = dir
+  process.env.KIMI_TASK_UID = "65534"
+  process.env.KIMI_TASK_GID = "65534"
+  const rootRelay = new ToolProxyRelay()
+  const hub = new FakeHubSocket()
+  try {
+    const handle = await rootRelay.startTask("task-kw6", hub)
+    assert.ok(handle, "task must start with the identity pinned")
+    const dirStat = statSync(dir)
+    assert.equal(dirStat.uid, 0, "leftover task-owned proxy dir must return to root-owned")
+    assert.equal(dirStat.mode & 0o777, 0o711, "proxy dir must be traversable-but-not-listable 0711")
+    const sockStat = statSync(handle.socketPath)
+    assert.equal(sockStat.uid, 65534, "only the per-task socket belongs to the task uid")
+  } finally {
+    await rootRelay.closeTask("task-kw6")
+    if (prevDir === undefined) delete process.env.LUNARWING_TOOL_PROXY_DIR
+    else process.env.LUNARWING_TOOL_PROXY_DIR = prevDir
+    if (prevUid === undefined) delete process.env.KIMI_TASK_UID
+    else process.env.KIMI_TASK_UID = prevUid
+    if (prevGid === undefined) delete process.env.KIMI_TASK_GID
+    else process.env.KIMI_TASK_GID = prevGid
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test("startTask returns null instead of throwing when the proxy dir is unusable (EF-2)", async () => {
   // MR !1549 EF-2: the proxy dir is a same-uid shared /tmp tree — a task
   // process can replace it with a plain file or chmod it. The relay must
@@ -351,6 +412,26 @@ test("socket path is filesystem-safe and unique per task id", () => {
   assert.notEqual(a, b)
   assert.ok(!a.includes(".."))
   assert.ok(!b.includes("\n"))
+})
+
+test("the proxy dir is created bridge-owned 0711 (KW-6)", async () => {
+  // A task uid can traverse the dir and reach its own (chowned) socket, but
+  // can never rename, delete, or plant entries in it. The chown half runs
+  // only as root with a pinned identity (in-image); the directory mode is
+  // pinned at creation on every run. Point the relay at a NOT-yet-existing
+  // subdir so creation (and its mode) is the relay's own work.
+  const sub = join(workDir, "kw6-proxy")
+  process.env.LUNARWING_TOOL_PROXY_DIR = sub
+  try {
+    const hub = new FakeHubSocket()
+    const handle = await relay.startTask("task-kw6", hub)
+    assert.ok(handle, "task proxy should start")
+    assert.equal(statSync(sub).mode & 0o777, 0o711)
+    handle!.close()
+  } finally {
+    process.env.LUNARWING_TOOL_PROXY_DIR = workDir
+    rmSync(sub, { recursive: true, force: true })
+  }
 })
 
 test("proxyEnvForTask carries the binding the shim reads", () => {

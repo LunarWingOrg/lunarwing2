@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { spawn } from "node:child_process"
-import { mkdtempSync, writeFileSync, chmodSync } from "node:fs"
+import { mkdtempSync, writeFileSync, chmodSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { executeTask } from "./kimi_task_executor.js"
@@ -451,6 +451,59 @@ test("executeTask: invalid workspace emits one error result", async () => {
     bin,
   )
   assert.equal(result?.status, "error")
+})
+
+test("executeTask: with the task identity pinned, the CLI spawns through setpriv with the pinned argv (WI#400)", async () => {
+  // KW-7(b): the websocket-mode drop must not silently disappear — removing
+  // the `if (identity)` wrap would ship the task running as the bridge's uid
+  // with no test noticing. A PATH-stub setpriv records its argv and execs
+  // the wrapped command unchanged (the host run is unprivileged; the real
+  // drop happens in the image).
+  const dir = mkdtempSync(join(tmpdir(), "kimi-setpriv-stub-"))
+  const recordFile = join(dir, "argv.json")
+  const stub = join(dir, "setpriv")
+  writeFileSync(
+    stub,
+    `#!/usr/bin/env node
+const fs = require("node:fs")
+const argv = process.argv.slice(2)
+fs.writeFileSync(${JSON.stringify(recordFile)}, JSON.stringify(argv))
+const rest = argv.slice(argv.indexOf("--") + 1)
+const { spawnSync } = require("node:child_process")
+const r = spawnSync(rest[0], rest.slice(1), { stdio: "inherit", env: process.env })
+process.exit(r.status ?? 1)
+`,
+    { mode: 0o755 },
+  )
+  const bin = makeMockKimi("success")
+  const savedPath = process.env.PATH
+  process.env.PATH = `${dir}:${savedPath}`
+  process.env.KIMI_TASK_UID = "10002"
+  process.env.KIMI_TASK_GID = "10002"
+  try {
+    const { result } = await runExecutor(
+      { task_id: "setpriv-pin", prompt: "hello world", timeout_ms: 10_000 },
+      bin,
+    )
+    assert.equal(result?.status, "success", `task failed: ${result?.error}`)
+    const recorded = JSON.parse(readFileSync(recordFile, "utf8")) as string[]
+    const prefix = [
+      "--reuid=10002",
+      "--regid=10002",
+      "--clear-groups",
+      "--ambient-caps=-all",
+      "--inh-caps=-all",
+      "--no-new-privs",
+      "--",
+    ]
+    assert.deepEqual(recorded.slice(0, prefix.length), prefix)
+    assert.equal(recorded[prefix.length], bin, "the CLI path follows the pinned setpriv prefix")
+  } finally {
+    process.env.PATH = savedPath
+    delete process.env.KIMI_TASK_UID
+    delete process.env.KIMI_TASK_GID
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 console.log("kimi task executor self-check passed")

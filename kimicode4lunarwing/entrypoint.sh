@@ -1,5 +1,17 @@
 #!/bin/bash
-# entrypoint.sh — LunarWing Kimi Code Worker startup script
+# entrypoint.sh — LunarWing Kimi Code Worker startup script (root launcher)
+#
+# WI#400: the container starts as root. The hub-handshake credential is
+# moved out of the process environment into a root-only file before any
+# long-lived process is spawned; the WebSocket bridge (which must be able
+# to drop privileges per task) runs as root and reads it from that file,
+# while every task process runs as the separate task uid (kimi, 10002) via
+# setpriv — so /proc/1/environ and the bridge's environ give task code
+# EACCES. Task-side setup (git config, SSH copies, config materialization)
+# runs as the task uid in entrypoint-task-setup.sh so task-owned files
+# keep the right ownership. PID 1 (tini) keeps the original container env
+# (/proc/1/environ is captured at exec time), but it runs as root, so a
+# task-uid read is EACCES — see docs/ops/WORKER-CONTAINERS.md.
 set -euo pipefail
 
 log()  { printf '[%s] %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
@@ -8,54 +20,43 @@ die()  { log "ERROR: $*" >&2; exit 1; }
 MODE="${KIMI_MODE:-websocket}"
 HEALTH_PORT="${HEALTH_PORT:-8443}"
 WS_STATE_FILE="${WS_STATE_FILE:-/tmp/lunarwing_ws_state.json}"
-FILE_UMASK="${FILE_UMASK:-0002}"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-/workspace}"
 KIMI_CODE_HOME="${KIMI_CODE_HOME:-/home/kimi/.kimi-code}"
-KIMI_CONFIG_SOURCE="${KIMI_CONFIG_SOURCE:-/app/config/config.toml}"
+KIMI_TASK_UID="${KIMI_TASK_UID:-10002}"
+KIMI_TASK_GID="${KIMI_TASK_GID:-10002}"
+# The bridge's executor reads these to wrap every task spawn (WI#400); keep
+# the launcher and the bridge on the same identity even when the image ENV
+# is absent (host-side runs).
+export KIMI_TASK_UID KIMI_TASK_GID
 
-umask "$FILE_UMASK"
-
-# ── git / SSH credential setup ────────────────────────────────────────────────
-if [ -n "${GIT_AUTHOR_NAME:-}" ] && ! git config --global user.name >/dev/null 2>&1; then
-  git config --global user.name "$GIT_AUTHOR_NAME"
-  log "Git user.name set to: $GIT_AUTHOR_NAME"
-fi
-if [ -n "${GIT_AUTHOR_EMAIL:-}" ] && ! git config --global user.email >/dev/null 2>&1; then
-  git config --global user.email "$GIT_AUTHOR_EMAIL"
-  log "Git user.email set to: $GIT_AUTHOR_EMAIL"
-fi
-
-if [ -n "${GITHUB_TOKEN:-}" ]; then
-  git config --global credential.https://github.com.helper \
-    '!f() { echo "protocol=https"; echo "host=github.com"; echo "username=x-access-token"; echo "password=${GITHUB_TOKEN}"; }; f'
-  log "GitHub HTTPS credential helper configured"
-elif [ -n "${GH_TOKEN:-}" ]; then
-  git config --global credential.https://github.com.helper \
-    '!f() { echo "protocol=https"; echo "host=github.com"; echo "username=x-access-token"; echo "password=${GH_TOKEN}"; }; f'
-  log "GitHub HTTPS credential helper configured (via GH_TOKEN)"
+# ── WI#400 credential handoff (before anything long-lived is spawned) ────────
+LUNARWING_TOKEN_DIR="${LUNARWING_TOKEN_DIR:-/run/lunarwing}"
+if [ -n "${AGENT_AUTH_TOKEN:-}" ]; then
+  install -d -m 0700 "$LUNARWING_TOKEN_DIR"
+  _token_tmp="$LUNARWING_TOKEN_DIR/.agent_auth_token.$$"
+  ( umask 0177; printf '%s' "$AGENT_AUTH_TOKEN" > "$_token_tmp" )
+  chmod 0400 "$_token_tmp"
+  mv "$_token_tmp" "$LUNARWING_TOKEN_DIR/agent_auth_token"
+  unset AGENT_AUTH_TOKEN
+  export AGENT_AUTH_TOKEN_FILE="$LUNARWING_TOKEN_DIR/agent_auth_token"
 fi
 
-# Copy host SSH keys into writable ~/.ssh if mounted (read-only mount needs copy)
-if [ -d /home/kimi/.host-ssh ] && [ "$(ls -A /home/kimi/.host-ssh 2>/dev/null)" ]; then
-  mkdir -p /home/kimi/.ssh
-  cp -a /home/kimi/.host-ssh/* /home/kimi/.ssh/ 2>/dev/null || true
-  chmod 700 /home/kimi/.ssh 2>/dev/null || true
-  chmod 600 /home/kimi/.ssh/id_* 2>/dev/null || true
-  chmod 644 /home/kimi/.ssh/*.pub 2>/dev/null || true
-  chmod 644 /home/kimi/.ssh/known_hosts 2>/dev/null || true
-  log "SSH keys copied from host mount"
-  if [ ! -f /home/kimi/.ssh/config ]; then
-    printf 'Host *\n  StrictHostKeyChecking accept-new\n  UserKnownHostsFile /home/kimi/.ssh/known_hosts\n' \
-      > /home/kimi/.ssh/config
-    chmod 600 /home/kimi/.ssh/config
+# setpriv flags: the cap-clearing pair is mandatory — setpriv(1) preserves
+# capabilities across the uid change otherwise, and the task could regain
+# the bridge uid (run-98 FY-1 prototype finding). --no-new-privs is
+# mandatory too (run-164 KW-2): without it a setuid or file-capability
+# binary in the image would let task code regain privilege.
+SETPRIV_FLAGS=(--reuid="$KIMI_TASK_UID" --regid="$KIMI_TASK_GID" --clear-groups --ambient-caps=-all --inh-caps=-all --no-new-privs)
+
+# as_task CMD [ARGS...] — run a command as the task uid with the task home;
+# direct exec when already unprivileged (host-side dev runs).
+as_task() {
+  if [ "$(id -u)" = "0" ]; then
+    setpriv "${SETPRIV_FLAGS[@]}" env HOME=/home/kimi "$@"
+  else
+    env HOME="${HOME:-/home/kimi}" "$@"
   fi
-fi
-
-# Copy host .gitconfig if mounted
-if [ -f /home/kimi/.host-gitconfig ] && [ -s /home/kimi/.host-gitconfig ]; then
-  cp /home/kimi/.host-gitconfig /home/kimi/.gitconfig 2>/dev/null || true
-  log "Host .gitconfig copied into container"
-fi
+}
 
 # ── parse CLI args ─────────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
@@ -67,179 +68,19 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# ── config setup ──────────────────────────────────────────────────────────────
-# Materialize the Kimi Code config (config.toml) from the baked default unless
-# a per-tenant KIMI_MODEL/KIMI_BASE_URL/KIMI_API_KEY override is present. Kimi
-# Code CLI reads its config from $KIMI_CODE_HOME/config.toml.
-# KIMI_MODEL replaces default_model; when it does not match an existing
-# [models] alias, the baked model entry is retargeted (alias + model id) so
-# default_model stays resolvable — 0.37.2 fails startup otherwise.
-# KIMI_API_KEY falls back to TENSORZERO_API_KEY for the TensorZero-backed
-# default provider.
-#
-# WI#206: after overrides are applied, the fail-closed policy ([permission]
-# dangerous_command_guard = true and the PreToolUse guard hook) is re-asserted
-# and the guard-disabling env vars are scrubbed from the task environment, so
-# a task (or a prompt-injected command) cannot lower its own approval policy.
+# ── task-side setup (config materialization, git/SSH, MCP registration) ──────
+KIMI_CODE_HOME="$KIMI_CODE_HOME" as_task /app/entrypoint-task-setup.sh
+
+# The bridge's per-task env must carry the LLM key fallback (deliberately
+# NOT stripped, WI#373); the setup process's export dies with it.
 export KIMI_API_KEY="${KIMI_API_KEY:-${TENSORZERO_API_KEY:-}}"
-mkdir -p "$KIMI_CODE_HOME"
 
-if [ ! -f "$KIMI_CONFIG_SOURCE" ]; then
-  die "Kimi config source not found: $KIMI_CONFIG_SOURCE"
-fi
-
-if [ -f "$KIMI_CONFIG_SOURCE" ]; then
-  python3 - "$KIMI_CONFIG_SOURCE" "$KIMI_CODE_HOME/config.toml" <<'PY'
-import os, re, sys, tempfile, tomllib
-
-source, target = sys.argv[1:]
-with open(source, "r", encoding="utf-8") as config_file:
-    text = config_file.read()
-
-def toml_string(value):
-    escapes = {'"': '\\"', '\\': '\\\\', '\b': '\\b', '\t': '\\t', '\n': '\\n', '\f': '\\f', '\r': '\\r'}
-    return '"' + ''.join(escapes.get(char, f"\\u{ord(char):04x}" if ord(char) < 0x20 or ord(char) == 0x7f else char) for char in value) + '"'
-
-def replace_setting(config, name, value, required):
-    if not value:
-        return config
-    pattern = re.compile(rf'^(\s*{re.escape(name)}\s*=).*$' , re.MULTILINE)
-    if pattern.search(config):
-        return pattern.sub(lambda match: f'{match.group(1)} {toml_string(value)}', config, count=1)
-    if required:
-        raise ValueError(f"config missing {name}")
-    return f'{name} = {toml_string(value)}\n{config}'
-
-def retarget_model_entry(config, old_alias, new_model):
-    # KIMI_MODEL does not match an existing [models] alias: rename the baked
-    # model entry (table header + model id) so default_model stays resolvable.
-    # kimi-code >= 0.37 fails startup when default_model is not a known alias.
-    header = re.compile(rf'^\[models\.(?:"{re.escape(old_alias)}"|{re.escape(old_alias)})\]\s*$', re.MULTILINE)
-    match = header.search(config)
-    if not match:
-        # Custom KIMI_CONFIG_SOURCE without a matching models table: leave it
-        # untouched; whoever mounts it owns alias resolution.
-        return config
-    config = config[:match.start()] + f'[models.{toml_string(new_model)}]' + config[match.end():]
-    body = re.compile(r'^(\s*model\s*=).*$', re.MULTILINE).search(config, match.start())
-    if body:
-        config = config[:body.start()] + f'{body.group(1)} {toml_string(new_model)}' + config[body.end():]
-    return config
-
-kimi_model = os.environ.get("KIMI_MODEL", "").strip()
-old_alias = ""
-if kimi_model:
-    try:
-        old_alias = tomllib.loads(text).get("default_model", "")
-    except tomllib.TOMLDecodeError:
-        old_alias = ""
-text = replace_setting(text, "default_model", kimi_model, False)
-if kimi_model and old_alias and old_alias != kimi_model:
-    text = retarget_model_entry(text, old_alias, kimi_model)
-# Whitespace-only URLs are unset (the placeholder guard must still fire).
-# Normalize the model once above so alias retargeting uses the same value;
-# API keys remain byte-for-byte as supplied.
-text = replace_setting(text, "base_url", os.environ.get("KIMI_BASE_URL", "").strip(), True)
-text = replace_setting(text, "api_key", os.environ.get("KIMI_API_KEY", ""), True)
-
-# WI#206 fail-closed policy enforcement. Whatever the source config said
-# (custom KIMI_CONFIG_SOURCE mounts included), the worker never runs with the
-# dangerous-command guard disabled or without the PreToolUse guard hook:
-# both are (re)injected when absent and verified present afterwards.
-def policy_block(config):
-    return "\n[permission]\ndangerous_command_guard = true\n"
-
-def hook_block():
-    return ("\n[[hooks]]\n"
-            "event = \"PreToolUse\"\n"
-            "matcher = \"Bash\"\n"
-            "command = \"node /app/hooks/headless_command_guard.mjs\"\n"
-            "timeout = 10\n")
-
-parsed = tomllib.loads(text)
-if "permission" not in parsed or not isinstance(parsed.get("permission"), dict):
-    text += policy_block(text)
-elif parsed["permission"].get("dangerous_command_guard") is not True:
-    if "dangerous_command_guard" in parsed["permission"]:
-        text = re.sub(
-            r"^\s*dangerous_command_guard\s*=.*$",
-            "dangerous_command_guard = true",
-            text,
-            count=1,
-            flags=re.MULTILINE,
-        )
-    else:
-        text = text.replace("[permission]", "[permission]\ndangerous_command_guard = true", 1)
-parsed = tomllib.loads(text)
-hooks = parsed.get("hooks")
-guard_hook_present = isinstance(hooks, list) and any(
-    isinstance(hook, dict)
-    and hook.get("event") == "PreToolUse"
-    and hook.get("matcher") == "Bash"
-    and "headless_command_guard.mjs" in str(hook.get("command", ""))
-    for hook in hooks
-)
-if not guard_hook_present:
-    text += hook_block()
-tomllib.loads(text)
-
-fd, temporary = tempfile.mkstemp(prefix=".config.toml.", dir=os.path.dirname(target))
-try:
-    os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as config_file:
-        config_file.write(text)
-        config_file.flush()
-        os.fsync(config_file.fileno())
-    os.replace(temporary, target)
-    os.chmod(target, 0o600)
-except BaseException:
-    try:
-        os.close(fd)
-    except OSError:
-        pass
-    try:
-        os.unlink(temporary)
-    except FileNotFoundError:
-        pass
-    raise
-PY
-  if [ -n "${KIMI_MODEL:-}" ] || [ -n "${KIMI_BASE_URL:-}" ] || [ -n "${KIMI_API_KEY:-}" ]; then
-    log "Config generated with overrides (model=${KIMI_MODEL:-<default>}, base_url=${KIMI_BASE_URL:-<default>}, api_key=${KIMI_API_KEY:+set})"
-  else
-    log "Config copied: $KIMI_CONFIG_SOURCE -> $KIMI_CODE_HOME/config.toml"
-  fi
-fi
-
-# WI#330: the baked config ships a placeholder base_url on the .invalid TLD
-# (guaranteed NXDOMAIN). mt-admin always renders KIMI_BASE_URL — defaulting to
-# the tenant's own LLM endpoint — so a placeholder that survives to the
-# runtime config means a hand-rolled deployment forgot the override. Fail
-# loudly at startup instead of at the first LLM request.
-if grep -q 'set-kimi-base-url\.invalid' "$KIMI_CODE_HOME/config.toml" 2>/dev/null; then
-  die "KIMI_BASE_URL is unset and the baked config is a placeholder; set it (mt-admin: configure-kimi <tenant> --base-url <url>) to a container-reachable OpenAI-compatible endpoint"
-fi
-
-# WI#324 worker-side tool bridge: register the thin stdio MCP server that
-# relays MCP tools/list + tools/call into tool_list/tool_call frames on the
-# hub WebSocket. User-level mcp.json is trusted (no workspace trust prompt);
-# written only when absent so an operator can override or disable the entry
-# ("enabled": false) without the entrypoint clobbering it. The shim
-# advertises zero tools unless the bridge injects the per-task proxy env, and
-# the hub stays deny-by-default without a tool_allowlist grant.
-if [ ! -f "$KIMI_CODE_HOME/mcp.json" ]; then
-  umask 0177
-  printf '%s\n' '{"mcpServers":{"lunarwing":{"command":"node","args":["/app/scripts/lunarwing_mcp_server.js"]}}}' \
-    > "$KIMI_CODE_HOME/mcp.json"
-  umask "$FILE_UMASK"
-  log "Registered lunarwing MCP tool-proxy server in $KIMI_CODE_HOME/mcp.json"
-fi
-
-# ── always start the health server in the background ──────────────────────────
+# ── always start the health server in the background (task uid: no secrets) ──
 log "Starting health server on port $HEALTH_PORT"
 export WS_STATE_FILE
 export KIMI_MODE="$MODE"
 export KIMI_VERSION="kimi-worker-1.0.0"
-python3 /app/health_server.py --port "$HEALTH_PORT" &
+as_task python3 /app/health_server.py --port "$HEALTH_PORT" &
 HEALTH_PID=$!
 
 sleep 1
@@ -268,9 +109,15 @@ case "$MODE" in
     # WI#411: kimi-code 2.2.0's KIMI_CODE_TRUST_WORKSPACE auto-spawns a repo's
     # .mcp.json servers before any model turn, outside the hook — never inherit it.
     unset KIMI_CODE_DANGEROUS_COMMAND_GUARD KIMI_CODE_TRUST_WORKSPACE
-    # WI#373: the prompt runs untrusted agent code — never inherit the
-    # bridge's hub-handshake credential.
-    exec env -u AGENT_AUTH_TOKEN kimi -p "$*" --output-format stream-json
+    # WI#373/WI#400: the prompt runs untrusted agent code — never inherit the
+    # bridge's hub-handshake credential or its file pointer; run as the task uid.
+    if [ "$(id -u)" = "0" ]; then
+      exec setpriv "${SETPRIV_FLAGS[@]}" \
+        env HOME=/home/kimi -u AGENT_AUTH_TOKEN -u AGENT_AUTH_TOKEN_FILE \
+        kimi -p "$*" --output-format stream-json
+    fi
+    exec env -u AGENT_AUTH_TOKEN -u AGENT_AUTH_TOKEN_FILE \
+      kimi -p "$*" --output-format stream-json
     ;;
 
   websocket)
