@@ -1125,8 +1125,9 @@ mod tests {
         );
         ws_send_envelope(&mut ws, &request_env).await;
 
-        // The connection's relay lives in the default proxy dir; the task id
-        // namespaces the socket file.
+        // The connection's relay lives in the per-test proxy dir
+        // (test_config's unique_proxy_dir — LD-17: never the shared
+        // /tmp/lunarwing-tool-proxy); the task id namespaces the socket.
         let socket_path = crate::tool_proxy::task_socket_path_in(&proxy_dir, &task_id);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while !socket_path.exists() {
