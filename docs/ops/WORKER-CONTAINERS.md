@@ -137,9 +137,10 @@ cap, and the same EF-2 never-fail lifecycle / EF-9+EV-4
 fail-fast-on-hub-close semantics. The in-task half is a thin stdio MCP
 server like the kimi lane's, also inside the same binary
 (`pebble4lunarwing mcp-shim`, `src/mcp_shim.rs`): pebble discovers
-`mcpServers.lunarwing` from the baked root-owned
-`$PEBBLE_CONFIG_HOME/settings.json` (`/etc/lunarwing/pebble`) and spawns it
-per task, passing its process env through to the MCP child, so the
+`mcpServers.lunarwing` from the baked
+`$PEBBLE_CONFIG_HOME/settings.json` (`/etc/lunarwing/pebble`; root-owned,
+but writable by task code, which runs as container root) and spawns a
+fresh shim for tool discovery and for each tool call, passing its process env through to the MCP child, so the
 executor's per-task `LUNARWING_TASK_ID` / `LUNARWING_TOOL_PROXY_SOCKET`
 injection (applied after task-supplied env, and stripped from both
 inherited and task-supplied env alongside `AGENT_AUTH_TOKEN`) reaches the

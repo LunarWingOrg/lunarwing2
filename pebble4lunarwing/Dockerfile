@@ -214,8 +214,9 @@ COPY pebble4lunarwing/entrypoint.sh /usr/local/bin/entrypoint.sh
 # LUNARWING_TOOL_PROXY_SOCKET / LUNARWING_TASK_ID from the env the bridge's
 # executor injects into the pebble process (pebble passes its env through
 # to MCP children); without them (cli mode, relay setup failure) it
-# advertises zero tools. Baked root-owned read-only, matching the other
-# worker lanes' config treatment.
+# advertises zero tools. Baked root-owned 0444 in a 0555 directory.
+# Unlike the other lanes, this does not protect it from task code: pebble
+# tasks run as container root until WI#400.
 COPY pebble4lunarwing/config/settings.json /etc/lunarwing/pebble/settings.json
 RUN chmod 0555 /etc/lunarwing/pebble && chmod 0444 /etc/lunarwing/pebble/settings.json
 

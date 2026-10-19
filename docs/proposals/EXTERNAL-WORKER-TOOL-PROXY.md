@@ -534,8 +534,9 @@ plugin, but on v2's rewritten plugin API — the v1 file-plugin shape
 The **pebble** lane implements the same wire contract in Rust, inside the
 `pebble4lunarwing` bridge binary — the kimi MCP-shim shape translates
 directly because pebble discovers stdio MCP servers from
-`$PEBBLE_CONFIG_HOME/settings.json` (`mcpServers`), spawns them per
-`pebble prompt` invocation, and passes its process env through to MCP
+`$PEBBLE_CONFIG_HOME/settings.json` (`mcpServers`), spawns a fresh child
+for tool discovery at each `pebble prompt` start and another for each tool
+call, and passes its process env through to MCP
 children (verified against the pinned upstream
 `crates/runtime/src/mcp_stdio.rs`: the spawn overlays the configured `env`
 map on the inherited environment — there is no `env_clear`):
@@ -560,7 +561,9 @@ map on the inherited environment — there is no `env_clear`):
   discard-to-newline and edge-based id recovery (in UTF-8 bytes, strictly
   tighter than the kimi lane's UTF-16 code units for non-ASCII).
 - Registration is baked into the image: `config/settings.json` installs to
-  `/etc/lunarwing/pebble/settings.json` (root-owned, read-only) and
+  `/etc/lunarwing/pebble/settings.json` (root-owned, mode 0444; this does
+  not protect it from task code, which runs as container root until
+  WI#400, and pebble keeps its own state files in this directory) and
   `ENV PEBBLE_CONFIG_HOME=/etc/lunarwing/pebble` points pebble's
   user-scope config discovery at it. The bridge's executor injects
   `LUNARWING_TASK_ID` / `LUNARWING_TOOL_PROXY_SOCKET` into the pebble child

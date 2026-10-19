@@ -110,8 +110,10 @@ pass. Full policy, controls, and the per-bump checklist:
 The bridge binary ships the worker-side half of the WI#324 tenant tool
 proxy: a per-task unix-socket relay (`src/tool_proxy.rs`) plus a thin stdio
 MCP server (`pebble4lunarwing mcp-shim`, `src/mcp_shim.rs`) that pebble
-spawns per task from the baked `mcpServers.lunarwing` entry in
-`$PEBBLE_CONFIG_HOME/settings.json` (`/etc/lunarwing/pebble`, root-owned).
+spawns (once for tool discovery, then once per tool call) from the baked
+`mcpServers.lunarwing` entry in
+`$PEBBLE_CONFIG_HOME/settings.json` (`/etc/lunarwing/pebble`; root-owned,
+but writable by task code, which runs as container root).
 The executor injects `LUNARWING_TASK_ID` / `LUNARWING_TOOL_PROXY_SOCKET`
 into each pebble process (after task-supplied env, so they cannot be
 shadowed; both keys are also stripped from inherited and task-supplied env
