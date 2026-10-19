@@ -531,12 +531,24 @@ the prime suspect, and the fix is the same normalization in the offending
   itself, never the paths beneath it; a leaf-symlink citation stays
   accepted)) — bare
   filenames without a repo-relative path and `file:line` anchors are the
-  documented out-of-scope limits. The cargo-deny job's final script step,
+  documented out-of-scope limits. The online half runs as the pinned script
+  of its own `cargo-deny-owners` job (run-164 KV-1c: keeping it out of the
+  cargo-deny job means a red cargo-deny always means a real advisory
+  finding, instead of the owner red and an advisory red sharing one badge
+  while no open owner exists),
   `python3 .gitlab/scripts/check_deny_toml_owners.py`, resolves each distinct
-  named owner through the anonymous GitLab issue API and HARD-fails when one
-  is not open: the moment an owner WI closes, every full-validation pipeline
-  goes red, which is the point (merging is not CI-gated, so the signal is
-  visibility, not a block). A 404 means the owner is a task-type work item —
+  named owner through the anonymous GitLab issue API and exits nonzero when
+  one is not open: the moment an owner WI closes, the job goes red naming
+  the WI, its state and advisory IDs (merging is not CI-gated, so the
+  signal is visibility, not a block). While the maintainer's owner decision
+  is pending (WI#363 note #10157) the job carries `allow_failure: true` —
+  WI#363's documented "warns (documented choice)" mode: the red stays
+  visible as a warning without drowning the advisory signal, and only a
+  maintainer removes `allow_failure` (hard mode) or names owners (green).
+  `validate_config.py` (`validate_deny_owner_gate`) fails closed if the job
+  is deleted and pins its exact script, template rules, runner tag,
+  bootstrap and inputs — `allow_failure` is the one permitted extra key. A
+  404 means the owner is a task-type work item —
   the anonymous single-issue endpoint serves only issue-type items (WI#274
   precedent) — or was deleted; transient outages/5xx/429 retry three times
   with 5s/10s backoff and then fail closed, because a check that warns on
