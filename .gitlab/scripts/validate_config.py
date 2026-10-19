@@ -105,6 +105,7 @@ FULL_VALIDATION_JOBS = (
     "rust-clippy-all",
     "cargo-deny",
     "satellite-advisory-sweep",
+    "cargo-deny-owners",
 )
 WORKER_NAMES = ("pebble", "opencode", "opencode2", "kimi")
 # Fixed build-read inputs of the kimi worker image build (the Dockerfile
@@ -525,6 +526,14 @@ ADVISORY_GATE_JOBS = (
     "default-graph-advisory-guard",
 )
 
+# MR !1758 run-164 KV-1c: the WI#363 clearing-owner check rides its own
+# job, pinned separately from ADVISORY_GATE_JOBS — the four advisory gates
+# must stay hard (no allow_failure) so a red gate always means a real
+# advisory finding, while the owner job carries WI#363's documented
+# "warns" mode while the maintainer's owner decision is pending.
+OWNER_GATE_JOB = "cargo-deny-owners"
+OWNER_GATE_SCRIPT = ["python3 .gitlab/scripts/check_deny_toml_owners.py"]
+
 # Run-135 IP-1 (MR !1680 review): a gate that never runs its checker is as
 # optional as an allow_failure one. `exit 0` before the wrapper (job or
 # template before_script, or the script itself), `|| true`, or an echoed
@@ -536,7 +545,6 @@ ADVISORY_GATE_SCRIPTS = {
     "cargo-deny": [
         "bash .gitlab/scripts/install-cargo-deny.sh",
         "bash .gitlab/scripts/cargo-deny-check.sh",
-        "python3 .gitlab/scripts/check_deny_toml_owners.py",
     ],
     "satellite-advisory-sweep": [
         "bash .gitlab/scripts/install-cargo-deny.sh",
@@ -558,6 +566,7 @@ ADVISORY_GATE_EFFECTIVE_KEYS = frozenset({
     "after_script", "before_script", "cache", "image", "needs", "rules",
     "script", "stage", "tags",
 })
+OWNER_GATE_EFFECTIVE_KEYS = ADVISORY_GATE_EFFECTIVE_KEYS | {"allow_failure"}
 
 # Run-137 IU-1: artifacts can replace checkers or supply dotenv variables
 # outside GLOBAL_VARIABLE_ALLOWLIST. Pin the allowed inputs as well as keys:
@@ -695,6 +704,62 @@ def validate_advisory_gates_not_optional(merged: dict, errors: list[str]) -> Non
                 break
 
 
+def validate_deny_owner_gate(merged: dict, errors: list[str]) -> None:
+    """Pin the WI#363 owner-check job (MR !1758 run-164 KV-1c).
+
+    The clearing-owner check runs in its own cargo-deny-owners job so
+    cargo-deny stays green or red on advisories alone: while no open owner
+    exists, an in-job owner red and a real advisory red were the same badge,
+    hiding new advisories (KV-1). The job must exist (fail closed on
+    deletion), run exactly OWNER_GATE_SCRIPT, carry exactly the
+    .full-validation-context rules and pinned runner tag, and keep the
+    advisory-gate bootstrap/image/needs/cache pins. Unlike the four advisory
+    gates it may set allow_failure — WI#363's documented "warns" mode while
+    the maintainer's owner decision is pending (WI#363 note #10157); the
+    script itself still exits 1 naming the closed WIs and advisory IDs, and
+    only a maintainer removes allow_failure (hard mode) or names owners.
+    Everything else that hollows a job (job-level when, extra keys,
+    variables/hooks/parallel) is refused exactly as for the advisory gates."""
+    job = merged.get(OWNER_GATE_JOB)
+    if not isinstance(job, dict):
+        errors.append(
+            f"{OWNER_GATE_JOB} is missing; the WI#363 clearing-owner check "
+            "must run in its own job (deleting it must fail closed)"
+        )
+        return
+    effective = resolve_extends(job, merged)
+    if effective.get("script") != OWNER_GATE_SCRIPT:
+        errors.append(
+            f"{OWNER_GATE_JOB} script must be exactly {OWNER_GATE_SCRIPT!r}"
+        )
+    if "when" in effective:
+        errors.append(f"{OWNER_GATE_JOB} must not set a job-level when")
+    template = resolve_extends(merged.get(".full-validation-context"), merged)
+    template_rules = template.get("rules")
+    if isinstance(template_rules, list) and effective.get("rules") != template_rules:
+        errors.append(
+            f"{OWNER_GATE_JOB} rules must be exactly "
+            ".full-validation-context's (no rule-level allow_failure, when "
+            "or variables)"
+        )
+    if effective.get("tags") != ["$CI_RUST_RUNNER_TAG"]:
+        errors.append(f"{OWNER_GATE_JOB} tags must be exactly ['$CI_RUST_RUNNER_TAG']")
+    if effective.get("before_script") != ADVISORY_GATE_BEFORE_SCRIPT:
+        errors.append(
+            f"{OWNER_GATE_JOB} before_script must be exactly the pinned "
+            f".rust-job bootstrap {ADVISORY_GATE_BEFORE_SCRIPT!r}"
+        )
+    for key, expected in ADVISORY_GATE_PINNED_VALUES.items():
+        if effective.get(key) != expected:
+            errors.append(f"{OWNER_GATE_JOB} {key} must be exactly {expected!r}")
+    unexpected = sorted(set(effective) - OWNER_GATE_EFFECTIVE_KEYS)
+    if unexpected:
+        errors.append(
+            f"{OWNER_GATE_JOB} must not carry job keys {unexpected}; variables, "
+            "hooks, inherit, parallel or timeout can hollow out a gate"
+        )
+
+
 # WI#363: the accepted-advisory list in ic/deny.toml relies on facts no gate
 # used to check — every ignore reason must name an OPEN clearing owner work
 # item (the 2.1.5.0 reasons named WI#304/#305/#306, closed without the
@@ -703,8 +768,8 @@ def validate_advisory_gates_not_optional(merged: dict, errors: list[str]) -> Non
 # policy and its audit trail cite must still exist (release moves broke this
 # link class once — MR !1505 review CP-8). The offline half below runs in
 # ci-config; the online half (.gitlab/scripts/check_deny_toml_owners.py) runs
-# in the cargo-deny job, which already fetches the advisory DB over the
-# network, and hard-fails when a named owner is not open.
+# in its own cargo-deny-owners job (run-164 KV-1c) and exits nonzero when a
+# named owner is not open.
 DENY_OWNER_PATTERN = re.compile(r"clearing owner:?\s*WI#(\d+)", re.IGNORECASE)
 DENY_WI_PATTERN = re.compile(r"WI#\d+")
 DENY_URL_PATTERN = re.compile(r"https?://\S+")
@@ -2449,6 +2514,7 @@ def main() -> int:
     validate_cargo_deny_gate(merged_config, errors)
     validate_satellite_advisory_sweep(merged_config, errors)
     validate_advisory_gates_not_optional(merged_config, errors)
+    validate_deny_owner_gate(merged_config, errors)
     validate_deny_toml_advisories(errors)
     validate_worker_ts_lanes(merged_config, errors)
     validate_pebble_rust_lane(merged_config, errors)
