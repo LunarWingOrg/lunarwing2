@@ -533,7 +533,9 @@ the environment of same-uid long-lived processes (PID 1, the entrypoint
 shell, the health server, the bridge), so `cat /proc/1/environ` hands it
 back — only pebble `cli`, which exec-replaces PID 1, is total. WI#373 was
 closed on 2026-10-14. WI#400's real isolation then landed for the
-kimi/opencode/pebble lanes: the entrypoint moves the hub token into a
+kimi/opencode/pebble lanes on rootless podman (the rootful pebble launch
+instead runs the whole container as the tenant uid with no split, WI#422):
+the entrypoint moves the hub token into a
 root-only `0400` file (out of every process environment), the bridge stays
 container root behind a trimmed capability set, and every task process
 drops to a separate task uid via `setpriv --clear-groups
@@ -847,8 +849,10 @@ egress-enabled workers; see
 
 **Worker credential isolation.** The WI#373 strips are env hygiene; the
 real boundary is WI#400 (root-only token file handoff plus the task-uid
-split, above) — in-tree for kimi/opencode/pebble, with real-worker
-acceptance riding the rebuilt images like every other worker change.
+split, above) — in-tree for kimi/opencode/pebble on rootless podman (the
+rootful pebble launch has no split: it runs as the tenant uid, WI#422), with
+real-worker acceptance riding the rebuilt images like every other worker
+change.
 
 **Known-broken lane.** The opencode **v1** worker lane (v1.18.25) still
 crashes inside `opencode serve` before any model call (WI#333); the new
@@ -880,7 +884,8 @@ evidence for every lane once the worker images are rebuilt; the mt-admin
 surface), WI#357 (the
 opencode2 v2.0.26 bump stays gated), and WI#412 (pending maintainer
 acceptance). WI#400's implementation landed this cycle (token file
-handoff + task-uid split on kimi/opencode/pebble); what stays open is its
+handoff + task-uid split on kimi/opencode/pebble, rootless lanes; the
+rootful pebble launch has no split by design); what stays open is its
 real-worker acceptance on rebuilt images and the opencode2 lane's own
 migration. The
 five test-build field reports (WI#366, WI#372, WI#385, WI#398, WI#399)
