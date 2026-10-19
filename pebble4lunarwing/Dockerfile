@@ -206,6 +206,19 @@ COPY --from=builder /build/bridge/target/release/pebble4lunarwing /usr/local/bin
 COPY --from=builder /build/pebble/target/release/pebble /usr/local/bin/pebble
 COPY pebble4lunarwing/entrypoint.sh /usr/local/bin/entrypoint.sh
 
+# WI#324: register the LunarWing tool-proxy MCP shim for `pebble` runs.
+# Pebble discovers mcpServers from $PEBBLE_CONFIG_HOME/settings.json
+# (user scope, merged with — and shadowable by — the task workspace's
+# .pebble/settings.json; the hub's deny-by-default allowlist stays
+# authoritative either way). The shim reads the per-task
+# LUNARWING_TOOL_PROXY_SOCKET / LUNARWING_TASK_ID from the env the bridge's
+# executor injects into the pebble process (pebble passes its env through
+# to MCP children); without them (cli mode, relay setup failure) it
+# advertises zero tools. Baked root-owned read-only, matching the other
+# worker lanes' config treatment.
+COPY pebble4lunarwing/config/settings.json /etc/lunarwing/pebble/settings.json
+RUN chmod 0555 /etc/lunarwing/pebble && chmod 0444 /etc/lunarwing/pebble/settings.json
+
 RUN /usr/local/bin/pebble --version && \
     test -x /usr/local/bin/pebble4lunarwing && \
     test -x /usr/local/bin/entrypoint.sh
@@ -213,6 +226,7 @@ RUN mkdir -p /workspace && chmod 777 /workspace
 
 ENV PEBBLE_BIN=/usr/local/bin/pebble \
     PEBBLE_MODE=websocket \
+    PEBBLE_CONFIG_HOME=/etc/lunarwing/pebble \
     WS_PORT=9090 \
     HEALTH_PORT=8443 \
     WORKSPACE_ROOT=/workspace

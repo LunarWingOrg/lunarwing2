@@ -128,7 +128,26 @@ resolves the calling session's task id from its title
 (`lunarwing-opencode2-<task_id>`) through the plugin context's in-process
 session API, and relays over the task's socket with the same
 first-title-wins caching and the same "not an isolation boundary" limits.
-The pebble lane does not have the bridge yet; see
+
+The pebble worker ships the same relay in Rust, inside the
+`pebble4lunarwing` bridge binary (`src/tool_proxy.rs`): one relay per hub
+connection, one per-task unix socket per accepted task, the same NDJSON IPC
+shapes, identifier bounds and locally pre-checked 256 KiB `tool_call` frame
+cap, and the same EF-2 never-fail lifecycle / EF-9+EV-4
+fail-fast-on-hub-close semantics. The in-task half is a thin stdio MCP
+server like the kimi lane's, also inside the same binary
+(`pebble4lunarwing mcp-shim`, `src/mcp_shim.rs`): pebble discovers
+`mcpServers.lunarwing` from the baked root-owned
+`$PEBBLE_CONFIG_HOME/settings.json` (`/etc/lunarwing/pebble`) and spawns it
+per task, passing its process env through to the MCP child, so the
+executor's per-task `LUNARWING_TASK_ID` / `LUNARWING_TOOL_PROXY_SOCKET`
+injection (applied after task-supplied env, and stripped from both
+inherited and task-supplied env alongside `AGENT_AUTH_TOKEN`) reaches the
+shim. Tools appear as `mcp__lunarwing__<name>`; without the proxy env the
+shim advertises zero tools. Note pebble merges project-scope
+`.pebble/settings.json` from the task workspace, so workspace content can
+shadow or disable the `lunarwing` entry — the hub stays authoritative, same
+as the kimi loader (EF-10). See
 [`docs/proposals/EXTERNAL-WORKER-TOOL-PROXY.md`](../proposals/EXTERNAL-WORKER-TOOL-PROXY.md)
 for the wire contract.
 

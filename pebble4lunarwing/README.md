@@ -105,6 +105,27 @@ deferred egress allowlist (WI#357 control 1) or a non-root lane hardening
 pass. Full policy, controls, and the per-bump checklist:
 `docs/ops/WORKER-CONTAINERS.md` → "Worker exposure policy (WI#357)".
 
+## Tool proxy (WI#324)
+
+The bridge binary ships the worker-side half of the WI#324 tenant tool
+proxy: a per-task unix-socket relay (`src/tool_proxy.rs`) plus a thin stdio
+MCP server (`pebble4lunarwing mcp-shim`, `src/mcp_shim.rs`) that pebble
+spawns per task from the baked `mcpServers.lunarwing` entry in
+`$PEBBLE_CONFIG_HOME/settings.json` (`/etc/lunarwing/pebble`, root-owned).
+The executor injects `LUNARWING_TASK_ID` / `LUNARWING_TOOL_PROXY_SOCKET`
+into each pebble process (after task-supplied env, so they cannot be
+shadowed; both keys are also stripped from inherited and task-supplied env
+alongside `AGENT_AUTH_TOKEN`), and pebble passes its env through to the MCP
+child. The shim translates MCP `tools/list` / `tools/call` into
+`tool_list` / `tool_call` frames on the hub WebSocket; tools appear to the
+agent as `mcp__lunarwing__<name>`. The hub stays deny-by-default until the
+worker's `tool_allowlist` (or `cron.tool_allowlist` for tick jobs) grants
+phase-1 names; without the proxy env the shim advertises zero tools.
+Pebble merges project-scope `.pebble/settings.json` from the task
+workspace, so workspace content can shadow or disable the `lunarwing`
+entry — the hub stays authoritative either way. Design doc:
+`docs/proposals/EXTERNAL-WORKER-TOOL-PROXY.md`.
+
 ## Protocol
 
 Speaks the `lunarwing-agent-v1` WebSocket subprotocol (the legacy `ironclaw-agent-v1` alias is no longer accepted). See `../opencode4lunarwing/agent_comm_protocol.json` for the full spec.
