@@ -18,7 +18,8 @@ on 2026-10-17 a bulk close orphaned WI#418/WI#368 the same way). While no
 open clearing owner exists (maintainer decision pending, WI#363 note
 #10157), the job carries allow_failure: WI#363's documented "warns" mode —
 the red stays visible as a warning without drowning the advisory signal,
-and only a maintainer removes allow_failure (hard mode) or names owners.
+and only a maintainer names owners and then removes allow_failure in the
+same change.
 Merging is not CI-gated on this project, so the signal is visibility, not
 a block. The maintenance step when closing an owner WI: re-point the
 ic/deny.toml reasons to the new open owner first (see .gitlab/README.md).

@@ -551,7 +551,8 @@ the prime suspect, and the fix is the same normalization in the offending
   is pending (WI#363 note #10157) the job carries `allow_failure: true` —
   WI#363's documented "warns (documented choice)" mode: the red stays
   visible as a warning without drowning the advisory signal, and only a
-  maintainer removes `allow_failure` (hard mode) or names owners (green).
+  maintainer names owners (green) and then removes `allow_failure` (hard
+  mode) in the same change.
   `validate_config.py` (`validate_deny_owner_gate`) fails closed if the job
   is deleted and pins its exact script, template rules, runner tag,
   bootstrap and inputs — `allow_failure` is the one permitted extra key. A
@@ -615,6 +616,9 @@ These run with `allow_failure: true`:
   green, closing the plan §15.5 reconciliation.
 - `secret-history`: scheduled only; becomes blocking after historical findings
   are reviewed.
+- `cargo-deny-owners`: warns while no open clearing owner exists (WI#363 note
+  #10157). Remove `allow_failure` in the same change that re-points the
+  `ic/deny.toml` reasons to the owner(s) the maintainer names.
 
 Formerly observational, now blocking (goals 2.1.1.0 item 23): `rust-clippy-all`
 (clean all-features baseline landed) and `architecture-boundaries` (changed-line

@@ -18,8 +18,9 @@ cargo-deny:
 # choice)" failure mode while the maintainer's owner decision is pending
 # (WI#363 note #10157) so the owner question stays visible as a warning
 # naming the WIs and advisory IDs without drowning the advisory signal.
-# Only a maintainer removes allow_failure (hard mode) or names owners
-# (green); agents must not file or reopen an owner work item.
+# Only a maintainer names owners (green) and then removes allow_failure
+# (hard mode) in the same change (run-166 LE-1); agents must not file or
+# reopen an owner work item.
 cargo-deny-owners:
   extends:
     - .rust-job

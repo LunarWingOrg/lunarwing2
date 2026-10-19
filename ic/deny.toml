@@ -44,8 +44,11 @@ ignore = [
     # named owner is closed (or is a task-type work item, which 404s on the
     # anonymous issue API); while no open owner exists that job carries
     # allow_failure (WI#363's documented warn mode) so the owner red cannot
-    # hide a real advisory red in cargo-deny. Closing an owner WI requires
-    # re-pointing its reasons to the new open owner first. Only a
+    # hide a real advisory red in cargo-deny — only a maintainer names
+    # owners and then removes allow_failure in the same change (the job's
+    # removal condition, .gitlab/README.md observational jobs). Closing an
+    # owner WI requires re-pointing its reasons to the new open owner
+    # first. Only a
     # maintainer creates or names a clearing owner; agents re-point to an
     # owner the maintainer named, must not reopen a clearing-owner work
     # item that a maintainer closed, and must not file a replacement owner:
