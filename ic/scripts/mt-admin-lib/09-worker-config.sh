@@ -1672,14 +1672,22 @@ prepare_pebble_workspace() {  # <tenant> — prints the workspace dir
   # passwd entry. stat follows a symlinked lw_root on purpose: a tenant who
   # points ~/lunarwing at other storage keeps working as long as the target
   # stays tenant-owned.
-  if [[ "$(stat -c %u "$workspace_dir" 2>/dev/null || printf -- -1)" \
-      != "$(stat -c %u "$lw_root" 2>/dev/null || printf -- -2)" ]]; then
+  # LD-9: on a rootful runtime the first create hands the plain directory to
+  # the in-container task uid (below); every later create/force-recreate
+  # must accept that owner instead of refusing itself.
+  local ws_owner lw_owner
+  ws_owner="$(stat -c %u "$workspace_dir" 2>/dev/null || printf -- -1)"
+  lw_owner="$(stat -c %u "$lw_root" 2>/dev/null || printf -- -2)"
+  if [[ "$MT_ROOTLESS" != "true" && "$ws_owner" == "$PEBBLE_CONTAINER_UID" ]]; then
+    :  # rootful re-create: an earlier create already handed this plain directory to the task uid
+  elif [[ "$ws_owner" != "$lw_owner" ]]; then
     printf 'error: pebble workspace not owned like the tenant root: %s\n' "$workspace_dir" >&2
     return 1
+  else
+    # chmod as the tenant: chmod follows symlinks, and root has no business
+    # touching a mode under a tenant-writable parent (WI#390).
+    tenant_chmod "$name" 0700 "$workspace_dir" || return 1
   fi
-  # chmod as the tenant: chmod follows symlinks, and root has no business
-  # touching a mode under a tenant-writable parent (WI#390).
-  tenant_chmod "$name" 0700 "$workspace_dir" || return 1
   if [[ "$MT_ROOTLESS" != "true" ]]; then
     # Rootful runtime: no keep-id, so the in-container task uid
     # (PEBBLE_CONTAINER_UID, WI#400) is a bare host uid and the workspace

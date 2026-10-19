@@ -907,6 +907,32 @@ assert_eq "pebble workspace created at the tenant path" "$ws_out" "$MT_FIXTURE/p
 assert_eq "pebble workspace is tenant-private (0700)" \
   "$(stat -c %a "$MT_FIXTURE/pebble-workspace")" "700"
 
+# WI#400 LD-9 (root-only): on a rootful runtime the FIRST create hands the
+# plain workspace to the in-container task uid; every later create or
+# force-recreate must accept that owner instead of refusing itself (the
+# pre-LD-9 owner check compared against the tenant root and broke upgrades).
+if [[ "$(id -u)" == "0" ]]; then
+  rm -rf "$MT_FIXTURE/pebble-workspace"
+  # The harness no-ops chown for its non-root body (line above); the rootful
+  # handoff needs the REAL chown, so lift the stub for this block only.
+  unset -f chown
+  hh4_prior_rootless="${MT_ROOTLESS:-}"
+  MT_ROOTLESS=false
+  if ws_first="$(prepare_pebble_workspace "$hh4_tenant" 2>&1)" \
+     && [[ "$(stat -c %u "$MT_FIXTURE/pebble-workspace")" == "$PEBBLE_CONTAINER_UID" ]]; then
+    if ws_second="$(prepare_pebble_workspace "$hh4_tenant" 2>&1)"; then
+      echo "  PASS: rootful re-create accepts the task-uid-owned workspace (LD-9)"
+    else
+      echo "  FAIL: rootful re-create refused the task-uid-owned workspace: $ws_second"; failures=$((failures + 1))
+    fi
+  else
+    echo "  FAIL: rootful first create did not hand the workspace to the task uid (owner=$(stat -c %u "$MT_FIXTURE/pebble-workspace" 2>/dev/null), want $PEBBLE_CONTAINER_UID): $ws_first"; failures=$((failures + 1))
+  fi
+  MT_ROOTLESS="$hh4_prior_rootless"
+  chown() { :; }  # restore the harness no-op stub
+  rm -rf "$MT_FIXTURE/pebble-workspace"
+fi
+
 echo "=== WI#390 (HH-2): refused pipe-form write aborts under suppressed errexit ==="
 
 # Production runs add_tenant/upgrade_tenant through the lifecycle lock as
