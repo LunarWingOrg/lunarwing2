@@ -120,6 +120,31 @@ test("cron bootstrap hands a newly created leaf to the task identity (WI#400 KW-
   }
 })
 
+test("cron bootstrap hands created intermediates to the task identity too (WI#400 LD-6, root)", () => {
+  // Root-only: the handoff targets a foreign uid, so only the root shape
+  // (the CI lane and the in-image gate) can observe real ownership change.
+  // A created INTERMEDIATE must be task-owned or the task cannot create
+  // siblings under it; a pre-existing component keeps its owner.
+  if (process.getuid!() !== 0) return
+  const TASK_ID = 65534
+  process.env.KIMI_TASK_UID = String(TASK_ID)
+  process.env.KIMI_TASK_GID = String(TASK_ID)
+  const root = mkdtempSync(join(tmpdir(), "kimi-cron-ld6-"))
+  try {
+    mkdirSync(join(root, "pre"), { mode: 0o755 })
+    const dir = resolveTaskWorkspace(
+      { project_dir: "pre/missions/kw4", cron_tick: { event: "cron.tick" } }, root)
+    assert.equal(statSync(join(root, "pre")).uid, 0, "pre-existing component keeps its owner")
+    assert.equal(statSync(join(root, "pre", "missions")).uid, TASK_ID,
+      "created intermediate must be owned by the task uid")
+    assert.equal(statSync(dir).uid, TASK_ID, "new leaf must be owned by the task uid")
+  } finally {
+    delete process.env.KIMI_TASK_UID
+    delete process.env.KIMI_TASK_GID
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test("cron bootstrap with a foreign task identity fails closed (unprivileged)", () => {
   // The non-vacuous half: without the KW-4 fchown this bootstrap would
   // succeed silently. Unprivileged, the handoff to a foreign uid must fail

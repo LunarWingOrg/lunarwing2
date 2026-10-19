@@ -71,29 +71,35 @@ export function resolveTaskWorkspace(
     throw new Error("Invalid workspace path for cron tick: /proc/self/fd is not available (required for symlink-safe directory creation)")
   }
   const flags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
-  // WI#400 run-164 KW-4: the bridge runs as root while the cron task runs
-  // under the separate task uid, so a freshly created leaf would stay
-  // root-owned and the task could not write its own project dir. Track
-  // whether THIS walk created the leaf; a pre-existing path is never chowned.
+  // WI#400 run-164 KW-4 + LD-6: the bridge runs as root while the cron task
+  // runs under the separate task uid, so every directory THIS walk creates
+  // (intermediates and leaf alike) is handed to the task identity — a
+  // root-owned intermediate would block sibling creation under it. A
+  // pre-existing path is never chowned.
   const identity = taskIdentity()
   let fd = openSync(root, flags)
   try {
     const parts = path.split("/")
-    let leafCreated = false
-    for (const [index, part] of parts.entries()) {
+    for (const part of parts) {
       const child = `/proc/self/fd/${fd}/${part}`
+      let created = false
       try {
         mkdirSync(child)
-        leafCreated = index === parts.length - 1
+        created = true
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw annotateComponent(error, part)
-        leafCreated = false
       }
       let next: number
       try {
         next = openSync(child, flags)
       } catch (error) {
         throw annotateComponent(error, part)
+      }
+      // KW-4/LD-6: hand the created component over through the
+      // O_DIRECTORY|O_NOFOLLOW descriptor the walk just opened — no path
+      // re-resolution, no symlink window.
+      if (created && identity) {
+        fchownSync(next, identity.uid, identity.gid)
       }
       closeSync(fd)
       fd = next
@@ -107,12 +113,6 @@ export function resolveTaskWorkspace(
     const landed = statSync(resolved)
     if (walked.dev !== landed.dev || walked.ino !== landed.ino) {
       throw new Error(`resolved path changed during bootstrap: ${path}`)
-    }
-    // KW-4: hand the newly created leaf to the task identity through the
-    // O_DIRECTORY|O_NOFOLLOW descriptor the walk still holds — no path
-    // re-resolution, no symlink window.
-    if (leafCreated && identity) {
-      fchownSync(fd, identity.uid, identity.gid)
     }
     return resolved
   } catch (error) {

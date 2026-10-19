@@ -79,6 +79,30 @@ try {
   }
 }
 
+// WI#400 LD-6 (root-only): a created INTERMEDIATE must be handed to the
+// task identity as well, or the task cannot create siblings under it; a
+// pre-existing component keeps its owner. The handoff targets a foreign
+// uid, so only the root shape (CI lane and in-image gate) can observe it.
+if (process.getuid!() === 0) {
+  const TASK_ID = 65534
+  process.env.OPENCODE_TASK_UID = String(TASK_ID)
+  process.env.OPENCODE_TASK_GID = String(TASK_ID)
+  const ld6Root = mkdtempSync(join(tmpdir(), "oc-cron-ld6-"))
+  try {
+    mkdirSync(join(ld6Root, "pre"), { mode: 0o755 })
+    const dir = resolveTaskWorkspace(
+      { project_dir: "pre/missions/kw4", cron_tick: { event: "cron.tick" } }, ld6Root)
+    assert.equal(statSync(join(ld6Root, "pre")).uid, 0, "pre-existing component keeps its owner")
+    assert.equal(statSync(join(ld6Root, "pre", "missions")).uid, TASK_ID,
+      "created intermediate must be owned by the task uid")
+    assert.equal(statSync(dir).uid, TASK_ID, "new leaf must be owned by the task uid")
+  } finally {
+    delete process.env.OPENCODE_TASK_UID
+    delete process.env.OPENCODE_TASK_GID
+    rmSync(ld6Root, { recursive: true, force: true })
+  }
+}
+
 // The non-vacuous half: without the KW-4 fchown this bootstrap would succeed
 // silently. Unprivileged, the handoff to a foreign uid must fail (EPERM →
 // permanent "Invalid" wording). In-image the gate runs as root, where the
