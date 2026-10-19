@@ -479,6 +479,21 @@ Commands:
     --api-key-file <path>          Read Kimi API key from a file, never argv
                                    (restart the worker after: stop-tenant && start-tenant)
 
+  configure-worker-tools <name> <worker> <tools|none>
+                                   Set the WI#324 proxied-tool grant
+                                   (tool_allowlist) for one external worker
+                                   (pebble|opencode|kimi|opencode2) in the
+                                   tenant config. Deny-by-default otherwise.
+                                   <tools> is a comma-separated list from the
+                                   phase-1 set: memory_read, memory_write,
+                                   knowledge_search, knowledge_submit_note,
+                                   knowledge_get_topic, gitlab_tool (prefer over
+                                   legacy gitlab-tool). 'none' clears the grant.
+                                   Refused on mode="cron" workers (grant
+                                   cron.tool_allowlist on the mission instead).
+                                   Restart the tenant daemon to load it
+                                   (restart-tenant <name>).
+
   configure-study-mcp <name>       Configure lw2studymcp for LunarWing and
     [--home <absolute-path>]       its opencode worker using a shared host checkout
                                    (default: STUDY_NOTES_DEFAULT_HOME; a default-home
@@ -1400,6 +1415,12 @@ main() {
       done
       [[ -n "$name" ]] || die "usage: configure-kimi <name> [--model <model>] [--base-url <url>] [--api-key-file <path>]"
       configure_kimi "$name" "$kimi_model" "$kimi_base_url" "$kimi_api_key"
+      ;;
+
+    configure-worker-tools)
+      require_root
+      [[ $# -eq 3 ]] || die "usage: configure-worker-tools <name> <pebble|opencode|kimi|opencode2> <tools|none>"
+      set_external_worker_tool_allowlist "$1" "$2" "$3"
       ;;
 
     configure-study-mcp)
