@@ -30,6 +30,10 @@ COPY scripts/*.ts ./scripts/
 # entrypoint_config_test.js reads ../entrypoint.sh — ship it in the build
 # stage so the in-build test gate validates the actual shipped entrypoint.
 COPY entrypoint.sh /build/entrypoint.sh
+# WI#400: entrypoint_config_test.js also reads ../entrypoint-task-setup.sh
+# (the config section moved there); ship it beside entrypoint.sh so the
+# in-build npm test gate validates the actual shipped setup script.
+COPY entrypoint-task-setup.sh /build/entrypoint-task-setup.sh
 # WI#206 fixtures: the headless-guard tests read /build/hooks/ and
 # /build/config/ during the in-build npm test gate (same builder-stage
 # pattern as entrypoint.sh above). Without these COPYs the 7 new
