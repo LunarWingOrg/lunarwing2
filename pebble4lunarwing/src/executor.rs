@@ -27,22 +27,30 @@ const UNTRUSTED_HISTORY_END: &str = "--- END UNTRUSTED CONVERSATION HISTORY ---"
 /// mints and persists a scoped token on the first lifecycle pass.
 const BRIDGE_AUTH_ENV_KEY: &str = "AGENT_AUTH_TOKEN";
 
+/// Env key carrying the path of the root-only file the bridge reads the
+/// hub-handshake credential from (WI#400). The file itself is unreadable to
+/// the task uid, but task code has no business knowing where the
+/// credential lives, so the key is stripped alongside the token itself.
+const BRIDGE_AUTH_FILE_ENV_KEY: &str = "AGENT_AUTH_TOKEN_FILE";
+
 /// Bridge-owned env keys a task process must never inherit or supply
-/// itself. The handshake token is stripped outright (WI#373); the WI#324
-/// proxy keys are set by the bridge per task (AFTER task-supplied env, so
-/// they cannot be shadowed) — a task pointing its shim at another task's
-/// relay socket would only borrow authority the container already shares
-/// (EF-1), but the strip keeps attribution honest: proxied calls are
-/// recorded against the job the hub connection serves.
-const BRIDGE_RESERVED_ENV_KEYS: [&str; 3] = [
+/// itself. The handshake token is stripped outright (WI#373) and so is its
+/// credential-file pointer (WI#400); the WI#324 proxy keys are set by the
+/// bridge per task (AFTER task-supplied env, so they cannot be shadowed) —
+/// a task pointing its shim at another task's relay socket would only
+/// borrow authority the container already shares (EF-1), but the strip
+/// keeps attribution honest: proxied calls are recorded against the job
+/// the hub connection serves.
+const BRIDGE_RESERVED_ENV_KEYS: [&str; 4] = [
     BRIDGE_AUTH_ENV_KEY,
+    BRIDGE_AUTH_FILE_ENV_KEY,
     tool_proxy::TASK_ID_ENV,
     tool_proxy::PROXY_SOCKET_ENV,
 ];
 
 /// Bridge env rebuilt for a spawned task minus the bridge's reserved keys
-/// (WI#373/WI#324). Everything else is preserved — PATH, locale and the
-/// PEBBLE_* provider variables the task legitimately needs.
+/// (WI#373/WI#324/WI#400). Everything else is preserved — PATH, locale and
+/// the PEBBLE_* provider variables the task legitimately needs.
 fn strip_bridge_reserved_env(
     env: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
@@ -53,6 +61,40 @@ fn strip_bridge_reserved_env(
                 .any(|reserved| key.as_os_str() == *reserved)
         })
         .collect()
+}
+
+/// Task-side uid/gid the worker drops to for every spawned task (WI#400):
+/// task code must run under a uid separate from the bridge so the bridge's
+/// (and PID 1's) environ gives it EACCES. The image pins the identity via
+/// `PEBBLE_TASK_UID`/`PEBBLE_TASK_GID`; both unset means "no split"
+/// (host-side dev runs and self-exec tests, where the bridge is
+/// unprivileged anyway). Exactly one set is a configuration error and fails
+/// the spawn closed. pub(crate) so the cron workspace bootstrap can hand a
+/// freshly created leaf directory to the same identity (run-164 KW-4).
+pub(crate) fn task_ids_from_env() -> Result<Option<(u32, u32)>, std::io::Error> {
+    let uid = std::env::var("PEBBLE_TASK_UID").ok();
+    let gid = std::env::var("PEBBLE_TASK_GID").ok();
+    match (uid, gid) {
+        (None, None) => Ok(None),
+        (Some(uid), Some(gid)) => {
+            let parse = |value: String, key: &str| {
+                value.parse::<u32>().map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("{key} is not a numeric id: {value:?}"),
+                    )
+                })
+            };
+            Ok(Some((
+                parse(uid, "PEBBLE_TASK_UID")?,
+                parse(gid, "PEBBLE_TASK_GID")?,
+            )))
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "PEBBLE_TASK_UID and PEBBLE_TASK_GID must be set together",
+        )),
+    }
 }
 
 pub struct ExecutorConfig {
@@ -158,8 +200,7 @@ fn spawn_pebble(
         Path::new(&config.workspace_root),
     )?;
 
-    let mut cmd = Command::new(&config.pebble_bin);
-    cmd.args([
+    let pebble_args = [
         "--output-format",
         "json",
         "--permission-mode",
@@ -167,13 +208,47 @@ fn spawn_pebble(
         "--model",
         &config.model,
         "prompt",
-    ])
-    .arg(build_task_prompt(request))
-    .current_dir(work_dir)
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .kill_on_drop(true);
+    ];
+    let task_prompt = build_task_prompt(request);
+
+    // WI#400: run the task process under a uid separate from the bridge.
+    // setpriv wraps the pebble argv; --ambient-caps=-all and --inh-caps=-all
+    // are mandatory — without them setpriv preserves capabilities across
+    // the uid change and the task could regain the bridge uid (run-98 FY-1
+    // prototype finding) — and --no-new-privs is mandatory too (run-164
+    // KW-2): without it a setuid or file-capability binary in the image
+    // would let task code regain privilege. The env assembled below is
+    // passed to setpriv and inherited by the task unchanged.
+    let task_ids = task_ids_from_env()?;
+    let mut program = std::ffi::OsString::from(&config.pebble_bin);
+    let mut argv: Vec<std::ffi::OsString> =
+        pebble_args.iter().map(std::ffi::OsString::from).collect();
+    argv.push(task_prompt.into());
+    if let Some((drop_user, drop_group)) = task_ids {
+        let mut wrapped: Vec<std::ffi::OsString> = [
+            format!("--reuid={drop_user}"),
+            format!("--regid={drop_group}"),
+            "--clear-groups".to_string(),
+            "--ambient-caps=-all".to_string(),
+            "--inh-caps=-all".to_string(),
+            "--no-new-privs".to_string(),
+            "--".to_string(),
+        ]
+        .into_iter()
+        .map(std::ffi::OsString::from)
+        .collect();
+        wrapped.push(program);
+        wrapped.extend(argv);
+        program = std::ffi::OsString::from("setpriv");
+        argv = wrapped;
+    }
+    let mut cmd = Command::new(program);
+    cmd.args(argv);
+    cmd.current_dir(work_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
 
     // WI#373: the child env is rebuilt from the bridge env with the
     // handshake credential dropped — plain inheritance would leak it into
@@ -183,6 +258,17 @@ fn spawn_pebble(
     // nor shadow the one the bridge issued.
     cmd.env_clear();
     cmd.envs(strip_bridge_reserved_env(std::env::vars_os()));
+    if task_ids.is_some() {
+        // Root's HOME/GOPATH are unreadable to the task uid; retarget the
+        // image-level defaults at the task home. Values the operator
+        // overrode to non-root paths pass through untouched.
+        if std::env::var_os("HOME").is_some_and(|h| h == "/root") {
+            cmd.env("HOME", "/home/pebbletask");
+        }
+        if std::env::var_os("GOPATH").is_some_and(|g| g == "/root/go") {
+            cmd.env("GOPATH", "/home/pebbletask/go");
+        }
+    }
     for (key, value) in &request.context.environment {
         if BRIDGE_RESERVED_ENV_KEYS
             .iter()
@@ -192,7 +278,7 @@ fn spawn_pebble(
             // bridge-reserved key is dropped; say so instead of letting the
             // value vanish silently (run-98 FY-5).
             eprintln!(
-                "[exec] {}: dropped task-supplied env entry {key}: reserved for the bridge (WI#373/WI#324)",
+                "[exec] {}: dropped task-supplied env entry {key}: reserved for the bridge (WI#373/WI#324/WI#400)",
                 request.task_id
             );
             continue;
@@ -661,15 +747,69 @@ mod tests {
                 "LUNARWING_TOOL_PROXY_SOCKET".into(),
                 "/tmp/stale.sock".into(),
             ),
+            (
+                "AGENT_AUTH_TOKEN_FILE".into(),
+                "/run/lunarwing/token".into(),
+            ),
             ("agent_auth_token".into(), "case-variant".into()),
         ]);
         let names: Vec<&str> = kept
             .iter()
             .map(|(key, _)| key.to_str().expect("utf-8 key"))
             .collect();
-        // Exact-key match only: the reserved keys are dropped, unrelated
-        // keys (including case variants) are preserved.
+        // Exact-key match only: the reserved keys (handshake token, its
+        // file pointer, the proxy keys) are dropped, unrelated keys
+        // (including case variants) are preserved.
         assert_eq!(names, ["PATH", "PEBBLE_API_KEY", "agent_auth_token"]);
+    }
+
+    #[test]
+    fn task_ids_from_env_requires_both_or_neither() {
+        // std::env mutation is unsafe in this crate; cover the parsing by
+        // re-exec: the parent sets each shape in turn for a child run.
+        const CHILD_MARKER: &str = "PEBBLE_WI400_IDS_CHILD";
+        const TEST_PATH: &str = "executor::tests::task_ids_from_env_requires_both_or_neither";
+        match std::env::var_os(CHILD_MARKER)
+            .as_deref()
+            .and_then(|v| v.to_str())
+        {
+            None => {
+                for (marker, uid, gid) in [
+                    ("both", Some("10004"), Some("10004")),
+                    ("uid-only", Some("10004"), None),
+                    ("gid-only", None, Some("10004")),
+                    ("garbage", Some("abc"), Some("10004")),
+                ] {
+                    let exe = std::env::current_exe().expect("test binary path");
+                    let mut cmd = std::process::Command::new(exe);
+                    cmd.args(["--exact", TEST_PATH, "--nocapture"])
+                        .env(CHILD_MARKER, marker);
+                    match uid {
+                        Some(value) => cmd.env("PEBBLE_TASK_UID", value),
+                        None => cmd.env_remove("PEBBLE_TASK_UID"),
+                    };
+                    match gid {
+                        Some(value) => cmd.env("PEBBLE_TASK_GID", value),
+                        None => cmd.env_remove("PEBBLE_TASK_GID"),
+                    };
+                    let out = cmd.output().expect("re-exec test binary");
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    assert!(out.status.success(), "child phase {marker} failed:\n{text}");
+                    assert!(
+                        text.contains("test result: ok. 1 passed"),
+                        "child phase {marker} ran no tests (drifted TEST_PATH?):\n{text}"
+                    );
+                }
+            }
+            Some("both") => assert_eq!(
+                task_ids_from_env().expect("both ids set"),
+                Some((10004, 10004))
+            ),
+            Some("uid-only" | "gid-only" | "garbage") => {
+                assert!(task_ids_from_env().is_err());
+            }
+            Some(other) => panic!("unknown child marker {other}"),
+        }
     }
 
     // WI#373 regression: with the bridge credential present in the parent
@@ -840,5 +980,101 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // WI#400: with PEBBLE_TASK_UID/GID pinned (the image's ENV), spawn_pebble
+    // must wrap the pebble argv in setpriv with the exact privilege-dropping
+    // flags, and retarget root's HOME/GOPATH at the task home. Runs as its
+    // own child test process so the env can carry the marker shape (the
+    // crate forbids unsafe code, so std::env::set_var is not an option); a
+    // PATH stub stands in for setpriv (the host test run is unprivileged).
+    #[tokio::test]
+    async fn spawned_task_wraps_setpriv_with_mandatory_flags() {
+        const CHILD_MARKER: &str = "PEBBLE_WI400_CHILD";
+        const TEST_PATH: &str = "executor::tests::spawned_task_wraps_setpriv_with_mandatory_flags";
+
+        let exe_dir = std::env::current_exe()
+            .expect("test binary path")
+            .parent()
+            .expect("exe directory")
+            .to_path_buf();
+        let stub_dir = exe_dir.join("pebble-wi400-bin");
+        let stub = stub_dir.join("setpriv");
+        let root = exe_dir.join("pebble-wi400-root");
+
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            // Parent phase: install the fake setpriv, then re-exec with the
+            // image-style env (task ids pinned, root HOME/GOPATH).
+            std::fs::create_dir_all(&stub_dir).expect("create stub dir");
+            std::fs::write(
+                &stub,
+                "#!/bin/sh\nprintf 'HOME=%s GOPATH=%s\\n' \"$HOME\" \"$GOPATH\"\nprintf '<%s>' \"$@\"\nprintf '\\n'\n",
+            )
+            .expect("write setpriv stub");
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                .expect("make setpriv stub executable");
+
+            let exe = std::env::current_exe().expect("test binary path");
+            let out = std::process::Command::new(exe)
+                .args(["--exact", TEST_PATH, "--nocapture"])
+                .env(CHILD_MARKER, "1")
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        stub_dir.display(),
+                        std::env::var("PATH").expect("PATH set")
+                    ),
+                )
+                .env("PEBBLE_TASK_UID", "10004")
+                .env("PEBBLE_TASK_GID", "10004")
+                .env("HOME", "/root")
+                .env("GOPATH", "/root/go")
+                .output()
+                .expect("re-exec test binary");
+            let text = String::from_utf8_lossy(&out.stdout);
+            let stderr_text = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success(),
+                "child phase failed:\nstdout: {text}\nstderr: {stderr_text}"
+            );
+            assert!(
+                text.contains("test result: ok. 1 passed"),
+                "child phase ran no tests (drifted TEST_PATH?):\nstdout: {text}\nstderr: {stderr_text}"
+            );
+            std::fs::remove_file(&stub).ok();
+            std::fs::remove_dir_all(&stub_dir).ok();
+            std::fs::remove_dir_all(&root).ok();
+            return;
+        }
+
+        // Child phase: spawn through the real spawn_pebble; the PATH stub
+        // records the wrapped argv and the env it was handed.
+        assert_eq!(std::env::var("PEBBLE_TASK_UID").as_deref(), Ok("10004"));
+        let config = ExecutorConfig {
+            pebble_bin: "pebble".to_string(),
+            model: "m".to_string(),
+            permission_mode: "danger-full-access".to_string(),
+            workspace_root: root.to_str().expect("utf-8 root").to_string(),
+        };
+        std::fs::create_dir_all(&root).expect("create workspace root");
+        let req = request("wrap me", vec![]);
+        let child = spawn_pebble(&config, &req, None).expect("spawn setpriv stub");
+        let out = child
+            .wait_with_output()
+            .await
+            .expect("setpriv stub completes");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(0), "setpriv stub exit: {text}");
+        assert!(
+            text.contains("HOME=/home/pebbletask GOPATH=/home/pebbletask/go"),
+            "root HOME/GOPATH not retargeted at the task home: {text}"
+        );
+        assert!(
+            text.contains(
+                "<--reuid=10004><--regid=10004><--clear-groups><--ambient-caps=-all><--inh-caps=-all><--no-new-privs><--><pebble><--output-format><json>"
+            ),
+            "setpriv flags missing or out of order — the cap-clearing pair and --no-new-privs are mandatory (WI#400, run-164 KW-2): {text}"
+        );
     }
 }

@@ -7,7 +7,7 @@
  */
 
 import assert from "node:assert/strict"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { connect, type Socket } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -351,6 +351,26 @@ test("socket path is filesystem-safe and unique per task id", () => {
   assert.notEqual(a, b)
   assert.ok(!a.includes(".."))
   assert.ok(!b.includes("\n"))
+})
+
+test("the proxy dir is created bridge-owned 0711 (KW-6)", async () => {
+  // A task uid can traverse the dir and reach its own (chowned) socket, but
+  // can never rename, delete, or plant entries in it. The chown half runs
+  // only as root with a pinned identity (in-image); the directory mode is
+  // pinned at creation on every run. Point the relay at a NOT-yet-existing
+  // subdir so creation (and its mode) is the relay's own work.
+  const sub = join(workDir, "kw6-proxy")
+  process.env.LUNARWING_TOOL_PROXY_DIR = sub
+  try {
+    const hub = new FakeHubSocket()
+    const handle = await relay.startTask("task-kw6", hub)
+    assert.ok(handle, "task proxy should start")
+    assert.equal(statSync(sub).mode & 0o777, 0o711)
+    handle!.close()
+  } finally {
+    process.env.LUNARWING_TOOL_PROXY_DIR = workDir
+    rmSync(sub, { recursive: true, force: true })
+  }
 })
 
 test("proxyEnvForTask carries the binding the shim reads", () => {

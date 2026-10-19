@@ -225,6 +225,21 @@ RUN /usr/local/bin/pebble --version && \
     test -x /usr/local/bin/entrypoint.sh
 RUN mkdir -p /workspace && chmod 777 /workspace
 
+# WI#400: task identity, separate from the bridge (which runs as container
+# root). The bridge drops every spawned task to this uid/gid via setpriv
+# (flags pinned by the executor self-test), so the bridge's and PID 1's
+# environ are EACCES to task code. mt-admin maps this uid to the tenant
+# account (PEBBLE_USERNS keep-id), so workspace writes land tenant-owned
+# on the host exactly as before. setpriv must exist in the base image —
+# fail the build if a base bump ever drops it.
+RUN groupadd --gid 10004 pebbletask \
+    && useradd --uid 10004 --gid 10004 -m -d /home/pebbletask pebbletask \
+    && mkdir -p /home/pebbletask/go \
+    && chown -R pebbletask:pebbletask /home/pebbletask \
+    && command -v setpriv >/dev/null
+ENV PEBBLE_TASK_UID=10004 \
+    PEBBLE_TASK_GID=10004
+
 ENV PEBBLE_BIN=/usr/local/bin/pebble \
     PEBBLE_MODE=websocket \
     PEBBLE_CONFIG_HOME=/etc/lunarwing/pebble \

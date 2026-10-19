@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { execFileSync, spawn } from "node:child_process"
 import { test } from "node:test"
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync, readFileSync } from "node:fs"
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { expandWorkspacePath, resolveWorkspacePath, resolveTaskWorkspace, workspacePathsOverlap } from "./workspace_path.js"
@@ -94,8 +94,55 @@ test("cron bootstrap creates a missing default dir, preserves state, and confine
   }
 })
 
-test("cron bootstrap: a non-directory component is permanent and names the component", () => {
-  const root = mkdtempSync(join(tmpdir(), "kimi-cron-file-"))
+test("cron bootstrap hands a newly created leaf to the task identity (WI#400 KW-4)", () => {
+  // The bridge runs as root while the cron task runs under the separate task
+  // uid; a freshly created leaf must be fchowned to the task identity or the
+  // task cannot write its own project dir. fchown to the process's own ids
+  // is permitted unprivileged, so this runs on dev hosts and in-image alike.
+  const uid = process.getuid!()
+  const gid = process.getgid!()
+  process.env.KIMI_TASK_UID = String(uid)
+  process.env.KIMI_TASK_GID = String(gid)
+  const root = mkdtempSync(join(tmpdir(), "kimi-cron-kw4-"))
+  try {
+    const context = { project_dir: "missions/kw4", cron_tick: { event: "cron.tick" } }
+    const dir = resolveTaskWorkspace(context, root)
+    const landed = statSync(dir)
+    assert.equal(landed.uid, uid, "new leaf must be owned by the task uid")
+    assert.equal(landed.gid, gid, "new leaf must be owned by the task gid")
+    // A pre-existing leaf is never re-chowned: the second tick takes the
+    // EEXIST path and leaves the identity untouched.
+    assert.equal(resolveTaskWorkspace(context, root), dir)
+  } finally {
+    delete process.env.KIMI_TASK_UID
+    delete process.env.KIMI_TASK_GID
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("cron bootstrap with a foreign task identity fails closed (unprivileged)", () => {
+  // The non-vacuous half: without the KW-4 fchown this bootstrap would
+  // succeed silently. Unprivileged, the handoff to a foreign uid must fail
+  // (EPERM → permanent "Invalid" wording). In-image the gate runs as root,
+  // where the same handoff legitimately succeeds — the kimi-lane pin there
+  // is the previous test.
+  if (process.getuid!() === 0) return
+  process.env.KIMI_TASK_UID = String(process.getuid!() + 1000)
+  process.env.KIMI_TASK_GID = String(process.getgid!() + 1000)
+  const root = mkdtempSync(join(tmpdir(), "kimi-cron-kw4-foreign-"))
+  try {
+    assert.throws(
+      () => resolveTaskWorkspace({ project_dir: "missions/kw4", cron_tick: { event: "cron.tick" } }, root),
+      /Invalid workspace path/,
+    )
+  } finally {
+    delete process.env.KIMI_TASK_UID
+    delete process.env.KIMI_TASK_GID
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("cron bootstrap: a non-directory component is permanent and names the component", () => {  const root = mkdtempSync(join(tmpdir(), "kimi-cron-file-"))
   try {
     writeFileSync(join(root, "missions"), "not a directory")
     const context = { project_dir: "missions/pr-digest", cron_tick: { event: "cron.tick" } }

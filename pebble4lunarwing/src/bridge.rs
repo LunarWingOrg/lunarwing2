@@ -86,9 +86,7 @@ impl BridgeConfig {
             ws_port: env_or("WS_PORT", "9090").parse().unwrap_or(9090),
             ws_path: env_or("WS_PATH", "/ws/agent"),
             health_port: env_or("HEALTH_PORT", "8443").parse().unwrap_or(8443),
-            auth_token: std::env::var("AGENT_AUTH_TOKEN")
-                .ok()
-                .filter(|t| !t.is_empty()),
+            auth_token: read_bridge_auth_token(),
             worker_id: env_or("LUNARWING_WORKER_ID", "worker-pebble-01"),
             pebble_bin: env_or("PEBBLE_BIN", "pebble"),
             model: env_or("PEBBLE_MODEL", "openai/gpt-5.2"),
@@ -101,6 +99,35 @@ impl BridgeConfig {
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Resolve the hub-handshake credential (WI#400): the entrypoint moves it
+/// out of the process environment into a root-only file
+/// (`AGENT_AUTH_TOKEN_FILE`) before spawning the bridge, so no long-lived
+/// process a task can inspect carries it in its environ. The env var stays
+/// as a fallback for dev launches that inject the token directly.
+fn read_bridge_auth_token() -> Option<String> {
+    if let Some(path) = std::env::var_os("AGENT_AUTH_TOKEN_FILE") {
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => {
+                let token = contents.trim_end_matches(['\r', '\n']).to_string();
+                if !token.is_empty() {
+                    return Some(token);
+                }
+                eprintln!(
+                    "[bridge] AGENT_AUTH_TOKEN_FILE {} is empty",
+                    path.to_string_lossy()
+                );
+            }
+            Err(e) => eprintln!(
+                "[bridge] cannot read AGENT_AUTH_TOKEN_FILE {}: {e}",
+                path.to_string_lossy()
+            ),
+        }
+    }
+    std::env::var("AGENT_AUTH_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
 }
 
 pub async fn run(

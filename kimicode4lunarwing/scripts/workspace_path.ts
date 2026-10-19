@@ -1,5 +1,7 @@
-import { closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, realpathSync, statSync } from "node:fs"
+import { closeSync, constants, existsSync, fchownSync, fstatSync, mkdirSync, openSync, realpathSync, statSync } from "node:fs"
 import { isAbsolute, relative, resolve } from "node:path"
+
+import { taskIdentity } from "./task_identity.js"
 
 export function expandWorkspacePath(path: string, workspaceRoot: string): string {
   if (path === "~") return workspaceRoot
@@ -69,14 +71,23 @@ export function resolveTaskWorkspace(
     throw new Error("Invalid workspace path for cron tick: /proc/self/fd is not available (required for symlink-safe directory creation)")
   }
   const flags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
+  // WI#400 run-164 KW-4: the bridge runs as root while the cron task runs
+  // under the separate task uid, so a freshly created leaf would stay
+  // root-owned and the task could not write its own project dir. Track
+  // whether THIS walk created the leaf; a pre-existing path is never chowned.
+  const identity = taskIdentity()
   let fd = openSync(root, flags)
   try {
-    for (const part of path.split("/")) {
+    const parts = path.split("/")
+    let leafCreated = false
+    for (const [index, part] of parts.entries()) {
       const child = `/proc/self/fd/${fd}/${part}`
       try {
         mkdirSync(child)
+        leafCreated = index === parts.length - 1
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw annotateComponent(error, part)
+        leafCreated = false
       }
       let next: number
       try {
@@ -96,6 +107,12 @@ export function resolveTaskWorkspace(
     const landed = statSync(resolved)
     if (walked.dev !== landed.dev || walked.ino !== landed.ino) {
       throw new Error(`resolved path changed during bootstrap: ${path}`)
+    }
+    // KW-4: hand the newly created leaf to the task identity through the
+    // O_DIRECTORY|O_NOFOLLOW descriptor the walk still holds — no path
+    // re-resolution, no symlink window.
+    if (leafCreated && identity) {
+      fchownSync(fd, identity.uid, identity.gid)
     }
     return resolved
   } catch (error) {

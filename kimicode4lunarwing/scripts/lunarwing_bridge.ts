@@ -26,6 +26,8 @@ import {
   type TaskResult,
   type WsState,
 } from "./lunarwing_runtime.js"
+import { readFileSync } from "node:fs"
+
 import { executeTask } from "./kimi_task_executor.js"
 import { proxyEnvForTask, ToolProxyRelay, type TaskProxyHandle } from "./lunarwing_tool_proxy.js"
 import { resolveTaskWorkspace, workspacePathsOverlap } from "./workspace_path.js"
@@ -43,7 +45,28 @@ const WS_BIND_HOST = process.env.WS_BIND_HOST || "0.0.0.0"
 const WS_PORT = parseInt(process.env.WS_PORT || "9090", 10)
 const WS_PATH = process.env.WS_PATH || "/ws/agent"
 const WS_URL = process.env.WS_URL || ""
-const AGENT_AUTH_TOKEN = process.env.AGENT_AUTH_TOKEN || ""
+// WI#400: the entrypoint moves the hub-handshake credential out of the
+// process environment into a root-only file (AGENT_AUTH_TOKEN_FILE) before
+// spawning the bridge, so no long-lived process a task can inspect carries
+// it in its environ. The env var stays as a dev-launch fallback.
+function readBridgeAuthToken(): string {
+  const tokenFile = process.env.AGENT_AUTH_TOKEN_FILE
+  if (tokenFile) {
+    try {
+      const contents = readFileSync(tokenFile, "utf8").replace(/[\r\n]+$/, "")
+      if (contents) return contents
+      console.error(`[bridge] AGENT_AUTH_TOKEN_FILE ${tokenFile} is empty`)
+    } catch (err) {
+      console.error(
+        `[bridge] cannot read AGENT_AUTH_TOKEN_FILE ${tokenFile}:`,
+        err instanceof Error ? err.message : err,
+      )
+    }
+  }
+  return process.env.AGENT_AUTH_TOKEN || ""
+}
+
+const AGENT_AUTH_TOKEN = readBridgeAuthToken()
 const RECONNECT_MS = parseInt(process.env.RECONNECT_MS || "3000", 10)
 const PING_INTERVAL_MS = parseInt(process.env.PING_INTERVAL_MS || "20000", 10)
 const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || "/workspace"
