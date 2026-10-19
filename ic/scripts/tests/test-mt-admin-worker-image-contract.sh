@@ -122,11 +122,19 @@ base_contract() {  # <worker>: the rootless-podman base contract the lane uses
     pebble) printf '%s' "$PEBBLE_ROOTLESS_LAUNCH_CONTRACT" ;;
   esac
 }
-image_user_for() {  # <worker>: what the lane's image-user guard expects
-  # WI#400: the guarded lanes (kimi/opencode/opencode2) expect the root
-  # entrypoint user; the pebble lane has no image-user guard, so any value
-  # passes it.
-  printf '0:0'
+image_user_for() {  # <worker>: the lane's real image Config.User
+  # Feed each lane the user its current image actually carries so each
+  # image-user guard is checked against its own expectation: WI#400 migrated
+  # the kimi and opencode lanes to a root entrypoint (USER 0:0) whose
+  # serve/tasks drop to the task uid, while the opencode2 lane is NOT migrated
+  # (its image still carries the task uid directly) — its guard must keep
+  # accepting exactly $OPENCODE2_CONTAINER_UID[:GID]. The pebble lane has no
+  # image-user guard and its image sets no USER, so Config.User is empty.
+  case "$1" in
+    kimi|opencode) printf '0:0' ;;
+    opencode2) printf '%s:%s' "$OPENCODE2_CONTAINER_UID" "$OPENCODE2_CONTAINER_GID" ;;
+    *) printf '' ;;
+  esac
 }
 use_init() {  # <systemd|openrc>
   local init="$1"
