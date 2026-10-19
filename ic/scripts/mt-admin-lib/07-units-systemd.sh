@@ -549,7 +549,7 @@ EOF
       # ("unsupported key 'SecurityOpt' in group 'Container'"), so the unit is
       # never created and the worker is unreachable (connection refused). Use
       # the spelling the other quadlets in this file already use.
-      printf 'PodmanArgs=--security-opt=no-new-privileges\n'
+      printf 'PodmanArgs=--security-opt=no-new-privileges --cap-drop=ALL --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER --cap-add=KILL --cap-add=SETUID --cap-add=SETGID\n'
     else
       # SSH agent DIRECTORY mount + env (always included — the daemon creates
       # the socket at startup; if SSH isn't configured, the socket won't exist
@@ -565,8 +565,16 @@ EOF
       # with a root bridge, the setting keeps setuid/file-capability
       # binaries from handing privilege back to task code. opencode2 is NOT
       # a WI#400 root-bridge lane yet, so it is deliberately excluded.
+      # KW-3: the same lanes' root bridge also runs with the default
+      # capability set otherwise — on rootful runtimes that is host root.
+      # Trim to the set the bridge actually uses: CHOWN (relay-socket and
+      # cron-leaf handoff to the task uid), SETUID/SETGID (the setpriv task
+      # drop), KILL (timeout/cancel kills of the task-uid children),
+      # DAC_OVERRIDE+FOWNER (cron workspace creation and mode management
+      # inside the task-owned workspace root; without them the bridge's own
+      # mkdir/chmod there fails).
       case "$worker" in
-        opencode|pebble) printf 'PodmanArgs=--security-opt=no-new-privileges\n' ;;
+        opencode|pebble) printf 'PodmanArgs=--security-opt=no-new-privileges --cap-drop=ALL --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER --cap-add=KILL --cap-add=SETUID --cap-add=SETGID\n' ;;
       esac
     fi
     # Publish the per-tenant dedicated health port (v8) -> container's 8443, so
