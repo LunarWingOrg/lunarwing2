@@ -214,9 +214,11 @@ COPY pebble4lunarwing/entrypoint.sh /usr/local/bin/entrypoint.sh
 # LUNARWING_TOOL_PROXY_SOCKET / LUNARWING_TASK_ID from the env the bridge's
 # executor injects into the pebble process (pebble passes its env through
 # to MCP children); without them (cli mode, relay setup failure) it
-# advertises zero tools. Baked root-owned 0444 in a 0555 directory.
-# Unlike the other lanes, this does not protect it from task code: pebble
-# tasks run as container root until WI#400.
+# advertises zero tools. Baked root-owned 0444 in a 0555 directory. WI#400:
+# with tasks dropped to PEBBLE_TASK_UID this now DOES protect it from task
+# code; the flip side is that pebble's own state writes into its config
+# home fail (documented in WORKER-CONTAINERS.md — model state is not
+# persisted under the split).
 COPY pebble4lunarwing/config/settings.json /etc/lunarwing/pebble/settings.json
 RUN chmod 0555 /etc/lunarwing/pebble && chmod 0444 /etc/lunarwing/pebble/settings.json
 
@@ -251,5 +253,14 @@ EXPOSE 9090 8443
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD curl -sf http://127.0.0.1:8443/health || exit 1
+
+# WI#400 LD-8: pin the bridge to container root. Under rootless podman
+# keep-id (the default multi-tenant deployment) an image with no USER would
+# start the entrypoint and bridge as the keep-id uid — the SAME uid every
+# task drops to — making the whole split a no-op (the token file would be
+# task-owned and /proc/self/environ readable by task code). USER 0:0 wins
+# over keep-id, the bridge runs as root, and the entrypoint/executor refuse
+# to run the websocket lane if they ever land on the task uid instead.
+USER 0:0
 
 ENTRYPOINT ["entrypoint.sh"]

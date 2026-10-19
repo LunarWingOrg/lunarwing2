@@ -1975,6 +1975,18 @@ start_tenant_pebble() {
   # must force-recreate the container (_worker_launch_contract).
   local pebble_launch_contract
   pebble_launch_contract="$(_worker_launch_contract "$name" lunarwing-worker-pebble:latest "$PEBBLE_ROOTLESS_LAUNCH_CONTRACT")"
+  # WI#400 LD-8: the pebble bridge must run as container root (image USER
+  # 0:0) — under rootless keep-id an image without USER starts the bridge
+  # as the task uid and the credential split is a no-op.
+  local image_user
+  image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
+    lunarwing-worker-pebble:latest 2>/dev/null || true)"
+  case "$image_user" in
+    "0:0"|"0") ;;
+    *)
+      die "pebble worker image has user '${image_user:-unset}', expected 0:0 (WI#400 root bridge; tasks drop to $PEBBLE_CONTAINER_UID); rebuild it"
+      ;;
+  esac
 
   # systemd + rootless podman: Quadlet .container owns the lifecycle (the unit's
   # [Container] spec creates+runs it), so skip the imperative `_ctr run` below.
