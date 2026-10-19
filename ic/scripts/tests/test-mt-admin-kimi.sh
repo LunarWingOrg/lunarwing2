@@ -96,6 +96,145 @@ assert_contains "$fixture/state/config.toml" 'timeout_ms = 3600000' \
   'other worker lanes retain one-hour timeout'
 assert_contains "$fixture/state/config.toml" 'timeout_ms = 14400000' \
   'repeated provisioning preserves Kimi timeout'
+
+# WI#324 KL-15(a): configure-worker-tools renders the proxied-tool grant into
+# the tenant's daemon config — the surface a rebuilt worker image was missing
+# (deny-by-default left every proxied call refused with no way to opt in).
+CFG="$fixture/state/config.toml"
+WORKER_BLOCK() {  # <worker> — prints that worker's block body from its name line
+  local worker="$1"
+  awk -v w="$worker" '
+    /^\[\[sandbox\.external_workers\]\][[:space:]]*$/ { if (emit) emit = 0; inblk = 1; next }
+    /^\[/ { inblk = 0; emit = 0; next }
+    inblk && $0 == "name = \"" w "\"" { emit = 1; print; next }
+    emit { print }
+  ' "$CFG"
+}
+KIMI_BLOCK() { WORKER_BLOCK kimi; }
+OPENCODE_BLOCK() { WORKER_BLOCK opencode; }
+
+set_external_worker_tool_allowlist root kimi "memory_read,memory_write"
+if grep -Fq 'tool_allowlist = ["memory_read", "memory_write"]' <<<"$(KIMI_BLOCK)"; then
+  pass 'worker tool grant lands inside the kimi block'
+else
+  fail 'worker tool grant missing from the kimi block'
+fi
+if grep -Fq 'tool_allowlist' <<<"$(OPENCODE_BLOCK)"; then
+  fail 'worker tool grant leaked into another worker block'
+else
+  pass 'worker tool grant stays scoped to the named worker'
+fi
+if [[ "$(grep -c '^tool_allowlist = ' "$CFG")" -eq 1 ]]; then
+  pass 'grant insert produces exactly one tool_allowlist key'
+else
+  fail 'grant insert produced the wrong key count'
+fi
+
+set_external_worker_tool_allowlist root kimi "memory_read,memory_write"
+if [[ "$(grep -c '^tool_allowlist = ' "$CFG")" -eq 1 ]] \
+  && grep -Fq 'tool_allowlist = ["memory_read", "memory_write"]' <<<"$(KIMI_BLOCK)"; then
+  pass 're-running the same grant is idempotent'
+else
+  fail 're-running the same grant duplicated or changed the key'
+fi
+
+set_external_worker_tool_allowlist root kimi "gitlab_tool,knowledge_search"
+grep -Fq 'tool_allowlist = ["gitlab_tool", "knowledge_search"]' <<<"$(KIMI_BLOCK)" \
+  && pass 'changing the grant rewrites the existing key' \
+  || fail 'changing the grant did not rewrite the key'
+
+if ( set_external_worker_tool_allowlist root kimi none ) >/dev/null 2>&1 \
+  && ! grep -Fq 'tool_allowlist' "$CFG"; then
+  pass "clearing with 'none' removes the grant (deny-by-default restored)"
+else
+  fail "clearing with 'none' left a tool_allowlist behind"
+fi
+if ( set_external_worker_tool_allowlist root kimi none ) >/dev/null 2>&1 \
+  && ! grep -Fq 'tool_allowlist' "$CFG"; then
+  pass "clearing an absent grant is a no-op"
+else
+  fail "clearing an absent grant misbehaved"
+fi
+
+if ( set_external_worker_tool_allowlist root kimi "shell" ) >/dev/null 2>&1; then
+  fail 'non-phase-1 tool name was accepted'
+else
+  pass 'non-phase-1 tool name is refused'
+fi
+grep -Fq 'tool_allowlist' "$CFG" \
+  && fail 'refused grant still wrote a key' \
+  || pass 'refused grant leaves config untouched'
+if ( set_external_worker_tool_allowlist root kimi "memory_read,memory_read" ) >/dev/null 2>&1; then
+  fail 'duplicate tool entry was accepted'
+else
+  pass 'duplicate tool entry is refused'
+fi
+if ( set_external_worker_tool_allowlist root nanocode "memory_read" ) >/dev/null 2>&1; then
+  fail 'unknown worker name was accepted'
+else
+  pass 'unknown worker name is refused'
+fi
+
+# A cron-mode worker never keeps a worker-level list (stripped at load,
+# MR !1549 EF-1) — the command must refuse the grant outright.
+cron_dir="$fixture/cron-state"
+real_tenant_state_dir() { printf '%s/state\n' "$fixture"; }
+tenant_state_dir() { printf '%s\n' "$cron_dir"; }
+mkdir -p "$cron_dir"
+cat >"$cron_dir/config.toml" <<'EOF'
+[[sandbox.external_workers]]
+name = "kimi"
+url = "ws://127.0.0.1:12001/ws/agent"
+mode = "cron"
+EOF
+if ( set_external_worker_tool_allowlist root kimi "memory_read" ) >/dev/null 2>&1; then
+  fail 'cron-mode worker accepted a worker-level grant'
+else
+  pass 'cron-mode worker refuses a worker-level grant'
+fi
+grep -Fq 'tool_allowlist' "$cron_dir/config.toml" \
+  && fail 'refused cron grant still wrote a key' \
+  || pass 'refused cron grant leaves config untouched'
+# Minimal block without timeout_ms: the grant inserts after the url line.
+cat >"$cron_dir/config.toml" <<'EOF'
+[[sandbox.external_workers]]
+name = "kimi"
+url = "ws://127.0.0.1:12001/ws/agent"
+EOF
+set_external_worker_tool_allowlist root kimi "knowledge_get_topic"
+if awk 'found_url && /^tool_allowlist = \["knowledge_get_topic"\]$/ {ok=1} /^url = /{found_url=1} END{exit ok?0:1}' \
+  "$cron_dir/config.toml"; then
+  pass 'grant inserts after url when timeout_ms is absent'
+else
+  fail 'grant insert without timeout_ms misplaced'
+fi
+tenant_state_dir() { real_tenant_state_dir; }
+
+# CLI surface: exact-arity dispatch and forwarding. The harness may run as a
+# non-root account here; the dispatcher's require_root is stubbed for these
+# forwarding checks only (the library calls above exercise the function body
+# directly, as every other configure-* test in this file does).
+require_root() { :; }
+set_external_worker_tool_allowlist() { CAPTURED_TOOLS="$*"; }
+CAPTURED_TOOLS=''
+main configure-worker-tools root kimi none
+if [[ "$CAPTURED_TOOLS" == 'root kimi none' ]]; then
+  pass 'configure-worker-tools forwards tenant, worker, and list'
+else
+  fail "configure-worker-tools forwarded wrong args: [$CAPTURED_TOOLS]"
+fi
+if ( main configure-worker-tools root kimi ) >/dev/null 2>&1; then
+  fail 'configure-worker-tools accepted a missing list argument'
+else
+  pass 'configure-worker-tools enforces its arity'
+fi
+help_output_tools="$(usage)"
+if [[ "$help_output_tools" == *'configure-worker-tools'* ]]; then
+  pass 'help documents configure-worker-tools'
+else
+  fail 'help omits configure-worker-tools'
+fi
+
 MT_ROOTLESS=true
 render_worker_quadlet root kimi 8443
 quadlet="$fixture/quadlets/lunarwing-kimi-root.container"

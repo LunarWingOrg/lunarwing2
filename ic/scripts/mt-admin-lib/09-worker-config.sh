@@ -518,7 +518,7 @@ EXTERNAL_WORKER_PROXY_TOOLS="memory_read memory_write knowledge_search knowledge
 
 set_external_worker_tool_allowlist() {  # <tenant> <worker> <csv|none>
   local name="$1" worker="$2" tools_arg="$3"
-  local config_path staged_in staged_out awk_status tool joined tools_line
+  local config_path staged_in staged_out awk_status tool joined tools_line=""
   name="$(sanitize_name "$name")"
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
   require_worker_name "$worker"
@@ -555,9 +555,9 @@ set_external_worker_tool_allowlist() {  # <tenant> <worker> <csv|none>
       [[ " ${seen[*]-} " != *" $tool "* ]] || die "duplicate tool '$tool' in the grant"
       seen+=("$tool")
     done
-    joined="$(printf '%s, ' "${tools[@]}")"
+    joined="$(printf '"%s", ' "${tools[@]}")"
     joined="${joined%, }"
-    tools_line="tool_allowlist = [\"$joined\"]"
+    tools_line="tool_allowlist = [$joined]"
   fi
 
   # WI#390: stage root-private outside the tenant-writable state dir (read as
@@ -603,9 +603,10 @@ set_external_worker_tool_allowlist() {  # <tenant> <worker> <csv|none>
             }
             next
           }
-          if (want != "" && !has_list && $0 ~ /^(timeout_ms|url)[[:space:]]*=/) {
+          if (want != "" && !has_list && !done_ins && $0 ~ /^(timeout_ms|url)[[:space:]]*=/) {
             print
             print want
+            done_ins = 1
             changed = 1
             next
           }
