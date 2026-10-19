@@ -38,7 +38,8 @@ XMPP_JID="${XMPP_JID:-vex@xmpp.sobe.world}"     # <-- confirm the account exists
 XMPP_PASSWORD="${XMPP_PASSWORD:-}"              # blank -> mt-admin generates one
 LLM_API_KEY="${LLM_API_KEY:-}"                 # blank -> defaults to token-vex (TensorZero proxy)
 GOTIFY_URL="${GOTIFY_URL:-}"                    # optional, e.g. https://gotify.example.com
-DOCKER_GROUP="${DOCKER_GROUP:-true}"           # add vex to the docker group (needed for sandbox + workers)
+DOCKER_GROUP="${DOCKER_GROUP:-false}"          # set true ONLY to reach a shared rootful daemon socket
+                                               #   (rootless podman needs no group — WI#389)
 WITH_PEBBLE="${WITH_PEBBLE:-true}"             # build the pebble worker Docker image
 ENSURE_WASM_TOOLCHAIN="${ENSURE_WASM_TOOLCHAIN:-true}"  # install cargo-component for vex if missing
 # ----------------------------------------------------------------------------
