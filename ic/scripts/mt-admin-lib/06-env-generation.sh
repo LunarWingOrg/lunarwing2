@@ -331,6 +331,14 @@ read_tenant_env_value() {  # <tenant> <file> <KEY>
   [[ "$(id -un)" != "$name" ]] || drop=()
   [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || die "invalid tenant env key"
   darkirc_path_components_safe "$target" || die "unsafe tenant env path: $target"
+  # First add_tenant pass: the target does not exist yet AND the tenant
+  # account has not been created (create_tenant_user runs later), so the
+  # tenant-side sudo below could only fail on the unknown account. That shape
+  # reads as absent (run-166 LF-1) — an existing target without an account is
+  # not this path and still refuses at the sudo boundary.
+  if [[ ! -e "$target" && ! -L "$target" ]] && ! id -u -- "$name" >/dev/null 2>&1; then
+    return 0
+  fi
   value="$("${drop[@]}" env -i PATH="/usr/bin:/bin" \
     TARGET_PATH="$target" TARGET_KEY="$key" bash --norc --noprofile -c '
       set -euo pipefail
@@ -339,9 +347,20 @@ read_tenant_env_value() {  # <tenant> <file> <KEY>
       uid="$(id -u)"
       # A parent that does not exist at all means nothing was provisioned yet
       # (the first add_tenant pass reads before create_tenant_user makes the
-      # env dir): read as absent. A parent that EXISTS in any shape other than
-      # a non-symlink directory still refuses (WI#423).
-      [[ -e "$parent" || -L "$parent" ]] || exit 0
+      # env dir): read as absent. But -e cannot tell ENOENT from EACCES on an
+      # untraversable ancestor, so before treating the parent as absent, walk
+      # up to the deepest VISIBLE ancestor and require it to be a searchable,
+      # non-symlink directory — otherwise the absence is not provable and the
+      # read refuses (run-166 LF-7; this is the fail-open path an empty-value
+      # refusal elsewhere would otherwise miss).
+      if [[ ! -e "$parent" && ! -L "$parent" ]]; then
+        probe="${parent%/*}"
+        while [[ -n "$probe" && "$probe" != "/" && ! -e "$probe" && ! -L "$probe" ]]; do
+          probe="${probe%/*}"
+        done
+        [[ -z "$probe" || ( -d "$probe" && ! -L "$probe" && -x "$probe" ) ]] || exit 73
+        exit 0
+      fi
       [[ -d "$parent" && ! -L "$parent" ]] || exit 73
       parent_owner="$(stat -c %u "$parent" 2>/dev/null || printf -- -1)"
       parent_mode="$(stat -c %a "$parent" 2>/dev/null || true)"
@@ -1250,7 +1269,11 @@ write_tenant_lunarwing_env() {
   cb_recovery="$(_env_existing "$env_snapshot" LLM_CIRCUIT_BREAKER_RECOVERY_SECS)"; cb_recovery="${cb_recovery:-15}"
   # Stable + migration-safe; resolved before the heredoc so it can read an
   # existing DATABASE_URL (preserving an already-initialised DB's password).
-  pg_password="$(tenant_pg_password "$name")"
+  # Run-166 LF-3: a refusal must be fatal — an empty password rendered into
+  # DATABASE_URL would brick the tenant's DB connection at first start.
+  if ! pg_password="$(tenant_pg_password "$name")"; then
+    die "could not resolve the PostgreSQL password for tenant '$name'"
+  fi
 
   # LLM endpoint the daemon's OpenAI-compatible client dials. When the proxy is
   # enabled, defaults to this tenant's local TensorZero proxy. When disabled,
@@ -2592,9 +2615,16 @@ upload_tenant_ssh_key() {
 
   http_port="$(ports_get "$name" http)"
   staged_key="$(tenant_env_dir "$name")/ssh_key_staged"
-  ssh_api_token="$(_read_env_value "$(tenant_env_dir "$name")/lunarwing.env" SSH_API_TOKEN)"
 
   [[ -f "$staged_key" ]] || { say "no staged SSH key for $name (skipping upload)"; return 0; }
+  # WI#423 (run-166 LF-4): the bearer crosses into an Authorization header —
+  # read it through the tenant-side per-key reader, not a root _read_env_value
+  # of the live path. A refusal (symlinked/foreign-owned env shape) is fatal
+  # for the upload; the staged key stays for the next pass.
+  if ! ssh_api_token="$(read_tenant_env_value "$name" "$(tenant_env_dir "$name")/lunarwing.env" SSH_API_TOKEN)"; then
+    say "ERROR: could not safely read SSH_API_TOKEN for tenant '$name'; staged key not uploaded" >&2
+    return 1
+  fi
   if [[ -z "$ssh_api_token" ]]; then
     say "ERROR: SSH_API_TOKEN missing for tenant '$name'; staged key not uploaded" >&2
     return 1
