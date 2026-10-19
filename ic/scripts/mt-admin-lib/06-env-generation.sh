@@ -107,16 +107,22 @@ validate_study_notes_state_home() {  # <absolute state path>
     || die "Study Notes notes directory must not be a symlink"
 }
 
+# WI#423: these values feed quadlet `Volume=` mount sources for the worker
+# containers — a swapped read could mount another tenant's study-notes
+# checkout into this tenant's worker, so they come from the tenant-side
+# per-key reader (symlink/ownership/link-count/mode checks as the tenant).
+# An absent env file reads as empty (no mount); an unsafe path refuses, and
+# the render/start callers abort fail-closed on that refusal.
 tenant_study_notes_home() {  # <tenant>
-  _env_existing "$(tenant_env_dir "$1")/lunarwing.env" LW2STUDYMCP_HOME
+  read_tenant_env_value "$1" "$(tenant_env_dir "$1")/lunarwing.env" LW2STUDYMCP_HOME
 }
 
 tenant_study_notes_state_home() {  # <tenant>
-  _env_existing "$(tenant_env_dir "$1")/lunarwing.env" LW2STUDYMCP_STATE_HOME
+  read_tenant_env_value "$1" "$(tenant_env_dir "$1")/lunarwing.env" LW2STUDYMCP_STATE_HOME
 }
 
 tenant_study_notes_allow_write() {  # <tenant>
-  _env_existing "$(tenant_env_dir "$1")/lunarwing.env" LW2STUDYMCP_ALLOW_WRITE
+  read_tenant_env_value "$1" "$(tenant_env_dir "$1")/lunarwing.env" LW2STUDYMCP_ALLOW_WRITE
 }
 
 study_notes_write_enabled() {  # <raw boolean>
@@ -226,7 +232,12 @@ resolve_tenant_xmpp_jid() {  # <name> [explicit_jid]
     return 0
   fi
   local existing
-  existing="$(_env_existing "$(tenant_env_dir "$name")/lunarwing.env" XMPP_JID)"
+  # WI#423: read through the tenant-side per-key reader. An unsafe live path
+  # refuses loudly instead of silently resetting the JID to xmpp.localhost
+  # (which would repoint a live tenant's bridge); an absent file still reads
+  # as empty so first provisioning keeps its default.
+  existing="$(read_tenant_env_value "$name" "$(tenant_env_dir "$name")/lunarwing.env" XMPP_JID)" \
+    || die "could not safely read XMPP_JID from $(tenant_env_dir "$name")/lunarwing.env as tenant '$name'"
   printf '%s\n' "${existing:-$name@xmpp.localhost}"
 }
 
@@ -529,7 +540,10 @@ _weechat_validate_relay_config() {  # <dir> <port> <plaintext_password>
 _weechat_generate_relay_config() {  # <tenant> <temp_dir> <port> <lunarwing_env>
   local tenant="$1" temp_dir="$2" relay_port="$3" lunarwing_env="$4"
   local relay_password weechat_bin
-  relay_password="$(_read_env_value "$lunarwing_env" RELAY_PASSWORD)"
+  # WI#423: tenant-side per-key read — the value is passed to a WeeChat run as
+  # the tenant, so a symlink swap must refuse rather than hand it the other
+  # tenant's relay credential.
+  relay_password="$(read_tenant_env_value "$tenant" "$lunarwing_env" RELAY_PASSWORD)" || return 1
   [[ -n "$relay_password" ]] || return 1
   weechat_bin="$(command -v weechat 2>/dev/null || true)"
   if [[ -z "$weechat_bin" ]]; then
@@ -568,7 +582,8 @@ configure_weechat_relay() {  # <tenant>
     printf 'error: tenant env file not found: %s\n' "$lunarwing_env" >&2
     return 1
   fi
-  relay_password="$(_read_env_value "$lunarwing_env" RELAY_PASSWORD)"
+  relay_password="$(read_tenant_env_value "$tenant" "$lunarwing_env" RELAY_PASSWORD)" \
+    || { printf 'error: could not safely read RELAY_PASSWORD from %s as tenant %q\n' "$lunarwing_env" "$tenant" >&2; return 1; }
   if [[ -z "$relay_password" ]]; then
     printf 'error: RELAY_PASSWORD missing from %s\n' "$lunarwing_env" >&2
     return 1
@@ -1109,12 +1124,14 @@ write_tenant_lunarwing_env() {
   # and voice.env are the same tenant-writable class (their tokens are carried
   # into this render) and are snapshotted the same way. The commit at the end
   # still re-validates the live path in write_tenant_file_atomic, so a
-  # post-snapshot swap fails closed there. resolve_tenant_xmpp_jid above runs
-  # before the snapshot by design: XMPP_JID is a non-secret identifier, and a
-  # foreign symlink dies on this snapshot before any value is rendered.
-  # Known exception (WI#423): tenant_pg_password below still root-reads
-  # pg.secret/lunarwing.env through the live path; that residue is tracked
-  # there rather than claimed covered by this snapshot.
+  # post-snapshot swap fails closed there. resolve_tenant_xmpp_jid above no
+  # longer touches the live path either (WI#423): XMPP_JID comes from the
+  # tenant-side per-key reader, and a foreign symlink refuses loudly there
+  # before any value is rendered.
+  # WI#423: tenant_pg_password below also reads pg.secret/lunarwing.env
+  # through its own tenant-side snapshots and commits through the tenant-side
+  # atomic writer — no root resolution of the live paths remains in this
+  # render.
   local env_snapshot vision_snapshot voice_snapshot
   _snapshot_tenant_env "$name" "$path" env_snapshot
   _snapshot_tenant_env "$name" "$(tenant_env_dir "$name")/vision.env" vision_snapshot
@@ -2549,7 +2566,9 @@ ensure_ssh_api_token() {
 
 tenant_ssh_api_token_present() {
   local name="$1"
-  [[ -n "$(_read_env_value "$(tenant_env_dir "$name")/lunarwing.env" SSH_API_TOKEN)" ]]
+  # WI#423: tenant-side read; an unsafe path reads as absent so the caller
+  # regenerates the credential through the tenant-side _env_set writer.
+  [[ -n "$(read_tenant_env_value "$name" "$(tenant_env_dir "$name")/lunarwing.env" SSH_API_TOKEN)" ]]
 }
 
 # Upload the staged SSH private key to the secrets store via the gateway's SSH
@@ -2628,11 +2647,13 @@ upload_tenant_darkirc_secret() {
 
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
 
-  darkirc_adapter_secret="$(_read_env_value "$env_path" DARKIRC_ADAPTER_SECRET)"
+  darkirc_adapter_secret="$(read_tenant_env_value "$name" "$env_path" DARKIRC_ADAPTER_SECRET)" \
+    || { say "WARNING: could not safely read DARKIRC_ADAPTER_SECRET from $env_path; not uploaded (upload manually via the API)" >&2; return 1; }
   # The secret is optional — nothing to upload if it is not set.
   [[ -n "$darkirc_adapter_secret" ]] || return 0
 
-  gateway_token="$(_read_env_value "$env_path" GATEWAY_AUTH_TOKEN)"
+  gateway_token="$(read_tenant_env_value "$name" "$env_path" GATEWAY_AUTH_TOKEN)" \
+    || { say "WARNING: could not safely read GATEWAY_AUTH_TOKEN from $env_path; DarkIRC adapter secret not uploaded (upload manually via the API)" >&2; return 1; }
   if [[ -z "$gateway_token" ]]; then
     say "WARNING: GATEWAY_AUTH_TOKEN not found in $env_path; DarkIRC adapter secret not uploaded (upload manually via the API)" >&2
     return 1
@@ -2686,7 +2707,8 @@ upload_tenant_brave_search_secret() {
   brave_key="${BRAVE_SEARCH_API_KEY:-${BRAVE_API_KEY:-}}"
   [[ -n "$brave_key" ]] || return 0
 
-  gateway_token="$(_read_env_value "$(tenant_env_dir "$name")/lunarwing.env" GATEWAY_AUTH_TOKEN)"
+  gateway_token="$(read_tenant_env_value "$name" "$(tenant_env_dir "$name")/lunarwing.env" GATEWAY_AUTH_TOKEN)" \
+    || { say "WARNING: could not safely read GATEWAY_AUTH_TOKEN for tenant $name; Brave key not uploaded (upload manually via the API)" >&2; return 1; }
   if [[ -z "$gateway_token" ]]; then
     say "WARNING: GATEWAY_AUTH_TOKEN not found for tenant $name; Brave key not uploaded (upload manually via the API)" >&2
     return 1
