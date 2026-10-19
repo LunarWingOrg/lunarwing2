@@ -1662,6 +1662,148 @@ fi
 assert_eq "WI#423 refusals leave the foreign env untouched" "$(cat "$wi423_victim")" "$wi423_victim_before"
 rm -f "$MT_FIXTURE/env/lunarwing.env" "$wi423_victim"
 
+echo "=== run-166 LF-1: first add_tenant pass (no account yet) reads as absent ==="
+
+# The reader runs `sudo -u <tenant>` before create_tenant_user has made the
+# account; real sudo refuses an unknown user, which the head turned into a
+# `|| die` abort of add-tenant for EVERY brand-new tenant. Model the real
+# refusal (unknown account -> sudo fails before running anything) and require
+# the default-JID path: target absent + account absent reads as absent.
+wi423_new_tenant="wi423-brand-new-tenant"
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+lf1_rc=0
+lf1_out="$(
+  (
+    sudo() {
+      if [[ "${1:-}" == "-u" ]] && ! id -u -- "$2" >/dev/null 2>&1; then
+        echo "sudo: unknown user $2" >&2
+        return 1
+      fi
+      return 1   # any other tenant-side drop is also a refusal here
+    }
+    read_tenant_env_value "$wi423_new_tenant" "$MT_FIXTURE/env/lunarwing.env" XMPP_JID
+  ) 2>/dev/null
+)" || lf1_rc=$?
+if [[ "$lf1_rc" -ne 0 || -n "$lf1_out" ]]; then
+  echo "  FAIL: pre-account read did not read as absent (rc=$lf1_rc out=[$lf1_out])"; failures=$((failures + 1))
+else
+  echo "  PASS: pre-account read reads as absent"
+fi
+assert_eq "pre-account JID resolution keeps the default" \
+  "$(resolve_tenant_xmpp_jid "$wi423_new_tenant" "")" "wi423-brand-new-tenant@xmpp.localhost"
+
+# Control: an EXISTING target without an account is not the pre-provision
+# shape — it still refuses at the tenant-side drop instead of reading as
+# absent (the fast path must not become a root read of a present target).
+printf 'XMPP_JID=foreign@xmpp.example\n' >"$MT_FIXTURE/env/lunarwing.env"
+chmod 600 "$MT_FIXTURE/env/lunarwing.env"
+lf1_rc=0
+lf1_out="$(
+  (
+    sudo() { return 1; }   # unknown account: sudo refuses everything
+    read_tenant_env_value "$wi423_new_tenant" "$MT_FIXTURE/env/lunarwing.env" XMPP_JID
+  ) 2>/dev/null
+)" || lf1_rc=$?
+if [[ "$lf1_rc" -eq 0 ]]; then
+  echo "  FAIL: present target without an account read as absent"; failures=$((failures + 1))
+else
+  echo "  PASS: present target without an account still refuses"
+fi
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+
+echo "=== run-166 LF-3: multi-line/blank-line pg.secret refuses fatally ==="
+
+# The head's `grep -c .` count let a leading blank line through (and a dropped
+# check — mutant M4 — let anything through). A pg.secret that is not exactly
+# one control-character-free line is a shape mt-admin never wrote: die loudly
+# instead of rendering the mangled value into DATABASE_URL / the pg quadlet.
+tenant_cat() { cat -- "$2"; }
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+printf 'first-password\nsecond-password\n' >"$MT_FIXTURE/env/pg.secret"
+chmod 600 "$MT_FIXTURE/env/pg.secret"
+lf3_rc=0
+lf3_err="$( ( tenant_pg_password fixture-tenant ) 2>&1 )" || lf3_rc=$?
+if [[ "$lf3_rc" -eq 0 ]]; then
+  echo "  FAIL: two-line pg.secret was accepted"; failures=$((failures + 1))
+elif [[ "$lf3_err" != *"is not a single password line"* ]]; then
+  echo "  FAIL: two-line refusal carried no message: $lf3_err"; failures=$((failures + 1))
+else
+  echo "  PASS: two-line pg.secret dies as not-a-single-password-line"
+fi
+printf '\nleading-blank-password\n' >"$MT_FIXTURE/env/pg.secret"
+chmod 600 "$MT_FIXTURE/env/pg.secret"
+lf3_rc=0
+( tenant_pg_password fixture-tenant ) >/dev/null 2>&1 || lf3_rc=$?
+if [[ "$lf3_rc" -eq 0 ]]; then
+  echo "  FAIL: leading-blank-line pg.secret was accepted"; failures=$((failures + 1))
+else
+  echo "  PASS: leading-blank-line pg.secret refuses"
+fi
+# The refusal is a die: the render callers cannot continue past it.
+lf3_rc=0
+lf3_err="$( ( write_tenant_lunarwing_env fixture-tenant ) 2>&1 )" || lf3_rc=$?
+if [[ "$lf3_rc" -eq 0 ]]; then
+  echo "  FAIL: env render continued past a refused pg.secret"; failures=$((failures + 1))
+else
+  echo "  PASS: env render aborts on a refused pg.secret"
+fi
+rm -f "$MT_FIXTURE/env/pg.secret"
+
+echo "=== run-166 LF-7: untraversable ancestor refuses; empty credential dies ==="
+
+# -e cannot tell ENOENT from EACCES: an env dir whose parent chain contains a
+# non-searchable directory must not read as "absent" (the head returned an
+# empty token with rc 0 and the worker started with AGENT_AUTH_TOKEN absent).
+# The tenant is the invoking user (a REAL account), so the LF-1 pre-provision
+# fast path does not apply — this exercises the tenant-side ancestor walk.
+lf7_tenant="$(id -un)"
+lf7_root="$MT_FIXTURE/lf7-root"
+mkdir -p "$lf7_root/no-search/sub"
+chmod 600 "$lf7_root/no-search"   # exists, visible, NOT searchable
+lf7_rc=0
+lf7_out="$(
+  read_tenant_env_value "$lf7_tenant" "$lf7_root/no-search/sub/lunarwing.env" WORKER_AUTH_TOKEN
+)" || lf7_rc=$?
+if [[ "$lf7_rc" -eq 0 ]]; then
+  echo "  FAIL: untraversable ancestor read as absent (rc 0, out=[$lf7_out])"; failures=$((failures + 1))
+else
+  echo "  PASS: untraversable ancestor refuses instead of reading as absent"
+fi
+# Control: the same deep path under a SEARCHABLE, tenant-private tree is
+# genuinely absent (the env-dir privacy checks demand 0700 — a 0755 parent is
+# itself a refusal shape, not an absence).
+mkdir -p "$lf7_root/searchable/sub"
+chmod 700 "$lf7_root/searchable/sub"
+lf7_rc=0
+lf7_out="$(
+  read_tenant_env_value "$lf7_tenant" "$lf7_root/searchable/sub/lunarwing.env" WORKER_AUTH_TOKEN
+)" || lf7_rc=$?
+if [[ "$lf7_rc" -ne 0 || -n "$lf7_out" ]]; then
+  echo "  FAIL: absent-under-searchable did not read as absent (rc=$lf7_rc out=[$lf7_out])"; failures=$((failures + 1))
+else
+  echo "  PASS: absent-under-searchable reads as absent"
+fi
+chmod 700 "$lf7_root/no-search"
+rm -rf "$lf7_root"
+
+# The resolver's last resort must not return success with an empty token: a
+# read-only env (no mint) carrying an explicitly empty GATEWAY_AUTH_TOKEN dies
+# instead of handing the caller a credential-less "success".
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+printf 'GATEWAY_AUTH_TOKEN=\n' >"$MT_FIXTURE/env/lunarwing.env"
+chmod 400 "$MT_FIXTURE/env/lunarwing.env"
+lf7_rc=0
+lf7_err="$( ( resolve_worker_auth_token fixture-tenant "$MT_FIXTURE/env/lunarwing.env" ) 2>&1 )" || lf7_rc=$?
+if [[ "$lf7_rc" -eq 0 ]]; then
+  echo "  FAIL: resolver returned success with an empty credential"; failures=$((failures + 1))
+elif [[ "$lf7_err" != *"no worker credential available"* ]]; then
+  echo "  FAIL: empty-credential refusal carried no message: $lf7_err"; failures=$((failures + 1))
+else
+  echo "  PASS: resolver dies on an empty credential"
+fi
+chmod 600 "$MT_FIXTURE/env/lunarwing.env"
+rm -f "$MT_FIXTURE/env/lunarwing.env"
+
 # Restore the env-writer stub shape the earlier sections rely on.
 tenant_pg_password()      { echo "pgpass-fixture"; }
 
