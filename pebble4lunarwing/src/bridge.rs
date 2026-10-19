@@ -517,8 +517,7 @@ mod tests {
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+                .map_or(0, |d| d.as_nanos())
         ));
         std::fs::create_dir_all(&dir).expect("create dir");
 
@@ -538,8 +537,7 @@ mod tests {
         let crlf = dir.join("crlf");
         std::fs::write(&crlf, "tok\r\n\n").expect("write crlf token");
         assert_eq!(
-            resolve_bridge_auth_token(Some(crlf.into_os_string()), None)
-                .expect("trimmed read"),
+            resolve_bridge_auth_token(Some(crlf.into_os_string()), None).expect("trimmed read"),
             Some("tok".to_string())
         );
         let interior = dir.join("interior");
@@ -555,7 +553,10 @@ mod tests {
         std::fs::write(&empty, "").expect("write empty file");
         let error = resolve_bridge_auth_token(Some(empty.into_os_string()), Some("env".into()))
             .expect_err("empty file must fail");
-        assert!(error.contains("holds no token"), "unexpected error: {error}");
+        assert!(
+            error.contains("holds no token"),
+            "unexpected error: {error}"
+        );
         let newline = dir.join("newline");
         std::fs::write(&newline, "\r\n\n").expect("write newline-only file");
         assert!(resolve_bridge_auth_token(Some(newline.into_os_string()), None).is_err());
@@ -575,8 +576,7 @@ mod tests {
         // With no file pointer, the dev env fallback still works (and an
         // empty env var means no auth, as before).
         assert_eq!(
-            resolve_bridge_auth_token(None, Some("env-token".to_string()))
-                .expect("env fallback"),
+            resolve_bridge_auth_token(None, Some("env-token".to_string())).expect("env fallback"),
             Some("env-token".to_string())
         );
         assert_eq!(

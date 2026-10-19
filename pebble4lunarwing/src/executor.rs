@@ -86,18 +86,20 @@ pub(crate) fn task_ids_from_env() -> Result<Option<(u32, u32)>, std::io::Error> 
                     )
                 })
             };
-            let task_uid = parse(uid, "PEBBLE_TASK_UID")?;
-            let task_gid = parse(gid, "PEBBLE_TASK_GID")?;
+            let ids = (
+                parse(uid, "PEBBLE_TASK_UID")?,
+                parse(gid, "PEBBLE_TASK_GID")?,
+            );
             // LD-14: id 0 would make the drop a no-op while every caller
             // keeps treating the split as active — refuse it. The value is
             // image ENV, not task env, so this is a misconfiguration gate.
-            if task_uid == 0 || task_gid == 0 {
+            if ids.0 == 0 || ids.1 == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "PEBBLE_TASK_UID/PEBBLE_TASK_GID must be non-zero (a zero id would make the privilege drop a no-op)",
                 ));
             }
-            Ok(Some((task_uid, task_gid)))
+            Ok(Some(ids))
         }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -212,6 +214,35 @@ fn resolve_setpriv_path() -> Result<std::ffi::OsString, std::io::Error> {
     ))
 }
 
+/// LD-8: refuse to spawn without a privilege split. If the bridge itself
+/// landed on the task uid (rootless keep-id with a USER-less image), the
+/// credential isolation WI#400 promises is absent: the task could read the
+/// bridge's environ and the token file. The owner of /proc/self is this
+/// process's uid (the crate forbids unsafe code, so `libc::geteuid` is not
+/// an option).
+fn refuse_shared_identity(task_ids: Option<(u32, u32)>) -> Result<(), std::io::Error> {
+    let Some((task_uid, _)) = task_ids else {
+        return Ok(());
+    };
+    let bridge_uid = std::fs::metadata("/proc/self")
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("cannot stat /proc/self for the bridge uid: {error}"),
+            )
+        })?
+        .uid();
+    if bridge_uid == task_uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "bridge runs as the task uid ({task_uid}); refusing to spawn without a privilege split (WI#400 LD-8)"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn spawn_pebble(
     config: &ExecutorConfig,
     request: &protocol::TaskRequest,
@@ -247,30 +278,7 @@ fn spawn_pebble(
     // would let task code regain privilege. The env assembled below is
     // passed to setpriv and inherited by the task unchanged.
     let task_ids = task_ids_from_env()?;
-    if let Some((task_uid, _)) = task_ids {
-        // LD-8: refuse to spawn without a privilege split. If the bridge
-        // itself landed on the task uid (rootless keep-id with a USER-less
-        // image), the credential isolation WI#400 promises is absent: the
-        // task could read the bridge's environ and the token file. The
-        // owner of /proc/self is this process's uid (the crate forbids
-        // unsafe code, so libc::geteuid is not an option).
-        let bridge_uid = std::fs::metadata("/proc/self")
-            .map_err(|error| {
-                std::io::Error::new(
-                    error.kind(),
-                    format!("cannot stat /proc/self for the bridge uid: {error}"),
-                )
-            })?
-            .uid();
-        if bridge_uid == task_uid {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "bridge runs as the task uid ({task_uid}); refusing to spawn without a privilege split (WI#400 LD-8)"
-                ),
-            ));
-        }
-    }
+    refuse_shared_identity(task_ids)?;
     let mut program = std::ffi::OsString::from(&config.pebble_bin);
     let mut argv: Vec<std::ffi::OsString> =
         pebble_args.iter().map(std::ffi::OsString::from).collect();
@@ -1174,8 +1182,10 @@ mod tests {
     #[tokio::test]
     async fn spawn_refuses_when_the_bridge_runs_as_the_task_uid() {
         const CHILD_MARKER: &str = "PEBBLE_WI400_LD8_CHILD";
-        const TEST_PATH: &str = "executor::tests::spawn_refuses_when_the_bridge_runs_as_the_task_uid";
+        const TEST_PATH: &str =
+            "executor::tests::spawn_refuses_when_the_bridge_runs_as_the_task_uid";
 
+        use std::os::unix::fs::MetadataExt;
         let exe_dir = std::env::current_exe()
             .expect("test binary path")
             .parent()
@@ -1183,12 +1193,12 @@ mod tests {
             .to_path_buf();
         let probe = exe_dir.join("pebble-wi400-ld8-selfid");
         let root = exe_dir.join("pebble-wi400-ld8-root");
-
         if std::env::var_os(CHILD_MARKER).is_none() {
-            use std::os::unix::fs::MetadataExt;
             std::fs::create_dir(&probe).expect("create self-id probe");
-            let own_uid = probe.metadata().expect("probe metadata").uid();
-            let own_gid = probe.metadata().expect("probe metadata").gid();
+            let ids = {
+                let meta = probe.metadata().expect("probe metadata");
+                (meta.uid(), meta.gid())
+            };
             std::fs::remove_dir_all(&probe).ok();
             let exe = std::env::current_exe().expect("test binary path");
             // The child must run AS the task uid so the refusal fires. As
@@ -1196,7 +1206,7 @@ mod tests {
             // identity check), so the re-exec drops to a stand-in unprivileged
             // uid through the same setpriv flags production uses (present in
             // both image stages); unprivileged hosts re-exec plainly.
-            if own_uid == 0 {
+            if ids.0 == 0 {
                 // The dropped child cannot create directories under the
                 // root-owned exe dir: stage its workspace root and hand it
                 // over first.
@@ -1234,8 +1244,8 @@ mod tests {
             let out = std::process::Command::new(&exe)
                 .args(["--exact", TEST_PATH, "--nocapture"])
                 .env(CHILD_MARKER, "1")
-                .env("PEBBLE_TASK_UID", own_uid.to_string())
-                .env("PEBBLE_TASK_GID", own_gid.to_string())
+                .env("PEBBLE_TASK_UID", ids.0.to_string())
+                .env("PEBBLE_TASK_GID", ids.1.to_string())
                 .output()
                 .expect("re-exec test binary");
             let text = String::from_utf8_lossy(&out.stdout);
@@ -1279,6 +1289,9 @@ mod tests {
     #[tokio::test]
     async fn split_mode_drops_task_supplied_loader_variables() {
         use std::sync::atomic::{AtomicU64, Ordering};
+
+        const CHILD_MARKER: &str = "PEBBLE_WI400_LD11_CHILD";
+        const TEST_PATH: &str = "executor::tests::split_mode_drops_task_supplied_loader_variables";
         static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
         let unique = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let prefix = format!("pebble-ld11-{}-{unique}", std::process::id());
@@ -1305,8 +1318,6 @@ mod tests {
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
             .expect("make stub executable");
 
-        const CHILD_MARKER: &str = "PEBBLE_WI400_LD11_CHILD";
-        const TEST_PATH: &str = "executor::tests::split_mode_drops_task_supplied_loader_variables";
         if std::env::var_os(CHILD_MARKER).is_none() {
             let exe = std::env::current_exe().expect("test binary path");
             let out = std::process::Command::new(exe)
@@ -1314,7 +1325,11 @@ mod tests {
                 .env(CHILD_MARKER, "1")
                 .env(
                     "PATH",
-                    format!("{}:{}", stub_dir.display(), std::env::var("PATH").expect("PATH set")),
+                    format!(
+                        "{}:{}",
+                        stub_dir.display(),
+                        std::env::var("PATH").expect("PATH set")
+                    ),
                 )
                 .env("PEBBLE_TASK_UID", "10004")
                 .env("PEBBLE_TASK_GID", "10004")

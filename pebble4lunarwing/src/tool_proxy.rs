@@ -390,7 +390,10 @@ fn prepare_socket_path(socket_path: &Path) -> std::io::Result<()> {
             if meta.file_type().is_symlink() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    format!("proxy dir {} is a symlink; refusing to follow it", parent.display()),
+                    format!(
+                        "proxy dir {} is a symlink; refusing to follow it",
+                        parent.display()
+                    ),
                 ));
             }
             if meta.uid() != own_uid {
@@ -411,7 +414,10 @@ fn prepare_socket_path(socket_path: &Path) -> std::io::Result<()> {
         if meta.file_type().is_symlink() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("proxy dir {} is a symlink; refusing to follow it", parent.display()),
+                format!(
+                    "proxy dir {} is a symlink; refusing to follow it",
+                    parent.display()
+                ),
             ));
         }
         if meta.uid() != own_uid {
@@ -434,7 +440,7 @@ fn prepare_socket_path(socket_path: &Path) -> std::io::Result<()> {
 }
 
 /// This process's uid, via the owner of /proc/self (the crate forbids
-/// unsafe code, so libc::geteuid is not an option).
+/// unsafe code, so `libc::geteuid` is not an option).
 fn bridge_uid() -> std::io::Result<u32> {
     use std::os::unix::fs::MetadataExt;
     Ok(std::fs::metadata("/proc/self")?.uid())
@@ -449,17 +455,16 @@ fn bridge_uid() -> std::io::Result<u32> {
 /// not without a bridge.
 fn hand_socket_to_task(socket_path: &Path, task_id: &str) {
     use std::os::unix::fs::PermissionsExt;
-    let Ok(Some((task_uid, task_gid))) = crate::executor::task_ids_from_env() else {
+    let Ok(Some(ids)) = crate::executor::task_ids_from_env() else {
         return;
     };
-    let handoff = std::os::unix::fs::lchown(socket_path, Some(task_uid), Some(task_gid)).and_then(
-        |()| {
-            std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
-        },
-    );
+    let handoff = std::os::unix::fs::lchown(socket_path, Some(ids.0), Some(ids.1)).and_then(|()| {
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+    });
     if let Err(e) = handoff {
         eprintln!(
-            "[tool-proxy] task {task_id}: socket handoff to uid {task_uid} failed (task runs without tools): {e}"
+            "[tool-proxy] task {task_id}: socket handoff to uid {} failed (task runs without tools): {e}",
+            ids.0
         );
     }
 }
@@ -1271,7 +1276,10 @@ mod tests {
         let handle = relay.start_task("ld15", hub_tx).await;
         assert!(handle.is_none(), "a symlinked proxy dir must be refused");
         assert!(
-            std::fs::read_dir(&victim).expect("read victim").next().is_none(),
+            std::fs::read_dir(&victim)
+                .expect("read victim")
+                .next()
+                .is_none(),
             "no socket may be created through the symlink"
         );
         assert!(std::fs::symlink_metadata(&link)
@@ -1298,7 +1306,10 @@ mod tests {
         std::os::unix::fs::chown(&dir, Some(65534), Some(65534)).expect("foreign owner");
         let (hub_tx, _hub_rx) = fake_hub();
         let handle = relay.start_task("ld15-foreign", hub_tx).await;
-        assert!(handle.is_none(), "a foreign-owned proxy dir must be refused");
+        assert!(
+            handle.is_none(),
+            "a foreign-owned proxy dir must be refused"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1309,6 +1320,8 @@ mod tests {
     /// permitted); the root branch pins a stand-in uid.
     #[tokio::test]
     async fn socket_is_handed_to_the_task_identity() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
         const CHILD_MARKER: &str = "PEBBLE_WI400_LD15_CHILD";
         const TEST_PATH: &str = "tool_proxy::tests::socket_is_handed_to_the_task_identity";
 
@@ -1316,7 +1329,11 @@ mod tests {
             let own_uid = std::fs::metadata("/proc/self")
                 .expect("proc metadata")
                 .uid();
-            let (uid, gid) = if own_uid == 0 { (65534, 65534) } else { (own_uid, own_uid) };
+            let (uid, gid) = if own_uid == 0 {
+                (65534, 65534)
+            } else {
+                (own_uid, own_uid)
+            };
             let exe = std::env::current_exe().expect("test binary path");
             let out = std::process::Command::new(exe)
                 .args(["--exact", TEST_PATH, "--nocapture"])
@@ -1338,8 +1355,6 @@ mod tests {
             return;
         }
 
-        use std::os::unix::fs::MetadataExt;
-        use std::os::unix::fs::PermissionsExt;
         let task_uid: u32 = std::env::var("PEBBLE_TASK_UID")
             .expect("task uid")
             .parse()
@@ -1352,7 +1367,11 @@ mod tests {
             .expect("task starts");
         let meta = std::fs::symlink_metadata(&handle.socket_path).expect("socket metadata");
         assert_eq!(meta.uid(), task_uid, "socket must be owned by the task uid");
-        assert_eq!(meta.permissions().mode() & 0o777, 0o600, "socket must be 0600");
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o600,
+            "socket must be 0600"
+        );
         relay.close_task("ld15-handoff").await;
         std::fs::remove_dir_all(&dir).ok();
     }

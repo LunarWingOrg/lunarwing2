@@ -570,10 +570,40 @@ mod tests {
     /// must be handed to the task identity (the bridge is root; the task
     /// writes there). Runs as its own child test process so the env can
     /// carry the identity shape (the crate forbids unsafe code, so
-    /// std::env::set_var is not an option). Both halves are non-vacuous:
-    /// unprivileged, a FOREIGN id must fail with PermissionDenied (without
+    /// `std::env::set_var` is not an option). Both halves are non-vacuous:
+    /// unprivileged, a FOREIGN id must fail with `PermissionDenied` (without
     /// the fchown it would silently succeed); as root (the in-image gate),
     /// the same shape must succeed and the leaf must carry the foreign uid.
+    /// Re-exec this test binary as a child with `PEBBLE_TASK_UID/GID` pinned
+    /// to `drop_ids` and the marker set, and require exactly one test to
+    /// pass in the child (the shared parent-phase shape of the WI#400
+    /// identity tests).
+    fn rerun_as_child_with_ids(
+        exe: &std::path::Path,
+        child_marker: &str,
+        marker: &str,
+        test_path: &str,
+        drop_ids: (u32, u32),
+    ) {
+        let out = std::process::Command::new(exe)
+            .args(["--exact", test_path, "--nocapture"])
+            .env(child_marker, marker)
+            .env("PEBBLE_TASK_UID", drop_ids.0.to_string())
+            .env("PEBBLE_TASK_GID", drop_ids.1.to_string())
+            .output()
+            .expect("re-exec test binary");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let stderr_text = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "child phase {marker} failed:\nstdout: {text}\nstderr: {stderr_text}"
+        );
+        assert!(
+            text.contains("test result: ok. 1 passed"),
+            "child phase {marker} ran no tests (drifted test path?):\nstdout: {text}\nstderr: {stderr_text}"
+        );
+    }
+
     #[test]
     fn cron_bootstrap_hands_new_leaf_to_the_task_identity() {
         use std::os::unix::fs::MetadataExt;
@@ -587,37 +617,20 @@ mod tests {
             // its owner/group are this process's euid/egid.
             let probe = temp_root("cron-kw4-selfid");
             let meta = probe.metadata().expect("self-id probe metadata");
-            let own_uid = meta.uid();
-            let own_gid = meta.gid();
+            let own_ids = (meta.uid(), meta.gid());
             std::fs::remove_dir_all(&probe).ok();
             let exe = std::env::current_exe().expect("test binary path");
             for marker in ["self", "foreign"] {
-                let (uid, gid) = if marker == "foreign" {
-                    (own_uid + 1000, own_gid + 1000)
-                } else if own_uid == 0 {
+                let drop_ids = if marker == "foreign" {
+                    (own_ids.0 + 1000, own_ids.1 + 1000)
+                } else if own_ids.0 == 0 {
                     // LD-14: id 0 is refused as a task identity, so the root
                     // "self" phase uses a stand-in unprivileged uid instead.
                     (65534, 65534)
                 } else {
-                    (own_uid, own_gid)
+                    own_ids
                 };
-                let out = std::process::Command::new(&exe)
-                    .args(["--exact", TEST_PATH, "--nocapture"])
-                    .env(CHILD_MARKER, marker)
-                    .env("PEBBLE_TASK_UID", uid.to_string())
-                    .env("PEBBLE_TASK_GID", gid.to_string())
-                    .output()
-                    .expect("re-exec test binary");
-                let text = String::from_utf8_lossy(&out.stdout);
-                let stderr_text = String::from_utf8_lossy(&out.stderr);
-                assert!(
-                    out.status.success(),
-                    "child phase {marker} failed:\nstdout: {text}\nstderr: {stderr_text}"
-                );
-                assert!(
-                    text.contains("test result: ok. 1 passed"),
-                    "child phase {marker} ran no tests (drifted TEST_PATH?):\nstdout: {text}\nstderr: {stderr_text}"
-                );
+                rerun_as_child_with_ids(&exe, CHILD_MARKER, marker, TEST_PATH, drop_ids);
             }
             return;
         }
@@ -627,14 +640,16 @@ mod tests {
             .as_deref()
             .and_then(|v| v.to_str())
             == Some("foreign");
-        let task_uid: u32 = std::env::var("PEBBLE_TASK_UID")
-            .expect("task uid in child env")
-            .parse()
-            .expect("numeric task uid");
-        let task_gid: u32 = std::env::var("PEBBLE_TASK_GID")
-            .expect("task gid in child env")
-            .parse()
-            .expect("numeric task gid");
+        let ids: (u32, u32) = (
+            std::env::var("PEBBLE_TASK_UID")
+                .expect("task uid in child env")
+                .parse()
+                .expect("numeric task uid"),
+            std::env::var("PEBBLE_TASK_GID")
+                .expect("task gid in child env")
+                .parse()
+                .expect("numeric task gid"),
+        );
 
         let root = temp_root("cron-kw4");
         // LD-12 shape: a pre-existing component plus a created intermediate
@@ -673,15 +688,15 @@ mod tests {
         } else {
             let mission = outcome.expect("bootstrap succeeds");
             let landed = mission.metadata().expect("leaf metadata");
-            assert_eq!(landed.uid(), task_uid, "new leaf must be task-owned");
-            assert_eq!(landed.gid(), task_gid, "new leaf must be task-group-owned");
+            assert_eq!(landed.uid(), ids.0, "new leaf must be task-owned");
+            assert_eq!(landed.gid(), ids.1, "new leaf must be task-group-owned");
             // LD-12: the created INTERMEDIATE is task-owned too, or the task
             // cannot create siblings under it.
             let intermediate = pre.join("missions");
             let inter_meta = intermediate.metadata().expect("intermediate metadata");
             assert_eq!(
                 inter_meta.uid(),
-                task_uid,
+                ids.0,
                 "created intermediate must be task-owned"
             );
             // A pre-existing component is never re-chowned: the root child
