@@ -178,8 +178,9 @@ test("entrypoint CLI mode forces print and stream-json", () => {
   // WI#373: the strip must stay in front of the exec — the one-shot prompt
   // runs untrusted agent code and must not inherit AGENT_AUTH_TOKEN. WI#400:
   // the credential-file pointer is stripped alongside, and the one-shot runs
-  // as the task uid via setpriv with the mandatory cap-clearing flags.
-  assert.match(entrypoint, /SETPRIV_FLAGS=\(--reuid="\$KIMI_TASK_UID" --regid="\$KIMI_TASK_GID" --clear-groups --ambient-caps=-all --inh-caps=-all\)/)
+  // as the task uid via setpriv with the mandatory cap-clearing flags plus
+  // --no-new-privs (run-164 KW-2).
+  assert.match(entrypoint, /SETPRIV_FLAGS=\(--reuid="\$KIMI_TASK_UID" --regid="\$KIMI_TASK_GID" --clear-groups --ambient-caps=-all --inh-caps=-all --no-new-privs\)/)
   assert.match(entrypoint, /exec setpriv "\$\{SETPRIV_FLAGS\[@\]\}"/)
   assert.match(entrypoint, /env HOME=\/home\/kimi -u AGENT_AUTH_TOKEN -u AGENT_AUTH_TOKEN_FILE \\?\n?\s*kimi -p "\$\*" --output-format stream-json/)
 })
