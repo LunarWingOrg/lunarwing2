@@ -536,7 +536,13 @@ mod tests {
         // security property (that is the empty redirected list above); a quiet
         // runner must not fail CI on it.
         if refused == 0 {
-            eprintln!("DS-1 race window never hit within the time budget (harness liveness only; no redirect was returned)");
+            // A direct stderr write: libtest captures eprintln! from a passing
+            // test, so the liveness miss would never reach the CI log.
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "DS-1 race window never hit within the time budget (harness liveness only; no redirect was returned)"
+            );
         }
     }
 
