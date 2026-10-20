@@ -503,6 +503,14 @@ render_worker_quadlet() {
   if [[ "$worker" == "opencode" || "$worker" == "opencode2" ]]; then
     study_notes_home="$(tenant_study_notes_home "$name")"
     [[ -z "$study_notes_home" ]] || validate_study_notes_home "$study_notes_home"
+    if [[ -n "$study_notes_home" ]] && ! study_notes_sync_home_trusted "$study_notes_home"; then
+      # WI#445 LV-8: the tenant account chooses this value, and the rendered
+      # mount source is re-resolved at every container start. An untrusted
+      # home renders no Study Notes mount at all — the worker starts without
+      # Study Notes rather than under a tenant-controlled host path.
+      say "WARNING: tenant '$name' LW2STUDYMCP_HOME is not trusted for the worker mount: $study_notes_home (expected the operator default or a root-owned directory); worker starts without Study Notes"
+      study_notes_home=""
+    fi
     if [[ -n "$study_notes_home" ]]; then
       study_notes_state_home="$(tenant_study_notes_state_home "$name")"
       study_notes_allow_write="$(tenant_study_notes_allow_write "$name")"

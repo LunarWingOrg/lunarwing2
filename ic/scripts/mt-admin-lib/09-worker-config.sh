@@ -1613,6 +1613,16 @@ start_tenant_opencode() {
     study_notes_home="$(tenant_study_notes_home "$name")"
     if [[ -n "$study_notes_home" ]]; then
       validate_study_notes_home "$study_notes_home"
+      if ! study_notes_sync_home_trusted "$study_notes_home"; then
+        # WI#445 LV-8: on rootful runtimes root performs this bind mount (and
+        # relabels the source with :z on SELinux hosts) under a path the
+        # tenant account chose. An untrusted home mounts nothing — the worker
+        # starts without Study Notes.
+        say "WARNING: tenant '$name' LW2STUDYMCP_HOME is not trusted for the worker mount: $study_notes_home (expected the operator default or a root-owned directory); worker starts without Study Notes"
+        study_notes_home=""
+      fi
+    fi
+    if [[ -n "$study_notes_home" ]]; then
       study_notes_mount=(
         -v "${study_notes_home}:${STUDY_NOTES_CONTAINER_HOME}:ro,z"
         -e "LW2STUDYMCP_HOME=${STUDY_NOTES_CONTAINER_HOME}"
