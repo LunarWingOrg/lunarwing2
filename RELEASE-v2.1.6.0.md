@@ -278,12 +278,47 @@ host-imposed four-hour maximum matching Kimi's default cap.
 
 **WI#325 is closed**; audio capture was scoped out at close-out. Of its
 residuals, WI#370 (retention/list visibility, event-outcome FK coverage) is
-open; WI#375 (remaining harness items) and WI#396 (the cross-cron
+implemented in-tree this cycle (see Cron Tick Retention and Job Visibility
+below; its PostgreSQL lane evidence rides the next pipeline); WI#375
+(remaining harness items) and WI#396 (the cross-cron
 shared-container pairing, now detected and failed closed — see the
 External-Worker Tool Proxy section) were closed on 2026-10-17, and WI#371
 (read-failure pause safety, durable breaker count) on 2026-10-18 — see Cron
 Mission Control Durability below. Design
 doc: `docs/proposals/EXTERNAL-WORKER-CRON-MODE.md`.
+
+### Cron Tick Retention and Job Visibility (WI#370)
+
+Cron missions are bounded tenants of the jobs store now. At the 60-second
+schedule floor a mission added up to 1,440 `agent_jobs` rows per day before
+reentries, and `list_jobs` sorts newest-first with a 100-row window — ticks
+hid ordinary jobs within hours. Two cooperating bounds landed:
+
+- **Per-mission retention** (`cron.retain_last_ticks`, default 50, cap
+  10,000): after every tick — and once at supervisor start, so an idle or
+  paused mission still gets swept on boot — the supervisor deletes that
+  mission's tick rows beyond the newest `retain_last_ticks`, always keeping
+  the persisted last-job anchor (which owner pause/resume audit events key
+  to), deleting `job_events` before their row (`job_events.job_id` has no
+  `ON DELETE CASCADE`), and re-checking the anchor afterwards so a deleted
+  or foreign anchor can never receive orphan or cross-owner events. Tick
+  rows are identified exactly — the supervisor-authored prompt-title prefix
+  for that mission, scoped to the worker's `job_mode` and the mission owner
+  — so ordinary jobs, other missions' ticks, and other owners' rows are
+  never matched.
+- **`list_jobs` cron filter**: tick rows and live tick contexts are tagged
+  `"cron_tick": true` and excluded from the tool's window unless
+  `include_cron: true` is passed.
+
+The remaining persisted-event outcome matrix (`cron_reentry`, `cron_tick_end`
+`abandoned`/`skipped_busy`/`paused`, breaker-origin `cron_paused`) is now
+asserted against the store, and a new `postgres_cron_retention` integration
+target runs in the PostgreSQL CI lane — pinning the FK-safe delete order and
+that the `job_events` FK refuses an event for a missing job row — where the
+generic external-worker target is auto-discovered only by the libSQL lane.
+Retention trades audit depth for boundedness: ticks beyond the window lose
+their `job_events` audit trail with the row; raise the knob when a longer
+audit window matters more than the space.
 
 ### Cron Mission Control Durability (WI#371)
 
