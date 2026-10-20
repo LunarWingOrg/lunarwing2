@@ -98,6 +98,16 @@ ensure_container_runtime() {
   MT_ROOTLESS=false
 }
 chown() { :; }
+# WI#446: unit rendering creates and writes the ~/.config tree tenant-side
+# (tenant_mkdir_p + write_tenant_file_atomic), dropping with sudo -u <tenant>.
+# The fixture tenant is not a real account, so map the drop onto the invoking
+# user — the fixture dirs are owned by that user, satisfying the tenant-side
+# ownership checks (the run-166 LF-8 prototype's mapping stub shape).
+sudo() {
+  [[ "${1:-}" == "-u" ]] || return 1
+  shift 2
+  "$@"
+}
 
 # Existing helper-specific tests cover command content. These replacements keep
 # this harness focused on conditional ownership by the full tenant renderers.
@@ -144,6 +154,55 @@ assert_no_file "disabled systemd adapter enable link removed" "$SYSTEMD_DIR/defa
 assert_not_contains "disabled systemd main drops backend dependency" "$SYSTEMD_MAIN" "lunarwing-weechat-${TENANT}.service"
 assert_not_contains "disabled systemd main drops adapter dependency" "$SYSTEMD_MAIN" "lunarwing-weechat-adapter-${TENANT}.service"
 assert_not_contains "disabled systemd main drops relay barrier" "$SYSTEMD_MAIN" "$RELAY_ENV_EXEC"
+
+echo "=== WI#446: tenant-side ~/.config unit writes ==="
+# The ~/.config tree (unit dir + weechat home + unit files) must be created and
+# owned through the tenant-side drop (tenant_mkdir_p + the atomic writer), so
+# root never mkdir/chown/cat/chmod through tenant-planted symlinks (run-166
+# LF-8). A pre-planted symlink at any of those names now refuses the render
+# instead of redirecting the root write.
+write_weechat_flag true
+render_tenant_systemd_units "$TENANT" >/dev/null
+
+WEECHAT_HOME_DIR="$(tenant_weechat_home "$TENANT")"
+if [[ -d "$WEECHAT_HOME_DIR" && ! -L "$WEECHAT_HOME_DIR" && -O "$WEECHAT_HOME_DIR" ]]; then
+  pass "weechat home is a real tenant-owned directory (no root chown handover)"
+else
+  fail "weechat home is a real tenant-owned directory (no root chown handover)"
+fi
+
+SYMLINK_VICTIM="$FIXTURE/wi446-symlink-victim.txt"
+printf 'sentinel\n' >"$SYMLINK_VICTIM"
+BRIDGE_UNIT_PATH="$SYSTEMD_DIR/xmpp-bridge-${TENANT}.service"
+rm -f "$BRIDGE_UNIT_PATH"
+ln -s "$SYMLINK_VICTIM" "$BRIDGE_UNIT_PATH"
+if (render_tenant_systemd_units "$TENANT" >/dev/null 2>&1); then
+  fail "render refuses a pre-planted symlink at a unit path"
+else
+  pass "render refuses a pre-planted symlink at a unit path"
+fi
+if [[ -L "$BRIDGE_UNIT_PATH" && "$(<"$SYMLINK_VICTIM")" == "sentinel" ]]; then
+  pass "unit-path symlink refusal leaves the redirect target untouched"
+else
+  fail "unit-path symlink refusal leaves the redirect target untouched"
+fi
+rm -f "$BRIDGE_UNIT_PATH"
+
+rm -rf "$WEECHAT_HOME_DIR"
+ln -s "$SYMLINK_VICTIM" "$WEECHAT_HOME_DIR"
+if (render_tenant_systemd_units "$TENANT" >/dev/null 2>&1); then
+  fail "render refuses a symlinked weechat home"
+else
+  pass "render refuses a symlinked weechat home"
+fi
+if [[ -L "$WEECHAT_HOME_DIR" && "$(<"$SYMLINK_VICTIM")" == "sentinel" ]]; then
+  pass "weechat-home symlink refusal leaves the redirect target untouched"
+else
+  fail "weechat-home symlink refusal leaves the redirect target untouched"
+fi
+rm -f "$WEECHAT_HOME_DIR"
+render_tenant_systemd_units "$TENANT" >/dev/null
+rm -f -- "$SYMLINK_VICTIM"
 
 echo "=== OpenRC rendering and dependency gating ==="
 write_weechat_flag true
