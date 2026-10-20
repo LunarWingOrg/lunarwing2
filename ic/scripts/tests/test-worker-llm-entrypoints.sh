@@ -569,6 +569,37 @@ def run_task_drop_argv(worker):
             f"{worker} setpriv argv missing mandatory flags (WI#400 KW-2/LD-7): {argv}"
 
 
+def run_task_zero_uid_refusal(worker):
+    """WI#400 LP-17: the kimi/opencode entrypoints must refuse a zero (or
+    non-numeric) task id right after the defaults — a zero id makes the
+    setpriv privilege drop a no-op while every caller keeps treating the
+    split as active. The refusal fires before any service start, so the pin
+    works in every uid shape."""
+    directory, _ = workers[worker]
+    entrypoint = (repo / directory / "entrypoint.sh").read_text()
+    prefix = worker.upper()
+    with temp_root(f"{worker}-zeroid-") as temp:
+        root = Path(temp)
+        for label, env_overrides in (
+            ("zero uid", {f"{prefix}_TASK_UID": "0"}),
+            ("zero gid", {f"{prefix}_TASK_GID": "0"}),
+            ("non-numeric uid", {f"{prefix}_TASK_UID": "1000x"}),
+        ):
+            env = {
+                "PATH": os.environ["PATH"], "HOME": str(root), "TMPDIR": temp,
+                f"{prefix}_MODE": "cli",
+                **env_overrides,
+            }
+            result = subprocess.run(
+                ["bash", "-s", "--", "probe prompt"],
+                input=entrypoint, text=True, env=env,
+                capture_output=True, timeout=60, **as_ci_user())
+            assert result.returncode != 0, \
+                f"{worker} entrypoint accepted a {label} (WI#400 LP-17)"
+            assert "must be non-zero numeric ids (a zero id would make the privilege drop a no-op)" in result.stderr, \
+                f"{worker} {label} refusal must name the no-op-drop reason: {result.stderr}"
+
+
 def run_pebble_websocket_inherit():
     """WI#400 x WI#422 (run-171): the rootful tenant-uid launch passes
     PEBBLE_TASK_UID/GID=inherit. That is the one sanctioned non-root shape:
@@ -693,6 +724,9 @@ if os.geteuid() == 0:
     for worker in ("kimi", "opencode"):
         run_task_drop_argv(worker)
         print(f"PASS: {worker} cli one-shot drops through setpriv with the mandatory flags (WI#400 KW-2/LD-7, root)")
+for worker in ("kimi", "opencode"):
+    run_task_zero_uid_refusal(worker)
+    print(f"PASS: {worker} entrypoint refuses zero/non-numeric task ids (WI#400 LP-17)")
 run_pebble_websocket_refusal()
 print("PASS: pebble websocket entrypoint refuses to run as the task uid (WI#400 LD-8)")
 run_pebble_websocket_inherit()
