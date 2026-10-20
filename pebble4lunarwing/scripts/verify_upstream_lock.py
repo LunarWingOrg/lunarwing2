@@ -15,9 +15,13 @@ import tomllib
 # 0348/0349 (session-secret Debug, ECH rejection, Brotli allocation, and
 # unauthenticated key-exchange hints). The reviewed package allowlist stays
 # the same; Dockerfile's digest pins the exact upgraded lock.
+# 2026-10-20 (item 28, CVE-2026-111943): rustls-webpki raised to 0.103.16
+# (RUSTSEC-2026-0382) and webpki-roots to 1.0.10 (RUSTSEC-2026-0381) — the
+# distrusted emSign intermediate distrust pair; webpki-roots joins the
+# allowlist for that raise.
 # chacha20: 0.10.1 is yanked on crates.io (upstream's own pin); 0.10.2 is the
 # identical-semver replacement, no advisory either way.
-ALLOWED_PACKAGES = {"rustls", "rustls-webpki", "chacha20"}
+ALLOWED_PACKAGES = {"rustls", "rustls-webpki", "webpki-roots", "chacha20"}
 
 
 def package_records(lock: dict) -> dict[tuple[str, str, str], dict]:
@@ -86,7 +90,7 @@ def main() -> int:
     except (OSError, UnicodeError, ValueError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
-    print("Verified Pebble lock SHA256 and rustls/rustls-webpki/chacha20-only package delta.")
+    print("Verified Pebble lock SHA256 and rustls/rustls-webpki/webpki-roots/chacha20-only package delta.")
     return 0
 
 

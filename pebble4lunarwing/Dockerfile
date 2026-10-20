@@ -37,17 +37,19 @@ RUN printf '%s' "${PEBBLE_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
 # The pinned upstream checkout ships rustls 0.23.41, which is affected by
 # RUSTSEC-2026-0285 (fixed >= 0.23.45). WI#409 raises the override to 0.23.46
 # for RUSTSEC-2026-0346/0347/0348/0349. Upstream also pins chacha20 0.10.1,
-# which is yanked on crates.io. The reviewed patched lock is supplied as a
-# hashed build input instead of an unpinned
-# build-time `cargo update`: it is upstream at PEBBLE_REF with only
-# rustls 0.23.41 -> 0.23.46, rustls-webpki 0.103.13 -> 0.103.15, and
-# chacha20 0.10.1 -> 0.10.2 changed.
+# which is yanked on crates.io. CVE-2026-111943 (2026-10-20, item 28) raises
+# rustls-webpki to 0.103.16 (RUSTSEC-2026-0382) and webpki-roots to 1.0.10
+# (RUSTSEC-2026-0381) — the distrusted emSign intermediates pair. The
+# reviewed patched lock is supplied as a hashed build input instead of an
+# unpinned build-time `cargo update`: it is upstream at PEBBLE_REF with only
+# rustls 0.23.41 -> 0.23.46, rustls-webpki 0.103.13 -> 0.103.16,
+# webpki-roots 1.0.8 -> 1.0.10, and chacha20 0.10.1 -> 0.10.2 changed.
 # The build fails if the checked-out lock or the pinned digest drift from the
 # reviewed inputs, keeping the locked/reproducible-build guarantee.
 COPY pebble4lunarwing/upstream/Cargo.lock /tmp/pebble-upstream-Cargo.lock
 COPY pebble4lunarwing/scripts/verify_upstream_lock.py /tmp/verify-pebble-lock.py
 # Canonical reviewed pin also covers mt-admin, Compose and plain docker builds.
-ARG PEBBLE_LOCK_SHA256=a87837f52b769730b33126250be12ed3b979988bfbffb490cf564f9c85f870ad
+ARG PEBBLE_LOCK_SHA256=f68c9e35e9630a5fe2b8db358578449aace5342d205a96070007ea8e9c754e4a
 RUN python3 /tmp/verify-pebble-lock.py pebble/Cargo.lock \
     /tmp/pebble-upstream-Cargo.lock "${PEBBLE_LOCK_SHA256}"
 RUN cp /tmp/pebble-upstream-Cargo.lock pebble/Cargo.lock && \

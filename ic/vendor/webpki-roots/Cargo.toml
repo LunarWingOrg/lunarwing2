@@ -11,9 +11,9 @@
 
 [package]
 edition = "2021"
-rust-version = "1.70"
+rust-version = "1.71"
 name = "webpki-roots"
-version = "1.0.9"
+version = "1.0.10"
 build = false
 autolib = false
 autobins = false
