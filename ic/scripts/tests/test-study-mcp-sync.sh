@@ -341,6 +341,18 @@ anchor="$(
   printf 'anchor walk did not stop at the deepest existing ancestor: %s\n' "$anchor" >&2
   exit 1
 }
+# A "." or ".." component in the missing tail must be refused before the
+# walk (pinned with the validator stubbed to accept, so only the component
+# check can refuse; run-174 LV-7).
+for dotted_home in "$fixture/anchor-unit/x/../../untrusted-anchor/chosen" "$fixture/anchor-unit/./chosen"; do
+  if (
+    darkirc_validate_root_owned_directory() { return 0; }
+    study_notes_sync_home_trusted "$dotted_home"
+  ); then
+    printf 'Study Notes sync trusted a home with a dot component: %s\n' "$dotted_home" >&2
+    exit 1
+  fi
+done
 # A symlink in the chain stops the walk and the real validator refuses it
 # (a dangling link must not be followed to its target's parent).
 ln -s "$fixture/anchor-unit/missing-target" "$fixture/anchor-unit/dangling"

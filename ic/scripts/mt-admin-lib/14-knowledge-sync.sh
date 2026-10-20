@@ -127,6 +127,10 @@ study_notes_sync_home_trusted() {  # <checkout home>
   local home="$1" anchor
   [[ "$home" == "$STUDY_NOTES_DEFAULT_HOME" ]] && return 0
   [[ "$home" =~ ^/[A-Za-z0-9._/-]+$ ]] || return 1
+  # The walk validates only the deepest existing ancestor; a "." or ".."
+  # component in the missing tail would let the literal path the sync then
+  # uses resolve outside the validated chain (run-174 LV-7).
+  [[ "/$home/" != */../* && "/$home/" != */./* ]] || return 1
   anchor="$home"
   while [[ ! -e "$anchor" && ! -L "$anchor" ]]; do anchor="$(dirname -- "$anchor")"; done
   darkirc_validate_root_owned_directory "$anchor"
