@@ -1684,22 +1684,30 @@ hearbeat_timeout_secs = 300
     #[test]
     fn cron_retention_window_is_floored_and_capped() {
         assert!(
-            resolve_cron_worker("schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nretain_last_ticks = 0")
-                .is_none(),
+            resolve_cron_worker(
+                "schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nretain_last_ticks = 0"
+            )
+            .is_none(),
             "retain_last_ticks = 0 must reject the worker at load"
         );
-        assert!(resolve_cron_worker(
-            "schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nretain_last_ticks = 1"
-        )
-        .is_some());
-        assert!(resolve_cron_worker(
-            "schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nretain_last_ticks = 50"
-        )
-        .is_some());
-        assert!(resolve_cron_worker(&format!(
-            "schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nretain_last_ticks = {}",
-            CronWorkerConfig::MAX_RETAIN_LAST_TICKS_LIMIT + 1
-        ))
-        .is_none());
+        assert!(
+            resolve_cron_worker(
+                "schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nretain_last_ticks = 1"
+            )
+            .is_some()
+        );
+        assert!(
+            resolve_cron_worker(
+                "schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nretain_last_ticks = 50"
+            )
+            .is_some()
+        );
+        assert!(
+            resolve_cron_worker(&format!(
+                "schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nretain_last_ticks = {}",
+                CronWorkerConfig::MAX_RETAIN_LAST_TICKS_LIMIT + 1
+            ))
+            .is_none()
+        );
     }
 }
