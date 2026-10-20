@@ -26,8 +26,11 @@ builds, both Compose services, mt-admin's Docker/Podman builders, and CI use
 that same default without an extra argument. The build rejects a digest
 mismatch and compares complete parsed package records — keyed by
 `(name, version, source)` so multi-version crates are fully covered — against
-the pinned upstream lock; only `rustls`, `rustls-webpki`, and `chacha20`
-may differ (the first two for RUSTSEC-2026-0285, the last to retire upstream's
+the pinned upstream lock; only `rustls`, `rustls-webpki`, `webpki-roots`, and
+`chacha20` may differ (rustls for RUSTSEC-2026-0285 and WI#409's
+RUSTSEC-2026-0346/0347/0348/0349 raise, rustls-webpki 0.103.16 and
+webpki-roots 1.0.10 for CVE-2026-111943 — RUSTSEC-2026-0382/0381, the
+distrusted emSign intermediates pair — and chacha20 to retire upstream's
 yanked 0.10.1 pin).
 Package additions, removals, or source/checksum/dependency edits outside that
 allowlist fail even when a caller supplies a matching digest override, and a
