@@ -4700,6 +4700,518 @@ async fn cron_tick_events_persist_to_job_events() {
     assert_eq!(end_row.data["outcome"], "completed");
 }
 
+// ── WI#370: outcome-matrix event persistence + retention ────────────
+
+/// Temp-file libsql store (per-connection backends cannot share `:memory:`).
+#[cfg(feature = "libsql")]
+async fn cron_event_db(name: &str) -> (Arc<dyn Database>, tempfile::TempDir) {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let backend = LibSqlBackend::new_local(&temp_dir.path().join(name))
+        .await
+        .expect("test db");
+    backend.run_migrations().await.expect("migrations");
+    (Arc::new(backend), temp_dir)
+}
+
+/// Poll the store until `job_id` has a persisted event of `event_type`,
+/// returning its data (WI#370 assertions are DB-backed, not log-backed).
+#[cfg(feature = "libsql")]
+async fn await_cron_event(
+    db: &Arc<dyn Database>,
+    job_id: Uuid,
+    event_type: &str,
+) -> serde_json::Value {
+    tokio::time::timeout(TEST_BOUND, async {
+        loop {
+            let events = db
+                .list_job_events(job_id, None)
+                .await
+                .expect("list job events");
+            if let Some(row) = events.iter().find(|e| e.event_type == event_type) {
+                return row.data.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{event_type} never persisted for job {job_id}"))
+}
+
+fn captured_task_id(request: &serde_json::Value) -> Uuid {
+    Uuid::parse_str(
+        request["payload"]["task_id"]
+            .as_str()
+            .expect("task_id string"),
+    )
+    .expect("task_id uuid")
+}
+
+/// WI#370 outcome matrix: a retryable failed link persists a `cron_reentry`
+/// event (kind=reentry) on the failed link, and the exhausted chain persists
+/// `cron_tick_end` outcome=abandoned on its final link.
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn cron_reentry_and_abandoned_tick_end_events_persist() {
+    let (db, _guard) = cron_event_db("cron-reentry-events.db").await;
+    let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::CaptureFail {
+        requests: request_tx,
+        error: "transient boom".to_string(),
+    })
+    .await;
+    let context_manager = Arc::new(ContextManager::new(16));
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(16);
+    let mgr = Arc::new(
+        ExternalWorkerManager::new(vec![cron_config_for(&url, 30, 1)])
+            .with_event_deps(event_tx, Arc::clone(&context_manager))
+            .with_store(db.clone()),
+    );
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    mgr.spawn_cron_supervisors("owner-1", shutdown_rx);
+    let _ = shutdown_tx;
+
+    timeout(TEST_BOUND, mgr.fire_cron_tick_now("mock", "owner-1"))
+        .await
+        .expect("tick timed out")
+        .expect("tick errored");
+    let first = request_rx.recv().await.expect("link 1 captured");
+    let first_id = captured_task_id(&first);
+    let second = timeout(TEST_BOUND * 3, request_rx.recv())
+        .await
+        .expect("re-dispatch timed out")
+        .expect("link 2 captured");
+    let second_id = captured_task_id(&second);
+    assert_ne!(first_id, second_id);
+
+    let reentry = await_cron_event(&db, first_id, "cron_reentry").await;
+    assert_eq!(reentry["kind"], "reentry");
+    assert_eq!(reentry["mission_id"], "test-mission");
+    let end = await_cron_event(&db, second_id, "cron_tick_end").await;
+    assert_eq!(end["outcome"], "abandoned");
+}
+
+/// WI#370 outcome matrix: three consecutive abandons trip the circuit
+/// breaker, and the trip itself is a persisted `cron_paused` event with
+/// origin=circuit_breaker on the third tick's job (owner-origin pauses are
+/// covered by the restart/recovery tests).
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn cron_breaker_pause_event_persists_with_circuit_breaker_origin() {
+    let (db, _guard) = cron_event_db("cron-breaker-events.db").await;
+    let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::CaptureFail {
+        requests: request_tx,
+        error: "timeout_ms must be an integer between 1 and 14400000".to_string(),
+    })
+    .await;
+    let context_manager = Arc::new(ContextManager::new(16));
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(16);
+    let mgr = Arc::new(
+        ExternalWorkerManager::new(vec![cron_config_for(&url, 30, 5)])
+            .with_event_deps(event_tx, Arc::clone(&context_manager))
+            .with_store(db.clone()),
+    );
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    mgr.spawn_cron_supervisors("owner-1", shutdown_rx);
+    let _ = shutdown_tx;
+
+    let mut last_job = None;
+    for tick in 1..=3u32 {
+        timeout(TEST_BOUND, mgr.fire_cron_tick_now("mock", "owner-1"))
+            .await
+            .expect("tick timed out")
+            .expect("tick errored");
+        let request = request_rx.recv().await.expect("dispatch captured");
+        let job_id = captured_task_id(&request);
+        // Waiting for each tick's end keeps the fires serialized on real
+        // resolutions (the command channel serializes them anyway).
+        let end = await_cron_event(&db, job_id, "cron_tick_end").await;
+        assert_eq!(end["outcome"], "abandoned", "tick {tick}");
+        last_job = Some(job_id);
+    }
+
+    let paused = await_cron_event(&db, last_job.expect("third tick job"), "cron_paused").await;
+    assert_eq!(paused["origin"], "circuit_breaker");
+    assert_eq!(paused["consecutive_abandoned"], 3);
+    assert_eq!(paused["mission_id"], "test-mission");
+    assert_eq!(
+        paused["durable"].as_bool(),
+        Some(true),
+        "libsql writes must succeed in this fixture"
+    );
+}
+
+/// WI#370 outcome matrix: an owner pause observed at a chain-link boundary
+/// persists `cron_tick_end` outcome=paused on the stopped link so the tick
+/// does not look lost.
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn cron_paused_tick_end_event_persists() {
+    let (db, _guard) = cron_event_db("cron-paused-end.db").await;
+    let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::CaptureHang {
+        requests: request_tx,
+    })
+    .await;
+    let context_manager = Arc::new(ContextManager::new(16));
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(16);
+    let mgr = Arc::new(
+        ExternalWorkerManager::new(vec![cron_config_for(&url, 2, 3)])
+            .with_event_deps(event_tx, Arc::clone(&context_manager))
+            .with_store(db.clone()),
+    );
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    mgr.spawn_cron_supervisors("owner-1", shutdown_rx);
+    let _ = shutdown_tx;
+
+    timeout(TEST_BOUND, mgr.fire_cron_tick_now("mock", "owner-1"))
+        .await
+        .expect("tick timed out")
+        .expect("tick errored");
+    let first = request_rx.recv().await.expect("link 1 captured");
+    let first_id = captured_task_id(&first);
+
+    mgr.pause_cron_mission("mock", "owner-1", CronCommandOrigin::OwnerTool)
+        .await
+        .expect("pause");
+
+    // Link 1 lapses (~2s), is cancelled, and the chain stops at the boundary
+    // instead of re-dispatching: the end event records outcome=paused.
+    let end = await_cron_event(&db, first_id, "cron_tick_end").await;
+    assert_eq!(end["outcome"], "paused");
+    let status = mgr
+        .cron_mission_status("mock", "owner-1")
+        .await
+        .expect("status");
+    assert!(status.paused);
+    assert_eq!(status.consecutive_abandoned, 0, "a paused tick is resolved, not abandoned");
+}
+
+/// WI#370 outcome matrix: exhausting the busy-retry budget persists
+/// `cron_tick_end` outcome=skipped_busy on the last busy-rejected link, and
+/// the skip must not feed the circuit breaker (contention is not mission
+/// failure). Slow by construction: the busy backoffs (4+8+16+32+60s) have to
+/// elapse inside a held workspace lock.
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn cron_skipped_busy_tick_end_event_persists() {
+    use lunarwing::orchestrator::cron_worker::cron_tick_title_prefix;
+
+    let (db, _guard) = cron_event_db("cron-skipped-busy.db").await;
+    let (request_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let active = std::sync::Arc::new(AtomicUsize::new(0));
+    let busy_rejections = std::sync::Arc::new(AtomicUsize::new(0));
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::LockAwareHang {
+        requests: request_tx,
+        active: active.clone(),
+        busy_rejections: busy_rejections.clone(),
+        // Outlast the full busy-retry backoff chain so every re-dispatch is
+        // rejected until MAX_BUSY_RETRIES (5) is exhausted.
+        hold: Duration::from_secs(140),
+    })
+    .await;
+    let context_manager = Arc::new(ContextManager::new(16));
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(16);
+    let mgr = Arc::new(
+        ExternalWorkerManager::new(vec![cron_config_for(&url, 2, 8)])
+            .with_event_deps(event_tx, Arc::clone(&context_manager))
+            .with_store(db.clone()),
+    );
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    mgr.spawn_cron_supervisors("owner-1", shutdown_rx);
+    let _ = shutdown_tx;
+
+    timeout(TEST_BOUND, mgr.fire_cron_tick_now("mock", "owner-1"))
+        .await
+        .expect("tick timed out")
+        .expect("tick errored");
+
+    // Busy-rejected links are not captured on the request channel; scan the
+    // mission's tick rows for the persisted skipped_busy end.
+    let prefix = cron_tick_title_prefix("test-mission");
+    let skipped = tokio::time::timeout(TEST_BOUND * 6, async {
+        loop {
+            let ticks = db
+                .list_cron_mission_ticks("owner-1", "external:mock", &prefix)
+                .await
+                .expect("mission ticks");
+            for tick in &ticks {
+                let events = db
+                    .list_job_events(tick.id, None)
+                    .await
+                    .expect("tick events");
+                if let Some(row) = events.iter().find(|e| e.event_type == "cron_tick_end")
+                    && row.data["outcome"] == "skipped_busy"
+                {
+                    return tick.id;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .expect("skipped_busy tick end never persisted");
+
+    assert!(
+        busy_rejections.load(Ordering::SeqCst) >= 5,
+        "the skip must come from exhausting the busy budget"
+    );
+    let status = mgr
+        .cron_mission_status("mock", "owner-1")
+        .await
+        .expect("status");
+    assert_eq!(
+        status.consecutive_abandoned, 0,
+        "a skipped-busy tick must not feed the circuit breaker"
+    );
+    assert!(!status.paused);
+    let _ = skipped;
+}
+
+/// Seed one terminal cron tick row (title = the supervisor-authored prompt
+/// prefix) with a `cron_tick`/`cron_tick_end` event pair, `age` in the past.
+#[cfg(feature = "libsql")]
+async fn seed_tick_row(
+    db: &Arc<dyn Database>,
+    id: Uuid,
+    owner: &str,
+    mission: &str,
+    age_secs: i64,
+) {
+    use lunarwing::orchestrator::cron_worker::cron_tick_title_prefix;
+
+    let created = chrono::Utc::now() - chrono::Duration::seconds(age_secs);
+    db.save_sandbox_job(&lunarwing::history::SandboxJobRecord {
+        id,
+        task: format!("{}, firing on cron schedule 'seeded'", cron_tick_title_prefix(mission)),
+        status: "completed".to_string(),
+        user_id: owner.to_string(),
+        project_dir: format!("missions/{mission}"),
+        success: Some(true),
+        failure_reason: None,
+        created_at: created,
+        started_at: Some(created),
+        completed_at: Some(created),
+        credential_grants_json: "[]".to_string(),
+        job_mode: "external:mock".to_string(),
+    })
+    .await
+    .expect("seed tick row");
+    db.save_job_event(id, "cron_tick", &serde_json::json!({ "mission_id": mission }))
+        .await
+        .expect("seed cron_tick event");
+    db.save_job_event(
+        id,
+        "cron_tick_end",
+        &serde_json::json!({ "mission_id": mission, "outcome": "completed" }),
+    )
+    .await
+    .expect("seed cron_tick_end event");
+}
+
+/// WI#370 retention: the supervisor's STARTUP sweep bounds the mission's
+/// seeded tick rows to the configured window, always keeps the persisted
+/// last-job anchor (even outside the window), never touches ordinary jobs,
+/// other missions' ticks, or other owners' rows, and deletes `job_events`
+/// with their row so no orphan events remain.
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn cron_retention_startup_sweep_bounds_seeded_rows() {
+    use lunarwing::orchestrator::cron_worker::cron_tick_title_prefix;
+
+    let (db, _guard) = cron_event_db("cron-retention-startup.db").await;
+    let oldest = Uuid::new_v4();
+    let middle = Uuid::new_v4();
+    let newest = Uuid::new_v4();
+    seed_tick_row(&db, oldest, "owner-1", "test-mission", 300).await;
+    seed_tick_row(&db, middle, "owner-1", "test-mission", 200).await;
+    seed_tick_row(&db, newest, "owner-1", "test-mission", 100).await;
+    // Negative controls: same worker + owner, but not this mission's ticks.
+    let ordinary = Uuid::new_v4();
+    db.save_sandbox_job(&lunarwing::history::SandboxJobRecord {
+        id: ordinary,
+        task: "Ordinary task-mode job".to_string(),
+        status: "completed".to_string(),
+        user_id: "owner-1".to_string(),
+        project_dir: String::new(),
+        success: Some(true),
+        failure_reason: None,
+        created_at: chrono::Utc::now(),
+        started_at: None,
+        completed_at: None,
+        credential_grants_json: "[]".to_string(),
+        job_mode: "external:mock".to_string(),
+    })
+    .await
+    .expect("seed ordinary row");
+    let other_mission = Uuid::new_v4();
+    seed_tick_row(&db, other_mission, "owner-1", "other-mission", 250).await;
+    let other_owner = Uuid::new_v4();
+    seed_tick_row(&db, other_owner, "owner-2", "test-mission", 250).await;
+
+    // Anchor = the OLDEST row: pins that the anchor survives even outside
+    // the newest-N window (DQ-6).
+    db.set_setting(
+        "owner-1",
+        "cron-mission:test-mission:last-job",
+        &serde_json::json!(oldest.to_string()),
+    )
+    .await
+    .expect("seed anchor setting");
+
+    // retain_last_ticks = 1: after the startup sweep only the newest row and
+    // the anchor row may remain.
+    let (request_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::Capture {
+        requests: request_tx,
+    })
+    .await;
+    let mut config = cron_config_for(&url, 30, 0);
+    config
+        .cron
+        .as_mut()
+        .expect("cron block")
+        .retain_last_ticks = Some(1);
+    let context_manager = Arc::new(ContextManager::new(16));
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(16);
+    let mgr = Arc::new(
+        ExternalWorkerManager::new(vec![config])
+            .with_event_deps(event_tx, Arc::clone(&context_manager))
+            .with_store(db.clone()),
+    );
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    mgr.spawn_cron_supervisors("owner-1", shutdown_rx);
+    let _ = shutdown_tx;
+
+    let prefix = cron_tick_title_prefix("test-mission");
+    tokio::time::timeout(TEST_BOUND, async {
+        loop {
+            let ticks = db
+                .list_cron_mission_ticks("owner-1", "external:mock", &prefix)
+                .await
+                .expect("mission ticks");
+            if ticks.len() <= 2 {
+                return ticks;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("startup retention sweep never bounded the mission rows");
+
+    // The middle row is gone with its events (no orphans); the newest row
+    // and the out-of-window anchor survive with theirs.
+    assert!(
+        db.get_sandbox_job(middle).await.expect("middle row").is_none(),
+        "the middle row is beyond keep(1) and is not the anchor"
+    );
+    assert!(
+        db.list_job_events(middle, None).await.expect("events").is_empty(),
+        "deleted rows must not leave orphan job_events"
+    );
+    for kept in [newest, oldest] {
+        assert!(db.get_sandbox_job(kept).await.expect("kept row").is_some());
+        assert!(
+            !db.list_job_events(kept, None).await.expect("events").is_empty(),
+            "kept rows keep their events"
+        );
+    }
+    // Negative controls are untouched.
+    for untouched in [ordinary, other_mission, other_owner] {
+        assert!(
+            db.get_sandbox_job(untouched).await.expect("row").is_some(),
+            "retention must not touch ordinary/other-mission/other-owner rows"
+        );
+    }
+    // The anchor row still backs the persisted setting.
+    let anchor = db
+        .get_setting("owner-1", "cron-mission:test-mission:last-job")
+        .await
+        .expect("anchor setting")
+        .expect("anchor setting present");
+    assert_eq!(anchor.as_str(), Some(oldest.to_string().as_str()));
+}
+
+/// WI#370 retention end-to-end: live ticks accumulate rows only up to the
+/// window (the sweep runs after every tick), the newest tick and its events
+/// survive, and the persisted anchor follows the newest tick.
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn cron_retention_after_each_tick_keeps_anchor_following() {
+    use lunarwing::orchestrator::cron_worker::cron_tick_title_prefix;
+
+    let (db, _guard) = cron_event_db("cron-retention-live.db").await;
+    let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::Capture {
+        requests: request_tx,
+    })
+    .await;
+    let mut config = cron_config_for(&url, 30, 0);
+    config
+        .cron
+        .as_mut()
+        .expect("cron block")
+        .retain_last_ticks = Some(1);
+    let context_manager = Arc::new(ContextManager::new(16));
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(16);
+    let mgr = Arc::new(
+        ExternalWorkerManager::new(vec![config])
+            .with_event_deps(event_tx, Arc::clone(&context_manager))
+            .with_store(db.clone()),
+    );
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    mgr.spawn_cron_supervisors("owner-1", shutdown_rx);
+    let _ = shutdown_tx;
+
+    let mut last_job = None;
+    for tick in 0..3 {
+        timeout(TEST_BOUND, mgr.fire_cron_tick_now("mock", "owner-1"))
+            .await
+            .expect("tick timed out")
+            .expect("tick errored");
+        let request = request_rx.recv().await.expect("dispatch captured");
+        let job_id = captured_task_id(&request);
+        // Wait for the tick's end (and thus this tick's sweep trigger).
+        let end = await_cron_event(&db, job_id, "cron_tick_end").await;
+        assert_eq!(end["outcome"], "completed", "tick {tick}");
+        last_job = Some(job_id);
+    }
+    let last_job = last_job.expect("fired ticks");
+
+    let prefix = cron_tick_title_prefix("test-mission");
+    let ticks = tokio::time::timeout(TEST_BOUND, async {
+        loop {
+            let ticks = db
+                .list_cron_mission_ticks("owner-1", "external:mock", &prefix)
+                .await
+                .expect("mission ticks");
+            // keep(1) + the anchor, which IS the newest tick here.
+            if ticks.len() <= 1 {
+                return ticks;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("post-tick retention never bounded the mission rows");
+    assert_eq!(ticks.len(), 1, "keep(1) with anchor == newest leaves one row");
+    assert_eq!(ticks[0].id, last_job);
+    // The newest tick keeps its full supervisor record, and the anchor
+    // setting points at it.
+    let events = db
+        .list_job_events(last_job, None)
+        .await
+        .expect("last tick events");
+    assert!(events.iter().any(|e| e.event_type == "cron_tick"));
+    assert!(events.iter().any(|e| e.event_type == "cron_tick_end"));
+    let anchor = db
+        .get_setting("owner-1", "cron-mission:test-mission:last-job")
+        .await
+        .expect("anchor setting")
+        .expect("anchor setting present");
+    assert_eq!(anchor.as_str(), Some(last_job.to_string().as_str()));
+}
+
 /// MR !1522 DE-3: owner commands are serviced while a tick chain is running
 /// — status and pause must answer immediately, not after the chain ends.
 /// (On the pre-fix loop this test timed out: `run_tick` was awaited inside
