@@ -448,6 +448,22 @@ write_tenant_file_atomic() {  # <tenant> <file> [mode] [private|owned-parent]
     '
 }
 
+# Tenant-side `mkdir -p` (WI#446, run-166 LF-8): root must never create (nor
+# chown — see below) directories through the tenant-controlled ~/.config path
+# chain, because a pre-placed symlink component redirects root's writes into
+# an attacker-chosen tree. Creating the directory AS the tenant owns it
+# outright, which also retires the historical root `chown` handover that
+# dereferenced the operand symlink. Fails closed on a non-absolute path or
+# any symlinked component (same ancestor walk the atomic writer uses).
+tenant_mkdir_p() {  # <tenant> <dir>
+  local name="$1" dir="$2"
+  local -a drop=(sudo -u "$name")
+  [[ "$(id -un)" != "$name" ]] || drop=()
+  [[ "$dir" == /* ]] || die "unsafe tenant directory path: $dir"
+  darkirc_path_components_safe "$dir" || die "unsafe tenant directory path: $dir"
+  "${drop[@]}" mkdir -p -- "$dir"
+}
+
 # Append complete lines (stdin) to a tenant-owned env file without root ever
 # opening the tenant-writable path (WI#390): the current content is staged out
 # (read as the tenant), the new lines land on the staged copy, and the result
