@@ -48,12 +48,11 @@ ignore = [
     # owners and then removes allow_failure in the same change (the job's
     # removal condition, .gitlab/README.md observational jobs). Closing an
     # owner WI requires re-pointing its reasons to the new open owner
-    # first. Only a
-    # maintainer creates or names a clearing owner; agents re-point to an
-    # owner the maintainer named, must not reopen a clearing-owner work
-    # item that a maintainer closed, and must not file a replacement owner:
-    # report the red gate on the MR or the work item and leave re-pointing
-    # or reopening to the maintainer.
+    # first. Only a maintainer creates or names a clearing owner; agents
+    # re-point to an owner the maintainer named, must not reopen a
+    # clearing-owner work item that a maintainer closed, and must not file
+    # a replacement owner: report the red gate on the MR or the work item
+    # and leave re-pointing or reopening to the maintainer.
     # CURRENT OWNER STATUS (2026-10-18): the maintainer closed WI#367,
     # WI#368 and WI#418 at 06:22Z with none of the chains cleared, and
     # closed the agent-filed umbrella WI#439 at 21:20Z (MR !1748 run-161
