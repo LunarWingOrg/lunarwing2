@@ -20,6 +20,8 @@ TOOLCHAIN = ROOT / "ic" / "rust-toolchain.toml"
 WORKSPACE_MANIFEST = ROOT / "ic" / "Cargo.toml"
 CARGO_CONFIG = ROOT / ".cargo" / "config.toml"
 DEFAULTS = ROOT / ".gitlab" / "ci" / "defaults.yml"
+MT_ADMIN_WORKER_CONFIG = ROOT / "ic" / "scripts" / "mt-admin-lib" / "09-worker-config.sh"
+EXTERNAL_WORKER_SOURCE = ROOT / "ic" / "src" / "orchestrator" / "external_worker.rs"
 OPENCODE_DOCKERFILE = ROOT / "opencode4lunarwing" / "Dockerfile"
 OPENCODE2_DOCKERFILE = ROOT / "opencode2.4lunarwing" / "Dockerfile"
 KIMI_DOCKERFILE = ROOT / "kimicode4lunarwing" / "Dockerfile"
@@ -1623,6 +1625,83 @@ def validate_worker_versions(errors: list[str]) -> None:
             )
 
 
+def proxy_tool_names_from_rust(text: str) -> set[str] | None:
+    """Extract the daemon's PROXY_TOOL_ALLOWLIST entries; None when the const
+    is not declared in the pinned shape (fail closed). Line comments inside
+    the const body are stripped first so a quoted name in prose cannot widen
+    or mask the set."""
+    match = re.search(r"const PROXY_TOOL_ALLOWLIST: &\[&str\] = &\[(.*?)\];", text, re.DOTALL)
+    if match is None:
+        return None
+    body = "\n".join(line.split("//", 1)[0] for line in match.group(1).splitlines())
+    return set(re.findall(r'"([^"]+)"', body))
+
+
+def validate_proxy_tool_set_sync(errors: list[str]) -> None:
+    """MR !1780 review LM-5 (run 171): mt-admin's operator boundary and the
+    daemon must agree on the WI#324 phase-1 proxied-tool set. The shell list
+    (EXTERNAL_WORKER_PROXY_TOOLS in mt-admin's 09-worker-config.sh) mirrors
+    the daemon's PROXY_TOOL_ALLOWLIST (ic/src/orchestrator/external_worker.rs)
+    by hand, and nothing kept them in sync: a daemon set widened without the
+    shell catching up is refused at the operator boundary (the grant can never
+    be issued), and a daemon set narrowed without the shell catching up writes
+    a grant the daemon strips at load. Both drift silently without this
+    cross-check."""
+    shell_names: set[str] | None = None
+    if not MT_ADMIN_WORKER_CONFIG.is_file():
+        errors.append(
+            "ic/scripts/mt-admin-lib/09-worker-config.sh missing; cannot verify the "
+            "EXTERNAL_WORKER_PROXY_TOOLS / PROXY_TOOL_ALLOWLIST sync"
+        )
+    else:
+        match = re.search(
+            r'(?m)^EXTERNAL_WORKER_PROXY_TOOLS="([^"]*)"$',
+            MT_ADMIN_WORKER_CONFIG.read_text(encoding="utf-8"),
+        )
+        if match is None:
+            errors.append(
+                "09-worker-config.sh no longer declares EXTERNAL_WORKER_PROXY_TOOLS as a "
+                "plain double-quoted space-separated list"
+            )
+        else:
+            names = match.group(1).split()
+            duplicates = sorted({name for name in names if names.count(name) > 1})
+            if duplicates:
+                errors.append(f"EXTERNAL_WORKER_PROXY_TOOLS has duplicate entries: {duplicates}")
+            shell_names = set(names)
+
+    daemon_names: set[str] | None = None
+    if not EXTERNAL_WORKER_SOURCE.is_file():
+        errors.append(
+            "ic/src/orchestrator/external_worker.rs missing; cannot verify the "
+            "EXTERNAL_WORKER_PROXY_TOOLS / PROXY_TOOL_ALLOWLIST sync"
+        )
+    else:
+        daemon_names = proxy_tool_names_from_rust(
+            EXTERNAL_WORKER_SOURCE.read_text(encoding="utf-8")
+        )
+        if daemon_names is None:
+            errors.append(
+                "external_worker.rs no longer declares PROXY_TOOL_ALLOWLIST as "
+                "'const PROXY_TOOL_ALLOWLIST: &[&str] = &[...]'"
+            )
+
+    if shell_names is None or daemon_names is None:
+        return
+    missing = sorted(daemon_names - shell_names)
+    if missing:
+        errors.append(
+            f"EXTERNAL_WORKER_PROXY_TOOLS is missing daemon tools {missing}: a widened "
+            "PROXY_TOOL_ALLOWLIST would be refused at the operator boundary"
+        )
+    extra = sorted(shell_names - daemon_names)
+    if extra:
+        errors.append(
+            f"EXTERNAL_WORKER_PROXY_TOOLS has tools absent from PROXY_TOOL_ALLOWLIST {extra}: "
+            "the grant would be written and then stripped at daemon load"
+        )
+
+
 def worker_input_files(block: str) -> list[str]:
     """Extract a worker case block's input_files list (quoted multi-line or
     bare single-line form)."""
@@ -2269,6 +2348,7 @@ def main() -> int:
     validate_pebble_rust_lane(merged_config, errors)
     validate_cache_trust(merged_config, errors)
     validate_worker_versions(errors)
+    validate_proxy_tool_set_sync(errors)
     validate_worker_input_manifest(errors)
     validate_trivy_ignore(errors)
     validate_trivy_gate_inputs(merged_config, errors)

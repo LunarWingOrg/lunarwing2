@@ -146,6 +146,12 @@ accepted (`memory_read`, `memory_write`, `knowledge_search`,
 workers are refused (tick authority is `cron.tool_allowlist` on the mission),
 and `gitlab_tool` is preferred over the legacy `gitlab-tool` spelling.
 
+Every job that worker container runs, concurrently and in sequence (one
+container is one authority domain), can then use the granted tools with the
+tenant's authority: read and write the tenant's memory, submit notes to the
+shared knowledge corpus, and act on GitLab with the tenant's token
+(`gitlab_tool`). Grant the smallest set the lane needs.
+
 ### Step 4: Start services
 
 ```bash
