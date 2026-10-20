@@ -14,20 +14,36 @@ use tokio::net::unix::OwnedWriteHalf;
 
 /// Protocol messages — must stay in sync with the server's
 /// `unix_socket_repl::ReplMessage`.
+///
+/// Newer fields (`features`, `attachments`) carry `#[serde(default)]` and the
+/// legacy client never receives `Status` (the server only sends it to clients
+/// that advertise the `status` feature), so this client keeps working against
+/// both old and new servers.
 #[derive(Debug, Serialize, Deserialize)]
 enum ReplMessage {
     Connect {
         version: String,
         client_info: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        features: Vec<String>,
     },
     Message {
         content: String,
         session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<ReplAttachment>,
     },
     Response {
         content: String,
         session_id: Option<String>,
         is_complete: bool,
+    },
+    Status {
+        kind: String,
+        content: String,
+        #[serde(default)]
+        data: serde_json::Value,
+        session_id: Option<String>,
     },
     Disconnect {
         session_id: Option<String>,
@@ -35,6 +51,15 @@ enum ReplMessage {
     },
     Ping,
     Pong,
+}
+
+/// Attachment mirror of the server's wire type (this legacy client never
+/// sends attachments, but the shape must parse).
+#[derive(Debug, Serialize, Deserialize)]
+struct ReplAttachment {
+    mime_type: String,
+    filename: Option<String>,
+    data_base64: String,
 }
 
 #[tokio::main]
@@ -67,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
         &ReplMessage::Connect {
             version: env!("CARGO_PKG_VERSION").to_string(),
             client_info: None,
+            features: Vec::new(),
         },
     )
     .await?;
@@ -120,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
             &ReplMessage::Message {
                 content: input.to_string(),
                 session_id: None,
+                attachments: Vec::new(),
             },
         )
         .await?;
