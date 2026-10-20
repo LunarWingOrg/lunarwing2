@@ -93,6 +93,10 @@ section and "Launch identity (WI#422)" further down.
   as root at the next container start (run-170 LP-1). The opencode bridge's
   credential resolver fails closed when the file pointer is set but the
   file is unreadable or empty (run-170 LP-4), like the kimi and pebble ones.
+  The pinned identities are validated everywhere they parse (the TS
+  `taskIdentity()` helpers, both entrypoints, the pebble executor): zero or
+  non-numeric ids fail closed, because a zero id would make the drop a
+  no-op while callers keep treating the split as active (run-171 LP-17).
   Kimi task-side setup (`entrypoint-task-setup.sh`) runs as the task uid —
   never as root — because everything it writes (`~/.gitconfig`, `~/.ssh`,
   `$KIMI_CODE_HOME`) is task state.
@@ -597,15 +601,20 @@ re-checked 2026-10-13):
   guard is the only in-CLI enforcement point and stays mandatory.
 - **pebble:** no listeners, pairing, or sharing in upstream
   (nanogpt-community/pebble) — the only `TcpListener` is test code.
-  **Finding (widened per run-79 EI-10):** the image has no `USER`
-  directive, so the agent runs as **root in the container**. That exposes
-  more than `pebble self-update` (fetches GitHub releases, replaces the
-  binary): a root-in-container agent can replace the bridge binary itself
-  and forge audit/bridge output (why control 9 reads `/proc` host-side).
-  Rootless podman maps it to the tenant uid on the host, but within the
-  container the pinned-build contract is not enforced. Mitigation is
-  control 1 (egress allowlist) or a lane hardening pass (non-root user +
-  root-owned bridge binary); recorded here per the bump-checklist rule.
+  **Finding (widened per run-79 EI-10; resolved by WI#400/WI#422):** the
+  image used to have no `USER` directive, so the agent ran as **root in
+  the container** — beyond `pebble self-update` (fetches GitHub releases,
+  replaces the binary), a root-in-container agent could replace the bridge
+  binary itself and forge audit/bridge output (why control 9 reads
+  `/proc` host-side). That shape is gone: the image now pins `USER 0:0`
+  and the WI#400 split (see "Task-uid split (WI#400)" above) drops every
+  spawned pebble process to the task uid via setpriv, so the bridge
+  binary and its root-owned state are out of the agent's reach on the
+  rootless lane; the rootful launch runs the whole container as the
+  tenant uid ("Launch identity (WI#422)"). Residual: `self-update` still
+  fetches over the network from the (now unprivileged) task uid, so the
+  real fix for that half remains control 1 (egress allowlist). Keep the
+  pinned `PEBBLE_LOCK_SHA256` build contract intact.
 
 ## LunarWing Worker
 

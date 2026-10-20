@@ -29,6 +29,12 @@ KIMI_TASK_GID="${KIMI_TASK_GID:-10002}"
 # is absent (host-side runs).
 export KIMI_TASK_UID KIMI_TASK_GID
 
+# WI#400 LP-17: a zero (or non-numeric) id would make the setpriv drop a
+# no-op while every caller keeps treating the split as active — refuse it.
+if [[ ! "$KIMI_TASK_UID" =~ ^[1-9][0-9]*$ || ! "$KIMI_TASK_GID" =~ ^[1-9][0-9]*$ ]]; then
+  die "KIMI_TASK_UID/KIMI_TASK_GID must be non-zero numeric ids (a zero id would make the privilege drop a no-op)"
+fi
+
 # ── WI#400 credential handoff (before anything long-lived is spawned) ────────
 LUNARWING_TOKEN_DIR="${LUNARWING_TOKEN_DIR:-/run/lunarwing}"
 if [ -n "${AGENT_AUTH_TOKEN:-}" ]; then

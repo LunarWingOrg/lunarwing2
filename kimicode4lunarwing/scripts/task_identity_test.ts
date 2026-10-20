@@ -31,6 +31,20 @@ test("taskIdentity: non-numeric ids fail closed", () => {
   delete process.env.KIMI_TASK_GID
 })
 
+test("taskIdentity: zero ids fail closed (WI#400 LP-17 — a zero id would make the privilege drop a no-op)", () => {
+  process.env.KIMI_TASK_UID = "0"
+  process.env.KIMI_TASK_GID = "10002"
+  assert.throws(() => taskIdentity(), /non-zero numeric ids/)
+  process.env.KIMI_TASK_UID = "10002"
+  process.env.KIMI_TASK_GID = "0"
+  assert.throws(() => taskIdentity(), /non-zero numeric ids/)
+  process.env.KIMI_TASK_UID = "0"
+  process.env.KIMI_TASK_GID = "0"
+  assert.throws(() => taskIdentity(), /non-zero numeric ids/)
+  delete process.env.KIMI_TASK_UID
+  delete process.env.KIMI_TASK_GID
+})
+
 test("taskSetprivArgv: exact flag sequence, cap-clearing pair + no-new-privs mandatory (WI#400)", () => {
   // setpriv(1) preserves capabilities across the uid change unless the
   // ambient/inheritable sets are cleared — a task keeping ambient

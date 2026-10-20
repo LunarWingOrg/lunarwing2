@@ -96,13 +96,15 @@ LunarWing owns every public exposure path through the daemon's tunnel; the
 only instruction channel into this worker is the daemon's job dispatch → the
 bridge → pebble on loopback. Upstream pebble has no listener/pairing/sharing
 surface; its one outbound footgun is `pebble self-update` (fetches GitHub
-releases and replaces the binary). The image has no `USER` directive, so the
-agent runs as root in the container: beyond `self-update`, a root-in-container
-agent can replace the bridge binary itself and forge bridge/audit output —
-which is why the control-9 listener audit reads `/proc` host-side. Keep the
-pinned `PEBBLE_LOCK_SHA256` build contract intact; the real fix is the
-deferred egress allowlist (WI#357 control 1) or a non-root lane hardening
-pass. Full policy, controls, and the per-bump checklist:
+releases and replaces the binary). The image pins `USER 0:0` and every
+spawned pebble process drops to the task uid via setpriv (WI#400 — see
+"Task-uid split (WI#400)" in `docs/ops/WORKER-CONTAINERS.md`; the rootful
+launch runs the whole container as the tenant uid, WI#422), so the agent
+no longer runs as container root and cannot replace the root-owned bridge
+binary — `self-update` remains an egress concern for the (unprivileged)
+task uid. Keep the pinned `PEBBLE_LOCK_SHA256` build contract intact; the
+real fix for the egress half is the deferred egress allowlist
+(WI#357 control 1). Full policy, controls, and the per-bump checklist:
 `docs/ops/WORKER-CONTAINERS.md` → "Worker exposure policy (WI#357)".
 
 ## Tool proxy (WI#324)
@@ -112,8 +114,11 @@ proxy: a per-task unix-socket relay (`src/tool_proxy.rs`) plus a thin stdio
 MCP server (`pebble4lunarwing mcp-shim`, `src/mcp_shim.rs`) that pebble
 spawns (once for tool discovery, then once per tool call) from the baked
 `mcpServers.lunarwing` entry in
-`$PEBBLE_CONFIG_HOME/settings.json` (`/etc/lunarwing/pebble`; root-owned,
-but writable by task code, which runs as container root).
+`$PEBBLE_CONFIG_HOME/settings.json` (`/etc/lunarwing/pebble`; root-owned
+0444 in a 0555 directory — with the WI#400 split, task code no longer
+runs as container root, so the directory is no longer writable by it;
+pebble's own state files in the same directory are the reason the config
+home is otherwise read-only for the task uid).
 The executor injects `LUNARWING_TASK_ID` / `LUNARWING_TOOL_PROXY_SOCKET`
 into each pebble process (after task-supplied env, so they cannot be
 shadowed; both keys are also stripped from inherited and task-supplied env
