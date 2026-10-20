@@ -196,10 +196,14 @@ enum MockBehavior {
     /// WI#328 (MR !1537 DW-6): like `ControlChannel`, but the worker never
     /// acks the prompt — it answers the follow-up with a bare `task_result`.
     /// The daemon must record the delivered seq as unacked at task end.
+    /// Constructed only by libsql-gated tests (WI#387).
+    #[cfg(feature = "libsql")]
     ControlChannelNoAck {
         messages: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
     },
     /// Ack the same delivered seq repeatedly, including refusal/legacy shapes.
+    /// Constructed only by libsql-gated tests (WI#387).
+    #[cfg(feature = "libsql")]
     ControlChannelAcks {
         messages: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
         accepted: Vec<Option<bool>>,
@@ -222,10 +226,11 @@ impl MockBehavior {
     /// Capabilities advertised in the mock's `ready` payload (WI#328).
     fn capabilities(&self) -> Vec<&'static str> {
         match self {
-            MockBehavior::ControlChannel { .. }
-            | MockBehavior::ControlChannelNoAck { .. }
-            | MockBehavior::ControlChannelAcks { .. }
-            | MockBehavior::ControlChannelHold { .. } => {
+            MockBehavior::ControlChannel { .. } | MockBehavior::ControlChannelHold { .. } => {
+                vec!["task_prompt"]
+            }
+            #[cfg(feature = "libsql")]
+            MockBehavior::ControlChannelNoAck { .. } | MockBehavior::ControlChannelAcks { .. } => {
                 vec!["task_prompt"]
             }
             _ => vec![],
@@ -1031,6 +1036,7 @@ async fn handle_connection(
                 handle_control_channel(&mut ws, messages, &[Some(true)]).await;
                 // Loop: the connection may be pooled and reused.
             }
+            #[cfg(feature = "libsql")]
             MockBehavior::ControlChannelNoAck { ref messages } => {
                 // DW-6 shape: same control channel, but the worker answers the
                 // follow-up with a bare task_result — no task_prompt_ack.
@@ -1038,6 +1044,7 @@ async fn handle_connection(
                 handle_control_channel(&mut ws, messages, &[]).await;
                 // Loop: the connection may be pooled and reused.
             }
+            #[cfg(feature = "libsql")]
             MockBehavior::ControlChannelAcks {
                 ref messages,
                 ref accepted,
