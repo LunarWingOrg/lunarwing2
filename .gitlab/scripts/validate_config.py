@@ -443,6 +443,10 @@ def validate_test_shapes(merged: dict, errors: list[str]) -> None:
         "rust-test-postgres-integration": (
             "--features postgres,integration",
             "--test workspace_integration",
+            # WI#370: the job_events FK semantics the cron retention sweep
+            # depends on must run against real PostgreSQL, not only the
+            # libSQL lane where the generic target is auto-discovered.
+            "--test postgres_cron_retention",
         ),
     }
     for job_name, fragments in expected.items():
@@ -1085,6 +1089,7 @@ WORKER_TS_LANE_SCRIPTS = {
             "cd opencode4lunarwing",
             "bun install --frozen-lockfile",
             "bun scripts/path_expand_test.ts",
+            "bun scripts/task_identity_test.ts",
             "bun scripts/opencode_result_test.ts",
             "bun scripts/task_prompt_test.ts",
             "bun scripts/lunarwing_bridge_test.ts",

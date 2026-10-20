@@ -117,6 +117,25 @@ ensure_knowledge_source_scheduler() {
   esac
 }
 
+# WI#445: both root-side sync entrypoints take LW2STUDYMCP_HOME from the
+# tenant's own lunarwing.env, and the tenant account can choose that value.
+# Root filesystem operations under it (git clone, install -d, the lock file,
+# the manifest publish) are only safe when the home is the operator default
+# or its deepest existing ancestor chain is root-owned, symlink-free, and not
+# group/other-writable — the darkirc lane's root-follows-tenant-path rules.
+study_notes_sync_home_trusted() {  # <checkout home>
+  local home="$1" anchor
+  [[ "$home" == "$STUDY_NOTES_DEFAULT_HOME" ]] && return 0
+  [[ "$home" =~ ^/[A-Za-z0-9._/-]+$ ]] || return 1
+  # The walk validates only the deepest existing ancestor; a "." or ".."
+  # component in the missing tail would let the literal path the sync then
+  # uses resolve outside the validated chain (run-174 LV-7).
+  [[ "/$home/" != */../* && "/$home/" != */./* ]] || return 1
+  anchor="$home"
+  while [[ ! -e "$anchor" && ! -L "$anchor" ]]; do anchor="$(dirname -- "$anchor")"; done
+  darkirc_validate_root_owned_directory "$anchor"
+}
+
 sync_enabled_study_notes_sources() {
   require_root
   ports_registry_require_readonly
@@ -142,7 +161,11 @@ sync_enabled_study_notes_sources() {
     home="$(_env_existing "$env_path" LW2STUDYMCP_HOME)"
     [[ -n "$home" ]] \
       || { say "WARNING: tenant '$name' enables knowledge sync without LW2STUDYMCP_HOME"; continue; }
-    validate_study_notes_path "$home" "Study Notes home"
+    # WI#445: a tenant-chosen home must be trusted before root-side sync
+    # operations run under it; an untrusted or malformed value skips only
+    # this tenant instead of aborting the whole hourly run.
+    study_notes_sync_home_trusted "$home" \
+      || { say "WARNING: tenant '$name' LW2STUDYMCP_HOME is not trusted for the root-side sync: $home (expected the operator default or a root-owned directory); skipping"; continue; }
     seen["$home"]=1
   done < <(jq -r '.tenants | keys[]' "$PORTS_REGISTRY")
 
@@ -165,6 +188,10 @@ run_tenant_knowledge_refresh() {  # <tenant> <sync source true|false>
   home="$(_env_existing "$env_path" LW2STUDYMCP_HOME)"
   [[ -n "$home" ]] || die "Study Notes MCP is not configured for tenant '$name'"
   if [[ "$sync_source" == "true" ]]; then
+    # WI#445: an explicit operator request dies on an untrusted home rather
+    # than running the root-side sync under a tenant-chosen path.
+    study_notes_sync_home_trusted "$home" \
+      || die "tenant '$name' LW2STUDYMCP_HOME is not trusted for the root-side sync: $home (expected the operator default or a root-owned directory)"
     sync_study_notes_checkout "$home"
   fi
   [[ -r "$home/.git/lunarwing-study-notes-generation.json" ]] \

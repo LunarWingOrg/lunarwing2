@@ -452,6 +452,21 @@ impl SandboxStore for PgBackend {
     ) -> Result<Vec<JobEventRecord>, DatabaseError> {
         self.store.list_job_events(job_id, limit).await
     }
+
+    async fn list_cron_mission_ticks(
+        &self,
+        user_id: &str,
+        job_mode: &str,
+        title_prefix: &str,
+    ) -> Result<Vec<SandboxJobRecord>, DatabaseError> {
+        self.store
+            .list_cron_mission_ticks(user_id, job_mode, title_prefix)
+            .await
+    }
+
+    async fn delete_sandbox_job_cascade(&self, job_id: Uuid) -> Result<bool, DatabaseError> {
+        self.store.delete_sandbox_job_cascade(job_id).await
+    }
 }
 
 // ==================== RoutineStore ====================

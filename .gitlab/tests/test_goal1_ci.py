@@ -121,6 +121,18 @@ class FullValidationTests(unittest.TestCase):
         config.validate_test_shapes(self.merged, errors)
         self.assertTrue(any("cavepony-wasm" in error for error in errors))
 
+    def test_dropping_cron_retention_from_postgres_lane_is_rejected(self):
+        self.merged["rust-test-postgres-integration"]["script"] = [
+            command.replace(" --test postgres_cron_retention", "")
+            for command in self.merged["rust-test-postgres-integration"]["script"]
+        ]
+        errors = []
+        config.validate_test_shapes(self.merged, errors)
+        self.assertTrue(
+            any("rust-test-postgres-integration" in error for error in errors),
+            errors,
+        )
+
     def test_full_validation_does_not_widen_worker_publication(self):
         errors = []
         config.validate_worker_publication(self.merged, errors)

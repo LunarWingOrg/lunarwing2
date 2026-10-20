@@ -97,10 +97,13 @@ test("cron bootstrap creates a missing default dir, preserves state, and confine
 test("cron bootstrap hands a newly created leaf to the task identity (WI#400 KW-4)", () => {
   // The bridge runs as root while the cron task runs under the separate task
   // uid; a freshly created leaf must be fchowned to the task identity or the
-  // task cannot write its own project dir. fchown to the process's own ids
-  // is permitted unprivileged, so this runs on dev hosts and in-image alike.
-  const uid = process.getuid!()
-  const gid = process.getgid!()
+  // task cannot write its own project dir. LP-17 refuses a zero task id, so a
+  // root runner (CI) hands the leaf to a fixed unprivileged identity instead
+  // of its own; root may fchown to any id. A non-root runner keeps its own
+  // ids (fchown to itself is permitted unprivileged), so this runs on dev
+  // hosts and in-image alike.
+  const uid = process.getuid!() === 0 ? 10002 : process.getuid!()
+  const gid = process.getgid!() === 0 ? 10002 : process.getgid!()
   process.env.KIMI_TASK_UID = String(uid)
   process.env.KIMI_TASK_GID = String(gid)
   const root = mkdtempSync(join(tmpdir(), "kimi-cron-kw4-"))

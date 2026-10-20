@@ -239,6 +239,7 @@ RUN cd /app && bun -e 'import("@opencode-ai/sdk/v2/client").then(m => { if (type
 RUN test "$(/usr/local/bin/opencode --version)" = "${OPENCODE_VERSION}" \
     && cd /app \
     && bun scripts/path_expand_test.ts \
+    && bun scripts/task_identity_test.ts \
     && bun scripts/opencode_result_test.ts \
     && bun scripts/opencode_task_executor_test.ts \
     && bun scripts/lunarwing_bridge_test.ts \

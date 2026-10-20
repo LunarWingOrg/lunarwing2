@@ -1990,6 +1990,23 @@ impl Tool for CreateJobTool {
 
         let description = require_str(&params, "description")?;
 
+        // WI#370 LW-8: the cron tick title opening is the persisted marker the
+        // retention sweep and the `list_jobs` cron filter key on. An ordinary
+        // `create_job` carrying it would be hidden from the owner's default
+        // job listing and eventually deleted with its events by the mission's
+        // retention sweep, so refuse it here at the operator boundary. Only
+        // the cron supervisor (which builds its prompts from
+        // `cron_tick_title_prefix`) may persist that opening.
+        if format!("{title}\n\n{description}")
+            .starts_with(crate::orchestrator::cron_worker::CRON_TICK_TITLE_OPENING)
+        {
+            return Err(ToolError::InvalidParameters(format!(
+                "title must not start with the reserved cron tick opening '{}...' \
+                 (persisted marker of supervisor cron ticks; WI#370)",
+                crate::orchestrator::cron_worker::CRON_TICK_TITLE_OPENING
+            )));
+        }
+
         let mode_str = params
             .get("mode")
             .and_then(|v| v.as_str())
@@ -2244,7 +2261,10 @@ impl Tool for ListJobsTool {
     }
 
     fn description(&self) -> &str {
-        "List up to 100 recent jobs or filter by status. Shows job IDs, titles, and current status."
+        "List up to 100 recent jobs or filter by status. Shows job IDs, titles, and current \
+         status. Cron-mission tick jobs are hidden by default so ordinary jobs stay \
+         discoverable; set include_cron: true to list them too (they carry a \"cron_tick\": \
+         true tag)."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -2255,6 +2275,12 @@ impl Tool for ListJobsTool {
                     "type": "string",
                     "description": "Filter by status: 'active', 'completed', 'failed', 'all' (default: 'all')",
                     "enum": ["active", "completed", "failed", "all"]
+                },
+                "include_cron": {
+                    "type": "boolean",
+                    "description": "Include cron-mission tick jobs (default: false). At the 60s \
+                     schedule floor a mission adds up to 1,440 rows/day, so ticks are excluded \
+                     by default to keep ordinary jobs visible within the 100-row window."
                 }
             }
         })
@@ -2271,6 +2297,10 @@ impl Tool for ListJobsTool {
             .get("filter")
             .and_then(|v| v.as_str())
             .unwrap_or("all");
+        let include_cron = params
+            .get("include_cron")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let mut all_jobs = std::collections::HashMap::new();
         if let Some(store) = &self.store {
@@ -2285,6 +2315,7 @@ impl Tool for ListJobsTool {
                                 "status": record.status,
                                 "created_at": record.created_at.to_rfc3339(),
                                 "source": "database",
+                                "cron_tick": crate::orchestrator::cron_worker::is_cron_tick_title(&record.title),
                             }),
                         );
                     }
@@ -2302,6 +2333,7 @@ impl Tool for ListJobsTool {
                                 "status": record.status,
                                 "created_at": record.created_at.to_rfc3339(),
                                 "source": "database",
+                                "cron_tick": crate::orchestrator::cron_worker::is_cron_tick_title(&record.task),
                             }),
                         );
                     }
@@ -2312,6 +2344,14 @@ impl Tool for ListJobsTool {
 
         for job_id in self.context_manager.all_jobs_for(&ctx.user_id).await {
             if let Ok(job_ctx) = self.context_manager.get_context(job_id).await {
+                // Live cron tick contexts carry the structured metadata the
+                // supervisor sets at registration (their in-memory title is
+                // the human-readable "<mission> tick #N", not the prompt).
+                let cron_tick = job_ctx
+                    .metadata
+                    .get("cron_mode")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 all_jobs.insert(
                     job_id,
                     serde_json::json!({
@@ -2320,6 +2360,7 @@ impl Tool for ListJobsTool {
                         "status": format!("{:?}", job_ctx.state),
                         "created_at": job_ctx.created_at.to_rfc3339(),
                         "source": "live",
+                        "cron_tick": cron_tick,
                     }),
                 );
             }
@@ -2357,6 +2398,10 @@ impl Tool for ListJobsTool {
 
         let mut jobs: Vec<_> = all_jobs
             .into_values()
+            // Cron-mission ticks are machine-generated at up to one row per
+            // schedule fire; without this filter they fill the 100-row window
+            // and hide ordinary jobs within hours (WI#370).
+            .filter(|job| include_cron || !job["cron_tick"].as_bool().unwrap_or(false))
             .filter(|job| job_matches_filter(filter, job["status"].as_str().unwrap_or_default()))
             .collect();
         jobs.sort_by(|left, right| {
@@ -3606,6 +3651,85 @@ mod tests {
         assert!(hidden_events.is_err());
     }
 
+    /// WI#370: cron-mission tick rows are tagged `cron_tick` and hidden from
+    /// the 100-row listing by default (a mission adds up to 1,440 rows/day
+    /// at the schedule floor and hides ordinary jobs within hours);
+    /// `include_cron: true` lists them tagged.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn list_jobs_hides_cron_ticks_unless_included() {
+        use crate::orchestrator::cron_worker::cron_tick_title_prefix;
+        use crate::testing::TestHarnessBuilder;
+
+        let harness = TestHarnessBuilder::new().build().await;
+        let store = Arc::clone(&harness.db);
+        let manager = Arc::new(ContextManager::new(5));
+        let ordinary = Uuid::new_v4();
+        let tick = Uuid::new_v4();
+        for (id, task) in [
+            (ordinary, "Ordinary task-mode job".to_string()),
+            (
+                tick,
+                format!(
+                    "{}, firing on cron schedule '0 15 10 * * *'",
+                    cron_tick_title_prefix("test-mission")
+                ),
+            ),
+        ] {
+            store
+                .save_sandbox_job(&SandboxJobRecord {
+                    id,
+                    task,
+                    status: "completed".to_string(),
+                    user_id: "default".to_string(),
+                    project_dir: String::new(),
+                    success: Some(true),
+                    failure_reason: None,
+                    created_at: Utc::now(),
+                    started_at: None,
+                    completed_at: None,
+                    credential_grants_json: "[]".to_string(),
+                    job_mode: "external:mock".to_string(),
+                })
+                .await
+                .expect("seed job row");
+        }
+
+        let ctx = JobContext::default();
+        let tool = ListJobsTool::new(manager).with_store(store);
+        let listed = tool
+            .execute(serde_json::json!({}), &ctx)
+            .await
+            .expect("default listing");
+        let ids: Vec<_> = listed.result["jobs"]
+            .as_array()
+            .expect("jobs array")
+            .iter()
+            .map(|job| job["job_id"].as_str().expect("job_id").to_string())
+            .collect();
+        assert_eq!(ids, vec![ordinary.to_string()]);
+        // The summary still counts everything (status filters behave the
+        // same way), so totals do not silently change shape.
+        assert_eq!(listed.result["summary"]["completed"], 2);
+
+        let with_cron = tool
+            .execute(serde_json::json!({ "include_cron": true }), &ctx)
+            .await
+            .expect("include_cron listing");
+        let jobs = with_cron.result["jobs"].as_array().expect("jobs array");
+        assert_eq!(jobs.len(), 2);
+        let tick_entry = jobs
+            .iter()
+            .find(|job| job["job_id"] == tick.to_string().as_str())
+            .expect("tick entry present");
+        assert_eq!(tick_entry["cron_tick"], true);
+        let ordinary_entry = jobs
+            .iter()
+            .find(|job| job["job_id"] == ordinary.to_string().as_str())
+            .expect("ordinary entry present");
+        assert_eq!(ordinary_entry["cron_tick"], false);
+    }
+
     /// WI#263 review finding: the `partial_output` snapshot must survive a
     /// daemon restart. The DB fallback branch of job_status recovers it from
     /// the persisted `partial_output` job event written by
@@ -3701,6 +3825,46 @@ mod tests {
                 .to_string()
                 .contains("missing 'description' parameter")
         );
+
+        // WI#370 LW-8: an ordinary create_job whose task starts with the
+        // reserved cron tick opening must be refused at the tool boundary —
+        // otherwise it is hidden from list_jobs by default and later deleted
+        // with its events by the mission's retention sweep.
+        let forged_tick = tool
+            .execute(
+                serde_json::json!({
+                    "title": format!(
+                        "{}fake-mission', firing on cron schedule",
+                        crate::orchestrator::cron_worker::CRON_TICK_TITLE_OPENING
+                    ),
+                    "description": "ordinary caller task text"
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(forged_tick.is_err()); // safety: test
+        let error_text = forged_tick.unwrap_err().to_string();
+        assert!(
+            /* safety: test */
+            error_text.contains("reserved cron tick opening"),
+            "unexpected refusal message: {error_text}"
+        );
+
+        // The refusal keys on the assembled task, so a description carrying
+        // the opening behind a normal title stays a legal ordinary job.
+        let opening_in_description = tool
+            .execute(
+                serde_json::json!({
+                    "title": "Ordinary job",
+                    "description": format!(
+                        "Mentions {}some-mission' only in the body",
+                        crate::orchestrator::cron_worker::CRON_TICK_TITLE_OPENING
+                    )
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(opening_in_description.is_ok()); // safety: test
     }
 
     #[tokio::test]

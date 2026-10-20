@@ -157,7 +157,7 @@ sync_study_notes_checkout() {  # <checkout home>
   # Clone the shared lw2studymcp checkout when missing, or fast-forward an
   # existing clean git checkout to the latest upstream. A non-git directory or
   # a dirty checkout is never modified — the operator must repair it by hand.
-  local home="$1" parent manifest last_good
+  local home="$1" parent manifest last_good origin_url
   validate_study_notes_path "$home" "Study Notes home"
   require_cmd git
   parent="$(dirname -- "$home")"
@@ -204,6 +204,13 @@ sync_study_notes_checkout() {  # <checkout home>
       [[ -d "$home" ]] || die "Study Notes home is not a directory: $home"
       [[ -d "$home/.git" ]] \
         || die "Study Notes home is not a git checkout; cannot sync to latest: $home"
+      # WI#445 LV-9: the pull follows whatever origin the existing checkout
+      # carries, and the published generation is mounted read-only into worker
+      # containers — only the operator's STUDY_NOTES_REPO may feed it. Compare
+      # the raw configured URL (remote get-url applies insteadOf rewrites).
+      origin_url="$(git -C "$home" config remote.origin.url 2>/dev/null || true)"
+      [[ "$origin_url" == "$STUDY_NOTES_REPO" ]] \
+        || die "Study Notes checkout origin does not match STUDY_NOTES_REPO; refusing to sync: $home (repair or remove it)"
       [[ -z "$(git -C "$home" status --porcelain 2>/dev/null)" ]] \
         || die "Study Notes checkout has local changes; refusing to sync: $home"
       say "syncing Study Notes MCP checkout to latest upstream: $home"
