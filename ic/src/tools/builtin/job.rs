@@ -2244,7 +2244,10 @@ impl Tool for ListJobsTool {
     }
 
     fn description(&self) -> &str {
-        "List up to 100 recent jobs or filter by status. Shows job IDs, titles, and current status."
+        "List up to 100 recent jobs or filter by status. Shows job IDs, titles, and current \
+         status. Cron-mission tick jobs are hidden by default so ordinary jobs stay \
+         discoverable; set include_cron: true to list them too (they carry a \"cron_tick\": \
+         true tag)."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -2255,6 +2258,12 @@ impl Tool for ListJobsTool {
                     "type": "string",
                     "description": "Filter by status: 'active', 'completed', 'failed', 'all' (default: 'all')",
                     "enum": ["active", "completed", "failed", "all"]
+                },
+                "include_cron": {
+                    "type": "boolean",
+                    "description": "Include cron-mission tick jobs (default: false). At the 60s \
+                     schedule floor a mission adds up to 1,440 rows/day, so ticks are excluded \
+                     by default to keep ordinary jobs visible within the 100-row window."
                 }
             }
         })
@@ -2271,6 +2280,10 @@ impl Tool for ListJobsTool {
             .get("filter")
             .and_then(|v| v.as_str())
             .unwrap_or("all");
+        let include_cron = params
+            .get("include_cron")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let mut all_jobs = std::collections::HashMap::new();
         if let Some(store) = &self.store {
@@ -2285,6 +2298,7 @@ impl Tool for ListJobsTool {
                                 "status": record.status,
                                 "created_at": record.created_at.to_rfc3339(),
                                 "source": "database",
+                                "cron_tick": crate::orchestrator::cron_worker::is_cron_tick_title(&record.title),
                             }),
                         );
                     }
@@ -2302,6 +2316,7 @@ impl Tool for ListJobsTool {
                                 "status": record.status,
                                 "created_at": record.created_at.to_rfc3339(),
                                 "source": "database",
+                                "cron_tick": crate::orchestrator::cron_worker::is_cron_tick_title(&record.task),
                             }),
                         );
                     }
@@ -2312,6 +2327,14 @@ impl Tool for ListJobsTool {
 
         for job_id in self.context_manager.all_jobs_for(&ctx.user_id).await {
             if let Ok(job_ctx) = self.context_manager.get_context(job_id).await {
+                // Live cron tick contexts carry the structured metadata the
+                // supervisor sets at registration (their in-memory title is
+                // the human-readable "<mission> tick #N", not the prompt).
+                let cron_tick = job_ctx
+                    .metadata
+                    .get("cron_mode")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 all_jobs.insert(
                     job_id,
                     serde_json::json!({
@@ -2320,6 +2343,7 @@ impl Tool for ListJobsTool {
                         "status": format!("{:?}", job_ctx.state),
                         "created_at": job_ctx.created_at.to_rfc3339(),
                         "source": "live",
+                        "cron_tick": cron_tick,
                     }),
                 );
             }
@@ -2357,6 +2381,10 @@ impl Tool for ListJobsTool {
 
         let mut jobs: Vec<_> = all_jobs
             .into_values()
+            // Cron-mission ticks are machine-generated at up to one row per
+            // schedule fire; without this filter they fill the 100-row window
+            // and hide ordinary jobs within hours (WI#370).
+            .filter(|job| include_cron || !job["cron_tick"].as_bool().unwrap_or(false))
             .filter(|job| job_matches_filter(filter, job["status"].as_str().unwrap_or_default()))
             .collect();
         jobs.sort_by(|left, right| {
