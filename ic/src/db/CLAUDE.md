@@ -65,6 +65,40 @@ are optional overrides.
   a note here.
 - Do not regress existing libSQL coverage.
 
+## Cron tick retention primitives (WI#370, v2.1.6.0)
+
+`SandboxStore` carries two methods backing the cron supervisor's per-mission
+retention sweep. Both backends implement them; no schema change is involved.
+
+- `list_cron_mission_ticks(user_id, job_mode, title_prefix)` — the mission's
+  tick rows, newest first. Matching is a prefix test on the bound parameter
+  (PostgreSQL `starts_with` on bytes; libSQL `substr`/`length`, which counts
+  TEXT characters — the same result for this comparison) — never LIKE, so no
+  wildcard escaping exists to get wrong. Tick rows are identified by the
+  supervisor-authored prompt-title prefix (`cron_worker::
+  cron_tick_title_prefix`), scoped to the mission worker's `job_mode` and the
+  owner; ordinary jobs, other missions' ticks, and other owners' rows are
+  never returned. `create_job` refuses an ordinary task starting with that
+  reserved opening, so no caller can forge the marker.
+- `delete_sandbox_job_cascade(job_id)` — deletes the row's `job_events` first,
+  then the `agent_jobs` row (`AND source = 'sandbox'`), because
+  `job_events.job_id` references `agent_jobs(id)` with **no** `ON DELETE
+  CASCADE`. A row-first delete would violate the FK. Returns whether the job
+  row existed. `job_actions`/`llm_calls`/`estimation_snapshots` cascade on the
+  row delete themselves. Two operational notes (LW-10): the delete is two
+  autocommit statements, not one transaction — a row delete failing after its
+  event delete leaves the row without events until the next sweep; and
+  because `llm_calls` cascade with the row, `user_usage_stats`/
+  `user_summary_stats` aggregates (built from `llm_calls`) shrink if tick jobs
+  ever record LLM calls — usage reporting does not preserve swept ticks.
+
+The PostgreSQL FK semantics (event-for-missing-row refused; delete order;
+re-delete idempotency; listing scoping) are pinned by
+`ic/tests/postgres_cron_retention.rs`, which runs in the
+`rust-test-postgres-integration` CI lane — the generic
+`external_worker_integration` target is auto-discovered only by the libSQL
+lane.
+
 ## Permission upgrade (V28 / WI#307)
 
 Both backends remove `tool_permissions.secret_delete` rows whose JSON value

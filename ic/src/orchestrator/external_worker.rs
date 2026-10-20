@@ -4650,6 +4650,7 @@ mod tests {
                 project_dir: None,
                 timezone: None,
                 tool_allowlist: grants.iter().map(|grant| grant.to_string()).collect(),
+                retain_last_ticks: None,
             }),
             ..ExternalWorkerConfig::test_config(name, url)
         }

@@ -1047,6 +1047,68 @@ impl Store {
         Ok(())
     }
 
+    /// List one cron mission's persisted tick rows, newest first (WI#370
+    /// retention). `starts_with` is a byte-prefix test, so the bound
+    /// `title_prefix` is matched literally — no LIKE wildcards to escape.
+    pub async fn list_cron_mission_ticks(
+        &self,
+        user_id: &str,
+        job_mode: &str,
+        title_prefix: &str,
+    ) -> Result<Vec<SandboxJobRecord>, DatabaseError> {
+        let conn = self.conn().await?;
+        let rows = conn
+            .query(
+                r#"
+                SELECT id, title, description, status, user_id, project_dir,
+                       success, failure_reason, created_at, started_at, completed_at,
+                       job_mode
+                FROM agent_jobs
+                WHERE source = 'sandbox' AND user_id = $1 AND job_mode = $2
+                  AND starts_with(title, $3)
+                ORDER BY created_at DESC, id DESC
+                "#,
+                &[&user_id, &job_mode, &title_prefix],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| SandboxJobRecord {
+                id: r.get("id"),
+                task: r.get("title"),
+                status: r.get("status"),
+                user_id: r.get("user_id"),
+                project_dir: r
+                    .get::<_, Option<String>>("project_dir")
+                    .unwrap_or_default(),
+                success: r.get("success"),
+                failure_reason: r.get("failure_reason"),
+                created_at: r.get("created_at"),
+                started_at: r.get("started_at"),
+                completed_at: r.get("completed_at"),
+                credential_grants_json: r.get::<_, String>("description"),
+                job_mode: r.get("job_mode"),
+            })
+            .collect())
+    }
+
+    /// Delete one sandbox job row together with its `job_events` (WI#370
+    /// retention). Events go first because `job_events.job_id` has no
+    /// `ON DELETE CASCADE`; `job_actions`/`llm_calls`/
+    /// `estimation_snapshots` cascade on the row delete.
+    pub async fn delete_sandbox_job_cascade(&self, job_id: Uuid) -> Result<bool, DatabaseError> {
+        let conn = self.conn().await?;
+        conn.execute("DELETE FROM job_events WHERE job_id = $1", &[&job_id])
+            .await?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM agent_jobs WHERE id = $1 AND source = 'sandbox'",
+                &[&job_id],
+            )
+            .await?;
+        Ok(deleted > 0)
+    }
+
     /// Get the job_mode for a sandbox job.
     pub async fn get_sandbox_job_mode(&self, id: Uuid) -> Result<Option<String>, DatabaseError> {
         let conn = self.conn().await?;

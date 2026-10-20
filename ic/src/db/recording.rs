@@ -147,6 +147,19 @@ impl SandboxStore for RecordingDb {
     ) -> Result<Vec<JobEventRecord>, DatabaseError> {
         self.inner.list_job_events(job_id, limit).await
     }
+    async fn list_cron_mission_ticks(
+        &self,
+        user_id: &str,
+        job_mode: &str,
+        title_prefix: &str,
+    ) -> Result<Vec<SandboxJobRecord>, DatabaseError> {
+        self.inner
+            .list_cron_mission_ticks(user_id, job_mode, title_prefix)
+            .await
+    }
+    async fn delete_sandbox_job_cascade(&self, job_id: Uuid) -> Result<bool, DatabaseError> {
+        self.inner.delete_sandbox_job_cascade(job_id).await
+    }
 }
 
 #[async_trait]
@@ -559,6 +572,19 @@ impl SandboxStore for FaultingSettingsDb {
         limit: Option<i64>,
     ) -> Result<Vec<JobEventRecord>, DatabaseError> {
         self.inner.list_job_events(job_id, limit).await
+    }
+    async fn list_cron_mission_ticks(
+        &self,
+        user_id: &str,
+        job_mode: &str,
+        title_prefix: &str,
+    ) -> Result<Vec<SandboxJobRecord>, DatabaseError> {
+        self.inner
+            .list_cron_mission_ticks(user_id, job_mode, title_prefix)
+            .await
+    }
+    async fn delete_sandbox_job_cascade(&self, job_id: Uuid) -> Result<bool, DatabaseError> {
+        self.inner.delete_sandbox_job_cascade(job_id).await
     }
 }
 
