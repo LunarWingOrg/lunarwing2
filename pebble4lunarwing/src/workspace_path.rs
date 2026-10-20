@@ -54,6 +54,26 @@ pub(crate) fn workspace_paths_overlap(left: &Path, right: &Path) -> bool {
     left.strip_prefix(right).is_ok() || right.strip_prefix(left).is_ok()
 }
 
+// WI#444: deterministic DS-1 test hook — a test installs a one-shot callback
+// that fires between the descriptor walk and the path re-resolve inside
+// `create_cron_workspace`, so the in-root redirect swap happens at exactly
+// that point on every run (no race window, no time budget). Thread-local so
+// parallel tests cannot cross-fire; compiled out of non-test builds.
+#[cfg(test)]
+thread_local! {
+    static PRE_RERESOLVE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_pre_reresolve_hook() {
+    PRE_RERESOLVE_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
 /// Bootstrap a cron mission directory using held directory descriptors.
 /// Linux workers provide /proc/self/fd; `O_NOFOLLOW` rejects symlink components
 /// before the next mkdir, including swaps by another task in the workspace.
@@ -119,6 +139,8 @@ fn create_cron_workspace(path: &str, workspace_root: &Path) -> io::Result<PathBu
         }
         parent = opened;
     }
+    #[cfg(test)]
+    run_pre_reresolve_hook();
     let resolved = resolve_workspace_path(path, &root)?;
     // WI#375 DS-1: the descriptor walk and the re-resolved path must name
     // the same directory — a dev/ino mismatch means an in-root redirect
@@ -575,6 +597,60 @@ mod tests {
                 "DS-1 race window never hit within the time budget (harness liveness only; no redirect was returned)"
             );
         }
+    }
+
+    /// WI#444: deterministic DS-1 pin — the thread-local hook fires between
+    /// the descriptor walk and the re-resolve, swapping `missions` for a
+    /// symlink to the decoy (which already contains "x"), so the dev/ino
+    /// re-check must refuse on every run — no race window, no time budget.
+    /// Mutation target: removing the compare returns the decoy path (Ok)
+    /// and this test fails.
+    #[test]
+    fn cron_bootstrap_refuses_hooked_in_root_redirect_deterministically() {
+        let root = temp_root("cron-ds1-hook")
+            .canonicalize()
+            .expect("canonical root");
+        let link = root.join("missions");
+        let decoy = root.join("decoy");
+        std::fs::create_dir(&link).expect("create missions dir");
+        std::fs::create_dir_all(decoy.join("x")).expect("create decoy/x");
+        let (hook_link, hook_decoy) = (link.clone(), decoy.clone());
+        PRE_RERESOLVE_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                std::fs::remove_dir_all(&hook_link).expect("remove walked missions dir");
+                std::os::unix::fs::symlink(&hook_decoy, &hook_link)
+                    .expect("swap missions to the decoy symlink");
+            }));
+        });
+        let context = crate::protocol::TaskContext {
+            project_dir: Some("missions/x".to_string()),
+            cron_tick: Some(serde_json::json!({"event":"cron.tick"})),
+            ..Default::default()
+        };
+        let error = resolve_task_workspace(&context, &root).expect_err("DS-1 refusal must fire");
+        assert!(
+            error.to_string().contains("resolved path changed"),
+            "expected the dev/ino mismatch refusal, got: {error}"
+        );
+        // DS-2: the redirect refusal is transient — the retry re-walks.
+        assert!(
+            error.to_string().contains("Transient workspace error"),
+            "refusal must classify transient, got: {error}"
+        );
+        PRE_RERESOLVE_HOOK.with(|slot| {
+            assert!(slot.borrow().is_none(), "hook must fire exactly once");
+        });
+        // The redirect is never returned: the decoy holds only its planted
+        // "x" and gains no new entries.
+        assert_eq!(
+            std::fs::read_dir(&decoy)
+                .expect("read decoy")
+                .filter_map(std::result::Result::ok)
+                .count(),
+            1,
+            "decoy must not gain entries"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// WI#400 run-164 KW-4: a cron tick whose leaf the bootstrap just created
