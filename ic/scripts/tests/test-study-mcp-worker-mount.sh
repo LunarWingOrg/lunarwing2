@@ -60,6 +60,12 @@ _ctr() {
 
 study_home="$fixture/study-notes"
 study_state="$(tenant_state_dir test)/study-notes"
+# WI#445 LV-8: the fixture home stands in for the operator default so the
+# real trust gate accepts the trusted mounts pinned below (fixture trees
+# are user-owned, never root-owned); the untrusted-home pin further down
+# overrides the env value to a non-default home and expects no mount.
+# shellcheck disable=SC2034
+STUDY_NOTES_DEFAULT_HOME="$study_home"
 mkdir -p \
   "$study_home/agent-notes-by-agent" \
   "$study_home/skills/study-notes" \
@@ -203,6 +209,42 @@ if grep -Eq 'stale-model|stale\.example' "$opencode_unit"; then
 fi
 if grep -q 'LW2STUDYMCP_ALLOW_WRITE' "$opencode_unit"; then
   printf 'Core Study Notes write settings leaked into OpenCode quadlet\n' >&2
+  exit 1
+fi
+
+# WI#445 LV-8: a tenant-chosen home that is neither the operator default
+# nor under a root-owned anchor must not be mounted into the worker at all —
+# root renders the mount source, and on rootful runtimes root performs the
+# bind mount (and the :z relabel) under it.
+untrusted_home="$fixture/study-notes-untrusted"
+mkdir -p "$untrusted_home/agent-notes-by-agent" "$untrusted_home/skills/study-notes"
+touch \
+  "$untrusted_home/study_notes_mcp.py" \
+  "$untrusted_home/memorydb.py" \
+  "$untrusted_home/skills/study-notes/SKILL.md"
+cp "$study_home/agent-notes.sqlite3" "$untrusted_home/agent-notes.sqlite3"
+env_file="$(tenant_env_dir test)/lunarwing.env"
+{ grep -v '^LW2STUDYMCP_HOME=' "$env_file"; printf 'LW2STUDYMCP_HOME=%s\n' "$untrusted_home"; } \
+  >"$fixture/env.swap"
+cat "$fixture/env.swap" >"$env_file"
+rm -f "$fixture/env.swap"
+: > "$ctr_calls"
+start_tenant_opencode test
+if grep -Fq -- "-v $untrusted_home" "$ctr_calls"; then
+  printf 'OpenCode mounted an untrusted Study Notes home\n' >&2
+  exit 1
+fi
+if grep -Fq -- '-e LW2STUDYMCP_HOME=' "$ctr_calls"; then
+  printf 'OpenCode container env carried an untrusted Study Notes home\n' >&2
+  exit 1
+fi
+if grep -Fq -- "-v $study_state" "$ctr_calls"; then
+  printf 'OpenCode mounted Study Notes state under an untrusted home\n' >&2
+  exit 1
+fi
+render_worker_quadlet test opencode 8443
+if grep -q 'LW2STUDYMCP' "$opencode_unit"; then
+  printf 'OpenCode quadlet rendered Study Notes for an untrusted home\n' >&2
   exit 1
 fi
 

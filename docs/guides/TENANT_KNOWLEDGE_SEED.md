@@ -191,6 +191,18 @@ without importing directly, run `sync-knowledge-sources`.
 - **Missing checkout retries.** If the checkout directory is not present at
   startup, the pass is skipped with a warning and retried on the next startup
   (no marker is written).
+- **Tenant-chosen sync homes are trust-gated (WI#445).** The host-side
+  scheduler and `refresh-knowledge --sync-source` read `LW2STUDYMCP_HOME`
+  from each tenant's own env, so a home is only synced when it is the
+  operator default (`STUDY_NOTES_DEFAULT_HOME`) or a path without `.`/`..`
+  components whose deepest existing ancestor chain is root-owned,
+  symlink-free, and not group/other-writable. An untrusted home skips just
+  that tenant with a warning (the hourly run never aborts on one bad value);
+  the explicit `--sync-source` form dies instead of syncing under it, and
+  the worker containers render no Study Notes mount for it at all (the
+  worker starts without Study Notes). An existing checkout is only
+  fast-forwarded when its configured `origin` is exactly the operator's
+  `STUDY_NOTES_REPO`.
 
 ## Verification
 

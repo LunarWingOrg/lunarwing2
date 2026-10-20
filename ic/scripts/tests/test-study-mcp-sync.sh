@@ -100,9 +100,10 @@ fi
 git -C "$STUDY_NOTES_DEFAULT_HOME" checkout -q -- study_notes_mcp.py
 sync_study_notes_checkout "$STUDY_NOTES_DEFAULT_HOME"
 retained_revision="$(jq -r '.source_revision' "$manifest")"
-# git pull reads the checkout's own origin, not STUDY_NOTES_REPO, so make the
-# remote itself unreachable to simulate a transient network failure.
-git -C "$STUDY_NOTES_DEFAULT_HOME" remote set-url origin "$fixture/nonexistent-origin.git"
+# The checkout's origin must equal STUDY_NOTES_REPO (pinned below), so a
+# transient upstream failure is simulated by making the origin repository
+# itself unreachable while its configured URL stays the operator's.
+mv "$STUDY_NOTES_REPO" "$fixture/origin-away"
 if sync_study_notes_checkout "$STUDY_NOTES_DEFAULT_HOME" 2>/dev/null; then
   printf 'Study Notes sync unexpectedly succeeded with an unreachable upstream\n' >&2
   exit 1
@@ -119,8 +120,38 @@ fi
   printf 'stale last-good marker left behind after restoration\n' >&2
   exit 1
 }
-# Restore the reachable remote for the later provision/scheduler assertions.
+mv "$fixture/origin-away" "$STUDY_NOTES_REPO"
+
+# WI#445 LV-9: an existing checkout may only follow the operator's repo — the
+# pull must be refused before it runs when the configured origin differs, and
+# nothing in the checkout may change. (a rogue repo with real commits makes
+# the refusal provably the origin gate, not an upstream reachability artifact)
+rogue_origin="$fixture/rogue-origin"
+git init -q -b main "$rogue_origin"
+printf 'rogue finding\n' >"$rogue_origin/rogue-topic.md"
+git -C "$rogue_origin" add -A
+git_commit "$rogue_origin" rogue
+git -C "$STUDY_NOTES_DEFAULT_HOME" remote set-url origin "$rogue_origin"
+if rogue_err="$(sync_study_notes_checkout "$STUDY_NOTES_DEFAULT_HOME" 2>&1)"; then
+  printf 'Study Notes sync pulled from a rogue origin\n' >&2
+  exit 1
+fi
+[[ "$rogue_err" == *"origin does not match STUDY_NOTES_REPO"* ]] || {
+  printf 'rogue-origin refusal did not name the origin mismatch:\n%s\n' "$rogue_err" >&2
+  exit 1
+}
+[[ ! -e "$STUDY_NOTES_DEFAULT_HOME/agent-notes-by-agent/rogue-topic.md" ]] || {
+  printf 'Study Notes sync wrote rogue-origin content into the checkout\n' >&2
+  exit 1
+}
+[[ ! -e "$manifest" ]] || {
+  printf 'rogue-origin refusal left a published generation behind\n' >&2
+  exit 1
+}
+# Restore the operator remote and republish for the later scheduler pins.
 git -C "$STUDY_NOTES_DEFAULT_HOME" remote set-url origin "$STUDY_NOTES_REPO"
+sync_study_notes_checkout "$STUDY_NOTES_DEFAULT_HOME"
+test -f "$manifest"
 
 # A non-git directory is never modified by the sync.
 mkdir -p "$fixture/not-git"
@@ -285,6 +316,10 @@ jq '.tenants.yeson = {} | .tenants.mixedcase = {}' "$PORTS_REGISTRY" >"$PORTS_RE
 mv "$PORTS_REGISTRY.tmp" "$PORTS_REGISTRY"
 warnings="$(
   say() { printf 'SAY: %s\n' "$*"; }
+  # WI#445: the enable-filter pins run with the root-owned anchor validator
+  # stubbed so the fixture's user-writable non-default homes stay syncable;
+  # the trust gate itself carries dedicated pins further down.
+  darkirc_validate_root_owned_directory() { return 0; }
   sync_enabled_study_notes_sources
 )"
 grep -Fqx 'filter finding' \
@@ -305,6 +340,108 @@ grep -Fqx 'filter finding' \
   exit 1
 }
 
+# WI#445: the root-side sync never follows a tenant-chosen LW2STUDYMCP_HOME
+# into root filesystem operations unless it is the operator default or its
+# deepest existing ancestor chain is root-owned, symlink-free, and not
+# group/other-writable. The gate is pinned at the unit level first (fixture
+# trees live under user-writable directories, so an explicitly group-writable
+# anchor makes the untrusted shape deterministic for every uid), then the
+# hourly scheduler and the explicit refresh path are exercised through it.
+mkdir -p "$fixture/untrusted-anchor"
+chmod 0777 "$fixture/untrusted-anchor"
+# The operator default is always trusted, even when the anchor rules would
+# refuse the path (the equality check short-circuits before the walk).
+(
+  darkirc_validate_root_owned_directory() { return 1; }
+  study_notes_sync_home_trusted "$STUDY_NOTES_DEFAULT_HOME"
+) || { printf 'the default Study Notes home must always be trusted\n' >&2; exit 1; }
+for untrusted_home in relative/path "/has space" "$fixture/untrusted-anchor/chosen"; do
+  if study_notes_sync_home_trusted "$untrusted_home"; then
+    printf 'Study Notes sync unexpectedly trusted home: %s\n' "$untrusted_home" >&2
+    exit 1
+  fi
+done
+# The anchor walk stops at the deepest existing ancestor, so the validator
+# judges exactly the chain the sync would create missing directories under.
+mkdir -p "$fixture/anchor-unit"
+anchor="$(
+  darkirc_validate_root_owned_directory() { printf '%s\n' "$1"; return 0; }
+  study_notes_sync_home_trusted "$fixture/anchor-unit/a/b"
+)"
+[[ "$anchor" == "$fixture/anchor-unit" ]] || {
+  printf 'anchor walk did not stop at the deepest existing ancestor: %s\n' "$anchor" >&2
+  exit 1
+}
+# A "." or ".." component in the missing tail must be refused before the
+# walk (pinned with the validator stubbed to accept, so only the component
+# check can refuse; run-174 LV-7).
+for dotted_home in "$fixture/anchor-unit/x/../../untrusted-anchor/chosen" "$fixture/anchor-unit/./chosen"; do
+  if (
+    darkirc_validate_root_owned_directory() { return 0; }
+    study_notes_sync_home_trusted "$dotted_home"
+  ); then
+    printf 'Study Notes sync trusted a home with a dot component: %s\n' "$dotted_home" >&2
+    exit 1
+  fi
+done
+# A symlink in the chain stops the walk and the real validator refuses it
+# (a dangling link must not be followed to its target's parent).
+ln -s "$fixture/anchor-unit/missing-target" "$fixture/anchor-unit/dangling"
+if study_notes_sync_home_trusted "$fixture/anchor-unit/dangling/deeper"; then
+  printf 'Study Notes sync trusted a path through a symlink\n' >&2
+  exit 1
+fi
+
+# One tenant's untrusted or malformed home must skip only that tenant: the
+# hourly run survives (the shared default home still fast-forwards) and no
+# root filesystem operation ever touches the untrusted paths.
+mkdir -p "$(tenant_env_dir trustskip)" "$(tenant_env_dir badshape)"
+chmod 700 "$(tenant_env_dir trustskip)" "$(tenant_env_dir badshape)"
+printf 'LW2STUDYMCP_HOME=%s\nKNOWLEDGE_SYNC_ENABLED=true\n' \
+  "$fixture/untrusted-anchor/trustskip-home" >"$(tenant_env_dir trustskip)/lunarwing.env"
+printf 'LW2STUDYMCP_HOME=relative/path\nKNOWLEDGE_SYNC_ENABLED=true\n' \
+  >"$(tenant_env_dir badshape)/lunarwing.env"
+chmod 600 "$(tenant_env_dir trustskip)/lunarwing.env" "$(tenant_env_dir badshape)/lunarwing.env"
+jq '.tenants.trustskip = {} | .tenants.badshape = {}' "$PORTS_REGISTRY" >"$PORTS_REGISTRY.tmp"
+mv "$PORTS_REGISTRY.tmp" "$PORTS_REGISTRY"
+printf 'trust finding\n' > "$STUDY_NOTES_REPO/agent-notes-by-agent/test-agent/trust.md"
+git -C "$STUDY_NOTES_REPO" add -A
+git_commit "$STUDY_NOTES_REPO" trust
+trust_warnings="$(
+  say() { printf 'SAY: %s\n' "$*"; }
+  sync_enabled_study_notes_sources
+)"
+grep -Fqx 'trust finding' \
+  "$STUDY_NOTES_DEFAULT_HOME/agent-notes-by-agent/test-agent/trust.md" || {
+  printf 'an untrusted tenant home aborted the hourly sync for every tenant\n' >&2
+  exit 1
+}
+[[ ! -e "$fixture/untrusted-anchor/trustskip-home" ]] || {
+  printf 'the hourly sync ran root filesystem operations under an untrusted home\n' >&2
+  exit 1
+}
+[[ "$trust_warnings" == *trustskip* && "$trust_warnings" == *badshape* ]] || {
+  printf 'untrusted Study Notes homes were not reported\n' >&2
+  exit 1
+}
+
+# The explicit operator path dies instead of syncing an untrusted home.
+mkdir -p "$(tenant_env_dir refrefresh)"
+chmod 700 "$(tenant_env_dir refrefresh)"
+printf 'LW2STUDYMCP_HOME=%s\n' "$fixture/untrusted-anchor/refrefresh-home" \
+  >"$(tenant_env_dir refrefresh)/lunarwing.env"
+chmod 600 "$(tenant_env_dir refrefresh)/lunarwing.env"
+jq '.tenants.refrefresh = {}' "$PORTS_REGISTRY" >"$PORTS_REGISTRY.tmp"
+mv "$PORTS_REGISTRY.tmp" "$PORTS_REGISTRY"
+if ( run_tenant_knowledge_refresh refrefresh true ) 2>/dev/null; then
+  printf 'refresh-knowledge --sync-source accepted an untrusted home\n' >&2
+  exit 1
+fi
+[[ ! -e "$fixture/untrusted-anchor/refrefresh-home" ]] || {
+  printf 'refresh-knowledge --sync-source ran root operations under an untrusted home\n' >&2
+  exit 1
+}
+
 # CLI surface pins: add-tenant(s) auto-configure flags and configure-study-mcp sync.
 # (SCRIPT_DIR is redefined by the sourced script to ic/scripts.)
 grep -Fq -- '--with-study-mcp' "$SCRIPT_DIR/lunarwing-mt-admin.sh"
@@ -313,6 +450,12 @@ grep -Fq -- '--sync) study_sync="true"; shift ;;' "$SCRIPT_DIR/lunarwing-mt-admi
 grep -Fq -- '--enable-knowledge-sync)' "$SCRIPT_DIR/lunarwing-mt-admin.sh"
 grep -Fq 'refresh-knowledge)' "$SCRIPT_DIR/lunarwing-mt-admin.sh"
 grep -Fq 'sync-knowledge-sources)' "$SCRIPT_DIR/lunarwing-mt-admin.sh"
+# Both root-side sync entrypoints carry the WI#445 trust gate.
+[[ "$(grep -Fc 'study_notes_sync_home_trusted "$home"' \
+  "$SCRIPT_DIR/mt-admin-lib/14-knowledge-sync.sh")" -eq 2 ]] || {
+  printf 'a root-side sync entrypoint lost the WI#445 trust gate\n' >&2
+  exit 1
+}
 # The add_tenant wiring call moved to the lifecycle library in the mt-admin split.
 grep -Fq 'provision_tenant_study_mcp "$name" "$study_mcp_home"' \
   "$SCRIPT_DIR/mt-admin-lib/04-tenant-lifecycle.sh"

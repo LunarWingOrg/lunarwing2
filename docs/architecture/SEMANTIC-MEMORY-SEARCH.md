@@ -359,7 +359,15 @@ limitation of the seed. A host-side scheduler (`ensure_knowledge_source_schedule
 mt-admin module `14-knowledge-sync.sh`) fast-forwards the published Study Notes
 checkout and writes a generation manifest
 (`.git/lunarwing-study-notes-generation.json`) only after a clean,
-validated checkout. Tenant daemons poll that manifest on their own cadence
+validated checkout. The scheduler and `refresh-knowledge --sync-source`
+trust a tenant-chosen `LW2STUDYMCP_HOME` only when it is the operator
+default or a path without `.`/`..` components whose deepest existing
+ancestor chain is root-owned, symlink-free, and not group/other-writable
+(WI#445); an untrusted home is skipped (hourly) or refused (`--sync-source`)
+before any root-side filesystem operation runs under it, the worker
+containers render no Study Notes mount for it at all, and an existing
+checkout whose `origin` is not the operator repo is never pulled. Tenant
+daemons poll that manifest on their own cadence
 (`KNOWLEDGE_SYNC_ENABLED`, default false; `KNOWLEDGE_SYNC_CADENCE_HOURS`,
 default 6; `KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN`, default 500;
 `KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN`, default 10 MiB) and import missing paths
