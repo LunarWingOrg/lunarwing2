@@ -96,7 +96,9 @@ section and "Launch identity (WI#422)" further down.
   The pinned identities are validated everywhere they parse (the TS
   `taskIdentity()` helpers, both entrypoints, the pebble executor): zero or
   non-numeric ids fail closed, because a zero id would make the drop a
-  no-op while callers keep treating the split as active (run-171 LP-17).
+  no-op while callers keep treating the split as active (LP-17 — added to
+  the WI#400 description 2026-10-20, numbered after the run-170 LP series;
+  the helpers also refuse partially numeric ids like `1000x`, LV-18).
   Kimi task-side setup (`entrypoint-task-setup.sh`) runs as the task uid —
   never as root — because everything it writes (`~/.gitconfig`, `~/.ssh`,
   `$KIMI_CODE_HOME`) is task state.
@@ -611,7 +613,9 @@ re-checked 2026-10-13):
   spawned pebble process to the task uid via setpriv, so the bridge
   binary and its root-owned state are out of the agent's reach on the
   rootless lane; the rootful launch runs the whole container as the
-  tenant uid ("Launch identity (WI#422)"). Residual: `self-update` still
+  tenant uid ("Launch identity (WI#422)") — there the agent shares the
+  bridge's uid, so it can still signal or trace the bridge and read its
+  environment (no split, by design per WI#422). Residual: `self-update` still
   fetches over the network from the (now unprivileged) task uid, so the
   real fix for that half remains control 1 (egress allowlist). Keep the
   pinned `PEBBLE_LOCK_SHA256` build contract intact.

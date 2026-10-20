@@ -99,10 +99,12 @@ surface; its one outbound footgun is `pebble self-update` (fetches GitHub
 releases and replaces the binary). The image pins `USER 0:0` and every
 spawned pebble process drops to the task uid via setpriv (WI#400 — see
 "Task-uid split (WI#400)" in `docs/ops/WORKER-CONTAINERS.md`; the rootful
-launch runs the whole container as the tenant uid, WI#422), so the agent
+launch runs the whole container as the tenant uid, WI#422 — on that lane
+the agent shares the bridge's uid and can still signal or trace the
+bridge and read its environment; no split, by design), so the agent
 no longer runs as container root and cannot replace the root-owned bridge
-binary — `self-update` remains an egress concern for the (unprivileged)
-task uid. Keep the pinned `PEBBLE_LOCK_SHA256` build contract intact; the
+binary on the rootless lane — `self-update` remains an egress concern for
+the (unprivileged) task uid. Keep the pinned `PEBBLE_LOCK_SHA256` build contract intact; the
 real fix for the egress half is the deferred egress allowlist
 (WI#357 control 1). Full policy, controls, and the per-bump checklist:
 `docs/ops/WORKER-CONTAINERS.md` → "Worker exposure policy (WI#357)".
