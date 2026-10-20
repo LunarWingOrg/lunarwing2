@@ -1954,8 +1954,8 @@ async fn run_retention_sweep(ctx: &TickCtx<'_>) {
     let Some(db) = ctx.manager.store_handle() else {
         return;
     };
-    let job_mode = crate::orchestrator::job_manager::JobMode::External(ctx.worker.name.clone())
-        .db_value();
+    let job_mode =
+        crate::orchestrator::job_manager::JobMode::External(ctx.worker.name.clone()).db_value();
     let ticks = match db
         .list_cron_mission_ticks(
             ctx.owner_id,

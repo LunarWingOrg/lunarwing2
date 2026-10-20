@@ -4884,7 +4884,10 @@ async fn cron_paused_tick_end_event_persists() {
         .await
         .expect("status");
     assert!(status.paused);
-    assert_eq!(status.consecutive_abandoned, 0, "a paused tick is resolved, not abandoned");
+    assert_eq!(
+        status.consecutive_abandoned, 0,
+        "a paused tick is resolved, not abandoned"
+    );
 }
 
 /// WI#370 outcome matrix: exhausting the busy-retry budget persists
@@ -4983,7 +4986,10 @@ async fn seed_tick_row(
     let created = chrono::Utc::now() - chrono::Duration::seconds(age_secs);
     db.save_sandbox_job(&lunarwing::history::SandboxJobRecord {
         id,
-        task: format!("{}, firing on cron schedule 'seeded'", cron_tick_title_prefix(mission)),
+        task: format!(
+            "{}, firing on cron schedule 'seeded'",
+            cron_tick_title_prefix(mission)
+        ),
         status: "completed".to_string(),
         user_id: owner.to_string(),
         project_dir: format!("missions/{mission}"),
@@ -4997,9 +5003,13 @@ async fn seed_tick_row(
     })
     .await
     .expect("seed tick row");
-    db.save_job_event(id, "cron_tick", &serde_json::json!({ "mission_id": mission }))
-        .await
-        .expect("seed cron_tick event");
+    db.save_job_event(
+        id,
+        "cron_tick",
+        &serde_json::json!({ "mission_id": mission }),
+    )
+    .await
+    .expect("seed cron_tick event");
     db.save_job_event(
         id,
         "cron_tick_end",
@@ -5067,11 +5077,7 @@ async fn cron_retention_startup_sweep_bounds_seeded_rows() {
     })
     .await;
     let mut config = cron_config_for(&url, 30, 0);
-    config
-        .cron
-        .as_mut()
-        .expect("cron block")
-        .retain_last_ticks = Some(1);
+    config.cron.as_mut().expect("cron block").retain_last_ticks = Some(1);
     let context_manager = Arc::new(ContextManager::new(16));
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(16);
     let mgr = Arc::new(
@@ -5102,17 +5108,26 @@ async fn cron_retention_startup_sweep_bounds_seeded_rows() {
     // The middle row is gone with its events (no orphans); the newest row
     // and the out-of-window anchor survive with theirs.
     assert!(
-        db.get_sandbox_job(middle).await.expect("middle row").is_none(),
+        db.get_sandbox_job(middle)
+            .await
+            .expect("middle row")
+            .is_none(),
         "the middle row is beyond keep(1) and is not the anchor"
     );
     assert!(
-        db.list_job_events(middle, None).await.expect("events").is_empty(),
+        db.list_job_events(middle, None)
+            .await
+            .expect("events")
+            .is_empty(),
         "deleted rows must not leave orphan job_events"
     );
     for kept in [newest, oldest] {
         assert!(db.get_sandbox_job(kept).await.expect("kept row").is_some());
         assert!(
-            !db.list_job_events(kept, None).await.expect("events").is_empty(),
+            !db.list_job_events(kept, None)
+                .await
+                .expect("events")
+                .is_empty(),
             "kept rows keep their events"
         );
     }
@@ -5147,11 +5162,7 @@ async fn cron_retention_after_each_tick_keeps_anchor_following() {
     })
     .await;
     let mut config = cron_config_for(&url, 30, 0);
-    config
-        .cron
-        .as_mut()
-        .expect("cron block")
-        .retain_last_ticks = Some(1);
+    config.cron.as_mut().expect("cron block").retain_last_ticks = Some(1);
     let context_manager = Arc::new(ContextManager::new(16));
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(16);
     let mgr = Arc::new(
@@ -5194,7 +5205,11 @@ async fn cron_retention_after_each_tick_keeps_anchor_following() {
     })
     .await
     .expect("post-tick retention never bounded the mission rows");
-    assert_eq!(ticks.len(), 1, "keep(1) with anchor == newest leaves one row");
+    assert_eq!(
+        ticks.len(),
+        1,
+        "keep(1) with anchor == newest leaves one row"
+    );
     assert_eq!(ticks[0].id, last_job);
     // The newest tick keeps its full supervisor record, and the anchor
     // setting points at it.

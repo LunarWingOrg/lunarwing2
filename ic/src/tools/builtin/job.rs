@@ -3634,6 +3634,85 @@ mod tests {
         assert!(hidden_events.is_err());
     }
 
+    /// WI#370: cron-mission tick rows are tagged `cron_tick` and hidden from
+    /// the 100-row listing by default (a mission adds up to 1,440 rows/day
+    /// at the schedule floor and hides ordinary jobs within hours);
+    /// `include_cron: true` lists them tagged.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn list_jobs_hides_cron_ticks_unless_included() {
+        use crate::orchestrator::cron_worker::cron_tick_title_prefix;
+        use crate::testing::TestHarnessBuilder;
+
+        let harness = TestHarnessBuilder::new().build().await;
+        let store = Arc::clone(&harness.db);
+        let manager = Arc::new(ContextManager::new(5));
+        let ordinary = Uuid::new_v4();
+        let tick = Uuid::new_v4();
+        for (id, task) in [
+            (ordinary, "Ordinary task-mode job".to_string()),
+            (
+                tick,
+                format!(
+                    "{}, firing on cron schedule '0 15 10 * * *'",
+                    cron_tick_title_prefix("test-mission")
+                ),
+            ),
+        ] {
+            store
+                .save_sandbox_job(&SandboxJobRecord {
+                    id,
+                    task,
+                    status: "completed".to_string(),
+                    user_id: "default".to_string(),
+                    project_dir: String::new(),
+                    success: Some(true),
+                    failure_reason: None,
+                    created_at: Utc::now(),
+                    started_at: None,
+                    completed_at: None,
+                    credential_grants_json: "[]".to_string(),
+                    job_mode: "external:mock".to_string(),
+                })
+                .await
+                .expect("seed job row");
+        }
+
+        let ctx = JobContext::default();
+        let tool = ListJobsTool::new(manager).with_store(store);
+        let listed = tool
+            .execute(serde_json::json!({}), &ctx)
+            .await
+            .expect("default listing");
+        let ids: Vec<_> = listed.result["jobs"]
+            .as_array()
+            .expect("jobs array")
+            .iter()
+            .map(|job| job["job_id"].as_str().expect("job_id").to_string())
+            .collect();
+        assert_eq!(ids, vec![ordinary.to_string()]);
+        // The summary still counts everything (status filters behave the
+        // same way), so totals do not silently change shape.
+        assert_eq!(listed.result["summary"]["completed"], 2);
+
+        let with_cron = tool
+            .execute(serde_json::json!({ "include_cron": true }), &ctx)
+            .await
+            .expect("include_cron listing");
+        let jobs = with_cron.result["jobs"].as_array().expect("jobs array");
+        assert_eq!(jobs.len(), 2);
+        let tick_entry = jobs
+            .iter()
+            .find(|job| job["job_id"] == tick.to_string().as_str())
+            .expect("tick entry present");
+        assert_eq!(tick_entry["cron_tick"], true);
+        let ordinary_entry = jobs
+            .iter()
+            .find(|job| job["job_id"] == ordinary.to_string().as_str())
+            .expect("ordinary entry present");
+        assert_eq!(ordinary_entry["cron_tick"], false);
+    }
+
     /// WI#263 review finding: the `partial_output` snapshot must survive a
     /// daemon restart. The DB fallback branch of job_status recovers it from
     /// the persisted `partial_output` job event written by

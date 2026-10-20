@@ -1096,16 +1096,10 @@ impl Store {
     /// retention). Events go first because `job_events.job_id` has no
     /// `ON DELETE CASCADE`; `job_actions`/`llm_calls`/
     /// `estimation_snapshots` cascade on the row delete.
-    pub async fn delete_sandbox_job_cascade(
-        &self,
-        job_id: Uuid,
-    ) -> Result<bool, DatabaseError> {
+    pub async fn delete_sandbox_job_cascade(&self, job_id: Uuid) -> Result<bool, DatabaseError> {
         let conn = self.conn().await?;
-        conn.execute(
-            "DELETE FROM job_events WHERE job_id = $1",
-            &[&job_id],
-        )
-        .await?;
+        conn.execute("DELETE FROM job_events WHERE job_id = $1", &[&job_id])
+            .await?;
         let deleted = conn
             .execute(
                 "DELETE FROM agent_jobs WHERE id = $1 AND source = 'sandbox'",
