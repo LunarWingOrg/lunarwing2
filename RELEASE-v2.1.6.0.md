@@ -848,10 +848,15 @@ refused tenant-side commit now fails `add-tenant`/`upgrade-tenant` instead
 of being swallowed. The root reads and writes WI#390 did not convert
 (`tenant_pg_password`, `resolve_worker_auth_token`, the study-notes mount
 sources) were converted by WI#423 (closed 2026-10-20), whose re-attempt
-also made every `resolve_worker_auth_token` caller fail closed and left its
-two follow-up owners open (WI#445, the root study-notes sync trusting a
-tenant-chosen `LW2STUDYMCP_HOME`; WI#446, root mkdir/chown/unit writes
-through tenant-controlled `~/.config`); the rootful pebble bind-source
+also made every `resolve_worker_auth_token` caller fail closed; its
+follow-up WI#445 (the root study-notes sync trusting a tenant-chosen
+`LW2STUDYMCP_HOME`) is closed too — both root-side sync entrypoints (the
+hourly `sync-knowledge-sources` scan and `refresh-knowledge --sync-source`)
+now accept only the operator default or a path whose deepest existing
+ancestor chain is root-owned, symlink-free, and not group/other-writable,
+and one untrusted tenant is skipped without aborting the hourly run, while
+WI#446 (root mkdir/chown/unit writes through tenant-controlled `~/.config`)
+remains open; the rootful pebble bind-source
 re-resolution WI#422 (closed 2026-10-20) is settled by the tenant-uid
 rootful launch — rootful pebble no longer runs as container root at all.
 WI#416 (partial — three of its six named sites): the trailing root `chown -R` in
@@ -1165,10 +1170,11 @@ v2.1.7.0; and WI#436 (v2.1.7.0 triage of the test-tenant failures — its
 first item, one failing note failing every hourly knowledge refresh and
 leaving `knowledge: critical`, is live in this release). The residual
 owners named in the sections above (WI#322, WI#333, WI#370, WI#383,
-WI#386, WI#387, WI#394) are open too, and so are the WI#423 re-attempt's
-two follow-ups: WI#445 (the root study-notes sync trusts a tenant-chosen
-`LW2STUDYMCP_HOME`) and WI#446 (root mkdir/chown/unit writes through
-tenant-controlled `~/.config`). WI#400's implementation landed this cycle
+WI#386, WI#387, WI#394) are open too, and so is the WI#423 re-attempt's
+follow-up WI#446 (root mkdir/chown/unit writes through tenant-controlled
+`~/.config`) — its sibling WI#445 (the root study-notes sync trusting a
+tenant-chosen `LW2STUDYMCP_HOME`) was closed this cycle by the root-side
+sync trust gate. WI#400's implementation landed this cycle
 (token file handoff + task-uid split on kimi/opencode/pebble, rootless
 lanes; the rootful pebble launch has no split by design); what stays open
 is its real-worker acceptance on rebuilt images and the opencode2 lane's
