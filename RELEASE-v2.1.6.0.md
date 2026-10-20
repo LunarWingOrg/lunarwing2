@@ -850,12 +850,15 @@ of being swallowed. The root reads and writes WI#390 did not convert
 sources) were converted by WI#423 (closed 2026-10-20), whose re-attempt
 also made every `resolve_worker_auth_token` caller fail closed; its
 follow-up WI#445 (the root study-notes sync trusting a tenant-chosen
-`LW2STUDYMCP_HOME`) is closed too — both root-side sync entrypoints (the
-hourly `sync-knowledge-sources` scan and `refresh-knowledge --sync-source`)
-now accept only the operator default or a path whose deepest existing
-ancestor chain is root-owned, symlink-free, and not group/other-writable,
-and one untrusted tenant is skipped without aborting the hourly run, while
-WI#446 (root mkdir/chown/unit writes through tenant-controlled `~/.config`)
+`LW2STUDYMCP_HOME`) is fixed in-tree, open for maintainer acceptance — both
+root-side sync entrypoints (the hourly `sync-knowledge-sources` scan and
+`refresh-knowledge --sync-source`) now accept only the operator default or a
+path without `.`/`..` components whose deepest existing ancestor chain is
+root-owned, symlink-free, and not group/other-writable, one untrusted tenant
+is skipped without aborting the hourly run, an existing checkout whose
+`origin` is not the operator repo is never pulled, and the worker containers
+render no Study Notes mount at all for an untrusted home, while WI#446
+(root mkdir/chown/unit writes through tenant-controlled `~/.config`)
 remains open; the rootful pebble bind-source
 re-resolution WI#422 (closed 2026-10-20) is settled by the tenant-uid
 rootful launch — rootful pebble no longer runs as container root at all.
@@ -1173,8 +1176,9 @@ owners named in the sections above (WI#322, WI#333, WI#370, WI#383,
 WI#386, WI#387, WI#394) are open too, and so is the WI#423 re-attempt's
 follow-up WI#446 (root mkdir/chown/unit writes through tenant-controlled
 `~/.config`) — its sibling WI#445 (the root study-notes sync trusting a
-tenant-chosen `LW2STUDYMCP_HOME`) was closed this cycle by the root-side
-sync trust gate. WI#400's implementation landed this cycle
+tenant-chosen `LW2STUDYMCP_HOME`) is fixed in-tree this cycle by the
+root-side sync trust gate, the rogue-origin pull refusal, and the
+worker-mount trust gate (open for maintainer acceptance). WI#400's implementation landed this cycle
 (token file handoff + task-uid split on kimi/opencode/pebble, rootless
 lanes; the rootful pebble launch has no split by design); what stays open
 is its real-worker acceptance on rebuilt images and the opencode2 lane's
@@ -1214,7 +1218,8 @@ closed on 2026-10-19, without notes. WI#422 (the rootful pebble
 re-resolution — rootful pebble now launches as the tenant uid under
 `no-new-privileges`, no credential split by design), WI#423 (mt-admin's
 remaining root reads/writes of tenant-writable env paths; its re-attempt's
-follow-ups WI#445/WI#446 are open), and WI#389 (the docker/podman group is
+follow-up WI#446 remains open; WI#445, the study-notes sync trust gate,
+is fixed in-tree pending acceptance), and WI#389 (the docker/podman group is
 now opt-in everywhere, defaults off — rootless podman never needed it) were
 closed on 2026-10-20.
 
