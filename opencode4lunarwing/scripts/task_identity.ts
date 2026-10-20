@@ -21,8 +21,8 @@ export function taskIdentity(): TaskIdentity | null {
   }
   const uid = Number.parseInt(uidRaw, 10)
   const gid = Number.parseInt(gidRaw, 10)
-  if (!Number.isInteger(uid) || uid < 0 || !Number.isInteger(gid) || gid < 0) {
-    throw new Error(`OPENCODE_TASK_UID/OPENCODE_TASK_GID must be numeric ids (got uid=${uidRaw}, gid=${gidRaw})`)
+  if (!Number.isInteger(uid) || uid <= 0 || !Number.isInteger(gid) || gid <= 0) {
+    throw new Error(`OPENCODE_TASK_UID/OPENCODE_TASK_GID must be non-zero numeric ids (a zero id would make the privilege drop a no-op) (got uid=${uidRaw}, gid=${gidRaw})`)
   }
   return { uid, gid }
 }
