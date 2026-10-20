@@ -850,8 +850,14 @@ of being swallowed. The root reads and writes WI#390 did not convert
 sources) were converted by WI#423 (closed 2026-10-20), whose re-attempt
 also made every `resolve_worker_auth_token` caller fail closed and left its
 two follow-up owners open (WI#445, the root study-notes sync trusting a
-tenant-chosen `LW2STUDYMCP_HOME`; WI#446, root mkdir/chown/unit writes
-through tenant-controlled `~/.config`); the rootful pebble bind-source
+tenant-chosen `LW2STUDYMCP_HOME`; and WI#446, root mkdir/chown/unit writes
+through tenant-controlled `~/.config` — its fix landed in-tree this cycle:
+every systemd unit/Quadlet render, the WeeChat home creation, the
+config-hash sidecar under `~/.config/lunarwing` and the add-tenant env-dir
+chmod now create and write tenant-side through `tenant_mkdir_p` and the
+tenant-side atomic writer, with fail-closed symlink-refusal pins in the
+weechat lifecycle and worker image-contract harnesses; the WI stays open
+for maintainer acceptance); the rootful pebble bind-source
 re-resolution WI#422 (closed 2026-10-20) is settled by the tenant-uid
 rootful launch — rootful pebble no longer runs as container root at all.
 WI#416 (partial — three of its six named sites): the trailing root `chown -R` in
@@ -1168,7 +1174,8 @@ owners named in the sections above (WI#322, WI#333, WI#370, WI#383,
 WI#386, WI#387, WI#394) are open too, and so are the WI#423 re-attempt's
 two follow-ups: WI#445 (the root study-notes sync trusts a tenant-chosen
 `LW2STUDYMCP_HOME`) and WI#446 (root mkdir/chown/unit writes through
-tenant-controlled `~/.config`). WI#400's implementation landed this cycle
+tenant-controlled `~/.config` — implemented in-tree this cycle, open only
+for maintainer acceptance). WI#400's implementation landed this cycle
 (token file handoff + task-uid split on kimi/opencode/pebble, rootless
 lanes; the rootful pebble launch has no split by design); what stays open
 is its real-worker acceptance on rebuilt images and the opencode2 lane's
@@ -1208,7 +1215,8 @@ closed on 2026-10-19, without notes. WI#422 (the rootful pebble
 re-resolution — rootful pebble now launches as the tenant uid under
 `no-new-privileges`, no credential split by design), WI#423 (mt-admin's
 remaining root reads/writes of tenant-writable env paths; its re-attempt's
-follow-ups WI#445/WI#446 are open), and WI#389 (the docker/podman group is
+follow-up WI#445 is open, and WI#446's fix is in-tree pending acceptance),
+and WI#389 (the docker/podman group is
 now opt-in everywhere, defaults off — rootless podman never needed it) were
 closed on 2026-10-20.
 
