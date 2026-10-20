@@ -4171,6 +4171,7 @@ fn cron_config_with_schedule(
             project_dir: None,
             timezone: None,
             tool_allowlist: Vec::new(),
+            retain_last_ticks: None,
         }),
         ..Default::default()
     }

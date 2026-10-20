@@ -2022,6 +2022,7 @@ mod tests {
             project_dir: None,
             timezone: None,
             tool_allowlist: Vec::new(),
+            retain_last_ticks: None,
         }
     }
 
