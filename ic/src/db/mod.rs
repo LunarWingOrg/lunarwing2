@@ -580,6 +580,23 @@ pub trait SandboxStore: Send + Sync {
         job_id: Uuid,
         limit: Option<i64>,
     ) -> Result<Vec<JobEventRecord>, DatabaseError>;
+    /// List one cron mission's persisted tick rows, newest first (WI#370
+    /// retention). Ticks are identified by the supervisor-authored prompt
+    /// title prefix — the row and its marker are written by the same INSERT,
+    /// so the marker cannot lag the row — scoped to the mission worker's
+    /// `job_mode` and the owning user: ordinary jobs and other missions'
+    /// ticks are never returned.
+    async fn list_cron_mission_ticks(
+        &self,
+        user_id: &str,
+        job_mode: &str,
+        title_prefix: &str,
+    ) -> Result<Vec<SandboxJobRecord>, DatabaseError>;
+    /// Delete one sandbox job row together with its `job_events` (WI#370
+    /// retention). `job_events.job_id` references `agent_jobs(id)` with no
+    /// `ON DELETE CASCADE`, so the events are deleted first — deleting the
+    /// row first would violate the FK. Returns whether the job row existed.
+    async fn delete_sandbox_job_cascade(&self, job_id: Uuid) -> Result<bool, DatabaseError>;
 }
 
 #[async_trait]
