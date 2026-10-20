@@ -21,9 +21,15 @@ export function taskIdentity(): TaskIdentity | null {
   if (uidRaw === undefined || gidRaw === undefined) {
     throw new Error("KIMI_TASK_UID and KIMI_TASK_GID must be set together")
   }
+  // LV-18: agree with the entrypoint's ^[1-9][0-9]*$ gate — parseInt alone
+  // accepts a partially numeric id ("1000x" parses as 1000) that the
+  // entrypoint refuses; the two layers must refuse the same shapes.
+  if (!/^[1-9][0-9]*$/.test(uidRaw) || !/^[1-9][0-9]*$/.test(gidRaw)) {
+    throw new Error(`KIMI_TASK_UID/KIMI_TASK_GID must be non-zero numeric ids (a zero id would make the privilege drop a no-op) (got uid=${uidRaw}, gid=${gidRaw})`)
+  }
   const uid = Number.parseInt(uidRaw, 10)
   const gid = Number.parseInt(gidRaw, 10)
-  if (!Number.isInteger(uid) || uid <= 0 || !Number.isInteger(gid) || gid <= 0) {
+  if (!Number.isInteger(uid) || !Number.isInteger(gid)) {
     throw new Error(`KIMI_TASK_UID/KIMI_TASK_GID must be non-zero numeric ids (a zero id would make the privilege drop a no-op) (got uid=${uidRaw}, gid=${gidRaw})`)
   }
   return { uid, gid }

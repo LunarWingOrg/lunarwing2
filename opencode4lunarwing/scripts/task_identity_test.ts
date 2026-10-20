@@ -36,4 +36,16 @@ assert.deepEqual(taskIdentity(), { uid: 10001, gid: 10001 })
 delete process.env.OPENCODE_TASK_UID
 delete process.env.OPENCODE_TASK_GID
 
+// WI#400 LV-18: parseInt("1000x") is 1000, so a partially numeric id must
+// fail closed too — the helper agrees with the entrypoint's ^[1-9][0-9]*$
+// gate (defence in depth; the entrypoint runs first and exports checked
+// values).
+for (const [uid, gid] of [["1000x", "10001"], ["10001", "1000x"], [" 10001", "10001"], ["10001", "10001 "]]) {
+  process.env.OPENCODE_TASK_UID = uid
+  process.env.OPENCODE_TASK_GID = gid
+  assert.throws(() => taskIdentity(), /non-zero numeric ids/, `uid=${uid} gid=${gid}`)
+  delete process.env.OPENCODE_TASK_UID
+  delete process.env.OPENCODE_TASK_GID
+}
+
 console.log("task identity self-check passed")

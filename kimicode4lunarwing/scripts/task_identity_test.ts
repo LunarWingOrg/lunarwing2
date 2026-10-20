@@ -45,6 +45,16 @@ test("taskIdentity: zero ids fail closed (WI#400 LP-17 — a zero id would make 
   delete process.env.KIMI_TASK_GID
 })
 
+test("taskIdentity: partially numeric ids fail closed (WI#400 LV-18 — parseInt(\"1000x\") is 1000; the helper must agree with the entrypoint's ^[1-9][0-9]*$ gate)", () => {
+  for (const [uid, gid] of [["1000x", "10002"], ["10002", "1000x"], [" 10002", "10002"], ["10002", "10002 "]]) {
+    process.env.KIMI_TASK_UID = uid
+    process.env.KIMI_TASK_GID = gid
+    assert.throws(() => taskIdentity(), /non-zero numeric ids/, `uid=${uid} gid=${gid}`)
+  }
+  delete process.env.KIMI_TASK_UID
+  delete process.env.KIMI_TASK_GID
+})
+
 test("taskSetprivArgv: exact flag sequence, cap-clearing pair + no-new-privs mandatory (WI#400)", () => {
   // setpriv(1) preserves capabilities across the uid change unless the
   // ambient/inheritable sets are cleared — a task keeping ambient
