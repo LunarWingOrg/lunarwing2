@@ -2707,6 +2707,83 @@ mod tests {
         );
     }
 
+    /// WI#370 LW-11: the post-sweep anchor re-check is defence in depth —
+    /// nothing in-tree deletes the anchor, but if its row is ever gone (or
+    /// foreign) both the live slot AND the persisted setting must be
+    /// cleared, so no later lifecycle event can target an orphan or
+    /// cross-owner row. A valid owned anchor is left untouched.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn recheck_clears_deleted_or_foreign_anchors_but_keeps_valid_ones() {
+        let (db, _dir) = crate::testing::test_db().await;
+        let manager = Arc::new(ExternalWorkerManager::new(vec![]).with_store(Arc::clone(&db)));
+        let worker = ExternalWorkerConfig::default();
+        let cron = test_cron();
+        let key = "cron-mission:pr-digest:last-job";
+
+        // Deleted anchor row: the slot points at an id whose row is gone.
+        let deleted = Uuid::new_v4();
+        db.set_setting("owner", key, &serde_json::json!(deleted))
+            .await
+            .unwrap(); // safety: test
+        let live = Arc::new(std::sync::Mutex::new(Some(deleted)));
+        recheck_last_job_anchor(&test_ctx(&manager, &worker, &cron, &live)).await;
+        assert!(
+            live.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_none(),
+            "a deleted anchor must be cleared from the live slot"
+        );
+        assert!(
+            db.get_setting("owner", key).await.unwrap().is_none(), // safety: test
+            "a deleted anchor must be cleared from the persisted setting"
+        );
+
+        // Foreign anchor row: the row exists but belongs to another owner.
+        let foreign = Uuid::new_v4();
+        db.save_sandbox_job(&test_job_record(foreign, "other"))
+            .await
+            .unwrap(); // safety: test
+        db.set_setting("owner", key, &serde_json::json!(foreign))
+            .await
+            .unwrap(); // safety: test
+        *live.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(foreign);
+        recheck_last_job_anchor(&test_ctx(&manager, &worker, &cron, &live)).await;
+        assert!(
+            live.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_none(),
+            "a foreign anchor must be cleared from the live slot"
+        );
+        assert!(
+            db.get_setting("owner", key).await.unwrap().is_none(), // safety: test
+            "a foreign anchor must be cleared from the persisted setting"
+        );
+
+        // Valid owned anchor: untouched (slot and setting survive).
+        let owned = Uuid::new_v4();
+        db.save_sandbox_job(&test_job_record(owned, "owner"))
+            .await
+            .unwrap(); // safety: test
+        db.set_setting("owner", key, &serde_json::json!(owned))
+            .await
+            .unwrap(); // safety: test
+        *live.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(owned);
+        recheck_last_job_anchor(&test_ctx(&manager, &worker, &cron, &live)).await;
+        assert_eq!(
+            *live.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some(owned),
+            "a valid owned anchor must survive the re-check"
+        );
+        assert_eq!(
+            db.get_setting("owner", key).await.unwrap(), // safety: test
+            Some(serde_json::json!(owned))
+        );
+
+        // No anchor at all: a no-op, not an error.
+        *live.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        recheck_last_job_anchor(&test_ctx(&manager, &worker, &cron, &live)).await;
+        assert!(
+            live.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_none()
+        );
+    }
+
     /// Minimal sandbox-job row for the `load_last_tick_job` anchor tests.
     #[cfg(feature = "libsql")]
     fn test_job_record(id: Uuid, user_id: &str) -> SandboxJobRecord {
