@@ -100,9 +100,10 @@ fi
 git -C "$STUDY_NOTES_DEFAULT_HOME" checkout -q -- study_notes_mcp.py
 sync_study_notes_checkout "$STUDY_NOTES_DEFAULT_HOME"
 retained_revision="$(jq -r '.source_revision' "$manifest")"
-# git pull reads the checkout's own origin, not STUDY_NOTES_REPO, so make the
-# remote itself unreachable to simulate a transient network failure.
-git -C "$STUDY_NOTES_DEFAULT_HOME" remote set-url origin "$fixture/nonexistent-origin.git"
+# The checkout's origin must equal STUDY_NOTES_REPO (pinned below), so a
+# transient upstream failure is simulated by making the origin repository
+# itself unreachable while its configured URL stays the operator's.
+mv "$STUDY_NOTES_REPO" "$fixture/origin-away"
 if sync_study_notes_checkout "$STUDY_NOTES_DEFAULT_HOME" 2>/dev/null; then
   printf 'Study Notes sync unexpectedly succeeded with an unreachable upstream\n' >&2
   exit 1
@@ -119,8 +120,38 @@ fi
   printf 'stale last-good marker left behind after restoration\n' >&2
   exit 1
 }
-# Restore the reachable remote for the later provision/scheduler assertions.
+mv "$fixture/origin-away" "$STUDY_NOTES_REPO"
+
+# WI#445 LV-9: an existing checkout may only follow the operator's repo — the
+# pull must be refused before it runs when the configured origin differs, and
+# nothing in the checkout may change. (a rogue repo with real commits makes
+# the refusal provably the origin gate, not an upstream reachability artifact)
+rogue_origin="$fixture/rogue-origin"
+git init -q -b main "$rogue_origin"
+printf 'rogue finding\n' >"$rogue_origin/rogue-topic.md"
+git -C "$rogue_origin" add -A
+git_commit "$rogue_origin" rogue
+git -C "$STUDY_NOTES_DEFAULT_HOME" remote set-url origin "$rogue_origin"
+if rogue_err="$(sync_study_notes_checkout "$STUDY_NOTES_DEFAULT_HOME" 2>&1)"; then
+  printf 'Study Notes sync pulled from a rogue origin\n' >&2
+  exit 1
+fi
+[[ "$rogue_err" == *"origin does not match STUDY_NOTES_REPO"* ]] || {
+  printf 'rogue-origin refusal did not name the origin mismatch:\n%s\n' "$rogue_err" >&2
+  exit 1
+}
+[[ ! -e "$STUDY_NOTES_DEFAULT_HOME/agent-notes-by-agent/rogue-topic.md" ]] || {
+  printf 'Study Notes sync wrote rogue-origin content into the checkout\n' >&2
+  exit 1
+}
+[[ ! -e "$manifest" ]] || {
+  printf 'rogue-origin refusal left a published generation behind\n' >&2
+  exit 1
+}
+# Restore the operator remote and republish for the later scheduler pins.
 git -C "$STUDY_NOTES_DEFAULT_HOME" remote set-url origin "$STUDY_NOTES_REPO"
+sync_study_notes_checkout "$STUDY_NOTES_DEFAULT_HOME"
+test -f "$manifest"
 
 # A non-git directory is never modified by the sync.
 mkdir -p "$fixture/not-git"
