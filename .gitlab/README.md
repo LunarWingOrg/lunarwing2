@@ -907,3 +907,14 @@ them from `bootstrap-shell.sh` (`xz-utils`).
 GitLab CI Lint remains required. Generic YAML parsing cannot validate merged
 GitLab semantics, runner availability, protected variables, or project-level
 settings.
+
+`validate_config.py` also cross-checks two non-CI surfaces against their
+authority: mt-admin's `EXTERNAL_WORKER_PROXY_TOOLS`
+(`ic/scripts/mt-admin-lib/09-worker-config.sh`) must equal the daemon's
+`PROXY_TOOL_ALLOWLIST` (`ic/src/orchestrator/external_worker.rs`) name for
+name (MR !1780 review LM-5) — a daemon set widened without the shell
+catching up is refused at the operator boundary, and a narrowed one writes a
+grant the daemon strips at load, so a deliberate phase-1 set change edits
+both lists in the same commit. The check fails closed on a renamed constant
+or a missing file, and ignores quoted names inside the Rust const's
+comments.
