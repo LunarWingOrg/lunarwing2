@@ -896,6 +896,7 @@ WORKER_TS_LANE_SCRIPTS = {
             "cd opencode4lunarwing",
             "bun install --frozen-lockfile",
             "bun scripts/path_expand_test.ts",
+            "bun scripts/task_identity_test.ts",
             "bun scripts/opencode_result_test.ts",
             "bun scripts/task_prompt_test.ts",
             "bun scripts/lunarwing_bridge_test.ts",
