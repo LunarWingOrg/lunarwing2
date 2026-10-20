@@ -15,17 +15,17 @@ yanked = "deny"
 ignore = [
     # Baseline accepted advisories re-verified against upstream 2026-10-10
     # for v2.1.6.0; WI#409's rustls additions are dated 2026-10-14 below.
-    # Baseline clearing decisions are owned by work item WI#331
+    # Baseline clearing decisions were owned by work item WI#331
     # (https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/331);
     # WI#304 was closed without a migration, so do not reference it as a
     # clearing owner. WI#331 and WI#409 are now both closed as well; the
     # seven libsql 0.6.0 legacy-chain acceptances they left behind
-    # (rustls-webpki 0.102 / h2 0.3.27 / rustls 0.22.4 entries below) are
-    # owned by open WI#418 under its standing decision record
+    # (rustls-webpki 0.102 / h2 0.3.27 / rustls 0.22.4 entries below) stand
+    # under the WI#418 standing decision record
     # docs/ops/v2.1.6.0_WI418_LIBSQL_LEGACY_CHAIN.md (2026-10-16), which
     # supersedes the closed WI#331/WI#409 records for those entries.
-    # Clearing work that outlives WI#331 is split into open follow-ups
-    # cited per entry: WI#367 (libsignal-protocol off failure/rental),
+    # Clearing work that outlived WI#331 was split into follow-ups cited
+    # per entry: WI#367 (libsignal-protocol off failure/rental/atty),
     # WI#368 (rsa policy / upstream tracking), and WI#418 (libsql legacy
     # chain). Re-verify each exposure note at every release per the
     # protocol in the WI#418 decision record. Historical decision record:

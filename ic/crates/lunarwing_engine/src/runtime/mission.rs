@@ -2241,10 +2241,19 @@ impl MissionManager {
             .store
             .list_missions_with_shared(project_id, user_id)
             .await?;
-        for mut mission in missions
+        for snapshot in missions
             .into_iter()
             .filter(|mission| mission.is_owned_by(user_id) && is_skill_learning_mission(mission))
         {
+            // WI#317: reload under the mission's fire lock before saving, so
+            // a concurrent fire's reservation (thread history, budget count,
+            // dedup key) is not overwritten by the stale list copy.
+            let lock = mission_lock(&self.fire_locks, snapshot.id).await;
+            let _guard = lock.lock().await;
+            let Some(mut mission) = self.store.load_mission(snapshot.id).await? else {
+                // Deleted between the list and the lock.
+                continue;
+            };
             if mission.status == MissionStatus::Active {
                 mark_gate_paused(&mut mission);
                 mission.updated_at = Utc::now();
@@ -2326,7 +2335,17 @@ impl MissionManager {
             .iter()
             .find(|m| m.metadata.get(metadata_key).is_some())
         {
-            let mut mission = existing.clone();
+            // WI#317: reload under the mission's fire lock before
+            // reconciling, so a concurrent fire's reservation (thread
+            // history, budget count, dedup key) is not overwritten by the
+            // stale list copy.
+            let lock = mission_lock(&self.fire_locks, existing.id).await;
+            let _guard = lock.lock().await;
+            let Some(mut mission) = self.store.load_mission(existing.id).await? else {
+                // Deleted between the list and the lock; nothing to
+                // reconcile onto a vanished record.
+                return Ok(existing.id);
+            };
             if mission.deleted_at.is_some() {
                 return Ok(mission.id);
             }
@@ -3337,12 +3356,30 @@ impl MissionManager {
     /// Entries carry the thread ID so a crash between those writes is
     /// recoverable without duplicating history. Notifications are best-effort
     /// and may repeat if the process dies before the acknowledgement saves.
+    ///
+    /// WI#317: every mission this pass mutates is reloaded and saved under
+    /// its fire lock — boot arms retry wakes and resumed-thread outcome
+    /// watchers before this loop runs, so an unlocked stale-copy save here
+    /// could silently revert a concurrent fire's reservation.
     pub async fn record_restart_interrupted_missions(&self) -> Result<Vec<MissionId>, EngineError> {
         let mut recorded = Vec::new();
-        for mission in self.store.list_all_missions_global().await? {
-            let mut mission = mission;
-            let mut changed = false;
+        for snapshot in self.store.list_all_missions_global().await? {
+            // WI#317: boot arms retry wakes and resumed-thread outcome
+            // watchers before this pass, so a mission fire can save the
+            // record while the loop iterates. The global list is only the
+            // candidate set — each mission is reloaded and saved under its
+            // fire lock, the same serialisation `fire_mission_inner` and the
+            // outcome watcher use, so this pass cannot overwrite a fire's
+            // thread-history entry, `last_fired_at`, daily-budget count, or
+            // trigger dedup key with a stale copy.
+            let lock = mission_lock(&self.fire_locks, snapshot.id).await;
+            let _guard = lock.lock().await;
+            let Some(mut mission) = self.store.load_mission(snapshot.id).await? else {
+                // Deleted between the candidate list and the lock.
+                continue;
+            };
             let history = mission.thread_history.clone();
+            let mut changed = false;
             for thread_id in history {
                 if self
                     .record_restart_interrupted_thread(&mut mission, thread_id)
@@ -5058,7 +5095,33 @@ mod tests {
         /// webhook-claim checks can be forced to both complete before
         /// either save lands.
         list_all_missions_barrier: Option<Arc<tokio::sync::Barrier>>,
+        /// WI#317 test hook: when set, `list_all_missions_global` signals
+        /// [`GlobalListGate::snapshotted`] after taking its (stale-able)
+        /// snapshot and then parks until [`GlobalListGate::open`] is
+        /// signalled, so a test can land a concurrent write between the
+        /// restart recorder's candidate snapshot and its save.
+        list_all_missions_global_gate: Option<Arc<GlobalListGate>>,
         write_log: tokio::sync::RwLock<Vec<TestStoreWrite>>,
+    }
+
+    /// Two-phase park gate backing the WI#317 test hook: the lister
+    /// publishes that its snapshot is taken, then waits for the test to
+    /// open the gate. The test observes `snapshotted` before opening, so
+    /// the parked lister's continuation runs strictly after the test's
+    /// in-between writes. `Notify`'s one-permit semantics keep both
+    /// directions race-free without registration ordering.
+    struct GlobalListGate {
+        snapshotted: tokio::sync::Notify,
+        open: tokio::sync::Notify,
+    }
+
+    impl GlobalListGate {
+        fn new() -> Self {
+            Self {
+                snapshotted: tokio::sync::Notify::new(),
+                open: tokio::sync::Notify::new(),
+            }
+        }
     }
 
     impl TestStore {
@@ -5074,6 +5137,7 @@ mod tests {
                 failing_thread_loads: tokio::sync::RwLock::new(Vec::new()),
                 failing_thread_saves: tokio::sync::RwLock::new(Vec::new()),
                 list_all_missions_barrier: None,
+                list_all_missions_global_gate: None,
                 write_log: tokio::sync::RwLock::new(Vec::new()),
             }
         }
@@ -5273,7 +5337,15 @@ mod tests {
             Ok(snapshot)
         }
         async fn list_all_missions_global(&self) -> Result<Vec<Mission>, EngineError> {
-            Ok(self.missions.read().await.values().cloned().collect())
+            // Snapshot first (stale-able), then park on the WI#317 gate —
+            // bounded so an ungated second lister cannot deadlock the test.
+            let snapshot: Vec<Mission> = self.missions.read().await.values().cloned().collect();
+            if let Some(gate) = &self.list_all_missions_global_gate {
+                gate.snapshotted.notify_one();
+                let _ =
+                    tokio::time::timeout(Duration::from_millis(500), gate.open.notified()).await;
+            }
+            Ok(snapshot)
         }
         async fn list_all_active_missions_global(&self) -> Result<Vec<Mission>, EngineError> {
             Ok(self
@@ -14670,6 +14742,102 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         assert!(
             store
                 .load_thread(thread.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_restart_failure_recorded()
+        );
+    }
+
+    /// WI#317: boot arms retry wakes and resumed-thread outcome watchers
+    /// before the restart recorder runs, so a fire can land between the
+    /// recorder's candidate snapshot and its save. The store gate forces
+    /// exactly that interleaving: the recorder snapshots the mission
+    /// (stale — without the fire), the fire's reservation save lands, and
+    /// only then is the recorder released. Without the per-mission
+    /// fire-lock + reload, its stale-copy save silently reverts the fire:
+    /// the thread-history entry disappears, `last_fired_at` reverts, the
+    /// daily budget undercounts, and the trigger dedup key is lost (a
+    /// redelivery could then fire the mission twice).
+    #[tokio::test]
+    async fn restart_record_survives_a_concurrent_fire() {
+        let gate = Arc::new(GlobalListGate::new());
+        let mut raw_store = TestStore::new();
+        raw_store.list_all_missions_global_gate = Some(Arc::clone(&gate));
+        let store = Arc::new(raw_store);
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        let (mission, interrupted) = restart_failed_mission_fixture(&store, Vec::new()).await;
+
+        let recorder_mgr = Arc::clone(&mgr);
+        let recorder = tokio::spawn(async move {
+            recorder_mgr
+                .record_restart_interrupted_missions()
+                .await
+                .map(|ids| ids.len())
+        });
+
+        // The recorder has snapshotted its candidate set and is parked.
+        tokio::time::timeout(Duration::from_millis(2000), gate.snapshotted.notified())
+            .await
+            .expect("recorder must reach the candidate-snapshot gate");
+
+        // A concurrent fire's durable reservation — the exact write
+        // `fire_mission_inner` makes under the fire lock: new thread in
+        // history, budget consumed, `last_fired_at` stamped, trigger dedup
+        // key recorded.
+        let mut fired = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            mission.project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        fired.state = ThreadState::Done;
+        store.save_thread(&fired).await.unwrap();
+        let mut current = store.load_mission(mission.id).await.unwrap().unwrap();
+        current.record_thread(fired.id);
+        current.threads_today += 1;
+        current.record_processed_trigger("wi317-dedup-key".to_string());
+        let fired_at = current.last_fired_at;
+        store.save_mission(&current).await.unwrap();
+
+        gate.open.notify_one();
+        assert_eq!(
+            recorder
+                .await
+                .expect("recorder task panicked")
+                .expect("recorder must not fail"),
+            1,
+            "exactly one mission must be recorded"
+        );
+
+        let saved = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(
+            saved.thread_history,
+            vec![interrupted.id, fired.id],
+            "the fire's thread-history entry must survive the recorder pass"
+        );
+        assert_eq!(
+            saved.last_fired_at, fired_at,
+            "the fire's last_fired_at must survive the recorder pass"
+        );
+        assert_eq!(
+            saved.threads_today, 1,
+            "the fire's daily-budget consumption must survive the recorder pass"
+        );
+        assert!(
+            saved.has_processed_trigger("wi317-dedup-key"),
+            "the fire's trigger dedup key must survive the recorder pass"
+        );
+        assert_eq!(
+            saved.approach_history.len(),
+            1,
+            "the INTERRUPTED entry must be recorded, and only once"
+        );
+        assert!(saved.approach_history[0].contains("INTERRUPTED: engine restart"));
+        assert!(
+            store
+                .load_thread(interrupted.id)
                 .await
                 .unwrap()
                 .unwrap()

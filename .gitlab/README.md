@@ -517,6 +517,7 @@ host's concurrent builds before retrying manually.
 - JUnit reports: `python-unit` emits `junit-python.xml`, `shell-harnesses`
   emits `junit-shell.xml`; the worker scan emits a GitLab
   `container_scanning` report alongside its blocking CRITICAL gate.
+<!-- deny-toml-guard-section:begin -->
 - cargo-deny and redacted current-tree Gitleaks scans.
 - cargo-deny runs unvendored: `.gitlab/scripts/cargo-deny-check.sh` executes
   from the repo root with an explicit `--manifest-path ic/Cargo.toml` so
@@ -561,6 +562,32 @@ host's concurrent builds before retrying manually.
   if a listed path disappears. This textual check is supplemented by a
   per-release review of effective flags and newly added build paths; it
   cannot resolve variable indirection.
+- WI#363 pins the accepted-advisory ownership trail in `ic/deny.toml` (filed
+  from MR !1505 review CP-2/CP-8 and MR !1518 review DC-7: the 2.1.5.0 reasons
+  named WI#304/#305/#306, which were closed without the migrations landing,
+  and nobody noticed until a review; on 2026-10-17 a bulk close orphaned
+  WI#418/WI#368 the same way). The offline guard `validate_config.py`
+  (`validate_deny_toml_advisories`, ci-config lane) requires every
+  `[advisories].ignore` entry to be a table whose non-empty reason names a
+  `clearing owner WI#N`, and requires every repo-relative path cited by
+  `ic/deny.toml` and by this marker-delimited section
+  (`deny-toml-guard-section:begin`/`end`) to be tracked (`git ls-files`; in
+  the git-less ci-config image, present inside the checkout — citations with
+  `..` segments, symlink escapes, or a directory-symlink component are
+  refused there too, matching what git mode can list (git lists the link
+  itself, never the paths beneath it; a leaf-symlink citation stays
+  accepted)) — bare
+  filenames without a repo-relative path and `file:line` anchors are the
+  documented out-of-scope limits. Checking whether a named owner is still
+  open (owner liveness) is deliberately out of scope per the WI#363 scope
+  decision of 2026-10-20: every owner the accepted advisories cite
+  (WI#367, WI#368, WI#418) was closed with the chains still locked, so an
+  online owner gate could only run failed-allowed; owner liveness stays a
+  review and release-notes concern, not a CI gate — no owner-liveness job
+  or network call exists. The guard carries unit tests under
+  `.gitlab/tests` (`test_deny_toml_guards.py`), also registered in the
+  `python-unit` suite.
+<!-- deny-toml-guard-section:end -->
 - Rust concurrency is host-managed: memory-constrained runners restrict eligible
   jobs and concurrent compiles; larger hosts can accept parallel work.
 - CI parallelism is intentional: `-j2` (libSQL `-j1`) caps peak memory within

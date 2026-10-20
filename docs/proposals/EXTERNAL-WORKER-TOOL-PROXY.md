@@ -698,19 +698,22 @@ cross-thread coordination (KV + advisory locks) is also still open.
   real-worker AC1/AC2 evidence need the rebuilt pebble image on a live
   tenant.
 
-Open acceptance items: AC1 with a **real** worker (hub-side evidence uses
-mock sockets with real memory tools; worker-side evidence uses a mock CLI
-against the real bridge/relay) and AC2 (`knowledge_search` real hits
-through the proxy). Both need a rebuilt kimi worker image and a live
-tenant, which is the protected-pipeline/deploy gate, not an MR-pipeline
-lane. The mt-admin render gap (KL-15(a)) is closed: `configure-worker-tools`
-writes the worker-level `tool_allowlist` into tenant config, so a live
-tenant can carry the grant before the acceptance run — the remaining need
-is the rebuilt images plus that explicit per-worker grant. The opencode,
-opencode2 and pebble
-lanes additionally need their rebuilt images so the plugin/shim
-registration ships in the image. WI#324 stays
-open until those land.
+Acceptance evidence (2026-10-20, tenant `barracuda`, live run recorded in
+WI#324 note #10753): the daily integration cycle rebuilt the tenant from the
+current target tree with fresh pebble/opencode/opencode2 images, and a real
+`create_job(mode: pebble)` run through the gateway chat (grant via
+`configure-worker-tools`) closed every criterion — AC1 (proxied
+`memory_write` → `memory_read` round-trip, exact 81-byte content, tenant DB
+row verified), AC2 (`knowledge_submit_note` → later `knowledge_search`
+returned the note itself as the single hit), AC3 observed live at the catalog
+layer (the un-granted `gitlab_tool` never appeared in the worker's tool
+catalog; the hub-side hard reject stays pinned by the integration suite),
+AC4 (5 `tool_use` + 5 `tool_result` canonical `job_events` for the run), AC5
+unchanged (in-tree regression guard; no secret material in any proxied
+output). Not exercised live: the opencode v1 lane (blocked by the WI#333
+upstream crash, re-confirmed on the 2026-10-20 image) and the opencode2 lane
+(pebble satisfied the criteria; the same probe shape applies). The grants
+were cleared after the run, restoring deny-by-default.
 
 ## Land-order note (MR !1540 review #7716)
 
