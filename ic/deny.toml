@@ -62,6 +62,13 @@ ignore = [
     { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102 URI name constraints; same libsql 0.6.0 legacy chain and opt-in-only exposure as RUSTSEC-2026-0049; residual opt-in exposure accepted per WI#418 standing decision record docs/ops/v2.1.6.0_WI418_LIBSQL_LEGACY_CHAIN.md (re-verified 2026-10-16); clearing owner WI#418" },
     { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102 wildcard name-constraint bypass; same libsql 0.6.0 legacy chain and opt-in-only exposure as RUSTSEC-2026-0049; residual opt-in exposure accepted per WI#418 standing decision record docs/ops/v2.1.6.0_WI418_LIBSQL_LEGACY_CHAIN.md (re-verified 2026-10-16); clearing owner WI#418" },
     { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102 CRL parsing panic; same libsql 0.6.0 legacy chain and opt-in-only exposure as RUSTSEC-2026-0049; residual opt-in exposure accepted per WI#418 standing decision record docs/ops/v2.1.6.0_WI418_LIBSQL_LEGACY_CHAIN.md (re-verified 2026-10-16); clearing owner WI#418" },
+    # RUSTSEC-2026-0382 (CVE-2026-111943, published 2026-10-20): certificate
+    # verification may accept distrusted emSign intermediates. Patched ranges
+    # are 0.103.16 / 0.104.0-alpha.8 only — no 0.102-line patch exists, same
+    # as every prior 0.102 advisory above. The modern 0.103 copy is upgraded
+    # to 0.103.16 (2026-10-20, item 28); only the libsql 0.6.0 legacy chain
+    # copy remains, behind the same opt-in libsql-remote-replica gate.
+    { id = "RUSTSEC-2026-0382", reason = "rustls-webpki 0.102 accepts distrusted emSign intermediate certificate paths (CVE-2026-111943); same libsql 0.6.0 legacy chain and opt-in-only exposure as RUSTSEC-2026-0049 — no 0.102-line patch exists (patched ranges start at 0.103.16); the modern 0.103 line is fixed at 0.103.16; residual opt-in exposure accepted per WI#418 standing decision record docs/ops/v2.1.6.0_WI418_LIBSQL_LEGACY_CHAIN.md (verified 2026-10-20); clearing owner WI#418" },
 
     # WI#409 (2026-10-14): the modern rustls line is upgraded to 0.23.46,
     # fixing RUSTSEC-2026-0346/0347/0348/0349. No patched 0.22 release exists.
@@ -128,6 +135,19 @@ ignore = [
     # .gitlab/scripts/check-default-graph-advisories.sh.
     { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27 pinned by libsql 0.6.0 legacy chain; no 0.3-line patch exists; 0.4 line upgraded to 0.4.20; exposure: opt-in libsql-remote-replica builds only, default builds cleared by WI#331 feature gate; residual opt-in exposure accepted per WI#418 standing decision record docs/ops/v2.1.6.0_WI418_LIBSQL_LEGACY_CHAIN.md (re-verified 2026-10-16); clearing owner WI#418" },
 
+    # webpki-roots 0.26.11 — RUSTSEC-2026-0381 (CVE-2026-111943, published
+    # 2026-10-20): the bundled root store trusted the distrusted emSign ECC
+    # Root CA - G3 intermediates. Patched at >= 1.0.10 only; no 0.26-line
+    # patch exists (the 0.26 line ended at 0.26.11). The copy remains via the
+    # libsql 0.6.0 -> hyper-rustls 0.25.0 legacy chain, same opt-in
+    # libsql-remote-replica gate as the rustls-webpki 0.102 entries above.
+    # Note: 0.26.11 is a shim whose root store is re-exported from its
+    # webpki-roots 1.x dependency — that dependency is upgraded to the
+    # patched 1.0.10 (2026-10-20, item 28), so the roots actually served
+    # through the shim no longer contain the distrusted CA; the advisory
+    # still flags the 0.26.11 shim by version.
+    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 bundled the distrusted emSign ECC Root CA - G3 (CVE-2026-111943); pinned by the libsql 0.6.0 -> hyper-rustls 0.25.0 legacy chain with no 0.26-line patch; the 0.26.11 shim serves its roots from its webpki-roots 1.x dependency, upgraded to the patched 1.0.10; exposure: opt-in libsql-remote-replica builds only, default builds cleared by WI#331 feature gate; residual opt-in exposure accepted per WI#418 standing decision record docs/ops/v2.1.6.0_WI418_LIBSQL_LEGACY_CHAIN.md (verified 2026-10-20); clearing owner WI#418" },
+
     # rental — unmaintained (informational, no vulnerability). Only visible
     # since the gate widened to --workspace --all-features (v2.1.5.0, MR
     # !1371 review A4): direct dep of the vendored libsignal-protocol
@@ -189,13 +209,18 @@ deny = [
     # against silent downgrade (MR !1371 review A3): the advisory ignores
     # above are keyed by ID, which would not fire if a future lockfile
     # regressed the PATCHED line below the fixed release. The legacy copies
-    # (h2 0.3.27, rustls 0.22.4, rustls-webpki 0.102.8) sit outside these
-    # ranges and remain governed by the accepted advisories.
+    # (h2 0.3.27, rustls 0.22.4, rustls-webpki 0.102.8, webpki-roots 0.26.11)
+    # sit outside these ranges and remain governed by the accepted advisories.
     { name = "h2", version = ">=0.4.0, <0.4.19" },
     { name = "rustls", version = ">=0.23.0, <0.23.46" },
-    { name = "rustls-webpki", version = ">=0.103.0, <0.103.15" },
+    { name = "rustls-webpki", version = ">=0.103.0, <0.103.16" },
+    # CVE-2026-111943 (2026-10-20, item 28): the patched webpki root-store
+    # lines are webpki-roots 1.0.10 / webpki-root-certs 1.0.10; deny every
+    # earlier release (webpki-roots 0.26.11 is the accepted legacy pin below).
+    { name = "webpki-root-certs", version = "<1.0.10" },
+    { name = "webpki-roots", version = ">=1.0.0, <1.0.10" },
     # WI#418 (IS-1): ID-keyed ignores also suppress findings for other
-    # affected copies. Permit only the three accepted legacy pins below
+    # affected copies. Permit only the four accepted legacy pins below
     # the modern lines; a new dependency must not inherit the acceptance.
     { name = "h2", version = "<0.3.27" },
     { name = "h2", version = ">0.3.27, <0.4.0" },
@@ -203,6 +228,8 @@ deny = [
     { name = "rustls", version = ">0.22.4, <0.23.0" },
     { name = "rustls-webpki", version = "<0.102.8" },
     { name = "rustls-webpki", version = ">0.102.8, <0.103.0" },
+    { name = "webpki-roots", version = "<0.26.11" },
+    { name = "webpki-roots", version = ">0.26.11, <1.0.0" },
     # Only libsql may depend directly on this legacy TLS-chain root.
     { name = "hyper-rustls", version = "=0.25.0", wrappers = ["libsql"] },
     # WI#360 (JH-1): the RUSTSEC-2021-0145 ignore is keyed by ID, so it would
