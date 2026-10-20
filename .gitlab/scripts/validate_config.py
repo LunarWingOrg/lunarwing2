@@ -7,6 +7,7 @@ import hashlib
 import json
 import pathlib
 import re
+import subprocess
 import sys
 import tomllib
 
@@ -109,6 +110,7 @@ FULL_VALIDATION_JOBS = (
     "rust-clippy-all",
     "cargo-deny",
     "satellite-advisory-sweep",
+    "cargo-deny-owners",
 )
 WORKER_NAMES = ("pebble", "opencode", "opencode2", "kimi")
 # Fixed build-read inputs of the kimi worker image build (the Dockerfile
@@ -529,6 +531,14 @@ ADVISORY_GATE_JOBS = (
     "default-graph-advisory-guard",
 )
 
+# MR !1758 run-164 KV-1c: the WI#363 clearing-owner check rides its own
+# job, pinned separately from ADVISORY_GATE_JOBS — the four advisory gates
+# must stay hard (no allow_failure) so a red gate always means a real
+# advisory finding, while the owner job carries WI#363's documented
+# "warns" mode while the maintainer's owner decision is pending.
+OWNER_GATE_JOB = "cargo-deny-owners"
+OWNER_GATE_SCRIPT = ["python3 .gitlab/scripts/check_deny_toml_owners.py"]
+
 # Run-135 IP-1 (MR !1680 review): a gate that never runs its checker is as
 # optional as an allow_failure one. `exit 0` before the wrapper (job or
 # template before_script, or the script itself), `|| true`, or an echoed
@@ -561,6 +571,7 @@ ADVISORY_GATE_EFFECTIVE_KEYS = frozenset({
     "after_script", "before_script", "cache", "image", "needs", "rules",
     "script", "stage", "tags",
 })
+OWNER_GATE_EFFECTIVE_KEYS = ADVISORY_GATE_EFFECTIVE_KEYS | {"allow_failure"}
 
 # Run-137 IU-1: artifacts can replace checkers or supply dotenv variables
 # outside GLOBAL_VARIABLE_ALLOWLIST. Pin the allowed inputs as well as keys:
@@ -696,6 +707,261 @@ def validate_advisory_gates_not_optional(merged: dict, errors: list[str]) -> Non
                     "EXPECTED_RUNNER_TAGS pins the routing for every job"
                 )
                 break
+
+
+def validate_deny_owner_gate(merged: dict, errors: list[str]) -> None:
+    """Pin the WI#363 owner-check job (MR !1758 run-164 KV-1c).
+
+    The clearing-owner check runs in its own cargo-deny-owners job so
+    cargo-deny stays green or red on advisories alone: while no open owner
+    exists, an in-job owner red and a real advisory red were the same badge,
+    hiding new advisories (KV-1). The job must exist (fail closed on
+    deletion), run exactly OWNER_GATE_SCRIPT, carry exactly the
+    .full-validation-context rules and pinned runner tag, and keep the
+    advisory-gate bootstrap/image/needs/cache pins. Unlike the four advisory
+    gates it may set allow_failure — WI#363's documented "warns" mode while
+    the maintainer's owner decision is pending (WI#363 note #10157); the
+    script itself still exits 1 naming the closed WIs and advisory IDs, and
+    only a maintainer names owners and then removes allow_failure in the
+    same change (run-166 LE-1). Everything else that hollows a job
+    (job-level when, extra keys, variables/hooks/parallel) is refused
+    exactly as for the advisory gates."""
+    job = merged.get(OWNER_GATE_JOB)
+    if not isinstance(job, dict):
+        errors.append(
+            f"{OWNER_GATE_JOB} is missing; the WI#363 clearing-owner check "
+            "must run in its own job (deleting it must fail closed)"
+        )
+        return
+    effective = resolve_extends(job, merged)
+    if effective.get("script") != OWNER_GATE_SCRIPT:
+        errors.append(
+            f"{OWNER_GATE_JOB} script must be exactly {OWNER_GATE_SCRIPT!r}"
+        )
+    if "when" in effective:
+        errors.append(f"{OWNER_GATE_JOB} must not set a job-level when")
+    template = resolve_extends(merged.get(".full-validation-context"), merged)
+    template_rules = template.get("rules")
+    if isinstance(template_rules, list) and effective.get("rules") != template_rules:
+        errors.append(
+            f"{OWNER_GATE_JOB} rules must be exactly "
+            ".full-validation-context's (no rule-level allow_failure, when "
+            "or variables)"
+        )
+    if effective.get("tags") != ["$CI_RUST_RUNNER_TAG"]:
+        errors.append(f"{OWNER_GATE_JOB} tags must be exactly ['$CI_RUST_RUNNER_TAG']")
+    if effective.get("before_script") != ADVISORY_GATE_BEFORE_SCRIPT:
+        errors.append(
+            f"{OWNER_GATE_JOB} before_script must be exactly the pinned "
+            f".rust-job bootstrap {ADVISORY_GATE_BEFORE_SCRIPT!r}"
+        )
+    for key, expected in ADVISORY_GATE_PINNED_VALUES.items():
+        if effective.get(key) != expected:
+            errors.append(f"{OWNER_GATE_JOB} {key} must be exactly {expected!r}")
+    unexpected = sorted(set(effective) - OWNER_GATE_EFFECTIVE_KEYS)
+    if unexpected:
+        errors.append(
+            f"{OWNER_GATE_JOB} must not carry job keys {unexpected}; variables, "
+            "hooks, inherit, parallel or timeout can hollow out a gate"
+        )
+    # Run-166 LE-2: allow_failure is the one permitted extra key, and its
+    # value is pinned to the two documented modes — True (warn mode) or
+    # absent (hard mode). The exit_codes hash form passed the key check and
+    # would let a non-1 exit (a crash) fail while the designed warn signal
+    # stays optional in a way the docs do not describe.
+    if "allow_failure" in effective and effective["allow_failure"] is not True:
+        errors.append(
+            f"{OWNER_GATE_JOB} allow_failure must be exactly true (the "
+            "documented warn mode) or absent (hard mode); other value "
+            "forms such as exit_codes are not documented modes"
+        )
+
+
+# WI#363: the accepted-advisory list in ic/deny.toml relies on facts no gate
+# used to check — every ignore reason must name an OPEN clearing owner work
+# item (the 2.1.5.0 reasons named WI#304/#305/#306, closed without the
+# migrations landing, and nobody noticed until a review; on 2026-10-17 a bulk
+# close orphaned WI#418/WI#368 the same way), and every repo-relative path the
+# policy and its audit trail cite must still exist (release moves broke this
+# link class once — MR !1505 review CP-8). The offline half below runs in
+# ci-config; the online half (.gitlab/scripts/check_deny_toml_owners.py) runs
+# in its own cargo-deny-owners job (run-164 KV-1c) and exits nonzero when a
+# named owner is not open.
+DENY_OWNER_PATTERN = re.compile(r"clearing owner:?\s*WI#(\d+)", re.IGNORECASE)
+DENY_WI_PATTERN = re.compile(r"WI#\d+")
+DENY_URL_PATTERN = re.compile(r"https?://\S+")
+DENY_PATH_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_.][A-Za-z0-9_./-]*")
+README_DENY_GUARD_BEGIN = "<!-- deny-toml-guard-section:begin -->"
+README_DENY_GUARD_END = "<!-- deny-toml-guard-section:end -->"
+
+
+def collect_tracked_paths() -> set[str] | None:
+    """The tracked-file truth for citation checks (`git ls-files`): a glob
+    would also see untracked scratch files in a dirty checkout. Returns None
+    when there is no git binary at all (the ci-config lint image ships
+    none); the caller then falls back to checkout existence, which is the
+    same truth in CI because the runner checks out a clean tree."""
+    try:
+        result = subprocess.run(
+            ["git", "ls-files"], cwd=ROOT, capture_output=True, text=True, check=False
+        )
+    except FileNotFoundError:
+        return None
+    if result.returncode != 0:
+        raise RuntimeError(f"git ls-files failed: {result.stderr.strip()}")
+    return set(result.stdout.splitlines())
+
+
+def extract_repo_paths(text: str, top_levels: set[str]) -> set[str]:
+    """Repo-relative path citations in free text.
+
+    A token must contain at least one `/` and its first segment must be a
+    tracked top-level entry — the gate skips prose fragments such as
+    `opencode/opencode2/pebble` or `2026-0098/0099`. Bare filenames
+    (`Cargo.lock`) are not repo-relative paths and are out of scope (a
+    documented limit). `file:line` anchors resolve to their path part because
+    `:` is outside the token alphabet; anchor-exact checking is a WI#363
+    follow-up.
+    """
+    paths = set()
+    for match in DENY_PATH_TOKEN_PATTERN.finditer(DENY_URL_PATTERN.sub(" ", text)):
+        token = match.group(0).rstrip("./")
+        if "/" not in token:
+            continue
+        if token.split("/", 1)[0] in top_levels:
+            paths.add(token)
+    return paths
+
+
+def check_cited_paths(
+    label: str, text: str, tracked: set[str] | None, top_levels: set[str], errors: list[str]
+) -> None:
+    for path in sorted(extract_repo_paths(text, top_levels)):
+        if tracked is None:
+            # git ls-files never lists `..` segments or paths beneath a
+            # directory symlink (it lists the link itself), so neither may
+            # the fallback, and a citation must also stay inside the
+            # checkout to count as present (run-157 KF-1, run-161 KN-2).
+            # A symlink at the final component is fine: git lists leaf
+            # symlinks, so the walk stops before the last part.
+            candidate = ROOT / path
+            parts = pathlib.PurePosixPath(path).parts
+            present = (
+                ".." not in parts
+                and not any(
+                    ROOT.joinpath(*parts[:i]).is_symlink()
+                    for i in range(1, len(parts))
+                )
+                and candidate.exists()
+                and candidate.resolve().is_relative_to(ROOT.resolve())
+            )
+        else:
+            present = path in tracked or any(
+                entry.startswith(path + "/") for entry in tracked
+            )
+        if present:
+            continue
+        where = (
+            "present in the checkout"
+            if tracked is None
+            else "a tracked path (git ls-files)"
+        )
+        errors.append(
+            f"{label} cites {path}, which is not {where}; fix or remove the citation"
+        )
+
+
+def validate_deny_toml_advisories(errors: list[str], tracked: set[str] | None = None) -> None:
+    """WI#363 offline guard: deny.toml reasons name an owner; cited paths exist.
+
+    Every [advisories].ignore entry must be a table whose non-empty reason
+    names a work item AND a "clearing owner WI#N" — the owner phrase is what
+    the cargo-deny job's online check polls, so a reason naming only closed
+    historical records would otherwise slip through unchecked. Every
+    repo-relative path cited anywhere in ic/deny.toml (comments and reason
+    strings) and in the marker-delimited cargo-deny section of
+    .gitlab/README.md must be a tracked path. The tracked-file truth comes
+    from `git ls-files`; in an image without a git binary (the ci-config
+    lint image ships none) it falls back to checkout existence, restricted to
+    citations git mode could list: no `..` segments, no path components
+    beneath a directory symlink (git lists the link itself, never the paths
+    beneath it — a symlink at the final component is fine because git lists
+    leaf symlinks), and no symlink escapes out of the checkout — the same
+    truth in CI because the runner checks out a clean tree.
+    """
+    deny_path = ROOT / "ic" / "deny.toml"
+    try:
+        deny_text = deny_path.read_text(encoding="utf-8")
+    except OSError as error:
+        errors.append(f"cannot read ic/deny.toml: {error}")
+        return
+    try:
+        deny = tomllib.loads(deny_text)
+    except tomllib.TOMLDecodeError as error:
+        errors.append(f"ic/deny.toml does not parse: {error}")
+        return
+    ignore = deny.get("advisories", {}).get("ignore")
+    if not isinstance(ignore, list):
+        errors.append("ic/deny.toml [advisories].ignore must be a list")
+        ignore = []
+    for index, entry in enumerate(ignore):
+        if not isinstance(entry, dict):
+            errors.append(
+                f"ic/deny.toml advisories.ignore entry {index} must be a table "
+                "with id and reason"
+            )
+            continue
+        entry_id = entry.get("id")
+        label = entry_id if isinstance(entry_id, str) and entry_id else f"entry {index}"
+        reason = entry.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            errors.append(
+                f"ic/deny.toml {label} has no reason; every accepted advisory "
+                "must name an open clearing owner work item"
+            )
+            continue
+        if not DENY_WI_PATTERN.search(reason):
+            errors.append(f"ic/deny.toml {label} reason names no WI#N work item")
+        if not DENY_OWNER_PATTERN.search(reason):
+            errors.append(
+                f"ic/deny.toml {label} reason names no 'clearing owner WI#N'; "
+                "the cargo-deny job checks the named owner is still open (WI#363)"
+            )
+
+    readme_path = ROOT / ".gitlab" / "README.md"
+    try:
+        readme_text = readme_path.read_text(encoding="utf-8")
+    except OSError as error:
+        errors.append(f"cannot read .gitlab/README.md: {error}")
+        return
+    begin = readme_text.find(README_DENY_GUARD_BEGIN)
+    end = readme_text.find(README_DENY_GUARD_END)
+    if (
+        readme_text.count(README_DENY_GUARD_BEGIN) != 1
+        or readme_text.count(README_DENY_GUARD_END) != 1
+        or begin > end
+    ):
+        errors.append(
+            ".gitlab/README.md must delimit its cargo-deny section with exactly "
+            f"one {README_DENY_GUARD_BEGIN} / {README_DENY_GUARD_END} marker pair"
+        )
+        return
+    section = readme_text[begin + len(README_DENY_GUARD_BEGIN):end]
+
+    if tracked is None:
+        try:
+            tracked = collect_tracked_paths()
+        except RuntimeError as error:
+            errors.append(str(error))
+            return
+    if tracked is None:
+        top_levels = {entry.name for entry in ROOT.iterdir() if entry.name != ".git"}
+    else:
+        top_levels = {entry.split("/", 1)[0] for entry in tracked}
+    check_cited_paths("ic/deny.toml", deny_text, tracked, top_levels, errors)
+    check_cited_paths(
+        ".gitlab/README.md cargo-deny section", section, tracked, top_levels, errors
+    )
 
 
 def validate_satellite_advisory_sweep(merged: dict, errors: list[str]) -> None:
@@ -2265,6 +2531,8 @@ def main() -> int:
     validate_cargo_deny_gate(merged_config, errors)
     validate_satellite_advisory_sweep(merged_config, errors)
     validate_advisory_gates_not_optional(merged_config, errors)
+    validate_deny_owner_gate(merged_config, errors)
+    validate_deny_toml_advisories(errors)
     validate_worker_ts_lanes(merged_config, errors)
     validate_pebble_rust_lane(merged_config, errors)
     validate_cache_trust(merged_config, errors)

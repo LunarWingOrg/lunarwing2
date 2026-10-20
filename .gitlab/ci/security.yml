@@ -10,6 +10,29 @@ cargo-deny:
     - bash .gitlab/scripts/install-cargo-deny.sh
     - bash .gitlab/scripts/cargo-deny-check.sh
 
+# WI#363 (run-164 KV-1c): the clearing-owner check runs in its own job so
+# cargo-deny stays green or red on advisories alone — while no open clearing
+# owner exists, a red cargo-deny would hide a real new advisory behind the
+# same red. The job's script still hard-fails on a closed owner (that is the
+# guard working); allow_failure documents WI#363's "warns (documented
+# choice)" failure mode while the maintainer's owner decision is pending
+# (WI#363 note #10157) so the owner question stays visible as a warning
+# naming the WIs and advisory IDs without drowning the advisory signal.
+# Only a maintainer names owners (green) and then removes allow_failure
+# (hard mode) in the same change (run-166 LE-1); agents must not file or
+# reopen an owner work item.
+cargo-deny-owners:
+  extends:
+    - .rust-job
+    - .full-validation-context
+  stage: security
+  allow_failure: true
+  needs:
+    - job: cargo-metadata
+      artifacts: false
+  script:
+    - python3 .gitlab/scripts/check_deny_toml_owners.py
+
 # Makes the release audit's "every committed lockfile is clean" claim
 # reproducible in CI: the same pinned cargo-deny over every manifest root
 # with a tracked Cargo.lock, not just the ic workspace (MR !1371 review A5).

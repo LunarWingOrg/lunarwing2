@@ -407,7 +407,14 @@ host's concurrent builds before retrying manually.
   `artifacts: false` — blocking both checkout-overwriting artifacts and
   higher-precedence dotenv variables from upstream jobs (MR !1688, IU-1).
   `secret-history` is the marked, deliberate exception while
-  historical findings are triaged. Three limits of the YAML validator
+  historical findings are triaged. The WI#363 owner job
+  `cargo-deny-owners` is pinned separately by
+  `validate_deny_owner_gate` (existence, exact script, template rules,
+  tag, bootstrap, inputs) and is the one other job allowed
+  `allow_failure` — WI#363's documented warn mode while the maintainer's
+  owner decision pends (MR !1758 run-164 KV-1c); every other hollowing
+  shape is refused exactly as for the four advisory gates. Three limits of
+  the YAML validator
   remain, by design: it cannot see repo files the pinned scripts still
   honour — a project `.npmrc`, a `bunfig.toml` `preload`, or the
   `package.json` `test` script in the worker script directories stay trust
@@ -517,6 +524,7 @@ host's concurrent builds before retrying manually.
 - JUnit reports: `python-unit` emits `junit-python.xml`, `shell-harnesses`
   emits `junit-shell.xml`; the worker scan emits a GitLab
   `container_scanning` report alongside its blocking CRITICAL gate.
+<!-- deny-toml-guard-section:begin -->
 - cargo-deny and redacted current-tree Gitleaks scans.
 - cargo-deny runs unvendored: `.gitlab/scripts/cargo-deny-check.sh` executes
   from the repo root with an explicit `--manifest-path ic/Cargo.toml` so
@@ -561,6 +569,60 @@ host's concurrent builds before retrying manually.
   if a listed path disappears. This textual check is supplemented by a
   per-release review of effective flags and newly added build paths; it
   cannot resolve variable indirection.
+- WI#363 pins the accepted-advisory ownership trail in `ic/deny.toml` (filed
+  from MR !1505 review CP-2/CP-8 and MR !1518 review DC-7: the 2.1.5.0 reasons
+  named WI#304/#305/#306, which were closed without the migrations landing,
+  and nobody noticed until a review; on 2026-10-17 a bulk close orphaned
+  WI#418/WI#368 the same way). Two guards: `validate_config.py`
+  (`validate_deny_toml_advisories`, ci-config lane) requires every
+  `[advisories].ignore` entry to be a table whose non-empty reason names a
+  `clearing owner WI#N`, and requires every repo-relative path cited by
+  `ic/deny.toml` and by this marker-delimited section
+  (`deny-toml-guard-section:begin`/`end`) to be tracked (`git ls-files`; in
+  the git-less ci-config image, present inside the checkout — citations with
+  `..` segments, symlink escapes, or a directory-symlink component are
+  refused there too, matching what git mode can list (git lists the link
+  itself, never the paths beneath it; a leaf-symlink citation stays
+  accepted)) — bare
+  filenames without a repo-relative path and `file:line` anchors are the
+  documented out-of-scope limits. The online half runs as the pinned script
+  of its own `cargo-deny-owners` job (run-164 KV-1c: keeping it out of the
+  cargo-deny job means a red cargo-deny always means a real advisory
+  finding, instead of the owner red and an advisory red sharing one badge
+  while no open owner exists),
+  `python3 .gitlab/scripts/check_deny_toml_owners.py`, resolves each distinct
+  named owner through the anonymous GitLab issue API and exits nonzero when
+  one is not open: the moment an owner WI closes, the job goes red naming
+  the WI, its state and advisory IDs (merging is not CI-gated, so the
+  signal is visibility, not a block). While the maintainer's owner decision
+  is pending (WI#363 note #10157) the job carries `allow_failure: true` —
+  WI#363's documented "warns (documented choice)" mode: the red stays
+  visible as a warning without drowning the advisory signal, and only a
+  maintainer names owners (green) and then removes `allow_failure` (hard
+  mode) in the same change.
+  `validate_config.py` (`validate_deny_owner_gate`) fails closed if the job
+  is deleted and pins its exact script, template rules, runner tag,
+  bootstrap and inputs — `allow_failure` is the one permitted extra key. A
+  404 means the owner is a task-type work item —
+  the anonymous single-issue endpoint serves only issue-type items (WI#274
+  precedent) — or was deleted; transient outages/5xx/429 retry three times
+  with 5s/10s backoff and then fail closed, because a check that warns on
+  outage silently stops checking (the index-failure silence class); a fully
+  unreachable API costs up to about 3.5 minutes per named owner (three 60s
+  attempts plus backoff) before the job fails. The
+  expected maintenance step when closing an owner WI: re-point the
+  `ic/deny.toml` reasons to the new open owner FIRST, then close the old one.
+  Agents must not reopen a clearing-owner work item that a maintainer closed:
+  report the red gate on the MR or the work item and leave re-pointing or
+  reopening to the maintainer.
+  Only a maintainer creates or names a clearing owner; agents re-point to an
+  owner the maintainer named — an agent filing a fresh owner to turn the gate
+  green would reproduce the reopen behavior this rule exists against, so the
+  gate is not satisfiable by a new agent-filed work item (MR !1748 run-161
+  KN-1: the maintainer declined the agent-filed umbrella WI#439).
+  Both checks carry unit tests under `.gitlab/tests` (stubbed fetch for the
+  online half), also registered in the `python-unit` suite.
+<!-- deny-toml-guard-section:end -->
 - Rust concurrency is host-managed: memory-constrained runners restrict eligible
   jobs and concurrent compiles; larger hosts can accept parallel work.
 - CI parallelism is intentional: `-j2` (libSQL `-j1`) caps peak memory within
@@ -601,6 +663,9 @@ These run with `allow_failure: true`:
   green, closing the plan §15.5 reconciliation.
 - `secret-history`: scheduled only; becomes blocking after historical findings
   are reviewed.
+- `cargo-deny-owners`: warns while no open clearing owner exists (WI#363 note
+  #10157). Remove `allow_failure` in the same change that re-points the
+  `ic/deny.toml` reasons to the owner(s) the maintainer names.
 
 Formerly observational, now blocking (goals 2.1.1.0 item 23): `rust-clippy-all`
 (clean all-features baseline landed) and `architecture-boundaries` (changed-line
@@ -674,7 +739,8 @@ only the three digest-pinned images listed above.
 
 Runner egress must reach:
 
-- This GitLab repository.
+- This GitLab repository (the cargo-deny job also reads its work-item API:
+  every `ic/deny.toml` clearing-owner WI must be open — WI#363).
 - Docker Hub authentication and registry endpoints.
 - Debian Bookworm package mirrors.
 - crates.io index/static files and the pinned Git dependencies in `Cargo.lock`.
