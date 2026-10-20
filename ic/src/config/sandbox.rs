@@ -313,6 +313,17 @@ pub struct CronWorkerConfig {
     /// `tool_allowlist = []` or a rollback could no longer boot the config.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_allowlist: Vec<String>,
+    /// Per-mission retention window for persisted tick rows (WI#370): after
+    /// each tick the supervisor deletes this mission's tick rows (and their
+    /// `job_events`) beyond the newest `retain_last_ticks`, always keeping
+    /// the persisted last-job anchor. Bounds the unbounded `agent_jobs`/
+    /// `job_events` growth a schedule produces (up to 1,440 rows/day at the
+    /// 60s floor before reentries). Default: 50. Serialized only when set
+    /// (`CronWorkerConfig` is `deny_unknown_fields`, so an older binary
+    /// rejects any config carrying this key — write-backs must not
+    /// introduce it, matching the `tool_allowlist` rollback rule).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retain_last_ticks: Option<u32>,
 }
 
 impl CronWorkerConfig {
@@ -334,6 +345,11 @@ impl CronWorkerConfig {
     /// Minimum gap between scheduled fires (seconds) unless
     /// `allow_subminute_schedule` is set.
     pub const MIN_SCHEDULE_INTERVAL_SECS: u64 = 60;
+    /// Default per-mission retention of persisted tick rows (WI#370).
+    pub const DEFAULT_RETAIN_LAST_TICKS: u32 = 50;
+    /// Cap on `retain_last_ticks`: retention exists to bound growth, and a
+    /// window beyond this is almost certainly a typo.
+    pub const MAX_RETAIN_LAST_TICKS_LIMIT: u32 = 10_000;
 
     pub fn heartbeat_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(
@@ -344,6 +360,12 @@ impl CronWorkerConfig {
 
     pub fn max_reentries(&self) -> u32 {
         self.max_reentries.unwrap_or(Self::DEFAULT_MAX_REENTRIES)
+    }
+
+    /// Effective per-mission tick-row retention window (WI#370).
+    pub fn retain_last_ticks(&self) -> u32 {
+        self.retain_last_ticks
+            .unwrap_or(Self::DEFAULT_RETAIN_LAST_TICKS)
     }
 
     /// Per-link tick deadline. Defaults to the host's 4h cap so a tick
@@ -383,7 +405,19 @@ impl CronWorkerConfig {
         self.validate_reentries()?;
         self.validate_tick_timeout()?;
         self.validate_timezone()?;
+        self.validate_retention()?;
         self.validate_project_dir(worker_name)
+    }
+
+    fn validate_retention(&self) -> Result<(), String> {
+        if self.retain_last_ticks() > Self::MAX_RETAIN_LAST_TICKS_LIMIT {
+            return Err(format!(
+                "cron.retain_last_ticks {} exceeds the {} cap",
+                self.retain_last_ticks(),
+                Self::MAX_RETAIN_LAST_TICKS_LIMIT
+            ));
+        }
+        Ok(())
     }
 
     fn validate_timezone(&self) -> Result<(), String> {

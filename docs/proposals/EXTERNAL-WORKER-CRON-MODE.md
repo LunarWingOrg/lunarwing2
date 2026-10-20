@@ -58,6 +58,9 @@ heartbeat_timeout_secs = 900      # optional; default 900 (15 min); floor 5
 tick_timeout_ms = 14400000        # optional; host limit matching Kimi's default
                                   # 4h cap; bounded 1_000..=14_400_000
 max_reentries = 3                 # optional; default 3; hard cap 16
+retain_last_ticks = 50            # optional; default 50; cap 10_000 (WI#370 —
+                                  # per-mission retention of tick rows+events;
+                                  # the last-job anchor always survives)
 # allow_subminute_schedule = true # explicit override for fire gaps < 60s
 # project_dir = "missions/pr-digest" # optional; default "missions/<mission_id>"
 # Updated bridges create this directory for cron ticks. On older images,
@@ -213,6 +216,45 @@ silently stranding the mission — WI#323 class). After the fact, a mission's
 full session log is retrievable by reading the per-tick jobs' `job_events`
 (the mission id links the chain; each job's metadata carries `mission_id`,
 `tick_index`, `chain_index`).
+
+### 5. Retention and list visibility (WI#370)
+
+At the 60-second schedule floor each mission adds up to **1,440 `agent_jobs`
+rows per day before reentries**, plus `job_events` (a `cron_tick` per link, a
+`cron_tick_end`/`cron_reentry` per resolution). `list_jobs` sorts newest
+first and truncates to 100, so cron ticks hid ordinary jobs within hours.
+Two cooperating bounds:
+
+- **Per-mission retention (`cron.retain_last_ticks`, default 50, cap
+  10_000).** After every tick — and once at supervisor start, so a mission
+  idle across restarts still gets swept — the supervisor deletes this
+  mission's tick rows beyond the newest `retain_last_ticks`, always keeping
+  the persisted last-job anchor (`cron-mission:<id>:last-job`), even when
+  the anchor sits outside the window (DQ-6). Identification is exact: the
+  supervisor-authored prompt-title prefix for THIS mission (the row and its
+  marker are written by one INSERT), scoped to the mission worker's
+  `job_mode` and the mission owner — ordinary jobs, other missions' ticks,
+  and other owners' rows are never matched (pinned in the postgres lane).
+  `job_events` are deleted before their row (`delete_sandbox_job_cascade`)
+  because `job_events.job_id` has no `ON DELETE CASCADE; the PostgreSQL
+  integration target `postgres_cron_retention` pins the FK-safe order and
+  that the FK refuses an event for a missing job row. The sweep runs between
+  ticks, when no mission tick can be in flight. Storage growth is therefore
+  bounded at roughly `retain_last_ticks` job rows plus their events per
+  mission (a few hundred rows at the default), independent of schedule
+  cadence. Retention trades audit depth for boundedness: ticks beyond the
+  window lose their `job_events` audit trail with the row — raise the knob
+  (up to the cap) when a longer audit window matters more than the space.
+- **`list_jobs` cron filter.** Tick rows (title marker) and live tick
+  contexts (`cron_mode` metadata) are tagged `"cron_tick": true` and hidden
+  from the tool's 100-row window unless `include_cron: true` is passed.
+  Ordinary jobs stay discoverable even when retention keeps 50 ticks per
+  mission.
+
+After each sweep the anchor is re-checked: a deleted or foreign anchor row
+clears the live slot and the persisted setting, so lifecycle events
+(`cron_paused`/`cron_resumed`) can never be keyed to an orphan or
+cross-owner job row.
 
 ## Review-driven hardening (MR !1509)
 
