@@ -442,6 +442,10 @@ def validate_test_shapes(merged: dict, errors: list[str]) -> None:
         "rust-test-postgres-integration": (
             "--features postgres,integration",
             "--test workspace_integration",
+            # WI#370: the job_events FK semantics the cron retention sweep
+            # depends on must run against real PostgreSQL, not only the
+            # libSQL lane where the generic target is auto-discovered.
+            "--test postgres_cron_retention",
         ),
     }
     for job_name, fragments in expected.items():
