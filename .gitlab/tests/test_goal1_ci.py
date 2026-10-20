@@ -3060,5 +3060,117 @@ class TrivyGateInputTests(unittest.TestCase):
         gate_check.assert_called_once()
 
 
+class ProxyToolSetSyncTests(unittest.TestCase):
+    """MR !1780 review LM-5 (run 171): nothing kept mt-admin's
+    EXTERNAL_WORKER_PROXY_TOOLS (09-worker-config.sh) in sync with the
+    daemon's PROXY_TOOL_ALLOWLIST (ic/src/orchestrator/external_worker.rs),
+    so a daemon change drifted silently — a widened set is refused at the
+    operator boundary, a narrowed set is written and then stripped at load.
+    config.validate_proxy_tool_set_sync closes both drifts and fails closed
+    on a renamed constant or a missing file."""
+
+    SHELL_TOOLS = (
+        "memory_read memory_write knowledge_search knowledge_submit_note "
+        "knowledge_get_topic gitlab_tool gitlab-tool"
+    )
+    DAEMON_TOOLS = (
+        "memory_read",
+        "memory_write",
+        "knowledge_search",
+        "knowledge_submit_note",
+        "knowledge_get_topic",
+        "gitlab_tool",
+        "gitlab-tool",
+    )
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = pathlib.Path(temporary.name)
+        self.worker_config = self.root / "09-worker-config.sh"
+        self.write_shell(self.SHELL_TOOLS)
+        self.daemon_source = self.root / "external_worker.rs"
+        self.write_daemon(*self.DAEMON_TOOLS)
+
+    def write_shell(self, tools: str):
+        self.worker_config.write_text(
+            f'EXTERNAL_WORKER_PROXY_TOOLS="{tools}"\n', encoding="utf-8"
+        )
+
+    def write_daemon(self, *names: str, comment: str | None = None):
+        lines = [f'    "{name}",' for name in names]
+        if comment is not None:
+            lines.append(f"    // {comment}")
+        self.daemon_source.write_text(
+            "const PROXY_TOOL_ALLOWLIST: &[&str] = &[\n" + "\n".join(lines) + "\n];\n",
+            encoding="utf-8",
+        )
+
+    def errors(self):
+        errors = []
+        with mock.patch.multiple(
+            config,
+            MT_ADMIN_WORKER_CONFIG=self.worker_config,
+            EXTERNAL_WORKER_SOURCE=self.daemon_source,
+        ):
+            config.validate_proxy_tool_set_sync(errors)
+        return errors
+
+    def test_matching_sets_pass(self):
+        self.assertEqual(self.errors(), [])
+
+    def test_real_tree_lists_match(self):
+        # The review's ask, verbatim: extract both lists from the checked-in
+        # sources and assert they are equal (main() runs the same validator in
+        # the ci-config job).
+        errors = []
+        config.validate_proxy_tool_set_sync(errors)
+        self.assertEqual(errors, [])
+
+    def test_daemon_set_widened_without_the_shell_is_caught(self):
+        # The shell list lost a daemon tool: a widened PROXY_TOOL_ALLOWLIST
+        # would be refused at the operator boundary (grant never issuable).
+        self.write_shell("memory_read memory_write")
+        self.assertTrue(any("missing daemon tools" in error for error in self.errors()))
+
+    def test_daemon_set_narrowed_without_the_shell_is_caught(self):
+        # The daemon dropped tools the shell still grants: written as a grant,
+        # then stripped at load (the "lying config" shape).
+        self.write_daemon("memory_read", "gitlab_tool", "gitlab-tool")
+        self.assertTrue(any("stripped at daemon load" in error for error in self.errors()))
+
+    def test_missing_declaration_or_file_is_caught(self):
+        # Fail closed: no vacuous pass when a constant is renamed away or a
+        # file goes missing.
+        self.worker_config.write_text(
+            "readonly OTHER_TOOLS='memory_read memory_write'\n", encoding="utf-8"
+        )
+        self.assertTrue(any("EXTERNAL_WORKER_PROXY_TOOLS" in error for error in self.errors()))
+        self.write_shell(self.SHELL_TOOLS)
+        self.daemon_source.write_text("const OTHER_ALLOWLIST: &[&str] = &[];\n", encoding="utf-8")
+        self.assertTrue(any("PROXY_TOOL_ALLOWLIST" in error for error in self.errors()))
+        self.daemon_source.unlink()
+        self.assertTrue(any("external_worker.rs missing" in error for error in self.errors()))
+
+    def test_shell_duplicate_entries_are_caught(self):
+        duplicated = self.SHELL_TOOLS.replace(
+            " knowledge_search", " knowledge_search memory_read", 1
+        )
+        self.write_shell(duplicated)
+        self.assertTrue(any("duplicate entries" in error for error in self.errors()))
+
+    def test_daemon_comment_strings_do_not_count_as_tools(self):
+        # A quoted name inside the const body's prose must not widen the
+        # extracted set (dropping the comment strip fails this pin).
+        self.write_daemon(*self.DAEMON_TOOLS, comment='mentioning "shell_exec" here')
+        self.assertEqual(self.errors(), [])
+
+    def test_main_runs_the_sync_validator(self):
+        # GV-2 precedent: deleting the main() call must not pass the suite.
+        with mock.patch.object(config, "validate_proxy_tool_set_sync") as sync_check:
+            self.assertEqual(config.main(), 0)
+        sync_check.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
