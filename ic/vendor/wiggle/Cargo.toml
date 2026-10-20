@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.86.0"
 name = "wiggle"
-version = "36.0.18"
+version = "36.0.19"
 authors = [
     "Pat Hickey <phickey@fastly.com>",
     "Jakub Konka <kubkonk@jakubkonka.com>",
@@ -76,12 +76,12 @@ version = "2.0.12"
 version = "0.1.26"
 
 [dependencies.wasmtime]
-version = "36.0.18"
+version = "36.0.19"
 optional = true
 default-features = false
 
 [dependencies.wiggle-macro]
-version = "=36.0.18"
+version = "=36.0.19"
 
 [dependencies.witx]
 version = "0.9.1"
@@ -99,7 +99,7 @@ features = [
 ]
 
 [dev-dependencies.wasmtime]
-version = "36.0.18"
+version = "36.0.19"
 default-features = false
 
 [lints.clippy]

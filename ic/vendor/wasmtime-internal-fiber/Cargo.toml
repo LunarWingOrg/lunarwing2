@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.86.0"
 name = "wasmtime-internal-fiber"
-version = "36.0.18"
+version = "36.0.19"
 authors = ["The Wasmtime Project Developers"]
 build = "build.rs"
 autolib = false
@@ -42,11 +42,11 @@ default-features = false
 version = "1.0"
 
 [dependencies.wasmtime-asm-macros]
-version = "=36.0.18"
+version = "=36.0.19"
 package = "wasmtime-internal-asm-macros"
 
 [dependencies.wasmtime-versioned-export-macros]
-version = "=36.0.18"
+version = "=36.0.19"
 package = "wasmtime-internal-versioned-export-macros"
 
 [dev-dependencies.backtrace]
@@ -56,7 +56,7 @@ version = "0.3.68"
 version = "1.0"
 
 [build-dependencies.wasmtime-versioned-export-macros]
-version = "=36.0.18"
+version = "=36.0.19"
 package = "wasmtime-internal-versioned-export-macros"
 
 [target."cfg(unix)".dependencies.libc]
