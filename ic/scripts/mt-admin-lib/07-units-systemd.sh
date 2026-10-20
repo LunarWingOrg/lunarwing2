@@ -370,6 +370,23 @@ render_voice_systemd_assets() {
 
 # ── Systemd service units ────────────────────────────────────────────────────
 
+# Write one tenant unit file without root ever opening the tenant-controlled
+# ~/.config destination (WI#446, run-166 LF-8): the body (a heredoc — an
+# infallible producer once expanded) is staged into a root-private mktemp and
+# committed through the tenant-side atomic writer, which refuses pre-placed
+# symlinks and foreign-owned targets. Plain user units land 0644 like the old
+# root `cat >` under umask 022; secret-bearing Quadlets land 0600.
+_write_systemd_unit() {  # <tenant> <path> <mode> — unit body on stdin
+  local name="$1" path="$2" mode="$3" staged rc=1
+  staged="$(mktemp)" || return 1
+  if cat >"$staged" \
+    && write_tenant_file_atomic "$name" "$path" "$mode" owned-parent <"$staged"; then
+    rc=0
+  fi
+  rm -f -- "$staged"
+  return "$rc"
+}
+
 # Render a per-tenant Quadlet .container for the Postgres container. The podman
 # user-generator turns this into lunarwing-pg-<t>.service at `systemctl --user
 # daemon-reload`; [Install] makes the lingering user manager start it at boot.
@@ -385,8 +402,14 @@ render_pg_quadlet() {
   if ! pg_password="$(tenant_pg_password "$name")"; then
     die "could not resolve the PostgreSQL password for tenant '$name'"
   fi
-  mkdir -p "$qdir"
-  cat >"$qdir/lunarwing-pg-${name}.container" <<EOF
+  # WI#446 (run-166 LF-8): the Quadlet dir and file are created tenant-side —
+  # root mkdir/cat/chmod/chown through ~/.config followed tenant-planted
+  # symlinks, and the file embeds POSTGRES_PASSWORD, so a redirect would have
+  # leaked it into an attacker-chosen path.
+  tenant_mkdir_p "$name" "$qdir" \
+    || die "could not safely create $qdir as tenant '$name'"
+  _write_systemd_unit "$name" "$qdir/lunarwing-pg-${name}.container" 600 <<EOF \
+    || die "could not safely write the Postgres Quadlet as tenant '$name'"
 [Unit]
 Description=LunarWing Postgres container ($name)
 After=network-online.target
@@ -416,8 +439,6 @@ TimeoutStartSec=120
 [Install]
 WantedBy=default.target
 EOF
-  chmod 0600 "$qdir/lunarwing-pg-${name}.container"
-  chown -R "$name:$name" "$(tenant_home "$name")/.config/containers"
 }
 
 # Render a per-tenant Quadlet .container for an external worker.
@@ -456,7 +477,8 @@ render_worker_quadlet() {
   [[ -z "$runtime_env_path" ]] \
     || runtime_env_hash="$(sha256sum "$runtime_env_path" | cut -d' ' -f1)"
   [[ "$worker" != "kimi" ]] || health_path="ready"
-  mkdir -p "$qdir"
+  tenant_mkdir_p "$name" "$qdir" \
+    || die "could not safely create $qdir as tenant '$name'"
 
   local agent_token tz_key env_snapshot
   # Scoped worker credential (WI#205): the worker is the WS server and this is
@@ -515,6 +537,12 @@ render_worker_quadlet() {
     fi
   fi
 
+  local unit_staged
+  # WI#446 (run-166 LF-8): the Quadlet embeds AGENT_AUTH_TOKEN/TENSORZERO_API_KEY,
+  # and its ~/.config/containers destination is tenant-controlled — the producer
+  # group below is not infallible, so per the atomic writer's contract it is
+  # staged root-private first and only committed tenant-side once it completed.
+  unit_staged="$(mktemp)" || return 1
   {
     cat <<EOF
 [Unit]
@@ -645,9 +673,12 @@ TimeoutStartSec=120
 [Install]
 WantedBy=default.target
 EOF
-  } >"$qdir/lunarwing-${worker}-${name}.container"
-  chmod 0600 "$qdir/lunarwing-${worker}-${name}.container"
-  chown -R "$name:$name" "$(tenant_home "$name")/.config/containers"
+  } >"$unit_staged"
+  if ! write_tenant_file_atomic "$name" "$qdir/lunarwing-${worker}-${name}.container" 600 owned-parent <"$unit_staged"; then
+    rm -f -- "$unit_staged"
+    die "could not safely write the ${worker} Quadlet as tenant '$name'"
+  fi
+  rm -f -- "$unit_staged"
 }
 
 # Render the WeeChat systemd user unit into <out_dir>.
@@ -663,7 +694,11 @@ _render_weechat_systemd_unit() {  # <tenant> <out_dir>
   start_helper="$(tenant_lw_root "$name")/ic/scripts/lunarwing-weechat-start.sh"
   stop_helper="$(tenant_lw_root "$name")/ic/scripts/lunarwing-weechat-stop.sh"
   weechat_binary="$(command -v weechat)"
-  cat >"$out_dir/lunarwing-weechat-${name}.service" <<EOF
+  # WI#446: the unit lands in the tenant-controlled ~/.config tree, so the
+  # write goes through the tenant-side atomic writer (0644, matching the old
+  # root `cat >` under umask 022).
+  _write_systemd_unit "$name" "$out_dir/lunarwing-weechat-${name}.service" 644 <<EOF \
+    || die "could not safely write the WeeChat unit as tenant '$name'"
 [Unit]
 Description=WeeChat IRC client ($name)
 After=network.target
@@ -687,8 +722,14 @@ render_tenant_systemd_units() {
   ensure_container_runtime
   local user_unit_dir
   user_unit_dir="$(tenant_home "$name")/.config/systemd/user"
-  mkdir -p "$user_unit_dir"
-  chown -R "$name:$name" "$(tenant_home "$name")/.config"
+  # WI#446 (run-166 LF-8): the unit tree under the tenant-controlled ~/.config
+  # is created and written tenant-side. The historical root `mkdir -p` plus
+  # `chown -R ~/.config` dereferenced tenant-planted symlinks (the chown
+  # operand follows a pre-placed link and recursively re-owns an
+  # attacker-chosen tree); tenant-side creation owns the directories outright,
+  # so the handover chown disappears entirely.
+  tenant_mkdir_p "$name" "$user_unit_dir" \
+    || die "could not safely create $user_unit_dir as tenant '$name'"
 
   local repo env_dir state_dir proxy_port bridge_port weechat_port
   repo="$(tenant_repo "$name")"
@@ -724,7 +765,8 @@ render_tenant_systemd_units() {
   [[ -n "$proxy_upstream" ]] \
     || die "proxy enabled for tenant '$name' but $env_dir/proxy.env has no TENSORZERO_URL; re-render with: $0 add-tenant $name --tensorzero-url <url>"
   validate_llm_url "$proxy_upstream" "proxy.env TENSORZERO_URL ($name)"
-  cat >"$user_unit_dir/lunarwing-proxy-${name}.service" <<EOF
+  _write_systemd_unit "$name" "$user_unit_dir/lunarwing-proxy-${name}.service" 644 <<EOF \
+    || return 1
 [Unit]
 Description=LunarWing TensorZero proxy ($name)
 After=network.target
@@ -746,13 +788,18 @@ EOF
     # WeeChat unit (runs in tmux so you can attach: tmux -L weechat-${name} attach)
     local weechat_home
     weechat_home="$(tenant_home "$name")/.config/weechat"
-    mkdir -p "$weechat_home"
-    chown "$name:$name" "$weechat_home"
+    # WI#446 (run-166 LF-8, the review's prototyped fix): root's mkdir+chown
+    # through the tenant-controlled ~/.config chain is replaced by a
+    # tenant-side mkdir — the chown operand dereferenced a pre-placed symlink
+    # at ~/.config/weechat and re-owned an attacker-chosen path.
+    tenant_mkdir_p "$name" "$weechat_home" \
+      || die "could not safely create $weechat_home as tenant '$name'"
 
     _render_weechat_systemd_unit "$name" "$user_unit_dir"
 
     # WeeChat WS adapter unit
-    cat >"$user_unit_dir/lunarwing-weechat-adapter-${name}.service" <<EOF
+    _write_systemd_unit "$name" "$user_unit_dir/lunarwing-weechat-adapter-${name}.service" 644 <<EOF \
+      || return 1
 [Unit]
 Description=LunarWing WeeChat WS adapter ($name)
 After=network.target lunarwing-weechat-${name}.service
@@ -785,7 +832,8 @@ EOF
     local darkirc_adapter_path
     darkirc_adapter_path="$(tenant_lw_root "$name")/darkirc_channel_for_lunarwing/darkirc/adapter/darkirc_adapter.py"
 
-    cat >"$user_unit_dir/lunarwing-darkirc-adapter-${name}.service" <<EOF
+    _write_systemd_unit "$name" "$user_unit_dir/lunarwing-darkirc-adapter-${name}.service" 644 <<EOF \
+      || return 1
 [Unit]
 Description=LunarWing DarkIRC adapter ($name)
 After=network.target
@@ -804,7 +852,8 @@ WantedBy=default.target
 EOF
 
     # DarkIRC daemon unit
-    cat >"$user_unit_dir/lunarwing-darkirc-${name}.service" <<EOF
+    _write_systemd_unit "$name" "$user_unit_dir/lunarwing-darkirc-${name}.service" 644 <<EOF \
+      || return 1
 [Unit]
 Description=DarkIRC daemon ($name)
 After=network.target
@@ -823,7 +872,8 @@ EOF
   fi
 
   # Bridge unit
-  cat >"$user_unit_dir/xmpp-bridge-${name}.service" <<EOF
+  _write_systemd_unit "$name" "$user_unit_dir/xmpp-bridge-${name}.service" 644 <<EOF \
+    || return 1
 [Unit]
 Description=LunarWing XMPP bridge ($name)
 After=network.target
@@ -871,7 +921,8 @@ EOF
   fi
 
   # Main daemon unit
-  cat >"$user_unit_dir/lunarwing-${name}.service" <<EOF
+  _write_systemd_unit "$name" "$user_unit_dir/lunarwing-${name}.service" 644 <<EOF \
+    || return 1
 [Unit]
 Description=LunarWing AI assistant ($name)
 After=network.target ${pg_dep_after}xmpp-bridge-${name}.service${proxy_sd_after}${weechat_sd_after}${darkirc_sd_after}
@@ -908,7 +959,8 @@ EOF
   # builds (build_tenant) run under lunarwing-build.slice. Slice names are
   # constant across tenants because each tenant has its own systemd user
   # manager.
-  cat >"$user_unit_dir/$WORKLOAD_SLICE" <<EOF
+  _write_systemd_unit "$name" "$user_unit_dir/$WORKLOAD_SLICE" 644 <<EOF \
+    || return 1
 [Unit]
 Description=LunarWing transient agent workloads ($name)
 
@@ -919,7 +971,8 @@ CPUQuota=$WORKLOAD_CPU_QUOTA
 TasksMax=$WORKLOAD_TASKS_MAX
 EOF
 
-  cat >"$user_unit_dir/$BUILD_SLICE" <<EOF
+  _write_systemd_unit "$name" "$user_unit_dir/$BUILD_SLICE" 644 <<EOF \
+    || return 1
 [Unit]
 Description=LunarWing operator build workloads ($name)
 
@@ -933,7 +986,6 @@ EOF
   # image availability determine whether those units should exist.
   render_vision_systemd_assets "$name" || return 1
 
-  chown -R "$name:$name" "$user_unit_dir"
   say "rendered systemd units for $name in $user_unit_dir"
 }
 
