@@ -1990,6 +1990,23 @@ impl Tool for CreateJobTool {
 
         let description = require_str(&params, "description")?;
 
+        // WI#370 LW-8: the cron tick title opening is the persisted marker the
+        // retention sweep and the `list_jobs` cron filter key on. An ordinary
+        // `create_job` carrying it would be hidden from the owner's default
+        // job listing and eventually deleted with its events by the mission's
+        // retention sweep, so refuse it here at the operator boundary. Only
+        // the cron supervisor (which builds its prompts from
+        // `cron_tick_title_prefix`) may persist that opening.
+        if format!("{title}\n\n{description}")
+            .starts_with(crate::orchestrator::cron_worker::CRON_TICK_TITLE_OPENING)
+        {
+            return Err(ToolError::InvalidParameters(format!(
+                "title must not start with the reserved cron tick opening '{}...' \
+                 (persisted marker of supervisor cron ticks; WI#370)",
+                crate::orchestrator::cron_worker::CRON_TICK_TITLE_OPENING
+            )));
+        }
+
         let mode_str = params
             .get("mode")
             .and_then(|v| v.as_str())
@@ -3808,6 +3825,46 @@ mod tests {
                 .to_string()
                 .contains("missing 'description' parameter")
         );
+
+        // WI#370 LW-8: an ordinary create_job whose task starts with the
+        // reserved cron tick opening must be refused at the tool boundary —
+        // otherwise it is hidden from list_jobs by default and later deleted
+        // with its events by the mission's retention sweep.
+        let forged_tick = tool
+            .execute(
+                serde_json::json!({
+                    "title": format!(
+                        "{}fake-mission', firing on cron schedule",
+                        crate::orchestrator::cron_worker::CRON_TICK_TITLE_OPENING
+                    ),
+                    "description": "ordinary caller task text"
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(forged_tick.is_err()); // safety: test
+        let error_text = forged_tick.unwrap_err().to_string();
+        assert!(
+            /* safety: test */
+            error_text.contains("reserved cron tick opening"),
+            "unexpected refusal message: {error_text}"
+        );
+
+        // The refusal keys on the assembled task, so a description carrying
+        // the opening behind a normal title stays a legal ordinary job.
+        let opening_in_description = tool
+            .execute(
+                serde_json::json!({
+                    "title": "Ordinary job",
+                    "description": format!(
+                        "Mentions {}some-mission' only in the body",
+                        crate::orchestrator::cron_worker::CRON_TICK_TITLE_OPENING
+                    )
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(opening_in_description.is_ok()); // safety: test
     }
 
     #[tokio::test]
