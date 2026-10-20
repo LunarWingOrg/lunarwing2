@@ -2241,10 +2241,19 @@ impl MissionManager {
             .store
             .list_missions_with_shared(project_id, user_id)
             .await?;
-        for mut mission in missions
+        for snapshot in missions
             .into_iter()
             .filter(|mission| mission.is_owned_by(user_id) && is_skill_learning_mission(mission))
         {
+            // WI#317: reload under the mission's fire lock before saving, so
+            // a concurrent fire's reservation (thread history, budget count,
+            // dedup key) is not overwritten by the stale list copy.
+            let lock = mission_lock(&self.fire_locks, snapshot.id).await;
+            let _guard = lock.lock().await;
+            let Some(mut mission) = self.store.load_mission(snapshot.id).await? else {
+                // Deleted between the list and the lock.
+                continue;
+            };
             if mission.status == MissionStatus::Active {
                 mark_gate_paused(&mut mission);
                 mission.updated_at = Utc::now();
@@ -2326,7 +2335,17 @@ impl MissionManager {
             .iter()
             .find(|m| m.metadata.get(metadata_key).is_some())
         {
-            let mut mission = existing.clone();
+            // WI#317: reload under the mission's fire lock before
+            // reconciling, so a concurrent fire's reservation (thread
+            // history, budget count, dedup key) is not overwritten by the
+            // stale list copy.
+            let lock = mission_lock(&self.fire_locks, existing.id).await;
+            let _guard = lock.lock().await;
+            let Some(mut mission) = self.store.load_mission(existing.id).await? else {
+                // Deleted between the list and the lock; nothing to
+                // reconcile onto a vanished record.
+                return Ok(existing.id);
+            };
             if mission.deleted_at.is_some() {
                 return Ok(mission.id);
             }
@@ -3337,12 +3356,30 @@ impl MissionManager {
     /// Entries carry the thread ID so a crash between those writes is
     /// recoverable without duplicating history. Notifications are best-effort
     /// and may repeat if the process dies before the acknowledgement saves.
+    ///
+    /// WI#317: every mission this pass mutates is reloaded and saved under
+    /// its fire lock — boot arms retry wakes and resumed-thread outcome
+    /// watchers before this loop runs, so an unlocked stale-copy save here
+    /// could silently revert a concurrent fire's reservation.
     pub async fn record_restart_interrupted_missions(&self) -> Result<Vec<MissionId>, EngineError> {
         let mut recorded = Vec::new();
-        for mission in self.store.list_all_missions_global().await? {
-            let mut mission = mission;
-            let mut changed = false;
+        for snapshot in self.store.list_all_missions_global().await? {
+            // WI#317: boot arms retry wakes and resumed-thread outcome
+            // watchers before this pass, so a mission fire can save the
+            // record while the loop iterates. The global list is only the
+            // candidate set — each mission is reloaded and saved under its
+            // fire lock, the same serialisation `fire_mission_inner` and the
+            // outcome watcher use, so this pass cannot overwrite a fire's
+            // thread-history entry, `last_fired_at`, daily-budget count, or
+            // trigger dedup key with a stale copy.
+            let lock = mission_lock(&self.fire_locks, snapshot.id).await;
+            let _guard = lock.lock().await;
+            let Some(mut mission) = self.store.load_mission(snapshot.id).await? else {
+                // Deleted between the candidate list and the lock.
+                continue;
+            };
             let history = mission.thread_history.clone();
+            let mut changed = false;
             for thread_id in history {
                 if self
                     .record_restart_interrupted_thread(&mut mission, thread_id)
