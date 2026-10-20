@@ -532,6 +532,15 @@ Commands:
                                    legacy gitlab-tool). 'none' clears the grant.
                                    Refused on mode="cron" workers (grant
                                    cron.tool_allowlist on the mission instead).
+                                   Every job that worker container runs,
+                                   concurrently and in sequence (one container
+                                   is one authority domain), can then use the
+                                   granted tools with the tenant's authority:
+                                   read and write the tenant's memory, submit
+                                   notes to the shared knowledge corpus, and
+                                   act on GitLab with the tenant's token
+                                   (gitlab_tool). Grant the smallest set the
+                                   lane needs.
                                    Restart the tenant daemon to load it
                                    (restart-tenant <name>).
 
