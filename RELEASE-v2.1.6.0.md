@@ -1,10 +1,10 @@
 # Release Notes for LunarWing v2.1.6.0
 
-**DRAFT — pre-release; content reflects the v2.1.6.0 tree as of 2026-10-19 and may grow before the tag is cut.**
+**DRAFT — pre-release; content reflects the v2.1.6.0 tree as of 2026-10-20 and may grow before the tag is cut.**
 
 ## Codename: Tsuno (角, つの): The Horns
 
-**Release date:** TBD (drafted 2026-10-16; refreshed 2026-10-19)
+**Release date:** TBD (drafted 2026-10-16; refreshed 2026-10-20)
 
 > Not raised in anger,
 > but set and sure all the same —
@@ -241,9 +241,10 @@ bridge binary (`pebble4lunarwing mcp-shim`). WI#324's real-worker
 acceptance (a granted proxied call from a real worker, and
 `knowledge_search` hits through the proxy) has no evidence yet: the kimi
 test-tenant jobs on rebuilt images (soarin, fleetfoot) returned a fixed
-`KIMI_WORKER_OK` string without a proxied call, and mt-admin renders no
-worker `tool_allowlist` (the default is empty, so a managed tenant has no
-proxied tools until an operator grants them). The opencode and opencode2
+`KIMI_WORKER_OK` string without a proxied call, and the default
+`tool_allowlist` is empty, so a managed tenant has no proxied tools until an
+operator grants them (`lunarwing-mt-admin.sh configure-worker-tools`, then
+`restart-tenant`). The opencode and opencode2
 plugins and the pebble shim reach tenants only with rebuilt images (the
 opencode one on the known-broken v1.18.25 lane, WI#333, bump-or-retire
 pending), and no real opencode, opencode2 or pebble job has exercised
@@ -1083,8 +1084,8 @@ worker-side tool-proxy bridge in this release (an MCP shim for kimi,
 serve-process plugins for opencode and opencode2), and the pebble lane
 ships the same MCP shim shape inside its Rust bridge binary. Proxied tools
 are off by default: a worker's `tool_allowlist` is empty unless an operator
-sets it, and mt-admin renders none, so every proxied call is denied until
-an operator adds one to the tenant config. No real worker has made a
+sets it (`configure-worker-tools` on multi-tenant hosts), so every proxied
+call is denied until an operator grants one. No real worker has made a
 granted proxied call yet, so WI#324's real-worker acceptance is still
 open, and the opencode and opencode2 plugins and the pebble shim ship only
 with their rebuilt images (the opencode one on a lane that stays frozen at
