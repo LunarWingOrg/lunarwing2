@@ -51,6 +51,7 @@ const NON_RETRYABLE_ERRNOS = new Set(["ENOTDIR", "ELOOP", "EACCES", "EPERM"])
 export function resolveTaskWorkspace(
   context: { project_dir?: string; cron_tick?: unknown } | undefined,
   workspaceRoot: string,
+  testHooks?: { beforeReresolve?: () => void },
 ): string {
   const tick = context?.cron_tick
   if (!tick || typeof tick !== "object" || !("event" in tick) || tick.event !== "cron.tick") {
@@ -86,6 +87,11 @@ export function resolveTaskWorkspace(
       closeSync(fd)
       fd = next
     }
+    // WI#444: deterministic test hook — a test injects the in-root redirect
+    // swap at exactly this point (between the descriptor walk and the
+    // re-resolve) so the DS-1 refusal is pinned on every run, with no
+    // dependence on winning a race. Never passed by production callers.
+    testHooks?.beforeReresolve?.()
     const resolved = resolveWorkspacePath(path, root)
     // DS-1: the descriptor walk and the re-resolved path must name the same
     // directory — a dev/ino mismatch means an in-root redirect raced the
