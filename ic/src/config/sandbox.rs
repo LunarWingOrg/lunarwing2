@@ -316,9 +316,14 @@ pub struct CronWorkerConfig {
     /// Per-mission retention window for persisted tick rows (WI#370): after
     /// each tick the supervisor deletes this mission's tick rows (and their
     /// `job_events`) beyond the newest `retain_last_ticks`, always keeping
-    /// the persisted last-job anchor. Bounds the unbounded `agent_jobs`/
-    /// `job_events` growth a schedule produces (up to 1,440 rows/day at the
-    /// 60s floor before reentries). Default: 50. Serialized only when set
+    /// the persisted last-job anchor. The window counts JOB ROWS, not
+    /// distinct ticks — a re-dispatched link carries the same prompt prefix,
+    /// so one tick with reentries spends several rows of the window. Bounds
+    /// the unbounded `agent_jobs`/`job_events` growth a schedule produces
+    /// (up to 1,440 rows/day at the 60s floor before reentries).
+    /// Default: 50; floor: 1 (a window of 0 would keep nothing but the
+    /// anchor — use the anchor's own lifecycle if no tick history is
+    /// wanted); cap: 10,000. Serialized only when set
     /// (`CronWorkerConfig` is `deny_unknown_fields`, so an older binary
     /// rejects any config carrying this key — write-backs must not
     /// introduce it, matching the `tool_allowlist` rollback rule).
@@ -347,6 +352,10 @@ impl CronWorkerConfig {
     pub const MIN_SCHEDULE_INTERVAL_SECS: u64 = 60;
     /// Default per-mission retention of persisted tick rows (WI#370).
     pub const DEFAULT_RETAIN_LAST_TICKS: u32 = 50;
+    /// Floor on `retain_last_ticks` (LW-9): a window of 0 would keep nothing
+    /// but the anchor — the anchor is always kept anyway, so 0 is almost
+    /// certainly a misconfiguration and is refused.
+    pub const MIN_RETAIN_LAST_TICKS: u32 = 1;
     /// Cap on `retain_last_ticks`: retention exists to bound growth, and a
     /// window beyond this is almost certainly a typo.
     pub const MAX_RETAIN_LAST_TICKS_LIMIT: u32 = 10_000;
@@ -410,6 +419,14 @@ impl CronWorkerConfig {
     }
 
     fn validate_retention(&self) -> Result<(), String> {
+        if self.retain_last_ticks() < Self::MIN_RETAIN_LAST_TICKS {
+            return Err(format!(
+                "cron.retain_last_ticks {} is below the floor of {} (the anchor is always kept; \
+                 the window must keep at least one tick row)",
+                self.retain_last_ticks(),
+                Self::MIN_RETAIN_LAST_TICKS
+            ));
+        }
         if self.retain_last_ticks() > Self::MAX_RETAIN_LAST_TICKS_LIMIT {
             return Err(format!(
                 "cron.retain_last_ticks {} exceeds the {} cap",
@@ -1658,5 +1675,31 @@ hearbeat_timeout_secs = 300
             settings.is_err(),
             "a misspelled cron key must fail TOML deserialization"
         );
+    }
+
+    /// WI#370 LW-9: the retention window is load-validated on both ends —
+    /// 0 would keep nothing but the anchor (the anchor is always kept
+    /// anyway), and beyond the cap a typo would silently re-enable unbounded
+    /// growth. Both reject the worker at load.
+    #[test]
+    fn cron_retention_window_is_floored_and_capped() {
+        assert!(
+            resolve_cron_worker("schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nretain_last_ticks = 0")
+                .is_none(),
+            "retain_last_ticks = 0 must reject the worker at load"
+        );
+        assert!(resolve_cron_worker(
+            "schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nretain_last_ticks = 1"
+        )
+        .is_some());
+        assert!(resolve_cron_worker(
+            "schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nretain_last_ticks = 50"
+        )
+        .is_some());
+        assert!(resolve_cron_worker(&format!(
+            "schedule = \"0 15 10 * * *\"\ngoal = \"g\"\nretain_last_ticks = {}",
+            CronWorkerConfig::MAX_RETAIN_LAST_TICKS_LIMIT + 1
+        ))
+        .is_none());
     }
 }

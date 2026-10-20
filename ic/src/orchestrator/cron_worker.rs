@@ -41,10 +41,12 @@
 //!   the DB-backed settings store, so it does not restart at 1 on every boot.
 //! - **Bounded persistence (WI#370)** — after every tick (and once at
 //!   supervisor start) a per-mission retention sweep deletes this mission's
-//!   tick rows beyond `cron.retain_last_ticks` (default 50), always keeping
-//!   the persisted last-job anchor, deleting `job_events` before their row so
-//!   the `job_events.job_id` FK never dangles, and re-checking the anchor so
-//!   a deleted anchor can never receive orphan or cross-owner events.
+//!   tick rows beyond `cron.retain_last_ticks` (default 50; the window counts
+//!   job rows, not distinct ticks — a tick's re-dispatched links each spend
+//!   one row), always keeping the persisted last-job anchor, deleting
+//!   `job_events` before their row so the `job_events.job_id` FK never
+//!   dangles, and re-checking the anchor so a deleted anchor can never
+//!   receive orphan or cross-owner events.
 //! - **Fail-closed control state (WI#371)** — the pause flag and the
 //!   circuit-breaker counter share one atomic settings row
 //!   (`cron-mission:<id>:control`), written with bounded-retry backoff. A
@@ -1943,8 +1945,10 @@ async fn load_last_tick_job(
 /// Identification is exact: the supervisor-authored prompt-title prefix for
 /// THIS mission, scoped to this worker's `job_mode` and the mission owner —
 /// ordinary jobs, other missions' ticks, and other owners' rows are never
-/// matched. The persisted last-job anchor always survives (DQ-6).
-/// `job_events` are deleted before their job row
+/// matched. The window counts JOB ROWS, not distinct ticks: a re-dispatched
+/// link carries the same prompt prefix, so one tick with reentries spends
+/// several rows of the window. The persisted last-job anchor always survives
+/// (DQ-6). `job_events` are deleted before their job row
 /// (`delete_sandbox_job_cascade`) so the `job_events.job_id` FK never
 /// dangles. The sweep runs between ticks (once at supervisor start and
 /// after each tick resolves), when no mission tick can be in flight, so an
