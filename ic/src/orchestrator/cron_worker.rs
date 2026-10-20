@@ -2729,7 +2729,9 @@ mod tests {
         let live = Arc::new(std::sync::Mutex::new(Some(deleted)));
         recheck_last_job_anchor(&test_ctx(&manager, &worker, &cron, &live)).await;
         assert!(
-            live.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_none(),
+            live.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
             "a deleted anchor must be cleared from the live slot"
         );
         assert!(
@@ -2745,10 +2747,14 @@ mod tests {
         db.set_setting("owner", key, &serde_json::json!(foreign))
             .await
             .unwrap(); // safety: test
-        *live.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(foreign);
+        *live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(foreign);
         recheck_last_job_anchor(&test_ctx(&manager, &worker, &cron, &live)).await;
         assert!(
-            live.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_none(),
+            live.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
             "a foreign anchor must be cleared from the live slot"
         );
         assert!(
@@ -2764,10 +2770,14 @@ mod tests {
         db.set_setting("owner", key, &serde_json::json!(owned))
             .await
             .unwrap(); // safety: test
-        *live.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(owned);
+        *live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(owned);
         recheck_last_job_anchor(&test_ctx(&manager, &worker, &cron, &live)).await;
         assert_eq!(
-            *live.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            *live
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             Some(owned),
             "a valid owned anchor must survive the re-check"
         );
@@ -2777,10 +2787,14 @@ mod tests {
         );
 
         // No anchor at all: a no-op, not an error.
-        *live.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         recheck_last_job_anchor(&test_ctx(&manager, &worker, &cron, &live)).await;
         assert!(
-            live.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_none()
+            live.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none()
         );
     }
 
