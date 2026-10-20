@@ -294,21 +294,35 @@ schedule floor a mission added up to 1,440 `agent_jobs` rows per day before
 reentries, and `list_jobs` sorts newest-first with a 100-row window — ticks
 hid ordinary jobs within hours. Two cooperating bounds landed:
 
-- **Per-mission retention** (`cron.retain_last_ticks`, default 50, cap
-  10,000): after every tick — and once at supervisor start, so an idle or
+- **Per-mission retention** (`cron.retain_last_ticks`, default 50, floor 1,
+  cap 10,000): after every tick — and once at supervisor start, so an idle or
   paused mission still gets swept on boot — the supervisor deletes that
   mission's tick rows beyond the newest `retain_last_ticks`, always keeping
   the persisted last-job anchor (which owner pause/resume audit events key
   to), deleting `job_events` before their row (`job_events.job_id` has no
   `ON DELETE CASCADE`), and re-checking the anchor afterwards so a deleted
-  or foreign anchor can never receive orphan or cross-owner events. Tick
-  rows are identified exactly — the supervisor-authored prompt-title prefix
-  for that mission, scoped to the worker's `job_mode` and the mission owner
-  — so ordinary jobs, other missions' ticks, and other owners' rows are
-  never matched.
+  or foreign anchor can never receive orphan or cross-owner events. The
+  window counts JOB ROWS, not distinct ticks — a tick's re-dispatched links
+  each spend one row. Tick rows are identified exactly — the
+  supervisor-authored prompt-title prefix for that mission, scoped to the
+  worker's `job_mode` and the mission owner — so ordinary jobs, other
+  missions' ticks, and other owners' rows are never matched, and
+  `create_job` refuses an ordinary task whose text starts with that
+  reserved opening, so a caller cannot forge the marker to hide work from
+  the default listing.
 - **`list_jobs` cron filter**: tick rows and live tick contexts are tagged
   `"cron_tick": true` and excluded from the tool's window unless
   `include_cron: true` is passed.
+
+**Upgrade note — irreversible first-boot deletion.** With no config change,
+the FIRST supervisor start after upgrading to this version runs the startup
+sweep on every configured mission and deletes that mission's existing tick
+rows beyond the newest 50 (the default window), together with their
+`job_events`. That deletion cannot be undone: snapshot the database first
+if the pre-upgrade tick history matters, or set a higher
+`retain_last_ticks` in each mission's cron block before the first boot.
+Swept rows also drop their `llm_calls`, so usage aggregates built from them
+shrink accordingly.
 
 The remaining persisted-event outcome matrix (`cron_reentry`, `cron_tick_end`
 `abandoned`/`skipped_busy`/`paused`, breaker-origin `cron_paused`) is now

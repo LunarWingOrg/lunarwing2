@@ -420,8 +420,10 @@ impl SandboxStore for LibSqlBackend {
         title_prefix: &str,
     ) -> Result<Vec<SandboxJobRecord>, DatabaseError> {
         let conn = self.connect().await?;
-        // substr(length(?3)) is a byte-prefix test on the bound parameter —
-        // no LIKE wildcards to escape (SQLite has no starts_with()).
+        // substr(length(?3)) = ?3 is a prefix test on the bound parameter —
+        // SQLite counts characters for TEXT, which gives the same result as a
+        // byte prefix for this comparison — and avoids LIKE wildcards to
+        // escape (SQLite has no starts_with()).
         let mut rows = conn
             .query(
                 r#"
