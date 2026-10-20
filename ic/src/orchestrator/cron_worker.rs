@@ -39,6 +39,12 @@
 //!   per-tick jobs' events.
 //! - **Durable tick counter** — the tick index is persisted per mission in
 //!   the DB-backed settings store, so it does not restart at 1 on every boot.
+//! - **Bounded persistence (WI#370)** — after every tick (and once at
+//!   supervisor start) a per-mission retention sweep deletes this mission's
+//!   tick rows beyond `cron.retain_last_ticks` (default 50), always keeping
+//!   the persisted last-job anchor, deleting `job_events` before their row so
+//!   the `job_events.job_id` FK never dangles, and re-checking the anchor so
+//!   a deleted anchor can never receive orphan or cross-owner events.
 //! - **Fail-closed control state (WI#371)** — the pause flag and the
 //!   circuit-breaker counter share one atomic settings row
 //!   (`cron-mission:<id>:control`), written with bounded-retry backoff. A
@@ -133,6 +139,25 @@ const NON_RETRYABLE_MARKERS: &[&str] = &[
     "Missing or invalid prompt",
     "ENOENT: no such file or directory, lstat",
 ];
+
+/// Opening of every cron tick job's persisted title (the supervisor-authored
+/// tick prompt; `persist_tick_record` writes the prompt as the row title).
+/// WI#370 retention and the `list_jobs` cron filter identify mission tick
+/// rows by this prefix — the marker is written by the same INSERT as the row,
+/// so it can never lag it the way a separate event-marker row can.
+pub const CRON_TICK_TITLE_OPENING: &str = "You are the resident worker for mission '";
+
+/// Exact title prefix of one mission's tick rows — the retention key.
+pub fn cron_tick_title_prefix(mission_id: &str) -> String {
+    format!("{CRON_TICK_TITLE_OPENING}{mission_id}'")
+}
+
+/// Whether a persisted sandbox-job title looks like a cron tick prompt (any
+/// mission). `list_jobs` uses this to tag and by default hide machine-
+/// generated ticks so ordinary jobs stay discoverable (WI#370).
+pub fn is_cron_tick_title(title: &str) -> bool {
+    title.starts_with(CRON_TICK_TITLE_OPENING)
+}
 
 /// Outcome of watching one tick job to resolution (or to a heartbeat lapse).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -489,6 +514,9 @@ async fn run_cron_mission(
             "Cron mission starts paused (persisted owner pause)"
         );
     }
+    // Catch-up retention (WI#370): a long-lived mission can accumulate tick
+    // rows across restarts while idle/paused; sweep once before waiting.
+    run_retention_sweep(&ctx).await;
     loop {
         if state.paused {
             if !paused_turn(&ctx, &mut state, &pause_flag, &mut cmd_rx, &mut shutdown_rx).await {
@@ -787,7 +815,9 @@ fn last_tick_job(ctx: &TickCtx<'_>) -> Option<Uuid> {
 /// Busy/capacity skips leave the breaker untouched (MR !1522 DE-2). The
 /// counter and the pause flag live in one atomic settings row (WI#371): the
 /// increment/trip is one write, and a resolved tick durably resets a
-/// non-zero counter so a restart cannot resurrect stale abandons.
+/// non-zero counter so a restart cannot resurrect stale abandons. After the
+/// bookkeeping the per-mission retention sweep runs (WI#370) — between
+/// ticks, so no mission tick can be in flight while it deletes.
 async fn after_tick(
     ctx: &TickCtx<'_>,
     state: &mut MissionState,
@@ -846,6 +876,7 @@ async fn after_tick(
             }
         }
     }
+    run_retention_sweep(ctx).await;
 }
 
 /// Compute the next fire time, logging and ending the mission loop when the
@@ -1907,6 +1938,118 @@ async fn load_last_tick_job(
         .then_some(id)
 }
 
+/// Delete this mission's tick rows beyond the retention window (WI#370).
+///
+/// Identification is exact: the supervisor-authored prompt-title prefix for
+/// THIS mission, scoped to this worker's `job_mode` and the mission owner —
+/// ordinary jobs, other missions' ticks, and other owners' rows are never
+/// matched. The persisted last-job anchor always survives (DQ-6).
+/// `job_events` are deleted before their job row
+/// (`delete_sandbox_job_cascade`) so the `job_events.job_id` FK never
+/// dangles. The sweep runs between ticks (once at supervisor start and
+/// after each tick resolves), when no mission tick can be in flight, so an
+/// "active"-status row in the victim set is by construction a stale
+/// leftover (e.g. a dispatch that failed before any status update).
+async fn run_retention_sweep(ctx: &TickCtx<'_>) {
+    let Some(db) = ctx.manager.store_handle() else {
+        return;
+    };
+    let job_mode = crate::orchestrator::job_manager::JobMode::External(ctx.worker.name.clone())
+        .db_value();
+    let ticks = match db
+        .list_cron_mission_ticks(
+            ctx.owner_id,
+            &job_mode,
+            &cron_tick_title_prefix(ctx.mission_id),
+        )
+        .await
+    {
+        Ok(ticks) => ticks,
+        Err(error) => {
+            tracing::warn!(
+                worker = %ctx.worker.name,
+                mission_id = %ctx.mission_id,
+                "Cron retention sweep skipped (listing failed): {error}"
+            );
+            return;
+        }
+    };
+    let keep = ctx.cron.retain_last_ticks() as usize;
+    let anchor = last_tick_job(ctx);
+    let mut deleted = 0usize;
+    for tick in ticks.into_iter().skip(keep) {
+        if Some(tick.id) == anchor {
+            continue;
+        }
+        match db.delete_sandbox_job_cascade(tick.id).await {
+            Ok(true) => deleted += 1,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(
+                    worker = %ctx.worker.name,
+                    mission_id = %ctx.mission_id,
+                    job = %tick.id,
+                    "Cron retention delete failed: {error}"
+                );
+            }
+        }
+    }
+    if deleted > 0 {
+        tracing::info!(
+            worker = %ctx.worker.name,
+            mission_id = %ctx.mission_id,
+            deleted,
+            keep,
+            "Cron retention sweep: deleted tick rows beyond the per-mission window"
+        );
+    }
+    recheck_last_job_anchor(ctx).await;
+}
+
+/// DQ-6: after retention the persisted last-job anchor must still exist and
+/// still belong to this owner — a deleted or foreign anchor must never
+/// receive lifecycle events (orphan or cross-owner). If the anchor row is
+/// gone, drop the live slot so `record_lifecycle_event` takes its
+/// no-job-row path until the next dispatch re-establishes an anchor.
+async fn recheck_last_job_anchor(ctx: &TickCtx<'_>) {
+    let Some(anchor) = last_tick_job(ctx) else {
+        return;
+    };
+    let Some(db) = ctx.manager.store_handle() else {
+        return;
+    };
+    let valid = match db.get_sandbox_job(anchor).await {
+        Ok(Some(record)) => record.user_id == ctx.owner_id,
+        Ok(None) => false,
+        Err(error) => {
+            tracing::warn!(%anchor, "Cron last-job anchor re-check failed: {error}");
+            return;
+        }
+    };
+    if valid {
+        return;
+    }
+    tracing::warn!(
+        worker = %ctx.worker.name,
+        mission_id = %ctx.mission_id,
+        %anchor,
+        "Cron last-job anchor row is gone or foreign; clearing the anchor"
+    );
+    ctx.last_tick_job_id
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Err(error) = db
+        .delete_setting(
+            ctx.owner_id,
+            &format!("cron-mission:{}:last-job", ctx.mission_id),
+        )
+        .await
+    {
+        tracing::warn!(%anchor, "Failed to clear persisted cron last-job anchor: {error}");
+    }
+}
+
 /// Persist the per-mission tick counter (best-effort; a lost write only
 /// reuses an index after a restart, never double-fires a tick).
 async fn persist_tick_counter(
@@ -1984,7 +2127,9 @@ async fn persist_control_state(ctx: &TickCtx<'_>, state: &mut MissionState) {
 }
 
 /// Build the tick job prompt: the mission goal plus the chain-handoff
-/// contract the worker follows via its durable workspace mount.
+/// contract the worker follows via its durable workspace mount. The prompt's
+/// opening is the persisted-title marker (`CRON_TICK_TITLE_OPENING`) — build
+/// both from one source so they cannot drift.
 fn build_tick_prompt(
     cron: &CronWorkerConfig,
     mission_id: &str,
@@ -1993,13 +2138,14 @@ fn build_tick_prompt(
     project_dir: &str,
 ) -> String {
     format!(
-        "You are the resident worker for mission '{mission_id}', firing on cron schedule \
+        "{prefix}, firing on cron schedule \
          '{schedule}'.\n\nMISSION GOAL:\n{goal}\n\nThis is tick #{tick_index} (attempt \
          {attempt}). Mission state is durable in your workspace directory ({project_dir}): read \
          prior state at the start of the tick and write updated state before you finish. The \
          host supervisor holds the mission lease — if this job dies or goes silent, a fresh job \
          is dispatched and resumes from the workspace. Work the mission goal for this tick, then \
          report what changed.",
+        prefix = cron_tick_title_prefix(mission_id),
         schedule = cron.schedule,
         goal = cron.goal,
         attempt = chain_index + 1,
@@ -2024,6 +2170,21 @@ mod tests {
             tool_allowlist: Vec::new(),
             retain_last_ticks: None,
         }
+    }
+
+    /// WI#370: the tick prompt's opening is the persisted-title marker, and
+    /// the per-mission retention prefix matches exactly this mission's rows
+    /// (not another mission that shares a prefix of the id).
+    #[test]
+    fn tick_prompt_title_marker_and_retention_prefix_agree() {
+        let cron = test_cron();
+        let prompt = build_tick_prompt(&cron, "pr-digest", 7, 0, "missions/pr-digest");
+        assert!(is_cron_tick_title(&prompt));
+        assert!(prompt.starts_with(&cron_tick_title_prefix("pr-digest")));
+        assert!(!prompt.starts_with(&cron_tick_title_prefix("pr-digest-2")));
+        // Ordinary job titles never match the marker.
+        assert!(!is_cron_tick_title("Fix the flaky gateway test"));
+        assert!(!is_cron_tick_title(""));
     }
 
     #[test]
