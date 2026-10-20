@@ -4744,6 +4744,10 @@ async fn await_cron_event(
     .unwrap_or_else(|_| panic!("{event_type} never persisted for job {job_id}"))
 }
 
+/// Used only by the libsql-gated WI#370 tests below; hard-gated so a
+/// postgres-only compile of this target sees no dead-code warning (WI#387
+/// idiom).
+#[cfg(feature = "libsql")]
 fn captured_task_id(request: &serde_json::Value) -> Uuid {
     Uuid::parse_str(
         request["payload"]["task_id"]
