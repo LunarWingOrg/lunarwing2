@@ -254,6 +254,11 @@ ENV GOROOT=/usr/local/go \
 # Keep IDs synchronized with ic/scripts/lunarwing-mt-admin.sh (opencode2 =
 # 10003, distinct from opencode 10001 and kimi 10002) so two opencode lanes on
 # one tenant keep separate userns identities.
+# WI#400 (WI#449 migration): this is the TASK identity only — the container
+# starts as root (see USER below); the serve process (which runs all task
+# code) and every one-shot process drop to this uid/gid via setpriv, while
+# the bridge stays root, so the bridge's and PID 1's environ are EACCES to
+# task code.
 RUN groupadd --gid 10003 opencode2 \
     && useradd --uid 10003 --gid 10003 -m -d /home/opencode2 opencode2
 
@@ -273,7 +278,9 @@ COPY --from=builder /build/opencode/packages/schema/package.json /app/node_modul
 COPY --from=builder /build/opencode/packages/protocol/src /app/node_modules/@opencode/protocol/src
 COPY --from=builder /build/opencode/packages/protocol/package.json /app/node_modules/@opencode/protocol/package.json
 
-COPY entrypoint.sh health_server.py agent_comm_protocol.json ./
+# WI#400 LD-2: /app files stay root-owned — container root executes these,
+# so they must not be writable by the task uid the serve process drops to.
+COPY entrypoint.sh entrypoint-task-setup.sh health_server.py agent_comm_protocol.json ./
 # WI#357 (run-79 EI-5): the exposure controls (wrapper, policy assert,
 # compile-out guard, lane config) must be root-owned and read-only — the
 # agent user gets edit/write on the workspace, so an agent-writable config
@@ -286,8 +293,9 @@ COPY entrypoint.sh health_server.py agent_comm_protocol.json ./
 COPY scripts/ ./scripts/
 COPY config/ ./config/
 
-RUN chmod +x /app/entrypoint.sh /app/health_server.py \
-    && chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/health_server.py /app/agent_comm_protocol.json
+RUN chmod +x /app/entrypoint.sh /app/entrypoint-task-setup.sh /app/health_server.py \
+    && command -v setpriv >/dev/null \
+    && chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/entrypoint-task-setup.sh /app/health_server.py /app/agent_comm_protocol.json
 
 # WI#357: install the exposure-guard wrapper as the only PATH-visible
 # opencode entrypoint, then fail the BUILD when the policy regresses:
@@ -358,6 +366,7 @@ RUN set -eu; \
          || { echo "FATAL: opencode --version reported '$actual', expected '$expected'" >&2; exit 1; }; } \
     && cd /app \
     && bun scripts/path_expand_test.ts \
+    && bun scripts/task_identity_test.ts \
     && bun scripts/opencode_result_test.ts \
     && bun scripts/opencode_task_executor_test.ts \
     && bun scripts/sdk_surface_test.ts \
@@ -394,7 +403,14 @@ EXPOSE 9090
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD curl -sf http://127.0.0.1:8443/health || exit 1
 
-USER 10003:10003
+# WI#400 (WI#449 migration): root entrypoint — the launcher drops the serve
+# process and every one-shot process to the opencode2 uid (10003) itself; the
+# WebSocket bridge stays root so its per-task resources (tool-proxy sockets)
+# can be handed to the task identity. Task identity is pinned for the
+# launcher, the bridge relay, and the cron-workspace bootstrap.
+ENV OPENCODE2_TASK_UID=10003 \
+    OPENCODE2_TASK_GID=10003
+USER 0:0
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
 CMD ["--mode", "websocket"]
