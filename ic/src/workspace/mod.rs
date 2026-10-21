@@ -58,9 +58,8 @@ mod search;
 pub use chunker::{ChunkConfig, chunk_document};
 pub use document::{
     DocumentVersion, IDENTITY_PATHS, MemoryChunk, MemoryDocument, VersionSummary, WorkspaceEntry,
-    WorkspaceFileContent, is_engine_internal_path, is_engine_projects_path,
-    is_engine_runtime_path, is_identity_path, is_mission_path, is_search_indexable_path,
-    merge_workspace_entries, paths,
+    WorkspaceFileContent, is_engine_internal_path, is_engine_projects_path, is_engine_runtime_path,
+    is_identity_path, is_mission_path, is_search_indexable_path, merge_workspace_entries, paths,
 };
 pub use embedding_cache::{CachedEmbeddingProvider, EmbeddingCacheConfig};
 pub use embeddings::{

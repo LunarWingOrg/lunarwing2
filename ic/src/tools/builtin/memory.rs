@@ -1392,7 +1392,10 @@ mod tests {
             "engine/./projects/../projects/foo/missions/bar/mission.json",
         ] {
             assert!(
-                matches!(normalize_memory_tool_path(path), Err(ToolError::NotAuthorized(_))),
+                matches!(
+                    normalize_memory_tool_path(path),
+                    Err(ToolError::NotAuthorized(_))
+                ),
                 "path should be reserved: {path}"
             );
         }
@@ -1400,10 +1403,19 @@ mod tests {
         // Near matches and escaped traversal stay ordinary paths.
         for (path, expected) in [
             ("engine/projects-notes.md", "engine/projects-notes.md"),
-            ("projects/foo/missions/bar/mission.json", "projects/foo/missions/bar/mission.json"),
-            ("foo/engine/projects/file.json", "foo/engine/projects/file.json"),
+            (
+                "projects/foo/missions/bar/mission.json",
+                "projects/foo/missions/bar/mission.json",
+            ),
+            (
+                "foo/engine/projects/file.json",
+                "foo/engine/projects/file.json",
+            ),
             ("engine/projects/../MEMORY.md", "engine/MEMORY.md"),
-            ("engine/projectz/x/mission.json", "engine/projectz/x/mission.json"),
+            (
+                "engine/projectz/x/mission.json",
+                "engine/projectz/x/mission.json",
+            ),
         ] {
             assert_eq!(
                 normalize_memory_tool_path(path).expect("ordinary path"),
@@ -2023,10 +2035,7 @@ mod tests {
                 .await
                 .expect("legitimate write");
             let output = read
-                .execute(
-                    serde_json::json!({"path": "notes/ordinary.md"}),
-                    &context,
-                )
+                .execute(serde_json::json!({"path": "notes/ordinary.md"}), &context)
                 .await
                 .expect("legitimate read");
             assert_eq!(output.result["content"], "ordinary note");
