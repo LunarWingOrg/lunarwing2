@@ -1340,11 +1340,13 @@ fn is_busy(reason: &str) -> bool {
 /// a config error, not a transient failure.
 ///
 /// MR !1531 DS-2: the bridges wrap genuinely transient bootstrap errnos
-/// (EMFILE/ENFILE/ENOMEM, ENOSPC/EDQUOT/EIO on first mkdir, ENOENT/EINVAL
-/// from a swap race) under `TRANSIENT_MARKER`; that explicit signal is
+/// (EMFILE/ENFILE/ENOMEM, ENOSPC/EDQUOT/EIO on first mkdir, ENOENT from a
+/// swap race) under `TRANSIENT_MARKER`; that explicit signal is
 /// checked first so a wrapped OS string that happens to contain a
 /// non-retryable substring (pebble's "could not be resolved under
-/// WORKSPACE_ROOT") cannot misclassify a transient failure.
+/// WORKSPACE_ROOT") cannot misclassify a transient failure. (Run-170 LP-16:
+/// EINVAL left the transient set — its only bootstrap source is fchown on an
+/// unmapped uid, which a re-dispatch can never fix.)
 fn is_non_retryable(reason: &str) -> bool {
     if reason.contains(TRANSIENT_MARKER) {
         return false;
