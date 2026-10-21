@@ -572,6 +572,26 @@ partial forgeries and corrupt stamps are cleared with a warning instead of
 arming retries (WI#338; full write-path reservation is WI#322, planned for
 v2.1.7.0). A known stuck-key abort window is tracked as WI#394.
 
+### Boot-Time Mission Writers Reload Under the Lock (WI#317)
+
+Boot-time and reconcile-time mission writers no longer save stale list
+snapshots: `record_restart_interrupted_missions` (the boot sweep that
+records interrupted missions), `ensure_mission_by_metadata`'s reconcile
+branch, and `deactivate_skill_learning_missions` each treat their listing
+as a candidate set only — per mission they take the mission lock, reload
+the record from the store, re-check their conditions on the fresh record,
+and save under the guard, the same serialization `fire_mission_inner`, the
+outcome watcher, and `record_unsettled_shutdown_fire` already use. A
+mission deleted between the candidate list and the lock is skipped instead
+of resurrected by a stale save; a concurrent fire's writes (thread history,
+`threads_today`, `last_fired_at`, trigger dedup key) can no longer be
+overwritten by a boot-time recorder working from an older copy. "Fire lost;
+not auto-refired" semantics are unchanged. The race is pinned by a
+regression test that parks the listing between snapshot and save, lands a
+fire-shaped reservation save in the window, and asserts both survive
+together. Engine-internal change only (open for maintainer acceptance,
+WI#317).
+
 ### Mission Webhook and Rate-Limit Hardening (WI#352, WI#359)
 
 A mission stored with an empty or unpresentable webhook secret is dormant:
@@ -719,8 +739,15 @@ container root behind a trimmed capability set, and every task process
 drops to a separate task uid via `setpriv --clear-groups
 --ambient-caps=-all --inh-caps=-all --no-new-privs` — so `/proc/1/environ`,
 the bridge environ and the token file all give task code EACCES. The
+pinned identities are validated everywhere they parse (the TS
+`taskIdentity()` helpers, both entrypoints, the pebble executor): zero or
+non-numeric ids fail closed, because a zero id would make the privilege
+drop a no-op while callers keep treating the split as active, and the
+helpers also refuse partially numeric ids like `1000x` (defence in depth
+with the entrypoints' `^[1-9][0-9]*$` gate). The
 opencode2 lane is deliberately not migrated (its image keeps the task uid
-directly). Worker images must be rebuilt for the strips and the split to
+directly; the migration is filed as the WI#449 follow-up, planned for
+v2.1.7.0). Worker images must be rebuilt for the strips and the split to
 reach live tenants.
 
 ### Daily-Log Backup Cap Fail-Closed (WI#335)
