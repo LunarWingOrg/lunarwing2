@@ -92,7 +92,7 @@ class EntrypointConfigTests(unittest.TestCase):
                 self.assertEqual(json.loads(service.read_text()), {"disabled": True})
                 # Simulate the mutable files left behind by an earlier boot.
                 self.target.write_text('{"share": "auto", "update": "enable"}')
-                # WI#427: v2.0.32 stores remote as a route object and keeps
+                # WI#427: v2.0.32+ stores remote as a route object and keeps
                 # consent separately; a restart must discard both too.
                 service.write_text(json.dumps({
                     "disabled": False, "hostname": "0.0.0.0",
