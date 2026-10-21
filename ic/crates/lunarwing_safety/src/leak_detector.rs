@@ -566,8 +566,7 @@ pub(crate) fn default_patterns() -> Vec<LeakPattern> {
         // Authorization header with key
         LeakPattern {
             name: "auth_header".to_string(),
-            regex: Regex::new(r"(?i)authorization:\s*[a-zA-Z]+\s+[a-zA-Z0-9_+/.=-]{20,}")
-                .unwrap(), // safety: hardcoded literal
+            regex: Regex::new(r"(?i)authorization:\s*[a-zA-Z]+\s+[a-zA-Z0-9_+/.=-]{20,}").unwrap(), // safety: hardcoded literal
             severity: LeakSeverity::High,
             action: LeakAction::Redact,
         },
@@ -790,7 +789,10 @@ mod tests {
 
         let result = detector.scan(&content);
         let redacted = result.redacted_content.expect("bearer must redact");
-        assert!(!redacted.contains(&token), "padded base64 token must be redacted");
+        assert!(
+            !redacted.contains(&token),
+            "padded base64 token must be redacted"
+        );
     }
 
     /// WI#353 asks for uncut detection plus both-cut regressions. The
