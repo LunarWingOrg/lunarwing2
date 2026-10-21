@@ -116,8 +116,12 @@ mkdir -p "$fixture/env" "$fixture/home" "$fixture/quadlets" "$fixture/workspace"
 env_file="$fixture/env/lunarwing.env"
 printf 'GATEWAY_AUTH_TOKEN=fixture\n' >"$env_file"
 : >"$fixture/env/kimi-runtime.env"
-# WI#446: the config-hash sidecar (`_store_container_hash`, used by every
-# imperative scenario below) now creates and writes ~/.config tenant-side via
+# WI#446 (run-174 LW-3): the config-hash sidecar lives in root-owned host
+# state ($CONTAINER_HASH_DIR/<tenant>/), not the tenant home; the harness
+# points it at the fixture.
+# shellcheck disable=SC2034  # read by the sourced _hash_dir
+CONTAINER_HASH_DIR="$fixture/container-hashes"
+# Tenant-side unit/env writers in the exercised lanes drop privileges via
 # `sudo -u`. The fixture tenant is not a real account (and CI runs
 # no-new-privileges), so the drop maps onto the invoking user; `command`
 # bypasses the harness's fake-runtime function stubs for the dropped call.
@@ -126,22 +130,31 @@ sudo() {
   command "$@"
 }
 
-# WI#446 (run-166 LF-8 sibling class): the config-hash sidecar commits
-# tenant-side, so a pre-planted symlink at the hash path must NOT be followed
-# — the file behind it keeps its bytes and the link stays a link.
+# WI#446 (run-174 LW-3): the sidecar directory must live OUTSIDE the tenant
+# home (root-owned host state), and a stale sidecar left by an older mt-admin
+# must stay updatable — the !1807 tenant-side writer could never update the
+# old root-owned sidecars, so every start force-recreated the container.
 wi446_hash_dir="$(_hash_dir alice)"
-wi446_victim="$fixture/wi446-hash-victim.txt"
+case "$wi446_hash_dir" in
+  "$fixture/container-hashes/alice") pass "hash sidecar lives in host state, not the tenant home (WI#446)" ;;
+  *) fail "hash sidecar lives in host state, not the tenant home (WI#446) (got: $wi446_hash_dir)" ;;
+esac
+case "$wi446_hash_dir" in
+  "$(tenant_home alice)"/*) fail "hash sidecar path must not resolve under the tenant home (WI#446)" ;;
+  *) pass "hash sidecar path does not resolve under the tenant home (WI#446)" ;;
+esac
+# A pre-existing (e.g. root-owned, from the old writer) sidecar is updated in
+# place: after the store, the config no longer reports changed.
 command mkdir -p "$wi446_hash_dir"
-printf 'sentinel\n' >"$wi446_victim"
-ln -s "$wi446_victim" "$wi446_hash_dir/lunarwing-symlink-probe-alice.hash"
-_store_container_hash alice lunarwing-symlink-probe-alice "$env_file" 2>/dev/null
-if [[ -L "$wi446_hash_dir/lunarwing-symlink-probe-alice.hash" \
-  && "$(<"$wi446_victim")" == "sentinel" ]]; then
-  pass "hash sidecar refuses a pre-planted symlink (WI#446)"
+printf 'stale\n' >"$wi446_hash_dir/lunarwing-stale-probe-alice.hash"
+_store_container_hash alice lunarwing-stale-probe-alice "$env_file" 2>/dev/null
+if [[ "$(<"$wi446_hash_dir/lunarwing-stale-probe-alice.hash")" != "stale" ]] \
+  && ! _container_config_changed alice lunarwing-stale-probe-alice "$env_file"; then
+  pass "a stale sidecar is updated in place, not stuck (WI#446 LW-3)"
 else
-  fail "hash sidecar refuses a pre-planted symlink (WI#446)"
+  fail "a stale sidecar is updated in place, not stuck (WI#446 LW-3)"
 fi
-command rm -f "$wi446_hash_dir/lunarwing-symlink-probe-alice.hash" "$wi446_victim"
+command rm -rf "$wi446_hash_dir"
 
 base_contract() {  # <worker>: the rootless-podman base contract the lane uses
   case "$1" in

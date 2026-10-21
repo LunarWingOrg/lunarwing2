@@ -22,6 +22,10 @@ tenant_lw_root() { printf '%s/home/%s/lunarwing' "$fixture" "$1"; }
 tenant_env_dir() { printf '%s/env' "$(tenant_lw_root "$1")"; }
 tenant_quadlet_dir() { printf '%s/.config/containers/systemd' "$(tenant_home "$1")"; }
 tenant_run_dir() { printf '%s/run' "$(tenant_lw_root "$1")"; }
+# WI#446 (run-174 LW-3): the config-hash sidecar lives in root-owned host
+# state; the harness points it at the fixture.
+# shellcheck disable=SC2034  # read by the sourced _hash_dir
+CONTAINER_HASH_DIR="$fixture/container-hashes"
 ports_get() {
   case "$2" in
     opencode_wss) echo 19090 ;;
