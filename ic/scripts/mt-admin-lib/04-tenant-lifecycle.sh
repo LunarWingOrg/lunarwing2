@@ -806,6 +806,13 @@ remove_tenant() {
   ports_deallocate "$name"
   say ""
 
+  # WI#450 (run-181 MC-3): the config-hash sidecars now live in root-owned
+  # host state, so remove-tenant no longer loses them with the home. The name
+  # has already been through sanitize_name; the guard keeps an empty name
+  # from resolving to the whole base directory.
+  [[ -n "$name" ]] && rm -rf -- "$(_hash_dir "$name")"
+  say ""
+
   remove_tenant_user "$name" "$purge"
   say ""
 

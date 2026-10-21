@@ -156,6 +156,17 @@ else
 fi
 command rm -rf "$wi446_hash_dir"
 
+# The sidecars are private to root: a fresh store leaves the base and the
+# per-tenant directory 0700 and the hash file 0600 whatever the caller's umask.
+wi446_mode_dir="$(_hash_dir carol)"
+(umask 022; _store_container_hash carol lunarwing-mode-probe-carol "$env_file" 2>/dev/null)
+if [[ "$(stat -c %a "$CONTAINER_HASH_DIR")" == 700 && "$(stat -c %a "$wi446_mode_dir")" == 700 && "$(stat -c %a "$wi446_mode_dir/lunarwing-mode-probe-carol.hash")" == 600 ]]; then
+  pass "hash sidecars are private to root (WI#446)"
+else
+  fail "hash sidecars are private to root (WI#446)"
+fi
+command rm -rf "$wi446_mode_dir"
+
 base_contract() {  # <worker>: the rootless-podman base contract the lane uses
   case "$1" in
     kimi) printf '%s' "$KIMI_ROOTLESS_LAUNCH_CONTRACT" ;;
