@@ -117,6 +117,28 @@ section and "Launch identity (WI#422)" further down.
   passes (chmod/re-assert) over task-created files the bridge does not own
   — dropping it is on the table the next time the set is re-proved end to
   end on every lane.
+- **Root-resolved commands come from root-owned PATH entries only
+  (WI#454/ME-1).** The root-launcher images (kimi, opencode) carry NO
+  task-owned directory in the image-wide `ENV PATH` — the task uid's
+  toolchain directories (`/home/<lane>/.cargo/bin`, `/home/<lane>/go/bin`)
+  used to lead it, and since WI#400 the container runs as root: the image
+  HEALTHCHECK, the root entrypoint on an in-place restart, and the bridge's
+  setpriv lookup all resolved through that PATH, so a task-planted file
+  there would run as container root and read the hub credential file. The
+  entrypoints export a fixed root PATH before their first command; the
+  task gets its toolchain directories at the privilege drop instead
+  (`TASK_PATH` on every `as_task`/one-shot exec, the kimi executor's child
+  env), and each healthcheck pins the absolute `/usr/bin/curl`. The kimi
+  bridge's `resolveFromBridgePath` skips a candidate that is not root-owned
+  or sits in a group-/world-writable directory when the resolver itself
+  runs as root (unprivileged host dev runs keep the plain lookup). Pins:
+  the Dockerfile/entrypoint shape pins in `test-mt-admin-kimi.sh`
+  (mutation-verified), the TS resolver pin, and the harness's root-only
+  drop-argv pin. Pebble needed none of this (its PATH entries are
+  root-owned); opencode2 is unaffected (still `USER 10003:10003`). The
+  maintainer's no-root policy (note #10954 on !1829) retires this whole
+  root-bridge shape in favor of two non-root containers per lane — that
+  split is its own work item; until it lands, this closes the ME-1 gap.
 - **Cron workspace ownership.** The cron bootstrap (`create_cron_workspace`
   / the TS `resolveTaskWorkspace`) runs in the root bridge, so EVERY
   directory the walk creates — intermediates and leaf alike, or the task
@@ -172,6 +194,25 @@ rootful path looked root-like; with `USER 0:0` the bridge side is now
 container root wherever nothing overrides it — the rootful pebble launch
 does override it with `--user <tenant uid>` (WI#422), which is why that lane
 declares `PEBBLE_TASK_UID=inherit` instead of a split.
+
+**Host-side workspace prep (WI#453, the WI#446 closeout):** the
+kimi/opencode/opencode2 workspace directories live inside the
+tenant-controlled `~/lunarwing` tree, so mt-admin never creates or chowns
+them as root anymore. `prepare_worker_workspace`
+(`ic/scripts/mt-admin-lib/09-worker-config.sh`) runs the
+`darkirc_path_components_safe` walk FIRST (a symlinked ancestor refuses
+before anything is created behind the link), creates the directory AS the
+tenant, refuses a symlinked or foreign-owned leaf (ownership checked
+against the tenant root, the pebble posture), and only then — on rootful
+runtimes, which need the bind mount handed to the image uid — chowns it,
+bounded with `--no-dereference` so the recursive walk never follows a
+symlink. Rootless keep-id maps the tenant identity, so no chown runs at
+all; `chmod 2770` goes through `tenant_chmod` (root has no business
+touching a mode under a tenant-writable parent, WI#390). Every caller
+(quadlet render and all three imperative lanes) makes a refusal fatal.
+Pins: the six workspace-symlink pins in `test-mt-admin-kimi.sh`
+(mutation-verified — reverting to the old root `mkdir -p` + `chown -R`
+shape fails exactly them).
 
 ## WebSocket message limits
 
