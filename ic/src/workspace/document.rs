@@ -67,6 +67,27 @@ pub fn is_engine_runtime_path(path: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
+/// The engine projects tree — the workspace home of engine-owned project
+/// documents and mission records.
+const ENGINE_PROJECTS_PATH: &str = "engine/projects";
+
+/// Check whether a normalized path belongs to the engine projects tree
+/// (`engine/projects`, `engine/projects/**`).
+///
+/// Mission records under `engine/projects/{project}/missions/**` are loaded
+/// through `Mission::from_value` at boot, bypassing every `create_mission`
+/// check (cadence validation, webhook-secret references, ownership, dedup),
+/// so agent-facing memory lanes must not be able to plant or edit them
+/// (WI#322). The whole tree is reserved, not just the missions subtree:
+/// the project documents (`project.json`, `missions.json` listings) are
+/// equally engine-owned state.
+pub fn is_engine_projects_path(path: &str) -> bool {
+    path == ENGINE_PROJECTS_PATH
+        || path
+            .strip_prefix(ENGINE_PROJECTS_PATH)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 /// Check whether a normalized path belongs to the mission-goal family
 /// (`engine/projects/{project}/missions/**`, any depth or suffix, plus the
 /// tenant-wide `engine/projects/{project}/missions.json` listing).
@@ -404,6 +425,43 @@ mod tests {
             assert!(
                 is_search_indexable_path(path),
                 "path should be indexed: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_engine_projects_paths_are_classified() {
+        // WI#322: the whole engine/projects tree is engine-owned state; the
+        // mission records inside it are loaded at boot without any
+        // create_mission validation.
+        for path in [
+            "engine/projects",
+            "engine/projects/foo",
+            "engine/projects/foo/project.json",
+            "engine/projects/foo/missions.json",
+            "engine/projects/foo/missions/bar/mission.json",
+            "engine/projects/foo/missions/bar/mission.json.bak",
+            "engine/projects/foo/missions/bar/other.json",
+        ] {
+            assert!(
+                is_engine_projects_path(path),
+                "path should be engine-projects: {path}"
+            );
+        }
+
+        for path in [
+            paths::MEMORY,
+            "daily/2026-07-23.md",
+            "engine",
+            "engine/.runtime/threads/active/id.json",
+            "engine/knowledge/summaries/id.json",
+            "engine/projects-notes.md",
+            "projects/foo/missions/bar/mission.json",
+            "engine/projectz/foo/mission.json",
+        ] {
+            assert!(
+                !is_engine_projects_path(path),
+                "path should not be engine-projects: {path}"
             );
         }
     }
