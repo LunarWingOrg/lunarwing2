@@ -3,6 +3,10 @@
 
 Only container paths are relocated; stop before health/server startup. Root
 CI/builds drop to uid 10003, while developer runs use their non-root uid.
+WI#449 (the WI#400 migration): the launcher's first half delegates every
+task-owned write to entrypoint-task-setup.sh via as_task (direct exec when
+already unprivileged), so this harness stages that script with the same path
+relocation and still ends up running the real production shell.
 """
 
 from __future__ import annotations
@@ -41,6 +45,14 @@ class EntrypointConfigTests(unittest.TestCase):
         self.source.parent.chmod(0o555)
         shutil.copyfile(LANE / "scripts/study_notes_config.py",
                         self.app / "scripts/study_notes_config.py")
+        # WI#449: stage the task-side setup the launcher execs, with the same
+        # /app/ and /home/opencode2/ relocation the launcher text gets below.
+        setup = (LANE / "entrypoint-task-setup.sh").read_text()
+        setup = setup.replace("/app/", str(self.app) + "/")
+        setup = setup.replace("/home/opencode2/", str(self.home) + "/")
+        staged_setup = self.app / "entrypoint-task-setup.sh"
+        staged_setup.write_text(setup)
+        staged_setup.chmod(0o755)
         self.target = self.workspace / ".opencode/opencode2.json"
         self.env = {
             "PATH": os.environ["PATH"], "HOME": str(self.home),

@@ -50,6 +50,7 @@ declare module "node:fs" {
   }
   export function closeSync(fd: number): void
   export function existsSync(path: string): boolean
+  export function fchownSync(fd: number, uid: number, gid: number): void
   export function fstatSync(fd: number): { dev: number; ino: number }
   export function mkdirSync(path: string): void
   export function openSync(path: string, flags: number): number

@@ -30,6 +30,7 @@ import { executeTask } from "./opencode_task_executor"
 type OpenCodeClient = NonNullable<Parameters<typeof executeTask>[4]>
 import { resolveTaskWorkspace, workspacePathsOverlap } from "./workspace_path"
 import { ToolProxyRelay, type TaskProxyHandle } from "./lunarwing_tool_proxy.ts"
+import { readBridgeAuthToken } from "./bridge_auth.ts"
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -38,7 +39,10 @@ const WS_BIND_HOST = process.env.WS_BIND_HOST || "0.0.0.0"
 const WS_PORT = parseInt(process.env.WS_PORT || "9090", 10)
 const WS_PATH = process.env.WS_PATH || "/ws/agent"
 const WS_URL = process.env.WS_URL || ""
-const AGENT_AUTH_TOKEN = process.env.AGENT_AUTH_TOKEN || ""
+// WI#400 (WI#449): the credential comes from the root-only file the
+// entrypoint staged (AGENT_AUTH_TOKEN_FILE) and fails closed when that
+// pointer is set but yields nothing; the plain env var is the dev fallback.
+const AGENT_AUTH_TOKEN = readBridgeAuthToken()
 const RECONNECT_MS = parseInt(process.env.RECONNECT_MS || "3000", 10)
 const PING_INTERVAL_MS = parseInt(process.env.PING_INTERVAL_MS || "20000", 10)
 const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || "/workspace"
