@@ -3,7 +3,7 @@
 ## What This Is
 
 Persistent container worker for upstream OpenCode **2** (the `v2` line, pinned
-v2.0.32). This is a separate worker lane from `opencode4lunarwing/` (the proven
+v2.1.2). This is a separate worker lane from `opencode4lunarwing/` (the proven
 v1 worker, pinned v1.18.25) per
 `docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md`. Tenants opt in explicitly; v1
 stays the default until v2 earns trust. The WebSocket bridge is
@@ -107,10 +107,11 @@ build with the default root HOME.
 Workers must never self-expose; LunarWing owns every public path through the
 daemon's tunnel. See `docs/ops/WORKER-CONTAINERS.md` → "Worker exposure
 policy" for the full control set, the !1490 gate record, and the bump
-checklist. This lane pins v2.0.32 under the maintainer-approved WI#427:
+checklist. This lane pins v2.1.2 (the v2.0.26 boundary was crossed at
+v2.0.32 under the maintainer-approved WI#427):
 v2.0.26 introduced OpenTunnel remote access (hosted relay, no self-host
 option). The compile-out guard stubs `remote-tunnel.ts` at build time,
-re-verified against v2.0.32, and CI + the build assertions fail if the tunnel
+re-verified against v2.1.2, and CI + the build assertions fail if the tunnel
 survives. Future bumps remain deliberate-only. WI#369's SDK-gate blind spots
 and WI#424's egress allowlist remain open; see the bump record.
 
