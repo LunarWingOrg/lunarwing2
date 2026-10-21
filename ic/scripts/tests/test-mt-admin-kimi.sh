@@ -417,6 +417,16 @@ assert_not_contains "$fixture/quadlets/lunarwing-opencode2-root.container" \
 assert_not_contains "$fixture/quadlets/lunarwing-opencode2-root.container" \
   '--cap-drop' \
   'opencode2 quadlet stays off the WI#400 capability trim until its migration'
+
+# WI#400 (run-170 LP-11): the keep-id mapping was pinned only for kimi above
+# and on the pebble imperative path (image-contract harness) — pin the
+# Quadlet UserNS= line for the other two split lanes as well.
+assert_contains "$fixture/quadlets/lunarwing-opencode-root.container" \
+  'UserNS=keep-id:uid=10001,gid=10001' \
+  'opencode quadlet carries the keep-id task-uid mapping (WI#400 LP-11)'
+assert_contains "$fixture/quadlets/lunarwing-pebble-root.container" \
+  'UserNS=keep-id:uid=10004,gid=10004' \
+  'pebble quadlet carries the keep-id task-uid mapping (WI#400 LP-11)'
 # Quadlet's full-file hash must also notice the mount policy change.
 legacy_quadlet="$fixture/quadlets/legacy-rw.container"
 sed 's#ssh-agent:ro,z#ssh-agent:z#' "$worker_quadlet" > "$legacy_quadlet"
