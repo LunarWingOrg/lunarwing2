@@ -23,6 +23,36 @@
 say() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
+# WI#384 display hygiene: tenant-controlled values echoed into root-side
+# terminal output and logs must never carry control bytes or terminal escapes.
+# %-encode every non-printable byte (LC_ALL=C) and cap the echo length so a
+# hostile value cannot forge terminal output or flood the log. Printable shell
+# metacharacters ($ & ; etc.) are DATA here, not an injection: die prints them
+# with %s and nothing downstream evals die output.
+sanitize_display_value() {  # <value> [max_len=160]
+  local value="$1" max_len="${2:-160}" out="" ch i n
+  LC_ALL=C
+  n=${#value}
+  if ((max_len < 4)); then
+    printf '%s' "${value:0:max_len}"
+    return 0
+  fi
+  for ((i = 0; i < n; i++)); do
+    ch="${value:i:1}"
+    if [[ "$ch" == [[:print:]] ]]; then
+      out+="$ch"
+    else
+      printf -v ch '%%%02X' "'$ch"
+      out+="$ch"
+    fi
+    if ((${#out} + 3 >= max_len)); then
+      out+='...'
+      break
+    fi
+  done
+  printf '%s' "$out"
+}
+
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
