@@ -636,6 +636,44 @@ assert_contains "$KIMI_DOCKERFILE" 'npm ci --omit=dev --prefix /opt/kimi-cli' 'K
 assert_contains "$KIMI_DOCKERFILE" 'org.opencontainers.image.toolchain-profile="${WITH_TOOLCHAINS}"' 'Kimi image records toolchain profile'
 assert_contains "$KIMI_DOCKERFILE" 'libz-dev' 'Kimi toolchain packages match OpenCode zlib development support'
 
+# WI#454/ME-1: since WI#400 the container runs as root, so the image-wide PATH
+# must carry only root-owned directories — a task-owned entry first would let
+# the task uid plant a file that root executes (the HEALTHCHECK resolves
+# through this PATH, and so does the root entrypoint and the bridge's setpriv
+# lookup). Pin that no /home/<lane> entry survives in the image PATH, and that
+# the healthcheck's curl is the absolute /usr/bin one.
+KIMI_IMAGE_PATH_LINE="$(sed -n 's/^ *PATH=\(.*\)$/\1/p' "$KIMI_DOCKERFILE" | tail -1)"
+if [[ "$KIMI_IMAGE_PATH_LINE" != *"/home/kimi"* && "$KIMI_IMAGE_PATH_LINE" != *"/home/opencode"* ]]; then
+  pass 'Kimi image PATH carries no task-owned directories (WI#454/ME-1)'
+else
+  fail "Kimi image PATH carries a task-owned directory: $KIMI_IMAGE_PATH_LINE"
+fi
+assert_contains "$KIMI_DOCKERFILE" 'CMD /usr/bin/curl -sf http://127.0.0.1:8443/ready' \
+  'Kimi healthcheck pins the absolute curl (WI#454/ME-1)'
+KIMI_ENTRYPOINT="$LUNARWING_ROOT/kimicode4lunarwing/entrypoint.sh"
+assert_contains "$KIMI_ENTRYPOINT" \
+  'export PATH=/usr/local/cargo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
+  'Kimi entrypoint pins the root-owned PATH before its first command (WI#454/ME-1)'
+assert_contains "$KIMI_ENTRYPOINT" \
+  'TASK_PATH="/home/kimi/.cargo/bin:/usr/local/cargo/bin:/usr/local/go/bin:/home/kimi/go/bin:$PATH"' \
+  'Kimi entrypoint hands the task toolchain over at the drop (WI#454/ME-1)'
+OPENCODE_DOCKERFILE="$LUNARWING_ROOT/opencode4lunarwing/Dockerfile"
+OC_IMAGE_PATH_LINE="$(sed -n 's/^ *PATH=\(.*\)$/\1/p' "$OPENCODE_DOCKERFILE" | tail -1)"
+if [[ "$OC_IMAGE_PATH_LINE" != *"/home/opencode"* && "$OC_IMAGE_PATH_LINE" != *"/home/kimi"* ]]; then
+  pass 'OpenCode image PATH carries no task-owned directories (WI#454/ME-1)'
+else
+  fail "OpenCode image PATH carries a task-owned directory: $OC_IMAGE_PATH_LINE"
+fi
+assert_contains "$OPENCODE_DOCKERFILE" 'CMD /usr/bin/curl -sf http://127.0.0.1:8443/health' \
+  'OpenCode healthcheck pins the absolute curl (WI#454/ME-1)'
+OPENCODE_ENTRYPOINT="$LUNARWING_ROOT/opencode4lunarwing/entrypoint.sh"
+assert_contains "$OPENCODE_ENTRYPOINT" \
+  'export PATH=/usr/local/cargo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
+  'OpenCode entrypoint pins the root-owned PATH before its first command (WI#454/ME-1)'
+assert_contains "$OPENCODE_ENTRYPOINT" \
+  'TASK_PATH="/home/opencode/.cargo/bin:/usr/local/cargo/bin:/usr/local/go/bin:/home/opencode/go/bin:$PATH"' \
+  'OpenCode entrypoint hands the task toolchain over at the drop (WI#454/ME-1)'
+
 help_output="$(usage)"
 if [[ "$(grep -c -- '--with-toolchains' <<<"$help_output")" -ge 4 ]]; then
   pass 'help documents toolchains for aggregate and worker builds'

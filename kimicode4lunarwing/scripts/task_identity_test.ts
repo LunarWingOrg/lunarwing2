@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { execFileSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -87,6 +88,53 @@ test("resolveFromBridgePath: finds an executable on the given PATH and ignores r
     assert.equal(resolveFromBridgePath("setpriv", `relative/dir:${good}`), join(good, "setpriv"))
     assert.throws(() => resolveFromBridgePath("setpriv", `${noexec}:relative/dir:`), /not found on the bridge PATH/)
     assert.throws(() => resolveFromBridgePath("setpriv", ""), /not found on the bridge PATH/)
+  } finally {
+    rmSync(base, { recursive: true, force: true })
+  }
+})
+
+test("resolveFromBridgePath: skips a group-writable directory and a non-root-owned candidate (WI#454/ME-1)", () => {
+  // Only meaningful as root: the resolver runs as the root bridge in the
+  // container, and only root can create root-owned fixtures.
+  if (process.geteuid?.() !== 0) {
+    console.log("SKIP: resolveFromBridgePath ownership pin requires root (WI#454/ME-1)")
+    return
+  }
+  const base = mkdtempSync(join(tmpdir(), "task-identity-owned-"))
+  try {
+    const writableDir = join(base, "writable-dir")
+    const ownedDir = join(base, "owned-dir")
+    const cleanDir = join(base, "clean-dir")
+    mkdirSync(writableDir)
+    mkdirSync(ownedDir)
+    mkdirSync(cleanDir)
+    // Explicit chmod: the process umask masks mkdirSync's mode, and the pin
+    // must hold whatever umask the test runs under.
+    chmodSync(writableDir, 0o775)
+    chmodSync(ownedDir, 0o755)
+    chmodSync(cleanDir, 0o755)
+    // A candidate inside a group-writable directory must be skipped.
+    writeFileSync(join(writableDir, "setpriv"), "#!/bin/sh\nexit 0\n")
+    chmodSync(join(writableDir, "setpriv"), 0o755)
+    // A candidate executable but non-root-owned must be skipped: drop its
+    // ownership to a non-root uid (nobody).
+    writeFileSync(join(ownedDir, "setpriv"), "#!/bin/sh\nexit 0\n")
+    chmodSync(join(ownedDir, "setpriv"), 0o755)
+    execFileSync("chown", ["65534", join(ownedDir, "setpriv")])
+    // The first clean, root-owned candidate wins even when the hostile
+    // entries come first on the PATH.
+    writeFileSync(join(cleanDir, "setpriv"), "#!/bin/sh\nexit 0\n")
+    chmodSync(join(cleanDir, "setpriv"), 0o755)
+    assert.equal(
+      resolveFromBridgePath("setpriv", `${writableDir}:${ownedDir}:${cleanDir}`),
+      join(cleanDir, "setpriv"),
+      "the hostile entries must be skipped, not resolved",
+    )
+    // With nothing else on the PATH the hostile entries still fail closed.
+    assert.throws(
+      () => resolveFromBridgePath("setpriv", `${writableDir}:${ownedDir}`),
+      /not found on the bridge PATH/,
+    )
   } finally {
     rmSync(base, { recursive: true, force: true })
   }
