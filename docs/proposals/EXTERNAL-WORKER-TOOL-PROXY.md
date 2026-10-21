@@ -486,7 +486,7 @@ against the pinned opencode source, `packages/opencode/src/mcp/index.ts` @
   error carrying the hub's denial reason (the hub stays deny-by-default and
   authoritative either way).
 
-The **opencode2** lane (upstream opencode v2, pinned v2.0.32) implements the
+The **opencode2** lane (upstream opencode v2, pinned v2.1.2) implements the
 same wire contract with the same bridge-side relay plus a serve-process
 plugin, but on v2's rewritten plugin API — the v1 file-plugin shape
 (`{id, server}` with an SDK client) does not exist there:
@@ -517,7 +517,8 @@ plugin, but on v2's rewritten plugin API — the v1 file-plugin shape
   this lane denies the `subagent` permission), and the JU-5 "not an isolation
   boundary" semantics all match the opencode lane. v2.0.32 additionally ships
   built-in Code Mode `session_move`/`session_rename` tools with no
-  permission check of their own (`packages/core/src/tool/plugin/opencode.ts`):
+  permission check of their own (`packages/core/src/tool/plugin/opencode.ts`;
+  still unguarded at the v2.1.2 pin):
   `session_rename` could rewrite the bound title directly (a descriptive
   self-rename loses the task's tools; renaming to another task's title
   rebinds onto that task's hub connection, grant set and call budget —
