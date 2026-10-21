@@ -48,7 +48,7 @@ remove_vision_systemd_assets() {
 }
 
 render_vision_systemd_fallback_unit() {
-  local name="$1" container="lunarwing-vision-${1}" unit_dir path tmp runtime_bin babysitter home uid
+  local name="$1" container="lunarwing-vision-${1}" unit_dir path runtime_bin babysitter home uid
   unit_dir="$(tenant_home "$name")/.config/systemd/user"
   path="$unit_dir/${container}.service"
   runtime_bin="$(command -v "$CONTAINER_RT" 2>/dev/null || true)"
@@ -65,9 +65,10 @@ render_vision_systemd_fallback_unit() {
       return 1
     fi
   fi
-  mkdir -p "$unit_dir"
-  tmp="$(mktemp "$unit_dir/.${container}.service.XXXXXX")" || return 1
-  cat >"$tmp" <<EOF
+  # WI#446 (run-174 LW-1): the unit dir and file are created tenant-side — a
+  # symlinked ~/.config component must not redirect root's writes.
+  tenant_mkdir_p "$name" "$unit_dir" || return 1
+  _write_systemd_unit "$name" "$path" 644 <<EOF || return 1
 # Managed by lunarwing-mt-admin: LunarVision fallback
 [Unit]
 Description=LunarWing vision sidecar ($name)
@@ -90,9 +91,6 @@ TimeoutStopSec=45
 [Install]
 WantedBy=default.target
 EOF
-  chown "$name:$name" "$tmp" || { rm -f -- "$tmp"; return 1; }
-  chmod 0644 "$tmp" || { rm -f -- "$tmp"; return 1; }
-  mv -f -- "$tmp" "$path"
 }
 
 _prepare_vision_systemd_fallback() {
@@ -114,7 +112,7 @@ _register_vision_systemd_fallback() {
 }
 
 render_vision_quadlet() {
-  local name="$1" qdir vision_port vision_health_port env_path path tmp
+  local name="$1" qdir vision_port vision_health_port env_path path
   qdir="$(tenant_quadlet_dir "$name")"
   vision_port="$(ports_get "$name" vision_service)" || return 1
   vision_health_port="$(ports_get "$name" vision_health)" || return 1
@@ -122,15 +120,16 @@ render_vision_quadlet() {
   env_path="$(tenant_env_dir "$name")/vision.env"
   [[ -f "$env_path" && ! -L "$env_path" ]] \
     || { say "ERROR: regular LunarVision env file required: $env_path" >&2; return 1; }
-  mkdir -p "$qdir"
+  # WI#446 (run-174 LW-1): the Quadlet dir and file are created tenant-side —
+  # a symlinked ~/.config component could otherwise redirect root's writes
+  # into the ROOTFUL Quadlet search path (/etc/containers/systemd).
+  tenant_mkdir_p "$name" "$qdir" || return 1
   path="$qdir/lunarwing-vision-${name}.container"
   if [[ -e "$path" || -L "$path" ]]; then
     [[ -f "$path" && ! -L "$path" ]] \
       || { say "ERROR: refusing to overwrite unsafe Quadlet path $path" >&2; return 1; }
   fi
-  tmp="$(mktemp "$qdir/.lunarwing-vision-${name}.container.XXXXXX")" || return 1
-
-  cat >"$tmp" <<EOF
+  _write_systemd_unit "$name" "$path" 644 <<EOF || return 1
 [Unit]
 Description=LunarWing vision sidecar ($name)
 After=network-online.target
@@ -161,9 +160,6 @@ TimeoutStartSec=120
 [Install]
 WantedBy=default.target
 EOF
-  chown "$name:$name" "$tmp" || { rm -f -- "$tmp"; return 1; }
-  chmod 0644 "$tmp" || { rm -f -- "$tmp"; return 1; }
-  mv -f -- "$tmp" "$path"
 }
 
 render_vision_systemd_assets() {
@@ -212,7 +208,7 @@ _remove_voice_systemd_fallback() {
 # Older Podman (<4.6) has no Quadlet generator, so rootless tenants get a
 # supervised user unit around the babysitter helper instead (podman wait).
 render_voice_systemd_fallback_unit() {
-  local name="$1" container="lunarwing-voice-${1}" unit_dir path tmp runtime_bin babysitter home uid
+  local name="$1" container="lunarwing-voice-${1}" unit_dir path runtime_bin babysitter home uid
   unit_dir="$(tenant_home "$name")/.config/systemd/user"
   path="$unit_dir/${container}.service"
   runtime_bin="$(command -v "$CONTAINER_RT" 2>/dev/null || true)"
@@ -229,9 +225,10 @@ render_voice_systemd_fallback_unit() {
       return 1
     fi
   fi
-  mkdir -p "$unit_dir"
-  tmp="$(mktemp "$unit_dir/.${container}.service.XXXXXX")" || return 1
-  cat >"$tmp" <<EOF
+  # WI#446 (run-174 LW-1): the unit dir and file are created tenant-side — a
+  # symlinked ~/.config component must not redirect root's writes.
+  tenant_mkdir_p "$name" "$unit_dir" || return 1
+  _write_systemd_unit "$name" "$path" 644 <<EOF || return 1
 # Managed by lunarwing-mt-admin: LunarVoice fallback
 [Unit]
 Description=LunarVoice ONNX sidecar ($name)
@@ -254,9 +251,6 @@ TimeoutStopSec=45
 [Install]
 WantedBy=default.target
 EOF
-  chown "$name:$name" "$tmp" || { rm -f -- "$tmp"; return 1; }
-  chmod 0644 "$tmp" || { rm -f -- "$tmp"; return 1; }
-  mv -f -- "$tmp" "$path"
 }
 
 # Switching from Quadlet to the fallback shape: retire the generated unit first
@@ -280,7 +274,7 @@ _register_voice_systemd_fallback() {
 }
 
 render_voice_quadlet() {
-  local name="$1" qdir voice_port voice_health_port env_path path tmp
+  local name="$1" qdir voice_port voice_health_port env_path path
   qdir="$(tenant_quadlet_dir "$name")"
   voice_port="$(ports_get "$name" voice_service)" || return 1
   voice_health_port="$(ports_get "$name" voice_health)" || return 1
@@ -288,14 +282,16 @@ render_voice_quadlet() {
   env_path="$(tenant_env_dir "$name")/voice.env"
   [[ -f "$env_path" && ! -L "$env_path" ]] \
     || { say "ERROR: regular LunarVoice env file required: $env_path" >&2; return 1; }
-  mkdir -p "$qdir"
+  # WI#446 (run-174 LW-1): the Quadlet dir and file are created tenant-side —
+  # a symlinked ~/.config component could otherwise redirect root's writes
+  # into the ROOTFUL Quadlet search path (/etc/containers/systemd).
+  tenant_mkdir_p "$name" "$qdir" || return 1
   path="$qdir/lunarwing-voice-${name}.container"
   if [[ -e "$path" || -L "$path" ]]; then
     [[ -f "$path" && ! -L "$path" ]] \
       || { say "ERROR: refusing to overwrite unsafe Quadlet path $path" >&2; return 1; }
   fi
-  tmp="$(mktemp "$qdir/.lunarwing-voice-${name}.container.XXXXXX")" || return 1
-  cat >"$tmp" <<EOF
+  _write_systemd_unit "$name" "$path" 644 <<EOF || return 1
 [Unit]
 Description=LunarVoice ONNX sidecar ($name)
 After=network-online.target
@@ -327,9 +323,6 @@ TimeoutStartSec=180
 [Install]
 WantedBy=default.target
 EOF
-  chown "$name:$name" "$tmp" || { rm -f -- "$tmp"; return 1; }
-  chmod 0644 "$tmp" || { rm -f -- "$tmp"; return 1; }
-  mv -f -- "$tmp" "$path"
 }
 
 # Refresh an enabled tenant's existing voice supervision shape without starting
