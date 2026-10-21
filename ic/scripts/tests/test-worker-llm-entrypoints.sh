@@ -495,11 +495,12 @@ def run_pebble_cli_drop_argv():
         argv = mark.read_text().strip()
         assert argv == (
             "<--reuid=10004><--regid=10004><--clear-groups>"
-            "<--ambient-caps=-all><--inh-caps=-all><--no-new-privs><-->"
+            "<--ambient-caps=-all><--inh-caps=-all><--no-new-privs>"
+            "<--bounding-set=-all><-->"
             "<env><-u><AGENT_AUTH_TOKEN><-u><AGENT_AUTH_TOKEN_FILE>"
             "<pebble><--permission-mode><danger-full-access>"
             "<--model><openai/gpt-5.2><--output-format><text><probe prompt>"
-        ), f"setpriv argv missing mandatory flags (WI#400 KW-2/LD-13): {argv}"
+        ), f"setpriv argv missing mandatory flags (WI#400 KW-2/LD-13/LP-7): {argv}"
 
 
 def run_task_drop_argv(worker):
@@ -548,10 +549,12 @@ def run_task_drop_argv(worker):
         argv = mark.read_text().strip()
         # The kimi/opencode SETPRIV_FLAGS arrays carry no bare `--`
         # separator (unlike pebble's entrypoint); the flags end at
-        # --no-new-privs and the env command follows directly.
+        # --bounding-set=-all (run-170 LP-7) and the env command follows
+        # directly.
         flags = (
             f"<--reuid={task_uid}><--regid={task_uid}><--clear-groups>"
             "<--ambient-caps=-all><--inh-caps=-all><--no-new-privs>"
+            "<--bounding-set=-all>"
         )
         if worker == "kimi":
             expected = flags + (

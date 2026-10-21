@@ -404,7 +404,7 @@ done
 # container-level no-new-privileges kimi carries; the unmigrated opencode2
 # lane is deliberately excluded (KW-1). LD-7: pin the FULL trimmed set on
 # the Quadlet PodmanArgs — a single dropped cap must fail the pin.
-KW3_QUADLET_ARGS='PodmanArgs=--security-opt=no-new-privileges --cap-drop=ALL --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER --cap-add=KILL --cap-add=SETUID --cap-add=SETGID'
+KW3_QUADLET_ARGS='PodmanArgs=--security-opt=no-new-privileges --cap-drop=ALL --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER --cap-add=KILL --cap-add=SETUID --cap-add=SETGID --cap-add=SETPCAP'
 assert_contains "$quadlet" "$KW3_QUADLET_ARGS" 'systemd Kimi quadlet carries the exact WI#400 capability trim (KW-3/LD-7)'
 for lane in opencode pebble; do
   assert_contains "$fixture/quadlets/lunarwing-${lane}-root.container" \
@@ -618,7 +618,7 @@ fi
 # WI#400 KW-3/LD-7: the root-bridge lanes run the bridge with a trimmed
 # capability set instead of the default root set. The FULL string is pinned:
 # a dropped KILL or DAC_OVERRIDE would otherwise only show in production.
-KW3_CAP_TRIM='--cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add KILL --cap-add SETUID --cap-add SETGID'
+KW3_CAP_TRIM='--cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add KILL --cap-add SETUID --cap-add SETGID --cap-add SETPCAP'
 for lane in kimi opencode pebble; do
   LANE_BLOCK="$(awk "/^start_tenant_${lane}\\(\\)/,/^stop_tenant_${lane}\\(\\)/" "$WORKER_LIB")"
   if grep -Fq -- "$KW3_CAP_TRIM" <<<"$LANE_BLOCK"; then

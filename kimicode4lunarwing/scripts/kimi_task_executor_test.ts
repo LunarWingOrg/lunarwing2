@@ -494,6 +494,7 @@ process.exit(r.status ?? 1)
       "--ambient-caps=-all",
       "--inh-caps=-all",
       "--no-new-privs",
+      "--bounding-set=-all",
       "--",
     ]
     assert.deepEqual(recorded.slice(0, prefix.length), prefix)

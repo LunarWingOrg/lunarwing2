@@ -61,6 +61,7 @@ test("taskSetprivArgv: exact flag sequence, cap-clearing pair + no-new-privs man
   // SETUID/SETGID could regain the bridge uid (run-98 FY-1 prototype).
   // --no-new-privs keeps the dropped task from regaining privilege through a
   // setuid or file-capability binary in the image (run-164 KW-2).
+  // --bounding-set=-all empties the bounding set as well (run-170 LP-7).
   assert.deepEqual(taskSetprivArgv({ uid: 10002, gid: 10002 }), [
     "--reuid=10002",
     "--regid=10002",
@@ -68,6 +69,7 @@ test("taskSetprivArgv: exact flag sequence, cap-clearing pair + no-new-privs man
     "--ambient-caps=-all",
     "--inh-caps=-all",
     "--no-new-privs",
+    "--bounding-set=-all",
     "--",
   ])
 })

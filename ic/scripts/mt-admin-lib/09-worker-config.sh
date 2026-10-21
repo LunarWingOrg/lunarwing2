@@ -1659,7 +1659,7 @@ start_tenant_opencode() {
       "${healthcheck_args[@]}" \
       "${opencode_userns_args[@]}" \
       --security-opt no-new-privileges \
-      --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add KILL --cap-add SETUID --cap-add SETGID \
+      --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add KILL --cap-add SETUID --cap-add SETGID --cap-add SETPCAP \
       -e LUNARWING_WORKER_ID="worker-opencode-${name}" \
       -e WS_PORT="$wss_port" \
       -e HEALTH_PORT="8443" \
@@ -2196,7 +2196,7 @@ start_tenant_kimi() {
       "${healthcheck_args[@]}" \
       "${kimi_userns_args[@]}" \
       --security-opt no-new-privileges \
-      --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add KILL --cap-add SETUID --cap-add SETGID \
+      --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add KILL --cap-add SETUID --cap-add SETGID --cap-add SETPCAP \
       -e LUNARWING_WORKER_ID="worker-kimi-${name}" \
       -e WS_PORT="$wss_port" \
       -e HEALTH_PORT="8443" \
@@ -2436,7 +2436,7 @@ start_tenant_pebble() {
       "${pebble_userns_args[@]}" \
       "${pebble_user_args[@]}" \
       --security-opt no-new-privileges \
-      --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add KILL --cap-add SETUID --cap-add SETGID \
+      --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add KILL --cap-add SETUID --cap-add SETGID --cap-add SETPCAP \
       -e LUNARWING_WORKER_ID="worker-pebble-${name}" \
       -e WS_PORT="$wss_port" \
       -e HEALTH_PORT="8443" \
