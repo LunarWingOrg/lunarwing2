@@ -78,11 +78,26 @@ export function resolveFromBridgePath(name: string, pathEnv: string | undefined 
 
 /** WI#400 LD-11/LP-6: variables the dynamic loader and glibc honour BEFORE
  * the drop; a task-supplied value would run inside the still-root setpriv.
- * Removes them in place and returns the keys that were dropped. */
+ * Removes them in place and returns the keys that were dropped.
+ * The list beyond LD_* is glibc's own unsafe-environment set (LP-14/ME-3,
+ * matching pebble's is_loader_env_key): LOCPATH/NLSPATH for locale loading,
+ * HOSTALIASES for resolver overrides, RES_OPTIONS/LOCALDOMAIN for the
+ * resolver, TZDIR for timezone loading, MALLOC_TRACE for allocator tracing. */
 export function dropLoaderEnv(env: NodeJS.ProcessEnv): string[] {
+  const loaderKeys = new Set([
+    "GCONV_PATH",
+    "GLIBC_TUNABLES",
+    "LOCPATH",
+    "NLSPATH",
+    "HOSTALIASES",
+    "RES_OPTIONS",
+    "LOCALDOMAIN",
+    "TZDIR",
+    "MALLOC_TRACE",
+  ])
   const dropped: string[] = []
   for (const key of Object.keys(env)) {
-    if (key.startsWith("LD_") || key === "GCONV_PATH" || key === "GLIBC_TUNABLES") {
+    if (key.startsWith("LD_") || loaderKeys.has(key)) {
       delete env[key]
       dropped.push(key)
     }
