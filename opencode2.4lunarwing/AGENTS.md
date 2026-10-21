@@ -3,7 +3,7 @@
 ## What This Is
 
 Persistent container worker for upstream OpenCode **2** (the `v2` line, pinned
-v2.0.32). This is a separate worker lane from `opencode4lunarwing/` (the proven
+v2.1.2). This is a separate worker lane from `opencode4lunarwing/` (the proven
 v1 worker, pinned v1.18.25) per
 `docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md`. Tenants opt in explicitly; v1
 stays the default until v2 earns trust. The WebSocket bridge is
@@ -17,7 +17,7 @@ internal opencode headless server.
 - `scripts/lunarwing_tool_plugin/index.ts` — WI#324 v2 serve-process plugin (directory plugin registered by absolute path in `config/opencode2.json`'s `plugins` array; v2 drops configured plugin *file* paths). Statically registers the phase-1 `lunarwing_*` tools via the v2 promise API (`{id, setup}` default export, `ctx.tool.transform`, `codemode: false`, plain JSON Schema inputs) and relays each call over the session's task socket. Dependency-free on purpose — the runtime image ships no `@opencode/plugin`/`effect` for it to import.
 - `scripts/opencode_task_executor.ts` — Task execution via the v2 client SDK. Controls session creation, permissions, event streaming.
 - `scripts/sdk_surface.ts` — Canonical list of the `@opencode/client` method paths the bridge calls and the event `type` literals it matches (WI#329). It drives the image-build gate (`scripts/sdk_surface_assert.ts`, run from the Dockerfile — asserts the method paths against the real pinned client and the event names against the pinned generated V2Event union, WI#369) and the executor self-test, which binds it to the injected mock, to the call sites/event literals extracted from every non-test `scripts/*.ts` source, and — via a recording Proxy over the mock — to every client leaf path the suite actually touches. ADD to this list whenever the bridge calls a new client method or matches a new event; never shrink it to force an assertion to pass.
-- `scripts/tsconfig.sdk-surface.json` — WI#369 compile-time gate: the Dockerfile builder stage runs `tsgo --noEmit` (from the monorepo's pinned devDependencies) over the SDK-facing scripts against the pinned generated client types, covering call argument and event payload shapes. Keep its `include` list covering every non-test script that imports `@opencode/client`. `scripts/gate-env.d.ts` carries the minimal runtime declarations the gate needs (the monorepo's bun install does not expose @types at a stable path); extend it when a gated script uses a new runtime API.
+- `scripts/tsconfig.sdk-surface.json` — WI#369 compile-time gate: the Dockerfile builder stage runs `tsc --noEmit` (the monorepo's pinned `@typescript/native` npm:typescript@7.0.2 binary; v2.0.32's `@typescript/native-preview` shipped it as `tsgo`) over the SDK-facing scripts against the pinned generated client types, covering call argument and event payload shapes. Keep its `include` list covering every non-test script that imports `@opencode/client`. `scripts/gate-env.d.ts` carries the minimal runtime declarations the gate needs (the monorepo's bun install does not expose @types at a stable path); extend it when a gated script uses a new runtime API.
 - `scripts/lunarwing_runtime.ts` — Shared types and envelope helpers. Keep in sync with `agent_comm_protocol.json`.
 - `entrypoint.sh` — Startup orchestration. Three modes: websocket, cli, acp.
 - `config/opencode2.json` — Mounted into container; controls LLM provider, MCP servers. v2 config shape (`providers`, `settings.baseURL`, `package`).
@@ -107,10 +107,11 @@ build with the default root HOME.
 Workers must never self-expose; LunarWing owns every public path through the
 daemon's tunnel. See `docs/ops/WORKER-CONTAINERS.md` → "Worker exposure
 policy" for the full control set, the !1490 gate record, and the bump
-checklist. This lane pins v2.0.32 under the maintainer-approved WI#427:
+checklist. This lane pins v2.1.2 (the v2.0.26 boundary was crossed at
+v2.0.32 under the maintainer-approved WI#427):
 v2.0.26 introduced OpenTunnel remote access (hosted relay, no self-host
 option). The compile-out guard stubs `remote-tunnel.ts` at build time,
-re-verified against v2.0.32, and CI + the build assertions fail if the tunnel
+re-verified against v2.1.2, and CI + the build assertions fail if the tunnel
 survives. Future bumps remain deliberate-only. WI#369's SDK-gate blind spots
 and WI#424's egress allowlist remain open; see the bump record.
 

@@ -15,8 +15,8 @@
  * relays the call over the per-task unix socket the bridge created
  * (../lunarwing_tool_proxy.ts).
  *
- * v2 registration notes (verified against the pinned v2.0.32 source,
- * anomalyco/opencode 843a6c51):
+ * v2 registration notes (verified against the pinned v2.1.2 source,
+ * anomalyco/opencode a517687f):
  * - Configured plugin paths must be DIRECTORIES: a file path in the config's
  *   `plugins` array is dropped with "configured plugin path must be a
  *   directory" (packages/core/src/config/plugin/source.ts). This directory is
@@ -63,7 +63,7 @@
  *   config lives in the model-writable $WORKSPACE_ROOT/.opencode/opencode2.json
  *   next to the auto-discovered .opencode/plugin(s) directories); the hub
  *   stays authoritative either way.
- * - v2.0.32's built-in Code Mode session_rename could rewrite the bound
+ * - v2.1.2's built-in Code Mode session_rename could rewrite the bound
  *   title directly (KL-1: a descriptive self-rename loses the task's tools;
  *   renaming to another task's title rebinds onto that task's hub connection
  *   and grant set), and session_move re-roots the session past the

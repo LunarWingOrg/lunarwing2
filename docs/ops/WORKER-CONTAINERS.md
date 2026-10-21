@@ -363,7 +363,9 @@ plus `opencode service set remote true` and `opencode pair` surfaces. !1490
 (v2.0.26 bump) was closed. **WI#427 (2026-10-17) records the maintainer's
 completed analysis and approval to cross that boundary at v2.0.32**, through
 the existing compile-out, wrapper, config and image assertions. See the
-v2.0.32 bump entry below for the source review and verification status.
+v2.0.32 bump entry below for the source review and verification status; the
+lane has since advanced to **v2.1.2** (2026-10-21, goals item 83) with every
+gate re-verified against a fresh clone — see the v2.1.2 bump entry.
 
 **Gate record for !1490 (run-79 EI-2):** the in-image layers below (ruleset,
 wrapper, config pins, compile-out) are **naive-use guards, not a boundary**
@@ -549,9 +551,9 @@ Enforced controls (opencode2 lane unless noted):
    only control 1 makes the crossing safe (see the gate record above).
 8. **Compile the tunnel out.** `scripts/compile_out_remote_tunnel.py` runs
    in the builder stage: the historical v2.0.24 path verifies there is no
-   tunnel surface; at the current v2.0.32 pin it replaces `remote-tunnel.ts`
-   with a fail-closed stub (re-verified against the real v2.0.32 tree for
-   WI#427: importers still use exactly
+   tunnel surface; at the current v2.1.2 pin it replaces `remote-tunnel.ts`
+   with a fail-closed stub (re-verified against the real v2.1.2 tree:
+   importers still use exactly
    `run`/`ensure`/`hostname`). Drift detection scans
    `packages/{cli,server,schema,core}/src` (`*.ts` and `*.tsx`), matches
    any quoted `@opentunnel/*` specifier (static, dynamic `import()`,
@@ -759,8 +761,9 @@ issue above); v2 is opt-in per tenant until upstream's
 tenant during the transition (agent routing confusion — plan §5).
 
 **Dockerfile:** `opencode2.4lunarwing/Dockerfile` — pinned to
-**v2.0.32** at reviewed full commit
-`843a6c514e606b436a7fe713422ace0a93ad3d61` (WI#427); the v2 bridge uses
+**v2.1.2** at reviewed full commit
+`a517687fde98a7329ada3ae644a01a9fc6c4e99e` (WI#427 boundary crossing first
+crossed at v2.0.32/`843a6c514e606b436a7fe713422ace0a93ad3d61`); the v2 bridge uses
 `@opencode/client` (promise API) instead of `@opencode-ai/sdk`, and the
 v2 config file is `config/opencode2.json` (`providers` map,
 `settings.baseURL`, `package`). Container UID/GID is **10003**
@@ -1127,6 +1130,81 @@ CLI credential records from OAuth tokens to external credentials. An image
 downgrade alone is not a verified database rollback; restore the matching
 pre-upgrade state with the prior image if rollback is needed.
 
+### v2.1.2 bump — item 83 (2026-10-21)
+
+**Authorization:** the WI#427 boundary crossing (OpenTunnel compile-out,
+wrapper, config and image assertions) remains the standing control set for
+every v2 pin; this bump re-verified each gate against the pinned source
+rather than trusting the previous pin's review. The tag was independently
+resolved with `git ls-remote` to
+`a517687fde98a7329ada3ae644a01a9fc6c4e99e` (lightweight tag resolving
+directly to the commit, same as every prior pin; the fresh clone's HEAD
+matches). Dockerfile defaults, the CI case block, and the CI validator
+fixtures moved together. The Bun base digest and `DEBIAN_SNAPSHOT` stay
+unchanged (WI#361 owns those).
+
+**Gate re-verification on the fresh v2.1.2 clone:**
+
+- compile-out guard: `packages/cli/src/services/remote-tunnel.ts` unchanged
+  in path and importer surface (`run`/`ensure`/`hostname` exactly);
+  `@opentunnel/client` stays declared-but-unimported after stubbing — same
+  shape as v2.0.32, and the runtime binary marker scan remains mandatory.
+- reproducible-build anchors: `script/build.ts` still sets `bytecode`/`splitting`
+  and takes `--single`; the patch script exits 0 on the pinned tree.
+- SDK surface (`sdk_surface_assert` against the pinned client):
+  6 bridge method paths present (`session.create/prompt/interrupt`,
+  `permission.reply`, `event.subscribe`, top-level `message.list`),
+  the 2 known-stale paths still absent (`session.message` exposes only
+  `get`; `permission` is a top-level group), and all 8 bridge event names
+  are member literals of the pinned generated V2Event union.
+- builder-stage WI#369 typecheck gate: **binary rename** — v2.0.32's
+  `@typescript/native-preview` shipped the native compiler as `tsgo`;
+  v2.1.2 pins `@typescript/native` (npm:typescript@7.0.2) whose bin is
+  `tsc`. The Dockerfile gate invocation moved with the pin and
+  `tsc --noEmit -p tsconfig.sdk-surface.json` exits 0 against the pinned
+  types (verified on the clone with a full `bun install`).
+- behavior pins: the build-agent permission defaults still ship only
+  `* allow` plus the `.env` asks (the KG-2 external_directory restore stays
+  required); Code Mode `session_move`/`session_rename` still carry no
+  permission assert of their own (KL-1/KL-2 deny rules stay required);
+  `service.json` keeps the `{remote: {route}, remoteAccepted}` shape and
+  the boot reset stays valid; `pair --remote` consent still exists and the
+  wrapper refusals cover it; `updater.ts` still honours
+  `OPENCODE_DISABLE_AUTOUPDATE` (`inspect()` gate reads it at v2.1.2).
+- **new upstream surfaces at v2.1.2, looked at (the !1831 review's MG-3):**
+  `SkillScan` (`packages/core/src/config/plugin/skill-scan.ts`, new)
+  replaces v2.0.32's glob with an explicit breadth-first walk of the project
+  tree to depth 6 collecting `SKILL.md` files plus depth-0 `.md` files and
+  skipping dot-directories — in this lane the project tree is the
+  task-writable workspace, so everything it discovers is task-authored
+  input to the serve process, the trust class the lane already records
+  (the EF-10 workspace-shadowing note); no new exposure. The Code Mode
+  `todo` plugin tool (`packages/core/src/tool/plugin/todo.ts`, new, name
+  `todowrite`) ships disabled behind `experimental.todo === true` — the
+  lane config does not set it, so it stays dormant unless task-authored
+  workspace config enables it, and unlike `session_move`/`session_rename`
+  it carries its own `permission.assert` (`resources: ["*"]`,
+  `save: ["*"]`), so it needs no extra deny rule; task-scoped todo state
+  is not an exposure surface.
+- in-host lane suites against the pinned client: bridge, executor, plugin,
+  proxy, sdk_surface (x2), result, path, prompt self-check suites pass;
+  `compile_out`, `entrypoint_config`, `exposure_policy_assert`,
+  `prepare_reproducible_build`, and `study_notes_config` python suites pass;
+  `.gitlab/tests` 234/234 and `validate_config.py` clean.
+
+**Remaining acceptance / rollout:** unchanged from the v2.0.32 entry — the
+protected `worker-opencode2-candidate` (whole-image digest comparison) and
+`worker-opencode2-scan` jobs must pass on a protected pipeline before
+promotion, then `mt-admin build-opencode2-worker` + `restart-tenant` per
+tenant with the same live exposure checks (service.json reset, wrapper
+refusals, `worker-listeners` clean). **Blocked at the pin's landing (the
+!1831 review's MG-1):** the instance's `throttle_unauthenticated_web` rate
+limit is blocking the registry push of every worker candidate build since
+pipeline 6151 (the !1828 review's MD-1), so no image has been built from
+this pin yet — the candidate/scan gate runs only once that limit is lifted
+(maintainer action, not in-tree), and until then tenants keep their current
+v2.0.32 images. Tenant rollouts are recorded below as they happen.
+
 v2.0.24 bump (2026-10-07, v2.1.5.0 checklist item #2): tag SHA
 `e7a34f09bfd9134dfade5a8ddb843f7030bc9a69` verified live against the
 anomalyco/opencode remote (`git ls-remote`, this date; a lightweight tag
@@ -1297,15 +1375,29 @@ optional for OAuth-backed setups. mt-admin keeps both credentials out of process
 arguments by materializing private `kimi-runtime.env`; API key input uses file
 path rather than plaintext argv. The Kimi Code CLI and bridge are installed
 with `npm ci` from committed integrity locks. `KIMI_CODE_VERSION` defaults to
-`2.2.0` and must match `kimi-cli/package-lock.json` (the pin moved `0.42.0` →
+`2.3.0` and must match `kimi-cli/package-lock.json` (the pin moved `0.42.0` →
 `0.43.0` → `0.43.1` → `2.0.2` earlier in the v2.1.2.0/v2.1.3.0 cycle, then
 `2.0.2` → `2.1.1` on 2026-09-26 for checklist item #2, adopting npm `latest`
-again, and `2.1.1` → `2.2.0` on 2026-10-15 for the v2.1.6.0 checklist item #4,
+again, `2.1.1` → `2.2.0` on 2026-10-15 for the v2.1.6.0 checklist item #4,
+and `2.2.0` → `2.3.0` on 2026-10-21 for the v2.1.6.0 checklist item #83,
 again npm `latest`; engine requirement unchanged at `node >=22.19.0`, satisfied by the
 pinned node 22 base; the 2.x behavior changes the worker cares about are the
-headless permission-contract findings below, verified on 2.0.x — the 2.2.0
+headless permission-contract findings below, verified on 2.0.x — the 2.3.0
 live CLI contract gate (`kimi_cli_contract_test.ts`) runs during the worker
-Dockerfile build and still needs a protected candidate build to verify it).
+Dockerfile build; the 2.3.0 real-binary lane was additionally run on the
+host (4/4: headless `-p --output-format stream-json` accepted, `--yolo`
+rejected alongside `-p`, the baked `[[hooks]]` PreToolUse guard table
+valid, and the `mcp.json` spawn + `initialize` → `tools/list` MCP
+handshake), so the in-image gate is a re-confirmation of verified
+behavior. 2.3.0's new env surface is
+`KIMI_CODE_MODEL_MIGRATION_STATE_FILE_NAME` and
+`KIMI_CODE_SESSION_RATING_PREVIEW` (survey state renamed); neither is
+exported by the worker). **Blocked at the pin's landing (the !1831
+review's MG-1):** the protected `worker-kimi-candidate` build is blocked by
+the instance's `throttle_unauthenticated_web` rate limit (the !1828
+review's MD-1), so no image has been built from the 2.3.0 pin yet —
+tenants keep their current 2.2.0 images until the limit is lifted and
+the candidate build runs.
 An override without a matching reviewed lock fails closed. The pinned version is baked
 into `KIMI_CODE_IMAGE_VERSION` and reported as `kimi_code_version`, and
 `ic/scripts/tests/test-mt-admin-kimi.sh` cross-checks Dockerfile default, CI

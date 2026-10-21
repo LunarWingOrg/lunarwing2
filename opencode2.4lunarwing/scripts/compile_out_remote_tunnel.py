@@ -10,7 +10,7 @@ style as prepare_reproducible_build.py, which fails the build on drift):
 - Tunnel present (v2.0.26+): packages/cli/src/services/remote-tunnel.ts is
   replaced with a stub that fails closed (run/ensure die; hostname reports
   no tunnel so pairing degrades gracefully). The stub mirrors the v2.0.26
-  export surface, re-verified against the real v2.0.32 tree for WI#427
+  export surface, re-verified against the real v2.1.2 tree
   (importers still use exactly run/ensure/hostname); if importers start
   using anything beyond it, or the module
   moves/renames (references remain but the expected path is gone), the build
