@@ -93,6 +93,16 @@ install_openrc_env_exec() { :; }
 read_tenant_env_value() { _read_env_value "$2" "$3"; }
 chown() { :; }
 chmod() { :; }
+# WI#446: unit rendering creates and writes the ~/.config tree tenant-side
+# (tenant_mkdir_p + write_tenant_file_atomic via sudo -u <tenant>). The
+# fixture tenants are not real accounts, so map the drop onto the invoking
+# user; the inner atomic writer runs in a fresh bash and performs its own
+# real chmod/mv, so the chmod stub above does not weaken it.
+sudo() {
+  [[ "${1:-}" == "-u" ]] || return 1
+  shift 2
+  "$@"
+}
 
 mkdir -p "$(tenant_repo t1)"
 export OPENRC_INITD_DIR="$MT_FIXTURE/init.d"

@@ -226,12 +226,21 @@ _container_config_hash() {  # <config-file> [launch-contract]
 
 # Compute and store the hash of a config file (e.g. a .container quadlet).
 # Usage: _store_container_hash <tenant> <container-name> <config-file> [launch-contract]
+# WI#446: the sidecar lives under the tenant-controlled ~/.config chain, so the
+# directory is created and the hash committed tenant-side — root's historical
+# `mkdir -p` + `printf >` followed a pre-placed symlink at either name. A
+# refusal is non-fatal by design: without a stored hash the next start simply
+# recreates the container (the fail-safe direction for a sidecar).
 _store_container_hash() {
   local name="$1" container="$2" config_file="$3" contract="${4:-}" hdir hash
   hdir="$(_hash_dir "$name")"
-  mkdir -p "$hdir" 2>/dev/null || true
   hash="$(_container_config_hash "$config_file" "$contract" || true)"
-  [[ -n "$hash" ]] && printf '%s\n' "$hash" >"$hdir/${container}.hash"
+  [[ -n "$hash" ]] || return 0
+  if ! (tenant_mkdir_p "$name" "$hdir") 2>/dev/null \
+    || ! printf '%s\n' "$hash" \
+      | write_tenant_file_atomic "$name" "$hdir/${container}.hash" 644 owned-parent; then
+    say "WARNING: could not safely store the config hash sidecar for $container (tenant '$name'); the next start will recreate the container" >&2
+  fi
 }
 
 # Check whether the config file's hash matches the stored hash.

@@ -116,6 +116,32 @@ mkdir -p "$fixture/env" "$fixture/home" "$fixture/quadlets" "$fixture/workspace"
 env_file="$fixture/env/lunarwing.env"
 printf 'GATEWAY_AUTH_TOKEN=fixture\n' >"$env_file"
 : >"$fixture/env/kimi-runtime.env"
+# WI#446: the config-hash sidecar (`_store_container_hash`, used by every
+# imperative scenario below) now creates and writes ~/.config tenant-side via
+# `sudo -u`. The fixture tenant is not a real account (and CI runs
+# no-new-privileges), so the drop maps onto the invoking user; `command`
+# bypasses the harness's fake-runtime function stubs for the dropped call.
+sudo() {
+  if [[ "${1:-}" == "-u" ]]; then shift 2; fi
+  command "$@"
+}
+
+# WI#446 (run-166 LF-8 sibling class): the config-hash sidecar commits
+# tenant-side, so a pre-planted symlink at the hash path must NOT be followed
+# — the file behind it keeps its bytes and the link stays a link.
+wi446_hash_dir="$(_hash_dir alice)"
+wi446_victim="$fixture/wi446-hash-victim.txt"
+command mkdir -p "$wi446_hash_dir"
+printf 'sentinel\n' >"$wi446_victim"
+ln -s "$wi446_victim" "$wi446_hash_dir/lunarwing-symlink-probe-alice.hash"
+_store_container_hash alice lunarwing-symlink-probe-alice "$env_file" 2>/dev/null
+if [[ -L "$wi446_hash_dir/lunarwing-symlink-probe-alice.hash" \
+  && "$(<"$wi446_victim")" == "sentinel" ]]; then
+  pass "hash sidecar refuses a pre-planted symlink (WI#446)"
+else
+  fail "hash sidecar refuses a pre-planted symlink (WI#446)"
+fi
+command rm -f "$wi446_hash_dir/lunarwing-symlink-probe-alice.hash" "$wi446_victim"
 
 base_contract() {  # <worker>: the rootless-podman base contract the lane uses
   case "$1" in
@@ -277,14 +303,11 @@ fi
 
 # WI#423 (run-171, the merge with !1784): the rootful create path below is the
 # one scenario in this harness that reaches the tenant-side credential reader,
-# which drops to the tenant with `sudo -u`. The fixture tenant is not a real
-# account (and CI runs no-new-privileges), so the drop maps onto the invoking
-# user, and the fixture env takes the production shape the tenant-side checks
-# demand: 0700 dir, 0600 file, the scoped worker credential present.
-sudo() {
-  if [[ "${1:-}" == "-u" ]]; then shift 2; fi
-  command "$@"
-}
+# which drops to the tenant with `sudo -u`. The mapping stub is defined once
+# in the fixture setup above (WI#446 moved it there so the config-hash
+# sidecar's tenant-side writes are covered too); the fixture env takes the
+# production shape the tenant-side checks demand: 0700 dir, 0600 file, the
+# scoped worker credential present.
 chmod 700 "$fixture/env"
 chmod 600 "$env_file"
 printf 'WORKER_AUTH_TOKEN=fixture-worker\n' >>"$env_file"

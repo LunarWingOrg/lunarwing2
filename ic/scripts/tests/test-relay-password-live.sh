@@ -24,6 +24,15 @@ trap cleanup EXIT
 tenant_env_dir() { printf '%s/env' "$fixture"; }
 tenant_weechat_home() { printf '%s/weechat' "$fixture"; }
 tenant_lw_root() { printf '%s' "$fixture/repo"; }
+# WI#446: the systemd unit renderer writes tenant-side (sudo -u <tenant> +
+# the atomic writer). This opt-in fixture runs unprivileged with a tenant
+# that is not a real account, so map the drop onto the invoking user — the
+# fixture tree is owned by that user and satisfies the tenant-side checks.
+sudo() {
+  [[ "${1:-}" == "-u" ]] || return 1
+  shift 2
+  "$@"
+}
 mkdir -p "$fixture/env" "$fixture/weechat" "$fixture/units" "$fixture/repo/ic/scripts"
 chmod 700 "$fixture/env"
 cp "$SCRIPT_DIR/lunarwing-weechat-"{start,stop}.sh "$fixture/repo/ic/scripts/"
