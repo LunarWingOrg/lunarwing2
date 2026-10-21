@@ -233,16 +233,25 @@ _container_config_hash() {  # <config-file> [launch-contract]
 # Usage: _store_container_hash <tenant> <container-name> <config-file> [launch-contract]
 # WI#446 (run-174 LW-3): written as root into root-owned host state (see
 # _hash_dir), so no tenant-controlled path component is ever followed and the
-# sidecar stays updatable across upgrades. A store failure is non-fatal by
-# design: without a stored hash every start recreates the container (the
-# fail-safe direction for a sidecar) until the write succeeds.
+# sidecar stays updatable across upgrades. WI#450 (run-181 MC-1): each hash
+# covers a secret-bearing env file or Quadlet, and the tenant home that used
+# to hold these sidecars was private — root's ambient umask would leave the
+# base and per-tenant directories 0755 and the file 0644, readable by every
+# local user. The directories are forced 0700 and the file is written under
+# umask 077 (0600). The mkdir itself stays outside umask 077: on a host where
+# /var/lib/lunarwing does not exist yet, a 0700 base would block tenants from
+# reaching /var/lib/lunarwing/voice-models, which is installed 0755.
+# A store failure is non-fatal by design: without a stored hash every start
+# recreates the container (the fail-safe direction for a sidecar) until the
+# write succeeds.
 _store_container_hash() {
   local name="$1" container="$2" config_file="$3" contract="${4:-}" hdir hash
   hdir="$(_hash_dir "$name")"
   hash="$(_container_config_hash "$config_file" "$contract" || true)"
   [[ -n "$hash" ]] || return 0
   if ! mkdir -p -- "$hdir" 2>/dev/null \
-    || ! printf '%s\n' "$hash" >"$hdir/${container}.hash" 2>/dev/null; then
+    || ! chmod 0700 -- "$CONTAINER_HASH_DIR" "$hdir" 2>/dev/null \
+    || ! (umask 077 && printf '%s\n' "$hash" >"$hdir/${container}.hash") 2>/dev/null; then
     say "WARNING: could not store the config hash sidecar for $container (tenant '$name'); starts will recreate the container until the sidecar can be written" >&2
   fi
 }
