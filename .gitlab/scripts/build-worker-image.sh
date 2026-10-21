@@ -71,8 +71,12 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         # Dockerfile self-test chain executes (KL-13).
         input_files='opencode2.4lunarwing/Dockerfile
 opencode2.4lunarwing/entrypoint.sh
+opencode2.4lunarwing/entrypoint-task-setup.sh
 opencode2.4lunarwing/scripts/prepare_reproducible_build.py
 opencode2.4lunarwing/scripts/path_expand_test.ts
+opencode2.4lunarwing/scripts/task_identity.ts
+opencode2.4lunarwing/scripts/task_identity_test.ts
+opencode2.4lunarwing/scripts/bridge_auth.ts
 opencode2.4lunarwing/scripts/opencode_result_test.ts
 opencode2.4lunarwing/scripts/sdk_surface.ts
 opencode2.4lunarwing/scripts/sdk_surface_assert.ts

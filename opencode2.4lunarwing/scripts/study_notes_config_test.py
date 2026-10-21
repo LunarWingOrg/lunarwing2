@@ -101,12 +101,27 @@ class StudyNotesConfigTests(unittest.TestCase):
             study_notes_config.configure(self.config, self.home)
 
     def test_entrypoint_rejects_worker_write_mode(self) -> None:
-        entrypoint = Path(__file__).resolve().parent.parent / "entrypoint.sh"
+        # WI#449: the refusal lives in the task-uid setup the root launcher
+        # delegates to via as_task — run the real launcher with /app
+        # relocated to a fixture holding the real setup script.
+        lane = Path(__file__).resolve().parent.parent
+        entrypoint = (lane / "entrypoint.sh").read_text(encoding="utf-8")
+        app = self.root / "app"
+        app.mkdir()
+        staged = app / "entrypoint-task-setup.sh"
+        staged.write_text(
+            (lane / "entrypoint-task-setup.sh").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        staged.chmod(0o755)
         result = subprocess.run(
-            ["bash", str(entrypoint)],
+            ["bash"],
+            input=entrypoint.replace("/app/", str(app) + "/"),
             env={
                 "HOME": str(self.root),
                 "PATH": os.environ["PATH"],
+                "TMPDIR": str(self.root),
+                "WORKSPACE_ROOT": str(self.root / "workspace"),
                 "LW2STUDYMCP_HOME": "/opt/lw2studymcp",
                 "LW2STUDYMCP_ALLOW_WRITE": "1",
             },

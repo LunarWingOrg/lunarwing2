@@ -232,8 +232,8 @@ done <<<"$dockerfile_code"
     || fail "Dockerfile wrapper install + binary marker scan must run in the same stage as the final --image-filesystem assertion (run-97 FQ-1: unused stages are skipped at build time)"
 [[ -n "$anchor_stage" && "$anchor_stage" == "$assert_stage" ]] \
     || fail "Dockerfile must declare ARG LUNARWING_WRAPPER_SHA256= in the final assertion stage (run-109 GW-3)"
-[[ -n "$last_user" && "$last_user" == "USER 10003:10003" ]] \
-    || fail "Dockerfile's last USER instruction must be exactly 'USER 10003:10003' (run-97 FQ-2)"
+[[ -n "$last_user" && "$last_user" == "USER 0:0" ]] \
+    || fail "Dockerfile's last USER instruction must be exactly 'USER 0:0' (WI#449: the WI#400 root-launcher entrypoint runs as container root and drops serve/one-shots to task uid 10003; a task-uid tail would silently void the split — run-97 FQ-2's shape updated by the migration)"
 
 # ENV keys are expanded by BuildKit, so a split protected name such as
 # ${PREFIX}SHA256 escapes the literal checks above. Accept only literal
@@ -279,11 +279,13 @@ grep -Fxq 'COPY config/ ./config/' <<<"$dockerfile_code" \
 if grep -Eq '^\s*COPY\s+[^#]*--chown=[^#]*\b(entrypoint\.sh|health_server\.py|agent_comm_protocol\.json)\b' <<<"$dockerfile_code"; then
     fail "Dockerfile hands boot files to the agent uid — boot files must be root-owned (FB-4)"
 fi
-grep -Fxq 'COPY entrypoint.sh health_server.py agent_comm_protocol.json ./' <<<"$dockerfile_code" \
+grep -Fxq 'COPY entrypoint.sh entrypoint-task-setup.sh health_server.py agent_comm_protocol.json ./' <<<"$dockerfile_code" \
     || fail "Dockerfile lost the root-owned COPY of the boot files (FB-4)"
 # One whole instruction, not a substring allowlist: neither the optional
 # exec-bit prefix nor the a-w command may hide a suffix restoring write access.
-grep -Eq '^RUN (chmod \+x /app/entrypoint\.sh /app/health_server\.py && )?chmod -R a-w /app/scripts /app/config /app/entrypoint\.sh /app/health_server\.py /app/agent_comm_protocol\.json$' <<<"$dockerfile_code" \
+# WI#449: the instruction also asserts setpriv(1) is present (the task drops
+# need it) and covers entrypoint-task-setup.sh.
+grep -Eq '^RUN chmod \+x /app/entrypoint\.sh /app/entrypoint-task-setup\.sh /app/health_server\.py && command -v setpriv >/dev/null && chmod -R a-w /app/scripts /app/config /app/entrypoint\.sh /app/entrypoint-task-setup\.sh /app/health_server\.py /app/agent_comm_protocol\.json$' <<<"$dockerfile_code" \
     || fail "Dockerfile must mark scripts, config and boot files read-only (FB-4)"
 
 # The bridge session ruleset must deny the self-exposure subcommands; the

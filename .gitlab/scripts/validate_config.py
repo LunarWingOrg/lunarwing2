@@ -1108,6 +1108,7 @@ WORKER_TS_LANE_SCRIPTS = {
         (
             "cd opencode2.4lunarwing",
             "bun scripts/path_expand_test.ts",
+            "bun scripts/task_identity_test.ts",
             "bun scripts/task_prompt_test.ts",
             "bun scripts/opencode_result_test.ts",
             "bun scripts/sdk_surface_test.ts",

@@ -32,7 +32,7 @@ function sessionPermissions() {
 COMPILE_OUT_COPY = "COPY scripts/compile_out_remote_tunnel.py /build/compile_out_remote_tunnel.py\n"
 COMPILE_OUT_RUN = "RUN python3 /build/compile_out_remote_tunnel.py /build/opencode\n"
 BUILD_RUN = 'RUN OPENCODE_VERSION="${OPENCODE_VERSION#v}" bun run build -- --single\n'
-READONLY_RUN = "RUN chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/health_server.py /app/agent_comm_protocol.json\n"
+READONLY_RUN = "RUN chmod +x /app/entrypoint.sh /app/entrypoint-task-setup.sh /app/health_server.py && command -v setpriv >/dev/null && chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/entrypoint-task-setup.sh /app/health_server.py /app/agent_comm_protocol.json\n"
 FILESYSTEM_ASSERTION = "RUN python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --image-filesystem\n"
 WRAPPER_ANCHOR_ARG = "ARG LUNARWING_WRAPPER_SHA256=\n"
 BINARY_SCAN_RUN = (
@@ -51,11 +51,11 @@ DOCKERFILE_LINES = (
     BINARY_SCAN_RUN,
     "COPY scripts/ ./scripts/\n",
     "COPY config/ ./config/\n",
-    "COPY entrypoint.sh health_server.py agent_comm_protocol.json ./\n",
+    "COPY entrypoint.sh entrypoint-task-setup.sh health_server.py agent_comm_protocol.json ./\n",
     READONLY_RUN,
     WRAPPER_ANCHOR_ARG,
     FILESYSTEM_ASSERTION,
-    "USER 10003:10003\n",
+    "USER 0:0\n",
 )
 
 
@@ -103,10 +103,13 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
             # The ci-config image (python:3.12-slim-bookworm) has no git; the
             # guard must resolve the repo root without it (run-79 EI-1). Build
             # a PATH of just the tools the guard needs, with no git in it.
+            # id/env/install/mv serve the nested entrypoint boot suite: since
+            # WI#449 the launcher probes `id -u` (as_task) and stages the token
+            # file with install/mv.
             minimal = self.root / "nogit-bin"
             minimal.mkdir(exist_ok=True)
             for tool in ("bash", "sh", "python3", "grep", "dirname", "cp", "mkdir",
-                         "chmod", "rm", "ln", "date"):
+                         "chmod", "rm", "ln", "date", "id", "env", "install", "mv"):
                 target = shutil.which(tool)
                 if target is None:
                     raise AssertionError(f"required tool {tool!r} not found")
@@ -210,7 +213,7 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
         dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
         dockerfile.write_text(
             dockerfile.read_text().replace(
-                "RUN chmod -R a-w /app/scripts /app/config", "RUN true"
+                "chmod -R a-w /app/scripts /app/config", "true"
             ),
             encoding="utf-8",
         )
@@ -354,7 +357,7 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
             dockerfile.read_text()
             + '\n# Mixed-case metadata and continued instructions are allowed.\n'
             + 'eXpOsE 8443\nhealthcheck --interval=30s \\\n    CMD curl -sf http://127.0.0.1:8443/health || exit 1\n'
-            + 'user 10003:10003\nentrypoint ["/app/entrypoint.sh"]\n'
+            + 'user 0:0\nentrypoint ["/app/entrypoint.sh"]\n'
             + 'cmd ["--mode", "websocket"]\nLABEL policy="WI357"\nstopsignal SIGTERM\n',
             encoding="utf-8",
         )
@@ -409,11 +412,14 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
     def test_dockerfile_readonly_step_must_be_exact(self):
         dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
         original = dockerfile.read_text()
-        exec_prefix = "RUN chmod +x /app/entrypoint.sh /app/health_server.py && "
+        exec_prefix = "RUN chmod +x /app/entrypoint.sh /app/entrypoint-task-setup.sh /app/health_server.py && command -v setpriv >/dev/null && "
         for replacement in (
             READONLY_RUN.rstrip() + " && chown -R opencode2 /app/scripts\n",
             exec_prefix + "chown -R opencode2 /app/scripts\n",
-            exec_prefix + READONLY_RUN.removeprefix("RUN ").rstrip() + " && chmod u+w /app/config\n",
+            # a write-restoring suffix must not hide behind the pinned step
+            READONLY_RUN.rstrip() + " && chmod u+w /app/config\n",
+            # the read-only list dropping a boot file must not pass
+            READONLY_RUN.replace(" /app/entrypoint-task-setup.sh /app/health_server.py /app/agent_comm_protocol.json", " /app/health_server.py /app/agent_comm_protocol.json"),
             READONLY_RUN.replace("entrypoint.sh", "entrypointXsh"),
         ):
             with self.subTest(replacement=replacement):
@@ -449,15 +455,17 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
                 self.assertIn("same stage", result.stderr)
         dockerfile.write_text(original, encoding="utf-8")
 
-    def test_dockerfile_last_user_must_be_agent_uid(self):
-        # Run-97 FQ-2: a USER root tail (or a missing group) would void the
-        # root-owned read-only controls outside mt-admin-managed deployments.
+    def test_dockerfile_last_user_must_be_root(self):
+        # Run-97 FQ-2, updated by WI#449 (the WI#400 migration): the lane is a
+        # root-bridge lane — the last USER must be exactly 0:0. A task-uid tail
+        # (the pre-migration 10003:10003 shape) silently voids the split, and
+        # a missing group is a malformed pin.
         dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
         original = dockerfile.read_text()
         for name, mutated in {
             "root-user": original + "USER root\n",
-            "numeric-root": original + "USER 0:0\n",
-            "no-group": original.replace("USER 10003:10003", "USER 10003"),
+            "task-uid": original.replace("USER 0:0", "USER 10003:10003"),
+            "no-group": original.replace("USER 0:0", "USER 0"),
         }.items():
             with self.subTest(name=name):
                 dockerfile.write_text(mutated, encoding="utf-8")

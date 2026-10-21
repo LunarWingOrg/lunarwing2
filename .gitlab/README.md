@@ -437,7 +437,9 @@ host's concurrent builds before retrying manually.
   `yaml.safe_load` rejects) fails closed with a clean one-line error naming
   the file, not a traceback (MR !1647 review HP-5).
 - `worker-opencode2-ts`: the opencode2 worker's dependency-free Bun suites
-  (`path_expand_test.ts`, `task_prompt_test.ts`, `opencode_result_test.ts`).
+  (`path_expand_test.ts`, `task_identity_test.ts`, `task_prompt_test.ts`,
+  `opencode_result_test.ts`, the WI#369 sdk-surface pair, and the WI#324
+  tool-proxy/plugin pair).
   The executor suite needs the image's built `@opencode/client` and stays
   gated at the (protected) worker image build. Runs on the same digest-pinned
   `CI_BUN_IMAGE` as the v1 lane on every MR/branch push and protected release

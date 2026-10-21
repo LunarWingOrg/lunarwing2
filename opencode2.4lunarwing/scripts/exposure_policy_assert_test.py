@@ -47,16 +47,25 @@ def write_lane(root: pathlib.Path, *, name: str = "opencode2.4lunarwing") -> pat
         "# comment naming opencode service mode is prose, not an invocation\n"
         'OPENCODE_SERVE_HOST="${OPENCODE_SERVE_HOST:-127.0.0.1}"\n'
         'OPENCODE_BIN="${OPENCODE_BIN:-/usr/local/bin/opencode}"\n'
+        'WORKSPACE_ROOT="$WORKSPACE_ROOT" as_task /app/entrypoint-task-setup.sh\n'
+        'export OPENCODE_PASSWORD="${OPENCODE_PASSWORD:-x}"\n'
+        '"$OPENCODE_BIN" serve --port "$OPENCODE_SERVE_PORT" \\\n'
+        '  --hostname "$OPENCODE_SERVE_HOST"\n'
+        'case "$MODE" in\n',
+        encoding="utf-8",
+    )
+    # WI#449: the service.json reset and the config materialization are
+    # task-owned writes, so they live in the task-uid setup script the root
+    # launcher delegates to — the fixture mirrors the split.
+    (lane / "entrypoint-task-setup.sh").write_text(
+        '[ "$(id -u)" != "0" ] || die "entrypoint-task-setup.sh runs as the task uid only (WI#400)"\n'
         'SERVICE_CONFIG_DIR="${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}"\n'
         'mkdir -p "$SERVICE_CONFIG_DIR"\n'
         'rm -rf -- "$SERVICE_CONFIG_DIR/service.json"\n'
         "printf '%s\\n' '{\"disabled\": true}' > \"$SERVICE_CONFIG_DIR/service.json\"\n"
         'mkdir -p "$WORKSPACE_ROOT/.opencode"\n'
         'rm -f "$WORKSPACE_ROOT/.opencode/opencode2.json"\n'
-        'cp /app/config/opencode2.json "$WORKSPACE_ROOT/.opencode/opencode2.json"\n'
-        'export OPENCODE_PASSWORD="${OPENCODE_PASSWORD:-x}"\n'
-        '"$OPENCODE_BIN" serve --port "$OPENCODE_SERVE_PORT" \\\n'
-        '  --hostname "$OPENCODE_SERVE_HOST"\n',
+        'cp /app/config/opencode2.json "$WORKSPACE_ROOT/.opencode/opencode2.json"\n',
         encoding="utf-8",
     )
     shutil.copy(WRAPPER, lane / "scripts" / WRAPPER.name)
@@ -139,29 +148,43 @@ class ExposurePolicyAssertTests(unittest.TestCase):
         self.assertIn("OPENCODE_BIN", result.stderr)
 
     def test_implicit_service_disable_must_be_executable_before_dispatch(self) -> None:
-        entrypoint = self.lane / "entrypoint.sh"
-        original = entrypoint.read_text(encoding="utf-8")
+        setup = self.lane / "entrypoint-task-setup.sh"
+        original = setup.read_text(encoding="utf-8")
         write = "printf '%s\\n' '{\"disabled\": true}' > \"$SERVICE_CONFIG_DIR/service.json\""
         for replacement in ("", "# " + write, write.replace("true", "false"),
-                            'case "$MODE" in\n' + write,
                             write.replace("service.json", "wrong.json")):
             with self.subTest(replacement=replacement):
-                entrypoint.write_text(original.replace(write, replacement), encoding="utf-8")
+                setup.write_text(original.replace(write, replacement), encoding="utf-8")
                 result = run_assert("--lane", str(self.lane))
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("must write service.json with disabled=true", result.stderr)
+        # The ordering half: the delegation must run BEFORE the mode dispatch
+        # (the fixture entrypoint ends with the case marker), or the reset
+        # never runs at boot.
+        entrypoint = self.lane / "entrypoint.sh"
+        entrypoint_original = entrypoint.read_text(encoding="utf-8")
+        delegation = 'WORKSPACE_ROOT="$WORKSPACE_ROOT" as_task /app/entrypoint-task-setup.sh\n'
+        entrypoint.write_text(
+            entrypoint_original.replace(delegation, "").replace(
+                'case "$MODE" in\n', 'case "$MODE" in\n' + delegation,
+            ),
+            encoding="utf-8",
+        )
+        result = run_assert("--lane", str(self.lane))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("must run entrypoint-task-setup.sh via as_task before mode dispatch", result.stderr)
 
     def test_service_reset_must_remove_plants_before_writing(self) -> None:
         # FB-6: a bare redirect hangs on a planted FIFO, crashes on a
         # directory, and follows a planted symlink onto the agent's file; the
         # reset must remove whatever sits at the path first.
-        entrypoint = self.lane / "entrypoint.sh"
-        original = entrypoint.read_text(encoding="utf-8")
+        setup = self.lane / "entrypoint-task-setup.sh"
+        original = setup.read_text(encoding="utf-8")
         removal = 'rm -rf -- "$SERVICE_CONFIG_DIR/service.json"'
         for replacement in ("", "# " + removal, removal.replace("service.json", "wrong.json"),
                             removal.replace(" -rf", "")):
             with self.subTest(replacement=replacement):
-                entrypoint.write_text(original.replace(removal, replacement), encoding="utf-8")
+                setup.write_text(original.replace(removal, replacement), encoding="utf-8")
                 result = run_assert("--lane", str(self.lane))
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("must remove a planted service.json", result.stderr)
@@ -198,9 +221,9 @@ class ExposurePolicyAssertTests(unittest.TestCase):
         self.assertIn("with --hostname", result.stderr)
 
     def test_workspace_config_not_rederived_fails(self) -> None:
-        entrypoint = self.lane / "entrypoint.sh"
-        entrypoint.write_text(
-            entrypoint.read_text(encoding="utf-8").replace(
+        setup = self.lane / "entrypoint-task-setup.sh"
+        setup.write_text(
+            setup.read_text(encoding="utf-8").replace(
                 'cp /app/config/opencode2.json "$WORKSPACE_ROOT/.opencode/opencode2.json"\n',
                 'true\n',
             ),

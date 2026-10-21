@@ -261,6 +261,12 @@ ENV GOROOT=/usr/local/go \
 # task code.
 RUN groupadd --gid 10003 opencode2 \
     && useradd --uid 10003 --gid 10003 -m -d /home/opencode2 opencode2
+# WI#400 (WI#449 migration): the task identity is pinned for the launcher,
+# the bridge relay, and the cron-workspace bootstrap (the launcher drops
+# serve and every one-shot process to this uid/gid via setpriv; the bridge
+# stays root). ENV sits before the final --image-filesystem assertion: the
+# exposure guard allows only metadata instructions after it.
+ENV OPENCODE2_TASK_UID=10003 OPENCODE2_TASK_GID=10003
 
 # ── app layout ─────────────────────────
 WORKDIR /app
@@ -406,10 +412,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
 # WI#400 (WI#449 migration): root entrypoint — the launcher drops the serve
 # process and every one-shot process to the opencode2 uid (10003) itself; the
 # WebSocket bridge stays root so its per-task resources (tool-proxy sockets)
-# can be handed to the task identity. Task identity is pinned for the
-# launcher, the bridge relay, and the cron-workspace bootstrap.
-ENV OPENCODE2_TASK_UID=10003 \
-    OPENCODE2_TASK_GID=10003
+# can be handed to the task identity.
 USER 0:0
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]

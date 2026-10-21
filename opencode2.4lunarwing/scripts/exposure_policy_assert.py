@@ -176,31 +176,53 @@ def check_entrypoint(lane: pathlib.Path, is_v2: bool) -> None:
         # FB-7: the reset must honour OPENCODE_CONFIG_DIR like upstream;
         # FB-6: it must remove an agent-planted FIFO/dir/symlink before the
         # write (a bare redirect hangs, crashes, or follows the symlink).
+        # WI#449 (the WI#400 migration): the reset and the config
+        # materialization write task-owned state, so they run as the task uid
+        # in entrypoint-task-setup.sh, which the root launcher must invoke via
+        # as_task before the mode dispatch — pin the delegation AND the moved
+        # bodies (the setup script itself refuses to run as root).
         boot = code.split('case "$MODE" in', 1)[0]
+        if re.search(r'as_task /app/entrypoint-task-setup\.sh', boot):
+            check("entrypoint.sh runs the task-side setup as the task uid before mode dispatch (WI#449)")
+        else:
+            fail(f"{entrypoint} must run entrypoint-task-setup.sh via as_task before mode dispatch (WI#449)")
+        setup = lane / "entrypoint-task-setup.sh"
+        try:
+            setup_text = setup.read_text(encoding="utf-8")
+        except OSError as error:
+            fail(f"{setup} unreadable: {error}")
+            return
+        setup_code = "\n".join(
+            line for line in setup_text.splitlines() if not line.lstrip().startswith("#")
+        )
+        if '[ "$(id -u)" != "0" ] || die "entrypoint-task-setup.sh runs as the task uid only (WI#400)"' in setup_code.splitlines():
+            check("entrypoint-task-setup.sh refuses to run as root (WI#400)")
+        else:
+            fail(f"{setup} must refuse to run as root (WI#400)")
         service_setup = (
             'SERVICE_CONFIG_DIR="${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}"',
             'mkdir -p "$SERVICE_CONFIG_DIR"',
             "printf '%s\\n' '{\"disabled\": true}' > \"$SERVICE_CONFIG_DIR/service.json\"",
         )
-        if all(line in boot.splitlines() for line in service_setup):
-            check("entrypoint.sh disables implicit shared-service startup at boot")
+        if all(line in setup_code.splitlines() for line in service_setup):
+            check("entrypoint-task-setup.sh disables implicit shared-service startup at boot")
         else:
-            fail(f"{entrypoint} must write service.json with disabled=true before mode dispatch")
+            fail(f"{setup} must write service.json with disabled=true")
         # FB-6: without the removal a planted FIFO/dir/symlink at the reset
         # path hangs the boot, crashes it, or redirects the write.
-        if 'rm -rf -- "$SERVICE_CONFIG_DIR/service.json"' in boot.splitlines():
-            check("entrypoint.sh removes a planted service.json before the reset")
+        if 'rm -rf -- "$SERVICE_CONFIG_DIR/service.json"' in setup_code.splitlines():
+            check("entrypoint-task-setup.sh removes a planted service.json before the reset")
         else:
-            fail(f"{entrypoint} must remove a planted service.json before the reset")
+            fail(f"{setup} must remove a planted service.json before the reset")
         # run-79 EI-5: the workspace config copy is untrusted — it must be
         # regenerated from the root-owned /app/config at every boot (copy or
         # symlink). The live copy remains agent-writable within a session.
-        copies = 'cp /app/config/opencode2.json "$WORKSPACE_ROOT/.opencode/opencode2.json"' in code
-        links = 'ln -sfn /app/config/opencode2.json "$WORKSPACE_ROOT/.opencode/opencode2.json"' in code
+        copies = 'cp /app/config/opencode2.json "$WORKSPACE_ROOT/.opencode/opencode2.json"' in setup_code
+        links = 'ln -sfn /app/config/opencode2.json "$WORKSPACE_ROOT/.opencode/opencode2.json"' in setup_code
         if copies or links:
-            check("entrypoint.sh re-derives the runtime config from /app/config at boot")
+            check("entrypoint-task-setup.sh re-derives the runtime config from /app/config at boot")
         else:
-            fail(f"{entrypoint} must materialize the runtime config from "
+            fail(f"{setup} must materialize the runtime config from "
                  "/app/config/opencode2.json (copy or symlink) at every boot")
 
 
