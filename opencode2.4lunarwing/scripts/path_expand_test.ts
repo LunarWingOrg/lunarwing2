@@ -186,4 +186,42 @@ for (;;) {
   if (refused === 0) console.error("DS-1 race window never hit within the time budget (harness liveness only; no redirect was returned)")
 }
 
+// WI#444: deterministic DS-1 pin — the injected hook fires between the
+// descriptor walk and the re-resolve and swaps `missions` for a symlink to
+// the decoy (which already contains "x"), so the dev/ino re-check must
+// refuse on every run with no race window. Mutation target: removing the
+// dev/ino compare returns the decoy path instead of throwing.
+{
+  const hookRoot = realpathSync(mkdtempSync(join(tmpdir(), "oc2-ds1-hook-")))
+  const linkPath = join(hookRoot, "missions")
+  const decoy = join(hookRoot, "decoy")
+  mkdirSync(linkPath)
+  mkdirSync(join(decoy, "x"), { recursive: true })
+  try {
+    let hookFired = 0
+    const hook = () => {
+      hookFired++
+      rmSync(linkPath, { recursive: true, force: true })
+      symlinkSync(decoy, linkPath)
+    }
+    const context = { project_dir: "missions/x", cron_tick: { event: "cron.tick" } }
+    assert.throws(
+      () => resolveTaskWorkspace(context, hookRoot, { beforeReresolve: hook }),
+      (error: unknown) => {
+        const message = String(error)
+        assert.ok(message.includes("resolved path changed during bootstrap"),
+          `expected the dev/ino refusal, got: ${message}`)
+        assert.ok(message.includes("Transient workspace error for cron tick"),
+          `refusal must classify transient (DS-2), got: ${message}`)
+        return true
+      },
+    )
+    assert.equal(hookFired, 1, "hook must fire exactly once")
+    // The redirect is never returned: the decoy holds only its planted "x".
+    assert.deepEqual(readdirSync(decoy), ["x"])
+  } finally {
+    rmSync(hookRoot, { recursive: true, force: true })
+  }
+}
+
 console.log("workspace path expansion self-check passed")
