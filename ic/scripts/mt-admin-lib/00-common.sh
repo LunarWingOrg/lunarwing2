@@ -30,8 +30,7 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 # metacharacters ($ & ; etc.) are DATA here, not an injection: die prints them
 # with %s and nothing downstream evals die output.
 sanitize_display_value() {  # <value> [max_len=160]
-  local value="$1" max_len="${2:-160}" out="" ch i n
-  LC_ALL=C
+  local value="$1" max_len="${2:-160}" out="" ch i n LC_ALL=C
   n=${#value}
   if ((max_len < 4)); then
     printf '%s' "${value:0:max_len}"
