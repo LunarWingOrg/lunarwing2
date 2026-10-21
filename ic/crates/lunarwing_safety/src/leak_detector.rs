@@ -739,23 +739,26 @@ mod tests {
     }
 
     /// WI#353 (BC-5): Bearer redaction used to stop at `~`, leaving the
-    /// tilde-suffixed token tail visible.
+    /// tilde-separated token tail visible.
     #[test]
     fn test_redact_bearer_tilde_token_completely() {
         let detector = LeakDetector::new();
-        let token = format!("{}~", "t".repeat(30));
-        let content = format!("Bearer {token} trailing");
+        // A tilde-separated token: everything after the first `~` stayed
+        // visible under the pre-WI#353 `[a-zA-Z0-9_-]` value class.
+        let tail = format!("{}~{}", "t".repeat(30), "s".repeat(30));
+        let content = format!("Bearer {tail} trailing");
 
         let result = detector.scan(&content);
         let redacted = result.redacted_content.expect("bearer must redact");
         assert!(redacted.contains("[REDACTED]"));
         assert!(
-            !redacted.contains(&token),
+            !redacted.contains(&tail),
             "tilde token must not survive redaction: {redacted}"
         );
+        // The post-tilde body specifically (the pre-WI#353 leak):
         assert!(
-            !redacted.contains(&format!("{}~", "t".repeat(5))),
-            "token tail including tilde must be redacted"
+            !redacted.contains(&format!("~{}", "s".repeat(30))),
+            "post-tilde tail must be redacted"
         );
         assert!(redacted.contains(" trailing"));
     }
