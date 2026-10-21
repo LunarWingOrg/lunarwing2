@@ -1283,8 +1283,8 @@ need a manual job retry (most recently the `shellcheck` job on
 release-target pipeline 6002), and no work item owns the rate limits. The
 WI#375 DS-1 cron-bootstrap race tests no longer fail when a loaded runner
 never hits the race window (the harness check is now a log line on every
-lane; any returned redirect still fails); the deterministic test hook
-WI#444 asks for is still open.
+lane; any returned redirect still fails); the deterministic per-lane test
+hook WI#444 asks for landed on all four lanes (item 80), mutation-verified.
 
 **Accepted advisories.** Ten vulnerability advisories, two unsound
 notices, and two unmaintained notices (fourteen IDs) ship accepted — see
