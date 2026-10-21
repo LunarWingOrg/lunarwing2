@@ -445,18 +445,21 @@ graph free of the legacy chain at both build roots.
 ### Crate Security Re-Audit
 
 The v2.1.6.0 audit (`docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md`) is a
-risk-acceptance record, not a clean bill: **eight vulnerability advisories,
+risk-acceptance record, not a clean bill: **ten vulnerability advisories,
 two unsound notices (`failure`, `atty`), and two unmaintained notices**
-(twelve IDs) ship accepted via `ic/deny.toml`, each with recorded exposure
+(fourteen IDs) ship accepted via `ic/deny.toml`, each with recorded exposure
 and a named clearing owner (rsa: WI#368; `failure`/`rental`/`atty`: WI#367;
-the seven libsql 0.6.0 legacy-chain acceptances — four rustls-webpki 0.102,
-the h2 0.3.27 pin, and the rustls 0.22.4 pair — WI#418, whose standing
+the nine libsql 0.6.0 legacy-chain acceptances — five rustls-webpki 0.102,
+the webpki-roots 0.26.11 shim, the h2 0.3.27 pin, and the rustls 0.22.4
+pair — WI#418, whose standing
 decision record `docs/ops/v2.1.6.0_WI418_LIBSQL_LEGACY_CHAIN.md`
 (2026-10-16) adopts the WI#331 feature gate as the long-term mitigation
 after re-confirming upstream — libsql 0.10.0 went stable 2026-10-13 and
 still pins hyper-rustls ^0.25 — so a bump still clears nothing). All three
 owners were closed on 2026-10-18 with every chain still in `ic/Cargo.lock`,
-so none of the twelve has an open clearing owner at release (see Accepted
+and the two 2026-10-20 emSign acceptances below re-home under the same WI#418
+decision record, so none of the fourteen has an open clearing owner at
+release (see Accepted
 advisories under Security, Deployment, and Release Limitations). After the
 WI#331 gate, exactly one vulnerability (rsa
 via russh) compiles into default builds; the webpki/h2 chain and the
@@ -476,7 +479,7 @@ ever resolves into a non-dev build graph. Its named clearing owner,
 WI#367, was closed on 2026-10-18 with the `env_logger` 0.6.2 dev-dep edge
 still in place.
 
-Two security upgrades landed late in the cycle on top of the semver sweep:
+Four security upgrades landed late in the cycle on top of the semver sweep:
 
 - **rustls 0.23.45 → 0.23.46** (WI#409), fixing RUSTSEC-2026-0346/0347/
   0348/0349. The daemon manifest now requires `>=0.23.46` on the 0.23 line
@@ -489,11 +492,48 @@ Two security upgrades landed late in the cycle on top of the semver sweep:
   component-handle host-memory exhaustion. The patch introduces a default
   per-store cap of 100,000 live component handles; exhausting it traps.
   Rebuild **and restart** the daemon and XMPP bridge to deploy it.
+- **Wasmtime/WASI 36.0.18 → 36.0.19** (Cranelift 0.123.18 → 0.123.19),
+  fixing RUSTSEC-2026-0379/0380 (published 2026-10-20; pipeline 6121)
+  — two critical-class Cranelift miscompilation bugs (an aarch64 `br_table`
+  jumping to an incorrect target, and bit-packing silent overflow), the
+  class that can undermine the Wasm-level safety guarantees when executing
+  untrusted WASM tools and channels, so both are fixed by upgrade, not
+  accepted. Both manifest minimums (daemon and XMPP bridge) rise to
+  36.0.19; 37 package records move in each lockfile (24 Wasmtime-family
+  36.0.19 + 13 Cranelift 0.123.19); `ic/vendor/` regenerated with the
+  rig-core patch preserved. No new acceptances (the twelve-entry policy
+  total at that point was unchanged). Rebuild **and restart** the daemon
+  and XMPP bridge; rolling back below 36.0.19 reintroduces both
+  miscompilations.
+- **webpki root-store trio for CVE-2026-111943** (published 2026-10-20;
+  pipeline 6137): RUSTSEC-2026-0381 (`webpki-roots`), 0382
+  (`rustls-webpki`), and 0383 (`webpki-root-certs`) — certificate paths
+  through the distrusted emSign intermediates (the emSign ECC Root CA - G3
+  private keys are now well known) were accepted by the bundled/verifying
+  webpki stacks. Fixed by semver-compatible upgrade everywhere a patch
+  exists: `webpki-roots` and `webpki-root-certs` 1.0.9 → 1.0.10 and
+  `rustls-webpki` 0.103.15 → 0.103.16 across `ic`, the XMPP bridge,
+  pebble, and the OCR sidecar, with `ic/vendor/` refreshed and `[bans]`
+  floors raised (`rustls-webpki <0.103.16`, `webpki-roots`/
+  `webpki-root-certs <1.0.10`, only the accepted 0.26.11 pin permitted
+  below the patched webpki-roots line). The pebble image's reviewed lock
+  override moves with them (re-pinned, `webpki-roots` added to the delta
+  gate's allowlist — deployed pebble images still need rebuild and
+  promotion). Two residual acceptances land on the WI#418 libsql 0.6.0
+  legacy chain, which has no patch for its pinned line and stays behind
+  the opt-in `libsql-remote-replica` gate: 0381 on the `webpki-roots`
+  0.26.11 shim (a documented semver shim whose served roots come from its
+  1.x dependency, now the patched 1.0.10 — the shim itself is still
+  flagged by version) and 0382 on `rustls-webpki` 0.102.8 (no 0.102-line
+  patch exists), moving the policy total twelve → fourteen. Pipeline 6137
+  is green with the upgrades in.
 
-Verification for both is recorded in `docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md`
+Verification for all four is recorded in `docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md`
 (October 14 update, pipeline 5710 addendum, the October 16 zip-yank
-follow-up described under Dependency Sweep below, and the October 17
-`unsound = "all"` widening follow-up described above).
+follow-up described under Dependency Sweep below, the October 17
+`unsound = "all"` widening follow-up described above, and the two
+October 20 addenda — pipeline 6121 for Wasmtime 36.0.19, pipeline 6137
+for the emSign trio).
 
 ### Pending-Gate Lifecycle (WI#332)
 
