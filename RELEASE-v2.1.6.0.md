@@ -1049,12 +1049,14 @@ External crates took MSRV-respecting semver-compatible updates across all
 0.2.38, toml 1.1.8, uuid 1.28.0, zeroize 1.9.1, html-to-markdown-rs 3.17.2,
 syn 3.0.7, among others), and `ic/vendor/` was regenerated — 1150
 directories: 1148 vendored crates plus the two pre-vendored libsignal path
-dependencies — with the rig-core patch restored and marker-verified. Two
-security upgrades landed late-cycle on top of the sweep (rustls 0.23.46,
-Wasmtime/WASI 36.0.18 — see Crate Security Re-Audit). The
+dependencies — with the rig-core patch restored and marker-verified. Four
+security upgrades landed late-cycle on top of the sweep (rustls 0.23.46;
+Wasmtime/WASI 36.0.18 then 36.0.19; the CVE-2026-111943 webpki root-store
+trio — see Crate Security Re-Audit). The
 `pebble4lunarwing/upstream/Cargo.lock` build-input pin was deliberately
-untouched by the sweep, then upgraded separately for the rustls advisories
-with its Dockerfile digest refreshed. External worker pins: kimi-code
+untouched by the sweep, then upgraded separately twice — for the rustls
+advisories and again for the webpki trio — with its Dockerfile digest
+refreshed each time. External worker pins: kimi-code
 advanced to 2.2.0; opencode v1.18.25 and the Pebble upstream ref are
 unchanged; opencode2 advances v2.0.24 → v2.0.32 per WI#427 (OpenTunnel
 compiled out; see Worker Exposure Policy). All four worker Dockerfiles and
@@ -1136,8 +1138,7 @@ are recorded in the audit doc's 2026-10-16 follow-up.
    and the WI#324 serve-process plugin, and the pebble image carries
    WI#334, the WI#324 MCP shim registration
    (`PEBBLE_CONFIG_HOME=/etc/lunarwing/pebble`), and the reviewed-lock
-   rustls
-   upgrade; all four images also move to the 20261017T082437Z Debian
+   rustls + CVE-2026-111943 webpki upgrades; all four images also move to the 20261017T082437Z Debian
    snapshot, which ships the fixed perl for the three CVEs
    `.gitlab/trivy-ignore` no longer suppresses (WI#361) — opencode stays
    v1.18.25, while opencode2 advances to v2.0.32
@@ -1165,7 +1166,9 @@ are recorded in the audit doc's 2026-10-16 follow-up.
 5. **Deploy rebuilt components together.** Rebuild the daemon, XMPP bridge,
    and installed WASM channels and tools; rebuild/reinstall all four
    channel and nine tool registry updates through the normal deployment
-   path. The rustls 0.23.46 and Wasmtime/WASI 36.0.18 security fixes ship
+   path. The rustls 0.23.46, Wasmtime/WASI 36.0.19 (36.0.18's successor —
+   both Cranelift miscompilation fixes), and CVE-2026-111943 webpki
+   security fixes ship
    in the daemon and XMPP bridge binaries — rebuild **and restart** both to
    deploy them.
 6. **Review cron worker authority.** Cron tick jobs draw from the new
