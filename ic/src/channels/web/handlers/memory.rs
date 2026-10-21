@@ -146,13 +146,23 @@ pub async fn memory_write_handler(
     // Shadow backup files (backups/) are written only by the shadow-backup
     // rotation itself, and quarantined daily logs (daily/*.poisoned-*.md)
     // hold live injection evidence; neither may be overwritten or erased
-    // through this route (WI#288 review T-2/J-2). Reads stay open for
+    // through this route (WI#288 review T-2/J-2). The engine projects tree
+    // (engine/projects/**, most critically the mission records) is
+    // Engine-owned state loaded at boot without create_mission validation;
+    // writing it through memory tools would forge or resurrect mission
+    // records, so it is reserved the same way (WI#322). Reads stay open for
     // operator recovery.
     let normalized_path = crate::workspace::normalize_path(&req.path);
     if crate::workspace::is_backup_path(&normalized_path) {
         return Err((
             StatusCode::FORBIDDEN,
             "backups/ paths are reserved for the shadow-backup rotation".to_string(),
+        ));
+    }
+    if crate::workspace::is_engine_projects_path(&normalized_path) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "engine/projects/ paths are Engine-owned project and mission records".to_string(),
         ));
     }
     if crate::workspace::is_quarantined_daily_log(&normalized_path) {
