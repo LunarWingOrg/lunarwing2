@@ -398,7 +398,9 @@ mod tests {
         }
         // LP-16: fchown's unmapped-uid EINVAL is permanent — no re-dispatch
         // can ever map the id.
-        assert!(is_non_retryable_bootstrap(&io::Error::from_raw_os_error(libc::EINVAL)));
+        assert!(is_non_retryable_bootstrap(&io::Error::from_raw_os_error(
+            libc::EINVAL
+        )));
         // Transient errnos are worth a re-dispatch (DS-2).
         for error in [
             io::Error::from_raw_os_error(libc::EMFILE),
