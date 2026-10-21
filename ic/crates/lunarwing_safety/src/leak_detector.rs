@@ -499,6 +499,15 @@ pub(crate) fn default_patterns() -> Vec<LeakPattern> {
             severity: LeakSeverity::Critical,
             action: LeakAction::Block,
         },
+        // GitLab personal access tokens (WI#353): `glpat-` followed by a
+        // base64-ish body; the 20-char minimum keeps the prefix from
+        // matching plain prose that merely mentions the scheme.
+        LeakPattern {
+            name: "gitlab_pat".to_string(),
+            regex: Regex::new(r"glpat-[a-zA-Z0-9_-]{20,}").unwrap(), // safety: hardcoded literal
+            severity: LeakSeverity::Critical,
+            action: LeakAction::Block,
+        },
         // PEM private keys
         LeakPattern {
             name: "pem_private_key".to_string(),
@@ -542,17 +551,23 @@ pub(crate) fn default_patterns() -> Vec<LeakPattern> {
             severity: LeakSeverity::High,
             action: LeakAction::Block,
         },
-        // Bearer tokens (redact instead of block, might be intentional)
+        // Bearer tokens (redact instead of block, might be intentional).
+        // WI#353: the value class covers the full bearer-token grammar —
+        // JWT dot-separated segments (`.`), tilde-suffixed tokens (`~`),
+        // and base64 padding (`+`, `/`, `=`) — so the payload and signature
+        // of a JWT and the tail of a tilde token are redacted with the rest
+        // instead of being left visible past the first separator.
         LeakPattern {
             name: "bearer_token".to_string(),
-            regex: Regex::new(r"Bearer\s+[a-zA-Z0-9_-]{20,}").unwrap(), // safety: hardcoded literal
+            regex: Regex::new(r"Bearer\s+[a-zA-Z0-9_+/.=-]{20,}").unwrap(), // safety: hardcoded literal
             severity: LeakSeverity::High,
             action: LeakAction::Redact,
         },
         // Authorization header with key
         LeakPattern {
             name: "auth_header".to_string(),
-            regex: Regex::new(r"(?i)authorization:\s*[a-zA-Z]+\s+[a-zA-Z0-9_-]{20,}").unwrap(), // safety: hardcoded literal
+            regex: Regex::new(r"(?i)authorization:\s*[a-zA-Z]+\s+[a-zA-Z0-9_+/.=-]{20,}")
+                .unwrap(), // safety: hardcoded literal
             severity: LeakSeverity::High,
             action: LeakAction::Redact,
         },
