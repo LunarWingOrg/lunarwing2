@@ -607,6 +607,83 @@ for good in 'https://gw.example.test/a;v=1?q=one&other=two#fragment' \
   fi
 done
 
+# WI#384 display hygiene: the die sites that echo the tenant-controlled URL
+# must render it sanitized — control bytes and terminal escapes %-encoded,
+# long values truncated — so a hostile value cannot forge terminal output or
+# flood root-side logs. The scheme gate fires before the content checks, so a
+# raw ANSI escape previously reached the terminal verbatim.
+echo "=== WI#384 validate_llm_url die-echo sanitization ==="
+
+ansi_url="$(printf 'gopher://x/\x1b[31mRED\x1b[0m/a')"
+scheme_err="$( (validate_llm_url "$ansi_url" --label) 2>&1 || true )"
+if [[ "$scheme_err" == *'%1B[31mRED%1B[0m/a' && "$scheme_err" != *$'\x1b'* ]]; then
+  echo "  PASS: scheme-gate die %-encodes terminal escapes"
+else
+  echo "  FAIL: scheme-gate die echoed raw escapes: [$scheme_err]"
+  failures=$((failures + 1))
+fi
+
+nohost_err="$( (validate_llm_url 'https:///openai/v1' --label) 2>&1 || true )"
+if [[ "$nohost_err" == *'has no host: https:///openai/v1' ]]; then
+  echo "  PASS: no-host die stays readable for a clean URL"
+else
+  echo "  FAIL: no-host die mangled a clean URL: [$nohost_err]"
+  failures=$((failures + 1))
+fi
+
+oversize_url="gopher://$(head -c 400 /dev/zero | tr '\0' 'x')"
+oversize_err="$( (validate_llm_url "$oversize_url" --label) 2>&1 || true )"
+if [[ "$oversize_err" == *'...'* && ${#oversize_err} -le 210 ]]; then
+  echo "  PASS: oversized URL echo is truncated (${#oversize_err} chars)"
+else
+  echo "  FAIL: oversized URL echo not capped: length ${#oversize_err}"
+  failures=$((failures + 1))
+fi
+
+# Printable metacharacters are data, not display hazards: they must survive
+# the echo verbatim so the operator can still see what they configured.
+meta_url='gopher://gw.example.test/$(oops)&x=1'
+meta_err="$( (validate_llm_url "$meta_url" --label) 2>&1 || true )"
+if [[ "$meta_err" == *'$(oops)&x=1' ]]; then
+  echo "  PASS: printable metacharacters stay readable"
+else
+  echo "  FAIL: printable metacharacters were mangled: [$meta_err]"
+  failures=$((failures + 1))
+fi
+
+# The helper itself: %-encode + truncate contract, independent of the caller.
+if [[ "$(sanitize_display_value "$(printf 'a\tb\x1bc')")" == 'a%09b%1Bc' ]]; then
+  echo "  PASS: sanitize_display_value encodes tab and ESC"
+else
+  echo "  FAIL: sanitize_display_value encoding wrong"
+  failures=$((failures + 1))
+fi
+if [[ "$(sanitize_display_value 'abcdefgh' 5)" == 'ab...' ]]; then
+  echo "  PASS: sanitize_display_value honors a custom cap"
+else
+  echo "  FAIL: sanitize_display_value custom cap wrong"
+  failures=$((failures + 1))
+fi
+
+# MM-1a (run-187 Info): a literal '%' is encoded as '%25', so a value whose
+# raw text contains '%1B' can never render identical to an encoded ESC.
+if [[ "$(sanitize_display_value 'gopher://x/%1B/y')" == 'gopher://x/%251B/y' ]]; then
+  echo "  PASS: sanitize_display_value %-encodes a literal percent (MM-1)"
+else
+  echo "  FAIL: literal percent left ambiguous (MM-1)"
+  failures=$((failures + 1))
+fi
+
+# MM-1b (run-187 Info): the '...' marker is appended only when a byte was
+# actually dropped — a value that fits exactly under the cap has no marker.
+fit157="$(printf 'a%.0s' $(seq 1 157))"
+if [[ "$(sanitize_display_value "$fit157")" == "$fit157" ]]; then
+  echo "  PASS: exact-cap value gains no spurious truncation marker (MM-1)"
+else
+  echo "  FAIL: exact-cap value gained a spurious marker (MM-1)"
+  failures=$((failures + 1))
+fi
+
 # worker_llm_url_container_ok: loopback and overlay MagicDNS are unreachable.
 for unreachable in "http://127.0.0.1:3000/v1" "http://localhost:3000" \
   "http://[::1]:3000/" "http://node1.netbird.selfhosted:3000" \
