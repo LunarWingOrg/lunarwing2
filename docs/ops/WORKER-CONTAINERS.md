@@ -1171,6 +1171,21 @@ unchanged (WI#361 owns those).
   the boot reset stays valid; `pair --remote` consent still exists and the
   wrapper refusals cover it; `updater.ts` still honours
   `OPENCODE_DISABLE_AUTOUPDATE` (`inspect()` gate reads it at v2.1.2).
+- **new upstream surfaces at v2.1.2, looked at (the !1831 review's MG-3):**
+  `SkillScan` (`packages/core/src/config/plugin/skill-scan.ts`, new)
+  replaces v2.0.32's glob with an explicit breadth-first walk of the project
+  tree to depth 6 collecting `SKILL.md` files plus depth-0 `.md` files and
+  skipping dot-directories — in this lane the project tree is the
+  task-writable workspace, so everything it discovers is task-authored
+  input to the serve process, the trust class the lane already records
+  (the EF-10 workspace-shadowing note); no new exposure. The Code Mode
+  `todo` plugin tool (`packages/core/src/tool/plugin/todo.ts`, new, name
+  `todowrite`) ships disabled behind `experimental.todo === true` — the
+  lane config does not set it, so it stays dormant unless task-authored
+  workspace config enables it, and unlike `session_move`/`session_rename`
+  it carries its own `permission.assert` (`resources: ["*"]`,
+  `save: ["*"]`), so it needs no extra deny rule; task-scoped todo state
+  is not an exposure surface.
 - in-host lane suites against the pinned client: bridge, executor, plugin,
   proxy, sdk_surface (x2), result, path, prompt self-check suites pass;
   `compile_out`, `entrypoint_config`, `exposure_policy_assert`,
