@@ -285,10 +285,13 @@ sides can remove all metadata. This fail-closed tradeoff is tracked in
 [WI#355](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/355), including
 the proposed byte-walk plus second bounded scan. The notice separates itself
 from retained text with blank lines and describes "retained edges", since
-either edge can be empty. Remaining detector gaps are tracked separately:
-[WI#353](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/353) for uncut
-GitLab PAT/Bearer tokens and [WI#354](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/354)
-for END-less PEM tails and encrypted/PGP private keys.
+either edge can be empty. The remaining detector gap is tracked separately:
+[WI#354](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/354)
+for END-less PEM tails and encrypted/PGP private keys. The WI#353 gap is
+closed: `glpat-` GitLab PATs have their own Block pattern, and the Bearer
+and Authorization-header value classes cover the full token grammar
+(`.`-separated JWT segments, `~`-separated tails, base64 `+`/`/`/`=`), so
+uncut tokens are blocked or redacted completely rather than only at cuts.
 WASM (10 MB), MCP (4 MiB), and built-in HTTP (5 MiB) size limits reject the
 call rather than truncate; tail preservation is not an end-to-end guarantee.
 Follow-ups that still
