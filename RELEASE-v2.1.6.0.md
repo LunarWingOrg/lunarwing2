@@ -1,10 +1,10 @@
 # Release Notes for LunarWing v2.1.6.0
 
-**DRAFT — pre-release; content reflects the v2.1.6.0 tree as of 2026-10-20 and may grow before the tag is cut.**
+**DRAFT — pre-release; content reflects the v2.1.6.0 tree as of 2026-10-21 and may grow before the tag is cut.**
 
 ## Codename: Tsuno (角, つの): The Horns
 
-**Release date:** TBD (drafted 2026-10-16; refreshed 2026-10-20)
+**Release date:** TBD (drafted 2026-10-16; refreshed 2026-10-20 and 2026-10-21)
 
 > Not raised in anger,
 > but set and sure all the same —
@@ -47,8 +47,10 @@ exposure-policy controls, and OpenRC proxy migrations refuse silently-wrong
 states instead of refusing healthy ones. The cycle closes with the usual
 dependency sweep (2.1.5 → 2.1.6 across all owned packages, refreshed
 registries, regenerated vendor tree) and a full crate-security re-audit with
-two late-cycle security upgrades (rustls 0.23.46, Wasmtime/WASI 36.0.18) —
-including one **breaking change**: Turso/libSQL remote-replica sync now
+four late-cycle security upgrades — rustls 0.23.46, Wasmtime/WASI 36.0.18
+then 36.0.19 (two Cranelift miscompiles), and the CVE-2026-111943 webpki
+root-store trio — including one **breaking change**: Turso/libSQL
+remote-replica sync now
 lives behind the non-default `libsql-remote-replica` cargo feature (see
 Upgrade Notes).
 
@@ -171,11 +173,11 @@ previous compatibility baseline.
 | Rust edition / MSRV | Rust 2024 / `1.96.1`, unchanged |
 | SQL migrations | V28 remains latest; no new migrations this cycle |
 | Multi-tenant port registry | v17, unchanged |
-| WASM runtime | Wasmtime/WASI 36.0.18; matching Cranelift family 0.123.18 — security upgrade from 36.0.17 (RUSTSEC-2026-0352/0363; see Crate Security Re-Audit) |
+| WASM runtime | Wasmtime/WASI 36.0.19; matching Cranelift family 0.123.19 — security upgrades from 36.0.17 (RUSTSEC-2026-0352/0363, then RUSTSEC-2026-0379/0380; see Crate Security Re-Audit) |
 | Bundled skills | Seven product skills, unchanged; no skill migration |
 | Channel registry | darkirc 0.1.12, multica 0.1.15, weechat 0.2.13, xmpp 0.1.18 |
 | Tool registry | cavepony-tool 0.4.6, gitlab 0.1.9, gotify 0.1.3, llm-context 0.1.4, multica-bridge 0.1.5, ssh 0.1.4, vision-analyze 0.1.6, voice-transcribe 0.1.4, web-search 0.2.5 |
-| External workers | kimi-code `2.2.0` (upgraded from 2.1.1), opencode `v1.18.25`, opencode2 `v2.0.32` (maintainer-approved WI#427; OpenTunnel compiled out), Pebble `2d0f3786…` (upstream ref unchanged; its reviewed lock was upgraded for the rustls advisories) |
+| External workers | kimi-code `2.2.0` (upgraded from 2.1.1), opencode `v1.18.25`, opencode2 `v2.0.32` (maintainer-approved WI#427; OpenTunnel compiled out), Pebble `2d0f3786…` (upstream ref unchanged; its reviewed lock was upgraded for the rustls and CVE-2026-111943 webpki advisories) |
 | Cargo features | New non-default `libsql-remote-replica` feature gates Turso sync (breaking — see Upgrade Notes) |
 
 Registry version bumps require rebuilding/reinstalling the affected WASM
@@ -443,18 +445,21 @@ graph free of the legacy chain at both build roots.
 ### Crate Security Re-Audit
 
 The v2.1.6.0 audit (`docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md`) is a
-risk-acceptance record, not a clean bill: **eight vulnerability advisories,
+risk-acceptance record, not a clean bill: **ten vulnerability advisories,
 two unsound notices (`failure`, `atty`), and two unmaintained notices**
-(twelve IDs) ship accepted via `ic/deny.toml`, each with recorded exposure
+(fourteen IDs) ship accepted via `ic/deny.toml`, each with recorded exposure
 and a named clearing owner (rsa: WI#368; `failure`/`rental`/`atty`: WI#367;
-the seven libsql 0.6.0 legacy-chain acceptances — four rustls-webpki 0.102,
-the h2 0.3.27 pin, and the rustls 0.22.4 pair — WI#418, whose standing
+the nine libsql 0.6.0 legacy-chain acceptances — five rustls-webpki 0.102,
+the webpki-roots 0.26.11 shim, the h2 0.3.27 pin, and the rustls 0.22.4
+pair — WI#418, whose standing
 decision record `docs/ops/v2.1.6.0_WI418_LIBSQL_LEGACY_CHAIN.md`
 (2026-10-16) adopts the WI#331 feature gate as the long-term mitigation
 after re-confirming upstream — libsql 0.10.0 went stable 2026-10-13 and
 still pins hyper-rustls ^0.25 — so a bump still clears nothing). All three
 owners were closed on 2026-10-18 with every chain still in `ic/Cargo.lock`,
-so none of the twelve has an open clearing owner at release (see Accepted
+and the two 2026-10-20 emSign acceptances below re-home under the same WI#418
+decision record, so none of the fourteen has an open clearing owner at
+release (see Accepted
 advisories under Security, Deployment, and Release Limitations). After the
 WI#331 gate, exactly one vulnerability (rsa
 via russh) compiles into default builds; the webpki/h2 chain and the
@@ -474,7 +479,7 @@ ever resolves into a non-dev build graph. Its named clearing owner,
 WI#367, was closed on 2026-10-18 with the `env_logger` 0.6.2 dev-dep edge
 still in place.
 
-Two security upgrades landed late in the cycle on top of the semver sweep:
+Four security upgrades landed late in the cycle on top of the semver sweep:
 
 - **rustls 0.23.45 → 0.23.46** (WI#409), fixing RUSTSEC-2026-0346/0347/
   0348/0349. The daemon manifest now requires `>=0.23.46` on the 0.23 line
@@ -487,11 +492,48 @@ Two security upgrades landed late in the cycle on top of the semver sweep:
   component-handle host-memory exhaustion. The patch introduces a default
   per-store cap of 100,000 live component handles; exhausting it traps.
   Rebuild **and restart** the daemon and XMPP bridge to deploy it.
+- **Wasmtime/WASI 36.0.18 → 36.0.19** (Cranelift 0.123.18 → 0.123.19),
+  fixing RUSTSEC-2026-0379/0380 (published 2026-10-20; pipeline 6121)
+  — two critical-class Cranelift miscompilation bugs (an aarch64 `br_table`
+  jumping to an incorrect target, and bit-packing silent overflow), the
+  class that can undermine the Wasm-level safety guarantees when executing
+  untrusted WASM tools and channels, so both are fixed by upgrade, not
+  accepted. Both manifest minimums (daemon and XMPP bridge) rise to
+  36.0.19; 37 package records move in each lockfile (24 Wasmtime-family
+  36.0.19 + 13 Cranelift 0.123.19); `ic/vendor/` regenerated with the
+  rig-core patch preserved. No new acceptances (the twelve-entry policy
+  total at that point was unchanged). Rebuild **and restart** the daemon
+  and XMPP bridge; rolling back below 36.0.19 reintroduces both
+  miscompilations.
+- **webpki root-store trio for CVE-2026-111943** (published 2026-10-20;
+  pipeline 6137): RUSTSEC-2026-0381 (`webpki-roots`), 0382
+  (`rustls-webpki`), and 0383 (`webpki-root-certs`) — certificate paths
+  through the distrusted emSign intermediates (the emSign ECC Root CA - G3
+  private keys are now well known) were accepted by the bundled/verifying
+  webpki stacks. Fixed by semver-compatible upgrade everywhere a patch
+  exists: `webpki-roots` and `webpki-root-certs` 1.0.9 → 1.0.10 and
+  `rustls-webpki` 0.103.15 → 0.103.16 across `ic`, the XMPP bridge,
+  pebble, and the OCR sidecar, with `ic/vendor/` refreshed and `[bans]`
+  floors raised (`rustls-webpki <0.103.16`, `webpki-roots`/
+  `webpki-root-certs <1.0.10`, only the accepted 0.26.11 pin permitted
+  below the patched webpki-roots line). The pebble image's reviewed lock
+  override moves with them (re-pinned, `webpki-roots` added to the delta
+  gate's allowlist — deployed pebble images still need rebuild and
+  promotion). Two residual acceptances land on the WI#418 libsql 0.6.0
+  legacy chain, which has no patch for its pinned line and stays behind
+  the opt-in `libsql-remote-replica` gate: 0381 on the `webpki-roots`
+  0.26.11 shim (a documented semver shim whose served roots come from its
+  1.x dependency, now the patched 1.0.10 — the shim itself is still
+  flagged by version) and 0382 on `rustls-webpki` 0.102.8 (no 0.102-line
+  patch exists), moving the policy total twelve → fourteen. Pipeline 6137
+  is green with the upgrades in.
 
-Verification for both is recorded in `docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md`
+Verification for all four is recorded in `docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md`
 (October 14 update, pipeline 5710 addendum, the October 16 zip-yank
-follow-up described under Dependency Sweep below, and the October 17
-`unsound = "all"` widening follow-up described above).
+follow-up described under Dependency Sweep below, the October 17
+`unsound = "all"` widening follow-up described above, and the two
+October 20 addenda — pipeline 6121 for Wasmtime 36.0.19, pipeline 6137
+for the emSign trio).
 
 ### Pending-Gate Lifecycle (WI#332)
 
@@ -529,6 +571,28 @@ parity checks (thread type, project, owner, `thread_history` membership):
 partial forgeries and corrupt stamps are cleared with a warning instead of
 arming retries (WI#338; full write-path reservation is WI#322, planned for
 v2.1.7.0). A known stuck-key abort window is tracked as WI#394.
+
+### Boot-Time Mission Writers Reload Under the Lock (WI#317)
+
+Boot-time and reconcile-time mission writers no longer save stale list
+snapshots: `record_restart_interrupted_missions` (the boot sweep that
+records interrupted missions), `ensure_mission_by_metadata`'s reconcile
+branch, and `deactivate_skill_learning_missions` each treat their listing
+as a candidate set only — per mission they take the mission lock, reload
+the record from the store, re-check their conditions on the fresh record,
+and save under the guard, the same serialization `fire_mission_inner`, the
+outcome watcher, and `record_unsettled_shutdown_fire` already use. A
+mission deleted between the candidate list and the lock is skipped instead
+of resurrected by a stale save; a concurrent fire's writes (thread history,
+`threads_today`, `last_fired_at`, trigger dedup key) can no longer be
+overwritten by a boot-time recorder working from an older copy. "Fire lost;
+not auto-refired" semantics are unchanged. The race is pinned by a
+regression test that parks the listing between snapshot and save, lands a
+fire-shaped reservation save (thread history, `threads_today`,
+`last_fired_at`, trigger dedup key) in the window, then releases the
+recorder and asserts all four fire writes survive with the INTERRUPTED
+entry recorded exactly once. Engine-internal change only (open for
+maintainer acceptance, WI#317).
 
 ### Mission Webhook and Rate-Limit Hardening (WI#352, WI#359)
 
@@ -677,8 +741,15 @@ container root behind a trimmed capability set, and every task process
 drops to a separate task uid via `setpriv --clear-groups
 --ambient-caps=-all --inh-caps=-all --no-new-privs` — so `/proc/1/environ`,
 the bridge environ and the token file all give task code EACCES. The
+pinned identities are validated everywhere they parse (the TS
+`taskIdentity()` helpers, both entrypoints, the pebble executor): zero or
+non-numeric ids fail closed, because a zero id would make the privilege
+drop a no-op while callers keep treating the split as active, and the
+helpers also refuse partially numeric ids like `1000x` (defence in depth
+with the entrypoints' `^[1-9][0-9]*$` gate). The
 opencode2 lane is deliberately not migrated (its image keeps the task uid
-directly). Worker images must be rebuilt for the strips and the split to
+directly; the migration is filed as the WI#449 follow-up, planned for
+v2.1.7.0). Worker images must be rebuilt for the strips and the split to
 reach live tenants.
 
 ### Daily-Log Backup Cap Fail-Closed (WI#335)
@@ -980,12 +1051,14 @@ External crates took MSRV-respecting semver-compatible updates across all
 0.2.38, toml 1.1.8, uuid 1.28.0, zeroize 1.9.1, html-to-markdown-rs 3.17.2,
 syn 3.0.7, among others), and `ic/vendor/` was regenerated — 1150
 directories: 1148 vendored crates plus the two pre-vendored libsignal path
-dependencies — with the rig-core patch restored and marker-verified. Two
-security upgrades landed late-cycle on top of the sweep (rustls 0.23.46,
-Wasmtime/WASI 36.0.18 — see Crate Security Re-Audit). The
+dependencies — with the rig-core patch restored and marker-verified. Four
+security upgrades landed late-cycle on top of the sweep (rustls 0.23.46;
+Wasmtime/WASI 36.0.18 then 36.0.19; the CVE-2026-111943 webpki root-store
+trio — see Crate Security Re-Audit). The
 `pebble4lunarwing/upstream/Cargo.lock` build-input pin was deliberately
-untouched by the sweep, then upgraded separately for the rustls advisories
-with its Dockerfile digest refreshed. External worker pins: kimi-code
+untouched by the sweep, then upgraded separately twice — for the rustls
+advisories and again for the webpki trio — with its Dockerfile digest
+refreshed each time. External worker pins: kimi-code
 advanced to 2.2.0; opencode v1.18.25 and the Pebble upstream ref are
 unchanged; opencode2 advances v2.0.24 → v2.0.32 per WI#427 (OpenTunnel
 compiled out; see Worker Exposure Policy). All four worker Dockerfiles and
@@ -1067,8 +1140,8 @@ are recorded in the audit doc's 2026-10-16 follow-up.
    and the WI#324 serve-process plugin, and the pebble image carries
    WI#334, the WI#324 MCP shim registration
    (`PEBBLE_CONFIG_HOME=/etc/lunarwing/pebble`), and the reviewed-lock
-   rustls
-   upgrade; all four images also move to the 20261017T082437Z Debian
+   rustls + CVE-2026-111943 webpki upgrades; all four images also move
+   to the 20261017T082437Z Debian
    snapshot, which ships the fixed perl for the three CVEs
    `.gitlab/trivy-ignore` no longer suppresses (WI#361) — opencode stays
    v1.18.25, while opencode2 advances to v2.0.32
@@ -1096,7 +1169,9 @@ are recorded in the audit doc's 2026-10-16 follow-up.
 5. **Deploy rebuilt components together.** Rebuild the daemon, XMPP bridge,
    and installed WASM channels and tools; rebuild/reinstall all four
    channel and nine tool registry updates through the normal deployment
-   path. The rustls 0.23.46 and Wasmtime/WASI 36.0.18 security fixes ship
+   path. The rustls 0.23.46, Wasmtime/WASI 36.0.19 (36.0.18's successor —
+   both Cranelift miscompilation fixes), and CVE-2026-111943 webpki
+   security fixes ship
    in the daemon and XMPP bridge binaries — rebuild **and restart** both to
    deploy them.
 6. **Review cron worker authority.** Cron tick jobs draw from the new
@@ -1166,9 +1241,12 @@ egress-enabled workers; see
 **Worker credential isolation.** The WI#373 strips are env hygiene; the
 real boundary is WI#400 (root-only token file handoff plus the task-uid
 split, above) — in-tree for kimi/opencode/pebble on rootless podman (the
-rootful pebble launch has no split: it runs as the tenant uid, WI#422), with
+rootful pebble launch has no split: it runs as the tenant uid, WI#422, so
+there the task agent shares the bridge's uid and can still signal or trace
+the bridge and read its environment — no split, by design), with
 real-worker acceptance riding the rebuilt images like every other worker
-change.
+change. WI#400 itself was closed on 2026-10-20 after its re-pass; the
+opencode2 lane's own migration is filed as the open WI#449 follow-up.
 
 **Known-broken lane.** The opencode **v1** worker lane (v1.18.25) still
 crashes inside `opencode serve` before any model call (WI#333); the new
@@ -1186,17 +1264,20 @@ never hits the race window (the harness check is now a log line on every
 lane; any returned redirect still fails); the deterministic test hook
 WI#444 asks for is still open.
 
-**Accepted advisories.** Eight vulnerability advisories, two unsound
-notices, and two unmaintained notices (twelve IDs) ship accepted — see
-`docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md`. Of the eight vulnerabilities, only
+**Accepted advisories.** Ten vulnerability advisories, two unsound
+notices, and two unmaintained notices (fourteen IDs) ship accepted — see
+`docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md`. Of the ten vulnerabilities, only
 rsa (via russh) compiles into default builds; the rustls-webpki 0.102 /
-h2 0.3 chain and the accepted rustls 0.22.4 pair (RUSTSEC-2026-0346/0349)
+h2 0.3 / webpki-roots 0.26.11 chain and the accepted rustls 0.22.4 pair
+(RUSTSEC-2026-0346/0349)
 exist only in opt-in `libsql-remote-replica` builds, under the WI#418
 standing decision record (`docs/ops/v2.1.6.0_WI418_LIBSQL_LEGACY_CHAIN.md`,
-2026-10-16), which re-homes the seven legacy-chain acceptances, adopts the
+2026-10-16), which re-homes the nine legacy-chain acceptances — the
+original seven plus the two 2026-10-20 emSign acceptances (0381 on the
+`webpki-roots` 0.26.11 shim, 0382 on `rustls-webpki` 0.102.8) — adopts the
 feature gate as the long-term mitigation, and sets their per-release
-re-verification. The twelfth acceptance — `atty` (RUSTSEC-2021-0145),
-surfaced by the WI#360 `unsound = "all"` widening — is dev-graph only (see
+re-verification. The `atty` acceptance (RUSTSEC-2021-0145),
+surfaced by the WI#360 `unsound = "all"` widening, is dev-graph only (see
 Crate Security Re-Audit). The clearing owners named in `ic/deny.toml`
 (WI#368 for rsa, WI#367 for `failure`/`rental`/`atty`, WI#418 for the
 libsql chain) were all closed on 2026-10-18 with every chain still in
@@ -1206,7 +1287,8 @@ release; WI#363, the CI guard that would require one, is still open.
 **Known issues / open at release.** Reconciled per item in
 `docs/ops/v2.1.6.0_OPEN_WORK_ITEMS_STATUS.md`, a 2026-10-14 01:05Z snapshot
 (work items filed after it, WI#402 and later, postdate the audit), and
-re-checked against the tracker on 2026-10-20. Open at release: WI#397
+re-checked against the tracker on 2026-10-20 and 2026-10-21. Open at
+release: WI#397
 (`high` — sb&kumo findings); WI#324 (real-worker acceptance evidence for
 every lane once the worker images are rebuilt and a worker `tool_allowlist`
 is configured — the mt-admin `tool_allowlist` render gap closed with the
@@ -1221,17 +1303,23 @@ holding the four WI#408 channel-host residuals), all three planned for
 v2.1.7.0; and WI#436 (v2.1.7.0 triage of the test-tenant failures — its
 first item, one failing note failing every hourly knowledge refresh and
 leaving `knowledge: critical`, is live in this release). The residual
-owners named in the sections above (WI#322, WI#333, WI#370, WI#383,
-WI#386, WI#387, WI#394) are open too, and so is the WI#423 re-attempt's
+owners named in the sections above (WI#317, WI#322, WI#333, WI#370,
+WI#383, WI#386, WI#387, WI#394) are open too — WI#317 as its section
+records, open pending maintainer acceptance — and so is the WI#423
+re-attempt's
 follow-up WI#446 (root mkdir/chown/unit writes through tenant-controlled
 `~/.config`) — its sibling WI#445 (the root study-notes sync trusting a
 tenant-chosen `LW2STUDYMCP_HOME`) is fixed in-tree this cycle by the
 root-side sync trust gate, the rogue-origin pull refusal, and the
 worker-mount trust gate (open for maintainer acceptance). WI#400's implementation landed this cycle
 (token file handoff + task-uid split on kimi/opencode/pebble, rootless
-lanes; the rootful pebble launch has no split by design); what stays open
-is its real-worker acceptance on rebuilt images and the opencode2 lane's
-own migration. Filed late and planned for v2.1.7.0, but live in this
+lanes; the rootful pebble launch has no split by design) and the WI itself
+was closed on 2026-10-20 after its re-pass (zero/non-numeric task ids are
+refused everywhere identities parse); what stays open is
+its real-worker acceptance on rebuilt images and the opencode2 lane's own
+migration, filed as **WI#449** together with the run-170 leftovers
+(LP-7, LP-11..LP-16), planned for v2.1.7.0. Filed late and planned for
+v2.1.7.0, but live in this
 release: WI#440 (`generate_token` falls back to a predictable `date +%s`
 token when `od` is absent) and WI#441 (`resolve_protected_paths` degrades
 silently when `SANDBOX_PROTECTED_PATHS` is unset); WI#362 tracks accuracy
