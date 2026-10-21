@@ -19,7 +19,8 @@ internal opencode headless server.
 - `scripts/sdk_surface.ts` — Canonical list of the `@opencode/client` method paths the bridge calls and the event `type` literals it matches (WI#329). It drives the image-build gate (`scripts/sdk_surface_assert.ts`, run from the Dockerfile — asserts the method paths against the real pinned client and the event names against the pinned generated V2Event union, WI#369) and the executor self-test, which binds it to the injected mock, to the call sites/event literals extracted from every non-test `scripts/*.ts` source, and — via a recording Proxy over the mock — to every client leaf path the suite actually touches. ADD to this list whenever the bridge calls a new client method or matches a new event; never shrink it to force an assertion to pass.
 - `scripts/tsconfig.sdk-surface.json` — WI#369 compile-time gate: the Dockerfile builder stage runs `tsgo --noEmit` (from the monorepo's pinned devDependencies) over the SDK-facing scripts against the pinned generated client types, covering call argument and event payload shapes. Keep its `include` list covering every non-test script that imports `@opencode/client`. `scripts/gate-env.d.ts` carries the minimal runtime declarations the gate needs (the monorepo's bun install does not expose @types at a stable path); extend it when a gated script uses a new runtime API.
 - `scripts/lunarwing_runtime.ts` — Shared types and envelope helpers. Keep in sync with `agent_comm_protocol.json`.
-- `entrypoint.sh` — Startup orchestration. Three modes: websocket, cli, acp.
+- `entrypoint.sh` — Startup orchestration. Three modes: websocket, cli, acp. Since WI#449 (the WI#400 migration) the container starts as root (`USER 0:0`): the entrypoint is the root launcher — it moves the hub credential into a root-only `0400` file, delegates every task-owned write to `entrypoint-task-setup.sh` via `as_task` (setpriv to the 10003 task uid), and drops the serve process and cli/acp one-shots to the task uid while the bridge stays root and is exec'd from root-owned `/app` (never the task-writable workspace — bun reads `bunfig.toml`/`.env` from its cwd).
+- `entrypoint-task-setup.sh` — the task-uid half of the boot (service.json reset, git/SSH, config materialization, Paseo/Study Notes MCP). Refuses to run as root; the exposure policy pins the launcher delegating to it before the mode dispatch.
 - `config/opencode2.json` — Mounted into container; controls LLM provider, MCP servers. v2 config shape (`providers`, `settings.baseURL`, `package`).
 
 ## Protocol Compatibility
@@ -93,7 +94,7 @@ build with the default root HOME.
   `OPENCODE_CONFIG_DIR` or `${XDG_CONFIG_HOME:-~/.config}/opencode` like
   upstream, removing any agent plant at the path first, so server-backed
   commands default to private servers), the session/config permission denies,
-  the root-owned read-only `entrypoint.sh`, `health_server.py`,
+  the root-owned read-only `entrypoint.sh`, `entrypoint-task-setup.sh`, `health_server.py`,
   `agent_comm_protocol.json`, `scripts/`+`config/`, the image build assertions, and
   `compile_out_remote_tunnel.py` fail-closed when bumping the pinned ref.
   These are naive-use guards, not a boundary — the real binary stays

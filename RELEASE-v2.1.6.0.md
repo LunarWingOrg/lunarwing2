@@ -751,9 +751,13 @@ non-numeric ids fail closed, because a zero id would make the privilege
 drop a no-op while callers keep treating the split as active, and the
 helpers also refuse partially numeric ids like `1000x` (defence in depth
 with the entrypoints' `^[1-9][0-9]*$` gate). The
-opencode2 lane is deliberately not migrated (its image keeps the task uid
-directly; the migration is filed as the WI#449 follow-up, planned for
-v2.1.7.0). Worker images must be rebuilt for the strips and the split to
+opencode2 lane joined the split with the WI#449 migration (2026-10-21):
+its image now pins `USER 0:0` with `OPENCODE2_TASK_UID/GID=10003`, its
+entrypoint is the same root-launcher shape (token-file handoff, task-side
+setup as the task uid, setpriv drops for serve and one-shots, the bridge
+exec'd from root-owned `/app`), and mt-admin's guard/trim/contracts moved
+with it.
+Worker images must be rebuilt for the strips and the split to
 reach live tenants. Rollback note (run-170 LP-16): roll back the scripts
 and the image TOGETHER — rolling back the scripts while keeping the new
 `USER 0:0` pebble image drops keep-id on rootless hosts, and tasks then
@@ -1256,13 +1260,13 @@ egress-enabled workers; see
 
 **Worker credential isolation.** The WI#373 strips are env hygiene; the
 real boundary is WI#400 (root-only token file handoff plus the task-uid
-split, above) — in-tree for kimi/opencode/pebble on rootless podman (the
+split, above) — in-tree for all four lanes on rootless podman (opencode2
+included after its WI#449 migration; the
 rootful pebble launch has no split: it runs as the tenant uid, WI#422, so
 there the task agent shares the bridge's uid and can still signal or trace
 the bridge and read its environment — no split, by design), with
 real-worker acceptance riding the rebuilt images like every other worker
-change. WI#400 itself was closed on 2026-10-20 after its re-pass; the
-opencode2 lane's own migration is filed as the open WI#449 follow-up.
+change. WI#400 itself was closed on 2026-10-20 after its re-pass.
 
 **Known-broken lane.** The opencode **v1** worker lane (v1.18.25) still
 crashes inside `opencode serve` before any model call (WI#333); the new
@@ -1329,13 +1333,13 @@ mkdir/chown/unit writes through tenant-controlled `~/.config`) by the
 tenant-side unit/Quadlet renders, the tenant-side WeeChat home creation
 and env-dir chmod, and the config-hash sidecar's move to root-owned host
 state. WI#400's implementation landed this cycle
-(token file handoff + task-uid split on kimi/opencode/pebble, rootless
-lanes; the rootful pebble launch has no split by design) and the WI itself
+(token file handoff + task-uid split on all four lanes, rootless;
+the rootful pebble launch has no split by design) and the WI itself
 was closed on 2026-10-20 after its re-pass (zero/non-numeric task ids are
-refused everywhere identities parse); what stays open is
-its real-worker acceptance on rebuilt images and the opencode2 lane's own
-migration, filed as **WI#449** together with the run-170 leftovers
-(LP-7, LP-11..LP-16), planned for v2.1.7.0. Filed late and planned for
+refused everywhere identities parse); the WI#449 follow-up — the opencode2
+lane migration and the run-170 leftovers (LP-7, LP-11..LP-16) — also landed
+in-tree (2026-10-21). What stays open is
+the real-worker acceptance on rebuilt images. Filed late and planned for
 v2.1.7.0, but live in this
 release: WI#440 (`generate_token` falls back to a predictable `date +%s`
 token when `od` is absent) and WI#441 (`resolve_protected_paths` degrades

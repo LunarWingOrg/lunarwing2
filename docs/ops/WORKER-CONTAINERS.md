@@ -58,7 +58,7 @@ Each lane enforces the strip at its task-process boundary:
 
 Residual, deliberate (run-98 FY-1): the strip does **not** hide the token
 from task code that goes looking for it — in lanes without the WI#400 split
-(opencode2 today; every lane's pre-WI#400 image), `/proc/1/environ` and the
+(every lane's pre-WI#400 image), `/proc/1/environ` and the
 bridge process's environ still contain it (see the env-hygiene paragraph
 above and the authority-domain section below). The OpenCode serve password
 (`OPENCODE_SERVER_PASSWORD`) is necessarily present in the serve process env —
@@ -68,11 +68,21 @@ deliberately *not* stripped: task execution needs them.
 
 ### Task-uid split (WI#400)
 
-The kimi, opencode and pebble lanes now implement WI#400's real isolation on
-rootless podman (the multi-tenant default). The rootful pebble launch is the
+The kimi, opencode, opencode2 and pebble lanes now implement WI#400's real
+isolation on rootless podman (the multi-tenant default); opencode2 joined
+through its WI#449 migration (2026-10-21), which ported the opencode lane's
+shape: `USER 0:0` image, root-launcher entrypoint, token-file handoff,
+setpriv drops for serve and one-shots, the LP-4 fail-closed bridge resolver,
+the KW-4 cron-leaf handover and the LD-15 relay socket handoff. The rootful
+pebble launch is the
 one exception: it runs the whole container as the tenant uid with no
 bridge/task split, by design — see the rootful paragraph at the end of this
-section and "Launch identity (WI#422)" further down.
+section and "Launch identity (WI#422)" further down. (WI#449 evaluated the
+same rootful no-split model for opencode2 and did not take it: the opencode2
+lane keeps the split on rootful hosts too, where the root bridge runs under
+the cap trim plus no-new-privileges — the WI#422 tenant-uid launch exists
+because pebble tasks build code as the workspace owner, which the serve
+model does not need.)
 
 - **Credential out of the environment.** The container entrypoint (root)
   writes the hub token to `/run/lunarwing/agent_auth_token` (directory
@@ -80,21 +90,28 @@ section and "Launch identity (WI#422)" further down.
   only `AGENT_AUTH_TOKEN_FILE`; the bridge reads the file. Nothing
   long-lived carries the token in its environment any more.
 - **Tasks under a separate uid.** The bridge stays container root; every
-  spawned task process (and opencode's `serve`, which hosts task code) drops
+  spawned task process (and the opencode lanes' `serve`, which hosts task
+  code) drops
   to the image's task uid/gid via
   `setpriv --reuid --regid --clear-groups --ambient-caps=-all --inh-caps=-all
-  --no-new-privs` (both capability clearances and `no_new_privs` are
+  --no-new-privs --bounding-set=-all` (both capability clearances and
+  `no_new_privs` are
   mandatory: without them the task keeps ambient SETUID/SETGID or regains
-  privilege through a setuid/file-capability binary). `/proc/1/environ`,
+  privilege through a setuid/file-capability binary; the bounding-set clear
+  is run-170 LP-7 belt-and-braces — with it the dropped task's bounding set
+  is empty, and it needs CAP_SETPCAP in the still-root setpriv, which the
+  trim below carries). `/proc/1/environ`,
   the bridge's environ, and the token file all give the task uid EACCES.
-  The opencode bridge is exec-ed from the root-owned `/app`, never from the
+  The opencode and opencode2 bridges are exec-ed from the root-owned `/app`,
+  never from the
   task-writable workspace: bun loads `bunfig.toml` preloads and `.env` from
   its working directory, so a task-planted file there would otherwise run
-  as root at the next container start (run-170 LP-1). The opencode bridge's
+  as root at the next container start (run-170 LP-1). The opencode and
+  opencode2 bridges'
   credential resolver fails closed when the file pointer is set but the
   file is unreadable or empty (run-170 LP-4), like the kimi and pebble ones.
   The pinned identities are validated everywhere they parse (the TS
-  `taskIdentity()` helpers, both entrypoints, the pebble executor): zero or
+  `taskIdentity()` helpers, the entrypoints, the pebble executor): zero or
   non-numeric ids fail closed, because a zero id would make the drop a
   no-op while callers keep treating the split as active (LP-17 — added to
   the WI#400 description 2026-10-20, numbered after the run-170 LP series;
@@ -104,16 +121,22 @@ section and "Launch identity (WI#422)" further down.
   `$KIMI_CODE_HOME`) is task state.
 - **Trimmed root bridge.** The worker containers run with
   `--cap-drop=ALL --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER
-  --cap-add=KILL --cap-add=SETUID --cap-add=SETGID` plus
+  --cap-add=KILL --cap-add=SETUID --cap-add=SETGID --cap-add=SETPCAP` plus
   `--security-opt no-new-privileges` (both the imperative `_ctr run` paths
   and the Quadlet `PodmanArgs`; the contracts record `cap-trim` so existing
   containers force-recreate). The bridge needs: CHOWN for the
-  relay-socket/cron-leaf handoff, SETUID/SETGID for the drop, KILL for
+  relay-socket/cron-leaf handoff, SETUID/SETGID for the drop, SETPCAP for
+  the drop's `--bounding-set=-all` (run-170 LP-7: `PR_CAPBSET_DROP` requires
+  it — verified empirically; SETPCAP can only shuffle capabilities within
+  the container's bounding set, which `--cap-drop=ALL` already limits to the
+  carried set), KILL for
   timeout/cancel of task-uid children, and DAC_OVERRIDE for cron workspace
   creation inside the task-owned workspace root (on keep-id rootless, the
   workspace presents as task-owned 2770). The run-166 root-bridge probe
   showed each of those five individually required on the pebble lane;
-  FOWNER is not individually required there but is retained for metadata
+  FOWNER is not individually required there — the LP-13 socket handoff
+  chmods before it chowns, so the mode change runs while root still owns
+  the socket — but is retained for metadata
   passes (chmod/re-assert) over task-created files the bridge does not own
   — dropping it is on the table the next time the set is re-proved end to
   end on every lane.
@@ -136,9 +159,10 @@ section and "Launch identity (WI#422)" further down.
   per-task socket is handed to the task identity (mode `0600`, right after
   bind and before the task spawns); with no identity pinned (host dev runs
   and tests) the socket is left untouched.
-- **opencode2 is NOT migrated** (its image still runs `USER 10003:10003`
-  and mt-admin's image-user guard continues to require exactly that); it
-  gets its own lane migration, like the pebble split here.
+- **opencode2 migrated with WI#449** (2026-10-21): the image now runs
+  `USER 0:0` with `OPENCODE2_TASK_UID/GID=10003` pinned, and mt-admin's
+  image-user guard requires `0:0` like the other split lanes. Details at
+  the top of this section.
 
 **Rootful pebble (run-164 KW-5, resolved by WI#422):** on rootful
 runtimes there is no user namespace, so an in-container task uid (10004)
@@ -447,7 +471,9 @@ Enforced controls (opencode2 lane unless noted):
    unused stages, so the exact line in a dead or builder stage satisfies
    presence checks while the shipped image has neither wrapper nor scan.
    Run-97 FQ-2/FQ-3: the last `USER` instruction must be exactly
-   `USER 10003:10003`, and Dockerfile parser directives
+   `USER 0:0` (WI#449: the WI#400 root-launcher entrypoint runs as container
+   root and drops serve/one-shots to the task uid; the pre-migration pin was
+   `USER 10003:10003`), and Dockerfile parser directives
    (`# escape=`, `# syntax=`, `# check=`) are refused outright, since a
    custom escape character would invalidate the guard's continuation
    joining. Run-103 GD-1: the directive refusal also covers the grammar's
@@ -763,7 +789,10 @@ tenant during the transition (agent routing confusion — plan §5).
 `843a6c514e606b436a7fe713422ace0a93ad3d61` (WI#427); the v2 bridge uses
 `@opencode/client` (promise API) instead of `@opencode-ai/sdk`, and the
 v2 config file is `config/opencode2.json` (`providers` map,
-`settings.baseURL`, `package`). Container UID/GID is **10003**
+`settings.baseURL`, `package`). The image pins `USER 0:0` with the
+task-uid split (WI#400, migrated under WI#449): the entrypoint is the root
+launcher, and the serve process plus one-shots drop to the task identity
+**10003** via setpriv
 (opencode 10001, kimi 10002) so both opencode lanes keep separate
 userns identities on one host.
 

@@ -62,7 +62,7 @@ workspace work.
 | Completion signal | `session.status` idle | `session.execution.{succeeded,failed,interrupted}` / `session.idle` |
 | Text streaming | `message.part.updated` | `session.text.delta` |
 | Cancel | `session.abort` | `session.interrupt` |
-| Container UID | 10001 | 10003 |
+| Task uid (both lanes run the bridge as container root, `USER 0:0`, since WI#400/WI#449) | 10001 | 10003 |
 | mt-admin ports | `opencode_wss` / `opencode_health` (extended block) | `opencode2_wss` / `opencode2_health` (dedicated range, registry v17) |
 | Worker env overrides | `OPENCODE_MODEL` / `OPENCODE_BASE_URL` | `OPENCODE2_MODEL` / `OPENCODE2_BASE_URL` |
 
