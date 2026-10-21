@@ -40,7 +40,10 @@ export function taskIdentity(): TaskIdentity | null {
  * change otherwise, and the task could regain the bridge uid (run-98 FY-1
  * prototype finding). --no-new-privs is mandatory too (run-164 KW-2): it
  * keeps the dropped task from ever regaining privilege through a setuid or
- * file-capability binary in the image. */
+ * file-capability binary in the image. --bounding-set=-all (run-170 LP-7)
+ * is belt and braces on top: the dropped task's bounding set is empty, so
+ * nothing it spawns can ever re-acquire a capability — it needs CAP_SETPCAP
+ * in the still-root setpriv, which the container cap trim carries. */
 export function taskSetprivArgv(identity: TaskIdentity): string[] {
   return [
     `--reuid=${identity.uid}`,
@@ -49,6 +52,7 @@ export function taskSetprivArgv(identity: TaskIdentity): string[] {
     "--ambient-caps=-all",
     "--inh-caps=-all",
     "--no-new-privs",
+    "--bounding-set=-all",
     "--",
   ]
 }

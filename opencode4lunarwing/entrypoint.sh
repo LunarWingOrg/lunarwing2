@@ -55,7 +55,11 @@ fi
 # the bridge uid (run-98 FY-1 prototype finding). --no-new-privs is
 # mandatory too (run-164 KW-2): without it a setuid or file-capability
 # binary in the image would let task code regain privilege.
-SETPRIV_FLAGS=(--reuid="$OPENCODE_TASK_UID" --regid="$OPENCODE_TASK_GID" --clear-groups --ambient-caps=-all --inh-caps=-all --no-new-privs)
+# --bounding-set=-all (run-170 LP-7) is belt and braces: the dropped task's
+# bounding set is empty, so nothing it spawns can re-acquire a capability.
+# It needs CAP_SETPCAP in the still-root setpriv, which the container cap
+# trim carries.
+SETPRIV_FLAGS=(--reuid="$OPENCODE_TASK_UID" --regid="$OPENCODE_TASK_GID" --clear-groups --ambient-caps=-all --inh-caps=-all --no-new-privs --bounding-set=-all)
 
 # as_task CMD [ARGS...] — run a command as the task uid with the task home;
 # direct exec when already unprivileged (host-side dev runs).

@@ -54,9 +54,11 @@ case "$PEBBLE_MODE" in
       # ambient/inheritable sets are cleared — both flags are mandatory
       # (run-98 FY-1 prototype finding). --no-new-privs is mandatory too
       # (run-164 KW-2): without it a setuid or file-capability binary in the
-      # image would let task code regain privilege.
+      # image would let task code regain privilege. --bounding-set=-all
+      # (run-170 LP-7) empties the bounding set as well; it needs the
+      # CAP_SETPCAP the container trim carries.
       exec setpriv --reuid="$PEBBLE_TASK_UID" --regid="$PEBBLE_TASK_GID" --clear-groups \
-        --ambient-caps=-all --inh-caps=-all --no-new-privs -- \
+        --ambient-caps=-all --inh-caps=-all --no-new-privs --bounding-set=-all -- \
         env -u AGENT_AUTH_TOKEN -u AGENT_AUTH_TOKEN_FILE \
         pebble --permission-mode "${PEBBLE_PERMISSION_MODE:-danger-full-access}" \
                   --model "${PEBBLE_MODEL:-openai/gpt-5.2}" \
