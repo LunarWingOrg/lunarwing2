@@ -1643,7 +1643,8 @@ start_tenant_opencode() {
     fi
 
     local workspace_dir
-    workspace_dir="$(prepare_worker_workspace "$name" opencode)"
+    workspace_dir="$(prepare_worker_workspace "$name" opencode)" \
+      || die "unsafe opencode workspace for tenant '$name'"
 
     local -a restart_arg=()
     [[ "$MT_ROOTLESS" == "true" ]] || restart_arg=(--restart unless-stopped)
@@ -1842,7 +1843,8 @@ start_tenant_opencode2() {
     fi
 
     local workspace_dir
-    workspace_dir="$(prepare_worker_workspace "$name" opencode2)"
+    workspace_dir="$(prepare_worker_workspace "$name" opencode2)" \
+      || die "unsafe opencode2 workspace for tenant '$name'"
 
     local -a restart_arg=()
     [[ "$MT_ROOTLESS" == "true" ]] || restart_arg=(--restart unless-stopped)
@@ -1907,10 +1909,38 @@ stop_tenant_opencode2() {
 }
 # ── Kimi Code worker container ────────────────────────────────────────────────
 
+# WI#453 (WI#446 closeout): the workspace sits inside the tenant-controlled
+# ~/lunarwing tree, so the historical root `mkdir -p` + unbounded `chown -R`
+# followed a tenant-planted symlink at any owned component into arbitrary
+# host territory — the same root-follows-tenant-path class WI#446 eliminated
+# everywhere else. Create the directory AS the tenant (tenant_mkdir_p refuses
+# non-absolute paths and any symlinked component outright), then refuse a
+# symlinked or foreign-owned path here. Rootful runtimes still need the
+# bind mount handed to the image uid, so the chown runs only after that
+# validation, bounded with --no-dereference so the walk never follows a
+# symlink (GNU chown: -h affects symlinks themselves; -R with it does not
+# follow). Rootless keep-id maps the tenant identity, so no chown at all.
+# chmod goes through tenant_chmod: chmod follows symlinks, and root has no
+# business touching a mode under a tenant-writable parent (WI#390).
 prepare_worker_workspace() {
-  local name="$1" worker="$2" workspace_dir container_uid container_gid
-  workspace_dir="$(tenant_lw_root "$name")/${worker}-workspace"
-  mkdir -p "$workspace_dir"
+  local name="$1" worker="$2" lw_root workspace_dir container_uid container_gid
+  lw_root="$(tenant_lw_root "$name")"
+  workspace_dir="$lw_root/${worker}-workspace"
+  tenant_mkdir_p "$name" "$workspace_dir" \
+    || die "could not safely create $workspace_dir as tenant '$name'"
+  if [[ ! -d "$workspace_dir" || -L "$workspace_dir" ]]; then
+    printf 'error: %s workspace is not a plain directory: %s\n' "$worker" "$workspace_dir" >&2
+    return 1
+  fi
+  # Ownership is checked against the tenant root dir — provisioned
+  # tenant-owned by create_tenant_user — rather than by resolving the
+  # account's uid, so the check also holds for fixture tenants with no
+  # passwd entry (same posture as prepare_pebble_workspace).
+  if [[ "$(stat -c %u "$workspace_dir" 2>/dev/null || printf -- -1)" \
+      != "$(stat -c %u "$lw_root" 2>/dev/null || printf -- -2)" ]]; then
+    printf 'error: %s workspace not owned like the tenant root: %s\n' "$worker" "$workspace_dir" >&2
+    return 1
+  fi
 
   case "$worker" in
     opencode)
@@ -1929,12 +1959,13 @@ prepare_worker_workspace() {
   esac
 
   if [[ "$MT_ROOTLESS" != "true" ]]; then
-    # Rootful runtimes do not apply keep-id, so bind mounts must use image IDs.
-    chown -R "$container_uid:$container_gid" "$workspace_dir"
-  else
-    chown -R "$name:$name" "$workspace_dir"
+    # Rootful runtimes do not apply keep-id, so bind mounts must use image
+    # IDs. The directory is verified plain and tenant-owned above, and
+    # --no-dereference keeps the recursive walk from following any symlink
+    # the tenant planted inside it (WI#453).
+    chown -R --no-dereference "$container_uid:$container_gid" "$workspace_dir"
   fi
-  chmod 2770 "$workspace_dir"
+  tenant_chmod "$name" 2770 "$workspace_dir" || return 1
   printf '%s\n' "$workspace_dir"
 }
 
@@ -2178,7 +2209,8 @@ start_tenant_kimi() {
     fi
 
     local workspace_dir
-    workspace_dir="$(prepare_worker_workspace "$name" kimi)"
+    workspace_dir="$(prepare_worker_workspace "$name" kimi)" \
+      || die "unsafe kimi workspace for tenant '$name'"
 
     local -a restart_arg=()
     [[ "$MT_ROOTLESS" == "true" ]] || restart_arg=(--restart unless-stopped)
