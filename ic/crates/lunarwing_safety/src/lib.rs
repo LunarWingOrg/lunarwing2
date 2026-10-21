@@ -66,7 +66,7 @@ impl SafetyLayer {
         let end = output.floor_char_boundary(cut.saturating_add(WINDOW).min(output.len()));
         let matches = self.leak_detector.scan(&output[start..end]).matches;
         let bytes = output.as_bytes();
-        let token = |b: u8| b.is_ascii_alphanumeric() || b"_+/=.-".contains(&b);
+        let token = |b: u8| b.is_ascii_alphanumeric() || b"_+/=.~-".contains(&b);
         loop {
             let previous = cut;
             for found in &matches {
@@ -919,11 +919,17 @@ mod tests {
                 format!("AIza{body}"),
                 format!("xoxb-{body}"),
                 format!("SG.{}.{}", &body[..22], &body[..43]),
-                format!("glpat-{body}"),
+                format!("glpat-{}q", "Q".repeat(119)),
                 format!("{body}.{body}.{body}"),
                 format!("Authorization: Bearer {body}"),
                 format!("Bearer {body}.{body}.{body}"),
                 format!("Bearer {body}~"),
+                // Run-185 MH-1: a bare tilde-separated run with a tail after
+                // the tilde. No prefix matches a detector pattern, so only
+                // the cut snapper's token-run class stands between the cut
+                // and the pre-tilde half — `~` must be in the class or the
+                // retained head shows everything before the tilde.
+                format!("{body}~{body}"),
                 format!(
                     concat!(
                         "-----BEGIN RSA ",
@@ -1054,8 +1060,9 @@ mod tests {
                 injection_check_enabled: true,
             });
             let body = "Q".repeat(24);
-            // glpat- blocks the whole output.
-            let glpat = format!("token: glpat-{body}");
+            // glpat- blocks the whole output. The body is mixed-case so the
+            // placeholder guard (run-185 MH-3) does not skip it.
+            let glpat = format!("token: glpat-{}q{}", "Q".repeat(11), "R".repeat(12));
             let result = safety.sanitize_tool_output("gitlab", &glpat);
             assert_eq!(
                 result.content,
