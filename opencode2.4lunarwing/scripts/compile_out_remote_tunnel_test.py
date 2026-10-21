@@ -2,7 +2,7 @@
 """Self-test for compile_out_remote_tunnel.py (WI#357 control 8).
 
 Builds synthetic upstream trees for the three pin shapes: predating the
-tunnel (historical v2.0.24), carrying it (v2.0.32 shape), and drifted (module moved,
+tunnel (historical v2.0.24), carrying it (v2.1.2 shape), and drifted (module moved,
 or a new RemoteTunnel export in use). The guard must pass the first, stub
 the second, and fail closed on every drift shape.
 """

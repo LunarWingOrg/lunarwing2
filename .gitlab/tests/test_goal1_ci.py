@@ -180,7 +180,7 @@ class WorkerVersionPinTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.dockerfiles["OPENCODE2_DOCKERFILE"].write_text(
-            f"ARG OPENCODE_VERSION=v2.0.32\nARG OPENCODE_REF={self.OPENCODE2_REF}\n",
+            f"ARG OPENCODE_VERSION=v2.1.2\nARG OPENCODE_REF={self.OPENCODE2_REF}\n",
             encoding="utf-8",
         )
         self.dockerfiles["KIMI_DOCKERFILE"].write_text(
@@ -210,7 +210,7 @@ class WorkerVersionPinTests(unittest.TestCase):
             pebble_ref=self.PEBBLE_REF,
             opencode_ref=self.OPENCODE_REF,
             opencode2_ref=self.OPENCODE2_REF,
-            opencode2_version="v2.0.32",
+            opencode2_version="v2.1.2",
             kimi_version="2.1.1",
         )
 
@@ -265,7 +265,7 @@ class WorkerVersionPinTests(unittest.TestCase):
             pebble_ref=self.PEBBLE_REF,
             opencode_ref=self.OPENCODE_REF,
             opencode2_ref=self.OPENCODE_REF,
-            opencode2_version="v2.0.32",
+            opencode2_version="v2.1.2",
             kimi_version="2.1.1",
         )
         self.assertTrue(any("opencode2" in error for error in self.errors()))
@@ -277,7 +277,7 @@ class WorkerVersionPinTests(unittest.TestCase):
             pebble_ref=self.PEBBLE_REF,
             opencode_ref=self.OPENCODE_REF,
             opencode2_ref=self.OPENCODE2_REF,
-            opencode2_version="v2.0.32",
+            opencode2_version="v2.1.2",
             kimi_version="2.1.1",
         )
         text = self.build_script.read_text(encoding="utf-8").replace(

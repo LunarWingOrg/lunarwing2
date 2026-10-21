@@ -142,9 +142,12 @@ previous compatibility baseline.
   wrapper, root-owned read-only scripts/config, the OpenTunnel compile-out,
   a byte-identity wrapper anchor, a BuildKit-faithful Dockerfile guard, and
   the host-side `mt-admin worker-listeners` audit — and opencode2 advances
-  to **v2.0.32** under the maintainer-approved WI#427 (protected
-  candidate/scan green; real jobs completed on the Gentoo/OpenRC tenants
-  soarin and scootaloo; WI#427 was closed on 2026-10-19).
+  to **v2.1.2** (item 83; every gate re-verified against the fresh pinned
+  clone — the maintainer-approved WI#427 boundary crossing first happened
+  at v2.0.32, protected
+  candidate/scan green at that pin; real jobs completed on the Gentoo/OpenRC tenants
+  soarin and scootaloo; WI#427 was closed on 2026-10-19; the v2.1.2
+  candidate/scan gate runs on its first protected pipeline).
 - **Credential echoes scrubbed in the sandbox proxy (WI#395).** Injected
   credentials can no longer ride back out through forwarded response
   headers (raw, form-encoded, re-encoded, or JSON-escaped spellings),
@@ -156,9 +159,14 @@ previous compatibility baseline.
   their `mission_update` is allowlist-bound to steering fields — a mission
   thread can no longer rename missions, wire one to a webhook with a
   model-chosen secret, or zero its daily budget.
-- **kimi-code 2.2.0.** The kimi worker advances to
-  `@moonshot-ai/kimi-code` 2.2.0 with the contract lane verified against
-  the real 2.2.0 binary (the image build re-runs the test suite in-image
+- **kimi-code 2.3.0.** The kimi worker advances to
+  `@moonshot-ai/kimi-code` 2.3.0 (2.2.0 during most of the cycle, re-bumped
+  for the goals item #83) with the contract lane verified against
+  the real binary at each pin — for 2.3.0 the four real-CLI tests
+  (headless `-p --output-format stream-json` accepted, `--yolo` rejected
+  alongside `-p`, the baked `[[hooks]]` PreToolUse guard table valid, and
+  the `mcp.json` spawn + MCP handshake) pass on the host against the actual
+  2.3.0 binary, and the image build re-runs the test suite in-image
   with the real binary on PATH, so every successfully built kimi image has
   passed the contract lane — on a rebuilt image the wire now carries
   `max_tokens: 131072`, verified end to end on a live tenant), plus new
@@ -177,7 +185,7 @@ previous compatibility baseline.
 | Bundled skills | Seven product skills, unchanged; no skill migration |
 | Channel registry | darkirc 0.1.12, multica 0.1.15, weechat 0.2.13, xmpp 0.1.18 |
 | Tool registry | cavepony-tool 0.4.6, gitlab 0.1.9, gotify 0.1.3, llm-context 0.1.4, multica-bridge 0.1.5, ssh 0.1.4, vision-analyze 0.1.6, voice-transcribe 0.1.4, web-search 0.2.5 |
-| External workers | kimi-code `2.2.0` (upgraded from 2.1.1), opencode `v1.18.25`, opencode2 `v2.0.32` (maintainer-approved WI#427; OpenTunnel compiled out), Pebble `2d0f3786…` (upstream ref unchanged; its reviewed lock was upgraded for the rustls and CVE-2026-111943 webpki advisories) |
+| External workers | kimi-code `2.3.0` (upgraded from 2.2.0), opencode `v1.18.25`, opencode2 `v2.1.2` (first crossed the OpenTunnel boundary at v2.0.32 under maintainer-approved WI#427; OpenTunnel compiled out, every exposure gate re-verified at the pin), Pebble `2d0f3786…` (upstream ref unchanged; its reviewed lock was upgraded for the rustls and CVE-2026-111943 webpki advisories) |
 | Cargo features | New non-default `libsql-remote-replica` feature gates Turso sync (breaking — see Upgrade Notes) |
 
 Registry version bumps require rebuilding/reinstalling the affected WASM
@@ -1001,13 +1009,15 @@ workspace prep, the add-tenant re-run env chmod, the study-seed root
 mktemp) stand unconverted, and no open work item tracks them. WI#390 was
 closed on 2026-10-17 and WI#416 on 2026-10-18.
 
-### Kimi Worker 2.2.0 and Environment/Config Pins (WI#411, WI#412)
+### Kimi Worker 2.3.0 and Environment/Config Pins (WI#411, WI#412)
 
-The kimi external worker advances to `@moonshot-ai/kimi-code` **2.2.0**
-(npm `latest` at bump time; the contract lane — stream-json
+The kimi external worker advances to `@moonshot-ai/kimi-code` **2.3.0**
+(re-bumped from 2.2.0 for goals item #83; npm `latest` at bump time; the
+contract lane — stream-json
 print mode, option conflicts, the WI#206 PreToolUse guard table, the WI#324
 MCP handshake — was verified 4/4 against the real 2.2.0 binary in a host
-run; the image build re-runs the test suite in-image with the real binary
+run, and re-verified 4/4 against the real 2.3.0 binary for the item-83
+re-bump; the image build re-runs the test suite in-image with the real binary
 on PATH, so every successfully built kimi image has passed the contract
 lane). On top of
 the bump, the executor and entrypoint now also scrub
