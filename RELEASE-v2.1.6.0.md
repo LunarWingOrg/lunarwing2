@@ -750,8 +750,12 @@ the entrypoint moves the hub token into a
 root-only `0400` file (out of every process environment), the bridge stays
 container root behind a trimmed capability set, and every task process
 drops to a separate task uid via `setpriv --clear-groups
---ambient-caps=-all --inh-caps=-all --no-new-privs` — so `/proc/1/environ`,
-the bridge environ and the token file all give task code EACCES. The
+--ambient-caps=-all --inh-caps=-all --no-new-privs --bounding-set=-all` —
+so `/proc/1/environ`,
+the bridge environ and the token file all give task code EACCES. (The
+`--bounding-set=-all` half landed with the WI#449 run-170 leftovers, with
+CAP_SETPCAP added to the container trim — `PR_CAPBSET_DROP` needs it.)
+The
 pinned identities are validated everywhere they parse (the TS
 `taskIdentity()` helpers, both entrypoints, the pebble executor): zero or
 non-numeric ids fail closed, because a zero id would make the privilege
@@ -761,7 +765,10 @@ with the entrypoints' `^[1-9][0-9]*$` gate). The
 opencode2 lane is deliberately not migrated (its image keeps the task uid
 directly; the migration is filed as the WI#449 follow-up, planned for
 v2.1.7.0). Worker images must be rebuilt for the strips and the split to
-reach live tenants.
+reach live tenants. Rollback note (run-170 LP-16): roll back the scripts
+and the image TOGETHER — rolling back the scripts while keeping the new
+`USER 0:0` pebble image drops keep-id on rootless hosts, and tasks then
+cannot write the `0700` workspace.
 
 ### Daily-Log Backup Cap Fail-Closed (WI#335)
 

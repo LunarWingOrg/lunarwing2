@@ -174,9 +174,11 @@ fn create_cron_workspace(path: &str, workspace_root: &Path) -> io::Result<PathBu
 
 /// DS-2: only validation, a non-directory component (ENOTDIR), a symlink loop
 /// (ELOOP), permission denials (EACCES/EPERM) and containment failures are
-/// permanent. Everything else (EMFILE/ENFILE/ENOMEM, ENOSPC/EDQUOT/EIO on the
-/// first mkdir, ENOENT/EINVAL from a swap race) is transient and the host
-/// supervisor may re-dispatch. `Unsupported` marks the missing-/proc preflight.
+/// permanent. So is EINVAL (run-170 LP-16): its only source here is fchown
+/// on an unmapped uid, which a re-dispatch can never fix. Everything else
+/// (EMFILE/ENFILE/ENOMEM, ENOSPC/EDQUOT/EIO on the first mkdir, ENOENT from a
+/// swap race) is transient and the host supervisor may re-dispatch.
+/// `Unsupported` marks the missing-/proc preflight.
 fn is_non_retryable_bootstrap(error: &io::Error) -> bool {
     use io::ErrorKind::{InvalidInput, PermissionDenied, Unsupported};
     if matches!(error.kind(), InvalidInput | PermissionDenied | Unsupported) {
@@ -190,7 +192,7 @@ fn is_non_retryable_bootstrap(error: &io::Error) -> bool {
             .and_then(|payload| payload.downcast_ref::<AnnotatedComponent>())
             .and_then(|annotated| annotated.inner.raw_os_error())
     });
-    matches!(raw, Some(code) if code == libc::ENOTDIR || code == libc::ELOOP)
+    matches!(raw, Some(code) if code == libc::ENOTDIR || code == libc::ELOOP || code == libc::EINVAL)
 }
 
 /// Bootstrap failure payload naming the path component that failed (WI#375
@@ -394,6 +396,9 @@ mod tests {
         ] {
             assert!(is_non_retryable_bootstrap(&error), "permanent: {error}");
         }
+        // LP-16: fchown's unmapped-uid EINVAL is permanent — no re-dispatch
+        // can ever map the id.
+        assert!(is_non_retryable_bootstrap(&io::Error::from_raw_os_error(libc::EINVAL)));
         // Transient errnos are worth a re-dispatch (DS-2).
         for error in [
             io::Error::from_raw_os_error(libc::EMFILE),
