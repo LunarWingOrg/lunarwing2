@@ -588,9 +588,11 @@ of resurrected by a stale save; a concurrent fire's writes (thread history,
 overwritten by a boot-time recorder working from an older copy. "Fire lost;
 not auto-refired" semantics are unchanged. The race is pinned by a
 regression test that parks the listing between snapshot and save, lands a
-fire-shaped reservation save in the window, and asserts both survive
-together. Engine-internal change only (open for maintainer acceptance,
-WI#317).
+fire-shaped reservation save (thread history, `threads_today`,
+`last_fired_at`, trigger dedup key) in the window, then releases the
+recorder and asserts all four fire writes survive with the INTERRUPTED
+entry recorded exactly once. Engine-internal change only (open for
+maintainer acceptance, WI#317).
 
 ### Mission Webhook and Rate-Limit Hardening (WI#352, WI#359)
 
