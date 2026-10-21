@@ -94,7 +94,7 @@ test("resolveFromBridgePath: finds an executable on the given PATH and ignores r
   }
 })
 
-test("dropLoaderEnv: removes LD_*, GCONV_PATH and GLIBC_TUNABLES and keeps everything else (WI#400 LD-11)", () => {
+test("dropLoaderEnv: removes LD_*, glibc loader vars and keeps everything else (WI#400 LD-11, LP-14/ME-3)", () => {
   const env: NodeJS.ProcessEnv = {
     PATH: "/usr/bin",
     HOME: "/home/kimi",
@@ -102,9 +102,28 @@ test("dropLoaderEnv: removes LD_*, GCONV_PATH and GLIBC_TUNABLES and keeps every
     LD_LIBRARY_PATH: "/tmp",
     GCONV_PATH: "/tmp/gconv",
     GLIBC_TUNABLES: "glibc.malloc.check=3",
+    LOCPATH: "/tmp/locale",
+    NLSPATH: "/tmp/catgets",
+    HOSTALIASES: "/tmp/hosts",
+    RES_OPTIONS: "ndots:1",
+    LOCALDOMAIN: "evil.example",
+    TZDIR: "/tmp/tz",
+    MALLOC_TRACE: "/tmp/trace",
     LDFLAGS: "-O2",
   }
-  assert.deepEqual(dropLoaderEnv(env), ["GCONV_PATH", "GLIBC_TUNABLES", "LD_LIBRARY_PATH", "LD_PRELOAD"])
+  assert.deepEqual(dropLoaderEnv(env), [
+    "GCONV_PATH",
+    "GLIBC_TUNABLES",
+    "HOSTALIASES",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "LOCALDOMAIN",
+    "LOCPATH",
+    "MALLOC_TRACE",
+    "NLSPATH",
+    "RES_OPTIONS",
+    "TZDIR",
+  ])
   assert.deepEqual(env, { PATH: "/usr/bin", HOME: "/home/kimi", LDFLAGS: "-O2" })
   assert.deepEqual(dropLoaderEnv(env), [])
 })
