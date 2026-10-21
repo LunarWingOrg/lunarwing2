@@ -1140,7 +1140,8 @@ are recorded in the audit doc's 2026-10-16 follow-up.
    and the WI#324 serve-process plugin, and the pebble image carries
    WI#334, the WI#324 MCP shim registration
    (`PEBBLE_CONFIG_HOME=/etc/lunarwing/pebble`), and the reviewed-lock
-   rustls + CVE-2026-111943 webpki upgrades; all four images also move to the 20261017T082437Z Debian
+   rustls + CVE-2026-111943 webpki upgrades; all four images also move
+   to the 20261017T082437Z Debian
    snapshot, which ships the fixed perl for the three CVEs
    `.gitlab/trivy-ignore` no longer suppresses (WI#361) — opencode stays
    v1.18.25, while opencode2 advances to v2.0.32
