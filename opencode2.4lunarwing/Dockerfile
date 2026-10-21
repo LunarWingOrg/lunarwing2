@@ -1,11 +1,11 @@
-# v2.0.32 resolves to this reviewed commit (WI#427). Both must move together.
+# v2.1.2 resolves to this reviewed commit. Both must move together.
 # OpenCode 2 is beta in practice (upstream's own migration doc: "server and
 # plugin APIs may continue to change"). This lane is deliberately SEPARATE
 # from the proven v1 worker (opencode4lunarwing, pinned v1.18.25) so tenants
 # opt into v2 explicitly — see docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md.
 # Re-bump only after re-verifying the bridge against the v2 server API.
-ARG OPENCODE_VERSION=v2.0.32
-ARG OPENCODE_REF=843a6c514e606b436a7fe713422ace0a93ad3d61
+ARG OPENCODE_VERSION=v2.1.2
+ARG OPENCODE_REF=a517687fde98a7329ada3ae644a01a9fc6c4e99e
 ARG DEBIAN_SNAPSHOT=20261017T082437Z
 ARG SOURCE_REVISION=unknown
 
@@ -68,7 +68,7 @@ COPY scripts/compile_out_remote_tunnel.py /build/compile_out_remote_tunnel.py
 # executable. Fail closed if the pinned upstream build options have drifted.
 RUN python3 /build/prepare_reproducible_build.py script/build.ts
 # WI#357 control 8: compile the OpenTunnel remote-access client out, fail
-# closed. WI#427 deliberately crosses the v2.0.26 boundary: v2.0.32's
+# closed. The pin deliberately stays past the v2.0.26 boundary: v2.1.2's
 # remote-tunnel.ts is replaced with a refusing stub. If upstream
 # moves/renames the module or extends its
 # export surface the build fails instead of silently shipping the tunnel.
