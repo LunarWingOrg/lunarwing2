@@ -400,23 +400,17 @@ for lane in opencode opencode2 pebble; do
   assert_not_contains "$worker_quadlet" 'Volume='"$fixture"'/run/ssh-agent:/tmp/ssh-agent:z' \
     "$lane quadlet does not mount the agent directory read-write"
 done
-# WI#400 run-164 KW-2: the root-bridge lanes (opencode, pebble) get the same
-# container-level no-new-privileges kimi carries; the unmigrated opencode2
-# lane is deliberately excluded (KW-1). LD-7: pin the FULL trimmed set on
-# the Quadlet PodmanArgs — a single dropped cap must fail the pin.
+# WI#400 run-164 KW-2: the root-bridge lanes (opencode, opencode2 after its
+# WI#449 migration, pebble) get the same
+# container-level no-new-privileges kimi carries. LD-7: pin the FULL trimmed
+# set on the Quadlet PodmanArgs — a single dropped cap must fail the pin.
 KW3_QUADLET_ARGS='PodmanArgs=--security-opt=no-new-privileges --cap-drop=ALL --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER --cap-add=KILL --cap-add=SETUID --cap-add=SETGID --cap-add=SETPCAP'
 assert_contains "$quadlet" "$KW3_QUADLET_ARGS" 'systemd Kimi quadlet carries the exact WI#400 capability trim (KW-3/LD-7)'
-for lane in opencode pebble; do
+for lane in opencode opencode2 pebble; do
   assert_contains "$fixture/quadlets/lunarwing-${lane}-root.container" \
     "$KW3_QUADLET_ARGS" \
     "$lane quadlet carries the exact WI#400 capability trim (KW-3/LD-7)"
 done
-assert_not_contains "$fixture/quadlets/lunarwing-opencode2-root.container" \
-  'no-new-privileges' \
-  'opencode2 quadlet stays off no-new-privileges until its own WI#400 migration'
-assert_not_contains "$fixture/quadlets/lunarwing-opencode2-root.container" \
-  '--cap-drop' \
-  'opencode2 quadlet stays off the WI#400 capability trim until its migration'
 
 # WI#400 (run-170 LP-11): the keep-id mapping was pinned only for kimi above
 # and on the pebble imperative path (image-contract harness) — pin the
@@ -629,7 +623,7 @@ fi
 # capability set instead of the default root set. The FULL string is pinned:
 # a dropped KILL or DAC_OVERRIDE would otherwise only show in production.
 KW3_CAP_TRIM='--cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add KILL --cap-add SETUID --cap-add SETGID --cap-add SETPCAP'
-for lane in kimi opencode pebble; do
+for lane in kimi opencode opencode2 pebble; do
   LANE_BLOCK="$(awk "/^start_tenant_${lane}\\(\\)/,/^stop_tenant_${lane}\\(\\)/" "$WORKER_LIB")"
   if grep -Fq -- "$KW3_CAP_TRIM" <<<"$LANE_BLOCK"; then
     pass "$lane imperative launch runs the exact WI#400 capability trim (KW-3/LD-7)"
@@ -661,9 +655,14 @@ for lane in opencode pebble; do
 done
 OPENCODE2_BLOCK="$(awk '/^start_tenant_opencode2\(\)/,/^stop_tenant_opencode2\(\)/' "$WORKER_LIB")"
 if grep -Fq -- '--security-opt no-new-privileges' <<<"$OPENCODE2_BLOCK"; then
-  fail 'opencode2 imperative launch picked up no-new-privileges before its WI#400 migration'
+  pass 'opencode2 imperative launch sets no-new-privileges (WI#449 migration)'
 else
-  pass 'opencode2 imperative launch unchanged by WI#400 (KW-1)'
+  fail 'opencode2 imperative launch missing no-new-privileges (WI#449)'
+fi
+if grep -Fq -- '--cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add KILL --cap-add SETUID --cap-add SETGID --cap-add SETPCAP' <<<"$OPENCODE2_BLOCK"; then
+  pass 'opencode2 imperative launch runs the exact WI#400 capability trim (WI#449)'
+else
+  fail 'opencode2 imperative launch missing the WI#400 capability trim (WI#449)'
 fi
 # The launch contract must carry the policy change so existing containers
 # force-recreate instead of surviving with the old mount.
@@ -674,14 +673,14 @@ assert_contains "$ROOT_SCRIPT" 'KIMI_ROOTLESS_LAUNCH_CONTRACT="userns=${KIMI_USE
 # imperative lanes. Quadlet recreations hash the rendered Volume= line.
 assert_contains "$ROOT_SCRIPT" 'OPENCODE_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE_USERNS};ssh-agent-dir-ro;no-new-privileges;cap-trim"' \
   'opencode rootless launch contract records the read-only SSH mount, WI#400 no-new-privileges, and cap-trim'
-assert_contains "$ROOT_SCRIPT" 'OPENCODE2_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE2_USERNS};ssh-agent-dir-ro"' \
-  'opencode2 rootless launch contract records the read-only SSH mount'
+assert_contains "$ROOT_SCRIPT" 'OPENCODE2_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE2_USERNS};ssh-agent-dir-ro;no-new-privileges;cap-trim"' \
+  'opencode2 rootless launch contract records the read-only SSH mount and its WI#449 migration to no-new-privileges + cap-trim'
 assert_contains "$ROOT_SCRIPT" 'PEBBLE_ROOTLESS_LAUNCH_CONTRACT="userns=${PEBBLE_USERNS};ssh-agent-dir-ro;no-new-privileges;cap-trim"' \
   'pebble launch contract records the WI#400 task-uid userns, read-only SSH mount, no-new-privileges, and cap-trim'
 assert_contains "$WORKER_LIB" 'local opencode_launch_contract="ssh-agent-dir-ro;cap-trim"' \
   'rootful opencode includes the SSH mount and the WI#400 cap-trim in its launch contract'
-assert_contains "$WORKER_LIB" 'local launch_contract="ssh-agent-dir-ro"' \
-  'rootful opencode2 includes the SSH mount in its launch contract'
+assert_contains "$WORKER_LIB" 'local launch_contract="ssh-agent-dir-ro;cap-trim"' \
+  'rootful opencode2 includes the SSH mount and the WI#400 cap-trim in its launch contract (WI#449)'
 
 _store_container_hash root old-rootless "$env_file" "userns=${OPENCODE_USERNS};ssh-agent-dir"
 if _container_config_changed root old-rootless "$env_file" "$OPENCODE_ROOTLESS_LAUNCH_CONTRACT"; then

@@ -604,11 +604,11 @@ EOF
       # host socket; :z shares its SELinux label across the worker lanes.
       printf 'Volume=%s:/tmp/ssh-agent:ro,z\n' "$ssh_agent_dir"
       printf 'Environment=SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock\n'
-      # WI#400 run-164 KW-2: the WI#400 root-bridge lanes get the same
-      # container-level no-new-privileges kimi has carried since WI#206 —
+      # WI#400 run-164 KW-2: the WI#400 root-bridge lanes (which after the
+      # WI#449 migration includes opencode2) get the same container-level
+      # no-new-privileges kimi has carried since WI#206 —
       # with a root bridge, the setting keeps setuid/file-capability
-      # binaries from handing privilege back to task code. opencode2 is NOT
-      # a WI#400 root-bridge lane yet, so it is deliberately excluded.
+      # binaries from handing privilege back to task code.
       # KW-3: the same lanes' root bridge also runs with the default
       # capability set otherwise — on rootful runtimes that is host root.
       # Trim to the set the bridge actually uses: CHOWN (relay-socket and
@@ -619,7 +619,7 @@ EOF
       # inside the task-owned workspace root; without them the bridge's own
       # mkdir/chmod there fails).
       case "$worker" in
-        opencode|pebble) printf 'PodmanArgs=--security-opt=no-new-privileges --cap-drop=ALL --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER --cap-add=KILL --cap-add=SETUID --cap-add=SETGID --cap-add=SETPCAP\n' ;;
+        opencode|opencode2|pebble) printf 'PodmanArgs=--security-opt=no-new-privileges --cap-drop=ALL --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER --cap-add=KILL --cap-add=SETUID --cap-add=SETGID --cap-add=SETPCAP\n' ;;
       esac
     fi
     # Publish the per-tenant dedicated health port (v8) -> container's 8443, so

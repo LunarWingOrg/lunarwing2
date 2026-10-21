@@ -1714,7 +1714,9 @@ start_tenant_opencode2() {
   ensure_container_runtime
 
   # Record the mount policy even for rootful/OpenRC imperative containers.
-  local launch_contract="ssh-agent-dir-ro"
+  # WI#449: opencode2 joined the WI#400 root-bridge lanes — the launch
+  # contract carries the cap-trim marker like the opencode lane's.
+  local launch_contract="ssh-agent-dir-ro;cap-trim"
   local -a userns_args=()
   if [[ "$CONTAINER_RT" == "podman" && "$MT_ROOTLESS" == "true" ]]; then
     launch_contract="$OPENCODE2_ROOTLESS_LAUNCH_CONTRACT"
@@ -1742,9 +1744,9 @@ start_tenant_opencode2() {
   image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
     lunarwing-worker-opencode2:latest 2>/dev/null || true)"
   case "$image_user" in
-    "$OPENCODE2_CONTAINER_UID"|"$OPENCODE2_CONTAINER_UID:$OPENCODE2_CONTAINER_GID") ;;
+    "0:0"|"0") ;;
     *)
-      die "opencode2 worker image has user '${image_user:-unset}', expected $OPENCODE2_CONTAINER_UID:$OPENCODE2_CONTAINER_GID; rebuild it"
+      die "opencode2 worker image has user '${image_user:-unset}', expected 0:0 (WI#400 root entrypoint; serve/tasks drop to $OPENCODE2_CONTAINER_UID); rebuild it"
       ;;
   esac
 
@@ -1857,6 +1859,8 @@ start_tenant_opencode2() {
       --name "$container_name" \
       "${healthcheck_args[@]}" \
       "${userns_args[@]}" \
+      --security-opt no-new-privileges \
+      --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add KILL --cap-add SETUID --cap-add SETGID --cap-add SETPCAP \
       -e LUNARWING_WORKER_ID="worker-opencode2-${name}" \
       -e WS_PORT="$wss_port" \
       -e HEALTH_PORT="8443" \

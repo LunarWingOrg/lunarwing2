@@ -167,13 +167,10 @@ base_contract() {  # <worker>: the rootless-podman base contract the lane uses
 image_user_for() {  # <worker>: the lane's real image Config.User
   # Feed each lane the user its current image actually carries so each
   # image-user guard is checked against its own expectation: WI#400 migrated
-  # the kimi, opencode and pebble lanes to a root bridge (USER 0:0) whose
-  # serve/tasks drop to the task uid, while the opencode2 lane is NOT
-  # migrated (its image still carries the task uid directly) — its guard
-  # must keep accepting exactly $OPENCODE2_CONTAINER_UID[:GID].
+  # every lane to a root bridge (USER 0:0) whose serve/tasks drop to the
+  # task uid — opencode2 joined with its WI#449 migration.
   case "$1" in
-    kimi|opencode|pebble) printf '0:0' ;;
-    opencode2) printf '%s:%s' "$OPENCODE2_CONTAINER_UID" "$OPENCODE2_CONTAINER_GID" ;;
+    kimi|opencode|opencode2|pebble) printf '0:0' ;;
     *) printf '' ;;
   esac
 }
@@ -281,7 +278,7 @@ done
 # the task uid can rewrite would run task-authored code as root on the next
 # container start (restart policy, daemon restart, health restart). A
 # COPY --chown=<task user> hands the tree over at build time — refuse it.
-for lane in kimicode4lunarwing opencode4lunarwing pebble4lunarwing; do
+for lane in kimicode4lunarwing opencode4lunarwing opencode2.4lunarwing pebble4lunarwing; do
   dockerfile="$HARNESS_REPO_ROOT/$lane/Dockerfile"
   if [[ ! -f "$dockerfile" ]]; then
     fail "$lane Dockerfile missing (WI#400 LD-2 pin)"
@@ -299,20 +296,23 @@ for lane in kimicode4lunarwing opencode4lunarwing pebble4lunarwing; do
   fi
 done
 
-# WI#400 LP-1): the opencode bridge is container root and bun loads
-# bunfig.toml/.env from its working directory, so the entrypoint must leave
-# the task-writable workspace before exec-ing the bridge.
-oc_entrypoint="$HARNESS_REPO_ROOT/opencode4lunarwing/entrypoint.sh"
-if awk '
-  /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
-  /^[[:space:]]*exec bun run \/app\/scripts\/lunarwing_bridge\.ts/ { found = 1; if (prev ~ /^[[:space:]]*cd \/app[[:space:]]*$/) ok = 1 }
-  { prev = $0 }
-  END { exit (found && ok) ? 0 : 1 }
-' "$oc_entrypoint"; then
-  pass 'opencode entrypoint: the bridge is exec-ed from the root-owned /app, not the workspace (WI#400 LP-1)'
-else
-  fail 'opencode entrypoint: exec bun run of the bridge must be preceded by cd /app (WI#400 LP-1)'
-fi
+# WI#400 LP-1): the opencode and opencode2 bridges (the latter after its
+# WI#449 migration) are container root and bun loads bunfig.toml/.env from
+# its working directory, so the entrypoint must leave the task-writable
+# workspace before exec-ing the bridge.
+for oc_lane in opencode4lunarwing opencode2.4lunarwing; do
+  oc_entrypoint="$HARNESS_REPO_ROOT/$oc_lane/entrypoint.sh"
+  if awk '
+    /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+    /^[[:space:]]*exec bun run \/app\/scripts\/lunarwing_bridge\.ts/ { found = 1; if (prev ~ /^[[:space:]]*cd \/app[[:space:]]*$/) ok = 1 }
+    { prev = $0 }
+    END { exit (found && ok) ? 0 : 1 }
+  ' "$oc_entrypoint"; then
+    pass "$oc_lane entrypoint: the bridge is exec-ed from the root-owned /app, not the workspace (WI#400 LP-1)"
+  else
+    fail "$oc_lane entrypoint: exec bun run of the bridge must be preceded by cd /app (WI#400 LP-1)"
+  fi
+done
 
 # ── WI#400 (run-170 LP-11): the kimi/pebble image-user guards refuse ──────
 # a pre-WI#400 image (task uid directly) and an uninspectable one — only the
@@ -337,6 +337,8 @@ image_user_refusal kimi "10002:10002"
 image_user_refusal kimi ""
 image_user_refusal pebble "10004:10004"
 image_user_refusal pebble ""
+image_user_refusal opencode2 "10003:10003"
+image_user_refusal opencode2 ""
 
 # WI#423 (run-171, the merge with !1784): the rootful create path below is the
 # one scenario in this harness that reaches the tenant-side credential reader,

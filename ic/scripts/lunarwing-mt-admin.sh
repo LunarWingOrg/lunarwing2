@@ -191,7 +191,12 @@ OPENCODE2_CONTAINER_UID="10003"
 OPENCODE2_CONTAINER_GID="10003"
 OPENCODE2_USERNS="keep-id:uid=${OPENCODE2_CONTAINER_UID},gid=${OPENCODE2_CONTAINER_GID}"
 # Same read-only directory mount and recreation contract as opencode.
-OPENCODE2_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE2_USERNS};ssh-agent-dir-ro"
+# WI#449 (the WI#400 migration): opencode2 is now a root-bridge lane —
+# the image pins USER 0:0, the serve process and one-shots drop to 10003,
+# and the launch gains no-new-privileges + the cap trim like the other
+# split lanes; recording both markers force-recreates existing containers
+# once on their next start.
+OPENCODE2_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE2_USERNS};ssh-agent-dir-ro;no-new-privileges;cap-trim"
 
 # The pebble lane mounts the SSH agent directory like the other non-kimi
 # workers; bump the contract to recreate existing containers with RW mounts.

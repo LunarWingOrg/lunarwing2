@@ -55,7 +55,7 @@ def run_config(worker, overrides=None, mounted=False, custom=None):
         # Relocate only container paths. Run the production shell/Python code,
         # including its real baked config, and stop before any service starts.
         script = entrypoint.split(boundary, 1)[0].replace("/app/", str(app) + "/")
-        for user in ("opencode", "kimi"):
+        for user in ("opencode", "opencode2", "kimi"):
             script = script.replace(f"/home/{user}/", str(home) + "/")
         hand_tree(root)
         result = subprocess.run(["bash"], input=script, text=True, env=env,
@@ -183,7 +183,7 @@ def stage_setup(source, app, home):
     if not setup.exists():
         return
     text = setup.read_text().replace("/app/", str(app) + "/")
-    for user in ("opencode", "kimi"):
+    for user in ("opencode", "opencode2", "kimi"):
         text = text.replace(f"/home/{user}/", str(home) + "/")
     target = app / "entrypoint-task-setup.sh"
     target.write_text(text)
@@ -287,7 +287,7 @@ def run_websocket_startup(worker):
         )
         bun_stub.chmod(0o755)
         script = entrypoint.replace("/app/", str(app) + "/").replace("cd /app\n", f"cd {app}\n")
-        for user in ("opencode", "kimi"):
+        for user in ("opencode", "opencode2", "kimi"):
             script = script.replace(f"/home/{user}/", str(home) + "/")
         env = {
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
@@ -311,7 +311,7 @@ def run_websocket_startup(worker):
             f"{worker}: stubs did not run: {result.stderr}"
         assert serve_mark.read_text().strip() == "ABSENT", \
             f"{worker}: hub-handshake token reached the serve process env (WI#373)"
-        if worker == "opencode":  # opencode2's bridge is not root (USER 10003), so cwd is not a boundary there
+        if worker in ("opencode", "opencode2"):  # both bridges run as container root (WI#400; opencode2 after its WI#449 migration), so cwd is a boundary on both
             assert bridge_cwd.exists() and \
                 Path(bridge_cwd.read_text().strip()).resolve() == app.resolve(), \
                 f"{worker}: the bridge must be exec-ed from /app, not the workspace (WI#400 LP-1): {bridge_cwd.read_text() if bridge_cwd.exists() else 'no cwd mark'}"
@@ -350,7 +350,7 @@ def run_oneshot_startup(worker, mode):
         )
         stub.chmod(0o755)
         script = entrypoint.replace("/app/", str(app) + "/")
-        for user in ("opencode", "kimi"):
+        for user in ("opencode", "opencode2", "kimi"):
             script = script.replace(f"/home/{user}/", str(home) + "/")
         env = {
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
@@ -505,17 +505,17 @@ def run_pebble_cli_drop_argv():
 
 def run_task_drop_argv(worker):
     """WI#400 KW-2/LD-7: with the harness running as root (the CI shape), the
-    kimi and opencode cli one-shots must exec setpriv with the exact
-    privilege-dropping flags (the cap-clearing pair AND --no-new-privs)
-    before the task binary. Unprivileged hosts cannot take the root branch,
-    so the pin is root-only."""
+    kimi/opencode/opencode2 cli one-shots must exec setpriv with the exact
+    privilege-dropping flags (the cap-clearing pair AND --no-new-privs AND
+    --bounding-set=-all, LP-7) before the task binary. Unprivileged hosts
+    cannot take the root branch, so the pin is root-only."""
     if os.geteuid() != 0:
         return
     directory, filename = workers[worker]
     source = repo / directory
     entrypoint = (source / "entrypoint.sh").read_text()
-    user = "kimi" if worker == "kimi" else "opencode"
-    task_uid = {"kimi": "10002", "opencode": "10001"}[worker]
+    user = {"kimi": "kimi", "opencode": "opencode", "opencode2": "opencode2"}[worker]
+    task_uid = {"kimi": "10002", "opencode": "10001", "opencode2": "10003"}[worker]
     with temp_root(f"{worker}-dropargv-") as temp:
         root = Path(temp)
         bin_dir = execable_dir(root)
@@ -535,7 +535,8 @@ def run_task_drop_argv(worker):
             "HOME": str(root / "home"), "TMPDIR": temp,
             "WORKSPACE_ROOT": str(root / "workspace"),
             "LUNARWING_TOKEN_DIR": str(root / "run-lunarwing"),
-            f"{worker.upper()}_MODE": "cli",
+            # opencode2 shares the opencode lane's OPENCODE_MODE variable.
+            ("KIMI_MODE" if worker == "kimi" else "OPENCODE_MODE"): "cli",
             **({"OPENCODE_BIN": str(task_stub)} if worker != "kimi" else {}),
         }
         (root / "home").mkdir()
@@ -564,7 +565,7 @@ def run_task_drop_argv(worker):
             )
         else:
             expected = flags + (
-                "<env><HOME=/home/opencode><-u><AGENT_AUTH_TOKEN>"
+                f"<env><HOME=/home/{user}><-u><AGENT_AUTH_TOKEN>"
                 "<-u><AGENT_AUTH_TOKEN_FILE>"
                 f"<{task_stub}><run><probe prompt>"
             )
@@ -724,10 +725,10 @@ print("PASS: pebble entrypoint token handoff layout is 0700/0400 and fully strip
 if os.geteuid() == 0:
     run_pebble_cli_drop_argv()
     print("PASS: pebble cli one-shot drops through setpriv with the mandatory flags (WI#400 KW-2/LD-13, root)")
-    for worker in ("kimi", "opencode"):
+    for worker in ("kimi", "opencode", "opencode2"):
         run_task_drop_argv(worker)
         print(f"PASS: {worker} cli one-shot drops through setpriv with the mandatory flags (WI#400 KW-2/LD-7, root)")
-for worker in ("kimi", "opencode"):
+for worker in ("kimi", "opencode", "opencode2"):
     run_task_zero_uid_refusal(worker)
     print(f"PASS: {worker} entrypoint refuses zero/non-numeric task ids (WI#400 LP-17)")
 run_pebble_websocket_refusal()
