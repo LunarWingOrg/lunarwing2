@@ -147,7 +147,10 @@ previous compatibility baseline.
   at v2.0.32, protected
   candidate/scan green at that pin; real jobs completed on the Gentoo/OpenRC tenants
   soarin and scootaloo; WI#427 was closed on 2026-10-19; the v2.1.2
-  candidate/scan gate runs on its first protected pipeline).
+  candidate/scan gate has not run — the instance's unauthenticated-web rate
+  limit has blocked every worker candidate push since pipeline 6151, so no
+  image exists at this pin yet; the gate runs on the first protected
+  pipeline after that limit is lifted).
 - **Credential echoes scrubbed in the sandbox proxy (WI#395).** Injected
   credentials can no longer ride back out through forwarded response
   headers (raw, form-encoded, re-encoded, or JSON-escaped spellings),

@@ -1182,8 +1182,13 @@ protected `worker-opencode2-candidate` (whole-image digest comparison) and
 `worker-opencode2-scan` jobs must pass on a protected pipeline before
 promotion, then `mt-admin build-opencode2-worker` + `restart-tenant` per
 tenant with the same live exposure checks (service.json reset, wrapper
-refusals, `worker-listeners` clean). Tenant rollouts are recorded below as
-they happen.
+refusals, `worker-listeners` clean). **Blocked at the pin's landing (the
+!1831 review's MG-1):** the instance's `throttle_unauthenticated_web` rate
+limit is blocking the registry push of every worker candidate build since
+pipeline 6151 (the !1828 review's MD-1), so no image has been built from
+this pin yet — the candidate/scan gate runs only once that limit is lifted
+(maintainer action, not in-tree), and until then tenants keep their current
+v2.0.32 images. Tenant rollouts are recorded below as they happen.
 
 v2.0.24 bump (2026-10-07, v2.1.5.0 checklist item #2): tag SHA
 `e7a34f09bfd9134dfade5a8ddb843f7030bc9a69` verified live against the
@@ -1372,7 +1377,12 @@ handshake), so the in-image gate is a re-confirmation of verified
 behavior. 2.3.0's new env surface is
 `KIMI_CODE_MODEL_MIGRATION_STATE_FILE_NAME` and
 `KIMI_CODE_SESSION_RATING_PREVIEW` (survey state renamed); neither is
-exported by the worker).
+exported by the worker). **Blocked at the pin's landing (the !1831
+review's MG-1):** the protected `worker-kimi-candidate` build is blocked by
+the instance's `throttle_unauthenticated_web` rate limit (the !1828
+review's MD-1), so no image has been built from the 2.3.0 pin yet —
+tenants keep their current 2.2.0 images until the limit is lifted and
+the candidate build runs.
 An override without a matching reviewed lock fails closed. The pinned version is baked
 into `KIMI_CODE_IMAGE_VERSION` and reported as `kimi_code_version`, and
 `ic/scripts/tests/test-mt-admin-kimi.sh` cross-checks Dockerfile default, CI
