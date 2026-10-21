@@ -173,20 +173,32 @@ fi
 
 SYMLINK_VICTIM="$FIXTURE/wi446-symlink-victim.txt"
 printf 'sentinel\n' >"$SYMLINK_VICTIM"
-BRIDGE_UNIT_PATH="$SYSTEMD_DIR/xmpp-bridge-${TENANT}.service"
-rm -f "$BRIDGE_UNIT_PATH"
-ln -s "$SYMLINK_VICTIM" "$BRIDGE_UNIT_PATH"
-if (render_tenant_systemd_units "$TENANT" >/dev/null 2>&1); then
-  fail "render refuses a pre-planted symlink at a unit path"
-else
-  pass "render refuses a pre-planted symlink at a unit path"
-fi
-if [[ -L "$BRIDGE_UNIT_PATH" && "$(<"$SYMLINK_VICTIM")" == "sentinel" ]]; then
-  pass "unit-path symlink refusal leaves the redirect target untouched"
-else
-  fail "unit-path symlink refusal leaves the redirect target untouched"
-fi
-rm -f "$BRIDGE_UNIT_PATH"
+# WI#446 (run-174 LW-4): loop the unit-path symlink pin over EVERY unit file
+# render_tenant_systemd_units writes through the real tenant-side writer in
+# this harness (the weechat unit itself goes through the harness's stubbed
+# helper; proxy/darkirc are disabled here).
+for wi446_unit in \
+  "lunarwing-weechat-adapter-${TENANT}.service" \
+  "xmpp-bridge-${TENANT}.service" \
+  "lunarwing-${TENANT}.service" \
+  "lunarwing-workloads.slice" \
+  "lunarwing-build.slice"; do
+  wi446_unit_path="$SYSTEMD_DIR/$wi446_unit"
+  rm -f "$wi446_unit_path"
+  ln -s "$SYMLINK_VICTIM" "$wi446_unit_path"
+  if (render_tenant_systemd_units "$TENANT" >/dev/null 2>&1); then
+    fail "render refuses a pre-planted symlink at unit path $wi446_unit"
+  else
+    pass "render refuses a pre-planted symlink at unit path $wi446_unit"
+  fi
+  if [[ -L "$wi446_unit_path" && "$(<"$SYMLINK_VICTIM")" == "sentinel" ]]; then
+    pass "unit-path symlink refusal leaves the redirect target untouched ($wi446_unit)"
+  else
+    fail "unit-path symlink refusal leaves the redirect target untouched ($wi446_unit)"
+  fi
+  rm -f "$wi446_unit_path"
+  render_tenant_systemd_units "$TENANT" >/dev/null
+done
 
 rm -rf "$WEECHAT_HOME_DIR"
 ln -s "$SYMLINK_VICTIM" "$WEECHAT_HOME_DIR"
@@ -203,6 +215,33 @@ fi
 rm -f "$WEECHAT_HOME_DIR"
 render_tenant_systemd_units "$TENANT" >/dev/null
 rm -f -- "$SYMLINK_VICTIM"
+
+# WI#446 (run-174 LW-4): the secret-bearing Quadlet renders (Postgres embeds
+# POSTGRES_PASSWORD; the worker Quadlet embeds AGENT_AUTH_TOKEN/… ) must refuse
+# a symlinked ~/.config Quadlet directory the same way (LW-1 pin shape): the
+# render dies at the tenant-side mkdir and creates nothing behind the link.
+WI446_QDIR_LINK="$(tenant_home "$TENANT")/.config/containers"
+WI446_QREDIRECT="$FIXTURE/wi446-quadlet-redirect"
+mkdir -p "$(tenant_env_dir "$TENANT")"
+chmod 0700 "$(tenant_env_dir "$TENANT")"
+printf 'fixture-pg-secret\n' >"$(tenant_env_dir "$TENANT")/pg.secret"
+chmod 0600 "$(tenant_env_dir "$TENANT")/pg.secret"
+wi446_quadlet_dir_pin() {  # <label> <render command...>
+  local label="$1"
+  shift
+  rm -rf "$WI446_QDIR_LINK"
+  mkdir -p "$WI446_QREDIRECT"
+  ln -s "$WI446_QREDIRECT" "$WI446_QDIR_LINK"
+  if ("$@") >/dev/null 2>&1 || [[ -n "$(ls -A "$WI446_QREDIRECT")" ]]; then
+    fail "$label refuses a symlinked ~/.config/containers (WI#446)"
+  else
+    pass "$label refuses a symlinked ~/.config/containers (WI#446)"
+  fi
+  rm -f "$WI446_QDIR_LINK"
+  rm -rf "$WI446_QREDIRECT"
+}
+wi446_quadlet_dir_pin "render_pg_quadlet" render_pg_quadlet "$TENANT"
+wi446_quadlet_dir_pin "render_worker_quadlet" render_worker_quadlet "$TENANT" pebble
 
 echo "=== OpenRC rendering and dependency gating ==="
 write_weechat_flag true
