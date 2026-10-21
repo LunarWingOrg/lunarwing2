@@ -1926,8 +1926,20 @@ prepare_worker_workspace() {
   local name="$1" worker="$2" lw_root workspace_dir container_uid container_gid
   lw_root="$(tenant_lw_root "$name")"
   workspace_dir="$lw_root/${worker}-workspace"
-  tenant_mkdir_p "$name" "$workspace_dir" \
-    || die "could not safely create $workspace_dir as tenant '$name'"
+  # The component walk runs FIRST: a symlinked ancestor (including lw_root
+  # itself) must refuse before anything is created behind the link. Root
+  # creating a directory through the tenant-controlled ~/lunarwing chain
+  # follows a tenant-planted symlink component (WI#453, the WI#446 class);
+  # creating AS the tenant owns the leaf outright instead.
+  if ! darkirc_path_components_safe "$workspace_dir"; then
+    printf 'error: unsafe %s workspace path: %s\n' "$worker" "$workspace_dir" >&2
+    return 1
+  fi
+  if [[ "$(id -un)" == "$name" ]]; then
+    mkdir -p -- "$workspace_dir" || return 1
+  else
+    sudo -u "$name" mkdir -p -- "$workspace_dir" || return 1
+  fi
   if [[ ! -d "$workspace_dir" || -L "$workspace_dir" ]]; then
     printf 'error: %s workspace is not a plain directory: %s\n' "$worker" "$workspace_dir" >&2
     return 1

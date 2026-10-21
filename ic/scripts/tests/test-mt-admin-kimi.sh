@@ -471,6 +471,61 @@ else
   fail "rootful OpenCode workspace ownership wrong: $CHOWN_CALL"
 fi
 
+# ── WI#453: the workspace sits in the tenant-controlled ~/lunarwing chain, so
+# root must never create or chown through it. A tenant-planted symlink at the
+# workspace (or at a parent component) must be refused, with no chown run.
+wi453_target="$fixture/home/outside-wi453"
+command mkdir -p "$wi453_target"
+command rm -rf -- "$fixture/home/lunarwing/kimi-workspace"
+command ln -s "$wi453_target" "$fixture/home/lunarwing/kimi-workspace"
+CHOWN_CALL=''
+if prepare_worker_workspace root kimi >/dev/null 2>&1; then
+  fail 'prepare_worker_workspace accepted a symlinked workspace (WI#453)'
+else
+  pass 'prepare_worker_workspace refuses a symlinked workspace (WI#453)'
+fi
+if [[ -z "$CHOWN_CALL" ]]; then
+  pass 'symlinked workspace refusal runs no chown (WI#453)'
+else
+  fail "symlinked workspace refusal ran chown: $CHOWN_CALL"
+fi
+if [[ "$(stat -c %u "$wi453_target" 2>/dev/null || printf -- -1)" \
+    == "$(stat -c %u "$fixture/home" 2>/dev/null || printf -- -2)" ]]; then
+  pass 'symlink redirect target was not chowned (WI#453)'
+else
+  fail 'symlink redirect leaked an ownership change to the target (WI#453)'
+fi
+command rm -f -- "$fixture/home/lunarwing/kimi-workspace"
+command rm -rf -- "$wi453_target"
+unset wi453_target
+
+# A symlinked parent component must also be refused (the tenant_mkdir_p
+# ancestor walk), and the helper must not have created anything behind it.
+wi453_real="$fixture/home/wi453-real"
+command mkdir -p "$wi453_real"
+command rm -rf -- "$fixture/home/lunarwing"
+command ln -s "$wi453_real" "$fixture/home/lunarwing"
+CHOWN_CALL=''
+if prepare_worker_workspace root kimi >/dev/null 2>&1; then
+  fail 'prepare_worker_workspace accepted a symlinked parent (WI#453)'
+else
+  pass 'prepare_worker_workspace refuses a symlinked parent (WI#453)'
+fi
+if [[ -n "$CHOWN_CALL" ]]; then
+  fail "symlinked parent refusal ran chown: $CHOWN_CALL"
+else
+  pass 'symlinked parent refusal runs no chown (WI#453)'
+fi
+if [[ -e "$wi453_real/kimi-workspace" || -L "$wi453_real/kimi-workspace" ]]; then
+  fail 'symlinked parent refusal left a workspace behind the link (WI#453)'
+else
+  pass 'symlinked parent refusal leaves nothing behind the link (WI#453)'
+fi
+command rm -f -- "$fixture/home/lunarwing"
+command mkdir -p "$fixture/home/lunarwing"
+command rm -rf -- "$wi453_real"
+unset wi453_real
+
 cat >"$fixture/env/legacy.env" <<'EOF'
 KIMI_API_KEY='key\\with\'quote'
 EOF
