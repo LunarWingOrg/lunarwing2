@@ -1,10 +1,10 @@
 # Release Notes for LunarWing v2.1.6.0
 
-**DRAFT — pre-release; content reflects the v2.1.6.0 tree as of 2026-10-20 and may grow before the tag is cut.**
+**DRAFT — pre-release; content reflects the v2.1.6.0 tree as of 2026-10-21 and may grow before the tag is cut.**
 
 ## Codename: Tsuno (角, つの): The Horns
 
-**Release date:** TBD (drafted 2026-10-16; refreshed 2026-10-20)
+**Release date:** TBD (drafted 2026-10-16; refreshed 2026-10-20 and 2026-10-21)
 
 > Not raised in anger,
 > but set and sure all the same —
@@ -47,8 +47,10 @@ exposure-policy controls, and OpenRC proxy migrations refuse silently-wrong
 states instead of refusing healthy ones. The cycle closes with the usual
 dependency sweep (2.1.5 → 2.1.6 across all owned packages, refreshed
 registries, regenerated vendor tree) and a full crate-security re-audit with
-two late-cycle security upgrades (rustls 0.23.46, Wasmtime/WASI 36.0.18) —
-including one **breaking change**: Turso/libSQL remote-replica sync now
+four late-cycle security upgrades — rustls 0.23.46, Wasmtime/WASI 36.0.18
+then 36.0.19 (two Cranelift miscompiles), and the CVE-2026-111943 webpki
+root-store trio — including one **breaking change**: Turso/libSQL
+remote-replica sync now
 lives behind the non-default `libsql-remote-replica` cargo feature (see
 Upgrade Notes).
 
@@ -171,11 +173,11 @@ previous compatibility baseline.
 | Rust edition / MSRV | Rust 2024 / `1.96.1`, unchanged |
 | SQL migrations | V28 remains latest; no new migrations this cycle |
 | Multi-tenant port registry | v17, unchanged |
-| WASM runtime | Wasmtime/WASI 36.0.18; matching Cranelift family 0.123.18 — security upgrade from 36.0.17 (RUSTSEC-2026-0352/0363; see Crate Security Re-Audit) |
+| WASM runtime | Wasmtime/WASI 36.0.19; matching Cranelift family 0.123.19 — security upgrades from 36.0.17 (RUSTSEC-2026-0352/0363, then RUSTSEC-2026-0379/0380; see Crate Security Re-Audit) |
 | Bundled skills | Seven product skills, unchanged; no skill migration |
 | Channel registry | darkirc 0.1.12, multica 0.1.15, weechat 0.2.13, xmpp 0.1.18 |
 | Tool registry | cavepony-tool 0.4.6, gitlab 0.1.9, gotify 0.1.3, llm-context 0.1.4, multica-bridge 0.1.5, ssh 0.1.4, vision-analyze 0.1.6, voice-transcribe 0.1.4, web-search 0.2.5 |
-| External workers | kimi-code `2.2.0` (upgraded from 2.1.1), opencode `v1.18.25`, opencode2 `v2.0.32` (maintainer-approved WI#427; OpenTunnel compiled out), Pebble `2d0f3786…` (upstream ref unchanged; its reviewed lock was upgraded for the rustls advisories) |
+| External workers | kimi-code `2.2.0` (upgraded from 2.1.1), opencode `v1.18.25`, opencode2 `v2.0.32` (maintainer-approved WI#427; OpenTunnel compiled out), Pebble `2d0f3786…` (upstream ref unchanged; its reviewed lock was upgraded for the rustls and CVE-2026-111943 webpki advisories) |
 | Cargo features | New non-default `libsql-remote-replica` feature gates Turso sync (breaking — see Upgrade Notes) |
 
 Registry version bumps require rebuilding/reinstalling the affected WASM
