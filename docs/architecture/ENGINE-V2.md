@@ -292,6 +292,10 @@ closed: `glpat-` GitLab PATs have their own Block pattern, and the Bearer
 and Authorization-header value classes cover the full token grammar
 (`.`-separated JWT segments, `~`-separated tails, base64 `+`/`/`/`=`), so
 uncut tokens are blocked or redacted completely rather than only at cuts.
+The Bearer scheme match is case-insensitive, the truncation-cut snapper
+treats `~` as part of a token run, and a `glpat-` body with fewer than
+three distinct characters (documentation placeholders) is not flagged, so
+fetched GitLab docs are not blocked wholesale.
 WASM (10 MB), MCP (4 MiB), and built-in HTTP (5 MiB) size limits reject the
 call rather than truncate; tail preservation is not an end-to-end guarantee.
 Follow-ups that still
