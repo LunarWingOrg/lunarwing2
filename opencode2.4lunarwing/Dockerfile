@@ -48,11 +48,13 @@ RUN bun install --frozen-lockfile && bun pm cache rm
 # argument and event payload shapes (the CY-2 residue the runtime-stage
 # sdk_surface_assert.ts existence/membership gate cannot see). A pinned-SDK
 # argument or payload rename now fails the image build here instead of at
-# runtime. tsgo ships in the monorepo's pinned devDependencies
-# (@typescript/native-preview, see bun.lock) so no new fetch is introduced;
-# --noEmit writes nothing into the layer.
+# runtime. The native TypeScript compiler ships in the monorepo's pinned
+# devDependencies (@typescript/native, npm:typescript@7.0.2, see bun.lock)
+# so no new fetch is introduced; at v2.1.2 the binary is tsc — v2.0.32's
+# @typescript/native-preview shipped it as tsgo — and --noEmit writes
+# nothing into the layer.
 COPY scripts/ /build/lunarwing/scripts/
-RUN /build/opencode/node_modules/.bin/tsgo --noEmit \
+RUN /build/opencode/node_modules/.bin/tsc --noEmit \
       -p /build/lunarwing/scripts/tsconfig.sdk-surface.json
 
 WORKDIR /build/opencode/packages/client
@@ -318,7 +320,7 @@ RUN install -D -m 0755 /app/scripts/opencode-exposure-guard.sh /usr/local/bin/op
 # (session.message.list / session.permission.reply do not exist; both are
 # top-level groups) or an event rename in the v2 union fails the image build
 # instead of dying at runtime (WI#303). Call argument and event payload
-# shapes are covered separately at the builder stage by the tsgo --noEmit
+# shapes are covered separately at the builder stage by the tsc --noEmit
 # gate (WI#369, see tsconfig.sdk-surface.json).
 #
 # Build-time self-tests run under a throwaway HOME rooted in the trap-cleaned
