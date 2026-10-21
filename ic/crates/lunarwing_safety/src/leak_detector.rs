@@ -218,6 +218,18 @@ impl LeakDetector {
                 let matched_text = mat.as_str();
                 let location = mat.start()..mat.end();
 
+                // Placeholder-only bodies (run-185 MH-3): GitLab's own docs
+                // spell the token shape as `glpat-xxxxxx…` (one repeated
+                // character). The 20-char minimum cannot exclude those, and
+                // the action is Block, so a fetched docs page would have its
+                // whole output blocked. A body with fewer than three distinct
+                // characters is documentation filler, not a secret.
+                if pattern.name == "gitlab_pat"
+                    && !is_plausible_token_body(&matched_text["glpat-".len()..])
+                {
+                    continue;
+                }
+
                 let leak_match = LeakMatch {
                     pattern_name: pattern.name.clone(),
                     severity: pattern.severity,
@@ -447,6 +459,19 @@ fn extract_literal_prefix(pattern: &str) -> Option<String> {
     }
 }
 
+/// A token body with fewer than three distinct characters is documentation
+/// filler (`glpat-xxxx…`), not a real secret. Used by the `gitlab_pat` Block
+/// pattern (run-185 MH-3) so fetched GitLab docs are not blocked wholesale.
+fn is_plausible_token_body(body: &str) -> bool {
+    let mut distinct = [false; 128];
+    for b in body.bytes() {
+        if b < 128 {
+            distinct[b as usize] = true;
+        }
+    }
+    distinct.iter().filter(|&&seen| seen).count() >= 3
+}
+
 /// Default leak detection patterns.
 pub(crate) fn default_patterns() -> Vec<LeakPattern> {
     vec![
@@ -556,18 +581,19 @@ pub(crate) fn default_patterns() -> Vec<LeakPattern> {
         // JWT dot-separated segments (`.`), tilde-separated tokens (`~`),
         // and base64 padding (`+`, `/`, `=`) — so the payload and signature
         // of a JWT and the tail of a tilde token are redacted with the rest
-        // instead of being left visible past the first separator.
+        // instead of being left visible past the first separator. The scheme
+        // match is case-insensitive (run-185 MH-2): OAuth responses and many
+        // logs print `token_type: bearer` / a lowercase `bearer <token>`.
         LeakPattern {
             name: "bearer_token".to_string(),
-            regex: Regex::new(r"Bearer\s+[a-zA-Z0-9_+/.=~=-]{20,}").unwrap(), // safety: hardcoded literal
+            regex: Regex::new(r"(?i)Bearer\s+[a-zA-Z0-9_+/.=~-]{20,}").unwrap(), // safety: hardcoded literal
             severity: LeakSeverity::High,
             action: LeakAction::Redact,
         },
         // Authorization header with key
         LeakPattern {
             name: "auth_header".to_string(),
-            regex: Regex::new(r"(?i)authorization:\s*[a-zA-Z]+\s+[a-zA-Z0-9_+/.=~=-]{20,}")
-                .unwrap(), // safety: hardcoded literal
+            regex: Regex::new(r"(?i)authorization:\s*[a-zA-Z]+\s+[a-zA-Z0-9_+/.=~-]{20,}").unwrap(), // safety: hardcoded literal
             severity: LeakSeverity::High,
             action: LeakAction::Redact,
         },
@@ -681,7 +707,7 @@ mod tests {
     #[test]
     fn test_detect_gitlab_pat() {
         let detector = LeakDetector::new();
-        let token = format!("glpat-{}", "x".repeat(20));
+        let token = format!("glpat-{}", "x1y2z3a4b5c6d7e8f9g0".repeat(2));
         for content in [
             format!("token: {token}"),
             format!("GITLAB_TOKEN={token}"),
@@ -715,6 +741,54 @@ mod tests {
         );
     }
 
+    /// Run-185 MH-3: GitLab's own documentation spells the token shape as
+    /// `glpat-` followed by a run of placeholder x's. The pattern's action
+    /// is Block, so matching that placeholder would replace a whole fetched
+    /// docs page with "[Output blocked due to potential secret leakage]".
+    /// A body with fewer than three distinct characters is skipped.
+    #[test]
+    fn test_gitlab_pat_docs_placeholder_not_flagged() {
+        let detector = LeakDetector::new();
+        let placeholder = format!("glpat-{}", "x".repeat(20));
+        let result = detector.scan(&format!(
+            "Create a token at the settings page; it looks like {placeholder}."
+        ));
+        assert!(
+            !result
+                .matches
+                .iter()
+                .any(|m| m.pattern_name == "gitlab_pat"),
+            "documentation placeholder must not match: {placeholder}"
+        );
+        assert!(!result.should_block);
+        // Two distinct characters are still filler (e.g. `abab…`).
+        let two = format!("glpat-{}", "ab".repeat(10));
+        let result = detector.scan(&two);
+        assert!(
+            !result
+                .matches
+                .iter()
+                .any(|m| m.pattern_name == "gitlab_pat")
+        );
+        // The placeholder must not block through the clean path either.
+        let cleaned = detector
+            .scan_and_clean(&placeholder)
+            .expect("placeholder is clean");
+        assert_eq!(cleaned, placeholder);
+    }
+
+    /// Run-185 MH-3 counterpart: a real-looking mixed body (three or more
+    /// distinct characters) still blocks, so the placeholder skip cannot be
+    /// used to smuggle a PAT past the detector.
+    #[test]
+    fn test_gitlab_pat_real_looking_body_still_blocks() {
+        let detector = LeakDetector::new();
+        let token = format!("glpat-{}", "x1y2z3a4b5c6d7e8f9g0".repeat(2));
+        let result = detector.scan(&format!("token: {token}"));
+        assert!(result.should_block);
+        assert!(detector.scan_and_clean(&token).is_err());
+    }
+
     /// WI#353 (BC-5): Bearer redaction used to stop at `.`, leaving a JWT's
     /// payload and signature visible after the redaction boundary. The whole
     /// dot-separated token must be redacted.
@@ -737,6 +811,19 @@ mod tests {
         assert!(!redacted.contains(&format!("{}.{}", "b".repeat(24), "c".repeat(24))));
         // Text after the token survives.
         assert!(redacted.contains(" and more text"));
+
+        // Run-185 MH-2: the scheme match is case-insensitive — OAuth
+        // responses and many logs print a lowercase `bearer`.
+        let lower = format!("token_type: bearer {jwt} issued");
+        let result = detector.scan(&lower);
+        let redacted = result
+            .redacted_content
+            .expect("lowercase bearer must redact");
+        assert!(
+            !redacted.contains(&jwt),
+            "lowercase bearer JWT survived: {redacted}"
+        );
+        assert!(redacted.contains(" issued"));
     }
 
     /// WI#353 (BC-5): Bearer redaction used to stop at `~`, leaving the
@@ -804,7 +891,10 @@ mod tests {
     #[test]
     fn test_scan_and_clean_blocks_gitlab_pat() {
         let detector = LeakDetector::new();
-        let content = format!("gitlab token is glpat-{} here", "q".repeat(20));
+        let content = format!(
+            "gitlab token is glpat-{} here",
+            "q1w2e3r4t5y6u7i8o9p0".repeat(2)
+        );
         let result = detector.scan_and_clean(&content);
         assert!(result.is_err());
     }
