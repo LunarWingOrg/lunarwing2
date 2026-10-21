@@ -21,11 +21,13 @@ function annotateComponent(error: unknown, part: string): Error {
 
 // Cron-only directory bootstrap. Keep the descriptor-relative, no-symlink
 // creation contract in sync with the Kimi and OpenCode2 worker bridges.
-// DS-2: only validation, ENOTDIR/ELOOP (non-directory component), EACCES/EPERM
-// and containment failures are permanent; other errnos (EMFILE/ENFILE/ENOMEM,
-// ENOSPC/EDQUOT/EIO on the first mkdir, ENOENT/EINVAL from a swap race) are
-// reported under a transient wording the host supervisor retries.
-const NON_RETRYABLE_ERRNOS = new Set(["ENOTDIR", "ELOOP", "EACCES", "EPERM"])
+// DS-2: only validation, ENOTDIR/ELOOP (non-directory component), EACCES/EPERM,
+// EINVAL and containment failures are permanent; other errnos (EMFILE/ENFILE/
+// ENOMEM, ENOSPC/EDQUOT/EIO on the first mkdir, ENOENT from a swap race) are
+// reported under a transient wording the host supervisor retries. EINVAL is
+// permanent (run-170 LP-16): its only source here is fchown on an unmapped
+// uid, which a re-dispatch can never fix.
+const NON_RETRYABLE_ERRNOS = new Set(["ENOTDIR", "ELOOP", "EACCES", "EPERM", "EINVAL"])
 export function resolveTaskWorkspace(
   context: { project_dir?: string; cron_tick?: unknown } | undefined,
   workspaceRoot: string,
