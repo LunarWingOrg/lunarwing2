@@ -55,7 +55,7 @@ workspace work.
 
 | Area | v1 (`opencode4lunarwing`) | v2 (this worker) |
 |---|---|---|
-| Pin | v1.18.25 (proven) | v2.0.32 (beta in practice) |
+| Pin | v1.18.25 (proven) | v2.1.2 (beta in practice) |
 | Client SDK | `@opencode-ai/sdk/v2/client` | `@opencode/client/promise` |
 | Config file | `config/opencode.json` | `config/opencode2.json` |
 | Config shape | `provider.<id>.{npm,options.baseURL}` | `providers.<id>.{package,settings.baseURL}` |
@@ -66,7 +66,10 @@ workspace work.
 | mt-admin ports | `opencode_wss` / `opencode_health` (extended block) | `opencode2_wss` / `opencode2_health` (dedicated range, registry v17) |
 | Worker env overrides | `OPENCODE_MODEL` / `OPENCODE_BASE_URL` | `OPENCODE2_MODEL` / `OPENCODE2_BASE_URL` |
 
-WI#427 approves this pin at `843a6c514e606b436a7fe713422ace0a93ad3d61`.
+WI#427 approved crossing the OpenTunnel boundary at
+`843a6c514e606b436a7fe713422ace0a93ad3d61` (v2.0.32); the current v2.1.2 pin
+is `a517687fde98a7329ada3ae644a01a9fc6c4e99e` (tag resolved via git
+ls-remote, every gate re-verified on the fresh clone).
 The build compiles OpenTunnel out; the wrapper refuses service/pairing,
 self-upgrade (`upgrade`/`update`), and non-loopback serving, and sharing
 stays disabled. The lane config's `update: "disable"` pin is not honored by

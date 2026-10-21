@@ -38,8 +38,9 @@ When in doubt about where a change belongs, read [`AGENTS.md`](../../AGENTS.md) 
   still Tier 3 by default (§3).
 - The v2.1.6.0 pre-release checklist is being worked through
   (`docs/ops/AGENT_GOALS_2.1.6.0.md`). The crate/pin state already moved
-  (all LunarWing crates at 2.1.6 per checklist item #1; kimi worker 2.2.0
-  per item #4; opencode2 moves to v2.0.32 under the maintainer-approved
+  (all LunarWing crates at 2.1.6 per checklist item #1; kimi worker 2.3.0
+  per items #4 and #83; opencode2 at v2.1.2 per item #83 — the v2.0.26
+  OpenTunnel boundary was first crossed at v2.0.32 under the maintainer-approved
   WI#427, with WI#357's tunnel compile-out and exposure guards retained;
   see `docs/ops/WORKER-CONTAINERS.md` for verification and rollout). Landed this cycle: the external-worker
   control channel (WI#328), external-worker cron mode (WI#325), the

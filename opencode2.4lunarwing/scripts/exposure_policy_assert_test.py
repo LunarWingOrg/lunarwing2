@@ -274,7 +274,7 @@ class ExposureGuardWrapperTests(unittest.TestCase):
         self.assertIn("refused 'opencode service'", result.stderr)
 
     def test_pair_refused(self) -> None:
-        # WI#427: v2.0.32 can enable remote access via pair --remote --yes
+        # WI#427: v2.0.32+ (verified still true at v2.1.2) can enable remote access via pair --remote --yes
         # (or -y), including in non-interactive sessions. Refuse all forms.
         for form in (
             ("pair",),

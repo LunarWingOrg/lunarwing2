@@ -993,11 +993,14 @@ tensorzero_openai_base() {
 # configure-* commands all go through them.
 
 # Shape-check an operator-supplied LLM endpoint. Dies on any violation.
-# Call directly (never inside $(...)) so die aborts the caller.
+# Call directly (never inside $(...)) so die aborts the caller. The die sites
+# echo the URL through sanitize_display_value (WI#384): the value is
+# tenant-controlled and the scheme/host checks fire before the content checks,
+# so raw control bytes or terminal escapes must never reach root-side output.
 validate_llm_url() {  # <url> <label>
   local url="$1" label="$2" LC_ALL=C
   [[ "$url" =~ ^https?:// ]] \
-    || die "$label must be an http(s) URL: $url"
+    || die "$label must be an http(s) URL: $(sanitize_display_value "$url")"
   # Whitespace/control characters would inject extra lines into env files.
   [[ "$url" != *[[:space:][:cntrl:]]* ]] \
     || die "$label must not contain whitespace or control characters"
@@ -1017,7 +1020,7 @@ validate_llm_url() {  # <url> <label>
   # A host is required.
   local rest="${url#*://}"
   [[ -n "${rest%%[:/]*}" ]] \
-    || die "$label has no host: $url"
+    || die "$label has no host: $(sanitize_display_value "$url")"
 }
 
 # True when <url> points at host loopback. Canonical mt-admin copy; the
