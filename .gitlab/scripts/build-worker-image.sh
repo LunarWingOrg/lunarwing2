@@ -95,7 +95,7 @@ opencode2.4lunarwing/scripts/exposure_policy_assert_test.py
 opencode2.4lunarwing/scripts/entrypoint_config_test.py
 opencode2.4lunarwing/scripts/compile_out_remote_tunnel.py
 opencode2.4lunarwing/scripts/compile_out_remote_tunnel_test.py'
-        source_ref=843a6c514e606b436a7fe713422ace0a93ad3d61
+        source_ref=a517687fde98a7329ada3ae644a01a9fc6c4e99e
         # WI#357 run-106 GJ-3(a): the checkout's wrapper digest, compared by
         # the in-image --image-filesystem assert against the installed wrapper.
         # Detects accidental drift; an adversarial Dockerfile can still defeat
@@ -111,8 +111,8 @@ opencode2.4lunarwing/scripts/compile_out_remote_tunnel_test.py'
         [ "${#wrapper_anchor}" -eq 64 ] || {
             echo "invalid wrapper sha256 for $wrapper_file" >&2; exit 1;
         }
-        build_args="OPENCODE_VERSION=v2.0.32
-OPENCODE_REF=843a6c514e606b436a7fe713422ace0a93ad3d61
+        build_args="OPENCODE_VERSION=v2.1.2
+OPENCODE_REF=a517687fde98a7329ada3ae644a01a9fc6c4e99e
 WITH_TOOLCHAINS=false
 LUNARWING_WRAPPER_SHA256=$wrapper_anchor
 SOURCE_REVISION=$CI_COMMIT_SHA"
