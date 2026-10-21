@@ -1239,5 +1239,8 @@
     - **Freshness:** header "as of" → 2026-10-21, release-date line refreshed, tracker re-check date updated; item-78 (WI#387 test-only dead-code fix) intentionally stays out per the item-40 CI/test-only convention
     - **Verification:** every changed claim re-read against the tree before writing (lockfile: wasmtime 36.0.19/cranelift 0.123.19, rustls-webpki 0.103.16 + legacy 0.102.8, webpki-roots 1.0.10 + 0.26.11; engine: all three writer fns + `GlobalListGate` + `restart_record_survives_a_concurrent_fire` at `ic/crates/lunarwing_engine/src/runtime/mission.rs`; TS: the `^[1-9][0-9]*$` gates in both `task_identity.ts` copies); WI statuses verified live on the tracker (WI#400 closed 2026-10-20, WI#449 open, WI#317 open, WI#445/WI#418 closed, WI#446 open); grep sweep confirms no stale "twelve IDs"/"seven libsql"/"two late-cycle"/bare-36.0.18-as-current claims remain; line-wrap matches the file's convention; `git diff --check` clean. Docs/markdown-only change set (single file) — no cargo/npm lanes apply
 85. [ ] This is a double banger. Work on both https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/450 and https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/451 - Related to one of our recent MRs that merged in. a followup
+86. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/449
+87. [x] (S) Reserved
+88. [x] (S) Reserved
 
 ---
