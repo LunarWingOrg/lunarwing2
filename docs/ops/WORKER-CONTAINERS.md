@@ -83,9 +83,12 @@ section and "Launch identity (WI#422)" further down.
   spawned task process (and opencode's `serve`, which hosts task code) drops
   to the image's task uid/gid via
   `setpriv --reuid --regid --clear-groups --ambient-caps=-all --inh-caps=-all
-  --no-new-privs` (both capability clearances and `no_new_privs` are
-  mandatory: without them the task keeps ambient SETUID/SETGID or regains
-  privilege through a setuid/file-capability binary). `/proc/1/environ`,
+  --no-new-privs --bounding-set=-all` (both capability clearances and
+  `no_new_privs` are mandatory: without them the task keeps ambient
+  SETUID/SETGID or regains privilege through a setuid/file-capability
+  binary; the bounding-set clear is run-170 LP-7 belt-and-braces — with it
+  the dropped task's bounding set is empty, and it needs CAP_SETPCAP in the
+  still-root setpriv, which the trim below carries). `/proc/1/environ`,
   the bridge's environ, and the token file all give the task uid EACCES.
   The opencode bridge is exec-ed from the root-owned `/app`, never from the
   task-writable workspace: bun loads `bunfig.toml` preloads and `.env` from
@@ -104,19 +107,38 @@ section and "Launch identity (WI#422)" further down.
   `$KIMI_CODE_HOME`) is task state.
 - **Trimmed root bridge.** The worker containers run with
   `--cap-drop=ALL --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER
-  --cap-add=KILL --cap-add=SETUID --cap-add=SETGID` plus
+  --cap-add=KILL --cap-add=SETUID --cap-add=SETGID --cap-add=SETPCAP` plus
   `--security-opt no-new-privileges` (both the imperative `_ctr run` paths
   and the Quadlet `PodmanArgs`; the contracts record `cap-trim` so existing
   containers force-recreate). The bridge needs: CHOWN for the
-  relay-socket/cron-leaf handoff, SETUID/SETGID for the drop, KILL for
+  relay-socket/cron-leaf handoff, SETUID/SETGID for the drop, SETPCAP for
+  the drop's `--bounding-set=-all` (run-170 LP-7: `PR_CAPBSET_DROP` requires
+  it — verified empirically; SETPCAP can only shuffle capabilities within
+  the container's bounding set, which `--cap-drop=ALL` already limits to the
+  carried set), KILL for
   timeout/cancel of task-uid children, and DAC_OVERRIDE for cron workspace
   creation inside the task-owned workspace root (on keep-id rootless, the
   workspace presents as task-owned 2770). The run-166 root-bridge probe
   showed each of those five individually required on the pebble lane;
-  FOWNER is not individually required there but is retained for metadata
+  FOWNER is not individually required there — the LP-13 socket handoff
+  chmods before it chowns, so the mode change runs while root still owns
+  the socket — but is retained for metadata
   passes (chmod/re-assert) over task-created files the bridge does not own
   — dropping it is on the table the next time the set is re-proved end to
   end on every lane.
+- **Standing residual (run-184 ME-1, open):** the kimi and opencode image
+  `PATH` entries start with directories the task uid owns
+  (`/home/<lane>/.cargo/bin`, `/home/<lane>/go/bin`), and several
+  root-side resolutions use that same `PATH` (the image `HEALTHCHECK`,
+  the kimi bridge's per-task `setpriv` lookup, the root entrypoint on an
+  in-place restart) — so task-planted code can get run as container root,
+  which would undo WI#400's split on those lanes. Pebble is not affected
+  (its PATH entries are root-owned). The run-184 fix (root-owned image
+  PATH + task toolchain dirs only at the drop, absolute-path health
+  probes, an owner-refusing `resolveFromBridgePath`) is recorded on the
+  review and applies to the already-root lanes whenever they are next
+  reworked; how those lanes come back in line with the maintainer's
+  no-root policy is the maintainer's decision.
 - **Cron workspace ownership.** The cron bootstrap (`create_cron_workspace`
   / the TS `resolveTaskWorkspace`) runs in the root bridge, so EVERY
   directory the walk creates — intermediates and leaf alike, or the task
@@ -137,8 +159,15 @@ section and "Launch identity (WI#422)" further down.
   bind and before the task spawns); with no identity pinned (host dev runs
   and tests) the socket is left untouched.
 - **opencode2 is NOT migrated** (its image still runs `USER 10003:10003`
-  and mt-admin's image-user guard continues to require exactly that); it
-  gets its own lane migration, like the pebble split here.
+  and mt-admin's image-user guard continues to require exactly that). The
+  !1829 attempt ported the root-launcher shape to this lane and was
+  rejected: the maintainer's policy is that **no worker container should
+  run as root**, which the `USER 0:0` migration violates — the same policy
+  question now hangs over the kimi/opencode/pebble root bridges
+  themselves. WI#449's remainder for this lane is a non-root split design
+  (the run-184 review's sketch: a bridge container holding the hub
+  credential under one uid plus a task container under another, sharing
+  the workspace volume over a unix socket), which needs its own work item.
 
 **Rootful pebble (run-164 KW-5, resolved by WI#422):** on rootful
 runtimes there is no user namespace, so an in-container task uid (10004)

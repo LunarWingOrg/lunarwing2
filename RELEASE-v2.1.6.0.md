@@ -752,8 +752,13 @@ drop a no-op while callers keep treating the split as active, and the
 helpers also refuse partially numeric ids like `1000x` (defence in depth
 with the entrypoints' `^[1-9][0-9]*$` gate). The
 opencode2 lane is deliberately not migrated (its image keeps the task uid
-directly; the migration is filed as the WI#449 follow-up, planned for
-v2.1.7.0). Worker images must be rebuilt for the strips and the split to
+directly): the !1829 attempt was rejected 2026-10-21 under the
+maintainer's no-root policy — `USER 0:0` is ruled out, and the lane's
+remainder needs a non-root split design (a bridge container holding the
+hub credential plus a task container, sharing the workspace volume over
+a unix socket — WI#449 stays open for it). The WI#449 run-170 leftovers
+(LP-7, LP-11..LP-16) did land in-tree 2026-10-21. Worker images must be
+rebuilt for the strips and the split to
 reach live tenants. Rollback note (run-170 LP-16): roll back the scripts
 and the image TOGETHER — rolling back the scripts while keeping the new
 `USER 0:0` pebble image drops keep-id on rootless hosts, and tasks then
@@ -1262,7 +1267,10 @@ there the task agent shares the bridge's uid and can still signal or trace
 the bridge and read its environment — no split, by design), with
 real-worker acceptance riding the rebuilt images like every other worker
 change. WI#400 itself was closed on 2026-10-20 after its re-pass; the
-opencode2 lane's own migration is filed as the open WI#449 follow-up.
+opencode2 lane stays non-root (`USER 10003:10003`) — its !1829 root
+migration was rejected under the maintainer's no-root policy, and the
+open WI#449 now tracks a non-root split design plus the landed run-170
+leftovers (LP-7, LP-11..LP-16 landed in-tree 2026-10-21).
 
 **Known-broken lane.** The opencode **v1** worker lane (v1.18.25) still
 crashes inside `opencode serve` before any model call (WI#333); the new
@@ -1334,8 +1342,10 @@ lanes; the rootful pebble launch has no split by design) and the WI itself
 was closed on 2026-10-20 after its re-pass (zero/non-numeric task ids are
 refused everywhere identities parse); what stays open is
 its real-worker acceptance on rebuilt images and the opencode2 lane's own
-migration, filed as **WI#449** together with the run-170 leftovers
-(LP-7, LP-11..LP-16), planned for v2.1.7.0. Filed late and planned for
+isolation, tracked as **WI#449**: its run-170 leftovers
+(LP-7, LP-11..LP-16) landed in-tree 2026-10-21, while the !1829 root
+migration was rejected under the maintainer's no-root policy — the lane's
+remainder is a non-root split design. Filed late and planned for
 v2.1.7.0, but live in this
 release: WI#440 (`generate_token` falls back to a predictable `date +%s`
 token when `od` is absent) and WI#441 (`resolve_protected_paths` degrades
