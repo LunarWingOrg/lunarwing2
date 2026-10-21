@@ -1748,4 +1748,54 @@ mod memory_write_route {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
+
+    /// WI#322: the write route reserves the engine projects tree — mission
+    /// records written here would load through `Mission::from_value` at
+    /// boot, bypassing every `create_mission` check — while a path that
+    /// merely normalizes out of the tree writes normally.
+    #[tokio::test]
+    async fn memory_write_reserves_engine_projects_mission_records() {
+        let (app, _dir) = setup().await;
+
+        for path in [
+            "engine/projects",
+            "engine/projects/foo/project.json",
+            " engine//projects/foo/missions.json/ ",
+            "engine/projects/foo/missions/bar/mission.json",
+            "engine/projects/foo/missions/bar/mission.json.bak",
+            "engine/projects/foo/missions/bar/other.json",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(write_request(
+                    "tok-alice",
+                    serde_json::json!({
+                        "path": path,
+                        "content": "{\"forged\": true}",
+                        "append": false,
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+
+        // `engine/projects/../MEMORY.md` normalizes to engine/MEMORY.md, an
+        // ordinary write; `engine/projects-notes.md` never enters the tree.
+        for path in ["engine/projects/../MEMORY.md", "engine/projects-notes.md"] {
+            let resp = app
+                .clone()
+                .oneshot(write_request(
+                    "tok-alice",
+                    serde_json::json!({
+                        "path": path,
+                        "content": "ordinary memory note",
+                        "append": false,
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        }
+    }
 }

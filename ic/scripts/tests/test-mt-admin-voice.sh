@@ -325,6 +325,34 @@ else
 fi
 rm -f "$fallback"
 
+# WI#446: the voice Quadlet and fallback unit are committed tenant-side, so a
+# tenant-planted symlink at a parent directory component (on a real host, for
+# example ~/.config/containers pointing at the rootful Quadlet directory) must
+# refuse the render and leave nothing behind the link. This harness keeps the
+# Quadlet directory outside the fixture home, so the Quadlet case points it
+# under a linked parent for the duration of the check.
+wi446_redirect="$ROOT/wi446-redirect"
+wi446_voice_pin() {  # <label> <link> <render function>
+  local label="$1" link="$2" render="$3"
+  command mkdir -p "$wi446_redirect"
+  [[ ! -e "$link" ]] || command mv "$link" "$link.real"
+  command ln -s "$wi446_redirect" "$link"
+  if ("$render" alpha) >/dev/null 2>&1 || [[ -n "$(command ls -A "$wi446_redirect")" ]]; then
+    bad "$label refuses a symlinked parent directory (WI#446)" "render followed the link"
+  else
+    ok "$label refuses a symlinked parent directory (WI#446)"
+  fi
+  command rm -f "$link"
+  [[ ! -e "$link.real" ]] || command mv "$link.real" "$link"
+  command rm -rf "$wi446_redirect"
+}
+wi446_quadlet_render() {
+  tenant_quadlet_dir() { printf '%s' "$ROOT/wi446-qparent/systemd"; }
+  render_voice_quadlet "$@"
+}
+wi446_voice_pin render_voice_quadlet "$ROOT/wi446-qparent" wi446_quadlet_render
+wi446_voice_pin render_voice_systemd_fallback_unit "$(tenant_home alpha)/.config/systemd" render_voice_systemd_fallback_unit
+
 # OpenRC registration renders the direct health unit and the crash supervisor.
 render_voice_openrc_unit() { CALLS+=("render-openrc:$1"); }
 render_container_babysitter_unit() { CALLS+=("render-supervisor:$*"); }

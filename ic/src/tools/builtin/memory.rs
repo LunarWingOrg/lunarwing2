@@ -20,8 +20,8 @@ use async_trait::async_trait;
 use crate::context::JobContext;
 use crate::tools::tool::{Tool, ToolError, ToolOutput, require_str};
 use crate::workspace::{
-    SearchResult, Workspace, is_backup_path, is_engine_internal_path, is_engine_runtime_path,
-    is_quarantined_daily_log, normalize_path, paths,
+    SearchResult, Workspace, is_backup_path, is_engine_internal_path, is_engine_projects_path,
+    is_engine_runtime_path, is_quarantined_daily_log, normalize_path, paths,
 };
 
 const MAX_MEMORY_TOOL_OUTPUT_BYTES: usize = 8_000;
@@ -113,6 +113,19 @@ pub(crate) fn normalize_memory_tool_path(path: &str) -> Result<String, ToolError
     if is_engine_runtime_path(&normalized) {
         return Err(ToolError::NotAuthorized(
             "internal Engine runtime state is not accessible through memory tools".to_string(),
+        ));
+    }
+    // The engine projects tree holds engine-owned state, most critically the
+    // mission records (`engine/projects/*/missions/**/mission.json`) that
+    // HybridStore loads through `Mission::from_value` at boot — a memory
+    // write here would bypass every `create_mission` check (cadence
+    // validation, webhook-secret references, ownership, dedup) and can
+    // resurrect deleted missions. The whole tree is reserved, project
+    // documents included, not just the missions subtree (WI#322).
+    if is_engine_projects_path(&normalized) {
+        return Err(ToolError::NotAuthorized(
+            "engine project and mission records (engine/projects/) are Engine-owned state"
+                .to_string(),
         ));
     }
     // Shadow backups can hold quarantined injection content and are the
@@ -610,7 +623,8 @@ impl Tool for MemoryWriteTool {
          'daily_log' for timestamped session notes, 'heartbeat' for the periodic \
          checklist (HEARTBEAT.md), 'bootstrap' to clear the first-run ritual file, \
          or provide a custom workspace path for arbitrary file creation. \
-         Internal Engine runtime paths and shadow backups (backups/) are reserved \
+         Internal Engine runtime paths, engine project/mission records (engine/projects/), \
+         and shadow backups (backups/) are reserved \
          and cannot be modified. \
          Never pass absolute filesystem paths like '/Users/...' or 'C:\\...'."
     }
@@ -902,7 +916,8 @@ impl Tool for MemoryReadTool {
          Use this to read files shown by memory_tree. NOT for local filesystem files \
          (use read_file for those). Do not pass absolute paths like '/Users/...' or 'C:\\...'. \
          Works with identity files, heartbeat checklist, \
-         memory, daily logs, or custom workspace paths. Internal Engine runtime state and \
+         memory, daily logs, or custom workspace paths. Internal Engine runtime state, \
+         engine project/mission records (engine/projects/), and \
          shadow backups (backups/) are reserved. \
          Large files are paginated; pass next_offset as offset and include revision to continue."
     }
@@ -1040,6 +1055,7 @@ fn memory_tree_root_revision(entries: &[crate::workspace::WorkspaceEntry]) -> St
     let mut hasher = blake3::Hasher::new();
     for entry in entries.iter().filter(|entry| {
         !is_engine_runtime_path(&entry.path)
+            && !is_engine_projects_path(&entry.path)
             && !is_backup_path(&entry.path)
             && !is_quarantined_daily_log(&entry.path)
     }) {
@@ -1096,6 +1112,7 @@ impl MemoryTreeTool {
         let mut result = Vec::new();
         for entry in entries {
             if is_engine_runtime_path(&entry.path)
+                || is_engine_projects_path(&entry.path)
                 || is_backup_path(&entry.path)
                 || is_quarantined_daily_log(&entry.path)
             {
@@ -1231,7 +1248,8 @@ impl Tool for MemoryTreeTool {
     fn description(&self) -> &str {
         "View the workspace memory structure as a tree (database-backed storage). \
          Use memory_read to read files shown here, NOT read_file. \
-         Internal Engine runtime state and shadow backups (backups/) are hidden. \
+         Internal Engine runtime state, engine project/mission records, \
+         and shadow backups (backups/) are hidden. \
          Large trees return a bounded prefix \
          with truncated=true; use next_offset plus revision for more root entries, or \
          query a visible subdirectory for omitted nested entries."
@@ -1354,6 +1372,57 @@ mod tests {
             normalize_memory_tool_path("foo/engine/.runtime/file.json").expect("nested path"),
             "foo/engine/.runtime/file.json"
         );
+    }
+
+    /// WI#322: memory tools must not touch the engine projects tree — a
+    /// memory write under `engine/projects/*/missions/**/mission.json` is
+    /// loaded through `Mission::from_value` at boot, bypassing every
+    /// `create_mission` check. The whole tree is reserved, and traversal
+    /// (`..`) that escapes it stays an ordinary path.
+    #[test]
+    fn memory_tool_paths_reserve_engine_projects_tree() {
+        for path in [
+            "engine/projects",
+            "engine/projects/foo",
+            " engine//projects/foo/project.json/ ",
+            "engine/projects/foo/missions.json",
+            "engine/projects/foo/missions/bar/mission.json",
+            "engine/projects/foo/missions/bar/mission.json.bak",
+            "engine/projects/foo/missions/bar/other.json",
+            "engine/./projects/../projects/foo/missions/bar/mission.json",
+        ] {
+            assert!(
+                matches!(
+                    normalize_memory_tool_path(path),
+                    Err(ToolError::NotAuthorized(_))
+                ),
+                "path should be reserved: {path}"
+            );
+        }
+
+        // Near matches and escaped traversal stay ordinary paths.
+        for (path, expected) in [
+            ("engine/projects-notes.md", "engine/projects-notes.md"),
+            (
+                "projects/foo/missions/bar/mission.json",
+                "projects/foo/missions/bar/mission.json",
+            ),
+            (
+                "foo/engine/projects/file.json",
+                "foo/engine/projects/file.json",
+            ),
+            ("engine/projects/../MEMORY.md", "engine/MEMORY.md"),
+            (
+                "engine/projectz/x/mission.json",
+                "engine/projectz/x/mission.json",
+            ),
+        ] {
+            assert_eq!(
+                normalize_memory_tool_path(path).expect("ordinary path"),
+                expected,
+                "path should stay writable: {path}"
+            );
+        }
     }
 
     fn search_result(path: &str, content: &str, score: f32) -> SearchResult {
@@ -1878,6 +1947,97 @@ mod tests {
                 )
                 .await
                 .expect("near-match read");
+            assert_eq!(output.result["content"], "ordinary note");
+        }
+
+        /// WI#322: `memory_write`/`memory_read`/`memory_tree` refuse the
+        /// engine projects tree, while a legitimate memory write still
+        /// works and the seeded mission record is untouched.
+        #[tokio::test]
+        async fn mission_records_are_blocked_from_agent_memory_tools() {
+            let (workspace, _temp_dir) = setup_workspace().await;
+            let mission_path = "engine/projects/foo/missions/bar/mission.json";
+            workspace
+                .write(mission_path, "{\"original\": true}")
+                .await
+                .expect("seed mission record");
+
+            let context = JobContext::default();
+            let write = MemoryWriteTool::from_workspace(Arc::clone(&workspace));
+            for params in [
+                serde_json::json!({
+                    "content": "{\"forged\": true}",
+                    "target": " engine//projects/foo/missions/bar/mission.json/ ",
+                    "append": false,
+                }),
+                serde_json::json!({
+                    "content": "append",
+                    "target": mission_path,
+                    "append": true,
+                }),
+                serde_json::json!({
+                    "content": "layer write",
+                    "target": mission_path,
+                    "layer": "missing",
+                    "append": false,
+                }),
+                serde_json::json!({
+                    "content": "project doc",
+                    "target": "engine/projects/foo/project.json",
+                    "append": false,
+                }),
+                serde_json::json!({
+                    "content": "listing",
+                    "target": "engine/projects/foo/missions.json",
+                    "append": false,
+                }),
+            ] {
+                assert_not_authorized(write.execute(params, &context).await);
+            }
+
+            let read = MemoryReadTool::from_workspace(Arc::clone(&workspace));
+            assert_not_authorized(
+                read.execute(
+                    serde_json::json!({"path": " engine//projects/foo/missions/bar/mission.json/ "}),
+                    &context,
+                )
+                .await,
+            );
+
+            let tree = MemoryTreeTool::from_workspace(Arc::clone(&workspace));
+            assert_not_authorized(
+                tree.execute(
+                    serde_json::json!({"path": " engine//projects/foo/missions/ "}),
+                    &context,
+                )
+                .await,
+            );
+
+            // The seeded record is untouched; a legitimate memory write and
+            // read still work.
+            assert_eq!(
+                workspace
+                    .read(mission_path)
+                    .await
+                    .expect("direct mission read")
+                    .content,
+                "{\"original\": true}"
+            );
+            write
+                .execute(
+                    serde_json::json!({
+                        "content": "ordinary note",
+                        "target": "notes/ordinary.md",
+                        "append": false,
+                    }),
+                    &context,
+                )
+                .await
+                .expect("legitimate write");
+            let output = read
+                .execute(serde_json::json!({"path": "notes/ordinary.md"}), &context)
+                .await
+                .expect("legitimate read");
             assert_eq!(output.result["content"], "ordinary note");
         }
 
