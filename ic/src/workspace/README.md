@@ -327,10 +327,14 @@ documents that legitimately appear in results (for example
 `engine/knowledge/summaries/*`) carry an explicit `"provenance":
 "engine_internal"` label so they are never silently ordinary-looking memory.
 
-All agent-facing memory tools reserve `engine/.runtime/**`, the
-shadow-backup prefix `backups/`, and quarantined daily logs
+All agent-facing memory tools reserve `engine/.runtime/**`, the engine
+projects tree `engine/projects/**` (Engine-owned project documents and
+mission records — a memory write there would be loaded through
+`Mission::from_value` at boot, bypassing every `create_mission` check;
+WI#322), the shadow-backup prefix `backups/`, and quarantined daily logs
 (`daily/*.poisoned-*.md`): writes and direct reads are rejected, and tree
-listings hide all three. Direct `Workspace` APIs
+listings hide all four. The web `POST /api/memory/write` route reserves the
+same prefixes. Direct `Workspace` APIs
 remain available to the Engine for recovery. `memory_read` returns at most 6,000
 source bytes per page plus `next_offset` and a revision required for later pages;
 each response is at most 8,000 serialized bytes. `memory_tree` returns at most
