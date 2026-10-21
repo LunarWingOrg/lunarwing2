@@ -672,6 +672,137 @@ mod tests {
         assert!(!redacted.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"));
     }
 
+    // ── WI#353: GitLab PAT detection and complete Bearer redaction ──
+
+    /// The GitLab PAT prefix had no detector: an uncut token body was fully
+    /// visible (only the secret-safe cut's token-run snapping elided it at
+    /// truncation boundaries). Fixtures are built at runtime so no glpat
+    /// body exists in source (gitleaks).
+    #[test]
+    fn test_detect_gitlab_pat() {
+        let detector = LeakDetector::new();
+        let token = format!("glpat-{}", "x".repeat(20));
+        for content in [
+            format!("token: {token}"),
+            format!("GITLAB_TOKEN={token}"),
+            format!("Private-Token: {token}"),
+            token.clone(),
+        ] {
+            let result = detector.scan(&content);
+            assert!(
+                result
+                    .matches
+                    .iter()
+                    .any(|m| m.pattern_name == "gitlab_pat"),
+                "glpat- token not detected in: {content}"
+            );
+            assert!(result.should_block, "glpat- token must block: {content}");
+        }
+    }
+
+    /// The glpat- prefix alone (prose mentioning the scheme) must not match:
+    /// the body needs the 20-char minimum.
+    #[test]
+    fn test_gitlab_pat_prefix_alone_not_flagged() {
+        let detector = LeakDetector::new();
+        let result = detector.scan("the token starts with glpat- and then base64");
+        assert!(
+            !result
+                .matches
+                .iter()
+                .any(|m| m.pattern_name == "gitlab_pat"),
+            "bare glpat- prefix must not match"
+        );
+    }
+
+    /// WI#353 (BC-5): Bearer redaction used to stop at `.`, leaving a JWT's
+    /// payload and signature visible after the redaction boundary. The whole
+    /// dot-separated token must be redacted.
+    #[test]
+    fn test_redact_bearer_jwt_completely() {
+        let detector = LeakDetector::new();
+        // header.payload.signature, dot-separated base64url — built at
+        // runtime so no JWT-shaped fixture sits in source (gitleaks).
+        let jwt = format!("{}.{}.{}", "a".repeat(24), "b".repeat(24), "c".repeat(24));
+        let content = format!("Authorization: Bearer {jwt} and more text");
+
+        let result = detector.scan(&content);
+        let redacted = result.redacted_content.expect("bearer must redact");
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(
+            !redacted.contains(&jwt),
+            "full JWT must not survive redaction: {redacted}"
+        );
+        // The payload and signature specifically (the pre-WI#353 leak):
+        assert!(!redacted.contains(&format!("{}.{}", "b".repeat(24), "c".repeat(24))));
+        // Text after the token survives.
+        assert!(redacted.contains(" and more text"));
+    }
+
+    /// WI#353 (BC-5): Bearer redaction used to stop at `~`, leaving the
+    /// tilde-suffixed token tail visible.
+    #[test]
+    fn test_redact_bearer_tilde_token_completely() {
+        let detector = LeakDetector::new();
+        let token = format!("{}~", "t".repeat(30));
+        let content = format!("Bearer {token} trailing");
+
+        let result = detector.scan(&content);
+        let redacted = result.redacted_content.expect("bearer must redact");
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(
+            !redacted.contains(&token),
+            "tilde token must not survive redaction: {redacted}"
+        );
+        assert!(
+            !redacted.contains(&format!("{}~", "t".repeat(5))),
+            "token tail including tilde must be redacted"
+        );
+        assert!(redacted.contains(" trailing"));
+    }
+
+    /// The authorization-header variant redacts dot-separated values too.
+    #[test]
+    fn test_redact_auth_header_jwt_completely() {
+        let detector = LeakDetector::new();
+        let jwt = format!("{}.{}.{}", "a".repeat(24), "b".repeat(24), "c".repeat(24));
+        let content = format!("Authorization: Bearer {jwt}");
+
+        let result = detector.scan(&content);
+        assert!(
+            result
+                .matches
+                .iter()
+                .any(|m| m.pattern_name == "auth_header" || m.pattern_name == "bearer_token")
+        );
+        let redacted = result.redacted_content.expect("auth header must redact");
+        assert!(!redacted.contains(&jwt));
+        assert!(redacted.contains("[REDACTED]"));
+    }
+
+    /// Bearer base64 values with padding and URL-safe alphabet characters
+    /// are covered by the same extended value class.
+    #[test]
+    fn test_redact_bearer_base64_padding() {
+        let detector = LeakDetector::new();
+        let token = format!("{}==", "z".repeat(22));
+        let content = format!("Bearer {token}");
+
+        let result = detector.scan(&content);
+        let redacted = result.redacted_content.expect("bearer must redact");
+        assert!(!redacted.contains(&token), "padded base64 token must be redacted");
+    }
+
+    /// WI#353 asks for uncut detection plus both-cut regressions. The
+    /// uncut gitlab PAT blocks the whole output through scan_and_clean.
+    #[test]
+    fn test_scan_and_clean_blocks_gitlab_pat() {
+        let detector = LeakDetector::new();
+        let content = format!("gitlab token is glpat-{} here", "q".repeat(20));
+        let result = detector.scan_and_clean(&content);
+        assert!(result.is_err());
+    }
+
     #[test]
     fn test_scan_and_clean_blocks() {
         let detector = LeakDetector::new();
