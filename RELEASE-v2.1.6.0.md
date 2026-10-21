@@ -907,8 +907,17 @@ root-owned, symlink-free, and not group/other-writable, one untrusted tenant
 is skipped without aborting the hourly run, an existing checkout whose
 `origin` is not the operator repo is never pulled, and the worker containers
 render no Study Notes mount at all for an untrusted home, while WI#446
-(root mkdir/chown/unit writes through tenant-controlled `~/.config`)
-remains open; the rootful pebble bind-source
+(root mkdir/chown/unit writes through tenant-controlled `~/.config`) is
+fixed in-tree, open for maintainer acceptance — every systemd unit/Quadlet
+render (including the vision/voice fallback and Quadlet renderers), the
+WeeChat home creation, and the add-tenant env-dir chmod now create and
+write tenant-side through `tenant_mkdir_p` and the tenant-side atomic
+writer, with fail-closed symlink-refusal pins across the weechat
+lifecycle, vision and worker image-contract harnesses, and the config-hash
+sidecar moved out of the tenant home entirely into root-owned host state
+(`/var/lib/lunarwing/container-hashes/<tenant>/` — one recreate per hashed
+container on the first start after upgrade, then stable); the rootful
+pebble bind-source
 re-resolution WI#422 (closed 2026-10-20) is settled by the tenant-uid
 rootful launch — rootful pebble no longer runs as container root at all.
 WI#416 (partial — three of its six named sites): the trailing root `chown -R` in
@@ -1222,12 +1231,15 @@ v2.1.7.0; and WI#436 (v2.1.7.0 triage of the test-tenant failures — its
 first item, one failing note failing every hourly knowledge refresh and
 leaving `knowledge: critical`, is live in this release). The residual
 owners named in the sections above (WI#322, WI#333, WI#370, WI#383,
-WI#386, WI#387, WI#394) are open too, and so is the WI#423 re-attempt's
-follow-up WI#446 (root mkdir/chown/unit writes through tenant-controlled
-`~/.config`) — its sibling WI#445 (the root study-notes sync trusting a
-tenant-chosen `LW2STUDYMCP_HOME`) is fixed in-tree this cycle by the
-root-side sync trust gate, the rogue-origin pull refusal, and the
-worker-mount trust gate (open for maintainer acceptance). WI#400's implementation landed this cycle
+WI#386, WI#387, WI#394) are open too, and so are the WI#423 re-attempt's
+two follow-ups, both fixed in-tree this cycle and open for maintainer
+acceptance: WI#445 (the root study-notes sync trusting a tenant-chosen
+`LW2STUDYMCP_HOME`) by the root-side sync trust gate, the rogue-origin
+pull refusal, and the worker-mount trust gate; and WI#446 (root
+mkdir/chown/unit writes through tenant-controlled `~/.config`) by the
+tenant-side unit/Quadlet renders, the tenant-side WeeChat home creation
+and env-dir chmod, and the config-hash sidecar's move to root-owned host
+state. WI#400's implementation landed this cycle
 (token file handoff + task-uid split on kimi/opencode/pebble, rootless
 lanes; the rootful pebble launch has no split by design); what stays open
 is its real-worker acceptance on rebuilt images and the opencode2 lane's
@@ -1267,8 +1279,10 @@ closed on 2026-10-19, without notes. WI#422 (the rootful pebble
 re-resolution — rootful pebble now launches as the tenant uid under
 `no-new-privileges`, no credential split by design), WI#423 (mt-admin's
 remaining root reads/writes of tenant-writable env paths; its re-attempt's
-follow-up WI#446 remains open; WI#445, the study-notes sync trust gate,
-is fixed in-tree pending acceptance), and WI#389 (the docker/podman group is
+follow-ups WI#445 (the study-notes sync trust gate) and WI#446 (the
+tenant-side `~/.config` unit/Quadlet renders plus the root-state
+config-hash sidecar) are both fixed in-tree pending acceptance), and
+WI#389 (the docker/podman group is
 now opt-in everywhere, defaults off — rootless podman never needed it) were
 closed on 2026-10-20.
 
