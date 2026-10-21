@@ -53,17 +53,32 @@ export function taskSetprivArgv(identity: TaskIdentity): string[] {
   ]
 }
 
-/** WI#400 LD-11/LP-6: the privilege-dropping helper runs as root BEFORE the
- * drop, so it must be looked up on the bridge's own PATH — never resolved
- * through the child environment, which carries task-supplied values. Only
- * absolute PATH entries are considered. */
+/** WI#400 LD-11/LP-6 + WI#454/ME-1: the privilege-dropping helper runs as
+ * root BEFORE the drop, so it must be looked up on the bridge's own PATH —
+ * never resolved through the child environment, which carries task-supplied
+ * values. Only absolute PATH entries are considered. When the resolver
+ * itself runs as root (the container bridge since WI#400), a candidate the
+ * task uid could plant or rewrite — not root-owned, or sitting in a
+ * group-/world-writable directory — is SKIPPED: resolving and executing it
+ * would run task-planted code as container root. Unprivileged (host dev)
+ * runs keep the plain lookup; the ownership rule guards root only. */
 export function resolveFromBridgePath(name: string, pathEnv: string | undefined = process.env.PATH): string {
+  const enforceRootOwnership = process.geteuid?.() === 0
   for (const dir of (pathEnv ?? "").split(delimiter)) {
     if (!dir || !isAbsolute(dir)) continue
     const candidate = join(dir, name)
     try {
-      if (!statSync(candidate).isFile()) continue
+      const candidateStat = statSync(candidate)
+      if (!candidateStat.isFile()) continue
       accessSync(candidate, fsConstants.X_OK)
+      if (enforceRootOwnership) {
+        // WI#454/ME-1: root executes the resolved path — skip a candidate
+        // the task uid could plant or rewrite (not root-owned, or sitting
+        // in a group/world-writable directory).
+        if (candidateStat.uid !== 0) continue
+        const dirStat = statSync(dir)
+        if (dirStat.uid !== 0 || dirStat.mode & 0o022) continue
+      }
       return candidate
     } catch {
       continue
