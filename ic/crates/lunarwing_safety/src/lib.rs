@@ -810,6 +810,36 @@ mod tests {
             })
         }
 
+        /// Run-187 MN-1: the straddle sweep's `glpat-` entry. The body
+        /// needs three or more distinct characters or the MH-3
+        /// `is_plausible_token_body` guard skips it as documentation
+        /// filler and the sweep stops exercising the `gitlab_pat`
+        /// detector path at a cut. Both the sweep and the pin test
+        /// below build the fixture through this helper so the two can
+        /// not drift apart again.
+        fn straddle_sweep_glpat_fixture() -> String {
+            format!("glpat-{}qR", "Q".repeat(118))
+        }
+
+        /// Run-187 MN-1 pin: the sweep fixture above must reach the
+        /// `gitlab_pat` detector (not be skipped as a docs placeholder),
+        /// so a revert to a low-variety body (e.g. the run-185
+        /// `glpat-{Q×119}q` two-char form) fails here instead of
+        /// silently reducing the sweep to the cut snapper alone.
+        #[test]
+        fn straddle_sweep_glpat_fixture_is_detector_visible() {
+            let detector = LeakDetector::new();
+            let fixture = straddle_sweep_glpat_fixture();
+            let result = detector.scan(&fixture);
+            assert!(
+                result
+                    .matches
+                    .iter()
+                    .any(|m| m.pattern_name == "gitlab_pat"),
+                "straddle-sweep glpat fixture must reach the gitlab_pat detector: {fixture}"
+            );
+        }
+
         // ── Truncation at multi-byte UTF-8 boundaries ───────────────
 
         #[test]
@@ -919,7 +949,11 @@ mod tests {
                 format!("AIza{body}"),
                 format!("xoxb-{body}"),
                 format!("SG.{}.{}", &body[..22], &body[..43]),
-                format!("glpat-{}q", "Q".repeat(119)),
+                // Run-187 MN-1: the body needs three or more distinct
+                // characters or the MH-3 `is_plausible_token_body` guard
+                // skips it as documentation filler, so this entry would stop
+                // exercising the `gitlab_pat` detector path at a cut.
+                straddle_sweep_glpat_fixture(),
                 format!("{body}.{body}.{body}"),
                 format!("Authorization: Bearer {body}"),
                 format!("Bearer {body}.{body}.{body}"),
