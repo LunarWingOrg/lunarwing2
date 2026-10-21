@@ -457,7 +457,7 @@ fi
 MT_ROOTLESS=false
 CHOWN_CALL=''
 prepare_worker_workspace root kimi >/dev/null
-if [[ "$CHOWN_CALL" == "-R 10002:10002 $fixture/home/lunarwing/kimi-workspace" ]]; then
+if [[ "$CHOWN_CALL" == "-R --no-dereference 10002:10002 $fixture/home/lunarwing/kimi-workspace" ]]; then
   pass 'rootful Kimi workspace uses image UID and GID'
 else
   fail "rootful Kimi workspace ownership wrong: $CHOWN_CALL"
@@ -465,7 +465,7 @@ fi
 
 CHOWN_CALL=''
 prepare_worker_workspace root opencode >/dev/null
-if [[ "$CHOWN_CALL" == "-R 10001:10001 $fixture/home/lunarwing/opencode-workspace" ]]; then
+if [[ "$CHOWN_CALL" == "-R --no-dereference 10001:10001 $fixture/home/lunarwing/opencode-workspace" ]]; then
   pass 'rootful OpenCode workspace uses image UID and GID'
 else
   fail "rootful OpenCode workspace ownership wrong: $CHOWN_CALL"
