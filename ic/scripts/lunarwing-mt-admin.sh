@@ -70,6 +70,11 @@ RELAY_ENV_EXEC="/usr/local/libexec/lunarwing-relay-env-exec"
 OPENRC_INITD_DIR="${LUNARWING_MT_OPENRC_INITD_DIR:-/etc/init.d}"
 OPENRC_CONFD_DIR="${LUNARWING_MT_OPENRC_CONFD_DIR:-/etc/conf.d}"
 OPENRC_PROXY_BACKUP_DIR="${LUNARWING_MT_OPENRC_PROXY_BACKUP_DIR:-/var/lib/lunarwing/openrc-proxy-backups}"
+# WI#446 (run-174 LW-3): config-hash sidecars are mt-admin's own bookkeeping,
+# so they live in root-owned host state, not the tenant-controlled ~/.config
+# chain (root writes there followed tenant-planted symlinks; and tenant-side
+# sidecars written by an older mt-admin were root-owned and unupdatable).
+CONTAINER_HASH_DIR="${LUNARWING_MT_CONTAINER_HASH_DIR:-/var/lib/lunarwing/container-hashes}"
 OPENRC_RUNLEVELS_DIR="${LUNARWING_MT_OPENRC_RUNLEVELS_DIR:-/etc/runlevels}"
 TEMPLATES_DIR="${SCRIPT_DIR}/templates"
 # WI#330: no built-in default — the historical developer-LAN address was
