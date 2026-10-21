@@ -224,7 +224,9 @@ create_tenant_user() {
     "$lw_root/state/xmpp" \
     "$lw_root/logs" \
     "$lw_root/run"
-  chmod 0700 "$lw_root/env"
+  # WI#446 (run-166 LF-8): root's chmod followed a tenant-planted symlink at
+  # the env dir name — run it as the tenant, the directory's owner.
+  sudo -u "$name" chmod 0700 -- "$lw_root/env"
   say "created directories under $lw_root"
 
   ensure_tenant_wasm_toolchain "$name" || true

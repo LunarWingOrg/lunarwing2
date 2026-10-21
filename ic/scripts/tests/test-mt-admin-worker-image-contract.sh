@@ -116,6 +116,45 @@ mkdir -p "$fixture/env" "$fixture/home" "$fixture/quadlets" "$fixture/workspace"
 env_file="$fixture/env/lunarwing.env"
 printf 'GATEWAY_AUTH_TOKEN=fixture\n' >"$env_file"
 : >"$fixture/env/kimi-runtime.env"
+# WI#446 (run-174 LW-3): the config-hash sidecar lives in root-owned host
+# state ($CONTAINER_HASH_DIR/<tenant>/), not the tenant home; the harness
+# points it at the fixture.
+# shellcheck disable=SC2034  # read by the sourced _hash_dir
+CONTAINER_HASH_DIR="$fixture/container-hashes"
+# Tenant-side unit/env writers in the exercised lanes drop privileges via
+# `sudo -u`. The fixture tenant is not a real account (and CI runs
+# no-new-privileges), so the drop maps onto the invoking user; `command`
+# bypasses the harness's fake-runtime function stubs for the dropped call.
+sudo() {
+  if [[ "${1:-}" == "-u" ]]; then shift 2; fi
+  command "$@"
+}
+
+# WI#446 (run-174 LW-3): the sidecar directory must live OUTSIDE the tenant
+# home (root-owned host state), and a stale sidecar left by an older mt-admin
+# must stay updatable — the !1807 tenant-side writer could never update the
+# old root-owned sidecars, so every start force-recreated the container.
+wi446_hash_dir="$(_hash_dir alice)"
+case "$wi446_hash_dir" in
+  "$fixture/container-hashes/alice") pass "hash sidecar lives in host state, not the tenant home (WI#446)" ;;
+  *) fail "hash sidecar lives in host state, not the tenant home (WI#446) (got: $wi446_hash_dir)" ;;
+esac
+case "$wi446_hash_dir" in
+  "$(tenant_home alice)"/*) fail "hash sidecar path must not resolve under the tenant home (WI#446)" ;;
+  *) pass "hash sidecar path does not resolve under the tenant home (WI#446)" ;;
+esac
+# A pre-existing (e.g. root-owned, from the old writer) sidecar is updated in
+# place: after the store, the config no longer reports changed.
+command mkdir -p "$wi446_hash_dir"
+printf 'stale\n' >"$wi446_hash_dir/lunarwing-stale-probe-alice.hash"
+_store_container_hash alice lunarwing-stale-probe-alice "$env_file" 2>/dev/null
+if [[ "$(<"$wi446_hash_dir/lunarwing-stale-probe-alice.hash")" != "stale" ]] \
+  && ! _container_config_changed alice lunarwing-stale-probe-alice "$env_file"; then
+  pass "a stale sidecar is updated in place, not stuck (WI#446 LW-3)"
+else
+  fail "a stale sidecar is updated in place, not stuck (WI#446 LW-3)"
+fi
+command rm -rf "$wi446_hash_dir"
 
 base_contract() {  # <worker>: the rootless-podman base contract the lane uses
   case "$1" in
@@ -277,14 +316,11 @@ fi
 
 # WI#423 (run-171, the merge with !1784): the rootful create path below is the
 # one scenario in this harness that reaches the tenant-side credential reader,
-# which drops to the tenant with `sudo -u`. The fixture tenant is not a real
-# account (and CI runs no-new-privileges), so the drop maps onto the invoking
-# user, and the fixture env takes the production shape the tenant-side checks
-# demand: 0700 dir, 0600 file, the scoped worker credential present.
-sudo() {
-  if [[ "${1:-}" == "-u" ]]; then shift 2; fi
-  command "$@"
-}
+# which drops to the tenant with `sudo -u`. The mapping stub is defined once
+# in the fixture setup above (WI#446 moved it there so the config-hash
+# sidecar's tenant-side writes are covered too); the fixture env takes the
+# production shape the tenant-side checks demand: 0700 dir, 0600 file, the
+# scoped worker credential present.
 chmod 700 "$fixture/env"
 chmod 600 "$env_file"
 printf 'WORKER_AUTH_TOKEN=fixture-worker\n' >>"$env_file"

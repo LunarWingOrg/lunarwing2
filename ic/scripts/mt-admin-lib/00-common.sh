@@ -208,8 +208,13 @@ tenant_run_dir() { printf '%s/run' "$(tenant_lw_root "$1")"; }
 # container was last created. If they differ, force-recreate the container.
 # The hash is stored in a sidecar file next to the container's quadlet/state.
 
-# Directory for config-hash sidecars (created on first use).
-_hash_dir() { printf '%s/.config/lunarwing/container-hashes' "$(tenant_home "$1")"; }
+# Directory for config-hash sidecars (created on first use). The sidecar is
+# mt-admin's own state, so it lives in root-owned host state, not the
+# tenant-controlled ~/.config chain (WI#446, run-174 LW-3): root's historical
+# mkdir/printf under ~/.config followed pre-placed symlinks, and the root-owned
+# sidecars the old writer left on upgraded tenants could never be updated by a
+# tenant-side writer (every start then force-recreated the container).
+_hash_dir() { printf '%s/%s' "$CONTAINER_HASH_DIR" "$1"; }
 
 # Hash a config file with an optional launch contract for arguments that are not
 # represented in that file. Empty contracts retain the historical file hash.
@@ -226,12 +231,20 @@ _container_config_hash() {  # <config-file> [launch-contract]
 
 # Compute and store the hash of a config file (e.g. a .container quadlet).
 # Usage: _store_container_hash <tenant> <container-name> <config-file> [launch-contract]
+# WI#446 (run-174 LW-3): written as root into root-owned host state (see
+# _hash_dir), so no tenant-controlled path component is ever followed and the
+# sidecar stays updatable across upgrades. A store failure is non-fatal by
+# design: without a stored hash every start recreates the container (the
+# fail-safe direction for a sidecar) until the write succeeds.
 _store_container_hash() {
   local name="$1" container="$2" config_file="$3" contract="${4:-}" hdir hash
   hdir="$(_hash_dir "$name")"
-  mkdir -p "$hdir" 2>/dev/null || true
   hash="$(_container_config_hash "$config_file" "$contract" || true)"
-  [[ -n "$hash" ]] && printf '%s\n' "$hash" >"$hdir/${container}.hash"
+  [[ -n "$hash" ]] || return 0
+  if ! mkdir -p -- "$hdir" 2>/dev/null \
+    || ! printf '%s\n' "$hash" >"$hdir/${container}.hash" 2>/dev/null; then
+    say "WARNING: could not store the config hash sidecar for $container (tenant '$name'); starts will recreate the container until the sidecar can be written" >&2
+  fi
 }
 
 # Check whether the config file's hash matches the stored hash.

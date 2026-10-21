@@ -53,6 +53,11 @@ OPENRC_ENV_EXEC="$FIXTURE/env-exec"
 OPENRC_PROXY_BACKUP_DIR="$FIXTURE/backup-units"
 env_dir="$(tenant_env_dir)"
 mkdir -p "$env_dir" "$(tenant_lw_root)/tensorzero-proxy-configurations"
+if [[ "$EUID" -eq 0 ]]; then
+  # WI#446: unit renders create ~/.config tenant-side, so the fixture home
+  # must be the tenant's, as on a real host.
+  chown "$TENANT:$(id -gn "$TENANT")" "$(tenant_home)"
+fi
 chmod 0700 "$env_dir"
 cp "$TEST_REPO_ROOT/ic/scripts/lunarwing-openrc-env-exec.sh" "$OPENRC_ENV_EXEC"
 chmod 0755 "$OPENRC_ENV_EXEC"

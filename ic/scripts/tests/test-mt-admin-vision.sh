@@ -165,6 +165,26 @@ assert_contains "$fallback_text" 'Environment=XDG_RUNTIME_DIR=/run/user/1001' "f
 assert_contains "$fallback_text" "ExecStart=$helper lunarwing-vision-alpha" "fallback unit supervises podman wait"
 assert_contains "$fallback_text" 'Restart=always' "fallback unit restarts babysitter"
 
+# WI#446: the vision Quadlet and fallback unit are committed tenant-side, so a
+# tenant-planted symlink at a ~/.config component (for example
+# ~/.config/containers pointing at the rootful Quadlet directory) must refuse
+# the render and leave nothing behind the link.
+wi446_redirect="$ROOT/wi446-redirect"
+for wi446_case in containers:render_vision_quadlet systemd:render_vision_systemd_fallback_unit; do
+  wi446_link="$(tenant_home alpha)/.config/${wi446_case%%:*}"
+  command mkdir -p "$wi446_redirect"
+  command mv "$wi446_link" "$wi446_link.real"
+  command ln -s "$wi446_redirect" "$wi446_link"
+  if ("${wi446_case#*:}" alpha) >/dev/null 2>&1 || [[ -n "$(command ls -A "$wi446_redirect")" ]]; then
+    fail "${wi446_case#*:} refuses a symlinked ~/.config/${wi446_case%%:*} (WI#446)"
+  else
+    pass "${wi446_case#*:} refuses a symlinked ~/.config/${wi446_case%%:*} (WI#446)"
+  fi
+  command rm -f "$wi446_link"
+  command mv "$wi446_link.real" "$wi446_link"
+  command rm -rf "$wi446_redirect"
+done
+
 # ── OpenRC registration includes direct health unit and crash supervisor ─────
 
 render_vision_openrc_unit() { CALLS+=("render-openrc:$1"); }
