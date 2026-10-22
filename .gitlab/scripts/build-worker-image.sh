@@ -230,11 +230,20 @@ metadata_digest() {
 # jwt/auth token per push, and several worker candidates pushing at once trip
 # GitLab's 429 rate limit at the very last step — pipeline 5984 lost the
 # opencode, opencode2 and kimi candidates (and, by cascade, their scans) to
-# one such burst. The build is deterministic and the retry reuses the layer
-# cache, so only the narrow observed transient signature is retried; a
-# genuine build failure exits on the first attempt. The publication jobs keep
-# their pinned `retry: 0` (no blind whole-job re-run) — this retry fires only
-# inside the job and only on the rate-limit signature.
+# one such burst, and pipeline 6212 lost the kimi candidate to a sustained
+# 429 burst that outlasted the original 4-attempt/3-minute window. The build is
+# deterministic and the retry reuses the layer cache, so only the narrow
+# observed transient signature is retried; a genuine build failure exits on
+# the first attempt. The publication jobs keep their pinned `retry: 0` (no
+# blind whole-job re-run) — this retry fires only inside the job and only on
+# the rate-limit signature.
+#
+# Exponential backoff with jitter desynchronizes concurrent worker pushes:
+# when kimi/opencode/opencode2 all hit the 429 at once, identical delays
+# would make them retry in lockstep and re-trip the rate limit together.
+# The PID-based jitter spreads them apart so each retry lands in a different
+# second, reducing the chance of a coordinated burst.
+_bwr_max_attempts=6
 push_attempt_log="$CI_PROJECT_DIR/.worker-push-attempt.log"
 push_attempt_rc="$CI_PROJECT_DIR/.worker-push-attempt.rc"
 
@@ -247,7 +256,7 @@ build_image_with_retry() {
     _bwr_meta=$2
     _bwr_clean=$3
     _bwr_attempt=1
-    while [ "$_bwr_attempt" -le 4 ]; do
+    while [ "$_bwr_attempt" -le "$_bwr_max_attempts" ]; do
         : > "$push_attempt_rc"
         # tee keeps the build streaming into the job trace; the brace group
         # records build_image's real exit status because the pipeline's own
@@ -259,13 +268,15 @@ build_image_with_retry() {
             return 0
         fi
         IFS= read -r _bwr_status < "$push_attempt_rc"
-        if [ "$_bwr_attempt" -lt 4 ] && transient_push_failure; then
-            _bwr_delay=$((_bwr_attempt * 30))
-            echo "registry push attempt $_bwr_attempt/4 hit a transient registry-auth error; retrying in ${_bwr_delay}s" >&2
+        if [ "$_bwr_attempt" -lt "$_bwr_max_attempts" ] && transient_push_failure; then
+            _bwr_base=$((30 * (1 << (_bwr_attempt - 1))))
+            _bwr_jitter=$(( ($$ % 15) + 1 ))
+            _bwr_delay=$((_bwr_base + _bwr_jitter))
+            echo "registry push attempt $_bwr_attempt/$_bwr_max_attempts hit a transient registry-auth error; retrying in ${_bwr_delay}s" >&2
             sleep "$_bwr_delay"
             _bwr_attempt=$((_bwr_attempt + 1))
         else
-            echo "image build attempt $_bwr_attempt/4 failed (exit $_bwr_status); not retrying" >&2
+            echo "image build attempt $_bwr_attempt/$_bwr_max_attempts failed (exit $_bwr_status); not retrying" >&2
             rm -f "$push_attempt_log" "$push_attempt_rc"
             return "$_bwr_status"
         fi

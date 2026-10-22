@@ -223,15 +223,16 @@ pushed at once; every job went green on retry).
 This is GitLab rate-limiting the registry auth realm when several candidates
 fetch push tokens concurrently. Since 2026-10-18
 `.gitlab/scripts/build-worker-image.sh` wraps both image pushes (candidate
-and clean rebuild) in a bounded retry — up to 4 attempts with 30s/60s/90s
-backoff — that fires only on this transient signature
+and clean rebuild) in a bounded retry — up to 6 attempts with exponential
+backoff (30/60/120/240/480s) plus PID-based jitter to desynchronize
+concurrent worker pushes — that fires only on this transient signature
 (`failed to fetch oauth token` / `429 Too Many Requests`); the build is
 deterministic and the retry reuses the layer cache, so only the push is
 re-executed, and a genuine build failure still exits on the first attempt.
 The publication jobs keep their pinned `retry: 0` (no blind whole-job
 re-run); the retry contract is pinned by hermetic stubbed tests in
 `.gitlab/tests/test_worker_build_args.py`. If a candidate still fails after
-all four attempts, wait a few minutes and re-run the job manually — the scan
+all six attempts, wait a few minutes and re-run the job manually — the scan
 follows once a candidate publishes `worker-image.env`.
 
 ## worker-kimi digest mismatch (directory mtime flake)
