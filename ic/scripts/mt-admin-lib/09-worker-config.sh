@@ -1982,20 +1982,18 @@ prepare_worker_workspace() {
     # same skip rule in 0.1s on a 10K-entry tree). Skip regular files
     # with a link count above 1 so a tenant-planted hard link to an
     # outside file keeps its owner (the run-170 LP-9 class).
-    # MV-4: run the cd and walk in a subshell so the caller's working
-    # directory is untouched and a failed cd cannot leave the shell
-    # inside the workspace.
-    if ! (
-      command cd -- "$workspace_dir" 2>/dev/null || {
-        printf 'error: cannot enter %s workspace: %s\n' "$worker" "$workspace_dir" >&2
-        exit 1
-      }
-      chown --no-dereference "$container_uid:$container_gid" .
-      find . -mindepth 1 ! \( -type f -links +1 \) \
-        -exec chown --no-dereference "$container_uid:$container_gid" {} +
-    ); then
+    # MV-4: save and restore the caller's working directory so the cd
+    # into the workspace does not leak to the caller.
+    local _save_pwd
+    _save_pwd="$PWD"
+    if ! command cd -- "$workspace_dir" 2>/dev/null; then
+      printf 'error: cannot enter %s workspace: %s\n' "$worker" "$workspace_dir" >&2
       return 1
     fi
+    chown --no-dereference "$container_uid:$container_gid" .
+    find . -mindepth 1 ! \( -type f -links +1 \) \
+      -exec chown --no-dereference "$container_uid:$container_gid" {} +
+    command cd -- "$_save_pwd" 2>/dev/null || true
   fi
   tenant_chmod "$name" 2770 "$workspace_dir" || return 1
   printf '%s\n' "$workspace_dir"
