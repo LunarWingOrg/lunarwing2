@@ -551,6 +551,20 @@ command mkdir -p "$mi3_stub_bin"
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\nexit 0\n' "$mi3_chown_log" \
   >"$mi3_stub_bin/chown"
 command chmod +x "$mi3_stub_bin/chown"
+# NB-8 (run-195 review): a stub that cannot EXECUTE decides the test's
+# verdict by accident — on a noexec /tmp the `find -exec` falls through to
+# the REAL chown and the walk assertions grade the environment, not the
+# code (the dev-VM "MI-3 failure" was exactly this artifact). Verify the
+# stub actually runs before trusting the pins below; skip the stub-derived
+# assertions with a named reason when the fixture tempdir is noexec.
+mi3_probe_rc=0
+"$mi3_stub_bin/chown" __nb8-probe__ 2>/dev/null || mi3_probe_rc=$?
+if grep -Fq '__nb8-probe__' "$mi3_chown_log"; then
+  mi3_stub_exec=yes
+else
+  mi3_stub_exec=no
+  pass 'MI-3: stub assertions SKIPPED — fixture tempdir cannot execute stubs (noexec mount; NB-8); environment artifact, not a code verdict'
+fi
 # Two chown channels: the top-dir `chown ... .` resolves to the shell-
 # function mock above (functions shadow PATH), while `find -exec chown`
 # execs the binary, which hits the PATH stub and is logged.
@@ -586,14 +600,11 @@ unset mi3_outside mi3_outside_file mi3_stub_bin mi3_chown_log mi3_status
 # function (harness dies, no PASS line, rc != 1), and in a suppressed-errexit
 # call context (cmd || status=$?, the shape used here and by the daemon-facing
 # callers) the same failure is silently swallowed and the function "succeeds"
-# with the ownership never handed over — the dev-VM MI-3 stub on a noexec /tmp
-# reproduced exactly that silent swallow before the guard. The harness's
-# chown() function mock swallows failures too (it shadows PATH), so it is
-# unset for this block only and restored after: with the mock active the top
-# -dir chown can never fail and the pin could not fire at all. The PATH stub
-# then makes the real chown binary exit 1 in every uid shape (as the invoking
-# user the stub's exit 1 needs no privileges). The caller's working directory
-# must be restored on that exit path (MV-4).
+# with the ownership never handed over — the reviewer's noexec reproduction
+# (NB-8, run-195) confirmed the suppressed-errexit silent swallow shape as a
+# real hazard, though the dev-VM MI-3 occurrence itself was later attributed
+# to the noexec environment, not production code (see the WI#461 block's
+# self-skip guard above).
 wi461_stub_bin="$fixture/wi461-stub-bin"
 command mkdir -p "$wi461_stub_bin"
 printf '#!/usr/bin/env bash\nexit 1\n' >"$wi461_stub_bin/chown"
@@ -618,6 +629,60 @@ else
 fi
 command rm -rf -- "$wi461_stub_bin"
 unset wi461_stub_bin wi461_save_pwd wi461_status
+
+# WI#461 (NB-9, run-195 review): the walk guard needs its own pin. The block
+# above stubs chown to fail on EVERY call, so the function refuses at the
+# FIRST guard (the top-dir chown) and the `find -exec` walk's guard never
+# runs — removing only the walk guard left the suite green. This case stubs
+# chown to SUCCEED for the top-level `.` call (args ending in " .") and FAIL
+# for the walk's per-entry calls, then asserts the walk refusal: clean rc 1
+# plus the "workspace contents" message naming the second guard. Mutation:
+# removing the walk's `if !` guard fails this pin (the function returns 0
+# and the message never prints).
+wi461b_stub_bin="$fixture/wi461b-stub-bin"
+command mkdir -p "$wi461b_stub_bin"
+cat >"$wi461b_stub_bin/chown" <<EOF
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  if [[ "\$arg" == "." ]]; then
+    exit 0
+  fi
+done
+exit 1
+EOF
+command chmod +x "$wi461b_stub_bin/chown"
+# Populate the workspace BEFORE running: with an empty directory `find .
+# -exec chown` never invokes chown at all (find exits 0 with no work), the
+# walk guard is trivially satisfied, and the pin cannot fire. A plain file
+# in the workspace forces the walk to call the per-entry chown (which is
+# exactly what MI-3 pins — the empty-workspace shortcut is not the real
+# production shape; tenant workspaces have content).
+command mkdir -p "$fixture/home/lunarwing/kimi-workspace"
+printf 'nb9\n' >"$fixture/home/lunarwing/kimi-workspace/plaintest.bin"
+wi461b_save_pwd="$PWD"
+wi461b_status=0
+wi461b_out=""
+unset -f chown
+wi461b_out="$(PATH="$wi461b_stub_bin:$PATH" prepare_worker_workspace root kimi 2>&1)" || wi461b_status=$?
+chown() { CHOWN_CALL="$*"; }
+if [[ "$wi461b_status" -eq 1 ]]; then
+  pass 'WI#461: walk chown failure refuses cleanly (rc 1 from the SECOND guard, not a set -e abort)'
+else
+  fail "WI#461: walk chown failure rc=$wi461b_status (expected clean rc 1 refusal from the walk guard)"
+fi
+if [[ "$wi461b_out" == *"cannot chown kimi workspace contents"* ]]; then
+  pass 'WI#461: walk refusal reports the workspace-contents guard (NB-9)'
+else
+  fail "WI#461: walk refusal message missing/ambiguous: $wi461b_out"
+fi
+if [[ "$PWD" == "$wi461b_save_pwd" ]]; then
+  pass 'WI#461: walk refusal restores the caller working directory'
+else
+  fail "WI#461: caller PWD leaked after walk refusal: $PWD"
+fi
+command rm -rf -- "$wi461b_stub_bin"
+command rm -f -- "$fixture/home/lunarwing/kimi-workspace/plaintest.bin"
+unset wi461b_stub_bin wi461b_save_pwd wi461b_status wi461b_out
 
 cat >"$fixture/env/legacy.env" <<'EOF'
 KIMI_API_KEY='key\\with\'quote'

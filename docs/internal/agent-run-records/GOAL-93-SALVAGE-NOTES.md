@@ -15,9 +15,12 @@ check-off (`8f8d3eebc`). Key corrections made to the salvage:
    "stub log stayed empty / pin didn't fire" mid-debug mystery from
    the timeout run was exactly this.
 2. The pre-existing MI-3 harness failure on the noexec-/tmp dev VM was
-   the WI#461 hole LIVE (suppressed-errexit silent swallow) — the
-   guarded fix makes it pass without touching the stub, so the kimi
-   harness is now 140/140.
+   RETRACTED as a WI#461 causal claim by run-195 review (NB-8): it is a
+   TEST-ENVIRONMENT artifact (the stub cannot execute from a noexec
+   tempdir, so `find -exec` falls through to the real chown). The harness
+   stub-derived pins now self-skip with a named reason on noexec
+   tempdirs. The WI#461 guard stands on its own merits (clean rc-1
+   refusals + PWD restore).
 
 The stash `stash@{0}` ("item-93 WI#461 chown-guard work ...") is
 superseded by the landed commits and can be dropped by an operator.

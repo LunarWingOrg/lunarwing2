@@ -78,32 +78,45 @@ carried `USER unset`; kimi's stale copies carry the *old task uid*.
    refusal, PWD restore on every exit path (MV-4), and two mutation-verified
    pins in `test-mt-admin-kimi.sh`. Harness now 140/140.
 
-3. **WI#462 (LOW, assigned): task-uid PATH ordering pinned.**
+3. **WI#462 (LOW, assigned): task-uid PATH ordering — REORDERED per run-195 review (NB-10).**
    The executor's task toolchain PATH
-   (`kimicode4lunarwing/scripts/kimi_task_executor.ts:351-361`) deliberately
-   prepends task-uid-writable dirs ahead of the ME-1-pinned root-owned dirs —
-   the inverse of the bridge-side ordering. The justification is now a
-   comment block naming WI#462: this PATH is only ever used by code that
-   already runs as the task uid (setpriv has already dropped), so a planted
-   `node`/`python` shim gains no privilege it did not already have, and the
-   toolchain must resolve from the task's own directories first. The bridge
-   never resolves through this PATH (setpriv and the kimi binary come from
-   the bridge PATH).
+   (`kimicode4lunarwing/scripts/kimi_task_executor.ts`) now appends the
+   task-uid-writable dirs AFTER the ME-1-pinned root-owned dirs — the same
+   posture as the bridge PATH. The original task-first ordering (and its
+   "task could shadow root's binaries" rationale) was backwards: task-first
+   is what lets one task's leftovers (a planted `node`, a rewritten entry
+   point) become the tools every LATER task resolves — including the kimi
+   CLI's own env-node interpreter lookup. Root-first ordering keeps the
+   task toolchain working (names root does not ship still resolve from the
+   task dirs) while removing the cross-task shadowing residual. A new pin
+   asserts the root-first order in the recorded child env (mutation-checked).
 
-4. **WI#463 (INFO, assigned): bare-name `kimi` resolution at the drop.**
+4. **WI#463 (INFO, assigned): bare-name `kimi` resolution at the drop — FAIL-CLOSED per run-195 review (NB-11).**
    `kimiBin()` returned a bare `kimi` that the *task-side* PATH would resolve
    after the setpriv drop. New `taskKimiBin()`: a bare name resolves through
    the **bridge's own PATH** (root-ownership-checked via
    `resolveFromBridgePath` when the resolver runs as root — the same
    treatment setpriv gets, WI#400 LD-11); an absolute `KIMI_BIN` (every
-   operator/test override) passes through unchanged. Mutation-verified pins
-   for both shapes; kimi TS suite 113/113 non-root, 109 pass / 4 skipped
-   (documented real-CLI lane) root-shaped.
+   operator/test override) passes through unchanged. **Amended by NB-11:**
+   the original catch-and-fallback returned the bare name when the bridge
+   lookup missed — sending setpriv down the child PATH, the lookup WI#463
+   exists to avoid. The pinned path now FAILS the task when the bridge
+   lookup fails (mutation-verified: restoring the fallback fails the pin).
 
-## Temporary test tenant verification (`kimi93test`)
+## Temporary test tenant verification (`kimi93test` — superseded by the full stale-image reproduction, 2026-10-22 run-195 review)
 
-Per the goals item, the fixes were exercised on a temporary test tenant
-provisioned for this item on the Gentoo dev VM (OpenRC, rootless podman):
+The first verification pass (tenant `kimi93test` on the Gentoo dev VM, torn
+down after use) established that a freshly-built image boots, hands over the
+WS handshake with the scoped bearer, and reports ready — but it never
+reproduced the FAILURE (the tenant was created fresh with the rebuilt image,
+so there was no stale image to heal; NB-7). The full failure→fix chain was
+reproduced afterwards on this host (Sigma, kernel 6.18.54-gentoo); see the
+next section. WI#456 itself was reported on a Fedora host (kernel
+7.2.9-100.fc43.x86_64 per the WI body — a different box from both
+verification hosts; the stale-image class is host-independent because it
+lives in mt-admin's image-distribution logic, not in any host kernel).
+
+### What the first pass DID establish (still valid)
 
 ```bash
 sudo bash ic/scripts/lunarwing-mt-admin.sh add-tenant kimi93test \
@@ -114,47 +127,68 @@ sudo bash ic/scripts/lunarwing-mt-admin.sh add-tenant kimi93test \
 sudo bash ic/scripts/lunarwing-mt-admin.sh start-tenant kimi93test
 ```
 
-- Port block 10030-10039 (base) + kimi dedicated range: **kimi_wss 30030,
-  kimi_health 30031**.
-- Image: freshly built `lunarwing-worker-kimi:latest` (slim, revision
-  `df89b66d6` — this branch's head, carrying WI#462/WI#463), `USER 0:0`,
-  distributed into the tenant's rootless store by `_ensure_tenant_image`.
-- `start-tenant` output: `kimi worker ready (lunarwing-kimi-kimi93test,
-  WSS port 30030)`; OpenRC unit registered + babysitter attached;
-  `mt-admin status kimi93test` → `Kimi worker: running`.
-- Container identity: `podman exec … id` → **uid=0(root)**, with
-  `KIMI_TASK_UID/GID=10002` driving the setpriv task drop.
-- Daemon-side route: `/home/kimi93test/lunarwing/state/config.toml` carries
-  `name = "kimi"`, `url = "ws://127.0.0.1:30030/ws/agent"`,
-  `auth_token = <scoped WORKER_AUTH_TOKEN>`, `timeout_ms = 14400000`.
-- **Handshake as the daemon dials it**: `curl -i` upgrade request with
-  `Sec-WebSocket-Protocol: lunarwing-agent-v1` and the scoped bearer →
-  **HTTP/1.1 101 Switching Protocols**. With a wrong bearer the bridge
-  answers 401 before the upgrade — auth is enforced. This exercises the
-  exact `connect_and_handshake` code path (`ic/src/orchestrator/external_worker.rs`)
-  whose failure produced WI#456's `External worker 'kimi' connection
-  failed: IO error: Connection refused (os error 111)` — the error is
-  gone with the rebuilt image.
-- **Readiness**: `curl http://127.0.0.1:30031/ready` →
-  `{"ready": true, … "websocket": {"listening": true, "port": 30030,
-  "path": "/ws/agent"}}`.
-- The daemon binary was built (`build-tenant kimi93test`) and started; its
-  boot logged `External workers configured: kimi, pebble, opencode` with
-  the live socket behind the route. A full LLM-driven
-  `create_job(mode: "kimi")` chat turn was attempted through
-  `/api/chat/send`; the turn reached the daemon and **failed at the LLM
-  upstream step** — this dev VM's TensorZero upstream answers `/health`
-  200 but its model providers return 401 (the fleet's live credentials are
-  not provisioned here; the same limitation every deploy-gated item
-  records). The dispatch-level failure of WI#456 lives in the WS connect,
-  which is verified end-to-end above; the LLM round-trip remains
-  deploy-gated like the item-69/!1783 real-worker acceptance evidence.
+- Image `USER 0:0`, container root with the setpriv task drop
+  (`KIMI_TASK_UID/GID=10002`), `kimi worker ready`.
+- Daemon boot logged `External workers configured: kimi, pebble, opencode`.
+- WS upgrade with `Sec-WebSocket-Protocol: lunarwing-agent-v1` + scoped
+  bearer → **101**; wrong bearer → 401. `/ready` → true.
+- LLM-driven `create_job` attempt failed at the LLM upstream (dev VM's
+  TensorZero has no model-provider credentials — deploy-gated, same class
+  as the item-69/!1783 acceptance evidence).
 
-Teardown: `sudo bash ic/scripts/lunarwing-mt-admin.sh remove-tenant
-kimi93test --purge` (the tenant, its user, ports block, and containers are
-removed; the rebuilt `lunarwing-worker-kimi:latest` stays in the rootful
-admin store for the fleet — scootaloo's next start-tenant will pick it up
-via `_ensure_tenant_image` and force-recreate its stale container).
+## Full failure→fix reproduction (NB-7 remediation, Sigma host, 2026-10-22)
+
+The reviewer's recipe, executed end-to-end with a temporary tenant
+(`dingo`, registry `source: autonomous-test`, purged after):
+
+**Seed (the BEFORE state):**
+1. `add-tenant dingo --with-kimi` (fresh tenant, no start yet).
+2. The tenant's rootless store was seeded with the ACTUAL stale pre-WI#400
+   artifact: `lunarwing-worker-kimi:latest` image `13da3b7dad6f`
+   (`USER 10002:10002`, built 2026-10-16) saved out of tenant `scootaloo`'s
+   store — the same image class the original diagnosis found — and loaded
+   into dingo's store under the same tag.
+3. The admin store's kimi image was untagged (saved to tar first), arming
+   `_ensure_tenant_image`'s stale-accept branch: tenant holds an image, the
+   admin store has none → the tenant's stale copy stays in play.
+
+**Stage 1 — the failure, captured live:**
+4. `start-tenant dingo` → `start_tenant_kimi`'s image-user guard **died
+   exactly as diagnosed**:
+   `error: kimi worker image has user '10002:10002', expected 0:0 (WI#400
+   root entrypoint; tasks drop to 10002); rebuild it`
+5. The kimi container was never created; the daemon-side config route
+   (`ws://127.0.0.1:30030/ws/agent`, rendered at add-tenant) stayed hot
+   against a socket with **nothing listening** — dialing it returned
+   **connection refused (os error 111)**, the exact WI#456 signature.
+6. The tenant services that had already started (pg/vision/weechat/xmpp/
+   daemon) kept running — WI#456's "no kimi ERROR lines, dead socket at
+   dispatch" shape reproduced in full.
+
+**Stage 2 — the fix, captured live:**
+7. The admin store's rebuilt image (`562a224f491b`, `USER 0:0`, revision
+   `87dc5bc98`) was restored.
+8. `start-tenant dingo` again → mt-admin **detected the stale image and
+   refreshed it** (`refreshing stale image lunarwing-worker-kimi:latest in
+   dingo's rootless store`), distributed the new image (`dingo` store
+   inspected: `USER=0:0`, ID `562a224f…`), **force-created the container on
+   the new image ID**, and reported `kimi worker ready (lunarwing-kimi-dingo,
+   WSS port 30030)`.
+9. WS upgrade with the scoped bearer → **HTTP/1.1 101 Switching
+   Protocols**; `/ready` → `ready: true, websocket.listening: true`. The
+   daemon booted with `External workers configured: pebble, kimi, opencode`.
+10. The dead socket became a live one **without any manual container
+    surgery** — the "image distribution + image-ID launch contract
+    self-heal" claim is now demonstrated, not just argued.
+
+**Teardown:** `remove-tenant dingo --purge` (tenant, user, ports block,
+containers removed; boot cgroup file re-rendered with the survivors).
+
+**Scootaloo (the originally-diagnosed stale-image holder) was left as
+found, per NB-7's note — its next `start-tenant` picks up the rebuilt
+image via the same demonstrated path.** Tenants known to hold stale kimi
+images at the time of writing: `scootaloo` (13da3b7, now demonstrably
+self-healing).
 
 ## What this item does NOT change
 
@@ -167,19 +201,35 @@ via `_ensure_tenant_image` and force-recreate its stale container).
 - The daemon's `ExternalWorkerConnectionFailed` path is unchanged — with a
   healthy worker the connection succeeds (verified 101).
 
-## Verification summary
+## Verification summary (updated for the run-195 review fixes)
 
-- `ic/scripts/tests/test-mt-admin-kimi.sh`: **140/140** (was 138 PASS + the
-  MI-3 stub failure — that failure was the WI#461 hole live; now fixed and
-  pinned).
+- `ic/scripts/tests/test-mt-admin-kimi.sh`: **144/144** (140 before the
+  review round; +2 NB-9 walk-guard pins, +1 stub-exec guard, +1 fixture
+  cleanup line accounted for in the pass count).
+- **NB-8 correction (MI-3 causal claim):** the reviewer reproduced the
+  dev-VM MI-3 failure with a noexec tempdir and showed it is a TEST-
+  ENVIRONMENT artifact, not the WI#461 hole — the stub cannot execute from
+  a noexec directory, so `find -exec` falls through to the real `chown`
+  and the walk assertion grades the environment. This head reproduces the
+  reviewer's numbers exactly (138→139 PASS / 2 FAIL under noexec, full
+  pass with an exec-able tempdir). The earlier claim that "the MI-3
+  failure was the WI#461 hole live" is RETRACTED; the WI#461 guard remains
+  valuable for its actual purpose (clean refusals + PWD restore), and the
+  harness stub-derived pins now SELF-SKIP with a named reason when the
+  fixture tempdir cannot execute stubs, so the environment never decides
+  a code verdict again.
 - kimi TS suite (`npm test` under `kimicode4lunarwing/scripts`):
-  **113/113** non-root; root-shaped 109 pass / 0 fail / 4 skipped (the
-  documented real-CLI contract lane self-skips without a kimi binary).
-- Mutation checks: WI#461 bare-chown revert fails exactly the rc-1 pin;
-  WI#463 `taskKimiBin()`→`kimiBin()` revert fails exactly the bare-name
-  argv pin.
+  **21/21** in the executor lane (19 + the NB-10 order pin + the NB-11
+  fail-closed pin); full suite green non-root, documented real-CLI skips
+  root-shaped.
+- Mutation checks (review round): WI#461 bare-chown revert fails the rc-1
+  pin; walk-guard removal fails exactly the NB-9 pin (2 FAIL, restored);
+  WI#462 task-first order revert fails the NB-10 order pin; WI#463
+  fallback restore fails exactly the NB-11 pin; WI#463
+  `taskKimiBin()`→`kimiBin()` revert fails exactly the bare-name argv pin.
 - `check-mt-admin.sh` shellcheck clean (16 lib files); repo `shellcheck.sh`
   clean; `shell-syntax.sh` 255 scripts + 3 hooks clean; `tsc` clean.
-- Live tenant: image `USER 0:0`, container running as root with task drop,
-  WS handshake 101 with the scoped token, 401 with a wrong token,
-  `/ready` true, mt-admin status `Kimi worker: running`.
+- Full failure→fix reproduction on a temporary tenant (NB-7): see the
+  dedicated section above — guard `die` captured, os-111 dead socket
+  captured, image refresh + force-recreate + live 101 captured, tenant
+  purged.
