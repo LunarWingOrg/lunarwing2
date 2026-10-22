@@ -1291,7 +1291,7 @@
     - **MV-4 (Info — fixed):** `prepare_worker_workspace` saves and restores `PWD` before/after the `cd` into the workspace, so the caller's working directory is untouched. (Subshell was tried first but the test's `chown()` mock sets a variable in the same shell — a subshell would isolate the assignment — so save/restore PWD was used instead.)
     - **Verification on this tree:** `test-mt-admin-kimi` all pass; `test-mt-admin-opencode2` all pass; `test-mt-admin-worker-image-contract` all pass; `test-study-mcp-worker-mount` passes; `test-worker-llm-entrypoints` 34 pass as host user and **37 pass root-shaped** (`podman unshare`, incl. the MV-2 setpriv argv pin); `check-mt-admin.sh` shellcheck clean (16 lib files); repo `shell-syntax.sh` (255 scripts + 3 hooks) clean; `shellcheck.sh` clean; `python_syntax.py` (131 files) clean. No daemon/bridge Rust touched, so no cargo lanes re-run. **Item stays `[ ]`** — WI#454 (non-root workers) is not implemented.
 92. [x] (S) Reserved
-93. [x] (S) Reserved other WIs
+93. [ ] look into this one https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/456 and lets try to fix kimi external worker if possible - please use a temporary test tenant in order to test your applicable fixes and document accordingly in docs/ops
 94. [x] (S) Reserved other WIs
 
 ---
