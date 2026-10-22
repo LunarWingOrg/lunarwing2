@@ -7,7 +7,9 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import pathlib
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -3073,6 +3075,133 @@ class TrivyGateInputTests(unittest.TestCase):
         with mock.patch.object(config, "validate_trivy_gate_inputs") as gate_check:
             self.assertEqual(config.main(), 0)
         gate_check.assert_called_once()
+
+
+class TrivyRetryWrapperBehaviorTests(unittest.TestCase):
+    """!1859 review run 195 NB-4: the gate's verdict now runs through the
+    trivy_with_retry shell function, so its behaviour — not just its text —
+    must be under test. This extracts the pinned wrapper from
+    WORKER_SCAN_SCRIPT and executes it under /bin/sh with sleep stubbed,
+    over the review's case list plus the conditional-context (errexit
+    suspended) temp failure that motivated the fail-closed rewrite."""
+
+    @staticmethod
+    def _wrapper_source():
+        for line in config.WORKER_SCAN_SCRIPT:
+            if line.strip().startswith("trivy_with_retry() {"):
+                # WORKER_SCAN_SCRIPT holds the wrapper as one triple-quoted
+                # entry with embedded newlines; the whole function is here.
+                return line if line.endswith("\n") else line + "\n"
+        raise AssertionError("trivy_with_retry definition not found in WORKER_SCAN_SCRIPT")
+
+    def _run(self, script):
+        with tempfile.TemporaryDirectory() as tmp:
+            stub_dir = os.path.join(tmp, "stub")
+            os.mkdir(stub_dir)
+            sleep_stub = os.path.join(stub_dir, "sleep")
+            with open(sleep_stub, "w") as fh:
+                fh.write("#!/bin/sh\nexit 0\n")
+            os.chmod(sleep_stub, 0o755)
+            env = dict(os.environ, PATH=stub_dir + os.pathsep + os.environ.get("PATH", ""))
+            proc = subprocess.run(
+                ["/bin/sh", "-e", "-c", script],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+            )
+            return proc.returncode, proc.stdout, proc.stderr
+
+    def setUp(self):
+        self.wrapper = self._wrapper_source()
+        self.harness = (
+            "set -e\n"
+            + self.wrapper
+            + "\n"
+        )
+
+    def test_success_returns_zero(self):
+        rc, out, err = self._run(self.harness + "trivy_with_retry true\n")
+        self.assertEqual((rc, err.strip()), (0, ""))
+
+    def test_critical_on_first_attempt_fails(self):
+        rc, _, err = self._run(self.harness + 'trivy_with_retry sh -c \'echo "CRITICAL" >&2; exit 1\'\n')
+        self.assertEqual(rc, 1)
+
+    def test_throttled_twice_then_clean_passes(self):
+        # The wrapper runs each attempt in a pipeline subshell, so a plain
+        # counter variable would reset every attempt: persist the count in a
+        # file instead (the review's own case — throttled twice then clean).
+        with tempfile.TemporaryDirectory() as cntdir:
+            counter = os.path.join(cntdir, "flaky-n")
+            script = (
+                self.harness
+                + "_n_file='%s'\n" % counter
+                + "flaky() { _n=$(cat \"$_n_file\" 2>/dev/null || echo 0); _n=$((_n+1));"
+                + " echo \"$_n\" > \"$_n_file\";"
+                + " if [ \"$_n\" -le 2 ]; then echo '429 Too Many Requests' >&2; return 1; fi; return 0; }\n"
+                + "trivy_with_retry flaky\n"
+            )
+            rc, _, err = self._run(script)
+        self.assertEqual(rc, 0, err)
+
+    def test_throttled_every_time_fails_after_retries(self):
+        script = (
+            self.harness
+            + "always() { echo '429 Too Many Requests' >&2; return 1; }\n"
+            + "trivy_with_retry always\n"
+        )
+        rc, _, err = self._run(script)
+        self.assertEqual(rc, 1, err)
+        # Attempts 1-3 log their retry; attempt 4 is the final verdict (the
+        # loop exits via the else branch, no retry line printed).
+        self.assertEqual(err.count("retrying in"), 3)
+
+
+
+    def test_critical_whose_log_mentions_throttle_fails(self):
+        # A retry repeats the same digest against the same cached DB, so it
+        # cannot flip the verdict: the last status wins even when the log
+        # happens to contain the throttle text.
+        script = (
+            self.harness
+            + "noisy() { echo 'CRITICAL: real finding (429 Too Many Requests text)' >&2; return 1; }\n"
+            + "trivy_with_retry noisy\n"
+        )
+        rc, _, _ = self._run(script)
+        self.assertEqual(rc, 1)
+
+    def test_killed_process_status_is_returned(self):
+        rc, _, _ = self._run(self.harness + "trivy_with_retry sh -c 'kill -9 $$'\n")
+        self.assertEqual(rc, 137)
+
+    def test_conditional_context_temp_failure_fails_closed(self):
+        # NB-4's core case: inside `if` (errexit suspended), a mktemp failure
+        # used to return 0. The wrapper must fail closed instead.
+        script = (
+            self.harness
+            + "if trivy_with_retry true; then echo SHOULD_NOT_PASS; exit 9; fi\n"
+        )
+        # Break mktemp for the subshell so the wrapper's mktemp fails.
+        script = (
+            self.harness
+            + "mktemp() { return 1; }\n"
+            + "if trivy_with_retry true; then echo SHOULD_NOT_PASS; exit 9; fi\n"
+            + "exit 0\n"
+        )
+        rc, _, _ = self._run(script)
+        self.assertEqual(rc, 0, "conditional-context mktemp failure must fail closed, not return success")
+
+    def test_readonly_temp_dir_fails_closed_in_conditional_context(self):
+        script = (
+            self.harness
+            + "TMPDIR=/proc/nonexistent-readonly\n"
+            + "export TMPDIR\n"
+            + "if trivy_with_retry true; then echo SHOULD_NOT_PASS; exit 9; fi\n"
+            + "exit 0\n"
+        )
+        rc, _, _ = self._run(script)
+        self.assertEqual(rc, 0, "unusable TMPDIR in conditional context must fail closed")
 
 
 class ProxyToolSetSyncTests(unittest.TestCase):
