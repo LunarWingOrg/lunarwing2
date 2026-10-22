@@ -668,7 +668,7 @@ assert_contains "$OPENCODE_DOCKERFILE" 'CMD /usr/bin/curl -sf http://127.0.0.1:8
   'OpenCode healthcheck pins the absolute curl (WI#454/ME-1)'
 OPENCODE_ENTRYPOINT="$LUNARWING_ROOT/opencode4lunarwing/entrypoint.sh"
 assert_contains "$OPENCODE_ENTRYPOINT" \
-  'export PATH=/usr/local/cargo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
+  'export PATH=/usr/local/cargo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bun-node-fallback-bin' \
   'OpenCode entrypoint pins the root-owned PATH before its first command (WI#454/ME-1)'
 assert_contains "$OPENCODE_ENTRYPOINT" \
   'TASK_PATH="/home/opencode/.cargo/bin:/usr/local/cargo/bin:/usr/local/go/bin:/home/opencode/go/bin:$PATH"' \

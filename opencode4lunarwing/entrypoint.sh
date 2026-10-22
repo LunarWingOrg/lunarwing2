@@ -22,7 +22,7 @@ die()  { log "ERROR: $*" >&2; exit 1; }
 # directories the task uid owns — a planted file there runs as root. Pin
 # the root PATH to the image's root-owned directories for the whole
 # launcher (the drop below re-points the task env at the task toolchain).
-export PATH=/usr/local/cargo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH=/usr/local/cargo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bun-node-fallback-bin
 
 MODE="${OPENCODE_MODE:-websocket}"
 HEALTH_PORT="${HEALTH_PORT:-8443}"

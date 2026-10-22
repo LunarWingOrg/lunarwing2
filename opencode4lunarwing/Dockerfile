@@ -206,10 +206,13 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
 # entries first would let the task uid plant a file that root executes.
 # The task gets its toolchain directories at the privilege drop instead
 # (as_task in entrypoint.sh; the serve process's env).
+# MI-2 (run-186 review): /usr/local/bun-node-fallback-bin is root-owned
+# (0755) on the oven/bun:debian base and holds `node -> /usr/local/bin/bun`;
+# it must stay on the PATH so task code calling `node`/`npx` still resolves.
 ENV GOROOT=/usr/local/go \
     GOPATH=/home/opencode/go \
     CARGO_HOME=/home/opencode/.cargo \
-    PATH=/usr/local/cargo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    PATH=/usr/local/cargo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bun-node-fallback-bin
 
 # ── non-root user ──────────────────────
 # Keep IDs synchronized with ic/scripts/lunarwing-mt-admin.sh. Rootless Podman
