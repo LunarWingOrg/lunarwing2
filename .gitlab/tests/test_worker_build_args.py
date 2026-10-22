@@ -157,14 +157,16 @@ metadata.write_text(json.dumps({{"containerimage.digest": "sha256:" + "0" * 64}}
         self.assertNotIn("--no-cache", calls[1])
         self.assertIn("--no-cache", calls[2])
         self.assertIn("transient registry-auth error", result.stderr)
+        # The retry message must report the updated max-attempts count.
+        self.assertIn("/6", result.stderr)
 
     def test_persistent_transient_failure_exhausts_retries(self):
         self.env["BUILDCTL_MODE"] = "fail_always"
         result = self.run_build()
         self.assertNotEqual(result.returncode, 0)
         calls = [json.loads(line) for line in self.log.read_text().splitlines()]
-        # Initial attempt plus three retries; the clean rebuild never runs.
-        self.assertEqual(len(calls), 4)
+        # Initial attempt plus five retries; the clean rebuild never runs.
+        self.assertEqual(len(calls), 6)
         for args in calls:
             self.assertNotIn("--no-cache", args)
         self.assertIn("not retrying", result.stderr)
