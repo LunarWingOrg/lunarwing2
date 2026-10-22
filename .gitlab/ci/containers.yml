@@ -65,6 +65,18 @@
     TRIVY_PASSWORD: "$CI_REGISTRY_PASSWORD"
     TRIVY_USERNAME: "$CI_REGISTRY_USER"
   script:
+    # Stagger the first registry request per worker so the four scan jobs
+    # don't all hit the GitLab container-registry JWT auth endpoint at once
+    # and draw a 429 (Too Many Requests) → 403 (forbidden) that makes the
+    # read-only Trivy scan fail flakily (pipeline #6231 worker-kimi-scan;
+    # the same flake rotated across all four workers in #6151–#6212).
+    - |
+      case "$CI_JOB_NAME" in
+        worker-pebble-scan)    sleep 0  ;;
+        worker-opencode-scan)  sleep 15 ;;
+        worker-opencode2-scan) sleep 30 ;;
+        worker-kimi-scan)      sleep 45 ;;
+      esac
     # The candidate publishes worker-image.env as a dotenv artifact. When the
     # candidate fails on the default branch (allow_failure: true there), this
     # job still runs and the raw source line below used to die with a cryptic

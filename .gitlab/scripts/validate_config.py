@@ -47,6 +47,16 @@ TRIVY_SCAN_VARIABLES = {"TRIVY_CACHE_DIR", "TRIVY_NO_PROGRESS", "TRIVY_PASSWORD"
 # the jobs may add only their needs wiring. A deliberate change edits these
 # constants in the same commit.
 WORKER_SCAN_SCRIPT = [
+    # Stagger the first registry request per worker so the four scan jobs
+    # don't all hit the GitLab container-registry JWT auth endpoint at once
+    # (pipeline #6231 flake). See containers.yml for the full rationale.
+    """case "$CI_JOB_NAME" in
+  worker-pebble-scan)    sleep 0  ;;
+  worker-opencode-scan)  sleep 15 ;;
+  worker-opencode2-scan) sleep 30 ;;
+  worker-kimi-scan)      sleep 45 ;;
+esac
+""",
     """if [ ! -f ./worker-image.env ]; then
   echo "ERROR: worker-image.env is missing — the candidate job for this worker failed or did not publish an image." >&2
   echo "       Finish the matching worker-*-candidate job successfully before retrying this scan." >&2
