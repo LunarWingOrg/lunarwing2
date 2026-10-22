@@ -148,13 +148,16 @@ case "$MODE" in
     # token var was unset above). The bridge (still root in this image) then
     # delegates each task to it over the socket instead of spawning the CLI
     # itself. KIMI_TASK_RUNNER=skip (host-side dev runs without a runner)
-    # keeps the bridge on local execution.
-    RUNNER_DIR="${KIMI_TASK_RUNNER_DIR:-/run/lunarwing}"
+    # keeps the bridge on local execution. The socket directory is SEPARATE
+    # from LUNARWING_TOKEN_DIR: the token directory must stay root-only
+    # 0700 (WI#400), and the runner must own its own directory to bind the
+    # socket — root hands it over 0700 task-uid below.
+    RUNNER_DIR="${KIMI_TASK_RUNNER_DIR:-/run/lunarwing-runner}"
     RUNNER_SOCKET="${KIMI_TASK_RUNNER_SOCKET:-$RUNNER_DIR/task-runner.sock}"
     if [ -n "${AGENT_AUTH_TOKEN_FILE:-}" ] && [ "${KIMI_TASK_RUNNER:-}" != "skip" ]; then
-      install -d -m 0711 "$RUNNER_DIR" 2>/dev/null || true
+      install -d -m 0700 "$RUNNER_DIR" 2>/dev/null || true
       if [ "$(id -u)" = "0" ]; then
-        chmod 0711 "$RUNNER_DIR" 2>/dev/null || true
+        chmod 0700 "$RUNNER_DIR" 2>/dev/null || true
         chown "$KIMI_TASK_UID:$KIMI_TASK_GID" "$RUNNER_DIR" 2>/dev/null || true
       fi
       # The runner runs as the task uid, so HOME and PATH must be the task's

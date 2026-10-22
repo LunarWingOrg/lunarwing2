@@ -157,9 +157,10 @@ section and "Launch identity (WI#422)" further down.
   client (`task_runner_client.ts`) that delegates each task over the
   socket. The entrypoint rehearses the split inside the current
   single-container image: with the credential handoff active it starts
-  the runner as the task uid on `/run/lunarwing/task-runner.sock` (the
-  directory handed to the task uid, the credential vars stripped from
-  what it inherits) and exports `LUNARWING_TASK_RUNNER_SOCKET` to the
+  the runner as the task uid on `/run/lunarwing-runner/task-runner.sock`
+  (a directory separate from the root-only token directory, handed to the
+  task uid `0700`, the credential vars stripped from what it inherits)
+  and exports `LUNARWING_TASK_RUNNER_SOCKET` to the
   bridge, which then routes every task to the unprivileged runner instead
   of spawning the CLI itself; `KIMI_TASK_RUNNER=skip` (or no credential
   handoff, the host dev shape) keeps local execution. The runner never
