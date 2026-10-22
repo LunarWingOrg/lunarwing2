@@ -457,7 +457,7 @@ fi
 MT_ROOTLESS=false
 CHOWN_CALL=''
 prepare_worker_workspace root kimi >/dev/null
-if [[ "$CHOWN_CALL" == "-R --no-dereference 10002:10002 $fixture/home/lunarwing/kimi-workspace" ]]; then
+if [[ "$CHOWN_CALL" == "--no-dereference 10002:10002 ." ]]; then
   pass 'rootful Kimi workspace uses image UID and GID'
 else
   fail "rootful Kimi workspace ownership wrong: $CHOWN_CALL"
@@ -465,7 +465,7 @@ fi
 
 CHOWN_CALL=''
 prepare_worker_workspace root opencode >/dev/null
-if [[ "$CHOWN_CALL" == "-R --no-dereference 10001:10001 $fixture/home/lunarwing/opencode-workspace" ]]; then
+if [[ "$CHOWN_CALL" == "--no-dereference 10001:10001 ." ]]; then
   pass 'rootful OpenCode workspace uses image UID and GID'
 else
   fail "rootful OpenCode workspace ownership wrong: $CHOWN_CALL"
@@ -525,6 +525,33 @@ command rm -f -- "$fixture/home/lunarwing"
 command mkdir -p "$fixture/home/lunarwing"
 command rm -rf -- "$wi453_real"
 unset wi453_real
+
+# MI-3 (run-186 review): a tenant-planted hard link inside the workspace
+# must keep its original owner — the chown walk skips regular files with a
+# link count above 1 so `chown -R` cannot hand an outside file to the
+# container uid.  Also verify the top-dir chown uses `.` (not -R).
+mi3_outside="$fixture/home/mi3-outside"
+mi3_outside_file="$mi3_outside/secret.txt"
+command mkdir -p "$mi3_outside"
+printf 'root-data' >"$mi3_outside_file"
+command rm -rf -- "$fixture/home/lunarwing/kimi-workspace"
+command mkdir -p "$fixture/home/lunarwing/kimi-workspace"
+command ln "$mi3_outside_file" "$fixture/home/lunarwing/kimi-workspace/link.txt"
+CHOWN_CALL=''
+prepare_worker_workspace root kimi >/dev/null 2>&1 || true
+# The hard link must keep its original owner (the mock chown is a no-op,
+# but the real code would skip it).  The chown mock only records the last
+# call, so on a non-empty workspace with one planted hard link, the find
+# loop calls chown for `.` (top), skips the hard link (link count 2), and
+# calls chown for nothing else — CHOWN_CALL holds the top-dir call.
+if [[ "$CHOWN_CALL" == "--no-dereference 10002:10002 ." ]]; then
+  pass 'MI-3: hard link in workspace keeps its owner (chown skips link count > 1)'
+else
+  fail "MI-3: unexpected chown on workspace with hard link: $CHOWN_CALL"
+fi
+command rm -f -- "$fixture/home/lunarwing/kimi-workspace/link.txt"
+command rm -rf -- "$mi3_outside"
+unset mi3_outside mi3_outside_file
 
 cat >"$fixture/env/legacy.env" <<'EOF'
 KIMI_API_KEY='key\\with\'quote'

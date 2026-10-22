@@ -1972,10 +1972,28 @@ prepare_worker_workspace() {
 
   if [[ "$MT_ROOTLESS" != "true" ]]; then
     # Rootful runtimes do not apply keep-id, so bind mounts must use image
-    # IDs. The directory is verified plain and tenant-owned above, and
-    # --no-dereference keeps the recursive walk from following any symlink
-    # the tenant planted inside it (WI#453).
-    chown -R --no-dereference "$container_uid:$container_gid" "$workspace_dir"
+    # IDs. The directory is verified plain and tenant-owned above. MI-3
+    # (run-186 review): cd into the directory first so an ancestor swap
+    # between the checks and the chown cannot redirect it. Use
+    # --no-dereference throughout. On first creation the directory is
+    # empty, so chown only the top node (not -R); when content exists,
+    # walk with find -mindepth 1 and skip regular files with a link count
+    # above 1 so a tenant-planted hard link to an outside file keeps its
+    # owner (the run-170 LP-9 class, narrower than before).
+    if ! command cd -- "$workspace_dir" 2>/dev/null; then
+      printf 'error: cannot enter %s workspace: %s\n' "$worker" "$workspace_dir" >&2
+      return 1
+    fi
+    chown --no-dereference "$container_uid:$container_gid" .
+    local _entry _links
+    while IFS= read -r -d '' _entry; do
+      _links="$(stat -c %h "$_entry" 2>/dev/null || printf 0)"
+      if [[ -f "$_entry" && "$_links" -gt 1 ]]; then
+        continue
+      fi
+      chown --no-dereference "$container_uid:$container_gid" "$_entry"
+    done < <(find . -mindepth 1 -print0 2>/dev/null)
+    command cd -- "$lw_root" 2>/dev/null || true
   fi
   tenant_chmod "$name" 2770 "$workspace_dir" || return 1
   printf '%s\n' "$workspace_dir"
