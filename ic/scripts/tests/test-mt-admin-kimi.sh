@@ -580,6 +580,45 @@ command rm -f -- "$fixture/home/lunarwing/kimi-workspace/plain.txt"
 command rm -rf -- "$mi3_outside" "$mi3_stub_bin" "$mi3_chown_log"
 unset mi3_outside mi3_outside_file mi3_stub_bin mi3_chown_log mi3_status
 
+# WI#461: a chown failure inside the rootful workspace walk must be a clean
+# rc-1 refusal from prepare_worker_workspace — never a bare-command outcome:
+# in a direct call a bare chown aborts the whole script from inside the
+# function (harness dies, no PASS line, rc != 1), and in a suppressed-errexit
+# call context (cmd || status=$?, the shape used here and by the daemon-facing
+# callers) the same failure is silently swallowed and the function "succeeds"
+# with the ownership never handed over — the dev-VM MI-3 stub on a noexec /tmp
+# reproduced exactly that silent swallow before the guard. The harness's
+# chown() function mock swallows failures too (it shadows PATH), so it is
+# unset for this block only and restored after: with the mock active the top
+# -dir chown can never fail and the pin could not fire at all. The PATH stub
+# then makes the real chown binary exit 1 in every uid shape (as the invoking
+# user the stub's exit 1 needs no privileges). The caller's working directory
+# must be restored on that exit path (MV-4).
+wi461_stub_bin="$fixture/wi461-stub-bin"
+command mkdir -p "$wi461_stub_bin"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$wi461_stub_bin/chown"
+command chmod +x "$wi461_stub_bin/chown"
+command mkdir -p "$fixture/home/lunarwing/kimi-workspace"
+wi461_save_pwd="$PWD"
+wi461_status=0
+# Neutralise the function mock for this block only (see comment above) and
+# restore it right after, so the later CHOWN_CALL pins keep their mock.
+unset -f chown
+PATH="$wi461_stub_bin:$PATH" prepare_worker_workspace root kimi >/dev/null 2>&1 || wi461_status=$?
+chown() { CHOWN_CALL="$*"; }
+if [[ "$wi461_status" -eq 1 ]]; then
+  pass 'WI#461: chown failure refuses cleanly (rc 1, not a set -e abort)'
+else
+  fail "WI#461: chown failure rc=$wi461_status (expected clean rc 1 refusal)"
+fi
+if [[ "$PWD" == "$wi461_save_pwd" ]]; then
+  pass 'WI#461: refusal restores the caller working directory'
+else
+  fail "WI#461: caller PWD leaked after refusal: $PWD"
+fi
+command rm -rf -- "$wi461_stub_bin"
+unset wi461_stub_bin wi461_save_pwd wi461_status
+
 cat >"$fixture/env/legacy.env" <<'EOF'
 KIMI_API_KEY='key\\with\'quote'
 EOF
