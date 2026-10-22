@@ -109,11 +109,12 @@ function LiveBlock(props: {
   live: LiveTurnView
   width: number
   protocol: ImageProtocol
+  height: number
 }): ReactNode {
   const live = props.live
   const liveText = live.text.length > 0 ? live.text : "…"
   return (
-    <box style={{ flexDirection: "column" }}>
+    <box style={{ flexDirection: "column", height: props.height }}>
       <text fg="#c0caf5">{`lunarwing ▏ ${liveText}`}</text>
       {live.images.map((image) => (
         <ImageBlock key={image.id} image={image} width={props.width} protocol={props.protocol} />
@@ -125,12 +126,22 @@ function LiveBlock(props: {
   )
 }
 
+/** Vertical rows the live area occupies, so layout can be computed exactly. */
+function liveRows(live: LiveTurnView): number {
+  const status = live.statusKind !== "idle" && live.statusText.length > 0 ? 1 : 0
+  return 1 + live.images.length * IMAGE_BLOCK_ROWS + status
+}
+
 /**
- * Scrollable transcript.
+ * Scrollable transcript with a pinned live area.
  *
- * `stickyScroll` keeps the view pinned to the newest content while a turn
- * streams, and releases the moment the user scrolls up so history stays
- * readable.
+ * Sealed history lives in a ScrollBox: `stickyScroll` keeps it pinned to the
+ * newest entry and releases the moment the user scrolls up. The turn
+ * currently streaming renders in its own pinned area below it.
+ *
+ * Heights are computed explicitly rather than left to flex growth: the real
+ * renderer collapses a flexGrow-only scrollbox to zero height, and an
+ * unsized live box paints its lines on top of each other.
  */
 export function Transcript(props: {
   items: TranscriptItem[]
@@ -142,20 +153,29 @@ export function Transcript(props: {
 }): ReactNode {
   const protocol = props.protocol ?? "auto"
   const inlineWidth = imageWidth(props.width)
+  const liveHeight = props.live === null ? 0 : liveRows(props.live)
+  const scrollHeight = Math.max(props.height - liveHeight, 1)
 
   return (
-    <scrollbox
-      stickyScroll
-      stickyStart="bottom"
-      scrollX={false}
-      style={{ flexGrow: 1, height: props.height }}
-    >
-      {props.items.map((item) => (
-        <ItemBlock key={item.id} item={item} width={inlineWidth} protocol={protocol} />
-      ))}
+    <>
+      <scrollbox
+        stickyScroll
+        stickyStart="bottom"
+        scrollX={false}
+        style={{ height: scrollHeight }}
+      >
+        {props.items.map((item) => (
+          <ItemBlock key={item.id} item={item} width={inlineWidth} protocol={protocol} />
+        ))}
+      </scrollbox>
       {props.live !== null && (
-        <LiveBlock key="live-turn" live={props.live} width={inlineWidth} protocol={protocol} />
+        <LiveBlock
+          live={props.live}
+          width={inlineWidth}
+          protocol={protocol}
+          height={liveHeight}
+        />
       )}
-    </scrollbox>
+    </>
   )
 }

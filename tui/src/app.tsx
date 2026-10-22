@@ -355,13 +355,14 @@ export function App(props: {
 
       <box
         title={busy ? "Message (Enter=queue · Ctrl+Enter/Ctrl+S=interrupt & send)" : "Message"}
-        style={{ border: true, height: 3, flexDirection: "row" }}
+        style={{ border: true, height: 3, flexDirection: "column" }}
       >
         <input
           key={inputEpoch}
           value={inputSeed}
           placeholder="Message LunarWing… (/img <path> to attach, Ctrl+V paste)"
           focused
+          style={{ width: "100%" }}
           onInput={(value) => {
             inputValueRef.current = value
             setInputValue(value)
