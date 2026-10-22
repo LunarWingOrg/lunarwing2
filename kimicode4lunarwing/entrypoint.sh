@@ -17,6 +17,13 @@ set -euo pipefail
 log()  { printf '[%s] %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
 die()  { log "ERROR: $*" >&2; exit 1; }
 
+# WI#454/ME-1: the entrypoint runs as container root, and every command it
+# resolves would otherwise walk an inherited PATH whose first entries are
+# directories the task uid owns — a planted file there runs as root. Pin
+# the root PATH to the image's root-owned directories for the whole
+# launcher (the drop below re-points the task env at the task toolchain).
+export PATH=/usr/local/cargo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 MODE="${KIMI_MODE:-websocket}"
 HEALTH_PORT="${HEALTH_PORT:-8443}"
 WS_STATE_FILE="${WS_STATE_FILE:-/tmp/lunarwing_ws_state.json}"
@@ -54,13 +61,18 @@ fi
 # binary in the image would let task code regain privilege.
 SETPRIV_FLAGS=(--reuid="$KIMI_TASK_UID" --regid="$KIMI_TASK_GID" --clear-groups --ambient-caps=-all --inh-caps=-all --no-new-privs)
 
+# WI#454/ME-1: the task's toolchain directories are handed over at the drop,
+# NOT baked into the image PATH (root resolves through that PATH too, and the
+# task owns these directories).
+TASK_PATH="/home/kimi/.cargo/bin:/usr/local/cargo/bin:/usr/local/go/bin:/home/kimi/go/bin:$PATH"
+
 # as_task CMD [ARGS...] — run a command as the task uid with the task home;
 # direct exec when already unprivileged (host-side dev runs).
 as_task() {
   if [ "$(id -u)" = "0" ]; then
-    setpriv "${SETPRIV_FLAGS[@]}" env HOME=/home/kimi "$@"
+    setpriv "${SETPRIV_FLAGS[@]}" env HOME=/home/kimi PATH="$TASK_PATH" "$@"
   else
-    env HOME="${HOME:-/home/kimi}" "$@"
+    env HOME="${HOME:-/home/kimi}" PATH="$TASK_PATH" "$@"
   fi
 }
 
@@ -119,10 +131,10 @@ case "$MODE" in
     # bridge's hub-handshake credential or its file pointer; run as the task uid.
     if [ "$(id -u)" = "0" ]; then
       exec setpriv "${SETPRIV_FLAGS[@]}" \
-        env HOME=/home/kimi -u AGENT_AUTH_TOKEN -u AGENT_AUTH_TOKEN_FILE \
+        env -u AGENT_AUTH_TOKEN -u AGENT_AUTH_TOKEN_FILE HOME=/home/kimi PATH="$TASK_PATH" \
         kimi -p "$*" --output-format stream-json
     fi
-    exec env -u AGENT_AUTH_TOKEN -u AGENT_AUTH_TOKEN_FILE \
+    exec env -u AGENT_AUTH_TOKEN -u AGENT_AUTH_TOKEN_FILE HOME="${HOME:-/home/kimi}" PATH="$TASK_PATH" \
       kimi -p "$*" --output-format stream-json
     ;;
 

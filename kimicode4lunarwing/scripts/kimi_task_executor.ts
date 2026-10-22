@@ -345,6 +345,12 @@ export async function executeTask(
     if (identity) {
       if (env.HOME === "/root") env.HOME = "/home/kimi"
       if (env.GOPATH === "/root/go") env.GOPATH = "/home/kimi/go"
+      // WI#454/ME-1: the image PATH carries only root-owned directories (the
+      // bridge runs as root and resolves through it), so the task uid's
+      // toolchain directories are handed to the child here, at the drop.
+      const taskToolchainPath =
+        `/home/kimi/.cargo/bin:/usr/local/cargo/bin:/usr/local/go/bin:/home/kimi/go/bin:${env.PATH ?? ""}`
+      env.PATH = taskToolchainPath
       // WI#400 LD-11/LP-6: setpriv comes from the bridge's OWN PATH (a bare
       // name would be looked up through the child env), and the loader
       // variables a task could supply are dropped before the still-root

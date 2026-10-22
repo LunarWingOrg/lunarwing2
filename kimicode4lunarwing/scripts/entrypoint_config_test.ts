@@ -198,10 +198,12 @@ test("entrypoint CLI mode forces print and stream-json", () => {
   // runs untrusted agent code and must not inherit AGENT_AUTH_TOKEN. WI#400:
   // the credential-file pointer is stripped alongside, and the one-shot runs
   // as the task uid via setpriv with the mandatory cap-clearing flags plus
-  // --no-new-privs (run-164 KW-2).
+  // --no-new-privs (run-164 KW-2). WI#454/ME-1: the task's toolchain
+  // directories are handed over at the drop (PATH="$TASK_PATH"), never
+  // baked into the image PATH root resolves through.
   assert.match(entrypoint, /SETPRIV_FLAGS=\(--reuid="\$KIMI_TASK_UID" --regid="\$KIMI_TASK_GID" --clear-groups --ambient-caps=-all --inh-caps=-all --no-new-privs\)/)
   assert.match(entrypoint, /exec setpriv "\$\{SETPRIV_FLAGS\[@\]\}"/)
-  assert.match(entrypoint, /env HOME=\/home\/kimi -u AGENT_AUTH_TOKEN -u AGENT_AUTH_TOKEN_FILE \\?\n?\s*kimi -p "\$\*" --output-format stream-json/)
+  assert.match(entrypoint, /env -u AGENT_AUTH_TOKEN -u AGENT_AUTH_TOKEN_FILE HOME=\/home\/kimi PATH="\$TASK_PATH" \\?\n?\s*kimi -p "\$\*" --output-format stream-json/)
 })
 
 test("entrypoint moves the hub credential into a root-only file before spawning (WI#400)", () => {
@@ -221,6 +223,24 @@ test("task-side setup refuses to run as root (WI#400)", () => {
   // Setup writes task-owned state, so the launcher must invoke it as the
   // task uid, never directly.
   assert.match(entrypoint, /as_task \/app\/entrypoint-task-setup\.sh/)
+})
+
+test("entrypoint pins the root PATH to root-owned directories (WI#454/ME-1)", () => {
+  // Since WI#400 the launcher runs as container root: an inherited PATH
+  // whose first entries are task-owned directories would let the task uid
+  // plant a file that root executes. The pin must land before any command
+  // resolution (before the task-id gate), and the task toolchain moves to
+  // the drop (TASK_PATH), not the image PATH.
+  const pin = /export PATH=\/usr\/local\/cargo\/bin:\/usr\/local\/go\/bin:\/usr\/local\/sbin:\/usr\/local\/bin:\/usr\/sbin:\/usr\/bin:\/sbin:\/bin/
+  assert.match(entrypoint, pin)
+  const pinAt = entrypoint.search(pin)
+  const gateAt = entrypoint.indexOf("KIMI_TASK_UID/KIMI_TASK_GID must be non-zero")
+  assert.ok(pinAt > 0 && gateAt > pinAt, "the root PATH pin must precede the first command resolution")
+  assert.match(entrypoint, /TASK_PATH="\/home\/kimi\/\.cargo\/bin:\/usr\/local\/cargo\/bin:\/usr\/local\/go\/bin:\/home\/kimi\/go\/bin:\$PATH"/)
+  assert.match(entrypoint, /setpriv "\$\{SETPRIV_FLAGS\[@\]\}" env HOME=\/home\/kimi PATH="\$TASK_PATH" "\$@"/)
+  // The pinned root PATH carries no task-owned directory.
+  const pinned = entrypoint.match(pin)?.[0] ?? ""
+  assert.ok(!pinned.includes("/home/kimi"), "the root PATH must not carry task-owned directories")
 })
 
 test("entrypoint rejects missing config source instead of reusing stale config", () => {
