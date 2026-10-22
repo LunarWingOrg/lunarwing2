@@ -139,6 +139,11 @@ section and "Launch identity (WI#422)" further down.
   maintainer's no-root policy (note #10954 on !1829) retires this whole
   root-bridge shape in favor of two non-root containers per lane — that
   split is its own work item; until it lands, this closes the ME-1 gap.
+  MI-2 (run-186 review): the opencode image PATH retains
+  `/usr/local/bun-node-fallback-bin` (root-owned 0755, holding
+  `node -> /usr/local/bin/bun`) so task code calling `node`/`npx` still
+  resolves; kimi is unaffected (`node:22` base, `node` in
+  `/usr/local/bin`).
 - **Cron workspace ownership.** The cron bootstrap (`create_cron_workspace`
   / the TS `resolveTaskWorkspace`) runs in the root bridge, so EVERY
   directory the walk creates — intermediates and leaf alike, or the task
@@ -206,13 +211,19 @@ tenant, refuses a symlinked or foreign-owned leaf (ownership checked
 against the tenant root, the pebble posture), and only then — on rootful
 runtimes, which need the bind mount handed to the image uid — chowns it,
 bounded with `--no-dereference` so the recursive walk never follows a
-symlink. Rootless keep-id maps the tenant identity, so no chown runs at
+symlink. MI-3 (run-186 review): the chown `cd`s into the directory first
+(preventing an ancestor swap between the checks and the walk), chowns
+only the top node on first creation (not `-R`, since the directory is
+empty), and when content exists, walks with `find -mindepth 1` skipping
+regular files with a link count above 1 (a tenant-planted hard link to
+an outside file keeps its owner). Rootless keep-id maps the tenant
+identity, so no chown runs at
 all; `chmod 2770` goes through `tenant_chmod` (root has no business
 touching a mode under a tenant-writable parent, WI#390). Every caller
 (quadlet render and all three imperative lanes) makes a refusal fatal.
-Pins: the six workspace-symlink pins in `test-mt-admin-kimi.sh`
-(mutation-verified — reverting to the old root `mkdir -p` + `chown -R`
-shape fails exactly them).
+Pins: the six workspace-symlink pins plus the hard-link-skip pin in
+`test-mt-admin-kimi.sh` (mutation-verified — reverting to the old root
+`mkdir -p` + `chown -R` shape fails exactly them).
 
 ## WebSocket message limits
 
