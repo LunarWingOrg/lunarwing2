@@ -577,6 +577,12 @@ def run_task_drop_argv(worker):
             "/usr/local/cargo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin"
             ":/usr/sbin:/usr/bin:/sbin:/bin"
         )
+        # MV-2: the opencode entrypoint's root PATH appends
+        # /usr/local/bun-node-fallback-bin (MI-2/WI#454), and TASK_PATH
+        # inherits $PATH, so the setpriv argv carries it.  Kimi's
+        # node:22 base does not need the fallback.
+        if worker != "kimi":
+            pinned_path = pinned_path + ":/usr/local/bun-node-fallback-bin"
         # The harness's /home/<user>/ relocation also rewrites the
         # TASK_PATH text, so the expected value follows the temp home.
         if worker == "kimi":
