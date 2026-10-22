@@ -154,6 +154,7 @@ case "$MODE" in
     # socket — root hands it over 0700 task-uid below.
     RUNNER_DIR="${KIMI_TASK_RUNNER_DIR:-/run/lunarwing-runner}"
     RUNNER_SOCKET="${KIMI_TASK_RUNNER_SOCKET:-$RUNNER_DIR/task-runner.sock}"
+    RUNNER_PID_FILE="${KIMI_TASK_RUNNER_PID_FILE:-$RUNNER_DIR/task-runner.pid}"
     if [ -n "${AGENT_AUTH_TOKEN_FILE:-}" ] && [ "${KIMI_TASK_RUNNER:-}" != "skip" ]; then
       install -d -m 0700 "$RUNNER_DIR" 2>/dev/null || true
       if [ "$(id -u)" = "0" ]; then
@@ -173,17 +174,55 @@ case "$MODE" in
         node /app/scripts/task_runner.js "$RUNNER_SOCKET" &
       RUNNER_PID=$!
       log "Task runner started as task uid on $RUNNER_SOCKET (pid $RUNNER_PID)"
+      # NB-17 (!1861 run 195): the runner runs as the task uid, so any task
+      # can kill it — after which every later task fails with a connection
+      # error while /ready stays true. Supervise it: a dead runner is
+      # restarted (up to 5 rapid-restart attempts, then the supervisor kills
+      # the bridge so the container's wait-loop exits and the orchestrator's
+      # restart policy takes over). The supervisor owns the runner PID from
+      # here on: it records the LIVE pid in $RUNNER_PID_FILE so the parent's
+      # cleanup() kills the current runner, not a stale first-generation pid.
+      (
+        _attempts=0
+        _current="$RUNNER_PID"
+        while :; do
+          # Watch the current runner generation.
+          while kill -0 "$_current" 2>/dev/null; do sleep 2; done
+          _attempts=$((_attempts + 1))
+          if [ "$_attempts" -gt 5 ]; then
+            log "Task runner failed 5 restart attempts — exiting container for orchestrator restart"
+            kill "$BRIDGE_PID" 2>/dev/null || true
+            exit 1
+          fi
+          log "Task runner exited — restarting (attempt $_attempts/5)"
+          as_task env -u AGENT_AUTH_TOKEN -u AGENT_AUTH_TOKEN_FILE \
+            -u KIMI_TASK_UID -u KIMI_TASK_GID \
+            WORKSPACE_ROOT="$WORKSPACE_ROOT" \
+            node /app/scripts/task_runner.js "$RUNNER_SOCKET" &
+          _current=$!
+          echo "$_current" > "$RUNNER_PID_FILE"
+          # Give the new runner a 30 s grace window; if it survives, the
+          # attempt counter has done its job for this generation.
+          sleep 30
+        done
+      ) &
+      RUNNER_SUPERVISOR_PID=$!
+      echo "$RUNNER_PID" > "$RUNNER_PID_FILE"
       # Hand the socket path to the bridge: with it set, every task is
       # delegated to the unprivileged runner (WI#454); unset means local
       # execution (the WI#400 drop inside the bridge executor).
       export LUNARWING_TASK_RUNNER_SOCKET="$RUNNER_SOCKET"
       cleanup() {
         log "Shutting down..."
+        [ -z "${RUNNER_SUPERVISOR_PID:-}" ] || kill "$RUNNER_SUPERVISOR_PID" 2>/dev/null || true
         [ -z "${BRIDGE_PID:-}" ] || kill "$BRIDGE_PID" 2>/dev/null || true
-        [ -z "${RUNNER_PID:-}" ] || kill "$RUNNER_PID" 2>/dev/null || true
+        # The supervisor may have restarted the runner: the LIVE pid lives in
+        # the pid file (NB-17), not in the spawn-time $RUNNER_PID.
+        RUNNER_LIVE_PID="$(cat "$RUNNER_PID_FILE" 2>/dev/null || echo "${RUNNER_PID:-}")"
+        [ -z "$RUNNER_LIVE_PID" ] || kill "$RUNNER_LIVE_PID" 2>/dev/null || true
         kill "$HEALTH_PID" 2>/dev/null || true
         [ -z "${BRIDGE_PID:-}" ] || wait "$BRIDGE_PID" 2>/dev/null || true
-        [ -z "${RUNNER_PID:-}" ] || wait "$RUNNER_PID" 2>/dev/null || true
+        [ -z "$RUNNER_LIVE_PID" ] || wait "$RUNNER_LIVE_PID" 2>/dev/null || true
         wait "$HEALTH_PID" 2>/dev/null || true
       }
     fi

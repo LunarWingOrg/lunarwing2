@@ -42,6 +42,15 @@ def _load_ws_state() -> dict | None:
     except json.JSONDecodeError:
         return {"ready": False, "error": "invalid websocket state file"}
 
+def _load_state_file(path: str) -> dict | None:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError:
+        return {"ready": False, "error": "invalid runner state file"}
+
 def _build_ready() -> tuple[dict, int]:
     mode = os.environ.get("KIMI_MODE", "websocket")
     body = {"ready": True, "uptime_seconds": _uptime(), "mode": mode}
@@ -58,8 +67,33 @@ def _build_ready() -> tuple[dict, int]:
     ready = bool(ws_state.get("ready"))
     body["ready"] = ready
     body["websocket"] = ws_state
+
+    # NB-17 (!1861 run 195): the task runner runs unsupervised from the
+    # health server's point of view unless its liveness is included. When
+    # delegation is configured (the runner socket env is set), a missing or
+    # not-ready runner state file makes /ready fail so the orchestrator
+    # restarts the container instead of accepting tasks the runner will
+    # refuse with connection errors.
+    runner_socket = os.environ.get("LUNARWING_TASK_RUNNER_SOCKET", "")
+    if runner_socket:
+        runner_state = _load_runner_state()
+        runner_ready = bool(runner_state and runner_state.get("ready"))
+        body["task_runner"] = {"ready": runner_ready,
+                               **(runner_state if runner_state else {"error": "state unavailable"})}
+        if not runner_ready:
+            body["ready"] = False
+            status = 503
+            return body, status
+
     status = 200 if ready else 503
     return body, status
+
+
+def _load_runner_state():
+    path = os.environ.get("LUNARWING_TASK_RUNNER_STATE_FILE", "")
+    if not path:
+        return None
+    return _load_state_file(path)
 
 class HealthHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):

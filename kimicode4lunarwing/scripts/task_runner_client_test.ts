@@ -193,3 +193,111 @@ test("cancelRunnerTask never throws on a dead socket", () => {
 test("runnerSocketLabel names the socket basename", () => {
   assert.equal(runnerSocketLabel("/tmp/dir/runner.sock"), "runner.sock")
 })
+
+test("NB-13: a task outlasting the connection deadline is NOT killed by it (accepted clears the handshake timer)", async () => {
+  // Review run 195 NB-13 probe shape: with the connection deadline at its
+  // 1 s minimum, a 3 s task was rejected at 1 s while the CLI kept running.
+  // The fix clears the connection deadline when the runner acks and arms a
+  // run deadline of timeout_ms + margin instead — so a 3 s task with a
+  // 60 s run bound completes.
+  process.env.KIMI_BIN = makeMockKimi(
+    `void (async () => { await new Promise((r) => setTimeout(r, 3000)); process.stdout.write(JSON.stringify({ role: "assistant", content: "slow but done" }) + "\\n") })()`,
+  )
+  process.env.LUNARWING_TASK_RUNNER_TIMEOUT_MS = "1000"
+  try {
+    const socketDir = scratch()
+    const { runner, path } = await startRunner(socketDir)
+    try {
+      const result = await delegateTaskToRunner(path, taskRequest("slow work", { timeout_ms: 60_000 }), undefined, () => {})
+      assert.equal(result.status, "success")
+      assert.match(result.output, /slow but done/)
+    } finally {
+      runner.close()
+    }
+  } finally {
+    delete process.env.KIMI_BIN
+    delete process.env.LUNARWING_TASK_RUNNER_TIMEOUT_MS
+  }
+})
+
+test("NB-13: a 5 s task completes despite the 1 s connection deadline (run bound supersedes it)", async () => {
+  // Same deadline posture as the previous pin, but the mock answers at 5 s:
+  // with the connection deadline (1 s) still cleared on accept, the run
+  // deadline (60 s + margin) governs, and the task succeeds.
+  process.env.KIMI_BIN = makeMockKimi(
+    `void (async () => { await new Promise((r) => setTimeout(r, 5000)); process.stdout.write(JSON.stringify({ role: "assistant", content: "slower still" }) + "\\n") })()`,
+  )
+  process.env.LUNARWING_TASK_RUNNER_TIMEOUT_MS = "1000"
+  try {
+    const socketDir = scratch()
+    const { runner, path } = await startRunner(socketDir)
+    try {
+      const result = await delegateTaskToRunner(path, taskRequest("slow", { timeout_ms: 60_000 }), undefined, () => {})
+      assert.equal(result.status, "success")
+      assert.match(result.output, /slower still/)
+    } finally {
+      runner.close()
+    }
+  } finally {
+    delete process.env.KIMI_BIN
+    delete process.env.LUNARWING_TASK_RUNNER_TIMEOUT_MS
+  }
+})
+
+test("NB-15: runner frames with a foreign task_id are dropped, not forwarded", async () => {
+  // Review NB-15 probe: a stand-in runner answered task `mine` with a
+  // success result for `someone-else` and it was accepted. The fixed
+  // client drops foreign frames; a stand-in cannot forge another task's
+  // result into the hub.
+  const socketDir = scratch()
+  // Hand-rolled runner that answers task t-1 with a result for t-OTHER.
+  const { createServer } = await import("node:net")
+  const sockPath = join(socketDir, "foreign.sock")
+  const server = createServer((conn) => {
+    let buf = Buffer.alloc(0)
+    conn.on("data", (chunk: Buffer) => {
+      buf = Buffer.concat([buf, chunk])
+      if (!buf.includes(0x0a)) return
+      conn.write(JSON.stringify({ ok: true, op: "accepted", task_id: "t-1" }) + "\n")
+      conn.write(JSON.stringify({ op: "progress", progress: { task_id: "t-OTHER", delta: "hijack" } }) + "\n")
+      conn.write(JSON.stringify({ op: "result", result: { task_id: "t-OTHER", status: "success", output: "forged", duration_ms: 1 } }) + "\n")
+      conn.write(JSON.stringify({ op: "result", result: { task_id: "t-1", status: "success", output: "legit", duration_ms: 2 } }) + "\n")
+      conn.end()
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(sockPath, resolve))
+  try {
+    const progress: TaskProgress[] = []
+    const result = await delegateTaskToRunner(sockPath, taskRequest("x"), undefined, (p) => progress.push(p))
+    assert.equal(result.status, "success")
+    assert.equal(result.output, "legit", "forged t-OTHER result must not be the terminal frame")
+    assert.equal(progress.length, 0, "foreign progress frames must be dropped")
+  } finally {
+    server.close()
+  }
+})
+
+test("NB-15: an unknown result status is rejected fail-closed", async () => {
+  const socketDir = scratch()
+  const { createServer } = await import("node:net")
+  const sockPath = join(socketDir, "badstatus.sock")
+  const server = createServer((conn) => {
+    let buf = Buffer.alloc(0)
+    conn.on("data", (chunk: Buffer) => {
+      buf = Buffer.concat([buf, chunk])
+      if (!buf.includes(0x0a)) return
+      conn.write(JSON.stringify({ ok: true, op: "accepted", task_id: "t-1" }) + "\n")
+      conn.write(JSON.stringify({ op: "result", result: { task_id: "t-1", status: "pwned", output: "", duration_ms: 1 } }) + "\n")
+      conn.end()
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(sockPath, resolve))
+  try {
+    await assert.rejects(
+      delegateTaskToRunner(sockPath, taskRequest("x"), undefined, () => {}),
+      /unknown result status/,
+    )
+  } finally {
+    server.close()
+  }
+})
