@@ -382,3 +382,24 @@ api_key = "k"
   })
   assert.equal(custom.status, 0, custom.stderr)
 })
+
+test("entrypoint starts the task runner as the task uid before the bridge (WI#454)", () => {
+  // The two-container rehearsal: with the credential handoff active, the
+  // launcher must start the runner daemon (the task-container half) under
+  // the task uid and export its socket to the bridge, so every task is
+  // delegated out of the root bridge process.
+  assert.match(entrypoint, /as_task env -u AGENT_AUTH_TOKEN -u AGENT_AUTH_TOKEN_FILE \\\n\s*WORKSPACE_ROOT="\$WORKSPACE_ROOT" \\\n\s*node \/app\/scripts\/task_runner\.js "\$RUNNER_SOCKET" &/)
+  assert.match(entrypoint, /export LUNARWING_TASK_RUNNER_SOCKET="\$RUNNER_SOCKET"/)
+  // The runner spawn must precede the bridge spawn.
+  const runnerAt = entrypoint.indexOf("node /app/scripts/task_runner.js")
+  const bridgeAt = entrypoint.indexOf("node /app/scripts/lunarwing_bridge.js")
+  assert.ok(runnerAt > 0 && bridgeAt > runnerAt, "the runner must start before the bridge")
+  // The runner gate is the credential handoff (host runs without a token
+  // file keep local execution), and KIMI_TASK_RUNNER=skip is the documented
+  // escape hatch.
+  assert.match(entrypoint, /\[ -n "\$\{AGENT_AUTH_TOKEN_FILE:-\}" \] && \[ "\$\{KIMI_TASK_RUNNER:-\}" != "skip" \]/)
+  // The runner directory is handed to the task uid (the runner creates its
+  // socket there), and the cleanup tears the runner down with the bridge.
+  assert.match(entrypoint, /chown "\$KIMI_TASK_UID:\$KIMI_TASK_GID" "\$RUNNER_DIR"/)
+  assert.match(entrypoint, /kill "\$RUNNER_PID"/)
+})
