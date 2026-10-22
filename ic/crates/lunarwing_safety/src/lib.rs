@@ -66,7 +66,7 @@ impl SafetyLayer {
         let end = output.floor_char_boundary(cut.saturating_add(WINDOW).min(output.len()));
         let matches = self.leak_detector.scan(&output[start..end]).matches;
         let bytes = output.as_bytes();
-        let token = |b: u8| b.is_ascii_alphanumeric() || b"_+/=.-".contains(&b);
+        let token = |b: u8| b.is_ascii_alphanumeric() || b"_+/=.~-".contains(&b);
         loop {
             let previous = cut;
             for found in &matches {
@@ -810,6 +810,36 @@ mod tests {
             })
         }
 
+        /// Run-187 MN-1: the straddle sweep's `glpat-` entry. The body
+        /// needs three or more distinct characters or the MH-3
+        /// `is_plausible_token_body` guard skips it as documentation
+        /// filler and the sweep stops exercising the `gitlab_pat`
+        /// detector path at a cut. Both the sweep and the pin test
+        /// below build the fixture through this helper so the two can
+        /// not drift apart again.
+        fn straddle_sweep_glpat_fixture() -> String {
+            format!("glpat-{}qR", "Q".repeat(118))
+        }
+
+        /// Run-187 MN-1 pin: the sweep fixture above must reach the
+        /// `gitlab_pat` detector (not be skipped as a docs placeholder),
+        /// so a revert to a low-variety body (e.g. the run-185
+        /// `glpat-{Q×119}q` two-char form) fails here instead of
+        /// silently reducing the sweep to the cut snapper alone.
+        #[test]
+        fn straddle_sweep_glpat_fixture_is_detector_visible() {
+            let detector = LeakDetector::new();
+            let fixture = straddle_sweep_glpat_fixture();
+            let result = detector.scan(&fixture);
+            assert!(
+                result
+                    .matches
+                    .iter()
+                    .any(|m| m.pattern_name == "gitlab_pat"),
+                "straddle-sweep glpat fixture must reach the gitlab_pat detector: {fixture}"
+            );
+        }
+
         // ── Truncation at multi-byte UTF-8 boundaries ───────────────
 
         #[test]
@@ -919,9 +949,21 @@ mod tests {
                 format!("AIza{body}"),
                 format!("xoxb-{body}"),
                 format!("SG.{}.{}", &body[..22], &body[..43]),
-                format!("glpat-{body}"),
+                // Run-187 MN-1: the body needs three or more distinct
+                // characters or the MH-3 `is_plausible_token_body` guard
+                // skips it as documentation filler, so this entry would stop
+                // exercising the `gitlab_pat` detector path at a cut.
+                straddle_sweep_glpat_fixture(),
                 format!("{body}.{body}.{body}"),
                 format!("Authorization: Bearer {body}"),
+                format!("Bearer {body}.{body}.{body}"),
+                format!("Bearer {body}~"),
+                // Run-185 MH-1: a bare tilde-separated run with a tail after
+                // the tilde. No prefix matches a detector pattern, so only
+                // the cut snapper's token-run class stands between the cut
+                // and the pre-tilde half — `~` must be in the class or the
+                // retained head shows everything before the tilde.
+                format!("{body}~{body}"),
                 format!(
                     concat!(
                         "-----BEGIN RSA ",
@@ -1037,6 +1079,42 @@ mod tests {
                     assert!(result.content.trim().ends_with("query the full output.]"));
                 }
             }
+        }
+
+        /// WI#353 (BC-5): an uncut gitlab PAT and an uncut Bearer JWT must
+        /// be blocked / fully redacted through the full
+        /// `sanitize_tool_output` path, not only at truncation cuts. The
+        /// `secret_safe_cut` token-run snapping previously elided these at
+        /// cuts, but uncut output under the size limit was never scanned for
+        /// the `glpat-` prefix at all.
+        #[test]
+        fn uncut_gitlab_pat_and_bearer_jwt_are_caught_by_sanitize() {
+            let safety = SafetyLayer::new(&SafetyConfig {
+                max_output_length: 100_000,
+                injection_check_enabled: true,
+            });
+            let body = "Q".repeat(24);
+            // glpat- blocks the whole output. The body is mixed-case so the
+            // placeholder guard (run-185 MH-3) does not skip it.
+            let glpat = format!("token: glpat-{}q{}", "Q".repeat(11), "R".repeat(12));
+            let result = safety.sanitize_tool_output("gitlab", &glpat);
+            assert_eq!(
+                result.content,
+                "[Output blocked due to potential secret leakage]"
+            );
+            // Bearer JWT is fully redacted (no truncation, small input).
+            let jwt = format!("{}.{}.{}", &body, &body, &body);
+            let content = format!("Authorization: Bearer {jwt}");
+            let result = safety.sanitize_tool_output("gitlab", &content);
+            assert!(result.was_modified);
+            assert!(
+                !result.content.contains(&jwt),
+                "full JWT must not survive sanitize_tool_output: {}",
+                result.content
+            );
+            assert!(result.content.contains("[REDACTED]"));
+            // The dot-separated payload and signature specifically.
+            assert!(!result.content.contains(&format!("{}.{}", &body, &body)));
         }
     }
 }
