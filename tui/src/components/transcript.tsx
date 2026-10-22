@@ -1,9 +1,15 @@
-/** Chat transcript rendering (tail view) with live streaming turn. */
+/**
+ * Chat transcript: a scrollable history with a live streaming turn.
+ *
+ * The view keeps the whole conversation and sticks to the bottom as new
+ * content arrives, so history is never discarded to fit the screen — scroll
+ * up to read it, and sticky-scroll re-engages when you return to the bottom.
+ */
 
-import { Fragment, type ReactNode } from "react"
+import type { ReactNode } from "react"
 import type { ReplStatusKind } from "../protocol.ts"
 import type { ImageProtocol } from "../images.ts"
-import { truncate, wrapText } from "../util.ts"
+import { truncate } from "../util.ts"
 
 export interface TranscriptImage {
   id: string
@@ -45,20 +51,13 @@ const PREFIX: Record<TranscriptItem["kind"], string> = {
 const IMAGE_ROWS = 12
 /** Caption line under the image. */
 const CAPTION_ROWS = 1
-/** Total vertical cost of one image block, used for the tail-view budget. */
+/** Total vertical size of one image block. */
 const IMAGE_BLOCK_ROWS = IMAGE_ROWS + CAPTION_ROWS
 
 /** Preferred inline image width for a given transcript width. */
 function imageWidth(transcriptWidth: number): number {
   const available = Math.max(transcriptWidth - 8, 16)
   return Math.min(available, 56)
-}
-
-interface Block {
-  key: string
-  text: string
-  height: number
-  render: () => ReactNode
 }
 
 /**
@@ -69,84 +68,70 @@ interface Block {
  * value bypasses that negotiation (needed behind a tmux that can forward
  * graphics).
  */
-function imageBlock(
-  image: TranscriptImage,
-  key: string,
-  width: number,
-  protocol: ImageProtocol,
-): Block {
-  const caption = image.caption ?? ""
-  return {
-    key,
-    // A non-empty caption makes the budget charge its wrapped height, but the
-    // image rows dominate, so the cost stays IMAGE_BLOCK_ROWS either way.
-    text: caption,
-    height: IMAGE_BLOCK_ROWS,
-    render: () => (
-      <box key={image.id} style={{ flexDirection: "column", height: IMAGE_BLOCK_ROWS }}>
-        <image
-          source={image.bytes}
-          fit="fit"
-          protocol={protocol}
-          style={{ width, height: IMAGE_ROWS }}
-        />
-        {caption.length > 0 && <text fg="#565f89">{truncate(caption, width)}</text>}
-      </box>
-    ),
-  }
+function ImageBlock(props: {
+  image: TranscriptImage
+  width: number
+  protocol: ImageProtocol
+}): ReactNode {
+  const caption = props.image.caption ?? ""
+  return (
+    <box style={{ flexDirection: "column", height: IMAGE_BLOCK_ROWS }}>
+      <image
+        source={props.image.bytes}
+        fit="fit"
+        protocol={props.protocol}
+        style={{ width: props.width, height: IMAGE_ROWS }}
+      />
+      {caption.length > 0 && <text fg="#565f89">{truncate(caption, props.width)}</text>}
+    </box>
+  )
 }
 
-/** Build renderable blocks from the transcript plus the live turn. */
-function buildBlocks(
-  items: TranscriptItem[],
-  live: LiveTurnView | null,
-  width: number,
-  protocol: ImageProtocol,
-): Block[] {
-  const blocks: Block[] = []
-  const inlineWidth = imageWidth(width)
-
-  for (const item of items) {
-    blocks.push({
-      key: `h-${item.id}`,
-      text: `${PREFIX[item.kind]} ▏ ${item.text}`,
-      height: 1,
-      render: () => (
-        <text fg={COLORS[item.kind]}>{`${PREFIX[item.kind]} ▏ ${item.text}`}</text>
-      ),
-    })
-    for (const image of item.images ?? []) {
-      blocks.push(imageBlock(image, `i-${image.id}`, inlineWidth, protocol))
-    }
-  }
-
-  if (live !== null) {
-    const liveText = live.text.length > 0 ? live.text : "…"
-    blocks.push({
-      key: "live-turn",
-      text: `lunarwing ▏ ${liveText}`,
-      height: 1,
-      render: () => <text fg="#c0caf5">{`lunarwing ▏ ${liveText}`}</text>,
-    })
-    // Images generated during the live turn render as they arrive, in the same
-    // shape they keep once the turn seals into a transcript item.
-    for (const image of live.images) {
-      blocks.push(imageBlock(image, `li-${image.id}`, inlineWidth, protocol))
-    }
-    if (live.statusKind !== "idle" && live.statusText.length > 0) {
-      blocks.push({
-        key: "live-status",
-        text: `  ⋮ ${live.statusText}`,
-        height: 1,
-        render: () => <text fg="#9ece6a">{`  ⋮ ${live.statusText}`}</text>,
-      })
-    }
-  }
-
-  return blocks
+/** One sealed transcript entry: its header line plus any inline images. */
+function ItemBlock(props: {
+  item: TranscriptItem
+  width: number
+  protocol: ImageProtocol
+}): ReactNode {
+  const item = props.item
+  return (
+    <box style={{ flexDirection: "column" }}>
+      <text fg={COLORS[item.kind]}>{`${PREFIX[item.kind]} ▏ ${item.text}`}</text>
+      {(item.images ?? []).map((image) => (
+        <ImageBlock key={image.id} image={image} width={props.width} protocol={props.protocol} />
+      ))}
+    </box>
+  )
 }
 
-/** Tail-view transcript: keeps the most recent blocks that fit. */
+/** The turn currently streaming: text, images arriving so far, and status. */
+function LiveBlock(props: {
+  live: LiveTurnView
+  width: number
+  protocol: ImageProtocol
+}): ReactNode {
+  const live = props.live
+  const liveText = live.text.length > 0 ? live.text : "…"
+  return (
+    <box style={{ flexDirection: "column" }}>
+      <text fg="#c0caf5">{`lunarwing ▏ ${liveText}`}</text>
+      {live.images.map((image) => (
+        <ImageBlock key={image.id} image={image} width={props.width} protocol={props.protocol} />
+      ))}
+      {live.statusKind !== "idle" && live.statusText.length > 0 && (
+        <text fg="#9ece6a">{`  ⋮ ${live.statusText}`}</text>
+      )}
+    </box>
+  )
+}
+
+/**
+ * Scrollable transcript.
+ *
+ * `stickyScroll` keeps the view pinned to the newest content while a turn
+ * streams, and releases the moment the user scrolls up so history stays
+ * readable.
+ */
 export function Transcript(props: {
   items: TranscriptItem[]
   live: LiveTurnView | null
@@ -155,29 +140,22 @@ export function Transcript(props: {
   /** Requested image backend; defaults to renderer negotiation. */
   protocol?: ImageProtocol
 }): ReactNode {
-  const blocks = buildBlocks(props.items, props.live, props.width, props.protocol ?? "auto")
-  const innerWidth = Math.max(props.width - 4, 12)
-  const budget = Math.max(props.height - 2, 1)
-
-  const kept: Block[] = []
-  let used = 0
-  for (let i = blocks.length - 1; i >= 0; i--) {
-    const block = blocks[i]
-    const cost = block.text.length === 0
-      ? block.height
-      : Math.max(wrapText(block.text, innerWidth).length, block.height)
-    if (used + cost > budget && kept.length > 0) {
-      break
-    }
-    used += cost
-    kept.unshift(block)
-  }
+  const protocol = props.protocol ?? "auto"
+  const inlineWidth = imageWidth(props.width)
 
   return (
-    <box style={{ flexDirection: "column", flexGrow: 1, padding: 0 }}>
-      {kept.map((block) => (
-        <Fragment key={block.key}>{block.render()}</Fragment>
+    <scrollbox
+      stickyScroll
+      stickyStart="bottom"
+      scrollX={false}
+      style={{ flexGrow: 1, height: props.height }}
+    >
+      {props.items.map((item) => (
+        <ItemBlock key={item.id} item={item} width={inlineWidth} protocol={protocol} />
       ))}
-    </box>
+      {props.live !== null && (
+        <LiveBlock key="live-turn" live={props.live} width={inlineWidth} protocol={protocol} />
+      )}
+    </scrollbox>
   )
 }

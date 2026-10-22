@@ -52,6 +52,10 @@ export function App(props: {
   // so streaming re-renders never disturb typed text.
   const [inputSeed, setInputSeed] = useState("")
   const [inputEpoch, setInputEpoch] = useState(0)
+  // Latest input text, readable from the global key handler without closing
+  // over a stale render. The input's own onSubmit is the primary send path;
+  // this ref backs Ctrl+Enter/Ctrl+S, which the input does not surface.
+  const inputValueRef = useRef("")
   const [items, setItems] = useState<TranscriptItem[]>([])
   const [pending, setPending] = useState<PendingImage[]>([])
   const [live, setLive] = useState<LiveTurnView | null>(null)
@@ -69,6 +73,7 @@ export function App(props: {
   }, [])
 
   const reseedInput = useCallback((text: string): void => {
+    inputValueRef.current = text
     setInputSeed(text)
     setInputValue(text)
     setInputEpoch((epoch) => epoch + 1)
@@ -83,6 +88,12 @@ export function App(props: {
       },
       onResponse: (content) => {
         const turn = turnRef.current
+        if (turn.isDone) {
+          // Duplicate done frame. The buffer's own invariant says a second
+          // done changes nothing; the app must not push the turn a second
+          // time either.
+          return
+        }
         if (turn.isIdle) {
           // Spontaneous response outside a turn (proactive notices).
           pushItem({ kind: "assistant", text: content })
@@ -99,19 +110,26 @@ export function App(props: {
           text: turn.text,
           images: images.length > 0 ? images : undefined,
         })
-        turn.reset()
+        // Stay in the `done` phase (no reset): a late status frame can no
+        // longer resurrect a live turn, and a duplicate done is rejected
+        // above. The next submit() begins the following turn.
         setLive(null)
         setBusyState(false)
       },
       onStatus: (kind, content, data) => {
+        const turn = turnRef.current
         if (kind === "stream_chunk") {
           // Late chunks after the turn sealed are dropped by the buffer.
-          turnRef.current.appendChunk(content)
-          setLive((previous) =>
-            previous === null
-              ? { text: turnRef.current.text, statusKind: "idle", statusText: "", images: [] }
-              : { ...previous, text: turnRef.current.text },
-          )
+          // Only a chunk the buffer accepts may touch the live view — a
+          // rejected chunk must not resurrect a turn that already sealed.
+          if (turn.appendChunk(content)) {
+            const text = turn.text
+            setLive((previous) =>
+              previous === null
+                ? { text, statusKind: "idle", statusText: "", images: [] }
+                : { ...previous, text },
+            )
+          }
           return
         }
         if (kind === "image_generated" && data?.data_url !== undefined) {
@@ -124,24 +142,28 @@ export function App(props: {
               // frame content, so it doubles as the caption.
               caption: content.length > 0 ? content : undefined,
             }
-            if (turnRef.current.isIdle) {
-              // No turn open (e.g. a late frame after the seam): land it in the
-              // transcript rather than dropping it on the floor.
-              pushItem({ kind: "assistant", text: "", images: [image] })
-            } else {
+            if (turn.isStreaming) {
               liveImagesRef.current = [...liveImagesRef.current, image]
               const images = liveImagesRef.current
               setLive((previous) =>
                 previous === null
-                  ? { text: turnRef.current.text, statusKind: "idle", statusText: "", images }
+                  ? { text: turn.text, statusKind: "idle", statusText: "", images }
                   : { ...previous, images },
               )
+            } else {
+              // No turn open, or one already sealed (a late frame after the
+              // seam): land it in the transcript rather than dropping it.
+              pushItem({ kind: "assistant", text: "", images: [image] })
             }
           }
           return
         }
+        // Status lines only belong to a turn that is still streaming.
+        if (!turn.isStreaming) {
+          return
+        }
         setLive((previous) => ({
-          text: turnRef.current.text,
+          text: turn.text,
           statusKind: kind,
           statusText: statusLine(kind, content, data),
           images: previous?.images ?? [],
@@ -186,14 +208,17 @@ export function App(props: {
   }, [props.socketPath, pushItem])
 
   // ── Submission ──────────────────────────────────────────────────────
+  // `text` is passed in by the caller (the input's onSubmit, or the global
+  // key handler) rather than read from a render closure, so a keypress never
+  // submits a stale copy of the typed text.
   const submit = useCallback(
-    (mode: { interrupt: boolean }): void => {
+    (mode: { interrupt: boolean; text: string }): void => {
       const client = clientRef.current
       if (client === null || !client.connected) {
         setNotice("not connected — start the daemon (`lunarwing run`)")
         return
       }
-      const text = inputValue.trim()
+      const text = mode.text.trim()
       if (text.length === 0 && pending.length === 0) {
         return
       }
@@ -242,7 +267,7 @@ export function App(props: {
       setBusyState(true)
       setLive({ text: "", statusKind: "idle", statusText: "", images: [] })
     },
-    [inputValue, pending, pushItem, reseedInput],
+    [pending, pushItem, reseedInput],
   )
 
   // ── Key handling ────────────────────────────────────────────────────
@@ -257,12 +282,10 @@ export function App(props: {
     }
     // Interrupt + send. Ctrl+Enter needs the kitty keyboard protocol to be
     // distinguishable from plain Enter; Ctrl+S works on every terminal.
+    // Plain Enter is NOT handled here — the input consumes it and reports it
+    // through onSubmit, which avoids a second, racy send path.
     if (is("return", true) || is("s", true)) {
-      submit({ interrupt: true })
-      return
-    }
-    if (is("return")) {
-      submit({ interrupt: false })
+      submit({ interrupt: true, text: inputValueRef.current })
       return
     }
     if (is("v", true)) {
@@ -271,7 +294,8 @@ export function App(props: {
         setPending((previous) => [...previous, clip.image])
         setNotice(null)
       } else if (clip.kind === "text") {
-        reseedInput(inputValue.length === 0 ? clip.text : `${inputValue} ${clip.text}`)
+        const current = inputValueRef.current
+        reseedInput(current.length === 0 ? clip.text : `${current} ${clip.text}`)
       } else {
         setNotice(clip.reason)
       }
@@ -338,7 +362,15 @@ export function App(props: {
           value={inputSeed}
           placeholder="Message LunarWing… (/img <path> to attach, Ctrl+V paste)"
           focused
-          onInput={setInputValue}
+          onInput={(value) => {
+            inputValueRef.current = value
+            setInputValue(value)
+          }}
+          // Enter is consumed by the input; this is the single send path, so
+          // it cannot race the global key handler and double-submit. The
+          // runtime emits the current text (the published .d.ts claims a
+          // SubmitEvent here, which is wrong — see InputRenderable.emit).
+          onSubmit={(value) => submit({ interrupt: false, text: submittedText(value) })}
         />
       </box>
 
@@ -349,6 +381,17 @@ export function App(props: {
       </box>
     </box>
   )
+}
+
+/**
+ * Text submitted by the input's enter event.
+ *
+ * The runtime emits the current input string, but the published type claims a
+ * `SubmitEvent`. Accept both so a library fix in either direction keeps
+ * working.
+ */
+function submittedText(value: string | { value?: string }): string {
+  return typeof value === "string" ? value : (value.value ?? "")
 }
 
 /**

@@ -230,7 +230,10 @@ export class ReplClient {
   private startKeepalive(): void {
     this.keepalive = setInterval(() => {
       if (this.connected) {
-        this.send("Ping")
+        // A protocol Ping, NOT a chat message. send() wraps its argument in a
+        // Message frame, which would make the daemon answer "Pong." as if the
+        // user had typed it.
+        this.sendRaw("Ping")
       }
     }, KEEPALIVE_INTERVAL_MS)
   }

@@ -147,6 +147,24 @@ test("server Ping is answered with Pong", async () => {
   client.disconnect()
 })
 
+test("REGRESSION: keepalive is a protocol Ping, never a chat message", async () => {
+  const client = new ReplClient(daemon.socketPath, {})
+  await client.connect()
+
+  // The keepalive fires on an interval far longer than a test should wait, so
+  // exercise the same code path directly: a bare "Ping" string is a protocol
+  // frame, whereas send("Ping") would wrap it as { Message: { content: "Ping" } }
+  // and the daemon would answer it as if the user had typed it.
+  const messagesBefore = daemon.received.length
+  ;(client as unknown as { sendRaw: (message: ReplMessage) => void }).sendRaw("Ping")
+  await new Promise((resolve) => setTimeout(resolve, 50))
+
+  const sent = daemon.received.slice(messagesBefore)
+  expect(sent).toContain("Ping")
+  expect(sent.some((message) => typeof message === "object" && "Message" in message)).toBe(false)
+  client.disconnect()
+})
+
 test("split TCP frames over one line are reassembled", async () => {
   const statuses: Array<[string, string]> = []
   const client = new ReplClient(daemon.socketPath, {

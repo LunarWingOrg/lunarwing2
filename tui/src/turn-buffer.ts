@@ -23,7 +23,7 @@ export class TurnBuffer {
 
   /** Open a turn (called when the user message is sent). Idempotent. */
   begin(): void {
-    if (this.phase === "idle") {
+    if (this.phase !== "streaming") {
       this.phase = "streaming"
       this.accumulated = ""
       this.sealedText = null

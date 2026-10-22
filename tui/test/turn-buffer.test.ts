@@ -68,4 +68,16 @@ describe("TurnBuffer", () => {
     expect(turn.isIdle).toBe(true)
     expect(turn.text).toBe("")
   })
+
+  test("begin after a sealed turn starts a fresh turn", () => {
+    const turn = new TurnBuffer()
+    turn.begin()
+    turn.appendChunk("first turn")
+    turn.complete("")
+    turn.begin()
+    expect(turn.isStreaming).toBe(true)
+    expect(turn.text).toBe("")
+    expect(turn.appendChunk("second")).toBe(true)
+    expect(turn.text).toBe("second")
+  })
 })

@@ -96,6 +96,12 @@ async function replyWithImage(): Promise<void> {
   })
   await sleep(60)
   send({ Response: { content: "", session_id: "img-1", is_complete: true } })
+  // Late frames after the turn sealed must NOT resurrect a live turn or
+  // duplicate the message. This is the regression the turn-state machine
+  // exists to prevent.
+  await sleep(40)
+  send({ Status: { kind: "stream_chunk", content: "zombie chunk", session_id: "img-1" } })
+  send({ Response: { content: "duplicate done payload", session_id: "img-1", is_complete: true } })
 }
 
 async function waitForFrame(
@@ -179,6 +185,15 @@ describe("App generated-image pipeline", () => {
         (frame) => frame.includes("ready") && frame.includes(IMAGE_CAPTION),
       )
       expect(sealed.startsWith("TIMEOUT")).toBe(false)
+
+      // Give the late chunk and duplicate done frame time to misbehave.
+      await sleep(120)
+      await setup.flush()
+      const after = setup.captureCharFrame()
+      // A late chunk must not resurrect a phantom live turn line.
+      expect(after).not.toContain("zombie chunk")
+      // A duplicate done frame must not push the turn a second time.
+      expect(after).not.toContain("duplicate done payload")
     } finally {
       setup.renderer.destroy()
     }
