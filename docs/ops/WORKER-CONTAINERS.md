@@ -144,6 +144,35 @@ section and "Launch identity (WI#422)" further down.
   `node -> /usr/local/bin/bun`) so task code calling `node`/`npx` still
   resolves; kimi is unaffected (`node:22` base, `node` in
   `/usr/local/bin`).
+- **Task-runner delegation (WI#454, kimi lane — first slice of the
+  two-container split).** The maintainer's no-root policy (note #10954 on
+  !1829) retires the root bridge: two non-root containers per lane, a
+  bridge container holding the hub credential and a task container
+  running all task code under a different uid, sharing the workspace
+  volume and talking over a unix socket. The kimi lane now carries the
+  worker-side machinery for that split: a task-runner daemon
+  (`kimicode4lunarwing/scripts/task_runner.ts`) that executes tasks as
+  the task uid (it refuses to start as root — the identity boundary is
+  the uid it runs under, so no setpriv drop is needed), and a bridge-side
+  client (`task_runner_client.ts`) that delegates each task over the
+  socket. The entrypoint rehearses the split inside the current
+  single-container image: with the credential handoff active it starts
+  the runner as the task uid on `/run/lunarwing/task-runner.sock` (the
+  directory handed to the task uid, the credential vars stripped from
+  what it inherits) and exports `LUNARWING_TASK_RUNNER_SOCKET` to the
+  bridge, which then routes every task to the unprivileged runner instead
+  of spawning the CLI itself; `KIMI_TASK_RUNNER=skip` (or no credential
+  handoff, the host dev shape) keeps local execution. The runner never
+  sees the hub credential: the token file is root-only `0400` and the
+  token var was unset before the runner spawn. A dead runner socket maps
+  to an error `task_result` (the hub is never stranded), cancel forwards
+  to the runner, and every delegation rejection surfaces as an error
+  result. What remains for the full split (WI#454's own remaining
+  scope): the image-level separation (bridge container and task
+  container as two mt-admin units under two different non-root uids,
+  with the socket crossing the shared workspace volume and the bridge
+  itself dropping `USER 0:0`), plus the same machinery on the opencode
+  and pebble lanes.
 - **Cron workspace ownership.** The cron bootstrap (`create_cron_workspace`
   / the TS `resolveTaskWorkspace`) runs in the root bridge, so EVERY
   directory the walk creates — intermediates and leaf alike, or the task
