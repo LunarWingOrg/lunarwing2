@@ -223,7 +223,7 @@ assert_not_contains "$scoped_quadlet" 'gate%%token' \
 MT_ROOTLESS=false
 CHOWN_CALL=''
 prepare_worker_workspace root opencode2 >/dev/null
-if [[ "$CHOWN_CALL" == "-R 10003:10003 $fixture/home/lunarwing/opencode2-workspace" ]]; then
+if [[ "$CHOWN_CALL" == "--no-dereference 10003:10003 ." ]]; then
   pass 'rootful opencode2 workspace uses image UID and GID'
 else
   fail "rootful opencode2 workspace ownership wrong: $CHOWN_CALL"

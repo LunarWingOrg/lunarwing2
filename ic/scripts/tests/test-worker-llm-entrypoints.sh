@@ -190,6 +190,24 @@ def stage_setup(source, app, home):
     target.chmod(0o755)
 
 
+def relocate_entrypoint(entrypoint, app, home, bin_dir=None):
+    """Apply the standard relocations to an entrypoint's text: /app/ and
+    /home/<user>/ into the scratch tree, and (WI#454/ME-1) the stub bin_dir
+    in front of the entrypoint's pinned root PATH — the pin is the ME-1 fix
+    and must survive the harness run, so the stubs ride inside it instead
+    of the inherited PATH the pin discards."""
+    script = entrypoint.replace("/app/", str(app) + "/")
+    for user in ("opencode", "kimi"):
+        script = script.replace(f"/home/{user}/", str(home) + "/")
+    if bin_dir is not None:
+        script = script.replace(
+            "export PATH=/usr/local/cargo/bin:/usr/local/go/bin",
+            f"export PATH={bin_dir}:/usr/local/cargo/bin:/usr/local/go/bin",
+            1,
+        )
+    return script
+
+
 def execable_dir(root):
     """Temp dirs can be mounted noexec on dev VMs; probe for a directory
     where the stub binaries can actually run. root/bin is probed first; the
@@ -286,9 +304,7 @@ def run_websocket_startup(worker):
             "exit 0\n"
         )
         bun_stub.chmod(0o755)
-        script = entrypoint.replace("/app/", str(app) + "/").replace("cd /app\n", f"cd {app}\n")
-        for user in ("opencode", "kimi"):
-            script = script.replace(f"/home/{user}/", str(home) + "/")
+        script = relocate_entrypoint(entrypoint, app, home, bin_dir).replace("cd /app\n", f"cd {app}\n")
         env = {
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
             "HOME": str(home), "TMPDIR": temp,
@@ -349,9 +365,7 @@ def run_oneshot_startup(worker, mode):
             "exit 0\n"
         )
         stub.chmod(0o755)
-        script = entrypoint.replace("/app/", str(app) + "/")
-        for user in ("opencode", "kimi"):
-            script = script.replace(f"/home/{user}/", str(home) + "/")
+        script = relocate_entrypoint(entrypoint, app, home, bin_dir)
         env = {
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
             "HOME": str(home), "TMPDIR": temp,
@@ -542,7 +556,7 @@ def run_task_drop_argv(worker):
         (root / "app" / "config").mkdir(parents=True)
         result = subprocess.run(
             ["bash", "-s", "--", "probe prompt"],
-            input=entrypoint.replace("/app/", str(root / "app") + "/"),
+            input=relocate_entrypoint(entrypoint, root / "app", root / "home", bin_dir),
             text=True, env=env, capture_output=True, timeout=60)
         assert result.returncode == 0, f"{worker} drop: entrypoint failed: {result.stderr}"
         argv = mark.read_text().strip()
@@ -553,16 +567,42 @@ def run_task_drop_argv(worker):
             f"<--reuid={task_uid}><--regid={task_uid}><--clear-groups>"
             "<--ambient-caps=-all><--inh-caps=-all><--no-new-privs>"
         )
+        # WI#454/ME-1: the task toolchain PATH is handed over at the drop
+        # (PATH="$TASK_PATH"), not inherited from the image PATH the root
+        # launcher pins to root-owned directories. TASK_PATH appends the
+        # PINNED root PATH (the launcher re-exports PATH before defining
+        # TASK_PATH), not the test's inherited PATH.
+        pinned_path = (
+            f"{bin_dir}:"
+            "/usr/local/cargo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin"
+            ":/usr/sbin:/usr/bin:/sbin:/bin"
+        )
+        # MV-2: the opencode entrypoint's root PATH appends
+        # /usr/local/bun-node-fallback-bin (MI-2/WI#454), and TASK_PATH
+        # inherits $PATH, so the setpriv argv carries it.  Kimi's
+        # node:22 base does not need the fallback.
+        if worker != "kimi":
+            pinned_path = pinned_path + ":/usr/local/bun-node-fallback-bin"
+        # The harness's /home/<user>/ relocation also rewrites the
+        # TASK_PATH text, so the expected value follows the temp home.
         if worker == "kimi":
+            task_path = (
+                f"{root}/home/.cargo/bin:/usr/local/cargo/bin:/usr/local/go/bin"
+                f":{root}/home/go/bin:" + pinned_path
+            )
             expected = flags + (
-                "<env><HOME=/home/kimi><-u><AGENT_AUTH_TOKEN>"
-                "<-u><AGENT_AUTH_TOKEN_FILE>"
+                "<env><-u><AGENT_AUTH_TOKEN><-u><AGENT_AUTH_TOKEN_FILE>"
+                "<HOME=/home/kimi><PATH=" + task_path + ">"
                 "<kimi><-p><probe prompt><--output-format><stream-json>"
             )
         else:
+            task_path = (
+                f"{root}/home/.cargo/bin:/usr/local/cargo/bin:/usr/local/go/bin"
+                f":{root}/home/go/bin:" + pinned_path
+            )
             expected = flags + (
-                "<env><HOME=/home/opencode><-u><AGENT_AUTH_TOKEN>"
-                "<-u><AGENT_AUTH_TOKEN_FILE>"
+                "<env><-u><AGENT_AUTH_TOKEN><-u><AGENT_AUTH_TOKEN_FILE>"
+                "<HOME=/home/opencode><PATH=" + task_path + ">"
                 f"<{task_stub}><run><probe prompt>"
             )
         assert argv == expected, \

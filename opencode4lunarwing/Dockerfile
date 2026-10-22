@@ -199,10 +199,20 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
       tar -C /usr/local -xzf /tmp/go.tgz; \
       rm /tmp/go.tgz; \
     fi
+# WI#454/ME-1: the image-wide PATH carries ONLY root-owned directories.
+# Since WI#400 the container runs as root, and every root-side command
+# resolution (the image HEALTHCHECK, the root entrypoint on an in-place
+# restart, the bridge's setpriv lookup) walks this PATH — task-owned
+# entries first would let the task uid plant a file that root executes.
+# The task gets its toolchain directories at the privilege drop instead
+# (as_task in entrypoint.sh; the serve process's env).
+# MI-2 (run-186 review): /usr/local/bun-node-fallback-bin is root-owned
+# (0755) on the oven/bun:debian base and holds `node -> /usr/local/bin/bun`;
+# it must stay on the PATH so task code calling `node`/`npx` still resolves.
 ENV GOROOT=/usr/local/go \
     GOPATH=/home/opencode/go \
     CARGO_HOME=/home/opencode/.cargo \
-    PATH=/home/opencode/.cargo/bin:/usr/local/cargo/bin:/usr/local/go/bin:/home/opencode/go/bin:$PATH
+    PATH=/usr/local/cargo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bun-node-fallback-bin
 
 # ── non-root user ──────────────────────
 # Keep IDs synchronized with ic/scripts/lunarwing-mt-admin.sh. Rootless Podman
@@ -260,8 +270,10 @@ EXPOSE 8443
 EXPOSE 9090
 
 # ── health check ───────────────────────
+# WI#454/ME-1: absolute path — the healthcheck runs as the container user
+# (root), and a bare `curl` would resolve through the image PATH.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-  CMD curl -sf http://127.0.0.1:8443/health || exit 1
+  CMD /usr/bin/curl -sf http://127.0.0.1:8443/health || exit 1
 
 # WI#400: root entrypoint — the launcher drops the serve process and every
 # one-shot process to the opencode uid (10001) itself; the WebSocket bridge
