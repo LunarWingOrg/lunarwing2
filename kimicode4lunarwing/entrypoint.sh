@@ -162,8 +162,13 @@ case "$MODE" in
       fi
       # The runner runs as the task uid, so HOME and PATH must be the task's
       # own (as_task's exact env shape) — and the credential vars must never
-      # be present in what it inherits.
+      # be present in what it inherits. KIMI_TASK_UID/KIMI_TASK_GID are
+      # UNSET for the runner: it already IS the task identity, and a second
+      # setpriv drop inside executeTask would look for setpriv on the task
+      # PATH and fail (or drop to the wrong identity). The identity stays
+      # pinned for the bridge process itself.
       as_task env -u AGENT_AUTH_TOKEN -u AGENT_AUTH_TOKEN_FILE \
+        -u KIMI_TASK_UID -u KIMI_TASK_GID \
         WORKSPACE_ROOT="$WORKSPACE_ROOT" \
         node /app/scripts/task_runner.js "$RUNNER_SOCKET" &
       RUNNER_PID=$!
