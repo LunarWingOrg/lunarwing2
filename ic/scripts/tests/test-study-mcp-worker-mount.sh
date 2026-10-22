@@ -178,10 +178,12 @@ CONTAINER_RT="podman"
 MT_ROOTLESS="true"
 start_tenant_opencode test
 grep -Fq -- "-v $(tenant_run_dir test)/ssh-agent:/tmp/ssh-agent:ro,z" "$ctr_calls"
-# WI#453: rootless hosts run no chown at all (keep-id maps the tenant
-# identity), so the old "-R test:test <workspace>" assertion must not fire.
-if [[ -s "$chown_calls" ]]; then
-  printf 'rootless opencode launch ran chown unexpectedly: %s\n' "$(cat "$chown_calls")" >&2
+# WI#453: rootless hosts run no chown at all for the workspace directory
+# (keep-id maps the tenant identity), so the old "-R test:test <workspace>"
+# assertion must not fire.  Other chown calls (study-notes state seeding)
+# are expected; only the workspace-specific chown must be absent.
+if grep -Fq -- "$(tenant_lw_root test)/opencode-workspace" "$chown_calls"; then
+  printf 'rootless opencode launch chowned the workspace unexpectedly: %s\n' "$(cat "$chown_calls")" >&2
   exit 1
 fi
 grep -Fq -- "-v $study_home:/opt/lw2studymcp:ro,z" "$ctr_calls"
@@ -204,10 +206,11 @@ fi
 render_worker_quadlet test opencode 8443
 opencode_unit="$(tenant_quadlet_dir test)/lunarwing-opencode-test.container"
 grep -Fq "Volume=$(tenant_run_dir test)/ssh-agent:/tmp/ssh-agent:ro,z" "$opencode_unit"
-# WI#453: rootless hosts run no chown at all (keep-id maps the tenant
-# identity), so the old "-R test:test <workspace>" assertion must not fire.
-if [[ -s "$chown_calls" ]]; then
-  printf 'rootless opencode quadlet ran chown unexpectedly: %s\n' "$(cat "$chown_calls")" >&2
+# WI#453: rootless hosts run no chown at all for the workspace directory
+# (keep-id maps the tenant identity), so the old "-R test:test <workspace>"
+# assertion must not fire.
+if grep -Fq -- "$(tenant_lw_root test)/opencode-workspace" "$chown_calls"; then
+  printf 'rootless opencode quadlet chowned the workspace unexpectedly: %s\n' "$(cat "$chown_calls")" >&2
   exit 1
 fi
 grep -Fq "Volume=$study_home:/opt/lw2studymcp:ro,z" "$opencode_unit"
