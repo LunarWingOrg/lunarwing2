@@ -561,9 +561,9 @@ if [[ "$mi3_status" -ne 0 ]]; then
   fail "MI-3: prepare_worker_workspace failed (rc $mi3_status)"
 fi
 if [[ "$CHOWN_CALL" == "--no-dereference 10002:10002 ." ]]; then
-  pass 'MI-3: top-dir chown uses `.` (not -R)'
+  pass 'MI-3: top-dir chown uses dot (not -R)'
 else
-  fail "MI-3: top-dir chown missing or not `.`-scoped: $CHOWN_CALL"
+  fail "MI-3: top-dir chown missing or not dot-scoped: $CHOWN_CALL"
 fi
 if grep -q 'plain.txt' "$mi3_chown_log"; then
   pass 'MI-3: chown walk covers plain files in the workspace'
