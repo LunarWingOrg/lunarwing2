@@ -2929,10 +2929,13 @@ class TrivyGateInputTests(unittest.TestCase):
     def test_gate_line_suffix_or_extra_line_is_caught(self):
         # MR !1750 review: the startswith() pin let every one of these pass,
         # and each makes trivy (or the job) exit 0 on an unfixed CRITICAL.
+        # The gate call is wrapped in trivy_with_retry (item 28), so locate it
+        # by the gate command itself, not by the line prefix.
         script = list(config.WORKER_SCAN_SCRIPT)
         gate = next(
-            index for index, line in enumerate(script)
-            if line.startswith(config.TRIVY_GATE_COMMAND)
+            index
+            for index, line in enumerate(script)
+            if config.TRIVY_GATE_COMMAND in line
         )
         cases = {
             "--ignore-unfixed": script[:gate] + [script[gate] + " --ignore-unfixed"] + script[gate + 1:],
