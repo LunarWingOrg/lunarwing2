@@ -529,7 +529,13 @@ unset wi453_real
 # MI-3 (run-186 review): a tenant-planted hard link inside the workspace
 # must keep its original owner — the chown walk skips regular files with a
 # link count above 1 so `chown -R` cannot hand an outside file to the
-# container uid.  Also verify the top-dir chown uses `.` (not -R).
+# container uid. MY-1 (run-193 review): the batched `find -exec chown` runs
+# the chown BINARY, not the shell-function mock above, so asserting on
+# CHOWN_CALL proves nothing about the walk. Put a stub `chown` executable
+# first on PATH that logs every invocation, then assert the hard link is
+# absent from the log and a plain file is present. Dropping the
+# `! ( -type f -links +1 )` clause from the production find reintroduces the
+# hard link into the log and fails this pin (mutation-verified).
 mi3_outside="$fixture/home/mi3-outside"
 mi3_outside_file="$mi3_outside/secret.txt"
 command mkdir -p "$mi3_outside"
@@ -537,21 +543,42 @@ printf 'root-data' >"$mi3_outside_file"
 command rm -rf -- "$fixture/home/lunarwing/kimi-workspace"
 command mkdir -p "$fixture/home/lunarwing/kimi-workspace"
 command ln "$mi3_outside_file" "$fixture/home/lunarwing/kimi-workspace/link.txt"
+printf 'plain' >"$fixture/home/lunarwing/kimi-workspace/plain.txt"
+mi3_stub_bin="$fixture/mi3-stub-bin"
+mi3_chown_log="$fixture/mi3-chown.log"
+command mkdir -p "$mi3_stub_bin"
+: >"$mi3_chown_log"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\nexit 0\n' "$mi3_chown_log" \
+  >"$mi3_stub_bin/chown"
+command chmod +x "$mi3_stub_bin/chown"
+# Two chown channels: the top-dir `chown ... .` resolves to the shell-
+# function mock above (functions shadow PATH), while `find -exec chown`
+# execs the binary, which hits the PATH stub and is logged.
 CHOWN_CALL=''
-prepare_worker_workspace root kimi >/dev/null 2>&1 || true
-# The hard link must keep its original owner (the mock chown is a no-op,
-# but the real code would skip it).  The chown mock only records the last
-# call, so on a non-empty workspace with one planted hard link, the find
-# loop calls chown for `.` (top), skips the hard link (link count 2), and
-# calls chown for nothing else — CHOWN_CALL holds the top-dir call.
+mi3_status=0
+PATH="$mi3_stub_bin:$PATH" prepare_worker_workspace root kimi >/dev/null 2>&1 || mi3_status=$?
+if [[ "$mi3_status" -ne 0 ]]; then
+  fail "MI-3: prepare_worker_workspace failed (rc $mi3_status)"
+fi
 if [[ "$CHOWN_CALL" == "--no-dereference 10002:10002 ." ]]; then
-  pass 'MI-3: hard link in workspace keeps its owner (chown skips link count > 1)'
+  pass 'MI-3: top-dir chown uses `.` (not -R)'
 else
-  fail "MI-3: unexpected chown on workspace with hard link: $CHOWN_CALL"
+  fail "MI-3: top-dir chown missing or not `.`-scoped: $CHOWN_CALL"
+fi
+if grep -q 'plain.txt' "$mi3_chown_log"; then
+  pass 'MI-3: chown walk covers plain files in the workspace'
+else
+  fail "MI-3: chown walk skipped plain file: $(cat "$mi3_chown_log")"
+fi
+if grep -q 'link.txt' "$mi3_chown_log"; then
+  fail 'MI-3: hard link in workspace was chowned (must skip link count > 1)'
+else
+  pass 'MI-3: hard link in workspace keeps its owner (chown skips link count > 1)'
 fi
 command rm -f -- "$fixture/home/lunarwing/kimi-workspace/link.txt"
-command rm -rf -- "$mi3_outside"
-unset mi3_outside mi3_outside_file
+command rm -f -- "$fixture/home/lunarwing/kimi-workspace/plain.txt"
+command rm -rf -- "$mi3_outside" "$mi3_stub_bin" "$mi3_chown_log"
+unset mi3_outside mi3_outside_file mi3_stub_bin mi3_chown_log mi3_status
 
 cat >"$fixture/env/legacy.env" <<'EOF'
 KIMI_API_KEY='key\\with\'quote'
