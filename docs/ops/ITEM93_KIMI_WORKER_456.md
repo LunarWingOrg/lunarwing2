@@ -130,14 +130,25 @@ sudo bash ic/scripts/lunarwing-mt-admin.sh start-tenant kimi93test
 - **Handshake as the daemon dials it**: `curl -i` upgrade request with
   `Sec-WebSocket-Protocol: lunarwing-agent-v1` and the scoped bearer →
   **HTTP/1.1 101 Switching Protocols**. With a wrong bearer the bridge
-  answers 401 before the upgrade — auth is enforced.
+  answers 401 before the upgrade — auth is enforced. This exercises the
+  exact `connect_and_handshake` code path (`ic/src/orchestrator/external_worker.rs`)
+  whose failure produced WI#456's `External worker 'kimi' connection
+  failed: IO error: Connection refused (os error 111)` — the error is
+  gone with the rebuilt image.
 - **Readiness**: `curl http://127.0.0.1:30031/ready` →
   `{"ready": true, … "websocket": {"listening": true, "port": 30030,
   "path": "/ws/agent"}}`.
-- The daemon binary for the tenant was built with `build-tenant
-  kimi93test` and started; the daemon-configured route above is what its
-  `create_job(mode: "kimi")` dispatch dials, and the handshake + ready
-  probes exercise that exact path (subprotocol, bearer, endpoint, port).
+- The daemon binary was built (`build-tenant kimi93test`) and started; its
+  boot logged `External workers configured: kimi, pebble, opencode` with
+  the live socket behind the route. A full LLM-driven
+  `create_job(mode: "kimi")` chat turn was attempted through
+  `/api/chat/send`; the turn reached the daemon and **failed at the LLM
+  upstream step** — this dev VM's TensorZero upstream answers `/health`
+  200 but its model providers return 401 (the fleet's live credentials are
+  not provisioned here; the same limitation every deploy-gated item
+  records). The dispatch-level failure of WI#456 lives in the WS connect,
+  which is verified end-to-end above; the LLM round-trip remains
+  deploy-gated like the item-69/!1783 real-worker acceptance evidence.
 
 Teardown: `sudo bash ic/scripts/lunarwing-mt-admin.sh remove-tenant
 kimi93test --purge` (the tenant, its user, ports block, and containers are
