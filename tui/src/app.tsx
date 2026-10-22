@@ -18,11 +18,11 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { useKeyboard, useRenderer } from "@opentui/react"
 import { ReplClient } from "./repl-client.ts"
 import { TurnBuffer } from "./turn-buffer.ts"
-import { attachFile, readClipboard } from "./images.ts"
-import { decodeDataUrl } from "./util.ts"
+import { attachFile, readClipboard, type ImageProtocol } from "./images.ts"
+import { decodeDataUrl, truncate } from "./util.ts"
 import type { PendingImage, ReplStatusKind } from "./protocol.ts"
 import { AttachmentBar } from "./components/attachment-bar.tsx"
-import { Transcript, type LiveTurnView, type TranscriptItem } from "./components/transcript.tsx"
+import { Transcript, type LiveTurnView, type TranscriptImage, type TranscriptItem } from "./components/transcript.tsx"
 
 let itemCounter = 0
 const nextId = (prefix: string): string => {
@@ -30,10 +30,20 @@ const nextId = (prefix: string): string => {
   return `${prefix}-${itemCounter}`
 }
 
-export function App(props: { socketPath: string; agentName: string }): ReactNode {
+export function App(props: {
+  socketPath: string
+  agentName: string
+  /** Requested image backend; `auto` lets the renderer negotiate. */
+  imageProtocol?: ImageProtocol
+}): ReactNode {
   const renderer = useRenderer()
+  const requestedImageProtocol = props.imageProtocol ?? "auto"
   const clientRef = useRef<ReplClient | null>(null)
   const turnRef = useRef(new TurnBuffer())
+  // Images generated during the current turn. Held in a ref (not state) so the
+  // socket callbacks below, which close over the mount-time render, still see
+  // the live list. Drained into the transcript item when the turn seals.
+  const liveImagesRef = useRef<TranscriptImage[]>([])
 
   const [connected, setConnected] = useState(false)
   const [inputValue, setInputValue] = useState("")
@@ -80,7 +90,15 @@ export function App(props: { socketPath: string; agentName: string }): ReactNode
         }
         // The done frame CLOSES the stream — never wipes it.
         turn.complete(content)
-        pushItem({ kind: "assistant", text: turn.text })
+        // Generated images belong to the sealed turn: carry them into the
+        // transcript item instead of letting setLive(null) discard them.
+        const images = liveImagesRef.current
+        liveImagesRef.current = []
+        pushItem({
+          kind: "assistant",
+          text: turn.text,
+          images: images.length > 0 ? images : undefined,
+        })
         turn.reset()
         setLive(null)
         setBusyState(false)
@@ -99,12 +117,26 @@ export function App(props: { socketPath: string; agentName: string }): ReactNode
         if (kind === "image_generated" && data?.data_url !== undefined) {
           const bytes = decodeDataUrl(String(data.data_url))
           if (bytes !== null) {
-            const image = { id: nextId("gen"), bytes }
-            setLive((previous) =>
-              previous === null
-                ? previous
-                : { ...previous, images: [...previous.images, image] },
-            )
+            const image: TranscriptImage = {
+              id: nextId("gen"),
+              bytes,
+              // The daemon sends the file path (or "generated image") as the
+              // frame content, so it doubles as the caption.
+              caption: content.length > 0 ? content : undefined,
+            }
+            if (turnRef.current.isIdle) {
+              // No turn open (e.g. a late frame after the seam): land it in the
+              // transcript rather than dropping it on the floor.
+              pushItem({ kind: "assistant", text: "", images: [image] })
+            } else {
+              liveImagesRef.current = [...liveImagesRef.current, image]
+              const images = liveImagesRef.current
+              setLive((previous) =>
+                previous === null
+                  ? { text: turnRef.current.text, statusKind: "idle", statusText: "", images }
+                  : { ...previous, images },
+              )
+            }
           }
           return
         }
@@ -121,10 +153,16 @@ export function App(props: { socketPath: string; agentName: string }): ReactNode
       onDisconnect: (reason) => {
         setConnected(false)
         const turn = turnRef.current
-        if (turn.isStreaming && turn.text.length > 0) {
+        const images = liveImagesRef.current
+        liveImagesRef.current = []
+        if (turn.isStreaming && (turn.text.length > 0 || images.length > 0)) {
           // Connection dropped mid-stream: seal what we have, never wipe.
           turn.complete("")
-          pushItem({ kind: "assistant", text: turn.text })
+          pushItem({
+            kind: "assistant",
+            text: turn.text,
+            images: images.length > 0 ? images : undefined,
+          })
           turn.reset()
         }
         setLive(null)
@@ -184,11 +222,22 @@ export function App(props: { socketPath: string; agentName: string }): ReactNode
       pushItem({
         kind: wasBusy && !mode.interrupt ? "queued" : "user",
         text: text.length > 0 ? text : "(image)",
+        // Show what was actually sent: an image that vanishes behind a bare
+        // "(image)" label is unhelpful when you want to review the turn later.
+        images:
+          pending.length > 0
+            ? pending.map((image) => ({
+                id: image.id,
+                bytes: image.bytes,
+                caption: image.filename ?? undefined,
+              }))
+            : undefined,
       })
       setPending([])
       reseedInput("")
       setNotice(null)
 
+      liveImagesRef.current = []
       turnRef.current.begin()
       setBusyState(true)
       setLive({ text: "", statusKind: "idle", statusText: "", images: [] })
@@ -245,20 +294,40 @@ export function App(props: { socketPath: string; agentName: string }): ReactNode
   const statusColor = connected ? "#9ece6a" : "#f7768e"
   const stateLabel = !connected ? "offline" : busy ? "busy" : "ready"
   const historyHeight = renderer.height - 7 - (pending.length > 0 ? 9 : 0)
+  // Which image protocol the renderer resolved for this terminal. OpenTUI
+  // resolves "auto" itself, so surfacing the effective choice makes a silent
+  // fallback to unicode blocks obvious instead of mysterious.
+  const imageProtocol = resolvedImageProtocol(requestedImageProtocol, renderer.capabilities)
+  const imageColor = imageProtocol === "kitty" ? "#9ece6a" : "#565f89"
+  // The header is a single row: budget the fixed labels first and truncate the
+  // socket path into whatever is left, so a narrow terminal never eats the
+  // agent name or the connection state.
+  const fixedHeaderWidth =
+    props.agentName.length + 2 + 2 + stateLabel.length +
+    (imageProtocol === null ? 0 : 5 + imageProtocol.length)
+  const socketRoom = Math.max(renderer.width - fixedHeaderWidth - 2, 0)
+  const socketLabel = socketRoom >= 4 ? truncate(props.socketPath, socketRoom) : ""
 
   return (
     <box style={{ flexDirection: "column", width: "100%", height: "100%" }}>
       <box style={{ flexDirection: "row", height: 1 }}>
         <text fg="#7aa2f7"> {props.agentName} </text>
         <text fg={statusColor}>● {stateLabel}</text>
-        <text fg="#565f89"> {props.socketPath}</text>
+        {imageProtocol !== null && <text fg={imageColor}> {`img:${imageProtocol}`}</text>}
+        {socketLabel.length > 0 && <text fg="#565f89"> {socketLabel}</text>}
       </box>
 
-      <Transcript items={items} live={liveWithText} height={historyHeight} width={renderer.width} />
+      <Transcript
+        items={items}
+        live={liveWithText}
+        height={historyHeight}
+        width={renderer.width}
+        protocol={requestedImageProtocol}
+      />
 
       {notice !== null && <text fg="#e0af68"> {notice}</text>}
 
-      <AttachmentBar images={pending} />
+      <AttachmentBar images={pending} protocol={requestedImageProtocol} />
 
       <box
         title={busy ? "Message (Enter=queue · Ctrl+Enter/Ctrl+S=interrupt & send)" : "Message"}
@@ -280,6 +349,45 @@ export function App(props: { socketPath: string; agentName: string }): ReactNode
       </box>
     </box>
   )
+}
+
+/**
+ * Effective image protocol for this terminal.
+ *
+ * Mirrors OpenTUI's resolution: an explicit request wins, then a declared
+ * `image_protocol` capability, and `auto` falls back through kitty → sixel →
+ * unicode blocks. A multiplexer downgrades to blocks (graphics escapes can be
+ * swallowed) unless a protocol is forced.
+ */
+function resolvedImageProtocol(
+  requested: ImageProtocol,
+  capabilities: {
+    image_protocol?: string
+    kitty_graphics: boolean
+    sixel: boolean
+    multiplexer: string
+  } | null,
+): string | null {
+  if (requested !== "auto") {
+    return requested
+  }
+  if (capabilities === null) {
+    return null
+  }
+  const declared = capabilities.image_protocol
+  if (declared !== undefined && declared !== "auto") {
+    return declared
+  }
+  if (capabilities.multiplexer === "tmux") {
+    return "blocks"
+  }
+  if (capabilities.kitty_graphics) {
+    return "kitty"
+  }
+  if (capabilities.sixel) {
+    return "sixel"
+  }
+  return "blocks"
 }
 
 /** Human-readable single-line rendering of a status frame. */

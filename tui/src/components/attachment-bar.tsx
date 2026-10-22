@@ -1,13 +1,18 @@
 /** Pending attachment strip with inline image previews. */
 
 import type { PendingImage } from "../protocol.ts"
+import type { ImageProtocol } from "../images.ts"
 import type { ReactNode } from "react"
 import { truncate } from "../util.ts"
 
 const PREVIEW_WIDTH = 20
 const PREVIEW_HEIGHT = 7
 
-export function AttachmentBar(props: { images: PendingImage[] }): ReactNode | null {
+export function AttachmentBar(props: {
+  images: PendingImage[]
+  /** Requested image backend; defaults to renderer negotiation. */
+  protocol?: ImageProtocol
+}): ReactNode | null {
   if (props.images.length === 0) {
     return null
   }
@@ -21,7 +26,7 @@ export function AttachmentBar(props: { images: PendingImage[] }): ReactNode | nu
           <image
             source={image.bytes}
             fit="cover"
-            protocol="auto"
+            protocol={props.protocol ?? "auto"}
             style={{ width: PREVIEW_WIDTH, height: PREVIEW_HEIGHT }}
           />
           <text fg="#7aa2f7">{truncate(image.filename ?? image.id, PREVIEW_WIDTH + 2)}</text>

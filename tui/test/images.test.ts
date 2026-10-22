@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { attachFile, makePendingImage, sniffImageMime } from "../src/images.ts"
+import { attachFile, makePendingImage, parseImageProtocol, sniffImageMime } from "../src/images.ts"
 import { decodeDataUrl, wrapText } from "../src/util.ts"
 
 describe("sniffImageMime", () => {
@@ -42,6 +42,22 @@ describe("attachFile", () => {
 
   test("returns null for missing files", () => {
     expect(attachFile("/nonexistent/image.png")).toBeNull()
+  })
+})
+
+describe("parseImageProtocol", () => {
+  test("accepts the known protocol names", () => {
+    expect(parseImageProtocol("auto")).toBe("auto")
+    expect(parseImageProtocol("kitty")).toBe("kitty")
+    expect(parseImageProtocol("sixel")).toBe("sixel")
+    expect(parseImageProtocol("blocks")).toBe("blocks")
+  })
+
+  test("rejects anything else rather than guessing", () => {
+    expect(parseImageProtocol("Kitty")).toBeNull()
+    expect(parseImageProtocol("")).toBeNull()
+    expect(parseImageProtocol("iterm")).toBeNull()
+    expect(parseImageProtocol("auto ")).toBeNull()
   })
 })
 

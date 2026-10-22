@@ -9,6 +9,22 @@ import type { PendingImage } from "./protocol.ts"
 
 let imageCounter = 0
 
+/**
+ * Terminal image render protocol. Mirrors OpenTUI's `ImageRenderProtocol`:
+ * `auto` lets the renderer negotiate, the rest force a specific backend.
+ *
+ * Forcing `kitty`/`sixel` bypasses OpenTUI's "tmux ⇒ unicode blocks" guard,
+ * which is useful behind a modern tmux that forwards graphics natively.
+ */
+export type ImageProtocol = "auto" | "kitty" | "sixel" | "blocks"
+
+export const IMAGE_PROTOCOLS: readonly ImageProtocol[] = ["auto", "kitty", "sixel", "blocks"]
+
+/** Parse a protocol name; null when it is not one of the known values. */
+export function parseImageProtocol(value: string): ImageProtocol | null {
+  return IMAGE_PROTOCOLS.find((candidate) => candidate === value) ?? null
+}
+
 function nextImageId(): string {
   imageCounter += 1
   return `img-${Date.now().toString(36)}-${imageCounter}`
