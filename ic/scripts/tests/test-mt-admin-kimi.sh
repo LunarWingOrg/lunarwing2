@@ -457,7 +457,7 @@ fi
 MT_ROOTLESS=false
 CHOWN_CALL=''
 prepare_worker_workspace root kimi >/dev/null
-if [[ "$CHOWN_CALL" == "-R 10002:10002 $fixture/home/lunarwing/kimi-workspace" ]]; then
+if [[ "$CHOWN_CALL" == "--no-dereference 10002:10002 ." ]]; then
   pass 'rootful Kimi workspace uses image UID and GID'
 else
   fail "rootful Kimi workspace ownership wrong: $CHOWN_CALL"
@@ -465,11 +465,93 @@ fi
 
 CHOWN_CALL=''
 prepare_worker_workspace root opencode >/dev/null
-if [[ "$CHOWN_CALL" == "-R 10001:10001 $fixture/home/lunarwing/opencode-workspace" ]]; then
+if [[ "$CHOWN_CALL" == "--no-dereference 10001:10001 ." ]]; then
   pass 'rootful OpenCode workspace uses image UID and GID'
 else
   fail "rootful OpenCode workspace ownership wrong: $CHOWN_CALL"
 fi
+
+# ── WI#453: the workspace sits in the tenant-controlled ~/lunarwing chain, so
+# root must never create or chown through it. A tenant-planted symlink at the
+# workspace (or at a parent component) must be refused, with no chown run.
+wi453_target="$fixture/home/outside-wi453"
+command mkdir -p "$wi453_target"
+command rm -rf -- "$fixture/home/lunarwing/kimi-workspace"
+command ln -s "$wi453_target" "$fixture/home/lunarwing/kimi-workspace"
+CHOWN_CALL=''
+if prepare_worker_workspace root kimi >/dev/null 2>&1; then
+  fail 'prepare_worker_workspace accepted a symlinked workspace (WI#453)'
+else
+  pass 'prepare_worker_workspace refuses a symlinked workspace (WI#453)'
+fi
+if [[ -z "$CHOWN_CALL" ]]; then
+  pass 'symlinked workspace refusal runs no chown (WI#453)'
+else
+  fail "symlinked workspace refusal ran chown: $CHOWN_CALL"
+fi
+if [[ "$(stat -c %u "$wi453_target" 2>/dev/null || printf -- -1)" \
+    == "$(stat -c %u "$fixture/home" 2>/dev/null || printf -- -2)" ]]; then
+  pass 'symlink redirect target was not chowned (WI#453)'
+else
+  fail 'symlink redirect leaked an ownership change to the target (WI#453)'
+fi
+command rm -f -- "$fixture/home/lunarwing/kimi-workspace"
+command rm -rf -- "$wi453_target"
+unset wi453_target
+
+# A symlinked parent component must also be refused (the tenant_mkdir_p
+# ancestor walk), and the helper must not have created anything behind it.
+wi453_real="$fixture/home/wi453-real"
+command mkdir -p "$wi453_real"
+command rm -rf -- "$fixture/home/lunarwing"
+command ln -s "$wi453_real" "$fixture/home/lunarwing"
+CHOWN_CALL=''
+if prepare_worker_workspace root kimi >/dev/null 2>&1; then
+  fail 'prepare_worker_workspace accepted a symlinked parent (WI#453)'
+else
+  pass 'prepare_worker_workspace refuses a symlinked parent (WI#453)'
+fi
+if [[ -n "$CHOWN_CALL" ]]; then
+  fail "symlinked parent refusal ran chown: $CHOWN_CALL"
+else
+  pass 'symlinked parent refusal runs no chown (WI#453)'
+fi
+if [[ -e "$wi453_real/kimi-workspace" || -L "$wi453_real/kimi-workspace" ]]; then
+  fail 'symlinked parent refusal left a workspace behind the link (WI#453)'
+else
+  pass 'symlinked parent refusal leaves nothing behind the link (WI#453)'
+fi
+command rm -f -- "$fixture/home/lunarwing"
+command mkdir -p "$fixture/home/lunarwing"
+command rm -rf -- "$wi453_real"
+unset wi453_real
+
+# MI-3 (run-186 review): a tenant-planted hard link inside the workspace
+# must keep its original owner — the chown walk skips regular files with a
+# link count above 1 so `chown -R` cannot hand an outside file to the
+# container uid.  Also verify the top-dir chown uses `.` (not -R).
+mi3_outside="$fixture/home/mi3-outside"
+mi3_outside_file="$mi3_outside/secret.txt"
+command mkdir -p "$mi3_outside"
+printf 'root-data' >"$mi3_outside_file"
+command rm -rf -- "$fixture/home/lunarwing/kimi-workspace"
+command mkdir -p "$fixture/home/lunarwing/kimi-workspace"
+command ln "$mi3_outside_file" "$fixture/home/lunarwing/kimi-workspace/link.txt"
+CHOWN_CALL=''
+prepare_worker_workspace root kimi >/dev/null 2>&1 || true
+# The hard link must keep its original owner (the mock chown is a no-op,
+# but the real code would skip it).  The chown mock only records the last
+# call, so on a non-empty workspace with one planted hard link, the find
+# loop calls chown for `.` (top), skips the hard link (link count 2), and
+# calls chown for nothing else — CHOWN_CALL holds the top-dir call.
+if [[ "$CHOWN_CALL" == "--no-dereference 10002:10002 ." ]]; then
+  pass 'MI-3: hard link in workspace keeps its owner (chown skips link count > 1)'
+else
+  fail "MI-3: unexpected chown on workspace with hard link: $CHOWN_CALL"
+fi
+command rm -f -- "$fixture/home/lunarwing/kimi-workspace/link.txt"
+command rm -rf -- "$mi3_outside"
+unset mi3_outside mi3_outside_file
 
 cat >"$fixture/env/legacy.env" <<'EOF'
 KIMI_API_KEY='key\\with\'quote'
@@ -580,6 +662,44 @@ assert_contains "$KIMI_DOCKERFILE" 'COPY kimi-cli/package.json kimi-cli/package-
 assert_contains "$KIMI_DOCKERFILE" 'npm ci --omit=dev --prefix /opt/kimi-cli' 'Kimi image installs selected package from its lock'
 assert_contains "$KIMI_DOCKERFILE" 'org.opencontainers.image.toolchain-profile="${WITH_TOOLCHAINS}"' 'Kimi image records toolchain profile'
 assert_contains "$KIMI_DOCKERFILE" 'libz-dev' 'Kimi toolchain packages match OpenCode zlib development support'
+
+# WI#454/ME-1: since WI#400 the container runs as root, so the image-wide PATH
+# must carry only root-owned directories — a task-owned entry first would let
+# the task uid plant a file that root executes (the HEALTHCHECK resolves
+# through this PATH, and so does the root entrypoint and the bridge's setpriv
+# lookup). Pin that no /home/<lane> entry survives in the image PATH, and that
+# the healthcheck's curl is the absolute /usr/bin one.
+KIMI_IMAGE_PATH_LINE="$(sed -n 's/^ *PATH=\(.*\)$/\1/p' "$KIMI_DOCKERFILE" | tail -1)"
+if [[ "$KIMI_IMAGE_PATH_LINE" != *"/home/kimi"* && "$KIMI_IMAGE_PATH_LINE" != *"/home/opencode"* ]]; then
+  pass 'Kimi image PATH carries no task-owned directories (WI#454/ME-1)'
+else
+  fail "Kimi image PATH carries a task-owned directory: $KIMI_IMAGE_PATH_LINE"
+fi
+assert_contains "$KIMI_DOCKERFILE" 'CMD /usr/bin/curl -sf http://127.0.0.1:8443/ready' \
+  'Kimi healthcheck pins the absolute curl (WI#454/ME-1)'
+KIMI_ENTRYPOINT="$LUNARWING_ROOT/kimicode4lunarwing/entrypoint.sh"
+assert_contains "$KIMI_ENTRYPOINT" \
+  'export PATH=/usr/local/cargo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
+  'Kimi entrypoint pins the root-owned PATH before its first command (WI#454/ME-1)'
+assert_contains "$KIMI_ENTRYPOINT" \
+  'TASK_PATH="/home/kimi/.cargo/bin:/usr/local/cargo/bin:/usr/local/go/bin:/home/kimi/go/bin:$PATH"' \
+  'Kimi entrypoint hands the task toolchain over at the drop (WI#454/ME-1)'
+OPENCODE_DOCKERFILE="$LUNARWING_ROOT/opencode4lunarwing/Dockerfile"
+OC_IMAGE_PATH_LINE="$(sed -n 's/^ *PATH=\(.*\)$/\1/p' "$OPENCODE_DOCKERFILE" | tail -1)"
+if [[ "$OC_IMAGE_PATH_LINE" != *"/home/opencode"* && "$OC_IMAGE_PATH_LINE" != *"/home/kimi"* ]]; then
+  pass 'OpenCode image PATH carries no task-owned directories (WI#454/ME-1)'
+else
+  fail "OpenCode image PATH carries a task-owned directory: $OC_IMAGE_PATH_LINE"
+fi
+assert_contains "$OPENCODE_DOCKERFILE" 'CMD /usr/bin/curl -sf http://127.0.0.1:8443/health' \
+  'OpenCode healthcheck pins the absolute curl (WI#454/ME-1)'
+OPENCODE_ENTRYPOINT="$LUNARWING_ROOT/opencode4lunarwing/entrypoint.sh"
+assert_contains "$OPENCODE_ENTRYPOINT" \
+  'export PATH=/usr/local/cargo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bun-node-fallback-bin' \
+  'OpenCode entrypoint pins the root-owned PATH before its first command (WI#454/ME-1)'
+assert_contains "$OPENCODE_ENTRYPOINT" \
+  'TASK_PATH="/home/opencode/.cargo/bin:/usr/local/cargo/bin:/usr/local/go/bin:/home/opencode/go/bin:$PATH"' \
+  'OpenCode entrypoint hands the task toolchain over at the drop (WI#454/ME-1)'
 
 help_output="$(usage)"
 if [[ "$(grep -c -- '--with-toolchains' <<<"$help_output")" -ge 4 ]]; then

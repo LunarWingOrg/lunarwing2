@@ -457,8 +457,11 @@ render_worker_quadlet() {
   worker_env_path="$env_dir/${worker}.env"
   workspace_dir="$(tenant_lw_root "$name")/${worker}-workspace"
   if [[ "$worker" == "kimi" || "$worker" == "opencode" || "$worker" == "opencode2" ]]; then
-    mkdir -p "$workspace_dir"
-    workspace_dir="$(prepare_worker_workspace "$name" "$worker")"
+    # WI#453: same tenant-side create/verify/tighten contract as pebble below
+    # — no root mkdir/chown through the tenant-controlled ~/lunarwing chain.
+    # The || die keeps a refusal fatal under suppressed errexit (subshell call).
+    workspace_dir="$(prepare_worker_workspace "$name" "$worker")" \
+      || die "unsafe $worker workspace for tenant '$name'"
   else
     # WI#390 (HH-4): pebble's workspace is created/verified/tightened as the
     # tenant — root chown/chmod here followed a tenant-planted symlink. The
