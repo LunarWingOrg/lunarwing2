@@ -55,12 +55,65 @@ fi
 """,
     "set -a; . ./worker-image.env; set +a",
     'test -n "$WORKER_IMAGE_REF" && test -n "$WORKER_IMAGE_DIGEST"',
+    # The trivy_with_retry wrapper is pinned line-for-line to catch any drift
+    # between the retry shipped in containers.yml and the gate the validator
+    # enforces (MR !1854 review, run 192, MX-1: retry on the 429 auth throttle,
+    # not cross-lane stagger).
+    r"""trivy_with_retry() {
+  _tsr_attempt=1
+  _tsr_max=4
+  _tsr_log="$(mktemp)" || return 1
+  # Fail-closed: success is only an explicit 0 recorded by the run.
+  # A missing, empty or non-numeric status file (mktemp failure,
+  # read-only temp dir, errexit suspended by an if/&&/|| context)
+  # must return failure, never a silent success.
+  while [ "$_tsr_attempt" -le "$_tsr_max" ]; do
+    # tee keeps trivy streaming into the job trace; the rc file records
+    # the real exit status because the pipeline's own status is tee's
+    # (no pipefail in POSIX sh) — an `if cmd` guard here would capture
+    # the if-statement's status and mask a real failure as success.
+    _tsr_rc="$(mktemp)" || { rm -f "$_tsr_log"; return 1; }
+    { "$@" 2>&1 || printf '%s\n' "$?" > "$_tsr_rc"; } | tee "$_tsr_log"
+    if [ ! -f "$_tsr_rc" ] || [ ! -r "$_tsr_rc" ]; then
+      rm -f "$_tsr_log" "$_tsr_rc"
+      echo "trivy_with_retry: status file unavailable — failing closed" >&2
+      return 1
+    fi
+    _tsr_status=""
+    IFS= read -r _tsr_status < "$_tsr_rc" || true
+    # An empty (but existing) status file means the run recorded no
+    # failure: that is explicit success. A non-numeric status is
+    # corruption and fails closed.
+    case "$_tsr_status" in
+      '') _tsr_status=0 ;;
+      *[!0-9]*)
+        rm -f "$_tsr_log" "$_tsr_rc"
+        echo "trivy_with_retry: non-numeric exit status recorded — failing closed" >&2
+        return 1
+        ;;
+    esac
+    if [ "$_tsr_attempt" -lt "$_tsr_max" ] && grep -qE '429 Too Many Requests|DENIED: access forbidden|too many requests' "$_tsr_log"; then
+      _tsr_delay=$((_tsr_attempt * 60))
+      echo "registry scan attempt $_tsr_attempt/$_tsr_max hit the transient registry-auth throttle; retrying in ${_tsr_delay}s" >&2
+      sleep "$_tsr_delay"
+      _tsr_attempt=$((_tsr_attempt + 1))
+    else
+      rm -f "$_tsr_log" "$_tsr_rc"
+      return "$_tsr_status"
+    fi
+  done
+  # Loop exhausted without a verdict (unreachable; kept fail-closed).
+  rm -f "$_tsr_log"
+  return 1
+}
+""",
     'rm -rf "$TRIVY_CACHE_DIR"',
-    'trivy image --config /dev/null --format template --template "@/contrib/gitlab.tpl" '
+    'trivy_with_retry trivy image --config /dev/null --format template --template "@/contrib/gitlab.tpl" '
     '--output gl-container-scanning-report.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"',
-    TRIVY_GATE_COMMAND
+    'trivy_with_retry '
+    + TRIVY_GATE_COMMAND
     + '--format json --output worker-vulnerabilities.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"',
-    'trivy image --config /dev/null --format cyclonedx --output worker-sbom.cdx.json '
+    'trivy_with_retry trivy image --config /dev/null --format cyclonedx --output worker-sbom.cdx.json '
     '"$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"',
 ]
 WORKER_SCAN_PINNED_VALUES = {

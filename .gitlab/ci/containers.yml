@@ -79,18 +79,80 @@
       fi
     - set -a; . ./worker-image.env; set +a
     - test -n "$WORKER_IMAGE_REF" && test -n "$WORKER_IMAGE_DIGEST"
+    # Bounded retry for the transient registry-auth throttle. Trivy pulls each
+    # image through `remote` with a jwt/auth token fetched from GitLab's
+    # container-registry auth endpoint, and that endpoint rate-limits the
+    # runner's address. The scan follows its own candidate minutes earlier (the
+    # candidate's pushes already drew tokens from the same endpoint), so the
+    # first pull can land in the still-warm throttle window and fail with a
+    # 429 (Too Many Requests) → 403 (forbidden) that a bare re-run five minutes
+    # later met again (pipeline #6231 worker-kimi-scan, jobs 127354/127389;
+    # the flake rotated across all four workers in #6151–#6212). Only this
+    # narrow observed signature is retried with a minute-scale backoff; a real
+    # CRITICAL finding, a missing image, or a network hard-error exits on the
+    # first attempt exactly as before. The publication jobs keep their pinned
+    # `retry: 0`, and the job-level `retry: {max: 1}` above stays the only
+    # whole-job re-run.
+    - |
+      trivy_with_retry() {
+        _tsr_attempt=1
+        _tsr_max=4
+        _tsr_log="$(mktemp)" || return 1
+        # Fail-closed: success is only an explicit 0 recorded by the run.
+        # A missing, empty or non-numeric status file (mktemp failure,
+        # read-only temp dir, errexit suspended by an if/&&/|| context)
+        # must return failure, never a silent success.
+        while [ "$_tsr_attempt" -le "$_tsr_max" ]; do
+          # tee keeps trivy streaming into the job trace; the rc file records
+          # the real exit status because the pipeline's own status is tee's
+          # (no pipefail in POSIX sh) — an `if cmd` guard here would capture
+          # the if-statement's status and mask a real failure as success.
+          _tsr_rc="$(mktemp)" || { rm -f "$_tsr_log"; return 1; }
+          { "$@" 2>&1 || printf '%s\n' "$?" > "$_tsr_rc"; } | tee "$_tsr_log"
+          if [ ! -f "$_tsr_rc" ] || [ ! -r "$_tsr_rc" ]; then
+            rm -f "$_tsr_log" "$_tsr_rc"
+            echo "trivy_with_retry: status file unavailable — failing closed" >&2
+            return 1
+          fi
+          _tsr_status=""
+          IFS= read -r _tsr_status < "$_tsr_rc" || true
+          # An empty (but existing) status file means the run recorded no
+          # failure: that is explicit success. A non-numeric status is
+          # corruption and fails closed.
+          case "$_tsr_status" in
+            '') _tsr_status=0 ;;
+            *[!0-9]*)
+              rm -f "$_tsr_log" "$_tsr_rc"
+              echo "trivy_with_retry: non-numeric exit status recorded — failing closed" >&2
+              return 1
+              ;;
+          esac
+          if [ "$_tsr_attempt" -lt "$_tsr_max" ] && grep -qE '429 Too Many Requests|DENIED: access forbidden|too many requests' "$_tsr_log"; then
+            _tsr_delay=$((_tsr_attempt * 60))
+            echo "registry scan attempt $_tsr_attempt/$_tsr_max hit the transient registry-auth throttle; retrying in ${_tsr_delay}s" >&2
+            sleep "$_tsr_delay"
+            _tsr_attempt=$((_tsr_attempt + 1))
+          else
+            rm -f "$_tsr_log" "$_tsr_rc"
+            return "$_tsr_status"
+          fi
+        done
+        # Loop exhausted without a verdict (unreachable; kept fail-closed).
+        rm -f "$_tsr_log"
+        return 1
+      }
     # TRIVY_CACHE_DIR is inside the checkout, and trivy reuses any DB there
     # whose metadata says it is fresh: start from an empty cache so neither a
     # committed .trivy-cache nor a DB fetched by an earlier call can stand in
     # for the real one. Every call takes --config /dev/null, because the
     # first call fills the cache the gate then reuses (MR !1750 review).
     - rm -rf "$TRIVY_CACHE_DIR"
-    - trivy image --config /dev/null --format template --template "@/contrib/gitlab.tpl" --output gl-container-scanning-report.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
+    - trivy_with_retry trivy image --config /dev/null --format template --template "@/contrib/gitlab.tpl" --output gl-container-scanning-report.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
     # --config /dev/null: trivy otherwise loads trivy.yaml from its working
     # directory (the checkout), which can set ignore-unfixed and hide every
     # unfixed CRITICAL with no expiry (WI#361).
-    - trivy image --config /dev/null --ignorefile "$CI_PROJECT_DIR/.gitlab/trivy-ignore" --exit-code 1 --severity CRITICAL --format json --output worker-vulnerabilities.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
-    - trivy image --config /dev/null --format cyclonedx --output worker-sbom.cdx.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
+    - trivy_with_retry trivy image --config /dev/null --ignorefile "$CI_PROJECT_DIR/.gitlab/trivy-ignore" --exit-code 1 --severity CRITICAL --format json --output worker-vulnerabilities.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
+    - trivy_with_retry trivy image --config /dev/null --format cyclonedx --output worker-sbom.cdx.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
   artifacts:
     when: always
     expire_in: 30 days
