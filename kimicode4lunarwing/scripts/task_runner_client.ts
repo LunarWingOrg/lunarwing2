@@ -139,6 +139,18 @@ export function delegateTaskToRunner(
     sock.once("error", (err) => {
       finish(() => reject(err))
     })
+    // NC-8: a runner that accepts and then dies (or is killed by any task
+    // since it runs as the task uid) closes the socket cleanly — without a
+    // terminal line, the client would wait the full run deadline (task
+    // timeout + 60 s, potentially hours) before rejecting. Reject at once
+    // when the connection ends without a settled result; the normal path
+    // has already settled by now (the result line resolves before end).
+    sock.once("close", () => {
+      finish(() => reject(new Error("runner connection closed without a result")))
+    })
+    sock.once("end", () => {
+      finish(() => reject(new Error("runner connection closed without a result")))
+    })
     const maxLineBytes = 1_048_576
     sock.on("data", (chunk: Buffer) => {
       buffer = Buffer.concat([buffer, chunk])
