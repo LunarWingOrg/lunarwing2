@@ -1747,6 +1747,133 @@ def extract_arg_default(text: str, arg: str) -> str | None:
     return match.group(1) if match else None
 
 
+# WI#467 (run-200 review NK-2): the opencode builder stage from the package
+# WORKDIR up to the next FROM, as logical instructions (see
+# dockerfile_instructions). Pinned exactly: dropping the MODELS_DEV_API_JSON
+# or loopback OPENCODE_MODELS_URL assignment, dropping the snapshot guard, or
+# adding a later step that rebuilds with a live models.dev fetch all fail
+# here instead of only at the protected clean-rebuild check. An OPENCODE_REF
+# bump that changes these steps updates this tuple in the same commit.
+OPENCODE_MODELS_DEV_BUILD_STEPS = (
+    "WORKDIR /build/opencode/packages/opencode",
+    "COPY models-dev/api.json /build/models-dev-api.json",
+    "COPY scripts/check_models_dev_snapshot.py /build/check_models_dev_snapshot.py",
+    " ".join((
+        "RUN set -eu;",
+        """actual="$(sha256sum /build/models-dev-api.json | cut -d' ' -f1)";""",
+        """[ "$actual" = "${MODELS_DEV_SNAPSHOT_SHA256}" ] || {""",
+        """echo "models.dev snapshot sha256 mismatch: got $actual, expected""",
+        """${MODELS_DEV_SNAPSHOT_SHA256}" >&2;""",
+        "exit 1;",
+        "};",
+        "python3 /build/check_models_dev_snapshot.py script/generate.ts /build/models-dev-api.json;",
+        "MODELS_DEV_API_JSON=/build/models-dev-api.json OPENCODE_MODELS_URL=http://127.0.0.1:9",
+        "bun run build -- --single",
+    )),
+    " ".join((
+        "RUN set -e;",
+        "set -- dist/opencode-*/bin/opencode;",
+        """[ "$#" -eq 1 ] && [ -x "$1" ];""",
+        """install -D -m 0755 "$1" /out/bin/opencode;""",
+        "install -d /out/sdk;",
+        "cp /build/opencode/packages/sdk/js/package.json /out/sdk/package.json;",
+        "cp -a /build/opencode/packages/sdk/js/src /out/sdk/src",
+    )),
+)
+
+
+def dockerfile_instructions(text: str) -> list[str]:
+    """Logical Dockerfile instructions: comment and blank lines dropped (also
+    inside a continuation, as Docker does), backslash continuations joined,
+    whitespace runs collapsed to one space and the keyword upper-cased, so a
+    pin compares instructions rather than layout."""
+    instructions: list[str] = []
+    current: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.endswith("\\"):
+            current.append(line[:-1])
+            continue
+        current.append(line)
+        words = " ".join(current).split()
+        current = []
+        instructions.append(" ".join([words[0].upper(), *words[1:]]))
+    if current:
+        words = " ".join(current).split()
+        if words:
+            instructions.append(" ".join([words[0].upper(), *words[1:]]))
+    return instructions
+
+
+def opencode_models_dev_build_errors(opencode_text: str) -> list[str]:
+    """WI#467: the builder stage's models.dev build tail must be exactly
+    OPENCODE_MODELS_DEV_BUILD_STEPS and must sit in the `AS builder` stage."""
+    instructions = dockerfile_instructions(opencode_text)
+    workdir = OPENCODE_MODELS_DEV_BUILD_STEPS[0]
+    starts = [index for index, instruction in enumerate(instructions) if instruction == workdir]
+    if len(starts) != 1:
+        return [f"OpenCode Dockerfile must contain exactly one '{workdir}' (WI#467 models.dev build pin)"]
+    start = starts[0]
+    stage = next(
+        (instruction for instruction in reversed(instructions[:start]) if instruction.startswith("FROM ")),
+        "",
+    )
+    if not stage.lower().endswith(" as builder"):
+        return [f"OpenCode Dockerfile '{workdir}' must be in the 'AS builder' stage (WI#467 models.dev build pin)"]
+    tail: list[str] = []
+    for instruction in instructions[start:]:
+        if instruction.startswith("FROM "):
+            break
+        tail.append(instruction)
+    if tuple(tail) != OPENCODE_MODELS_DEV_BUILD_STEPS:
+        return [
+            "OpenCode builder stage from '" + workdir + "' to the next FROM differs from the "
+            "reviewed WI#467 models.dev build steps (validate_config.OPENCODE_MODELS_DEV_BUILD_STEPS)"
+        ]
+    return []
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    seen: set[str] = set()
+    for key, _ in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate key {key!r}")
+        seen.add(key)
+    return dict(pairs)
+
+
+def _reject_json_constant(name: str) -> object:
+    raise ValueError(f"non-standard JSON constant {name}")
+
+
+def models_dev_snapshot_errors(path: pathlib.Path) -> list[str]:
+    """WI#467 (run-200 review NK-3): the snapshot is compiled into the opencode
+    binary as code (a Bun define), so it must be strict JSON (one non-empty
+    object, no duplicate keys, no NaN/Infinity), committed in the canonical
+    pretty layout (json.dumps indent=1, ensure_ascii=False, key order kept,
+    one trailing newline) so every refresh diffs line by line."""
+    label = "opencode4lunarwing/models-dev/api.json"
+    try:
+        raw = path.read_bytes()
+        data = json.loads(
+            raw,
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_json_constant,
+        )
+    except (OSError, ValueError) as error:
+        return [f"{label} is not strict JSON: {error}"]
+    if not isinstance(data, dict) or not data:
+        return [f"{label} must be a non-empty JSON object"]
+    if raw != (json.dumps(data, indent=1, ensure_ascii=False) + "\n").encode("utf-8"):
+        return [
+            f"{label} must be committed pretty-printed (json.dumps indent=1, "
+            "ensure_ascii=False, key order kept, one trailing newline) so refreshes stay reviewable"
+        ]
+    return []
+
+
 def worker_case_blocks(build_script: str) -> dict[str, str]:
     """Extract each worker's case block from build-worker-image.sh so pin
     checks bind to the right lane — opencode and opencode2 share the
@@ -1776,6 +1903,24 @@ def validate_worker_versions(errors: list[str]) -> None:
         errors.append("Pebble Dockerfile must declare a reviewed PEBBLE_LOCK_SHA256 default")
     elif not lock_path.is_file() or hashlib.sha256(lock_path.read_bytes()).hexdigest() != lock_digest:
         errors.append("Pebble upstream Cargo.lock differs from the Dockerfile's reviewed SHA256")
+
+    # WI#467: the opencode lane's committed models.dev snapshot is compiled
+    # into the binary; its Dockerfile ARG pin must stay in sync with the file,
+    # or a refreshed snapshot without the pin (or vice versa) only fails at
+    # the protected candidate build.
+    models_path = ROOT / "opencode4lunarwing" / "models-dev" / "api.json"
+    models_digest = extract_arg_default(opencode_text, "MODELS_DEV_SNAPSHOT_SHA256") or ""
+    if not re.fullmatch(r"[0-9a-f]{64}", models_digest):
+        errors.append(
+            "OpenCode Dockerfile must declare a reviewed MODELS_DEV_SNAPSHOT_SHA256 default"
+        )
+    elif not models_path.is_file() or hashlib.sha256(models_path.read_bytes()).hexdigest() != models_digest:
+        errors.append(
+            "opencode4lunarwing/models-dev/api.json differs from the Dockerfile's reviewed SHA256"
+        )
+    if models_path.is_file():
+        errors.extend(models_dev_snapshot_errors(models_path))
+    errors.extend(opencode_models_dev_build_errors(opencode_text))
 
     blocks = worker_case_blocks(build_script)
     canonical_pins = (

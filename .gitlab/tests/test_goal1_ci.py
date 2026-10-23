@@ -10,6 +10,7 @@ import json
 import os
 import pathlib
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -177,10 +178,10 @@ class WorkerVersionPinTests(unittest.TestCase):
             f"ARG PEBBLE_REF={self.PEBBLE_REF}\nARG PEBBLE_LOCK_SHA256={lock_digest}\n",
             encoding="utf-8",
         )
-        self.dockerfiles["OPENCODE_DOCKERFILE"].write_text(
-            f"ARG OPENCODE_VERSION=v1.18.25\nARG OPENCODE_REF={self.OPENCODE_REF}\n",
-            encoding="utf-8",
-        )
+        models = self.root / "opencode4lunarwing/models-dev/api.json"
+        models.parent.mkdir(parents=True)
+        self.write_models_snapshot('{\n "fixture": true\n}\n')
+        self.write_opencode_dockerfile()
         self.dockerfiles["OPENCODE2_DOCKERFILE"].write_text(
             f"ARG OPENCODE_VERSION=v2.1.2\nARG OPENCODE_REF={self.OPENCODE2_REF}\n",
             encoding="utf-8",
@@ -259,6 +260,104 @@ class WorkerVersionPinTests(unittest.TestCase):
 
     def test_consistent_pins_pass(self):
         self.assertEqual(self.errors(), [])
+
+    def write_models_snapshot(self, text, pin=True):
+        """Write the fixture snapshot; pin=True also re-pins the ARG so a
+        test sees only the error it is about."""
+        models = self.root / "opencode4lunarwing/models-dev/api.json"
+        models.write_text(text, encoding="utf-8")
+        if pin:
+            self.models_digest = hashlib.sha256(models.read_bytes()).hexdigest()
+
+    def write_opencode_dockerfile(self, tail=None, builder="FROM base AS builder"):
+        steps = "\n".join(config.OPENCODE_MODELS_DEV_BUILD_STEPS if tail is None else tail)
+        self.dockerfiles["OPENCODE_DOCKERFILE"].write_text(
+            f"ARG OPENCODE_VERSION=v1.18.25\nARG OPENCODE_REF={self.OPENCODE_REF}\n"
+            f"ARG MODELS_DEV_SNAPSHOT_SHA256={self.models_digest}\n"
+            f"{builder}\nRUN bun install --frozen-lockfile\n{steps}\n"
+            "FROM base AS runtime\nCOPY --from=builder /out/bin/opencode /usr/local/bin/opencode\n",
+            encoding="utf-8",
+        )
+
+    def test_models_dev_snapshot_drift_is_caught(self):
+        # WI#467: a refreshed snapshot without the Dockerfile ARG pin (or a
+        # stale ARG after refresh) must fail the offline check, not only the
+        # protected candidate build.
+        self.write_models_snapshot('{\n "fixture": "refreshed"\n}\n', pin=False)
+        self.assertEqual(
+            self.errors(),
+            ["opencode4lunarwing/models-dev/api.json differs from the Dockerfile's reviewed SHA256"],
+        )
+
+    def test_models_dev_snapshot_must_be_strict_pretty_json(self):
+        # WI#467 NK-3: the snapshot is compiled in as code (a Bun define), so
+        # it must be strict JSON, and it is committed pretty-printed so each
+        # refresh is reviewable line by line.
+        cases = (
+            ('{\n "a": 1,\n "a": 2\n}\n', "is not strict JSON: duplicate key 'a'"),
+            ('{\n "a": NaN\n}\n', "is not strict JSON: non-standard JSON constant NaN"),
+            ('{\n "a": Infinity\n}\n', "is not strict JSON: non-standard JSON constant Infinity"),
+            ('{"a": 1,\n', "is not strict JSON"),
+            ('[\n 1\n]\n', "must be a non-empty JSON object"),
+            ('{}\n', "must be a non-empty JSON object"),
+            ('{"a": 1}\n', "must be committed pretty-printed"),
+            ('{\n  "a": 1\n}\n', "must be committed pretty-printed"),
+            ('{\n "a": 1\n}', "must be committed pretty-printed"),
+            ('{\n "a": "\\u00e9"\n}\n', "must be committed pretty-printed"),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.write_models_snapshot(text)
+                self.write_opencode_dockerfile()
+                errors = self.errors()
+                self.assertEqual(len(errors), 1, errors)
+                self.assertIn(expected, errors[0])
+
+    def test_models_dev_build_steps_are_pinned(self):
+        # WI#467 NK-2: every way of dropping the snapshot inputs, the loopback
+        # models URL or the guard, or of rebuilding after the pinned step,
+        # fails the offline check.
+        steps = list(config.OPENCODE_MODELS_DEV_BUILD_STEPS)
+        build = steps[3]
+        mutants = {
+            "no snapshot env": build.replace("MODELS_DEV_API_JSON=/build/models-dev-api.json ", ""),
+            "no loopback url": build.replace(" OPENCODE_MODELS_URL=http://127.0.0.1:9", ""),
+            "no guard": build.replace(
+                " python3 /build/check_models_dev_snapshot.py script/generate.ts /build/models-dev-api.json;", ""),
+            "guard without snapshot": build.replace(" /build/models-dev-api.json;", ";", 1),
+            "live url": build.replace("http://127.0.0.1:9", "https://models.dev"),
+            "no hash check": build.replace("[ \"$actual\" = ", "[ \"$actual\" != ", 1),
+        }
+        for name, mutant in mutants.items():
+            with self.subTest(mutant=name):
+                self.assertNotEqual(mutant, build)
+                self.write_opencode_dockerfile(steps[:3] + [mutant] + steps[4:])
+                self.assertEqual(len(self.errors()), 1)
+        layouts = {
+            "later rebuild": steps + ["RUN bun run build -- --single"],
+            "later lower-case rebuild": steps + ["run bun run build -- --single"],
+            "dropped extract": steps[:4],
+            "swapped copy": [steps[0], steps[2], steps[1], *steps[3:]],
+            "duplicated workdir": [steps[0], *steps],
+        }
+        for name, tail in layouts.items():
+            with self.subTest(layout=name):
+                self.write_opencode_dockerfile(tail)
+                self.assertEqual(len(self.errors()), 1)
+        with self.subTest(layout="runtime stage"):
+            self.write_opencode_dockerfile(builder="FROM base AS prep")
+            self.assertEqual(len(self.errors()), 1)
+
+    def test_models_dev_build_steps_match_the_real_dockerfile_layout(self):
+        # The pin compares logical instructions, so the committed multi-line
+        # RUN with comments and continuations must normalise to the tuple.
+        real = config.OPENCODE_DOCKERFILE.read_text(encoding="utf-8")
+        self.assertEqual(config.opencode_models_dev_build_errors(real), [])
+        commented = real.replace(
+            "    }; \\\n", "    }; \\\n    # a comment line inside the continuation\n", 1
+        )
+        self.assertNotEqual(commented, real)
+        self.assertEqual(config.opencode_models_dev_build_errors(commented), [])
 
     def test_cross_lane_ref_swap_is_caught(self):
         # opencode2's build_args REF swapped to the v1 lane's SHA: a
@@ -357,6 +456,63 @@ class WorkerVersionPinTests(unittest.TestCase):
         (self.root / "ic/scripts/mt-admin-lib/05-tenant-build.sh").unlink()
         self.assertTrue(any("05-tenant-build.sh missing" in error for error in self.errors()))
 
+
+
+class ModelsDevSnapshotGuardTests(unittest.TestCase):
+    """WI#467: the build-time guard (opencode4lunarwing/scripts/
+    check_models_dev_snapshot.py) fails the image build when the pinned
+    upstream generate.ts stops reading either snapshot env var, or when the
+    snapshot is not strict JSON."""
+
+    GUARD = pathlib.Path(__file__).resolve().parents[2] / "opencode4lunarwing/scripts/check_models_dev_snapshot.py"
+    GENERATE = (
+        'const modelsUrl = process.env.OPENCODE_MODELS_URL || "https://models.dev"\n'
+        "export const modelsData = process.env.MODELS_DEV_API_JSON\n"
+        "  ? await Bun.file(process.env.MODELS_DEV_API_JSON).text()\n"
+        "  : await fetch(`${modelsUrl}/api.json`).then((x) => x.text())\n"
+    )
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = pathlib.Path(temporary.name)
+
+    def run_guard(self, generate, snapshot):
+        generate_path = self.root / "generate.ts"
+        snapshot_path = self.root / "api.json"
+        generate_path.write_text(generate, encoding="utf-8")
+        snapshot_path.write_text(snapshot, encoding="utf-8")
+        return subprocess.run(
+            [sys.executable, "-I", str(self.GUARD), str(generate_path), str(snapshot_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_upstream_shape_and_strict_snapshot_pass(self):
+        result = self.run_guard(self.GENERATE, '{\n "openai": {}\n}\n')
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+
+    def test_dropped_env_reads_fail(self):
+        for fragment in ("process.env.OPENCODE_MODELS_URL", "process.env.MODELS_DEV_API_JSON"):
+            with self.subTest(fragment=fragment):
+                result = self.run_guard(self.GENERATE.replace(fragment, "undefined"), '{"openai": {}}')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(fragment, result.stderr)
+
+    def test_non_strict_snapshot_fails(self):
+        for snapshot in ('{"a": 1, "a": 2}', '{"a": NaN}', '{"a": -Infinity}', "[1]", "{}", "{", ""):
+            with self.subTest(snapshot=snapshot):
+                result = self.run_guard(self.GENERATE, snapshot)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("models.dev snapshot", result.stderr)
+
+    def test_usage_requires_both_paths(self):
+        result = subprocess.run(
+            [sys.executable, "-I", str(self.GUARD), "generate.ts"], capture_output=True, text=True, check=False
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("usage:", result.stderr)
 
 class WorkerInputManifestTests(unittest.TestCase):
     """Item 35: the kimi worker-inputs manifest must cover every build-read

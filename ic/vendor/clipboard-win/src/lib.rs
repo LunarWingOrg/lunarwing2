@@ -45,7 +45,7 @@
 //!```
 //!use clipboard_win::{Clipboard, formats, Getter, Setter};
 //!
-//!const SAMPLE: &str = "MY loli sample ^^";
+//!const SAMPLE: &str = "MY smol sample ^^";
 //!
 //!let _clip = Clipboard::new_attempts(10).expect("Open clipboard");
 //!formats::Unicode.write_clipboard(&SAMPLE).expect("Write sample");
@@ -81,7 +81,7 @@
 
 #![no_std]
 #![warn(missing_docs)]
-#![cfg_attr(feature = "cargo-clippy", allow(clippy::style))]
+#![allow(clippy::style)]
 
 #[cfg(feature = "std")]
 extern crate std;
@@ -155,8 +155,9 @@ impl Clipboard {
                 }
             }
 
-            //0 causes to yield remaining time in scheduler, but remain to be scheduled once again.
-            unsafe { sys::Sleep(0) };
+            //Uses the same value as chrome
+            //https://source.chromium.org/chromium/chromium/src/+/main:ui/base/clipboard/clipboard_win.cc;l=127
+            unsafe { sys::Sleep(5) };
         }
     }
 }
