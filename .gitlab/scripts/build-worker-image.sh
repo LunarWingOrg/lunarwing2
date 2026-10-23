@@ -50,7 +50,12 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         image_name=worker-opencode
         context=opencode4lunarwing
         dockerfile_dir=opencode4lunarwing
-        input_files=opencode4lunarwing/Dockerfile
+        # WI#467: the models.dev snapshot is compiled into the binary and the
+        # guard script executes during the build (CY-4 precedent: build-read
+        # inputs and build-executed scripts must hash into worker-inputs).
+        input_files='opencode4lunarwing/Dockerfile
+opencode4lunarwing/models-dev/api.json
+opencode4lunarwing/scripts/check_models_dev_snapshot.py'
         source_ref=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
         build_args="OPENCODE_VERSION=v1.18.25
 OPENCODE_REF=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
