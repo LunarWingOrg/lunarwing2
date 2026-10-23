@@ -116,7 +116,11 @@ section and "Launch identity (WI#422)" further down.
   FOWNER is not individually required there but is retained for metadata
   passes (chmod/re-assert) over task-created files the bridge does not own
   — dropping it is on the table the next time the set is re-proved end to
-  end on every lane.
+  end on every lane. **LP-7 declined (2026-10-22, maintainer ruling via
+  run-195 follow-up #11230):** `--bounding-set=-all` will NOT be added to the
+  setpriv drops and `CAP_SETPCAP` will NOT be added to the capability trim.
+  The root-bridge lanes are slated for replacement by WI#454's non-root
+  design, so hardening their capability sets is not wanted.
 - **Root-resolved commands come from root-owned PATH entries only
   (WI#454/ME-1).** The root-launcher images (kimi, opencode) carry NO
   task-owned directory in the image-wide `ENV PATH` — the task uid's
