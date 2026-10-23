@@ -141,6 +141,53 @@ case "$MODE" in
   websocket)
     log "Mode: WebSocket — starting bridge"
 
+    # WI#454: start the task-runner daemon as the task uid BEFORE the bridge.
+    # The runner is the task-container half of the two-container non-root
+    # split: it executes every task under the task uid and never sees the
+    # hub-handshake credential (the token file is 0400 root-only and the
+    # token var was unset above). The bridge (still root in this image) then
+    # delegates each task to it over the socket instead of spawning the CLI
+    # itself. KIMI_TASK_RUNNER=skip (host-side dev runs without a runner)
+    # keeps the bridge on local execution. The socket directory is SEPARATE
+    # from LUNARWING_TOKEN_DIR: the token directory must stay root-only
+    # 0700 (WI#400), and the runner must own its own directory to bind the
+    # socket — root hands it over 0700 task-uid below.
+    RUNNER_DIR="${KIMI_TASK_RUNNER_DIR:-/run/lunarwing-runner}"
+    RUNNER_SOCKET="${KIMI_TASK_RUNNER_SOCKET:-$RUNNER_DIR/task-runner.sock}"
+    if [ -n "${AGENT_AUTH_TOKEN_FILE:-}" ] && [ "${KIMI_TASK_RUNNER:-}" != "skip" ]; then
+      install -d -m 0700 "$RUNNER_DIR" 2>/dev/null || true
+      if [ "$(id -u)" = "0" ]; then
+        chmod 0700 "$RUNNER_DIR" 2>/dev/null || true
+        chown "$KIMI_TASK_UID:$KIMI_TASK_GID" "$RUNNER_DIR" 2>/dev/null || true
+      fi
+      # The runner runs as the task uid, so HOME and PATH must be the task's
+      # own (as_task's exact env shape) — and the credential vars must never
+      # be present in what it inherits. KIMI_TASK_UID/KIMI_TASK_GID are
+      # UNSET for the runner: it already IS the task identity, and a second
+      # setpriv drop inside executeTask would look for setpriv on the task
+      # PATH and fail (or drop to the wrong identity). The identity stays
+      # pinned for the bridge process itself.
+      as_task env -u AGENT_AUTH_TOKEN -u AGENT_AUTH_TOKEN_FILE \
+        -u KIMI_TASK_UID -u KIMI_TASK_GID \
+        WORKSPACE_ROOT="$WORKSPACE_ROOT" \
+        node /app/scripts/task_runner.js "$RUNNER_SOCKET" &
+      RUNNER_PID=$!
+      log "Task runner started as task uid on $RUNNER_SOCKET (pid $RUNNER_PID)"
+      # Hand the socket path to the bridge: with it set, every task is
+      # delegated to the unprivileged runner (WI#454); unset means local
+      # execution (the WI#400 drop inside the bridge executor).
+      export LUNARWING_TASK_RUNNER_SOCKET="$RUNNER_SOCKET"
+      cleanup() {
+        log "Shutting down..."
+        [ -z "${BRIDGE_PID:-}" ] || kill "$BRIDGE_PID" 2>/dev/null || true
+        [ -z "${RUNNER_PID:-}" ] || kill "$RUNNER_PID" 2>/dev/null || true
+        kill "$HEALTH_PID" 2>/dev/null || true
+        [ -z "${BRIDGE_PID:-}" ] || wait "$BRIDGE_PID" 2>/dev/null || true
+        [ -z "${RUNNER_PID:-}" ] || wait "$RUNNER_PID" 2>/dev/null || true
+        wait "$HEALTH_PID" 2>/dev/null || true
+      }
+    fi
+
     cd "$WORKSPACE_ROOT"
     export KIMI_CODE_HOME
     export WS_STATE_FILE
