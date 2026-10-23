@@ -116,7 +116,12 @@ section and "Launch identity (WI#422)" further down.
   FOWNER is not individually required there but is retained for metadata
   passes (chmod/re-assert) over task-created files the bridge does not own
   — dropping it is on the table the next time the set is re-proved end to
-  end on every lane.
+  end on every lane. `--bounding-set=-all` is deliberately NOT added to the
+  setpriv drops and `CAP_SETPCAP` is deliberately NOT added to the trim
+  (WI#449 LP-7): the maintainer declined both on 2026-10-22 (run-195
+  follow-up #11230). The ruling states the decision and no reason, so none
+  is recorded here; treat the absence as settled and do not propose LP-7
+  again without a fresh ruling.
 - **Root-resolved commands come from root-owned PATH entries only
   (WI#454/ME-1).** The root-launcher images (kimi, opencode) carry NO
   task-owned directory in the image-wide `ENV PATH` — the task uid's
