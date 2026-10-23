@@ -1990,9 +1990,25 @@ prepare_worker_workspace() {
       printf 'error: cannot enter %s workspace: %s\n' "$worker" "$workspace_dir" >&2
       return 1
     fi
-    chown --no-dereference "$container_uid:$container_gid" .
-    find . -mindepth 1 ! \( -type f -links +1 \) \
-      -exec chown --no-dereference "$container_uid:$container_gid" {} +
+    # WI#461: both chown steps must be guarded. Bare commands under
+    # set -euo pipefail are neither a clean refusal nor a guaranteed
+    # abort: in a direct caller context a failure kills the whole
+    # mt-admin run from inside the function, while in a suppressed-
+    # errexit context (`cmd || status=$?`) the same failure is silently
+    # swallowed and the bind mount reaches the container with the
+    # wrong owner. Wrapping both makes every caller see a clean rc-1
+    # refusal instead. Restore PWD on every exit path (MV-4).
+    if ! chown --no-dereference "$container_uid:$container_gid" .; then
+      command cd -- "$_save_pwd" 2>/dev/null || true
+      printf 'error: cannot chown %s workspace root: %s\n' "$worker" "$workspace_dir" >&2
+      return 1
+    fi
+    if ! find . -mindepth 1 ! \( -type f -links +1 \) \
+      -exec chown --no-dereference "$container_uid:$container_gid" {} +; then
+      command cd -- "$_save_pwd" 2>/dev/null || true
+      printf 'error: cannot chown %s workspace contents: %s\n' "$worker" "$workspace_dir" >&2
+      return 1
+    fi
     command cd -- "$_save_pwd" 2>/dev/null || true
   fi
   tenant_chmod "$name" 2770 "$workspace_dir" || return 1
