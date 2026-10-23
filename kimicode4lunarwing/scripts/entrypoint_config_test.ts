@@ -597,6 +597,35 @@ test("health server /ready publishes runner liveness only, not the socket path o
   assert.deepEqual(Object.keys(probe.body.task_runner ?? {}).sort(), ["heartbeat_at", "ready"])
 })
 
+interface ProcRead<T> { value?: T; error?: string }
+interface RunnerProc { exe: ProcRead<string>; environ: ProcRead<string[]>; fd3: ProcRead<string> }
+
+const RUNNER_PROC_PROBE = `const fs = require("fs")
+const pid = process.argv[1]
+const read = (f) => { try { return { value: f() } } catch (err) { return { error: String(err && err.message ? err.message : err) } } }
+process.stdout.write(JSON.stringify({
+  exe: read(() => fs.readlinkSync("/proc/" + pid + "/exe")),
+  environ: read(() => fs.readFileSync("/proc/" + pid + "/environ", "utf8").split(String.fromCharCode(0))),
+  fd3: read(() => fs.readlinkSync("/proc/" + pid + "/fd/3")),
+}))`
+
+/**
+ * The runner's /proc/<pid>/{exe,environ,fd/3}, read as the runner's own uid.
+ * Reading another uid's entries needs CAP_SYS_PTRACE, which the rootless
+ * BuildKit image build does not grant (master pipeline 6308). So under root
+ * a capability-free probe runs as the runner's uid/gid (65534, the harness's
+ * SETPRIV_FLAGS); on a host the runner already shares our uid.
+ */
+function runnerProc(pid: number): RunnerProc {
+  const probe = [process.execPath, "-e", RUNNER_PROC_PROBE, String(pid)]
+  const argv = process.geteuid?.() === 0
+    ? ["/usr/bin/setpriv", "--reuid=65534", "--regid=65534", "--clear-groups", "--inh-caps=-all", "--no-new-privs", "--", ...probe]
+    : probe
+  const out = spawnSync(argv[0], argv.slice(1), { encoding: "utf8", timeout: 10_000 })
+  assert.equal(out.status, 0, `runner /proc probe failed: ${out.error?.message ?? ""} ${out.stderr}`)
+  return JSON.parse(out.stdout) as RunnerProc
+}
+
 test("run_task_runner execs the runner in place with the root PATH and a root-bound socket (NL-1, NL-4, NL-7)", async () => {
   // The real function text, run unprivileged on a host (or as root in CI,
   // where it drops to uid 65534 through setpriv). Only the image paths are
@@ -643,13 +672,16 @@ wait
       assert.ok(existsSync(socketPath), `runner socket never appeared: ${stderr}`)
       const pid = Number(readFileSync(pidFile, "utf8").trim())
       // NL-4: $! is the runner itself (python3 -> setpriv -> env -> node all exec).
-      let exe = ""
-      for (let i = 0; i < 100 && !exe.endsWith(process.execPath.split("/").pop()!); i++) {
-        try { exe = readlinkSync(`/proc/${pid}/exe`) } catch { exe = "" }
+      // Read as the runner's uid: see runnerProc.
+      const nodeExe = readlinkSync("/proc/self/exe")
+      let view = runnerProc(pid)
+      for (let i = 0; i < 100 && view.exe.value !== nodeExe; i++) {
         await new Promise((resolve) => setTimeout(resolve, 50))
+        view = runnerProc(pid)
       }
-      assert.equal(exe, readlinkSync("/proc/self/exe"), `$! must be the node runner, not a wrapper (got ${exe})`)
-      const environ = readFileSync(`/proc/${pid}/environ`, "utf8").split("\0")
+      assert.equal(view.exe.value, nodeExe, `$! must be the node runner, not a wrapper (got ${view.exe.value ?? view.exe.error})`)
+      const environ = view.environ.value
+      assert.ok(environ, `runner environ unreadable: ${view.environ.error}`)
       const envValue = (key: string) => environ.find((entry) => entry.startsWith(`${key}=`))?.slice(key.length + 1)
       // NL-1: the root-owned launcher PATH, not TASK_PATH.
       assert.equal(envValue("PATH"), "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
@@ -658,7 +690,7 @@ wait
       }
       // NL-7: the listener came in as fd 3, in an owner-only directory.
       assert.equal(envValue("LUNARWING_TASK_RUNNER_LISTEN_FD"), "3")
-      assert.match(readlinkSync(`/proc/${pid}/fd/3`), /^socket:/)
+      assert.match(view.fd3.value ?? "", /^socket:/, `runner fd 3: ${view.fd3.value ?? view.fd3.error}`)
       assert.equal(statSync(dirname(socketPath)).mode & 0o777, 0o700)
       assert.equal(statSync(dirname(socketPath)).uid, process.geteuid?.())
       const reply = await new Promise<Record<string, unknown>>((resolve, reject) => {
