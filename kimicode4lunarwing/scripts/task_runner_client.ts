@@ -235,7 +235,9 @@ function consumeLine(
     if (res.task_id !== expectedTaskId) {
       return "ignored"
     }
-    const allowedStatuses = new Set(["success", "error", "timeout", "cancelled"])
+    // NC-6: use the protocol's status names (lunarwing_runtime.ts TaskResult.status),
+    // not the colloquial "timeout" — the executor emits "timed_out" (WI#263).
+    const allowedStatuses = new Set(["success", "error", "cancelled", "timed_out"])
     if (typeof res.status === "string" && !allowedStatuses.has(res.status)) {
       onError(new Error(`task runner sent an unknown result status ${JSON.stringify(res.status).slice(0, 64)}`))
       return "terminal"
