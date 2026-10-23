@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import { after, test } from "node:test"
 import { spawn } from "node:child_process"
 import { connect } from "node:net"
-import { chmodSync, chownSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs"
+import { chmodSync, chownSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -31,6 +31,8 @@ after(() => {
 
 function makeMockKimi(content: string): string {
   const dir = scratch()
+  // Traversable by a dropped runner uid too (root CI shape, see stageRunner).
+  chmodSync(dir, 0o755)
   const binPath = join(dir, "mock-kimi")
   writeFileSync(binPath, `#!/usr/bin/env node\n${content}\n`)
   chmodSync(binPath, 0o755)
@@ -360,6 +362,45 @@ test("NC-8: a runner that accepts and closes without a result is rejected at onc
 
 // ── !1873 run-200 fixes (NL-2, NL-3, NL-7) ───────────────────────────────────
 
+const asRoot = process.geteuid?.() === 0
+const scriptsDir = dirname(fileURLToPath(import.meta.url))
+
+/**
+ * argv that starts the REAL runner as a separate process. The runner refuses
+ * root (as in the image), so under root (the CI lane) it is started the way
+ * the image's launcher does: through setpriv as an unprivileged uid (65534),
+ * from a world-readable copy of the compiled scripts.
+ */
+function runnerArgv(): string[] {
+  if (!asRoot) return [process.execPath, join(scriptsDir, "task_runner.js")]
+  const stage = scratch()
+  chmodSync(stage, 0o755)
+  for (const name of readdirSync(scriptsDir)) {
+    if ((name.endsWith(".js") && !name.endsWith("_test.js")) || name === "package.json") {
+      copyFileSync(join(scriptsDir, name), join(stage, name))
+    }
+  }
+  return ["/usr/bin/setpriv", "--reuid=65534", "--regid=65534", "--clear-groups", "--", process.execPath, join(stage, "task_runner.js")]
+}
+
+/** A scratch dir the (possibly dropped) runner and its CLI can write. */
+function sharedDir(): string {
+  const dir = scratch()
+  chmodSync(dir, 0o777)
+  return dir
+}
+
+/** Under root the reap must accept the dropped uid, like KIMI_TASK_UID in the image. */
+function withRunnerUid<T>(fn: () => Promise<T>): Promise<T> {
+  if (!asRoot) return fn()
+  process.env.KIMI_TASK_UID = "65534"
+  process.env.KIMI_TASK_GID = "65534"
+  return fn().finally(() => {
+    delete process.env.KIMI_TASK_UID
+    delete process.env.KIMI_TASK_GID
+  })
+}
+
 /** True while pid is a live (non-zombie) process. */
 function processAlive(pid: number): boolean {
   try {
@@ -458,17 +499,17 @@ test("NL-3: a runner killed mid-task does not settle the run while its CLI still
   // at once and the bridge freed the workspace lock while the detached CLI
   // kept editing (its marker landed 8 s later, past its own 3 s timeout).
   // The fixed client reaps the CLI's process group before it settles.
-  const work = scratch()
+  const work = sharedDir()
   const pidFile = join(work, "cli.pid")
   const marker = join(work, "marker")
   const kimi = hangingCli(pidFile, marker, 4_000)
-  const socketPath = join(scratch(), "runner.sock")
-  const runnerScript = fileURLToPath(new URL("./task_runner.js", import.meta.url))
-  const runnerProc = spawn(process.execPath, [runnerScript, socketPath], {
+  const socketPath = join(sharedDir(), "runner.sock")
+  const [runnerBin, ...runnerArgs] = runnerArgv()
+  const runnerProc = spawn(runnerBin, [...runnerArgs, socketPath], {
     env: { ...process.env, KIMI_BIN: kimi, WORKSPACE_ROOT: work, LUNARWING_TASK_RUNNER_STATE_FILE: join(work, "state.json") },
     stdio: "ignore",
   })
-  try {
+  await withRunnerUid(async () => { try {
     const deadline = Date.now() + 10_000
     while (!existsSync(socketPath) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50))
     const promise = delegateTaskToRunner(socketPath, taskRequest("edit", { task_id: "nl3-kill", timeout_ms: 3_000 }), undefined, () => {})
@@ -484,7 +525,7 @@ test("NL-3: a runner killed mid-task does not settle the run while its CLI still
   } finally {
     runnerProc.kill("SIGKILL")
     try { process.kill(Number(readFileSync(pidFile, "utf8")), "SIGKILL") } catch { /* gone */ }
-  }
+  } })
 })
 
 test("NL-3: a delegated cancel settles only after the CLI is gone", async () => {
@@ -544,7 +585,6 @@ test("NL-3: the reap signals only groups whose members all belong to the task ui
 // image runs it as root before setpriv). The runner gets only the listening
 // descriptor, which never reaches task code.
 const bindHelper = fileURLToPath(new URL("../task_runner_bind.py", import.meta.url))
-const scriptsDir = dirname(fileURLToPath(import.meta.url))
 
 function runBindHelper(socketPath: string, program: string[], env: NodeJS.ProcessEnv = {}) {
   return spawn("python3", ["-I", bindHelper, socketPath, "--", ...program], {
@@ -560,7 +600,7 @@ async function exitOf(proc: ReturnType<typeof spawn>): Promise<{ code: number | 
 }
 
 test("NL-7: the bind helper hands the runner a listener in an owner-only directory, and task code never inherits it", async () => {
-  const base = scratch()
+  const base = sharedDir()
   const socketDir = join(base, "sock")
   const socketPath = join(socketDir, "task-runner.sock")
   const report = join(base, "fds.json")
@@ -570,7 +610,7 @@ test("NL-7: the bind helper hands the runner a listener in an owner-only directo
     fs.writeFileSync(${JSON.stringify(report)}, JSON.stringify({ fds, listenFdEnv: process.env.LUNARWING_TASK_RUNNER_LISTEN_FD ?? null }))
     process.stdout.write(JSON.stringify({ role: "assistant", content: "fd report written" }) + "\\n")`,
   )
-  const runner = runBindHelper(socketPath, [process.execPath, join(scriptsDir, "task_runner.js")], {
+  const runner = runBindHelper(socketPath, runnerArgv(), {
     KIMI_BIN: kimi,
     WORKSPACE_ROOT: base,
     LUNARWING_TASK_RUNNER_STATE_FILE: join(base, "state.json"),
