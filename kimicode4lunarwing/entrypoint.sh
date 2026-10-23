@@ -190,11 +190,13 @@ case "$MODE" in
       # NB-17 (!1861 run 195): the runner runs as the task uid, so any task
       # can kill it — after which every later task fails with a connection
       # error while /ready stays true. Supervise it: a dead runner is
-      # restarted (up to 5 rapid-restart attempts, then the supervisor kills
-      # the bridge so the container's wait-loop exits and the orchestrator's
-      # restart policy takes over). The supervisor owns the runner PID from
-      # here on: it records the LIVE pid in $RUNNER_PID_FILE so the parent's
-      # cleanup() kills the current runner, not a stale first-generation pid.
+      # restarted (up to 5 rapid-restart attempts, then the supervisor
+      # signals this launcher, whose cleanup trap stops the bridge, the
+      # runner and the health server so tini exits the container and the
+      # orchestrator's restart policy takes over). The supervisor owns the
+      # runner PID from here on: it records the LIVE pid in $RUNNER_PID_FILE
+      # so the parent's cleanup() kills the current runner, not a stale
+      # first-generation pid.
       (
         _attempts=0
         _current="$RUNNER_PID"
@@ -203,8 +205,15 @@ case "$MODE" in
           while kill -0 "$_current" 2>/dev/null; do sleep 2; done
           _attempts=$((_attempts + 1))
           if [ "$_attempts" -gt 5 ]; then
-            log "Task runner failed 5 restart attempts — exiting container for orchestrator restart"
-            kill "$BRIDGE_PID" 2>/dev/null || true
+            log "Task runner failed 5 restart attempts — stopping the container for orchestrator restart"
+            # NI-3 (!1868 run 198): this subshell forked BEFORE $BRIDGE_PID
+            # existed, so it holds an empty copy — killing $BRIDGE_PID here
+            # was a no-op and `exit 1` only ended the subshell, leaving a
+            # root bridge accepting tasks it could never complete. Signal
+            # the launcher itself instead: `$$` in a subshell is still the
+            # parent's pid, so this runs the cleanup trap, which stops the
+            # bridge, the runner and the health server.
+            kill -TERM "$$" 2>/dev/null || true
             exit 1
           fi
           log "Task runner exited — restarting (attempt $_attempts/5)"
