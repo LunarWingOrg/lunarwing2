@@ -160,6 +160,10 @@ kimicode4lunarwing/scripts/path_expand_test.ts
 kimicode4lunarwing/scripts/smoke_test.ts
 kimicode4lunarwing/scripts/task_identity.ts
 kimicode4lunarwing/scripts/task_identity_test.ts
+kimicode4lunarwing/scripts/task_runner.ts
+kimicode4lunarwing/scripts/task_runner_test.ts
+kimicode4lunarwing/scripts/task_runner_client.ts
+kimicode4lunarwing/scripts/task_runner_client_test.ts
 kimicode4lunarwing/scripts/task_prompt_test.ts
 kimicode4lunarwing/scripts/workspace_path.ts'
         source_ref=2.3.0

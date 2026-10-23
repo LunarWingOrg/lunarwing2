@@ -42,6 +42,15 @@ def _load_ws_state() -> dict | None:
     except json.JSONDecodeError:
         return {"ready": False, "error": "invalid websocket state file"}
 
+def _load_state_file(path: str) -> dict | None:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError:
+        return {"ready": False, "error": "invalid runner state file"}
+
 def _build_ready() -> tuple[dict, int]:
     mode = os.environ.get("KIMI_MODE", "websocket")
     body = {"ready": True, "uptime_seconds": _uptime(), "mode": mode}
@@ -58,8 +67,66 @@ def _build_ready() -> tuple[dict, int]:
     ready = bool(ws_state.get("ready"))
     body["ready"] = ready
     body["websocket"] = ws_state
+
+    # NB-17 (!1861 run 195): the task runner runs unsupervised from the
+    # health server's point of view unless its liveness is included. When
+    # delegation is configured (the runner socket env is set), a missing or
+    # not-ready runner state file makes /ready fail so the orchestrator
+    # restarts the container instead of accepting tasks the runner will
+    # refuse with connection errors.
+    runner_socket = os.environ.get("LUNARWING_TASK_RUNNER_SOCKET", "")
+    if runner_socket:
+        runner_state = _load_runner_state()
+        runner_ready = False
+        if runner_state:
+            runner_ready = bool(runner_state.get("ready"))
+            # NC-7: a stale heartbeat means the runner is dead. The runner
+            # writes every 10 s; treat anything older than 30 s (3 missed
+            # beats) as not ready, so a SIGKILL'd runner (which leaves a
+            # ready:true file with no further updates) is caught.
+            heartbeat_at = runner_state.get("heartbeat_at")
+            if runner_ready and heartbeat_at:
+                try:
+                    hb_ts = time.time() - _parse_iso(heartbeat_at)
+                    if hb_ts > 30:
+                        runner_ready = False
+                        runner_state = {**runner_state, "ready": False,
+                                        "error": "heartbeat stale"}
+                except Exception:
+                    runner_ready = False
+                    runner_state = {**runner_state, "ready": False,
+                                    "error": "heartbeat unparseable"}
+        body["task_runner"] = {"ready": runner_ready,
+                               **(runner_state if runner_state else {"error": "state unavailable"})}
+        if not runner_ready:
+            body["ready"] = False
+            status = 503
+            return body, status
+
     status = 200 if ready else 503
     return body, status
+
+
+def _parse_iso(ts: str) -> float:
+    """Parse an ISO 8601 timestamp to epoch seconds (best-effort)."""
+    # Python 3.11+ has datetime.fromisoformat handling 'Z'; be robust.
+    s = ts.rstrip("Z").replace("T", " ")
+    return time.mktime(time.strptime(s, "%Y-%m-%d %H:%M:%S"))
+
+def _load_runner_state():
+    # NC-7: use the same default as the runner (task_runner.ts main()):
+    # <socket dir>/task-runner-state.json. The entrypoint exports both
+    # LUNARWING_TASK_RUNNER_SOCKET and LUNARWING_TASK_RUNNER_STATE_FILE before
+    # starting the health server so this path resolves to the runner's state.
+    path = os.environ.get("LUNARWING_TASK_RUNNER_STATE_FILE", "")
+    if not path:
+        socket_path = os.environ.get("LUNARWING_TASK_RUNNER_SOCKET", "")
+        if socket_path:
+            import os.path as _osp
+            path = _osp.join(_osp.dirname(socket_path), "task-runner-state.json")
+    if not path:
+        return None
+    return _load_state_file(path)
 
 class HealthHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):

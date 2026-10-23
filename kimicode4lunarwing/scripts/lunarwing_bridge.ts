@@ -30,6 +30,12 @@ import { readFileSync } from "node:fs"
 
 import { executeTask } from "./kimi_task_executor.js"
 import { proxyEnvForTask, ToolProxyRelay, type TaskProxyHandle } from "./lunarwing_tool_proxy.js"
+import {
+  bridgeRunnerSocketPath,
+  cancelRunnerTask,
+  delegateTaskToRunner,
+  verifyRunnerSocket,
+} from "./task_runner_client.js"
 import { resolveTaskWorkspace, workspacePathsOverlap } from "./workspace_path.js"
 
 // A single malformed frame or a stray async error must not take the whole
@@ -268,19 +274,65 @@ async function handleTaskRequest(
     const proxyEnv = toolProxy
       ? proxyEnvForTask(request.task_id, toolProxy.socketPath)
       : undefined
-    await executeTask(
-      request,
-      (progress: TaskProgress) => {
-        sendEnvelope(ws, "task_progress", progress as unknown as Record<string, unknown>)
-      },
-      (result: TaskResult) => {
-        sendEnvelope(ws, "task_result", result as unknown as Record<string, unknown>)
-        console.log(`[bridge] task ${request.task_id}: ${result.status} (${result.duration_ms}ms)`)
-      },
-      controller.signal,
-      workspace,
-      proxyEnv,
-    )
+    // WI#454: with a task runner configured, the bridge delegates execution
+    // to the runner daemon (the task-container half of the two-container
+    // split) — the runner runs as the task uid and never sees the hub
+    // credential. Without one, execution stays local (the WI#400 setpriv
+    // drop inside executeTask).
+    const runnerSocket = bridgeRunnerSocketPath()
+    if (runnerSocket) {
+    // NB-16: refuse to connect through a path the task uid controls that
+    // is not a task-uid-owned socket (symlink stand-ins are lstat-refused).
+    try {
+      verifyRunnerSocket(runnerSocket)
+    } catch (err) {
+      sendEnvelope(ws, "task_result", {
+        task_id: request.task_id,
+        status: "error",
+        output: "",
+        error: err instanceof Error ? err.message : String(err),
+        duration_ms: 0,
+      })
+      console.warn(`[bridge] task ${request.task_id}: runner socket verification failed: ${err instanceof Error ? err.message : err}`)
+      return
+    }
+    const result = await delegateTaskToRunner(
+        runnerSocket,
+        request,
+        proxyEnv,
+        (progress: TaskProgress) => {
+          sendEnvelope(ws, "task_progress", progress as unknown as Record<string, unknown>)
+        },
+        controller.signal,
+      )
+      sendEnvelope(ws, "task_result", result as unknown as Record<string, unknown>)
+      console.log(`[bridge] task ${request.task_id}: ${result.status} (${result.duration_ms}ms, delegated)`)
+    } else {
+      await executeTask(
+        request,
+        (progress: TaskProgress) => {
+          sendEnvelope(ws, "task_progress", progress as unknown as Record<string, unknown>)
+        },
+        (result: TaskResult) => {
+          sendEnvelope(ws, "task_result", result as unknown as Record<string, unknown>)
+          console.log(`[bridge] task ${request.task_id}: ${result.status} (${result.duration_ms}ms)`)
+        },
+        controller.signal,
+        workspace,
+        proxyEnv,
+      )
+    }
+  } catch (err) {
+    // Delegation rejections (connection failure, malformed runner line)
+    // must not strand the hub waiting on a task_result.
+    console.error(`[bridge] task ${request.task_id}: execution failed:`, err)
+    sendEnvelope(ws, "task_result", {
+      task_id: request.task_id,
+      status: "error",
+      output: "",
+      error: err instanceof Error ? err.message : String(err),
+      duration_ms: 0,
+    })
   } finally {
     toolProxy?.close()
     activeTasks.delete(request.task_id)
@@ -296,6 +348,8 @@ function handleCancel(payload: unknown, ws: BridgeSocket): void {
   const task = activeTasks.get(payload.task_id)
   if (task?.socket === ws) {
     console.log(`[bridge] task ${payload.task_id}: cancelled`)
+    const runnerSocket = bridgeRunnerSocketPath()
+    if (runnerSocket) cancelRunnerTask(runnerSocket, payload.task_id)
     task.controller.abort()
   } else if (task) {
     console.warn(`[bridge] cancel: task ${payload.task_id} belongs to another connection`)

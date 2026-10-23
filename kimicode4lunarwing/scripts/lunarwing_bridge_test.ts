@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { createServer } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -9,6 +9,7 @@ import { test } from "node:test"
 import { WebSocket, WebSocketServer } from "ws"
 
 import { SUBPROTOCOL } from "./lunarwing_runtime.js"
+import { TaskRunner } from "./task_runner.js"
 
 const bridgePath = fileURLToPath(new URL("./lunarwing_bridge.js", import.meta.url))
 
@@ -423,6 +424,107 @@ conn.on("data", (d) => {
     assert.match(String(reply.error), /hub connection closed/)
   } finally {
     hub.close()
+    child.kill("SIGTERM")
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("a runner-socket bridge delegates the task and returns its result to the hub (WI#454)", async () => {
+  // Full two-container rehearsal inside one process tree: the bridge is
+  // spawned with LUNARWING_TASK_RUNNER_SOCKET set, a real TaskRunner
+  // (the task-container half) listens on that socket, and a hub-side
+  // WebSocket drives a task_request through the bridge into the runner and
+  // collects the delegated result. The bridge's own env must NOT leak into
+  // the runner's task env — the runner process was started separately, so
+  // only the request's env crosses the boundary.
+  const root = mkdtempSync(join(tmpdir(), "kimi-runner-bridge-"))
+  const workspace = join(root, "workspace")
+  mkdirSync(workspace, { recursive: true })
+  const bin = join(root, "mock-kimi")
+  writeFileSync(bin, `#!/usr/bin/env node
+const messages = [
+  { role: "assistant", content: "Delegated work started." },
+  { role: "assistant", content: "Delegated result: ok" },
+]
+for (const m of messages) process.stdout.write(JSON.stringify(m) + "\\n")
+`, { mode: 0o755 })
+  const runner = new TaskRunner(workspace)
+  const runnerSocket = await runner.listen(join(root, "runner", "runner.sock"))
+  assert.ok(runnerSocket, "runner failed to listen")
+  // The runner shares THIS process, so pin its KIMI_BIN here (the bridge
+  // child sets it in its own env; the runner would otherwise resolve a real
+  // kimi from the host PATH).
+  const previousKimiBin = process.env.KIMI_BIN
+  process.env.KIMI_BIN = bin
+  const bridgePort = await freePort()
+  const child = startBridge(bridgePort, "runner-bridge-token", {
+    WORKSPACE_ROOT: workspace,
+    LUNARWING_TASK_RUNNER_SOCKET: runnerSocket,
+  })
+  try {
+    await waitForListening(child)
+    const ws = await connect(bridgePort, "runner-bridge-token")
+    try {
+      const resultLine = await new Promise<Record<string, unknown>>((resolve, reject) => {
+        ws.on("message", (data) => {
+          const message = JSON.parse(data.toString()) as Record<string, unknown>
+          if (message.type === "task_result") resolve(message as Record<string, unknown>)
+        })
+        ws.once("error", reject)
+        ws.send(JSON.stringify({ type: "task_request", payload: {
+          task_id: "delegate-1", prompt: "do the work", timeout_ms: 30000,
+        }}))
+      })
+      const payload = resultLine.payload as Record<string, unknown>
+      assert.equal(payload.task_id, "delegate-1")
+      assert.equal(payload.status, "success", JSON.stringify(payload))
+      assert.match(String(payload.output), /Delegated result: ok/)
+      assert.equal(runner.activeRunCount, 0)
+    } finally {
+      ws.close()
+    }
+  } finally {
+    if (previousKimiBin === undefined) delete process.env.KIMI_BIN
+    else process.env.KIMI_BIN = previousKimiBin
+    child.kill("SIGTERM")
+    runner.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("a runner-socket bridge maps a dead runner socket to an error task_result (WI#454)", async () => {
+  // The runner is absent (the two-container task container never came up):
+  // the bridge must answer the hub with an error result instead of stranding
+  // the task on a rejected delegation.
+  const root = mkdtempSync(join(tmpdir(), "kimi-runner-dead-"))
+  const runnerSocket = join(root, "runner", "runner.sock")
+  const bridgePort = await freePort()
+  const child = startBridge(bridgePort, "runner-dead-token", {
+    WORKSPACE_ROOT: root,
+    LUNARWING_TASK_RUNNER_SOCKET: runnerSocket,
+  })
+  try {
+    await waitForListening(child)
+    const ws = await connect(bridgePort, "runner-dead-token")
+    try {
+      const resultLine = await new Promise<Record<string, unknown>>((resolve, reject) => {
+        ws.on("message", (data) => {
+          const message = JSON.parse(data.toString()) as Record<string, unknown>
+          if (message.type === "task_result") resolve(message as Record<string, unknown>)
+        })
+        ws.once("error", reject)
+        ws.send(JSON.stringify({ type: "task_request", payload: {
+          task_id: "dead-runner-1", prompt: "doomed", timeout_ms: 30000,
+        }}))
+      })
+      const payload = resultLine.payload as Record<string, unknown>
+      assert.equal(payload.task_id, "dead-runner-1")
+      assert.equal(payload.status, "error")
+      assert.match(String(payload.error), /ENOENT|ECONNREFUSED|connect/i)
+    } finally {
+      ws.close()
+    }
+  } finally {
     child.kill("SIGTERM")
     rmSync(root, { recursive: true, force: true })
   }
