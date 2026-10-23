@@ -3316,5 +3316,51 @@ class ProxyToolSetSyncTests(unittest.TestCase):
         sync_check.assert_called_once()
 
 
+
+class KimiBuilderFixtureCopyTests(unittest.TestCase):
+    """!1873 run-202 NM-1: the kimi builder stage runs `npm test` from
+    /build/scripts, so every ../<file> a kimi test reads must be COPYed into
+    /build. The /ready tests read ../health_server.py, which the builder
+    never copied, so the image build's test gate would have failed with
+    ENOENT while the repo-checkout CI lane stayed green."""
+
+    def builder_copies(self):
+        text = (ROOT / "kimicode4lunarwing" / "Dockerfile").read_text(encoding="utf-8")
+        builder = text.split("\nFROM ", 2)[1]
+        copied = set()
+        for line in builder.splitlines():
+            parts = line.split()
+            if len(parts) < 3 or parts[0] != "COPY" or parts[1].startswith("--"):
+                continue
+            *sources, dest = parts[1:]
+            for source in sources:
+                if source.endswith("/"):
+                    # A directory source copies its CONTENTS into dest.
+                    copied.add(dest if dest.endswith("/") else dest + "/")
+                elif dest.endswith("/"):
+                    copied.add(dest + pathlib.PurePosixPath(source).name)
+                else:
+                    copied.add(dest)
+        return copied
+
+    def test_every_parent_file_a_kimi_test_reads_is_copied_into_the_builder(self):
+        import re
+        pattern = re.compile(r'new URL\("\.\./([^"]+)"')
+        wanted = set()
+        for test_file in sorted((ROOT / "kimicode4lunarwing" / "scripts").glob("*_test.ts")):
+            wanted.update(pattern.findall(test_file.read_text(encoding="utf-8")))
+        self.assertIn("health_server.py", wanted)
+        copied = self.builder_copies()
+        missing = []
+        for relative in sorted(wanted):
+            target = f"/build/{relative}"
+            if target in copied:
+                continue
+            if any(entry.endswith("/") and target.startswith(entry) for entry in copied):
+                continue
+            missing.append(relative)
+        self.assertEqual(missing, [], f"kimi tests read files the builder stage never copies into /build: {missing}")
+
+
 if __name__ == "__main__":
     unittest.main()
