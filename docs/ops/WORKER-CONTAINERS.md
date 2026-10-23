@@ -186,17 +186,28 @@ section and "Launch identity (WI#422)" further down.
   caps the receive buffer at 1 MiB (NB-15); the bridge verifies the
   socket is a task-uid-owned socket before connecting (NB-16); the
   runner publishes a heartbeat state file included in `/ready` and the
-  entrypoint supervises the runner with restart-on-exit (5 rapid
-  attempts, then container exit for the orchestrator) (NB-17). Run-196
+  entrypoint supervises the runner with restart-on-exit (NB-17). Run-196
   hardening (NC-6..NC-10): the status allowlist uses the protocol's
   `"timed_out"` (not `"timeout"`) so a delegated task that times out is
   reported correctly with partial output (NC-6); the runner env vars are
-  exported before the health server starts and a heartbeat older than
-  30 s makes `/ready` fail (NC-7); the client rejects immediately when
-  the runner connection closes without a result (NC-8); the supervisor
-  resets its attempt counter when a runner generation survives (NC-9);
-  the runner PID file lives in the root-only token directory (NC-9).
-  remains for the full split (WI#454's own remaining
+  exported before the health server starts, and `/ready` treats a runner
+  heartbeat as authoritative — a heartbeat that is missing, unparseable,
+  or older than 30 s (three missed 10 s beats) fails it (NC-7); the
+  client rejects immediately when the runner connection closes without a
+  result (NC-8); the supervisor resets its attempt counter when a runner
+  generation survives 30 s, and the runner PID file lives in the
+  root-only token directory rather than the task-uid-owned runner
+  directory (NC-9). After five failed restarts the supervisor signals the
+  launcher (`kill -TERM $$` — the subshell forked before `BRIDGE_PID`
+  existed, so it cannot signal the bridge directly), which runs the
+  cleanup trap and stops the bridge, the runner and the health server so
+  the container exits for the orchestrator (run-198 NI-3). **Accepted
+  residual (NC-10, Low):** `verifyRunnerSocket` does `lstatSync` and then
+  `connect` — two separate path operations on a task-owned directory
+  (TOCTOU). The durable fix (root owns the listening socket) belongs to
+  the two-container split below. Until then the data path is still
+  validated by the NB-15 `task_id` checks. What remains for the full
+  split (WI#454's own remaining
   scope): the image-level separation (bridge container and task
   container as two mt-admin units under two different non-root uids,
   with the socket crossing the shared workspace volume and the bridge
