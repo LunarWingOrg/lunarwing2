@@ -93,6 +93,18 @@ KIMI_CODE_HOME="$KIMI_CODE_HOME" as_task /app/entrypoint-task-setup.sh
 # NOT stripped, WI#373); the setup process's export dies with it.
 export KIMI_API_KEY="${KIMI_API_KEY:-${TENSORZERO_API_KEY:-}}"
 
+# NC-7: compute runner paths early so the health server (started next) can
+# see them. The runner socket dir is only created when the credential handoff
+# is active (websocket mode below), but the health server needs the env vars
+# at its start to include runner liveness in /ready.
+RUNNER_DIR="${KIMI_TASK_RUNNER_DIR:-/run/lunarwing-runner}"
+RUNNER_SOCKET="${KIMI_TASK_RUNNER_SOCKET:-$RUNNER_DIR/task-runner.sock}"
+RUNNER_STATE_FILE="${KIMI_TASK_RUNNER_STATE_FILE:-$RUNNER_DIR/task-runner-state.json}"
+if [ -n "${AGENT_AUTH_TOKEN_FILE:-}" ] && [ "${KIMI_TASK_RUNNER:-}" != "skip" ]; then
+  export LUNARWING_TASK_RUNNER_SOCKET="$RUNNER_SOCKET"
+  export LUNARWING_TASK_RUNNER_STATE_FILE="$RUNNER_STATE_FILE"
+fi
+
 # ── always start the health server in the background (task uid: no secrets) ──
 log "Starting health server on port $HEALTH_PORT"
 export WS_STATE_FILE
@@ -152,8 +164,6 @@ case "$MODE" in
     # from LUNARWING_TOKEN_DIR: the token directory must stay root-only
     # 0700 (WI#400), and the runner must own its own directory to bind the
     # socket — root hands it over 0700 task-uid below.
-    RUNNER_DIR="${KIMI_TASK_RUNNER_DIR:-/run/lunarwing-runner}"
-    RUNNER_SOCKET="${KIMI_TASK_RUNNER_SOCKET:-$RUNNER_DIR/task-runner.sock}"
     RUNNER_PID_FILE="${KIMI_TASK_RUNNER_PID_FILE:-$RUNNER_DIR/task-runner.pid}"
     if [ -n "${AGENT_AUTH_TOKEN_FILE:-}" ] && [ "${KIMI_TASK_RUNNER:-}" != "skip" ]; then
       install -d -m 0700 "$RUNNER_DIR" 2>/dev/null || true
@@ -208,10 +218,8 @@ case "$MODE" in
       ) &
       RUNNER_SUPERVISOR_PID=$!
       echo "$RUNNER_PID" > "$RUNNER_PID_FILE"
-      # Hand the socket path to the bridge: with it set, every task is
-      # delegated to the unprivileged runner (WI#454); unset means local
-      # execution (the WI#400 drop inside the bridge executor).
-      export LUNARWING_TASK_RUNNER_SOCKET="$RUNNER_SOCKET"
+      # LUNARWING_TASK_RUNNER_SOCKET was already exported before the health
+      # server started (NC-7); the bridge reads it from the inherited env.
       cleanup() {
         log "Shutting down..."
         [ -z "${RUNNER_SUPERVISOR_PID:-}" ] || kill "$RUNNER_SUPERVISOR_PID" 2>/dev/null || true
