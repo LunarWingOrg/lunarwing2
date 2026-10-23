@@ -13,10 +13,13 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 START_TIME = time.time()
 WS_STATE_FILE = os.environ.get("WS_STATE_FILE", "/tmp/lunarwing_ws_state.json")
+# The runner writes a heartbeat every 10 s; three missed beats is dead.
+HEARTBEAT_MAX_AGE_SECONDS = 30.0
 
 def _uptime() -> float:
     return round(time.time() - START_TIME, 2)
@@ -86,16 +89,15 @@ def _build_ready() -> tuple[dict, int]:
             # ready:true file with no further updates) is caught.
             heartbeat_at = runner_state.get("heartbeat_at")
             if runner_ready and heartbeat_at:
-                try:
-                    hb_ts = time.time() - _parse_iso(heartbeat_at)
-                    if hb_ts > 30:
-                        runner_ready = False
-                        runner_state = {**runner_state, "ready": False,
-                                        "error": "heartbeat stale"}
-                except Exception:
+                age = _heartbeat_age(heartbeat_at)
+                if age is None:
                     runner_ready = False
                     runner_state = {**runner_state, "ready": False,
                                     "error": "heartbeat unparseable"}
+                elif age > HEARTBEAT_MAX_AGE_SECONDS:
+                    runner_ready = False
+                    runner_state = {**runner_state, "ready": False,
+                                    "error": "heartbeat stale"}
         body["task_runner"] = {"ready": runner_ready,
                                **(runner_state if runner_state else {"error": "state unavailable"})}
         if not runner_ready:
@@ -108,10 +110,25 @@ def _build_ready() -> tuple[dict, int]:
 
 
 def _parse_iso(ts: str) -> float:
-    """Parse an ISO 8601 timestamp to epoch seconds (best-effort)."""
-    # Python 3.11+ has datetime.fromisoformat handling 'Z'; be robust.
-    s = ts.rstrip("Z").replace("T", " ")
-    return time.mktime(time.strptime(s, "%Y-%m-%d %H:%M:%S"))
+    """Parse an ISO 8601 UTC timestamp to epoch seconds.
+
+    ``datetime.fromisoformat`` has accepted the trailing ``Z`` since Python
+    3.11; it also keeps any fractional seconds that ``Date.toISOString()``
+    emits (``2026-10-23T03:29:05.739Z``), which a strptime with a bare
+    ``%S`` rejects. The result is timezone-aware, so the offset is applied
+    explicitly instead of being reinterpreted as local time (NI-2).
+    """
+    parsed = datetime.fromisoformat(ts.strip().replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+def _heartbeat_age(ts: str) -> float | None:
+    """Seconds since *ts* in UTC, or None when it cannot be parsed."""
+    try:
+        return time.time() - _parse_iso(ts)
+    except (TypeError, ValueError):
+        return None
 
 def _load_runner_state():
     # NC-7: use the same default as the runner (task_runner.ts main()):
