@@ -12,8 +12,10 @@ ARG DEBIAN_SNAPSHOT=20261017T082437Z
 # the upstream build compiles into the binary instead of fetching live.
 # Refresh the file and this pin together in one deliberate commit (see the
 # opencode bump checklist in docs/ops/WORKER-CONTAINERS.md); CI's
-# validate_worker_versions fails when the two drift apart.
-ARG MODELS_DEV_API_JSON_SHA256=78e4722b4db9b8d3edc47acb4d68fe9336a44e997fbe3af97d142d01da6b1259
+# validate_worker_versions fails when the two drift apart. The name says
+# SNAPSHOT on purpose: secret scanning (gitleaks generic-api-key) reads an
+# ARG whose name contains API and whose value is 64 hex as a leaked key.
+ARG MODELS_DEV_SNAPSHOT_SHA256=7552284ad975a895e287180ab1e2157328ff19bc7832516ab00ddbaceba51b9a
 ARG SOURCE_REVISION=unknown
 
 # ──────────────────────
@@ -26,7 +28,7 @@ FROM docker.io/oven/bun:debian@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6
 ARG OPENCODE_VERSION
 ARG OPENCODE_REF
 ARG DEBIAN_SNAPSHOT
-ARG MODELS_DEV_API_JSON_SHA256
+ARG MODELS_DEV_SNAPSHOT_SHA256
 WORKDIR /build
 
 RUN set -eu; \
@@ -64,13 +66,18 @@ WORKDIR /build/opencode/packages/opencode
 # WI#467: pin the models.dev snapshot the upstream build compiles into the
 # binary. At the pinned ref, script/generate.ts reads the snapshot from the
 # file named by MODELS_DEV_API_JSON when set, and fetches
-# https://models.dev/api.json live otherwise — the live response then became
-# part of the binary, so candidate vs clean-rebuild digests differed whenever
-# models.dev published between the two builds (master pipelines 6252/6269/
-# 6288 lost every opencode candidate to that). COPY the committed snapshot in,
-# verify its hash against the ARG pin and assert the env-var hook still exists
-# in this same RUN, so a swapped snapshot or a bump that drops the hook fails
-# the build instead of silently re-enabling the live fetch.
+# ${OPENCODE_MODELS_URL:-https://models.dev}/api.json live otherwise — the
+# live response then became part of the binary, so candidate and
+# clean-rebuild digests differed whenever models.dev published between the
+# two builds (the clean-rebuild mismatches tracked as WI#467). COPY the
+# committed snapshot in, verify its hash against the ARG pin, check that it is
+# strict JSON and that generate.ts still reads both env vars, then build with
+# OPENCODE_MODELS_URL pointed at a closed loopback port: an upstream that
+# ignores the snapshot and fetches anyway fails the build instead of
+# compiling a live catalog. validate_worker_versions pins this builder-stage
+# tail (this WORKDIR up to the next FROM) instruction by instruction, so
+# dropping an env assignment or the guard call, or adding a later rebuild,
+# fails CI (validate_config.OPENCODE_MODELS_DEV_BUILD_STEPS).
 COPY models-dev/api.json /build/models-dev-api.json
 COPY scripts/check_models_dev_snapshot.py /build/check_models_dev_snapshot.py
 # Build only the native platform target. opencode's build.ts (script/build.ts)
@@ -82,12 +89,13 @@ COPY scripts/check_models_dev_snapshot.py /build/check_models_dev_snapshot.py
 # See docs/proposals/OPENCODE-WORKER-SINGLE-TARGET-BUILD.md for full rationale.
 RUN set -eu; \
     actual="$(sha256sum /build/models-dev-api.json | cut -d' ' -f1)"; \
-    [ "$actual" = "${MODELS_DEV_API_JSON_SHA256}" ] || { \
-      echo "models.dev snapshot sha256 mismatch: got $actual, expected ${MODELS_DEV_API_JSON_SHA256}" >&2; \
+    [ "$actual" = "${MODELS_DEV_SNAPSHOT_SHA256}" ] || { \
+      echo "models.dev snapshot sha256 mismatch: got $actual, expected ${MODELS_DEV_SNAPSHOT_SHA256}" >&2; \
       exit 1; \
     }; \
-    python3 /build/check_models_dev_snapshot.py script/generate.ts; \
-    MODELS_DEV_API_JSON=/build/models-dev-api.json bun run build -- --single
+    python3 /build/check_models_dev_snapshot.py script/generate.ts /build/models-dev-api.json; \
+    MODELS_DEV_API_JSON=/build/models-dev-api.json OPENCODE_MODELS_URL=http://127.0.0.1:9 \
+      bun run build -- --single
 
 # Keep cross-stage artifacts small. Copying the full monorepo retains thousands
 # of source and node_modules files in the runtime stage. The compiled binary is
