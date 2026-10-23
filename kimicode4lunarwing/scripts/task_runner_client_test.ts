@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { after, test } from "node:test"
-import { spawn } from "node:child_process"
+import { spawn, spawnSync } from "node:child_process"
 import { connect } from "node:net"
 import { chmodSync, chownSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -383,6 +383,35 @@ function runnerArgv(): string[] {
   return ["/usr/bin/setpriv", "--reuid=65534", "--regid=65534", "--clear-groups", "--", process.execPath, join(stage, "task_runner.js")]
 }
 
+interface ProcRead<T> { value?: T; error?: string }
+interface RunnerProc { exe: ProcRead<string>; environ: ProcRead<string[]>; fd3: ProcRead<string> }
+
+const RUNNER_PROC_PROBE = `const fs = require("fs")
+const pid = process.argv[1]
+const read = (f) => { try { return { value: f() } } catch (err) { return { error: String(err && err.message ? err.message : err) } } }
+process.stdout.write(JSON.stringify({
+  exe: read(() => fs.readlinkSync("/proc/" + pid + "/exe")),
+  environ: read(() => fs.readFileSync("/proc/" + pid + "/environ", "utf8").split(String.fromCharCode(0))),
+  fd3: read(() => fs.readlinkSync("/proc/" + pid + "/fd/3")),
+}))`
+
+/**
+ * The runner's /proc/<pid>/{exe,environ,fd/3}, read as the runner's own uid.
+ * Reading another uid's entries needs CAP_SYS_PTRACE, which the rootless
+ * BuildKit image build does not grant (master pipeline 6308). So under root
+ * a capability-free probe runs as the runner's uid/gid (65534); on a host the
+ * runner already shares our uid.
+ */
+function runnerProc(pid: number | undefined): RunnerProc {
+  const probe = [process.execPath, "-e", RUNNER_PROC_PROBE, String(pid)]
+  const argv = asRoot
+    ? ["/usr/bin/setpriv", "--reuid=65534", "--regid=65534", "--clear-groups", "--inh-caps=-all", "--no-new-privs", "--", ...probe]
+    : probe
+  const out = spawnSync(argv[0], argv.slice(1), { encoding: "utf8", timeout: 10_000 })
+  assert.equal(out.status, 0, `runner /proc probe failed: ${out.error?.message ?? ""} ${out.stderr}`)
+  return JSON.parse(out.stdout) as RunnerProc
+}
+
 /** A scratch dir the (possibly dropped) runner and its CLI can write. */
 function sharedDir(): string {
   const dir = scratch()
@@ -622,13 +651,15 @@ test("NL-7: the bind helper hands the runner a listener in an owner-only directo
     assert.ok(existsSync(join(base, "state.json")), "runner never came up on the inherited fd")
     // The socket directory is owner-only and the runner is the exec'd pid.
     assert.equal(statSync(socketDir).mode & 0o777, 0o700)
-    assert.match(readlinkSync(`/proc/${runner.pid}/exe`), /node/, "the helper must exec the runner in place (NL-4)")
+    const exe = runnerProc(runner.pid).exe
+    assert.match(exe.value ?? "", /node/, `the helper must exec the runner in place (NL-4); exe: ${exe.value ?? exe.error}`)
     const state = JSON.parse(readFileSync(join(base, "state.json"), "utf8")) as Record<string, unknown>
     assert.deepEqual(Object.keys(state).sort(), ["heartbeat_at", "ready"], "the state file carries liveness only (NL-8)")
     const result = await delegateTaskToRunner(socketPath, taskRequest("report fds", { task_id: "nl7-fd", timeout_ms: 10_000 }), undefined, () => {})
     assert.equal(result.status, "success", result.error ?? "")
-    const runnerFd3 = readlinkSync(`/proc/${runner.pid}/fd/3`)
-    assert.match(runnerFd3, /^socket:/)
+    const fd3 = runnerProc(runner.pid).fd3
+    const runnerFd3 = fd3.value ?? ""
+    assert.match(runnerFd3, /^socket:/, `runner fd 3: ${fd3.value ?? fd3.error}`)
     const seen = JSON.parse(readFileSync(report, "utf8")) as { fds: string[]; listenFdEnv: string | null }
     assert.ok(!seen.fds.includes(runnerFd3), `task code inherited the runner's listening socket ${runnerFd3}: ${seen.fds.join(",")}`)
     assert.equal(seen.listenFdEnv, null)
