@@ -12,6 +12,11 @@ import { SUBPROTOCOL } from "./lunarwing_runtime.js"
 
 const bridgePath = fileURLToPath(new URL("./lunarwing_bridge.js", import.meta.url))
 
+// killBridge waits for the child to exit after SIGTERM. Without waiting, a
+// lingering child process keeps a stdio pipe open and the node test runner
+// hangs until the 120 s timeout (pipeline #6252 kimi candidate 127798:
+// 101 pass, 0 fail, 1 cancelled — the one hang).
+
 async function freePort(): Promise<number> {
   const server = createServer()
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
@@ -24,7 +29,7 @@ async function freePort(): Promise<number> {
 
 function startBridge(port: number, token: string, extraEnv: Record<string, string> = {}): ChildProcessWithoutNullStreams {
   const stateDir = mkdtempSync(join(tmpdir(), "kimi-bridge-"))
-  return spawn(process.execPath, [bridgePath], {
+  const child = spawn(process.execPath, [bridgePath], {
     env: {
       ...process.env,
       AGENT_AUTH_TOKEN: token,
@@ -35,6 +40,25 @@ function startBridge(port: number, token: string, extraEnv: Record<string, strin
     },
     stdio: ["pipe", "pipe", "pipe"],
   })
+  child.once("exit", () => {
+    rmSync(stateDir, { recursive: true, force: true })
+  })
+  return child
+}
+
+async function killBridge(child: ChildProcessWithoutNullStreams): Promise<void> {
+  if (child.killed) return
+  const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()))
+  child.kill("SIGTERM")
+  // Escalate to SIGKILL if the bridge doesn't exit within 3 s (e.g. a task
+  // child keeping the event loop alive). SIGKILL cannot be caught so the
+  // process exits immediately.
+  const force = setTimeout(() => {
+    if (!child.killed) child.kill("SIGKILL")
+  }, 3000)
+  force.unref()
+  await exited
+  clearTimeout(force)
 }
 
 async function waitForListening(child: ChildProcessWithoutNullStreams): Promise<void> {
@@ -73,7 +97,7 @@ test("bridge requires token and rejects wrong bearer before upgrade", async () =
     assert.equal(ready.type, "ready")
     ws.close()
   } finally {
-    child.kill("SIGTERM")
+    await killBridge(child)
   }
 })
 
@@ -115,7 +139,7 @@ console.log(JSON.stringify({ role: "assistant", content: "done" }))
     assert.equal(readFileSync(join(root, "missions/pr-digest/state"), "utf8"), "first tick")
   } finally {
     ws?.close()
-    child.kill("SIGTERM")
+    await killBridge(child)
     rmSync(root, { recursive: true, force: true })
   }
 })
@@ -168,7 +192,7 @@ console.log(JSON.stringify({ role: "assistant", content: sock ? "HAS_PROXY_ENV" 
     assert.match(String(second.output), /NO_PROXY_ENV/)
   } finally {
     ws?.close()
-    child.kill("SIGTERM")
+    await killBridge(child)
     rmSync(root, { recursive: true, force: true })
   }
 })
@@ -250,7 +274,7 @@ setTimeout(() => {
     assert.match(String(result.output), /tool:proxied-content/)
   } finally {
     ws?.close()
-    child.kill("SIGTERM")
+    await killBridge(child)
     rmSync(root, { recursive: true, force: true })
   }
 })
@@ -328,7 +352,7 @@ conn.on("data", (d) => {
     assert.match(String(reply.error), /hub connection closed/)
   } finally {
     ws?.close()
-    child.kill("SIGTERM")
+    await killBridge(child)
     rmSync(root, { recursive: true, force: true })
   }
 })
@@ -423,7 +447,7 @@ conn.on("data", (d) => {
     assert.match(String(reply.error), /hub connection closed/)
   } finally {
     hub.close()
-    child.kill("SIGTERM")
+    await killBridge(child)
     rmSync(root, { recursive: true, force: true })
   }
 })
