@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { after, test } from "node:test"
 import { connect, type Socket } from "node:net"
-import { mkdtempSync, rmSync, symlinkSync, mkdirSync, writeFileSync, chmodSync } from "node:fs"
+import { existsSync, mkdtempSync, rmSync, symlinkSync, mkdirSync, writeFileSync, chmodSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -161,15 +161,20 @@ test("run streams progress and exactly one result, then ends the connection", as
       try {
         client.send({ op: "run", request: taskRequest("do it") })
         // Collect until the terminal result; the mock emits one progress
-        // line per assistant message, so the count is mock-defined.
+        // line per assistant message, so the count is mock-defined. The run
+        // is acknowledged first (NB-13: accepted clears the bridge's
+        // connection deadline and arms the run deadline).
         const progressLines: Array<Record<string, unknown>> = []
         let resultLine: Record<string, unknown> | undefined
+        let acceptedLine = false
         for (let i = 0; i < 8 && resultLine === undefined; i++) {
           const line = await client.nextLine()
-          if (line.op === "progress") progressLines.push(line)
+          if (line.op === "accepted") acceptedLine = true
+          else if (line.op === "progress") progressLines.push(line)
           else if (line.op === "result") resultLine = line
           else assert.fail(`unexpected runner line: ${JSON.stringify(line)}`)
         }
+        assert.ok(acceptedLine, "runner never acknowledged the run (NB-13)")
         assert.ok(resultLine !== undefined, "runner never sent the terminal result")
         assert.ok(progressLines.length >= 1, "runner never sent progress")
         for (const progress of progressLines) {
@@ -204,6 +209,10 @@ test("cancel aborts the in-flight run", async () => {
       const client = await RunnerClient.connectTo(path)
       try {
         client.send({ op: "run", request: taskRequest("hang", { timeout_ms: 60_000 }) })
+        // The run is acked before it registers (NB-13); consume the ack so
+        // the cancel reply isn't misread as the ack.
+        const accepted = await client.nextLine()
+        assert.equal(accepted.op, "accepted")
         // Wait for the run to be registered (heartbeat/wait would race).
         await new Promise((resolve) => setTimeout(resolve, 300))
         assert.equal(runner.activeRunCount, 1)
@@ -237,6 +246,10 @@ test("duplicate run and unknown op are refused", async () => {
       const client = await RunnerClient.connectTo(path)
       try {
         client.send({ op: "run", request: taskRequest("one", { task_id: "dup", timeout_ms: 60_000 }) })
+        // Consume the NB-13 acceptance ack before the duplicate-refusal
+        // reply arrives (both are queued on the same connection).
+        const dupAccepted = await client.nextLine()
+        assert.equal(dupAccepted.op, "accepted")
         await new Promise((resolve) => setTimeout(resolve, 300))
         client.send({ op: "run", request: taskRequest("two", { task_id: "dup", timeout_ms: 60_000 }) })
         const dup = await client.nextLine()
@@ -330,4 +343,75 @@ test("listen replaces a stale socket file", async () => {
   const path = await runner.listen(join(socketDir, "runner.sock"))
   assert.ok(path, "listen must replace the stale socket")
   runner.close()
+})
+
+test("NB-13: closing the bridge connection aborts the in-flight run", async () => {
+  // Review NB-13 probe: after a deadline rejection, the abandoned run kept
+  // editing the workspace. The runner must abort the run when its bridge
+  // connection closes, so the workspace lock frees with the error result.
+  const workspace = scratch()
+  const socketDir = scratch()
+  process.env.KIMI_BIN = makeMockKimi(
+    `process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)`,
+  )
+  try {
+    const { runner, path } = await startRunner(workspace, socketDir)
+    const client = await RunnerClient.connectTo(path)
+    client.send({ op: "run", request: taskRequest("hang", { timeout_ms: 60_000 }) })
+    const accepted = await client.nextLine()
+    assert.equal(accepted.op, "accepted")
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    assert.equal(runner.activeRunCount, 1)
+    // Vanish the bridge connection.
+    client.close()
+    // The close handler aborts the run; give the abort a beat to land.
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    assert.equal(runner.activeRunCount, 0, "run must be aborted when the bridge connection closes (NB-13)")
+    runner.close()
+  } finally {
+    delete process.env.KIMI_BIN
+  }
+})
+
+test("NB-14: a delegated task executes in its project directory, not the workspace root", async () => {
+  const workspace = scratch()
+  const projectDir = join(workspace, "proj")
+  mkdirSync(projectDir, { recursive: true })
+  const socketDir = scratch()
+  // The mock writes a marker into its CWD; the executor runs the CLI with
+  // cwd = the workspace the runner resolved.
+  process.env.KIMI_BIN = makeMockKimi(
+    `require("fs").writeFileSync(require("path").join(process.cwd(), "marker.txt"), "cwd-marker")
+    process.stdout.write(JSON.stringify({ role: "assistant", content: "marked" }) + "\\n")`,
+  )
+  try {
+    const { runner, path } = await startRunner(workspace, socketDir)
+    try {
+      const client = await RunnerClient.connectTo(path)
+      try {
+        const request = taskRequest("mark it")
+        ;(request as { context?: { project_dir?: string } }).context = { project_dir: "proj" }
+        client.send({ op: "run", request })
+        const accepted = await client.nextLine()
+        assert.equal(accepted.op, "accepted")
+        let resultLine: Record<string, unknown> | undefined
+        for (let i = 0; i < 6 && resultLine === undefined; i++) {
+          const line = await client.nextLine()
+          if (line.op === "result") resultLine = line
+        }
+        assert.ok(resultLine !== undefined, "runner never sent the result")
+        assert.equal((resultLine!.result as TaskResult).status, "success")
+        assert.ok(existsSync(join(projectDir, "marker.txt")),
+          "task must run in the project dir (NB-14)")
+        assert.ok(!existsSync(join(workspace, "marker.txt")),
+          "task must NOT run in the workspace root (NB-14)")
+      } finally {
+        client.close()
+      }
+    } finally {
+      runner.close()
+    }
+  } finally {
+    delete process.env.KIMI_BIN
+  }
 })

@@ -34,6 +34,7 @@ import {
   bridgeRunnerSocketPath,
   cancelRunnerTask,
   delegateTaskToRunner,
+  verifyRunnerSocket,
 } from "./task_runner_client.js"
 import { resolveTaskWorkspace, workspacePathsOverlap } from "./workspace_path.js"
 
@@ -280,7 +281,22 @@ async function handleTaskRequest(
     // drop inside executeTask).
     const runnerSocket = bridgeRunnerSocketPath()
     if (runnerSocket) {
-      const result = await delegateTaskToRunner(
+    // NB-16: refuse to connect through a path the task uid controls that
+    // is not a task-uid-owned socket (symlink stand-ins are lstat-refused).
+    try {
+      verifyRunnerSocket(runnerSocket)
+    } catch (err) {
+      sendEnvelope(ws, "task_result", {
+        task_id: request.task_id,
+        status: "error",
+        output: "",
+        error: err instanceof Error ? err.message : String(err),
+        duration_ms: 0,
+      })
+      console.warn(`[bridge] task ${request.task_id}: runner socket verification failed: ${err instanceof Error ? err.message : err}`)
+      return
+    }
+    const result = await delegateTaskToRunner(
         runnerSocket,
         request,
         proxyEnv,

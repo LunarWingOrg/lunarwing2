@@ -25,10 +25,11 @@
  */
 
 import { createServer, type Server, type Socket } from "node:net"
-import { lstatSync, mkdirSync, rmSync, unlinkSync } from "node:fs"
+import { lstatSync, mkdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs"
 import { dirname } from "node:path"
 
 import { executeTask } from "./kimi_task_executor.js"
+import { resolveTaskWorkspace } from "./workspace_path.js"
 import { isRecord, type TaskProgress, type TaskRequest, type TaskResult } from "./lunarwing_runtime.js"
 
 // Keep in sync with the bridge's WS_MAX_PAYLOAD_BYTES default (1 MiB), which
@@ -58,6 +59,7 @@ export function refuseSymlinkedRunnerDir(dir: string): void {
 interface ActiveRun {
   taskId: string
   controller: AbortController
+  conn: Socket
 }
 
 /**
@@ -145,10 +147,10 @@ export class TaskRunner {
       }
     })
     conn.on("close", () => {
-      // A vanished bridge cancels nothing by itself: a run's progress has
-      // nowhere to go, but the executor owns the process lifecycle and the
-      // bridge reconnects to collect results on the next run. Keep runs
-      // running — the executor's own timeout/watchdogs bound them.
+      // Runs started on THIS connection are aborted in handleRun's own
+      // close listener (NB-13), which matches by connection identity. This
+      // handler stays for connections that only ever carried cancel/ping
+      // traffic — nothing to do for those.
     })
   }
 
@@ -234,7 +236,23 @@ export class TaskRunner {
         )
       : undefined
     const controller = new AbortController()
-    this.runs.set(taskId, { taskId, controller })
+    this.runs.set(taskId, { taskId, controller, conn })
+    // NB-13: ack the acceptance before the run starts, so the bridge's
+    // connection deadline clears the moment the runner takes the job and
+    // the RUN deadline (task timeout + margin) takes over from there.
+    this.writeLine(conn, { ok: true, op: "accepted", task_id: taskId })
+    // NB-13: the runner's connection is the bridge's only heartbeat for this
+    // run. A vanished bridge means progress has nowhere to go AND nothing
+    // will ever collect the result — the client's close-path comment already
+    // assumes the run dies with the connection. Abort it; the executor's
+    // own escalation reaps the child CLI.
+    conn.on("close", () => {
+      const run = this.runs.get(taskId)
+      if (run && run.conn === conn) {
+        run.controller.abort()
+        this.runs.delete(taskId)
+      }
+    })
     try {
       await executeTask(
         taskRequest,
@@ -244,7 +262,11 @@ export class TaskRunner {
           conn.end()
         },
         controller.signal,
-        this.workspaceRoot,
+        // NB-14: executeTask's workdir argument is resolved by resolveTaskWorkspace
+        // from the request's own context (project_dir / cron_tick), under the
+        // same WORKSPACE_ROOT the bridge resolved against — so a delegated task
+        // runs in ITS project directory, not the workspace root.
+        resolveTaskWorkspace(taskRequest.context, this.workspaceRoot),
         extraEnv,
       )
     } catch (err) {
@@ -288,7 +310,28 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     return 1
   }
   console.log(`[task-runner] listening on ${started}`)
+  // NB-17: publish runner liveness for the health server's /ready check.
+  // The heartbeat interval is short relative to any watchdog, and the file
+  // lives next to the socket (task-uid owned, 0700 dir).
+  const stateFile = process.env.LUNARWING_TASK_RUNNER_STATE_FILE
+    || `${dirname(socketPath)}/task-runner-state.json`
+  const writeState = () => {
+    try {
+      writeFileSync(stateFile, JSON.stringify({
+        ready: true,
+        socket: socketPath,
+        pid: process.pid,
+        heartbeat_at: new Date().toISOString(),
+      }) + "\n", { mode: 0o600 })
+    } catch (err) {
+      console.error("[task-runner] state write failed:", err instanceof Error ? err.message : err)
+    }
+  }
+  writeState()
+  const heartbeat = setInterval(writeState, 10_000)
   const shutdown = () => {
+    clearInterval(heartbeat)
+    try { rmSync(stateFile, { force: true }) } catch { /* state is best-effort */ }
     runner.close()
     process.exit(0)
   }

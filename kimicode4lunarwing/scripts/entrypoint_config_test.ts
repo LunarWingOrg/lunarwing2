@@ -404,6 +404,10 @@ test("entrypoint starts the task runner as the task uid before the bridge (WI#45
   assert.match(entrypoint, /\[ -n "\$\{AGENT_AUTH_TOKEN_FILE:-\}" \] && \[ "\$\{KIMI_TASK_RUNNER:-\}" != "skip" \]/)
   // The runner directory is handed to the task uid (the runner creates its
   // socket there), and the cleanup tears the runner down with the bridge.
+  // NB-17: the supervisor may have restarted the runner, so cleanup reads
+  // the LIVE pid from the pid file (with the spawn-time pid as fallback).
   assert.match(entrypoint, /chown "\$KIMI_TASK_UID:\$KIMI_TASK_GID" "\$RUNNER_DIR"/)
-  assert.match(entrypoint, /kill "\$RUNNER_PID"/)
+  assert.match(entrypoint, /RUNNER_PID_FILE=/)
+  assert.match(entrypoint, /cat "\$RUNNER_PID_FILE"/)
+  assert.match(entrypoint, /kill "\$RUNNER_LIVE_PID"/)
 })

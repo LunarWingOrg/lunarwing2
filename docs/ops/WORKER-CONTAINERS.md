@@ -163,12 +163,32 @@ section and "Launch identity (WI#422)" further down.
   and exports `LUNARWING_TASK_RUNNER_SOCKET` to the
   bridge, which then routes every task to the unprivileged runner instead
   of spawning the CLI itself; `KIMI_TASK_RUNNER=skip` (or no credential
-  handoff, the host dev shape) keeps local execution. The runner never
+  handoff, the host dev shape) keeps local execution. **Delegation is ON
+  by default whenever the credential handoff is active — maintainer
+  decision, 2026-10-22 (run 195 follow-up on !1861): the runner starts
+  whenever the credential handoff is active, and `KIMI_TASK_RUNNER=skip`
+  is the explicit operator escape hatch for host-side dev runs.** The
+  runner never
   sees the hub credential: the token file is root-only `0400` and the
   token var was unset before the runner spawn. A dead runner socket maps
   to an error `task_result` (the hub is never stranded), cancel forwards
   to the runner, and every delegation rejection surfaces as an error
-  result. What remains for the full split (WI#454's own remaining
+  result. Post-review hardening on this slice (run 195, NB-13..NB-17):
+  the runner acknowledges acceptance (`{"op":"accepted"}`) and the bridge
+  replaces its handshake deadline with a run deadline of the task's own
+  `timeout_ms` (default 4 h) plus a 60 s margin — no delegated task dies
+  at the 15 s default; the runner aborts a run when its bridge connection
+  closes (no orphaned CLI editing a workspace the hub believes is free);
+  delegated tasks execute in the task's own `project_dir` (resolved with
+  the same `resolveTaskWorkspace` the bridge uses, NB-14); the bridge
+  drops runner frames carrying a foreign `task_id`, rejects unknown
+  result statuses, bounds result output at the 1 MiB envelope limit, and
+  caps the receive buffer at 1 MiB (NB-15); the bridge verifies the
+  socket is a task-uid-owned socket before connecting (NB-16); the
+  runner publishes a heartbeat state file included in `/ready` and the
+  entrypoint supervises the runner with restart-on-exit (5 rapid
+  attempts, then container exit for the orchestrator) (NB-17). What
+  remains for the full split (WI#454's own remaining
   scope): the image-level separation (bridge container and task
   container as two mt-admin units under two different non-root uids,
   with the socket crossing the shared workspace volume and the bridge
