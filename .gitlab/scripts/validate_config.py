@@ -1775,6 +1775,21 @@ def validate_worker_versions(errors: list[str]) -> None:
     elif not lock_path.is_file() or hashlib.sha256(lock_path.read_bytes()).hexdigest() != lock_digest:
         errors.append("Pebble upstream Cargo.lock differs from the Dockerfile's reviewed SHA256")
 
+    # WI#467: the opencode lane's committed models.dev snapshot is compiled
+    # into the binary; its Dockerfile ARG pin must stay in sync with the file,
+    # or a refreshed snapshot without the pin (or vice versa) only fails at
+    # the protected candidate build.
+    models_path = ROOT / "opencode4lunarwing" / "models-dev" / "api.json"
+    models_digest = extract_arg_default(opencode_text, "MODELS_DEV_API_JSON_SHA256") or ""
+    if not re.fullmatch(r"[0-9a-f]{64}", models_digest):
+        errors.append(
+            "OpenCode Dockerfile must declare a reviewed MODELS_DEV_API_JSON_SHA256 default"
+        )
+    elif not models_path.is_file() or hashlib.sha256(models_path.read_bytes()).hexdigest() != models_digest:
+        errors.append(
+            "opencode4lunarwing/models-dev/api.json differs from the Dockerfile's reviewed SHA256"
+        )
+
     blocks = worker_case_blocks(build_script)
     canonical_pins = (
         ("pebble", "PEBBLE_REF", pebble_text, "PEBBLE_REF"),

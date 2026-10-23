@@ -177,8 +177,13 @@ class WorkerVersionPinTests(unittest.TestCase):
             f"ARG PEBBLE_REF={self.PEBBLE_REF}\nARG PEBBLE_LOCK_SHA256={lock_digest}\n",
             encoding="utf-8",
         )
+        models = self.root / "opencode4lunarwing/models-dev/api.json"
+        models.parent.mkdir(parents=True)
+        models.write_text('{"fixture": true}\n', encoding="utf-8")
+        models_digest = hashlib.sha256(models.read_bytes()).hexdigest()
         self.dockerfiles["OPENCODE_DOCKERFILE"].write_text(
-            f"ARG OPENCODE_VERSION=v1.18.25\nARG OPENCODE_REF={self.OPENCODE_REF}\n",
+            f"ARG OPENCODE_VERSION=v1.18.25\nARG OPENCODE_REF={self.OPENCODE_REF}\n"
+            f"ARG MODELS_DEV_API_JSON_SHA256={models_digest}\n",
             encoding="utf-8",
         )
         self.dockerfiles["OPENCODE2_DOCKERFILE"].write_text(
@@ -259,6 +264,15 @@ class WorkerVersionPinTests(unittest.TestCase):
 
     def test_consistent_pins_pass(self):
         self.assertEqual(self.errors(), [])
+
+    def test_models_dev_snapshot_drift_is_caught(self):
+        # WI#467: a refreshed snapshot without the Dockerfile ARG pin (or a
+        # stale ARG after refresh) must fail the offline check, not only the
+        # protected candidate build.
+        models = self.root / "opencode4lunarwing/models-dev/api.json"
+        models.write_text('{"fixture": "refreshed"}\n', encoding="utf-8")
+        self.assertTrue(any("MODELS_DEV_API_JSON_SHA256" in error or "models-dev" in error
+                            for error in self.errors()))
 
     def test_cross_lane_ref_swap_is_caught(self):
         # opencode2's build_args REF swapped to the v1 lane's SHA: a

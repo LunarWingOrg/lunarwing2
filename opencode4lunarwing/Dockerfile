@@ -8,6 +8,12 @@
 ARG OPENCODE_VERSION=v1.18.25
 ARG OPENCODE_REF=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
 ARG DEBIAN_SNAPSHOT=20261017T082437Z
+# WI#467: sha256 of the committed models.dev snapshot (models-dev/api.json)
+# the upstream build compiles into the binary instead of fetching live.
+# Refresh the file and this pin together in one deliberate commit (see the
+# opencode bump checklist in docs/ops/WORKER-CONTAINERS.md); CI's
+# validate_worker_versions fails when the two drift apart.
+ARG MODELS_DEV_API_JSON_SHA256=78e4722b4db9b8d3edc47acb4d68fe9336a44e997fbe3af97d142d01da6b1259
 ARG SOURCE_REVISION=unknown
 
 # ──────────────────────
@@ -20,6 +26,7 @@ FROM docker.io/oven/bun:debian@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6
 ARG OPENCODE_VERSION
 ARG OPENCODE_REF
 ARG DEBIAN_SNAPSHOT
+ARG MODELS_DEV_API_JSON_SHA256
 WORKDIR /build
 
 RUN set -eu; \
@@ -54,6 +61,18 @@ WORKDIR /build/opencode/packages/sdk/js
 RUN bun run build || echo "WARNING: @opencode-ai/sdk build reported errors (import-verified in runtime stage)"
 
 WORKDIR /build/opencode/packages/opencode
+# WI#467: pin the models.dev snapshot the upstream build compiles into the
+# binary. At the pinned ref, script/generate.ts reads the snapshot from the
+# file named by MODELS_DEV_API_JSON when set, and fetches
+# https://models.dev/api.json live otherwise — the live response then became
+# part of the binary, so candidate vs clean-rebuild digests differed whenever
+# models.dev published between the two builds (master pipelines 6252/6269/
+# 6288 lost every opencode candidate to that). COPY the committed snapshot in,
+# verify its hash against the ARG pin and assert the env-var hook still exists
+# in this same RUN, so a swapped snapshot or a bump that drops the hook fails
+# the build instead of silently re-enabling the live fetch.
+COPY models-dev/api.json /build/models-dev-api.json
+COPY scripts/check_models_dev_snapshot.py /build/check_models_dev_snapshot.py
 # Build only the native platform target. opencode's build.ts (script/build.ts)
 # otherwise cross-compiles 12 targets (linux/darwin/win32 × arm64/x64 ×
 # musl/baseline variants), each a separate Rust compile pulling fresh toolchains.
@@ -61,7 +80,14 @@ WORKDIR /build/opencode/packages/opencode
 # baseline + musl variants), which is the only binary the worker ever loads —
 # the image is distributed same-host via podman save|load, never cross-arch.
 # See docs/proposals/OPENCODE-WORKER-SINGLE-TARGET-BUILD.md for full rationale.
-RUN bun run build -- --single
+RUN set -eu; \
+    actual="$(sha256sum /build/models-dev-api.json | cut -d' ' -f1)"; \
+    [ "$actual" = "${MODELS_DEV_API_JSON_SHA256}" ] || { \
+      echo "models.dev snapshot sha256 mismatch: got $actual, expected ${MODELS_DEV_API_JSON_SHA256}" >&2; \
+      exit 1; \
+    }; \
+    python3 /build/check_models_dev_snapshot.py script/generate.ts; \
+    MODELS_DEV_API_JSON=/build/models-dev-api.json bun run build -- --single
 
 # Keep cross-stage artifacts small. Copying the full monorepo retains thousands
 # of source and node_modules files in the runtime stage. The compiled binary is
