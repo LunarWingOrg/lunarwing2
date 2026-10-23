@@ -137,9 +137,10 @@ process.exit(0)
 
 async function runExecutor(
   request: TaskRequest,
-  binPath: string,
+  binPath: string | null,
 ): Promise<{ result?: TaskResult; progress: string[] }> {
-  process.env.KIMI_BIN = binPath
+  if (binPath === null) delete process.env.KIMI_BIN
+  else process.env.KIMI_BIN = binPath
   process.env.WORKSPACE_ROOT = "/tmp"
   process.env.KIMI_CODE_HOME = "/tmp"
   const progress: string[] = []
@@ -506,4 +507,206 @@ process.exit(r.status ?? 1)
   }
 })
 
+test("executeTask: WI#463 — a bare-name CLI resolves through the bridge PATH at the drop, an absolute KIMI_BIN passes through", async () => {
+  // Two pins in one lane (they share the setpriv stub machinery):
+  // 1. With KIMI_BIN unset, the setpriv argv must carry the bridge-PATH-
+  //    resolved `kimi` (resolveFromBridgePath — root-ownership-checked when
+  //    the resolver runs as root), not the bare name that the task-side
+  //    PATH would resolve after the drop.
+  // 2. With KIMI_BIN set to an absolute path (every operator/test override),
+  //    that exact path is passed through unchanged.
+  // The stub setpriv records its argv and execs the wrapped command, so both
+  // shapes run the task to completion and the argv can be asserted. A plain
+  // `kimi` shim is planted FIRST on the bridge PATH ahead of the real mock
+  // to prove the resolution is ordered and picks the first absolute entry.
+  const dir = mkdtempSync(join(tmpdir(), "kimi-wi463-stub-"))
+  const recordFile = join(dir, "argv.json")
+  const stub = join(dir, "setpriv")
+  writeFileSync(
+    stub,
+    `#!/usr/bin/env node
+const fs = require("node:fs")
+const argv = process.argv.slice(2)
+fs.writeFileSync(${JSON.stringify(recordFile)}, JSON.stringify(argv))
+const rest = argv.slice(argv.indexOf("--") + 1)
+const { spawnSync } = require("node:child_process")
+const r = spawnSync(rest[0], rest.slice(1), { stdio: "inherit", env: process.env })
+process.exit(r.status ?? 1)
+`,
+    { mode: 0o755 },
+  )
+  const bin = makeMockKimi("success")
+  // A second mock named exactly `kimi` in its own directory: the bare-name
+  // resolution looks up "kimi" per PATH entry, and makeMockKimi names its
+  // binary "mock-kimi" (absolute-KIMI_BIN tests point at that path).
+  const bareDir = mkdtempSync(join(tmpdir(), "kimi-wi463-bare-"))
+  const bareBin = join(bareDir, "kimi")
+  writeFileSync(bareBin, readFileSync(bin, "utf8"), { mode: 0o755 })
+  chmodSync(bareBin, 0o755)
+  const savedPath = process.env.PATH
+  process.env.PATH = `${dir}:${savedPath}`
+  process.env.KIMI_TASK_UID = "10002"
+  process.env.KIMI_TASK_GID = "10002"
+  const recordedArgv = async (): Promise<string[]> =>
+    JSON.parse(readFileSync(recordFile, "utf8")) as string[]
+  try {
+    // 1. Bare name: KIMI_BIN unset (runExecutor(null)). The `kimi`-named
+    // mock's directory is prepended to the bridge PATH so
+    // resolveFromBridgePath finds it (the host run is unprivileged, so the
+    // root-ownership skip is inert here — the image's root-shaped run
+    // exercises it).
+    process.env.PATH = `${bareDir}:${process.env.PATH}`
+    const { result } = await runExecutor(
+      { task_id: "wi463-bare", prompt: "hello world", timeout_ms: 10_000 },
+      null,
+    )
+    assert.equal(result?.status, "success", `bare-name task failed: ${result?.error}`)
+    const recorded = await recordedArgv()
+    const dropIndex = recorded.indexOf("--")
+    assert.ok(dropIndex >= 0, "setpriv argv must contain the -- separator")
+    const resolved = recorded[dropIndex + 1]
+    assert.equal(resolved, bareBin, `bare-name CLI must resolve to the bridge-PATH entry (got ${resolved})`)
+
+    // 2. Absolute KIMI_BIN: passed through byte-for-byte.
+    const { result: absResult } = await runExecutor(
+      { task_id: "wi463-absolute", prompt: "hello world", timeout_ms: 10_000 },
+      bin,
+    )
+    assert.equal(absResult?.status, "success", `absolute-path task failed: ${absResult?.error}`)
+    const absRecorded = await recordedArgv()
+    const absDropIndex = absRecorded.indexOf("--")
+    assert.equal(absRecorded[absDropIndex + 1], bin, "an absolute KIMI_BIN must pass through unchanged")
+  } finally {
+    process.env.PATH = savedPath
+    delete process.env.KIMI_BIN
+    delete process.env.KIMI_TASK_UID
+    delete process.env.KIMI_TASK_GID
+    rmSync(dir, { recursive: true, force: true })
+    rmSync(bareDir, { recursive: true, force: true })
+  }
+})
+
 console.log("kimi task executor self-check passed")
+
+test("executeTask: WI#462/NB-10 — the drop PATH is root-owned dirs FIRST, task dirs after (ME-1 posture)", async () => {
+  // NB-10 (run-195 review): the child env.PATH the executor hands the
+  // dropped task must carry the pinned root-owned dirs BEFORE the
+  // task-uid-writable ones. Task-first ordering lets ONE task's leftovers
+  // (a planted node/python, a rewritten entry point) become the tools every
+  // LATER task's process resolves — including the kimi CLI's own
+  // env-node interpreter lookup. The stub setpriv records the env it was
+  // handed and exits, so the PATH can be asserted from the recorded env.
+  const dir = mkdtempSync(join(tmpdir(), "kimi-nb10-stub-"))
+  const recordFile = join(dir, "argv.json")
+  const stub = join(dir, "setpriv")
+  writeFileSync(
+    stub,
+    `#!/usr/bin/env node
+const fs = require("node:fs")
+const argv = process.argv.slice(2)
+fs.writeFileSync(${JSON.stringify(recordFile)}, JSON.stringify({ argv, path: process.env.PATH }))
+const rest = argv.slice(argv.indexOf("--") + 1)
+const { spawnSync } = require("node:child_process")
+const r = spawnSync(rest[0], rest.slice(1), { stdio: "inherit", env: process.env })
+process.exit(r.status ?? 1)
+`,
+    { mode: 0o755 },
+  )
+  const bin = makeMockKimi("success")
+  const savedPath = process.env.PATH
+  process.env.PATH = `${dir}:${savedPath}`
+  process.env.KIMI_TASK_UID = "10002"
+  process.env.KIMI_TASK_GGID = undefined
+  process.env.KIMI_TASK_GID = "10002"
+  try {
+    const { result } = await runExecutor(
+      { task_id: "nb10-order", prompt: "hello world", timeout_ms: 10_000 },
+      bin,
+    )
+    assert.equal(result?.status, "success", `task failed: ${result?.error}`)
+    const record = JSON.parse(readFileSync(recordFile, "utf8")) as { argv: string[]; path: string }
+    const childPath = record.path || ""
+    const firstTaskOwned = childPath.indexOf("/home/kimi/.cargo/bin")
+    const firstRootOwned = childPath.indexOf("/usr/local/bin")
+    assert.ok(
+      firstRootOwned >= 0 && firstTaskOwned >= 0 && firstRootOwned < firstTaskOwned,
+      `drop PATH must put root-owned dirs before task-writable dirs (NB-10): ${childPath}`,
+    )
+  } finally {
+    process.env.PATH = savedPath
+    delete process.env.KIMI_TASK_UID
+    delete process.env.KIMI_TASK_GID
+    delete process.env.KIMI_TASK_GGID
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("executeTask: WI#463/NB-11 — on the pinned path a failed bridge CLI lookup fails the task (no bare-name fallback)", async () => {
+  // NB-11: the old catch returned the bare name on a bridge-lookup miss,
+  // sending setpriv down the child PATH — the lookup WI#463 exists to
+  // avoid. On the pinned path the failure must surface as a task error.
+  // Set up: a stub setpriv (the SCALED setpriv pin — resolveFromBridgePath
+  // finds it; it records argv and exits) and a mock kimi named "kimi-mock"
+  // (an ALIAS on the bridge PATH). The executor's taskKimiBin is called
+  // with a bare name that is NOT on the bridge PATH, so resolveFromBridgePath
+  // throws and the task must error out cleanly.
+  const stubDir = mkdtempSync(join(tmpdir(), "kimi-nb11-stub-"))
+  const recordFile = join(stubDir, "argv.json")
+  const setprivStub = join(stubDir, "setpriv")
+  writeFileSync(
+    setprivStub,
+    `#!/usr/bin/env node
+const fs = require("node:fs")
+const argv = process.argv.slice(2)
+fs.writeFileSync(${JSON.stringify(recordFile)}, JSON.stringify(argv))
+process.exit(0)
+`,
+    { mode: 0o755 },
+  )
+  // A mock kimi named "kimi-mock" (not "kimi") — an absolute-path binary on
+  // the bridge PATH, so runExecutor can use it as the bin for the task but
+  // taskKimiBin's bare-name lookup for "kimi" finds nothing.
+  const mockDir = mkdtempSync(join(tmpdir(), "kimi-nb11-mock-"))
+  const mockPath = join(mockDir, "kimi-mock")
+  writeFileSync(
+    mockPath,
+    `#!/usr/bin/env node
+process.stdout.write(JSON.stringify({ role: "assistant", content: "ok" }) + "\\n")
+process.exit(0)
+`,
+    { mode: 0o755 },
+  )
+  const savedPath = process.env.PATH
+  process.env.PATH = `${stubDir}:${mockDir}:${savedPath}`
+  process.env.KIMI_TASK_UID = "10002"
+  process.env.KIMI_TASK_GID = "10002"
+  // runExecutor(null) DELETES KIMI_BIN, which resets to the default bare
+  // "kimi" — resolvable on a host that has the CLI installed. Set the
+  // absent bare name AFTER that point by calling executeTask directly.
+  process.env.KIMI_BIN = "kimi-absent-nb11" // bare name guaranteed absent from PATH
+  let result: TaskResult | undefined
+  try {
+    await executeTask(
+      { task_id: "nb11-failclosed", prompt: "hello", timeout_ms: 10_000 },
+      () => {},
+      (r) => { result = r },
+      undefined,
+    )
+    assert.equal(result?.status, "error")
+    assert.match(result?.error || "", /not found on the bridge PATH/)
+    // The setpriv pin should NOT have been reached (resolution failed
+    // BEFORE spawn), so the record file should not exist — or exist only
+    // from the prior argv, not this run. Assert no record was written.
+    const fsStat = (await import("node:fs")).statSync
+    let recordExists = false
+    try { fsStat(recordFile); recordExists = true } catch { /* expected */ }
+    assert.ok(!recordExists, "setpriv stub should not run if bridge CLI lookup fails first")
+  } finally {
+    process.env.PATH = savedPath
+    delete process.env.KIMI_TASK_UID
+    delete process.env.KIMI_TASK_GID
+    delete process.env.KIMI_BIN
+    rmSync(stubDir, { recursive: true, force: true })
+    rmSync(mockDir, { recursive: true, force: true })
+  }
+})
