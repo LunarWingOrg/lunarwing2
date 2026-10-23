@@ -156,63 +156,101 @@ section and "Launch identity (WI#422)" further down.
   the uid it runs under, so no setpriv drop is needed), and a bridge-side
   client (`task_runner_client.ts`) that delegates each task over the
   socket. The entrypoint rehearses the split inside the current
-  single-container image: with the credential handoff active it starts
-  the runner as the task uid on `/run/lunarwing-runner/task-runner.sock`
-  (a directory separate from the root-only token directory, handed to the
-  task uid `0700`, the credential vars stripped from what it inherits)
-  and exports `LUNARWING_TASK_RUNNER_SOCKET` to the
-  bridge, which then routes every task to the unprivileged runner instead
-  of spawning the CLI itself; `KIMI_TASK_RUNNER=skip` (or no credential
-  handoff, the host dev shape) keeps local execution. **Delegation is ON
-  by default whenever the credential handoff is active — maintainer
-  decision, 2026-10-22 (run 195 follow-up on !1861): the runner starts
-  whenever the credential handoff is active, and `KIMI_TASK_RUNNER=skip`
-  is the explicit operator escape hatch for host-side dev runs.** The
-  runner never
-  sees the hub credential: the token file is root-only `0400` and the
-  token var was unset before the runner spawn. A dead runner socket maps
-  to an error `task_result` (the hub is never stranded), cancel forwards
-  to the runner, and every delegation rejection surfaces as an error
-  result. Post-review hardening on this slice (run 195, NB-13..NB-17):
-  the runner acknowledges acceptance (`{"op":"accepted"}`) and the bridge
-  replaces its handshake deadline with a run deadline of the task's own
-  `timeout_ms` (default 4 h) plus a 60 s margin — no delegated task dies
-  at the 15 s default; the runner aborts a run when its bridge connection
-  closes (no orphaned CLI editing a workspace the hub believes is free);
-  delegated tasks execute in the task's own `project_dir` (resolved with
-  the same `resolveTaskWorkspace` the bridge uses, NB-14); the bridge
-  drops runner frames carrying a foreign `task_id`, rejects unknown
-  result statuses, bounds result output at the 1 MiB envelope limit, and
-  caps the receive buffer at 1 MiB (NB-15); the bridge verifies the
-  socket is a task-uid-owned socket before connecting (NB-16); the
-  runner publishes a heartbeat state file included in `/ready` and the
-  entrypoint supervises the runner with restart-on-exit (NB-17). Run-196
-  hardening (NC-6..NC-10): the status allowlist uses the protocol's
-  `"timed_out"` (not `"timeout"`) so a delegated task that times out is
-  reported correctly with partial output (NC-6); the runner env vars are
-  exported before the health server starts, and `/ready` treats a runner
-  heartbeat as authoritative — a heartbeat that is missing, unparseable,
-  or older than 30 s (three missed 10 s beats) fails it (NC-7); the
-  client rejects immediately when the runner connection closes without a
-  result (NC-8); the supervisor resets its attempt counter when a runner
-  generation survives 30 s, and the runner PID file lives in the
-  root-only token directory rather than the task-uid-owned runner
-  directory (NC-9). After five failed restarts the supervisor signals the
-  launcher (`kill -TERM $$` — the subshell forked before `BRIDGE_PID`
-  existed, so it cannot signal the bridge directly), which runs the
-  cleanup trap and stops the bridge, the runner and the health server so
-  the container exits for the orchestrator (run-198 NI-3). **Accepted
-  residual (NC-10, Low):** `verifyRunnerSocket` does `lstatSync` and then
-  `connect` — two separate path operations on a task-owned directory
-  (TOCTOU). The durable fix (root owns the listening socket) belongs to
-  the two-container split below. Until then the data path is still
-  validated by the NB-15 `task_id` checks. What remains for the full
-  split (WI#454's own remaining
-  scope): the image-level separation (bridge container and task
-  container as two mt-admin units under two different non-root uids,
-  with the socket crossing the shared workspace volume and the bridge
-  itself dropping `USER 0:0`), plus the same machinery on the opencode
-  and pebble lanes.
+  single-container image: with the credential handoff active,
+  `run_task_runner` has root bind the listening socket
+  `/run/lunarwing-runner-sock/task-runner.sock` in a root-only `0700`
+  directory (`kimicode4lunarwing/task_runner_bind.py`), then exec
+  `setpriv` → `/usr/bin/env` → `/usr/local/bin/node task_runner.js` as the
+  task uid with only the listening descriptor inherited
+  (`LUNARWING_TASK_RUNNER_LISTEN_FD`). The credential vars are stripped
+  from what the runner inherits, and the task-uid `0700` directory
+  `/run/lunarwing-runner` keeps only the runner's heartbeat state file.
+  The launcher exports `LUNARWING_TASK_RUNNER_SOCKET` to the bridge, which
+  then routes every task to the unprivileged runner instead of spawning
+  the CLI itself; `KIMI_TASK_RUNNER=skip` (or no credential handoff, the
+  host dev shape) keeps local execution. **Delegation is ON by default
+  whenever the credential handoff is active — maintainer decision,
+  2026-10-22 (run 195 follow-up on !1861): the runner starts whenever the
+  credential handoff is active, and `KIMI_TASK_RUNNER=skip` is the
+  explicit operator escape hatch for host-side dev runs.** The runner
+  never sees the hub credential: the token file is root-only `0400` and
+  the token var was unset before the runner spawn. A dead runner socket
+  maps to an error `task_result` (the hub is never stranded) and every
+  delegation rejection surfaces as an error result.
+  - **Wire and bounds.** The runner acknowledges acceptance
+    (`{"op":"accepted"}`), reports the CLI's process group
+    (`{"op":"spawned"}`), streams progress and ends with exactly one
+    result. The bridge replaces its handshake deadline with a run deadline
+    of the task's own `timeout_ms` (default 4 h) plus a 60 s margin (no
+    delegated task dies at the 15 s default, NB-13). Delegated tasks
+    execute in the task's own `project_dir` (resolved with the same
+    `resolveTaskWorkspace` the bridge uses, NB-14). The bridge drops runner
+    frames carrying a foreign `task_id` and rejects unknown result
+    statuses (the protocol's `"timed_out"`, not `"timeout"`, NB-15/NC-6).
+    Every runner-socket line, in both directions, is capped at the hub's
+    `WS_MAX_PAYLOAD_BYTES` plus 64 KiB (the same env, so a larger hub cap
+    is honoured end to end); the runner serializes progress and result
+    lines within that cap with the hub envelope's own truncation rule, so
+    a large result reaches the hub truncated exactly as in local
+    execution, never refused (run-200 NL-2/NL-8).
+  - **Cancel, timeouts and runner death (run-200 NL-3).** The bridge frees
+    a task's workspace lock only once the task's CLI is gone. A cancel (or
+    hub disconnect, or an expired run deadline) is sent as
+    `{"op":"cancel"}` on the run's own connection, and the bridge waits
+    (the kill grace plus 5 s) for the run's terminal result, which the
+    runner writes after the executor's SIGTERM→SIGKILL escalation stopped
+    the CLI. The hub then gets `cancelled`, as in local execution (this
+    retires the NC-11 note). A run that ends without a terminal result
+    (the runner died or dropped the connection, the wait timed out) first
+    has its CLI process group SIGKILLed by the bridge and waited for; the
+    bridge signals it only when every live member belongs to the task uid.
+    As in local execution, a process that left the group on purpose
+    (`setsid`) is not tracked.
+  - **The runner's CLI environment (run-200 NL-1).** The runner gets the
+    root-owned launcher PATH, never `TASK_PATH`, and the executor applies
+    the WI#462 order to the CLI it spawns (that PATH first, the task
+    toolchain directories after) and resolves a bare `kimi` only to a
+    root-owned file in a root-owned, non-writable directory of the
+    runner's PATH (WI#463, fail-closed), exactly as on the setpriv path.
+    Without this, one task could plant a `kimi` (or a `node` for the
+    CLI's env-node line) in the task-owned `~/.cargo/bin` that every later
+    task then ran.
+  - **Socket ownership (run-200 NL-7, replaces the NC-10 note).** Because
+    root binds the socket in a root-only directory, the task uid can
+    neither replace the socket path nor connect to it, and a root bridge
+    refuses any runner socket that is not root-owned in a root-owned
+    directory that group and others cannot write. The old task-owned
+    directory let any task stand in for the runner without a race, and
+    the `task_id` checks above never authenticated anything: they only
+    keep one run's frames apart from another's. Node marks inherited
+    descriptors close-on-exec at startup, so the CLI and its tools never
+    inherit the listener (pinned by a test). **Residual (Low):** the
+    runner and every task still share one uid, so task code that may
+    ptrace the runner (or take its descriptor with `pidfd_getfd`) could
+    take the listener over; only the two-container split below removes
+    that.
+  - **Liveness and supervision.** The runner publishes a heartbeat state
+    file (`ready` and `heartbeat_at` only), and `/ready` fails unless it
+    is a JSON object with `ready: true` and a string `heartbeat_at` that
+    parses, is no older than 30 s (three missed 10 s beats) and is no more
+    than 5 s in the future. `/ready` publishes only that liveness, not the
+    socket path or pid (NB-17/NC-7, run-200 NL-6/NL-8). The runner env
+    vars are exported before the health server starts (NC-7). The
+    entrypoint supervises the runner: `$!` is the runner itself (every
+    step of `run_task_runner` execs, NL-4), a runner that exited, became a
+    zombie or was stopped (`SIGSTOP`, NL-5) is killed and restarted, the
+    attempt counter resets when a generation survives 30 s, and the pid
+    file lives in the root-only token directory (NC-9). After five failed
+    restarts the supervisor signals the launcher (`kill -TERM $$` — the
+    subshell forked before `BRIDGE_PID` existed, so it cannot signal the
+    bridge directly), which runs the cleanup trap and stops the bridge,
+    the runner and the health server so the container exits for the
+    orchestrator (run-198 NI-3).
+  - **What remains for the full split** (WI#454's own remaining scope):
+    the image-level separation (bridge container and task container as
+    two mt-admin units under two different non-root uids, with the socket
+    crossing the shared workspace volume and the bridge itself dropping
+    `USER 0:0`), plus the same machinery on the opencode and pebble lanes.
 - **Cron workspace ownership.** The cron bootstrap (`create_cron_workspace`
   / the TS `resolveTaskWorkspace`) runs in the root bridge, so EVERY
   directory the walk creates — intermediates and leaf alike, or the task
