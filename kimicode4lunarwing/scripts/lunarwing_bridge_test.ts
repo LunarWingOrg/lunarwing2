@@ -529,3 +529,86 @@ test("a runner-socket bridge maps a dead runner socket to an error task_result (
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+test("a runner-socket bridge reports a delegated cancel as cancelled and keeps the workspace locked until the CLI is gone (NL-3)", async () => {
+  // Run-200 probe: a delegated cancel settled at once, so the bridge freed
+  // the workspace lock (and accepted a second task for it) while the CLI,
+  // which ignores SIGTERM, ran on until the executor's kill grace. The hub
+  // also got `error` instead of `cancelled` (NC-11).
+  const root = mkdtempSync(join(tmpdir(), "kimi-runner-cancel-"))
+  const workspace = join(root, "workspace")
+  mkdirSync(workspace, { recursive: true })
+  const pidFile = join(root, "cli.pid")
+  const bin = join(root, "mock-kimi")
+  writeFileSync(bin, `#!/usr/bin/env node
+process.on("SIGTERM", () => {})
+require("fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid))
+process.stdout.write(JSON.stringify({ role: "assistant", content: "working" }) + "\\n")
+setInterval(() => {}, 1000)
+`, { mode: 0o755 })
+  const runner = new TaskRunner(workspace)
+  const runnerSocket = await runner.listen(join(root, "runner", "runner.sock"))
+  assert.ok(runnerSocket, "runner failed to listen")
+  const previousKimiBin = process.env.KIMI_BIN
+  const previousGrace = process.env.KIMI_KILL_GRACE_MS
+  process.env.KIMI_BIN = bin
+  process.env.KIMI_KILL_GRACE_MS = "1500"
+  const bridgePort = await freePort()
+  const child = startBridge(bridgePort, "runner-cancel-token", {
+    WORKSPACE_ROOT: workspace,
+    LUNARWING_TASK_RUNNER_SOCKET: runnerSocket,
+    KIMI_KILL_GRACE_MS: "1500",
+  })
+  const cliAlive = (pid: number) => {
+    try { process.kill(pid, 0) } catch { return false }
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8")
+      return !["Z", "X"].includes(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0])
+    } catch { return false }
+  }
+  try {
+    await waitForListening(child)
+    const ws = await connect(bridgePort, "runner-cancel-token")
+    try {
+      const results = new Map<string, Record<string, unknown>>()
+      const waiters = new Map<string, (payload: Record<string, unknown>) => void>()
+      ws.on("message", (data) => {
+        const message = JSON.parse(data.toString()) as { type: string; payload: Record<string, unknown> }
+        if (message.type !== "task_result") return
+        const id = String(message.payload.task_id)
+        results.set(id, message.payload)
+        waiters.get(id)?.(message.payload)
+      })
+      const resultOf = (id: string) => new Promise<Record<string, unknown>>((resolve, reject) => {
+        const known = results.get(id)
+        if (known) return resolve(known)
+        const timer = setTimeout(() => reject(new Error(`no task_result for ${id} within 15 s`)), 15_000)
+        waiters.set(id, (payload) => { clearTimeout(timer); resolve(payload) })
+      })
+      ws.send(JSON.stringify({ type: "task_request", payload: { task_id: "cancel-1", prompt: "edit", timeout_ms: 60_000 } }))
+      const deadline = Date.now() + 10_000
+      while (!existsSync(pidFile) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50))
+      const cliPid = Number(readFileSync(pidFile, "utf8"))
+      ws.send(JSON.stringify({ type: "cancel", payload: { task_id: "cancel-1" } }))
+      // While the CLI survives its SIGTERM, the workspace stays locked.
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      ws.send(JSON.stringify({ type: "task_request", payload: { task_id: "cancel-2", prompt: "edit too", timeout_ms: 60_000 } }))
+      const second = await resultOf("cancel-2")
+      assert.equal(second.status, "error")
+      assert.match(String(second.error), /already being modified by task cancel-1/)
+      const first = await resultOf("cancel-1")
+      assert.equal(first.status, "cancelled", JSON.stringify(first))
+      assert.equal(cliAlive(cliPid), false, "the CLI must be gone when the cancelled result reaches the hub")
+    } finally {
+      ws.close()
+    }
+  } finally {
+    if (previousKimiBin === undefined) delete process.env.KIMI_BIN
+    else process.env.KIMI_BIN = previousKimiBin
+    if (previousGrace === undefined) delete process.env.KIMI_KILL_GRACE_MS
+    else process.env.KIMI_KILL_GRACE_MS = previousGrace
+    child.kill("SIGTERM")
+    runner.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})

@@ -34,6 +34,11 @@ COPY entrypoint.sh /build/entrypoint.sh
 # (the config section moved there); ship it beside entrypoint.sh so the
 # in-build npm test gate validates the actual shipped setup script.
 COPY entrypoint-task-setup.sh /build/entrypoint-task-setup.sh
+# WI#454 (!1873 run-202 NM-1): the /ready tests in entrypoint_config_test.js
+# load ../health_server.py and the runner-launch tests run
+# ../task_runner_bind.py; without these COPYs the in-build npm test gate
+# fails with ENOENT and the image build with it.
+COPY health_server.py task_runner_bind.py /build/
 # WI#206 fixtures: the headless-guard tests read /build/hooks/ and
 # /build/config/ during the in-build npm test gate (same builder-stage
 # pattern as entrypoint.sh above). Without these COPYs the 7 new
@@ -206,7 +211,7 @@ WORKDIR /app
 COPY --from=builder /build/scripts/ /app/scripts/
 # WI#400 LD-2: /app files stay root-owned — container root executes these,
 # so they must not be writable by the task uid the bridge drops to.
-COPY entrypoint.sh entrypoint-task-setup.sh health_server.py agent_comm_protocol.json ./
+COPY entrypoint.sh entrypoint-task-setup.sh health_server.py task_runner_bind.py agent_comm_protocol.json ./
 COPY config/ ./config/
 COPY hooks/ ./hooks/
 

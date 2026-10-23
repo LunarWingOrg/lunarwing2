@@ -17,6 +17,7 @@ import {
   serializeEnvelopeWithinLimit,
   validateTaskRequest,
   writeWsState,
+  wsMaxPayloadBytes,
   SUBPROTOCOL,
   WORKER_ID,
   WORKER_VERSION,
@@ -32,7 +33,6 @@ import { executeTask } from "./kimi_task_executor.js"
 import { proxyEnvForTask, ToolProxyRelay, type TaskProxyHandle } from "./lunarwing_tool_proxy.js"
 import {
   bridgeRunnerSocketPath,
-  cancelRunnerTask,
   delegateTaskToRunner,
   verifyRunnerSocket,
 } from "./task_runner_client.js"
@@ -88,7 +88,8 @@ function envInteger(name: string, fallback: number, min: number, max: number): n
   return value
 }
 
-const WS_MAX_PAYLOAD_BYTES = envInteger("WS_MAX_PAYLOAD_BYTES", 1_048_576, 1_024, 16_777_216)
+// One parser for the bridge, the task runner and the runner client (NL-8).
+const WS_MAX_PAYLOAD_BYTES = wsMaxPayloadBytes()
 const KIMI_MAX_TASK_ID_BYTES = envInteger("KIMI_MAX_TASK_ID_BYTES", 256, 1, 4_096)
 const KIMI_MAX_PROMPT_BYTES = envInteger("KIMI_MAX_PROMPT_BYTES", 524_288, 1, 8_388_608)
 const KIMI_MAX_ENVIRONMENT_BYTES = envInteger("KIMI_MAX_ENVIRONMENT_BYTES", 65_536, 0, 1_048_576)
@@ -281,8 +282,9 @@ async function handleTaskRequest(
     // drop inside executeTask).
     const runnerSocket = bridgeRunnerSocketPath()
     if (runnerSocket) {
-    // NB-16: refuse to connect through a path the task uid controls that
-    // is not a task-uid-owned socket (symlink stand-ins are lstat-refused).
+    // NB-16/NL-7: refuse to connect unless the path is the runner socket the
+    // root launcher bound (root-owned, in a root-owned directory); symlink
+    // stand-ins are lstat-refused.
     try {
       verifyRunnerSocket(runnerSocket)
     } catch (err) {
@@ -348,8 +350,8 @@ function handleCancel(payload: unknown, ws: BridgeSocket): void {
   const task = activeTasks.get(payload.task_id)
   if (task?.socket === ws) {
     console.log(`[bridge] task ${payload.task_id}: cancelled`)
-    const runnerSocket = bridgeRunnerSocketPath()
-    if (runnerSocket) cancelRunnerTask(runnerSocket, payload.task_id)
+    // A delegated run is cancelled by the runner client itself, on the
+    // run's own connection, when this abort fires (NL-3).
     task.controller.abort()
   } else if (task) {
     console.warn(`[bridge] cancel: task ${payload.task_id} belongs to another connection`)

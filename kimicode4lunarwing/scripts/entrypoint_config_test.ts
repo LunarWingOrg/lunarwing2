@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
-import { spawnSync } from "node:child_process"
-import { lchownSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs"
+import { spawn, spawnSync } from "node:child_process"
+import { chmodSync, copyFileSync, existsSync, lchownSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { connect } from "node:net"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -388,22 +389,33 @@ test("entrypoint starts the task runner as the task uid before the bridge (WI#45
   // launcher must start the runner daemon (the task-container half) under
   // the task uid and export its socket to the bridge, so every task is
   // delegated out of the root bridge process.
-  // The runner spawn must precede the bridge spawn.
-  const runnerAt = entrypoint.indexOf("node /app/scripts/task_runner.js")
+  // The runner spawn must precede the bridge spawn, and both the first
+  // start and the supervisor restart go through run_task_runner (NL-1/NL-4).
+  const runnerAt = entrypoint.indexOf("      run_task_runner &")
   const bridgeAt = entrypoint.indexOf("node /app/scripts/lunarwing_bridge.js")
   assert.ok(runnerAt > 0 && bridgeAt > runnerAt, "the runner must start before the bridge")
+  assert.equal((entrypoint.match(/^\s+run_task_runner &$/gm) ?? []).length, 2, "first start and restart must both use run_task_runner")
+  assert.doesNotMatch(entrypoint, /node \/app\/scripts\/task_runner\.js "\$RUNNER_SOCKET"/, "the runner no longer binds its own socket path (NL-7)")
   // The bridge learns the socket via env: with it set, every task is
   // delegated to the unprivileged runner.
   assert.match(entrypoint, /export LUNARWING_TASK_RUNNER_SOCKET="\$RUNNER_SOCKET"/)
   // The runner IS the task identity — the split env vars are unset for it,
   // so executeTask never attempts a second (setpriv) drop inside the runner.
-  assert.match(entrypoint, /as_task env -u AGENT_AUTH_TOKEN -u AGENT_AUTH_TOKEN_FILE \\\n\s*-u KIMI_TASK_UID -u KIMI_TASK_GID \\\n\s*WORKSPACE_ROOT="\$WORKSPACE_ROOT" \\\n\s*node \/app\/scripts\/task_runner\.js "\$RUNNER_SOCKET" &/)
+  // NL-1/NL-4/NL-7: every step is an absolute exec, the PATH handed over is
+  // the root-owned launcher PATH (never TASK_PATH), and root binds the socket.
+  const fn = runTaskRunnerFunction()
+  assert.match(fn, /exec \/usr\/bin\/python3 -I \/app\/task_runner_bind\.py "\$RUNNER_SOCKET" -- \\\n/)
+  assert.match(fn, /drop=\(\/usr\/bin\/setpriv "\$\{SETPRIV_FLAGS\[@\]\}" --\)/)
+  assert.match(fn, /"\$\{drop\[@\]\}" \/usr\/bin\/env -u AGENT_AUTH_TOKEN -u AGENT_AUTH_TOKEN_FILE \\\n\s*-u KIMI_TASK_UID -u KIMI_TASK_GID \\\n\s*HOME="\$runner_home" PATH="\$PATH" WORKSPACE_ROOT="\$WORKSPACE_ROOT" \\\n\s*\/usr\/local\/bin\/node \/app\/scripts\/task_runner\.js\n/)
+  assert.doesNotMatch(fn, /TASK_PATH|as_task/, "the runner must not inherit the task-first PATH (NL-1)")
   // The runner gate is the credential handoff (host runs without a token
   // file keep local execution), and KIMI_TASK_RUNNER=skip is the documented
   // escape hatch.
   assert.match(entrypoint, /\[ -n "\$\{AGENT_AUTH_TOKEN_FILE:-\}" \] && \[ "\$\{KIMI_TASK_RUNNER:-\}" != "skip" \]/)
-  // The runner directory is handed to the task uid (the runner creates its
-  // socket there), and the cleanup tears the runner down with the bridge.
+  // The runner directory is handed to the task uid (the runner writes its
+  // heartbeat state there), while the socket lives in its own root-only
+  // directory (NL-7), and the cleanup tears the runner down with the bridge.
+  assert.match(entrypoint, /RUNNER_SOCKET="\$\{KIMI_TASK_RUNNER_SOCKET:-\/run\/lunarwing-runner-sock\/task-runner\.sock\}"/)
   // NB-17: the supervisor may have restarted the runner, so cleanup reads
   // the LIVE pid from the pid file (with the spawn-time pid as fallback).
   assert.match(entrypoint, /chown "\$KIMI_TASK_UID:\$KIMI_TASK_GID" "\$RUNNER_DIR"/)
@@ -419,7 +431,7 @@ test("entrypoint exports the runner paths before the health server starts (NC-7)
   // below the health server start would silently disable the check.
   const socketExport = entrypoint.indexOf("export LUNARWING_TASK_RUNNER_SOCKET=")
   const stateExport = entrypoint.indexOf("export LUNARWING_TASK_RUNNER_STATE_FILE=")
-  const healthAt = entrypoint.indexOf("as_task python3 /app/health_server.py")
+  const healthAt = entrypoint.indexOf("as_task /usr/bin/python3 /app/health_server.py")
   const bridgeAt = entrypoint.indexOf("node /app/scripts/lunarwing_bridge.js")
   assert.ok(socketExport > 0 && stateExport > 0 && healthAt > 0 && bridgeAt > healthAt)
   assert.ok(socketExport < healthAt, "LUNARWING_TASK_RUNNER_SOCKET must be exported before the health server starts")
@@ -438,7 +450,7 @@ test("supervisor resets its attempt counter when a runner generation survives (N
   const graceAt = supervisor.indexOf("sleep 30")
   const resetAt = supervisor.indexOf("_attempts=0", graceAt)
   assert.ok(graceAt > 0 && resetAt > graceAt, "the attempt counter must reset after the 30 s grace window")
-  assert.match(supervisor, /if kill -0 "\$_current" 2>\/dev\/null; then\n\s*_attempts=0\n\s*fi/)
+  assert.match(supervisor, /if task_runner_alive "\$_current"; then\n\s*_attempts=0\n\s*fi/)
 })
 
 test("supervisor gives up by signalling the launcher, not a stale bridge pid (NI-3)", () => {
@@ -497,11 +509,9 @@ function readyFixture(heartbeat: string | null): string {
   const root = mkdtempSync(join(tmpdir(), "kimi-ready-"))
   writeFileSync(join(root, "ws.json"), JSON.stringify({ ready: true }))
   if (heartbeat !== null) {
-    // Exactly the shape task_runner.ts writes.
+    // Exactly the shape task_runner.ts writes (NL-8: liveness only).
     writeFileSync(join(root, "task-runner-state.json"), JSON.stringify({
       ready: true,
-      socket: join(root, "task-runner.sock"),
-      pid: 4242,
       heartbeat_at: heartbeat,
     }) + "\n")
   }
@@ -532,4 +542,146 @@ test("health server /ready fails on a missing or stale runner heartbeat (NC-7, N
   const staleInNewYork = readyProbe(readyFixture(staleStamp), { TZ: "America/New_York" })
   assert.equal(staleInNewYork.status, 503, JSON.stringify(staleInNewYork.body))
   assert.equal(staleInNewYork.body.task_runner?.error, "heartbeat stale")
+})
+
+// ── !1873 run-200 fixes (NL-1, NL-4, NL-6, NL-7, NL-8) ──────────────────────
+
+function runTaskRunnerFunction(): string {
+  const start = entrypoint.indexOf("run_task_runner() {\n")
+  const end = entrypoint.indexOf("\n}\n", start)
+  assert.ok(start > 0 && end > start, "run_task_runner not found in entrypoint.sh")
+  return entrypoint.slice(start, end + 3)
+}
+
+function stateFixture(state: unknown): string {
+  const root = mkdtempSync(join(tmpdir(), "kimi-ready-nl6-"))
+  writeFileSync(join(root, "ws.json"), JSON.stringify({ ready: true }))
+  writeFileSync(join(root, "task-runner-state.json"), typeof state === "string" ? state : JSON.stringify(state))
+  return root
+}
+
+test("health server /ready requires a valid, present heartbeat (NL-6)", () => {
+  const cases: Array<[string, unknown, string]> = [
+    ["missing heartbeat_at", { ready: true }, "heartbeat missing"],
+    ["empty heartbeat_at", { ready: true, heartbeat_at: "" }, "heartbeat missing"],
+    ["blank heartbeat_at", { ready: true, heartbeat_at: "   " }, "heartbeat missing"],
+    ["numeric heartbeat_at", { ready: true, heartbeat_at: 1767225600 }, "heartbeat missing"],
+    ["null heartbeat_at", { ready: true, heartbeat_at: null }, "heartbeat missing"],
+    ["unparseable heartbeat_at", { ready: true, heartbeat_at: "yesterday" }, "heartbeat unparseable"],
+    ["future heartbeat_at", { ready: true, heartbeat_at: new Date(Date.now() + 120_000).toISOString() }, "heartbeat in the future"],
+    ["ready false", { ready: false, heartbeat_at: new Date().toISOString() }, "runner not ready"],
+    ["ready truthy non-boolean", { ready: "yes", heartbeat_at: new Date().toISOString() }, "runner not ready"],
+    ["JSON list", [1, 2, 3], "invalid runner state file"],
+    ["JSON number", 42, "invalid runner state file"],
+    ["broken JSON", "{not json", "invalid runner state file"],
+  ]
+  for (const [label, state, error] of cases) {
+    const probe = readyProbe(stateFixture(state))
+    assert.equal(probe.status, 503, `${label}: ${JSON.stringify(probe.body)}`)
+    assert.equal(probe.body.ready, false, label)
+    assert.equal(probe.body.task_runner?.error, error, `${label}: ${JSON.stringify(probe.body)}`)
+  }
+  // A small clock skew is not "the future".
+  const skewed = readyProbe(stateFixture({ ready: true, heartbeat_at: new Date(Date.now() + 2_000).toISOString() }))
+  assert.equal(skewed.status, 200, JSON.stringify(skewed.body))
+})
+
+test("health server /ready publishes runner liveness only, not the socket path or pid (NL-8)", () => {
+  const probe = readyProbe(stateFixture({
+    ready: true,
+    heartbeat_at: runnerHeartbeat(),
+    socket: "/run/lunarwing-runner-sock/task-runner.sock",
+    pid: 4242,
+  }))
+  assert.equal(probe.status, 200, JSON.stringify(probe.body))
+  assert.deepEqual(Object.keys(probe.body.task_runner ?? {}).sort(), ["heartbeat_at", "ready"])
+})
+
+test("run_task_runner execs the runner in place with the root PATH and a root-bound socket (NL-1, NL-4, NL-7)", async () => {
+  // The real function text, run unprivileged on a host (or as root in CI,
+  // where it drops to uid 65534 through setpriv). Only the image paths are
+  // re-pointed at this checkout: /app/... at the scripts and the bind
+  // helper, /usr/local/bin/node at this node.
+  const work = mkdtempSync(join(tmpdir(), "kimi-runrunner-"))
+  try {
+    chmodSync(work, 0o755)
+    const app = join(work, "app")
+    mkdirSync(join(app, "scripts"), { recursive: true })
+    const scripts = dirname(fileURLToPath(import.meta.url))
+    for (const name of readdirSync(scripts)) {
+      if ((name.endsWith(".js") && !name.endsWith("_test.js")) || name === "package.json") {
+        copyFileSync(join(scripts, name), join(app, "scripts", name))
+      }
+    }
+    copyFileSync(fileURLToPath(new URL("../task_runner_bind.py", import.meta.url)), join(app, "task_runner_bind.py"))
+    for (const dir of [app, join(app, "scripts")]) chmodSync(dir, 0o755)
+    const fn = runTaskRunnerFunction()
+      .replaceAll("/app/", `${app}/`)
+      .replaceAll("/usr/local/bin/node", process.execPath)
+    const socketPath = join(work, "sock", "task-runner.sock")
+    const pidFile = join(work, "runner.pid")
+    const harness = `set -u
+SETPRIV_FLAGS=(--reuid=65534 --regid=65534 --clear-groups --ambient-caps=-all --inh-caps=-all --no-new-privs)
+export AGENT_AUTH_TOKEN=forbidden-in-runner AGENT_AUTH_TOKEN_FILE=/nonexistent KIMI_TASK_UID=10002 KIMI_TASK_GID=10002
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+TASK_PATH=/home/kimi/.cargo/bin:$PATH
+RUNNER_SOCKET=${JSON.stringify(socketPath)}
+WORKSPACE_ROOT=${JSON.stringify(work)}
+${fn}
+run_task_runner &
+echo $! > ${JSON.stringify(pidFile)}
+wait
+`
+    const launcher = spawn("bash", ["-c", harness], { stdio: ["ignore", "ignore", "pipe"], detached: true })
+    let stderr = ""
+    launcher.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8") })
+    try {
+      const deadline = Date.now() + 15_000
+      while (!(existsSync(socketPath) && existsSync(pidFile)) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      }
+      assert.ok(existsSync(socketPath), `runner socket never appeared: ${stderr}`)
+      const pid = Number(readFileSync(pidFile, "utf8").trim())
+      // NL-4: $! is the runner itself (python3 -> setpriv -> env -> node all exec).
+      let exe = ""
+      for (let i = 0; i < 100 && !exe.endsWith(process.execPath.split("/").pop()!); i++) {
+        try { exe = readlinkSync(`/proc/${pid}/exe`) } catch { exe = "" }
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      }
+      assert.equal(exe, readlinkSync("/proc/self/exe"), `$! must be the node runner, not a wrapper (got ${exe})`)
+      const environ = readFileSync(`/proc/${pid}/environ`, "utf8").split("\0")
+      const envValue = (key: string) => environ.find((entry) => entry.startsWith(`${key}=`))?.slice(key.length + 1)
+      // NL-1: the root-owned launcher PATH, not TASK_PATH.
+      assert.equal(envValue("PATH"), "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+      for (const key of ["AGENT_AUTH_TOKEN", "AGENT_AUTH_TOKEN_FILE", "KIMI_TASK_UID", "KIMI_TASK_GID"]) {
+        assert.equal(envValue(key), undefined, `${key} must not reach the runner`)
+      }
+      // NL-7: the listener came in as fd 3, in an owner-only directory.
+      assert.equal(envValue("LUNARWING_TASK_RUNNER_LISTEN_FD"), "3")
+      assert.match(readlinkSync(`/proc/${pid}/fd/3`), /^socket:/)
+      assert.equal(statSync(dirname(socketPath)).mode & 0o777, 0o700)
+      assert.equal(statSync(dirname(socketPath)).uid, process.geteuid?.())
+      const reply = await new Promise<Record<string, unknown>>((resolve, reject) => {
+        const sock = connect(socketPath)
+        let buffer = ""
+        sock.once("error", reject)
+        sock.on("data", (chunk: Buffer) => {
+          buffer += chunk.toString("utf8")
+          if (buffer.includes("\n")) {
+            sock.destroy()
+            resolve(JSON.parse(buffer.slice(0, buffer.indexOf("\n"))) as Record<string, unknown>)
+          }
+        })
+        sock.once("connect", () => sock.write(JSON.stringify({ op: "ping" }) + "\n"))
+      })
+      assert.equal(reply.op, "pong")
+      assert.notEqual(reply.uid, 0, "the runner must never run as root")
+      if (process.geteuid?.() === 0) assert.equal(reply.uid, 65534)
+    } finally {
+      try { process.kill(-launcher.pid!, "SIGKILL") } catch { /* gone */ }
+      try { process.kill(Number(readFileSync(pidFile, "utf8")), "SIGKILL") } catch { /* gone */ }
+    }
+  } finally {
+    rmSync(work, { recursive: true, force: true })
+  }
 })

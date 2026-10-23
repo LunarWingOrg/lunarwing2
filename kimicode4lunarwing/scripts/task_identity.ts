@@ -61,9 +61,16 @@ export function taskSetprivArgv(identity: TaskIdentity): string[] {
  * task uid could plant or rewrite — not root-owned, or sitting in a
  * group-/world-writable directory — is SKIPPED: resolving and executing it
  * would run task-planted code as container root. Unprivileged (host dev)
- * runs keep the plain lookup; the ownership rule guards root only. */
-export function resolveFromBridgePath(name: string, pathEnv: string | undefined = process.env.PATH): string {
-  const enforceRootOwnership = process.geteuid?.() === 0
+ * runs keep the plain lookup unless the caller forces the ownership rule:
+ * the delegated task runner does (NL-1), because a candidate any earlier
+ * task could plant would otherwise run inside every later task. */
+export function resolveFromBridgePath(
+  name: string,
+  pathEnv: string | undefined = process.env.PATH,
+  // NL-1 (!1873 run 200): the delegated task runner is unprivileged but must
+  // still refuse task-plantable candidates, so it forces the rule on.
+  enforceRootOwnership: boolean = process.geteuid?.() === 0,
+): string {
   for (const dir of (pathEnv ?? "").split(delimiter)) {
     if (!dir || !isAbsolute(dir)) continue
     const candidate = join(dir, name)

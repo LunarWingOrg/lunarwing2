@@ -13,15 +13,29 @@
  *
  * IPC protocol (one JSON object per line, mirroring the tool-proxy relay):
  *   {"op": "run", "request": <TaskRequest>, "extra_env": {...}}
+ *     → {"ok": true, "op": "accepted", "task_id": "..."}
+ *     → {"op": "spawned", "task_id": "...", "pgid": <CLI process group>}
  *     → any number of {"op": "progress", "progress": <TaskProgress>}
  *     → exactly one terminal {"op": "result", "result": <TaskResult>}
- *     → {"op": "cancel", "task_id": "..."} (best effort; SIGTERM/SIGKILL
- *       escalation is owned by the executor once a run starts)
+ *   {"op": "cancel", "task_id": "..."} → {"ok": true, "op": "cancelled"}
+ *     (the run's own terminal result follows once the executor's
+ *     SIGTERM/SIGKILL escalation has stopped the CLI; the bridge sends this
+ *     on the run's own connection and waits for that result, NL-3)
  *   {"op": "ping"} → {"ok": true, "op": "pong", "uid": <runner uid>}
  *   Every failure shape is {"ok": false, "error": "<reason>"}.
  *
- * Bounds: a request line larger than the hub's task_request budget can never
- * be valid, so the line is refused and the connection dropped.
+ * Bounds (NL-2/NL-8, !1873 run 200): every line, in both directions, is
+ * capped at runnerLineCapBytes() — the hub's WS_MAX_PAYLOAD_BYTES plus
+ * framing slack, read from the same env as the bridge. A longer request
+ * line can never be valid, so it is refused and the connection dropped.
+ * Progress and result lines are serialized within the cap by truncating
+ * their delta/output/error with the hub envelope's own rule, so a large
+ * result arrives truncated, never as an over-cap line the client rejects.
+ *
+ * Listening (NL-7): in the image the root launcher binds the socket in a
+ * root-only directory (task_runner_bind.py) and the runner inherits just the
+ * listening descriptor (LUNARWING_TASK_RUNNER_LISTEN_FD); the path form
+ * (`node task_runner.js <socket-path>`) stays for host-side runs and tests.
  */
 
 import { createServer, type Server, type Socket } from "node:net"
@@ -30,12 +44,17 @@ import { dirname } from "node:path"
 
 import { executeTask } from "./kimi_task_executor.js"
 import { resolveTaskWorkspace } from "./workspace_path.js"
-import { isRecord, type TaskProgress, type TaskRequest, type TaskResult } from "./lunarwing_runtime.js"
+import {
+  isRecord,
+  runnerLineCapBytes,
+  serializeFrameWithinLimit,
+  type TaskProgress,
+  type TaskRequest,
+  type TaskResult,
+} from "./lunarwing_runtime.js"
 
-// Keep in sync with the bridge's WS_MAX_PAYLOAD_BYTES default (1 MiB), which
-// bounds a task_request envelope on the hub socket; a runner line that big
-// can never be a valid request.
-export const RUNNER_REQUEST_LINE_CAP_BYTES = 1_048_576
+/** Env var carrying the inherited listening descriptor (NL-7). */
+export const RUNNER_LISTEN_FD_ENV = "LUNARWING_TASK_RUNNER_LISTEN_FD"
 
 /** Socket path the daemon listens on. Configured by the entrypoint/launcher. */
 export function taskRunnerSocketPath(): string {
@@ -71,9 +90,34 @@ export class TaskRunner {
   private readonly runs = new Map<string, ActiveRun>()
   private socketPath: string | null = null
   private closed = false
+  // NL-8: one cap for both directions, following the hub's envelope cap.
+  private readonly lineCap = runnerLineCapBytes()
 
   constructor(private readonly workspaceRoot: string = process.env.WORKSPACE_ROOT || "/workspace") {
     this.server = createServer((conn) => this.acceptConnection(conn))
+  }
+
+  /** Line cap in bytes for both directions (test introspection). */
+  get lineCapBytes(): number {
+    return this.lineCap
+  }
+
+  /**
+   * NL-7: listen on an inherited, already-bound and listening descriptor (the
+   * root launcher's task_runner_bind.py). The runner never owns the socket
+   * path, so close() leaves it to the launcher. Node marks inherited
+   * descriptors close-on-exec at startup, so the CLI and its tools never
+   * inherit the listener.
+   */
+  async listenFd(fd: number): Promise<boolean> {
+    if (this.closed) return false
+    return await new Promise<boolean>((resolve) => {
+      this.server.once("error", (err) => {
+        console.error("[task-runner] listen on inherited fd failed:", err.message)
+        resolve(false)
+      })
+      this.server.listen({ fd }, () => resolve(true))
+    })
   }
 
   /** Listen on the socket path. Returns the path, or null on failure (the
@@ -131,8 +175,8 @@ export class TaskRunner {
       buffer = Buffer.concat([buffer, chunk])
       let newline = buffer.indexOf(0x0a)
       while (newline >= 0) {
-        if (newline > RUNNER_REQUEST_LINE_CAP_BYTES) {
-          this.writeLine(conn, { ok: false, error: `request line exceeds ${RUNNER_REQUEST_LINE_CAP_BYTES} bytes` })
+        if (newline > this.lineCap) {
+          this.writeLine(conn, { ok: false, error: `request line exceeds ${this.lineCap} bytes` })
           conn.destroy()
           return
         }
@@ -141,8 +185,8 @@ export class TaskRunner {
         if (line.length > 0) void this.handleLine(conn, line)
         newline = buffer.indexOf(0x0a)
       }
-      if (buffer.length > RUNNER_REQUEST_LINE_CAP_BYTES) {
-        this.writeLine(conn, { ok: false, error: `request line exceeds ${RUNNER_REQUEST_LINE_CAP_BYTES} bytes` })
+      if (buffer.length > this.lineCap) {
+        this.writeLine(conn, { ok: false, error: `request line exceeds ${this.lineCap} bytes` })
         conn.destroy()
       }
     })
@@ -157,9 +201,40 @@ export class TaskRunner {
   private writeLine(conn: Socket, message: Record<string, unknown>): void {
     if (conn.destroyed) return
     try {
-      conn.write(JSON.stringify(message) + "\n")
+      conn.write(this.serializeLine(message) + "\n")
     } catch {
       // Peer vanished; nothing useful to do.
+    }
+  }
+
+  /**
+   * NL-2 (!1873 run 200): the executor caps OUTPUT bytes, not the line, and
+   * JSON escaping can grow a 1 MiB output well past the client's line cap
+   * (a timed_out result with 1 MiB of newline-separated output was a
+   * 1.57 MB line, rejected outright). Progress and result lines are
+   * serialized within the cap with the hub envelope's truncation rule.
+   */
+  private serializeLine(message: Record<string, unknown>): string {
+    const key = message.op === "result" ? "result" : message.op === "progress" ? "progress" : null
+    if (key === null) return JSON.stringify(message)
+    try {
+      return serializeFrameWithinLimit(message, key, this.lineCap, "task runner line")
+    } catch {
+      // Only oversized non-truncatable fields (an enormous task_id) land
+      // here; the terminal frame must still be a valid line.
+      const inner = isRecord(message[key]) ? (message[key] as Record<string, unknown>) : {}
+      const taskId = typeof inner.task_id === "string" ? inner.task_id.slice(0, 256) : ""
+      if (key === "progress") return JSON.stringify({ op: "progress", progress: { task_id: taskId, delta: "", done: false } })
+      return JSON.stringify({
+        op: "result",
+        result: {
+          task_id: taskId,
+          status: "error",
+          output: "",
+          error: `task result exceeds the ${this.lineCap}-byte runner line cap`,
+          duration_ms: typeof inner.duration_ms === "number" ? inner.duration_ms : 0,
+        },
+      })
     }
   }
 
@@ -268,6 +343,13 @@ export class TaskRunner {
         // runs in ITS project directory, not the workspace root.
         resolveTaskWorkspace(taskRequest.context, this.workspaceRoot),
         extraEnv,
+        {
+          // NL-1: the WI#462 PATH order and the root-owned kimi lookup.
+          delegatedRunner: true,
+          // NL-3: the bridge needs the CLI's process group to reap a run
+          // whose runner dies before the terminal result.
+          onSpawn: (pid) => this.writeLine(conn, { op: "spawned", task_id: taskId, pgid: pid }),
+        },
       )
     } catch (err) {
       // executeTask's contract resolves (never rejects) — this is the
@@ -289,11 +371,31 @@ export class TaskRunner {
   }
 }
 
-/** CLI entrypoint: `node task_runner.js <socket-path>` (env-driven too). */
+/** Parses LUNARWING_TASK_RUNNER_LISTEN_FD; null when unset, throws when malformed. */
+export function inheritedListenFd(raw: string | undefined = process.env[RUNNER_LISTEN_FD_ENV]): number | null {
+  if (raw === undefined || raw === "") return null
+  if (!/^[0-9]+$/.test(raw) || Number(raw) < 3 || !Number.isSafeInteger(Number(raw))) {
+    throw new Error(`${RUNNER_LISTEN_FD_ENV} must be a descriptor number >= 3 (got ${JSON.stringify(raw).slice(0, 32)})`)
+  }
+  return Number(raw)
+}
+
+/**
+ * CLI entrypoint. In the image: `node task_runner.js` with the listening
+ * descriptor inherited from the root launcher (NL-7). Host runs and tests:
+ * `node task_runner.js <socket-path>` (or LUNARWING_TASK_RUNNER_SOCKET).
+ */
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
-  const socketPath = argv[0] ?? taskRunnerSocketPath()
-  if (!socketPath) {
-    console.error("[task-runner] socket path required (argv or LUNARWING_TASK_RUNNER_SOCKET)")
+  let listenFd: number | null
+  try {
+    listenFd = inheritedListenFd()
+  } catch (err) {
+    console.error("[task-runner]", err instanceof Error ? err.message : err)
+    return 1
+  }
+  const socketPath = listenFd === null ? (argv[0] ?? taskRunnerSocketPath()) : ""
+  if (listenFd === null && !socketPath) {
+    console.error("[task-runner] socket path required (argv or LUNARWING_TASK_RUNNER_SOCKET), or an inherited LUNARWING_TASK_RUNNER_LISTEN_FD")
     return 1
   }
   if (typeof process.getuid === "function" && process.getuid() === 0) {
@@ -304,23 +406,33 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     return 1
   }
   const runner = new TaskRunner()
-  const started = await runner.listen(socketPath)
-  if (!started) {
-    console.error(`[task-runner] could not listen on ${socketPath}`)
-    return 1
+  if (listenFd !== null) {
+    if (!(await runner.listenFd(listenFd))) {
+      console.error(`[task-runner] could not listen on inherited fd ${listenFd}`)
+      return 1
+    }
+    console.log(`[task-runner] listening on inherited fd ${listenFd}`)
+  } else {
+    const started = await runner.listen(socketPath)
+    if (!started) {
+      console.error(`[task-runner] could not listen on ${socketPath}`)
+      return 1
+    }
+    console.log(`[task-runner] listening on ${started}`)
   }
-  console.log(`[task-runner] listening on ${started}`)
   // NB-17: publish runner liveness for the health server's /ready check.
-  // The heartbeat interval is short relative to any watchdog, and the file
-  // lives next to the socket (task-uid owned, 0700 dir).
+  // The heartbeat interval is short relative to any watchdog. The file lives
+  // in the task-uid-owned runner directory; in the inherited-fd shape the
+  // socket directory is root-only, so the launcher always exports the path.
+  // NL-8: the state carries liveness only — /ready is served off-container,
+  // so the socket path and pid are not published.
   const stateFile = process.env.LUNARWING_TASK_RUNNER_STATE_FILE
-    || `${dirname(socketPath)}/task-runner-state.json`
+    || (socketPath ? `${dirname(socketPath)}/task-runner-state.json` : "")
   const writeState = () => {
+    if (!stateFile) return
     try {
       writeFileSync(stateFile, JSON.stringify({
         ready: true,
-        socket: socketPath,
-        pid: process.pid,
         heartbeat_at: new Date().toISOString(),
       }) + "\n", { mode: 0o600 })
     } catch (err) {
@@ -331,7 +443,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   const heartbeat = setInterval(writeState, 10_000)
   const shutdown = () => {
     clearInterval(heartbeat)
-    try { rmSync(stateFile, { force: true }) } catch { /* state is best-effort */ }
+    if (stateFile) {
+      try { rmSync(stateFile, { force: true }) } catch { /* state is best-effort */ }
+    }
     runner.close()
     process.exit(0)
   }

@@ -5,7 +5,8 @@ import { existsSync, mkdtempSync, rmSync, symlinkSync, mkdirSync, writeFileSync,
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { TaskRunner, refuseSymlinkedRunnerDir, taskRunnerSocketPath } from "./task_runner.js"
+import { TaskRunner, inheritedListenFd, refuseSymlinkedRunnerDir, taskRunnerSocketPath } from "./task_runner.js"
+import { TASK_TOOLCHAIN_DIRS } from "./kimi_task_executor.js"
 import type { TaskRequest, TaskResult } from "./lunarwing_runtime.js"
 
 const scratchDirs: string[] = []
@@ -35,6 +36,8 @@ class RunnerClient {
   private buffer = Buffer.alloc(0)
   private readonly pending: Array<(line: Record<string, unknown>) => void> = []
   private readonly lines: Array<Record<string, unknown>> = []
+  /** NL-3 {"op":"spawned"} frames, kept out of the reply queue. */
+  readonly spawned: Array<Record<string, unknown>> = []
   constructor(private readonly sock: Socket) {
     sock.on("data", (chunk: Buffer) => {
       this.buffer = Buffer.concat([this.buffer, chunk])
@@ -44,6 +47,11 @@ class RunnerClient {
         this.buffer = this.buffer.subarray(newline + 1)
         if (line.length > 0) {
           const parsed = JSON.parse(line) as Record<string, unknown>
+          if (parsed.op === "spawned") {
+            this.spawned.push(parsed)
+            newline = this.buffer.indexOf(0x0a)
+            continue
+          }
           const waiter = this.pending.shift()
           if (waiter) waiter(parsed)
           else this.lines.push(parsed)
@@ -176,6 +184,10 @@ test("run streams progress and exactly one result, then ends the connection", as
         }
         assert.ok(acceptedLine, "runner never acknowledged the run (NB-13)")
         assert.ok(resultLine !== undefined, "runner never sent the terminal result")
+        // NL-3: the CLI's process group is reported for the bridge's reap.
+        assert.equal(client.spawned.length, 1, "runner must report the spawned CLI exactly once (NL-3)")
+        assert.equal(client.spawned[0].task_id, "t-1")
+        assert.ok(Number.isSafeInteger(client.spawned[0].pgid) && (client.spawned[0].pgid as number) >= 2)
         assert.ok(progressLines.length >= 1, "runner never sent progress")
         for (const progress of progressLines) {
           assert.equal((progress.progress as TaskResult).task_id, "t-1")
@@ -413,5 +425,129 @@ test("NB-14: a delegated task executes in its project directory, not the workspa
     }
   } finally {
     delete process.env.KIMI_BIN
+  }
+})
+
+// ── !1873 run-200 fixes (NL-1, NL-8) ─────────────────────────────────────────
+
+async function runOnce(runner: TaskRunner, path: string, request: TaskRequest): Promise<TaskResult> {
+  const client = await RunnerClient.connectTo(path)
+  try {
+    client.send({ op: "run", request })
+    for (let i = 0; i < 16; i++) {
+      const line = await client.nextLine(20_000)
+      if (line.op === "result") return line.result as TaskResult
+    }
+    throw new Error("runner never sent a result")
+  } finally {
+    client.close()
+  }
+}
+
+test("NL-1: the delegated runner never runs a task-plantable bare kimi from its PATH", async () => {
+  // Run-200 probe shape: the runner resolved a bare `kimi` through its
+  // inherited PATH, whose first entry is the task-owned ~/.cargo/bin, so one
+  // task could plant a `kimi` that every later task ran. The plant here is
+  // first on the runner's PATH in a world-writable directory: it is skipped
+  // whether the suite runs as root (CI) or not, and with no root-owned kimi
+  // the task fails closed instead.
+  const plantDir = scratch()
+  chmodSync(plantDir, 0o777)
+  const marker = join(scratch(), "planted-ran")
+  writeFileSync(join(plantDir, "kimi-nl1-probe"), `#!/bin/sh\necho planted > ${JSON.stringify(marker)}\nexit 0\n`, { mode: 0o755 })
+  chmodSync(join(plantDir, "kimi-nl1-probe"), 0o755)
+  const savedPath = process.env.PATH
+  process.env.PATH = `${plantDir}:${savedPath}`
+  process.env.KIMI_BIN = "kimi-nl1-probe"
+  try {
+    const { runner, path } = await startRunner(scratch(), scratch())
+    try {
+      const result = await runOnce(runner, path, taskRequest("probe", { task_id: "nl1-plant", timeout_ms: 10_000 }))
+      assert.equal(result.status, "error", JSON.stringify(result))
+      assert.match(result.error ?? "", /not found on the bridge PATH/)
+      assert.ok(!existsSync(marker), "the planted kimi must never run (NL-1)")
+    } finally {
+      runner.close()
+    }
+  } finally {
+    process.env.PATH = savedPath
+    delete process.env.KIMI_BIN
+  }
+})
+
+test("NL-1: the delegated CLI gets the runner's PATH first and the task toolchain dirs after (WI#462 order)", async () => {
+  const workspace = scratch()
+  process.env.KIMI_BIN = makeMockKimi(
+    `process.stdout.write(JSON.stringify({ role: "assistant", content: JSON.stringify({ path: process.env.PATH, fd: process.env.LUNARWING_TASK_RUNNER_LISTEN_FD ?? null }) }) + "\\n")`,
+  )
+  process.env.LUNARWING_TASK_RUNNER_LISTEN_FD = "3"
+  try {
+    const { runner, path } = await startRunner(workspace, scratch())
+    try {
+      const result = await runOnce(runner, path, taskRequest("print env", { task_id: "nl1-path", timeout_ms: 10_000 }))
+      assert.equal(result.status, "success", JSON.stringify(result))
+      const seen = JSON.parse(result.output) as { path: string; fd: string | null }
+      const expectedTail = `:${TASK_TOOLCHAIN_DIRS.join(":")}`
+      assert.equal(seen.path, `${process.env.PATH}${expectedTail}`,
+        "the CLI PATH must be the runner's own PATH followed by the task toolchain dirs (NL-1)")
+      assert.equal(seen.fd, null, "the runner's listening-fd handoff must not reach task code (NL-7)")
+    } finally {
+      runner.close()
+    }
+  } finally {
+    delete process.env.KIMI_BIN
+    delete process.env.LUNARWING_TASK_RUNNER_LISTEN_FD
+  }
+})
+
+test("NL-8: the runner request cap follows WS_MAX_PAYLOAD_BYTES", async () => {
+  // A 2 MiB hub envelope cap must admit a 1.5 MiB task through the runner
+  // (the old fixed 1 MiB cap refused it and dropped the connection).
+  const saved = process.env.WS_MAX_PAYLOAD_BYTES
+  process.env.WS_MAX_PAYLOAD_BYTES = String(2 * 1_048_576)
+  process.env.KIMI_BIN = makeMockKimi(
+    `process.stdout.write(JSON.stringify({ role: "assistant", content: "big request ok" }) + "\\n")`,
+  )
+  try {
+    const runner = new TaskRunner(scratch())
+    const path = await runner.listen(join(scratch(), "runner.sock"))
+    assert.ok(path)
+    try {
+      assert.equal(runner.lineCapBytes, 2 * 1_048_576 + 65_536)
+      // The bulk rides in context metadata (a 1.5 MB argv string would hit
+      // the kernel's per-argument limit, which is not what this pins).
+      const request = taskRequest("small prompt", { task_id: "nl8-big", timeout_ms: 20_000 })
+      ;(request as { context?: Record<string, unknown> }).context = { metadata: { blob: "x".repeat(1_500_000) } }
+      const client = await RunnerClient.connectTo(path)
+      try {
+        client.send({ op: "run", request })
+        const first = await client.nextLine(20_000)
+        assert.equal(first.op, "accepted", `a 1.5 MB request under a 2 MiB hub cap must be accepted: ${JSON.stringify(first).slice(0, 200)}`)
+        let result: Record<string, unknown> | undefined
+        for (let i = 0; i < 8 && result === undefined; i++) {
+          const line = await client.nextLine(20_000)
+          if (line.op === "result") result = line
+        }
+        assert.equal((result?.result as TaskResult | undefined)?.status, "success")
+      } finally {
+        client.close()
+      }
+    } finally {
+      runner.close()
+    }
+  } finally {
+    if (saved === undefined) delete process.env.WS_MAX_PAYLOAD_BYTES
+    else process.env.WS_MAX_PAYLOAD_BYTES = saved
+    delete process.env.KIMI_BIN
+  }
+})
+
+test("NL-7: LUNARWING_TASK_RUNNER_LISTEN_FD is parsed strictly", () => {
+  assert.equal(inheritedListenFd(undefined), null)
+  assert.equal(inheritedListenFd(""), null)
+  assert.equal(inheritedListenFd("3"), 3)
+  assert.equal(inheritedListenFd("17"), 17)
+  for (const bad of ["0", "2", "-1", "3x", " 3", "abc"]) {
+    assert.throws(() => inheritedListenFd(bad), /descriptor number >= 3/, bad)
   }
 })

@@ -169,14 +169,16 @@ FULL_VALIDATION_JOBS = (
 WORKER_NAMES = ("pebble", "opencode", "opencode2", "kimi")
 # Fixed build-read inputs of the kimi worker image build (the Dockerfile
 # cross-checks kimi-cli/package.json, npm-ci's both package dirs, tsc reads
-# tsconfig.json, and the in-build test gate reads entrypoint.sh, hooks/ and
-# config/; runtime COPYs also ship the health server and protocol JSON).
+# tsconfig.json, and the in-build test gate reads entrypoint.sh, hooks/,
+# config/, the health server and the runner bind helper; runtime COPYs also
+# ship those two and the protocol JSON).
 # validate_worker_input_manifest requires all of them plus every
 # on-disk kimicode4lunarwing/scripts/*.ts.
 KIMI_BUILD_INPUT_CORE = (
     "kimicode4lunarwing/Dockerfile",
     "kimicode4lunarwing/entrypoint.sh",
     "kimicode4lunarwing/health_server.py",
+    "kimicode4lunarwing/task_runner_bind.py",
     "kimicode4lunarwing/agent_comm_protocol.json",
     "kimicode4lunarwing/config/config.toml",
     "kimicode4lunarwing/hooks/headless_command_guard.mjs",

@@ -448,7 +448,7 @@ class WorkerInputManifestTests(unittest.TestCase):
     def test_kimi_runtime_input_omissions_are_caught(self):
         # IL-1: literal paths keep this independent of the core tuple used
         # by the fixture; dropping either required entry must fail this pin.
-        for filename in ("health_server.py", "agent_comm_protocol.json"):
+        for filename in ("health_server.py", "task_runner_bind.py", "agent_comm_protocol.json"):
             with self.subTest(filename=filename):
                 relative = f"kimicode4lunarwing/{filename}"
                 self.write_build_script(

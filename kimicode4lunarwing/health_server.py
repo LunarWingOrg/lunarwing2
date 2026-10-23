@@ -20,6 +20,10 @@ START_TIME = time.time()
 WS_STATE_FILE = os.environ.get("WS_STATE_FILE", "/tmp/lunarwing_ws_state.json")
 # The runner writes a heartbeat every 10 s; three missed beats is dead.
 HEARTBEAT_MAX_AGE_SECONDS = 30.0
+# NL-6 (!1873 run 200): a stamp further in the future than this clock skew
+# is not a heartbeat (a forged or corrupt state file would otherwise keep
+# /ready green long after the runner died).
+HEARTBEAT_MAX_FUTURE_SKEW_SECONDS = 5.0
 
 def _uptime() -> float:
     return round(time.time() - START_TIME, 2)
@@ -51,8 +55,11 @@ def _load_state_file(path: str) -> dict | None:
             return json.load(handle)
     except FileNotFoundError:
         return None
-    except json.JSONDecodeError:
+    except ValueError:
+        # Invalid JSON or invalid UTF-8 (NL-6: never an exception in /ready).
         return {"ready": False, "error": "invalid runner state file"}
+    except OSError:
+        return {"ready": False, "error": "runner state file unreadable"}
 
 def _build_ready() -> tuple[dict, int]:
     mode = os.environ.get("KIMI_MODE", "websocket")
@@ -79,27 +86,8 @@ def _build_ready() -> tuple[dict, int]:
     # refuse with connection errors.
     runner_socket = os.environ.get("LUNARWING_TASK_RUNNER_SOCKET", "")
     if runner_socket:
-        runner_state = _load_runner_state()
-        runner_ready = False
-        if runner_state:
-            runner_ready = bool(runner_state.get("ready"))
-            # NC-7: a stale heartbeat means the runner is dead. The runner
-            # writes every 10 s; treat anything older than 30 s (3 missed
-            # beats) as not ready, so a SIGKILL'd runner (which leaves a
-            # ready:true file with no further updates) is caught.
-            heartbeat_at = runner_state.get("heartbeat_at")
-            if runner_ready and heartbeat_at:
-                age = _heartbeat_age(heartbeat_at)
-                if age is None:
-                    runner_ready = False
-                    runner_state = {**runner_state, "ready": False,
-                                    "error": "heartbeat unparseable"}
-                elif age > HEARTBEAT_MAX_AGE_SECONDS:
-                    runner_ready = False
-                    runner_state = {**runner_state, "ready": False,
-                                    "error": "heartbeat stale"}
-        body["task_runner"] = {"ready": runner_ready,
-                               **(runner_state if runner_state else {"error": "state unavailable"})}
+        runner_ready, runner_body = _runner_liveness(_load_runner_state())
+        body["task_runner"] = runner_body
         if not runner_ready:
             body["ready"] = False
             status = 503
@@ -125,10 +113,47 @@ def _parse_iso(ts: str) -> float:
 
 def _heartbeat_age(ts: str) -> float | None:
     """Seconds since *ts* in UTC, or None when it cannot be parsed."""
+    if not isinstance(ts, str):
+        return None
     try:
         return time.time() - _parse_iso(ts)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
+
+def _runner_liveness(state: object) -> tuple[bool, dict]:
+    """(ready, body) for the runner's heartbeat state file.
+
+    NC-7: a stale heartbeat means the runner is dead. The runner writes every
+    10 s; anything older than 30 s (three missed beats) is not ready, so a
+    SIGKILLed runner, which leaves a ready:true file behind, is caught.
+    NL-6 (!1873 run 200): the heartbeat is REQUIRED. A state file that is
+    not a JSON object, is not ready:true, or whose heartbeat_at is missing,
+    empty, not a string, unparseable or in the future (beyond a small clock
+    skew) is not ready; before, a missing or empty stamp passed and a
+    numeric one raised AttributeError.
+    NL-8: the body carries liveness only (ready, heartbeat_at, error). /ready
+    is served off-container, so the socket path and pid are not published.
+    """
+    if state is None:
+        return False, {"ready": False, "error": "state unavailable"}
+    if not isinstance(state, dict):
+        return False, {"ready": False, "error": "invalid runner state file"}
+    if state.get("error") and state.get("ready") is not True:
+        return False, {"ready": False, "error": str(state.get("error"))[:128]}
+    if state.get("ready") is not True:
+        return False, {"ready": False, "error": "runner not ready"}
+    heartbeat_at = state.get("heartbeat_at")
+    if not isinstance(heartbeat_at, str) or not heartbeat_at.strip():
+        return False, {"ready": False, "error": "heartbeat missing"}
+    body = {"ready": False, "heartbeat_at": heartbeat_at[:64]}
+    age = _heartbeat_age(heartbeat_at)
+    if age is None:
+        return False, {**body, "error": "heartbeat unparseable"}
+    if age > HEARTBEAT_MAX_AGE_SECONDS:
+        return False, {**body, "error": "heartbeat stale"}
+    if age < -HEARTBEAT_MAX_FUTURE_SKEW_SECONDS:
+        return False, {**body, "error": "heartbeat in the future"}
+    return True, {**body, "ready": True}
 
 def _load_runner_state():
     # NC-7: use the same default as the runner (task_runner.ts main()):
