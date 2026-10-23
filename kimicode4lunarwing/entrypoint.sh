@@ -164,7 +164,10 @@ case "$MODE" in
     # from LUNARWING_TOKEN_DIR: the token directory must stay root-only
     # 0700 (WI#400), and the runner must own its own directory to bind the
     # socket — root hands it over 0700 task-uid below.
-    RUNNER_PID_FILE="${KIMI_TASK_RUNNER_PID_FILE:-$RUNNER_DIR/task-runner.pid}"
+    # NC-9: the PID file lives in the root-only LUNARWING_TOKEN_DIR, not the
+    # task-uid-owned RUNNER_DIR — the task uid can rewrite files there, and
+    # cleanup() runs kill as root on whatever it reads.
+    RUNNER_PID_FILE="${KIMI_TASK_RUNNER_PID_FILE:-$LUNARWING_TOKEN_DIR/task-runner.pid}"
     if [ -n "${AGENT_AUTH_TOKEN_FILE:-}" ] && [ "${KIMI_TASK_RUNNER:-}" != "skip" ]; then
       install -d -m 0700 "$RUNNER_DIR" 2>/dev/null || true
       if [ "$(id -u)" = "0" ]; then
@@ -211,9 +214,13 @@ case "$MODE" in
             node /app/scripts/task_runner.js "$RUNNER_SOCKET" &
           _current=$!
           echo "$_current" > "$RUNNER_PID_FILE"
-          # Give the new runner a 30 s grace window; if it survives, the
-          # attempt counter has done its job for this generation.
+          # Give the new runner a 30 s grace window; if it survives, reset
+          # the attempt counter (NC-9: without this, the 6th runner death
+          # over the container's lifetime — however far apart — exits).
           sleep 30
+          if kill -0 "$_current" 2>/dev/null; then
+            _attempts=0
+          fi
         done
       ) &
       RUNNER_SUPERVISOR_PID=$!
