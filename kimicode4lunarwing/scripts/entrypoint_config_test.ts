@@ -411,3 +411,125 @@ test("entrypoint starts the task runner as the task uid before the bridge (WI#45
   assert.match(entrypoint, /cat "\$RUNNER_PID_FILE"/)
   assert.match(entrypoint, /kill "\$RUNNER_LIVE_PID"/)
 })
+
+test("entrypoint exports the runner paths before the health server starts (NC-7)", () => {
+  // NC-7: /ready can only report runner liveness if the health server — a
+  // separate process that inherits this environment at spawn — was started
+  // after both runner variables were exported. Moving either export back
+  // below the health server start would silently disable the check.
+  const socketExport = entrypoint.indexOf("export LUNARWING_TASK_RUNNER_SOCKET=")
+  const stateExport = entrypoint.indexOf("export LUNARWING_TASK_RUNNER_STATE_FILE=")
+  const healthAt = entrypoint.indexOf("as_task python3 /app/health_server.py")
+  const bridgeAt = entrypoint.indexOf("node /app/scripts/lunarwing_bridge.js")
+  assert.ok(socketExport > 0 && stateExport > 0 && healthAt > 0 && bridgeAt > healthAt)
+  assert.ok(socketExport < healthAt, "LUNARWING_TASK_RUNNER_SOCKET must be exported before the health server starts")
+  assert.ok(stateExport < healthAt, "LUNARWING_TASK_RUNNER_STATE_FILE must be exported before the health server starts")
+})
+
+test("supervisor resets its attempt counter when a runner generation survives (NC-9)", () => {
+  // NC-9: without the reset, the 6th runner death over a container's whole
+  // lifetime — however far apart — stops the container. The counter must be
+  // cleared only after the grace window proves the new generation lives.
+  const supervisor = entrypoint.slice(
+    entrypoint.indexOf("_attempts=0\n        _current="),
+    entrypoint.indexOf("RUNNER_SUPERVISOR_PID="),
+  )
+  assert.ok(supervisor.length > 0, "supervisor block not found")
+  const graceAt = supervisor.indexOf("sleep 30")
+  const resetAt = supervisor.indexOf("_attempts=0", graceAt)
+  assert.ok(graceAt > 0 && resetAt > graceAt, "the attempt counter must reset after the 30 s grace window")
+  assert.match(supervisor, /if kill -0 "\$_current" 2>\/dev\/null; then\n\s*_attempts=0\n\s*fi/)
+})
+
+test("supervisor gives up by signalling the launcher, not a stale bridge pid (NI-3)", () => {
+  // NI-3: the supervisor subshell forks before BRIDGE_PID is assigned, so its
+  // copy is empty and `kill "$BRIDGE_PID"` was a no-op — the container kept a
+  // root bridge that accepted tasks it could never complete. It must signal
+  // the launcher ($$, unchanged inside a subshell) so the cleanup trap runs.
+  const supervisor = entrypoint.slice(
+    entrypoint.indexOf("_attempts=0\n        _current="),
+    entrypoint.indexOf("RUNNER_SUPERVISOR_PID="),
+  )
+  assert.match(supervisor, /kill -TERM "\$\$"/)
+  assert.doesNotMatch(supervisor, /kill "\$BRIDGE_PID"/)
+})
+
+test("runner pid file lives in the root-only token directory (NC-9)", () => {
+  // NC-9: the runner runs as the task uid and owns RUNNER_DIR, so a pid file
+  // there could be rewritten by any task — and cleanup() runs kill as root on
+  // whatever it reads. It must sit in the root-only token directory.
+  assert.match(entrypoint, /RUNNER_PID_FILE="\$\{KIMI_TASK_RUNNER_PID_FILE:-\$LUNARWING_TOKEN_DIR\/task-runner\.pid\}"/)
+})
+
+// ── health server /ready: runner liveness (NC-7, NI-2) ──────────────────────
+const healthServerPath = fileURLToPath(new URL("../health_server.py", import.meta.url))
+const READY_PROBE = `
+import importlib.util, json, os, sys
+health_path, root = sys.argv[1], sys.argv[2]
+os.environ["KIMI_MODE"] = "websocket"
+os.environ["WS_STATE_FILE"] = os.path.join(root, "ws.json")
+os.environ["LUNARWING_TASK_RUNNER_SOCKET"] = os.path.join(root, "task-runner.sock")
+os.environ["LUNARWING_TASK_RUNNER_STATE_FILE"] = os.path.join(root, "task-runner-state.json")
+spec = importlib.util.spec_from_file_location("health_server_probe", health_path)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+body, status = mod._build_ready()
+print(json.dumps({"status": status, "body": body}))
+`
+// The runner writes `new Date().toISOString()` — ask node for exactly that
+// rather than hand-rolling a format the runner might not produce (NI-2).
+function runnerHeartbeat(): string {
+  const result = spawnSync(process.execPath, ["-e", "process.stdout.write(new Date().toISOString())"], {
+    encoding: "utf8",
+  })
+  assert.equal(result.status, 0, result.stderr)
+  return result.stdout
+}
+function readyProbe(root: string, env: NodeJS.ProcessEnv = {}) {
+  const result = spawnSync("python3", ["-I", "-c", READY_PROBE, healthServerPath, root], {
+    encoding: "utf8",
+    env: { ...process.env, ...env },
+  })
+  assert.equal(result.status, 0, result.stderr)
+  return JSON.parse(result.stdout) as { status: number; body: { ready: boolean; task_runner?: { ready: boolean; error?: string } } }
+}
+function readyFixture(heartbeat: string | null): string {
+  const root = mkdtempSync(join(tmpdir(), "kimi-ready-"))
+  writeFileSync(join(root, "ws.json"), JSON.stringify({ ready: true }))
+  if (heartbeat !== null) {
+    // Exactly the shape task_runner.ts writes.
+    writeFileSync(join(root, "task-runner-state.json"), JSON.stringify({
+      ready: true,
+      socket: join(root, "task-runner.sock"),
+      pid: 4242,
+      heartbeat_at: heartbeat,
+    }) + "\n")
+  }
+  return root
+}
+
+test("health server /ready reports a fresh runner heartbeat as ready (NC-7, NI-2)", () => {
+  const fresh = readyProbe(readyFixture(runnerHeartbeat()))
+  assert.equal(fresh.status, 200, JSON.stringify(fresh.body))
+  assert.equal(fresh.body.task_runner?.ready, true)
+  // Same answer under a non-UTC host clock: the stamp is UTC, and reading it
+  // as local time would make a dead runner look fresh for hours (NI-2).
+  const freshInNewYork = readyProbe(readyFixture(runnerHeartbeat()), { TZ: "America/New_York" })
+  assert.equal(freshInNewYork.status, 200, JSON.stringify(freshInNewYork.body))
+})
+
+test("health server /ready fails on a missing or stale runner heartbeat (NC-7, NI-2)", () => {
+  const missing = readyProbe(readyFixture(null))
+  assert.equal(missing.status, 503)
+  assert.equal(missing.body.task_runner?.error, "state unavailable")
+
+  const staleStamp = new Date(Date.now() - 120_000).toISOString()
+  const stale = readyProbe(readyFixture(staleStamp))
+  assert.equal(stale.status, 503, JSON.stringify(stale.body))
+  assert.equal(stale.body.task_runner?.error, "heartbeat stale")
+  // The stale verdict must not flip under a host TZ hours away from UTC: the
+  // old mktime parse turned the same stamp into a future time (NI-2).
+  const staleInNewYork = readyProbe(readyFixture(staleStamp), { TZ: "America/New_York" })
+  assert.equal(staleInNewYork.status, 503, JSON.stringify(staleInNewYork.body))
+  assert.equal(staleInNewYork.body.task_runner?.error, "heartbeat stale")
+})
