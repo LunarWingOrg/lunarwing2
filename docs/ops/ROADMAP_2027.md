@@ -5,6 +5,7 @@
 |---------|--------|
 | Revamped LunarWing TUI REPLv3 utilizing OpenTUI, Multimodal input/output, and more | v2.1.7.0 |
 | Remaining polish items from massive changes introduced in `Tsuno` | v2.1.7.0 |
+| General Agent Loop Engine Polish | v2.1.7.0 |
 | Further Podman Sandbox refinements, improvements, and proper tunnel networking support | v2.1.8.0 |
 | Part two of Mission Improvements with enhanced metric evaluations and external worker adjacent looping | v2.1.8.0 |
 | Introduction of new external worker, LunarDepth | v2.1.8.0 |
