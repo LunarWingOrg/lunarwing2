@@ -50,7 +50,12 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         image_name=worker-opencode
         context=opencode4lunarwing
         dockerfile_dir=opencode4lunarwing
-        input_files=opencode4lunarwing/Dockerfile
+        # WI#467: the models.dev snapshot is compiled into the binary and the
+        # guard script executes during the build (CY-4 precedent: build-read
+        # inputs and build-executed scripts must hash into worker-inputs).
+        input_files='opencode4lunarwing/Dockerfile
+opencode4lunarwing/models-dev/api.json
+opencode4lunarwing/scripts/check_models_dev_snapshot.py'
         source_ref=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
         build_args="OPENCODE_VERSION=v1.18.25
 OPENCODE_REF=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
@@ -126,13 +131,15 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         # and executes every scripts/*.ts, and the in-build test gate reads
         # entrypoint.sh, hooks/ and config/; the CLI install cross-checks
         # kimi-cli/package.json against KIMI_CODE_VERSION. Runtime COPYs also
-        # ship health_server.py and agent_comm_protocol.json (IL-1).
+        # ship health_server.py, task_runner_bind.py (WI#454 NL-7) and
+        # agent_comm_protocol.json (IL-1).
         # The Dockerfile's `COPY scripts/*.ts` glob means a new bridge source
         # must join this list in the same commit (validate_config.py enforces it).
         input_files='kimicode4lunarwing/Dockerfile
 kimicode4lunarwing/entrypoint.sh
 kimicode4lunarwing/entrypoint-task-setup.sh
 kimicode4lunarwing/health_server.py
+kimicode4lunarwing/task_runner_bind.py
 kimicode4lunarwing/agent_comm_protocol.json
 kimicode4lunarwing/config/config.toml
 kimicode4lunarwing/hooks/headless_command_guard.mjs
@@ -142,6 +149,7 @@ kimicode4lunarwing/scripts/package.json
 kimicode4lunarwing/scripts/package-lock.json
 kimicode4lunarwing/scripts/tsconfig.json
 kimicode4lunarwing/scripts/entrypoint_config_test.ts
+kimicode4lunarwing/scripts/entrypoint_supervisor_test.ts
 kimicode4lunarwing/scripts/headless_command_guard_test.ts
 kimicode4lunarwing/scripts/kimi_cli_contract_test.ts
 kimicode4lunarwing/scripts/kimi_result.ts
@@ -160,6 +168,10 @@ kimicode4lunarwing/scripts/path_expand_test.ts
 kimicode4lunarwing/scripts/smoke_test.ts
 kimicode4lunarwing/scripts/task_identity.ts
 kimicode4lunarwing/scripts/task_identity_test.ts
+kimicode4lunarwing/scripts/task_runner.ts
+kimicode4lunarwing/scripts/task_runner_test.ts
+kimicode4lunarwing/scripts/task_runner_client.ts
+kimicode4lunarwing/scripts/task_runner_client_test.ts
 kimicode4lunarwing/scripts/task_prompt_test.ts
 kimicode4lunarwing/scripts/workspace_path.ts'
         source_ref=2.3.0

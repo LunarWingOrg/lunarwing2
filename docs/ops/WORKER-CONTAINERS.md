@@ -116,7 +116,12 @@ section and "Launch identity (WI#422)" further down.
   FOWNER is not individually required there but is retained for metadata
   passes (chmod/re-assert) over task-created files the bridge does not own
   — dropping it is on the table the next time the set is re-proved end to
-  end on every lane.
+  end on every lane. `--bounding-set=-all` is deliberately NOT added to the
+  setpriv drops and `CAP_SETPCAP` is deliberately NOT added to the trim
+  (WI#449 LP-7): the maintainer declined both on 2026-10-22 (run-195
+  follow-up #11230). The ruling states the decision and no reason, so none
+  is recorded here; treat the absence as settled and do not propose LP-7
+  again without a fresh ruling.
 - **Root-resolved commands come from root-owned PATH entries only
   (WI#454/ME-1).** The root-launcher images (kimi, opencode) carry NO
   task-owned directory in the image-wide `ENV PATH` — the task uid's
@@ -144,6 +149,113 @@ section and "Launch identity (WI#422)" further down.
   `node -> /usr/local/bin/bun`) so task code calling `node`/`npx` still
   resolves; kimi is unaffected (`node:22` base, `node` in
   `/usr/local/bin`).
+- **Task-runner delegation (WI#454, kimi lane — first slice of the
+  two-container split).** The maintainer's no-root policy (note #10954 on
+  !1829) retires the root bridge: two non-root containers per lane, a
+  bridge container holding the hub credential and a task container
+  running all task code under a different uid, sharing the workspace
+  volume and talking over a unix socket. The kimi lane now carries the
+  worker-side machinery for that split: a task-runner daemon
+  (`kimicode4lunarwing/scripts/task_runner.ts`) that executes tasks as
+  the task uid (it refuses to start as root — the identity boundary is
+  the uid it runs under, so no setpriv drop is needed), and a bridge-side
+  client (`task_runner_client.ts`) that delegates each task over the
+  socket. The entrypoint rehearses the split inside the current
+  single-container image: with the credential handoff active,
+  `run_task_runner` has root bind the listening socket
+  `/run/lunarwing-runner-sock/task-runner.sock` in a root-only `0700`
+  directory (`kimicode4lunarwing/task_runner_bind.py`), then exec
+  `setpriv` → `/usr/bin/env` → `/usr/local/bin/node task_runner.js` as the
+  task uid with only the listening descriptor inherited
+  (`LUNARWING_TASK_RUNNER_LISTEN_FD`). The credential vars are stripped
+  from what the runner inherits, and the task-uid `0700` directory
+  `/run/lunarwing-runner` keeps only the runner's heartbeat state file.
+  The launcher exports `LUNARWING_TASK_RUNNER_SOCKET` to the bridge, which
+  then routes every task to the unprivileged runner instead of spawning
+  the CLI itself; `KIMI_TASK_RUNNER=skip` (or no credential handoff, the
+  host dev shape) keeps local execution. **Delegation is ON by default
+  whenever the credential handoff is active — maintainer decision,
+  2026-10-22 (run 195 follow-up on !1861): the runner starts whenever the
+  credential handoff is active, and `KIMI_TASK_RUNNER=skip` is the
+  explicit operator escape hatch for host-side dev runs.** The runner
+  never sees the hub credential: the token file is root-only `0400` and
+  the token var was unset before the runner spawn. A dead runner socket
+  maps to an error `task_result` (the hub is never stranded) and every
+  delegation rejection surfaces as an error result.
+  - **Wire and bounds.** The runner acknowledges acceptance
+    (`{"op":"accepted"}`), reports the CLI's process group
+    (`{"op":"spawned"}`), streams progress and ends with exactly one
+    result. The bridge replaces its handshake deadline with a run deadline
+    of the task's own `timeout_ms` (default 4 h) plus a 60 s margin (no
+    delegated task dies at the 15 s default, NB-13). Delegated tasks
+    execute in the task's own `project_dir` (resolved with the same
+    `resolveTaskWorkspace` the bridge uses, NB-14). The bridge drops runner
+    frames carrying a foreign `task_id` and rejects unknown result
+    statuses (the protocol's `"timed_out"`, not `"timeout"`, NB-15/NC-6).
+    Every runner-socket line, in both directions, is capped at the hub's
+    `WS_MAX_PAYLOAD_BYTES` plus 64 KiB (the same env, so a larger hub cap
+    is honoured end to end); the runner serializes progress and result
+    lines within that cap with the hub envelope's own truncation rule, so
+    a large result reaches the hub truncated exactly as in local
+    execution, never refused (run-200 NL-2/NL-8).
+  - **Cancel, timeouts and runner death (run-200 NL-3).** The bridge frees
+    a task's workspace lock only once the task's CLI is gone. A cancel (or
+    hub disconnect, or an expired run deadline) is sent as
+    `{"op":"cancel"}` on the run's own connection, and the bridge waits
+    (the kill grace plus 5 s) for the run's terminal result, which the
+    runner writes after the executor's SIGTERM→SIGKILL escalation stopped
+    the CLI. The hub then gets `cancelled`, as in local execution (this
+    retires the NC-11 note). A run that ends without a terminal result
+    (the runner died or dropped the connection, the wait timed out) first
+    has its CLI process group SIGKILLed by the bridge and waited for; the
+    bridge signals it only when every live member belongs to the task uid.
+    As in local execution, a process that left the group on purpose
+    (`setsid`) is not tracked.
+  - **The runner's CLI environment (run-200 NL-1).** The runner gets the
+    root-owned launcher PATH, never `TASK_PATH`, and the executor applies
+    the WI#462 order to the CLI it spawns (that PATH first, the task
+    toolchain directories after) and resolves a bare `kimi` only to a
+    root-owned file in a root-owned, non-writable directory of the
+    runner's PATH (WI#463, fail-closed), exactly as on the setpriv path.
+    Without this, one task could plant a `kimi` (or a `node` for the
+    CLI's env-node line) in the task-owned `~/.cargo/bin` that every later
+    task then ran.
+  - **Socket ownership (run-200 NL-7, replaces the NC-10 note).** Because
+    root binds the socket in a root-only directory, the task uid can
+    neither replace the socket path nor connect to it, and a root bridge
+    refuses any runner socket that is not root-owned in a root-owned
+    directory that group and others cannot write. The old task-owned
+    directory let any task stand in for the runner without a race, and
+    the `task_id` checks above never authenticated anything: they only
+    keep one run's frames apart from another's. Node marks inherited
+    descriptors close-on-exec at startup, so the CLI and its tools never
+    inherit the listener (pinned by a test). **Residual (Low):** the
+    runner and every task still share one uid, so task code that may
+    ptrace the runner (or take its descriptor with `pidfd_getfd`) could
+    take the listener over; only the two-container split below removes
+    that.
+  - **Liveness and supervision.** The runner publishes a heartbeat state
+    file (`ready` and `heartbeat_at` only), and `/ready` fails unless it
+    is a JSON object with `ready: true` and a string `heartbeat_at` that
+    parses, is no older than 30 s (three missed 10 s beats) and is no more
+    than 5 s in the future. `/ready` publishes only that liveness, not the
+    socket path or pid (NB-17/NC-7, run-200 NL-6/NL-8). The runner env
+    vars are exported before the health server starts (NC-7). The
+    entrypoint supervises the runner: `$!` is the runner itself (every
+    step of `run_task_runner` execs, NL-4), a runner that exited, became a
+    zombie or was stopped (`SIGSTOP`, NL-5) is killed and restarted, the
+    attempt counter resets when a generation survives 30 s, and the pid
+    file lives in the root-only token directory (NC-9). After five failed
+    restarts the supervisor signals the launcher (`kill -TERM $$` — the
+    subshell forked before `BRIDGE_PID` existed, so it cannot signal the
+    bridge directly), which runs the cleanup trap and stops the bridge,
+    the runner and the health server so the container exits for the
+    orchestrator (run-198 NI-3).
+  - **What remains for the full split** (WI#454's own remaining scope):
+    the image-level separation (bridge container and task container as
+    two mt-admin units under two different non-root uids, with the socket
+    crossing the shared workspace volume and the bridge itself dropping
+    `USER 0:0`), plus the same machinery on the opencode and pebble lanes.
 - **Cron workspace ownership.** The cron bootstrap (`create_cron_workspace`
   / the TS `resolveTaskWorkspace`) runs in the root bridge, so EVERY
   directory the walk creates — intermediates and leaf alike, or the task
@@ -802,6 +914,8 @@ The default image is slim and does not contain Rust, Go, or C/C++ toolchains. Bu
 Agent-facing dispatch uses `create_job(title: "...", description: "...", mode: "opencode")` in both legacy and Engine V2 chat paths. `opencode` is a named job execution backend, not an extension, MCP server, skill, routine, or SSH host; no registry search or installation is involved.
 
 **Known issue (WI#320 F4, tracked as WI#333; WI#374 reported the same crash on a 2.1.6.0 test tenant):** at the pinned v1.18.25 the `mode: "opencode"` lane is broken in the LunarWing worker shape — every task fails with `external worker 'opencode' failed: Unexpected server error` because `opencode serve` crashes in `SystemPrompt.environment` (`undefined is not an object (evaluating 'a.name')`) while assembling the prompt, before any model call, and answers the SDK with that bare HTTP 500 wrapper. No config remediation (base-URL override, MCP/plugin strip, git-init workspace) avoids it, and v1.18.29 is worse (see the pin note above), so the lane cannot be fixed from this repo until upstream ships a fix; the opencode2 lane below is the working one. To surface the root cause, the worker attaches a bounded, ref-correlated, error-level tail of serve's own structured log (`$XDG_DATA_HOME|~/.local/share/opencode/log/opencode.log` — verified at the pinned ref: serve logs 500 causes there as `level=ERROR` lines with a unique `ref=` id, and the 500 body carries the same ref) to these job errors — only the failing request's line attaches, and a 500 without a ref attaches nothing — so the crash's real stack line reaches `list_jobs`/`job_status`. The v1 lane is expected to be retired in v2.1.7.0 (goals item 34: "prob rm opencode v1 in .1.7.0").
+
+**Reproducible build input (WI#467, 2026-10-23):** the pinned v1.18.25 build compiles a models.dev catalog into the binary. At `cb7d8b2f`, `packages/opencode/script/generate.ts` reads it from the file named by `MODELS_DEV_API_JSON` when set, and otherwise fetches `${OPENCODE_MODELS_URL:-https://models.dev}/api.json` live; `script/build.ts` then passes the text to `Bun.build` as the `OPENCODE_MODELS_DEV` define, so the catalog is compiled in as code. Until WI#467 the Dockerfile never set the variable, so the binary changed whenever models.dev published between the candidate build and the `--no-cache` rebuild, and the clean-rebuild gate failed on master. The lane now carries a reviewed snapshot at `opencode4lunarwing/models-dev/api.json` (fetched from models.dev @ `a051b3ca330b`, 2026-10-23), committed pretty-printed so a refresh diffs line by line; the minified bundle is byte-identical to the one built from the one-line form. Its sha256 is pinned as the Dockerfile's `MODELS_DEV_SNAPSHOT_SHA256` ARG (not `*_API_JSON_*`: gitleaks' generic-api-key rule reads an ARG whose name contains `API` and whose value is 64 hex as a leaked key). `validate_config.py` cross-checks the pin, requires the snapshot to be strict JSON (one non-empty object, no duplicate keys, no NaN/Infinity) in the canonical pretty layout, and pins the builder-stage tail from `WORKDIR /build/opencode/packages/opencode` to the next `FROM` instruction by instruction (`OPENCODE_MODELS_DEV_BUILD_STEPS`). The build RUN verifies the hash, runs `scripts/check_models_dev_snapshot.py` (strict JSON, and `generate.ts` must still read both env vars), and builds with `OPENCODE_MODELS_URL=http://127.0.0.1:9`, so an upstream that ignores the snapshot and fetches anyway fails the build instead of compiling a live catalog. Both files hash into the opencode `worker-inputs.sha256`. **Bump checklist addition:** refreshing the snapshot is a deliberate commit: write the canonical form (`curl -fsS https://models.dev/api.json | python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin), indent=1, ensure_ascii=False))' > opencode4lunarwing/models-dev/api.json`), update `MODELS_DEV_SNAPSHOT_SHA256` to match (`sha256sum opencode4lunarwing/models-dev/api.json`), and record the models.dev commit/date here. An `OPENCODE_REF` bump re-checks `generate.ts` and updates `OPENCODE_MODELS_DEV_BUILD_STEPS` in the same commit if the build step changes.
 
 ## OpenCode 2 Worker (opencode2)
 

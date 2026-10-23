@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "clipboard-win"
-version = "5.4.1"
+version = "5.4.3"
 dependencies = [
  "error-code",
  "windows-win",

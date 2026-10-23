@@ -14,6 +14,8 @@ Persistent container worker for upstream opencode. The WebSocket bridge is TypeS
 - `scripts/lunarwing_tool_plugin.ts` — WI#324 opencode plugin (registered in `config/opencode.json`) that statically exposes the phase-1 tools to the serve process. opencode owns MCP servers per project Instance with frozen env, so instead of an MCP shim each tool's `execute()` resolves the calling session's task id from its title (`lunarwing-opencode-<task_id>`) via the plugin host's authenticated client and relays over the per-task socket. Dependency-free on purpose (the runtime image ships only `@opencode-ai/sdk`).
 - `entrypoint.sh` — Startup orchestration. Three modes: websocket, cli, acp.
 - `config/opencode.json` — Mounted into container; controls LLM provider, plugins, MCP servers.
+- `models-dev/api.json` — WI#467 reviewed models.dev catalog snapshot compiled into the binary at build time (`MODELS_DEV_API_JSON`), committed pretty-printed (`json.dumps` indent=1, `ensure_ascii=False`); sha256 pinned as the Dockerfile's `MODELS_DEV_SNAPSHOT_SHA256` ARG and cross-checked by `validate_config.py`, which also enforces strict JSON in that layout. Refresh both in one deliberate commit (command in `docs/ops/WORKER-CONTAINERS.md`).
+- `scripts/check_models_dev_snapshot.py` — WI#467 fail-closed build assert: the pinned upstream `generate.ts` must still read `MODELS_DEV_API_JSON` and `OPENCODE_MODELS_URL` (the build points the latter at a closed loopback port, so any live fetch fails), and the snapshot must be strict JSON.
 
 ## Protocol Compatibility
 
@@ -21,7 +23,7 @@ The `lunarwing-agent-v1` WebSocket subprotocol is shared with Pebble and Kimi Co
 
 ## Build Notes
 
-The Dockerfile fetches anomalyco/opencode at the full SHA in `OPENCODE_REF` and requires its committed Bun lock. Update the release-to-commit mapping deliberately. Base images, Debian package indexes, rustup, and Go archives are pinned; refresh their recorded digests/checksums rather than restoring tag-only or fallback installs.
+The Dockerfile fetches anomalyco/opencode at the full SHA in `OPENCODE_REF` and requires its committed Bun lock. Update the release-to-commit mapping deliberately. Base images, Debian package indexes, rustup, and Go archives are pinned; refresh their recorded digests/checksums rather than restoring tag-only or fallback installs. The models.dev catalog the build compiles into the binary is pinned the same way (WI#467): the committed `models-dev/api.json` snapshot plus the `MODELS_DEV_SNAPSHOT_SHA256` ARG, never a live fetch — update both together when refreshing. `validate_config.py` pins the builder-stage build steps exactly (`OPENCODE_MODELS_DEV_BUILD_STEPS`); update that tuple in the same commit when a bump changes them.
 
 ## Do Not
 
