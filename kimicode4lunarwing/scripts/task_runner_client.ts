@@ -42,6 +42,15 @@ export function bridgeRunnerSocketPath(): string {
  * is a socket owned by the task identity before connecting; if the task-uid
  * env pins are absent (host-side dev runs), the liveness/type check still
  * applies but ownership cannot be asserted.
+ *
+ * NC-10: lstat and connect are separate operations on a task-owned directory;
+ * the task uid can swap the path between them (TOCTOU). The gain is small (root
+ * connects to a socket of the task's choosing; the data path is already
+ * validated by NB-15 task_id checks). The durable shape is for root to own
+ * the listening socket — bind on the root side and pass the descriptor to the
+ * runner, or have the runner connect to a root-owned socket. That belongs to
+ * the two-container split (WI#454). Until then the verify-then-connect gap is
+ * accepted as Low.
  */
 export function verifyRunnerSocket(socketPath: string): void {
   const st = lstatSync(socketPath)
