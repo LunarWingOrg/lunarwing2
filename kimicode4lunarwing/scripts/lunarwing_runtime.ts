@@ -76,12 +76,32 @@ export function bearerTokenMatches(header: string | undefined, expected: string)
 }
 
 export function serializeEnvelopeWithinLimit(envelope: Envelope, maxBytes: number): string {
-  const limited: Envelope = { ...envelope, payload: { ...envelope.payload } }
+  return serializeFrameWithinLimit(envelope as unknown as Record<string, unknown>, "payload", maxBytes, "WebSocket envelope")
+}
+
+/**
+ * Serializes `frame` as one JSON text of at most `maxBytes` UTF-8 bytes by
+ * truncating, in order, the `output`, `delta` and `error` strings of the
+ * nested record `frame[payloadKey]` (each to the longest UTF-8-safe prefix
+ * that fits). The hub envelope and the task-runner socket lines share this
+ * one truncation rule, so a delegated result reaches the hub exactly as a
+ * local one does (NL-2, !1873 run 200).
+ */
+export function serializeFrameWithinLimit(
+  frame: Record<string, unknown>,
+  payloadKey: string,
+  maxBytes: number,
+  label = "frame",
+): string {
+  const nested = frame[payloadKey]
+  const payload: Record<string, unknown> = isRecord(nested) ? { ...nested } : {}
+  const limited: Record<string, unknown> = { ...frame, [payloadKey]: isRecord(nested) ? payload : nested }
   let serialized = JSON.stringify(limited)
   if (utf8ByteLength(serialized) <= maxBytes) return serialized
+  if (!isRecord(nested)) throw new Error(`${label} exceeds ${maxBytes} bytes`)
 
   for (const field of ["output", "delta", "error"] as const) {
-    const value = limited.payload[field]
+    const value = payload[field]
     if (typeof value !== "string") continue
     let low = 0
     let high = utf8ByteLength(value)
@@ -89,7 +109,7 @@ export function serializeEnvelopeWithinLimit(envelope: Envelope, maxBytes: numbe
     while (low <= high) {
       const middle = Math.floor((low + high) / 2)
       const candidate = truncateUtf8(value, middle)
-      limited.payload[field] = candidate
+      payload[field] = candidate
       const encoded = JSON.stringify(limited)
       if (utf8ByteLength(encoded) <= maxBytes) {
         best = candidate
@@ -99,12 +119,41 @@ export function serializeEnvelopeWithinLimit(envelope: Envelope, maxBytes: numbe
         high = middle - 1
       }
     }
-    limited.payload[field] = best
+    payload[field] = best
     serialized = JSON.stringify(limited)
     if (utf8ByteLength(serialized) <= maxBytes) return serialized
   }
 
-  throw new Error(`WebSocket envelope exceeds ${maxBytes} bytes`)
+  throw new Error(`${label} exceeds ${maxBytes} bytes`)
+}
+
+/**
+ * WS_MAX_PAYLOAD_BYTES exactly as the bridge enforces it (default 1 MiB,
+ * 1 KiB..16 MiB, a malformed value is a startup error). The task runner and
+ * the bridge-side runner client read it too, so the runner socket's line
+ * caps follow the hub's envelope cap instead of a fixed 1 MiB (NL-8).
+ */
+export function wsMaxPayloadBytes(): number {
+  const raw = process.env.WS_MAX_PAYLOAD_BYTES
+  if (raw === undefined || raw === "") return 1_048_576
+  const value = /^\d+$/.test(raw) ? Number(raw) : Number.NaN
+  if (!Number.isSafeInteger(value) || value < 1_024 || value > 16_777_216) {
+    throw new Error("WS_MAX_PAYLOAD_BYTES must be an integer between 1024 and 16777216")
+  }
+  return value
+}
+
+/**
+ * Framing slack on top of the hub's envelope cap for one task-runner socket
+ * line: a `run` line re-serializes a hub-bounded request and adds the
+ * bridge's tool-proxy env; a `result` line wraps a result the bridge then
+ * re-serializes within the hub cap anyway.
+ */
+export const RUNNER_LINE_SLACK_BYTES = 65_536
+
+/** Byte cap for one task-runner socket line, in either direction (NL-2/NL-8). */
+export function runnerLineCapBytes(): number {
+  return wsMaxPayloadBytes() + RUNNER_LINE_SLACK_BYTES
 }
 
 // ── Message Types ─────────────────────────────────────────────────────────────

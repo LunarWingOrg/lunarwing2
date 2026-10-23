@@ -42,10 +42,46 @@ function kimiBin(): string {
 // the task (fail-closed): falling back to the bare name would send setpriv
 // down the child PATH — the very lookup this function exists to avoid (and,
 // after the NB-10 root-first reordering, one a prior task could have seeded).
-function taskKimiBin(): string {
+function taskKimiBin(enforceRootOwnership?: boolean): string {
   const bin = kimiBin()
   if (isAbsolute(bin)) return bin
-  return resolveFromBridgePath(bin)
+  return resolveFromBridgePath(bin, process.env.PATH, enforceRootOwnership)
+}
+
+/**
+ * WI#462 (NB-10, run-195 review): the task child's PATH carries the
+ * ROOT-OWNED directories first and the task uid's toolchain directories
+ * after, so whatever one task leaves in its writable directories (a planted
+ * `node`, a rewritten `python`) never shadows the image's copy for a LATER
+ * task's processes. One policy for both execution shapes: the setpriv drop
+ * (identity pinned) and the delegated task runner (NL-1, !1873 run 200).
+ */
+export const TASK_TOOLCHAIN_DIRS: readonly string[] = [
+  "/home/kimi/.cargo/bin",
+  "/usr/local/cargo/bin",
+  "/usr/local/go/bin",
+  "/home/kimi/go/bin",
+]
+
+export function taskChildPath(rootPath: string | undefined): string {
+  return `${rootPath ?? ""}:${TASK_TOOLCHAIN_DIRS.join(":")}`
+}
+
+/** Per-call execution options (WI#454 delegated runner). */
+export interface ExecuteTaskOptions {
+  /**
+   * NL-1 (!1873 run 200): set by the delegated task runner. The runner IS
+   * the task uid, so the identity branch (setpriv drop, WI#462 PATH order,
+   * WI#463 kimi lookup) never runs for it; this flag applies the same PATH
+   * and kimi-resolution policy without the drop.
+   */
+  delegatedRunner?: boolean
+  /**
+   * NL-3 (!1873 run 200): called with the CLI's pid right after the spawn.
+   * The CLI is spawned detached, so the pid is also its process-group id —
+   * the handle the bridge needs to reap a run whose runner died.
+   */
+  onSpawn?: (pid: number) => void
 }
 function kimiCodeHome(): string {
   return process.env.KIMI_CODE_HOME || ""
@@ -159,6 +195,7 @@ export async function executeTask(
   // AFTER request.context.environment so task-supplied env can never shadow
   // the proxy binding for the MCP shim.
   extraEnv?: Record<string, string>,
+  options?: ExecuteTaskOptions,
 ): Promise<void> {
   const startTime = Date.now()
   const timeoutMs = request.timeout_ms ?? DEFAULT_TIMEOUT_MS
@@ -380,9 +417,7 @@ export async function executeTask(
       // The bridge itself never resolves through this PATH (setpriv and
       // the kimi binary are resolved from the bridge PATH, below and via
       // taskKimiBin).
-      const taskToolchainPath =
-        `${env.PATH ?? ""}:/home/kimi/.cargo/bin:/usr/local/cargo/bin:/usr/local/go/bin:/home/kimi/go/bin`
-      env.PATH = taskToolchainPath
+      env.PATH = taskChildPath(env.PATH)
       // WI#400 LD-11/LP-6: setpriv comes from the bridge's OWN PATH (a bare
       // name would be looked up through the child env), and the loader
       // variables a task could supply are dropped before the still-root
@@ -394,6 +429,21 @@ export async function executeTask(
         )
       }
       spawnArgs = [...taskSetprivArgv(identity), taskKimiBin(), ...args]
+    } else if (options?.delegatedRunner) {
+      // NL-1 (!1873 run 200): the runner IS the task uid, so the branch
+      // above never ran for it, and a bare `kimi` resolved through the
+      // runner's inherited PATH, whose first entry was the task-owned
+      // ~/.cargo/bin: one task could plant a `kimi` (or a `node` for the
+      // CLI's env-node line) that every later task then ran. The same
+      // policy applies here without the drop: the CLI's PATH is the
+      // runner's own root-owned launcher PATH followed by the task
+      // toolchain dirs (WI#462 order), and a bare kimi resolves only to a
+      // root-owned file in a root-owned, non-group/world-writable directory
+      // of the RUNNER's PATH, failing the task when there is none (WI#463).
+      env.PATH = taskChildPath(env.PATH)
+      // The runner's listening-socket handoff (NL-7) is not task input.
+      delete env.LUNARWING_TASK_RUNNER_LISTEN_FD
+      spawnBin = taskKimiBin(true)
     }
 
     proc = spawn(spawnBin, spawnArgs, {
@@ -402,6 +452,13 @@ export async function executeTask(
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
     })
+    if (proc.pid !== undefined && options?.onSpawn) {
+      try {
+        options.onSpawn(proc.pid)
+      } catch (error) {
+        console.error("[kimi executor] onSpawn hook failed:", error)
+      }
+    }
     if (stopReason) killProc()
 
     await new Promise<void>((resolveTask, rejectTask) => {
