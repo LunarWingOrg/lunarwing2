@@ -1341,7 +1341,8 @@ was closed on 2026-10-20 after its re-pass (zero/non-numeric task ids are
 refused everywhere identities parse); what stays open is
 its real-worker acceptance on rebuilt images and the opencode2 lane's own
 migration, filed as **WI#449** together with the run-170 leftovers
-(LP-7, LP-11..LP-16), planned for v2.1.7.0. Filed late and planned for
+(LP-11..LP-16; LP-7 declined by the maintainer on 2026-10-22), planned for
+v2.1.7.0. Filed late and planned for
 v2.1.7.0, but live in this
 release: WI#440 (`generate_token` falls back to a predictable `date +%s`
 token when `od` is absent) and WI#441 (`resolve_protected_paths` degrades
