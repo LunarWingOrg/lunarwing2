@@ -301,3 +301,60 @@ test("NB-15: an unknown result status is rejected fail-closed", async () => {
     server.close()
   }
 })
+
+test("NC-6: a timed_out result status is accepted (protocol name, not 'timeout')", async () => {
+  // The protocol's TaskResult.status is 'success' | 'error' | 'cancelled' | 'timed_out'.
+  // The old allowlist used 'timeout' instead of 'timed_out', so every delegated
+  // run that hit its task timeout was rejected as 'unknown result status'.
+  const socketDir = scratch()
+  const { createServer } = await import("node:net")
+  const sockPath = join(socketDir, "timedout.sock")
+  const server = createServer((conn) => {
+    let buf = Buffer.alloc(0)
+    conn.on("data", (chunk: Buffer) => {
+      buf = Buffer.concat([buf, chunk])
+      if (!buf.includes(0x0a)) return
+      conn.write(JSON.stringify({ ok: true, op: "accepted", task_id: "t-1" }) + "\n")
+      conn.write(JSON.stringify({ op: "result", result: { task_id: "t-1", status: "timed_out", output: "partial work", duration_ms: 1500 } }) + "\n")
+      conn.end()
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(sockPath, resolve))
+  try {
+    const result = await delegateTaskToRunner(sockPath, taskRequest("x", { timeout_ms: 60_000 }), undefined, () => {})
+    assert.equal(result.status, "timed_out")
+    assert.equal(result.output, "partial work")
+  } finally {
+    server.close()
+  }
+})
+
+test("NC-8: a runner that accepts and closes without a result is rejected at once", async () => {
+  // Review run 196 NC-8 probe: a stand-in runner sends 'accepted' then drops
+  // the connection. Without a close handler, the client waited the full run
+  // deadline (task timeout + 60s, potentially hours) before rejecting.
+  const socketDir = scratch()
+  const { createServer } = await import("node:net")
+  const sockPath = join(socketDir, "died.sock")
+  const server = createServer((conn) => {
+    let buf = Buffer.alloc(0)
+    conn.on("data", (chunk: Buffer) => {
+      buf = Buffer.concat([buf, chunk])
+      if (!buf.includes(0x0a)) return
+      conn.write(JSON.stringify({ ok: true, op: "accepted", task_id: "t-1" }) + "\n")
+      conn.end()
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(sockPath, resolve))
+  try {
+    const start = Date.now()
+    await assert.rejects(
+      delegateTaskToRunner(sockPath, taskRequest("x", { timeout_ms: 60_000 }), undefined, () => {}),
+      /runner connection closed without a result/,
+    )
+    const elapsed = Date.now() - start
+    assert.ok(elapsed < 5000, `should reject within seconds, not wait the full deadline (took ${elapsed}ms)`)
+  } finally {
+    server.close()
+  }
+})
