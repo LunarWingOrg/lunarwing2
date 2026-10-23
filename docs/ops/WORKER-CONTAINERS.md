@@ -1461,6 +1461,30 @@ selection in `/etc/lunarwing/ports.json`. `build-tenant --with-<worker>` and the
 standalone build commands build shared images but do not select a worker for a
 tenant.
 
+**WI#456 runbook — kimi dispatch fails with `Connection refused (os error
+111)`, no kimi ERROR lines in daemon.log:** the kimi lane dies before the
+container listens whenever a tenant store still holds a pre-WI#400 kimi
+image (`USER 10002:10002`, or `USER unset`) while the rootful admin store
+has no rebuilt copy — `_ensure_tenant_image`'s admin-store-empty branch keeps
+the stale tenant copy in play, and `start_tenant_kimi`'s image-user guard
+(`ic/scripts/mt-admin-lib/09-worker-config.sh`) then `die`s loudly, leaving
+the daemon-side `[[sandbox.external_workers]]` route hot against a dead
+socket. Same class as the pebble WI#452. **Remediation:**
+`sudo ic/scripts/lunarwing-mt-admin.sh build-kimi-worker`, then
+`start-tenant <name>` (or `start-worker <name> kimi`) — image distribution to
+tenant stores plus the image-ID launch contract force-recreates the stale
+container on the next start. Verified end-to-end on temporary tenant
+`kimi93test` (2026-10-22, item 93): fresh image `USER 0:0` at CLI pin 2.3.0,
+container root with the setpriv task drop, WS handshake `101 Switching
+Protocols` with the scoped bearer (401 with a wrong one), `/ready` true —
+see `docs/ops/ITEM93_KIMI_WORKER_456.md`. The item also hardened the three
+2026-10-22 hunter findings: WI#461 (the rootful workspace chown walk is
+`if !`-guarded with a clean rc-1 refusal instead of a bare-command
+set-e/errexit hazard), WI#462 (the task-uid PATH ordering at the setpriv
+drop is comment-pinned as intentional), and WI#463 (a bare-name `kimi` in
+the drop argv now resolves through the bridge's own root-ownership-checked
+PATH; absolute `KIMI_BIN` overrides pass through unchanged).
+
 ### Headless permission contract (WI#195, WI#206)
 
 The Kimi worker runs every task through `kimi -p --output-format stream-json`,
