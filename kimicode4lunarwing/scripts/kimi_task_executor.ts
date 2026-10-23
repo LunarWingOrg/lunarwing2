@@ -8,6 +8,8 @@
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
 
+import { isAbsolute } from "node:path"
+
 import { dropLoaderEnv, resolveFromBridgePath, taskIdentity, taskSetprivArgv } from "./task_identity.js"
 import {
   buildTaskPrompt,
@@ -27,6 +29,23 @@ import { resolveWorkspacePath } from "./workspace_path.js"
 // time, which breaks per-task overrides (and tests that set env after import).
 function kimiBin(): string {
   return process.env.KIMI_BIN || "kimi"
+}
+// WI#463 (amended by NB-11, run-195 review): with the identity pinned (the
+// container bridge, running as root), a bare `kimi` in the setpriv argv is
+// resolved by the TASK-side PATH the executor is about to hand the child —
+// a resolution the task uid can plant a shim into even though setpriv execs
+// it after the drop. Resolve the bare name through the BRIDGE's own PATH
+// first (root-ownership-checked), the same treatment setpriv gets (WI#400
+// LD-11). An absolute KIMI_BIN — every operator/test override — is passed
+// through unchanged, preserving the host-side dev shape where no `kimi` is
+// installed on PATH at all. On the pinned path a failed bridge lookup FAILS
+// the task (fail-closed): falling back to the bare name would send setpriv
+// down the child PATH — the very lookup this function exists to avoid (and,
+// after the NB-10 root-first reordering, one a prior task could have seeded).
+function taskKimiBin(): string {
+  const bin = kimiBin()
+  if (isAbsolute(bin)) return bin
+  return resolveFromBridgePath(bin)
 }
 function kimiCodeHome(): string {
   return process.env.KIMI_CODE_HOME || ""
@@ -348,8 +367,21 @@ export async function executeTask(
       // WI#454/ME-1: the image PATH carries only root-owned directories (the
       // bridge runs as root and resolves through it), so the task uid's
       // toolchain directories are handed to the child here, at the drop.
+      // WI#462 (NB-10, run-195 review): the toolchain order is ROOT-OWNED
+      // dirs FIRST, task-uid-writable dirs after — the same ME-1 posture as
+      // the bridge PATH. The old task-first order was backwards: whatever
+      // one task left in its writable directories (a planted `node`, a
+      // rewritten `python`) is then used by LATER tasks' processes in the
+      // same container, including the kimi CLI's own interpreter lookup
+      // (its npm entry point starts with an env-node line). Task-owned
+      // names root does not ship (cargo/go toolchain dirs) still resolve
+      // from the task directories, so the toolchain keeps working —
+      // ordering only decides which copy wins when BOTH have the name.
+      // The bridge itself never resolves through this PATH (setpriv and
+      // the kimi binary are resolved from the bridge PATH, below and via
+      // taskKimiBin).
       const taskToolchainPath =
-        `/home/kimi/.cargo/bin:/usr/local/cargo/bin:/usr/local/go/bin:/home/kimi/go/bin:${env.PATH ?? ""}`
+        `${env.PATH ?? ""}:/home/kimi/.cargo/bin:/usr/local/cargo/bin:/usr/local/go/bin:/home/kimi/go/bin`
       env.PATH = taskToolchainPath
       // WI#400 LD-11/LP-6: setpriv comes from the bridge's OWN PATH (a bare
       // name would be looked up through the child env), and the loader
@@ -361,7 +393,7 @@ export async function executeTask(
           `[kimi executor] dropped task env entry ${key} for task ${request.task_id}: loader variables never reach the privilege drop (WI#400 LD-11)`
         )
       }
-      spawnArgs = [...taskSetprivArgv(identity), kimiBin(), ...args]
+      spawnArgs = [...taskSetprivArgv(identity), taskKimiBin(), ...args]
     }
 
     proc = spawn(spawnBin, spawnArgs, {
