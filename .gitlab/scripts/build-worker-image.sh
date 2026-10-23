@@ -231,19 +231,24 @@ metadata_digest() {
 # GitLab's 429 rate limit at the very last step — pipeline 5984 lost the
 # opencode, opencode2 and kimi candidates (and, by cascade, their scans) to
 # one such burst, and pipeline 6212 lost the kimi candidate to a sustained
-# 429 burst that outlasted the original 4-attempt/3-minute window. The build is
-# deterministic and the retry reuses the layer cache, so only the narrow
-# observed transient signature is retried; a genuine build failure exits on
-# the first attempt. The publication jobs keep their pinned `retry: 0` (no
-# blind whole-job re-run) — this retry fires only inside the job and only on
-# the rate-limit signature.
+# 429 burst that outlasted the original 4-attempt/3-minute window. Pipeline
+# 6252 lost the opencode and pebble candidates to a 429 burst that outlasted
+# even the 6-attempt/15-minute window (jobs 127943/127951 each used all six
+# push attempts over ~19 minutes). The build is deterministic and the retry
+# reuses the layer cache, so only the narrow observed transient signature is
+# retried; a genuine build failure exits on the first attempt. The
+# publication jobs keep their pinned `retry: 0` (no blind whole-job re-run)
+# — this retry fires only inside the job and only on the rate-limit signature.
 #
 # Exponential backoff with jitter desynchronizes concurrent worker pushes:
 # when kimi/opencode/opencode2 all hit the 429 at once, identical delays
 # would make them retry in lockstep and re-trip the rate limit together.
 # The PID-based jitter spreads them apart so each retry lands in a different
-# second, reducing the chance of a coordinated burst.
-_bwr_max_attempts=6
+# second, reducing the chance of a coordinated burst. The 8-attempt window
+# with a 45-second base and a 48-minute ceiling covers even sustained bursts.
+_bwr_max_attempts=8
+_bwr_base_delay=45
+_bwr_max_delay=2880
 push_attempt_log="$CI_PROJECT_DIR/.worker-push-attempt.log"
 push_attempt_rc="$CI_PROJECT_DIR/.worker-push-attempt.rc"
 
@@ -269,7 +274,10 @@ build_image_with_retry() {
         fi
         IFS= read -r _bwr_status < "$push_attempt_rc"
         if [ "$_bwr_attempt" -lt "$_bwr_max_attempts" ] && transient_push_failure; then
-            _bwr_base=$((30 * (1 << (_bwr_attempt - 1))))
+            _bwr_base=$((_bwr_base_delay * (1 << (_bwr_attempt - 1))))
+            if [ "$_bwr_base" -gt "$_bwr_max_delay" ]; then
+                _bwr_base=$_bwr_max_delay
+            fi
             _bwr_jitter=$(( ($$ % 15) + 1 ))
             _bwr_delay=$((_bwr_base + _bwr_jitter))
             echo "registry push attempt $_bwr_attempt/$_bwr_max_attempts hit a transient registry-auth error; retrying in ${_bwr_delay}s" >&2
