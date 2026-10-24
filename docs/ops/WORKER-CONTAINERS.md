@@ -179,9 +179,17 @@ section and "Launch identity (WI#422)" further down.
   credential handoff is active, and `KIMI_TASK_RUNNER=skip` is the
   explicit operator escape hatch for host-side dev runs.** The runner
   never sees the hub credential: the token file is root-only `0400` and
-  the token var was unset before the runner spawn. A dead runner socket
-  maps to an error `task_result` (the hub is never stranded) and every
-  delegation rejection surfaces as an error result.
+  the token var was unset before the runner spawn. That unset is now an
+  **enforced contract, not a convention** (WI#454): the runner is the
+  environment store for task code, so `main()` refuses to start when
+  `AGENT_AUTH_TOKEN` or `AGENT_AUTH_TOKEN_FILE` is present and non-empty in
+  its own environment (`presentCredentialKeys` / `startupRefusal`). The
+  credential gate runs before the uid gate, so a root launch that also
+  leaked the token reports the actionable configuration error rather than
+  the uid one, and the gate is pinned in both uid shapes (the image test
+  gate runs as root, where the uid gate would otherwise answer first). A
+  dead runner socket maps to an error `task_result` (the hub is never
+  stranded) and every delegation rejection surfaces as an error result.
   - **Wire and bounds.** The runner acknowledges acceptance
     (`{"op":"accepted"}`), reports the CLI's process group
     (`{"op":"spawned"}`), streams progress and ends with exactly one
