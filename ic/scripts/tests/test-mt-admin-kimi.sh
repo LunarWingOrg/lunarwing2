@@ -578,7 +578,6 @@ else
   command chmod 755 "$fixture" "$no4_root" "$no4_root/lunarwing"
   command chown nobody:nogroup "$no4_root/lunarwing" 2>/dev/null \
     || command chown nobody "$no4_root/lunarwing"
-  no4_real_sudo() { no4_sudo "$@"; }
   no4_orig_sudo="$(declare -f sudo)"
   no4_orig_lwroot="$(declare -f tenant_lw_root)"
   tenant_lw_root() { printf '%s/lunarwing\n' "$fixture/no4-home"; }
@@ -634,7 +633,6 @@ else
   eval "$no4_orig_sudo"
   eval "$no4_orig_lwroot"
   unset no4_orig_sudo no4_orig_lwroot no4_slot no4_rc1 no4_rc2 no4_rc3 no4_out3
-  unset -f no4_real_sudo
   chown() { CHOWN_CALL="$*"; }
   unset no4_root
 fi
