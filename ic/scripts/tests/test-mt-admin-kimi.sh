@@ -526,6 +526,70 @@ command mkdir -p "$fixture/home/lunarwing"
 command rm -rf -- "$wi453_real"
 unset wi453_real
 
+# NR-1 (run-206 review of !1887): if the leaf is swapped for a symlink
+# between the pre-cd path checks and `command cd -- "$workspace_dir"`, `cd`
+# follows the link. The post-cd `pwd -P` + `stat -c %u .` gate must refuse
+# before any chown or chmod runs, restore the caller's PWD, and leave the
+# decoy's mode and owner untouched.
+nr1_decoy="$fixture/nr1-decoy"
+command mkdir -p "$nr1_decoy"
+command chmod 700 "$nr1_decoy"
+command rm -rf -- "$fixture/home/lunarwing/kimi-workspace"
+stat() {
+  command stat "$@"
+  if [[ "${3:-}" == "$fixture/home/lunarwing" ]]; then
+    command rm -rf -- "$fixture/home/lunarwing/kimi-workspace"
+    command ln -s "$nr1_decoy" "$fixture/home/lunarwing/kimi-workspace"
+  fi
+}
+CHOWN_CALL=''
+nr1_saved_pwd="$PWD"
+nr1_rc=0
+nr1_out="$(prepare_worker_workspace root kimi 2>&1)" || nr1_rc=$?
+unset -f stat
+if [[ "$nr1_rc" -eq 1 && "$nr1_out" == *'redirected or changed owner on enter'* ]]; then
+  pass 'NR-1: post-check pre-cd symlink swap is refused on enter'
+else
+  fail "NR-1: post-check pre-cd symlink swap was not refused (rc $nr1_rc): $nr1_out"
+fi
+if [[ -z "$CHOWN_CALL" ]]; then
+  pass 'NR-1: post-cd refusal runs no chown'
+else
+  fail "NR-1: post-cd refusal ran chown: $CHOWN_CALL"
+fi
+if [[ "$(command stat -c %a "$nr1_decoy")" == 700 ]]; then
+  pass 'NR-1: decoy directory keeps its mode when pre-cd symlink swap is refused'
+else
+  fail "NR-1: decoy directory mode changed to $(command stat -c %a "$nr1_decoy")"
+fi
+if [[ "$PWD" == "$nr1_saved_pwd" ]]; then
+  pass 'NR-1: post-cd refusal restores caller PWD'
+else
+  fail "NR-1: post-cd refusal leaked PWD: $PWD != $nr1_saved_pwd"
+fi
+command rm -rf -- "$fixture/home/lunarwing/kimi-workspace" "$nr1_decoy"
+# Also pin the post-cd owner re-check (`stat -c %u .`) on its own when the
+# physical path still matches `$workspace_dir` (an in-place swap to a
+# foreign-owned plain directory between the pre-cd check and `cd`).
+stat() {
+  if [[ "${3:-}" == "." ]]; then
+    printf '10001\n'
+    return 0
+  fi
+  command stat "$@"
+}
+CHOWN_CALL=''
+nr1_rc=0
+nr1_out="$(prepare_worker_workspace root kimi 2>&1)" || nr1_rc=$?
+unset -f stat
+if [[ "$nr1_rc" -eq 1 && "$nr1_out" == *'redirected or changed owner on enter'* && -z "$CHOWN_CALL" ]]; then
+  pass 'NR-1: post-cd foreign-owner swap at same physical path is refused without chown'
+else
+  fail "NR-1: post-cd foreign-owner swap was not refused (rc $nr1_rc, chown='$CHOWN_CALL'): $nr1_out"
+fi
+command rm -rf -- "$fixture/home/lunarwing/kimi-workspace"
+unset nr1_decoy nr1_saved_pwd nr1_rc nr1_out
+
 # NO-4 (run-203 review of !1880): the pins above cannot see the rootful
 # defects because their tenant IS the invoking account, `sudo` runs fixture
 # commands directly and `chown` is a shell no-op — ownership never changes,
@@ -629,10 +693,63 @@ else
   else
     fail "NO-3: refused foreign leaf was chowned to $(command stat -c %u "$no4_root/lunarwing/kimi-workspace" 2>/dev/null)"
   fi
-  command rm -rf -- "$no4_root"
+  # NR-1 (run-206 review): tenant swaps the leaf in the window between the
+  # pre-cd checks and `cd` — (a) to a symlink targeting a root-owned decoy
+  # outside the tenant tree (pins `pwd -P`), and (b) in-place to a 10001-
+  # owned plain directory at the exact workspace path (pins `stat -c %u .`
+  # after `cd` when `pwd -P` still matches).
+  no4_decoy="$fixture/no4-decoy"
+  command mkdir -p "$no4_decoy"
+  printf 'root-secret\n' >"$no4_decoy/secret.txt"
+  command chown -R 0:0 "$no4_decoy"
+  command chmod 755 "$no4_decoy"
+  command rm -rf -- "$no4_root/lunarwing/kimi-workspace"
+  stat() {
+    command stat "$@"
+    if [[ "${3:-}" == "$no4_root/lunarwing" ]]; then
+      no4_sudo -u nobody rm -rf -- "$no4_root/lunarwing/kimi-workspace"
+      no4_sudo -u nobody ln -s "$no4_decoy" "$no4_root/lunarwing/kimi-workspace"
+    fi
+  }
+  no4_rc4=0
+  no4_out4="$(prepare_worker_workspace nobody kimi 2>&1)" || no4_rc4=$?
+  unset -f stat
+  if [[ "$no4_rc4" -eq 1 && "$no4_out4" == *'redirected or changed owner on enter'* ]]; then
+    pass 'NR-1 (rootful): tenant symlink swap before cd is refused'
+  else
+    fail "NR-1 (rootful): tenant symlink swap before cd was not refused (rc $no4_rc4): $no4_out4"
+  fi
+  if [[ "$(command stat -c '%u:%a' "$no4_decoy")" == "0:755" \
+      && "$(command stat -c %u "$no4_decoy/secret.txt")" == 0 ]]; then
+    pass 'NR-1 (rootful): root-owned decoy keeps owner 0 and mode 755'
+  else
+    fail "NR-1 (rootful): decoy altered: dir=$(command stat -c '%u:%a' "$no4_decoy") file=$(command stat -c %u "$no4_decoy/secret.txt")"
+  fi
+  no4_swap_foreign="$no4_root/lunarwing/swap-10001"
+  command mkdir -p "$no4_swap_foreign"
+  command chown 10001:10001 "$no4_swap_foreign"
+  command chmod 700 "$no4_swap_foreign"
+  command rm -rf -- "$no4_root/lunarwing/kimi-workspace"
+  stat() {
+    command stat "$@"
+    if [[ "${3:-}" == "$no4_root/lunarwing" ]]; then
+      no4_sudo -u nobody rm -rf -- "$no4_root/lunarwing/kimi-workspace"
+      no4_sudo -u nobody mv "$no4_swap_foreign" "$no4_root/lunarwing/kimi-workspace"
+    fi
+  }
+  no4_rc5=0
+  no4_out5="$(prepare_worker_workspace nobody kimi 2>&1)" || no4_rc5=$?
+  unset -f stat
+  if [[ "$no4_rc5" -eq 1 && "$no4_out5" == *'redirected or changed owner on enter'* \
+      && "$(command stat -c '%u:%a' "$no4_root/lunarwing/kimi-workspace")" == "10001:700" ]]; then
+    pass 'NR-1 (rootful): in-place foreign-dir swap before cd is refused with owner/mode intact'
+  else
+    fail "NR-1 (rootful): in-place foreign-dir swap not refused (rc $no4_rc5, $(command stat -c '%u:%a' "$no4_root/lunarwing/kimi-workspace" 2>/dev/null)): $no4_out5"
+  fi
+  command rm -rf -- "$no4_root" "$no4_decoy"
   eval "$no4_orig_sudo"
   eval "$no4_orig_lwroot"
-  unset no4_orig_sudo no4_orig_lwroot no4_slot no4_rc1 no4_rc2 no4_rc3 no4_out3
+  unset no4_orig_sudo no4_orig_lwroot no4_slot no4_decoy no4_swap_foreign no4_rc1 no4_rc2 no4_rc3 no4_rc4 no4_rc5 no4_out3 no4_out4 no4_out5
   chown() { CHOWN_CALL="$*"; }
   unset no4_root
 fi

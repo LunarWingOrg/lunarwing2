@@ -321,9 +321,11 @@ unbounded `chown -R` is gone. `prepare_worker_workspace`
 before anything is created behind the link), creates the directory AS the
 tenant, then enforces the leaf contract and, on rootful runtimes — which
 need the bind mount handed to the image uid — chowns it, bounded with
-`--no-dereference` so the recursive walk never follows a symlink. MI-3
-(run-186 review): the chown `cd`s into the directory first (preventing an
-ancestor swap between the checks and the walk), chowns only the top node
+`--no-dereference` so the recursive walk never follows a symlink. MI-3 (run-186 review) + NR-1/NR-2 (run-206 review): the rootful branch
+`cd`s into the directory to pin `.`, then verifies where it landed (`pwd -P`
+must equal `$workspace_dir` and `stat -c %u .` must still be one of the two
+accepted owners) before any chown or chmod runs, closing the swap window
+between the pre-`cd` path checks and `cd`; it then chowns only the top node
 on first creation (not `-R`, since the directory is empty), and when
 content exists, walks with `find -mindepth 1` skipping regular files with
 a link count above 1 (a tenant-planted hard link to an outside file keeps
@@ -348,16 +350,20 @@ rootful the tenant no longer owns the leaf after the chown, so
 itself, inside the verified `cd`, where `.` is the directory it already
 entered, so no symlink can be followed.
 
-Pins: the six workspace-symlink pins, the hard-link-skip pin, and the
-rootful real-chown block in `test-mt-admin-kimi.sh` — tenant `nobody`,
-real `chown`, real uid switch — which asserts calls 1 and 2 both succeed
-with the leaf at the container uid and mode 2770, and that a foreign-owned
-leaf renamed into the slot is refused with its ownership untouched. All
-mutation-verified (reverting to the old root `mkdir -p` + `chown -R` shape
-fails the symlink pins; restoring `tenant_chmod` on the rootful path or
-removing the two-owner gate fails the real-chown block). That block needs
-euid 0 plus a mapped uid 10001 and a working uid switch, so it self-skips
-with a named reason elsewhere (the dev VM runs it under `podman unshare`).
+Pins: the six workspace-symlink pins, the post-`cd` symlink/owner swap pins
+(NR-1), the hard-link-skip pin, and the rootful real-chown block in
+`test-mt-admin-kimi.sh` — tenant `nobody`, real `chown`, real uid switch —
+which asserts calls 1 and 2 both succeed with the leaf at the container uid
+and mode 2770, that a foreign-owned leaf renamed into the slot is refused
+with its ownership untouched, and that a tenant symlink or foreign-dir swap
+between the pre-`cd` checks and `cd` is refused on enter without touching
+the decoy's owner or mode. All mutation-verified (reverting to the old root
+`mkdir -p` + `chown -R` shape fails the symlink pins; restoring
+`tenant_chmod` on the rootful path, removing the two-owner gate, or
+dropping the post-`cd` `pwd -P`/`stat -c %u .` check fails the NR-1 and
+real-chown pins). That block needs euid 0 plus a mapped uid 10001 and a
+working uid switch, so it self-skips with a named reason elsewhere (the dev
+VM runs it under `podman unshare`).
 
 ## WebSocket message limits
 
