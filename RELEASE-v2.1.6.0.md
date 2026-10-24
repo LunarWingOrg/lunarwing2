@@ -1304,11 +1304,11 @@ External crates took MSRV-respecting semver-compatible updates across all
 syn 3.0.7, among others — tokio moved to 1.53.3 with the 2026-10-23
 advisory-db refresh), and `ic/vendor/` was regenerated — 1150
 directories: 1148 vendored crates plus the two pre-vendored libsignal path
-dependencies — with the rig-core patch restored and marker-verified. Five
+dependencies — with the rig-core patch restored and marker-verified. Six
 security upgrades landed late-cycle on top of the sweep (rustls 0.23.46;
 Wasmtime/WASI 36.0.18 then 36.0.19; the CVE-2026-111943 webpki root-store
-trio; the 2026-10-23 tokio/ctutils/clipboard-win set — see Crate Security
-Re-Audit). The
+trio; the 2026-10-23 tokio/ctutils/clipboard-win set; crypto-bigint 0.7.6
+on 2026-10-24 — see Crate Security Re-Audit). The
 `pebble4lunarwing/upstream/Cargo.lock` build-input pin was deliberately
 untouched by the sweep, then upgraded separately twice — for the rustls
 advisories and again for the webpki trio — with its Dockerfile digest
@@ -1434,8 +1434,9 @@ are recorded in the audit doc's 2026-10-16 follow-up.
    and installed WASM channels and tools; rebuild/reinstall all four
    channel and nine tool registry updates through the normal deployment
    path. The rustls 0.23.46, Wasmtime/WASI 36.0.19 (36.0.18's successor —
-   both Cranelift miscompilation fixes), and CVE-2026-111943 webpki
-   security fixes ship
+   both Cranelift miscompilation fixes), CVE-2026-111943 webpki,
+   2026-10-23 tokio/ctutils/clipboard-win, and 2026-10-24 crypto-bigint
+   0.7.6 security fixes ship
    in the daemon and XMPP bridge binaries — rebuild **and restart** both to
    deploy them.
 6. **Review cron worker authority.** Cron tick jobs draw from the new
