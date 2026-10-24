@@ -218,6 +218,30 @@ Evidence value: the fat pebble image's **C++ toolchain** works, `std::async`
 threading is available inside the task sandbox, and pebble drives a
 build → run → parse loop across a generated helper script.
 
+### pebble — task 2: Rust recursive-descent expression evaluator
+
+Job `9fedf119-0dcd-4704-ac31-e0a36120ad47`, `external:pebble`, completed.
+
+- `rustc 1.96.1 (31fca3adb 2026-06-26)`
+- `/workspace/pebble_rs/src/main.rs` — hand-written recursive-descent parser
+  (grammar `expr → term (('+'|'-') term)*`, `term → factor (('*'|'/') factor)*`,
+  `factor → ('+'|'-')* primary`, `primary → number | '(' expr ')'`), `f64`
+  arithmetic, no external crates, argv-or-stdin input, non-zero exit on parse
+  error. Built with `cargo build --release`.
+- Five required inputs, all correct:
+
+  | input | output | expected |
+  | --- | --- | --- |
+  | `2+3*4` | `14` | 14 (precedence) |
+  | `(2+3)*4` | `20` | 20 |
+  | `100/7` | `14.285714285714286` | f64 division |
+  | `((1+2)*(3+4))-5` | `16` | 16 |
+  | `2*(3+(4*5))` | `46` | 46 |
+
+Evidence value: the pebble lane's **Rust toolchain** works (same 1.96.1 pin as
+the kimi image), and the worker produced a genuinely non-trivial parser whose
+operator-precedence handling is proven by the `2+3*4 = 14` case.
+
 ## Findings
 
 (Filled in below.)
