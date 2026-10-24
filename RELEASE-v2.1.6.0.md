@@ -1412,7 +1412,7 @@ decision (bump or retire, planned for v2.1.7.0) is unchanged.
 
 **CI rate limits.** HTTP 429s from GitLab's registry auth (`/jwt/auth`)
 and from the `get_sources` repository fetch hit CI pipelines:
-worker-image pushes now retry the registry-auth 429 (up to four attempts,
+worker-image pushes now retry the registry-auth 429 (up to six attempts,
 `.gitlab/scripts/build-worker-image.sh`), and the worker-image Trivy scans
 retry the same narrow signature with minute-scale backoff (four attempts,
 fail-closed on a missing or non-numeric status file, `.gitlab/ci/containers.yml`;
