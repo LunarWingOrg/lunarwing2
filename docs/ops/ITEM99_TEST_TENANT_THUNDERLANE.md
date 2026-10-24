@@ -118,7 +118,45 @@ sudo bash ic/scripts/lunarwing-mt-admin.sh build-tenant thunderlane \
 
 ## Worker task exercise
 
-(Filled in below.)
+Driven through the real path: gateway chat (`POST /api/chat/send`) → agent LLM
+loop → `create_job` tool → **approval gate** → `/api/chat/approval`
+(`action=always`) → resume → orchestrator on-demand WS dial → worker bridge →
+container executor → `job_events` → assistant reply.
+
+> **Operational note (found on the first dispatch):** the approval POST must
+> carry `thread_id`. Without it the daemon logs
+> `engine v2: approval matched no engine gate; falling through to legacy path`
+> with `scope="none"`, clears nothing, and the turn parks as `Failed` with the
+> gate still pending. Supply the owning `thread_id` and the same call clears
+> the gate and resumes the turn. This is worth a follow-up work item: the
+> handler already has `ApprovalRequest.thread_id` but does not warn at the API
+> layer when it is absent, so a caller gets `202 accepted` for a no-op.
+> Also observed: after that no-op the original thread stopped accepting new
+> turns (`/api/chat/history` showed no new turn), so a fresh
+> `POST /api/chat/thread/new` thread was used for the remaining dispatches.
+
+### kimi — task 1: memoized Fibonacci CLI (Rust)
+
+Job `646bf782-cc67-4175-9d7d-0f870a2b7cf2`, `job_mode`
+`external:kimi`, `created → running → completed` in **61 s**.
+
+Worker events (`/api/jobs/{id}/events`, 23 of them) show the full tool loop
+inside the container:
+
+- `[Write] {"path":"/workspace/kimi_calc/src/main.rs", ...}`
+- `[Bash] {"command":"cd /workspace/kimi_calc && cargo build 2>&1"}`
+  → `Compiling kimi_calc v0.1.0 … Finished `dev` profile … in 0.71s`
+- `[Bash]` running the three required cases →
+  `=== N=10 === 55`, `=== N=50 === 12586269025`,
+  `=== N=90 === 2880067194370816120` (all correct)
+- `[Bash]` inspecting the written cache file → 81+ `N=value` lines present
+- `result: "Completed: Everything works end-to-end…"` with the full report:
+  toolchain **rustc 1.96.1 (31fca3adb 2026-06-26) / cargo 1.96.1
+  (356927216 2026-06-26)**, the complete `main.rs` source, and the outputs.
+
+This is real evidence that the fat kimi image's Rust toolchain works inside
+the task sandbox (the item's "full toolchains" requirement), and that the
+worker round-trips file writes, builds, executions, and a long result body.
 
 ## Findings
 
