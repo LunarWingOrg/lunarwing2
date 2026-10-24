@@ -58,6 +58,7 @@ const NON_RETRYABLE_ERRNOS = new Set(["ENOTDIR", "ELOOP", "EACCES", "EPERM", "EI
 export function isNonRetryableBootstrapErrno(code: string | undefined): boolean {
   return code !== undefined && NON_RETRYABLE_ERRNOS.has(code)
 }
+
 export function resolveTaskWorkspace(
   context: { project_dir?: string; cron_tick?: unknown } | undefined,
   workspaceRoot: string,
