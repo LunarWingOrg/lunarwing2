@@ -564,14 +564,31 @@ Four security upgrades landed late in the cycle on top of the semver sweep:
   manifest-less upstream pin `pebble4lunarwing/upstream/Cargo.lock`
   (`verify_upstream_lock.py`) is unchanged. No new acceptances; the
   fourteen-ID policy total is unchanged, and `ic/vendor/` was refreshed.
+- **crypto-bigint 0.7.6** (2026-10-24, advisory-db `21d909e4`;
+  RUSTSEC-2026-0387). Timing variability in operations meant to be
+  constant-time: subtraction, zero counting, division, Montgomery
+  multiplication, `UintRef` equality, and `BoxedMontyForm::invert`. Fixed
+  in 0.7.6. Only two lockfiles carry the crate, through the SSH key and
+  signature path (russh, ssh-encoding, rsa, elliptic-curve, primefield,
+  rfc6979, crypto-primes): `ic/Cargo.lock` and the XMPP bridge's. The lock
+  edit is minimal — 0.7.5 `1a52aa3f` → 0.7.6 `6bb08299`, both checksums
+  checked against the crates.io index — because 0.7.6 has the same normal
+  dependency list and its only tightened requirement, `ctutils ^0.4.5`, is
+  already met by the 2026-10-23 upgrade; no other entry moves and no crate
+  is added. `ic/vendor/` was refreshed (only `ic/vendor/crypto-bigint`
+  changes, rig-core patch restored, vendor set matches the locks) and the
+  gate reports `advisories ok, bans ok, licenses ok, sources ok` on
+  `21d909e4`. No new acceptances; the fourteen-ID total is unchanged.
+  Deploy note: this is a binary-content fix, so the daemon and XMPP bridge
+  must be rebuilt **and restarted** with the rustls/Wasmtime/webpki set.
 
-Verification for all five is recorded in `docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md`
+Verification for all six is recorded in `docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md`
 (October 14 update, pipeline 5710 addendum, the October 16 zip-yank
 follow-up described under Dependency Sweep below, the October 17
 `unsound = "all"` widening follow-up described above, the two
 October 20 addenda — pipeline 6121 for Wasmtime 36.0.19, pipeline 6137
-for the emSign trio — and the 2026-10-23 tokio/ctutils/clipboard-win
-refresh).
+for the emSign trio — the 2026-10-23 tokio/ctutils/clipboard-win
+refresh, and the 2026-10-24 crypto-bigint refresh).
 
 ### Pending-Gate Lifecycle (WI#332)
 
