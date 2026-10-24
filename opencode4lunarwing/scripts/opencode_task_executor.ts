@@ -29,11 +29,13 @@ const OPENCODE_BASE_URL = `http://${OPENCODE_HOST}:${OPENCODE_PORT}`
 const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || "/workspace"
 
 /**
- * WI#454: the hub-handshake credential names. Only the bridge needs them and
- * task code is untrusted, so task-supplied `context.environment` may never
- * introduce either into the shared process env this lane runs tasks in.
+ * Task `context.environment` stays on the request only (NU-1): it is never
+ * merged into the bridge's process.env. The serve process is started by the
+ * entrypoint with its own scrubbed environment, so these values do not reach
+ * task code on this lane (WI#474); merging them here only changed shared
+ * bridge lazy reads. The v1 serve-log scrub uses the per-task values
+ * explicitly (run-92 FJ-6).
  */
-export const RESERVED_CREDENTIAL_KEYS = new Set(["AGENT_AUTH_TOKEN", "AGENT_AUTH_TOKEN_FILE"])
 
 const RETRY_PROMPT =
   "The previous model request failed transiently. Continue this task from the current session and " +
@@ -132,9 +134,10 @@ function secretEnvValues(env: Record<string, string | undefined>): string[] {
   return values
 }
 
-// Snapshot at module load: tasks inject their context.environment into
-// process.env, and a task value named TENSORZERO_API_KEY must not shadow the
-// boot value — the boot value is the one serve actually logs (run-92 FJ-6).
+// Snapshot at module load: task context.environment values stay on the
+// request (NU-1) and are scrubbed from the per-task map, so they never replace
+// the bridge's boot env — the boot value is the one serve actually logs
+// (run-92 FJ-6).
 const BOOT_SECRET_ENV_VALUES = secretEnvValues(process.env)
 
 function secretScrubValues(request: TaskRequest): string[] {
@@ -184,27 +187,6 @@ export async function executeTask(
   // the task started can belong to it — one serve process serves the whole
   // tenant container.
   const serveLogStart = serveLogStartSize()
-
-  const injectedKeys: string[] = []
-  const savedValues: Record<string, string | undefined> = {}
-  if (request.context?.environment) {
-    for (const [key, value] of Object.entries(request.context.environment)) {
-      // WI#454: this lane injects task env into the bridge's OWN process.env
-      // (the serve process and its bash tools inherit it), so a task naming
-      // the hub-handshake credential would hand itself — and every concurrent
-      // task — the bridge's token. Refused here, like the kimi and pebble
-      // executors' post-merge delete.
-      if (RESERVED_CREDENTIAL_KEYS.has(key)) {
-        console.warn(
-          `[opencode executor] dropped task-supplied env entry ${key} for task ${request.task_id}: reserved for the bridge handshake (WI#454)`,
-        )
-        continue
-      }
-      injectedKeys.push(key)
-      savedValues[key] = process.env[key]
-      process.env[key] = value
-    }
-  }
 
   const sdk = sdkOverride ?? createSdk(workDir)
   let sessionID: string | undefined
@@ -655,13 +637,6 @@ export async function executeTask(
     if (progressHeartbeat) clearInterval(progressHeartbeat)
     abortSignal?.removeEventListener("abort", handleAbort)
     closeEvents?.()
-    for (const key of injectedKeys) {
-      if (savedValues[key] === undefined) {
-        delete process.env[key]
-      } else {
-        process.env[key] = savedValues[key]
-      }
-    }
   }
 }
 

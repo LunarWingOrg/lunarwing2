@@ -37,11 +37,12 @@ const OPENCODE_BASE_URL = `http://${OPENCODE_HOST}:${OPENCODE_PORT}`
 const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || "/workspace"
 
 /**
- * WI#454: the hub-handshake credential names. Only the bridge needs them and
- * task code is untrusted, so task-supplied `context.environment` may never
- * introduce either into the shared process env this lane runs tasks in.
+ * Task `context.environment` stays on the request only (NU-1): it is never
+ * merged into the bridge's process.env. The serve process is started by the
+ * entrypoint with its own scrubbed environment, so these values do not reach
+ * task code on this lane (WI#474); merging them here only changed shared
+ * bridge lazy reads.
  */
-export const RESERVED_CREDENTIAL_KEYS = new Set(["AGENT_AUTH_TOKEN", "AGENT_AUTH_TOKEN_FILE"])
 
 const RETRY_PROMPT =
   "The previous model request failed transiently. Continue this task from the current " +
@@ -216,28 +217,6 @@ export async function executeTask(
   const retryDelayMs = providerRetryDelayMs()
   const heartbeatMs = progressHeartbeatMs()
   const abortTimeoutMs = sessionAbortTimeoutMs()
-
-  const injectedKeys: string[] = []
-  const savedValues: Record<string, string | undefined> = {}
-  if (request.context?.environment) {
-    for (const [key, value] of Object.entries(request.context.environment)) {
-      // WI#454: this lane injects task env into the bridge's OWN process.env
-      // (the serve process and its bash tools inherit it), so a task that
-      // named the hub-handshake credential would hand itself — and every
-      // concurrent task on this container — the bridge's token. The two
-      // reserved names are refused here for the same reason the kimi and
-      // pebble executors delete them after every env merge.
-      if (RESERVED_CREDENTIAL_KEYS.has(key)) {
-        console.warn(
-          `[opencode2 executor] dropped task-supplied env entry ${key} for task ${request.task_id}: reserved for the bridge handshake (WI#454)`,
-        )
-        continue
-      }
-      injectedKeys.push(key)
-      savedValues[key] = process.env[key]
-      process.env[key] = value
-    }
-  }
 
   const sdk = sdkOverride ?? createSdk()
   let sessionID: string | undefined
@@ -531,13 +510,6 @@ export async function executeTask(
     if (progressHeartbeat) clearInterval(progressHeartbeat)
     abortSignal?.removeEventListener("abort", handleAbort)
     closeEvents?.()
-    for (const key of injectedKeys) {
-      if (savedValues[key] === undefined) {
-        delete process.env[key]
-      } else {
-        process.env[key] = savedValues[key]
-      }
-    }
   }
 }
 

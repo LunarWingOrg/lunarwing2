@@ -46,16 +46,19 @@ Each lane enforces the strip at its task-process boundary:
   its own copy. The one-shot `cli` and `acp` modes exec the task process the
   same way. Pinned by the worker entrypoint harness, which asserts both
   directions (serve sees it absent, bridge sees it present) plus every
-  one-shot mode. Both executors also **refuse task-supplied** reserved names
-  (WI#454): these lanes inject `context.environment` into the bridge's own
-  `process.env`, so a task naming `AGENT_AUTH_TOKEN` or
-  `AGENT_AUTH_TOKEN_FILE` would have handed itself — and every concurrent
-  task on that container — the bridge's token. The key is dropped before
-  injection with the FY-5 warning (key and task id, never the value); on the
-  v1 lane this also stops a crafted key from widening the serve-log scrub set,
-  which reads back the injected values. Pinned per lane by the env sampled at
-  prompt time (the moment task code inherits it), so a mutant that injects and
-  restores in the `finally` still fails.
+  one-shot mode. Both executors keep task `context.environment` on the request
+  only (run-209 NU-1): it is **not** merged into the bridge's `process.env`, so
+  no agent-chosen grant name (`options.credential_grants[].env_var` at
+  `create_job`) can alter shared bridge lazy reads (task identity, serve auth,
+  retry/heartbeat/abort knobs, tool-proxy timeout) or inject the hub credential.
+  On these lanes the values do not reach task code at all — the serve process
+  is started by the entrypoint with its own scrubbed environment — so an
+  opencode credential grant is currently ineffective; that residual and its
+  live-tenant confirmation are tracked as **WI#474**. The v1 serve-log scrub
+  still redacts the request's per-task values explicitly (run-92 FJ-6), not by
+  reading them back from `process.env`. Pinned per lane by the env sampled at
+  prompt time, asserting that neither the reserved names nor an ordinary grant
+  key ever lands in the shared env.
 - **Pebble** — `spawn_pebble` rebuilds the child env via `env_clear()` +
   `strip_bridge_reserved_env` (everything else preserved: PATH, locale,
   `PEBBLE_*` provider variables) and drops task-supplied re-injections of the

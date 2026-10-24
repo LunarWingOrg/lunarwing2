@@ -43,7 +43,8 @@ function makeSdk(options: MockOptions = {}) {
   let v2Replies = 0
   let aborts = 0
   const promptArgs: unknown[] = []
-  // WI#454: the shared env at prompt time — the moment task code inherits it.
+  // NU-1: sample the shared bridge env at prompt time. Task grant entries
+  // must never land in it (the serve process does not inherit this env).
   const promptEnvSnapshots: Array<Record<string, string | undefined>> = []
   const signals: AbortSignal[] = []
   const captureSignal = (args: unknown[]) => {
@@ -1265,7 +1266,8 @@ assert.equal(errorCloseQueue.closed, true, "error path must close the queue")
 // bridge's secrets scrubbed. The fixture secret is built at runtime so no
 // literal in this file trips secret-detection (run-92 FJ-3), and both secret
 // channels are covered: the boot env value (module-load snapshot, FJ-6) and
-// a task context.environment value that shadows it in process.env.
+// a task context.environment value scrubbed from the per-task map (NU-1 —
+// it is never merged into process.env).
 {
   const GENERIC_MSG = "Unexpected server error. Check server logs for details."
   const FIXTURE_SECRET = ["fixture", "scrub", "value", "0042"].join("-")
@@ -1347,11 +1349,10 @@ console.log(JSON.stringify(results[0]?.error ?? ""))
   }
 }
 
-// WI#454: this lane injects task-supplied env into its OWN process.env (the
-// serve process and its bash tools inherit it), so a task naming the
-// hub-handshake credential would hand itself — and every concurrent task —
-// the bridge's token. Both reserved names are dropped and logged; ordinary
-// task env still lands and is restored.
+// NU-1: task grant entries (agent-chosen at create_job) are never merged into
+// the bridge's process.env — neither the reserved hub-credential names nor an
+// ordinary key may land in the shared env at prompt time. The v1 serve-log
+// scrub still reads the request's per-task values explicitly (FJ-6).
 {
   const savedToken = process.env.AGENT_AUTH_TOKEN
   const savedTokenFile = process.env.AGENT_AUTH_TOKEN_FILE
@@ -1378,18 +1379,17 @@ console.log(JSON.stringify(results[0]?.error ?? ""))
     assert.equal(envSdk.promptEnvSnapshots.length, 1)
     assert.deepEqual(
       envSdk.promptEnvSnapshots[0],
-      { AGENT_AUTH_TOKEN: "bridge-secret", AGENT_AUTH_TOKEN_FILE: undefined, LEGIT_TASK_VAR: "kept" },
-      "task code must see the bridge's own token unchanged, no handoff pointer, and its ordinary env",
+      { AGENT_AUTH_TOKEN: "bridge-secret", AGENT_AUTH_TOKEN_FILE: undefined, LEGIT_TASK_VAR: undefined },
+      "no task grant entry may land in the shared bridge env at prompt time",
     )
-    // The bridge's own credential survives, and ordinary keys are restored.
+    // The bridge's own credential survives, and no ordinary key is injected
+    // (and therefore nothing needs restoring afterward).
     assert.equal(process.env.AGENT_AUTH_TOKEN, "bridge-secret")
     assert.equal(process.env.AGENT_AUTH_TOKEN_FILE, undefined)
     assert.equal(process.env.LEGIT_TASK_VAR, undefined)
     const drops = warnings.filter((w) => w.includes("dropped task-supplied env entry"))
-    assert.equal(drops.length, 2, `expected one drop warning per reserved key, got ${JSON.stringify(warnings)}`)
-    assert.ok(drops.some((w) => w.includes("AGENT_AUTH_TOKEN_FILE")))
-    assert.ok(drops.every((w) => w.includes("task-env-reserved")), "each drop must name the task")
-    assert.ok(drops.every((w) => !w.includes("forged-by-task")), "never log the value")
+    assert.equal(drops.length, 0, `no env-drop path should remain, got ${JSON.stringify(warnings)}`)
+    assert.ok(warnings.every((w) => !w.includes("forged-by-task")), "never log the value")
   } finally {
     console.warn = savedWarn
     if (savedToken === undefined) delete process.env.AGENT_AUTH_TOKEN
