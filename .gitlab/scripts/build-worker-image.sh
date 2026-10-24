@@ -255,7 +255,17 @@ metadata_digest() {
 # would make them retry in lockstep and re-trip the rate limit together.
 # The PID-based jitter spreads them apart so each retry lands in a different
 # second, reducing the chance of a coordinated burst.
-_bwr_max_attempts=6
+#
+# Pipeline 6252's burst ran 19 minutes and outlasted the previous
+# 6-attempt/~15-minute window (opencode and pebble each burned all six, and
+# their scans then stopped at the "worker-image.env is missing" guard). Eight
+# attempts with a 45 s base and a ceiling put the worst case near
+# 45+90+180+360+720+1440+2880 ≈ 95 minutes of sleeping, which still sits well
+# inside the candidate job's 8 h timeout. The ceiling matters: an uncapped
+# doubling would make the last wait larger than the whole budget.
+_bwr_max_attempts=8
+_bwr_base_delay=45
+_bwr_ceiling_delay=2880
 push_attempt_log="$CI_PROJECT_DIR/.worker-push-attempt.log"
 push_attempt_rc="$CI_PROJECT_DIR/.worker-push-attempt.rc"
 
@@ -281,7 +291,8 @@ build_image_with_retry() {
         fi
         IFS= read -r _bwr_status < "$push_attempt_rc"
         if [ "$_bwr_attempt" -lt "$_bwr_max_attempts" ] && transient_push_failure; then
-            _bwr_base=$((30 * (1 << (_bwr_attempt - 1))))
+            _bwr_base=$((_bwr_base_delay * (1 << (_bwr_attempt - 1))))
+            [ "$_bwr_base" -gt "$_bwr_ceiling_delay" ] && _bwr_base=$_bwr_ceiling_delay
             _bwr_jitter=$(( ($$ % 15) + 1 ))
             _bwr_delay=$((_bwr_base + _bwr_jitter))
             echo "registry push attempt $_bwr_attempt/$_bwr_max_attempts hit a transient registry-auth error; retrying in ${_bwr_delay}s" >&2
