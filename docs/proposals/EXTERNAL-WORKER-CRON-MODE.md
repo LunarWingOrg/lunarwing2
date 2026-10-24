@@ -88,6 +88,10 @@ split into permanent (`Invalid workspace path for cron tick: …` — validation
 ENOTDIR/ELOOP, EACCES/EPERM, containment) and transient (`Transient workspace
 error for cron tick: …` — EMFILE/ENFILE/ENOMEM, ENOSPC/EDQUOT/EIO, swap-race
 ENOENT/EINVAL), and the host re-dispatches only the transient ones (DS-2).
+EINVAL is split by source rather than errno (run-204 NP-1): the swap race that
+`realpathSync`'s lstat→readlink pair raises stays transient so the supervisor
+re-walks it (DS-1), while the `fchown` onto an unmapped task uid — which no
+re-dispatch can ever fix — is permanent and is classified at that call.
 **Older images require the directory to pre-exist**
 (for example, create `missions/pr-digest` inside their workspace mount before
 enabling this example). Upgrade/recreate workers with the daemon changes;
