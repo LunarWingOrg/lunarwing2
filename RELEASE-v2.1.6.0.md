@@ -1412,7 +1412,10 @@ decision (bump or retire, planned for v2.1.7.0) is unchanged.
 **CI rate limits.** HTTP 429s from GitLab's registry auth (`/jwt/auth`)
 and from the `get_sources` repository fetch hit CI pipelines:
 worker-image pushes now retry the registry-auth 429 (up to four attempts,
-`.gitlab/scripts/build-worker-image.sh`), but `get_sources` 429s still
+`.gitlab/scripts/build-worker-image.sh`), and the worker-image Trivy scans
+retry the same narrow signature with minute-scale backoff (four attempts,
+fail-closed on a missing or non-numeric status file, `.gitlab/ci/containers.yml`;
+item 28's NB-4), but `get_sources` 429s still
 need a manual job retry (most recently the `shellcheck` job on
 release-target pipeline 6002), and no work item owns the rate limits. The
 WI#375 DS-1 cron-bootstrap race tests no longer fail when a loaded runner
