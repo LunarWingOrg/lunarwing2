@@ -314,28 +314,50 @@ declares `PEBBLE_TASK_UID=inherit` instead of a split.
 
 **Host-side workspace prep (WI#453, the WI#446 closeout):** the
 kimi/opencode/opencode2 workspace directories live inside the
-tenant-controlled `~/lunarwing` tree, so mt-admin never creates or chowns
-them as root anymore. `prepare_worker_workspace`
+tenant-controlled `~/lunarwing` tree, so the historical root `mkdir -p` +
+unbounded `chown -R` is gone. `prepare_worker_workspace`
 (`ic/scripts/mt-admin-lib/09-worker-config.sh`) runs the
 `darkirc_path_components_safe` walk FIRST (a symlinked ancestor refuses
 before anything is created behind the link), creates the directory AS the
-tenant, refuses a symlinked or foreign-owned leaf (ownership checked
-against the tenant root, the pebble posture), and only then — on rootful
-runtimes, which need the bind mount handed to the image uid — chowns it,
-bounded with `--no-dereference` so the recursive walk never follows a
-symlink. MI-3 (run-186 review): the chown `cd`s into the directory first
-(preventing an ancestor swap between the checks and the walk), chowns
-only the top node on first creation (not `-R`, since the directory is
-empty), and when content exists, walks with `find -mindepth 1` skipping
-regular files with a link count above 1 (a tenant-planted hard link to
-an outside file keeps its owner). Rootless keep-id maps the tenant
-identity, so no chown runs at
-all; `chmod 2770` goes through `tenant_chmod` (root has no business
-touching a mode under a tenant-writable parent, WI#390). Every caller
-(quadlet render and all three imperative lanes) makes a refusal fatal.
-Pins: the six workspace-symlink pins plus the hard-link-skip pin in
-`test-mt-admin-kimi.sh` (mutation-verified — reverting to the old root
-`mkdir -p` + `chown -R` shape fails exactly them).
+tenant, then enforces the leaf contract and, on rootful runtimes — which
+need the bind mount handed to the image uid — chowns it, bounded with
+`--no-dereference` so the recursive walk never follows a symlink. MI-3
+(run-186 review): the chown `cd`s into the directory first (preventing an
+ancestor swap between the checks and the walk), chowns only the top node
+on first creation (not `-R`, since the directory is empty), and when
+content exists, walks with `find -mindepth 1` skipping regular files with
+a link count above 1 (a tenant-planted hard link to an outside file keeps
+its owner). Every caller (quadlet render and all three imperative lanes)
+makes a refusal fatal.
+
+The leaf-uid gate accepts exactly two owners: the tenant root's uid
+(provisioned tenant-owned by `create_tenant_user`, and what every rootless
+leaf stays), and — on rootful hosts, where the chown legitimately hands
+the leaf to the container uid and never restores tenant ownership — this
+lane's own container uid, so a second call is idempotent. Any other owner
+is refused before the chown, which is what stops a tenant from renaming
+another lane's workspace (or any foreign-owned directory) into this slot:
+run-203 review of !1880 showed the !1880 fix had dropped that refusal
+entirely. Rootless keep-id maps the tenant identity, so no chown runs
+there and a foreign owner is always a spoof signal.
+
+Mode: rootless keeps `chmod 2770` through `tenant_chmod` (root has no
+business touching a mode under a tenant-writable parent, WI#390). On
+rootful the tenant no longer owns the leaf after the chown, so
+`tenant_chmod` would fail `EPERM` on the first call — root sets `2770`
+itself, inside the verified `cd`, where `.` is the directory it already
+entered, so no symlink can be followed.
+
+Pins: the six workspace-symlink pins, the hard-link-skip pin, and the
+rootful real-chown block in `test-mt-admin-kimi.sh` — tenant `nobody`,
+real `chown`, real uid switch — which asserts calls 1 and 2 both succeed
+with the leaf at the container uid and mode 2770, and that a foreign-owned
+leaf renamed into the slot is refused with its ownership untouched. All
+mutation-verified (reverting to the old root `mkdir -p` + `chown -R` shape
+fails the symlink pins; restoring `tenant_chmod` on the rootful path or
+removing the two-owner gate fails the real-chown block). That block needs
+euid 0 plus a mapped uid 10001 and a working uid switch, so it self-skips
+with a named reason elsewhere (the dev VM runs it under `podman unshare`).
 
 ## WebSocket message limits
 
