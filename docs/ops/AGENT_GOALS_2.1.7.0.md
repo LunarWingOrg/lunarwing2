@@ -17,6 +17,10 @@
 
 ```
 need to re-org set up this for 2.1.7.0 next
+and add these
+| Revamped LunarWing TUI REPLv3 utilizing OpenTUI, Multimodal input/output, and more | v2.1.7.0 |
+| Remaining polish items from massive changes introduced in `Tsuno` | v2.1.7.0 |
+| General Agent Loop Engine Polish | v2.1.7.0 |
 ```
 
 ## Phase 1 — Foundation (engine, crates & architecture)
