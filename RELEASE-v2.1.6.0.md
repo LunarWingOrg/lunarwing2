@@ -1111,7 +1111,7 @@ of being swallowed. The root reads and writes WI#390 did not convert
 sources) were converted by WI#423 (closed 2026-10-20), whose re-attempt
 also made every `resolve_worker_auth_token` caller fail closed; its
 follow-up WI#445 (the root study-notes sync trusting a tenant-chosen
-`LW2STUDYMCP_HOME`) is fixed in-tree, open for maintainer acceptance — both
+`LW2STUDYMCP_HOME`) is fixed in-tree and closed on 2026-10-20 — both
 root-side sync entrypoints (the hourly `sync-knowledge-sources` scan and
 `refresh-knowledge --sync-source`) now accept only the operator default or a
 path without `.`/`..` components whose deepest existing ancestor chain is
@@ -1120,7 +1120,7 @@ is skipped without aborting the hourly run, an existing checkout whose
 `origin` is not the operator repo is never pulled, and the worker containers
 render no Study Notes mount at all for an untrusted home, while WI#446
 (root mkdir/chown/unit writes through tenant-controlled `~/.config`) is
-fixed in-tree, open for maintainer acceptance — every systemd unit/Quadlet
+fixed in-tree and closed on 2026-10-21 — every systemd unit/Quadlet
 render (including the vision/voice fallback and Quadlet renderers), the
 WeeChat home creation, and the add-tenant env-dir chmod now create and
 write tenant-side through `tenant_mkdir_p` and the tenant-side atomic
