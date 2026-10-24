@@ -16,7 +16,7 @@ LunarWing v2.1.6.0 expands the platform's reach through external workers. The he
 
 The expansion is deliberate. Cron workers have their own authority domain; mission webhooks require usable secrets; HTTP tool surfaces are credential-redacted before reaching events, prompts, or summaries; bridge credentials are kept out of spawned task environments; and tenant-controlled proxy URLs are no longer shell-evaluated as root by OpenRC proxy units. The OpenRC migration is a required step for multi-tenant hosts. OpenCode gains an orchestrator control channel for follow-up prompts and a single final wrap-up turn.
 
-Operations and worker reliability grow alongside the new capabilities. Multi-tenant provisioning requires a real LLM endpoint instead of an unreachable fleet default, Pebble's image validates its toolchain anchors before promotion, and OpenCode 2 carries its worker-exposure controls. OpenRC migration checks distinguish unsafe units from healthy ones. All three external-worker applications are updated to current upstream versions: Kimi Code 2.3.1, OpenCode 1.19.4, and OpenCode 2.1.2. The Pebble upstream source revision is unchanged, while its reviewed dependency lock receives the security updates.
+Operations and worker reliability grow alongside the new capabilities. Multi-tenant provisioning requires a real LLM endpoint instead of an unreachable fleet default, Pebble's image validates its toolchain anchors before promotion, and OpenCode 2 carries its worker-exposure controls. OpenRC migration checks distinguish unsafe units from healthy ones. Two of the three external-worker applications move to newer upstream releases: Kimi Code 2.3.0 (from 2.1.1) and OpenCode 2 v2.1.2 (from v2.0.24); OpenCode v1 stays at v1.18.25. The Pebble upstream source revision is unchanged, while its reviewed dependency lock receives the security updates.
 
 The release also completes a broad dependency sweep and security re-audit, including rustls 0.23.46, Wasmtime/WASI 36.0.19, the webpki root-store fixes for CVE-2026-111943, the October 23 tokio/ctutils/clipboard-win updates, and crypto-bigint 0.7.6. A breaking change places Turso/libSQL remote-replica sync behind the non-default `libsql-remote-replica` Cargo feature (see Upgrade Notes).
 
@@ -113,7 +113,7 @@ See the [v2.1.5.0 release notes](docs/releases/RELEASE-v2.1.5.0.md) for the prev
   their `mission_update` is allowlist-bound to steering fields — a mission
   thread can no longer rename missions, wire one to a webhook with a
   model-chosen secret, or zero its daily budget.
-- **Kimi Code advances with its upstream (WI#411, WI#412, WI#454).** The worker is updated to `@moonshot-ai/kimi-code` 2.3.1. Task environments scrub `KIMI_CODE_TRUST_WORKSPACE`, the FrontierCODEK lane pins `max_output_size = 131072`, and task execution is delegated through the worker's task-runner process. The image contract checks run against the actual CLI during image builds.
+- **Kimi Code advances with its upstream (WI#411, WI#412, WI#454).** The worker is updated to `@moonshot-ai/kimi-code` 2.3.0 (from 2.1.1 in v2.1.5.0). Task environments scrub `KIMI_CODE_TRUST_WORKSPACE`, the FrontierCODEK lane pins `max_output_size = 131072`, and task execution is delegated through the worker's task-runner process. The image contract checks run against the actual CLI during image builds.
 
 
 ## Compatibility
@@ -128,7 +128,7 @@ See the [v2.1.5.0 release notes](docs/releases/RELEASE-v2.1.5.0.md) for the prev
 | Bundled skills | Seven product skills, unchanged; no skill migration |
 | Channel registry | darkirc 0.1.12, multica 0.1.15, weechat 0.2.13, xmpp 0.1.18 |
 | Tool registry | cavepony-tool 0.4.6, gitlab 0.1.9, gotify 0.1.3, llm-context 0.1.4, multica-bridge 0.1.5, ssh 0.1.4, vision-analyze 0.1.6, voice-transcribe 0.1.4, web-search 0.2.5 |
-| External workers | kimi-code `2.3.1`, opencode `v1.19.4` (models.dev catalog pinned in-image), opencode2 `v2.1.2` (OpenTunnel compiled out; worker-exposure controls included), Pebble `2d0f3786…` (upstream ref unchanged; reviewed lock includes the current rustls and webpki security updates) |
+| External workers | kimi-code `2.3.0` (bumped from 2.1.1), opencode `v1.18.25` (unchanged from v2.1.5.0; models.dev catalog pinned in-image), opencode2 `v2.1.2` (bumped from v2.0.24; OpenTunnel compiled out; worker-exposure controls included), Pebble `2d0f3786…` (upstream ref unchanged; reviewed lock includes the current rustls and webpki security updates). The upstream releases published on 2026-10-22 and 2026-10-23 (kimi-code 2.3.1, opencode v1.19.4, opencode2 v2.1.4) are not in this release; that bump is tracked in WI#468 |
 | Cargo features | New non-default `libsql-remote-replica` feature gates Turso sync (breaking — see Upgrade Notes) |
 
 Registry version bumps require rebuilding/reinstalling the affected WASM
@@ -766,7 +766,7 @@ log. The lookup is bounded to an 8 KiB window from task start, accepts only
 and scrubs known secret values before the log tail enters the job record. The
 log is opened with `O_RDONLY|O_NOFOLLOW|O_NONBLOCK`, so a FIFO, symlink, or
 renamed-over directory cannot wedge or redirect the read. The OpenCode v1
-worker is updated to upstream `v1.19.4`.
+worker stays at upstream `v1.18.25` in this release.
 
 ### Worker Credential Environment Hygiene (WI#373, WI#400)
 
@@ -968,9 +968,9 @@ home directories. Workspace creation and ownership changes avoid following
 tenant-planted symlinks, including during rootful Pebble launch (WIs #390,
 #416, #422, #423, #445, #446, #450, #451, #453, and #461).
 
-### Kimi Code 2.3.1 and Environment/Config Pins (WI#411, WI#412)
+### Kimi Code 2.3.0 and Environment/Config Pins (WI#411, WI#412)
 
-The Kimi external worker is updated to `@moonshot-ai/kimi-code` **2.3.1**.
+The Kimi external worker is updated to `@moonshot-ai/kimi-code` **2.3.0** (from 2.1.1).
 The image contract covers stream-JSON print mode, option conflicts, the
 WI#206 `PreToolUse` guard table, and the WI#324 MCP handshake against the
 real CLI. The executor and entrypoint scrub `KIMI_CODE_TRUST_WORKSPACE` from
@@ -1007,16 +1007,16 @@ during the image build. The snapshot is strict-JSON validated, its digest is
 pinned as `MODELS_DEV_SNAPSHOT_SHA256`, and both the snapshot and build inputs
 are included in `worker-inputs.sha256`. The image build verifies the hash and
 checks that upstream still consumes the configured snapshot instead of
-silently fetching live data. The OpenCode worker is updated to upstream
-`v1.19.4`.
+silently fetching live data. The OpenCode worker stays at upstream
+`v1.18.25`; the snapshot pin applies to that build.
 
 ### Worker Image Rollout and Traceable mt-admin Builds
 
 Rebuilt worker images now reach running tenants on both systemd and OpenRC.
 The worker-container launch contract hash includes the image ID, so the first
 `start-tenant` or `restart-tenant` after upgrading mt-admin recreates each
-worker container once. Current upstream pins are Kimi Code `2.3.1`, OpenCode
-v1 `v1.19.4`, and OpenCode 2 `v2.1.2`; Pebble's upstream source revision is
+worker container once. The pins in this release are Kimi Code `2.3.0`, OpenCode
+v1 `v1.18.25`, and OpenCode 2 `v2.1.2`; Pebble's upstream source revision is
 unchanged, with its reviewed dependency lock refreshed for the security
 updates in this release. mt-admin builds stamp
 `org.opencontainers.image.revision` with the checkout HEAD, `-dirty`, or
@@ -1053,8 +1053,10 @@ on 2026-10-24 — see Crate Security Re-Audit). The
 `pebble4lunarwing/upstream/Cargo.lock` build-input pin was deliberately
 untouched by the sweep, then upgraded separately twice — for the rustls
 advisories and again for the webpki trio — with its Dockerfile digest
-refreshed each time. External worker pins are current upstream versions: Kimi Code 2.3.1,
-OpenCode v1.19.4, and OpenCode 2.1.2. Pebble's upstream source ref is
+refreshed each time. External worker pins in this release are Kimi Code 2.3.0,
+OpenCode v1.18.25, and OpenCode 2 v2.1.2; the upstream releases of 2026-10-22
+and 2026-10-23 (kimi-code 2.3.1, opencode v1.19.4, opencode2 v2.1.4) are
+deferred to WI#468. Pebble's upstream source ref is
 unchanged, with its reviewed dependency lock updated for the current security
 advisories. OpenTunnel remains compiled out in the OpenCode 2 worker; see
 Worker Exposure Policy. All four worker Dockerfiles and
@@ -1128,11 +1130,11 @@ are recorded in the audit doc's 2026-10-16 follow-up.
    worker-specific configuration. OpenCode v1 includes the pinned models.dev
    snapshot; OpenCode 2 includes its SDK-surface gate and exposure controls;
    Pebble includes the tool-proxy MCP shim and reviewed dependency-lock
-   security updates; Kimi includes the 2.3.1 CLI contract, configuration pins,
+   security updates; Kimi includes the 2.3.0 CLI contract, configuration pins,
    and task-runner delegation.
 
-   The current upstream pins are Kimi Code **2.3.1**, OpenCode v1 **1.19.4**,
-   and OpenCode 2 **2.1.2**. All four worker images use the
+   The worker pins in this release are Kimi Code **2.3.0**, OpenCode v1 **v1.18.25**,
+   and OpenCode 2 **v2.1.2**. All four worker images use the
    `20261017T082437Z` Debian snapshot, including the fixed Perl packages
    covered by WI#361. Preserve OpenCode 2 state before its first boot after
    changing image versions because upstream may migrate its database.
