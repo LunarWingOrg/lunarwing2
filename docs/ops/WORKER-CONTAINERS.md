@@ -122,6 +122,28 @@ section and "Launch identity (WI#422)" further down.
   follow-up #11230). The ruling states the decision and no reason, so none
   is recorded here; treat the absence as settled and do not propose LP-7
   again without a fresh ruling.
+- **Run-170 leftovers landed (WI#449, item 86).** LP-11 pins the kimi/pebble
+  image-user refusals and the opencode/pebble Quadlet `UserNS=` keep-id
+  lines; LP-12 makes the LD-11 absolute-path pins failable; LP-13 is a fix —
+  the socket handoff now chmods before it chowns, so the mode change runs
+  while root still owns the socket and needs no `CAP_FOWNER` (the old
+  lchown-first order made the handoff depend on a droppable capability);
+  LP-14 restricts the `setpriv` resolver to absolute `PATH` entries and
+  extends the loader denylist to glibc's full unsafe-environment list
+  (`GCONV_PATH`/`GLIBC_TUNABLES`/`LOCPATH`/`NLSPATH`/`HOSTALIASES`/
+  `RES_OPTIONS`/`LOCALDOMAIN`/`TZDIR`/`MALLOC_TRACE`, matching in pebble's
+  `is_loader_env_key` and kimi's `dropLoaderEnv` — that parity is ME-3);
+  LP-15 learns the bridge uid from the `Uid:` line of `/proc/self/status`
+  rather than the owner of `/proc/self`, which reads as root for a
+  non-dumpable process; LP-16 makes the *unmapped-task-uid* `EINVAL` from
+  `fchown` permanent, classified at the `fchown` call itself in the kimi and
+  opencode lanes, because no re-dispatch can map the id. The swap-race
+  `EINVAL` that `realpathSync`'s lstat→readlink pair produces stays
+  transient: run-204 NP-1 showed a blanket `EINVAL` rule abandoned a
+  deliberate DS-2 retry, so the classification sits at the errno's source.
+  LP-7 stays declined per #11230.
+  The opencode2 lane's own credential-isolation migration remains WI#454's
+  (the non-root split, item 91) and is not part of these leftovers.
 - **Root-resolved commands come from root-owned PATH entries only
   (WI#454/ME-1).** The root-launcher images (kimi, opencode) carry NO
   task-owned directory in the image-wide `ENV PATH` — the task uid's
