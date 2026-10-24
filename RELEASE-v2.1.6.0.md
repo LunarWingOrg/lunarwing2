@@ -550,7 +550,9 @@ Four security upgrades landed late in the cycle on top of the semver sweep:
   `unsound = "all"` scope (`ic/deny.toml`, WI#360) surfaces as a hard
   error. Each is fixed by semver-compatible upgrade: tokio 1.53.3 across
   `ic`, the XMPP bridge, `unix-socket-client`, `pebble`,
-  `pebble4lunarwing`, and both sidecars; ctutils 0.4.5 in `ic` and the
+  `pebble4lunarwing`, both sidecars, and both
+  `git-lunarwing-unix-socket-client` repos (the repo-root one and the
+  `replv2git/` copy); ctutils 0.4.5 in `ic` and the
   XMPP bridge; clipboard-win 5.4.3 in `ic`, the XMPP bridge, and `pebble`.
   The locks were bumped minimally — a plain `cargo update` also re-picked
   unrelated `windows-sys`/`socket2` edges (quinn onto socket2 0.5.10), so
