@@ -528,4 +528,97 @@ missing a routing target: broadcast() requires a thread_id on the response`
 (16:38:39). The gate reply is dropped instead of reaching the owning thread;
 cosmetic for these tests but worth a note alongside F2/F5.
 
-_(further tasks appended below)_
+### pebble — complex task 4: weighted interval scheduling with brute-force validation
+
+Job `bea2e06c-72d6-4b22-bb44-0c470f238b0a` (`external:pebble`), created
+17:04:46, completed 17:06:47 (**121 s**). `/workspace/pebble_item101_algo`
+(`main.cpp`, `Makefile`, binary `wis`), built with
+`g++ -O2 -std=c++17 -Wall -Wextra` on g++ 12.2.0.
+
+- **240 randomized instances** (N=1..12, times 0..30, weights 1..50, fixed
+  seed) cross-validated DP optimum against exhaustive subset enumeration:
+  **0 mismatches**.
+- Edge cases 3/3: empty input → 0; touching endpoints both selectable;
+  identical overlapping intervals choose only the heavier.
+- Scaling: N=2000 DP time 0 ms (opt weight guard 11462).
+- Independently re-verified: recompiled `main.cpp` from scratch and re-ran the
+  self-test in the container — same 240/0, 3/3 and N=2000 guard value 11462.
+
+## Job inventory (all real dispatches on this tenant)
+
+| job | lane | outcome | created → terminal | elapsed |
+| --- | --- | --- | --- | --- |
+| `da98363c` smoke (markers + versions) | kimi | completed | 15:54:29 → 15:55:38 | 69 s |
+| `7ae2cc44` Rust thread-pool evaluator | kimi | cancelled (F4/F9; partial work verified) | 15:59:08 → 16:56:48 | — |
+| `85d1a0b4` duplicate of the above | kimi | failed — workspace lock (F3) | 16:00:53 | 0 s |
+| `4b44ed5a` C++17 parallel statistics | pebble | completed | 16:03:27 → 16:06:29 | 182 s |
+| `0170b460` duplicate of the above | pebble | failed — workspace lock (F3) | 16:04:01 | 0 s |
+| `ab3ca985` Go inverted index + HTTP | pebble | completed | 16:14:47 → 16:18:35 | 228 s |
+| `e5c68890` re-dispatch of the above | pebble | failed — workspace lock (F5) | 16:17:06 | 0 s |
+| `39140d71` Rust expression evaluator | pebble | completed | 16:22:58 → 16:24:46 | 108 s |
+| `352b152e` Go HTTP server | kimi | completed | 16:30:53 → 16:34:36 | 223 s |
+| `0b101865` Python log-analysis pipeline | kimi | completed | 16:46:35 → 16:56:05 | 570 s |
+| `bea2e06c` weighted interval scheduling | pebble | completed | 17:04:46 → 17:06:47 | 121 s |
+
+**7 of 11 jobs completed successfully** (3 kimi + 4 pebble), 3 failed as
+intended by the workspace lock, 1 cancelled after an upstream stall. Every
+completed job's artifacts were **independently re-executed** in the worker
+container (`podman exec`) and matched the worker's own report — no result in
+this document rests on the model's say-so alone.
+
+## Landed-changes exercise matrix
+
+| Area | Evidence on silverzoom |
+| --- | --- |
+| Full toolchains (the item's explicit ask) | fat images; in-container rustc/cargo 1.96.1, go 1.24.3, g++ 12.2.0, python3 3.11.2 all exercised on both lanes (kimi: Rust/Go/Python; pebble: C++/Go/Rust/C++ algorithms) |
+| WI#330 worker URL inheritance | `KIMI_BASE_URL` = tenant endpoint with `KIMI_BASE_URL_SOURCE=inherited`; real jobs called it successfully |
+| kimi worker lane (WI#324/WI#456) | fat image, kimi-code 2.3.0, delegated task runner (`success (…ms, delegated)` in bridge log), 3 completed jobs |
+| pebble worker lane | fat image, `openai/gpt-5.2` with operator-supplied `NANOGPT_API_KEY`, 4 completed jobs |
+| WI#357 workers never self-expose | `worker-listeners silverzoom` → `worker listener audit: clean`; host-loopback-only mappings for 10028/30020 + in-container 8443 |
+| Approval gate / pending state | `create_job` parked at `approval` and resumed with `action=always` **plus the owning `thread_id`**; later `create_job` calls auto-approved |
+| Workspace lock / concurrency | duplicate dispatches refused with an actionable error (F3); per-path semantics confirmed in code (F8) |
+| Stuck-job self-repair | **false-stuck on slow external jobs + unbounded warning loop + cancel does not clear it (F9/F11)** |
+| Engine v2 turn lifecycle | turns complete on simple prompts; long code-heavy delegation prompts can hit `repl_argument_corruption` (F5) and may still dispatch afterwards |
+| Job cancel API | `/api/jobs/{id}/cancel` → 200 and `state: cancelled` (but see F11) |
+| WASM channel/tool suite | 12 extensions active (9 tools + 3 channels), built and installed by `build-tenant --with-wasm` |
+| Host health pipeline (systemd user units) | `lunarwing-mt-health.service` runs green every 5 min (`status=0/SUCCESS`, 17:00:08) and covers silverzoom |
+| LunarVision sidecar | healthy on registry ports 20025/20026 (no hardcoded 8088) |
+
+## Findings index
+
+| id | severity | summary |
+| --- | --- | --- |
+| F1 | API ergonomics | `/api/chat/history` marks in-flight/gate-parked turns `Failed`; use `/api/chat/threads` state |
+| F2 | carried (item 99) | approvals need the owning `thread_id` |
+| F3 | behaviour (correct) | duplicate dispatch refused by the workspace lock |
+| F4 | upstream latency + observability | 508 s time-to-first-token on a large worker request; only a 2-minute heartbeat visible |
+| F5 | gateway model output | `repl_argument_corruption` (`nested_fence`) on long delegation prompts; the turn may still dispatch later, so wait for the job id |
+| F6 | observability | `job_mode` only in `/api/jobs/{id}`, not the list |
+| F7 | minor environment | `ps` unusable inside the pebble task sandbox (`fatal library error, lookup self`) |
+| F8 | semantics | workspace lock is per-path overlap, not per-lane; concurrent jobs on one lane are possible |
+| F9 | **defect** | self-repair declares slow external jobs stuck, burns 3 repairs, then warns "Manual intervention needed" every 60 s forever |
+| F10 | minor routing | expired-gate reply dropped: `broadcast() requires a thread_id on the response` |
+| F11 | **defect** | external-job cancel updates the DB but not `ContextManager`, so the F9 loop continues after cancellation |
+| F12 | methodology | focused jobs succeed; one oversized job stalled — size acceptance tasks accordingly |
+
+## Hand-off / what is left running
+
+- **Tenant `silverzoom` is left running** as required: daemon, PostgreSQL,
+  xmpp-bridge, weechat + adapter, LunarVision, `lunarwing-pebble-silverzoom`
+  (:10028) and `lunarwing-kimi-silverzoom` (:30020) all `active` under the
+  tenant's systemd user manager; gateway `:10020/api/health` healthy.
+  Verified with `mt-admin status silverzoom` after the last job (17:00+).
+- Ports 10020-10029 (+ extended/kimi blocks) remain allocated in
+  `/etc/lunarwing/ports.json`; no teardown was run and no animal name was used.
+- The only non-terminal job is `7ae2cc44`, cancelled via the API (F11 notes the
+  reaper caveat). The 3 lock-refused duplicates are `failed` by design.
+- Log level was raised to `debug` via `/api/logs/level` during diagnosis and
+  left there; restore with `PUT /api/logs/level {"level":"info"}` if desired.
+- Reproduce the checks: the dispatch/verification helpers live in
+  `/tmp/item101/` on the host (`lw.py`, `dispatch2.py`, `watch.py`,
+  `verify-*.sh`), and each task's artifacts remain in the worker containers
+  under `/workspace/item101_*`, `/workspace/kimi_item101_*`,
+  `/workspace/pebble_item101_*`.
+- Recommended follow-up work items: F9 + F11 (external-job reaper/cancel),
+  F5 (delegation prompt steering + turn error surfacing), F1 (history state
+  semantics), F4 (worker LLM latency visibility).
