@@ -1,10 +1,10 @@
 # Release Notes for LunarWing v2.1.6.0
 
-**DRAFT — pre-release; content reflects the v2.1.6.0 tree as of 2026-10-21 and may grow before the tag is cut.**
+**DRAFT — pre-release; content reflects the v2.1.6.0 tree as of 2026-10-24 and may grow before the tag is cut.**
 
 ## Codename: Tsuno (角, つの): The Horns
 
-**Release date:** TBD (drafted 2026-10-16; refreshed 2026-10-20 and 2026-10-21)
+**Release date:** TBD (drafted 2026-10-16; refreshed 2026-10-20, 2026-10-21, and 2026-10-24)
 
 > Not raised in anger,
 > but set and sure all the same —
@@ -47,9 +47,11 @@ exposure-policy controls, and OpenRC proxy migrations refuse silently-wrong
 states instead of refusing healthy ones. The cycle closes with the usual
 dependency sweep (2.1.5 → 2.1.6 across all owned packages, refreshed
 registries, regenerated vendor tree) and a full crate-security re-audit with
-four late-cycle security upgrades — rustls 0.23.46, Wasmtime/WASI 36.0.18
-then 36.0.19 (two Cranelift miscompiles), and the CVE-2026-111943 webpki
-root-store trio — including one **breaking change**: Turso/libSQL
+five late-cycle security upgrades — rustls 0.23.46, Wasmtime/WASI 36.0.18
+then 36.0.19 (two Cranelift miscompiles), the CVE-2026-111943 webpki
+root-store trio, and the 2026-10-23 tokio/ctutils/clipboard-win set
+(two RUSTSEC unsound/yank advisories plus a yanked crate) — including one
+**breaking change**: Turso/libSQL
 remote-replica sync now
 lives behind the non-default `libsql-remote-replica` cargo feature (see
 Upgrade Notes).
