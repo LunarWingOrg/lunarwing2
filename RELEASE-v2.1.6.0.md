@@ -1,10 +1,10 @@
 # Release Notes for LunarWing v2.1.6.0
 
-**DRAFT — pre-release; content reflects the v2.1.6.0 tree as of 2026-10-21 and may grow before the tag is cut.**
+**DRAFT — pre-release; content reflects the v2.1.6.0 tree as of 2026-10-24 and may grow before the tag is cut.**
 
 ## Codename: Tsuno (角, つの): The Horns
 
-**Release date:** TBD (drafted 2026-10-16; refreshed 2026-10-20 and 2026-10-21)
+**Release date:** TBD (drafted 2026-10-16; refreshed 2026-10-20, 2026-10-21, and 2026-10-24)
 
 > Not raised in anger,
 > but set and sure all the same —
@@ -47,9 +47,13 @@ exposure-policy controls, and OpenRC proxy migrations refuse silently-wrong
 states instead of refusing healthy ones. The cycle closes with the usual
 dependency sweep (2.1.5 → 2.1.6 across all owned packages, refreshed
 registries, regenerated vendor tree) and a full crate-security re-audit with
-four late-cycle security upgrades — rustls 0.23.46, Wasmtime/WASI 36.0.18
-then 36.0.19 (two Cranelift miscompiles), and the CVE-2026-111943 webpki
-root-store trio — including one **breaking change**: Turso/libSQL
+six late-cycle security upgrades — rustls 0.23.46, Wasmtime/WASI 36.0.18
+then 36.0.19 (two Cranelift miscompiles), the CVE-2026-111943 webpki
+root-store trio, the 2026-10-23 tokio/ctutils/clipboard-win set
+(a ctutils constant-time vulnerability, a tokio unsound notice and a
+yanked `clipboard-win`), and the 2026-10-24 crypto-bigint 0.7.6 fix (timing
+variability in operations meant to be constant-time) — including one
+**breaking change**: Turso/libSQL
 remote-replica sync now
 lives behind the non-default `libsql-remote-replica` cargo feature (see
 Upgrade Notes).
@@ -188,7 +192,7 @@ previous compatibility baseline.
 | Bundled skills | Seven product skills, unchanged; no skill migration |
 | Channel registry | darkirc 0.1.12, multica 0.1.15, weechat 0.2.13, xmpp 0.1.18 |
 | Tool registry | cavepony-tool 0.4.6, gitlab 0.1.9, gotify 0.1.3, llm-context 0.1.4, multica-bridge 0.1.5, ssh 0.1.4, vision-analyze 0.1.6, voice-transcribe 0.1.4, web-search 0.2.5 |
-| External workers | kimi-code `2.3.0` (upgraded from 2.2.0), opencode `v1.18.25`, opencode2 `v2.1.2` (first crossed the OpenTunnel boundary at v2.0.32 under maintainer-approved WI#427; OpenTunnel compiled out, every exposure gate re-verified at the pin), Pebble `2d0f3786…` (upstream ref unchanged; its reviewed lock was upgraded for the rustls and CVE-2026-111943 webpki advisories) |
+| External workers | kimi-code `2.3.0` (upgraded from 2.2.0), opencode `v1.18.25` (models.dev catalog pinned in-image, no live fetch — WI#467; ships with the next opencode rebuild), opencode2 `v2.1.2` (first crossed the OpenTunnel boundary at v2.0.32 under maintainer-approved WI#427; OpenTunnel compiled out, every exposure gate re-verified at the pin), Pebble `2d0f3786…` (upstream ref unchanged; its reviewed lock was upgraded for the rustls and CVE-2026-111943 webpki advisories) |
 | Cargo features | New non-default `libsql-remote-replica` feature gates Turso sync (breaking — see Upgrade Notes) |
 
 Registry version bumps require rebuilding/reinstalling the affected WASM
@@ -250,18 +254,19 @@ opencode2 lane additionally denies upstream's unchecked built-in
 `session_move`/`session_rename` tools so they cannot rewrite the
 title-based task binding or the external-directory confinement. The pebble
 lane ships the same relay plus an in-image stdio MCP shim inside its Rust
-bridge binary (`pebble4lunarwing mcp-shim`). WI#324's real-worker
-acceptance (a granted proxied call from a real worker, and
-`knowledge_search` hits through the proxy) has no evidence yet: the kimi
-test-tenant jobs on rebuilt images (soarin, fleetfoot) returned a fixed
-`KIMI_WORKER_OK` string without a proxied call, and the default
+bridge binary (`pebble4lunarwing mcp-shim`). The default
 `tool_allowlist` is empty, so a managed tenant has no proxied tools until an
 operator grants them (`lunarwing-mt-admin.sh configure-worker-tools`, then
 `restart-tenant`). The opencode and opencode2
 plugins and the pebble shim reach tenants only with rebuilt images (the
 opencode one on the known-broken v1.18.25 lane, WI#333, bump-or-retire
-pending), and no real opencode, opencode2 or pebble job has exercised
-them — **WI#324 remains open**. Design doc:
+pending). **WI#324 closed on 2026-10-21** after the harness work; the
+real-worker acceptance it left behind (a granted proxied call from a real
+worker, and `knowledge_search` hits through the proxy) rides the rebuilt
+images and stays uncovered — the kimi test-tenant jobs on rebuilt images
+(soarin, fleetfoot) returned a fixed `KIMI_WORKER_OK` string without a
+proxied call — so it is tracked with the other image-level residuals under
+WI#449. Design doc:
 `docs/proposals/EXTERNAL-WORKER-TOOL-PROXY.md`.
 
 ### Cron Missions on External Workers (WI#325)
@@ -538,13 +543,52 @@ Four security upgrades landed late in the cycle on top of the semver sweep:
   flagged by version) and 0382 on `rustls-webpki` 0.102.8 (no 0.102-line
   patch exists), moving the policy total twelve → fourteen. Pipeline 6137
   is green with the upgrades in.
+- **tokio 1.53.3, ctutils 0.4.5, clipboard-win 5.4.3** (2026-10-23, advisory-db
+  snapshots `f7b2f6bc`/`84d943a6`). The advisory-db refresh turned cargo-deny
+  and the satellite-advisory-sweep red on every v2.1.6.0 pipeline with three
+  entries: RUSTSEC-2026-0385 on `ctutils` 0.4.3 (fixed upstream in 0.4.4),
+  the yanked `clipboard-win` 5.4.1, and RUSTSEC-2026-0386 on `tokio
+  < 1.53.3` — unsound safe `AsyncFd` constructors, which the widened
+  `unsound = "all"` scope (`ic/deny.toml`, WI#360) surfaces as a hard
+  error. Each is fixed by semver-compatible upgrade: tokio 1.53.3 across
+  `ic`, the XMPP bridge, `unix-socket-client`, `pebble`,
+  `pebble4lunarwing`, both sidecars, and both
+  `git-lunarwing-unix-socket-client` repos (the repo-root one and the
+  `replv2git/` copy); ctutils 0.4.5 in `ic` and the
+  XMPP bridge; clipboard-win 5.4.3 in `ic`, the XMPP bridge, and `pebble`.
+  The locks were bumped minimally — a plain `cargo update` also re-picked
+  unrelated `windows-sys`/`socket2` edges (quinn onto socket2 0.5.10), so
+  each lockfile changes only these packages' version and checksum lines,
+  and every root was re-verified with `cargo metadata --locked`. No
+  first-party or vendored code calls the flagged tokio constructors. The
+  manifest-less upstream pin `pebble4lunarwing/upstream/Cargo.lock`
+  (`verify_upstream_lock.py`) is unchanged. No new acceptances; the
+  fourteen-ID policy total is unchanged, and `ic/vendor/` was refreshed.
+- **crypto-bigint 0.7.6** (2026-10-24, advisory-db `21d909e4`;
+  RUSTSEC-2026-0387). Timing variability in operations meant to be
+  constant-time: subtraction, zero counting, division, Montgomery
+  multiplication, `UintRef` equality, and `BoxedMontyForm::invert`. Fixed
+  in 0.7.6. Only two lockfiles carry the crate, through the SSH key and
+  signature path (russh, ssh-encoding, rsa, elliptic-curve, primefield,
+  rfc6979, crypto-primes): `ic/Cargo.lock` and the XMPP bridge's. The lock
+  edit is minimal — 0.7.5 `1a52aa3f` → 0.7.6 `6bb08299`, both checksums
+  checked against the crates.io index — because 0.7.6 has the same normal
+  dependency list and its only tightened requirement, `ctutils ^0.4.5`, is
+  already met by the 2026-10-23 upgrade; no other entry moves and no crate
+  is added. `ic/vendor/` was refreshed (only `ic/vendor/crypto-bigint`
+  changes, rig-core patch restored, vendor set matches the locks) and the
+  gate reports `advisories ok, bans ok, licenses ok, sources ok` on
+  `21d909e4`. No new acceptances; the fourteen-ID total is unchanged.
+  Deploy note: this is a binary-content fix, so the daemon and XMPP bridge
+  must be rebuilt **and restarted** with the rustls/Wasmtime/webpki set.
 
-Verification for all four is recorded in `docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md`
+Verification for all six is recorded in `docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md`
 (October 14 update, pipeline 5710 addendum, the October 16 zip-yank
 follow-up described under Dependency Sweep below, the October 17
-`unsound = "all"` widening follow-up described above, and the two
+`unsound = "all"` widening follow-up described above, the two
 October 20 addenda — pipeline 6121 for Wasmtime 36.0.19, pipeline 6137
-for the emSign trio).
+for the emSign trio — the 2026-10-23 tokio/ctutils/clipboard-win
+refresh, and the 2026-10-24 crypto-bigint refresh).
 
 ### Pending-Gate Lifecycle (WI#332)
 
@@ -580,8 +624,111 @@ existing WI#301/WI#276 semantics. Stamps older than 24 hours are cleared as
 stale, and `resolve_stamped_interruption` now mirrors the restart recorder's
 parity checks (thread type, project, owner, `thread_history` membership):
 partial forgeries and corrupt stamps are cleared with a warning instead of
-arming retries (WI#338; full write-path reservation is WI#322, planned for
-v2.1.7.0). A known stuck-key abort window is tracked as WI#394.
+arming retries (WI#338; the write-path reservation that backs it landed as
+WI#322, below). A known stuck-key abort window is tracked as WI#394.
+
+### `engine/projects` Reserved From Memory Writes (WI#322)
+
+`memory_write` and the web memory write route now refuse the whole
+`engine/projects/` tree (`is_engine_projects_path` in
+`ic/src/tools/builtin/memory.rs`), so a mission record can no longer be
+forged or edited through a memory tool: engine project and mission records
+(`engine/projects/*/missions/**/mission.json`) are Engine-owned state, and
+the refusal is reported as such rather than as a generic path error. This
+closes the write-path half of WI#338's parity story; the trackers closed
+WI#322 on 2026-10-21. The remaining boot-loaded-document residual — the
+`engine/knowledge` and `engine/orchestrator` docs still agent-writable
+through memory tools, with id-shadowing at boot and a provenance-label
+inversion — is filed as **WI#455** (security, open, planned for v2.1.7.0).
+
+### Leak Detector: GitLab PAT and Complete Bearer Redaction (WI#353)
+
+The safety leak detector (`ic/crates/lunarwing_safety/src/leak_detector.rs`)
+gains a `gitlab_pat` block pattern for the `glpat-` prefix, which had no
+detector: an uncut token body was fully visible because the block truncation
+boundaries never matched it. Redaction of `Bearer` tokens now covers the
+full bearer-token grammar — JWT dot-separated segments (`.`) and
+tilde-separated tokens (`~`) included — so the head of a JWT and the tail
+of a tilde token are redacted with the rest, not truncated mid-token; the
+match is case-insensitive against `bearer` to catch worker logs that spell
+`token_type: bearer` / a lowercase `bearer <token>`. Placeholder bodies
+(GitLab's own docs spell the shape as `glpat-xxxxxx…`) are skipped via
+`is_plausible_token_body`, so fetched documentation is not blocked
+wholesale. WI#353 was closed on 2026-10-22; the run-185/run-187 review
+refinements (case-insensitive bearer, tilde tokens, placeholder skip,
+straddle-sweep fixtures) all landed with it.
+
+### Config-Hash Sidecars Moved to Root-Owned Host State (WI#446, WI#450, WI#451)
+
+The per-container config-hash sidecar that lets `start-tenant` recreate a
+container only when its config actually changed moved out of the
+tenant-controlled `~/.config` tree into root-owned host state
+(`/var/lib/lunarwing/container-hashes/<tenant>/`) — root's historical
+mkdir/printf under `~/.config` followed pre-placed symlinks, and the
+root-owned sidecars the old writer left on upgraded tenants could never be
+updated by a tenant-side writer (every start then force-recreated the
+container). That move is WI#446 (closed 2026-10-21).
+
+**WI#450** (closed 2026-10-21, run-181 MC-1) closes the confidentiality gap
+the move opened: each hash covers a secret-bearing env file or Quadlet, and
+the tenant home that used to hold these sidecars was private — root's
+ambient umask would leave the base and per-tenant directories `0755` and
+the file `0644`, readable by every local user. The directories are now
+forced `0700` and the file is written under `umask 077` (`0600`); the base
+`mkdir` stays outside `umask 077` so a fresh `/var/lib/lunarwing` does not
+block tenants from reaching the 0755 `voice-models` tree.
+
+**WI#451** (closed 2026-10-22, run-181 MC-2) pins the symlink-redirect
+refusals on the voice renderer's Quadlet and fallback paths — half of the
+run-181 rootful-Quadlet finding — so the voice renderer's `~/.config`
+writes can no longer follow a tenant-planted symlink onto another tenant's
+state.
+
+### `prepare_worker_workspace` Creates as the Tenant, Chowns Without Following (WI#453, WI#461)
+
+The workspace sits inside the tenant-controlled `~/lunarwing` tree, so the
+historical root `mkdir -p` + unbounded `chown -R` followed a tenant-planted
+symlink at any owned component into arbitrary host territory — the same
+root-follows-tenant-path class WI#446 eliminated everywhere else.
+**WI#453** (closed 2026-10-22): `prepare_worker_workspace` validates the
+workspace path first (`darkirc_path_components_safe` refuses non-absolute
+paths and any `.`, `..` or symlinked component), then creates the
+workspace **as the tenant** (`sudo -u <tenant> mkdir -p`, or a plain
+`mkdir -p` when mt-admin already runs as the tenant) and refuses a leaf
+that is not a plain directory owned like the tenant root — so root never
+opens a path the tenant chose; the chown step uses
+`chown --no-dereference` on the workspace root and every non-hard-link
+descendant, so a symlink in the tree can no longer redirect root's chown
+onto a victim path. The `chmod 2770` site that WI#416 left unconverted is
+now the tenant-side `tenant_chmod` in this path. **WI#461** (closed
+2026-10-24, hunter 2026-10-22 LOW): both chown steps in the walk refuse
+cleanly under `set -euo pipefail` — a `chown` failure inside a suppressed
+errexit context (`cmd || status=$?`) used to be silently swallowed and the
+bind mount reached the container with the wrong owner; both now return rc-1
+with a named message and restore `PWD` on every exit path.
+
+**Known regression on rootful hosts (open at release, run-203 NO-2 on
+!1880):** on Docker-default hosts (`LUNARWING_MT_ROOTLESS=false`) the
+workspace root and contents are chowned to the container uid **before**
+the tenant-side `tenant_chmod 2770` runs — the tenant no longer owns the
+leaf, so the `chmod` fails with EPERM and every kimi, opencode and
+opencode2 worker start dies on the first call. Proven with a non-root
+tenant in run-203; unfixed at release and owned by goals item 91, which
+now carries !1880's findings. See the known-issues entry below.
+
+### `validate_llm_url` Escapes and Length-Caps the Tenant URL (WI#384)
+
+`validate_llm_url`'s `die` messages (`must be an http(s) URL`, `has no
+host`, `must not embed userinfo`, etc.) used to print the tenant-supplied
+URL verbatim, leaking it into the job trace. The scheme and no-host
+error lines now route through `sanitize_display_value`
+(`ic/scripts/mt-admin-lib/06-env-generation.sh`), which percent-encodes
+every non-printable character and `%` and caps the value at 160 bytes
+(appending `...` only when a byte was actually dropped) — the URL is still
+printed there, but in a short, terminal-safe, injection-free form; every
+other die site prints no URL at all. Because the scheme check runs first,
+a credential URL with a mistyped scheme still shows its userinfo through
+those two escaped lines. WI#384 was closed on 2026-10-23.
 
 ### Boot-Time Mission Writers Reload Under the Lock (WI#317)
 
@@ -981,7 +1128,7 @@ of being swallowed. The root reads and writes WI#390 did not convert
 sources) were converted by WI#423 (closed 2026-10-20), whose re-attempt
 also made every `resolve_worker_auth_token` caller fail closed; its
 follow-up WI#445 (the root study-notes sync trusting a tenant-chosen
-`LW2STUDYMCP_HOME`) is fixed in-tree, open for maintainer acceptance — both
+`LW2STUDYMCP_HOME`) is fixed in-tree and closed on 2026-10-20 — both
 root-side sync entrypoints (the hourly `sync-knowledge-sources` scan and
 `refresh-knowledge --sync-source`) now accept only the operator default or a
 path without `.`/`..` components whose deepest existing ancestor chain is
@@ -990,7 +1137,7 @@ is skipped without aborting the hourly run, an existing checkout whose
 `origin` is not the operator repo is never pulled, and the worker containers
 render no Study Notes mount at all for an untrusted home, while WI#446
 (root mkdir/chown/unit writes through tenant-controlled `~/.config`) is
-fixed in-tree, open for maintainer acceptance — every systemd unit/Quadlet
+fixed in-tree and closed on 2026-10-21 — every systemd unit/Quadlet
 render (including the vision/voice fallback and Quadlet renderers), the
 WeeChat home creation, and the add-tenant env-dir chmod now create and
 write tenant-side through `tenant_mkdir_p` and the tenant-side atomic
@@ -1035,6 +1182,106 @@ cap's effect). Both
 fixes reach tenants only with a rebuilt/promoted kimi image — see Upgrade
 Notes.
 
+### Kimi Task-Runner Delegation (WI#454)
+
+The kimi lane gains the first worker-side slice of the two-container split
+WI#454 calls for (the maintainer's no-root policy, note #10954 on !1829).
+A task-runner daemon (`kimicode4lunarwing/scripts/task_runner.ts`)
+executes tasks as the task uid — it refuses to start as root, so no
+`setpriv` privilege drop is needed — and a bridge-side client
+(`task_runner_client.ts`) delegates each task over a unix socket. Inside
+the current single-container image the entrypoint rehearses the split:
+with the credential handoff active, `run_task_runner` has root bind the
+listening socket `/run/lunarwing-runner-sock/task-runner.sock` in a
+root-only `0700` directory (`kimicode4lunarwing/task_runner_bind.py`),
+then exec `setpriv` → `/usr/bin/env` →
+`/usr/local/bin/node task_runner.js` as the task uid with only the
+listening descriptor inherited (`LUNARWING_TASK_RUNNER_LISTEN_FD`). The
+credential vars are stripped from what the runner inherits, so the
+runner never sees the hub credential. The launcher exports
+`LUNARWING_TASK_RUNNER_SOCKET` to the bridge, which routes every task to
+the unprivileged runner instead of spawning the CLI itself;
+`KIMI_TASK_RUNNER=skip` (or no credential handoff, the host dev shape)
+keeps local execution. Delegation is ON by default whenever the
+credential handoff is active (maintainer decision, 2026-10-22,
+run-195 follow-up on !1861); `KIMI_TASK_RUNNER=skip` is the operator
+escape hatch.
+
+The runner protocol, bounds, and supervision are described in
+`docs/ops/WORKER-CONTAINERS.md` (run-200 NL-1..NL-8, run-198 NI-1..NI-6,
+run-196 NC-6..NC-10 fixes all carried): the runner acknowledges
+acceptance, reports the CLI's process group, streams progress, and ends
+with exactly one result; every runner-socket line is capped at the hub's
+`WS_MAX_PAYLOAD_BYTES` plus 64 KiB, so a large result is truncated
+exactly as in local execution, never refused; the bridge frees the
+workspace lock only once the CLI is gone, and a dead runner maps to an
+error `task_result` (the hub is never stranded); `/ready` reports
+liveness only (a JSON object with `ready: true` and a string
+`heartbeat_at` parsed as UTC with milliseconds, no older than 30 s and no
+more than 5 s in the future — the earlier `strptime` form read an
+ISO-8601 stamp as local time and dropped the milliseconds, so every
+fresh beat was 503, run-198 NI-2); the entrypoint supervises the runner
+and, after five failed restarts, signals the launcher (`kill -TERM $$` —
+the subshell forked before `BRIDGE_PID` existed, so it cannot signal the
+bridge directly), whose cleanup trap stops the bridge, the runner, and
+the health server so the container exits for the orchestrator (run-198
+NI-3). The kimi-image test gate reads the runner's `/proc` as the
+runner's own uid, so the in-image `npm test` does not need
+`CAP_SYS_PTRACE` under rootless BuildKit (run-202 NN-1). The runner's CLI
+environment gets the root-owned launcher PATH, never `TASK_PATH`, and the
+executor applies the WI#462 order (that PATH first, the task toolchain
+directories after) and resolves a bare `kimi` only to a root-owned file
+in a root-owned, non-writable directory of the runner's PATH (WI#463,
+fail-closed), matching the setpriv path. Socket ownership: root binds the
+socket in a root-only directory, so the task uid can neither replace it
+nor connect to it, and a root bridge refuses any runner socket that is
+not root-owned in a root-owned, non-writable directory; the `task_id`
+checks keep one run's frames apart from another's, they never
+authenticated anything. **Residual (Low):** the runner and every task
+still share one uid, so task code that may ptrace the runner (or take its
+descriptor with `pidfd_getfd`) could take the listener over; only the
+two-container split removes that. **What remains for the full split**
+(WI#454's own scope, still open): the image-level separation (bridge
+container and task container as two mt-admin units under two different
+non-root uids, with the socket crossing the shared workspace volume and
+the bridge itself dropping `USER 0:0`), plus the same machinery on the
+opencode and pebble lanes. WI#454 stays open on the tracker.
+
+### opencode Reproducible Build: models.dev Snapshot Pin (WI#467)
+
+The opencode v1.18.25 build compiles a models.dev catalog into the
+binary: at the pinned `cb7d8b2f` upstream,
+`packages/opencode/script/generate.ts` reads it from the file named by
+`MODELS_DEV_API_JSON` when set, and otherwise fetches
+`${OPENCODE_MODELS_URL:-https://models.dev}/api.json` live;
+`script/build.ts` passes the text to `Bun.build` as the
+`OPENCODE_MODELS_DEV` define, so the catalog is compiled in as code.
+Until WI#467 the worker Dockerfile never set the variable, so the binary
+changed whenever models.dev published between the candidate build and
+the `--no-cache` rebuild, and the `worker-opencode-candidate`
+clean-rebuild gate failed on master. The lane now carries a reviewed
+snapshot at `opencode4lunarwing/models-dev/api.json` (fetched from
+models.dev @ `a051b3ca330b`, 2026-10-23), committed pretty-printed so a
+refresh diffs line by line (the minified bundle is byte-identical to the
+one built from the one-line form). Its sha256 is pinned as the
+Dockerfile's `MODELS_DEV_SNAPSHOT_SHA256` ARG — not `*_API_JSON_*`:
+gitleaks' generic-api-key rule reads an ARG whose name contains `API` and
+whose value is 64 hex as a leaked key (run-200 NK-1). `validate_config.py`
+cross-checks the pin, requires the snapshot to be strict JSON (one
+non-empty object, no duplicate keys, no NaN/Infinity) in the canonical
+pretty layout, and pins the builder-stage tail from
+`WORKDIR /build/opencode/packages/opencode` to the next `FROM`
+instruction by instruction (`OPENCODE_MODELS_DEV_BUILD_STEPS` — run-200
+NK-2: the substring guard had let dropping the variable, dropping the
+guard call, and a live-fetch upstream pass). The build RUN verifies the
+hash, runs `scripts/check_models_dev_snapshot.py` (strict JSON, and
+`generate.ts` must still read both env vars), and builds with
+`OPENCODE_MODELS_URL=http://127.0.0.1:9`, so an upstream that ignores the
+snapshot and fetches anyway fails the build instead of compiling a live
+catalog (run-200 NK-3/NK-5). Both files hash into the opencode
+`worker-inputs.sha256`. WI#467 was closed on 2026-10-24; the fix ships
+with the next opencode image rebuild (see Upgrade Notes).
+
 ### Worker Image Rollout and Traceable mt-admin Builds
 
 Rebuilt worker images now reach running tenants on both init systems: the
@@ -1069,20 +1316,24 @@ together (see Compatibility), and a tracked-manifest/lock audit confirms no
 project-owned package or path dependency remains at 2.1.4 or 2.1.5.
 
 External crates took MSRV-respecting semver-compatible updates across all
-26 swept lockfile roots (tokio 1.53.2, hyper 1.12.0, h2 0.4.20, jiff
+26 swept lockfile roots (tokio 1.53.3, hyper 1.12.0, h2 0.4.20, jiff
 0.2.38, toml 1.1.8, uuid 1.28.0, zeroize 1.9.1, html-to-markdown-rs 3.17.2,
-syn 3.0.7, among others), and `ic/vendor/` was regenerated — 1150
+syn 3.0.7, among others — tokio moved to 1.53.3 with the 2026-10-23
+advisory-db refresh), and `ic/vendor/` was regenerated — 1150
 directories: 1148 vendored crates plus the two pre-vendored libsignal path
-dependencies — with the rig-core patch restored and marker-verified. Four
+dependencies — with the rig-core patch restored and marker-verified. Six
 security upgrades landed late-cycle on top of the sweep (rustls 0.23.46;
 Wasmtime/WASI 36.0.18 then 36.0.19; the CVE-2026-111943 webpki root-store
-trio — see Crate Security Re-Audit). The
+trio; the 2026-10-23 tokio/ctutils/clipboard-win set; crypto-bigint 0.7.6
+on 2026-10-24 — see Crate Security Re-Audit). The
 `pebble4lunarwing/upstream/Cargo.lock` build-input pin was deliberately
 untouched by the sweep, then upgraded separately twice — for the rustls
 advisories and again for the webpki trio — with its Dockerfile digest
 refreshed each time. External worker pins: kimi-code
-advanced to 2.2.0; opencode v1.18.25 and the Pebble upstream ref are
-unchanged; opencode2 advances v2.0.24 → v2.0.32 per WI#427 (OpenTunnel
+advanced to 2.3.0 (2.2.0 during most of the cycle, re-bumped for goals
+item 83); opencode v1.18.25 and the Pebble upstream ref are
+unchanged; opencode2 advances v2.0.24 → v2.0.32 per WI#427, then to
+v2.1.2 for goals item 83 (OpenTunnel
 compiled out; see Worker Exposure Policy). All four worker Dockerfiles and
 the CI `CI_DEBIAN_SNAPSHOT` moved from the 20260906T000000Z to the
 20261017T082437Z Debian snapshot, which carries the Debian-fixed perl
@@ -1149,8 +1400,10 @@ are recorded in the audit doc's 2026-10-16 follow-up.
    opencode2 and pebble tool-proxy bridges, the WI#325 cron bootstrap, the
    WI#328
    control channel,
-   the WI#330 placeholder guards, the WI#373 credential strips, and the
-   WI#411/WI#412 kimi env/config pins all ship in the worker images.
+   the WI#330 placeholder guards, the WI#373 credential strips, the
+   WI#411/WI#412 kimi env/config pins, the WI#454 kimi task-runner
+   delegation machinery, and the WI#467 opencode models.dev snapshot pin
+   all ship in the worker images.
    Rebuild all four worker images (`build-<worker>-worker` or
    `build-tenant --with-<worker>`), promote each through the normal
    candidate → scan → promotion path, then `restart-tenant` each tenant.
@@ -1159,7 +1412,9 @@ are recorded in the audit doc's 2026-10-16 follow-up.
    serve-process tool-proxy plugin, and the executor's
    `session_move`/`session_rename` denies, the opencode image
    carries the WI#374 crash-line enrichment, the WI#373 credential strip,
-   and the WI#324 serve-process plugin, and the pebble image carries
+   the WI#324 serve-process plugin, and the WI#467 models.dev snapshot
+   pin (the build refuses to compile unless the committed snapshot hash
+   matches and the upstream reads it), and the pebble image carries
    WI#334, the WI#324 MCP shim registration
    (`PEBBLE_CONFIG_HOME=/etc/lunarwing/pebble`), and the reviewed-lock
    rustls + CVE-2026-111943 webpki upgrades; all four images also move
@@ -1167,13 +1422,17 @@ are recorded in the audit doc's 2026-10-16 follow-up.
    snapshot, which ships the fixed perl for the three CVEs
    `.gitlab/trivy-ignore` no longer suppresses (WI#361) — opencode stays
    v1.18.25, while opencode2 advances to v2.0.32
-   under WI#427. Skipping those rebuilds leaves WI#357 undeployed, the
+   under WI#427 and then v2.1.2 for goals item 83. Skipping those rebuilds
+   leaves WI#357 undeployed, the
    three WI#361 perl CVEs in the running images, and the opencode,
    opencode2 and pebble tool proxies unsurfaced. Preserve
    opencode2 state before the first new-version boot: upstream migrates its
    database, so rolling back the image alone is not a verified rollback.
-   kimi-code is upgraded to **2.2.0** (an earlier 2.2.0 image promoted
-   during the cycle predates the WI#411/WI#412 fixes — rebuild from the
+   kimi-code is upgraded to **2.3.0** (2.2.0 during most of the cycle — an
+   earlier 2.2.0 image promoted
+   during the cycle predates the WI#411/WI#412 fixes; the 2.3.0 re-bump
+   carries the same fixes plus the WI#454 task-runner delegation machinery —
+   rebuild from the
    release tree and recreate the tenant containers; mt-admin now recreates
    worker containers automatically when the image ID changes, on OpenRC as
    well). Note the one-time rollout effect: the first
@@ -1192,8 +1451,9 @@ are recorded in the audit doc's 2026-10-16 follow-up.
    and installed WASM channels and tools; rebuild/reinstall all four
    channel and nine tool registry updates through the normal deployment
    path. The rustls 0.23.46, Wasmtime/WASI 36.0.19 (36.0.18's successor —
-   both Cranelift miscompilation fixes), and CVE-2026-111943 webpki
-   security fixes ship
+   both Cranelift miscompilation fixes), CVE-2026-111943 webpki,
+   2026-10-23 tokio/ctutils/clipboard-win, and 2026-10-24 crypto-bigint
+   0.7.6 security fixes ship
    in the daemon and XMPP bridge binaries — rebuild **and restart** both to
    deploy them.
 6. **Review cron worker authority.** Cron tick jobs draw from the new
@@ -1240,8 +1500,9 @@ ships the same MCP shim shape inside its Rust bridge binary. Proxied tools
 are off by default: a worker's `tool_allowlist` is empty unless an operator
 sets it (`configure-worker-tools` on multi-tenant hosts), so every proxied
 call is denied until an operator grants one. No real worker has made a
-granted proxied call yet, so WI#324's real-worker acceptance is still
-open, and the opencode and opencode2 plugins and the pebble shim ship only
+granted proxied call yet, so WI#324's real-worker acceptance
+(the tracker closed WI#324 itself on 2026-10-21) rides the rebuilt images
+under WI#449, and the opencode and opencode2 plugins and the pebble shim ship only
 with their rebuilt images (the opencode one on a lane that stays frozen at
 v1.18.25 pending the WI#333 decision). On all four lanes the tool grant is
 ambient for every process in the task (untrusted repo scripts can call the
@@ -1277,14 +1538,18 @@ decision (bump or retire, planned for v2.1.7.0) is unchanged.
 
 **CI rate limits.** HTTP 429s from GitLab's registry auth (`/jwt/auth`)
 and from the `get_sources` repository fetch hit CI pipelines:
-worker-image pushes now retry the registry-auth 429 (up to four attempts,
-`.gitlab/scripts/build-worker-image.sh`), but `get_sources` 429s still
+worker-image pushes now retry the registry-auth 429 (up to six attempts,
+`.gitlab/scripts/build-worker-image.sh`), and the worker-image Trivy scans
+retry the same narrow signature with minute-scale backoff (four attempts,
+fail-closed on a missing or non-numeric status file, `.gitlab/ci/containers.yml`;
+item 28's NB-4), but `get_sources` 429s still
 need a manual job retry (most recently the `shellcheck` job on
 release-target pipeline 6002), and no work item owns the rate limits. The
 WI#375 DS-1 cron-bootstrap race tests no longer fail when a loaded runner
 never hits the race window (the harness check is now a log line on every
-lane; any returned redirect still fails); the deterministic test hook
-WI#444 asks for is still open.
+lane; any returned redirect still fails); the deterministic per-lane test
+hook WI#444 asks for landed on all four lanes (item 80), mutation-verified,
+and WI#444 closed on 2026-10-23.
 
 **Accepted advisories.** Ten vulnerability advisories, two unsound
 notices, and two unmaintained notices (fourteen IDs) ship accepted — see
@@ -1304,87 +1569,111 @@ Crate Security Re-Audit). The clearing owners named in `ic/deny.toml`
 (WI#368 for rsa, WI#367 for `failure`/`rental`/`atty`, WI#418 for the
 libsql chain) were all closed on 2026-10-18 with every chain still in
 `ic/Cargo.lock`, so no accepted advisory has an open clearing owner at
-release; WI#363, the CI guard that would require one, is still open.
+release; WI#363, the CI guard that would require one, was closed on 2026-10-21
+(its offline guard landed with !1806 and is described under the
+Accepted-advisory guard changes).
+
+**Accepted-advisory guard (WI#363).** The `ic/deny.toml` accepted-advisory
+list relied on two facts no gate checked: that every `ignore` reason names
+a clearing-owner work item, and that the owner is real. `validate_config.py`
+now requires the `clearing owner: WI#N` phrase in every ignore reason and
+runs offline in the `ci-config` lane (landed with !1806, merged 2026-10-20;
+WI#363 closed on 2026-10-21). A reason naming only a work item fails, so an
+acceptance can no longer reach `ic/Cargo.lock` without a named owner — the
+gap that let the WI#331/WI#367/WI#368/WI#418 acceptances sit ownerless
+after their work items closed. The offline guard checks the phrase and that
+cited paths exist; it does **not** check that the named owner is still open
+(the online owner-open half was dropped in the 2026-10-20 scope decision),
+so an acceptance whose owner work item has since closed still passes — the
+guard closes the ownerless gap, not owner drift.
 
 **Known issues / open at release.** Reconciled per item in
 `docs/ops/v2.1.6.0_OPEN_WORK_ITEMS_STATUS.md`, a 2026-10-14 01:05Z snapshot
 (work items filed after it, WI#402 and later, postdate the audit), and
-re-checked against the tracker on 2026-10-20 and 2026-10-21. Open at
+re-checked against the tracker on 2026-10-20, 2026-10-21, and 2026-10-24.
+Open at
 release: WI#397
-(`high` — sb&kumo findings); WI#324 (real-worker acceptance evidence for
-every lane once the worker images are rebuilt and a worker `tool_allowlist`
-is configured — the mt-admin `tool_allowlist` render gap closed with the
-`configure-worker-tools` surface); WI#388 (the fleet-wide OpenRC proxy-unit
-neutralization for WI#376, Upgrade Note 2, is still an open rollout item);
-WI#429 (the sandbox proxy's empty-body over-refusal) and WI#430 (the WASM
-tool wrapper's retained-framing gap); WI#363 (the `ic/deny.toml`
-open-owner guard — see Accepted advisories); WI#424 (the deferred worker
-egress allowlist and opencode2 runtime-smoke suite), WI#425 (out-of-band
+(`high` — sb&kumo findings); WI#333 (the opencode v1 lane's upstream crash,
+bump-or-retire pending); WI#383 and WI#386 (harness redaction/lifecycle
+residuals, and the opencode executor reporting retry diagnostics as a
+deliverable); WI#394 (the WI#341 residual stuck dedup key); WI#429 (the
+sandbox proxy's empty-body over-refusal) and WI#430 (the WASM tool
+wrapper's retained-framing gap); WI#424 (the deferred worker egress
+allowlist and opencode2 runtime-smoke suite), WI#425 (out-of-band
 worker-image verification), and WI#432 (WASM-host redaction follow-ups, now
 holding the four WI#408 channel-host residuals), all three planned for
-v2.1.7.0; and WI#436 (v2.1.7.0 triage of the test-tenant failures — its
+v2.1.7.0; WI#436 (v2.1.7.0 triage of the test-tenant failures — its
 first item, one failing note failing every hourly knowledge refresh and
-leaving `knowledge: critical`, is live in this release). The residual
-owners named in the sections above (WI#322, WI#333, WI#370, WI#383,
-WI#386, WI#387, WI#394) are open too, and so are the WI#423 re-attempt's
-two follow-ups, both fixed in-tree this cycle and open for maintainer
-acceptance: WI#445 (the root study-notes sync trusting a tenant-chosen
-`LW2STUDYMCP_HOME`) by the root-side sync trust gate, the rogue-origin
-pull refusal, and the worker-mount trust gate; and WI#446 (root
-mkdir/chown/unit writes through tenant-controlled `~/.config`) by the
-tenant-side unit/Quadlet renders, the tenant-side WeeChat home creation
-and env-dir chmod, and the config-hash sidecar's move to root-owned host
-state. WI#400's implementation landed this cycle
-(token file handoff + task-uid split on kimi/opencode/pebble, rootless
-lanes; the rootful pebble launch has no split by design) and the WI itself
-was closed on 2026-10-20 after its re-pass (zero/non-numeric task ids are
-refused everywhere identities parse); what stays open is
-its real-worker acceptance on rebuilt images and the opencode2 lane's own
-migration, filed as **WI#449** together with the run-170 leftovers
-(LP-11..LP-16; LP-7 declined by the maintainer on 2026-10-22), planned for
-v2.1.7.0. Filed late and planned for
-v2.1.7.0, but live in this
-release: WI#440 (`generate_token` falls back to a predictable `date +%s`
-token when `od` is absent) and WI#441 (`resolve_protected_paths` degrades
-silently when `SANDBOX_PROTECTED_PATHS` is unset); WI#362 tracks accuracy
-corrections to `docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md`. The five
-test-build field reports (WI#366, WI#372, WI#385, WI#398, WI#399)
-and the WI#359/WI#373 triage items were closed on 2026-10-14; WI#336,
-WI#356, WI#376, WI#377, WI#380, WI#393, WI#395, WI#410, WI#411, and WI#417
-closed during final review (2026-10-13 through 2026-10-16). Closed since:
-WI#357, WI#364, WI#365 (tenant rustup installs on noexec `/tmp` hosts:
-`rustup-init` is now staged under the tenant home), WI#375, WI#390,
-WI#392, WI#396, and WI#419 (2026-10-17);
+leaving `knowledge: critical`, is live in this release); and WI#362
+(accuracy corrections to `docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md`). Filed
+late and planned for v2.1.7.0, but live in this release: WI#440
+(`generate_token` falls back to a predictable `date +%s` token when `od` is
+absent), WI#441 (`resolve_protected_paths` degrades silently when
+`SANDBOX_PROTECTED_PATHS` is unset), **WI#455** (the WI#322 residual — the
+`engine/knowledge` and `engine/orchestrator` boot-loaded docs are still
+agent-writable through memory tools, with id-shadowing at boot and a
+provenance-label inversion), and the engine-v2 migration-completeness
+residuals WI#442. **Rootful worker starts are broken on Docker-default
+hosts (run-203 NO-2 on !1880, owned by goals item 91):** with
+`LUNARWING_MT_ROOTLESS=false`, `prepare_worker_workspace` chowns the
+workspace leaf to the container uid before the tenant-side
+`tenant_chmod 2770` runs, so the tenant no longer owns the leaf, the
+`chmod` fails with EPERM, and every kimi, opencode and opencode2 worker
+start dies on the first call — live in this release since WI#453 and
+unfixed at release; the mechanism is described in the WI#453 section above.
+
+The worker-image residuals stay open pending rebuilds: **WI#449** (the
+opencode2 lane's credential-isolation migration, plus the run-170 leftovers
+LP-11..LP-16 — LP-7 was declined by the maintainer on 2026-10-22 — and the
+image-level acceptance covering WI#324 and WI#400), **WI#454** (the
+two-container split; its worker-side kimi slice is described above and its
+scope is now documented in `docs/ops/ITEM91_KIMI_WORKER_454.md`), and
+**WI#456** (kimi external worker "connection refused (os error 111)" on a
+new build post-20 — see the runbook in `docs/ops/WORKER-CONTAINERS.md` for
+the stale-image remediation). **WI#469** explains WI#456's multi-lane
+refusals: `start_tenant`'s worker start loop aborts on the first
+stale-image `die`, silencing every later lane. **WI#464** would make the
+class visible before the first job (a boot-time probe of each configured
+worker's socket).
+
+Closed since the last repass, by tracker date: WI#388 (the fleet-wide
+OpenRC proxy-unit rollout for WI#376, Upgrade Note 2), WI#461, WI#462, and
+WI#463 on 2026-10-24; WI#354, WI#384, WI#434, WI#444, WI#452, and WI#457
+on 2026-10-23; WI#353, WI#451, and WI#453 on 2026-10-22; WI#317, WI#322,
+WI#324, WI#363, WI#387, WI#450, and WI#446 on 2026-10-21; WI#445, WI#422,
+WI#423, WI#389, and WI#370 on 2026-10-20 (WI#450, WI#451, WI#453, and
+WI#454's first slice close the run-181/run-186 review residuals of the
+WI#446 re-attempt); and WI#416 and WI#438 on 2026-10-18. WI#416's residual
+is now converted rather than orphaned: the `prepare_worker_workspace`
+`chmod 2770` site it left unconverted was converted by **WI#453**
+(`f30e4fc80`) — the workspace is created as the tenant and chowned with
+`--no-dereference`; on rootful hosts that chown precedes the tenant-side
+`tenant_chmod`, which regressed worker starts there (run-203 NO-2, the
+known-issues entry above; owned by item 91).
+Earlier closures, per the same tracker pass: the five test-build field
+reports WI#366, WI#372, WI#385, WI#398, and WI#399 together with the
+WI#359/WI#373 triage items on 2026-10-14; WI#336, WI#356, WI#376, WI#377,
+WI#380, WI#393, WI#395, WI#410, WI#411, and WI#417 during final review
+(2026-10-13 through 2026-10-16); WI#357, WI#364, WI#365 (tenant rustup
+installs on noexec `/tmp` hosts — `rustup-init` is now staged under the
+tenant home), WI#375, WI#390, WI#392, WI#396, and WI#419 on 2026-10-17;
 WI#360, WI#371, WI#415, the advisory-clearing owners WI#367, WI#368, and
-WI#418 (chains still locked — see Accepted advisories), and WI#402, WI#408,
-and WI#412 (2026-10-18). WI#416 and WI#438 were also closed on 2026-10-18,
-without notes, and their remaining residuals have no open owner: WI#416
-with three of its six root-ownership sites addressed (the
-`configure_weechat_relay` trailing `chown -R`, the relay start lock, and
-the SSH key staging), leaving the `prepare_worker_workspace` `chmod 2770`,
-the `add-tenant` re-run `chmod 0700` of the tenant env directory, and the
-study-seed root `mktemp -d` unconverted; and WI#438 with the standalone
-TensorZero proxies under `tensorzero-proxy-configurations/` still
-defaulting to developer-LAN endpoints (no shipped path uses those
-defaults: mt-admin's proxy units pass the upstream explicitly). WI#369
-(the opencode2 SDK-surface gate blind spots; the widened gates are
-described under opencode2 SDK Surface Pinning), WI#427 (the opencode2
-v2.0.32 bump; its Gentoo/OpenRC rollout is recorded under Worker Exposure
-Policy), and WI#361 (the worker-image Trivy gate: `.gitlab/trivy-ignore`
-now uses Trivy's `exp:` expiry syntax, enforced by the `ci-config`
-validator, the three Debian-fixed perl CVEs are no longer suppressed, and
-all four worker images moved to the 20261017T082437Z Debian snapshot; the
-rebuilt images' SBOMs on master pipeline 6007 show the fixed perl) were
-closed on 2026-10-19, without notes. WI#422 (the rootful pebble
-re-resolution — rootful pebble now launches as the tenant uid under
-`no-new-privileges`, no credential split by design), WI#423 (mt-admin's
-remaining root reads/writes of tenant-writable env paths; its re-attempt's
-follow-ups WI#445 (the study-notes sync trust gate) and WI#446 (the
-tenant-side `~/.config` unit/Quadlet renders plus the root-state
-config-hash sidecar) are both fixed in-tree pending acceptance), and
-WI#389 (the docker/podman group is
-now opt-in everywhere, defaults off — rootless podman never needed it) were
-closed on 2026-10-20.
+WI#418 (chains still locked — see Accepted advisories), WI#402, WI#408, and
+WI#412 on 2026-10-18; WI#369 (the opencode2 SDK-surface gate blind spots;
+the widened gates are described under opencode2 SDK Surface Pinning),
+WI#427 (the opencode2 v2.0.32 bump; its Gentoo/OpenRC rollout is recorded
+under Worker Exposure Policy), and WI#361 (the worker-image Trivy gate:
+`.gitlab/trivy-ignore` now uses Trivy's `exp:` expiry syntax, enforced by
+the `ci-config` validator, the three Debian-fixed perl CVEs are no longer
+suppressed, and all four worker images moved to the 20261017T082437Z
+Debian snapshot; the rebuilt images' SBOMs on master pipeline 6007 show the
+fixed perl) on 2026-10-19; and WI#467 (the opencode build's models.dev
+reproducibility gap — the committed snapshot pin described under the
+opencode Changes section) on 2026-10-24. WI#438's residual stands as
+recorded: the standalone TensorZero proxies under
+`tensorzero-proxy-configurations/` still default to developer-LAN
+endpoints, though no shipped path uses those defaults (mt-admin's proxy
+units pass the upstream explicitly).
 
 **Deployment boundaries.** The onboarding web app remains a trusted local
 console without user accounts or TLS: retain loopback binding and use an
