@@ -540,13 +540,33 @@ Four security upgrades landed late in the cycle on top of the semver sweep:
   flagged by version) and 0382 on `rustls-webpki` 0.102.8 (no 0.102-line
   patch exists), moving the policy total twelve → fourteen. Pipeline 6137
   is green with the upgrades in.
+- **tokio 1.53.3, ctutils 0.4.5, clipboard-win 5.4.3** (2026-10-23, advisory-db
+  snapshots `f7b2f6bc`/`84d943a6`). The advisory-db refresh turned cargo-deny
+  and the satellite-advisory-sweep red on every v2.1.6.0 pipeline with three
+  entries: RUSTSEC-2026-0385 on `ctutils` 0.4.3 (fixed upstream in 0.4.4),
+  the yanked `clipboard-win` 5.4.1, and RUSTSEC-2026-0386 on `tokio
+  < 1.53.3` — unsound safe `AsyncFd` constructors, which the widened
+  `unsound = "all"` scope (`ic/deny.toml`, WI#360) surfaces as a hard
+  error. Each is fixed by semver-compatible upgrade: tokio 1.53.3 across
+  `ic`, the XMPP bridge, `unix-socket-client`, `pebble`,
+  `pebble4lunarwing`, and both sidecars; ctutils 0.4.5 in `ic` and the
+  XMPP bridge; clipboard-win 5.4.3 in `ic`, the XMPP bridge, and `pebble`.
+  The locks were bumped minimally — a plain `cargo update` also re-picked
+  unrelated `windows-sys`/`socket2` edges (quinn onto socket2 0.5.10), so
+  each lockfile changes only these packages' version and checksum lines,
+  and every root was re-verified with `cargo metadata --locked`. No
+  first-party or vendored code calls the flagged tokio constructors. The
+  manifest-less upstream pin `pebble4lunarwing/upstream/Cargo.lock`
+  (`verify_upstream_lock.py`) is unchanged. No new acceptances; the
+  fourteen-ID policy total is unchanged, and `ic/vendor/` was refreshed.
 
-Verification for all four is recorded in `docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md`
+Verification for all five is recorded in `docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md`
 (October 14 update, pipeline 5710 addendum, the October 16 zip-yank
 follow-up described under Dependency Sweep below, the October 17
-`unsound = "all"` widening follow-up described above, and the two
+`unsound = "all"` widening follow-up described above, the two
 October 20 addenda — pipeline 6121 for Wasmtime 36.0.19, pipeline 6137
-for the emSign trio).
+for the emSign trio — and the 2026-10-23 tokio/ctutils/clipboard-win
+refresh).
 
 ### Pending-Gate Lifecycle (WI#332)
 
