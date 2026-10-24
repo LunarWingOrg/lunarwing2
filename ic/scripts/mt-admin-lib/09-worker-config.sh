@@ -1920,8 +1920,16 @@ stop_tenant_opencode2() {
 # validation, bounded with --no-dereference so the walk never follows a
 # symlink (GNU chown: -h affects symlinks themselves; -R with it does not
 # follow). Rootless keep-id maps the tenant identity, so no chown at all.
-# chmod goes through tenant_chmod: chmod follows symlinks, and root has no
-# business touching a mode under a tenant-writable parent (WI#390).
+# NO-2/NO-3 (run-203 review of !1880): the leaf-uid gate accepts exactly two
+# owners — the tenant root uid (a fresh leaf, and every rootless leaf) and,
+# on rootful hosts only, this lane's container uid (a leaf handed over by an
+# earlier rootful call, which never restores tenant ownership). Any other
+# owner, such as another lane's workspace renamed into this slot, is refused
+# before the chown. On rootful hosts the mode is set by root inside the
+# verified `cd` after the chown: the tenant no longer owns the leaf, so
+# tenant_chmod would fail EPERM on its first call (NO-2). Rootless keeps
+# tenant_chmod — chmod follows symlinks, and root has no business touching a
+# mode under a tenant-writable parent (WI#390).
 prepare_worker_workspace() {
   local name="$1" worker="$2" lw_root workspace_dir container_uid container_gid
   lw_root="$(tenant_lw_root "$name")"
@@ -1944,15 +1952,6 @@ prepare_worker_workspace() {
     printf 'error: %s workspace is not a plain directory: %s\n' "$worker" "$workspace_dir" >&2
     return 1
   fi
-  # Ownership is checked against the tenant root dir — provisioned
-  # tenant-owned by create_tenant_user — rather than by resolving the
-  # account's uid, so the check also holds for fixture tenants with no
-  # passwd entry (same posture as prepare_pebble_workspace).
-  if [[ "$(stat -c %u "$workspace_dir" 2>/dev/null || printf -- -1)" \
-      != "$(stat -c %u "$lw_root" 2>/dev/null || printf -- -2)" ]]; then
-    printf 'error: %s workspace not owned like the tenant root: %s\n' "$worker" "$workspace_dir" >&2
-    return 1
-  fi
 
   case "$worker" in
     opencode)
@@ -1969,6 +1968,22 @@ prepare_worker_workspace() {
       ;;
     *) die "unsupported private worker workspace: $worker" ;;
   esac
+
+  # Ownership is checked against the tenant root dir — provisioned
+  # tenant-owned by create_tenant_user — rather than by resolving the
+  # account's uid, so the check also holds for fixture tenants with no
+  # passwd entry (same posture as prepare_pebble_workspace). NO-3: a
+  # rootful leaf from an earlier call is container-uid-owned (the chown
+  # below never restores tenant ownership), so exactly that second owner
+  # is accepted there; anything else — e.g. another lane's workspace
+  # renamed into this slot — is refused before any chown runs.
+  local leaf_uid root_uid
+  leaf_uid="$(stat -c %u "$workspace_dir" 2>/dev/null || printf -- -1)"
+  root_uid="$(stat -c %u "$lw_root" 2>/dev/null || printf -- -2)"
+  if [[ "$leaf_uid" != "$root_uid" && ! ( "$MT_ROOTLESS" != "true" && "$leaf_uid" == "$container_uid" ) ]]; then
+    printf 'error: %s workspace not owned like the tenant root: %s\n' "$worker" "$workspace_dir" >&2
+    return 1
+  fi
 
   if [[ "$MT_ROOTLESS" != "true" ]]; then
     # Rootful runtimes do not apply keep-id, so bind mounts must use image
@@ -2009,9 +2024,19 @@ prepare_worker_workspace() {
       printf 'error: cannot chown %s workspace contents: %s\n' "$worker" "$workspace_dir" >&2
       return 1
     fi
+    # NO-2: the leaf is container-uid-owned now, so the tenant can no
+    # longer chmod it (tenant_chmod would fail EPERM on the first call).
+    # Root sets the mode on the directory it already entered and verified;
+    # `.` is that directory itself, so no symlink can be followed.
+    if ! chmod 2770 .; then
+      command cd -- "$_save_pwd" 2>/dev/null || true
+      printf 'error: cannot set %s workspace mode: %s\n' "$worker" "$workspace_dir" >&2
+      return 1
+    fi
     command cd -- "$_save_pwd" 2>/dev/null || true
+  else
+    tenant_chmod "$name" 2770 "$workspace_dir" || return 1
   fi
-  tenant_chmod "$name" 2770 "$workspace_dir" || return 1
   printf '%s\n' "$workspace_dir"
 }
 
