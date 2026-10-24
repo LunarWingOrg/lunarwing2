@@ -606,8 +606,22 @@ existing WI#301/WI#276 semantics. Stamps older than 24 hours are cleared as
 stale, and `resolve_stamped_interruption` now mirrors the restart recorder's
 parity checks (thread type, project, owner, `thread_history` membership):
 partial forgeries and corrupt stamps are cleared with a warning instead of
-arming retries (WI#338; full write-path reservation is WI#322, planned for
-v2.1.7.0). A known stuck-key abort window is tracked as WI#394.
+arming retries (WI#338; the write-path reservation that backs it landed as
+WI#322, below). A known stuck-key abort window is tracked as WI#394.
+
+### `engine/projects` Reserved From Memory Writes (WI#322)
+
+`memory_write` and the web memory write route now refuse the whole
+`engine/projects/` tree (`is_engine_projects_path` in
+`ic/src/tools/builtin/memory.rs`), so a mission record can no longer be
+forged or edited through a memory tool: engine project and mission records
+(`engine/projects/*/missions/**/mission.json`) are Engine-owned state, and
+the refusal is reported as such rather than as a generic path error. This
+closes the write-path half of WI#338's parity story; the trackers closed
+WI#322 on 2026-10-21. The remaining boot-loaded-document residual — the
+`engine/knowledge` and `engine/orchestrator` docs still agent-writable
+through memory tools, with id-shadowing at boot and a provenance-label
+inversion — is filed as **WI#455** (security, open, planned for v2.1.7.0).
 
 ### Boot-Time Mission Writers Reload Under the Lock (WI#317)
 
