@@ -46,6 +46,7 @@ function makeSdk(options: MockOptions = {}) {
   let messageListCalls = 0
   const messageListArgs: unknown[] = []
   const promptArgs: unknown[] = []
+  const promptEnvSnapshots: Array<Record<string, string | undefined>> = []
   const createArgs: unknown[] = []
   const signals: AbortSignal[] = []
   const captureSignal = (args: unknown[]) => {
@@ -79,6 +80,13 @@ function makeSdk(options: MockOptions = {}) {
       prompt: async (...args: unknown[]) => {
         promptArgs.push(args)
         captureSignal(args)
+        // NU-1: sample the shared bridge env at prompt time. No task grant
+        // entries may land in it (the serve process does not inherit it).
+        promptEnvSnapshots.push({
+          AGENT_AUTH_TOKEN: process.env.AGENT_AUTH_TOKEN,
+          AGENT_AUTH_TOKEN_FILE: process.env.AGENT_AUTH_TOKEN_FILE,
+          LEGIT_TASK_VAR: process.env.LEGIT_TASK_VAR,
+        })
         if (options.pendingPrompt) await new Promise(() => {})
         if (options.promptError) throw options.promptError
         return { id: "inbox-1", sessionID: "session-1", type: "user" }
@@ -170,6 +178,7 @@ function makeSdk(options: MockOptions = {}) {
     messageListArgs,
     signals,
     promptArgs,
+    promptEnvSnapshots,
     createArgs,
   }
 }
@@ -628,6 +637,59 @@ AUTHORITATIVE TASK
 fix it`,
 })
 assert.ok(contextPromptArgs[1].signal instanceof AbortSignal)
+
+// NU-1: task grant entries (agent-chosen at create_job) are never merged into
+// the bridge's process.env — neither the reserved hub-credential names nor an
+// ordinary key may land in the shared env at prompt time.
+{
+  const savedToken = process.env.AGENT_AUTH_TOKEN
+  const savedTokenFile = process.env.AGENT_AUTH_TOKEN_FILE
+  process.env.AGENT_AUTH_TOKEN = "bridge-secret"
+  delete process.env.AGENT_AUTH_TOKEN_FILE
+  const warnings: string[] = []
+  const savedWarn = console.warn
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map((a) => String(a)).join(" "))
+  }
+  try {
+    const envSdk = makeSdk({})
+    await runTask(envSdk.sdk, {
+      task_id: "task-env-reserved",
+      prompt: "read env",
+      context: {
+        environment: {
+          AGENT_AUTH_TOKEN: "forged-by-task",
+          AGENT_AUTH_TOKEN_FILE: "/run/lunarwing/agent_auth_token",
+          LEGIT_TASK_VAR: "kept",
+        },
+      },
+    })
+    assert.equal(process.env.AGENT_AUTH_TOKEN, "bridge-secret", "the bridge's own token must survive a task run")
+    assert.equal(
+      process.env.AGENT_AUTH_TOKEN_FILE,
+      undefined,
+      "a task-supplied handoff pointer must never land in the shared env",
+    )
+    // No task grant entry may land in the shared bridge env at prompt time.
+    assert.equal(envSdk.promptEnvSnapshots.length, 1)
+    assert.deepEqual(
+      envSdk.promptEnvSnapshots[0],
+      { AGENT_AUTH_TOKEN: "bridge-secret", AGENT_AUTH_TOKEN_FILE: undefined, LEGIT_TASK_VAR: undefined },
+      "no task grant entry may land in the shared bridge env at prompt time",
+    )
+    // Nothing is injected, so there is nothing to restore afterward either.
+    assert.equal(process.env.LEGIT_TASK_VAR, undefined)
+    const drops = warnings.filter((w) => w.includes("dropped task-supplied env entry"))
+    assert.equal(drops.length, 0, `no env-drop path should remain, got ${JSON.stringify(warnings)}`)
+    assert.ok(warnings.every((w) => !w.includes("forged-by-task")), "never log the value")
+  } finally {
+    console.warn = savedWarn
+    if (savedToken === undefined) delete process.env.AGENT_AUTH_TOKEN
+    else process.env.AGENT_AUTH_TOKEN = savedToken
+    if (savedTokenFile === undefined) delete process.env.AGENT_AUTH_TOKEN_FILE
+    else process.env.AGENT_AUTH_TOKEN_FILE = savedTokenFile
+  }
+}
 
 // WI#357 exposure policy: the session ruleset handed to session.create must
 // deny the self-exposure command surface, and those denies must come AFTER

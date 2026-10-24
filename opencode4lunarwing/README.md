@@ -73,9 +73,12 @@ the enrichment re-reads for up to ~1.5 s before giving up. The tail is
 bounded (last 25 lines / 8 KiB, 400-character code-point line cap) and known
 secret values (the bridge's credential environment — fixed names plus any
 `TOKEN`/`SECRET`/`PASSWORD`/`PASSWD`/`API_KEY`/`PRIVATE_KEY`/`CREDENTIAL`/
-`AUTH`-shaped name, snapshotted at worker start — and this task's injected
-environment, in both raw and JSON-escaped form, longest first) are redacted
-before anything is persisted. The read is symlink- and FIFO-safe. Set
+`AUTH`-shaped name, snapshotted at worker start — and this task's
+`context.environment` values, kept on the request and never merged into the
+bridge's `process.env` (NU-1), in both raw and JSON-escaped form, longest
+first) are redacted before anything is persisted. On this lane those grant
+values do not reach task code at all (WI#474). The read is symlink- and
+FIFO-safe. Set
 `OPENCODE_SERVE_LOG` to override the log path or to an explicit empty value
 (`OPENCODE_SERVE_LOG=`) to disable the enrichment entirely. The structured
 log lives in the container (persisted in the `opencode-data` volume in the
