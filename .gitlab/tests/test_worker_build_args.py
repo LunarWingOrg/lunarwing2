@@ -185,20 +185,27 @@ metadata.write_text(json.dumps({{"containerimage.digest": "sha256:" + "0" * 64}}
     def test_push_backoff_doubles_from_45s_across_eight_attempts(self):
         # Pipeline 6252's sustained 19-minute burst outlasted the previous
         # 6-attempt/~15-minute window. The curve must keep its 45 s base and
-        # its doubling across exactly 8 attempts: 45+90+180+360+720+1440+2880
-        # ≈ 95 min of sleeping, inside the candidate job's 8 h timeout. A
-        # wider curve would grow past that budget, so pin the rungs.
+        # its doubling across exactly 8 attempts: the seven retry rungs
+        # 45+90+180+360+720+1440+2880 sum to 5715 s (~95.25 min) of
+        # sleeping, inside the candidate job's 8 h timeout. A wider curve
+        # would grow past that budget, so pin the rungs. The jitter is
+        # CI_JOB_ID % 30 (run-205 NQ-2) and this suite pins CI_JOB_ID=2,
+        # so the rungs assert exactly (run-205 NQ-1: the old PID-jitter
+        # envelope bound failed about one run in five — the bases alone
+        # sum to 5715 s, not 95*60, so any PID with $$ % 15 >= 12 broke
+        # the total bound).
         self.env["BUILDCTL_MODE"] = "fail_always"
         result = self.run_build()
         self.assertNotEqual(result.returncode, 0)
         delays = self.recorded_sleeps()
-        self.assertEqual(len(delays), 7, delays)
-        # Each delay is base + a 1..15 s PID jitter, so assert the envelope.
         expected_bases = [45, 90, 180, 360, 720, 1440, 2880]
-        for delay, base in zip(delays, expected_bases):
-            self.assertGreaterEqual(delay, base, delays)
-            self.assertLessEqual(delay, base + 15, delays)
-        self.assertLessEqual(sum(delays), 95 * 60 + 7 * 15)
+        jitter = int(self.env["CI_JOB_ID"]) % 30
+        self.assertEqual(
+            delays,
+            [base + jitter for base in expected_bases],
+            f"jitter {jitter} from CI_JOB_ID={self.env['CI_JOB_ID']}",
+        )
+        self.assertLessEqual(sum(expected_bases) + 7 * 29, 8 * 3600)
 
     def test_non_transient_build_failure_is_not_retried(self):
         self.env["BUILDCTL_MODE"] = "fail_compile"

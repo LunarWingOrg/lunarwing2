@@ -49,9 +49,14 @@ const KILL_GRACE_MS = 3_000
  *
  * A bare `child.kill("SIGTERM")` only queues the signal: the process can
  * outlive it holding a stdio pipe open, which keeps the runner's event loop
- * alive until the 120 s per-test timeout. Pipeline 6308's kimi candidate
- * failed exactly that way (169 tests, 101 pass, 0 fail, 1 cancelled). SIGKILL
- * after a short grace bounds a bridge that ignores SIGTERM.
+ * alive until the 120 s per-test timeout. SIGKILL after a short grace
+ * bounds a bridge that ignores or outlives SIGTERM. This is hygiene, not a
+ * credited pipeline fix (run-205 NQ-3): the file-level hang shape is
+ * pipeline 6252's kimi candidate (job 127798: one `not ok -
+ * lunarwing_bridge_test.js` at the 120 s testTimeoutFailure with no
+ * subtest output), whose cause was never root-caused, and 6308's kimi
+ * candidate was not a hang at all (163 pass / 2 fail / 0 cancelled /
+ * 4 skipped — the `/proc` EACCES failures !1876 fixed).
  */
 async function killBridge(child: ChildProcessWithoutNullStreams): Promise<void> {
   try {
@@ -341,6 +346,15 @@ conn.on("data", (d) => {
         if (message.type === "tool_call" && message.payload.call_id === "drop1") resolve()
       })
       ws!.once("error", reject)
+      // Bound the parked wait (run-205 NQ-3): a bridge whose tool proxy
+      // died — e.g. the socket path over the unix limit, `listen EINVAL` —
+      // never relays the frame, and an unbounded await would sit out the
+      // whole per-test timeout.
+      const bound = setTimeout(
+        () => reject(new Error("timed out waiting for the parked tool_call frame")),
+        15_000,
+      )
+      bound.unref()
     })
     ws.send(JSON.stringify({ type: "task_request", payload: {
       task_id: "drop-task", prompt: "read a note", timeout_ms: 30000,
@@ -437,6 +451,13 @@ conn.on("data", (d) => {
         })
         hubSide.once("error", reject)
       })
+      // Bound the parked wait (run-205 NQ-3): same reason as the server-mode
+      // test above — a dead tool proxy never relays the frame.
+      const bound = setTimeout(
+        () => reject(new Error("timed out waiting for the parked tool_call frame")),
+        15_000,
+      )
+      bound.unref()
     })
     // Park the call in the relay: the hub observes the frame but never
     // answers, then closes the connection. Closing the server afterwards
