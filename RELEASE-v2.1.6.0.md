@@ -190,7 +190,7 @@ previous compatibility baseline.
 | Bundled skills | Seven product skills, unchanged; no skill migration |
 | Channel registry | darkirc 0.1.12, multica 0.1.15, weechat 0.2.13, xmpp 0.1.18 |
 | Tool registry | cavepony-tool 0.4.6, gitlab 0.1.9, gotify 0.1.3, llm-context 0.1.4, multica-bridge 0.1.5, ssh 0.1.4, vision-analyze 0.1.6, voice-transcribe 0.1.4, web-search 0.2.5 |
-| External workers | kimi-code `2.3.0` (upgraded from 2.2.0), opencode `v1.18.25`, opencode2 `v2.1.2` (first crossed the OpenTunnel boundary at v2.0.32 under maintainer-approved WI#427; OpenTunnel compiled out, every exposure gate re-verified at the pin), Pebble `2d0f3786…` (upstream ref unchanged; its reviewed lock was upgraded for the rustls and CVE-2026-111943 webpki advisories) |
+| External workers | kimi-code `2.3.0` (upgraded from 2.2.0), opencode `v1.18.25` (models.dev catalog pinned in-image, no live fetch — WI#467; ships with the next opencode rebuild), opencode2 `v2.1.2` (first crossed the OpenTunnel boundary at v2.0.32 under maintainer-approved WI#427; OpenTunnel compiled out, every exposure gate re-verified at the pin), Pebble `2d0f3786…` (upstream ref unchanged; its reviewed lock was upgraded for the rustls and CVE-2026-111943 webpki advisories) |
 | Cargo features | New non-default `libsql-remote-replica` feature gates Turso sync (breaking — see Upgrade Notes) |
 
 Registry version bumps require rebuilding/reinstalling the affected WASM
