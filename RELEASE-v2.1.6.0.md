@@ -1461,7 +1461,19 @@ Crate Security Re-Audit). The clearing owners named in `ic/deny.toml`
 (WI#368 for rsa, WI#367 for `failure`/`rental`/`atty`, WI#418 for the
 libsql chain) were all closed on 2026-10-18 with every chain still in
 `ic/Cargo.lock`, so no accepted advisory has an open clearing owner at
-release; WI#363, the CI guard that would require one, is still open.
+release; WI#363, the CI guard that would require one, was closed on 2026-10-21
+(its offline guard landed with !1806 and is described under the
+Accepted-advisory guard changes).
+
+**Accepted-advisory guard (WI#363).** The `ic/deny.toml` accepted-advisory
+list relied on two facts no gate checked: that every `ignore` reason names
+a clearing-owner work item, and that the owner is real. `validate_config.py`
+now requires the `clearing owner: WI#N` phrase in every ignore reason and
+runs offline in the `ci-config` lane (landed with !1806, merged 2026-10-20;
+WI#363 closed on 2026-10-21). A reason naming only a work item fails, so an
+acceptance can no longer reach `ic/Cargo.lock` without a named owner — the
+gap that let the WI#331/WI#367/WI#368/WI#418 acceptances sit ownerless
+after their work items closed.
 
 **Known issues / open at release.** Reconciled per item in
 `docs/ops/v2.1.6.0_OPEN_WORK_ITEMS_STATUS.md`, a 2026-10-14 01:05Z snapshot
