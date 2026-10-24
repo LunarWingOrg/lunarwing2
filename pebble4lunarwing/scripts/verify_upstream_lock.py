@@ -25,7 +25,13 @@ import tomllib
 # RUSTSEC-2026-0338/0339/0340/0341/0342 (QUIC DoS: remote panic, unbounded
 # memory growth; patched >= 0.11.18, all five clear at 0.11.19). The shipped
 # graph resolves quinn-proto through reqwest's QUIC feature, so this is a
-# live worker-image exposure, not a lockfile-only pin. quinn and quinn-udp
+# lockfile-pinned exposure carried by the shipped worker lock, not a
+# lockfile-only pin: it resolves through reqwest's optional QUIC
+# dependencies. The default `pebble prompt` build does not enable reqwest's
+# http3 feature, so the QUIC code is not compiled in the default binary;
+# quinn stays lockfile-only until that feature is enabled, exactly the
+# pyo3 class .gitlab/scripts/check-lockfile-only-advisories.sh guards.
+# quinn and quinn-udp
 # move to the same patch levels as every other audited root (quinn 0.11.11 ->
 # 0.11.12, quinn-udp 0.5.15 -> 0.5.16; quinn-udp's windows-sys edge moves
 # 0.61.2 -> 0.59.0 inside its existing requirement, which re-points errno /
