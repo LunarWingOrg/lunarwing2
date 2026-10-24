@@ -21,7 +21,33 @@ import tomllib
 # allowlist for that raise.
 # chacha20: 0.10.1 is yanked on crates.io (upstream's own pin); 0.10.2 is the
 # identical-semver replacement, no advisory either way.
-ALLOWED_PACKAGES = {"rustls", "rustls-webpki", "webpki-roots", "chacha20"}
+# 2026-10-24 (v2.1.7.0 item 3): quinn-proto 0.11.16 is affected by
+# RUSTSEC-2026-0338/0339/0340/0341/0342 (QUIC DoS: remote panic, unbounded
+# memory growth; patched >= 0.11.18, all five clear at 0.11.19). The shipped
+# graph resolves quinn-proto through reqwest's QUIC feature, so this is a
+# live worker-image exposure, not a lockfile-only pin. quinn and quinn-udp
+# move to the same patch levels as every other audited root (quinn 0.11.11 ->
+# 0.11.12, quinn-udp 0.5.15 -> 0.5.16; quinn-udp's windows-sys edge moves
+# 0.61.2 -> 0.59.0 inside its existing requirement, which re-points errno /
+# rustix / winapi-util dependency edges — windows-sys 0.61.2 itself stays
+# locked and no package is added or removed).
+# tokio 1.52.3 -> 1.53.3 clears RUSTSEC-2026-0386 (unsound safe AsyncFd
+# constructors) and clipboard-win 5.4.1 -> 5.4.3 replaces a yanked pin, the
+# same remediations already applied to the other roots on 2026-10-23.
+ALLOWED_PACKAGES = {
+    "chacha20",
+    "clipboard-win",
+    "errno",
+    "quinn",
+    "quinn-proto",
+    "quinn-udp",
+    "rustix",
+    "rustls",
+    "rustls-webpki",
+    "tokio",
+    "winapi-util",
+    "webpki-roots",
+}
 
 
 def package_records(lock: dict) -> dict[tuple[str, str, str], dict]:
@@ -90,7 +116,7 @@ def main() -> int:
     except (OSError, UnicodeError, ValueError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
-    print("Verified Pebble lock SHA256 and rustls/rustls-webpki/webpki-roots/chacha20-only package delta.")
+    print("Verified Pebble lock SHA256 and reviewed package-only delta.")
     return 0
 
 
