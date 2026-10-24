@@ -1378,8 +1378,9 @@ ships the same MCP shim shape inside its Rust bridge binary. Proxied tools
 are off by default: a worker's `tool_allowlist` is empty unless an operator
 sets it (`configure-worker-tools` on multi-tenant hosts), so every proxied
 call is denied until an operator grants one. No real worker has made a
-granted proxied call yet, so WI#324's real-worker acceptance is still
-open, and the opencode and opencode2 plugins and the pebble shim ship only
+granted proxied call yet, so WI#324's real-worker acceptance
+(the tracker closed WI#324 itself on 2026-10-21) rides the rebuilt images
+under WI#449, and the opencode and opencode2 plugins and the pebble shim ship only
 with their rebuilt images (the opencode one on a lane that stays frozen at
 v1.18.25 pending the WI#333 decision). On all four lanes the tool grant is
 ambient for every process in the task (untrusted repo scripts can call the
