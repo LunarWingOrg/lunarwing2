@@ -390,16 +390,80 @@ partial state:
   both per-result worker ids and byte-identical reruns), not a lane defect;
   a rerun comparing output with `(wN)` stripped is the right check.
 
-### F8 (refinement of F3): the workspace lock is held by the *executing* task, not the lane
+### F8 (refinement of F3): the workspace lock is per-path, and long jobs coexist
 
-The duplicate dispatches in F3 were refused, but the later kimi Go job
-`352b152e` was accepted and completed while the Rust job `7ae2cc44` still
-owned `/workspace` (it created `/workspace/kimi_item101_go` alongside
-`/workspace/item101_rust`). So the practical rule is: a second job is refused
-while the first is **actively executing**, and accepted once the first is
-idle/waiting. Concurrent jobs on one lane therefore share a writable
-`/workspace`; the lock does not give per-job isolation over a long,
-mostly-waiting task. Operators wanting isolation should still serialise jobs
-per lane (or use separate task directories, as these did).
+The lock is a **path-overlap** check, not a lane-wide mutex:
+`kimicode4lunarwing/scripts/lunarwing_bridge.ts:238`
+(`workspacePathsOverlap(active, workspace)` against `activeWorkspaces`, default
+`KIMI_MAX_CONCURRENT_TASKS=8`) and `pebble4lunarwing/src/bridge.rs:405`
+(`registry.try_register`). The F3 duplicates were refused because both jobs
+resolved to the same `/workspace` root.
+
+Observed here: the kimi Go job `352b152e` was accepted and completed while the
+Rust job `7ae2cc44` was still `in_progress`, and both wrote under
+`/workspace` (`item101_rust` and `kimi_item101_go`). So **two jobs can be live
+on one lane at once**; plan on serialising dispatches yourself if you want
+isolation, or give each job a distinct `project_dir` (the `create_job`
+parameter is forwarded as `context.project_dir`). I did not vary
+`project_dir` in this pass, so the exact per-subdirectory behaviour is
+asserted from the code, not from a live experiment.
+
+### F9 (self-repair — slow-but-alive external jobs are declared stuck, then spam "manual intervention")
+
+The most operationally important finding of this pass. The big Rust job's
+`turnStep=0.17` request sat unanswered from 16:17:21. At **16:23:13** the
+daemon's self-repair logged:
+
+```
+INFO  Attempting to repair stuck job 7ae2cc44-…
+WARN  Manual intervention needed: Job 7ae2cc44-… has exceeded maximum repair attempts (3)
+```
+
+and it has repeated that pair **every 60 s since** (16:28, 16:29, 16:30, …,
+still going at 16:42), while `/api/jobs/7ae2cc44` continues to report
+`state: in_progress` with only the `creating → running` transition.
+
+Earlier, while the worker was genuinely silent in the 508 s upstream wait, the
+same job was "repaired" three times in three minutes:
+
+- 16:05:13 `Successfully recovered job 7ae2cc44-…` / `Repair succeeded: … recovered and will be retried`
+- 16:06:13 same
+- 16:07:13 same
+
+Mechanism, confirmed in-tree: `DefaultSelfRepair` runs every
+`repair_check_interval_secs` (60 s) with `stuck_threshold_secs` **300**
+(`ic/src/settings.rs:691`, `ic/src/agent/agent_loop.rs:652`);
+`find_stuck_jobs_with_threshold` measures **idleness** from
+`last_activity_at` and explicitly excludes synthetic worker heartbeats
+(`ic/src/context/manager.rs:250-256`). The `[worker] Still waiting for Kimi
+Code response; task remains active.` heartbeats therefore do **not** reset the
+idle clock, so any external job whose worker is quiet for 5 minutes — exactly
+what a slow upstream produces — is declared stuck, "recovered" three times,
+and then parked in a permanent once-a-minute "Manual intervention needed"
+loop with no state change visible to the API.
+
+Consequences:
+
+1. The "Manual intervention needed" warning is a **false alarm** for slow
+   external jobs; nothing is actually repaired or cancelled, and the worker
+   keeps running (this job's kimi-code process was still alive).
+2. Once `repair_attempts >= 3` the message repeats forever at 60 s intervals —
+   log spam with no escalation or backoff, and no way to tell a genuinely dead
+   job from a slow one without reading worker-side logs.
+3. Real remediation has to happen at the worker/upstream layer (or an explicit
+   `/api/jobs/{id}/cancel`), not via the reaper.
+
+Suggested follow-ups: let genuine worker heartbeats count as activity for
+external jobs (or use a much larger threshold for `external:*` modes), stop
+re-logging "Manual intervention needed" once it has been emitted, and surface
+`stuck`/`repair_attempts` in `/api/jobs/{id}` so the operator can see why.
+
+### F10 (minor, gateway routing): expired-gate reply has no routing target
+
+While the turns finished, the daemon logged
+`failed to deliver expired-gate reply channel=gateway error=Channel gateway is
+missing a routing target: broadcast() requires a thread_id on the response`
+(16:38:39). The gate reply is dropped instead of reaching the owning thread;
+cosmetic for these tests but worth a note alongside F2/F5.
 
 _(further tasks appended below)_
