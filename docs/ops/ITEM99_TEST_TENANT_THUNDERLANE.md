@@ -158,6 +158,30 @@ This is real evidence that the fat kimi image's Rust toolchain works inside
 the task sandbox (the item's "full toolchains" requirement), and that the
 worker round-trips file writes, builds, executions, and a long result body.
 
+### kimi — task 2: Go HTTP server (three endpoints)
+
+Job `97040ff8-3295-4ebc-859c-2d123289f49a`, `job_mode` `external:kimi`,
+completed in **290 s** on a fresh thread (14 events). Worker tool loop:
+
+- `[Bash] go version && ls -la /workspace` → `go version go1.24.3 linux/amd64`
+- `[Write] /workspace/kimi_go_http/main.go` (1588 bytes, stdlib only:
+  `net/http`, `strconv`, `sync/atomic`)
+- `[Bash] go mod init … && go build -o server .` → 8.4 MB binary produced
+- `[Bash]` running the server in the background and curling every endpoint →
+  ```
+  --- GET /health ---      {"ok":true}
+  --- GET /fib?n=20 ---    {"fib":6765,"n":20}
+  --- GET /count (1st) --- {"count":1}
+  --- GET /count (2nd) --- {"count":2}
+  ```
+- `result: "Completed: All done — the server builds and every endpoint behaves
+  as specified…"` with the full source and the Go version.
+
+Evidence value: the fat kimi image's **Go toolchain** works (1.24.3), the
+worker can start long-lived background processes inside the task sandbox and
+kill them, and the shared counter proves real in-process state, not a
+replayed canned answer.
+
 ## Findings
 
 (Filled in below.)
