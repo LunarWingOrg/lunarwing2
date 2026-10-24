@@ -46,6 +46,7 @@ function makeSdk(options: MockOptions = {}) {
   let messageListCalls = 0
   const messageListArgs: unknown[] = []
   const promptArgs: unknown[] = []
+  const promptEnvSnapshots: Array<Record<string, string | undefined>> = []
   const createArgs: unknown[] = []
   const signals: AbortSignal[] = []
   const captureSignal = (args: unknown[]) => {
@@ -79,6 +80,14 @@ function makeSdk(options: MockOptions = {}) {
       prompt: async (...args: unknown[]) => {
         promptArgs.push(args)
         captureSignal(args)
+        // WI#454: sample the shared env at prompt time — the moment task code
+        // would inherit it — so a pin can assert the reserved credential
+        // names never landed, whatever a later `finally` restores.
+        promptEnvSnapshots.push({
+          AGENT_AUTH_TOKEN: process.env.AGENT_AUTH_TOKEN,
+          AGENT_AUTH_TOKEN_FILE: process.env.AGENT_AUTH_TOKEN_FILE,
+          LEGIT_TASK_VAR: process.env.LEGIT_TASK_VAR,
+        })
         if (options.pendingPrompt) await new Promise(() => {})
         if (options.promptError) throw options.promptError
         return { id: "inbox-1", sessionID: "session-1", type: "user" }
@@ -170,6 +179,7 @@ function makeSdk(options: MockOptions = {}) {
     messageListArgs,
     signals,
     promptArgs,
+    promptEnvSnapshots,
     createArgs,
   }
 }
@@ -628,6 +638,67 @@ AUTHORITATIVE TASK
 fix it`,
 })
 assert.ok(contextPromptArgs[1].signal instanceof AbortSignal)
+
+// WI#454: this lane injects task-supplied env into its OWN process.env (the
+// serve process and its bash tools inherit it), so a task naming the
+// hub-handshake credential would hand itself — and every concurrent task —
+// the bridge's token. Both reserved names are dropped, and the drop is
+// logged; ordinary task env still lands.
+{
+  const savedToken = process.env.AGENT_AUTH_TOKEN
+  const savedTokenFile = process.env.AGENT_AUTH_TOKEN_FILE
+  process.env.AGENT_AUTH_TOKEN = "bridge-secret"
+  delete process.env.AGENT_AUTH_TOKEN_FILE
+  const warnings: string[] = []
+  const savedWarn = console.warn
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map((a) => String(a)).join(" "))
+  }
+  try {
+    const envSdk = makeSdk({})
+    await runTask(envSdk.sdk, {
+      task_id: "task-env-reserved",
+      prompt: "read env",
+      context: {
+        environment: {
+          AGENT_AUTH_TOKEN: "forged-by-task",
+          AGENT_AUTH_TOKEN_FILE: "/run/lunarwing/agent_auth_token",
+          LEGIT_TASK_VAR: "kept",
+        },
+      },
+    })
+    assert.equal(process.env.AGENT_AUTH_TOKEN, "bridge-secret", "the bridge's own token must survive a task run")
+    assert.equal(
+      process.env.AGENT_AUTH_TOKEN_FILE,
+      undefined,
+      "a task-supplied handoff pointer must never land in the shared env",
+    )
+    // The stronger half: the env task code would actually inherit, sampled at
+    // prompt time. A mutant that injects the names but restores them in the
+    // `finally` still hands them to every task process in between.
+    assert.equal(envSdk.promptEnvSnapshots.length, 1)
+    assert.deepEqual(
+      envSdk.promptEnvSnapshots[0],
+      { AGENT_AUTH_TOKEN: "bridge-secret", AGENT_AUTH_TOKEN_FILE: undefined, LEGIT_TASK_VAR: "kept" },
+      "task code must see the bridge's own token unchanged, no handoff pointer, and its ordinary env",
+    )
+    // LEGIT_TASK_VAR is restored by executeTask's finally, so it is absent
+    // again here — the inject/restore contract, unchanged for ordinary keys.
+    assert.equal(process.env.LEGIT_TASK_VAR, undefined)
+    const drops = warnings.filter((w) => w.includes("dropped task-supplied env entry"))
+    assert.equal(drops.length, 2, `expected one drop warning per reserved key, got ${JSON.stringify(warnings)}`)
+    assert.ok(drops.some((w) => w.includes("AGENT_AUTH_TOKEN ") || w.includes("AGENT_AUTH_TOKEN for")))
+    assert.ok(drops.some((w) => w.includes("AGENT_AUTH_TOKEN_FILE")))
+    assert.ok(drops.every((w) => w.includes("task-env-reserved")), "each drop must name the task")
+    assert.ok(drops.every((w) => !w.includes("forged-by-task")), "never log the value")
+  } finally {
+    console.warn = savedWarn
+    if (savedToken === undefined) delete process.env.AGENT_AUTH_TOKEN
+    else process.env.AGENT_AUTH_TOKEN = savedToken
+    if (savedTokenFile === undefined) delete process.env.AGENT_AUTH_TOKEN_FILE
+    else process.env.AGENT_AUTH_TOKEN_FILE = savedTokenFile
+  }
+}
 
 // WI#357 exposure policy: the session ruleset handed to session.create must
 // deny the self-exposure command surface, and those denies must come AFTER
