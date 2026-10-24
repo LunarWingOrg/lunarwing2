@@ -223,4 +223,49 @@ but a >8 minute silent stretch is indistinguishable from a hang to an operator.
 Recommendation: surface per-request elapsed time in `job_events`, or add a
 worker-side LLM timeout with a visible retry.
 
+### F5 (gateway model output — `repl_argument_corruption` / `nested_fence`)
+
+Long, code-heavy delegation prompts repeatedly drove the **gateway** model
+(`tensorzero::function_name::lunarwing`) into emitting a REPL/tool draft with a
+nested code fence, which the daemon rejects by design:
+
+```
+WARN Rejected corrupted REPL arguments before execution
+  provider="tensorzero::function_name::lunarwing"
+  error_class="repl_argument_corruption" corruption_signature=nested_fence
+WARN model request failed after provider recovery failure_kind=repl_argument_corruption
+```
+
+Guard location: `ic/src/llm/stream_integrity.rs` (`validate_tool_response` →
+`reject_repl_arguments`), corruption kinds in
+`ic/crates/lunarwing_engine/src/types/repl.rs:18` (`nested_fence`). The
+protection itself is correct — the tainted draft never executes — but two
+operator-visible consequences matter:
+
+1. The turn ends with **no assistant response** and no job, while
+   `/api/chat/history` shows only `state: Failed` with `response: null` and no
+   error text (F1). The reason is visible only in the daemon journal.
+2. **It is not fully terminal:** one pebble-Go turn that logged
+   `repl_argument_corruption` at 16:12:36 still created its job at 16:14:47
+   (the model recovered and called `create_job` afterwards). Dispatchers must
+   therefore wait for the *job*, not assume the turn is dead, or they will
+   double-dispatch — which is exactly how jobs `e5c68890` (Go, rejected at
+   16:17:06) and `85d1a0b4` (Rust) hit the F3 workspace lock.
+
+Mitigation that worked here: adding to the *gateway* prompt "never emit
+markdown code fences and never write Python REPL code yourself; put every
+instruction in the create_job description as plain prose" made subsequent
+delegations reach `create_job` promptly. A durable fix would be for the
+delegation/system prompt to steer the model away from fenced REPL drafts when
+the requested action is a single structured `create_job` call, and to surface
+the failure kind on the turn so the operator does not have to read the journal.
+
+### F6 (observability — no job id in the gateway response, no mode in job list)
+
+`/api/jobs` returns only `id`, `title`, `state`, `user_id`, `created_at`,
+`started_at`; `job_mode` (`external:kimi` / `external:pebble`) is available
+only from `/api/jobs/{id}`. Multi-job testing therefore needs a detail call per
+job to attribute it to a lane. The worker's own result is the authoritative
+record of what ran.
+
 _(further tasks appended below)_
