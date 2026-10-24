@@ -526,6 +526,49 @@ command mkdir -p "$fixture/home/lunarwing"
 command rm -rf -- "$wi453_real"
 unset wi453_real
 
+# SweetieBot pass-256 on WI#453 (note #11232): rootful workspace prep must be
+# IDEMPOTENT. The rootful branch chowns the leaf to the container uid and
+# never restores tenant ownership, so a SECOND prepare_worker_workspace call
+# sees a container-uid leaf. The leaf-uid gate must not refuse that — a
+# config-change force-recreate, or the Quadlet render that runs before the
+# existing-container freshness gate, would then wedge every later start of
+# that worker lane on that host. Rootless runs keep the gate: keep-id maps
+# the tenant identity, so the leaf stays tenant-owned there and a foreign
+# owner is still a spoof signal. The `stat` shell function shadows the binary
+# for the helper's two `stat -c %u` probes, reporting the CONTAINER uid for
+# the leaf (the post-chown state) and the real owner for the tenant root.
+wi453b_leaf="$fixture/home/lunarwing/kimi-workspace"
+command mkdir -p "$wi453b_leaf"
+wi453b_container_uid=10002
+stat() {
+  if [[ "${1:-}" == "-c" && "${2:-}" == "%u" && "${3:-}" == "$wi453b_leaf" ]]; then
+    printf '%s\n' "$wi453b_container_uid"
+    return 0
+  fi
+  command stat "$@"
+}
+MT_ROOTLESS=false
+wi453b_rootful_rc=0
+prepare_worker_workspace root kimi >/dev/null 2>&1 || wi453b_rootful_rc=$?
+if [[ "$wi453b_rootful_rc" -eq 0 ]]; then
+  pass 'rootful workspace prep is idempotent across a container-uid leaf (WI#453 pass-256)'
+else
+  fail "rootful workspace prep refused a container-uid leaf (rc $wi453b_rootful_rc) — every later start of the lane would wedge"
+fi
+MT_ROOTLESS=true
+wi453b_rootless_rc=0
+wi453b_rootless_out="$(prepare_worker_workspace root kimi 2>&1)" || wi453b_rootless_rc=$?
+if [[ "$wi453b_rootless_rc" -eq 1 && "$wi453b_rootless_out" == *'not owned like the tenant root'* ]]; then
+  pass 'rootless workspace prep still refuses a foreign-owned leaf (WI#453)'
+else
+  fail "rootless leaf-uid gate missing (rc $wi453b_rootless_rc): $wi453b_rootless_out"
+fi
+unset -f stat
+# shellcheck disable=SC2034  # read by the sourced prepare_worker_workspace
+MT_ROOTLESS=false
+command rm -rf -- "$wi453b_leaf"
+unset wi453b_leaf wi453b_container_uid wi453b_rootful_rc wi453b_rootless_rc wi453b_rootless_out
+
 # MI-3 (run-186 review): a tenant-planted hard link inside the workspace
 # must keep its original owner — the chown walk skips regular files with a
 # link count above 1 so `chown -R` cannot hand an outside file to the

@@ -1947,8 +1947,18 @@ prepare_worker_workspace() {
   # Ownership is checked against the tenant root dir — provisioned
   # tenant-owned by create_tenant_user — rather than by resolving the
   # account's uid, so the check also holds for fixture tenants with no
-  # passwd entry (same posture as prepare_pebble_workspace).
-  if [[ "$(stat -c %u "$workspace_dir" 2>/dev/null || printf -- -1)" \
+  # passwd entry (same posture as prepare_pebble_workspace). The gate is
+  # scoped to rootless runs: on rootful hosts the rootful branch below
+  # legitimately chowns the leaf to the container uid, so a second call
+  # (any config-change force-recreate, or a Quadlet render that runs
+  # before the existing-container freshness gate) would find a
+  # container-uid leaf and refuse, wedging every later start of that
+  # worker lane on that host (SweetieBot pass-256 on WI#453, note #11232).
+  # The anti-spoof purpose of the gate is already covered on rootful by
+  # the component walk above plus the tenant-side mkdir: the leaf was
+  # created by the tenant, and root chowns only the verified directory.
+  if [[ "$MT_ROOTLESS" == "true" \
+      && "$(stat -c %u "$workspace_dir" 2>/dev/null || printf -- -1)" \
       != "$(stat -c %u "$lw_root" 2>/dev/null || printf -- -2)" ]]; then
     printf 'error: %s workspace not owned like the tenant root: %s\n' "$worker" "$workspace_dir" >&2
     return 1
