@@ -242,9 +242,115 @@ Evidence value: the pebble lane's **Rust toolchain** works (same 1.96.1 pin as
 the kimi image), and the worker produced a genuinely non-trivial parser whose
 operator-precedence handling is proven by the `2+3*4 = 14` case.
 
+## Landed-changes exercise matrix
+
+| Area | Evidence on thunderlane |
+| --- | --- |
+| WI#330 no-default LLM endpoint + worker inheritance | `KIMI_BASE_URL` written as the tenant endpoint with `KIMI_BASE_URL_SOURCE=inherited`; the endpoint is container-reachable (worker jobs called it successfully) |
+| kimi worker lane | fat image, kimi-code **2.3.0**, `max_output_size = 131072` pinned on `tensorzero::function_name::FrontierCODEK`; two real jobs completed |
+| pebble worker lane | fat image, pebble **0.5.0**; two real jobs completed after the key was supplied cleanly |
+| Full toolchains (the item's explicit ask) | kimi image: rustc/cargo 1.96.1, go 1.24.3, g++ 12.x, python3, node 22 — all exercised in-container. pebble image: rustc 1.96.1, go 1.24.3, g++ 12.2.0 — all exercised in-container |
+| WI#357 workers never self-expose | `worker-listeners thunderlane` → `clean`; both workers publish host loopback only |
+| Approval gate / pending state | every `create_job` parked at the `approval` gate with the full parameter payload; `action=always` resumed it (see F2 for the `thread_id` requirement) |
+| Knowledge seed + sweep + study MCP | 1799 notes seeded, 22 skipped, 20 failed (`knowledge_seed_state.json`); first sweep ran; `study_notes` extension active and authenticated |
+| WASM channel/tool suite | 3 channels (`multica`, `weechat`, `xmpp`) + 9 tools installed; 13 extensions total |
+| Host health pipeline (OpenRC contract) | `lunarwing-mt-health` covers thunderlane through its OpenRC units; no thunderlane-specific unit failures |
+| Engine v2 turn lifecycle | turns transition `Created → Running → Completed`; failed turns leave the thread unusable (F3) |
+
 ## Findings
 
-(Filled in below.)
+### F1 (corpus defect, pre-existing — reproduced, blocks the knowledge refresh)
+
+The shared lw2studymcp corpus note
+`agent-notes-by-agent/sweetiebot/lorebook-injection-defense-and-cache.md`
+contains a **raw NUL byte at byte 2890** (inside a code span that intends to
+show the escape text `</?[\x00s]*lore_entry`). PostgreSQL `text` rejects NUL,
+so that note's write fails deterministically:
+
+```
+knowledge import: …/lorebook-injection-defense-and-cache.md: stranded-row write failed: Search failed: Update failed: db error
+knowledge sync: additive refresh failed; serving last good corpus error_class="note_import_failed" retry_after_secs=61
+```
+
+`knowledge_sync_state.json` after ~35 min shows `consecutive_failures: 6`,
+`last_success_at: null`, `notes_added_last_run: 0`, with 61 → 127 → 247 s
+exponential backoff that can never succeed while the byte is in the corpus.
+The one-shot **seed** absorbs it as a per-note warning (1 of the 20
+`notes_failed`), so the tenant is functional from the seeded corpus, but the
+hourly additive refresh is poisoned. This is the same defect item 74 recorded
+as F1 on `fleetfoot` — still unfixed in the corpus generation this tenant
+synced (`5857c69e81b25f22e3de30a2f6ff33f019fc1c42`). Two follow-ups stand:
+(a) strip/escape the NUL in the lw2studymcp note; (b) make the refresh treat a
+deterministic per-note import failure like the seed does (skip-and-count)
+instead of failing the whole run.
+
+### F2 (API ergonomics — approval without `thread_id` silently no-ops)
+
+`POST /api/chat/approval` accepts `{"request_id": ..., "action": "always"}`
+with no `thread_id` and answers `202 accepted`, but nothing happens: the daemon
+logs
+
+```
+engine v2: approval matched no engine gate; falling through to legacy path
+  user_id=thunderlane channel=gateway request_id=ee5c05ce-… scope="none"
+```
+
+and the gate stays in `pending-gates.json`. Supplying the owning `thread_id` on
+the identical call clears the gate and resumes the turn. `ApprovalRequest`
+already carries an optional `thread_id` (`ic/src/channels/web/types.rs:142`)
+and the handler's doc comment says it is there "so the agent loop finds the
+right session", but there is no warning at the API layer when it is omitted —
+the caller gets a success status for a no-op. Suggested fix: return `400` when
+`thread_id` is absent while exactly one gate exists, or resolve the gate's
+thread from `request_id` server-side.
+
+### F3 (usability — a failed turn wedges its thread)
+
+After the F2 no-op the original thread stopped accepting turns:
+`POST /api/chat/send` still returned `202 accepted`, but
+`/api/chat/history` never gained a new turn and the second dispatch silently
+never ran. A fresh `POST /api/chat/thread/new` thread worked immediately. This
+affects any operator retrying a failed turn on the same thread.
+
+### F4 (stale `shell` gates accumulate indefinitely)
+
+After several dispatches `/api/chat/pending-gates` holds gates for `shell`
+tool calls that were never approved and whose turns are long finished, e.g.
+
+```
+422ad756-… | shell | 0bb0de14-… | { "command": "echo \"job 9fedf119 completed …\"" }
+699fe429-… | shell | f8b7f7e8-… | { "command": "FINAL_dummy=1; echo done" }
+ef8ca6d7-… | shell | 0d67969e-… | { "command": "sleep 45 && echo \"waited\"", "timeout": 60 }
+845460e0-… | shell | a2c71ee2-… | { "command": "echo done" }
+```
+
+They are never reaped when their turn ends, so the gate list grows forever and
+(per F2) approving one without its exact `thread_id` does nothing. A
+turn-completion sweep that drops gates whose thread is no longer running would
+close this.
+
+### F5 (operator credential hygiene — quoted values pass through `--env-file`)
+
+Copying `NANOGPT_API_KEY` from a sibling tenant's `pebble.env` as the literal
+`"sk-nano-…"` (with quotes) makes every pebble job fail with
+`api returned 401 Unauthorized (authentication_error): Invalid session`.
+`podman --env-file` does not strip quotes, so the quoted string is sent as the
+bearer token. Proven from inside the pebble container: quoted value → 401
+`invalid_api_key`, unquoted value → 200. `configure-pebble` writes whatever it
+is given verbatim, so the operator sees only a generic auth error. Suggested
+follow-up: have `configure-pebble` reject/strip a surrounding quote pair (or
+warn) so a copy-pasted env line cannot silently poison the lane.
+
+### F6 (cosmetic, expected)
+
+- `multica` channel reports unhealthy (`invalid multica config: invalid type:
+  null, expected a string`) — no multica server is configured for this tenant.
+  Same as every prior test tenant.
+- WeeChat relay not configured (provisioning anomaly P1) — the adapter and
+  channel still come up; the host's WeeChat 4.10.0 lacks cJSON.
+- `thunderlane@xmpp.sobe.world` XMPP auth: the bridge unit starts and is
+  omemo-ready, but the account does not exist upstream (same operator step as
+  items 72/74).
 
 ## Disposition
 
