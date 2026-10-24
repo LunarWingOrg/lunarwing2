@@ -47,11 +47,12 @@ exposure-policy controls, and OpenRC proxy migrations refuse silently-wrong
 states instead of refusing healthy ones. The cycle closes with the usual
 dependency sweep (2.1.5 → 2.1.6 across all owned packages, refreshed
 registries, regenerated vendor tree) and a full crate-security re-audit with
-five late-cycle security upgrades — rustls 0.23.46, Wasmtime/WASI 36.0.18
+six late-cycle security upgrades — rustls 0.23.46, Wasmtime/WASI 36.0.18
 then 36.0.19 (two Cranelift miscompiles), the CVE-2026-111943 webpki
-root-store trio, and the 2026-10-23 tokio/ctutils/clipboard-win set
+root-store trio, the 2026-10-23 tokio/ctutils/clipboard-win set
 (a ctutils constant-time vulnerability, a tokio unsound notice and a
-yanked `clipboard-win`) — including one
+yanked `clipboard-win`), and the 2026-10-24 crypto-bigint 0.7.6 fix (timing
+variability in operations meant to be constant-time) — including one
 **breaking change**: Turso/libSQL
 remote-replica sync now
 lives behind the non-default `libsql-remote-replica` cargo feature (see
