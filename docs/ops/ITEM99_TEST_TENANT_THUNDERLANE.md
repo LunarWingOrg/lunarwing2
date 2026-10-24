@@ -82,7 +82,42 @@ sudo bash ic/scripts/lunarwing-mt-admin.sh build-tenant thunderlane \
   --with-wasm --with-pebble --with-kimi --with-toolchains
 ```
 
-(Filled in below — see the verification section.)
+`BUILD_EXIT=0`, one pass. Artifacts:
+
+- Daemon release binary `/home/thunderlane/lunarwing/ic/target/release/lunarwing`
+  (110 MB) built from the tenant clone of this branch, plus
+  `bridges/xmpp-bridge/target/release/xmpp-bridge`.
+- Worker images, both **fat (`WITH_TOOLCHAINS=true`)**, in the admin (root)
+  podman store:
+  - `lunarwing-worker-pebble:latest` — 2.34 GB, source revision `48d1ccdfe`,
+    pebble **0.5.0**
+  - `lunarwing-worker-kimi:latest` — 2.69 GB, source revision `722d07a47`,
+    kimi-code **2.3.0**, `config.toml:60` pins `max_output_size = 131072` on
+    `tensorzero::function_name::FrontierCODEK`
+  (pebble builds from the live checkout, kimi from the tenant clone — a
+  docs/mt-admin-only delta.)
+- WASM suite: **12 installed, 1 skipped** (darkirc correctly skipped — tenant
+  darkirc disabled). Channels `multica`/`weechat`/`xmpp`; tools
+  `cavepony`, `gitlab`, `gotify`, `llm-context`, `multica-bridge`, `ssh`,
+  `vision-analyze`, `voice-transcribe`, `web-search`.
+
+### Toolchain probe (the item's "full toolchains" requirement)
+
+Run directly against the built images:
+
+| tool | `lunarwing-worker-kimi` | `lunarwing-worker-pebble` |
+| --- | --- | --- |
+| rustc / cargo | 1.96.1 | 1.96.1 |
+| go | 1.24.3 | 1.24.3 |
+| g++ | 12.x | 12.2.0 |
+| python3 | present | present |
+| node | v22.23.2 | v18.20.4 |
+
+Note: the toolchains live under `/usr/local/{cargo,go}/bin` and are only on
+`PATH` for a **login** shell; a non-login `sh -c 'which rustc'` reports them
+missing. That is expected image shape (the task runner gets the login PATH),
+but it is worth knowing when hand-probing a worker image — it looks like a
+missing toolchain otherwise.
 
 ## Verification
 
@@ -351,6 +386,24 @@ warn) so a copy-pasted env line cannot silently poison the lane.
 - `thunderlane@xmpp.sobe.world` XMPP auth: the bridge unit starts and is
   omemo-ready, but the account does not exist upstream (same operator step as
   items 72/74).
+
+## Job inventory (this tenant, all real dispatches)
+
+| job | worker | outcome | elapsed |
+| --- | --- | --- | --- |
+| `646bf782` memoized Fibonacci CLI (Rust) | kimi | completed | 61 s |
+| `97040ff8` Go HTTP server | kimi | completed | 290 s |
+| `9e0ecbfd` parallel Fibonacci (C++17) | pebble | completed | ~90 s |
+| `9fedf119` expression evaluator (Rust) | pebble | completed | ~106 s |
+| `995897cf` expression evaluator (Rust, duplicate) | pebble | completed | 42 s |
+| `21008b1f` / `a15af501` parallel Fibonacci (attempts) | pebble | failed — 401 quoted key (F5) | 3 s each |
+| `1d7ecae4` environment probe (attempt) | pebble | failed — 401 quoted key (F5) | 3 s |
+
+The duplicate `995897cf` is itself a finding: the F3 wedged thread's third
+dispatch **did** create a job server-side (and the worker ran it correctly in
+42 s) even though `/api/chat/history` never showed a new turn — so a "failed"
+turn can leave real detached work behind with no operator-visible trace except
+`/api/jobs`.
 
 ## Disposition
 
