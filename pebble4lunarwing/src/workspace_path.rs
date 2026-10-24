@@ -582,9 +582,11 @@ mod tests {
         while std::time::Instant::now() < deadline && redirected.is_empty() && refused == 0 {
             match resolve_task_workspace(&context, &root) {
                 Ok(resolved) if resolved.starts_with(&decoy) => redirected.push(resolved),
-                Ok(_) => {}
+                // DS-1's refusal is the only thing the harness counts; any
+                // other outcome (a clean resolve, or another refusal) is a
+                // no-op for this liveness signal.
                 Err(error) if error.to_string().contains("resolved path changed") => refused += 1,
-                Err(_) => {}
+                Ok(_) | Err(_) => {}
             }
         }
         stop.store(true, Ordering::Relaxed);
