@@ -1091,14 +1091,16 @@ together (see Compatibility), and a tracked-manifest/lock audit confirms no
 project-owned package or path dependency remains at 2.1.4 or 2.1.5.
 
 External crates took MSRV-respecting semver-compatible updates across all
-26 swept lockfile roots (tokio 1.53.2, hyper 1.12.0, h2 0.4.20, jiff
+26 swept lockfile roots (tokio 1.53.3, hyper 1.12.0, h2 0.4.20, jiff
 0.2.38, toml 1.1.8, uuid 1.28.0, zeroize 1.9.1, html-to-markdown-rs 3.17.2,
-syn 3.0.7, among others), and `ic/vendor/` was regenerated — 1150
+syn 3.0.7, among others — tokio moved to 1.53.3 with the 2026-10-23
+advisory-db refresh), and `ic/vendor/` was regenerated — 1150
 directories: 1148 vendored crates plus the two pre-vendored libsignal path
-dependencies — with the rig-core patch restored and marker-verified. Four
+dependencies — with the rig-core patch restored and marker-verified. Five
 security upgrades landed late-cycle on top of the sweep (rustls 0.23.46;
 Wasmtime/WASI 36.0.18 then 36.0.19; the CVE-2026-111943 webpki root-store
-trio — see Crate Security Re-Audit). The
+trio; the 2026-10-23 tokio/ctutils/clipboard-win set — see Crate Security
+Re-Audit). The
 `pebble4lunarwing/upstream/Cargo.lock` build-input pin was deliberately
 untouched by the sweep, then upgraded separately twice — for the rustls
 advisories and again for the webpki trio — with its Dockerfile digest
