@@ -1529,11 +1529,30 @@ is now converted rather than orphaned: the `prepare_worker_workspace`
 `chmod 2770` site it left unconverted was converted by **WI#453**
 (`f30e4fc80`) — the workspace is created as the tenant and chowned with
 `--no-dereference`, which is exactly what a rootful start must not undo.
-Earlier closures remain as recorded in the 2026-10-14 through 2026-10-19
-groups above (field reports, final-review items, and the 2026-10-17 /
-2026-10-18 / 2026-10-19 batches, including WI#467 on 2026-10-24 and the
-advisory-clearing owners WI#367, WI#368, and WI#418, whose chains are
-still locked — see Accepted advisories).
+Earlier closures, per the same tracker pass: the five test-build field
+reports WI#366, WI#372, WI#385, WI#398, and WI#399 together with the
+WI#359/WI#373 triage items on 2026-10-14; WI#336, WI#356, WI#376, WI#377,
+WI#380, WI#393, WI#395, WI#410, WI#411, and WI#417 during final review
+(2026-10-13 through 2026-10-16); WI#357, WI#364, WI#365 (tenant rustup
+installs on noexec `/tmp` hosts — `rustup-init` is now staged under the
+tenant home), WI#375, WI#390, WI#392, WI#396, and WI#419 on 2026-10-17;
+WI#360, WI#371, WI#415, the advisory-clearing owners WI#367, WI#368, and
+WI#418 (chains still locked — see Accepted advisories), WI#402, WI#408, and
+WI#412 on 2026-10-18; WI#369 (the opencode2 SDK-surface gate blind spots;
+the widened gates are described under opencode2 SDK Surface Pinning),
+WI#427 (the opencode2 v2.0.32 bump; its Gentoo/OpenRC rollout is recorded
+under Worker Exposure Policy), and WI#361 (the worker-image Trivy gate:
+`.gitlab/trivy-ignore` now uses Trivy's `exp:` expiry syntax, enforced by
+the `ci-config` validator, the three Debian-fixed perl CVEs are no longer
+suppressed, and all four worker images moved to the 20261017T082437Z
+Debian snapshot; the rebuilt images' SBOMs on master pipeline 6007 show the
+fixed perl) on 2026-10-19; and WI#467 (the opencode build's models.dev
+reproducibility gap — the committed snapshot pin described under the
+opencode Changes section) on 2026-10-24. WI#438's residual stands as
+recorded: the standalone TensorZero proxies under
+`tensorzero-proxy-configurations/` still default to developer-LAN
+endpoints, though no shipped path uses those defaults (mt-admin's proxy
+units pass the upstream explicitly).
 
 **Deployment boundaries.** The onboarding web app remains a trusted local
 console without user accounts or TLS: retain loopback binding and use an
