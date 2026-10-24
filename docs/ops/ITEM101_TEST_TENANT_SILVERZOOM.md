@@ -268,4 +268,65 @@ only from `/api/jobs/{id}`. Multi-job testing therefore needs a detail call per
 job to attribute it to a lane. The worker's own result is the authoritative
 record of what ran.
 
+### pebble — complex task 2: Go concurrent inverted index + HTTP server
+
+Job `ab3ca985-763d-480b-8edf-3f51f8da5c85` (`external:pebble`), created
+16:14:47, completed 16:19:36 (~289 s). Note this job was created **two minutes
+after** its gateway turn logged `repl_argument_corruption` — see F5 point 2;
+it is the same Go task that a later re-dispatch tried to duplicate.
+
+Worker artifacts in `/workspace/item101_go`: `corpus.go` (50-doc seeded
+corpus), `index.go` (4-goroutine pool + channels + mutex), `server.go`
+(`/health`, `/doc`, `/search`, JSON 404), `main.go`, `index_test.go`, `go.mod`
+with no external dependencies. Reported results, **all re-verified
+independently** with `podman exec` on the container:
+
+- `go version go1.24.3 linux/amd64`; `go vet ./...` clean.
+- `go test -race ./...` → `ok item101_go 1.031s` (re-run: 1.032s); 5 tests
+  (`TestBuildIndexConcurrent_Race`, `TestIndexPostingsAreSortedUnique`,
+  `TestSearchHandler`, `TestNotFoundJSON`, `TestDocHandler`), all PASS under
+  the race detector.
+- `index` CLI: `documents=50`, `distinct_words=26`; `alpha:` 20 doc ids,
+  `kilo:` 20, `zulu:` 18 — identical to the worker's report.
+- Live server: `/health` → `{"ok":true}`; `/search?q=alpha` →
+  `{"query":"alpha","count":20,"doc_ids":[0,1,2,5,6,8,9,17,19,21,23,24,28,29,32,36,39,42,43,47]}`;
+  `/missing` → HTTP **404** with `{"error":"not found"}`.
+- Worker-noted deviation: `ps` inside the container fails with `fatal library
+  error, lookup self`, so it used `kill -TERM` + `wait` rather than `ps` as
+  shutdown proof (matches F7 below).
+
+### pebble — complex task 3: Rust expression evaluator with error handling
+
+Job `39140d71-f9f8-45bf-a78a-5a982f8bd6b8` (`external:pebble`), created
+16:19:51, completed 16:24:46 (**295 s**). `/workspace/pebble_item101_rs`,
+no external crates, hand-written recursive-descent parser, f64, argv + stdin
+modes. `rustc 1.96.1 (31fca3adb 2026-06-26)`, **5 unit tests passed**.
+
+Independently re-run (`cargo test --release --offline` + the release binary):
+
+| input | exit | output |
+| --- | --- | --- |
+| `2+3*4` | 0 | `14` |
+| `(2+3)*4` | 0 | `20` |
+| `100/7` | 0 | `14.285714285714286` |
+| `((1+2)*(3+4))-5` | 0 | `16` |
+| `2*(3+(4*5))` | 0 | `46` |
+| `-(-3)` | 0 | `3` |
+| `5/0` | 1 | `evaluation error at byte 1: division by zero` |
+| `2+` | 1 | `parse error at byte 2: expected expression after '+'` |
+| empty | 1 | `parse error at byte 0: empty input` |
+| `1 2` | 1 | `parse error at byte 2: trailing garbage: unexpected '2'` |
+
+stdin mode: three piped expressions printed `14` and `20`, then exited 1 with
+`line 3: evaluation error at byte 1: division by zero`. Error paths really do
+exit non-zero instead of panicking — the strongest evidence in this pass that
+the lane handles non-happy-path requirements.
+
+### F7 (minor, container environment): `ps` is unreliable inside the pebble task sandbox
+
+The Go worker reported `fatal library error, lookup self` from `ps` in the
+pebble container; host-side `podman exec … ps aux` works. Treat `ps` as
+unusable from inside a pebble task and prefer `kill`/`wait`, `/proc`, or the
+worker bridge's own status for process checks.
+
 _(further tasks appended below)_
