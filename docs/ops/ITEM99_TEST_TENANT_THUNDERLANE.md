@@ -86,7 +86,35 @@ sudo bash ic/scripts/lunarwing-mt-admin.sh build-tenant thunderlane \
 
 ## Verification
 
-(Filled in below.)
+`start-tenant thunderlane` → `START_EXIT=0`. All services under OpenRC with
+`-sup` crash supervisors, boot-persistent (default runlevel):
+
+- PostgreSQL (`lunarwing-pg-thunderlane`, 10033), daemon
+  (`lunarwing-thunderlane`), xmpp-bridge, weechat + WS adapter, LunarVision
+  sidecar (healthy, 20035/20036), and both worker containers
+  (`lunarwing-pebble-thunderlane` :10038, `lunarwing-kimi-thunderlane` :30030).
+- Gateway `:10030/api/health` → `{"status":"healthy","channel":"gateway"}`.
+- `/api/gateway/status` (bearer): version 2.1.6, `llm_backend`
+  `openai_compatible`, model `tensorzero::function_name::lunarwing`, channels
+  unix_socket_repl/multica/weechat/xmpp/http/gateway, skills enabled.
+  `multica` reports unhealthy (no multica server configured — cosmetic, same
+  as every prior test tenant).
+- **13 extensions active**: `study_notes` MCP + 9 WASM tools + 3 WASM
+  channels (`multica`, `weechat`, `xmpp`).
+- **WI#357 exposure audit**: `worker-listeners thunderlane` → `clean`. Both
+  workers publish host loopback only (10038 / 30030 plus the in-container
+  health 8443), no self-exposed inbound path.
+- Worker bridges live: kimi `[bridge] server listening on
+  ws://0.0.0.0:30030/ws/agent`, subprotocol `lunarwing-agent-v1`, auth
+  enabled; pebble `[bridge] listening on ws://0.0.0.0:10038/ws/agent`.
+  The kimi task runner starts as the task uid via the root bridge
+  (WI#400 shape).
+- **Agent LLM loop**: first gateway chat turn answered `BOOT_OK` in 41 s
+  (`state: Completed`), proving the tenant's own LLM path
+  (`LLM_BASE_URL=http://100.88.232.146:3000/openai/v1`) is live.
+- LLM endpoint independently probed from the host with the tenant's
+  `LLM_API_KEY` → HTTP 200 for both `tensorzero::function_name::lunarwing`
+  and `tensorzero::function_name::FrontierCODEK` (the kimi lane's model).
 
 ## Worker task exercise
 
