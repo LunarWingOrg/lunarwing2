@@ -1199,20 +1199,7 @@ worker-side bridge is invoked. `memory_read` grants expose workspace content
 to workers whose network configuration permits egress. The hub remains
 authoritative for the capability set. See
 `docs/proposals/EXTERNAL-WORKER-TOOL-PROXY.md` and
-`docs/ops/WORKER-CONTAINERS.md`.
-
-**Accepted advisories.** The release records ten vulnerability advisories,
-two unsound notices, and two unmaintained notices (fourteen IDs) accepted
-under `ic/deny.toml`; see `docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md`. Of the
-ten vulnerabilities, only `rsa` via `russh` compiles into default builds.
-The rustls-webpki 0.102 / h2 0.3 / webpki-roots 0.26.11 chain and accepted
-rustls 0.22.4 advisories are confined to opt-in `libsql-remote-replica`
-builds. Their accepted status and exposure are recorded in the WI#418
-standing decision record (`docs/ops/v2.1.6.0_WI418_LIBSQL_LEGACY_CHAIN.md`).
-The `atty` acceptance (RUSTSEC-2021-0145) is dev-graph only, through the
-vendored `libsignal-protocol` `env_logger` 0.6.2 development dependency.
-The accepted-advisory guard requires every accepted advisory to name a
-clearing-owner work item and checks that referenced paths exist.
+`docs/ops/WORKER-CONTAINERS.md`
 
 **Deployment boundaries carried forward.** The onboarding web app remains a
 trusted local console without user accounts or TLS: retain loopback binding
@@ -1222,7 +1209,7 @@ private-network deployments. External workers do not automatically inherit
 core MCP configuration. OpenRC hosts without usable cgroup v2 delegation use
 nice-only build scheduling. Kawarimi remains PostgreSQL-only. DarkIRC Secure
 Key Exchange Stages B–D and automated QR/web/trusted-channel delivery remain
-disabled.
+disabled
 
 ---
 
