@@ -182,6 +182,42 @@ worker can start long-lived background processes inside the task sandbox and
 kill them, and the shared counter proves real in-process state, not a
 replayed canned answer.
 
+### pebble — task 1: parallel Fibonacci in C++17
+
+Two earlier dispatches (`21008b1f`, `a15af501`, `1d7ecae4`) failed with
+`api returned 401 Unauthorized (authentication_error): Invalid session`.
+Root cause was **operator input, not the lane**: the `NANOGPT_API_KEY` value
+copied from a sibling tenant's env carried literal surrounding double quotes,
+and `podman --env-file` passes quotes through verbatim, so the key sent on the
+wire was `"sk-nano-…"`. Proven by curling nano-gpt from *inside* the pebble
+container: with the quoted value → 401 `invalid_api_key`; after stripping the
+quotes → 200. `configure-pebble` was re-run with the clean value and the
+container recreated. Recorded as finding **F1** below because the misleading
+part is that the lane reported only "Invalid session" with no hint that the
+credential had a quoting defect.
+
+Job `9e0ecbfd-2ff5-42bc-84da-a0b1edd7c777`, `external:pebble`, completed.
+Single `result` event carrying the whole answer:
+
+- `g++ (Debian 12.2.0-14+deb12u1) 12.2.0`
+- `/workspace/pebble_par/main.cpp` — C++17, `std::async` fan-out over
+  `fib(1..40)` with a deliberately naive recursive `fib` so the parallelism is
+  measurable, `steady_clock` timing, `-O2 -std=c++17 -pthread`
+- Three timed runs from the generated runner script:
+  ```
+  sum=267914295 time_ms=85
+  sum=267914295 time_ms=74
+  sum=267914295 time_ms=80
+  best_time_ms=74
+  ```
+- Final sum `267914295` — arithmetically correct
+  (`sum(fib(1..40)) = fib(42) - 1 = 267914296 - 1`), so the worker's answer is
+  computed, not asserted.
+
+Evidence value: the fat pebble image's **C++ toolchain** works, `std::async`
+threading is available inside the task sandbox, and pebble drives a
+build → run → parse loop across a generated helper script.
+
 ## Findings
 
 (Filled in below.)
