@@ -1,5 +1,26 @@
 # Item 101 — Test tenant `silverzoom` (kimi + pebble external workers, full toolchains)
 
+___ 
+There are some INACCURACIES IN THE FOLLOWING REPORT:
+NW-1 (Low, accuracy): F8's explanation contradicts the lock code
+workspacePathsOverlap refuses a new task when either path contains the other, and activeWorkspaces is released only when the owning task ends (lunarwing_bridge.ts:238-260, :341). Two jobs both resolving to /workspace therefore cannot coexist, which is exactly what F3 recorded. The Go job's acceptance while the Rust job was live means the two had disjoint project_dir values; the gateway agent sets project_dir in create_job, and /api/jobs/{id} shows it. As written, F8 tells operators that two root-level jobs can run on one lane; they cannot. Check the two jobs' project_dir and reword F8. The operational advice (serialise, or give each job its own project_dir) stands.
+NW-2 (Low, accuracy): the toolchain note repeats the item-99 claim corrected in run 208
+Both Dockerfiles put the toolchain directories in the image-wide ENV PATH (kimi around line 195, pebble around line 161), and the kimi task runner also receives TASK_PATH from the entrypoint. The toolchains are not login-shell-only; a hand probe that saw them missing used a different environment than the task runner. The same correction landed in the item-99 report under NT-6.
+NW-3 (Low, accuracy): inventory and section timestamps disagree
+
+ab3ca985: the section says completed 16:19:36 (about 289 s); the inventory says 16:18:35 (228 s).
+39140d71: the section says created 16:19:51 (295 s); the inventory says 16:22:58 (108 s).
+0b101865: created 16:46:24 in the section, 16:46:35 in the inventory.
+The header names branch aj/kimi-101-20261024-1200; the MR branch is aj/kimi-101-20261024-1504.
+The inventory labels e5c68890 "(F5)"; the refusal is F3's lock, F5 explains why it was re-dispatched.
+
+NW-4 (Info): cross-references
+F1 should cite WI#436 item 4 and F2 should cite WI#472; the "Recommended follow-up work items" paragraph can now point at WI#475 through WI#481.
+NW-5 (Info, hygiene): hand-off state
+The tenant was left at log level debug, with "restore if desired". Restore info as part of the hand-off: debug on a long-running tenant widens what reaches the journal. The pebble key was copied from a sibling tenant; the hand-off should say so, since revoking or rotating it affects both tenants.
+___
+
+
 > Provisioned 2026-10-24 by Rarity (autonomous), branch
 > `aj/kimi-101-20261024-1200` (tenant clone at `722d07a47`).
 > **This tenant is deliberately left running.** The name `silverzoom` is from
