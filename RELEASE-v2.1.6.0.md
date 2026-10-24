@@ -707,15 +707,6 @@ errexit context (`cmd || status=$?`) used to be silently swallowed and the
 bind mount reached the container with the wrong owner; both now return rc-1
 with a named message and restore `PWD` on every exit path.
 
-**Known regression on rootful hosts (open at release, run-203 NO-2 on
-!1880):** on Docker-default hosts (`LUNARWING_MT_ROOTLESS=false`) the
-workspace root and contents are chowned to the container uid **before**
-the tenant-side `tenant_chmod 2770` runs — the tenant no longer owns the
-leaf, so the `chmod` fails with EPERM and every kimi, opencode and
-opencode2 worker start dies on the first call. Proven with a non-root
-tenant in run-203; unfixed at release and owned by goals item 91, which
-now carries !1880's findings. See the known-issues entry below.
-
 ### `validate_llm_url` Escapes and Length-Caps the Tenant URL (WI#384)
 
 `validate_llm_url`'s `die` messages (`must be an http(s) URL`, `has no
@@ -1586,94 +1577,6 @@ cited paths exist; it does **not** check that the named owner is still open
 (the online owner-open half was dropped in the 2026-10-20 scope decision),
 so an acceptance whose owner work item has since closed still passes — the
 guard closes the ownerless gap, not owner drift.
-
-**Known issues / open at release.** Reconciled per item in
-`docs/ops/v2.1.6.0_OPEN_WORK_ITEMS_STATUS.md`, a 2026-10-14 01:05Z snapshot
-(work items filed after it, WI#402 and later, postdate the audit), and
-re-checked against the tracker on 2026-10-20, 2026-10-21, and 2026-10-24.
-Open at
-release: WI#397
-(`high` — sb&kumo findings); WI#333 (the opencode v1 lane's upstream crash,
-bump-or-retire pending); WI#383 and WI#386 (harness redaction/lifecycle
-residuals, and the opencode executor reporting retry diagnostics as a
-deliverable); WI#394 (the WI#341 residual stuck dedup key); WI#429 (the
-sandbox proxy's empty-body over-refusal) and WI#430 (the WASM tool
-wrapper's retained-framing gap); WI#424 (the deferred worker egress
-allowlist and opencode2 runtime-smoke suite), WI#425 (out-of-band
-worker-image verification), and WI#432 (WASM-host redaction follow-ups, now
-holding the four WI#408 channel-host residuals), all three planned for
-v2.1.7.0; WI#436 (v2.1.7.0 triage of the test-tenant failures — its
-first item, one failing note failing every hourly knowledge refresh and
-leaving `knowledge: critical`, is live in this release); and WI#362
-(accuracy corrections to `docs/ops/v2.1.6.0_CARGO_DENY_AUDIT.md`). Filed
-late and planned for v2.1.7.0, but live in this release: WI#440
-(`generate_token` falls back to a predictable `date +%s` token when `od` is
-absent), WI#441 (`resolve_protected_paths` degrades silently when
-`SANDBOX_PROTECTED_PATHS` is unset), **WI#455** (the WI#322 residual — the
-`engine/knowledge` and `engine/orchestrator` boot-loaded docs are still
-agent-writable through memory tools, with id-shadowing at boot and a
-provenance-label inversion), and the engine-v2 migration-completeness
-residuals WI#442. **Rootful worker starts are broken on Docker-default
-hosts (run-203 NO-2 on !1880, owned by goals item 91):** with
-`LUNARWING_MT_ROOTLESS=false`, `prepare_worker_workspace` chowns the
-workspace leaf to the container uid before the tenant-side
-`tenant_chmod 2770` runs, so the tenant no longer owns the leaf, the
-`chmod` fails with EPERM, and every kimi, opencode and opencode2 worker
-start dies on the first call — live in this release since WI#453 and
-unfixed at release; the mechanism is described in the WI#453 section above.
-
-The worker-image residuals stay open pending rebuilds: **WI#449** (the
-opencode2 lane's credential-isolation migration, plus the run-170 leftovers
-LP-11..LP-16 — LP-7 was declined by the maintainer on 2026-10-22 — and the
-image-level acceptance covering WI#324 and WI#400), **WI#454** (the
-two-container split; its worker-side kimi slice is described above and its
-scope is now documented in `docs/ops/ITEM91_KIMI_WORKER_454.md`), and
-**WI#456** (kimi external worker "connection refused (os error 111)" on a
-new build post-20 — see the runbook in `docs/ops/WORKER-CONTAINERS.md` for
-the stale-image remediation). **WI#469** explains WI#456's multi-lane
-refusals: `start_tenant`'s worker start loop aborts on the first
-stale-image `die`, silencing every later lane. **WI#464** would make the
-class visible before the first job (a boot-time probe of each configured
-worker's socket).
-
-Closed since the last repass, by tracker date: WI#388 (the fleet-wide
-OpenRC proxy-unit rollout for WI#376, Upgrade Note 2), WI#461, WI#462, and
-WI#463 on 2026-10-24; WI#354, WI#384, WI#434, WI#444, WI#452, and WI#457
-on 2026-10-23; WI#353, WI#451, and WI#453 on 2026-10-22; WI#317, WI#322,
-WI#324, WI#363, WI#387, WI#450, and WI#446 on 2026-10-21; WI#445, WI#422,
-WI#423, WI#389, and WI#370 on 2026-10-20 (WI#450, WI#451, WI#453, and
-WI#454's first slice close the run-181/run-186 review residuals of the
-WI#446 re-attempt); and WI#416 and WI#438 on 2026-10-18. WI#416's residual
-is now converted rather than orphaned: the `prepare_worker_workspace`
-`chmod 2770` site it left unconverted was converted by **WI#453**
-(`f30e4fc80`) — the workspace is created as the tenant and chowned with
-`--no-dereference`; on rootful hosts that chown precedes the tenant-side
-`tenant_chmod`, which regressed worker starts there (run-203 NO-2, the
-known-issues entry above; owned by item 91).
-Earlier closures, per the same tracker pass: the five test-build field
-reports WI#366, WI#372, WI#385, WI#398, and WI#399 together with the
-WI#359/WI#373 triage items on 2026-10-14; WI#336, WI#356, WI#376, WI#377,
-WI#380, WI#393, WI#395, WI#410, WI#411, and WI#417 during final review
-(2026-10-13 through 2026-10-16); WI#357, WI#364, WI#365 (tenant rustup
-installs on noexec `/tmp` hosts — `rustup-init` is now staged under the
-tenant home), WI#375, WI#390, WI#392, WI#396, and WI#419 on 2026-10-17;
-WI#360, WI#371, WI#415, the advisory-clearing owners WI#367, WI#368, and
-WI#418 (chains still locked — see Accepted advisories), WI#402, WI#408, and
-WI#412 on 2026-10-18; WI#369 (the opencode2 SDK-surface gate blind spots;
-the widened gates are described under opencode2 SDK Surface Pinning),
-WI#427 (the opencode2 v2.0.32 bump; its Gentoo/OpenRC rollout is recorded
-under Worker Exposure Policy), and WI#361 (the worker-image Trivy gate:
-`.gitlab/trivy-ignore` now uses Trivy's `exp:` expiry syntax, enforced by
-the `ci-config` validator, the three Debian-fixed perl CVEs are no longer
-suppressed, and all four worker images moved to the 20261017T082437Z
-Debian snapshot; the rebuilt images' SBOMs on master pipeline 6007 show the
-fixed perl) on 2026-10-19; and WI#467 (the opencode build's models.dev
-reproducibility gap — the committed snapshot pin described under the
-opencode Changes section) on 2026-10-24. WI#438's residual stands as
-recorded: the standalone TensorZero proxies under
-`tensorzero-proxy-configurations/` still default to developer-LAN
-endpoints, though no shipped path uses those defaults (mt-admin's proxy
-units pass the upstream explicitly).
 
 **Deployment boundaries.** The onboarding web app remains a trusted local
 console without user accounts or TLS: retain loopback binding and use an
