@@ -57,8 +57,10 @@ Each lane enforces the strip at its task-process boundary:
   prompt time (the moment task code inherits it), so a mutant that injects and
   restores in the `finally` still fails.
 - **Pebble** — `spawn_pebble` rebuilds the child env via `env_clear()` +
-  `strip_bridge_credentials` (everything else preserved: PATH, locale,
-  `PEBBLE_*` provider variables) and drops task-supplied re-injections.
+  `strip_bridge_reserved_env` (everything else preserved: PATH, locale,
+  `PEBBLE_*` provider variables) and drops task-supplied re-injections of the
+  same four reserved keys (`AGENT_AUTH_TOKEN`, `AGENT_AUTH_TOKEN_FILE` and the
+  two tool-proxy keys) before the child env is assembled.
   Pinned by a self-exec regression test that carries the token in the parent
   env and probes the real spawned environment through a stub. The one-shot
   `cli` mode execs under `env -u AGENT_AUTH_TOKEN` (harness-pinned) — this is
