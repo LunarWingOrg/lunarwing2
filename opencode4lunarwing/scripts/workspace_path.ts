@@ -25,11 +25,56 @@ function annotateComponent(error: unknown, part: string): Error {
 // and containment failures are permanent; other errnos (EMFILE/ENFILE/ENOMEM,
 // ENOSPC/EDQUOT/EIO on the first mkdir, ENOENT/EINVAL from a swap race) are
 // reported under a transient wording the host supervisor retries.
+//
+// EINVAL is NOT permanent here: realpathSync runs lstat per component and then
+// readlink on a symlink, so a task swapping that component from a link to a
+// directory between the two calls raises EINVAL — the DS-2 swap race this set
+// must keep transient. The one genuinely permanent EINVAL, an fchown onto a
+// task uid the user namespace does not map, is classified at the fchown call
+// that raises it (`handoffCreatedDir`).
 const NON_RETRYABLE_ERRNOS = new Set(["ENOTDIR", "ELOOP", "EACCES", "EPERM"])
+
+/** DS-2: is this bootstrap errno permanent (abandon) rather than transient
+ * (re-dispatch)? Exported so the classification is pinnable on its own. */
+export function isNonRetryableBootstrapErrno(code: string | undefined): boolean {
+  return code !== undefined && NON_RETRYABLE_ERRNOS.has(code)
+}
+
+/** A bootstrap failure that no re-dispatch can fix. Thrown by the
+ * task-identity handoff so the permanent classification sits at the errno's
+ * source rather than on the errno set above (NP-1: a blanket EINVAL rule
+ * would also abandon the DS-2 swap race). */
+export class PermanentBootstrapError extends Error {}
+
+/** KW-4/LD-6: hand a directory this walk created to the task identity through
+ * the descriptor the walk opened (no path re-resolution, no symlink window).
+ *
+ * fchown onto a uid the host's user namespace does not map fails with EINVAL,
+ * and no re-dispatch can ever map it — so that EINVAL is permanent. The
+ * `chown` injection exists so a test can raise that errno on a host whose
+ * namespace maps every id (the production default is `fchownSync`). */
+export function handoffCreatedDir(
+  fd: number,
+  identity: { uid: number; gid: number },
+  chown: (fd: number, uid: number, gid: number) => void = fchownSync,
+): void {
+  try {
+    chown(fd, identity.uid, identity.gid)
+  } catch (error) {
+    const errno = error as NodeJS.ErrnoException
+    if (errno.code === "EINVAL") {
+      throw new PermanentBootstrapError(
+        `cannot hand the created directory to task uid ${identity.uid}/gid ${identity.gid}: the id is unmapped in this user namespace (${errno.message ?? String(error)})`,
+      )
+    }
+    throw error
+  }
+}
+
 export function resolveTaskWorkspace(
   context: { project_dir?: string; cron_tick?: unknown } | undefined,
   workspaceRoot: string,
-  testHooks?: { beforeReresolve?: () => void },
+  testHooks?: { beforeReresolve?: () => void; chown?: (fd: number, uid: number, gid: number) => void },
 ): string {
   const tick = context?.cron_tick
   if (!tick || typeof tick !== "object" || !("event" in tick) || tick.event !== "cron.tick") {
@@ -75,7 +120,7 @@ export function resolveTaskWorkspace(
       // O_DIRECTORY|O_NOFOLLOW descriptor the walk just opened — no path
       // re-resolution, no symlink window.
       if (created && identity) {
-        fchownSync(next, identity.uid, identity.gid)
+        handoffCreatedDir(next, identity, testHooks?.chown)
       }
       closeSync(fd)
       fd = next
@@ -100,9 +145,9 @@ export function resolveTaskWorkspace(
     return candidate
   } catch (error) {
     const message = String(error)
-    const code = (error as NodeJS.ErrnoException).code
     if (message.includes("Workspace path escapes WORKSPACE_ROOT") ||
-        (code !== undefined && NON_RETRYABLE_ERRNOS.has(code))) {
+        error instanceof PermanentBootstrapError ||
+        isNonRetryableBootstrapErrno((error as NodeJS.ErrnoException).code)) {
       throw new Error(`Invalid workspace path for cron tick: ${message}`)
     }
     throw new Error(`Transient workspace error for cron tick: ${message}`)
