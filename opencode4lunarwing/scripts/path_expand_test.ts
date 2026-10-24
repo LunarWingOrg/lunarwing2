@@ -4,7 +4,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSyn
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { expandWorkspacePath, resolveTaskWorkspace } from "./workspace_path"
+import { expandWorkspacePath, isNonRetryableBootstrapErrno, resolveTaskWorkspace } from "./workspace_path"
 
 const workspaceRoot = "/workspace"
 
@@ -268,3 +268,17 @@ for (;;) {
     rmSync(hookRoot, { recursive: true, force: true })
   }
 }
+
+// WI#449 LP-16 (run-170): EINVAL is permanent, not retried. Its only source
+// in this bootstrap is fchown on an unmapped uid, which no re-dispatch can
+// fix — retrying it forever would strand the cron tick. Pinned through the
+// classifier because a host user namespace maps every id the suite can drop
+// to, so the fchown path itself cannot be made to fail with EINVAL here.
+assert.equal(isNonRetryableBootstrapErrno("EINVAL"), true, "EINVAL must be permanent (LP-16)")
+for (const code of ["ENOTDIR", "ELOOP", "EACCES", "EPERM"]) {
+  assert.equal(isNonRetryableBootstrapErrno(code), true, `${code} must stay permanent (DS-2)`)
+}
+for (const code of ["EMFILE", "ENFILE", "ENOMEM", "ENOSPC", "EDQUOT", "EIO", "ENOENT"]) {
+  assert.equal(isNonRetryableBootstrapErrno(code), false, `${code} must stay transient (DS-2)`)
+}
+assert.equal(isNonRetryableBootstrapErrno(undefined), false, "an errno-less failure is transient")

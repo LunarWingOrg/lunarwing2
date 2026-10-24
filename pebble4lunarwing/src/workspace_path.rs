@@ -174,9 +174,13 @@ fn create_cron_workspace(path: &str, workspace_root: &Path) -> io::Result<PathBu
 
 /// DS-2: only validation, a non-directory component (ENOTDIR), a symlink loop
 /// (ELOOP), permission denials (EACCES/EPERM) and containment failures are
-/// permanent. Everything else (EMFILE/ENFILE/ENOMEM, ENOSPC/EDQUOT/EIO on the
-/// first mkdir, ENOENT/EINVAL from a swap race) is transient and the host
-/// supervisor may re-dispatch. `Unsupported` marks the missing-/proc preflight.
+/// permanent. EINVAL is permanent too (run-170 LP-16) — its only bootstrap
+/// source is fchown on an unmapped uid, which a re-dispatch can never fix;
+/// std already maps it to `ErrorKind::InvalidInput`, so the arm above covers
+/// it and the raw-errno compare below needs no extra clause. Everything else
+/// (EMFILE/ENFILE/ENOMEM, ENOSPC/EDQUOT/EIO on the first mkdir, ENOENT from a
+/// swap race) is transient and the host supervisor may re-dispatch.
+/// `Unsupported` marks the missing-/proc preflight.
 fn is_non_retryable_bootstrap(error: &io::Error) -> bool {
     use io::ErrorKind::{InvalidInput, PermissionDenied, Unsupported};
     if matches!(error.kind(), InvalidInput | PermissionDenied | Unsupported) {
@@ -391,6 +395,11 @@ mod tests {
             io::Error::from_raw_os_error(libc::ENOTDIR),
             io::Error::from_raw_os_error(libc::ELOOP),
             io::Error::from_raw_os_error(libc::EACCES),
+            // LP-16: fchown's unmapped-uid EINVAL is permanent — no
+            // re-dispatch can ever map the id. Covers it through std's
+            // EINVAL→InvalidInput mapping (the arm above), not a raw
+            // compare, so this pin holds the classification end to end.
+            io::Error::from_raw_os_error(libc::EINVAL),
         ] {
             assert!(is_non_retryable_bootstrap(&error), "permanent: {error}");
         }
@@ -573,9 +582,11 @@ mod tests {
         while std::time::Instant::now() < deadline && redirected.is_empty() && refused == 0 {
             match resolve_task_workspace(&context, &root) {
                 Ok(resolved) if resolved.starts_with(&decoy) => redirected.push(resolved),
-                Ok(_) => {}
+                // DS-1's refusal is the only thing the harness counts; any
+                // other outcome (a clean resolve, or another refusal) is a
+                // no-op for this liveness signal.
                 Err(error) if error.to_string().contains("resolved path changed") => refused += 1,
-                Err(_) => {}
+                Ok(_) | Err(_) => {}
             }
         }
         stop.store(true, Ordering::Relaxed);

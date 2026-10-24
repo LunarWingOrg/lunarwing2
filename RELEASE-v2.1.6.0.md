@@ -751,7 +751,10 @@ root-only `0400` file (out of every process environment), the bridge stays
 container root behind a trimmed capability set, and every task process
 drops to a separate task uid via `setpriv --clear-groups
 --ambient-caps=-all --inh-caps=-all --no-new-privs` — so `/proc/1/environ`,
-the bridge environ and the token file all give task code EACCES. The
+the bridge environ and the token file all give task code EACCES. (LP-7's
+`--bounding-set=-all` and its `CAP_SETPCAP` trim are NOT part of this
+release: the maintainer declined both on 2026-10-22, #11230.)
+The
 pinned identities are validated everywhere they parse (the TS
 `taskIdentity()` helpers, both entrypoints, the pebble executor): zero or
 non-numeric ids fail closed, because a zero id would make the privilege
@@ -761,7 +764,10 @@ with the entrypoints' `^[1-9][0-9]*$` gate). The
 opencode2 lane is deliberately not migrated (its image keeps the task uid
 directly; the migration is filed as the WI#449 follow-up, planned for
 v2.1.7.0). Worker images must be rebuilt for the strips and the split to
-reach live tenants.
+reach live tenants. Rollback note (run-170 LP-16): roll back the scripts
+and the image TOGETHER — rolling back the scripts while keeping the new
+`USER 0:0` pebble image drops keep-id on rootless hosts, and tasks then
+cannot write the `0700` workspace.
 
 ### Daily-Log Backup Cap Fail-Closed (WI#335)
 
@@ -1341,7 +1347,12 @@ was closed on 2026-10-20 after its re-pass (zero/non-numeric task ids are
 refused everywhere identities parse); what stays open is
 its real-worker acceptance on rebuilt images and the opencode2 lane's own
 migration, filed as **WI#449** together with the run-170 leftovers
-(LP-11..LP-16; LP-7 declined by the maintainer on 2026-10-22), planned for
+(LP-11..LP-16; LP-7 declined by the maintainer on 2026-10-22). The LP
+leftovers landed in this release for kimi/opencode/opencode2/pebble (LP-11
+pins, LP-12 failable pins, LP-13 ordering note, LP-14 absolute-PATH +
+glibc loader denylist, LP-15 probe-file bridge uid, LP-16 `EINVAL`
+permanent in the cron bootstrap), with LP-7 staying out per that ruling;
+the opencode2 lane's own migration remains WI#449/WI#454's, planned for
 v2.1.7.0. Filed late and planned for
 v2.1.7.0, but live in this
 release: WI#440 (`generate_token` falls back to a predictable `date +%s`

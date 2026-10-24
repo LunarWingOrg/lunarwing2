@@ -113,7 +113,9 @@ section and "Launch identity (WI#422)" further down.
   creation inside the task-owned workspace root (on keep-id rootless, the
   workspace presents as task-owned 2770). The run-166 root-bridge probe
   showed each of those five individually required on the pebble lane;
-  FOWNER is not individually required there but is retained for metadata
+  FOWNER is not individually required there — the LP-13 socket handoff
+  chmods before it chowns, so the mode change runs while root still owns
+  the socket — but is retained for metadata
   passes (chmod/re-assert) over task-created files the bridge does not own
   — dropping it is on the table the next time the set is re-proved end to
   end on every lane. `--bounding-set=-all` is deliberately NOT added to the
@@ -122,6 +124,21 @@ section and "Launch identity (WI#422)" further down.
   follow-up #11230). The ruling states the decision and no reason, so none
   is recorded here; treat the absence as settled and do not propose LP-7
   again without a fresh ruling.
+- **Run-170 leftovers landed (WI#449, item 86).** LP-11 pins the kimi/pebble
+  image-user refusals and the opencode/pebble Quadlet `UserNS=` keep-id
+  lines; LP-12 makes the LD-11 absolute-path pins failable; LP-13 is the
+  FOWNER ordering note above; LP-14 restricts the `setpriv` resolver to
+  absolute `PATH` entries and extends the loader denylist to glibc's full
+  unsafe-environment list (`GCONV_PATH`/`GLIBC_TUNABLES`/`LOCPATH`/`NLSPATH`/
+  `HOSTALIASES`/`RES_OPTIONS`/`LOCALDOMAIN`/`TZDIR`/`MALLOC_TRACE`, matching
+  in pebble's `is_loader_env_key` and kimi's `dropLoaderEnv` — that parity is
+  ME-3); LP-15 learns the bridge uid from a probe file the bridge creates
+  rather than the owner of `/proc/self`, which reads 0 for a non-dumpable
+  process; LP-16 makes `EINVAL` permanent in every cron-bootstrap classifier
+  (its only source is `fchown` on an unmapped uid, which no re-dispatch can
+  fix, so it used to be retried forever). LP-7 stays declined per #11230.
+  The opencode2 lane's own credential-isolation migration remains WI#454's
+  (the non-root split, item 91) and is not part of these leftovers.
 - **Root-resolved commands come from root-owned PATH entries only
   (WI#454/ME-1).** The root-launcher images (kimi, opencode) carry NO
   task-owned directory in the image-wide `ENV PATH` — the task uid's
