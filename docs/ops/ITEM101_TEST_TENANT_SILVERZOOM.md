@@ -154,4 +154,73 @@ creation to terminal). Worker events show the real in-container tool loop:
   item 99's F2 (a `thread_id`-less approval returns 202 and no-ops) is still
   the documented behaviour to avoid.
 
+### pebble — complex task: parallel C++17 statistics engine
+
+Job `4b44ed5a-6e4d-4e1c-8668-cc592bbc79fb` (`job_mode: external:pebble`),
+`created → running → completed` in **182 s** (16:03:27 → 16:06:29). The job
+description asked for a 20000-row deterministic CSV, a C++17 parallel
+aggregator with `std::async`, deterministic merge, a reproducible checksum,
+three identical runs plus 1/8-partition runs, and an independent awk/python
+cross-check.
+
+The worker produced a single long `result` event covering all six
+requirements, with artifacts under `/workspace/item101_cpp`
+(`gen_data.py`, `input.csv` 374600 bytes, `stats_parallel.cpp` 7917 bytes,
+`stats_parallel` binary, five run-output files):
+
+- `g++ (Debian 12.2.0-14+deb12u1) 12.2.0`, built with exactly
+  `g++ -O2 -std=c++17 -pthread -Wall -Wextra`, no warnings.
+- 20000 rows parsed, 0 malformed; FNV-1a checksum `0x88409e90bb3cd1b` over
+  `fixed<<setprecision(6)` values.
+- Per-category aggregates, identical across p=4 ×3, p=1 and p=8:
+
+  | cat | count | sum | mean | min | max | stddev |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | A | 5000 | -1074.064000 | -0.214813 | -499.944000 | 499.940000 | 287.968686 |
+  | B | 5000 | -17428.120000 | -3.485624 | -499.709000 | 499.739000 | 289.271215 |
+  | C | 5000 | -8552.960000 | -1.710592 | -499.950000 | 499.966000 | 291.791616 |
+  | D | 5000 | 7426.040000 | 1.485208 | -499.735000 | 499.869000 | 290.240629 |
+
+- Reported timings: p4 runs 0/0/0 ms, p1 0 ms, p8 1 ms (small dataset; the
+  parallel path is exercised but not meaningfully benchmarked).
+
+**Independent verification (not just the worker's claim):** re-ran the built
+binary and an independent Python aggregation inside the pebble container with
+`podman exec` — same checksum and byte-identical aggregates, and regenerating
+`input.csv` with `gen_data.py` reproduces the same SHA-256
+(`ec7b83a52bb91720a61f3aa0e7f3573756e1ba42c19838f7ece3f6f9a571f0bd`). The
+worker's numbers are computed, not asserted.
+
+### F3 (worker workspace lock rejects concurrent dispatches — works as designed)
+
+Because two gateway turns were dispatched per lane while testing, each lane
+received a second job while the first still owned `/workspace`. Both were
+refused with a clear, actionable error rather than corrupting the workspace:
+
+- kimi: job `85d1a0b4-d538-4f41-96e3-65f668f9f480` → `failed` after 105 s,
+  `Failed: Workspace /workspace is already being modified by task
+  7ae2cc44-… Cancel or finish that task before dispatching another task to
+  this workspace.` Worker log: `rejected because workspace is owned by
+  7ae2cc44-…`.
+- pebble: job `0170b460-5db2-46e2-a502-aa322b7166d9` → `failed` in 34 s with
+  the same message naming `4b44ed5a-…`.
+
+So a single worker lane serialises on its workspace: only **one complex job at
+a time per worker**. Operators must wait for the previous job to finish (or
+cancel it) before dispatching the next one to the same lane.
+
+### F4 (latency — upstream, not the lane): long turns take minutes
+
+The complex kimi job's second LLM request took **508.8 s time-to-first-token**
+(worker-side `kimi-code.log`: `turnStep=0.2 ttftMs=508781
+streamDurationMs=8573 outputTokens=5668`), while the surrounding requests were
+6 s and 6.1 s. During that window the only daemon-visible signal is the
+two-minute `[worker] Still waiting for Kimi Code response; task remains
+active.` heartbeat. A direct host-side probe of the same long prompt against
+`FrontierCODEK` returned HTTP 200 in 48.6 s (300 max tokens), so this is
+upstream queueing/latency on large requests rather than a broken bridge —
+but a >8 minute silent stretch is indistinguishable from a hang to an operator.
+Recommendation: surface per-request elapsed time in `job_events`, or add a
+worker-side LLM timeout with a visible retry.
+
 _(further tasks appended below)_
