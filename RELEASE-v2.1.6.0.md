@@ -50,7 +50,8 @@ registries, regenerated vendor tree) and a full crate-security re-audit with
 five late-cycle security upgrades — rustls 0.23.46, Wasmtime/WASI 36.0.18
 then 36.0.19 (two Cranelift miscompiles), the CVE-2026-111943 webpki
 root-store trio, and the 2026-10-23 tokio/ctutils/clipboard-win set
-(two RUSTSEC unsound/yank advisories plus a yanked crate) — including one
+(a ctutils constant-time vulnerability, a tokio unsound notice and a
+yanked `clipboard-win`) — including one
 **breaking change**: Turso/libSQL
 remote-replica sync now
 lives behind the non-default `libsql-remote-replica` cargo feature (see
