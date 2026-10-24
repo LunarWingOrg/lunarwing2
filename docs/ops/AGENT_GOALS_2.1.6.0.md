@@ -1322,7 +1322,7 @@
     - **Admin-store revision:** the dev VM's rootful admin store holds `562a224f491b` (built from `87dc5bc98`, the previous unmerged head); rebuild from the target after merge is the operator step
 94. [ ] similar to 83rd goal but bumping opencode2 and opencode1 and kimicode external worker versions again to new ones.... see work item https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/468 as reference stub. versions to upgrade to are 2.1.4 for opencode2, 1.19.4 for opencode1, and 2.3.1 for kimicode. do all three. gogogo
 95. [X] (S) Reserved
-96. [ ] Another repass of 40th goal. update all release notes draft stuff since its been a bit since last release notes update
+96. [ ] Another repass of 40th goal. update all release notes draft stuff since its been a bit since last release notes update - last attempt had problems. closed MR with comments to reference: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1879
 97. [X] (S) Reserved
 98. [X] (S) Reserved
 99. [ ] (multi-pass, multi-agent goal, not duplicate) spin up a new test tenant with kimi and pebble external workers. full toolchains. perform extensive tests on kimi and pebble external workers by assigning workers with complex tasks. report findings in a new doc in docs/ops. do not destroy tenant when completed. keep it running. do not assign the tenant an "animal name" such that it is automatically destroyed by the teardown routine
