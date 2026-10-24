@@ -43,6 +43,8 @@ function makeSdk(options: MockOptions = {}) {
   let v2Replies = 0
   let aborts = 0
   const promptArgs: unknown[] = []
+  // WI#454: the shared env at prompt time — the moment task code inherits it.
+  const promptEnvSnapshots: Array<Record<string, string | undefined>> = []
   const signals: AbortSignal[] = []
   const captureSignal = (args: unknown[]) => {
     const options = args[1] as { signal?: AbortSignal } | undefined
@@ -71,6 +73,11 @@ function makeSdk(options: MockOptions = {}) {
       prompt: async (...args: unknown[]) => {
         promptArgs.push(args)
         captureSignal(args)
+        promptEnvSnapshots.push({
+          AGENT_AUTH_TOKEN: process.env.AGENT_AUTH_TOKEN,
+          AGENT_AUTH_TOKEN_FILE: process.env.AGENT_AUTH_TOKEN_FILE,
+          LEGIT_TASK_VAR: process.env.LEGIT_TASK_VAR,
+        })
         const callIndex = promptArgs.length - 1
         if (options.pendingPrompt || (options.pendingPromptAfterFirst && callIndex >= 1)) {
           await new Promise(() => {})
@@ -138,6 +145,7 @@ function makeSdk(options: MockOptions = {}) {
     abortCount: () => aborts,
     signals,
     promptArgs,
+    promptEnvSnapshots,
   }
 }
 
@@ -1336,6 +1344,58 @@ console.log(JSON.stringify(results[0]?.error ?? ""))
     }
   } finally {
     rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+// WI#454: this lane injects task-supplied env into its OWN process.env (the
+// serve process and its bash tools inherit it), so a task naming the
+// hub-handshake credential would hand itself — and every concurrent task —
+// the bridge's token. Both reserved names are dropped and logged; ordinary
+// task env still lands and is restored.
+{
+  const savedToken = process.env.AGENT_AUTH_TOKEN
+  const savedTokenFile = process.env.AGENT_AUTH_TOKEN_FILE
+  process.env.AGENT_AUTH_TOKEN = "bridge-secret"
+  delete process.env.AGENT_AUTH_TOKEN_FILE
+  const warnings: string[] = []
+  const savedWarn = console.warn
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map((a) => String(a)).join(" "))
+  }
+  try {
+    const envSdk = makeSdk()
+    await runTask(envSdk.sdk, {
+      task_id: "task-env-reserved",
+      prompt: "read env",
+      context: {
+        environment: {
+          AGENT_AUTH_TOKEN: "forged-by-task",
+          AGENT_AUTH_TOKEN_FILE: "/run/lunarwing/agent_auth_token",
+          LEGIT_TASK_VAR: "kept",
+        },
+      },
+    })
+    assert.equal(envSdk.promptEnvSnapshots.length, 1)
+    assert.deepEqual(
+      envSdk.promptEnvSnapshots[0],
+      { AGENT_AUTH_TOKEN: "bridge-secret", AGENT_AUTH_TOKEN_FILE: undefined, LEGIT_TASK_VAR: "kept" },
+      "task code must see the bridge's own token unchanged, no handoff pointer, and its ordinary env",
+    )
+    // The bridge's own credential survives, and ordinary keys are restored.
+    assert.equal(process.env.AGENT_AUTH_TOKEN, "bridge-secret")
+    assert.equal(process.env.AGENT_AUTH_TOKEN_FILE, undefined)
+    assert.equal(process.env.LEGIT_TASK_VAR, undefined)
+    const drops = warnings.filter((w) => w.includes("dropped task-supplied env entry"))
+    assert.equal(drops.length, 2, `expected one drop warning per reserved key, got ${JSON.stringify(warnings)}`)
+    assert.ok(drops.some((w) => w.includes("AGENT_AUTH_TOKEN_FILE")))
+    assert.ok(drops.every((w) => w.includes("task-env-reserved")), "each drop must name the task")
+    assert.ok(drops.every((w) => !w.includes("forged-by-task")), "never log the value")
+  } finally {
+    console.warn = savedWarn
+    if (savedToken === undefined) delete process.env.AGENT_AUTH_TOKEN
+    else process.env.AGENT_AUTH_TOKEN = savedToken
+    if (savedTokenFile === undefined) delete process.env.AGENT_AUTH_TOKEN_FILE
+    else process.env.AGENT_AUTH_TOKEN_FILE = savedTokenFile
   }
 }
 

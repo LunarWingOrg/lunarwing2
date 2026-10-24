@@ -27,6 +27,14 @@ const OPENCODE_HOST = process.env.OPENCODE_SERVE_HOST || "127.0.0.1"
 const OPENCODE_PORT = process.env.OPENCODE_SERVE_PORT || "4096"
 const OPENCODE_BASE_URL = `http://${OPENCODE_HOST}:${OPENCODE_PORT}`
 const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || "/workspace"
+
+/**
+ * WI#454: the hub-handshake credential names. Only the bridge needs them and
+ * task code is untrusted, so task-supplied `context.environment` may never
+ * introduce either into the shared process env this lane runs tasks in.
+ */
+export const RESERVED_CREDENTIAL_KEYS = new Set(["AGENT_AUTH_TOKEN", "AGENT_AUTH_TOKEN_FILE"])
+
 const RETRY_PROMPT =
   "The previous model request failed transiently. Continue this task from the current session and " +
   "workspace state. Do not repeat completed work. Inspect existing changes and proceed from " +
@@ -181,6 +189,17 @@ export async function executeTask(
   const savedValues: Record<string, string | undefined> = {}
   if (request.context?.environment) {
     for (const [key, value] of Object.entries(request.context.environment)) {
+      // WI#454: this lane injects task env into the bridge's OWN process.env
+      // (the serve process and its bash tools inherit it), so a task naming
+      // the hub-handshake credential would hand itself — and every concurrent
+      // task — the bridge's token. Refused here, like the kimi and pebble
+      // executors' post-merge delete.
+      if (RESERVED_CREDENTIAL_KEYS.has(key)) {
+        console.warn(
+          `[opencode executor] dropped task-supplied env entry ${key} for task ${request.task_id}: reserved for the bridge handshake (WI#454)`,
+        )
+        continue
+      }
       injectedKeys.push(key)
       savedValues[key] = process.env[key]
       process.env[key] = value
