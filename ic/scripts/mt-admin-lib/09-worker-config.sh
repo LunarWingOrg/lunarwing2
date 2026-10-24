@@ -1913,8 +1913,10 @@ stop_tenant_opencode2() {
 # ~/lunarwing tree, so the historical root `mkdir -p` + unbounded `chown -R`
 # followed a tenant-planted symlink at any owned component into arbitrary
 # host territory — the same root-follows-tenant-path class WI#446 eliminated
-# everywhere else. Create the directory AS the tenant (tenant_mkdir_p refuses
-# non-absolute paths and any symlinked component outright), then refuse a
+# everywhere else. Validate the path first (darkirc_path_components_safe
+# refuses non-absolute paths and any symlinked component outright), then
+# create the directory AS the tenant (sudo -u <tenant> mkdir -p, or a plain
+# mkdir -p when mt-admin already runs as the tenant), then refuse a
 # symlinked or foreign-owned path here. Rootful runtimes still need the
 # bind mount handed to the image uid, so the chown runs only after that
 # validation, bounded with --no-dereference so the walk never follows a

@@ -690,10 +690,13 @@ The workspace sits inside the tenant-controlled `~/lunarwing` tree, so the
 historical root `mkdir -p` + unbounded `chown -R` followed a tenant-planted
 symlink at any owned component into arbitrary host territory — the same
 root-follows-tenant-path class WI#446 eliminated everywhere else.
-**WI#453** (closed 2026-10-22): `prepare_worker_workspace` creates the
-workspace **as the tenant** (`tenant_mkdir_p` refuses non-absolute paths and
-every component that is not owned and writable by the tenant), so root
-never opens a path the tenant chose; the chown step uses
+**WI#453** (closed 2026-10-22): `prepare_worker_workspace` validates the
+workspace path first (`darkirc_path_components_safe` refuses non-absolute
+paths and any `.`, `..` or symlinked component), then creates the
+workspace **as the tenant** (`sudo -u <tenant> mkdir -p`, or a plain
+`mkdir -p` when mt-admin already runs as the tenant) and refuses a leaf
+that is not a plain directory owned like the tenant root — so root never
+opens a path the tenant chose; the chown step uses
 `chown --no-dereference` on the workspace root and every non-hard-link
 descendant, so a symlink in the tree can no longer redirect root's chown
 onto a victim path. The `chmod 2770` site that WI#416 left unconverted is
@@ -704,14 +707,28 @@ errexit context (`cmd || status=$?`) used to be silently swallowed and the
 bind mount reached the container with the wrong owner; both now return rc-1
 with a named message and restore `PWD` on every exit path.
 
-### `validate_llm_url` No Longer Echoes the Tenant URL (WI#384)
+**Known regression on rootful hosts (open at release, run-203 NO-2 on
+!1880):** on Docker-default hosts (`LUNARWING_MT_ROOTLESS=false`) the
+workspace root and contents are chowned to the container uid **before**
+the tenant-side `tenant_chmod 2770` runs — the tenant no longer owns the
+leaf, so the `chmod` fails with EPERM and every kimi, opencode and
+opencode2 worker start dies on the first call. Proven with a non-root
+tenant in run-203; unfixed at release and owned by goals item 91, which
+now carries !1880's findings. See the known-issues entry below.
+
+### `validate_llm_url` Escapes and Length-Caps the Tenant URL (WI#384)
 
 `validate_llm_url`'s `die` messages (`must be an http(s) URL`, `has no
 host`, `must not embed userinfo`, etc.) used to print the tenant-supplied
-URL verbatim, leaking it into the job trace. They now route through
-`sanitize_display_value`, which redacts the value to a short, safe form
-before it reaches any error line (`ic/scripts/mt-admin-lib/06-env-generation.sh`).
-WI#384 was closed on 2026-10-23.
+URL verbatim, leaking it into the job trace. The scheme and no-host
+error lines now route through `sanitize_display_value`
+(`ic/scripts/mt-admin-lib/06-env-generation.sh`), which percent-encodes
+every non-printable character and `%` and caps the value at 160 bytes
+(appending `...` only when a byte was actually dropped) — the URL is still
+printed there, but in a short, terminal-safe, injection-free form; every
+other die site prints no URL at all. Because the scheme check runs first,
+a credential URL with a mistyped scheme still shows its userinfo through
+those two escaped lines. WI#384 was closed on 2026-10-23.
 
 ### Boot-Time Mission Writers Reload Under the Lock (WI#317)
 
@@ -1564,7 +1581,11 @@ runs offline in the `ci-config` lane (landed with !1806, merged 2026-10-20;
 WI#363 closed on 2026-10-21). A reason naming only a work item fails, so an
 acceptance can no longer reach `ic/Cargo.lock` without a named owner — the
 gap that let the WI#331/WI#367/WI#368/WI#418 acceptances sit ownerless
-after their work items closed.
+after their work items closed. The offline guard checks the phrase and that
+cited paths exist; it does **not** check that the named owner is still open
+(the online owner-open half was dropped in the 2026-10-20 scope decision),
+so an acceptance whose owner work item has since closed still passes — the
+guard closes the ownerless gap, not owner drift.
 
 **Known issues / open at release.** Reconciled per item in
 `docs/ops/v2.1.6.0_OPEN_WORK_ITEMS_STATUS.md`, a 2026-10-14 01:05Z snapshot
@@ -1592,7 +1613,14 @@ absent), WI#441 (`resolve_protected_paths` degrades silently when
 `engine/knowledge` and `engine/orchestrator` boot-loaded docs are still
 agent-writable through memory tools, with id-shadowing at boot and a
 provenance-label inversion), and the engine-v2 migration-completeness
-residuals WI#442.
+residuals WI#442. **Rootful worker starts are broken on Docker-default
+hosts (run-203 NO-2 on !1880, owned by goals item 91):** with
+`LUNARWING_MT_ROOTLESS=false`, `prepare_worker_workspace` chowns the
+workspace leaf to the container uid before the tenant-side
+`tenant_chmod 2770` runs, so the tenant no longer owns the leaf, the
+`chmod` fails with EPERM, and every kimi, opencode and opencode2 worker
+start dies on the first call — live in this release since WI#453 and
+unfixed at release; the mechanism is described in the WI#453 section above.
 
 The worker-image residuals stay open pending rebuilds: **WI#449** (the
 opencode2 lane's credential-isolation migration, plus the run-170 leftovers
@@ -1612,14 +1640,16 @@ Closed since the last repass, by tracker date: WI#388 (the fleet-wide
 OpenRC proxy-unit rollout for WI#376, Upgrade Note 2), WI#461, WI#462, and
 WI#463 on 2026-10-24; WI#354, WI#384, WI#434, WI#444, WI#452, and WI#457
 on 2026-10-23; WI#353, WI#451, and WI#453 on 2026-10-22; WI#317, WI#322,
-WI#324, WI#363, WI#370, WI#387, and WI#450 on 2026-10-21; WI#445, WI#446,
-WI#422, WI#423, and WI#389 on 2026-10-20 (WI#450, WI#451, WI#453, and
+WI#324, WI#363, WI#387, WI#450, and WI#446 on 2026-10-21; WI#445, WI#422,
+WI#423, WI#389, and WI#370 on 2026-10-20 (WI#450, WI#451, WI#453, and
 WI#454's first slice close the run-181/run-186 review residuals of the
 WI#446 re-attempt); and WI#416 and WI#438 on 2026-10-18. WI#416's residual
 is now converted rather than orphaned: the `prepare_worker_workspace`
 `chmod 2770` site it left unconverted was converted by **WI#453**
 (`f30e4fc80`) — the workspace is created as the tenant and chowned with
-`--no-dereference`, which is exactly what a rootful start must not undo.
+`--no-dereference`; on rootful hosts that chown precedes the tenant-side
+`tenant_chmod`, which regressed worker starts there (run-203 NO-2, the
+known-issues entry above; owned by item 91).
 Earlier closures, per the same tracker pass: the five test-build field
 reports WI#366, WI#372, WI#385, WI#398, and WI#399 together with the
 WI#359/WI#373 triage items on 2026-10-14; WI#336, WI#356, WI#376, WI#377,
