@@ -1205,8 +1205,10 @@ Re-Audit). The
 untouched by the sweep, then upgraded separately twice — for the rustls
 advisories and again for the webpki trio — with its Dockerfile digest
 refreshed each time. External worker pins: kimi-code
-advanced to 2.2.0; opencode v1.18.25 and the Pebble upstream ref are
-unchanged; opencode2 advances v2.0.24 → v2.0.32 per WI#427 (OpenTunnel
+advanced to 2.3.0 (2.2.0 during most of the cycle, re-bumped for goals
+item 83); opencode v1.18.25 and the Pebble upstream ref are
+unchanged; opencode2 advances v2.0.24 → v2.0.32 per WI#427, then to
+v2.1.2 for goals item 83 (OpenTunnel
 compiled out; see Worker Exposure Policy). All four worker Dockerfiles and
 the CI `CI_DEBIAN_SNAPSHOT` moved from the 20260906T000000Z to the
 20261017T082437Z Debian snapshot, which carries the Debian-fixed perl
@@ -1296,8 +1298,11 @@ are recorded in the audit doc's 2026-10-16 follow-up.
    opencode2 and pebble tool proxies unsurfaced. Preserve
    opencode2 state before the first new-version boot: upstream migrates its
    database, so rolling back the image alone is not a verified rollback.
-   kimi-code is upgraded to **2.2.0** (an earlier 2.2.0 image promoted
-   during the cycle predates the WI#411/WI#412 fixes — rebuild from the
+   kimi-code is upgraded to **2.3.0** (2.2.0 during most of the cycle — an
+   earlier 2.2.0 image promoted
+   during the cycle predates the WI#411/WI#412 fixes; the 2.3.0 re-bump
+   carries the same fixes plus the WI#454 task-runner delegation machinery —
+   rebuild from the
    release tree and recreate the tenant containers; mt-admin now recreates
    worker containers automatically when the image ID changes, on OpenRC as
    well). Note the one-time rollout effect: the first
