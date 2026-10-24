@@ -526,6 +526,236 @@ command mkdir -p "$fixture/home/lunarwing"
 command rm -rf -- "$wi453_real"
 unset wi453_real
 
+# NR-1 (run-206 review of !1887): if the leaf is swapped for a symlink
+# between the pre-cd path checks and `command cd -- "$workspace_dir"`, `cd`
+# follows the link. The post-cd `pwd -P` + `stat -c %u .` gate must refuse
+# before any chown or chmod runs, restore the caller's PWD, and leave the
+# decoy's mode and owner untouched.
+nr1_decoy="$fixture/nr1-decoy"
+command mkdir -p "$nr1_decoy"
+command chmod 700 "$nr1_decoy"
+command rm -rf -- "$fixture/home/lunarwing/kimi-workspace"
+stat() {
+  command stat "$@"
+  if [[ "${3:-}" == "$fixture/home/lunarwing" ]]; then
+    command rm -rf -- "$fixture/home/lunarwing/kimi-workspace"
+    command ln -s "$nr1_decoy" "$fixture/home/lunarwing/kimi-workspace"
+  fi
+}
+CHOWN_CALL=''
+nr1_saved_pwd="$PWD"
+nr1_rc=0
+nr1_out="$(prepare_worker_workspace root kimi 2>&1)" || nr1_rc=$?
+unset -f stat
+if [[ "$nr1_rc" -eq 1 && "$nr1_out" == *'redirected or changed owner on enter'* ]]; then
+  pass 'NR-1: post-check pre-cd symlink swap is refused on enter'
+else
+  fail "NR-1: post-check pre-cd symlink swap was not refused (rc $nr1_rc): $nr1_out"
+fi
+if [[ -z "$CHOWN_CALL" ]]; then
+  pass 'NR-1: post-cd refusal runs no chown'
+else
+  fail "NR-1: post-cd refusal ran chown: $CHOWN_CALL"
+fi
+if [[ "$(command stat -c %a "$nr1_decoy")" == 700 ]]; then
+  pass 'NR-1: decoy directory keeps its mode when pre-cd symlink swap is refused'
+else
+  fail "NR-1: decoy directory mode changed to $(command stat -c %a "$nr1_decoy")"
+fi
+if [[ "$PWD" == "$nr1_saved_pwd" ]]; then
+  pass 'NR-1: post-cd refusal restores caller PWD'
+else
+  fail "NR-1: post-cd refusal leaked PWD: $PWD != $nr1_saved_pwd"
+fi
+command rm -rf -- "$fixture/home/lunarwing/kimi-workspace" "$nr1_decoy"
+# Also pin the post-cd owner re-check (`stat -c %u .`) on its own when the
+# physical path still matches `$workspace_dir` (an in-place swap to a
+# foreign-owned plain directory between the pre-cd check and `cd`).
+stat() {
+  if [[ "${3:-}" == "." ]]; then
+    printf '10001\n'
+    return 0
+  fi
+  command stat "$@"
+}
+CHOWN_CALL=''
+nr1_rc=0
+nr1_out="$(prepare_worker_workspace root kimi 2>&1)" || nr1_rc=$?
+unset -f stat
+if [[ "$nr1_rc" -eq 1 && "$nr1_out" == *'redirected or changed owner on enter'* && -z "$CHOWN_CALL" ]]; then
+  pass 'NR-1: post-cd foreign-owner swap at same physical path is refused without chown'
+else
+  fail "NR-1: post-cd foreign-owner swap was not refused (rc $nr1_rc, chown='$CHOWN_CALL'): $nr1_out"
+fi
+command rm -rf -- "$fixture/home/lunarwing/kimi-workspace"
+unset nr1_decoy nr1_saved_pwd nr1_rc nr1_out
+
+# NO-4 (run-203 review of !1880): the pins above cannot see the rootful
+# defects because their tenant IS the invoking account, `sudo` runs fixture
+# commands directly and `chown` is a shell no-op — ownership never changes,
+# so the tenant chmod always succeeds. This block uses a REAL non-root
+# fixture tenant (nobody, 65534), the real `chown`, and a `sudo` that
+# actually drops uid, then pins the two rootful contracts:
+#   NO-2 — calls 1 and 2 both return 0 and leave the leaf at the container
+#          uid with mode 2770. On the !1880 head call 1 fails with
+#          `chmod ... Operation not permitted` (tenant_chmod after the
+#          container-uid chown), so this pin fails there on call 1.
+#   NO-3 — a foreign-owned leaf renamed into the slot (another lane's
+#          workspace, 10001) is refused with its ownership untouched.
+# Needs euid 0 (CI runs as root; the dev VM reproduces it inside
+# `podman unshare`, where `id` also reports uid 0) plus a real chown and a
+# real uid switch; otherwise it self-skips with a named reason, like the
+# NB-8/ND-2 noexec guards.
+no4_sudo() {
+  local user="${2:-}"
+  [[ "${1:-}" == -u && -n "$user" ]] || return 1
+  shift 2
+  if [[ "$(id -un)" == "$user" ]]; then
+    "$@"
+    return
+  fi
+  if command -v setpriv >/dev/null 2>&1; then
+    setpriv --reuid="$(id -u "$user")" --regid="$(id -g "$user")" \
+      --clear-groups -- "$@"
+  elif command -v runuser >/dev/null 2>&1; then
+    runuser -u "$user" -- "$@"
+  else
+    return 1
+  fi
+}
+no4_ready=no
+if [[ "$EUID" == 0 ]] && id -u nobody >/dev/null 2>&1 \
+    && no4_sudo -u nobody true >/dev/null 2>&1; then
+  no4_probe_dir="$(mktemp -d)"
+  if command chown 10001:10001 "$no4_probe_dir" >/dev/null 2>&1 \
+      && [[ "$(command stat -c %u "$no4_probe_dir")" == 10001 ]]; then
+    no4_ready=yes
+  fi
+  command rm -rf -- "$no4_probe_dir"
+  unset no4_probe_dir
+fi
+if [[ "$no4_ready" != yes ]]; then
+  pass 'NO-2/NO-3 rootful real-chown pins SKIPPED — needs euid 0, a mapped uid 10001 and a real uid switch (dev VM: run under `podman unshare`); environment artifact, not a code verdict'
+else
+  no4_root="$fixture/no4-home"
+  command mkdir -p "$no4_root/lunarwing"
+  command chmod 755 "$fixture" "$no4_root" "$no4_root/lunarwing"
+  command chown nobody:nogroup "$no4_root/lunarwing" 2>/dev/null \
+    || command chown nobody "$no4_root/lunarwing"
+  no4_orig_sudo="$(declare -f sudo)"
+  no4_orig_lwroot="$(declare -f tenant_lw_root)"
+  tenant_lw_root() { printf '%s/lunarwing\n' "$fixture/no4-home"; }
+  sudo() { no4_sudo "$@"; }
+  unset -f chown  # the mock above is a no-op; this block needs the binary
+  # shellcheck disable=SC2034  # read by the sourced prepare_worker_workspace
+  MT_ROOTLESS=false
+  no4_rc1=0
+  no4_rc2=0
+  prepare_worker_workspace nobody kimi >/dev/null 2>&1 || no4_rc1=$?
+  prepare_worker_workspace nobody kimi >/dev/null 2>&1 || no4_rc2=$?
+  if [[ "$no4_rc1" -eq 0 ]]; then
+    pass 'NO-2: first rootful prep with a non-root tenant succeeds'
+  else
+    fail "NO-2: first rootful prep failed (rc $no4_rc1) — tenant chmod after the container-uid chown"
+  fi
+  if [[ "$no4_rc2" -eq 0 ]]; then
+    pass 'NO-2: second rootful prep is idempotent across the container-uid leaf'
+  else
+    fail "NO-2: second rootful prep refused the container-uid leaf (rc $no4_rc2)"
+  fi
+  if [[ "$(command stat -c %u "$no4_root/lunarwing/kimi-workspace" 2>/dev/null)" == 10002 ]]; then
+    pass 'NO-2: rootful leaf is handed to the container uid'
+  else
+    fail "NO-2: rootful leaf owner wrong: $(command stat -c %u "$no4_root/lunarwing/kimi-workspace" 2>/dev/null)"
+  fi
+  if [[ "$(command stat -c %a "$no4_root/lunarwing/kimi-workspace" 2>/dev/null)" == 2770 ]]; then
+    pass 'NO-2: rootful leaf mode is 2770'
+  else
+    fail "NO-2: rootful leaf mode wrong: $(command stat -c %a "$no4_root/lunarwing/kimi-workspace" 2>/dev/null)"
+  fi
+  # NO-3: the tenant renames another lane's workspace (10001-owned) into
+  # this lane's slot; root must refuse before any chown, leaving it 10001.
+  no4_slot="$no4_root/lunarwing/slot-10001"
+  command mkdir -p "$no4_slot"
+  printf 'foreign\n' >"$no4_slot/f.txt"
+  command chown -R 10001:10001 "$no4_slot"
+  command rm -rf -- "$no4_root/lunarwing/kimi-workspace"
+  no4_sudo -u nobody mv "$no4_slot" "$no4_root/lunarwing/kimi-workspace"
+  no4_rc3=0
+  no4_out3="$(prepare_worker_workspace nobody kimi 2>&1)" || no4_rc3=$?
+  if [[ "$no4_rc3" -eq 1 && "$no4_out3" == *'not owned like the tenant root'* ]]; then
+    pass 'NO-3: a foreign-owned leaf renamed into the slot is refused'
+  else
+    fail "NO-3: foreign-owned leaf not refused (rc $no4_rc3): $no4_out3"
+  fi
+  if [[ "$(command stat -c %u "$no4_root/lunarwing/kimi-workspace" 2>/dev/null)" == 10001 ]]; then
+    pass 'NO-3: the refused foreign leaf keeps its ownership'
+  else
+    fail "NO-3: refused foreign leaf was chowned to $(command stat -c %u "$no4_root/lunarwing/kimi-workspace" 2>/dev/null)"
+  fi
+  # NR-1 (run-206 review): tenant swaps the leaf in the window between the
+  # pre-cd checks and `cd` — (a) to a symlink targeting a root-owned decoy
+  # outside the tenant tree (pins `pwd -P`), and (b) in-place to a 10001-
+  # owned plain directory at the exact workspace path (pins `stat -c %u .`
+  # after `cd` when `pwd -P` still matches).
+  no4_decoy="$fixture/no4-decoy"
+  command mkdir -p "$no4_decoy"
+  printf 'root-secret\n' >"$no4_decoy/secret.txt"
+  command chown -R 0:0 "$no4_decoy"
+  command chmod 755 "$no4_decoy"
+  command rm -rf -- "$no4_root/lunarwing/kimi-workspace"
+  stat() {
+    command stat "$@"
+    if [[ "${3:-}" == "$no4_root/lunarwing" ]]; then
+      no4_sudo -u nobody rm -rf -- "$no4_root/lunarwing/kimi-workspace"
+      no4_sudo -u nobody ln -s "$no4_decoy" "$no4_root/lunarwing/kimi-workspace"
+    fi
+  }
+  no4_rc4=0
+  no4_out4="$(prepare_worker_workspace nobody kimi 2>&1)" || no4_rc4=$?
+  unset -f stat
+  if [[ "$no4_rc4" -eq 1 && "$no4_out4" == *'redirected or changed owner on enter'* ]]; then
+    pass 'NR-1 (rootful): tenant symlink swap before cd is refused'
+  else
+    fail "NR-1 (rootful): tenant symlink swap before cd was not refused (rc $no4_rc4): $no4_out4"
+  fi
+  if [[ "$(command stat -c '%u:%a' "$no4_decoy")" == "0:755" \
+      && "$(command stat -c %u "$no4_decoy/secret.txt")" == 0 ]]; then
+    pass 'NR-1 (rootful): root-owned decoy keeps owner 0 and mode 755'
+  else
+    fail "NR-1 (rootful): decoy altered: dir=$(command stat -c '%u:%a' "$no4_decoy") file=$(command stat -c %u "$no4_decoy/secret.txt")"
+  fi
+  no4_swap_foreign="$no4_root/lunarwing/swap-10001"
+  command mkdir -p "$no4_swap_foreign"
+  command chown 10001:10001 "$no4_swap_foreign"
+  command chmod 700 "$no4_swap_foreign"
+  command rm -rf -- "$no4_root/lunarwing/kimi-workspace"
+  stat() {
+    command stat "$@"
+    if [[ "${3:-}" == "$no4_root/lunarwing" ]]; then
+      no4_sudo -u nobody rm -rf -- "$no4_root/lunarwing/kimi-workspace"
+      no4_sudo -u nobody mv "$no4_swap_foreign" "$no4_root/lunarwing/kimi-workspace"
+    fi
+  }
+  no4_rc5=0
+  no4_out5="$(prepare_worker_workspace nobody kimi 2>&1)" || no4_rc5=$?
+  unset -f stat
+  if [[ "$no4_rc5" -eq 1 && "$no4_out5" == *'redirected or changed owner on enter'* \
+      && "$(command stat -c '%u:%a' "$no4_root/lunarwing/kimi-workspace")" == "10001:700" ]]; then
+    pass 'NR-1 (rootful): in-place foreign-dir swap before cd is refused with owner/mode intact'
+  else
+    fail "NR-1 (rootful): in-place foreign-dir swap not refused (rc $no4_rc5, $(command stat -c '%u:%a' "$no4_root/lunarwing/kimi-workspace" 2>/dev/null)): $no4_out5"
+  fi
+  command rm -rf -- "$no4_root" "$no4_decoy"
+  eval "$no4_orig_sudo"
+  eval "$no4_orig_lwroot"
+  unset no4_orig_sudo no4_orig_lwroot no4_slot no4_decoy no4_swap_foreign no4_rc1 no4_rc2 no4_rc3 no4_rc4 no4_rc5 no4_out3 no4_out4 no4_out5
+  chown() { CHOWN_CALL="$*"; }
+  unset no4_root
+fi
+unset -f no4_sudo
+unset no4_ready
+
 # MI-3 (run-186 review): a tenant-planted hard link inside the workspace
 # must keep its original owner — the chown walk skips regular files with a
 # link count above 1 so `chown -R` cannot hand an outside file to the

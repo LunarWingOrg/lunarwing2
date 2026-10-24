@@ -1920,8 +1920,21 @@ stop_tenant_opencode2() {
 # validation, bounded with --no-dereference so the walk never follows a
 # symlink (GNU chown: -h affects symlinks themselves; -R with it does not
 # follow). Rootless keep-id maps the tenant identity, so no chown at all.
-# chmod goes through tenant_chmod: chmod follows symlinks, and root has no
-# business touching a mode under a tenant-writable parent (WI#390).
+# NO-2/NO-3 (run-203 review of !1880) + NR-1/NR-2 (run-206 review of !1887):
+# the leaf-uid gate accepts exactly two owners — the tenant root uid (a fresh
+# leaf, and every rootless leaf) and, on rootful hosts only, this lane's
+# container uid (a leaf handed over by an earlier rootful call, which never
+# restores tenant ownership). Any other owner, such as another lane's
+# workspace renamed into this slot, is refused before the chown. On rootful
+# hosts, after `cd` enters the workspace and pins `.`, root re-verifies where
+# it landed (`pwd -P` must equal `$workspace_dir` and `stat -c %u .` must
+# still be one of the two accepted owners) before any chown or chmod runs,
+# closing the swap window between the pre-cd path checks and `cd` (NR-1).
+# The mode is then set by root on `.` inside that verified `cd`: the tenant
+# no longer owns the leaf after the chown, so tenant_chmod would fail EPERM
+# on its first call (NO-2). Rootless keeps tenant_chmod — chmod follows
+# symlinks, and root has no business touching a mode under a tenant-writable
+# parent (WI#390).
 prepare_worker_workspace() {
   local name="$1" worker="$2" lw_root workspace_dir container_uid container_gid
   lw_root="$(tenant_lw_root "$name")"
@@ -1944,15 +1957,6 @@ prepare_worker_workspace() {
     printf 'error: %s workspace is not a plain directory: %s\n' "$worker" "$workspace_dir" >&2
     return 1
   fi
-  # Ownership is checked against the tenant root dir — provisioned
-  # tenant-owned by create_tenant_user — rather than by resolving the
-  # account's uid, so the check also holds for fixture tenants with no
-  # passwd entry (same posture as prepare_pebble_workspace).
-  if [[ "$(stat -c %u "$workspace_dir" 2>/dev/null || printf -- -1)" \
-      != "$(stat -c %u "$lw_root" 2>/dev/null || printf -- -2)" ]]; then
-    printf 'error: %s workspace not owned like the tenant root: %s\n' "$worker" "$workspace_dir" >&2
-    return 1
-  fi
 
   case "$worker" in
     opencode)
@@ -1970,24 +1974,54 @@ prepare_worker_workspace() {
     *) die "unsupported private worker workspace: $worker" ;;
   esac
 
+  # Ownership is checked against the tenant root dir — provisioned
+  # tenant-owned by create_tenant_user — rather than by resolving the
+  # account's uid, so the check also holds for fixture tenants with no
+  # passwd entry (same posture as prepare_pebble_workspace). NO-3: a
+  # rootful leaf from an earlier call is container-uid-owned (the chown
+  # below never restores tenant ownership), so exactly that second owner
+  # is accepted there; anything else — e.g. another lane's workspace
+  # renamed into this slot — is refused before any chown runs.
+  local leaf_uid root_uid leaf_owner_ok=no
+  leaf_uid="$(stat -c %u "$workspace_dir" 2>/dev/null || printf -- -1)"
+  root_uid="$(stat -c %u "$lw_root" 2>/dev/null || printf -- -2)"
+  if [[ "$leaf_uid" == "$root_uid" ]]; then
+    leaf_owner_ok=yes
+  elif [[ "$MT_ROOTLESS" != "true" && "$leaf_uid" == "$container_uid" ]]; then
+    leaf_owner_ok=yes
+  fi
+  if [[ "$leaf_owner_ok" != yes ]]; then
+    printf 'error: %s workspace not owned like the tenant root: %s\n' "$worker" "$workspace_dir" >&2
+    return 1
+  fi
+
   if [[ "$MT_ROOTLESS" != "true" ]]; then
     # Rootful runtimes do not apply keep-id, so bind mounts must use image
-    # IDs. The directory is verified plain and tenant-owned above. MI-3
-    # (run-186 review): cd into the directory first so an ancestor swap
-    # between the checks and the chown cannot redirect it. Use
-    # --no-dereference throughout. On first creation the directory is
-    # empty, so chown only the top node (not -R); when content exists,
-    # use a single batched find -exec (MV-3: the per-entry stat+chown
-    # loop cost seconds per thousand entries; one find -exec does the
-    # same skip rule in 0.1s on a 10K-entry tree). Skip regular files
-    # with a link count above 1 so a tenant-planted hard link to an
+    # IDs. The directory is verified plain and owner-checked above. MI-3
+    # (run-186 review) + NR-1/NR-2 (run-206 review): cd into the directory
+    # to pin `.`, then verify the physical path entered (`pwd -P` equals
+    # `$workspace_dir`) and re-check `.`'s owner before any chown or chmod
+    # runs, so a symlink or foreign-dir swap between the pre-cd checks and
+    # `cd` is refused. Use --no-dereference throughout. On first creation
+    # the directory is empty, so chown only the top node (not -R); when
+    # content exists, use a single batched find -exec (MV-3: the per-entry
+    # stat+chown loop cost seconds per thousand entries; one find -exec
+    # does the same skip rule in 0.1s on a 10K-entry tree). Skip regular
+    # files with a link count above 1 so a tenant-planted hard link to an
     # outside file keeps its owner (the run-170 LP-9 class).
     # MV-4: save and restore the caller's working directory so the cd
     # into the workspace does not leak to the caller.
-    local _save_pwd
+    local _save_pwd landed_uid
     _save_pwd="$PWD"
     if ! command cd -- "$workspace_dir" 2>/dev/null; then
       printf 'error: cannot enter %s workspace: %s\n' "$worker" "$workspace_dir" >&2
+      return 1
+    fi
+    landed_uid="$(stat -c %u . 2>/dev/null || printf -- -1)"
+    if [[ "$(pwd -P 2>/dev/null || true)" != "$workspace_dir" ]] \
+        || { [[ "$landed_uid" != "$root_uid" ]] && [[ "$landed_uid" != "$container_uid" ]]; }; then
+      command cd -- "$_save_pwd" 2>/dev/null || true
+      printf 'error: %s workspace redirected or changed owner on enter: %s\n' "$worker" "$workspace_dir" >&2
       return 1
     fi
     # WI#461: both chown steps must be guarded. Bare commands under
@@ -2009,9 +2043,19 @@ prepare_worker_workspace() {
       printf 'error: cannot chown %s workspace contents: %s\n' "$worker" "$workspace_dir" >&2
       return 1
     fi
+    # NO-2: the leaf is container-uid-owned now, so the tenant can no
+    # longer chmod it (tenant_chmod would fail EPERM on the first call).
+    # Root sets the mode on the directory it already entered and verified;
+    # `.` is that directory itself, so no symlink can be followed.
+    if ! chmod 2770 .; then
+      command cd -- "$_save_pwd" 2>/dev/null || true
+      printf 'error: cannot set %s workspace mode: %s\n' "$worker" "$workspace_dir" >&2
+      return 1
+    fi
     command cd -- "$_save_pwd" 2>/dev/null || true
+  else
+    tenant_chmod "$name" 2770 "$workspace_dir" || return 1
   fi
-  tenant_chmod "$name" 2770 "$workspace_dir" || return 1
   printf '%s\n' "$workspace_dir"
 }
 
