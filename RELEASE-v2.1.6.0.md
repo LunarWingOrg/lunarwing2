@@ -1057,6 +1057,106 @@ cap's effect). Both
 fixes reach tenants only with a rebuilt/promoted kimi image — see Upgrade
 Notes.
 
+### Kimi Task-Runner Delegation (WI#454)
+
+The kimi lane gains the first worker-side slice of the two-container split
+WI#454 calls for (the maintainer's no-root policy, note #10954 on !1829).
+A task-runner daemon (`kimicode4lunarwing/scripts/task_runner.ts`)
+executes tasks as the task uid — it refuses to start as root, so no
+`setpriv` privilege drop is needed — and a bridge-side client
+(`task_runner_client.ts`) delegates each task over a unix socket. Inside
+the current single-container image the entrypoint rehearses the split:
+with the credential handoff active, `run_task_runner` has root bind the
+listening socket `/run/lunarwing-runner-sock/task-runner.sock` in a
+root-only `0700` directory (`kimicode4lunarwing/task_runner_bind.py`),
+then exec `setpriv` → `/usr/bin/env` →
+`/usr/local/bin/node task_runner.js` as the task uid with only the
+listening descriptor inherited (`LUNARWING_TASK_RUNNER_LISTEN_FD`). The
+credential vars are stripped from what the runner inherits, so the
+runner never sees the hub credential. The launcher exports
+`LUNARWING_TASK_RUNNER_SOCKET` to the bridge, which routes every task to
+the unprivileged runner instead of spawning the CLI itself;
+`KIMI_TASK_RUNNER=skip` (or no credential handoff, the host dev shape)
+keeps local execution. Delegation is ON by default whenever the
+credential handoff is active (maintainer decision, 2026-10-22,
+run-195 follow-up on !1861); `KIMI_TASK_RUNNER=skip` is the operator
+escape hatch.
+
+The runner protocol, bounds, and supervision are described in
+`docs/ops/WORKER-CONTAINERS.md` (run-200 NL-1..NL-8, run-198 NI-1..NI-6,
+run-196 NC-6..NC-10 fixes all carried): the runner acknowledges
+acceptance, reports the CLI's process group, streams progress, and ends
+with exactly one result; every runner-socket line is capped at the hub's
+`WS_MAX_PAYLOAD_BYTES` plus 64 KiB, so a large result is truncated
+exactly as in local execution, never refused; the bridge frees the
+workspace lock only once the CLI is gone, and a dead runner maps to an
+error `task_result` (the hub is never stranded); `/ready` reports
+liveness only (a JSON object with `ready: true` and a string
+`heartbeat_at` parsed as UTC with milliseconds, no older than 30 s and no
+more than 5 s in the future — the earlier `strptime` form read an
+ISO-8601 stamp as local time and dropped the milliseconds, so every
+fresh beat was 503, run-198 NI-2); the entrypoint supervises the runner
+and, after five failed restarts, signals the launcher (`kill -TERM $$` —
+the subshell forked before `BRIDGE_PID` existed, so it cannot signal the
+bridge directly), whose cleanup trap stops the bridge, the runner, and
+the health server so the container exits for the orchestrator (run-198
+NI-3). The kimi-image test gate reads the runner's `/proc` as the
+runner's own uid, so the in-image `npm test` does not need
+`CAP_SYS_PTRACE` under rootless BuildKit (run-202 NN-1). The runner's CLI
+environment gets the root-owned launcher PATH, never `TASK_PATH`, and the
+executor applies the WI#462 order (that PATH first, the task toolchain
+directories after) and resolves a bare `kimi` only to a root-owned file
+in a root-owned, non-writable directory of the runner's PATH (WI#463,
+fail-closed), matching the setpriv path. Socket ownership: root binds the
+socket in a root-only directory, so the task uid can neither replace it
+nor connect to it, and a root bridge refuses any runner socket that is
+not root-owned in a root-owned, non-writable directory; the `task_id`
+checks keep one run's frames apart from another's, they never
+authenticated anything. **Residual (Low):** the runner and every task
+still share one uid, so task code that may ptrace the runner (or take its
+descriptor with `pidfd_getfd`) could take the listener over; only the
+two-container split removes that. **What remains for the full split**
+(WI#454's own scope, still open): the image-level separation (bridge
+container and task container as two mt-admin units under two different
+non-root uids, with the socket crossing the shared workspace volume and
+the bridge itself dropping `USER 0:0`), plus the same machinery on the
+opencode and pebble lanes. WI#454 stays open on the tracker.
+
+### opencode Reproducible Build: models.dev Snapshot Pin (WI#467)
+
+The opencode v1.18.25 build compiles a models.dev catalog into the
+binary: at the pinned `cb7d8b2f` upstream,
+`packages/opencode/script/generate.ts` reads it from the file named by
+`MODELS_DEV_API_JSON` when set, and otherwise fetches
+`${OPENCODE_MODELS_URL:-https://models.dev}/api.json` live;
+`script/build.ts` passes the text to `Bun.build` as the
+`OPENCODE_MODELS_DEV` define, so the catalog is compiled in as code.
+Until WI#467 the worker Dockerfile never set the variable, so the binary
+changed whenever models.dev published between the candidate build and
+the `--no-cache` rebuild, and the `worker-opencode-candidate`
+clean-rebuild gate failed on master. The lane now carries a reviewed
+snapshot at `opencode4lunarwing/models-dev/api.json` (fetched from
+models.dev @ `a051b3ca330b`, 2026-10-23), committed pretty-printed so a
+refresh diffs line by line (the minified bundle is byte-identical to the
+one built from the one-line form). Its sha256 is pinned as the
+Dockerfile's `MODELS_DEV_SNAPSHOT_SHA256` ARG — not `*_API_JSON_*`:
+gitleaks' generic-api-key rule reads an ARG whose name contains `API` and
+whose value is 64 hex as a leaked key (run-200 NK-1). `validate_config.py`
+cross-checks the pin, requires the snapshot to be strict JSON (one
+non-empty object, no duplicate keys, no NaN/Infinity) in the canonical
+pretty layout, and pins the builder-stage tail from
+`WORKDIR /build/opencode/packages/opencode` to the next `FROM`
+instruction by instruction (`OPENCODE_MODELS_DEV_BUILD_STEPS` — run-200
+NK-2: the substring guard had let dropping the variable, dropping the
+guard call, and a live-fetch upstream pass). The build RUN verifies the
+hash, runs `scripts/check_models_dev_snapshot.py` (strict JSON, and
+`generate.ts` must still read both env vars), and builds with
+`OPENCODE_MODELS_URL=http://127.0.0.1:9`, so an upstream that ignores the
+snapshot and fetches anyway fails the build instead of compiling a live
+catalog (run-200 NK-3/NK-5). Both files hash into the opencode
+`worker-inputs.sha256`. WI#467 was closed on 2026-10-24; the fix ships
+with the next opencode image rebuild (see Upgrade Notes).
+
 ### Worker Image Rollout and Traceable mt-admin Builds
 
 Rebuilt worker images now reach running tenants on both init systems: the
