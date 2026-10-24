@@ -778,6 +778,75 @@ mod tests {
         mpsc::unbounded_channel()
     }
 
+    /// NP-2 (run-204): the bridge uid comes from the `Uid:` line of
+    /// /proc/self/status — a read, not a probe file created in a directory.
+    /// The pin runs the lookup in a child whose TMPDIR is a read-only
+    /// directory: a probe-shaped implementation cannot create its file there
+    /// and fails, while the status read does not care. The value must also
+    /// equal the fsuid of a file this process creates.
+    #[test]
+    fn bridge_uid_reads_self_status_without_writing_anywhere() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD_MARKER: &str = "PEBBLE_NP2_BRIDGE_UID_CHILD";
+        const TEST_PATH: &str =
+            "tool_proxy::tests::bridge_uid_reads_self_status_without_writing_anywhere";
+
+        let base = match std::env::var_os("NP2_BRIDGE_UID_BASE") {
+            Some(base) => std::path::PathBuf::from(base),
+            None => test_dir(),
+        };
+        let readonly = base.join("readonly");
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            std::fs::create_dir_all(&readonly).expect("create readonly dir");
+            // 0o500: traversable and readable, not writable — a probe file
+            // cannot be created inside it.
+            std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o500))
+                .expect("make dir read-only");
+            let exe = std::env::current_exe().expect("test binary path");
+            let out = std::process::Command::new(exe)
+                .args([TEST_PATH, "--exact", "--nocapture", "--test-threads=1"])
+                .env(CHILD_MARKER, "1")
+                // The child must not call test_dir(): its TMPDIR is the
+                // read-only dir on purpose. It writes its witness under the
+                // parent's (writable) base instead.
+                .env("NP2_BRIDGE_UID_BASE", &base)
+                .env("TMPDIR", &readonly)
+                .env("TMP", &readonly)
+                .env("TEMP", &readonly)
+                .output()
+                .expect("run the child probe");
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success(),
+                "the uid lookup must work with an unwritable TMPDIR (NP-2): {}{}",
+                String::from_utf8_lossy(&out.stderr),
+                text
+            );
+            assert!(
+                text.contains("NP2-BRIDGE-UID-OK"),
+                "the child never reported a uid: {text}"
+            );
+            std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o700)).ok();
+            std::fs::remove_dir_all(&base).ok();
+            return;
+        }
+
+        let base = std::path::PathBuf::from(
+            std::env::var_os("NP2_BRIDGE_UID_BASE").expect("parent passes the witness base"),
+        );
+        let uid = bridge_uid().expect("bridge uid from /proc/self/status");
+        let witness = base.join("witness");
+        std::fs::write(&witness, b"x").expect("write witness");
+        assert_eq!(
+            uid,
+            witness.metadata().expect("witness metadata").uid(),
+            "the status Uid: line must report this process's effective uid"
+        );
+        std::fs::remove_file(&witness).ok();
+        println!("NP2-BRIDGE-UID-OK {uid}");
+    }
+
     async fn next_hub_frame(rx: &mut mpsc::UnboundedReceiver<Message>) -> Envelope {
         let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
