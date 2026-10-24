@@ -329,4 +329,77 @@ pebble container; host-side `podman exec … ps aux` works. Treat `ps` as
 unusable from inside a pebble task and prefer `kill`/`wait`, `/proc`, or the
 worker bridge's own status for process checks.
 
+### kimi — complex task 2: Go HTTP server (three endpoints)
+
+Job `352b152e-3ec4-4a1e-a5d8-09a09ecb180f` (`external:kimi`), created 16:30:53,
+completed 16:34:36 (**223 s**, 29 events). This job ran **while the big Rust
+job below still held `/workspace`**, and was accepted — so the F3 lock is not a
+simple one-job-per-lane gate; see F8.
+
+`/workspace/kimi_item101_go` (go.mod with no external requirements, main.go,
+main_test.go). Raw tool results, not just the summary:
+
+- `go version go1.24.3 linux/amd64`; `go vet` → `VET OK`;
+  `go test ./...` → `TestFib` PASS, `ok kimi_item101_go 0.004s`; `BUILD OK`.
+- One bash loop curled all seven endpoints and returned exact bodies/status:
+  `/health` 200 `{"ok":true}`; `/fib?n=20` 200 `{"fib":6765,"n":20}`;
+  `/fib?n=0` 200 `{"fib":0,"n":0}`; `/fib?n=bad` **400**
+  `{"error":"invalid n \"bad\": must be an integer between 0 and 90"}`;
+  `/count` twice → `{"count":1}` then `{"count":2}` (real in-process atomic
+  state); `/unknown` **404**.
+- Shutdown: the worker's first check showed the server still answering, then
+  `pkill -x server` + a port check confirmed 8080 closed.
+- Independently re-verified with `podman exec`: rebuilt the binary, reran vet/
+  tests and the same curl series — identical bodies and status codes.
+- Declared deviations: JSON key order is `{"fib":…,"n":…}` (Go maps marshal
+  alphabetically), and the 400 body includes the offending value. Both are
+  within spec.
+
+### kimi — complex task 1 (large): Rust thread-pool expression evaluator — PARTIAL
+
+Job `7ae2cc44-020c-47eb-a49e-28c01b5be812` (`external:kimi`), created
+15:59:08. **Real, substantial work happened** (44 events by 16:17:21):
+
+- `rustc 1.96.1 (31fca3adb 2026-06-26)` / `cargo 1.96.1 (356927216 2026-06-26)`.
+- Created `/workspace/item101_rust` (Cargo.toml, src/main.rs), then iterated
+  with `[Write]` and `[Edit]` on the parser and the bounded pool.
+- `sample.txt` with 14 expressions including `2+3*4`, `-(2+3)*4`,
+  `max(10, min(20, 15))`, `100/7`, `7%3`, `1/0`, `2+`, `((1+2)*(3+4))-5`.
+- Ran the release binary twice: `TOTAL=14 OK=11 ERR=3 WORKERS_USED=4`, values
+  correct (`2+3*4 = 14`, `-(2+3)*4 = -20`, `100/7 = 14.285714285714286`,
+  `7%3 = 1`, `((1+2)*(3+4))-5 = 16`), error lines `1/0 ! division by zero`,
+  `2+ ! expected number, identifier or '(' but found None at token index 2`,
+  `100/(3-3) ! division by zero`; exit code 1 with errors mirrored to stderr.
+
+**It did not finish.** After the 16:17:21 edit, `turnStep=0.17`'s LLM request
+stayed unanswered for >15 minutes (F4/F9), leaving the crate mid-refactor. A
+direct `podman exec` verification at that point is honest evidence of the
+partial state:
+
+- `cargo test --offline` and `cargo build --release --offline` **fail**:
+  `src/main.rs:358:32` — `use of undeclared type AtomicUsize` (the worker's
+  in-flight refactor removed the import while adding a `pending` counter).
+  The previously built release binary still runs, which is why the outputs
+  above are reproducible.
+- Two consecutive runs **differ on stdout only in the `(wN)` worker-id
+  suffixes** — e.g. `-(2+3)*4 = -20 (w1)` vs `(w2)`. Values, order and stderr
+  are identical. The worker itself had already noticed this and was fixing it
+  when the stall began: with per-result worker ids printed, the item-7
+  "run it a second time to confirm deterministic output" requirement is not
+  satisfiable byte-for-byte. That is a **task-design conflict** (spec asked for
+  both per-result worker ids and byte-identical reruns), not a lane defect;
+  a rerun comparing output with `(wN)` stripped is the right check.
+
+### F8 (refinement of F3): the workspace lock is held by the *executing* task, not the lane
+
+The duplicate dispatches in F3 were refused, but the later kimi Go job
+`352b152e` was accepted and completed while the Rust job `7ae2cc44` still
+owned `/workspace` (it created `/workspace/kimi_item101_go` alongside
+`/workspace/item101_rust`). So the practical rule is: a second job is refused
+while the first is **actively executing**, and accepted once the first is
+idle/waiting. Concurrent jobs on one lane therefore share a writable
+`/workspace`; the lock does not give per-job isolation over a long,
+mostly-waiting task. Operators wanting isolation should still serialise jobs
+per lane (or use separate task directories, as these did).
+
 _(further tasks appended below)_
