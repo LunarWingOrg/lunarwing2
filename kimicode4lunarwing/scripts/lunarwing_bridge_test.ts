@@ -23,9 +23,11 @@ async function freePort(): Promise<number> {
   return port
 }
 
+const bridgeStateDirs = new Map<ChildProcessWithoutNullStreams, string>()
+
 function startBridge(port: number, token: string, extraEnv: Record<string, string> = {}): ChildProcessWithoutNullStreams {
   const stateDir = mkdtempSync(join(tmpdir(), "kimi-bridge-"))
-  return spawn(process.execPath, [bridgePath], {
+  const child = spawn(process.execPath, [bridgePath], {
     env: {
       ...process.env,
       AGENT_AUTH_TOKEN: token,
@@ -36,6 +38,44 @@ function startBridge(port: number, token: string, extraEnv: Record<string, strin
     },
     stdio: ["pipe", "pipe", "pipe"],
   })
+  bridgeStateDirs.set(child, stateDir)
+  return child
+}
+
+const KILL_GRACE_MS = 3_000
+
+/**
+ * Stop a bridge child and wait for it to actually exit.
+ *
+ * A bare `child.kill("SIGTERM")` only queues the signal: the process can
+ * outlive it holding a stdio pipe open, which keeps the runner's event loop
+ * alive until the 120 s per-test timeout. SIGKILL after a short grace
+ * bounds a bridge that ignores or outlives SIGTERM. This is hygiene, not a
+ * credited pipeline fix (run-205 NQ-3): the file-level hang shape is
+ * pipeline 6252's kimi candidate (job 127798: one `not ok -
+ * lunarwing_bridge_test.js` at the 120 s testTimeoutFailure with no
+ * subtest output), whose cause was never root-caused, and 6308's kimi
+ * candidate was not a hang at all (163 pass / 2 fail / 0 cancelled /
+ * 4 skipped — the `/proc` EACCES failures !1876 fixed).
+ */
+async function killBridge(child: ChildProcessWithoutNullStreams): Promise<void> {
+  try {
+    if (child.exitCode === null && child.signalCode === null) {
+      const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()))
+      child.kill("SIGTERM")
+      const escalate = setTimeout(() => child.kill("SIGKILL"), KILL_GRACE_MS)
+      escalate.unref()
+      try {
+        await exited
+      } finally {
+        clearTimeout(escalate)
+      }
+    }
+  } finally {
+    const stateDir = bridgeStateDirs.get(child)
+    bridgeStateDirs.delete(child)
+    if (stateDir) rmSync(stateDir, { recursive: true, force: true })
+  }
 }
 
 async function waitForListening(child: ChildProcessWithoutNullStreams): Promise<void> {
@@ -74,7 +114,7 @@ test("bridge requires token and rejects wrong bearer before upgrade", async () =
     assert.equal(ready.type, "ready")
     ws.close()
   } finally {
-    child.kill("SIGTERM")
+    await killBridge(child)
   }
 })
 
@@ -116,7 +156,7 @@ console.log(JSON.stringify({ role: "assistant", content: "done" }))
     assert.equal(readFileSync(join(root, "missions/pr-digest/state"), "utf8"), "first tick")
   } finally {
     ws?.close()
-    child.kill("SIGTERM")
+    await killBridge(child)
     rmSync(root, { recursive: true, force: true })
   }
 })
@@ -169,7 +209,7 @@ console.log(JSON.stringify({ role: "assistant", content: sock ? "HAS_PROXY_ENV" 
     assert.match(String(second.output), /NO_PROXY_ENV/)
   } finally {
     ws?.close()
-    child.kill("SIGTERM")
+    await killBridge(child)
     rmSync(root, { recursive: true, force: true })
   }
 })
@@ -251,7 +291,7 @@ setTimeout(() => {
     assert.match(String(result.output), /tool:proxied-content/)
   } finally {
     ws?.close()
-    child.kill("SIGTERM")
+    await killBridge(child)
     rmSync(root, { recursive: true, force: true })
   }
 })
@@ -306,6 +346,15 @@ conn.on("data", (d) => {
         if (message.type === "tool_call" && message.payload.call_id === "drop1") resolve()
       })
       ws!.once("error", reject)
+      // Bound the parked wait (run-205 NQ-3): a bridge whose tool proxy
+      // died — e.g. the socket path over the unix limit, `listen EINVAL` —
+      // never relays the frame, and an unbounded await would sit out the
+      // whole per-test timeout.
+      const bound = setTimeout(
+        () => reject(new Error("timed out waiting for the parked tool_call frame")),
+        15_000,
+      )
+      bound.unref()
     })
     ws.send(JSON.stringify({ type: "task_request", payload: {
       task_id: "drop-task", prompt: "read a note", timeout_ms: 30000,
@@ -329,7 +378,7 @@ conn.on("data", (d) => {
     assert.match(String(reply.error), /hub connection closed/)
   } finally {
     ws?.close()
-    child.kill("SIGTERM")
+    await killBridge(child)
     rmSync(root, { recursive: true, force: true })
   }
 })
@@ -402,6 +451,13 @@ conn.on("data", (d) => {
         })
         hubSide.once("error", reject)
       })
+      // Bound the parked wait (run-205 NQ-3): same reason as the server-mode
+      // test above — a dead tool proxy never relays the frame.
+      const bound = setTimeout(
+        () => reject(new Error("timed out waiting for the parked tool_call frame")),
+        15_000,
+      )
+      bound.unref()
     })
     // Park the call in the relay: the hub observes the frame but never
     // answers, then closes the connection. Closing the server afterwards
@@ -424,7 +480,7 @@ conn.on("data", (d) => {
     assert.match(String(reply.error), /hub connection closed/)
   } finally {
     hub.close()
-    child.kill("SIGTERM")
+    await killBridge(child)
     rmSync(root, { recursive: true, force: true })
   }
 })
@@ -486,7 +542,7 @@ for (const m of messages) process.stdout.write(JSON.stringify(m) + "\\n")
   } finally {
     if (previousKimiBin === undefined) delete process.env.KIMI_BIN
     else process.env.KIMI_BIN = previousKimiBin
-    child.kill("SIGTERM")
+    await killBridge(child)
     runner.close()
     rmSync(root, { recursive: true, force: true })
   }
@@ -525,7 +581,7 @@ test("a runner-socket bridge maps a dead runner socket to an error task_result (
       ws.close()
     }
   } finally {
-    child.kill("SIGTERM")
+    await killBridge(child)
     rmSync(root, { recursive: true, force: true })
   }
 })
@@ -607,7 +663,7 @@ setInterval(() => {}, 1000)
     else process.env.KIMI_BIN = previousKimiBin
     if (previousGrace === undefined) delete process.env.KIMI_KILL_GRACE_MS
     else process.env.KIMI_KILL_GRACE_MS = previousGrace
-    child.kill("SIGTERM")
+    await killBridge(child)
     runner.close()
     rmSync(root, { recursive: true, force: true })
   }

@@ -223,17 +223,27 @@ pushed at once; every job went green on retry).
 This is GitLab rate-limiting the registry auth realm when several candidates
 fetch push tokens concurrently. Since 2026-10-18
 `.gitlab/scripts/build-worker-image.sh` wraps both image pushes (candidate
-and clean rebuild) in a bounded retry — up to 6 attempts with exponential
-backoff (30/60/120/240/480s) plus PID-based jitter to desynchronize
-concurrent worker pushes — that fires only on this transient signature
-(`failed to fetch oauth token` / `429 Too Many Requests`); the build is
-deterministic and the retry reuses the layer cache, so only the push is
-re-executed, and a genuine build failure still exits on the first attempt.
+and clean rebuild) in a bounded retry — up to 8 attempts with exponential
+backoff from a 45 s base (45/90/180/360/720/1440/2880s; the eighth attempt
+is final, so the curve ends at its last rung — there is no separate cap)
+plus job-id-based jitter (`CI_JOB_ID % 30`) to desynchronize concurrent
+worker pushes — that fires only on this transient signature
+(`failed to fetch oauth token` / `429 Too Many Requests`), and a genuine
+build failure still exits on the first attempt. On the candidate leg the
+build is deterministic and the retry reuses the layer cache, so only the
+push is re-executed — but the clean-rebuild leg is deliberately the
+uncached `--no-cache` build, so a sustained 429 on its push re-runs the
+full rebuild on every attempt (the WI#467 residual: with eight attempts
+that is up to eight full no-cache builds).
 The publication jobs keep their pinned `retry: 0` (no blind whole-job
 re-run); the retry contract is pinned by hermetic stubbed tests in
-`.gitlab/tests/test_worker_build_args.py`. If a candidate still fails after
-all six attempts, wait a few minutes and re-run the job manually — the scan
-follows once a candidate publishes `worker-image.env`.
+`.gitlab/tests/test_worker_build_args.py`. The window covers 5715 s
+(~95 minutes) of sleeping, inside the candidate job's 8 h timeout: pipeline
+6252's sustained 19-minute burst outlasted the previous
+6-attempt/~15-minute shape, so opencode and pebble burned every attempt
+there. If a candidate still fails after all eight attempts, wait a few
+minutes and re-run the job manually — the scan follows once a candidate
+publishes `worker-image.env`.
 
 ## worker-kimi digest mismatch (directory mtime flake)
 

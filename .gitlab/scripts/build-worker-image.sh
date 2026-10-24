@@ -253,9 +253,22 @@ metadata_digest() {
 # Exponential backoff with jitter desynchronizes concurrent worker pushes:
 # when kimi/opencode/opencode2 all hit the 429 at once, identical delays
 # would make them retry in lockstep and re-trip the rate limit together.
-# The PID-based jitter spreads them apart so each retry lands in a different
-# second, reducing the chance of a coordinated burst.
-_bwr_max_attempts=6
+# The jitter is derived from CI_JOB_ID (run-205 NQ-2): the job shell's PID
+# lands on nearly the same value in every fresh candidate container (in
+# 6327 the pebble, opencode2 and kimi candidates all retried at the same
+# 43 s delay), while concurrent candidates always carry distinct job ids,
+# so each retrying candidate lands at a different offset.
+#
+# Pipeline 6252's burst ran 19 minutes and outlasted the previous
+# 6-attempt/~15-minute window (opencode and pebble each burned all six, and
+# their scans then stopped at the "worker-image.env is missing" guard). Eight
+# attempts from a 45 s base give 45+90+180+360+720+1440+2880 = 5715 s
+# (~95.25 minutes) of sleeping, which still sits well inside the candidate
+# job's 8 h timeout. The 8th attempt is the final one, so the 2880 s rung
+# is never doubled past — adding attempts without re-checking this curve
+# would outgrow the timeout.
+_bwr_max_attempts=8
+_bwr_base_delay=45
 push_attempt_log="$CI_PROJECT_DIR/.worker-push-attempt.log"
 push_attempt_rc="$CI_PROJECT_DIR/.worker-push-attempt.rc"
 
@@ -281,8 +294,8 @@ build_image_with_retry() {
         fi
         IFS= read -r _bwr_status < "$push_attempt_rc"
         if [ "$_bwr_attempt" -lt "$_bwr_max_attempts" ] && transient_push_failure; then
-            _bwr_base=$((30 * (1 << (_bwr_attempt - 1))))
-            _bwr_jitter=$(( ($$ % 15) + 1 ))
+            _bwr_base=$((_bwr_base_delay * (1 << (_bwr_attempt - 1))))
+            _bwr_jitter=$(( CI_JOB_ID % 30 ))
             _bwr_delay=$((_bwr_base + _bwr_jitter))
             echo "registry push attempt $_bwr_attempt/$_bwr_max_attempts hit a transient registry-auth error; retrying in ${_bwr_delay}s" >&2
             sleep "$_bwr_delay"
