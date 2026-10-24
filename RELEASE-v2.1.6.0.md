@@ -4,8 +4,8 @@
 
 **Release date:** 2026-10-24
 
-> Horns emerge at dawn,  
-> each new growth reaches outward,  
+> Horns emerge at dawn,
+> each new growth reaches outward,
 > past the old outline. 角
 
 After Bungei Fukkō reopened the workshop, **Tsuno grows beyond it**. The horns make growth visible: new reach emerging from a strong foundation, branching toward places the project could not previously reach. The work of the earlier chapters becomes the ground from which LunarWing can extend into new domains, connect more of its capabilities, and take on work that once lay beyond its reach.
