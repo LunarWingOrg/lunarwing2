@@ -135,18 +135,17 @@ ignore = [
     # .gitlab/scripts/check-default-graph-advisories.sh.
     { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27 pinned by libsql 0.6.0 legacy chain; no 0.3-line patch exists; 0.4 line upgraded to 0.4.20; exposure: opt-in libsql-remote-replica builds only, default builds cleared by WI#331 feature gate; residual opt-in exposure accepted per WI#418 standing decision record docs/ops/v2.1.6.0_WI418_LIBSQL_LEGACY_CHAIN.md (re-verified 2026-10-16); clearing owner WI#418" },
 
-    # webpki-roots 0.26.11 — RUSTSEC-2026-0381 (CVE-2026-111943, published
-    # 2026-10-20): the bundled root store trusted the distrusted emSign ECC
-    # Root CA - G3 intermediates. Patched at >= 1.0.10 only; no 0.26-line
-    # patch exists (the 0.26 line ended at 0.26.11). The copy remains via the
-    # libsql 0.6.0 -> hyper-rustls 0.25.0 legacy chain, same opt-in
-    # libsql-remote-replica gate as the rustls-webpki 0.102 entries above.
-    # Note: 0.26.11 is a shim whose root store is re-exported from its
-    # webpki-roots 1.x dependency — that dependency is upgraded to the
-    # patched 1.0.10 (2026-10-20, item 28), so the roots actually served
-    # through the shim no longer contain the distrusted CA; the advisory
-    # still flags the 0.26.11 shim by version.
-    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 bundled the distrusted emSign ECC Root CA - G3 (CVE-2026-111943); pinned by the libsql 0.6.0 -> hyper-rustls 0.25.0 legacy chain with no 0.26-line patch; the 0.26.11 shim serves its roots from its webpki-roots 1.x dependency, upgraded to the patched 1.0.10; exposure: opt-in libsql-remote-replica builds only, default builds cleared by WI#331 feature gate; residual opt-in exposure accepted per WI#418 standing decision record docs/ops/v2.1.6.0_WI418_LIBSQL_LEGACY_CHAIN.md (verified 2026-10-20); clearing owner WI#418" },
+    # RUSTSEC-2026-0381 (webpki-roots 0.26.11 shim) — acceptance REMOVED by the
+    # v2.1.7.0 crate-security audit (2026-10-24, advisory-db 21d909e4): that
+    # database revision marks the 0.26.11 compatibility shim `unaffected`
+    # (`unaffected = ["= 0.26.11"]`), because the shim carries no independent
+    # trust store and re-exports the roots of its separately resolved
+    # webpki-roots 1.x dependency, pinned at the patched 1.0.10. The shim
+    # itself remains reachable only through the opt-in
+    # libsql-remote-replica legacy chain, and a downgrade of the 1.x parent
+    # is still a hard failure (the same advisory matches the 1.x package it
+    # resolves to). The ignore was producing `warning[advisory-not-detected]`
+    # on every gate run — a stale acceptance, not a live exposure.
 
     # rental — unmaintained (informational, no vulnerability). Only visible
     # since the gate widened to --workspace --all-features (v2.1.5.0, MR
