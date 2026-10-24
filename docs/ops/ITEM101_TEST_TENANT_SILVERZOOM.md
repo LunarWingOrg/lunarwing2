@@ -329,6 +329,32 @@ pebble container; host-side `podman exec … ps aux` works. Treat `ps` as
 unusable from inside a pebble task and prefer `kill`/`wait`, `/proc`, or the
 worker bridge's own status for process checks.
 
+### kimi — complex task 3: multi-stage Python log-analysis pipeline
+
+Job `0b101865-0eee-4eca-b0f5-0d9aef2ae077` (`external:kimi`), created 16:46:24,
+completed 16:56:05 (**570 s**). Five stages: seeded fixture generator
+(`generator.py`), parser (`logparse.py`), CLI with text and `--json` modes
+(`cli.py`), unittest suite (`test_logparse.py`), and a determinism diff.
+Python 3.11.2, standard library only.
+
+Worker-reported results, **all re-verified with `podman exec`**:
+
+- Fixture: 200 lines, seed 42, 33 status-500 lines, 2 deliberately malformed
+  lines (61 and 131).
+- `python3 -m unittest discover -v` → **Ran 10 tests … OK** (parser valid/
+  malformed, malformed skip+count, percentile even/odd/empty, p95 rank, JSON
+  report shape).
+- Text and JSON reports identical between runs (`diff` empty), and identical to
+  my independent re-run:
+  `total_lines: 200`, `parsed: 198`, `malformed: 2`, top paths `/index` 54,
+  `/search` 46, `/cart` 28, `error_rate: 32.83%`, `p50_latency_ms: 266`,
+  `p95_latency_ms: 480`, `status_500_count: 33`.
+- **Independent percentile cross-check** (own script re-parsing `access.log`
+  with nearest-rank): parsed 198, n500 33, p50 266, p95 480 — exact match.
+- Declared deviations: `error_rate` counts any status ≥ 400 (a 500-only rate
+  would be 16.67%), and the worker mistyped one diff filename (`run2.txt` vs
+  `run2.json`) then corrected it — both reported honestly by the worker.
+
 ### kimi — complex task 2: Go HTTP server (three endpoints)
 
 Job `352b152e-3ec4-4a1e-a5d8-09a09ecb180f` (`external:kimi`), created 16:30:53,
@@ -457,6 +483,42 @@ Suggested follow-ups: let genuine worker heartbeats count as activity for
 external jobs (or use a much larger threshold for `external:*` modes), stop
 re-logging "Manual intervention needed" once it has been emitted, and surface
 `stuck`/`repair_attempts` in `/api/jobs/{id}` so the operator can see why.
+
+### F11 (cancel does not stop the reaper — sandbox/external cancel leaves ContextManager stale)
+
+Follow-up experiment on the stuck Rust job, at 16:58:5x:
+
+```
+POST /api/jobs/7ae2cc44-…/cancel  → 200 {"job_id":"7ae2cc44-…","status":"cancelled"}
+GET  /api/jobs/7ae2cc44-…        → state "cancelled"
+```
+
+**The once-a-minute "Manual intervention needed" warnings continued
+afterwards** (16:58:13, and subsequent sweeps). Cause, in-tree:
+`ic/src/channels/web/handlers/jobs.rs:329-341` — the sandbox/external branch
+of `jobs_cancel_handler` delivers the cancel through
+`ExternalWorkerManager::cancel_task` and then calls
+`store.update_sandbox_job_status(...)`, but never updates the in-memory
+`ContextManager` job state, which is exactly what
+`find_stuck_jobs_with_threshold` and the self-repair loop read. Only the
+*agent-job* fallback below it goes through the scheduler, whose comment says it
+"updates the in-memory ContextManager AND aborts the task handle". So for
+`external:*` jobs the API says cancelled while the reaper still treats the job
+as live and stuck.
+
+Operational consequence: there is no supported way to silence the F9 loop for
+an external job short of a daemon restart (or letting the job finish). The
+cancel endpoint should also mark the context cancelled (and the reaper should
+skip cancelled contexts).
+
+### F12 (validation takeaway for this item): task-size matters more than the lane
+
+Every job that finished produced correct, independently reproducible work.
+The one incomplete job was also the **largest** (7-part spec, parser +
+thread pool + tests + determinism, >40 worker events and a mid-refactor
+edit) and died of upstream latency plus F9, not of any tool/build failure.
+For acceptance testing prefer several focused jobs over one large one; both
+lanes handled focused jobs of ~200-600 s reliably.
 
 ### F10 (minor, gateway routing): expired-gate reply has no routing target
 
