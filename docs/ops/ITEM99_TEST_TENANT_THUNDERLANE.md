@@ -25,6 +25,13 @@ disk. Pre-existing tenants: `antelope` (10000-10009), `scootaloo`
 (10010-10019), `barracuda` (10020-10029). `thunderlane` takes the next free
 block, **10030-10039**.
 
+**Name/collision note (run-208 NT-8):**
+`ic/scripts/create-tenant-thunderlane.sh` already exists in-tree as an older
+staging provisioning wrapper for the same name and
+`thunderlane@xmpp.sobe.world`. The name was free on this host before this run
+(only the three tenants above existed); do not run that wrapper here now — it
+would collide with this test tenant.
+
 ## Provisioning record (add-tenant)
 
 ```bash
@@ -94,8 +101,10 @@ sudo bash ic/scripts/lunarwing-mt-admin.sh build-tenant thunderlane \
   - `lunarwing-worker-kimi:latest` — 2.69 GB, source revision `722d07a47`,
     kimi-code **2.3.0**, `config.toml:60` pins `max_output_size = 131072` on
     `tensorzero::function_name::FrontierCODEK`
-  (pebble builds from the live checkout, kimi from the tenant clone — a
-  docs/mt-admin-only delta.)
+  (source-root asymmetry: `build_pebble_worker` builds from the operator's
+  live checkout root, while `build_kimi_worker` builds from the tenant clone.
+  This is a real mt-admin asymmetry, not just a docs delta — a candidate for
+  its own follow-up, per run-208 NT-8.)
 - WASM suite: **12 installed, 1 skipped** (darkirc correctly skipped — tenant
   darkirc disabled). Channels `multica`/`weechat`/`xmpp`; tools
   `cavepony`, `gitlab`, `gotify`, `llm-context`, `multica-bridge`, `ssh`,
@@ -113,11 +122,12 @@ Run directly against the built images:
 | python3 | present | present |
 | node | v22.23.2 | v18.20.4 |
 
-Note: the toolchains live under `/usr/local/{cargo,go}/bin` and are only on
-`PATH` for a **login** shell; a non-login `sh -c 'which rustc'` reports them
-missing. That is expected image shape (the task runner gets the login PATH),
-but it is worth knowing when hand-probing a worker image — it looks like a
-missing toolchain otherwise.
+Note (corrected per run-208 NT-6): the toolchains are **not** login-shell-only.
+Both Dockerfiles put the toolchain directories (`/usr/local/cargo/bin`,
+`/usr/local/go/bin`, etc.) in the image-wide `ENV PATH`, and the kimi task
+runner additionally receives `TASK_PATH` from `entrypoint.sh`. A bare
+non-login hand-probe can use a different PATH than the task runner, so probe
+with the task environment rather than inferring a missing toolchain.
 
 ## Verification
 
@@ -161,11 +171,12 @@ container executor → `job_events` → assistant reply.
 > **Operational note (found on the first dispatch):** the approval POST must
 > carry `thread_id`. Without it the daemon logs
 > `engine v2: approval matched no engine gate; falling through to legacy path`
-> with `scope="none"`, clears nothing, and the turn parks as `Failed` with the
-> gate still pending. Supply the owning `thread_id` and the same call clears
-> the gate and resumes the turn. This is worth a follow-up work item: the
-> handler already has `ApprovalRequest.thread_id` but does not warn at the API
-> layer when it is absent, so a caller gets `202 accepted` for a no-op.
+> with `scope="none"`, clears nothing, and the turn is left pending at the
+> approval gate (rendered `Failed` in history) with the gate still pending. Supply the owning `thread_id` and the same call clears
+> the gate and resumes the turn. This is filed as **WI#472**: resolve the
+> gate/thread from `request_id` server-side where possible, and return 404 (or
+> 400) when no live gate matches instead of returning `202 accepted` for a
+> no-op.
 > Also observed: after that no-op the original thread stopped accepting new
 > turns (`/api/chat/history` showed no new turn), so a fresh
 > `POST /api/chat/thread/new` thread was used for the remaining dispatches.
@@ -219,7 +230,8 @@ replayed canned answer.
 
 ### pebble — task 1: parallel Fibonacci in C++17
 
-Two earlier dispatches (`21008b1f`, `a15af501`, `1d7ecae4`) failed with
+Three earlier dispatches (`21008b1f`, `a15af501`, `1d7ecae4` — two
+parallel-Fibonacci attempts plus one environment probe) failed with
 `api returned 401 Unauthorized (authentication_error): Invalid session`.
 Root cause was **operator input, not the lane**: the `NANOGPT_API_KEY` value
 copied from a sibling tenant's env carried literal surrounding double quotes,
@@ -227,7 +239,7 @@ and `podman --env-file` passes quotes through verbatim, so the key sent on the
 wire was `"sk-nano-…"`. Proven by curling nano-gpt from *inside* the pebble
 container: with the quoted value → 401 `invalid_api_key`; after stripping the
 quotes → 200. `configure-pebble` was re-run with the clean value and the
-container recreated. Recorded as finding **F1** below because the misleading
+container recreated. Recorded as finding **F5** below because the misleading
 part is that the lane reported only "Invalid session" with no hint that the
 credential had a quoting defect.
 
@@ -290,7 +302,7 @@ operator-precedence handling is proven by the `2+3*4 = 14` case.
 | Knowledge seed + sweep + study MCP | 1799 notes seeded, 22 skipped, 20 failed (`knowledge_seed_state.json`); first sweep ran; `study_notes` extension active and authenticated |
 | WASM channel/tool suite | 3 channels (`multica`, `weechat`, `xmpp`) + 9 tools installed; 13 extensions total |
 | Host health pipeline (OpenRC contract) | `lunarwing-mt-health` covers thunderlane through its OpenRC units; no thunderlane-specific unit failures |
-| Engine v2 turn lifecycle | turns transition `Created → Running → Completed`; failed turns leave the thread unusable (F3) |
+| Engine v2 turn lifecycle | turns transition `Created → Running → Completed`; approval-parked turns can be rendered `Failed` by history (F3 / WI#436 item 4) |
 
 ## Findings
 
@@ -314,12 +326,24 @@ The one-shot **seed** absorbs it as a per-note warning (1 of the 20
 `notes_failed`), so the tenant is functional from the seeded corpus, but the
 hourly additive refresh is poisoned. This is the same defect item 74 recorded
 as F1 on `fleetfoot` — still unfixed in the corpus generation this tenant
-synced (`5857c69e81b25f22e3de30a2f6ff33f019fc1c42`). Two follow-ups stand:
-(a) strip/escape the NUL in the lw2studymcp note; (b) make the refresh treat a
-deterministic per-note import failure like the seed does (skip-and-count)
-instead of failing the whole run.
+synced (`5857c69e81b25f22e3de30a2f6ff33f019fc1c42`).
 
-### F2 (API ergonomics — approval without `thread_id` silently no-ops)
+**WI#436 (2026-10-18, items 1-3) already triages this chain and shows that
+remedy (a), stripping this NUL alone, is insufficient.** In that corpus, 16
+other notes fail validation on dotted tags (`is_valid_slug`, e.g. `v2.1.0.0`,
+`default.py`, `rust-1.89`) and one (`kumo/findings-index.md`, 71,870 bytes)
+exceeds the 50,000-byte body cap; with this NUL note they account for 18 of
+fleetfoot's 20 seed failures. Metadata/size validation runs before the
+"already imported" check, so each errors on every pass and the refresh still
+fails even if this one note is fixed. WI#436 item 3 also covers the non-atomic
+write that leaves an empty "stranded" row behind.
+
+The real fix is therefore WI#436 item 1 / remedy (b): make the refresh treat a
+deterministic per-note import failure like the seed does (skip-and-count)
+instead of failing the whole run. Stripping/escaping this NUL and normalizing
+dotted tags are useful adjuncts, not a sufficient fix on their own.
+
+### F2 (API ergonomics — approval without `thread_id` silently no-ops; WI#472)
 
 `POST /api/chat/approval` accepts `{"request_id": ..., "action": "always"}`
 with no `thread_id` and answers `202 accepted`, but nothing happens: the daemon
@@ -332,14 +356,19 @@ engine v2: approval matched no engine gate; falling through to legacy path
 
 and the gate stays in `pending-gates.json`. Supplying the owning `thread_id` on
 the identical call clears the gate and resumes the turn. `ApprovalRequest`
-already carries an optional `thread_id` (`ic/src/channels/web/types.rs:142`)
-and the handler's doc comment says it is there "so the agent loop finds the
-right session", but there is no warning at the API layer when it is omitted —
-the caller gets a success status for a no-op. Suggested fix: return `400` when
-`thread_id` is absent while exactly one gate exists, or resolve the gate's
-thread from `request_id` server-side.
+already carries an optional `thread_id` (`ic/src/channels/web/types.rs:142`),
+and the handler only scopes the message when it is present
+(`ic/src/channels/web/server.rs:1518-1520`; duplicate handler in
+`handlers/chat.rs:119-121`), so the unscoped submission matches no engine gate
+(`ic/src/bridge/router.rs:2413`). The same no-op applies to `deny`: without
+`thread_id` it also returns 202 while the gate remains approvable, so an
+operator can believe the action was refused when it was not.
 
-### F3 (usability — a failed turn wedges its thread)
+Filed as **WI#472**: resolve the gate/thread from `request_id` server-side
+where possible, and return **404 (or 400)** when no live gate matches instead
+of falling through with a success status.
+
+### F3 (usability — an approval-parked turn is rendered `Failed` and wedges its thread)
 
 After the F2 no-op the original thread stopped accepting turns:
 `POST /api/chat/send` still returned `202 accepted`, but
@@ -347,7 +376,16 @@ After the F2 no-op the original thread stopped accepting turns:
 never ran. A fresh `POST /api/chat/thread/new` thread worked immediately. This
 affects any operator retrying a failed turn on the same thread.
 
-### F4 (stale `shell` gates accumulate indefinitely)
+Run-208 re-check: after the F2 no-op the gate **stayed pending**, so the turn
+was **parked at the approval gate**, not failed at engine level. History still
+renders it as `Failed` because the engine-v2 history fallback rebuilds turns
+from DB messages and marks any trailing user message without an assistant reply
+as `Failed`, hard-coding `pending_approval: None`
+(`build_turns_from_db_messages`, `util.rs:184-187`; WI#436 item 4). A live
+`/api/chat/pending-gates` read for that thread is the direct confirmation when
+the tenant is up.
+
+### F4 (stale `shell` gates linger until expiry, not turn completion; WI#473)
 
 After several dispatches `/api/chat/pending-gates` holds gates for `shell`
 tool calls that were never approved and whose turns are long finished, e.g.
@@ -359,12 +397,17 @@ ef8ca6d7-… | shell | 0d67969e-… | { "command": "sleep 45 && echo \"waited\""
 845460e0-… | shell | a2c71ee2-… | { "command": "echo done" }
 ```
 
-They are never reaped when their turn ends, so the gate list grows forever and
-(per F2) approving one without its exact `thread_id` does nothing. A
-turn-completion sweep that drops gates whose thread is no longer running would
-close this.
+They are not reaped when their turn ends, but they **do expire**: pending gates
+carry `expires_at` (default **30 minutes** via
+`AGENT_PENDING_GATE_EXPIRY_SECS`, bounded 30 seconds through 30 days;
+`ic/src/config/agent.rs:40-59`), `drain_expired` runs on ingress
+(`ic/src/bridge/router.rs:3626`), and the pending-gates listing filters expired
+gates (`ic/src/gate/store.rs:315-334`). So the list grows until the 30-minute
+default expiry, not forever. A turn-completion sweep that drops gates whose
+thread is no longer running is still a fair improvement and is filed as
+**WI#473**.
 
-### F5 (operator credential hygiene — quoted values pass through `--env-file`)
+### F5 (operator credential hygiene — quoted values pass through `--env-file`; WI#471)
 
 Copying `NANOGPT_API_KEY` from a sibling tenant's `pebble.env` as the literal
 `"sk-nano-…"` (with quotes) makes every pebble job fail with
@@ -372,20 +415,25 @@ Copying `NANOGPT_API_KEY` from a sibling tenant's `pebble.env` as the literal
 `podman --env-file` does not strip quotes, so the quoted string is sent as the
 bearer token. Proven from inside the pebble container: quoted value → 401
 `invalid_api_key`, unquoted value → 200. `configure-pebble` writes whatever it
-is given verbatim, so the operator sees only a generic auth error. Suggested
-follow-up: have `configure-pebble` reject/strip a surrounding quote pair (or
-warn) so a copy-pasted env line cannot silently poison the lane.
+is given verbatim, so the operator sees only a generic auth error.
 
-### F6 (cosmetic, expected)
+Filed as **WI#471**: have `configure-pebble` reject (or strip with a clear
+warning) surrounding matching quotes and leading/trailing whitespace before
+writing `pebble.env` or recreating the worker. This is adjacent to WI#436 item
+8 (a keyless pebble worker reports healthy and accepts jobs it cannot run):
+here the key is present but invalid because of quoting.
+
+### F6 (cosmetic, expected — already triaged in WI#436)
 
 - `multica` channel reports unhealthy (`invalid multica config: invalid type:
   null, expected a string`) — no multica server is configured for this tenant.
-  Same as every prior test tenant.
+  Same as every prior test tenant; WI#436 item 7 covers the null-config defect.
 - WeeChat relay not configured (provisioning anomaly P1) — the adapter and
-  channel still come up; the host's WeeChat 4.10.0 lacks cJSON.
+  channel still come up; the host's WeeChat 4.10.0 lacks cJSON. WI#436 item 9
+  covers the relay/cJSON recovery path.
 - `thunderlane@xmpp.sobe.world` XMPP auth: the bridge unit starts and is
   omemo-ready, but the account does not exist upstream (same operator step as
-  items 72/74).
+  items 72/74). WI#436 item 6 covers the unbounded auth-retry behavior.
 
 ## Job inventory (this tenant, all real dispatches)
 
@@ -399,7 +447,7 @@ warn) so a copy-pasted env line cannot silently poison the lane.
 | `21008b1f` / `a15af501` parallel Fibonacci (attempts) | pebble | failed — 401 quoted key (F5) | 3 s each |
 | `1d7ecae4` environment probe (attempt) | pebble | failed — 401 quoted key (F5) | 3 s |
 
-The duplicate `995897cf` is itself a finding: the F3 wedged thread's third
+The duplicate `995897cf` is itself a finding: the F3 thread's third
 dispatch **did** create a job server-side (and the worker ran it correctly in
 42 s) even though `/api/chat/history` never showed a new turn — so a "failed"
 turn can leave real detached work behind with no operator-visible trace except
