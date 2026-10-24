@@ -337,6 +337,23 @@ Pins: the six workspace-symlink pins plus the hard-link-skip pin in
 `test-mt-admin-kimi.sh` (mutation-verified — reverting to the old root
 `mkdir -p` + `chown -R` shape fails exactly them).
 
+The leaf-uid gate is scoped to rootless runs. On rootful hosts the chown
+above legitimately hands the leaf to the container uid and does not
+restore tenant ownership, so a SECOND call — any config-change
+force-recreate, or the quadlet render that runs before the
+existing-container freshness gate — would otherwise find a container-uid
+leaf and refuse with `... workspace not owned like the tenant root`,
+wedging every later start of that lane on that host until an operator
+chowned it back by hand (SweetieBot pass-256 on WI#453, note #11232).
+Rootless keep-id leaves the leaf tenant-owned, so there the gate still
+refuses a foreign owner; on rootful the component walk plus the
+tenant-side `mkdir` already carry that anti-spoof purpose. Pinned by the
+two idempotence pins beside the symlink pins (a `stat` shim reports the
+container uid for the leaf and the real owner for the tenant root):
+rootful prep returns 0 across a container-uid leaf, rootless prep still
+refuses with the named message, and restoring the unconditional gate
+fails the rootful pin alone.
+
 ## WebSocket message limits
 
 The daemon accepts external-worker messages and individual WebSocket frames
