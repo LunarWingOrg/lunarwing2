@@ -31,8 +31,13 @@ class WorkerBuildArgsTests(unittest.TestCase):
             tool = shutil.which(name)
             self.assertIsNotNone(tool, f"required tool {name!r} not found")
             (self.bin / name).symlink_to(tool)
-        # The retry backoff must not slow the hermetic suite.
-        self.write_shim("sleep", "#!/bin/sh\nexit 0\n")
+        # The retry backoff must not slow the hermetic suite. Record each
+        # requested delay so the backoff curve and its ceiling stay pinned.
+        self.sleeps = self.root / "sleeps.txt"
+        self.write_shim(
+            "sleep",
+            f"#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{self.sleeps}'\nexit 0\n",
+        )
         self.log = self.root / "build-calls.jsonl"
         self.script = self.root / SCRIPT.name
         shutil.copy(SCRIPT, self.script)
@@ -99,10 +104,16 @@ metadata.write_text(json.dumps({{"containerimage.digest": "sha256:" + "0" * 64}}
 
     def run_build(self):
         self.log.unlink(missing_ok=True)
+        self.sleeps.unlink(missing_ok=True)
         return subprocess.run(
             ["sh", str(self.script), "opencode2"], cwd=self.root, env=self.env,
             capture_output=True, text=True, timeout=30,
         )
+
+    def recorded_sleeps(self) -> list[int]:
+        if not self.sleeps.exists():
+            return []
+        return [int(line) for line in self.sleeps.read_text().split()]
 
     def test_checkout_digest_reaches_candidate_and_clean_rebuild(self):
         # Changing the checkout catches hardcoded/stale digests; inspect the
@@ -157,19 +168,37 @@ metadata.write_text(json.dumps({{"containerimage.digest": "sha256:" + "0" * 64}}
         self.assertNotIn("--no-cache", calls[1])
         self.assertIn("--no-cache", calls[2])
         self.assertIn("transient registry-auth error", result.stderr)
-        # The retry message must report the updated max-attempts count.
-        self.assertIn("/6", result.stderr)
+        # The retry message must report the current max-attempts count.
+        self.assertIn("/8", result.stderr)
 
     def test_persistent_transient_failure_exhausts_retries(self):
         self.env["BUILDCTL_MODE"] = "fail_always"
         result = self.run_build()
         self.assertNotEqual(result.returncode, 0)
         calls = [json.loads(line) for line in self.log.read_text().splitlines()]
-        # Initial attempt plus five retries; the clean rebuild never runs.
-        self.assertEqual(len(calls), 6)
+        # Initial attempt plus seven retries; the clean rebuild never runs.
+        self.assertEqual(len(calls), 8)
         for args in calls:
             self.assertNotIn("--no-cache", args)
         self.assertIn("not retrying", result.stderr)
+
+    def test_push_backoff_doubles_from_45s_across_eight_attempts(self):
+        # Pipeline 6252's sustained 19-minute burst outlasted the previous
+        # 6-attempt/~15-minute window. The curve must keep its 45 s base and
+        # its doubling across exactly 8 attempts: 45+90+180+360+720+1440+2880
+        # ≈ 95 min of sleeping, inside the candidate job's 8 h timeout. A
+        # wider curve would grow past that budget, so pin the rungs.
+        self.env["BUILDCTL_MODE"] = "fail_always"
+        result = self.run_build()
+        self.assertNotEqual(result.returncode, 0)
+        delays = self.recorded_sleeps()
+        self.assertEqual(len(delays), 7, delays)
+        # Each delay is base + a 1..15 s PID jitter, so assert the envelope.
+        expected_bases = [45, 90, 180, 360, 720, 1440, 2880]
+        for delay, base in zip(delays, expected_bases):
+            self.assertGreaterEqual(delay, base, delays)
+            self.assertLessEqual(delay, base + 15, delays)
+        self.assertLessEqual(sum(delays), 95 * 60 + 7 * 15)
 
     def test_non_transient_build_failure_is_not_retried(self):
         self.env["BUILDCTL_MODE"] = "fail_compile"
