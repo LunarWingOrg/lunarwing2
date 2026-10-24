@@ -224,7 +224,7 @@ for (;;) {
   }
 }
 
-// WI#449 LP-16/NP-1 (run-170): EINVAL is a swap race in this bootstrap and
+// WI#449 NP-1 (run-170): EINVAL is a swap race in this bootstrap and
 // must stay transient — realpathSync's lstat-then-readlink pair raises it when
 // the task swaps a component from a symlink to a directory between the calls.
 // This lane has no task-uid fchown (opencode2's credential split is WI#454's),

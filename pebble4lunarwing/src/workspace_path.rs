@@ -178,15 +178,16 @@ fn create_cron_workspace(path: &str, workspace_root: &Path) -> io::Result<PathBu
 /// `EINVAL → ErrorKind::InvalidInput` mapping — a pre-existing classification,
 /// not a change run 170 made. The source observed on this lane is the chunk-4
 /// `fchown` handoff onto a task id the user namespace does not map, which no
-/// re-dispatch can fix. NP-1 (run-204): the earlier wording claimed that was
-/// EINVAL's *only* bootstrap source; it is not a general truth (the TS lanes
-/// meet a swap-race EINVAL from `realpathSync`'s lstat→readlink pair, which
-/// stays transient there), and this lane's `canonicalize` reaches realpath(3),
-/// which walks the same way. Treat the residual as recorded, not proven
-/// absent: a realpath EINVAL race here abandons the tick instead of re-walking
-/// it. Everything else (EMFILE/ENFILE/ENOMEM, ENOSPC/EDQUOT/EIO on the first
-/// mkdir, ENOENT from a swap race) is transient and the host supervisor may
-/// re-dispatch. `Unsupported` marks the missing-/proc preflight.
+/// re-dispatch can fix. NP-1 (run-204): the TS lanes meet a swap-race
+/// EINVAL from `realpathSync`'s lstat→readlink pair, which stays transient
+/// there — but that race cannot happen on this lane: `canonicalize` reaches
+/// glibc realpath(3), which since 2.33 calls `readlink` on every component
+/// and treats an EINVAL return as "not a symlink", with no lstat→readlink
+/// window to race (run-208 NT-2). The pebble image is Debian 12 with glibc
+/// 2.36, so the fchown onto an unmapped task id is this lane's only bootstrap
+/// EINVAL. Everything else (EMFILE/ENFILE/ENOMEM, ENOSPC/EDQUOT/EIO on the
+/// first mkdir, ENOENT from a swap race) is transient and the host supervisor
+/// may re-dispatch. `Unsupported` marks the missing-/proc preflight.
 fn is_non_retryable_bootstrap(error: &io::Error) -> bool {
     use io::ErrorKind::{InvalidInput, PermissionDenied, Unsupported};
     if matches!(error.kind(), InvalidInput | PermissionDenied | Unsupported) {
@@ -403,9 +404,10 @@ mod tests {
             io::Error::from_raw_os_error(libc::EACCES),
             // EINVAL is permanent on this lane through std's EINVAL →
             // InvalidInput mapping (the arm above), not a raw compare. The
-            // observed source is fchown's unmapped-uid failure (no
-            // re-dispatch can map it); a realpath swap-race EINVAL would be
-            // abandoned rather than re-walked — the residual NP-1 records.
+            // only source is fchown's unmapped-uid failure (no re-dispatch
+            // can map it): glibc realpath(3) has had no lstat→readlink
+            // window since 2.33, and the image's glibc is 2.36, so the
+            // TS lanes' swap-race EINVAL cannot occur here (run-208 NT-2).
             io::Error::from_raw_os_error(libc::EINVAL),
         ] {
             assert!(is_non_retryable_bootstrap(&error), "permanent: {error}");

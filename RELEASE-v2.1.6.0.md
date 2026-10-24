@@ -1536,8 +1536,9 @@ restricts the `setpriv` resolver to absolute `PATH` entries and extends the
 loader denylist to glibc's unsafe-environment list; LP-15 reads the bridge
 uid from `/proc/self/status` (the owner of `/proc/self` reads as root for a
 non-dumpable process, and a probe file would write into task-controlled
-directories); LP-16 makes the unmapped-task-uid `fchown` `EINVAL` permanent
-where that call raises it, while the swap-race `EINVAL` stays transient.
+directories); NP-1 classifies the unmapped-task-uid `fchown` `EINVAL` as
+permanent at the call that raises it, while the swap-race `EINVAL` stays
+transient (LP-16 itself is only the run-170 rollback note).
 LP-7 stays declined per #11230.
 
 **Known-broken lane.** The opencode **v1** worker lane (v1.18.25) still

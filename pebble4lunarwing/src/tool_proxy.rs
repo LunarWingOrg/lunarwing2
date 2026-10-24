@@ -780,14 +780,17 @@ mod tests {
 
     /// NP-2 (run-204): the bridge uid comes from the `Uid:` line of
     /// /proc/self/status — a read, not a probe file created in a directory.
-    /// The pin runs the lookup in a child whose TMPDIR is a read-only
-    /// directory: a probe-shaped implementation cannot create its file there
-    /// and fails, while the status read does not care. The value must also
-    /// equal the fsuid of a file this process creates.
+    /// The pin runs the lookup in a child whose TMPDIR is a path UNDER a
+    /// regular file: creating anything there fails with ENOTDIR for EVERY
+    /// uid — root included (run-208 NT-3: a mode-0500 directory only
+    /// refused the probe on a non-root host, and CI plus the image build
+    /// run the suite as root) — so a probe-shaped implementation cannot
+    /// create its file there and fails, while the status read does not
+    /// care. The value must also equal the fsuid of a file this process
+    /// creates.
     #[test]
     fn bridge_uid_reads_self_status_without_writing_anywhere() {
         use std::os::unix::fs::MetadataExt;
-        use std::os::unix::fs::PermissionsExt;
         const CHILD_MARKER: &str = "PEBBLE_NP2_BRIDGE_UID_CHILD";
         const TEST_PATH: &str =
             "tool_proxy::tests::bridge_uid_reads_self_status_without_writing_anywhere";
@@ -796,30 +799,32 @@ mod tests {
             Some(base) => std::path::PathBuf::from(base),
             None => test_dir(),
         };
-        let readonly = base.join("readonly");
         if std::env::var_os(CHILD_MARKER).is_none() {
-            std::fs::create_dir_all(&readonly).expect("create readonly dir");
-            // 0o500: traversable and readable, not writable — a probe file
-            // cannot be created inside it.
-            std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o500))
-                .expect("make dir read-only");
+            let blocker_parent = base.join("np2-blocker");
+            std::fs::create_dir_all(&blocker_parent).expect("create blocker parent dir");
+            // A regular file at the TMPDIR prefix: any file or directory
+            // creation under <blocker>/tmp fails with ENOTDIR for every
+            // uid, root included (run-208 NT-3).
+            let blocker = blocker_parent.join("blocker");
+            std::fs::write(&blocker, b"regular file").expect("write blocker file");
+            let notdir_tmp = blocker.join("tmp");
             let exe = std::env::current_exe().expect("test binary path");
             let out = std::process::Command::new(exe)
                 .args([TEST_PATH, "--exact", "--nocapture", "--test-threads=1"])
                 .env(CHILD_MARKER, "1")
                 // The child must not call test_dir(): its TMPDIR is the
-                // read-only dir on purpose. It writes its witness under the
+                // ENOTDIR path on purpose. It writes its witness under the
                 // parent's (writable) base instead.
                 .env("NP2_BRIDGE_UID_BASE", &base)
-                .env("TMPDIR", &readonly)
-                .env("TMP", &readonly)
-                .env("TEMP", &readonly)
+                .env("TMPDIR", &notdir_tmp)
+                .env("TMP", &notdir_tmp)
+                .env("TEMP", &notdir_tmp)
                 .output()
                 .expect("run the child probe");
             let text = String::from_utf8_lossy(&out.stdout);
             assert!(
                 out.status.success(),
-                "the uid lookup must work with an unwritable TMPDIR (NP-2): {}{}",
+                "the uid lookup must work with an unusable TMPDIR (NP-2): {}{}",
                 String::from_utf8_lossy(&out.stderr),
                 text
             );
@@ -827,7 +832,6 @@ mod tests {
                 text.contains("NP2-BRIDGE-UID-OK"),
                 "the child never reported a uid: {text}"
             );
-            std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o700)).ok();
             std::fs::remove_dir_all(&base).ok();
             return;
         }

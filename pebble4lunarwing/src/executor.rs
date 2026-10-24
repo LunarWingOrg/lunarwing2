@@ -1456,10 +1456,20 @@ mod tests {
     }
 
     // LP-14: a relative (or empty) PATH entry must never anchor the setpriv
-    // lookup at the bridge's working directory.
+    // lookup at the bridge's working directory. The stub dirs are removed
+    // through Drop guards, so a failing assertion cannot leave
+    // pebble-lp14-* directories behind in the package root (run-208 NT-3:
+    // an unwind-time leftover was observed with the mutant, and the image
+    // contract then stamped the tree dirty).
     #[test]
     fn setpriv_resolution_requires_absolute_path_entries() {
         use std::sync::atomic::{AtomicU64, Ordering};
+        struct RemoveOnDrop(std::path::PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).ok();
+            }
+        }
         static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
         let unique = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let exe_dir = std::env::current_exe()
@@ -1471,6 +1481,7 @@ mod tests {
         std::fs::create_dir_all(&abs_dir).expect("create absolute stub dir");
         let abs_stub = abs_dir.join("setpriv");
         std::fs::write(&abs_stub, "#!/bin/sh\n").expect("write absolute stub");
+        let _abs_guard = RemoveOnDrop(abs_dir.clone());
         // A REAL relative entry under the cwd (cargo test runs in the package
         // root) carrying a setpriv file: a resolver that honours relative
         // entries would return it — the pin must be able to fail.
@@ -1478,6 +1489,7 @@ mod tests {
         let rel_dir = std::env::current_dir().expect("cwd").join(&rel_name);
         std::fs::create_dir_all(&rel_dir).expect("create relative stub dir");
         std::fs::write(rel_dir.join("setpriv"), "#!/bin/sh\n").expect("write relative stub");
+        let _rel_guard = RemoveOnDrop(rel_dir.clone());
         let relative_only = std::ffi::OsString::from(&rel_name);
         assert!(
             resolve_setpriv_in(&relative_only).is_err(),
@@ -1486,7 +1498,5 @@ mod tests {
         let path = std::ffi::OsString::from(format!("{rel_name}:{}", abs_dir.display()));
         let resolved = resolve_setpriv_in(&path).expect("absolute entry resolves");
         assert_eq!(resolved, abs_stub.as_os_str());
-        std::fs::remove_dir_all(&abs_dir).ok();
-        std::fs::remove_dir_all(&rel_dir).ok();
     }
 }

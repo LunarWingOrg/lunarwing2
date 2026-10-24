@@ -135,7 +135,7 @@ section and "Launch identity (WI#422)" further down.
   `is_loader_env_key` and kimi's `dropLoaderEnv` — that parity is ME-3);
   LP-15 learns the bridge uid from the `Uid:` line of `/proc/self/status`
   rather than the owner of `/proc/self`, which reads as root for a
-  non-dumpable process; LP-16 makes the *unmapped-task-uid* `EINVAL` from
+  non-dumpable process; NP-1 makes the *unmapped-task-uid* `EINVAL` from
   `fchown` permanent, classified at the `fchown` call itself in the kimi and
   opencode lanes, because no re-dispatch can map the id. The swap-race
   `EINVAL` that `realpathSync`'s lstat→readlink pair produces stays

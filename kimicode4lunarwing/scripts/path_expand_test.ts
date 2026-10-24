@@ -348,7 +348,7 @@ test("cron bootstrap refuses a hooked in-root redirect deterministically (WI#444
   }
 })
 
-test("cron bootstrap: EINVAL stays transient, the fchown EINVAL is permanent (WI#449 LP-16/NP-1)", () => {
+test("cron bootstrap: EINVAL stays transient, the fchown EINVAL is permanent (WI#449 NP-1)", () => {
   // NP-1: a blanket EINVAL rule was wrong. realpathSync's lstat-then-readlink
   // pair raises EINVAL when the task swaps a component from a symlink to a
   // directory between the calls — the DS-2 swap race, which must stay
@@ -364,7 +364,7 @@ test("cron bootstrap: EINVAL stays transient, the fchown EINVAL is permanent (WI
   assert.equal(isNonRetryableBootstrapErrno(undefined), false, "an errno-less failure is transient")
 })
 
-test("cron bootstrap: an unmapped task uid in fchown abandons the tick (WI#449 LP-16/NP-1)", () => {
+test("cron bootstrap: an unmapped task uid in fchown abandons the tick (WI#449 NP-1)", () => {
   // The one genuinely permanent EINVAL is classified at its source: fchown
   // onto an id this user namespace does not map. A host namespace maps every
   // id the suite can drop to, so the injected chown raises it instead.
@@ -400,7 +400,7 @@ test("cron bootstrap: an unmapped task uid in fchown abandons the tick (WI#449 L
   }
 })
 
-test("cron bootstrap: a non-EINVAL fchown failure stays transient (WI#449 LP-16/NP-1)", () => {
+test("cron bootstrap: a non-EINVAL fchown failure stays transient (WI#449 NP-1)", () => {
   // Control: the source classifier must not launder other fchown errnos into
   // permanence — ENOSPC on a full volume is still worth a re-dispatch.
   const root = realpathSync(mkdtempSync(join(tmpdir(), "lp16-kimi-ctl-")))

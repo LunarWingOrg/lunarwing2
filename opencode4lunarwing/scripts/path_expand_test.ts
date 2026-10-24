@@ -269,7 +269,7 @@ for (;;) {
   }
 }
 
-// WI#449 LP-16/NP-1 (run-170): EINVAL is a swap race in this bootstrap and
+// WI#449 NP-1 (run-170): EINVAL is a swap race in this bootstrap and
 // must stay transient. realpathSync's lstat-then-readlink pair raises EINVAL
 // when the task swaps a component from a symlink to a directory between the
 // two calls — abandoning the tick there would contradict DS-1's re-walk rule.
