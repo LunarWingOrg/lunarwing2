@@ -4,7 +4,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSyn
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { expandWorkspacePath, resolveWorkspacePath, resolveTaskWorkspace, workspacePathsOverlap } from "./workspace_path"
+import { expandWorkspacePath, isNonRetryableBootstrapErrno, resolveWorkspacePath, resolveTaskWorkspace, workspacePathsOverlap } from "./workspace_path"
 
 const workspaceRoot = "/workspace"
 
@@ -223,5 +223,17 @@ for (;;) {
     rmSync(hookRoot, { recursive: true, force: true })
   }
 }
+
+
+// WI#449 LP-16 (run-170): EINVAL is permanent, not retried — see the v1 lane's
+// pin for why the classifier is exercised directly rather than through fchown.
+assert.equal(isNonRetryableBootstrapErrno("EINVAL"), true, "EINVAL must be permanent (LP-16)")
+for (const code of ["ENOTDIR", "ELOOP", "EACCES", "EPERM"]) {
+  assert.equal(isNonRetryableBootstrapErrno(code), true, `${code} must stay permanent (DS-2)`)
+}
+for (const code of ["EMFILE", "ENFILE", "ENOMEM", "ENOSPC", "EDQUOT", "EIO", "ENOENT"]) {
+  assert.equal(isNonRetryableBootstrapErrno(code), false, `${code} must stay transient (DS-2)`)
+}
+assert.equal(isNonRetryableBootstrapErrno(undefined), false, "an errno-less failure is transient")
 
 console.log("workspace path expansion self-check passed")

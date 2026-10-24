@@ -85,9 +85,11 @@ tasks do not gain directory creation. These bridges run in Linux containers
 with `/proc/self/fd` available; a missing `/proc/self/fd` is detected up front
 and reported as a non-retryable environment error (DS-6). Bootstrap failures
 split into permanent (`Invalid workspace path for cron tick: …` — validation,
-ENOTDIR/ELOOP, EACCES/EPERM, containment) and transient (`Transient workspace
+ENOTDIR/ELOOP, EACCES/EPERM, EINVAL, containment) and transient (`Transient workspace
 error for cron tick: …` — EMFILE/ENFILE/ENOMEM, ENOSPC/EDQUOT/EIO, swap-race
-ENOENT/EINVAL), and the host re-dispatches only the transient ones (DS-2).
+ENOENT), and the host re-dispatches only the transient ones (DS-2; run-170
+LP-16 moved EINVAL to permanent — its only bootstrap source is fchown on an
+unmapped uid, which a re-dispatch can never fix).
 **Older images require the directory to pre-exist**
 (for example, create `missions/pr-digest` inside their workspace mount before
 enabling this example). Upgrade/recreate workers with the daemon changes;

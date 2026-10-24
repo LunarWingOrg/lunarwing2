@@ -43,11 +43,21 @@ function annotateComponent(error: unknown, part: string): Error {
 
 // Keep cron-directory creation in sync with Kimi and OpenCode. Linux workers
 // use descriptor-relative mkdir and O_NOFOLLOW to reject symlink traversal.
-// DS-2: only validation, ENOTDIR/ELOOP (non-directory component), EACCES/EPERM
-// and containment failures are permanent; other errnos (EMFILE/ENFILE/ENOMEM,
-// ENOSPC/EDQUOT/EIO on the first mkdir, ENOENT/EINVAL from a swap race) are
-// reported under a transient wording the host supervisor retries.
-const NON_RETRYABLE_ERRNOS = new Set(["ENOTDIR", "ELOOP", "EACCES", "EPERM"])
+// DS-2: only validation, ENOTDIR/ELOOP (non-directory component), EACCES/EPERM,
+// EINVAL and containment failures are permanent; other errnos (EMFILE/ENFILE/
+// ENOMEM, ENOSPC/EDQUOT/EIO on the first mkdir, ENOENT from a swap race) are
+// reported under a transient wording the host supervisor retries. EINVAL is
+// permanent (run-170 LP-16): its only source here is fchown on an unmapped
+// uid, which a re-dispatch can never fix.
+const NON_RETRYABLE_ERRNOS = new Set(["ENOTDIR", "ELOOP", "EACCES", "EPERM", "EINVAL"])
+
+/** DS-2: is this bootstrap errno permanent (abandon) rather than transient
+ * (re-dispatch)? Exported so the classification is pinnable on its own —
+ * EINVAL's only source here is fchown on an unmapped uid, which cannot be
+ * produced on a host whose user namespace maps every id under test. */
+export function isNonRetryableBootstrapErrno(code: string | undefined): boolean {
+  return code !== undefined && NON_RETRYABLE_ERRNOS.has(code)
+}
 export function resolveTaskWorkspace(
   context: { project_dir?: string; cron_tick?: unknown } | undefined,
   workspaceRoot: string,
@@ -105,9 +115,8 @@ export function resolveTaskWorkspace(
     return resolved
   } catch (error) {
     const message = String(error)
-    const code = (error as NodeJS.ErrnoException).code
     if (message.includes("Workspace path escapes WORKSPACE_ROOT") ||
-        (code !== undefined && NON_RETRYABLE_ERRNOS.has(code))) {
+        isNonRetryableBootstrapErrno((error as NodeJS.ErrnoException).code)) {
       throw new Error(`Invalid workspace path for cron tick: ${message}`)
     }
     throw new Error(`Transient workspace error for cron tick: ${message}`)

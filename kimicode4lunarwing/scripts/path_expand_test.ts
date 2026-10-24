@@ -4,7 +4,7 @@ import { test } from "node:test"
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { expandWorkspacePath, resolveWorkspacePath, resolveTaskWorkspace, workspacePathsOverlap } from "./workspace_path.js"
+import { expandWorkspacePath, isNonRetryableBootstrapErrno, resolveWorkspacePath, resolveTaskWorkspace, workspacePathsOverlap } from "./workspace_path.js"
 
 const workspaceRoot = "/workspace"
 
@@ -346,4 +346,19 @@ test("cron bootstrap refuses a hooked in-root redirect deterministically (WI#444
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
+})
+
+test("cron bootstrap: EINVAL is permanent, not a transient retry (WI#449 LP-16)", () => {
+  // fchown on an unmapped task uid fails with EINVAL and no re-dispatch can
+  // ever map the id, so the tick must be abandoned rather than retried
+  // forever. The fchown path itself needs an unmappable uid, which a host
+  // user namespace does not provide, so the classifier is pinned directly.
+  assert.equal(isNonRetryableBootstrapErrno("EINVAL"), true)
+  for (const code of ["ENOTDIR", "ELOOP", "EACCES", "EPERM"]) {
+    assert.equal(isNonRetryableBootstrapErrno(code), true, `${code} stays permanent (DS-2)`)
+  }
+  for (const code of ["EMFILE", "ENFILE", "ENOMEM", "ENOSPC", "EDQUOT", "EIO", "ENOENT"]) {
+    assert.equal(isNonRetryableBootstrapErrno(code), false, `${code} stays transient (DS-2)`)
+  }
+  assert.equal(isNonRetryableBootstrapErrno(undefined), false, "an errno-less failure is transient")
 })
