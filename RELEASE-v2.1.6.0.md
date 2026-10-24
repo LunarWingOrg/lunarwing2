@@ -1443,7 +1443,8 @@ release; WI#363, the CI guard that would require one, is still open.
 **Known issues / open at release.** Reconciled per item in
 `docs/ops/v2.1.6.0_OPEN_WORK_ITEMS_STATUS.md`, a 2026-10-14 01:05Z snapshot
 (work items filed after it, WI#402 and later, postdate the audit), and
-re-checked against the tracker on 2026-10-20 and 2026-10-21. Open at
+re-checked against the tracker on 2026-10-20, 2026-10-21, and 2026-10-24.
+Open at
 release: WI#397
 (`high` — sb&kumo findings); WI#324 (real-worker acceptance evidence for
 every lane once the worker images are rebuilt and a worker `tool_allowlist`
@@ -1476,7 +1477,12 @@ refused everywhere identities parse); what stays open is
 its real-worker acceptance on rebuilt images and the opencode2 lane's own
 migration, filed as **WI#449** together with the run-170 leftovers
 (LP-11..LP-16; LP-7 declined by the maintainer on 2026-10-22), planned for
-v2.1.7.0. Filed late and planned for
+v2.1.7.0. The WI#454 worker-side kimi slice (task-runner delegation,
+described above) landed in-tree this cycle but the work item stays open
+for its remaining image-level split; **WI#456** (kimi external worker
+"connection refused (os error 111)" on a new build post-20) is also still
+open — see the runbook in `docs/ops/WORKER-CONTAINERS.md` for the stale-image
+remediation. Filed late and planned for
 v2.1.7.0, but live in this
 release: WI#440 (`generate_token` falls back to a predictable `date +%s`
 token when `od` is absent) and WI#441 (`resolve_protected_paths` degrades
@@ -1509,7 +1515,9 @@ now uses Trivy's `exp:` expiry syntax, enforced by the `ci-config`
 validator, the three Debian-fixed perl CVEs are no longer suppressed, and
 all four worker images moved to the 20261017T082437Z Debian snapshot; the
 rebuilt images' SBOMs on master pipeline 6007 show the fixed perl) were
-closed on 2026-10-19, without notes. WI#422 (the rootful pebble
+closed on 2026-10-19, without notes. WI#467 (the opencode build's
+models.dev reproducibility gap — the committed snapshot pin described
+under the opencode Changes section) was closed on 2026-10-24. WI#422 (the rootful pebble
 re-resolution — rootful pebble now launches as the tenant uid under
 `no-new-privileges`, no credential split by design), WI#423 (mt-admin's
 remaining root reads/writes of tenant-writable env paths; its re-attempt's
