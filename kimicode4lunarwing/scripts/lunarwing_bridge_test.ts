@@ -23,9 +23,11 @@ async function freePort(): Promise<number> {
   return port
 }
 
+const bridgeStateDirs = new Map<ChildProcessWithoutNullStreams, string>()
+
 function startBridge(port: number, token: string, extraEnv: Record<string, string> = {}): ChildProcessWithoutNullStreams {
   const stateDir = mkdtempSync(join(tmpdir(), "kimi-bridge-"))
-  return spawn(process.execPath, [bridgePath], {
+  const child = spawn(process.execPath, [bridgePath], {
     env: {
       ...process.env,
       AGENT_AUTH_TOKEN: token,
@@ -36,6 +38,39 @@ function startBridge(port: number, token: string, extraEnv: Record<string, strin
     },
     stdio: ["pipe", "pipe", "pipe"],
   })
+  bridgeStateDirs.set(child, stateDir)
+  return child
+}
+
+const KILL_GRACE_MS = 3_000
+
+/**
+ * Stop a bridge child and wait for it to actually exit.
+ *
+ * A bare `child.kill("SIGTERM")` only queues the signal: the process can
+ * outlive it holding a stdio pipe open, which keeps the runner's event loop
+ * alive until the 120 s per-test timeout. Pipeline 6308's kimi candidate
+ * failed exactly that way (169 tests, 101 pass, 0 fail, 1 cancelled). SIGKILL
+ * after a short grace bounds a bridge that ignores SIGTERM.
+ */
+async function killBridge(child: ChildProcessWithoutNullStreams): Promise<void> {
+  try {
+    if (child.exitCode === null && child.signalCode === null) {
+      const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()))
+      child.kill("SIGTERM")
+      const escalate = setTimeout(() => child.kill("SIGKILL"), KILL_GRACE_MS)
+      escalate.unref()
+      try {
+        await exited
+      } finally {
+        clearTimeout(escalate)
+      }
+    }
+  } finally {
+    const stateDir = bridgeStateDirs.get(child)
+    bridgeStateDirs.delete(child)
+    if (stateDir) rmSync(stateDir, { recursive: true, force: true })
+  }
 }
 
 async function waitForListening(child: ChildProcessWithoutNullStreams): Promise<void> {
@@ -74,7 +109,7 @@ test("bridge requires token and rejects wrong bearer before upgrade", async () =
     assert.equal(ready.type, "ready")
     ws.close()
   } finally {
-    child.kill("SIGTERM")
+    await killBridge(child)
   }
 })
 
@@ -116,7 +151,7 @@ console.log(JSON.stringify({ role: "assistant", content: "done" }))
     assert.equal(readFileSync(join(root, "missions/pr-digest/state"), "utf8"), "first tick")
   } finally {
     ws?.close()
-    child.kill("SIGTERM")
+    await killBridge(child)
     rmSync(root, { recursive: true, force: true })
   }
 })
@@ -169,7 +204,7 @@ console.log(JSON.stringify({ role: "assistant", content: sock ? "HAS_PROXY_ENV" 
     assert.match(String(second.output), /NO_PROXY_ENV/)
   } finally {
     ws?.close()
-    child.kill("SIGTERM")
+    await killBridge(child)
     rmSync(root, { recursive: true, force: true })
   }
 })
@@ -251,7 +286,7 @@ setTimeout(() => {
     assert.match(String(result.output), /tool:proxied-content/)
   } finally {
     ws?.close()
-    child.kill("SIGTERM")
+    await killBridge(child)
     rmSync(root, { recursive: true, force: true })
   }
 })
@@ -329,7 +364,7 @@ conn.on("data", (d) => {
     assert.match(String(reply.error), /hub connection closed/)
   } finally {
     ws?.close()
-    child.kill("SIGTERM")
+    await killBridge(child)
     rmSync(root, { recursive: true, force: true })
   }
 })
@@ -424,7 +459,7 @@ conn.on("data", (d) => {
     assert.match(String(reply.error), /hub connection closed/)
   } finally {
     hub.close()
-    child.kill("SIGTERM")
+    await killBridge(child)
     rmSync(root, { recursive: true, force: true })
   }
 })
@@ -486,7 +521,7 @@ for (const m of messages) process.stdout.write(JSON.stringify(m) + "\\n")
   } finally {
     if (previousKimiBin === undefined) delete process.env.KIMI_BIN
     else process.env.KIMI_BIN = previousKimiBin
-    child.kill("SIGTERM")
+    await killBridge(child)
     runner.close()
     rmSync(root, { recursive: true, force: true })
   }
@@ -525,7 +560,7 @@ test("a runner-socket bridge maps a dead runner socket to an error task_result (
       ws.close()
     }
   } finally {
-    child.kill("SIGTERM")
+    await killBridge(child)
     rmSync(root, { recursive: true, force: true })
   }
 })
@@ -607,7 +642,7 @@ setInterval(() => {}, 1000)
     else process.env.KIMI_BIN = previousKimiBin
     if (previousGrace === undefined) delete process.env.KIMI_KILL_GRACE_MS
     else process.env.KIMI_KILL_GRACE_MS = previousGrace
-    child.kill("SIGTERM")
+    await killBridge(child)
     runner.close()
     rmSync(root, { recursive: true, force: true })
   }
