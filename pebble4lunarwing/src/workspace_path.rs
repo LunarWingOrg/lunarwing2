@@ -174,9 +174,19 @@ fn create_cron_workspace(path: &str, workspace_root: &Path) -> io::Result<PathBu
 
 /// DS-2: only validation, a non-directory component (ENOTDIR), a symlink loop
 /// (ELOOP), permission denials (EACCES/EPERM) and containment failures are
-/// permanent. Everything else (EMFILE/ENFILE/ENOMEM, ENOSPC/EDQUOT/EIO on the
-/// first mkdir, ENOENT/EINVAL from a swap race) is transient and the host
-/// supervisor may re-dispatch. `Unsupported` marks the missing-/proc preflight.
+/// permanent. EINVAL sits in that permanent set through std's
+/// `EINVAL → ErrorKind::InvalidInput` mapping — a pre-existing classification,
+/// not a change run 170 made. The source observed on this lane is the chunk-4
+/// `fchown` handoff onto a task id the user namespace does not map, which no
+/// re-dispatch can fix. NP-1 (run-204): the earlier wording claimed that was
+/// EINVAL's *only* bootstrap source; it is not a general truth (the TS lanes
+/// meet a swap-race EINVAL from `realpathSync`'s lstat→readlink pair, which
+/// stays transient there), and this lane's `canonicalize` reaches realpath(3),
+/// which walks the same way. Treat the residual as recorded, not proven
+/// absent: a realpath EINVAL race here abandons the tick instead of re-walking
+/// it. Everything else (EMFILE/ENFILE/ENOMEM, ENOSPC/EDQUOT/EIO on the first
+/// mkdir, ENOENT from a swap race) is transient and the host supervisor may
+/// re-dispatch. `Unsupported` marks the missing-/proc preflight.
 fn is_non_retryable_bootstrap(error: &io::Error) -> bool {
     use io::ErrorKind::{InvalidInput, PermissionDenied, Unsupported};
     if matches!(error.kind(), InvalidInput | PermissionDenied | Unsupported) {
@@ -391,6 +401,12 @@ mod tests {
             io::Error::from_raw_os_error(libc::ENOTDIR),
             io::Error::from_raw_os_error(libc::ELOOP),
             io::Error::from_raw_os_error(libc::EACCES),
+            // EINVAL is permanent on this lane through std's EINVAL →
+            // InvalidInput mapping (the arm above), not a raw compare. The
+            // observed source is fchown's unmapped-uid failure (no
+            // re-dispatch can map it); a realpath swap-race EINVAL would be
+            // abandoned rather than re-walked — the residual NP-1 records.
+            io::Error::from_raw_os_error(libc::EINVAL),
         ] {
             assert!(is_non_retryable_bootstrap(&error), "permanent: {error}");
         }
@@ -573,9 +589,11 @@ mod tests {
         while std::time::Instant::now() < deadline && redirected.is_empty() && refused == 0 {
             match resolve_task_workspace(&context, &root) {
                 Ok(resolved) if resolved.starts_with(&decoy) => redirected.push(resolved),
-                Ok(_) => {}
+                // DS-1's refusal is the only thing the harness counts; any
+                // other outcome (a clean resolve, or another refusal) is a
+                // no-op for this liveness signal.
                 Err(error) if error.to_string().contains("resolved path changed") => refused += 1,
-                Err(_) => {}
+                Ok(_) | Err(_) => {}
             }
         }
         stop.store(true, Ordering::Relaxed);
