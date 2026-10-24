@@ -253,18 +253,19 @@ opencode2 lane additionally denies upstream's unchecked built-in
 `session_move`/`session_rename` tools so they cannot rewrite the
 title-based task binding or the external-directory confinement. The pebble
 lane ships the same relay plus an in-image stdio MCP shim inside its Rust
-bridge binary (`pebble4lunarwing mcp-shim`). WI#324's real-worker
-acceptance (a granted proxied call from a real worker, and
-`knowledge_search` hits through the proxy) has no evidence yet: the kimi
-test-tenant jobs on rebuilt images (soarin, fleetfoot) returned a fixed
-`KIMI_WORKER_OK` string without a proxied call, and the default
+bridge binary (`pebble4lunarwing mcp-shim`). The default
 `tool_allowlist` is empty, so a managed tenant has no proxied tools until an
 operator grants them (`lunarwing-mt-admin.sh configure-worker-tools`, then
 `restart-tenant`). The opencode and opencode2
 plugins and the pebble shim reach tenants only with rebuilt images (the
 opencode one on the known-broken v1.18.25 lane, WI#333, bump-or-retire
-pending), and no real opencode, opencode2 or pebble job has exercised
-them — **WI#324 remains open**. Design doc:
+pending). **WI#324 closed on 2026-10-21** after the harness work; the
+real-worker acceptance it left behind (a granted proxied call from a real
+worker, and `knowledge_search` hits through the proxy) rides the rebuilt
+images and stays uncovered — the kimi test-tenant jobs on rebuilt images
+(soarin, fleetfoot) returned a fixed `KIMI_WORKER_OK` string without a
+proxied call — so it is tracked with the other image-level residuals under
+WI#449. Design doc:
 `docs/proposals/EXTERNAL-WORKER-TOOL-PROXY.md`.
 
 ### Cron Missions on External Workers (WI#325)
