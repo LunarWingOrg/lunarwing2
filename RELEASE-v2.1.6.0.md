@@ -889,7 +889,10 @@ root-only `0400` file (out of every process environment), the bridge stays
 container root behind a trimmed capability set, and every task process
 drops to a separate task uid via `setpriv --clear-groups
 --ambient-caps=-all --inh-caps=-all --no-new-privs` — so `/proc/1/environ`,
-the bridge environ and the token file all give task code EACCES. The
+the bridge environ and the token file all give task code EACCES. (LP-7's
+`--bounding-set=-all` and its `CAP_SETPCAP` trim are NOT part of this
+release: the maintainer declined both on 2026-10-22, #11230.)
+The
 pinned identities are validated everywhere they parse (the TS
 `taskIdentity()` helpers, both entrypoints, the pebble executor): zero or
 non-numeric ids fail closed, because a zero id would make the privilege
@@ -899,7 +902,10 @@ with the entrypoints' `^[1-9][0-9]*$` gate). The
 opencode2 lane is deliberately not migrated (its image keeps the task uid
 directly; the migration is filed as the WI#449 follow-up, planned for
 v2.1.7.0). Worker images must be rebuilt for the strips and the split to
-reach live tenants.
+reach live tenants. Rollback note (run-170 LP-16): roll back the scripts
+and the image TOGETHER — rolling back the scripts while keeping the new
+`USER 0:0` pebble image drops keep-id on rootless hosts, and tasks then
+cannot write the `0700` workspace.
 
 ### Daily-Log Backup Cap Fail-Closed (WI#335)
 
@@ -1521,6 +1527,18 @@ the bridge and read its environment — no split, by design), with
 real-worker acceptance riding the rebuilt images like every other worker
 change. WI#400 itself was closed on 2026-10-20 after its re-pass; the
 opencode2 lane's own migration is filed as the open WI#449 follow-up.
+The run-170 LP leftovers underneath that split landed for the
+kimi/opencode/opencode2/pebble lanes: LP-11 pins the kimi/pebble image-user
+refusals and the opencode/pebble Quadlet `UserNS=` lines; LP-12 makes the
+LD-11 absolute-`PATH` pins failable; LP-13 changes the socket handoff to
+chmod before it chowns (so the mode change needs no `CAP_FOWNER`); LP-14
+restricts the `setpriv` resolver to absolute `PATH` entries and extends the
+loader denylist to glibc's unsafe-environment list; LP-15 reads the bridge
+uid from `/proc/self/status` (the owner of `/proc/self` reads as root for a
+non-dumpable process, and a probe file would write into task-controlled
+directories); LP-16 makes the unmapped-task-uid `fchown` `EINVAL` permanent
+where that call raises it, while the swap-race `EINVAL` stays transient.
+LP-7 stays declined per #11230.
 
 **Known-broken lane.** The opencode **v1** worker lane (v1.18.25) still
 crashes inside `opencode serve` before any model call (WI#333); the new
