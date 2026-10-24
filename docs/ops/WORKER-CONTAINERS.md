@@ -46,7 +46,16 @@ Each lane enforces the strip at its task-process boundary:
   its own copy. The one-shot `cli` and `acp` modes exec the task process the
   same way. Pinned by the worker entrypoint harness, which asserts both
   directions (serve sees it absent, bridge sees it present) plus every
-  one-shot mode.
+  one-shot mode. Both executors also **refuse task-supplied** reserved names
+  (WI#454): these lanes inject `context.environment` into the bridge's own
+  `process.env`, so a task naming `AGENT_AUTH_TOKEN` or
+  `AGENT_AUTH_TOKEN_FILE` would have handed itself — and every concurrent
+  task on that container — the bridge's token. The key is dropped before
+  injection with the FY-5 warning (key and task id, never the value); on the
+  v1 lane this also stops a crafted key from widening the serve-log scrub set,
+  which reads back the injected values. Pinned per lane by the env sampled at
+  prompt time (the moment task code inherits it), so a mutant that injects and
+  restores in the `finally` still fails.
 - **Pebble** — `spawn_pebble` rebuilds the child env via `env_clear()` +
   `strip_bridge_credentials` (everything else preserved: PATH, locale,
   `PEBBLE_*` provider variables) and drops task-supplied re-injections.
