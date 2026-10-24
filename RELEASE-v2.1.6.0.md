@@ -623,6 +623,78 @@ WI#322 on 2026-10-21. The remaining boot-loaded-document residual — the
 through memory tools, with id-shadowing at boot and a provenance-label
 inversion — is filed as **WI#455** (security, open, planned for v2.1.7.0).
 
+### Leak Detector: GitLab PAT and Complete Bearer Redaction (WI#353)
+
+The safety leak detector (`ic/crates/lunarwing_safety/src/leak_detector.rs`)
+gains a `gitlab_pat` block pattern for the `glpat-` prefix, which had no
+detector: an uncut token body was fully visible because the block truncation
+boundaries never matched it. Redaction of `Bearer` tokens now covers the
+full bearer-token grammar — JWT dot-separated segments (`.`) and
+tilde-separated tokens (`~`) included — so the head of a JWT and the tail
+of a tilde token are redacted with the rest, not truncated mid-token; the
+match is case-insensitive against `bearer` to catch worker logs that spell
+`token_type: bearer` / a lowercase `bearer <token>`. Placeholder bodies
+(GitLab's own docs spell the shape as `glpat-xxxxxx…`) are skipped via
+`is_plausible_token_body`, so fetched documentation is not blocked
+wholesale. WI#353 was closed on 2026-10-22; the run-185/run-187 review
+refinements (case-insensitive bearer, tilde tokens, placeholder skip,
+straddle-sweep fixtures) all landed with it.
+
+### Config-Hash Sidecars Moved to Root-Owned Host State (WI#446, WI#450, WI#451)
+
+The per-container config-hash sidecar that lets `start-tenant` recreate a
+container only when its config actually changed moved out of the
+tenant-controlled `~/.config` tree into root-owned host state
+(`/var/lib/lunarwing/container-hashes/<tenant>/`) — root's historical
+mkdir/printf under `~/.config` followed pre-placed symlinks, and the
+root-owned sidecars the old writer left on upgraded tenants could never be
+updated by a tenant-side writer (every start then force-recreated the
+container). That move is WI#446 (closed 2026-10-21).
+
+**WI#450** (closed 2026-10-21, run-181 MC-1) closes the confidentiality gap
+the move opened: each hash covers a secret-bearing env file or Quadlet, and
+the tenant home that used to hold these sidecars was private — root's
+ambient umask would leave the base and per-tenant directories `0755` and
+the file `0644`, readable by every local user. The directories are now
+forced `0700` and the file is written under `umask 077` (`0600`); the base
+`mkdir` stays outside `umask 077` so a fresh `/var/lib/lunarwing` does not
+block tenants from reaching the 0755 `voice-models` tree.
+
+**WI#451** (closed 2026-10-22, run-181 MC-2) pins the symlink-redirect
+refusals on the voice renderer's Quadlet and fallback paths — half of the
+run-181 rootful-Quadlet finding — so the voice renderer's `~/.config`
+writes can no longer follow a tenant-planted symlink onto another tenant's
+state.
+
+### `prepare_worker_workspace` Creates as the Tenant, Chowns Without Following (WI#453, WI#461)
+
+The workspace sits inside the tenant-controlled `~/lunarwing` tree, so the
+historical root `mkdir -p` + unbounded `chown -R` followed a tenant-planted
+symlink at any owned component into arbitrary host territory — the same
+root-follows-tenant-path class WI#446 eliminated everywhere else.
+**WI#453** (closed 2026-10-22): `prepare_worker_workspace` creates the
+workspace **as the tenant** (`tenant_mkdir_p` refuses non-absolute paths and
+every component that is not owned and writable by the tenant), so root
+never opens a path the tenant chose; the chown step uses
+`chown --no-dereference` on the workspace root and every non-hard-link
+descendant, so a symlink in the tree can no longer redirect root's chown
+onto a victim path. The `chmod 2770` site that WI#416 left unconverted is
+now the tenant-side `tenant_chmod` in this path. **WI#461** (closed
+2026-10-24, hunter 2026-10-22 LOW): both chown steps in the walk refuse
+cleanly under `set -euo pipefail` — a `chown` failure inside a suppressed
+errexit context (`cmd || status=$?`) used to be silently swallowed and the
+bind mount reached the container with the wrong owner; both now return rc-1
+with a named message and restore `PWD` on every exit path.
+
+### `validate_llm_url` No Longer Echoes the Tenant URL (WI#384)
+
+`validate_llm_url`'s `die` messages (`must be an http(s) URL`, `has no
+host`, `must not embed userinfo`, etc.) used to print the tenant-supplied
+URL verbatim, leaking it into the job trace. They now route through
+`sanitize_display_value`, which redacts the value to a short, safe form
+before it reaches any error line (`ic/scripts/mt-admin-lib/06-env-generation.sh`).
+WI#384 was closed on 2026-10-23.
+
 ### Boot-Time Mission Writers Reload Under the Lock (WI#317)
 
 Boot-time and reconcile-time mission writers no longer save stale list
