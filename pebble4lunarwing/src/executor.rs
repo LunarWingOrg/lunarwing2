@@ -1,4 +1,3 @@
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Instant;
@@ -212,7 +211,17 @@ pub async fn run_task(
 /// supplied, letting task code substitute its own "setpriv" for the drop.
 fn resolve_setpriv_path() -> Result<std::ffi::OsString, std::io::Error> {
     let path = std::env::var_os("PATH").unwrap_or_default();
-    for dir in std::env::split_paths(&path) {
+    resolve_setpriv_in(&path)
+}
+
+/// LP-14: only ABSOLUTE PATH entries are considered — a relative (or empty)
+/// entry would anchor the lookup at the bridge's working directory, which
+/// the launch shape does not control as tightly as the image PATH.
+fn resolve_setpriv_in(path: &std::ffi::OsStr) -> Result<std::ffi::OsString, std::io::Error> {
+    for dir in std::env::split_paths(path) {
+        if !dir.is_absolute() {
+            continue;
+        }
         let candidate = dir.join("setpriv");
         if candidate.is_file() {
             return Ok(candidate.into_os_string());
@@ -224,24 +233,45 @@ fn resolve_setpriv_path() -> Result<std::ffi::OsString, std::io::Error> {
     ))
 }
 
+/// LD-11/LP-14: variables the dynamic loader and glibc honour in the
+/// still-root setpriv process BEFORE the drop — a task-supplied value would
+/// run as root. Tracks glibc's unsafe-environment list (the LD_* family plus
+/// the named locale/resolver/tuning knobs).
+fn is_loader_env_key(key: &str) -> bool {
+    key.starts_with("LD_")
+        || matches!(
+            key,
+            "GCONV_PATH"
+                | "GLIBC_TUNABLES"
+                | "LOCPATH"
+                | "NLSPATH"
+                | "HOSTALIASES"
+                | "RES_OPTIONS"
+                | "LOCALDOMAIN"
+                | "TZDIR"
+                | "MALLOC_TRACE"
+        )
+}
+
 /// LD-8: refuse to spawn without a privilege split. If the bridge itself
 /// landed on the task uid (rootless keep-id with a USER-less image), the
 /// credential isolation WI#400 promises is absent: the task could read the
-/// bridge's environ and the token file. The owner of /proc/self is this
-/// process's uid (the crate forbids unsafe code, so `libc::geteuid` is not
-/// an option).
+/// bridge's environ and the token file. The bridge's effective uid comes
+/// from the `Uid:` line of `/proc/self/status` (LP-15/NP-2): the owner of
+/// `/proc/self` reads as root for a non-dumpable process, and the crate
+/// forbids unsafe code, so `libc::geteuid` is not an option. The status
+/// file needs no write, so this check never touches a task-controlled
+/// directory.
 fn refuse_shared_identity(task_ids: Option<(u32, u32)>) -> Result<(), std::io::Error> {
     let Some((task_uid, _)) = task_ids else {
         return Ok(());
     };
-    let bridge_uid = std::fs::metadata("/proc/self")
-        .map_err(|error| {
-            std::io::Error::new(
-                error.kind(),
-                format!("cannot stat /proc/self for the bridge uid: {error}"),
-            )
-        })?
-        .uid();
+    let bridge_uid = crate::tool_proxy::bridge_uid().map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("cannot learn the bridge uid from /proc/self/status: {error}"),
+        )
+    })?;
     if bridge_uid == task_uid {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -285,8 +315,11 @@ fn spawn_pebble(
     // the uid change and the task could regain the bridge uid (run-98 FY-1
     // prototype finding) — and --no-new-privs is mandatory too (run-164
     // KW-2): without it a setuid or file-capability binary in the image
-    // would let task code regain privilege. The env assembled below is
-    // passed to setpriv and inherited by the task unchanged.
+    // would let task code regain privilege. (LP-7's --bounding-set=-all is
+    // deliberately absent: the maintainer declined it on 2026-10-22, #11230 —
+    // it also needed CAP_SETPCAP in the still-root setpriv.) The env
+    // assembled below is passed to setpriv and inherited by the task
+    // unchanged.
     let task_ids = task_ids_from_env()?;
     refuse_shared_identity(task_ids)?;
     let mut program = std::ffi::OsString::from(&config.pebble_bin);
@@ -354,13 +387,12 @@ fn spawn_pebble(
             );
             continue;
         }
-        // LD-11: in split mode the child env reaches the still-root setpriv
-        // process; loader/interpreter variables there would let task code
-        // run code as root before the drop. The daemon already denylists
-        // these for worker env — the bridge must not depend on that.
-        if task_ids.is_some()
-            && (key.starts_with("LD_") || key == "GCONV_PATH" || key == "GLIBC_TUNABLES")
-        {
+        // LD-11/LP-14: in split mode the child env reaches the still-root
+        // setpriv process; loader/interpreter variables there would let task
+        // code run code as root before the drop. The daemon already
+        // denylists these for worker env — the bridge must not depend on
+        // that.
+        if task_ids.is_some() && is_loader_env_key(key) {
             eprintln!(
                 "[exec] {}: dropped task-supplied env entry {key}: loader variable refused before the privilege drop (WI#400 LD-11)",
                 request.task_id
@@ -1116,6 +1148,7 @@ mod tests {
             .to_path_buf();
         let stub_dir = exe_dir.join("pebble-wi400-bin");
         let stub = stub_dir.join("setpriv");
+        let evil_dir = exe_dir.join("pebble-wi400-evil-bin");
         let root = exe_dir.join("pebble-wi400-root");
 
         if std::env::var_os(CHILD_MARKER).is_none() {
@@ -1129,6 +1162,17 @@ mod tests {
             .expect("write setpriv stub");
             std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
                 .expect("make setpriv stub executable");
+            // LP-12: a hostile `setpriv` that only runs if the program is
+            // resolved through the task-supplied child PATH — the LD-11
+            // absolute-path pin must be able to FAIL.
+            std::fs::create_dir_all(&evil_dir).expect("create evil stub dir");
+            std::fs::write(evil_dir.join("setpriv"), "#!/bin/sh\necho EVIL\n")
+                .expect("write evil setpriv stub");
+            std::fs::set_permissions(
+                evil_dir.join("setpriv"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("make evil setpriv stub executable");
 
             let exe = std::env::current_exe().expect("test binary path");
             let out = std::process::Command::new(exe)
@@ -1160,6 +1204,7 @@ mod tests {
             );
             std::fs::remove_file(&stub).ok();
             std::fs::remove_dir_all(&stub_dir).ok();
+            std::fs::remove_dir_all(&evil_dir).ok();
             std::fs::remove_dir_all(&root).ok();
             return;
         }
@@ -1174,7 +1219,12 @@ mod tests {
             workspace_root: root.to_str().expect("utf-8 root").to_string(),
         };
         std::fs::create_dir_all(&root).expect("create workspace root");
-        let req = request("wrap me", vec![]);
+        let mut req = request("wrap me", vec![]);
+        // LP-12: a bare-name "setpriv" mutant resolves through the CHILD env
+        // — point the task-supplied PATH at the EVIL stub so the mutant is
+        // observed, while the bridge's own PATH keeps the benign stub.
+        req.context.environment =
+            HashMap::from([("PATH".to_string(), evil_dir.to_string_lossy().into_owned())]);
         let child = spawn_pebble(&config, &req, None).expect("spawn setpriv stub");
         let out = child
             .wait_with_output()
@@ -1195,6 +1245,10 @@ mod tests {
         assert!(
             !text.contains("<setpriv>"),
             "setpriv must be resolved to an absolute path from the bridge PATH, not a bare name (WI#400 LD-11): {text}"
+        );
+        assert!(
+            !text.contains("EVIL"),
+            "the task-supplied PATH resolved setpriv — the bridge PATH must win (WI#400 LP-12): {text}"
         );
     }
 
@@ -1337,7 +1391,7 @@ mod tests {
         let stub = stub_dir.join("setpriv");
         std::fs::write(
             &stub,
-            "#!/bin/sh\nprintf 'LD_PRELOAD=%s\\n' \"${LD_PRELOAD:-unset}\"\nprintf 'GCONV=%s\\n' \"${GCONV_PATH:-unset}\"\n",
+            "#!/bin/sh\nprintf 'LD_PRELOAD=%s\\n' \"${LD_PRELOAD:-unset}\"\nprintf 'GCONV=%s\\n' \"${GCONV_PATH:-unset}\"\nprintf 'TZDIR=%s\\n' \"${TZDIR:-unset}\"\n",
         )
         .expect("write stub");
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
@@ -1385,15 +1439,64 @@ mod tests {
         req.context.environment = HashMap::from([
             ("LD_PRELOAD".to_string(), "/evil.so".to_string()),
             ("GCONV_PATH".to_string(), "/evil".to_string()),
+            // LP-14: the glibc unsafe-environment list beyond the LD_* family.
+            ("TZDIR".to_string(), "/evil-tz".to_string()),
         ]);
         let child = spawn_pebble(&config, &req, None).expect("spawn setpriv stub");
         let out = child.wait_with_output().await.expect("stub completes");
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(
-            text.contains("LD_PRELOAD=unset") && text.contains("GCONV=unset"),
-            "task-supplied loader variables reached the root-side drop process (WI#400 LD-11): {text}"
+            text.contains("LD_PRELOAD=unset")
+                && text.contains("GCONV=unset")
+                && text.contains("TZDIR=unset"),
+            "task-supplied loader variables reached the root-side drop process (WI#400 LD-11/LP-14): {text}"
         );
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&stub_dir).ok();
+    }
+
+    // LP-14: a relative (or empty) PATH entry must never anchor the setpriv
+    // lookup at the bridge's working directory. The stub dirs are removed
+    // through Drop guards, so a failing assertion cannot leave
+    // pebble-lp14-* directories behind in the package root (run-208 NT-3:
+    // an unwind-time leftover was observed with the mutant, and the image
+    // contract then stamped the tree dirty).
+    #[test]
+    fn setpriv_resolution_requires_absolute_path_entries() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        struct RemoveOnDrop(std::path::PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).ok();
+            }
+        }
+        static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let exe_dir = std::env::current_exe()
+            .expect("test binary path")
+            .parent()
+            .expect("exe directory")
+            .to_path_buf();
+        let abs_dir = exe_dir.join(format!("pebble-lp14-abs-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&abs_dir).expect("create absolute stub dir");
+        let abs_stub = abs_dir.join("setpriv");
+        std::fs::write(&abs_stub, "#!/bin/sh\n").expect("write absolute stub");
+        let _abs_guard = RemoveOnDrop(abs_dir.clone());
+        // A REAL relative entry under the cwd (cargo test runs in the package
+        // root) carrying a setpriv file: a resolver that honours relative
+        // entries would return it — the pin must be able to fail.
+        let rel_name = format!("pebble-lp14-rel-{}-{unique}", std::process::id());
+        let rel_dir = std::env::current_dir().expect("cwd").join(&rel_name);
+        std::fs::create_dir_all(&rel_dir).expect("create relative stub dir");
+        std::fs::write(rel_dir.join("setpriv"), "#!/bin/sh\n").expect("write relative stub");
+        let _rel_guard = RemoveOnDrop(rel_dir.clone());
+        let relative_only = std::ffi::OsString::from(&rel_name);
+        assert!(
+            resolve_setpriv_in(&relative_only).is_err(),
+            "a relative PATH entry must not resolve setpriv"
+        );
+        let path = std::ffi::OsString::from(format!("{rel_name}:{}", abs_dir.display()));
+        let resolved = resolve_setpriv_in(&path).expect("absolute entry resolves");
+        assert_eq!(resolved, abs_stub.as_os_str());
     }
 }

@@ -47,7 +47,21 @@ function annotateComponent(error: unknown, part: string): Error {
 // and containment failures are permanent; other errnos (EMFILE/ENFILE/ENOMEM,
 // ENOSPC/EDQUOT/EIO on the first mkdir, ENOENT/EINVAL from a swap race) are
 // reported under a transient wording the host supervisor retries.
+//
+// EINVAL in particular is a swap race here and must stay transient (NP-1):
+// resolveWorkspacePath's realpathSync runs lstat per component and then
+// readlink on a symlink, so a task swapping that component from a link to a
+// directory between the two calls raises EINVAL. This lane has no task-uid
+// fchown (opencode2's credential split is WI#454's), so there is no permanent
+// EINVAL source to carve out.
 const NON_RETRYABLE_ERRNOS = new Set(["ENOTDIR", "ELOOP", "EACCES", "EPERM"])
+
+/** DS-2: is this bootstrap errno permanent (abandon) rather than transient
+ * (re-dispatch)? Exported so the classification is pinnable on its own. */
+export function isNonRetryableBootstrapErrno(code: string | undefined): boolean {
+  return code !== undefined && NON_RETRYABLE_ERRNOS.has(code)
+}
+
 export function resolveTaskWorkspace(
   context: { project_dir?: string; cron_tick?: unknown } | undefined,
   workspaceRoot: string,
@@ -105,9 +119,8 @@ export function resolveTaskWorkspace(
     return resolved
   } catch (error) {
     const message = String(error)
-    const code = (error as NodeJS.ErrnoException).code
     if (message.includes("Workspace path escapes WORKSPACE_ROOT") ||
-        (code !== undefined && NON_RETRYABLE_ERRNOS.has(code))) {
+        isNonRetryableBootstrapErrno((error as NodeJS.ErrnoException).code)) {
       throw new Error(`Invalid workspace path for cron tick: ${message}`)
     }
     throw new Error(`Transient workspace error for cron tick: ${message}`)

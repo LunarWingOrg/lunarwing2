@@ -5,7 +5,15 @@ import { existsSync, mkdtempSync, rmSync, symlinkSync, mkdirSync, writeFileSync,
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { TaskRunner, inheritedListenFd, refuseSymlinkedRunnerDir, taskRunnerSocketPath } from "./task_runner.js"
+import {
+  TaskRunner,
+  inheritedListenFd,
+  main,
+  presentCredentialKeys,
+  refuseSymlinkedRunnerDir,
+  startupRefusal,
+  taskRunnerSocketPath,
+} from "./task_runner.js"
 import { TASK_TOOLCHAIN_DIRS } from "./kimi_task_executor.js"
 import type { TaskRequest, TaskResult } from "./lunarwing_runtime.js"
 
@@ -550,4 +558,68 @@ test("NL-7: LUNARWING_TASK_RUNNER_LISTEN_FD is parsed strictly", () => {
   for (const bad of ["0", "2", "-1", "3x", " 3", "abc"]) {
     assert.throws(() => inheritedListenFd(bad), /descriptor number >= 3/, bad)
   }
+})
+
+test("WI#454: the runner's environment contract names both hub credential keys", () => {
+  // Empty and missing values are both "absent": the launcher unsets the name,
+  // and an empty export is the same non-credential.
+  assert.deepEqual(presentCredentialKeys({}), [])
+  assert.deepEqual(presentCredentialKeys({ AGENT_AUTH_TOKEN: "", AGENT_AUTH_TOKEN_FILE: "" }), [])
+  // Either name carrying a value is a contract violation the runner refuses.
+  assert.deepEqual(presentCredentialKeys({ AGENT_AUTH_TOKEN: "hub-bearer" }), ["AGENT_AUTH_TOKEN"])
+  assert.deepEqual(
+    presentCredentialKeys({ AGENT_AUTH_TOKEN: "hub-bearer", AGENT_AUTH_TOKEN_FILE: "/run/lunarwing/agent_auth_token" }),
+    ["AGENT_AUTH_TOKEN", "AGENT_AUTH_TOKEN_FILE"],
+  )
+  // Nothing else in the environment is the credential.
+  assert.deepEqual(presentCredentialKeys({ KIMI_API_KEY: "provider-key", PATH: "/usr/bin" }), [])
+})
+
+test("WI#454: main() refuses to start when the hub credential reaches the runner", async () => {
+  // The launcher unsets both names before the exec; this pin makes that a
+  // refusal instead of a convention. A runner that inherited the token would
+  // pass it to every task it spawns, so the daemon must not come up at all.
+  // Asserted through startupRefusal() as well, because this suite also runs as
+  // root in the image gate, where main()'s uid gate answers first.
+  const previousToken = process.env.AGENT_AUTH_TOKEN
+  const previousFile = process.env.AGENT_AUTH_TOKEN_FILE
+  process.env.AGENT_AUTH_TOKEN = "hub-bearer"
+  delete process.env.AGENT_AUTH_TOKEN_FILE
+  try {
+    const socketPath = join(scratch(), "unused.sock")
+    const refusal = startupRefusal({ listenFd: null, socketPath, env: process.env, uid: 10002 })
+    assert.match(String(refusal), /hub credential in its environment \(AGENT_AUTH_TOKEN\)/)
+    // And in the real entry path, whatever uid this suite runs as the refusal
+    // is the credential one (it is checked before the root gate).
+    const rc = await main([socketPath])
+    if ((process.getuid?.() ?? -1) !== 0) {
+      assert.equal(rc, 1, "main() must fail closed rather than listen with the credential present")
+    }
+    assert.deepEqual(process.exitCode, undefined, "main() reports through its return, never process.exit")
+  } finally {
+    if (previousToken === undefined) delete process.env.AGENT_AUTH_TOKEN
+    else process.env.AGENT_AUTH_TOKEN = previousToken
+    if (previousFile === undefined) delete process.env.AGENT_AUTH_TOKEN_FILE
+    else process.env.AGENT_AUTH_TOKEN_FILE = previousFile
+  }
+})
+
+test("WI#454: startupRefusal gates socket, credential, then uid", () => {
+  const ok = { listenFd: null, socketPath: "/tmp/x.sock", env: {}, uid: 10002 }
+  assert.equal(startupRefusal(ok), null)
+  // An inherited descriptor satisfies the socket gate.
+  assert.equal(startupRefusal({ ...ok, socketPath: "", listenFd: 3 }), null)
+  // No socket at all is refused before anything else is considered.
+  assert.match(
+    String(startupRefusal({ ...ok, socketPath: "", listenFd: null, env: { AGENT_AUTH_TOKEN: "t" } })),
+    /socket path required/,
+  )
+  // The credential gate precedes the uid gate, so a root launch that also
+  // leaked the token reports the leak (the actionable config error).
+  assert.match(
+    String(startupRefusal({ ...ok, uid: 0, env: { AGENT_AUTH_TOKEN_FILE: "/run/lunarwing/agent_auth_token" } })),
+    /hub credential in its environment \(AGENT_AUTH_TOKEN_FILE\)/,
+  )
+  // Root with a clean environment is still refused.
+  assert.match(String(startupRefusal({ ...ok, uid: 0 })), /refusing to run as root/)
 })

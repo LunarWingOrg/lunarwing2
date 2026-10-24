@@ -56,6 +56,66 @@ import {
 /** Env var carrying the inherited listening descriptor (NL-7). */
 export const RUNNER_LISTEN_FD_ENV = "LUNARWING_TASK_RUNNER_LISTEN_FD"
 
+/**
+ * Hub-handshake credential names the runner must never see (WI#373/WI#400).
+ * The launcher unsets both before exec'ing the runner; the list below turns
+ * that convention into an enforced contract (WI#454 — the runner is the
+ * environment store for task code, so it must not itself hold the credential
+ * the bridge uses to authenticate to the hub).
+ */
+export const RESERVED_CREDENTIAL_KEYS = ["AGENT_AUTH_TOKEN", "AGENT_AUTH_TOKEN_FILE"] as const
+
+/**
+ * Reserved credential names present (non-empty) in `env`. Empty means the
+ * launcher's credential handoff did its job.
+ */
+export function presentCredentialKeys(env: NodeJS.ProcessEnv = process.env): string[] {
+  return RESERVED_CREDENTIAL_KEYS.filter((key) => (env[key] ?? "") !== "")
+}
+
+/** Everything `main` needs to decide whether the daemon may come up. */
+export interface StartupState {
+  listenFd: number | null
+  socketPath: string
+  env: NodeJS.ProcessEnv
+  /** `process.getuid()` when the platform has it, else null. */
+  uid: number | null
+}
+
+/**
+ * The daemon's startup gates, in order, as a pure function: returns the
+ * refusal message, or null when the runner may listen. Kept separate from
+ * `main` so every gate is pinned in both uid shapes — a test running as root
+ * cannot exercise the credential gate through `main` because the root gate
+ * answers first.
+ */
+export function startupRefusal(state: StartupState): string | null {
+  const { listenFd, socketPath, env, uid } = state
+  if (listenFd === null && !socketPath) {
+    return "socket path required (argv or LUNARWING_TASK_RUNNER_SOCKET), or an inherited LUNARWING_TASK_RUNNER_LISTEN_FD"
+  }
+  // WI#454: the runner is the environment store for task code, so the bridge's
+  // hub-handshake credential must not reach it. The launcher unsets both names
+  // before the exec; enforce that here rather than trust the convention — a
+  // runner that inherited the token would hand it to every task it spawns.
+  // This is a configuration error on any uid, so it is checked before the
+  // unit gate and reports consistently whatever the runner runs as.
+  const leaked = presentCredentialKeys(env)
+  if (leaked.length > 0) {
+    return (
+      `refusing to start with the hub credential in its environment (${leaked.join(", ")}); ` +
+      "the launcher must unset it before exec (WI#454)"
+    )
+  }
+  if (uid === 0) {
+    // The runner must never be root: it spawns task code, and a root runner
+    // is exactly the WI#400 hazard this daemon exists to remove. The only
+    // sanctioned launcher drops to the task uid before exec'ing it.
+    return "refusing to run as root (WI#454: task code must run unprivileged)"
+  }
+  return null
+}
+
 /** Socket path the daemon listens on. Configured by the entrypoint/launcher. */
 export function taskRunnerSocketPath(): string {
   return process.env.LUNARWING_TASK_RUNNER_SOCKET || ""
@@ -394,15 +454,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     return 1
   }
   const socketPath = listenFd === null ? (argv[0] ?? taskRunnerSocketPath()) : ""
-  if (listenFd === null && !socketPath) {
-    console.error("[task-runner] socket path required (argv or LUNARWING_TASK_RUNNER_SOCKET), or an inherited LUNARWING_TASK_RUNNER_LISTEN_FD")
-    return 1
-  }
-  if (typeof process.getuid === "function" && process.getuid() === 0) {
-    // The runner must never be root: it spawns task code, and a root runner
-    // is exactly the WI#400 hazard this daemon exists to remove. The only
-    // sanctioned launcher drops to the task uid before exec'ing it.
-    console.error("[task-runner] refusing to run as root (WI#454: task code must run unprivileged)")
+  const refusal = startupRefusal({
+    listenFd,
+    socketPath,
+    env: process.env,
+    uid: typeof process.getuid === "function" ? process.getuid() : null,
+  })
+  if (refusal !== null) {
+    console.error(`[task-runner] ${refusal}`)
     return 1
   }
   const runner = new TaskRunner()

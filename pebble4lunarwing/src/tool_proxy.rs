@@ -382,54 +382,16 @@ impl Default for ToolProxyRelay {
 /// adopting a dir another uid prepared) would let task code aim the relay's
 /// filesystem writes wherever it likes.
 fn prepare_socket_path(socket_path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
-    let own_uid = bridge_uid()?;
     if let Some(parent) = socket_path.parent() {
         if let Ok(meta) = std::fs::symlink_metadata(parent) {
-            if meta.file_type().is_symlink() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "proxy dir {} is a symlink; refusing to follow it",
-                        parent.display()
-                    ),
-                ));
-            }
-            if meta.uid() != own_uid {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!(
-                        "proxy dir {} is owned by uid {}; refusing to adopt a foreign directory",
-                        parent.display(),
-                        meta.uid()
-                    ),
-                ));
-            }
+            refuse_foreign_proxy_dir(parent, &meta)?;
         }
         std::fs::create_dir_all(parent)?;
         // create_dir_all silently succeeds on an existing symlink-to-dir:
         // re-check on the created path with lstat semantics.
         let meta = std::fs::symlink_metadata(parent)?;
-        if meta.file_type().is_symlink() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "proxy dir {} is a symlink; refusing to follow it",
-                    parent.display()
-                ),
-            ));
-        }
-        if meta.uid() != own_uid {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "proxy dir {} is owned by uid {}; refusing to adopt a foreign directory",
-                    parent.display(),
-                    meta.uid()
-                ),
-            ));
-        }
+        refuse_foreign_proxy_dir(parent, &meta)?;
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o711))?;
     }
     match std::fs::remove_file(socket_path) {
@@ -439,11 +401,76 @@ fn prepare_socket_path(socket_path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// This process's uid, via the owner of /proc/self (the crate forbids
-/// unsafe code, so `libc::geteuid` is not an option).
-fn bridge_uid() -> std::io::Result<u32> {
+/// LD-15 proxy-dir gate: refuse a symlinked directory and one owned by a uid
+/// other than the bridge's. The relay runs as root, and following a link (or
+/// adopting a dir another uid prepared) would let task code aim the relay's
+/// filesystem writes wherever it likes.
+fn refuse_foreign_proxy_dir(parent: &Path, meta: &std::fs::Metadata) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
-    Ok(std::fs::metadata("/proc/self")?.uid())
+    if meta.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "proxy dir {} is a symlink; refusing to follow it",
+                parent.display()
+            ),
+        ));
+    }
+    let own_uid = bridge_uid()?;
+    if meta.uid() != own_uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "proxy dir {} is owned by uid {}; refusing to adopt a foreign directory",
+                parent.display(),
+                meta.uid()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// This process's effective uid, read from the `Uid:` line of
+/// `/proc/self/status` (the crate forbids unsafe code, so `libc::geteuid`
+/// is not an option).
+///
+/// LP-15: the *owner of `/proc/self`* is not a usable self-id source — a
+/// non-dumpable process has that directory owned by root while its own uid
+/// is something else. The status file itself stays world-readable whatever
+/// the process's dumpability, so its `Uid:` line still reports this
+/// process's real ids. NP-2 (run-204): the earlier LP-15 shape learned the
+/// uid by creating and unlinking a probe file inside a caller-supplied
+/// directory, which made a privileged self-identity check write into
+/// directories the task controls (the `/tmp/lunarwing-tool-proxy` squatting
+/// case and the task workspace on every split-mode spawn). Reading status
+/// needs no write and depends on no directory.
+///
+/// The second numeric field is the effective uid: a setuid launcher is
+/// root for the drop, and that is the identity the privilege-split gates
+/// must compare against.
+pub(crate) fn bridge_uid() -> std::io::Result<u32> {
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    let line = status
+        .lines()
+        .find(|line| line.starts_with("Uid:"))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "/proc/self/status carries no Uid: line",
+            )
+        })?;
+    let effective = line.split_whitespace().nth(2).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("cannot parse the effective uid from '{line}'"),
+        )
+    })?;
+    effective.parse::<u32>().map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("cannot parse the effective uid from '{line}': {error}"),
+        )
+    })
 }
 
 /// LD-15: under the WI#400 split the task process and its MCP shim run as
@@ -453,14 +480,18 @@ fn bridge_uid() -> std::io::Result<u32> {
 /// identity pinned (host dev runs and tests) the socket is left untouched.
 /// Never throws (EF-2): a failed handoff leaves the task without tools,
 /// not without a bridge.
+///
+/// LP-13: chmod BEFORE lchown — root changing the mode of a file it still
+/// owns needs no `CAP_FOWNER` (only the chown's `CAP_CHOWN` after it). The
+/// lchown-first order did need FOWNER and made the handoff depend on a
+/// capability the docs had marked droppable.
 fn hand_socket_to_task(socket_path: &Path, task_id: &str) {
     use std::os::unix::fs::PermissionsExt;
     let Ok(Some(ids)) = crate::executor::task_ids_from_env() else {
         return;
     };
-    let handoff = std::os::unix::fs::lchown(socket_path, Some(ids.0), Some(ids.1)).and_then(|()| {
-        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
-    });
+    let handoff = std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+        .and_then(|()| std::os::unix::fs::lchown(socket_path, Some(ids.0), Some(ids.1)));
     if let Err(e) = handoff {
         eprintln!(
             "[tool-proxy] task {task_id}: socket handoff to uid {} failed (task runs without tools): {e}",
@@ -745,6 +776,79 @@ mod tests {
 
     fn fake_hub() -> (Outbound, mpsc::UnboundedReceiver<Message>) {
         mpsc::unbounded_channel()
+    }
+
+    /// NP-2 (run-204): the bridge uid comes from the `Uid:` line of
+    /// /proc/self/status — a read, not a probe file created in a directory.
+    /// The pin runs the lookup in a child whose TMPDIR is a path UNDER a
+    /// regular file: creating anything there fails with ENOTDIR for EVERY
+    /// uid — root included (run-208 NT-3: a mode-0500 directory only
+    /// refused the probe on a non-root host, and CI plus the image build
+    /// run the suite as root) — so a probe-shaped implementation cannot
+    /// create its file there and fails, while the status read does not
+    /// care. The value must also equal the fsuid of a file this process
+    /// creates.
+    #[test]
+    fn bridge_uid_reads_self_status_without_writing_anywhere() {
+        use std::os::unix::fs::MetadataExt;
+        const CHILD_MARKER: &str = "PEBBLE_NP2_BRIDGE_UID_CHILD";
+        const TEST_PATH: &str =
+            "tool_proxy::tests::bridge_uid_reads_self_status_without_writing_anywhere";
+
+        let base = match std::env::var_os("NP2_BRIDGE_UID_BASE") {
+            Some(base) => std::path::PathBuf::from(base),
+            None => test_dir(),
+        };
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let blocker_parent = base.join("np2-blocker");
+            std::fs::create_dir_all(&blocker_parent).expect("create blocker parent dir");
+            // A regular file at the TMPDIR prefix: any file or directory
+            // creation under <blocker>/tmp fails with ENOTDIR for every
+            // uid, root included (run-208 NT-3).
+            let blocker = blocker_parent.join("blocker");
+            std::fs::write(&blocker, b"regular file").expect("write blocker file");
+            let notdir_tmp = blocker.join("tmp");
+            let exe = std::env::current_exe().expect("test binary path");
+            let out = std::process::Command::new(exe)
+                .args([TEST_PATH, "--exact", "--nocapture", "--test-threads=1"])
+                .env(CHILD_MARKER, "1")
+                // The child must not call test_dir(): its TMPDIR is the
+                // ENOTDIR path on purpose. It writes its witness under the
+                // parent's (writable) base instead.
+                .env("NP2_BRIDGE_UID_BASE", &base)
+                .env("TMPDIR", &notdir_tmp)
+                .env("TMP", &notdir_tmp)
+                .env("TEMP", &notdir_tmp)
+                .output()
+                .expect("run the child probe");
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success(),
+                "the uid lookup must work with an unusable TMPDIR (NP-2): {}{}",
+                String::from_utf8_lossy(&out.stderr),
+                text
+            );
+            assert!(
+                text.contains("NP2-BRIDGE-UID-OK"),
+                "the child never reported a uid: {text}"
+            );
+            std::fs::remove_dir_all(&base).ok();
+            return;
+        }
+
+        let base = std::path::PathBuf::from(
+            std::env::var_os("NP2_BRIDGE_UID_BASE").expect("parent passes the witness base"),
+        );
+        let uid = bridge_uid().expect("bridge uid from /proc/self/status");
+        let witness = base.join("witness");
+        std::fs::write(&witness, b"x").expect("write witness");
+        assert_eq!(
+            uid,
+            witness.metadata().expect("witness metadata").uid(),
+            "the status Uid: line must report this process's effective uid"
+        );
+        std::fs::remove_file(&witness).ok();
+        println!("NP2-BRIDGE-UID-OK {uid}");
     }
 
     async fn next_hub_frame(rx: &mut mpsc::UnboundedReceiver<Message>) -> Envelope {

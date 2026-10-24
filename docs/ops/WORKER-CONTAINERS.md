@@ -46,10 +46,24 @@ Each lane enforces the strip at its task-process boundary:
   its own copy. The one-shot `cli` and `acp` modes exec the task process the
   same way. Pinned by the worker entrypoint harness, which asserts both
   directions (serve sees it absent, bridge sees it present) plus every
-  one-shot mode.
+  one-shot mode. Both executors keep task `context.environment` on the request
+  only (run-209 NU-1): it is **not** merged into the bridge's `process.env`, so
+  no agent-chosen grant name (`options.credential_grants[].env_var` at
+  `create_job`) can alter shared bridge lazy reads (task identity, serve auth,
+  retry/heartbeat/abort knobs, tool-proxy timeout) or inject the hub credential.
+  On these lanes the values do not reach task code at all — the serve process
+  is started by the entrypoint with its own scrubbed environment — so an
+  opencode credential grant is currently ineffective; that residual and its
+  live-tenant confirmation are tracked as **WI#474**. The v1 serve-log scrub
+  still redacts the request's per-task values explicitly (run-92 FJ-6), not by
+  reading them back from `process.env`. Pinned per lane by the env sampled at
+  prompt time, asserting that neither the reserved names nor an ordinary grant
+  key ever lands in the shared env.
 - **Pebble** — `spawn_pebble` rebuilds the child env via `env_clear()` +
-  `strip_bridge_credentials` (everything else preserved: PATH, locale,
-  `PEBBLE_*` provider variables) and drops task-supplied re-injections.
+  `strip_bridge_reserved_env` (everything else preserved: PATH, locale,
+  `PEBBLE_*` provider variables) and drops task-supplied re-injections of the
+  same four reserved keys (`AGENT_AUTH_TOKEN`, `AGENT_AUTH_TOKEN_FILE` and the
+  two tool-proxy keys) before the child env is assembled.
   Pinned by a self-exec regression test that carries the token in the parent
   env and probes the real spawned environment through a stub. The one-shot
   `cli` mode execs under `env -u AGENT_AUTH_TOKEN` (harness-pinned) — this is
@@ -122,6 +136,28 @@ section and "Launch identity (WI#422)" further down.
   follow-up #11230). The ruling states the decision and no reason, so none
   is recorded here; treat the absence as settled and do not propose LP-7
   again without a fresh ruling.
+- **Run-170 leftovers landed (WI#449, item 86).** LP-11 pins the kimi/pebble
+  image-user refusals and the opencode/pebble Quadlet `UserNS=` keep-id
+  lines; LP-12 makes the LD-11 absolute-path pins failable; LP-13 is a fix —
+  the socket handoff now chmods before it chowns, so the mode change runs
+  while root still owns the socket and needs no `CAP_FOWNER` (the old
+  lchown-first order made the handoff depend on a droppable capability);
+  LP-14 restricts the `setpriv` resolver to absolute `PATH` entries and
+  extends the loader denylist to glibc's full unsafe-environment list
+  (`GCONV_PATH`/`GLIBC_TUNABLES`/`LOCPATH`/`NLSPATH`/`HOSTALIASES`/
+  `RES_OPTIONS`/`LOCALDOMAIN`/`TZDIR`/`MALLOC_TRACE`, matching in pebble's
+  `is_loader_env_key` and kimi's `dropLoaderEnv` — that parity is ME-3);
+  LP-15 learns the bridge uid from the `Uid:` line of `/proc/self/status`
+  rather than the owner of `/proc/self`, which reads as root for a
+  non-dumpable process; NP-1 makes the *unmapped-task-uid* `EINVAL` from
+  `fchown` permanent, classified at the `fchown` call itself in the kimi and
+  opencode lanes, because no re-dispatch can map the id. The swap-race
+  `EINVAL` that `realpathSync`'s lstat→readlink pair produces stays
+  transient: run-204 NP-1 showed a blanket `EINVAL` rule abandoned a
+  deliberate DS-2 retry, so the classification sits at the errno's source.
+  LP-7 stays declined per #11230.
+  The opencode2 lane's own credential-isolation migration remains WI#454's
+  (the non-root split, item 91) and is not part of these leftovers.
 - **Root-resolved commands come from root-owned PATH entries only
   (WI#454/ME-1).** The root-launcher images (kimi, opencode) carry NO
   task-owned directory in the image-wide `ENV PATH` — the task uid's
@@ -179,9 +215,17 @@ section and "Launch identity (WI#422)" further down.
   credential handoff is active, and `KIMI_TASK_RUNNER=skip` is the
   explicit operator escape hatch for host-side dev runs.** The runner
   never sees the hub credential: the token file is root-only `0400` and
-  the token var was unset before the runner spawn. A dead runner socket
-  maps to an error `task_result` (the hub is never stranded) and every
-  delegation rejection surfaces as an error result.
+  the token var was unset before the runner spawn. That unset is now an
+  **enforced contract, not a convention** (WI#454): the runner is the
+  environment store for task code, so `main()` refuses to start when
+  `AGENT_AUTH_TOKEN` or `AGENT_AUTH_TOKEN_FILE` is present and non-empty in
+  its own environment (`presentCredentialKeys` / `startupRefusal`). The
+  credential gate runs before the uid gate, so a root launch that also
+  leaked the token reports the actionable configuration error rather than
+  the uid one, and the gate is pinned in both uid shapes (the image test
+  gate runs as root, where the uid gate would otherwise answer first). A
+  dead runner socket maps to an error `task_result` (the hub is never
+  stranded) and every delegation rejection surfaces as an error result.
   - **Wire and bounds.** The runner acknowledges acceptance
     (`{"op":"accepted"}`), reports the CLI's process group
     (`{"op":"spawned"}`), streams progress and ends with exactly one

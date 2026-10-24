@@ -4,7 +4,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSyn
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { expandWorkspacePath, resolveTaskWorkspace } from "./workspace_path"
+import { expandWorkspacePath, isNonRetryableBootstrapErrno, resolveTaskWorkspace } from "./workspace_path"
 
 const workspaceRoot = "/workspace"
 
@@ -266,5 +266,72 @@ for (;;) {
     assert.deepEqual(readdirSync(decoy), ["x"])
   } finally {
     rmSync(hookRoot, { recursive: true, force: true })
+  }
+}
+
+// WI#449 NP-1 (run-170): EINVAL is a swap race in this bootstrap and
+// must stay transient. realpathSync's lstat-then-readlink pair raises EINVAL
+// when the task swaps a component from a symlink to a directory between the
+// two calls — abandoning the tick there would contradict DS-1's re-walk rule.
+// The one permanent EINVAL, fchown onto an unmapped task uid, is classified at
+// its source below.
+assert.equal(isNonRetryableBootstrapErrno("EINVAL"), false,
+  "the swap-race EINVAL must stay transient (DS-2, NP-1)")
+for (const code of ["ENOTDIR", "ELOOP", "EACCES", "EPERM"]) {
+  assert.equal(isNonRetryableBootstrapErrno(code), true, `${code} must stay permanent (DS-2)`)
+}
+for (const code of ["EMFILE", "ENFILE", "ENOMEM", "ENOSPC", "EDQUOT", "EIO", "ENOENT"]) {
+  assert.equal(isNonRetryableBootstrapErrno(code), false, `${code} must stay transient (DS-2)`)
+}
+assert.equal(isNonRetryableBootstrapErrno(undefined), false, "an errno-less failure is transient")
+
+// The unmapped-task-uid EINVAL IS permanent, classified where fchown raises it.
+// A host user namespace maps every id the suite can drop to, so the injected
+// chown raises the errno instead.
+{
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "lp16-opencode-")))
+  const previous = { uid: process.env.OPENCODE_TASK_UID, gid: process.env.OPENCODE_TASK_GID }
+  process.env.OPENCODE_TASK_UID = "12345"
+  process.env.OPENCODE_TASK_GID = "12345"
+  try {
+    assert.throws(
+      () => resolveTaskWorkspace({ project_dir: "missions/x", cron_tick: { event: "cron.tick" } }, root, {
+        chown: () => {
+          const error = new Error("invalid argument, chown") as NodeJS.ErrnoException
+          error.code = "EINVAL"
+          throw error
+        },
+      }),
+      (error: unknown) => {
+        const message = String(error)
+        assert.ok(message.includes("Invalid workspace path for cron tick"),
+          `the unmapped-uid fchown EINVAL must be permanent, got: ${message}`)
+        assert.ok(message.includes("unmapped in this user namespace"),
+          `the refusal must name the unmapped id, got: ${message}`)
+        return true
+      },
+    )
+    // Control: another fchown errno must stay transient.
+    assert.throws(
+      () => resolveTaskWorkspace({ project_dir: "missions/x", cron_tick: { event: "cron.tick" } }, root, {
+        chown: () => {
+          const error = new Error("no space left on device, chown") as NodeJS.ErrnoException
+          error.code = "ENOSPC"
+          throw error
+        },
+      }),
+      (error: unknown) => {
+        const message = String(error)
+        assert.ok(message.includes("Transient workspace error for cron tick"),
+          `a non-EINVAL fchown failure must stay transient, got: ${message}`)
+        return true
+      },
+    )
+  } finally {
+    if (previous.uid === undefined) delete process.env.OPENCODE_TASK_UID
+    else process.env.OPENCODE_TASK_UID = previous.uid
+    if (previous.gid === undefined) delete process.env.OPENCODE_TASK_GID
+    else process.env.OPENCODE_TASK_GID = previous.gid
+    rmSync(root, { recursive: true, force: true })
   }
 }
