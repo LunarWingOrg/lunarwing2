@@ -1347,7 +1347,12 @@ was closed on 2026-10-20 after its re-pass (zero/non-numeric task ids are
 refused everywhere identities parse); what stays open is
 its real-worker acceptance on rebuilt images and the opencode2 lane's own
 migration, filed as **WI#449** together with the run-170 leftovers
-(LP-11..LP-16; LP-7 declined by the maintainer on 2026-10-22), planned for
+(LP-11..LP-16; LP-7 declined by the maintainer on 2026-10-22). The LP
+leftovers landed in this release for kimi/opencode/opencode2/pebble (LP-11
+pins, LP-12 failable pins, LP-13 ordering note, LP-14 absolute-PATH +
+glibc loader denylist, LP-15 probe-file bridge uid, LP-16 `EINVAL`
+permanent in the cron bootstrap), with LP-7 staying out per that ruling;
+the opencode2 lane's own migration remains WI#449/WI#454's, planned for
 v2.1.7.0. Filed late and planned for
 v2.1.7.0, but live in this
 release: WI#440 (`generate_token` falls back to a predictable `date +%s`
