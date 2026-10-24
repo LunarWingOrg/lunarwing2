@@ -1344,7 +1344,10 @@ fn is_busy(reason: &str) -> bool {
 /// from a swap race) under `TRANSIENT_MARKER`; that explicit signal is
 /// checked first so a wrapped OS string that happens to contain a
 /// non-retryable substring (pebble's "could not be resolved under
-/// WORKSPACE_ROOT") cannot misclassify a transient failure.
+/// WORKSPACE_ROOT") cannot misclassify a transient failure. The wrapper
+/// decides: a lane that classifies an EINVAL at its source as permanent
+/// (the kimi/opencode fchown onto an unmapped task uid) reports it without
+/// the marker, so no marker set here needs to name EINVAL (NP-1).
 fn is_non_retryable(reason: &str) -> bool {
     if reason.contains(TRANSIENT_MARKER) {
         return false;
