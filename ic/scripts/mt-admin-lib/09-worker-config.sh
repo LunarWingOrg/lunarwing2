@@ -1977,10 +1977,15 @@ prepare_worker_workspace() {
   # below never restores tenant ownership), so exactly that second owner
   # is accepted there; anything else — e.g. another lane's workspace
   # renamed into this slot — is refused before any chown runs.
-  local leaf_uid root_uid
+  local leaf_uid root_uid leaf_owner_ok=no
   leaf_uid="$(stat -c %u "$workspace_dir" 2>/dev/null || printf -- -1)"
   root_uid="$(stat -c %u "$lw_root" 2>/dev/null || printf -- -2)"
-  if [[ "$leaf_uid" != "$root_uid" && ! ( "$MT_ROOTLESS" != "true" && "$leaf_uid" == "$container_uid" ) ]]; then
+  if [[ "$leaf_uid" == "$root_uid" ]]; then
+    leaf_owner_ok=yes
+  elif [[ "$MT_ROOTLESS" != "true" && "$leaf_uid" == "$container_uid" ]]; then
+    leaf_owner_ok=yes
+  fi
+  if [[ "$leaf_owner_ok" != yes ]]; then
     printf 'error: %s workspace not owned like the tenant root: %s\n' "$worker" "$workspace_dir" >&2
     return 1
   fi
