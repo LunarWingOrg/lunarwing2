@@ -1275,8 +1275,10 @@ are recorded in the audit doc's 2026-10-16 follow-up.
    opencode2 and pebble tool-proxy bridges, the WI#325 cron bootstrap, the
    WI#328
    control channel,
-   the WI#330 placeholder guards, the WI#373 credential strips, and the
-   WI#411/WI#412 kimi env/config pins all ship in the worker images.
+   the WI#330 placeholder guards, the WI#373 credential strips, the
+   WI#411/WI#412 kimi env/config pins, the WI#454 kimi task-runner
+   delegation machinery, and the WI#467 opencode models.dev snapshot pin
+   all ship in the worker images.
    Rebuild all four worker images (`build-<worker>-worker` or
    `build-tenant --with-<worker>`), promote each through the normal
    candidate → scan → promotion path, then `restart-tenant` each tenant.
@@ -1285,7 +1287,9 @@ are recorded in the audit doc's 2026-10-16 follow-up.
    serve-process tool-proxy plugin, and the executor's
    `session_move`/`session_rename` denies, the opencode image
    carries the WI#374 crash-line enrichment, the WI#373 credential strip,
-   and the WI#324 serve-process plugin, and the pebble image carries
+   the WI#324 serve-process plugin, and the WI#467 models.dev snapshot
+   pin (the build refuses to compile unless the committed snapshot hash
+   matches and the upstream reads it), and the pebble image carries
    WI#334, the WI#324 MCP shim registration
    (`PEBBLE_CONFIG_HOME=/etc/lunarwing/pebble`), and the reviewed-lock
    rustls + CVE-2026-111943 webpki upgrades; all four images also move
@@ -1293,7 +1297,8 @@ are recorded in the audit doc's 2026-10-16 follow-up.
    snapshot, which ships the fixed perl for the three CVEs
    `.gitlab/trivy-ignore` no longer suppresses (WI#361) — opencode stays
    v1.18.25, while opencode2 advances to v2.0.32
-   under WI#427. Skipping those rebuilds leaves WI#357 undeployed, the
+   under WI#427 and then v2.1.2 for goals item 83. Skipping those rebuilds
+   leaves WI#357 undeployed, the
    three WI#361 perl CVEs in the running images, and the opencode,
    opencode2 and pebble tool proxies unsurfaced. Preserve
    opencode2 state before the first new-version boot: upstream migrates its
