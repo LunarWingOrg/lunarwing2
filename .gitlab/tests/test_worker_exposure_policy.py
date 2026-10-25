@@ -569,7 +569,21 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
                 self.assertIn(reason, result.stderr)
         dockerfile.write_bytes(original)
 
-    def test_glued_continuation_splitting_a_token_is_refused(self):
+    def test_missing_dockerfile_names_the_real_cause(self):
+        # WI#425 GZ-2: a missing or unreadable Dockerfile used to surface as
+        # the misleading "contains NUL bytes" failure (the inline probe's
+        # open() raises before any byte is inspected; the `if !` branch then
+        # printed the NUL text). It failed closed; the message must now name
+        # the real cause. Mutation pin: removing the readability guard
+        # reverts the message to "NUL bytes".
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        original = dockerfile.read_bytes()
+        dockerfile.unlink()
+        result = self.run_guard(self.root)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("missing or unreadable", result.stderr)
+        self.assertNotIn("NUL bytes", result.stderr)
+        dockerfile.write_bytes(original)
         # Run-111 GZ-1: BuildKit keeps the character before a continuation
         # backslash and appends the next line with no separator, while the
         # guard joins with a space. `SHEL\` + `L [...]` therefore reached the
