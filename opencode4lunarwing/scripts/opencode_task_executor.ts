@@ -323,10 +323,13 @@ export async function executeTask(
     for (let attempt = 0; ; attempt++) {
       let sessionErrorMsg = ""
       const promptText = nextPrompt
-      // Streamed text/tool output for THIS turn attempt (MR !1537 DW-7): a
-      // turn whose assistant text is empty but whose tools produced output
-      // still banks that output, so a follow-up can't erase a tool-only main
-      // turn. Reset per attempt — failed attempts don't bank partial text.
+      // Streamed assistant text and COMPLETED-tool output for THIS turn
+      // attempt (MR !1537 DW-7): a turn whose assistant text is empty but
+      // whose tools produced output still banks that output, so a follow-up
+      // can't erase a tool-only main turn. Reset per attempt — failed
+      // attempts don't bank partial text. Tool ERRORS never join it
+      // (WI#386 EZ-2): a clean turn whose only part is a tool error must
+      // not bank the error line as its deliverable.
       let turnStreamed = ""
       // DW-10: a stale idle event (published by a previous turn, possibly
       // under both event names) must not end this turn before the session
@@ -398,8 +401,10 @@ export async function executeTask(
           if (part.type === "tool" && part.state?.status === "error") {
             const toolName = part.tool || "unknown"
             const delta = `[${toolName}] ERROR: ${part.state.error}`
+            // Diagnostics only (WI#386 EZ-2): tool errors stay in the
+            // progress stream and the raw accumulator, never in the banked
+            // turn, so they cannot become the deliverable.
             output += delta + "\n"
-            turnStreamed += delta + "\n"
             emitProgress(delta)
           }
         }
@@ -475,8 +480,11 @@ export async function executeTask(
 
       if (!promptError) {
         // Turn finished cleanly; bank its canonical text (DI-3) — or, when
-        // the assistant produced no text, this turn's streamed output (DW-7),
-        // so a tool-only main turn survives a later "status?" follow-up.
+        // the assistant produced no text, this turn's streamed assistant
+        // text / completed-tool output (DW-7), so a tool-only main turn
+        // survives a later "status?" follow-up. Tool errors and retry
+        // diagnostics never reach either fallback (WI#386 EZ-2): a clean
+        // turn with nothing but those resolves as an empty-output error.
         const turnText = extractAssistantText(promptData?.parts) || turnStreamed.trim() || turnToolOutput.trim()
         if (turnText) canonicalTurns.push(turnText)
         // A queued follow-up prompt (WI#328 runtime control channel)
