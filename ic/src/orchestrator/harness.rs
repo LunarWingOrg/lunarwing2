@@ -1367,6 +1367,31 @@ fn sanitize_display_path(raw: &str) -> String {
         .collect()
 }
 
+/// Scrub every mounted secret value out of a completed promotion summary
+/// (DZ-6). Accepted promotions already pass the content and now the path scan,
+/// but a structured leak detector gap, a hostile reason string, or a value
+/// that slipped past a best-effort scan must not survive in the audit event or
+/// the `wait=true` result surfaced to the parent. Redacts record/rejection
+/// paths and reasons, plus the skip reason.
+pub fn scrub_promotion_summary(summary: &mut PromotionSummary, redactor: &SecretValueRedactor) {
+    if !redactor.is_armed() {
+        return;
+    }
+    for record in &mut summary.records {
+        record.relative_path = redactor.scrub(&record.relative_path);
+        if let Some(backup) = &mut record.backup_path {
+            *backup = redactor.scrub(backup);
+        }
+    }
+    for rejection in &mut summary.rejections {
+        rejection.relative_path = redactor.scrub(&rejection.relative_path);
+        rejection.reason = redactor.scrub(&rejection.reason);
+    }
+    if let Some(reason) = &mut summary.skip_reason {
+        *reason = redactor.scrub(reason);
+    }
+}
+
 /// Scan the staging dir and partition files into promotable writes and
 /// rejections. Enforces normalized path discipline, the hard-deny set, the
 /// (narrowed) root allowlist, size/count limits, UTF-8, the leak scan, and
@@ -1426,7 +1451,18 @@ pub fn plan_promotion(
             total_bytes: &mut total_bytes,
         }) {
             Ok(write) => plan.accepted.push(write),
-            Err(reason) => plan.reject(relative, reason),
+            Err(reason) => {
+                // DZ-6: rejection paths are container-controlled strings that
+                // land verbatim in the `harness_write_back` audit event and
+                // the `wait=true` result. Scrub the recorded path against the
+                // job's own mounted values at the source — a file NAMED after
+                // a secret must not re-leak it through its rejection record.
+                let display = match redactor {
+                    Some(r) => r.scrub(&relative),
+                    None => relative,
+                };
+                plan.reject(display, reason);
+            }
         }
     }
     Ok(plan)
@@ -1512,6 +1548,15 @@ fn screen_staged_file(input: ScreenInput<'_>) -> Result<StagedWrite, String> {
         normalize_harness_path(input.relative).map_err(|e| format!("invalid staged path: {e}"))?;
     if let Some(reason) = write_back_deny_reason(&relative) {
         return Err(reason.to_string());
+    }
+    // DZ-6: staged PATHS are as much an exfiltration channel as content — a
+    // job can name a file after a mounted secret value, and that name lands
+    // in the `harness_write_back` audit event and the `wait=true` result.
+    // Reject before any read so the value never reaches the write set.
+    if let Some(redactor) = input.redactor
+        && redactor.contains_secret(&relative)
+    {
+        return Err("staged path embeds a mounted worker secret value".to_string());
     }
     if !input.policy.root_allows(&relative) {
         return Err(format!(
@@ -2225,6 +2270,95 @@ mod tests {
                 .any(|r| r.relative_path == "projects/dirty.md"
                     && r.reason.contains("worker secret"))
         );
+    }
+
+    #[test]
+    fn promotion_rejects_staged_paths_embedding_mounted_secrets() {
+        // DZ-6: a staged file NAMED after a mounted secret value must be
+        // rejected before the name reaches the write set — it would otherwise
+        // land verbatim in the `harness_write_back` audit event and the
+        // `wait=true` result. The rejection record must not re-leak the name.
+        let secret = "harness-staged-path-fixture-value";
+        let tmp = staging_with(&[
+            ("projects/clean.md", "fine"),
+            (format!("projects/{secret}.md").as_str(), "content"),
+        ]);
+        let redactor = SecretValueRedactor::new(&[SecretString::from(secret.to_string())]);
+        let plan =
+            plan_promotion(tmp.path(), &WriteBackPolicy::default(), Some(&redactor)).unwrap(); // safety: test
+        assert_eq!(plan.accepted.len(), 1, "clean file only: {plan:?}");
+        assert_eq!(plan.accepted[0].relative_path, "projects/clean.md");
+        assert!(
+            plan.rejections
+                .iter()
+                .any(|r| r.reason
+                    == "staged path embeds a mounted worker secret value"),
+            "the secret-named staged file must be rejected by the path scan, got {plan:?}"
+        );
+        // The secret value must never appear in the recorded rejection.
+        for rejection in &plan.rejections {
+            assert!(
+                !rejection.relative_path.contains(secret),
+                "rejection path leaked the secret: {}",
+                rejection.relative_path
+            );
+            assert!(
+                !rejection.reason.contains(secret),
+                "rejection reason leaked the secret: {}",
+                rejection.reason
+            );
+        }
+    }
+
+    #[test]
+    fn scrub_promotion_summary_redacts_leaked_paths_and_reasons() {
+        // DZ-6 backstop: even if a value slips past the path/content scans
+        // (best-effort redaction is not a boundary), the audit event and
+        // `wait=true` result must not persist or surface it. The stored
+        // summary is scrubbed in place before it is persisted or attached to
+        // the handle.
+        let secret = "harness-summary-scrub-fixture-value";
+        let redactor =
+            SecretValueRedactor::new(&[SecretString::from(secret.to_string())]);
+        let mut summary = PromotionSummary {
+            records: vec![PromotionRecord {
+                relative_path: format!("projects/{secret}.md"),
+                sha256: "deadbeef".to_string(),
+                previous_sha256: None,
+                backup_path: Some(format!("backups/harness/x/{secret}.md")),
+                size_bytes: 4,
+                job_id: Uuid::new_v4(),
+                owner_id: "owner".to_string(),
+                promoted_at: Utc::now(),
+            }],
+            rejections: vec![PromotionRejection {
+                relative_path: format!("projects/{secret}-other.md"),
+                reason: format!("rejected because {secret}"),
+            }],
+            dropped_rejections: 0,
+            skipped: true,
+            skip_reason: Some(format!("skipped over {secret}")),
+        };
+        scrub_promotion_summary(&mut summary, &redactor);
+        let serialized = serde_json::to_string(&summary).unwrap(); // safety: test
+        assert!(
+            !serialized.contains(secret),
+            "scrubbed summary still carries the secret: {serialized}"
+        );
+        assert_eq!(summary.records[0].owner_id, "owner");
+        assert!(serialized.contains("[redacted-secret]"));
+    }
+
+    #[test]
+    fn scrub_promotion_summary_is_a_noop_for_unarmed_redactors() {
+        let mut summary = PromotionSummary {
+            skipped: true,
+            skip_reason: Some("plain reason".to_string()),
+            ..Default::default()
+        };
+        let redactor = SecretValueRedactor::new(&[]);
+        scrub_promotion_summary(&mut summary, &redactor);
+        assert_eq!(summary.skip_reason.as_deref(), Some("plain reason"));
     }
 
     #[test]
