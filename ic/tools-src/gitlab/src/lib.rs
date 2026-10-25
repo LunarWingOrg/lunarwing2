@@ -5,6 +5,7 @@
 
 mod api;
 mod gitlab;
+mod params;
 mod types;
 
 use types::GitlabAction;
@@ -45,27 +46,56 @@ impl exports::lunarwing::agent::tool::Guest for GitlabTool {
          use project-local iid values. Token is injected by LunarWing and never exposed \
          to WASM. List responses carry explicit pagination metadata. Use list_issues \
          with all_pages=true for classic issues, or list_work_items with all_pages=true \
-         for a bounded, single-approval inventory across Issue and Task types. Calls \
-         require approval unless you choose to always allow this tool."
+         for a bounded, single-approval inventory across Issue and Task types. \
+         search_blobs takes optional ref (branch, tag, or commit SHA) and searches \
+         only the project's default branch when it is omitted, so branch-only files \
+         need ref. Bad parameter names are rejected with the action's valid set. \
+         Calls require approval unless you choose to always allow this tool."
             .to_string()
     }
 }
 
 fn execute_inner(params: &str) -> Result<String, String> {
-    let action = parse_action(params).map_err(|error| {
-        lunarwing::agent::host::log(
-            lunarwing::agent::host::LogLevel::Warn,
-            "GitLab tool parameter validation failed",
-        );
-        format!(
-            "Invalid GitLab parameters: {error}. Expected {{\"action\":\"<name>\",...}}; call tool_info for schema."
-        )
-    })?;
+    execute_with(params, gitlab::GitlabClient::load)
+}
+
+/// Host logging goes through wit imports that only exist inside a wasm
+/// runtime — calling them natively aborts the process. The native test seam
+/// (`execute_with` with an injected loader) no-ops both log sites (run-214
+/// NX-6); every other host call (`secret_exists`, `workspace_read`,
+/// `http_request`) stays behind the injected loader or the recording client.
+#[cfg(not(test))]
+fn log_validation_failed() {
+    lunarwing::agent::host::log(
+        lunarwing::agent::host::LogLevel::Warn,
+        "GitLab tool parameter validation failed",
+    );
+}
+
+#[cfg(not(test))]
+fn log_dispatched(action: &str) {
     lunarwing::agent::host::log(
         lunarwing::agent::host::LogLevel::Info,
-        &format!("GitLab action dispatched: {}", action_name(&action)),
+        &format!("GitLab action dispatched: {action}"),
     );
-    let client = gitlab::GitlabClient::load()?;
+}
+
+#[cfg(test)]
+fn log_validation_failed() {}
+
+#[cfg(test)]
+fn log_dispatched(_action: &str) {}
+
+/// `execute_inner` with an injectable client loader (run-214 NX-6): the
+/// dispatch itself can be pinned end to end — a recording client asserts the
+/// exact request URL, and a panicking loader pins the validate-first order.
+fn execute_with(
+    params: &str,
+    load: impl FnOnce() -> Result<gitlab::GitlabClient, String>,
+) -> Result<String, String> {
+    let action = validated_action(params).inspect_err(|_| log_validation_failed())?;
+    log_dispatched(action_name(&action));
+    let client = load()?;
 
     let result = match action {
         GitlabAction::CurrentUser {} => api::current_user(&client)?,
@@ -297,9 +327,10 @@ fn execute_inner(params: &str) -> Result<String, String> {
         GitlabAction::SearchBlobs {
             project,
             query,
+            ref_,
             per_page,
             page,
-        } => api::search_blobs(&client, &project, &query, per_page, page)?,
+        } => api::search_blobs(&client, &project, &query, ref_.as_deref(), per_page, page)?,
         GitlabAction::ListPipelines {
             project,
             status,
@@ -342,6 +373,47 @@ fn parse_action(params: &str) -> Result<GitlabAction, String> {
     } else {
         Err(format!("unknown field(s): {}", unknown.join(", ")))
     }
+}
+
+/// Whole pre-dispatch path, with no host capability calls for **name and
+/// schema errors**: `execute_inner` runs it before `GitlabClient::load`, so
+/// those rejections can neither prompt for a token nor issue an HTTP
+/// request. Value checks (blank strings, enum choices, change guards) run
+/// inside the `api::*` functions after the client loads, so with no token
+/// configured a value error answers with the token message instead of the
+/// value message — no HTTP request is sent either way (run-214 NX-7).
+///
+/// One approval covers parameter errors as well as HTTP calls, so a
+/// rejection must teach the caller how to retry in a single message. Field
+/// names are checked before serde: its strict-schema rejection names only
+/// the offending field, not the names that would work (WI#315).
+fn validated_action(params: &str) -> Result<GitlabAction, String> {
+    params::validate(params).map_err(|error| format!("Invalid GitLab parameters: {error}"))?;
+    parse_action(params).map_err(|error| {
+        // Serde's internally tagged enum reports e.g. `invalid type: string
+        // "seven", expected u64` with no path, so the caller cannot tell
+        // which parameter is at fault. Naming the action's parameter set
+        // here as well turns that into a usable correction.
+        let valid = action_param_hint(params);
+        format!(
+            "Invalid GitLab parameters: {error}.{valid} Expected {{\"action\":\"<name>\",...}}; call tool_info for schema."
+        )
+    })
+}
+
+fn action_param_hint(params: &str) -> String {
+    let action = serde_json::from_str::<serde_json::Value>(params)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("action")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        });
+    action
+        .and_then(|action| params::valid_params(&action))
+        .map(|valid| format!(" Valid for this action: [{}].", valid.join(", ")))
+        .unwrap_or_default()
 }
 
 /// `body` is an accepted alias for the `description` field of issue write
@@ -424,8 +496,188 @@ export!(GitlabTool);
 mod tests {
     use schemars::schema_for;
 
-    use super::parse_action;
     use super::types::GitlabAction;
+    use super::{execute_with, parse_action, validated_action};
+
+    /// The full execute path must reject a wrong parameter name before any
+    /// host capability (token, workspace, HTTP) is touched, and the message
+    /// the caller sees must carry the actionable rename and valid set.
+    #[test]
+    fn validated_action_rejects_wrong_params_actionably() {
+        let error = validated_action(
+            r#"{"action":"get_file_content","project":"g/p","path":"a.txt","branch":"feature"}"#,
+        )
+        .expect_err("branch must be rejected");
+        assert_eq!(
+            error,
+            "Invalid GitLab parameters: branch not valid for get_file_content; use ref. Valid: [project, path, ref]"
+        );
+
+        let error = validated_action(r#"{"action":"list_projects","query":"lunarwing"}"#)
+            .expect_err("query must be rejected");
+        assert!(error.contains("use search"), "{error}");
+        assert!(
+            error.contains("Valid: [per_page, page, search, membership]"),
+            "{error}"
+        );
+
+        let error = validated_action(r#"{"action":"nope"}"#).expect_err("unknown action");
+        assert!(error.contains("Valid actions: [current_user"), "{error}");
+    }
+
+    /// Type/enum errors keep the schema message (the field name is valid,
+    /// only its value is wrong) and carry the tool_info pointer.
+    #[test]
+    fn validated_action_keeps_value_errors_in_the_schema_path() {
+        let error = validated_action(r#"{"action":"get_issue","project":"g/p","iid":"seven"}"#)
+            .expect_err("iid must be an integer");
+        assert!(error.contains("Invalid GitLab parameters:"), "{error}");
+        assert!(error.contains("call tool_info for schema"), "{error}");
+        assert!(error.contains("expected u64"), "{error}");
+        assert!(
+            error.contains("Valid for this action: [project, iid]."),
+            "{error}"
+        );
+
+        let error = validated_action(
+            r#"{"action":"create_issue","project":"g/p","title":"t","body":"a","description":"b"}"#,
+        )
+        .expect_err("body+description must conflict");
+        assert!(error.contains("body and description"), "{error}");
+    }
+
+    /// A correct call still reaches deserialization; search_blobs keeps ref.
+    #[test]
+    fn validated_action_accepts_branch_scoped_search() {
+        let action = validated_action(
+            r#"{"action":"search_blobs","project":35,"query":"TODO","ref":"feature/wi-315","per_page":50}"#,
+        )
+        .unwrap_or_else(|error| panic!("valid search must parse: {error}"));
+        let GitlabAction::SearchBlobs {
+            project,
+            ref_,
+            per_page,
+            ..
+        } = action
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(project, "35");
+        assert_eq!(ref_.as_deref(), Some("feature/wi-315"));
+        assert_eq!(per_page, 50);
+    }
+
+    /// NX-6: the WI#315 regression — `ref` silently dropped and the search
+    /// run against the default branch — must be un-reintroducible at the
+    /// dispatch level, not just in the endpoint builder. A recording client
+    /// asserts the exact URL the full execute path issues, with and without
+    /// a ref.
+    #[test]
+    fn search_blobs_ref_reaches_the_dispatched_request_url() {
+        let recorded = super::gitlab::recorder();
+        let client = super::gitlab::GitlabClient::recording(recorded.clone());
+        let outcome = execute_with(
+            r#"{"action":"search_blobs","project":35,"query":"TODO","ref":"feature/wi-315","per_page":50}"#,
+            move || Ok(client),
+        );
+        assert!(
+            outcome
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.contains("recording client")),
+            "the recording client must short-circuit the request: {outcome:?}"
+        );
+        let requests = recorded.lock().expect("recorder lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "GET");
+        assert_eq!(
+            requests[0].1,
+            "/projects/35/search?scope=blobs&search=TODO&per_page=50&page=1&ref=feature%2Fwi-315",
+            "the dispatched request URL must carry the encoded ref"
+        );
+        drop(requests);
+
+        // Omitting ref must stay a true default-branch search: no &ref= at all.
+        let recorded = super::gitlab::recorder();
+        let client = super::gitlab::GitlabClient::recording(recorded.clone());
+        execute_with(
+            r#"{"action":"search_blobs","project":35,"query":"TODO","per_page":50}"#,
+            move || Ok(client),
+        )
+        .expect_err("the recording client errors instead of sending");
+        let requests = recorded.lock().expect("recorder lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "GET");
+        assert_eq!(
+            requests[0].1, "/projects/35/search?scope=blobs&search=TODO&per_page=50&page=1",
+            "no ref may be appended when the caller omits it"
+        );
+    }
+
+    /// NX-6: a parameter rejection must run before the client loads — the
+    /// promise in `validated_action`'s doc comment is pinned by a loader
+    /// that would abort the test if it ever ran for rejected parameters.
+    #[test]
+    fn validation_precedes_the_client_load() {
+        let outcome = execute_with(
+            r#"{"action":"get_file_content","project":"g/p","path":"a.txt","branch":"feature"}"#,
+            || -> Result<super::gitlab::GitlabClient, String> {
+                panic!("the loader must not run when parameters are rejected")
+            },
+        );
+        let error = outcome.expect_err("the bad parameter name must be rejected");
+        assert!(
+            error.contains("branch not valid for get_file_content"),
+            "unexpected outcome: {error}"
+        );
+    }
+
+    /// Regression guard for the WI#315 pre-validation pass: a canonical call
+    /// for every action must still deserialize. A validator that accepted
+    /// the name but broke the alias or required-field path would otherwise
+    /// only be caught on a live tenant.
+    #[test]
+    fn validated_action_accepts_a_canonical_call_for_every_action() {
+        for input in [
+            r#"{"action":"current_user"}"#,
+            r#"{"action":"list_projects","search":"lunarwing","membership":true}"#,
+            r#"{"action":"get_project","project":35}"#,
+            r#"{"action":"create_project","name":"demo"}"#,
+            r#"{"action":"list_issues","project":"g/p","all_pages":true}"#,
+            r#"{"action":"get_issue","project":"g/p","iid":1}"#,
+            r#"{"action":"get_work_item","project":"g/p","iid":1}"#,
+            r#"{"action":"list_work_items","project":"g/p","cursor":"abc","all_pages":true}"#,
+            r#"{"action":"create_issue","project":"g/p","title":"t","body":"b"}"#,
+            r#"{"action":"update_issue","project":"g/p","iid":1,"description":"d"}"#,
+            r#"{"action":"list_issue_notes","project":"g/p","iid":1}"#,
+            r#"{"action":"create_issue_note","project":"g/p","iid":1,"body":"b"}"#,
+            r#"{"action":"list_merge_requests","project":"g/p","state":"merged"}"#,
+            r#"{"action":"get_merge_request","project":"g/p","iid":1}"#,
+            r#"{"action":"create_merge_request","project":"g/p","source_branch":"a","target_branch":"b","title":"t"}"#,
+            r#"{"action":"update_merge_request","project":"g/p","iid":1,"title":"t"}"#,
+            r#"{"action":"list_mr_notes","project":"g/p","iid":1}"#,
+            r#"{"action":"create_mr_note","project":"g/p","iid":1,"body":"b"}"#,
+            r#"{"action":"approve_merge_request","project":"g/p","iid":1,"sha":"abc"}"#,
+            r#"{"action":"merge_merge_request","project":"g/p","iid":1,"sha":"abc"}"#,
+            r#"{"action":"list_branches","project":"g/p","search":"feat"}"#,
+            r#"{"action":"get_branch","project":"g/p","branch":"main"}"#,
+            r#"{"action":"create_branch","project":"g/p","branch":"b","ref":"main"}"#,
+            r#"{"action":"delete_branch","project":"g/p","branch":"b"}"#,
+            r#"{"action":"get_file_content","project":"g/p","path":"a.txt","ref":"main"}"#,
+            r#"{"action":"create_or_update_file","project":"g/p","path":"a.txt","branch":"b","content":"YQ==","commit_message":"m","last_commit_id":"abc"}"#,
+            r#"{"action":"delete_file","project":"g/p","path":"a.txt","branch":"b","commit_message":"m","last_commit_id":"abc"}"#,
+            r#"{"action":"search_projects","query":"lunarwing"}"#,
+            r#"{"action":"search_issues","project":"g/p","query":"regression"}"#,
+            r#"{"action":"search_blobs","project":"g/p","query":"TODO","ref":"main"}"#,
+            r#"{"action":"search_blobs","project":"g/p","query":"TODO"}"#,
+            r#"{"action":"list_pipelines","project":"g/p","status":"success","ref":"main"}"#,
+            r#"{"action":"get_pipeline","project":"g/p","pipeline_id":1}"#,
+            r#"{"action":"list_jobs","project":"g/p","pipeline_id":1}"#,
+        ] {
+            validated_action(input)
+                .unwrap_or_else(|error| panic!("canonical call rejected for {input}: {error}"));
+        }
+    }
 
     #[test]
     fn generated_schema_lists_action_discriminator() {
@@ -440,6 +692,33 @@ mod tests {
     fn action_parser_rejects_unknown_fields() {
         let input = r#"{"action":"current_user","token":"must-not-be-accepted"}"#;
         assert!(parse_action(input).is_err());
+    }
+
+    #[test]
+    fn search_blobs_accepts_optional_ref() {
+        let action = parse_action(
+            r#"{"action":"search_blobs","project":"group/repo","query":"TODO","ref":"feature/wi-315"}"#,
+        )
+        .unwrap_or_else(|error| panic!("ref must be accepted: {error}"));
+        let GitlabAction::SearchBlobs {
+            project,
+            query,
+            ref_,
+            ..
+        } = action
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(project, "group/repo");
+        assert_eq!(query, "TODO");
+        assert_eq!(ref_.as_deref(), Some("feature/wi-315"));
+
+        let action = parse_action(r#"{"action":"search_blobs","project":35,"query":"TODO"}"#)
+            .unwrap_or_else(|error| panic!("default branch call must stay valid: {error}"));
+        let GitlabAction::SearchBlobs { ref_, .. } = action else {
+            panic!("wrong variant");
+        };
+        assert!(ref_.is_none());
     }
 
     #[test]

@@ -266,6 +266,12 @@ pub enum GitlabAction {
         #[serde(alias = "project_id", deserialize_with = "deserialize_project")]
         project: String,
         query: String,
+        /// Branch or tag to search, passed to GitLab's project search `ref`
+        /// filter. GitLab searches the project's default branch when this is
+        /// omitted, so a file that exists only on a feature branch is
+        /// invisible without it (WI#315).
+        #[serde(rename = "ref", default)]
+        ref_: Option<String>,
         #[serde(default = "default_per_page")]
         per_page: u32,
         #[serde(default = "default_page")]
