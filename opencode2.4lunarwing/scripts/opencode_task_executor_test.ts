@@ -392,7 +392,10 @@ await executeTask(
 )
 assert.equal(toolResults[0]!.status, "success")
 assert.match(toolResults[0]!.output, /\[bash\] completed/)
-assert.match(toolResults[0]!.output, /\[edit\] ERROR: boom/)
+// WI#386 (EZ-2): the failed tool's error line is a diagnostic. It stays in
+// the progress stream, never in the success deliverable.
+assert.match(toolProgress.join("\n"), /\[edit\] ERROR: boom/)
+assert.doesNotMatch(toolResults[0]!.output, /\[edit\] ERROR: boom/)
 
 const otherSessionEvents = makeSdk({
   events: [
@@ -471,6 +474,133 @@ if (savedRetryDelay === undefined) {
   delete process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS
 } else {
   process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS = savedRetryDelay
+}
+
+// WI#386: diagnostics never decide success. The success output is completed
+// output only — canonical assistant text, the final attempt's streamed text,
+// or completed tool output banked across the turn's retries.
+{
+  const savedDelay = process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS
+  process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS = "0"
+  const toolErrorEvent = {
+    type: "session.tool.failed",
+    data: { sessionID: "session-1", id: "tool-1/run/bash", error: { message: "permission denied" } },
+  }
+  const toolSuccessEvent = {
+    type: "session.tool.success",
+    data: { sessionID: "session-1", id: "tool-1/run/bash" },
+  }
+  try {
+    // EZ-2: a clean turn whose only stream is a tool ERROR is not a
+    // deliverable; the error line stays in the progress stream.
+    {
+      const sdk = makeSdk({
+        events: [
+          toolErrorEvent,
+          { type: "session.execution.succeeded", data: { sessionID: "session-1" } },
+        ],
+        messages: [],
+      })
+      const progress: string[] = []
+      const results: Array<{ status: string; output: string; error: string | null }> = []
+      await executeTask(
+        { task_id: "wi386-tool-error-only", prompt: "build" },
+        (delta) => progress.push(delta.delta),
+        (result) => results.push(result), undefined, sdk.sdk,
+      )
+      assert.equal(results.length, 1)
+      assert.equal(results[0]!.status, "error", "a tool error must not manufacture success")
+      assert.equal(results[0]!.error, "opencode completed without assistant text or tool output")
+      assert.match(progress.join("\n"), /\[bash\] ERROR: permission denied/)
+      assert.equal(results[0]!.output, "")
+    }
+
+    // EZ-2 + ER-3: the same turn with a denied permission reports the denial.
+    {
+      const sdk = makeSdk({
+        events: [
+          {
+            type: "permission.asked",
+            data: { id: "wi386-perm", sessionID: "session-1", action: "edit", resources: ["*"] },
+          },
+          toolErrorEvent,
+          { type: "session.execution.succeeded", data: { sessionID: "session-1" } },
+        ],
+        messages: [],
+      })
+      const result = await runTask(sdk.sdk, { task_id: "wi386-denied", prompt: "build" })
+      assert.equal(result.status, "error", "a denied permission plus a tool error is not success")
+      assert.match(result.error!, /1 permission request\(s\).*denied/)
+    }
+
+    // ER-6: retry diagnostics only, then a clean EMPTY retry → error.
+    {
+      const sdk = makeSdk({
+        events: [
+          {
+            type: "session.execution.failed",
+            data: { sessionID: "session-1", error: { message: "No provider available" } },
+          },
+          { type: "session.execution.succeeded", data: { sessionID: "session-1" } },
+        ],
+        messages: [],
+      })
+      const result = await runTask(sdk.sdk, { task_id: "wi386-retry-only", prompt: "build" })
+      assert.equal(sdk.promptArgs.length, 2)
+      assert.equal(result.status, "error", "retry diagnostics must not manufacture success")
+      assert.equal(result.error, "opencode completed without assistant text or tool output")
+    }
+
+    // ER-6: a tool-only attempt that fails retryably, then a clean EMPTY
+    // retry → success with the completed tool output as the deliverable, and
+    // no diagnostics in it.
+    {
+      const sdk = makeSdk({
+        events: [
+          toolSuccessEvent,
+          {
+            type: "session.execution.failed",
+            data: { sessionID: "session-1", error: { message: "No provider available" } },
+          },
+          { type: "session.execution.succeeded", data: { sessionID: "session-1" } },
+        ],
+        messages: [],
+      })
+      const result = await runTask(sdk.sdk, { task_id: "wi386-tool-retry", prompt: "build" })
+      assert.equal(sdk.promptArgs.length, 2)
+      assert.equal(result.status, "success")
+      assert.equal(result.error, null)
+      assert.equal(result.output, "[bash] completed")
+      assert.doesNotMatch(result.output, /No provider available/)
+      assert.doesNotMatch(result.output, /Transient provider failure/)
+    }
+
+    // ER-6 + ER-3: a denied permission, one transient retry, and a clean
+    // EMPTY turn → error carrying the denied-permission message.
+    {
+      const sdk = makeSdk({
+        events: [
+          {
+            type: "permission.asked",
+            data: { id: "wi386-perm-retry", sessionID: "session-1", action: "edit", resources: ["*"] },
+          },
+          {
+            type: "session.execution.failed",
+            data: { sessionID: "session-1", error: { message: "No provider available" } },
+          },
+          { type: "session.execution.succeeded", data: { sessionID: "session-1" } },
+        ],
+        messages: [],
+      })
+      const result = await runTask(sdk.sdk, { task_id: "wi386-denied-retry", prompt: "build" })
+      assert.equal(sdk.promptArgs.length, 2)
+      assert.equal(result.status, "error")
+      assert.match(result.error!, /Task performed no actions: 1 permission request\(s\).*denied/)
+    }
+  } finally {
+    if (savedDelay === undefined) delete process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS
+    else process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS = savedDelay
+  }
 }
 
 const permission = makeSdk({

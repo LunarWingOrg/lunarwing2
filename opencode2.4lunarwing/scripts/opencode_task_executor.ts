@@ -315,9 +315,22 @@ export async function executeTask(
       [Symbol.asyncIterator]()
     closeEvents = () => void eventIterator.return?.()
     let executionError = ""
+    // WI#386: completed tool output of the current turn, accumulated across
+    // its retry attempts. turnStreamed resets per attempt, so a tool-only
+    // turn whose first attempt produced output and then failed retryably
+    // would otherwise bank nothing when the clean retry is silent. Only
+    // completed tools count — never tool errors, partial text, or retry
+    // diagnostics — so a failing attempt cannot manufacture success.
+    let turnToolOutput = ""
+    // Streamed assistant text and COMPLETED-tool output of the current
+    // attempt. Reset per attempt: a failed attempt's partial text must not
+    // bank. Tool errors and retry diagnostics never join it (WI#386), so a
+    // clean turn whose only stream is diagnostics is not a deliverable.
+    let turnStreamed = ""
 
     for (let attempt = 0; ; attempt++) {
       let sessionErrorMsg = ""
+      turnStreamed = ""
       const promptText = attempt === 0 ? buildTaskPrompt(request) : RETRY_PROMPT
       // Attach rejection handling immediately so a provider/API error cannot
       // become an unhandled rejection while the SSE loop is still draining.
@@ -378,6 +391,7 @@ export async function executeTask(
           const delta: unknown = event.data?.delta
           if (typeof delta === "string" && delta) {
             output += delta
+            turnStreamed += delta
             emitProgress(delta)
           }
           continue
@@ -390,11 +404,15 @@ export async function executeTask(
             typeof toolID === "string" && toolID.includes("/") ? toolID.split("/").pop() : toolID
           if (event.type === "session.tool.failed") {
             const delta = `[${toolName ?? "tool"}] ERROR: ${eventErrorMessage(event)}`
+            // Diagnostics only: kept in the raw accumulator and the progress
+            // stream, never banked as the turn's deliverable (WI#386).
             output += delta + "\n"
             emitProgress(delta)
           } else {
             const delta = `[${toolName ?? "tool"}] completed`
             output += delta + "\n"
+            turnStreamed += delta + "\n"
+            turnToolOutput += delta + "\n"
             emitProgress(delta)
           }
           continue
@@ -445,7 +463,13 @@ export async function executeTask(
     }
 
     const canonicalOutput = await fetchAssistantText(sdk, sessionID)
-    const resultOutput = canonicalOutput || output.trim()
+    // WI#386: the success decision uses completed output only — canonical
+    // assistant text, the final attempt's streamed assistant text, or
+    // completed tool output banked across the turn's retries. The raw
+    // accumulator still carries retry notes and tool errors, but those are
+    // diagnostics: they feed the progress stream and the failure paths,
+    // never the deliverable or the success decision.
+    const resultOutput = canonicalOutput || turnStreamed.trim() || turnToolOutput.trim()
     const durationMs = Date.now() - startTime
 
     // If every permission was denied and the task produced no output, it did
