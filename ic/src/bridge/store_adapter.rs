@@ -2341,7 +2341,7 @@ mod tests {
         let mut research = Project::new("u", "research", "r");
         research.created_at = chrono::Utc::now() - chrono::Duration::hours(5);
         let default = Project::new("u", "default", "d");
-        let refs = vec![&research, &default];
+        let refs = [&research, &default];
         assert_eq!(
             canonical_default_project("u", &refs).map(|project| project.id),
             Some(default.id)
