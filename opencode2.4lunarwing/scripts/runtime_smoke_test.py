@@ -338,8 +338,16 @@ class CliWiringTests(unittest.TestCase):
             rc = smoke.main(["--profile", "build", "--root", root])
             self.assertEqual(rc, 1)
 
-    def test_container_profile_requires_a_name(self) -> None:
-        self.assertEqual(smoke.main(["--profile", "container"]), 2)
+    def test_remote_profile_requires_a_name(self) -> None:
+        self.assertEqual(smoke.main(["--profile", "remote"]), 2)
+
+    def test_container_profile_is_local(self) -> None:
+        # `--profile container` runs inside the worker: the same fixture root
+        # checks apply, so the clean tree passes without a runtime binary.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._fixture_root(directory)
+            rc = smoke.main(["--profile", "container", "--root", root])
+            self.assertEqual(rc, 0)
 
     def test_json_output_is_parseable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -415,9 +415,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--profile",
-        choices=("build", "container"),
+        choices=("build", "container", "remote"),
         default="build",
-        help="build: inspect this image; container: inspect a live worker container",
+        help=(
+            "build: inspect this image; container: run inside the worker "
+            "container (podman exec); remote: drive a container from the host"
+        ),
     )
     parser.add_argument(
         "--root",
@@ -427,7 +430,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--container",
         default="",
-        help="container profile: worker container name (default lunarwing-opencode2-<tenant>)",
+        help="remote profile: worker container to inspect",
     )
     parser.add_argument(
         "--runtime",
@@ -456,10 +459,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    if args.profile == "container":
+    if args.profile == "remote":
         if not args.container:
             print(
-                "runtime-smoke: --container is required for --profile container",
+                "runtime-smoke: --container is required for --profile remote",
                 file=sys.stderr,
             )
             return 2
