@@ -131,8 +131,20 @@ impl ExtraField {
                 )?)
             }
             Ok(UsedExtraField::Ntfs) => {
-                // NTFS extra field
-                ExtraField::Ntfs(Ntfs::try_from_reader(reader, len)?)
+                let mut data = vec![0; len as usize];
+                reader.read_exact(&mut data)?;
+                // Preserve malformed optional metadata as opaque bytes, as with custom fields.
+                match Ntfs::try_from_reader(&mut Cursor::new(&data), len) {
+                    Ok(ntfs) => ExtraField::Ntfs(ntfs),
+                    Err(crate::result::ZipError::UnsupportedArchive(_)) => {
+                        ExtraField::Custom(CustomExtraField::new(
+                            false,
+                            extra_field_header_id,
+                            data.into_boxed_slice(),
+                        ))
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             #[cfg(feature = "aes-crypto")]
             Ok(UsedExtraField::AeXEncryption) => {
@@ -239,6 +251,11 @@ impl ExtraField {
 
 impl ZipFileData {
     pub(crate) fn apply_extra_fields(&mut self, file_name_raw: &mut Vec<u8>) -> ZipResult<()> {
+        #[cfg(feature = "aes-crypto")]
+        let mut has_aes = false;
+        let mut orig_name_crc = None;
+        let mut orig_comment_crc = None;
+
         for one_extra_field in &self.extra_fields.inner {
             match one_extra_field {
                 // Zip64 extended information extra field
@@ -260,6 +277,12 @@ impl ZipFileData {
                 ExtraField::AeXEncryption(AexEncryption {
                     compression_method, ..
                 }) => {
+                    if has_aes || self.compression_method != crate::CompressionMethod::Aes {
+                        return Err(invalid!(
+                            "AES extra field present without AES compression method (99)"
+                        ));
+                    }
+                    has_aes = true;
                     self.compression_method = *compression_method;
                 }
                 ExtraField::UnicodeComment(unicode) => {
@@ -268,7 +291,9 @@ impl ZipFileData {
                     // If the CRC check fails, this Unicode Comment extra field SHOULD be ignored and
                     // the File Comment field in the header SHOULD be used instead.
                     // Check if the comment is UTF-8
-                    if unicode.is_crc32_valid(self.file_comment.as_bytes())
+                    let crc = *orig_comment_crc
+                        .get_or_insert_with(|| crc32fast::hash(self.file_comment.as_bytes()));
+                    if unicode.crc32 == crc
                         && let Ok(comment) = String::from_utf8(unicode.content.to_vec())
                     {
                         self.file_comment = comment.into_boxed_str();
@@ -280,9 +305,8 @@ impl ZipFileData {
                     // APPNOTE 4.6.9 and https://libzip.org/specifications/extrafld.txt
                     // If the CRC check fails, this UTF-8 Path Extra Field SHOULD be ignored and
                     // the File Name field in the header SHOULD be used instead.
-                    if unicode.is_crc32_valid(file_name_raw)
-                        && std::str::from_utf8(&unicode.content).is_ok()
-                    {
+                    let crc = *orig_name_crc.get_or_insert_with(|| crc32fast::hash(file_name_raw));
+                    if unicode.crc32 == crc && std::str::from_utf8(&unicode.content).is_ok() {
                         *file_name_raw = unicode.content.to_vec();
                         self.flags |= ZipFlags::LanguageEncoding.as_u16();
                     }
@@ -298,9 +322,12 @@ impl ZipFileData {
 
 #[cfg(test)]
 mod tests {
-    use crate::extra_fields::ExtraField;
     use crate::extra_fields::ExtraFields;
+    use crate::extra_fields::{CustomExtraField, ExtraField};
     use crate::format::blocks::ZipEntryBlock;
+    use crate::write::FullFileOptions;
+    use crate::{ZipArchive, ZipWriter};
+    use std::io::Cursor;
 
     struct PlaceHolderBlock;
 
@@ -326,6 +353,39 @@ mod tests {
             extra_fields.inner[0],
             ExtraField::AeXEncryption(..)
         ));
+    }
+
+    #[test]
+    fn ntfs_extra_field() {
+        let mut ntfs_extra_field = [0; 32];
+        ntfs_extra_field[4] = 1;
+        ntfs_extra_field[6] = 24;
+        let mut options = FullFileOptions::default();
+        options.name = Some(b"test.txt");
+        options.extended_options.extra_fields = vec![CustomExtraField {
+            central_only: false,
+            header_id: 0x000A,
+            data: Box::new(ntfs_extra_field),
+        }]
+        .into();
+        // Compression is disabled on Miri for zlib-backed flate2 backends
+        // (zlib-rs / zlib / zlib-ng / zlib-ng-compat) because when it's enabled,
+        // flate2::Decompress::new makes a C function call (zlibVersion via
+        // flate2::ffi::c::c_backend::mz_inflateInit2).
+        #[cfg(all(
+            miri,
+            any(
+                feature = "deflate-flate2-zlib-rs",
+                feature = "deflate-flate2-zlib",
+                feature = "deflate-flate2-zlib-ng",
+                feature = "deflate-flate2-zlib-ng-compat"
+            )
+        ))]
+        let options = options.compression_method(crate::CompressionMethod::Stored);
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer.start_file_with_options(options).unwrap();
+        let archive = writer.finish().unwrap();
+        ZipArchive::new(archive).unwrap();
     }
 
     #[test]

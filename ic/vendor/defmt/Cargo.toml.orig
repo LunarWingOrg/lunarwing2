@@ -10,17 +10,21 @@ description = "A highly efficient logging framework that targets resource-constr
 edition = "2021"
 keywords = [ "knurling", "logging", "logger", "formatting", "formatter" ]
 license = "MIT OR Apache-2.0"
+rust-version = "1.81"
 links = "defmt" # Prevent multiple versions of defmt being linked
 name = "defmt"
 readme = "README.md"
 repository = "https://github.com/knurling-rs/defmt"
 homepage = "https://knurling.ferrous-systems.com/"
-version = "1.1.1"
+version = "1.2.0"
 
 [features]
 alloc = []
 avoid-default-panic = []
 ip_in_core = []
+# Include the panic information message if it is a single string literal. This might increase
+# the code size, but panic printouts might become more useful.
+panic-message = []
 
 # Encoding feature flags. These should only be set by end-user crates, not by library crates.
 #
@@ -45,7 +49,7 @@ unstable-test = [ "defmt-macros/unstable-test" ]
 [dependencies]
 # There is exactly one version of defmt-macros supported in this version of
 # defmt. Although, multiple versions of defmt might use the *same* defmt-macros.
-defmt-macros = { path = "../macros", version = "=1.1.1" }
+defmt-macros = { path = "../macros", version = "=1.2.0" }
 bitflags = "1"
 
 [dev-dependencies]

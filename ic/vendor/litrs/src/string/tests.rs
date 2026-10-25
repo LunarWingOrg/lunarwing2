@@ -122,6 +122,10 @@ fn unicode_escapes() {
 
 #[test]
 fn string_continue() {
+    check!("\
+        foo", true, None);
+    check!("\
+", true, None);
     check!("నక్క\
         bar", true, None);
     check!("foo\
@@ -177,12 +181,23 @@ fn raw_string() {
 }
 
 #[test]
+fn raw_string_max_hashes() {
+    let input = format!("r{h}\"peter\"{h}", h = "#".repeat(255));
+    check!("peter", &*input, false, Some(255), "");
+
+    let input = format!("r{h}\"peter\"{h}", h = "#".repeat(256));
+    assert_err_single!(StringLit::parse(&*input), TooManyHashes, 1..257);
+    assert_err_single!(Literal::parse(&*input), TooManyHashes, 1..257);
+}
+
+#[test]
 fn suffixes() {
     check!("hello", r###""hello"suffix"###, false, None, "suffix");
     check!(r"お前はもう死んでいる", r###"r"お前はもう死んでいる"_banana"###, false, Some(0), "_banana");
     check!("fox", r#""fox"peter"#, false, None, "peter");
     check!("🦊", r#""🦊"peter"#, false, None, "peter");
     check!("నక్క\\\\u{0b10}", r###""నక్క\\\\u{0b10}"jü_rgen"###, true, None, "jü_rgen");
+    check!("a\nb", r#""a\nb"_josé"#, true, None, "_josé");
 }
 
 #[test]
@@ -191,6 +206,7 @@ fn parse_err() {
     assert_err!(StringLit, r#""犬"#, UnterminatedString, None);
     assert_err!(StringLit, r#""Jürgen"#, UnterminatedString, None);
     assert_err!(StringLit, r#""foo bar baz"#, UnterminatedString, None);
+    assert_err!(StringLit, r#""\nJosé"#, UnterminatedString, None);
 
     assert_err!(StringLit, r#""fox"peter""#, InvalidSuffix, 5);
     assert_err!(StringLit, r###"r#"foo "# bar"#"###, UnexpectedChar, 9);
@@ -246,6 +262,8 @@ fn invalid_unicode_escapes() {
 
     assert_err!(StringLit, r#""\u{_}నక్క""#, InvalidStartOfUnicodeEscape, 4);
     assert_err!(StringLit, r#""\u{_5f}""#, InvalidStartOfUnicodeEscape, 4);
+    assert_err!(StringLit, r#""\u{}""#, InvalidStartOfUnicodeEscape, 4);
+    assert_err!(StringLit, r#""🦊\u{}a""#, InvalidStartOfUnicodeEscape, 8);
 
     assert_err!(StringLit, r#""fox\u{x}""#, NonHexDigitInUnicodeEscape, 7);
     assert_err!(StringLit, r#""\u{0x}🦊""#, NonHexDigitInUnicodeEscape, 5);

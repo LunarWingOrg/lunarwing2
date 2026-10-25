@@ -15,21 +15,34 @@ use crate::converter::inline::link::{MarkdownLink, append_markdown_link};
 use crate::converter::main_helpers::tag_name_eq;
 use crate::converter::media::MediaContext;
 use crate::converter::media::first_address;
+use crate::converter::utility::content::normalized_tag_name;
 use crate::converter::utility::escaping::escape_link_label;
 use crate::converter::utility::preprocessing::sanitize_markdown_url;
+use crate::converter::walk::{CaptureEnd, Close, Open};
 use crate::options::{ConversionOptions, InlineDataMedia};
 
-/// ~keep Append a media element's `src` as a Markdown link where the destination doubles as
-/// the label (`[src](src)`), routed through [`append_markdown_link`] so the destination gets
-/// the same sanitization/escaping as `<a href>` (audit #24: `src` was previously spliced into
-/// both the label and destination positions completely unescaped).
-///
-/// `raw_text` is passed as `""` rather than `src` to keep `append_markdown_link`'s
-/// `default_title` branch (which fires when `raw_text == href`) from ever firing here — these
-/// elements never rendered a title before this fix, and `src` is guaranteed non-empty by the
-/// `should_output_media_link` guard at the call site, so `"" == src` is never true.
-fn append_media_src_link(output: &mut String, src: &str, options: &ConversionOptions, ctx: &Context) {
-    let escaped_label = escape_link_label(src);
+/// ~keep Keep media destinations out of page text; use an authored title or the element kind.
+fn append_media_src_link(output: &mut String, src: &str, tag: &HTMLTag, options: &ConversionOptions, ctx: &Context) {
+    let title = crate::converter::utility::attributes::decoded_attribute(tag, "title");
+    let name = normalized_tag_name(tag.name().as_utf8_str());
+    let label = title
+        .as_deref()
+        .filter(|label| !label.trim().is_empty())
+        .unwrap_or(&name);
+    if ctx.in_link && matches!(name.as_ref(), "audio" | "video") {
+        output.push_str(label);
+        if let Some(boundary) = ctx.media_boundary.as_ref() {
+            let mut state = boundary.get();
+            if state.first_edge.is_none() {
+                state.first_edge = label.chars().next();
+                state.first_is_media = true;
+            }
+            state.last_edge = label.chars().next_back();
+            boundary.set(state);
+        }
+        return;
+    }
+    let escaped_label = escape_link_label(label);
     append_markdown_link(
         output,
         &MarkdownLink {
@@ -52,7 +65,11 @@ pub fn extract_media_src<'a>(tag: &'a HTMLTag<'a>) -> Cow<'a, str> {
 ///
 /// With any choice but [`InlineDataMedia::Keep`], a `data:` address is passed over for the next
 /// non-empty one among the element's `src` and every nested `<source>`'s.
-fn media_element_src<'a>(tag: &'a HTMLTag<'a>, parser: &'a Parser, choice: InlineDataMedia) -> Cow<'a, str> {
+pub(in crate::converter) fn media_element_src<'a>(
+    tag: &'a HTMLTag<'a>,
+    parser: &'a Parser,
+    choice: InlineDataMedia,
+) -> Cow<'a, str> {
     let own = extract_media_src(tag);
     let children = tag.children();
     let mut sources = children
@@ -88,32 +105,100 @@ pub const fn should_output_media_link(src: &str) -> bool {
     !src.is_empty()
 }
 
-fn render_media_fallback(tag: &HTMLTag, parser: &Parser, output: &mut String, context: MediaContext<'_>) {
-    use crate::converter::main::walk_node;
+/// Open an `audio` or a `video`: writes its address and lists its fallback content in `children`.
+///
+/// The walk captures the text of that content for [`close_media_fallback`]. Returns `None` for an
+/// element that is complete.
+pub fn open_media(
+    tag_name: &str,
+    node_handle: &NodeHandle,
+    parser: &Parser,
+    output: &mut String,
+    context: MediaContext<'_>,
+    children: &mut Vec<NodeHandle>,
+) -> Option<Open> {
+    let Some(tl::Node::Tag(tag)) = node_handle.get(parser) else {
+        return None;
+    };
+    if tag_name == "audio" {
+        handle_audio(node_handle, tag, parser, output, context, children);
+    } else {
+        handle_video(node_handle, tag, parser, output, context, children);
+    }
+    (!children.is_empty()).then_some(Open {
+        scope: None,
+        close: Close::Capture(CaptureEnd::MediaFallback),
+    })
+}
 
-    let MediaContext {
-        options,
-        ctx,
-        depth,
-        dom_ctx,
-    } = context;
-    let mut fallback = String::new();
-    for child_handle in tag.children().top().iter() {
-        let is_source =
-            matches!(child_handle.get(parser), Some(tl::Node::Tag(child_tag)) if is_source_element(child_tag));
-        if !is_source {
-            walk_node(
-                child_handle,
-                parser,
-                &mut fallback,
-                crate::converter::block::container::HandlerContext::new(options, ctx, depth + 1, dom_ctx),
-            );
+/// List the fallback content of a media element: each child that is no `source`.
+fn list_media_fallback(tag: &HTMLTag, parser: &Parser, children: &mut Vec<NodeHandle>) {
+    children.extend(tag.children().top().iter().copied().filter(|child_handle| {
+        !matches!(child_handle.get(parser), Some(tl::Node::Tag(child_tag)) if is_source_element(child_tag))
+    }));
+}
+
+/// Write `fallback`, the text of the fallback content of a media element.
+pub fn close_media_fallback(fallback: &str, output: &mut String, ctx: &Context) {
+    if !fallback.is_empty() {
+        let fallback = fallback.trim();
+        if ctx.in_link
+            && !fallback.is_empty()
+            && output.ends_with(|character: char| !character.is_whitespace())
+            && !output.ends_with(['(', '[', '{'])
+            && !fallback.starts_with(['.', ',', ';', ':', '!', '?', ')', ']', '}'])
+        {
+            output.push(' ');
+        }
+        output.push_str(fallback);
+        if ctx.in_link && !fallback.is_empty() {
+            mark_media_tail(ctx);
+        }
+        if !ctx.in_paragraph && !ctx.convert_as_inline && !ctx.in_link {
+            output.push_str("\n\n");
         }
     }
-    if !fallback.is_empty() {
-        output.push_str(fallback.trim());
-        if !ctx.in_paragraph && !ctx.convert_as_inline {
-            output.push_str("\n\n");
+}
+
+fn mark_media_tail(ctx: &Context) {
+    if let Some(boundary) = ctx.media_boundary.as_ref() {
+        let mut state = boundary.get();
+        state.pending = true;
+        boundary.set(state);
+    }
+}
+
+/// Apply the result of a media visitor callback. Returns whether the element is complete.
+#[cfg(feature = "visitor")]
+fn apply_media_visit_result(
+    visit_result: crate::visitor::VisitResult,
+    node_handle: &NodeHandle,
+    parser: &Parser,
+    output: &mut String,
+    ctx: &Context,
+) -> bool {
+    use crate::visitor::VisitResult;
+
+    match visit_result {
+        VisitResult::Continue => false,
+        VisitResult::Skip => true,
+        VisitResult::Custom(custom) => {
+            output.push_str(&custom);
+            if !ctx.in_paragraph && !ctx.convert_as_inline && !custom.ends_with('\n') {
+                output.push('\n');
+            }
+            true
+        }
+        VisitResult::PreserveHtml => {
+            use crate::converter::utility::serialization::serialize_node;
+            output.push_str(&serialize_node(node_handle, parser));
+            true
+        }
+        VisitResult::Error(err) => {
+            if ctx.visitor_error.borrow().is_none() {
+                *ctx.visitor_error.borrow_mut() = Some(err);
+            }
+            true
         }
     }
 }
@@ -121,14 +206,15 @@ fn render_media_fallback(tag: &HTMLTag, parser: &Parser, output: &mut String, co
 /// Handle audio element conversion to Markdown.
 ///
 /// Extracts src from audio tag or nested source elements, outputs as a link,
-/// and processes fallback content (e.g., browser compatibility text).
+/// and lists the fallback content (e.g., browser compatibility text) in `children`.
 #[cfg_attr(not(feature = "visitor"), allow(unused_variables))]
-pub fn handle_audio(
+fn handle_audio(
     node_handle: &NodeHandle,
     tag: &HTMLTag,
     parser: &Parser,
     output: &mut String,
     context: MediaContext<'_>,
+    children: &mut Vec<NodeHandle>,
 ) {
     let MediaContext {
         options,
@@ -143,7 +229,7 @@ pub fn handle_audio(
 
     #[cfg(feature = "visitor")]
     if let Some(ref visitor_handle) = ctx.visitor {
-        use crate::visitor::{NodeContext, NodeType, VisitResult};
+        use crate::visitor::{NodeContext, NodeType};
 
         let node_id = node_handle.get_inner();
         let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
@@ -161,55 +247,43 @@ pub fn handle_audio(
             let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
             visitor.visit_audio(&node_ctx, src_opt)
         };
-        match visit_result {
-            VisitResult::Continue => {}
-            VisitResult::Skip => return,
-            VisitResult::Custom(custom) => {
-                output.push_str(&custom);
-                if !ctx.in_paragraph && !ctx.convert_as_inline && !custom.ends_with('\n') {
-                    output.push('\n');
-                }
-                return;
-            }
-            VisitResult::PreserveHtml => {
-                use crate::converter::utility::serialization::serialize_node;
-                output.push_str(&serialize_node(node_handle, parser));
-                return;
-            }
-            VisitResult::Error(err) => {
-                if ctx.visitor_error.borrow().is_none() {
-                    *ctx.visitor_error.borrow_mut() = Some(err);
-                }
-                return;
-            }
+        if apply_media_visit_result(visit_result, node_handle, parser, output, ctx) {
+            return;
         }
     }
 
+    if ctx.in_code_block {
+        return;
+    }
     let inline_data = ctx.inline_data_treatment(options.inline_data_media, &src);
     if inline_data == InlineDataMedia::DropElement {
         return;
     }
     if inline_data == InlineDataMedia::Keep && should_output_media_link(&src) {
-        append_media_src_link(output, &src, options, ctx);
-        if !ctx.in_paragraph && !ctx.convert_as_inline {
+        append_media_src_link(output, &src, tag, options, ctx);
+        if !ctx.in_paragraph && !ctx.convert_as_inline && !ctx.in_link {
             output.push_str("\n\n");
         }
     }
 
-    render_media_fallback(tag, parser, output, context);
+    list_media_fallback(tag, parser, children);
+    if ctx.in_link && inline_data == InlineDataMedia::Keep && !src.is_empty() {
+        mark_media_tail(ctx);
+    }
 }
 
 /// Handle video element conversion to Markdown.
 ///
 /// Extracts src from video tag or nested source elements, outputs as a link,
-/// and processes fallback content (e.g., browser compatibility text).
+/// and lists the fallback content (e.g., browser compatibility text) in `children`.
 #[cfg_attr(not(feature = "visitor"), allow(unused_variables))]
-pub fn handle_video(
+fn handle_video(
     node_handle: &NodeHandle,
     tag: &HTMLTag,
     parser: &Parser,
     output: &mut String,
     context: MediaContext<'_>,
+    children: &mut Vec<NodeHandle>,
 ) {
     let MediaContext {
         options,
@@ -224,7 +298,7 @@ pub fn handle_video(
 
     #[cfg(feature = "visitor")]
     if let Some(ref visitor_handle) = ctx.visitor {
-        use crate::visitor::{NodeContext, NodeType, VisitResult};
+        use crate::visitor::{NodeContext, NodeType};
 
         let node_id = node_handle.get_inner();
         let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
@@ -242,75 +316,37 @@ pub fn handle_video(
             let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
             visitor.visit_video(&node_ctx, src_opt)
         };
-        match visit_result {
-            VisitResult::Continue => {}
-            VisitResult::Skip => return,
-            VisitResult::Custom(custom) => {
-                output.push_str(&custom);
-                if !ctx.in_paragraph && !ctx.convert_as_inline && !custom.ends_with('\n') {
-                    output.push('\n');
-                }
-                return;
-            }
-            VisitResult::PreserveHtml => {
-                use crate::converter::utility::serialization::serialize_node;
-                output.push_str(&serialize_node(node_handle, parser));
-                return;
-            }
-            VisitResult::Error(err) => {
-                if ctx.visitor_error.borrow().is_none() {
-                    *ctx.visitor_error.borrow_mut() = Some(err);
-                }
-                return;
-            }
+        if apply_media_visit_result(visit_result, node_handle, parser, output, ctx) {
+            return;
         }
     }
 
+    if ctx.in_code_block {
+        return;
+    }
     let inline_data = ctx.inline_data_treatment(options.inline_data_media, &src);
     if inline_data == InlineDataMedia::DropElement {
         return;
     }
     if inline_data == InlineDataMedia::Keep && should_output_media_link(&src) {
-        append_media_src_link(output, &src, options, ctx);
-        if !ctx.in_paragraph && !ctx.convert_as_inline {
+        append_media_src_link(output, &src, tag, options, ctx);
+        if !ctx.in_paragraph && !ctx.convert_as_inline && !ctx.in_link {
             output.push_str("\n\n");
         }
     }
 
-    render_media_fallback(tag, parser, output, context);
+    list_media_fallback(tag, parser, children);
+    if ctx.in_link && inline_data == InlineDataMedia::Keep && !src.is_empty() {
+        mark_media_tail(ctx);
+    }
 }
 
 /// Handle picture element conversion to Markdown.
 ///
-/// Finds and processes the first child img element, skipping source elements.
-pub fn handle_picture(
-    _node_handle: &NodeHandle,
-    tag: &HTMLTag,
-    parser: &Parser,
-    output: &mut String,
-    context: MediaContext<'_>,
-) {
-    let MediaContext {
-        options,
-        ctx,
-        depth,
-        dom_ctx,
-    } = context;
-    use crate::converter::main::walk_node;
-
-    for child_handle in tag.children().top().iter() {
-        if let Some(tl::Node::Tag(child_tag)) = child_handle.get(parser) {
-            if tag_name_eq(child_tag.name().as_utf8_str(), "img") {
-                walk_node(
-                    child_handle,
-                    parser,
-                    output,
-                    crate::converter::block::container::HandlerContext::new(options, ctx, depth + 1, dom_ctx),
-                );
-                break;
-            }
-        }
-    }
+/// Lists image and fallback children for the walk, skipping source declarations.
+pub fn open_picture(tag: &HTMLTag, parser: &Parser, children: &mut Vec<NodeHandle>) -> crate::converter::walk::Open {
+    list_media_fallback(tag, parser, children);
+    crate::converter::walk::Open::children_only()
 }
 
 /// Handle iframe element conversion to Markdown.
@@ -338,7 +374,7 @@ pub fn handle_iframe(
 
     #[cfg(feature = "visitor")]
     if let Some(ref visitor_handle) = ctx.visitor {
-        use crate::visitor::{NodeContext, NodeType, VisitResult};
+        use crate::visitor::{NodeContext, NodeType};
 
         let node_id = node_handle.get_inner();
         let parent_tag = dom_ctx.parent_tag_name(node_id, parser);
@@ -356,32 +392,13 @@ pub fn handle_iframe(
             let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
             visitor.visit_iframe(&node_ctx, src_opt)
         };
-        match visit_result {
-            VisitResult::Continue => {}
-            VisitResult::Skip => return,
-            VisitResult::Custom(custom) => {
-                output.push_str(&custom);
-                if !ctx.in_paragraph && !ctx.convert_as_inline && !custom.ends_with('\n') {
-                    output.push('\n');
-                }
-                return;
-            }
-            VisitResult::PreserveHtml => {
-                use crate::converter::utility::serialization::serialize_node;
-                output.push_str(&serialize_node(node_handle, parser));
-                return;
-            }
-            VisitResult::Error(err) => {
-                if ctx.visitor_error.borrow().is_none() {
-                    *ctx.visitor_error.borrow_mut() = Some(err);
-                }
-                return;
-            }
+        if apply_media_visit_result(visit_result, node_handle, parser, output, ctx) {
+            return;
         }
     }
 
     if ctx.inline_data_treatment(options.inline_data_media, &src) == InlineDataMedia::Keep && !src.is_empty() {
-        append_media_src_link(output, &src, options, ctx);
+        append_media_src_link(output, &src, tag, options, ctx);
         if !ctx.in_paragraph && !ctx.convert_as_inline {
             output.push_str("\n\n");
         }
@@ -399,10 +416,7 @@ mod tests {
         let html = "<iframe src='a](https://evil.example/payload)b'></iframe>";
         let result = crate::convert(html, None).unwrap();
         let content = result.content.unwrap_or_default();
-        assert_eq!(
-            content,
-            "[a\\](https://evil.example/payload)b](a](https://evil.example/payload)b)\n"
-        );
+        assert_eq!(content, "[iframe](a](https://evil.example/payload)b)\n");
     }
 
     #[test]
@@ -410,10 +424,7 @@ mod tests {
         let html = "<audio src='a](https://evil.example/payload)b'></audio>";
         let result = crate::convert(html, None).unwrap();
         let content = result.content.unwrap_or_default();
-        assert_eq!(
-            content,
-            "[a\\](https://evil.example/payload)b](a](https://evil.example/payload)b)\n"
-        );
+        assert_eq!(content, "[audio](a](https://evil.example/payload)b)\n");
     }
 
     #[test]
@@ -421,9 +432,6 @@ mod tests {
         let html = "<video src='a](https://evil.example/payload)b'></video>";
         let result = crate::convert(html, None).unwrap();
         let content = result.content.unwrap_or_default();
-        assert_eq!(
-            content,
-            "[a\\](https://evil.example/payload)b](a](https://evil.example/payload)b)\n"
-        );
+        assert_eq!(content, "[video](a](https://evil.example/payload)b)\n");
     }
 }

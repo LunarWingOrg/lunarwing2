@@ -13,7 +13,7 @@
 edition = "2018"
 rust-version = "1.83"
 name = "async-compression"
-version = "0.4.50"
+version = "0.4.51"
 authors = [
     "Wim Looman <wim@nemo157.com>",
     "Allen Bui <fairingrey@gmail.com>",
@@ -28,6 +28,13 @@ description = """
 Adaptors between compression crates and Rust's modern asynchronous IO types.
 """
 readme = "README.md"
+keywords = [
+    "compression",
+    "decompression",
+    "async-io",
+    "tokio",
+    "futures-io",
+]
 categories = [
     "compression",
     "asynchronous",
@@ -91,6 +98,7 @@ xz2 = [
 ]
 zlib = ["compression-codecs/zlib"]
 zstd = ["compression-codecs/zstd"]
+zstd-mzstd = ["compression-codecs/zstd-mzstd"]
 zstdmt = [
     "compression-codecs/zstdmt",
     "zstd",
@@ -196,6 +204,11 @@ required-features = [
 ]
 
 [[test]]
+name = "zstd-mzstd"
+path = "tests/zstd-mzstd.rs"
+required-features = ["zstd-mzstd"]
+
+[[test]]
 name = "zstd-window-size"
 path = "tests/zstd-window-size.rs"
 required-features = [
@@ -204,10 +217,10 @@ required-features = [
 ]
 
 [dependencies.compression-codecs]
-version = "0.4.45"
+version = "0.4.46"
 
 [dependencies.compression-core]
-version = "0.4.33"
+version = "0.4.34"
 
 [dependencies.futures-io]
 version = "0.3"

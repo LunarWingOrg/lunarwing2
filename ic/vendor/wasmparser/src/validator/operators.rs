@@ -68,16 +68,9 @@ pub(crate) struct OperatorValidator {
     /// Whether validation is happening in a shared context.
     shared: bool,
 
-    /// A trace of all operand push/pop operations performed while validating an
-    /// opcode. This is then compared to the arity that we report to double
-    /// check that arity report's correctness. `true` is "push" and `false` is
-    /// "pop".
+    /// A count of operands popped from or pushed to the operand stack.
     #[cfg(debug_assertions)]
-    pub(crate) pop_push_log: Vec<bool>,
-
-    /// The number of pops skipped entirely because of unreachable code.
-    #[cfg(debug_assertions)]
-    pub(crate) elided_bottom_pops: u32,
+    pub(crate) pop_push_count: (u64, u64),
 
     /// When "try-op" validation of an operator is pending, this is a trace
     /// of discarded info that can restore the OperatorValidator to its
@@ -378,9 +371,7 @@ impl OperatorValidator {
             control,
             shared: false,
             #[cfg(debug_assertions)]
-            pop_push_log: vec![],
-            #[cfg(debug_assertions)]
-            elided_bottom_pops: 0,
+            pop_push_count: (0, 0),
             transaction: Transaction::new(rollback_log),
         }
     }
@@ -573,14 +564,23 @@ impl OperatorValidator {
     // records a pop that mutated the operand stack
     fn record_pop(&mut self, ty: MaybeType) {
         self.transaction.map(|log| log.record_pop(ty));
-        self.record_any_pop();
+        self.record_any_pop(1);
     }
 
-    // records any pop, including a Bottom synthesized from an empty polymorphic operand stack
-    fn record_any_pop(&mut self) {
+    // records any pops, including a Bottom synthesized from an empty polymorphic operand stack.
+    // Hides the fact that we might push and then pop a temporary while validating an
+    // instruction, which shouldn't be visible from the outside.
+    fn record_any_pop(&mut self, _count: u32) {
         #[cfg(debug_assertions)]
         {
-            self.pop_push_log.push(false);
+            let mut count = _count as u64;
+            let (pop_count, push_count) = &mut self.pop_push_count;
+            if *push_count > 0 {
+                let internal_pushes = u64::min(count, *push_count);
+                *push_count -= internal_pushes;
+                count -= internal_pushes;
+            }
+            *pop_count += count;
         }
     }
 
@@ -588,7 +588,7 @@ impl OperatorValidator {
         self.transaction.map(|log| log.record_push());
         #[cfg(debug_assertions)]
         {
-            self.pop_push_log.push(true);
+            self.pop_push_count.1 += 1;
         }
     }
 
@@ -843,7 +843,7 @@ where
         self.operands.extend(popped);
         let control = self.control.last().unwrap();
         let actual = if self.operands.len() == control.height && control.unreachable {
-            self.record_any_pop();
+            self.record_any_pop(1);
             MaybeType::Bottom
         } else {
             if self.operands.len() == control.height {
@@ -1947,18 +1947,13 @@ where
         (p1, r1): (&[ValType], &[ValType]),
         (p2, r2): (&[ValType], &[ValType]),
     ) -> bool {
-        // Note that the order of params/results is intentionally swapped
-        // and matches the variance needed for this subtyping check.
-        p1.len() == p2.len()
-            && p1
-                .iter()
-                .zip(p2.iter())
-                .all(|(t1, t2)| self.resources.is_subtype(*t2, *t1))
-            && r1.len() == r2.len()
-            && r1
-                .iter()
-                .zip(r2.iter())
-                .all(|(r1, r2)| self.resources.is_subtype(*r1, *r2))
+        crate::func_signature_matches(
+            p1.iter().copied(),
+            r1.iter().copied(),
+            p2.iter().copied(),
+            r2.iter().copied(),
+            |a, b| self.resources.is_subtype(a, b),
+        )
     }
 
     fn check_binop128(&mut self) -> Result<()> {
@@ -3935,7 +3930,7 @@ where
                 assert_eq!(self.pop_operand(Some(elem_ty))?, MaybeType::Bottom);
                 #[cfg(debug_assertions)]
                 {
-                    self.elided_bottom_pops += n - i - 1;
+                    self.record_any_pop(n - i - 1);
                 }
                 break;
             }

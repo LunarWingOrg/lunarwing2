@@ -11,14 +11,16 @@ pub(crate) fn expand(args: TokenStream) -> TokenStream {
 
     let format_string = args.format_string.value();
 
-    let fragments = match defmt_parser::parse(&format_string, ParserMode::Strict) {
-        Ok(args) => args,
-        Err(e) => {
-            return syn::Error::new(args.format_string.span(), format!("{}", e))
-                .into_compile_error()
-                .into()
-        }
-    };
+    let (fragments, warnings) =
+        match defmt_parser::parse_with_warnings(&format_string, ParserMode::Strict) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                return syn::Error::new(args.format_string.span(), format!("{}", e))
+                    .into_compile_error()
+                    .into()
+            }
+        };
+    let warnings = construct::format_string_warnings(&warnings, args.format_string.span());
 
     let formatting_exprs: Vec<_> = args
         .formatting_args
@@ -42,6 +44,7 @@ pub(crate) fn expand(args: TokenStream) -> TokenStream {
             #[export_name = "_defmt_timestamp"]
             #[inline(never)]
             fn defmt_timestamp(fmt: defmt::Formatter<'_>) {
+                #warnings
                 match (#(&(#formatting_exprs)),*) {
                     (#(#patterns),*) => {
                     // NOTE: No format string index, and no finalize call.
@@ -53,8 +56,9 @@ pub(crate) fn expand(args: TokenStream) -> TokenStream {
             #var_item;
 
             // Unique symbol name to prevent multiple `timestamp!` invocations in the crate graph.
-            // Uses `#var_name` to ensure it is not discarded by the linker.
-            // This symbol itself is retained via a `EXTERN` directive in the linker script.
+            // Retaining this symbol also retains `#var_name` through the reference below. The
+            // linker script's `EXTERN` directive provides the same guarantee when it is used.
+            #[used]
             #[no_mangle]
             #[cfg_attr(target_os = "macos", link_section = ".defmt,end.timestamp")]
             #[cfg_attr(not(target_os = "macos"), link_section = ".defmt.end.timestamp")]

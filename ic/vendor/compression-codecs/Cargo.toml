@@ -13,7 +13,7 @@
 edition = "2018"
 rust-version = "1.83"
 name = "compression-codecs"
-version = "0.4.45"
+version = "0.4.46"
 authors = [
     "Wim Looman <wim@nemo157.com>",
     "Allen Bui <fairingrey@gmail.com>",
@@ -28,6 +28,13 @@ description = """
 Adaptors for various compression algorithms.
 """
 readme = "README.md"
+keywords = [
+    "compression",
+    "codec",
+    "gzip",
+    "zstd",
+    "brotli",
+]
 categories = [
     "compression",
     "asynchronous",
@@ -81,6 +88,7 @@ zstd = [
     "libzstd",
     "zstd-safe",
 ]
+zstd-mzstd = ["dep:mzstd"]
 zstdmt = [
     "zstd",
     "zstd-safe/zstdmt",
@@ -99,7 +107,7 @@ version = "0.6.1"
 optional = true
 
 [dependencies.compression-core]
-version = "0.4.33"
+version = "0.4.34"
 
 [dependencies.deflate64]
 version = "0.1.10"
@@ -136,6 +144,16 @@ default-features = false
 [dependencies.memchr]
 version = "2"
 optional = true
+
+[dependencies.mzstd]
+version = "0.2.6"
+features = [
+    "std",
+    "compression",
+    "decompression",
+]
+optional = true
+default-features = false
 
 [dependencies.zstd-safe]
 version = "8"

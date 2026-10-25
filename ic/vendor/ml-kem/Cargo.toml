@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.85"
 name = "ml-kem"
-version = "0.3.2"
+version = "0.3.3"
 build = false
 exclude = [
     "tests/key-gen.rs",
@@ -114,7 +114,11 @@ default-features = false
 version = "0.10"
 
 [dependencies.sha3]
-version = "0.11"
+version = "0.12"
+default-features = false
+
+[dependencies.shake]
+version = "0.1"
 default-features = false
 
 [dependencies.zeroize]
