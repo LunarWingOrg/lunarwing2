@@ -2439,6 +2439,26 @@ mod tests {
         ))
     }
 
+    /// Assert exactly `expected` captured lines at `level` carry `needle`.
+    fn assert_logged_count(
+        lines: &[&str],
+        level: &str,
+        needle: &str,
+        expected: usize,
+    ) -> Result<(), String> {
+        let matches: Vec<&&str> = lines
+            .iter()
+            .filter(|line| line_has_level(line, level) && line.contains(needle))
+            .collect();
+        if matches.len() == expected {
+            return Ok(());
+        }
+        Err(format!(
+            "expected {expected} {level} line(s) carrying {needle:?}, got {} ({matches:?})",
+            matches.len()
+        ))
+    }
+
     /// Assert no captured line at `level` or above carries `needle`.
     ///
     /// Debug lines may legitimately echo the full error text; the content that
@@ -2802,6 +2822,13 @@ mod tests {
         let oldest_id = oldest.id.0.to_string();
         let newest_id = newest.id.0.to_string();
         logs_assert(|lines: &[&str]| {
+            // Exactly one duplicate line, not one per picker call (NY-19).
+            assert_logged_count(
+                lines,
+                "WARN",
+                "multiple \"default\" projects for one user",
+                1,
+            )?;
             assert_logged_at(
                 lines,
                 "WARN",
