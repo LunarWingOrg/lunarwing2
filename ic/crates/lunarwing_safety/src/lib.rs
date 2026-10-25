@@ -28,6 +28,13 @@ pub use policy::{Policy, PolicyAction, PolicyRule, Severity};
 pub use sanitizer::{InjectionWarning, SanitizedOutput, Sanitizer};
 pub use validator::{ValidationResult, Validator};
 
+/// A cut position plus the bounds of the scan window that examined it.
+struct CutScan {
+    cut: usize,
+    start: usize,
+    end: usize,
+}
+
 /// Safety configuration.
 #[derive(Debug, Clone)]
 pub struct SafetyConfig {
@@ -42,6 +49,8 @@ pub struct SafetyLayer {
     policy: Policy,
     leak_detector: LeakDetector,
     config: SafetyConfig,
+    #[cfg(test)]
+    cut_scan_bytes: std::cell::RefCell<Vec<usize>>,
 }
 
 impl SafetyLayer {
@@ -53,17 +62,19 @@ impl SafetyLayer {
             policy: Policy::default(),
             leak_detector: LeakDetector::new(),
             config: config.clone(),
+            #[cfg(test)]
+            cut_scan_bytes: std::cell::RefCell::new(Vec::new()),
         }
     }
 
-    /// Move a cut outward across detected secrets and token-like runs. Scan a
-    /// fixed window once per cut, then reach a fixpoint over those matches.
-    /// If the window cannot establish a safe boundary, discard that retained
-    /// side rather than expose an unrecognized suffix. Work stays bounded.
-    fn secret_safe_cut(&self, output: &str, mut cut: usize, tail: bool) -> usize {
+    /// Move a cut outward across detected secrets and token-like runs inside
+    /// one bounded window, then reach a fixpoint over those matches.
+    fn scan_cut_window(&self, output: &str, mut cut: usize, tail: bool) -> CutScan {
         const WINDOW: usize = 1024;
         let start = output.ceil_char_boundary(cut.saturating_sub(WINDOW));
         let end = output.floor_char_boundary(cut.saturating_add(WINDOW).min(output.len()));
+        #[cfg(test)]
+        self.cut_scan_bytes.borrow_mut().push(end - start);
         let matches = self.leak_detector.scan(&output[start..end]).matches;
         let bytes = output.as_bytes();
         let token = |b: u8| b.is_ascii_alphanumeric() || b"_+/=.~-".contains(&b);
@@ -83,13 +94,56 @@ impl SafetyLayer {
                     cut -= 1;
                 }
             }
-            if (tail && cut == end && end < output.len()) || (!tail && cut == start && start > 0) {
-                return if tail { output.len() } else { 0 };
-            }
             if cut == previous {
-                return cut;
+                return CutScan { cut, start, end };
             }
         }
+    }
+
+    /// Whether a window-limited walk ran into the window edge, i.e. the
+    /// token-like run continues outside the bytes the window examined.
+    fn window_exhausted(output: &str, scan: &CutScan, tail: bool) -> bool {
+        (tail && scan.cut == scan.end && scan.end < output.len())
+            || (!tail && scan.cut == scan.start && scan.start > 0)
+    }
+
+    /// Move a cut outward across detected secrets and token-like runs (WI#349,
+    /// !1474 BA-1). WI#355: instead of discarding a retained side as soon as
+    /// its run crosses the first window edge, walk the run with a plain byte
+    /// loop (no further regex over the run), then scan one more bounded window
+    /// at the new cut. Only a second exhausted window discards the side, so a
+    /// long inline base64/hex blob no longer costs the pagination tail or
+    /// repository-file metadata. At most two 2 KiB windows are scanned per
+    /// cut, keeping WI#75's bound; the byte walk is linear in the run and
+    /// cheaper than the format! copy that follows.
+    fn secret_safe_cut(&self, output: &str, cut: usize, tail: bool) -> usize {
+        let first = self.scan_cut_window(output, cut, tail);
+        if !Self::window_exhausted(output, &first, tail) {
+            return first.cut;
+        }
+        // The run extends past this window. Walk to its boundary on plain
+        // bytes, crossing only ASCII so the new cut is a char boundary. Like
+        // the in-window snap, the walk stops where the cut would separate two
+        // token bytes, so it cannot eat a plain word past the run's edge.
+        let bytes = output.as_bytes();
+        let token = |b: u8| b.is_ascii_alphanumeric() || b"_+/=.~-".contains(&b);
+        let mut walked = first.cut;
+        while walked > 0
+            && walked < output.len()
+            && token(bytes[walked - 1])
+            && token(bytes[walked])
+        {
+            if tail {
+                walked += 1;
+            } else {
+                walked -= 1;
+            }
+        }
+        let second = self.scan_cut_window(output, walked, tail);
+        if Self::window_exhausted(output, &second, tail) {
+            return if tail { output.len() } else { 0 };
+        }
+        second.cut
     }
 
     /// Sanitize tool output before it reaches the LLM.
@@ -1014,8 +1068,12 @@ mod tests {
             assert!(result.content.contains("showing 0/100000 bytes"));
         }
 
+        /// WI#355 (BE-1 from !1474 note #6861): the first-window exhaustion
+        /// shapes no longer discard a side. The plain byte walk reaches the
+        /// run boundary and the second window scan clears it, so the 100-byte
+        /// edge and the whole 3000-byte run survive in the elision counts.
         #[test]
-        fn head_window_exhaustion_discards_retained_prefix() {
+        fn head_window_exhaustion_walk_keeps_retained_prefix() {
             let safety = safety_with_max_len(4096);
             let input = format!(
                 "{}{}{}",
@@ -1025,13 +1083,14 @@ mod tests {
             );
             let result = safety.sanitize_tool_output("test", &input);
             assert!(!result.content.contains('Q'));
-            assert!(result.content.starts_with("\n\n[... truncated:"));
-            assert!(result.content.contains("showing 2048/8100 bytes"));
+            assert!(result.content.starts_with(&" ".repeat(100)));
+            assert!(result.content.contains("showing 2148/8100 bytes"));
+            assert!(result.content.contains("5952 middle bytes elided"));
             assert!(result.content.ends_with(&" ".repeat(2048)));
         }
 
         #[test]
-        fn tail_window_exhaustion_discards_retained_suffix() {
+        fn tail_window_exhaustion_walk_keeps_retained_suffix() {
             let safety = safety_with_max_len(4096);
             let input = format!(
                 "{}{}{}",
@@ -1042,8 +1101,200 @@ mod tests {
             let result = safety.sanitize_tool_output("test", &input);
             assert!(!result.content.contains('Q'));
             assert!(result.content.starts_with(&" ".repeat(2048)));
-            assert!(result.content.contains("showing 2048/8100 bytes"));
-            assert!(result.content.ends_with("query the full output.]\n\n"));
+            assert!(result.content.contains("showing 2148/8100 bytes"));
+            assert!(result.content.contains("5952 middle bytes elided"));
+            assert!(result.content.ends_with(&" ".repeat(100)));
+        }
+
+        /// Payload bytes kept on either side of the truncation notice, which
+        /// is what the size budget is charged against.
+        fn shown_payload_bytes(content: &str) -> usize {
+            match content.find("\n\n[... truncated:") {
+                Some(at) => {
+                    let notice_len = content[at..]
+                        .find("]\n\n")
+                        .map(|end| end + 3)
+                        .expect("truncation notice must be closed");
+                    content.len() - notice_len
+                }
+                None => content.len(),
+            }
+        }
+
+        fn base64_run(len: usize) -> String {
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+                .chars()
+                .cycle()
+                .take(len)
+                .collect()
+        }
+
+        /// WI#355 acceptance: a GitLab keyset list response with one inline
+        /// 20 KiB base64 image must keep its pagination cursor at every
+        /// placement of the blob, not only when the cut lands outside it.
+        /// Pre-WI#355 the tail side was discarded whenever its cut landed in
+        /// the run (39 of 121 offsets in !1474 note #6846).
+        #[test]
+        fn inline_base64_list_keeps_pagination_cursor_at_every_offset() {
+            let safety = safety_with_max_len(4096);
+            let blob = base64_run(20_000);
+            let pagination = r#""],"pagination":{"next_cursor":"CURSOR-WI355","truncated":true,"complete":false}}"#;
+            for offset in (1_000..=13_000).step_by(100) {
+                let input = format!(
+                    "{{\"items\":[{{\"description\":\"{}\",\"image\":\"{}\"{}",
+                    " ".repeat(offset),
+                    blob,
+                    pagination
+                );
+                let result = safety.sanitize_tool_output("gitlab", &input);
+                assert!(
+                    result.content.ends_with(pagination),
+                    "pagination lost with the blob at offset {offset}: {}",
+                    &result.content[result.content.len().saturating_sub(300)..]
+                );
+                assert!(result.content.starts_with("{\"items\":[{"));
+                let shown = shown_payload_bytes(&result.content);
+                assert!(
+                    shown <= 4096,
+                    "shown payload over budget at offset {offset}: {shown}"
+                );
+            }
+        }
+
+        /// WI#355 acceptance: the repository-files API shape, serialized in
+        /// the guest's own key order (`serde_json::Value::Object` = BTreeMap,
+        /// WI#349). Its base64 `content` used to cost both retained sides
+        /// (`showing 0/N`), taking `file_name`, `ref` and `blob_id` with it.
+        #[test]
+        fn repository_file_metadata_survives_long_base64_content() {
+            let safety = safety_with_max_len(4096);
+            for tail_pad in [100usize, 500, 1_000] {
+                let input = serde_json::json!({
+                    "blob_id": "BLOB-WI355",
+                    "content": base64_run(30_000),
+                    "file_name": "src/main.rs",
+                    "ref": "main",
+                    "size": 30_000,
+                    "padding": " ".repeat(tail_pad),
+                })
+                .to_string();
+                // Pin the fixture to the WI#355 shape: the raw tail cut lands
+                // inside the base64 run, so the first window exhausts.
+                let content_end = input.find("\",\"file_name\"").expect("content end");
+                assert!(input.len() - 2048 < content_end);
+                let result = safety.sanitize_tool_output("gitlab", &input);
+                assert!(
+                    result.content.contains("file_name\":\"src/main.rs"),
+                    "file_name lost at pad {tail_pad}: {}",
+                    result.content
+                );
+                assert!(result.content.contains("ref\":\"main"));
+                assert!(result.content.contains("blob_id\":\"BLOB-WI355"));
+                assert!(!result.content.contains("showing 0/"));
+                assert!(shown_payload_bytes(&result.content) <= 4096);
+            }
+        }
+
+        /// WI#355 acceptance: each cut performs at most two detector scans of
+        /// at most 2 KiB each, even while walking a multi-KiB token run.
+        #[test]
+        fn token_run_walk_scans_at_most_two_2kib_windows_per_cut() {
+            for tail in [false, true] {
+                for run_len in [3_000usize, 20_000, 100_000] {
+                    let safety = safety_with_max_len(4096);
+                    let input = if tail {
+                        format!(
+                            "{}{}{}",
+                            " ".repeat(5_000),
+                            base64_run(run_len),
+                            " ".repeat(100)
+                        )
+                    } else {
+                        format!(
+                            "{}{}{}",
+                            " ".repeat(100),
+                            base64_run(run_len),
+                            " ".repeat(5_000)
+                        )
+                    };
+                    let cut = if tail { input.len() - 2048 } else { 2048 };
+                    safety.secret_safe_cut(&input, cut, tail);
+                    let scans = safety.cut_scan_bytes.borrow();
+                    assert_eq!(
+                        scans.len(),
+                        2,
+                        "expected the first window plus one bounded rescan (tail={tail}, run={run_len}): {scans:?}"
+                    );
+                    assert!(
+                        scans.iter().all(|len| *len <= 2 * 1024),
+                        "window over 2 KiB (tail={tail}, run={run_len}): {scans:?}"
+                    );
+                }
+            }
+        }
+
+        /// WI#355: the cut itself now lands on the run boundary, not on the
+        /// empty side. Direct pins complement the sanitize-level tests.
+        #[test]
+        fn exhausted_window_walks_to_run_boundary_instead_of_discarding() {
+            let safety = safety_with_max_len(4096);
+            let head_input = format!(
+                "{}{}{}",
+                " ".repeat(100),
+                "Q".repeat(3_000),
+                " ".repeat(5_000)
+            );
+            assert_eq!(safety.secret_safe_cut(&head_input, 2048, false), 100);
+            let tail_input = format!(
+                "{}{}{}",
+                " ".repeat(5_000),
+                "Q".repeat(3_000),
+                " ".repeat(100)
+            );
+            assert_eq!(safety.secret_safe_cut(&tail_input, 6052, true), 8000);
+        }
+
+        /// The fail-closed fallback stays: if the second window also cannot
+        /// establish a safe boundary, the retained side is still discarded.
+        /// A detector span crossing the walked-to cut drives the second
+        /// window to its own edge; a plain run boundary never does.
+        #[test]
+        fn second_window_exhaustion_still_discards_the_side() {
+            let mut safety = safety_with_max_len(4096);
+            safety.leak_detector = LeakDetector::with_patterns(vec![LeakPattern {
+                name: "test_marker_span".to_string(),
+                regex: regex::Regex::new("M[^Z]*").expect("literal test regex"),
+                severity: LeakSeverity::Critical,
+                action: LeakAction::Block,
+            }]);
+
+            // Head: Q run 2000..5000, cut 3500 exhausts the first window
+            // [2476,4524). The walk reaches 2000; the second window is
+            // [976,3024) and the marker at 976 spans the new cut, pushing it
+            // to the second window's start.
+            let mut head_input = format!(
+                "{}{}{}",
+                " ".repeat(2_000),
+                "Q".repeat(3_000),
+                " ".repeat(5_000)
+            );
+            head_input.replace_range(976..977, "M");
+            assert_eq!(safety.secret_safe_cut(&head_input, 3500, false), 0);
+
+            // Tail: Q run 5000..8000, cut 6000 exhausts the first window
+            // [4976,7024). The walk reaches 8000; the marker at 7999 spans
+            // the new cut out to the second window's end (9024).
+            let mut tail_input = format!(
+                "{}{}{}",
+                " ".repeat(5_000),
+                "Q".repeat(3_000),
+                " ".repeat(2_000)
+            );
+            tail_input.replace_range(7999..8000, "M");
+            assert_eq!(
+                safety.secret_safe_cut(&tail_input, 6000, true),
+                tail_input.len()
+            );
         }
 
         #[test]
@@ -1103,7 +1354,7 @@ mod tests {
                 "[Output blocked due to potential secret leakage]"
             );
             // Bearer JWT is fully redacted (no truncation, small input).
-            let jwt = format!("{}.{}.{}", &body, &body, &body);
+            let jwt = format!("{body}.{body}.{body}");
             let content = format!("Authorization: Bearer {jwt}");
             let result = safety.sanitize_tool_output("gitlab", &content);
             assert!(result.was_modified);
@@ -1114,7 +1365,133 @@ mod tests {
             );
             assert!(result.content.contains("[REDACTED]"));
             // The dot-separated payload and signature specifically.
-            assert!(!result.content.contains(&format!("{}.{}", &body, &body)));
+            assert!(!result.content.contains(&format!("{body}.{body}")));
+        }
+
+        /// WI#355 reviewer probe P2 (!1909 run-215 review): a long token run
+        /// ending in the bearer scheme word, a space and a 40-byte credential,
+        /// then 100 trailing spaces, at budget 16 384. The walk stops at the
+        /// space, so only the second-window rescan can catch the credential.
+        /// Pins the no-disclosure assertion the existing suite covered only via
+        /// scan-count and discard tests. Fails if the second window is skipped
+        /// (returning `walked`).
+        #[test]
+        fn probe_tail_rescan_covers_bearer_split_at_walked_boundary() {
+            let safety = safety_with_max_len(16_384);
+            let input = format!(
+                "{}{}Bearer {}{}",
+                " ".repeat(30_000),
+                "Z".repeat(9_000),
+                "Q".repeat(40),
+                " ".repeat(100)
+            );
+            let r = safety.sanitize_tool_output("test", &input);
+            assert!(!r.content.contains('Q'), "PROBE P2: credential shown");
+            assert!(r.content.ends_with(&" ".repeat(100)));
+        }
+
+        /// WI#355 reviewer probe P3 (!1909 run-215 review): at the production
+        /// budget of 100 000, a 60 KB base64 run walked from byte 50 000 reaches
+        /// its boundary at 100 (head) and 120 000 (tail). Four scans of at most
+        /// 2048 bytes each, and the notice reads `showing 50100/120100 bytes`.
+        /// Pins the walk at the production budget — a capped walk (`walked` close
+        /// to `first.cut`) leaves the suite green at 4096-only budgets.
+        #[test]
+        fn probe_walk_reaches_far_run_boundary_at_production_budget() {
+            let safety = safety_with_max_len(100_000);
+            let head = format!(
+                "{}{}{}",
+                " ".repeat(100),
+                base64_run(60_000),
+                " ".repeat(60_000)
+            );
+            assert_eq!(
+                safety.secret_safe_cut(&head, 50_000, false),
+                100,
+                "PROBE P3 head"
+            );
+            let tail = format!(
+                "{}{}{}",
+                " ".repeat(60_000),
+                base64_run(60_000),
+                " ".repeat(100)
+            );
+            assert_eq!(
+                safety.secret_safe_cut(&tail, tail.len() - 50_000, true),
+                120_000,
+                "PROBE P3 tail"
+            );
+            {
+                let scans = safety.cut_scan_bytes.borrow();
+                assert_eq!(scans.len(), 4, "{scans:?}");
+                assert!(scans.iter().all(|l| *l <= 2048));
+            }
+            let r = safety.sanitize_tool_output("test", &head);
+            assert!(r.content.starts_with(&" ".repeat(100)));
+            assert!(
+                r.content.contains("showing 50100/120100 bytes"),
+                "PROBE P3 notice"
+            );
+        }
+
+        /// WI#355 reviewer probe P4 (!1909 run-215 review): a 10 KB single run
+        /// walks to byte 0 and to `len` without panicking (`showing 0/10000`).
+        /// Pins the `walked > 0` and `walked < output.len()` guards that the
+        /// existing suite did not exercise at the output edge.
+        #[test]
+        fn probe_walk_to_output_edge() {
+            let safety = safety_with_max_len(4096);
+            let input = "Z".repeat(10_000);
+            assert_eq!(
+                safety.secret_safe_cut(&input, 2048, false),
+                0,
+                "PROBE P4 head"
+            );
+            assert_eq!(
+                safety.secret_safe_cut(&input, 10_000 - 2048, true),
+                10_000,
+                "PROBE P4 tail"
+            );
+            let r = safety.sanitize_tool_output("test", &input);
+            assert!(!r.content.contains('Z'));
+            assert!(
+                r.content.contains("showing 0/10000 bytes"),
+                "PROBE P4 notice"
+            );
+        }
+
+        /// WI#355 reviewer probe P5 (!1909 run-215 review): second-window edges
+        /// land inside 2-byte (`é`) characters; the cuts are 3001 and 30 000 and
+        /// stay on char boundaries. Pins `ceil_char_boundary` / `floor_char_
+        /// boundary` on the second window, which the existing suite reached
+        /// only at ASCII edges.
+        #[test]
+        fn probe_second_window_edges_inside_multibyte_chars() {
+            let safety = safety_with_max_len(16_384);
+            let head = format!(
+                "{} {}{}",
+                "é".repeat(1_500),
+                "Z".repeat(10_000),
+                " ".repeat(20_000)
+            );
+            assert_eq!(
+                safety.secret_safe_cut(&head, 8_192, false),
+                3_001,
+                "PROBE P5 head"
+            );
+            let tail = format!(
+                "{}{} {}",
+                " ".repeat(20_000),
+                "Z".repeat(10_000),
+                "é".repeat(1_500)
+            );
+            assert_eq!(
+                safety.secret_safe_cut(&tail, tail.len() - 8_192, true),
+                30_000,
+                "PROBE P5 tail"
+            );
+            let r = safety.sanitize_tool_output("test", &head);
+            assert!(r.content.starts_with(&format!("{} ", "é".repeat(1_500))));
         }
     }
 }
