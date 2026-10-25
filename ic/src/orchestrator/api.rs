@@ -276,8 +276,21 @@ async fn report_complete(
         success: report.success,
         message: report.message.clone(),
     };
-    if let Err(e) = state.job_manager.complete_job(job_id, result).await {
-        tracing::error!(job_id = %job_id, "Failed to complete job cleanup: {}", e);
+    match state.job_manager.complete_job(job_id, result).await {
+        Ok(()) => {}
+        // DZ-7/EA-7/EE-6: a duplicate or raced /complete is a no-op. Return
+        // early — WITHOUT persisting `completed`, broadcasting a JobResult
+        // SSE, or moving the ContextManager to `Completed` — so a late
+        // /complete cannot overwrite a terminal `Stopped`/`cancelled`
+        // outcome (which would make the cancel tool's later
+        // `Completed -> Cancelled` transition be rejected and `cancelled`
+        // never persist).
+        Err(crate::error::OrchestratorError::JobAlreadyCompleted { .. }) => {
+            return Ok(Json(serde_json::json!({"status": "ok"})));
+        }
+        Err(e) => {
+            tracing::error!(job_id = %job_id, "Failed to complete job cleanup: {}", e);
+        }
     }
     let status = completion_report_status(&report);
     if let Some(ref store) = state.store

@@ -85,16 +85,20 @@ async fn stop_claims_terminal_state_before_container_io() {
     let handle = mgr.get_handle(job_id).await.unwrap();
     assert_eq!(handle.state, ContainerState::Stopped);
     assert!(!handle.completion_result.unwrap().success);
-    // A /complete arriving during the SIGTERM grace period cannot promote.
-    mgr.complete_job(
-        job_id,
-        CompletionResult {
-            success: true,
-            message: None,
-        },
-    )
-    .await
-    .unwrap();
+    // A /complete arriving during the SIGTERM grace period cannot promote —
+    // stop_job already claimed the terminal result, so this duplicate is
+    // structurally refused (DZ-7/EE-6).
+    assert!(matches!(
+        mgr.complete_job(
+            job_id,
+            CompletionResult {
+                success: true,
+                message: None,
+            },
+        )
+        .await,
+        Err(OrchestratorError::JobAlreadyCompleted { .. })
+    ));
     assert!(!claim_unreported_exit(&mgr.containers, job_id, "late exit").await);
     let handle = mgr.get_handle(job_id).await.unwrap();
     assert_eq!(handle.state, ContainerState::Stopped);
@@ -132,20 +136,24 @@ async fn finalizing_blocks_stop_cleanup_and_exit_watcher() {
     assert!(futures::poll!(&mut complete).is_pending());
     assert!(matches!(
         mgr.stop_job(job_id).await,
-        Err(OrchestratorError::InvalidContainerState { .. })
+        Err(OrchestratorError::JobFinalizing { .. })
     ));
     mgr.cleanup_job(job_id).await;
     assert!(!claim_unreported_exit(&mgr.containers, job_id, "late exit").await);
-    // A duplicate completion also cannot replace the accepted result.
-    mgr.complete_job(
-        job_id,
-        CompletionResult {
-            success: false,
-            message: None,
-        },
-    )
-    .await
-    .unwrap();
+    // A duplicate completion also cannot replace the accepted result — it is
+    // refused structurally so `report_complete` skips its terminal side
+    // effects (DZ-7/EA-7/EE-6).
+    assert!(matches!(
+        mgr.complete_job(
+            job_id,
+            CompletionResult {
+                success: false,
+                message: None,
+            },
+        )
+        .await,
+        Err(OrchestratorError::JobAlreadyCompleted { .. })
+    ));
     let handle = mgr.get_handle(job_id).await.unwrap();
     assert_eq!(handle.state, ContainerState::Finalizing);
     assert!(handle.completion_result.unwrap().success);
@@ -161,15 +169,19 @@ async fn watcher_claim_prevents_late_completion_and_cleanup_removes_handle() {
         .await
         .insert(job_id, running_handle(job_id));
     assert!(claim_unreported_exit(&mgr.containers, job_id, "exit code 1").await);
-    mgr.complete_job(
-        job_id,
-        CompletionResult {
-            success: true,
-            message: None,
-        },
-    )
-    .await
-    .unwrap();
+    // A late /complete after the exit watcher claimed the terminal result is
+    // refused structurally (DZ-7/EE-6), never replacing the claimed outcome.
+    assert!(matches!(
+        mgr.complete_job(
+            job_id,
+            CompletionResult {
+                success: true,
+                message: None,
+            },
+        )
+        .await,
+        Err(OrchestratorError::JobAlreadyCompleted { .. })
+    ));
     let handle = mgr.get_handle(job_id).await.unwrap();
     assert_eq!(handle.state, ContainerState::Stopped);
     assert!(!handle.completion_result.unwrap().success);
