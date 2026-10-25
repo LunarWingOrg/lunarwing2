@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.0](https://github.com/rust-lang/cc-rs/compare/cc-v1.9.0...cc-v1.10.0) - 2026-10-23
+
+### Added
+
+- Initial libtool support ([#1618](https://github.com/rust-lang/cc-rs/pull/1618))
+
+### Fixed
+
+- *(parallel)* print the child's exit status as debug output ([#2055](https://github.com/rust-lang/cc-rs/pull/2055))
+- *(target-parsing)* wasm32-none-component ([#2054](https://github.com/rust-lang/cc-rs/pull/2054))
+
+### Other
+
+- Regenerate target info ([#2053](https://github.com/rust-lang/cc-rs/pull/2053))
+
+## [1.9.0](https://github.com/rust-lang/cc-rs/compare/cc-v1.8.0...cc-v1.9.0) - 2026-10-19
+
+### Added
+
+- pass AddressSanitizer on to the C compiler ([#2045](https://github.com/rust-lang/cc-rs/pull/2045))
+- add source root for stable external object names ([#2034](https://github.com/rust-lang/cc-rs/pull/2034))
+- emit rerun-if-env-changed for the compiler's own env vars ([#2035](https://github.com/rust-lang/cc-rs/pull/2035))
+- *(env)* read Cargo's variables from the env snapshot ([#2028](https://github.com/rust-lang/cc-rs/pull/2028))
+- collect compile commands into a `compile_commands.json` ([#1990](https://github.com/rust-lang/cc-rs/pull/1990))
+
+### Fixed
+
+- don't prefer clang for -Clinker-plugin-lto=no ([#2046](https://github.com/rust-lang/cc-rs/pull/2046))
+- keep the order of flag and flag_if_supported ([#2044](https://github.com/rust-lang/cc-rs/pull/2044))
+- correct "arbitary" typo in target parser comment ([#2039](https://github.com/rust-lang/cc-rs/pull/2039))
+- correct "stablised" typos in TODO comments ([#2040](https://github.com/rust-lang/cc-rs/pull/2040))
+- *(msvc)* pass objects to the archiver relative to the output directory ([#2033](https://github.com/rust-lang/cc-rs/pull/2033))
+- honor disabled linker-plugin LTO ([#2024](https://github.com/rust-lang/cc-rs/pull/2024))
+- apply `RUSTC_WRAPPER` to the `cl.exe` cc finds itself ([#2022](https://github.com/rust-lang/cc-rs/pull/2022))
+
+### Other
+
+- *(parallel)* poll on jobserver helper thread ([#2021](https://github.com/rust-lang/cc-rs/pull/2021))
+- *(parallel)* add jobserver polling for windows ([#2020](https://github.com/rust-lang/cc-rs/pull/2020))
+- Regenerate windows sys bindings ([#2019](https://github.com/rust-lang/cc-rs/pull/2019))
+- *(parallel)* add polling for process exit on windows ([#2016](https://github.com/rust-lang/cc-rs/pull/2016))
+- *(parallel)* poll for process exit on macOS/bsd ([#2014](https://github.com/rust-lang/cc-rs/pull/2014))
+
+## [1.8.0](https://github.com/rust-lang/cc-rs/compare/cc-v1.7.0...cc-v1.8.0) - 2026-10-11
+
+### Added
+
+- add `CC_PREFER_CLANG_CL_OVER_MSVC` to override `prefer_clang_cl_over_msvc` ([#2001](https://github.com/rust-lang/cc-rs/pull/2001))
+
+### Fixed
+
+- *(panic)* fix panic in code and replace with error when appropriate ([#2008](https://github.com/rust-lang/cc-rs/pull/2008))
+- *(env)* do not panic if WASM_MUSL_SYSROOT not set ([#2007](https://github.com/rust-lang/cc-rs/pull/2007))
+- *(jobserver)* help thread gets more token than necessary ([#2006](https://github.com/rust-lang/cc-rs/pull/2006))
+- stop forwarding -Cprofile-generate/-Cprofile-use to the C compiler ([#2003](https://github.com/rust-lang/cc-rs/pull/2003))
+- do not apply target crt-static when target is overridden ([#1999](https://github.com/rust-lang/cc-rs/pull/1999))
+
+### Other
+
+- *(parallel)* poll for process exit on linux ([#2009](https://github.com/rust-lang/cc-rs/pull/2009))
+- document `NVCC` and other environment variables ([#2005](https://github.com/rust-lang/cc-rs/pull/2005))
+- *(jobserver)* poll for new token ([#2004](https://github.com/rust-lang/cc-rs/pull/2004))
+- *(parallel)* Use poll on unix ([#2000](https://github.com/rust-lang/cc-rs/pull/2000))
+
 ## [1.7.0](https://github.com/rust-lang/cc-rs/compare/cc-v1.6.0...cc-v1.7.0) - 2026-10-10
 
 ### Added

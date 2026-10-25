@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.2.5 (2026-10-19)
+### Fixed
+- Return `PadError` from `InOutBufReserved::into_padded_blocks`
+  for incorrect `Padding` implementations  ([#1562])
+
+[#1562]: https://github.com/RustCrypto/utils/pull/1562
+
+## 0.2.4 (2026-10-16)
+### Fixed
+- Output buffer length check in `InOutBufReserved::into_padded_blocks` ([#1559])
+
+[#1559]: https://github.com/RustCrypto/utils/pull/1559
+
+## 0.2.3 (2026-10-14) [YANKED]
+### Fixed
+- List of safety pre-conditions in `InOutBufReserved::from_raw` docs ([#1502])
+- Stacked Borrows violation in `PaddedInOutBuf` ([#1556])
+
+[#1502]: https://github.com/RustCrypto/utils/pull/1502
+[#1556]: https://github.com/RustCrypto/utils/pull/1556
+
 ## 0.2.2 (2025-12-27)
 ### Changed
 - Require `block-padding` v0.4.2 ([#1291])

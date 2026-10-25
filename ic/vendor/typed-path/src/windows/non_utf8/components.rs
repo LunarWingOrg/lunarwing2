@@ -53,20 +53,46 @@ impl<'a> Components<'a> for WindowsComponents<'a> {
     }
 
     /// Returns true only if the path represented by the components
-    /// has a prefix followed by a root directory
+    /// has a prefix followed by a root directory, or a UNC prefix
+    /// alone.
     ///
-    /// e.g. `C:\some\path` -> true, `C:some\path` -> false
+    /// A disk prefix alone is not absolute, because Windows treats
+    /// such a path (e.g. `C:file.txt`) as relative to a per-disk
+    /// current working directory, as a historical relic of MS-DOS.
+    /// However, a complete UNC prefix (e.g. `\\server\share`) is
+    /// absolute, because it is equivalent to the same path with a
+    /// trailing `\` when pushing path components.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use typed_path::WindowsPath;
+    ///
+    /// let disk_backslash = WindowsPath::new(br"C:\some\path");
+    /// assert!(disk_backslash.is_absolute());
+    ///
+    /// let disk_only = WindowsPath::new(br"C:some\path");
+    /// assert!(!disk_only.is_absolute());
+    ///
+    /// let complete_unc = WindowsPath::new(br"\\some.server\share");
+    /// assert!(complete_unc.is_absolute());
+    ///
+    /// let unc_server_only = WindowsPath::new(br"\\some.server");
+    /// assert!(!unc_server_only.is_absolute());
+    /// ```
     fn is_absolute(&self) -> bool {
         // Create a copy of our parser so we don't mutate state
         let mut parser = self.parser.clone();
 
-        matches!(
-            (parser.next_front(), parser.next_front()),
-            (
-                Ok(WindowsComponent::Prefix(_)),
-                Ok(WindowsComponent::RootDir)
-            )
-        )
+        match parser.next_front() {
+            Ok(WindowsComponent::Prefix(p)) => match p.kind() {
+                WindowsPrefix::UNC(_, share) | WindowsPrefix::VerbatimUNC(_, share) => {
+                    !share.is_empty()
+                }
+                _ => matches!(parser.next_front(), Ok(WindowsComponent::RootDir)),
+            },
+            _ => false,
+        }
     }
 
     /// Returns true if the `path` has either:

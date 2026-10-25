@@ -164,14 +164,13 @@ impl<'de> Deserializer<'de> {
                     }
                 }
             }
-            '*' => {
-                while let Some((_, c)) = self.next() {
-                    if c == '*' && self.peek().is_some_and(|(_, c)| c == '/') {
-                        self.next();
-                        break;
-                    }
+            '*' => loop {
+                let (_, c) = self.next_or(ErrorCode::EofParsingComment)?;
+                if c == '*' && self.peek().is_some_and(|(_, c)| c == '/') {
+                    self.next();
+                    break;
                 }
-            }
+            },
             _ => {
                 return Err(self.err_at(offset, ErrorCode::ExpectedComment));
             }
@@ -260,7 +259,7 @@ impl<'de> Deserializer<'de> {
     }
 
     // Aside from the representation of Infinity, NaN, and hex numbers, which are handled in
-    // parse_number, the f64, i64, and u64 implementations of FromStr implement exactly the format
+    // parse_number, the u128, i128, and f64 implementations of FromStr implement exactly the format
     // we need.
     fn parse_decimal_number(
         &mut self,
@@ -274,15 +273,14 @@ impl<'de> Deserializer<'de> {
             self.next();
             offset = o;
         }
-        if self.input[start..=offset].contains(['.', 'e', 'E']) {
-            // https://doc.rust-lang.org/std/primitive.f64.html#method.from_str
-            Ok(NumberResult::F64(self.parse_from_str(start, offset)?))
-        } else if neg {
-            // https://doc.rust-lang.org/std/primitive.i64.html#method.from_str
-            Ok(NumberResult::I128(self.parse_from_str(start, offset)?))
+        if !neg && let Ok(u) = self.parse_from_str::<u128>(start, offset) {
+            Ok(NumberResult::U128(u))
+        } else if neg && let Ok(i) = self.parse_from_str::<i128>(start, offset) {
+            Ok(NumberResult::I128(i))
         } else {
-            // https://doc.rust-lang.org/std/primitive.u64.html#method.from_str
-            Ok(NumberResult::U128(self.parse_from_str(start, offset)?))
+            Ok(NumberResult::F64(
+                self.parse_from_str::<f64>(start, offset)?,
+            ))
         }
     }
 
@@ -312,7 +310,7 @@ impl<'de> Deserializer<'de> {
                 .and_then(|n| {
                     n.checked_add(u128::from(c.to_digit(16).expect("c is ascii hexdigit")))
                 })
-                .ok_or(self.err_at(offset, ErrorCode::OverflowParsingNumber))?;
+                .ok_or_else(|| self.err_at(offset, ErrorCode::OverflowParsingNumber))?;
         }
 
         if neg {
@@ -357,7 +355,7 @@ impl<'de> Deserializer<'de> {
                 // LineTerminator is forbidden except U+2028 and U+2029 are explicitly allowed.
                 return Err(self.err_at(offset, ErrorCode::LineTerminatorInString));
             } else if c == '\\' {
-                let owned = owned.get_or_insert(self.input[start..offset].to_owned());
+                let owned = owned.get_or_insert_with(|| self.input[start..offset].to_owned());
                 if let Some(c) = self.parse_escape_sequence(offset)? {
                     owned.push(c);
                 }
@@ -394,7 +392,7 @@ impl<'de> Deserializer<'de> {
                 Ok(Some('\u{0000}'))
             }
 
-            '1'..'9' => Err(self.err_at(offset, ErrorCode::InvalidEscapeSequence)),
+            '1'..='9' => Err(self.err_at(offset, ErrorCode::InvalidEscapeSequence)),
 
             'x' => Ok(Some(self.parse_hex_escape_sequence(offset)?)),
 
@@ -473,7 +471,7 @@ impl<'de> Deserializer<'de> {
 
             if c == '\\' {
                 self.next();
-                let owned = owned.get_or_insert(self.input[start..offset].to_owned());
+                let owned = owned.get_or_insert_with(|| self.input[start..offset].to_owned());
                 self.expect_char(
                     'u',
                     ErrorCode::EofParsingIdentifier,
@@ -537,30 +535,52 @@ impl<'de> Deserializer<'de> {
     fn with_position(&self, err: Error, offset: usize) -> Error {
         err.with_position(Position::from_offset(offset, self.input))
     }
+
+    fn deserialize_number<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value> {
+        let (offset, number) = self.parse_number()?;
+        match number {
+            NumberResult::U128(u) => {
+                // If the result fits in a u64 then visit_u64 because it has better support.
+                if let Ok(u) = u64::try_from(u) {
+                    visitor.visit_u64(u)
+                } else {
+                    visitor.visit_u128(u)
+                }
+            }
+            NumberResult::I128(i) => {
+                // If the result fits in an i64 then visit_i64 because it has better support.
+                if let Ok(i) = i64::try_from(i) {
+                    visitor.visit_i64(i)
+                } else {
+                    visitor.visit_i128(i)
+                }
+            }
+            NumberResult::F64(f) => visitor.visit_f64(f),
+        }
+        .map_err(|err| self.with_position(err, offset))
+    }
 }
 
 macro_rules! deserialize_number {
     ($method:ident) => {
         fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+            self.deserialize_number(visitor)
+        }
+    };
+}
+
+macro_rules! deserialize_float {
+    ($method:ident, $ty:ty, $visit:ident) => {
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+        fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
             let (offset, number) = self.parse_number()?;
-            match number {
-                NumberResult::U128(u) => {
-                    if let Ok(u) = u64::try_from(u) {
-                        visitor.visit_u64(u)
-                    } else {
-                        visitor.visit_u128(u)
-                    }
-                }
-                NumberResult::I128(i) => {
-                    if let Ok(i) = i64::try_from(i) {
-                        visitor.visit_i64(i)
-                    } else {
-                        visitor.visit_i128(i)
-                    }
-                }
-                NumberResult::F64(f) => visitor.visit_f64(f),
-            }
-            .map_err(|err| self.with_position(err, offset))
+            visitor
+                .$visit(match number {
+                    NumberResult::U128(u) => u as $ty,
+                    NumberResult::I128(i) => i as $ty,
+                    NumberResult::F64(f) => f as $ty,
+                })
+                .map_err(|err| self.with_position(err, offset))
         }
     };
 }
@@ -628,8 +648,9 @@ impl<'de> serde::de::Deserializer<'de> for &mut Deserializer<'de> {
     deserialize_number!(deserialize_i32);
     deserialize_number!(deserialize_i64);
     deserialize_number!(deserialize_i128);
-    deserialize_number!(deserialize_f32);
-    deserialize_number!(deserialize_f64);
+
+    deserialize_float!(deserialize_f32, f32, visit_f32);
+    deserialize_float!(deserialize_f64, f64, visit_f64);
 
     deserialize_string!(deserialize_str);
     deserialize_string!(deserialize_string);
@@ -760,7 +781,7 @@ impl<'de> serde::de::Deserializer<'de> for &mut Deserializer<'de> {
             (_, 'n') => self.deserialize_unit(visitor),
             (_, 't' | 'f') => self.deserialize_bool(visitor),
             (_, '"' | '\'') => self.deserialize_str(visitor),
-            (_, '+' | '-' | '.' | 'I' | 'N' | '0'..='9') => self.deserialize_f64(visitor),
+            (_, '+' | '-' | '.' | 'I' | 'N' | '0'..='9') => self.deserialize_number(visitor),
             (_, '[') => self.deserialize_seq(visitor),
             (_, '{') => self.deserialize_map(visitor),
             (offset, _) => Err(self.err_at(offset, ErrorCode::ExpectedValue)),

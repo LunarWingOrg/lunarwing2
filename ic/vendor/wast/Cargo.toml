@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.88.0"
 name = "wast"
-version = "261.0.0"
+version = "262.0.0"
 authors = ["Alex Crichton <alex@alexcrichton.com>"]
 build = false
 autolib = false
@@ -83,7 +83,7 @@ version = "2.4.1"
 version = "0.2.0"
 
 [dependencies.wasm-encoder]
-version = "0.261.0"
+version = "0.262.0"
 features = ["std"]
 default-features = false
 

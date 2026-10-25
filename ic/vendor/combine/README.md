@@ -1,5 +1,5 @@
 # combine
-[![Build Status](https://travis-ci.org/Marwes/combine.svg?branch=master)](https://travis-ci.org/Marwes/combine)
+[![Build Status](https://github.com/Marwes/combine/actions/workflows/rust.yml/badge.svg)](https://github.com/Marwes/combine/actions)
 [![Docs](https://docs.rs/combine/badge.svg)](https://docs.rs/combine)
 [![Gitter](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/Marwes/combine?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge)
 

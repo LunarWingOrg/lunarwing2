@@ -16,6 +16,7 @@
 #include <openssl/cipher.h>
 #include <openssl/err.h>
 #include <openssl/nid.h>
+#include <openssl/obj.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 #include <openssl/span.h>
@@ -1064,6 +1065,22 @@ TEST(CipherTest, GetCipher) {
   EXPECT_FALSE(EVP_CIPHER_iv_length(nullptr));
 }
 
+OPENSSL_BEGIN_ALLOW_DEPRECATED
+// |EVP_add_cipher| is a no-op that exists for OpenSSL compatibility. Callers
+// such as aioquic register ciphers with it at startup and then look them up.
+TEST(CipherTest, AddCipher) {
+  const EVP_CIPHER *ciphers[] = {EVP_aes_128_ecb(), EVP_aes_128_gcm(),
+                                 EVP_aes_256_ecb(), EVP_aes_256_gcm()};
+  for (const EVP_CIPHER *cipher : ciphers) {
+    EXPECT_EQ(1, EVP_add_cipher(cipher));
+    EXPECT_EQ(cipher, EVP_get_cipherbynid(EVP_CIPHER_nid(cipher)));
+    EXPECT_EQ(cipher,
+              EVP_get_cipherbyname(OBJ_nid2sn(EVP_CIPHER_nid(cipher))));
+  }
+  EXPECT_EQ(0, EVP_add_cipher(nullptr));
+}
+OPENSSL_END_ALLOW_DEPRECATED
+
 // Test the AES-GCM EVP_CIPHER's internal IV management APIs. OpenSSH uses these
 // APIs.
 TEST(CipherTest, GCMIncrementingIV) {
@@ -1423,6 +1440,103 @@ TEST(CipherTest, GCMIncrementingIV) {
                                      const_cast<uint8_t *>(kIVInvTooLarge)));
   }
 }
+
+// Regression for EVP_CTRL_AEAD_SET_IVLEN not maintaining the invariant
+// alloc-size(gctx->iv) >= gctx->ivlen for the legacy AES-GCM EVP path.
+// Zig-zagging ivlen across EVP_MAX_IV_LENGTH with EVP_CIPHER_CTX_copy
+// interleaved used to leave gctx->iv pointing at an undersized buffer, so a
+// subsequent EncryptInit_ex would OOB-write the IV and later GCM_IV_GEN
+// could satisfy the ivlen >= 8 guard on a 4-byte allocation.
+TEST(CipherTest, GCMRepeatedlyChangeIVLength) {
+  const EVP_CIPHER *kCipher = EVP_aes_128_gcm();
+  static const uint8_t kKey[16] = {0, 1, 2,  3,  4,  5,  6,  7,
+                                   8, 9, 10, 11, 12, 13, 14, 15};
+  static const uint8_t kInput[] = {'h', 'e', 'l', 'l', 'o'};
+
+  const std::vector<std::vector<int>> kLengthSequences = {
+      {64, 128, 256},
+      {12, 13, 14, 15, 16},
+      {256, 128, 64},
+      {12, 11, 10, 9},
+      {256, 128, 64, 32, 16, 8, 4, 8, 16},
+      {256, 128, 64, 32, 16, 8, 4, 8, 16, 32, 64, 128},
+  };
+
+  for (size_t i = 0; i < kLengthSequences.size(); i++) {
+    const std::vector<int> &seq = kLengthSequences[i];
+    SCOPED_TRACE(i);
+    const int final_len = seq.back();
+    std::vector<uint8_t> iv(final_len, 0);
+
+    // Compute the expected ciphertext + tag by setting the final IV length in
+    // one step.
+    uint8_t expected_ct[sizeof(kInput)];
+    uint8_t expected_tag[16];
+    {
+      bssl::UniquePtr<EVP_CIPHER_CTX> ref(EVP_CIPHER_CTX_new());
+      ASSERT_TRUE(ref);
+      ASSERT_TRUE(EVP_EncryptInit_ex(ref.get(), kCipher, /*impl=*/nullptr, kKey,
+                                     /*iv=*/nullptr));
+      ASSERT_TRUE(EVP_CIPHER_CTX_ctrl(ref.get(), EVP_CTRL_AEAD_SET_IVLEN,
+                                      final_len, nullptr));
+      ASSERT_TRUE(EVP_EncryptInit_ex(ref.get(), /*cipher=*/nullptr,
+                                     /*impl=*/nullptr, /*key=*/nullptr,
+                                     iv.data()));
+      int ct_len = 0, extra = 0;
+      ASSERT_TRUE(EVP_EncryptUpdate(ref.get(), expected_ct, &ct_len, kInput,
+                                    sizeof(kInput)));
+      ASSERT_TRUE(EVP_EncryptFinal_ex(ref.get(), nullptr, &extra));
+      ASSERT_EQ(extra, 0);
+      ASSERT_EQ(ct_len, static_cast<int>(sizeof(kInput)));
+      ASSERT_TRUE(EVP_CIPHER_CTX_ctrl(ref.get(), EVP_CTRL_AEAD_GET_TAG,
+                                      sizeof(expected_tag), expected_tag));
+    }
+
+    for (bool copy : {false, true}) {
+      SCOPED_TRACE(copy);
+      bssl::UniquePtr<EVP_CIPHER_CTX> ctx(EVP_CIPHER_CTX_new());
+      ASSERT_TRUE(ctx);
+      ASSERT_TRUE(EVP_EncryptInit_ex(ctx.get(), kCipher, /*impl=*/nullptr, kKey,
+                                     /*iv=*/nullptr));
+      ASSERT_TRUE(MaybeCopyCipherContext(copy, &ctx));
+
+      // Walk the sequence, interleaving copies. The last SET_IVLEN leaves
+      // ivlen == final_len, matching the reference encrypt above.
+      for (int len : seq) {
+        ASSERT_TRUE(EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_AEAD_SET_IVLEN, len,
+                                        nullptr));
+        ASSERT_TRUE(MaybeCopyCipherContext(copy, &ctx));
+      }
+
+      ASSERT_TRUE(EVP_EncryptInit_ex(ctx.get(), /*cipher=*/nullptr,
+                                     /*impl=*/nullptr, /*key=*/nullptr,
+                                     iv.data()));
+      ASSERT_TRUE(MaybeCopyCipherContext(copy, &ctx));
+      uint8_t ct[sizeof(kInput)];
+      int ct_len = 0, extra = 0;
+      ASSERT_TRUE(EVP_EncryptUpdate(ctx.get(), ct, &ct_len, kInput,
+                                    sizeof(kInput)));
+      ASSERT_TRUE(EVP_EncryptFinal_ex(ctx.get(), nullptr, &extra));
+      ASSERT_EQ(extra, 0);
+      ASSERT_EQ(ct_len, static_cast<int>(sizeof(kInput)));
+      uint8_t tag[16];
+      ASSERT_TRUE(EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_AEAD_GET_TAG,
+                                      sizeof(tag), tag));
+
+      EXPECT_EQ(Bytes(ct, ct_len), Bytes(expected_ct, sizeof(expected_ct)));
+      EXPECT_EQ(Bytes(tag), Bytes(expected_tag));
+    }
+  }
+}
+// The OpenSSL EVP_CTRL_CCM_* control names are aliases of the generic
+// EVP_CTRL_AEAD_* controls, whose behavior is covered by the existing CCM
+// tests.
+static_assert(EVP_CTRL_CCM_SET_IVLEN == EVP_CTRL_AEAD_SET_IVLEN,
+              "EVP_CTRL_CCM_SET_IVLEN must alias EVP_CTRL_AEAD_SET_IVLEN");
+static_assert(EVP_CTRL_CCM_GET_TAG == EVP_CTRL_AEAD_GET_TAG,
+              "EVP_CTRL_CCM_GET_TAG must alias EVP_CTRL_AEAD_GET_TAG");
+static_assert(EVP_CTRL_CCM_SET_TAG == EVP_CTRL_AEAD_SET_TAG,
+              "EVP_CTRL_CCM_SET_TAG must alias EVP_CTRL_AEAD_SET_TAG");
 
 #define CHECK_ERROR(function, err) \
     ERR_clear_error();                 \

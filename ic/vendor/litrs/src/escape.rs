@@ -72,8 +72,10 @@ pub(crate) fn unescape(
             let closing_pos = input.bytes().position(|b| b == b'}')
                 .ok_or(perr(0..input.len(), UnterminatedUnicodeEscape))?;
 
+            // The escape has to start with a hex digit, which also rules out
+            // an empty `\u{}`.
             let inner = &input[3..closing_pos];
-            if inner.as_bytes().first() == Some(&b'_') {
+            if matches!(inner.as_bytes().first(), None | Some(&b'_')) {
                 return Err(perr(3, InvalidStartOfUnicodeEscape));
             }
 
@@ -138,7 +140,6 @@ impl Unescape {
 
 pub(crate) trait EscapeContainer {
     fn new() -> Self;
-    fn is_empty(&self) -> bool;
     fn push(&mut self, v: Unescape);
     fn push_str(&mut self, s: &str);
 }
@@ -146,9 +147,6 @@ pub(crate) trait EscapeContainer {
 impl EscapeContainer for Vec<u8> {
     fn new() -> Self {
         Self::new()
-    }
-    fn is_empty(&self) -> bool {
-        self.is_empty()
     }
     fn push_str(&mut self, s: &str) {
         self.extend_from_slice(s.as_bytes());
@@ -168,9 +166,6 @@ impl EscapeContainer for Vec<u8> {
 impl EscapeContainer for String {
     fn new() -> Self {
         Self::new()
-    }
-    fn is_empty(&self) -> bool {
-        self.is_empty()
     }
     fn push_str(&mut self, s: &str) {
         self.push_str(s);
@@ -196,10 +191,16 @@ pub(crate) fn unescape_string<C: EscapeContainer>(
     byte_escapes: bool,
     allow_nul: bool,
 ) -> Result<(Option<C>, usize), ParseError> {
+    // Escapes are parsed from input without the last char (usually the closing
+    // quote). That char might be multi-byte (e.g. in a suffix), so we can't
+    // just cut off one byte.
+    let end_escape_input = input.len() - input.chars().next_back().map_or(0, char::len_utf8);
+
     let mut closing_quote_pos = None;
     let mut i = offset;
     let mut end_last_escape = offset;
     let mut value = C::new();
+    let mut has_escape = false;
     while i < input.len() {
         match input.as_bytes()[i] {
             // Handle "string continue".
@@ -213,15 +214,17 @@ pub(crate) fn unescape_string<C: EscapeContainer>(
 
                 i += 2 + end_escape;
                 end_last_escape = i;
+                has_escape = true;
             }
             b'\\' => {
-                let rest = &input[i..input.len() - 1];
+                let rest = &input[i..end_escape_input];
                 let (c, len) = unescape(rest, unicode, byte_escapes, allow_nul)
                     .map_err(|e| e.offset_span(i))?;
                 value.push_str(&input[end_last_escape..i]);
                 value.push(c);
                 i += len;
                 end_last_escape = i;
+                has_escape = true;
             }
             b'\r' => return Err(perr(i, CarriageReturn)),
             b'"' => {
@@ -240,10 +243,9 @@ pub(crate) fn unescape_string<C: EscapeContainer>(
     let suffix = &input[start_suffix..];
     check_suffix(suffix).map_err(|kind| perr(start_suffix, kind))?;
 
-    // `value` is only empty if there was no escape in the input string
-    // (with the special case of the input being empty). This means the
-    // string value basically equals the input, so we store `None`.
-    let value = if value.is_empty() {
+    // If there was no escape in the input string, the string value equals the
+    // input, so we store `None`.
+    let value = if !has_escape {
         None
     } else {
         // There was an escape in the string, so we need to push the
@@ -268,7 +270,7 @@ pub(crate) fn scan_raw_string(
     let num_hashes = input[offset..].bytes().position(|b| b != b'#')
         .ok_or(perr(None, InvalidLiteral))?;
 
-    if num_hashes > 256 {
+    if num_hashes > 255 {
         return Err(perr(offset..offset + num_hashes, TooManyHashes));
     }
 

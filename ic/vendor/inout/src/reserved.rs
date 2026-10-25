@@ -22,6 +22,9 @@ pub struct InOutBufReserved<'inp, 'out, T> {
 
 impl<'a, T> InOutBufReserved<'a, 'a, T> {
     /// Crate [`InOutBufReserved`] from a single mutable slice.
+    ///
+    /// # Errors
+    /// If `out` is too small.
     pub fn from_mut_slice(buf: &'a mut [T], msg_len: usize) -> Result<Self, OutIsTooSmallError> {
         if msg_len > buf.len() {
             return Err(OutIsTooSmallError);
@@ -49,6 +52,7 @@ impl<T> InOutBufReserved<'_, '_, T> {
     ///   must be valid for both reads and writes for `out_len * mem::size_of::<T>()`
     ///   many bytes.
     /// - `in_ptr` and `out_ptr` must be either equal or non-overlapping.
+    /// - `in_len` must be less than or equal to `out_len` (i.e. `in_len <= out_len`).
     /// - If `in_ptr` and `out_ptr` are equal, then the memory referenced by
     ///   them must not be accessed through any other pointer (not derived from
     ///   the return value) for the duration of lifetime 'a. Both read and write
@@ -78,18 +82,21 @@ impl<T> InOutBufReserved<'_, '_, T> {
 
     /// Get raw input and output pointers.
     #[inline(always)]
+    #[must_use]
     pub fn into_raw(self) -> (*const T, *mut T) {
         (self.in_ptr, self.out_ptr)
     }
 
     /// Get input buffer length.
     #[inline(always)]
+    #[must_use]
     pub fn get_in_len(&self) -> usize {
         self.in_len
     }
 
     /// Get output buffer length.
     #[inline(always)]
+    #[must_use]
     pub fn get_out_len(&self) -> usize {
         self.out_len
     }
@@ -114,6 +121,9 @@ impl<T> InOutBufReserved<'_, '_, T> {
 
 impl<'inp, 'out, T> InOutBufReserved<'inp, 'out, T> {
     /// Crate [`InOutBufReserved`] from two separate slices.
+    ///
+    /// # Errors
+    /// If `out` is too small.
     pub fn from_slices(
         in_buf: &'inp [T],
         out_buf: &'out mut [T],
@@ -132,6 +142,7 @@ impl<'inp, 'out, T> InOutBufReserved<'inp, 'out, T> {
 
     /// Get input slice.
     #[inline(always)]
+    #[must_use]
     pub fn get_in(&self) -> &[T] {
         unsafe { slice::from_raw_parts(self.in_ptr, self.in_len) }
     }
@@ -144,6 +155,7 @@ impl<'inp, 'out, T> InOutBufReserved<'inp, 'out, T> {
 
     /// Consume `self` and get output slice with lifetime `'out`.
     #[inline(always)]
+    #[must_use]
     pub fn into_out(self) -> &'out mut [T] {
         unsafe { slice::from_raw_parts_mut(self.out_ptr, self.out_len) }
     }
@@ -152,63 +164,68 @@ impl<'inp, 'out, T> InOutBufReserved<'inp, 'out, T> {
 #[cfg(feature = "block-padding")]
 impl<'inp, 'out> InOutBufReserved<'inp, 'out, u8> {
     /// Transform buffer into [`PaddedInOutBuf`] using padding algorithm `P`.
+    ///
+    /// # Errors
+    /// If the padding is invalid
     #[inline(always)]
     pub fn into_padded_blocks<P, BS>(self) -> Result<PaddedInOutBuf<'inp, 'out, BS>, PadError>
     where
         P: Padding,
         BS: ArraySize,
     {
-        let bs = BS::USIZE;
-        let blocks_len = self.in_len / bs;
-
         use block_padding::PaddedData;
+        let out_blocks_len = self.out_len / BS::USIZE;
+
         let (blocks, tail_block) = match P::pad_detached(self.get_in()) {
-            PaddedData::Pad { blocks, tail_block } => (blocks, Some(tail_block)),
-            PaddedData::NoPad { blocks } => (blocks, None),
+            PaddedData::Pad { blocks, tail_block } => {
+                // If tail block is present, the output buffer must contain
+                // at least `blocks.len() + 1` full blocks
+                if out_blocks_len <= blocks.len() {
+                    return Err(PadError);
+                }
+                (blocks, Some(tail_block))
+            }
+            PaddedData::NoPad { blocks } => {
+                // If tail block is not present, the output buffer must contain
+                // at least `blocks.len()` full blocks
+                if out_blocks_len < blocks.len() {
+                    return Err(PadError);
+                }
+                (blocks, None)
+            }
             PaddedData::Error => return Err(PadError),
         };
 
-        assert_eq!(blocks.len(), blocks_len);
-
-        let out_len = self.out_len;
-        let (in_ptr, out_ptr) = self.into_raw();
-
-        let blocks = unsafe {
-            InOutBuf::from_raw(
-                in_ptr.cast::<Array<u8, BS>>(),
-                out_ptr.cast::<Array<u8, BS>>(),
-                blocks_len,
-            )
-        };
-
-        let Some(tail_block) = tail_block else {
-            let tail_inout = None;
-            return Ok(PaddedInOutBuf { blocks, tail_inout });
-        };
-
-        let blocks_byte_len = blocks_len * bs;
-        let reserve_len = out_len - blocks_byte_len;
-        if reserve_len < tail_block.len() {
+        // These invariants must hold for all valid padding implementations.
+        if blocks.as_ptr().cast() != self.in_ptr {
             return Err(PadError);
         }
-        // SAFETY: we checked that the out buffer has enough bytes in reserve
-        let tail_out: &mut Array<u8, BS> = unsafe {
-            let tail_out_ptr = out_ptr.add(blocks_byte_len);
-            &mut *(tail_out_ptr.cast())
-        };
+        if blocks.len() != self.in_len / BS::USIZE {
+            return Err(PadError);
+        }
 
-        let tail_inout = Some((tail_block, tail_out));
-
-        Ok(PaddedInOutBuf { blocks, tail_inout })
+        Ok(PaddedInOutBuf {
+            in_ptr: blocks.as_ptr(),
+            out_ptr: self.out_ptr.cast(),
+            blocks_len: blocks.len(),
+            tail_block,
+            _pd: PhantomData,
+        })
     }
 }
 
 /// Variant of [`InOutBuf`] with optional padded tail block.
 #[cfg(feature = "block-padding")]
-#[allow(clippy::type_complexity)]
 pub struct PaddedInOutBuf<'inp, 'out, BS: ArraySize> {
-    blocks: InOutBuf<'inp, 'out, Array<u8, BS>>,
-    tail_inout: Option<(Array<u8, BS>, &'out mut Array<u8, BS>)>,
+    /// Pointer to the input blocks.
+    in_ptr: *const Array<u8, BS>,
+    /// Pointer to the output blocks (including tail block if present).
+    out_ptr: *mut Array<u8, BS>,
+    /// Number of full blocks (i.e. excluding the tail block if present).
+    blocks_len: usize,
+    /// Padded input tail.
+    tail_block: Option<Array<u8, BS>>,
+    _pd: PhantomData<(&'inp u8, &'out mut u8)>,
 }
 
 #[cfg(feature = "block-padding")]
@@ -216,7 +233,7 @@ impl<'out, BS: ArraySize> PaddedInOutBuf<'_, 'out, BS> {
     /// Get full blocks.
     #[inline(always)]
     pub fn get_blocks(&mut self) -> InOutBuf<'_, '_, Array<u8, BS>> {
-        self.blocks.reborrow()
+        unsafe { InOutBuf::from_raw(self.in_ptr, self.out_ptr, self.blocks_len) }
     }
 
     /// Get padded tail block.
@@ -224,25 +241,24 @@ impl<'out, BS: ArraySize> PaddedInOutBuf<'_, 'out, BS> {
     /// Most padding implementations always return `Some`.
     #[inline(always)]
     pub fn get_tail_block(&mut self) -> Option<InOut<'_, '_, Array<u8, BS>>> {
-        self.tail_inout.as_mut().map(|(in_block, out_block)| {
-            let in_block = &*in_block;
-            let out_block = &mut **out_block;
-            InOut::from((in_block, out_block))
+        // SAFETY: if `tail` is `Some`, then `out_ptr` points to a buffer with length equal
+        // to at least `blocks_len + 1` blocks, so it satisfies the safety conditions
+        // required by `InOut::from_raw`.
+        self.tail_block.as_ref().map(|in_block| unsafe {
+            let tail_out_ptr = self.out_ptr.add(self.blocks_len);
+            InOut::from_raw(in_block, tail_out_ptr)
         })
     }
 
     /// Convert buffer into output slice.
     #[inline(always)]
     pub fn into_out(self) -> &'out [u8] {
-        let total_blocks = if self.tail_inout.is_some() {
-            self.blocks.len() + 1
-        } else {
-            self.blocks.len()
-        };
-        let res_len = BS::USIZE * total_blocks;
-        let (_, out_ptr) = self.blocks.into_raw();
-        // SAFETY: `res_len` is always valid for the output buffer since
-        // it's checked during type construction
-        unsafe { slice::from_raw_parts(out_ptr as *const u8, res_len) }
+        let mut bytes_len = BS::USIZE * self.blocks_len;
+        // If tail is present, add its length to the resulting buffer length.
+        if self.tail_block.is_some() {
+            bytes_len += BS::USIZE;
+        }
+        // SAFETY: `out_ptr` points to a valid memory with size of `bytes_len`
+        unsafe { slice::from_raw_parts(self.out_ptr.cast(), bytes_len) }
     }
 }

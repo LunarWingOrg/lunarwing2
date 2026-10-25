@@ -11,9 +11,10 @@ pub struct InvalidToken {
 }
 
 impl InvalidToken {
-    /// Returns a token stream representing `compile_error!("msg");` where
-    /// `"msg"` is the output of `self.to_string()`. **Panics if called outside
-    /// of a proc-macro context!**
+    /// Returns a token stream representing `compile_error! { "msg" }` where
+    /// `"msg"` is the output of `self.to_string()`. Braces are used so that it
+    /// works in item, statement and expression position. **Panics if called
+    /// outside of a proc-macro context!**
     pub fn to_compile_error(&self) -> proc_macro::TokenStream {
         use proc_macro::{Delimiter, Group, Ident, Punct, Spacing, TokenTree};
 
@@ -27,7 +28,7 @@ impl InvalidToken {
             TokenTree::from(Ident::new("compile_error", span)),
             TokenTree::from(Punct::new('!', Spacing::Alone)),
             TokenTree::from(Group::new(
-                Delimiter::Parenthesis,
+                Delimiter::Brace,
                 TokenTree::from(proc_macro::Literal::string(&msg)).into(),
             )),
         ];
@@ -52,7 +53,7 @@ impl InvalidToken {
             TokenTree::from(Ident::new("compile_error", span)),
             TokenTree::from(Punct::new('!', Spacing::Alone)),
             TokenTree::from(Group::new(
-                Delimiter::Parenthesis,
+                Delimiter::Brace,
                 TokenTree::from(proc_macro2::Literal::string(&msg)).into(),
             )),
         ];
@@ -73,7 +74,7 @@ impl fmt::Display for InvalidToken {
                 TokenKind::Group => "a group",
                 TokenKind::Literal => "a literal",
                 TokenKind::BoolLit => "a bool literal (`true` or `false`)",
-                TokenKind::ByteLit => "a byte literal (e.g. `b'r')",
+                TokenKind::ByteLit => "a byte literal (e.g. `b'r'`)",
                 TokenKind::ByteStringLit => r#"a byte string literal (e.g. `b"fox"`)"#,
                 TokenKind::CharLit => "a character literal (e.g. `'P'`)",
                 TokenKind::FloatLit => "a float literal (e.g. `3.14`)",
@@ -321,7 +322,7 @@ pub(crate) enum ParseErrorKind {
     /// `\r` in a (raw) string or (raw) byte string literal.
     CarriageReturn,
 
-    /// Rust only allows 256 hashes in raw * string literals.
+    /// Rust only allows 255 hashes in raw * string literals.
     TooManyHashes,
 
     /// Literal suffix is not a valid identifier.
@@ -380,7 +381,7 @@ impl fmt::Display for ParseError {
             DisallowedNulEscape => r"`\0` escape not allowed inside C string literal",
             NulByte => r"nul byte not allowed inside C string literal",
             CarriageReturn => r"`\r` not allowed in string literals",
-            TooManyHashes => "raw string literal has too many # symbols (max 256)",
+            TooManyHashes => "raw string literal has too many # symbols (max 255)",
             InvalidSuffix => "literal suffix is not a valid identifier",
             UnexpectedIntegerLit => "expected float literal, but found integer",
             IntegerSuffixStartingWithE => "integer literal suffix must not start with 'e' or 'E'",
