@@ -29,6 +29,17 @@ python3 "$lane/scripts/exposure_policy_assert_test.py" || failed=1
 python3 "$lane/scripts/compile_out_remote_tunnel_test.py" || failed=1
 python3 "$lane/scripts/entrypoint_config_test.py" || failed=1
 
+# WI#425 Ask 4: cross-check the bash grammar below against BuildKit's own
+# frontend parser (pinned buildkit v0.25.1 = the candidate CI image). The
+# parser applies the same Dockerfile-wiring policy to BuildKit's instruction
+# list, retiring the bash-parser divergence class by construction. It is a
+# cross-check, not the gate: run where a go toolchain exists (dev VM, a future
+# Go CI lane); the ci-config python image has none, so it is skipped there.
+if command -v go >/dev/null 2>&1; then
+    ( cd "$repo_root/.gitlab/go/dockerfile-parse" && go run . "$lane/Dockerfile" ) \
+        || fail "BuildKit-parser exposure-policy cross-check failed (WI#425 Ask 4)"
+fi
+
 # The wrapper must actually be installed over the pinned binary path, and
 # each build-time policy step must be an anchored RUN: a deleted RUN used to
 # pass because the script stayed named in COPY lines and comments (run-90
