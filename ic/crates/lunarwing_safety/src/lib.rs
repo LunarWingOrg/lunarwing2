@@ -56,11 +56,16 @@ impl SafetyLayer {
         }
     }
 
-    /// Move a cut outward across detected secrets and token-like runs. Scan a
-    /// fixed window once per cut, then reach a fixpoint over those matches.
-    /// If the window cannot establish a safe boundary, discard that retained
-    /// side rather than expose an unrecognized suffix. Work stays bounded.
-    fn secret_safe_cut(&self, output: &str, mut cut: usize, tail: bool) -> usize {
+    /// A cut position plus the bounds of the scan window that examined it.
+    struct CutScan {
+        cut: usize,
+        start: usize,
+        end: usize,
+    }
+
+    /// Move a cut outward across detected secrets and token-like runs inside
+    /// one bounded window, then reach a fixpoint over those matches.
+    fn scan_cut_window(&self, output: &str, mut cut: usize, tail: bool) -> CutScan {
         const WINDOW: usize = 1024;
         let start = output.ceil_char_boundary(cut.saturating_sub(WINDOW));
         let end = output.floor_char_boundary(cut.saturating_add(WINDOW).min(output.len()));
@@ -83,13 +88,56 @@ impl SafetyLayer {
                     cut -= 1;
                 }
             }
-            if (tail && cut == end && end < output.len()) || (!tail && cut == start && start > 0) {
-                return if tail { output.len() } else { 0 };
-            }
             if cut == previous {
-                return cut;
+                return CutScan { cut, start, end };
             }
         }
+    }
+
+    /// Whether a window-limited walk ran into the window edge, i.e. the
+    /// token-like run continues outside the bytes the window examined.
+    fn window_exhausted(output: &str, scan: &CutScan, tail: bool) -> bool {
+        (tail && scan.cut == scan.end && scan.end < output.len())
+            || (!tail && scan.cut == scan.start && scan.start > 0)
+    }
+
+    /// Move a cut outward across detected secrets and token-like runs (WI#349,
+    /// !1474 BA-1). WI#355: instead of discarding a retained side as soon as
+    /// its run crosses the first window edge, walk the run with a plain byte
+    /// loop (no further regex over the run), then scan one more bounded window
+    /// at the new cut. Only a second exhausted window discards the side, so a
+    /// long inline base64/hex blob no longer costs the pagination tail or
+    /// repository-file metadata. At most two 2 KiB windows are scanned per
+    /// cut, keeping WI#75's bound; the byte walk is linear in the run and
+    /// cheaper than the format! copy that follows.
+    fn secret_safe_cut(&self, output: &str, cut: usize, tail: bool) -> usize {
+        let first = self.scan_cut_window(output, cut, tail);
+        if !Self::window_exhausted(output, &first, tail) {
+            return first.cut;
+        }
+        // The run extends past this window. Walk to its boundary on plain
+        // bytes, crossing only ASCII so the new cut is a char boundary. Like
+        // the in-window snap, the walk stops where the cut would separate two
+        // token bytes, so it cannot eat a plain word past the run's edge.
+        let bytes = output.as_bytes();
+        let token = |b: u8| b.is_ascii_alphanumeric() || b"_+/=.~-".contains(&b);
+        let mut walked = first.cut;
+        while walked > 0
+            && walked < output.len()
+            && token(bytes[walked - 1])
+            && token(bytes[walked])
+        {
+            if tail {
+                walked += 1;
+            } else {
+                walked -= 1;
+            }
+        }
+        let second = self.scan_cut_window(output, walked, tail);
+        if Self::window_exhausted(output, &second, tail) {
+            return if tail { output.len() } else { 0 };
+        }
+        second.cut
     }
 
     /// Sanitize tool output before it reaches the LLM.
