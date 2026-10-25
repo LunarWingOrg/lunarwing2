@@ -31,14 +31,18 @@ pub struct GitlabClient {
     /// without touching the host, so dispatch-level tests can assert on
     /// the exact request URL. Production clients are only ever built by
     /// `load`, which never records.
+    #[cfg(test)]
     recording: bool,
+    #[cfg(test)]
     recorded_requests: RecordedRequests,
 }
 
 /// Recorded (method, endpoint) pairs from a recording client (NX-6).
+#[cfg(test)]
 pub type RecordedRequests = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
 
 /// A fresh recorder for a recording client (NX-6 test seam).
+#[cfg(test)]
 pub fn recorder() -> RecordedRequests {
     std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))
 }
@@ -67,7 +71,9 @@ impl GitlabClient {
         );
         Ok(Self {
             api_base,
+            #[cfg(test)]
             recording: false,
+            #[cfg(test)]
             recorded_requests: recorder(),
         })
     }
@@ -205,6 +211,7 @@ impl GitlabClient {
         body: Option<&[u8]>,
     ) -> Result<(u16, Vec<u8>, String), String> {
         // NX-6 test seam: record instead of issuing, before any host call.
+        #[cfg(test)]
         if self.recording {
             self.recorded_requests
                 .lock()

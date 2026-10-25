@@ -668,4 +668,23 @@ mod tests {
             .expect_err("ixe must be rejected");
         assert!(!error.contains("did you mean"), "{error}");
     }
+
+    #[test]
+    fn unknown_action_echo_is_bounded_and_escaped() {
+        let action = format!("\u{1b}\n{}", "界".repeat(100_000));
+        let error = validate(&json!({ "action": action }).to_string())
+            .expect_err("unknown action must be rejected");
+        assert!(
+            error.len() < 2_048,
+            "unbounded action echo: {} bytes",
+            error.len()
+        );
+        assert!(error.contains("(+99938 chars)"), "{error}");
+        assert!(
+            !error.contains('\u{1b}') && !error.contains('\n'),
+            "{error}"
+        );
+        assert!(error.contains("Valid actions: [current_user"), "{error}");
+        assert!(!error.contains("did you mean"), "{error}");
+    }
 }
