@@ -49,7 +49,13 @@ _hd1_ctl=$'\x0b\x0c\x0d'
 # Run-110 GX-1: bash's read drops NUL bytes that BuildKit keeps, so a NUL
 # after a trailing backslash, or a NUL-prefixed line inside a continuation,
 # ends an instruction for BuildKit while this loop joins the next one.
-if ! python3 -c 'import sys; sys.exit(b"\0" in open(sys.argv[1], "rb").read())' "$dockerfile"; then
+# WI#425 GZ-2: name the real cause — a missing or unreadable Dockerfile
+# used to surface as the misleading "contains NUL bytes" message (the
+# inline probe raises on open() before any byte is inspected). It still
+# fails closed; now it says what is actually wrong.
+if [ ! -r "$dockerfile" ]; then
+    fail "Dockerfile is missing or unreadable (WI#425 GZ-2): $dockerfile"
+elif ! python3 -c 'import sys; sys.exit(b"\0" in open(sys.argv[1], "rb").read())' "$dockerfile"; then
     fail "Dockerfile contains NUL bytes (run-110 GX-1)"
 fi
 _first_line=1

@@ -140,7 +140,9 @@ ENV OPENCODE_DISABLE_AUTOUPDATE=1
 # rewrite both files identically. This detects accidental drift; an adversarial
 # Dockerfile edit can still defeat it by replacing the environment or checker
 # (run-109 GW-3). Absent or mismatched fails the build with the checker intact.
-ARG LUNARWING_WRAPPER_SHA256=
+# WI#425 GX-3: the ARG is declared right above the final assert RUN, so a
+# wrapper edit invalidates only that layer instead of every runtime-stage
+# layer below the old mid-file declaration.
 
 LABEL org.opencontainers.image.title="LunarWing OpenCode 2 Worker" \
       org.opencontainers.image.description="Persistent OpenCode 2 worker with WebSocket agent communication" \
@@ -386,6 +388,11 @@ RUN mkdir -p /home/opencode2/.local/share/opencode \
     && chown -R opencode2:opencode2 /home/opencode2 /workspace /var/log/lunarwing /app/results
 
 # Check the final runtime filesystem, after all COPY/chown/chmod operations.
+# The wrapper anchor ARG (WI#357 run-106 GJ-3(a), WI#425 GX-3 layer-locality)
+# is declared here so the digest comparison is visible at the assert and a
+# wrapper edit invalidates only this layer's cache, not the whole runtime
+# stage. build-worker-image.sh and mt-admin's build_opencode2_worker pass it.
+ARG LUNARWING_WRAPPER_SHA256=
 RUN python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --image-filesystem
 
 # ── ports ──────────────────────

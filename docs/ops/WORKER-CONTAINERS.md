@@ -1010,7 +1010,14 @@ userns identities on one host.
 
 ```bash
 cd opencode2.4lunarwing
-docker build -t lunarwing-worker-opencode2:latest .
+# The final --image-filesystem assert anchors the installed wrapper against
+# the checkout's scripts/opencode-exposure-guard.sh digest (WI#357 GJ-3a,
+# WI#425): a manual build must forward it or the image fails fail-closed.
+# Recompute it after any wrapper edit:
+#   sha256sum scripts/opencode-exposure-guard.sh
+docker build \
+  --build-arg LUNARWING_WRAPPER_SHA256=f2fc2ba6befc2d6d22dbae33029ab9a84ced4e6fa6927839ac636fdd42ca5b7b \
+  -t lunarwing-worker-opencode2:latest .
 
 # Select the worker per tenant, then build the shared image via mt-admin
 sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <name> --with-opencode2
