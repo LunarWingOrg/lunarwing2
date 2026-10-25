@@ -138,6 +138,18 @@ jq '.tenants.alpha.ports.weird = "oops"' "$FIXTURE/clean.json" >"$PORTS_REGISTRY
 assert_eq "non-numeric values ignored" \
   "$(ports_registry_duplicate_ports)" ""
 
+# NY-9 (!1907 review): a genuinely unparseable registry (a tenant's .ports is
+# a string) must surface as a non-zero status, not a silent "no duplicates".
+# Before the fix the helper ended in '|| true' and returned rc=0 with empty
+# output, so doctor printed '[PASS] no duplicate ports' for a file it could
+# not read. Capture the status explicitly — assert_eq's $(...) would abort
+# under set -e on the non-zero return we are asserting for.
+jq '.tenants.alpha.ports = "corrupt"' "$FIXTURE/clean.json" >"$PORTS_REGISTRY"
+dup_rc=0
+dup_out="$(ports_registry_duplicate_ports)" || dup_rc=$?
+assert_eq "unparseable registry returns non-zero status" "$dup_rc" "5"
+assert_eq "unparseable registry yields empty collision output" "$dup_out" ""
+
 echo "=== ports_warn_block_in_use tests ==="
 
 BUSY_PORT="$(free_port)"

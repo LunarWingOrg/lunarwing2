@@ -24,12 +24,19 @@
 
 ports_registry_init() {
   local registry_version="" registry_needs_repair="false"
+  # NY-10 (!1907 review): a freshly-seeded registry has no prior live state to
+  # roll back to, so the v8 migration's backup + rollback hint would be
+  # confusing litter on every new host. Track whether the file pre-existed
+  # this call; ports_migrate_v8 skips the backup when it did not.
   if [[ -f "$PORTS_REGISTRY" ]]; then
+    ports_migrate_registry_preexisted=1
     registry_version="$(jq -r '.version // 0' "$PORTS_REGISTRY" 2>/dev/null || true)"
     if jq -e '.tenants | to_entries[] | select(.value.extended_ports | has("darkirc_adapter") | not)' \
         "$PORTS_REGISTRY" >/dev/null 2>&1; then
       registry_needs_repair="true"
     fi
+  else
+    ports_migrate_registry_preexisted=0
   fi
   if [[ ! -f "$PORTS_REGISTRY" || "$registry_version" != "17" || "$registry_needs_repair" == "true" ]]; then
     acquire_ports_lock
@@ -229,9 +236,26 @@ ports_migrate_v7() {
   say "port registry migrated to v7 (darkirc_irc + darkirc_rpc added)"
 }
 
+# v7 -> v8: dedicate extended_ports.reserved_3 -> nanocode_health and
+# reserved_4 -> pebble_health (pure rename). Mirrors the standalone
+# scripts/migrate-ports-v8.sh's safety net (WI#379): back the live registry up
+# first, then refuse to swap a candidate that leaves any numeric port assigned
+# to more than one slot — on refusal the backup stays and the live registry is
+# untouched.
 ports_migrate_v8() {
   say "migrating port registry v${current_version} -> v8 (dedicate nanocode_health + pebble_health) ..."
-  local tmp
+  local backup="" tmp collisions
+  # NY-10 (!1907 review): only back up and offer a rollback hint when the
+  # registry pre-existed this invocation. A freshly-seeded v3 registry has no
+  # prior live state; backing up its intermediate v7 form would leave a
+  # confusing `.bak.*` next to a file that never existed as a live state.
+  if [[ "${ports_migrate_registry_preexisted:-1}" == "1" ]]; then
+    backup="${PORTS_REGISTRY}.bak.$(date -u +%Y%m%d%H%M%S)"
+    cp -p "$PORTS_REGISTRY" "$backup" \
+      || die "failed to back up port registry to $backup; v8 migration aborted"
+    say "backed up port registry to $backup"
+  fi
+
   tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
   jq '
     .version = 8
@@ -247,10 +271,27 @@ ports_migrate_v8() {
             )
         )
       )
-  ' "$PORTS_REGISTRY" >"$tmp"
+  ' "$PORTS_REGISTRY" >"$tmp" \
+    || { rm -f "$tmp"; die "failed to migrate port registry to v8; registry unchanged (backup: $backup)"; }
+
+  collisions="$(ports_registry_collision_list "$tmp")" || {
+    rm -f "$tmp"
+    die "v8 migration aborted: could not verify port uniqueness; registry unchanged (backup: $backup)"
+  }
+  if [[ -n "$collisions" ]]; then
+    rm -f "$tmp"
+    die "v8 migration aborted: port(s) $collisions assigned to more than one slot; registry unchanged (backup: $backup)"
+  fi
+
   chmod 0644 "$tmp"
   mv "$tmp" "$PORTS_REGISTRY"
   current_version=8
+  say "port registry migrated to v8 (nanocode_health + pebble_health dedicated)"
+  # Not a bare `&&` chain: that would make the no-backup case the function's
+  # exit status and abort the `set -e` caller.
+  if [[ -n "$backup" ]]; then
+    say "rollback if needed: cp $backup $PORTS_REGISTRY"
+  fi
 }
 
 ports_migrate() {
@@ -805,13 +846,20 @@ ports_warn_block_in_use() {
   return 0
 }
 
-# List port numbers assigned to more than one slot across the whole registry
-# (all per-tenant port maps plus the host-global health_metrics slot). Empty
-# output means no collisions. Pure read — used by doctor; also handy for
-# operators debugging a hand-edited or migrated registry.
-ports_registry_duplicate_ports() {
+# List numeric port numbers assigned to more than one slot in <registry-file>
+# (all per-tenant port maps plus the host-global health_metrics slot) as a
+# comma-separated string; empty output means no collisions. Non-numeric hand
+# edits are ignored. Shared by the post-allocation warning / doctor query and
+# the v8 migration's pre-swap guard (WI#379) so both define "collision"
+# identically.
+#
+# Returns jq's status (NY-9, !1907 review): a corrupt or unreadable registry
+# surfaces as a non-zero exit with empty output, NOT a silent "no collisions".
+# Callers that only care about the collision string must either tolerate a
+# non-zero status (set +e around the capture) or branch on it like the v8
+# migration guard and doctor do.
+ports_registry_collision_list() {  # <registry-file>
   require_cmd jq
-  [[ -f "$PORTS_REGISTRY" ]] || return 0
   jq -r '
     [ .tenants[]
       | ((.ports // {}) | to_entries[] | .value),
@@ -824,7 +872,17 @@ ports_registry_duplicate_ports() {
     | group_by(.)
     | map(select(length > 1) | .[0] | tostring)
     | join(", ")
-  ' "$PORTS_REGISTRY" 2>/dev/null
+  ' "$1" 2>/dev/null
+}
+
+# List port numbers assigned to more than one slot across the whole registry.
+# Empty output means no collisions. Pure read — used by doctor; also handy for
+# operators debugging a hand-edited or migrated registry. Propagates the
+# collision-list status (non-zero on an unparseable registry) so doctor can
+# distinguish "no collisions" from "could not parse".
+ports_registry_duplicate_ports() {
+  [[ -f "$PORTS_REGISTRY" ]] || return 0
+  ports_registry_collision_list "$PORTS_REGISTRY"
 }
 
 # Mark darkirc enabled for a tenant in the registry (one-directional: false -> true).

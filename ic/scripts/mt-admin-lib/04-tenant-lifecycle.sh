@@ -2048,13 +2048,19 @@ doctor() {
   # duplicates until now.
   if [[ -f "$PORTS_REGISTRY" ]]; then
     local _port_dups
-    _port_dups="$(ports_registry_duplicate_ports)"
-    if [[ -n "$_port_dups" ]]; then
-      printf '[FAIL] no duplicate ports in registry (colliding: %s)\n' "$_port_dups"
-      fail=$((fail + 1))
+    if _port_dups="$(ports_registry_duplicate_ports)"; then
+      if [[ -n "$_port_dups" ]]; then
+        printf '[FAIL] no duplicate ports in registry (colliding: %s)\n' "$_port_dups"
+        fail=$((fail + 1))
+      else
+        printf '[PASS] no duplicate ports in registry\n'
+        pass=$((pass + 1))
+      fi
     else
-      printf '[PASS] no duplicate ports in registry\n'
-      pass=$((pass + 1))
+      # An unparseable registry is itself the failure (NY-9, !1907 review): the
+      # duplicate check must not report PASS for a file it could not read.
+      printf '[FAIL] could not parse port registry\n'
+      fail=$((fail + 1))
     fi
   fi
   _check "source repo exists" test -d "$SOURCE_REPO/ic"
