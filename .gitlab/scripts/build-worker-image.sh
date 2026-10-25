@@ -99,7 +99,9 @@ opencode2.4lunarwing/scripts/exposure_policy_assert.py
 opencode2.4lunarwing/scripts/exposure_policy_assert_test.py
 opencode2.4lunarwing/scripts/entrypoint_config_test.py
 opencode2.4lunarwing/scripts/compile_out_remote_tunnel.py
-opencode2.4lunarwing/scripts/compile_out_remote_tunnel_test.py'
+opencode2.4lunarwing/scripts/compile_out_remote_tunnel_test.py
+opencode2.4lunarwing/scripts/runtime_smoke.py
+opencode2.4lunarwing/scripts/runtime_smoke_test.py'
         source_ref=a517687fde98a7329ada3ae644a01a9fc6c4e99e
         # WI#357 run-106 GJ-3(a): the checkout's wrapper digest, compared by
         # the in-image --image-filesystem assert against the installed wrapper.
