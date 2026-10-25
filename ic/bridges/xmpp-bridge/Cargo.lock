@@ -3959,7 +3959,7 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
 name = "lunarwing"
-version = "2.1.6"
+version = "2.1.7"
 dependencies = [
  "aes-gcm 0.10.3",
  "agent-client-protocol",
@@ -4062,7 +4062,7 @@ dependencies = [
 
 [[package]]
 name = "lunarwing_common"
-version = "2.1.6"
+version = "2.1.7"
 dependencies = [
  "serde",
  "serde_json",
@@ -4070,7 +4070,7 @@ dependencies = [
 
 [[package]]
 name = "lunarwing_engine"
-version = "2.1.6"
+version = "2.1.7"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4093,7 +4093,7 @@ dependencies = [
 
 [[package]]
 name = "lunarwing_safety"
-version = "2.1.6"
+version = "2.1.7"
 dependencies = [
  "aho-corasick",
  "regex",
@@ -4105,7 +4105,7 @@ dependencies = [
 
 [[package]]
 name = "lunarwing_skills"
-version = "2.1.6"
+version = "2.1.7"
 dependencies = [
  "chrono",
  "futures",
@@ -9322,7 +9322,7 @@ dependencies = [
 
 [[package]]
 name = "xmpp-bridge"
-version = "2.1.6"
+version = "2.1.7"
 dependencies = [
  "anyhow",
  "axum",
