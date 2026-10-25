@@ -7677,6 +7677,24 @@ pub(crate) mod tests {
                 "duplicate defaults must resolve to the oldest, not map order"
             );
         }
+
+        // `TestStore` lists from a `HashMap`, so a first-match `.find()` mutant
+        // picks the oldest only by luck. Rebuild the store — and with it the
+        // map's iteration order — enough times that surviving is not credible.
+        for _ in 0..20 {
+            let shuffled = Arc::new(TestStore::new());
+            shuffled.save_project(&other).await.expect("save other");
+            shuffled.save_project(&oldest).await.expect("save oldest");
+            shuffled.save_project(&newest).await.expect("save newest");
+            let shuffled_dyn: Arc<dyn Store> = shuffled;
+            let resolved = resolve_user_project(&shuffled_dyn, "bob", fallback)
+                .await
+                .expect("resolve project");
+            assert_eq!(
+                resolved, oldest.id,
+                "the oldest duplicate default must win for every listing order"
+            );
+        }
     }
 
     #[tokio::test]
