@@ -340,9 +340,15 @@ fi
 # OpenRC start() ordering), then start the container and probe it. This host's
 # rootless backend (pasta) publishes the host at 169.254.1.2; the arm detects
 # the backend and uses the same host addresses the renderer emits.
+# Set at file scope: the EXIT trap runs after run_live_arm returns, when its
+# `local`s are gone (an unbound `container` aborted cleanup mid-way).
+LIVE_NET="lw-egress-liveprobe"
+LIVE_CONTAINER="egress-liveprobe"
+LIVE_HTTPD_PID=""
+
 run_live_arm() {
-  local image="docker.io/library/busybox:stable" net="lw-egress-liveprobe"
-  local subnet="10.89.249.0/24" container="egress-liveprobe" port=18099
+  local image="docker.io/library/busybox:stable"
+  local net="$LIVE_NET" subnet="10.89.249.0/24" container="$LIVE_CONTAINER" port=18099
   local addr_ok addr_deny
   command -v podman >/dev/null 2>&1 || { say_skip "live arm: podman missing"; return 0; }
   command -v nft >/dev/null 2>&1 || { say_skip "live arm: nft missing"; return 0; }
@@ -356,16 +362,22 @@ run_live_arm() {
   addr_deny="203.0.113.10"   # TEST-NET-3: never routed
 
   cleanup_live() {
-    podman rm -f "$container" >/dev/null 2>&1 || true
-    podman network rm -f "$net" >/dev/null 2>&1 || true
-    [[ -n "${httpd_pid:-}" ]] && kill "$httpd_pid" >/dev/null 2>&1 || true
+    podman rm -f "$LIVE_CONTAINER" >/dev/null 2>&1 || true
+    podman network rm -f "$LIVE_NET" >/dev/null 2>&1 || true
+    if [[ -n "$LIVE_HTTPD_PID" ]]; then
+      kill -9 "$LIVE_HTTPD_PID" >/dev/null 2>&1 || true
+    fi
     podman unshare --rootless-netns nft delete table inet "$WORKER_EGRESS_TABLE" >/dev/null 2>&1 || true
   }
   trap cleanup_live EXIT
 
-  # A host-local "allowed destination" for the allowlisted half.
-  ( cd "$fixture" && python3 -m http.server "$port" --bind 0.0.0.0 >/dev/null 2>&1 ) &
-  httpd_pid=$!
+  # A host-local "allowed destination" for the allowlisted half. The server is
+  # started with every inherited descriptor redirected to the log: a background
+  # job that keeps the harness's stdout alive makes the caller's pipe wait on a
+  # process the harness no longer owns (observed: `| tail` never returned).
+  ( cd "$fixture" && exec python3 -m http.server "$port" --bind 0.0.0.0 ) \
+    >"$fixture/httpd.log" 2>&1 </dev/null &
+  LIVE_HTTPD_PID=$!
   sleep 1
   curl -sf -o /dev/null -m 2 "http://127.0.0.1:$port/" \
     || { say_skip "live arm: could not start the local fixture server"; return 0; }
@@ -374,6 +386,11 @@ run_live_arm() {
     || { fail "live arm: network create failed"; return 1; }
   printf 'SUBNET=%s\nALLOW=%s:%s\n' "$subnet" "$addr_ok" "$port" \
     >"$WORKER_EGRESS_DIR/liveprobe.conf"
+  # The earlier sections replace these two sources with fixed stubs; the live
+  # arm must render from the real conf file it just wrote, so point them back
+  # at the module's own reader for this tenant.
+  _worker_egress_llm_targets() { return 0; }
+  _worker_egress_operator_allow() { worker_egress_state_get liveprobe ALLOW; }
   CONTAINER_RT=podman MT_ROOTLESS=true worker_egress_ruleset liveprobe \
     >"$fixture/liveprobe.nft" || { fail "live arm: ruleset render failed"; return 1; }
 
@@ -389,10 +406,12 @@ run_live_arm() {
     || { fail "live arm: container start failed"; return 1; }
   sleep 2
 
-  if podman exec "$container" wget -q -O /dev/null -T 5 "http://$addr_ok:$port/" >/dev/null 2>&1; then
+  local probe_err
+  if probe_err="$(podman exec "$container" wget -q -O /dev/null -T 5 "http://$addr_ok:$port/" 2>&1)"; then
     pass "live arm: an allowlisted destination is reachable from the worker"
   else
-    fail "live arm: the allowlisted destination was blocked (allowlist too narrow)"
+    fail "live arm: the allowlisted destination was blocked (${probe_err:-no output})"
+    say "  ruleset under test:"; sed 's/^/    /' "$fixture/liveprobe.nft"
   fi
   if podman exec "$container" wget -q -O /dev/null -T 5 "https://$addr_deny/" >/dev/null 2>&1; then
     fail "live arm: a non-allowlisted destination was reachable (filter not enforcing)"
