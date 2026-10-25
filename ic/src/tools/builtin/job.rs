@@ -2702,10 +2702,9 @@ impl Tool for CancelJobTool {
                 Err(crate::error::OrchestratorError::ContainerNotFound { .. }) => {}
                 // DG-4: write-back promotion is running; cancellation must
                 // not clear the secrets its secret-scan needs or remove the
-                // staging dir mid-walk.
-                Err(crate::error::OrchestratorError::InvalidContainerState { state, .. })
-                    if state.starts_with("finalizing") =>
-                {
+                // staging dir mid-walk. Structural refusal variant (DH-4
+                // nit) — no error-string matching.
+                Err(crate::error::OrchestratorError::JobFinalizing { .. }) => {
                     return Err(ToolError::ExecutionFailed(format!(
                         "job {job_id} is finalizing write-back promotion; cancellation is refused — retry once it completes"
                     )));
