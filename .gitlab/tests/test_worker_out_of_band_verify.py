@@ -18,6 +18,7 @@ import os
 import pathlib
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -173,6 +174,63 @@ class BuildScriptWiringTests(unittest.TestCase):
 
     def test_build_image_appends_extra_output(self):
         self.assertIn('[ -n "${build_image_extra_output:-}" ] && set -- "$@" --output "$build_image_extra_output"', self.build_script)
+
+
+class GoParserPolicyTests(unittest.TestCase):
+    """WI#425 Ask 4: BuildKit's own parser drives a policy cross-check.
+
+    The Go tool under .gitlab/go/dockerfile-parse/ applies the exposure policy
+    to BuildKit's instruction list (pinned buildkit v0.25.1 = the candidate
+    CI image) instead of re-implementing the Dockerfile grammar in bash. The
+    bash grammar in check-worker-exposure-policy.sh stays the authoritative
+    gate; this parser is the cross-check the WI asks for while ten historical
+    divergences are retired by construction (they were bash-parser artifacts).
+    """
+
+    PARSER_DIR = ROOT / ".gitlab" / "go" / "dockerfile-parse"
+    GO = shutil.which("go")
+
+    def test_module_is_pinned_to_the_candidate_buildkit(self):
+        go_mod = (self.PARSER_DIR / "go.mod").read_text(encoding="utf-8")
+        self.assertIn("github.com/moby/buildkit v0.25.1", go_mod)
+        go_sum = (self.PARSER_DIR / "go.sum").read_text(encoding="utf-8")
+        self.assertIn("github.com/moby/buildkit v0.25.1", go_sum)
+
+    def test_policy_source_applies_the_parser(self):
+        # The policy must import BuildKit's frontend parser (mutation pin:
+        # reverting to a hand-rolled split is caught here).
+        main_go = (self.PARSER_DIR / "main.go").read_text(encoding="utf-8")
+        self.assertIn('"github.com/moby/buildkit/frontend/dockerfile/parser"', main_go)
+        self.assertIn("parser.Parse", main_go)
+
+    @unittest.skipUnless(
+        shutil.which("go") is not None, "go toolchain not available in this image"
+    )
+    def test_go_tests_pass_on_the_real_tree(self):
+        result = subprocess.run(
+            ["go", "test", "./..."],
+            cwd=self.PARSER_DIR,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ok", result.stdout)
+
+    @unittest.skipUnless(
+        shutil.which("go") is not None, "go toolchain not available in this image"
+    )
+    def test_parser_policy_accepts_the_real_dockerfile(self):
+        dockerfile = ROOT / "opencode2.4lunarwing" / "Dockerfile"
+        result = subprocess.run(
+            ["go", "run", ".", str(dockerfile)],
+            cwd=self.PARSER_DIR,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("BuildKit parser): ok", result.stdout)
 
 
 if __name__ == "__main__":
