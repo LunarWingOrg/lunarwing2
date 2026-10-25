@@ -1636,6 +1636,15 @@ async fn finalize_harness_job(
         summary = run_promotion(&deps, job_id, &owner_id, &staging, &policy).await;
     }
 
+    // DZ-6: the `harness_write_back` audit event is written via a direct
+    // `save_job_event` — the event ingest redaction never sees it. Scrub the
+    // summary against the job's own mounted secret values before persisting,
+    // the same defense the /event and /complete handlers apply (best-effort
+    // backstop behind the path and content scans, not the primary control).
+    if let Some(redactor) = deps.token_store.harness_secret_redactor(job_id).await {
+        harness::scrub_promotion_summary(&mut summary, &redactor);
+    }
+
     tracing::info!(
         job_id = %job_id,
         promoted = summary.records.len(),
