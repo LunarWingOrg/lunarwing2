@@ -1246,6 +1246,94 @@ build_opencode_worker() {
   say "opencode worker image built: lunarwing-worker-opencode:latest [$toolchain_desc] (revision $source_revision)"
 }
 
+# WI#425 (run-109 GW-3 out-of-band verification, mt-admin half): verify a
+# freshly built opencode2 image with the CHECKOUT's own wrapper bytes and
+# policy assertions instead of trusting the in-Dockerfile assert. The
+# in-image checker and its environment are baked by the same Dockerfile
+# they verify; this check runs host-side, from the same checkout that
+# produced the build args, against the published image object.
+#   * the installed wrapper (/usr/local/bin/opencode) must be byte-identical
+#     to the checkout's scripts/opencode-exposure-guard.sh (podman create +
+#     podman cp + cmp — never cat inside the image: the image is untrusted);
+#   * the real binary (/usr/local/lib/opencode2/opencode) must be present and
+#     a regular file;
+#   * the image config Env must not retarget OPENCODE_BIN or
+#     LUNARWING_REAL_OPENCODE, and must carry OPENCODE_DISABLE_AUTOUPDATE=1
+#     (the updater's actual kill switch);
+#   * the image config must not carry a Shell override (the Dockerfile
+#     refuses SHELL, so a baked one is drift).
+# Failures are fatal (die): the caller just built the image; a refusal here
+# must not leave a bad image tagged :latest behind — the caller re-tags on
+# success only.
+# Usage: _verify_opencode2_image_out_of_band <image-ref> <opencode2-dir> <wrapper-anchor-sha256>
+_verify_opencode2_image_out_of_band() {
+  local image_ref="$1" opencode2_dir="$2" wrapper_anchor="$3"
+  local verify_status=0
+  local cid tmp_dir wrapper_source installed_sha env_json config_shell
+
+  [[ -n "$image_ref" && -d "$opencode2_dir" && "$wrapper_anchor" =~ ^[0-9a-f]{64}$ ]] \
+    || die "out-of-band verification needs <image> <opencode2-dir> <wrapper-sha256>"
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/lw-oob.XXXXXX")" || die "cannot create out-of-band verify dir"
+  # The container is never started (create only); it is removed on every path.
+  cid="$("$CONTAINER_RT" create "$image_ref" 2>/dev/null)" || {
+    rm -rf "$tmp_dir"
+    die "out-of-band verification: cannot create a container from $image_ref"
+  }
+
+  if "$CONTAINER_RT" cp "$cid:/usr/local/bin/opencode" "$tmp_dir/wrapper" 2>/dev/null; then
+    wrapper_source="$opencode2_dir/scripts/opencode-exposure-guard.sh"
+    if cmp -s "$tmp_dir/wrapper" "$wrapper_source"; then
+      say "out-of-band verify: installed wrapper is byte-identical to the checkout"
+    else
+      echo "ERROR: installed /usr/local/bin/opencode differs from $wrapper_source (WI#425 out-of-band)" >&2
+      verify_status=1
+    fi
+    installed_sha="$(sha256sum < "$tmp_dir/wrapper")" || installed_sha=""
+    installed_sha="${installed_sha%% *}"
+    if [[ "$installed_sha" != "$wrapper_anchor" ]]; then
+      echo "ERROR: installed wrapper digest $installed_sha does not match the build-arg anchor $wrapper_anchor (WI#425 out-of-band)" >&2
+      verify_status=1
+    fi
+  else
+    echo "ERROR: cannot copy /usr/local/bin/opencode out of $image_ref (WI#425 out-of-band)" >&2
+    verify_status=1
+  fi
+
+  if "$CONTAINER_RT" cp "$cid:/usr/local/lib/opencode2/opencode" "$tmp_dir/real-binary" 2>/dev/null \
+     && [[ -f "$tmp_dir/real-binary" ]]; then
+    say "out-of-band verify: real binary present in the image"
+  else
+    echo "ERROR: /usr/local/lib/opencode2/opencode is missing from $image_ref (WI#425 out-of-band)" >&2
+    verify_status=1
+  fi
+
+  "$CONTAINER_RT" rm "$cid" >/dev/null 2>&1 || true
+  rm -rf "$tmp_dir"
+
+  env_json="$("$CONTAINER_RT" image inspect "$image_ref" --format '{{json .Config.Env}}' 2>/dev/null)" \
+    || { echo "ERROR: cannot inspect image config Env for $image_ref (WI#425 out-of-band)" >&2; verify_status=1; }
+  if [[ "$verify_status" -eq 0 ]]; then
+    if printf '%s' "$env_json" | grep -Eq '"OPENCODE_BIN=|"LUNARWING_REAL_OPENCODE='; then
+      echo "ERROR: image config Env retargets OPENCODE_BIN or LUNARWING_REAL_OPENCODE (WI#425 out-of-band)" >&2
+      verify_status=1
+    fi
+    if ! printf '%s' "$env_json" | grep -q '"OPENCODE_DISABLE_AUTOUPDATE=1"'; then
+      echo "ERROR: image config Env lost OPENCODE_DISABLE_AUTOUPDATE=1 (WI#425 out-of-band)" >&2
+      verify_status=1
+    fi
+    config_shell="$("$CONTAINER_RT" image inspect "$image_ref" --format '{{.Config.Shell}}' 2>/dev/null)" \
+      || config_shell=""
+    if [[ -n "${config_shell// /}" && "$config_shell" != "<nil>" ]]; then
+      echo "ERROR: image config carries a Shell override: $config_shell (WI#425 out-of-band)" >&2
+      verify_status=1
+    fi
+  fi
+
+  [[ "$verify_status" -eq 0 ]] || die "out-of-band opencode2 image verification FAILED for $image_ref (WI#425)"
+  say "out-of-band verify: $image_ref passes the checkout-side exposure-policy checks"
+}
+
 build_opencode2_worker() {
   local no_cache="${1:-false}"
   local with_toolchains="${2:-false}"
@@ -1272,12 +1360,16 @@ build_opencode2_worker() {
   # WI#357 run-106 GJ-3(a): pass the checkout's exposure-guard wrapper digest
   # for the in-image --image-filesystem comparison. This detects accidental
   # drift; an adversarial Dockerfile can still replace the environment or
-  # checker. Out-of-band image verification remains a WI#357 follow-up (GW-3).
+  # checker — the WI#425 out-of-band verification below re-checks the built
+  # image host-side with the checkout's own bytes.
   local wrapper_file="$opencode2_dir/scripts/opencode-exposure-guard.sh" wrapper_anchor
   wrapper_anchor=$(sha256sum < "$wrapper_file") || die "cannot hash $wrapper_file"
   wrapper_anchor=${wrapper_anchor%% *}
   [[ "$wrapper_anchor" =~ ^[0-9a-f]{64}$ ]] || die "invalid wrapper sha256 for $wrapper_file"
 
+  # Build to a candidate tag first: WI#425's out-of-band verification must
+  # gate the :latest re-tag so a refused image never replaces a good one.
+  local candidate_tag="lunarwing-worker-opencode2:candidate"
   if [[ "$CONTAINER_RT" == "podman" ]]; then
     local -a layer_args=()
     if [[ "$no_cache" == "true" ]]; then
@@ -1289,12 +1381,21 @@ build_opencode2_worker() {
       fi
       layer_args=(--layers=false)
     fi
-    podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" --build-arg "LUNARWING_WRAPPER_SHA256=$wrapper_anchor" --network=host --format docker -t lunarwing-worker-opencode2:latest "$opencode2_dir" \
+    podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" --build-arg "LUNARWING_WRAPPER_SHA256=$wrapper_anchor" --network=host --format docker -t "$candidate_tag" "$opencode2_dir" \
       || die "opencode2 worker image build failed"
   else
-    docker build "${cache_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" --build-arg "LUNARWING_WRAPPER_SHA256=$wrapper_anchor" -t lunarwing-worker-opencode2:latest "$opencode2_dir" \
+    docker build "${cache_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" --build-arg "LUNARWING_WRAPPER_SHA256=$wrapper_anchor" -t "$candidate_tag" "$opencode2_dir" \
       || die "opencode2 worker image build failed"
   fi
+
+  # WI#425 (run-109 GW-3, durable out-of-band verification): verify the built
+  # image with the checkout's own wrapper bytes and config expectations —
+  # host-side, independent of anything the Dockerfile bakes. Only a passing
+  # image is re-tagged :latest.
+  _verify_opencode2_image_out_of_band "$candidate_tag" "$opencode2_dir" "$wrapper_anchor"
+  "$CONTAINER_RT" tag "$candidate_tag" lunarwing-worker-opencode2:latest \
+    || die "cannot re-tag $candidate_tag as lunarwing-worker-opencode2:latest"
+  "$CONTAINER_RT" rmi "$candidate_tag" >/dev/null 2>&1 || true
 
   say "opencode2 worker image built: lunarwing-worker-opencode2:latest [$toolchain_desc] (revision $source_revision)"
 }
