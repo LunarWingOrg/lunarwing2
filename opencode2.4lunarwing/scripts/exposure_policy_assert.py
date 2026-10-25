@@ -354,8 +354,9 @@ def check_installed_wrapper(
     installed digest must also match the LUNARWING_WRAPPER_SHA256 build-arg
     anchor (run-106 GJ-3a). This detects accidental drift; an adversarial
     Dockerfile edit can still defeat it by replacing the environment or
-    checker (run-109 GW-3). Image builds only (v2 profile); independent
-    checkout-side image verification remains a WI#357 follow-up.
+    checker (run-109 GW-3). Image builds only (v2 profile); the durable
+    checkout-side out-of-band verification is WI#425 Ask 1 (the CI export +
+    --image-root path and mt-admin's podman create/cp/cmp).
 
     WI#425 GX-2: OPENCODE_BIN may not retarget the wrapper at build time,
     the real binary's owner and mode are verified (root-owned, not

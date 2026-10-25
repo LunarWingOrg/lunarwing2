@@ -761,19 +761,26 @@ Enforced controls (opencode2 lane unless noted):
    **not unforgeable**: an adversarial Dockerfile edit can still defeat the
    check by replacing its environment or the checker itself (run-109 GW-3).
    The CI guard's ENV/SHELL refusals are an additional drift check.
-   **WI#357 follow-up:** verify the built image out of band with the
-   checkout's checker and wrapper bytes, including image-config `Env` and
-   `Shell`: export the BuildKit filesystem via a local/tar output in CI,
-   and use `podman create`/`podman cp` (or the Docker equivalents) plus
-   checkout-side comparison in mt-admin. This durable check is deferred;
-   it would also avoid relying on the partial Dockerfile parser for GW-2
-   and the remaining binary/boot-path checks in GW-4. Note the
-   `PATH` resolution is a *build-time* property: at runtime the agent-owned
-   `~/.cargo/bin` and `~/go/bin` (five PATH entries — the four toolchain
-   dirs plus an empty `/usr/local/sbin` — precede `/usr/local/bin`), so a
-   runtime `PATH` `opencode` need not hit the wrapper; the entrypoint is
-   unaffected (absolute `OPENCODE_BIN`) and the wrapper remains a
-   naive-use guard.
+   **WI#425 out-of-band verification (was the WI#357 follow-up, run-109
+   GW-3):** verify the built image out of band with the checkout's checker
+   and wrapper bytes, including image-config `Env` and `Shell` — **landed in
+   2.1.7.0.** In CI, the opencode2 candidate build exports its final
+   filesystem via a second BuildKit `--output type=local`, and
+   `worker-opencode2-exposure-verify` runs the checkout's
+   `exposure_policy_assert.py --image-root` against that export plus fetches
+   the image config blob (refusing a `Shell` override, an `Env` retargeting
+   `OPENCODE_BIN`/`LUNARWING_REAL_OPENCODE`, or a missing
+   `OPENCODE_DISABLE_AUTOUPDATE=1`); promotion now `needs` that verify job.
+   In mt-admin, `build_opencode2_worker` builds a `:candidate` tag then
+   `podman create`/`podman cp` + `cmp` the installed wrapper against the
+   checkout (and checks image-config `Env`/`Shell`) before re-tagging
+   `:latest`. This no longer relies on the partial Dockerfile parser for
+   GW-2 / the binary/boot-path checks in GW-4. Note the `PATH` resolution is
+   a *build-time* property: at runtime the agent-owned `~/.cargo/bin` and
+   `~/go/bin` (five PATH entries — the four toolchain dirs plus an empty
+   `/usr/local/sbin` — precede `/usr/local/bin`), so a runtime `PATH`
+   `opencode` need not hit the wrapper; the entrypoint is unaffected
+   (absolute `OPENCODE_BIN`) and the wrapper remains a naive-use guard.
 6. **Runtime smoke (automated suite DEFERRED to WI#424, 2.1.7.0):** live
    `service.json`/`opentunnel` dir/listener assertions against a running
    container are required manually for WI#427 until that suite exists.
