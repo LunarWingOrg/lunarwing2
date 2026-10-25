@@ -257,6 +257,7 @@ cat >"$FIXTURE/rename-fail-v7.json" <<'JSON'
 JSON
 PORTS_REGISTRY="$FIXTURE/rename-fail.json"
 cp "$FIXTURE/rename-fail-v7.json" "$PORTS_REGISTRY"
+# shellcheck disable=SC2034  # read by ports_migrate_v8 (sourced library)
 current_version=7
 
 rc=0
