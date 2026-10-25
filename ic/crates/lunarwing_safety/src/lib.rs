@@ -1354,7 +1354,7 @@ mod tests {
                 "[Output blocked due to potential secret leakage]"
             );
             // Bearer JWT is fully redacted (no truncation, small input).
-            let jwt = format!("{}.{}.{}", &body, &body, &body);
+            let jwt = format!("{body}.{body}.{body}");
             let content = format!("Authorization: Bearer {jwt}");
             let result = safety.sanitize_tool_output("gitlab", &content);
             assert!(result.was_modified);
@@ -1365,7 +1365,7 @@ mod tests {
             );
             assert!(result.content.contains("[REDACTED]"));
             // The dot-separated payload and signature specifically.
-            assert!(!result.content.contains(&format!("{}.{}", &body, &body)));
+            assert!(!result.content.contains(&format!("{body}.{body}")));
         }
     }
 }
