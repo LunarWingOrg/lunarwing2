@@ -534,6 +534,53 @@ mod tests {
         assert_eq!(per_page, 50);
     }
 
+    /// Regression guard for the WI#315 pre-validation pass: a canonical call
+    /// for every action must still deserialize. A validator that accepted
+    /// the name but broke the alias or required-field path would otherwise
+    /// only be caught on a live tenant.
+    #[test]
+    fn validated_action_accepts_a_canonical_call_for_every_action() {
+        for input in [
+            r#"{"action":"current_user"}"#,
+            r#"{"action":"list_projects","search":"lunarwing","membership":true}"#,
+            r#"{"action":"get_project","project":35}"#,
+            r#"{"action":"create_project","name":"demo"}"#,
+            r#"{"action":"list_issues","project":"g/p","all_pages":true}"#,
+            r#"{"action":"get_issue","project":"g/p","iid":1}"#,
+            r#"{"action":"get_work_item","project":"g/p","iid":1}"#,
+            r#"{"action":"list_work_items","project":"g/p","cursor":"abc","all_pages":true}"#,
+            r#"{"action":"create_issue","project":"g/p","title":"t","body":"b"}"#,
+            r#"{"action":"update_issue","project":"g/p","iid":1,"description":"d"}"#,
+            r#"{"action":"list_issue_notes","project":"g/p","iid":1}"#,
+            r#"{"action":"create_issue_note","project":"g/p","iid":1,"body":"b"}"#,
+            r#"{"action":"list_merge_requests","project":"g/p","state":"merged"}"#,
+            r#"{"action":"get_merge_request","project":"g/p","iid":1}"#,
+            r#"{"action":"create_merge_request","project":"g/p","source_branch":"a","target_branch":"b","title":"t"}"#,
+            r#"{"action":"update_merge_request","project":"g/p","iid":1,"title":"t"}"#,
+            r#"{"action":"list_mr_notes","project":"g/p","iid":1}"#,
+            r#"{"action":"create_mr_note","project":"g/p","iid":1,"body":"b"}"#,
+            r#"{"action":"approve_merge_request","project":"g/p","iid":1,"sha":"abc"}"#,
+            r#"{"action":"merge_merge_request","project":"g/p","iid":1,"sha":"abc"}"#,
+            r#"{"action":"list_branches","project":"g/p","search":"feat"}"#,
+            r#"{"action":"get_branch","project":"g/p","branch":"main"}"#,
+            r#"{"action":"create_branch","project":"g/p","branch":"b","ref":"main"}"#,
+            r#"{"action":"delete_branch","project":"g/p","branch":"b"}"#,
+            r#"{"action":"get_file_content","project":"g/p","path":"a.txt","ref":"main"}"#,
+            r#"{"action":"create_or_update_file","project":"g/p","path":"a.txt","branch":"b","content":"YQ==","commit_message":"m","last_commit_id":"abc"}"#,
+            r#"{"action":"delete_file","project":"g/p","path":"a.txt","branch":"b","commit_message":"m","last_commit_id":"abc"}"#,
+            r#"{"action":"search_projects","query":"lunarwing"}"#,
+            r#"{"action":"search_issues","project":"g/p","query":"regression"}"#,
+            r#"{"action":"search_blobs","project":"g/p","query":"TODO","ref":"main"}"#,
+            r#"{"action":"search_blobs","project":"g/p","query":"TODO"}"#,
+            r#"{"action":"list_pipelines","project":"g/p","status":"success","ref":"main"}"#,
+            r#"{"action":"get_pipeline","project":"g/p","pipeline_id":1}"#,
+            r#"{"action":"list_jobs","project":"g/p","pipeline_id":1}"#,
+        ] {
+            validated_action(input)
+                .unwrap_or_else(|error| panic!("canonical call rejected for {input}: {error}"));
+        }
+    }
+
     #[test]
     fn generated_schema_lists_action_discriminator() {
         let schema = serde_json::to_value(schema_for!(GitlabAction)).unwrap();
