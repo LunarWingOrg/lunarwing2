@@ -15,7 +15,10 @@ use serde_json::Value;
 /// `table_matches_generated_schema` test fails if this table drifts.
 pub(crate) const ACTION_PARAMS: &[(&str, &[&str])] = &[
     ("current_user", &[]),
-    ("list_projects", &["per_page", "page", "search", "membership"]),
+    (
+        "list_projects",
+        &["per_page", "page", "search", "membership"],
+    ),
     ("get_project", &["project"]),
     (
         "create_project",
@@ -96,10 +99,7 @@ pub(crate) const ACTION_PARAMS: &[(&str, &[&str])] = &[
             "should_remove_source_branch",
         ],
     ),
-    (
-        "list_branches",
-        &["project", "search", "per_page", "page"],
-    ),
+    ("list_branches", &["project", "search", "per_page", "page"]),
     ("get_branch", &["project", "branch"]),
     ("create_branch", &["project", "branch", "ref"]),
     ("delete_branch", &["project", "branch"]),
@@ -120,7 +120,13 @@ pub(crate) const ACTION_PARAMS: &[(&str, &[&str])] = &[
     ),
     (
         "delete_file",
-        &["project", "path", "branch", "commit_message", "last_commit_id"],
+        &[
+            "project",
+            "path",
+            "branch",
+            "commit_message",
+            "last_commit_id",
+        ],
     ),
     ("search_projects", &["query", "per_page", "page"]),
     ("search_issues", &["project", "query", "per_page", "page"]),
@@ -133,10 +139,7 @@ pub(crate) const ACTION_PARAMS: &[(&str, &[&str])] = &[
         &["project", "status", "ref", "per_page", "page"],
     ),
     ("get_pipeline", &["project", "pipeline_id"]),
-    (
-        "list_jobs",
-        &["project", "pipeline_id", "per_page", "page"],
-    ),
+    ("list_jobs", &["project", "pipeline_id", "per_page", "page"]),
 ];
 
 /// Serde aliases that hold for every action carrying the canonical field.
@@ -313,7 +316,7 @@ mod tests {
     use schemars::schema_for;
     use serde_json::{Value, json};
 
-    use super::{ACTION_PARAMS, validate, valid_params};
+    use super::{ACTION_PARAMS, valid_params, validate};
     use crate::types::GitlabAction;
 
     /// Every action's parameter set as the generated schema describes it.
@@ -416,7 +419,10 @@ mod tests {
 
         let error = validate(r#"{"action":"list_projects","query":"lunarwing"}"#)
             .expect_err("query must be rejected");
-        assert!(error.contains("query not valid for list_projects"), "{error}");
+        assert!(
+            error.contains("query not valid for list_projects"),
+            "{error}"
+        );
         assert!(error.contains("use search"), "{error}");
         assert!(
             error.contains("Valid: [per_page, page, search, membership]"),
@@ -440,8 +446,9 @@ mod tests {
 
     #[test]
     fn all_pages_rejection_explains_paging() {
-        let error = validate(r#"{"action":"list_merge_requests","project":"g/p","all_pages":true}"#)
-            .expect_err("all_pages must be rejected here");
+        let error =
+            validate(r#"{"action":"list_merge_requests","project":"g/p","all_pages":true}"#)
+                .expect_err("all_pages must be rejected here");
         assert!(
             error.contains("this action returns a single page; use page/per_page"),
             "{error}"
@@ -450,7 +457,10 @@ mod tests {
         // The two actions that do support it keep accepting it.
         for action in ["list_issues", "list_work_items"] {
             let params = json!({ "action": action, "project": "g/p", "all_pages": true });
-            assert!(validate(&params.to_string()).is_ok(), "{action} rejected all_pages");
+            assert!(
+                validate(&params.to_string()).is_ok(),
+                "{action} rejected all_pages"
+            );
         }
     }
 
@@ -465,14 +475,18 @@ mod tests {
             r#"{"action":"create_merge_request","project":"g/p","source_branch":"a","target_branch":"b","title":"t","body":"x"}"#,
         )
         .expect_err("body must not alias the MR description");
-        assert!(error.contains("body not valid for create_merge_request"), "{error}");
+        assert!(
+            error.contains("body not valid for create_merge_request"),
+            "{error}"
+        );
         assert!(error.contains("use description"), "{error}");
     }
 
     #[test]
     fn every_invalid_field_is_reported_at_once() {
-        let error = validate(r#"{"action":"get_issue","project":"g/p","iid":1,"branch":"a","q":"b"}"#)
-            .expect_err("two bad fields must be rejected");
+        let error =
+            validate(r#"{"action":"get_issue","project":"g/p","iid":1,"branch":"a","q":"b"}"#)
+                .expect_err("two bad fields must be rejected");
         assert!(error.contains("branch not valid for get_issue"), "{error}");
         assert!(error.contains("q not valid for get_issue"), "{error}");
     }
@@ -484,7 +498,10 @@ mod tests {
         assert!(error.contains("get_file_content"), "{error}");
 
         let error = validate(r#"{"action":"open_an_issue"}"#).expect_err("unknown action");
-        assert!(error.contains("unknown action \"open_an_issue\""), "{error}");
+        assert!(
+            error.contains("unknown action \"open_an_issue\""),
+            "{error}"
+        );
         assert!(error.contains("Valid actions: [current_user"), "{error}");
 
         let error = validate(r#"["not","an","object"]"#).expect_err("non-object params");
@@ -496,16 +513,14 @@ mod tests {
         // Name-level acceptance is the whole contract: values are serde's job.
         for (action, params) in ACTION_PARAMS {
             assert!(valid_params(action).is_some(), "{action} lookup failed");
-            let object: serde_json::Map<String, Value> = std::iter::once((
-                "action".to_string(),
-                json!(action),
-            ))
-            .chain(
-                params
-                    .iter()
-                    .map(|param| ((*param).to_string(), json!("x"))),
-            )
-            .collect();
+            let object: serde_json::Map<String, Value> =
+                std::iter::once(("action".to_string(), json!(action)))
+                    .chain(
+                        params
+                            .iter()
+                            .map(|param| ((*param).to_string(), json!("x"))),
+                    )
+                    .collect();
             validate(&Value::Object(object).to_string())
                 .unwrap_or_else(|error| panic!("{action} rejected a full call: {error}"));
         }
