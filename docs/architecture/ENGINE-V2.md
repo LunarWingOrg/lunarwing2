@@ -681,45 +681,6 @@ missing timestamp alone does not establish that a mission was born terminal.
 Tool listings remain project- and owner-scoped (including shared missions),
 so absence from another project's list does not establish deletion.
 
-### Scheduler Liveness Signals (WI#323)
-
-Because a stored `next_fire_at` says nothing about whether the scheduler is
-running, the mission cron ticker emits its own liveness trail at info level:
-
-- one `mission cron ticker started` line naming the active-mission count, the
-  tick interval and the heartbeat interval;
-- `mission fired` per fire, carrying the mission id, thread id, the cadence
-  KIND (`cron`, `channel_event`, `system_event`, `webhook`, `manual` — not
-  how the fire was triggered, which a manual fire of a cron mission would
-  misstate) and the fired mission's `next_fire_at` (the stored value, which a
-  non-tick fire does not advance);
-- `mission goal declared achieved; auto-completing mission` when a run's own
-  goal declaration completes the mission — distinct from the info-level
-  `mission explicitly completed` line of an operator `complete_mission`;
-- a `mission scheduler heartbeat` line at most hourly with the active-mission
-  count (rows that actually loaded as Active, plus a `load_failures` count for
-  index entries that failed to load), the earliest scheduled fire among them
-  (`next_fire_at=none` when nothing is scheduled) and how many Active cron
-  missions are already overdue;
-- a `warn` when an Active cron mission's `next_fire_at` is more than two
-  minutes overdue, so a schedule the ticker keeps missing is visible rather
-  than indistinguishable from an idle scheduler.
-
-A tick that returns an error logs at warn level with a static, user-
-content-free error class (for example `error_kind=invalid_cadence` for a
-stored cadence or timezone the parser rejects); the full error text, which
-for cadence failures quotes the stored value, stays at debug. A single
-mission's failed fire is warned about and skipped without stopping the rest
-of the tick. The heartbeat's clock is the monotonic `Instant` elapsed time, so
-a stalled loop delays the beat instead of counting ticks it never ran; the
-first beat comes one interval after the ticker starts (its clock is seeded one
-interval in the past, so it is still emitted even if the ticker dies in its
-first hour).
-
-None of these lines carry user content — no mission names, goals, prompts,
-cadence expressions, event patterns or trigger payloads. Only ids, cadence
-kinds, counts and timestamps are logged.
-
 Cron missions receive `next_fire_at` when created, updated, or resumed. Startup
 repairs older valid cron missions missing this value. Scheduler fires advance
 the next occurrence even when the daily thread budget blocks a run; manual
@@ -1409,6 +1370,46 @@ the consumed batch nor collide a genuinely new one with an old processed key
 (WI #183 G8-F7). The periodic tick also scans for eligible sources directly, so
 completions that raced their event's persistence or arrived during broadcast
 lag still produce runs.
+
+### Scheduler Liveness Signals (WI#323)
+
+Because a stored `next_fire_at` says nothing about whether the scheduler is
+running, the mission cron ticker emits its own liveness trail at info level:
+
+- one `mission cron ticker started` line naming the active-index size, the
+  tick interval (60 seconds) and the heartbeat interval (3600 seconds);
+- `mission fired` per successful fire, carrying the mission id, thread id,
+  cadence kind (`cron`, `channel_event`, `system_event`, `webhook`, `manual`)
+  and stored `next_fire_at`. The kind describes the cadence, not how this fire
+  was triggered; non-tick fires do not advance the stored schedule;
+- `mission goal declared achieved; auto-completing mission` when a run's own
+  goal declaration completes the mission — distinct from the info-level
+  `mission explicitly completed` line of an operator `complete_mission`;
+- a `mission scheduler heartbeat` on the first tick after the 30-second
+  startup warmup, then at most hourly. It reports `active_missions` (rows
+  actually loaded as Active), `load_failures`, the earliest scheduled fire
+  among Active missions (`next_fire_at=none` when nothing is scheduled), and
+  `overdue_cron_missions`;
+- a `warn` when an Active cron mission's `next_fire_at` is at least two
+  minutes overdue. It reports `mission_id`, `scheduled_for`, and
+  `overdue_seconds` before attempting the fire, not as proof of success.
+  The warning is de-duplicated per mission and scheduled occurrence in this
+  process: repeated failed attempts for the same occurrence do not repeat it.
+  A new overdue occurrence (or a process restart) can warn again. The heartbeat
+  continues to count overdue missions even when this warning is suppressed.
+
+The per-mission fire-failed warn uses a static `error_kind` (`invalid_cadence`
+or `engine_error`), and the ticker-level tick-error warn uses the same
+classification. Full error text, which can quote stored cadence or timezone
+values, stays at debug. A failed fire is skipped without stopping the rest
+of the tick. The heartbeat uses monotonic `Instant` elapsed time, not tick
+counts: a stalled loop delays the beat. Seeding its clock one hour in the
+past makes the first post-warmup tick emit a heartbeat immediately; a loop
+that never gets through its first tick still leaves only the start line.
+
+None of these info/warn lines carry user content — no mission names, goals,
+prompts, cadence expressions, event patterns or trigger payloads. Only ids,
+static kinds/classes, counts and timestamps are logged.
 
 ### Error Diagnosis (`self-improvement`)
 

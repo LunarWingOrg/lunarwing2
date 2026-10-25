@@ -101,7 +101,7 @@ const MAX_SHUTDOWN_INTERRUPTION_STAMP_AGE: Duration = Duration::from_secs(24 * 6
 /// under a minute late is ordinary scheduling jitter; two minutes of lateness
 /// means the schedule is being missed and the operator should hear about it.
 const CRON_OVERDUE_WARN_THRESHOLD: chrono::Duration = chrono::Duration::minutes(2);
-/// Wall-clock spacing of the ticker's liveness heartbeat (WI#323).
+/// Monotonic elapsed-time spacing of the ticker's liveness heartbeat (WI#323).
 const MISSION_TICKER_HEARTBEAT: Duration = Duration::from_secs(60 * 60);
 /// Poll period of the mission cron ticker, named so the start log can state it.
 const MISSION_TICK_INTERVAL: Duration = Duration::from_secs(60);
@@ -312,6 +312,9 @@ pub struct MissionManager {
     thread_manager: Arc<ThreadManager>,
     /// Active missions indexed by ID for quick lookup.
     active: RwLock<Vec<MissionId>>,
+    /// Last overdue occurrence warned about per mission in this process.
+    /// Ticks prune ids no longer in the active index; no store writes are needed.
+    overdue_warnings: Mutex<HashMap<MissionId, DateTime<Utc>>>,
     /// Serialize state transitions for each mission without retaining dead locks forever.
     fire_locks: Arc<MissionLockRegistry>,
     /// Broadcast channel for mission outcome notifications.
@@ -434,14 +437,14 @@ fn mission_fire_error_kind(error: &EngineError) -> &'static str {
 /// Warn when an Active cron mission's scheduled fire is significantly
 /// overdue (WI#323): at info level an idle-but-healthy ticker and a stalled
 /// one look the same, and a schedule the ticker keeps missing is the signal
-/// that separates them. Called from the tick's cron branch, so the warning
-/// accompanies the late fire itself.
-///
-/// The warning repeats every tick it persists (NX-14): the message states
-/// the fire is late and names the last-failed mission count the heartbeat
-/// can still surface, but a single fire that keeps failing also warns in
-/// `tick`, so this stays informational rather than noisy.
-fn warn_if_cron_overdue(mission: &Mission, now: DateTime<Utc>) {
+/// that separates them. Called before attempting a fire, not proof of success.
+/// Warn once per scheduled occurrence so repeated failed attempts do not also
+/// repeat this warning. The heartbeat continues to report overdue missions.
+fn warn_if_cron_overdue(
+    mission: &Mission,
+    now: DateTime<Utc>,
+    warned: &mut HashMap<MissionId, DateTime<Utc>>,
+) {
     if mission.status != MissionStatus::Active
         || !matches!(mission.cadence, MissionCadence::Cron { .. })
     {
@@ -451,14 +454,15 @@ fn warn_if_cron_overdue(mission: &Mission, now: DateTime<Utc>) {
         return;
     };
     let overdue = now.signed_duration_since(next_fire_at);
-    if overdue < CRON_OVERDUE_WARN_THRESHOLD {
+    if overdue < CRON_OVERDUE_WARN_THRESHOLD || warned.get(&mission.id) == Some(&next_fire_at) {
         return;
     }
+    warned.insert(mission.id, next_fire_at);
     warn!(
         mission_id = %mission.id,
         scheduled_for = %next_fire_at.to_rfc3339(),
         overdue_seconds = overdue.num_seconds(),
-        "Active cron mission is firing late: it is overdue for its scheduled fire"
+        "Active cron mission is overdue for its scheduled fire; attempting fire"
     );
 }
 
@@ -527,6 +531,7 @@ impl MissionManager {
             store,
             thread_manager,
             active: RwLock::new(Vec::new()),
+            overdue_warnings: Mutex::new(HashMap::new()),
             fire_locks: Arc::new(Mutex::new(HashMap::new())),
             notification_tx,
             channel_contexts: RwLock::new(HashMap::new()),
@@ -1618,7 +1623,7 @@ impl MissionManager {
             }
 
             let mut interval = tokio::time::interval(MISSION_TICK_INTERVAL);
-            // Wall-clock, not tick-counted: a stalled tick loop delays the
+            // Monotonic elapsed time, not tick-counted: a stalled tick loop delays the
             // heartbeat instead of silently pretending everything is fine.
             // Seed the clock one interval in the past so the first post-warmup
             // tick beats immediately instead of an hour after start (NX-15):
@@ -1638,7 +1643,7 @@ impl MissionManager {
     /// One ticker iteration: fire due missions, then emit the hourly liveness
     /// heartbeat. A per-mission failure is already warned about inside
     /// [`Self::tick`], which keeps going; the heartbeat's own clock is
-    /// wall-clock so a stalled loop delays the beat instead of counting
+    /// monotonic so a stalled loop delays the beat instead of counting
     /// ticks it never ran.
     async fn run_cron_tick(&self, user_id: &str, last_heartbeat: &mut tokio::time::Instant) {
         match self.tick(user_id).await {
@@ -1646,7 +1651,11 @@ impl MissionManager {
                 info!(count = spawned.len(), "cron ticker spawned mission threads");
             }
             Err(error) => {
-                warn!(error = %error, "mission cron ticker tick failed");
+                warn!(
+                    error_kind = mission_fire_error_kind(&error),
+                    "mission cron ticker tick failed"
+                );
+                debug!(error = %error, "mission cron ticker tick failed");
             }
             Ok(_) => {}
         }
@@ -2590,6 +2599,10 @@ impl MissionManager {
     /// Returns the IDs of threads spawned.
     pub async fn tick(&self, _fallback_user_id: &str) -> Result<Vec<ThreadId>, EngineError> {
         let active_ids = self.active.read().await.clone();
+        self.overdue_warnings
+            .lock()
+            .await
+            .retain(|id, _| active_ids.contains(id));
         let mut spawned = Vec::new();
         let now = chrono::Utc::now();
 
@@ -2608,10 +2621,10 @@ impl MissionManager {
 
             let should_fire = match &mission.cadence {
                 MissionCadence::Cron { .. } => {
-                    // Fire if next_fire_at has passed. Anything significantly
-                    // late is also called out (WI#323): firing now does not
-                    // make a silently missed schedule unremarkable.
-                    warn_if_cron_overdue(&mission, now);
+                    // Report each overdue occurrence once, even if this
+                    // attempt fails and leaves next_fire_at unchanged.
+                    let mut warned = self.overdue_warnings.lock().await;
+                    warn_if_cron_overdue(&mission, now, &mut warned);
                     mission.next_fire_at.is_some_and(|next| next <= now)
                 }
                 MissionCadence::Manual => false,
@@ -15142,7 +15155,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         ))
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     #[traced_test]
     async fn ticker_start_and_hourly_heartbeat_are_info_level() {
         let store = Arc::new(TestStore::new());
@@ -15170,15 +15183,25 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             assert_logged_at(
                 lines,
                 "INFO",
-                &["mission cron ticker started", "active_missions=2"],
+                &[
+                    "mission cron ticker started",
+                    "active_missions=2",
+                    "tick_interval_seconds=60",
+                    "heartbeat_interval_seconds=3600",
+                ],
             )
         });
         // Stop the real loop before driving iterations by hand, so no
         // concurrent ticker line can race the assertions below.
         mgr.shutdown().await;
 
-        // One ticker iteration; the hourly heartbeat is forced rather than slept out.
-        let mut last_heartbeat = tokio::time::Instant::now() - MISSION_TICKER_HEARTBEAT;
+        // Drive monotonic time independently of the configured interval: no
+        // beat at 59 minutes, exactly one at 60. No real-time sleep is needed.
+        let mut last_heartbeat = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_secs(59 * 60)).await;
+        mgr.run_cron_tick("test-user", &mut last_heartbeat).await;
+        assert!(!logs_contain("mission scheduler heartbeat"));
+        tokio::time::advance(Duration::from_secs(60)).await;
         mgr.run_cron_tick("test-user", &mut last_heartbeat).await;
         logs_assert(|lines: &[&str]| {
             assert_logged_at(
@@ -15192,6 +15215,37 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
                 ],
             )?;
             assert_no_log_carries(lines, "cron name sentinel must never be logged")
+        });
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn ticker_first_heartbeat_follows_startup_warmup() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(store));
+        mgr.start_cron_ticker("test-user".into()).await;
+        // Let the spawned ticker register its startup sleep before advancing.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(29)).await;
+        tokio::task::yield_now().await;
+        assert!(!logs_contain("mission scheduler heartbeat"));
+
+        // Cross the 30-second warmup (allowing for timer granularity). The
+        // actual loop, not a manually seeded run_cron_tick, must now beat.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        for _ in 0..100 {
+            if logs_contain("mission scheduler heartbeat") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        mgr.shutdown().await;
+        logs_assert(|lines| {
+            assert_logged_at(
+                lines,
+                "INFO",
+                &["mission scheduler heartbeat", "active_missions=0"],
+            )
         });
     }
 
@@ -15219,6 +15273,44 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
                     "load_failures=1",
                     "next_fire_at=none",
                     "overdue_cron_missions=0",
+                ],
+            )
+        });
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn heartbeat_counts_overdue_active_but_not_paused_missions() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let cadence = MissionCadence::Cron {
+            expression: "0 * * * *".into(),
+            timezone: None,
+        };
+        let active = liveness_mission(&mgr, cadence.clone(), "overdue active").await;
+        let paused = liveness_mission(&mgr, cadence, "overdue paused").await;
+        let next_fire_at = Utc::now() - chrono::Duration::minutes(3);
+        {
+            let mut missions = store.missions.write().await;
+            missions.get_mut(&active).unwrap().next_fire_at = Some(next_fire_at);
+            let mission = missions.get_mut(&paused).unwrap();
+            mission.status = MissionStatus::Paused;
+            mission.next_fire_at = Some(next_fire_at - chrono::Duration::hours(1));
+        }
+        // Keep the stale index entry: the heartbeat must inspect stored status,
+        // not assume every indexed mission is still Active.
+        assert!(mgr.active.read().await.contains(&paused));
+        mgr.log_ticker_heartbeat().await;
+        logs_assert(|lines| {
+            assert_logged_at(
+                lines,
+                "INFO",
+                &[
+                    "mission scheduler heartbeat",
+                    "active_missions=1",
+                    "load_failures=0",
+                    &format!("next_fire_at={}", next_fire_at.to_rfc3339()),
+                    "overdue_cron_missions=1",
                 ],
             )
         });
@@ -15330,7 +15422,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
                 lines,
                 "WARN",
                 &[
-                    "Active cron mission is firing late",
+                    "Active cron mission is overdue",
                     &format!("mission_id={id}"),
                     &format!("scheduled_for={}", scheduled_fire.to_rfc3339()),
                     "overdue_seconds=",
@@ -15388,6 +15480,55 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
 
     #[tokio::test]
     #[traced_test]
+    async fn webhook_fire_logs_kind_without_trigger_payload() {
+        const PAYLOAD_SENTINEL: &str = "wi323-live-webhook-payload-sentinel";
+        const SECRET_SENTINEL: &str = "wi323-webhook-secret-sentinel";
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let id = liveness_mission(
+            &mgr,
+            MissionCadence::Webhook {
+                path: "liveness-hook".into(),
+                secret: Some(SECRET_SENTINEL.into()),
+            },
+            "webhook log hygiene",
+        )
+        .await;
+        let payload = serde_json::json!({ "content": PAYLOAD_SENTINEL });
+        let spawned = mgr
+            .fire_webhook_mission("liveness-hook", Some(SECRET_SENTINEL), payload.clone())
+            .await
+            .unwrap();
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(
+            mgr.get_mission(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_trigger_payload,
+            Some(payload),
+            "the fire must actually receive Some(payload), not an overwritten stored sentinel"
+        );
+        mgr.shutdown().await;
+        logs_assert(|lines| {
+            assert_logged_at(
+                lines,
+                "INFO",
+                &[
+                    "mission fired",
+                    &format!("mission_id={id}"),
+                    &format!("thread_id={}", spawned[0]),
+                    "trigger_kind=webhook",
+                    "next_fire_at=none",
+                ],
+            )?;
+            assert_no_log_carries(lines, PAYLOAD_SENTINEL)?;
+            assert_no_log_carries(lines, SECRET_SENTINEL)
+        });
+    }
+
+    #[tokio::test]
+    #[traced_test]
     async fn overdue_warn_threshold_is_two_minutes() {
         let store = Arc::new(TestStore::new());
         let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
@@ -15400,21 +15541,94 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             "borderline cron",
         )
         .await;
-        // Just under two minutes late is polling jitter: fire, but no warning.
+        let now = DateTime::parse_from_rfc3339("2026-10-25T02:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut mission = mgr.get_mission(id).await.unwrap().unwrap();
+        mission.next_fire_at = Some(now - chrono::Duration::seconds(119));
+        let mut warned = HashMap::new();
+        warn_if_cron_overdue(&mission, now, &mut warned);
+        logs_assert(|lines: &[&str]| {
+            assert_no_log_carries(lines, "Active cron mission is overdue")
+        });
+        // Exactly 120 seconds must warn; a 150-second threshold must fail.
+        warn_if_cron_overdue(&mission, now + chrono::Duration::seconds(1), &mut warned);
+        logs_assert(|lines| {
+            assert_logged_at(
+                lines,
+                "WARN",
+                &["Active cron mission is overdue", "overdue_seconds=120"],
+            )
+        });
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn overdue_warn_is_once_per_occurrence_even_when_fire_keeps_failing() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let id = liveness_mission(
+            &mgr,
+            MissionCadence::Cron {
+                expression: "0 * * * *".into(),
+                timezone: None,
+            },
+            "failing overdue cron",
+        )
+        .await;
+        let first = Utc::now() - chrono::Duration::minutes(5);
+        {
+            let mut missions = store.missions.write().await;
+            let mission = missions.get_mut(&id).unwrap();
+            mission.cadence = MissionCadence::Cron {
+                expression: "not a cron expression".into(),
+                timezone: None,
+            };
+            mission.next_fire_at = Some(first);
+        }
+        for _ in 0..3 {
+            assert!(mgr.tick("test-user").await.unwrap().is_empty());
+        }
+        logs_assert(|lines| {
+            assert_logged_at(
+                lines,
+                "WARN",
+                &[
+                    "Active cron mission is overdue",
+                    &format!("mission_id={id}"),
+                ],
+            )
+        });
+
+        // A different scheduled occurrence must still warn exactly once.
+        let second = first + chrono::Duration::minutes(1);
         store
             .missions
             .write()
             .await
             .get_mut(&id)
             .unwrap()
-            .next_fire_at = Some(Utc::now() - chrono::Duration::seconds(119));
-
-        assert_eq!(mgr.tick("test-user").await.unwrap().len(), 1);
-        logs_assert(|lines: &[&str]| {
-            assert_no_log_carries(lines, "is firing late")
-                .map_err(|_| "a sub-threshold late fire must not warn".to_string())?;
-            assert_logged_at(lines, "INFO", &["mission fired", "trigger_kind=cron"])
+            .next_fire_at = Some(second);
+        for _ in 0..2 {
+            assert!(mgr.tick("test-user").await.unwrap().is_empty());
+        }
+        logs_assert(|lines| {
+            for scheduled in [first, second] {
+                assert_logged_at(
+                    lines,
+                    "WARN",
+                    &[
+                        "Active cron mission is overdue",
+                        &format!("scheduled_for={}", scheduled.to_rfc3339()),
+                    ],
+                )?;
+            }
+            Ok(())
         });
+        // Removed index entries must not accumulate in the process-local map.
+        mgr.active.write().await.clear();
+        mgr.tick("test-user").await.unwrap();
+        assert!(mgr.overdue_warnings.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -15456,7 +15670,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         }
 
         assert!(mgr.tick("test-user").await.unwrap().is_empty());
-        assert!(!logs_contain("is firing late"));
+        assert!(!logs_contain("Active cron mission is overdue"));
     }
 
     #[tokio::test]
@@ -15496,6 +15710,9 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             "the fired thread must be recorded"
         );
 
+        // Auto-completion leaves the id indexed until a later reconciliation.
+        assert!(mgr.active.read().await.contains(&id));
+        mgr.log_ticker_heartbeat().await;
         logs_assert(|lines: &[&str]| {
             assert_logged_at(
                 lines,
@@ -15507,7 +15724,18 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
                 "INFO",
                 &["mission fired", "trigger_kind=manual", "next_fire_at=none"],
             )?;
-            assert_no_log_carries(lines, RESPONSE_SENTINEL)
+            assert_no_log_carries(lines, RESPONSE_SENTINEL)?;
+            assert_logged_at(
+                lines,
+                "INFO",
+                &[
+                    "mission scheduler heartbeat",
+                    "active_missions=0",
+                    "load_failures=0",
+                    "next_fire_at=none",
+                    "overdue_cron_missions=0",
+                ],
+            )
         });
         assert!(!logs_contain("explicitly completed"));
     }
