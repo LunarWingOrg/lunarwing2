@@ -91,7 +91,9 @@ start() {
     fi
     _egress_mode="rootful"
     [ "\${wk_rootless}" = "true" ] && _egress_mode="rootless"
-    "\${wk_egress_guard}" "\${wk_egress_ruleset}" "\${_egress_mode}" \
+    # OpenRC runs this as root; pass the tenant so the guard enters that user's
+    # rootless netns (a Quadlet ExecStartPre already runs as the tenant).
+    "\${wk_egress_guard}" "\${wk_egress_ruleset}" "\${_egress_mode}" "\${wk_user}" \
         || { eend 1 "worker egress filter failed to load or verify; refusing to start unfiltered"; return 1; }
     _wk start "\${wk_container}" >/dev/null 2>&1 || { eend 1 "container start failed"; return 1; }
     _w=0

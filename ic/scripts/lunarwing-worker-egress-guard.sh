@@ -2,7 +2,7 @@
 # WI#424 control 1 — load and verify a worker egress allowlist before a worker
 # container starts.
 #
-# Usage: lunarwing-worker-egress-guard.sh <ruleset> [rootless|rootful]
+# Usage: lunarwing-worker-egress-guard.sh <ruleset> [rootless|rootful] [tenant]
 #
 # Called from every worker boot path (Quadlet `ExecStartPre`, the OpenRC worker
 # init script's start(), and mt-admin's prepare_worker_egress). It exists as a
@@ -26,9 +26,10 @@ CHAIN="workers"
 
 die() { printf 'worker-egress-guard: %s\n' "$*" >&2; exit "${2:-3}"; }
 
-[[ $# -ge 1 ]] || die "usage: $0 <ruleset> [rootless|rootful]"
+[[ $# -ge 1 ]] || die "usage: $0 <ruleset> [rootless|rootful] [tenant]"
 ruleset="$1"
 mode="${2:-rootless}"
+tenant="${3:-}"
 
 case "$mode" in
   rootless|rootful) ;;
@@ -45,12 +46,27 @@ NFT="$(command -v nft 2>/dev/null)" || NFT=""
 PODMAN="$(command -v podman || printf '/usr/bin/podman')"
 
 # Run nft in the namespace that owns the bridge.
+#
+# Rootless podman keeps the bridge in the TENANT's netns, so the command must
+# run as that user. A Quadlet ExecStartPre already runs as the tenant (no third
+# argument needed); the OpenRC path runs as root and passes the tenant name, so
+# root drops to the tenant here rather than inventing a second code path.
 nft_in_netns() {
-  if [[ "$mode" == "rootless" ]]; then
-    "$PODMAN" unshare --rootless-netns "$NFT" "$@"
-  else
+  if [[ "$mode" != "rootless" ]]; then
     "$NFT" "$@"
+    return
   fi
+  if [[ -n "$tenant" && "$(id -u)" == "0" ]]; then
+    [[ "$tenant" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] \
+      || die "invalid tenant name '$tenant'"
+    local uid home
+    uid="$(id -u -- "$tenant")" || die "cannot resolve uid for tenant '$tenant'"
+    home="$(getent passwd "$tenant" | cut -d: -f6)"
+    ( cd / && exec sudo -u "$tenant" env HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" \
+        "$PODMAN" unshare --rootless-netns "$NFT" "$@" )
+    return
+  fi
+  "$PODMAN" unshare --rootless-netns "$NFT" "$@"
 }
 
 nft_in_netns -f "$ruleset" >/dev/null 2>&1 \

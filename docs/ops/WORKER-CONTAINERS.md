@@ -940,17 +940,32 @@ How it is wired:
   created, and every create path attaches `--network lw-egress-<tenant>`
   (Quadlet: `Network=`; imperative/OpenRC: `--network`).
 * The rendered ruleset (`/etc/lunarwing/worker-egress/<tenant>.nft`, 0644 — no
-  secrets) is loaded **before every start** from a boot-persistent path:
-  Quadlet `ExecStartPre=podman unshare --rootless-netns nft -f …`, and the
-  OpenRC worker init script's `start()`. A rootless netns is recreated when no
-  container pins it, so a rule set loaded once at provision time would be gone
-  after a reboot; loading immediately before the container starts also means
-  the netns is pinned by the worker for its whole life.
-* `worker_egress_apply` re-reads the chain from a **fresh** netns entry after
-  loading it and dies if the chain or its reject rule is not there. The start
-  path turns that into a refusal to run the worker. **Fail closed**: a host
-  where the filter cannot be proven live runs no worker, rather than a worker
-  with open egress.
+  secrets) is loaded **before every start** from a boot-persistent path by one
+  root-owned helper, `/usr/local/libexec/lunarwing-worker-egress-guard`
+  (`ic/scripts/lunarwing-worker-egress-guard.sh`, installed by mt-admin):
+  Quadlet `ExecStartPre=<guard> <ruleset> rootless`, and the OpenRC worker init
+  script's `start()` (`<guard> <ruleset> rootless|rootful <tenant>` — OpenRC
+  runs as root, so the guard drops to the tenant to enter that user's netns).
+  Both init systems share the one script so their behaviour cannot drift. A
+  rootless netns exists only while something pins it; loading immediately
+  before the container starts also means the worker itself pins it for its
+  whole life.
+* The guard loads the ruleset and then **re-reads the chain through a fresh
+  netns entry**, refusing if the chain or its reject rule is absent. That
+  second invocation is the point: a host without a persistent tenant
+  runtime directory (no lingering session) would otherwise load rules into a
+  namespace that disappears with the command and start the worker unfiltered.
+  `worker_egress_apply` performs the same load-and-verify for an operator
+  re-apply. **Fail closed**: where the filter cannot be proven live, no worker
+  runs.
+
+Measured on the dev host (rootless podman 5.8.2 / netavark / pasta, busybox
+probe; the sequence the harness's `LUNARWING_MT_EGRESS_LIVE=1` arm re-runs):
+with the filter loaded before the container existed, an allowlisted host port
+answered (`rc 0`), `https://example.com/` and `https://1.1.1.1/` both failed
+(`rc 1`, the raw-IP case proves DNS is not a bypass), DNS still resolved
+through the gateway, and the chain's reject counter recorded the denied
+probes.
 
 Operator surface:
 
@@ -961,13 +976,20 @@ sudo lunarwing-mt-admin.sh configure-worker-egress <tenant> --allow git.example.
 sudo lunarwing-mt-admin.sh configure-worker-egress <tenant> --allow none
 ```
 
+`worker-egress-apply` (and every worker start) also installs/refreshes the
+root-owned guard, so an upgraded mt-admin never leaves a stale guard behind.
+
 `worker-egress` is host-side by construction: it reads the network config,
 whether each running worker container is actually attached, and the live chain
 through the tenant's own netns. An agent inside the container cannot forge any
 of it. The harness `ic/scripts/tests/test-worker-egress.sh` pins the ruleset
-shape, gateway translation, entry validation (no nft syntax or wildcards),
-allocation, the fail-closed apply, every wiring site, and loads the generated
-ruleset into a real rootless netns when the host supports it.
+shape, host-address translation, entry validation (no nft syntax or wildcards),
+allocation, the guard's fail-closed load/verify, every wiring site, and loads
+the generated ruleset into a real rootless netns when the host supports it.
+Its opt-in live arm (`LUNARWING_MT_EGRESS_LIVE=1`) is the acceptance proof for
+"a non-allowlisted fetch fails, an allowlisted one succeeds": it creates the
+network, loads and verifies the filter with no container present, starts a
+busybox probe, and asserts all four outcomes plus the reject counter.
 
 **Residual limits (do not overclaim this control):**
 

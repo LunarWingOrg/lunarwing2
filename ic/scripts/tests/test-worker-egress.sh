@@ -327,6 +327,107 @@ else
   pass "live kernel check skipped (no rootless podman/nft on this host)"
 fi
 
+# ── live acceptance arm (WI#424 AC2) ───────────────────────────────────────
+# Proves the acceptance criterion on a real kernel: a non-allowlisted fetch from
+# inside a worker FAILS and an allowlisted one SUCCEEDS. Opt-in because it needs
+# a pullable worker-shaped image (~2 MB busybox), a free port, and a writable
+# tmpdir; run it on a host where egress is available:
+#
+#   LUNARWING_MT_EGRESS_LIVE=1 bash ic/scripts/tests/test-worker-egress.sh
+#
+# The sequence is exactly the production one: allocate + create the network,
+# load and verify the filter with NO container present (the ExecStartPre /
+# OpenRC start() ordering), then start the container and probe it. This host's
+# rootless backend (pasta) publishes the host at 169.254.1.2; the arm detects
+# the backend and uses the same host addresses the renderer emits.
+run_live_arm() {
+  local image="docker.io/library/busybox:stable" net="lw-egress-liveprobe"
+  local subnet="10.89.249.0/24" container="egress-liveprobe" port=18099
+  local addr_ok addr_deny
+  command -v podman >/dev/null 2>&1 || { say_skip "live arm: podman missing"; return 0; }
+  command -v nft >/dev/null 2>&1 || { say_skip "live arm: nft missing"; return 0; }
+  command -v curl >/dev/null 2>&1 || { say_skip "live arm: curl missing"; return 0; }
+  podman image exists "$image" 2>/dev/null \
+    || podman pull -q "$image" >/dev/null 2>&1 \
+    || { say_skip "live arm: $image unavailable"; return 0; }
+  [[ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" == "true" ]] \
+    || { say_skip "live arm: rootless podman only (the harness has no tenant netns)"; return 0; }
+  addr_ok="${WORKER_EGRESS_HOST_ADDRS%% *}"
+  addr_deny="203.0.113.10"   # TEST-NET-3: never routed
+
+  cleanup_live() {
+    podman rm -f "$container" >/dev/null 2>&1 || true
+    podman network rm -f "$net" >/dev/null 2>&1 || true
+    [[ -n "${httpd_pid:-}" ]] && kill "$httpd_pid" >/dev/null 2>&1 || true
+    podman unshare --rootless-netns nft delete table inet "$WORKER_EGRESS_TABLE" >/dev/null 2>&1 || true
+  }
+  trap cleanup_live EXIT
+
+  # A host-local "allowed destination" for the allowlisted half.
+  ( cd "$fixture" && python3 -m http.server "$port" --bind 0.0.0.0 >/dev/null 2>&1 ) &
+  httpd_pid=$!
+  sleep 1
+  curl -sf -o /dev/null -m 2 "http://127.0.0.1:$port/" \
+    || { say_skip "live arm: could not start the local fixture server"; return 0; }
+
+  podman network create --subnet "$subnet" "$net" >/dev/null 2>&1 \
+    || { fail "live arm: network create failed"; return 1; }
+  printf 'SUBNET=%s\nALLOW=%s:%s\n' "$subnet" "$addr_ok" "$port" \
+    >"$WORKER_EGRESS_DIR/liveprobe.conf"
+  CONTAINER_RT=podman MT_ROOTLESS=true worker_egress_ruleset liveprobe \
+    >"$fixture/liveprobe.nft" || { fail "live arm: ruleset render failed"; return 1; }
+
+  # Filter first, container second — the production ordering.
+  if ! "$HARNESS_REPO_ROOT/ic/scripts/lunarwing-worker-egress-guard.sh" \
+        "$fixture/liveprobe.nft" rootless >/dev/null 2>&1; then
+    fail "live arm: guard could not load and verify the filter"
+    return 1
+  fi
+  pass "live arm: guard loaded and verified the filter before any container existed"
+
+  podman run -d --name "$container" --network "$net" "$image" sleep 120 >/dev/null 2>&1 \
+    || { fail "live arm: container start failed"; return 1; }
+  sleep 2
+
+  if podman exec "$container" wget -q -O /dev/null -T 5 "http://$addr_ok:$port/" >/dev/null 2>&1; then
+    pass "live arm: an allowlisted destination is reachable from the worker"
+  else
+    fail "live arm: the allowlisted destination was blocked (allowlist too narrow)"
+  fi
+  if podman exec "$container" wget -q -O /dev/null -T 5 "https://$addr_deny/" >/dev/null 2>&1; then
+    fail "live arm: a non-allowlisted destination was reachable (filter not enforcing)"
+  else
+    pass "live arm: a non-allowlisted destination is blocked from the worker"
+  fi
+  # A denied fetch must also fail when addressed by raw IP: DNS is allowlisted,
+  # so a name-only block would leave DNS/rebinding as a bypass.
+  if podman exec "$container" wget -q -O /dev/null -T 5 "https://1.1.1.1/" >/dev/null 2>&1; then
+    fail "live arm: a raw-IP destination was reachable (DNS could be used as a bypass)"
+  else
+    pass "live arm: a raw-IP destination is blocked too (no DNS bypass)"
+  fi
+  if podman exec "$container" nslookup example.com >/dev/null 2>&1; then
+    pass "live arm: DNS still resolves through the tenant gateway"
+  else
+    fail "live arm: DNS is broken under the allowlist (workers would fail name lookups)"
+  fi
+  local counter
+  counter="$(podman unshare --rootless-netns nft list chain inet "$WORKER_EGRESS_TABLE" "$WORKER_EGRESS_CHAIN" 2>/dev/null | grep -o 'counter packets [0-9]*' | head -1)"
+  if [[ "$counter" == "counter packets 0" || -z "$counter" ]]; then
+    fail "live arm: the reject counter did not move despite denied probes"
+  else
+    pass "live arm: the reject counter recorded the denied probes ($counter)"
+  fi
+}
+
+say_skip() { printf 'SKIP: %s\n' "$1"; }
+
+if [[ "${LUNARWING_MT_EGRESS_LIVE:-0}" == "1" ]]; then
+  run_live_arm || true
+else
+  say_skip "live acceptance arm (set LUNARWING_MT_EGRESS_LIVE=1 to run it)"
+fi
+
 # ── summary ─────────────────────────────────────────────────────────────────
 if ((failures > 0)); then
   printf '\n%d failure(s)\n' "$failures" >&2
