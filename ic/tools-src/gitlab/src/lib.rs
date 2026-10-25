@@ -56,17 +56,46 @@ impl exports::lunarwing::agent::tool::Guest for GitlabTool {
 }
 
 fn execute_inner(params: &str) -> Result<String, String> {
-    let action = validated_action(params).inspect_err(|_| {
-        lunarwing::agent::host::log(
-            lunarwing::agent::host::LogLevel::Warn,
-            "GitLab tool parameter validation failed",
-        );
-    })?;
+    execute_with(params, gitlab::GitlabClient::load)
+}
+
+/// Host logging goes through wit imports that only exist inside a wasm
+/// runtime — calling them natively aborts the process. The native test seam
+/// (`execute_with` with an injected loader) no-ops both log sites (run-214
+/// NX-6); every other host call (`secret_exists`, `workspace_read`,
+/// `http_request`) stays behind the injected loader or the recording client.
+#[cfg(not(test))]
+fn log_validation_failed() {
+    lunarwing::agent::host::log(
+        lunarwing::agent::host::LogLevel::Warn,
+        "GitLab tool parameter validation failed",
+    );
+}
+
+#[cfg(not(test))]
+fn log_dispatched(action: &str) {
     lunarwing::agent::host::log(
         lunarwing::agent::host::LogLevel::Info,
-        &format!("GitLab action dispatched: {}", action_name(&action)),
+        &format!("GitLab action dispatched: {action}"),
     );
-    let client = gitlab::GitlabClient::load()?;
+}
+
+#[cfg(test)]
+fn log_validation_failed() {}
+
+#[cfg(test)]
+fn log_dispatched(_action: &str) {}
+
+/// `execute_inner` with an injectable client loader (run-214 NX-6): the
+/// dispatch itself can be pinned end to end — a recording client asserts the
+/// exact request URL, and a panicking loader pins the validate-first order.
+fn execute_with(
+    params: &str,
+    load: impl FnOnce() -> Result<gitlab::GitlabClient, String>,
+) -> Result<String, String> {
+    let action = validated_action(params).inspect_err(|_| log_validation_failed())?;
+    log_dispatched(action_name(&action));
+    let client = load()?;
 
     let result = match action {
         GitlabAction::CurrentUser {} => api::current_user(&client)?,
@@ -346,9 +375,13 @@ fn parse_action(params: &str) -> Result<GitlabAction, String> {
     }
 }
 
-/// Whole pre-dispatch path, with no host capability calls: `execute_inner`
-/// runs it before `GitlabClient::load`, so a parameter rejection can neither
-/// prompt for a token nor issue an HTTP request.
+/// Whole pre-dispatch path, with no host capability calls for **name and
+/// schema errors**: `execute_inner` runs it before `GitlabClient::load`, so
+/// those rejections can neither prompt for a token nor issue an HTTP
+/// request. Value checks (blank strings, enum choices, change guards) run
+/// inside the `api::*` functions after the client loads, so with no token
+/// configured a value error answers with the token message instead of the
+/// value message — no HTTP request is sent either way (run-214 NX-7).
 ///
 /// One approval covers parameter errors as well as HTTP calls, so a
 /// rejection must teach the caller how to retry in a single message. Field
@@ -464,7 +497,7 @@ mod tests {
     use schemars::schema_for;
 
     use super::types::GitlabAction;
-    use super::{parse_action, validated_action};
+    use super::{execute_with, parse_action, validated_action};
 
     /// The full execute path must reject a wrong parameter name before any
     /// host capability (token, workspace, HTTP) is touched, and the message
@@ -532,6 +565,71 @@ mod tests {
         assert_eq!(project, "35");
         assert_eq!(ref_.as_deref(), Some("feature/wi-315"));
         assert_eq!(per_page, 50);
+    }
+
+    /// NX-6: the WI#315 regression — `ref` silently dropped and the search
+    /// run against the default branch — must be un-reintroducible at the
+    /// dispatch level, not just in the endpoint builder. A recording client
+    /// asserts the exact URL the full execute path issues, with and without
+    /// a ref.
+    #[test]
+    fn search_blobs_ref_reaches_the_dispatched_request_url() {
+        let recorded = super::gitlab::recorder();
+        let client = super::gitlab::GitlabClient::recording(recorded.clone());
+        let outcome = execute_with(
+            r#"{"action":"search_blobs","project":35,"query":"TODO","ref":"feature/wi-315","per_page":50}"#,
+            move || Ok(client),
+        );
+        assert!(
+            outcome
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.contains("recording client")),
+            "the recording client must short-circuit the request: {outcome:?}"
+        );
+        let requests = recorded.lock().expect("recorder lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "GET");
+        assert_eq!(
+            requests[0].1,
+            "/projects/35/search?scope=blobs&search=TODO&per_page=50&page=1&ref=feature%2Fwi-315",
+            "the dispatched request URL must carry the encoded ref"
+        );
+        drop(requests);
+
+        // Omitting ref must stay a true default-branch search: no &ref= at all.
+        let recorded = super::gitlab::recorder();
+        let client = super::gitlab::GitlabClient::recording(recorded.clone());
+        execute_with(
+            r#"{"action":"search_blobs","project":35,"query":"TODO","per_page":50}"#,
+            move || Ok(client),
+        )
+        .expect_err("the recording client errors instead of sending");
+        let requests = recorded.lock().expect("recorder lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "GET");
+        assert_eq!(
+            requests[0].1, "/projects/35/search?scope=blobs&search=TODO&per_page=50&page=1",
+            "no ref may be appended when the caller omits it"
+        );
+    }
+
+    /// NX-6: a parameter rejection must run before the client loads — the
+    /// promise in `validated_action`'s doc comment is pinned by a loader
+    /// that would abort the test if it ever ran for rejected parameters.
+    #[test]
+    fn validation_precedes_the_client_load() {
+        let outcome = execute_with(
+            r#"{"action":"get_file_content","project":"g/p","path":"a.txt","branch":"feature"}"#,
+            || -> Result<super::gitlab::GitlabClient, String> {
+                panic!("the loader must not run when parameters are rejected")
+            },
+        );
+        let error = outcome.expect_err("the bad parameter name must be rejected");
+        assert!(
+            error.contains("branch not valid for get_file_content"),
+            "unexpected outcome: {error}"
+        );
     }
 
     /// Regression guard for the WI#315 pre-validation pass: a canonical call

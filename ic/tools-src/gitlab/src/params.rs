@@ -145,6 +145,13 @@ pub(crate) const ACTION_PARAMS: &[(&str, &[&str])] = &[
 /// Serde aliases that hold for every action carrying the canonical field.
 const GLOBAL_ALIASES: &[(&str, &str)] = &[("project_id", "project")];
 
+/// Echoed-name and report bounds (run-214 NX-5): the rejection message is
+/// built from caller-controlled bytes that land verbatim in the model
+/// context, so names are escaped, head-truncated, count-capped, and the
+/// `Valid` list is printed once instead of per name.
+const MAX_ECHOED_NAME_CHARS: usize = 64;
+const MAX_REPORTED_NAMES: usize = 10;
+
 /// Serde aliases scoped to one action, because the alias name is a real
 /// field of other actions: `body` is the note text everywhere except in the
 /// two issue-write actions, where it spells `description`.
@@ -197,16 +204,27 @@ pub(crate) fn validate(params: &str) -> Result<(), String> {
     };
 
     let mut errors = Vec::new();
+    let mut offending = 0usize;
     for field in object.keys() {
         if field == "action" || accepts(action, valid, field) {
             continue;
         }
-        errors.push(invalid_field(action, field, valid));
+        offending += 1;
+        if errors.len() < MAX_REPORTED_NAMES {
+            errors.push(invalid_field(action, field, valid));
+        }
     }
-    if errors.is_empty() {
+    if offending == 0 {
         Ok(())
     } else {
-        Err(errors.join("; "))
+        if offending > MAX_REPORTED_NAMES {
+            errors.push(format!("(+{} more)", offending - MAX_REPORTED_NAMES));
+        }
+        Err(format!(
+            "{}. Valid: [{}]",
+            errors.join("; "),
+            valid.join(", ")
+        ))
     }
 }
 
@@ -228,21 +246,44 @@ fn accepts(action: &str, valid: &[&str], field: &str) -> bool {
 }
 
 fn invalid_field(action: &str, field: &str, valid: &[&str]) -> String {
-    let mut message = format!("{field} not valid for {action}");
+    let mut message = format!("{} not valid for {action}", echo_name(field));
     if let Some(hint) = hint_for(field, valid) {
         message.push_str("; ");
         message.push_str(&hint);
     }
-    message.push_str(&format!(". Valid: [{}]", valid.join(", ")));
     message
+}
+
+/// Echo a caller-supplied field name safely (run-214 NX-5): names are
+/// attacker-controlled bytes that would otherwise land verbatim in the
+/// model context. Control characters and quotes are `escape_debug`-escaped
+/// and over-long names are head-truncated with the dropped char count.
+fn echo_name(field: &str) -> String {
+    let escaped: String = field.escape_debug().collect();
+    let total = escaped.chars().count();
+    if total > MAX_ECHOED_NAME_CHARS {
+        let head: String = escaped.chars().take(MAX_ECHOED_NAME_CHARS).collect();
+        format!("{head}…(+{} chars)", total - MAX_ECHOED_NAME_CHARS)
+    } else {
+        escaped
+    }
 }
 
 /// Turn a rejected name into a rename instruction when one is defensible.
 fn hint_for(field: &str, valid: &[&str]) -> Option<String> {
-    if field == "all_pages" {
-        // Only the two classic listing actions accept all_pages; every other
-        // list action returns one page and pages with page/per_page.
+    if field == "all_pages" && valid.contains(&"page") {
+        // Only actions that page can hear the paging explanation: a
+        // `page`-capable action rejects all_pages because it returns one
+        // page and pages with page/per_page. Actions without page/per_page
+        // at all (get_issue, create_issue, get_file_content, …) fall
+        // through to the normal hints (run-214 NX-8).
         return Some("this action returns a single page; use page/per_page".to_string());
+    }
+    // Long names skip the did-you-mean entirely: they are a near-miss of
+    // nothing here, and `edit_distance` on unbounded input is the
+    // amplification NX-5 closes.
+    if field.chars().count() > MAX_ECHOED_NAME_CHARS {
+        return None;
     }
     if let Some((_, candidate)) = SYNONYMS
         .iter()
@@ -255,8 +296,21 @@ fn hint_for(field: &str, valid: &[&str]) -> Option<String> {
 
 fn unknown_action(action: &str) -> String {
     let names: Vec<&str> = ACTION_PARAMS.iter().map(|(name, _)| *name).collect();
-    let mut message = format!("unknown action {action:?}");
-    if let Some(candidate) = closest(action, &names) {
+    // Bound the caller-supplied action echo too (NX-5): `{:?}` escapes
+    // control characters, and an over-long name is head-truncated.
+    let total = action.chars().count();
+    let mut message = if total > MAX_ECHOED_NAME_CHARS {
+        let head: String = action.chars().take(MAX_ECHOED_NAME_CHARS).collect();
+        format!(
+            "unknown action {head:?} (+{} chars)",
+            total - MAX_ECHOED_NAME_CHARS
+        )
+    } else {
+        format!("unknown action {action:?}")
+    };
+    if total <= MAX_ECHOED_NAME_CHARS
+        && let Some(candidate) = closest(action, &names)
+    {
         message.push_str(&format!("; did you mean {candidate}?"));
     }
     message.push_str(&format!(". Valid actions: [{}]", names.join(", ")));
@@ -316,7 +370,7 @@ mod tests {
     use schemars::schema_for;
     use serde_json::{Value, json};
 
-    use super::{ACTION_PARAMS, valid_params, validate};
+    use super::{ACTION_PARAMS, MAX_ECHOED_NAME_CHARS, valid_params, validate};
     use crate::types::GitlabAction;
 
     /// Every action's parameter set as the generated schema describes it.
@@ -524,5 +578,94 @@ mod tests {
             validate(&Value::Object(object).to_string())
                 .unwrap_or_else(|error| panic!("{action} rejected a full call: {error}"));
         }
+    }
+
+    /// NX-5: the rejection message is bounded and safe — field names are
+    /// caller-controlled bytes echoed into the model context.
+    #[test]
+    fn rejection_message_is_bounded_escaped_and_prints_valid_once() {
+        // A hundred short junk keys stay a bounded message.
+        let mut object = serde_json::Map::new();
+        object.insert("action".to_string(), json!("create_or_update_file"));
+        for index in 0..100 {
+            object.insert(format!("junk{index:03}"), Value::Null);
+        }
+        let error =
+            validate(&Value::Object(object).to_string()).expect_err("junk keys must be rejected");
+        assert!(
+            error.len() < 4_096,
+            "rejection message amplified to {} bytes: {error}",
+            error.len()
+        );
+        assert!(error.contains("junk000 not valid"), "{error}");
+        assert!(error.contains("(+90 more)"), "{error}");
+        // The Valid list is printed exactly once, not per name.
+        assert_eq!(error.matches("Valid: [").count(), 1, "{error}");
+
+        // Control characters in a name are escaped, never echoed raw.
+        let error = validate(r#"{"action":"get_issue","project":"g/p","iid":1,"a\u001b[31mb":1}"#)
+            .expect_err("control-byte name must be rejected");
+        assert!(error.contains("a\\u{1b}"), "{error}");
+        assert!(!error.contains("a\u{1b}"), "{error}");
+
+        // An over-long name is head-truncated with the dropped count and
+        // skips the did-you-mean entirely.
+        let mut long_call = serde_json::Map::new();
+        long_call.insert("action".to_string(), json!("get_issue"));
+        long_call.insert("project".to_string(), json!("g/p"));
+        long_call.insert("iid".to_string(), json!(1));
+        long_call.insert("x".repeat(300), json!(1));
+        let error = validate(&Value::Object(long_call).to_string())
+            .expect_err("the long junk name must be rejected");
+        assert!(error.contains("…(+236 chars)"), "{error}");
+        assert!(
+            !error.contains(&"x".repeat(MAX_ECHOED_NAME_CHARS + 1)),
+            "the echoed name was not truncated: {error}"
+        );
+        assert!(!error.contains("did you mean"), "{error}");
+    }
+
+    /// NX-8: actions that do not page at all get the normal rejection, not
+    /// the paging explanation.
+    #[test]
+    fn all_pages_hint_only_on_paging_actions() {
+        for input in [
+            r#"{"action":"get_issue","project":"g/p","iid":1,"all_pages":true}"#,
+            r#"{"action":"create_issue","project":"g/p","title":"t","all_pages":true}"#,
+            r#"{"action":"get_file_content","project":"g/p","path":"a.txt","all_pages":true}"#,
+        ] {
+            let error = validate(input).expect_err("all_pages must stay rejected");
+            assert!(
+                error.contains("all_pages not valid for"),
+                "{input}: {error}"
+            );
+            assert!(
+                !error.contains("single page"),
+                "a page-less action must not hear the paging hint: {input}: {error}"
+            );
+        }
+    }
+
+    /// NX-6: `project_id` aliases `project` only where `project` exists —
+    /// a project-less action must reject it.
+    #[test]
+    fn project_id_alias_is_rejected_on_project_less_actions() {
+        let error = validate(r#"{"action":"search_projects","query":"x","project_id":35}"#)
+            .expect_err("project_id must be rejected on a project-less action");
+        assert!(
+            error.contains("project_id not valid for search_projects"),
+            "{error}"
+        );
+        assert!(error.contains("Valid: [query, per_page, page]"), "{error}");
+    }
+
+    /// NX-6: the suggestion budget tightens for short candidates — a
+    /// two-character slip from a four-or-fewer-character field is noise,
+    /// not a hint.
+    #[test]
+    fn short_candidates_keep_the_tight_suggestion_budget() {
+        let error = validate(r#"{"action":"get_issue","project":"g/p","iid":1,"ixe":2}"#)
+            .expect_err("ixe must be rejected");
+        assert!(!error.contains("did you mean"), "{error}");
     }
 }
