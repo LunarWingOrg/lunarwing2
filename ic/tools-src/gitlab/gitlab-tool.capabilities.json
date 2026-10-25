@@ -1,5 +1,5 @@
 {
-  "version": "0.1.6",
+  "version": "0.1.10",
   "wit_version": "0.3.0",
   "description": "Manage projects, classic issues, unified Work Items (including Tasks), merge requests, branches, repository files, search, and pipelines on self-hosted GitLab. The personal access token is injected host-side and never exposed to WASM.",
   "capabilities": {
