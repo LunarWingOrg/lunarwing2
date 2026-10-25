@@ -1841,11 +1841,15 @@ output. The 16 MiB daemon WebSocket limit rejects oversized results; it does not
 truncate accumulated output or guarantee delivery of an oversized deliverable.
 The normal terminal path delivers the banked canonical turns joined. When no
 turn was banked, the task resolves `error`; accumulated output is delivered as
-diagnostics only (FG-1). Success is
-preserved through a failed or timed-out follow-up only when a turn was banked
-(canonical text, streamed text, or completed-tool output of that turn),
-including tool output from a main attempt retried successfully with no text;
-a later failed follow-up preserves that main turn's success (ER-1). Raw
+diagnostics only (FG-1). Success is preserved through a failed or timed-out
+follow-up only when a turn was banked (canonical assistant text, streamed
+assistant text, or completed-tool output of that turn), including tool output
+from a main attempt retried successfully with no text; a later failed
+follow-up preserves that main turn's success (ER-1). Success is decided from
+completed output only: a clean turn whose sole stream is a tool error or a
+transient-retry note banks nothing, so it resolves as an empty-output (or
+denied-permission) error while the diagnostics stay in the progress stream —
+the same rule in the opencode and opencode2 executors (WI#386). Raw
 accumulated output feeds the delivered text on the failure paths but never
 the success decision itself.
 
