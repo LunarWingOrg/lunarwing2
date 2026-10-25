@@ -414,18 +414,20 @@ fn trigger_kind(mission: &Mission) -> &'static str {
 /// Warn when an Active cron mission's scheduled fire is significantly
 /// overdue (WI#323): at info level an idle-but-healthy ticker and a stalled
 /// one look the same, and a schedule the ticker keeps missing is the signal
-/// that separates them. Returns how far past the scheduled time the mission
-/// is (always `Some` for an overdue mission) for the heartbeat summary.
-fn warn_if_cron_overdue(mission: &Mission, now: DateTime<Utc>) -> Option<chrono::Duration> {
+/// that separates them. Called from the tick's cron branch, so the warning
+/// accompanies the late fire itself.
+fn warn_if_cron_overdue(mission: &Mission, now: DateTime<Utc>) {
     if mission.status != MissionStatus::Active
         || !matches!(mission.cadence, MissionCadence::Cron { .. })
     {
-        return None;
+        return;
     }
-    let next_fire_at = mission.next_fire_at?;
+    let Some(next_fire_at) = mission.next_fire_at else {
+        return;
+    };
     let overdue = now.signed_duration_since(next_fire_at);
     if overdue < CRON_OVERDUE_WARN_THRESHOLD {
-        return None;
+        return;
     }
     warn!(
         mission_id = %mission.id,
@@ -433,7 +435,6 @@ fn warn_if_cron_overdue(mission: &Mission, now: DateTime<Utc>) -> Option<chrono:
         overdue_seconds = overdue.num_seconds(),
         "Active cron mission is overdue for its scheduled fire; it will fire on its next tick"
     );
-    Some(overdue)
 }
 
 /// Stamp legacy counters conservatively; reset dated counters at a UTC boundary.
