@@ -1399,9 +1399,23 @@ mod tests {
         #[test]
         fn probe_walk_reaches_far_run_boundary_at_production_budget() {
             let safety = safety_with_max_len(100_000);
-            let head = format!("{}{}{}", " ".repeat(100), base64_run(60_000), " ".repeat(60_000));
-            assert_eq!(safety.secret_safe_cut(&head, 50_000, false), 100, "PROBE P3 head");
-            let tail = format!("{}{}{}", " ".repeat(60_000), base64_run(60_000), " ".repeat(100));
+            let head = format!(
+                "{}{}{}",
+                " ".repeat(100),
+                base64_run(60_000),
+                " ".repeat(60_000)
+            );
+            assert_eq!(
+                safety.secret_safe_cut(&head, 50_000, false),
+                100,
+                "PROBE P3 head"
+            );
+            let tail = format!(
+                "{}{}{}",
+                " ".repeat(60_000),
+                base64_run(60_000),
+                " ".repeat(100)
+            );
             assert_eq!(
                 safety.secret_safe_cut(&tail, tail.len() - 50_000, true),
                 120_000,
@@ -1414,7 +1428,10 @@ mod tests {
             }
             let r = safety.sanitize_tool_output("test", &head);
             assert!(r.content.starts_with(&" ".repeat(100)));
-            assert!(r.content.contains("showing 50100/120100 bytes"), "PROBE P3 notice");
+            assert!(
+                r.content.contains("showing 50100/120100 bytes"),
+                "PROBE P3 notice"
+            );
         }
 
         /// WI#355 reviewer probe P4 (!1909 run-215 review): a 10 KB single run
@@ -1425,7 +1442,11 @@ mod tests {
         fn probe_walk_to_output_edge() {
             let safety = safety_with_max_len(4096);
             let input = "Z".repeat(10_000);
-            assert_eq!(safety.secret_safe_cut(&input, 2048, false), 0, "PROBE P4 head");
+            assert_eq!(
+                safety.secret_safe_cut(&input, 2048, false),
+                0,
+                "PROBE P4 head"
+            );
             assert_eq!(
                 safety.secret_safe_cut(&input, 10_000 - 2048, true),
                 10_000,
@@ -1433,7 +1454,10 @@ mod tests {
             );
             let r = safety.sanitize_tool_output("test", &input);
             assert!(!r.content.contains('Z'));
-            assert!(r.content.contains("showing 0/10000 bytes"), "PROBE P4 notice");
+            assert!(
+                r.content.contains("showing 0/10000 bytes"),
+                "PROBE P4 notice"
+            );
         }
 
         /// WI#355 reviewer probe P5 (!1909 run-215 review): second-window edges
@@ -1444,9 +1468,23 @@ mod tests {
         #[test]
         fn probe_second_window_edges_inside_multibyte_chars() {
             let safety = safety_with_max_len(16_384);
-            let head = format!("{} {}{}", "é".repeat(1_500), "Z".repeat(10_000), " ".repeat(20_000));
-            assert_eq!(safety.secret_safe_cut(&head, 8_192, false), 3_001, "PROBE P5 head");
-            let tail = format!("{}{} {}", " ".repeat(20_000), "Z".repeat(10_000), "é".repeat(1_500));
+            let head = format!(
+                "{} {}{}",
+                "é".repeat(1_500),
+                "Z".repeat(10_000),
+                " ".repeat(20_000)
+            );
+            assert_eq!(
+                safety.secret_safe_cut(&head, 8_192, false),
+                3_001,
+                "PROBE P5 head"
+            );
+            let tail = format!(
+                "{}{} {}",
+                " ".repeat(20_000),
+                "Z".repeat(10_000),
+                "é".repeat(1_500)
+            );
             assert_eq!(
                 safety.secret_safe_cut(&tail, tail.len() - 8_192, true),
                 30_000,
