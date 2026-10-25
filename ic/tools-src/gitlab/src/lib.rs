@@ -46,8 +46,11 @@ impl exports::lunarwing::agent::tool::Guest for GitlabTool {
          use project-local iid values. Token is injected by LunarWing and never exposed \
          to WASM. List responses carry explicit pagination metadata. Use list_issues \
          with all_pages=true for classic issues, or list_work_items with all_pages=true \
-         for a bounded, single-approval inventory across Issue and Task types. Calls \
-         require approval unless you choose to always allow this tool."
+         for a bounded, single-approval inventory across Issue and Task types. \
+         search_blobs takes optional ref (branch, tag, or commit SHA) and searches \
+         only the project's default branch when it is omitted, so branch-only files \
+         need ref. Bad parameter names are rejected with the action's valid set. \
+         Calls require approval unless you choose to always allow this tool."
             .to_string()
     }
 }

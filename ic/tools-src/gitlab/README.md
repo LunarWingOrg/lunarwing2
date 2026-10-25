@@ -23,7 +23,37 @@ injection, bounded errors, and approval gating.
 `project` accepts a numeric project ID or `group/project`, as a JSON string or
 number, and may also be spelled `project_id`. Issue, Work Item, and merge
 request `iid` values are project-local IDs shown by GitLab, not global IDs.
-`get_file_content` returns base64 to preserve arbitrary file bytes.
+`get_file_content` returns base64 to preserve arbitrary file bytes and
+accepts only `project`, `path`, and `ref` (no `branch` or `sha` spelling).
+`list_projects` filters by `search`, not `query`. Only `list_issues` and
+`list_work_items` accept `all_pages`; `list_merge_requests` and the other
+list actions return one page and paginate with `page`/`per_page`.
+
+### Parameters and branch-scoped search
+
+`search_blobs` accepts an optional `ref` (branch, tag, or commit SHA) passed
+to GitLab's project search `ref` filter, for example:
+
+```json
+{"action":"search_blobs","project":"lunarwing/lunarwing2","query":"search_blobs","ref":"sweetiebot/kimi-36-20261025-0005"}
+```
+
+**Without `ref`, GitLab searches only the project's default branch.** A file
+that exists solely on a feature branch is invisible to such a call; empty
+results do not mean the file or symbol is absent from the repository. Pass
+`ref` whenever searching work in progress on a branch or tag. GitLab
+supports `ref` for the repository search scopes (`blobs`, `commits`,
+`wiki_blobs`), so `search_issues` and `search_projects` have no `ref`.
+
+Invalid parameter names are rejected with the action's exact parameter set
+and a rename hint rather than a bare schema violation, for example
+`branch not valid for get_file_content; use ref. Valid: [project, path, ref]`
+and `query not valid for list_projects; use search. Valid: [per_page, page,
+search, membership]`. Every offending name in a call is reported at once, so
+a single retry can fix all of them. Close misspellings get a
+`did you mean <param>?` suggestion and an unknown action name lists the
+valid actions. Missing required fields, wrong JSON types, and invalid enum
+values are still reported by serde's schema errors.
 
 `create_issue` and `update_issue` accept the issue text as `description`
 (GitLab's REST field name) or `body` (the note-action spelling callers
