@@ -173,6 +173,105 @@ if ((${#backups[@]} == 1)); then
 fi
 assert_no_glob "refusal removes the candidate temp file" "$PORTS_REGISTRY.tmp.*"
 
+echo "=== ports_migrate_v8 unparseable registry refusal (NY-9) ==="
+
+# A corrupt registry (tenant b's .ports is a string) passes the rename jq
+# (which only touches .extended_ports) but the post-rename collision query
+# fails with 'string ("corrupt") has no keys'. Before NY-9 the inline guard
+# swallowed that jq error and swapped the candidate; the standalone script
+# refused it. The guard must now fail closed: the candidate is removed, the
+# live registry stays byte-identical, and the refusal names the backup.
+cat >"$FIXTURE/corrupt-v7.json" <<'JSON'
+{
+  "version": 7,
+  "range": {"start": 10000, "end": 19999},
+  "extended_range": {"start": 20000, "end": 29999},
+  "block_size": 10,
+  "extended_block_size": 10,
+  "tenants": {
+    "alpha": {
+      "base_port": 10000,
+      "ports": {"gateway": 10000, "http": 10001},
+      "extended_base": 20000,
+      "extended_ports": {"reserved_3": 20003, "reserved_4": 20004}
+    },
+    "beta": {
+      "base_port": 10010,
+      "ports": "corrupt",
+      "extended_base": 20010,
+      "extended_ports": {"reserved_3": 10000, "reserved_4": 20014}
+    }
+  }
+}
+JSON
+PORTS_REGISTRY="$FIXTURE/corrupt.json"
+cp "$FIXTURE/corrupt-v7.json" "$PORTS_REGISTRY"
+# shellcheck disable=SC2034  # read by ports_migrate_v8 (sourced library)
+current_version=7
+
+rc=0
+unparseable_out="$( ( ports_migrate_v8 ) 2>&1 )" || rc=$?
+
+assert_eq "unparseable registry refusal exits non-zero" "$rc" "1"
+assert_contains "refusal says it could not verify uniqueness" \
+  "$unparseable_out" "could not verify port uniqueness"
+assert_contains "refusal states the registry is unchanged" \
+  "$unparseable_out" "registry unchanged"
+assert_file_eq "live registry left byte-identical" \
+  "$PORTS_REGISTRY" "$FIXTURE/corrupt-v7.json"
+assert_eq "version stays at 7 after unparseable refusal" \
+  "$(jq -r '.version' "$PORTS_REGISTRY")" "7"
+
+backups=()
+while IFS= read -r path; do
+  [[ -n "$path" ]] && backups+=("$path")
+done < <(compgen -G "$PORTS_REGISTRY.bak.*" || true)
+assert_eq "unparseable refusal still leaves one backup" "${#backups[@]}" "1"
+if ((${#backups[@]} == 1)); then
+  assert_file_eq "unparseable refusal backup holds the unchanged registry" \
+    "${backups[0]}" "$FIXTURE/corrupt-v7.json"
+fi
+assert_no_glob "unparseable refusal removes the candidate temp file" \
+  "$PORTS_REGISTRY.tmp.*"
+
+echo "=== ports_migrate_v8 rename-jq failure cleanup (NY-11) ==="
+
+# A registry whose extended_base is a string makes the rename jq itself fail
+# (string + number). The candidate temp file is written empty; the migration
+# must remove it and die naming the backup. Before NY-11 this cleanup was
+# untested.
+cat >"$FIXTURE/rename-fail-v7.json" <<'JSON'
+{
+  "version": 7,
+  "range": {"start": 10000, "end": 19999},
+  "block_size": 10,
+  "tenants": {
+    "alpha": {
+      "base_port": 10000,
+      "ports": {"gateway": 10000, "http": 10001},
+      "extended_base": "oops",
+      "extended_ports": {"reserved_3": 20003}
+    }
+  }
+}
+JSON
+PORTS_REGISTRY="$FIXTURE/rename-fail.json"
+cp "$FIXTURE/rename-fail-v7.json" "$PORTS_REGISTRY"
+current_version=7
+
+rc=0
+rename_fail_out="$( ( ports_migrate_v8 ) 2>&1 )" || rc=$?
+
+assert_eq "rename-jq failure exits non-zero" "$rc" "1"
+assert_contains "rename-jq failure states the registry is unchanged" \
+  "$rename_fail_out" "registry unchanged"
+assert_file_eq "rename-jq failure leaves the live registry byte-identical" \
+  "$PORTS_REGISTRY" "$FIXTURE/rename-fail-v7.json"
+assert_eq "version stays at 7 after rename-jq failure" \
+  "$(jq -r '.version' "$PORTS_REGISTRY")" "7"
+assert_no_glob "rename-jq failure removes the candidate temp file" \
+  "$PORTS_REGISTRY.tmp.*"
+
 echo
 if ((failures == 0)); then
   echo "ALL PASS"
