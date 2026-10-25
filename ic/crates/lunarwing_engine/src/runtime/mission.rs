@@ -411,11 +411,36 @@ fn trigger_kind(mission: &Mission) -> &'static str {
     }
 }
 
+/// Static error class for a mission fire failure, for logs. Cadence and
+/// timezone validation failures quote the stored user value in their `reason`,
+/// so the class is logged instead of the full `%e` at warn level (WI#323
+/// reviewer NX-12): the full error — including that stored value — stays at
+/// debug. Everything else falls back to `engine_error`, still user-content-free.
+fn mission_fire_error_kind(error: &EngineError) -> &'static str {
+    let EngineError::Effect { reason } = error else {
+        return "engine_error";
+    };
+    if reason.starts_with("invalid mission cron expression")
+        || reason.starts_with("invalid mission timezone")
+        || reason.starts_with("mission cron expression") && reason.contains("no future fire time")
+        || reason.starts_with("mission cron expression") && reason.contains("sub-minute")
+    {
+        "invalid_cadence"
+    } else {
+        "engine_error"
+    }
+}
+
 /// Warn when an Active cron mission's scheduled fire is significantly
 /// overdue (WI#323): at info level an idle-but-healthy ticker and a stalled
 /// one look the same, and a schedule the ticker keeps missing is the signal
 /// that separates them. Called from the tick's cron branch, so the warning
 /// accompanies the late fire itself.
+///
+/// The warning repeats every tick it persists (NX-14): the message states
+/// the fire is late and names the last-failed mission count the heartbeat
+/// can still surface, but a single fire that keeps failing also warns in
+/// `tick`, so this stays informational rather than noisy.
 fn warn_if_cron_overdue(mission: &Mission, now: DateTime<Utc>) {
     if mission.status != MissionStatus::Active
         || !matches!(mission.cadence, MissionCadence::Cron { .. })
@@ -431,9 +456,9 @@ fn warn_if_cron_overdue(mission: &Mission, now: DateTime<Utc>) {
     }
     warn!(
         mission_id = %mission.id,
-        next_fire_at = %next_fire_at.to_rfc3339(),
+        scheduled_for = %next_fire_at.to_rfc3339(),
         overdue_seconds = overdue.num_seconds(),
-        "Active cron mission is overdue for its scheduled fire; it will fire on its next tick"
+        "Active cron mission is firing late: it is overdue for its scheduled fire"
     );
 }
 
@@ -1595,7 +1620,10 @@ impl MissionManager {
             let mut interval = tokio::time::interval(MISSION_TICK_INTERVAL);
             // Wall-clock, not tick-counted: a stalled tick loop delays the
             // heartbeat instead of silently pretending everything is fine.
-            let mut last_heartbeat = tokio::time::Instant::now();
+            // Seed the clock one interval in the past so the first post-warmup
+            // tick beats immediately instead of an hour after start (NX-15):
+            // a ticker that dies in its first hour still leaves a heartbeat.
+            let mut last_heartbeat = tokio::time::Instant::now() - MISSION_TICKER_HEARTBEAT;
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
@@ -1629,15 +1657,20 @@ impl MissionManager {
     }
 
     /// Hourly info-level proof that the ticker is alive (WI#323). Reports the
-    /// active-mission count, the earliest scheduled fire among them, and how
-    /// many Active cron missions are already overdue. Ids/timestamps/counts
-    /// only — no mission names, goals or other user content.
+    /// active-mission count (rows that loaded as Active — not the raw index
+    /// size), the earliest scheduled fire among them, how many Active cron
+    /// missions are already overdue, and how many active-index entries could
+    /// not be loaded. Ids/timestamps/counts only — no mission names, goals or
+    /// other user content.
     async fn log_ticker_heartbeat(&self) {
         let active_ids = self.active.read().await.clone();
         let mut scheduled: Vec<(DateTime<Utc>, bool)> = Vec::new();
+        let mut loaded_active = 0usize;
+        let mut load_failures = 0usize;
         for mission_id in active_ids.iter() {
             match self.store.load_mission(*mission_id).await {
                 Ok(Some(mission)) if mission.status == MissionStatus::Active => {
+                    loaded_active += 1;
                     if let Some(next_fire_at) = mission.next_fire_at {
                         let cron = matches!(mission.cadence, MissionCadence::Cron { .. });
                         scheduled.push((next_fire_at, cron));
@@ -1645,6 +1678,7 @@ impl MissionManager {
                 }
                 Ok(_) => {}
                 Err(error) => {
+                    load_failures += 1;
                     debug!(mission_id = %mission_id, %error, "ticker heartbeat: could not load mission");
                 }
             }
@@ -1660,7 +1694,8 @@ impl MissionManager {
             .map(|next| next.to_rfc3339())
             .unwrap_or_else(|| "none".to_string());
         info!(
-            active_missions = active_ids.len(),
+            active_missions = loaded_active,
+            load_failures = load_failures,
             next_fire_at = %next_fire_at,
             overdue_cron_missions = overdue,
             "mission scheduler heartbeat"
@@ -2599,9 +2634,10 @@ impl MissionManager {
                     Err(e) => {
                         warn!(
                             mission_id = %mid,
-                            error = %e,
+                            error_kind = mission_fire_error_kind(&e),
                             "mission tick: fire failed, continuing to next mission"
                         );
+                        debug!(mission_id = %mid, error = %e, "mission tick: fire failed");
                     }
                 }
             }
@@ -15071,6 +15107,41 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         Ok(())
     }
 
+    /// Assert no captured line at `level` or above carries `needle`. Debug
+    /// lines legitimately echo full error text (the reviewer's NX-12 concern
+    /// is user content at warn and above, not the debug diagnostic), so the
+    /// assertion is scoped to the level that is safety-relevant.
+    fn assert_no_log_carries_at_or_above(
+        lines: &[&str],
+        needle: &str,
+        level: &str,
+    ) -> Result<(), String> {
+        const LEVELS: [&str; 5] = ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"];
+        let threshold = LEVELS
+            .iter()
+            .position(|candidate| *candidate == level)
+            .unwrap_or(0);
+        let offending = lines
+            .iter()
+            .filter(|line| {
+                if !line.contains(needle) {
+                    return false;
+                }
+                LEVELS
+                    .iter()
+                    .position(|candidate| line.contains(&format!(" {candidate} ")))
+                    .map(|position| position <= threshold)
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        if offending.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "{needle:?} reached the scheduler log at {level} or above: {offending:?}"
+        ))
+    }
+
     #[tokio::test]
     #[traced_test]
     async fn ticker_start_and_hourly_heartbeat_are_info_level() {
@@ -15126,7 +15197,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
 
     #[tokio::test]
     #[traced_test]
-    async fn heartbeat_reports_no_scheduled_fire_and_survives_load_errors() {
+    async fn heartbeat_reports_no_scheduled_fire_and_failing_loads() {
         let store = Arc::new(TestStore::new());
         let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
         let id = liveness_mission(&mgr, MissionCadence::Manual, "unscheduled").await;
@@ -15144,7 +15215,8 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
                 "INFO",
                 &[
                     "mission scheduler heartbeat",
-                    "active_missions=1",
+                    "active_missions=0",
+                    "load_failures=1",
                     "next_fire_at=none",
                     "overdue_cron_missions=0",
                 ],
@@ -15181,7 +15253,15 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         let mut last_heartbeat = tokio::time::Instant::now();
         mgr.run_cron_tick("test-user", &mut last_heartbeat).await;
         logs_assert(|lines: &[&str]| {
-            assert_logged_at(lines, "WARN", &["mission tick: fire failed"])?;
+            assert_logged_at(
+                lines,
+                "WARN",
+                &[
+                    "mission tick: fire failed",
+                    "error_kind=\"invalid_cadence\"",
+                ],
+            )?;
+            assert_no_log_carries_at_or_above(lines, "not a cron expression", "WARN")?;
             assert_no_log_carries(lines, "mission scheduler heartbeat").map_err(|_| {
                 "the heartbeat must wait for its hour, not fire every tick".to_string()
             })
@@ -15250,9 +15330,9 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
                 lines,
                 "WARN",
                 &[
-                    "Active cron mission is overdue",
+                    "Active cron mission is firing late",
                     &format!("mission_id={id}"),
-                    &format!("next_fire_at={}", scheduled_fire.to_rfc3339()),
+                    &format!("scheduled_for={}", scheduled_fire.to_rfc3339()),
                     "overdue_seconds=",
                 ],
             )?;
@@ -15331,7 +15411,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
 
         assert_eq!(mgr.tick("test-user").await.unwrap().len(), 1);
         logs_assert(|lines: &[&str]| {
-            assert_no_log_carries(lines, "is overdue")
+            assert_no_log_carries(lines, "is firing late")
                 .map_err(|_| "a sub-threshold late fire must not warn".to_string())?;
             assert_logged_at(lines, "INFO", &["mission fired", "trigger_kind=cron"])
         });
@@ -15376,7 +15456,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         }
 
         assert!(mgr.tick("test-user").await.unwrap().is_empty());
-        assert!(!logs_contain("is overdue"));
+        assert!(!logs_contain("is firing late"));
     }
 
     #[tokio::test]
