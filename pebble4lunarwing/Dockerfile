@@ -46,16 +46,16 @@ RUN printf '%s' "${PEBBLE_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
 # webpki-roots 1.0.8 -> 1.0.10, chacha20 0.10.1 -> 0.10.2, and the 2026-10-24
 # security refresh (v2.1.7.0 item 3) changed: quinn 0.11.11 -> 0.11.12,
 # quinn-proto 0.11.16 -> 0.11.19 (RUSTSEC-2026-0338/0339/0340/0341/0342),
-# quinn-udp 0.5.15 -> 0.5.16 (its windows-sys edge moves 0.61.2 -> 0.59.0,
-# re-pointing the unchanged errno/rustix/winapi-util records),
-# tokio 1.52.3 -> 1.53.3 (RUSTSEC-2026-0386) and clipboard-win 5.4.1 ->
-# 5.4.3 (yanked). No package is added or removed.
+# quinn-udp 0.5.15 -> 0.5.16, tokio 1.52.3 -> 1.53.3 (RUSTSEC-2026-0386)
+# and clipboard-win 5.4.1 -> 5.4.3 (yanked). Only those five packages'
+# version/checksum lines change; no dependency edge is re-pointed
+# (run-214 NX-1) and no package is added or removed.
 # The build fails if the checked-out lock or the pinned digest drift from the
 # reviewed inputs, keeping the locked/reproducible-build guarantee.
 COPY pebble4lunarwing/upstream/Cargo.lock /tmp/pebble-upstream-Cargo.lock
 COPY pebble4lunarwing/scripts/verify_upstream_lock.py /tmp/verify-pebble-lock.py
 # Canonical reviewed pin also covers mt-admin, Compose and plain docker builds.
-ARG PEBBLE_LOCK_SHA256=ae490478053d6547c64d1999f7a4fb242d48f8388f08f8d96eed84ae12e172b6
+ARG PEBBLE_LOCK_SHA256=24fc1c2284f5527634c4129542f01c2b11b438fbe1caa7c9bbc50f6dae8156a4
 RUN python3 /tmp/verify-pebble-lock.py pebble/Cargo.lock \
     /tmp/pebble-upstream-Cargo.lock "${PEBBLE_LOCK_SHA256}"
 RUN cp /tmp/pebble-upstream-Cargo.lock pebble/Cargo.lock && \
