@@ -2427,8 +2427,7 @@ mod tests {
         let matches: Vec<&&str> = lines
             .iter()
             .filter(|line| {
-                line_has_level(line, level)
-                    && fragments.iter().all(|needle| line.contains(needle))
+                line_has_level(line, level) && fragments.iter().all(|needle| line.contains(needle))
             })
             .collect();
         if matches.len() == 1 {
