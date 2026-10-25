@@ -269,6 +269,63 @@ def check_image_filesystem(lane: pathlib.Path) -> None:
         check("image boot files, scripts and config are root-owned and read-only")
 
 
+def _check_real_binary_metadata(
+    label: str, path: pathlib.Path, *, owner_uid: int
+) -> bool:
+    """WI#425 GX-2: the real binary must be root-owned and not group/other
+    writable, otherwise the agent uid could replace it with a tunnel-bearing
+    build that the wrapper would then exec. Missing/unreadable reports the
+    real cause (GZ-2 shape)."""
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        fail(f"{label} {path} is missing or unreadable: {error}")
+        return False
+    mode = stat.S_IMODE(metadata.st_mode)
+    if metadata.st_uid != owner_uid:
+        fail(f"{label} {path} must be owned by uid {owner_uid} (got uid {metadata.st_uid})")
+        return False
+    if mode & 0o022:
+        fail(f"{label} {path} must not be group- or other-writable (mode {mode:o})")
+        return False
+    return True
+
+
+def _check_parent_directories(
+    label: str, path: pathlib.Path, *, owner_uid: int
+) -> bool:
+    """WI#425 GX-2: every parent of the wrapper and the real binary must block
+    entry replacement by a non-root uid, so the agent cannot swap either
+    file by renaming it through a writable parent.
+
+    A parent passes when it is owned by the wrapper owner or by root and
+    carries no group/other write bit, or when it is sticky (the sticky bit
+    already prevents non-owner rename/removal of the entries below it —
+    the /tmp shape). Hardcoding root as an allowed owner matters for the
+    test fixtures, whose paths live under root-owned ancestors (/home, /).
+    """
+    ok = True
+    for parent in path.parents:
+        try:
+            metadata = parent.lstat()
+        except OSError as error:
+            fail(f"{label} parent {parent} is missing or unreadable: {error}")
+            ok = False
+            continue
+        mode = stat.S_IMODE(metadata.st_mode)
+        if mode & stat.S_ISVTX:
+            continue
+        if metadata.st_uid not in (owner_uid, 0):
+            fail(f"{label} parent {parent} must be owned by uid {owner_uid} or root "
+                 f"(got uid {metadata.st_uid})")
+            ok = False
+        if mode & 0o022:
+            fail(f"{label} parent {parent} must not be group- or other-writable "
+                 f"(mode {mode:o}) — a writable parent allows entry replacement")
+            ok = False
+    return ok
+
+
 def check_installed_wrapper(
     lane: pathlib.Path,
     wrapper_path: pathlib.Path = pathlib.Path("/usr/local/bin/opencode"),
@@ -291,6 +348,15 @@ def check_installed_wrapper(
     Dockerfile edit can still defeat it by replacing the environment or
     checker (run-109 GW-3). Image builds only (v2 profile); independent
     checkout-side image verification remains a WI#357 follow-up.
+
+    WI#425 GX-2: OPENCODE_BIN may not retarget the wrapper at build time,
+    the real binary's owner and mode are verified (root-owned, not
+    group/other-writable), and every parent directory of both the wrapper
+    and the real binary is root-owned and not group/other-writable.
+    WI#425 GX-3: the executable-bit check requires all three execute bits
+    (mode AND 0o111 == 0o111) — a root-owned 0744 wrapper bricks the
+    runtime user (the agent uid cannot execute an owner-only-executable
+    file), so owner-only exec no longer passes.
     """
     try:
         metadata = wrapper_path.lstat()
@@ -306,12 +372,14 @@ def check_installed_wrapper(
     if metadata.st_mode & 0o022:
         fail(f"installed wrapper {wrapper_path} must not be group- or other-writable")
         return
-    # Run-106 GJ-3(c): a non-executable wrapper is skipped by PATH lookup, so
-    # 'opencode' resolves elsewhere — refuse it with its own reason instead
-    # of the misleading "earlier PATH dir shadows" text.
-    if not metadata.st_mode & stat.S_IXUSR:
-        fail(f"installed wrapper {wrapper_path} must be executable "
-             f"(mode {stat.S_IMODE(metadata.st_mode):o})")
+    # Run-106 GJ-3(c) + WI#425 GX-3: a non-executable wrapper is skipped by
+    # PATH lookup, and an owner-only-executable wrapper (0744) cannot be
+    # executed by the runtime user — require every execute bit so the
+    # agent uid the wrapper serves can run it.
+    if (stat.S_IMODE(metadata.st_mode) & 0o111) != 0o111:
+        fail(f"installed wrapper {wrapper_path} must be executable by user, group "
+             f"and other (mode {stat.S_IMODE(metadata.st_mode):o}) — a root-owned "
+             f"0744 wrapper bricks the runtime user (WI#425 GX-3)")
         return
     source = lane / "scripts" / "opencode-exposure-guard.sh"
     try:
@@ -362,11 +430,29 @@ def check_installed_wrapper(
         fail(f"LUNARWING_REAL_OPENCODE={real_override!r} is set at build time — the "
              f"wrapper would exec that instead of {binary_path} (run-106 GJ-3b)")
         check_binary(pathlib.Path(real_override))
+    # WI#425 GX-2: the entrypoint defaults OPENCODE_BIN to the wrapper, so an
+    # ENV pointing it at anything but the wrapper path makes the bridge spawn
+    # the real binary directly, bypassing every argv scan. Only the wrapper
+    # path (or an unset value) passes at build time; a foreign value fails
+    # AND is scanned so the report says what sits at the override target.
+    opencode_bin_override = os.environ.get("OPENCODE_BIN", "")
+    if opencode_bin_override and pathlib.Path(opencode_bin_override) != wrapper_path:
+        fail(f"OPENCODE_BIN={opencode_bin_override!r} is set at build time — the "
+             f"bridge would spawn that instead of the wrapper {wrapper_path} "
+             "(WI#425 GX-2)")
+        check_binary(pathlib.Path(opencode_bin_override))
     resolved = shutil.which("opencode")
     if resolved is None or pathlib.Path(resolved) != wrapper_path:
         fail(f"'opencode' on PATH must resolve to the wrapper {wrapper_path} "
              f"(got {resolved!r}) — an earlier PATH dir shadows the guard")
         return
+    # WI#425 GX-2: the real binary must be root-owned and not group/other
+    # writable like the wrapper; every parent directory of both paths must
+    # block entry replacement so the agent uid cannot swap either file
+    # through a writable parent (rename/swap attacks).
+    _check_real_binary_metadata("real binary", binary_path, owner_uid=owner_uid)
+    _check_parent_directories("wrapper", wrapper_path, owner_uid=owner_uid)
+    _check_parent_directories("real binary", binary_path, owner_uid=owner_uid)
     check_binary(binary_path)
     if not failures:
         check(f"installed wrapper {wrapper_path} is the exposure guard "
