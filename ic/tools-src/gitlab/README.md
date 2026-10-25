@@ -53,7 +53,9 @@ search, membership]`. Every offending name in a call is reported at once, so
 a single retry can fix all of them. Close misspellings get a
 `did you mean <param>?` suggestion and an unknown action name lists the
 valid actions. Missing required fields, wrong JSON types, and invalid enum
-values are still reported by serde's schema errors.
+values are still reported by serde's schema errors; because those errors do
+not name the offending field, they are followed by
+`Valid for this action: [...]` with the same parameter list.
 
 `create_issue` and `update_issue` accept the issue text as `description`
 (GitLab's REST field name) or `body` (the note-action spelling callers

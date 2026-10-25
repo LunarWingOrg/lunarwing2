@@ -56,25 +56,11 @@ impl exports::lunarwing::agent::tool::Guest for GitlabTool {
 }
 
 fn execute_inner(params: &str) -> Result<String, String> {
-    // One approval covers parameter errors as well as HTTP calls, so a
-    // rejection must teach the caller how to retry in a single message.
-    // Field names are checked before serde: its strict-schema rejection
-    // names only the offending field, not the names that would work.
-    params::validate(params).map_err(|error| {
+    let action = validated_action(params).inspect_err(|_| {
         lunarwing::agent::host::log(
             lunarwing::agent::host::LogLevel::Warn,
             "GitLab tool parameter validation failed",
         );
-        format!("Invalid GitLab parameters: {error}")
-    })?;
-    let action = parse_action(params).map_err(|error| {
-        lunarwing::agent::host::log(
-            lunarwing::agent::host::LogLevel::Warn,
-            "GitLab tool parameter validation failed",
-        );
-        format!(
-            "Invalid GitLab parameters: {error}. Expected {{\"action\":\"<name>\",...}}; call tool_info for schema."
-        )
     })?;
     lunarwing::agent::host::log(
         lunarwing::agent::host::LogLevel::Info,
@@ -360,6 +346,43 @@ fn parse_action(params: &str) -> Result<GitlabAction, String> {
     }
 }
 
+/// Whole pre-dispatch path, with no host capability calls: `execute_inner`
+/// runs it before `GitlabClient::load`, so a parameter rejection can neither
+/// prompt for a token nor issue an HTTP request.
+///
+/// One approval covers parameter errors as well as HTTP calls, so a
+/// rejection must teach the caller how to retry in a single message. Field
+/// names are checked before serde: its strict-schema rejection names only
+/// the offending field, not the names that would work (WI#315).
+fn validated_action(params: &str) -> Result<GitlabAction, String> {
+    params::validate(params).map_err(|error| format!("Invalid GitLab parameters: {error}"))?;
+    parse_action(params).map_err(|error| {
+        // Serde's internally tagged enum reports e.g. `invalid type: string
+        // "seven", expected u64` with no path, so the caller cannot tell
+        // which parameter is at fault. Naming the action's parameter set
+        // here as well turns that into a usable correction.
+        let valid = action_param_hint(params);
+        format!(
+            "Invalid GitLab parameters: {error}.{valid} Expected {{\"action\":\"<name>\",...}}; call tool_info for schema."
+        )
+    })
+}
+
+fn action_param_hint(params: &str) -> String {
+    let action = serde_json::from_str::<serde_json::Value>(params)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("action")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        });
+    action
+        .and_then(|action| params::valid_params(&action))
+        .map(|valid| format!(" Valid for this action: [{}].", valid.join(", ")))
+        .unwrap_or_default()
+}
+
 /// `body` is an accepted alias for the `description` field of issue write
 /// actions (WI#266: callers habitually reuse the note-action parameter name).
 /// Serde counts the alias and the canonical spelling as the same field, so
@@ -440,8 +463,76 @@ export!(GitlabTool);
 mod tests {
     use schemars::schema_for;
 
-    use super::parse_action;
     use super::types::GitlabAction;
+    use super::{parse_action, validated_action};
+
+    /// The full execute path must reject a wrong parameter name before any
+    /// host capability (token, workspace, HTTP) is touched, and the message
+    /// the caller sees must carry the actionable rename and valid set.
+    #[test]
+    fn validated_action_rejects_wrong_params_actionably() {
+        let error = validated_action(
+            r#"{"action":"get_file_content","project":"g/p","path":"a.txt","branch":"feature"}"#,
+        )
+        .expect_err("branch must be rejected");
+        assert_eq!(
+            error,
+            "Invalid GitLab parameters: branch not valid for get_file_content; use ref. Valid: [project, path, ref]"
+        );
+
+        let error = validated_action(r#"{"action":"list_projects","query":"lunarwing"}"#)
+            .expect_err("query must be rejected");
+        assert!(error.contains("use search"), "{error}");
+        assert!(
+            error.contains("Valid: [per_page, page, search, membership]"),
+            "{error}"
+        );
+
+        let error = validated_action(r#"{"action":"nope"}"#).expect_err("unknown action");
+        assert!(error.contains("Valid actions: [current_user"), "{error}");
+    }
+
+    /// Type/enum errors keep the schema message (the field name is valid,
+    /// only its value is wrong) and carry the tool_info pointer.
+    #[test]
+    fn validated_action_keeps_value_errors_in_the_schema_path() {
+        let error = validated_action(r#"{"action":"get_issue","project":"g/p","iid":"seven"}"#)
+            .expect_err("iid must be an integer");
+        assert!(error.contains("Invalid GitLab parameters:"), "{error}");
+        assert!(error.contains("call tool_info for schema"), "{error}");
+        assert!(error.contains("expected u64"), "{error}");
+        assert!(
+            error.contains("Valid for this action: [project, iid]."),
+            "{error}"
+        );
+
+        let error = validated_action(
+            r#"{"action":"create_issue","project":"g/p","title":"t","body":"a","description":"b"}"#,
+        )
+        .expect_err("body+description must conflict");
+        assert!(error.contains("body and description"), "{error}");
+    }
+
+    /// A correct call still reaches deserialization; search_blobs keeps ref.
+    #[test]
+    fn validated_action_accepts_branch_scoped_search() {
+        let action = validated_action(
+            r#"{"action":"search_blobs","project":35,"query":"TODO","ref":"feature/wi-315","per_page":50}"#,
+        )
+        .unwrap_or_else(|error| panic!("valid search must parse: {error}"));
+        let GitlabAction::SearchBlobs {
+            project,
+            ref_,
+            per_page,
+            ..
+        } = action
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(project, "35");
+        assert_eq!(ref_.as_deref(), Some("feature/wi-315"));
+        assert_eq!(per_page, 50);
+    }
 
     #[test]
     fn generated_schema_lists_action_discriminator() {
