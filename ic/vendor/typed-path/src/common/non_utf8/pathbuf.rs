@@ -8,6 +8,13 @@ use core::ops::Deref;
 use core::str::FromStr;
 use core::{cmp, fmt};
 
+#[cfg(feature = "serde")]
+use serde_core::{
+    de,
+    de::{Unexpected, Visitor},
+    Deserialize, Deserializer, Serialize, Serializer,
+};
+
 use crate::no_std_compat::*;
 use crate::{CheckedPathError, Encoding, Iter, Path};
 
@@ -308,6 +315,9 @@ where
     /// If [`self.extension`] is [`None`], the extension is added; otherwise
     /// it is replaced.
     ///
+    /// Anything trailing [`self.file_name`], such as separators or a current directory segment,
+    /// is discarded alongside the old extension.
+    ///
     /// [`self.file_name`]: Path::file_name
     /// [`self.extension`]: Path::extension
     ///
@@ -324,34 +334,35 @@ where
     /// p.set_extension("dark_side");
     /// assert_eq!(Path::new("/feel/the.dark_side"), p.as_path());
     /// ```
+    ///
+    /// Trailing separators are dropped along with the old extension:
+    ///
+    /// ```
+    /// use typed_path::{Path, PathBuf, UnixEncoding};
+    ///
+    /// let mut p = PathBuf::<UnixEncoding>::from("/feel/the.force/");
+    ///
+    /// p.set_extension("dark_side");
+    /// assert_eq!(Path::new("/feel/the.dark_side"), p.as_path());
+    /// ```
     pub fn set_extension<S: AsRef<[u8]>>(&mut self, extension: S) -> bool {
         self._set_extension(extension.as_ref())
     }
 
     fn _set_extension(&mut self, extension: &[u8]) -> bool {
-        if self.file_stem().is_none() {
-            return false;
-        }
+        // The file stem borrows from our buffer, so the offset just past it is where the old
+        // extension begins. Everything from there on is discarded, which also covers anything
+        // trailing the file name such as separators or a current directory segment
+        let end_of_stem = match self.file_stem() {
+            Some(stem) => (stem.as_ptr() as usize - self.inner.as_ptr() as usize) + stem.len(),
+            None => return false,
+        };
 
-        let old_ext_len = self.extension().map(|ext| ext.len()).unwrap_or(0);
-
-        // Truncate to remove the extension
-        if old_ext_len > 0 {
-            self.inner.truncate(self.inner.len() - old_ext_len);
-
-            // If we end with a '.' now from the previous extension, remove that too
-            if self.inner.last() == Some(&b'.') {
-                self.inner.pop();
-            }
-        }
+        self.inner.truncate(end_of_stem);
 
         // Add the new extension if it exists
         if !extension.is_empty() {
-            // Add a '.' at the end prior to adding the extension
-            if self.inner.last() != Some(&b'.') {
-                self.inner.push(b'.');
-            }
-
+            self.inner.push(b'.');
             self.inner.extend_from_slice(extension);
         }
 
@@ -743,12 +754,90 @@ where
     }
 }
 
+#[cfg(feature = "serde")]
+struct PathBufVisitor<T>(PhantomData<T>)
+where
+    T: Encoding;
+
+#[cfg(feature = "serde")]
+impl<'de, T> Visitor<'de> for PathBufVisitor<T>
+where
+    T: Encoding,
+{
+    type Value = PathBuf<T>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("path string")
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(PathBuf::from(v))
+    }
+
+    fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(PathBuf::from(v))
+    }
+
+    fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        core::str::from_utf8(v)
+            .map(PathBuf::from)
+            .map_err(|_| de::Error::invalid_value(Unexpected::Bytes(v), &self))
+    }
+
+    fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        String::from_utf8(v)
+            .map(PathBuf::from)
+            .map_err(|e| de::Error::invalid_value(Unexpected::Bytes(&e.into_bytes()), &self))
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<T> Serialize for PathBuf<T>
+where
+    T: Encoding,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.as_path().serialize(serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, T> Deserialize<'de> for PathBuf<T>
+where
+    T: Encoding,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_string(PathBufVisitor(PhantomData))
+    }
+}
+
 #[cfg(any(
     unix,
     all(target_vendor = "fortanix", target_env = "sgx"),
     target_os = "solid_asp3",
     target_os = "hermit",
-    target_os = "wasi"
+    all(
+        target_os = "wasi",
+        any(not(target_env = "p2"), feature = "nightly-wasip2")
+    )
 ))]
 #[cfg(feature = "std")]
 mod std_conversions {
@@ -784,5 +873,86 @@ mod std_conversions {
         fn as_ref(&self) -> &OsStr {
             OsStrExt::from_bytes(self.as_bytes())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{UnixEncoding, WindowsEncoding};
+
+    #[test]
+    fn set_extension_should_replace_the_extension_of_the_file_name() {
+        let mut path = PathBuf::<UnixEncoding>::from("/feel/the");
+        assert!(path.set_extension("force"));
+        assert_eq!(path, PathBuf::from("/feel/the.force"));
+
+        assert!(path.set_extension("dark_side"));
+        assert_eq!(path, PathBuf::from("/feel/the.dark_side"));
+
+        let mut path = PathBuf::<UnixEncoding>::from("foo.tar.gz");
+        assert!(path.set_extension("xz"));
+        assert_eq!(path, PathBuf::from("foo.tar.xz"));
+    }
+
+    #[test]
+    fn set_extension_should_remove_the_extension_when_given_an_empty_extension() {
+        let mut path = PathBuf::<UnixEncoding>::from("foo.tar.gz");
+        assert!(path.set_extension(""));
+        assert_eq!(path, PathBuf::from("foo.tar"));
+
+        let mut path = PathBuf::<UnixEncoding>::from("foo.");
+        assert!(path.set_extension(""));
+        assert_eq!(path, PathBuf::from("foo"));
+    }
+
+    #[test]
+    fn set_extension_should_discard_anything_trailing_the_file_name() {
+        let mut path = PathBuf::<UnixEncoding>::from("a.bc/");
+        assert!(path.set_extension("z"));
+        assert_eq!(path, PathBuf::from("a.z"));
+
+        let mut path = PathBuf::<UnixEncoding>::from("a.bc/////");
+        assert!(path.set_extension("z"));
+        assert_eq!(path, PathBuf::from("a.z"));
+
+        let mut path = PathBuf::<UnixEncoding>::from("test.reallylongext/");
+        assert!(path.set_extension("a"));
+        assert_eq!(path, PathBuf::from("test.a"));
+
+        let mut path = PathBuf::<UnixEncoding>::from("/usr/bin/");
+        assert!(path.set_extension("z"));
+        assert_eq!(path, PathBuf::from("/usr/bin.z"));
+
+        let mut path = PathBuf::<UnixEncoding>::from("foo.txt/.//");
+        assert!(path.set_extension("z"));
+        assert_eq!(path, PathBuf::from("foo.z"));
+
+        let mut path = PathBuf::<UnixEncoding>::from("foo.tar.gz/");
+        assert!(path.set_extension(""));
+        assert_eq!(path, PathBuf::from("foo.tar"));
+
+        let mut path = PathBuf::<WindowsEncoding>::from(r"C:\a.bc\");
+        assert!(path.set_extension("z"));
+        assert_eq!(path, PathBuf::from(r"C:\a.z"));
+
+        let mut path = PathBuf::<WindowsEncoding>::from("C:/a.bc/");
+        assert!(path.set_extension("z"));
+        assert_eq!(path, PathBuf::from("C:/a.z"));
+    }
+
+    #[test]
+    fn set_extension_should_do_nothing_when_there_is_no_file_name() {
+        let mut path = PathBuf::<UnixEncoding>::from("/");
+        assert!(!path.set_extension("z"));
+        assert_eq!(path, PathBuf::from("/"));
+
+        let mut path = PathBuf::<UnixEncoding>::from("foo/..");
+        assert!(!path.set_extension("z"));
+        assert_eq!(path, PathBuf::from("foo/.."));
+
+        let mut path = PathBuf::<WindowsEncoding>::from(r"C:\");
+        assert!(!path.set_extension("z"));
+        assert_eq!(path, PathBuf::from(r"C:\"));
     }
 }

@@ -34,6 +34,16 @@ pub fn handle(node_handle: &NodeHandle, parser: &Parser, output: &mut String, ha
         return;
     }
 
+    // ~keep Nested-wrapper BRs keep the established empty-boundary policy (#868).
+    // ~keep Only a retained direct code child opts into the break-only correction (#921).
+    if ctx.in_code
+        && !ctx.in_code_block
+        && let Some((owner, breaks)) = &ctx.inline_code_breaks
+        && handler.dom_ctx.parent_of(node_handle.get_inner()) == Some(*owner)
+    {
+        breaks.set(breaks.get().saturating_add(1));
+    }
+
     if let Some(rule_like_text) = &ctx.djot_rule_like_text {
         rule_like_text.advance();
     }
@@ -56,8 +66,12 @@ fn write_special_break(output: &mut String, ctx: &Context) -> bool {
         // ~keep "  \n" marker regardless of heading context, but `close_heading` then
         // ~keep folds every whitespace run (including that marker) in the finished
         // ~keep heading body down to one space.
-        trim_trailing_whitespace(output);
-        output.push(' ');
+        if ctx.inline_code_links.is_some() {
+            output.push('\n');
+        } else {
+            trim_trailing_whitespace(output);
+            output.push(' ');
+        }
         true
     } else if ctx.in_table_cell && ctx.in_code && !ctx.in_code_block {
         // ~keep Neither a code SPAN nor a table cell can carry a hard break on its own
@@ -70,15 +84,20 @@ fn write_special_break(output: &mut String, ctx: &Context) -> bool {
         // ~keep newline). Not `emit_table_cell_break`: a literal `<br>` in HTML is not
         // ~keep valid content inside a code span regardless of `br_in_tables`, so that
         // ~keep option is never consulted here either.
-        trim_trailing_whitespace(output);
-        output.push(' ');
+        if ctx.inline_code_links.is_some() {
+            // ~keep Collected link ranges must remain valid until the code span is emitted.
+            output.push('\n');
+        } else {
+            trim_trailing_whitespace(output);
+            output.push(' ');
+        }
         true
     } else if ctx.in_code_block {
         // ~keep A `<pre>` code BLOCK reproduces its content literally, line structure
         // ~keep included: a `<br>` here is real content, so the byte pushed is a genuine
         // ~keep `\n`, not a marker -- `newline_style` is never consulted (issue #487).
         if let Some(ref offsets) = ctx.pre_cell_break_offsets {
-            offsets.borrow_mut().push(output.len());
+            offsets.borrow_mut().record(output);
         }
         output.push('\n');
         true
@@ -131,12 +150,14 @@ fn write_flow_break(output: &mut String, options: &ConversionOptions, ctx: &Cont
         // ~keep true or false by coincidence. Whether a break at either edge of the label
         // ~keep survives is `normalize_link_label`'s decision, not this one's.
         output.push_str(hard_break_marker(options));
-    } else if output.len() == ctx.block_content_start {
+    } else if (output.is_empty() && !ctx.in_paragraph)
+        || (std::ptr::from_ref::<String>(output) as usize == ctx.block_output_ptr
+            && output.len() == ctx.block_content_start)
+    {
         // ~keep A paragraph-leading break has no preceding line and therefore emits nothing
-        // ~keep (#572), but only the paragraph's own buffer can prove that position. A fresh
-        // ~keep inline-wrapper scratch buffer can have the same length after real paragraph
-        // ~keep content; its bare newline is an internal sentinel that the wrapper turns into
-        // ~keep either a real break before following content or a separator when break-only.
+        // ~keep (#572), but only the paragraph's own buffer can prove that position. An inline
+        // ~keep scratch buffer can have that numeric length after real paragraph content; its
+        // ~keep break must still survive independently of that coincidence (#863).
         // ~keep A bare top-level break also remains an intentional leading line (#112).
         if !is_paragraph_block_output(output, ctx) {
             output.push('\n');
@@ -190,6 +211,13 @@ fn visit_line_break(
         let mut visitor = visitor_handle.lock().expect("visitor mutex poisoned");
         visitor.visit_line_break(&node_ctx)
     };
+    if handler.options.whitespace_mode == crate::options::WhitespaceMode::Strict {
+        handler.dom_ctx.record_absent_breaks(
+            node_id,
+            matches!(&visit_result, VisitResult::Skip)
+                || matches!(&visit_result, VisitResult::Custom(custom) if custom.trim_matches([' ', '\t']).is_empty()),
+        );
+    }
     match visit_result {
         VisitResult::Continue => false,
         VisitResult::Skip => true,

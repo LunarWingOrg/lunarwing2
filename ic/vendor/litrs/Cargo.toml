@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.56"
 name = "litrs"
-version = "1.0.0"
+version = "1.0.1"
 authors = ["Lukas Kalbertodt <lukas.kalbertodt@gmail.com>"]
 build = false
 exclude = [".github"]

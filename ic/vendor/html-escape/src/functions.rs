@@ -2,7 +2,44 @@ use alloc::vec::Vec;
 #[cfg(feature = "std")]
 use std::io::{self, Write};
 
-const HEX_DIGITS: [u8; 16] = *b"0123456789ABCDEF";
+pub(crate) const HEX_DIGITS: [u8; 16] = *b"0123456789ABCDEF";
+
+/// Find the next `byte` from `p`, or return the length of `text_bytes` if there is none.
+#[inline]
+pub(crate) fn find_byte(text_bytes: &[u8], mut p: usize, byte: u8) -> usize {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+
+    // The target is often the current byte in dense text, so check it before the 8-byte loop.
+    if p < text_bytes.len() && text_bytes[p] == byte {
+        return p;
+    }
+
+    let pattern = LO * byte as u64;
+
+    while p + 8 <= text_bytes.len() {
+        let x = u64::from_ne_bytes(text_bytes[p..(p + 8)].try_into().unwrap()) ^ pattern;
+
+        // This is non-zero only if a byte of `x` is zero, which means one of the 8 bytes is `byte`.
+        if x.wrapping_sub(LO) & !x & HI != 0 {
+            break;
+        }
+
+        p += 8;
+    }
+
+    while p < text_bytes.len() && text_bytes[p] != byte {
+        p += 1;
+    }
+
+    p
+}
+
+/// Find the next `<` from `p`, or return the length of `text_bytes` if there is none.
+#[inline]
+pub(crate) fn find_less_than(text_bytes: &[u8], p: usize) -> usize {
+    find_byte(text_bytes, p, b'<')
+}
 
 #[inline]
 pub(crate) fn write_hex_to_vec(e: u8, output: &mut Vec<u8>) {
@@ -28,7 +65,10 @@ pub(crate) fn write_hex_to_vec(e: u8, output: &mut Vec<u8>) {
 
 #[cfg(feature = "std")]
 #[inline]
-pub(crate) fn write_hex_to_writer<W: Write>(e: u8, output: &mut W) -> Result<(), io::Error> {
+pub(crate) fn write_hex_to_writer<W: Write + ?Sized>(
+    e: u8,
+    output: &mut W,
+) -> Result<(), io::Error> {
     let entity =
         [b'&', b'#', b'x', HEX_DIGITS[(e >> 4) as usize], HEX_DIGITS[(e & 0xF) as usize], b';'];
 
@@ -48,7 +88,7 @@ pub(crate) fn write_html_entity_to_vec(e: u8, output: &mut Vec<u8>) {
 
 #[cfg(feature = "std")]
 #[inline]
-pub(crate) fn write_html_entity_to_writer<W: Write>(
+pub(crate) fn write_html_entity_to_writer<W: Write + ?Sized>(
     e: u8,
     output: &mut W,
 ) -> Result<(), io::Error> {
@@ -75,7 +115,10 @@ pub(crate) fn write_char_to_vec(c: char, output: &mut Vec<u8>) {
 
 #[cfg(feature = "std")]
 #[inline]
-pub(crate) fn write_char_to_writer<W: Write>(c: char, output: &mut W) -> Result<(), io::Error> {
+pub(crate) fn write_char_to_writer<W: Write + ?Sized>(
+    c: char,
+    output: &mut W,
+) -> Result<(), io::Error> {
     let mut buffer = [0u8; 4];
     let length = c.encode_utf8(&mut buffer).len();
 

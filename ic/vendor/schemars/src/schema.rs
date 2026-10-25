@@ -386,6 +386,7 @@ impl Schema {
 
     fn validate<E: serde::de::Error>(value: &Value) -> Result<(), E> {
         use serde::de::Unexpected;
+        let arbitrary_precision;
         let unexpected = match value {
             Value::Bool(_) | Value::Object(_) => return Ok(()),
             Value::Null => Unexpected::Unit,
@@ -397,7 +398,8 @@ impl Schema {
                 } else if let Some(f) = n.as_f64() {
                     Unexpected::Float(f)
                 } else {
-                    unreachable!()
+                    arbitrary_precision = n.to_string();
+                    Unexpected::Other(&arbitrary_precision)
                 }
             }
             Value::String(s) => Unexpected::Str(s),
@@ -420,7 +422,7 @@ impl From<Schema> for Value {
     }
 }
 
-impl core::convert::TryFrom<Value> for Schema {
+impl TryFrom<Value> for Schema {
     type Error = serde_json::Error;
 
     fn try_from(value: Value) -> serde_json::Result<Schema> {
@@ -429,7 +431,7 @@ impl core::convert::TryFrom<Value> for Schema {
     }
 }
 
-impl<'a> core::convert::TryFrom<&'a Value> for &'a Schema {
+impl<'a> TryFrom<&'a Value> for &'a Schema {
     type Error = serde_json::Error;
 
     fn try_from(value: &Value) -> serde_json::Result<&Schema> {
@@ -438,7 +440,7 @@ impl<'a> core::convert::TryFrom<&'a Value> for &'a Schema {
     }
 }
 
-impl<'a> core::convert::TryFrom<&'a mut Value> for &'a mut Schema {
+impl<'a> TryFrom<&'a mut Value> for &'a mut Schema {
     type Error = serde_json::Error;
 
     fn try_from(value: &mut Value) -> serde_json::Result<&mut Schema> {

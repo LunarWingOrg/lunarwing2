@@ -11,8 +11,9 @@
 
 [package]
 edition = "2021"
+rust-version = "1.81"
 name = "defmt"
-version = "1.1.1"
+version = "1.2.0"
 authors = ["The Knurling-rs developers"]
 build = "build.rs"
 links = "defmt"
@@ -54,6 +55,7 @@ avoid-default-panic = []
 encoding-raw = []
 encoding-rzcobs = []
 ip_in_core = []
+panic-message = []
 unstable-test = ["defmt-macros/unstable-test"]
 
 [lib]
@@ -84,7 +86,7 @@ path = "tests/ui_logs_off.rs"
 version = "1"
 
 [dependencies.defmt-macros]
-version = "=1.1.1"
+version = "=1.2.0"
 
 [dev-dependencies.rustc_version]
 version = "0.4"

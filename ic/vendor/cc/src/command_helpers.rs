@@ -6,7 +6,7 @@ use std::{
     ffi::{OsStr, OsString},
     fmt::{self, Display},
     fs,
-    hash::Hasher,
+    hash::{Hash, Hasher},
     io::{self, Read, Write},
     path::Path,
     process::{Child, ChildStderr, Command, ExitStatus, Output, Stdio},
@@ -17,10 +17,9 @@ use std::{
 };
 
 use crate::{
-    build_env::{BuildEnv, EnvVars},
+    build_env::{BuildEnv, EnvSnapshot, EnvVars},
     logger::Logger,
-    utilities::cargo_env_var_os,
-    BuildMessageKind, Error, ErrorKind, Object,
+    BuildMessageKind, CompileCommand, Error, ErrorKind, Object,
 };
 
 #[derive(Clone, Debug)]
@@ -133,6 +132,17 @@ impl CargoOutput {
         Error::new(ErrorKind::ToolExecError, message)
     }
 
+    /// Pass `cmd`, which compiles `obj` in `directory`, to the logger.
+    pub(crate) fn log_compile_command(&self, cmd: &Command, obj: &Object, directory: &Path) {
+        if let Some(logger) = &self.logger {
+            logger.log(
+                BuildMessageKind::CompileCommand,
+                &CommandLine(cmd).to_string(),
+                &CompileCommand::new(cmd, &obj.src, &obj.dst, directory),
+            );
+        }
+    }
+
     pub(crate) fn print_debug(&self, arg: &dyn Display) {
         if self.metadata
             && self
@@ -193,99 +203,104 @@ impl StderrForwarder {
         }
     }
 
+    #[cfg(feature = "parallel")]
+    pub(crate) fn stderr(&self) -> Option<&ChildStderr> {
+        self.inner.as_ref().map(|inner| &inner.0)
+    }
+
     /// Forward the stderr of `cmd` that is available.
     pub(crate) fn forward_available(&mut self, cmd: &Command) -> bool {
-        if let Some((stderr, buffer)) = self.inner.as_mut() {
-            loop {
-                // For non-blocking we check to see if there is data available, so we should try to
-                // read at least that much. For blocking, always read at least the minimum amount.
-                #[cfg(not(feature = "parallel"))]
-                let to_reserve = MIN_BUFFER_CAPACITY;
-                #[cfg(feature = "parallel")]
-                let to_reserve = if self.is_non_blocking && !self.bytes_available_failed {
-                    match crate::parallel::stderr::bytes_available(stderr) {
-                        #[cfg(windows)]
-                        Ok(0) => break false,
-                        #[cfg(unix)]
-                        Ok(0) => {
-                            // On Unix, depending on the implementation, we may sometimes get 0 in a
-                            // loop (either there is data available or the pipe is broken), so
-                            // continue with the non-blocking read anyway.
-                            MIN_BUFFER_CAPACITY
-                        }
-                        #[cfg(windows)]
-                        Err(_) => {
-                            // On Windows, if we get an error then the pipe is broken, so flush
-                            // the buffer and bail.
-                            if self.bytes_buffered > 0 {
-                                self.cargo_output
-                                    .forward_stderr_line(&buffer[..self.bytes_buffered], cmd);
-                            }
-                            self.inner = None;
-                            break true;
-                        }
-                        #[cfg(unix)]
-                        Err(_) => {
-                            // On Unix, depending on the implementation, we may get spurious
-                            // errors so make a note not to use bytes_available again and try
-                            // the non-blocking read anyway.
-                            self.bytes_available_failed = true;
-                            MIN_BUFFER_CAPACITY
-                        }
-                        #[cfg(target_family = "wasm")]
-                        Err(_) => panic!("bytes_available should always succeed on wasm"),
-                        Ok(bytes_available) => MIN_BUFFER_CAPACITY.max(bytes_available),
-                    }
-                } else {
-                    MIN_BUFFER_CAPACITY
-                };
-                if self.bytes_buffered + to_reserve > buffer.len() {
-                    buffer.resize(self.bytes_buffered + to_reserve, 0);
-                }
+        let Some((stderr, buffer)) = self.inner.as_mut() else {
+            return true;
+        };
 
-                match stderr.read(&mut buffer[self.bytes_buffered..]) {
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        // No data currently, yield back.
-                        break false;
+        loop {
+            // For non-blocking we check to see if there is data available, so we should try to
+            // read at least that much. For blocking, always read at least the minimum amount.
+            #[cfg(not(feature = "parallel"))]
+            let to_reserve = MIN_BUFFER_CAPACITY;
+            #[cfg(feature = "parallel")]
+            let to_reserve = if self.is_non_blocking && !self.bytes_available_failed {
+                match crate::parallel::stderr::bytes_available(stderr) {
+                    #[cfg(windows)]
+                    Ok(0) => break false,
+                    #[cfg(unix)]
+                    Ok(0) => {
+                        // On Unix, depending on the implementation, we may sometimes get 0 in a
+                        // loop (either there is data available or the pipe is broken), so
+                        // continue with the non-blocking read anyway.
+                        MIN_BUFFER_CAPACITY
                     }
-                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
-                        // Interrupted, try again.
-                        continue;
-                    }
-                    Ok(bytes_read) if bytes_read != 0 => {
-                        self.bytes_buffered += bytes_read;
-                        let mut consumed = 0;
-                        for line in buffer[..self.bytes_buffered].split_inclusive(|&b| b == b'\n') {
-                            // Only forward complete lines, leave the rest in the buffer.
-                            if let Some((b'\n', line)) = line.split_last() {
-                                consumed += line.len() + 1;
-                                self.cargo_output.forward_stderr_line(line, cmd);
-                            }
-                        }
-                        if consumed > 0 && consumed < self.bytes_buffered {
-                            // Remove the consumed bytes from buffer
-                            buffer.copy_within(consumed.., 0);
-                        }
-                        self.bytes_buffered -= consumed;
-                    }
-                    res => {
-                        // End of stream: flush remaining data and bail.
+                    #[cfg(windows)]
+                    Err(_) => {
+                        // On Windows, if we get an error then the pipe is broken, so flush
+                        // the buffer and bail.
                         if self.bytes_buffered > 0 {
                             self.cargo_output
                                 .forward_stderr_line(&buffer[..self.bytes_buffered], cmd);
                         }
-                        if let Err(err) = res {
-                            self.cargo_output.print_warning(&format_args!(
-                                "Failed to read from child stderr: {err}"
-                            ));
-                        }
-                        self.inner.take();
+                        self.inner = None;
                         break true;
                     }
+                    #[cfg(unix)]
+                    Err(_) => {
+                        // On Unix, depending on the implementation, we may get spurious
+                        // errors so make a note not to use bytes_available again and try
+                        // the non-blocking read anyway.
+                        self.bytes_available_failed = true;
+                        MIN_BUFFER_CAPACITY
+                    }
+                    #[cfg(target_family = "wasm")]
+                    Err(_) => panic!("bytes_available should always succeed on wasm"),
+                    Ok(bytes_available) => MIN_BUFFER_CAPACITY.max(bytes_available),
+                }
+            } else {
+                MIN_BUFFER_CAPACITY
+            };
+            if self.bytes_buffered + to_reserve > buffer.len() {
+                buffer.resize(self.bytes_buffered + to_reserve, 0);
+            }
+
+            match stderr.read(&mut buffer[self.bytes_buffered..]) {
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    // No data currently, yield back.
+                    break false;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                    // Interrupted, try again.
+                    continue;
+                }
+                Ok(bytes_read) if bytes_read != 0 => {
+                    self.bytes_buffered += bytes_read;
+                    let mut consumed = 0;
+                    for line in buffer[..self.bytes_buffered].split_inclusive(|&b| b == b'\n') {
+                        // Only forward complete lines, leave the rest in the buffer.
+                        if let Some((b'\n', line)) = line.split_last() {
+                            consumed += line.len() + 1;
+                            self.cargo_output.forward_stderr_line(line, cmd);
+                        }
+                    }
+                    if consumed > 0 && consumed < self.bytes_buffered {
+                        // Remove the consumed bytes from buffer
+                        buffer.copy_within(consumed.., 0);
+                    }
+                    self.bytes_buffered -= consumed;
+                }
+                res => {
+                    // End of stream: flush remaining data and bail.
+                    if self.bytes_buffered > 0 {
+                        self.cargo_output
+                            .forward_stderr_line(&buffer[..self.bytes_buffered], cmd);
+                    }
+                    if let Err(err) = res {
+                        self.cargo_output.print_warning(&format_args!(
+                            "Failed to read from child stderr: {err}"
+                        ));
+                    }
+                    self.inner.take();
+                    break true;
                 }
             }
-        } else {
-            true
         }
     }
 
@@ -352,8 +367,14 @@ fn wait_on_child(
 }
 
 /// Find the destination object path for each file in the input source files,
-/// and store them in the output Object.
-pub(crate) fn objects_from_files(files: &[Arc<Path>], dst: &Path) -> Result<Vec<Object>, Error> {
+/// and store them in the output Object. `vars` is the snapshot of the `Build`,
+/// which holds Cargo's `OUT_DIR` and `CARGO_MANIFEST_DIR`.
+pub(crate) fn objects_from_files(
+    files: &[Arc<Path>],
+    dst: &Path,
+    vars: &EnvSnapshot,
+    source_root: Option<&Path>,
+) -> Result<Vec<Object>, Error> {
     let mut objects = Vec::with_capacity(files.len());
     for file in files {
         let basename = file
@@ -380,25 +401,37 @@ pub(crate) fn objects_from_files(files: &[Arc<Path>], dst: &Path) -> Result<Vec<
         let mut hasher = hash_map::DefaultHasher::new();
 
         // Make the dirname relative (if possible) to avoid full system paths influencing the sha
-        // and making the output system-dependent
-        // Sources generated by a build script live under OUT_DIR, which is not under
-        // CARGO_MANIFEST_DIR when the target dir is elsewhere, so try OUT_DIR first.
-        let strip_root = |var| {
-            cargo_env_var_os(var).and_then(|root| {
-                dirname
-                    .strip_prefix(&*root.to_string_lossy())
-                    .map(|rel| Cow::Owned(rel.to_owned()))
-            })
+        // and making the output system-dependent.
+        // Strips `root` from the start of `dirname`, if it is one.
+        let strip = |root: &str| {
+            dirname
+                .strip_prefix(root)
+                .map(|rel| Cow::Owned(rel.to_owned()))
         };
-        let dirname = strip_root("OUT_DIR")
-            .or_else(|| strip_root("CARGO_MANIFEST_DIR"))
-            .unwrap_or(dirname);
-
-        hasher.write(dirname.as_bytes());
+        // Sources generated by a build script live under OUT_DIR, which is not under
+        // CARGO_MANIFEST_DIR when the target dir is elsewhere, so OUT_DIR is tried first.
+        let strip_env_root = |var: &str| {
+            vars.get(OsStr::new(var))
+                .and_then(|root| strip(&root.to_string_lossy()))
+        };
+        let (origin, dirname) = if let Some(rel) = strip_env_root("OUT_DIR") {
+            ("out_dir", rel)
+        } else if let Some(rel) = strip_env_root("CARGO_MANIFEST_DIR") {
+            ("manifest_dir", rel)
+        } else if let Some(rel) = source_root.and_then(|root| {
+            // Component-aware matching, so `external-other` doesn't match `external`.
+            let rel = file.parent()?.strip_prefix(root).ok()?;
+            Some(Cow::Owned(rel.to_string_lossy().into_owned()))
+        }) {
+            ("source_root", rel)
+        } else {
+            ("absolute", dirname)
+        };
+        origin.hash(&mut hasher);
+        dirname.hash(&mut hasher);
         if let Some(extension) = file.extension() {
-            hasher.write(extension.to_string_lossy().as_bytes());
+            extension.to_string_lossy().hash(&mut hasher);
         }
-
         let obj = dst
             .join(format!("{:016x}-{}", hasher.finish(), basename))
             .with_extension("o");
@@ -733,5 +766,115 @@ mod tests {
         let stderr = b"expando.c\n\nsecond\n";
         let warnings: Vec<_> = stderr_warnings(stderr, None).collect();
         assert_eq!(warnings, [&b"expando.c"[..], &b"second"[..]]);
+    }
+}
+
+#[cfg(test)]
+mod source_root_regression_tests {
+    use super::*;
+
+    fn object_name(
+        file: &Path,
+        vars: &EnvSnapshot,
+        root: Option<&Path>,
+        base: &Path,
+    ) -> std::ffi::OsString {
+        let sources = vec![Arc::<Path>::from(file)];
+        objects_from_files(&sources, &base.join("objects"), vars, root)
+            .unwrap()
+            .remove(0)
+            .dst
+            .file_name()
+            .unwrap()
+            .to_os_string()
+    }
+
+    #[test]
+    fn external_roots_produce_stable_distinct_names_for_duplicate_basenames() {
+        let base = std::env::temp_dir().join("cc-rs-source-root-regression");
+        let first_root = base.join("checkout-a").join("external");
+        let second_root = base.join("checkout-b").join("external");
+
+        let make = |root: &Path| {
+            let sources: Vec<Arc<Path>> = ["first", "second"]
+                .iter()
+                .map(|dir| Arc::<Path>::from(root.join(dir).join("foo.c")))
+                .collect();
+            let vars = EnvSnapshot::from_pairs(&[]);
+            let objects =
+                objects_from_files(&sources, &base.join("objects"), &vars, Some(root)).unwrap();
+            objects
+                .into_iter()
+                .map(|obj| obj.dst.file_name().unwrap().to_os_string())
+                .collect::<Vec<_>>()
+        };
+
+        let a = make(&first_root);
+        let b = make(&second_root);
+        assert_eq!(a, b, "moving an external source tree changed object names");
+        assert_ne!(a[0], a[1], "two sources named foo.c collided");
+    }
+
+    #[test]
+    fn source_root_does_not_match_a_sibling_with_the_same_string_prefix() {
+        let base = std::env::temp_dir().join("cc-rs-source-root-regression");
+        let source_root = base.join("external");
+        let sibling = base.join("external-other").join("foo.c");
+        let sources = vec![Arc::<Path>::from(sibling)];
+        let vars = EnvSnapshot::from_pairs(&[]);
+        let with_root =
+            objects_from_files(&sources, &base.join("objects"), &vars, Some(&source_root)).unwrap();
+        let without_root =
+            objects_from_files(&sources, &base.join("objects"), &vars, None).unwrap();
+        assert_eq!(with_root[0].dst, without_root[0].dst);
+    }
+
+    #[test]
+    fn source_root_names_do_not_collide_with_out_dir_names() {
+        let base = std::env::temp_dir().join("cc-rs-source-root-regression");
+        let out_dir = base.join("out");
+        let root = base.join("external");
+        let vars = EnvSnapshot::from_pairs(&[("OUT_DIR", out_dir.to_str().unwrap())]);
+
+        // same relative dir ("sub") and basename under each root
+        let from_out = object_name(&out_dir.join("sub").join("a.c"), &vars, Some(&root), &base);
+        let from_root = object_name(&root.join("sub").join("a.c"), &vars, Some(&root), &base);
+        assert_ne!(from_out, from_root);
+    }
+
+    #[test]
+    fn manifest_dir_takes_precedence_over_source_root() {
+        let base = std::env::temp_dir().join("cc-rs-source-root-regression");
+        let manifest = base.join("pkg");
+        let vars = EnvSnapshot::from_pairs(&[("CARGO_MANIFEST_DIR", manifest.to_str().unwrap())]);
+        let file = manifest.join("sub").join("a.c");
+
+        // source_root contains the file too, but the manifest match must win,
+        // so setting source_root must not change the name.
+        let with_root = object_name(&file, &vars, Some(&manifest), &base);
+        let without_root = object_name(&file, &vars, None, &base);
+        assert_eq!(with_root, without_root);
+    }
+    #[test]
+    fn out_dir_and_manifest_dir_names_do_not_collide() {
+        let base = std::env::temp_dir().join("cc-rs-source-root-regression");
+        let out_dir = base.join("out");
+        let manifest = base.join("pkg");
+        let vars = EnvSnapshot::from_pairs(&[
+            ("OUT_DIR", out_dir.to_str().unwrap()),
+            ("CARGO_MANIFEST_DIR", manifest.to_str().unwrap()),
+        ]);
+
+        let from_out = object_name(&out_dir.join("sub").join("a.c"), &vars, None, &base);
+        let from_manifest = object_name(&manifest.join("sub").join("a.c"), &vars, None, &base);
+        assert_ne!(from_out, from_manifest);
+    }
+    #[test]
+    fn same_basename_with_different_extensions_do_not_collide() {
+        let base = std::env::temp_dir().join("cc-rs-source-root-regression");
+        let vars = EnvSnapshot::from_pairs(&[]);
+        let c = object_name(&base.join("src").join("foo.c"), &vars, None, &base);
+        let cpp = object_name(&base.join("src").join("foo.cpp"), &vars, None, &base);
+        assert_ne!(c, cpp);
     }
 }

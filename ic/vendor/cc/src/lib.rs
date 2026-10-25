@@ -78,13 +78,28 @@
 //!   for sccache, simply set `CC` to `sccache cc`.
 //!   For other custom `CC` wrapper, just set `CC_KNOWN_WRAPPER_CUSTOM`
 //!   to the custom wrapper used in `CC`.
+//!   `CC` can also include flags, for example `gcc -m32`, which are passed
+//!   before all other flags.
 //! * `AR` - the `ar` (archiver) executable to use to build the static library.
+//! * `ARFLAGS` - a series of space separated flags passed to the archiver,
+//!   before those from [`Build::ar_flag`].
+//! * `RANLIB` and `RANLIBFLAGS` - the `ranlib` executable and its flags that
+//!   [`Build::get_ranlib`] returns. `cc` doesn't run `ranlib` itself.
 //! * `CC_MASM_ASM` - the assembler for `.asm` files on MSVC targets, used
 //!   instead of `ml64.exe`, `ml.exe`, `armasm.exe` or `armasm64.exe`. Like `AR`,
 //!   it can include arguments, for example `llvm-ml -m64`. For `llvm-ml`, cc
 //!   passes `-m64` or `-m32` to match the target. When it is not set and
 //!   `ml64.exe` or `ml.exe` can't be found, as when cross compiling, cc uses
 //!   `llvm-ml` from next to `clang-cl` or from `PATH` instead.
+//! * `NVCC` - the `nvcc` executable used for [CUDA](#cuda-c-support), instead of
+//!   `nvcc` from `PATH`. Its whole value is the path, so unlike `CC` it can't
+//!   include a wrapper or arguments. The C++ compiler (see `CXX`) is still
+//!   passed to it with `-ccbin`, unless [`Build::ccbin`] turns that off.
+//! * `CROSS_COMPILE` - when cross compiling and `CC` (or `CXX`), `AR` or
+//!   `RANLIB` isn't set, `cc` names that tool for many targets with a prefix,
+//!   such as `arm-linux-gnueabi-gcc`. This variable sets that prefix, for
+//!   example `arm-linux-gnueabi-`. If it isn't set, a `RUSTC_LINKER` from Cargo
+//!   that ends in `-gcc` gives the prefix instead.
 //! * `CRATE_CC_NO_DEFAULTS` - the default compiler flags may cause conflicts in
 //!   some cross compiling scenarios. Setting this variable
 //!   will disable the generation of default compiler
@@ -96,6 +111,12 @@
 //!   arguments (similar to `make` and `cmake`) rather than splitting them on each space.
 //!   For example, with `CFLAGS='a "b c"'`, the compiler will be invoked with 2 arguments -
 //!   `a` and `b c` - rather than 3: `a`, `"b` and `c"`.
+//! * `CC_PREFER_CLANG_CL_OVER_MSVC` - on MSVC targets, whether `cc` looks for
+//!   `clang-cl.exe` instead of `cl.exe` when `CC` (or `CXX` for C++) is not
+//!   set. It takes precedence over [`Build::prefer_clang_cl_over_msvc`] in
+//!   every build script, unless it is empty. It counts as `true` unless set to
+//!   `"0"`, `"no"` or `"false"`, and is read without the prefixes and suffixes
+//!   described below.
 //! * `CXX...` - see [C++ Support](#c-support).
 //! * `CC_FORCE_DISABLE` - If set, `cc` will never run any [`Command`]s, and methods that
 //!   would return an [`Error`]. This is intended for use by third-party build systems
@@ -104,32 +125,101 @@
 //!   [`Build::get_compiler`] may produce less accurate results as in some cases `cc` runs
 //!   commands in order to locate compilers. Additionally, this does nothing to prevent
 //!   users from running [`Tool::to_command`] and executing the [`Command`] themselves.
-//! * `RUSTC_WRAPPER` - If set, the specified command will be prefixed to the compiler
-//!   command. This is useful for projects that want to use
+//! * `RUSTC_WRAPPER` - if its file name is `sccache`, `cachepot`, `buildcache`
+//!   or `kache` (ignoring case and the extension, so `/usr/bin/sccache` and
+//!   `SCCACHE.EXE` count), `cc` prefixes it to the compiler command, unless `CC`
+//!   (or `CXX` for C++) already names a wrapper (`nvcc` for CUDA gets it either
+//!   way). This is useful for projects that want to use
 //!   [sccache](https://github.com/mozilla/sccache),
 //!   [buildcache](https://gitlab.com/bits-n-bites/buildcache),
 //!   [cachepot](https://github.com/paritytech/cachepot), or
-//!   [kache](https://github.com/kunobi-ninja/kache).
+//!   [kache](https://github.com/kunobi-ninja/kache). Other wrappers are
+//!   ignored, since they usually only work with rustc. The wrapper isn't used
+//!   for a compiler set with [`Build::compiler`], or for the default `emcc` on
+//!   Emscripten targets.
+//! * `SDKROOT` - the Apple SDK path that `cc` passes with `-isysroot`, instead
+//!   of the one from `xcrun`, on Apple targets other than macOS and on macOS
+//!   with a compiler from an Xcode toolchain (`.xctoolchain`). It is ignored if
+//!   it isn't an existing absolute path or is clearly for another platform.
+//! * `MACOSX_DEPLOYMENT_TARGET`, `IPHONEOS_DEPLOYMENT_TARGET`,
+//!   `TVOS_DEPLOYMENT_TARGET`, `WATCHOS_DEPLOYMENT_TARGET` and
+//!   `XROS_DEPLOYMENT_TARGET` - the minimum OS version that `cc` compiles for on
+//!   the matching Apple targets.
+//! * `WASI_SDK_PATH` - on WASI targets, the
+//!   [wasi-sdk](https://github.com/WebAssembly/wasi-sdk) installation. If it has
+//!   a `bin/<target>-clang`, `cc` uses that as the default compiler.
+//! * `WASI_SYSROOT` - on WASI targets, the sysroot that `cc` passes with
+//!   `--sysroot`. For C++ on `wasm32`, `cc` also links `libc++` and `libc++abi`
+//!   from its `lib/<target>` folder.
+//! * `WASM_MUSL_SYSROOT` - required on `wasm32` Linux targets such as
+//!   `wasm32-wali-linux-musl`: the sysroot that `cc` passes with `--sysroot`.
+//!   For C++, `cc` also links `libc++` and `libc++abi` from its `lib` folder.
+//! * `PAUTHTEST_SYSROOT` and `PAUTHTEST_RESOURCE_DIR` - required on `pauthtest`
+//!   targets such as `aarch64-unknown-linux-pauthtest`: the sysroot and the
+//!   Clang resource folder that `cc` passes with `--sysroot` and
+//!   `-resource-dir`. For C++, `cc` also links `libc++` and `libc++abi` from the
+//!   sysroot's `lib` folder.
+//! * `VCINSTALLDIR` - set by a Visual Studio developer command prompt. On
+//!   Windows, `cc` then takes `cl.exe`, `lib.exe` and the other MSVC tools from
+//!   `PATH`, or from the Visual Studio in `VSINSTALLDIR` if the prompt is for
+//!   another architecture, before it looks for an installed Visual Studio. On
+//!   other hosts, `cc` looks for these tools in `VCINSTALLDIR` and
+//!   `VSINSTALLDIR`, which must both be set, and then in `PATH`.
 //!
 //! Furthermore, projects using this crate may specify custom environment variables
 //! to be inspected, for example via the `Build::try_flags_from_environment`
 //! function. Consult the project’s own documentation or its use of the `cc` crate
 //! for any additional variables it may use.
 //!
-//! Each of these variables can also be supplied with certain prefixes and suffixes,
-//! in the following prioritized order:
+//! `CC`, `CXX`, `AR`, `RANLIB`, `NVCC`, `CC_MASM_ASM`, `CXXSTDLIB`,
+//! `CXXSTDLIB_STATIC` and the flags variables `CFLAGS`, `CXXFLAGS`, `ARFLAGS`
+//! and `RANLIBFLAGS` can also be supplied with certain prefixes and suffixes, in
+//! the following prioritized order:
 //!
 //!   1. `<var>_<target>` - for example, `CC_x86_64-unknown-linux-gnu` or `CC_thumbv8m.main-none-eabi`
-//!   2. `<var>_<target_with_underscores>` - for example, `CC_x86_64_unknown_linux_gnu` or `CC_thumbv8m_main_none_eabi` (both periods and underscores are replaced)
+//!   2. `<var>_<target_with_underscores>` - for example, `CC_x86_64_unknown_linux_gnu` or `CC_thumbv8m_main_none_eabi` (both dashes and periods are replaced)
 //!   3. `<build-kind>_<var>` - for example, `HOST_CC` or `TARGET_CFLAGS`
 //!   4. `<var>` - a plain `CC`, `AR` as above.
 //!
+//! For the flags variables, every form that is set is used, in the reverse of
+//! this order, so the more specific flags come last. The other variables listed
+//! above are only read as written, without prefixes or suffixes.
+//!
 //! If none of these variables exist, cc-rs uses built-in defaults.
+//!
+//! The compiler also reads some variables by itself, such as `CPATH` for GCC
+//! and Clang, `INCLUDE` and `CL` for MSVC, and `SDKROOT` on Apple targets. cc
+//! tells Cargo to rerun the build script when these change too, see
+//! [`Build::emit_rerun_if_env_changed`] for the full list.
 //!
 //! In addition to the above optional environment variables, `cc-rs` has some
 //! functions with hard requirements on some variables supplied by [cargo's
 //! build-script driver][cargo] that it has the `TARGET`, `OUT_DIR`, `OPT_LEVEL`,
-//! and `HOST` variables.
+//! and `HOST` variables. It also reads these variables from Cargo when they are
+//! set:
+//!
+//! * `DEBUG` - the profile's `debug` setting. Unless it is off (`""`, `"0"`,
+//!   `"false"` or `"none"`), `cc` passes debug info flags such as `-g` or `-Z7`
+//!   and, with GCC and Clang, keeps frame pointers. [`Build::debug`] overrides
+//!   it.
+//! * `CARGO_CFG_TARGET_FEATURE` - if it contains `crt-static`, `cc` passes `-MT`
+//!   instead of `-MD` to MSVC and clang-cl, unless [`Build::static_crt`] is set,
+//!   and `-static` to GCC. This only applies when the build is for Cargo's
+//!   `TARGET`.
+//! * `CARGO_CFG_SANITIZE` - the sanitizers rustc instruments the Rust code
+//!   for, from `-Zsanitizer` or from a target such as
+//!   `x86_64-unknown-linux-gnuasan`. Cargo sets it only with a nightly rustc,
+//!   since stable rustc leaves this cfg out of `--print cfg`. If it contains
+//!   `address`, `cc` passes
+//!   `-fsanitize=address` too, so that the C code is instrumented as well. It
+//!   does so only for GCC and Clang on `x86_64` Linux with glibc and for
+//!   `cl.exe` on `x86_64` Windows, the configurations CI tests with rustc's
+//!   runtime, not for CUDA, and only when the build is for Cargo's `TARGET`.
+//!   Elsewhere, and for the other sanitizers, add the flags yourself with
+//!   [`Build::flag`] where they work. The flag is one of the default flags, so
+//!   [`Build::no_default_flags`] and `CRATE_CC_NO_DEFAULTS` leave it out, and
+//!   with GCC and Clang `-fno-sanitize=address` in `CFLAGS` or `CXXFLAGS`
+//!   turns it off again.
 //!
 //! [cargo]: https://doc.rust-lang.org/cargo/reference/build-scripts.html#inputs-to-the-build-script
 //!
@@ -163,7 +253,7 @@
 //!   require Visual Studio to be installed. `cc-rs` attempts to locate it, and
 //!   if it fails, `cl.exe` is expected to be available in `PATH`. This can be
 //!   set up by running the appropriate developer tools shell.
-//!    * When using `prefer_clang_cl_over_msvc`, make sure that the `C++ Clang compiler for Windows` component
+//!    * When using `prefer_clang_cl_over_msvc` or `CC_PREFER_CLANG_CL_OVER_MSVC`, make sure that the `C++ Clang compiler for Windows` component
 //!      is installed through the Visual Studio Installer, so that `cc-rs` can find `clang-cl.exe`.
 //! * Windows platforms targeting MinGW (e.g. your target name ends in `-gnu`)
 //!   require `cc` to be available in `PATH`. We recommend the
@@ -271,7 +361,6 @@
 #![doc(html_root_url = "https://docs.rs/cc/1.0")]
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Display};
@@ -375,7 +464,10 @@ use command_helpers::*;
 
 mod logger;
 use logger::Logger;
-pub use logger::{BuildMessage, BuildMessageKind, BuildMessageLogger};
+pub use logger::{BuildMessage, BuildMessageKind, BuildMessageLogger, CompileCommand};
+
+#[cfg(feature = "compile-commands")]
+pub mod compile_commands;
 
 mod build_env;
 use build_env::{BuildEnv, EnvSnapshot, EnvVars};
@@ -390,12 +482,11 @@ mod utilities;
 use utilities::*;
 
 mod flags;
-use flags::*;
 
 /// Key of the flag support cache, next to the flag itself: everything else the
 /// probe `Build` in [`Build::is_flag_supported_inner`] is made from. Built by
 /// [`Build::flag_support_cache_key`].
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, PartialEq)]
 struct CompilerFlag {
     compiler: Box<Path>,
     target: Option<Arc<str>>,
@@ -417,14 +508,26 @@ enum PrefixMapFlag {
 
 #[derive(Debug, Default)]
 struct BuildCache {
-    apple_sdk_root_cache: RwLock<HashMap<Box<str>, Arc<OsStr>>>,
-    apple_versions_cache: RwLock<HashMap<Box<str>, Arc<str>>>,
+    apple_sdk_root_cache: RwLock<VecMap<&'static str, Arc<OsStr>>>,
+    apple_versions_cache: RwLock<VecMap<&'static str, Arc<str>>>,
     cached_compiler_family: RwLock<CompilerFamilyLookupCache>,
     cached_uses_libcxx: RwLock<CppStdlibLookupCache>,
-    emitted_cpp_link_stdlibs: Mutex<HashSet<Box<str>>>,
-    known_flag_support_status_cache: RwLock<BTreeMap<CompilerFlag, HashMap<Box<OsStr>, bool>>>,
-    target_info_parser: target::TargetInfoParser,
+    emitted_cpp_link_stdlibs: Mutex<Vec<Box<str>>>,
+    /// The variables `cargo:rerun-if-env-changed` was printed for.
+    emitted_rerun_if_env_changed: Mutex<Vec<Box<str>>>,
+    known_flag_support_status_cache: RwLock<VecMap<CompilerFlag, VecMap<Box<OsStr>, bool>>>,
     warned_about_msvc_linker_flags: AtomicBool,
+}
+
+/// Add `value` to `emitted` unless it is already there, and tell whether it
+/// was added.
+fn push_if_new(emitted: &Mutex<Vec<Box<str>>>, value: &str) -> bool {
+    let mut emitted = emitted.lock().unwrap();
+    let new = !emitted.iter().any(|emitted| **emitted == *value);
+    if new {
+        emitted.push(value.into());
+    }
+    new
 }
 
 /// A builder for compilation of a native library.
@@ -436,23 +539,25 @@ struct BuildCache {
 /// A `Build` reads the process environment once, the first time it needs it
 /// (for example in [`Build::compile`], [`Build::get_compiler`],
 /// [`Build::is_flag_supported`] or [`Build::try_flags_from_environment`]), and
-/// keeps that copy. Its own lookups of variables such as `CC` or `CFLAGS` use
-/// the copy, and the compiler and other tools it runs get the copy as their
-/// whole environment instead of inheriting the process environment, so later
-/// changes to the process environment are not seen. A clone made after that
-/// point keeps the copy, one made before takes its own. Use [`Build::env`] to
-/// change the environment of the child processes.
+/// keeps that copy. Its own lookups of variables such as `CC` or `CFLAGS`, and
+/// of those Cargo sets for build scripts such as `TARGET`, `OUT_DIR` or
+/// `CARGO_CFG_TARGET_FEATURE`, use the copy, and the compiler and other tools
+/// it runs get the copy as their whole environment instead of inheriting the
+/// process environment, so later changes to the process environment are not
+/// seen. A clone made after that point keeps the copy, one made before takes
+/// its own. Use [`Build::env`] to change the environment of the child
+/// processes.
 #[derive(Clone, Debug)]
 pub struct Build {
     include_directories: Vec<Arc<Path>>,
     definitions: Vec<(Arc<str>, Option<Arc<str>>)>,
     objects: Vec<Arc<Path>>,
-    flags: Vec<Arc<OsStr>>,
-    flags_supported: Vec<Arc<OsStr>>,
+    flags: Vec<BuildFlag>,
     ar_flags: Vec<Arc<OsStr>>,
     asm_flags: Vec<Arc<OsStr>>,
     no_default_flags: bool,
     files: Vec<Arc<Path>>,
+    source_root: Option<Arc<Path>>,
     cpp: bool,
     cpp_link_stdlib: Option<Option<Arc<str>>>,
     cpp_link_stdlib_static: bool,
@@ -552,6 +657,22 @@ impl Display for Error {
 
 impl std::error::Error for Error {}
 
+/// A flag from [`Build::flag`] or [`Build::flag_if_supported`]. Both go in
+/// one list so that the command line keeps the order they were added in.
+#[derive(Clone, Debug)]
+enum BuildFlag {
+    Always(Arc<OsStr>),
+    IfSupported(Arc<OsStr>),
+}
+
+impl AsRef<OsStr> for BuildFlag {
+    fn as_ref(&self) -> &OsStr {
+        match self {
+            BuildFlag::Always(flag) | BuildFlag::IfSupported(flag) => flag,
+        }
+    }
+}
+
 /// Represents an object.
 ///
 /// This is a source file -> object file pair.
@@ -581,11 +702,11 @@ impl Build {
             definitions: Vec::new(),
             objects: Vec::new(),
             flags: Vec::new(),
-            flags_supported: Vec::new(),
             ar_flags: Vec::new(),
             asm_flags: Vec::new(),
             no_default_flags: false,
             files: Vec::new(),
+            source_root: None,
             shared_flag: None,
             static_flag: None,
             cpp: false,
@@ -718,7 +839,7 @@ impl Build {
     ///     .compile("foo");
     /// ```
     pub fn flag(&mut self, flag: impl AsRef<OsStr>) -> &mut Build {
-        self.flags.push(flag.as_ref().into());
+        self.flags.push(BuildFlag::Always(flag.as_ref().into()));
         self
     }
 
@@ -756,7 +877,9 @@ impl Build {
     ///     .remove_flag("unwanted_flag");
     /// ```
     pub fn remove_flag(&mut self, flag: &str) -> &mut Build {
-        self.flags.retain(|other_flag| &**other_flag != flag);
+        self.flags.retain(
+            |other_flag| !matches!(other_flag, BuildFlag::Always(other_flag) if &**other_flag == flag),
+        );
         self
     }
 
@@ -797,6 +920,8 @@ impl Build {
 
     /// Add an arbitrary flag to the invocation of the compiler if it supports it
     ///
+    /// The flag keeps its place among the flags added with [`Build::flag`].
+    ///
     /// # Example
     ///
     /// ```no_run
@@ -807,7 +932,8 @@ impl Build {
     ///     .compile("foo");
     /// ```
     pub fn flag_if_supported(&mut self, flag: impl AsRef<OsStr>) -> &mut Build {
-        self.flags_supported.push(flag.as_ref().into());
+        self.flags
+            .push(BuildFlag::IfSupported(flag.as_ref().into()));
         self
     }
 
@@ -844,7 +970,7 @@ impl Build {
         self.flags.extend(
             flags
                 .into_iter()
-                .map(|flag| Arc::from(OsString::from(flag).as_os_str())),
+                .map(|flag| BuildFlag::Always(Arc::from(OsString::from(flag).as_os_str()))),
         );
         Ok(self)
     }
@@ -915,6 +1041,34 @@ impl Build {
         for file in p.into_iter() {
             self.file(file);
         }
+        self
+    }
+
+    /// Set an additional root used to generate stable object filenames for
+    /// source files outside Cargo's manifest and output directories.
+    ///
+    /// Source directories beneath this root are hashed relative to it, rather
+    /// than by their machine-specific absolute paths. This does not remap
+    /// debug information embedded by the compiler.
+    ///
+    /// The root and source paths must use the same path representation.
+    /// In particular, an absolute source path requires an absolute root.
+    ///
+    /// If a source is also under `OUT_DIR` or `CARGO_MANIFEST_DIR`, those take
+    /// precedence over this root.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// let root = std::path::PathBuf::from("/external/compiler-rt");
+    ///
+    /// cc::Build::new()
+    ///     .source_root(&root)
+    ///     .file(root.join("lib/builtins/absvdi2.c"))
+    ///     .compile("compiler-rt");
+    /// ```
+    pub fn source_root<P: AsRef<Path>>(&mut self, root: P) -> &mut Build {
+        self.source_root = Some(root.as_ref().into());
         self
     }
 
@@ -1376,8 +1530,14 @@ impl Build {
     }
 
     /// Sets a logger that receives cc's messages: its own warnings, each line
-    /// the commands it runs write to stderr, and the commands that failed. See
-    /// [`BuildMessageKind`] for the details.
+    /// the commands it runs write to stderr, the commands that failed, and the
+    /// command that compiles each object file. See [`BuildMessageKind`] for
+    /// the details, and [`compile_commands`] for writing the compile commands
+    /// to a `compile_commands.json`.
+    #[cfg_attr(
+        not(feature = "compile-commands"),
+        allow(rustdoc::broken_intra_doc_links)
+    )]
     ///
     /// The warnings and stderr lines are still printed as cargo warnings too.
     /// Disable [`cargo_warnings`](Build::cargo_warnings) to send them only to
@@ -1479,6 +1639,42 @@ impl Build {
     /// rebuild when detected environment changes, by default build script is
     /// always run on every compilation if no rerun cargo metadata is emitted.
     ///
+    /// The `cargo:rerun-if-env-changed` lines name the variables cc reads, and
+    /// those that the compiler, or a program it runs, reads by itself and that
+    /// change what it compiles or which programs it runs:
+    ///
+    /// - GCC and Clang, clang-cl included: `CPATH`, `C_INCLUDE_PATH`,
+    ///   `CPLUS_INCLUDE_PATH`, `OBJC_INCLUDE_PATH`, `OBJCPLUS_INCLUDE_PATH`,
+    ///   `COMPILER_PATH` and `SOURCE_DATE_EPOCH`
+    /// - GCC: `GCC_EXEC_PREFIX`
+    /// - Clang, clang-cl included: `CCC_OVERRIDE_OPTIONS` and
+    ///   `CLANG_NO_DEFAULT_CONFIG`
+    /// - `zig cc`: `ZIG_LIB_DIR` and `ZIG_LIBC`
+    /// - cl.exe, and Clang on MSVC targets: `INCLUDE` and `EXTERNAL_INCLUDE`
+    /// - Clang on MSVC targets: `VCToolsInstallDir` and `VCINSTALLDIR`
+    /// - cl.exe and clang-cl: `CL` and `_CL_`, and for cl.exe `LIBPATH`
+    /// - `ml.exe` and `ml64.exe`, for `.asm` files: `ML`
+    /// - nvcc, for CUDA: `NVCC_PREPEND_FLAGS`, `NVCC_APPEND_FLAGS` and
+    ///   `NVCC_CCBIN`, and on MSVC targets `VSCMD_VER`
+    /// - emcc, on Emscripten targets: `EMCC_CFLAGS`, `EMCC_LOCAL_PORTS`,
+    ///   `EM_CONFIG`, `EM_CACHE`, `EM_PORTS`, `EM_LLVM_ROOT`,
+    ///   `EM_CLANG_ADD_VERSION` and `EM_COMPILER_WRAPPER`
+    /// - `xcrun`, on Apple targets, where cc runs it to find the SDK, and on
+    ///   macOS hosts, where the compilers in `/usr/bin` run through it:
+    ///   `DEVELOPER_DIR`, `TOOLCHAINS` and `SDKROOT`
+    /// - Apple targets: the target's deployment target variable, such as
+    ///   `MACOSX_DEPLOYMENT_TARGET`, and for Clang `RC_DEBUG_OPTIONS` and
+    ///   `RC_DEBUG_PREFIX_MAP`
+    ///
+    /// Variables that only change diagnostics, logs, temporary files or
+    /// linking are left out, such as `GCC_COLORS`, `CC_PRINT_OPTIONS`, `TMPDIR`
+    /// and `LIBRARY_PATH`. cc prints the lines for the compiler's variables
+    /// whenever it works out the compiler, such as in [`Build::compile`],
+    /// [`Build::expand`], [`Build::get_compiler`] or a flag check that runs the
+    /// compiler, and the line for `ML` when it compiles `.asm` files. Like the
+    /// lines for the variables cc looks up in its copy of the environment,
+    /// each is printed once for a `Build` and its clones.
+    ///
     /// NOTE that cc does not emit metadata to detect changes for `PATH`, since it could
     /// be changed every compilation yet does not affect the result of compilation
     /// (i.e. rust-analyzer adds temporary directory to `PATH`).
@@ -1550,6 +1746,16 @@ impl Build {
     /// Prefer to use clang-cl over msvc.
     ///
     /// This option defaults to `false`.
+    ///
+    /// On MSVC targets, this makes `cc` look for `clang-cl.exe` instead of
+    /// `cl.exe` when no compiler is set with [`Build::compiler`] or the `CC`
+    /// and `CXX` environment variables.
+    ///
+    /// The `CC_PREFER_CLANG_CL_OVER_MSVC` environment variable takes precedence
+    /// over this option both ways, unless it is empty, so whoever runs the
+    /// build can choose for every crate that uses `cc`. It counts as `true`
+    /// unless set to `"0"`, `"no"` or `"false"`. A build that only works with
+    /// clang-cl can check the compiler it got with [`Tool::is_like_clang_cl`].
     pub fn prefer_clang_cl_over_msvc(&mut self, prefer_clang_cl_over_msvc: bool) -> &mut Build {
         self.prefer_clang_cl_over_msvc = prefer_clang_cl_over_msvc;
         self
@@ -1561,7 +1767,7 @@ impl Build {
     /// allows the following standard environment variables to be overwritten by this function:
     /// - `SDKROOT`
     /// - `*_DEPLOYMENT_TARGET`
-    /// - `WASI_SDK_ROOT`
+    /// - `WASI_SDK_PATH`
     ///
     /// The logic here is "environment variables that the C compiler could itself reasonably have
     /// read".
@@ -1586,17 +1792,23 @@ impl Build {
     /// environment, with [`Build::env`] still applied on top. A variable given
     /// more than once takes its last value.
     ///
+    /// cc also reads the variables Cargo sets for build scripts, such as
+    /// `OUT_DIR`, `TARGET`, `OPT_LEVEL` and `CARGO_CFG_*`, from `vars`, unless
+    /// they are set on the `Build` with [`Build::out_dir`], [`Build::target`]
+    /// and the like. So `vars` usually starts from [`std::env::vars_os`].
+    ///
     /// This replaces the environment rather than adding to it. Call it before
     /// using the `Build`. A later call still replaces the environment for what
-    /// cc looks up and runs from then on, but a [`Tool`] returned earlier keeps
-    /// its environment, and the Apple SDK path and deployment target are not
-    /// looked up again once found.
+    /// cc looks up and runs from then on, Cargo's variables included, so a new
+    /// `TARGET` there also changes the target cc compiles for. But a [`Tool`]
+    /// returned earlier keeps its environment, and the Apple SDK path and
+    /// deployment target are not looked up again once found for an SDK.
     ///
-    /// The variables Cargo sets for build scripts, such as `OUT_DIR`, `TARGET`
-    /// and `CARGO_CFG_*`, are read from the process environment either way,
-    /// and so is `CC_ENABLE_DEBUG_OUTPUT`, which [`Build::new`] reads. On
-    /// Windows, the `vswhere` and `cl.exe` that cc runs to find Visual Studio
-    /// also still get the process environment.
+    /// `CC_ENABLE_DEBUG_OUTPUT`, which [`Build::new`] reads, is read from the
+    /// process environment either way, and so are `NUM_JOBS` and Cargo's
+    /// jobserver with the `parallel` feature, since they are shared by every
+    /// `Build` in the process. On Windows, the `vswhere` and `cl.exe` that cc
+    /// runs to find Visual Studio also still get the process environment.
     #[doc(hidden)]
     pub fn set_envs_snapshot<I, K, V>(&mut self, vars: I) -> &mut Build
     where
@@ -1636,6 +1848,10 @@ struct FlagSupportProbeFiles<'a> {
         crate::tempfile::NamedTempfile,
     )>,
 }
+
+/// How an Arm target's architecture starts, the architecture flags GCC gets
+/// for it, and the lowest common denominator FPU of its `eabihf` variant.
+type ArmArch = (&'static str, &'static [&'static str], Option<&'static str>);
 
 /// Invoke or fetch the compiler or archiver.
 impl Build {
@@ -1699,7 +1915,7 @@ impl Build {
                 let src = self.ensure_check_file()?;
                 let obj = dir.join("flag_check");
                 Ok(FlagSupportProbeFiles {
-                    dir,
+                    dir: Cow::Borrowed(dir),
                     src,
                     obj,
                     _temp_files: None,
@@ -1827,7 +2043,7 @@ impl Build {
         if compiler.is_like_clang() {
             // Avoid reporting that the arg is unsupported just because the
             // compiler complains that it wasn't used.
-            compiler.push_cc_arg("-Wno-unused-command-line-argument".into());
+            compiler.push_cc_str("-Wno-unused-command-line-argument");
         }
 
         let mut cmd = compiler.to_command();
@@ -1887,7 +2103,8 @@ impl Build {
                 answers.insert(flag.into(), is_supported);
             }
             None => {
-                let answers = HashMap::from([(flag.into(), is_supported)]);
+                let mut answers = VecMap::default();
+                answers.insert(flag.into(), is_supported);
                 cache.insert(key.clone(), answers);
             }
         }
@@ -1903,8 +2120,12 @@ impl Build {
         // Reject a bad name before compiling anything.
         lib_and_archive_names(output, "compile")?;
         let dst = self.get_out_dir()?;
-
-        let objects = objects_from_files(&self.files, &dst)?;
+        let objects = objects_from_files(
+            &self.files,
+            dst,
+            self.env.inherited(),
+            self.source_root.as_deref(),
+        )?;
 
         self.compile_objects(&objects)?;
         let library = self.try_create_archive(output, objects.iter().map(|o| &o.dst))?;
@@ -1985,12 +2206,7 @@ impl Build {
                 };
                 let emit = !once
                     || (self.cargo_output.metadata
-                        && self
-                            .build_cache
-                            .emitted_cpp_link_stdlibs
-                            .lock()
-                            .unwrap()
-                            .insert(link_lib.as_str().into()));
+                        && push_if_new(&self.build_cache.emitted_cpp_link_stdlibs, &link_lib));
                 if emit {
                     self.cargo_output
                         .print_metadata(&format_args!("cargo:rustc-link-lib={link_lib}"));
@@ -2007,7 +2223,7 @@ impl Build {
                         ));
                     }
                 } else if target.os == "linux" {
-                    let musl_sysroot = self.wasm_musl_sysroot().unwrap();
+                    let musl_sysroot = self.wasm_musl_sysroot()?;
                     self.cargo_output.print_metadata(&format_args!(
                         "cargo:rustc-flags=-L {}/lib -lstatic=c++ -lstatic=c++abi",
                         Path::new(&musl_sysroot).display(),
@@ -2067,7 +2283,7 @@ impl Build {
                 if libtst && libdir.is_dir() {
                     self.cargo_output.print_metadata(&format_args!(
                         "cargo:rustc-link-search=native={}",
-                        libdir.to_str().unwrap()
+                        libdir.display()
                     ));
                 }
 
@@ -2075,7 +2291,12 @@ impl Build {
                 let lib = match cudart {
                     "shared" => "cudart",
                     "static" => "cudart_static",
-                    bad => panic!("unsupported cudart option: {}", bad),
+                    bad => {
+                        return Err(Error::new(
+                            ErrorKind::InvalidArgument,
+                            format!("unsupported cudart option: {bad}"),
+                        ));
+                    }
                 };
                 self.cargo_output
                     .print_metadata(&format_args!("cargo:rustc-link-lib={lib}"));
@@ -2150,7 +2371,12 @@ impl Build {
     /// This will return a result instead of panicking; see `compile_intermediates()` for the complete description.
     pub fn try_compile_intermediates(&self) -> Result<Vec<PathBuf>, Error> {
         let dst = self.get_out_dir()?;
-        let objects = objects_from_files(&self.files, &dst)?;
+        let objects = objects_from_files(
+            &self.files,
+            dst,
+            self.env.inherited(),
+            self.source_root.as_deref(),
+        )?;
 
         self.compile_objects(&objects)?;
 
@@ -2241,23 +2467,47 @@ impl Build {
         let compiler = self.try_get_compiler()?;
         // Likewise for the assembler of `.asm` files, once the first one needs it.
         let mut msvc_asm_tool = None;
+        let compile_command_dir = self.compile_command_dir();
+        let mut create_cmd = |obj: &Object| -> Result<Command, Error> {
+            let cmd = self.create_compile_object_cmd(obj, &compiler, &mut msvc_asm_tool)?;
+            if let Some(dir) = &compile_command_dir {
+                self.cargo_output.log_compile_command(&cmd, obj, dir);
+            }
+            Ok(cmd)
+        };
 
         #[cfg(feature = "parallel")]
         if objs.len() > 1 {
             return parallel::run_commands_in_parallel(
                 &self.cargo_output,
-                &mut objs
-                    .iter()
-                    .map(|obj| self.create_compile_object_cmd(obj, &compiler, &mut msvc_asm_tool)),
+                &mut objs.iter().map(&mut create_cmd),
             );
         }
 
         for obj in objs {
-            let mut cmd = self.create_compile_object_cmd(obj, &compiler, &mut msvc_asm_tool)?;
+            let mut cmd = create_cmd(obj)?;
             run(&mut cmd, &self.cargo_output)?;
         }
 
         Ok(())
+    }
+
+    /// The folder compile commands run in, for the logger's
+    /// [`BuildMessageKind::CompileCommand`] messages, or `None` without a
+    /// logger.
+    fn compile_command_dir(&self) -> Option<PathBuf> {
+        self.cargo_output.logger.as_ref()?;
+        // cc doesn't change the directory of the compile commands, so they run
+        // in this process's current directory.
+        match env::current_dir() {
+            Ok(dir) => Some(dir),
+            Err(e) => {
+                self.cargo_output.print_warning(&format_args!(
+                    "compile commands aren't logged because the current directory can't be read: {e}"
+                ));
+                None
+            }
+        }
     }
 
     /// `compiler` is the result of [`Build::try_get_compiler`]. `msvc_asm_tool`
@@ -2359,10 +2609,12 @@ impl Build {
         let mut cmd = compiler.to_command();
         cmd.arg("-E");
 
-        assert!(
-            self.files.len() <= 1,
-            "Expand may only be called for a single file"
-        );
+        if self.files.len() > 1 {
+            return Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "Expand may only be called for a single file",
+            ));
+        }
 
         let is_asm = self
             .files
@@ -2446,6 +2698,7 @@ impl Build {
         let target = self.get_target()?;
 
         let mut cmd = self.get_base_compiler()?;
+        self.rerun_if_compiler_env_changed(&cmd, &target);
         // Shared by every flag probe below, see `is_flag_supported_inner`.
         let mut flag_support_key = None;
 
@@ -2479,7 +2732,7 @@ impl Build {
         // Disable default flag generation via `no_default_flags` or environment variable
         let no_defaults = self.no_default_flags || self.get_env_boolean("CRATE_CC_NO_DEFAULTS");
         if !no_defaults {
-            self.add_default_flags(&mut cmd, &target, &opt_level, &mut flag_support_key)?;
+            self.add_default_flags(&mut cmd, &target, opt_level, &mut flag_support_key)?;
         }
 
         // Specify various flags that are not considered part of the default flags above.
@@ -2492,7 +2745,7 @@ impl Build {
             cmd.push_cc_arg(format!("-std{separator}{std}").into());
         }
         for directory in self.include_directories.iter() {
-            cmd.args.push("-I".into());
+            cmd.push_arg_str("-I");
             cmd.args.push(directory.as_os_str().into());
         }
         if self.warnings_into_errors {
@@ -2539,22 +2792,20 @@ impl Build {
 
         // Set flags configured in the builder (do this second-to-last, to allow these to override
         // everything above).
+        // The entries after `/link` are dropped without being probed.
         let (flags, linker_flags) = split_off_msvc_linker_flags(cmd.family, &self.flags);
-        let mut ignored_flags: Vec<&OsStr> = linker_flags.iter().map(|f| &**f).collect();
+        let mut ignored_flags: Vec<&OsStr> = linker_flags.iter().map(AsRef::as_ref).collect();
         for flag in flags {
-            cmd.args.push((**flag).into());
-        }
-        // Like `self.flags` above, drop `/link` and the entries after it in
-        // this list without probing them.
-        let (flags_supported, linker_flags) =
-            split_off_msvc_linker_flags(cmd.family, &self.flags_supported);
-        ignored_flags.extend(linker_flags.iter().map(|f| &**f));
-        for flag in flags_supported {
-            if self
-                .is_flag_supported_inner(flag, &cmd, &target, &mut flag_support_key)
-                .unwrap_or(false)
-            {
-                cmd.push_cc_arg((**flag).into());
+            match flag {
+                BuildFlag::Always(flag) => cmd.args.push((**flag).into()),
+                BuildFlag::IfSupported(flag) => {
+                    if self
+                        .is_flag_supported_inner(flag, &cmd, &target, &mut flag_support_key)
+                        .unwrap_or(false)
+                    {
+                        cmd.push_cc_arg((**flag).into());
+                    }
+                }
             }
         }
         for (key, value) in self.definitions.iter() {
@@ -2595,6 +2846,34 @@ impl Build {
         Ok(cmd)
     }
 
+    /// The architecture flags GCC gets for Arm targets, by how the target's
+    /// architecture starts, and the lowest common denominator FPU of their
+    /// `eabihf` variants. The first match wins.
+    // One row per architecture, which rustfmt would spread over several lines.
+    #[rustfmt::skip]
+    const GNU_ARM_ARCHS: &'static [ArmArch] = &[
+        // Armv6-M targets (no FPU available). ARMv6S-M is an old name for
+        // "ARMv6-M with SVC support" before SVC support became mandatory.
+        // Some versions of GAS care about the difference.
+        ("thumbv6m", &["-march=armv6s-m"], None),
+        // Armv7-M targets (no FPU available)
+        ("thumbv7m", &["-march=armv7-m"], None),
+        ("thumbv7em", &["-march=armv7e-m"], Some("-mfpu=fpv4-sp-d16")),
+        // Armv8-M Baseline (no FPU available)
+        ("thumbv8m.base", &["-march=armv8-m.base"], None),
+        ("thumbv8m.main", &["-march=armv8-m.main"], Some("-mfpu=fpv5-sp-d16")),
+        ("armv6", &["-march=armv6"], Some("-mfpu=vfpv2")),
+        ("thumbv6", &["-march=armv6"], Some("-mfpu=vfpv2")),
+        // Armv7-R: see the Cortex-R4 technical reference manual for the FPU.
+        ("armebv7r", &["-mbig-endian", "-march=armv7-r"], Some("-mfpu=vfpv3-d16")),
+        ("armv7r", &["-march=armv7-r"], Some("-mfpu=vfpv3-d16")),
+        ("thumbv7r", &["-march=armv7-r"], Some("-mfpu=vfpv3-d16")),
+        ("armv7a", &["-march=armv7-a"], Some("-mfpu=vfpv3-d16")),
+        ("thumbv7a", &["-march=armv7-a"], Some("-mfpu=vfpv3-d16")),
+        ("armv8r", &["-march=armv8-r"], Some("-mfpu=fp-armv8")),
+        ("thumbv8r", &["-march=armv8-r"], Some("-mfpu=fp-armv8")),
+    ];
+
     fn add_default_flags(
         &self,
         cmd: &mut Tool,
@@ -2607,14 +2886,16 @@ impl Build {
         // If the flag is not conditioned on target variable, it belongs here :)
         match cmd.family {
             ToolFamily::Msvc { .. } => {
-                cmd.push_cc_arg("-nologo".into());
+                cmd.push_cc_str("-nologo");
 
                 let crt_flag = match self.static_crt {
                     Some(true) => "-MT",
                     Some(false) => "-MD",
+                    None if !self.is_cargo_target() => "-MD",
                     None => {
-                        let features = cargo_env_var_os("CARGO_CFG_TARGET_FEATURE");
-                        let features = features.as_deref().unwrap_or_default();
+                        let features = self
+                            .get_cargo_env("CARGO_CFG_TARGET_FEATURE")
+                            .unwrap_or_default();
                         if features.to_string_lossy().contains("crt-static") {
                             "-MT"
                         } else {
@@ -2655,8 +2936,7 @@ impl Build {
                     && target.os != "tvos"
                     && target.os != "visionos"
                 {
-                    cmd.push_cc_arg("-ffunction-sections".into());
-                    cmd.push_cc_arg("-fdata-sections".into());
+                    cmd.push_cc_args(&["-ffunction-sections", "-fdata-sections"]);
                 }
                 // Disable generation of PIC on bare-metal for now: rust-lld doesn't support this yet
                 //
@@ -2670,13 +2950,13 @@ impl Build {
                         && target.arch != "wasm32"
                         && target.arch != "wasm64",
                 ) {
-                    cmd.push_cc_arg("-fPIC".into());
+                    cmd.push_cc_str("-fPIC");
                     // PLT only applies if code is compiled with PIC support,
                     // and only for ELF targets.
                     if (target.os == "linux" || target.os == "android")
                         && !self.use_plt.unwrap_or(true)
                     {
-                        cmd.push_cc_arg("-fno-plt".into());
+                        cmd.push_cc_str("-fno-plt");
                     }
                 }
 
@@ -2690,7 +2970,7 @@ impl Build {
 
                     // FIXME(madsmtm): Read from `target_features` instead?
                     if raw_target.contains("threads") {
-                        cmd.push_cc_arg("-pthread".into());
+                        cmd.push_cc_str("-pthread");
                     }
                 }
 
@@ -2719,12 +2999,12 @@ impl Build {
         if self.get_debug() {
             if self.cuda {
                 // NVCC debug flag
-                cmd.args.push("-G".into());
+                cmd.push_arg_str("-G");
             }
             let family = cmd.family;
             family.add_debug_flags(
                 cmd,
-                self.get_debug_str().as_deref().unwrap_or_default(),
+                self.get_debug_str().unwrap_or_default(),
                 self.get_dwarf_version(),
             );
         }
@@ -2732,7 +3012,7 @@ impl Build {
         if self.get_force_frame_pointer() {
             let family = cmd.family;
             if let ToolFamily::Gnu | ToolFamily::Clang { .. } = family {
-                cmd.push_cc_arg("-fno-omit-frame-pointer".into());
+                cmd.push_cc_str("-fno-omit-frame-pointer");
                 let flag = OsString::from("-mno-omit-leaf-frame-pointer");
                 if self
                     .is_flag_supported_inner(&flag, cmd, target, flag_support_key)
@@ -2745,17 +3025,17 @@ impl Build {
 
         if !cmd.is_like_msvc() {
             if target.arch == "x86" {
-                cmd.args.push("-m32".into());
+                cmd.push_arg_str("-m32");
             } else if target.abi == "x32" {
-                cmd.args.push("-mx32".into());
+                cmd.push_arg_str("-mx32");
             } else if target.os == "aix" {
                 if cmd.family == ToolFamily::Gnu {
-                    cmd.args.push("-maix64".into());
+                    cmd.push_arg_str("-maix64");
                 } else {
-                    cmd.args.push("-m64".into());
+                    cmd.push_arg_str("-m64");
                 }
             } else if target.arch == "x86_64" || target.arch == "powerpc64" {
-                cmd.args.push("-m64".into());
+                cmd.push_arg_str("-m64");
             }
         }
 
@@ -2786,7 +3066,7 @@ impl Build {
                         // There's no compelling reason to use a different approach when compiling
                         // natively.
                         if self.cpp && self.cpp_set_stdlib.is_none() {
-                            cmd.push_cc_arg("-stdlib=libc++".into());
+                            cmd.push_cc_str("-stdlib=libc++");
                         }
                     } else if target.arch == "wasm32" && target.os == "linux" {
                         for x in &[
@@ -2801,11 +3081,11 @@ impl Build {
                         for x in &["wasm-exceptions", "declspec"] {
                             cmd.push_cc_arg(format!("-f{x}").into());
                         }
-                        let musl_sysroot = self.wasm_musl_sysroot().unwrap();
+                        let musl_sysroot = self.wasm_musl_sysroot()?;
                         cmd.push_cc_arg(
                             format!("--sysroot={}", Path::new(&musl_sysroot).display()).into(),
                         );
-                        cmd.push_cc_arg("-pthread".into());
+                        cmd.push_cc_str("-pthread");
                     } else if target.abi == "pauthtest" {
                         let pauthtest_sysroot = self.pauthtest_sysroot()?;
                         let pauthtest_resource_dir = self.pauthtest_resource_dir()?;
@@ -2819,9 +3099,9 @@ impl Build {
                             )
                             .into(),
                         );
-                        cmd.push_cc_arg("-march=armv8.3-a+pauth".into());
+                        cmd.push_cc_str("-march=armv8.3-a+pauth");
                         if self.cpp && self.cpp_set_stdlib.is_none() {
-                            cmd.push_cc_arg("-stdlib=libc++".into());
+                            cmd.push_cc_str("-stdlib=libc++");
                             cmd.push_cc_arg(
                                 format!(
                                     "-I{}/include/c++/v1",
@@ -2860,7 +3140,7 @@ impl Build {
                         .then(|| self.apple_deployment_target(target));
 
                     let clang_target =
-                        target.llvm_target(&self.get_raw_target()?, version.as_deref());
+                        target.llvm_target(self.get_raw_target()?, version.as_deref());
                     cmd.push_cc_arg(format!("--target={clang_target}").into());
                 }
             }
@@ -2868,13 +3148,13 @@ impl Build {
                 // This is an undocumented flag from MSVC but helps with making
                 // builds more reproducible by avoiding putting timestamps into
                 // files.
-                cmd.push_cc_arg("-Brepro".into());
+                cmd.push_cc_str("-Brepro");
 
                 if clang_cl {
                     cmd.push_cc_arg(
                         format!(
                             "--target={}",
-                            target.llvm_target(&self.get_raw_target()?, None)
+                            target.llvm_target(self.get_raw_target()?, None)
                         )
                         .into(),
                     );
@@ -2889,12 +3169,12 @@ impl Build {
                         // NOTE: The same applies for STL. See: -
                         // <https://github.com/microsoft/STL/issues/3922>, and -
                         // <https://github.com/microsoft/STL/pull/4741>.
-                        cmd.push_cc_arg("-arch:SSE2".into());
+                        cmd.push_cc_str("-arch:SSE2");
                     }
                 } else if target.full_arch == "i586" {
-                    cmd.push_cc_arg("-arch:IA32".into());
+                    cmd.push_cc_str("-arch:IA32");
                 } else if target.full_arch == "arm64ec" {
-                    cmd.push_cc_arg("-arm64EC".into());
+                    cmd.push_cc_str("-arm64EC");
                 }
                 // There is a check in corecrt.h that will generate a
                 // compilation error if
@@ -2906,20 +3186,20 @@ impl Build {
                 // the SDK, but for all released versions of the
                 // Windows SDK it is required.
                 if target.arch == "arm" {
-                    cmd.args
-                        .push("-D_ARM_WINAPI_PARTITION_DESKTOP_SDK_AVAILABLE=1".into());
+                    cmd.push_arg_str("-D_ARM_WINAPI_PARTITION_DESKTOP_SDK_AVAILABLE=1");
                 }
             }
             ToolFamily::Gnu => {
                 if target.vendor == "kmc" {
-                    cmd.args.push("-finput-charset=utf-8".into());
+                    cmd.push_arg_str("-finput-charset=utf-8");
                 }
 
-                if self.static_flag.is_none() {
-                    let features = cargo_env_var_os("CARGO_CFG_TARGET_FEATURE");
-                    let features = features.as_deref().unwrap_or_default();
+                if self.static_flag.is_none() && self.is_cargo_target() {
+                    let features = self
+                        .get_cargo_env("CARGO_CFG_TARGET_FEATURE")
+                        .unwrap_or_default();
                     if features.to_string_lossy().contains("crt-static") {
-                        cmd.args.push("-static".into());
+                        cmd.push_arg_str("-static");
                     }
                 }
 
@@ -2928,63 +3208,47 @@ impl Build {
                     || target.full_arch.starts_with("thumbv7"))
                     && (target.os == "linux" || target.vendor == "kmc")
                 {
-                    cmd.args.push("-march=armv7-a".into());
+                    cmd.push_arg_str("-march=armv7-a");
 
                     if target.abi == "eabihf" {
                         // lowest common denominator FPU
-                        cmd.args.push("-mfpu=vfpv3-d16".into());
-                        cmd.args.push("-mfloat-abi=hard".into());
+                        cmd.push_args(&["-mfpu=vfpv3-d16", "-mfloat-abi=hard"]);
                     }
                 }
 
                 // (x86 Android doesn't say "eabi")
                 if target.os == "android" && target.full_arch.contains("v7") {
-                    cmd.args.push("-march=armv7-a".into());
-                    cmd.args.push("-mthumb".into());
+                    cmd.push_args(&["-march=armv7-a", "-mthumb"]);
                     if !target.full_arch.contains("neon") {
                         // On android we can guarantee some extra float instructions
                         // (specified in the android spec online)
                         // NEON guarantees even more; see below.
-                        cmd.args.push("-mfpu=vfpv3-d16".into());
+                        cmd.push_arg_str("-mfpu=vfpv3-d16");
                     }
-                    cmd.args.push("-mfloat-abi=softfp".into());
+                    cmd.push_arg_str("-mfloat-abi=softfp");
                 }
 
                 if target.full_arch.contains("neon") {
-                    cmd.args.push("-mfpu=neon".into());
+                    cmd.push_arg_str("-mfpu=neon");
                 }
 
-                if target.full_arch == "armv4t" && target.os == "linux" {
-                    cmd.args.push("-march=armv4t".into());
-                    cmd.args.push("-marm".into());
-                    cmd.args.push("-mfloat-abi=soft".into());
-                }
-
-                if target.full_arch == "armv5te" && target.os == "linux" {
-                    cmd.args.push("-march=armv5te".into());
-                    cmd.args.push("-marm".into());
-                    cmd.args.push("-mfloat-abi=soft".into());
-                }
-
-                // For us arm == armv6 by default
-                if target.full_arch == "arm" && target.os == "linux" {
-                    cmd.args.push("-march=armv6".into());
-                    cmd.args.push("-marm".into());
-                    if target.abi == "eabihf" {
-                        cmd.args.push("-mfpu=vfp".into());
-                    } else {
-                        cmd.args.push("-mfloat-abi=soft".into());
+                if target.os == "linux" {
+                    match target.full_arch {
+                        "armv4t" => cmd.push_args(&["-march=armv4t", "-marm", "-mfloat-abi=soft"]),
+                        "armv5te" => {
+                            cmd.push_args(&["-march=armv5te", "-marm", "-mfloat-abi=soft"])
+                        }
+                        // For us arm == armv6 by default
+                        "arm" if target.abi == "eabihf" => {
+                            cmd.push_args(&["-march=armv6", "-marm", "-mfpu=vfp"])
+                        }
+                        "arm" => cmd.push_args(&["-march=armv6", "-marm", "-mfloat-abi=soft"]),
+                        // Turn codegen down on i586 to avoid some instructions.
+                        "i586" => cmd.push_arg_str("-march=pentium"),
+                        // Set codegen level for i686 correctly
+                        "i686" => cmd.push_arg_str("-march=i686"),
+                        _ => {}
                     }
-                }
-
-                // Turn codegen down on i586 to avoid some instructions.
-                if target.full_arch == "i586" && target.os == "linux" {
-                    cmd.args.push("-march=pentium".into());
-                }
-
-                // Set codegen level for i686 correctly
-                if target.full_arch == "i686" && target.os == "linux" {
-                    cmd.args.push("-march=i686".into());
                 }
 
                 // Looks like `musl-gcc` makes it hard for `-m32` to make its way
@@ -2993,7 +3257,7 @@ impl Build {
                 // typically only be used for build scripts which transitively use
                 // these flags that try to compile executables.
                 if target.arch == "x86" && target.env == "musl" {
-                    cmd.args.push("-Wl,-melf_i386".into());
+                    cmd.push_arg_str("-Wl,-melf_i386");
                 }
 
                 //
@@ -3002,84 +3266,19 @@ impl Build {
 
                 // Set Float ABI for all Arm bare-metal targets using EABIHF
                 if target.arch == "arm" && target.os == "none" && target.abi == "eabihf" {
-                    cmd.args.push("-mfloat-abi=hard".into())
+                    cmd.push_arg_str("-mfloat-abi=hard");
                 }
                 // Set -mthumb for all Thumb targets
                 if target.full_arch.starts_with("thumb") {
-                    cmd.args.push("-mthumb".into());
+                    cmd.push_arg_str("-mthumb");
                 }
-                // Armv6-M targets (no FPU available)
-                if target.full_arch.starts_with("thumbv6m") {
-                    // ARMv6S-M is an old name for "ARMv6-M with SVC support"
-                    // before SVC support became mandatory. Some versions of GAS care
-                    // about the difference.
-                    cmd.args.push("-march=armv6s-m".into());
-                }
-                // Armv7-M targets (no FPU available)
-                if target.full_arch.starts_with("thumbv7m") {
-                    cmd.args.push("-march=armv7-m".into());
-                }
-                // Armv7E-M targets
-                if target.full_arch.starts_with("thumbv7em") {
-                    cmd.args.push("-march=armv7e-m".into());
-                    if target.abi == "eabihf" {
-                        cmd.args.push("-mfpu=fpv4-sp-d16".into())
-                    }
-                }
-                // Armv8-M Baseline (no FPU available)
-                if target.full_arch.starts_with("thumbv8m.base") {
-                    cmd.args.push("-march=armv8-m.base".into());
-                }
-                // Armv8-M Mainline targets
-                if target.full_arch.starts_with("thumbv8m.main") {
-                    cmd.args.push("-march=armv8-m.main".into());
-                    if target.abi == "eabihf" {
-                        cmd.args.push("-mfpu=fpv5-sp-d16".into())
-                    }
-                }
-                // ARMv6 targets
-                if target.full_arch.starts_with("armv6")
-                    || (target.full_arch.starts_with("thumbv6")
-                        && !target.full_arch.starts_with("thumbv6m"))
-                {
-                    cmd.args.push("-march=armv6".into());
-                    if target.abi == "eabihf" {
-                        // lowest common denominator FPU
-                        cmd.args.push("-mfpu=vfpv2".into());
-                    }
-                }
-                // ARMv7-R targets
-                if target.full_arch.starts_with("armebv7r")
-                    || target.full_arch.starts_with("armv7r")
-                    || target.full_arch.starts_with("thumbv7r")
-                {
-                    if target.full_arch.starts_with("armeb") {
-                        cmd.args.push("-mbig-endian".into());
-                    }
-                    cmd.args.push("-march=armv7-r".into());
-                    if target.abi == "eabihf" {
-                        // lowest common denominator FPU
-                        // (see Cortex-R4 technical reference manual)
-                        cmd.args.push("-mfpu=vfpv3-d16".into())
-                    }
-                }
-                // Armv7-A targets
-                if target.full_arch.starts_with("armv7a")
-                    || target.full_arch.starts_with("thumbv7a")
-                {
-                    cmd.args.push("-march=armv7-a".into());
-                    if target.abi == "eabihf" {
-                        // lowest common denominator FPU
-                        cmd.args.push("-mfpu=vfpv3-d16".into());
-                    }
-                }
-                // Armv8-R targets
-                if target.full_arch.starts_with("armv8r")
-                    || target.full_arch.starts_with("thumbv8r")
-                {
-                    cmd.args.push("-march=armv8-r".into());
-                    if target.abi == "eabihf" {
-                        cmd.args.push("-mfpu=fp-armv8".into())
+                for (prefix, flags, eabihf_fpu) in Self::GNU_ARM_ARCHS {
+                    if target.full_arch.starts_with(prefix) {
+                        cmd.push_args(flags);
+                        if let (Some(fpu), "eabihf") = (eabihf_fpu, target.abi) {
+                            cmd.push_arg_str(fpu);
+                        }
+                        break;
                     }
                 }
 
@@ -3091,22 +3290,20 @@ impl Build {
                             target.os,
                             "linux" | "freebsd" | "netbsd" | "managarm" | "redox"
                         ) {
-                            cmd.args.push(("-march=rv64gc").into());
-                            cmd.args.push("-mabi=lp64d".into());
+                            cmd.push_args(&["-march=rv64gc", "-mabi=lp64d"]);
                         } else {
-                            cmd.args.push(("-march=rv".to_owned() + arch).into());
-                            cmd.args.push("-mabi=lp64".into());
+                            cmd.args.push(format!("-march=rv{arch}").into());
+                            cmd.push_arg_str("-mabi=lp64");
                         }
                     } else if arch.starts_with("32") {
                         if target.os == "linux" {
-                            cmd.args.push(("-march=rv32gc").into());
-                            cmd.args.push("-mabi=ilp32d".into());
+                            cmd.push_args(&["-march=rv32gc", "-mabi=ilp32d"]);
                         } else {
-                            cmd.args.push(("-march=rv".to_owned() + arch).into());
-                            cmd.args.push("-mabi=ilp32".into());
+                            cmd.args.push(format!("-march=rv{arch}").into());
+                            cmd.push_arg_str("-mabi=ilp32");
                         }
                     } else {
-                        cmd.args.push("-mcmodel=medany".into());
+                        cmd.push_arg_str("-mcmodel=medany");
                     }
                 }
             }
@@ -3115,8 +3312,7 @@ impl Build {
         if raw_target == "wasm32v1-none" {
             // `wasm32v1-none` target only exists in `rustc`, so we need to change the compilation flags:
             // https://doc.rust-lang.org/rustc/platform-support/wasm32v1-none.html
-            cmd.push_cc_arg("-mcpu=mvp".into());
-            cmd.push_cc_arg("-mmutable-globals".into());
+            cmd.push_cc_args(&["-mcpu=mvp", "-mmutable-globals"]);
         }
 
         if target.os == "solaris" || target.os == "illumos" {
@@ -3134,7 +3330,7 @@ impl Build {
             //
             // We're typically building C code to eventually link into a Rust program. Many Rust
             // programs are multi-threaded in some form. So, set the flag by default.
-            cmd.args.push("-D_REENTRANT".into());
+            cmd.push_arg_str("-D_REENTRANT");
         }
 
         if target.vendor == "apple" {
@@ -3142,10 +3338,10 @@ impl Build {
         }
 
         if self.static_flag.unwrap_or(false) {
-            cmd.args.push("-static".into());
+            cmd.push_arg_str("-static");
         }
         if self.shared_flag.unwrap_or(false) {
-            cmd.args.push("-shared".into());
+            cmd.push_arg_str("-shared");
         }
 
         if self.cpp {
@@ -3160,7 +3356,44 @@ impl Build {
             }
         }
 
+        self.add_sanitizer_flags(cmd, target);
+
         Ok(())
+    }
+
+    /// Instrument the C code for the sanitizers that rustc instruments the
+    /// Rust code for, which Cargo lists in `CARGO_CFG_SANITIZE`.
+    ///
+    /// Only `address` is passed on, and only to the compilers and targets that
+    /// CI builds and runs it with: GCC and Clang on `x86_64` Linux with glibc,
+    /// whose objects work with the runtime from rustc's LLVM, and `cl.exe` on
+    /// `x86_64` Windows, where rustc links the runtime that matches `cl.exe`
+    /// (`/INFERASANLIBS`). Elsewhere the flag may not fit: objects from Apple
+    /// Clang need Apple's runtime rather than rustc's, and on bare-metal
+    /// targets rustc reports `kernel-address` as `address` too. `hwaddress`
+    /// can't become `address`: rustc links only the `hwasan` runtime for it.
+    fn add_sanitizer_flags(&self, cmd: &mut Tool, target: &TargetInfo<'_>) {
+        // The target (arch, os, env, abi) CI tests each compiler with.
+        let tested = match cmd.family {
+            ToolFamily::Gnu | ToolFamily::Clang { .. } => ("x86_64", "linux", "gnu", ""),
+            ToolFamily::Msvc { clang_cl: false } => ("x86_64", "windows", "msvc", ""),
+            ToolFamily::Msvc { clang_cl: true } => return,
+        };
+        if (target.arch, target.os, target.env, target.abi) != tested
+            || cmd.cuda
+            || !self.is_cargo_target()
+        {
+            return;
+        }
+        let Some(sanitizers) = self
+            .get_cargo_env("CARGO_CFG_SANITIZE")
+            .and_then(OsStr::to_str)
+        else {
+            return;
+        };
+        if sanitizers.split(',').any(|name| name == "address") {
+            cmd.push_cc_str("-fsanitize=address");
+        }
     }
 
     fn add_inherited_rustflags(
@@ -3169,13 +3402,10 @@ impl Build {
         target: &TargetInfo<'_>,
         flag_support_key: &mut Option<CompilerFlag>,
     ) -> Result<(), Error> {
-        let Some(env_os) = cargo_env_var_os("CARGO_ENCODED_RUSTFLAGS") else {
+        let Some(codegen_flags) = self.env.inherited().rustc_codegen_flags()? else {
             // No encoded RUSTFLAGS -> nothing to do
             return Ok(());
         };
-
-        let env = env_os.to_string_lossy();
-        let codegen_flags = RustcCodegenFlags::parse(&env)?;
         codegen_flags.cc_flags(self, cmd, target, flag_support_key);
         Ok(())
     }
@@ -3194,10 +3424,10 @@ impl Build {
         if cmd.is_like_msvc() && !cmd.is_like_clang_cl() {
             return Ok(());
         }
-        let Some(scope) = cargo_env_var_os("CARGO_TRIM_PATHS_SCOPE") else {
+        let Some(scope) = self.get_cargo_env("CARGO_TRIM_PATHS_SCOPE") else {
             return Ok(());
         };
-        let Some(remap) = cargo_env_var_os("CARGO_TRIM_PATHS_REMAP") else {
+        let Some(remap) = self.get_cargo_env("CARGO_TRIM_PATHS_REMAP") else {
             return Ok(());
         };
 
@@ -3337,34 +3567,38 @@ impl Build {
             .file_stem()
             .and_then(OsStr::to_str)
             .map_or(false, |stem| stem.starts_with_ignore_ascii_case("llvm-ml"));
+        if !is_arm(&target) && !is_llvm_ml {
+            // ml.exe and ml64.exe take default options from it, see
+            // https://learn.microsoft.com/en-us/cpp/assembler/masm/ml-and-ml64-command-line-reference
+            self.rerun_if_env_changed("ML");
+        }
         if is_llvm_ml {
             // llvm-ml assembles for 32-bit x86 unless it is told otherwise or
             // runs as `llvm-ml64`. It takes the last `-m`, so one in the
             // user's arguments still wins.
             match target.arch {
-                "x86_64" => cmd.args.push("-m64".into()),
-                "x86" => cmd.args.push("-m32".into()),
+                "x86_64" => cmd.push_arg_str("-m64"),
+                "x86" => cmd.push_arg_str("-m32"),
                 _ => {}
             }
         }
         cmd.args.extend(args.into_iter().map(OsString::from));
-        cmd.args.push("-nologo".into()); // undocumented, yet working with armasm[64]
+        cmd.push_arg_str("-nologo"); // undocumented, yet working with armasm[64]
         for directory in self.include_directories.iter() {
-            cmd.args.push("-I".into());
+            cmd.push_arg_str("-I");
             cmd.args.push(directory.as_os_str().into());
         }
         if is_arm(&target) {
             if self.get_debug() {
-                cmd.args.push("-g".into());
+                cmd.push_arg_str("-g");
             }
 
             if target.arch == "arm64ec" {
-                cmd.args.push("-machine".into());
-                cmd.args.push("ARM64EC".into());
+                cmd.push_args(&["-machine", "ARM64EC"]);
             }
 
             for (key, value) in self.definitions.iter() {
-                cmd.args.push("-PreDefine".into());
+                cmd.push_arg_str("-PreDefine");
                 if let Some(ref value) = *value {
                     if let Ok(i) = value.parse::<i32>() {
                         cmd.args.push(format!("{key} SETA {i}").into());
@@ -3380,7 +3614,7 @@ impl Build {
         } else {
             // llvm-ml ignores `-Zi` with a warning.
             if self.get_debug() && !is_llvm_ml {
-                cmd.args.push("-Zi".into());
+                cmd.push_arg_str("-Zi");
             }
 
             for (key, value) in self.definitions.iter() {
@@ -3393,7 +3627,7 @@ impl Build {
         }
 
         if target.arch == "x86" {
-            cmd.args.push("-safeseh".into());
+            cmd.push_arg_str("-safeseh");
         }
 
         Ok(cmd)
@@ -3459,17 +3693,27 @@ impl Build {
         let mut objs = objs
             .chain(self.objects.iter().map(core::ops::Deref::deref))
             .peekable();
-        let mut batch = Vec::new();
-        while objs.peek().is_some() {
-            let mut remaining_len = 4000;
-            while let Some(path) =
-                objs.next_if(|peek| batch.is_empty() || peek.as_os_str().len() <= remaining_len)
-            {
-                batch.push(path);
-                remaining_len = remaining_len.saturating_sub(path.as_os_str().len());
+
+        // libtool can't add to an existing library, so it gets every object
+        // in one call instead of in batches. See `assemble_libtool`.
+        let libtool = is_libtool(&self.try_get_archiver_and_flags()?.1);
+        let mut libtool_objs = Vec::new();
+        if libtool {
+            libtool_objs.extend(objs);
+            self.assemble_libtool(dst, &libtool_objs)?;
+        } else {
+            let mut batch = Vec::new();
+            while objs.peek().is_some() {
+                let mut remaining_len = 4000;
+                while let Some(path) =
+                    objs.next_if(|peek| batch.is_empty() || peek.as_os_str().len() <= remaining_len)
+                {
+                    batch.push(path);
+                    remaining_len = remaining_len.saturating_sub(path.as_os_str().len());
+                }
+                self.assemble_progressive(dst, &batch, &mut deterministic_ar)?;
+                batch.clear();
             }
-            self.assemble_progressive(dst, &batch, &mut deterministic_ar)?;
-            batch.clear();
         }
 
         if self.cuda && self.cuda_file_count() > 0 {
@@ -3481,7 +3725,13 @@ impl Build {
             let mut nvcc = self.get_compiler().to_command();
             nvcc.arg("--device-link").arg("-o").arg(&dlink).arg(dst);
             run(&mut nvcc, &self.cargo_output)?;
-            self.assemble_progressive(dst, &[dlink.as_path()], &mut deterministic_ar)?;
+            if libtool {
+                let mut objs: Vec<&Path> = libtool_objs.clone();
+                objs.push(&dlink);
+                self.assemble_libtool(dst, &objs)?;
+            } else {
+                self.assemble_progressive(dst, &[dlink.as_path()], &mut deterministic_ar)?;
+            }
         }
 
         let target = self.get_target()?;
@@ -3504,6 +3754,9 @@ impl Build {
                     ));
                 }
             };
+        } else if libtool {
+            // `libtool -static` always writes the symbol table itself, and it
+            // doesn't understand `ar`'s `s` mode.
         } else {
             // Non-msvc targets (those using `ar`) need a separate step to add
             // the symbol table to archives since our construction command of
@@ -3542,7 +3795,7 @@ impl Build {
     ) -> Result<(), Error> {
         let target = self.get_target()?;
 
-        let (mut cmd, program, any_flags) = self.try_get_archiver_and_flags()?;
+        let (mut cmd, program, any_flags, any_args) = self.try_get_archiver_and_flags()?;
         let is_llvm_ar = program.file_name().map_or(false, |name| {
             name.to_string_lossy().contains_ignore_ascii_case("llvm-ar")
         });
@@ -3562,7 +3815,31 @@ impl Build {
             if dst.exists() {
                 cmd.arg(dst);
             }
-            cmd.args(objs);
+            // lib.exe and llvm-lib name each member by the path they are given,
+            // so absolute paths would put the location of the build into the
+            // archive. Run the archiver in the folder of the library, where cc
+            // writes the objects, and pass them relative to it. Arguments from
+            // `AR`, `ARFLAGS` or `ar_flag` and an archiver given by a relative
+            // path may name files relative to the current directory, so they
+            // keep it.
+            let dir = dst.parent().filter(|dir| {
+                dir.is_absolute()
+                    && !any_args
+                    && (program.is_absolute() || program.components().count() == 1)
+            });
+            if let Some(dir) = dir {
+                let current_dir = env::current_dir()?;
+                cmd.current_dir(dir);
+                for obj in objs {
+                    match obj.strip_prefix(dir) {
+                        Ok(relative) => cmd.arg(relative),
+                        Err(_) if obj.is_relative() => cmd.arg(current_dir.join(obj)),
+                        Err(_) => cmd.arg(obj),
+                    };
+                }
+            } else {
+                cmd.args(objs);
+            }
             run(&mut cmd, &self.cargo_output)?;
         } else {
             // Set an environment variable to tell the OSX archiver to ensure
@@ -3607,7 +3884,7 @@ impl Build {
                         *deterministic_ar = Some(true);
                     } else {
                         *deterministic_ar = Some(false);
-                        let (mut cmd, _, _) = self.try_get_archiver_and_flags()?;
+                        let (mut cmd, ..) = self.try_get_archiver_and_flags()?;
                         cmd.env("ZERO_AR_DATE", "1");
                         run(cmd.arg("cq").arg(dst).args(objs), &self.cargo_output)?;
                     }
@@ -3616,6 +3893,53 @@ impl Build {
         }
 
         Ok(())
+    }
+
+    /// Write the library `dst` with libtool, from all of `objs` at once.
+    ///
+    /// `ar` gets objects in batches to keep each command line short, adding
+    /// each batch to the library the previous ones wrote. libtool can't add to
+    /// an existing library, so instead it reads the objects from a file with
+    /// `-filelist`, one path per line, next to the library.
+    fn assemble_libtool(&self, dst: &Path, objs: &[&Path]) -> Result<(), Error> {
+        let mut list = Vec::new();
+        for obj in objs {
+            #[cfg(unix)]
+            list.extend_from_slice(std::os::unix::ffi::OsStrExt::as_bytes(obj.as_os_str()));
+            #[cfg(not(unix))]
+            list.extend_from_slice(
+                obj.to_str()
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::InvalidArgument,
+                            format!("libtool can't read the object path {}", obj.display()),
+                        )
+                    })?
+                    .as_bytes(),
+            );
+            list.push(b'\n');
+        }
+        let mut list_path = dst.as_os_str().to_owned();
+        list_path.push(".filelist");
+        let list_path = PathBuf::from(list_path);
+        fs::write(&list_path, list)?;
+
+        // NOTE: These are added even if flags were passed using
+        // $ARFLAGS/ar_flag, because they dictate the _mode_ libtool runs in,
+        // like `cq` does for `ar`.
+        // -static: create a static library.
+        // -D: zero out timestamps, UIDs, and GIDs, like `ar`'s `D` modifier.
+        // -o: the path of the library to write.
+        let mut filelist_arg = list_path.as_os_str().to_owned();
+        filelist_arg.push(",");
+        let mut cmd = self.try_get_archiver()?;
+        cmd.arg("-static")
+            .arg("-D")
+            .arg("-o")
+            .arg(dst)
+            .arg("-filelist")
+            .arg(filelist_arg);
+        run(&mut cmd, &self.cargo_output)
     }
 
     fn apple_flags(&self, cmd: &mut Tool) -> Result<(), Error> {
@@ -3627,7 +3951,7 @@ impl Build {
         // https://clang.llvm.org/docs/CommandGuide/clang.html#cmdoption-arch
         if cmd.is_like_gnu() {
             let arch = map_darwin_target_from_rust_to_compiler_architecture(&target);
-            cmd.args.push("-arch".into());
+            cmd.push_arg_str("-arch");
             cmd.args.push(arch.into());
         }
 
@@ -3654,7 +3978,7 @@ impl Build {
             ));
             let sdk_path = self.apple_sdk_root(&target)?;
 
-            cmd.args.push("-isysroot".into());
+            cmd.push_arg_str("-isysroot");
             cmd.args.push(OsStr::new(&sdk_path).to_owned());
             cmd.env
                 .push((OsStr::new("SDKROOT").into(), Arc::clone(&sdk_path)));
@@ -3700,17 +4024,19 @@ impl Build {
         cmd
     }
 
+    /// Whether to look for `clang` (or `clang++`) first when no compiler is
+    /// set, so that C and C++ code can take part in rustc's linker-plugin LTO.
     fn prefer_clang(&self) -> bool {
-        if let Some(env) = cargo_env_var_os("CARGO_ENCODED_RUSTFLAGS") {
-            env.to_string_lossy().contains("linker-plugin-lto")
-        } else {
-            false
-        }
+        // Flags that don't parse are left for rustc and
+        // `add_inherited_rustflags` to report.
+        matches!(
+            self.env.inherited().rustc_codegen_flags(),
+            Ok(Some(flags)) if flags.linker_plugin_lto()
+        )
     }
 
     fn get_base_compiler(&self) -> Result<Tool, Error> {
         let out_dir = self.get_out_dir().ok();
-        let out_dir = out_dir.as_deref();
 
         if let Some(c) = &self.compiler {
             return Ok(Tool::new(
@@ -3724,7 +4050,15 @@ impl Build {
         let target = self.get_target()?;
         let raw_target = self.get_raw_target()?;
 
-        let msvc = if self.prefer_clang_cl_over_msvc {
+        // The environment variable takes precedence over the builder option,
+        // unless it is empty. Only MSVC targets look for `cl.exe`, so only
+        // they read it.
+        let prefer_clang_cl = target.env == "msvc"
+            && self
+                .get_env("CC_PREFER_CLANG_CL_OVER_MSVC")
+                .filter(|v| !v.is_empty())
+                .map_or(self.prefer_clang_cl_over_msvc, |v| env_value_is_true(v));
+        let msvc = if prefer_clang_cl {
             "clang-cl.exe"
         } else {
             "cl.exe"
@@ -3786,7 +4120,7 @@ impl Build {
                             ToolFamily::Clang { zig_cc: false },
                             self.env.inherited().clone(),
                         );
-                        t.args.push("/c".into());
+                        t.push_arg_str("/c");
                         t.args.push(format!("{tool}.bat").into());
                         Some(t)
                     } else {
@@ -3802,7 +4136,11 @@ impl Build {
                     None
                 }
             })
-            .or_else(|| cl_exe.clone());
+            .or_else(|| {
+                let mut t = cl_exe.clone()?;
+                self.apply_rustc_wrapper_fallback(&mut t);
+                Some(t)
+            });
 
         let tool = match tool_opt {
             Some(t) => t,
@@ -3821,7 +4159,7 @@ impl Build {
                 {
                     clang.into()
                 } else if target.os == "android" {
-                    autodetect_android_compiler(&raw_target, gnu, clang, self.env.inherited())
+                    autodetect_android_compiler(raw_target, gnu, clang, self.env.inherited())
                 } else if target.os == "cloudabi" {
                     format!(
                         "{}-{}-{}-{}",
@@ -3829,7 +4167,7 @@ impl Build {
                     )
                     .into()
                 } else if target.os == "wasi" {
-                    self.autodetect_wasi_compiler(&raw_target, clang)
+                    self.autodetect_wasi_compiler(raw_target, clang)
                 } else if target.arch == "wasm32" || target.arch == "wasm64" {
                     // Compiling WASM is not currently supported by GCC, so
                     // let's default to Clang.
@@ -3844,7 +4182,7 @@ impl Build {
                     // See for details: https://github.com/rust-lang/cc-rs/pull/1319
                     if self.cpp { "q++" } else { "qcc" }.into()
                 } else if self.get_is_cross_compile()? {
-                    let prefix = self.prefix_for_target(&raw_target);
+                    let prefix = self.prefix_for_target(raw_target);
                     match prefix {
                         Some(prefix) => {
                             let cc = if target.abi == "llvm" { clang } else { gnu };
@@ -3863,9 +4201,7 @@ impl Build {
                     &self.cargo_output,
                     out_dir,
                 );
-                if let Some(cc_wrapper) = self.rustc_wrapper_fallback() {
-                    t.cc_wrapper_path = Some(Path::new(&cc_wrapper).to_owned());
-                }
+                self.apply_rustc_wrapper_fallback(&mut t);
                 t
             }
         };
@@ -3893,9 +4229,7 @@ impl Build {
                     .args
                     .push(format!("-ccbin={}", tool.path.display()).into());
             }
-            if let Some(cc_wrapper) = self.rustc_wrapper_fallback() {
-                nvcc_tool.cc_wrapper_path = Some(Path::new(&cc_wrapper).to_owned());
-            }
+            self.apply_rustc_wrapper_fallback(&mut nvcc_tool);
             nvcc_tool.family = tool.family;
             nvcc_tool
         } else {
@@ -3929,7 +4263,7 @@ impl Build {
                     let (_, version) = target.split_at(target.rfind('d').unwrap() + 1);
                     if let Ok(version) = version.parse::<u32>() {
                         if version > 15 && version < 25 {
-                            tool.args.push("-mstackrealign".into());
+                            tool.push_arg_str("-mstackrealign");
                         }
                     }
                 }
@@ -3997,21 +4331,29 @@ impl Build {
         Ok(tool)
     }
 
+    /// Runs `tool` through the wrapper from `RUSTC_WRAPPER`, if
+    /// `rustc_wrapper_fallback` accepts it.
+    fn apply_rustc_wrapper_fallback(&self, tool: &mut Tool) {
+        if let Some(cc_wrapper) = self.rustc_wrapper_fallback() {
+            tool.cc_wrapper_path = Some(Path::new(cc_wrapper).to_owned());
+        }
+    }
+
     /// Returns a fallback `cc_compiler_wrapper` by introspecting `RUSTC_WRAPPER`
-    fn rustc_wrapper_fallback(&self) -> Option<Cow<'_, OsStr>> {
+    fn rustc_wrapper_fallback(&self) -> Option<&OsStr> {
         // No explicit CC wrapper was detected, but check if RUSTC_WRAPPER
         // is defined and is a build accelerator that is compatible with
         // C/C++ compilers (e.g. sccache)
         const VALID_WRAPPERS: &[&str] = &["sccache", "cachepot", "buildcache", "kache"];
 
-        let rustc_wrapper = cargo_env_var_os("RUSTC_WRAPPER")?;
-        let wrapper_path = Path::new(&rustc_wrapper);
+        let rustc_wrapper = self.get_cargo_env("RUSTC_WRAPPER")?;
+        let wrapper_path = Path::new(rustc_wrapper);
         let wrapper_stem = wrapper_path.file_stem()?;
 
         VALID_WRAPPERS
             .iter()
             .any(|wrapper| wrapper_stem.eq_ignore_ascii_case(wrapper))
-            .then_some(Cow::Owned(rustc_wrapper))
+            .then_some(rustc_wrapper)
     }
 
     /// Returns compiler path, optional modifier name from whitelist, and arguments vec
@@ -4028,7 +4370,11 @@ impl Build {
         // interpretation at all, just pass it on through. This'll hopefully get
         // us to support spaces-in-paths.
         if let Some(exe) = check_exe(Path::new(tool).into()) {
-            return Some((exe, self.rustc_wrapper_fallback(), Vec::new()));
+            return Some((
+                exe,
+                self.rustc_wrapper_fallback().map(Cow::Borrowed),
+                Vec::new(),
+            ));
         }
 
         // Ok now we want to handle a couple of scenarios. We'll assume from
@@ -4060,8 +4406,11 @@ impl Build {
             "buildcache",
             "kache",
         ];
-        if let Some(custom_wrapper) = self.get_env("CC_KNOWN_WRAPPER_CUSTOM") {
-            known_wrappers.push(custom_wrapper.to_str().unwrap());
+        if let Some(custom_wrapper) = self
+            .get_env("CC_KNOWN_WRAPPER_CUSTOM")
+            .and_then(|v| v.to_str())
+        {
+            known_wrappers.push(custom_wrapper);
         }
 
         let mut parts = tool.split_whitespace();
@@ -4083,7 +4432,7 @@ impl Build {
 
         Some((
             maybe_wrapper.into(),
-            self.rustc_wrapper_fallback(),
+            self.rustc_wrapper_fallback().map(Cow::Borrowed),
             parts.map(|s| s.to_string()).collect(),
         ))
     }
@@ -4164,7 +4513,7 @@ impl Build {
             .uses_libcxx(
                 &self.build_cache.cached_uses_libcxx,
                 &quiet.cargo_output,
-                quiet.get_out_dir().ok().as_deref(),
+                quiet.get_out_dir().ok(),
             )
             .unwrap_or(false)
     }
@@ -4208,8 +4557,12 @@ impl Build {
         Ok(self.try_get_archiver_and_flags()?.0)
     }
 
-    fn try_get_archiver_and_flags(&self) -> Result<(Command, PathBuf, bool), Error> {
-        let (mut cmd, name) = self.get_base_archiver()?;
+    /// Returns the archiver, its name, whether `ARFLAGS` or `ar_flag` gave it
+    /// flags, and whether the user gave it any arguments at all: those flags
+    /// or arguments in `AR` itself. Arguments cc adds, like `/machine:arm64ec`,
+    /// don't count.
+    fn try_get_archiver_and_flags(&self) -> Result<(Command, PathBuf, bool, bool), Error> {
+        let (mut cmd, name, any_ar_args) = self.get_base_archiver()?;
         let mut any_flags = false;
         if let Some(flags) = self.envflags("ARFLAGS")? {
             any_flags = true;
@@ -4219,13 +4572,15 @@ impl Build {
             any_flags = true;
             cmd.arg(&**flag);
         }
-        Ok((cmd, name, any_flags))
+        Ok((cmd, name, any_flags, any_flags || any_ar_args))
     }
 
-    fn get_base_archiver(&self) -> Result<(Command, PathBuf), Error> {
+    /// Returns the archiver, its name, and whether `AR` (or `AR_<target>`,
+    /// `TARGET_AR`, `HOST_AR`) gave it arguments.
+    fn get_base_archiver(&self) -> Result<(Command, PathBuf, bool), Error> {
         if let Some(ref a) = self.archiver {
             let archiver = &**a;
-            return Ok((self.cmd(archiver), archiver.into()));
+            return Ok((self.cmd(archiver), archiver.into(), false));
         }
 
         self.get_base_archiver_variant("AR", "ar")
@@ -4276,13 +4631,15 @@ impl Build {
         &self,
         env: &str,
         tool: &str,
-    ) -> Result<(Command, PathBuf), Error> {
+    ) -> Result<(Command, PathBuf, bool), Error> {
         let target = self.get_target()?;
         let mut name = PathBuf::new();
+        let mut any_args = false;
         let tool_opt: Option<Command> = self
             .env_tool(env)
             .map(|(tool, _wrapper, args)| {
                 name.clone_from(&tool);
+                any_args = !args.is_empty();
                 let mut cmd = self.cmd(tool);
                 cmd.args(args);
                 cmd
@@ -4385,7 +4742,7 @@ impl Build {
                     };
                     self.cmd(&name)
                 } else if self.get_is_cross_compile()? {
-                    match self.prefix_for_target(&self.get_raw_target()?) {
+                    match self.prefix_for_target(self.get_raw_target()?) {
                         Some(prefix) => {
                             // GCC uses $target-gcc-ar, whereas binutils uses $target-ar -- try both.
                             // Prefer -ar if it exists, as builds of `-gcc-ar` have been observed to be
@@ -4426,8 +4783,166 @@ impl Build {
             }
         };
 
-        Ok((tool, name))
+        Ok((tool, name, any_args))
     }
+
+    /// The GNU toolchain prefix of the targets that have one, sorted by target,
+    /// see [`Build::prefix_for_target`].
+    const GNU_PREFIXES: &'static [(&'static str, &'static str)] = &[
+        // Note: there is no `aarch64-pc-windows-gnu` target, only `-gnullvm`
+        ("aarch64-pc-windows-gnullvm", "aarch64-w64-mingw32"),
+        ("aarch64-unknown-helenos", "aarch64-helenos"),
+        ("aarch64-unknown-linux-gnu", "aarch64-linux-gnu"),
+        ("aarch64-unknown-linux-musl", "aarch64-linux-musl"),
+        ("aarch64-unknown-linux-relibc", "aarch64-linux-relibc"),
+        ("aarch64-unknown-netbsd", "aarch64--netbsd"),
+        ("aarch64-uwp-windows-gnu", "aarch64-w64-mingw32"),
+        ("aarch64_be-unknown-linux-gnu", "aarch64_be-linux-gnu"),
+        ("arm-unknown-linux-gnueabi", "arm-linux-gnueabi"),
+        ("arm-unknown-linux-gnueabihf", "arm-linux-gnueabihf"),
+        ("arm-unknown-linux-musleabi", "arm-linux-musleabi"),
+        ("arm-unknown-linux-musleabihf", "arm-linux-musleabihf"),
+        ("arm-unknown-netbsd-eabi", "arm--netbsdelf-eabi"),
+        ("armeb-unknown-linux-gnueabi", "armeb-linux-gnueabi"),
+        ("armebv7r-none-eabi", "arm-none-eabi"),
+        ("armebv7r-none-eabihf", "arm-none-eabi"),
+        ("armv4t-none-eabi", "arm-none-eabi"),
+        ("armv4t-unknown-linux-gnueabi", "arm-linux-gnueabi"),
+        ("armv5te-none-eabi", "arm-none-eabi"),
+        ("armv5te-unknown-helenos-eabi", "arm-helenos"),
+        ("armv5te-unknown-linux-gnueabi", "arm-linux-gnueabi"),
+        ("armv5te-unknown-linux-musleabi", "arm-linux-gnueabi"),
+        ("armv6-none-eabi", "arm-none-eabi"),
+        ("armv6-none-eabihf", "arm-none-eabi"),
+        ("armv6-unknown-netbsd-eabihf", "armv6--netbsdelf-eabihf"),
+        ("armv7-unknown-linux-gnueabi", "arm-linux-gnueabi"),
+        ("armv7-unknown-linux-gnueabihf", "arm-linux-gnueabihf"),
+        ("armv7-unknown-linux-musleabihf", "arm-linux-musleabihf"),
+        ("armv7-unknown-netbsd-eabihf", "armv7--netbsdelf-eabihf"),
+        ("armv7a-none-eabi", "arm-none-eabi"),
+        ("armv7a-none-eabihf", "arm-none-eabi"),
+        ("armv7neon-unknown-linux-gnueabihf", "arm-linux-gnueabihf"),
+        ("armv7neon-unknown-linux-musleabihf", "arm-linux-musleabihf"),
+        ("armv7r-none-eabi", "arm-none-eabi"),
+        ("armv7r-none-eabihf", "arm-none-eabi"),
+        ("armv8r-none-eabihf", "arm-none-eabi"),
+        ("hexagon-unknown-linux-musl", "hexagon-linux-musl"),
+        ("i586-unknown-linux-musl", "musl"),
+        ("i686-pc-windows-gnu", "i686-w64-mingw32"),
+        ("i686-pc-windows-gnullvm", "i686-w64-mingw32"),
+        ("i686-unknown-helenos", "i686-helenos"),
+        ("i686-unknown-linux-musl", "musl"),
+        ("i686-unknown-netbsd", "i486--netbsdelf"),
+        ("i686-uwp-windows-gnu", "i686-w64-mingw32"),
+        ("loongarch64-unknown-linux-gnu", "loongarch64-linux-gnu"),
+        ("m68k-unknown-linux-gnu", "m68k-linux-gnu"),
+        ("mips-unknown-linux-gnu", "mips-linux-gnu"),
+        ("mips-unknown-linux-musl", "mips-linux-musl"),
+        ("mips64-unknown-linux-gnuabi64", "mips64-linux-gnuabi64"),
+        ("mips64el-unknown-linux-gnuabi64", "mips64el-linux-gnuabi64"),
+        ("mipsel-unknown-linux-gnu", "mipsel-linux-gnu"),
+        ("mipsel-unknown-linux-musl", "mipsel-linux-musl"),
+        ("mipsisa32r6-unknown-linux-gnu", "mipsisa32r6-linux-gnu"),
+        ("mipsisa32r6el-unknown-linux-gnu", "mipsisa32r6el-linux-gnu"),
+        (
+            "mipsisa64r6-unknown-linux-gnuabi64",
+            "mipsisa64r6-linux-gnuabi64",
+        ),
+        (
+            "mipsisa64r6el-unknown-linux-gnuabi64",
+            "mipsisa64r6el-linux-gnuabi64",
+        ),
+        ("powerpc-unknown-helenos", "ppc-helenos"),
+        ("powerpc-unknown-linux-gnu", "powerpc-linux-gnu"),
+        ("powerpc-unknown-linux-gnuspe", "powerpc-linux-gnuspe"),
+        ("powerpc-unknown-netbsd", "powerpc--netbsd"),
+        ("powerpc64-unknown-linux-gnu", "powerpc64-linux-gnu"),
+        ("powerpc64le-unknown-linux-gnu", "powerpc64le-linux-gnu"),
+        ("riscv32gc-unknown-linux-gnu", "riscv32-linux-gnu"),
+        ("riscv32gc-unknown-linux-musl", "riscv32-linux-musl"),
+        ("riscv32imac-esp-espidf", "riscv32-esp-elf"),
+        ("riscv32imc-esp-espidf", "riscv32-esp-elf"),
+        ("riscv64a23-unknown-linux-gnu", "riscv64-linux-gnu"),
+        ("riscv64gc-unknown-linux-gnu", "riscv64-linux-gnu"),
+        ("riscv64gc-unknown-linux-musl", "riscv64-linux-musl"),
+        ("riscv64gc-unknown-netbsd", "riscv64--netbsd"),
+        ("s390x-unknown-linux-gnu", "s390x-linux-gnu"),
+        ("sparc-unknown-linux-gnu", "sparc-linux-gnu"),
+        ("sparc64-unknown-helenos", "sparc64-helenos"),
+        ("sparc64-unknown-linux-gnu", "sparc64-linux-gnu"),
+        ("sparc64-unknown-netbsd", "sparc64--netbsd"),
+        ("sparcv9-sun-solaris", "sparcv9-sun-solaris"),
+        ("thumbv4t-none-eabi", "arm-none-eabi"),
+        ("thumbv5te-none-eabi", "arm-none-eabi"),
+        ("thumbv6-none-eabi", "arm-none-eabi"),
+        ("thumbv6m-none-eabi", "arm-none-eabi"),
+        ("thumbv7-unknown-linux-gnueabihf", "arm-linux-gnueabihf"),
+        ("thumbv7-unknown-linux-musleabihf", "arm-linux-musleabihf"),
+        ("thumbv7a-none-eabi", "arm-none-eabi"),
+        ("thumbv7a-none-eabihf", "arm-none-eabi"),
+        ("thumbv7em-none-eabi", "arm-none-eabi"),
+        ("thumbv7em-none-eabihf", "arm-none-eabi"),
+        ("thumbv7m-none-eabi", "arm-none-eabi"),
+        ("thumbv7neon-unknown-linux-gnueabihf", "arm-linux-gnueabihf"),
+        (
+            "thumbv7neon-unknown-linux-musleabihf",
+            "arm-linux-musleabihf",
+        ),
+        ("thumbv7r-none-eabi", "arm-none-eabi"),
+        ("thumbv7r-none-eabihf", "arm-none-eabi"),
+        ("thumbv8m.base-none-eabi", "arm-none-eabi"),
+        ("thumbv8m.main-none-eabi", "arm-none-eabi"),
+        ("thumbv8m.main-none-eabihf", "arm-none-eabi"),
+        ("thumbv8r-none-eabihf", "arm-none-eabi"),
+        ("x86_64-pc-windows-gnu", "x86_64-w64-mingw32"),
+        ("x86_64-pc-windows-gnullvm", "x86_64-w64-mingw32"),
+        ("x86_64-rumprun-netbsd", "x86_64-rumprun-netbsd"),
+        ("x86_64-unknown-helenos", "amd64-helenos"),
+        ("x86_64-unknown-netbsd", "x86_64--netbsd"),
+        ("x86_64-uwp-windows-gnu", "x86_64-w64-mingw32"),
+        ("xtensa-esp32-espidf", "xtensa-esp-elf"),
+        ("xtensa-esp32-none-elf", "xtensa-esp-elf"),
+        ("xtensa-esp32s2-espidf", "xtensa-esp-elf"),
+        ("xtensa-esp32s2-none-elf", "xtensa-esp-elf"),
+        ("xtensa-esp32s3-espidf", "xtensa-esp-elf"),
+        ("xtensa-esp32s3-none-elf", "xtensa-esp-elf"),
+    ];
+
+    const RISCV32_ELF: &'static [&'static str] = &[
+        "riscv32-unknown-elf",
+        "riscv64-unknown-elf",
+        "riscv-none-embed",
+    ];
+    const RISCV64_ELF: &'static [&'static str] = &[
+        "riscv64-unknown-elf",
+        "riscv32-unknown-elf",
+        "riscv-none-embed",
+    ];
+
+    /// Targets with several compatible GNU toolchain prefixes, most likely first.
+    /// The first one with a compiler on `PATH` is used, see
+    /// [`Build::find_working_gnu_prefix`].
+    const GNU_PREFIX_CANDIDATES: &'static [(&'static str, &'static [&'static str])] = &[
+        // `x86_64-linux-gnu` transparently supports gcc-multilib
+        (
+            "i686-unknown-linux-gnu",
+            &["i686-linux-gnu", "x86_64-linux-gnu"],
+        ),
+        ("riscv32i-unknown-none-elf", Self::RISCV32_ELF),
+        ("riscv32im-unknown-none-elf", Self::RISCV32_ELF),
+        ("riscv32imac-unknown-none-elf", Self::RISCV32_ELF),
+        ("riscv32imafc-unknown-none-elf", Self::RISCV32_ELF),
+        ("riscv32imac-unknown-xous-elf", Self::RISCV32_ELF),
+        ("riscv32imc-unknown-none-elf", Self::RISCV32_ELF),
+        ("riscv64gc-unknown-none-elf", Self::RISCV64_ELF),
+        ("riscv64imac-unknown-none-elf", Self::RISCV64_ELF),
+        ("x86_64-unknown-linux-gnu", &["x86_64-linux-gnu"]),
+        ("x86_64-unknown-linux-musl", &["x86_64-linux-musl", "musl"]),
+        (
+            "x86_64-unknown-linux-relibc",
+            &["x86_64-linux-relibc", "relibc"],
+        ),
+    ];
 
     // FIXME: Use parsed target instead of raw target.
     fn prefix_for_target(&self, target: &str) -> Option<Cow<'static, str>> {
@@ -4437,7 +4952,7 @@ impl Build {
             .map(Cow::Owned)
             .or_else(|| {
                 // Put aside RUSTC_LINKER's prefix to be used as second choice, after CROSS_COMPILE
-                cargo_env_var_os("RUSTC_LINKER").and_then(|var| {
+                self.get_cargo_env("RUSTC_LINKER").and_then(|var| {
                     var.to_string_lossy()
                         .strip_suffix("-gcc")
                         .map(str::to_string)
@@ -4445,171 +4960,16 @@ impl Build {
                 })
             })
             .or_else(|| {
-                match target {
-                    // Note: there is no `aarch64-pc-windows-gnu` target, only `-gnullvm`
-                    "aarch64-pc-windows-gnullvm" => Some("aarch64-w64-mingw32"),
-                    "aarch64-uwp-windows-gnu" => Some("aarch64-w64-mingw32"),
-                    "aarch64-unknown-helenos" => Some("aarch64-helenos"),
-                    "aarch64-unknown-linux-gnu" => Some("aarch64-linux-gnu"),
-                    "aarch64_be-unknown-linux-gnu" => Some("aarch64_be-linux-gnu"),
-                    "aarch64-unknown-linux-musl" => Some("aarch64-linux-musl"),
-                    "aarch64-unknown-linux-relibc" => Some("aarch64-linux-relibc"),
-                    "aarch64-unknown-netbsd" => Some("aarch64--netbsd"),
-                    "arm-unknown-linux-gnueabi" => Some("arm-linux-gnueabi"),
-                    "armv4t-unknown-linux-gnueabi" => Some("arm-linux-gnueabi"),
-                    "armv5te-unknown-helenos-eabi" => Some("arm-helenos"),
-                    "armv5te-unknown-linux-gnueabi" => Some("arm-linux-gnueabi"),
-                    "armv5te-unknown-linux-musleabi" => Some("arm-linux-gnueabi"),
-                    "arm-unknown-linux-gnueabihf" => Some("arm-linux-gnueabihf"),
-                    "arm-unknown-linux-musleabi" => Some("arm-linux-musleabi"),
-                    "arm-unknown-linux-musleabihf" => Some("arm-linux-musleabihf"),
-                    "arm-unknown-netbsd-eabi" => Some("arm--netbsdelf-eabi"),
-                    "armeb-unknown-linux-gnueabi" => Some("armeb-linux-gnueabi"),
-                    "armv6-unknown-netbsd-eabihf" => Some("armv6--netbsdelf-eabihf"),
-                    "armv7-unknown-linux-gnueabi" => Some("arm-linux-gnueabi"),
-                    "armv7-unknown-linux-gnueabihf" => Some("arm-linux-gnueabihf"),
-                    "armv7-unknown-linux-musleabihf" => Some("arm-linux-musleabihf"),
-                    "armv7neon-unknown-linux-gnueabihf" => Some("arm-linux-gnueabihf"),
-                    "armv7neon-unknown-linux-musleabihf" => Some("arm-linux-musleabihf"),
-                    "thumbv7-unknown-linux-gnueabihf" => Some("arm-linux-gnueabihf"),
-                    "thumbv7-unknown-linux-musleabihf" => Some("arm-linux-musleabihf"),
-                    "thumbv7neon-unknown-linux-gnueabihf" => Some("arm-linux-gnueabihf"),
-                    "thumbv7neon-unknown-linux-musleabihf" => Some("arm-linux-musleabihf"),
-                    "armv7-unknown-netbsd-eabihf" => Some("armv7--netbsdelf-eabihf"),
-                    "hexagon-unknown-linux-musl" => Some("hexagon-linux-musl"),
-                    "i586-unknown-linux-musl" => Some("musl"),
-                    "i686-pc-windows-gnu" => Some("i686-w64-mingw32"),
-                    "i686-pc-windows-gnullvm" => Some("i686-w64-mingw32"),
-                    "i686-uwp-windows-gnu" => Some("i686-w64-mingw32"),
-                    "i686-unknown-helenos" => Some("i686-helenos"),
-                    "i686-unknown-linux-gnu" => self.find_working_gnu_prefix(&[
-                        "i686-linux-gnu",
-                        "x86_64-linux-gnu", // transparently support gcc-multilib
-                    ]), // explicit None if not found, so caller knows to fall back
-                    "i686-unknown-linux-musl" => Some("musl"),
-                    "i686-unknown-netbsd" => Some("i486--netbsdelf"),
-                    "loongarch64-unknown-linux-gnu" => Some("loongarch64-linux-gnu"),
-                    "m68k-unknown-linux-gnu" => Some("m68k-linux-gnu"),
-                    "mips-unknown-linux-gnu" => Some("mips-linux-gnu"),
-                    "mips-unknown-linux-musl" => Some("mips-linux-musl"),
-                    "mipsel-unknown-linux-gnu" => Some("mipsel-linux-gnu"),
-                    "mipsel-unknown-linux-musl" => Some("mipsel-linux-musl"),
-                    "mips64-unknown-linux-gnuabi64" => Some("mips64-linux-gnuabi64"),
-                    "mips64el-unknown-linux-gnuabi64" => Some("mips64el-linux-gnuabi64"),
-                    "mipsisa32r6-unknown-linux-gnu" => Some("mipsisa32r6-linux-gnu"),
-                    "mipsisa32r6el-unknown-linux-gnu" => Some("mipsisa32r6el-linux-gnu"),
-                    "mipsisa64r6-unknown-linux-gnuabi64" => Some("mipsisa64r6-linux-gnuabi64"),
-                    "mipsisa64r6el-unknown-linux-gnuabi64" => Some("mipsisa64r6el-linux-gnuabi64"),
-                    "powerpc-unknown-helenos" => Some("ppc-helenos"),
-                    "powerpc-unknown-linux-gnu" => Some("powerpc-linux-gnu"),
-                    "powerpc-unknown-linux-gnuspe" => Some("powerpc-linux-gnuspe"),
-                    "powerpc-unknown-netbsd" => Some("powerpc--netbsd"),
-                    "powerpc64-unknown-linux-gnu" => Some("powerpc64-linux-gnu"),
-                    "powerpc64le-unknown-linux-gnu" => Some("powerpc64le-linux-gnu"),
-                    "riscv32i-unknown-none-elf" => self.find_working_gnu_prefix(&[
-                        "riscv32-unknown-elf",
-                        "riscv64-unknown-elf",
-                        "riscv-none-embed",
-                    ]),
-                    "riscv32im-unknown-none-elf" => self.find_working_gnu_prefix(&[
-                        "riscv32-unknown-elf",
-                        "riscv64-unknown-elf",
-                        "riscv-none-embed",
-                    ]),
-                    "riscv32imac-esp-espidf" => Some("riscv32-esp-elf"),
-                    "riscv32imac-unknown-none-elf" => self.find_working_gnu_prefix(&[
-                        "riscv32-unknown-elf",
-                        "riscv64-unknown-elf",
-                        "riscv-none-embed",
-                    ]),
-                    "riscv32imafc-unknown-none-elf" => self.find_working_gnu_prefix(&[
-                        "riscv32-unknown-elf",
-                        "riscv64-unknown-elf",
-                        "riscv-none-embed",
-                    ]),
-                    "riscv32imac-unknown-xous-elf" => self.find_working_gnu_prefix(&[
-                        "riscv32-unknown-elf",
-                        "riscv64-unknown-elf",
-                        "riscv-none-embed",
-                    ]),
-                    "riscv32imc-esp-espidf" => Some("riscv32-esp-elf"),
-                    "riscv32imc-unknown-none-elf" => self.find_working_gnu_prefix(&[
-                        "riscv32-unknown-elf",
-                        "riscv64-unknown-elf",
-                        "riscv-none-embed",
-                    ]),
-                    "riscv64gc-unknown-none-elf" => self.find_working_gnu_prefix(&[
-                        "riscv64-unknown-elf",
-                        "riscv32-unknown-elf",
-                        "riscv-none-embed",
-                    ]),
-                    "riscv64imac-unknown-none-elf" => self.find_working_gnu_prefix(&[
-                        "riscv64-unknown-elf",
-                        "riscv32-unknown-elf",
-                        "riscv-none-embed",
-                    ]),
-                    "riscv64gc-unknown-linux-gnu" => Some("riscv64-linux-gnu"),
-                    "riscv64a23-unknown-linux-gnu" => Some("riscv64-linux-gnu"),
-                    "riscv32gc-unknown-linux-gnu" => Some("riscv32-linux-gnu"),
-                    "riscv64gc-unknown-linux-musl" => Some("riscv64-linux-musl"),
-                    "riscv32gc-unknown-linux-musl" => Some("riscv32-linux-musl"),
-                    "riscv64gc-unknown-netbsd" => Some("riscv64--netbsd"),
-                    "s390x-unknown-linux-gnu" => Some("s390x-linux-gnu"),
-                    "sparc-unknown-linux-gnu" => Some("sparc-linux-gnu"),
-                    "sparc64-unknown-helenos" => Some("sparc64-helenos"),
-                    "sparc64-unknown-linux-gnu" => Some("sparc64-linux-gnu"),
-                    "sparc64-unknown-netbsd" => Some("sparc64--netbsd"),
-                    "sparcv9-sun-solaris" => Some("sparcv9-sun-solaris"),
-                    "armv4t-none-eabi" => Some("arm-none-eabi"),
-                    "armv5te-none-eabi" => Some("arm-none-eabi"),
-                    "armv6-none-eabi" => Some("arm-none-eabi"),
-                    "armv6-none-eabihf" => Some("arm-none-eabi"),
-                    "armv7a-none-eabi" => Some("arm-none-eabi"),
-                    "armv7a-none-eabihf" => Some("arm-none-eabi"),
-                    "armebv7r-none-eabi" => Some("arm-none-eabi"),
-                    "armebv7r-none-eabihf" => Some("arm-none-eabi"),
-                    "armv7r-none-eabi" => Some("arm-none-eabi"),
-                    "armv7r-none-eabihf" => Some("arm-none-eabi"),
-                    "armv8r-none-eabihf" => Some("arm-none-eabi"),
-                    "thumbv4t-none-eabi" => Some("arm-none-eabi"),
-                    "thumbv5te-none-eabi" => Some("arm-none-eabi"),
-                    "thumbv6-none-eabi" => Some("arm-none-eabi"),
-                    "thumbv7a-none-eabi" => Some("arm-none-eabi"),
-                    "thumbv7a-none-eabihf" => Some("arm-none-eabi"),
-                    "thumbv7r-none-eabi" => Some("arm-none-eabi"),
-                    "thumbv7r-none-eabihf" => Some("arm-none-eabi"),
-                    "thumbv8r-none-eabihf" => Some("arm-none-eabi"),
-                    "thumbv6m-none-eabi" => Some("arm-none-eabi"),
-                    "thumbv7em-none-eabi" => Some("arm-none-eabi"),
-                    "thumbv7em-none-eabihf" => Some("arm-none-eabi"),
-                    "thumbv7m-none-eabi" => Some("arm-none-eabi"),
-                    "thumbv8m.base-none-eabi" => Some("arm-none-eabi"),
-                    "thumbv8m.main-none-eabi" => Some("arm-none-eabi"),
-                    "thumbv8m.main-none-eabihf" => Some("arm-none-eabi"),
-                    "x86_64-pc-windows-gnu" => Some("x86_64-w64-mingw32"),
-                    "x86_64-pc-windows-gnullvm" => Some("x86_64-w64-mingw32"),
-                    "x86_64-uwp-windows-gnu" => Some("x86_64-w64-mingw32"),
-                    "x86_64-rumprun-netbsd" => Some("x86_64-rumprun-netbsd"),
-                    "x86_64-unknown-helenos" => Some("amd64-helenos"),
-                    "x86_64-unknown-linux-gnu" => self.find_working_gnu_prefix(&[
-                        "x86_64-linux-gnu", // rustfmt wrap
-                    ]), // explicit None if not found, so caller knows to fall back
-                    "x86_64-unknown-linux-musl" => {
-                        self.find_working_gnu_prefix(&["x86_64-linux-musl", "musl"])
-                    }
-                    "x86_64-unknown-linux-relibc" => {
-                        self.find_working_gnu_prefix(&["x86_64-linux-relibc", "relibc"])
-                    }
-                    "x86_64-unknown-netbsd" => Some("x86_64--netbsd"),
-                    "xtensa-esp32-espidf"
-                    | "xtensa-esp32-none-elf"
-                    | "xtensa-esp32s2-espidf"
-                    | "xtensa-esp32s2-none-elf"
-                    | "xtensa-esp32s3-espidf"
-                    | "xtensa-esp32s3-none-elf" => Some("xtensa-esp-elf"),
-                    _ => None,
+                if let Some(prefix) = lookup_sorted(Self::GNU_PREFIXES, target) {
+                    return Some(Cow::Borrowed(prefix));
                 }
-                .map(Cow::Borrowed)
+                for (candidate, prefixes) in Self::GNU_PREFIX_CANDIDATES {
+                    if *candidate == target {
+                        // explicit None if not found, so caller knows to fall back
+                        return self.find_working_gnu_prefix(prefixes).map(Cow::Borrowed);
+                    }
+                }
+                None
             })
     }
 
@@ -4645,39 +5005,50 @@ impl Build {
 
     fn get_target(&self) -> Result<TargetInfo<'_>, Error> {
         match &self.target {
-            Some(t) if Some(OsStr::new(&**t)) != cargo_env_var_os("TARGET").as_deref() => {
+            Some(t) if Some(OsStr::new(&**t)) != self.get_cargo_env("TARGET") => {
                 TargetInfo::from_rustc_target(t)
             }
             // Fetch target information from environment if not set, or if the
             // target was the same as the TARGET environment variable, in
             // case the user did `build.target(&env::var("TARGET").unwrap())`.
-            _ => self
-                .build_cache
-                .target_info_parser
-                .parse_from_cargo_environment_variables(),
+            _ => self.env.inherited().cargo_target(),
         }
     }
 
-    fn get_raw_target(&self) -> Result<Cow<'_, str>, Error> {
+    /// Returns true if this build configuration is targeting Cargo's `TARGET`.
+    ///
+    /// When `target` is overridden to something else (e.g., `HOST`), Cargo's
+    /// `CARGO_CFG_*` target-feature environment variables do not apply.
+    fn is_cargo_target(&self) -> bool {
         match &self.target {
-            Some(t) => Ok(Cow::Borrowed(t)),
-            None => cargo_env_var("TARGET").map(Cow::Owned),
+            Some(t) => Some(OsStr::new(&**t)) == self.get_cargo_env("TARGET"),
+            None => true,
+        }
+    }
+
+    fn get_raw_target(&self) -> Result<&str, Error> {
+        match self.target.as_deref() {
+            Some(t) => Ok(t),
+            None => self.get_cargo_env_str("TARGET"),
+        }
+    }
+
+    fn get_host(&self) -> Result<&str, Error> {
+        match &self.host {
+            Some(h) => Ok(h),
+            None => self.get_cargo_env_str("HOST"),
         }
     }
 
     fn get_is_cross_compile(&self) -> Result<bool, Error> {
         let target = self.get_raw_target()?;
-        let host: Cow<'_, str> = match &self.host {
-            Some(h) => Cow::Borrowed(h),
-            None => Cow::Owned(cargo_env_var("HOST")?),
-        };
-        Ok(host != target)
+        Ok(self.get_host()? != target)
     }
 
-    fn get_opt_level(&self) -> Result<Cow<'_, str>, Error> {
-        match &self.opt_level {
-            Some(ol) => Ok(Cow::Borrowed(ol)),
-            None => cargo_env_var("OPT_LEVEL").map(Cow::Owned),
+    fn get_opt_level(&self) -> Result<&str, Error> {
+        match self.opt_level.as_deref() {
+            Some(ol) => Ok(ol),
+            None => self.get_cargo_env_str("OPT_LEVEL"),
         }
     }
 
@@ -4687,7 +5058,7 @@ impl Build {
     fn get_debug(&self) -> bool {
         match self.get_debug_str() {
             Err(_) => false,
-            Ok(d) => match &*d {
+            Ok(d) => match d {
                 // From https://doc.rust-lang.org/cargo/reference/profiles.html#debug
                 "" | "0" | "false" | "none" => false,
                 _ => true,
@@ -4695,10 +5066,10 @@ impl Build {
         }
     }
 
-    fn get_debug_str(&self) -> Result<Cow<'_, str>, Error> {
-        match &self.debug {
-            Some(d) => Ok(Cow::Borrowed(d)),
-            None => cargo_env_var("DEBUG").map(Cow::Owned),
+    fn get_debug_str(&self) -> Result<&str, Error> {
+        match self.debug.as_deref() {
+            Some(d) => Ok(d),
+            None => self.get_cargo_env_str("DEBUG"),
         }
     }
 
@@ -4728,30 +5099,22 @@ impl Build {
         self.force_frame_pointer.unwrap_or_else(|| self.get_debug())
     }
 
-    fn get_out_dir(&self) -> Result<Cow<'_, Path>, Error> {
-        match &self.out_dir {
-            Some(p) => Ok(Cow::Borrowed(&**p)),
-            None => cargo_env_var_os("OUT_DIR")
-                .map(PathBuf::from)
-                .map(Cow::Owned)
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::EnvVarNotFound,
-                        "Environment variable OUT_DIR not defined.",
-                    )
-                }),
+    fn get_out_dir(&self) -> Result<&Path, Error> {
+        match self.out_dir.as_deref() {
+            Some(p) => Ok(p),
+            None => self.get_cargo_env("OUT_DIR").map(Path::new).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::EnvVarNotFound,
+                    "Environment variable OUT_DIR not defined.",
+                )
+            }),
         }
     }
 
     /// Look up an environment variable in the snapshot, and tell Cargo that we
     /// used it.
     fn get_env(&self, v: &str) -> Option<&Arc<OsStr>> {
-        // Excluding `PATH` prevents spurious rebuilds on Windows, see
-        // <https://github.com/rust-lang/cc-rs/pull/1215> for details.
-        if self.emit_rerun_if_env_changed && v != "PATH" {
-            self.cargo_output
-                .print_metadata(&format_args!("cargo:rerun-if-env-changed={v}"));
-        }
+        self.rerun_if_env_changed(v);
         let r = self.env.inherited().get(OsStr::new(v));
         self.cargo_output.print_metadata(&format_args!(
             "{} = {}",
@@ -4759,6 +5122,24 @@ impl Build {
             OptionOsStrDisplay(r.map(|r| &**r))
         ));
         r
+    }
+
+    /// Look up a variable that Cargo sets for build scripts, such as `TARGET`
+    /// or `OUT_DIR`, in the snapshot.
+    ///
+    /// <https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-build-scripts>
+    ///
+    /// Cargo doesn't need to be told about these with `rerun-if-env-changed`,
+    /// so unlike [`Build::get_env`] this prints no such line, and
+    /// [`Build::env`] doesn't overwrite them.
+    fn get_cargo_env(&self, key: &str) -> Option<&OsStr> {
+        self.env.inherited().get(OsStr::new(key)).map(|v| &**v)
+    }
+
+    /// [`Build::get_cargo_env`] for a variable that must be set and valid
+    /// UTF-8.
+    fn get_cargo_env_str(&self, key: &str) -> Result<&str, Error> {
+        self.env.inherited().get_cargo_var(key)
     }
 
     /// Look up an environment variable that's allowed to be overwritten by
@@ -4792,6 +5173,116 @@ impl Build {
         }
     }
 
+    /// Tell Cargo to rerun the build script when the variable `v` changes,
+    /// unless this `Build`, a clone of it or one of its flag checks already
+    /// did.
+    fn rerun_if_env_changed(&self, v: &str) {
+        // Excluding `PATH` prevents spurious rebuilds on Windows, see
+        // <https://github.com/rust-lang/cc-rs/pull/1215> for details.
+        if !self.emit_rerun_if_env_changed || !self.cargo_output.metadata || v == "PATH" {
+            return;
+        }
+        if !push_if_new(&self.build_cache.emitted_rerun_if_env_changed, v) {
+            return;
+        }
+        self.cargo_output
+            .print_metadata(&format_args!("cargo:rerun-if-env-changed={v}"));
+    }
+
+    /// Tell Cargo to rerun the build script when a variable changes that
+    /// `compiler`, or a program it runs, reads by itself and that changes what
+    /// it compiles or which programs it runs. Their values aren't used.
+    fn rerun_if_compiler_env_changed(&self, compiler: &Tool, target: &TargetInfo<'_>) {
+        let gcc = compiler.family == ToolFamily::Gnu;
+        let clang_cl = compiler.family == ToolFamily::Msvc { clang_cl: true };
+        let cl_exe = compiler.family == ToolFamily::Msvc { clang_cl: false };
+        // Clang in every driver mode.
+        let clang = clang_cl || matches!(compiler.family, ToolFamily::Clang { .. });
+        let zig_cc = compiler.family == ToolFamily::Clang { zig_cc: true };
+        let msvc_target = target.env == "msvc";
+        let apple_target = target.vendor == "apple";
+        let macos_host = matches!(self.get_host(), Ok(host) if host.ends_with("-apple-darwin"));
+        let groups: &[(bool, &[&str])] = &[
+            // https://gcc.gnu.org/onlinedocs/gcc/Environment-Variables.html
+            // and Clang's `Clang.cpp` and `Driver.cpp`.
+            (
+                gcc || clang,
+                &[
+                    "CPATH",
+                    "C_INCLUDE_PATH",
+                    "CPLUS_INCLUDE_PATH",
+                    "OBJC_INCLUDE_PATH",
+                    "OBJCPLUS_INCLUDE_PATH",
+                    "COMPILER_PATH",
+                    "SOURCE_DATE_EPOCH",
+                ],
+            ),
+            (gcc, &["GCC_EXEC_PREFIX"]),
+            // Clang's `driver.cpp` and `Driver.cpp`.
+            (clang, &["CCC_OVERRIDE_OPTIONS", "CLANG_NO_DEFAULT_CONFIG"]),
+            // Zig's `main.zig`.
+            (zig_cc, &["ZIG_LIB_DIR", "ZIG_LIBC"]),
+            // cl.exe reads `EXTERNAL_INCLUDE` only with
+            // `/external:env:EXTERNAL_INCLUDE`. Visual Studio's developer
+            // prompts set both.
+            (
+                cl_exe || (clang && msvc_target),
+                &["INCLUDE", "EXTERNAL_INCLUDE"],
+            ),
+            // Clang finds Visual Studio through these, for its headers and
+            // `_MSC_VER`, see LLVM's `MSVCPaths.cpp`.
+            (clang && msvc_target, &["VCToolsInstallDir", "VCINSTALLDIR"]),
+            // https://learn.microsoft.com/en-us/cpp/build/reference/cl-environment-variables
+            (cl_exe || clang_cl, &["CL", "_CL_"]),
+            (cl_exe, &["LIBPATH"]),
+            // https://docs.nvidia.com/cuda/cuda-compiler-driver-nvcc/#nvcc-environment-variables
+            // `NVCC_CCBIN` counts only when cc doesn't pass `-ccbin`. On
+            // Windows nvcc skips Visual Studio's batch file for cl.exe only
+            // when `VSCMD_VER` is set.
+            (
+                self.cuda,
+                &["NVCC_PREPEND_FLAGS", "NVCC_APPEND_FLAGS", "NVCC_CCBIN"],
+            ),
+            (self.cuda && msvc_target, &["VSCMD_VER"]),
+            // Emscripten's `emcc.py` and `tools/config.py`.
+            (
+                target.os == "emscripten",
+                &[
+                    "EMCC_CFLAGS",
+                    "EMCC_LOCAL_PORTS",
+                    "EM_CONFIG",
+                    "EM_CACHE",
+                    "EM_PORTS",
+                    "EM_LLVM_ROOT",
+                    "EM_CLANG_ADD_VERSION",
+                    "EM_COMPILER_WRAPPER",
+                ],
+            ),
+            // `xcrun`, which cc runs for the SDK on Apple targets, and which
+            // runs the compilers in `/usr/bin` on macOS.
+            (
+                apple_target || macos_host,
+                &["DEVELOPER_DIR", "TOOLCHAINS", "SDKROOT"],
+            ),
+            // Clang's `Darwin.cpp`.
+            (apple_target, &["RC_DEBUG_OPTIONS", "RC_DEBUG_PREFIX_MAP"]),
+        ];
+        for &(reads, vars) in groups {
+            if reads {
+                for var in vars {
+                    self.rerun_if_env_changed(var);
+                }
+            }
+        }
+        if apple_target {
+            // The compiler reads it when cc doesn't pass the deployment target
+            // itself, and cc reads it when it does.
+            if let Some(var) = target.apple_deployment_target_var() {
+                self.rerun_if_env_changed(var);
+            }
+        }
+    }
+
     /// The list of environment variables to check for a given env, in order of priority.
     fn target_envs(&self, env: &str) -> Result<[String; 4], Error> {
         let target = self.get_raw_target()?;
@@ -4800,7 +5291,8 @@ impl Build {
         } else {
             "HOST"
         };
-        let target_u = target.replace(['-', '.'], "_");
+        // A `&str` pattern, like the others, rather than another instance.
+        let target_u = target.replace("-", "_").replace(".", "_");
 
         Ok([
             format!("{env}_{target}"),
@@ -4936,7 +5428,7 @@ impl Build {
             .apple_sdk_root_cache
             .write()
             .expect("apple_sdk_root_cache lock failed")
-            .insert(sdk.into(), sdk_path.clone());
+            .insert(sdk, sdk_path.clone());
         Ok(sdk_path)
     }
 
@@ -4966,7 +5458,8 @@ impl Build {
             Some(Arc::from(core::str::from_utf8(&version).ok()?.trim()))
         };
 
-        let deployment_from_env = |name: &str| -> Option<Arc<str>> {
+        let deployment_from_env = || -> Option<Arc<str>> {
+            let name = target.apple_deployment_target_var()?;
             self.get_env_overridable(name)?.to_str().map(Arc::from)
         };
 
@@ -4975,13 +5468,22 @@ impl Build {
         // A long time ago they used libstdc++, but since macOS 10.9 and iOS 7 libc++ has been the library the SDKs provide to link against.
         // If a `cc`` config wants to use C++, we round up to these versions as the baseline.
         let maybe_cpp_version_baseline = |deployment_target_ver: Arc<str>| -> Option<Arc<str>> {
-            if !self.cpp {
+            // watchOS, tvOS, visionOS, and others are all new enough that libc++ is their baseline.
+            if !self.cpp || !matches!(target.os, "macos" | "ios") {
                 return Some(deployment_target_ver);
             }
 
-            let mut deployment_target = deployment_target_ver
+            let Ok(parts) = deployment_target_ver
                 .split('.')
-                .map(|v| v.parse::<u32>().expect("integer version"));
+                .map(str::parse::<u32>)
+                .collect::<Result<Vec<_>, _>>()
+            else {
+                self.cargo_output.print_warning(&format_args!(
+                    "ignoring invalid deployment target {deployment_target_ver:?}"
+                ));
+                return None;
+            };
+            let mut deployment_target = parts.into_iter();
 
             match target.os {
                 "macos" => {
@@ -5007,7 +5509,6 @@ impl Build {
                         return None;
                     }
                 }
-                // watchOS, tvOS, visionOS, and others are all new enough that libc++ is their baseline.
                 _ => {}
             }
 
@@ -5026,44 +5527,30 @@ impl Build {
         //
         // The ordering of env -> XCode SDK -> old rustc defaults is intentional for performance when using
         // an explicit target.
-        let version: Arc<str> = match target.os {
-            "macos" => deployment_from_env("MACOSX_DEPLOYMENT_TARGET")
-                .and_then(maybe_cpp_version_baseline)
-                .or_else(default_deployment_from_sdk)
-                .unwrap_or_else(|| {
-                    if target.arch == "aarch64" {
-                        "11.0".into()
-                    } else {
-                        let default: Arc<str> = Arc::from("10.7");
-                        maybe_cpp_version_baseline(default.clone()).unwrap_or(default)
-                    }
-                }),
-
-            "ios" => deployment_from_env("IPHONEOS_DEPLOYMENT_TARGET")
-                .and_then(maybe_cpp_version_baseline)
-                .or_else(default_deployment_from_sdk)
-                .unwrap_or_else(|| "7.0".into()),
-
-            "watchos" => deployment_from_env("WATCHOS_DEPLOYMENT_TARGET")
-                .or_else(default_deployment_from_sdk)
-                .unwrap_or_else(|| "5.0".into()),
-
-            "tvos" => deployment_from_env("TVOS_DEPLOYMENT_TARGET")
-                .or_else(default_deployment_from_sdk)
-                .unwrap_or_else(|| "9.0".into()),
-
-            "visionos" => deployment_from_env("XROS_DEPLOYMENT_TARGET")
-                .or_else(default_deployment_from_sdk)
-                .unwrap_or_else(|| "1.0".into()),
-
+        let fallback = match target.os {
+            "macos" if target.arch == "aarch64" => "11.0",
+            "macos" => "10.7",
+            "ios" => "7.0",
+            "watchos" => "5.0",
+            "tvos" => "9.0",
+            "visionos" => "1.0",
             os => unreachable!("unknown Apple OS: {}", os),
         };
+        let version = deployment_from_env()
+            .and_then(maybe_cpp_version_baseline)
+            .or_else(default_deployment_from_sdk)
+            .unwrap_or_else(|| {
+                let fallback: Arc<str> = fallback.into();
+                // Too low for C++ only on x86_64 macOS, where the SDK's target
+                // definitions handle it.
+                maybe_cpp_version_baseline(fallback.clone()).unwrap_or(fallback)
+            });
 
         self.build_cache
             .apple_versions_cache
             .write()
             .expect("apple_versions_cache lock failed")
-            .insert(sdk.into(), version.clone());
+            .insert(sdk, version.clone());
 
         version
     }
@@ -5390,6 +5877,14 @@ fn is_llvm_mingw_wrapper(clang_path: &Path) -> bool {
     }
 }
 
+/// Whether the archiver is Apple's `libtool` or `llvm-libtool-darwin`, which
+/// take `-static -o <lib> <inputs>` instead of `ar`'s `cq <lib> <inputs>`.
+fn is_libtool(archiver: &Path) -> bool {
+    archiver.file_name().map_or(false, |name| {
+        name.to_string_lossy().contains_ignore_ascii_case("libtool")
+    })
+}
+
 // FIXME: Use parsed target.
 fn autodetect_android_compiler(
     raw_target: &str,
@@ -5519,6 +6014,12 @@ fn check_exe(exe: PathBuf) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gnu_prefixes_are_sorted() {
+        // `prefix_for_target` searches them by bisection.
+        assert!(Build::GNU_PREFIXES.windows(2).all(|w| w[0].0 < w[1].0));
+    }
 
     #[test]
     fn test_android_clang_compiler_uses_target_arg_internally() {

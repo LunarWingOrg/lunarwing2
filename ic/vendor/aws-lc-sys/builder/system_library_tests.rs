@@ -105,6 +105,18 @@ fn setup_test_env_with_target(os: &str, env: &str) -> TestEnvGuard<'static> {
     }
 }
 
+#[test]
+fn test_crypto_link_kind() {
+    for (lib_type, fips_build, expected) in [
+        (OutputLibType::Static, true, "static:+whole-archive"),
+        (OutputLibType::Dynamic, true, "dylib"),
+        (OutputLibType::Static, false, "static"),
+        (OutputLibType::Dynamic, false, "dylib"),
+    ] {
+        assert_eq!(crypto_link_kind(&lib_type, fips_build), expected);
+    }
+}
+
 // -------------------------------------------------------------------------
 // version_at_least
 // -------------------------------------------------------------------------
@@ -797,6 +809,39 @@ fn test_probe_succeeds_on_valid_install() {
 
     // `probe` memoizes its result; a second call must still succeed.
     sys.probe().expect("probe should be idempotent");
+}
+
+#[test]
+#[cfg(not(feature = "fips"))]
+fn test_probe_rejects_versions_below_minimum() {
+    let _env = setup_test_env();
+    for version in ["1.68.0", "5.6.0"] {
+        let fx = fake_valid_install();
+        write_base_h(
+            &fx.root.join("include"),
+            &format!(
+                "#define OPENSSL_IS_AWSLC 1\n#define AWSLC_VERSION_NUMBER_STRING \"{version}\"\n"
+            ),
+        );
+        let sys = SystemLib::new(PathBuf::from("."), fx.root.clone(), None, false);
+        let err = sys.probe().unwrap_err();
+        assert!(err.contains("AWS-LC version too old"), "{err}");
+        assert!(err.contains("minimum supported 5.7.0"), "{err}");
+    }
+}
+
+#[test]
+#[cfg(not(feature = "fips"))]
+fn test_probe_accepts_minimum_version() {
+    let _env = setup_test_env();
+    let fx = fake_valid_install();
+    write_base_h(
+        &fx.root.join("include"),
+        "#define OPENSSL_IS_AWSLC 1\n#define AWSLC_VERSION_NUMBER_STRING \"5.7.0\"\n",
+    );
+    let sys = SystemLib::new(PathBuf::from("."), fx.root.clone(), None, false);
+    sys.probe()
+        .expect("AWS-LC 5.7.0 should satisfy the minimum version check");
 }
 
 #[test]

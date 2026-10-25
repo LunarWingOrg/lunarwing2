@@ -19,11 +19,11 @@ mod win_x86_64;
 
 use crate::nasm_builder::NasmBuilder;
 use crate::{
-    cargo_env, compiler_is_cl_like, emit_warning, env_var_to_bool, execute_command, find_clang_cl,
-    get_crate_cc, get_crate_cflags, get_crate_cxx, is_cross_compiling, is_link_whole_archive,
-    is_no_asm, is_small, out_dir, requested_c_std, set_env_for_target, should_build_jitter_entropy,
-    target, target_arch, target_env, target_is_msvc, target_os, target_vendor, use_prebuilt_nasm,
-    CStdRequested, EnvGuard, OutputLibType,
+    cargo_env, compiler_is_cl_like, emit_warning, env_var_to_bool, execute_command,
+    export_crate_compilers, find_clang_cl, get_crate_cc, get_crate_cflags, is_cross_compiling,
+    is_link_whole_archive, is_no_asm, is_small, out_dir, requested_c_std, set_env_for_target,
+    should_build_jitter_entropy, target, target_arch, target_env, target_is_msvc, target_os,
+    target_vendor, use_prebuilt_nasm, CStdRequested, EnvGuard, OutputLibType,
 };
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -225,13 +225,6 @@ impl CcBuilder {
             }
         }
 
-        if let Some(cc) = get_crate_cc() {
-            set_env_for_target("CC", &cc);
-        }
-        if let Some(cxx) = get_crate_cxx() {
-            set_env_for_target("CXX", &cxx);
-        }
-
         if target_arch() == "x86" && !is_cl_like {
             if let Some(option) = BuildOption::flag_if_supported(cc_build, "-msse2") {
                 build_options.push(option);
@@ -378,6 +371,7 @@ impl CcBuilder {
         if let Some(cflags) = get_crate_cflags() {
             set_env_for_target("CFLAGS", cflags);
         }
+        export_crate_compilers();
 
         let mut cc_build = self.create_builder();
         let (_, build_options) = self.collect_universal_build_options(&cc_build, false);
@@ -468,7 +462,35 @@ impl CcBuilder {
         }
     }
 
-    fn prepare_jitter_entropy_builder(&self, is_cl_like: bool) -> cc::Build {
+    /// Compiles jitterentropy at `-O0`. The CFLAGS guards span the builder's whole
+    /// lifetime because which `cc` call first reads the environment varies by
+    /// release (#1064, #1252).
+    fn compile_jitter_entropy(
+        &self,
+        is_cl_like: bool,
+        sources: &[PathBuf],
+    ) -> Result<Vec<PathBuf>, cc::Error> {
+        let je_cflags_guards = Self::jitter_entropy_cflags_guards(is_cl_like);
+        let mut je_builder = self.prepare_jitter_entropy_builder(&je_cflags_guards, is_cl_like);
+        je_builder.flag(format!(
+            "{}{}",
+            if is_cl_like { "/FI" } else { "--include=" },
+            self.manifest_dir
+                .join("generated-include")
+                .join("openssl")
+                .join("boringssl_prefix_symbols.h")
+                .display()
+        ));
+        je_builder.files(sources);
+        je_builder.try_compile_intermediates()
+    }
+
+    /// The returned builder must not outlive `_cflags_guards`.
+    fn prepare_jitter_entropy_builder(
+        &self,
+        _cflags_guards: &JitterEntropyCflagsGuards,
+        is_cl_like: bool,
+    ) -> cc::Build {
         // See: https://github.com/aws/aws-lc/blob/2294510cd0ecb2d5946461e3dbb038363b7b94cb/third_party/jitterentropy/CMakeLists.txt#L19-L35
         let mut build_options: Vec<BuildOption> = Vec::new();
         self.add_includes(&mut build_options);
@@ -576,7 +598,7 @@ impl CcBuilder {
     ///
     /// Every variable cc reads must be filtered (see `cflags_env_names`); missing
     /// the raw-triple spelling was <https://github.com/aws/aws-lc-rs/issues/1205>.
-    fn jitter_entropy_cflags_guards(is_cl_like: bool) -> Vec<EnvGuard> {
+    fn jitter_entropy_cflags_guards(is_cl_like: bool) -> JitterEntropyCflagsGuards {
         // Jitterentropy may be cross-compiled, so include TARGET_CFLAGS too.
         let cflags_env_names = cflags_env_names(true);
 
@@ -595,13 +617,15 @@ impl CcBuilder {
             }
         };
 
-        cflags_env_names
-            .into_iter()
-            .filter_map(|name| {
-                let value = env::var(&name).ok()?;
-                Some(EnvGuard::new(&name, filter_cflags(&value)))
-            })
-            .collect()
+        JitterEntropyCflagsGuards(
+            cflags_env_names
+                .into_iter()
+                .filter_map(|name| {
+                    let value = env::var(&name).ok()?;
+                    Some(EnvGuard::new(&name, filter_cflags(&value)))
+                })
+                .collect(),
+        )
     }
 
     fn add_all_files(&self, sources: &[&'static str], cc_build: &mut cc::Build) {
@@ -622,20 +646,8 @@ impl CcBuilder {
         s2n_bignum_builder.define("S2N_BN_HIDE_SYMBOLS", "1");
 
         // CPU Jitter Entropy is compiled separately due to needing specific flags.
-        // Only set up the builder if jitter entropy is actually going to be built.
-        let mut jitter_entropy_builder = should_build_jitter_entropy().then(|| {
-            let mut jitter_entropy_builder = self.prepare_jitter_entropy_builder(is_cl_like);
-            jitter_entropy_builder.flag(format!(
-                "{}{}",
-                force_include_option,
-                self.manifest_dir
-                    .join("generated-include")
-                    .join("openssl")
-                    .join("boringssl_prefix_symbols.h")
-                    .display()
-            ));
-            jitter_entropy_builder
-        });
+        let build_jitter_entropy = should_build_jitter_entropy();
+        let mut jitter_entropy_sources: Vec<PathBuf> = Vec::new();
 
         let mut build_options = vec![];
         self.add_includes(&mut build_options);
@@ -690,8 +702,8 @@ impl CcBuilder {
                 }
             } else if is_jitter_entropy {
                 // Only compile if not disabled.
-                if let Some(builder) = jitter_entropy_builder.as_mut() {
-                    builder.file(source_path);
+                if build_jitter_entropy {
+                    jitter_entropy_sources.push(source_path);
                 }
             } else if source_path.extension() == Some("asm".as_ref()) {
                 nasm_builder.file(source_path);
@@ -704,9 +716,10 @@ impl CcBuilder {
         for object in s2n_bignum_object_files {
             cc_build.object(object);
         }
-        if let Some(builder) = jitter_entropy_builder {
-            let _je_cflags_guards = Self::jitter_entropy_cflags_guards(is_cl_like);
-            let jitter_entropy_object_files = builder.compile_intermediates();
+        if build_jitter_entropy {
+            let jitter_entropy_object_files = self
+                .compile_jitter_entropy(is_cl_like, &jitter_entropy_sources)
+                .unwrap_or_else(|e| panic!("Failed to compile jitterentropy: {e}"));
             for object in jitter_entropy_object_files {
                 cc_build.object(object);
             }
@@ -997,6 +1010,10 @@ fn cflags_env_names(include_target_prefixed: bool) -> Vec<String> {
     names.push("CFLAGS".to_string());
     names
 }
+
+/// Filtered `CFLAGS` overrides for the jitterentropy build, restored on drop. A
+/// distinct type so only these guards satisfy `prepare_jitter_entropy_builder`.
+struct JitterEntropyCflagsGuards(#[allow(dead_code)] Vec<EnvGuard>);
 
 /// Temporarily removes every `CFLAGS`-family env var the cc crate consults (see its
 /// `target_envs`), so that `cc::Build::get_compiler()` computes only the target's
@@ -1394,6 +1411,149 @@ mod tests {
         assert_eq!(env::var("HOST_CFLAGS").unwrap(), "-Ofast -fhost");
         assert_eq!(env::var("TARGET_CFLAGS").unwrap(), "-Os -ftarget");
         assert_eq!(env::var("CFLAGS").unwrap(), "-O1 -fbase");
+    }
+
+    // Guards #1252 and #1064: user CFLAGS optimization must not reach the jitter
+    // compile. GNU-mode compilers only, since `__OPTIMIZE__` is GNU/clang-only.
+    #[test]
+    fn test_jitter_entropy_compiles_unoptimized_despite_user_cflags() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(host) = host_triple() else {
+            return;
+        };
+        let parts: Vec<&str> = host.split('-').collect();
+        let target_env = ["msvc", "gnu", "musl"]
+            .into_iter()
+            .find(|env| host.ends_with(env))
+            .unwrap_or("");
+        let temp_out = tempfile::tempdir().unwrap();
+        let manifest_dir = tempfile::tempdir().unwrap();
+        let target_u = host.replace(['-', '.'], "_");
+        let _guards = [
+            EnvGuard::new("OUT_DIR", temp_out.path()),
+            EnvGuard::new("TARGET", &host),
+            EnvGuard::new("HOST", &host),
+            EnvGuard::new("CARGO_CFG_TARGET_OS", std::env::consts::OS),
+            EnvGuard::new("CARGO_CFG_TARGET_ARCH", std::env::consts::ARCH),
+            EnvGuard::new("CARGO_CFG_TARGET_VENDOR", parts[1]),
+            EnvGuard::new("CARGO_CFG_TARGET_ENV", target_env),
+            EnvGuard::new("OPT_LEVEL", "0"),
+            EnvGuard::new("DEBUG", "false"),
+            EnvGuard::new("CFLAGS", "-O2"),
+            EnvGuard::new(format!("CFLAGS_{target_u}").as_str(), "-O2"),
+        ];
+        {
+            let _cflags_guards = cflags_ignore_guards();
+            match cc::Build::new().try_get_compiler() {
+                Ok(compiler) if !compiler_is_cl_like(&compiler) => {}
+                _ => return,
+            }
+        }
+
+        let header_dir = manifest_dir
+            .path()
+            .join("generated-include")
+            .join("openssl");
+        std::fs::create_dir_all(&header_dir).unwrap();
+        std::fs::write(header_dir.join("boringssl_prefix_symbols.h"), "").unwrap();
+        let source = manifest_dir.path().join("jitter_opt_check.c");
+        std::fs::write(
+            &source,
+            "#ifdef __OPTIMIZE__\n#error \"jitterentropy compiled with optimizations\"\n#endif\nint jitter_opt_check(void) { return 0; }\n",
+        )
+        .unwrap();
+
+        let builder = CcBuilder::new(
+            manifest_dir.path().to_path_buf(),
+            temp_out.path().to_path_buf(),
+            None,
+            OutputLibType::Static,
+        );
+        let result = builder.compile_jitter_entropy(false, &[source]);
+        assert_eq!(
+            env::var("CFLAGS").unwrap(),
+            "-O2",
+            "CFLAGS must be restored"
+        );
+        let objects = result.unwrap_or_else(|e| {
+            panic!("user CFLAGS optimization reached the jitterentropy compile: {e}")
+        });
+        assert_eq!(objects.len(), 1);
+    }
+
+    // `AWS_LC_SYS_CC` must reach the main library build, not only jitterentropy's
+    // separate `cc::Build`. The override is a symlink to the default compiler named
+    // `cc` (the macOS xcrun shim dispatches on its name), so it still works but has
+    // a distinct path. Only cc releases that cache env reads per `Build` (e.g.
+    // 1.2.41, 1.6.0) can detect a late export.
+    #[cfg(unix)]
+    #[test]
+    fn test_crate_cc_reaches_main_builder() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(host) = host_triple() else {
+            return;
+        };
+        let parts: Vec<&str> = host.split('-').collect();
+        let target_env = ["gnu", "musl"]
+            .into_iter()
+            .find(|env| host.ends_with(env))
+            .unwrap_or("");
+        let temp_out = tempfile::tempdir().unwrap();
+        let manifest_dir = tempfile::tempdir().unwrap();
+        let target_u = host.to_lowercase().replace('-', "_");
+        let mut guards = vec![
+            EnvGuard::new("OUT_DIR", temp_out.path()),
+            EnvGuard::new("TARGET", &host),
+            EnvGuard::new("HOST", &host),
+            EnvGuard::new("CARGO_PKG_NAME", "aws-lc-sys"),
+            EnvGuard::new("CARGO_CFG_TARGET_OS", std::env::consts::OS),
+            EnvGuard::new("CARGO_CFG_TARGET_ARCH", std::env::consts::ARCH),
+            EnvGuard::new("CARGO_CFG_TARGET_VENDOR", parts[1]),
+            EnvGuard::new("CARGO_CFG_TARGET_ENV", target_env),
+            EnvGuard::new("OPT_LEVEL", "0"),
+            EnvGuard::new("DEBUG", "false"),
+        ];
+        // Isolate both cc-rs and crate-specific compiler overrides. Guard CFLAGS
+        // too: prepare_builder can export it into the target-specific environment.
+        for name in ["CC", "HOST_CC", "CXX", "HOST_CXX", "CFLAGS", "HOST_CFLAGS"] {
+            for prefix in ["", "AWS_LC_SYS_"] {
+                let name = format!("{prefix}{name}");
+                for key in [
+                    name.clone(),
+                    format!("{name}_{host}"),
+                    format!("{name}_{target_u}"),
+                ] {
+                    guards.push(EnvGuard::remove(&key));
+                }
+            }
+        }
+        let Ok(default_cc) = cc::Build::new().try_get_compiler() else {
+            return;
+        };
+        let Some(default_cc_path) = env::var_os("PATH").and_then(|path| {
+            env::split_paths(&path)
+                .map(|dir| dir.join(default_cc.path()))
+                .find(|candidate| candidate.is_file())
+        }) else {
+            return;
+        };
+        let crate_cc = manifest_dir.path().join("cc");
+        std::os::unix::fs::symlink(default_cc_path, &crate_cc).unwrap();
+        // Drop the override before restoring any inherited AWS_LC_SYS_CC.
+        let _crate_cc_guard = EnvGuard::new("AWS_LC_SYS_CC", &crate_cc);
+
+        let builder = CcBuilder::new(
+            manifest_dir.path().to_path_buf(),
+            temp_out.path().to_path_buf(),
+            None,
+            OutputLibType::Static,
+        );
+        let cc_build = builder.prepare_builder();
+        assert_eq!(
+            cc_build.get_compiler().path(),
+            crate_cc,
+            "AWS_LC_SYS_CC must select the main library's compiler"
+        );
     }
 
     // cc 1.2.26 replaces only `-` in `target_envs`, while newer versions replace

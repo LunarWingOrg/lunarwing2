@@ -34,6 +34,12 @@ pub enum SymlinkExtractAction {
     #[cfg(any(unix, windows))]
     ExtractInFolder,
     /// Extract symlinks with no restrictions.
+    ///
+    /// On Windows, creating a symlink requires that we know whether the target is a file or directory.
+    /// To determine that, this option will open the file metadata of the target path, which will
+    /// cause NTLMv2 authentication to be sent if the target is on an SMB network share. This may be a security risk,
+    /// because it allows relay attacks and offline cracking. WebDAV is also vulnerable, but only when a file
+    /// host in the Intranet Zone is already compromised.
     #[cfg(any(unix, windows))]
     ExtractNoRestrictions,
 }
@@ -43,6 +49,8 @@ pub enum SymlinkExtractAction {
 #[non_exhaustive]
 pub struct ExtractOptions {
     pub(crate) symlink_action: SymlinkExtractAction,
+    pub(crate) size_limit: Option<u64>,
+    pub(crate) enforce_header_consistency: bool,
 }
 
 impl ExtractOptions {
@@ -51,6 +59,24 @@ impl ExtractOptions {
     pub fn symlink_action(self, symlink_action: SymlinkExtractAction) -> Self {
         Self {
             symlink_action,
+            ..self
+        }
+    }
+
+    /// Set the maximum declared uncompressed size accepted for extraction.
+    #[must_use]
+    pub fn with_size_limit(self, size_limit: u64) -> Self {
+        Self {
+            size_limit: Some(size_limit),
+            ..self
+        }
+    }
+
+    /// Enforce consistency between local file headers and central directory headers during extraction.
+    #[must_use]
+    pub fn enforce_header_consistency(self, enforce: bool) -> Self {
+        Self {
+            enforce_header_consistency: enforce,
             ..self
         }
     }
@@ -256,7 +282,8 @@ pub(crate) fn set_permissions_no_follow_symlink(
             use nix::sys::stat::{FchmodatFlags, Mode, fchmodat};
             use std::os::unix::fs::PermissionsExt;
 
-            let mode = Mode::from_bits_truncate(mode.mode() as u16);
+            // `mode_t` is `u16` on macOS, FreeBSD and DragonFly, but `u32` on NetBSD and OpenBSD.
+            let mode = Mode::from_bits_truncate(mode.mode() as nix::libc::mode_t);
 
             // Use fchmodat with the flag telling it NOT to follow the symlink
             fchmodat(AT_FDCWD, path, mode, FchmodatFlags::NoFollowSymlink)?;
@@ -325,6 +352,11 @@ impl<R: Read + Seek> ZipArchive<R> {
     /// may be left on disk. However, on Unix targets, no newly-created directories with part but
     /// not all of their contents extracted will be readable, writable or usable as process working
     /// directories by any non-root user except you.
+    ///
+    /// Extraction is also not atomic in term of permissions. Permissions are applied after the
+    /// extraction (because some folder have stricter permissions when we cannot access it). That
+    /// means, for a moment, a file could be created with default permissions (and then changed
+    /// to the correct one). On Unix this only applies to directories and symlinks.
     ///
     /// On Unix and Windows, symbolic links are extracted correctly. On other platforms such as
     /// WebAssembly, symbolic links aren't supported, so they're extracted as normal files
@@ -419,6 +451,20 @@ impl<R: Read + Seek> ZipArchive<R> {
     ) -> ZipResult<()> {
         use std::fs;
 
+        if extract_options.enforce_header_consistency {
+            self.validate_header_consistency()?;
+        }
+
+        if let Some(limit) = extract_options.size_limit {
+            match self.decompressed_size() {
+                Some(size) if size > u128::from(limit) => {
+                    return Err(ZipError::DecompressedSizeLimitExceeded { size, limit });
+                }
+                None => return Err(ZipError::DecompressedSizeUnknown),
+                Some(_) => {}
+            }
+        }
+
         fs::create_dir_all(&directory)?;
         let directory = directory.as_ref().canonicalize()?;
 
@@ -449,7 +495,9 @@ impl<R: Read + Seek> ZipArchive<R> {
         let mut files_by_unix_mode = UnixFileModes::default();
 
         for i in 0..self.len() {
-            let mut file = self.by_index(i)?;
+            let read_options = crate::read::ZipReadOptions::new()
+                .enforce_header_consistency(extract_options.enforce_header_consistency);
+            let mut file = self.by_index_with_options(i, read_options)?;
 
             let mut outpath = directory.clone();
             /* TODO: the control flow of this method call and subsequent expectations about the
@@ -521,8 +569,21 @@ impl<R: Read + Seek> ZipArchive<R> {
                     files_by_unix_mode.add_mode(outpath, mode);
                 }
             } else {
-                let mut outfile = fs::File::create(&outpath)?;
+                let mut options = fs::OpenOptions::new();
+                options.create(true).write(true).truncate(true); // Default for `fs::File::create`
+                #[cfg(unix)]
+                if let Some(mode) = file.unix_mode() {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(mode);
+                }
+                let mut outfile = options.open(&outpath)?;
                 io::copy(&mut file, &mut outfile)?;
+                #[cfg(unix)]
+                if let Some(mode) = file.unix_mode() {
+                    // OpenOptions::mode only applies when the file is created. Record modes
+                    // for the final pass too, so overwriting an existing path updates them.
+                    files_by_unix_mode.add_mode(outpath, mode);
+                }
                 // Set original timestamp.
                 #[cfg(feature = "chrono")]
                 if let Some(last_modified) = file.last_modified()
@@ -535,11 +596,6 @@ impl<R: Read + Seek> ZipArchive<R> {
                     let mut permissions = outfile.metadata()?.permissions();
                     permissions.set_readonly(true);
                     outfile.set_permissions(permissions)?;
-                }
-                #[cfg(unix)]
-                if let Some(mode) = file.unix_mode() {
-                    use std::os::unix::fs::PermissionsExt;
-                    outfile.set_permissions(fs::Permissions::from_mode(mode))?;
                 }
             }
         }

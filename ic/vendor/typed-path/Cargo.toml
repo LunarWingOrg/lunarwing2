@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.65.0"
 name = "typed-path"
-version = "0.12.3"
+version = "0.13.0"
 authors = ["Chip Senkbeil <chip@senkbeil.org>"]
 build = false
 autolib = false
@@ -40,6 +40,8 @@ repository = "https://github.com/chipsenkbeil/typed-path"
 
 [features]
 default = ["std"]
+nightly-wasip2 = ["std"]
+serde = ["dep:serde_core"]
 std = []
 
 [lib]
@@ -84,4 +86,11 @@ name = "windows_utf8"
 path = "examples/windows_utf8.rs"
 required-features = ["std"]
 
-[dependencies]
+[dependencies.serde_core]
+version = "1"
+features = ["alloc"]
+optional = true
+default-features = false
+
+[dev-dependencies.serde_json]
+version = "1"

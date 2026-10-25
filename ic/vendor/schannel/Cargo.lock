@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "schannel"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "windows-sys",
 ]

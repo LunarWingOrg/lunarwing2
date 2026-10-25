@@ -118,6 +118,10 @@ fn unicode_escapes() {    check!(c"\u{b} ", true, None);
 
 #[test]
 fn string_continue() {
+    check!(c"\
+        foo", true, None);
+    check!(c"\
+", true, None);
     check!(c"foo\
         bar", true, None);
     check!(c"foo\
@@ -165,11 +169,22 @@ fn raw_c_string() {
 }
 
 #[test]
+fn raw_c_string_max_hashes() {
+    let input = format!("cr{h}\"peter\"{h}", h = "#".repeat(255));
+    check!(c"peter", &*input, false, Some(255), "");
+
+    let input = format!("cr{h}\"peter\"{h}", h = "#".repeat(256));
+    assert_err_single!(CStringLit::parse(&*input), TooManyHashes, 2..258);
+    assert_err_single!(Literal::parse(&*input), TooManyHashes, 2..258);
+}
+
+#[test]
 fn suffixes() {
     check!(c"hello", r###"c"hello"suffix"###, false, None, "suffix");
     check!(c"fox", r#"c"fox"peter"#, false, None, "peter");
     check!(c"a\x0cb\\", r#"c"a\x0cb\\"_jürgen"#, true, None, "_jürgen");
     check!(cr"a\x0cb\\", r###"cr#"a\x0cb\\"#_jürgen"###, false, Some(1), "_jürgen");
+    check!(c"a\nb", r#"c"a\nb"_josé"#, true, None, "_josé");
 }
 
 #[test]
@@ -178,6 +193,7 @@ fn parse_err() {
     assert_err!(CStringLit, r#"c"cat"#, UnterminatedString, None);
     assert_err!(CStringLit, r#"c"Jurgen"#, UnterminatedString, None);
     assert_err!(CStringLit, r#"c"foo bar baz"#, UnterminatedString, None);
+    assert_err!(CStringLit, r#"c"\nJosé"#, UnterminatedString, None);
 
     assert_err!(CStringLit, r#"c"fox"peter""#, InvalidSuffix, 6);
     assert_err!(CStringLit, r###"cr#"foo "# bar"#"###, UnexpectedChar, 10);
@@ -219,4 +235,5 @@ fn invalid_escapes() {
     assert_err!(CStringLit, r#"c"foo\x1""#, UnterminatedEscape, 5..8);
     assert_err!(CStringLit, r#"c" \xaj""#, InvalidXEscape, 3..7);
     assert_err!(CStringLit, r#"c"\xjbbaz""#, InvalidXEscape, 2..6);
+    assert_err!(CStringLit, r#"c"\u{}""#, InvalidStartOfUnicodeEscape, 5);
 }

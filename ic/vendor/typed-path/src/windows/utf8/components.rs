@@ -54,9 +54,18 @@ impl<'a> Utf8Components<'a> for Utf8WindowsComponents<'a> {
     }
 
     /// Returns true only if the path represented by the components
-    /// has a prefix followed by a root directory
+    /// has a prefix followed by a root directory, or a UNC prefix
+    /// alone.
     ///
-    /// e.g. `C:\some\path` -> true, `C:some\path` -> false
+    /// A disk prefix alone is not absolute, because Windows treats
+    /// such a path (e.g. `C:file.txt`) as relative to a per-disk
+    /// current working directory, as a historical relic of MS-DOS.
+    /// However, a complete UNC prefix (e.g. `\\server\share`) is
+    /// absolute, because it is equivalent to the same path with a
+    /// trailing `\` when pushing path components.
+    ///
+    /// e.g. `C:\some\path` -> true, `C:some\path` -> false,
+    ///      `\\some.server\share` -> true, `\\some.server` -> false
     fn is_absolute(&self) -> bool {
         self.inner.is_absolute()
     }
