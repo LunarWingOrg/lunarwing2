@@ -117,6 +117,10 @@ fn non_ascii_escapes() {
 
 #[test]
 fn string_continue() {
+    check!(b"\
+        foo", true, None);
+    check!(b"\
+", true, None);
     check!(b"foo\
         bar", true, None);
     check!(b"foo\
@@ -164,11 +168,22 @@ fn raw_byte_string() {
 }
 
 #[test]
+fn raw_byte_string_max_hashes() {
+    let input = format!("br{h}\"peter\"{h}", h = "#".repeat(255));
+    check!(b"peter", &*input, false, Some(255), "");
+
+    let input = format!("br{h}\"peter\"{h}", h = "#".repeat(256));
+    assert_err_single!(ByteStringLit::parse(&*input), TooManyHashes, 2..258);
+    assert_err_single!(Literal::parse(&*input), TooManyHashes, 2..258);
+}
+
+#[test]
 fn suffixes() {
     check!(b"hello", r###"b"hello"suffix"###, false, None, "suffix");
     check!(b"fox", r#"b"fox"peter"#, false, None, "peter");
     check!(b"a\x0cb\\", r#"b"a\x0cb\\"_jürgen"#, true, None, "_jürgen");
     check!(br"a\x0cb\\", r###"br#"a\x0cb\\"#_jürgen"###, false, Some(1), "_jürgen");
+    check!(b"a\nb", r#"b"a\nb"_josé"#, true, None, "_josé");
 }
 
 #[test]
@@ -198,6 +213,7 @@ fn parse_err() {
 fn non_ascii() {
     assert_err!(ByteStringLit, r#"b"న""#, NonAsciiInByteLiteral, 2);
     assert_err!(ByteStringLit, r#"b"foo犬""#, NonAsciiInByteLiteral, 5);
+    assert_err!(ByteStringLit, r#"b"\nJosé"#, NonAsciiInByteLiteral, 7);
     assert_err!(ByteStringLit, r#"b"x🦊baz""#, NonAsciiInByteLiteral, 3);
     assert_err!(ByteStringLit, r#"br"న""#, NonAsciiInByteLiteral, 3);
     assert_err!(ByteStringLit, r#"br"foo犬""#, NonAsciiInByteLiteral, 6);

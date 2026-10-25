@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "json5"
-version = "1.3.1"
+version = "1.3.4"
 authors = ["Callum Oakley <hello@callumoakley.net>"]
 build = false
 autolib = false

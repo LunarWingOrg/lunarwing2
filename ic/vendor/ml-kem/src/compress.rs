@@ -39,7 +39,8 @@ impl Compress for Elem {
         const Q_HALF: u64 = (BaseField::QLL + 1) >> 1;
         let x = u64::from(self.0);
         let y = (((x << D::USIZE) + Q_HALF) * D::DIV_MUL) >> D::DIV_SHIFT;
-        self.0 = u16::truncate(y) & D::MASK;
+        let y: u16 = Truncate::truncate(y);
+        self.0 = y & D::MASK;
         self
     }
 

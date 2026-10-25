@@ -1,5 +1,5 @@
 {
-  "version": "0.4.6",
+  "version": "0.4.7",
   "wit_version": "0.3.0",
   "description": "Compress, expand, measure, or restyle prose with Cavepony modes, including Tony Soprano-inspired speech. Pure local text transformation; no network, filesystem, environment, or secret access.",
   "license": "MIT",

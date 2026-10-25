@@ -19,9 +19,6 @@ macro_rules! platform_binding {
     };
 }
 
-platform_binding!(universal_prefixed, universal_prefixed_crypto);
-platform_binding!(universal_no_u1_prefixed, universal_no_u1_prefixed_crypto);
-platform_binding!(universal_no_u1, universal_no_u1_crypto);
 platform_binding!(universal, universal_crypto);
 
 platform_binding!(aarch64_linux_android, aarch64_linux_android_crypto);
@@ -53,7 +50,7 @@ platform_binding!(x86_64_unknown_linux_musl, x86_64_unknown_linux_musl_crypto);
     clippy::doc_markdown,
     clippy::missing_safety_doc,
     clippy::must_use_candidate,
-    clippy::not_unsafe_ptr_arg_deref,
+    clippy::possible_missing_else,
     clippy::ptr_as_ptr,
     clippy::ptr_offset_with_cast,
     clippy::pub_underscore_fields,

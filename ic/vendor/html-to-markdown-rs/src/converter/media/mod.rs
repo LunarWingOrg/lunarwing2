@@ -24,6 +24,24 @@ pub struct MediaContext<'a> {
     pub dom_ctx: &'a super::DomContext,
 }
 
+/// Keep a rendered media label distinct from its adjacent text after visitors and captures. ~keep
+pub(in crate::converter) fn record_text_label(label: &str, ctx: &super::Context) {
+    if !label.chars().any(char::is_alphanumeric) {
+        return;
+    }
+    let Some(first_edge) = label.chars().next() else {
+        return;
+    };
+    if let Some(boundary) = ctx.media_boundary.as_ref() {
+        boundary.set(super::context::MediaBoundaryState {
+            pending: true,
+            first_edge: Some(first_edge),
+            last_edge: label.chars().next_back(),
+            first_is_media: true,
+        });
+    }
+}
+
 /// Whether `address` is a `data:` URL, which carries its content inline. The scheme matches in
 /// any case, after leading whitespace, as a URL parser reads it.
 pub fn is_inline_data(address: &str) -> bool {
@@ -76,9 +94,6 @@ pub fn first_address<T: AsRef<str>>(choice: InlineDataMedia, addresses: impl Int
 /// | Tag(s) | Handler | Description |
 /// |--------|---------|-------------|
 /// | `iframe` | embedded | Embedded content frames |
-/// | `video` | embedded | Video elements |
-/// | `audio` | embedded | Audio elements |
-/// | `picture` | embedded | Responsive image containers |
 /// | `svg` | svg | SVG image elements |
 /// | `math` | svg | `MathML` elements |
 ///
@@ -103,18 +118,6 @@ pub fn dispatch_media_handler(
     match tag_name {
         "iframe" => {
             embedded::handle_iframe(node_handle, tag, parser, output, context);
-            true
-        }
-        "video" => {
-            embedded::handle_video(node_handle, tag, parser, output, context);
-            true
-        }
-        "audio" => {
-            embedded::handle_audio(node_handle, tag, parser, output, context);
-            true
-        }
-        "picture" => {
-            embedded::handle_picture(node_handle, tag, parser, output, context);
             true
         }
         "svg" => {

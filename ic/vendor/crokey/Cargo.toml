@@ -11,9 +11,9 @@
 
 [package]
 edition = "2021"
-rust-version = "1.56"
+rust-version = "1.71"
 name = "crokey"
-version = "1.5.0"
+version = "1.5.1"
 authors = ["dystroy <denys.seguret@gmail.com>"]
 build = false
 autolib = false
@@ -47,7 +47,7 @@ name = "hygiene"
 path = "tests/hygiene.rs"
 
 [dependencies.crokey-proc_macros]
-version = "1.5.0"
+version = "1.5.1"
 
 [dependencies.crossterm]
 version = "0.29"

@@ -1,17 +1,24 @@
-## [4.6.8](https://github.com/gluon-lang/gluon/compare/v4.6.7..4.6.8) - 2026-08-25
+## [4.6.9](https://github.com/Marwes/combine/compare/v4.6.8..v4.6.9) - 2026-10-15
 
 ### Bug Fixes
 
-- usage of `BytesMut` in `extend_buf_sync` - ([b705882](https://github.com/gluon-lang/gluon/commit/b705882f725c18b4c767864a2e7830c5551083ad)) - Paolo Barbolini
+- Handle partial parsing in parsers based on TokensCmp - ([c8742a5](https://github.com/Marwes/combine/commit/c8742a59452e20f16d92d95b30b7a88390e7aa0a)) - Markus Westerlind
+- Make count/length_prefix/escaped handle partial parsing correctly - ([148333e](https://github.com/Marwes/combine/commit/148333ec4a9715e387644757b1b5b93cb12da4e7)) - Markus Westerlind
+
+## [4.6.8](https://github.com/Marwes/combine/compare/v4.6.7..v4.6.8) - 2026-08-25
+
+### Bug Fixes
+
+- usage of `BytesMut` in `extend_buf_sync` - ([b705882](https://github.com/Marwes/combine/commit/b705882f725c18b4c767864a2e7830c5551083ad)) - Paolo Barbolini
 
 ### Documentation
 
-- Add documentation to no_partial - ([b3c770f](https://github.com/gluon-lang/gluon/commit/b3c770f9bd43db7b4197225566bf9d951887c2b3)) - Markus Westerlind
-- Use from_str in examples/async.rs - ([8068d6c](https://github.com/gluon-lang/gluon/commit/8068d6c472d390fd129cd7da631125bcfe2d3cc5)) - Markus Westerlind
+- Add documentation to no_partial - ([b3c770f](https://github.com/Marwes/combine/commit/b3c770f9bd43db7b4197225566bf9d951887c2b3)) - Markus Westerlind
+- Use from_str in examples/async.rs - ([8068d6c](https://github.com/Marwes/combine/commit/8068d6c472d390fd129cd7da631125bcfe2d3cc5)) - Markus Westerlind
 
 ### Parser/combinator
 
-- Drop superfluous semicolon in `opaque` - ([6a3701d](https://github.com/gluon-lang/gluon/commit/6a3701d742a80d40cf7907f336c34599821a3353)) - Christian Aistleitner
+- Drop superfluous semicolon in `opaque` - ([6a3701d](https://github.com/Marwes/combine/commit/6a3701d742a80d40cf7907f336c34599821a3353)) - Christian Aistleitner
 
 <a name="v4.6.7"></a>
 ### v4.6.7 (2024-04-10)

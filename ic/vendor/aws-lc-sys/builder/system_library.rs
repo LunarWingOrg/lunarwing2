@@ -309,9 +309,9 @@ impl SystemLib {
             resolve_bindings(self.layout.bindings_prefix.as_deref(), &self.bindings_file)?;
 
         if is_fips_build() {
-            // Verify the supplied FIPS library is a usable FIPS module before
-            // committing to it. The matching startup self-check link directive
-            // is emitted later, in `link`.
+            // This may execute code from the trusted FIPS candidate before
+            // validation completes. See `system_detect` for the trust model. The
+            // matching startup self-check link directive is emitted in `link`.
             verify_fips_install(
                 self.manifest_dir.as_path(),
                 include_dir,
@@ -392,7 +392,8 @@ impl SystemLib {
         println!("cargo:libcrypto={}", crypto_lib.name);
         println!("cargo:libcrypto_path={}", crypto_lib.path.display());
         println!("cargo:link_kind={kind}");
-        println!("cargo:rustc-link-lib={kind}={}", crypto_lib.name);
+        let crypto_kind = crypto_link_kind(&crypto_lib.lib_type, is_fips_build());
+        println!("cargo:rustc-link-lib={crypto_kind}={}", crypto_lib.name);
         if let Some(ssl_lib) = optional_ssl_lib.as_ref() {
             // `link_kind` (above) describes libcrypto. Without a requested lib
             // type the two libraries could in principle resolve to different
@@ -423,17 +424,29 @@ impl SystemLib {
     }
 }
 
+fn crypto_link_kind(lib_type: &OutputLibType, fips_build: bool) -> &str {
+    if fips_build && *lib_type == OutputLibType::Static {
+        // rustc links the packed +whole-archive runtime check after the rlibs.
+        // Ordinary bundling puts crypto in an earlier rlib, where a one-pass
+        // linker can miss FIPS_mode when LTO removes the Rust references. Pack
+        // crypto too, so it follows the check. Unlike -bundle, this also keeps
+        // the native library in downstream Rust staticlib outputs.
+        "static:+whole-archive"
+    } else {
+        lib_type.rust_lib_type()
+    }
+}
+
 // =============================================================================
 // Header validation / version extraction
 // =============================================================================
 
 /// Minimum AWS-LC (mainline) version supported via the system-library path,
-/// for the non-FIPS `aws-lc-sys` crate. `1.68.0` is the first release that can
-/// emit Rust bindings (`-DGENERATE_RUST_BINDINGS=ON`), which the
-/// system-library path consumes. A declared floor (not derived from the
-/// bundled submodule) whose support is proven by CI; bump it and the CI pin
-/// together. See `.github/workflows/system-lib-tests.yml`.
-const MINIMUM_AWS_LC_VERSION: &str = "1.68.0";
+/// for the non-FIPS `aws-lc-sys` crate.
+/// A declared floor (not derived from the bundled submodule) whose support is
+/// proven by CI; bump it and the CI pin together.
+/// See `.github/workflows/system-lib-tests.yml`.
+const MINIMUM_AWS_LC_VERSION: &str = "5.7.0";
 
 /// Minimum AWS-LC FIPS *module* version supported via the system-library path,
 /// for `aws-lc-fips-sys`. The FIPS version (aws/aws-lc#3211) is decoupled from
