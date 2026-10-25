@@ -629,13 +629,23 @@ class InstalledWrapperTests(unittest.TestCase):
         # The scenarios above call the function directly (GD-3: the image
         # build is the only place --image-filesystem runs, and it is a
         # protected-pipeline gate) — pin the main() wiring so the check
-        # cannot be dropped from the shipped invocation unnoticed.
+        # cannot be dropped from the shipped invocation unnoticed. The
+        # --image-root branch (WI#425 out-of-band verification in CI) points
+        # the same check at an unpacked BuildKit export, with no live PATH.
         source = ASSERT.read_text(encoding="utf-8")
         wiring = (
             "    if args.image_filesystem:\n"
             "        check_image_filesystem(lane)\n"
             "        if is_v2:\n"
-            "            check_installed_wrapper(lane)\n"
+            "            if args.image_root is not None:\n"
+            "                check_installed_wrapper(\n"
+            "                    lane,\n"
+            "                    args.image_root / \"usr/local/bin/opencode\",\n"
+            "                    args.image_root / \"usr/local/lib/opencode2/opencode\",\n"
+            "                    check_path_resolution=False,\n"
+            "                )\n"
+            "            else:\n"
+            "                check_installed_wrapper(lane)\n"
         )
         self.assertIn(wiring, source)
 
