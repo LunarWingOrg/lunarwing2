@@ -172,8 +172,13 @@ _worker_egress_gateway() {  # <subnet e.g. 10.89.12.0/24>
 # and are translated to the tenant network's gateway — the only host address
 # reachable from a rootless worker.
 _worker_egress_split_target() {  # <target> <require-port: true|false>
-  local target="$1" require_port="${2:-false}" authority host port
-  authority="${target#*://}"
+  local target="$1" require_port="${2:-false}" scheme="" authority host port
+  if [[ "$target" == *"://"* ]]; then
+    scheme="${target%%://*}"
+    authority="${target#*://}"
+  else
+    authority="$target"
+  fi
   authority="${authority%%/*}"
   [[ "$authority" == *"@"* ]] && authority="${authority##*@}"
   case "$authority" in
@@ -184,6 +189,15 @@ _worker_egress_split_target() {  # <target> <require-port: true|false>
     *)        host="$authority"; port="" ;;
   esac
   [[ -n "$host" ]] || return 1
+  if [[ -z "$port" ]] && [[ -n "$scheme" ]]; then
+    # A URL without an explicit port uses the scheme default (HTTP semantics);
+    # refusing it would drop a tenant's whole LLM endpoint from the allowlist.
+    case "$scheme" in
+      http) port=80 ;;
+      https) port=443 ;;
+      *) return 1 ;;
+    esac
+  fi
   if [[ -n "$port" ]]; then
     [[ "$port" =~ ^[0-9]+$ ]] && ((port > 0 && port < 65536)) || return 1
   elif [[ "$require_port" == "true" ]]; then
@@ -213,10 +227,20 @@ _worker_egress_host_addrs() {  # <gateway>
   done
 }
 
-_worker_egress_resolve_target() {  # <url-or-host:port> <gateway>
-  local target="$1" gateway="$2" host port answer address split
+# <url-or-host:port> <gateway> [strict]
+#
+# `strict` decides what an unresolvable hostname means:
+#   * operator entries (strict): die — the operator asked for this destination
+#     explicitly, so a typo or a dead DNS server must be loud, not quietly
+#     dropped from their allowlist;
+#   * tenant-derived LLM endpoints (non-strict): warn and omit. Omitting a
+#     target can only NARROW the allowlist (the worker then cannot reach that
+#     endpoint and says so), so a transient resolver failure at boot must not
+#     take the worker down; the warning keeps it visible.
+_worker_egress_resolve_target() {  # <target> <gateway> [strict]
+  local target="$1" gateway="$2" strict="${3:-false}" host port answer address split
   split="$(_worker_egress_split_target "$target" true)" \
-    || die "invalid worker egress target '$target' (host:port required)"
+    || die "invalid worker egress target '$target' (host:port or http(s) URL required)"
   read -r host port <<<"$split"
   case "$host" in
     127.0.0.1|localhost|0.0.0.0|::1)
@@ -227,10 +251,15 @@ _worker_egress_resolve_target() {  # <url-or-host:port> <gateway>
       return 0
       ;;
     *[!0-9.]*)
-      if ! answer="$(getent ahostsv4 "$host" 2>/dev/null | awk '$2 == "STREAM" { print $1 }' | sort -u)"; then
-        die "cannot resolve worker egress target '$host'"
+      answer="$(getent ahostsv4 "$host" 2>/dev/null | awk '$2 == "STREAM" { print $1 }' | sort -u || true)"
+      if [[ -z "$answer" ]]; then
+        if [[ "$strict" == "true" ]]; then
+          die "cannot resolve worker egress target '$host'"
+        fi
+        printf 'worker-egress: WARNING: cannot resolve %s; omitting it from the allowlist (the worker will not reach it)\n' \
+          "$host" >&2
+        return 0
       fi
-      [[ -n "$answer" ]] || die "worker egress target '$host' has no IPv4 address"
       while IFS= read -r address; do
         printf '%s %s\n' "$address" "$port"
       done <<<"$answer"
@@ -271,24 +300,47 @@ _worker_egress_operator_allow() {  # <tenant>
 # target silently missing. That is the fail-open shape this control exists to
 # avoid, caught by the harness's unresolvable-hostname case.
 worker_egress_targets() {  # <tenant>
-  local name="$1" subnet gateway target raw resolved
-  local -a targets=()
+  local name="$1" subnet gateway target raw
+  local -a llm_targets=() operator_targets=()
+  local line
   subnet="$(worker_egress_state_get "$name" SUBNET)"
   [[ -n "$subnet" ]] || return 0
   gateway="$(_worker_egress_gateway "$subnet")"
-  raw="$(
-    _worker_egress_llm_targets "$name" || exit 1
-    _worker_egress_operator_allow "$name" || exit 1
-  )" || return 1
+  # Tenant-derived endpoints first (non-strict), then operator entries
+  # (strict). Both sources stay in this shell: a `die` inside a pipeline would
+  # only exit that element and emit a ruleset with the entry silently missing.
+  raw="$(_worker_egress_llm_targets "$name")" || return 1
   while IFS= read -r target; do
-    [[ -n "$target" ]] && targets+=("$target")
+    [[ -n "$target" ]] && llm_targets+=("$target")
   done <<<"$raw"
-  resolved="$(
-    for target in "${targets[@]}"; do
-      _worker_egress_resolve_target "$target" "$gateway" || exit 1
-    done
-  )" || return 1
-  printf '%s\n' "$resolved" | awk 'NF == 2 && !seen[$0]++'
+  raw="$(_worker_egress_operator_allow "$name")" || return 1
+  while IFS= read -r target; do
+    [[ -n "$target" ]] && operator_targets+=("$target")
+  done <<<"$raw"
+  # Resolve through COMMAND substitution, not process substitution, so a
+  # `die` propagates: `< <(...)` would let a strict-target failure exit only
+  # that subshell and leave the ruleset with the entry silently missing. The
+  # dedupe stays in this shell for the same reason.
+  local -A seen=()
+  local -a lines=()
+  local resolved
+  for target in "${llm_targets[@]}"; do
+    resolved="$(_worker_egress_resolve_target "$target" "$gateway" false)" || return 1
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && lines+=("$line")
+    done <<<"$resolved"
+  done
+  for target in "${operator_targets[@]}"; do
+    resolved="$(_worker_egress_resolve_target "$target" "$gateway" true)" || return 1
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && lines+=("$line")
+    done <<<"$resolved"
+  done
+  for line in "${lines[@]}"; do
+    [[ -n "${seen[$line]:-}" ]] && continue
+    seen[$line]=1
+    printf '%s\n' "$line"
+  done
 }
 
 # Render the complete nftables script. Statements:

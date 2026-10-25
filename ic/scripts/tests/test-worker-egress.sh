@@ -142,17 +142,40 @@ assert_contains "$(CONTAINER_RT=podman MT_ROOTLESS=false worker_egress_ruleset a
   "ip saddr 10.89.10.0/24 ip daddr 10.89.10.1 tcp dport 8443 accept" \
   "host-loopback endpoints keep their port through translation"
 OPERATOR_ALLOW=("https://203.0.113.20:443/repo.git")
-# An unresolvable hostname is a hard error (fail closed, never a silent gap).
+# An unresolvable OPERATOR entry is a hard error: the operator asked for it
+# explicitly, so a typo/dead DNS must be loud rather than silently dropped.
 OPERATOR_ALLOW=("https://does-not-exist.example.invalid:443/repo.git")
 if ( worker_egress_ruleset alpha ) >/dev/null 2>&1; then
-  fail "an unresolvable allowlist hostname was silently skipped"
+  fail "an unresolvable operator entry was silently skipped"
 else
-  pass "an unresolvable allowlist hostname refuses the ruleset (fail closed)"
-fi
-if ( worker_egress_ruleset alpha ) >/dev/null 2>&1; then
-  fail "the unresolvable hostname case did not fail the ruleset"
+  pass "an unresolvable operator entry refuses the ruleset (fail closed)"
 fi
 OPERATOR_ALLOW=("https://203.0.113.20:443/repo.git")
+
+# An unresolvable TENANT LLM endpoint warns and narrows instead: omitting it
+# can only restrict egress, and a transient resolver failure at boot must not
+# stop the worker. The warning must still be visible.
+LLM_TARGETS=("http://does-not-exist.example.invalid:8080/v1")
+llm_warn="$fixture/llm-warn"
+if worker_egress_ruleset alpha >"$fixture/llm.out" 2>"$llm_warn"; then
+  pass "an unresolvable tenant LLM endpoint does not block the ruleset"
+else
+  fail "an unresolvable tenant LLM endpoint failed the whole ruleset"
+fi
+assert_contains "$(cat "$llm_warn")" "WARNING: cannot resolve" \
+  "an omitted tenant LLM endpoint warns loudly"
+assert_absent "$(cat "$fixture/llm.out")" "does-not-exist" \
+  "an omitted tenant LLM endpoint is not rendered as a rule"
+# A URL with no explicit port uses the scheme default, not a dropped entry.
+LLM_TARGETS=("http://203.0.113.30/v1")
+assert_contains "$(worker_egress_ruleset alpha)" \
+  "ip saddr 10.89.10.0/24 ip daddr 203.0.113.30 tcp dport 80 accept" \
+  "a portless http URL is allowed on port 80"
+LLM_TARGETS=("https://203.0.113.31/v1")
+assert_contains "$(worker_egress_ruleset alpha)" \
+  "ip saddr 10.89.10.0/24 ip daddr 203.0.113.31 tcp dport 443 accept" \
+  "a portless https URL is allowed on port 443"
+LLM_TARGETS=("http://127.0.0.1:3000/v1" "https://203.0.113.10:8443/v1")
 
 # Deduplication and stable order.
 targets="$(worker_egress_targets alpha)"

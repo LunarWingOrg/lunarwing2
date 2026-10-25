@@ -50,6 +50,12 @@ ensure_container_runtime() { :; }
 _ensure_tenant_image() { return 0; }
 ensure_init_system() { INIT_SYSTEM="openrc"; }
 _register_worker_unit() { :; }
+# WI#424 control 1: the egress allowlist needs a real tenant account (rootless
+# netns entry) and a real nftables namespace. This harness uses fixture tenant
+# `test`, which has no account, so the egress step is stubbed; the mount policy
+# under test is unrelated to it and test-worker-egress.sh pins the real
+# behaviour.
+prepare_worker_egress() { :; }
 # WI#400: the opencode lane runs a root entrypoint (image USER 0:0) whose
 # serve/tasks drop to the task uid, so the stubbed image user is 0:0.
 container_image_user="0:0"
