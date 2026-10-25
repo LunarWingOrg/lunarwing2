@@ -892,15 +892,17 @@ async fn resolve_user_project(
     }
 
     // Look for an existing default project owned by this user. The pick is
-    // deterministic and warns on duplicates (WI#321) so a conversation cannot
-    // land in a different "default" project on each resolution.
+    // deterministic (WI#321) so a conversation cannot land in a different
+    // "default" project on each resolution; the duplicate warning is emitted
+    // once at boot by `warn_duplicate_default_projects`, never here, because
+    // this path runs for every message.
     let projects = store
         .list_projects(user_id)
         .await
         .map_err(|e| engine_err("project lookup", e))?;
 
     let defaults: Vec<&lunarwing_engine::Project> = projects.iter().collect();
-    if let Some(project) = canonical_default_project(user_id, &defaults) {
+    if let Some(project) = canonical_default_project(&defaults) {
         return Ok(project.id);
     }
 
@@ -1830,13 +1832,14 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
     migrate_legacy_user_ids(&store_dyn, owner_id).await;
 
     // Reuse the persisted default project when available. The pick is
-    // deterministic and warns on duplicates (WI#321).
+    // deterministic (WI#321); duplicate defaults are reported once by the
+    // store's boot scan, not on this path.
     let owner_projects = store
         .list_projects(owner_id)
         .await
         .map_err(|e| engine_err("store error", e))?;
     let owner_defaults: Vec<&Project> = owner_projects.iter().collect();
-    let project_id = match canonical_default_project(owner_id, &owner_defaults) {
+    let project_id = match canonical_default_project(&owner_defaults) {
         Some(project) => project.id,
         None => {
             let project = Project::new(owner_id, "default", "Default project for engine v2");
@@ -5008,7 +5011,7 @@ async fn resolve_user_project_readonly(
     match store.list_projects(user_id).await {
         Ok(projects) => {
             let defaults: Vec<&Project> = projects.iter().collect();
-            canonical_default_project(user_id, &defaults)
+            canonical_default_project(&defaults)
                 .map(|project| project.id)
                 .unwrap_or(fallback)
         }
@@ -7643,6 +7646,37 @@ pub(crate) mod tests {
         let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
         *lock.write().await = None;
         *lock.write().await = state;
+    }
+
+    /// WI#321 NY-20: nothing used to exercise the routing path with duplicate
+    /// `"default"` projects, so reverting `resolve_user_project` to a plain
+    /// first-match `.find()` left every test green. A conversation must land in
+    /// the same, oldest project however the store orders its listing.
+    #[tokio::test]
+    async fn resolve_user_project_picks_the_oldest_duplicate_default() {
+        let store = Arc::new(TestStore::new());
+        let mut oldest = Project::new("bob", "default", "oldest");
+        oldest.created_at = chrono::Utc::now() - chrono::Duration::hours(2);
+        let mut newest = Project::new("bob", "default", "newest");
+        newest.created_at = chrono::Utc::now();
+        // An older non-default project must never be mistaken for the default.
+        let mut other = Project::new("bob", "research", "not a default");
+        other.created_at = chrono::Utc::now() - chrono::Duration::hours(3);
+        store.save_project(&other).await.expect("save other");
+        store.save_project(&oldest).await.expect("save oldest");
+        store.save_project(&newest).await.expect("save newest");
+
+        let store_dyn: Arc<dyn Store> = store;
+        let fallback = Project::new("alice", "default", "engine default").id;
+        for _ in 0..3 {
+            let resolved = resolve_user_project(&store_dyn, "bob", fallback)
+                .await
+                .expect("resolve project");
+            assert_eq!(
+                resolved, oldest.id,
+                "duplicate defaults must resolve to the oldest, not map order"
+            );
+        }
     }
 
     #[tokio::test]

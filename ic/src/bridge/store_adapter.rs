@@ -225,9 +225,11 @@ impl HybridStore {
     /// Two unlocked check-then-create windows (`resolve_user_project` and the
     /// engine boot path) can each mint a `"default"` project when the first
     /// one's `project.json` has not loaded or the lookup raced. Missions and
-    /// conversations are then attached to whichever project a map listing
-    /// happened to yield first, which reads as "the mission disappeared".
-    /// Boot is the earliest point where every loaded project is visible.
+    /// conversations are then attached to whichever project the shared picker
+    /// chose, which reads as "the mission disappeared". Boot is the earliest
+    /// point where every loaded project is visible, and the only place that
+    /// reports the duplicate — the picker itself runs per message and stays
+    /// silent (NY-19).
     async fn warn_duplicate_default_projects(&self) {
         let projects: Vec<Project> = self.projects.read().await.values().cloned().collect();
         let mut by_user: HashMap<&str, Vec<&Project>> = HashMap::new();
@@ -237,10 +239,18 @@ impl HybridStore {
                 .or_default()
                 .push(project);
         }
-        // Reuse the picker so the boot scan and the routing path warn with the
-        // same wording and agree on which project wins.
         for (user_id, defaults) in by_user {
-            let _ = canonical_default_project(user_id, &defaults);
+            let ordered = sorted_default_projects(&defaults);
+            if ordered.len() < 2 {
+                continue;
+            }
+            let project_ids: Vec<String> = ordered.iter().map(|p| p.id.0.to_string()).collect();
+            warn!(
+                user_id = %user_id,
+                count = ordered.len(),
+                project_ids = ?project_ids,
+                "multiple \"default\" projects for one user; using the oldest"
+            );
         }
     }
 
@@ -641,6 +651,11 @@ impl HybridStore {
     /// debug it was invisible under the default log filter and the record then
     /// also vanished from every listing and schedule. `kind` names the record
     /// family so the warning reads without a stack of surrounding context.
+    ///
+    /// The warning carries identifiers and a static error class only. The raw
+    /// serde error quotes the stored value it choked on — message text or tool
+    /// output for thread, step and event records — so it stays at `debug!`
+    /// (WI#321 NY-18).
     async fn load_map<T, F, Fut>(
         &self,
         ws: &Workspace,
@@ -657,20 +672,33 @@ impl HybridStore {
                 Ok(doc) => match serde_json::from_str::<T>(&doc.content) {
                     Ok(value) => on_value(value).await,
                     Err(e) => {
-                        let record_id = record_id_hint(&doc.content);
+                        let record_id = record_id_hint(&doc.content).describe();
                         warn!(
-                            kind,
+                            kind = %kind,
                             path = %entry.path,
-                            record_id = record_id.as_deref().unwrap_or("unknown"),
-                            "dropping {kind} record: failed to parse: {e}"
+                            record_id = %record_id,
+                            error_kind = %parse_error_kind(&e),
+                            line = e.line(),
+                            column = e.column(),
+                            "dropping {kind} record: failed to parse"
+                        );
+                        debug!(
+                            kind = %kind,
+                            path = %entry.path,
+                            record_id = %record_id,
+                            "dropping {kind} record: parse error: {e}"
                         );
                     }
                 },
-                Err(e) => warn!(
-                    kind,
-                    path = %entry.path,
-                    "dropping {kind} record: failed to read: {e}"
-                ),
+                Err(e) => {
+                    warn!(
+                        kind = %kind,
+                        path = %entry.path,
+                        record_id = "unknown",
+                        "dropping {kind} record: failed to read"
+                    );
+                    debug!(kind = %kind, path = %entry.path, "dropping {kind} record: read error: {e}");
+                }
             }
         }
     }
@@ -1016,8 +1044,10 @@ impl HybridStore {
                     Err(e) => {
                         warn!(
                             path = %mission_file,
-                            "dropping mission: failed to read mission.json: {e}"
+                            record_id = "unknown",
+                            "dropping mission: failed to read mission.json"
                         );
+                        debug!(path = %mission_file, "dropping mission: read error: {e}");
                         continue;
                     }
                 };
@@ -1027,26 +1057,41 @@ impl HybridStore {
                             candidates.push((mission_file, raw, mission));
                         }
                         Err(e) => {
+                            // The mission name is user-authored and the serde
+                            // error quotes the stored value it rejected, so
+                            // neither goes to `warn!` (WI#321 NY-18). The id
+                            // and path identify the record.
                             let mission_id = raw
                                 .get("id")
                                 .and_then(|id| id.as_str())
                                 .unwrap_or("unknown");
-                            let mission_name = raw
-                                .get("name")
-                                .and_then(|name| name.as_str())
-                                .unwrap_or("unknown");
                             warn!(
                                 path = %mission_file,
-                                mission_id,
-                                mission_name,
-                                "dropping mission: failed to parse: {e}"
+                                mission_id = %mission_id,
+                                error_kind = %parse_error_kind(&e),
+                                line = e.line(),
+                                column = e.column(),
+                                "dropping mission: failed to parse"
+                            );
+                            debug!(
+                                path = %mission_file,
+                                mission_id = %mission_id,
+                                "dropping mission: parse error: {e}"
                             );
                         }
                     },
                     Err(e) => {
                         warn!(
                             path = %mission_file,
-                            "dropping mission: failed to parse mission.json: {e}"
+                            record_id = "unknown",
+                            error_kind = %parse_error_kind(&e),
+                            line = e.line(),
+                            column = e.column(),
+                            "dropping mission: failed to parse mission.json"
+                        );
+                        debug!(
+                            path = %mission_file,
+                            "dropping mission: mission.json parse error: {e}"
                         );
                     }
                 }
@@ -1341,22 +1386,81 @@ fn project_path(name: &str, project_id: ProjectId) -> String {
     format!("{}/project.json", project_dir(name, project_id))
 }
 
-/// Best-effort record id from a document that failed to deserialize (WI#321).
+/// Best-effort identifiers from a document that failed to deserialize (WI#321).
 ///
-/// Re-parses only on the failure path, so the happy path pays nothing. Handles
-/// the `Vec<_>` record families (steps, events) by reading the first element.
-/// `None` means the document is not JSON at all or carries no string `id`; the
-/// warning still names the path.
-fn record_id_hint(content: &str) -> Option<String> {
-    let raw: serde_json::Value = serde_json::from_str(content).ok()?;
-    let record = match &raw {
-        serde_json::Value::Array(items) => items.first()?,
-        other => other,
+/// Re-parses only on the failure path, so the happy path pays nothing.
+/// `id` is the record's own string `id`; `thread_id` is the thread a `Vec<_>`
+/// batch record (steps, events) is keyed by — that is the identifier an
+/// operator needs, while the element's own step/event id is not (WI#321
+/// NY-21). Both are `None` when the document is not JSON at all or the field
+/// is absent; the warning still names the path.
+#[derive(Default)]
+struct RecordIds {
+    id: Option<String>,
+    thread_id: Option<String>,
+}
+
+impl RecordIds {
+    /// Single content-free identifier for a `warn!` field.
+    fn describe(&self) -> String {
+        match (self.id.as_deref(), self.thread_id.as_deref()) {
+            (Some(id), Some(thread)) => format!("{id} (thread {thread})"),
+            (Some(id), None) => id.to_owned(),
+            (None, Some(thread)) => format!("thread {thread}"),
+            (None, None) => "unknown".to_owned(),
+        }
+    }
+}
+
+fn record_id_hint(content: &str) -> RecordIds {
+    let Ok(raw) = serde_json::from_str::<serde_json::Value>(content) else {
+        return RecordIds::default();
     };
-    record
-        .get("id")
-        .and_then(|id| id.as_str())
-        .map(str::to_owned)
+    let (record, batch) = match &raw {
+        serde_json::Value::Array(items) => match items.first() {
+            Some(first) => (first, true),
+            None => return RecordIds::default(),
+        },
+        other => (other, false),
+    };
+    let string_field = |name: &str| {
+        record
+            .get(name)
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+    };
+    RecordIds {
+        id: string_field("id"),
+        thread_id: batch.then(|| string_field("thread_id")).flatten(),
+    }
+}
+
+/// Static class of a JSON parse failure, safe to log at `warn!` (WI#321 NY-18).
+///
+/// `serde_json`'s `Display` quotes the offending *value* (`unknown variant
+/// \`<value>\``, `invalid type: string "<value>"`), so echoing the error at
+/// `warn!` publishes stored content — message text or tool output for thread,
+/// step and event records. The category, line and column locate the failure
+/// without the value; the full error stays at `debug!`.
+fn parse_error_kind(error: &serde_json::Error) -> &'static str {
+    match error.classify() {
+        serde_json::error::Category::Io => "io",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "data",
+        serde_json::error::Category::Eof => "eof",
+    }
+}
+
+/// The user's `"default"` projects in canonical order: oldest first, ties
+/// broken by id.
+fn sorted_default_projects<'a>(projects: &[&'a Project]) -> Vec<&'a Project> {
+    let mut defaults: Vec<&Project> = projects
+        .iter()
+        .copied()
+        .filter(|project| project.name == "default")
+        .collect();
+    defaults.sort_by_key(|project| (project.created_at, project.id.0));
+    defaults
 }
 
 /// Pick a user's canonical `"default"` project out of one listing.
@@ -1364,30 +1468,15 @@ fn record_id_hint(content: &str) -> Option<String> {
 /// WI#321: two unlocked check-then-create windows can leave more than one
 /// `"default"` project for the same user, and a map-backed listing makes
 /// "first" arbitrary — so a conversation could land in a different project on
-/// each call and its missions look like they vanished. Warn when that is
-/// observed, and always return the oldest (ties broken by id) so repeated
-/// resolutions agree.
-pub(crate) fn canonical_default_project<'a>(
-    user_id: &str,
-    projects: &[&'a Project],
-) -> Option<&'a Project> {
-    let mut defaults: Vec<&Project> = projects
-        .iter()
-        .copied()
-        .filter(|project| project.name == "default")
-        .collect();
-    defaults.sort_by_key(|project| (project.created_at, project.id.0));
-    let picked = *defaults.first()?;
-    if defaults.len() > 1 {
-        let project_ids: Vec<String> = defaults.iter().map(|p| p.id.0.to_string()).collect();
-        warn!(
-            user_id,
-            count = defaults.len(),
-            project_ids = ?project_ids,
-            "multiple \"default\" projects for one user; using the oldest"
-        );
-    }
-    Some(picked)
+/// each call and its missions look like they vanished. Always return the
+/// oldest (ties broken by id) so repeated resolutions agree.
+///
+/// Deliberately silent: this runs on every message and on each mission
+/// listing, so warning here would repeat once per message for an affected
+/// user (WI#321 NY-19). Boot-time `warn_duplicate_default_projects` is the
+/// one place that reports duplicates.
+pub(crate) fn canonical_default_project<'a>(projects: &[&'a Project]) -> Option<&'a Project> {
+    sorted_default_projects(projects).first().copied()
 }
 
 fn thread_path(thread_id: ThreadId) -> String {
@@ -2320,17 +2409,106 @@ mod tests {
         );
     }
 
+    /// True when a captured line was emitted at `level`.
+    ///
+    /// `tracing-subscriber`'s full formatter right-aligns levels to five
+    /// columns (`" WARN "`, `" INFO "`) but not `"DEBUG "`/`"TRACE "`, so both
+    /// the padded and unpadded shapes are accepted.
+    fn line_has_level(line: &str, level: &str) -> bool {
+        line.starts_with(&format!("{level} ")) || line.contains(&format!(" {level} "))
+    }
+
+    /// Assert exactly one log line at `level` carries every `fragments`.
+    ///
+    /// Returns `Err` rather than panicking: `tracing-test` holds its
+    /// process-global buffer lock while the `logs_assert` closure runs, so a
+    /// panic would poison the buffer and fail every other test in the binary.
+    fn assert_logged_at(lines: &[&str], level: &str, fragments: &[&str]) -> Result<(), String> {
+        let matches: Vec<&&str> = lines
+            .iter()
+            .filter(|line| {
+                line_has_level(line, level)
+                    && fragments.iter().all(|needle| line.contains(needle))
+            })
+            .collect();
+        if matches.len() == 1 {
+            return Ok(());
+        }
+        Err(format!(
+            "expected exactly one {level} line carrying {fragments:?}, got {} ({matches:?}); lines: {lines:?}",
+            matches.len()
+        ))
+    }
+
+    /// Assert no captured line at `level` or above carries `needle`.
+    ///
+    /// Debug lines may legitimately echo the full error text; the content that
+    /// must stay clean is what the default filter shows (WI#321 NY-18).
+    fn assert_no_log_carries_at_or_above(
+        lines: &[&str],
+        needle: &str,
+        level: &str,
+    ) -> Result<(), String> {
+        const LEVELS: [&str; 5] = ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"];
+        let threshold = LEVELS
+            .iter()
+            .position(|candidate| *candidate == level)
+            .unwrap_or(0);
+        let offending = lines
+            .iter()
+            .filter(|line| {
+                if !line.contains(needle) {
+                    return false;
+                }
+                LEVELS
+                    .iter()
+                    .position(|candidate| line_has_level(line, candidate))
+                    .map(|position| position <= threshold)
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        if offending.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "{needle:?} reached the log at {level} or above: {offending:?}"
+        ))
+    }
+
     #[test]
     fn record_id_hint_reads_object_and_batch_ids() {
         // The dropped-record warning names the id when the document is valid
-        // JSON with a string `id`, including the `Vec<_>` step/event batches.
-        assert_eq!(record_id_hint(r#"{"id":"abc"}"#).as_deref(), Some("abc"));
+        // JSON with a string `id`. For the `Vec<_>` step/event batches the
+        // thread the batch is keyed by is the identifier an operator needs, so
+        // it is reported next to the element's own id (WI#321 NY-21).
+        assert_eq!(record_id_hint(r#"{"id":"abc"}"#).describe(), "abc");
         assert_eq!(
-            record_id_hint(r#"[{"id":"first"},{"id":"second"}]"#).as_deref(),
-            Some("first")
+            record_id_hint(r#"[{"id":"first","thread_id":"t1"}]"#).describe(),
+            "first (thread t1)"
         );
-        assert_eq!(record_id_hint("{not json"), None);
-        assert_eq!(record_id_hint(r#"{"id":7}"#), None);
+        assert_eq!(
+            record_id_hint(r#"[{"thread_id":"t1"}]"#).describe(),
+            "thread t1"
+        );
+        assert_eq!(record_id_hint("{not json").describe(), "unknown");
+        assert_eq!(record_id_hint(r#"{"id":7}"#).describe(), "unknown");
+        assert_eq!(record_id_hint(r#"[]"#).describe(), "unknown");
+    }
+
+    #[test]
+    fn parse_error_kind_is_static_and_never_quotes_the_value() {
+        // NY-18: the Display text of a serde error quotes the stored value on
+        // a data mismatch. The classify() class does not, which is why it is
+        // what `warn!` carries.
+        let data = serde_json::from_str::<Vec<u32>>(r#""LEAKED""#).expect_err("data error");
+        assert_eq!(parse_error_kind(&data), "data");
+        assert!(data.to_string().contains("LEAKED"));
+        assert!(!parse_error_kind(&data).contains("LEAKED"));
+
+        let syntax = serde_json::from_str::<Vec<u32>>("[}").expect_err("syntax error");
+        assert_eq!(parse_error_kind(&syntax), "syntax");
+        let eof = serde_json::from_str::<Vec<u32>>("[1,").expect_err("eof error");
+        assert_eq!(parse_error_kind(&eof), "eof");
     }
 
     #[test]
@@ -2343,10 +2521,55 @@ mod tests {
         let default = Project::new("u", "default", "d");
         let refs = [&research, &default];
         assert_eq!(
-            canonical_default_project("u", &refs).map(|project| project.id),
+            canonical_default_project(&refs).map(|project| project.id),
             Some(default.id)
         );
-        assert!(canonical_default_project("u", &[&research]).is_none());
+        assert!(canonical_default_project(&[&research]).is_none());
+    }
+
+    #[test]
+    fn canonical_default_project_picks_the_oldest_whatever_the_input_order() {
+        // Kills the `sort_by_key(..)` → `reverse()` mutant deterministically:
+        // every input permutation must yield the same (oldest) project, so the
+        // order handed in cannot decide the answer. A two-element slice lets
+        // the mutant pass about half the time, which is why this covers all
+        // six orderings of three defaults (WI#321 NY-20).
+        let base = chrono::Utc::now();
+        let mut oldest = Project::new("u", "default", "oldest");
+        oldest.created_at = base - chrono::Duration::hours(3);
+        let mut middle = Project::new("u", "default", "middle");
+        middle.created_at = base - chrono::Duration::hours(2);
+        let mut newest = Project::new("u", "default", "newest");
+        newest.created_at = base - chrono::Duration::hours(1);
+        for order in [
+            [&oldest, &middle, &newest],
+            [&oldest, &newest, &middle],
+            [&middle, &oldest, &newest],
+            [&middle, &newest, &oldest],
+            [&newest, &oldest, &middle],
+            [&newest, &middle, &oldest],
+        ] {
+            assert_eq!(
+                canonical_default_project(&order).map(|project| project.id),
+                Some(oldest.id),
+                "the oldest default must win regardless of input order"
+            );
+        }
+
+        // Ties break on the id, not on the input position.
+        let mut first = Project::new("u", "default", "tie a");
+        first.created_at = base;
+        let mut second = Project::new("u", "default", "tie b");
+        second.created_at = base;
+        let (low, high) = if first.id.0 < second.id.0 {
+            (&first, &second)
+        } else {
+            (&second, &first)
+        };
+        assert_eq!(
+            canonical_default_project(&[high, low]).map(|project| project.id),
+            Some(low.id)
+        );
     }
 
     #[cfg(feature = "libsql")]
@@ -2406,15 +2629,89 @@ mod tests {
                 .is_none(),
             "a mission that failed to parse must not silently appear as loaded"
         );
+        let mission_id = mission.id.0.to_string();
+        let goal = mission.goal.clone();
+        logs_assert(|lines: &[&str]| {
+            // The warn carries the id, the path and a static class — and it is
+            // really at warn, which WI#321's first acceptance criterion asks
+            // for (NY-20).
+            assert_logged_at(
+                lines,
+                "WARN",
+                &[
+                    "dropping mission: failed to parse",
+                    &mission_id,
+                    &path,
+                    "error_kind=data",
+                ],
+            )?;
+            // NY-18: neither the user-authored name or goal, nor the stored
+            // cadence value serde quotes in its Display text, may reach warn
+            // or above.
+            assert_no_log_carries_at_or_above(lines, &mission.name, "WARN")?;
+            assert_no_log_carries_at_or_above(lines, &goal, "WARN")?;
+            assert_no_log_carries_at_or_above(lines, "not-a-cadence", "WARN")
+        });
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    #[traced_test]
+    async fn corrupt_step_batch_warns_with_the_batch_identity_and_no_content() {
+        // NY-18/NY-21 class: step records carry user-visible content (tool
+        // output in `action_results`). A type mismatch makes serde quote the
+        // stored string in its Display text, which must not reach warn; the
+        // thread the batch is keyed by is what the warning names.
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("corrupt-step-warn", db));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let thread_id = ThreadId::new();
+        store
+            .save_step(&Step::new(thread_id, 1))
+            .await
+            .expect("save step");
+        let path = step_path(thread_id);
+        let mut raw: serde_json::Value = serde_json::from_str(
+            &workspace
+                .read(&path)
+                .await
+                .expect("read step batch")
+                .content,
+        )
+        .expect("step batch json");
+        raw[0]["action_results"] = serde_json::json!("LEAKED TOOL OUTPUT");
+        workspace
+            .write(&path, &raw.to_string())
+            .await
+            .expect("corrupt step batch");
+
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded
+            .load_state_from_workspace()
+            .await
+            .expect("reload engine state");
+
         assert!(
-            logs_contain("dropping mission: failed to parse"),
-            "expected a parse warning (tracing-test prints the captured logs on failure)"
+            reloaded
+                .load_steps(thread_id)
+                .await
+                .expect("load")
+                .is_empty(),
+            "a step batch that failed to parse must not appear as loaded"
         );
-        assert!(
-            logs_contain(&mission.id.0.to_string()),
-            "the warning must name the mission id"
-        );
-        assert!(logs_contain(&path), "the warning must name the path");
+        let thread = thread_id.0.to_string();
+        logs_assert(|lines: &[&str]| {
+            assert_logged_at(
+                lines,
+                "WARN",
+                &[
+                    "dropping thread step batch record: failed to parse",
+                    &thread,
+                    "error_kind=data",
+                ],
+            )?;
+            assert_no_log_carries_at_or_above(lines, "LEAKED TOOL OUTPUT", "WARN")
+        });
     }
 
     #[cfg(feature = "libsql")]
@@ -2449,17 +2746,27 @@ mod tests {
                 .is_none(),
             "a project that failed to parse must not appear as loaded"
         );
-        assert!(logs_contain("dropping project record: failed to parse"));
-        assert!(logs_contain(&path), "the warning must name the path");
+        logs_assert(|lines: &[&str]| {
+            assert_logged_at(
+                lines,
+                "WARN",
+                &[
+                    "dropping project record: failed to parse",
+                    &path,
+                    "error_kind=syntax",
+                ],
+            )?;
+            assert_no_log_carries_at_or_above(lines, "this is not json", "WARN")
+        });
     }
 
     #[cfg(feature = "libsql")]
     #[tokio::test]
     #[traced_test]
-    async fn duplicate_default_projects_warn_at_boot_and_pick_the_oldest() {
+    async fn duplicate_default_projects_warn_once_at_boot_and_pick_the_oldest() {
         // WI#321: two unlocked check-then-create windows can mint two "default"
-        // projects for one user. Boot must say so, and the shared picker must
-        // return the oldest deterministically so routing/listings agree.
+        // projects for one user. Boot must say so once, and the shared picker
+        // must return the oldest deterministically so routing/listings agree.
         let (db, _temp_dir) = crate::testing::test_db().await;
         let workspace = Arc::new(Workspace::new_with_db("duplicate-defaults", db));
         let store = HybridStore::new(Some(Arc::clone(&workspace)));
@@ -2480,20 +2787,33 @@ mod tests {
             .await
             .expect("reload engine state");
 
-        assert!(
-            logs_contain("multiple \"default\" projects for one user"),
-            "boot must warn about duplicate default projects"
-        );
-        assert!(logs_contain(&oldest.id.0.to_string()));
-        assert!(logs_contain(&newest.id.0.to_string()));
-
+        // The picker runs on every message and every mission listing, so it
+        // stays silent (NY-19). Calling it here means a second warning would
+        // fail the exactly-one assertion below.
         let projects = reloaded.list_projects("test-user").await.expect("list");
         let defaults: Vec<&Project> = projects.iter().collect();
-        let picked = canonical_default_project("test-user", &defaults).expect("a default");
-        assert_eq!(
-            picked.id, oldest.id,
-            "the oldest default project must win, not a map-order pick"
-        );
+        for _ in 0..3 {
+            let picked = canonical_default_project(&defaults).expect("a default");
+            assert_eq!(
+                picked.id, oldest.id,
+                "the oldest default project must win, not a map-order pick"
+            );
+        }
+
+        let oldest_id = oldest.id.0.to_string();
+        let newest_id = newest.id.0.to_string();
+        logs_assert(|lines: &[&str]| {
+            assert_logged_at(
+                lines,
+                "WARN",
+                &[
+                    "multiple \"default\" projects for one user",
+                    "count=2",
+                    &oldest_id,
+                    &newest_id,
+                ],
+            )
+        });
     }
 
     #[test]
