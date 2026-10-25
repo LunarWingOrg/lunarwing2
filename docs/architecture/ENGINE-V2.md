@@ -681,6 +681,35 @@ missing timestamp alone does not establish that a mission was born terminal.
 Tool listings remain project- and owner-scoped (including shared missions),
 so absence from another project's list does not establish deletion.
 
+### Scheduler Liveness Signals (WI#323)
+
+Because a stored `next_fire_at` says nothing about whether the scheduler is
+running, the mission cron ticker emits its own liveness trail at info level:
+
+- one `mission cron ticker started` line naming the active-mission count, the
+  tick interval and the heartbeat interval;
+- a `mission scheduler heartbeat` line at most hourly with the active-mission
+  count, the earliest scheduled fire among them (`next_fire_at=none` when
+  nothing is scheduled) and how many Active cron missions are already overdue;
+- `mission fired` per fire, carrying the mission id, thread id, trigger kind
+  (`cron`, `channel_event`, `system_event`, `webhook`, `manual`) and the new
+  `next_fire_at` the tick persisted;
+- `mission goal declared achieved; auto-completing mission` when a run's own
+  goal declaration completes the mission — distinct from the info-level
+  `mission explicitly completed` line of an operator `complete_mission`;
+- a `warn` when an Active cron mission's `next_fire_at` is more than two
+  minutes overdue, so a schedule the ticker keeps missing is visible rather
+  than indistinguishable from an idle scheduler.
+
+A tick that returns an error logs at warn level; a single mission's failed
+fire is warned about and skipped without stopping the rest of the tick. The
+heartbeat's clock is wall-clock elapsed time, so a stalled loop delays the
+beat instead of counting ticks it never ran.
+
+None of these lines carry user content — no mission names, goals, prompts,
+cadence expressions, event patterns or trigger payloads. Only ids, cadence
+kinds, counts and timestamps are logged.
+
 Cron missions receive `next_fire_at` when created, updated, or resumed. Startup
 repairs older valid cron missions missing this value. Scheduler fires advance
 the next occurrence even when the daily thread budget blocks a run; manual
