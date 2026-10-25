@@ -255,16 +255,86 @@ printf '#!/bin/sh\n# fixture wrapper\n' > "$wrapper_file"
 # shellcheck disable=SC2034
 CONTAINER_RT=docker
 ensure_container_runtime() { :; }
-docker() { BUILD_CALL="$*"; printf '%s\n' "$*" >> "$fixture/build-calls"; }
+# WI#425 out-of-band verify mock: the fake image serves the wrapper and the
+# real binary from a fixture root, so the verify path can pass and — when
+# the fixture bytes are tampered — fail exactly like the real runtime would.
+oob_image_root="$fixture/oob-image"
+oob_env_extra=()
+oob_shell_override=''
+oob_real_binary_missing=false
+oob_serve_wrapper_file="$wrapper_file"
+mkdir -p "$oob_image_root/usr/local/bin" "$oob_image_root/usr/local/lib/opencode2"
+cp "$wrapper_file" "$oob_image_root/usr/local/bin/opencode"
+printf '\x7fELF clean pinned build\n' > "$oob_image_root/usr/local/lib/opencode2/opencode"
+docker() {
+  case "${1:-}" in
+    build) BUILD_CALL="$*"; printf '%s\n' "$*" >> "$fixture/build-calls" ;;
+    create) printf 'fake-container-id\n' ;;
+    cp)
+      local src="$2" dst="$3" rel
+      rel="${src#fake-container-id:}"
+      if [[ "$rel" == "$src" ]]; then
+        return 1
+      fi
+      # The fake image serves the CURRENT served-wrapper file (normally the
+      # checkout wrapper, so the GW-1 rewrite loop and untampered builds
+      # pass); the WI#425 refusal tests point it at tampered bytes.
+      if [[ "$rel" == /usr/local/bin/opencode ]]; then
+        cp "$oob_serve_wrapper_file" "$dst"
+      elif [[ "$rel" == /usr/local/lib/opencode2/opencode ]]; then
+        # server-side absence is simulated by the flag, not by the fixture
+        # file: the fixture keeps a real file so untampered passes serve it.
+        if [[ "$oob_real_binary_missing" == true ]]; then
+          return 1
+        fi
+        cp "$oob_image_root/$rel" "$dst"
+      elif [[ -f "$oob_image_root/$rel" ]]; then
+        cp "$oob_image_root/$rel" "$dst"
+      else
+        return 1
+      fi ;;
+    rm | rmi) return 0 ;;
+    tag) OOB_TAG_CALLS+=("$2 -> $3") ;;
+    image)
+      case "${2:-}" in
+        inspect)
+          local fmt="${*: -1}" out
+          case "$fmt" in
+            '{{json .Config.Env}}')
+              out='["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin","OPENCODE_DISABLE_AUTOUPDATE=1"'
+              local kv
+              for kv in "${oob_env_extra[@]}"; do out+=",\"$kv\""; done
+              out+=']'
+              printf '%s\n' "$out" ;;
+            '{{.Config.Shell}}')
+              if [[ -n "$oob_shell_override" ]]; then
+                printf '%s\n' "$oob_shell_override"
+              else
+                printf '<nil>\n'
+              fi ;;
+            *) return 1 ;;
+          esac ;;
+        *) return 1 ;;
+      esac ;;
+    *) BUILD_CALL="$*"; printf '%s\n' "$*" >> "$fixture/build-calls" ;;
+  esac
+}
 podman() { docker "$@"; }
+OOB_TAG_CALLS=()
 BUILD_CALL=''
 build_opencode2_worker false true "$fixture/target" >/dev/null
 if [[ "$BUILD_CALL" == *'--build-arg WITH_TOOLCHAINS=true'* \
-  && "$BUILD_CALL" == *"-t lunarwing-worker-opencode2:latest"* \
+  && "$BUILD_CALL" == *'-t lunarwing-worker-opencode2:candidate'* \
   && "$BUILD_CALL" == *"$fixture/target/opencode2.4lunarwing"* ]]; then
-  pass 'opencode2 builder forwards toolchain flag and source root'
+  pass 'opencode2 builder forwards toolchain flag and source root (candidate tag)'
 else
   fail "opencode2 builder contract wrong: $BUILD_CALL"
+fi
+# WI#425: the out-of-band verification gates the :latest re-tag.
+if [[ "${OOB_TAG_CALLS[0]}" == 'lunarwing-worker-opencode2:candidate -> lunarwing-worker-opencode2:latest' ]]; then
+  pass 'opencode2 builder re-tags :latest only after the out-of-band verify'
+else
+  fail "opencode2 builder did not gate the :latest re-tag on the out-of-band verify: ${OOB_TAG_CALLS[*]:-}"
 fi
 
 BUILD_CALL=''
@@ -343,6 +413,59 @@ if (build_opencode2_worker false false "$fixture/missing") >/dev/null 2>&1; then
 else
   pass 'opencode2 builder refuses a missing worker dir'
 fi
+
+# ── WI#425 out-of-band verification refusals ─────────────────────────────────
+# Each tampered shape must FAIL the build verify (die) and never re-tag
+# :latest — the good previous image stays in place.
+oob_refusal_run() {
+  local log_file="$1" label="$2"
+  OOB_TAG_CALLS=()
+  if (build_opencode2_worker false false "$fixture/target") >"$log_file" 2>&1; then
+    fail "out-of-band verify accepted $label"
+    return 1
+  fi
+  if [[ "${#OOB_TAG_CALLS[@]}" -ne 0 ]]; then
+    fail "out-of-band verify re-tagged :latest on $label refusal"
+    return 1
+  fi
+  pass "out-of-band verify refuses $label and keeps :latest untouched"
+  return 0
+}
+
+# Tampered installed wrapper: the image serves different bytes than the
+# checkout (the run-103 GD-2 shape, now caught host-side too). The mock's
+# served wrapper comes from oob_serve_wrapper_file, which the untampered
+# runs keep pointed at the live checkout wrapper.
+oob_serve_wrapper_file="$wrapper_file"
+printf '#!/bin/sh\n# tampered wrapper\nexec /bin/sh\n' > "$fixture/tampered-wrapper"
+oob_serve_wrapper_file="$fixture/tampered-wrapper"
+oob_refusal_run "$fixture/oob-tampered.log" 'a tampered installed wrapper'
+assert_contains "$fixture/oob-tampered.log" 'WI#425 out-of-band' \
+  'tampered-wrapper refusal names the out-of-band check'
+oob_serve_wrapper_file="$wrapper_file"
+
+# Drifted image Env: the config retargets OPENCODE_BIN at the real binary —
+# the GX-2 shape caught host-side too.
+oob_env_extra=("OPENCODE_BIN=/usr/local/lib/opencode2/opencode")
+oob_refusal_run "$fixture/oob-env.log" 'a drifted image Env (OPENCODE_BIN retarget)'
+assert_contains "$fixture/oob-env.log" 'retargets OPENCODE_BIN' \
+  'drifted-Env refusal names the retarget'
+oob_env_extra=()
+
+# Missing real binary in the image.
+oob_real_binary_missing=true
+oob_refusal_run "$fixture/oob-binary.log" 'a missing real binary'
+assert_contains "$fixture/oob-binary.log" 'missing from' \
+  'missing-binary refusal names the path'
+oob_real_binary_missing=false
+
+# Baked Shell override (the Dockerfile refuses SHELL; a config carrying one
+# is drift).
+oob_shell_override='[/bin/false,-c]'
+oob_refusal_run "$fixture/oob-shell.log" 'a baked Shell override'
+assert_contains "$fixture/oob-shell.log" 'Shell override' \
+  'Shell-override refusal names the drift'
+oob_shell_override=''
 
 # ── build flag forwarding through the dispatcher ─────────────────────────────
 require_root() { :; }
