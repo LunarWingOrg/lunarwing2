@@ -473,7 +473,12 @@ def validate_worker_publication(merged: dict, errors: list[str]) -> None:
             errors.append(f"{promotion_name} must use unique tag {expected_tag}")
         needs = promotion_job.get("needs", []) if isinstance(promotion_job, dict) else []
         needed_jobs = {need.get("job") for need in needs if isinstance(need, dict)}
-        if needed_jobs != {candidate_name, scan_name}:
+        # WI#425: the opencode2 promotion additionally requires the durable
+        # out-of-band exposure-policy verification job.
+        expected_needs = {candidate_name, scan_name}
+        if worker == "opencode2":
+            expected_needs.add("worker-opencode2-exposure-verify")
+        if needed_jobs != expected_needs:
             errors.append(f"{promotion_name} must need its exact candidate and scan")
         if not extends_template(merged.get(candidate_name), ".worker-candidate"):
             errors.append(f"{candidate_name} must extend .worker-candidate")

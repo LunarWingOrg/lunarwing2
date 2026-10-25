@@ -31,7 +31,14 @@ Assertions (opencode2 lane):
      resolve 'opencode' to it, the real binary is re-scanned for OpenTunnel
      markers (run-103 GD-2), LUNARWING_REAL_OPENCODE may not retarget the
      wrapper at build time, and the installed digest must match the
-     LUNARWING_WRAPPER_SHA256 build-arg anchor (run-106 GJ-3).
+     LUNARWING_WRAPPER_SHA256 build-arg anchor (run-106 GJ-3). WI#425 GX-2
+     adds the OPENCODE_BIN retarget refusal, the real binary's owner/mode,
+     and the parent-directory checks; GX-3 requires all three execute bits.
+     --image-root DIR (WI#425 out-of-band verification) points the
+     installed-wrapper check at an unpacked BuildKit filesystem export
+     instead of the live root: the PATH-resolution check is skipped there
+     (no live environment) and the CI driver checks the image config
+     Env/Shell separately.
 
 v1 lane (--lane opencode4lunarwing): only the share-disabled and
 entrypoint-loopback checks apply (v1.18.25 has no service mode or
@@ -333,6 +340,7 @@ def check_installed_wrapper(
     *,
     owner_uid: int = 0,
     wrapper_sha256: str | None = None,
+    check_path_resolution: bool = True,
 ) -> None:
     """Run-103 GD-2: verify the shipped wrapper, not the Dockerfile's claim.
 
@@ -441,11 +449,16 @@ def check_installed_wrapper(
              f"bridge would spawn that instead of the wrapper {wrapper_path} "
              "(WI#425 GX-2)")
         check_binary(pathlib.Path(opencode_bin_override))
-    resolved = shutil.which("opencode")
-    if resolved is None or pathlib.Path(resolved) != wrapper_path:
-        fail(f"'opencode' on PATH must resolve to the wrapper {wrapper_path} "
-             f"(got {resolved!r}) — an earlier PATH dir shadows the guard")
-        return
+    # WI#425: in the --image-root (out-of-band export) mode there is no live
+    # PATH to resolve — the exported tree is not the running environment —
+    # so the resolution check is the CI script's job (it checks the image
+    # config Env instead). In-image builds keep the original check.
+    if check_path_resolution:
+        resolved = shutil.which("opencode")
+        if resolved is None or pathlib.Path(resolved) != wrapper_path:
+            fail(f"'opencode' on PATH must resolve to the wrapper {wrapper_path} "
+                 f"(got {resolved!r}) — an earlier PATH dir shadows the guard")
+            return
     # WI#425 GX-2: the real binary must be root-owned and not group/other
     # writable like the wrapper; every parent directory of both paths must
     # block entry replacement so the agent uid cannot swap either file
@@ -479,6 +492,15 @@ def main() -> int:
         help="verify installed policy-file ownership/modes (image builds only)",
     )
     parser.add_argument(
+        "--image-root",
+        type=pathlib.Path,
+        default=None,
+        help="root of an unpacked image filesystem (WI#425 out-of-band verification "
+        "in CI): the installed wrapper and real binary are verified under this "
+        "root instead of / — the BuildKit local export carries no /proc, so "
+        "nothing about the in-image environment is trusted",
+    )
+    parser.add_argument(
         "--config",
         default=None,
         help="lane config filename (default: opencode2.json for the v2 lane, opencode.json otherwise)",
@@ -510,7 +532,15 @@ def main() -> int:
     if args.image_filesystem:
         check_image_filesystem(lane)
         if is_v2:
-            check_installed_wrapper(lane)
+            if args.image_root is not None:
+                check_installed_wrapper(
+                    lane,
+                    args.image_root / "usr/local/bin/opencode",
+                    args.image_root / "usr/local/lib/opencode2/opencode",
+                    check_path_resolution=False,
+                )
+            else:
+                check_installed_wrapper(lane)
 
     if failures:
         print(f"exposure policy: {len(failures)} check(s) FAILED for {lane}", file=sys.stderr)

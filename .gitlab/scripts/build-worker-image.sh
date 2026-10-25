@@ -229,6 +229,10 @@ build_image() {
         --opt filename=Dockerfile \
         --metadata-file "$output_metadata" \
         --output "type=image,name=$output_ref,push=true,oci-mediatypes=false,rewrite-timestamp=true"
+    # WI#425: the opencode2 candidate additionally exports its filesystem
+    # (multiple --output flags, BuildKit >= 0.13; pinned v0.25.1) for the
+    # out-of-band exposure-policy verification job.
+    [ -n "${build_image_extra_output:-}" ] && set -- "$@" --output "$build_image_extra_output"
     while IFS= read -r build_arg; do
         [ -n "$build_arg" ] && set -- "$@" --opt "build-arg:$build_arg"
     done < "$CI_PROJECT_DIR/worker-build-args.txt"
@@ -382,12 +386,34 @@ print_reproducibility_diagnosis() {
     return 0
 }
 
+# WI#425 (run-109 GW-3, durable out-of-band verification — CI half): the
+# opencode2 candidate build additionally exports its final filesystem via a
+# second --output (multiple exporters need BuildKit >= 0.13; the pinned
+# v0.25.1 has them), so the worker-opencode2-exposure-verify job can run the
+# CHECKOUT's exposure_policy_assert.py against the shipped tree instead of
+# trusting the in-Dockerfile assert (the checker and its environment are
+# baked by the same Dockerfile they verify). BuildKit's local exporter
+# applies layer whiteouts, so the export is the true final filesystem; the
+# rebuild pass deliberately does not export again (same inputs, one export).
+if [ "$1" = opencode2 ]; then
+    export_dir="$CI_PROJECT_DIR/opencode2-rootfs-export"
+    rm -rf "$export_dir"
+    build_image_extra_output="type=local,dest=$export_dir"
+fi
+
 build_image_with_retry "$candidate_ref" "$metadata_file" false
 digest=$(metadata_digest "$metadata_file")
 case "$digest" in
     sha256:????????????????????????????????????????????????????????????????) ;;
     *) echo "BuildKit did not report a valid image digest" >&2; exit 1 ;;
 esac
+# WI#425: the filesystem export rides the candidate build only; the rebuild
+# is a reproducibility re-check and must not re-export (same inputs).
+build_image_extra_output=""
+if [ "$1" = opencode2 ] && [ ! -d "$export_dir/app/scripts" ]; then
+    echo "BuildKit local export did not produce the app tree (WI#425)" >&2
+    exit 1
+fi
 
 build_image_with_retry "$rebuild_ref" "$rebuild_metadata_file" true
 rebuild_digest=$(metadata_digest "$rebuild_metadata_file")

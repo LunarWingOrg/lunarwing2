@@ -31,6 +31,11 @@
       - worker-image-metadata.json
       - worker-image-rebuild-metadata.json
       - worker-inputs.sha256
+      # WI#425: opencode2 candidate exports its final filesystem for the
+      # out-of-band exposure-policy verification job. Only opencode2 writes
+      # it; the other workers' candidate jobs log a harmless "no matching
+      # files" and continue.
+      - opencode2-rootfs-export
   rules:
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$/ && $CI_COMMIT_REF_PROTECTED == "true"'
       when: manual
@@ -262,6 +267,37 @@ worker-opencode2-promote:
       artifacts: true
     - job: worker-opencode2-scan
       artifacts: true
+    - job: worker-opencode2-exposure-verify
+      artifacts: false
+
+# WI#425 (run-109 GW-3): durable out-of-band exposure-policy verification —
+# runs the CHECKOUT's checker against the candidate image's exported
+# filesystem and fetches the image config blob to refuse Env/Shell drift,
+# instead of trusting the in-Dockerfile assert (whose checker and
+# environment are baked by the same file they verify).
+worker-opencode2-exposure-verify:
+  image:
+    name: "docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"
+  tags:
+    - container-build
+  stage: containers
+  interruptible: false
+  retry: 0
+  timeout: 30m
+  needs:
+    - job: worker-opencode2-candidate
+      artifacts: true
+  script:
+    - set -a; . ./worker-image.env; set +a
+    - python3 .gitlab/scripts/verify-opencode2-exposure-out-of-band.py
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$/ && $CI_COMMIT_REF_PROTECTED == "true"'
+      when: on_success
+      allow_failure: false
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+      when: on_success
+      allow_failure: false
+    - when: never
 
 worker-kimi-candidate:
   extends: .worker-candidate
