@@ -853,9 +853,16 @@ re-checked 2026-10-13):
   rootless lane; the rootful launch runs the whole container as the
   tenant uid ("Launch identity (WI#422)") — there the agent shares the
   bridge's uid, so it can still signal or trace the bridge and read its
-  environment (no split, by design per WI#422). Residual: `self-update` still
-  fetches over the network from the (now unprivileged) task uid, so the
-  real fix for that half remains control 1 (egress allowlist). Keep the
+  environment (no split, by design per WI#422). **WI#425 (2026-10-25):**
+  `pebble self-update` is now refused by a PATH-visible refusal wrapper
+  (`pebble4lunarwing/scripts/pebble-self-update-guard.sh`, installed over
+  `/usr/local/bin/pebble`; the real pinned binary moves to
+  `/usr/local/lib/pebble/pebble`), so a naive `self-update` cannot replace
+  the reviewed, reproducibly-built pin with an unreviewed upstream release
+  from either the bridge-spawned task (whose `pebble_bin` resolves through
+  PATH) or the CLI one-shot. It is a naive-use guard — task code can still
+  exec `/usr/local/lib/pebble/pebble` directly — so the real fix for the
+  network fetch remains control 1 (egress allowlist, WI#424). Keep the
   pinned `PEBBLE_LOCK_SHA256` build contract intact.
 
 ## LunarWing Worker
