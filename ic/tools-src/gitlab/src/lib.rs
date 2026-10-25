@@ -312,14 +312,7 @@ fn execute_inner(params: &str) -> Result<String, String> {
             ref_,
             per_page,
             page,
-        } => api::search_blobs(
-            &client,
-            &project,
-            &query,
-            ref_.as_deref(),
-            per_page,
-            page,
-        )?,
+        } => api::search_blobs(&client, &project, &query, ref_.as_deref(), per_page, page)?,
         GitlabAction::ListPipelines {
             project,
             status,
@@ -481,10 +474,8 @@ mod tests {
         assert_eq!(query, "TODO");
         assert_eq!(ref_.as_deref(), Some("feature/wi-315"));
 
-        let action = parse_action(
-            r#"{"action":"search_blobs","project":35,"query":"TODO"}"#,
-        )
-        .unwrap_or_else(|error| panic!("default branch call must stay valid: {error}"));
+        let action = parse_action(r#"{"action":"search_blobs","project":35,"query":"TODO"}"#)
+            .unwrap_or_else(|error| panic!("default branch call must stay valid: {error}"));
         let GitlabAction::SearchBlobs { ref_, .. } = action else {
             panic!("wrong variant");
         };

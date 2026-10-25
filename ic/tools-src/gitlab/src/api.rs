@@ -829,8 +829,7 @@ mod tests {
             ("0f4b2a1c", "0f4b2a1c"),
             ("release candidate", "release%20candidate"),
         ] {
-            let endpoint =
-                search_blobs_endpoint("35", "search_blobs", Some(ref_), 20, 1).unwrap();
+            let endpoint = search_blobs_endpoint("35", "search_blobs", Some(ref_), 20, 1).unwrap();
             assert!(
                 endpoint.ends_with(&format!("&ref={encoded}")),
                 "ref {ref_} not encoded into {endpoint}"
@@ -849,14 +848,8 @@ mod tests {
 
     #[test]
     fn project_search_endpoint_encodes_project_and_query() {
-        let endpoint = project_search_endpoint(
-            "group/project",
-            "blobs",
-            "def search_blobs(",
-            20,
-            1,
-        )
-        .unwrap();
+        let endpoint =
+            project_search_endpoint("group/project", "blobs", "def search_blobs(", 20, 1).unwrap();
         assert_eq!(
             endpoint,
             "/projects/group%2Fproject/search?scope=blobs&search=def%20search_blobs%28&per_page=20&page=1"
