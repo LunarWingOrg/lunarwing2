@@ -913,10 +913,16 @@ What a worker may reach:
 * its own tenant's configured LLM endpoint(s) — the container-reachable form
   of `LLM_BASE_URL` and `{opencode,opencode2,kimi,pebble}_BASE_URL`. A
   host-loopback endpoint (`127.0.0.1`, `localhost`, `0.0.0.0`) is translated to
-  the tenant network's gateway, the only host address a rootless worker can
-  reach; a hostname is resolved on the host and every IPv4 answer becomes a
-  rule. An unresolvable name **fails the ruleset** — a target is never silently
-  dropped;
+  every host address the worker can actually reach — the network gateway, plus
+  pasta's `169.254.1.2` (`host.containers.internal`) under rootless podman,
+  which is the one a rootless worker really uses; a hostname is resolved on the
+  host and every IPv4 answer becomes a
+  rule. A URL with no explicit port uses the scheme default (80/443). An
+  unresolvable **operator** entry fails the ruleset (a typo or dead resolver
+  must be loud); an unresolvable **tenant LLM endpoint** is warned about and
+  omitted, which can only narrow the allowlist — a transient resolver failure
+  at boot must not take the worker down, and the worker then reports the
+  endpoint unreachable;
 * DNS, UDP and TCP port 53, **to the network gateway only** (aardvark-dns
   forwards upstream from there; the container never talks to an external
   resolver, so a worker cannot use DNS as an exfiltration path);
