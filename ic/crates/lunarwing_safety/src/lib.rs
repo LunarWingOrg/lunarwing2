@@ -49,6 +49,8 @@ pub struct SafetyLayer {
     policy: Policy,
     leak_detector: LeakDetector,
     config: SafetyConfig,
+    #[cfg(test)]
+    cut_scan_bytes: std::cell::RefCell<Vec<usize>>,
 }
 
 impl SafetyLayer {
@@ -60,6 +62,8 @@ impl SafetyLayer {
             policy: Policy::default(),
             leak_detector: LeakDetector::new(),
             config: config.clone(),
+            #[cfg(test)]
+            cut_scan_bytes: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -69,6 +73,8 @@ impl SafetyLayer {
         const WINDOW: usize = 1024;
         let start = output.ceil_char_boundary(cut.saturating_sub(WINDOW));
         let end = output.floor_char_boundary(cut.saturating_add(WINDOW).min(output.len()));
+        #[cfg(test)]
+        self.cut_scan_bytes.borrow_mut().push(end - start);
         let matches = self.leak_detector.scan(&output[start..end]).matches;
         let bytes = output.as_bytes();
         let token = |b: u8| b.is_ascii_alphanumeric() || b"_+/=.~-".contains(&b);
@@ -1186,6 +1192,44 @@ mod tests {
                 assert!(result.content.contains("blob_id\":\"BLOB-WI355"));
                 assert!(!result.content.contains("showing 0/"));
                 assert!(shown_payload_bytes(&result.content) <= 4096);
+            }
+        }
+
+        /// WI#355 acceptance: each cut performs at most two detector scans of
+        /// at most 2 KiB each, even while walking a multi-KiB token run.
+        #[test]
+        fn token_run_walk_scans_at_most_two_2kib_windows_per_cut() {
+            for tail in [false, true] {
+                for run_len in [3_000usize, 20_000, 100_000] {
+                    let safety = safety_with_max_len(4096);
+                    let input = if tail {
+                        format!(
+                            "{}{}{}",
+                            " ".repeat(5_000),
+                            base64_run(run_len),
+                            " ".repeat(100)
+                        )
+                    } else {
+                        format!(
+                            "{}{}{}",
+                            " ".repeat(100),
+                            base64_run(run_len),
+                            " ".repeat(5_000)
+                        )
+                    };
+                    let cut = if tail { input.len() - 2048 } else { 2048 };
+                    safety.secret_safe_cut(&input, cut, tail);
+                    let scans = safety.cut_scan_bytes.borrow();
+                    assert_eq!(
+                        scans.len(),
+                        2,
+                        "expected the first window plus one bounded rescan (tail={tail}, run={run_len}): {scans:?}"
+                    );
+                    assert!(
+                        scans.iter().all(|len| *len <= 2 * 1024),
+                        "window over 2 KiB (tail={tail}, run={run_len}): {scans:?}"
+                    );
+                }
             }
         }
 

@@ -275,15 +275,18 @@ the safety layer's `sanitize_tool_output` size cut
 the v1 routine loop, and the engine effect bridge (the v1 live loop is capped
 there, not uncapped as WI#349 stated), and the v1 routine tool loop adds its
 own 8192-byte cap (`ic/src/agent/routine_engine.rs`). Safety truncation scans
-fixed 2 KiB windows around both cuts, removes crossing secrets/token runs,
-and drops a retained side if the window cannot establish a safe boundary.
-The final retained text is still leak-scanned; PEM BEGIN and END markers block.
+bounded 2 KiB windows around both cuts and removes crossing secrets/token
+runs. When a run crosses a window edge, the cut walks to the run boundary with
+a plain byte loop (no regex over the run) and scans one more bounded window
+there — at most two 2 KiB windows per cut
+([WI#355](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/355)).
+Only a second window that still cannot establish a safe boundary discards the
+retained side, so a long inline base64/hex blob (e.g. an inline image in a
+list item or a repository-file `content` field) no longer costs the
+pagination block or `file_name`/`ref`/`blob_id` metadata. The final retained
+text is still leak-scanned; PEM BEGIN and END markers block.
 Thus secret protection can reduce the retained payload below its budget.
-In particular, a long base64/hex run crossing a cut can exhaust the window:
-discarding the tail also discards its pagination block, and discarding both
-sides can remove all metadata. This fail-closed tradeoff is tracked in
-[WI#355](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/355), including
-the proposed byte-walk plus second bounded scan. The notice separates itself
+The notice separates itself
 from retained text with blank lines and describes "retained edges", since
 either edge can be empty. The remaining detector gap is tracked separately:
 [WI#354](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/354)
