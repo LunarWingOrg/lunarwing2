@@ -40,7 +40,8 @@ pebble4lunarwing/src/workspace_path.rs
 pebble4lunarwing/upstream/Cargo.lock
 pebble4lunarwing/scripts/verify_upstream_lock.py
 pebble4lunarwing/scripts/toolchain-profile.sh
-pebble4lunarwing/scripts/rustup-wrapper.sh'
+pebble4lunarwing/scripts/rustup-wrapper.sh
+pebble4lunarwing/scripts/pebble-self-update-guard.sh'
         source_ref=2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b
         build_args="PEBBLE_REF=2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b
 WITH_TOOLCHAINS=false

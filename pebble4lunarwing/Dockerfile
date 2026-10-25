@@ -211,7 +211,15 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
     fi
 
 COPY --from=builder /build/bridge/target/release/pebble4lunarwing /usr/local/bin/pebble4lunarwing
-COPY --from=builder /build/pebble/target/release/pebble /usr/local/bin/pebble
+# WI#425 (control 11 pebble residual): the real pinned pebble moves aside so
+# the self-update refusal wrapper can own /usr/local/bin/pebble. Task code
+# reaching `pebble self-update` (via PATH or the bridge's `pebble_bin`)
+# hits the wrapper; the pin stays a reviewed, reproducibly-built binary.
+COPY --from=builder /build/pebble/target/release/pebble /usr/local/lib/pebble/pebble
+COPY pebble4lunarwing/scripts/pebble-self-update-guard.sh /usr/local/bin/pebble
+RUN chmod 0755 /usr/local/bin/pebble /usr/local/lib/pebble/pebble \
+    && [ "$(stat -c %a /usr/local/bin/pebble)" = "755" ] \
+    && [ "$(stat -c %U /usr/local/bin/pebble)" = "root" ]
 COPY pebble4lunarwing/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # WI#324: register the LunarWing tool-proxy MCP shim for `pebble` runs.

@@ -253,6 +253,17 @@ class TaskShellToolchainPathTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertIn(path, build_script)
 
+    def test_ci_image_build_tracks_the_self_update_guard(self):
+        # WI#425: the self-update refusal wrapper is a build-executed input
+        # (installed over /usr/local/bin/pebble), so it hashes into the
+        # worker-inputs manifest like the opencode2 wrapper does (CY-4).
+        build_script = (ROOT / ".gitlab/scripts/build-worker-image.sh").read_text(encoding="utf-8")
+        self.assertIn("pebble4lunarwing/scripts/pebble-self-update-guard.sh", build_script)
+
+        dockerfile = (ROOT / "pebble4lunarwing/Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("COPY --from=builder /build/pebble/target/release/pebble /usr/local/lib/pebble/pebble", dockerfile)
+        self.assertIn("COPY pebble4lunarwing/scripts/pebble-self-update-guard.sh /usr/local/bin/pebble", dockerfile)
+
 
 class ToolchainProfileBehaviourTests(unittest.TestCase):
     """WI#334: source toolchain-profile.sh in a real POSIX shell and assert
