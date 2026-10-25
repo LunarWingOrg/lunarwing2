@@ -134,10 +134,15 @@ impl HybridStore {
         };
 
         self.load_knowledge_docs(ws).await;
-        self.load_map(ws, PROJECTS_PREFIX, |project: Project| async {
+        self.load_map(ws, PROJECTS_PREFIX, "project", |project: Project| async {
             self.projects.write().await.insert(project.id, project);
         })
         .await;
+        // WI#321: a project whose project.json failed to load is absent from
+        // the map, so the unlocked check-then-create can mint a second
+        // "default" project for the same user. Surface that here, before any
+        // mission/thread resolution has to pick between them.
+        self.warn_duplicate_default_projects().await;
         // Consolidation runs after projects load so legacy-identity duplicates
         // (nil project) can be adopted by the sole known project when one
         // exists — otherwise the seeder would never find the canonical doc.
@@ -145,6 +150,7 @@ impl HybridStore {
         self.load_map(
             ws,
             CONVERSATIONS_PREFIX,
+            "conversation",
             |conversation: ConversationSurface| async {
                 self.conversations
                     .write()
@@ -153,23 +159,33 @@ impl HybridStore {
             },
         )
         .await;
-        self.load_map(ws, THREADS_PREFIX, |thread: Thread| async {
+        self.load_map(ws, THREADS_PREFIX, "thread", |thread: Thread| async {
             self.threads.write().await.insert(thread.id, thread);
         })
         .await;
-        self.load_map(ws, STEPS_PREFIX, |steps: Vec<Step>| async {
-            if let Some(thread_id) = steps.first().map(|step| step.thread_id) {
-                self.steps.write().await.insert(thread_id, steps);
-            }
-        })
+        self.load_map(
+            ws,
+            STEPS_PREFIX,
+            "thread step batch",
+            |steps: Vec<Step>| async {
+                if let Some(thread_id) = steps.first().map(|step| step.thread_id) {
+                    self.steps.write().await.insert(thread_id, steps);
+                }
+            },
+        )
         .await;
-        self.load_map(ws, EVENTS_PREFIX, |events: Vec<ThreadEvent>| async {
-            if let Some(thread_id) = events.first().map(|event| event.thread_id) {
-                self.events.write().await.insert(thread_id, events);
-            }
-        })
+        self.load_map(
+            ws,
+            EVENTS_PREFIX,
+            "thread event batch",
+            |events: Vec<ThreadEvent>| async {
+                if let Some(thread_id) = events.first().map(|event| event.thread_id) {
+                    self.events.write().await.insert(thread_id, events);
+                }
+            },
+        )
         .await;
-        self.load_map(ws, LEASES_PREFIX, |lease: CapabilityLease| async {
+        self.load_map(ws, LEASES_PREFIX, "lease", |lease: CapabilityLease| async {
             self.leases.write().await.insert(lease.id, lease);
         })
         .await;
@@ -202,6 +218,30 @@ impl HybridStore {
             "loaded engine state from workspace"
         );
         Ok(())
+    }
+
+    /// Warn once per user holding more than one `"default"` project (WI#321).
+    ///
+    /// Two unlocked check-then-create windows (`resolve_user_project` and the
+    /// engine boot path) can each mint a `"default"` project when the first
+    /// one's `project.json` has not loaded or the lookup raced. Missions and
+    /// conversations are then attached to whichever project a map listing
+    /// happened to yield first, which reads as "the mission disappeared".
+    /// Boot is the earliest point where every loaded project is visible.
+    async fn warn_duplicate_default_projects(&self) {
+        let projects: Vec<Project> = self.projects.read().await.values().cloned().collect();
+        let mut by_user: HashMap<&str, Vec<&Project>> = HashMap::new();
+        for project in projects.iter().filter(|p| p.name == "default") {
+            by_user
+                .entry(project.user_id.as_str())
+                .or_default()
+                .push(project);
+        }
+        // Reuse the picker so the boot scan and the routing path warn with the
+        // same wording and agree on which project wins.
+        for (user_id, defaults) in by_user {
+            let _ = canonical_default_project(user_id, &defaults);
+        }
     }
 
     /// Evict terminal (Done/Failed) threads from in-memory caches.
@@ -594,8 +634,20 @@ impl HybridStore {
         );
     }
 
-    async fn load_map<T, F, Fut>(&self, ws: &Workspace, directory: &str, on_value: F)
-    where
+    /// Load every persisted record under `directory` into the in-memory maps.
+    ///
+    /// A record whose file cannot be read or parsed is dropped from the map, so
+    /// the warning below is the only trace that it ever existed (WI#321): at
+    /// debug it was invisible under the default log filter and the record then
+    /// also vanished from every listing and schedule. `kind` names the record
+    /// family so the warning reads without a stack of surrounding context.
+    async fn load_map<T, F, Fut>(
+        &self,
+        ws: &Workspace,
+        directory: &str,
+        kind: &'static str,
+        on_value: F,
+    ) where
         T: DeserializeOwned,
         F: Fn(T) -> Fut,
         Fut: std::future::Future<Output = ()>,
@@ -604,9 +656,21 @@ impl HybridStore {
             match ws.read(&entry.path).await {
                 Ok(doc) => match serde_json::from_str::<T>(&doc.content) {
                     Ok(value) => on_value(value).await,
-                    Err(e) => debug!(path = %entry.path, "failed to parse engine state: {e}"),
+                    Err(e) => {
+                        let record_id = record_id_hint(&doc.content);
+                        warn!(
+                            kind,
+                            path = %entry.path,
+                            record_id = record_id.as_deref().unwrap_or("unknown"),
+                            "dropping {kind} record: failed to parse: {e}"
+                        );
+                    }
                 },
-                Err(e) => debug!(path = %entry.path, "failed to read engine state: {e}"),
+                Err(e) => warn!(
+                    kind,
+                    path = %entry.path,
+                    "dropping {kind} record: failed to read: {e}"
+                ),
             }
         }
     }
@@ -947,19 +1011,43 @@ impl HybridStore {
                     continue;
                 }
                 let mission_file = format!("{}/mission.json", mission_entry.path);
-                if let Ok(doc) = ws.read_primary(&mission_file).await {
-                    match serde_json::from_str::<serde_json::Value>(&doc.content) {
-                        Ok(raw) => match serde_json::from_value::<Mission>(raw.clone()) {
-                            Ok(mission) => {
-                                candidates.push((mission_file, raw, mission));
-                            }
-                            Err(e) => {
-                                debug!(path = %mission_file, "failed to parse mission: {e}")
-                            }
-                        },
-                        Err(e) => {
-                            debug!(path = %mission_file, "failed to parse mission JSON: {e}")
+                let doc = match ws.read_primary(&mission_file).await {
+                    Ok(doc) => doc,
+                    Err(e) => {
+                        warn!(
+                            path = %mission_file,
+                            "dropping mission: failed to read mission.json: {e}"
+                        );
+                        continue;
+                    }
+                };
+                match serde_json::from_str::<serde_json::Value>(&doc.content) {
+                    Ok(raw) => match serde_json::from_value::<Mission>(raw.clone()) {
+                        Ok(mission) => {
+                            candidates.push((mission_file, raw, mission));
                         }
+                        Err(e) => {
+                            let mission_id = raw
+                                .get("id")
+                                .and_then(|id| id.as_str())
+                                .unwrap_or("unknown");
+                            let mission_name = raw
+                                .get("name")
+                                .and_then(|name| name.as_str())
+                                .unwrap_or("unknown");
+                            warn!(
+                                path = %mission_file,
+                                mission_id,
+                                mission_name,
+                                "dropping mission: failed to parse: {e}"
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        warn!(
+                            path = %mission_file,
+                            "dropping mission: failed to parse mission.json: {e}"
+                        );
                     }
                 }
             }
@@ -1251,6 +1339,55 @@ fn project_dir(name: &str, project_id: ProjectId) -> String {
 
 fn project_path(name: &str, project_id: ProjectId) -> String {
     format!("{}/project.json", project_dir(name, project_id))
+}
+
+/// Best-effort record id from a document that failed to deserialize (WI#321).
+///
+/// Re-parses only on the failure path, so the happy path pays nothing. Handles
+/// the `Vec<_>` record families (steps, events) by reading the first element.
+/// `None` means the document is not JSON at all or carries no string `id`; the
+/// warning still names the path.
+fn record_id_hint(content: &str) -> Option<String> {
+    let raw: serde_json::Value = serde_json::from_str(content).ok()?;
+    let record = match &raw {
+        serde_json::Value::Array(items) => items.first()?,
+        other => other,
+    };
+    record
+        .get("id")
+        .and_then(|id| id.as_str())
+        .map(str::to_owned)
+}
+
+/// Pick a user's canonical `"default"` project out of one listing.
+///
+/// WI#321: two unlocked check-then-create windows can leave more than one
+/// `"default"` project for the same user, and a map-backed listing makes
+/// "first" arbitrary — so a conversation could land in a different project on
+/// each call and its missions look like they vanished. Warn when that is
+/// observed, and always return the oldest (ties broken by id) so repeated
+/// resolutions agree.
+pub(crate) fn canonical_default_project<'a>(
+    user_id: &str,
+    projects: &[&'a Project],
+) -> Option<&'a Project> {
+    let mut defaults: Vec<&Project> = projects
+        .iter()
+        .copied()
+        .filter(|project| project.name == "default")
+        .collect();
+    defaults.sort_by_key(|project| (project.created_at, project.id.0));
+    let picked = *defaults.first()?;
+    if defaults.len() > 1 {
+        let project_ids: Vec<String> = defaults.iter().map(|p| p.id.0.to_string()).collect();
+        warn!(
+            user_id,
+            count = defaults.len(),
+            project_ids = ?project_ids,
+            "multiple \"default\" projects for one user; using the oldest"
+        );
+    }
+    Some(picked)
 }
 
 fn thread_path(thread_id: ThreadId) -> String {
@@ -2167,6 +2304,7 @@ impl Store for HybridStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing_test::traced_test;
 
     #[test]
     fn mission_delete_path_targets_persisted_document() {
@@ -2179,6 +2317,182 @@ mod tests {
                 "{}/mission.json",
                 mission_dir("default--project", "Daily report", id)
             )
+        );
+    }
+
+    #[test]
+    fn record_id_hint_reads_object_and_batch_ids() {
+        // The dropped-record warning names the id when the document is valid
+        // JSON with a string `id`, including the `Vec<_>` step/event batches.
+        assert_eq!(record_id_hint(r#"{"id":"abc"}"#).as_deref(), Some("abc"));
+        assert_eq!(
+            record_id_hint(r#"[{"id":"first"},{"id":"second"}]"#).as_deref(),
+            Some("first")
+        );
+        assert_eq!(record_id_hint("{not json"), None);
+        assert_eq!(record_id_hint(r#"{"id":7}"#), None);
+    }
+
+    #[test]
+    fn canonical_default_project_ignores_non_default_projects() {
+        // The picker is fed the caller's whole project list, so only projects
+        // actually named "default" may compete — an older custom project must
+        // never be returned as the default (WI#321).
+        let mut research = Project::new("u", "research", "r");
+        research.created_at = chrono::Utc::now() - chrono::Duration::hours(5);
+        let default = Project::new("u", "default", "d");
+        let refs = vec![&research, &default];
+        assert_eq!(
+            canonical_default_project("u", &refs).map(|project| project.id),
+            Some(default.id)
+        );
+        assert!(canonical_default_project("u", &[&research]).is_none());
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    #[traced_test]
+    async fn corrupt_mission_json_warns_with_identifiers_instead_of_vanishing() {
+        // WI#321 regression: a mission.json that fails to deserialize used to be
+        // dropped at debug! — the mission then disappeared from every listing
+        // and schedule with no above-debug signal. It must now warn, name the
+        // record, and still be absent from the loaded map (the drop is real).
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("corrupt-mission-warn", db));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let project = Project::new("test-user", "warn project", "test");
+        let mission = Mission::new(
+            project.id,
+            "test-user",
+            "vanishing mission",
+            "should warn",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        store.save_project(&project).await.expect("save project");
+        store.save_mission(&mission).await.expect("save mission");
+
+        // Schema-invalid but still parseable JSON: the id survives for the
+        // warning, the typed deserialization does not.
+        let path = mission_path(
+            &store.project_slug(project.id).await,
+            &mission.name,
+            mission.id,
+        );
+        let mut raw: serde_json::Value = serde_json::from_str(
+            &workspace
+                .read_primary(&path)
+                .await
+                .expect("read mission")
+                .content,
+        )
+        .expect("mission json");
+        raw["cadence"] = serde_json::json!("not-a-cadence");
+        workspace
+            .write(&path, &raw.to_string())
+            .await
+            .expect("corrupt mission");
+
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded
+            .load_state_from_workspace()
+            .await
+            .expect("reload engine state");
+
+        assert!(
+            reloaded
+                .load_mission(mission.id)
+                .await
+                .expect("load")
+                .is_none(),
+            "a mission that failed to parse must not silently appear as loaded"
+        );
+        assert!(
+            logs_contain("dropping mission: failed to parse"),
+            "expected a parse warning (tracing-test prints the captured logs on failure)"
+        );
+        assert!(
+            logs_contain(&mission.id.0.to_string()),
+            "the warning must name the mission id"
+        );
+        assert!(logs_contain(&path), "the warning must name the path");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    #[traced_test]
+    async fn non_json_project_file_warns_instead_of_vanishing() {
+        // Same class as the mission regression above, on the project load path:
+        // a project.json that is not JSON at all is dropped, so the warning is
+        // the only trace that the project ever existed.
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("corrupt-project-warn", db));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let project = Project::new("test-user", "broken project", "test");
+        store.save_project(&project).await.expect("save project");
+        let path = project_path(&project.name, project.id);
+        workspace
+            .write(&path, "{ this is not json")
+            .await
+            .expect("corrupt project");
+
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded
+            .load_state_from_workspace()
+            .await
+            .expect("reload engine state");
+
+        assert!(
+            reloaded
+                .load_project(project.id)
+                .await
+                .expect("load")
+                .is_none(),
+            "a project that failed to parse must not appear as loaded"
+        );
+        assert!(logs_contain("dropping project record: failed to parse"));
+        assert!(logs_contain(&path), "the warning must name the path");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    #[traced_test]
+    async fn duplicate_default_projects_warn_at_boot_and_pick_the_oldest() {
+        // WI#321: two unlocked check-then-create windows can mint two "default"
+        // projects for one user. Boot must say so, and the shared picker must
+        // return the oldest deterministically so routing/listings agree.
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("duplicate-defaults", db));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let mut oldest = Project::new("test-user", "default", "first");
+        oldest.created_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        let mut newest = Project::new("test-user", "default", "second");
+        newest.created_at = chrono::Utc::now();
+        // An older non-default project must never be mistaken for the default.
+        let mut other = Project::new("test-user", "research", "not a default");
+        other.created_at = chrono::Utc::now() - chrono::Duration::hours(2);
+        store.save_project(&other).await.expect("save other");
+        store.save_project(&oldest).await.expect("save oldest");
+        store.save_project(&newest).await.expect("save newest");
+
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded
+            .load_state_from_workspace()
+            .await
+            .expect("reload engine state");
+
+        assert!(
+            logs_contain("multiple \"default\" projects for one user"),
+            "boot must warn about duplicate default projects"
+        );
+        assert!(logs_contain(&oldest.id.0.to_string()));
+        assert!(logs_contain(&newest.id.0.to_string()));
+
+        let projects = reloaded.list_projects("test-user").await.expect("list");
+        let defaults: Vec<&Project> = projects.iter().collect();
+        let picked = canonical_default_project("test-user", &defaults).expect("a default");
+        assert_eq!(
+            picked.id, oldest.id,
+            "the oldest default project must win, not a map-order pick"
         );
     }
 

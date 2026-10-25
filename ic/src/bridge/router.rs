@@ -25,7 +25,7 @@ use crate::bridge::effect_adapter::{
     EffectBridgeAdapter, MISSIONS_CAPABILITY, mission_action_defs,
 };
 use crate::bridge::llm_adapter::{DEFAULT_MAX_OUTPUT_TOKENS, LlmBridgeAdapter};
-use crate::bridge::store_adapter::HybridStore;
+use crate::bridge::store_adapter::{HybridStore, canonical_default_project};
 use crate::channels::web::sse::SseManager;
 use crate::channels::{IncomingMessage, OutgoingResponse, StatusUpdate};
 use crate::db::Database;
@@ -891,13 +891,16 @@ async fn resolve_user_project(
         return Ok(fallback);
     }
 
-    // Look for an existing default project owned by this user
+    // Look for an existing default project owned by this user. The pick is
+    // deterministic and warns on duplicates (WI#321) so a conversation cannot
+    // land in a different "default" project on each resolution.
     let projects = store
         .list_projects(user_id)
         .await
         .map_err(|e| engine_err("project lookup", e))?;
 
-    if let Some(project) = projects.iter().find(|p| p.name == "default") {
+    let defaults: Vec<&lunarwing_engine::Project> = projects.iter().collect();
+    if let Some(project) = canonical_default_project(user_id, &defaults) {
         return Ok(project.id);
     }
 
@@ -1826,14 +1829,14 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
     let owner_id = &agent.deps.owner_id;
     migrate_legacy_user_ids(&store_dyn, owner_id).await;
 
-    // Reuse the persisted default project when available.
-    let project_id = match store
+    // Reuse the persisted default project when available. The pick is
+    // deterministic and warns on duplicates (WI#321).
+    let owner_projects = store
         .list_projects(owner_id)
         .await
-        .map_err(|e| engine_err("store error", e))?
-        .into_iter()
-        .find(|project| project.name == "default")
-    {
+        .map_err(|e| engine_err("store error", e))?;
+    let owner_defaults: Vec<&Project> = owner_projects.iter().collect();
+    let project_id = match canonical_default_project(owner_id, &owner_defaults) {
         Some(project) => project.id,
         None => {
             let project = Project::new(owner_id, "default", "Default project for engine v2");
@@ -5003,11 +5006,12 @@ async fn resolve_user_project_readonly(
         return fallback;
     }
     match store.list_projects(user_id).await {
-        Ok(projects) => projects
-            .iter()
-            .find(|project| project.name == "default")
-            .map(|project| project.id)
-            .unwrap_or(fallback),
+        Ok(projects) => {
+            let defaults: Vec<&Project> = projects.iter().collect();
+            canonical_default_project(user_id, &defaults)
+                .map(|project| project.id)
+                .unwrap_or(fallback)
+        }
         Err(_) => fallback,
     }
 }
