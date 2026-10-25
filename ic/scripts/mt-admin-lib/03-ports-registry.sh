@@ -229,9 +229,20 @@ ports_migrate_v7() {
   say "port registry migrated to v7 (darkirc_irc + darkirc_rpc added)"
 }
 
+# v7 -> v8: dedicate extended_ports.reserved_3 -> nanocode_health and
+# reserved_4 -> pebble_health (pure rename). Mirrors the standalone
+# scripts/migrate-ports-v8.sh's safety net (WI#379): back the live registry up
+# first, then refuse to swap a candidate that leaves any numeric port assigned
+# to more than one slot — on refusal the backup stays and the live registry is
+# untouched.
 ports_migrate_v8() {
   say "migrating port registry v${current_version} -> v8 (dedicate nanocode_health + pebble_health) ..."
-  local tmp
+  local backup tmp collisions
+  backup="${PORTS_REGISTRY}.bak.$(date -u +%Y%m%d%H%M%S)"
+  cp -p "$PORTS_REGISTRY" "$backup" \
+    || die "failed to back up port registry to $backup; v8 migration aborted"
+  say "backed up port registry to $backup"
+
   tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
   jq '
     .version = 8
@@ -247,10 +258,20 @@ ports_migrate_v8() {
             )
         )
       )
-  ' "$PORTS_REGISTRY" >"$tmp"
+  ' "$PORTS_REGISTRY" >"$tmp" \
+    || { rm -f "$tmp"; die "failed to migrate port registry to v8; registry unchanged (backup: $backup)"; }
+
+  collisions="$(ports_registry_collision_list "$tmp")"
+  if [[ -n "$collisions" ]]; then
+    rm -f "$tmp"
+    die "v8 migration aborted: port(s) $collisions assigned to more than one slot; registry unchanged (backup: $backup)"
+  fi
+
   chmod 0644 "$tmp"
   mv "$tmp" "$PORTS_REGISTRY"
   current_version=8
+  say "port registry migrated to v8 (nanocode_health + pebble_health dedicated)"
+  say "rollback if needed: cp $backup $PORTS_REGISTRY"
 }
 
 ports_migrate() {
@@ -805,13 +826,14 @@ ports_warn_block_in_use() {
   return 0
 }
 
-# List port numbers assigned to more than one slot across the whole registry
-# (all per-tenant port maps plus the host-global health_metrics slot). Empty
-# output means no collisions. Pure read — used by doctor; also handy for
-# operators debugging a hand-edited or migrated registry.
-ports_registry_duplicate_ports() {
+# List numeric port numbers assigned to more than one slot in <registry-file>
+# (all per-tenant port maps plus the host-global health_metrics slot) as a
+# comma-separated string; empty output means no collisions. Non-numeric hand
+# edits are ignored. Shared by the post-allocation warning / doctor query and
+# the v8 migration's pre-swap guard (WI#379) so both define "collision"
+# identically.
+ports_registry_collision_list() {  # <registry-file>
   require_cmd jq
-  [[ -f "$PORTS_REGISTRY" ]] || return 0
   jq -r '
     [ .tenants[]
       | ((.ports // {}) | to_entries[] | .value),
@@ -824,7 +846,15 @@ ports_registry_duplicate_ports() {
     | group_by(.)
     | map(select(length > 1) | .[0] | tostring)
     | join(", ")
-  ' "$PORTS_REGISTRY" 2>/dev/null
+  ' "$1" 2>/dev/null || true
+}
+
+# List port numbers assigned to more than one slot across the whole registry.
+# Empty output means no collisions. Pure read — used by doctor; also handy for
+# operators debugging a hand-edited or migrated registry.
+ports_registry_duplicate_ports() {
+  [[ -f "$PORTS_REGISTRY" ]] || return 0
+  ports_registry_collision_list "$PORTS_REGISTRY"
 }
 
 # Mark darkirc enabled for a tenant in the registry (one-directional: false -> true).
