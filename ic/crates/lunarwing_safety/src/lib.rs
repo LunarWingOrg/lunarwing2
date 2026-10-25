@@ -1367,5 +1367,93 @@ mod tests {
             // The dot-separated payload and signature specifically.
             assert!(!result.content.contains(&format!("{body}.{body}")));
         }
+
+        /// WI#355 reviewer probe P2 (!1909 run-215 review): a long token run
+        /// ending in the bearer scheme word, a space and a 40-byte credential,
+        /// then 100 trailing spaces, at budget 16 384. The walk stops at the
+        /// space, so only the second-window rescan can catch the credential.
+        /// Pins the no-disclosure assertion the existing suite covered only via
+        /// scan-count and discard tests. Fails if the second window is skipped
+        /// (returning `walked`).
+        #[test]
+        fn probe_tail_rescan_covers_bearer_split_at_walked_boundary() {
+            let safety = safety_with_max_len(16_384);
+            let input = format!(
+                "{}{}Bearer {}{}",
+                " ".repeat(30_000),
+                "Z".repeat(9_000),
+                "Q".repeat(40),
+                " ".repeat(100)
+            );
+            let r = safety.sanitize_tool_output("test", &input);
+            assert!(!r.content.contains('Q'), "PROBE P2: credential shown");
+            assert!(r.content.ends_with(&" ".repeat(100)));
+        }
+
+        /// WI#355 reviewer probe P3 (!1909 run-215 review): at the production
+        /// budget of 100 000, a 60 KB base64 run walked from byte 50 000 reaches
+        /// its boundary at 100 (head) and 120 000 (tail). Four scans of at most
+        /// 2048 bytes each, and the notice reads `showing 50100/120100 bytes`.
+        /// Pins the walk at the production budget — a capped walk (`walked` close
+        /// to `first.cut`) leaves the suite green at 4096-only budgets.
+        #[test]
+        fn probe_walk_reaches_far_run_boundary_at_production_budget() {
+            let safety = safety_with_max_len(100_000);
+            let head = format!("{}{}{}", " ".repeat(100), base64_run(60_000), " ".repeat(60_000));
+            assert_eq!(safety.secret_safe_cut(&head, 50_000, false), 100, "PROBE P3 head");
+            let tail = format!("{}{}{}", " ".repeat(60_000), base64_run(60_000), " ".repeat(100));
+            assert_eq!(
+                safety.secret_safe_cut(&tail, tail.len() - 50_000, true),
+                120_000,
+                "PROBE P3 tail"
+            );
+            {
+                let scans = safety.cut_scan_bytes.borrow();
+                assert_eq!(scans.len(), 4, "{scans:?}");
+                assert!(scans.iter().all(|l| *l <= 2048));
+            }
+            let r = safety.sanitize_tool_output("test", &head);
+            assert!(r.content.starts_with(&" ".repeat(100)));
+            assert!(r.content.contains("showing 50100/120100 bytes"), "PROBE P3 notice");
+        }
+
+        /// WI#355 reviewer probe P4 (!1909 run-215 review): a 10 KB single run
+        /// walks to byte 0 and to `len` without panicking (`showing 0/10000`).
+        /// Pins the `walked > 0` and `walked < output.len()` guards that the
+        /// existing suite did not exercise at the output edge.
+        #[test]
+        fn probe_walk_to_output_edge() {
+            let safety = safety_with_max_len(4096);
+            let input = "Z".repeat(10_000);
+            assert_eq!(safety.secret_safe_cut(&input, 2048, false), 0, "PROBE P4 head");
+            assert_eq!(
+                safety.secret_safe_cut(&input, 10_000 - 2048, true),
+                10_000,
+                "PROBE P4 tail"
+            );
+            let r = safety.sanitize_tool_output("test", &input);
+            assert!(!r.content.contains('Z'));
+            assert!(r.content.contains("showing 0/10000 bytes"), "PROBE P4 notice");
+        }
+
+        /// WI#355 reviewer probe P5 (!1909 run-215 review): second-window edges
+        /// land inside 2-byte (`é`) characters; the cuts are 3001 and 30 000 and
+        /// stay on char boundaries. Pins `ceil_char_boundary` / `floor_char_
+        /// boundary` on the second window, which the existing suite reached
+        /// only at ASCII edges.
+        #[test]
+        fn probe_second_window_edges_inside_multibyte_chars() {
+            let safety = safety_with_max_len(16_384);
+            let head = format!("{} {}{}", "é".repeat(1_500), "Z".repeat(10_000), " ".repeat(20_000));
+            assert_eq!(safety.secret_safe_cut(&head, 8_192, false), 3_001, "PROBE P5 head");
+            let tail = format!("{}{} {}", " ".repeat(20_000), "Z".repeat(10_000), "é".repeat(1_500));
+            assert_eq!(
+                safety.secret_safe_cut(&tail, tail.len() - 8_192, true),
+                30_000,
+                "PROBE P5 tail"
+            );
+            let r = safety.sanitize_tool_output("test", &head);
+            assert!(r.content.starts_with(&format!("{} ", "é".repeat(1_500))));
+        }
     }
 }
