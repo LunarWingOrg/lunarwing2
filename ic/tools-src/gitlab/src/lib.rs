@@ -5,6 +5,7 @@
 
 mod api;
 mod gitlab;
+mod params;
 mod types;
 
 use types::GitlabAction;
@@ -52,6 +53,17 @@ impl exports::lunarwing::agent::tool::Guest for GitlabTool {
 }
 
 fn execute_inner(params: &str) -> Result<String, String> {
+    // One approval covers parameter errors as well as HTTP calls, so a
+    // rejection must teach the caller how to retry in a single message.
+    // Field names are checked before serde: its strict-schema rejection
+    // names only the offending field, not the names that would work.
+    params::validate(params).map_err(|error| {
+        lunarwing::agent::host::log(
+            lunarwing::agent::host::LogLevel::Warn,
+            "GitLab tool parameter validation failed",
+        );
+        format!("Invalid GitLab parameters: {error}")
+    })?;
     let action = parse_action(params).map_err(|error| {
         lunarwing::agent::host::log(
             lunarwing::agent::host::LogLevel::Warn,
@@ -297,9 +309,17 @@ fn execute_inner(params: &str) -> Result<String, String> {
         GitlabAction::SearchBlobs {
             project,
             query,
+            ref_,
             per_page,
             page,
-        } => api::search_blobs(&client, &project, &query, per_page, page)?,
+        } => api::search_blobs(
+            &client,
+            &project,
+            &query,
+            ref_.as_deref(),
+            per_page,
+            page,
+        )?,
         GitlabAction::ListPipelines {
             project,
             status,
@@ -440,6 +460,35 @@ mod tests {
     fn action_parser_rejects_unknown_fields() {
         let input = r#"{"action":"current_user","token":"must-not-be-accepted"}"#;
         assert!(parse_action(input).is_err());
+    }
+
+    #[test]
+    fn search_blobs_accepts_optional_ref() {
+        let action = parse_action(
+            r#"{"action":"search_blobs","project":"group/repo","query":"TODO","ref":"feature/wi-315"}"#,
+        )
+        .unwrap_or_else(|error| panic!("ref must be accepted: {error}"));
+        let GitlabAction::SearchBlobs {
+            project,
+            query,
+            ref_,
+            ..
+        } = action
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(project, "group/repo");
+        assert_eq!(query, "TODO");
+        assert_eq!(ref_.as_deref(), Some("feature/wi-315"));
+
+        let action = parse_action(
+            r#"{"action":"search_blobs","project":35,"query":"TODO"}"#,
+        )
+        .unwrap_or_else(|error| panic!("default branch call must stay valid: {error}"));
+        let GitlabAction::SearchBlobs { ref_, .. } = action else {
+            panic!("wrong variant");
+        };
+        assert!(ref_.is_none());
     }
 
     #[test]

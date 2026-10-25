@@ -570,14 +570,56 @@ pub fn search_issues(
     project_search(client, project, "issues", query, per_page, page_number)
 }
 
+/// GitLab's project search supports `ref` only for the repository scopes
+/// (`blobs`, `commits`, `wiki_blobs`); `search_issues` has no branch filter.
+/// A branch/tag/SHA is accepted rather than a branch name only: GitLab
+/// passes `ref` straight through to the repository search backend.
 pub fn search_blobs(
     client: &GitlabClient,
     project: &str,
     query: &str,
+    ref_: Option<&str>,
     per_page: u32,
     page_number: u32,
 ) -> Result<Value, String> {
-    project_search(client, project, "blobs", query, per_page, page_number)
+    let endpoint = search_blobs_endpoint(project, query, ref_, per_page, page_number)?;
+    client.request_json("GET", &endpoint, None)
+}
+
+fn search_blobs_endpoint(
+    project: &str,
+    query: &str,
+    ref_: Option<&str>,
+    per_page: u32,
+    page_number: u32,
+) -> Result<String, String> {
+    require_nonempty("query", query)?;
+    if let Some(ref_) = ref_ {
+        require_nonempty("ref", ref_)?;
+    }
+    let (per_page, page_number) = page(per_page, page_number);
+    let mut endpoint = project_search_endpoint(project, "blobs", query, per_page, page_number)?;
+    if let Some(ref_) = ref_ {
+        endpoint.push_str("&ref=");
+        endpoint.push_str(&url_encode(ref_));
+    }
+    Ok(endpoint)
+}
+
+/// Search URL shared by every project search scope. Split out so the
+/// `blobs` branch filter can be pinned without a live GitLab instance.
+fn project_search_endpoint(
+    project: &str,
+    scope: &str,
+    query: &str,
+    per_page: u32,
+    page_number: u32,
+) -> Result<String, String> {
+    Ok(format!(
+        "/projects/{}/search?scope={scope}&search={}&per_page={per_page}&page={page_number}",
+        project_path(project)?,
+        url_encode(query)
+    ))
 }
 
 fn project_search(
@@ -725,7 +767,10 @@ fn nonempty_optional(value: Option<&str>) -> Option<&str> {
 mod tests {
     use serde_json::Map;
 
-    use super::{require_changes, validate_choice, validate_file_path, work_items_endpoint};
+    use super::{
+        project_search_endpoint, require_changes, search_blobs_endpoint, validate_choice,
+        validate_file_path, work_items_endpoint,
+    };
 
     #[test]
     fn validates_enums() {
@@ -765,5 +810,64 @@ mod tests {
     #[test]
     fn update_requires_a_change() {
         assert!(require_changes("update_issue", &Map::new()).is_err());
+    }
+
+    /// WI#315: the branch/tag filter must reach the request URL, and stay
+    /// absent when the caller does not name a ref.
+    #[test]
+    fn search_blobs_ref_reaches_the_request_url() {
+        let default_branch = search_blobs_endpoint("35", "search_blobs", None, 20, 1).unwrap();
+        assert_eq!(
+            default_branch,
+            "/projects/35/search?scope=blobs&search=search_blobs&per_page=20&page=1"
+        );
+        assert!(!default_branch.contains("ref="));
+
+        for (ref_, encoded) in [
+            ("feature/wi-315", "feature%2Fwi-315"),
+            ("v2.1.7.0", "v2.1.7.0"),
+            ("0f4b2a1c", "0f4b2a1c"),
+            ("release candidate", "release%20candidate"),
+        ] {
+            let endpoint =
+                search_blobs_endpoint("35", "search_blobs", Some(ref_), 20, 1).unwrap();
+            assert!(
+                endpoint.ends_with(&format!("&ref={encoded}")),
+                "ref {ref_} not encoded into {endpoint}"
+            );
+        }
+
+        for blank in ["", "   "] {
+            assert!(
+                search_blobs_endpoint("35", "q", Some(blank), 20, 1).is_err(),
+                "accepted a blank ref {blank:?}"
+            );
+        }
+        // An empty query is still rejected with or without a ref.
+        assert!(search_blobs_endpoint("35", "", Some("main"), 20, 1).is_err());
+    }
+
+    #[test]
+    fn project_search_endpoint_encodes_project_and_query() {
+        let endpoint = project_search_endpoint(
+            "group/project",
+            "blobs",
+            "def search_blobs(",
+            20,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            endpoint,
+            "/projects/group%2Fproject/search?scope=blobs&search=def%20search_blobs%28&per_page=20&page=1"
+        );
+
+        // Only the repository scopes take ref; issues never gains one.
+        let issues = project_search_endpoint("35", "issues", "refactor", 20, 2).unwrap();
+        assert_eq!(
+            issues,
+            "/projects/35/search?scope=issues&search=refactor&per_page=20&page=2"
+        );
+        assert!(!issues.contains("ref="));
     }
 }
