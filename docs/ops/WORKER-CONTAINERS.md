@@ -1005,6 +1005,13 @@ busybox probe, and asserts all four outcomes plus the reject counter.
   is the boundary, and it is only as good as the operator's list: adding a
   broad `host:443` entry widens it.
 
+**Rollout on an existing fleet.** The network is attached at container
+*create* time, so a tenant already running a pre-WI#424 worker keeps open
+egress until that container is recreated. `start-tenant` (or
+`worker-egress-apply` followed by a worker restart) does this, because the
+launch contract gains the network and the create path force-recreates on a
+contract change; nothing removes a running container out from under a job.
+
 ### Generic sandbox egress default (WI#154)
 
 The generic podman sandbox (`shell` tool, `ic/src/sandbox/`) defaults to

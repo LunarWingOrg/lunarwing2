@@ -235,6 +235,61 @@ else
   pass "attachment detection: unattached"
 fi
 
+# ── audit (WI#424 AC3) ──────────────────────────────────────────────────────
+# The audit must report host-side truth and fail unless the filter is provably
+# live. drive_audit() runs it in a subshell with the registry/runtime stubs so
+# the real function body is exercised.
+tenant_exists_in_registry() { return 0; }
+audit_output=""
+drive_audit() {  # <nft-list-rc> <attached?>
+  (
+    CTR_ATTACHED="$2"
+    NFT_LIST_RC="$1"
+    NFT_LIST_OUT=$'table inet lunarwing_worker_egress {\n\tchain workers {\n\t\tip saddr 10.89.10.0/24 counter reject\n\t}\n}'
+    worker_egress_audit alpha
+  ) 2>&1
+}
+
+audit_output="$(drive_audit 0 attached)"
+if ( NFT_LIST_RC=0 CTR_ATTACHED=attached; worker_egress_audit alpha ) >/dev/null 2>&1; then
+  pass "audit exits 0 when the network, attachment and filter are all present"
+else
+  fail "audit failed a fully healthy tenant"
+fi
+assert_contains "$audit_output" "filter: live" "audit reports the live filter"
+assert_contains "$audit_output" "container lunarwing-opencode2-alpha: attached" \
+  "audit reports container attachment"
+
+if ( CTR_ATTACHED="" NFT_LIST_RC=0 worker_egress_audit alpha ) >/dev/null 2>&1; then
+  fail "audit passed a container that is not on the egress network"
+else
+  pass "audit fails a container that is not on the egress network"
+fi
+assert_contains "$(CTR_ATTACHED="" NFT_LIST_RC=0 worker_egress_audit alpha 2>&1)" \
+  "NOT ATTACHED" "audit names the unattached container"
+
+if ( CTR_ATTACHED=attached NFT_LIST_RC=1 worker_egress_audit alpha ) >/dev/null 2>&1; then
+  fail "audit passed a tenant with no loaded filter"
+else
+  pass "audit fails a tenant with no loaded filter"
+fi
+assert_contains "$(CTR_ATTACHED=attached NFT_LIST_RC=1 worker_egress_audit alpha 2>&1)" \
+  "filter: NOT LOADED" "audit names the missing filter"
+
+# An unallocated tenant must not report a healthy (empty) allowlist.
+if ( worker_egress_audit unallocated ) >/dev/null 2>&1; then
+  fail "audit passed a tenant with no egress allocation"
+else
+  pass "audit fails a tenant with no egress allocation"
+fi
+
+# The audit must never read container-writable state: it asks the runtime and
+# the netns directly.
+audit_src="$(sed -n '/^worker_egress_audit()/,/^}/p' "$HARNESS_REPO_ROOT/ic/scripts/mt-admin-lib/15-worker-egress.sh")"
+assert_contains "$audit_src" "worker_egress_nft" "audit reads the live chain host-side"
+assert_contains "$audit_src" "worker_egress_container_attached" "audit reads attachment from the runtime"
+assert_absent "$audit_src" "podman exec" "audit never asks the container about itself"
+
 # ── launch-contract pins (source-level, like the other harnesses) ────────────
 worker_config="$HARNESS_REPO_ROOT/ic/scripts/mt-admin-lib/09-worker-config.sh"
 systemd_lib="$HARNESS_REPO_ROOT/ic/scripts/mt-admin-lib/07-units-systemd.sh"
