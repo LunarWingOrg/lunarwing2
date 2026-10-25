@@ -115,6 +115,15 @@ assert_contains "$ruleset" "ip saddr 10.89.10.0/24 ip daddr 10.89.10.1 udp dport
   "DNS is allowed only to the tenant gateway"
 assert_contains "$ruleset" "ip saddr 10.89.10.0/24 ip daddr 10.89.10.1 tcp dport 3000 accept" \
   "a host-loopback LLM endpoint is translated to the gateway"
+# Headless/rootless check: run the pure renderer in a subshell so the
+# rootless extra host alias is exercised too (this harness runs as a test
+# user, so CONTAINER_RT/MT_ROOTLESS come from the sourced constants).
+assert_contains "$(CONTAINER_RT=podman MT_ROOTLESS=true worker_egress_ruleset alpha)" \
+  "ip saddr 10.89.10.0/24 ip daddr 169.254.1.2 tcp dport 3000 accept" \
+  "rootless workers may reach the host at its pasta alias"
+assert_contains "$(CONTAINER_RT=podman MT_ROOTLESS=false worker_egress_ruleset alpha)" \
+  "ip saddr 10.89.10.0/24 ip daddr 10.89.10.1 tcp dport 3000 accept" \
+  "rootful workers reach the host through the bridge gateway"
 assert_contains "$ruleset" "ip saddr 10.89.10.0/24 ip daddr 203.0.113.10 tcp dport 8443 accept" \
   "an address-literal LLM endpoint becomes its own rule"
 assert_contains "$ruleset" "counter reject with icmpx type admin-prohibited" \
@@ -129,7 +138,7 @@ assert_eq "$(grep -c 'reject' <<<"$ruleset")" "1" "exactly one reject rule"
 # A loopback endpoint keeps its port through translation (distinct port so the
 # assertion cannot be satisfied by the 3000 rule).
 OPERATOR_ALLOW=("http://127.0.0.1:8443/admin")
-assert_contains "$(worker_egress_ruleset alpha)" \
+assert_contains "$(CONTAINER_RT=podman MT_ROOTLESS=false worker_egress_ruleset alpha)" \
   "ip saddr 10.89.10.0/24 ip daddr 10.89.10.1 tcp dport 8443 accept" \
   "host-loopback endpoints keep their port through translation"
 OPERATOR_ALLOW=("https://203.0.113.20:443/repo.git")
@@ -235,12 +244,63 @@ assert_eq "$(grep -c 'prepare_worker_egress "$name"' "$worker_config")" "4" \
   "all four worker start paths prepare (and verify) the filter"
 assert_contains "$(cat "$systemd_lib")" 'Network=${egress_network}' \
   "Quadlet workers join the egress network"
-assert_contains "$(cat "$systemd_lib")" 'ExecStartPre=${egress_podman} unshare --rootless-netns' \
-  "Quadlet workers reload the filter before every start"
+assert_contains "$(cat "$systemd_lib")" 'ExecStartPre=${egress_guard} ${egress_ruleset} rootless' \
+  "Quadlet workers load and verify the filter before every start"
+assert_absent "$(cat "$systemd_lib")" 'egress_nft' \
+  "the Quadlet no longer carries its own nft invocation (one guard for both inits)"
 assert_contains "$(cat "$worker_config")" "refusing to start unfiltered" \
   "the OpenRC boot path fails closed"
-assert_contains "$(cat "$worker_config")" "worker egress ruleset missing" \
-  "the OpenRC boot path refuses to start without a ruleset"
+assert_contains "$(cat "$worker_config")" 'wk_egress_guard' \
+  "the OpenRC boot path runs the same guard as the Quadlet"
+assert_contains "$(cat "$worker_config")" "worker egress guard missing" \
+  "the OpenRC boot path refuses to start without the guard"
+
+# ── the guard script itself ─────────────────────────────────────────────────
+guard="$HARNESS_REPO_ROOT/ic/scripts/lunarwing-worker-egress-guard.sh"
+guard_src="$(cat "$guard")"
+assert_contains "$guard_src" "list chain inet" "the guard verifies through a fresh netns entry"
+assert_contains "$guard_src" "did not survive the load" "the guard refuses a filter that did not persist"
+assert_contains "$guard_src" "without its reject rule" "the guard refuses a chain with no drop rule"
+assert_absent "$guard_src" "|| true" "the guard never swallows a load failure"
+assert_eq "$(stat -c '%a' "$guard")" "755" "the guard is executable"
+assert_contains "$(cat "$HARNESS_REPO_ROOT/ic/scripts/mt-admin-lib/15-worker-egress.sh")" \
+  'WORKER_EGRESS_GUARD="/usr/local/libexec/lunarwing-worker-egress-guard"' \
+  "the guard is installed to a root-owned libexec path (not tenant-writable)"
+
+# Behavioural: a ruleset file that does not exist must fail, and a real one
+# must pass against a stubbed nft. The stub keeps this hermetic.
+guard_bin="$fixture/bin"
+mkdir -p "$guard_bin"
+cat >"$guard_bin/nft" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+  -f) exit "${FAKE_LOAD_RC:-0}" ;;
+  list) [[ "${FAKE_LIST_RC:-0}" == "0" ]] || exit 1
+        printf 'chain workers {\n  ip saddr 10.89.10.0/24 counter reject\n}\n' ;;
+esac
+STUB
+chmod +x "$guard_bin/nft"
+if PATH="$guard_bin:$PATH" FAKE_LOAD_RC=0 "$guard" "$fixture/alpha.nft" rootful >/dev/null 2>&1; then
+  fail "the guard passed with a missing ruleset file"
+else
+  pass "the guard refuses a missing ruleset file"
+fi
+: >"$fixture/alpha.nft"
+if PATH="$guard_bin:$PATH" FAKE_LOAD_RC=0 "$guard" "$fixture/alpha.nft" rootful >/dev/null 2>&1; then
+  pass "the guard passes a live filter"
+else
+  fail "the guard rejected a live filter"
+fi
+if PATH="$guard_bin:$PATH" FAKE_LOAD_RC=1 "$guard" "$fixture/alpha.nft" rootful >/dev/null 2>&1; then
+  fail "the guard passed a failed load"
+else
+  pass "the guard refuses a failed load"
+fi
+if PATH="$guard_bin:$PATH" FAKE_LIST_RC=1 "$guard" "$fixture/alpha.nft" rootful >/dev/null 2>&1; then
+  fail "the guard passed a filter that did not survive"
+else
+  pass "the guard refuses a filter that did not survive"
+fi
 
 # ── live kernel check (rootless netns) ──────────────────────────────────────
 # Loads the *real* generated ruleset into a throwaway rootless netns and reads

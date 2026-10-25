@@ -546,11 +546,10 @@ render_worker_quadlet() {
   # starts at every boot (the netns is recreated when no container pins it, so
   # a build-once rule set would be gone after a reboot). ExecStartPre failure
   # refuses the unit start: fail closed.
-  local egress_network egress_ruleset egress_nft egress_podman
+  local egress_network egress_ruleset egress_guard
   egress_network="$(worker_egress_network_name "$name")"
   egress_ruleset="$(worker_egress_ruleset_path "$name")"
-  egress_nft="$(command -v nft || printf '/usr/sbin/nft')"
-  egress_podman="$(command -v podman || printf '/usr/bin/podman')"
+  egress_guard="$WORKER_EGRESS_GUARD"
 
   local unit_staged
   # WI#446 (run-166 LF-8): the Quadlet embeds AGENT_AUTH_TOKEN/TENSORZERO_API_KEY,
@@ -685,7 +684,7 @@ HealthStartPeriod=30s
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=120
-ExecStartPre=${egress_podman} unshare --rootless-netns ${egress_nft} -f ${egress_ruleset}
+ExecStartPre=${egress_guard} ${egress_ruleset} rootless
 
 [Install]
 WantedBy=default.target

@@ -43,6 +43,19 @@ WORKER_EGRESS_SUBNET_PREFIX="10.89"
 WORKER_EGRESS_SUBNET_MIN=10
 WORKER_EGRESS_SUBNET_MAX=250
 WORKER_EGRESS_LOCK=""
+# Addresses a worker can use to reach services on THIS host. The network
+# gateway covers rootful podman/netavark (the bridge gateway is a host
+# address); rootless podman with pasta publishes the host at 169.254.1.2 and
+# puts it in the container's /etc/hosts as `host.containers.internal`
+# (verified on this fleet). Both are the same machine, so a loopback endpoint
+# is allowed on both. LUNARWING_MT_WORKER_HOST_ADDRS overrides the extra list
+# for a different rootless backend (slirp4netns uses 10.0.2.2).
+WORKER_EGRESS_HOST_ADDRS="${LUNARWING_MT_WORKER_HOST_ADDRS:-169.254.1.2}"
+# Root-owned copy of the load+verify helper the boot paths call. It lives in
+# /usr/local/libexec so a tenant-writable path can never shadow it (the guard
+# itself runs as the tenant in a Quadlet ExecStartPre).
+WORKER_EGRESS_GUARD_SRC="$SCRIPT_DIR/lunarwing-worker-egress-guard.sh"
+WORKER_EGRESS_GUARD="/usr/local/libexec/lunarwing-worker-egress-guard"
 
 worker_egress_network_name() {  # <tenant>
   printf 'lw-egress-%s\n' "$1"
@@ -87,6 +100,19 @@ _worker_egress_unlock() {
   [[ -n "$WORKER_EGRESS_LOCK" ]] || return 0
   exec 197>&-
   WORKER_EGRESS_LOCK=""
+# Addresses a worker can use to reach services on THIS host. The network
+# gateway covers rootful podman/netavark (the bridge gateway is a host
+# address); rootless podman with pasta publishes the host at 169.254.1.2 and
+# puts it in the container's /etc/hosts as `host.containers.internal`
+# (verified on this fleet). Both are the same machine, so a loopback endpoint
+# is allowed on both. LUNARWING_MT_WORKER_HOST_ADDRS overrides the extra list
+# for a different rootless backend (slirp4netns uses 10.0.2.2).
+WORKER_EGRESS_HOST_ADDRS="${LUNARWING_MT_WORKER_HOST_ADDRS:-169.254.1.2}"
+# Root-owned copy of the load+verify helper the boot paths call. It lives in
+# /usr/local/libexec so a tenant-writable path can never shadow it (the guard
+# itself runs as the tenant in a Quadlet ExecStartPre).
+WORKER_EGRESS_GUARD_SRC="$SCRIPT_DIR/lunarwing-worker-egress-guard.sh"
+WORKER_EGRESS_GUARD="/usr/local/libexec/lunarwing-worker-egress-guard"
 }
 
 worker_egress_state_get() {  # <tenant> <KEY>
@@ -175,6 +201,18 @@ _worker_egress_split_target() {  # <target> <require-port: true|false>
 # reachable from a rootless worker. Split and resolution are separate so
 # *validation* stays offline (no DNS at configure time); resolution failure at
 # render time is fatal, never a silently dropped allowlist entry.
+# Every address a worker can use to reach this host: the tenant network
+# gateway, plus the rootless host alias(es). Rootful runs add only the gateway.
+_worker_egress_host_addrs() {  # <gateway>
+  local gateway="$1" address
+  printf '%s\n' "$gateway"
+  [[ "${CONTAINER_RT:-}" == "podman" && "${MT_ROOTLESS:-}" == "true" ]] || return 0
+  for address in $WORKER_EGRESS_HOST_ADDRS; do
+    [[ "$address" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid LUNARWING_MT_WORKER_HOST_ADDRS entry '$address'"
+    [[ "$address" == "$gateway" ]] || printf '%s\n' "$address"
+  done
+}
+
 _worker_egress_resolve_target() {  # <url-or-host:port> <gateway>
   local target="$1" gateway="$2" host port answer address split
   split="$(_worker_egress_split_target "$target" true)" \
@@ -182,7 +220,10 @@ _worker_egress_resolve_target() {  # <url-or-host:port> <gateway>
   read -r host port <<<"$split"
   case "$host" in
     127.0.0.1|localhost|0.0.0.0|::1)
-      printf '%s %s\n' "$gateway" "$port"
+      local host_addrs
+      host_addrs="$(_worker_egress_host_addrs "$gateway")" \
+        || die "cannot derive the host addresses for worker egress"
+      printf '%s\n' "$host_addrs" | awk -v p="$port" 'NF == 1 { print $1, p }'
       return 0
       ;;
     *[!0-9.]*)
@@ -345,6 +386,7 @@ worker_egress_apply() {  # <tenant>
   require_cmd nft
   ruleset_path="$(worker_egress_ruleset_path "$name")"
   _worker_egress_write_ruleset "$name" || die "failed to render worker egress ruleset for '$name'"
+  install_worker_egress_guard
   worker_egress_nft "$name" -f "$ruleset_path" \
     || die "failed to load worker egress ruleset for '$name'"
   if ! dump="$(worker_egress_nft "$name" list chain inet "$WORKER_EGRESS_TABLE" "$WORKER_EGRESS_CHAIN" 2>/dev/null)"; then
@@ -353,6 +395,18 @@ worker_egress_apply() {  # <tenant>
   grep -q "reject" <<<"$dump" \
     || die "worker egress filter for '$name' loaded without its drop rule (fail closed)"
   printf '%s\n' "$dump"
+}
+
+# Install the root-owned load+verify helper the boot paths invoke. Same shape as
+# the other mt-admin libexec helpers: byte-copied, root-owned, 0755.
+install_worker_egress_guard() {
+  # Only root installs into the system path; a non-root dry run (or the
+  # harness) keeps the load+verify behaviour without touching /usr/local.
+  [[ "$(id -u)" == "0" ]] || return 0
+  [[ -f "$WORKER_EGRESS_GUARD_SRC" ]] \
+    || die "worker egress guard script missing: $WORKER_EGRESS_GUARD_SRC"
+  install -d -m 0755 /usr/local/libexec
+  install -m 0755 -o root -g root "$WORKER_EGRESS_GUARD_SRC" "$WORKER_EGRESS_GUARD"
 }
 
 worker_egress_flush() {  # <tenant>

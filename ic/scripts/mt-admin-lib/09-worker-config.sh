@@ -36,9 +36,9 @@ render_worker_openrc_unit() {
   # reload the egress filter before the container starts. The ruleset lives in
   # root-owned state and the netns is recreated across reboots, so a rule set
   # loaded once at provision time would not be there.
-  local egress_ruleset egress_nft
+  local egress_ruleset egress_guard
   egress_ruleset="$(worker_egress_ruleset_path "$name")"
-  egress_nft="$(command -v nft || printf '/usr/sbin/nft')"
+  egress_guard="$WORKER_EGRESS_GUARD"
 
   cat >"/etc/init.d/${container}" <<INITEOF
 #!/sbin/openrc-run
@@ -54,7 +54,7 @@ description="LunarWing ${worker} worker ($name)"
 : "\${wk_health_port:=$health_port}"
 : "\${wk_wait:=60}"
 : "\${wk_egress_ruleset:=$egress_ruleset}"
-: "\${wk_nft:=$egress_nft}"
+: "\${wk_egress_guard:=$egress_guard}"
 
 depend() {
     need net localmount
@@ -83,17 +83,16 @@ start() {
         checkpath -d -m 0700 -o "\${wk_user}:\${wk_user}" "/run/user/\${wk_uid}"
     fi
     # WI#424 control 1: fail closed — no verified egress filter, no worker.
-    if [ ! -f "\${wk_egress_ruleset}" ]; then
-        eend 1 "worker egress ruleset missing (\${wk_egress_ruleset}); run configure-worker-egress"
+    # Same root-owned guard the Quadlet ExecStartPre runs, so the two init
+    # paths cannot drift.
+    if [ ! -x "\${wk_egress_guard}" ]; then
+        eend 1 "worker egress guard missing (\${wk_egress_guard}); run worker-egress-apply as root"
         return 1
     fi
-    if [ "\${wk_rootless}" = "true" ]; then
-        _wk unshare --rootless-netns "\${wk_nft}" -f "\${wk_egress_ruleset}" \
-            || { eend 1 "worker egress filter failed to load; refusing to start unfiltered"; return 1; }
-    else
-        "\${wk_nft}" -f "\${wk_egress_ruleset}" \
-            || { eend 1 "worker egress filter failed to load; refusing to start unfiltered"; return 1; }
-    fi
+    _egress_mode="rootful"
+    [ "\${wk_rootless}" = "true" ] && _egress_mode="rootless"
+    "\${wk_egress_guard}" "\${wk_egress_ruleset}" "\${_egress_mode}" \
+        || { eend 1 "worker egress filter failed to load or verify; refusing to start unfiltered"; return 1; }
     _wk start "\${wk_container}" >/dev/null 2>&1 || { eend 1 "container start failed"; return 1; }
     _w=0
     while ! _wk_healthy; do
