@@ -1680,8 +1680,6 @@ start_tenant_opencode() {
     local -a ssh_mount=(-v "${ssh_agent_dir}:/tmp/ssh-agent:ro,z" -e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock)
     _ctr "$name" run -d \
       --name "$container_name" \
-      --network "$(worker_egress_network_name "$name")" \
-      --label "lunarwing.egress=$(worker_egress_network_name "$name")" \
       "${healthcheck_args[@]}" \
       "${opencode_userns_args[@]}" \
       --security-opt no-new-privileges \
@@ -1700,6 +1698,8 @@ start_tenant_opencode() {
       "${health_publish[@]}" \
       -v "$workspace_dir:/workspace:z" \
       "${restart_arg[@]}" \
+      --network "$(worker_egress_network_name "$name")" \
+      --label "lunarwing.egress=$(worker_egress_network_name "$name")" \
       lunarwing-worker-opencode:latest \
       --mode websocket >/dev/null
     _store_container_hash \
@@ -1883,8 +1883,6 @@ start_tenant_opencode2() {
     local -a ssh_mount=(-v "${ssh_agent_dir}:/tmp/ssh-agent:ro,z" -e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock)
     _ctr "$name" run -d \
       --name "$container_name" \
-      --network "$(worker_egress_network_name "$name")" \
-      --label "lunarwing.egress=$(worker_egress_network_name "$name")" \
       "${healthcheck_args[@]}" \
       "${userns_args[@]}" \
       -e LUNARWING_WORKER_ID="worker-opencode2-${name}" \
@@ -1901,6 +1899,8 @@ start_tenant_opencode2() {
       "${health_publish[@]}" \
       -v "$workspace_dir:/workspace:z" \
       "${restart_arg[@]}" \
+      --network "$(worker_egress_network_name "$name")" \
+      --label "lunarwing.egress=$(worker_egress_network_name "$name")" \
       lunarwing-worker-opencode2:latest \
       --mode websocket >/dev/null
     _store_container_hash \
@@ -2346,8 +2346,6 @@ start_tenant_kimi() {
     # broker, not the shared tenant agent. Other worker lanes keep the mount.
     _ctr "$name" run -d \
       --name "$container_name" \
-      --network "$(worker_egress_network_name "$name")" \
-      --label "lunarwing.egress=$(worker_egress_network_name "$name")" \
       "${healthcheck_args[@]}" \
       "${kimi_userns_args[@]}" \
       --security-opt no-new-privileges \
@@ -2364,6 +2362,8 @@ start_tenant_kimi() {
       "${health_publish[@]}" \
       -v "$workspace_dir:/workspace:z" \
       "${restart_arg[@]}" \
+      --network "$(worker_egress_network_name "$name")" \
+      --label "lunarwing.egress=$(worker_egress_network_name "$name")" \
       lunarwing-worker-kimi:latest \
       --mode websocket >/dev/null
     _store_container_hash \
@@ -2588,8 +2588,6 @@ start_tenant_pebble() {
     fi
     _ctr "$name" run -d \
       --name "$container_name" \
-      --network "$(worker_egress_network_name "$name")" \
-      --label "lunarwing.egress=$(worker_egress_network_name "$name")" \
       "${healthcheck_args[@]}" \
       "${pebble_userns_args[@]}" \
       "${pebble_user_args[@]}" \
@@ -2607,6 +2605,8 @@ start_tenant_pebble() {
       "${health_publish[@]}" \
       -v "$workspace_dir:/workspace:z" \
       "${restart_arg[@]}" \
+      --network "$(worker_egress_network_name "$name")" \
+      --label "lunarwing.egress=$(worker_egress_network_name "$name")" \
       lunarwing-worker-pebble:latest >/dev/null
     _store_container_hash "$name" "$container_name" "$(tenant_env_dir "$name")/lunarwing.env" "$pebble_launch_contract"
   fi

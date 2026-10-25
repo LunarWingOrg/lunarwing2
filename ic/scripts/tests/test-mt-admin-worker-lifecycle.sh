@@ -80,6 +80,12 @@ _ctr() {
   CALLS+=("ctr:$*")
   return 0
 }
+# WI#424 control 1: the egress allowlist needs a real tenant account and a real
+# netns (it fails closed without one). These lifecycle tests use fixture tenant
+# names that have no account, so the egress step is stubbed here — its own
+# behaviour is pinned by ic/scripts/tests/test-worker-egress.sh, including the
+# rewritten Quadlet's ExecStartPre and Network= lines.
+prepare_worker_egress() { CALLS+=("egress:$1:$2"); }
 start_tenant_opencode() { CALLS+=("start-opencode:$1"); }
 start_tenant_kimi() { CALLS+=("start-kimi:$1"); }
 
