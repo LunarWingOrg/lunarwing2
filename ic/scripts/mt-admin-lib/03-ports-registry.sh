@@ -261,7 +261,10 @@ ports_migrate_v8() {
   ' "$PORTS_REGISTRY" >"$tmp" \
     || { rm -f "$tmp"; die "failed to migrate port registry to v8; registry unchanged (backup: $backup)"; }
 
-  collisions="$(ports_registry_collision_list "$tmp")"
+  collisions="$(ports_registry_collision_list "$tmp")" || {
+    rm -f "$tmp"
+    die "v8 migration aborted: could not verify port uniqueness; registry unchanged (backup: $backup)"
+  }
   if [[ -n "$collisions" ]]; then
     rm -f "$tmp"
     die "v8 migration aborted: port(s) $collisions assigned to more than one slot; registry unchanged (backup: $backup)"
@@ -832,6 +835,12 @@ ports_warn_block_in_use() {
 # edits are ignored. Shared by the post-allocation warning / doctor query and
 # the v8 migration's pre-swap guard (WI#379) so both define "collision"
 # identically.
+#
+# Returns jq's status (NY-9, !1907 review): a corrupt or unreadable registry
+# surfaces as a non-zero exit with empty output, NOT a silent "no collisions".
+# Callers that only care about the collision string must either tolerate a
+# non-zero status (set +e around the capture) or branch on it like the v8
+# migration guard and doctor do.
 ports_registry_collision_list() {  # <registry-file>
   require_cmd jq
   jq -r '
@@ -846,12 +855,14 @@ ports_registry_collision_list() {  # <registry-file>
     | group_by(.)
     | map(select(length > 1) | .[0] | tostring)
     | join(", ")
-  ' "$1" 2>/dev/null || true
+  ' "$1" 2>/dev/null
 }
 
 # List port numbers assigned to more than one slot across the whole registry.
 # Empty output means no collisions. Pure read — used by doctor; also handy for
-# operators debugging a hand-edited or migrated registry.
+# operators debugging a hand-edited or migrated registry. Propagates the
+# collision-list status (non-zero on an unparseable registry) so doctor can
+# distinguish "no collisions" from "could not parse".
 ports_registry_duplicate_ports() {
   [[ -f "$PORTS_REGISTRY" ]] || return 0
   ports_registry_collision_list "$PORTS_REGISTRY"
