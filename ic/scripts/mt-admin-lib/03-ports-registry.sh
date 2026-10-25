@@ -24,12 +24,19 @@
 
 ports_registry_init() {
   local registry_version="" registry_needs_repair="false"
+  # NY-10 (!1907 review): a freshly-seeded registry has no prior live state to
+  # roll back to, so the v8 migration's backup + rollback hint would be
+  # confusing litter on every new host. Track whether the file pre-existed
+  # this call; ports_migrate_v8 skips the backup when it did not.
   if [[ -f "$PORTS_REGISTRY" ]]; then
+    ports_migrate_registry_preexisted=1
     registry_version="$(jq -r '.version // 0' "$PORTS_REGISTRY" 2>/dev/null || true)"
     if jq -e '.tenants | to_entries[] | select(.value.extended_ports | has("darkirc_adapter") | not)' \
         "$PORTS_REGISTRY" >/dev/null 2>&1; then
       registry_needs_repair="true"
     fi
+  else
+    ports_migrate_registry_preexisted=0
   fi
   if [[ ! -f "$PORTS_REGISTRY" || "$registry_version" != "17" || "$registry_needs_repair" == "true" ]]; then
     acquire_ports_lock
@@ -237,11 +244,17 @@ ports_migrate_v7() {
 # untouched.
 ports_migrate_v8() {
   say "migrating port registry v${current_version} -> v8 (dedicate nanocode_health + pebble_health) ..."
-  local backup tmp collisions
-  backup="${PORTS_REGISTRY}.bak.$(date -u +%Y%m%d%H%M%S)"
-  cp -p "$PORTS_REGISTRY" "$backup" \
-    || die "failed to back up port registry to $backup; v8 migration aborted"
-  say "backed up port registry to $backup"
+  local backup="" tmp collisions
+  # NY-10 (!1907 review): only back up and offer a rollback hint when the
+  # registry pre-existed this invocation. A freshly-seeded v3 registry has no
+  # prior live state; backing up its intermediate v7 form would leave a
+  # confusing `.bak.*` next to a file that never existed as a live state.
+  if [[ "${ports_migrate_registry_preexisted:-1}" == "1" ]]; then
+    backup="${PORTS_REGISTRY}.bak.$(date -u +%Y%m%d%H%M%S)"
+    cp -p "$PORTS_REGISTRY" "$backup" \
+      || die "failed to back up port registry to $backup; v8 migration aborted"
+    say "backed up port registry to $backup"
+  fi
 
   tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
   jq '
@@ -274,7 +287,11 @@ ports_migrate_v8() {
   mv "$tmp" "$PORTS_REGISTRY"
   current_version=8
   say "port registry migrated to v8 (nanocode_health + pebble_health dedicated)"
-  say "rollback if needed: cp $backup $PORTS_REGISTRY"
+  # Not a bare `&&` chain: that would make the no-backup case the function's
+  # exit status and abort the `set -e` caller.
+  if [[ -n "$backup" ]]; then
+    say "rollback if needed: cp $backup $PORTS_REGISTRY"
+  fi
 }
 
 ports_migrate() {

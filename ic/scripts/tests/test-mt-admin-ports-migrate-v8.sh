@@ -273,6 +273,44 @@ assert_eq "version stays at 7 after rename-jq failure" \
 assert_no_glob "rename-jq failure removes the candidate temp file" \
   "$PORTS_REGISTRY.tmp.*"
 
+echo "=== ports_migrate_v8 fresh-registry skip-backup (NY-10) ==="
+
+# A freshly-seeded registry (ports_registry_init created it this invocation)
+# has no prior live state to roll back to. ports_migrate_v8 must not write a
+# .bak.* or print a rollback hint for it. The init path sets
+# ports_migrate_registry_preexisted=0 before ports_migrate runs; simulating
+# that here mirrors the fresh-host ladder.
+PORTS_REGISTRY="$FIXTURE/fresh.json"
+cp "$FIXTURE/clean-v7.json" "$PORTS_REGISTRY"
+# shellcheck disable=SC2034  # read by ports_migrate_v8 (sourced library)
+current_version=7
+ports_migrate_registry_preexisted=0
+
+fresh_out="$(ports_migrate_v8)"
+
+assert_eq "fresh registry still bumps to v8" \
+  "$(jq -r '.version' "$PORTS_REGISTRY")" "8"
+assert_eq "fresh registry reports no duplicate ports" \
+  "$(ports_registry_duplicate_ports)" ""
+assert_no_glob "fresh registry writes no backup" "$PORTS_REGISTRY.bak.*"
+assert_no_glob "fresh registry leaves no candidate temp" "$PORTS_REGISTRY.tmp.*"
+case "$fresh_out" in
+  *"rollback if needed"*)
+    echo "  FAIL: fresh registry printed a rollback hint"
+    echo "        in: [$fresh_out]"
+    failures=$((failures + 1))
+    ;;
+  *) echo "  PASS: fresh registry prints no rollback hint" ;;
+esac
+case "$fresh_out" in
+  *"backed up port registry"*)
+    echo "  FAIL: fresh registry announced a backup"
+    echo "        in: [$fresh_out]"
+    failures=$((failures + 1))
+    ;;
+  *) echo "  PASS: fresh registry announces no backup" ;;
+esac
+
 echo
 if ((failures == 0)); then
   echo "ALL PASS"
