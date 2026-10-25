@@ -284,6 +284,7 @@ PORTS_REGISTRY="$FIXTURE/fresh.json"
 cp "$FIXTURE/clean-v7.json" "$PORTS_REGISTRY"
 # shellcheck disable=SC2034  # read by ports_migrate_v8 (sourced library)
 current_version=7
+# shellcheck disable=SC2034  # read by ports_migrate_v8 (sourced library)
 ports_migrate_registry_preexisted=0
 
 fresh_out="$(ports_migrate_v8)"
