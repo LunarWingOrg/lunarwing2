@@ -58,10 +58,26 @@ worker_egress_ruleset_path() {  # <tenant>
 
 # The lock file lives next to the allocations so concurrent add-tenant calls
 # cannot hand two tenants the same /24.
+# The state directory is root-owned in production (mt-admin runs as root) and
+# carries no secrets — the ruleset must be readable by the tenant's own units
+# because they load it inside the tenant netns. A non-root invocation (the
+# harness, a dry run) keeps the invoking user's ownership rather than failing.
+_worker_egress_install_dir() {
+  [[ ! -L "$WORKER_EGRESS_DIR" ]] || die "unsafe worker egress state directory"
+  if [[ "$(id -u)" == "0" ]]; then
+    install -d -o root -g root -m 0755 "$WORKER_EGRESS_DIR"
+  else
+    install -d -m 0755 "$WORKER_EGRESS_DIR"
+  fi
+}
+
+_worker_egress_own_root() {  # <path>
+  [[ "$(id -u)" != "0" ]] || chown root:root -- "$1"
+}
+
 _worker_egress_lock() {
   require_cmd flock
-  [[ ! -L "$WORKER_EGRESS_DIR" ]] || die "unsafe worker egress state directory"
-  install -d -o root -g root -m 0755 "$WORKER_EGRESS_DIR"
+  _worker_egress_install_dir
   WORKER_EGRESS_LOCK="$WORKER_EGRESS_DIR/.lock"
   exec 197>>"$WORKER_EGRESS_LOCK"
   flock -x 197
@@ -81,6 +97,9 @@ worker_egress_state_get() {  # <tenant> <KEY>
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ "$line" == "$key="* ]] && printf '%s\n' "${line#*=}"
   done <"$conf"
+  # The read loop ends on EOF with status 1; callers use this in $(...)
+  # assignments under `set -e`, so an empty/absent key must succeed.
+  return 0
 }
 
 _worker_egress_subnet_in_use() {  # <subnet> <excluding tenant>
@@ -126,24 +145,43 @@ _worker_egress_gateway() {  # <subnet e.g. 10.89.12.0/24>
 # own entry. `127.0.0.1`/`localhost`/`0.0.0.0` mean "a service on this host"
 # and are translated to the tenant network's gateway — the only host address
 # reachable from a rootless worker.
-_worker_egress_resolve_target() {  # <url-or-host:port> <gateway>
-  local target="$1" gateway="$2" authority host port answer
+_worker_egress_split_target() {  # <target> <require-port: true|false>
+  local target="$1" require_port="${2:-false}" authority host port
   authority="${target#*://}"
   authority="${authority%%/*}"
   [[ "$authority" == *"@"* ]] && authority="${authority##*@}"
   case "$authority" in
     \[*\]:*) host="${authority%]:*}"; host="${host#[}"
-             port="${authority##*]:}" ;;
+              port="${authority##*]:}" ;;
     \[*\])   host="${authority#[}"; host="${host%]}"; port="" ;;
-    *:*)     host="${authority%:*}"; port="${authority##*:}" ;;
-    *)       host="$authority"; port="" ;;
+    *:*)      host="${authority%:*}"; port="${authority##*:}" ;;
+    *)        host="$authority"; port="" ;;
   esac
-  [[ -n "$host" ]] || return 0
-  [[ -n "$port" ]] || return 0
-  [[ "$port" =~ ^[0-9]+$ ]] && ((port > 0 && port < 65536)) \
-    || die "invalid port in worker egress target '$target'"
+  [[ -n "$host" ]] || return 1
+  if [[ -n "$port" ]]; then
+    [[ "$port" =~ ^[0-9]+$ ]] && ((port > 0 && port < 65536)) || return 1
+  elif [[ "$require_port" == "true" ]]; then
+    return 1
+  fi
+  printf '%s %s\n' "$host" "$port"
+}
+
+# Print one `address port` pair for a target.
+#
+# Hostnames are resolved on the host (the container's DNS path is allowlisted
+# to the gateway, but the rule set is static): every IPv4 answer becomes its
+# own entry. `127.0.0.1`/`localhost`/`0.0.0.0` mean "a service on this host"
+# and are translated to the tenant network's gateway — the only host address
+# reachable from a rootless worker. Split and resolution are separate so
+# *validation* stays offline (no DNS at configure time); resolution failure at
+# render time is fatal, never a silently dropped allowlist entry.
+_worker_egress_resolve_target() {  # <url-or-host:port> <gateway>
+  local target="$1" gateway="$2" host port answer address split
+  split="$(_worker_egress_split_target "$target" true)" \
+    || die "invalid worker egress target '$target' (host:port required)"
+  read -r host port <<<"$split"
   case "$host" in
-    127.0.0.1|localhost|0.0.0.0|::1|"[::1]")
+    127.0.0.1|localhost|0.0.0.0|::1)
       printf '%s %s\n' "$gateway" "$port"
       return 0
       ;;
@@ -184,17 +222,32 @@ _worker_egress_operator_allow() {  # <tenant>
 }
 
 # Emit `address port` lines in a stable order, de-duplicated.
+#
+# Both the source collection and the resolution stay in the CURRENT shell (no
+# pipeline, no process substitution around the resolver): a target that cannot
+# be resolved must fail the whole ruleset, and a `die` inside a pipeline only
+# exits that pipeline element — the ruleset would then be emitted with the
+# target silently missing. That is the fail-open shape this control exists to
+# avoid, caught by the harness's unresolvable-hostname case.
 worker_egress_targets() {  # <tenant>
-  local name="$1" subnet gateway target
+  local name="$1" subnet gateway target raw resolved
+  local -a targets=()
   subnet="$(worker_egress_state_get "$name" SUBNET)"
   [[ -n "$subnet" ]] || return 0
   gateway="$(_worker_egress_gateway "$subnet")"
-  {
-    while IFS= read -r target; do
-      [[ -n "$target" ]] || continue
-      _worker_egress_resolve_target "$target" "$gateway"
-    done < <(_worker_egress_llm_targets "$name"; _worker_egress_operator_allow "$name")
-  } | awk 'NF == 2 && !seen[$0]++'
+  raw="$(
+    _worker_egress_llm_targets "$name" || exit 1
+    _worker_egress_operator_allow "$name" || exit 1
+  )" || return 1
+  while IFS= read -r target; do
+    [[ -n "$target" ]] && targets+=("$target")
+  done <<<"$raw"
+  resolved="$(
+    for target in "${targets[@]}"; do
+      _worker_egress_resolve_target "$target" "$gateway" || exit 1
+    done
+  )" || return 1
+  printf '%s\n' "$resolved" | awk 'NF == 2 && !seen[$0]++'
 }
 
 # Render the complete nftables script. Statements:
@@ -220,11 +273,14 @@ table inet $WORKER_EGRESS_TABLE {
         ip saddr $subnet ip daddr $gateway udp dport 53 accept
         ip saddr $subnet ip daddr $gateway tcp dport 53 accept
 EOF
-  worker_egress_targets "$name" | while read -r address port; do
+  local target_lines
+  target_lines="$(worker_egress_targets "$name")" \
+    || die "failed to resolve the worker egress targets for '$name' (refusing a partial allowlist)"
+  while read -r address port; do
     [[ -n "$address" && -n "$port" ]] || continue
     printf '        ip saddr %s ip daddr %s tcp dport %s accept\n' \
       "$subnet" "$address" "$port"
-  done
+  done <<<"$target_lines"
   cat <<EOF
         ip saddr $subnet counter reject with icmpx type admin-prohibited
     }
@@ -253,8 +309,7 @@ worker_egress_nft() {  # <tenant> <nft args...>
 worker_egress_ensure() {  # <tenant>
   local name="$1" network subnet
   network="$(worker_egress_network_name "$name")"
-  [[ ! -L "$WORKER_EGRESS_DIR" ]] || die "unsafe worker egress state directory"
-  install -d -o root -g root -m 0755 "$WORKER_EGRESS_DIR"
+  _worker_egress_install_dir
   _worker_egress_lock
   subnet="$(_worker_egress_alloc_subnet "$name")"
   _worker_egress_unlock
@@ -278,7 +333,7 @@ _worker_egress_write_ruleset() {  # <tenant>
   staged="$(mktemp "${WORKER_EGRESS_DIR}/.ruleset.XXXXXX")"
   worker_egress_ruleset "$name" >"$staged" || { rm -f "$staged"; return 1; }
   chmod 0644 "$staged"
-  chown root:root "$staged"
+  _worker_egress_own_root "$staged"
   mv -f -- "$staged" "$ruleset_path"
 }
 
@@ -375,8 +430,7 @@ configure_worker_egress() {  # <tenant> [--allow csv|none]
   done
   name="$(sanitize_name "$name")"
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
-  [[ ! -L "$WORKER_EGRESS_DIR" ]] || die "unsafe worker egress state directory"
-  install -d -o root -g root -m 0755 "$WORKER_EGRESS_DIR"
+  _worker_egress_install_dir
   _worker_egress_lock
   local conf staged
   conf="$(worker_egress_conf_path "$name")"
@@ -395,7 +449,7 @@ configure_worker_egress() {  # <tenant> [--allow csv|none]
     done
   fi
   chmod 0644 "$staged"
-  chown root:root "$staged"
+  _worker_egress_own_root "$staged"
   mv -f -- "$staged" "$conf"
   _worker_egress_unlock
   worker_egress_ensure "$name" >/dev/null
@@ -404,21 +458,16 @@ configure_worker_egress() {  # <tenant> [--allow csv|none]
 }
 
 # Reject entries that could smuggle nft syntax or a wildcard into the ruleset.
+# Syntax only: configuration must not depend on DNS being reachable, and the
+# resolution that matters happens when the ruleset is rendered.
 validate_worker_egress_entry() {  # <entry>
-  local entry="$1" host port
-  [[ "$entry" =~ ^[A-Za-z0-9._:\[\]/-]+$ ]] \
+  local entry="$1"
+  # `]` first, `-` last: the only spelling of a bracket class that treats
+  # both as literals in a bash ERE (escaped brackets close the class early).
+  [[ "$entry" =~ ^[]A-Za-z0-9._:/[-]+$ ]] \
     || die "invalid worker egress entry '$entry'"
-  case "$entry" in
-    *"://"*) _worker_egress_resolve_target "$entry" 10.0.0.1 >/dev/null ;;
-    *:*)
-      host="${entry%:*}"
-      port="${entry##*:}"
-      [[ -n "$host" ]] || die "invalid worker egress entry '$entry'"
-      [[ "$port" =~ ^[0-9]+$ ]] && ((port > 0 && port < 65536)) \
-        || die "invalid worker egress port in '$entry'"
-      ;;
-    *) die "worker egress entry '$entry' needs host:port" ;;
-  esac
+  _worker_egress_split_target "$entry" true >/dev/null \
+    || die "worker egress entry '$entry' needs host:port"
 }
 
 # `_ctr run` argument for the worker container.
