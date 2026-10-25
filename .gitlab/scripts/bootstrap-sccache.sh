@@ -6,9 +6,9 @@
 # --show-stats verifies the cached binary and reports telemetry without downloading.
 set -euo pipefail
 
-SCCACHE_VERSION="0.17.0"
-SCCACHE_SHA256="67c4a96dd237c1f518f6b36083f270f9976d516f1e57fce891755ea782e50006"
-SCCACHE_BIN_SHA256="066c5a84c85044c8f48b3ab571ac114293ea717c3d36985db022af8206e21e63"
+SCCACHE_VERSION="0.19.0"
+SCCACHE_SHA256="aa73c7270c997894038c0d8f0d297865f57569e1687883322bc431713d4bb9dd"
+SCCACHE_BIN_SHA256="0b44834be857e21b026f7db49a7762023fedb5eb5ed60725a66f698d8d79a34b"
 SCCACHE_URL="https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz"
 
 bin_dir="$CI_PROJECT_DIR/.ci-cache/bin"

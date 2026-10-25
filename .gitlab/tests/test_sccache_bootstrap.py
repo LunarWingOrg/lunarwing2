@@ -18,11 +18,11 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 BOOTSTRAP = ROOT / ".gitlab/scripts/bootstrap-sccache.sh"
 TRUSTED_BINARY = b'''#!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FIXTURE/trusted-runs"
-echo 'sccache 0.17.0'
+echo 'sccache 0.19.0'
 '''
 POISONED_BINARY = b'''#!/usr/bin/env bash
 touch "$FIXTURE/payload-ran"
-echo 'sccache 0.17.0'
+echo 'sccache 0.19.0'
 '''
 
 
@@ -64,7 +64,7 @@ exit 2
 
     def write_release(self, binary):
         with tarfile.open(self.release, "w:gz") as archive:
-            entry = tarfile.TarInfo("sccache-v0.17.0-x86_64-unknown-linux-musl/sccache")
+            entry = tarfile.TarInfo("sccache-v0.19.0-x86_64-unknown-linux-musl/sccache")
             entry.size = len(binary)
             entry.mode = 0o755
             archive.addfile(entry, io.BytesIO(binary))
