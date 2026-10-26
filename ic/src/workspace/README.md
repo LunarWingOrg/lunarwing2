@@ -72,6 +72,21 @@ let results = workspace.search("dark mode preference", 5).await?;
 let prompt = workspace.system_prompt().await?;
 ```
 
+### Workspace Path Safety (WI#493)
+
+Replace, append, layered, and internal snapshot writes reject paths containing
+Unicode control characters (C0, DEL, and C1) before normalization can trim or
+otherwise transform them. `memory_write` applies the same check to its original
+target before normalizing it, and the web write route reports this as HTTP 400.
+The error renders the rejected path with debug escaping rather than echoing a
+raw control character.
+
+Reads and exact-path recovery remain available for legacy documents already
+stored with such paths. User-facing tree/list display names escape those
+controls, while the underlying entry path remains unchanged for lookups and
+traversal. Engine boot read/parse warnings likewise debug-format stored paths
+so a legacy newline cannot forge a continuation log line.
+
 ### Prompt-Injection Write Scanning
 
 Writes to prompt-visible files (the identity files, `lorebooks/`, and
