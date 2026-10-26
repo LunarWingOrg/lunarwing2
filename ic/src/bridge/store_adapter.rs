@@ -2757,7 +2757,7 @@ mod tests {
                 &[
                     "dropping mission: failed to parse mission.json",
                     &path,
-                    "record_id=unknown",
+                    "record_id=\"unknown\"",
                     "error_kind=syntax",
                 ],
             )?;
@@ -2811,7 +2811,7 @@ mod tests {
                 &[
                     "dropping project record: failed to read",
                     &project_file,
-                    "record_id=unknown",
+                    "record_id=\"unknown\"",
                 ],
             )?;
             assert_logged_at(
@@ -2820,7 +2820,7 @@ mod tests {
                 &[
                     "dropping mission: failed to read mission.json",
                     &mission_file,
-                    "record_id=unknown",
+                    "record_id=\"unknown\"",
                 ],
             )
         });
