@@ -140,6 +140,7 @@ ignore = [
     # database revision marks the 0.26.11 compatibility shim `unaffected`
     # (`unaffected = ["= 0.26.11"]`), because the shim carries no independent
     # trust store and re-exports the roots of its separately resolved
+    # webpki-roots 1.x dependency (now locked at 1.0.11). The shim
     # itself remains reachable only through the opt-in
     # libsql-remote-replica legacy chain, and a downgrade of the 1.x parent
     # is still a hard failure (the same advisory matches the 1.x package it
