@@ -163,7 +163,7 @@ Details:
 - Candidate and promotion jobs are non-interruptible and have retries disabled,
   so redundant-pipeline cancellation or automatic timeout retries cannot hide a
   partial registry operation.
-- The digest-pinned `moby/buildkit:v0.25.1-rootless` image runs without a Docker
+- The digest-pinned `moby/buildkit:v0.31.1-rootless` image runs without a Docker
   daemon or privileged container. The protected `container-build` runner must
   allow the narrow user-namespace/mount syscall set BuildKit needs; never mount
   a Docker socket or disable seccomp wholesale.
