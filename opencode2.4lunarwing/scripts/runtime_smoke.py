@@ -55,12 +55,7 @@ class CheckResult:
 
 
 class Transport:
-    """Filesystem / process access used by every check.
-
-    The build profile reads the image directly; the container profile shells
-    out to ``podman exec``. Keeping both behind one object is what lets the
-    unit tests drive the checks over a fixture tree.
-    """
+    """Filesystem / process access used by every check."""
 
     def read_text(self, path: str) -> str | None:
         raise NotImplementedError
@@ -69,6 +64,9 @@ class Transport:
         raise NotImplementedError
 
     def is_dir(self, path: str) -> bool:
+        raise NotImplementedError
+
+    def is_executable(self, path: str) -> bool:
         raise NotImplementedError
 
     def run(self, argv: Sequence[str], env: dict[str, str]) -> tuple[int, str]:
@@ -80,11 +78,14 @@ class Transport:
     def home_dirs(self) -> Iterable[str]:
         raise NotImplementedError
 
+    def environment(self) -> dict[str, str]:
+        raise NotImplementedError
+
 
 def _safe_read(path: Path) -> str | None:
     try:
         return path.read_text(encoding="utf-8", errors="replace")
-    except (FileNotFoundError, NotADirectoryError, IsADirectoryError, OSError):
+    except (FileNotFoundError, NotADirectoryError):
         return None
 
 
@@ -106,14 +107,20 @@ class LocalTransport(Transport):
     def is_dir(self, path: str) -> bool:
         return self._resolve(path).is_dir()
 
+    def is_executable(self, path: str) -> bool:
+        try:
+            resolved = self._resolve(path)
+            return resolved.is_file() and resolved.stat().st_mode & 0o111 == 0o111
+        except OSError:
+            return False
+
     def run(self, argv: Sequence[str], env: dict[str, str]) -> tuple[int, str]:
-        if self.root != Path("/"):
-            # A fixture root has no runnable image; callers that need a
-            # subprocess supply their own runner through override_run().
-            return (127, "no runner for fixture root")
+        if not argv:
+            return (127, "empty command")
+        command = [str(self._resolve(argv[0])), *argv[1:]]
         try:
             proc = subprocess.run(
-                list(argv),
+                command,
                 env=env,
                 capture_output=True,
                 text=True,
@@ -137,6 +144,9 @@ class LocalTransport(Transport):
             seen.add(candidate)
             yield candidate
 
+    def environment(self) -> dict[str, str]:
+        return dict(os.environ)
+
 
 class ContainerTransport(Transport):
     def __init__(self, runtime: str, container: str) -> None:
@@ -158,7 +168,12 @@ class ContainerTransport(Transport):
 
     def read_text(self, path: str) -> str | None:
         rc, out = self._exec(["cat", "--", path])
-        return out if rc == 0 else None
+        if rc == 0:
+            return out
+        exists_rc, _ = self._exec(["test", "-e", path])
+        if exists_rc != 0:
+            return None
+        raise OSError(f"{path} exists but is unreadable: {out.strip()}")
 
     def exists(self, path: str) -> bool:
         rc, _ = self._exec(["test", "-e", path])
@@ -168,16 +183,28 @@ class ContainerTransport(Transport):
         rc, _ = self._exec(["test", "-d", path])
         return rc == 0
 
+    def is_executable(self, path: str) -> bool:
+        rc, _ = self._exec(["test", "-x", path])
+        return rc == 0
+
     def run(self, argv: Sequence[str], env: dict[str, str]) -> tuple[int, str]:
         assignments = [f"{key}={value}" for key, value in sorted(env.items())]
         return self._exec(["env", *assignments, *argv])
 
     def listening_sockets(self) -> str:
         rc, out = self._exec(["cat", "/proc/net/tcp", "/proc/net/tcp6"])
-        return out if rc == 0 else ""
+        if rc != 0:
+            raise OSError(f"cannot read container socket tables: {out.strip()}")
+        return out
 
     def home_dirs(self) -> Iterable[str]:
         return ("/root", "/home/opencode2")
+
+    def environment(self) -> dict[str, str]:
+        rc, out = self._exec(["env"])
+        if rc != 0:
+            raise OSError(f"cannot read container environment: {out.strip()}")
+        return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
 
 
 def parse_listeners(table: str) -> list[tuple[str, int]]:
@@ -255,7 +282,10 @@ def opentunnel_dirs(env: dict[str, str], homes: Iterable[str]) -> list[str]:
 
 def check_service_config(transport: Transport, env: dict[str, str]) -> CheckResult:
     path = service_config_path(env)
-    raw = transport.read_text(path)
+    try:
+        raw = transport.read_text(path)
+    except OSError as exc:
+        return CheckResult("service_config", False, f"{path} is unreadable: {exc}")
     if raw is None:
         return CheckResult(
             "service_config",
@@ -298,31 +328,41 @@ def check_opentunnel_identity(
     )
 
 
-def check_listeners(transport: Transport, health_port: int) -> CheckResult:
-    listeners = parse_listeners(transport.listening_sockets())
+def check_listeners(
+    transport: Transport, health_port: int, ws_port: int | None = None
+) -> CheckResult:
+    try:
+        listeners = parse_listeners(transport.listening_sockets())
+    except OSError as exc:
+        return CheckResult("listeners", False, f"socket tables are unreadable: {exc}")
+    allowed_ports = {health_port}
+    if ws_port is not None:
+        allowed_ports.add(ws_port)
     offending = [
         f"{address}:{port}"
         for address, port in listeners
-        if not is_loopback(address) and port != health_port
+        if not is_loopback(address) and port not in allowed_ports
     ]
     if offending:
         return CheckResult(
             "listeners",
             False,
-            "listener beyond loopback (health port "
-            f"{health_port} excepted): {offending}",
+            f"listener beyond loopback (allowed ports {sorted(allowed_ports)}): {offending}",
         )
     return CheckResult(
         "listeners",
         True,
-        f"{len(listeners)} loopback listener(s), health port {health_port} allowed",
+        f"{len(listeners)} listener(s); only health/WS ports {sorted(allowed_ports)} may be non-loopback",
     )
 
 
 def check_share_disabled(transport: Transport, config_path: str) -> CheckResult:
-    raw = transport.read_text(config_path)
+    try:
+        raw = transport.read_text(config_path)
+    except OSError as exc:
+        return CheckResult("share_disabled", False, f"{config_path} is unreadable: {exc}")
     if raw is None:
-        return CheckResult("share_disabled", False, f"{config_path} is unreadable")
+        return CheckResult("share_disabled", False, f"{config_path} is absent")
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -337,14 +377,15 @@ def check_share_disabled(transport: Transport, config_path: str) -> CheckResult:
     return CheckResult("share_disabled", True, "share resolves to disabled")
 
 
-def check_remote_refused(transport: Transport, wrapper: str) -> CheckResult:
-    """Run the installed wrapper and require `service set remote true` to fail.
+REMOTE_REFUSAL_MARKER = "opencode-exposure-guard: refused 'opencode service'"
 
-    Home and every XDG dir point at a throwaway sandbox, so the attempt cannot
-    leave state behind in the image (the build's leak tripwire covers /root
-    and /home; a sandboxed HOME is what keeps this check out of those paths)
-    and the follow-up mutation read is deterministic.
-    """
+
+def check_remote_refused(transport: Transport, wrapper: str) -> CheckResult:
+    """Require the installed wrapper's specific exit-77 exposure refusal."""
+    if not transport.is_executable(wrapper):
+        return CheckResult(
+            "remote_refused", False, f"{wrapper} is missing or not executable"
+        )
     sandbox = tempfile.mkdtemp(prefix="opencode2-runtime-smoke-")
     try:
         env = {
@@ -357,31 +398,36 @@ def check_remote_refused(transport: Transport, wrapper: str) -> CheckResult:
             "TMPDIR": sandbox,
         }
         rc, output = transport.run([wrapper, "service", "set", "remote", "true"], env)
-        if rc == 0:
+        if rc != 77 or REMOTE_REFUSAL_MARKER not in output:
             return CheckResult(
                 "remote_refused",
                 False,
-                f"{wrapper} accepted 'service set remote true' (rc=0): {output.strip()}",
+                f"{wrapper} did not produce the guard's exit-77 service refusal "
+                f"(rc={rc}): {output.strip()}",
             )
         planted = f"{sandbox}/.config/opencode/service.json"
-        planted_raw = _safe_read(Path(planted))
+        try:
+            planted_raw = transport.read_text(planted)
+        except OSError as exc:
+            return CheckResult(
+                "remote_refused", False, f"cannot verify {planted}: {exc}"
+            )
         if planted_raw is not None:
             try:
-                if json.loads(planted_raw).get("remote"):
-                    return CheckResult(
-                        "remote_refused",
-                        False,
-                        f"refused with rc={rc} but wrote remote=true to {planted}",
-                    )
+                parsed = json.loads(planted_raw)
             except json.JSONDecodeError:
                 return CheckResult(
                     "remote_refused",
                     False,
-                    f"refused with rc={rc} but left invalid JSON at {planted}",
+                    f"guard refusal left invalid JSON at {planted}",
                 )
-        return CheckResult(
-            "remote_refused", True, f"refused with rc={rc}"
-        )
+            if not isinstance(parsed, dict) or parsed.get("remote"):
+                return CheckResult(
+                    "remote_refused",
+                    False,
+                    f"guard refusal wrote remote=true to {planted}",
+                )
+        return CheckResult("remote_refused", True, "guard refusal rc=77 verified")
     finally:
         shutil.rmtree(sandbox, ignore_errors=True)
 
@@ -393,17 +439,21 @@ def run_checks(
     wrapper: str,
     env: dict[str, str],
 ) -> list[CheckResult]:
+    try:
+        ws_port = int(env.get("WS_PORT", "0"))
+    except ValueError:
+        ws_port = 0
     return [
         check_service_config(transport, env),
         check_opentunnel_identity(transport, env),
-        check_listeners(transport, health_port),
+        check_listeners(transport, health_port, ws_port or None),
         check_share_disabled(transport, config_path),
         check_remote_refused(transport, wrapper),
     ]
 
 
-def build_env(health_port: int) -> dict[str, str]:
-    env = dict(os.environ)
+def build_env(transport: Transport, health_port: int) -> dict[str, str]:
+    env = transport.environment()
     env.setdefault("HOME", "/root")
     env["HEALTH_PORT"] = str(health_port)
     return env
@@ -474,9 +524,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         transport = LocalTransport(args.root)
 
-    results = run_checks(
-        transport, args.health_port, args.config, args.wrapper, build_env(args.health_port)
-    )
+    try:
+        env = build_env(transport, args.health_port)
+    except OSError as exc:
+        print(f"runtime-smoke: {exc}", file=sys.stderr)
+        return 2
+    results = run_checks(transport, args.health_port, args.config, args.wrapper, env)
     failures = [result for result in results if not result.ok]
     if args.json:
         print(
