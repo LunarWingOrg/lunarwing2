@@ -292,6 +292,22 @@ run_refresh
 check 'a re-run after the discard commands completes' exited_ok
 reset_fixture
 
+# 8. !1952: a crate replaced through [patch.crates-io] keeps its retired
+#    registry dir in vendor/ without counting as lockfile drift, while the
+#    same dir without the patch entry still fails the set check. (Every case
+#    above runs with no ic/Cargo.toml beside ic/Cargo.lock, which pins OV-1.)
+mkdir -p "$repo/ic/vendor/patched-crate"
+printf '[package]\nname = "patched-crate"\nversion = "1.0.0"\n' >"$repo/ic/vendor/patched-crate/Cargo.toml"
+printf '[workspace]\n\n[patch.crates-io]\npatched-crate = { path = "patches/patched-crate" }\n' >"$repo/ic/Cargo.toml"
+run_refresh
+check 'a [patch.crates-io] crate is not reported as a stray' exited_ok
+check 'the set check still ran with the patch exemption' output_has 'vendor set matches synced Cargo.lock files'
+printf '[workspace]\n' >"$repo/ic/Cargo.toml"
+run_refresh
+check 'the same dir without a patch entry is still a stray' exited_nonzero
+check 'the stray is reported as lockfile drift' output_has 'lockfiles drifted'
+reset_fixture
+
 if ((failures > 0)); then
   printf '%d refresh-vendor rig-core guard check(s) failed\n' "$failures" >&2
   exit 1

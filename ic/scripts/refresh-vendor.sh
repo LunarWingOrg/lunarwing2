@@ -243,7 +243,11 @@ for lock in lockfiles:
         for pkg in tomllib.load(fh).get("package", []):
             if pkg.get("source"):
                 lock_names.add(pkg["name"])
+    # A lockfile without a sibling manifest has no [patch] table to read
+    # (!1952 OV-1: the unconditional open crashed the set check).
     manifest = os.path.join(os.path.dirname(lock), "Cargo.toml")
+    if not os.path.isfile(manifest):
+        continue
     with open(manifest, "rb") as fh:
         manifest_data = tomllib.load(fh)
     patched_names.update(manifest_data.get("patch", {}).get("crates-io", {}))
