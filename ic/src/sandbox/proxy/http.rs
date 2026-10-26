@@ -1747,6 +1747,99 @@ mod tests {
         );
     }
 
+    /// WI#429 (IV-2/JD-2): an empty body cannot echo a credential, so its
+    /// content and transfer codings do not make it opaque. All four reviewed
+    /// over-refusals keep their upstream status and an empty body; a header
+    /// echo on every answer must still be scrubbed.
+    #[tokio::test]
+    #[traced_test]
+    async fn proxy_credential_exchange_allows_empty_body_with_opaque_codings() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const SECRET: &str = "qp-empty-body-secret-2c4d6e";
+
+        let allowlist = DomainAllowlist::new(&["127.0.0.1".to_string()]);
+        let mappings = vec![CredentialMapping {
+            secret_name: "QP_TOKEN".to_string(),
+            location: CredentialLocation::QueryParam {
+                name: "api_key".to_string(),
+            },
+            host_patterns: vec!["127.0.0.1".to_string()],
+            path_patterns: Vec::new(),
+            optional: false,
+        }];
+        let decider = Arc::new(DefaultPolicyDecider::new(allowlist, mappings));
+        let resolver = Arc::new(FixedCredentialResolver(SECRET.to_string()));
+        let proxy = HttpProxy::new(decider, resolver);
+        let addr = proxy.start(0).await.unwrap();
+
+        for (label, method, status_line, coding) in [
+            ("HEAD+CE", "HEAD", "200 OK", "Content-Encoding: gzip\r\n"),
+            (
+                "304+CE",
+                "GET",
+                "304 Not Modified",
+                "Content-Encoding: gzip\r\n",
+            ),
+            (
+                "204+TE",
+                "GET",
+                "204 No Content",
+                "Transfer-Encoding: chunked,\r\n",
+            ),
+            (
+                "HEAD+TE",
+                "HEAD",
+                "200 OK",
+                "Transfer-Encoding: chunked,\r\n",
+            ),
+        ] {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream_port = upstream.local_addr().unwrap().port();
+            let answer = format!(
+                "HTTP/1.1 {status_line}\r\n{coding}X-Echo: {SECRET}\r\nConnection: close\r\n\r\n"
+            );
+            let upstream_task = tokio::spawn(async move {
+                let (mut conn, _) = upstream.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = conn.read(&mut buf).await;
+                conn.write_all(answer.as_bytes()).await.unwrap();
+            });
+
+            let request = format!(
+                "{method} http://127.0.0.1:{upstream_port}/mapped HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+            );
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client.write_all(request.as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                client.read_to_end(&mut response),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+            let text = String::from_utf8_lossy(&response);
+            let expected_status = status_line.split(' ').next().unwrap();
+            assert!(
+                text.starts_with(&format!("HTTP/1.1 {expected_status}")),
+                "{label}: {text}"
+            );
+            let (head, body) = text.split_once("\r\n\r\n").unwrap();
+            assert!(body.is_empty(), "{label}: non-empty body: {text}");
+            assert!(
+                head.lines()
+                    .any(|line| line.eq_ignore_ascii_case("x-echo: [REDACTED]")),
+                "{label}: credential header was not scrubbed: {text}"
+            );
+            assert!(!text.contains(SECRET), "{label}: secret leaked: {text}");
+            upstream_task.await.unwrap();
+        }
+        assert!(!logs_contain(SECRET), "credential leaked into proxy logs");
+        proxy.stop().await;
+    }
+
     /// WI#419: without an injected credential there is nothing to scrub,
     /// so an ordinary exchange keeps the upstream's encoding untouched —
     /// even the duplicate-field and gzip shape the credentialed path
