@@ -219,12 +219,14 @@ PYEOF
   fi
 done
 
-# Set check against the committed lockfiles (the approved pins): every
-# vendored crate dir must come from one of the synced Cargo.lock files. A
-# stray means a lockfile drifted between vendor runs — fix the lock instead
-# of letting cargo re-resolve. Duplicate version dirs (e.g. hashbrown x5) are
-# expected: each synced lockfile may pin a different version of a shared
-# crate, and the vendor set is their union.
+# Set check against the committed lockfiles (the approved pins): every registry
+# vendored crate dir must come from one of the synced Cargo.lock files. A stray
+# means a lockfile drifted between vendor runs — fix the lock instead of letting
+# cargo re-resolve. Duplicate version dirs (e.g. hashbrown x5) are expected:
+# each synced lockfile may pin a different version of a shared crate, and the
+# vendor set is their union. Local [patch.crates-io] path dependencies replace
+# registry packages, so their old registry dirs are exempt like pre-vendored
+# path dependencies.
 python3 - "$VENDOR_DIR" "${lockfiles[@]}" <<'PYEOF'
 import os, sys, tomllib
 
@@ -235,11 +237,16 @@ lockfiles = sys.argv[2:]
 # git+); cargo vendor vendored both families into the vendor dir. Workspace-
 # local packages have no source and are never vendored.
 lock_names = set()
+patched_names = set()
 for lock in lockfiles:
     with open(lock, "rb") as fh:
         for pkg in tomllib.load(fh).get("package", []):
             if pkg.get("source"):
                 lock_names.add(pkg["name"])
+    manifest = os.path.join(os.path.dirname(lock), "Cargo.toml")
+    with open(manifest, "rb") as fh:
+        manifest_data = tomllib.load(fh)
+    patched_names.update(manifest_data.get("patch", {}).get("crates-io", {}))
 
 
 def base_candidates(d):
@@ -257,8 +264,8 @@ strays, joints = [], {}
 for d in sorted(os.listdir(vendor_dir)):
     if not os.path.isdir(os.path.join(vendor_dir, d)):
         continue
-    if d in ("libsignal-protocol", "libsignal-protocol-sys"):
-        continue  # pre-vendored path deps, not from crates.io
+    if d in ("libsignal-protocol", "libsignal-protocol-sys") or d in patched_names:
+        continue  # path dependencies are not registry-vendored crates
     base = next((c for c in base_candidates(d) if c in lock_names), d)
     joints[base] = joints.get(base, 0) + 1
     if base == d and d not in lock_names:
