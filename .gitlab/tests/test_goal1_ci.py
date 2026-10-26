@@ -169,6 +169,9 @@ class FullValidationTests(unittest.TestCase):
                 "opencode2-rootfs.tar"
             ),
             "promotion need": lambda merged: merged["worker-opencode2-promote"].update(needs=[]),
+            "parser promotion need": lambda merged: merged["worker-opencode2-promote"]["needs"].remove(
+                {"job": "worker-buildkit-parser-policy-guard", "artifacts": False}
+            ),
         }
         for name, mutate in mutations.items():
             with self.subTest(name=name):
@@ -185,6 +188,9 @@ class FullValidationTests(unittest.TestCase):
             ("toolchain", "variables", {"GOTOOLCHAIN": "auto"}),
             ("commands", "script", ["true"]),
             ("optional", "allow_failure", True),
+            ("rules", "rules", [{"when": "never"}]),
+            ("job-level when", "when", "manual"),
+            ("before script", "before_script", ["exit 0"]),
         ):
             with self.subTest(name=name):
                 merged = copy.deepcopy(self.merged)
@@ -195,6 +201,13 @@ class FullValidationTests(unittest.TestCase):
                 errors = []
                 config.validate_test_shapes(merged, errors)
                 self.assertTrue(any("buildkit-parser" in error for error in errors), errors)
+
+    def test_ci_config_go_bootstrap_cannot_be_removed(self):
+        merged = copy.deepcopy(self.merged)
+        merged["ci-config"]["before_script"] = ["python3 -m pip install --no-deps PyYAML==6.0.3"]
+        errors = []
+        config.validate_test_shapes(merged, errors)
+        self.assertIn("ci-config must run the pinned Go bootstrap before its parser fixtures", errors)
 
 
 class WorkerVersionPinTests(unittest.TestCase):

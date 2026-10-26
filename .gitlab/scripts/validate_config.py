@@ -530,6 +530,9 @@ def validate_worker_publication(merged: dict, errors: list[str]) -> None:
         expected_needs = {candidate_name, scan_name}
         if worker == "opencode2":
             expected_needs.add("worker-opencode2-exposure-verify")
+            expected_needs.add("worker-buildkit-parser-policy-guard")
+            if {"job": "worker-buildkit-parser-policy-guard", "artifacts": False} not in needs:
+                errors.append("worker-opencode2-promote must hard-need the BuildKit parser guard")
         if needed_jobs != expected_needs:
             errors.append(f"{promotion_name} must need its exact candidate and scan")
         if not extends_template(merged.get(candidate_name), ".worker-candidate"):
@@ -571,12 +574,39 @@ def validate_buildkit_parser_guard(merged: dict, errors: list[str]) -> None:
             errors.append(f"worker-buildkit-parser-policy-guard drifted at {key}")
     if not extends_template(job, ".full-validation-context"):
         errors.append("worker-buildkit-parser-policy-guard must remain a required validation job")
-    if "allow_failure" in job and job["allow_failure"] is not False:
+    effective = resolve_extends(job, merged)
+    context = resolve_extends(merged.get(".full-validation-context"), merged)
+    if effective.get(EXTENDS_TRUNCATED_KEY):
+        errors.append("worker-buildkit-parser-policy-guard has a truncated extends chain")
+    if effective.get("allow_failure"):
         errors.append("worker-buildkit-parser-policy-guard must not be optional")
+    if effective.get("rules") != context.get("rules"):
+        errors.append("worker-buildkit-parser-policy-guard must inherit the exact full-validation rules")
+    if effective.get("when") is not None:
+        errors.append("worker-buildkit-parser-policy-guard must not set a job-level when")
+    if effective.get("before_script") is not None:
+        errors.append("worker-buildkit-parser-policy-guard must not set before_script")
+
+
+CI_CONFIG_BEFORE_SCRIPT = [
+    "python3 -m pip install --no-deps PyYAML==6.0.3",
+    "python3 .gitlab/scripts/fetch-go-toolchain.py /tmp/lunarwing-go",
+    'export PATH="/tmp/lunarwing-go/go/bin:$PATH"',
+]
+
+
+def validate_ci_config_go_bootstrap(merged: dict, errors: list[str]) -> None:
+    job = merged.get("ci-config")
+    if not isinstance(job, dict):
+        errors.append("ci-config is required for the BuildKit parser fixtures")
+        return
+    if job.get("before_script") != CI_CONFIG_BEFORE_SCRIPT:
+        errors.append("ci-config must run the pinned Go bootstrap before its parser fixtures")
 
 
 def validate_test_shapes(merged: dict, errors: list[str]) -> None:
     validate_buildkit_parser_guard(merged, errors)
+    validate_ci_config_go_bootstrap(merged, errors)
     # Host-side runner limits control compile concurrency. A resource group
     # here would serialize independent hosts across all project pipelines.
     for name, job in merged.items():

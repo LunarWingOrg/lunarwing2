@@ -280,6 +280,8 @@ worker-opencode2-promote:
       artifacts: true
     - job: worker-opencode2-exposure-verify
       artifacts: false
+    - job: worker-buildkit-parser-policy-guard
+      artifacts: false
 
 # WI#425: verify the tar export with the CHECKOUT's checker and tar-header
 # ownership/modes, compare checkout-owned /app bytes, and pin the complete
