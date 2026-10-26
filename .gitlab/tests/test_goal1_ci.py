@@ -148,6 +148,54 @@ class FullValidationTests(unittest.TestCase):
                         self.assertIn('CI_PIPELINE_SOURCE == "push"', condition)
                         self.assertNotIn("LUNARWING_CI_FULL_VALIDATION", condition)
 
+    def test_opencode2_exposure_verify_cannot_become_optional_or_unpinned(self):
+        mutations = {
+            "job allow_failure": lambda merged: merged["worker-opencode2-exposure-verify"].update(
+                allow_failure=True
+            ),
+            "rule allow_failure": lambda merged: merged["worker-opencode2-exposure-verify"]["rules"][0].update(
+                allow_failure=True
+            ),
+            "image": lambda merged: merged["worker-opencode2-exposure-verify"].update(
+                image="docker.io/library/python:latest"
+            ),
+            "needs": lambda merged: merged["worker-opencode2-exposure-verify"]["needs"][0].update(
+                artifacts=False
+            ),
+            "script": lambda merged: merged["worker-opencode2-exposure-verify"]["script"].__setitem__(
+                2, "true"
+            ),
+            "tar artifact": lambda merged: merged["worker-opencode2-candidate"]["artifacts"]["paths"].remove(
+                "opencode2-rootfs.tar"
+            ),
+            "promotion need": lambda merged: merged["worker-opencode2-promote"].update(needs=[]),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                merged = copy.deepcopy(self.merged)
+                mutate(merged)
+                errors = []
+                config.validate_worker_publication(merged, errors)
+                self.assertTrue(any("opencode2" in error for error in errors), (name, errors))
+
+    def test_buildkit_parser_guard_is_required_and_pinned(self):
+        for name, key, value in (
+            ("missing job", None, None),
+            ("image", "image", "golang:latest"),
+            ("toolchain", "variables", {"GOTOOLCHAIN": "auto"}),
+            ("commands", "script", ["true"]),
+            ("optional", "allow_failure", True),
+        ):
+            with self.subTest(name=name):
+                merged = copy.deepcopy(self.merged)
+                if key is None:
+                    merged.pop("worker-buildkit-parser-policy-guard")
+                else:
+                    merged["worker-buildkit-parser-policy-guard"][key] = value
+                errors = []
+                config.validate_test_shapes(merged, errors)
+                self.assertTrue(any("buildkit-parser" in error for error in errors), errors)
+
 
 class WorkerVersionPinTests(unittest.TestCase):
     """The worker pin cross-check must bind values to each worker's own case
