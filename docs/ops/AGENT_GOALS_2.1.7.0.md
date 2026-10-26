@@ -1192,5 +1192,7 @@
 118. [x] (H) Remaining polish items from massive changes introduced in `Tsuno`
 119. [x] (H) General Agent Loop Engine Polish
 120. [x] (H) OPERATOR NOTE: Start the gallop
+121. [x] (S) Reserved
+122. [x] (H) Deploy the stoplight system
 
 ---
