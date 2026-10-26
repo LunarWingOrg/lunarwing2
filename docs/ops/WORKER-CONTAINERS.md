@@ -747,9 +747,12 @@ Enforced controls (opencode2 lane unless noted):
    direct policy fixtures alongside the broader Python fixture suite. The CI
    job uses a digest-pinned Go 1.24.3 image with `GOTOOLCHAIN=local`,
    `GOFLAGS=-mod=readonly`, and checksum-verified modules; it runs `gofmt`,
-   the Go policy tests, and the real Dockerfile check. Out-of-band image
-   verification remains the separate control-5 backstop below, not a parser
-   substitute.
+   the Go policy tests, and the real Dockerfile check. `ci-config` installs
+   the same pinned Go through `.gitlab/scripts/fetch-go-toolchain.py`, so the
+   Python parser fixtures execute instead of skipping on its Python-only
+   image. OpenCode 2 promotion hard-needs both this parser job and the
+   out-of-band verifier. Out-of-band image verification remains the separate
+   control-5 backstop below, not a parser substitute.
 5. **Build-time assertion.** The opencode2 Dockerfile runs
    `scripts/exposure_policy_assert.py --binary …`: the image fails to build
    if the config lacks the pins, the entrypoint touches service mode or
@@ -796,18 +799,28 @@ Enforced controls (opencode2 lane unless noted):
    every emitted entry uses its tar-header metadata. Its
    shared `image_config_policy.py` allowlist covers the complete `Env`
    (including PATH order and loader variables), `Entrypoint`, `Cmd`, `User`,
-   `WorkingDir`, and `Shell`; promotion hard-needs the non-optional job.
+   `WorkingDir`, `Healthcheck`, `ExposedPorts`, and `StopSignal`; `OnBuild`,
+   `Volumes`, and `Shell` must be empty. Promotion hard-needs the
+   non-optional job and the BuildKit parser guard.
    In mt-admin, `build_opencode2_worker` uses a per-build candidate tag and
-   `--iidfile`, then `create --pull=never` plus `cp`/`cmp` verifies regular
-   files and modes, `diff --no-dereference` compares checkout-owned `/app`,
-   and the same full-config policy runs by immutable image ID. mt-admin runs
-   as root while the checkout can be tenant-owned, so the policy is never
-   executed from the checkout: root reads its bytes (no symlink, regular
-   file, at most 1 MiB) into the root-owned scratch dir and runs that copy as
-   `nobody` via `setpriv --no-new-privs` with `python3 -I` and an empty
-   environment (run-221 OK-1). Cleanup is
-   trapped, links are refused before comparison, and only the verified ID is
-   tagged `:latest`. Note the `PATH` resolution is a *build-time* property:
+   `--iidfile`, then `create --pull=never`, `export`, and full `image inspect`
+   feed the same tar/config verifier by immutable image ID. Docker's
+   `Config.Healthcheck` and Podman's top-level `Healthcheck` normalize to the
+   same policy; neither runtime can silently drop that field. The verifier
+   and checkout-owned reference files enter a root-owned snapshot only after
+   every source parent resolves beneath the canonical checkout; final links
+   and special files are refused. The snapshot Python runs as `nobody` via
+   `setpriv --clear-groups --no-new-privs`, `python3 -I`, and an empty
+   environment. The exported tar and inspect JSON stay under `/var/tmp` in a
+   `0700` `nobody`-owned input directory with `0600` files, and extraction
+   uses a separate `0700` work directory. Cleanup is trapped, and only the
+   verified ID is tagged `:latest`.
+   The mt-admin trust boundary is deliberately narrow: only the wrapper has a
+   build-time digest anchor; the other reference and verifier bytes are a
+   verify-time snapshot of the live checkout. A hostile tenant can change
+   both its checkout and the image that mt-admin builds as root from it, so
+   this is a drift/naive-use check, not a tenant-to-host security boundary.
+   Note the `PATH` resolution is a *build-time* property:
    at runtime the agent-owned `~/.cargo/bin` and `~/go/bin` (five PATH
    entries — the four toolchain dirs plus `/usr/local/sbin` — precede
    `/usr/local/bin`), so a runtime `PATH` `opencode` need not hit the
@@ -902,10 +915,15 @@ re-checked 2026-10-13):
   file permissions — not the wrapper — prevent replacement under either
   launch identity. The wrapper is only a naive-use guard, and the GitHub
   fetch remains an egress-allowlist concern (WI#424). Keep the pinned
-  `PEBBLE_LOCK_SHA256` build contract intact. **Residual:** the bridge still
-  pins `USER 0:0` on the rootless split; this item does not claim a non-root
-  bridge. A rebuilt pebble candidate and a live `mt-admin worker-listeners`
-  audit remain the protected-pipeline/deploy acceptance evidence.
+  `PEBBLE_LOCK_SHA256` build contract intact. **WI#425 AC4 interpretation
+  (run-221 OK9):** the original "non-root user" wording predates WI#400 and
+  WI#422 and is satisfied at the agent-execution boundary: every rootless
+  spawned pebble process uses the non-root task uid, and the rootful launch
+  runs the whole container as the tenant uid. The rootless bridge deliberately
+  keeps `USER 0:0` so it can drop tasks and protect the hub credential;
+  changing it to the task uid would collapse that newer boundary. This item
+  does not claim a non-root bridge. A rebuilt pebble candidate and a live
+  `mt-admin worker-listeners` audit remain protected-pipeline/deploy evidence.
 
 ## LunarWing Worker
 

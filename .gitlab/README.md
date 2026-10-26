@@ -520,7 +520,11 @@ host's concurrent builds before retrying manually.
   `.gitlab/tests` regressions for the inventory and full package-record guard.
 - `ci-config` validation rejects jobs whose `stage:` is missing from the root
   `stages` list, so stage renames/removals fail at validation time instead of
-  killing the whole pipeline after push.
+  killing the whole pipeline after push. It also installs the pinned Go
+  toolchain through `fetch-go-toolchain.py`, making the BuildKit parser
+  fixtures mandatory in the Python test discovery lane. OpenCode 2 promotion
+  hard-needs both the BuildKit parser guard and the tar/config verifier;
+  neither can be removed or made optional without failing validation.
 - Worker promotion runs a 15-second registry auth-realm smoke test
   (`.gitlab/scripts/registry-realm-smoke.py`) before the promote script, so a
   broken realm fails cheaply instead of after the multi-hour candidate and

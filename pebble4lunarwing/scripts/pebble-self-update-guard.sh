@@ -7,8 +7,7 @@
 # releases and replaces the running binary; in a LunarWing worker the
 # pebble version is a reviewed, reproducibly-built pin (PEBBLE_REF + the
 # reviewed Cargo.lock override), and an in-container self-update would
-# replace it with an unreviewed upstream build outside that contract —
-# The egress allowlist (WI#424, deferred) will block the download. The
+# replace it with an unreviewed upstream build outside that contract. The
 # root-owned real binary and its root-owned parent directory are what stop a
 # direct self-update from replacing it under either launch identity.
 #

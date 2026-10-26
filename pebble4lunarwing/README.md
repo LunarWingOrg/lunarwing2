@@ -113,12 +113,14 @@ honours no environment override; direct execution of
 `/usr/local/lib/pebble/pebble` remains possible, but the root-owned binary
 and parent directory prevent replacement. The wrapper is a naive-use guard,
 not a boundary, and the fetch remains subject to the deferred egress
-allowlist (WI#424). The bridge still pins `USER 0:0` on the rootless split;
-spawned pebble processes drop to the task uid via setpriv (WI#400), while
-the rootful launch runs the whole container as the tenant uid (WI#422).
-The rootless agent therefore cannot replace the bridge binary; on the
-rootful lane the agent shares the bridge's uid by design and can signal or
-trace it and read its environment. Keep the pinned `PEBBLE_LOCK_SHA256`
+allowlist (WI#424). WI#425's non-root requirement applies to the agent
+process: spawned pebble processes drop to the task uid via setpriv
+(WI#400), while the rootful launch runs the whole container as the tenant
+uid (WI#422). The rootless bridge deliberately pins `USER 0:0` so it can
+create that credential boundary; changing it to the task uid would collapse
+the split. The rootless agent therefore cannot replace the bridge binary;
+on the rootful lane the agent shares the bridge's uid by design and can
+signal or trace it and read its environment. Keep the pinned `PEBBLE_LOCK_SHA256`
 build contract intact. Full policy, controls, and the per-bump checklist:
 `docs/ops/WORKER-CONTAINERS.md` → "Worker exposure policy (WI#357)".
 
