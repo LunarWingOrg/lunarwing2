@@ -12,6 +12,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import tempfile
 import unittest
 
 LANE_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -19,13 +20,21 @@ WRAPPER = LANE_ROOT / "scripts" / "pebble-self-update-guard.sh"
 
 
 def run_wrapper(*args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["/bin/sh", str(WRAPPER), *args],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        env={**os.environ, "LUNARWING_REAL_PEBBLE": "/bin/echo"},
-    )
+    with tempfile.TemporaryDirectory() as temporary:
+        wrapper = pathlib.Path(temporary) / "pebble-self-update-guard.sh"
+        wrapper.write_text(
+            WRAPPER.read_text(encoding="utf-8").replace(
+                "REAL_PEBBLE=/usr/local/lib/pebble/pebble", "REAL_PEBBLE=/bin/echo"
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.run(
+            ["/bin/sh", str(wrapper), *args],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={**os.environ, "LUNARWING_REAL_PEBBLE": "/bin/false"},
+        )
 
 
 class PebbleSelfUpdateGuardTests(unittest.TestCase):
@@ -71,11 +80,13 @@ class PebbleSelfUpdateGuardTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), " ".join(args))
 
-    def test_real_pebble_override_env_honoured(self) -> None:
-        # The wrapper honours LUNARWING_REAL_PEBBLE over the default path so
-        # fixtures (and any future lane relocation) can point elsewhere.
+    def test_real_pebble_override_env_is_not_honoured(self) -> None:
         script = WRAPPER.read_text(encoding="utf-8")
-        self.assertIn('REAL_PEBBLE="${LUNARWING_REAL_PEBBLE:-/usr/local/lib/pebble/pebble}"', script)
+        self.assertIn("REAL_PEBBLE=/usr/local/lib/pebble/pebble", script)
+        self.assertNotIn("REAL_PEBBLE=\"${LUNARWING_REAL_PEBBLE", script)
+        result = run_wrapper("run", "fixed path")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "run fixed path")
 
 
 if __name__ == "__main__":

@@ -8,20 +8,20 @@
 # pebble version is a reviewed, reproducibly-built pin (PEBBLE_REF + the
 # reviewed Cargo.lock override), and an in-container self-update would
 # replace it with an unreviewed upstream build outside that contract —
-# and, per WI#400/WI#422, on the rootful tenant-uid lane the task uid can
-# reach the binary. The egress allowlist (WI#424, deferred) will also block
-# its GitHub fetch; this wrapper is the naive-use refusal now.
+# The egress allowlist (WI#424, deferred) will block the download. The
+# root-owned real binary and its root-owned parent directory are what stop a
+# direct self-update from replacing it under either launch identity.
 #
 # This is a NAIVE-USE guard, not a boundary: task code can still exec the
 # real binary path directly. The boundary against a compromised agent is
-# the egress allowlist (control 1).
+# the egress allowlist (control 1). No environment override is honoured.
 #
 # Every argv token is scanned (opencode-lane precedent): the self-update
 # subcommand is refused wherever it appears; everything else execs the
 # real binary unchanged.
 set -eu
 
-REAL_PEBBLE="${LUNARWING_REAL_PEBBLE:-/usr/local/lib/pebble/pebble}"
+REAL_PEBBLE=/usr/local/lib/pebble/pebble
 
 refuse() {
   echo "pebble-self-update-guard: refused 'pebble $1': $2" >&2
