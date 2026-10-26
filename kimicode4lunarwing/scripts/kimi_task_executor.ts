@@ -131,6 +131,45 @@ function silenceTimeoutMs(taskTimeoutMs: number): number {
   return Math.min(budget, Math.max(1, taskTimeoutMs))
 }
 
+function llmHeadersTimeoutMs(): number {
+  return boundedEnvInteger("KIMI_CODE_LLM_HEADERS_TIMEOUT_MS", 900_000, 1_000, 86_400_000)
+}
+
+class LlmRequestTracker {
+  private index = 1
+  private startedAt = Date.now()
+  private awaiting = true
+  private pendingTools = new Set<string>()
+
+  snapshot(): { index: number; elapsedSeconds: number; awaiting: boolean } {
+    return {
+      index: this.index,
+      elapsedSeconds: Math.floor((Date.now() - this.startedAt) / 1_000),
+      awaiting: this.awaiting,
+    }
+  }
+
+  complete(toolCallIds: readonly string[]): void {
+    this.awaiting = false
+    this.startedAt = Date.now()
+    this.pendingTools = new Set(toolCallIds)
+  }
+
+  retry(): void {
+    if (this.awaiting) return
+    this.awaiting = true
+    this.startedAt = Date.now()
+  }
+
+  finishTool(toolCallId: string | undefined): void {
+    if (toolCallId !== undefined) this.pendingTools.delete(toolCallId)
+    if (this.awaiting || this.pendingTools.size > 0) return
+    this.index += 1
+    this.startedAt = Date.now()
+    this.awaiting = true
+  }
+}
+
 type StopReason = "timeout" | "cancelled" | "silence"
 
 class TaskStoppedError extends Error {
@@ -148,6 +187,24 @@ interface StreamJsonLine {
   tool_calls?: KimiMessage["tool_calls"]
   tool_call_id?: string
   type?: string
+  next_attempt?: number
+  max_attempts?: number
+  delay_ms?: number
+  error_name?: string
+  status_code?: number
+}
+
+function optionalNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
+function retryProgress(line: StreamJsonLine, requestIndex: number): string {
+  const next = line.next_attempt ?? "?"
+  const max = line.max_attempts ?? "?"
+  const delay = line.delay_ms ?? "?"
+  const error = line.error_name ? ` after ${truncateUtf8(line.error_name, 128)}` : ""
+  const status = line.status_code === undefined ? "" : ` (HTTP ${line.status_code})`
+  return `[worker] LLM request ${requestIndex} retry ${next}/${max} in ${delay}ms${error}${status}; task remains active.`
 }
 
 function isAssistantMessage(line: StreamJsonLine): boolean {
@@ -220,6 +277,8 @@ export async function executeTask(
   // claims "still waiting".
   let lastStreamAt = Date.now()
   const silenceBudget = silenceTimeoutMs(timeoutMs)
+  const headersTimeoutMs = llmHeadersTimeoutMs()
+  const requestTracker = new LlmRequestTracker()
 
   // Bounds on in-memory accumulation for long/verbose runs (default task
   // timeout is 4h). Progress is streamed live, so truncating loses nothing
@@ -265,7 +324,11 @@ export async function executeTask(
     heartbeatMs > 0
       ? setInterval(() => {
           if (Date.now() - lastProgressAt < heartbeatMs) return
-          emitProgress("[worker] Still waiting for Kimi Code response; task remains active.")
+          const current = requestTracker.snapshot()
+          const phase = current.awaiting ? "response" : "tool results"
+          emitProgress(
+            `[worker] Still waiting for Kimi Code ${phase}; request ${current.index} elapsed ${current.elapsedSeconds}s; task remains active.`,
+          )
         }, heartbeatMs)
       : undefined
 
@@ -390,6 +453,8 @@ export async function executeTask(
     // Auto-update and telemetry: disable to keep CI/headless runs deterministic.
     env.KIMI_CODE_NO_AUTO_UPDATE = env.KIMI_CODE_NO_AUTO_UPDATE || "1"
     env.KIMI_DISABLE_TELEMETRY = env.KIMI_DISABLE_TELEMETRY || "1"
+    // Operator-owned request deadline: task-supplied env cannot extend it.
+    env.KIMI_CODE_LLM_HEADERS_TIMEOUT_MS = String(headersTimeoutMs)
 
     // WI#400: the bridge runs as container root; task code runs under the
     // pinned task uid (separate from the bridge) via a setpriv wrapper, so
@@ -545,6 +610,11 @@ export async function executeTask(
                 isRecord(call.function) && typeof call.function.name === "string" &&
                 typeof call.function.arguments === "string")
             : undefined,
+          next_attempt: optionalNumber(value.next_attempt),
+          max_attempts: optionalNumber(value.max_attempts),
+          delay_ms: optionalNumber(value.delay_ms),
+          error_name: typeof value.error_name === "string" ? value.error_name : undefined,
+          status_code: optionalNumber(value.status_code),
         }
 
         // Collect for final output extraction. Bounded: only the tail is
@@ -563,6 +633,9 @@ export async function executeTask(
         }
 
         if (isAssistantMessage(parsed)) {
+          const toolCallIds = (parsed.tool_calls ?? []).flatMap((call) =>
+            typeof call.id === "string" ? [call.id] : [])
+          requestTracker.complete(toolCallIds)
           const text = typeof parsed.content === "string" ? parsed.content.trim() : ""
           if (text) {
             appendOutput(text + "\n")
@@ -576,6 +649,7 @@ export async function executeTask(
             }
           }
         } else if (isToolMessage(parsed)) {
+          requestTracker.finishTool(parsed.tool_call_id)
           const toolOutput = typeof parsed.content === "string" ? parsed.content.trim() : ""
           if (toolOutput) {
             const delta = `[tool result] ${toolOutput}`
@@ -583,7 +657,10 @@ export async function executeTask(
             emitProgress(delta)
           }
         } else if (isMetaMessage(parsed)) {
-          // Meta messages (resume hints, retry notices, version) go to stderr only.
+          if (parsed.type === "turn.step.retrying") {
+            requestTracker.retry()
+            emitProgress(retryProgress(parsed, requestTracker.snapshot().index))
+          }
           if (typeof parsed.type === "string") {
             console.error(`[kimi meta] ${truncateUtf8(parsed.type, progressCap)}`)
           }
