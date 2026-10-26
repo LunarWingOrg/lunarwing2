@@ -513,10 +513,10 @@ impl HybridStore {
                                 .insert(memory_doc.id, entry.path.clone());
                             self.docs.write().await.insert(memory_doc.id, memory_doc);
                         } else {
-                            debug!(path = %entry.path, "skipped non-doc file in engine");
+                            debug!(path = ?entry.path, "skipped non-doc file in engine");
                         }
                     }
-                    Err(e) => debug!(path = %entry.path, "failed to read engine doc: {e}"),
+                    Err(e) => debug!(path = ?entry.path, "failed to read engine doc: {e}"),
                 }
             }
         }
@@ -709,7 +709,7 @@ impl HybridStore {
                         let record_id = record_id_hint(&doc.content).describe();
                         warn!(
                             kind = %kind,
-                            path = %entry.path,
+                            path = ?entry.path,
                             record_id = %record_id,
                             error_kind = %parse_error_kind(&e),
                             line = e.line(),
@@ -718,7 +718,7 @@ impl HybridStore {
                         );
                         debug!(
                             kind = %kind,
-                            path = %entry.path,
+                            path = ?entry.path,
                             record_id = %record_id,
                             "dropping {kind} record: parse error: {e}"
                         );
@@ -727,11 +727,11 @@ impl HybridStore {
                 Err(e) => {
                     warn!(
                         kind = %kind,
-                        path = %entry.path,
+                        path = ?entry.path,
                         record_id = "unknown",
                         "dropping {kind} record: failed to read"
                     );
-                    debug!(kind = %kind, path = %entry.path, "dropping {kind} record: read error: {e}");
+                    debug!(kind = %kind, path = ?entry.path, "dropping {kind} record: read error: {e}");
                 }
             }
         }
@@ -1077,11 +1077,11 @@ impl HybridStore {
                     Ok(doc) => doc,
                     Err(e) => {
                         warn!(
-                            path = %mission_file,
+                            path = ?mission_file,
                             record_id = "unknown",
                             "dropping mission: failed to read mission.json"
                         );
-                        debug!(path = %mission_file, "dropping mission: read error: {e}");
+                        debug!(path = ?mission_file, "dropping mission: read error: {e}");
                         continue;
                     }
                 };
@@ -1101,7 +1101,7 @@ impl HybridStore {
                             let mission_id = record_uuid_field(&raw, "id")
                                 .unwrap_or_else(|| "unknown".to_owned());
                             warn!(
-                                path = %mission_file,
+                                path = ?mission_file,
                                 mission_id = %mission_id,
                                 error_kind = %parse_error_kind(&e),
                                 line = e.line(),
@@ -1109,7 +1109,7 @@ impl HybridStore {
                                 "dropping mission: failed to parse"
                             );
                             debug!(
-                                path = %mission_file,
+                                path = ?mission_file,
                                 mission_id = %mission_id,
                                 "dropping mission: parse error: {e}"
                             );
@@ -1117,7 +1117,7 @@ impl HybridStore {
                     },
                     Err(e) => {
                         warn!(
-                            path = %mission_file,
+                            path = ?mission_file,
                             record_id = "unknown",
                             error_kind = %parse_error_kind(&e),
                             line = e.line(),
@@ -1125,7 +1125,7 @@ impl HybridStore {
                             "dropping mission: failed to parse mission.json"
                         );
                         debug!(
-                            path = %mission_file,
+                            path = ?mission_file,
                             "dropping mission: mission.json parse error: {e}"
                         );
                     }
@@ -2936,6 +2936,49 @@ mod tests {
                 ],
             )?;
             assert_no_log_carries_at_or_above(lines, "LEAKED TOOL OUTPUT", "WARN")
+        });
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    #[traced_test]
+    async fn control_bearing_step_paths_are_escaped_at_boot() {
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let forged = "FORGED control_bearing_step_paths_are_escaped_at_boot: OF2_FORGED_PATH";
+        let path = format!("engine/.runtime/steps/PROBEPATH\n{forged}.json");
+        let doc = db
+            .get_or_create_document_by_path("control-path-warn", None, &path)
+            .await
+            .expect("seed legacy control-bearing path");
+        db.update_document(doc.id, "{not json")
+            .await
+            .expect("corrupt legacy step batch");
+        let workspace = Arc::new(Workspace::new_with_db("control-path-warn", db));
+
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded
+            .load_state_from_workspace()
+            .await
+            .expect("reload engine state");
+        assert!(reloaded.steps.read().await.is_empty());
+
+        let escaped_path = format!("{path:?}");
+        logs_assert(|lines: &[&str]| {
+            assert_logged_at(
+                lines,
+                "WARN",
+                &[
+                    "dropping thread step batch record: failed to parse",
+                    &escaped_path,
+                ],
+            )?;
+            if lines
+                .iter()
+                .any(|line| line.contains(forged) && !line.contains(&escaped_path))
+            {
+                return Err("stored path forged a continuation log line".to_owned());
+            }
+            Ok(())
         });
     }
 
