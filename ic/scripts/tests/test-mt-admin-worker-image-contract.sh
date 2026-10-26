@@ -514,6 +514,12 @@ cp -a "$repo/opencode2.4lunarwing/scripts/opencode-exposure-guard.sh" \
   "$opencode2_rootfs/usr/local/bin/opencode"
 cp -a "$fixture/real-opencode" "$opencode2_rootfs/usr/local/lib/opencode2/opencode"
 cp -a "$fixture/real-opencode" "$opencode2_rootfs/usr/bin/tini"
+find "$opencode2_rootfs" -type d -exec chmod 755 {} +
+find "$opencode2_rootfs" -type f -exec chmod 644 {} +
+chmod 755 "$opencode2_rootfs/app/entrypoint.sh" \
+  "$opencode2_rootfs/usr/local/bin/opencode" \
+  "$opencode2_rootfs/usr/local/lib/opencode2/opencode" \
+  "$opencode2_rootfs/usr/bin/tini"
 printf 'fixture\n' >"$repo/README"
 git_fx=(git -C "$repo" -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false)
 "${git_fx[@]}" init -q

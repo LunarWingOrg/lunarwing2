@@ -447,7 +447,7 @@ class MainWiringTests(unittest.TestCase):
                     self.module, "check_filesystem_half",
                     side_effect=lambda path, env: calls.append(("filesystem", path, env)),
                 ):
-            self.assertEqual(self.module.main(), 0)
+            self.assertEqual(self.module.main([]), 0)
         self.assertEqual(calls[0], ("config", config))
         self.assertEqual(calls[1][0:2], ("filesystem", self.module.REPO_ROOT / "opencode2-rootfs.tar"))
         self.assertEqual(calls[1][2]["OPENCODE_DISABLE_AUTOUPDATE"], "1")
@@ -460,7 +460,7 @@ class MainWiringTests(unittest.TestCase):
                 mock.patch.object(self.module, "check_filesystem_half") as filesystem, \
                 contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
-                self.module.main()
+                self.module.main([])
         filesystem.assert_not_called()
 
     def test_main_rejects_a_malformed_digest_before_fetching(self):
@@ -469,7 +469,7 @@ class MainWiringTests(unittest.TestCase):
                 mock.patch.object(self.module, "_fetch_candidate_config") as fetch, \
                 contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
-                self.module.main()
+                self.module.main([])
         fetch.assert_not_called()
 
 
