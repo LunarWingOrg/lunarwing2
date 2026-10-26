@@ -862,10 +862,10 @@ with two-round percent-decode detection on proxy headers; response bodies
 are scrubbed at the byte level; and `headers_json` is parsed and redacted
 so JSON-escaped spellings cannot slip through. Credential-injected
 exchanges strip every guest `Accept-Encoding` spelling, send exactly
-`identity`, and refuse any response whose content coding or transfer framing the scrub
-cannot safely inspect (tightened by
-WI#419 below) — an uninspectable body is never forwarded blind. The WASM guest HTTP wrapper
-applies one guest-facing redaction over the whole outcome, covering
+`identity`, and refuse any non-empty response body whose content coding or
+transfer framing the scrub cannot safely inspect (tightened by WI#419
+below) — an uninspectable body is never forwarded blind. The WASM guest HTTP
+wrapper applies one guest-facing redaction over the whole outcome, covering
 validator errors that quote the injected URL. WI#395 was closed on
 2026-10-16.
 
@@ -874,12 +874,21 @@ behavior (WI#419, landed 2026-10-17): hyper removes exactly one chunked
 layer, and only when the last comma token of the last `Transfer-Encoding`
 field is `chunked` — so `chunked,` (trailing comma), `chunked` followed by
 an empty field, `chunked, chunked`, and double-chunked bodies all reach
-the echo scrub with their framing intact. A transfer-coding-only body is
-inspectable now only when it has exactly one `chunked` token in last
-position; every other shape — including unreadable or empty
-`Transfer-Encoding` fields — is opaque and refused, and the refusal covers
-retained-framing spellings regardless of whether hyper de-chunks them.
+the echo scrub with their framing intact. On non-empty bodies, a
+transfer-coding-only answer is inspectable only when it has exactly one
+`chunked` token in last position; every other shape — including unreadable
+or empty `Transfer-Encoding` fields — is opaque and refused, and the refusal
+covers retained-framing spellings regardless of whether hyper de-chunks them.
 WI#419 closed on 2026-10-17.
+
+WI#429 implements the deferred v2.1.6 item-54 IV-2/JD-2 availability
+follow-up: the coding refusal now applies only to non-empty collected
+bodies. Credentialed HEAD and 304 responses with `Content-Encoding: gzip`,
+and HEAD and 204 responses with `Transfer-Encoding: chunked,`, preserve
+their upstream status and empty body. Echoed credentials in response headers
+remain scrubbed, and all non-empty-body refusals for duplicate or unreadable
+content codings, other transfer codings, and kept chunk framing remain in
+force.
 
 ### Channel WASM Host Credential Redaction (WI#408)
 
