@@ -623,6 +623,41 @@ class InstalledWrapperTests(unittest.TestCase):
         failures = self.check(self.bin_dir)
         self.assertTrue(any("real binary" in f and "other-writable" in f for f in failures), failures)
 
+    def test_real_binary_group_write_and_privilege_bits_fail(self) -> None:
+        for mode in (0o775, 0o4755, 0o2755):
+            with self.subTest(mode=oct(mode)):
+                self.binary_path.chmod(mode)
+                failures = self.check(self.bin_dir)
+                self.assertTrue(
+                    any("real binary" in failure for failure in failures), failures,
+                )
+                self.binary_path.chmod(0o755)
+
+    def test_wrapper_privilege_bits_fail(self) -> None:
+        for mode in (0o4755, 0o2755):
+            with self.subTest(mode=oct(mode)):
+                self.wrapper_path.chmod(mode)
+                failures = self.check(self.bin_dir)
+                self.assertTrue(any("setuid/setgid" in failure for failure in failures), failures)
+                self.wrapper_path.chmod(0o755)
+
+    def test_group_writable_parent_fails(self) -> None:
+        self.bin_dir.chmod(0o775)
+        failures = self.check(self.bin_dir)
+        self.assertTrue(
+            any("parent" in failure and str(self.bin_dir) in failure for failure in failures),
+            failures,
+        )
+        self.bin_dir.chmod(0o755)
+
+    def test_special_real_binary_is_refused_without_reading_it(self) -> None:
+        self.binary_path.unlink()
+        os.mkfifo(self.binary_path)
+        with mock.patch.object(self.assert_module, "check_binary") as read_binary:
+            failures = self.check(self.bin_dir)
+        read_binary.assert_not_called()
+        self.assertTrue(any("regular file" in failure for failure in failures), failures)
+
     def test_real_binary_wrong_owner_fails(self) -> None:
         with self.altered_owner(self.binary_path):
             failures = self.check(self.bin_dir)

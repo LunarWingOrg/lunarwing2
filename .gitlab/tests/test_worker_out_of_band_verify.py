@@ -117,8 +117,8 @@ class TarFixture:
         self.entries: dict[str, dict] = {}
         self.add_dir("")
         for name in (
-            "app", "usr", "usr/local", "usr/local/bin", "usr/local/lib",
-            "usr/local/lib/opencode2",
+            "app", "app/node_modules", "usr", "usr/bin", "usr/local", "usr/local/bin",
+            "usr/local/lib", "usr/local/lib/opencode2",
         ):
             self.add_dir(name)
         self.add_dir("app/scripts", mode=0o555)
@@ -136,13 +136,28 @@ class TarFixture:
         self.add_file(
             "usr/local/lib/opencode2/opencode", b"\x7fELF clean pinned build", mode=0o755,
         )
+        self.add_file("usr/bin/tini", b"\x7fELF pinned tini", mode=0o755)
+
+    def _add_parents(self, name: str):
+        for parent in reversed(list(pathlib.PurePosixPath(name).parents)):
+            key = str(parent)
+            if key not in ("", ".") and key not in self.entries:
+                self.add_dir(key)
 
     def add_dir(self, name: str, mode: int = 0o755, uid: int = 0):
+        self._add_parents(name)
         self.entries[name] = {"kind": "dir", "mode": mode, "uid": uid, "gid": 0}
 
     def add_file(self, name: str, data: bytes, mode: int = 0o444, uid: int = 0):
+        self._add_parents(name)
         self.entries[name] = {
             "kind": "file", "mode": mode, "uid": uid, "gid": 0, "data": data,
+        }
+
+    def add_symlink(self, name: str, target: str):
+        self._add_parents(name)
+        self.entries[name] = {
+            "kind": "symlink", "mode": 0o777, "uid": 0, "gid": 0, "target": target,
         }
 
     def write(self, archive_path: pathlib.Path):
@@ -152,6 +167,7 @@ class TarFixture:
                 member.mode = entry["mode"]
                 member.uid = entry["uid"]
                 member.gid = entry["gid"]
+                member.pax_headers.update(entry.get("pax", {}))
                 if entry["kind"] == "dir":
                     member.type = tarfile.DIRTYPE
                     archive.addfile(member)
@@ -276,6 +292,156 @@ class FilesystemExportTests(unittest.TestCase):
                 self.assertRaises(SystemExit):
             self.module.check_filesystem_half(self.root / "missing.tar", image_environment())
         self.assertIn("missing or unreadable", stderr.getvalue())
+
+
+    def test_earlier_path_entries_of_any_type_are_refused(self):
+        cases = (
+            ("usr/local/sbin/opencode", "file"),
+            ("usr/local/go/bin/opencode", "symlink"),
+            ("home/opencode2/.cargo/bin/opencode", "file"),
+            ("home/opencode2/.cargo/bin", "symlinked-directory"),
+        )
+        for name, kind in cases:
+            with self.subTest(name=name, kind=kind):
+                self.fixture = TarFixture(self.lane)
+                if kind == "file":
+                    self.fixture.add_file(name, b"#!/bin/sh\n", mode=0o755)
+                elif kind == "symlink":
+                    self.fixture.add_symlink(name, "/usr/local/lib/opencode2/opencode")
+                else:
+                    self.fixture.add_symlink(name, "/usr/local/lib/opencode2")
+                self.fixture.write(self.archive)
+                self.assert_refused("PATH shadow")
+
+    def test_node_modules_owner_mode_links_and_capabilities_are_checked(self):
+        name = "app/node_modules/@opencode/client/package.json"
+        cases = (
+            ("owner", {"uid": 10003}, "root:root"),
+            ("group-write", {"mode": 0o664}, "privilege or write bits"),
+            ("other-write", {"mode": 0o646}, "privilege or write bits"),
+            ("setuid", {"mode": 0o4644}, "privilege or write bits"),
+        )
+        for label, overrides, expected in cases:
+            with self.subTest(label=label):
+                self.fixture = TarFixture(self.lane)
+                values = {"data": b"{}\n", "mode": 0o444, "uid": 0, **overrides}
+                self.fixture.add_file(name, **values)
+                self.fixture.write(self.archive)
+                self.assert_refused(expected)
+        for label, capability in (("link", False), ("capability", True)):
+            with self.subTest(label=label):
+                self.fixture = TarFixture(self.lane)
+                if capability:
+                    self.fixture.add_file(name, b"{}\n")
+                    self.fixture.entries[name]["pax"] = {
+                        "SCHILY.xattr.security.capability": "AQAAAoAAAAAA",
+                    }
+                else:
+                    self.fixture.add_symlink(name, "/bin/sh")
+                self.fixture.write(self.archive)
+                self.assert_refused("protected path")
+
+    def test_real_binary_privilege_bits_and_capabilities_are_refused(self):
+        for mode in (0o4755, 0o2755):
+            with self.subTest(mode=oct(mode)):
+                self.fixture = TarFixture(self.lane)
+                self.fixture.add_file(
+                    "usr/local/lib/opencode2/opencode", b"clean", mode=mode,
+                )
+                self.fixture.write(self.archive)
+                self.assert_refused("setuid/setgid")
+        self.fixture = TarFixture(self.lane)
+        self.fixture.entries["usr/local/lib/opencode2/opencode"]["pax"] = {
+            "security.capability": "AQAAAoAAAAAA",
+        }
+        self.fixture.write(self.archive)
+        self.assert_refused("file capabilities")
+
+    def test_loader_preload_and_missing_or_linked_tini_are_refused(self):
+        self.fixture.add_file("etc/ld.so.preload", b"/tmp/evil.so\n")
+        self.fixture.write(self.archive)
+        self.assert_refused("ld.so.preload")
+        for linked in (False, True):
+            with self.subTest(linked=linked):
+                self.fixture = TarFixture(self.lane)
+                del self.fixture.entries["usr/bin/tini"]
+                if linked:
+                    self.fixture.add_symlink("usr/bin/tini", "/bin/true")
+                self.fixture.write(self.archive)
+                self.assert_refused("installed file usr/bin/tini")
+
+    def test_whiteouts_duplicate_and_unsafe_names_are_refused(self):
+        self.fixture.add_file("app/.wh.planted", b"")
+        self.fixture.write(self.archive)
+        self.assert_refused("whiteout")
+        self.fixture = TarFixture(self.lane)
+        self.fixture.add_file("app//entrypoint.sh", b"duplicate", mode=0o444)
+        self.fixture.write(self.archive)
+        self.assert_refused("duplicate member")
+        self.fixture = TarFixture(self.lane)
+        self.fixture.entries["../escape"] = {
+            "kind": "file", "mode": 0o444, "uid": 0, "gid": 0, "data": b"x",
+        }
+        self.fixture.write(self.archive)
+        self.assert_refused("unsafe member name")
+
+    def test_extra_file_in_source_directory_is_refused(self):
+        self.fixture.add_file("app/scripts/planted.py", b"print('planted')\n")
+        self.fixture.write(self.archive)
+        self.assert_refused("unexpected=['app/scripts/planted.py']")
+
+    def test_node_modules_tree_is_required(self):
+        del self.fixture.entries["app/node_modules"]
+        self.fixture.write(self.archive)
+        self.assert_refused("directory app/node_modules")
+
+
+class MainWiringTests(unittest.TestCase):
+    def setUp(self):
+        self.module = load_verify_module()
+        self.digest = "sha256:" + "b" * 64
+        self.environment = {
+            "WORKER_IMAGE_REF": "registry.example/group/worker-opencode2:candidate",
+            "WORKER_IMAGE_DIGEST": self.digest,
+            "OPENCODE_DISABLE_AUTOUPDATE": "",
+        }
+
+    def test_main_runs_both_halves_with_the_fetched_image_environment(self):
+        config = clean_config()
+        calls = []
+        with mock.patch.dict(os.environ, self.environment), \
+                mock.patch.object(self.module, "_fetch_candidate_config", return_value=config), \
+                mock.patch.object(
+                    self.module, "check_config_half", side_effect=lambda value: calls.append(("config", value)),
+                ), \
+                mock.patch.object(
+                    self.module, "check_filesystem_half",
+                    side_effect=lambda path, env: calls.append(("filesystem", path, env)),
+                ):
+            self.assertEqual(self.module.main(), 0)
+        self.assertEqual(calls[0], ("config", config))
+        self.assertEqual(calls[1][0:2], ("filesystem", self.module.REPO_ROOT / "opencode2-rootfs.tar"))
+        self.assertEqual(calls[1][2]["OPENCODE_DISABLE_AUTOUPDATE"], "1")
+
+    def test_main_config_refusal_skips_the_filesystem_half(self):
+        config = clean_config()
+        config["config"]["User"] = "0:0"
+        with mock.patch.dict(os.environ, self.environment), \
+                mock.patch.object(self.module, "_fetch_candidate_config", return_value=config), \
+                mock.patch.object(self.module, "check_filesystem_half") as filesystem, \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.module.main()
+        filesystem.assert_not_called()
+
+    def test_main_rejects_a_malformed_digest_before_fetching(self):
+        self.environment["WORKER_IMAGE_DIGEST"] = "latest"
+        with mock.patch.dict(os.environ, self.environment), \
+                mock.patch.object(self.module, "_fetch_candidate_config") as fetch, \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.module.main()
+        fetch.assert_not_called()
 
 
 class BuildScriptWiringTests(unittest.TestCase):

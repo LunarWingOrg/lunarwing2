@@ -96,6 +96,8 @@ def _member_name(name: str) -> str:
         return ""
     if normalized == ".." or normalized.startswith(("../", "/")):
         die(f"tar export carries unsafe member name {name!r}")
+    if any(part.startswith(".wh.") for part in pathlib.PurePosixPath(normalized).parts):
+        die(f"tar export carries an unapplied whiteout {name!r}")
     return normalized
 
 
@@ -117,6 +119,61 @@ def _kind(member: tarfile.TarInfo) -> int:
     if member.issym():
         return stat.S_IFLNK
     return 0
+
+
+def _has_capabilities(member: tarfile.TarInfo) -> bool:
+    return any(
+        key.lower() == "security.capability"
+        or key.lower().endswith(".security.capability")
+        for key in member.pax_headers
+    )
+
+
+def _check_root_member(member: tarfile.TarInfo, name: str, *, executable: bool = False) -> None:
+    if not (member.isdir() or member.isreg()):
+        die(f"tar export protected path {name} must be a regular file or directory")
+    if member.uid != 0 or member.gid != 0:
+        die(f"tar export protected path {name} must be owned by root:root")
+    mode = member.mode & 0o7777
+    if mode & 0o6022:
+        die(f"tar export protected path {name} has privilege or write bits {mode:o}")
+    if executable and (not member.isreg() or mode & 0o111 != 0o111):
+        die(f"tar export protected executable {name} must be a regular 0755-style file")
+    if _has_capabilities(member):
+        die(f"tar export protected path {name} carries file capabilities")
+
+
+def _resolve_export_path(path: str, members: dict[str, tarfile.TarInfo]) -> str:
+    pending = [part for part in path.split("/") if part]
+    resolved = ""
+    for _ in range(40):
+        if not pending:
+            return resolved
+        candidate = posixpath.join(resolved, pending.pop(0))
+        member = members.get(candidate)
+        if member is None or not member.issym():
+            resolved = candidate
+            continue
+        base = "/" if member.linkname.startswith("/") else f"/{resolved}"
+        target = posixpath.normpath(posixpath.join(base, member.linkname, *pending))
+        if target == "/" or not target.startswith("/"):
+            die(f"tar export path {path} resolves outside the image root")
+        resolved = ""
+        pending = [part for part in target.split("/") if part]
+    die(f"tar export path {path} has too many symlink hops")
+    return ""
+
+
+def _check_path_shadows(members: dict[str, tarfile.TarInfo], path_value: str) -> None:
+    if not path_value:
+        die("image PATH is empty; cannot prove the wrapper is unshadowed")
+    for directory in path_value.split(":"):
+        if not directory.startswith("/") or posixpath.normpath(directory) != directory:
+            die(f"image PATH carries a non-canonical directory {directory!r}")
+        resolved = _resolve_export_path(directory.removeprefix("/"), members)
+        shadow = posixpath.join(resolved, "opencode")
+        if shadow != "usr/local/bin/opencode" and shadow in members:
+            die(f"tar export carries an opencode PATH shadow at /{shadow}")
 
 
 def _metadata(members: dict[str, tarfile.TarInfo]) -> dict[str, dict[str, int]]:
@@ -185,21 +242,29 @@ def _validate_members(members: dict[str, tarfile.TarInfo]) -> None:
     if "" in members and not members[""].isdir():
         die("tar export root entry is not a directory")
     required_dirs = {
-        "app", "usr", "usr/local", "usr/local/bin", "usr/local/lib",
-        "usr/local/lib/opencode2", *SOURCE_PREFIXES,
+        "app", "app/node_modules", "usr", "usr/bin", "usr/local", "usr/local/bin",
+        "usr/local/lib", "usr/local/lib/opencode2", *SOURCE_PREFIXES,
     }
     for name in required_dirs:
         if name not in members or not members[name].isdir():
             die(f"tar export directory {name} is missing or not a directory")
-    for name in INSTALLED_FILES:
+    for name in (*INSTALLED_FILES, "usr/bin/tini"):
         if name not in members or not members[name].isreg():
             die(f"tar export installed file {name} must be a regular file, not a link")
-    for name in members:
-        if _is_source_path(name) and not (members[name].isdir() or members[name].isreg()):
-            die(f"tar export source path {name} is a link or special file")
+        if _has_capabilities(members[name]):
+            die(f"tar export protected path {name} carries file capabilities")
+    _check_root_member(members["usr/bin"], "usr/bin")
+    _check_root_member(members["usr/bin/tini"], "usr/bin/tini", executable=True)
+    if "etc/ld.so.preload" in members:
+        die("tar export carries /etc/ld.so.preload")
+    for name, member in members.items():
+        dependency = name == "app/node_modules" or name.startswith("app/node_modules/")
+        if dependency:
+            _check_root_member(member, name)
+        elif _is_source_path(name) and _has_capabilities(member):
+            die(f"tar export protected path {name} carries file capabilities")
         if name.startswith("app/") and not _is_source_path(name) and not (
-            name == "app/results" or name.startswith("app/results/")
-            or name == "app/node_modules" or name.startswith("app/node_modules/")
+            name == "app/results" or name.startswith("app/results/") or dependency
         ):
             die(f"tar export carries unexpected /app entry {name}")
 
@@ -274,6 +339,7 @@ def check_filesystem_half(archive_path: pathlib.Path, image_environment: dict[st
                 tarfile.open(archive_path, mode="r:*") as archive:
             members = _members(archive)
             _validate_members(members)
+            _check_path_shadows(members, image_environment.get("PATH", ""))
             checkout = _checkout_entries()
             _compare_checkout_tree(archive, members, checkout)
             workspace = pathlib.Path(tmp)

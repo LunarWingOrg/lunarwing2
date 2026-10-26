@@ -323,8 +323,9 @@ def _check_real_binary_metadata(
     if metadata.st_uid != owner_uid:
         fail(f"{label} {path} must be owned by uid {owner_uid} (got uid {metadata.st_uid})")
         return False
-    if mode & 0o022:
-        fail(f"{label} {path} must not be group- or other-writable (mode {mode:o})")
+    if mode & 0o6022:
+        fail(f"{label} {path} must not carry setuid/setgid and must not be "
+             f"group- or other-writable (mode {mode:o})")
         return False
     return True
 
@@ -395,8 +396,9 @@ def _read_installed_wrapper(
     if metadata.st_uid != owner_uid:
         fail(f"installed wrapper {wrapper_path} must be owned by uid {owner_uid}")
         return None
-    if metadata.st_mode & 0o022:
-        fail(f"installed wrapper {wrapper_path} must not be group- or other-writable")
+    if stat.S_IMODE(metadata.st_mode) & 0o6022:
+        fail(f"installed wrapper {wrapper_path} must not carry setuid/setgid and "
+             "must not be group- or other-writable")
         return None
     if (stat.S_IMODE(metadata.st_mode) & 0o111) != 0o111:
         fail(f"installed wrapper {wrapper_path} must be executable by user, group "
@@ -501,7 +503,7 @@ def check_installed_wrapper(
             fail(f"'opencode' on PATH must resolve to the wrapper {wrapper_path} "
                  f"(got {resolved!r}) — an earlier PATH dir shadows the guard")
             return
-    _check_real_binary_metadata(
+    binary_ok = _check_real_binary_metadata(
         "real binary",
         binary_path,
         owner_uid=owner_uid,
@@ -517,7 +519,8 @@ def check_installed_wrapper(
             image_root=image_root,
             image_metadata=image_metadata,
         )
-    check_binary(binary_path)
+    if binary_ok:
+        check_binary(binary_path)
     if not failures:
         check(f"installed wrapper {wrapper_path} is the exposure guard "
               "and the real binary carries no tunnel markers")
