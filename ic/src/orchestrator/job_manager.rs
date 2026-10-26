@@ -1284,11 +1284,10 @@ impl ContainerJobManager {
             // DH-4: promotion is running detached against the staging dir and
             // the held secret values (CW-10 scan). A stop now would clear
             // both mid-walk — refuse; finalize flips to Stopped when done.
+            // Structural refusal variant, not a stringly-typed state (DH-4
+            // nit): callers match on the variant instead of the error text.
             if handle.state == ContainerState::Finalizing {
-                return Err(OrchestratorError::InvalidContainerState {
-                    job_id,
-                    state: "finalizing (write-back promotion in progress)".to_string(),
-                });
+                return Err(OrchestratorError::JobFinalizing { job_id });
             }
             if handle.container_id.is_empty() {
                 return Err(OrchestratorError::InvalidContainerState {
@@ -1369,9 +1368,16 @@ impl ContainerJobManager {
                 Some(handle) => {
                     // DH-3: /complete is idempotent — a duplicate or racing
                     // report must not spawn a second finalize task or flip
-                    // state mid-promotion.
+                    // state mid-promotion. DZ-7/EA-7/EE-6: the caller must be
+                    // able to tell "I accepted this" from "this was already
+                    // claimed", because a late /complete racing stop_job or
+                    // the exit watcher would otherwise still persist
+                    // `completed`, broadcast a JobResult SSE and move the
+                    // ContextManager to `Completed` — overwriting the
+                    // terminal `Stopped`/`cancelled` outcome and rejecting the
+                    // cancel tool's later `Completed -> Cancelled` transition.
                     if handle.completion_result.is_some() {
-                        return Ok(());
+                        return Err(OrchestratorError::JobAlreadyCompleted { job_id });
                     }
                     handle.completion_result = Some(result);
                     let promote = handle
@@ -1628,6 +1634,15 @@ async fn finalize_harness_job(
             Some("container teardown could not be confirmed; write-back refused".to_string());
     } else {
         summary = run_promotion(&deps, job_id, &owner_id, &staging, &policy).await;
+    }
+
+    // DZ-6: the `harness_write_back` audit event is written via a direct
+    // `save_job_event` — the event ingest redaction never sees it. Scrub the
+    // summary against the job's own mounted secret values before persisting,
+    // the same defense the /event and /complete handlers apply (best-effort
+    // backstop behind the path and content scans, not the primary control).
+    if let Some(redactor) = deps.token_store.harness_secret_redactor(job_id).await {
+        harness::scrub_promotion_summary(&mut summary, &redactor);
     }
 
     tracing::info!(

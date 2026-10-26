@@ -405,6 +405,18 @@ pub enum OrchestratorError {
     #[error("Container for job {job_id} is in unexpected state: {state}")]
     InvalidContainerState { job_id: Uuid, state: String },
 
+    /// The job is mid write-back promotion (`Finalizing`): stop/cancel is
+    /// refused until the detached promotion lands, so callers can distinguish
+    /// this from a generic state error structurally instead of matching on the
+    /// error string (DH-4 nit).
+    #[error("Job {job_id} is finalizing write-back promotion; retry once it completes")]
+    JobFinalizing { job_id: Uuid },
+
+    /// The job has already completed; a duplicate or raced `/complete` report
+    /// is a no-op and must not re-run terminal side effects (DZ-7/EA-7/EE-6).
+    #[error("Job {job_id} has already completed")]
+    JobAlreadyCompleted { job_id: Uuid },
+
     #[error("Internal API error: {reason}")]
     ApiError { reason: String },
 

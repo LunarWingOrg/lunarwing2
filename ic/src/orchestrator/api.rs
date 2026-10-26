@@ -276,8 +276,21 @@ async fn report_complete(
         success: report.success,
         message: report.message.clone(),
     };
-    if let Err(e) = state.job_manager.complete_job(job_id, result).await {
-        tracing::error!(job_id = %job_id, "Failed to complete job cleanup: {}", e);
+    match state.job_manager.complete_job(job_id, result).await {
+        Ok(()) => {}
+        // DZ-7/EA-7/EE-6: a duplicate or raced /complete is a no-op. Return
+        // early — WITHOUT persisting `completed`, broadcasting a JobResult
+        // SSE, or moving the ContextManager to `Completed` — so a late
+        // /complete cannot overwrite a terminal `Stopped`/`cancelled`
+        // outcome (which would make the cancel tool's later
+        // `Completed -> Cancelled` transition be rejected and `cancelled`
+        // never persist).
+        Err(crate::error::OrchestratorError::JobAlreadyCompleted { .. }) => {
+            return Ok(Json(serde_json::json!({"status": "ok"})));
+        }
+        Err(e) => {
+            tracing::error!(job_id = %job_id, "Failed to complete job cleanup: {}", e);
+        }
     }
     let status = completion_report_status(&report);
     if let Some(ref store) = state.store
@@ -1578,5 +1591,102 @@ mod tests {
         let handle = jm.get_handle(job_id).await.unwrap();
         assert_eq!(handle.worker_iteration, 5);
         assert_eq!(handle.last_worker_status.as_deref(), Some("Iteration 5"));
+    }
+
+    /// OA-15 (run-217 review): the early return in `report_complete`'s
+    /// `JobAlreadyCompleted` arm is what actually stops the late-`/complete`
+    /// side effects — it is the substance of DZ-7 and EE-6. This handler-level
+    /// test drives the real handler with an armed terminal claim, then asserts
+    /// the handle state is unchanged, no `JobResult` reaches the event
+    /// channel, and the `ContextManager` state is unchanged. With `store: None`,
+    /// this test does not observe persisted job status.
+    #[tokio::test]
+    async fn report_complete_after_terminal_claim_skips_side_effects() {
+        use crate::context::ContextManager;
+        use crate::orchestrator::job_manager::CompletionResult;
+
+        let (tx, mut rx) = broadcast::channel::<(Uuid, String, SseEvent)>(16);
+        let cm = Arc::new(ContextManager::new(8));
+        let token_store = TokenStore::new();
+        let jm = ContainerJobManager::new(ContainerJobConfig::default(), token_store.clone());
+        let job_id = Uuid::new_v4();
+        // Register the job in the ContextManager so a transition would show.
+        cm.register_sandbox_job(job_id, "owner", "race test", "OA-15")
+            .await
+            .unwrap();
+
+        let state = OrchestratorState {
+            llm: Arc::new(StubLlm::default()),
+            job_manager: Arc::new(jm),
+            token_store,
+            job_event_tx: Some(tx),
+            prompt_queue: Arc::new(Mutex::new(HashMap::new())),
+            store: None,
+            secrets_store: None,
+            user_id: "default".to_string(),
+            job_owner_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            context_manager: Some(cm.clone()),
+        };
+        // Insert a Running handle, then claim the terminal result the same way
+        // `stop_job` does (state -> Stopped, completion_result set) — a late
+        // `/complete` arrives after this claim.
+        insert_test_handle(&state, job_id, "owner").await;
+        {
+            let mut containers = state.job_manager.containers.write().await;
+            let handle = containers.get_mut(&job_id).unwrap();
+            handle.state = crate::orchestrator::job_manager::ContainerState::Stopped;
+            handle.completion_result = Some(CompletionResult {
+                success: false,
+                message: Some("Job stopped before reporting completion".to_string()),
+            });
+        }
+        let token = state.token_store.create_token(job_id).await;
+        let pre_ctx = cm.get_context(job_id).await.unwrap();
+
+        let router = OrchestratorApi::router(state.clone());
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/worker/{job_id}/complete"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"success": true, "message": "late", "iterations": 1})
+                    .to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            router.oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        // No JobResult SSE must have been broadcast.
+        assert!(
+            rx.try_recv().is_err(),
+            "a late /complete must not broadcast a JobResult SSE"
+        );
+        // The ContextManager state must be unchanged.
+        let post_ctx = cm.get_context(job_id).await.unwrap();
+        assert_eq!(
+            post_ctx.state, pre_ctx.state,
+            "a late /complete must not move the ContextManager"
+        );
+        // The handle state must stay the terminal claim, not the
+        // late success.
+        let handle = state.job_manager.get_handle(job_id).await.unwrap();
+        assert_eq!(
+            handle.state,
+            crate::orchestrator::job_manager::ContainerState::Stopped
+        );
+        assert!(
+            !handle.completion_result.unwrap().success,
+            "the late /complete must not overwrite the terminal completion result"
+        );
+
+        // Mutation check: if the `JobAlreadyCompleted` arm is removed so the
+        // duplicate falls through to the generic error branch, report_complete
+        // broadcasts and transitions the ContextManager. Those two assertions
+        // carry the regression pin; the handle assertions above do not detect
+        // this mutant. No persisted-status write is observed without a store.
+        // Run-221 review of !1932 verified this mutant is killed.
     }
 }
