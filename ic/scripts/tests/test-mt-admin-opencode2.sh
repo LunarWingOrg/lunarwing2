@@ -258,7 +258,7 @@ else
 fi
 
 # ── builder contract ────────────────────────────────────────────────────────
-mkdir -p "$fixture/target/opencode2.4lunarwing"
+mkdir -p "$fixture/target/opencode2.4lunarwing" "$fixture/target/.gitlab/scripts"
 cp -a "$HARNESS_REPO_ROOT/opencode2.4lunarwing/scripts" "$fixture/target/opencode2.4lunarwing/"
 cp -a "$HARNESS_REPO_ROOT/opencode2.4lunarwing/config" "$fixture/target/opencode2.4lunarwing/"
 cp -a "$HARNESS_REPO_ROOT/opencode2.4lunarwing/Dockerfile" \
@@ -266,6 +266,8 @@ cp -a "$HARNESS_REPO_ROOT/opencode2.4lunarwing/Dockerfile" \
   "$HARNESS_REPO_ROOT/opencode2.4lunarwing/health_server.py" \
   "$HARNESS_REPO_ROOT/opencode2.4lunarwing/agent_comm_protocol.json" \
   "$fixture/target/opencode2.4lunarwing/"
+cp -a "$HARNESS_REPO_ROOT/.gitlab/scripts/verify-opencode2-exposure-out-of-band.py" \
+  "$fixture/target/.gitlab/scripts/"
 wrapper_file="$fixture/target/opencode2.4lunarwing/scripts/opencode-exposure-guard.sh"
 chmod 755 "$wrapper_file"
 # Override consumed by the sourced container helpers.
@@ -278,15 +280,46 @@ oob_shell_override=''
 oob_drop_env=''
 oob_user='10003:10003'
 oob_config_inspect_failure=false
+oob_export_failure=false
 oob_empty_cid=false
 oob_wrapper_symlink=false
 oob_wrapper_mode=''
+oob_wrapper_uid=0
 oob_tamper_app=false
 oob_real_binary_missing=false
+oob_path_shadow=''
 oob_serve_wrapper_file="$wrapper_file"
-mkdir -p "$oob_image_root/usr/local/lib/opencode2"
-printf '\x7fELF clean pinned build\n' > "$oob_image_root/usr/local/lib/opencode2/opencode"
-chmod 755 "$oob_image_root/usr/local/lib/opencode2/opencode"
+oob_prepare_image() {
+  rm -rf "$oob_image_root"
+  mkdir -p "$oob_image_root/app/node_modules" "$oob_image_root/usr/bin" \
+    "$oob_image_root/usr/local/bin" "$oob_image_root/usr/local/lib/opencode2"
+  cp -a "$fixture/target/opencode2.4lunarwing/scripts" "$oob_image_root/app/scripts"
+  cp -a "$fixture/target/opencode2.4lunarwing/config" "$oob_image_root/app/config"
+  cp -a "$fixture/target/opencode2.4lunarwing/entrypoint.sh" \
+    "$fixture/target/opencode2.4lunarwing/health_server.py" \
+    "$fixture/target/opencode2.4lunarwing/agent_comm_protocol.json" \
+    "$oob_image_root/app/"
+  if [[ "$oob_tamper_app" == true ]]; then
+    printf '# tampered in image\n' >> "$oob_image_root/app/scripts/opencode-exposure-guard.sh"
+  fi
+  if [[ "$oob_wrapper_symlink" == true ]]; then
+    ln -s "$oob_serve_wrapper_file" "$oob_image_root/usr/local/bin/opencode"
+  else
+    cp "$oob_serve_wrapper_file" "$oob_image_root/usr/local/bin/opencode"
+    chmod "${oob_wrapper_mode:-755}" "$oob_image_root/usr/local/bin/opencode"
+  fi
+  if [[ "$oob_real_binary_missing" != true ]]; then
+    printf '\x7fELF clean pinned build\n' > "$oob_image_root/usr/local/lib/opencode2/opencode"
+    chmod 755 "$oob_image_root/usr/local/lib/opencode2/opencode"
+  fi
+  printf '\x7fELF pinned tini\n' > "$oob_image_root/usr/bin/tini"
+  chmod 755 "$oob_image_root/usr/bin/tini"
+  if [[ -n "$oob_path_shadow" ]]; then
+    mkdir -p "$oob_image_root/$(dirname "$oob_path_shadow")"
+    cp "$oob_image_root/usr/local/lib/opencode2/opencode" "$oob_image_root/$oob_path_shadow"
+    chmod 755 "$oob_image_root/$oob_path_shadow"
+  fi
+}
 docker() {
   case "${1:-}" in
     build)
@@ -302,33 +335,39 @@ docker() {
     create)
       printf '%s\n' "$*" >> "$fixture/create-calls"
       [[ "$oob_empty_cid" == true ]] || printf 'fakecontainerid\n' ;;
-    cp)
-      local src="$2" dst="$3" rel
-      rel="${src#fakecontainerid:}"
-      [[ "$rel" != "$src" ]] || return 1
-      if [[ "$rel" == /usr/local/bin/opencode ]]; then
-        if [[ "$oob_wrapper_symlink" == true ]]; then
-          ln -s "$oob_serve_wrapper_file" "$dst"
-        else
-          cp "$oob_serve_wrapper_file" "$dst"
-        fi
-        [[ -z "$oob_wrapper_mode" ]] || chmod "$oob_wrapper_mode" "$dst"
-      elif [[ "$rel" == /usr/local/lib/opencode2/opencode ]]; then
-        [[ "$oob_real_binary_missing" != true ]] || return 1
-        cp "$oob_image_root/$rel" "$dst"
-      elif [[ "$rel" == /app/scripts || "$rel" == /app/config ]]; then
-        cp -a "$fixture/target/opencode2.4lunarwing${rel#/app}" "$dst"
-        if [[ "$oob_tamper_app" == true && "$rel" == /app/scripts ]]; then
-          printf '# tampered in image\n' >> "$dst/opencode-exposure-guard.sh"
-        fi
-      elif [[ "$rel" == /app/entrypoint.sh || "$rel" == /app/health_server.py \
-             || "$rel" == /app/agent_comm_protocol.json ]]; then
-        cp "$fixture/target/opencode2.4lunarwing${rel#/app}" "$dst"
-      else
-        return 1
-      fi ;;
+    export)
+      [[ "$oob_export_failure" != true ]] || return 1
+      [[ "${2:-}" == --output && "${4:-}" == fakecontainerid ]] || return 1
+      oob_prepare_image
+      python3 - "$oob_image_root" "$3" "$oob_wrapper_uid" <<'PY'
+import pathlib
+import sys
+import tarfile
+root, output, wrapper_uid = pathlib.Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+with tarfile.open(output, "w") as archive:
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        info = archive.gettarinfo(str(path), arcname=relative)
+        info.uid = wrapper_uid if relative == "usr/local/bin/opencode" else 0
+        info.gid = 0
+        if relative.startswith("app/") and not path.is_symlink() and path.is_file():
+            info.mode = 0o444
+        if path.is_dir() and (
+            relative in {"app/scripts", "app/config"}
+            or relative.startswith(("app/scripts/", "app/config/"))
+        ):
+            info.mode = 0o555
+        if path.is_symlink() or path.is_dir():
+            archive.addfile(info)
+        elif path.is_file():
+            with path.open("rb") as source:
+                archive.addfile(info, source)
+        else:
+            raise SystemExit(f"unsupported fixture entry: {path}")
+PY
+      ;;
     rm | rmi) return 0 ;;
-    tag) OOB_TAG_CALLS+=("$2 -> $3") ;;
+    tag) printf '%s\n' "$2 -> $3" >> "$fixture/tag-calls" ;;
     image)
       [[ "$oob_config_inspect_failure" != true ]] || return 1
       [[ "${*: -1}" == '{{json .Config}}' ]] || return 1
@@ -355,6 +394,15 @@ print(json.dumps({
     "Cmd": ["--mode", "websocket"],
     "User": user,
     "WorkingDir": "/app",
+    "Healthcheck": {
+        "Test": ["CMD-SHELL", "curl -sf http://127.0.0.1:8443/health || exit 1"],
+        "Interval": 30000000000,
+        "Timeout": 5000000000,
+        "StartPeriod": 30000000000,
+        "Retries": 3,
+    },
+    "ExposedPorts": {"8443/tcp": {}, "9090/tcp": {}},
+    "StopSignal": "SIGTERM",
     "Shell": json.loads(shell) if shell else None,
 }))
 PY
@@ -363,7 +411,7 @@ PY
   esac
 }
 podman() { docker "$@"; }
-OOB_TAG_CALLS=()
+: > "$fixture/tag-calls"
 BUILD_CALL=''
 build_opencode2_worker false true "$fixture/target" >/dev/null
 if [[ "$BUILD_CALL" == *'--build-arg WITH_TOOLCHAINS=true'* \
@@ -376,16 +424,14 @@ else
 fi
 # WI#425: the out-of-band verification gates the :latest re-tag by image ID.
 expected_image_id="sha256:$(printf '%064d' 0)"
-if [[ "${OOB_TAG_CALLS[0]}" == "$expected_image_id -> lunarwing-worker-opencode2:latest" ]]; then
+if [[ "$(head -n1 "$fixture/tag-calls")" == "$expected_image_id -> lunarwing-worker-opencode2:latest" ]]; then
   pass 'opencode2 builder re-tags :latest only after verifying the immutable image ID'
 else
-  fail "opencode2 builder did not gate the :latest re-tag on the verified ID: ${OOB_TAG_CALLS[*]:-}"
+  fail "opencode2 builder did not gate the :latest re-tag on the verified ID: $(cat "$fixture/tag-calls")"
 fi
 
-# run-221 OK-1: root never executes the checkout's policy file. A planted
-# scripts/json.py (untracked in the tenant checkout, copied into the image by
-# `COPY scripts/`, so the /app compare still passes) would be imported first
-# if the policy ran from its own directory.
+# run-221 OK-1: root never executes checkout Python. A planted scripts/json.py
+# must not be imported by the shared verifier's isolated Python mode.
 planted_marker="$fixture/planted-json-ran"
 cat > "$fixture/target/opencode2.4lunarwing/scripts/json.py" <<EOF
 import pathlib
@@ -394,18 +440,20 @@ EOF
 : > "$fixture/setpriv-calls"
 if (build_opencode2_worker false false "$fixture/target") >"$fixture/oob-planted.log" 2>&1 \
    && [[ ! -e "$planted_marker" ]]; then
-  pass 'image-config policy ignores a json.py planted next to it in the checkout'
+  pass 'shared verifier ignores a json.py planted next to the checkout policy'
 else
   fail "planted checkout json.py ran or broke the verify: $(cat "$fixture/oob-planted.log")"
 fi
 rm -f "$fixture/target/opencode2.4lunarwing/scripts/json.py" "$planted_marker"
 nobody_uid="$(id -u nobody)"
 setpriv_call="$(head -n1 "$fixture/setpriv-calls")"
-if [[ "$setpriv_call" == "--reuid=$nobody_uid --regid=$(id -g nobody) --clear-groups --no-new-privs -- env -i PATH=/usr/bin:/bin "*" -I "*"/policy/image_config_policy.py" \
+if [[ "$setpriv_call" == "--reuid=$nobody_uid --regid=$(id -g nobody) --clear-groups --no-new-privs -- env -i PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 "* \
+   && "$setpriv_call" == *" -I "*"/checkout/.gitlab/scripts/verify-opencode2-exposure-out-of-band.py --archive "* \
+   && "$setpriv_call" == *" --config "*" --workspace-dir "* \
    && "$setpriv_call" != *"$fixture/target"* ]]; then
-  pass 'image-config policy runs as nobody, isolated, from a root-owned copy'
+  pass 'shared tar/config verifier runs as nobody from an isolated root-owned snapshot'
 else
-  fail "image-config policy privilege drop wrong: $setpriv_call"
+  fail "shared verifier privilege drop wrong: $setpriv_call"
 fi
 
 BUILD_CALL=''
@@ -417,9 +465,11 @@ else
 fi
 
 # GW-1: bind both runtime lanes to the selected checkout's wrapper bytes.
+cp "$wrapper_file" "$wrapper_file.base"
 for CONTAINER_RT in docker podman; do
   for revision in first second; do
-    printf '#!/bin/sh\n# %s wrapper\n' "$revision" > "$wrapper_file"
+    cp "$wrapper_file.base" "$wrapper_file"
+    printf '# %s wrapper digest variant\n' "$revision" >> "$wrapper_file"
     expected_anchor=$(sha256sum < "$wrapper_file")
     expected_anchor=${expected_anchor%% *}
     BUILD_CALL=''
@@ -446,6 +496,7 @@ for CONTAINER_RT in docker podman; do
   fi
   mv "$wrapper_file.saved" "$wrapper_file"
 done
+mv "$wrapper_file.base" "$wrapper_file"
 
 for bad_digest in '' short "$(printf '%064d' 0)g" "$(printf '%064d' 0 | tr 0 g)"; do
   : > "$fixture/build-calls"
@@ -490,12 +541,12 @@ fi
 # :latest — the good previous image stays in place.
 oob_refusal_run() {
   local log_file="$1" label="$2"
-  OOB_TAG_CALLS=()
+  : > "$fixture/tag-calls"
   if (build_opencode2_worker false false "$fixture/target") >"$log_file" 2>&1; then
     fail "out-of-band verify accepted $label"
     return 1
   fi
-  if [[ "${#OOB_TAG_CALLS[@]}" -ne 0 ]]; then
+  if [[ -s "$fixture/tag-calls" ]]; then
     fail "out-of-band verify re-tagged :latest on $label refusal"
     return 1
   fi
@@ -506,13 +557,11 @@ oob_refusal_run() {
 assert_contains "$fixture/create-calls" '--pull=never' \
   'out-of-band create never pulls or resolves a moving tag'
 
-# Tampered installed wrapper, served with the expected mode so the byte check
-# (not the independent mode refusal) is what rejects it.
 printf '#!/bin/sh\n# tampered wrapper\nexec /bin/sh\n' > "$fixture/tampered-wrapper"
 chmod 755 "$fixture/tampered-wrapper"
 oob_serve_wrapper_file="$fixture/tampered-wrapper"
 oob_refusal_run "$fixture/oob-tampered.log" 'a tampered installed wrapper'
-assert_contains "$fixture/oob-tampered.log" 'installed wrapper differs from the checkout' \
+assert_contains "$fixture/oob-tampered.log" 'not byte-identical' \
   'tampered-wrapper refusal names the checkout comparison'
 oob_serve_wrapper_file="$wrapper_file"
 
@@ -536,21 +585,39 @@ assert_contains "$fixture/oob-inspect-failure.log" 'cannot inspect full image co
   'image-config inspect failure is never tolerated'
 oob_config_inspect_failure=false
 
+oob_export_failure=true
+oob_refusal_run "$fixture/oob-export-failure.log" 'an image filesystem export failure'
+assert_contains "$fixture/oob-export-failure.log" 'cannot export the opencode2 image filesystem' \
+  'filesystem export failure is never tolerated'
+oob_export_failure=false
+
 oob_wrapper_symlink=true
 oob_refusal_run "$fixture/oob-wrapper-link.log" 'a symlinked installed wrapper'
-assert_contains "$fixture/oob-wrapper-link.log" 'missing, linked, or not mode 0755' \
-  'symlinked wrapper is refused before cmp can follow it'
+assert_contains "$fixture/oob-wrapper-link.log" 'must be a regular file, not a link' \
+  'symlinked wrapper is refused from its tar type'
 oob_wrapper_symlink=false
 
 oob_wrapper_mode=744
 oob_refusal_run "$fixture/oob-wrapper-mode.log" 'an owner-only-executable wrapper'
-assert_contains "$fixture/oob-wrapper-mode.log" 'not mode 0755' \
+assert_contains "$fixture/oob-wrapper-mode.log" 'GX-3' \
   'wrapper with the wrong mode is refused'
 oob_wrapper_mode=''
 
+oob_wrapper_uid=10003
+oob_refusal_run "$fixture/oob-wrapper-owner.log" 'an agent-owned installed wrapper'
+assert_contains "$fixture/oob-wrapper-owner.log" 'owned by uid 0' \
+  'mt-admin preserves CI tar-header ownership enforcement'
+oob_wrapper_uid=0
+
+oob_path_shadow='usr/local/sbin/opencode'
+oob_refusal_run "$fixture/oob-path-shadow.log" 'an opencode earlier on PATH'
+assert_contains "$fixture/oob-path-shadow.log" 'PATH shadow' \
+  'mt-admin preserves CI PATH-shadow enforcement'
+oob_path_shadow=''
+
 oob_tamper_app=true
 oob_refusal_run "$fixture/oob-app-drift.log" 'a tampered checkout-owned /app tree'
-assert_contains "$fixture/oob-app-drift.log" 'exported /app/scripts differs from the checkout' \
+assert_contains "$fixture/oob-app-drift.log" 'app/scripts/opencode-exposure-guard.sh differs from the checkout' \
   'checkout-owned app content is compared out of band'
 oob_tamper_app=false
 
@@ -562,7 +629,7 @@ oob_empty_cid=false
 
 oob_real_binary_missing=true
 oob_refusal_run "$fixture/oob-binary.log" 'a missing real binary'
-assert_contains "$fixture/oob-binary.log" 'real binary is missing' \
+assert_contains "$fixture/oob-binary.log" 'installed file usr/local/lib/opencode2/opencode' \
   'missing-binary refusal names the path'
 oob_real_binary_missing=false
 
@@ -578,14 +645,14 @@ assert_contains "$fixture/oob-shell.log" 'Shell override' \
   'Shell-override refusal names the drift'
 oob_shell_override=''
 
-# run-221 OK-1: root reads the checkout policy without following a symlink
-# (the image copy carries the same link, so only the policy read refuses).
+# A linked checkout policy is refused in the root-owned snapshot before any
+# Python is invoked, preserving the OK-1 no-follow guarantee.
 policy_file="$fixture/target/opencode2.4lunarwing/scripts/image_config_policy.py"
 mv "$policy_file" "$fixture/policy-real.py"
 ln -s "$fixture/policy-real.py" "$policy_file"
 oob_refusal_run "$fixture/oob-policy-link.log" 'a symlinked checkout image-config policy'
-assert_contains "$fixture/oob-policy-link.log" 'cannot safely read the checkout image-config policy' \
-  'symlinked checkout policy is refused before root reads through it'
+assert_contains "$fixture/oob-policy-link.log" 'checkout snapshot contains a link or special file' \
+  'symlinked checkout policy is refused before snapshot Python runs'
 rm -f "$policy_file"
 mv "$fixture/policy-real.py" "$policy_file"
 

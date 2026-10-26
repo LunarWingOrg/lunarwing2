@@ -314,7 +314,7 @@ def _run_assertion(
     environment_path.write_text(json.dumps(environment), encoding="utf-8")
     result = subprocess.run(
         [
-            sys.executable, str(ASSERT), "--lane", str(export / "app"),
+            sys.executable, "-I", str(ASSERT), "--lane", str(export / "app"),
             "--profile", "opencode2", "--image-filesystem", "--image-root", str(export),
             "--image-metadata", str(metadata_path), "--image-env-file", str(environment_path),
         ],

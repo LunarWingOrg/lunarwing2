@@ -484,7 +484,7 @@ CONTAINER_EXISTS="true"
 
 # ── SOURCE_REVISION stamping ─────────────────────────────────────────────────
 repo="$fixture/src"
-for dir in kimicode4lunarwing opencode4lunarwing opencode2.4lunarwing/scripts pebble4lunarwing; do
+for dir in kimicode4lunarwing opencode4lunarwing opencode2.4lunarwing/scripts pebble4lunarwing .gitlab/scripts; do
   mkdir -p "$repo/$dir"
 done
 for dir in kimicode4lunarwing opencode4lunarwing opencode2.4lunarwing pebble4lunarwing; do
@@ -498,8 +498,22 @@ cp -a "$HARNESS_REPO_ROOT/opencode2.4lunarwing/entrypoint.sh" \
   "$HARNESS_REPO_ROOT/opencode2.4lunarwing/health_server.py" \
   "$HARNESS_REPO_ROOT/opencode2.4lunarwing/agent_comm_protocol.json" \
   "$repo/opencode2.4lunarwing/"
+cp -a "$HARNESS_REPO_ROOT/.gitlab/scripts/verify-opencode2-exposure-out-of-band.py" \
+  "$repo/.gitlab/scripts/"
 printf '\x7fELF clean pinned build\n' >"$fixture/real-opencode"
 chmod 755 "$fixture/real-opencode"
+opencode2_rootfs="$fixture/opencode2-rootfs"
+mkdir -p "$opencode2_rootfs/app/node_modules" "$opencode2_rootfs/usr/bin" \
+  "$opencode2_rootfs/usr/local/bin" "$opencode2_rootfs/usr/local/lib/opencode2"
+cp -a "$repo/opencode2.4lunarwing/scripts" "$opencode2_rootfs/app/scripts"
+cp -a "$repo/opencode2.4lunarwing/config" "$opencode2_rootfs/app/config"
+cp -a "$repo/opencode2.4lunarwing/entrypoint.sh" \
+  "$repo/opencode2.4lunarwing/health_server.py" \
+  "$repo/opencode2.4lunarwing/agent_comm_protocol.json" "$opencode2_rootfs/app/"
+cp -a "$repo/opencode2.4lunarwing/scripts/opencode-exposure-guard.sh" \
+  "$opencode2_rootfs/usr/local/bin/opencode"
+cp -a "$fixture/real-opencode" "$opencode2_rootfs/usr/local/lib/opencode2/opencode"
+cp -a "$fixture/real-opencode" "$opencode2_rootfs/usr/bin/tini"
 printf 'fixture\n' >"$repo/README"
 git_fx=(git -C "$repo" -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false)
 "${git_fx[@]}" init -q
@@ -528,7 +542,7 @@ else
 fi
 
 fake_worker_runtime() {
-  local runtime="$1" previous='' argument src dst rel
+  local runtime="$1" previous='' argument
   shift
   CALLS+=("$runtime:$*")
   case "${1:-}" in
@@ -540,22 +554,34 @@ fake_worker_runtime() {
         previous="$argument"
       done ;;
     create) printf 'contractcid\n' ;;
-    cp)
-      src="$2"
-      dst="$3"
-      rel="${src#contractcid:}"
-      [[ "$rel" != "$src" ]] || return 1
-      case "$rel" in
-        /usr/local/bin/opencode)
-          cp "$repo/opencode2.4lunarwing/scripts/opencode-exposure-guard.sh" "$dst" ;;
-        /usr/local/lib/opencode2/opencode)
-          cp "$fixture/real-opencode" "$dst" ;;
-        /app/scripts | /app/config)
-          cp -a "$repo/opencode2.4lunarwing${rel#/app}" "$dst" ;;
-        /app/entrypoint.sh | /app/health_server.py | /app/agent_comm_protocol.json)
-          cp "$repo/opencode2.4lunarwing${rel#/app}" "$dst" ;;
-        *) return 1 ;;
-      esac ;;
+    export)
+      [[ "${2:-}" == --output && "${4:-}" == contractcid ]] || return 1
+      python3 - "$opencode2_rootfs" "$3" <<'PY'
+import pathlib
+import sys
+import tarfile
+root, output = pathlib.Path(sys.argv[1]), sys.argv[2]
+with tarfile.open(output, "w") as archive:
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        info = archive.gettarinfo(str(path), arcname=relative)
+        info.uid = info.gid = 0
+        if relative.startswith("app/") and not path.is_symlink() and path.is_file():
+            info.mode = 0o444
+        if path.is_dir() and (
+            relative in {"app/scripts", "app/config"}
+            or relative.startswith(("app/scripts/", "app/config/"))
+        ):
+            info.mode = 0o555
+        if path.is_symlink() or path.is_dir():
+            archive.addfile(info)
+        elif path.is_file():
+            with path.open("rb") as source:
+                archive.addfile(info, source)
+        else:
+            raise SystemExit(f"unsupported fixture entry: {path}")
+PY
+      ;;
     image)
       [[ "${2:-}" == inspect && "${*: -1}" == '{{json .Config}}' ]] || return 1
       python3 - <<'PY'
@@ -576,6 +602,15 @@ print(json.dumps({
     "Cmd": ["--mode", "websocket"],
     "User": "10003:10003",
     "WorkingDir": "/app",
+    "Healthcheck": {
+        "Test": ["CMD-SHELL", "curl -sf http://127.0.0.1:8443/health || exit 1"],
+        "Interval": 30000000000,
+        "Timeout": 5000000000,
+        "StartPeriod": 30000000000,
+        "Retries": 3,
+    },
+    "ExposedPorts": {"8443/tcp": {}, "9090/tcp": {}},
+    "StopSignal": "SIGTERM",
     "Shell": None,
 }))
 PY
@@ -593,6 +628,9 @@ build_arg_seen() {  # <image tag> <SOURCE_REVISION value>
   done
   return 1
 }
+# The non-root harness cannot chown the verifier's scratch work dir to nobody;
+# production keeps that ownership transition mandatory.
+chown() { :; }
 CALLS=()
 build_kimi_worker false false "" "$repo"
 build_opencode_worker false false "$repo"
