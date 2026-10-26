@@ -1143,5 +1143,6 @@
 106. [x] (H) Revamped LunarWing TUI REPLv3 utilizing OpenTUI, Multimodal input/output, and more
 107. [x] (H) Remaining polish items from massive changes introduced in `Tsuno`
 108. [x] (H) General Agent Loop Engine Polish
+109. [x] (H) Start the gallop
 
 ---
