@@ -95,6 +95,9 @@ pub struct HybridStore {
     /// before the canonical write has succeeded (MR !885 review).
     #[cfg(test)]
     fail_next_doc_save: std::sync::atomic::AtomicBool,
+    /// Test-only paths whose workspace reads fail, to pin boot read warnings.
+    #[cfg(test)]
+    fail_workspace_reads: Mutex<HashSet<String>>,
 }
 
 impl HybridStore {
@@ -124,6 +127,8 @@ impl HybridStore {
             secrets_store,
             #[cfg(test)]
             fail_next_doc_save: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_workspace_reads: Mutex::new(HashSet::new()),
         }
     }
 
@@ -134,10 +139,15 @@ impl HybridStore {
         };
 
         self.load_knowledge_docs(ws).await;
-        self.load_map(ws, PROJECTS_PREFIX, |project: Project| async {
+        self.load_map(ws, PROJECTS_PREFIX, "project", |project: Project| async {
             self.projects.write().await.insert(project.id, project);
         })
         .await;
+        // WI#321: a project whose project.json failed to load is absent from
+        // the map, so the unlocked check-then-create can mint a second
+        // "default" project for the same user. Surface that here, before any
+        // mission/thread resolution has to pick between them.
+        self.warn_duplicate_default_projects().await;
         // Consolidation runs after projects load so legacy-identity duplicates
         // (nil project) can be adopted by the sole known project when one
         // exists — otherwise the seeder would never find the canonical doc.
@@ -145,6 +155,7 @@ impl HybridStore {
         self.load_map(
             ws,
             CONVERSATIONS_PREFIX,
+            "conversation",
             |conversation: ConversationSurface| async {
                 self.conversations
                     .write()
@@ -153,23 +164,33 @@ impl HybridStore {
             },
         )
         .await;
-        self.load_map(ws, THREADS_PREFIX, |thread: Thread| async {
+        self.load_map(ws, THREADS_PREFIX, "thread", |thread: Thread| async {
             self.threads.write().await.insert(thread.id, thread);
         })
         .await;
-        self.load_map(ws, STEPS_PREFIX, |steps: Vec<Step>| async {
-            if let Some(thread_id) = steps.first().map(|step| step.thread_id) {
-                self.steps.write().await.insert(thread_id, steps);
-            }
-        })
+        self.load_map(
+            ws,
+            STEPS_PREFIX,
+            "thread step batch",
+            |steps: Vec<Step>| async {
+                if let Some(thread_id) = steps.first().map(|step| step.thread_id) {
+                    self.steps.write().await.insert(thread_id, steps);
+                }
+            },
+        )
         .await;
-        self.load_map(ws, EVENTS_PREFIX, |events: Vec<ThreadEvent>| async {
-            if let Some(thread_id) = events.first().map(|event| event.thread_id) {
-                self.events.write().await.insert(thread_id, events);
-            }
-        })
+        self.load_map(
+            ws,
+            EVENTS_PREFIX,
+            "thread event batch",
+            |events: Vec<ThreadEvent>| async {
+                if let Some(thread_id) = events.first().map(|event| event.thread_id) {
+                    self.events.write().await.insert(thread_id, events);
+                }
+            },
+        )
         .await;
-        self.load_map(ws, LEASES_PREFIX, |lease: CapabilityLease| async {
+        self.load_map(ws, LEASES_PREFIX, "lease", |lease: CapabilityLease| async {
             self.leases.write().await.insert(lease.id, lease);
         })
         .await;
@@ -202,6 +223,40 @@ impl HybridStore {
             "loaded engine state from workspace"
         );
         Ok(())
+    }
+
+    /// Warn once per user holding more than one `"default"` project (WI#321).
+    ///
+    /// Two unlocked check-then-create windows (`resolve_user_project` and the
+    /// engine boot path) can each mint a `"default"` project when the first
+    /// one's `project.json` has not loaded or the lookup raced. Missions and
+    /// conversations are then attached to whichever project the shared picker
+    /// chose, which reads as "the mission disappeared". Boot is the earliest
+    /// point where every loaded project is visible, and the only place that
+    /// reports the duplicate — the picker itself runs per message and stays
+    /// silent (NY-19).
+    async fn warn_duplicate_default_projects(&self) {
+        let projects: Vec<Project> = self.projects.read().await.values().cloned().collect();
+        let mut by_user: HashMap<&str, Vec<&Project>> = HashMap::new();
+        for project in projects.iter().filter(|p| p.name == "default") {
+            by_user
+                .entry(project.user_id.as_str())
+                .or_default()
+                .push(project);
+        }
+        for (user_id, defaults) in by_user {
+            let ordered = sorted_default_projects(&defaults);
+            if ordered.len() < 2 {
+                continue;
+            }
+            let project_ids: Vec<String> = ordered.iter().map(|p| p.id.0.to_string()).collect();
+            warn!(
+                user_id = %user_id,
+                count = ordered.len(),
+                project_ids = ?project_ids,
+                "multiple \"default\" projects for one user; using the oldest"
+            );
+        }
     }
 
     /// Evict terminal (Done/Failed) threads from in-memory caches.
@@ -594,19 +649,90 @@ impl HybridStore {
         );
     }
 
-    async fn load_map<T, F, Fut>(&self, ws: &Workspace, directory: &str, on_value: F)
-    where
+    async fn read_workspace(
+        &self,
+        ws: &Workspace,
+        path: &str,
+    ) -> Result<crate::workspace::MemoryDocument, crate::error::WorkspaceError> {
+        #[cfg(test)]
+        if self.fail_workspace_reads.lock().await.contains(path) {
+            return Err(crate::error::WorkspaceError::IoError {
+                reason: "injected workspace read failure".to_owned(),
+            });
+        }
+        ws.read(path).await
+    }
+
+    async fn read_workspace_primary(
+        &self,
+        ws: &Workspace,
+        path: &str,
+    ) -> Result<crate::workspace::MemoryDocument, crate::error::WorkspaceError> {
+        #[cfg(test)]
+        if self.fail_workspace_reads.lock().await.contains(path) {
+            return Err(crate::error::WorkspaceError::IoError {
+                reason: "injected workspace read failure".to_owned(),
+            });
+        }
+        ws.read_primary(path).await
+    }
+
+    /// Load every persisted record under `directory` into the in-memory maps.
+    ///
+    /// A record whose file cannot be read or parsed is dropped from the map, so
+    /// the warning below is the only trace that it ever existed (WI#321): at
+    /// debug it was invisible under the default log filter and the record then
+    /// also vanished from every listing and schedule. `kind` names the record
+    /// family so the warning reads without a stack of surrounding context.
+    ///
+    /// The warning carries UUID-validated identifiers, the operator-facing path
+    /// and a static error class. Directory slugs in that path can derive from
+    /// user-authored names. The raw serde error quotes the stored value it choked
+    /// on — message text or tool output for thread, step and event records — so
+    /// it stays at `debug!` (WI#321 NY-18/OA-8).
+    async fn load_map<T, F, Fut>(
+        &self,
+        ws: &Workspace,
+        directory: &str,
+        kind: &'static str,
+        on_value: F,
+    ) where
         T: DeserializeOwned,
         F: Fn(T) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
         for entry in self.file_entries(ws, directory, &[".json"]).await {
-            match ws.read(&entry.path).await {
+            match self.read_workspace(ws, &entry.path).await {
                 Ok(doc) => match serde_json::from_str::<T>(&doc.content) {
                     Ok(value) => on_value(value).await,
-                    Err(e) => debug!(path = %entry.path, "failed to parse engine state: {e}"),
+                    Err(e) => {
+                        let record_id = record_id_hint(&doc.content).describe();
+                        warn!(
+                            kind = %kind,
+                            path = %entry.path,
+                            record_id = %record_id,
+                            error_kind = %parse_error_kind(&e),
+                            line = e.line(),
+                            column = e.column(),
+                            "dropping {kind} record: failed to parse"
+                        );
+                        debug!(
+                            kind = %kind,
+                            path = %entry.path,
+                            record_id = %record_id,
+                            "dropping {kind} record: parse error: {e}"
+                        );
+                    }
                 },
-                Err(e) => debug!(path = %entry.path, "failed to read engine state: {e}"),
+                Err(e) => {
+                    warn!(
+                        kind = %kind,
+                        path = %entry.path,
+                        record_id = "unknown",
+                        "dropping {kind} record: failed to read"
+                    );
+                    debug!(kind = %kind, path = %entry.path, "dropping {kind} record: read error: {e}");
+                }
             }
         }
     }
@@ -947,19 +1073,61 @@ impl HybridStore {
                     continue;
                 }
                 let mission_file = format!("{}/mission.json", mission_entry.path);
-                if let Ok(doc) = ws.read_primary(&mission_file).await {
-                    match serde_json::from_str::<serde_json::Value>(&doc.content) {
-                        Ok(raw) => match serde_json::from_value::<Mission>(raw.clone()) {
-                            Ok(mission) => {
-                                candidates.push((mission_file, raw, mission));
-                            }
-                            Err(e) => {
-                                debug!(path = %mission_file, "failed to parse mission: {e}")
-                            }
-                        },
-                        Err(e) => {
-                            debug!(path = %mission_file, "failed to parse mission JSON: {e}")
+                let doc = match self.read_workspace_primary(ws, &mission_file).await {
+                    Ok(doc) => doc,
+                    Err(e) => {
+                        warn!(
+                            path = %mission_file,
+                            record_id = "unknown",
+                            "dropping mission: failed to read mission.json"
+                        );
+                        debug!(path = %mission_file, "dropping mission: read error: {e}");
+                        continue;
+                    }
+                };
+                match serde_json::from_str::<serde_json::Value>(&doc.content) {
+                    Ok(raw) => match serde_json::from_value::<Mission>(raw.clone()) {
+                        Ok(mission) => {
+                            candidates.push((mission_file, raw, mission));
                         }
+                        Err(e) => {
+                            // No explicit mission-name field is logged on this
+                            // failure path; the raw serde error stays at `debug!`
+                            // (WI#321 NY-18). The operator-facing path stays at
+                            // `warn!`; its directory slugs can carry user-authored
+                            // project and mission names (OA-8). Validate the
+                            // stored id too: corrupt ids can contain arbitrary
+                            // text or newlines (OF-1).
+                            let mission_id = record_uuid_field(&raw, "id")
+                                .unwrap_or_else(|| "unknown".to_owned());
+                            warn!(
+                                path = %mission_file,
+                                mission_id = %mission_id,
+                                error_kind = %parse_error_kind(&e),
+                                line = e.line(),
+                                column = e.column(),
+                                "dropping mission: failed to parse"
+                            );
+                            debug!(
+                                path = %mission_file,
+                                mission_id = %mission_id,
+                                "dropping mission: parse error: {e}"
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        warn!(
+                            path = %mission_file,
+                            record_id = "unknown",
+                            error_kind = %parse_error_kind(&e),
+                            line = e.line(),
+                            column = e.column(),
+                            "dropping mission: failed to parse mission.json"
+                        );
+                        debug!(
+                            path = %mission_file,
+                            "dropping mission: mission.json parse error: {e}"
+                        );
                     }
                 }
             }
@@ -1251,6 +1419,109 @@ fn project_dir(name: &str, project_id: ProjectId) -> String {
 
 fn project_path(name: &str, project_id: ProjectId) -> String {
     format!("{}/project.json", project_dir(name, project_id))
+}
+
+/// Best-effort identifiers from a document that failed to deserialize (WI#321).
+///
+/// Re-parses only on the failure path, so the happy path pays nothing.
+/// `id` is the record's own UUID `id`; `thread_id` is the thread a `Vec<_>`
+/// batch record (steps, events) is keyed by — that is the identifier an
+/// operator needs, while the element's own step/event id is not (WI#321
+/// NY-21). Both contain only canonical UUIDs or the static `"invalid"` marker
+/// (OF-1). They are `None` when the document is not JSON at all or the field is
+/// absent; the warning still names the path.
+#[derive(Default)]
+struct RecordIds {
+    id: Option<String>,
+    thread_id: Option<String>,
+}
+
+impl RecordIds {
+    /// Bounded UUID identifiers for a `warn!` field, with static `invalid` or
+    /// `unknown` markers instead of malformed or unavailable stored values.
+    fn describe(&self) -> String {
+        match (self.id.as_deref(), self.thread_id.as_deref()) {
+            (Some(id), Some(thread)) => format!("{id} (thread {thread})"),
+            (Some(id), None) => id.to_owned(),
+            (None, Some(thread)) => format!("thread {thread}"),
+            (None, None) => "unknown".to_owned(),
+        }
+    }
+}
+
+fn record_id_hint(content: &str) -> RecordIds {
+    let Ok(raw) = serde_json::from_str::<serde_json::Value>(content) else {
+        return RecordIds::default();
+    };
+    let (record, batch) = match &raw {
+        serde_json::Value::Array(items) => match items.first() {
+            Some(first) => (first, true),
+            None => return RecordIds::default(),
+        },
+        other => (other, false),
+    };
+    RecordIds {
+        id: record_uuid_field(record, "id"),
+        thread_id: batch
+            .then(|| record_uuid_field(record, "thread_id"))
+            .flatten(),
+    }
+}
+
+/// Never echo an unvalidated stored identifier at `warn!` (WI#321 OF-1).
+fn record_uuid_field(record: &serde_json::Value, field: &str) -> Option<String> {
+    let raw = record.get(field)?;
+    match raw.as_str().and_then(|id| Uuid::parse_str(id).ok()) {
+        Some(id) => Some(id.to_string()),
+        None => {
+            debug!(field, value = ?raw, "invalid stored record identifier");
+            Some("invalid".to_owned())
+        }
+    }
+}
+
+/// Static class of a JSON parse failure, safe to log at `warn!` (WI#321 NY-18).
+///
+/// `serde_json`'s `Display` quotes the offending *value* (`unknown variant
+/// \`<value>\``, `invalid type: string "<value>"`), so echoing the error at
+/// `warn!` publishes stored content — message text or tool output for thread,
+/// step and event records. The category, line and column locate the failure
+/// without the value; the full error stays at `debug!`.
+fn parse_error_kind(error: &serde_json::Error) -> &'static str {
+    match error.classify() {
+        serde_json::error::Category::Io => "io",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "data",
+        serde_json::error::Category::Eof => "eof",
+    }
+}
+
+/// The user's `"default"` projects in canonical order: oldest first, ties
+/// broken by id.
+fn sorted_default_projects<'a>(projects: &[&'a Project]) -> Vec<&'a Project> {
+    let mut defaults: Vec<&Project> = projects
+        .iter()
+        .copied()
+        .filter(|project| project.name == "default")
+        .collect();
+    defaults.sort_by_key(|project| (project.created_at, project.id.0));
+    defaults
+}
+
+/// Pick a user's canonical `"default"` project out of one listing.
+///
+/// WI#321: two unlocked check-then-create windows can leave more than one
+/// `"default"` project for the same user, and a map-backed listing makes
+/// "first" arbitrary — so a conversation could land in a different project on
+/// each call and its missions look like they vanished. Always return the
+/// oldest (ties broken by id) so repeated resolutions agree.
+///
+/// Deliberately silent: this runs on every message and on each mission
+/// listing, so warning here would repeat once per message for an affected
+/// user (WI#321 NY-19). Boot-time `warn_duplicate_default_projects` is the
+/// one place that reports duplicates.
+pub(crate) fn canonical_default_project<'a>(projects: &[&'a Project]) -> Option<&'a Project> {
+    sorted_default_projects(projects).first().copied()
 }
 
 fn thread_path(thread_id: ThreadId) -> String {
@@ -2167,6 +2438,7 @@ impl Store for HybridStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing_test::traced_test;
 
     #[test]
     fn mission_delete_path_targets_persisted_document() {
@@ -2180,6 +2452,729 @@ mod tests {
                 mission_dir("default--project", "Daily report", id)
             )
         );
+    }
+
+    /// True when a captured line was emitted at `level`.
+    ///
+    /// `tracing-subscriber`'s full formatter right-aligns levels to five
+    /// columns (`" WARN "`, `" INFO "`) but not `"DEBUG "`/`"TRACE "`, so both
+    /// the padded and unpadded shapes are accepted.
+    fn line_has_level(line: &str, level: &str) -> bool {
+        line.starts_with(&format!("{level} ")) || line.contains(&format!(" {level} "))
+    }
+
+    /// Assert exactly one log line at `level` carries every `fragments`.
+    ///
+    /// Returns `Err` rather than panicking: `tracing-test` holds its
+    /// process-global buffer lock while the `logs_assert` closure runs, so a
+    /// panic would poison the buffer and fail every other test in the binary.
+    fn assert_logged_at(lines: &[&str], level: &str, fragments: &[&str]) -> Result<(), String> {
+        let matches: Vec<&&str> = lines
+            .iter()
+            .filter(|line| {
+                line_has_level(line, level) && fragments.iter().all(|needle| line.contains(needle))
+            })
+            .collect();
+        if matches.len() == 1 {
+            return Ok(());
+        }
+        Err(format!(
+            "expected exactly one {level} line carrying {fragments:?}, got {} ({matches:?}); lines: {lines:?}",
+            matches.len()
+        ))
+    }
+
+    /// Assert exactly `expected` captured lines at `level` carry `needle`.
+    fn assert_logged_count(
+        lines: &[&str],
+        level: &str,
+        needle: &str,
+        expected: usize,
+    ) -> Result<(), String> {
+        let matches: Vec<&&str> = lines
+            .iter()
+            .filter(|line| line_has_level(line, level) && line.contains(needle))
+            .collect();
+        if matches.len() == expected {
+            return Ok(());
+        }
+        Err(format!(
+            "expected {expected} {level} line(s) carrying {needle:?}, got {} ({matches:?})",
+            matches.len()
+        ))
+    }
+
+    /// Assert no captured line at `level` or above carries `needle`.
+    ///
+    /// Debug lines may legitimately echo the full error text; the content that
+    /// must stay clean is what the default filter shows (WI#321 NY-18).
+    fn assert_no_log_carries_at_or_above(
+        lines: &[&str],
+        needle: &str,
+        level: &str,
+    ) -> Result<(), String> {
+        const LEVELS: [&str; 5] = ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"];
+        let threshold = LEVELS
+            .iter()
+            .position(|candidate| *candidate == level)
+            .unwrap_or(0);
+        let offending = lines
+            .iter()
+            .filter(|line| {
+                if !line.contains(needle) {
+                    return false;
+                }
+                LEVELS
+                    .iter()
+                    .position(|candidate| line_has_level(line, candidate))
+                    .map(|position| position <= threshold)
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        if offending.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "{needle:?} reached the log at {level} or above: {offending:?}"
+        ))
+    }
+
+    #[test]
+    fn record_id_hint_reads_object_and_batch_ids() {
+        // The dropped-record warning names the id when the document is valid
+        // JSON with a UUID `id`. For the `Vec<_>` step/event batches the
+        // thread the batch is keyed by is the identifier an operator needs, so
+        // it is reported next to the element's own id (WI#321 NY-21).
+        let id = Uuid::new_v4();
+        let thread = Uuid::new_v4();
+        assert_eq!(
+            record_id_hint(&serde_json::json!({"id": id.to_string().to_uppercase()}).to_string())
+                .describe(),
+            id.to_string(),
+            "valid identifiers must be printed in canonical UUID form"
+        );
+        assert_eq!(
+            record_id_hint(&serde_json::json!([{"id": id, "thread_id": thread}]).to_string())
+                .describe(),
+            format!("{id} (thread {thread})")
+        );
+        assert_eq!(
+            record_id_hint(&serde_json::json!([{"thread_id": thread}]).to_string()).describe(),
+            format!("thread {thread}")
+        );
+        assert_eq!(record_id_hint("{not json").describe(), "unknown");
+        assert_eq!(record_id_hint(r#"{}"#).describe(), "unknown");
+        assert_eq!(record_id_hint(r#"[]"#).describe(), "unknown");
+    }
+
+    #[test]
+    fn record_id_hint_replaces_invalid_ids_with_static_markers() {
+        let thread = Uuid::new_v4();
+        for invalid in [
+            serde_json::json!("stored text\nFORGED LOG LINE"),
+            serde_json::json!("x".repeat(10_000)),
+            serde_json::json!(7),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(
+                record_id_hint(&serde_json::json!({"id": invalid}).to_string()).describe(),
+                "invalid"
+            );
+            assert_eq!(
+                record_id_hint(
+                    &serde_json::json!([{"id": invalid, "thread_id": thread}]).to_string()
+                )
+                .describe(),
+                format!("invalid (thread {thread})")
+            );
+            assert_eq!(
+                record_id_hint(
+                    &serde_json::json!([{"id": thread, "thread_id": invalid}]).to_string()
+                )
+                .describe(),
+                format!("{thread} (thread invalid)")
+            );
+            assert_eq!(
+                record_id_hint(&serde_json::json!([{"thread_id": invalid}]).to_string()).describe(),
+                "thread invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_error_kind_is_static_and_never_quotes_the_value() {
+        // NY-18: the Display text of a serde error quotes the stored value on
+        // a data mismatch. The classify() class does not, which is why it is
+        // what `warn!` carries.
+        let data = serde_json::from_str::<Vec<u32>>(r#""LEAKED""#).expect_err("data error");
+        assert_eq!(parse_error_kind(&data), "data");
+        assert!(data.to_string().contains("LEAKED"));
+        assert!(!parse_error_kind(&data).contains("LEAKED"));
+
+        let syntax = serde_json::from_str::<Vec<u32>>("[}").expect_err("syntax error");
+        assert_eq!(parse_error_kind(&syntax), "syntax");
+        let eof = serde_json::from_str::<Vec<u32>>("[1,").expect_err("eof error");
+        assert_eq!(parse_error_kind(&eof), "eof");
+    }
+
+    #[test]
+    fn canonical_default_project_ignores_non_default_projects() {
+        // The picker is fed the caller's whole project list, so only projects
+        // actually named "default" may compete — an older custom project must
+        // never be returned as the default (WI#321).
+        let mut research = Project::new("u", "research", "r");
+        research.created_at = chrono::Utc::now() - chrono::Duration::hours(5);
+        let default = Project::new("u", "default", "d");
+        let refs = [&research, &default];
+        assert_eq!(
+            canonical_default_project(&refs).map(|project| project.id),
+            Some(default.id)
+        );
+        assert!(canonical_default_project(&[&research]).is_none());
+    }
+
+    #[test]
+    fn canonical_default_project_picks_the_oldest_whatever_the_input_order() {
+        // Kills the `sort_by_key(..)` → `reverse()` mutant deterministically:
+        // every input permutation must yield the same (oldest) project, so the
+        // order handed in cannot decide the answer. A two-element slice lets
+        // the mutant pass about half the time, which is why this covers all
+        // six orderings of three defaults (WI#321 NY-20).
+        let base = chrono::Utc::now();
+        let mut oldest = Project::new("u", "default", "oldest");
+        oldest.created_at = base - chrono::Duration::hours(3);
+        let mut middle = Project::new("u", "default", "middle");
+        middle.created_at = base - chrono::Duration::hours(2);
+        let mut newest = Project::new("u", "default", "newest");
+        newest.created_at = base - chrono::Duration::hours(1);
+        for order in [
+            [&oldest, &middle, &newest],
+            [&oldest, &newest, &middle],
+            [&middle, &oldest, &newest],
+            [&middle, &newest, &oldest],
+            [&newest, &oldest, &middle],
+            [&newest, &middle, &oldest],
+        ] {
+            assert_eq!(
+                canonical_default_project(&order).map(|project| project.id),
+                Some(oldest.id),
+                "the oldest default must win regardless of input order"
+            );
+        }
+
+        // Ties break on the id, not on the input position.
+        let mut first = Project::new("u", "default", "tie a");
+        first.created_at = base;
+        let mut second = Project::new("u", "default", "tie b");
+        second.created_at = base;
+        let (low, high) = if first.id.0 < second.id.0 {
+            (&first, &second)
+        } else {
+            (&second, &first)
+        };
+        assert_eq!(
+            canonical_default_project(&[high, low]).map(|project| project.id),
+            Some(low.id)
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    #[traced_test]
+    async fn corrupt_mission_json_warns_with_identifiers_instead_of_vanishing() {
+        // WI#321 regression: a mission.json that fails to deserialize used to be
+        // dropped at debug! — the mission then disappeared from every listing
+        // and schedule with no above-debug signal. It must now warn, name the
+        // record, and still be absent from the loaded map (the drop is real).
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("corrupt-mission-warn", db));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let project = Project::new("test-user", "warn project", "test");
+        let mission = Mission::new(
+            project.id,
+            "test-user",
+            "vanishing-mission",
+            "should warn",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        store.save_project(&project).await.expect("save project");
+        store.save_mission(&mission).await.expect("save mission");
+
+        // Schema-invalid but still parseable JSON: the id survives for the
+        // warning, the typed deserialization does not.
+        let path = mission_path(
+            &store.project_slug(project.id).await,
+            &mission.name,
+            mission.id,
+        );
+        assert!(
+            path.contains(&mission.name),
+            "the fixture must cover the slugged-name path called out by OA-8"
+        );
+        let mut raw: serde_json::Value = serde_json::from_str(
+            &workspace
+                .read_primary(&path)
+                .await
+                .expect("read mission")
+                .content,
+        )
+        .expect("mission json");
+        raw["cadence"] = serde_json::json!("not-a-cadence");
+        workspace
+            .write(&path, &raw.to_string())
+            .await
+            .expect("corrupt mission");
+
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded
+            .load_state_from_workspace()
+            .await
+            .expect("reload engine state");
+
+        assert!(
+            reloaded
+                .load_mission(mission.id)
+                .await
+                .expect("load")
+                .is_none(),
+            "a mission that failed to parse must not silently appear as loaded"
+        );
+        let mission_id = mission.id.0.to_string();
+        let goal = mission.goal.clone();
+        logs_assert(|lines: &[&str]| {
+            assert_logged_at(
+                lines,
+                "WARN",
+                &[
+                    "dropping mission: failed to parse",
+                    &mission_id,
+                    &path,
+                    "error_kind=data",
+                ],
+            )?;
+            // OA-8: the required operator path legitimately carries the slugged
+            // name. Exclude that path before checking no separate name field or
+            // other user content reaches warn; the goal and raw serde value must
+            // stay out too (NY-18).
+            let without_paths: Vec<String> = lines
+                .iter()
+                .map(|line| line.replace(&path, "<mission-path>"))
+                .collect();
+            let without_paths: Vec<&str> = without_paths.iter().map(String::as_str).collect();
+            assert_no_log_carries_at_or_above(&without_paths, &mission.name, "WARN")?;
+            assert_no_log_carries_at_or_above(lines, &goal, "WARN")?;
+            assert_no_log_carries_at_or_above(lines, "not-a-cadence", "WARN")
+        });
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    #[traced_test]
+    async fn non_json_mission_file_warns_instead_of_vanishing() {
+        // OA-7: the syntax-error path is distinct from a schema-invalid JSON
+        // document and must also warn at boot with its operator-facing path.
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("non-json-mission-warn", db));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let project = Project::new("test-user", "warn project", "test");
+        let mission = Mission::new(
+            project.id,
+            "test-user",
+            "non-json-mission",
+            "should warn",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        store.save_project(&project).await.expect("save project");
+        store.save_mission(&mission).await.expect("save mission");
+        let path = mission_path(
+            &store.project_slug(project.id).await,
+            &mission.name,
+            mission.id,
+        );
+        workspace
+            .write(&path, "{ this is not json")
+            .await
+            .expect("corrupt mission");
+
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded
+            .load_state_from_workspace()
+            .await
+            .expect("reload engine state");
+        assert!(reloaded.missions.read().await.is_empty());
+
+        logs_assert(|lines: &[&str]| {
+            assert_logged_at(
+                lines,
+                "WARN",
+                &[
+                    "dropping mission: failed to parse mission.json",
+                    &path,
+                    "record_id=\"unknown\"",
+                    "error_kind=syntax",
+                ],
+            )?;
+            assert_no_log_carries_at_or_above(lines, "this is not json", "WARN")
+        });
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    #[traced_test]
+    async fn project_and_mission_read_failures_warn_at_boot() {
+        // OA-7: fail the actual workspace reads after directory discovery, so
+        // both boot read-failure branches prove their levels and identifiers.
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("read-failure-warn", db));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let project = Project::new("test-user", "read project", "test");
+        let mission = Mission::new(
+            project.id,
+            "test-user",
+            "read-failure-mission",
+            "should warn",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        store.save_project(&project).await.expect("save project");
+        store.save_mission(&mission).await.expect("save mission");
+        let project_file = project_path(&project.name, project.id);
+        let mission_file = mission_path(
+            &store.project_slug(project.id).await,
+            &mission.name,
+            mission.id,
+        );
+
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        {
+            let mut failures = reloaded.fail_workspace_reads.lock().await;
+            failures.insert(project_file.clone());
+            failures.insert(mission_file.clone());
+        }
+        reloaded
+            .load_state_from_workspace()
+            .await
+            .expect("reload engine state");
+        assert!(reloaded.projects.read().await.is_empty());
+        assert!(reloaded.missions.read().await.is_empty());
+
+        logs_assert(|lines: &[&str]| {
+            assert_logged_at(
+                lines,
+                "WARN",
+                &[
+                    "dropping project record: failed to read",
+                    &project_file,
+                    "record_id=\"unknown\"",
+                ],
+            )?;
+            assert_logged_at(
+                lines,
+                "WARN",
+                &[
+                    "dropping mission: failed to read mission.json",
+                    &mission_file,
+                    "record_id=\"unknown\"",
+                ],
+            )
+        });
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    #[traced_test]
+    async fn corrupt_step_batch_warns_with_the_batch_identity_and_no_content() {
+        // NY-18/NY-21 class: step records carry user-visible content (tool
+        // output in `action_results`). A type mismatch makes serde quote the
+        // stored string in its Display text, which must not reach warn; the
+        // thread the batch is keyed by is what the warning names.
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("corrupt-step-warn", db));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let thread_id = ThreadId::new();
+        store
+            .save_step(&Step::new(thread_id, 1))
+            .await
+            .expect("save step");
+        let path = step_path(thread_id);
+        let mut raw: serde_json::Value = serde_json::from_str(
+            &workspace
+                .read(&path)
+                .await
+                .expect("read step batch")
+                .content,
+        )
+        .expect("step batch json");
+        raw[0]["action_results"] = serde_json::json!("LEAKED TOOL OUTPUT");
+        workspace
+            .write(&path, &raw.to_string())
+            .await
+            .expect("corrupt step batch");
+
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded
+            .load_state_from_workspace()
+            .await
+            .expect("reload engine state");
+
+        assert!(
+            reloaded
+                .load_steps(thread_id)
+                .await
+                .expect("load")
+                .is_empty(),
+            "a step batch that failed to parse must not appear as loaded"
+        );
+        let thread = thread_id.0.to_string();
+        logs_assert(|lines: &[&str]| {
+            assert_logged_at(
+                lines,
+                "WARN",
+                &[
+                    "dropping thread step batch record: failed to parse",
+                    &thread,
+                    "error_kind=data",
+                ],
+            )?;
+            assert_no_log_carries_at_or_above(lines, "LEAKED TOOL OUTPUT", "WARN")
+        });
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    #[traced_test]
+    async fn invalid_step_batch_ids_are_not_logged_at_warn() {
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("invalid-step-ids-warn", db));
+        let mut expected_warnings = Vec::new();
+        for field in ["id", "thread_id"] {
+            let marker = format!("OF1_STEP_{field}");
+            // Include the test scope on the forged continuation so tracing-test
+            // captures it too, rather than filtering away the injected line.
+            let invalid =
+                format!("{marker}\nFORGED invalid_step_batch_ids_are_not_logged_at_warn: {marker}");
+            let thread_id = ThreadId::new();
+            let step = Step::new(thread_id, 1);
+            let expected_id = if field == "id" {
+                format!("record_id=invalid (thread {})", thread_id.0)
+            } else {
+                format!("record_id={} (thread invalid)", step.id.0)
+            };
+            let path = step_path(thread_id);
+            let mut raw = serde_json::json!([step]);
+            raw[0][field] = serde_json::json!(invalid);
+            workspace
+                .write(&path, &raw.to_string())
+                .await
+                .expect("write corrupt step batch");
+            expected_warnings.push((path, expected_id, marker));
+        }
+
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded
+            .load_state_from_workspace()
+            .await
+            .expect("reload engine state");
+        assert!(reloaded.steps.read().await.is_empty());
+
+        logs_assert(|lines: &[&str]| {
+            for (path, expected_id, marker) in &expected_warnings {
+                assert_logged_at(
+                    lines,
+                    "WARN",
+                    &[
+                        "dropping thread step batch record: failed to parse",
+                        path,
+                        expected_id,
+                    ],
+                )?;
+                assert_logged_at(
+                    lines,
+                    "DEBUG",
+                    &["invalid stored record identifier", marker],
+                )?;
+                assert_no_log_carries_at_or_above(lines, marker, "WARN")?;
+                if lines
+                    .iter()
+                    .any(|line| line.contains(marker) && !line_has_level(line, "DEBUG"))
+                {
+                    return Err(format!("stored id forged a non-debug log line: {marker}"));
+                }
+            }
+            Ok(())
+        });
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    #[traced_test]
+    async fn invalid_mission_id_is_not_logged_at_warn() {
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("invalid-mission-id-warn", db));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let project = Project::new("test-user", "warn project", "test");
+        let mission = Mission::new(
+            project.id,
+            "test-user",
+            "invalid-id-mission",
+            "should warn",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        store.save_project(&project).await.expect("save project");
+        let path = mission_path(
+            &store.project_slug(project.id).await,
+            &mission.name,
+            mission.id,
+        );
+        let mut raw = serde_json::json!(mission);
+        let marker = "OF1_MISSION_ID";
+        raw["id"] = serde_json::json!(format!(
+            "{marker}\nFORGED invalid_mission_id_is_not_logged_at_warn: {marker}"
+        ));
+        workspace
+            .write(&path, &raw.to_string())
+            .await
+            .expect("write corrupt mission");
+
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded
+            .load_state_from_workspace()
+            .await
+            .expect("reload engine state");
+        assert!(reloaded.missions.read().await.is_empty());
+
+        logs_assert(|lines: &[&str]| {
+            assert_logged_at(
+                lines,
+                "WARN",
+                &[
+                    "dropping mission: failed to parse",
+                    &path,
+                    "mission_id=invalid",
+                ],
+            )?;
+            assert_logged_at(
+                lines,
+                "DEBUG",
+                &["invalid stored record identifier", marker],
+            )?;
+            assert_no_log_carries_at_or_above(lines, marker, "WARN")?;
+            if lines
+                .iter()
+                .any(|line| line.contains(marker) && !line_has_level(line, "DEBUG"))
+            {
+                return Err("stored mission id forged a non-debug log line".to_owned());
+            }
+            Ok(())
+        });
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    #[traced_test]
+    async fn non_json_project_file_warns_instead_of_vanishing() {
+        // Same class as the mission regression above, on the project load path:
+        // a project.json that is not JSON at all is dropped, so the warning is
+        // the only trace that the project ever existed.
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("corrupt-project-warn", db));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let project = Project::new("test-user", "broken project", "test");
+        store.save_project(&project).await.expect("save project");
+        let path = project_path(&project.name, project.id);
+        workspace
+            .write(&path, "{ this is not json")
+            .await
+            .expect("corrupt project");
+
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded
+            .load_state_from_workspace()
+            .await
+            .expect("reload engine state");
+
+        assert!(
+            reloaded
+                .load_project(project.id)
+                .await
+                .expect("load")
+                .is_none(),
+            "a project that failed to parse must not appear as loaded"
+        );
+        logs_assert(|lines: &[&str]| {
+            assert_logged_at(
+                lines,
+                "WARN",
+                &[
+                    "dropping project record: failed to parse",
+                    &path,
+                    "error_kind=syntax",
+                ],
+            )?;
+            assert_no_log_carries_at_or_above(lines, "this is not json", "WARN")
+        });
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    #[traced_test]
+    async fn duplicate_default_projects_warn_once_at_boot_and_pick_the_oldest() {
+        // WI#321: two unlocked check-then-create windows can mint two "default"
+        // projects for one user. Boot must say so once, and the shared picker
+        // must return the oldest deterministically so routing/listings agree.
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("duplicate-defaults", db));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let mut oldest = Project::new("test-user", "default", "first");
+        oldest.created_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        let mut newest = Project::new("test-user", "default", "second");
+        newest.created_at = chrono::Utc::now();
+        // An older non-default project must never be mistaken for the default.
+        let mut other = Project::new("test-user", "research", "not a default");
+        other.created_at = chrono::Utc::now() - chrono::Duration::hours(2);
+        store.save_project(&other).await.expect("save other");
+        store.save_project(&oldest).await.expect("save oldest");
+        store.save_project(&newest).await.expect("save newest");
+
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded
+            .load_state_from_workspace()
+            .await
+            .expect("reload engine state");
+
+        // The picker runs on every message and every mission listing, so it
+        // stays silent (NY-19). Calling it here means a second warning would
+        // fail the exactly-one assertion below.
+        let projects = reloaded.list_projects("test-user").await.expect("list");
+        let defaults: Vec<&Project> = projects.iter().collect();
+        for _ in 0..3 {
+            let picked = canonical_default_project(&defaults).expect("a default");
+            assert_eq!(
+                picked.id, oldest.id,
+                "the oldest default project must win, not a map-order pick"
+            );
+        }
+
+        let oldest_id = oldest.id.0.to_string();
+        let newest_id = newest.id.0.to_string();
+        logs_assert(|lines: &[&str]| {
+            // Exactly one duplicate line, not one per picker call (NY-19).
+            assert_logged_count(
+                lines,
+                "WARN",
+                "multiple \"default\" projects for one user",
+                1,
+            )?;
+            assert_logged_at(
+                lines,
+                "WARN",
+                &[
+                    "multiple \"default\" projects for one user",
+                    "count=2",
+                    &oldest_id,
+                    &newest_id,
+                ],
+            )
+        });
     }
 
     #[test]
