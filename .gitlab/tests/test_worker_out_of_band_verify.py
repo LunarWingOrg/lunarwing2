@@ -1,25 +1,18 @@
 #!/usr/bin/env python3
-"""WI#425 tests — the out-of-band opencode2 image verification surfaces.
-
-Covers:
-  * .gitlab/scripts/verify-opencode2-exposure-out-of-band.py — the
-    image-config half (Env retarget refusal, kill-switch presence, Shell
-    override refusal) and the export-dir existence refusal, plus the
-    candidate-build wiring (the local export output rides the candidate
-    build only).
-  * the exposure_policy_assert.py --image-root mode that the CI verify job
-    drives against the exported tree.
-"""
+"""End-to-end tests for opencode2 out-of-band image verification (WI#425)."""
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
+import json
 import os
 import pathlib
 import shutil
-import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -38,157 +31,276 @@ def load_verify_module():
     return module
 
 
+def clean_config() -> dict:
+    return {
+        "config": {
+            "Env": [
+                "PATH=/home/opencode2/.cargo/bin:/usr/local/cargo/bin:/usr/local/go/bin:"
+                "/home/opencode2/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:"
+                "/sbin:/bin:/usr/local/bun-node-fallback-bin",
+                "BUN_RUNTIME_TRANSPILER_CACHE_PATH=0",
+                "BUN_INSTALL_BIN=/usr/local/bin",
+                "OPENCODE_IMAGE_REF=v2.1.2@" + "a" * 40,
+                "OPENCODE_DISABLE_AUTOUPDATE=1",
+                "RUSTUP_HOME=/usr/local/rustup",
+                "GOROOT=/usr/local/go",
+                "GOPATH=/home/opencode2/go",
+                "CARGO_HOME=/home/opencode2/.cargo",
+            ],
+            "Entrypoint": ["/usr/bin/tini", "--", "/app/entrypoint.sh"],
+            "Cmd": ["--mode", "websocket"],
+            "User": "10003:10003",
+            "WorkingDir": "/app",
+            "Shell": None,
+        }
+    }
+
+
+def image_environment() -> dict[str, str]:
+    return dict(entry.split("=", 1) for entry in clean_config()["config"]["Env"])
+
+
 class ConfigHalfTests(unittest.TestCase):
     def setUp(self):
         self.module = load_verify_module()
 
+    def assert_refused(self, config: dict, text: str):
+        with contextlib.redirect_stderr(io.StringIO()) as stderr, \
+                self.assertRaises(SystemExit) as caught:
+            self.module.check_config_half(config)
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn(text, stderr.getvalue())
+
     def test_clean_config_passes(self):
-        # The shipped image config shape: the autoupdate kill switch, no
-        # retarget keys, no Shell override.
-        config = {
-            "config": {
-                "Env": [
-                    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                    "OPENCODE_DISABLE_AUTOUPDATE=1",
-                ],
-                "Shell": None,
-            }
+        self.module.check_config_half(clean_config())
+
+    def test_adversarial_runtime_shapes_are_refused(self):
+        cases = {
+            "entrypoint": ("Entrypoint", ["/usr/local/lib/opencode2/opencode"]),
+            "cmd": ("Cmd", ["serve", "--hostname", "0.0.0.0"]),
+            "user": ("User", "0:0"),
+            "workdir": ("WorkingDir", "/"),
+            "shell": ("Shell", ["/bin/false"]),
         }
-        with mock.patch("builtins.print"):
-            self.module.check_config_half(config)
+        for name, (key, value) in cases.items():
+            with self.subTest(name=name):
+                config = clean_config()
+                config["config"][key] = value
+                self.assert_refused(config, key)
 
-    def test_opencode_bin_retarget_refused(self):
-        # Include the kill switch so ONLY the retarget can fail this config —
-        # a mutation removing the retarget loop must be caught (without the
-        # kill switch here, the missing-switch check would mask the mutant).
-        config = {"config": {"Env": [
-            "OPENCODE_DISABLE_AUTOUPDATE=1",
+    def test_path_order_and_loader_drift_are_refused(self):
+        for entry in ("PATH=/tmp:/usr/local/bin", "LD_PRELOAD=/tmp/evil.so"):
+            with self.subTest(entry=entry):
+                config = clean_config()
+                config["config"]["Env"].append(entry)
+                self.assert_refused(config, entry.split("=", 1)[0])
+
+    def test_binary_retargets_and_missing_kill_switch_are_refused(self):
+        for entry in (
             "OPENCODE_BIN=/usr/local/lib/opencode2/opencode",
-        ]}}
-        with self.assertRaises(SystemExit) as ctx:
-            self.module.check_config_half(config)
-        self.assertEqual(ctx.exception.code, 1)
-
-    def test_real_opencode_retarget_refused(self):
-        config = {"config": {"Env": [
-            "OPENCODE_DISABLE_AUTOUPDATE=1",
             "LUNARWING_REAL_OPENCODE=/tmp/evil",
-        ]}}
-        with self.assertRaises(SystemExit):
-            self.module.check_config_half(config)
-
-    def test_missing_kill_switch_refused(self):
-        config = {"config": {"Env": ["PATH=/bin"]}}
-        with self.assertRaises(SystemExit):
-            self.module.check_config_half(config)
-
-    def test_shell_override_refused(self):
-        config = {"config": {"Env": ["OPENCODE_DISABLE_AUTOUPDATE=1"], "Shell": ["/bin/false"]}}
-        with self.assertRaises(SystemExit):
-            self.module.check_config_half(config)
+        ):
+            with self.subTest(entry=entry):
+                config = clean_config()
+                config["config"]["Env"].append(entry)
+                self.assert_refused(config, "retargets")
+        config = clean_config()
+        config["config"]["Env"] = [
+            entry for entry in config["config"]["Env"]
+            if not entry.startswith("OPENCODE_DISABLE_AUTOUPDATE=")
+        ]
+        self.assert_refused(config, "OPENCODE_DISABLE_AUTOUPDATE")
 
 
-class MissingExportRefusalTests(unittest.TestCase):
+class TarFixture:
+    def __init__(self, lane: pathlib.Path):
+        self.entries: dict[str, dict] = {}
+        self.add_dir("")
+        for name in (
+            "app", "usr", "usr/local", "usr/local/bin", "usr/local/lib",
+            "usr/local/lib/opencode2",
+        ):
+            self.add_dir(name)
+        self.add_dir("app/scripts", mode=0o555)
+        self.add_dir("app/config", mode=0o555)
+        for name in ("entrypoint.sh", "health_server.py", "agent_comm_protocol.json"):
+            self.add_file(f"app/{name}", (lane / name).read_bytes(), mode=0o444)
+        for directory in ("scripts", "config"):
+            for path in (lane / directory).rglob("*"):
+                name = f"app/{path.relative_to(lane).as_posix()}"
+                if path.is_dir():
+                    self.add_dir(name, mode=0o555)
+                else:
+                    self.add_file(name, path.read_bytes(), mode=0o444)
+        self.add_file("usr/local/bin/opencode", WRAPPER.read_bytes(), mode=0o755)
+        self.add_file(
+            "usr/local/lib/opencode2/opencode", b"\x7fELF clean pinned build", mode=0o755,
+        )
+
+    def add_dir(self, name: str, mode: int = 0o755, uid: int = 0):
+        self.entries[name] = {"kind": "dir", "mode": mode, "uid": uid, "gid": 0}
+
+    def add_file(self, name: str, data: bytes, mode: int = 0o444, uid: int = 0):
+        self.entries[name] = {
+            "kind": "file", "mode": mode, "uid": uid, "gid": 0, "data": data,
+        }
+
+    def write(self, archive_path: pathlib.Path):
+        with tarfile.open(archive_path, "w") as archive:
+            for name, entry in self.entries.items():
+                member = tarfile.TarInfo(name or ".")
+                member.mode = entry["mode"]
+                member.uid = entry["uid"]
+                member.gid = entry["gid"]
+                if entry["kind"] == "dir":
+                    member.type = tarfile.DIRTYPE
+                    archive.addfile(member)
+                elif entry["kind"] == "symlink":
+                    member.type = tarfile.SYMTYPE
+                    member.linkname = entry["target"]
+                    archive.addfile(member)
+                else:
+                    data = entry["data"]
+                    member.type = tarfile.REGTYPE
+                    member.size = len(data)
+                    archive.addfile(member, io.BytesIO(data))
+
+
+class FilesystemExportTests(unittest.TestCase):
     def setUp(self):
-        self.module = load_verify_module()
-
-    def test_missing_export_dir_dies_with_real_cause(self):
-        # GZ-2 shape: the missing export names the export, not a downstream
-        # symptom. Assert on the MESSAGE so a mutation that drops the
-        # existence check (falling through to the assert-run failure) cannot
-        # pass through the generic exit code.
-        with tempfile.TemporaryDirectory() as tmp:
-            empty = pathlib.Path(tmp)
-            with mock.patch.object(self.module, "REPO_ROOT", empty), \
-                 self.assertRaises(SystemExit) as ctx, \
-                 mock.patch("sys.stderr") as stderr:
-                self.module.check_filesystem_half(empty / "opencode2-rootfs-export")
-            self.assertEqual(ctx.exception.code, 1)
-            written = "".join(call.args[0] for call in stderr.write.call_args_list)
-            self.assertIn("did not export the opencode2 filesystem", written)
-            self.assertNotIn("FAILED", written)
-
-
-class ImageRootModeTests(unittest.TestCase):
-    """The --image-root mode the CI verify job drives against the export."""
-
-    def setUp(self):
-        # A minimal exported-tree fixture: root-owned files cannot be faked
-        # as uid 0 by a non-root runner, so the mode is exercised through the
-        # assert module directly with owner_uid = os.geteuid() and the paths
-        # the wiring uses.
-        temporary = tempfile.TemporaryDirectory(dir=LANE)
+        temporary = tempfile.TemporaryDirectory(dir=ROOT)
         self.addCleanup(temporary.cleanup)
         self.root = pathlib.Path(temporary.name)
-        # lane tree inside the "export"
-        self.export = self.root / "opencode2-rootfs-export"
-        (self.export / "app" / "scripts").mkdir(parents=True)
-        (self.export / "app" / "config").mkdir()
-        shutil.copy(WRAPPER, self.export / "app" / "scripts" / WRAPPER.name)
-        # the exported wrapper under its installed path
-        (self.export / "usr" / "local" / "bin").mkdir(parents=True)
-        shutil.copy(WRAPPER, self.export / "usr" / "local" / "bin" / "opencode")
-        self.wrapper_path = self.export / "usr" / "local" / "bin" / "opencode"
-        self.wrapper_path.chmod(0o755)
-        (self.export / "usr" / "local" / "lib" / "opencode2").mkdir(parents=True)
-        self.binary_path = self.export / "usr" / "local" / "lib" / "opencode2" / "opencode"
-        self.binary_path.write_bytes(b"\x7fELF clean pinned build")
-        spec = importlib.util.spec_from_file_location("exposure_policy_assert", ASSERT)
-        self.assert_module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(self.assert_module)
+        self.lane = self.root / "lane"
+        shutil.copytree(
+            LANE,
+            self.lane,
+            ignore=shutil.ignore_patterns("node_modules", "__pycache__", "*.pyc"),
+        )
+        self.module = load_verify_module()
+        self.module.REPO_ROOT = self.root
+        self.module.LANE = self.lane
+        self.module.ASSERT = ASSERT
+        self.fixture = TarFixture(self.lane)
+        self.archive = self.root / "rootfs.tar"
+        self.fixture.write(self.archive)
 
-    def test_wiring_uses_image_root_paths(self):
-        # The main() wiring must point the installed-wrapper check at the
-        # image-root paths (mutation pin: reverting to check_installed_wrapper
-        # (lane) alone fails this).
-        source = ASSERT.read_text(encoding="utf-8")
-        self.assertIn('args.image_root / "usr/local/bin/opencode"', source)
-        self.assertIn('args.image_root / "usr/local/lib/opencode2/opencode"', source)
-        self.assertIn("check_path_resolution=False", source)
+    def verify(self) -> tuple[int, str, str]:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        code = 0
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                self.module.check_filesystem_half(self.archive, image_environment())
+            except SystemExit as error:
+                code = error.code
+        return code, stdout.getvalue(), stderr.getvalue()
 
-    def test_cli_accepts_image_root(self):
-        # The --image-root flag must exist and parse.
-        source = ASSERT.read_text(encoding="utf-8")
-        self.assertIn("--image-root", source)
+    def assert_refused(self, text: str):
+        code, _, stderr = self.verify()
+        self.assertEqual(code, 1, stderr)
+        self.assertIn(text, stderr)
+
+    def test_legitimate_export_passes_end_to_end(self):
+        code, stdout, stderr = self.verify()
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("all checks passed", stdout)
+        self.assertIn("tar metadata and checkout-owned files clean", stdout)
+
+    def test_ci_job_environment_is_not_used_as_image_environment(self):
+        with mock.patch.dict(os.environ, {"OPENCODE_DISABLE_AUTOUPDATE": ""}):
+            code, _, stderr = self.verify()
+        self.assertEqual(code, 0, stderr)
+
+    def test_tampered_installed_wrapper_is_refused(self):
+        self.fixture.add_file("usr/local/bin/opencode", b"#!/bin/sh\n# tampered\n", mode=0o755)
+        self.fixture.write(self.archive)
+        self.assert_refused("out-of-band filesystem verification FAILED")
+
+    def test_tampered_checkout_owned_entrypoint_is_refused(self):
+        path = self.lane / "entrypoint.sh"
+        self.fixture.add_file("app/entrypoint.sh", path.read_bytes() + b"# tampered\n")
+        self.fixture.write(self.archive)
+        self.assert_refused("exported app/entrypoint.sh differs from the checkout")
+
+    def test_unexpected_app_entry_is_refused(self):
+        self.fixture.add_file("app/unexpected.sh", b"#!/bin/sh\n")
+        self.fixture.write(self.archive)
+        self.assert_refused("unexpected /app entry app/unexpected.sh")
+
+    def test_tar_uid_not_host_uid_controls_wrapper_ownership(self):
+        self.fixture.add_file("usr/local/bin/opencode", WRAPPER.read_bytes(), mode=0o755, uid=10003)
+        self.fixture.write(self.archive)
+        self.assert_refused("owned by uid 0")
+
+    def test_tar_uid_controls_checkout_file_ownership(self):
+        self.fixture.add_file("app/entrypoint.sh", (self.lane / "entrypoint.sh").read_bytes(), uid=10003)
+        self.fixture.write(self.archive)
+        self.assert_refused("root-owned and read-only")
+
+    def test_writable_parent_from_tar_header_is_refused(self):
+        self.fixture.add_dir("usr/local", mode=0o777)
+        self.fixture.write(self.archive)
+        self.assert_refused("parent")
+        self.assertIn("writable", self.verify()[2])
+
+    def test_owner_only_executable_wrapper_is_refused(self):
+        self.fixture.add_file("usr/local/bin/opencode", WRAPPER.read_bytes(), mode=0o744)
+        self.fixture.write(self.archive)
+        self.assert_refused("GX-3")
+
+    def test_symlinked_wrapper_never_gets_followed(self):
+        self.fixture.entries["usr/local/bin/opencode"] = {
+            "kind": "symlink", "mode": 0o777, "uid": 0, "gid": 0, "target": str(WRAPPER),
+        }
+        self.fixture.write(self.archive)
+        self.assert_refused("must be a regular file, not a link")
+
+    def test_tunnel_marker_in_real_binary_is_refused(self):
+        self.fixture.add_file(
+            "usr/local/lib/opencode2/opencode", b"binary with https://opentunnel.xyz", mode=0o755,
+        )
+        self.fixture.write(self.archive)
+        self.assert_refused("opentunnel.xyz")
+
+    def test_missing_binary_and_archive_name_real_causes(self):
+        del self.fixture.entries["usr/local/lib/opencode2/opencode"]
+        self.fixture.write(self.archive)
+        self.assert_refused("installed file usr/local/lib/opencode2/opencode")
+        with contextlib.redirect_stderr(io.StringIO()) as stderr, \
+                self.assertRaises(SystemExit):
+            self.module.check_filesystem_half(self.root / "missing.tar", image_environment())
+        self.assertIn("missing or unreadable", stderr.getvalue())
 
 
 class BuildScriptWiringTests(unittest.TestCase):
-    """The candidate build must export the filesystem for the verify job."""
-
     def setUp(self):
-        self.build_script = (
-            ROOT / ".gitlab" / "scripts" / "build-worker-image.sh"
-        ).read_text(encoding="utf-8")
+        self.build_script = (ROOT / ".gitlab" / "scripts" / "build-worker-image.sh").read_text()
+        self.containers = (ROOT / ".gitlab" / "ci" / "containers.yml").read_text()
 
-    def test_opencode2_candidate_exports_local_output(self):
-        self.assertIn('build_image_extra_output="type=local,dest=$export_dir"', self.build_script)
-        self.assertIn('if [ "$1" = opencode2 ]; then\n    export_dir=', self.build_script)
+    def test_candidate_exports_tar_output(self):
+        self.assertIn('build_image_extra_output="type=tar,dest=$export_file"', self.build_script)
+        self.assertIn('export_file="$CI_PROJECT_DIR/opencode2-rootfs.tar"', self.build_script)
+        self.assertIn("[ ! -s \"$export_file\" ]", self.build_script)
 
     def test_rebuild_does_not_re_export(self):
-        # The reset must precede the rebuild call (mutation pin: moving the
-        # reset after the rebuild keeps a stale export for the wrong inputs).
-        self.assertIn('build_image_extra_output=""\n', self.build_script)
         reset_index = self.build_script.index('build_image_extra_output=""\n')
         rebuild_index = self.build_script.index('build_image_with_retry "$rebuild_ref"')
         self.assertLess(reset_index, rebuild_index)
 
     def test_build_image_appends_extra_output(self):
-        self.assertIn('[ -n "${build_image_extra_output:-}" ] && set -- "$@" --output "$build_image_extra_output"', self.build_script)
+        self.assertIn(
+            '[ -n "${build_image_extra_output:-}" ] && set -- "$@" --output "$build_image_extra_output"',
+            self.build_script,
+        )
+
+    def test_verify_job_and_artifact_are_wired(self):
+        self.assertIn("      - opencode2-rootfs.tar\n", self.containers)
+        self.assertIn("worker-opencode2-exposure-verify:", self.containers)
+        self.assertIn("    - python3 .gitlab/scripts/verify-opencode2-exposure-out-of-band.py", self.containers)
 
 
 class GoParserPolicyTests(unittest.TestCase):
-    """WI#425 Ask 4: BuildKit's own parser drives a policy cross-check.
-
-    The Go tool under .gitlab/go/dockerfile-parse/ applies the exposure policy
-    to BuildKit's instruction list (pinned buildkit v0.25.1 = the candidate
-    CI image) instead of re-implementing the Dockerfile grammar in bash. The
-    bash grammar in check-worker-exposure-policy.sh stays the authoritative
-    gate; this parser is the cross-check the WI asks for while ten historical
-    divergences are retired by construction (they were bash-parser artifacts).
-    """
-
     PARSER_DIR = ROOT / ".gitlab" / "go" / "dockerfile-parse"
-    GO = shutil.which("go")
 
     def test_module_is_pinned_to_the_candidate_buildkit(self):
         go_mod = (self.PARSER_DIR / "go.mod").read_text(encoding="utf-8")
@@ -197,37 +309,24 @@ class GoParserPolicyTests(unittest.TestCase):
         self.assertIn("github.com/moby/buildkit v0.25.1", go_sum)
 
     def test_policy_source_applies_the_parser(self):
-        # The policy must import BuildKit's frontend parser (mutation pin:
-        # reverting to a hand-rolled split is caught here).
         main_go = (self.PARSER_DIR / "main.go").read_text(encoding="utf-8")
         self.assertIn('"github.com/moby/buildkit/frontend/dockerfile/parser"', main_go)
         self.assertIn("parser.Parse", main_go)
 
-    @unittest.skipUnless(
-        shutil.which("go") is not None, "go toolchain not available in this image"
-    )
+    @unittest.skipUnless(shutil.which("go") is not None, "go toolchain not available")
     def test_go_tests_pass_on_the_real_tree(self):
         result = subprocess.run(
-            ["go", "test", "./..."],
-            cwd=self.PARSER_DIR,
-            capture_output=True,
-            text=True,
-            timeout=300,
+            ["go", "test", "./..."], cwd=self.PARSER_DIR,
+            capture_output=True, text=True, timeout=300,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("ok", result.stdout)
 
-    @unittest.skipUnless(
-        shutil.which("go") is not None, "go toolchain not available in this image"
-    )
+    @unittest.skipUnless(shutil.which("go") is not None, "go toolchain not available")
     def test_parser_policy_accepts_the_real_dockerfile(self):
-        dockerfile = ROOT / "opencode2.4lunarwing" / "Dockerfile"
         result = subprocess.run(
-            ["go", "run", ".", str(dockerfile)],
-            cwd=self.PARSER_DIR,
-            capture_output=True,
-            text=True,
-            timeout=300,
+            ["go", "run", ".", str(LANE / "Dockerfile")], cwd=self.PARSER_DIR,
+            capture_output=True, text=True, timeout=300,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("BuildKit parser): ok", result.stdout)

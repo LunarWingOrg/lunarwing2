@@ -24,8 +24,9 @@ fail() { echo "ERROR: $*" >&2; failed=1; }
 python3 "$lane/scripts/exposure_policy_assert.py" --lane "$lane" --profile opencode2 || failed=1
 python3 "$lane/scripts/exposure_policy_assert.py" --lane "$v1_lane" --profile opencode-v1 || failed=1
 # Exercise the real wrapper and non-root boot path on MRs, not only during
-# the protected image build. All three suites use only Python's stdlib + sh.
+# the protected image build. These suites use only Python's stdlib + sh.
 python3 "$lane/scripts/exposure_policy_assert_test.py" || failed=1
+python3 "$lane/scripts/image_config_policy_test.py" || failed=1
 python3 "$lane/scripts/compile_out_remote_tunnel_test.py" || failed=1
 python3 "$lane/scripts/entrypoint_config_test.py" || failed=1
 

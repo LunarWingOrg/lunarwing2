@@ -390,6 +390,58 @@ def validate_release_gates(merged: dict, defaults: dict, errors: list[str]) -> N
             errors.append(f"{job_name} must run for protected release tags")
 
 
+def validate_opencode2_exposure_verify(merged: dict, errors: list[str]) -> None:
+    job = merged.get("worker-opencode2-exposure-verify")
+    if not isinstance(job, dict):
+        errors.append("worker-opencode2-exposure-verify is missing")
+        return
+    image = image_name(job.get("image"))
+    expected_image = image_name(merged.get(".worker-promotion", {}).get("image"))
+    if not image or image != expected_image:
+        errors.append("worker-opencode2-exposure-verify must use the promotion's pinned image")
+    if job.get("tags") != ["container-build"]:
+        errors.append("worker-opencode2-exposure-verify must use the container-build runner")
+    if job.get("interruptible") is not False or job.get("retry") != 0:
+        errors.append("worker-opencode2-exposure-verify must be non-interruptible with retry: 0")
+    if "allow_failure" in job and job["allow_failure"] is not False:
+        errors.append("worker-opencode2-exposure-verify must never be optional")
+    rules = job.get("rules")
+    if not isinstance(rules, list) or len(rules) != 3 or rules[-1] != {"when": "never"}:
+        errors.append("worker-opencode2-exposure-verify needs two protected rules and a final never")
+    else:
+        for rule, marker in zip(rules[:2], ("CI_COMMIT_TAG", "CI_COMMIT_BRANCH"), strict=True):
+            if (
+                rule.get("when") != "on_success"
+                or rule.get("allow_failure") is not False
+                or marker not in str(rule.get("if", ""))
+                or 'CI_COMMIT_REF_PROTECTED == "true"' not in str(rule.get("if", ""))
+                or 'CI_PIPELINE_SOURCE == "push"' not in str(rule.get("if", ""))
+            ):
+                errors.append(f"worker-opencode2-exposure-verify has an unsafe {marker} rule")
+    if job.get("needs") != [{"job": "worker-opencode2-candidate", "artifacts": True}]:
+        errors.append("worker-opencode2-exposure-verify must download its exact candidate artifacts")
+    script = job.get("script")
+    if (
+        not isinstance(script, list)
+        or len(script) != 3
+        or "opencode2-rootfs.tar" not in script[0]
+        or "worker-image.env" not in script[0]
+        or script[1:] != [
+            "set -a; . ./worker-image.env; set +a",
+            "python3 .gitlab/scripts/verify-opencode2-exposure-out-of-band.py",
+        ]
+    ):
+        errors.append("worker-opencode2-exposure-verify script drifted from its pinned checks")
+    candidate_artifacts = merged.get("worker-opencode2-candidate", {}).get("artifacts", {})
+    if "opencode2-rootfs.tar" not in candidate_artifacts.get("paths", []):
+        errors.append("worker-opencode2-candidate must publish opencode2-rootfs.tar")
+    if candidate_artifacts.get("reports", {}).get("dotenv") != "worker-image.env":
+        errors.append("worker-opencode2-candidate must retain its dotenv artifact")
+    promotion_needs = merged.get("worker-opencode2-promote", {}).get("needs", [])
+    if {"job": "worker-opencode2-exposure-verify", "artifacts": False} not in promotion_needs:
+        errors.append("worker-opencode2-promote must hard-need the non-optional verify job")
+
+
 def validate_worker_publication(merged: dict, errors: list[str]) -> None:
     candidate = merged.get(".worker-candidate", {})
     promotion = merged.get(".worker-promotion", {})
@@ -488,6 +540,7 @@ def validate_worker_publication(merged: dict, errors: list[str]) -> None:
             {"job": candidate_name, "artifacts": True}
         ]:
             errors.append(f"{scan_name} must download artifacts from its exact candidate")
+    validate_opencode2_exposure_verify(merged, errors)
 
 
 def validate_test_shapes(merged: dict, errors: list[str]) -> None:

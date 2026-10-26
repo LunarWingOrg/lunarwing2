@@ -372,6 +372,7 @@ RUN set -eu; \
     && python3 scripts/prepare_reproducible_build_test.py \
     && python3 scripts/study_notes_config_test.py \
     && python3 scripts/exposure_policy_assert_test.py \
+    && python3 scripts/image_config_policy_test.py \
     && python3 scripts/entrypoint_config_test.py \
     && python3 scripts/compile_out_remote_tunnel_test.py \
     && for leaked in /root/.bun /root/.local /root/.cache /root/.config; do \
