@@ -205,6 +205,12 @@ sudo ic/scripts/lunarwing-mt-admin.sh configure-pebble <name> \
 sudo ic/scripts/lunarwing-mt-admin.sh restart-worker <name> pebble
 ```
 
+Pass only the raw token value, not an env-file assignment or literal quote
+characters copied from one. The command rejects leading/trailing whitespace,
+matching literal surrounding quotes, and CR/LF before writing `pebble.env`.
+Normal shell quoting, as in the example above, is fine because the shell removes
+it before mt-admin receives the value.
+
 The current command accepts the NanoGPT key on argv, so run it only from a
 private administrative shell and avoid recording the command in shared history
 or logs.
