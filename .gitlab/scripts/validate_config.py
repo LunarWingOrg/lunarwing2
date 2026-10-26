@@ -543,7 +543,40 @@ def validate_worker_publication(merged: dict, errors: list[str]) -> None:
     validate_opencode2_exposure_verify(merged, errors)
 
 
+def validate_buildkit_parser_guard(merged: dict, errors: list[str]) -> None:
+    job = merged.get("worker-buildkit-parser-policy-guard")
+    if not isinstance(job, dict):
+        errors.append("worker-buildkit-parser-policy-guard is required")
+        return
+    expected = {
+        "stage": "security",
+        "needs": [],
+        "image": {"name": "docker.io/library/golang:1.24.3-bookworm@sha256:29d97266c1d341b7424e2f5085440b74654ae0b61ecdba206bc12d6264844e21"},
+        "tags": ["$CI_LINT_RUNNER_TAG"],
+        "variables": {
+            "GOTOOLCHAIN": "local",
+            "GOFLAGS": "-mod=readonly",
+            "GOPROXY": "https://proxy.golang.org",
+            "GOSUMDB": "sum.golang.org",
+        },
+        "script": [
+            "cd .gitlab/go/dockerfile-parse",
+            'test -z "$(gofmt -l main.go main_test.go)"',
+            "go test ./...",
+            "go run . ../../../opencode2.4lunarwing/Dockerfile",
+        ],
+    }
+    for key, value in expected.items():
+        if job.get(key) != value:
+            errors.append(f"worker-buildkit-parser-policy-guard drifted at {key}")
+    if not extends_template(job, ".full-validation-context"):
+        errors.append("worker-buildkit-parser-policy-guard must remain a required validation job")
+    if "allow_failure" in job and job["allow_failure"] is not False:
+        errors.append("worker-buildkit-parser-policy-guard must not be optional")
+
+
 def validate_test_shapes(merged: dict, errors: list[str]) -> None:
+    validate_buildkit_parser_guard(merged, errors)
     # Host-side runner limits control compile concurrency. A resource group
     # here would serialize independent hosts across all project pipelines.
     for name, job in merged.items():

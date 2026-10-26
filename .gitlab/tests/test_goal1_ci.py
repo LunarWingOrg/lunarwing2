@@ -178,6 +178,24 @@ class FullValidationTests(unittest.TestCase):
                 config.validate_worker_publication(merged, errors)
                 self.assertTrue(any("opencode2" in error for error in errors), (name, errors))
 
+    def test_buildkit_parser_guard_is_required_and_pinned(self):
+        for name, key, value in (
+            ("missing job", None, None),
+            ("image", "image", "golang:latest"),
+            ("toolchain", "variables", {"GOTOOLCHAIN": "auto"}),
+            ("commands", "script", ["true"]),
+            ("optional", "allow_failure", True),
+        ):
+            with self.subTest(name=name):
+                merged = copy.deepcopy(self.merged)
+                if key is None:
+                    merged.pop("worker-buildkit-parser-policy-guard")
+                else:
+                    merged["worker-buildkit-parser-policy-guard"][key] = value
+                errors = []
+                config.validate_test_shapes(merged, errors)
+                self.assertTrue(any("buildkit-parser" in error for error in errors), errors)
+
 
 class WorkerVersionPinTests(unittest.TestCase):
     """The worker pin cross-check must bind values to each worker's own case
