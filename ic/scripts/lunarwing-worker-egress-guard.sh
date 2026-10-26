@@ -1,85 +1,87 @@
 #!/usr/bin/env bash
-# WI#424 control 1 — load and verify a worker egress allowlist before a worker
-# container starts.
-#
-# Usage: lunarwing-worker-egress-guard.sh <ruleset> [rootless|rootful] [tenant]
-#
-# Called from every worker boot path (Quadlet `ExecStartPre`, the OpenRC worker
-# init script's start(), and mt-admin's prepare_worker_egress). It exists as a
-# separate script so the two init systems cannot drift: both run these exact
-# steps, and the fail-closed property is testable outside a unit file.
-#
-# Why the verification is a SEPARATE invocation: `podman unshare
-# --rootless-netns` creates the tenant's netns on demand. If that netns does not
-# persist (no stable XDG_RUNTIME_DIR — i.e. no lingering user session), the
-# ruleset would be loaded into a namespace that disappears with the command, and
-# the worker would then start *unfiltered*. Reading the chain back through a
-# fresh entry is the only way to prove the filter is still there. A failure is
-# fatal: the caller must not start the worker.
-#
-# Exit codes: 0 filter live and verified, 1 load failed, 2 verification failed,
-# 3 usage/environment error.
+# WI#424 control 1 — load/verify a tenant's worker egress boundary.
+# Usage: lunarwing-worker-egress-guard [--verify] <ruleset> <rootless|rootful> <chain> [tenant]
 set -euo pipefail
 
 TABLE="lunarwing_worker_egress"
-CHAIN="workers"
+VERIFY_ONLY=false
+if [[ "${1:-}" == "--verify" ]]; then
+  VERIFY_ONLY=true
+  shift
+fi
 
-die() { printf 'worker-egress-guard: %s\n' "$*" >&2; exit "${2:-3}"; }
+die() { printf 'worker-egress-guard: %s\n' "$1" >&2; exit "${2:-3}"; }
 
-[[ $# -ge 1 ]] || die "usage: $0 <ruleset> [rootless|rootful] [tenant]"
+[[ $# -ge 3 && $# -le 4 ]] \
+  || die "usage: $0 [--verify] <ruleset> <rootless|rootful> <chain> [tenant]"
 ruleset="$1"
-mode="${2:-rootless}"
-tenant="${3:-}"
-
+mode="$2"
+chain="$3"
+tenant="${4:-}"
 case "$mode" in
   rootless|rootful) ;;
   *) die "invalid mode '$mode' (expected rootless or rootful)" ;;
 esac
-
+[[ "$chain" =~ ^worker-[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] \
+  || die "invalid worker egress chain '$chain'"
+if [[ -n "$tenant" ]]; then
+  [[ "$tenant" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] \
+    || die "invalid tenant name '$tenant'"
+fi
+input_chain="worker-input-${chain#worker-}"
 [[ -f "$ruleset" && ! -L "$ruleset" ]] \
   || die "egress ruleset not found or not a regular file: $ruleset"
 
-# `command -v` under `set -e`; an absent nft is handled explicitly below.
 NFT="$(command -v nft 2>/dev/null)" || NFT=""
 [[ -n "$NFT" ]] || die "nft not found; refusing to start a worker without an egress filter"
+PODMAN="$(command -v podman 2>/dev/null || printf '/usr/bin/podman')"
 
-PODMAN="$(command -v podman || printf '/usr/bin/podman')"
-
-# Run nft in the namespace that owns the bridge.
-#
-# Rootless podman keeps the bridge in the TENANT's netns, so the command must
-# run as that user. A Quadlet ExecStartPre already runs as the tenant (no third
-# argument needed); the OpenRC path runs as root and passes the tenant name, so
-# root drops to the tenant here rather than inventing a second code path.
 nft_in_netns() {
   if [[ "$mode" != "rootless" ]]; then
     "$NFT" "$@"
     return
   fi
   if [[ -n "$tenant" && "$(id -u)" == "0" ]]; then
-    [[ "$tenant" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] \
-      || die "invalid tenant name '$tenant'"
     local uid home
     uid="$(id -u -- "$tenant")" || die "cannot resolve uid for tenant '$tenant'"
     home="$(getent passwd "$tenant" | cut -d: -f6)"
-    ( cd / && exec sudo -u "$tenant" env HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" \
-        "$PODMAN" unshare --rootless-netns "$NFT" "$@" )
+    (cd / && exec sudo -u "$tenant" env HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" \
+      "$PODMAN" unshare --rootless-netns "$NFT" "$@")
     return
   fi
   "$PODMAN" unshare --rootless-netns "$NFT" "$@"
 }
 
-nft_in_netns -f "$ruleset" >/dev/null 2>&1 \
-  || die "failed to load the egress ruleset $ruleset" 1
+# Only the generated all-protocol reject yields the expected subnet. A TCP-only
+# or missing reject never reaches the load path.
+subnet="$(awk '
+  $1 == "iifname" && $3 == "ip" && $4 == "saddr" && $6 == "counter" &&
+  $7 == "reject" && $8 == "with" && $9 == "icmpx" && $10 == "type" && $11 == "admin-prohibited" {
+    if (!found) { subnet = $5; found = 1 }
+  }
+  END { if (!found) exit 1; print subnet }
+' "$ruleset")" \
+  || die "ruleset has no exact all-protocol reject; refusing to start unfiltered" 2
 
-dump="$(nft_in_netns list chain inet "$TABLE" "$CHAIN" 2>/dev/null)" \
-  || die "egress filter did not survive the load (refusing to run the worker unfiltered)" 2
+verify_chain() {
+  local chain_name="$1" dump
+  dump="$(nft_in_netns list chain inet "$TABLE" "$chain_name" 2>/dev/null)" \
+    || die "egress chain $chain_name did not survive (refusing unfiltered start)" 2
+  awk -v subnet="$subnet" '
+    $1 == "iifname" && $3 == "ip" && $4 == "saddr" && $5 == subnet {
+      if ($6 == "counter" && $7 == "reject" && $8 == "with" && $9 == "icmpx" && $10 == "type" && $11 == "admin-prohibited") found = 1
+      if ($6 == "counter" && $7 == "packets" && $11 == "reject" && $12 == "with" && $13 == "icmpx" && $14 == "type" && $15 == "admin-prohibited") found = 1
+    }
+    END { exit(found ? 0 : 1) }
+  ' <<<"$dump" \
+    || die "egress chain $chain_name lacks the tenant's exact reject for $subnet" 2
+}
 
-# The reject rule is the control's whole point; a chain that loaded without it
-# would allow everything not explicitly listed.
-grep -q 'reject' <<<"$dump" \
-  || die "egress chain loaded without its reject rule (refusing to run the worker unfiltered)" 2
-
-# awk rather than `grep -c` so a zero-match count cannot look like a failure.
-printf 'worker-egress-guard: filter live (%s, %s rule line(s))\n' \
-  "$mode" "$(awk '/^[[:space:]]/ { n += 1 } END { print n + 0 }' <<<"$dump")"
+if [[ "$VERIFY_ONLY" != "true" ]]; then
+  nft_in_netns -f "$ruleset" >/dev/null 2>&1 \
+    || die "failed to load the egress ruleset $ruleset" 1
+fi
+verify_chain "$chain"
+verify_chain "$input_chain"
+printf 'worker-egress-guard: filter live (%s, %s + %s, subnet %s)\n' \
+  "$mode" "$chain" "$input_chain" "$subnet"
