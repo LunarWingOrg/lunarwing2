@@ -702,7 +702,9 @@ class InstalledWrapperTests(unittest.TestCase):
         source = ASSERT.read_text(encoding="utf-8")
         wiring = (
             "    if args.image_filesystem:\n"
-            "        check_image_filesystem(lane)\n"
+            "        check_image_filesystem(\n"
+            "            lane, image_root=args.image_root, image_metadata=image_metadata\n"
+            "        )\n"
             "        if is_v2:\n"
             "            if args.image_root is not None:\n"
             "                check_installed_wrapper(\n"
@@ -711,6 +713,9 @@ class InstalledWrapperTests(unittest.TestCase):
             "                    args.image_root / \"usr/local/lib/opencode2/opencode\",\n"
             "                    check_path_resolution=False,\n"
             "                    parent_root=args.image_root,\n"
+            "                    environ=image_environment,\n"
+            "                    image_root=args.image_root,\n"
+            "                    image_metadata=image_metadata,\n"
             "                )\n"
             "            else:\n"
             "                check_installed_wrapper(lane)\n"
