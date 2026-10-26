@@ -147,8 +147,8 @@ _deregister_worker_unit() {
 # `podman inspect` value no longer yields the tenant's dashboard surface
 # (WI#205).
 #
-# Idempotent: a tenant entry is written once and skipped on re-runs. Exact legacy
-# 5-minute deadlines migrate to the current default. Set
+# Idempotent: a tenant entry is written once; re-runs disable unsupported
+# OpenCode credential grants and migrate exact legacy 5-minute deadlines. Set
 # LUNARWING_MT_MIGRATE_LEGACY_EXTERNAL_WORKER_TIMEOUTS=false to preserve an
 # intentional 5-minute value. Other explicit values remain untouched.
 
@@ -392,6 +392,90 @@ upgrade_external_worker_timeout() {
   fi
 }
 
+# OpenCode's separate serve process cannot consume task credentials. Converge
+# existing managed entries too, before any hub can decrypt a useless grant.
+# Stage outside the tenant tree and commit through the tenant-side writer,
+# preserving the same untrusted-path boundary as the other config migrations.
+upgrade_external_worker_credentials() {
+  local name="$1" worker="$2" config_path="$3" staged_in staged_out edit_status=0
+  [[ "$worker" == "opencode" || "$worker" == "opencode2" ]] || return 0
+  staged_in="$(mktemp)" || return 2
+  if ! tenant_cat "$name" "$config_path" >"$staged_in"; then
+    rm -f -- "$staged_in"
+    return 2
+  fi
+  staged_out="$(mktemp)" || { rm -f -- "$staged_in"; return 2; }
+  python3 - "$worker" "$staged_in" "$staged_out" <<'PY' || edit_status=$?
+import copy
+import re
+import sys
+import tomllib
+
+worker, src, dst = sys.argv[1:]
+
+
+def refuse():
+    print("cannot safely disable worker credential grants; repair config.toml first", file=sys.stderr)
+    sys.exit(2)
+
+
+with open(src, encoding="utf-8") as handle:
+    text = handle.read()
+try:
+    before = tomllib.loads(text)
+except tomllib.TOMLDecodeError:
+    refuse()
+sandbox = before.get("sandbox", {})
+if not isinstance(sandbox, dict):
+    refuse()
+workers = sandbox.get("external_workers", [])
+if not isinstance(workers, list) or any(not isinstance(entry, dict) for entry in workers):
+    refuse()
+matches = [i for i, entry in enumerate(workers) if entry.get("name") == worker]
+if len(matches) != 1:
+    refuse()
+idx = matches[0]
+if workers[idx].get("supports_credentials") is False:
+    sys.exit(42)
+lines = text.splitlines(keepends=True)
+headers = [i for i, line in enumerate(lines)
+           if re.match(r"^\s*\[\[\s*sandbox\.external_workers\s*\]\]\s*(#.*)?$", line)]
+if len(headers) != len(workers):
+    refuse()
+start = headers[idx] + 1
+end = next((i for i in range(start, len(lines)) if re.match(r"^\s*\[", lines[i])), len(lines))
+keys = [i for i in range(start, end) if re.match(r"^\s*supports_credentials\s*=", lines[i])]
+if keys:
+    lines[keys[0]] = "supports_credentials = false\n"
+else:
+    if not lines[start - 1].endswith("\n"):
+        lines[start - 1] += "\n"
+    lines.insert(start, "supports_credentials = false\n")
+result = "".join(lines)
+expected = copy.deepcopy(before)
+expected["sandbox"]["external_workers"][idx]["supports_credentials"] = False
+try:
+    if tomllib.loads(result) != expected:
+        refuse()
+except tomllib.TOMLDecodeError:
+    refuse()
+with open(dst, "w", encoding="utf-8") as handle:
+    handle.write(result)
+PY
+  case "$edit_status" in
+    0)
+      if ! write_tenant_file_atomic "$name" "$config_path" 600 owned-parent <"$staged_out"; then
+        rm -f -- "$staged_in" "$staged_out"
+        return 2
+      fi
+      say "disabled unsupported credential grants for '$worker' (WI#474)"
+      ;;
+    42) ;;
+    *) rm -f -- "$staged_in" "$staged_out"; return 2 ;;
+  esac
+  rm -f -- "$staged_in" "$staged_out"
+}
+
 ensure_external_worker_config() {
   local name="$1"      # tenant name
   local worker="$2"    # logical worker name, matches create_job mode
@@ -432,6 +516,8 @@ ensure_external_worker_config() {
   # TOML writer emits `name = "<worker>"` identically, so this also matches a
   # file that has been load-modify-saved by `/model`.
   if [[ -f "$config_path" ]] && grep -q "name = \"$worker\"" "$config_path" 2>/dev/null; then
+    upgrade_external_worker_credentials "$name" "$worker" "$config_path" \
+      || die "failed to disable unsupported credential grants for '$worker' in $config_path"
     local upgrade_status=0
     upgrade_external_worker_timeout "$name" "$worker" "$config_path" || upgrade_status=$?
     case "$upgrade_status" in
@@ -500,6 +586,9 @@ HDR
       printf 'auth_token = "%s"\n' "$auth_token"
     fi
     printf 'timeout_ms = %s\n' "$default_timeout_ms"
+    if [[ "$worker" == "opencode" || "$worker" == "opencode2" ]]; then
+      printf 'supports_credentials = false\n'
+    fi
   } >>"$staged_cfg"
 
   if ! write_tenant_file_atomic "$name" "$config_path" 600 owned-parent <"$staged_cfg"; then

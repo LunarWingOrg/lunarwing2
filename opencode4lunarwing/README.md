@@ -71,13 +71,12 @@ into another job's record and a response without a ref attaches nothing.
 The cause line is batched by serve's file logger on a 1 s flush window, so
 the enrichment re-reads for up to ~1.5 s before giving up. The tail is
 bounded (last 25 lines / 8 KiB, 400-character code-point line cap) and known
-secret values (the bridge's credential environment — fixed names plus any
+secret values (the bridge's boot credential environment — fixed names plus any
 `TOKEN`/`SECRET`/`PASSWORD`/`PASSWD`/`API_KEY`/`PRIVATE_KEY`/`CREDENTIAL`/
-`AUTH`-shaped name, snapshotted at worker start — and this task's
-`context.environment` values, kept on the request and never merged into the
-bridge's `process.env` (NU-1), in both raw and JSON-escaped form, longest
-first) are redacted before anything is persisted. On this lane those grant
-values do not reach task code at all (WI#474). The read is symlink- and
+`AUTH`-shaped name, snapshotted at worker start — in both raw and JSON-escaped
+form, longest first) are redacted before anything is persisted. Task
+`context.environment` maps are rejected before this path (WI#474) and are never
+merged into the bridge's `process.env` (NU-1). The read is symlink- and
 FIFO-safe. Set
 `OPENCODE_SERVE_LOG` to override the log path or to an explicit empty value
 (`OPENCODE_SERVE_LOG=`) to disable the enrichment entirely. The structured

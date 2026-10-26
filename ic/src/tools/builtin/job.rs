@@ -445,6 +445,21 @@ fn external_prompt_context(
     }
 }
 
+/// The worker-side refusal is defence in depth: unsupported grants must not
+/// leave the hub at all (WI#474 ON-1). Keep the error free of grant names/values.
+fn validate_external_credentials(
+    worker: &crate::config::ExternalWorkerConfig,
+    has_credentials: bool,
+) -> Result<(), ToolError> {
+    if has_credentials && !worker.supports_credentials {
+        return Err(ToolError::InvalidParameters(
+            "credential grants are not supported by this worker; resubmit without credentials or use kimi/pebble"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Tool for creating a new job.
 ///
 /// When sandbox deps are injected (via `with_sandbox`), the tool automatically
@@ -1327,6 +1342,7 @@ impl CreateJobTool {
         let worker_config = ewm.get_worker(worker_name).ok_or_else(|| {
             ToolError::ExecutionFailed(format!("External worker '{worker_name}' is not configured"))
         })?;
+        validate_external_credentials(worker_config, !options.credential_grants.is_empty())?;
         let worker_timeout_ms = worker_config.timeout_ms;
 
         let job_id = Uuid::new_v4();
@@ -1809,7 +1825,8 @@ impl Tool for CreateJobTool {
                 props["credentials"] = serde_json::json!({
                     "type": "object",
                     "description": "Map of secret names to env var names. Each secret must exist in the \
-                                    secrets store (via 'lunarwing tool auth' or web UI). Example: \
+                                    secrets store (via 'lunarwing tool auth' or web UI). OpenCode workers \
+                                    do not accept credential grants; omit credentials or use kimi/pebble. Example: \
                                     {\"github_token\": \"GITHUB_TOKEN\", \"npm_token\": \"NPM_TOKEN\"}",
                     "additionalProperties": { "type": "string" }
                 });
@@ -2086,7 +2103,7 @@ impl Tool for CreateJobTool {
                 ));
             }
             if let Some(ref ewm) = self.external_worker_manager
-                && ewm.get_worker(mode_str).is_some()
+                && let Some(worker_config) = ewm.get_worker(mode_str)
             {
                 if params.get("max_iterations").is_some() {
                     return Err(ToolError::InvalidParameters(format!(
@@ -2099,6 +2116,13 @@ impl Tool for CreateJobTool {
                     .get("project_dir")
                     .and_then(|v| v.as_str())
                     .map(String::from);
+                validate_external_credentials(
+                    worker_config,
+                    params
+                        .get("credentials")
+                        .and_then(serde_json::Value::as_object)
+                        .is_some_and(|grants| !grants.is_empty()),
+                )?;
                 let credential_grants = self.parse_credentials(&params, &ctx.user_id).await?;
                 let task = format!("{}\n\n{}", title, description);
                 return self
@@ -3375,6 +3399,12 @@ mod tests {
             serde_json::json!(["none", "recent"])
         );
         assert_eq!(schema["properties"]["context_scope"]["default"], "none");
+        assert!(
+            schema["properties"]["credentials"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("OpenCode workers do not accept credential grants")
+        );
         assert_eq!(
             schema["properties"]["max_iterations"]["default"],
             DEFAULT_WORKER_ITERATIONS
@@ -3383,6 +3413,99 @@ mod tests {
             schema["properties"]["max_iterations"]["maximum"],
             MAX_WORKER_ITERATIONS
         );
+    }
+
+    #[tokio::test]
+    async fn unsupported_external_credentials_are_rejected_before_secret_lookup() {
+        use crate::config::ExternalWorkerConfig;
+
+        // No secrets store: reaching parse_credentials would return a different
+        // error. Include an alias so the policy cannot be hardcoded to a name.
+        for name in ["opencode", "opencode2", "custom-serve-worker"] {
+            let manager = Arc::new(ContextManager::new(5));
+            let workers = Arc::new(ExternalWorkerManager::new(vec![ExternalWorkerConfig {
+                supports_credentials: false,
+                ..ExternalWorkerConfig::test_config(name, "ws://127.0.0.1:9/ws/agent")
+            }]));
+            let tool =
+                CreateJobTool::new(Arc::clone(&manager)).with_external_workers(workers, None);
+            let error = tool
+                .execute(
+                    serde_json::json!({
+                        "title": "Unsupported grant",
+                        "description": "Do work",
+                        "mode": name,
+                        "credentials": {"missing_secret": "SYNTHETIC_TASK_VAR"}
+                    }),
+                    &JobContext::default(),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ToolError::InvalidParameters(_)), "{error}");
+            let message = error.to_string();
+            assert!(message.contains("resubmit without credentials or use kimi/pebble"));
+            assert!(!message.contains("missing_secret"));
+            assert!(!message.contains("SYNTHETIC_TASK_VAR"));
+            assert!(manager.all_jobs().await.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn external_credentials_capability_is_checked_before_decryption() {
+        use crate::config::ExternalWorkerConfig;
+        use crate::testing::credentials::test_secrets_store;
+
+        // Exercise the lower-level dispatch entry independently of execute's
+        // pre-parse check. A missing secret fails decryption only when enabled.
+        for supports_credentials in [false, true] {
+            let manager = Arc::new(ContextManager::new(5));
+            let workers = Arc::new(ExternalWorkerManager::new(vec![ExternalWorkerConfig {
+                supports_credentials,
+                ..ExternalWorkerConfig::test_config("serve-worker", "ws://127.0.0.1:9/ws/agent")
+            }]));
+            let tool = CreateJobTool::new(Arc::clone(&manager))
+                .with_external_workers(workers, None)
+                .with_secrets(Arc::new(test_secrets_store()));
+            let error = tool
+                .execute_external(
+                    "Do work",
+                    "serve-worker",
+                    &JobContext::default(),
+                    ExternalExecutionOptions {
+                        wait: true,
+                        context_scope: ExternalContextScope::None,
+                        project_dir: None,
+                        credential_grants: vec![CredentialGrant {
+                            secret_name: "missing_secret".to_string(),
+                            env_var: "SYNTHETIC_TASK_VAR".to_string(),
+                        }],
+                    },
+                )
+                .await
+                .unwrap_err();
+            if supports_credentials {
+                assert!(error.to_string().contains("failed to decrypt secret"));
+            } else {
+                assert!(matches!(error, ToolError::InvalidParameters(_)), "{error}");
+                assert!(error.to_string().contains("resubmit without credentials"));
+            }
+            assert!(manager.all_jobs().await.is_empty());
+        }
+    }
+
+    #[test]
+    fn external_credentials_capability_allows_empty_grants_and_legacy_workers() {
+        for supports_credentials in [false, true] {
+            let worker = crate::config::ExternalWorkerConfig {
+                supports_credentials,
+                ..Default::default()
+            };
+            assert!(validate_external_credentials(&worker, false).is_ok());
+            assert_eq!(
+                validate_external_credentials(&worker, true).is_ok(),
+                supports_credentials
+            );
+        }
     }
 
     #[tokio::test]

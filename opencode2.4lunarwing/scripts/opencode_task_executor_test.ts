@@ -818,14 +818,16 @@ fix it`,
 })
 assert.ok(contextPromptArgs[1].signal instanceof AbortSignal)
 
-// NU-1: task grant entries (agent-chosen at create_job) are never merged into
-// the bridge's process.env — neither the reserved hub-credential names nor an
-// ordinary key may land in the shared env at prompt time.
+// WI#474: task grant entries are rejected before any SDK/session activity.
+// The shared bridge env stays untouched (NU-1), and neither keys nor values
+// leak into the diagnostic.
 {
   const savedToken = process.env.AGENT_AUTH_TOKEN
   const savedTokenFile = process.env.AGENT_AUTH_TOKEN_FILE
+  const savedLegit = process.env.LEGIT_TASK_VAR
   process.env.AGENT_AUTH_TOKEN = "bridge-secret"
   delete process.env.AGENT_AUTH_TOKEN_FILE
+  delete process.env.LEGIT_TASK_VAR
   const warnings: string[] = []
   const savedWarn = console.warn
   console.warn = (...args: unknown[]) => {
@@ -833,7 +835,7 @@ assert.ok(contextPromptArgs[1].signal instanceof AbortSignal)
   }
   try {
     const envSdk = makeSdk({})
-    await runTask(envSdk.sdk, {
+    const result = await runTask(envSdk.sdk, {
       task_id: "task-env-reserved",
       prompt: "read env",
       context: {
@@ -844,30 +846,27 @@ assert.ok(contextPromptArgs[1].signal instanceof AbortSignal)
         },
       },
     })
-    assert.equal(process.env.AGENT_AUTH_TOKEN, "bridge-secret", "the bridge's own token must survive a task run")
+    assert.equal(result.status, "error")
     assert.equal(
-      process.env.AGENT_AUTH_TOKEN_FILE,
-      undefined,
-      "a task-supplied handoff pointer must never land in the shared env",
+      result.error,
+      "credential grants are not supported by OpenCode workers; resubmit without credentials or use kimi/pebble",
     )
-    // No task grant entry may land in the shared bridge env at prompt time.
-    assert.equal(envSdk.promptEnvSnapshots.length, 1)
-    assert.deepEqual(
-      envSdk.promptEnvSnapshots[0],
-      { AGENT_AUTH_TOKEN: "bridge-secret", AGENT_AUTH_TOKEN_FILE: undefined, LEGIT_TASK_VAR: undefined },
-      "no task grant entry may land in the shared bridge env at prompt time",
-    )
-    // Nothing is injected, so there is nothing to restore afterward either.
+    assert.equal(result.output, "")
+    assert.equal(envSdk.createArgs.length, 0, "grant rejection must precede session.create")
+    assert.equal(envSdk.promptArgs.length, 0, "grant rejection must precede session.prompt")
+    assert.equal(envSdk.promptEnvSnapshots.length, 0)
+    assert.equal(process.env.AGENT_AUTH_TOKEN, "bridge-secret", "the bridge's own token must survive rejection")
+    assert.equal(process.env.AGENT_AUTH_TOKEN_FILE, undefined)
     assert.equal(process.env.LEGIT_TASK_VAR, undefined)
-    const drops = warnings.filter((w) => w.includes("dropped task-supplied env entry"))
-    assert.equal(drops.length, 0, `no env-drop path should remain, got ${JSON.stringify(warnings)}`)
-    assert.ok(warnings.every((w) => !w.includes("forged-by-task")), "never log the value")
+    assert.ok(warnings.every((w) => !w.includes("forged-by-task") && !w.includes("kept")), "never log grant values")
   } finally {
     console.warn = savedWarn
     if (savedToken === undefined) delete process.env.AGENT_AUTH_TOKEN
     else process.env.AGENT_AUTH_TOKEN = savedToken
     if (savedTokenFile === undefined) delete process.env.AGENT_AUTH_TOKEN_FILE
     else process.env.AGENT_AUTH_TOKEN_FILE = savedTokenFile
+    if (savedLegit === undefined) delete process.env.LEGIT_TASK_VAR
+    else process.env.LEGIT_TASK_VAR = savedLegit
   }
 }
 

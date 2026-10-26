@@ -37,11 +37,10 @@ const OPENCODE_BASE_URL = `http://${OPENCODE_HOST}:${OPENCODE_PORT}`
 const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || "/workspace"
 
 /**
- * Task `context.environment` stays on the request only (NU-1): it is never
- * merged into the bridge's process.env. The serve process is started by the
- * entrypoint with its own scrubbed environment, so these values do not reach
- * task code on this lane (WI#474); merging them here only changed shared
- * bridge lazy reads.
+ * The entrypoint starts serve with a separate environment, so this lane has
+ * no per-task delivery path for `context.environment`. Reject non-empty maps
+ * before creating a session (WI#474), and never merge them into the bridge's
+ * shared process.env (NU-1).
  */
 
 const RETRY_PROMPT =
@@ -212,6 +211,16 @@ export async function executeTask(
   sdkOverride?: OpenCodeClient,
 ): Promise<void> {
   const startTime = Date.now()
+  if (Object.keys(request.context?.environment ?? {}).length > 0) {
+    onResult({
+      task_id: request.task_id,
+      status: "error",
+      output: "",
+      error: "credential grants are not supported by OpenCode workers; resubmit without credentials or use kimi/pebble",
+      duration_ms: Date.now() - startTime,
+    })
+    return
+  }
   const timeoutMs = request.timeout_ms ?? DEFAULT_TIMEOUT_MS
   const maxProviderRetries = providerMaxRetries()
   const retryDelayMs = providerRetryDelayMs()
