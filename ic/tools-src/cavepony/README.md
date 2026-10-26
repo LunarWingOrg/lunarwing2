@@ -51,5 +51,7 @@ commands as code to guarantee preservation.
 Source basis: [Cavepony v0.3.0](https://clawhub.ai/chrismcfee/skills/cavepony)
 by Baud & sun and the supplied [IronClaw Caveman Skill
 Specification](https://i.desu.si/BrTNxfKb.md). The ClawHub release declares
-MIT-0 while its archive `package.json` declares MIT; this port conservatively
-retains the MIT terms shipped in package metadata.
+MIT-0 while its archive `package.json` declares MIT; this port is dual-licensed
+`AGPL-3.0-or-later AND MIT`. The upstream MIT notice is retained in `LICENSE`
+and the capabilities `license_notice`, and AGPL-3.0-or-later applies to the
+LunarWing-authored port code as with the rest of the daemon.

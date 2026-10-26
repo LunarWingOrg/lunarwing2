@@ -3,7 +3,7 @@ name = "cavepony-tool"
 version = "0.4.7"
 edition = "2021"
 description = "Cavepony text compression and expansion tool for LunarWing"
-license = "MIT"
+license = "AGPL-3.0-or-later AND MIT"
 publish = false
 
 [dependencies]
