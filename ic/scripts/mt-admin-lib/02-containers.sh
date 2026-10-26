@@ -161,11 +161,13 @@ _ensure_tenant_image() {
 # way). Hashing the image ID into the container contract makes start-tenant
 # force-recreate after every rebuild, as the vision/voice sidecar contracts
 # (_vision_launch_contract / _voice_launch_contract) already do. The base
-# contract is returned unchanged when the image cannot be inspected, so an
-# inspect failure alone never forces a recreate.
+# contract gains the egress network even when the image cannot be inspected, so
+# pre-WI#424 containers always recreate; an inspect failure alone forces no extra
+# recreate beyond that migration.
 # Usage: _worker_launch_contract <tenant> <image-ref> [<base-contract>]
 _worker_launch_contract() {
   local name="$1" image="$2" base="${3:-}" image_id
+  base="${base:+$base;}egress=$(worker_egress_network_name "$name")"
   image_id="$(_ctr "$name" image inspect -f '{{.Id}}' "$image" 2>/dev/null)" || image_id=""
   if [[ -z "$image_id" ]]; then
     printf '%s' "$base"
@@ -213,7 +215,7 @@ render_container_babysitter_unit() {
   # helper here too — otherwise a worker-less tenant renders a -sup unit whose
   # required_files=<helper> never exists and supervise-daemon silently never starts it.
   ensure_babysitter_helper
-  local babysitter="/etc/init.d/${container}-sup"
+  local babysitter="${OPENRC_INITD_DIR:-/etc/init.d}/${container}-sup"
   # Log into the tenant's existing logs dir (created at add-tenant, tenant-owned),
   # exactly like every other unit (lunarwing/proxy/xmpp-bridge). The old
   # /var/log/lunarwing/<t> path had no parent on a fresh host, so the non-recursive
@@ -221,6 +223,15 @@ render_container_babysitter_unit() {
   # the babysitter never stayed up (landed in /run/openrc/failed/).
   local log_dir
   log_dir="$(tenant_lw_root "$name")/logs"
+  local egress_guard="" egress_ruleset="" egress_chain="" worker_dependency=""
+  case "$type" in
+    pebble|opencode|opencode2|kimi)
+      egress_guard="$WORKER_EGRESS_GUARD"
+      egress_ruleset="$(worker_egress_ruleset_path "$name")"
+      egress_chain="$(worker_egress_chain "$name")"
+      worker_dependency="$container"
+      ;;
+  esac
 
   cat >"$babysitter" <<INITEOF
 #!/sbin/openrc-run
@@ -237,20 +248,23 @@ description="LunarWing ${type} container babysitter ($name)"
 : "\${babysitter_log_dir:=$log_dir}"
 : "\${babysitter_output_log:=\${babysitter_log_dir}/${type}-babysitter.log}"
 : "\${babysitter_error_log:=\${babysitter_log_dir}/${type}-babysitter.err}"
+: "\${babysitter_egress_guard:=$egress_guard}"
+: "\${babysitter_egress_ruleset:=$egress_ruleset}"
+: "\${babysitter_egress_chain:=$egress_chain}"
 
 supervisor="supervise-daemon"
 command="/usr/local/sbin/lunarwing-ctr-babysit"
-command_args="\${babysitter_container}"
+command_args="\${babysitter_container} \${babysitter_egress_guard} \${babysitter_egress_ruleset} \${babysitter_egress_chain}"
 command_user="\${babysitter_user}:\${babysitter_user}"
 respawn_delay="\${babysitter_respawn_delay}"
 respawn_max="\${babysitter_respawn_max}"
 respawn_period="\${babysitter_respawn_period}"
 output_log="\${babysitter_output_log}"
 error_log="\${babysitter_error_log}"
-required_files="\${command}"
+required_files="\${command} $egress_guard"
 
 depend() {
-    need net localmount
+    need net localmount $worker_dependency
     after firewall
 }
 

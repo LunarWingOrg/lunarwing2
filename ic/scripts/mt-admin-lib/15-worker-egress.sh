@@ -19,7 +19,8 @@ WORKER_EGRESS_SUBNET_MAX=250
 WORKER_EGRESS_LOCK=""
 WORKER_EGRESS_HOST_ADDRS="${LUNARWING_MT_WORKER_HOST_ADDRS:-169.254.1.2}"
 WORKER_EGRESS_GUARD_SRC="$SCRIPT_DIR/lunarwing-worker-egress-guard.sh"
-WORKER_EGRESS_GUARD="/usr/local/libexec/lunarwing-worker-egress-guard"
+WORKER_EGRESS_GUARD="${LUNARWING_MT_WORKER_EGRESS_GUARD:-/usr/local/libexec/lunarwing-worker-egress-guard}"
+WORKER_EGRESS_LAUNCH_ARGS=()
 
 _worker_egress_validate_name() {
   [[ "$1" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] \
@@ -722,9 +723,12 @@ worker_egress_enabled() {
 }
 
 prepare_worker_egress() {
-  local name="$1" worker="$2"
+  local name="$1" worker="$2" launch_text
   require_cmd nft
   worker_egress_ensure "$name" >/dev/null
   worker_egress_apply "$name" >/dev/null
+  launch_text="$(worker_egress_launch_args "$name")" \
+    || die "cannot render worker egress launch arguments for '$name'"
+  mapfile -t WORKER_EGRESS_LAUNCH_ARGS <<<"$launch_text"
   say "worker egress filter enforced for $name ($worker)"
 }
