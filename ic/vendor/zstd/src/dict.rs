@@ -27,14 +27,38 @@ pub struct EncoderDictionary<'a> {
     cdict: CDict<'a>,
 }
 
+/// The error for a dictionary zstd could not load.
+fn invalid_dictionary() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "zstd could not load the dictionary",
+    )
+}
+
 impl EncoderDictionary<'static> {
     /// Creates a prepared dictionary for compression.
     ///
     /// This will copy the dictionary internally.
+    ///
+    /// # Panics
+    ///
+    /// If zstd cannot load the dictionary - for instance, it starts with the
+    /// dictionary magic number but its header is corrupt. Use
+    /// [`EncoderDictionary::try_copy`] for a dictionary you did not make
+    /// yourself.
     pub fn copy(dictionary: &[u8], level: i32) -> Self {
-        Self {
-            cdict: zstd_safe::create_cdict(dictionary, level),
-        }
+        Self::try_copy(dictionary, level)
+            .expect("zstd returned null pointer when creating dict")
+    }
+
+    /// Creates a prepared dictionary for compression, or an error if zstd
+    /// cannot load it.
+    ///
+    /// This will copy the dictionary internally.
+    pub fn try_copy(dictionary: &[u8], level: i32) -> std::io::Result<Self> {
+        let cdict = zstd_safe::CDict::try_create(dictionary, level)
+            .ok_or_else(invalid_dictionary)?;
+        Ok(Self { cdict })
     }
 }
 
@@ -46,10 +70,27 @@ impl<'a> EncoderDictionary<'a> {
     /// A level of `0` uses zstd's default (currently `3`).
     ///
     /// Only available with the `experimental` feature. Use `EncoderDictionary::copy` otherwise.
+    ///
+    /// # Panics
+    ///
+    /// If zstd cannot load the dictionary. Use [`EncoderDictionary::try_new`]
+    /// for a dictionary you did not make yourself.
     pub fn new(dictionary: &'a [u8], level: i32) -> Self {
-        Self {
-            cdict: zstd_safe::CDict::create_by_reference(dictionary, level),
-        }
+        Self::try_new(dictionary, level).expect("zstd returned null pointer")
+    }
+
+    #[cfg(feature = "experimental")]
+    #[cfg_attr(feature = "doc-cfg", doc(cfg(feature = "experimental")))]
+    /// Create prepared dictionary for compression, or an error if zstd cannot
+    /// load it.
+    ///
+    /// Only available with the `experimental` feature. Use
+    /// `EncoderDictionary::try_copy` otherwise.
+    pub fn try_new(dictionary: &'a [u8], level: i32) -> std::io::Result<Self> {
+        let cdict =
+            zstd_safe::CDict::try_create_by_reference(dictionary, level)
+                .ok_or_else(invalid_dictionary)?;
+        Ok(Self { cdict })
     }
 
     /// Returns reference to `CDict` inner object
@@ -67,10 +108,26 @@ impl DecoderDictionary<'static> {
     /// Create a prepared dictionary for decompression.
     ///
     /// This will copy the dictionary internally.
+    ///
+    /// # Panics
+    ///
+    /// If zstd cannot load the dictionary - for instance, it starts with the
+    /// dictionary magic number but its header is corrupt. Use
+    /// [`DecoderDictionary::try_copy`] for a dictionary you did not make
+    /// yourself.
     pub fn copy(dictionary: &[u8]) -> Self {
-        Self {
-            ddict: zstd_safe::DDict::create(dictionary),
-        }
+        Self::try_copy(dictionary)
+            .expect("zstd returned null pointer when creating dict")
+    }
+
+    /// Create a prepared dictionary for decompression, or an error if zstd
+    /// cannot load it.
+    ///
+    /// This will copy the dictionary internally.
+    pub fn try_copy(dictionary: &[u8]) -> std::io::Result<Self> {
+        let ddict = zstd_safe::DDict::try_create(dictionary)
+            .ok_or_else(invalid_dictionary)?;
+        Ok(Self { ddict })
     }
 }
 
@@ -80,10 +137,26 @@ impl<'a> DecoderDictionary<'a> {
     /// Create prepared dictionary for decompression
     ///
     /// Only available with the `experimental` feature. Use `DecoderDictionary::copy` otherwise.
+    ///
+    /// # Panics
+    ///
+    /// If zstd cannot load the dictionary. Use [`DecoderDictionary::try_new`]
+    /// for a dictionary you did not make yourself.
     pub fn new(dict: &'a [u8]) -> Self {
-        Self {
-            ddict: zstd_safe::DDict::create_by_reference(dict),
-        }
+        Self::try_new(dict).expect("zstd returned null pointer")
+    }
+
+    #[cfg(feature = "experimental")]
+    #[cfg_attr(feature = "doc-cfg", doc(cfg(feature = "experimental")))]
+    /// Create prepared dictionary for decompression, or an error if zstd
+    /// cannot load it.
+    ///
+    /// Only available with the `experimental` feature. Use
+    /// `DecoderDictionary::try_copy` otherwise.
+    pub fn try_new(dict: &'a [u8]) -> std::io::Result<Self> {
+        let ddict = zstd_safe::DDict::try_create_by_reference(dict)
+            .ok_or_else(invalid_dictionary)?;
+        Ok(Self { ddict })
     }
 
     /// Returns reference to `DDict` inner object
@@ -100,7 +173,7 @@ impl<'a> DecoderDictionary<'a> {
 ///
 /// * `sample_data` is the concatenation of all sample data.
 /// * `sample_sizes` is the size of each sample in `sample_data`.
-///     The sum of all `sample_sizes` should equal the length of `sample_data`.
+///   The sum of all `sample_sizes` should equal the length of `sample_data`.
 /// * `max_size` is the maximum size of the dictionary to generate.
 ///
 /// The result is the dictionary data. You can, for example, feed it to [`CDict::create`].
@@ -114,7 +187,12 @@ pub fn from_continuous(
     use crate::map_error_code;
 
     // Complain if the lengths don't add up to the entire data.
-    if sample_sizes.iter().sum::<usize>() != sample_data.len() {
+    // Add them with overflow detection: a wrapping sum would accept sizes
+    // reaching far outside of `sample_data`.
+    let total_size = sample_sizes
+        .iter()
+        .try_fold(0usize, |total, &size| total.checked_add(size));
+    if total_size != Some(sample_data.len()) {
         return Err(io::Error::new(
             io::ErrorKind::Other,
             "sample sizes don't add up".to_string(),
@@ -222,7 +300,7 @@ where
 /// Train a dict from a list of files.
 ///
 /// * `filenames` is an iterator of files to load. Each file will be treated as an individual
-///     sample.
+///   sample.
 /// * `max_size` is the maximum size of the dictionary to generate.
 ///
 /// The result is the dictionary data. You can, for example, feed it to [`CDict::create`].
@@ -292,5 +370,13 @@ mod tests {
 
             assert_eq!(&content, &result);
         }
+    }
+
+    #[test]
+    fn test_from_continuous_overflowing_sizes() {
+        // These sizes only add up to the data length by wrapping around.
+        let data = [0u8; 100];
+        let sizes = [usize::MAX - 99, 200];
+        assert!(super::from_continuous(&data, &sizes, 4000).is_err());
     }
 }
