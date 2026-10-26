@@ -3319,7 +3319,7 @@ impl Workspace {
     }
 }
 
-fn validate_write_path(path: &str) -> Result<(), WorkspaceError> {
+pub(crate) fn validate_write_path(path: &str) -> Result<(), WorkspaceError> {
     if path.chars().any(char::is_control) {
         return Err(WorkspaceError::InvalidPath {
             path: path.to_string(),
