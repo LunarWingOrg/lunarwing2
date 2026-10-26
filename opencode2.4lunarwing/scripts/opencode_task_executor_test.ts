@@ -597,6 +597,56 @@ if (savedRetryDelay === undefined) {
       assert.equal(result.status, "error")
       assert.match(result.error!, /Task performed no actions: 1 permission request\(s\).*denied/)
     }
+
+    // OA-19: a failed attempt's partial streamed text must not bank when the
+    // clean retry is silent.
+    {
+      const sdk = makeSdk({
+        events: [
+          { type: "session.text.delta", data: { sessionID: "session-1", delta: "partial" } },
+          {
+            type: "session.execution.failed",
+            data: { sessionID: "session-1", error: { message: "No provider available" } },
+          },
+          { type: "session.execution.succeeded", data: { sessionID: "session-1" } },
+        ],
+        messages: [],
+      })
+      const result = await runTask(sdk.sdk, { task_id: "wi386-partial-retry", prompt: "build" })
+      assert.equal(sdk.promptArgs.length, 2)
+      assert.equal(result.status, "error", "a failed attempt's partial text must not bank")
+      assert.equal(result.error, "opencode completed without assistant text or tool output")
+    }
+
+    // OA-20: failed attempts can also leave their partial assistant message in
+    // session history. Neither an error field nor finish=error makes it
+    // canonical completed output.
+    for (const failedMessage of [
+      { error: { message: "No provider available" } },
+      { finish: "error" },
+    ]) {
+      const sdk = makeSdk({
+        events: [
+          { type: "session.text.delta", data: { sessionID: "session-1", delta: "partial" } },
+          {
+            type: "session.execution.failed",
+            data: { sessionID: "session-1", error: { message: "No provider available" } },
+          },
+          { type: "session.execution.succeeded", data: { sessionID: "session-1" } },
+        ],
+        messages: [
+          {
+            type: "assistant",
+            ...failedMessage,
+            content: [{ type: "text", text: "partial" }],
+          },
+        ],
+      })
+      const result = await runTask(sdk.sdk, { task_id: "wi386-failed-message", prompt: "build" })
+      assert.equal(sdk.promptArgs.length, 2)
+      assert.equal(result.status, "error", "a failed assistant message must not decide success")
+      assert.equal(result.error, "opencode completed without assistant text or tool output")
+    }
   } finally {
     if (savedDelay === undefined) delete process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS
     else process.env.OPENCODE_PROVIDER_RETRY_DELAY_MS = savedDelay

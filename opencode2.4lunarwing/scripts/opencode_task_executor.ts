@@ -560,7 +560,12 @@ const MESSAGE_LIST_PAGE_SIZE = 200 // upstream maximum per page
 const MESSAGE_LIST_MAX_PAGES = 5
 
 async function fetchAssistantText(sdk: OpenCodeClient, sessionID: string): Promise<string> {
-  const newestFirst: Array<{ type?: unknown; content?: unknown }> = []
+  const newestFirst: Array<{
+    type?: unknown
+    content?: unknown
+    error?: unknown
+    finish?: unknown
+  }> = []
   let cursor: string | undefined
   try {
     for (let page = 0; page < MESSAGE_LIST_MAX_PAGES; page++) {
@@ -585,7 +590,12 @@ async function fetchAssistantText(sdk: OpenCodeClient, sessionID: string): Promi
   }
   return newestFirst
     .reverse()
-    .filter((message) => message?.type === "assistant")
+    .filter(
+      (message) =>
+        message?.type === "assistant" &&
+        (message.error === undefined || message.error === null) &&
+        message.finish !== "error",
+    )
     .flatMap((message) => (Array.isArray(message.content) ? message.content : []))
     .filter(
       (part) =>
