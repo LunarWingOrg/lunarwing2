@@ -299,37 +299,42 @@ def _check_real_binary_metadata(
 
 
 def _check_parent_directories(
-    label: str, path: pathlib.Path, *, owner_uid: int
+    label: str,
+    path: pathlib.Path,
+    *,
+    owner_uid: int,
+    parent_root: pathlib.Path | None = None,
 ) -> bool:
-    """WI#425 GX-2: every parent of the wrapper and the real binary must block
-    entry replacement by a non-root uid, so the agent cannot swap either
-    file by renaming it through a writable parent.
+    """Check parents through, but never above, the trusted filesystem root."""
+    absolute_path = pathlib.Path(os.path.abspath(path))
+    root = pathlib.Path(os.path.abspath(parent_root or absolute_path.anchor))
+    if root not in absolute_path.parents:
+        fail(f"{label} path {absolute_path} is outside the trusted parent root {root}")
+        return False
 
-    A parent passes when it is owned by the wrapper owner or by root and
-    carries no group/other write bit, or when it is sticky (the sticky bit
-    already prevents non-owner rename/removal of the entries below it —
-    the /tmp shape). Hardcoding root as an allowed owner matters for the
-    test fixtures, whose paths live under root-owned ancestors (/home, /).
-    """
     ok = True
-    for parent in path.parents:
+    for parent in absolute_path.parents:
         try:
             metadata = parent.lstat()
         except OSError as error:
             fail(f"{label} parent {parent} is missing or unreadable: {error}")
             ok = False
+            if parent == root:
+                break
             continue
         mode = stat.S_IMODE(metadata.st_mode)
-        if mode & stat.S_ISVTX:
-            continue
         if metadata.st_uid not in (owner_uid, 0):
             fail(f"{label} parent {parent} must be owned by uid {owner_uid} or root "
                  f"(got uid {metadata.st_uid})")
             ok = False
-        if mode & 0o022:
+        if mode & 0o022 and not (
+            mode & stat.S_ISVTX and metadata.st_uid in (owner_uid, 0)
+        ):
             fail(f"{label} parent {parent} must not be group- or other-writable "
                  f"(mode {mode:o}) — a writable parent allows entry replacement")
             ok = False
+        if parent == root:
+            break
     return ok
 
 
@@ -341,6 +346,7 @@ def check_installed_wrapper(
     owner_uid: int = 0,
     wrapper_sha256: str | None = None,
     check_path_resolution: bool = True,
+    parent_root: pathlib.Path | None = None,
 ) -> None:
     """Run-103 GD-2: verify the shipped wrapper, not the Dockerfile's claim.
 
@@ -465,8 +471,12 @@ def check_installed_wrapper(
     # block entry replacement so the agent uid cannot swap either file
     # through a writable parent (rename/swap attacks).
     _check_real_binary_metadata("real binary", binary_path, owner_uid=owner_uid)
-    _check_parent_directories("wrapper", wrapper_path, owner_uid=owner_uid)
-    _check_parent_directories("real binary", binary_path, owner_uid=owner_uid)
+    _check_parent_directories(
+        "wrapper", wrapper_path, owner_uid=owner_uid, parent_root=parent_root
+    )
+    _check_parent_directories(
+        "real binary", binary_path, owner_uid=owner_uid, parent_root=parent_root
+    )
     check_binary(binary_path)
     if not failures:
         check(f"installed wrapper {wrapper_path} is the exposure guard "
@@ -539,6 +549,7 @@ def main() -> int:
                     args.image_root / "usr/local/bin/opencode",
                     args.image_root / "usr/local/lib/opencode2/opencode",
                     check_path_resolution=False,
+                    parent_root=args.image_root,
                 )
             else:
                 check_installed_wrapper(lane)

@@ -435,8 +435,22 @@ class InstalledWrapperTests(unittest.TestCase):
                 self.wrapper_path,
                 self.binary_path,
                 owner_uid=os.geteuid(),
+                parent_root=self.root,
             )
         return list(self.assert_module.failures)
+
+    def altered_owner(self, target: pathlib.Path):
+        real_lstat = pathlib.Path.lstat
+
+        def lstat(path: pathlib.Path):
+            metadata = real_lstat(path)
+            if path != target:
+                return metadata
+            fields = list(metadata)
+            fields[4] = os.geteuid() + 1
+            return os.stat_result(fields)
+
+        return mock.patch.object(pathlib.Path, "lstat", lstat)
 
     def test_as_built_passes(self) -> None:
         self.assertEqual(self.check(self.bin_dir), [])
@@ -609,14 +623,67 @@ class InstalledWrapperTests(unittest.TestCase):
         failures = self.check(self.bin_dir)
         self.assertTrue(any("real binary" in f and "other-writable" in f for f in failures), failures)
 
+    def test_real_binary_wrong_owner_fails(self) -> None:
+        with self.altered_owner(self.binary_path):
+            failures = self.check(self.bin_dir)
+        self.assertTrue(
+            any("real binary" in failure and "owned" in failure for failure in failures),
+            failures,
+        )
+
     def test_writable_parent_of_wrapper_fails(self) -> None:
-        # WI#425 GX-2: a writable parent directory lets any uid replace the
-        # wrapper by rename — the file's own root-owned mode says nothing
-        # about the directory entry. The parent walk must catch it.
         self.bin_dir.chmod(0o777)
         failures = self.check(self.bin_dir)
         self.assertTrue(any("parent" in f and str(self.bin_dir) in f for f in failures), failures)
         self.bin_dir.chmod(0o755)
+
+    def test_writable_parent_of_real_binary_fails(self) -> None:
+        self.binary_path.parent.chmod(0o777)
+        failures = self.check(self.bin_dir)
+        self.assertTrue(
+            any(str(self.binary_path.parent) in failure for failure in failures),
+            failures,
+        )
+
+    def test_writable_grandparent_fails(self) -> None:
+        self.root.chmod(0o777)
+        failures = self.check(self.bin_dir)
+        self.assertTrue(any(str(self.root) in failure for failure in failures), failures)
+        self.root.chmod(0o755)
+
+    def test_sticky_parent_still_requires_a_trusted_owner(self) -> None:
+        self.bin_dir.chmod(0o1777)
+        with self.altered_owner(self.bin_dir):
+            failures = self.check(self.bin_dir)
+        self.assertTrue(
+            any(str(self.bin_dir) in failure and "owned" in failure for failure in failures),
+            failures,
+        )
+
+    def test_sticky_parent_with_trusted_owner_passes(self) -> None:
+        self.bin_dir.chmod(0o1777)
+        self.assertEqual(self.check(self.bin_dir), [])
+
+    def test_missing_parent_fails_with_real_cause(self) -> None:
+        self.binary_path.unlink()
+        self.binary_path.parent.rmdir()
+        failures = self.check(self.bin_dir)
+        self.assertTrue(
+            any("parent" in failure and "missing or unreadable" in failure
+                for failure in failures),
+            failures,
+        )
+
+    def test_parent_walk_never_leaves_the_fixture_root(self) -> None:
+        real_lstat = pathlib.Path.lstat
+
+        def bounded_lstat(path: pathlib.Path):
+            if path != self.root and self.root not in path.parents:
+                raise AssertionError(f"parent walk escaped {self.root}: {path}")
+            return real_lstat(path)
+
+        with mock.patch.object(pathlib.Path, "lstat", bounded_lstat):
+            self.assertEqual(self.check(self.bin_dir), [])
 
     def test_missing_real_binary_fails_with_real_cause(self) -> None:
         # GZ-2 shape on the new paths: an unreadable/missing real binary
@@ -643,6 +710,7 @@ class InstalledWrapperTests(unittest.TestCase):
             "                    args.image_root / \"usr/local/bin/opencode\",\n"
             "                    args.image_root / \"usr/local/lib/opencode2/opencode\",\n"
             "                    check_path_resolution=False,\n"
+            "                    parent_root=args.image_root,\n"
             "                )\n"
             "            else:\n"
             "                check_installed_wrapper(lane)\n"
