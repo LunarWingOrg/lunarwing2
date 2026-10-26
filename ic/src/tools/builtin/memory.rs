@@ -20,8 +20,9 @@ use async_trait::async_trait;
 use crate::context::JobContext;
 use crate::tools::tool::{Tool, ToolError, ToolOutput, require_str};
 use crate::workspace::{
-    SearchResult, Workspace, is_backup_path, is_engine_internal_path, is_engine_projects_path,
-    is_engine_runtime_path, is_quarantined_daily_log, normalize_path, paths,
+    SearchResult, Workspace, escape_path_for_display, is_backup_path, is_engine_internal_path,
+    is_engine_projects_path, is_engine_runtime_path, is_quarantined_daily_log, normalize_path,
+    paths, validate_write_path,
 };
 
 const MAX_MEMORY_TOOL_OUTPUT_BYTES: usize = 8_000;
@@ -353,6 +354,9 @@ fn looks_like_filesystem_path(path: &str) -> bool {
 fn map_write_err(e: crate::error::WorkspaceError) -> ToolError {
     use crate::error::WorkspaceError;
     match e {
+        error @ WorkspaceError::InvalidPath { .. } => {
+            ToolError::InvalidParameters(error.to_string())
+        }
         WorkspaceError::InjectionRejected { path, reason } => {
             ToolError::ContentRejected(injection_rejection_message(&path, &reason))
         }
@@ -741,6 +745,7 @@ impl Tool for MemoryWriteTool {
 
         // Resolve the target to a workspace path
         let resolved_path = resolve_memory_write_target(target, tz);
+        validate_write_path(&resolved_path).map_err(map_write_err)?;
         let normalized_path = normalize_memory_tool_path(&resolved_path)?;
         let workspace = self.resolver.resolve(&ctx.user_id).await;
 
@@ -1067,8 +1072,9 @@ fn memory_tree_root_revision(entries: &[crate::workspace::WorkspaceEntry]) -> St
 }
 
 fn memory_tree_display_path(path: &str) -> String {
-    if json_string_fits(path, MAX_MEMORY_PATH_JSON_BYTES) {
-        return path.to_string();
+    let escaped = escape_path_for_display(path);
+    if json_string_fits(&escaped, MAX_MEMORY_PATH_JSON_BYTES) {
+        return escaped;
     }
     let digest = blake3::hash(path.as_bytes()).to_hex().to_string();
     format!("[path omitted: {}]", &digest[..12])
@@ -1866,6 +1872,84 @@ mod tests {
                     collect_tree_names(children, names);
                 }
             }
+        }
+
+        #[tokio::test]
+        async fn memory_write_rejects_control_bearing_paths() {
+            let (workspace, _temp_dir) = setup_workspace().await;
+            let write = MemoryWriteTool::from_workspace(Arc::clone(&workspace));
+            let context = JobContext::default();
+            for (target, append, layer) in [
+                ("notes/forged\ncontinuation.md", false, None),
+                ("notes/append\u{7}.md", true, None),
+                ("notes/layer\u{85}.md", false, Some("private")),
+                ("notes/layer-append\u{1f}.md", true, Some("private")),
+                ("notes/trimmed-carriage-return\r", false, None),
+            ] {
+                let mut params = serde_json::json!({
+                    "target": target,
+                    "content": "must not persist",
+                    "append": append,
+                });
+                if let Some(layer) = layer {
+                    params["layer"] = serde_json::json!(layer);
+                }
+                let message = match write.execute(params, &context).await {
+                    Err(ToolError::InvalidParameters(message)) => message,
+                    other => panic!("expected invalid-path rejection, got {other:?}"),
+                };
+                assert!(message.contains("control characters"), "{message}");
+                assert!(
+                    !message.chars().any(char::is_control),
+                    "the rejection must not echo a raw control character: {message:?}"
+                );
+            }
+            assert!(
+                workspace
+                    .list_all()
+                    .await
+                    .expect("list after refused tool writes")
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn memory_tree_escapes_legacy_control_bearing_names() {
+            let (workspace, db, _temp_dir) = setup_workspace_with_db().await;
+            let stored_path = "legacy\nline\u{1b}c1\u{85}.md";
+            let doc = db
+                .get_or_create_document_by_path("memory_tool_test", None, stored_path)
+                .await
+                .expect("seed legacy document");
+            db.update_document(doc.id, "legacy content")
+                .await
+                .expect("write legacy content");
+
+            let tree = MemoryTreeTool::from_workspace(Arc::clone(&workspace));
+            let output = tree
+                .execute(serde_json::json!({"depth": 1}), &JobContext::default())
+                .await
+                .expect("list legacy control-bearing document");
+            let mut names = Vec::new();
+            collect_tree_names(&output.result["tree"], &mut names);
+            assert!(
+                names
+                    .iter()
+                    .any(|name| name == r"legacy\nline\u{1b}c1\u{85}.md"),
+                "escaped legacy name missing from tree: {names:?}"
+            );
+            assert!(
+                names.iter().all(|name| !name.chars().any(char::is_control)),
+                "tree display names must not carry raw controls: {names:?}"
+            );
+            assert_eq!(
+                workspace
+                    .read(stored_path)
+                    .await
+                    .expect("raw legacy path remains readable")
+                    .content,
+                "legacy content"
+            );
         }
 
         #[tokio::test]
