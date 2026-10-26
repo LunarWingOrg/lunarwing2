@@ -95,6 +95,9 @@ pub struct HybridStore {
     /// before the canonical write has succeeded (MR !885 review).
     #[cfg(test)]
     fail_next_doc_save: std::sync::atomic::AtomicBool,
+    /// Test-only paths whose workspace reads fail, to pin boot read warnings.
+    #[cfg(test)]
+    fail_workspace_reads: Mutex<HashSet<String>>,
 }
 
 impl HybridStore {
@@ -124,6 +127,8 @@ impl HybridStore {
             secrets_store,
             #[cfg(test)]
             fail_next_doc_save: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_workspace_reads: Mutex::new(HashSet::new()),
         }
     }
 
@@ -644,6 +649,34 @@ impl HybridStore {
         );
     }
 
+    async fn read_workspace(
+        &self,
+        ws: &Workspace,
+        path: &str,
+    ) -> Result<crate::workspace::MemoryDocument, crate::error::WorkspaceError> {
+        #[cfg(test)]
+        if self.fail_workspace_reads.lock().await.contains(path) {
+            return Err(crate::error::WorkspaceError::IoError {
+                reason: "injected workspace read failure".to_owned(),
+            });
+        }
+        ws.read(path).await
+    }
+
+    async fn read_workspace_primary(
+        &self,
+        ws: &Workspace,
+        path: &str,
+    ) -> Result<crate::workspace::MemoryDocument, crate::error::WorkspaceError> {
+        #[cfg(test)]
+        if self.fail_workspace_reads.lock().await.contains(path) {
+            return Err(crate::error::WorkspaceError::IoError {
+                reason: "injected workspace read failure".to_owned(),
+            });
+        }
+        ws.read_primary(path).await
+    }
+
     /// Load every persisted record under `directory` into the in-memory maps.
     ///
     /// A record whose file cannot be read or parsed is dropped from the map, so
@@ -652,10 +685,11 @@ impl HybridStore {
     /// also vanished from every listing and schedule. `kind` names the record
     /// family so the warning reads without a stack of surrounding context.
     ///
-    /// The warning carries identifiers and a static error class only. The raw
-    /// serde error quotes the stored value it choked on — message text or tool
-    /// output for thread, step and event records — so it stays at `debug!`
-    /// (WI#321 NY-18).
+    /// The warning carries identifiers, the operator-facing path and a static
+    /// error class. Directory slugs in that path can derive from user-authored
+    /// names. The raw serde error quotes the stored value it choked on — message
+    /// text or tool output for thread, step and event records — so it stays at
+    /// `debug!` (WI#321 NY-18/OA-8).
     async fn load_map<T, F, Fut>(
         &self,
         ws: &Workspace,
@@ -668,7 +702,7 @@ impl HybridStore {
         Fut: std::future::Future<Output = ()>,
     {
         for entry in self.file_entries(ws, directory, &[".json"]).await {
-            match ws.read(&entry.path).await {
+            match self.read_workspace(ws, &entry.path).await {
                 Ok(doc) => match serde_json::from_str::<T>(&doc.content) {
                     Ok(value) => on_value(value).await,
                     Err(e) => {
@@ -1039,7 +1073,7 @@ impl HybridStore {
                     continue;
                 }
                 let mission_file = format!("{}/mission.json", mission_entry.path);
-                let doc = match ws.read_primary(&mission_file).await {
+                let doc = match self.read_workspace_primary(ws, &mission_file).await {
                     Ok(doc) => doc,
                     Err(e) => {
                         warn!(
@@ -1057,10 +1091,10 @@ impl HybridStore {
                             candidates.push((mission_file, raw, mission));
                         }
                         Err(e) => {
-                            // The mission name is user-authored and the serde
-                            // error quotes the stored value it rejected, so
-                            // neither goes to `warn!` (WI#321 NY-18). The id
-                            // and path identify the record.
+                            // The explicit mission-name field and raw serde error
+                            // stay at `debug!` (WI#321 NY-18). The operator-facing
+                            // path stays at `warn!`; its directory slugs can carry
+                            // user-authored project and mission names (OA-8).
                             let mission_id = raw
                                 .get("id")
                                 .and_then(|id| id.as_str())
@@ -2606,7 +2640,7 @@ mod tests {
         let mission = Mission::new(
             project.id,
             "test-user",
-            "vanishing mission",
+            "vanishing-mission",
             "should warn",
             lunarwing_engine::MissionCadence::Manual,
         );
@@ -2619,6 +2653,10 @@ mod tests {
             &store.project_slug(project.id).await,
             &mission.name,
             mission.id,
+        );
+        assert!(
+            path.contains(&mission.name),
+            "the fixture must cover the slugged-name path called out by OA-8"
         );
         let mut raw: serde_json::Value = serde_json::from_str(
             &workspace
@@ -2651,9 +2689,6 @@ mod tests {
         let mission_id = mission.id.0.to_string();
         let goal = mission.goal.clone();
         logs_assert(|lines: &[&str]| {
-            // The warn carries the id, the path and a static class — and it is
-            // really at warn, which WI#321's first acceptance criterion asks
-            // for (NY-20).
             assert_logged_at(
                 lines,
                 "WARN",
@@ -2664,12 +2699,130 @@ mod tests {
                     "error_kind=data",
                 ],
             )?;
-            // NY-18: neither the user-authored name or goal, nor the stored
-            // cadence value serde quotes in its Display text, may reach warn
-            // or above.
-            assert_no_log_carries_at_or_above(lines, &mission.name, "WARN")?;
+            // OA-8: the required operator path legitimately carries the slugged
+            // name. Exclude that path before checking no separate name field or
+            // other user content reaches warn; the goal and raw serde value must
+            // stay out too (NY-18).
+            let without_paths: Vec<String> = lines
+                .iter()
+                .map(|line| line.replace(&path, "<mission-path>"))
+                .collect();
+            let without_paths: Vec<&str> = without_paths.iter().map(String::as_str).collect();
+            assert_no_log_carries_at_or_above(&without_paths, &mission.name, "WARN")?;
             assert_no_log_carries_at_or_above(lines, &goal, "WARN")?;
             assert_no_log_carries_at_or_above(lines, "not-a-cadence", "WARN")
+        });
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    #[traced_test]
+    async fn non_json_mission_file_warns_instead_of_vanishing() {
+        // OA-7: the syntax-error path is distinct from a schema-invalid JSON
+        // document and must also warn at boot with its operator-facing path.
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("non-json-mission-warn", db));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let project = Project::new("test-user", "warn project", "test");
+        let mission = Mission::new(
+            project.id,
+            "test-user",
+            "non-json-mission",
+            "should warn",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        store.save_project(&project).await.expect("save project");
+        store.save_mission(&mission).await.expect("save mission");
+        let path = mission_path(
+            &store.project_slug(project.id).await,
+            &mission.name,
+            mission.id,
+        );
+        workspace
+            .write(&path, "{ this is not json")
+            .await
+            .expect("corrupt mission");
+
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded
+            .load_state_from_workspace()
+            .await
+            .expect("reload engine state");
+        assert!(reloaded.missions.read().await.is_empty());
+
+        logs_assert(|lines: &[&str]| {
+            assert_logged_at(
+                lines,
+                "WARN",
+                &[
+                    "dropping mission: failed to parse mission.json",
+                    &path,
+                    "record_id=unknown",
+                    "error_kind=syntax",
+                ],
+            )?;
+            assert_no_log_carries_at_or_above(lines, "this is not json", "WARN")
+        });
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    #[traced_test]
+    async fn project_and_mission_read_failures_warn_at_boot() {
+        // OA-7: fail the actual workspace reads after directory discovery, so
+        // both boot read-failure branches prove their levels and identifiers.
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("read-failure-warn", db));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let project = Project::new("test-user", "read project", "test");
+        let mission = Mission::new(
+            project.id,
+            "test-user",
+            "read-failure-mission",
+            "should warn",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        store.save_project(&project).await.expect("save project");
+        store.save_mission(&mission).await.expect("save mission");
+        let project_file = project_path(&project.name, project.id);
+        let mission_file = mission_path(
+            &store.project_slug(project.id).await,
+            &mission.name,
+            mission.id,
+        );
+
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        {
+            let mut failures = reloaded.fail_workspace_reads.lock().await;
+            failures.insert(project_file.clone());
+            failures.insert(mission_file.clone());
+        }
+        reloaded
+            .load_state_from_workspace()
+            .await
+            .expect("reload engine state");
+        assert!(reloaded.projects.read().await.is_empty());
+        assert!(reloaded.missions.read().await.is_empty());
+
+        logs_assert(|lines: &[&str]| {
+            assert_logged_at(
+                lines,
+                "WARN",
+                &[
+                    "dropping project record: failed to read",
+                    &project_file,
+                    "record_id=unknown",
+                ],
+            )?;
+            assert_logged_at(
+                lines,
+                "WARN",
+                &[
+                    "dropping mission: failed to read mission.json",
+                    &mission_file,
+                    "record_id=unknown",
+                ],
+            )
         });
     }
 
