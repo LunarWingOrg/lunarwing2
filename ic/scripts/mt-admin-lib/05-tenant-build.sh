@@ -1297,7 +1297,7 @@ _verify_opencode2_image_out_of_band() (
     echo "ERROR: cannot export the opencode2 image filesystem (WI#425 out-of-band)" >&2
     return 1
   fi
-  config_json="$("$CONTAINER_RT" image inspect "$image_ref" --format '{{json .Config}}' 2>/dev/null)" || {
+  config_json="$("$CONTAINER_RT" image inspect "$image_ref" 2>/dev/null)" || {
     echo "ERROR: cannot inspect full image config for $image_ref (WI#425 out-of-band)" >&2
     return 1
   }

@@ -381,12 +381,27 @@ def _fetch_candidate_config(image_ref: str, image_digest: str) -> dict:
     return image_config(repo, config_digest, token)
 
 
+def _normalize_local_config(payload: object) -> dict:
+    if isinstance(payload, dict):
+        return payload
+    if not isinstance(payload, list) or len(payload) != 1 or not isinstance(payload[0], dict):
+        die("runtime image inspect must contain exactly one image object")
+    inspected = payload[0]
+    section = inspected.get("Config")
+    if not isinstance(section, dict):
+        die("runtime image inspect carries no Config object")
+    config = dict(section)
+    if "Healthcheck" in inspected:
+        config["Healthcheck"] = inspected["Healthcheck"]
+    return {"config": config}
+
+
 def _local_config(path: pathlib.Path) -> dict:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         die(f"cannot read local image config {path}: {error}")
-    return {}
+    return _normalize_local_config(payload)
 
 
 def _argument_parser() -> argparse.ArgumentParser:

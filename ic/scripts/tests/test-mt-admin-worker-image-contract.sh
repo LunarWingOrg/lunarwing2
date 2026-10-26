@@ -589,10 +589,12 @@ with tarfile.open(output, "w") as archive:
 PY
       ;;
     image)
-      [[ "${2:-}" == inspect && "${*: -1}" == '{{json .Config}}' ]] || return 1
-      python3 - <<'PY'
+      [[ "${2:-}" == inspect && $# -eq 3 ]] || return 1
+      python3 - "$runtime" <<'PY'
 import json
-print(json.dumps({
+import sys
+runtime = sys.argv[1]
+config = {
     "Env": [
         "PATH=/home/opencode2/.cargo/bin:/usr/local/cargo/bin:/usr/local/go/bin:/home/opencode2/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bun-node-fallback-bin",
         "BUN_RUNTIME_TRANSPILER_CACHE_PATH=0",
@@ -608,17 +610,22 @@ print(json.dumps({
     "Cmd": ["--mode", "websocket"],
     "User": "10003:10003",
     "WorkingDir": "/app",
-    "Healthcheck": {
-        "Test": ["CMD-SHELL", "curl -sf http://127.0.0.1:8443/health || exit 1"],
-        "Interval": 30000000000,
-        "Timeout": 5000000000,
-        "StartPeriod": 30000000000,
-        "Retries": 3,
-    },
     "ExposedPorts": {"8443/tcp": {}, "9090/tcp": {}},
     "StopSignal": "SIGTERM",
     "Shell": None,
-}))
+}
+healthcheck = {
+    "Test": ["CMD-SHELL", "curl -sf http://127.0.0.1:8443/health || exit 1"],
+    "Interval": 30000000000,
+    "Timeout": 5000000000,
+    "StartPeriod": 30000000000,
+    "Retries": 3,
+}
+if runtime == "podman":
+    print(json.dumps([{"Config": config, "Healthcheck": healthcheck}]))
+else:
+    config["Healthcheck"] = healthcheck
+    print(json.dumps([{"Config": config}]))
 PY
       ;;
   esac

@@ -126,6 +126,34 @@ class ConfigHalfTests(unittest.TestCase):
         self.assert_refused(config, "OPENCODE_DISABLE_AUTOUPDATE")
 
 
+class LocalImageInspectTests(unittest.TestCase):
+    def setUp(self):
+        self.module = load_verify_module()
+
+    def assert_config_accepted(self, payload: object):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "inspect.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            config = self.module._local_config(path)
+        self.module.check_config_half(config)
+        self.assertEqual(self.module._environment(config), image_environment())
+
+    def test_docker_inspect_uses_config_healthcheck(self):
+        self.assert_config_accepted([{"Config": clean_config()["config"]}])
+
+    def test_podman_inspect_merges_top_level_healthcheck(self):
+        section = clean_config()["config"]
+        healthcheck = section.pop("Healthcheck")
+        self.assert_config_accepted([{"Config": section, "Healthcheck": healthcheck}])
+
+    def test_runtime_inspect_requires_exactly_one_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "inspect.json"
+            path.write_text("[]", encoding="utf-8")
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                self.module._local_config(path)
+
+
 class TarFixture:
     def __init__(self, lane: pathlib.Path):
         self.entries: dict[str, dict] = {}

@@ -320,7 +320,9 @@ oob_prepare_image() {
     chmod 755 "$oob_image_root/$oob_path_shadow"
   fi
 }
-docker() {
+fake_container_runtime() {
+  local runtime="$1"
+  shift
   case "${1:-}" in
     build)
       BUILD_CALL="$*"
@@ -370,11 +372,11 @@ PY
     tag) printf '%s\n' "$2 -> $3" >> "$fixture/tag-calls" ;;
     image)
       [[ "$oob_config_inspect_failure" != true ]] || return 1
-      [[ "${*: -1}" == '{{json .Config}}' ]] || return 1
-      python3 - "$oob_shell_override" "$oob_drop_env" "$oob_user" "${oob_env_extra[@]}" <<'PY'
+      [[ "${2:-}" == inspect && $# -eq 3 ]] || return 1
+      python3 - "$runtime" "$oob_shell_override" "$oob_drop_env" "$oob_user" "${oob_env_extra[@]}" <<'PY'
 import json
 import sys
-shell, drop, user, *extra = sys.argv[1:]
+runtime, shell, drop, user, *extra = sys.argv[1:]
 env = [
     "PATH=/home/opencode2/.cargo/bin:/usr/local/cargo/bin:/usr/local/go/bin:/home/opencode2/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bun-node-fallback-bin",
     "BUN_RUNTIME_TRANSPILER_CACHE_PATH=0",
@@ -388,29 +390,35 @@ env = [
 ] + extra
 if drop:
     env = [entry for entry in env if not entry.startswith(drop + "=")]
-print(json.dumps({
+config = {
     "Env": env,
     "Entrypoint": ["/usr/bin/tini", "--", "/app/entrypoint.sh"],
     "Cmd": ["--mode", "websocket"],
     "User": user,
     "WorkingDir": "/app",
-    "Healthcheck": {
-        "Test": ["CMD-SHELL", "curl -sf http://127.0.0.1:8443/health || exit 1"],
-        "Interval": 30000000000,
-        "Timeout": 5000000000,
-        "StartPeriod": 30000000000,
-        "Retries": 3,
-    },
     "ExposedPorts": {"8443/tcp": {}, "9090/tcp": {}},
     "StopSignal": "SIGTERM",
     "Shell": json.loads(shell) if shell else None,
-}))
+}
+healthcheck = {
+    "Test": ["CMD-SHELL", "curl -sf http://127.0.0.1:8443/health || exit 1"],
+    "Interval": 30000000000,
+    "Timeout": 5000000000,
+    "StartPeriod": 30000000000,
+    "Retries": 3,
+}
+if runtime == "podman":
+    print(json.dumps([{"Config": config, "Healthcheck": healthcheck}]))
+else:
+    config["Healthcheck"] = healthcheck
+    print(json.dumps([{"Config": config}]))
 PY
       ;;
     *) BUILD_CALL="$*"; printf '%s\n' "$*" >> "$fixture/build-calls" ;;
   esac
 }
-podman() { docker "$@"; }
+docker() { fake_container_runtime docker "$@"; }
+podman() { fake_container_runtime podman "$@"; }
 : > "$fixture/tag-calls"
 BUILD_CALL=''
 build_opencode2_worker false true "$fixture/target" >/dev/null
