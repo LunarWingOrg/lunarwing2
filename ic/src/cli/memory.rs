@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use clap::Subcommand;
 
-use crate::workspace::{EmbeddingCacheConfig, EmbeddingProvider, SearchConfig, Workspace};
+use crate::workspace::{
+    EmbeddingCacheConfig, EmbeddingProvider, SearchConfig, Workspace, escape_path_for_display,
+};
 
 /// Run a memory command using the Database trait (works with any backend).
 pub async fn run_memory_command_with_db(
@@ -197,9 +199,10 @@ async fn print_tree(
         let is_last = i == count - 1;
         let connector = if is_last { "└── " } else { "├── " };
         let child_prefix = if is_last { "    " } else { "│   " };
+        let display_name = escape_path_for_display(entry.name());
 
         if entry.is_directory {
-            println!("{}{}{}/", prefix, connector, entry.name());
+            println!("{}{}{}/", prefix, connector, display_name);
             Box::pin(print_tree(
                 workspace,
                 &entry.path,
@@ -209,7 +212,7 @@ async fn print_tree(
             ))
             .await?;
         } else {
-            println!("{}{}{}", prefix, connector, entry.name());
+            println!("{}{}{}", prefix, connector, display_name);
         }
     }
 
