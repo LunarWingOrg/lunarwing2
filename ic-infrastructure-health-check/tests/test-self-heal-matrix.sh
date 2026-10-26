@@ -177,6 +177,15 @@ b20="$(sb)"; report "$b20" '{components:[{component:"gateway",status:"healthy",m
 oB20="$(run_dry "$b20" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1)"
 assert_contains "$oB20" "nothing to do" "B20: absent diagnostic components create no targets"
 
+# B21 — WI#424: a tenant whose egress filter disappeared is monitor-only,
+# tenant-attributed, and never becomes an unknown service-mapping restart.
+b21="$(sb)"; report "$b21" '{components:[{component:"worker_egress",status:"critical",metrics:{instances:[
+  {tenant:"acme",status:"critical"}]}}]}'
+oB21="$(run_dry "$b21" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oB21" "ESCALATING: worker_egress@acme (monitor_only" "B21: missing egress escalates with tenant attribution"
+assert_absent "$oB21" "no service mapping for component 'worker_egress'" "B21: worker egress has a diagnostic registration"
+assert_absent "$oB21" "would run: systemctl restart" "B21: missing egress never blindly restarts a service"
+
 # B9 — three unhealthy logical components, all targeted in one run.
 b9="$(sb)"; report "$b9" '{components:[
   {component:"gateway",   status:"degraded",metrics:{}},
