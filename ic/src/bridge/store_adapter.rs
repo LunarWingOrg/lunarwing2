@@ -685,11 +685,11 @@ impl HybridStore {
     /// also vanished from every listing and schedule. `kind` names the record
     /// family so the warning reads without a stack of surrounding context.
     ///
-    /// The warning carries identifiers, the operator-facing path and a static
-    /// error class. Directory slugs in that path can derive from user-authored
-    /// names. The raw serde error quotes the stored value it choked on — message
-    /// text or tool output for thread, step and event records — so it stays at
-    /// `debug!` (WI#321 NY-18/OA-8).
+    /// The warning carries UUID-validated identifiers, the operator-facing path
+    /// and a static error class. Directory slugs in that path can derive from
+    /// user-authored names. The raw serde error quotes the stored value it choked
+    /// on — message text or tool output for thread, step and event records — so
+    /// it stays at `debug!` (WI#321 NY-18/OA-8).
     async fn load_map<T, F, Fut>(
         &self,
         ws: &Workspace,
@@ -1095,11 +1095,11 @@ impl HybridStore {
                             // failure path; the raw serde error stays at `debug!`
                             // (WI#321 NY-18). The operator-facing path stays at
                             // `warn!`; its directory slugs can carry user-authored
-                            // project and mission names (OA-8).
-                            let mission_id = raw
-                                .get("id")
-                                .and_then(|id| id.as_str())
-                                .unwrap_or("unknown");
+                            // project and mission names (OA-8). Validate the
+                            // stored id too: corrupt ids can contain arbitrary
+                            // text or newlines (OF-1).
+                            let mission_id = record_uuid_field(&raw, "id")
+                                .unwrap_or_else(|| "unknown".to_owned());
                             warn!(
                                 path = %mission_file,
                                 mission_id = %mission_id,
@@ -1424,11 +1424,12 @@ fn project_path(name: &str, project_id: ProjectId) -> String {
 /// Best-effort identifiers from a document that failed to deserialize (WI#321).
 ///
 /// Re-parses only on the failure path, so the happy path pays nothing.
-/// `id` is the record's own string `id`; `thread_id` is the thread a `Vec<_>`
+/// `id` is the record's own UUID `id`; `thread_id` is the thread a `Vec<_>`
 /// batch record (steps, events) is keyed by — that is the identifier an
 /// operator needs, while the element's own step/event id is not (WI#321
-/// NY-21). Both are `None` when the document is not JSON at all or the field
-/// is absent; the warning still names the path.
+/// NY-21). Both contain only canonical UUIDs or the static `"invalid"` marker
+/// (OF-1). They are `None` when the document is not JSON at all or the field is
+/// absent; the warning still names the path.
 #[derive(Default)]
 struct RecordIds {
     id: Option<String>,
@@ -1436,7 +1437,8 @@ struct RecordIds {
 }
 
 impl RecordIds {
-    /// Single content-free identifier for a `warn!` field.
+    /// Bounded UUID identifiers for a `warn!` field, with static `invalid` or
+    /// `unknown` markers instead of malformed or unavailable stored values.
     fn describe(&self) -> String {
         match (self.id.as_deref(), self.thread_id.as_deref()) {
             (Some(id), Some(thread)) => format!("{id} (thread {thread})"),
@@ -1458,15 +1460,23 @@ fn record_id_hint(content: &str) -> RecordIds {
         },
         other => (other, false),
     };
-    let string_field = |name: &str| {
-        record
-            .get(name)
-            .and_then(|value| value.as_str())
-            .map(str::to_owned)
-    };
     RecordIds {
-        id: string_field("id"),
-        thread_id: batch.then(|| string_field("thread_id")).flatten(),
+        id: record_uuid_field(record, "id"),
+        thread_id: batch
+            .then(|| record_uuid_field(record, "thread_id"))
+            .flatten(),
+    }
+}
+
+/// Never echo an unvalidated stored identifier at `warn!` (WI#321 OF-1).
+fn record_uuid_field(record: &serde_json::Value, field: &str) -> Option<String> {
+    let raw = record.get(field)?;
+    match raw.as_str().and_then(|id| Uuid::parse_str(id).ok()) {
+        Some(id) => Some(id.to_string()),
+        None => {
+            debug!(field, value = ?raw, "invalid stored record identifier");
+            Some("invalid".to_owned())
+        }
     }
 }
 
@@ -2532,21 +2542,63 @@ mod tests {
     #[test]
     fn record_id_hint_reads_object_and_batch_ids() {
         // The dropped-record warning names the id when the document is valid
-        // JSON with a string `id`. For the `Vec<_>` step/event batches the
+        // JSON with a UUID `id`. For the `Vec<_>` step/event batches the
         // thread the batch is keyed by is the identifier an operator needs, so
         // it is reported next to the element's own id (WI#321 NY-21).
-        assert_eq!(record_id_hint(r#"{"id":"abc"}"#).describe(), "abc");
+        let id = Uuid::new_v4();
+        let thread = Uuid::new_v4();
         assert_eq!(
-            record_id_hint(r#"[{"id":"first","thread_id":"t1"}]"#).describe(),
-            "first (thread t1)"
+            record_id_hint(&serde_json::json!({"id": id.to_string().to_uppercase()}).to_string())
+                .describe(),
+            id.to_string(),
+            "valid identifiers must be printed in canonical UUID form"
         );
         assert_eq!(
-            record_id_hint(r#"[{"thread_id":"t1"}]"#).describe(),
-            "thread t1"
+            record_id_hint(&serde_json::json!([{"id": id, "thread_id": thread}]).to_string())
+                .describe(),
+            format!("{id} (thread {thread})")
+        );
+        assert_eq!(
+            record_id_hint(&serde_json::json!([{"thread_id": thread}]).to_string()).describe(),
+            format!("thread {thread}")
         );
         assert_eq!(record_id_hint("{not json").describe(), "unknown");
-        assert_eq!(record_id_hint(r#"{"id":7}"#).describe(), "unknown");
+        assert_eq!(record_id_hint(r#"{}"#).describe(), "unknown");
         assert_eq!(record_id_hint(r#"[]"#).describe(), "unknown");
+    }
+
+    #[test]
+    fn record_id_hint_replaces_invalid_ids_with_static_markers() {
+        let thread = Uuid::new_v4();
+        for invalid in [
+            serde_json::json!("stored text\nFORGED LOG LINE"),
+            serde_json::json!("x".repeat(10_000)),
+            serde_json::json!(7),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(
+                record_id_hint(&serde_json::json!({"id": invalid}).to_string()).describe(),
+                "invalid"
+            );
+            assert_eq!(
+                record_id_hint(
+                    &serde_json::json!([{"id": invalid, "thread_id": thread}]).to_string()
+                )
+                .describe(),
+                format!("invalid (thread {thread})")
+            );
+            assert_eq!(
+                record_id_hint(
+                    &serde_json::json!([{"id": thread, "thread_id": invalid}]).to_string()
+                )
+                .describe(),
+                format!("{thread} (thread invalid)")
+            );
+            assert_eq!(
+                record_id_hint(&serde_json::json!([{"thread_id": invalid}]).to_string()).describe(),
+                "thread invalid"
+            );
+        }
     }
 
     #[test]
@@ -2884,6 +2936,135 @@ mod tests {
                 ],
             )?;
             assert_no_log_carries_at_or_above(lines, "LEAKED TOOL OUTPUT", "WARN")
+        });
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    #[traced_test]
+    async fn invalid_step_batch_ids_are_not_logged_at_warn() {
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("invalid-step-ids-warn", db));
+        let mut expected_warnings = Vec::new();
+        for field in ["id", "thread_id"] {
+            let marker = format!("OF1_STEP_{field}");
+            // Include the test scope on the forged continuation so tracing-test
+            // captures it too, rather than filtering away the injected line.
+            let invalid =
+                format!("{marker}\nFORGED invalid_step_batch_ids_are_not_logged_at_warn: {marker}");
+            let thread_id = ThreadId::new();
+            let step = Step::new(thread_id, 1);
+            let expected_id = if field == "id" {
+                format!("record_id=invalid (thread {})", thread_id.0)
+            } else {
+                format!("record_id={} (thread invalid)", step.id.0)
+            };
+            let path = step_path(thread_id);
+            let mut raw = serde_json::json!([step]);
+            raw[0][field] = serde_json::json!(invalid);
+            workspace
+                .write(&path, &raw.to_string())
+                .await
+                .expect("write corrupt step batch");
+            expected_warnings.push((path, expected_id, marker));
+        }
+
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded
+            .load_state_from_workspace()
+            .await
+            .expect("reload engine state");
+        assert!(reloaded.steps.read().await.is_empty());
+
+        logs_assert(|lines: &[&str]| {
+            for (path, expected_id, marker) in &expected_warnings {
+                assert_logged_at(
+                    lines,
+                    "WARN",
+                    &[
+                        "dropping thread step batch record: failed to parse",
+                        path,
+                        expected_id,
+                    ],
+                )?;
+                assert_logged_at(
+                    lines,
+                    "DEBUG",
+                    &["invalid stored record identifier", marker],
+                )?;
+                assert_no_log_carries_at_or_above(lines, marker, "WARN")?;
+                if lines
+                    .iter()
+                    .any(|line| line.contains(marker) && !line_has_level(line, "DEBUG"))
+                {
+                    return Err(format!("stored id forged a non-debug log line: {marker}"));
+                }
+            }
+            Ok(())
+        });
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    #[traced_test]
+    async fn invalid_mission_id_is_not_logged_at_warn() {
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("invalid-mission-id-warn", db));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let project = Project::new("test-user", "warn project", "test");
+        let mission = Mission::new(
+            project.id,
+            "test-user",
+            "invalid-id-mission",
+            "should warn",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        store.save_project(&project).await.expect("save project");
+        let path = mission_path(
+            &store.project_slug(project.id).await,
+            &mission.name,
+            mission.id,
+        );
+        let mut raw = serde_json::json!(mission);
+        let marker = "OF1_MISSION_ID";
+        raw["id"] = serde_json::json!(format!(
+            "{marker}\nFORGED invalid_mission_id_is_not_logged_at_warn: {marker}"
+        ));
+        workspace
+            .write(&path, &raw.to_string())
+            .await
+            .expect("write corrupt mission");
+
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded
+            .load_state_from_workspace()
+            .await
+            .expect("reload engine state");
+        assert!(reloaded.missions.read().await.is_empty());
+
+        logs_assert(|lines: &[&str]| {
+            assert_logged_at(
+                lines,
+                "WARN",
+                &[
+                    "dropping mission: failed to parse",
+                    &path,
+                    "mission_id=invalid",
+                ],
+            )?;
+            assert_logged_at(
+                lines,
+                "DEBUG",
+                &["invalid stored record identifier", marker],
+            )?;
+            assert_no_log_carries_at_or_above(lines, marker, "WARN")?;
+            if lines
+                .iter()
+                .any(|line| line.contains(marker) && !line_has_level(line, "DEBUG"))
+            {
+                return Err("stored mission id forged a non-debug log line".to_owned());
+            }
+            Ok(())
         });
     }
 
