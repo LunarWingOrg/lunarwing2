@@ -461,5 +461,21 @@ class CliWiringTests(unittest.TestCase):
             self.assertEqual(len(payload["results"]), 5)
 
 
+class CandidateBuildWiringTests(unittest.TestCase):
+    def test_candidate_runs_smoke_against_the_started_entrypoint(self) -> None:
+        lane = Path(__file__).resolve().parents[1]
+        dockerfile = (lane / "Dockerfile").read_text()
+        runner = (lane / "scripts/runtime_smoke_entrypoint.sh").read_text()
+        self.assertIn("RUN bash /app/scripts/runtime_smoke_entrypoint.sh", dockerfile)
+        self.assertNotIn("runtime_smoke.py --profile build", dockerfile)
+        self.assertIn("/app/entrypoint.sh --mode websocket", runner)
+        self.assertIn("runtime_smoke.py --profile container", runner)
+
+    def test_candidate_input_manifest_includes_the_entrypoint_runner(self) -> None:
+        repo = Path(__file__).resolve().parents[2]
+        manifest = (repo / ".gitlab/scripts/build-worker-image.sh").read_text()
+        self.assertIn("opencode2.4lunarwing/scripts/runtime_smoke_entrypoint.sh", manifest)
+
+
 if __name__ == "__main__":
     unittest.main()
