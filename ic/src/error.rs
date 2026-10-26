@@ -309,6 +309,9 @@ pub enum WorkspaceError {
     #[error("Invalid document type: {doc_type}")]
     InvalidDocType { doc_type: String },
 
+    #[error("Invalid workspace path {path:?}: control characters are not allowed")]
+    InvalidPath { path: String },
+
     #[error("Workspace not initialized for user {user_id}")]
     NotInitialized { user_id: String },
 
