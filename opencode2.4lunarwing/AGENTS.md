@@ -67,6 +67,9 @@ fallback installs.
 
 The CI publication gate requires the whole image to be byte-reproducible
 (candidate vs uncached clean rebuild; both must report the same digest).
+The candidate also exports `opencode2-rootfs.tar`; promotion requires the
+out-of-band tar/config verifier. Do not replace that archive with BuildKit's
+ownership-losing local directory export.
 OpenCode 2 appends a timestamped, randomly-IDed log line to
 `$HOME/.local/share/opencode/log/opencode.log` on EVERY start — including
 `opencode --version` — so any build-time `RUN` that executes the binary must
@@ -118,7 +121,9 @@ and WI#424's egress allowlist remain open; see the bump record.
 ## Key Files (this policy)
 
 - `scripts/opencode-exposure-guard.sh` — installed as `/usr/local/bin/opencode`; scans every argv token for `service`/`pair`/`upgrade`/`update`/`--service`/non-loopback `--hostname` (naive-use guard).
-- `scripts/exposure_policy_assert.py` — shared static policy checker (image build + CI guard); `--image-filesystem` also checks installed ownership and modes and (v2, run-103 GD-2 + run-106 GJ-3) verifies the installed wrapper: `/usr/local/bin/opencode` must be the byte-identical, root-owned, non-group-writable, executable guard that build-time `PATH` resolves to, with the real binary re-scanned for tunnel markers, no `LUNARWING_REAL_OPENCODE` retarget at build time, and the installed digest matching the `LUNARWING_WRAPPER_SHA256` build-arg anchor (computed from the checkout by `build-worker-image.sh` and mt-admin's `build_opencode2_worker`; missing or mismatched fails the build).
+- `scripts/exposure_policy_assert.py` — shared static policy checker (image build + CI guard); `--image-filesystem` checks installed ownership/modes, all three wrapper execute bits, real-binary metadata, and bounded parent directories. `--image-root` uses explicit tar-header metadata and image-environment JSON rather than host ownership or the CI job environment.
+- `scripts/image_config_policy.py` — checkout-owned allowlist for the complete image `Env` (PATH order included), `Entrypoint`, `Cmd`, `User`, `WorkingDir`, and `Shell`; shared by the protected tar verifier and mt-admin.
+- `../.gitlab/go/dockerfile-parse` — required BuildKit-parser Dockerfile policy; the old bash grammar is retired. Keep its Go tests and divergence fixtures current, and preserve the pinned Go CI job.
 - `scripts/entrypoint_config_test.py` — non-root startup configuration regression tests using a 0444 baked config, including repeat boots, HOME/XDG/`OPENCODE_CONFIG_DIR` service defaults, and agent plants (FIFO/dir/symlink) at the reset path.
 - `scripts/compile_out_remote_tunnel.py` — fail-closed build patch that compiles the OpenTunnel client out; drift scan over `packages/{cli,server,schema,core}/src` (ts+tsx, any quoted `@opentunnel/*` specifier, all workspace manifests).
 - `scripts/opencode_task_executor.ts` — `sessionPermissions()` carries the shell deny rules (after the allow-all rule; ordering matters).

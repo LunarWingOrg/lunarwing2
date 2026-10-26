@@ -435,8 +435,22 @@ class InstalledWrapperTests(unittest.TestCase):
                 self.wrapper_path,
                 self.binary_path,
                 owner_uid=os.geteuid(),
+                parent_root=self.root,
             )
         return list(self.assert_module.failures)
+
+    def altered_owner(self, target: pathlib.Path):
+        real_lstat = pathlib.Path.lstat
+
+        def lstat(path: pathlib.Path):
+            metadata = real_lstat(path)
+            if path != target:
+                return metadata
+            fields = list(metadata)
+            fields[4] = os.geteuid() + 1
+            return os.stat_result(fields)
+
+        return mock.patch.object(pathlib.Path, "lstat", lstat)
 
     def test_as_built_passes(self) -> None:
         self.assertEqual(self.check(self.bin_dir), [])
@@ -547,17 +561,164 @@ class InstalledWrapperTests(unittest.TestCase):
                 self.assertEqual(len(failures), 1, failures)
                 self.assertIn("OPENCODE_DISABLE_AUTOUPDATE", failures[0])
 
+    def test_opencode_bin_env_override_fails_and_scans_the_target(self) -> None:
+        # WI#425 GX-2: the entrypoint defaults OPENCODE_BIN to the wrapper, so
+        # an image ENV retargeting it at the real binary makes the bridge
+        # spawn that directly — past every argv scan the wrapper owns. The
+        # value at the override target is marker-scanned too, so the report
+        # says what sits there.
+        alt = self.root / "altbin" / "opencode.real"
+        alt.parent.mkdir()
+        alt.write_bytes(b"\x7fELF tampered build embedding https://opentunnel.xyz relay")
+        failures = self.check(self.bin_dir, env={"OPENCODE_BIN": str(alt)})
+        self.assertTrue(any("OPENCODE_BIN" in f for f in failures), failures)
+        self.assertTrue(any("opentunnel" in f for f in failures), failures)
+
+    def test_opencode_bin_env_override_at_the_wrapper_path_passes(self) -> None:
+        failures = self.check(
+            self.bin_dir, env={"OPENCODE_BIN": str(self.wrapper_path)}
+        )
+        self.assertEqual(failures, [])
+
+    def test_owner_only_executable_wrapper_fails(self) -> None:
+        # WI#425 GX-3: the exec-bit check used to test owner-exec only, so a
+        # root-owned 0744 wrapper passed the build gate while the runtime
+        # agent uid (10003) could not execute it — a bricked lane that also
+        # fell back to whatever PATH resolved instead. All three execute
+        # bits are now required.
+        self.wrapper_path.chmod(0o744)
+        failures = self.check(self.bin_dir)
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("GX-3", failures[0])
+
+    def test_any_missing_execute_bit_fails(self) -> None:
+        # WI#425 GX-3: every missing exec bit must fail — the old
+        # S_IXUSR-only check passed 0o744 (owner-exec only), which bricks the
+        # runtime agent uid; the other forms pin that group-only or
+        # other-only exec cannot sneak through either.
+        for mode in (0o744, 0o745, 0o754, 0o655, 0o755 & ~0o111):
+            with self.subTest(mode=oct(mode)):
+                self.wrapper_path.chmod(mode)
+                failures = self.check(self.bin_dir)
+                self.assertEqual(len(failures), 1, (oct(mode), failures))
+                self.assertIn("GX-3", failures[0])
+                self.wrapper_path.chmod(0o755)
+
+    def test_non_executable_wrapper_keeps_its_own_reason(self) -> None:
+        # Run-106 GJ-3(c) regression: a 0644 wrapper must keep the executable
+        # reason (now the GX-3 text), never fall through to the misleading
+        # "earlier PATH dir shadows" message.
+        self.wrapper_path.chmod(0o644)
+        failures = self.check(self.bin_dir)
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("GX-3", failures[0])
+        self.assertNotIn("shadows", failures[0])
+
+    def test_real_binary_owner_and_mode_verified(self) -> None:
+        # WI#425 GX-2: the real binary behind the wrapper must be owned by
+        # the same uid and not group/other-writable, or a post-scan RUN (or
+        # a root-capable agent path) could swap in a tunnel-bearing build.
+        # A mode change alone must fail; the marker scan is not enough.
+        self.binary_path.chmod(0o766)
+        failures = self.check(self.bin_dir)
+        self.assertTrue(any("real binary" in f and "other-writable" in f for f in failures), failures)
+
+    def test_real_binary_wrong_owner_fails(self) -> None:
+        with self.altered_owner(self.binary_path):
+            failures = self.check(self.bin_dir)
+        self.assertTrue(
+            any("real binary" in failure and "owned" in failure for failure in failures),
+            failures,
+        )
+
+    def test_writable_parent_of_wrapper_fails(self) -> None:
+        self.bin_dir.chmod(0o777)
+        failures = self.check(self.bin_dir)
+        self.assertTrue(any("parent" in f and str(self.bin_dir) in f for f in failures), failures)
+        self.bin_dir.chmod(0o755)
+
+    def test_writable_parent_of_real_binary_fails(self) -> None:
+        self.binary_path.parent.chmod(0o777)
+        failures = self.check(self.bin_dir)
+        self.assertTrue(
+            any(str(self.binary_path.parent) in failure for failure in failures),
+            failures,
+        )
+
+    def test_writable_grandparent_fails(self) -> None:
+        self.root.chmod(0o777)
+        failures = self.check(self.bin_dir)
+        self.assertTrue(any(str(self.root) in failure for failure in failures), failures)
+        self.root.chmod(0o755)
+
+    def test_sticky_parent_still_requires_a_trusted_owner(self) -> None:
+        self.bin_dir.chmod(0o1777)
+        with self.altered_owner(self.bin_dir):
+            failures = self.check(self.bin_dir)
+        self.assertTrue(
+            any(str(self.bin_dir) in failure and "owned" in failure for failure in failures),
+            failures,
+        )
+
+    def test_sticky_parent_with_trusted_owner_passes(self) -> None:
+        self.bin_dir.chmod(0o1777)
+        self.assertEqual(self.check(self.bin_dir), [])
+
+    def test_missing_parent_fails_with_real_cause(self) -> None:
+        self.binary_path.unlink()
+        self.binary_path.parent.rmdir()
+        failures = self.check(self.bin_dir)
+        self.assertTrue(
+            any("parent" in failure and "missing or unreadable" in failure
+                for failure in failures),
+            failures,
+        )
+
+    def test_parent_walk_never_leaves_the_fixture_root(self) -> None:
+        real_lstat = pathlib.Path.lstat
+
+        def bounded_lstat(path: pathlib.Path):
+            if path != self.root and self.root not in path.parents:
+                raise AssertionError(f"parent walk escaped {self.root}: {path}")
+            return real_lstat(path)
+
+        with mock.patch.object(pathlib.Path, "lstat", bounded_lstat):
+            self.assertEqual(self.check(self.bin_dir), [])
+
+    def test_missing_real_binary_fails_with_real_cause(self) -> None:
+        # GZ-2 shape on the new paths: an unreadable/missing real binary
+        # names the real cause instead of a mode complaint.
+        self.binary_path.unlink()
+        failures = self.check(self.bin_dir)
+        self.assertTrue(any("real binary" in f and "missing or unreadable" in f for f in failures), failures)
+
     def test_image_filesystem_path_wires_the_check_in(self) -> None:
         # The scenarios above call the function directly (GD-3: the image
         # build is the only place --image-filesystem runs, and it is a
         # protected-pipeline gate) — pin the main() wiring so the check
-        # cannot be dropped from the shipped invocation unnoticed.
+        # cannot be dropped from the shipped invocation unnoticed. The
+        # --image-root branch (WI#425 out-of-band verification in CI) points
+        # the same check at an unpacked BuildKit export, with no live PATH.
         source = ASSERT.read_text(encoding="utf-8")
         wiring = (
             "    if args.image_filesystem:\n"
-            "        check_image_filesystem(lane)\n"
+            "        check_image_filesystem(\n"
+            "            lane, image_root=args.image_root, image_metadata=image_metadata\n"
+            "        )\n"
             "        if is_v2:\n"
-            "            check_installed_wrapper(lane)\n"
+            "            if args.image_root is not None:\n"
+            "                check_installed_wrapper(\n"
+            "                    lane,\n"
+            "                    args.image_root / \"usr/local/bin/opencode\",\n"
+            "                    args.image_root / \"usr/local/lib/opencode2/opencode\",\n"
+            "                    check_path_resolution=False,\n"
+            "                    parent_root=args.image_root,\n"
+            "                    environ=image_environment,\n"
+            "                    image_root=args.image_root,\n"
+            "                    image_metadata=image_metadata,\n"
+            "                )\n"
+            "            else:\n"
+            "                check_installed_wrapper(lane)\n"
         )
         self.assertIn(wiring, source)
 

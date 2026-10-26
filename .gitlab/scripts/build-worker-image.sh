@@ -40,7 +40,8 @@ pebble4lunarwing/src/workspace_path.rs
 pebble4lunarwing/upstream/Cargo.lock
 pebble4lunarwing/scripts/verify_upstream_lock.py
 pebble4lunarwing/scripts/toolchain-profile.sh
-pebble4lunarwing/scripts/rustup-wrapper.sh'
+pebble4lunarwing/scripts/rustup-wrapper.sh
+pebble4lunarwing/scripts/pebble-self-update-guard.sh'
         source_ref=2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b
         build_args="PEBBLE_REF=2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b
 WITH_TOOLCHAINS=false
@@ -97,6 +98,8 @@ opencode2.4lunarwing/scripts/lunarwing_tool_plugin_test.ts
 opencode2.4lunarwing/scripts/opencode-exposure-guard.sh
 opencode2.4lunarwing/scripts/exposure_policy_assert.py
 opencode2.4lunarwing/scripts/exposure_policy_assert_test.py
+opencode2.4lunarwing/scripts/image_config_policy.py
+opencode2.4lunarwing/scripts/image_config_policy_test.py
 opencode2.4lunarwing/scripts/entrypoint_config_test.py
 opencode2.4lunarwing/scripts/compile_out_remote_tunnel.py
 opencode2.4lunarwing/scripts/compile_out_remote_tunnel_test.py'
@@ -104,7 +107,8 @@ opencode2.4lunarwing/scripts/compile_out_remote_tunnel_test.py'
         # WI#357 run-106 GJ-3(a): the checkout's wrapper digest, compared by
         # the in-image --image-filesystem assert against the installed wrapper.
         # Detects accidental drift; an adversarial Dockerfile can still defeat
-        # it. Out-of-band image verification remains a WI#357 follow-up (GW-3).
+        # it. The durable out-of-band verification is WI#425 Ask 1 (the tar
+        # filesystem export + worker-opencode2-exposure-verify job below).
         wrapper_file="$CI_PROJECT_DIR/opencode2.4lunarwing/scripts/opencode-exposure-guard.sh"
         wrapper_anchor=$(sha256sum < "$wrapper_file") || {
             echo "cannot hash $wrapper_file" >&2; exit 1;
@@ -228,6 +232,10 @@ build_image() {
         --opt filename=Dockerfile \
         --metadata-file "$output_metadata" \
         --output "type=image,name=$output_ref,push=true,oci-mediatypes=false,rewrite-timestamp=true"
+    # WI#425: the opencode2 candidate additionally exports its filesystem
+    # (multiple --output flags, BuildKit >= 0.13; pinned v0.25.1) for the
+    # out-of-band exposure-policy verification job.
+    [ -n "${build_image_extra_output:-}" ] && set -- "$@" --output "$build_image_extra_output"
     while IFS= read -r build_arg; do
         [ -n "$build_arg" ] && set -- "$@" --opt "build-arg:$build_arg"
     done < "$CI_PROJECT_DIR/worker-build-args.txt"
@@ -381,12 +389,26 @@ print_reproducibility_diagnosis() {
     return 0
 }
 
+# WI#425: export the opencode2 candidate's final filesystem as tar, preserving
+# the uid/gid/mode headers that BuildKit's local directory exporter rewrites.
+# The verify job checks those headers and the checkout-owned bytes out of band.
+if [ "$1" = opencode2 ]; then
+    export_file="$CI_PROJECT_DIR/opencode2-rootfs.tar"
+    rm -f "$export_file"
+    build_image_extra_output="type=tar,dest=$export_file"
+fi
+
 build_image_with_retry "$candidate_ref" "$metadata_file" false
 digest=$(metadata_digest "$metadata_file")
 case "$digest" in
     sha256:????????????????????????????????????????????????????????????????) ;;
     *) echo "BuildKit did not report a valid image digest" >&2; exit 1 ;;
 esac
+build_image_extra_output=""
+if [ "$1" = opencode2 ] && [ ! -s "$export_file" ]; then
+    echo "BuildKit tar export did not produce a filesystem archive (WI#425)" >&2
+    exit 1
+fi
 
 build_image_with_retry "$rebuild_ref" "$rebuild_metadata_file" true
 rebuild_digest=$(metadata_digest "$rebuild_metadata_file")

@@ -31,7 +31,14 @@ Assertions (opencode2 lane):
      resolve 'opencode' to it, the real binary is re-scanned for OpenTunnel
      markers (run-103 GD-2), LUNARWING_REAL_OPENCODE may not retarget the
      wrapper at build time, and the installed digest must match the
-     LUNARWING_WRAPPER_SHA256 build-arg anchor (run-106 GJ-3).
+     LUNARWING_WRAPPER_SHA256 build-arg anchor (run-106 GJ-3). WI#425 GX-2
+     adds the OPENCODE_BIN retarget refusal, the real binary's owner/mode,
+     and the parent-directory checks; GX-3 requires all three execute bits.
+     --image-root DIR (WI#425 out-of-band verification) checks a safely
+     materialized tar export using --image-metadata from its tar headers and
+     --image-env-file from the actual image config. Host ownership and the CI
+     job's own environment are never treated as image facts; the CI driver
+     separately pins the complete runtime config, including PATH order.
 
 v1 lane (--lane opencode4lunarwing): only the share-disabled and
 entrypoint-loopback checks apply (v1.18.25 has no service mode or
@@ -246,8 +253,37 @@ def check_binary(binary: pathlib.Path) -> None:
     check(f"{binary.name} contains no OpenTunnel client markers")
 
 
-def check_image_filesystem(lane: pathlib.Path) -> None:
-    """FB-4: check actual image metadata, not just Dockerfile text."""
+def _path_metadata(
+    path: pathlib.Path,
+    image_root: pathlib.Path | None,
+    records: dict[str, dict[str, int]] | None,
+) -> os.stat_result:
+    if records is None:
+        return path.lstat()
+    if image_root is None:
+        raise OSError("tar-header metadata requires an image root")
+    try:
+        relative = pathlib.Path(os.path.abspath(path)).relative_to(
+            pathlib.Path(os.path.abspath(image_root))
+        )
+    except ValueError as error:
+        raise OSError(f"path {path} escapes image root {image_root}") from error
+    key = "" if relative == pathlib.Path(".") else relative.as_posix()
+    record = records.get(key)
+    if record is None:
+        raise OSError(f"no tar-header metadata for {key or '/'}")
+    return os.stat_result((
+        record["mode"], 0, 0, 0, record["uid"], record["gid"], 0, 0, 0, 0,
+    ))
+
+
+def check_image_filesystem(
+    lane: pathlib.Path,
+    *,
+    image_root: pathlib.Path | None = None,
+    image_metadata: dict[str, dict[str, int]] | None = None,
+) -> None:
+    """FB-4: check image ownership/modes, from tar headers out of band."""
     paths = [lane, *(lane / name for name in (
         "entrypoint.sh", "health_server.py", "agent_comm_protocol.json",
     ))]
@@ -256,17 +292,180 @@ def check_image_filesystem(lane: pathlib.Path) -> None:
         paths.extend((tree, *tree.rglob("*")))
     for path in paths:
         try:
-            metadata = path.lstat()
+            metadata = _path_metadata(path, image_root, image_metadata)
         except OSError as error:
             fail(f"image policy file unreadable: {path}: {error}")
             continue
-        # /app must prevent replacement of its children; its root-only write
-        # bit is fine. All protected children must have no write bits at all.
         writable = metadata.st_mode & (0o022 if path == lane else 0o222)
-        if metadata.st_uid != 0 or writable or path.is_symlink():
+        if metadata.st_uid != 0 or writable or stat.S_ISLNK(metadata.st_mode):
             fail(f"image policy path must be root-owned and read-only: {path}")
     if not failures:
         check("image boot files, scripts and config are root-owned and read-only")
+
+
+def _check_real_binary_metadata(
+    label: str,
+    path: pathlib.Path,
+    *,
+    owner_uid: int,
+    image_root: pathlib.Path | None = None,
+    image_metadata: dict[str, dict[str, int]] | None = None,
+) -> bool:
+    try:
+        metadata = _path_metadata(path, image_root, image_metadata)
+    except OSError as error:
+        fail(f"{label} {path} is missing or unreadable: {error}")
+        return False
+    if not stat.S_ISREG(metadata.st_mode):
+        fail(f"{label} {path} must be a regular file, not a symlink or special file")
+        return False
+    mode = stat.S_IMODE(metadata.st_mode)
+    if metadata.st_uid != owner_uid:
+        fail(f"{label} {path} must be owned by uid {owner_uid} (got uid {metadata.st_uid})")
+        return False
+    if mode & 0o022:
+        fail(f"{label} {path} must not be group- or other-writable (mode {mode:o})")
+        return False
+    return True
+
+
+def _check_parent_directories(
+    label: str,
+    path: pathlib.Path,
+    *,
+    owner_uid: int,
+    parent_root: pathlib.Path | None = None,
+    image_root: pathlib.Path | None = None,
+    image_metadata: dict[str, dict[str, int]] | None = None,
+) -> bool:
+    """Check parents through, but never above, the trusted filesystem root."""
+    absolute_path = pathlib.Path(os.path.abspath(path))
+    root = pathlib.Path(os.path.abspath(parent_root or absolute_path.anchor))
+    if root not in absolute_path.parents:
+        fail(f"{label} path {absolute_path} is outside the trusted parent root {root}")
+        return False
+
+    ok = True
+    for parent in absolute_path.parents:
+        try:
+            metadata = _path_metadata(parent, image_root, image_metadata)
+        except OSError as error:
+            fail(f"{label} parent {parent} is missing or unreadable: {error}")
+            ok = False
+            if parent == root:
+                break
+            continue
+        if not stat.S_ISDIR(metadata.st_mode):
+            fail(f"{label} parent {parent} must be a directory")
+            ok = False
+        mode = stat.S_IMODE(metadata.st_mode)
+        if metadata.st_uid not in (owner_uid, 0):
+            fail(f"{label} parent {parent} must be owned by uid {owner_uid} or root "
+                 f"(got uid {metadata.st_uid})")
+            ok = False
+        if mode & 0o022 and not (
+            mode & stat.S_ISVTX and metadata.st_uid in (owner_uid, 0)
+        ):
+            fail(f"{label} parent {parent} must not be group- or other-writable "
+                 f"(mode {mode:o}) — a writable parent allows entry replacement")
+            ok = False
+        if parent == root:
+            break
+    return ok
+
+
+def _read_installed_wrapper(
+    lane: pathlib.Path,
+    wrapper_path: pathlib.Path,
+    environment: dict[str, str],
+    *,
+    owner_uid: int,
+    wrapper_sha256: str | None,
+    image_root: pathlib.Path | None,
+    image_metadata: dict[str, dict[str, int]] | None,
+) -> bytes | None:
+    try:
+        metadata = _path_metadata(wrapper_path, image_root, image_metadata)
+    except OSError as error:
+        fail(f"installed wrapper {wrapper_path} is missing or unreadable: {error}")
+        return None
+    if not stat.S_ISREG(metadata.st_mode):
+        fail(f"installed wrapper {wrapper_path} must be a regular file, not a symlink")
+        return None
+    if metadata.st_uid != owner_uid:
+        fail(f"installed wrapper {wrapper_path} must be owned by uid {owner_uid}")
+        return None
+    if metadata.st_mode & 0o022:
+        fail(f"installed wrapper {wrapper_path} must not be group- or other-writable")
+        return None
+    if (stat.S_IMODE(metadata.st_mode) & 0o111) != 0o111:
+        fail(f"installed wrapper {wrapper_path} must be executable by user, group "
+             f"and other (mode {stat.S_IMODE(metadata.st_mode):o}) — a root-owned "
+             f"0744 wrapper bricks the runtime user (WI#425 GX-3)")
+        return None
+
+    source = lane / "scripts" / "opencode-exposure-guard.sh"
+    try:
+        installed = wrapper_path.read_bytes()
+        expected = source.read_bytes()
+    except OSError as error:
+        fail(f"installed wrapper comparison unreadable: {error}")
+        return None
+    if installed != expected:
+        fail(f"installed wrapper {wrapper_path} is not byte-identical to {source} — "
+             "replaced after the scan (run-103 GD-2)")
+        return None
+    anchor = wrapper_sha256 if wrapper_sha256 is not None else environment.get(
+        "LUNARWING_WRAPPER_SHA256", ""
+    )
+    installed_digest = hashlib.sha256(installed).hexdigest()
+    if not anchor:
+        fail("LUNARWING_WRAPPER_SHA256 (the checkout's wrapper digest) is missing — "
+             "the installed wrapper cannot be anchored (run-106 GJ-3a)")
+        return None
+    if anchor != installed_digest:
+        fail(f"installed wrapper {wrapper_path} digest {installed_digest} does not "
+             "match the LUNARWING_WRAPPER_SHA256 build-arg anchor — rewritten "
+             "together with the in-image reference (run-106 GJ-3a)")
+        return None
+    return installed
+
+
+def _override_path(value: str, image_root: pathlib.Path | None) -> pathlib.Path | None:
+    path = pathlib.Path(value)
+    if image_root is None:
+        return path
+    if not path.is_absolute() or ".." in path.parts:
+        return None
+    return image_root.joinpath(*path.parts[1:])
+
+
+def _check_wrapper_environment(
+    environment: dict[str, str],
+    wrapper_path: pathlib.Path,
+    binary_path: pathlib.Path,
+    image_root: pathlib.Path | None,
+) -> None:
+    if environment.get("OPENCODE_DISABLE_AUTOUPDATE") != "1":
+        fail("OPENCODE_DISABLE_AUTOUPDATE=1 must be set in the image environment — "
+             "the updater ignores the lane config's update pin")
+    expected_wrapper = pathlib.Path("/usr/local/bin/opencode") if image_root else wrapper_path
+    expected_binary = (
+        pathlib.Path("/usr/local/lib/opencode2/opencode") if image_root else binary_path
+    )
+    overrides = (
+        ("LUNARWING_REAL_OPENCODE", expected_binary, "run-106 GJ-3b"),
+        ("OPENCODE_BIN", expected_wrapper, "WI#425 GX-2"),
+    )
+    for key, expected, reason in overrides:
+        value = environment.get(key, "")
+        if not value or pathlib.Path(value) == expected:
+            continue
+        fail(f"{key}={value!r} is set in the image environment — it must resolve to "
+             f"{expected} ({reason})")
+        mapped = _override_path(value, image_root)
+        if mapped is not None:
+            check_binary(mapped)
 
 
 def check_installed_wrapper(
@@ -276,143 +475,126 @@ def check_installed_wrapper(
     *,
     owner_uid: int = 0,
     wrapper_sha256: str | None = None,
+    check_path_resolution: bool = True,
+    parent_root: pathlib.Path | None = None,
+    environ: dict[str, str] | None = None,
+    image_root: pathlib.Path | None = None,
+    image_metadata: dict[str, dict[str, int]] | None = None,
 ) -> None:
-    """Run-103 GD-2: verify the shipped wrapper, not the Dockerfile's claim.
-
-    A RUN in the final stage between the wrapper-install scan and the
-    --image-filesystem assertion can replace the wrapper (or the real
-    binary) after the earlier scan, so inspect the installed files here.
-    The wrapper must be the byte-identical, owner-only-writable,
-    executable exposure guard, PATH must resolve 'opencode' to it, the real
-    binary is re-scanned for OpenTunnel markers, and LUNARWING_REAL_OPENCODE
-    may not retarget the wrapper at build time (run-106 GJ-3b/c). The
-    installed digest must also match the LUNARWING_WRAPPER_SHA256 build-arg
-    anchor (run-106 GJ-3a). This detects accidental drift; an adversarial
-    Dockerfile edit can still defeat it by replacing the environment or
-    checker (run-109 GW-3). Image builds only (v2 profile); independent
-    checkout-side image verification remains a WI#357 follow-up.
-    """
-    try:
-        metadata = wrapper_path.lstat()
-    except OSError as error:
-        fail(f"installed wrapper {wrapper_path} is missing or unreadable: {error}")
-        return
-    if wrapper_path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
-        fail(f"installed wrapper {wrapper_path} must be a regular file, not a symlink")
-        return
-    if metadata.st_uid != owner_uid:
-        fail(f"installed wrapper {wrapper_path} must be owned by uid {owner_uid}")
-        return
-    if metadata.st_mode & 0o022:
-        fail(f"installed wrapper {wrapper_path} must not be group- or other-writable")
-        return
-    # Run-106 GJ-3(c): a non-executable wrapper is skipped by PATH lookup, so
-    # 'opencode' resolves elsewhere — refuse it with its own reason instead
-    # of the misleading "earlier PATH dir shadows" text.
-    if not metadata.st_mode & stat.S_IXUSR:
-        fail(f"installed wrapper {wrapper_path} must be executable "
-             f"(mode {stat.S_IMODE(metadata.st_mode):o})")
-        return
-    source = lane / "scripts" / "opencode-exposure-guard.sh"
-    try:
-        installed = wrapper_path.read_bytes()
-        expected = source.read_bytes()
-    except OSError as error:
-        fail(f"installed wrapper comparison unreadable: {error}")
-        return
-    if installed != expected:
-        fail(f"installed wrapper {wrapper_path} is not byte-identical to {source} — "
-             "replaced after the scan (run-103 GD-2)")
-        return
-    # Run-106 GJ-3(a): {source} ships inside the image, so the same root RUN
-    # can rewrite both files identically and pass the byte-identity check.
-    # The build passes the checkout's wrapper sha256 as a build argument
-    # (LUNARWING_WRAPPER_SHA256); compare the installed digest against that
-    # anchor, and fail closed when it is absent — a dropped ARG or a builder
-    # that does not forward the arg must fail the image build, not pass.
-    # The Dockerfile still controls this environment and checker (GW-3).
-    anchor = wrapper_sha256 if wrapper_sha256 is not None else os.environ.get(
-        "LUNARWING_WRAPPER_SHA256", ""
+    """Verify the installed wrapper and binary, in-image or from a tar export."""
+    environment = os.environ if environ is None else environ
+    installed = _read_installed_wrapper(
+        lane,
+        wrapper_path,
+        environment,
+        owner_uid=owner_uid,
+        wrapper_sha256=wrapper_sha256,
+        image_root=image_root,
+        image_metadata=image_metadata,
     )
-    installed_digest = hashlib.sha256(installed).hexdigest()
-    if not anchor:
-        fail("LUNARWING_WRAPPER_SHA256 (the checkout's wrapper digest) is missing — "
-             "the installed wrapper cannot be anchored (run-106 GJ-3a)")
+    if installed is None:
         return
-    if anchor != installed_digest:
-        fail(f"installed wrapper {wrapper_path} digest {installed_digest} does not "
-             f"match the LUNARWING_WRAPPER_SHA256 build-arg anchor — rewritten "
-             "together with the in-image reference (run-106 GJ-3a)")
-        return
-    # !1735 review KG-3 / !1699 JE-3: the updater ignores the lane config's
-    # "update": "disable" pin (it reads only the global config dir, never
-    # OPENCODE_CONFIG), so the image env must carry the kill switch the
-    # updater actually honours (updater.ts inspect() gate).
-    if os.environ.get("OPENCODE_DISABLE_AUTOUPDATE") != "1":
-        fail("OPENCODE_DISABLE_AUTOUPDATE=1 must be set in the image environment — "
-             "the updater ignores the lane config's update pin")
-        return
-    # Run-106 GJ-3(b): the wrapper honours LUNARWING_REAL_OPENCODE over the
-    # default binary path, so an ENV pointing it elsewhere would exec that
-    # path at runtime while this check scans only binary_path. Only the
-    # default passes at build time; a foreign value fails AND is scanned so
-    # the report says what sits at the override target.
-    real_override = os.environ.get("LUNARWING_REAL_OPENCODE", "")
-    if real_override and pathlib.Path(real_override) != binary_path:
-        fail(f"LUNARWING_REAL_OPENCODE={real_override!r} is set at build time — the "
-             f"wrapper would exec that instead of {binary_path} (run-106 GJ-3b)")
-        check_binary(pathlib.Path(real_override))
-    resolved = shutil.which("opencode")
-    if resolved is None or pathlib.Path(resolved) != wrapper_path:
-        fail(f"'opencode' on PATH must resolve to the wrapper {wrapper_path} "
-             f"(got {resolved!r}) — an earlier PATH dir shadows the guard")
-        return
+    _check_wrapper_environment(environment, wrapper_path, binary_path, image_root)
+    if check_path_resolution:
+        resolved = shutil.which("opencode", path=environment.get("PATH"))
+        if resolved is None or pathlib.Path(resolved) != wrapper_path:
+            fail(f"'opencode' on PATH must resolve to the wrapper {wrapper_path} "
+                 f"(got {resolved!r}) — an earlier PATH dir shadows the guard")
+            return
+    _check_real_binary_metadata(
+        "real binary",
+        binary_path,
+        owner_uid=owner_uid,
+        image_root=image_root,
+        image_metadata=image_metadata,
+    )
+    for label, path in (("wrapper", wrapper_path), ("real binary", binary_path)):
+        _check_parent_directories(
+            label,
+            path,
+            owner_uid=owner_uid,
+            parent_root=parent_root,
+            image_root=image_root,
+            image_metadata=image_metadata,
+        )
     check_binary(binary_path)
     if not failures:
         check(f"installed wrapper {wrapper_path} is the exposure guard "
               "and the real binary carries no tunnel markers")
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--lane",
-        type=pathlib.Path,
-        default=LANE_ROOT,
-        help="worker lane root (default: this script's lane)",
-    )
-    parser.add_argument(
-        "--binary",
-        type=pathlib.Path,
-        default=None,
-        help="built opencode binary to scan for OpenTunnel markers (image builds)",
-    )
-    parser.add_argument(
-        "--image-filesystem",
-        action="store_true",
-        help="verify installed policy-file ownership/modes (image builds only)",
-    )
-    parser.add_argument(
-        "--config",
-        default=None,
-        help="lane config filename (default: opencode2.json for the v2 lane, opencode.json otherwise)",
-    )
-    parser.add_argument(
-        "--profile",
-        choices=("opencode2", "opencode-v1"),
-        default=None,
-        help="lane profile (default: infer from the lane directory name; "
-        "required when the lane is unpacked under a generic name like /app)",
-    )
-    args = parser.parse_args()
+def _json_object(path: pathlib.Path, label: str) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ValueError(f"cannot read {label} {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} {path} must contain a JSON object")
+    return value
 
+
+def _out_of_band_inputs(args: argparse.Namespace) -> tuple[dict | None, dict | None]:
+    if args.image_root is None:
+        if args.image_metadata is not None or args.image_env_file is not None:
+            raise ValueError("--image-metadata and --image-env-file require --image-root")
+        return None, None
+    if not args.image_filesystem:
+        raise ValueError("--image-root requires --image-filesystem")
+    if args.image_metadata is None or args.image_env_file is None:
+        raise ValueError("--image-root requires --image-metadata and --image-env-file")
+
+    metadata = _json_object(args.image_metadata, "image metadata")
+    for key, record in metadata.items():
+        path = pathlib.PurePosixPath(key)
+        canonical = "" if key == "" else path.as_posix()
+        if key != canonical or path.is_absolute() or ".." in path.parts:
+            raise ValueError(f"image metadata has a non-canonical path {key!r}")
+        if not isinstance(record, dict) or any(
+            type(record.get(field)) is not int or record[field] < 0
+            for field in ("mode", "uid", "gid")
+        ):
+            raise ValueError(f"image metadata for {key!r} needs integer mode/uid/gid")
+    environment = _json_object(args.image_env_file, "image environment")
+    allowed = {
+        "LUNARWING_WRAPPER_SHA256", "OPENCODE_DISABLE_AUTOUPDATE",
+        "LUNARWING_REAL_OPENCODE", "OPENCODE_BIN",
+    }
+    if any(not isinstance(key, str) or key not in allowed for key in environment):
+        raise ValueError("image environment file carries an unapproved key")
+    if any(not isinstance(value, str) for value in environment.values()):
+        raise ValueError("image environment values must be strings")
+    return metadata, environment
+
+
+def _argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--lane", type=pathlib.Path, default=LANE_ROOT)
+    parser.add_argument("--binary", type=pathlib.Path, default=None)
+    parser.add_argument("--image-filesystem", action="store_true")
+    parser.add_argument("--image-root", type=pathlib.Path, default=None)
+    parser.add_argument("--image-metadata", type=pathlib.Path, default=None)
+    parser.add_argument("--image-env-file", type=pathlib.Path, default=None)
+    parser.add_argument("--config", default=None)
+    parser.add_argument("--profile", choices=("opencode2", "opencode-v1"), default=None)
+    return parser
+
+
+def main() -> int:
+    args = _argument_parser().parse_args()
     lane = args.lane
     if not lane.is_dir():
         print(f"FAIL: lane root {lane} is not a directory", file=sys.stderr)
         return 1
-
     profile = args.profile or ("opencode2" if lane.name.startswith("opencode2") else "opencode-v1")
     is_v2 = profile == "opencode2"
+    try:
+        image_metadata, image_environment = _out_of_band_inputs(args)
+    except ValueError as error:
+        print(f"FAIL: {error}", file=sys.stderr)
+        return 1
+    if args.image_root is not None and not is_v2:
+        print("FAIL: --image-root is supported only for the opencode2 profile", file=sys.stderr)
+        return 1
 
     config_name = args.config or ("opencode2.json" if is_v2 else "opencode.json")
     check_config(lane, config_name, is_v2)
@@ -422,9 +604,23 @@ def main() -> int:
     if args.binary is not None:
         check_binary(args.binary)
     if args.image_filesystem:
-        check_image_filesystem(lane)
+        check_image_filesystem(
+            lane, image_root=args.image_root, image_metadata=image_metadata
+        )
         if is_v2:
-            check_installed_wrapper(lane)
+            if args.image_root is not None:
+                check_installed_wrapper(
+                    lane,
+                    args.image_root / "usr/local/bin/opencode",
+                    args.image_root / "usr/local/lib/opencode2/opencode",
+                    check_path_resolution=False,
+                    parent_root=args.image_root,
+                    environ=image_environment,
+                    image_root=args.image_root,
+                    image_metadata=image_metadata,
+                )
+            else:
+                check_installed_wrapper(lane)
 
     if failures:
         print(f"exposure policy: {len(failures)} check(s) FAILED for {lane}", file=sys.stderr)
