@@ -3855,6 +3855,71 @@ async fn memory_write_read_roundtrip_and_mission_path_guard() {
     );
 }
 
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn proxied_memory_write_rejects_control_bearing_paths() {
+    let (db, _tmp) = test_db().await;
+    let workspace = Arc::new(Workspace::new_with_db("tenant-user", db));
+    let tools = Arc::new(lunarwing::tools::ToolRegistry::new());
+    tools
+        .register(Arc::new(MemoryWriteTool::from_workspace(workspace.clone())))
+        .await;
+
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::ToolProxy {
+        calls: vec![
+            (
+                "memory_write".to_string(),
+                serde_json::json!({
+                    "target": "notes/forged\ncontinuation.md",
+                    "content": "must not persist",
+                    "append": false,
+                }),
+            ),
+            (
+                "memory_write".to_string(),
+                serde_json::json!({
+                    "target": "notes/append\u{85}.md",
+                    "content": "must not persist",
+                    "append": true,
+                }),
+            ),
+            (
+                "memory_write".to_string(),
+                serde_json::json!({
+                    "target": "notes/trimmed-carriage-return\r",
+                    "content": "must not persist",
+                    "append": false,
+                }),
+            ),
+        ],
+        replies: reply_tx,
+    })
+    .await;
+
+    let mut config = config_for(&url);
+    config.tool_allowlist = vec!["memory_write".to_string()];
+    let mgr = ExternalWorkerManager::new(vec![config]).with_tool_proxy(test_proxy(tools));
+    let replies = run_proxy_task(&mgr, Uuid::new_v4(), &mut reply_rx, 3).await;
+
+    for reply in replies {
+        assert_eq!(reply["payload"]["status"], "error", "{reply}");
+        let error = reply["payload"]["error"].as_str().expect("error text");
+        assert!(error.contains("control characters"), "{reply}");
+        assert!(
+            !error.chars().any(char::is_control),
+            "worker error must not carry a raw control character: {reply}"
+        );
+    }
+    assert!(
+        workspace
+            .list_all()
+            .await
+            .expect("list after refused worker writes")
+            .is_empty()
+    );
+}
+
 // ── MR !1533 review (DP-1/DP-2/DP-3/DP-5): hardening pins ────────────
 
 #[tokio::test]

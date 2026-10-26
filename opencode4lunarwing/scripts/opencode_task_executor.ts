@@ -29,12 +29,10 @@ const OPENCODE_BASE_URL = `http://${OPENCODE_HOST}:${OPENCODE_PORT}`
 const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || "/workspace"
 
 /**
- * Task `context.environment` stays on the request only (NU-1): it is never
- * merged into the bridge's process.env. The serve process is started by the
- * entrypoint with its own scrubbed environment, so these values do not reach
- * task code on this lane (WI#474); merging them here only changed shared
- * bridge lazy reads. The v1 serve-log scrub uses the per-task values
- * explicitly (run-92 FJ-6).
+ * The entrypoint starts serve with a separate environment, so this lane has
+ * no per-task delivery path for `context.environment`. Reject non-empty maps
+ * before creating a session (WI#474), and never merge them into the bridge's
+ * shared process.env (NU-1).
  */
 
 const RETRY_PROMPT =
@@ -106,8 +104,7 @@ function emptyOutputError(deniedPermissions: number): string {
   return "opencode completed without assistant text or tool output"
 }
 
-// Values that must never survive into a job record via the serve-log tail:
-// the bridge's own credential env plus everything this task injected.
+// Values that must never survive into a job record via the serve-log tail.
 // Beyond the fixed names, any env name matching the secret patterns is
 // selected too, so credentials mt-admin injects via --env-file or compose
 // EXTRA_ENV_FILE (provider keys and friends) are covered (run-92 FJ-6).
@@ -134,18 +131,12 @@ function secretEnvValues(env: Record<string, string | undefined>): string[] {
   return values
 }
 
-// Snapshot at module load: task context.environment values stay on the
-// request (NU-1) and are scrubbed from the per-task map, so they never replace
-// the bridge's boot env — the boot value is the one serve actually logs
-// (run-92 FJ-6).
+// Snapshot at module load: the boot value is the one serve actually logs.
+// Task environment maps are rejected before serve-log enrichment (WI#474).
 const BOOT_SECRET_ENV_VALUES = secretEnvValues(process.env)
 
-function secretScrubValues(request: TaskRequest): string[] {
-  const values = [...BOOT_SECRET_ENV_VALUES]
-  for (const value of Object.values(request.context?.environment ?? {})) {
-    if (typeof value === "string" && value.length > 0) values.push(value)
-  }
-  return values
+function secretScrubValues(): string[] {
+  return [...BOOT_SECRET_ENV_VALUES]
 }
 
 function createSdk(directory?: string): OpencodeClient {
@@ -175,6 +166,17 @@ export async function executeTask(
   followups?: FollowupQueue,
 ): Promise<void> {
   const startTime = Date.now()
+  if (Object.keys(request.context?.environment ?? {}).length > 0) {
+    if (followups) followups.closed = true
+    onResult({
+      task_id: request.task_id,
+      status: "error",
+      output: "",
+      error: "credential grants are not supported by OpenCode workers; resubmit without credentials or use kimi/pebble",
+      duration_ms: Date.now() - startTime,
+    })
+    return
+  }
   const timeoutMs = request.timeout_ms ?? DEFAULT_TIMEOUT_MS
   const maxProviderRetries = providerMaxRetries()
   const retryDelayMs = providerRetryDelayMs()
@@ -628,7 +630,7 @@ export async function executeTask(
         : await withServeLogDetail(errorMsg, {
             ref: serverErrorRef ?? opencodeErrorRef(err),
             startOffset: serveLogStart,
-            secrets: secretScrubValues(request),
+            secrets: secretScrubValues(),
           })
     }
     onResult({

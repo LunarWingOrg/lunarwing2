@@ -143,6 +143,16 @@ class LockDeltaTests(unittest.TestCase):
         self.assertIn("pebble4lunarwing/scripts/verify_upstream_lock.py\n", build_script)
         self.assertNotIn("PEBBLE_LOCK_SHA256=", build_script)  # CI uses the reviewed default too.
 
+    def test_request_events_patch_is_a_checked_build_input(self):
+        patch = "pebble4lunarwing/patches/wi477-request-events.patch"
+        self.assertTrue((ROOT / patch).is_file())
+        dockerfile = (ROOT / "pebble4lunarwing/Dockerfile").read_text(encoding="utf-8")
+        self.assertIn(f"COPY {patch} /tmp/wi477-request-events.patch", dockerfile)
+        self.assertIn("git -C /build/pebble apply --check /tmp/wi477-request-events.patch", dockerfile)
+        self.assertIn("git -C /build/pebble apply /tmp/wi477-request-events.patch", dockerfile)
+        build_script = (ROOT / ".gitlab/scripts/build-worker-image.sh").read_text(encoding="utf-8")
+        self.assertIn(f"{patch}\n", build_script)
+
     def test_matching_digest_does_not_authorize_package_addition(self):
         with tempfile.TemporaryDirectory() as temporary:
             upstream = pathlib.Path(temporary) / "upstream.lock"

@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::process::Stdio;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -129,6 +130,88 @@ pub enum ExecutorEvent {
     Result(Envelope),
 }
 
+fn bounded_env_u64(name: &str, fallback: u64, min: u64, max: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(fallback, |value| value.clamp(min, max))
+}
+
+fn progress_heartbeat_ms() -> u64 {
+    bounded_env_u64("PEBBLE_PROGRESS_HEARTBEAT_MS", 120_000, 0, 300_000)
+}
+
+fn llm_request_timeout_secs() -> u64 {
+    bounded_env_u64("PEBBLE_API_TIMEOUT_SECS", 600, 1, 86_400)
+}
+
+struct RequestState {
+    index: u64,
+    started: Instant,
+    awaiting: bool,
+}
+
+impl RequestState {
+    fn new() -> Self {
+        Self {
+            index: 1,
+            started: Instant::now(),
+            awaiting: true,
+        }
+    }
+}
+
+type SharedRequestState = Arc<Mutex<RequestState>>;
+
+struct StreamOptions {
+    timeout_ms: u64,
+    heartbeat_ms: u64,
+    request_state: SharedRequestState,
+}
+
+fn request_marker(state: &SharedRequestState, line: &str) -> Option<String> {
+    if line.starts_with("[llm-retry]") {
+        let index = state.lock().map_or(0, |state| state.index);
+        return Some(format!(
+            "[worker] LLM request {index} retry reported by Pebble; task remains active."
+        ));
+    }
+    let mut parts = line.split_whitespace();
+    let (Some("[llm-request]"), Some("request"), Some(index), Some(event), None) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return None;
+    };
+    let index = index.parse::<u64>().ok()?;
+    let mut state = state.lock().ok()?;
+    match event {
+        "started" => {
+            state.index = index;
+            state.started = Instant::now();
+            state.awaiting = true;
+        }
+        "finished" if state.index == index => state.awaiting = false,
+        _ => return None,
+    }
+    None
+}
+
+fn heartbeat_delta(state: &SharedRequestState) -> Option<String> {
+    let state = state.lock().ok()?;
+    if !state.awaiting {
+        return None;
+    }
+    Some(format!(
+        "[worker] Still waiting for Pebble response; request {} elapsed {}s; task remains active.",
+        state.index,
+        state.started.elapsed().as_secs()
+    ))
+}
+
 pub async fn run_task(
     config: &ExecutorConfig,
     request: &protocol::TaskRequest,
@@ -136,10 +219,31 @@ pub async fn run_task(
     cancel_rx: tokio::sync::oneshot::Receiver<()>,
     proxy_env: Option<&[(String, String); 2]>,
 ) {
+    run_task_with_options(
+        config,
+        request,
+        event_tx,
+        cancel_rx,
+        proxy_env,
+        progress_heartbeat_ms(),
+        llm_request_timeout_secs(),
+    )
+    .await;
+}
+
+async fn run_task_with_options(
+    config: &ExecutorConfig,
+    request: &protocol::TaskRequest,
+    event_tx: mpsc::UnboundedSender<ExecutorEvent>,
+    cancel_rx: tokio::sync::oneshot::Receiver<()>,
+    proxy_env: Option<&[(String, String); 2]>,
+    heartbeat_ms: u64,
+    timeout_secs: u64,
+) {
     let start = Instant::now();
     let timeout_ms = request.timeout_ms.unwrap_or(protocol::DEFAULT_TIMEOUT_MS);
 
-    let mut child = match spawn_pebble(config, request, proxy_env) {
+    let mut child = match spawn_pebble_with_options(config, request, proxy_env, timeout_secs) {
         Ok(child) => {
             eprintln!(
                 "[exec] {}: spawned pebble pid={:?}",
@@ -167,21 +271,39 @@ pub async fn run_task(
     let task_id = request.task_id.clone();
     let tx_stderr = event_tx.clone();
     let task_id_stderr = task_id.clone();
+    let request_state = Arc::new(Mutex::new(RequestState::new()));
+    let request_state_stderr = Arc::clone(&request_state);
 
     let stderr_handle = tokio::spawn(async move {
         let mut reader = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = reader.next_line().await {
             if !line.trim().is_empty() {
+                let retry = request_marker(&request_state_stderr, &line);
                 let _ = tx_stderr.send(ExecutorEvent::Progress(protocol::progress_envelope(
                     &task_id_stderr,
                     &format!("[stderr] {line}"),
                 )));
+                if let Some(retry) = retry {
+                    let _ = tx_stderr.send(ExecutorEvent::Progress(protocol::progress_envelope(
+                        &task_id_stderr,
+                        &retry,
+                    )));
+                }
             }
         }
     });
 
     let (outcome, accumulated_output, final_message) = stream_stdout(
-        stdout, &task_id, &event_tx, timeout_ms, cancel_rx, &mut child,
+        stdout,
+        &task_id,
+        &event_tx,
+        cancel_rx,
+        &mut child,
+        StreamOptions {
+            timeout_ms,
+            heartbeat_ms,
+            request_state,
+        },
     )
     .await;
     eprintln!("[exec] {}: stdout stream ended", request.task_id);
@@ -283,10 +405,20 @@ fn refuse_shared_identity(task_ids: Option<(u32, u32)>) -> Result<(), std::io::E
     Ok(())
 }
 
+#[cfg(test)]
 fn spawn_pebble(
     config: &ExecutorConfig,
     request: &protocol::TaskRequest,
     proxy_env: Option<&[(String, String); 2]>,
+) -> Result<tokio::process::Child, std::io::Error> {
+    spawn_pebble_with_options(config, request, proxy_env, llm_request_timeout_secs())
+}
+
+fn spawn_pebble_with_options(
+    config: &ExecutorConfig,
+    request: &protocol::TaskRequest,
+    proxy_env: Option<&[(String, String); 2]>,
+    timeout_secs: u64,
 ) -> Result<tokio::process::Child, std::io::Error> {
     let requested_dir = request
         .context
@@ -406,6 +538,8 @@ fn spawn_pebble(
             cmd.env(key, value);
         }
     }
+    cmd.env("PEBBLE_API_TIMEOUT_SECS", timeout_secs.to_string());
+    cmd.env("PEBBLE_LUNARWING_REQUEST_EVENTS", "1");
 
     cmd.spawn()
 }
@@ -456,39 +590,52 @@ async fn stream_stdout(
     stdout: tokio::process::ChildStdout,
     task_id: &str,
     event_tx: &mpsc::UnboundedSender<ExecutorEvent>,
-    timeout_ms: u64,
     mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
     child: &mut tokio::process::Child,
+    options: StreamOptions,
 ) -> (Outcome, String, Option<String>) {
-    let timeout = tokio::time::Duration::from_millis(timeout_ms);
+    let deadline = tokio::time::sleep(Duration::from_millis(options.timeout_ms));
+    tokio::pin!(deadline);
+    let mut heartbeat = tokio::time::interval(Duration::from_millis(options.heartbeat_ms.max(1)));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    heartbeat.tick().await;
     let mut accumulated_output = String::new();
     let mut final_message: Option<String> = None;
     let mut reader = BufReader::new(stdout).lines();
 
-    let outcome = tokio::select! {
-        result = async {
-            while let Ok(Some(line)) = reader.next_line().await {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                if let Some(early) = process_json_line(
-                    &line, task_id, event_tx, &mut accumulated_output, &mut final_message,
-                ) {
-                    return early;
+    let outcome = loop {
+        tokio::select! {
+            line = reader.next_line() => {
+                match line {
+                    Ok(Some(line)) => {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        if let Some(early) = process_json_line(
+                            &line, task_id, event_tx, &mut accumulated_output, &mut final_message,
+                        ) {
+                            break early;
+                        }
+                    }
+                    Ok(None) | Err(_) => break Outcome::Completed,
                 }
             }
-            Outcome::Completed
-        } => result,
-
-        () = tokio::time::sleep(timeout) => {
-            let _ = child.kill().await;
-            Outcome::Timeout
-        },
-
-        _ = &mut cancel_rx => {
-            let _ = child.kill().await;
-            Outcome::Cancelled
-        },
+            _ = heartbeat.tick(), if options.heartbeat_ms > 0 => {
+                if let Some(delta) = heartbeat_delta(&options.request_state) {
+                    let _ = event_tx.send(ExecutorEvent::Progress(protocol::progress_envelope(
+                        task_id, &delta,
+                    )));
+                }
+            }
+            () = &mut deadline => {
+                let _ = child.kill().await;
+                break Outcome::Timeout;
+            }
+            _ = &mut cancel_rx => {
+                let _ = child.kill().await;
+                break Outcome::Cancelled;
+            }
+        }
     };
 
     (outcome, accumulated_output, final_message)
@@ -1498,5 +1645,93 @@ mod tests {
         let path = std::ffi::OsString::from(format!("{rel_name}:{}", abs_dir.display()));
         let resolved = resolve_setpriv_in(&path).expect("absolute entry resolves");
         assert_eq!(resolved, abs_stub.as_os_str());
+    }
+
+    #[tokio::test]
+    async fn request_events_drive_heartbeat_retry_and_timeout() {
+        struct Cleanup(std::path::PathBuf, std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                std::fs::remove_file(&self.0).ok();
+                std::fs::remove_dir_all(&self.1).ok();
+            }
+        }
+
+        let exe_dir = std::env::current_exe()
+            .expect("test binary path")
+            .parent()
+            .expect("exe directory")
+            .to_path_buf();
+        let prefix = format!("pebble-wi477-{}", std::process::id());
+        let stub = exe_dir.join(format!("{prefix}-probe.sh"));
+        let root = exe_dir.join(format!("{prefix}-root"));
+        let _cleanup = Cleanup(stub.clone(), root.clone());
+        std::fs::create_dir_all(&root).expect("create workspace root");
+        std::fs::write(
+            &stub,
+            r#"#!/bin/sh
+printf '%s\n' '[llm-request] request 1 started' >&2
+printf '%s\n' '[llm-request] request 1 finished' >&2
+printf '%s\n' '[llm-request] request 2 started' >&2
+printf 'timeout=%s events=%s\n' "${PEBBLE_API_TIMEOUT_SECS-unset}" "${PEBBLE_LUNARWING_REQUEST_EVENTS-unset}" >&2
+printf '%s\n' '[llm-retry] attempt 1 failed; retrying' >&2
+exec sleep 1
+"#,
+        )
+        .expect("write request-event probe");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("make request-event probe executable");
+
+        let config = ExecutorConfig {
+            pebble_bin: stub.to_string_lossy().into_owned(),
+            model: "m".to_string(),
+            permission_mode: "danger-full-access".to_string(),
+            workspace_root: root.to_string_lossy().into_owned(),
+        };
+        let mut req = request("hold request two", vec![]);
+        req.task_id = "wi477-request-events".to_string();
+        req.timeout_ms = Some(120);
+        req.context.environment = HashMap::from([
+            ("PEBBLE_API_TIMEOUT_SECS".to_string(), "999".to_string()),
+            (
+                "PEBBLE_LUNARWING_REQUEST_EVENTS".to_string(),
+                "0".to_string(),
+            ),
+        ]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+
+        run_task_with_options(&config, &req, tx, cancel_rx, None, 20, 17).await;
+
+        let mut progress = Vec::new();
+        let mut result = None;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                ExecutorEvent::Progress(envelope) => progress.push(
+                    envelope.payload["delta"]
+                        .as_str()
+                        .expect("progress delta")
+                        .to_string(),
+                ),
+                ExecutorEvent::Result(envelope) => result = Some(envelope.payload),
+            }
+        }
+        assert!(
+            progress.iter().any(|delta| {
+                delta.starts_with("[worker] Still waiting for Pebble response; request 2 elapsed ")
+                    && delta.ends_with("s; task remains active.")
+            }),
+            "missing request-two heartbeat: {progress:?}"
+        );
+        assert!(progress.iter().any(|delta| {
+            delta == "[worker] LLM request 2 retry reported by Pebble; task remains active."
+        }));
+        assert!(progress
+            .iter()
+            .any(|delta| delta == "[stderr] timeout=17 events=1"));
+        assert!(!progress.iter().any(|delta| delta.contains("timeout=999")));
+        let result = result.expect("terminal result");
+        assert_eq!(result["status"].as_str(), Some("error"));
+        assert_eq!(result["error"].as_str(), Some("task timed out after 120ms"));
     }
 }

@@ -51,6 +51,14 @@ use mt-admin's runtime-backed status lines on both systemd user managers and
 OpenRC, so active daemon units cannot hide a broken Podman store or missing
 worker. Verification failure fails the onboarding job/CLI exit.
 
+Managed OpenCode and OpenCode 2 worker entries include
+`supports_credentials = false` (WI#474, !1943 ON-1). Config reconciliation also
+sets it on existing entries; reload by restarting the tenant daemon through
+mt-admin. `create_job` then refuses non-empty grants before secret lookup or
+decryption. Other workers retain the default `true`. Unmanaged or renamed
+OpenCode entries require the same explicit flag; the worker-side rejection alone
+still receives plaintext grants. See `docs/ops/WORKER-CONTAINERS.md`.
+
 ---
 
 ## Startup Sequence (main.rs)

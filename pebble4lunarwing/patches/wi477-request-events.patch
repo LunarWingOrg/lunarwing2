@@ -1,0 +1,74 @@
+--- a/crates/pebble/src/runtime_client.rs
++++ b/crates/pebble/src/runtime_client.rs
+@@ -55,6 +55,33 @@
+     }
+ }
+ 
++fn request_events_enabled() -> bool {
++    std::env::var_os("PEBBLE_LUNARWING_REQUEST_EVENTS").is_some()
++}
++
++struct LlmRequestEventGuard {
++    index: u64,
++    enabled: bool,
++}
++
++impl LlmRequestEventGuard {
++    fn new(index: u64) -> Self {
++        let enabled = request_events_enabled();
++        if enabled {
++            eprintln!("[llm-request] request {index} started");
++        }
++        Self { index, enabled }
++    }
++}
++
++impl Drop for LlmRequestEventGuard {
++    fn drop(&mut self) {
++        if self.enabled {
++            eprintln!("[llm-request] request {} finished", self.index);
++        }
++    }
++}
++
+ pub(crate) struct PebbleRuntimeClient {
+     runtime: tokio::runtime::Runtime,
+     service: ApiService,
+@@ -68,6 +95,7 @@
+     reasoning_effort: Option<ReasoningEffort>,
+     fast_mode: FastMode,
+     render_output: bool,
++    next_request_index: u64,
+ }
+ 
+ impl PebbleRuntimeClient {
+@@ -97,6 +125,7 @@
+             reasoning_effort,
+             fast_mode,
+             render_output,
++            next_request_index: 1,
+         })
+     }
+ }
+@@ -111,6 +140,9 @@
+         request: ApiRequest,
+         cancellation: &CancellationToken,
+     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
++        let request_index = self.next_request_index;
++        self.next_request_index = self.next_request_index.saturating_add(1);
++        let _request_events = LlmRequestEventGuard::new(request_index);
+         if self.service == ApiService::Grok {
+             return self.stream_via_grok_cli(request, cancellation);
+         }
+--- a/crates/api/src/client.rs
++++ b/crates/api/src/client.rs
+@@ -565,6 +565,9 @@
+     }
+ 
+     fn backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
++        if std::env::var_os("PEBBLE_LUNARWING_REQUEST_EVENTS").is_some() {
++            eprintln!("[llm-retry] attempt {attempt} failed; retrying");
++        }
+         let Some(multiplier) = 1_u32.checked_shl(attempt.saturating_sub(1)) else {
+             return Err(ApiError::BackoffOverflow {
+                 attempt,

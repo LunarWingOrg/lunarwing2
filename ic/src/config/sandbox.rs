@@ -575,6 +575,9 @@ pub struct ExternalWorkerConfig {
     pub url: String,
     pub auth_token: Option<SecretString>,
     pub timeout_ms: u64,
+    /// Can deliver per-task credential grants. False rejects them host-side
+    /// before secret lookup/decryption or task reservation (WI#474 ON-1).
+    pub supports_credentials: bool,
     /// Multiple endpoints for load-balanced workers.
     /// When non-empty, `url`/`auth_token` are treated as fallback only.
     pub endpoints: Vec<WorkerEndpoint>,
@@ -628,6 +631,7 @@ impl Default for ExternalWorkerConfig {
             auth_token: None,
             // Mirrors `default_external_worker_timeout` in settings.rs.
             timeout_ms: 3_600_000,
+            supports_credentials: true,
             endpoints: Vec::new(),
             load_balance: LoadBalanceStrategy::default(),
             prompt_context: PromptContextLimits::default(),
@@ -664,6 +668,7 @@ impl ExternalWorkerConfig {
                     url: ew.url.clone(),
                     auth_token: ew.auth_token.clone(),
                     timeout_ms: ew.timeout_ms,
+                    supports_credentials: ew.supports_credentials,
                     endpoints: ew.endpoints.clone(),
                     load_balance: ew.load_balance.clone(),
                     prompt_context,
@@ -1172,6 +1177,32 @@ timeout_ms = 3600000
         );
         assert_eq!(workers[0].timeout_ms, 3_600_000);
         assert_eq!(workers[0].prompt_context, PromptContextLimits::default());
+    }
+
+    #[test]
+    fn external_worker_credentials_capability_resolves_without_name_inference() {
+        let settings: crate::settings::Settings = toml::from_str(
+            r#"
+[[sandbox.external_workers]]
+name = "kimi"
+url = "ws://127.0.0.1:10001/ws/agent"
+[[sandbox.external_workers]]
+name = "opencode"
+url = "ws://127.0.0.1:10002/ws/agent"
+supports_credentials = false
+[[sandbox.external_workers]]
+name = "custom-serve-worker"
+url = "ws://127.0.0.1:10003/ws/agent"
+supports_credentials = false
+"#,
+        )
+        .expect("config parses");
+        let workers = ExternalWorkerConfig::resolve_from_settings(&settings);
+        assert_eq!(workers.len(), 3);
+        assert!(workers[0].supports_credentials);
+        assert!(!workers[1].supports_credentials);
+        assert!(!workers[2].supports_credentials);
+        assert!(ExternalWorkerConfig::default().supports_credentials);
     }
 
     #[test]

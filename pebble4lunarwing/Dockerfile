@@ -34,6 +34,11 @@ RUN printf '%s' "${PEBBLE_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
     git -C /build/pebble fetch --depth 1 origin "${PEBBLE_REF}" && \
     git -C /build/pebble checkout --detach FETCH_HEAD && \
     test "$(git -C /build/pebble rev-parse HEAD)" = "${PEBBLE_REF}"
+# WI#477: opt-in request lifecycle markers let the bridge report accurate
+# request indexes and native retry outcomes without changing normal CLI JSON.
+COPY pebble4lunarwing/patches/wi477-request-events.patch /tmp/wi477-request-events.patch
+RUN git -C /build/pebble apply --check /tmp/wi477-request-events.patch && \
+    git -C /build/pebble apply /tmp/wi477-request-events.patch
 # The pinned upstream checkout ships rustls 0.23.41, which is affected by
 # RUSTSEC-2026-0285 (fixed >= 0.23.45). WI#409 raises the override to 0.23.46
 # for RUSTSEC-2026-0346/0347/0348/0349. Upstream also pins chacha20 0.10.1,

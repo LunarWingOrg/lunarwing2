@@ -898,6 +898,10 @@ pub struct ExternalWorkerSettings {
     /// Default task timeout in milliseconds.
     #[serde(default = "default_external_worker_timeout")]
     pub timeout_ms: u64,
+    /// Whether this worker can deliver per-task credential grants. Defaults to
+    /// true for compatibility; set false for OpenCode's separate serve process.
+    #[serde(default = "default_true")]
+    pub supports_credentials: bool,
     /// Multiple endpoints for load-balanced workers.
     /// When non-empty, `url`/`auth_token` are treated as fallback only.
     #[serde(default)]
@@ -2271,6 +2275,34 @@ max_total_chars = 9000
             base.sandbox.external_workers[0].url,
             "ws://localhost:9090/ws/agent"
         );
+    }
+
+    #[test]
+    fn external_worker_credentials_capability_survives_settings_roundtrips() {
+        let settings: Settings = toml::from_str(
+            r#"
+[[sandbox.external_workers]]
+name = "pebble"
+url = "ws://localhost:9090/ws/agent"
+[[sandbox.external_workers]]
+name = "opencode2"
+url = "ws://localhost:9091/ws/agent"
+supports_credentials = false
+"#,
+        )
+        .unwrap();
+        assert!(settings.sandbox.external_workers[0].supports_credentials);
+        assert!(!settings.sandbox.external_workers[1].supports_credentials);
+        let mut merged = Settings::default();
+        merged.merge_from(&settings);
+        let restored = Settings::from_db_map(&merged.to_db_map());
+        assert!(!restored.sandbox.external_workers[1].supports_credentials);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        restored.save_toml(&path).unwrap();
+        let reloaded: Settings = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert!(reloaded.sandbox.external_workers[0].supports_credentials);
+        assert!(!reloaded.sandbox.external_workers[1].supports_credentials);
     }
 
     #[test]

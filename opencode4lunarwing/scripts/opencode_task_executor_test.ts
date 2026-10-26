@@ -1378,15 +1378,14 @@ assert.equal(errorCloseQueue.closed, true, "error path must close the queue")
 // path resolution can be pointed at a fixture: a generic serve 500 (SDK shape
 // with cause.body.data.ref) is enriched with the structured-log line carrying
 // the same ref — only lines appended after the task started, with the
-// bridge's secrets scrubbed. The fixture secret is built at runtime so no
-// literal in this file trips secret-detection (run-92 FJ-3), and both secret
-// channels are covered: the boot env value (module-load snapshot, FJ-6) and
-// a task context.environment value scrubbed from the per-task map (NU-1 —
-// it is never merged into process.env).
+// bridge's secrets scrubbed. The fixture secrets are built at runtime so no
+// literal in this file trips secret-detection (run-92 FJ-3). Fixed-name and
+// pattern-only boot env values cover the module-load snapshot (FJ-6); task
+// environment maps are rejected before this path (WI#474).
 {
   const GENERIC_MSG = "Unexpected server error. Check server logs for details."
   const FIXTURE_SECRET = ["fixture", "scrub", "value", "0042"].join("-")
-  const FIXTURE_TASK_SECRET = ["task", "override", "value", "0043"].join("-")
+  const FIXTURE_PASSWORD_SECRET = ["task", "override", "value", "0043"].join("-")
   // Pattern-only name (no entry in the fixed key list): mt-admin injects
   // provider credentials like this via --env-file / EXTRA_ENV_FILE.
   const FIXTURE_PATTERN_SECRET = ["pattern", "only", "value", "0044"].join("-")
@@ -1397,7 +1396,7 @@ assert.equal(errorCloseQueue.closed, true, "error path must close the queue")
   const CRASH =
     `timestamp=2026-10-12T00:00:01.000Z level=ERROR run=run01 message=failed ref=${CRASH_REF} ` +
     `error=TypeError: undefined is not an object (evaluating 'a.name') token=${FIXTURE_SECRET} ` +
-    `key2=${FIXTURE_TASK_SECRET} pat=${FIXTURE_PATTERN_SECRET}`
+    `key2=${FIXTURE_PASSWORD_SECRET} pat=${FIXTURE_PATTERN_SECRET}`
   const dir = mkdtempSync(join(tmpdir(), "executor-serve-log-"))
   try {
     const logPath = join(dir, "opencode.log")
@@ -1424,7 +1423,7 @@ const sdk = {
 }
 const results = []
 await executeTask(
-  { task_id: "task-serve-log", prompt: "test", context: { environment: { TENSORZERO_API_KEY: ${JSON.stringify(FIXTURE_TASK_SECRET)} } } },
+  { task_id: "task-serve-log", prompt: "test" },
   () => {}, (r) => results.push(r), undefined, sdk,
 )
 console.log(JSON.stringify(results[0]?.error ?? ""))
@@ -1436,6 +1435,7 @@ console.log(JSON.stringify(results[0]?.error ?? ""))
         env: {
           ...process.env,
           OPENCODE_SERVE_LOG: logPath,
+          OPENCODE_SERVER_PASSWORD: FIXTURE_PASSWORD_SECRET,
           TENSORZERO_API_KEY: FIXTURE_SECRET,
           GITEA_TOKEN: FIXTURE_PATTERN_SECRET,
         },
@@ -1455,7 +1455,7 @@ console.log(JSON.stringify(results[0]?.error ?? ""))
       assert.ok(errorMessage.includes("TypeError: undefined is not an object"))
       assert.ok(!errorMessage.includes("earlier-tenant-task-failed"), "pre-task line leaked past the task-start offset")
       assert.ok(!errorMessage.includes(FIXTURE_SECRET), "boot secret survived the scrub")
-      assert.ok(!errorMessage.includes(FIXTURE_TASK_SECRET), "task env secret survived the scrub")
+      assert.ok(!errorMessage.includes(FIXTURE_PASSWORD_SECRET), "password secret survived the scrub")
       assert.ok(!errorMessage.includes(FIXTURE_PATTERN_SECRET), "pattern-named secret survived the scrub")
       assert.ok(errorMessage.includes("[redacted]"))
     }
@@ -1464,15 +1464,16 @@ console.log(JSON.stringify(results[0]?.error ?? ""))
   }
 }
 
-// NU-1: task grant entries (agent-chosen at create_job) are never merged into
-// the bridge's process.env — neither the reserved hub-credential names nor an
-// ordinary key may land in the shared env at prompt time. The v1 serve-log
-// scrub still reads the request's per-task values explicitly (FJ-6).
+// WI#474: task grant entries are rejected before any SDK/session activity.
+// The shared bridge env stays untouched (NU-1), the diagnostic carries no
+// grant values, and the follow-up queue closes on this early return.
 {
   const savedToken = process.env.AGENT_AUTH_TOKEN
   const savedTokenFile = process.env.AGENT_AUTH_TOKEN_FILE
+  const savedLegit = process.env.LEGIT_TASK_VAR
   process.env.AGENT_AUTH_TOKEN = "bridge-secret"
   delete process.env.AGENT_AUTH_TOKEN_FILE
+  delete process.env.LEGIT_TASK_VAR
   const warnings: string[] = []
   const savedWarn = console.warn
   console.warn = (...args: unknown[]) => {
@@ -1480,37 +1481,49 @@ console.log(JSON.stringify(results[0]?.error ?? ""))
   }
   try {
     const envSdk = makeSdk()
-    await runTask(envSdk.sdk, {
-      task_id: "task-env-reserved",
-      prompt: "read env",
-      context: {
-        environment: {
-          AGENT_AUTH_TOKEN: "forged-by-task",
-          AGENT_AUTH_TOKEN_FILE: "/run/lunarwing/agent_auth_token",
-          LEGIT_TASK_VAR: "kept",
+    const envResults: Array<{ status: string; output: string; error: string | null }> = []
+    const queue: FollowupQueue = { prompts: [], closed: false }
+    await executeTask(
+      {
+        task_id: "task-env-reserved",
+        prompt: "read env",
+        context: {
+          environment: {
+            AGENT_AUTH_TOKEN: "forged-by-task",
+            AGENT_AUTH_TOKEN_FILE: "/run/lunarwing/agent_auth_token",
+            LEGIT_TASK_VAR: "kept",
+          },
         },
       },
-    })
-    assert.equal(envSdk.promptEnvSnapshots.length, 1)
-    assert.deepEqual(
-      envSdk.promptEnvSnapshots[0],
-      { AGENT_AUTH_TOKEN: "bridge-secret", AGENT_AUTH_TOKEN_FILE: undefined, LEGIT_TASK_VAR: undefined },
-      "no task grant entry may land in the shared bridge env at prompt time",
+      () => {},
+      (result) => envResults.push(result),
+      undefined,
+      envSdk.sdk,
+      queue,
     )
-    // The bridge's own credential survives, and no ordinary key is injected
-    // (and therefore nothing needs restoring afterward).
-    assert.equal(process.env.AGENT_AUTH_TOKEN, "bridge-secret")
+    assert.equal(envResults.length, 1)
+    assert.equal(envResults[0]!.status, "error")
+    assert.equal(
+      envResults[0]!.error,
+      "credential grants are not supported by OpenCode workers; resubmit without credentials or use kimi/pebble",
+    )
+    assert.equal(envResults[0]!.output, "")
+    assert.equal(envSdk.signals.length, 0, "grant rejection must precede every SDK call")
+    assert.equal(envSdk.promptArgs.length, 0)
+    assert.equal(envSdk.promptEnvSnapshots.length, 0)
+    assert.equal(queue.closed, true)
+    assert.equal(process.env.AGENT_AUTH_TOKEN, "bridge-secret", "the bridge's own token must survive rejection")
     assert.equal(process.env.AGENT_AUTH_TOKEN_FILE, undefined)
     assert.equal(process.env.LEGIT_TASK_VAR, undefined)
-    const drops = warnings.filter((w) => w.includes("dropped task-supplied env entry"))
-    assert.equal(drops.length, 0, `no env-drop path should remain, got ${JSON.stringify(warnings)}`)
-    assert.ok(warnings.every((w) => !w.includes("forged-by-task")), "never log the value")
+    assert.ok(warnings.every((w) => !w.includes("forged-by-task") && !w.includes("kept")), "never log grant values")
   } finally {
     console.warn = savedWarn
     if (savedToken === undefined) delete process.env.AGENT_AUTH_TOKEN
     else process.env.AGENT_AUTH_TOKEN = savedToken
     if (savedTokenFile === undefined) delete process.env.AGENT_AUTH_TOKEN_FILE
     else process.env.AGENT_AUTH_TOKEN_FILE = savedTokenFile
+    if (savedLegit === undefined) delete process.env.LEGIT_TASK_VAR
+    else process.env.LEGIT_TASK_VAR = savedLegit
   }
 }
 
