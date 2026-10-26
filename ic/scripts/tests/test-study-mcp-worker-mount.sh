@@ -55,7 +55,16 @@ _register_worker_unit() { :; }
 # `test`, which has no account, so the egress step is stubbed; the mount policy
 # under test is unrelated to it and test-worker-egress.sh pins the real
 # behaviour.
-prepare_worker_egress() { :; }
+prepare_worker_egress() {
+  WORKER_EGRESS_LAUNCH_ARGS=(--network "lw-egress-$1" --dns 127.0.0.1)
+}
+worker_egress_container_attached() { return 0; }
+worker_egress_verify_after_start() { :; }
+worker_egress_state_get() {
+  [[ "$2" != "SUBNET" ]] || printf '10.89.10.0/24\n'
+  return 0
+}
+worker_egress_host_mappings() { :; }
 # WI#400: the opencode lane runs a root entrypoint (image USER 0:0) whose
 # serve/tasks drop to the task uid, so the stubbed image user is 0:0.
 container_image_user="0:0"

@@ -43,6 +43,11 @@ sudo() {
 }
 say() { :; }
 sanitize_name() { printf '%s' "$1"; }
+worker_egress_state_get() {
+  [[ "$2" != "SUBNET" ]] || printf '10.89.10.0/24\n'
+  return 0
+}
+worker_egress_host_mappings() { printf 'git.example.org:203.0.113.40\n'; }
 
 mkdir -p "$fixture/env" "$fixture/state" "$fixture/home/lunarwing" "$fixture/quadlets"
 chmod 700 "$fixture/env"
@@ -129,6 +134,11 @@ assert_contains "$quadlet" "Environment=AGENT_AUTH_TOKEN=${minted//%/%%}" 'quadl
 assert_not_contains "$quadlet" 'Environment=AGENT_AUTH_TOKEN=gate%%token' 'quadlet never inlines the gateway bearer'
 assert_contains "$quadlet" 'Exec=--mode websocket' 'quadlet selects websocket mode'
 assert_contains "$quadlet" 'HealthCmd=curl -sf http://127.0.0.1:8443/health' 'quadlet probes the health endpoint'
+assert_contains "$quadlet" 'Network=lw-egress-root' 'quadlet joins only the tenant egress network'
+assert_contains "$quadlet" 'DNS=127.0.0.1' 'quadlet pins an unserved loopback resolver'
+assert_contains "$quadlet" 'AddHost=git.example.org:203.0.113.40' 'quadlet installs static hosts from the resolved allowlist'
+assert_contains "$quadlet" 'ExecStartPre=/usr/local/libexec/lunarwing-worker-egress-guard /etc/lunarwing/worker-egress/root.nft rootless worker-root' 'quadlet runs the pre-start guard'
+assert_contains "$quadlet" 'ExecStartPost=/usr/local/libexec/lunarwing-worker-egress-guard --verify /etc/lunarwing/worker-egress/root.nft rootless worker-root' 'quadlet runs the post-start guard'
 
 # v1 worker's quadlet must be untouched by the opencode2 render.
 cat >"$env_file.bak" <<"EOF"
