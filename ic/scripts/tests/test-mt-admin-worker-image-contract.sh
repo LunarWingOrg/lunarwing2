@@ -482,6 +482,15 @@ for dir in kimicode4lunarwing opencode4lunarwing opencode2.4lunarwing pebble4lun
   printf 'FROM scratch\n' >"$repo/$dir/Dockerfile"
 done
 printf '#!/bin/sh\n' >"$repo/opencode2.4lunarwing/scripts/opencode-exposure-guard.sh"
+chmod 755 "$repo/opencode2.4lunarwing/scripts/opencode-exposure-guard.sh"
+cp -a "$HARNESS_REPO_ROOT/opencode2.4lunarwing/scripts/." "$repo/opencode2.4lunarwing/scripts/"
+cp -a "$HARNESS_REPO_ROOT/opencode2.4lunarwing/config" "$repo/opencode2.4lunarwing/"
+cp -a "$HARNESS_REPO_ROOT/opencode2.4lunarwing/entrypoint.sh" \
+  "$HARNESS_REPO_ROOT/opencode2.4lunarwing/health_server.py" \
+  "$HARNESS_REPO_ROOT/opencode2.4lunarwing/agent_comm_protocol.json" \
+  "$repo/opencode2.4lunarwing/"
+printf '\x7fELF clean pinned build\n' >"$fixture/real-opencode"
+chmod 755 "$fixture/real-opencode"
 printf 'fixture\n' >"$repo/README"
 git_fx=(git -C "$repo" -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false)
 "${git_fx[@]}" init -q
@@ -509,8 +518,64 @@ else
   fail 'source lookup retries as the checkout owner when root is refused'
 fi
 
-podman() { CALLS+=("podman:$*"); return 0; }
-docker() { CALLS+=("docker:$*"); return 0; }
+fake_worker_runtime() {
+  local runtime="$1" previous='' argument src dst rel
+  shift
+  CALLS+=("$runtime:$*")
+  case "${1:-}" in
+    build)
+      for argument in "$@"; do
+        if [[ "$previous" == --iidfile ]]; then
+          printf 'sha256:%064d\n' 0 > "$argument"
+        fi
+        previous="$argument"
+      done ;;
+    create) printf 'contractcid\n' ;;
+    cp)
+      src="$2"
+      dst="$3"
+      rel="${src#contractcid:}"
+      [[ "$rel" != "$src" ]] || return 1
+      case "$rel" in
+        /usr/local/bin/opencode)
+          cp "$repo/opencode2.4lunarwing/scripts/opencode-exposure-guard.sh" "$dst" ;;
+        /usr/local/lib/opencode2/opencode)
+          cp "$fixture/real-opencode" "$dst" ;;
+        /app/scripts | /app/config)
+          cp -a "$repo/opencode2.4lunarwing${rel#/app}" "$dst" ;;
+        /app/entrypoint.sh | /app/health_server.py | /app/agent_comm_protocol.json)
+          cp "$repo/opencode2.4lunarwing${rel#/app}" "$dst" ;;
+        *) return 1 ;;
+      esac ;;
+    image)
+      [[ "${2:-}" == inspect && "${*: -1}" == '{{json .Config}}' ]] || return 1
+      python3 - <<'PY'
+import json
+print(json.dumps({
+    "Env": [
+        "PATH=/home/opencode2/.cargo/bin:/usr/local/cargo/bin:/usr/local/go/bin:/home/opencode2/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bun-node-fallback-bin",
+        "BUN_RUNTIME_TRANSPILER_CACHE_PATH=0",
+        "BUN_INSTALL_BIN=/usr/local/bin",
+        "OPENCODE_IMAGE_REF=v2.1.2@" + "a" * 40,
+        "OPENCODE_DISABLE_AUTOUPDATE=1",
+        "RUSTUP_HOME=/usr/local/rustup",
+        "GOROOT=/usr/local/go",
+        "GOPATH=/home/opencode2/go",
+        "CARGO_HOME=/home/opencode2/.cargo",
+    ],
+    "Entrypoint": ["/usr/bin/tini", "--", "/app/entrypoint.sh"],
+    "Cmd": ["--mode", "websocket"],
+    "User": "10003:10003",
+    "WorkingDir": "/app",
+    "Shell": None,
+}))
+PY
+      ;;
+  esac
+  return 0
+}
+podman() { fake_worker_runtime podman "$@"; }
+docker() { fake_worker_runtime docker "$@"; }
 build_arg_seen() {  # <image tag> <SOURCE_REVISION value>
   local call
   for call in "${CALLS[@]}"; do
@@ -525,12 +590,17 @@ build_opencode_worker false false "$repo"
 build_opencode2_worker false false "$repo"
 LUNARWING_ROOT="$repo" build_pebble_worker false false
 for worker in kimi opencode opencode2 pebble; do
-  if build_arg_seen "lunarwing-worker-${worker}:latest" "$head"; then
+  build_tag="lunarwing-worker-${worker}:latest"
+  [[ "$worker" != opencode2 ]] || build_tag="lunarwing-worker-opencode2:candidate-$$"
+  if build_arg_seen "$build_tag" "$head"; then
     pass "build-${worker}-worker stamps SOURCE_REVISION=HEAD"
   else
     fail "build-${worker}-worker stamps SOURCE_REVISION=HEAD"
   fi
 done
+expected_image_id="sha256:$(printf '%064d' 0)"
+assert_call "podman:tag $expected_image_id lunarwing-worker-opencode2:latest" \
+  'opencode2 promotion tags the verified immutable ID'
 printf 'FROM scratch\nLABEL fixture=2\n' >"$repo/kimicode4lunarwing/Dockerfile"
 CALLS=()
 build_kimi_worker false false "" "$repo"

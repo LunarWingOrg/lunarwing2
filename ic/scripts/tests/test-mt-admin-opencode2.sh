@@ -2,6 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HARNESS_REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 MT_ADMIN="$SCRIPT_DIR/../lunarwing-mt-admin.sh"
 # shellcheck source=../lunarwing-mt-admin.sh
 source "$MT_ADMIN"
@@ -248,74 +249,107 @@ else
 fi
 
 # ── builder contract ────────────────────────────────────────────────────────
-mkdir -p "$fixture/target/opencode2.4lunarwing/scripts"
+mkdir -p "$fixture/target/opencode2.4lunarwing"
+cp -a "$HARNESS_REPO_ROOT/opencode2.4lunarwing/scripts" "$fixture/target/opencode2.4lunarwing/"
+cp -a "$HARNESS_REPO_ROOT/opencode2.4lunarwing/config" "$fixture/target/opencode2.4lunarwing/"
+cp -a "$HARNESS_REPO_ROOT/opencode2.4lunarwing/Dockerfile" \
+  "$HARNESS_REPO_ROOT/opencode2.4lunarwing/entrypoint.sh" \
+  "$HARNESS_REPO_ROOT/opencode2.4lunarwing/health_server.py" \
+  "$HARNESS_REPO_ROOT/opencode2.4lunarwing/agent_comm_protocol.json" \
+  "$fixture/target/opencode2.4lunarwing/"
 wrapper_file="$fixture/target/opencode2.4lunarwing/scripts/opencode-exposure-guard.sh"
-printf '#!/bin/sh\n# fixture wrapper\n' > "$wrapper_file"
+chmod 755 "$wrapper_file"
 # Override consumed by the sourced container helpers.
 # shellcheck disable=SC2034
 CONTAINER_RT=docker
 ensure_container_runtime() { :; }
-# WI#425 out-of-band verify mock: the fake image serves the wrapper and the
-# real binary from a fixture root, so the verify path can pass and — when
-# the fixture bytes are tampered — fail exactly like the real runtime would.
 oob_image_root="$fixture/oob-image"
 oob_env_extra=()
 oob_shell_override=''
+oob_drop_env=''
+oob_user='10003:10003'
+oob_config_inspect_failure=false
+oob_empty_cid=false
+oob_wrapper_symlink=false
+oob_wrapper_mode=''
+oob_tamper_app=false
 oob_real_binary_missing=false
 oob_serve_wrapper_file="$wrapper_file"
-mkdir -p "$oob_image_root/usr/local/bin" "$oob_image_root/usr/local/lib/opencode2"
-cp "$wrapper_file" "$oob_image_root/usr/local/bin/opencode"
+mkdir -p "$oob_image_root/usr/local/lib/opencode2"
 printf '\x7fELF clean pinned build\n' > "$oob_image_root/usr/local/lib/opencode2/opencode"
+chmod 755 "$oob_image_root/usr/local/lib/opencode2/opencode"
 docker() {
   case "${1:-}" in
-    build) BUILD_CALL="$*"; printf '%s\n' "$*" >> "$fixture/build-calls" ;;
-    create) printf 'fake-container-id\n' ;;
+    build)
+      BUILD_CALL="$*"
+      printf '%s\n' "$*" >> "$fixture/build-calls"
+      local previous='' argument
+      for argument in "$@"; do
+        if [[ "$previous" == --iidfile ]]; then
+          printf 'sha256:%064d\n' 0 > "$argument"
+        fi
+        previous="$argument"
+      done ;;
+    create)
+      printf '%s\n' "$*" >> "$fixture/create-calls"
+      [[ "$oob_empty_cid" == true ]] || printf 'fakecontainerid\n' ;;
     cp)
       local src="$2" dst="$3" rel
-      rel="${src#fake-container-id:}"
-      if [[ "$rel" == "$src" ]]; then
-        return 1
-      fi
-      # The fake image serves the CURRENT served-wrapper file (normally the
-      # checkout wrapper, so the GW-1 rewrite loop and untampered builds
-      # pass); the WI#425 refusal tests point it at tampered bytes.
+      rel="${src#fakecontainerid:}"
+      [[ "$rel" != "$src" ]] || return 1
       if [[ "$rel" == /usr/local/bin/opencode ]]; then
-        cp "$oob_serve_wrapper_file" "$dst"
-      elif [[ "$rel" == /usr/local/lib/opencode2/opencode ]]; then
-        # server-side absence is simulated by the flag, not by the fixture
-        # file: the fixture keeps a real file so untampered passes serve it.
-        if [[ "$oob_real_binary_missing" == true ]]; then
-          return 1
+        if [[ "$oob_wrapper_symlink" == true ]]; then
+          ln -s "$oob_serve_wrapper_file" "$dst"
+        else
+          cp "$oob_serve_wrapper_file" "$dst"
         fi
+        [[ -z "$oob_wrapper_mode" ]] || chmod "$oob_wrapper_mode" "$dst"
+      elif [[ "$rel" == /usr/local/lib/opencode2/opencode ]]; then
+        [[ "$oob_real_binary_missing" != true ]] || return 1
         cp "$oob_image_root/$rel" "$dst"
-      elif [[ -f "$oob_image_root/$rel" ]]; then
-        cp "$oob_image_root/$rel" "$dst"
+      elif [[ "$rel" == /app/scripts || "$rel" == /app/config ]]; then
+        cp -a "$fixture/target/opencode2.4lunarwing${rel#/app}" "$dst"
+        if [[ "$oob_tamper_app" == true && "$rel" == /app/scripts ]]; then
+          printf '# tampered in image\n' >> "$dst/opencode-exposure-guard.sh"
+        fi
+      elif [[ "$rel" == /app/entrypoint.sh || "$rel" == /app/health_server.py \
+             || "$rel" == /app/agent_comm_protocol.json ]]; then
+        cp "$fixture/target/opencode2.4lunarwing${rel#/app}" "$dst"
       else
         return 1
       fi ;;
     rm | rmi) return 0 ;;
     tag) OOB_TAG_CALLS+=("$2 -> $3") ;;
     image)
-      case "${2:-}" in
-        inspect)
-          local fmt="${*: -1}" out
-          case "$fmt" in
-            '{{json .Config.Env}}')
-              out='["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin","OPENCODE_DISABLE_AUTOUPDATE=1"'
-              local kv
-              for kv in "${oob_env_extra[@]}"; do out+=",\"$kv\""; done
-              out+=']'
-              printf '%s\n' "$out" ;;
-            '{{.Config.Shell}}')
-              if [[ -n "$oob_shell_override" ]]; then
-                printf '%s\n' "$oob_shell_override"
-              else
-                printf '<nil>\n'
-              fi ;;
-            *) return 1 ;;
-          esac ;;
-        *) return 1 ;;
-      esac ;;
+      [[ "$oob_config_inspect_failure" != true ]] || return 1
+      [[ "${*: -1}" == '{{json .Config}}' ]] || return 1
+      python3 - "$oob_shell_override" "$oob_drop_env" "$oob_user" "${oob_env_extra[@]}" <<'PY'
+import json
+import sys
+shell, drop, user, *extra = sys.argv[1:]
+env = [
+    "PATH=/home/opencode2/.cargo/bin:/usr/local/cargo/bin:/usr/local/go/bin:/home/opencode2/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bun-node-fallback-bin",
+    "BUN_RUNTIME_TRANSPILER_CACHE_PATH=0",
+    "BUN_INSTALL_BIN=/usr/local/bin",
+    "OPENCODE_IMAGE_REF=v2.1.2@" + "a" * 40,
+    "OPENCODE_DISABLE_AUTOUPDATE=1",
+    "RUSTUP_HOME=/usr/local/rustup",
+    "GOROOT=/usr/local/go",
+    "GOPATH=/home/opencode2/go",
+    "CARGO_HOME=/home/opencode2/.cargo",
+] + extra
+if drop:
+    env = [entry for entry in env if not entry.startswith(drop + "=")]
+print(json.dumps({
+    "Env": env,
+    "Entrypoint": ["/usr/bin/tini", "--", "/app/entrypoint.sh"],
+    "Cmd": ["--mode", "websocket"],
+    "User": user,
+    "WorkingDir": "/app",
+    "Shell": json.loads(shell) if shell else None,
+}))
+PY
+      ;;
     *) BUILD_CALL="$*"; printf '%s\n' "$*" >> "$fixture/build-calls" ;;
   esac
 }
@@ -325,16 +359,18 @@ BUILD_CALL=''
 build_opencode2_worker false true "$fixture/target" >/dev/null
 if [[ "$BUILD_CALL" == *'--build-arg WITH_TOOLCHAINS=true'* \
   && "$BUILD_CALL" == *'-t lunarwing-worker-opencode2:candidate'* \
+  && "$BUILD_CALL" == *'--iidfile '* \
   && "$BUILD_CALL" == *"$fixture/target/opencode2.4lunarwing"* ]]; then
-  pass 'opencode2 builder forwards toolchain flag and source root (candidate tag)'
+  pass 'opencode2 builder forwards toolchain flag, source root, and immutable-ID output'
 else
   fail "opencode2 builder contract wrong: $BUILD_CALL"
 fi
-# WI#425: the out-of-band verification gates the :latest re-tag.
-if [[ "${OOB_TAG_CALLS[0]}" == 'lunarwing-worker-opencode2:candidate -> lunarwing-worker-opencode2:latest' ]]; then
-  pass 'opencode2 builder re-tags :latest only after the out-of-band verify'
+# WI#425: the out-of-band verification gates the :latest re-tag by image ID.
+expected_image_id="sha256:$(printf '%064d' 0)"
+if [[ "${OOB_TAG_CALLS[0]}" == "$expected_image_id -> lunarwing-worker-opencode2:latest" ]]; then
+  pass 'opencode2 builder re-tags :latest only after verifying the immutable image ID'
 else
-  fail "opencode2 builder did not gate the :latest re-tag on the out-of-band verify: ${OOB_TAG_CALLS[*]:-}"
+  fail "opencode2 builder did not gate the :latest re-tag on the verified ID: ${OOB_TAG_CALLS[*]:-}"
 fi
 
 BUILD_CALL=''
@@ -432,36 +468,76 @@ oob_refusal_run() {
   return 0
 }
 
-# Tampered installed wrapper: the image serves different bytes than the
-# checkout (the run-103 GD-2 shape, now caught host-side too). The mock's
-# served wrapper comes from oob_serve_wrapper_file, which the untampered
-# runs keep pointed at the live checkout wrapper.
-oob_serve_wrapper_file="$wrapper_file"
+assert_contains "$fixture/create-calls" '--pull=never' \
+  'out-of-band create never pulls or resolves a moving tag'
+
+# Tampered installed wrapper, served with the expected mode so the byte check
+# (not the independent mode refusal) is what rejects it.
 printf '#!/bin/sh\n# tampered wrapper\nexec /bin/sh\n' > "$fixture/tampered-wrapper"
+chmod 755 "$fixture/tampered-wrapper"
 oob_serve_wrapper_file="$fixture/tampered-wrapper"
 oob_refusal_run "$fixture/oob-tampered.log" 'a tampered installed wrapper'
-assert_contains "$fixture/oob-tampered.log" 'WI#425 out-of-band' \
-  'tampered-wrapper refusal names the out-of-band check'
+assert_contains "$fixture/oob-tampered.log" 'installed wrapper differs from the checkout' \
+  'tampered-wrapper refusal names the checkout comparison'
 oob_serve_wrapper_file="$wrapper_file"
 
-# Drifted image Env: the config retargets OPENCODE_BIN at the real binary —
-# the GX-2 shape caught host-side too.
-oob_env_extra=("OPENCODE_BIN=/usr/local/lib/opencode2/opencode")
-oob_refusal_run "$fixture/oob-env.log" 'a drifted image Env (OPENCODE_BIN retarget)'
-assert_contains "$fixture/oob-env.log" 'retargets OPENCODE_BIN' \
-  'drifted-Env refusal names the retarget'
+for retarget in OPENCODE_BIN LUNARWING_REAL_OPENCODE; do
+  oob_env_extra=("$retarget=/usr/local/lib/opencode2/opencode")
+  oob_refusal_run "$fixture/oob-env.log" "a drifted image Env ($retarget retarget)"
+  assert_contains "$fixture/oob-env.log" "retargets $retarget" \
+    "drifted-Env refusal names $retarget"
+done
 oob_env_extra=()
 
-# Missing real binary in the image.
+oob_drop_env=OPENCODE_DISABLE_AUTOUPDATE
+oob_refusal_run "$fixture/oob-kill-switch.log" 'a missing autoupdate kill switch'
+assert_contains "$fixture/oob-kill-switch.log" 'OPENCODE_DISABLE_AUTOUPDATE' \
+  'missing kill switch is refused by the shared full-config policy'
+oob_drop_env=''
+
+oob_config_inspect_failure=true
+oob_refusal_run "$fixture/oob-inspect-failure.log" 'an image-config inspect failure'
+assert_contains "$fixture/oob-inspect-failure.log" 'cannot inspect full image config' \
+  'image-config inspect failure is never tolerated'
+oob_config_inspect_failure=false
+
+oob_wrapper_symlink=true
+oob_refusal_run "$fixture/oob-wrapper-link.log" 'a symlinked installed wrapper'
+assert_contains "$fixture/oob-wrapper-link.log" 'missing, linked, or not mode 0755' \
+  'symlinked wrapper is refused before cmp can follow it'
+oob_wrapper_symlink=false
+
+oob_wrapper_mode=744
+oob_refusal_run "$fixture/oob-wrapper-mode.log" 'an owner-only-executable wrapper'
+assert_contains "$fixture/oob-wrapper-mode.log" 'not mode 0755' \
+  'wrapper with the wrong mode is refused'
+oob_wrapper_mode=''
+
+oob_tamper_app=true
+oob_refusal_run "$fixture/oob-app-drift.log" 'a tampered checkout-owned /app tree'
+assert_contains "$fixture/oob-app-drift.log" 'exported /app/scripts differs from the checkout' \
+  'checkout-owned app content is compared out of band'
+oob_tamper_app=false
+
+oob_empty_cid=true
+oob_refusal_run "$fixture/oob-empty-cid.log" 'an empty container ID'
+assert_contains "$fixture/oob-empty-cid.log" 'could not create a container' \
+  'empty container ID is refused'
+oob_empty_cid=false
+
 oob_real_binary_missing=true
 oob_refusal_run "$fixture/oob-binary.log" 'a missing real binary'
-assert_contains "$fixture/oob-binary.log" 'missing from' \
+assert_contains "$fixture/oob-binary.log" 'real binary is missing' \
   'missing-binary refusal names the path'
 oob_real_binary_missing=false
 
-# Baked Shell override (the Dockerfile refuses SHELL; a config carrying one
-# is drift).
-oob_shell_override='[/bin/false,-c]'
+oob_user='0:0'
+oob_refusal_run "$fixture/oob-root-user.log" 'a root image user'
+assert_contains "$fixture/oob-root-user.log" 'image config User' \
+  'root image user is refused by the shared config policy'
+oob_user='10003:10003'
+
+oob_shell_override='["/bin/false","-c"]'
 oob_refusal_run "$fixture/oob-shell.log" 'a baked Shell override'
 assert_contains "$fixture/oob-shell.log" 'Shell override' \
   'Shell-override refusal names the drift'
