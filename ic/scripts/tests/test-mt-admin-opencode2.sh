@@ -49,6 +49,14 @@ setpriv() {
   printf '%s\n' "$*" >> "$fixture/setpriv-calls"
   while [[ $# -gt 0 && "$1" != -- ]]; do shift; done
   shift
+  local previous='' argument
+  for argument in "$@"; do
+    if [[ "$previous" == --archive ]]; then
+      printf '%s %s\n' "$(dirname "$argument")" "$(stat -c '%a' "$(dirname "$argument")")" \
+        >> "$fixture/oob-input-locations"
+    fi
+    previous="$argument"
+  done
   command "$@"
 }
 say() { :; }
@@ -438,6 +446,13 @@ else
   fail "opencode2 builder did not gate the :latest re-tag on the verified ID: $(cat "$fixture/tag-calls")"
 fi
 
+read -r input_parent input_mode < <(head -n1 "$fixture/oob-input-locations")
+if [[ "$input_parent" == /var/tmp/lw-oob.*/inputs && "$input_mode" == 700 ]]; then
+  pass 'archive and config handoff uses a private /var/tmp input directory'
+else
+  fail "out-of-band input directory is wrong: $input_parent mode $input_mode"
+fi
+
 # run-221 OK-1: root never executes checkout Python. A planted scripts/json.py
 # must not be imported by the shared verifier's isolated Python mode.
 planted_marker="$fixture/planted-json-ran"
@@ -663,6 +678,14 @@ assert_contains "$fixture/oob-policy-link.log" 'checkout snapshot contains a lin
   'symlinked checkout policy is refused before snapshot Python runs'
 rm -f "$policy_file"
 mv "$fixture/policy-real.py" "$policy_file"
+
+mv "$fixture/target/.gitlab" "$fixture/gitlab-outside"
+ln -s "$fixture/gitlab-outside" "$fixture/target/.gitlab"
+oob_refusal_run "$fixture/oob-parent-link.log" 'a symlinked checkout parent'
+assert_contains "$fixture/oob-parent-link.log" 'escapes the checkout root' \
+  'checkout parent symlinks cannot redirect the root snapshot'
+rm -f "$fixture/target/.gitlab"
+mv "$fixture/gitlab-outside" "$fixture/target/.gitlab"
 
 # ── build flag forwarding through the dispatcher ─────────────────────────────
 require_root() { :; }

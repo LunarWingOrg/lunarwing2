@@ -1246,26 +1246,46 @@ build_opencode_worker() {
   say "opencode worker image built: lunarwing-worker-opencode:latest [$toolchain_desc] (revision $source_revision)"
 }
 
-# Snapshot only the verifier and checkout-owned reference files. cp never
-# follows source links; the subsequent find refuses every link or special file
-# before any snapshot Python is executed. The snapshot is root-owned and
-# read-only, so the tenant cannot retarget it after these checks.
+_opencode2_snapshot_source() {
+  local source_root="$1" source="$2"
+  local parent base resolved_parent prefix
+  parent="$(dirname -- "$source")"
+  base="$(basename -- "$source")"
+  resolved_parent="$(realpath -e -- "$parent")" || {
+    echo "ERROR: cannot resolve checkout source parent for $source (WI#425 out-of-band)" >&2
+    return 1
+  }
+  prefix="${source_root%/}/"
+  if [[ "$resolved_parent" != "$source_root" && "$resolved_parent" != "$prefix"* ]]; then
+    echo "ERROR: checkout source $source escapes the checkout root (WI#425 out-of-band)" >&2
+    return 1
+  fi
+  printf '%s/%s\n' "$resolved_parent" "$base"
+}
+
+# Resolve every source parent below the canonical checkout, copy without
+# following final links, then refuse every link or special file before any
+# snapshot Python is executed. The snapshot is root-owned and read-only.
 _opencode2_snapshot_checkout() {
   local source_root="$1" opencode2_dir="$2" tmp_dir="$3"
-  local snapshot="$tmp_dir/checkout" name
+  local snapshot="$tmp_dir/checkout" name source resolved_root
   local lane="$snapshot/opencode2.4lunarwing"
+  resolved_root="$(realpath -e -- "$source_root")" || return 1
   mkdir -p "$snapshot/.gitlab/scripts" "$lane" || return 1
   for name in scripts config; do
+    source="$(_opencode2_snapshot_source "$resolved_root" "$opencode2_dir/$name")" || return 1
     cp -R --no-dereference --no-preserve=ownership -- \
-      "$opencode2_dir/$name" "$lane/$name" || return 1
+      "$source" "$lane/$name" || return 1
   done
   for name in entrypoint.sh health_server.py agent_comm_protocol.json; do
+    source="$(_opencode2_snapshot_source "$resolved_root" "$opencode2_dir/$name")" || return 1
     cp -R --no-dereference --no-preserve=ownership -- \
-      "$opencode2_dir/$name" "$lane/$name" || return 1
+      "$source" "$lane/$name" || return 1
   done
+  source="$(_opencode2_snapshot_source "$resolved_root" \
+    "$source_root/.gitlab/scripts/verify-opencode2-exposure-out-of-band.py")" || return 1
   cp -R --no-dereference --no-preserve=ownership -- \
-    "$source_root/.gitlab/scripts/verify-opencode2-exposure-out-of-band.py" \
-    "$snapshot/.gitlab/scripts/verify-opencode2-exposure-out-of-band.py" || return 1
+    "$source" "$snapshot/.gitlab/scripts/verify-opencode2-exposure-out-of-band.py" || return 1
   if [[ -n "$(find "$snapshot" ! -type f ! -type d -print -quit)" ]]; then
     echo "ERROR: checkout snapshot contains a link or special file (WI#425 out-of-band)" >&2
     return 1
@@ -1280,18 +1300,20 @@ _opencode2_snapshot_checkout() {
 _verify_opencode2_image_out_of_band() (
   local image_ref="$1" source_root="$2" wrapper_anchor="$3"
   local opencode2_dir="$source_root/opencode2.4lunarwing"
-  local cid='' tmp_dir archive config_json config_file snapshot snapshot_anchor
+  local cid='' tmp_dir inputs archive config_json config_file snapshot snapshot_anchor
   local python nobody_uid nobody_gid work
   [[ -n "$image_ref" && -d "$opencode2_dir" && "$wrapper_anchor" =~ ^[0-9a-f]{64}$ ]] || return 2
 
-  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/lw-oob.XXXXXX")" || return 1
+  tmp_dir="$(mktemp -d "/var/tmp/lw-oob.XXXXXX")" || return 1
   trap '_status=$?; [[ -z "$cid" ]] || "$CONTAINER_RT" rm -f "$cid" >/dev/null 2>&1 || true; rm -rf "$tmp_dir"; exit "$_status"' EXIT
+  inputs="$tmp_dir/inputs"
+  mkdir -m 0700 "$inputs" || return 1
   cid="$("$CONTAINER_RT" create --pull=never "$image_ref" 2>/dev/null)" || cid=''
   if [[ -z "$cid" || ! "$cid" =~ ^[[:alnum:]]+$ ]]; then
     echo "ERROR: out-of-band verification could not create a container from $image_ref" >&2
     return 1
   fi
-  archive="$tmp_dir/rootfs.tar"
+  archive="$inputs/rootfs.tar"
   if ! "$CONTAINER_RT" export --output "$archive" "$cid" >/dev/null 2>&1 \
      || [[ ! -f "$archive" || -L "$archive" ]]; then
     echo "ERROR: cannot export the opencode2 image filesystem (WI#425 out-of-band)" >&2
@@ -1301,7 +1323,7 @@ _verify_opencode2_image_out_of_band() (
     echo "ERROR: cannot inspect full image config for $image_ref (WI#425 out-of-band)" >&2
     return 1
   }
-  config_file="$tmp_dir/image-config.json"
+  config_file="$inputs/image-config.json"
   printf '%s' "$config_json" > "$config_file" || return 1
   snapshot="$(_opencode2_snapshot_checkout "$source_root" "$opencode2_dir" "$tmp_dir")" || return 1
   snapshot_anchor="$(sha256sum < "$snapshot/opencode2.4lunarwing/scripts/opencode-exposure-guard.sh")" || return 1
@@ -1319,8 +1341,10 @@ _verify_opencode2_image_out_of_band() (
     return 1
   fi
   work="$tmp_dir/work"
-  mkdir -m 0700 "$work" && chown "$nobody_uid:$nobody_gid" "$work" \
-    && chmod 0711 "$tmp_dir" && chmod 0644 "$archive" "$config_file" || return 1
+  mkdir -m 0700 "$work" \
+    && chown "$nobody_uid:$nobody_gid" "$work" "$inputs" "$archive" "$config_file" \
+    && chmod 0711 "$tmp_dir" && chmod 0700 "$work" "$inputs" \
+    && chmod 0600 "$archive" "$config_file" || return 1
   if ! setpriv --reuid="$nobody_uid" --regid="$nobody_gid" --clear-groups --no-new-privs -- \
       env -i PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 \
       "$python" -I "$snapshot/.gitlab/scripts/verify-opencode2-exposure-out-of-band.py" \
