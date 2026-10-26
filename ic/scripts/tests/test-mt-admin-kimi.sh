@@ -52,6 +52,7 @@ GATEWAY_AUTH_TOKEN=gate%token
 KIMI_MODEL=old-model
 KIMI_BASE_URL=https://old.example/v1
 KIMI_API_KEY=old%key
+KIMI_CODE_LLM_HEADERS_TIMEOUT_MS=123456
 EOF
 chmod 600 "$env_file"
 
@@ -446,6 +447,7 @@ fi
 assert_contains "$fixture/env/kimi-runtime.env" "AGENT_AUTH_TOKEN=$minted" 'runtime env carries the scoped worker credential'
 assert_not_contains "$fixture/env/kimi-runtime.env" 'AGENT_AUTH_TOKEN=gate%token' 'runtime env never carries the gateway bearer'
 assert_contains "$fixture/env/kimi-runtime.env" 'KIMI_API_KEY=old%key' 'runtime env preserves Kimi API key literally'
+assert_contains "$fixture/env/kimi-runtime.env" 'KIMI_CODE_LLM_HEADERS_TIMEOUT_MS=123456' 'runtime env forwards the operator LLM timeout (WI#477)'
 if [[ "$(stat -c '%a' "$fixture/env/kimi-runtime.env")" == "600" ]]; then
   pass 'Kimi runtime env is private'
 else

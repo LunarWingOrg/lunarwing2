@@ -444,6 +444,57 @@ closes the connection with a 1009 (message too big) error, and the bridge
 then aborts the task that was running on that socket (MR !1561 EV-5). Keep
 the worker's `WS_MAX_PAYLOAD_BYTES` at or above the hub cap when tuning it.
 
+## LLM request latency, heartbeats and timeouts (WI#477)
+
+Large coding turns are not expected to finish at ordinary chat latency. A small
+direct request can answer in under a minute, while a large request with a long
+context and many tool results can spend several minutes queued before its first
+token; the silverzoom evidence recorded **508.8 s** to first token and about
+8.5 s of subsequent streaming. Treat a multi-minute request as possible, not as
+proof of a dead worker. The heartbeat and deadline below make that wait visible
+without turning it into an ETA.
+
+Both workers default to a **120 s** progress heartbeat. While an LLM request is
+outstanding, the persisted `task_progress` / `job_events` text carries its
+one-based logical request index and elapsed seconds, for example
+`[worker] Still waiting for Pebble response; request 2 elapsed 240s; task remains active.`
+The existing `[worker] … ; task remains active.` daemon filtering contract is
+unchanged. Kimi also reports the following tool-wait phase with the same index
+and elapsed fields. Its request index is inferred from assistant/tool stream
+boundaries: it starts at 1 and advances after every tool call from the previous
+response has a result. Pebble's pinned build emits exact start/finish markers
+around each runtime API call through the reviewed
+`pebble4lunarwing/patches/wi477-request-events.patch`; those markers are enabled
+only by the bridge, so ordinary Pebble CLI JSON output is unchanged. Native
+retries stay on the same logical request index.
+
+- **Kimi:** `KIMI_CODE_LLM_HEADERS_TIMEOUT_MS` defaults to **900000 ms**
+  (15 minutes, clamped to 1000..86400000). This is the CLI's native per-attempt
+  response-headers deadline, covering connection and time to response headers,
+  not the entire token stream. `turn.step.retrying` becomes a visible worker
+  progress event with the request index, next/max attempt, delay and bounded
+  error class; final failure still produces the task error result. The bridge
+  applies the operator value after task-supplied env, so a task cannot extend
+  it. mt-admin forwards the key from `lunarwing.env` into the protected
+  `kimi-runtime.env`. Upstream Kimi does not apply this override through a
+  SOCKS proxy: it warns and keeps its own default headers timeout; use a direct
+  or HTTP-proxy connection when relying on this deadline.
+  `KIMI_SILENCE_TIMEOUT_MS` remains a separate whole-CLI no-output watchdog.
+- **Pebble:** `PEBBLE_API_TIMEOUT_SECS` defaults to **600 s** (clamped to
+  1..86400). This is the native reqwest per-HTTP-attempt total request timeout.
+  Retryable expiry produces the upstream `[llm-retry]` marker plus a visible
+  worker event carrying the current request index; exhausted or non-retryable
+  failures reach the task error result. The bridge overrides task-supplied
+  values with the operator value. `PEBBLE_PROGRESS_HEARTBEAT_MS=0` disables
+  heartbeats, not the API deadline. The reqwest setting does not replace
+  provider-specific deadlines such as the Grok ACP response timeout.
+
+These are **per-attempt** limits, not a promise for a whole turn: retries can
+multiply the wait (Pebble defaults to two retries after the initial attempt),
+and each task's existing `timeout_ms` remains the outer bound. Choose values
+that accommodate the expected large-request envelope, and inspect the visible
+retry/failure event rather than waiting silently for the outer task deadline.
+
 ## Worker-side tool proxy bridge (WI#324)
 
 The kimi worker image ships the WI#324 worker-side bridge: a per-task unix

@@ -2222,7 +2222,7 @@ write_kimi_runtime_env() {
   # instead of publishing the partial stream (die() only exits this subshell).
   staged="$(mktemp)" || return 1
   if ! (
-    for key in KIMI_MODEL KIMI_BASE_URL KIMI_API_KEY; do
+    for key in KIMI_MODEL KIMI_BASE_URL KIMI_API_KEY KIMI_CODE_LLM_HEADERS_TIMEOUT_MS; do
       value="$(read_tenant_env_value "$name" "$source_path" "$key")" || exit 1
       [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] \
         || die "$key cannot contain a newline"
