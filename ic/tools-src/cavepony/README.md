@@ -30,7 +30,9 @@ contractions and blunt, informal phrasing. It does not generate threats, slurs,
 criminal advice, or dialogue from the show. Natural model responses receive
 additional tone guidance from the bundled Cavepony skill.
 
-Release 0.4.7 carries the v2.1.7 dependency refresh. The Cargo package,
+Release 0.4.7 carried the v2.1.7 dependency refresh; 0.4.8 relabels the
+package as dual-licensed `AGPL-3.0-or-later AND MIT` for WI#391. The Cargo
+package,
 lockfile entry, capabilities metadata, registry release, and CI expectation
 are kept at the same version; `ci-config` rejects drift before the WASM build.
 Metadata corrections also require a registry version newer than the MR base;
@@ -51,5 +53,7 @@ commands as code to guarantee preservation.
 Source basis: [Cavepony v0.3.0](https://clawhub.ai/chrismcfee/skills/cavepony)
 by Baud & sun and the supplied [IronClaw Caveman Skill
 Specification](https://i.desu.si/BrTNxfKb.md). The ClawHub release declares
-MIT-0 while its archive `package.json` declares MIT; this port conservatively
-retains the MIT terms shipped in package metadata.
+MIT-0 while its archive `package.json` declares MIT; this port is dual-licensed
+`AGPL-3.0-or-later AND MIT`. The upstream MIT notice is retained in `LICENSE`
+and the capabilities `license_notice`, and AGPL-3.0-or-later applies to the
+LunarWing-authored port code as with the rest of the daemon.
