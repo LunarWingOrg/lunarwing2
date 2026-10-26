@@ -2291,8 +2291,7 @@ mod tests {
         assert!(
             plan.rejections
                 .iter()
-                .any(|r| r.reason
-                    == "staged path embeds a mounted worker secret value"),
+                .any(|r| r.reason == "staged path embeds a mounted worker secret value"),
             "the secret-named staged file must be rejected by the path scan, got {plan:?}"
         );
         // The secret value must never appear in the recorded rejection.
@@ -2318,8 +2317,7 @@ mod tests {
         // summary is scrubbed in place before it is persisted or attached to
         // the handle.
         let secret = "harness-summary-scrub-fixture-value";
-        let redactor =
-            SecretValueRedactor::new(&[SecretString::from(secret.to_string())]);
+        let redactor = SecretValueRedactor::new(&[SecretString::from(secret.to_string())]);
         let mut summary = PromotionSummary {
             records: vec![PromotionRecord {
                 relative_path: format!("projects/{secret}.md"),
