@@ -63,8 +63,13 @@ Job metadata and progress events are persisted by LunarWing. After a daemon rest
 running jobs are reported as `interrupted`, while `list_jobs`, `job_status`, and
 `job_events` can still read their saved status and event history from the database.
 While inference is otherwise silent, the worker emits a persisted progress
-heartbeat every 120 seconds; configure or disable it with
-`KIMI_PROGRESS_HEARTBEAT_MS` (0-300000).
+heartbeat every 120 seconds with the logical request index and elapsed seconds
+(or the following tool wait); configure or disable it with
+`KIMI_PROGRESS_HEARTBEAT_MS` (0-300000). The native response-headers deadline
+defaults to 15 minutes via `KIMI_CODE_LLM_HEADERS_TIMEOUT_MS=900000`; timeout
+retries become visible progress events and final failures reach the task result.
+See `docs/ops/WORKER-CONTAINERS.md` → "LLM request latency, heartbeats and
+timeouts" for the large-request envelope and per-attempt semantics.
 Only one active task may modify overlapping resolved workspace paths. A second
 task targeting same directory, parent, or child fails immediately with active
 task UUID; cancel or finish that task before dispatching another.
