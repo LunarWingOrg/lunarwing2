@@ -1091,10 +1091,11 @@ impl HybridStore {
                             candidates.push((mission_file, raw, mission));
                         }
                         Err(e) => {
-                            // The explicit mission-name field and raw serde error
-                            // stay at `debug!` (WI#321 NY-18). The operator-facing
-                            // path stays at `warn!`; its directory slugs can carry
-                            // user-authored project and mission names (OA-8).
+                            // No explicit mission-name field is logged on this
+                            // failure path; the raw serde error stays at `debug!`
+                            // (WI#321 NY-18). The operator-facing path stays at
+                            // `warn!`; its directory slugs can carry user-authored
+                            // project and mission names (OA-8).
                             let mission_id = raw
                                 .get("id")
                                 .and_then(|id| id.as_str())
