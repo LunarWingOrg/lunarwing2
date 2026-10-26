@@ -616,23 +616,23 @@ an egress boundary. **Control 1 is now implemented in mt-admin (WI#424,
 2.1.7.0)** — see the egress-allowlist section below for the mechanism, the
 fail-closed verification, and its limits.
 
-**v2.0.26-boundary decision (re-affirmed 2026-10-25, WI#424):** the crossing
+**v2.0.26-boundary decision (re-affirmed 2026-10-26, WI#424):** the crossing
 at v2.0.32 approved under WI#427 stands, and the lane at v2.1.2 keeps it. The
 decision was made on compile-out plus config because no boundary existed; on a
 tenant running the mt-admin egress allowlist the crossing now also sits behind
 the only control that holds against a compromised agent. No new approval is
 needed for the already-shipped pin; every future bump keeps the control-7
-checklist, and a lane started outside mt-admin (or on a host where the filter
-could not be proven live) simply does not run — the fail-closed start is the
-decision point, not the bump record.
+checklist, and every mt-admin-managed worker start refuses when the filter
+cannot be proven live — that fail-closed start is the decision point, not the
+bump record.
 
 Enforced controls (opencode2 lane unless noted):
 
 1. **Egress allowlist (ENFORCED, WI#424, 2.1.7.0):** mt-admin puts every
-   worker container on a per-tenant podman network and installs an nftables
-   forward chain keyed on that subnet: the configured LLM endpoint(s), DNS on
-   the network gateway, and operator-listed hosts only; everything else is
-   rejected. It is the only control that also covers future phone-home
+   worker container on a per-tenant network and installs per-tenant nftables
+   forward and input chains keyed on its bridge: the configured LLM endpoint(s)
+   and operator-listed hosts only, with static host mappings and recursive DNS
+   disabled; everything else is rejected. It is the only control that also covers future phone-home
    features and `webfetch`/shell exfiltration, and the only one that holds
    against a compromised agent (see the gate record above and the section
    below for the exact guarantees and residual limits).
@@ -793,16 +793,18 @@ Enforced controls (opencode2 lane unless noted):
    stub with no suite, so control 6 pointed at nothing; this work item re-points
    it to `opencode2.4lunarwing/scripts/runtime_smoke.py`. The suite asserts, in
    one run: no `service.json` carrying `remote` (absent is the private boot
-   default), no `opentunnel` identity directory under any XDG data/state home,
-   no listener beyond loopback except the health port, `share` resolving to
-   `disabled`, and `opencode service set remote true` refused. It runs in the
-   **protected candidate image build** (the Dockerfile self-test chain, so
-   `worker-opencode2-candidate` fails instead of publishing an image that
-   regressed) and against a live container with
-   `mt-admin worker-smoke <tenant> [opencode2]` (host driver:
-   `python3 /app/scripts/runtime_smoke.py --profile container` via
-   `podman exec`, or `--profile remote --container <name>` from the host).
-   Control 9 still covers the live-listener half for every lane.
+   default, but an unreadable file fails), no `opentunnel` identity directory,
+   no listener beyond loopback except the health and bridge-WS ports, `share`
+   resolving to `disabled`, and `opencode service set remote true` producing the
+   installed wrapper's specific exit-77 refusal (a missing/crashing wrapper does
+   not pass). The **protected candidate image build** runs
+   `scripts/runtime_smoke_entrypoint.sh`, which starts the real entrypoint and
+   its health/opencode/bridge listeners before running all five checks; an empty
+   Dockerfile `RUN` process table cannot satisfy the suite. Against a tenant use
+   `mt-admin worker-smoke <tenant> [opencode2]` (inside the container via
+   `podman exec`), or `--profile remote --container <name>` from the host; remote
+   mode reads the container's own environment and WS port. Control 9 still
+   covers the live-listener half for every lane.
 7. **Bump checklist (REQUIRED for every worker version bump).** The bump
    entry in this file must record the upstream features that add network
    exposure or outbound publication — tunnels, pairing, sharing, remote MCP,
@@ -898,125 +900,119 @@ Runs as non-root user `sandbox` (UID 1000) in `/workspace`. Entrypoint is the `l
 
 ### Worker egress allowlist (WI#424 control 1)
 
-**Decision (2026-10-25, item 46):** enforce with a **per-tenant podman
-network plus an nftables forward chain in the network namespace that owns the
-bridge** — the tenant's rootless netns for rootless podman, the host netns for
-rootful. This was chosen over a proxy/sidecar design because it needs no new
-image lane and no long-lived proxy process, and because the container has no
-route that bypasses the chain: the bridge is the worker's only interface, and
-the chain classifies every packet sourced from its subnet. All implementation
-lives in mt-admin (`ic/scripts/mt-admin-lib/15-worker-egress.sh`), never in a
-wrapper; both init systems are covered.
+**Mechanism decision (re-affirmed 2026-10-26, item 46):** enforce with a
+**per-tenant container network plus per-tenant nftables forward and input
+chains in the network namespace that owns the bridge** — the tenant's rootless
+netns for rootless podman, the host netns for rootful podman or docker. This
+keeps enforcement in mt-admin (`ic/scripts/mt-admin-lib/15-worker-egress.sh`),
+needs no proxy process or new image lane, and covers both init systems. Each
+chain classifies only its own bridge (`iifname`), never another tenant's
+traffic; applying one tenant never flushes another tenant's rules. IPv6,
+secondary source addresses, and every unapproved protocol are rejected, not
+left to an `accept` policy.
 
 What a worker may reach:
 
-* its own tenant's configured LLM endpoint(s) — the container-reachable form
-  of `LLM_BASE_URL` and `{opencode,opencode2,kimi,pebble}_BASE_URL`. A
-  host-loopback endpoint (`127.0.0.1`, `localhost`, `0.0.0.0`) is translated to
-  every host address the worker can actually reach — the network gateway, plus
-  pasta's `169.254.1.2` (`host.containers.internal`) under rootless podman,
-  which is the one a rootless worker really uses; a hostname is resolved on the
-  host and every IPv4 answer becomes a
-  rule. A URL with no explicit port uses the scheme default (80/443). An
-  unresolvable **operator** entry fails the ruleset (a typo or dead resolver
-  must be loud); an unresolvable **tenant LLM endpoint** is warned about and
-  omitted, which can only narrow the allowlist — a transient resolver failure
-  at boot must not take the worker down, and the worker then reports the
-  endpoint unreachable;
-* DNS, UDP and TCP port 53, **to the network gateway only** (aardvark-dns
-  forwards upstream from there; the container never talks to an external
-  resolver, so a worker cannot use DNS as an exfiltration path);
-* operator-listed `host:port` entries (`configure-worker-egress`, default
-  empty), for git hosts or other deliberate destinations;
+* its configured LLM endpoint(s) and operator-listed `host:port` entries over
+  TCP. Host-loopback endpoints map to the network gateway and, under rootless
+  podman/pasta, `169.254.1.2`; other hostnames are resolved host-side to IPv4
+  answers. URLs without an explicit port use 80/443. An unresolvable operator
+  entry refuses the update; an unresolvable tenant-derived LLM endpoint warns
+  and is omitted, which can only narrow access;
+* those same hostnames through static `/etc/hosts` entries, rendered from the
+  **same resolution pass** as the nft rules. Podman networks are created with
+  `--disable-dns`; every worker also launches with `--dns 127.0.0.1`, an
+  unserved loopback resolver. There is no aardvark or other recursive resolver
+  to tunnel data through;
 * return traffic for established flows.
 
-Everything else from the worker subnet is rejected (`reject with icmpx type
-admin-prohibited`), including `opentunnel.xyz`, opencode's share service, and
-GitHub release downloads. The chain policy is `accept` and only the tenant's
-own subnet is matched, so tenant sidecars, postgres, and every non-worker
-container keep their existing egress.
+Everything else is rejected with `icmpx type admin-prohibited`, including
+`opentunnel.xyz`, opencode's share service, GitHub release downloads, arbitrary
+UDP/ICMP, and host services on unapproved ports. The input chains are as
+important as the forward chains on rootful hosts: packets addressed to the host
+do not traverse `forward`, so only explicitly allowed host ports are accepted
+there too.
 
 How it is wired:
 
-* `worker_egress_ensure` allocates the tenant's `/24` from
-  `10.89.10.0/24`–`10.89.250.0/24` under a dedicated lock, records it in
-  root-owned `/etc/lunarwing/worker-egress/<tenant>.conf`, and creates the
-  `lw-egress-<tenant>` podman network.
-* Every worker start path calls `prepare_worker_egress` before the container is
-  created, and every create path attaches `--network lw-egress-<tenant>`
-  (Quadlet: `Network=`; imperative/OpenRC: `--network`).
-* The rendered ruleset (`/etc/lunarwing/worker-egress/<tenant>.nft`, 0644 — no
-  secrets) is loaded **before every start** from a boot-persistent path by one
-  root-owned helper, `/usr/local/libexec/lunarwing-worker-egress-guard`
-  (`ic/scripts/lunarwing-worker-egress-guard.sh`, installed by mt-admin):
-  Quadlet `ExecStartPre=<guard> <ruleset> rootless`, and the OpenRC worker init
-  script's `start()` (`<guard> <ruleset> rootless|rootful <tenant>` — OpenRC
-  runs as root, so the guard drops to the tenant to enter that user's netns).
-  Both init systems share the one script so their behaviour cannot drift. A
-  rootless netns exists only while something pins it; loading immediately
-  before the container starts also means the worker itself pins it for its
-  whole life.
-* The guard loads the ruleset and then **re-reads the chain through a fresh
-  netns entry**, refusing if the chain or its reject rule is absent. That
-  second invocation is the point: a host without a persistent tenant
-  runtime directory (no lingering session) would otherwise load rules into a
-  namespace that disappears with the command and start the worker unfiltered.
-  `worker_egress_apply` performs the same load-and-verify for an operator
-  re-apply. **Fail closed**: where the filter cannot be proven live, no worker
-  runs.
-
-Measured on the dev host (rootless podman 5.8.2 / netavark / pasta, busybox
-probe; the sequence the harness's `LUNARWING_MT_EGRESS_LIVE=1` arm re-runs):
-with the filter loaded before the container existed, an allowlisted host port
-answered (`rc 0`), `https://example.com/` and `https://1.1.1.1/` both failed
-(`rc 1`, the raw-IP case proves DNS is not a bypass), DNS still resolved
-through the gateway, and the chain's reject counter recorded the denied
-probes.
+* `worker_egress_ensure` allocates `10.89.N.0/24` under a dedicated lock and
+  creates `lw-egress-<tenant>` with bridge `lwegN`. Existing networks are
+  inspected on every prepare: subnet, gateway, bridge name, and disabled-DNS
+  contract must all match or the start refuses. Podman uses
+  `--interface-name` and `--disable-dns`; docker uses the equivalent bridge
+  option and the same loopback-resolver launch pin.
+* `worker_egress_apply` renders root-owned 0644 `<tenant>.nft` and
+  `<tenant>.hosts` state under `/etc/lunarwing/worker-egress/`. One resolution
+  pass feeds both files. Render failure removes older boot state instead of
+  leaving a wider ruleset available. The launch contract includes the network,
+  and stale pre-WI#424 containers (wrong network, extra networks, missing DNS
+  pin, or missing static hosts) are force-recreated even when already running.
+* Every create joins only that network and receives its static `AddHost` /
+  `--add-host` entries. Quadlet uses `Network=`, `DNS=`, and `AddHost=`;
+  imperative starts use the matching arguments.
+* The root-owned `/usr/local/libexec/lunarwing-worker-egress-guard` loads and
+  verifies the tenant's exact all-protocol reject in **both** chains through a
+  fresh netns read. Quadlet runs it in mandatory `ExecStartPre` and
+  `ExecStartPost`; the OpenRC worker unit runs it before and after `podman
+  start`. The OpenRC `-sup` babysitter depends on the worker unit and runs the
+  same guard before and after every respawn, so an agent cannot obtain an
+  unfiltered restart by killing its container.
+* `worker_egress_verify_after_start` also checks the runtime's exclusive
+  network/DNS/static-host contract and stops the container on failure. Missing
+  `nft`, a vanished chain, a TCP-only or wrong-subnet reject, and a missing
+  guard all refuse the start.
 
 Operator surface:
 
 ```bash
-sudo lunarwing-mt-admin.sh worker-egress <tenant>            # read-only audit; exit 1 unless the filter is provably live
+sudo lunarwing-mt-admin.sh worker-egress <tenant>            # read-only host-side audit
 sudo lunarwing-mt-admin.sh worker-egress-apply <tenant>      # re-render, load, verify
 sudo lunarwing-mt-admin.sh configure-worker-egress <tenant> --allow git.example.org:443,203.0.113.5:8443
 sudo lunarwing-mt-admin.sh configure-worker-egress <tenant> --allow none
+sudo lunarwing-mt-admin.sh restart-tenant <tenant>           # refresh existing containers' static hosts
 ```
 
-`worker-egress-apply` (and every worker start) also installs/refreshes the
-root-owned guard, so an upgraded mt-admin never leaves a stale guard behind.
+The audit checks the inspected network contract, exclusive container
+attachment, DNS and static-host state, and both live tenant-specific rejects;
+it never asks the container to report on itself. The
+`health-worker-egress.sh` component runs that audit on every health-pipeline
+tick and reports per-tenant failures as `worker_egress@<tenant>` monitor-only
+escalations. It detects firewall reloads that deleted rules without inventing
+a parallel restart or re-apply path.
 
-`worker-egress` is host-side by construction: it reads the network config,
-whether each running worker container is actually attached, and the live chain
-through the tenant's own netns. An agent inside the container cannot forge any
-of it. The harness `ic/scripts/tests/test-worker-egress.sh` pins the ruleset
-shape, host-address translation, entry validation (no nft syntax or wildcards),
-allocation, the guard's fail-closed load/verify, every wiring site, and loads
-the generated ruleset into a real rootless netns when the host supports it.
-Its opt-in live arm (`LUNARWING_MT_EGRESS_LIVE=1`) is the acceptance proof for
-"a non-allowlisted fetch fails, an allowlisted one succeeds": it creates the
-network, loads and verifies the filter with no container present, starts a
-busybox probe, and asserts all four outcomes plus the reject counter.
+The hermetic harness `ic/scripts/tests/test-worker-egress.sh` covers per-tenant
+isolation, exact rejects, DNS/host rendering, stale-container migration,
+missing-`nft` behavior, OpenRC and babysitter fail-closed paths, and the health
+contract. It also passes with `nft` absent from `PATH` and performs no host
+ruleset mutation by default. Its opt-in live arm
+(`LUNARWING_MT_EGRESS_LIVE=1`) additionally proves an allowlisted static-host
+fetch succeeds, non-allowlisted and raw-IP fetches fail, and recursive DNS is
+disabled.
 
 **Residual limits (do not overclaim this control):**
 
-* It is TCP plus gateway DNS. UDP other than DNS is denied; the worker network
-  is IPv4-only, so there is no IPv6 egress path.
-* It bounds *destinations*, not what a worker does with an allowed one. An LLM
-  endpoint or a listed git host is a legitimate channel; prompt-level
-  exfiltration through it is out of scope for a network filter.
-* On rootless podman the filter lives in the tenant's netns, so root on the
-  host can always remove it, and the tenant account itself is the trust
-  boundary for its own containers (the same assumption WI#357 already makes).
-* The in-image guards (controls 2–5, 8) remain naive-use guards. The allowlist
-  is the boundary, and it is only as good as the operator's list: adding a
-  broad `host:443` entry widens it.
+* Allowlisted application traffic is TCP-only. Static host mappings are not a
+  dynamic DNS service: after a deliberate destination/IP change, re-run
+  `worker-egress-apply` and `restart-tenant` so rules and `/etc/hosts` move
+  together.
+* IP+port is not a domain security boundary. A hostname behind a CDN, shared
+  anycast address, or shared hosting can admit every site reachable at that
+  same IP+port; TLS/SNI content is not inspected. A broad `host:443` entry is
+  correspondingly broad.
+* The filter bounds destinations, not what a worker sends through an allowed
+  LLM or git endpoint. Host root remains trusted; on rootless podman the tenant
+  account and its netns are the trust boundary, while rootful filtering lives
+  in the host netns.
+* In-image guards remain naive-use guards. The supported managed-worker start
+  paths fail closed when the filter cannot be proven live; manually launched
+  containers are outside mt-admin's contract and are not a supported bypass.
 
-**Rollout on an existing fleet.** The network is attached at container
-*create* time, so a tenant already running a pre-WI#424 worker keeps open
-egress until that container is recreated. `start-tenant` (or
-`worker-egress-apply` followed by a worker restart) does this, because the
-launch contract gains the network and the create path force-recreates on a
-contract change; nothing removes a running container out from under a job.
+**Rollout on an existing fleet.** The next `start-tenant` adds the new launch
+contract and recreates stale pre-WI#424 containers, including running ones;
+schedule that restart window rather than assuming a running job is undisturbed.
+`worker-egress-apply` refreshes live nft rules immediately, while
+`restart-tenant` is what refreshes existing containers' static hosts and DNS
+launch settings.
 
 ### Generic sandbox egress default (WI#154)
 

@@ -115,14 +115,14 @@ option). The compile-out guard stubs `remote-tunnel.ts` at build time,
 re-verified against v2.1.2, and CI + the build assertions fail if the tunnel
 survives. Future bumps remain deliberate-only. WI#369's SDK-gate blind spots remain
 open; WI#424's egress allowlist is implemented (mt-admin `worker-egress`) and
-`scripts/runtime_smoke.py` runs in the candidate build and against a live
-container; see the bump record.
+`scripts/runtime_smoke_entrypoint.sh` starts the real entrypoint for the
+candidate smoke; `scripts/runtime_smoke.py` also runs against a live container.
 
 ## Key Files (this policy)
 
 - `scripts/opencode-exposure-guard.sh` — installed as `/usr/local/bin/opencode`; scans every argv token for `service`/`pair`/`upgrade`/`update`/`--service`/non-loopback `--hostname` (naive-use guard).
 - `scripts/exposure_policy_assert.py` — shared static policy checker (image build + CI guard); `--image-filesystem` also checks installed ownership and modes and (v2, run-103 GD-2 + run-106 GJ-3) verifies the installed wrapper: `/usr/local/bin/opencode` must be the byte-identical, root-owned, non-group-writable, executable guard that build-time `PATH` resolves to, with the real binary re-scanned for tunnel markers, no `LUNARWING_REAL_OPENCODE` retarget at build time, and the installed digest matching the `LUNARWING_WRAPPER_SHA256` build-arg anchor (computed from the checkout by `build-worker-image.sh` and mt-admin's `build_opencode2_worker`; missing or mismatched fails the build).
 - `scripts/entrypoint_config_test.py` — non-root startup configuration regression tests using a 0444 baked config, including repeat boots, HOME/XDG/`OPENCODE_CONFIG_DIR` service defaults, and agent plants (FIFO/dir/symlink) at the reset path.
-- `scripts/runtime_smoke.py` — WI#424 control 6 runtime exposure suite (the image build runs `--profile build`; `--profile container` runs inside a live worker, `--profile remote` drives one from the host). Fails on a `remote` service config, an opentunnel identity dir, a non-loopback listener beyond the health port, an enabled `share`, or a wrapper that accepts `service set remote true`; `scripts/runtime_smoke_test.py` pins each failure mode.
+- `scripts/runtime_smoke.py` — WI#424 control 6 runtime exposure suite. The candidate build runs `scripts/runtime_smoke_entrypoint.sh` against the real started entrypoint; `--profile container` runs inside a live worker and `--profile remote` reads the container's own environment from the host. Fails on a `remote` service config (including unreadable files), an opentunnel identity dir, a non-loopback listener beyond the health/WS ports, an enabled `share`, or a missing/crashing wrapper that does not produce the specific exit-77 `service set remote true` refusal; `scripts/runtime_smoke_test.py` pins each failure mode.
 - `scripts/compile_out_remote_tunnel.py` — fail-closed build patch that compiles the OpenTunnel client out; drift scan over `packages/{cli,server,schema,core}/src` (ts+tsx, any quoted `@opentunnel/*` specifier, all workspace manifests).
 - `scripts/opencode_task_executor.ts` — `sessionPermissions()` carries the shell deny rules (after the allow-all rule; ordering matters).
