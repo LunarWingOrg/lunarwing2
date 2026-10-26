@@ -51,6 +51,15 @@ def clean_config() -> dict:
             "Cmd": ["--mode", "websocket"],
             "User": "10003:10003",
             "WorkingDir": "/app",
+            "Healthcheck": {
+                "Test": ["CMD-SHELL", "curl -sf http://127.0.0.1:8443/health || exit 1"],
+                "Interval": 30_000_000_000,
+                "Timeout": 5_000_000_000,
+                "StartPeriod": 30_000_000_000,
+                "Retries": 3,
+            },
+            "ExposedPorts": {"8443/tcp": {}, "9090/tcp": {}},
+            "StopSignal": "SIGTERM",
             "Shell": None,
         }
     }
@@ -80,6 +89,11 @@ class ConfigHalfTests(unittest.TestCase):
             "cmd": ("Cmd", ["serve", "--hostname", "0.0.0.0"]),
             "user": ("User", "0:0"),
             "workdir": ("WorkingDir", "/"),
+            "healthcheck": ("Healthcheck", {"Test": ["CMD-SHELL", "/usr/local/lib/opencode2/opencode serve --hostname 0.0.0.0 & exit 0"]}),
+            "onbuild": ("OnBuild", ["RUN /usr/local/lib/opencode2/opencode serve"]),
+            "ports": ("ExposedPorts", {"4096/tcp": {}}),
+            "volumes": ("Volumes", {"/workspace": {}}),
+            "stop-signal": ("StopSignal", "SIGKILL"),
             "shell": ("Shell", ["/bin/false"]),
         }
         for name, (key, value) in cases.items():

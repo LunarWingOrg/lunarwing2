@@ -404,6 +404,8 @@ EXPOSE 9090
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD curl -sf http://127.0.0.1:8443/health || exit 1
 
+STOPSIGNAL SIGTERM
+
 USER 10003:10003
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]

@@ -71,6 +71,13 @@ class ImageConfigPolicyTests(unittest.TestCase):
                 config["config"][key] = "0:0" if key == "User" else ["bad"]
                 self.assertTrue(any(key in failure for failure in config_failures(config)))
 
+    def test_onbuild_and_volumes_must_be_empty(self):
+        for key, value in (("OnBuild", ["RUN true"]), ("Volumes", {"/data": {}})):
+            with self.subTest(key=key):
+                config = clean_config()
+                config["config"][key] = value
+                self.assertTrue(any(key in failure for failure in config_failures(config)))
+
     def test_shell_override_is_refused(self):
         config = clean_config()
         config["config"]["Shell"] = ["/bin/false"]
