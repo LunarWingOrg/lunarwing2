@@ -446,4 +446,124 @@ mod promotion {
             Err(WorkspaceError::DocumentNotFound { .. })
         ));
     }
+
+    /// OA-16 (run-217 review): the `scrub_promotion_summary` call inside
+    /// `finalize_harness_job` is the backstop that keeps a value which slipped
+    /// past the path/content scans out of the persisted `harness_write_back`
+    /// audit event and the `wait=true` result. `scrub_promotion_summary` is
+    /// unit-tested, but nothing pinned the CALL. Here a workspace write failure
+    /// embeds a mounted secret in its reason, and the finalizer must scrub it
+    /// before persisting or attaching the summary.
+    #[tokio::test]
+    async fn finalize_harness_job_scrubs_summary_before_persisting() {
+        let sentinel = "harness-finalize-scrub-sentinel";
+        let fixture = Fixture::new().await;
+        // Mirror the proven `failed_replacement_removes_unused_snapshot` shape:
+        // a prior document exists, so the replacement is a real UPDATE and the
+        // rollback snapshot runs first.
+        fixture
+            .workspace
+            .write("projects/out.md", "prior notes")
+            .await
+            .unwrap();
+
+        // Fail the write-back replacement with a trigger whose message embeds
+        // the sentinel — the workspace error surfaces it verbatim in the
+        // rejection reason produced by `promote_write`, which appends to
+        // `summary.rejections` WITHOUT source scrubbing (the backstop gap this
+        // pin closes).
+        fixture
+            .db
+            .execute_batch(&format!(
+                "CREATE TRIGGER reject_replace_for_sentinel BEFORE UPDATE ON memory_documents
+                 WHEN NEW.path = 'projects/out.md' AND NEW.content = 'replacement'
+                 BEGIN SELECT RAISE(ABORT, 'write fault: {sentinel}'); END;"
+            ))
+            .await;
+
+        let job_id = fixture.job_id;
+        // The container handle must carry harness write-back state pointing at
+        // the real staging dir so the finalizer runs the promotion pipeline.
+        let mut handle = running_handle(job_id);
+        if let Some(harness_state) = handle.harness.as_mut() {
+            harness_state.staging_dir = Some(fixture.staging.clone());
+        }
+        let containers: HashMap<Uuid, ContainerHandle> = [(job_id, handle)].into_iter().collect();
+        let containers = Arc::new(RwLock::new(containers));
+
+        // Mount the sentinel as a harness secret so the finalizer's redactor is
+        // armed and scrubs it.
+        let token_store = TokenStore::new();
+        token_store
+            .store_harness_secrets(
+                job_id,
+                vec![(
+                    "API_KEY".to_string(),
+                    secrecy::SecretString::from(sentinel.to_string()),
+                )],
+            )
+            .await;
+
+        let deps = PromotionDeps {
+            containers: Arc::clone(&containers),
+            token_store,
+            workspace: Some(Arc::new(FixedWorkspaceResolver::new(
+                fixture.workspace.clone(),
+            ))),
+            store: Some(fixture.db.database()),
+        };
+
+        // `save_job_event` inserts into `job_events` (FK -> `agent_jobs`), so
+        // seed a minimal row for this job id.
+        fixture
+            .db
+            .execute_batch(&format!(
+                "INSERT INTO agent_jobs (id, title, description, status, source, user_id, job_mode)
+                 VALUES ('{job_id}', 'OA-16', 'finalize scrub pin', 'running', 'sandbox', 'owner', 'harness');"
+            ))
+            .await;
+
+        finalize_harness_job(deps, job_id, true, true).await;
+
+        // The handle's promotion summary must not carry the sentinel.
+        let handle = containers.read().await.get(&job_id).unwrap().clone();
+        let summary = handle
+            .harness
+            .as_ref()
+            .and_then(|h| h.promotion.as_ref())
+            .expect("finalize attaches the promotion summary");
+        let serialized = serde_json::to_string(summary).unwrap();
+        assert!(
+            !serialized.contains(sentinel),
+            "promotion summary still carries the secret: {serialized}"
+        );
+        // Non-vacuous: the sentinel reached the summary and the scrub replaced
+        // it, rather than the summary simply never carrying it.
+        assert!(
+            serialized.contains("[redacted-secret]"),
+            "the scrubbed summary must carry the redaction marker: {serialized}"
+        );
+        assert_eq!(
+            summary.records.len(),
+            0,
+            "the rejected replacement must not be recorded as promoted: {summary:?}"
+        );
+
+        // The persisted `harness_write_back` audit event must not carry it either.
+        let events = fixture
+            .db
+            .database()
+            .list_job_events(job_id, None)
+            .await
+            .unwrap();
+        let write_back = events
+            .iter()
+            .find(|e| e.event_type == "harness_write_back")
+            .expect("finalize persists the write-back audit event");
+        assert!(
+            !write_back.data.to_string().contains(sentinel),
+            "audit event still carries the secret: {}",
+            write_back.data
+        );
+    }
 }
