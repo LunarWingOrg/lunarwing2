@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # WI#424 control 1 — hermetic worker egress boundary harness.
-# shellcheck disable=SC1091,SC2016,SC2329  # generated sources, literal unit pins, indirect test doubles
+# shellcheck disable=SC1091,SC2016,SC2034,SC2329  # generated sources, literal unit pins, indirect test doubles
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

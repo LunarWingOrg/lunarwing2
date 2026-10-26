@@ -63,6 +63,7 @@ TRACK_EXISTENCE="false"
 # fixture tenant has no account, so stub the step (its own harness pins the
 # behaviour, and the recreate decision under test happens before the worker
 # start path runs the filter).
+# shellcheck disable=SC2034  # real lane run lines expand this launch-argument array.
 prepare_worker_egress() {
   WORKER_EGRESS_LAUNCH_ARGS=(--network "lw-egress-$1" --dns 127.0.0.1)
 }

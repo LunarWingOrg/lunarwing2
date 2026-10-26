@@ -55,6 +55,7 @@ _register_worker_unit() { :; }
 # `test`, which has no account, so the egress step is stubbed; the mount policy
 # under test is unrelated to it and test-worker-egress.sh pins the real
 # behaviour.
+# shellcheck disable=SC2034  # real lane run lines expand this launch-argument array.
 prepare_worker_egress() {
   WORKER_EGRESS_LAUNCH_ARGS=(--network "lw-egress-$1" --dns 127.0.0.1)
 }
