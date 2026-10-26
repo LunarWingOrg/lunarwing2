@@ -1095,6 +1095,18 @@ configure_pebble() {
   local nanogpt_api_key="$2"
   local model="$3"
 
+  [[ "$nanogpt_api_key" != *$'\n'* && "$nanogpt_api_key" != *$'\r'* ]] \
+    || die "configure-pebble: NANOGPT_API_KEY must be a single-line raw token"
+  if [[ "$nanogpt_api_key" =~ ^[[:space:]] || "$nanogpt_api_key" =~ [[:space:]]$ ]]; then
+    die "configure-pebble: pass the raw NANOGPT_API_KEY without leading/trailing whitespace or env-file syntax"
+  fi
+  local key_start="${nanogpt_api_key:0:1}" key_end="${nanogpt_api_key: -1}"
+  if [[ ${#nanogpt_api_key} -gt 1 ]] \
+    && { [[ "$key_start" == '"' && "$key_end" == '"' ]] \
+      || [[ "$key_start" == "'" && "$key_end" == "'" ]]; }; then
+    die "configure-pebble: pass the raw NANOGPT_API_KEY without surrounding quotes"
+  fi
+
   name="$(sanitize_name "$name")"
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
 
