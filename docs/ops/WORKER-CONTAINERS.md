@@ -727,7 +727,9 @@ Enforced controls (opencode2 lane unless noted):
    `worker-opencode2-exposure-verify` job safely materializes only regular
    files, checks those tar headers with the checkout's
    `exposure_policy_assert.py --image-root`, compares checkout-owned `/app`
-   files byte for byte, and refuses unexpected source-tree entries. Its
+   files byte for byte, and refuses unexpected source-tree entries. BuildKit
+   omits the `/` header, so only that root is a structural trust boundary;
+   every emitted entry uses its tar-header metadata. Its
    shared `image_config_policy.py` allowlist covers the complete `Env`
    (including PATH order and loader variables), `Entrypoint`, `Cmd`, `User`,
    `WorkingDir`, and `Shell`; promotion hard-needs the non-optional job.
