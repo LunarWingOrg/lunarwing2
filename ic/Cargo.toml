@@ -8,6 +8,9 @@ exclude = [
     "crates/lunarwing_safety/fuzz",
 ]
 
+[patch.crates-io]
+wasmtime-internal-cache = { path = "patches/wasmtime-internal-cache" }
+
 [package]
 name = "lunarwing"
 version = "2.1.7"
