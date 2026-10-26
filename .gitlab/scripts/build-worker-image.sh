@@ -105,7 +105,8 @@ opencode2.4lunarwing/scripts/compile_out_remote_tunnel_test.py'
         # WI#357 run-106 GJ-3(a): the checkout's wrapper digest, compared by
         # the in-image --image-filesystem assert against the installed wrapper.
         # Detects accidental drift; an adversarial Dockerfile can still defeat
-        # it. Out-of-band image verification remains a WI#357 follow-up (GW-3).
+        # it. The durable out-of-band verification is WI#425 Ask 1 (the local
+        # filesystem export + worker-opencode2-exposure-verify job below).
         wrapper_file="$CI_PROJECT_DIR/opencode2.4lunarwing/scripts/opencode-exposure-guard.sh"
         wrapper_anchor=$(sha256sum < "$wrapper_file") || {
             echo "cannot hash $wrapper_file" >&2; exit 1;
