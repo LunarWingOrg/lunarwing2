@@ -27,3 +27,6 @@ tower = { version = "0.5", features = ["util"] }
 strip = true
 
 [workspace]
+
+[patch.crates-io]
+wasmtime-internal-cache = { path = "../../patches/wasmtime-internal-cache" }
