@@ -99,7 +99,9 @@ pub async fn memory_list_handler(
     let list_entries: Vec<ListEntry> = entries
         .iter()
         .map(|e| ListEntry {
-            name: e.path.rsplit('/').next().unwrap_or(&e.path).to_string(),
+            name: crate::workspace::escape_path_for_display(
+                e.path.rsplit('/').next().unwrap_or(&e.path),
+            ),
             path: e.path.clone(),
             is_dir: e.is_directory,
             updated_at: e.updated_at.map(|dt| dt.to_rfc3339()),
@@ -220,16 +222,18 @@ pub async fn memory_write_handler(
     }))
 }
 
-/// HTTP status for a failed workspace write. Content refused by the
-/// prompt-injection gate is a client input problem (422, matching the prompt
-/// editor); a daily-log quarantine and an append refused only because of
-/// content already stored in the file are state conflicts (409: the request
-/// body was fine, the stored file is not). None is a server fault, so none
-/// maps to 500 (WI#290).
+/// HTTP status for a failed workspace write. Invalid paths and unknown layers
+/// are client input problems (400). Content refused by the prompt-injection
+/// gate is also a client input problem (422, matching the prompt editor); a
+/// daily-log quarantine and an append refused only because of content already
+/// stored in the file are state conflicts (409: the request body was fine, the
+/// stored file is not). None is a server fault, so none maps to 500 (WI#290).
 fn write_error_status(error: &crate::error::WorkspaceError) -> StatusCode {
     use crate::error::WorkspaceError;
     match error {
-        WorkspaceError::LayerNotFound { .. } => StatusCode::BAD_REQUEST,
+        WorkspaceError::InvalidPath { .. } | WorkspaceError::LayerNotFound { .. } => {
+            StatusCode::BAD_REQUEST
+        }
         WorkspaceError::LayerReadOnly { .. } => StatusCode::FORBIDDEN,
         WorkspaceError::PrivacyRedirectFailed | WorkspaceError::InjectionRejected { .. } => {
             StatusCode::UNPROCESSABLE_ENTITY
@@ -320,6 +324,12 @@ mod tests {
             reason: "Attempt to inject user message (line 1)".to_string(),
         };
         assert_eq!(write_error_status(&stored_poison), StatusCode::CONFLICT);
+        assert_eq!(
+            write_error_status(&WorkspaceError::InvalidPath {
+                path: "notes/bad\npath.md".to_string()
+            }),
+            StatusCode::BAD_REQUEST
+        );
         assert_eq!(
             write_error_status(&WorkspaceError::LayerNotFound {
                 name: "missing".to_string()
