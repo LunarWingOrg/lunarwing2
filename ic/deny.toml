@@ -140,12 +140,14 @@ ignore = [
     # database revision marks the 0.26.11 compatibility shim `unaffected`
     # (`unaffected = ["= 0.26.11"]`), because the shim carries no independent
     # trust store and re-exports the roots of its separately resolved
-    # webpki-roots 1.x dependency, pinned at the patched 1.0.10. The shim
     # itself remains reachable only through the opt-in
     # libsql-remote-replica legacy chain, and a downgrade of the 1.x parent
     # is still a hard failure (the same advisory matches the 1.x package it
-    # resolves to). The ignore was producing `warning[advisory-not-detected]`
-    # on every gate run — a stale acceptance, not a live exposure.
+    # resolves to). The 1.x parent is locked at 1.0.11 since the v2.1.7.0
+    # crate sweep (2026-10-25, item 1); the floor below still denies every
+    # pre-1.0.10 release. The ignore was producing
+    # `warning[advisory-not-detected]` on every gate run — a stale
+    # acceptance, not a live exposure.
 
     # rental — unmaintained (informational, no vulnerability). Only visible
     # since the gate widened to --workspace --all-features (v2.1.5.0, MR
@@ -215,7 +217,10 @@ deny = [
     { name = "rustls-webpki", version = ">=0.103.0, <0.103.16" },
     # CVE-2026-111943 (2026-10-20, item 28): the patched webpki root-store
     # lines are webpki-roots 1.0.10 / webpki-root-certs 1.0.10; deny every
-    # earlier release (webpki-roots 0.26.11 is the accepted legacy pin below).
+    # earlier release (webpki-roots 0.26.11 is the accepted legacy pin
+    # below). The locks moved to 1.0.11 with the v2.1.7.0 crate sweep
+    # (2026-10-25, item 1); the floors are minimums and still deny every
+    # pre-1.0.10 release.
     { name = "webpki-root-certs", version = "<1.0.10" },
     { name = "webpki-roots", version = ">=1.0.0, <1.0.10" },
     # WI#418 (IS-1): ID-keyed ignores also suppress findings for other
