@@ -486,12 +486,12 @@ async fn forward_request(
                     // WI#395 (run-111 HA-2): 3xx bodies echo the redirect
                     // target URL on common edges (Go, Apache, Express), so a
                     // credential-injected exchange scrubs the body with the
-                    // same spellings as the headers. A body whose content or
-                    // transfer coding is not inspectable is refused rather
-                    // than forwarded with a possible echo blind.
+                    // same spellings as the headers. A non-empty body whose
+                    // content or transfer coding is not inspectable is refused
+                    // rather than forwarded with a possible echo blind (WI#429).
                     let mut body_scrubbed = false;
                     if !echo_spellings.is_empty() {
-                        if response_body_coding_is_opaque(&headers) {
+                        if !body.is_empty() && response_body_coding_is_opaque(&headers) {
                             tracing::warn!(
                                 "Proxy: refused content-encoded response body that cannot be scrubbed for echoed credentials"
                             );
