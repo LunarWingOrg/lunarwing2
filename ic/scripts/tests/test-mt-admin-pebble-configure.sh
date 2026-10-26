@@ -34,12 +34,30 @@ before_sha="$(sha256sum "$env_file" | cut -d' ' -f1)"
 bad_keys=(
   "\"$secret\""
   "'$secret'"
+  "NANOGPT_API_KEY=$secret"
+  "export NANOGPT_API_KEY=$secret"
+  $'export\t'"NANOGPT_API_KEY=$secret"
+  "export  NANOGPT_API_KEY=$secret"
+  "\"$secret"
+  "$secret\""
+  "'$secret"
+  "$secret'"
+  '"'
+  "'"
+  "\"$secret'"
+  "'$secret\""
   " $secret"
   "$secret "
   "$secret"$'\t'
   "$secret"$'\nPEBBLE_MODEL=injected'
 )
-labels=(double-quoted single-quoted leading-space trailing-space trailing-tab embedded-newline)
+labels=(
+  double-quoted single-quoted
+  assignment exported-assignment tab-exported-assignment spaced-exported-assignment
+  leading-double-quote trailing-double-quote leading-single-quote trailing-single-quote
+  lone-double-quote lone-single-quote mismatched-double-single-quotes mismatched-single-double-quotes
+  leading-space trailing-space trailing-tab embedded-newline
+)
 for index in "${!bad_keys[@]}"; do
   bad_key="${bad_keys[$index]}"
   if output="$(configure_pebble alice "$bad_key" openai/rejected 2>&1)"; then

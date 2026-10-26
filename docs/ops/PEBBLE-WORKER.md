@@ -207,7 +207,9 @@ sudo ic/scripts/lunarwing-mt-admin.sh restart-worker <name> pebble
 
 Pass only the raw token value, not an env-file assignment or literal quote
 characters copied from one. The command rejects leading/trailing whitespace,
-matching literal surrounding quotes, and CR/LF before writing `pebble.env`.
+`NANOGPT_API_KEY=...` assignments (including `export NANOGPT_API_KEY=...`),
+literal single or double quotes at either end (even one stray quote or a lone
+quote), and CR/LF before writing `pebble.env`.
 Normal shell quoting, as in the example above, is fine because the shell removes
 it before mt-admin receives the value.
 

@@ -1098,13 +1098,17 @@ configure_pebble() {
   [[ "$nanogpt_api_key" != *$'\n'* && "$nanogpt_api_key" != *$'\r'* ]] \
     || die "configure-pebble: NANOGPT_API_KEY must be a single-line raw token"
   if [[ "$nanogpt_api_key" =~ ^[[:space:]] || "$nanogpt_api_key" =~ [[:space:]]$ ]]; then
-    die "configure-pebble: pass the raw NANOGPT_API_KEY without leading/trailing whitespace or env-file syntax"
+    die "configure-pebble: pass the raw NANOGPT_API_KEY without leading/trailing whitespace"
+  fi
+  # OM-1: reject a pasted env-file line, not just a quoted value from one.
+  if [[ "$nanogpt_api_key" == NANOGPT_API_KEY=* \
+    || "$nanogpt_api_key" =~ ^export[[:blank:]]+NANOGPT_API_KEY= ]]; then
+    die "configure-pebble: pass only the raw NANOGPT_API_KEY value, not an env-file assignment"
   fi
   local key_start="${nanogpt_api_key:0:1}" key_end="${nanogpt_api_key: -1}"
-  if [[ ${#nanogpt_api_key} -gt 1 ]] \
-    && { [[ "$key_start" == '"' && "$key_end" == '"' ]] \
-      || [[ "$key_start" == "'" && "$key_end" == "'" ]]; }; then
-    die "configure-pebble: pass the raw NANOGPT_API_KEY without surrounding quotes"
+  if [[ "$key_start" == '"' || "$key_start" == "'" \
+    || "$key_end" == '"' || "$key_end" == "'" ]]; then
+    die "configure-pebble: pass the raw NANOGPT_API_KEY without literal quotes at either end"
   fi
 
   name="$(sanitize_name "$name")"
