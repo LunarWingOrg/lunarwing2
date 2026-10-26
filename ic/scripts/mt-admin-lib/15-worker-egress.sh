@@ -34,12 +34,14 @@ worker_egress_network_name() {
 
 worker_egress_chain() {
   _worker_egress_validate_name "$1"
-  printf 'worker-%s\n' "$1"
+  local normalized="${1//-/_}"
+  printf 'worker_%s\n' "$normalized"
 }
 
 worker_egress_input_chain() {
   _worker_egress_validate_name "$1"
-  printf 'worker-input-%s\n' "$1"
+  local normalized="${1//-/_}"
+  printf 'worker_input_%s\n' "$normalized"
 }
 
 worker_egress_conf_path() { printf '%s/%s.conf\n' "$WORKER_EGRESS_DIR" "$1"; }
@@ -175,13 +177,15 @@ _worker_egress_split_target() {
 
 _worker_egress_host_addrs() {
   local gateway="$1" address
+  if [[ "${CONTAINER_RT:-}" == "podman" && "${MT_ROOTLESS:-}" == "true" ]]; then
+    for address in $WORKER_EGRESS_HOST_ADDRS; do
+      _worker_egress_valid_ipv4 "$address" \
+        || die "invalid LUNARWING_MT_WORKER_HOST_ADDRS entry '$address'"
+      printf '%s\n' "$address"
+    done
+    return 0
+  fi
   printf '%s\n' "$gateway"
-  [[ "${CONTAINER_RT:-}" == "podman" && "${MT_ROOTLESS:-}" == "true" ]] || return 0
-  for address in $WORKER_EGRESS_HOST_ADDRS; do
-    _worker_egress_valid_ipv4 "$address" \
-      || die "invalid LUNARWING_MT_WORKER_HOST_ADDRS entry '$address'"
-    [[ "$address" == "$gateway" ]] || printf '%s\n' "$address"
-  done
 }
 
 _worker_egress_resolution_failed() {
@@ -319,7 +323,7 @@ _worker_egress_is_host_address() {
 _worker_egress_forward_rules() {
   local subnet="$1" bridge="$2" records="$3" host address port
   cat <<EOF
-        iifname "$bridge" nfproto ipv6 counter reject with icmpx type admin-prohibited
+        iifname "$bridge" meta nfproto ipv6 counter reject with icmpx type admin-prohibited
         iifname "$bridge" ip saddr != $subnet counter reject with icmpx type admin-prohibited
         iifname "$bridge" ip saddr $subnet ct state established,related accept
 EOF
@@ -335,7 +339,7 @@ EOF
 _worker_egress_input_rules() {
   local subnet="$1" bridge="$2" records="$3" gateway="$4" host address port
   cat <<EOF
-        iifname "$bridge" nfproto ipv6 counter reject with icmpx type admin-prohibited
+        iifname "$bridge" meta nfproto ipv6 counter reject with icmpx type admin-prohibited
         iifname "$bridge" ip saddr != $subnet counter reject with icmpx type admin-prohibited
         iifname "$bridge" ip saddr $subnet ct state established,related accept
 EOF
@@ -359,20 +363,20 @@ _worker_egress_ruleset_render() {
   input_chain="$(worker_egress_input_chain "$name")"
   cat <<EOF
 table inet $WORKER_EGRESS_TABLE {
-    chain "$chain" {
+    chain $chain {
         type filter hook forward priority filter; policy accept;
     }
-    chain "$input_chain" {
+    chain $input_chain {
         type filter hook input priority filter; policy accept;
     }
 }
-flush chain inet $WORKER_EGRESS_TABLE "$chain"
-flush chain inet $WORKER_EGRESS_TABLE "$input_chain"
+flush chain inet $WORKER_EGRESS_TABLE $chain
+flush chain inet $WORKER_EGRESS_TABLE $input_chain
 table inet $WORKER_EGRESS_TABLE {
-    chain "$chain" {
+    chain $chain {
 $(_worker_egress_forward_rules "$subnet" "$bridge" "$records")
     }
-    chain "$input_chain" {
+    chain $input_chain {
 $(_worker_egress_input_rules "$subnet" "$bridge" "$records" "$gateway")
     }
 }
@@ -406,8 +410,8 @@ worker_egress_verify_dump() {
   [[ -n "$subnet" ]] || return 1
   awk -v subnet="$subnet" '
     $1 == "iifname" && $3 == "ip" && $4 == "saddr" && $5 == subnet {
-      if ($6 == "counter" && $7 == "reject" && $8 == "with" && $9 == "icmpx" && $10 == "type" && $11 == "admin-prohibited") found = 1
-      if ($6 == "counter" && $7 == "packets" && $11 == "reject" && $12 == "with" && $13 == "icmpx" && $14 == "type" && $15 == "admin-prohibited") found = 1
+      if ($6 == "counter" && $7 == "reject" && $8 == "with" && $9 == "icmpx" && (($10 == "type" && $11 == "admin-prohibited") || ($10 == "admin-prohibited"))) found = 1
+      if ($6 == "counter" && $7 == "packets" && $11 == "reject" && $12 == "with" && $13 == "icmpx" && (($14 == "type" && $15 == "admin-prohibited") || ($14 == "admin-prohibited"))) found = 1
     }
     END { exit(found ? 0 : 1) }
   ' <<<"$dump"

@@ -137,8 +137,8 @@ assert_contains "$quadlet" 'HealthCmd=curl -sf http://127.0.0.1:8443/health' 'qu
 assert_contains "$quadlet" 'Network=lw-egress-root' 'quadlet joins only the tenant egress network'
 assert_contains "$quadlet" 'DNS=127.0.0.1' 'quadlet pins an unserved loopback resolver'
 assert_contains "$quadlet" 'AddHost=git.example.org:203.0.113.40' 'quadlet installs static hosts from the resolved allowlist'
-assert_contains "$quadlet" 'ExecStartPre=/usr/local/libexec/lunarwing-worker-egress-guard /etc/lunarwing/worker-egress/root.nft rootless worker-root' 'quadlet runs the pre-start guard'
-assert_contains "$quadlet" 'ExecStartPost=/usr/local/libexec/lunarwing-worker-egress-guard --verify /etc/lunarwing/worker-egress/root.nft rootless worker-root' 'quadlet runs the post-start guard'
+assert_contains "$quadlet" 'ExecStartPre=/usr/local/libexec/lunarwing-worker-egress-guard /etc/lunarwing/worker-egress/root.nft rootless worker_root' 'quadlet runs the pre-start guard'
+assert_contains "$quadlet" 'ExecStartPost=/usr/local/libexec/lunarwing-worker-egress-guard --verify /etc/lunarwing/worker-egress/root.nft rootless worker_root' 'quadlet runs the post-start guard'
 
 # v1 worker's quadlet must be untouched by the opencode2 render.
 cat >"$env_file.bak" <<"EOF"

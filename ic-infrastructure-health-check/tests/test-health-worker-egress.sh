@@ -8,7 +8,8 @@ CHECK="$ROOT/health-worker-egress.sh"
 FIXTURE="$(mktemp -d)"
 trap 'rm -rf "$FIXTURE"' EXIT
 failures=0
-pass() { printf 'PASS: %s\n' "$1"; }
+passes=0
+pass() { printf 'PASS: %s\n' "$1"; passes=$((passes + 1)); }
 fail() { printf 'FAIL: %s\n' "$1" >&2; failures=$((failures + 1)); }
 assert_eq() {
   if [[ "$1" == "$2" ]]; then pass "$3"; else fail "$3 (got '$1', want '$2')"; fi
@@ -86,8 +87,7 @@ assert_contains "$main_report" 'run_check "health-worker-egress.sh" "worker_egre
 # shellcheck disable=SC2016  # literal shell variable reference in the generated report.
 assert_contains "$main_report" '${check_worker_egress:-}' "main report includes the worker egress component"
 
+printf '%d passed, %d failed\n' "$passes" "$failures"
 if ((failures > 0)); then
-  printf '%d failure(s)\n' "$failures" >&2
   exit 1
 fi
-printf 'worker egress health tests passed\n'

@@ -22,13 +22,13 @@ case "$mode" in
   rootless|rootful) ;;
   *) die "invalid mode '$mode' (expected rootless or rootful)" ;;
 esac
-[[ "$chain" =~ ^worker-[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] \
+[[ "$chain" =~ ^worker_[a-z0-9]([a-z0-9_]*[a-z0-9])?$ ]] \
   || die "invalid worker egress chain '$chain'"
 if [[ -n "$tenant" ]]; then
   [[ "$tenant" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] \
     || die "invalid tenant name '$tenant'"
 fi
-input_chain="worker-input-${chain#worker-}"
+input_chain="worker_input_${chain#worker_}"
 [[ -f "$ruleset" && ! -L "$ruleset" ]] \
   || die "egress ruleset not found or not a regular file: $ruleset"
 
@@ -69,17 +69,21 @@ verify_chain() {
     || die "egress chain $chain_name did not survive (refusing unfiltered start)" 2
   awk -v subnet="$subnet" '
     $1 == "iifname" && $3 == "ip" && $4 == "saddr" && $5 == subnet {
-      if ($6 == "counter" && $7 == "reject" && $8 == "with" && $9 == "icmpx" && $10 == "type" && $11 == "admin-prohibited") found = 1
-      if ($6 == "counter" && $7 == "packets" && $11 == "reject" && $12 == "with" && $13 == "icmpx" && $14 == "type" && $15 == "admin-prohibited") found = 1
+      if ($6 == "counter" && $7 == "reject" && $8 == "with" && $9 == "icmpx" && (($10 == "type" && $11 == "admin-prohibited") || ($10 == "admin-prohibited"))) found = 1
+      if ($6 == "counter" && $7 == "packets" && $11 == "reject" && $12 == "with" && $13 == "icmpx" && (($14 == "type" && $15 == "admin-prohibited") || ($14 == "admin-prohibited"))) found = 1
     }
     END { exit(found ? 0 : 1) }
-  ' <<<"$dump" \
-    || die "egress chain $chain_name lacks the tenant's exact reject for $subnet" 2
+  ' <<<"$dump" || {
+    printf '%s\n' "$dump" >&2
+    die "egress chain $chain_name lacks the tenant's exact reject for $subnet" 2
+  }
 }
 
 if [[ "$VERIFY_ONLY" != "true" ]]; then
-  nft_in_netns -f "$ruleset" >/dev/null 2>&1 \
-    || die "failed to load the egress ruleset $ruleset" 1
+  if ! load_output="$(nft_in_netns -f "$ruleset" 2>&1)"; then
+    printf '%s\n' "$load_output" >&2
+    die "failed to load the egress ruleset $ruleset" 1
+  fi
 fi
 verify_chain "$chain"
 verify_chain "$input_chain"

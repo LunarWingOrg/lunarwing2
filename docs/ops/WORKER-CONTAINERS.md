@@ -914,8 +914,8 @@ left to an `accept` policy.
 What a worker may reach:
 
 * its configured LLM endpoint(s) and operator-listed `host:port` entries over
-  TCP. Host-loopback endpoints map to the network gateway and, under rootless
-  podman/pasta, `169.254.1.2`; other hostnames are resolved host-side to IPv4
+  TCP. Host-loopback endpoints map to the network gateway on rootful runtimes
+  and to pasta's `169.254.1.2` on rootless podman; other hostnames are resolved host-side to IPv4
   answers. URLs without an explicit port use 80/443. An unresolvable operator
   entry refuses the update; an unresolvable tenant-derived LLM endpoint warns
   and is omitted, which can only narrow access;
