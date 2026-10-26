@@ -838,7 +838,10 @@
 45. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/394
 46. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/424 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1922 but needs re-attempt - see comments of previosuly closed MR
 47. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/425 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1921 but needs re-attempt - see comments of previosuly closed MR
-48. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/429
+48. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/429
+    - DONE 2026-10-26 (SweetieBot, item-48, branch `sweetiebot/kimi-48-20261026-0605`): WI#429 implemented. `forward_request` now applies the opaque-coding refusal only to successfully collected, non-empty bodies on credential-injected exchanges; body-read failures, response-header scrubbing, and every non-empty duplicate/unreadable content-coding, other transfer-coding, and kept-chunk-framing refusal stay unchanged. The v2.1.6 item-54 IV-2/JD-2 deferral is recorded as implemented in `docs/releases/RELEASE-v2.1.6.0.md`; the proxy contract is updated in `ic/src/NETWORK_SECURITY.md`.
+    - **Regression evidence:** the new real proxy/loopback-upstream test covers HEAD + `Content-Encoding: gzip`, 304 + `Content-Encoding: gzip`, 204 + `Transfer-Encoding: chunked,`, and HEAD + `Transfer-Encoding: chunked,`; each preserves its upstream status and empty body, and every response's echoed credential header is scrubbed with no secret in the response or logs. The test failed on the unguarded tree with the expected HEAD+CE 502, then passed 1/1 with the guard. Existing non-empty refusal and ordinary-exchange behavior is covered by the full suite below.
+    - **Verification (`taskset -c 0-17`, `-j18`):** `cargo test --lib sandbox::proxy -- --nocapture` **50/50**; `cargo clippy --lib --tests -- -D warnings` clean; `cargo fmt --all -- --check` and `git diff --check` clean.
 49. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/430
 50. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/432
 51. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/471

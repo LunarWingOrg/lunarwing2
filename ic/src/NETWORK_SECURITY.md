@@ -427,20 +427,22 @@ Response *bodies* are scrubbed too (WI#395): 3xx bodies echo the redirect
 target URL on common edges (Go `net/http`, Apache, Express), so a
 credential-injected exchange requests `Accept-Encoding: identity`,
 byte-scrubs the body, drops the stale upstream `Content-Length` (hyper
-re-frames), and refuses — with 502 — a body whose coding it cannot inspect
-(WI#419): every `Content-Encoding` and `Transfer-Encoding` field is
-checked — a duplicate field cannot hide a coding behind an `identity`
-first field — with each comma-joined token checked individually; only
-`identity` content codings and a single `chunked` transfer coding that
+re-frames), and refuses — with 502 — a non-empty body whose coding it
+cannot inspect (WI#419): every `Content-Encoding` and `Transfer-Encoding`
+field is checked — a duplicate field cannot hide a coding behind an
+`identity` first field — with each comma-joined token checked individually;
+only `identity` content codings and a single `chunked` transfer coding that
 hyper removes (the last element of the last field) pass. `chunked,` or a
 trailing empty field leave chunk framing intact; repeated `chunked` can
 leave an inner layer. These are refused, and any other transfer-coding
 token (`gzip`, `identity`, `chunked;x=1`) is refused regardless of whether
-hyper removes the framing. An unreadable coding value is refused too.
-The proxy currently applies this check even to empty bodies: HEAD/304 with
-`Content-Encoding: gzip` and HEAD/204 with `Transfer-Encoding: chunked,`
-are over-refused with 502. The empty-body exemption is deferred to
-[WI#429](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/429).
+hyper removes the framing. An unreadable coding value is refused too. The
+refusal runs only after successful body collection; body-read failures
+remain 502. Empty bodies cannot carry a credential echo and are exempt
+([WI#429](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/429)):
+HEAD/304 with `Content-Encoding: gzip` and HEAD/204 with
+`Transfer-Encoding: chunked,` preserve the upstream status and empty body,
+while response headers still go through the scrub path above.
 Unlike headers, the body scrub matches only the raw and form-encoded spellings
 exactly; re-encoded body echoes (e.g. a double-encoded `redirect_to`
 parameter carried inside a 3xx body) are not detected — a recorded
