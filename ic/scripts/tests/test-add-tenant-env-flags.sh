@@ -1189,6 +1189,15 @@ ig3_rc=0
 assert_eq "auth-token upgrade on a symlinked config returns 2" "$ig3_rc" "2"
 assert_eq "auth-token upgrade refusal preserves the redirect target" \
   "$(grep -c 'auth_token = "stale-token"' "$sensitive")" "1"
+# WI#474 ON-1: the new capability migration must use the same tenant-side
+# writer, not a root redirect that follows an existing config symlink.
+mk_ig3_target "$sensitive"
+sed -i 's/name = "pebble"/name = "opencode"/' "$sensitive"
+ig3_before="$(cat "$sensitive")"
+ig3_rc=0
+( upgrade_external_worker_credentials fixture-tenant opencode "$MT_FIXTURE/state/config.toml" ) >/dev/null 2>&1 || ig3_rc=$?
+assert_eq "credential capability upgrade on a symlinked config returns 2" "$ig3_rc" "2"
+assert_eq "credential capability refusal preserves the redirect target" "$(cat "$sensitive")" "$ig3_before"
 assert_eq "upgrade refusals leave the symlink in place" \
   "$(if [[ -L "$MT_FIXTURE/state/config.toml" ]]; then echo symlink; else echo replaced; fi)" "symlink"
 rm -f "$MT_FIXTURE/state/config.toml"
@@ -1206,6 +1215,12 @@ ig3_rc=0
 assert_eq "auth-token upgrade on a clean config succeeds" "$ig3_rc" "0"
 assert_eq "clean auth-token upgrade applied" \
   "$(grep -c 'auth_token = "fixture-worker-token"' "$MT_FIXTURE/state/config.toml")" "1"
+sed -i 's/name = "pebble"/name = "opencode"/' "$MT_FIXTURE/state/config.toml"
+ig3_rc=0
+( upgrade_external_worker_credentials fixture-tenant opencode "$MT_FIXTURE/state/config.toml" ) >/dev/null 2>&1 || ig3_rc=$?
+assert_eq "credential capability upgrade on a clean config succeeds" "$ig3_rc" "0"
+assert_eq "clean credential capability upgrade applied" \
+  "$(grep -c 'supports_credentials = false' "$MT_FIXTURE/state/config.toml")" "1"
 rm -f "$MT_FIXTURE/state/config.toml"
 
 echo "=== WI#390 (IG-4): darkirc adapter env write fails closed ==="

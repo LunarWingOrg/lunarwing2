@@ -50,8 +50,21 @@ Each lane enforces the strip at its task-process boundary:
   from the bridge, so both executors reject any non-empty `context.environment`
   before creating an SDK client or session (**WI#474**). The task returns an
   explicit error telling the caller to resubmit without credentials or use
-  kimi/pebble; grants are never silently accepted as a no-op. They are also
-  **never** merged into the bridge's `process.env` (run-209 NU-1), so no
+  kimi/pebble; grants are never silently accepted as a no-op. The hub additionally
+  refuses non-empty `create_job.credentials` for workers configured with
+  `supports_credentials = false`, before secret lookup/decryption, job
+  registration or dispatch (**!1943 ON-1**). mt-admin writes this flag for both
+  OpenCode lanes and converges existing managed entries on its next config
+  reconciliation (for example `patch-env <tenant>` / `upgrade-tenant <tenant>`).
+  Restart the tenant daemon through mt-admin after changing config to load the
+  flag. **Unmanaged/renamed OpenCode entries must set it explicitly** in their
+  `[[sandbox.external_workers]]` table; omission defaults to `true` for backwards
+  compatibility with credential-capable workers such as kimi/pebble. All
+  load-balanced endpoints of an entry must support the configured capability.
+  Until the flag is loaded, worker-side rejection still receives the plaintext
+  grant and is only defence in depth, not a hub-side secrecy boundary. Downgrading
+  to a daemon without this capability check likewise loses the hub-side guard.
+  Grants are also **never** merged into the bridge's `process.env` (run-209 NU-1), so no
   agent-chosen grant name (`options.credential_grants[].env_var` at
   `create_job`) can alter shared bridge lazy reads (task identity, serve auth,
   retry/heartbeat/abort knobs, tool-proxy timeout) or inject the hub credential.
