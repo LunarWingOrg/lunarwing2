@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import base64
 import hashlib
 import json
@@ -328,15 +329,20 @@ def _run_assertion(
         die("out-of-band filesystem verification FAILED (WI#425)")
 
 
-def check_filesystem_half(archive_path: pathlib.Path, image_environment: dict[str, str]) -> None:
+def check_filesystem_half(
+    archive_path: pathlib.Path,
+    image_environment: dict[str, str],
+    workspace_parent: pathlib.Path | None = None,
+) -> None:
     try:
         if not stat.S_ISREG(archive_path.lstat().st_mode):
             die(f"filesystem export {archive_path} is not a regular tar file")
     except OSError as error:
         die(f"filesystem export {archive_path} is missing or unreadable: {error}")
     try:
-        with tempfile.TemporaryDirectory(prefix=".opencode2-verify-", dir=REPO_ROOT) as tmp, \
-                tarfile.open(archive_path, mode="r:*") as archive:
+        with tempfile.TemporaryDirectory(
+            prefix=".opencode2-verify-", dir=workspace_parent or REPO_ROOT,
+        ) as tmp, tarfile.open(archive_path, mode="r:*") as archive:
             members = _members(archive)
             _validate_members(members)
             _check_path_shadows(members, image_environment.get("PATH", ""))
@@ -375,7 +381,37 @@ def _fetch_candidate_config(image_ref: str, image_digest: str) -> dict:
     return image_config(repo, config_digest, token)
 
 
-def main() -> int:
+def _local_config(path: pathlib.Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        die(f"cannot read local image config {path}: {error}")
+    return {}
+
+
+def _argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--archive", type=pathlib.Path)
+    parser.add_argument("--config", type=pathlib.Path)
+    parser.add_argument("--workspace-dir", type=pathlib.Path)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _argument_parser().parse_args(argv)
+    if (args.archive is None) != (args.config is None):
+        die("--archive and --config must be supplied together")
+    if args.workspace_dir is not None and args.archive is None:
+        die("--workspace-dir requires the local --archive/--config mode")
+    if args.archive is not None:
+        config = _local_config(args.config)
+        check_config_half(config)
+        check_filesystem_half(
+            args.archive, _environment(config), workspace_parent=args.workspace_dir,
+        )
+        print(f"out-of-band verification PASSED for local export {args.archive} (WI#425)")
+        return 0
+
     image_ref = os.environ.get("WORKER_IMAGE_REF", "")
     image_digest = os.environ.get("WORKER_IMAGE_DIGEST", "")
     if not (image_ref and re.fullmatch(r"sha256:[0-9a-f]{64}", image_digest)):

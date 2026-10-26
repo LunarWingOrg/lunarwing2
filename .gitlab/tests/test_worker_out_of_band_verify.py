@@ -410,6 +410,21 @@ class FilesystemExportTests(unittest.TestCase):
         self.assert_refused("directory app/node_modules")
 
 
+    def test_local_archive_config_mode_uses_the_shared_verifier(self):
+        config = self.root / "image-config.json"
+        config.write_text(json.dumps(clean_config()), encoding="utf-8")
+        workspace = self.root / "nobody-work"
+        workspace.mkdir()
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            result = self.module.main([
+                "--archive", str(self.archive), "--config", str(config),
+                "--workspace-dir", str(workspace),
+            ])
+        self.assertEqual(result, 0)
+        self.assertIn("local export", stdout.getvalue())
+
+
 class MainWiringTests(unittest.TestCase):
     def setUp(self):
         self.module = load_verify_module()
