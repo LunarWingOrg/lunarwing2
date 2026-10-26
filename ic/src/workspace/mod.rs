@@ -1270,6 +1270,7 @@ impl Workspace {
         content: &str,
         fail_closed: bool,
     ) -> Result<MemoryDocument, WorkspaceError> {
+        validate_write_path(path)?;
         let path = normalize_path(path);
         validate_prompt_write(&path, content)?;
         let doc = self
@@ -1414,6 +1415,7 @@ impl Workspace {
         path: &str,
         content: &str,
     ) -> Result<(), WorkspaceError> {
+        validate_write_path(path)?;
         if normalize_path(path) != path || !path.starts_with("backups/") {
             return Err(WorkspaceError::IoError {
                 reason: "snapshot target must be a canonical backups/ path".to_string(),
@@ -1732,6 +1734,7 @@ impl Workspace {
     /// [`WorkspaceError::ExistingContentRejected`] (WI#290): classification
     /// only, the append is refused either way.
     pub async fn append(&self, path: &str, content: &str) -> Result<(), WorkspaceError> {
+        validate_write_path(path)?;
         let path = normalize_path(path);
         if is_lorebook_json_file(&path) {
             return Err(WorkspaceError::AppendNotSupported {
@@ -1934,6 +1937,7 @@ impl Workspace {
         force: bool,
         fail_closed: bool,
     ) -> Result<WriteResult, WorkspaceError> {
+        validate_write_path(path)?;
         let (scope, actual_layer, redirected) =
             self.resolve_layer_target(layer_name, content, force)?;
         let path = normalize_path(path);
@@ -1991,6 +1995,7 @@ impl Workspace {
         content: &str,
         force: bool,
     ) -> Result<WriteResult, WorkspaceError> {
+        validate_write_path(path)?;
         let (scope, actual_layer, redirected) =
             self.resolve_layer_target(layer_name, content, force)?;
         let path = normalize_path(path);
@@ -3314,6 +3319,27 @@ impl Workspace {
     }
 }
 
+pub(crate) fn validate_write_path(path: &str) -> Result<(), WorkspaceError> {
+    if path.chars().any(char::is_control) {
+        return Err(WorkspaceError::InvalidPath {
+            path: path.to_string(),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn escape_path_for_display(path: &str) -> String {
+    let mut escaped = String::with_capacity(path.len());
+    for character in path.chars() {
+        if character.is_control() {
+            escaped.extend(character.escape_debug());
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
+}
+
 /// Normalize a virtual file path.
 ///
 /// Leading/trailing and repeated slashes are removed, `.` segments are skipped,
@@ -3355,6 +3381,39 @@ mod tests {
         assert_eq!(normalize_path("../escape.md"), "escape.md");
         assert_eq!(normalize_path("foo/../../bar"), "bar");
         assert_eq!(normalize_path(".."), "");
+    }
+
+    #[test]
+    fn write_path_validation_rejects_every_control_character() {
+        for code in (0..=0x1f).chain(0x7f..=0x9f) {
+            let character = char::from_u32(code).expect("valid Unicode scalar");
+            let path = format!("notes/{character}forged.md");
+            let error = validate_write_path(&path)
+                .expect_err("control-bearing workspace paths must be rejected");
+            assert!(
+                matches!(error, WorkspaceError::InvalidPath { .. }),
+                "U+{code:04X}"
+            );
+            assert!(
+                !error.to_string().contains(character),
+                "the error must escape U+{code:04X} instead of echoing it raw"
+            );
+        }
+        for path in ["notes/plain.md", "notes/🙂.md", " notes/with spaces.md "] {
+            assert!(validate_write_path(path).is_ok(), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn display_path_escapes_controls_without_changing_ordinary_names() {
+        assert_eq!(
+            escape_path_for_display("notes/line\nreturn\resc\u{1b}c1\u{85}.md"),
+            r"notes/line\nreturn\resc\u{1b}c1\u{85}.md"
+        );
+        assert_eq!(
+            escape_path_for_display("notes/🙂/plain.md"),
+            "notes/🙂/plain.md"
+        );
     }
 
     #[test]
@@ -3897,6 +3956,47 @@ mod runtime_index_tests {
     async fn create_test_workspace() -> (Workspace, tempfile::TempDir) {
         let (db, temp_dir) = create_test_database().await;
         (Workspace::new_with_db("runtime_index_test", db), temp_dir)
+    }
+
+    #[tokio::test]
+    async fn every_write_lane_rejects_control_bearing_paths_without_persisting() {
+        fn assert_invalid_path<T>(result: Result<T, WorkspaceError>) {
+            assert!(matches!(result, Err(WorkspaceError::InvalidPath { .. })));
+        }
+
+        let (workspace, _temp_dir) = create_test_workspace().await;
+        for path in [
+            "notes/forged\ncontinuation.md",
+            "notes/c1\u{85}.md",
+            "notes/trimmed-carriage-return\r",
+        ] {
+            assert_invalid_path(workspace.write(path, "replace").await);
+            assert_invalid_path(workspace.append(path, "append").await);
+            assert_invalid_path(
+                workspace
+                    .write_to_layer("private", path, "layer replace", false)
+                    .await,
+            );
+            assert_invalid_path(
+                workspace
+                    .append_to_layer("private", path, "layer append", false)
+                    .await,
+            );
+            assert_invalid_path(
+                workspace
+                    .write_backup_snapshot(&format!("backups/{path}"), "snapshot")
+                    .await,
+            );
+        }
+
+        assert!(
+            workspace
+                .list_all()
+                .await
+                .expect("list after refused writes")
+                .is_empty(),
+            "a rejected path must not create a document or directory"
+        );
     }
 
     #[tokio::test]
