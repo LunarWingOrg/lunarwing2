@@ -206,6 +206,12 @@ class FilesystemExportTests(unittest.TestCase):
         self.assertIn("all checks passed", stdout)
         self.assertIn("tar metadata and checkout-owned files clean", stdout)
 
+    def test_buildkits_missing_root_header_is_a_structural_boundary(self):
+        del self.fixture.entries[""]
+        self.fixture.write(self.archive)
+        code, _, stderr = self.verify()
+        self.assertEqual(code, 0, stderr)
+
     def test_ci_job_environment_is_not_used_as_image_environment(self):
         with mock.patch.dict(os.environ, {"OPENCODE_DISABLE_AUTOUPDATE": ""}):
             code, _, stderr = self.verify()

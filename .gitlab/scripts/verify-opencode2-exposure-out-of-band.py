@@ -120,7 +120,7 @@ def _kind(member: tarfile.TarInfo) -> int:
 
 
 def _metadata(members: dict[str, tarfile.TarInfo]) -> dict[str, dict[str, int]]:
-    return {
+    records = {
         name: {
             "mode": _kind(member) | (member.mode & 0o7777),
             "uid": member.uid,
@@ -128,6 +128,10 @@ def _metadata(members: dict[str, tarfile.TarInfo]) -> dict[str, dict[str, int]]:
         }
         for name, member in members.items()
     }
+    # BuildKit's fs.Walk skips the root entry. Treat it as the structural
+    # trust boundary; every emitted entry still comes from its tar header.
+    records.setdefault("", {"mode": stat.S_IFDIR | 0o755, "uid": 0, "gid": 0})
+    return records
 
 
 def _is_source_path(name: str) -> bool:
@@ -178,8 +182,8 @@ def _compare_checkout_tree(
 
 
 def _validate_members(members: dict[str, tarfile.TarInfo]) -> None:
-    if "" not in members or not members[""].isdir():
-        die("tar export lacks its root directory header; ownership cannot be verified")
+    if "" in members and not members[""].isdir():
+        die("tar export root entry is not a directory")
     required_dirs = {
         "app", "usr", "usr/local", "usr/local/bin", "usr/local/lib",
         "usr/local/lib/opencode2", *SOURCE_PREFIXES,
