@@ -1597,8 +1597,9 @@ mod tests {
     /// `JobAlreadyCompleted` arm is what actually stops the late-`/complete`
     /// side effects — it is the substance of DZ-7 and EE-6. This handler-level
     /// test drives the real handler with an armed terminal claim, then asserts
-    /// the job's stored status is not overwritten, no `JobResult` reaches the
-    /// event channel, and the `ContextManager` state is unchanged.
+    /// the handle state is unchanged, no `JobResult` reaches the event
+    /// channel, and the `ContextManager` state is unchanged. With `store: None`,
+    /// this test does not observe persisted job status.
     #[tokio::test]
     async fn report_complete_after_terminal_claim_skips_side_effects() {
         use crate::context::ContextManager;
@@ -1669,7 +1670,7 @@ mod tests {
             post_ctx.state, pre_ctx.state,
             "a late /complete must not move the ContextManager"
         );
-        // The handle's stored status must stay the terminal claim, not the
+        // The handle state must stay the terminal claim, not the
         // late success.
         let handle = state.job_manager.get_handle(job_id).await.unwrap();
         assert_eq!(
@@ -1683,9 +1684,9 @@ mod tests {
 
         // Mutation check: if the `JobAlreadyCompleted` arm is removed so the
         // duplicate falls through to the generic error branch, report_complete
-        // still persists `completed`, broadcasts and transitions the
-        // ContextManager — every assertion above would fail. (Verified
-        // offline by the reviewer; the pin catches any future regression of
-        // that class.)
+        // broadcasts and transitions the ContextManager. Those two assertions
+        // carry the regression pin; the handle assertions above do not detect
+        // this mutant. No persisted-status write is observed without a store.
+        // Run-221 review of !1932 verified this mutant is killed.
     }
 }
