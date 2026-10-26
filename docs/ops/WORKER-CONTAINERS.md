@@ -46,19 +46,19 @@ Each lane enforces the strip at its task-process boundary:
   its own copy. The one-shot `cli` and `acp` modes exec the task process the
   same way. Pinned by the worker entrypoint harness, which asserts both
   directions (serve sees it absent, bridge sees it present) plus every
-  one-shot mode. Both executors keep task `context.environment` on the request
-  only (run-209 NU-1): it is **not** merged into the bridge's `process.env`, so
-  no agent-chosen grant name (`options.credential_grants[].env_var` at
+  one-shot mode. The serve process cannot receive per-task environment updates
+  from the bridge, so both executors reject any non-empty `context.environment`
+  before creating an SDK client or session (**WI#474**). The task returns an
+  explicit error telling the caller to resubmit without credentials or use
+  kimi/pebble; grants are never silently accepted as a no-op. They are also
+  **never** merged into the bridge's `process.env` (run-209 NU-1), so no
+  agent-chosen grant name (`options.credential_grants[].env_var` at
   `create_job`) can alter shared bridge lazy reads (task identity, serve auth,
   retry/heartbeat/abort knobs, tool-proxy timeout) or inject the hub credential.
-  On these lanes the values do not reach task code at all — the serve process
-  is started by the entrypoint with its own scrubbed environment — so an
-  opencode credential grant is currently ineffective; that residual and its
-  live-tenant confirmation are tracked as **WI#474**. The v1 serve-log scrub
-  still redacts the request's per-task values explicitly (run-92 FJ-6), not by
-  reading them back from `process.env`. Pinned per lane by the env sampled at
-  prompt time, asserting that neither the reserved names nor an ordinary grant
-  key ever lands in the shared env.
+  The v1 serve-log scrub covers boot-environment values; rejected task maps
+  cannot reach that enrichment path. Executor pins assert zero SDK calls,
+  unchanged bridge credentials, no grant values in diagnostics, and closure of
+  the v1 follow-up queue on the early return.
 - **Pebble** — `spawn_pebble` rebuilds the child env via `env_clear()` +
   `strip_bridge_reserved_env` (everything else preserved: PATH, locale,
   `PEBBLE_*` provider variables) and drops task-supplied re-injections of the
