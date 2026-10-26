@@ -2,6 +2,7 @@
 name = "unix-socket-client"                                               
 version = "0.1.0"                                                         
 edition = "2021"                                               
+license = "AGPL-3.0-or-later" 
                                                                           
 [dependencies]                                                 
 tokio = { version = "1.0", features = ["full"] }                          

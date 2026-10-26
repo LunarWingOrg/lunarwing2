@@ -3,7 +3,7 @@ name = "web-search-tool"
 version = "0.2.0"
 edition = "2021"
 description = "Brave Web Search tool for LunarWing (WASM component)"
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0-or-later"
 publish = false
 
 [dependencies]

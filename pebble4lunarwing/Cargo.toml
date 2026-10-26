@@ -3,6 +3,7 @@ name = "pebble4lunarwing"
 version = "0.1.0"
 edition = "2021"
 publish = false
+license = "AGPL-3.0-or-later"
 
 [dependencies]
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
