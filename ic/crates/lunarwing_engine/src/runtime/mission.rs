@@ -83,10 +83,10 @@ const SHUTDOWN_STOP_GRACE: Duration = Duration::from_secs(3);
 /// writes. The mission row (history + dedup release) is saved before the
 /// retry marker, so an abort between the two saves leaves a mission row
 /// without a marker (the key already released) and an abort before the
-/// mission save leaves no trace with the key still recorded on the old row
-/// (the stuck-key residual, WI#394) — never a marker whose dedup release
-/// never saved. Markers written in the opposite order by older builds are
-/// healed by the next boot's retry recovery.
+/// mission save can leave a settled-stop thread beside the old mission row
+/// with its key still recorded. The next boot releases that key without
+/// re-firing (WI#394); markers written in the opposite order by older builds
+/// are healed by the same retry recovery pass.
 const SHUTDOWN_SETTLE_BUDGET: Duration = Duration::from_secs(8);
 /// Oldest age a pending-shutdown-interruption stamp may reach and still be
 /// resolved into a retry (WI#337). The resolution is a next-boot affair: a
@@ -2910,6 +2910,10 @@ impl MissionManager {
     /// graceful shutdown persist their marker too, via the outcome watcher's
     /// shutdown stop (WI#276).
     ///
+    /// The same pass releases a dedup key stranded by the settled-stop abort
+    /// window (WI#394). That heal is record-only and runs for every status;
+    /// only the retry recovery below is restricted to Active missions.
+    ///
     /// Call after thread checkpoint recovery: threads still holding a
     /// `mission_retry` marker are supposed to be terminal — a Suspended row
     /// means checkpoint recovery already owns its future, so the sweep
@@ -2919,8 +2923,11 @@ impl MissionManager {
         let mut scheduled = Vec::new();
         // A previously scheduled retry can outlive this process's active
         // index (e.g. bootstrap skips a project). Discover from durable
-        // mission records instead; paused and terminal missions stay inert.
+        // mission records instead; paused and terminal missions stay inert
+        // after the status-independent dedup heal.
         for mission in self.store.list_all_missions_global().await? {
+            self.release_stuck_trigger_key_for_settled_stop(&mission)
+                .await;
             if mission.status != MissionStatus::Active {
                 continue;
             }
@@ -3051,6 +3058,103 @@ impl MissionManager {
                 );
             }
         }
+    }
+
+    /// Release the dedup key left by an abort after a host stop settled but
+    /// before the outcome processor saved the mission row (WI#394). The fire
+    /// stays record-only: only an external redelivery may re-fire it. This
+    /// runs for every mission status and independently of retry policy.
+    async fn release_stuck_trigger_key_for_settled_stop(&self, snapshot: &Mission) {
+        let Some((thread_id, key)) = Self::settled_stop_dedup_candidate(snapshot) else {
+            return;
+        };
+        // The global-listing snapshot may be stale. Re-check both rows under
+        // the fire lock so a concurrent fire or outcome keeps its own key.
+        let lock = mission_lock(&self.fire_locks, snapshot.id).await;
+        let _guard = lock.lock().await;
+        let mut current = match self.store.load_mission(snapshot.id).await {
+            Ok(Some(current)) => current,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(
+                    mission_id = %snapshot.id,
+                    %thread_id,
+                    %error,
+                    "failed to reload mission for settled-stop dedup recovery"
+                );
+                return;
+            }
+        };
+        let Some((current_thread_id, current_key)) = Self::settled_stop_dedup_candidate(&current)
+        else {
+            return;
+        };
+        if current_thread_id != thread_id || current_key != key {
+            return;
+        }
+        let thread = match self.store.load_thread(thread_id).await {
+            Ok(Some(thread)) => thread,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(
+                    mission_id = %snapshot.id,
+                    %thread_id,
+                    %error,
+                    "failed to load thread for settled-stop dedup recovery"
+                );
+                return;
+            }
+        };
+        if !Self::is_unowned_settled_host_stop(&current, &thread) {
+            return;
+        }
+        current.processed_trigger_keys.retain(|k| k != &key);
+        current.updated_at = Utc::now();
+        if let Err(error) = self.store.save_mission(&current).await {
+            warn!(
+                mission_id = %snapshot.id,
+                %thread_id,
+                dedup_key = %key,
+                %error,
+                "failed to release stuck trigger dedup key after settled stop"
+            );
+        } else {
+            debug!(
+                mission_id = %snapshot.id,
+                %thread_id,
+                dedup_key = %key,
+                "released stuck trigger dedup key after settled-stop abort"
+            );
+        }
+    }
+
+    /// The snapshot's newest fire and payload key, when both are present and
+    /// no shutdown-resolution stamp owns that fire.
+    fn settled_stop_dedup_candidate(mission: &Mission) -> Option<(ThreadId, String)> {
+        let thread_id = *mission.thread_history.last()?;
+        let key = mission
+            .last_trigger_payload
+            .as_ref()
+            .and_then(trigger_dedup_key)?;
+        if !mission.has_processed_trigger(&key)
+            || stamped_interrupted_threads(mission).contains(&thread_id)
+        {
+            return None;
+        }
+        Some((thread_id, key))
+    }
+
+    /// Whether the newest fire is the WI#394 crash state, with the same
+    /// type/project/owner checks as the other mission recovery paths.
+    fn is_unowned_settled_host_stop(mission: &Mission, thread: &Thread) -> bool {
+        mission.thread_history.last() == Some(&thread.id)
+            && thread.thread_type == ThreadType::Mission
+            && thread.state == ThreadState::Failed
+            && thread.project_id == mission.project_id
+            && (mission.owner_id().is_shared() || thread.user_id == mission.user_id)
+            && !thread.is_failed_by_restart()
+            && RetryState::from_metadata(&thread.metadata).is_none()
+            && is_settled_host_stop(thread)
     }
 
     /// Emit and acknowledge the boot-time notice for a re-armed retry whose
@@ -4516,11 +4620,10 @@ async fn process_mission_outcome_and_notify(
     // lands first and the retry marker is the final commit write. An abort
     // between the two saves leaves a mission row without a marker — the
     // dedup key already released for redelivery — while an abort before the
-    // mission save leaves no trace with the key still recorded on the old
-    // row (the settled stop may already have persisted the thread row; the
-    // stuck-key residual, WI#394) — never a marker whose mission-side
-    // release never saved. Markers written in the opposite order by older
-    // builds are healed by the boot sweep.
+    // mission save can leave a settled-stop thread beside the old row with
+    // its key still recorded. The boot sweep releases that key without
+    // re-firing (WI#394) and also heals markers written in the opposite
+    // order by older builds.
     mission.updated_at = chrono::Utc::now();
     store.save_mission(&mission).await?;
 
@@ -12524,6 +12627,203 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             "the re-fire must spawn after the heal"
         );
         mgr.shutdown().await;
+    }
+
+    /// Seed WI#394's crash prefix: the stop is terminal on the thread, but
+    /// the old mission row still owns the fire's dedup key and has no stamp.
+    async fn settled_stop_stuck_key_fixture(
+        store: &Arc<TestStore>,
+        source: &str,
+    ) -> (Mission, Thread, serde_json::Value, String) {
+        let project_id = ProjectId::new();
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "webhook-mission",
+            "goal",
+            MissionCadence::Manual,
+        );
+        let payload = serde_json::json!({"source_thread_id": source});
+        let key = trigger_dedup_key(&payload).expect("payload carries a dedup key");
+        mission.last_trigger_payload = Some(payload.clone());
+        mission.record_processed_trigger(key.clone());
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        thread
+            .transition_to(ThreadState::Running, None)
+            .expect("created -> running");
+        thread
+            .transition_to(
+                ThreadState::Failed,
+                Some(crate::types::thread::EXECUTION_STOPPED_REASON.to_string()),
+            )
+            .expect("running -> host-stopped");
+        mission.thread_history.push(thread.id);
+        store.save_thread(&thread).await.unwrap();
+        store.save_mission(&mission).await.unwrap();
+        (mission, thread, payload, key)
+    }
+
+    /// WI#394: boot releases the stuck key without re-firing the lost run.
+    /// The heal is independent of Active status and retry policy; an external
+    /// redelivery of the Active mission's payload is no longer suppressed.
+    #[tokio::test]
+    async fn settled_stop_abort_heal_releases_keys_without_scheduling_retries() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        mgr.arm_retry_wake().await;
+        let (active, _, payload, active_key) =
+            settled_stop_stuck_key_fixture(&store, "wi394-active").await;
+        let (mut paused, _, _, paused_key) =
+            settled_stop_stuck_key_fixture(&store, "wi394-paused").await;
+        paused.status = MissionStatus::Paused;
+        paused.retry_policy.max_retries = 0;
+        store.save_mission(&paused).await.unwrap();
+
+        assert!(
+            mgr.recover_pending_mission_retries()
+                .await
+                .unwrap()
+                .is_empty(),
+            "the heal is record-only and never arms a retry"
+        );
+        for (mission_id, key) in [(active.id, active_key), (paused.id, paused_key)] {
+            let healed = store.load_mission(mission_id).await.unwrap().unwrap();
+            assert!(
+                !healed.has_processed_trigger(&key),
+                "the settled-stop crash key must be released"
+            );
+        }
+        assert!(mgr.task_handles.lock().await.is_empty());
+        assert!(
+            mgr.fire_mission(active.id, "test-user", Some(payload))
+                .await
+                .unwrap()
+                .is_some(),
+            "external redelivery must spawn after the heal"
+        );
+        mgr.shutdown().await;
+    }
+
+    /// A stamped fire belongs to shutdown resolution, and a restart-failed
+    /// fire belongs to WI#301. Neither may be rewritten by the WI#394 heal.
+    #[tokio::test]
+    async fn settled_stop_abort_heal_defers_to_stamp_and_restart_recovery() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        let (mut stamped, stamped_thread, _, stamped_key) =
+            settled_stop_stuck_key_fixture(&store, "wi394-stamped").await;
+        stamped.metadata = serde_json::json!({ PENDING_SHUTDOWN_INTERRUPTION_KEY: {
+            (stamped_thread.id.0.to_string()): { "recorded_at": Utc::now().to_rfc3339() },
+        }});
+        store.save_mission(&stamped).await.unwrap();
+        let (restart, mut restart_thread, _, restart_key) =
+            settled_stop_stuck_key_fixture(&store, "wi394-restart").await;
+        restart_thread.mark_failed_by_restart();
+        store.save_thread(&restart_thread).await.unwrap();
+
+        assert!(
+            mgr.recover_pending_mission_retries()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        for (mission_id, key) in [(stamped.id, stamped_key), (restart.id, restart_key)] {
+            let untouched = store.load_mission(mission_id).await.unwrap().unwrap();
+            assert!(
+                untouched.has_processed_trigger(&key),
+                "another recovery path retains ownership of this fire"
+            );
+        }
+        mgr.shutdown().await;
+    }
+
+    /// The mission listing is only a candidate snapshot. If a newer fire
+    /// lands before the fire lock, the heal must not release an older key or
+    /// save the stale row over the new fire's payload and history.
+    #[tokio::test]
+    async fn settled_stop_abort_heal_rechecks_snapshot_under_fire_lock() {
+        let gate = Arc::new(GlobalListGate::new());
+        let mut raw_store = TestStore::new();
+        raw_store.list_all_missions_global_gate = Some(Arc::clone(&gate));
+        let store = Arc::new(raw_store);
+        let (mission, _, _, old_key) = settled_stop_stuck_key_fixture(&store, "wi394-old").await;
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        let recovery = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.recover_pending_mission_retries().await })
+        };
+        gate.snapshotted.notified().await;
+
+        let mut newer = store.load_mission(mission.id).await.unwrap().unwrap();
+        let new_payload = serde_json::json!({"source_thread_id": "wi394-new"});
+        let new_key = trigger_dedup_key(&new_payload).expect("new payload has a key");
+        let new_thread = Thread::new(
+            "goal",
+            ThreadType::Mission,
+            mission.project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        newer.thread_history.push(new_thread.id);
+        newer.last_trigger_payload = Some(new_payload);
+        newer.record_processed_trigger(new_key.clone());
+        store.save_thread(&new_thread).await.unwrap();
+        store.save_mission(&newer).await.unwrap();
+        gate.open.notify_one();
+
+        assert!(recovery.await.unwrap().unwrap().is_empty());
+        let saved = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(saved.thread_history.last(), Some(&new_thread.id));
+        assert!(saved.has_processed_trigger(&old_key));
+        assert!(saved.has_processed_trigger(&new_key));
+        mgr.shutdown().await;
+    }
+
+    /// Defense in depth for the agent-writable mission record (WI#338): a
+    /// marker, wrong thread type, cross-project/user id, or non-failed state
+    /// disqualifies the candidate even when its terminal event says host stop.
+    #[tokio::test]
+    async fn settled_stop_abort_heal_requires_an_unowned_matching_mission_thread() {
+        let store = Arc::new(TestStore::new());
+        let (mission, thread, payload, _) =
+            settled_stop_stuck_key_fixture(&store, "wi394-guards").await;
+        assert!(MissionManager::is_unowned_settled_host_stop(
+            &mission, &thread
+        ));
+
+        let pending = PendingMissionRetry::new(
+            mission.id,
+            "test-user",
+            1,
+            Some(payload),
+            &mission.retry_policy,
+            Utc::now(),
+        )
+        .unwrap();
+        let mut marked = thread.clone();
+        marked.metadata = serde_json::json!({
+            RetryState::METADATA_KEY: pending.to_retry_state()
+        });
+        let mut wrong_type = thread.clone();
+        wrong_type.thread_type = ThreadType::Foreground;
+        let mut wrong_project = thread.clone();
+        wrong_project.project_id = ProjectId::new();
+        let mut wrong_user = thread.clone();
+        wrong_user.user_id = "another-user".into();
+        let mut not_failed = thread.clone();
+        not_failed.state = ThreadState::Completed;
+        for candidate in [marked, wrong_type, wrong_project, wrong_user, not_failed] {
+            assert!(
+                !MissionManager::is_unowned_settled_host_stop(&mission, &candidate),
+                "candidate must remain with its existing recovery owner"
+            );
+        }
     }
 
     /// WI#276 review: the retry marker is the commit write of outcome

@@ -25,7 +25,7 @@ use crate::bridge::effect_adapter::{
     EffectBridgeAdapter, MISSIONS_CAPABILITY, mission_action_defs,
 };
 use crate::bridge::llm_adapter::{DEFAULT_MAX_OUTPUT_TOKENS, LlmBridgeAdapter};
-use crate::bridge::store_adapter::HybridStore;
+use crate::bridge::store_adapter::{HybridStore, canonical_default_project};
 use crate::channels::web::sse::SseManager;
 use crate::channels::{IncomingMessage, OutgoingResponse, StatusUpdate};
 use crate::db::Database;
@@ -891,13 +891,18 @@ async fn resolve_user_project(
         return Ok(fallback);
     }
 
-    // Look for an existing default project owned by this user
+    // Look for an existing default project owned by this user. The pick is
+    // deterministic (WI#321) so a conversation cannot land in a different
+    // "default" project on each resolution; the duplicate warning is emitted
+    // once at boot by `warn_duplicate_default_projects`, never here, because
+    // this path runs for every message.
     let projects = store
         .list_projects(user_id)
         .await
         .map_err(|e| engine_err("project lookup", e))?;
 
-    if let Some(project) = projects.iter().find(|p| p.name == "default") {
+    let defaults: Vec<&lunarwing_engine::Project> = projects.iter().collect();
+    if let Some(project) = canonical_default_project(&defaults) {
         return Ok(project.id);
     }
 
@@ -910,6 +915,31 @@ async fn resolve_user_project(
         .map_err(|e| engine_err("create project", e))?;
     debug!(user_id, project_id = %pid, "created default project for user");
     Ok(pid)
+}
+
+/// Resolve the owner's default project during engine initialization.
+async fn resolve_owner_default_project(
+    store: &Arc<dyn Store>,
+    owner_id: &str,
+) -> Result<lunarwing_engine::ProjectId, Error> {
+    // Keep this pick deterministic (WI#321); duplicate defaults are reported
+    // once by the store's boot scan, not on this path.
+    let owner_projects = store
+        .list_projects(owner_id)
+        .await
+        .map_err(|e| engine_err("store error", e))?;
+    let owner_defaults: Vec<&Project> = owner_projects.iter().collect();
+    if let Some(project) = canonical_default_project(&owner_defaults) {
+        return Ok(project.id);
+    }
+
+    let project = Project::new(owner_id, "default", "Default project for engine v2");
+    let project_id = project.id;
+    store
+        .save_project(&project)
+        .await
+        .map_err(|e| engine_err("store error", e))?;
+    Ok(project_id)
 }
 
 /// Persistent engine state that lives across messages.
@@ -1827,24 +1857,7 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
     migrate_legacy_user_ids(&store_dyn, owner_id).await;
 
     // Reuse the persisted default project when available.
-    let project_id = match store
-        .list_projects(owner_id)
-        .await
-        .map_err(|e| engine_err("store error", e))?
-        .into_iter()
-        .find(|project| project.name == "default")
-    {
-        Some(project) => project.id,
-        None => {
-            let project = Project::new(owner_id, "default", "Default project for engine v2");
-            let project_id = project.id;
-            store
-                .save_project(&project)
-                .await
-                .map_err(|e| engine_err("store error", e))?;
-            project_id
-        }
-    };
+    let project_id = resolve_owner_default_project(&store_dyn, owner_id).await?;
 
     let conversation_manager = Arc::new(ConversationManager::new(
         Arc::clone(&thread_manager),
@@ -5003,11 +5016,12 @@ async fn resolve_user_project_readonly(
         return fallback;
     }
     match store.list_projects(user_id).await {
-        Ok(projects) => projects
-            .iter()
-            .find(|project| project.name == "default")
-            .map(|project| project.id)
-            .unwrap_or(fallback),
+        Ok(projects) => {
+            let defaults: Vec<&Project> = projects.iter().collect();
+            canonical_default_project(&defaults)
+                .map(|project| project.id)
+                .unwrap_or(fallback)
+        }
         Err(_) => fallback,
     }
 }
@@ -7639,6 +7653,69 @@ pub(crate) mod tests {
         let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
         *lock.write().await = None;
         *lock.write().await = state;
+    }
+
+    async fn assert_oldest_default_at_every_call_site(
+        store: &Arc<dyn Store>,
+        fallback: lunarwing_engine::ProjectId,
+        expected: lunarwing_engine::ProjectId,
+    ) {
+        let routed = resolve_user_project(store, "bob", fallback)
+            .await
+            .expect("resolve routing project");
+        assert_eq!(
+            routed, expected,
+            "routing must use the oldest default, not map order"
+        );
+
+        let listed = resolve_user_project_readonly(store, "bob", fallback).await;
+        assert_eq!(
+            listed, expected,
+            "mission listing must use the same oldest default"
+        );
+
+        let boot = resolve_owner_default_project(store, "bob")
+            .await
+            .expect("resolve owner project");
+        assert_eq!(
+            boot, expected,
+            "engine initialization must use the same oldest default"
+        );
+    }
+
+    /// Every default-project call site must make the same deterministic pick
+    /// (WI#321 NY-20/OA-7), whatever order the store returns its listing in.
+    #[tokio::test]
+    async fn default_project_resolution_picks_the_oldest_at_every_call_site() {
+        let store = Arc::new(TestStore::new());
+        let mut oldest = Project::new("bob", "default", "oldest");
+        oldest.created_at = chrono::Utc::now() - chrono::Duration::hours(2);
+        let mut newest = Project::new("bob", "default", "newest");
+        newest.created_at = chrono::Utc::now();
+        // An older non-default project must never be mistaken for the default.
+        let mut other = Project::new("bob", "research", "not a default");
+        other.created_at = chrono::Utc::now() - chrono::Duration::hours(3);
+        store.save_project(&other).await.expect("save other");
+        store.save_project(&oldest).await.expect("save oldest");
+        store.save_project(&newest).await.expect("save newest");
+
+        let store_dyn: Arc<dyn Store> = store;
+        let fallback = Project::new("alice", "default", "engine default").id;
+        for _ in 0..3 {
+            assert_oldest_default_at_every_call_site(&store_dyn, fallback, oldest.id).await;
+        }
+
+        // `TestStore` lists from a `HashMap`, so a first-match `.find()` mutant
+        // picks the oldest only by luck. Rebuild the store — and with it the
+        // map's iteration order — enough times that surviving is not credible.
+        for _ in 0..20 {
+            let shuffled = Arc::new(TestStore::new());
+            shuffled.save_project(&other).await.expect("save other");
+            shuffled.save_project(&oldest).await.expect("save oldest");
+            shuffled.save_project(&newest).await.expect("save newest");
+            let shuffled_dyn: Arc<dyn Store> = shuffled;
+            assert_oldest_default_at_every_call_site(&shuffled_dyn, fallback, oldest.id).await;
+        }
     }
 
     #[tokio::test]
