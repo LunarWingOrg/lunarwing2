@@ -40,7 +40,11 @@ type parsedLine struct {
 	node *parser.Node
 }
 
-func canonical(text string) string { return strings.Join(strings.Fields(text), " ") }
+func canonical(text string) string {
+	return strings.Join(strings.FieldsFunc(text, func(r rune) bool {
+		return r == ' ' || r == '\t'
+	}), " ")
+}
 
 func instructionName(text string) string {
 	fields := strings.Fields(text)
@@ -163,9 +167,6 @@ func checkEnv(line parsedLine) error {
 }
 
 func checkProtected(line parsedLine) error {
-	if line.name != "ARG" && line.name != "ENV" && line.name != "RUN" {
-		return nil
-	}
 	if sameInstruction(line, anchorArg) {
 		return nil
 	}
@@ -316,8 +317,11 @@ func policy(lines []parsedLine) error {
 		if len(line.node.Heredocs) > 0 {
 			errs = append(errs, fmt.Errorf("Dockerfile heredocs are not allowed (run-109 GW-2): %s", line.text))
 		}
-		if line.name == "SHELL" {
+		switch line.name {
+		case "SHELL":
 			errs = append(errs, fmt.Errorf("Dockerfile SHELL overrides are not allowed (run-109 GW-3)"))
+		case "ADD", "ONBUILD", "VOLUME":
+			errs = append(errs, fmt.Errorf("Dockerfile %s is not allowed in the opencode2 lane", line.name))
 		}
 		if err := checkProtected(line); err != nil {
 			errs = append(errs, err)

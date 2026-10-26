@@ -100,13 +100,19 @@ func TestParserDivergenceFixtures(t *testing.T) {
 }
 
 func TestStructuralPolicyFixtures(t *testing.T) {
+	builderUser := strings.Replace(
+		strings.TrimSuffix(validDockerfile, "USER 10003:10003\n"),
+		"FROM example.invalid/bun AS runtime",
+		"USER 10003:10003\nFROM example.invalid/bun AS runtime",
+		1,
+	)
 	cases := []struct {
 		name string
 		src  string
 		want string
 	}{
 		{"missing anchor", strings.Replace(validDockerfile, anchorArg, "", 1), "must declare ARG LUNARWING_WRAPPER_SHA256="},
-		{"anchor not adjacent", strings.Replace(validDockerfile, anchorArg, anchorArg+"ENV SAFE=value\n", 1), "immediately above"},
+		{"anchor not adjacent", strings.Replace(validDockerfile, anchorArg, anchorArg+"\nENV SAFE=value\n", 1), "immediately above"},
 		{"post-assert RUN", validDockerfile + "RUN rm -rf /app/scripts\n", "after --image-filesystem"},
 		{"post-assert stage", validDockerfile + "FROM example.invalid/bun AS unchecked\n", "after --image-filesystem"},
 		{"post-assert COPY", validDockerfile + "COPY --from=runtime / /ignored\n", "after --image-filesystem"},
@@ -115,7 +121,19 @@ func TestStructuralPolicyFixtures(t *testing.T) {
 		{"legacy ENV key", insertBeforeAssertion(validDockerfile, "ENV STAGE final\n"), "literal, unprotected key=value"},
 		{"legacy ENV with equals in value", insertBeforeAssertion(validDockerfile, "ENV STAGE final=other\n"), "literal, unprotected key=value"},
 		{"SHELL", insertBeforeAssertion(validDockerfile, "SHELL [\"/bin/sh\", \"-c\"]\n"), "SHELL overrides are not allowed"},
+		{"ONBUILD protected name", insertBeforeAssertion(validDockerfile, "ONBUILD ENV LUNARWING_REAL_OPENCODE=/tmp/other\n"), "must not override exposure-policy variables"},
+		{"LABEL protected name", insertBeforeAssertion(validDockerfile, "LABEL policy=$LUNARWING_WRAPPER_SHA256\n"), "must not override exposure-policy variables"},
+		{"ONBUILD", insertBeforeAssertion(validDockerfile, "ONBUILD RUN true\n"), "ONBUILD is not allowed"},
+		{"VOLUME", insertBeforeAssertion(validDockerfile, "VOLUME [\"/workspace\"]\n"), "VOLUME is not allowed"},
+		{"ADD git source", insertBeforeAssertion(validDockerfile, "ADD https://github.com/anomalyco/opencode.git /tmp/opencode\n"), "ADD is not allowed"},
+		{"ADD URL source", insertBeforeAssertion(validDockerfile, "ADD https://example.invalid/opencode /tmp/opencode\n"), "ADD is not allowed"},
+		{"unicode assertion space", strings.Replace(validDockerfile, "--profile opencode2 --image-filesystem", "--profile opencode2\u00a0--image-filesystem", 1), "must verify installed policy-file ownership"},
 		{"final root user", validDockerfile + "USER 0:0\n", "last USER"},
+		{"builder USER does not satisfy final stage", builderUser, "last USER"},
+		{"binary COPY outside final stage", strings.Replace(validDockerfile, "FROM example.invalid/bun AS runtime\n"+wrapperBinary, wrapperBinary+"\nFROM example.invalid/bun AS runtime", 1), "no longer moves the pinned binary"},
+		{"missing scripts COPY", strings.Replace(validDockerfile, scriptsCopy+"\n", "", 1), "root-owned scripts COPY"},
+		{"missing config COPY", strings.Replace(validDockerfile, configCopy+"\n", "", 1), "root-owned config COPY"},
+		{"missing boot COPY", strings.Replace(validDockerfile, bootCopy+"\n", "", 1), "root-owned boot COPY"},
 		{"missing wrapper scan", strings.Replace(validDockerfile, "RUN install -D -m 0755", "RUN true # RUN install -D -m 0755", 1), "no longer installs the exposure-guard wrapper"},
 		{"compile-out after build", strings.Replace(validDockerfile, compileRun+"\n"+guardedBuild, guardedBuild+"\n"+compileRun, 1), "compile-out"},
 		{"missing read-only step", strings.Replace(validDockerfile, "RUN chmod -R a-w", "RUN true # chmod -R a-w", 1), "read-only chmod"},
