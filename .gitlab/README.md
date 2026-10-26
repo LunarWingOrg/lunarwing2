@@ -51,8 +51,8 @@ Pinned images:
   `sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f`
 - cargo-deny 0.20.2 x86-64 musl archive:
   `sha256:9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f`
-- BuildKit 0.25.1 rootless OCI index:
-  `sha256:0c0ce4929976ace509f7a53878303504b2de8857829aea4932af9f7325a30f51`
+- BuildKit 0.31.1 rootless OCI index:
+  `sha256:946cf909534b789c9b84af75e6d4f8cb23c3b9cb387daec5ba0f4878a3e4647c`
 - Trivy 0.74.0 OCI index:
   `sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969`
 - pgvector PostgreSQL 16 OCI index:
