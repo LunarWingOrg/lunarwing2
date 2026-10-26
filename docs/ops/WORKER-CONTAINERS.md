@@ -736,7 +736,12 @@ Enforced controls (opencode2 lane unless noted):
    In mt-admin, `build_opencode2_worker` uses a per-build candidate tag and
    `--iidfile`, then `create --pull=never` plus `cp`/`cmp` verifies regular
    files and modes, `diff --no-dereference` compares checkout-owned `/app`,
-   and the same full-config policy runs by immutable image ID. Cleanup is
+   and the same full-config policy runs by immutable image ID. mt-admin runs
+   as root while the checkout can be tenant-owned, so the policy is never
+   executed from the checkout: root reads its bytes (no symlink, regular
+   file, at most 1 MiB) into the root-owned scratch dir and runs that copy as
+   `nobody` via `setpriv --no-new-privs` with `python3 -I` and an empty
+   environment (run-221 OK-1). Cleanup is
    trapped, links are refused before comparison, and only the verified ID is
    tagged `:latest`. Note the `PATH` resolution is a *build-time* property:
    at runtime the agent-owned `~/.cargo/bin` and `~/go/bin` (five PATH

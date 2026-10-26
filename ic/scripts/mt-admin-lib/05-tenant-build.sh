@@ -1282,6 +1282,60 @@ _opencode2_compare_checkout_app() {
   done
 }
 
+# Run the checkout's image-config policy on the inspect JSON (stdin) without
+# executing checkout code as root (run-221 OK-1). On build-tenant and
+# upgrade-tenant the opencode2 dir is the tenant-owned checkout, so root only
+# reads the policy bytes (no symlink, regular file, bounded size) into the
+# root-owned scratch dir; the copy then runs as the unprivileged nobody account
+# in Python's isolated mode (-I: no script-dir or user-site imports, PYTHON*
+# ignored) with an empty environment. A planted scripts/json.py or an edited
+# policy can at most fail the check, never run as root.
+# Usage: _opencode2_run_image_config_policy <opencode2-dir> <root-owned-tmp-dir>
+_opencode2_run_image_config_policy() {
+  local opencode2_dir="$1" tmp_dir="$2" policy_dir python nobody_uid nobody_gid
+  python="$(command -v python3)" || {
+    echo "ERROR: python3 is required for the image-config policy (WI#425 out-of-band)" >&2
+    return 1
+  }
+  nobody_uid="$(id -u nobody 2>/dev/null)" || nobody_uid=''
+  nobody_gid="$(id -g nobody 2>/dev/null)" || nobody_gid=''
+  if [[ ! "$nobody_uid" =~ ^[1-9][0-9]*$ || ! "$nobody_gid" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: an unprivileged nobody account is required to run the image-config policy (WI#425 out-of-band)" >&2
+    return 1
+  fi
+  policy_dir="$tmp_dir/policy"
+  if ! mkdir -m 0755 "$policy_dir" || ! chmod 0711 "$tmp_dir"; then
+    return 1
+  fi
+  if ! "$python" -I -c '
+import os, stat, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+try:
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_size > 1048576:
+        sys.exit("not a regular file under 1 MiB")
+    chunks, total = [], 0
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > 1048576:
+            sys.exit("grew past 1 MiB while reading")
+        chunks.append(chunk)
+finally:
+    os.close(fd)
+with open(sys.argv[2], "xb") as out:
+    out.write(b"".join(chunks))
+' "$opencode2_dir/scripts/image_config_policy.py" "$policy_dir/image_config_policy.py"; then
+    echo "ERROR: cannot safely read the checkout image-config policy (WI#425 out-of-band)" >&2
+    return 1
+  fi
+  chmod 0644 "$policy_dir/image_config_policy.py" || return 1
+  setpriv --reuid="$nobody_uid" --regid="$nobody_gid" --clear-groups --no-new-privs -- \
+    env -i PATH=/usr/bin:/bin "$python" -I "$policy_dir/image_config_policy.py"
+}
+
 # Verify by immutable image ID, with subshell-scoped cleanup on every exit.
 # Usage: _verify_opencode2_image_out_of_band <image-id> <opencode2-dir> <wrapper-sha256>
 _verify_opencode2_image_out_of_band() (
@@ -1323,7 +1377,7 @@ _verify_opencode2_image_out_of_band() (
     echo "ERROR: cannot inspect full image config for $image_ref (WI#425 out-of-band)" >&2
     return 1
   }
-  if ! printf '%s' "$config_json" | python3 "$opencode2_dir/scripts/image_config_policy.py"; then
+  if ! printf '%s' "$config_json" | _opencode2_run_image_config_policy "$opencode2_dir" "$tmp_dir"; then
     verify_status=1
   fi
   if [[ "$verify_status" -eq 0 ]]; then

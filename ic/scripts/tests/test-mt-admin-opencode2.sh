@@ -42,6 +42,15 @@ sudo() {
   if [[ "${1:-}" == "-u" ]]; then shift 2; fi
   command "$@"
 }
+# The image-config policy drops to nobody via setpriv (run-221 OK-1). The
+# harness cannot change uid: record the call to a file (a subshell-safe
+# record) and run the wrapped command as the invoking user.
+setpriv() {
+  printf '%s\n' "$*" >> "$fixture/setpriv-calls"
+  while [[ $# -gt 0 && "$1" != -- ]]; do shift; done
+  shift
+  command "$@"
+}
 say() { :; }
 sanitize_name() { printf '%s' "$1"; }
 
@@ -373,6 +382,32 @@ else
   fail "opencode2 builder did not gate the :latest re-tag on the verified ID: ${OOB_TAG_CALLS[*]:-}"
 fi
 
+# run-221 OK-1: root never executes the checkout's policy file. A planted
+# scripts/json.py (untracked in the tenant checkout, copied into the image by
+# `COPY scripts/`, so the /app compare still passes) would be imported first
+# if the policy ran from its own directory.
+planted_marker="$fixture/planted-json-ran"
+cat > "$fixture/target/opencode2.4lunarwing/scripts/json.py" <<EOF
+import pathlib
+pathlib.Path("$planted_marker").write_text("ran")
+EOF
+: > "$fixture/setpriv-calls"
+if (build_opencode2_worker false false "$fixture/target") >"$fixture/oob-planted.log" 2>&1 \
+   && [[ ! -e "$planted_marker" ]]; then
+  pass 'image-config policy ignores a json.py planted next to it in the checkout'
+else
+  fail "planted checkout json.py ran or broke the verify: $(cat "$fixture/oob-planted.log")"
+fi
+rm -f "$fixture/target/opencode2.4lunarwing/scripts/json.py" "$planted_marker"
+nobody_uid="$(id -u nobody)"
+setpriv_call="$(head -n1 "$fixture/setpriv-calls")"
+if [[ "$setpriv_call" == "--reuid=$nobody_uid --regid=$(id -g nobody) --clear-groups --no-new-privs -- env -i PATH=/usr/bin:/bin "*" -I "*"/policy/image_config_policy.py" \
+   && "$setpriv_call" != *"$fixture/target"* ]]; then
+  pass 'image-config policy runs as nobody, isolated, from a root-owned copy'
+else
+  fail "image-config policy privilege drop wrong: $setpriv_call"
+fi
+
 BUILD_CALL=''
 build_opencode2_worker true false "$fixture/target" >/dev/null
 if [[ "$BUILD_CALL" == *'--no-cache'* ]]; then
@@ -542,6 +577,17 @@ oob_refusal_run "$fixture/oob-shell.log" 'a baked Shell override'
 assert_contains "$fixture/oob-shell.log" 'Shell override' \
   'Shell-override refusal names the drift'
 oob_shell_override=''
+
+# run-221 OK-1: root reads the checkout policy without following a symlink
+# (the image copy carries the same link, so only the policy read refuses).
+policy_file="$fixture/target/opencode2.4lunarwing/scripts/image_config_policy.py"
+mv "$policy_file" "$fixture/policy-real.py"
+ln -s "$fixture/policy-real.py" "$policy_file"
+oob_refusal_run "$fixture/oob-policy-link.log" 'a symlinked checkout image-config policy'
+assert_contains "$fixture/oob-policy-link.log" 'cannot safely read the checkout image-config policy' \
+  'symlinked checkout policy is refused before root reads through it'
+rm -f "$policy_file"
+mv "$fixture/policy-real.py" "$policy_file"
 
 # ── build flag forwarding through the dispatcher ─────────────────────────────
 require_root() { :; }

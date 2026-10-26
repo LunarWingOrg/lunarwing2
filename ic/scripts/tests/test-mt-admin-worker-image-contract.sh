@@ -129,6 +129,15 @@ sudo() {
   if [[ "${1:-}" == "-u" ]]; then shift 2; fi
   command "$@"
 }
+# The opencode2 image-config policy drops to nobody via setpriv (run-221
+# OK-1). The harness cannot change uid, so drop the setpriv options and run
+# the wrapped command as the invoking user; test-mt-admin-opencode2.sh pins
+# the drop itself.
+setpriv() {
+  while [[ $# -gt 0 && "$1" != -- ]]; do shift; done
+  shift
+  command "$@"
+}
 
 # WI#446 (run-174 LW-3): the sidecar directory must live OUTSIDE the tenant
 # home (root-owned host state), and a stale sidecar left by an older mt-admin
