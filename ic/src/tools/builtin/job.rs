@@ -4023,6 +4023,70 @@ mod tests {
         assert_eq!(unchanged.state, JobState::Completed);
     }
 
+    /// OA-17 (run-217 review, WI#383 EA-9): a job whose container is in the
+    /// `Finalizing` state (write-back promotion running) must be refused by the
+    /// cancel tool instead of falling through to mark the job cancelled
+    /// mid-promotion. Structural refusal variant (DH-4 nit) — the tool matches
+    /// `JobFinalizing`, not an error string.
+    #[tokio::test]
+    async fn test_cancel_job_refused_while_container_is_finalizing() {
+        use crate::orchestrator::job_manager::{ContainerHandle, HarnessJobState};
+
+        let manager = Arc::new(ContextManager::new(5));
+        let job_id = manager
+            .create_job_for_user("default", "Finalizing Job", "promoting write-back")
+            .await
+            .unwrap(); // safety: test
+        manager
+            .update_context(job_id, |ctx| ctx.transition_to(JobState::InProgress, None))
+            .await
+            .unwrap() // safety: test
+            .unwrap(); // safety: test
+
+        let jm = Arc::new(ContainerJobManager::new(
+            crate::orchestrator::job_manager::ContainerJobConfig::default(),
+            crate::orchestrator::TokenStore::new(),
+        ));
+        jm.containers.write().await.insert(
+            job_id,
+            ContainerHandle {
+                job_id,
+                container_id: "finalizing-container".to_string(),
+                state: crate::orchestrator::job_manager::ContainerState::Finalizing,
+                mode: JobMode::Harness,
+                owner_id: "default".to_string(),
+                mcp_servers: Vec::new(),
+                created_at: chrono::Utc::now(),
+                project_dir: None,
+                task_description: "finalizing".to_string(),
+                last_worker_status: None,
+                worker_iteration: 0,
+                completion_result: None,
+                harness: Some(HarnessJobState {
+                    staging_dir: None,
+                    write_back: None,
+                    promotion: None,
+                }),
+            },
+        );
+
+        let tool = CancelJobTool::new(Arc::clone(&manager)).with_sandbox(jm, None);
+        let ctx = JobContext::default();
+        let error = tool
+            .execute(serde_json::json!({ "job_id": job_id.to_string() }), &ctx)
+            .await
+            .unwrap_err(); // safety: test
+
+        let message = error.to_string();
+        assert!(
+            message.contains("finalizing write-back promotion"),
+            "cancel must refuse a Finalizing container structurally, got: {message}"
+        );
+        // The job must NOT have been marked cancelled mid-promotion.
+        let unchanged = manager.get_context(job_id).await.unwrap(); // safety: test
+        assert_eq!(unchanged.state, JobState::InProgress);
+    }
+
     #[tokio::test]
     async fn test_job_status_includes_fallback_deliverable() {
         let manager = Arc::new(ContextManager::new(5));
