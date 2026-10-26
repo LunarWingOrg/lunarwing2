@@ -710,3 +710,96 @@ process.exit(0)
     rmSync(mockDir, { recursive: true, force: true })
   }
 })
+
+function makeRequestMock(script: string): string {
+  const dir = mkdtempSync(join(tmpdir(), "kimi-request-mock-"))
+  const binPath = join(dir, "mock-kimi")
+  writeFileSync(binPath, `#!/usr/bin/env node\n${script}`, { mode: 0o755 })
+  chmodSync(binPath, 0o755)
+  return binPath
+}
+
+test("executeTask: heartbeat carries the current request index and elapsed wait (WI#477)", async () => {
+  const bin = makeRequestMock(`
+const write = (value) => process.stdout.write(JSON.stringify(value) + "\\n")
+setTimeout(() => {
+  write({ role: "assistant", tool_calls: [
+    { id: "call-1", type: "function", function: { name: "shell", arguments: "{}" } },
+  ] })
+  setTimeout(() => {
+    write({ role: "tool", tool_call_id: "call-1", content: "tool done" })
+    process.on("SIGTERM", () => {})
+    setInterval(() => {}, 1000)
+  }, 40)
+}, 40)
+`)
+  process.env.KIMI_PROGRESS_HEARTBEAT_MS = "40"
+  process.env.KIMI_SILENCE_TIMEOUT_MS = "250"
+  process.env.KIMI_KILL_GRACE_MS = "50"
+  try {
+    const { result, progress } = await runExecutor(
+      { task_id: "request-heartbeat", prompt: "track request two", timeout_ms: 5_000 },
+      bin,
+    )
+    assert.equal(result?.status, "timed_out")
+    const heartbeat = progress.find((delta) =>
+      delta.includes("Still waiting for Kimi Code response") && delta.includes("request 2"))
+    assert.ok(heartbeat, `no request-two heartbeat in ${JSON.stringify(progress)}`)
+    assert.match(heartbeat, /request 2 elapsed [0-9]+s; task remains active\.$/)
+  } finally {
+    delete process.env.KIMI_PROGRESS_HEARTBEAT_MS
+    delete process.env.KIMI_SILENCE_TIMEOUT_MS
+    delete process.env.KIMI_KILL_GRACE_MS
+  }
+})
+
+test("executeTask: native LLM timeout retry is a visible progress event (WI#477)", async () => {
+  const bin = makeRequestMock(`
+process.stdout.write(JSON.stringify({
+  role: "meta",
+  type: "turn.step.retrying",
+  failed_attempt: 1,
+  next_attempt: 2,
+  max_attempts: 10,
+  delay_ms: 250,
+  error_name: "APITimeoutError",
+  error_message: "provider detail must not be copied",
+  status_code: 408,
+}) + "\\n")
+process.stdout.write(JSON.stringify({ role: "assistant", content: "recovered" }) + "\\n")
+`)
+  const { result, progress } = await runExecutor(
+    { task_id: "request-retry", prompt: "surface retry", timeout_ms: 5_000 },
+    bin,
+  )
+  assert.equal(result?.status, "success")
+  assert.ok(progress.includes(
+    "[worker] LLM request 1 retry 2/10 in 250ms after APITimeoutError (HTTP 408); task remains active.",
+  ))
+  assert.ok(!progress.some((delta) => delta.includes("provider detail must not be copied")))
+})
+
+test("executeTask: operator LLM timeout reaches the CLI and task env cannot override it", async () => {
+  const bin = makeRequestMock(`
+process.stdout.write(JSON.stringify({
+  role: "assistant",
+  content: "headers=" + process.env.KIMI_CODE_LLM_HEADERS_TIMEOUT_MS,
+}) + "\\n")
+`)
+  process.env.KIMI_CODE_LLM_HEADERS_TIMEOUT_MS = "120000"
+  try {
+    const { result } = await runExecutor(
+      {
+        task_id: "request-timeout-env",
+        prompt: "check timeout",
+        timeout_ms: 5_000,
+        context: { environment: { KIMI_CODE_LLM_HEADERS_TIMEOUT_MS: "1" } },
+      },
+      bin,
+    )
+    assert.equal(result?.status, "success")
+    assert.equal(result?.output, "headers=120000")
+  } finally {
+    delete process.env.KIMI_CODE_LLM_HEADERS_TIMEOUT_MS
+  }
+})
