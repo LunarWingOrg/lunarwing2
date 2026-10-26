@@ -57,14 +57,16 @@ protecting replacement gates, and the resolve-time liveness re-check that
 fails closed), the WI#337/WI#339/WI#341 shutdown-interruption resolution
 work (parity-checked stamp resolution, the per-thread interruption-stamp
 map, per-mission/per-stamp sweep isolation, marker-persists-before-notice
-ordering with acknowledged notices, the 24h stamp-age bound, and the
-WI#394 stuck-key residual), the WI#338 scan-time parity checks as defense
-in depth (full `mission.json` forges remain out of scope until WI#322),
-and the WI#359 webhook/rate-limit hardening (the usable-secret predicate
-so an empty/whitespace stored secret never authenticates a fire, the
-serialized webhook claim check-then-save across create/update/resume, the
-shared recursive credential-key redaction over summaries/events/http
-surfaces, and the corrected aggregate/stop-bucket limiter wording).
+ordering with acknowledged notices, and the 24h stamp-age bound), the
+WI#338 scan-time parity checks as defense in depth (full `mission.json`
+forges remain out of scope until WI#322), and the WI#359
+webhook/rate-limit hardening (the usable-secret predicate so an
+empty/whitespace stored secret never authenticates a fire, the serialized
+webhook claim check-then-save across create/update/resume, the shared
+recursive credential-key redaction over summaries/events/http surfaces,
+and the corrected aggregate/stop-bucket limiter wording). Updates for
+2.1.7.0 include the WI#394 settled-stop dedup-key boot heal documented
+under mission retries.
 
 Enabled at runtime via the `ENGINE_V2=true` environment variable. The gateway
 uses Engine V2 by default when enabled. The bridge router (`ic/src/bridge/router.rs`)
@@ -811,19 +813,30 @@ daemon); the post-restart sweep re-arms the retry from the marker, with the
 usual fresh backoff and attempt accounting (an interrupted fire costs one
 retry attempt). Outcome writes are ordered so the retry marker is the final
 commit write: the mission row (approach history plus the dedup release) is
-saved first, so an abort in the window leaves either no trace or a mission
-row without a marker (the key already released for redelivery) — never a
-marker whose release never saved. The no-trace leg is not always the clean
-pre-WI#188 loss: the settled stop persists the thread row
+saved first, so an abort in the window leaves either no mission-row update
+or a mission row without a marker (the key already released for redelivery)
+— never a marker whose release never saved. The no-update leg is not always
+the clean pre-WI#188 loss: the settled stop persists the thread row
 `Failed("execution stopped")` before the watcher's mission save, so an
-abort in that narrower span leaves the dedup key still recorded on the old
-mission row with no marker and no stamp — every boot sweep skips the fire,
-a silent loss with a stuck key that also suppresses an external redelivery
-of the same payload (the Q-4 residual, WI#394; the abort-window test
+abort in that narrower span can leave the dedup key recorded on the old
+mission row with no retry marker or shutdown stamp. At the next boot,
+`recover_pending_mission_retries` releases that key (WI#394): the candidate
+must be the mission's newest history entry, a Mission thread with matching
+project/owner, `Failed` with a host-stop terminal reason, and neither a
+retry marker nor a restart-failure marker, and no interruption stamp for
+that thread. The mission and thread are reloaded and the newest-fire and
+payload checks repeated under the fire lock, so a concurrent fire cannot
+lose its own key or have a stale snapshot overwrite it. The heal runs for
+every mission status and independently of retry policy; it never schedules
+a retry or emits a notice. The lost fire stays record-only, while an
+external redelivery of the same payload can fire again. Stamped fires stay
+with shutdown resolution, restart-failed fires with WI#301, and superseded
+fires untouched. The abort-window test
 `outcome_processing_writes_no_marker_when_the_mission_save_fails` pins the
-"old row still holds the key" state). Markers
-written in the opposite order by older builds can still pair a live marker
-with a recorded key; the sweep releases that stale key before re-arming.
+input state and the `settled_stop_abort_heal_*` tests pin the recovery.
+Markers written in the opposite order by older builds can still pair a live
+marker with a recorded key; the sweep releases that stale key before
+re-arming.
 The shutdown-time "retry scheduled" broadcast has no live consumer, so the
 marker records the notice as undelivered and the boot sweep emits it once
 when re-arming, acknowledging the delivery on the marker itself (the same
