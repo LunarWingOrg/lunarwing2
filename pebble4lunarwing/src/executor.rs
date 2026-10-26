@@ -171,7 +171,7 @@ struct StreamOptions {
 
 fn request_marker(state: &SharedRequestState, line: &str) -> Option<String> {
     if line.starts_with("[llm-retry]") {
-        let index = state.lock().map(|state| state.index).unwrap_or(0);
+        let index = state.lock().map_or(0, |state| state.index);
         return Some(format!(
             "[worker] LLM request {index} retry reported by Pebble; task remains active."
         ));
