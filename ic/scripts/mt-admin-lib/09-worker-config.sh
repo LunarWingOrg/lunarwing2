@@ -32,6 +32,13 @@ render_worker_openrc_unit() {
   [[ -n "${CONTAINER_RT:-}" ]] && runtime_bin="$(command -v "$CONTAINER_RT" 2>/dev/null || true)"
   uid="$(id -u "$name" 2>/dev/null || echo "")"
   home="$(tenant_home "$name")"
+  # WI#424 control 1: the boot path (OpenRC starts this unit directly) must
+  # reload the egress filter before the container starts. The ruleset lives in
+  # root-owned state and the netns is recreated across reboots, so a rule set
+  # loaded once at provision time would not be there.
+  local egress_ruleset egress_guard
+  egress_ruleset="$(worker_egress_ruleset_path "$name")"
+  egress_guard="$WORKER_EGRESS_GUARD"
 
   cat >"/etc/init.d/${container}" <<INITEOF
 #!/sbin/openrc-run
@@ -46,6 +53,8 @@ description="LunarWing ${worker} worker ($name)"
 : "\${wk_uid:=$uid}"
 : "\${wk_health_port:=$health_port}"
 : "\${wk_wait:=60}"
+: "\${wk_egress_ruleset:=$egress_ruleset}"
+: "\${wk_egress_guard:=$egress_guard}"
 
 depend() {
     need net localmount
@@ -73,6 +82,19 @@ start() {
     if [ "\${wk_rootless}" = "true" ]; then
         checkpath -d -m 0700 -o "\${wk_user}:\${wk_user}" "/run/user/\${wk_uid}"
     fi
+    # WI#424 control 1: fail closed — no verified egress filter, no worker.
+    # Same root-owned guard the Quadlet ExecStartPre runs, so the two init
+    # paths cannot drift.
+    if [ ! -x "\${wk_egress_guard}" ]; then
+        eend 1 "worker egress guard missing (\${wk_egress_guard}); run worker-egress-apply as root"
+        return 1
+    fi
+    _egress_mode="rootful"
+    [ "\${wk_rootless}" = "true" ] && _egress_mode="rootless"
+    # OpenRC runs this as root; pass the tenant so the guard enters that user's
+    # rootless netns (a Quadlet ExecStartPre already runs as the tenant).
+    "\${wk_egress_guard}" "\${wk_egress_ruleset}" "\${_egress_mode}" "\${wk_user}" \
+        || { eend 1 "worker egress filter failed to load or verify; refusing to start unfiltered"; return 1; }
     _wk start "\${wk_container}" >/dev/null 2>&1 || { eend 1 "container start failed"; return 1; }
     _w=0
     while ! _wk_healthy; do
@@ -1499,6 +1521,7 @@ start_tenant_opencode() {
   # Pin the tenant-store image ID into the container contract: a rebuilt image
   # must force-recreate the container (_worker_launch_contract).
   opencode_launch_contract="$(_worker_launch_contract "$name" lunarwing-worker-opencode:latest "$opencode_launch_contract")"
+  prepare_worker_egress "$name" opencode
   local image_user
   image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
     lunarwing-worker-opencode:latest 2>/dev/null || true)"
@@ -1675,6 +1698,8 @@ start_tenant_opencode() {
       "${health_publish[@]}" \
       -v "$workspace_dir:/workspace:z" \
       "${restart_arg[@]}" \
+      --network "$(worker_egress_network_name "$name")" \
+      --label "lunarwing.egress=$(worker_egress_network_name "$name")" \
       lunarwing-worker-opencode:latest \
       --mode websocket >/dev/null
     _store_container_hash \
@@ -1739,6 +1764,7 @@ start_tenant_opencode2() {
   # Pin the tenant-store image ID into the container contract: a rebuilt image
   # must force-recreate the container (_worker_launch_contract).
   launch_contract="$(_worker_launch_contract "$name" lunarwing-worker-opencode2:latest "$launch_contract")"
+  prepare_worker_egress "$name" opencode2
   local image_user
   image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
     lunarwing-worker-opencode2:latest 2>/dev/null || true)"
@@ -1873,6 +1899,8 @@ start_tenant_opencode2() {
       "${health_publish[@]}" \
       -v "$workspace_dir:/workspace:z" \
       "${restart_arg[@]}" \
+      --network "$(worker_egress_network_name "$name")" \
+      --label "lunarwing.egress=$(worker_egress_network_name "$name")" \
       lunarwing-worker-opencode2:latest \
       --mode websocket >/dev/null
     _store_container_hash \
@@ -2223,6 +2251,7 @@ start_tenant_kimi() {
   # Pin the tenant-store image ID into the container contract: a rebuilt image
   # must force-recreate the container (_worker_launch_contract).
   kimi_launch_contract="$(_worker_launch_contract "$name" lunarwing-worker-kimi:latest "$kimi_launch_contract")"
+  prepare_worker_egress "$name" kimi
   local image_user
   image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
     lunarwing-worker-kimi:latest 2>/dev/null || true)"
@@ -2333,6 +2362,8 @@ start_tenant_kimi() {
       "${health_publish[@]}" \
       -v "$workspace_dir:/workspace:z" \
       "${restart_arg[@]}" \
+      --network "$(worker_egress_network_name "$name")" \
+      --label "lunarwing.egress=$(worker_egress_network_name "$name")" \
       lunarwing-worker-kimi:latest \
       --mode websocket >/dev/null
     _store_container_hash \
@@ -2398,6 +2429,7 @@ start_tenant_pebble() {
   else
     pebble_launch_contract="$(_worker_launch_contract "$name" lunarwing-worker-pebble:latest "$PEBBLE_ROOTFUL_LAUNCH_CONTRACT")"
   fi
+  prepare_worker_egress "$name" pebble
   # WI#400 LD-8: the pebble bridge must run as container root (image USER
   # 0:0) — under rootless keep-id an image without USER starts the bridge
   # as the task uid and the credential split is a no-op.
@@ -2573,6 +2605,8 @@ start_tenant_pebble() {
       "${health_publish[@]}" \
       -v "$workspace_dir:/workspace:z" \
       "${restart_arg[@]}" \
+      --network "$(worker_egress_network_name "$name")" \
+      --label "lunarwing.egress=$(worker_egress_network_name "$name")" \
       lunarwing-worker-pebble:latest >/dev/null
     _store_container_hash "$name" "$container_name" "$(tenant_env_dir "$name")/lunarwing.env" "$pebble_launch_contract"
   fi
@@ -2880,4 +2914,33 @@ worker_listeners() {  # <tenant>
     return 1
   fi
   say "worker listener audit: clean"
+}
+
+# WI#424 control 6: run the lane's runtime exposure smoke suite inside a live
+# container. The suite itself lives in the image (/app/scripts/runtime_smoke.py)
+# and is also executed by the protected candidate build; this is the
+# tenant-facing entry point the work item asks to document. The suite reads the
+# container's own /proc/net and the installed wrapper, so it needs no host
+# privileges beyond `podman exec` on the tenant store.
+worker_runtime_smoke() {  # <tenant> [opencode2]
+  local name worker container
+  name="$(sanitize_name "$1")"
+  worker="${2:-opencode2}"
+  require_worker_name "$worker"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  ensure_container_runtime
+  container="lunarwing-${worker}-${name}"
+  if ! _ctr "$name" inspect "$container" >/dev/null 2>&1; then
+    die "container $container is not running; start the $worker worker first"
+  fi
+  case "$worker" in
+    opencode2)
+      _ctr "$name" exec "$container" \
+        python3 /app/scripts/runtime_smoke.py --profile container \
+          --container "$container" --runtime "$CONTAINER_RT"
+      ;;
+    *)
+      die "runtime smoke is implemented for the opencode2 lane only (WI#424 control 6)"
+      ;;
+  esac
 }

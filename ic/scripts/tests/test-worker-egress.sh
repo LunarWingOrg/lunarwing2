@@ -1,0 +1,533 @@
+#!/usr/bin/env bash
+# WI#424 control 1 — worker egress allowlist harness (mt-admin).
+#
+# Pins the properties that make the control a boundary rather than a comment:
+#   * the generated nftables ruleset classifies only the tenant's worker
+#     subnet, allows established/DNS/allowlisted destinations, and ends in a
+#     reject (no implicit accept for anything else);
+#   * host-loopback endpoints are translated to the tenant network gateway,
+#     because 127.0.0.1 is not reachable from a rootless worker;
+#   * operator entries cannot smuggle nft syntax;
+#   * subnet allocation is persistent and collision-free;
+#   * apply verifies the chain from a fresh netns entry and dies when the
+#     filter did not survive (fail closed — the worker must not start);
+#   * every worker launch path attaches the tenant's egress network and every
+#     boot path reloads the filter.
+#
+# The live kernel portion runs when `nft` + rootless podman are available: the
+# generated ruleset is loaded into a throwaway rootless netns and read back, so
+# a syntax regression fails here instead of at the first tenant start.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HARNESS_REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+MT_ADMIN="$SCRIPT_DIR/../lunarwing-mt-admin.sh"
+# shellcheck source=../lunarwing-mt-admin.sh
+source "$MT_ADMIN"
+
+failures=0
+fixture="$(mktemp -d)"
+trap 'command rm -rf "$fixture"' EXIT
+
+pass() { printf 'PASS: %s\n' "$1"; }
+fail() { printf 'FAIL: %s\n' "$1"; failures=$((failures + 1)); }
+assert_eq() {  # <actual> <expected> <label>
+  if [[ "$1" == "$2" ]]; then pass "$3"; else fail "$3 (got '$1', want '$2')"; fi
+}
+assert_contains() {  # <haystack> <needle> <label>
+  if [[ "$1" == *"$2"* ]]; then pass "$3"; else fail "$3 (missing: $2)"; fi
+}
+assert_absent() {  # <haystack> <needle> <label>
+  if [[ "$1" != *"$2"* ]]; then pass "$3"; else fail "$3 (unexpected: $2)"; fi
+}
+
+WORKER_EGRESS_DIR="$fixture/egress"
+mkdir -p "$WORKER_EGRESS_DIR"
+
+# ── stubs ────────────────────────────────────────────────────────────────────
+# 203.0.113.0/24 is TEST-NET-3: an address-literal target keeps the harness
+# hermetic (a hostname would need DNS and the resolver's answer would become
+# part of the expectation).
+LLM_TARGETS=("http://127.0.0.1:3000/v1" "https://203.0.113.10:8443/v1")
+OPERATOR_ALLOW=("https://203.0.113.20:443/repo.git")
+_worker_egress_llm_targets() { printf '%s\n' "${LLM_TARGETS[@]}"; }
+_worker_egress_operator_allow() { printf '%s\n' "${OPERATOR_ALLOW[@]}"; }
+
+NFT_CALLS=()
+NFT_LOAD_RC=0
+NFT_LIST_RC=0
+NFT_LIST_OUT=""
+worker_egress_nft() {  # <tenant> <args...>
+  local name="$1"; shift
+  NFT_CALLS+=("$name $*")
+  if [[ "$1" == "-f" ]]; then
+    return "$NFT_LOAD_RC"
+  fi
+  if [[ "$1" == "list" ]]; then
+    [[ "$NFT_LIST_RC" == "0" ]] || return 1
+    printf '%s\n' "$NFT_LIST_OUT"
+    return 0
+  fi
+  return 0
+}
+
+CTR_NETWORK_EXISTS="false"
+CTR_CREATE_RC=0
+CTR_CALLS=()
+CTR_ATTACHED="attached"
+_ctr() {  # <tenant> <args...>
+  local name="$1"; shift
+  CTR_CALLS+=("$name $*")
+  case "$1" in
+    network)
+      case "$2" in
+        exists) [[ "$CTR_NETWORK_EXISTS" == "true" ]] && return 0; return 1 ;;
+        create) return "$CTR_CREATE_RC" ;;
+      esac
+      ;;
+    inspect) printf '%s\n' "$CTR_ATTACHED"; return 0 ;;
+  esac
+  return 0
+}
+
+# ── subnet allocation ────────────────────────────────────────────────────────
+subnet="$(_worker_egress_alloc_subnet alpha)"
+assert_eq "$subnet" "10.89.10.0/24" "first allocation takes the lowest free /24"
+assert_eq "$(worker_egress_state_get alpha SUBNET)" "10.89.10.0/24" "allocation is persisted"
+assert_eq "$(_worker_egress_alloc_subnet alpha)" "10.89.10.0/24" "re-allocation is stable"
+subnet="$(umask 022; _worker_egress_alloc_subnet beta)"
+assert_eq "$subnet" "10.89.11.0/24" "a second tenant gets a different /24"
+asset_eq_perm="$(stat -c '%a' "$WORKER_EGRESS_DIR/beta.conf")"
+assert_eq "$asset_eq_perm" "644" "allocation file is world-readable (no secrets) and root-owned"
+assert_eq "$(_worker_egress_gateway 10.89.11.0/24)" "10.89.11.1" "gateway derivation"
+
+# An existing ALLOW line survives a later allocation (ensure may run first).
+printf 'ALLOW=git.example.org:443\n' >"$WORKER_EGRESS_DIR/gamma.conf"
+_worker_egress_alloc_subnet gamma >/dev/null
+assert_contains "$(cat "$WORKER_EGRESS_DIR/gamma.conf")" "ALLOW=git.example.org:443" \
+  "allocation appends and does not drop a recorded allowlist"
+
+# ── ruleset generation ───────────────────────────────────────────────────────
+ruleset="$(worker_egress_ruleset alpha)"
+assert_contains "$ruleset" "ip saddr 10.89.10.0/24 ct state established,related accept" \
+  "return traffic is accepted"
+assert_contains "$ruleset" "ip saddr 10.89.10.0/24 ip daddr 10.89.10.1 udp dport 53 accept" \
+  "DNS is allowed only to the tenant gateway"
+assert_contains "$ruleset" "ip saddr 10.89.10.0/24 ip daddr 10.89.10.1 tcp dport 3000 accept" \
+  "a host-loopback LLM endpoint is translated to the gateway"
+# Headless/rootless check: run the pure renderer in a subshell so the
+# rootless extra host alias is exercised too (this harness runs as a test
+# user, so CONTAINER_RT/MT_ROOTLESS come from the sourced constants).
+assert_contains "$(CONTAINER_RT=podman MT_ROOTLESS=true worker_egress_ruleset alpha)" \
+  "ip saddr 10.89.10.0/24 ip daddr 169.254.1.2 tcp dport 3000 accept" \
+  "rootless workers may reach the host at its pasta alias"
+assert_contains "$(CONTAINER_RT=podman MT_ROOTLESS=false worker_egress_ruleset alpha)" \
+  "ip saddr 10.89.10.0/24 ip daddr 10.89.10.1 tcp dport 3000 accept" \
+  "rootful workers reach the host through the bridge gateway"
+assert_contains "$ruleset" "ip saddr 10.89.10.0/24 ip daddr 203.0.113.10 tcp dport 8443 accept" \
+  "an address-literal LLM endpoint becomes its own rule"
+assert_contains "$ruleset" "counter reject with icmpx type admin-prohibited" \
+  "everything else from the subnet is rejected (no implicit accept)"
+assert_absent "$ruleset" "ip daddr 127.0.0.1" "container rules never target host loopback"
+assert_absent "$ruleset" "policy drop" "other tenant traffic is not affected (policy accept)"
+# The reject must be the LAST rule, or an accept could follow it.
+last_rule="$(printf '%s\n' "$ruleset" | grep -E '^\s{8}(ip|tcp|udp|counter)' | tail -1)"
+assert_contains "$last_rule" "reject" "the reject rule is last"
+# Exactly one reject: a second one would mean a widened rule set slipped in.
+assert_eq "$(grep -c 'reject' <<<"$ruleset")" "1" "exactly one reject rule"
+# A loopback endpoint keeps its port through translation (distinct port so the
+# assertion cannot be satisfied by the 3000 rule).
+OPERATOR_ALLOW=("http://127.0.0.1:8443/admin")
+assert_contains "$(CONTAINER_RT=podman MT_ROOTLESS=false worker_egress_ruleset alpha)" \
+  "ip saddr 10.89.10.0/24 ip daddr 10.89.10.1 tcp dport 8443 accept" \
+  "host-loopback endpoints keep their port through translation"
+OPERATOR_ALLOW=("https://203.0.113.20:443/repo.git")
+# An unresolvable OPERATOR entry is a hard error: the operator asked for it
+# explicitly, so a typo/dead DNS must be loud rather than silently dropped.
+OPERATOR_ALLOW=("https://does-not-exist.example.invalid:443/repo.git")
+if ( worker_egress_ruleset alpha ) >/dev/null 2>&1; then
+  fail "an unresolvable operator entry was silently skipped"
+else
+  pass "an unresolvable operator entry refuses the ruleset (fail closed)"
+fi
+OPERATOR_ALLOW=("https://203.0.113.20:443/repo.git")
+
+# An unresolvable TENANT LLM endpoint warns and narrows instead: omitting it
+# can only restrict egress, and a transient resolver failure at boot must not
+# stop the worker. The warning must still be visible.
+LLM_TARGETS=("http://does-not-exist.example.invalid:8080/v1")
+llm_warn="$fixture/llm-warn"
+if worker_egress_ruleset alpha >"$fixture/llm.out" 2>"$llm_warn"; then
+  pass "an unresolvable tenant LLM endpoint does not block the ruleset"
+else
+  fail "an unresolvable tenant LLM endpoint failed the whole ruleset"
+fi
+assert_contains "$(cat "$llm_warn")" "WARNING: cannot resolve" \
+  "an omitted tenant LLM endpoint warns loudly"
+assert_absent "$(cat "$fixture/llm.out")" "does-not-exist" \
+  "an omitted tenant LLM endpoint is not rendered as a rule"
+# A URL with no explicit port uses the scheme default, not a dropped entry.
+LLM_TARGETS=("http://203.0.113.30/v1")
+assert_contains "$(worker_egress_ruleset alpha)" \
+  "ip saddr 10.89.10.0/24 ip daddr 203.0.113.30 tcp dport 80 accept" \
+  "a portless http URL is allowed on port 80"
+LLM_TARGETS=("https://203.0.113.31/v1")
+assert_contains "$(worker_egress_ruleset alpha)" \
+  "ip saddr 10.89.10.0/24 ip daddr 203.0.113.31 tcp dport 443 accept" \
+  "a portless https URL is allowed on port 443"
+LLM_TARGETS=("http://127.0.0.1:3000/v1" "https://203.0.113.10:8443/v1")
+
+# Deduplication and stable order.
+targets="$(worker_egress_targets alpha)"
+assert_eq "$(printf '%s\n' "$targets" | sort | uniq -d | wc -l | tr -d ' ')" "0" \
+  "targets are de-duplicated"
+
+# ── entry validation ────────────────────────────────────────────────────────
+for good in "git.example.org:443" "https://git.example.org:8443/x" "10.0.0.5:443" \
+            "[2001:db8::1]:443"; do
+  if validate_worker_egress_entry "$good" 2>/dev/null; then
+    pass "accepts allowlist entry '$good'"
+  else
+    fail "rejected a valid allowlist entry '$good'"
+  fi
+done
+for bad in "hostonly" "host:0" "host:99999" "*:443" "host:443; rm -rf /" \
+           "host:443 extra" 'host:443" accept' "https://:443"; do
+  if ( validate_worker_egress_entry "$bad" ) 2>/dev/null; then
+    fail "accepted a hostile allowlist entry '$bad'"
+  else
+    pass "refuses hostile allowlist entry '$bad'"
+  fi
+done
+
+# ── apply: fail closed ───────────────────────────────────────────────────────
+NFT_LOAD_RC=0
+NFT_LIST_RC=1
+if ( worker_egress_apply alpha ) >/dev/null 2>"$fixture/apply.err"; then
+  fail "apply accepted a filter that did not survive the load"
+else
+  pass "apply dies when the loaded filter is gone (worker start refuses)"
+  assert_contains "$(cat "$fixture/apply.err")" "did not survive the load" \
+    "the refusal names the cause"
+fi
+
+NFT_LIST_RC=0
+NFT_LIST_OUT=$'table inet lunarwing_worker_egress {\n\tchain workers {\n\t\tcounter packets 0 bytes 0 reject with icmpx admin-prohibited\n\t}\n}'
+NFT_CALLS=()
+# Parent shell (not a subshell): the fake runtime records calls in a variable.
+if worker_egress_apply alpha >/dev/null 2>"$fixture/apply2.err"; then
+  pass "apply succeeds when the filter is provably live"
+else
+  fail "apply rejected a live filter: $(cat "$fixture/apply2.err")"
+fi
+assert_contains "$(printf '%s\n' "${NFT_CALLS[@]}")" "-f" "apply loads the rendered ruleset file"
+
+NFT_LIST_RC=0
+NFT_LIST_OUT=$'table inet lunarwing_worker_egress {\n\tchain workers {\n\t}\n}'
+if ( worker_egress_apply alpha ) >/dev/null 2>"$fixture/apply3.err"; then
+  fail "apply accepted a live chain with no drop rule"
+else
+  pass "apply refuses a chain without its drop rule"
+fi
+
+# ── network ensure + attachment ─────────────────────────────────────────────
+CTR_NETWORK_EXISTS="false"
+# Run in this shell: a $(...) call would record the fake runtime's calls in a
+# subshell that cannot update CTR_CALLS.
+worker_egress_ensure alpha >"$fixture/network.out"
+network="$(cat "$fixture/network.out")"
+assert_eq "$network" "lw-egress-alpha" "egress network name"
+assert_contains "${CTR_CALLS[*]}" "network create --subnet 10.89.10.0/24" \
+  "the network is created with the allocated subnet"
+CTR_NETWORK_EXISTS="true"
+unset 'CTR_CALLS[0]' 2>/dev/null || true
+CTR_CALLS=()
+worker_egress_ensure alpha >/dev/null
+assert_absent "${CTR_CALLS[*]}" "network create" "ensure is idempotent"
+
+CTR_ATTACHED="attached"
+if worker_egress_container_attached alpha lunarwing-opencode2-alpha; then
+  pass "attachment detection: attached"
+else
+  fail "attachment detection missed an attached container"
+fi
+CTR_ATTACHED=""
+if worker_egress_container_attached alpha lunarwing-opencode2-alpha; then
+  fail "attachment detection claimed an unattached container"
+else
+  pass "attachment detection: unattached"
+fi
+
+# ── audit (WI#424 AC3) ──────────────────────────────────────────────────────
+# The audit must report host-side truth and fail unless the filter is provably
+# live. drive_audit() runs it in a subshell with the registry/runtime stubs so
+# the real function body is exercised.
+tenant_exists_in_registry() { return 0; }
+audit_output=""
+drive_audit() {  # <nft-list-rc> <attached?>
+  (
+    CTR_ATTACHED="$2"
+    NFT_LIST_RC="$1"
+    NFT_LIST_OUT=$'table inet lunarwing_worker_egress {\n\tchain workers {\n\t\tip saddr 10.89.10.0/24 counter reject\n\t}\n}'
+    worker_egress_audit alpha
+  ) 2>&1
+}
+
+audit_output="$(drive_audit 0 attached)"
+if ( NFT_LIST_RC=0 CTR_ATTACHED=attached; worker_egress_audit alpha ) >/dev/null 2>&1; then
+  pass "audit exits 0 when the network, attachment and filter are all present"
+else
+  fail "audit failed a fully healthy tenant"
+fi
+assert_contains "$audit_output" "filter: live" "audit reports the live filter"
+assert_contains "$audit_output" "container lunarwing-opencode2-alpha: attached" \
+  "audit reports container attachment"
+
+if ( CTR_ATTACHED="" NFT_LIST_RC=0 worker_egress_audit alpha ) >/dev/null 2>&1; then
+  fail "audit passed a container that is not on the egress network"
+else
+  pass "audit fails a container that is not on the egress network"
+fi
+assert_contains "$(CTR_ATTACHED="" NFT_LIST_RC=0 worker_egress_audit alpha 2>&1)" \
+  "NOT ATTACHED" "audit names the unattached container"
+
+if ( CTR_ATTACHED=attached NFT_LIST_RC=1 worker_egress_audit alpha ) >/dev/null 2>&1; then
+  fail "audit passed a tenant with no loaded filter"
+else
+  pass "audit fails a tenant with no loaded filter"
+fi
+assert_contains "$(CTR_ATTACHED=attached NFT_LIST_RC=1 worker_egress_audit alpha 2>&1)" \
+  "filter: NOT LOADED" "audit names the missing filter"
+
+# An unallocated tenant must not report a healthy (empty) allowlist.
+if ( worker_egress_audit unallocated ) >/dev/null 2>&1; then
+  fail "audit passed a tenant with no egress allocation"
+else
+  pass "audit fails a tenant with no egress allocation"
+fi
+
+# The audit must never read container-writable state: it asks the runtime and
+# the netns directly.
+audit_src="$(sed -n '/^worker_egress_audit()/,/^}/p' "$HARNESS_REPO_ROOT/ic/scripts/mt-admin-lib/15-worker-egress.sh")"
+assert_contains "$audit_src" "worker_egress_nft" "audit reads the live chain host-side"
+assert_contains "$audit_src" "worker_egress_container_attached" "audit reads attachment from the runtime"
+assert_absent "$audit_src" "podman exec" "audit never asks the container about itself"
+
+# ── launch-contract pins (source-level, like the other harnesses) ────────────
+worker_config="$HARNESS_REPO_ROOT/ic/scripts/mt-admin-lib/09-worker-config.sh"
+systemd_lib="$HARNESS_REPO_ROOT/ic/scripts/mt-admin-lib/07-units-systemd.sh"
+run_sites="$(grep -c -- '--network "$(worker_egress_network_name "$name")"' "$worker_config")"
+assert_eq "$run_sites" "4" "all four imperative worker run sites attach the egress network"
+assert_eq "$(grep -c 'prepare_worker_egress "$name"' "$worker_config")" "4" \
+  "all four worker start paths prepare (and verify) the filter"
+assert_contains "$(cat "$systemd_lib")" 'Network=${egress_network}' \
+  "Quadlet workers join the egress network"
+assert_contains "$(cat "$systemd_lib")" 'ExecStartPre=${egress_guard} ${egress_ruleset} rootless' \
+  "Quadlet workers load and verify the filter before every start"
+assert_absent "$(cat "$systemd_lib")" 'egress_nft' \
+  "the Quadlet no longer carries its own nft invocation (one guard for both inits)"
+assert_contains "$(cat "$worker_config")" "refusing to start unfiltered" \
+  "the OpenRC boot path fails closed"
+assert_contains "$(cat "$worker_config")" 'wk_egress_guard' \
+  "the OpenRC boot path runs the same guard as the Quadlet"
+assert_contains "$(cat "$worker_config")" "worker egress guard missing" \
+  "the OpenRC boot path refuses to start without the guard"
+
+# ── the guard script itself ─────────────────────────────────────────────────
+guard="$HARNESS_REPO_ROOT/ic/scripts/lunarwing-worker-egress-guard.sh"
+guard_src="$(cat "$guard")"
+assert_contains "$guard_src" "list chain inet" "the guard verifies through a fresh netns entry"
+assert_contains "$guard_src" "did not survive the load" "the guard refuses a filter that did not persist"
+assert_contains "$guard_src" "without its reject rule" "the guard refuses a chain with no drop rule"
+assert_absent "$guard_src" "|| true" "the guard never swallows a load failure"
+assert_eq "$(stat -c '%a' "$guard")" "755" "the guard is executable"
+assert_contains "$(cat "$HARNESS_REPO_ROOT/ic/scripts/mt-admin-lib/15-worker-egress.sh")" \
+  'WORKER_EGRESS_GUARD="/usr/local/libexec/lunarwing-worker-egress-guard"' \
+  "the guard is installed to a root-owned libexec path (not tenant-writable)"
+
+# Behavioural: a ruleset file that does not exist must fail, and a real one
+# must pass against a stubbed nft. The stub keeps this hermetic.
+guard_bin="$fixture/bin"
+mkdir -p "$guard_bin"
+cat >"$guard_bin/nft" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+  -f) exit "${FAKE_LOAD_RC:-0}" ;;
+  list) [[ "${FAKE_LIST_RC:-0}" == "0" ]] || exit 1
+        printf 'chain workers {\n  ip saddr 10.89.10.0/24 counter reject\n}\n' ;;
+esac
+STUB
+chmod +x "$guard_bin/nft"
+if PATH="$guard_bin:$PATH" FAKE_LOAD_RC=0 "$guard" "$fixture/alpha.nft" rootful >/dev/null 2>&1; then
+  fail "the guard passed with a missing ruleset file"
+else
+  pass "the guard refuses a missing ruleset file"
+fi
+: >"$fixture/alpha.nft"
+if PATH="$guard_bin:$PATH" FAKE_LOAD_RC=0 "$guard" "$fixture/alpha.nft" rootful >/dev/null 2>&1; then
+  pass "the guard passes a live filter"
+else
+  fail "the guard rejected a live filter"
+fi
+if PATH="$guard_bin:$PATH" FAKE_LOAD_RC=1 "$guard" "$fixture/alpha.nft" rootful >/dev/null 2>&1; then
+  fail "the guard passed a failed load"
+else
+  pass "the guard refuses a failed load"
+fi
+if PATH="$guard_bin:$PATH" FAKE_LIST_RC=1 "$guard" "$fixture/alpha.nft" rootful >/dev/null 2>&1; then
+  fail "the guard passed a filter that did not survive"
+else
+  pass "the guard refuses a filter that did not survive"
+fi
+
+# ── live kernel check (rootless netns) ──────────────────────────────────────
+# Loads the *real* generated ruleset into a throwaway rootless netns and reads
+# it back inside the same invocation. Skipped when podman/nft are unavailable.
+if command -v podman >/dev/null 2>&1 && command -v nft >/dev/null 2>&1 \
+    && podman unshare --rootless-netns nft list ruleset >/dev/null 2>&1; then
+  live_ruleset="$fixture/live.nft"
+  NFT_LIST_RC=0
+  worker_egress_ruleset beta >"$live_ruleset"
+  # The live load must not depend on the stub: write through the real nft.
+  if podman unshare --rootless-netns nft -f "$live_ruleset" >/dev/null 2>&1; then
+    live_dump="$(podman unshare --rootless-netns nft list chain inet "$WORKER_EGRESS_TABLE" "$WORKER_EGRESS_CHAIN" 2>/dev/null || true)"
+    # The throwaway netns is not pinned by a container, so the chain may be
+    # gone immediately; only assert the syntax when it is still visible.
+    if [[ -n "$live_dump" ]]; then
+      assert_contains "$live_dump" "10.89.11.0/24" "live kernel accepts the generated ruleset"
+    else
+      pass "live kernel accepted the generated ruleset (netns not pinned, chain gone as expected)"
+    fi
+  else
+    fail "live kernel rejected the generated ruleset"
+  fi
+else
+  pass "live kernel check skipped (no rootless podman/nft on this host)"
+fi
+
+# ── live acceptance arm (WI#424 AC2) ───────────────────────────────────────
+# Proves the acceptance criterion on a real kernel: a non-allowlisted fetch from
+# inside a worker FAILS and an allowlisted one SUCCEEDS. Opt-in because it needs
+# a pullable worker-shaped image (~2 MB busybox), a free port, and a writable
+# tmpdir; run it on a host where egress is available:
+#
+#   LUNARWING_MT_EGRESS_LIVE=1 bash ic/scripts/tests/test-worker-egress.sh
+#
+# The sequence is exactly the production one: allocate + create the network,
+# load and verify the filter with NO container present (the ExecStartPre /
+# OpenRC start() ordering), then start the container and probe it. This host's
+# rootless backend (pasta) publishes the host at 169.254.1.2; the arm detects
+# the backend and uses the same host addresses the renderer emits.
+# Set at file scope: the EXIT trap runs after run_live_arm returns, when its
+# `local`s are gone (an unbound `container` aborted cleanup mid-way).
+LIVE_NET="lw-egress-liveprobe"
+LIVE_CONTAINER="egress-liveprobe"
+LIVE_HTTPD_PID=""
+
+run_live_arm() {
+  local image="docker.io/library/busybox:stable"
+  local net="$LIVE_NET" subnet="10.89.249.0/24" container="$LIVE_CONTAINER" port=18099
+  local addr_ok addr_deny
+  command -v podman >/dev/null 2>&1 || { say_skip "live arm: podman missing"; return 0; }
+  command -v nft >/dev/null 2>&1 || { say_skip "live arm: nft missing"; return 0; }
+  command -v curl >/dev/null 2>&1 || { say_skip "live arm: curl missing"; return 0; }
+  podman image exists "$image" 2>/dev/null \
+    || podman pull -q "$image" >/dev/null 2>&1 \
+    || { say_skip "live arm: $image unavailable"; return 0; }
+  [[ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" == "true" ]] \
+    || { say_skip "live arm: rootless podman only (the harness has no tenant netns)"; return 0; }
+  addr_ok="${WORKER_EGRESS_HOST_ADDRS%% *}"
+  addr_deny="203.0.113.10"   # TEST-NET-3: never routed
+
+  cleanup_live() {
+    podman rm -f "$LIVE_CONTAINER" >/dev/null 2>&1 || true
+    podman network rm -f "$LIVE_NET" >/dev/null 2>&1 || true
+    if [[ -n "$LIVE_HTTPD_PID" ]]; then
+      kill -9 "$LIVE_HTTPD_PID" >/dev/null 2>&1 || true
+    fi
+    podman unshare --rootless-netns nft delete table inet "$WORKER_EGRESS_TABLE" >/dev/null 2>&1 || true
+  }
+  trap cleanup_live EXIT
+
+  # A host-local "allowed destination" for the allowlisted half. The server is
+  # started with every inherited descriptor redirected to the log: a background
+  # job that keeps the harness's stdout alive makes the caller's pipe wait on a
+  # process the harness no longer owns (observed: `| tail` never returned).
+  ( cd "$fixture" && exec python3 -m http.server "$port" --bind 0.0.0.0 ) \
+    >"$fixture/httpd.log" 2>&1 </dev/null &
+  LIVE_HTTPD_PID=$!
+  sleep 1
+  curl -sf -o /dev/null -m 2 "http://127.0.0.1:$port/" \
+    || { say_skip "live arm: could not start the local fixture server"; return 0; }
+
+  podman network create --subnet "$subnet" "$net" >/dev/null 2>&1 \
+    || { fail "live arm: network create failed"; return 1; }
+  printf 'SUBNET=%s\nALLOW=%s:%s\n' "$subnet" "$addr_ok" "$port" \
+    >"$WORKER_EGRESS_DIR/liveprobe.conf"
+  # The earlier sections replace these two sources with fixed stubs; the live
+  # arm must render from the real conf file it just wrote, so point them back
+  # at the module's own reader for this tenant.
+  _worker_egress_llm_targets() { return 0; }
+  _worker_egress_operator_allow() { worker_egress_state_get liveprobe ALLOW; }
+  CONTAINER_RT=podman MT_ROOTLESS=true worker_egress_ruleset liveprobe \
+    >"$fixture/liveprobe.nft" || { fail "live arm: ruleset render failed"; return 1; }
+
+  # Filter first, container second — the production ordering.
+  if ! "$HARNESS_REPO_ROOT/ic/scripts/lunarwing-worker-egress-guard.sh" \
+        "$fixture/liveprobe.nft" rootless >/dev/null 2>&1; then
+    fail "live arm: guard could not load and verify the filter"
+    return 1
+  fi
+  pass "live arm: guard loaded and verified the filter before any container existed"
+
+  podman run -d --name "$container" --network "$net" "$image" sleep 120 >/dev/null 2>&1 \
+    || { fail "live arm: container start failed"; return 1; }
+  sleep 2
+
+  local probe_err
+  if probe_err="$(podman exec "$container" wget -q -O /dev/null -T 5 "http://$addr_ok:$port/" 2>&1)"; then
+    pass "live arm: an allowlisted destination is reachable from the worker"
+  else
+    fail "live arm: the allowlisted destination was blocked (${probe_err:-no output})"
+    say "  ruleset under test:"; sed 's/^/    /' "$fixture/liveprobe.nft"
+  fi
+  if podman exec "$container" wget -q -O /dev/null -T 5 "https://$addr_deny/" >/dev/null 2>&1; then
+    fail "live arm: a non-allowlisted destination was reachable (filter not enforcing)"
+  else
+    pass "live arm: a non-allowlisted destination is blocked from the worker"
+  fi
+  # A denied fetch must also fail when addressed by raw IP: DNS is allowlisted,
+  # so a name-only block would leave DNS/rebinding as a bypass.
+  if podman exec "$container" wget -q -O /dev/null -T 5 "https://1.1.1.1/" >/dev/null 2>&1; then
+    fail "live arm: a raw-IP destination was reachable (DNS could be used as a bypass)"
+  else
+    pass "live arm: a raw-IP destination is blocked too (no DNS bypass)"
+  fi
+  if podman exec "$container" nslookup example.com >/dev/null 2>&1; then
+    pass "live arm: DNS still resolves through the tenant gateway"
+  else
+    fail "live arm: DNS is broken under the allowlist (workers would fail name lookups)"
+  fi
+  local counter
+  counter="$(podman unshare --rootless-netns nft list chain inet "$WORKER_EGRESS_TABLE" "$WORKER_EGRESS_CHAIN" 2>/dev/null | grep -o 'counter packets [0-9]*' | head -1)"
+  if [[ "$counter" == "counter packets 0" || -z "$counter" ]]; then
+    fail "live arm: the reject counter did not move despite denied probes"
+  else
+    pass "live arm: the reject counter recorded the denied probes ($counter)"
+  fi
+}
+
+say_skip() { printf 'SKIP: %s\n' "$1"; }
+
+if [[ "${LUNARWING_MT_EGRESS_LIVE:-0}" == "1" ]]; then
+  run_live_arm || true
+else
+  say_skip "live acceptance arm (set LUNARWING_MT_EGRESS_LIVE=1 to run it)"
+fi
+
+# ── summary ─────────────────────────────────────────────────────────────────
+if ((failures > 0)); then
+  printf '\n%d failure(s)\n' "$failures" >&2
+  exit 1
+fi
+printf '\nworker egress harness: all checks passed\n'

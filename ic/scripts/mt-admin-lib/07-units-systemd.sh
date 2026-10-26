@@ -541,6 +541,16 @@ render_worker_quadlet() {
     fi
   fi
 
+  # WI#424 control 1: the container joins the tenant's egress network, and the
+  # tenant's rootless netns gets the allowlist loaded before the container
+  # starts at every boot (the netns is recreated when no container pins it, so
+  # a build-once rule set would be gone after a reboot). ExecStartPre failure
+  # refuses the unit start: fail closed.
+  local egress_network egress_ruleset egress_guard
+  egress_network="$(worker_egress_network_name "$name")"
+  egress_ruleset="$(worker_egress_ruleset_path "$name")"
+  egress_guard="$WORKER_EGRESS_GUARD"
+
   local unit_staged
   # WI#446 (run-166 LF-8): the Quadlet embeds AGENT_AUTH_TOKEN/TENSORZERO_API_KEY,
   # and its ~/.config/containers destination is tenant-controlled — the producer
@@ -558,6 +568,7 @@ StartLimitBurst=5
 
 [Container]
 ContainerName=lunarwing-${worker}-${name}
+Network=${egress_network}
 Image=lunarwing-worker-${worker}:latest
 PublishPort=127.0.0.1:${wss_port}:${wss_port}
 Volume=${workspace_dir}:/workspace:z
@@ -673,6 +684,7 @@ HealthStartPeriod=30s
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=120
+ExecStartPre=${egress_guard} ${egress_ruleset} rootless
 
 [Install]
 WantedBy=default.target

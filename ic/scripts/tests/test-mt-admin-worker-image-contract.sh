@@ -58,6 +58,12 @@ assert_no_call() { if has_call "$1"; then fail "$2 (unexpected call: $1)"; else 
 IMAGE_ID="sha256:aaaa"
 IMAGE_USER=""
 TRACK_EXISTENCE="false"
+# WI#424 control 1: the egress allowlist reads the tenant env through a
+# tenant-side read and needs a real netns; it fails closed without either. The
+# fixture tenant has no account, so stub the step (its own harness pins the
+# behaviour, and the recreate decision under test happens before the worker
+# start path runs the filter).
+prepare_worker_egress() { :; }
 CONTAINER_EXISTS="true"
 _ctr() {
   CALLS+=("ctr:$*")
