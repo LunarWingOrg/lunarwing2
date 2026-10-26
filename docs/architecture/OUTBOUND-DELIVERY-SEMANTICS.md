@@ -98,20 +98,20 @@ client task, backed by a durable on-disk spool. Four hardening rules apply
   this; no channel returns a delivery receipt and remote confirmation
   (e.g. XEP-0198 acks) is not part of this contract.
 - **Mission-run ledger.** The engine-side half of WI#270's long-term fix is
-  separate from the channel spool. A graceful shutdown no longer loses a
-  mid-run fire of an Active mission, with two exceptions (a mission paused
-  or retired mid-run records a quiet stop; an abort between the settled
-  stop and the mission-row save loses the fire with its dedup key still
-  recorded — see ENGINE-V2.md): the run is stopped within a short
-  grace, the interruption is recorded, and a persisted retry marker re-fires
-  it after restart within the mission's retry policy (WI#276; see
-  ENGINE-V2.md, mission retries — a policy with no attempts left records the
-  interruption without a re-fire). A run that cannot
-  stop within the grace is still recorded and stamped at shutdown; the boot
-  sweep resolves the stamp against the thread's final state and retries a
-  settled stop, while a hard kill stays restart recovery's record-only case
-  (WI#301). A re-fired run may repeat side effects the interrupted run
-  already performed (at-least-once).
+  separate from the channel spool. For a mid-run fire of an Active mission,
+  the run is stopped within a short grace, the interruption is recorded,
+  and a persisted retry marker re-fires it after restart within the
+  mission's retry policy (WI#276; see ENGINE-V2.md, mission retries — a
+  policy with no attempts left records the interruption without a re-fire).
+  A mission paused or retired mid-run instead records a quiet stop with no
+  retry. An abort between the settled stop and the mission-row save still
+  loses the fire, but the next boot releases its recorded dedup key without
+  auto-refiring (WI#394), so an external redelivery can proceed. A run that
+  cannot stop within the grace is recorded and stamped at shutdown; the
+  boot sweep resolves the stamp against the thread's final state and
+  retries a settled stop, while a hard kill stays restart recovery's
+  record-only case (WI#301). A re-fired run may repeat side effects the
+  interrupted run already performed (at-least-once).
 - **Other channels.** The spool is XMPP-local. Channels with similar
   in-memory outbound queues keep their existing semantics.
 
