@@ -1798,4 +1798,38 @@ mod memory_write_route {
             assert_eq!(resp.status(), StatusCode::OK, "{path}");
         }
     }
+
+    #[tokio::test]
+    async fn memory_write_rejects_control_bearing_paths_on_every_write_branch() {
+        let (app, _dir) = setup().await;
+        for (path, append, layer) in [
+            ("notes/forged\ncontinuation.md", false, None),
+            ("notes/append\u{7}.md", true, None),
+            ("notes/layer\u{85}.md", false, Some("private")),
+            ("notes/layer-append\u{1f}.md", true, Some("private")),
+            ("notes/trimmed-carriage-return\r", false, None),
+        ] {
+            let mut body = serde_json::json!({
+                "path": path,
+                "content": "must not persist",
+                "append": append,
+            });
+            if let Some(layer) = layer {
+                body["layer"] = serde_json::json!(layer);
+            }
+            let resp = app
+                .clone()
+                .oneshot(write_request("tok-alice", body))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{path:?}");
+            let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            let text = String::from_utf8_lossy(&body);
+            assert!(text.contains("control characters"), "{text:?}");
+            assert!(
+                !text.chars().any(char::is_control),
+                "the response must not echo a raw control character: {text:?}"
+            );
+        }
+    }
 }
