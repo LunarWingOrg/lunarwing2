@@ -38,6 +38,15 @@ no-op override fails too, so the input is retired once upstream ships its own
 fix. Update the reviewed digest together with any intentional lock change; CI
 checks they match.
 
+The build also applies `patches/wi477-request-events.patch` at that exact ref
+and hashes it into CI worker inputs. Its request start/finish and retry markers
+are emitted only when the bridge sets `PEBBLE_LUNARWING_REQUEST_EVENTS=1`, so
+ordinary Pebble CLI JSON is unchanged. The bridge uses them for indexed,
+elapsed-time heartbeats (`PEBBLE_PROGRESS_HEARTBEAT_MS`, default 120000) and
+visible retry events. `PEBBLE_API_TIMEOUT_SECS=600` is the native per-attempt
+API deadline; see `docs/ops/WORKER-CONTAINERS.md` → "LLM request latency,
+heartbeats and timeouts".
+
 Fast regression checks (no image build):
 
 ```bash
