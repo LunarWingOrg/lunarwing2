@@ -608,6 +608,8 @@ WASM tools execute HTTP requests through the host runtime, subject to:
    spellings include URL/form encoding, URL-parser forms, JSON string content,
    lower/uppercase hexadecimal, and injected-header credential tokens. An echo
    split across two response header fields replaces both complete values.
+   Both hosts share the implementation in `src/tools/wasm/http_security.rs`
+   rather than maintaining independent needle plans.
    Residuals: only **proxy headers** get the two-round percent-decode detector;
    proxy bodies and wrapper headers/bodies do not. The wrapper's heuristic
    response leak scan still skips bodies that are not valid UTF-8, but the
@@ -675,9 +677,14 @@ allowlist, so the guest receives the (redacted) 3xx instead.
 WI#432 closes the former WI#408 residuals. Credentialed exchanges also drop
 `Range` and `If-Range`, and a `206 Partial Content` response is refused at the
 redaction boundary, so a guest cannot reassemble an echo from byte ranges;
-ordinary exchanges retain their range semantics. The channel uses the tool
-wrapper's `reject_private_ip` guard unless `ALLOW_PRIVATE_IPS=1` explicitly
-permits local/private sidecars. Response bodies stream through the same capped
+ordinary exchanges retain their range semantics. Both hosts use the shared
+`reject_private_ip` guard. General private-target access requires the separate,
+default-off `WASM_HTTP_ALLOW_PRIVATE_IPS=1` opt-in; the daemon's
+`ALLOW_PRIVATE_IPS=1` setting for Postgres, TensorZero and other private
+infrastructure does not disable these WASM guards. The host-configured
+vision/voice sidecar is a narrow tool-host exception tied to its exact
+configured origin and `/v1/` scope (with the extension allowlist and method
+restrictions still applied). Response bodies stream through the same capped
 collector: declared lengths are checked up front, actual chunks are checked as
 they arrive, and reading stops at the first over-limit chunk instead of after
 full buffering. Stream errors still pass through `without_url()`.
