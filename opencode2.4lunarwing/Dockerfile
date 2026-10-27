@@ -140,7 +140,9 @@ ENV OPENCODE_DISABLE_AUTOUPDATE=1
 # rewrite both files identically. This detects accidental drift; an adversarial
 # Dockerfile edit can still defeat it by replacing the environment or checker
 # (run-109 GW-3). Absent or mismatched fails the build with the checker intact.
-ARG LUNARWING_WRAPPER_SHA256=
+# WI#425 GX-3: the ARG is declared right above the final assert RUN, so a
+# wrapper edit invalidates only that layer instead of every runtime-stage
+# layer below the old mid-file declaration.
 
 LABEL org.opencontainers.image.title="LunarWing OpenCode 2 Worker" \
       org.opencontainers.image.description="Persistent OpenCode 2 worker with WebSocket agent communication" \
@@ -370,6 +372,7 @@ RUN set -eu; \
     && python3 scripts/prepare_reproducible_build_test.py \
     && python3 scripts/study_notes_config_test.py \
     && python3 scripts/exposure_policy_assert_test.py \
+    && python3 scripts/image_config_policy_test.py \
     && python3 scripts/entrypoint_config_test.py \
     && python3 scripts/compile_out_remote_tunnel_test.py \
     && for leaked in /root/.bun /root/.local /root/.cache /root/.config; do \
@@ -386,6 +389,11 @@ RUN mkdir -p /home/opencode2/.local/share/opencode \
     && chown -R opencode2:opencode2 /home/opencode2 /workspace /var/log/lunarwing /app/results
 
 # Check the final runtime filesystem, after all COPY/chown/chmod operations.
+# The wrapper anchor ARG (WI#357 run-106 GJ-3(a), WI#425 GX-3 layer-locality)
+# is declared here so the digest comparison is visible at the assert and a
+# wrapper edit invalidates only this layer's cache, not the whole runtime
+# stage. build-worker-image.sh and mt-admin's build_opencode2_worker pass it.
+ARG LUNARWING_WRAPPER_SHA256=
 RUN python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --image-filesystem
 
 # ── ports ──────────────────────
@@ -395,6 +403,8 @@ EXPOSE 9090
 # ── health check ───────────────────────
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD curl -sf http://127.0.0.1:8443/health || exit 1
+
+STOPSIGNAL SIGTERM
 
 USER 10003:10003
 

@@ -51,8 +51,8 @@ Pinned images:
   `sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f`
 - cargo-deny 0.20.2 x86-64 musl archive:
   `sha256:9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f`
-- BuildKit 0.25.1 rootless OCI index:
-  `sha256:0c0ce4929976ace509f7a53878303504b2de8857829aea4932af9f7325a30f51`
+- BuildKit 0.34.1 rootless OCI index:
+  `sha256:f68752a5a94acfcdad2d07867b7075601a421638e17fc5f28efc1c814d0c4f89`
 - Trivy 0.74.0 OCI index:
   `sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969`
 - pgvector PostgreSQL 16 OCI index:
@@ -520,7 +520,15 @@ host's concurrent builds before retrying manually.
   `.gitlab/tests` regressions for the inventory and full package-record guard.
 - `ci-config` validation rejects jobs whose `stage:` is missing from the root
   `stages` list, so stage renames/removals fail at validation time instead of
-  killing the whole pipeline after push.
+  killing the whole pipeline after push. It also installs the pinned Go
+  1.26.10 toolchain through `fetch-go-toolchain.py`, making the BuildKit
+  parser fixtures mandatory in the Python test discovery lane. This is a
+  required-gate availability dependency: every pipeline downloads the roughly
+  64 MiB archive from go.dev, verifies its SHA-256, and extracts it with the
+  tar `data` filter, so a go.dev outage fails `ci-config` until the job can be
+  retried successfully. OpenCode 2 promotion hard-needs both the BuildKit
+  parser guard and the tar/config verifier; neither can be removed or made
+  optional without failing validation.
 - Worker promotion runs a 15-second registry auth-realm smoke test
   (`.gitlab/scripts/registry-realm-smoke.py`) before the promote script, so a
   broken realm fails cheaply instead of after the multi-hour candidate and

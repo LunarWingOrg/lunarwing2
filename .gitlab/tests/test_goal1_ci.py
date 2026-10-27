@@ -148,6 +148,67 @@ class FullValidationTests(unittest.TestCase):
                         self.assertIn('CI_PIPELINE_SOURCE == "push"', condition)
                         self.assertNotIn("LUNARWING_CI_FULL_VALIDATION", condition)
 
+    def test_opencode2_exposure_verify_cannot_become_optional_or_unpinned(self):
+        mutations = {
+            "job allow_failure": lambda merged: merged["worker-opencode2-exposure-verify"].update(
+                allow_failure=True
+            ),
+            "rule allow_failure": lambda merged: merged["worker-opencode2-exposure-verify"]["rules"][0].update(
+                allow_failure=True
+            ),
+            "image": lambda merged: merged["worker-opencode2-exposure-verify"].update(
+                image="docker.io/library/python:latest"
+            ),
+            "needs": lambda merged: merged["worker-opencode2-exposure-verify"]["needs"][0].update(
+                artifacts=False
+            ),
+            "script": lambda merged: merged["worker-opencode2-exposure-verify"]["script"].__setitem__(
+                2, "true"
+            ),
+            "tar artifact": lambda merged: merged["worker-opencode2-candidate"]["artifacts"]["paths"].remove(
+                "opencode2-rootfs.tar"
+            ),
+            "promotion need": lambda merged: merged["worker-opencode2-promote"].update(needs=[]),
+            "parser promotion need": lambda merged: merged["worker-opencode2-promote"]["needs"].remove(
+                {"job": "worker-buildkit-parser-policy-guard", "artifacts": False}
+            ),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                merged = copy.deepcopy(self.merged)
+                mutate(merged)
+                errors = []
+                config.validate_worker_publication(merged, errors)
+                self.assertTrue(any("opencode2" in error for error in errors), (name, errors))
+
+    def test_buildkit_parser_guard_is_required_and_pinned(self):
+        for name, key, value in (
+            ("missing job", None, None),
+            ("image", "image", "golang:latest"),
+            ("toolchain", "variables", {"GOTOOLCHAIN": "auto"}),
+            ("commands", "script", ["true"]),
+            ("optional", "allow_failure", True),
+            ("rules", "rules", [{"when": "never"}]),
+            ("job-level when", "when", "manual"),
+            ("before script", "before_script", ["exit 0"]),
+        ):
+            with self.subTest(name=name):
+                merged = copy.deepcopy(self.merged)
+                if key is None:
+                    merged.pop("worker-buildkit-parser-policy-guard")
+                else:
+                    merged["worker-buildkit-parser-policy-guard"][key] = value
+                errors = []
+                config.validate_test_shapes(merged, errors)
+                self.assertTrue(any("buildkit-parser" in error for error in errors), errors)
+
+    def test_ci_config_go_bootstrap_cannot_be_removed(self):
+        merged = copy.deepcopy(self.merged)
+        merged["ci-config"]["before_script"] = ["python3 -m pip install --no-deps PyYAML==6.0.3"]
+        errors = []
+        config.validate_test_shapes(merged, errors)
+        self.assertIn("ci-config must run the pinned Go bootstrap before its parser fixtures", errors)
+
 
 class WorkerVersionPinTests(unittest.TestCase):
     """The worker pin cross-check must bind values to each worker's own case
@@ -738,7 +799,7 @@ class BunImageTieTests(unittest.TestCase):
             "CI_DEBIAN_SNAPSHOT": "20260906T000000Z",
         }
         self.merged = {
-            ".worker-candidate": {"image": "docker.io/moby/buildkit:v0.25.1-rootless@sha256:0c0ce4929976ace509f7a53878303504b2de8857829aea4932af9f7325a30f51"},
+            ".worker-candidate": {"image": "docker.io/moby/buildkit:v0.34.1-rootless@sha256:f68752a5a94acfcdad2d07867b7075601a421638e17fc5f28efc1c814d0c4f89"},
             ".worker-scan": {"image": "docker.io/aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969"},
             ".worker-promotion": {"image": "docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"},
             "rust-test-postgres-integration": {
@@ -766,6 +827,23 @@ class BunImageTieTests(unittest.TestCase):
             f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST} AS runtime\n"
         )
         self.assertEqual(self.errors(), [])
+
+    def test_buildkit_tag_and_digest_must_both_match_reviewed_pin(self):
+        self.write_dockerfile(
+            f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST} AS builder\n"
+        )
+        self.assertEqual(self.errors(), [])
+        tag, digest = self.merged[".worker-candidate"]["image"].split("@")
+        for image in (
+            f"{tag}@sha256:{self.OTHER_DIGEST}",
+            f"docker.io/moby/buildkit:v0.0.0-rootless@{digest}",
+        ):
+            with self.subTest(image=image):
+                self.merged[".worker-candidate"]["image"] = image
+                errors = self.errors()
+                self.assertEqual(len(errors), 1, errors)
+                self.assertIn(".worker-candidate image", errors[0])
+                self.assertIn("differs from the reviewed pin", errors[0])
 
     def test_digest_mismatch_is_caught(self):
         self.write_dockerfile(
@@ -852,7 +930,7 @@ class NodeImageTieTests(unittest.TestCase):
             "CI_DEBIAN_SNAPSHOT": self.SNAPSHOT,
         }
         self.merged = {
-            ".worker-candidate": {"image": "docker.io/moby/buildkit:v0.25.1-rootless@sha256:0c0ce4929976ace509f7a53878303504b2de8857829aea4932af9f7325a30f51"},
+            ".worker-candidate": {"image": "docker.io/moby/buildkit:v0.34.1-rootless@sha256:f68752a5a94acfcdad2d07867b7075601a421638e17fc5f28efc1c814d0c4f89"},
             ".worker-scan": {"image": "docker.io/aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969"},
             ".worker-promotion": {"image": "docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"},
             "rust-test-postgres-integration": {
@@ -997,7 +1075,7 @@ class DebianSnapshotTieTests(unittest.TestCase):
             "CI_DEBIAN_SNAPSHOT": self.SNAPSHOT,
         }
         self.merged = {
-            ".worker-candidate": {"image": "docker.io/moby/buildkit:v0.25.1-rootless@sha256:0c0ce4929976ace509f7a53878303504b2de8857829aea4932af9f7325a30f51"},
+            ".worker-candidate": {"image": "docker.io/moby/buildkit:v0.34.1-rootless@sha256:f68752a5a94acfcdad2d07867b7075601a421638e17fc5f28efc1c814d0c4f89"},
             ".worker-scan": {"image": "docker.io/aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969"},
             ".worker-promotion": {"image": "docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"},
             "rust-test-postgres-integration": {

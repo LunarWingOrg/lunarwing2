@@ -583,13 +583,13 @@ WASM tools execute HTTP requests through the host runtime, subject to:
    decompress, a credential-injected exchange sends exactly one
    `accept-encoding: identity` (replacing every guest spelling) and removes
    every `TE` offer. A **non-empty** response with any non-identity
-   `Content-Encoding` or non-chunked `Transfer-Encoding` token is refused —
-   the guest could otherwise decode an echoed credential itself. Hyper
-   removes a single `chunked` layer when the last token of the last field
-   is `chunked`. The wrapper still accepts trailing-empty and repeated
-   `chunked` forms whose framing may remain and hide a split echo from the
-   byte scrub; this gap is tracked separately in
-   [WI#430](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/430).
+   `Content-Encoding` or a `Transfer-Encoding` that keeps chunk framing is
+   refused — the guest could otherwise decode an echoed credential itself.
+   hyper removes a single `chunked` layer only when the last element of the
+   last field is `chunked`, so only that form is inspectable: `chunked,`, a
+   `chunked` field followed by an empty field, repeated `chunked`, and
+   `gzip, chunked` are refused (WI#430), while `,chunked`, whitespace
+   variants, mixed case and an empty field followed by `chunked` pass.
    Empty bodies (including HEAD/204/304 responses) are exempt from this
    encoding refusal; ordinary exchanges keep the guest's own headers and answer.
    Duplicate response fields are comma-joined before the encoding check,
@@ -741,8 +741,27 @@ silently shadow an operator's setting there. `lunarwing service install`
 xmpp-bridge, weechat, darkirc, babysitters), is protected by the
 `add_mt_tenant_siblings` rule and the mt-admin `SANDBOX_PROTECTED_PATHS`
 render, and the harness layout (`TEST_ROOT/{logs,state}`) by the same sibling
-rule. A custom redirect elsewhere belongs in `SANDBOX_PROTECTED_PATHS`. The
-boot banner prints the gateway URL with `?token=` on every start when the CLI
+rule. A custom redirect elsewhere belongs in `SANDBOX_PROTECTED_PATHS`.
+
+`add_mt_tenant_siblings` (WI#441) no longer depends on the base component being
+literally named `state`: that name is still honoured on its own, and a base
+whose parent carries the structural MT tenant-root marker (the sibling
+`env/lunarwing.env` credential file plus a `run/` or `logs/` directory) gets
+`<root>/env`, `<root>/run` and `<root>/logs` covered too. A non-standard MT
+layout (`data/state`, `var`, `store`) therefore
+keeps sibling coverage instead of silently falling back to the unprotected
+condition WI#209 fixed. An ordinary single-node home containing a Python
+`env/` virtualenv and `run/` or `logs/` is not an MT root without that credential
+file; its unrelated sibling directories remain mountable and unmasked. The
+literal `state` base-name fallback remains available before tenant files exist,
+and explicit protected paths are never removed by the heuristic.
+
+When neither `SANDBOX_PROTECTED_PATHS` nor `LUNARWING_SERVICE_LOG_DIRS` names
+anything, `resolve_protected_paths` logs **one `warn!` per boot** naming the
+resolved base dir and whether coverage came from the structural heuristic
+(WI#441). An absent list is correct for single-node installs but is a degrade
+in multi-tenant ones, and it used to be invisible apart from reading source.
+The boot banner prints the gateway URL with `?token=` on every start when the CLI
 channel is enabled; when stdout is not a terminal (a redirect into one of
 these files) the token is replaced by
 `<hidden: GATEWAY_AUTH_TOKEN, or lunarwing config get channels.gateway_auth_token>`.

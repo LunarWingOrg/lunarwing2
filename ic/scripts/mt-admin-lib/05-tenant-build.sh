@@ -1246,6 +1246,115 @@ build_opencode_worker() {
   say "opencode worker image built: lunarwing-worker-opencode:latest [$toolchain_desc] (revision $source_revision)"
 }
 
+_opencode2_snapshot_source() {
+  local source_root="$1" source="$2"
+  local parent base resolved_parent prefix
+  parent="$(dirname -- "$source")"
+  base="$(basename -- "$source")"
+  resolved_parent="$(realpath -e -- "$parent")" || {
+    echo "ERROR: cannot resolve checkout source parent for $source (WI#425 out-of-band)" >&2
+    return 1
+  }
+  prefix="${source_root%/}/"
+  if [[ "$resolved_parent" != "$source_root" && "$resolved_parent" != "$prefix"* ]]; then
+    echo "ERROR: checkout source $source escapes the checkout root (WI#425 out-of-band)" >&2
+    return 1
+  fi
+  printf '%s/%s\n' "$resolved_parent" "$base"
+}
+
+# Resolve every source parent below the canonical checkout, copy without
+# following final links, then refuse every link or special file before any
+# snapshot Python is executed. The snapshot is root-owned and read-only.
+_opencode2_snapshot_checkout() {
+  local source_root="$1" opencode2_dir="$2" tmp_dir="$3"
+  local snapshot="$tmp_dir/checkout" name source resolved_root
+  local lane="$snapshot/opencode2.4lunarwing"
+  resolved_root="$(realpath -e -- "$source_root")" || return 1
+  mkdir -p "$snapshot/.gitlab/scripts" "$lane" || return 1
+  for name in scripts config; do
+    source="$(_opencode2_snapshot_source "$resolved_root" "$opencode2_dir/$name")" || return 1
+    cp -R --no-dereference --no-preserve=ownership -- \
+      "$source" "$lane/$name" || return 1
+  done
+  for name in entrypoint.sh health_server.py agent_comm_protocol.json; do
+    source="$(_opencode2_snapshot_source "$resolved_root" "$opencode2_dir/$name")" || return 1
+    cp -R --no-dereference --no-preserve=ownership -- \
+      "$source" "$lane/$name" || return 1
+  done
+  source="$(_opencode2_snapshot_source "$resolved_root" \
+    "$source_root/.gitlab/scripts/verify-opencode2-exposure-out-of-band.py")" || return 1
+  cp -R --no-dereference --no-preserve=ownership -- \
+    "$source" "$snapshot/.gitlab/scripts/verify-opencode2-exposure-out-of-band.py" || return 1
+  if [[ -n "$(find "$snapshot" ! -type f ! -type d -print -quit)" ]]; then
+    echo "ERROR: checkout snapshot contains a link or special file (WI#425 out-of-band)" >&2
+    return 1
+  fi
+  chmod -R go-w,a+rX "$snapshot" || return 1
+  printf '%s\n' "$snapshot"
+}
+
+# Verify by immutable image ID using the same tar policy as protected CI.
+# Tenant-controlled Python runs only as nobody, with an empty environment.
+# Usage: _verify_opencode2_image_out_of_band <image-id> <source-root> <wrapper-sha256>
+_verify_opencode2_image_out_of_band() (
+  local image_ref="$1" source_root="$2" wrapper_anchor="$3"
+  local opencode2_dir="$source_root/opencode2.4lunarwing"
+  local cid='' tmp_dir inputs archive config_json config_file snapshot snapshot_anchor
+  local python nobody_uid nobody_gid work
+  [[ -n "$image_ref" && -d "$opencode2_dir" && "$wrapper_anchor" =~ ^[0-9a-f]{64}$ ]] || return 2
+
+  tmp_dir="$(mktemp -d "/var/tmp/lw-oob.XXXXXX")" || return 1
+  trap '_status=$?; [[ -z "$cid" ]] || "$CONTAINER_RT" rm -f "$cid" >/dev/null 2>&1 || true; rm -rf "$tmp_dir"; exit "$_status"' EXIT
+  inputs="$tmp_dir/inputs"
+  mkdir -m 0700 "$inputs" || return 1
+  cid="$("$CONTAINER_RT" create --pull=never "$image_ref" 2>/dev/null)" || cid=''
+  if [[ -z "$cid" || ! "$cid" =~ ^[[:alnum:]]+$ ]]; then
+    echo "ERROR: out-of-band verification could not create a container from $image_ref" >&2
+    return 1
+  fi
+  archive="$inputs/rootfs.tar"
+  if ! "$CONTAINER_RT" export --output "$archive" "$cid" >/dev/null 2>&1 \
+     || [[ ! -f "$archive" || -L "$archive" ]]; then
+    echo "ERROR: cannot export the opencode2 image filesystem (WI#425 out-of-band)" >&2
+    return 1
+  fi
+  config_json="$("$CONTAINER_RT" image inspect "$image_ref" 2>/dev/null)" || {
+    echo "ERROR: cannot inspect full image config for $image_ref (WI#425 out-of-band)" >&2
+    return 1
+  }
+  config_file="$inputs/image-config.json"
+  printf '%s' "$config_json" > "$config_file" || return 1
+  snapshot="$(_opencode2_snapshot_checkout "$source_root" "$opencode2_dir" "$tmp_dir")" || return 1
+  snapshot_anchor="$(sha256sum < "$snapshot/opencode2.4lunarwing/scripts/opencode-exposure-guard.sh")" || return 1
+  snapshot_anchor="${snapshot_anchor%% *}"
+  if [[ "$snapshot_anchor" != "$wrapper_anchor" ]]; then
+    echo "ERROR: checkout wrapper changed between build and verification (WI#425 out-of-band)" >&2
+    return 1
+  fi
+
+  python="$(command -v python3)" || return 1
+  nobody_uid="$(id -u nobody 2>/dev/null)" || nobody_uid=''
+  nobody_gid="$(id -g nobody 2>/dev/null)" || nobody_gid=''
+  if [[ ! "$nobody_uid" =~ ^[1-9][0-9]*$ || ! "$nobody_gid" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: an unprivileged nobody account is required for out-of-band verification" >&2
+    return 1
+  fi
+  work="$tmp_dir/work"
+  mkdir -m 0700 "$work" \
+    && chown "$nobody_uid:$nobody_gid" "$work" "$inputs" "$archive" "$config_file" \
+    && chmod 0711 "$tmp_dir" && chmod 0700 "$work" "$inputs" \
+    && chmod 0600 "$archive" "$config_file" || return 1
+  if ! setpriv --reuid="$nobody_uid" --regid="$nobody_gid" --clear-groups --no-new-privs -- \
+      env -i PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 \
+      "$python" -I "$snapshot/.gitlab/scripts/verify-opencode2-exposure-out-of-band.py" \
+      --archive "$archive" --config "$config_file" --workspace-dir "$work"; then
+    echo "ERROR: shared opencode2 export verification failed (WI#425 out-of-band)" >&2
+    return 1
+  fi
+  say "out-of-band verify: $image_ref passes the shared tar/config exposure policy"
+)
+
 build_opencode2_worker() {
   local no_cache="${1:-false}"
   local with_toolchains="${2:-false}"
@@ -1272,29 +1381,46 @@ build_opencode2_worker() {
   # WI#357 run-106 GJ-3(a): pass the checkout's exposure-guard wrapper digest
   # for the in-image --image-filesystem comparison. This detects accidental
   # drift; an adversarial Dockerfile can still replace the environment or
-  # checker. Out-of-band image verification remains a WI#357 follow-up (GW-3).
+  # checker — the WI#425 out-of-band verification below re-checks the built
+  # image host-side with the checkout's own bytes.
   local wrapper_file="$opencode2_dir/scripts/opencode-exposure-guard.sh" wrapper_anchor
   wrapper_anchor=$(sha256sum < "$wrapper_file") || die "cannot hash $wrapper_file"
   wrapper_anchor=${wrapper_anchor%% *}
   [[ "$wrapper_anchor" =~ ^[0-9a-f]{64}$ ]] || die "invalid wrapper sha256 for $wrapper_file"
 
+  # A per-build tag and --iidfile avoid cross-build verification races. Verify
+  # and promote only the immutable ID; the friendly tag is never trusted.
+  local candidate_tag="lunarwing-worker-opencode2:candidate-$$" iid_file image_id
+  iid_file="$(mktemp "${TMPDIR:-/tmp}/lw-opencode2-iid.XXXXXX")" \
+    || die "cannot create opencode2 image-id file"
+  local -a identity_args=(--iidfile "$iid_file")
   if [[ "$CONTAINER_RT" == "podman" ]]; then
     local -a layer_args=()
     if [[ "$no_cache" == "true" ]]; then
-      # Same dangling-layer hygiene as the v1 worker builder; the v2 build is
-      # an equally large Bun compile.
       say "pruning dangling Podman images before uncached OpenCode 2 build ..."
       if ! podman image prune -f >/dev/null; then
         say "WARNING: failed to prune dangling Podman images; continuing build" >&2
       fi
       layer_args=(--layers=false)
     fi
-    podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" --build-arg "LUNARWING_WRAPPER_SHA256=$wrapper_anchor" --network=host --format docker -t lunarwing-worker-opencode2:latest "$opencode2_dir" \
-      || die "opencode2 worker image build failed"
+    podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" --build-arg "LUNARWING_WRAPPER_SHA256=$wrapper_anchor" --network=host --format docker "${identity_args[@]}" -t "$candidate_tag" "$opencode2_dir" \
+      || { rm -f "$iid_file"; die "opencode2 worker image build failed"; }
   else
-    docker build "${cache_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" --build-arg "LUNARWING_WRAPPER_SHA256=$wrapper_anchor" -t lunarwing-worker-opencode2:latest "$opencode2_dir" \
-      || die "opencode2 worker image build failed"
+    docker build "${cache_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" --build-arg "LUNARWING_WRAPPER_SHA256=$wrapper_anchor" "${identity_args[@]}" -t "$candidate_tag" "$opencode2_dir" \
+      || { rm -f "$iid_file"; die "opencode2 worker image build failed"; }
   fi
+  image_id="$(<"$iid_file")"
+  rm -f "$iid_file"
+  [[ "$image_id" =~ ^(sha256:)?[0-9a-f]{64}$ ]] \
+    || die "opencode2 build did not produce a valid immutable image ID"
+
+  if ! _verify_opencode2_image_out_of_band "$image_id" "$source_root" "$wrapper_anchor"; then
+    "$CONTAINER_RT" rmi "$candidate_tag" >/dev/null 2>&1 || true
+    die "out-of-band opencode2 image verification FAILED for $image_id (WI#425)"
+  fi
+  "$CONTAINER_RT" tag "$image_id" lunarwing-worker-opencode2:latest \
+    || die "cannot re-tag verified $image_id as lunarwing-worker-opencode2:latest"
+  "$CONTAINER_RT" rmi "$candidate_tag" >/dev/null 2>&1 || true
 
   say "opencode2 worker image built: lunarwing-worker-opencode2:latest [$toolchain_desc] (revision $source_revision)"
 }
