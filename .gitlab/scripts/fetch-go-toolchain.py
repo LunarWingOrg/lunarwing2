@@ -13,10 +13,10 @@ import tarfile
 import urllib.error
 import urllib.request
 
-GO_VERSION = "1.24.3"
+GO_VERSION = "1.26.10"
 ARCHIVES = {
-    "x86_64": ("amd64", "3333f6ea53afa971e9078895eaa4ac7204a8c6b5c68c10e6bc9a33e8e391bdd8"),
-    "aarch64": ("arm64", "a463cb59382bd7ae7d8f4c68846e73c4d589f223c589ac76871b66811ded7836"),
+    "x86_64": ("amd64", "ccfe7ae822d2c2f41f4fe7c956199967a4dac22d0ee0d2b2bfdb440aab3b20c5"),
+    "aarch64": ("arm64", "3f4227ce7b206a513e794f1393adb473a07b46e94d18bd15d1c684bbb7319797"),
 }
 MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 
