@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 # WI#424 control 6: exercise the real entrypoint during the candidate build.
+#
+# The smoke runs as the image's own runtime user (10003) — not as root — so it
+# observes the permissions, listeners and wrapper behaviour a real worker has
+# (run-226 OQ-6). Root only creates/cleans the scratch tree.
 set -euo pipefail
 
 SMOKE_ROOT="/tmp/opencode2-runtime-smoke-entrypoint"
+SMOKE_UID="${SMOKE_UID:-10003}"
+SMOKE_GID="${SMOKE_GID:-10003}"
 ENTRYPOINT_PID=""
 READY=false
 
@@ -19,6 +25,18 @@ cleanup() {
 }
 trap cleanup EXIT
 rm -rf -- "$SMOKE_ROOT"
+mkdir -p "$SMOKE_ROOT"
+chown "$SMOKE_UID:$SMOKE_GID" "$SMOKE_ROOT"
+
+# Run a given command as the image runtime user. `setpriv` ships in Debian's
+# util-linux (always present); fall back to `su` if it is ever absent.
+as_runtime_user() {
+  if command -v setpriv >/dev/null 2>&1; then
+    setpriv --reuid="$SMOKE_UID" --regid="$SMOKE_GID" --clear-groups -- "$@"
+  else
+    su -s /bin/bash -c "$(printf '%q ' "$@")" - 10003
+  fi
+}
 
 export HOME="$SMOKE_ROOT/home"
 export XDG_CONFIG_HOME="$HOME/.config"
@@ -37,8 +55,9 @@ export WS_PORT=19090
 export WS_BIND_HOST=0.0.0.0
 export OPENCODE_SERVE_PORT=4096
 mkdir -p "$HOME" "$TMPDIR" "$WORKSPACE_ROOT"
+chown -R "$SMOKE_UID:$SMOKE_GID" "$SMOKE_ROOT"
 
-/app/entrypoint.sh --mode websocket >"$SMOKE_ROOT/entrypoint.log" 2>&1 &
+as_runtime_user /app/entrypoint.sh --mode websocket >"$SMOKE_ROOT/entrypoint.log" 2>&1 &
 ENTRYPOINT_PID=$!
 
 for _ in $(seq 1 60); do
@@ -60,4 +79,10 @@ if [[ "$READY" != "true" ]]; then
   exit 1
 fi
 
-python3 /app/scripts/runtime_smoke.py --profile container --health-port "$HEALTH_PORT"
+# Refuse to certify a smoke that silently ran as root.
+if [[ "$(as_runtime_user id -u)" != "$SMOKE_UID" ]]; then
+  printf 'runtime smoke: could not drop to the image runtime user %s\n' "$SMOKE_UID" >&2
+  exit 1
+fi
+
+as_runtime_user python3 /app/scripts/runtime_smoke.py --profile container --health-port "$HEALTH_PORT"

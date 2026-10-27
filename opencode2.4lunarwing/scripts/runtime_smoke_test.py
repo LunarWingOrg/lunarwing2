@@ -471,6 +471,17 @@ class CandidateBuildWiringTests(unittest.TestCase):
         self.assertIn("/app/entrypoint.sh --mode websocket", runner)
         self.assertIn("runtime_smoke.py --profile container", runner)
 
+    def test_candidate_smoke_runs_as_the_image_runtime_user(self) -> None:
+        # OQ-6: a root-run smoke observes root permissions and would certify a
+        # worker shape the image never has. It must drop to uid 10003 and prove
+        # the drop took effect before reporting for the entrypoint.
+        lane = Path(__file__).resolve().parents[1]
+        runner = (lane / "scripts/runtime_smoke_entrypoint.sh").read_text()
+        self.assertIn("SMOKE_UID=\"${SMOKE_UID:-10003}\"", runner)
+        self.assertIn('as_runtime_user /app/entrypoint.sh --mode websocket', runner)
+        self.assertIn('as_runtime_user python3 /app/scripts/runtime_smoke.py', runner)
+        self.assertIn('as_runtime_user id -u', runner)
+
     def test_candidate_input_manifest_includes_the_entrypoint_runner(self) -> None:
         repo = Path(__file__).resolve().parents[2]
         manifest = (repo / ".gitlab/scripts/build-worker-image.sh").read_text()
