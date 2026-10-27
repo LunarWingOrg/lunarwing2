@@ -100,8 +100,9 @@ build with the default root HOME.
   `agent_comm_protocol.json`, `scripts/`+`config/`, the image build assertions, and
   `compile_out_remote_tunnel.py` fail-closed when bumping the pinned ref.
   These are naive-use guards, not a boundary — the real binary stays
-  executable; only the egress allowlist (WI#357 control 1, deferred) holds
-  against a compromised agent. The wrapper rejects explicit service commands;
+  executable; only the egress allowlist (WI#424 control 1, enforced by
+  mt-admin's `worker-egress` on every worker start) holds against a
+  compromised agent. The wrapper rejects explicit service commands;
   implicit startup is controlled by the agent-writable live `service.json`,
   which the entrypoint resets at each boot.
 
@@ -115,8 +116,10 @@ v2.0.32 under the maintainer-approved WI#427):
 v2.0.26 introduced OpenTunnel remote access (hosted relay, no self-host
 option). The compile-out guard stubs `remote-tunnel.ts` at build time,
 re-verified against v2.1.2, and CI + the build assertions fail if the tunnel
-survives. Future bumps remain deliberate-only. WI#369's SDK-gate blind spots
-and WI#424's egress allowlist remain open; see the bump record.
+survives. Future bumps remain deliberate-only. WI#369's SDK-gate blind spots remain
+open; WI#424's egress allowlist is implemented (mt-admin `worker-egress`) and
+`scripts/runtime_smoke_entrypoint.sh` starts the real entrypoint for the
+candidate smoke; `scripts/runtime_smoke.py` also runs against a live container.
 
 ## Key Files (this policy)
 
@@ -125,5 +128,6 @@ and WI#424's egress allowlist remain open; see the bump record.
 - `scripts/image_config_policy.py` — checkout-owned allowlist for the complete image `Env` (PATH order included), `Entrypoint`, `Cmd`, `User`, `WorkingDir`, `Healthcheck`, `ExposedPorts`, and `StopSignal`, with `OnBuild`, `Volumes`, and `Shell` required empty; shared by the protected tar verifier and mt-admin. The verifier normalizes Docker's `Config.Healthcheck` and Podman's top-level `Healthcheck` before applying this policy.
 - `../.gitlab/go/dockerfile-parse` — required BuildKit-parser Dockerfile policy; the old bash grammar is retired. Keep its Go tests and divergence fixtures current, and preserve the pinned Go CI job.
 - `scripts/entrypoint_config_test.py` — non-root startup configuration regression tests using a 0444 baked config, including repeat boots, HOME/XDG/`OPENCODE_CONFIG_DIR` service defaults, and agent plants (FIFO/dir/symlink) at the reset path.
+- `scripts/runtime_smoke.py` — WI#424 control 6 runtime exposure suite. The candidate build runs `scripts/runtime_smoke_entrypoint.sh` against the real started entrypoint; `--profile container` runs inside a live worker and `--profile remote` reads the container's own environment from the host. Fails on a `remote` service config (including unreadable files), an opentunnel identity dir, a non-loopback listener beyond the health/WS ports, an enabled `share`, or a missing/crashing wrapper that does not produce the specific exit-77 `service set remote true` refusal; `scripts/runtime_smoke_test.py` pins each failure mode.
 - `scripts/compile_out_remote_tunnel.py` — fail-closed build patch that compiles the OpenTunnel client out; drift scan over `packages/{cli,server,schema,core}/src` (ts+tsx, any quoted `@opentunnel/*` specifier, all workspace manifests).
 - `scripts/opencode_task_executor.ts` — `sessionPermissions()` carries the shell deny rules (after the allow-all rule; ordering matters).
