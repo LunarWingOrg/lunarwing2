@@ -4122,8 +4122,8 @@ mod tests {
     };
     use crate::channels::wasm::schema::ChannelCapabilitiesFile;
     use crate::channels::wasm::wrapper::{
-        EmitDispatchContext, HttpResponse, POLL_FAILURE_HEALTH_THRESHOLD, WasmChannel,
-        WasmChannelHealthState, resolve_owner_broadcast_target, status_to_wit,
+        ChannelStoreData, EmitDispatchContext, HttpResponse, POLL_FAILURE_HEALTH_THRESHOLD,
+        WasmChannel, WasmChannelHealthState, resolve_owner_broadcast_target, status_to_wit,
         uses_owner_broadcast_target,
     };
     use crate::pairing::PairingStore;
