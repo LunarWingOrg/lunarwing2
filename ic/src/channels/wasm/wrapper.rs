@@ -1362,6 +1362,12 @@ impl WasmChannel {
             host_credentials,
             pairing_store,
         );
+        #[cfg(test)]
+        let store_data = {
+            let mut store_data = store_data;
+            store_data.allow_private_ips = true;
+            store_data
+        };
         let mut store = Store::new(engine, store_data);
 
         // Configure fuel if enabled
