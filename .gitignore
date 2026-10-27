@@ -46,3 +46,8 @@ tests/fixtures/llm_traces/live/github_dev_workflow_full_loop.log
 
 # Generated CI JUnit reports (junit-python.xml, junit-shell.xml)
 junit-*.xml
+
+# Vendored JS dependency trees are never tracked (WI#488). A committed
+# node_modules tree has no manifest/lockfile pinning it in-tree, so a
+# prebuilt blob refresh has no review surface.
+node_modules/
