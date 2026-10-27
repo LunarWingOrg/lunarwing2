@@ -298,6 +298,8 @@ struct StoreData {
     host_credentials: Vec<ResolvedHostCredential>,
     /// Exact host-configured origin/path scope for built-in service clients.
     scoped_http_prefix: Option<String>,
+    /// Explicit WASM HTTP opt-in, independent of the daemon's network setting.
+    allow_private_ips: bool,
     /// Dedicated tokio runtime for HTTP requests, lazily initialized.
     /// Reused across multiple `http_request` calls within one execution.
     http_runtime: Option<tokio::runtime::Runtime>,
@@ -335,6 +337,7 @@ impl StoreData {
             credentials,
             host_credentials,
             scoped_http_prefix: None,
+            allow_private_ips: private_http_targets_allowed(),
             http_runtime: None,
             http_interceptor: None,
             ssh_bridge: Arc::new(std::sync::OnceLock::new()),
@@ -646,7 +649,7 @@ impl StoreData {
             .scoped_http_prefix
             .as_deref()
             .is_some_and(|prefix| url_matches_scoped_prefix(&url, prefix));
-        if !host_scoped_service && !private_http_targets_allowed() {
+        if !host_scoped_service && !self.allow_private_ips {
             reject_private_ip(&url)?;
         }
 
@@ -3579,6 +3582,60 @@ mod tests {
             Some("[REDACTED:API_TOKEN]")
         );
         assert_eq!(map.get("x-other").map(String::as_str), Some("ok"));
+    }
+
+    #[test]
+    fn wi432_private_guard_allows_only_the_configured_sidecar_scope() {
+        use super::lunarwing::agent::host::Host as _;
+        use crate::tools::wasm::capabilities::{EndpointPattern, HttpCapability};
+
+        let capabilities = Capabilities::default().with_http(HttpCapability::new(vec![
+            EndpointPattern::host("127.0.0.1").with_path_prefix("/v1/"),
+        ]));
+        let mut store = StoreData::new(1024 * 1024, capabilities, HashMap::new(), Vec::new());
+        store.allow_private_ips = false;
+
+        let error = store
+            .http_request(
+                "POST".to_string(),
+                "http://127.0.0.1:8088/v1/ocr".to_string(),
+                "{}".to_string(),
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("private/internal IP"), "{error}");
+
+        store.scoped_http_prefix = Some("http://127.0.0.1:8088/v1/".to_string());
+        let error = store
+            .http_request(
+                "POST".to_string(),
+                "http://127.0.0.1:8088/other".to_string(),
+                "{}".to_string(),
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("host-configured service origin"), "{error}");
+
+        store.http_interceptor = Some(Arc::new(EncodingStub {
+            seen: Mutex::new(Vec::new()),
+            responses: Mutex::new(VecDeque::from([HttpExchangeResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: "ok".to_string(),
+            }])),
+        }));
+        let response = store
+            .http_request(
+                "POST".to_string(),
+                "http://127.0.0.1:8088/v1/ocr".to_string(),
+                "{}".to_string(),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(response.status, 200);
     }
 
     /// WI#395 (GN-6/GN-7): the trait boundary applies one redaction over the
