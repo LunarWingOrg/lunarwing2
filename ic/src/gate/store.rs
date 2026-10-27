@@ -451,6 +451,49 @@ impl PendingGateStore {
         expired
     }
 
+    /// Remove turn-bound gates for a thread, including already-expired entries.
+    /// Authentication-fallback gates intentionally outlive their thread and stay
+    /// pending. Request-id checks protect replacements parked after the snapshot.
+    pub async fn drain_for_thread(
+        &self,
+        thread_id: lunarwing_engine::ThreadId,
+    ) -> Vec<PendingGate> {
+        let candidates: Vec<(PendingGateKey, Uuid)> = {
+            let inner = self.inner.lock().await;
+            inner
+                .by_key
+                .iter()
+                .filter(|(_, gate)| gate.thread_id == thread_id && !gate.outlives_thread())
+                .map(|(key, gate)| (key.clone(), gate.request_id))
+                .collect()
+        };
+        let mut drained = Vec::with_capacity(candidates.len());
+        for (key, request_id) in candidates {
+            let _reservation = self.key_locks.reserve(&key).await;
+            let gate = {
+                let mut inner = self.inner.lock().await;
+                let Some(gate) = inner.by_key.get(&key) else {
+                    continue;
+                };
+                if gate.request_id != request_id || gate.outlives_thread() {
+                    continue;
+                }
+                let Some(gate) = inner.by_key.remove(&key) else {
+                    continue;
+                };
+                inner.by_request_id.remove(&request_id);
+                gate
+            };
+            if let Some(ref persistence) = self.persistence
+                && let Err(error) = persistence.remove(&key).await
+            {
+                tracing::debug!(%error, "failed to remove terminal-turn gate from persistence");
+            }
+            drained.push(gate);
+        }
+        drained
+    }
+
     /// Run an async operation under a key reservation while no gate exists.
     ///
     /// Successful finalization invalidates same-key inserts already waiting for
@@ -773,6 +816,48 @@ mod tests {
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].request_id, expired.request_id);
         assert!(store.peek(&valid.key()).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_drain_for_thread_preserves_other_threads_and_auth_fallbacks() {
+        let store = PendingGateStore::in_memory();
+        let thread_id = ThreadId::new();
+        let target = sample_gate_with("alice", thread_id, "web", 300);
+        let other = sample_gate_with("alice", ThreadId::new(), "web", 300);
+        store.insert(target.clone()).await.unwrap();
+        store.insert(other.clone()).await.unwrap();
+
+        let drained = store.drain_for_thread(thread_id).await;
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].request_id, target.request_id);
+        assert!(store.peek(&other.key()).await.is_some());
+
+        let mut fallback = sample_gate_with("alice", thread_id, "web", 300);
+        fallback.gate_name = "authentication".into();
+        fallback.action_name = "authentication_fallback".into();
+        fallback.resume_kind = ResumeKind::Authentication {
+            credential_name: "gitlab".into(),
+            instructions: "provide a token".into(),
+            auth_url: None,
+        };
+        fallback.original_message = Some("original request".into());
+        store.insert(fallback.clone()).await.unwrap();
+
+        assert!(store.drain_for_thread(thread_id).await.is_empty());
+        assert!(store.peek(&fallback.key()).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_drain_for_thread_removes_expired_gate_before_expiry_sweep() {
+        let store = PendingGateStore::in_memory();
+        let thread_id = ThreadId::new();
+        let expired = sample_gate_with("alice", thread_id, "web", -1);
+        store.insert(expired.clone()).await.unwrap();
+
+        let drained = store.drain_for_thread(thread_id).await;
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].request_id, expired.request_id);
+        assert!(store.drain_expired().await.is_empty());
     }
 
     // ── Concurrency ──────────────────────────────────────────
