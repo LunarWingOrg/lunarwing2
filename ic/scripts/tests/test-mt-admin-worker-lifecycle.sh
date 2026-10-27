@@ -23,6 +23,8 @@ trap 'command rm -rf "$fixture"' EXIT
 OPENRC_INITD_DIR="$fixture/init.d"
 OPENRC_CONFD_DIR="$fixture/conf.d"
 OPENRC_RUNLEVELS_DIR="$fixture/runlevels"
+# shellcheck disable=SC2034  # read by sourced lifecycle helpers
+CONTAINER_HASH_DIR="$fixture/container-hashes"
 mkdir -p "$OPENRC_INITD_DIR" "$OPENRC_CONFD_DIR" "$OPENRC_RUNLEVELS_DIR/default"
 
 fail() {
@@ -295,6 +297,71 @@ stop_worker alice kimi
 assert_call "desired:alice kimi false"
 assert_call "rc:lunarwing-kimi-alice-sup stop"
 assert_call "rc:lunarwing-kimi-alice stop"
+
+# WI#469: a stale image must not prevent any later worker lane from starting.
+test_start_tenant_worker_failures_are_isolated() (
+  local calls="$fixture/worker-start-calls" messages="$fixture/worker-start-messages"
+  : >"$calls"
+  : >"$messages"
+  INIT_SYSTEM=systemd
+  tenant_worker_enabled() { return 0; }
+  start_tenant_pebble() { printf 'pebble\n' >>"$calls"; return 1; }
+  start_tenant_opencode() { printf 'opencode\n' >>"$calls"; return 1; }
+  start_tenant_kimi() { printf 'kimi\n' >>"$calls"; }
+  start_tenant_opencode2() { printf 'opencode2\n' >>"$calls"; }
+  say() { printf '%s\n' "$*" >>"$messages"; }
+
+  _start_tenant_workers alice
+  local expected=$'pebble\nopencode\nkimi\nopencode2'
+  if [[ "$(<"$calls")" != "$expected" ]]; then
+    printf 'worker start order/continuation mismatch:\n%s\n' "$(<"$calls")" >&2
+    return 1
+  fi
+  if [[ "$(grep -c '^WARNING: ' "$messages")" != 2 ]]; then
+    printf 'expected two worker-start warnings:\n%s\n' "$(<"$messages")" >&2
+    return 1
+  fi
+  grep -Fxq 'WARNING: pebble worker failed to start for alice; continuing' "$messages" || return 1
+  grep -Fxq 'WARNING: opencode worker failed to start for alice; continuing' "$messages" || return 1
+)
+
+if test_start_tenant_worker_failures_are_isolated; then
+  printf 'PASS: worker start failures are isolated per lane (WI#469)\n'
+else
+  fail 'worker start failures are isolated per lane (WI#469)'
+fi
+
+# Other fatal starter errors, notably credential resolution, keep their die contract.
+test_start_tenant_worker_die_stays_fatal() (
+  local calls="$fixture/worker-start-fatal-calls" output
+  : >"$calls"
+  INIT_SYSTEM=openrc
+  tenant_worker_enabled() { return 0; }
+  tenant_worker_desired_running() { return 0; }
+  start_tenant_pebble() { die 'fatal worker credential'; }
+  start_tenant_opencode() { printf 'opencode\n' >>"$calls"; }
+  start_tenant_kimi() { printf 'kimi\n' >>"$calls"; }
+  start_tenant_opencode2() { printf 'opencode2\n' >>"$calls"; }
+
+  if output="$(_start_tenant_workers alice 2>&1)"; then
+    printf 'fatal worker die was downgraded to a warning\n' >&2
+    return 1
+  fi
+  if [[ "$output" != *'error: fatal worker credential'* ]]; then
+    printf 'fatal worker error text was lost: %s\n' "$output" >&2
+    return 1
+  fi
+  if [[ -s "$calls" ]]; then
+    printf 'a later worker ran after fatal die:\n%s\n' "$(<"$calls")" >&2
+    return 1
+  fi
+)
+
+if test_start_tenant_worker_die_stays_fatal; then
+  printf 'PASS: fatal worker die still aborts the start loop (WI#469)\n'
+else
+  fail 'fatal worker die still aborts the start loop (WI#469)'
+fi
 
 # Destructive reconciliation requires explicit registry evidence. Unknown or
 # malformed state must not authorize stopping a live worker.
