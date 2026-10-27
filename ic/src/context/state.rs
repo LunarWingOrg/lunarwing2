@@ -198,31 +198,27 @@ pub struct JobContext {
     pub started_at: Option<DateTime<Utc>>,
     /// When the job was completed.
     pub completed_at: Option<DateTime<Utc>>,
-    /// When the job last emitted observable progress (WI#263).
+    /// When the job last emitted genuine observable progress (WI#263).
     ///
-    /// Stuck detection must distinguish "running long" from "silent": a
-    /// multi-hour external-worker investigation streams evidence throughout
-    /// and is healthy, while a wedged worker goes quiet. Activity is noted on
-    /// genuine progress events (synthetic worker heartbeats excluded); idle
-    /// detection measures from this stamp, falling back to `started_at` when
-    /// no activity was ever recorded.
+    /// Synthetic worker heartbeats never update this evidence stamp. Idle
+    /// detection starts here, may use a newer external-worker heartbeat, and
+    /// falls back to `started_at` when neither stamp exists.
     pub last_activity_at: Option<DateTime<Utc>>,
     /// Name of the external worker running this job (`kimi`, `pebble`, …),
     /// set when the job is dispatched to `external:<name>` mode (WI#475).
     ///
-    /// Stuck detection uses it to apply the (larger) external-worker idle
-    /// threshold and to describe the job truthfully in recovery messages:
-    /// an external task is never retried by the daemon.
+    /// Stuck detection uses it to apply the external-worker idle threshold
+    /// and to request manual intervention without claiming a daemon retry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_worker: Option<String>,
     /// When the external worker last emitted a synthetic heartbeat waiting
     /// on its CLI (WI#475).
     ///
-    /// Kept separate from `last_activity_at` on purpose: WI#263 uses that
-    /// stamp as "genuine evidence" and heartbeats must stay out of it. The
-    /// external-worker idle baseline takes the maximum of the two, because a
-    /// heartbeat proves the executor is alive and the worker's own per-attempt
-    /// LLM deadline (WI#477) bounds a wedged CLI from the worker side.
+    /// Kept separate from `last_activity_at` because a heartbeat proves only
+    /// executor liveness, not CLI progress. The external idle baseline takes
+    /// the newer stamp. If a CLI wedges outside its bounded LLM call while
+    /// the executor keeps heartbeating, the outer task `timeout_ms` is the
+    /// remaining bound; self-repair deliberately does not detect that case.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_worker_heartbeat_at: Option<DateTime<Utc>>,
     /// Number of repair attempts.
@@ -439,30 +435,32 @@ impl JobContext {
         self.transition_to(JobState::Stuck, Some(reason.into()))
     }
 
-    /// Record observable progress on this job (WI#263).
-    ///
-    /// Called for genuine streamed progress (never for synthetic worker
-    /// heartbeats) so idle-based stuck detection measures time since the last
-    /// real evidence, not time since the job started. Never moves the job
-    /// backwards out of a terminal state.
+    /// Record genuine observable progress now (WI#263).
     pub fn note_activity(&mut self) {
-        if self.state.is_terminal() {
-            return;
-        }
-        self.last_activity_at = Some(Utc::now());
+        self.note_activity_at(Utc::now());
     }
 
-    /// Record a synthetic external-worker heartbeat (WI#475).
-    ///
-    /// Kept apart from [`note_activity`] so WI#263's genuine-evidence stamp
-    /// keeps its meaning, while external-worker idle detection can still tell
-    /// "the executor is alive and waiting on its CLI" from "nothing at all".
-    /// Ignored for terminal jobs, like [`note_activity`].
-    pub fn note_worker_heartbeat(&mut self) {
+    /// Record genuine observable progress at a caller-supplied time.
+    /// Terminal jobs ignore late progress.
+    pub fn note_activity_at(&mut self, observed_at: DateTime<Utc>) {
         if self.state.is_terminal() {
             return;
         }
-        self.last_worker_heartbeat_at = Some(Utc::now());
+        self.last_activity_at = Some(observed_at);
+    }
+
+    /// Record a synthetic external-worker heartbeat now (WI#475).
+    pub fn note_worker_heartbeat(&mut self) {
+        self.note_worker_heartbeat_at(Utc::now());
+    }
+
+    /// Record executor liveness without changing the genuine-evidence stamp.
+    /// Terminal jobs ignore late heartbeats, like [`note_activity_at`].
+    pub fn note_worker_heartbeat_at(&mut self, observed_at: DateTime<Utc>) {
+        if self.state.is_terminal() {
+            return;
+        }
+        self.last_worker_heartbeat_at = Some(observed_at);
     }
 
     /// Whether this job is dispatched to an external worker (`external:*` mode).
