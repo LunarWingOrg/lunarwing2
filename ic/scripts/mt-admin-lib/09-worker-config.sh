@@ -32,8 +32,17 @@ render_worker_openrc_unit() {
   [[ -n "${CONTAINER_RT:-}" ]] && runtime_bin="$(command -v "$CONTAINER_RT" 2>/dev/null || true)"
   uid="$(id -u "$name" 2>/dev/null || echo "")"
   home="$(tenant_home "$name")"
+  # WI#424 control 1: the boot path (OpenRC starts this unit directly) must
+  # reload the egress filter before the container starts. The ruleset lives in
+  # root-owned state and the netns is recreated across reboots, so a rule set
+  # loaded once at provision time would not be there.
+  local egress_ruleset egress_guard egress_chain initd
+  egress_ruleset="$(worker_egress_ruleset_path "$name")"
+  egress_guard="$WORKER_EGRESS_GUARD"
+  egress_chain="$(worker_egress_chain "$name")"
+  initd="${OPENRC_INITD_DIR:-/etc/init.d}"
 
-  cat >"/etc/init.d/${container}" <<INITEOF
+  cat >"${initd}/${container}" <<INITEOF
 #!/sbin/openrc-run
 
 description="LunarWing ${worker} worker ($name)"
@@ -46,6 +55,9 @@ description="LunarWing ${worker} worker ($name)"
 : "\${wk_uid:=$uid}"
 : "\${wk_health_port:=$health_port}"
 : "\${wk_wait:=60}"
+: "\${wk_egress_ruleset:=$egress_ruleset}"
+: "\${wk_egress_guard:=$egress_guard}"
+: "\${wk_egress_chain:=$egress_chain}"
 
 depend() {
     need net localmount
@@ -73,7 +85,22 @@ start() {
     if [ "\${wk_rootless}" = "true" ]; then
         checkpath -d -m 0700 -o "\${wk_user}:\${wk_user}" "/run/user/\${wk_uid}"
     fi
+    # WI#424 control 1: fail closed — no verified egress filter, no worker.
+    # Same root-owned guard the Quadlet ExecStartPre runs, so the two init
+    # paths cannot drift.
+    if [ ! -x "\${wk_egress_guard}" ]; then
+        eend 1 "worker egress guard missing (\${wk_egress_guard}); run worker-egress-apply as root"
+        return 1
+    fi
+    _egress_mode="rootful"
+    [ "\${wk_rootless}" = "true" ] && _egress_mode="rootless"
+    # OpenRC runs this as root; pass the tenant so the guard enters that user's
+    # rootless netns (a Quadlet ExecStartPre already runs as the tenant).
+    "\${wk_egress_guard}" "\${wk_egress_ruleset}" "\${_egress_mode}" "\${wk_egress_chain}" "\${wk_user}" \
+        || { eend 1 "worker egress filter failed to load or verify; refusing to start unfiltered"; return 1; }
     _wk start "\${wk_container}" >/dev/null 2>&1 || { eend 1 "container start failed"; return 1; }
+    "\${wk_egress_guard}" --verify "\${wk_egress_ruleset}" "\${_egress_mode}" "\${wk_egress_chain}" "\${wk_user}" \
+        || { eend 1 "worker egress filter vanished after start; stopping the container"; _wk stop "\${wk_container}" >/dev/null 2>&1 || true; return 1; }
     _w=0
     while ! _wk_healthy; do
         _w=\$((_w + 1))
@@ -98,20 +125,21 @@ status() {
     einfo "\${wk_container}: stopped"; return 3
 }
 INITEOF
-  chmod 0755 "/etc/init.d/${container}"
+  chmod 0755 "${initd}/${container}"
 }
 
 # Promote a (rootless) worker container to a dedicated OpenRC unit so it is
 # health-monitored, self-healed, and boot-persistent. No-op unless OpenRC.
 _register_worker_unit() {
   local name="$1" worker="$2"
+  local container="lunarwing-${worker}-${name}"
+  worker_egress_verify_after_start "$name" "$container"
   ensure_init_system
   [[ "$INIT_SYSTEM" == "openrc" ]] || return 0
   render_worker_openrc_unit "$name" "$worker"
   _openrc_update add "lunarwing-${worker}-${name}" default >/dev/null 2>&1 || true
   _openrc_service "lunarwing-${worker}-${name}" start >/dev/null 2>&1 || true
   say "registered OpenRC unit lunarwing-${worker}-${name} (health-monitored, boot-persistent)"
-  local container="lunarwing-${worker}-${name}"
   local uid home
   uid="$(id -u "$name" 2>/dev/null || echo "")"
   home="$(tenant_home "$name")"
@@ -405,7 +433,7 @@ upgrade_external_worker_credentials() {
     return 2
   fi
   staged_out="$(mktemp)" || { rm -f -- "$staged_in"; return 2; }
-  python3 - "$worker" "$staged_in" "$staged_out" <<'PY' || edit_status=$?
+  python3 -I - "$worker" "$staged_in" "$staged_out" <<'PY' || edit_status=$?
 import copy
 import re
 import sys
@@ -676,7 +704,7 @@ set_external_worker_tool_allowlist() {  # <tenant> <worker> <csv|none>
   # The existing array is replaced as a whole span, so the multi-line shape
   # the daemon's own save_toml writes is handled instead of being torn.
   edit_status=0
-  python3 - "$worker" "$tools_csv" "$staged_in" "$staged_out" <<'PY' || edit_status=$?
+  python3 -I - "$worker" "$tools_csv" "$staged_in" "$staged_out" <<'PY' || edit_status=$?
 import copy
 import json
 import re
@@ -858,7 +886,7 @@ remove_external_worker_config() {
   temp_path="$(mktemp "${config_path}.tmp.XXXXXX")"
   backup_path="${config_path}.pre-${worker}-retirement"
 
-  python3 - "$config_path" "$temp_path" "$backup_path" "$worker" <<'PY' || rc=$?
+  python3 -I - "$config_path" "$temp_path" "$backup_path" "$worker" <<'PY' || rc=$?
 import os
 import re
 import stat
@@ -1082,7 +1110,7 @@ _archive_nanocode_env() {
   if [[ -e "$env_path" || -L "$env_path" ]]; then
     backup="$env_path.pre-nanocode-retirement"
     temp="$(mktemp "${env_path}.tmp.XXXXXX")"
-    python3 - "$env_path" "$temp" "$backup" <<'PY' || rc=$?
+    python3 -I - "$env_path" "$temp" "$backup" <<'PY' || rc=$?
 import os
 import stat
 import sys
@@ -1136,7 +1164,7 @@ PY
   if [[ -e "$legacy" || -L "$legacy" ]]; then
     archive="$legacy.retired"
     [[ ! -e "$archive" ]] || archive="$archive.$(date -u +%Y%m%dT%H%M%SZ).$$"
-    python3 - "$legacy" "$archive" <<'PY' || return 1
+    python3 -I - "$legacy" "$archive" <<'PY' || return 1
 import os
 import stat
 import sys
@@ -1347,7 +1375,7 @@ configure_opencode2() {
 
 snapshot_sqlite_database() {  # <source> <destination>
   require_cmd python3
-  python3 - "$1" "$2" <<'PY'
+  python3 -I - "$1" "$2" <<'PY'
 import sqlite3
 import sys
 from pathlib import Path
@@ -1604,6 +1632,7 @@ start_tenant_opencode() {
   # Pin the tenant-store image ID into the container contract: a rebuilt image
   # must force-recreate the container (_worker_launch_contract).
   opencode_launch_contract="$(_worker_launch_contract "$name" lunarwing-worker-opencode:latest "$opencode_launch_contract")"
+  prepare_worker_egress "$name" opencode
   local image_user
   image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
     lunarwing-worker-opencode:latest 2>/dev/null || true)"
@@ -1629,6 +1658,7 @@ start_tenant_opencode() {
     # does not clear that systemd lockout, so reset it before the explicit retry.
     _systemctl_user "$name" reset-failed "$opencode_service" >/dev/null 2>&1 || true
     if _systemctl_user "$name" start "$opencode_service" >/dev/null 2>&1; then
+      worker_egress_verify_after_start "$name" "lunarwing-opencode-${name}"
       _store_container_hash "$name" "lunarwing-opencode-${name}" "$quadlet_file" "$opencode_launch_contract"
       say "opencode worker ready via quadlet ($opencode_service, WSS port $wss_port)"
     else
@@ -1644,6 +1674,7 @@ start_tenant_opencode() {
     healthcheck_args=(--no-healthcheck)
   fi
 
+  worker_egress_reconcile_container "$name" "$container_name"
   if _ctr "$name" inspect "$container_name" &>/dev/null; then
     local env_file_for_hash
     env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
@@ -1780,6 +1811,8 @@ start_tenant_opencode() {
       "${health_publish[@]}" \
       -v "$workspace_dir:/workspace:z" \
       "${restart_arg[@]}" \
+      "${WORKER_EGRESS_LAUNCH_ARGS[@]}" \
+      --label "lunarwing.egress=$(worker_egress_network_name "$name")" \
       lunarwing-worker-opencode:latest \
       --mode websocket >/dev/null
     _store_container_hash \
@@ -1844,6 +1877,7 @@ start_tenant_opencode2() {
   # Pin the tenant-store image ID into the container contract: a rebuilt image
   # must force-recreate the container (_worker_launch_contract).
   launch_contract="$(_worker_launch_contract "$name" lunarwing-worker-opencode2:latest "$launch_contract")"
+  prepare_worker_egress "$name" opencode2
   local image_user
   image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
     lunarwing-worker-opencode2:latest 2>/dev/null || true)"
@@ -1867,6 +1901,7 @@ start_tenant_opencode2() {
     fi
     _systemctl_user "$name" reset-failed "$service" >/dev/null 2>&1 || true
     if _systemctl_user "$name" start "$service" >/dev/null 2>&1; then
+      worker_egress_verify_after_start "$name" "lunarwing-opencode2-${name}"
       _store_container_hash "$name" "lunarwing-opencode2-${name}" "$quadlet_file" "$launch_contract"
       say "opencode2 worker ready via quadlet ($service, WSS port $wss_port)"
     else
@@ -1882,6 +1917,7 @@ start_tenant_opencode2() {
     healthcheck_args=(--no-healthcheck)
   fi
 
+  worker_egress_reconcile_container "$name" "$container_name"
   if _ctr "$name" inspect "$container_name" &>/dev/null; then
     local env_file_for_hash
     env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
@@ -1978,6 +2014,8 @@ start_tenant_opencode2() {
       "${health_publish[@]}" \
       -v "$workspace_dir:/workspace:z" \
       "${restart_arg[@]}" \
+      "${WORKER_EGRESS_LAUNCH_ARGS[@]}" \
+      --label "lunarwing.egress=$(worker_egress_network_name "$name")" \
       lunarwing-worker-opencode2:latest \
       --mode websocket >/dev/null
     _store_container_hash \
@@ -2328,6 +2366,7 @@ start_tenant_kimi() {
   # Pin the tenant-store image ID into the container contract: a rebuilt image
   # must force-recreate the container (_worker_launch_contract).
   kimi_launch_contract="$(_worker_launch_contract "$name" lunarwing-worker-kimi:latest "$kimi_launch_contract")"
+  prepare_worker_egress "$name" kimi
   local image_user
   image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
     lunarwing-worker-kimi:latest 2>/dev/null || true)"
@@ -2351,6 +2390,7 @@ start_tenant_kimi() {
     fi
     _systemctl_user "$name" reset-failed "$kimi_service" >/dev/null 2>&1 || true
     if _systemctl_user "$name" start "$kimi_service" >/dev/null 2>&1; then
+      worker_egress_verify_after_start "$name" "lunarwing-kimi-${name}"
       _store_container_hash "$name" "lunarwing-kimi-${name}" "$quadlet_file" "$kimi_launch_contract"
       say "kimi worker ready via quadlet ($kimi_service, WSS port $wss_port)"
     else
@@ -2366,6 +2406,7 @@ start_tenant_kimi() {
     healthcheck_args=(--no-healthcheck)
   fi
 
+  worker_egress_reconcile_container "$name" "$container_name"
   if _ctr "$name" inspect "$container_name" &>/dev/null; then
     local env_file_for_hash
     env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
@@ -2438,6 +2479,8 @@ start_tenant_kimi() {
       "${health_publish[@]}" \
       -v "$workspace_dir:/workspace:z" \
       "${restart_arg[@]}" \
+      "${WORKER_EGRESS_LAUNCH_ARGS[@]}" \
+      --label "lunarwing.egress=$(worker_egress_network_name "$name")" \
       lunarwing-worker-kimi:latest \
       --mode websocket >/dev/null
     _store_container_hash \
@@ -2503,6 +2546,7 @@ start_tenant_pebble() {
   else
     pebble_launch_contract="$(_worker_launch_contract "$name" lunarwing-worker-pebble:latest "$PEBBLE_ROOTFUL_LAUNCH_CONTRACT")"
   fi
+  prepare_worker_egress "$name" pebble
   # WI#400 LD-8: the pebble bridge must run as container root (image USER
   # 0:0) — under rootless keep-id an image without USER starts the bridge
   # as the task uid and the credential split is a no-op.
@@ -2531,6 +2575,7 @@ start_tenant_pebble() {
     fi
     _systemctl_user "$name" reset-failed "$pebble_service" >/dev/null 2>&1 || true
     if _systemctl_user "$name" start "$pebble_service" >/dev/null 2>&1; then
+      worker_egress_verify_after_start "$name" "lunarwing-pebble-${name}"
       _store_container_hash "$name" "lunarwing-pebble-${name}" "$quadlet_file" "$pebble_launch_contract"
       say "pebble worker ready via quadlet ($pebble_service, WSS port $wss_port)"
     else
@@ -2546,6 +2591,7 @@ start_tenant_pebble() {
     healthcheck_args=(--no-healthcheck)
   fi
 
+  worker_egress_reconcile_container "$name" "$container_name"
   if _ctr "$name" inspect "$container_name" &>/dev/null; then
     local env_file_for_hash
     env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
@@ -2678,6 +2724,8 @@ start_tenant_pebble() {
       "${health_publish[@]}" \
       -v "$workspace_dir:/workspace:z" \
       "${restart_arg[@]}" \
+      "${WORKER_EGRESS_LAUNCH_ARGS[@]}" \
+      --label "lunarwing.egress=$(worker_egress_network_name "$name")" \
       lunarwing-worker-pebble:latest >/dev/null
     _store_container_hash "$name" "$container_name" "$(tenant_env_dir "$name")/lunarwing.env" "$pebble_launch_contract"
   fi
@@ -2985,4 +3033,33 @@ worker_listeners() {  # <tenant>
     return 1
   fi
   say "worker listener audit: clean"
+}
+
+# WI#424 control 6: run the lane's runtime exposure smoke suite inside a live
+# container. The suite itself lives in the image (/app/scripts/runtime_smoke.py)
+# and is also executed by the protected candidate build; this is the
+# tenant-facing entry point the work item asks to document. The suite reads the
+# container's own /proc/net and the installed wrapper, so it needs no host
+# privileges beyond `podman exec` on the tenant store.
+worker_runtime_smoke() {  # <tenant> [opencode2]
+  local name worker container
+  name="$(sanitize_name "$1")"
+  worker="${2:-opencode2}"
+  require_worker_name "$worker"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  ensure_container_runtime
+  container="lunarwing-${worker}-${name}"
+  if ! _ctr "$name" inspect "$container" >/dev/null 2>&1; then
+    die "container $container is not running; start the $worker worker first"
+  fi
+  case "$worker" in
+    opencode2)
+      _ctr "$name" exec "$container" \
+        python3 /app/scripts/runtime_smoke.py --profile container \
+          --container "$container" --runtime "$CONTAINER_RT"
+      ;;
+    *)
+      die "runtime smoke is implemented for the opencode2 lane only (WI#424 control 6)"
+      ;;
+  esac
 }

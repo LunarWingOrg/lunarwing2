@@ -289,6 +289,8 @@ source "$MT_ADMIN_LIB_DIR/12-health-pipeline.sh"
 source "$MT_ADMIN_LIB_DIR/13-cgroups-openrc.sh"
 # shellcheck source=mt-admin-lib/14-knowledge-sync.sh
 source "$MT_ADMIN_LIB_DIR/14-knowledge-sync.sh"
+# shellcheck source=mt-admin-lib/15-worker-egress.sh
+source "$MT_ADMIN_LIB_DIR/15-worker-egress.sh"
 
 usage() {
   cat <<'EOF'
@@ -611,6 +613,18 @@ Commands:
                                    sockets inside the tenant's running worker
                                    containers; fail on any bind or published
                                    mapping outside the loopback contract
+  worker-egress <name>             WI#424 control 1: report the worker egress
+                                   allowlist read host-side (network, container
+                                   attachment, live nftables chain); exit 1
+                                   unless the filter is provably live
+  worker-egress-apply <name>       Re-render and load the egress filter, then
+                                   verify it survived the load (fail closed)
+  configure-worker-egress <name> [--allow host:port,...|none]
+                                   Set the operator allowlist (extra
+                                   destinations on top of the tenant's LLM
+                                   endpoints); applies immediately
+  worker-smoke <name> [opencode2]  WI#424 control 6: run the runtime exposure
+                                   smoke suite inside a running worker container
   tokens [name]                    Print gateway auth tokens (all or one)
   doctor                           System dependency and health checks
   coord-doctor <name>              Read-only coordination knowledge-share
@@ -1322,6 +1336,37 @@ main() {
     worker-listeners)
       [[ -n "${1:-}" ]] || die "usage: worker-listeners <name>"
       worker_listeners "$1"
+      ;;
+
+    worker-egress)
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: worker-egress <name>"
+      worker_egress_audit "$1"
+      ;;
+
+    worker-egress-apply)
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: worker-egress-apply <name>"
+      local egress_tenant
+      egress_tenant="$(sanitize_name "$1")"
+      tenant_exists_in_registry "$egress_tenant" \
+        || die "tenant '$egress_tenant' not found in registry"
+      worker_egress_ensure "$egress_tenant" >/dev/null
+      worker_egress_apply "$egress_tenant" >/dev/null
+      say "worker egress filter applied and verified for $egress_tenant"
+      ;;
+
+    configure-worker-egress)
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: configure-worker-egress <name> [--allow host:port,...|none]"
+      local egress_tenant="$1"; shift
+      configure_worker_egress "$egress_tenant" "$@"
+      ;;
+
+    worker-smoke)
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: worker-smoke <name> [opencode2]"
+      worker_runtime_smoke "$1" "${2:-opencode2}"
       ;;
 
     darkirc-contact)

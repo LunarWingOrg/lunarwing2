@@ -503,12 +503,13 @@ declare -A MONITOR_ONLY=()
 MONITOR_ONLY[lunarvoice]=1
 MONITOR_ONLY[runtime]=1
 MONITOR_ONLY[knowledge]=1
+MONITOR_ONLY[worker_egress]=1
 if [[ "$NETBIRD_REMEDIATE" != true ]]; then
     MONITOR_ONLY[netbird]=1
 fi
 
 # Monitor-only diagnostic components that own NO service at all (MR !1041
-# review finding 2): runtime and knowledge report per-tenant instance
+# review finding 2): runtime, knowledge, and worker egress report per-tenant instance
 # diagnostics, so their failures enter the monitor-only escalation path with
 # tenant attribution (synthetic "<comp>@<tenant>" identities built in main),
 # never a SERVICE_MAP restart. Without this registration, standard MT
@@ -517,6 +518,7 @@ fi
 declare -A DIAGNOSTIC_COMPONENTS=(
     [runtime]=1
     [knowledge]=1
+    [worker_egress]=1
 )
 
 # Service identities that inherit monitor-only treatment regardless of which
@@ -1097,7 +1099,7 @@ main() {
         done
     done < <(jq -r '.components[] | "\(.component)\t\(.status)"' "$report" 2>/dev/null || true)
 
-    # 1b) Monitor-only diagnostic components (runtime, knowledge — MR !1041
+    # 1b) Monitor-only diagnostic components (runtime, knowledge, worker_egress — MR !1041
     # review finding 2): per-instance failures become synthetic monitor-only
     # targets ("<comp>@<tenant>", or bare "<comp>" for unattributed/legacy
     # single-node results) so they grace-track and escalate with tenant
@@ -1107,7 +1109,7 @@ main() {
     # not page per tenant).
     local diag_comp inst_tenant inst_status diag_id diag_cstatus
     local -a diag_bad=()
-    for diag_comp in runtime knowledge; do
+    for diag_comp in runtime knowledge worker_egress; do
         diag_bad=()
         while IFS=$'\t' read -r inst_tenant inst_status; do
             [[ -n "$inst_tenant" ]] || continue

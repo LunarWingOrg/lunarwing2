@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034  # fixture values are consumed by sourced lane code and generated units.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,6 +24,7 @@ trap 'command rm -rf "$fixture"' EXIT
 OPENRC_INITD_DIR="$fixture/init.d"
 OPENRC_CONFD_DIR="$fixture/conf.d"
 OPENRC_RUNLEVELS_DIR="$fixture/runlevels"
+CONTAINER_HASH_DIR="$fixture/container-hashes"
 mkdir -p "$OPENRC_INITD_DIR" "$OPENRC_CONFD_DIR" "$OPENRC_RUNLEVELS_DIR/default"
 
 fail() {
@@ -80,6 +82,17 @@ _ctr() {
   CALLS+=("ctr:$*")
   return 0
 }
+# WI#424 control 1: the egress allowlist needs a real tenant account and a real
+# netns (it fails closed without one). These lifecycle tests use fixture tenant
+# names that have no account, so the egress step is stubbed here — its own
+# behaviour is pinned by ic/scripts/tests/test-worker-egress.sh, including the
+# rewritten Quadlet's ExecStartPre and Network= lines.
+prepare_worker_egress() {
+  CALLS+=("egress:$1:$2")
+  WORKER_EGRESS_LAUNCH_ARGS=(--network "lw-egress-$1" --dns 127.0.0.1)
+}
+worker_egress_container_attached() { return 0; }
+worker_egress_verify_after_start() { :; }
 start_tenant_opencode() { CALLS+=("start-opencode:$1"); }
 start_tenant_kimi() { CALLS+=("start-kimi:$1"); }
 
