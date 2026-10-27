@@ -3546,9 +3546,8 @@ fn redact_url_for_log(raw: &str) -> String {
     }
 }
 
-/// `ALLOW_PRIVATE_IPS=1` opts out of the public-IP requirement and permits
-/// plain `http` for local-dev / private-network harness setups, matching the
-/// existing WASM host-function guard in `tools/wasm/wrapper.rs`.
+/// `ALLOW_PRIVATE_IPS=1` opts XMPP attachment fetches out of the public-IP
+/// requirement and permits plain `http` for local-dev / private-network harnesses.
 fn allow_private_attachment_ips() -> bool {
     std::env::var("ALLOW_PRIVATE_IPS").ok().as_deref() == Some("1")
 }
