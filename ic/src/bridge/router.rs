@@ -6342,7 +6342,7 @@ pub(crate) mod tests {
             lunarwing_engine::ResumeKind::Approval { allow_always: true },
         );
         let request_id = gate.request_id;
-        state.pending_gates.insert(gate).await.unwrap();
+        state.pending_gates.insert(gate).await.unwrap(); // safety: test-only fixture
         *ENGINE_STATE.get_or_init(|| RwLock::new(None)).write().await = Some(state);
         (request_id, thread.id)
     }
