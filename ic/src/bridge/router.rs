@@ -6329,6 +6329,24 @@ pub(crate) mod tests {
         *lock.write().await = None;
     }
 
+    /// Install one live approval gate; caller must hold the engine-state lock.
+    pub(crate) async fn install_engine_approval_for_tests(
+        user_id: &str,
+    ) -> (uuid::Uuid, lunarwing_engine::ThreadId) {
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store.clone());
+        let thread = save_waiting_thread(&store, state.default_project_id, user_id).await;
+        let gate = sample_pending_gate(
+            user_id,
+            thread.id,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        let request_id = gate.request_id;
+        state.pending_gates.insert(gate).await.unwrap();
+        *ENGINE_STATE.get_or_init(|| RwLock::new(None)).write().await = Some(state);
+        (request_id, thread.id)
+    }
+
     #[test]
     fn engine_max_output_tokens_falls_back_to_the_default_for_bad_values() {
         let cases = [
