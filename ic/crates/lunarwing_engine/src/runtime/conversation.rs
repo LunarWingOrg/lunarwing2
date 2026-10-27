@@ -77,9 +77,27 @@ impl ConversationManager {
         channel: &str,
         user_id: &str,
     ) -> Result<ConversationId, EngineError> {
+        let (id, _) = self
+            .get_or_create_conversation_with_created(channel, user_id)
+            .await?;
+        Ok(id)
+    }
+
+    /// Get or create a conversation, also reporting whether this call created
+    /// the surface.
+    ///
+    /// The created flag lets one-time migrations tell a brand-new surface from
+    /// one the user has already been chatting on (WI#442 F7): seeding a
+    /// pre-switch v1 history into a surface that already existed would surface
+    /// context the user never saw in that thread, and would undo `/clear`.
+    pub async fn get_or_create_conversation_with_created(
+        &self,
+        channel: &str,
+        user_id: &str,
+    ) -> Result<(ConversationId, bool), EngineError> {
         let key = (channel.to_string(), user_id.to_string());
         if let Some(conv) = self.find_conversation(channel, user_id).await? {
-            return Ok(conv.id);
+            return Ok((conv.id, false));
         }
 
         // Create new conversation. The scoped `channel:scope` keys handed over
@@ -95,7 +113,7 @@ impl ConversationManager {
         // same key would otherwise each create a surface and orphan one,
         // losing its history while reads keep succeeding.
         if let Some(&existing) = index.get(&key) {
-            return Ok(existing);
+            return Ok((existing, false));
         }
         self.store.save_conversation(&conv).await?;
         convs.insert(conv_id, conv);
@@ -111,7 +129,7 @@ impl ConversationManager {
             );
         }
         debug!(conversation_id = %conv_id, channel, user_id, "created conversation");
-        Ok(conv_id)
+        Ok((conv_id, true))
     }
 
     /// Find and hydrate an existing surface without creating one. Read and
@@ -145,6 +163,47 @@ impl ConversationManager {
         index.insert(key, conv.id);
         convs.insert(conv.id, conv.clone());
         Ok(Some(conv))
+    }
+
+    /// Prepend imported v1-compatible history to an existing conversation.
+    ///
+    /// WI#442 F7: Engine V2's bridge dual-write is forward-only, so a tenant's
+    /// pre-switch v1 rows never reach the v2 surface on their own. The bridge
+    /// reads them once (gated on a per-conversation marker) and calls this to
+    /// seed the surface, so a new engine thread inherits the pre-switch
+    /// context instead of starting cold. Ownership of the *surface* is
+    /// enforced here as on every other conversation mutation; ownership of the
+    /// v1 rows is the caller's to verify before reading them.
+    pub async fn import_v1_history(
+        &self,
+        conversation_id: ConversationId,
+        user_id: &str,
+        entries: Vec<ConversationEntry>,
+    ) -> Result<usize, EngineError> {
+        let mut convs = self.conversations.write().await;
+        let conv = convs.get_mut(&conversation_id).ok_or(EngineError::Store {
+            reason: format!("conversation {conversation_id} not found"),
+        })?;
+        if conv.user_id != user_id {
+            return Err(EngineError::AccessDenied {
+                user_id: user_id.to_string(),
+                entity: format!("conversation {conversation_id}"),
+            });
+        }
+
+        let previous = conv.clone();
+        let count = conv.prepend_imported_entries(entries);
+        if count == 0 {
+            return Ok(0);
+        }
+        if let Err(error) = self.store.save_conversation(conv).await {
+            // Roll back the in-memory surface so a failed persist cannot leave
+            // memory and store disagreeing about whether the import happened.
+            *conv = previous;
+            warn!(conversation_id = %conversation_id, %error, "failed to persist imported v1 history");
+            return Err(error);
+        }
+        Ok(count)
     }
 
     /// Persist a steer note until the conversation's next foreground turn.
@@ -629,9 +688,9 @@ fn build_history_from_entries(
         .iter()
         .filter_map(|entry| match &entry.sender {
             EntrySender::User => Some(crate::types::message::ThreadMessage::user(&entry.content)),
-            EntrySender::Agent { .. } => Some(crate::types::message::ThreadMessage::assistant(
-                &entry.content,
-            )),
+            EntrySender::Agent { .. } | EntrySender::ImportedAgent => Some(
+                crate::types::message::ThreadMessage::assistant(&entry.content),
+            ),
             EntrySender::System => None, // skip system notifications
         })
         .collect()
@@ -672,6 +731,22 @@ mod tests {
         assert_eq!(history.len(), MAX_CONVERSATION_ENTRIES - 1);
         assert_eq!(history[0].content, "message 10");
         assert!(history.iter().all(|message| message.content != "message 9"));
+    }
+
+    #[test]
+    fn imported_v1_agent_entries_seed_as_assistant_history() {
+        use crate::types::conversation::ConversationEntry;
+
+        let mut conv = ConversationSurface::new("xmpp", "user");
+        conv.add_entry(ConversationEntry::imported_user("before", chrono::Utc::now()));
+        conv.add_entry(ConversationEntry::imported_agent("earlier answer", chrono::Utc::now()));
+        conv.add_entry(ConversationEntry::user("current"));
+
+        let history = build_history_from_entries(&conv.entries);
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, "before");
+        assert_eq!(history[1].content, "earlier answer");
     }
 
     // ── Mocks (same as manager tests) ───────────────────────
