@@ -15,6 +15,7 @@ import json
 import os
 import pathlib
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -382,6 +383,121 @@ class ExposureGuardWrapperTests(unittest.TestCase):
             result = self.run_wrapper(*form)
             self.assertEqual(result.returncode, 0, (form, result.stderr))
             self.assertEqual(result.stdout.strip(), " ".join(form))
+
+
+class ImageFilesystemDependencyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = pathlib.Path(temporary.name)
+        self.lane = write_lane(self.root)
+        self.dependencies = self.lane / "node_modules"
+        self.package = self.dependencies / "@opencode" / "client"
+        self.package.mkdir(parents=True)
+        (self.package / "index.js").write_text("module.exports = {};\n", encoding="utf-8")
+        for name in ("health_server.py", "agent_comm_protocol.json"):
+            (self.lane / name).write_text("{}\n", encoding="utf-8")
+        for path in (
+            self.lane / "entrypoint.sh",
+            self.lane / "health_server.py",
+            self.lane / "agent_comm_protocol.json",
+            self.lane / "scripts",
+            *(self.lane / "scripts").rglob("*"),
+            self.lane / "config",
+            *(self.lane / "config").rglob("*"),
+        ):
+            path.chmod(0o555 if path.is_dir() else 0o444)
+        spec = importlib.util.spec_from_file_location("exposure_policy_assert", ASSERT)
+        if spec is None or spec.loader is None:  # pragma: no cover - import shape
+            raise AssertionError("cannot load exposure_policy_assert")
+        self.assert_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.assert_module)
+
+    def check(
+        self,
+        *,
+        foreign: pathlib.Path | None = None,
+        metadata: dict[str, dict[str, int]] | None = None,
+    ) -> list[str]:
+        self.assert_module.failures.clear()
+        real_lstat = pathlib.Path.lstat
+
+        def root_owned_lstat(path: pathlib.Path):
+            fields = list(real_lstat(path))
+            fields[4] = 10003 if path == foreign else 0
+            fields[5] = 10003 if path == foreign else 0
+            return os.stat_result(fields)
+
+        with mock.patch.object(pathlib.Path, "lstat", root_owned_lstat):
+            self.assert_module.check_image_filesystem(
+                self.lane,
+                image_root=self.root if metadata is not None else None,
+                image_metadata=metadata,
+            )
+        return list(self.assert_module.failures)
+
+    def tar_metadata(self) -> dict[str, dict[str, int]]:
+        records = {}
+        for path in (self.lane, *self.lane.rglob("*")):
+            records[path.relative_to(self.root).as_posix()] = {
+                "mode": path.lstat().st_mode,
+                "uid": 0,
+                "gid": 0,
+            }
+        return records
+
+    def test_dependency_tree_passes(self) -> None:
+        self.assertEqual(self.check(), [])
+
+    def test_setgid_dependency_directory_fails(self) -> None:
+        self.dependencies.chmod(0o2755)
+        failures = self.check()
+        self.assertTrue(
+            any("privilege or write bits 2755" in failure for failure in failures),
+            failures,
+        )
+
+    def test_dependency_privilege_and_write_bits_fail(self) -> None:
+        target = self.package / "index.js"
+        for mode in (0o4755, 0o775, 0o757):
+            with self.subTest(mode=oct(mode)):
+                target.chmod(mode)
+                failures = self.check()
+                self.assertTrue(
+                    any(f"privilege or write bits {mode:o}" in failure for failure in failures),
+                    failures,
+                )
+
+    def test_non_root_dependency_fails(self) -> None:
+        failures = self.check(foreign=self.package)
+        self.assertTrue(any("owned by root:root" in failure for failure in failures), failures)
+
+    def test_dependency_symlink_fails(self) -> None:
+        (self.dependencies / "client-link").symlink_to(self.package / "index.js")
+        failures = self.check()
+        self.assertTrue(
+            any("regular file or directory" in failure for failure in failures), failures,
+        )
+
+    def test_missing_dependency_tree_fails(self) -> None:
+        shutil.rmtree(self.dependencies)
+        failures = self.check()
+        self.assertTrue(any("missing or unreadable" in failure for failure in failures), failures)
+
+    def test_tar_metadata_does_not_require_dependency_materialization(self) -> None:
+        metadata = self.tar_metadata()
+        shutil.rmtree(self.dependencies)
+        self.assertEqual(self.check(metadata=metadata), [])
+
+    def test_tar_metadata_bad_dependency_mode_fails(self) -> None:
+        metadata = self.tar_metadata()
+        key = self.dependencies.relative_to(self.root).as_posix()
+        metadata[key]["mode"] = stat.S_IFDIR | 0o2755
+        shutil.rmtree(self.dependencies)
+        failures = self.check(metadata=metadata)
+        self.assertTrue(
+            any("privilege or write bits 2755" in failure for failure in failures), failures,
+        )
 
 
 class InstalledWrapperTests(unittest.TestCase):

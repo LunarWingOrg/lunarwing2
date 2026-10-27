@@ -806,7 +806,12 @@ Enforced controls (opencode2 lane unless noted):
    setuid/setgid and write bits throughout `/app/node_modules` after every
    dependency `COPY` and before the wrapper anchor; the parser requires that
    ordering so `cp -a` cannot carry privileged source-directory modes into
-   the published image.
+   the published image. The final in-build `--image-filesystem` assertion
+   recursively requires every dependency entry to be a root-owned regular
+   file or directory with no setuid/setgid or group/other write bits, so a
+   later `RUN` that restores those modes fails at the source (run-236 PL-2).
+   The out-of-band assertion reads the same dependency metadata directly from
+   the tar headers without extracting the dependency tree.
    In mt-admin, `build_opencode2_worker` uses a per-build candidate tag and
    `--iidfile`, then `create --pull=never`, `export`, and full `image inspect`
    feed the same tar/config verifier by immutable image ID. Docker's
