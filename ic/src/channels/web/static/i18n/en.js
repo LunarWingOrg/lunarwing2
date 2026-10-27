@@ -596,6 +596,8 @@ I18n.register('en', {
   'cfg.agent_session_idle.desc': 'Seconds before idle session expires',
   'cfg.agent_stuck_threshold.label': 'Stuck Threshold',
   'cfg.agent_stuck_threshold.desc': 'Seconds before a job is considered stuck',
+  'cfg.agent_external_stuck_threshold.label': 'External Worker Stuck Threshold',
+  'cfg.agent_external_stuck_threshold.desc': 'Idle seconds before an external-worker job is considered stuck (heartbeats count as activity)',
   'cfg.agent_max_repair.label': 'Max Repair Attempts',
   'cfg.agent_max_repair.desc': 'Auto-recovery attempts for stuck jobs',
   'cfg.agent_max_cost.label': 'Max Daily Cost',

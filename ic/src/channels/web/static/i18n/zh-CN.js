@@ -555,6 +555,8 @@ I18n.register('zh-CN', {
   'cfg.agent_session_idle.desc': '空闲会话过期前的秒数',
   'cfg.agent_stuck_threshold.label': '卡住阈值',
   'cfg.agent_stuck_threshold.desc': '任务被认为卡住前的秒数',
+  'cfg.agent_external_stuck_threshold.label': '外部工作者卡住阈值',
+  'cfg.agent_external_stuck_threshold.desc': '外部工作者任务被认为卡住前的空闲秒数（心跳算作活动）',
   'cfg.agent_max_repair.label': '最大修复尝试次数',
   'cfg.agent_max_repair.desc': '卡住任务的自动恢复尝试次数',
   'cfg.agent_max_cost.label': '每日最大费用',
