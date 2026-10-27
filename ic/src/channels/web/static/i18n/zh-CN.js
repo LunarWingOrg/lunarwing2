@@ -133,6 +133,7 @@ I18n.register('zh-CN', {
   'jobs.title': '标题',
   'jobs.status': '状态',
   'jobs.created': '创建时间',
+  'jobs.mode': '模式',
   'jobs.actions': '操作',
   'jobs.empty': '暂无任务',
   'jobs.confirmCancel': '取消此任务？',

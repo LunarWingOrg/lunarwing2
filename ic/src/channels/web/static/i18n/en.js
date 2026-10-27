@@ -174,6 +174,7 @@ I18n.register('en', {
   'jobs.title': 'Title',
   'jobs.status': 'Status',
   'jobs.created': 'Created',
+  'jobs.mode': 'Mode',
   'jobs.actions': 'Actions',
   'jobs.empty': 'No jobs',
   'jobs.confirmCancel': 'Cancel this job?',

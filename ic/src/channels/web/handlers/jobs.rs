@@ -15,9 +15,45 @@ use crate::channels::web::auth::AuthenticatedUser;
 use crate::channels::web::server::GatewayState;
 use crate::channels::web::types::*;
 
+/// Query parameters for `GET /api/jobs`.
+#[derive(Debug, Deserialize)]
+pub struct JobListQuery {
+    /// Optional mode filter: `worker`, `harness`, `external`, or
+    /// `external:<worker>` (WI#479). Jobs with no stored mode match `worker`
+    /// — the historical default — but never `external*`.
+    pub mode: Option<String>,
+}
+
+impl JobListQuery {
+    /// Whether a job carrying `job_mode` should be returned for this filter.
+    fn accepts(&self, job_mode: Option<&str>) -> bool {
+        let Some(filter) = self.mode.as_deref().map(str::trim) else {
+            return true;
+        };
+        if filter.is_empty() {
+            return true;
+        }
+        // Stored modes are canonical lowercase (`worker`, `harness`,
+        // `external:<name>`), so a case-insensitive filter lets `?mode=External`
+        // behave like `?mode=external` instead of silently matching nothing.
+        let filter = filter.to_ascii_lowercase();
+        // The detail response omits the `worker` default, so treat it as
+        // equivalent to an absent mode here for filter purposes.
+        let mode = match job_mode {
+            Some(m) if !m.is_empty() => m,
+            _ => "worker",
+        };
+        match filter.as_str() {
+            "external" => mode.starts_with("external:"),
+            _ => mode == filter,
+        }
+    }
+}
+
 pub async fn jobs_list_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
+    Query(query): Query<JobListQuery>,
 ) -> Result<Json<JobListResponse>, (StatusCode, String)> {
     let store = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -36,6 +72,12 @@ pub async fn jobs_list_handler(
                     "running" => "in_progress",
                     s => s,
                 };
+                // WI#479: the record already carries `job_mode`, so lane
+                // attribution needs no per-job detail call.
+                let mode = Some(j.job_mode.as_str()).filter(|m| !m.is_empty());
+                if !query.accepts(mode) {
+                    continue;
+                }
                 seen_ids.insert(j.id);
                 jobs.push(JobInfo {
                     id: j.id,
@@ -44,6 +86,8 @@ pub async fn jobs_list_handler(
                     user_id: j.user_id.clone(),
                     created_at: j.created_at.to_rfc3339(),
                     started_at: j.started_at.map(|dt| dt.to_rfc3339()),
+                    job_mode: mode.filter(|m| *m != "worker").map(str::to_string),
+                    worker_name: worker_name_from_mode(mode),
                 });
             }
         }
@@ -53,10 +97,15 @@ pub async fn jobs_list_handler(
     }
 
     // Fetch agent (non-sandbox) jobs scoped to this user, deduplicating by ID.
+    // Agent jobs carry no sandbox `job_mode`, so only the unfiltered list and
+    // the explicit `worker` alias include them.
     match store.list_agent_jobs_for_user(&user.user_id).await {
         Ok(agent_jobs) => {
             for j in &agent_jobs {
                 if seen_ids.contains(&j.id) {
+                    continue;
+                }
+                if !query.accepts(None) {
                     continue;
                 }
                 jobs.push(JobInfo {
@@ -66,6 +115,8 @@ pub async fn jobs_list_handler(
                     user_id: j.user_id.clone(),
                     created_at: j.created_at.to_rfc3339(),
                     started_at: j.started_at.map(|dt| dt.to_rfc3339()),
+                    job_mode: None,
+                    worker_name: None,
                 });
             }
         }

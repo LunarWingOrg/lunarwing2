@@ -1938,6 +1938,25 @@ acks; invalid identifiers themselves cannot be correlated.
 
 Interop: pre-WI#328 workers that never send `task_prompt_ack` still function — the daemon tolerates missing acks and ignores unknown message types, and newer workers must likewise ignore `task_prompt` if they do not implement prompting (they simply omit the capability, and the daemon never sends them the frame).
 
+### Job list lane attribution (WI#479)
+
+`GET /api/jobs` now carries the lane on every entry, so attributing jobs during
+multi-job testing no longer needs a detail call per job. Each `JobInfo` gains:
+
+- `job_mode` — the same value the detail response reports (`external:kimi`,
+  `external:pebble`, `harness`, …), **omitted** when the job is in the default
+  `worker` mode, matching the detail response's omission rule.
+- `worker_name` — the lane name for `external:<name>` jobs only, omitted
+  otherwise.
+
+Both come from the `job_mode` column already selected by
+`list_sandbox_jobs_for_user` / the libSQL equivalent, so the list stays a
+single query per source. Agent (non-sandbox) jobs have no sandbox mode and
+report neither field. An optional `?mode=` filter accepts `worker`
+(the default, also matching mode-less rows), `harness`,
+`external` (any external lane) or `external:<name>`; the web Jobs table shows
+a Mode column fed from the same field.
+
 ### Rebuilt image rollout (image-ID contract)
 
 A worker container is bound to the image ID it was created from. `start-tenant` refreshes the tenant's rootless store with a rebuilt image (`_ensure_tenant_image`), but on OpenRC and the non-Quadlet fallback it then only `podman start`s an existing container, and an already-active Quadlet unit is not restarted, so a rebuilt image did not reach a running worker: the old container kept serving the old image until an operator removed it by hand (`restart-tenant` helped only on Quadlet hosts, where the unit re-runs `podman run`). This is how the kimi 2.2.0 image stayed in service without the WI#411/WI#412 fixes. Every worker lane (`pebble`, `opencode`, `opencode2`, `kimi`) now hashes the tenant-store image ID into its container contract (`_worker_launch_contract`, the same mechanism as the LunarVision/LunarVoice sidecar contracts), so `start-tenant` and `restart-tenant` force-recreate the container whenever the image ID differs from the one it was created from, on both init systems. The procedure after any worker change is therefore:
