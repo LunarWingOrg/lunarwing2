@@ -799,7 +799,7 @@ class BunImageTieTests(unittest.TestCase):
             "CI_DEBIAN_SNAPSHOT": "20260906T000000Z",
         }
         self.merged = {
-            ".worker-candidate": {"image": "docker.io/moby/buildkit:v0.25.1-rootless@sha256:0c0ce4929976ace509f7a53878303504b2de8857829aea4932af9f7325a30f51"},
+            ".worker-candidate": {"image": "docker.io/moby/buildkit:v0.34.1-rootless@sha256:f68752a5a94acfcdad2d07867b7075601a421638e17fc5f28efc1c814d0c4f89"},
             ".worker-scan": {"image": "docker.io/aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969"},
             ".worker-promotion": {"image": "docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"},
             "rust-test-postgres-integration": {
@@ -827,6 +827,23 @@ class BunImageTieTests(unittest.TestCase):
             f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST} AS runtime\n"
         )
         self.assertEqual(self.errors(), [])
+
+    def test_buildkit_tag_and_digest_must_both_match_reviewed_pin(self):
+        self.write_dockerfile(
+            f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST} AS builder\n"
+        )
+        self.assertEqual(self.errors(), [])
+        tag, digest = self.merged[".worker-candidate"]["image"].split("@")
+        for image in (
+            f"{tag}@sha256:{self.OTHER_DIGEST}",
+            f"docker.io/moby/buildkit:v0.0.0-rootless@{digest}",
+        ):
+            with self.subTest(image=image):
+                self.merged[".worker-candidate"]["image"] = image
+                errors = self.errors()
+                self.assertEqual(len(errors), 1, errors)
+                self.assertIn(".worker-candidate image", errors[0])
+                self.assertIn("differs from the reviewed pin", errors[0])
 
     def test_digest_mismatch_is_caught(self):
         self.write_dockerfile(
@@ -913,7 +930,7 @@ class NodeImageTieTests(unittest.TestCase):
             "CI_DEBIAN_SNAPSHOT": self.SNAPSHOT,
         }
         self.merged = {
-            ".worker-candidate": {"image": "docker.io/moby/buildkit:v0.25.1-rootless@sha256:0c0ce4929976ace509f7a53878303504b2de8857829aea4932af9f7325a30f51"},
+            ".worker-candidate": {"image": "docker.io/moby/buildkit:v0.34.1-rootless@sha256:f68752a5a94acfcdad2d07867b7075601a421638e17fc5f28efc1c814d0c4f89"},
             ".worker-scan": {"image": "docker.io/aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969"},
             ".worker-promotion": {"image": "docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"},
             "rust-test-postgres-integration": {
@@ -1058,7 +1075,7 @@ class DebianSnapshotTieTests(unittest.TestCase):
             "CI_DEBIAN_SNAPSHOT": self.SNAPSHOT,
         }
         self.merged = {
-            ".worker-candidate": {"image": "docker.io/moby/buildkit:v0.25.1-rootless@sha256:0c0ce4929976ace509f7a53878303504b2de8857829aea4932af9f7325a30f51"},
+            ".worker-candidate": {"image": "docker.io/moby/buildkit:v0.34.1-rootless@sha256:f68752a5a94acfcdad2d07867b7075601a421638e17fc5f28efc1c814d0c4f89"},
             ".worker-scan": {"image": "docker.io/aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969"},
             ".worker-promotion": {"image": "docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"},
             "rust-test-postgres-integration": {
