@@ -4077,20 +4077,14 @@ mod tests {
             ),
             (
                 encoded_response(
-                    &[
-                        ("transfer-encoding", "chunked"),
-                        ("transfer-encoding", ""),
-                    ],
+                    &[("transfer-encoding", "chunked"), ("transfer-encoding", "")],
                     "opaque",
                 ),
                 true,
             ),
             (
                 encoded_response(
-                    &[
-                        ("transfer-encoding", ""),
-                        ("transfer-encoding", "chunked"),
-                    ],
+                    &[("transfer-encoding", ""), ("transfer-encoding", "chunked")],
                     "plain",
                 ),
                 false,
@@ -4311,24 +4305,36 @@ mod tests {
         ));
         for (label, headers, body) in refused {
             let response = exchange(&headers, body).await;
-            let response =
-                super::collect_guest_http_response(response, 1024 * 1024, &super::LeakDetector::new())
-                    .await
-                    .unwrap();
+            let response = super::collect_guest_http_response(
+                response,
+                1024 * 1024,
+                &super::LeakDetector::new(),
+            )
+            .await
+            .unwrap();
             let (mut store, _) = encoding_test_store(Vec::new());
             store.last_http_exchange_had_credentials = true;
             let err = store
                 .redact_http_outcome_for_guest(Ok(response))
                 .err()
                 .unwrap_or_else(|| panic!("{label}: framing left intact was delivered"));
-            assert!(err.contains("encoded body cannot be inspected"), "{label}: {err}");
+            assert!(
+                err.contains("encoded body cannot be inspected"),
+                "{label}: {err}"
+            );
         }
 
         // Controls: hyper really de-chunks these, so the contiguous echo is
         // scrubbed in full — the complete body is asserted, not just a marker.
         let inspectable: Vec<(&str, String)> = vec![
-            ("single chunked", "Transfer-Encoding: chunked\r\n".to_string()),
-            ("mixed-case Chunked", "Transfer-Encoding: Chunked\r\n".to_string()),
+            (
+                "single chunked",
+                "Transfer-Encoding: chunked\r\n".to_string(),
+            ),
+            (
+                "mixed-case Chunked",
+                "Transfer-Encoding: Chunked\r\n".to_string(),
+            ),
             (",chunked", "Transfer-Encoding: ,chunked\r\n".to_string()),
             (", chunked", "Transfer-Encoding: , chunked\r\n".to_string()),
             (
@@ -4342,18 +4348,20 @@ mod tests {
         ];
         for (label, headers) in inspectable {
             let response = exchange(&headers, one_layer.clone()).await;
-            let response =
-                super::collect_guest_http_response(response, 1024 * 1024, &super::LeakDetector::new())
-                    .await
-                    .unwrap();
+            let response = super::collect_guest_http_response(
+                response,
+                1024 * 1024,
+                &super::LeakDetector::new(),
+            )
+            .await
+            .unwrap();
             let (mut store, _) = encoding_test_store(Vec::new());
             store.last_http_exchange_had_credentials = true;
             let delivered = store
                 .redact_http_outcome_for_guest(Ok(response))
                 .unwrap_or_else(|e| panic!("{label}: {e}"));
             assert_eq!(
-                delivered.body,
-                b"echo=[REDACTED:host_credential];end",
+                delivered.body, b"echo=[REDACTED:host_credential];end",
                 "{label}: the whole scrubbed body must be delivered"
             );
         }
