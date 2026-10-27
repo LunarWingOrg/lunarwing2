@@ -62,7 +62,7 @@ use crate::tools::wasm::credential_injector::{
 use crate::tools::wasm::http_security::{
     RedactionNeedle, collect_capped_response_body, private_http_targets_allowed,
     push_credential_needles, redact_cross_field_echoes, redact_text_with_needles,
-    reject_private_ip, replace_all_bytes, sort_redaction_needles,
+    replace_all_bytes, sort_redaction_needles, vet_http_target,
 };
 #[cfg(test)]
 use crate::tools::wasm::http_security::{encoded_spellings, form_encode_secret};
@@ -93,6 +93,58 @@ struct ResolvedHostCredential {
     secret_value: String,
 }
 
+type SharedBridgeOrigins = Arc<std::sync::RwLock<Vec<String>>>;
+
+const BRIDGE_ORIGIN_KEYS: [&str; 5] = [
+    "bridge_url",
+    "adapter_url",
+    "relay_url",
+    "ws_adapter_url",
+    "multica_url",
+];
+
+fn configured_bridge_origins(config_json: &str) -> Vec<String> {
+    let Ok(config) = serde_json::from_str::<HashMap<String, serde_json::Value>>(config_json) else {
+        return Vec::new();
+    };
+    let mut origins: Vec<String> = BRIDGE_ORIGIN_KEYS
+        .iter()
+        .filter_map(|key| config.get(*key))
+        .filter_map(serde_json::Value::as_str)
+        .filter_map(loopback_bridge_origin)
+        .collect();
+    origins.sort();
+    origins.dedup();
+    origins
+}
+
+fn loopback_bridge_origin(raw_url: &str) -> Option<String> {
+    let url = url::Url::parse(raw_url).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    let loopback = match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    };
+    loopback.then(|| url.origin().ascii_serialization())
+}
+
+fn matches_bridge_origin(raw_url: &str, allowed_origins: &[String]) -> bool {
+    url::Url::parse(raw_url).ok().is_some_and(|url| {
+        url.username().is_empty()
+            && url.password().is_none()
+            && allowed_origins
+                .iter()
+                .any(|origin| origin == &url.origin().ascii_serialization())
+    })
+}
+
 /// Store data for WASM channel execution.
 ///
 /// Contains the resource limiter, channel-specific host state, and WASI context.
@@ -112,9 +164,11 @@ struct ChannelStoreData {
     /// Dedicated tokio runtime for HTTP requests, lazily initialized.
     /// Reused across multiple `http_request` calls within one execution.
     http_runtime: Option<tokio::runtime::Runtime>,
-    /// Local-dev / multi-tenant escape hatch for loopback sidecars. Captured
-    /// at construction so tests never mutate process-wide environment state.
+    /// Explicit global escape hatch, captured at construction so tests never
+    /// mutate process-wide environment state.
     allow_private_ips: bool,
+    /// Exact configured loopback bridge origins exempt from the private guard.
+    allowed_bridge_origins: SharedBridgeOrigins,
     /// Whether the most recent exchange had a credential injected
     /// (placeholder or host credential); scopes the identity-encoding
     /// request and the opaque-body refusal (HJ-1/HQ-2 parity).
@@ -143,8 +197,14 @@ impl ChannelStoreData {
             pairing_store,
             http_runtime: None,
             allow_private_ips: private_http_targets_allowed(),
+            allowed_bridge_origins: Arc::new(std::sync::RwLock::new(Vec::new())),
             last_http_exchange_had_credentials: false,
         }
+    }
+
+    fn with_bridge_origins(mut self, origins: SharedBridgeOrigins) -> Self {
+        self.allowed_bridge_origins = origins;
+        self
     }
 
     /// Inject credentials into a string by replacing placeholders.
@@ -478,9 +538,16 @@ impl ChannelStoreData {
             .map(|h| h.max_response_bytes)
             .unwrap_or(10 * 1024 * 1024);
 
-        if !self.allow_private_ips {
-            reject_private_ip(&url)?;
-        }
+        let configured_bridge = self
+            .allowed_bridge_origins
+            .read()
+            .map(|origins| matches_bridge_origin(&url, &origins))
+            .unwrap_or(false);
+        let vetted_target = if !configured_bridge && !self.allow_private_ips {
+            Some(vet_http_target(&url)?)
+        } else {
+            None
+        };
 
         // Make the HTTP request using a dedicated single-threaded runtime.
         // We're inside spawn_blocking, so we can't rely on the main runtime's
@@ -500,9 +567,14 @@ impl ChannelStoreData {
             // Never follow redirects: reqwest's default policy keeps custom
             // credential headers across hosts and skips the allowlist; the
             // 3xx is returned to the guest (redacted) like the tool wrapper.
-            let client = reqwest::Client::builder()
+            let client_builder = reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))
-                .redirect(reqwest::redirect::Policy::none())
+                .redirect(reqwest::redirect::Policy::none());
+            let client_builder = match &vetted_target {
+                Some(target) => target.pin_client(client_builder),
+                None => client_builder,
+            };
+            let client = client_builder
                 .build()
                 .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 
@@ -834,6 +906,9 @@ pub struct WasmChannel {
     /// Wrapped in RwLock to allow updating before start.
     config_json: RwLock<String>,
 
+    /// Loopback bridge origins derived from the current channel configuration.
+    allowed_bridge_origins: SharedBridgeOrigins,
+
     /// Channel configuration returned by on_start.
     channel_config: RwLock<Option<ChannelConfig>>,
 
@@ -1093,6 +1168,9 @@ impl WasmChannel {
     ) -> Self {
         let name = prepared.name.clone();
         let rate_limiter = ChannelEmitRateLimiter::new(capabilities.emit_rate_limit.clone());
+        let allowed_bridge_origins = Arc::new(std::sync::RwLock::new(configured_bridge_origins(
+            &config_json,
+        )));
 
         Self {
             name,
@@ -1100,6 +1178,7 @@ impl WasmChannel {
             prepared,
             capabilities,
             config_json: RwLock::new(config_json),
+            allowed_bridge_origins,
             channel_config: RwLock::new(None),
             message_tx: Arc::new(RwLock::new(None)),
             pending_responses: RwLock::new(HashMap::new()),
@@ -1189,6 +1268,14 @@ impl WasmChannel {
 
         // Serialize back
         *config_guard = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
+        let origins = configured_bridge_origins(&config_guard);
+        match self.allowed_bridge_origins.write() {
+            Ok(mut allowed) => *allowed = origins,
+            Err(_) => tracing::error!(
+                channel = %self.name,
+                "Bridge-origin policy lock poisoned; configured exemptions unavailable"
+            ),
+        }
 
         // Log a sanitized summary only. The merged config frequently contains
         // host-injected secrets (xmpp_password, relay_password, adapter tokens),
@@ -1355,6 +1442,7 @@ impl WasmChannel {
         credentials: HashMap<String, String>,
         host_credentials: Vec<ResolvedHostCredential>,
         pairing_store: Arc<PairingStore>,
+        allowed_bridge_origins: SharedBridgeOrigins,
     ) -> Result<Store<ChannelStoreData>, WasmChannelError> {
         let engine = runtime.engine();
         let limits = &prepared.limits;
@@ -1367,13 +1455,8 @@ impl WasmChannel {
             credentials,
             host_credentials,
             pairing_store,
-        );
-        #[cfg(test)]
-        let store_data = {
-            let mut store_data = store_data;
-            store_data.allow_private_ips = true;
-            store_data
-        };
+        )
+        .with_bridge_origins(allowed_bridge_origins);
         let mut store = Store::new(engine, store_data);
 
         // Configure fuel if enabled
@@ -1541,6 +1624,7 @@ impl WasmChannel {
         )
         .await;
         let pairing_store = self.pairing_store.clone();
+        let allowed_bridge_origins = self.allowed_bridge_origins.clone();
         let workspace_store = self.workspace_store.clone();
 
         tokio::time::timeout(timeout, async move {
@@ -1552,6 +1636,7 @@ impl WasmChannel {
                     credentials,
                     host_credentials,
                     pairing_store,
+                    allowed_bridge_origins,
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -1702,6 +1787,7 @@ impl WasmChannel {
         )
         .await;
         let pairing_store = self.pairing_store.clone();
+        let allowed_bridge_origins = self.allowed_bridge_origins.clone();
         // Prepare request data
         let method = method.to_string();
         let path = path.to_string();
@@ -1721,6 +1807,7 @@ impl WasmChannel {
                     credentials,
                     host_credentials,
                     pairing_store,
+                    allowed_bridge_origins,
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -1848,6 +1935,7 @@ impl WasmChannel {
         )
         .await;
         let pairing_store = self.pairing_store.clone();
+        let allowed_bridge_origins = self.allowed_bridge_origins.clone();
 
         // Execute in blocking task with timeout
         let result = tokio::time::timeout(timeout, async move {
@@ -1859,6 +1947,7 @@ impl WasmChannel {
                     credentials,
                     host_credentials,
                     pairing_store,
+                    allowed_bridge_origins,
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -1949,6 +2038,7 @@ impl WasmChannel {
         )
         .await;
         let pairing_store = self.pairing_store.clone();
+        let allowed_bridge_origins = self.allowed_bridge_origins.clone();
 
         // Prepare response data
         let message_id_str = message_id.to_string();
@@ -1978,6 +2068,7 @@ impl WasmChannel {
                     credentials,
                     host_credentials,
                     pairing_store,
+                    allowed_bridge_origins,
                 )?;
 
                 tracing::info!("Instantiating WASM component for on_respond");
@@ -2093,6 +2184,7 @@ impl WasmChannel {
         )
         .await;
         let pairing_store = self.pairing_store.clone();
+        let allowed_bridge_origins = self.allowed_bridge_origins.clone();
 
         let user_id = user_id.to_string();
         let content = content.to_string();
@@ -2116,6 +2208,7 @@ impl WasmChannel {
                     credentials,
                     host_credentials,
                     pairing_store,
+                    allowed_bridge_origins,
                 )?;
 
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
@@ -2200,6 +2293,7 @@ impl WasmChannel {
         )
         .await;
         let pairing_store = self.pairing_store.clone();
+        let allowed_bridge_origins = self.allowed_bridge_origins.clone();
 
         let Some(wit_update) = status_to_wit(status, metadata) else {
             return Ok(());
@@ -2214,6 +2308,7 @@ impl WasmChannel {
                     credentials,
                     host_credentials,
                     pairing_store,
+                    allowed_bridge_origins,
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -2261,6 +2356,7 @@ impl WasmChannel {
         credentials: &RwLock<HashMap<String, String>>,
         host_credentials: Vec<ResolvedHostCredential>,
         pairing_store: Arc<PairingStore>,
+        allowed_bridge_origins: SharedBridgeOrigins,
         timeout: Duration,
         wit_update: wit_channel::StatusUpdate,
     ) -> Result<(), WasmChannelError> {
@@ -2283,6 +2379,7 @@ impl WasmChannel {
                     credentials_snapshot,
                     host_credentials,
                     pairing_store,
+                    allowed_bridge_origins,
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -2384,6 +2481,7 @@ impl WasmChannel {
                 )
                 .await;
                 let pairing_store = self.pairing_store.clone();
+                let allowed_bridge_origins = self.allowed_bridge_origins.clone();
                 let callback_timeout = self.runtime.config().callback_timeout;
                 let Some(wit_update) = status_to_wit(&status, metadata) else {
                     return Ok(());
@@ -2408,6 +2506,7 @@ impl WasmChannel {
                             &credentials,
                             hc,
                             pairing_store.clone(),
+                            allowed_bridge_origins.clone(),
                             callback_timeout,
                             wit_update_clone,
                         )
@@ -2578,6 +2677,7 @@ impl WasmChannel {
         let rate_limiter = self.rate_limiter.clone();
         let credentials = self.credentials.clone();
         let pairing_store = self.pairing_store.clone();
+        let allowed_bridge_origins = self.allowed_bridge_origins.clone();
         let callback_timeout = self.runtime.config().callback_timeout;
         let workspace_store = self.workspace_store.clone();
         let last_broadcast_metadata = self.last_broadcast_metadata.clone();
@@ -2604,6 +2704,7 @@ impl WasmChannel {
                     let rl = rate_limiter.clone();
                     let creds = credentials.clone();
                     let ps = pairing_store.clone();
+                    let bridge_origins = allowed_bridge_origins.clone();
                     let ws = workspace_store.clone();
                     let lbm = last_broadcast_metadata.clone();
                     let ss = settings_store.clone();
@@ -2639,6 +2740,7 @@ impl WasmChannel {
                                 &creds,
                                 host_credentials,
                                 ps.clone(),
+                                bridge_origins.clone(),
                                 callback_timeout,
                                 &ws,
                             )
@@ -2784,6 +2886,7 @@ impl WasmChannel {
         credentials: &RwLock<HashMap<String, String>>,
         host_credentials: Vec<ResolvedHostCredential>,
         pairing_store: Arc<PairingStore>,
+        allowed_bridge_origins: SharedBridgeOrigins,
         timeout: Duration,
         workspace_store: &Arc<ChannelWorkspaceStore>,
     ) -> Result<PollExecution, WasmChannelError> {
@@ -2812,6 +2915,7 @@ impl WasmChannel {
                     credentials_snapshot,
                     host_credentials,
                     pairing_store,
+                    allowed_bridge_origins,
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -4474,6 +4578,7 @@ mod tests {
             &credentials,
             Vec::new(), // no host credentials in test
             Arc::new(PairingStore::new()),
+            Arc::new(std::sync::RwLock::new(Vec::new())),
             timeout,
             &workspace_store,
         )
@@ -7568,6 +7673,180 @@ mod tests {
                 url_parser.contains(&"P@ss%20word!".to_string()),
                 "{url_parser:?}"
             );
+        }
+    }
+
+    mod bridge_origin_pins {
+        use std::collections::HashMap;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::Arc;
+
+        use super::super::lunarwing::agent::channel_host::Host as _;
+        use super::super::{WasmChannel, configured_bridge_origins, matches_bridge_origin};
+        use crate::channels::wasm::runtime::{
+            PreparedChannelModule, WasmChannelRuntime, WasmChannelRuntimeConfig,
+        };
+        use crate::channels::wasm::schema::ChannelCapabilitiesFile;
+        use crate::pairing::PairingStore;
+        use crate::tools::wasm::ResourceLimits;
+
+        fn serve_ok() -> (u16, std::thread::JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("address").port();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut request = [0; 1024];
+                let _ = stream.read(&mut request).expect("read request");
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .expect("write response");
+            });
+            (port, server)
+        }
+
+        fn channel_for(
+            runtime: &Arc<WasmChannelRuntime>,
+            manifest: &ChannelCapabilitiesFile,
+        ) -> WasmChannel {
+            let prepared = Arc::new(PreparedChannelModule {
+                name: manifest.name.clone(),
+                description: "bridge-origin test".to_string(),
+                component: None,
+                limits: ResourceLimits::default(),
+            });
+            WasmChannel::new(
+                Arc::clone(runtime),
+                prepared,
+                manifest.to_capabilities(),
+                "default",
+                manifest.config_json(),
+                Arc::new(PairingStore::new()),
+                None,
+            )
+        }
+
+        #[test]
+        fn wi432_shipped_channel_defaults_reach_configured_loopback_bridges() {
+            let manifests: &[(&str, &[(&str, &str)])] = &[
+                (
+                    include_str!("../../../channels-src/xmpp/xmpp.capabilities.json"),
+                    &[("bridge_url", "/v1/messages")],
+                ),
+                (
+                    include_str!("../../../channels-src/darkirc/darkirc.capabilities.json"),
+                    &[("adapter_url", "/health")],
+                ),
+                (
+                    include_str!("../../../channels-src/weechat/weechat.capabilities.json"),
+                    &[
+                        ("relay_url", "/api/version"),
+                        ("ws_adapter_url", "/api/version"),
+                    ],
+                ),
+                (
+                    include_str!("../../../channels-src/multica/multica.capabilities.json"),
+                    &[("multica_url", "/api/daemon/register")],
+                ),
+            ];
+            let runtime = Arc::new(
+                WasmChannelRuntime::new(WasmChannelRuntimeConfig::for_testing())
+                    .expect("test runtime"),
+            );
+
+            for (manifest_json, endpoints) in manifests {
+                let mut manifest = ChannelCapabilitiesFile::from_json(manifest_json)
+                    .expect("shipped manifest parses");
+                for (key, path) in *endpoints {
+                    let configured = manifest
+                        .config
+                        .get(*key)
+                        .and_then(serde_json::Value::as_str)
+                        // Multica documents localhost:8080 but leaves its required
+                        // setup value null in the manifest.
+                        .unwrap_or("http://localhost:8080");
+                    let parsed = url::Url::parse(configured).expect("default bridge URL");
+                    let (port, server) = serve_ok();
+                    let origin = format!(
+                        "{}://{}:{}",
+                        parsed.scheme(),
+                        parsed.host_str().expect("default bridge host"),
+                        port
+                    );
+                    manifest
+                        .config
+                        .insert((*key).to_string(), serde_json::Value::String(origin));
+                    let channel = channel_for(&runtime, &manifest);
+                    let mut store = WasmChannel::create_store(
+                        &channel.runtime,
+                        &channel.prepared,
+                        &channel.capabilities,
+                        HashMap::new(),
+                        Vec::new(),
+                        channel.pairing_store.clone(),
+                        channel.allowed_bridge_origins.clone(),
+                    )
+                    .expect("store");
+                    store.data_mut().allow_private_ips = false;
+                    let bridge_url = manifest
+                        .config
+                        .get(*key)
+                        .and_then(serde_json::Value::as_str)
+                        .expect("inserted bridge URL");
+
+                    let response = store
+                        .data_mut()
+                        .http_request(
+                            "GET".to_string(),
+                            format!("{bridge_url}{path}"),
+                            "{}".to_string(),
+                            None,
+                            Some(5000),
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "{} {key} must reach its configured bridge: {error}",
+                                manifest.name
+                            )
+                        });
+                    assert_eq!(response.status, 200);
+                    server.join().expect("bridge server");
+                }
+            }
+        }
+
+        #[test]
+        fn wi432_bridge_exemption_is_exact_and_loopback_only() {
+            let origins = configured_bridge_origins(
+                r#"{
+                    "bridge_url":"http://127.0.0.1:8787/base",
+                    "adapter_url":"http://10.0.0.5:6680",
+                    "relay_url":"https://localhost:443"
+                }"#,
+            );
+            assert_eq!(
+                origins,
+                vec![
+                    "http://127.0.0.1:8787".to_string(),
+                    "https://localhost".to_string(),
+                ]
+            );
+            assert!(matches_bridge_origin(
+                "http://127.0.0.1:8787/v1/messages?cursor=1",
+                &origins
+            ));
+            assert!(matches_bridge_origin("https://localhost/v1", &origins));
+            for denied in [
+                "http://127.0.0.1:8788/v1/messages",
+                "https://127.0.0.1:8787/v1/messages",
+                "http://127.0.0.2:8787/v1/messages",
+                "http://user@127.0.0.1:8787/v1/messages",
+                "http://10.0.0.5:6680/health",
+            ] {
+                assert!(!matches_bridge_origin(denied, &origins), "{denied}");
+            }
         }
     }
 }
