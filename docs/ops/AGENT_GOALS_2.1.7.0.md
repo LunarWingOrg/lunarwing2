@@ -846,7 +846,7 @@
     - **Recovery behavior:** `recover_pending_mission_retries` now performs a status-independent, record-only dedup heal before its Active-only retry scan. It releases only the newest fire's current payload key when the thread is a parity-matching Mission thread, `Failed` with a host-stop reason, and has no retry marker, restart-failure marker, or shutdown-interruption stamp. Mission and thread are reloaded and the newest-fire/payload checks repeated under the fire lock; store failures leave the key for a later boot. No retry wake or notification is generated, while external redelivery can fire again. Stamped, restart-owned, and superseded fires remain with their existing owners.
     - **Tests and docs:** four `settled_stop_abort_heal_*` regressions cover Active plus Paused/zero-retry healing and real redelivery, stamp/restart ownership, the stale-global-snapshot/newer-fire race, and marker/type/project/user/state guards. Updated the mission recovery comments, `ENGINE-V2.md`, and `OUTBOUND-DELIVERY-SEMANTICS.md` to describe the healed behavior without claiming the lost run is replayed
     - **Verification:** focused WI#394 filter **4/4**; full `taskset -c 0-17 cargo test -j18 -p lunarwing_engine --lib -- --test-threads=18` **789 passed, 0 failed**; `taskset -c 0-17 cargo clippy -j18 -p lunarwing_engine --all-targets -- -D warnings` clean; `cargo fmt --all -- --check` and `git diff --check` clean.
-46. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/424 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1960 - see comments on closed MR for blockers that must be addressed on next attempt
+46. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/424 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1971 - see comments on closed MR for blockers that must be addressed on next attempt
 47. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/425 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1951 but needs re-attempt - please see comments of previosuly closed MR to address the blockers. pay attention to the LATEST comment since the changes you made were edited since your last attempt on the branch the old MR references as you can clearly see
     - PARTIAL 2026-10-27 (Rarity, item-47 re-attempt, branch `aj/kimi-47-20261027-0900`): !1957 was approved and merged before this run, so there was no reason to replay its 33-file change set. Starting from target `571b16032`, inspected the first protected master pipeline carrying that work (6540): all four candidate/scan pairs passed, including Pebble jobs 137490/137491, but `worker-opencode2-exposure-verify` exposed two new defects — 18 dependency directories exported with setgid mode `2755` (job 137644) and a registry-token HTTP 429 on the latest retry (job 137715). Item 47 stays unchecked because WI#425 AC4 remains open.
     - **OpenCode 2 verification fixes:** the runtime Dockerfile now strips setuid/setgid and write bits throughout `/app/node_modules`; the BuildKit policy requires that normalization after every dependency `COPY` and before the wrapper anchor (not strict adjacency, so legitimate unrelated `ENV`/continued `RUN` instructions still pass). Registry token, manifest and config fetches share bounded retries for HTTP 429/500/502/503/504 with 15/30/60-second backoff; permanent HTTP errors and invalid JSON still fail immediately. Tests cover the exact `2755` directory, transient recovery, persistent-429 exhaustion, permanent-error refusal, real token-path wiring, and both normalization order directions.
@@ -880,14 +880,14 @@
     - **Docs:** `ic/src/NETWORK_SECURITY.md` drops the "wrapper still accepts trailing-empty/repeated `chunked` forms" residual and states the framing-aware rule (WI#430 closed in-tree).
     - **Regression evidence:** the new `split_credential_echo_across_chunk_framing_is_refused` drives the real reqwest/hyper response path against a loopback upstream with a form-encoded credential echo split across chunk boundaries. The four required shapes (`chunked,`; `chunked` + empty field; `chunked, chunked` over a double-chunked body; two `chunked` fields over a double-chunked body) plus `gzip, chunked` and `identity, chunked` are each refused before guest delivery; controls assert the **complete scrubbed body** (`echo=[REDACTED:host_credential];end`) for the inspectable variants. Reverting the framing rule to the old token rule makes both the new real-path test and the updated unit matrix fail (mutation-verified against a scratch copy, restored). WI#430 stays open pending maintainer acceptance, consistent with the other in-tree items.
     - **Verification (`taskset -c 0-17`, `-j18`):** `cargo check --lib --tests` clean; `cargo test --lib tools::wasm::wrapper::tests::` **61 passed / 0 failed / 1 ignored**; `cargo clippy --lib --tests -- -D warnings` clean; `cargo fmt --all -- --check` clean
-50. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/432 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1961 - see comments on closed MR for blockers that must be addressed on next attempt
+50. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/432 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1975 - see comments on closed MR for blockers that must be addressed on next attempt
 51. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/471
     - DONE 2026-10-26 (SweetieBot, item-51, branch `sweetiebot/kimi-51-20261026-0905`): WI#471 implemented. `configure_pebble` now rejects CR/LF, leading/trailing whitespace, pasted `NANOGPT_API_KEY=` assignments (with or without `export`), and literal single/double quotes at either end with actionable key-free errors before registry lookup, env-directory creation, env-file writing, or container inspection/restart handling. Clean keys/models retain the existing `pebble.env` output and existing-container restart guidance. Kimi uses a separate quoted `lunarwing.env` writer, not this raw `--env-file` path, and is unchanged.
     - **Tests/docs:** new `test-mt-admin-pebble-configure.sh` covers double/single quotes, space/tab padding, embedded newline, key-material hygiene, existing-env preservation, no env creation/writer/container calls on rejection, clean env-file output, and existing-container inspection/restart guidance. `PEBBLE-WORKER.md` distinguishes literal env-file quotes from normal shell quoting.
     - **Initial verification:** the new configure harness and existing Pebble build-input harness PASS; `check-mt-admin.sh` is clean with the pinned `.ci-bin/shellcheck`; repository `shell-syntax.sh` validates 257 scripts + 3 hooks and `shellcheck.sh` is clean; `git diff --check` is clean. Shell/docs-only change, so no cargo lanes apply. The broader `test-mt-admin-worker-lifecycle.sh` was also attempted but is not a clean gate under this non-root account: it fails unrelated OpenRC fixture assertions and a `/var/lib/lunarwing/container-hashes` permission denial. It does not call `configure_pebble`, and this branch changes no lifecycle code.
     - **!1942 run-223 follow-up (OM-1 Low):** the raw-key guard now rejects whole env-file assignments, including `export` followed by spaces/tabs, and any literal quote at either end rather than requiring a matching pair or a two-character minimum. The harness adds assignment, exported-assignment, one-sided, lone and mismatched-quote cases, retaining the key-free error, unchanged-file and no writer/container side-effect assertions. The new assignment regression fails on the original guard. `PEBBLE-WORKER.md` now states the enforced forms explicitly. Info-only OM-2..OM-6 are outside this pass.
     - **OM-1 verification:** all **18 rejected-input cases** pass (also under `LC_ALL=C`); **7/7** independent mutants are killed by the harness (bare assignment prefix, exported assignment prefix, each of the four quote-end checks, and the old two-character minimum). Mutants run against scratch copies of the function and harness; tracked work-in-progress files are never mutated or restored from Git. The Pebble build-input harness PASSes; `check-mt-admin.sh`, the configure harness and repository shell gate are clean with ShellCheck **0.11.0**; `shell-syntax.sh` validates **257 scripts + 3 hooks**; `.gitlab/tests/test_goal1_ci.py` **251/251** and `git diff --check` pass. The shell/CI checks run in tmux; no cargo lanes apply.
-52. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/472
+52. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/472 - last attempt was rejected and the MR was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1973 and please see comments and address blockers and findingsin
 53. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/473 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1962 - see comments on closed MR for blockers that must be addressed on next attempt
     - DONE 2026-10-27 (Applejack, item-53, branch `aj/kimi-53-20261027-1200`): carried the six reviewed implementation/test/documentation commits from closed !1962 onto the current target and addressed run-233 PE-1/PE-2. Completed, failed, stopped and max-iteration turns now immediately drain their turn-bound pending gates from memory and persistence with request-id-checked reservations and `thread_terminated` broadcasts. `GatePaused` outcomes and authentication-fallback gates remain pending, and the existing dead-thread/expiry sweep remains the backstop; `docs/architecture/ENGINE-V2.md` records the lifecycle.
     - **Review fixes and verification:** the out-of-line test fixture now has the required test-only safety marker, clearing PE-1's panic-policy failure. The new PE-2 regression completes a `GatePaused` outcome and proves both an existing same-thread sentinel and the newly parked gate remain peek-able and listed for their users, covering the reviewed reap-on-pause mutant. `cargo test --locked --lib -- gate:: bridge::router::outcome` passed **64/64**; `cargo clippy --locked --lib --tests -D warnings`, `cargo fmt --all -- --check`, panic-policy against base `571b16032`, and `git diff --check` all pass under `taskset -c 0-17` with Cargo at `-j18`. No live-tenant or protected-pipeline validation was performed; WI#473 remains open for maintainer acceptance.
@@ -897,7 +897,7 @@
     - DONE 2026-10-26 (SweetieBot, item-54, branch `sweetiebot/kimi-54-20261026-1005`): WI#474 implemented an explicit rejection on both OpenCode lanes instead of accepting credential grants as a no-op. Any non-empty `context.environment` now returns one credential-safe error before SDK client/session creation, telling the caller to resubmit without credentials or use kimi/pebble. No grant entry is merged into shared `process.env`; v1 also closes its follow-up queue on the early return, and its now-unreachable per-task serve-log scrub branch was removed. Both `agent_comm_protocol.json` contracts and `docs/ops/WORKER-CONTAINERS.md` document the behavior; the v1 README is consistent with the boot-env-only scrub.
     - **Live-tenant evidence (antelope):** direct authenticated worker-protocol `task_request` probes used a synthetic grant-shaped `context.environment` marker (the exact field populated by `create_job` credentials), never a real tenant secret. On OpenCode 2, task `2d909cdf-388d-4ea9-bc68-8b5aeb9105df` completed successfully and returned **`WI474_ENV_ABSENT`**, confirming the granted value does not reach task code. The v1 probe `1279379b-cf91-4690-a9e8-a1631a7ab171` reached the executor but hit the already-documented WI#333 `a.name` startup failure before task code ran, so no v1 live env verdict is claimed; its separate-serve topology and the new rejection are pinned by source and the executor suite.
     - **Regression pins:** both executor suites assert an explicit error, zero SDK/session calls, unchanged bridge credentials and ordinary env, and no grant values in diagnostics; v1 additionally asserts follow-up queue closure. Verification on this tree: all 8 v1 Bun suites + strict `tsc --noEmit` passed; all 9 v2 Bun suites passed (the 7 MR-lane suites plus executor and bridge); both protocol JSON files parsed; `validate_config.py` validated 8 CI YAML files; `.gitlab/tests/test_goal1_ci.py` **251/251 OK** (with `TMPDIR` on the executable workspace filesystem because `/tmp` is noexec here); `git diff --check` clean. TypeScript/docs-only change set, so no cargo lanes or debug builds were run. The normal protected worker-image rebuild remains the deployment gate; no tenant image was rebuilt in this pass.
-55. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/475
+55. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/475 - Rejected. Last attempt was: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1980
 56. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/476
 57. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/477
     - DONE 2026-10-26 (SweetieBot, item-57, branch `sweetiebot/kimi-57-20261026-1105`): WI#477's in-tree acceptance is implemented for Kimi and Pebble. Heartbeats now carry one-based request indexes and elapsed seconds, native per-attempt LLM deadlines are configurable and operator-owned, timeout retries/failures are visible in progress/results, and `docs/ops/WORKER-CONTAINERS.md` documents the large-request latency envelope and per-attempt-vs-task-deadline semantics.
@@ -1205,7 +1205,7 @@
     - **Verification on this tree:** `test-mt-admin-kimi.sh` 140 PASS / 0 FAIL on the noexec `/tmp` dev VM (4 named skips for the noexec blocks); `kimi_task_executor_test.ts` 21/21 PASS with a non-noexec TMPDIR (the 17 noexec `/tmp` failures are the same environment artifact class — mock binaries cannot execute from noexec tmpfs; not a code verdict); `tsc --noEmit` clean; shellcheck 0.11.0 `--severity=warning` clean on `test-mt-admin-kimi.sh` and `09-worker-config.sh`
     - **On the tracker:** WI#456 stays open until the affected tenant(s) on the reporting host get `build-kimi-worker` + `start-tenant` (maintainer step). The runbook in `docs/ops/WORKER-CONTAINERS.md` and `docs/ops/ITEM93_KIMI_WORKER_456.md` document the stale-image class and remediation. ND-3 (Info) noted: a boot-time probe of each configured worker would make WI#456 visible before the first job — worth its own work item, not this MR
     - **Admin-store revision:** the dev VM's rootful admin store holds `562a224f491b` (built from `87dc5bc98`, the previous unmerged head); rebuild from the target after merge is the operator step
-94. [ ] similar to 83rd goal but bumping opencode2 and opencode1 and kimicode external worker versions again to new ones.... see work item https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/468 as reference stub. versions to upgrade to are 2.1.4 for opencode2, 1.19.4 for opencode1, and 2.3.3 for kimicode. do all three. gogogo and see https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/482 work item with actual versions in it too
+94. [ ] similar to 83rd goal but bumping opencode2 and opencode1 and kimicode external worker versions again to new ones.... see work item https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/468 as reference stub. versions to upgrade to are 2.1.4 for opencode2, 1.19.4 for opencode1, and 2.3.3 for kimicode. do all three. gogogo and ensure you use the versions written HERE in this goal item - Reference WI is https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/482
 95. [X] (S) Reserved
 96. [x] Another repass of 40th goal. update all release notes draft stuff since its been a bit since last release notes update - last attempt had problems. closed MR with comments to reference: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1879
     - DONE 2026-10-24 (SweetieBot, item-96, branch `sweetiebot/kimi-96-20261024-1115`): re-attempt of !1879 after the run-203 review (verdict REQUEST CHANGES, narrow; notes #11483). The 10 commits of !1879 were replayed unchanged onto the current target, then every run-203 finding fixed. `RELEASE-v2.1.6.0.md` only; `docs/ops/GOAL-96-SALVAGE-NOTES.md` did not exist
@@ -1264,21 +1264,42 @@
 112. [x] (S) RESERVED
 113. [x] (S) RESERVED
 
-## Phase 6 - Operator Notes
+## Phase 6 - Initial Operator Notes
 
-114. [x] (S) check earlier ops notes i left from before
-115. [x] (S) NOTE TO LOOK AT ALL GOALS AGAIN AND REORG
-116. [x] (S) NOTE TO RECHECK ALL WIS WITH TAG FOR 2.1.6.0
-117. [x] (H) Revamped LunarWing TUI REPLv3 utilizing OpenTUI, Multimodal input/output, and more
+114. [x] (S) Reserved
+115. [x] (S) Reserved
+116. [x] (S) Reserved
+117. [x] (H) Reserved
 118. [x] (H) Remaining polish items from massive changes introduced in `Tsuno`
-119. [x] (H) General Agent Loop Engine Polish
-120. [x] (H) OPERATOR NOTE: Start the gallop
+119. [x] (H) Reserved
+120. [x] (H) Reserved
 121. [x] (S) Reserved
 122. [x] (H) Deploy the stoplight system
 
 ## Phase 7 - Gauntlets (for work items, see comments on work items in addition to reading full descriptions)
 
-123. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/442
+123. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/442 - rejected - see last attempt on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1974 - address findings and blockers in comments
 124. [x] (S) Reserved
+
+## Phase 8 - Advanced Operator Notes
+
+125. [x] (S) check earlier ops notes i left from before
+126. [x] (S) NOTE TO LOOK AT ALL GOALS AGAIN AND REORG
+127. [x] (S) NOTE TO RECHECK ALL WIS WITH TAG FOR 2.1.6.0
+128. [x] (H) Revamped LunarWing TUI REPLv3 utilizing OpenTUI, Multimodal input/output, and more
+129. [x] (H) Remaining polish items from massive changes introduced in `Tsuno`
+130. [x] (H) General Agent Loop Engine Polish
+131. [x] (H) OPERATOR NOTE: Start the gallop
+132. [x] (S) Reserved
+133. [x] (H) Deploy the stoplight system
+134. [x] (H) Deploy the stoplight system
+135. [x] (H) Deploy the stoplight system
+136. [x] (H) Deploy the stoplight system
+137. [x] (H) Deploy the stoplight system
+138. [x] (H) Deploy the stoplight system
+139. [x] (H) Deploy the stoplight system
+140. [x] (H) Deploy the stoplight system
+141. [x] (H) Deploy the stoplight system
+142. [x] (S) Reserved
 
 ---
