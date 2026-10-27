@@ -531,7 +531,7 @@ class BuildScriptWiringTests(unittest.TestCase):
 class GoParserPolicyTests(unittest.TestCase):
     PARSER_DIR = ROOT / ".gitlab" / "go" / "dockerfile-parse"
 
-    def test_module_is_pinned_to_the_candidate_buildkit(self):
+    def test_module_is_pinned_to_the_reviewed_parser_buildkit(self):
         go_mod = (self.PARSER_DIR / "go.mod").read_text(encoding="utf-8")
         self.assertIn("github.com/moby/buildkit v0.34.1", go_mod)
         go_sum = (self.PARSER_DIR / "go.sum").read_text(encoding="utf-8")
