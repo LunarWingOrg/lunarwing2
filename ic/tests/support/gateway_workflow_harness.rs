@@ -246,6 +246,7 @@ impl GatewayWorkflowHarness {
             ws_idle_timeout_secs: 120,
             voice: None,
             voice_rate_limiter: lunarwing::channels::web::server::PerUserRateLimiter::new(10, 60),
+            context_manager: None,
         });
 
         let mut agent = Agent::new(

@@ -764,6 +764,14 @@ pub struct JobDetailResponse {
     /// The kind of job: "sandbox" or "agent".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub job_kind: Option<String>,
+    /// WI#475: live runtime state the sandbox record does not carry. `stuck`
+    /// is set when the daemon flagged the job; `repair_attempts` counts the
+    /// state flips self-repair performed on it. Absent when the daemon has no
+    /// in-memory context for the job (restart, eviction).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stuck: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repair_attempts: Option<u32>,
 }
 
 // --- Project Files ---

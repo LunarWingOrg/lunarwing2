@@ -205,6 +205,21 @@ pub async fn jobs_detail_handler(
                     None => false,
                 };
 
+            // WI#475: surface the live `stuck` / `repair_attempts` state when
+            // the daemon has an in-memory context for this job. The DB sandbox
+            // row carries neither, so absent context (restart/eviction) leaves
+            // them `None`.
+            let (stuck, repair_attempts) = match state.context_manager.as_ref() {
+                Some(cm) => match cm.get_context(job_id).await {
+                    Ok(ctx) => (
+                        Some(ctx.state == crate::context::JobState::Stuck),
+                        Some(ctx.repair_attempts),
+                    ),
+                    Err(_) => (None, None),
+                },
+                None => (None, None),
+            };
+
             return Ok(Json(JobDetailResponse {
                 id: job.id,
                 title: job.task.clone(),
@@ -222,6 +237,8 @@ pub async fn jobs_detail_handler(
                 can_restart: state.job_manager.is_some(),
                 can_prompt,
                 job_kind: Some("sandbox".to_string()),
+                stuck,
+                repair_attempts,
             }));
         }
         Ok(None) => {}
@@ -250,6 +267,19 @@ pub async fn jobs_detail_handler(
                 ctx.state,
                 crate::context::JobState::Pending | crate::context::JobState::InProgress
             );
+            // WI#475: prefer live in-memory state when present (it carries the
+            // current stuck flag and attempt count); fall back to the
+            // DB-reconstructed context's persisted `repair_attempts`.
+            let (stuck, repair_attempts) = match state.context_manager.as_ref() {
+                Some(cm) => match cm.get_context(job_id).await {
+                    Ok(live) => (
+                        Some(live.state == crate::context::JobState::Stuck),
+                        Some(live.repair_attempts),
+                    ),
+                    Err(_) => (None, Some(ctx.repair_attempts)),
+                },
+                None => (None, Some(ctx.repair_attempts)),
+            };
             Ok(Json(JobDetailResponse {
                 id: ctx.job_id,
                 title: ctx.title.clone(),
@@ -267,6 +297,8 @@ pub async fn jobs_detail_handler(
                 can_restart: state.scheduler.is_some(),
                 can_prompt: is_promptable && state.scheduler.is_some(),
                 job_kind: Some("agent".to_string()),
+                stuck,
+                repair_attempts,
             }))
         }
         Ok(None) => Err((StatusCode::NOT_FOUND, "Job not found".to_string())),

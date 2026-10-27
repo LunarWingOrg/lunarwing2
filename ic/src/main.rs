@@ -869,6 +869,7 @@ async fn async_main() -> anyhow::Result<()> {
         if let Some(ref manager) = external_worker_manager {
             gw = gw.with_external_worker_manager(Arc::clone(manager));
         }
+        gw = gw.with_context_manager(Arc::clone(&components.context_manager));
         gw = gw.with_scheduler(scheduler_slot.clone());
         gw = gw.with_routine_engine_slot(Arc::clone(&shared_routine_engine_slot));
         if let Some(ref sr) = components.skill_registry {

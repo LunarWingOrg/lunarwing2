@@ -227,6 +227,7 @@ async fn start_test_server_with_provider(
         ws_idle_timeout_secs: 120,
         voice: None,
         voice_rate_limiter: lunarwing::channels::web::server::PerUserRateLimiter::new(10, 60),
+        context_manager: None,
     });
 
     let auth = lunarwing::channels::web::auth::MultiAuthState::single(
@@ -741,6 +742,7 @@ async fn test_no_llm_provider_returns_503() {
         ws_idle_timeout_secs: 120,
         voice: None,
         voice_rate_limiter: lunarwing::channels::web::server::PerUserRateLimiter::new(10, 60),
+        context_manager: None,
     });
 
     let auth = lunarwing::channels::web::auth::MultiAuthState::single(
