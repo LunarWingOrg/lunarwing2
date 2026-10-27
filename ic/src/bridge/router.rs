@@ -11224,8 +11224,6 @@ pub(crate) mod tests {
         owner: &str,
         rows: &[(&str, &str)],
     ) -> uuid::Uuid {
-        use crate::db::ConversationStore;
-
         let conv = db
             .create_conversation("gateway", owner, None)
             .await
@@ -11316,40 +11314,53 @@ pub(crate) mod tests {
 
         let v1_conv = seed_v1_history(&db, "alice", &[("user", "pre-switch question")]).await;
 
-        // The surface already existed — this message did not create it, the
-        // shape every already-switched tenant hits on the first message after
-        // this lands.
+        // First message after the switch creates the engine surface and,
+        // because it is new, imports the pre-switch rows once.
         let (conv_id, created) = state
             .conversation_manager
             .get_or_create_conversation_with_created("gateway", "alice")
             .await
-            .expect("existing engine surface");
-        assert!(!created, "the second lookup reuses the surface");
+            .expect("first lookup creates the surface");
+        assert!(created, "the first lookup creates the surface");
+        let imported =
+            v1_history_import::import_v1_history_if_needed(&state, conv_id, v1_conv, "alice", true)
+                .await;
+        assert_eq!(imported, 1, "the brand-new surface backfills once");
 
-        let imported = v1_history_import::import_v1_history_if_needed(
+        // The tenant is now on Engine V2. A second message reuses the surface
+        // (created == false), so the import must NOT backfill again even if the
+        // marker is somehow absent — the new-surface gate is the real guard,
+        // not just the marker.
+        let (conv_id_again, created_again) = state
+            .conversation_manager
+            .get_or_create_conversation_with_created("gateway", "alice")
+            .await
+            .expect("second lookup reuses the surface");
+        assert_eq!(conv_id_again, conv_id, "the same surface is reused");
+        assert!(!created_again, "the second lookup did not create a surface");
+
+        db.update_conversation_metadata_field(
+            v1_conv,
+            v1_history_import::IMPORTED_MARKER,
+            &serde_json::Value::Null,
+        )
+        .await
+        .expect("clear marker");
+        let imported_again = v1_history_import::import_v1_history_if_needed(
             &state, conv_id, v1_conv, "alice", false,
         )
         .await;
 
-        assert_eq!(imported, 0, "an existing surface never backfills");
+        assert_eq!(imported_again, 0, "an existing surface never backfills");
         let surface = state
             .conversation_manager
             .get_conversation(conv_id)
             .await
             .expect("engine surface");
-        assert!(
-            surface.entries.is_empty(),
-            "no pre-switch rows are prepended to a surface the user already chats on"
-        );
-        let metadata = db
-            .get_conversation_metadata(v1_conv)
-            .await
-            .expect("v1 metadata")
-            .expect("metadata row exists");
         assert_eq!(
-            metadata.get(v1_history_import::IMPORTED_MARKER),
-            Some(&serde_json::json!(true)),
-            "the marker is recorded so later turns skip the read"
+            surface.entries.len(),
+            1,
+            "no extra rows are prepended to a surface the user already chats on"
         );
     }
 
@@ -11415,7 +11426,6 @@ pub(crate) mod tests {
     async fn v1_history_import_skips_rows_written_after_the_surface_existed() {
         let (state, db, _temp) = make_v1_import_test_state().await;
 
-        use crate::db::ConversationStore;
         let v1_conv = db
             .create_conversation("gateway", "alice", None)
             .await
