@@ -224,11 +224,6 @@ impl VettedHttpTarget {
     }
 }
 
-/// Validate an HTTP target without retaining its vetted DNS result.
-pub(crate) fn reject_private_ip(url: &str) -> Result<(), String> {
-    vet_http_target(url).map(|_| ())
-}
-
 /// Resolve and validate every address before connecting. HTTP callers must pass
 /// the result to [`VettedHttpTarget::pin_client`] on the same request's client.
 pub(crate) fn vet_http_target(url: &str) -> Result<VettedHttpTarget, String> {
