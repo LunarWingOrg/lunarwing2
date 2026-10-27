@@ -207,6 +207,24 @@ pub struct JobContext {
     /// detection measures from this stamp, falling back to `started_at` when
     /// no activity was ever recorded.
     pub last_activity_at: Option<DateTime<Utc>>,
+    /// Name of the external worker running this job (`kimi`, `pebble`, …),
+    /// set when the job is dispatched to `external:<name>` mode (WI#475).
+    ///
+    /// Stuck detection uses it to apply the (larger) external-worker idle
+    /// threshold and to describe the job truthfully in recovery messages:
+    /// an external task is never retried by the daemon.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_worker: Option<String>,
+    /// When the external worker last emitted a synthetic heartbeat waiting
+    /// on its CLI (WI#475).
+    ///
+    /// Kept separate from `last_activity_at` on purpose: WI#263 uses that
+    /// stamp as "genuine evidence" and heartbeats must stay out of it. The
+    /// external-worker idle baseline takes the maximum of the two, because a
+    /// heartbeat proves the executor is alive and the worker's own per-attempt
+    /// LLM deadline (WI#477) bounds a wedged CLI from the worker side.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_worker_heartbeat_at: Option<DateTime<Utc>>,
     /// Number of repair attempts.
     pub repair_attempts: u32,
     /// State transition history.
@@ -280,6 +298,8 @@ impl JobContext {
             started_at: None,
             completed_at: None,
             last_activity_at: None,
+            external_worker: None,
+            last_worker_heartbeat_at: None,
             repair_attempts: 0,
             transitions: Vec::new(),
             extra_env: Arc::new(HashMap::new()),
@@ -430,6 +450,36 @@ impl JobContext {
             return;
         }
         self.last_activity_at = Some(Utc::now());
+    }
+
+    /// Record a synthetic external-worker heartbeat (WI#475).
+    ///
+    /// Kept apart from [`note_activity`] so WI#263's genuine-evidence stamp
+    /// keeps its meaning, while external-worker idle detection can still tell
+    /// "the executor is alive and waiting on its CLI" from "nothing at all".
+    /// Ignored for terminal jobs, like [`note_activity`].
+    pub fn note_worker_heartbeat(&mut self) {
+        if self.state.is_terminal() {
+            return;
+        }
+        self.last_worker_heartbeat_at = Some(Utc::now());
+    }
+
+    /// Whether this job is dispatched to an external worker (`external:*` mode).
+    pub fn is_external_worker_job(&self) -> bool {
+        self.external_worker.is_some()
+    }
+
+    /// Idle baseline used by stuck detection: the latest of genuine activity,
+    /// the worker heartbeat, and (as a last resort) the start stamp.
+    pub fn idle_baseline(&self) -> Option<DateTime<Utc>> {
+        let mut baseline = self.last_activity_at;
+        if let Some(heartbeat) = self.last_worker_heartbeat_at
+            && baseline.is_none_or(|current| heartbeat > current)
+        {
+            baseline = Some(heartbeat);
+        }
+        baseline.or(self.started_at)
     }
 
     /// Attempt to recover from stuck state.

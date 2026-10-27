@@ -249,6 +249,10 @@ impl Store {
                     // Not persisted yet (WI#263): idle detection falls back to
                     // started_at for contexts reconstructed from the DB.
                     last_activity_at: None,
+                    // WI#475: external-worker identity and heartbeats are
+                    // runtime-only; a DB-reconstructed agent job is internal.
+                    external_worker: None,
+                    last_worker_heartbeat_at: None,
                     transitions: Vec::new(), // Not loaded from DB for now
                     metadata: serde_json::Value::Null,
                     prompt_context: std::sync::Arc::from([]),

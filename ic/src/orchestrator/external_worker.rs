@@ -2256,12 +2256,28 @@ async fn run_external_task(
                                 // Still waiting…" keep-alive). A wedged CLI
                                 // emits nothing at all while its heartbeat
                                 // claims the task is active, so heartbeats
-                                // must not refresh the idle baseline used by
-                                // stuck detection.
-                                if is_genuine_progress(&progress.delta)
-                                    && let Some(cm) = context_manager
-                                {
-                                    let _ = cm.update_context(job_id, |ctx| ctx.note_activity()).await;
+                                // must not refresh the genuine-evidence
+                                // baseline used by stuck detection.
+                                //
+                                // WI#475: an external job's heartbeat is
+                                // still evidence that the *executor* is
+                                // alive and waiting on its CLI; it feeds the
+                                // separate `last_worker_heartbeat_at` stamp
+                                // and the larger external-worker idle
+                                // threshold keeps a slow-LLM task out of
+                                // self-repair while a totally silent worker
+                                // still trips it.
+                                if let Some(cm) = context_manager {
+                                    let genuine = is_genuine_progress(&progress.delta);
+                                    let _ = cm
+                                        .update_context(job_id, |ctx| {
+                                            if genuine {
+                                                ctx.note_activity();
+                                            } else {
+                                                ctx.note_worker_heartbeat();
+                                            }
+                                        })
+                                        .await;
                                 }
 
                                 // WI#267: heartbeats are not evidence. They
