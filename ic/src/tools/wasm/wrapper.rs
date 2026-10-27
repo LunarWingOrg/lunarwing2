@@ -5150,7 +5150,8 @@ mod tests {
     fn test_reject_private_ip_loopback() {
         let result = super::vet_http_target("https://127.0.0.1:8080/api");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("private/internal IP"));
+        let error = result.err().expect("loopback must be refused");
+        assert!(error.contains("private/internal IP"));
     }
 
     #[test]
