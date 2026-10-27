@@ -1093,7 +1093,7 @@ async fn reconcile_pending_gate_state(
 /// waiting-thread liveness rule must not apply to it. Such gates stay
 /// actionable until expiry (WI#332, MR !1528 DJ-1).
 fn gate_outlives_thread(gate: &PendingGate) -> bool {
-    gate.action_name == "authentication_fallback" && gate.original_message.is_some()
+    gate.outlives_thread()
 }
 
 /// A pending gate stays actionable only while its owning thread is parked on
