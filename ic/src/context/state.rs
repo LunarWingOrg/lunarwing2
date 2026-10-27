@@ -591,6 +591,61 @@ mod tests {
         assert_eq!(ctx.last_activity_at, before);
     }
 
+    /// WI#475: the external-worker heartbeat stamp is kept apart from the
+    /// WI#263 genuine-evidence stamp, and both feed the idle baseline (the
+    /// later of the two winning), falling back to `started_at`.
+    #[test]
+    fn test_note_worker_heartbeat_tracking() {
+        let mut ctx = JobContext::new("Test", "External");
+        assert!(ctx.last_worker_heartbeat_at.is_none());
+
+        ctx.transition_to(JobState::InProgress, None).unwrap();
+
+        // Heartbeats never touch the genuine-evidence stamp.
+        ctx.note_worker_heartbeat();
+        assert!(ctx.last_worker_heartbeat_at.is_some());
+        assert!(ctx.last_activity_at.is_none());
+
+        // A terminal job stops accepting heartbeats too.
+        ctx.transition_to(JobState::Failed, None).unwrap();
+        let before = ctx.last_worker_heartbeat_at;
+        ctx.note_worker_heartbeat();
+        assert_eq!(ctx.last_worker_heartbeat_at, before);
+    }
+
+    #[test]
+    fn test_idle_baseline_prefers_latest_stamp() {
+        let mut ctx = JobContext::new("Test", "External");
+        ctx.transition_to(JobState::InProgress, None).unwrap();
+        let started = ctx.started_at;
+        assert_eq!(
+            ctx.idle_baseline(),
+            started,
+            "no stamps yet: fall back to started_at"
+        );
+
+        let old = Utc::now() - chrono::Duration::seconds(600);
+        let fresh = Utc::now() - chrono::Duration::seconds(10);
+
+        // Heartbeat newer than genuine activity must win.
+        ctx.last_activity_at = Some(old);
+        ctx.last_worker_heartbeat_at = Some(fresh);
+        assert_eq!(ctx.idle_baseline(), Some(fresh));
+
+        // …and the reverse ordering too.
+        ctx.last_activity_at = Some(fresh);
+        ctx.last_worker_heartbeat_at = Some(old);
+        assert_eq!(ctx.idle_baseline(), Some(fresh));
+    }
+
+    #[test]
+    fn test_is_external_worker_job() {
+        let mut ctx = JobContext::new("Test", "External");
+        assert!(!ctx.is_external_worker_job());
+        ctx.external_worker = Some("kimi".to_string());
+        assert!(ctx.is_external_worker_job());
+    }
+
     #[test]
     fn test_job_context_transitions() {
         let mut ctx = JobContext::new("Test", "Test job");
