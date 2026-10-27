@@ -43,6 +43,16 @@ sudo() {
 }
 
 mkdir -p "$fixture/env" "$fixture/state" "$fixture/home/lunarwing"
+# WI#424 control 1: `render_worker_quadlet` refuses to render without prepared
+# egress state (production always runs `prepare_worker_egress` first). This
+# harness renders the Quadlet directly, so it seeds the same fixture contract
+# the image-contract and lifecycle harnesses use: a recorded subnet plus a
+# static-hosts file under a fixture egress dir.
+# shellcheck disable=SC2034  # read by the sourced egress helpers
+WORKER_EGRESS_DIR="$fixture/egress"
+mkdir -p "$WORKER_EGRESS_DIR"
+printf 'SUBNET=10.89.10.0/24\n' >"$WORKER_EGRESS_DIR/root.conf"
+: >"$WORKER_EGRESS_DIR/root.hosts"
 # The tenant-side readers/writers require a private env parent (and a private
 # env file) owned by the fixture tenant, which is the invoking root account.
 chmod 700 "$fixture/env"

@@ -24,6 +24,22 @@
 # Rate-limit state directory (shared between gateway and health check).
 #RATELIMIT_DIR="/var/lib/lunarwing/ratelimit"
 
+# WI#424 worker egress audit: health-worker-egress.sh performs its own
+# read-only, host-side audit from the root-owned health lib (it never runs an
+# operator checkout from cron). No mt-admin path is needed. Each per-observation
+# runtime/nft read is bounded (default 8 seconds).
+#
+# HEALTH_WORKER_EGRESS_RUNTIME / HEALTH_WORKER_EGRESS_ROOTLESS are written by
+# mt-admin into /etc/lunarwing/health.env (and reconciled on upgrade) with the
+# runtime and launch mode it provisions workers under. Leave them at `auto` only
+# on a hand-maintained install: `auto` guesses rootless whenever podman exists,
+# which is wrong on a rootful-podman host (LUNARWING_MT_ROOTLESS=false) and
+# makes the audit report running tenants critical.
+#LUNARWING_MT_WORKER_EGRESS_DIR="/etc/lunarwing/worker-egress"
+#HEALTH_WORKER_EGRESS_TIMEOUT=8
+#HEALTH_WORKER_EGRESS_RUNTIME="auto"
+#HEALTH_WORKER_EGRESS_ROOTLESS="auto"
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Notification
 # ═════════════════════════════════════════════════════════════════════════════

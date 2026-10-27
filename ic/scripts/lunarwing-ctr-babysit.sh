@@ -1,28 +1,38 @@
 #!/bin/sh
-# lunarwing-ctr-babysit — podman wait babysitter for rootless container supervision
-#
-# This script is the foreground command supervised by OpenRC's supervise-daemon.
-# It ensures the container is started, then blocks on `podman wait` until the
-# container exits. When podman wait returns, this script exits, and supervise-daemon
-# respawns it (which starts the container again).
-#
-# Usage: lunarwing-ctr-babysit <container-name>
-#
-# Environment required (provided by OpenRC start_pre):
-#   HOME, XDG_RUNTIME_DIR — rootless podman environment
-
+# lunarwing-ctr-babysit — rootless container supervision for OpenRC.
+# Usage: lunarwing-ctr-babysit <container> [egress-guard ruleset chain]
 set -eu
 
-ctr="${1:-}"
-if [ -z "${ctr}" ]; then
-    echo "usage: lunarwing-ctr-babysit <container-name>" >&2
+if [ "$#" -ne 1 ] && [ "$#" -ne 4 ]; then
+    echo "usage: lunarwing-ctr-babysit <container> [egress-guard ruleset chain]" >&2
     exit 1
 fi
+ctr="$1"
+guard="${2:-}"
+ruleset="${3:-}"
+chain="${4:-}"
 
-# Ensure container is started (idempotent; no-op if already running)
-podman start "${ctr}" >/dev/null 2>&1 || true
+if [ "$#" -eq 4 ]; then
+    [ -x "$guard" ] || {
+        echo "worker egress guard is missing or not executable: $guard" >&2
+        exit 1
+    }
+    "$guard" "$ruleset" rootless "$chain"
+fi
 
-# Block until container exits. `podman wait` exits 0 when the container stops
-# (regardless of the container's own exit code), which supervise-daemon treats
-# as the command exiting, so it respawns the babysitter and restarts the container.
-exec podman wait "${ctr}"
+# Non-worker callers retain the historical idempotent best-effort start. Worker
+# starts fail closed: a guard was required above, and a failed start must not be
+# followed by a successful-looking podman wait/respawn cycle.
+if ! podman start "$ctr" >/dev/null 2>&1; then
+    [ "$#" -eq 1 ] || exit 1
+fi
+
+if [ "$#" -eq 4 ]; then
+    if ! "$guard" --verify "$ruleset" rootless "$chain"; then
+        podman stop "$ctr" >/dev/null 2>&1 || true
+        echo "worker egress filter vanished after $ctr started; stopped it" >&2
+        exit 1
+    fi
+fi
+
+exec podman wait "$ctr"
