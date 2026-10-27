@@ -28,13 +28,13 @@ use crate::tools::wasm::credential_injector::{
 };
 use crate::tools::wasm::error::WasmError;
 use crate::tools::wasm::host::{HostState, LogLevel};
-#[cfg(test)]
-use crate::tools::wasm::http_security::is_private_ip;
 use crate::tools::wasm::http_security::{
     RedactionNeedle, collect_capped_response_body, enforce_response_size,
     private_http_targets_allowed, push_credential_needles, redact_cross_field_echoes,
-    redact_text_with_needles, reject_private_ip, replace_all_bytes, sort_redaction_needles,
+    redact_text_with_needles, replace_all_bytes, sort_redaction_needles, vet_http_target,
 };
+#[cfg(test)]
+use crate::tools::wasm::http_security::{is_private_ip, reject_private_ip};
 use crate::tools::wasm::limits::{ResourceLimits, WasmResourceLimiter};
 use crate::tools::wasm::runtime::{EPOCH_TICK_INTERVAL, PreparedModule, WasmToolRuntime};
 
@@ -642,16 +642,18 @@ impl StoreData {
             .map(|h| h.max_response_bytes)
             .unwrap_or(10 * 1024 * 1024);
 
-        // Host-scoped sidecars are tied to an exact configured origin and /v1/
-        // path above. Other private targets require the WASM-specific opt-in;
-        // the daemon's database/network setting must not disable this guard.
-        let host_scoped_service = self
-            .scoped_http_prefix
-            .as_deref()
-            .is_some_and(|prefix| url_matches_scoped_prefix(&url, prefix));
-        if !host_scoped_service && !self.allow_private_ips {
-            reject_private_ip(&url)?;
-        }
+        // Only local host-scoped sidecars are exempt, tied to their exact
+        // configured origin and /v1/ path above. Other private targets require
+        // the WASM-specific opt-in, never the daemon's general network setting.
+        let host_scoped_service = self.scoped_http_prefix.as_deref().is_some_and(|prefix| {
+            url_matches_scoped_prefix(&url, prefix)
+                && url::Url::parse(prefix).is_ok_and(|parsed| is_local_service_url(&parsed))
+        });
+        let vetted_target = if !host_scoped_service && !self.allow_private_ips {
+            Some(vet_http_target(&url)?)
+        } else {
+            None
+        };
 
         // Make HTTP request using a dedicated single-threaded runtime.
         // We're inside spawn_blocking, so we can't rely on the main runtime's
@@ -725,6 +727,10 @@ impl StoreData {
             let client_builder = reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
                 .redirect(reqwest::redirect::Policy::none());
+            let client_builder = match &vetted_target {
+                Some(target) => target.pin_client(client_builder),
+                None => client_builder,
+            };
             let client_builder = if bypass_proxy {
                 client_builder.no_proxy()
             } else {
@@ -2038,18 +2044,24 @@ async fn refresh_oauth_token(
         );
         return false;
     }
-    if let Err(reason) = reject_private_ip(&config.token_url) {
-        tracing::warn!(
-            token_url = %config.token_url,
-            reason = %reason,
-            "OAuth token_url points to a private/internal IP, refusing token refresh"
-        );
-        return false;
-    }
+    let vetted_target = match vet_http_target(&config.token_url) {
+        Ok(target) => target,
+        Err(reason) => {
+            tracing::warn!(
+                token_url = %config.token_url,
+                reason = %reason,
+                "OAuth token_url points to a private/internal IP, refusing token refresh"
+            );
+            return false;
+        }
+    };
 
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .redirect(reqwest::redirect::Policy::none())
+    let client = match vetted_target
+        .pin_client(
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .redirect(reqwest::redirect::Policy::none()),
+        )
         .build()
     {
         Ok(c) => c,
@@ -3636,6 +3648,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(response.status, 200);
+    }
+
+    #[test]
+    fn wi432_remote_sidecar_scope_does_not_bypass_private_guard() {
+        use super::lunarwing::agent::host::Host as _;
+        use crate::tools::wasm::capabilities::{EndpointPattern, HttpCapability};
+
+        let capabilities = Capabilities::default().with_http(HttpCapability::new(vec![
+            EndpointPattern::host("192.168.1.20").with_path_prefix("/v1/"),
+        ]));
+        let mut store = StoreData::new(1024 * 1024, capabilities, HashMap::new(), Vec::new());
+        store.allow_private_ips = false;
+        store.scoped_http_prefix = Some("https://192.168.1.20/v1/".to_string());
+
+        let error = store
+            .http_request(
+                "POST".to_string(),
+                "https://192.168.1.20/v1/ocr".to_string(),
+                "{}".to_string(),
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("private/internal IP"), "{error}");
     }
 
     /// WI#395 (GN-6/GN-7): the trait boundary applies one redaction over the
