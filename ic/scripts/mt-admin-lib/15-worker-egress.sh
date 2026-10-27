@@ -466,10 +466,17 @@ if not subnet:
         gateway = gateway or ci(item, "gateway", "")
 options = ci(net, "options", {}) or {}
 interface = ci(net, "network_interface", "") or ci(options, "com.docker.network.bridge.name", "")
-dns_disabled = ci(net, "dns_enabled", None) is False if runtime == "podman" else True
+# OQ-5: only podman exposes whether its embedded resolver is off. Docker
+# user-defined networks always run it and forward to the --dns servers, so its
+# DNS state is not observable here; report it as unverified instead of claiming
+# `disabled`.
+if runtime == "podman":
+    dns_state = "disabled" if ci(net, "dns_enabled", None) is False else "enabled"
+else:
+    dns_state = "unverified"
 print(subnet)
 print(interface)
-print("disabled" if dns_disabled else "enabled")
+print(dns_state)
 print(gateway)
 ' "$CONTAINER_RT" <<<"$json"
 }
@@ -493,8 +500,15 @@ worker_egress_ensure() {
       || die "worker egress network '$network' has subnet '${fields[0]}', expected '$subnet'; recreate it"
     [[ "${fields[1]}" == "$bridge" ]] \
       || die "worker egress network '$network' has bridge '${fields[1]}', expected '$bridge'; recreate it"
-    [[ "${fields[2]}" == "disabled" ]] \
-      || die "worker egress network '$network' still has recursive DNS enabled; recreate it"
+    # OQ-5: podman must prove recursive DNS is off; docker's embedded resolver
+    # is unobservable, so `unverified` is the most it can report.
+    case "${fields[2]}" in
+      disabled) ;;
+      unverified)
+        [[ "$CONTAINER_RT" == "docker" ]] \
+          || die "worker egress network '$network' reported unverified DNS on $CONTAINER_RT; recreate it" ;;
+      *) die "worker egress network '$network' still has recursive DNS enabled; recreate it" ;;
+    esac
     [[ "${fields[3]}" == "$(_worker_egress_gateway "$subnet")" ]] \
       || die "worker egress network '$network' has gateway '${fields[3]}', expected '$(_worker_egress_gateway "$subnet")'; recreate it"
   else
@@ -653,7 +667,9 @@ worker_egress_audit() {
     details="$(worker_egress_network_details "$name" "$network")" || missing=1
     if [[ -n "$details" ]]; then
       say "  network contract: $details"
-      [[ "$details" == "$subnet"$'\n'"$(_worker_egress_bridge_for_subnet "$subnet")"$'\n'disabled$'\n'"$(_worker_egress_gateway "$subnet")" ]] \
+      local expected_dns="disabled"
+      [[ "$CONTAINER_RT" == "docker" ]] && expected_dns="unverified"
+      [[ "$details" == "$subnet"$'\n'"$(_worker_egress_bridge_for_subnet "$subnet")"$'\n'"$expected_dns"$'\n'"$(_worker_egress_gateway "$subnet")" ]] \
         || missing=1
     fi
   else

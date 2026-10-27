@@ -341,6 +341,15 @@ else
 fi
 CTR_NETWORK_EXISTS=true
 
+# OQ-5: docker's embedded resolver is unobservable. An existing docker network
+# must audit as `unverified` (never a bogus `disabled` claim), and podman must
+# still refuse anything that is not verifiably `disabled`.
+if (CONTAINER_RT=docker MT_ROOTLESS=false worker_egress_ensure alpha) >/dev/null 2>&1; then
+  pass "an existing docker network audits as unverified DNS (OQ-5)"
+else
+  fail "docker network ensure rejected an unverified-DNS contract"
+fi
+
 worker_egress_apply alpha >/dev/null
 CTR_NETWORKS=lw-egress-alpha
 CTR_DNS=127.0.0.1
