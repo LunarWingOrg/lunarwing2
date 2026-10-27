@@ -910,6 +910,80 @@ mod jobs_isolation {
         );
     }
 
+    async fn get_job_endpoint(app: Router, uri: &str) -> serde_json::Value {
+        let req = Request::builder()
+            .uri(uri)
+            .header("Authorization", "Bearer tok-alice")
+            .body(Body::empty())
+            .unwrap(); // safety: test-only request builder
+        let resp = app.oneshot(req).await.unwrap(); // safety: test-only
+        assert_eq!(resp.status(), StatusCode::OK); // safety: test-only
+        let bytes = axum::body::to_bytes(resp.into_body(), 16384).await.unwrap(); // safety: test-only
+        serde_json::from_slice(&bytes).unwrap() // safety: test-only
+    }
+
+    #[tokio::test]
+    async fn test_jobs_cancel_external_synchronizes_context_and_stuck_sweep() {
+        use crate::agent::{DefaultSelfRepair, SelfRepair};
+        use crate::config::ExternalWorkerConfig;
+        use crate::context::{ContextManager, JobState};
+        use crate::orchestrator::ExternalWorkerManager;
+
+        let (db, _dir) = test_db().await;
+        let mut job = make_sandbox_job("alice", "external cancellation");
+        job.status = "running".to_string();
+        job.success = None;
+        job.completed_at = None;
+        job.job_mode = "external:harness".to_string();
+        db.save_sandbox_job(&job).await.unwrap();
+
+        let cm = Arc::new(ContextManager::new(10));
+        cm.register_sandbox_job(job.id, "alice", "external cancellation", "desc")
+            .await
+            .unwrap();
+        cm.update_context(job.id, |ctx| ctx.transition_to(JobState::Stuck, None))
+            .await
+            .unwrap()
+            .unwrap();
+        let repair = DefaultSelfRepair::new(Arc::clone(&cm), Duration::from_secs(0), 3);
+        assert_eq!(repair.detect_stuck_jobs().await.len(), 1);
+
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let ewm = Arc::new(
+            ExternalWorkerManager::new(vec![ExternalWorkerConfig::test_config(
+                "harness",
+                "ws://127.0.0.1:9/ws/agent",
+            )])
+            .with_event_deps(events, Arc::clone(&cm)),
+        );
+        ewm.reserve_task(job.id, "harness", "alice").await.unwrap();
+        let state = build_state_ex(Some(db.clone()), None, Some(ewm));
+        let app = jobs_router(state, two_user_auth());
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/jobs/{}/cancel", job.id))
+            .header("Authorization", "Bearer tok-alice")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let stored = db.get_sandbox_job(job.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, "cancelled");
+        let context = cm.get_context(job.id).await.unwrap();
+        assert_eq!(context.state, JobState::Cancelled);
+
+        let detail = get_job_endpoint(app.clone(), &format!("/api/jobs/{}", job.id)).await;
+        assert_eq!(detail["state"], "cancelled");
+        let summary = get_job_endpoint(app, "/api/jobs/summary").await;
+        assert_eq!(summary["total"], 1);
+        assert_eq!(summary["in_progress"], 0);
+        assert_eq!(summary["stuck"], 0);
+        assert_eq!(summary["failed"], 1);
+        assert!(repair.detect_stuck_jobs().await.is_empty());
+    }
+
     // ── WI#479: job_mode on the list endpoint ──────────────────────────
 
     async fn list_jobs(app: Router, uri: &str) -> serde_json::Value {

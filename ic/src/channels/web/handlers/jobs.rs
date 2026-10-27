@@ -328,6 +328,49 @@ pub async fn jobs_detail_handler(
     }
 }
 
+async fn cancel_external_job(
+    state: &GatewayState,
+    job_id: Uuid,
+) -> Result<bool, (StatusCode, String)> {
+    let manager = state.external_worker_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "External worker manager not available".to_string(),
+    ))?;
+    let context_manager = manager.context_manager_handle().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Job context manager not available".to_string(),
+    ))?;
+    if !manager.cancel_task(job_id).await {
+        return Ok(false);
+    }
+
+    context_manager
+        .update_context(job_id, |context| {
+            if context.state == crate::context::JobState::Cancelled {
+                Ok(())
+            } else {
+                context.transition_to(
+                    crate::context::JobState::Cancelled,
+                    Some("Cancelled by user".to_string()),
+                )
+            }
+        })
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load job context for cancellation: {error}"),
+            )
+        })?
+        .map_err(|reason| {
+            (
+                StatusCode::CONFLICT,
+                format!("Job context cannot be cancelled: {reason}"),
+            )
+        })?;
+    Ok(true)
+}
+
 pub async fn jobs_cancel_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
@@ -355,11 +398,7 @@ pub async fn jobs_cancel_handler(
                     .await
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
                 let delivered = if mode.as_deref().is_some_and(|m| m.starts_with("external:")) {
-                    let manager = state.external_worker_manager.as_ref().ok_or((
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "External worker manager not available".to_string(),
-                    ))?;
-                    manager.cancel_task(job_id).await
+                    cancel_external_job(state.as_ref(), job_id).await?
                 } else if let Some(ref manager) = state.job_manager {
                     manager.stop_job(job_id).await.map_err(|error| {
                         (
