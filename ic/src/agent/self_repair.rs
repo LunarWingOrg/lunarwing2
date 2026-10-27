@@ -747,6 +747,135 @@ mod tests {
         );
     }
 
+    /// WI#475: a job past the repair limit surfaces the manual-intervention
+    /// warning exactly once per boot, then a `Retry` (suppressed alert) on
+    /// later sweeps.
+    #[tokio::test]
+    async fn repair_stuck_job_manual_warning_emitted_once() {
+        let cm = Arc::new(ContextManager::new(10));
+        let job_id = cm.create_job("Unrepairable", "desc").await.unwrap();
+        let repair = DefaultSelfRepair::new(cm, Duration::from_secs(60), 2);
+
+        let stuck_job = StuckJob {
+            job_id,
+            last_activity: Utc::now(),
+            stuck_duration: Duration::from_secs(300),
+            last_error: Some("persistent failure".to_string()),
+            repair_attempts: 2, // == max
+            external_worker: None,
+        };
+
+        let first = repair.repair_stuck_job(&stuck_job).await.unwrap();
+        assert!(
+            matches!(first, RepairResult::ManualRequired { .. }),
+            "first sweep: Expected ManualRequired, got: {first:?}"
+        );
+        let second = repair.repair_stuck_job(&stuck_job).await.unwrap();
+        assert!(
+            matches!(second, RepairResult::Retry { .. }),
+            "second sweep: Expected Retry (alert suppressed), got: {second:?}"
+        );
+    }
+
+    /// WI#475: an external job that exceeds the limit names the worker and
+    /// the daemon never claims it "will be retried".
+    #[tokio::test]
+    async fn repair_stuck_external_job_message_is_truthful() {
+        let cm = Arc::new(ContextManager::new(10));
+        let job_id = cm.create_job("External wedged", "desc").await.unwrap();
+        let repair = DefaultSelfRepair::new(cm, Duration::from_secs(60), 2);
+
+        let stuck_job = StuckJob {
+            job_id,
+            last_activity: Utc::now(),
+            stuck_duration: Duration::from_secs(2000),
+            last_error: None,
+            repair_attempts: 2, // == max
+            external_worker: Some("kimi".to_string()),
+        };
+
+        let result = repair.repair_stuck_job(&stuck_job).await.unwrap();
+        match result {
+            RepairResult::ManualRequired { message } => {
+                assert!(message.contains("kimi"), "message names the worker: {message}");
+                assert!(
+                    !message.contains("will be retried"),
+                    "external jobs are not retried by the daemon: {message}"
+                );
+            }
+            other => panic!("Expected ManualRequired, got: {other:?}"),
+        }
+    }
+
+    /// WI#475: a successful external recovery does not claim "retried".
+    #[tokio::test]
+    async fn repair_stuck_external_job_success_is_not_retried() {
+        let cm = Arc::new(ContextManager::new(10));
+        let job_id = cm.create_job("External recoverable", "desc").await.unwrap();
+        cm.update_context(job_id, |ctx| ctx.transition_to(JobState::InProgress, None))
+            .await
+            .unwrap()
+            .unwrap();
+        cm.update_context(job_id, |ctx| ctx.transition_to(JobState::Stuck, None))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let repair = DefaultSelfRepair::new(Arc::clone(&cm), Duration::from_secs(60), 3);
+        let stuck_job = StuckJob {
+            job_id,
+            last_activity: Utc::now(),
+            stuck_duration: Duration::from_secs(120),
+            last_error: None,
+            repair_attempts: 0,
+            external_worker: Some("pebble".to_string()),
+        };
+
+        let result = repair.repair_stuck_job(&stuck_job).await.unwrap();
+        match result {
+            RepairResult::Success { message } => {
+                assert!(message.contains("pebble"));
+                assert!(
+                    !message.contains("will be retried"),
+                    "external recovery must not claim retry: {message}"
+                );
+            }
+            other => panic!("Expected Success, got: {other:?}"),
+        }
+    }
+
+    /// WI#475: once the manual alert went out, `detect_stuck_jobs` no longer
+    /// re-reports the job (no repeated notification on every sweep).
+    #[tokio::test]
+    async fn detect_skips_job_after_manual_alert() {
+        let cm = Arc::new(ContextManager::new(10));
+        let job_id = cm.create_job("Unrepairable", "desc").await.unwrap();
+        cm.update_context(job_id, |ctx| ctx.transition_to(JobState::InProgress, None))
+            .await
+            .unwrap()
+            .unwrap();
+        cm.update_context(job_id, |ctx| {
+            ctx.repair_attempts = 3;
+            ctx.transition_to(JobState::Stuck, None)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        let repair = DefaultSelfRepair::new(cm, Duration::from_secs(0), 2);
+        let first = repair.detect_stuck_jobs().await;
+        assert_eq!(first.len(), 1);
+        let _ = repair
+            .repair_stuck_job(&first[0])
+            .await
+            .unwrap();
+        let second = repair.detect_stuck_jobs().await;
+        assert!(
+            second.is_empty(),
+            "alerted job must not be re-detected: {second:?}"
+        );
+    }
+
     #[tokio::test]
     async fn detect_and_repair_in_progress_job_via_threshold() {
         let cm = Arc::new(ContextManager::new(10));

@@ -857,6 +857,152 @@ mod tests {
         assert_eq!(stuck[0], id);
     }
 
+    /// WI#475 acceptance: a worker that heartbeats every two minutes during a
+    /// ten-minute LLM wait is not declared stuck at the external threshold.
+    #[tokio::test]
+    async fn external_heartbeat_every_two_minutes_is_not_stuck() {
+        let manager = ContextManager::new(10);
+        let external_id = manager
+            .create_job("External slow LLM", "desc")
+            .await
+            .unwrap();
+        let internal_id = manager.create_job("Internal", "desc").await.unwrap();
+
+        for id in [external_id, internal_id] {
+            manager
+                .update_context(id, |ctx| {
+                    ctx.transition_to(crate::context::JobState::InProgress, None)
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            // Both silent since "start" ten minutes ago.
+            manager
+                .update_context(id, |ctx| -> Result<(), crate::error::JobError> {
+                    ctx.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(600));
+                    Ok(())
+                })
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        // The external job heartbeats (the last one two minutes ago).
+        manager
+            .update_context(external_id, |ctx| -> Result<(), crate::error::JobError> {
+                ctx.external_worker = Some("kimi".to_string());
+                ctx.last_worker_heartbeat_at =
+                    Some(chrono::Utc::now() - chrono::Duration::seconds(120));
+                Ok(())
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let stuck = manager
+            .find_stuck_jobs_with_thresholds(
+                Some(Duration::from_secs(300)),
+                Some(Duration::from_secs(1800)),
+            )
+            .await;
+        assert!(
+            !stuck.contains(&external_id),
+            "heartbeat every 2 min must keep a 10-min LLM wait out of repair"
+        );
+        assert!(stuck.contains(&internal_id));
+    }
+
+    /// WI#475: a totally silent external worker still trips its own
+    /// threshold, and the smaller internal threshold applies to internal jobs.
+    #[tokio::test]
+    async fn external_threshold_applies_per_mode() {
+        let manager = ContextManager::new(10);
+        let external_id = manager
+            .create_job("External silent", "desc")
+            .await
+            .unwrap();
+        let internal_id = manager.create_job("Internal silent", "desc").await.unwrap();
+
+        for (id, external) in [(external_id, true), (internal_id, false)] {
+            manager
+                .update_context(id, |ctx| {
+                    ctx.transition_to(crate::context::JobState::InProgress, None)
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            manager
+                .update_context(id, |ctx| -> Result<(), crate::error::JobError> {
+                    ctx.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(600));
+                    if external {
+                        ctx.external_worker = Some("pebble".to_string());
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        // 600 s idle: past the 300 s internal threshold, below the 1800 s
+        // external one — only the internal job is stuck.
+        let stuck = manager
+            .find_stuck_jobs_with_thresholds(
+                Some(Duration::from_secs(300)),
+                Some(Duration::from_secs(1800)),
+            )
+            .await;
+        assert!(!stuck.contains(&external_id));
+        assert!(stuck.contains(&internal_id));
+
+        // Once the external threshold is exceeded too, both are reported.
+        manager
+            .update_context(external_id, |ctx| -> Result<(), crate::error::JobError> {
+                ctx.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(2000));
+                Ok(())
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let stuck = manager
+            .find_stuck_jobs_with_thresholds(
+                Some(Duration::from_secs(300)),
+                Some(Duration::from_secs(1800)),
+            )
+            .await;
+        assert!(stuck.contains(&external_id));
+        assert!(stuck.contains(&internal_id));
+    }
+
+    /// WI#475: when no external threshold is configured, the single threshold
+    /// applies to both kinds (the pre-WI#475 fallback).
+    #[tokio::test]
+    async fn external_jobs_fall_back_to_single_threshold() {
+        let manager = ContextManager::new(10);
+        let id = manager.create_job("External", "desc").await.unwrap();
+        manager
+            .update_context(id, |ctx| {
+                ctx.transition_to(crate::context::JobState::InProgress, None)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        manager
+            .update_context(id, |ctx| -> Result<(), crate::error::JobError> {
+                ctx.external_worker = Some("kimi".to_string());
+                ctx.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(600));
+                Ok(())
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let stuck = manager
+            .find_stuck_jobs_with_threshold(Some(Duration::from_secs(300)))
+            .await;
+        assert!(stuck.contains(&id));
+    }
+
     #[tokio::test]
     async fn active_count_tracks_non_terminal_jobs() {
         let manager = ContextManager::new(10);

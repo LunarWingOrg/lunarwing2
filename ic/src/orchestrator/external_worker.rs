@@ -5040,6 +5040,88 @@ mod tests {
         assert_eq!(stuck[0], job_id);
     }
 
+    /// WI#475: a worker whose genuine evidence is stale, but that keeps
+    /// heartbeating every couple of minutes, is not declared stuck at the
+    /// external threshold. Heartbeats are routed to
+    /// `last_worker_heartbeat_at` and the external idle baseline takes the
+    /// latest of activity/heartbeat.
+    #[tokio::test]
+    async fn heartbeat_only_streams_keep_external_job_out_of_repair() {
+        let cm = std::sync::Arc::new(crate::context::ContextManager::new(10));
+        let job_id = Uuid::new_v4();
+        cm.register_sandbox_job(job_id, "user-1", "task", "desc")
+            .await
+            .unwrap();
+
+        // Mark the job as external and backdate start/genuine activity ten
+        // minutes ago (a slow LLM request waiting on first token).
+        cm.update_context(job_id, |ctx| -> Result<(), crate::error::JobError> {
+            ctx.external_worker = Some("kimi".to_string());
+            ctx.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(600));
+            ctx.last_activity_at = Some(chrono::Utc::now() - chrono::Duration::seconds(600));
+            Ok(())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        // Simulate the orchestrator's progress handler on heartbeat frames
+        // (WI#475: the new branch routes heartbeats to note_worker_heartbeat).
+        let delta = "[worker] Still waiting for Kimi Code response; task remains active.";
+        let genuine = is_genuine_progress(delta);
+        cm.update_context(job_id, |ctx| {
+            if genuine {
+                ctx.note_activity();
+            } else {
+                ctx.note_worker_heartbeat();
+            }
+        })
+        .await
+        .unwrap();
+
+        // Two minutes after start the most recent heartbeat is 120 s old, so
+        // an external threshold of 1800 s keeps the job alive while a 300 s
+        // internal threshold would catch a wedged executor.
+        cm.update_context(job_id, |ctx| -> Result<(), crate::error::JobError> {
+            ctx.last_worker_heartbeat_at =
+                Some(chrono::Utc::now() - chrono::Duration::seconds(120));
+            Ok(())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        let stuck = cm
+            .find_stuck_jobs_with_thresholds(
+                Some(std::time::Duration::from_secs(300)),
+                Some(std::time::Duration::from_secs(1800)),
+            )
+            .await;
+        assert!(
+            !stuck.contains(&job_id),
+            "WI#475: heartbeat every 2 min during a 10-min LLM wait is healthy"
+        );
+
+        // A totally silent external worker still trips its own threshold
+        // (both genuine activity and the heartbeat are now beyond 1800 s).
+        cm.update_context(job_id, |ctx| -> Result<(), crate::error::JobError> {
+            ctx.last_activity_at = Some(chrono::Utc::now() - chrono::Duration::seconds(2000));
+            ctx.last_worker_heartbeat_at =
+                Some(chrono::Utc::now() - chrono::Duration::seconds(2000));
+            Ok(())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let stuck = cm
+            .find_stuck_jobs_with_thresholds(
+                Some(std::time::Duration::from_secs(300)),
+                Some(std::time::Duration::from_secs(1800)),
+            )
+            .await;
+        assert!(stuck.contains(&job_id));
+    }
+
     #[test]
     fn strip_worker_heartbeats_removes_only_keepalive_lines() {
         // WI#267: a worker-supplied buffer that folded its synthetic
