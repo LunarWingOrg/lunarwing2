@@ -802,7 +802,10 @@ Enforced controls (opencode2 lane unless noted):
    (including PATH order and loader variables), `Entrypoint`, `Cmd`, `User`,
    `WorkingDir`, `Healthcheck`, `ExposedPorts`, and `StopSignal`; `OnBuild`,
    `Volumes`, and `Shell` must be empty. Promotion hard-needs the
-   non-optional job and the BuildKit parser guard.
+   non-optional job and the BuildKit parser guard. The Dockerfile strips
+   setuid/setgid and write bits throughout `/app/node_modules` immediately
+   before the wrapper anchor; the parser requires that step so `cp -a` cannot
+   carry privileged source-directory modes into the published image.
    In mt-admin, `build_opencode2_worker` uses a per-build candidate tag and
    `--iidfile`, then `create --pull=never`, `export`, and full `image inspect`
    feed the same tar/config verifier by immutable image ID. Docker's
