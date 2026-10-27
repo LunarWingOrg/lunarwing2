@@ -2071,7 +2071,7 @@ mod approval_resolution {
             let thread = sess
                 .threads
                 .get_mut(&thread_id)
-                .expect("resolved thread exists");
+                .expect("resolved thread exists"); // safety: test-only fixture
             thread.state = ThreadState::AwaitingApproval;
             thread.pending_approval = Some(crate::agent::session::PendingApproval {
                 request_id,
