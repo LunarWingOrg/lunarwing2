@@ -135,18 +135,25 @@ UNITEOF
 # if absent. The file is otherwise write-once so operator edits survive; a
 # stale value here would silently misroute a root-side check, so managed keys
 # are rewritten line-by-line (file mode/owner preserved).
+#
+# The key and value are interpolated into grep/awk patterns verbatim: callers
+# must pass fixed key names and value tokens that are regex/ERE-safe (today
+# podman/docker and true/false/auto). health.env holds notification
+# credentials, so the mktemp copy (mode 0600) is removed even when a step
+# fails midway — a partially-written original is left alone rather than
+# replaced with a truncated file.
 health_env_reconcile_line() {  # <KEY> <VALUE>
   local key="$1" value="$2" _tmp
   grep -q "^${key}=${value}$" "$HEALTH_ENV_FILE" && return 0
   _tmp="$(mktemp)"
   if grep -q "^${key}=" "$HEALTH_ENV_FILE"; then
     awk -v k="$key" -v v="$value" 'index($0, k "=") == 1 {print k "=" v; next} {print}' \
-      "$HEALTH_ENV_FILE" >"$_tmp"
+      "$HEALTH_ENV_FILE" >"$_tmp" || { rm -f "$_tmp"; return 1; }
   else
-    cp "$HEALTH_ENV_FILE" "$_tmp"
-    printf '%s=%s\n' "$key" "$value" >>"$_tmp"
+    cp "$HEALTH_ENV_FILE" "$_tmp" || { rm -f "$_tmp"; return 1; }
+    printf '%s=%s\n' "$key" "$value" >>"$_tmp" || { rm -f "$_tmp"; return 1; }
   fi
-  cat "$_tmp" >"$HEALTH_ENV_FILE"
+  cat "$_tmp" >"$HEALTH_ENV_FILE" || { rm -f "$_tmp"; return 1; }
   rm -f "$_tmp"
   say "reconciled ${key}=${value} in $HEALTH_ENV_FILE"
 }
