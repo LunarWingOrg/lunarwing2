@@ -521,10 +521,14 @@ host's concurrent builds before retrying manually.
 - `ci-config` validation rejects jobs whose `stage:` is missing from the root
   `stages` list, so stage renames/removals fail at validation time instead of
   killing the whole pipeline after push. It also installs the pinned Go
-  toolchain through `fetch-go-toolchain.py`, making the BuildKit parser
-  fixtures mandatory in the Python test discovery lane. OpenCode 2 promotion
-  hard-needs both the BuildKit parser guard and the tar/config verifier;
-  neither can be removed or made optional without failing validation.
+  1.26.10 toolchain through `fetch-go-toolchain.py`, making the BuildKit
+  parser fixtures mandatory in the Python test discovery lane. This is a
+  required-gate availability dependency: every pipeline downloads the roughly
+  64 MiB archive from go.dev, verifies its SHA-256, and extracts it with the
+  tar `data` filter, so a go.dev outage fails `ci-config` until the job can be
+  retried successfully. OpenCode 2 promotion hard-needs both the BuildKit
+  parser guard and the tar/config verifier; neither can be removed or made
+  optional without failing validation.
 - Worker promotion runs a 15-second registry auth-realm smoke test
   (`.gitlab/scripts/registry-realm-smoke.py`) before the promote script, so a
   broken realm fails cheaply instead of after the multi-hour candidate and

@@ -734,18 +734,19 @@ Enforced controls (opencode2 lane unless noted):
    ordering without git. Dockerfile wiring is owned by the required
    `worker-buildkit-parser-policy-guard` job (WI#425): the bash grammar is
    retired, and `.gitlab/go/dockerfile-parse` applies the policy to BuildKit
-   v0.25.1's own instruction tree. The parser requires the compile-out COPY
-   and RUN before the native build in `AS builder`, the wrapper/binary scan,
-   root-owned read-only `scripts/`+`config/` and boot files, and the wrapper
-   anchor ARG immediately above the final `--image-filesystem` assertion in
-   the same stage. The final stage's last USER must be `10003:10003`; after
-   the assertion only `EXPOSE`, `HEALTHCHECK`, `USER`, `ENTRYPOINT`, `CMD`,
-   `LABEL` and `STOPSIGNAL` are allowed. Parser directives and heredocs are
-   refused, and BuildKit's structured ENV parser rejects expanded, quoted,
-   legacy, or protected keys while literal keys may retain quoted/expanded
-   values. The FQ-3/GD-1/GJ-1/GJ-2/GW-2/GX-1/GZ-1/HD-1 divergence shapes have
-   direct policy fixtures alongside the broader Python fixture suite. The CI
-   job uses a digest-pinned Go 1.24.3 image with `GOTOOLCHAIN=local`,
+   v0.34.1's own instruction tree (the module declares Go 1.26.8). The parser
+   requires the compile-out COPY and RUN before the native build in
+   `AS builder`, the wrapper/binary scan, root-owned read-only
+   `scripts/`+`config/` and boot files, and the wrapper anchor ARG immediately
+   above the final `--image-filesystem` assertion in the same stage. The final
+   stage's last USER must be `10003:10003`; after the assertion only `EXPOSE`,
+   `HEALTHCHECK`, `USER`, `ENTRYPOINT`, `CMD`, `LABEL` and `STOPSIGNAL` are
+   allowed. Parser directives and heredocs are refused, and BuildKit's
+   structured ENV parser rejects expanded, quoted, legacy, or protected keys
+   while literal keys may retain quoted/expanded values. The
+   FQ-3/GD-1/GJ-1/GJ-2/GW-2/GX-1/GZ-1/HD-1 divergence shapes have direct
+   policy fixtures alongside the broader Python fixture suite. The CI job uses
+   a digest-pinned Go 1.26.10 image with `GOTOOLCHAIN=local`,
    `GOFLAGS=-mod=readonly`, and checksum-verified modules; it runs `gofmt`,
    the Go policy tests, and the real Dockerfile check. `ci-config` installs
    the same pinned Go through `.gitlab/scripts/fetch-go-toolchain.py`, so the
