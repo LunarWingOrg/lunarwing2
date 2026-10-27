@@ -59,6 +59,7 @@ use crate::tools::wasm::WasmResourceLimiter;
 use crate::tools::wasm::credential_injector::{
     InjectedCredentials, host_matches_pattern, inject_credential,
 };
+use crate::tools::wasm::wrapper::{collect_capped_response_body, reject_private_ip};
 
 // Generate component model bindings from the WIT file
 wasmtime::component::bindgen!({
@@ -105,6 +106,9 @@ struct ChannelStoreData {
     /// Dedicated tokio runtime for HTTP requests, lazily initialized.
     /// Reused across multiple `http_request` calls within one execution.
     http_runtime: Option<tokio::runtime::Runtime>,
+    /// Local-dev / multi-tenant escape hatch for loopback sidecars. Captured
+    /// at construction so tests never mutate process-wide environment state.
+    allow_private_ips: bool,
     /// Whether the most recent exchange had a credential injected
     /// (placeholder or host credential); scopes the identity-encoding
     /// request and the opaque-body refusal (HJ-1/HQ-2 parity).
@@ -132,6 +136,7 @@ impl ChannelStoreData {
             host_credentials,
             pairing_store,
             http_runtime: None,
+            allow_private_ips: std::env::var("ALLOW_PRIVATE_IPS").ok().as_deref() == Some("1"),
             last_http_exchange_had_credentials: false,
         }
     }
@@ -184,76 +189,60 @@ impl ChannelStoreData {
         result
     }
 
-    /// Replace injected credential values with `[REDACTED]` in text.
-    ///
-    /// Prevents credentials from leaking through error messages, logs, or
-    /// return values to WASM. reqwest::Error includes the full URL in its
-    /// Display output, so any error from an injected-URL request will
-    /// contain the raw credential unless we scrub it.
-    ///
-    /// Scrubs the raw spelling plus both encoded spellings of each secret
-    /// (WI#408): `urlencoding::encode` and the `application/x-www-form-urlencoded`
-    /// form produced by `query_pairs_mut` query-param injection. The two
-    /// encoders differ for space, `~` and `*`, so scrubbing only one leaves
-    /// the other intact in an echo.
-    fn redact_credentials(&self, text: &str) -> String {
-        let mut result = text.to_string();
+    fn redaction_needles(&self) -> Vec<RedactionNeedle> {
+        let mut needles = Vec::new();
         for (name, value) in &self.credentials {
-            if !value.is_empty() {
-                let tag = format!("[REDACTED:{}]", name);
-                result = result.replace(value, &tag);
-                result = replace_encoded_spellings(&result, value, &tag);
-            }
+            push_credential_needles(&mut needles, value, &format!("[REDACTED:{name}]"));
         }
         for cred in &self.host_credentials {
-            let tag = "[REDACTED:host_credential]";
-            for needle in host_credential_needles(cred) {
-                result = result.replace(needle, tag);
-                result = replace_encoded_spellings(&result, needle, tag);
+            for value in host_credential_needles(cred) {
+                push_credential_needles(&mut needles, value, "[REDACTED:host_credential]");
             }
         }
-        result
+        sort_redaction_needles(&mut needles);
+        needles
     }
 
-    /// Byte-level credential scrub for response bodies (WI#408): bodies are
-    /// not guaranteed UTF-8, so the raw and both encoded spellings are
-    /// replaced at the byte level rather than through lossy string
-    /// conversion.
+    /// Replace injected credential values with `[REDACTED]` in text.
+    /// Longest-first ordering keeps one credential nested inside another from
+    /// leaving a visible remainder (WI#432).
+    fn redact_credentials(&self, text: &str) -> String {
+        redact_text_with_needles(text, &self.redaction_needles())
+    }
+
+    /// Byte-level credential scrub for response bodies, including the raw,
+    /// URL/form, URL-parser, JSON-string and hexadecimal spellings (WI#432).
     fn redact_credential_bytes(&self, mut bytes: Vec<u8>) -> Vec<u8> {
-        for (name, value) in &self.credentials {
-            if !value.is_empty() {
-                let marker = format!("[REDACTED:{name}]").into_bytes();
-                scrub_secret_bytes(&mut bytes, value, &marker);
-            }
-        }
-        for cred in &self.host_credentials {
-            for needle in host_credential_needles(cred) {
-                scrub_secret_bytes(&mut bytes, needle, b"[REDACTED:host_credential]");
-            }
+        for needle in self.redaction_needles() {
+            replace_all_bytes(
+                &mut bytes,
+                needle.value.as_bytes(),
+                needle.marker.as_bytes(),
+            );
         }
         bytes
     }
 
-    /// Redact credentials from a serialized headers map at the field level
-    /// (WI#408): a secret containing `"` or `\` is JSON-escaped in the
-    /// serialized form, so string-level replacement can miss it, and a blind
-    /// string replace could even produce invalid JSON. Parsing first and
-    /// redacting each name and value keeps the output valid for any secret
-    /// bytes.
+    /// Redact credentials from a serialized headers map at the field level.
+    /// Cross-field echoes replace both complete values before per-field
+    /// scrubbing, so neither side of a split secret survives (WI#432).
     fn redact_headers_json(&self, headers_json: &str) -> String {
-        let Ok(map) = serde_json::from_str::<HashMap<String, String>>(headers_json) else {
-            return self.redact_credentials(headers_json);
+        let needles = self.redaction_needles();
+        let Ok(mut map) = serde_json::from_str::<HashMap<String, String>>(headers_json) else {
+            return redact_text_with_needles(headers_json, &needles);
         };
+        redact_cross_field_echoes(&mut map, &needles);
         let redacted: HashMap<String, String> = map
             .into_iter()
             .map(|(name, value)| {
                 (
-                    self.redact_credentials(&name),
-                    self.redact_credentials(&value),
+                    redact_text_with_needles(&name, &needles),
+                    redact_text_with_needles(&value, &needles),
                 )
             })
             .collect();
-        serde_json::to_string(&redacted).unwrap_or_else(|_| self.redact_credentials(headers_json))
+        serde_json::to_string(&redacted)
+            .unwrap_or_else(|_| redact_text_with_needles(headers_json, &needles))
     }
 
     /// Apply the guest-facing redaction to one HTTP exchange outcome
@@ -271,6 +260,15 @@ impl ChannelStoreData {
     ) -> Result<lunarwing::agent::channel_host::HttpResponse, String> {
         match outcome {
             Ok(mut resp) => {
+                if self.last_http_exchange_had_credentials && resp.status == 206 {
+                    tracing::warn!(
+                        "WASM channel http_request: refused partial response on a credentialed exchange"
+                    );
+                    return Err(
+                        "HTTP response refused: partial content cannot be inspected for echoed credentials"
+                            .to_string(),
+                    );
+                }
                 if self.last_http_exchange_had_credentials
                     && !resp.body.is_empty()
                     && guest_body_encoding_is_opaque(&resp.headers_json)
@@ -452,13 +450,14 @@ impl ChannelStoreData {
                 self.inject_host_credentials(&host, &mut headers, &mut url);
         }
 
-        // HJ-1/HQ-2 parity with the tool wrapper: a credential-injected
-        // exchange asks for identity only (every guest spelling replaced)
-        // and offers no transfer codings; opaque answers are refused at the
-        // boundary.
+        // Credentialed exchanges use inspectable identity responses and cannot
+        // split an echo across transfer codings or byte ranges (WI#432).
         if self.last_http_exchange_had_credentials {
             headers.retain(|k, _| {
-                !k.eq_ignore_ascii_case("accept-encoding") && !k.eq_ignore_ascii_case("te")
+                !k.eq_ignore_ascii_case("accept-encoding")
+                    && !k.eq_ignore_ascii_case("te")
+                    && !k.eq_ignore_ascii_case("range")
+                    && !k.eq_ignore_ascii_case("if-range")
             });
             headers.insert("accept-encoding".to_string(), "identity".to_string());
         }
@@ -472,6 +471,10 @@ impl ChannelStoreData {
             .as_ref()
             .map(|h| h.max_response_bytes)
             .unwrap_or(10 * 1024 * 1024);
+
+        if !self.allow_private_ips {
+            reject_private_ip(&url)?;
+        }
 
         // Make the HTTP request using a dedicated single-threaded runtime.
         // We're inside spawn_blocking, so we can't rely on the main runtime's
@@ -542,28 +545,13 @@ impl ChannelStoreData {
             let response_headers = guest_response_headers(response.headers());
             let headers_json = serde_json::to_string(&response_headers).unwrap_or_default();
 
-            // Enforce max response body size to prevent memory exhaustion.
-            let max_response = max_response_bytes;
-            if let Some(cl) = response.content_length()
-                && cl as usize > max_response
-            {
-                return Err(format!(
-                    "Response body too large: {} bytes exceeds limit of {} bytes",
-                    cl, max_response
-                ));
-            }
-            let body = response
-                .bytes()
-                .await
-                .map_err(|e| format!("Failed to read response body: {}", e.without_url()))?;
-            if body.len() > max_response {
-                return Err(format!(
-                    "Response body too large: {} bytes exceeds limit of {} bytes",
-                    body.len(),
-                    max_response
-                ));
-            }
-            let body = body.to_vec();
+            let content_length = response.content_length();
+            let body_stream = futures::StreamExt::map(response.bytes_stream(), |chunk| {
+                chunk.map_err(|error| error.without_url())
+            });
+            let body =
+                collect_capped_response_body(body_stream, content_length, max_response_bytes)
+                    .await?;
 
             tracing::info!(
                 status = status,
@@ -3668,32 +3656,95 @@ impl HttpResponse {
     }
 }
 
-/// The `application/x-www-form-urlencoded` spelling of a secret, matching
-/// what `query_pairs_mut().append_pair()` produces when host query-param
-/// credentials are injected (WI#408). It differs from
-/// `urlencoding::encode` for space (`+` vs `%20`), `~` (`%7E` vs `~`) and
-/// `*` (`*` vs `%2A`), so an echo of the injected URL can carry this form.
-fn form_encode_secret(secret: &str) -> String {
-    url::form_urlencoded::byte_serialize(secret.as_bytes()).collect()
+const MIN_CREDENTIAL_SCRUB_LEN: usize = 4;
+
+struct RedactionNeedle {
+    value: String,
+    marker: String,
 }
 
-/// Replace every encoded spelling of a secret in text (WI#408): the
-/// `urlencoding::encode` form, the form (`query_pairs_mut`) form, and the
-/// URL-parser spellings (IO-3).
-fn replace_encoded_spellings(text: &str, secret: &str, tag: &str) -> String {
+fn push_credential_needles(needles: &mut Vec<RedactionNeedle>, secret: &str, marker: &str) {
+    if secret.len() < MIN_CREDENTIAL_SCRUB_LEN {
+        return;
+    }
+    let mut spellings = vec![secret.to_string()];
+    spellings.extend(encoded_spellings(secret));
+    for value in spellings {
+        if value.len() >= MIN_CREDENTIAL_SCRUB_LEN {
+            needles.push(RedactionNeedle {
+                value,
+                marker: marker.to_string(),
+            });
+        }
+    }
+}
+
+fn sort_redaction_needles(needles: &mut Vec<RedactionNeedle>) {
+    needles.sort_by(|left, right| {
+        right
+            .value
+            .len()
+            .cmp(&left.value.len())
+            .then_with(|| left.value.cmp(&right.value))
+            .then_with(|| left.marker.cmp(&right.marker))
+    });
+    needles.dedup_by(|left, right| left.value == right.value);
+}
+
+fn redact_text_with_needles(text: &str, needles: &[RedactionNeedle]) -> String {
     let mut result = text.to_string();
-    for encoded in encoded_spellings(secret) {
-        result = result.replace(encoded.as_str(), tag);
+    for needle in needles {
+        result = result.replace(&needle.value, &needle.marker);
     }
     result
 }
 
-/// Every non-raw spelling the host itself can put on the wire for `secret`:
-/// `urlencoding::encode`, the form spelling (`append_pair` query injection)
-/// and the WHATWG URL parser spellings a placeholder substituted raw into a
-/// URL path or query takes when reqwest re-parses the injected URL. Empty
-/// and raw-identical spellings are dropped (an empty needle would match
-/// everywhere).
+fn redact_cross_field_echoes(fields: &mut HashMap<String, String>, needles: &[RedactionNeedle]) {
+    let snapshot: Vec<(String, String)> = fields
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    let mut replacements = HashMap::new();
+    for (index, (left_name, left_value)) in snapshot.iter().enumerate() {
+        for (right_name, right_value) in snapshot.iter().skip(index + 1) {
+            if let Some(needle) = cross_field_needle(left_value, right_value, needles) {
+                replacements
+                    .entry(left_name.clone())
+                    .or_insert_with(|| needle.marker.clone());
+                replacements
+                    .entry(right_name.clone())
+                    .or_insert_with(|| needle.marker.clone());
+            }
+        }
+    }
+    for (name, value) in fields {
+        if let Some(marker) = replacements.get(name) {
+            *value = marker.clone();
+        }
+    }
+}
+
+fn cross_field_needle<'a>(
+    left: &str,
+    right: &str,
+    needles: &'a [RedactionNeedle],
+) -> Option<&'a RedactionNeedle> {
+    needles.iter().find(|needle| {
+        let value = &needle.value;
+        (1..value.len()).any(|split| {
+            value.is_char_boundary(split)
+                && ((left.ends_with(&value[..split]) && right.starts_with(&value[split..]))
+                    || (right.ends_with(&value[..split]) && left.starts_with(&value[split..])))
+        })
+    })
+}
+
+/// The `application/x-www-form-urlencoded` spelling used by query-pair
+/// injection. It differs from `urlencoding::encode` for space, `~` and `*`.
+fn form_encode_secret(secret: &str) -> String {
+    url::form_urlencoded::byte_serialize(secret.as_bytes()).collect()
+}
+
 fn encoded_spellings(secret: &str) -> Vec<String> {
     let mut out = vec![
         urlencoding::encode(secret).to_string(),
@@ -3716,10 +3767,31 @@ fn encoded_spellings(secret: &str) -> Vec<String> {
             out.push(decoded.into_owned());
         }
     }
+    if let Ok(json) = serde_json::to_string(secret)
+        && let Some(inner) = json.strip_prefix('"').and_then(|v| v.strip_suffix('"'))
+    {
+        out.push(inner.to_string());
+    }
+    out.push(hex_encode_secret(secret, false));
+    out.push(hex_encode_secret(secret, true));
     out.retain(|spelling| !spelling.is_empty() && spelling != secret);
     out.sort();
     out.dedup();
     out
+}
+
+fn hex_encode_secret(secret: &str, uppercase: bool) -> String {
+    let digits = if uppercase {
+        b"0123456789ABCDEF"
+    } else {
+        b"0123456789abcdef"
+    };
+    let mut encoded = String::with_capacity(secret.len() * 2);
+    for byte in secret.bytes() {
+        encoded.push(digits[(byte >> 4) as usize] as char);
+        encoded.push(digits[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 /// Needles for one host credential: the raw secret plus the credential
@@ -3808,15 +3880,6 @@ fn transfer_coding_keeps_framing(value: &str) -> bool {
         .last()
         .is_some_and(|token| token.eq_ignore_ascii_case("chunked"));
     !(non_empty == 1 && last_is_chunked)
-}
-
-/// Byte-level scrub of every spelling of `secret` (WI#408): response bodies
-/// are not guaranteed UTF-8, so string-level replacement cannot be used.
-fn scrub_secret_bytes(bytes: &mut Vec<u8>, secret: &str, marker: &[u8]) {
-    replace_all_bytes(bytes, secret.as_bytes(), marker);
-    for encoded in encoded_spellings(secret) {
-        replace_all_bytes(bytes, encoded.as_bytes(), marker);
-    }
 }
 
 /// Replace every occurrence of `needle` in `haystack` with `marker`, at the
@@ -6471,6 +6534,106 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wi432_needles_are_longest_first_and_skip_short_secrets() {
+        use super::{push_credential_needles, redact_text_with_needles, sort_redaction_needles};
+
+        let mut needles = Vec::new();
+        push_credential_needles(&mut needles, "prefix", "[REDACTED:SHORT]");
+        push_credential_needles(&mut needles, "prefixSuffix9", "[REDACTED:LONG]");
+        push_credential_needles(&mut needles, "utf", "[REDACTED:TINY]");
+        sort_redaction_needles(&mut needles);
+
+        let long = needles
+            .iter()
+            .position(|needle| needle.value == "prefixSuffix9")
+            .expect("long needle");
+        let short = needles
+            .iter()
+            .position(|needle| needle.value == "prefix")
+            .expect("short needle");
+        assert!(long < short);
+        assert!(!needles.iter().any(|needle| needle.value == "utf"));
+        assert!(!needles.iter().any(|needle| needle.value == "757474"));
+        assert_eq!(
+            redact_text_with_needles("prefixSuffix9 charset=utf-8", &needles),
+            "[REDACTED:LONG] charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn wi432_short_secret_does_not_mangle_channel_response() {
+        let mut credentials = HashMap::new();
+        credentials.insert("SHORT".to_string(), "utf".to_string());
+        credentials.insert("LONG".to_string(), "longsecret".to_string());
+        let store_data = ChannelStoreData::new(
+            1024 * 1024,
+            "test",
+            ChannelCapabilities::default(),
+            credentials,
+            Vec::new(),
+            Arc::new(PairingStore::new()),
+        );
+
+        assert_eq!(
+            store_data.redact_credentials("charset=utf-8 longsecret"),
+            "charset=utf-8 [REDACTED:LONG]"
+        );
+        assert_eq!(
+            store_data.redact_credential_bytes(b"charset=utf-8 longsecret".to_vec()),
+            b"charset=utf-8 [REDACTED:LONG]"
+        );
+    }
+
+    #[test]
+    fn wi432_body_scrub_covers_json_and_hex_spellings() {
+        let mut credentials = HashMap::new();
+        credentials.insert("API_TOKEN".to_string(), "A\"9z".to_string());
+        let store_data = ChannelStoreData::new(
+            1024 * 1024,
+            "test",
+            ChannelCapabilities::default(),
+            credentials,
+            Vec::new(),
+            Arc::new(PairingStore::new()),
+        );
+
+        let body = br#"raw=A"9z json=A\"9z lower=4122397a upper=4122397A"#.to_vec();
+        let redacted = store_data.redact_credential_bytes(body);
+        assert_eq!(
+            redacted,
+            br#"raw=[REDACTED:API_TOKEN] json=[REDACTED:API_TOKEN] lower=[REDACTED:API_TOKEN] upper=[REDACTED:API_TOKEN]"#
+        );
+    }
+
+    #[test]
+    fn wi432_header_scrub_covers_cross_field_echoes() {
+        let mut credentials = HashMap::new();
+        credentials.insert("API_TOKEN".to_string(), "s3cr3t-value".to_string());
+        let store_data = ChannelStoreData::new(
+            1024 * 1024,
+            "test",
+            ChannelCapabilities::default(),
+            credentials,
+            Vec::new(),
+            Arc::new(PairingStore::new()),
+        );
+        let headers = r#"{"x-first":"s3cr","x-second":"3t-value","x-other":"ok"}"#;
+
+        let redacted = store_data.redact_headers_json(headers);
+        let map: HashMap<String, String> =
+            serde_json::from_str(&redacted).expect("redacted headers remain valid JSON");
+        assert_eq!(
+            map.get("x-first").map(String::as_str),
+            Some("[REDACTED:API_TOKEN]")
+        );
+        assert_eq!(
+            map.get("x-second").map(String::as_str),
+            Some("[REDACTED:API_TOKEN]")
+        );
+        assert_eq!(map.get("x-other").map(String::as_str), Some("ok"));
+    }
+
     /// WI#408 finding 1: host query credentials are injected with
     /// `query_pairs_mut().append_pair` (form spelling) but redaction used to
     /// scrub only the `urlencoding::encode` spelling. The encoders differ
@@ -6744,6 +6907,7 @@ mod tests {
             host_credentials,
             Arc::new(PairingStore::new()),
         );
+        store_data.allow_private_ips = true;
 
         let url = format!("http://{address}/echo");
         let resp = tokio::task::spawn_blocking(move || {
@@ -6846,6 +7010,7 @@ mod tests {
             host_credentials,
             Arc::new(PairingStore::new()),
         );
+        store_data.allow_private_ips = true;
         let resp = store_data
             .http_request(
                 "GET".to_string(),
@@ -6897,6 +7062,7 @@ mod tests {
             Vec::new(),
             Arc::new(PairingStore::new()),
         );
+        store_data.allow_private_ips = true;
         let err = store_data
             .http_request(
                 "GET".to_string(),
@@ -7091,6 +7257,14 @@ mod tests {
         }
 
         fn store(credentials: HashMap<String, String>, host_credential: bool) -> ChannelStoreData {
+            store_with_response_cap(credentials, host_credential, 10 * 1024 * 1024)
+        }
+
+        fn store_with_response_cap(
+            credentials: HashMap<String, String>,
+            host_credential: bool,
+            max_response_bytes: usize,
+        ) -> ChannelStoreData {
             let mut query_params = HashMap::new();
             query_params.insert("api_key".to_string(), SECRET.to_string());
             let host_credentials = if host_credential {
@@ -7104,19 +7278,24 @@ mod tests {
                 Vec::new()
             };
             let mut capabilities = ChannelCapabilities::for_channel("test");
-            capabilities.tool_capabilities.http = Some(HttpCapability::new(vec![
-                EndpointPattern::host("127.0.0.1"),
-                EndpointPattern::host("localhost"),
-                EndpointPattern::host("api.example.com").with_path_prefix("/allowed/"),
-            ]));
-            ChannelStoreData::new(
+            capabilities.tool_capabilities.http = Some(
+                HttpCapability::new(vec![
+                    EndpointPattern::host("127.0.0.1"),
+                    EndpointPattern::host("localhost"),
+                    EndpointPattern::host("api.example.com").with_path_prefix("/allowed/"),
+                ])
+                .with_max_response_bytes(max_response_bytes),
+            );
+            let mut store = ChannelStoreData::new(
                 1024 * 1024,
                 "test",
                 capabilities,
                 credentials,
                 host_credentials,
                 Arc::new(PairingStore::new()),
-            )
+            );
+            store.allow_private_ips = true;
+            store
         }
 
         fn placeholder(value: &str) -> HashMap<String, String> {
@@ -7408,6 +7587,123 @@ mod tests {
             };
             assert!(err.contains("Failed to read response body"), "{err}");
             assert!(!err.contains("for url"), "{err}");
+        }
+
+        #[test]
+        fn wi432_ranges_are_stripped_and_partial_content_is_refused() {
+            let ok = response("200 OK", &["Content-Length: 2"], "ok");
+            let partial = response("206 Partial Content", &["Content-Length: 4"], "part");
+            let (addr, heads) = serve(vec![ok.clone(), partial, ok]);
+            let guest = r#"{"Range":"bytes=0-1","If-Range":"\"tag\""}"#;
+
+            let first = store(HashMap::new(), true)
+                .http_request(
+                    "GET".to_string(),
+                    format!("http://{addr}/r"),
+                    guest.to_string(),
+                    None,
+                    Some(5000),
+                )
+                .expect("complete response");
+            assert_eq!(first.status, 200);
+            let error = store(HashMap::new(), true)
+                .http_request(
+                    "GET".to_string(),
+                    format!("http://{addr}/r"),
+                    guest.to_string(),
+                    None,
+                    Some(5000),
+                )
+                .expect_err("206 must be refused on a credentialed exchange");
+            assert!(error.contains("partial content"), "{error}");
+            store(HashMap::new(), false)
+                .http_request(
+                    "GET".to_string(),
+                    format!("http://{addr}/r"),
+                    guest.to_string(),
+                    None,
+                    Some(5000),
+                )
+                .expect("ordinary exchanges retain range semantics");
+
+            let heads = heads.lock().expect("lock");
+            assert_eq!(heads.len(), 3);
+            assert!(
+                !heads[0].to_ascii_lowercase().contains("range:"),
+                "{}",
+                heads[0]
+            );
+            let ordinary = heads[2].to_ascii_lowercase();
+            assert!(ordinary.contains("range: bytes=0-1"), "{ordinary}");
+            assert!(ordinary.contains("if-range: \"tag\""), "{ordinary}");
+        }
+
+        #[test]
+        fn wi432_private_targets_are_refused_without_the_opt_in() {
+            let mut store = store(HashMap::new(), true);
+            store.allow_private_ips = false;
+            let error = store
+                .http_request(
+                    "GET".to_string(),
+                    "http://127.0.0.1:9/r".to_string(),
+                    "{}".to_string(),
+                    None,
+                    Some(2000),
+                )
+                .expect_err("loopback must be refused before connecting");
+            assert!(error.contains("private/internal IP"), "{error}");
+            assert!(!error.contains("HTTP request failed"), "{error}");
+        }
+
+        #[test]
+        fn wi432_response_cap_disconnects_at_the_first_over_limit_chunk() {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(&[13, 10, 13, 10]) {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n8\r\nxxxxxxxx\r\n8\r\nyyyyyyyy\r\n",
+                    )
+                    .expect("write chunks");
+                stream.flush().expect("flush chunks");
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .expect("read timeout");
+                match stream.read(&mut byte) {
+                    Ok(0) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ) => {}
+                    other => panic!("client did not close the over-limit response: {other:?}"),
+                }
+            });
+
+            let error = store_with_response_cap(HashMap::new(), true, 8)
+                .http_request(
+                    "GET".to_string(),
+                    format!("http://{addr}/r"),
+                    "{}".to_string(),
+                    None,
+                    Some(5000),
+                )
+                .expect_err("the second chunk crosses the response cap");
+            assert!(
+                error.contains("16 bytes exceeds limit of 8 bytes"),
+                "{error}"
+            );
+            server.join().expect("upstream thread");
         }
 
         /// Parsed-query spellings: an upstream reads '+' as a space and
