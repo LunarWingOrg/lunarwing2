@@ -1614,6 +1614,53 @@ Wraps the `Workspace` as the engine's `Store` trait:
 The router dual-writes compatibility conversation history to the relational
 `Database` separately. That database is not the backing store for `HybridStore`.
 
+#### Pre-switch history import (WI#442 F7)
+
+The dual-write is forward-only: rows created before a tenant switched to
+Engine V2 are not in the engine surface that seeds each new thread, so without
+an import the first thread after the switch would start cold. The router runs
+one import per v1 conversation (`router/v1_history_import.rs`) that reads that
+conversation's `user` and `assistant` rows and prepends them to the surface as
+imported entries (`EntrySender::ImportedAgent` / `imported_from: v1`
+metadata), which `build_history_from_entries` maps back to user/assistant
+history.
+
+Four properties make it safe:
+
+- **Ownership gate** — the v1 conversation must belong to the message's user
+  before anything is read from or written to it. A caller-supplied `thread_id`
+  is not proof of ownership, so a forged one cannot copy another user's history
+  into the caller's engine context. This mirrors the v1 hydrate boundary in
+  `agent/thread_ops.rs`. `get_or_create_scoped_conversation` also fails
+  (`DatabaseError::NotFound`) instead of returning a conversation owned by
+  another user or channel, which closes the same class of gap on the forward
+  dual-write path.
+- **New-surface gate** — the import runs only when the current message created
+  the engine surface (`get_or_create_conversation_with_created`). Tenants
+  already on Engine V2 get the marker recorded without a backfill, so this
+  change neither surfaces weeks-old context in a thread that never had it nor
+  undoes `/clear` (which empties entries but keeps `created_at`).
+- **Marker gate** — `engine_v2_v1_history_imported` in the v1 conversation's
+  metadata short-circuits later messages.
+- **Creation-time cutoff plus a bounded read** — only rows older than the
+  surface's `created_at` are imported, so the forward dual-write's own v2 rows
+  can never be re-imported even when the marker write fails. The read goes
+  through `list_conversation_messages_paginated` with the surface's own entry
+  bound, so an oversized v1 conversation never has to be loaded whole before
+  the bound applies.
+
+The cutoff compares two clocks (Postgres rows take `created_at` from the
+database's `NOW()`; the surface's comes from the daemon — libSQL uses the
+daemon clock for both). Skew shifts the boundary, but the marker keeps that
+from re-importing rows and the new-surface gate normally puts the boundary at
+"now" with only genuinely pre-switch rows on the far side.
+
+`tool_calls` and `interrupted` marker rows are skipped: they are v1
+bookkeeping, not conversation context. The import is best-effort — a database
+or store failure is logged and the turn proceeds without the extra context. The
+marker lookup costs one extra query on each turn of a conversation that has not
+been imported yet.
+
 ### Channel Routing And Delivery
 
 `should_route_to_engine_v2()` owns the rollout policy. `ENGINE_V2=false`
@@ -1625,6 +1672,15 @@ Note there is no opt-out value: any entry that is not one of the eligible
 channel names — including
 something like `none` — is simply ignored, and the gateway always routes
 while `ENGINE_V2=true`. The only durable opt-out is `ENGINE_V2=false`.
+
+The exact-name allowlist is **by design** (WI#442 F8), not a gap: non-opted
+channels keep running the v1 loop until engine coverage for them lands under
+WI#221/#222. The consequence for operators is that v1-era findings remain
+relevant on those lanes even at full Engine V2 adoption — they are not retired
+by the switch. Expanding the set means adding an eligible channel to
+`ENGINE_V2_OPT_IN_CHANNELS` and these docs together; retiring the v1 loop is a
+separate, larger decision. WI#442 F8's acceptance is the recorded decision to
+keep the allowlist, which this paragraph is.
 
 Engine `ResponseDelta` events flow through
 `ChannelManager::send_status(StatusUpdate::StreamChunk)`. The gateway maps each

@@ -58,6 +58,12 @@ pub enum EntrySender {
     Agent { thread_id: ThreadId },
     /// System notification (thread started, completed, etc.).
     System,
+    /// Agent output imported from pre-Engine-V2 (v1) history.
+    ///
+    /// Carries no origin thread: the v1 row predates the engine's thread
+    /// model, so a synthetic id would make thread lookups chase a thread that
+    /// never existed. Seeding still maps it to assistant history (WI#442 F7).
+    ImportedAgent,
 }
 
 /// A single entry in a conversation — a message visible to the user.
@@ -119,6 +125,32 @@ impl ConversationEntry {
             origin_thread_id: Some(thread_id),
             timestamp: Utc::now(),
             metadata: serde_json::Value::Null,
+        }
+    }
+    /// Create a user entry imported from v1 history (WI#442 F7).
+    ///
+    /// Keeps the v1 row's timestamp so seeding order matches the original
+    /// conversation rather than the import time.
+    pub fn imported_user(content: impl Into<String>, timestamp: DateTime<Utc>) -> Self {
+        Self {
+            id: EntryId::new(),
+            sender: EntrySender::User,
+            content: content.into(),
+            origin_thread_id: None,
+            timestamp,
+            metadata: serde_json::json!({ "imported_from": "v1" }),
+        }
+    }
+
+    /// Create an agent entry imported from v1 history (WI#442 F7).
+    pub fn imported_agent(content: impl Into<String>, timestamp: DateTime<Utc>) -> Self {
+        Self {
+            id: EntryId::new(),
+            sender: EntrySender::ImportedAgent,
+            content: content.into(),
+            origin_thread_id: None,
+            timestamp,
+            metadata: serde_json::json!({ "imported_from": "v1" }),
         }
     }
 }
@@ -205,6 +237,24 @@ impl ConversationSurface {
         if evict > 0 {
             self.entries.drain(..evict);
         }
+    }
+
+    /// Prepend imported v1-history entries ahead of the existing ones.
+    ///
+    /// Import order is v1 chronological order, so imported rows go before any
+    /// live entries the surface already holds. Eviction then trims from the
+    /// oldest end, matching [`Self::add_entry`]'s retention behaviour.
+    /// Returns the surface's entry count after eviction (the oldest imports
+    /// can be dropped immediately when the v1 history exceeds the bounds).
+    pub fn prepend_imported_entries(&mut self, mut imported: Vec<ConversationEntry>) -> usize {
+        if imported.is_empty() {
+            return 0;
+        }
+        imported.append(&mut self.entries);
+        self.entries = imported;
+        self.evict_overflow();
+        self.updated_at = Utc::now();
+        self.entries.len()
     }
 
     /// Register a thread as active in this conversation.
@@ -399,5 +449,50 @@ mod tests {
         let restored: ConversationSurface =
             serde_json::from_value(serialized).expect("legacy conversation should deserialize");
         assert!(restored.pending_steer_notes.is_empty());
+    }
+
+    #[test]
+    fn imported_v1_entries_precede_live_entries_in_order() {
+        let mut conv = ConversationSurface::new("xmpp", "user");
+        conv.add_entry(ConversationEntry::user("live question"));
+
+        let imported = vec![
+            ConversationEntry::imported_user("v1 question", Utc::now()),
+            ConversationEntry::imported_agent("v1 answer", Utc::now()),
+        ];
+        let count = conv.prepend_imported_entries(imported);
+
+        assert_eq!(count, 3);
+        let contents: Vec<&str> = conv.entries.iter().map(|e| e.content.as_str()).collect();
+        assert_eq!(contents, ["v1 question", "v1 answer", "live question"]);
+        assert!(matches!(conv.entries[1].sender, EntrySender::ImportedAgent));
+        assert_eq!(conv.entries[1].metadata["imported_from"], "v1");
+    }
+
+    #[test]
+    fn prepending_imported_entries_respects_the_retention_bounds() {
+        let mut conv = ConversationSurface::new("xmpp", "user");
+        conv.add_entry(ConversationEntry::user("newest"));
+        let imported: Vec<_> = (0..MAX_CONVERSATION_ENTRIES + 5)
+            .map(|index| ConversationEntry::imported_user(format!("old {index}"), Utc::now()))
+            .collect();
+        let count = conv.prepend_imported_entries(imported);
+        assert_eq!(count, MAX_CONVERSATION_ENTRIES);
+        // The live newest entry survives; the oldest imports are evicted.
+        assert_eq!(
+            conv.last_entry().map(|e| e.content.as_str()),
+            Some("newest")
+        );
+    }
+
+    #[test]
+    fn prepending_no_imported_entries_is_a_no_op() {
+        let mut conv = ConversationSurface::new("xmpp", "user");
+        conv.add_entry(ConversationEntry::user("live question"));
+        let before = conv.updated_at;
+        let count = conv.prepend_imported_entries(Vec::new());
+        assert_eq!(count, 0);
+        assert_eq!(conv.entries.len(), 1);
+        assert_eq!(conv.updated_at, before);
     }
 }
