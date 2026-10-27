@@ -408,6 +408,13 @@ mod tests {
         assert!(agent_env_key_warning("XMPP_BRIDGE_TOKEN").is_none());
     }
 
+    /// WI#475: `AGENT_EXTERNAL_STUCK_THRESHOLD_SECS` is a recognized agent env
+    /// key (must not be flagged as "ignored" by the env-key diagnostics).
+    #[test]
+    fn external_stuck_threshold_env_key_is_recognized() {
+        assert!(agent_env_key_warning("AGENT_EXTERNAL_STUCK_THRESHOLD_SECS").is_none());
+    }
+
     #[test]
     fn test_default_timezone_rejects_invalid() {
         let mut settings = Settings::default();
@@ -450,6 +457,16 @@ mod tests {
             clamp_pending_gate_expiry_secs(config.pending_gate_expiry_secs),
             900
         );
+    }
+
+    /// WI#475: the external-worker stuck threshold resolves from its settings
+    /// field into `AgentConfig`.
+    #[test]
+    fn external_stuck_threshold_flows_from_settings() {
+        let mut settings = Settings::default();
+        settings.agent.external_stuck_threshold_secs = 4321;
+        let config = AgentConfig::resolve(&settings).expect("resolve");
+        assert_eq!(config.external_stuck_threshold, Duration::from_secs(4321));
     }
 
     #[test]
