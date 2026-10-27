@@ -1231,7 +1231,7 @@
     - **Initial verification (`taskset -c 0-17`):** `cargo check -j18 --lib` clean; `cargo test -j18 --lib sandbox::mount_guard` **28 passed, 0 failed**; `cargo clippy -j18 --lib -- -D warnings` clean. No dependency or lockfile change; no behavior removed
     - **Trail shape mirrors the reviewed WI:** `!1796` on the WI is an unrelated item-55 release-notes MR (auto-cross-link only), so this run's tree needed no cherry-pick
     - **!1959 run-232 follow-up (PC-1 blocker / PC-2 Low):** ran `cargo fmt --all` to fix the CI-blocking test assertion. The structural marker now requires `env/lunarwing.env` to be a file, not merely a generic `env/` directory. The single-node regression covers both an absent marker and a directory with that name: ordinary home `env/`, `run/` and `logs/` remain mountable and unmasked, the daemon base stays protected, and `nonstandard_base_name` remains false. Existing MT coverage now exercises both siblings, run-only and logs-only layouts so legitimate systemd/OpenRC tenants keep all three protected siblings. The literal `state` fallback and explicit lists are unchanged; the security reference describes the tighter marker
-    - **Review verification:** `taskset -c 0-11 cargo test --lib sandbox::mount_guard --locked --offline -j12 -- --test-threads=12` **29/29**; `taskset -c 0-11 cargo clippy --lib --locked --offline -j12 -- -D warnings` clean; `taskset -c 0-11 cargo fmt --all -- --check` and `git diff --check` clean; `.gitlab/tests/test_goal1_ci.py` **251/251**. A focused Rust probe using the production predicate passes the virtualenv, marker-type and single-runtime-directory matrix, rejects the original implementation, and kills `is_file` → `exists` and `run || logs` → `run && logs` mutants; tracked files are never mutated. Cargo verification ran in tmux with dev/test debug symbols and incremental compilation disabled; no full debug build or release build was used.
+    - **Review verification:** `taskset -c 0-11 cargo test --lib sandbox::mount_guard --locked --offline -j12 -- --test-threads=12` **29/29**; `taskset -c 0-11 cargo clippy --lib --locked --offline -j12 -- -D warnings` clean; `taskset -c 0-11 cargo fmt --all -- --check` and `git diff --check` clean; `.gitlab/tests/test_goal1_ci.py` **251/251**. A focused Rust probe using the production predicate passes the virtualenv, marker-type and single-runtime-directory matrix, rejects the original implementation, and kills `is_file` → `exists` and `run || logs` → `run && logs` mutants; tracked files are never mutated. Cargo verification ran in tmux with dev/test debug symbols and incremental compilation disabled; no full debug build or release build was used
 106. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/455
 107. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/478
 108. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/479 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/1963 - see comments on closed MR for blockers that must be addressed on next attempt
@@ -1252,5 +1252,10 @@
 120. [x] (H) OPERATOR NOTE: Start the gallop
 121. [x] (S) Reserved
 122. [x] (H) Deploy the stoplight system
+
+## Phase 7 - Gauntlets (for work items, see comments on work items in addition to reading full descriptions)
+
+123. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/442
+124. [x] (S) Reserved
 
 ---
