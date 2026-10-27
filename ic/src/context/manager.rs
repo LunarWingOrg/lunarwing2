@@ -245,7 +245,7 @@ impl ContextManager {
         self.find_stuck_jobs_with_threshold(None).await
     }
 
-    /// Find stuck jobs with an optional elapsed threshold for `InProgress` detection.
+    /// Find stuck jobs with optional idle thresholds for `InProgress` detection.
     ///
     /// The threshold is measured against **idleness**, not total runtime
     /// (WI#263): time since the job's last recorded activity
@@ -254,9 +254,18 @@ impl ContextManager {
     /// activity was ever recorded. A multi-hour external-worker investigation
     /// that keeps streaming evidence is healthy; only a worker that goes
     /// silent past the threshold is stuck.
-    pub async fn find_stuck_jobs_with_threshold(
+    ///
+    /// `external_threshold` applies to jobs dispatched to an external worker
+    /// (`external:*`), whose idle baseline additionally includes synthetic
+    /// worker heartbeats (WI#475): a kimi/pebble task waiting on a slow LLM
+    /// request proves it is alive on every heartbeat, and the worker owns a
+    /// native per-attempt LLM deadline (WI#477), so the daemon must not
+    /// declare it stuck at the local-chat threshold. `None` falls back to
+    /// `internal_threshold`.
+    pub async fn find_stuck_jobs_with_thresholds(
         &self,
-        elapsed_threshold: Option<Duration>,
+        internal_threshold: Option<Duration>,
+        external_threshold: Option<Duration>,
     ) -> Vec<Uuid> {
         let now = chrono::Utc::now();
         self.contexts
@@ -268,15 +277,20 @@ impl ContextManager {
                 if c.state == crate::context::JobState::Stuck {
                     return true;
                 }
+                let threshold = if c.is_external_worker_job() {
+                    external_threshold.or(internal_threshold)
+                } else {
+                    internal_threshold
+                };
                 // Detect InProgress jobs that have been idle beyond the
                 // threshold. NOTE: `started_at` is set on the first transition
                 // to InProgress and is NOT reset when a job recovers from
-                // Stuck back to InProgress; `last_activity_at` (noted on every
-                // genuine progress event) is the more accurate idle baseline,
-                // so it is preferred when present.
+                // Stuck back to InProgress; `idle_baseline()` (genuine
+                // activity, then worker heartbeat, then start) is the more
+                // accurate idle baseline.
                 if c.state == crate::context::JobState::InProgress
-                    && let Some(threshold) = elapsed_threshold
-                    && let Some(started) = c.last_activity_at.or(c.started_at)
+                    && let Some(threshold) = threshold
+                    && let Some(started) = c.idle_baseline()
                 {
                     let elapsed = now.signed_duration_since(started);
                     let elapsed_secs = elapsed.num_seconds().max(0) as u64;
@@ -286,6 +300,15 @@ impl ContextManager {
             })
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    /// Find stuck jobs with a single idle threshold for every job kind.
+    pub async fn find_stuck_jobs_with_threshold(
+        &self,
+        elapsed_threshold: Option<Duration>,
+    ) -> Vec<Uuid> {
+        self.find_stuck_jobs_with_thresholds(elapsed_threshold, None)
+            .await
     }
 
     /// Get summary of all jobs.
