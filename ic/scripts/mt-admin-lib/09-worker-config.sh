@@ -433,7 +433,7 @@ upgrade_external_worker_credentials() {
     return 2
   fi
   staged_out="$(mktemp)" || { rm -f -- "$staged_in"; return 2; }
-  python3 - "$worker" "$staged_in" "$staged_out" <<'PY' || edit_status=$?
+  python3 -I - "$worker" "$staged_in" "$staged_out" <<'PY' || edit_status=$?
 import copy
 import re
 import sys
@@ -704,7 +704,7 @@ set_external_worker_tool_allowlist() {  # <tenant> <worker> <csv|none>
   # The existing array is replaced as a whole span, so the multi-line shape
   # the daemon's own save_toml writes is handled instead of being torn.
   edit_status=0
-  python3 - "$worker" "$tools_csv" "$staged_in" "$staged_out" <<'PY' || edit_status=$?
+  python3 -I - "$worker" "$tools_csv" "$staged_in" "$staged_out" <<'PY' || edit_status=$?
 import copy
 import json
 import re
@@ -886,7 +886,7 @@ remove_external_worker_config() {
   temp_path="$(mktemp "${config_path}.tmp.XXXXXX")"
   backup_path="${config_path}.pre-${worker}-retirement"
 
-  python3 - "$config_path" "$temp_path" "$backup_path" "$worker" <<'PY' || rc=$?
+  python3 -I - "$config_path" "$temp_path" "$backup_path" "$worker" <<'PY' || rc=$?
 import os
 import re
 import stat
@@ -1110,7 +1110,7 @@ _archive_nanocode_env() {
   if [[ -e "$env_path" || -L "$env_path" ]]; then
     backup="$env_path.pre-nanocode-retirement"
     temp="$(mktemp "${env_path}.tmp.XXXXXX")"
-    python3 - "$env_path" "$temp" "$backup" <<'PY' || rc=$?
+    python3 -I - "$env_path" "$temp" "$backup" <<'PY' || rc=$?
 import os
 import stat
 import sys
@@ -1164,7 +1164,7 @@ PY
   if [[ -e "$legacy" || -L "$legacy" ]]; then
     archive="$legacy.retired"
     [[ ! -e "$archive" ]] || archive="$archive.$(date -u +%Y%m%dT%H%M%SZ).$$"
-    python3 - "$legacy" "$archive" <<'PY' || return 1
+    python3 -I - "$legacy" "$archive" <<'PY' || return 1
 import os
 import stat
 import sys
@@ -1375,7 +1375,7 @@ configure_opencode2() {
 
 snapshot_sqlite_database() {  # <source> <destination>
   require_cmd python3
-  python3 - "$1" "$2" <<'PY'
+  python3 -I - "$1" "$2" <<'PY'
 import sqlite3
 import sys
 from pathlib import Path

@@ -163,7 +163,10 @@ ensure_health_pipeline() {
 LUNARWING_BASE_DIR=$HEALTH_BASE_DIR
 LUNARWING_SERVICE_MANAGER=$INIT_SYSTEM
 SELF_HEAL_TENANTS_FILE=$PORTS_REGISTRY
-LUNARWING_MT_ADMIN=$SCRIPT_DIR/lunarwing-mt-admin.sh
+# WI#424 worker egress audit: the health lib performs its own read-only
+# root-owned audit (health-worker-egress.sh). Root cron must never execute or
+# source an operator checkout (2026-10-15 ruling), so no LUNARWING_MT_ADMIN is
+# recorded here.
 
 # MT hardening: remediate only auto-discovered per-tenant init units; disable
 # checks that are N/A host-globally; page only on self-heal escalation (not on
@@ -235,9 +238,15 @@ ENVEOF
       rm -f "$_tmp2"
       say "reconciled SELF_HEAL_TENANTS_FILE=$PORTS_REGISTRY in $HEALTH_ENV_FILE"
     fi
-    if ! grep -q '^LUNARWING_MT_ADMIN=' "$HEALTH_ENV_FILE"; then
-      printf 'LUNARWING_MT_ADMIN=%s\n' "$SCRIPT_DIR/lunarwing-mt-admin.sh" >>"$HEALTH_ENV_FILE"
-      say "added LUNARWING_MT_ADMIN for the worker egress health audit"
+    # WI#424 (run-226 OQ-1): root cron must not exec an operator-checkout path.
+    # Drop the previously recorded LUNARWING_MT_ADMIN so upgrades stop handing
+    # the health lib a user-owned mt-admin to run on every tick.
+    if grep -q '^LUNARWING_MT_ADMIN=' "$HEALTH_ENV_FILE"; then
+      local _tmp3; _tmp3="$(mktemp)"
+      grep -v '^LUNARWING_MT_ADMIN=' "$HEALTH_ENV_FILE" >"$_tmp3" || true
+      cat "$_tmp3" >"$HEALTH_ENV_FILE"
+      rm -f "$_tmp3"
+      say "removed LUNARWING_MT_ADMIN from $HEALTH_ENV_FILE (root cron must not run an operator checkout)"
     fi
   fi
 

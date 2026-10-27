@@ -32,16 +32,19 @@ worker_egress_network_name() {
   printf 'lw-egress-%s\n' "$1"
 }
 
+# OQ-4: distinct fixed prefixes keep the two chain families from ever colliding
+# (the previous `worker_`/`worker_input_` pair made tenant `x`'s input chain and
+# tenant `input-x`'s forward chain the same name).
 worker_egress_chain() {
   _worker_egress_validate_name "$1"
   local normalized="${1//-/_}"
-  printf 'worker_%s\n' "$normalized"
+  printf 'fwd_%s\n' "$normalized"
 }
 
 worker_egress_input_chain() {
   _worker_egress_validate_name "$1"
   local normalized="${1//-/_}"
-  printf 'worker_input_%s\n' "$normalized"
+  printf 'in_%s\n' "$normalized"
 }
 
 worker_egress_conf_path() { printf '%s/%s.conf\n' "$WORKER_EGRESS_DIR" "$1"; }
@@ -441,7 +444,7 @@ worker_egress_network_exists() {
 worker_egress_network_details() {
   local name="$1" network="$2" json
   json="$(_ctr "$name" network inspect "$network" 2>/dev/null)" || return 1
-  python3 -c '
+  python3 -I -c '
 import json, sys
 runtime = sys.argv[1]
 doc = json.load(sys.stdin)
@@ -560,6 +563,23 @@ worker_egress_flush() {
     worker_egress_nft "$name" flush chain inet "$WORKER_EGRESS_TABLE" "$chain" >/dev/null 2>&1 || true
     worker_egress_nft "$name" delete chain inet "$WORKER_EGRESS_TABLE" "$chain" >/dev/null 2>&1 || true
   done
+}
+
+# Tenant removal must not leave the egress network, the rendered state or the
+# live chains behind for a later tenant of the same name to inherit (OQ-6).
+# Every step is best-effort: the tenant account may already be gone.
+worker_egress_teardown() {
+  local name="$1" network conf ruleset hosts
+  _worker_egress_validate_name "$name"
+  worker_egress_flush "$name" || true
+  network="$(worker_egress_network_name "$name")"
+  _ctr "$name" network rm "$network" >/dev/null 2>&1 || true
+  _worker_egress_lock
+  conf="$(worker_egress_conf_path "$name")"
+  ruleset="$(worker_egress_ruleset_path "$name")"
+  hosts="$(worker_egress_hosts_path "$name")"
+  rm -f -- "$conf" "$ruleset" "$hosts"
+  _worker_egress_unlock
 }
 
 worker_egress_host_mappings() {

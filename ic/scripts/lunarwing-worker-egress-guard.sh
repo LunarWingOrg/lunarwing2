@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # WI#424 control 1 — load/verify a tenant's worker egress boundary.
-# Usage: lunarwing-worker-egress-guard [--verify] <ruleset> <rootless|rootful> <chain> [tenant]
+# Usage: lunarwing-worker-egress-guard [--verify] <ruleset> <rootless|rootful> <forward-chain> [tenant]
 set -euo pipefail
 
 TABLE="lunarwing_worker_egress"
@@ -13,7 +13,7 @@ fi
 die() { printf 'worker-egress-guard: %s\n' "$1" >&2; exit "${2:-3}"; }
 
 [[ $# -ge 3 && $# -le 4 ]] \
-  || die "usage: $0 [--verify] <ruleset> <rootless|rootful> <chain> [tenant]"
+  || die "usage: $0 [--verify] <ruleset> <rootless|rootful> <forward-chain> [tenant]"
 ruleset="$1"
 mode="$2"
 chain="$3"
@@ -22,13 +22,15 @@ case "$mode" in
   rootless|rootful) ;;
   *) die "invalid mode '$mode' (expected rootless or rootful)" ;;
 esac
-[[ "$chain" =~ ^worker_[a-z0-9]([a-z0-9_]*[a-z0-9])?$ ]] \
-  || die "invalid worker egress chain '$chain'"
+[[ "$chain" =~ ^fwd_[a-z0-9]([a-z0-9_]*[a-z0-9])?$ ]] \
+  || die "invalid worker egress forward chain '$chain'"
 if [[ -n "$tenant" ]]; then
   [[ "$tenant" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] \
     || die "invalid tenant name '$tenant'"
 fi
-input_chain="worker_input_${chain#worker_}"
+# OQ-4: the two chain families use distinct fixed prefixes, so deriving the
+# input chain can never coincide with another tenant's forward chain.
+input_chain="in_${chain#fwd_}"
 [[ -f "$ruleset" && ! -L "$ruleset" ]] \
   || die "egress ruleset not found or not a regular file: $ruleset"
 
