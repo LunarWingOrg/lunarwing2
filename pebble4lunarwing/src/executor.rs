@@ -1703,15 +1703,16 @@ mod tests {
 
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("pebble-etxtbsy-{}-{seq}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pebble-etxtbsy-{}-{seq}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create stub dir");
 
         // Positive control: the rejected shape. Holding the write handle open
         // across the spawn is what makes the kernel refuse the exec.
         let busy = dir.join("busy.sh");
         let mut handle = std::fs::File::create(&busy).expect("create busy stub");
-        handle.write_all(b"#!/bin/sh\nexit 0\n").expect("write busy stub");
+        handle
+            .write_all(b"#!/bin/sh\nexit 0\n")
+            .expect("write busy stub");
         std::fs::set_permissions(&busy, std::fs::Permissions::from_mode(0o755))
             .expect("chmod busy stub");
         let refused = std::process::Command::new(&busy)
