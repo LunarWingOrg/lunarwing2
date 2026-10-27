@@ -131,6 +131,26 @@ UNITEOF
   fi
 }
 
+# Reconcile one KEY=VALUE line in the host-global health env file, creating it
+# if absent. The file is otherwise write-once so operator edits survive; a
+# stale value here would silently misroute a root-side check, so managed keys
+# are rewritten line-by-line (file mode/owner preserved).
+health_env_reconcile_line() {  # <KEY> <VALUE>
+  local key="$1" value="$2" _tmp
+  grep -q "^${key}=${value}$" "$HEALTH_ENV_FILE" && return 0
+  _tmp="$(mktemp)"
+  if grep -q "^${key}=" "$HEALTH_ENV_FILE"; then
+    awk -v k="$key" -v v="$value" 'index($0, k "=") == 1 {print k "=" v; next} {print}' \
+      "$HEALTH_ENV_FILE" >"$_tmp"
+  else
+    cp "$HEALTH_ENV_FILE" "$_tmp"
+    printf '%s=%s\n' "$key" "$value" >>"$_tmp"
+  fi
+  cat "$_tmp" >"$HEALTH_ENV_FILE"
+  rm -f "$_tmp"
+  say "reconciled ${key}=${value} in $HEALTH_ENV_FILE"
+}
+
 ensure_health_pipeline() {
   # Idempotently install + schedule the host-global health-check -> self-heal
   # pipeline. Auto-discovers all tenants, so one install covers every tenant.
@@ -155,6 +175,15 @@ ensure_health_pipeline() {
 
   # 3) Config env file (write-if-absent so operator edits survive).
   mkdir -p /etc/lunarwing
+  local egress_runtime="auto" egress_rootless="auto" _egress
+  # Subshell: ensure_container_runtime dies when no runtime is installed, and
+  # that must not abort a health-only install.
+  if _egress="$( ensure_container_runtime >/dev/null 2>&1 \
+        && printf '%s %s' "$CONTAINER_RT" "$MT_ROOTLESS" )" \
+     && [[ -n "$_egress" ]]; then
+    egress_runtime="${_egress%% *}"
+    egress_rootless="${_egress##* }"
+  fi
   if [[ ! -f "$HEALTH_ENV_FILE" ]]; then
     ( umask 077
       cat >"$HEALTH_ENV_FILE" <<ENVEOF
@@ -167,6 +196,14 @@ SELF_HEAL_TENANTS_FILE=$PORTS_REGISTRY
 # root-owned audit (health-worker-egress.sh). Root cron must never execute or
 # source an operator checkout (2026-10-15 ruling), so no LUNARWING_MT_ADMIN is
 # recorded here.
+#
+# The audit must read the SAME launch mode mt-admin provisions with: on a
+# rootful host (docker, or LUNARWING_MT_ROOTLESS=false) workers live in the
+# host network namespace, so guessing "rootless whenever podman exists" audits
+# the wrong netns and reports every running tenant critical (run-232 PB-1).
+# Both lines are reconciled on every install/upgrade.
+HEALTH_WORKER_EGRESS_RUNTIME=${egress_runtime}
+HEALTH_WORKER_EGRESS_ROOTLESS=${egress_rootless}
 
 # MT hardening: remediate only auto-discovered per-tenant init units; disable
 # checks that are N/A host-globally; page only on self-heal escalation (not on
@@ -249,6 +286,13 @@ ENVEOF
       say "removed LUNARWING_MT_ADMIN from $HEALTH_ENV_FILE (root cron must not run an operator checkout)"
     fi
   fi
+
+  # WI#424 (run-232 PB-1): record the launch mode the audit must observe, on
+  # both the fresh-install and the upgrade path, so a rootful-podman host does
+  # not get rootless-netns audits. Reconciled separately from the write-once
+  # block because a fresh install already wrote the values above.
+  health_env_reconcile_line HEALTH_WORKER_EGRESS_RUNTIME "$egress_runtime"
+  health_env_reconcile_line HEALTH_WORKER_EGRESS_ROOTLESS "$egress_rootless"
 
   # 4) Launcher: source env, then run the pipeline (health-check -> self-heal LIVE).
   cat >"$HEALTH_LAUNCHER" <<LAUNCHEOF

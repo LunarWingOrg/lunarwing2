@@ -1063,6 +1063,23 @@ An idle tenant (no running worker container) is never given a rootless netns
 just to be audited, and `remove-tenant` tears down the network, rendered state
 and live chains while the tenant account still exists.
 
+The audit reads the launch mode mt-admin provisions with rather than guessing
+it: `ensure_health_pipeline` writes `HEALTH_WORKER_EGRESS_RUNTIME` and
+`HEALTH_WORKER_EGRESS_ROOTLESS` into `/etc/lunarwing/health.env` and reconciles
+both on upgrade (run-232 PB-1), so a rootful-podman host
+(`LUNARWING_MT_ROOTLESS=false`) is audited in the host netns it actually uses
+instead of a rootless one, which would otherwise report every running tenant
+critical. **What the observations can and cannot prove (PB-2):** the
+root-owned `.conf`/`.hosts` reads are authoritative; the runtime and nft
+observations run as the tenant account, so an agent *inside* the container
+cannot forge them (the WI#424 requirement), but a compromised tenant account
+could. That is the same trust level as mt-admin's own `_ctr` helper, not a
+stronger boundary. Two side effects to know: `sudo` is a hard dependency of the
+root cron path (without it every tenant reports critical), and
+`podman network inspect` as a never-run tenant account initializes that
+account's podman storage, so the audit is read-only for root but not strictly
+side-effect-free for the tenant.
+
 The hermetic harness `ic/scripts/tests/test-worker-egress.sh` covers per-tenant
 isolation, exact rejects, DNS/host rendering, stale-container migration,
 missing-`nft` behavior, OpenRC and babysitter fail-closed paths, and the health

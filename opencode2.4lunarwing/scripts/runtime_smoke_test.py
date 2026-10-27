@@ -481,6 +481,10 @@ class CandidateBuildWiringTests(unittest.TestCase):
         self.assertIn('as_runtime_user /app/entrypoint.sh --mode websocket', runner)
         self.assertIn('as_runtime_user python3 /app/scripts/runtime_smoke.py', runner)
         self.assertIn('as_runtime_user id -u', runner)
+        # PB-3: the old `su ... - 10003` fallback could never work (`su` takes a
+        # user name, not a uid), so a missing setpriv must fail loudly instead.
+        self.assertNotIn("su -s", runner)
+        self.assertIn("setpriv is missing", runner)
 
     def test_candidate_input_manifest_includes_the_entrypoint_runner(self) -> None:
         repo = Path(__file__).resolve().parents[2]

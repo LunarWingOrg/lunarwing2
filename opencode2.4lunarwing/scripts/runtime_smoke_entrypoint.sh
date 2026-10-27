@@ -29,13 +29,13 @@ mkdir -p "$SMOKE_ROOT"
 chown "$SMOKE_UID:$SMOKE_GID" "$SMOKE_ROOT"
 
 # Run a given command as the image runtime user. `setpriv` ships in Debian's
-# util-linux (always present); fall back to `su` if it is ever absent.
+# util-linux, so its absence means the image is not what we pinned: fail loudly
+# instead of guessing at a fallback that would silently run as root (run-232
+# PB-3 — `su` takes a user name, not a uid, so the old fallback never worked).
 as_runtime_user() {
-  if command -v setpriv >/dev/null 2>&1; then
-    setpriv --reuid="$SMOKE_UID" --regid="$SMOKE_GID" --clear-groups -- "$@"
-  else
-    su -s /bin/bash -c "$(printf '%q ' "$@")" - 10003
-  fi
+  command -v setpriv >/dev/null 2>&1 \
+    || { printf 'runtime_smoke: setpriv is missing; cannot drop to uid %s\n' "$SMOKE_UID" >&2; return 1; }
+  setpriv --reuid="$SMOKE_UID" --regid="$SMOKE_GID" --clear-groups -- "$@"
 }
 
 export HOME="$SMOKE_ROOT/home"

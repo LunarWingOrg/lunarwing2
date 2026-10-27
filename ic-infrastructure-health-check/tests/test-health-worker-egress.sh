@@ -254,6 +254,37 @@ pipeline="$(cat "$SCRIPT_DIR/../../ic/scripts/mt-admin-lib/12-health-pipeline.sh
 assert_absent "$pipeline" 'LUNARWING_MT_ADMIN=$SCRIPT_DIR/lunarwing-mt-admin.sh' "the health env records no operator checkout path (OQ-1)"
 assert_contains "$pipeline" 'removed LUNARWING_MT_ADMIN' "upgrades drop a previously recorded checkout path (OQ-1)"
 
+# PB-1: the audit must not guess the launch mode. mt-admin records the runtime
+# and rootless flag it provisions with into health.env (fresh install AND
+# upgrade), so a rootful-podman host is not audited through a rootless netns.
+# shellcheck disable=SC2016  # literal ${...} names in the generated env template.
+assert_contains "$pipeline" 'HEALTH_WORKER_EGRESS_RUNTIME=${egress_runtime}' "health.env carries the provisioned runtime (PB-1)"
+# shellcheck disable=SC2016  # literal ${...} names in the generated env template.
+assert_contains "$pipeline" 'HEALTH_WORKER_EGRESS_ROOTLESS=${egress_rootless}' "health.env carries the provisioned rootless flag (PB-1)"
+assert_contains "$pipeline" 'health_env_reconcile_line HEALTH_WORKER_EGRESS_RUNTIME' "the runtime line is reconciled on upgrade (PB-1)"
+assert_contains "$pipeline" 'health_env_reconcile_line HEALTH_WORKER_EGRESS_ROOTLESS' "the rootless line is reconciled on upgrade (PB-1)"
+
+# Functional pin for the reconciler: existing operator lines survive, the two
+# managed lines take the provisioned value, and a missing line is appended.
+RECONCILER="$FIXTURE/reconciler.sh"
+{
+  printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+  printf 'say() { :; }\nHEALTH_ENV_FILE=%q\n' "$FIXTURE/health.env"
+  awk '/^health_env_reconcile_line\(\) \{/,/^\}/' \
+    "$SCRIPT_DIR/../../ic/scripts/mt-admin-lib/12-health-pipeline.sh"
+  printf 'health_env_reconcile_line HEALTH_WORKER_EGRESS_RUNTIME podman\n'
+  printf 'health_env_reconcile_line HEALTH_WORKER_EGRESS_ROOTLESS false\n'
+} >"$RECONCILER"
+printf 'HEALTH_WORKER_EGRESS_RUNTIME=auto\nOPERATOR_TOKEN=keep-me\n' >"$FIXTURE/health.env"
+if bash "$RECONCILER"; then
+  env_text="$(cat "$FIXTURE/health.env")"
+  assert_contains "$env_text" 'HEALTH_WORKER_EGRESS_RUNTIME=podman' "the reconciler rewrites a stale runtime (PB-1)"
+  assert_contains "$env_text" 'HEALTH_WORKER_EGRESS_ROOTLESS=false' "the reconciler appends a missing flag (PB-1)"
+  assert_contains "$env_text" 'OPERATOR_TOKEN=keep-me' "the reconciler preserves operator lines (PB-1)"
+else
+  fail "the health env reconciler runs (PB-1)"
+fi
+
 printf '%d passed, %d failed\n' "$passes" "$failures"
 if ((failures > 0)); then
   exit 1
