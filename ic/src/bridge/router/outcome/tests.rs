@@ -11,7 +11,7 @@ use super::*;
 use crate::bridge::router::{
     PendingGateResolution, engine_conversation_key, matching_engine_approval_gate,
     matching_engine_auth_gate,
-    tests::{TestStore, make_expected_test_state, save_waiting_thread},
+    tests::{TestStore, make_expected_test_state, sample_pending_gate, save_waiting_thread},
 };
 use crate::channels::OutgoingResponse;
 use crate::hooks::{
@@ -342,6 +342,109 @@ async fn late_authentication_fallback_persists_a_resolvable_gate() {
             .entries
             .iter()
             .any(|entry| matches!(entry.sender, lunarwing_engine::EntrySender::Agent { .. }))
+    );
+}
+
+async fn insert_shell_gate(rig: &Rig) -> PendingGate {
+    let mut gate = sample_pending_gate(
+        "alice",
+        rig.turn.thread_id,
+        lunarwing_engine::ResumeKind::Approval {
+            allow_always: false,
+        },
+    );
+    gate.conversation_id = rig.turn.conversation_id;
+    gate.source_channel = "xmpp".into();
+    rig.turn
+        .state
+        .pending_gates
+        .insert(gate.clone())
+        .await
+        .unwrap();
+    gate
+}
+
+#[tokio::test]
+async fn terminal_turns_reap_shell_gates_from_memory_and_persistence() {
+    let outcomes = [
+        ThreadOutcome::Completed {
+            response: Some("done".into()),
+        },
+        ThreadOutcome::Failed {
+            kind: lunarwing_engine::ThreadFailureKind::Orchestrator,
+            error: "failed".into(),
+        },
+        ThreadOutcome::Stopped,
+        ThreadOutcome::MaxIterations,
+    ];
+    for outcome in outcomes {
+        let rig = Rig::new(None, None).await;
+        let gate = insert_shell_gate(&rig).await;
+        rig.turn.complete(outcome).await.unwrap();
+
+        assert!(rig.turn.state.pending_gates.list_all().await.is_empty());
+        let restored = crate::gate::store::PendingGateStore::new(Some(Arc::new(
+            crate::gate::persistence::FileGatePersistence::new(rig._disk.path().join("gates.json")),
+        )));
+        assert_eq!(restored.restore_from_persistence().await.unwrap(), 0);
+        assert!(
+            rig.turn
+                .state
+                .pending_gates
+                .peek(&gate.key())
+                .await
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn terminal_turn_broadcasts_thread_terminated_gate_resolution() {
+    use crate::channels::web::{GatewayChannel, types::SseEvent};
+    use futures::{FutureExt, StreamExt};
+
+    let mut rig = Rig::new(None, None).await;
+    let gateway = GatewayChannel::new(
+        crate::config::GatewayConfig {
+            host: "127.0.0.1".into(),
+            port: 0,
+            auth_token: Some("test-token".into()),
+            mascot_enabled: false,
+            user_id: "alice".into(),
+            workspace_read_scopes: vec![],
+            memory_layers: vec![],
+            user_tokens: None,
+            ws_ping_interval_secs: 30,
+            ws_idle_timeout_secs: 120,
+        },
+        "alice".into(),
+    );
+    let sse = Arc::clone(&gateway.state().sse);
+    let mut events = sse.subscribe_raw(Some("alice".into())).unwrap();
+    rig.turn.state.sse = Some(sse);
+    let gate = insert_shell_gate(&rig).await;
+
+    rig.turn.complete(ThreadOutcome::Stopped).await.unwrap();
+
+    let mut resolutions = Vec::new();
+    while let Some(Some(event)) = events.next().now_or_never() {
+        if let SseEvent::GateResolved {
+            request_id,
+            resolution,
+            thread_id,
+            ..
+        } = event
+        {
+            resolutions.push((request_id, resolution, thread_id));
+        }
+    }
+    assert_eq!(
+        resolutions,
+        vec![(
+            gate.request_id.to_string(),
+            "thread_terminated".into(),
+            Some(gate.thread_id.to_string()),
+        )]
     );
 }
 
