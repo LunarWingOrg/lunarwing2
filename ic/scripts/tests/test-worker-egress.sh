@@ -117,9 +117,12 @@ CTR_CALLS=()
 network_json() {
   local subnet="${CTR_SUBNET:-$(worker_egress_state_get alpha SUBNET)}"
   local bridge
-  bridge="$(_worker_egress_bridge_for_subnet "$subnet")"
+  # CTR_BRIDGE lets a fixture present a network whose bridge differs from the
+  # derived one (OQ-3: the bridge check is what keeps every rule meaningful —
+  # all rules key on iifname, so a wrong bridge means no filtering at all).
+  bridge="${CTR_BRIDGE:-$(_worker_egress_bridge_for_subnet "$subnet")}"
   printf '{"subnets":[{"subnet":"%s","gateway":"%s"}],"network_interface":"%s","dns_enabled":%s}\n' \
-    "$subnet" "$(_worker_egress_gateway "$subnet")" "$bridge" "$CTR_DNS_ENABLED"
+    "$subnet" "${CTR_GATEWAY:-$(_worker_egress_gateway "$subnet")}" "$bridge" "$CTR_DNS_ENABLED"
 }
 _ctr() {
   local name="$1"; shift
@@ -176,25 +179,28 @@ assert_eq "$(cat "$fixture/second-lock")" "acquired" "second allocator acquires 
 pass "subnet allocation lock excludes concurrent holders"
 
 ruleset="$(worker_egress_ruleset alpha)"
-assert_contains "$ruleset" 'chain worker_alpha' "tenant has its own forward chain"
-assert_contains "$ruleset" 'chain worker_input_alpha' "tenant has its own input chain"
-assert_contains "$ruleset" 'flush chain inet lunarwing_worker_egress worker_alpha' "apply flushes only the tenant forward chain"
-assert_absent "$ruleset" 'flush chain inet lunarwing_worker_egress worker_beta' "tenant apply never flushes another tenant"
+assert_contains "$ruleset" 'chain fwd_alpha' "tenant has its own forward chain"
+assert_contains "$ruleset" 'chain in_alpha' "tenant has its own input chain"
+assert_contains "$ruleset" 'flush chain inet lunarwing_worker_egress fwd_alpha' "apply flushes only the tenant forward chain"
+assert_absent "$ruleset" 'flush chain inet lunarwing_worker_egress fwd_beta' "tenant apply never flushes another tenant"
 assert_absent "$ruleset" 'chain workers' "the shared workers chain is gone"
 assert_absent "$ruleset" 'dport 53' "recursive DNS has no allow rule"
 assert_contains "$ruleset" 'iifname "lweg10" meta nfproto ipv6 counter reject with icmpx type admin-prohibited' "IPv6 is rejected on the worker bridge"
+forward_block="$(awk '/chain fwd_alpha/{blocks++; inside=1} inside && blocks == 2 {print} inside && blocks == 2 && /^    }/{exit}' <<<"$ruleset")"
+assert_contains "$forward_block" 'meta nfproto ipv6 counter reject with icmpx type admin-prohibited' "the forward chain carries the IPv6 reject (OQ-3)"
+assert_contains "$forward_block" 'ip saddr != 10.89.10.0/24 counter reject with icmpx type admin-prohibited' "the forward chain rejects secondary sources (OQ-3)"
 assert_contains "$ruleset" 'iifname "lweg10" ip saddr != 10.89.10.0/24 counter reject with icmpx type admin-prohibited' "unclassified source addresses are rejected"
 assert_contains "$ruleset" 'iifname "lweg10" ip saddr 10.89.10.0/24 counter reject with icmpx type admin-prohibited' "exact all-protocol tenant reject is rendered"
 assert_absent "$ruleset" 'meta l4proto tcp' "the final reject is not narrowed to TCP"
 assert_contains "$ruleset" 'ip daddr 203.0.113.40 tcp dport 443 accept' "hostname resolution pins the default HTTPS port"
 assert_contains "$ruleset" 'ip daddr 169.254.1.2 tcp dport 3000 accept' "rootless host alias is allowlisted"
-input_block="$(awk '/chain worker_input_alpha/{blocks++; inside=1} inside && blocks == 2 {print} inside && blocks == 2 && /^    }/{exit}' <<<"$ruleset")"
+input_block="$(awk '/chain in_alpha/{blocks++; inside=1} inside && blocks == 2 {print} inside && blocks == 2 && /^    }/{exit}' <<<"$ruleset")"
 assert_contains "$input_block" 'ip daddr 169.254.1.2 tcp dport 3000 accept' "input chain permits the configured host LLM port"
 assert_absent "$input_block" '203.0.113.40' "input chain does not expose arbitrary host ports for external destinations"
 assert_eq "$(CONTAINER_RT=podman MT_ROOTLESS=false _worker_egress_host_addrs 10.89.10.1)" '10.89.10.1' "rootful loopback maps to the bridge gateway"
 assert_absent "$ruleset" 'policy drop' "unrelated host traffic remains outside the tenant chains"
 beta_ruleset="$(worker_egress_ruleset beta)"
-assert_absent "$beta_ruleset" 'flush chain inet lunarwing_worker_egress "worker_alpha"' "beta render never touches alpha"
+assert_absent "$beta_ruleset" 'flush chain inet lunarwing_worker_egress "fwd_alpha"' "beta render never touches alpha"
 
 LLM_TARGETS=("http://203.0.113.30/v1")
 assert_contains "$(worker_egress_ruleset alpha)" 'ip daddr 203.0.113.30 tcp dport 80 accept' "portless HTTP uses port 80"
@@ -224,7 +230,7 @@ else
   assert_contains "$(cat "$fixture/apply.err")" 'did not survive the load' "apply refusal names the real cause"
 fi
 NFT_LIST_RC=0
-NFT_LIST_OUT=$'chain "worker_alpha" {\n}'
+NFT_LIST_OUT=$'chain "fwd_alpha" {\n}'
 if (worker_egress_apply alpha) >/dev/null 2>"$fixture/no-reject.err"; then
   fail "apply accepted a chain without its reject"
 else
@@ -301,6 +307,14 @@ else
   assert_contains "$(cat "$fixture/subnet-mismatch.err")" 'expected' "subnet mismatch names the expected contract"
 fi
 CTR_SUBNET=""
+CTR_BRIDGE=lweg99
+if (worker_egress_ensure alpha) >/dev/null 2>"$fixture/bridge-mismatch.err"; then
+  fail "network ensure accepted a bridge-name mismatch (OQ-3)"
+else
+  pass "network ensure rejects a bridge-name mismatch (OQ-3)"
+  assert_contains "$(cat "$fixture/bridge-mismatch.err")" "bridge 'lweg99'" "bridge mismatch names the observed bridge"
+fi
+CTR_BRIDGE=""
 CTR_DNS_ENABLED=true
 if (worker_egress_ensure alpha) >/dev/null 2>"$fixture/dns-enabled.err"; then
   fail "network ensure accepted recursive DNS"
@@ -309,6 +323,13 @@ else
   assert_contains "$(cat "$fixture/dns-enabled.err")" 'recursive DNS enabled' "DNS-enabled network refusal names the cause"
 fi
 CTR_DNS_ENABLED=false
+CTR_GATEWAY=""
+if (CTR_GATEWAY=10.89.10.254 worker_egress_ensure alpha) >/dev/null 2>"$fixture/gateway-mismatch.err"; then
+  fail "network ensure accepted a gateway mismatch (OQ-3)"
+else
+  pass "network ensure rejects a gateway mismatch (OQ-3)"
+  assert_contains "$(cat "$fixture/gateway-mismatch.err")" "gateway '10.89.10.254'" "gateway mismatch names the observed gateway"
+fi
 CTR_NETWORK_EXISTS=false
 CTR_CALLS=()
 : >"$CTR_LOG"
@@ -342,6 +363,13 @@ if (worker_egress_verify() { return 1; }; worker_egress_verify_after_start alpha
 else
   pass "post-start check fails when the filter vanishes"
   assert_contains "$(cat "$CTR_LOG")" 'stop lunarwing-opencode2-alpha' "post-start failure stops the worker"
+fi
+: >"$CTR_LOG"
+if (CTR_NETWORKS=lw-egress-alpha,default worker_egress_verify_after_start alpha lunarwing-opencode2-alpha) >/dev/null 2>&1; then
+  fail "post-start check accepted an extra network attachment (OQ-3)"
+else
+  pass "post-start check refuses an extra network attachment (OQ-3)"
+  assert_contains "$(cat "$CTR_LOG")" 'stop lunarwing-opencode2-alpha' "extra-network post-start failure stops the worker"
 fi
 contract="$(_worker_launch_contract alpha lunarwing-worker-opencode2:latest ssh-agent-dir-ro)"
 assert_contains "$contract" 'egress=lw-egress-alpha' "launch contract forces pre-egress containers to recreate"
@@ -392,28 +420,28 @@ case "${1:-}" in
 esac
 STUB
 chmod +x "$guard_bin/nft"
-assert_rc_fail env PATH="$guard_bin:$PATH" "$guard" "$fixture/missing.nft" rootful worker_alpha
-if PATH="$guard_bin:$PATH" "$guard" "$fixture/alpha.nft" rootful worker_alpha >/dev/null; then
+assert_rc_fail env PATH="$guard_bin:$PATH" "$guard" "$fixture/missing.nft" rootful fwd_alpha
+if PATH="$guard_bin:$PATH" "$guard" "$fixture/alpha.nft" rootful fwd_alpha >/dev/null; then
   pass "guard accepts both exact live chains"
 else
   fail "guard rejected both exact live chains"
 fi
-assert_rc_fail env PATH="$guard_bin:$PATH" FAKE_LOAD_RC=1 "$guard" "$fixture/alpha.nft" rootful worker_alpha
-assert_rc_fail env PATH="$guard_bin:$PATH" FAKE_LIST_RC=1 "$guard" "$fixture/alpha.nft" rootful worker_alpha
-assert_rc_fail env PATH="$guard_bin:$PATH" FAKE_MODE=empty "$guard" "$fixture/alpha.nft" rootful worker_alpha
-assert_rc_fail env PATH="$guard_bin:$PATH" FAKE_MODE=wrong "$guard" "$fixture/alpha.nft" rootful worker_alpha
-assert_rc_fail env PATH="$guard_bin:$PATH" FAKE_MODE=narrow "$guard" "$fixture/alpha.nft" rootful worker_alpha
-if PATH="$guard_bin:$PATH" "$guard" --verify "$fixture/alpha.nft" rootful worker_alpha >/dev/null; then
+assert_rc_fail env PATH="$guard_bin:$PATH" FAKE_LOAD_RC=1 "$guard" "$fixture/alpha.nft" rootful fwd_alpha
+assert_rc_fail env PATH="$guard_bin:$PATH" FAKE_LIST_RC=1 "$guard" "$fixture/alpha.nft" rootful fwd_alpha
+assert_rc_fail env PATH="$guard_bin:$PATH" FAKE_MODE=empty "$guard" "$fixture/alpha.nft" rootful fwd_alpha
+assert_rc_fail env PATH="$guard_bin:$PATH" FAKE_MODE=wrong "$guard" "$fixture/alpha.nft" rootful fwd_alpha
+assert_rc_fail env PATH="$guard_bin:$PATH" FAKE_MODE=narrow "$guard" "$fixture/alpha.nft" rootful fwd_alpha
+if PATH="$guard_bin:$PATH" "$guard" --verify "$fixture/alpha.nft" rootful fwd_alpha >/dev/null; then
   pass "guard --verify rechecks a started worker without reloading"
 else
   fail "guard --verify rejected a live worker"
 fi
 mkdir -p "$fixture/no-nft"
-assert_rc_fail env PATH="$fixture/no-nft" /bin/bash "$guard" "$fixture/alpha.nft" rootful worker_alpha
-assert_rc_fail env PATH="$guard_bin:$PATH" /bin/bash "$guard" "$fixture/alpha.nft" rootless worker_alpha 'bad;tenant'
+assert_rc_fail env PATH="$fixture/no-nft" /bin/bash "$guard" "$fixture/alpha.nft" rootful fwd_alpha
+assert_rc_fail env PATH="$guard_bin:$PATH" /bin/bash "$guard" "$fixture/alpha.nft" rootless fwd_alpha 'bad;tenant'
 sed 's/ip saddr 10.89.10.0\/24 counter reject/meta l4proto tcp ip saddr 10.89.10.0\/24 counter reject/' \
   "$fixture/alpha.nft" >"$fixture/narrow.nft"
-assert_rc_fail env PATH="$guard_bin:$PATH" "$guard" "$fixture/narrow.nft" rootful worker_alpha
+assert_rc_fail env PATH="$guard_bin:$PATH" "$guard" "$fixture/narrow.nft" rootful fwd_alpha
 
 # ── rendered OpenRC start behavior ────────────────────────────────────────────
 mkdir -p "$fixture/initd"
@@ -492,7 +520,7 @@ chmod +x "$fixture/podman"
 babysitter="$HARNESS_REPO_ROOT/ic/scripts/lunarwing-ctr-babysit.sh"
 : >"$GUARD_LOG"; : >"$CTR_LOG"
 if PATH="$fixture:$PATH" LOAD_RC=0 VERIFY_RC=0 GUARD_LOG="$GUARD_LOG" CTR_LOG="$CTR_LOG" \
-    "$babysitter" lunarwing-opencode2-alpha "$fixture/openrc-guard" "$fixture/alpha.nft" worker_alpha >/dev/null 2>&1; then
+    "$babysitter" lunarwing-opencode2-alpha "$fixture/openrc-guard" "$fixture/alpha.nft" fwd_alpha >/dev/null 2>&1; then
   pass "babysitter runs pre/post guards around podman start"
   assert_contains "$(cat "$CTR_LOG")" 'start lunarwing-opencode2-alpha' "babysitter starts the guarded container"
 else
@@ -500,13 +528,13 @@ else
 fi
 : >"$GUARD_LOG"; : >"$CTR_LOG"
 assert_rc_fail env PATH="$fixture:$PATH" LOAD_RC=1 VERIFY_RC=0 GUARD_LOG="$GUARD_LOG" CTR_LOG="$CTR_LOG" \
-  "$babysitter" lunarwing-opencode2-alpha "$fixture/openrc-guard" "$fixture/alpha.nft" worker_alpha
+  "$babysitter" lunarwing-opencode2-alpha "$fixture/openrc-guard" "$fixture/alpha.nft" fwd_alpha
 assert_absent "$(cat "$CTR_LOG")" 'start lunarwing-opencode2-alpha' "babysitter pre-guard failure prevents respawn"
 : >"$GUARD_LOG"; : >"$CTR_LOG"
 assert_rc_fail env PATH="$fixture:$PATH" LOAD_RC=0 VERIFY_RC=1 GUARD_LOG="$GUARD_LOG" CTR_LOG="$CTR_LOG" \
-  "$babysitter" lunarwing-opencode2-alpha "$fixture/openrc-guard" "$fixture/alpha.nft" worker_alpha
+  "$babysitter" lunarwing-opencode2-alpha "$fixture/openrc-guard" "$fixture/alpha.nft" fwd_alpha
 assert_contains "$(cat "$CTR_LOG")" 'stop lunarwing-opencode2-alpha' "babysitter post-guard failure stops the respawned worker"
-assert_rc_fail env PATH="$fixture:$PATH" "$babysitter" lunarwing-opencode2-alpha "$fixture/missing-guard" "$fixture/alpha.nft" worker_alpha
+assert_rc_fail env PATH="$fixture:$PATH" "$babysitter" lunarwing-opencode2-alpha "$fixture/missing-guard" "$fixture/alpha.nft" fwd_alpha
 
 # ── source wiring pins ────────────────────────────────────────────────────────
 worker_config="$HARNESS_REPO_ROOT/ic/scripts/mt-admin-lib/09-worker-config.sh"
@@ -538,10 +566,10 @@ run_live_arm() {
     podman rm -f "$LIVE_CONTAINER" >/dev/null 2>&1 || true
     podman network rm -f "$LIVE_NET" >/dev/null 2>&1 || true
     [[ -z "$LIVE_HTTPD_PID" ]] || kill -9 "$LIVE_HTTPD_PID" >/dev/null 2>&1 || true
-    podman unshare --rootless-netns nft flush chain inet "$WORKER_EGRESS_TABLE" worker_liveprobe >/dev/null 2>&1 || true
-    podman unshare --rootless-netns nft delete chain inet "$WORKER_EGRESS_TABLE" worker_liveprobe >/dev/null 2>&1 || true
-    podman unshare --rootless-netns nft flush chain inet "$WORKER_EGRESS_TABLE" worker_input_liveprobe >/dev/null 2>&1 || true
-    podman unshare --rootless-netns nft delete chain inet "$WORKER_EGRESS_TABLE" worker_input_liveprobe >/dev/null 2>&1 || true
+    podman unshare --rootless-netns nft flush chain inet "$WORKER_EGRESS_TABLE" fwd_liveprobe >/dev/null 2>&1 || true
+    podman unshare --rootless-netns nft delete chain inet "$WORKER_EGRESS_TABLE" fwd_liveprobe >/dev/null 2>&1 || true
+    podman unshare --rootless-netns nft flush chain inet "$WORKER_EGRESS_TABLE" in_liveprobe >/dev/null 2>&1 || true
+    podman unshare --rootless-netns nft delete chain inet "$WORKER_EGRESS_TABLE" in_liveprobe >/dev/null 2>&1 || true
   }
   trap cleanup_live EXIT
   (cd "$fixture" && exec python3 -m http.server "$port" --bind 0.0.0.0) >"$fixture/httpd.log" 2>&1 </dev/null &
@@ -556,7 +584,7 @@ run_live_arm() {
   CONTAINER_RT=podman MT_ROOTLESS=true worker_egress_ruleset liveprobe >"$fixture/liveprobe.nft" \
     || { fail "live arm: render failed"; return 1; }
   _worker_egress_static_hosts "$(worker_egress_target_records liveprobe)" >"$WORKER_EGRESS_DIR/liveprobe.hosts"
-  if ! "$guard" "$fixture/liveprobe.nft" rootless worker_liveprobe >"$fixture/live-guard.out" 2>"$fixture/live-guard.err"; then
+  if ! "$guard" "$fixture/liveprobe.nft" rootless fwd_liveprobe >"$fixture/live-guard.out" 2>"$fixture/live-guard.err"; then
     cat "$fixture/live-guard.err" >&2
     sed 's/^/  /' "$fixture/liveprobe.nft" >&2
     fail "live arm: pre-start guard failed"; return 1
@@ -566,7 +594,7 @@ run_live_arm() {
   podman run -d --name "$LIVE_CONTAINER" "${live_args[@]}" "$image" sleep 120 >/dev/null \
     || { fail "live arm: container start failed"; return 1; }
   sleep 2
-  "$guard" --verify "$fixture/liveprobe.nft" rootless worker_liveprobe >/dev/null 2>&1 \
+  "$guard" --verify "$fixture/liveprobe.nft" rootless fwd_liveprobe >/dev/null 2>&1 \
     || { fail "live arm: post-start guard failed"; return 1; }
   if podman exec "$LIVE_CONTAINER" wget -q -O /dev/null -T 5 "http://localhost:$port/"; then
     pass "live arm: static-host allowlisted fetch succeeds"
