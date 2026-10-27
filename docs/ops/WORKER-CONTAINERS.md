@@ -864,7 +864,9 @@ Enforced controls (opencode2 lane unless noted):
    not pass). The **protected candidate image build** runs
    `scripts/runtime_smoke_entrypoint.sh`, which starts the real entrypoint and
    its health/opencode/bridge listeners before running all five checks; an empty
-   Dockerfile `RUN` process table cannot satisfy the suite. Against a tenant use
+   Dockerfile `RUN` process table cannot satisfy the suite, and the smoke runs
+   as the image runtime user (uid 10003), not root, so it observes real worker
+   permissions. Against a tenant use
    `mt-admin worker-smoke <tenant> [opencode2]` (inside the container via
    `podman exec`), or `--profile remote --container <name>` from the host; remote
    mode reads the container's own environment and WS port. Control 9 still
@@ -1001,10 +1003,12 @@ How it is wired:
 
 * `worker_egress_ensure` allocates `10.89.N.0/24` under a dedicated lock and
   creates `lw-egress-<tenant>` with bridge `lwegN`. Existing networks are
-  inspected on every prepare: subnet, gateway, bridge name, and disabled-DNS
-  contract must all match or the start refuses. Podman uses
-  `--interface-name` and `--disable-dns`; docker uses the equivalent bridge
-  option and the same loopback-resolver launch pin.
+  inspected on every prepare: subnet, gateway, bridge name, and DNS contract
+  must all match or the start refuses. Podman uses `--interface-name` and
+  `--disable-dns`; docker uses the equivalent bridge option and the same
+  loopback-resolver launch pin. Docker user-defined networks always run their
+  embedded resolver, so the docker lane reports its DNS state as `unverified`
+  rather than claiming `disabled`; podman must still prove it disabled.
 * `worker_egress_apply` renders root-owned 0644 `<tenant>.nft` and
   `<tenant>.hosts` state under `/etc/lunarwing/worker-egress/`. One resolution
   pass feeds both files. Render failure removes older boot state instead of
@@ -1024,7 +1028,9 @@ How it is wired:
 * `worker_egress_verify_after_start` also checks the runtime's exclusive
   network/DNS/static-host contract and stops the container on failure. Missing
   `nft`, a vanished chain, a TCP-only or wrong-subnet reject, and a missing
-  guard all refuse the start.
+  guard all refuse the start. Chain families use distinct fixed prefixes
+  (`fwd_<tenant>` forward, `in_<tenant>` input), so no tenant's input chain can
+  collide with another tenant's forward chain on a shared rootful netns.
 
 Operator surface:
 
@@ -1043,6 +1049,15 @@ it never asks the container to report on itself. The
 tick and reports per-tenant failures as `worker_egress@<tenant>` monitor-only
 escalations. It detects firewall reloads that deleted rules without inventing
 a parallel restart or re-apply path.
+
+The health component is self-contained on purpose: it runs as root from cron,
+so it reads only root-owned state under `/etc/lunarwing/worker-egress/` and
+observes the runtime/nft as the tenant. It never executes or sources the
+operator checkout — the health lib sync (`12-health-pipeline.sh`) records no
+`LUNARWING_MT_ADMIN` path and drops any it finds in an existing `health.env`.
+An idle tenant (no running worker container) is never given a rootless netns
+just to be audited, and `remove-tenant` tears down the network, rendered state
+and live chains while the tenant account still exists.
 
 The hermetic harness `ic/scripts/tests/test-worker-egress.sh` covers per-tenant
 isolation, exact rejects, DNS/host rendering, stale-container migration,
