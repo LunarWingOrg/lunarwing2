@@ -469,9 +469,12 @@ impl StoreData {
     /// byte-level scrub as opaque bytes the scrub cannot inspect — and the
     /// guest, which chose `Accept-Encoding`, could decode an echo itself.
     /// The wrapper forces `accept-encoding: identity` and removes `TE` on
-    /// those requests. Non-identity content codings and non-chunked transfer
-    /// codings are refused for non-empty bodies; hyper removes chunk framing.
-    /// The refusal lives here so the interceptor test path pins it end to end.
+    /// those requests. Non-identity content codings are refused, and a
+    /// transfer coding is refused unless it is exactly the single `chunked`
+    /// layer hyper removes (WI#430) — trailing empty elements/fields and
+    /// repeated `chunked` can leave framing that hides a split echo from the
+    /// byte scrub. The refusal lives here so the interceptor test path pins
+    /// it end to end.
     fn redact_http_outcome_for_guest(
         &self,
         outcome: Result<lunarwing::agent::host::HttpResponse, String>,
@@ -963,25 +966,48 @@ fn guest_response_headers(headers: &reqwest::header::HeaderMap) -> HashMap<Strin
 }
 
 /// True when response headers are unreadable or declare an opaque body coding.
-/// Content-Encoding allows only identity; Transfer-Encoding allows only chunked
-/// (hyper removes that framing). Empty tokens are ignored. Both field names and
-/// coding names are case-insensitive, and every comma-separated token is checked.
+/// Content-Encoding allows only identity; Transfer-Encoding passes only when
+/// hyper actually removes the chunk framing (see
+/// [`transfer_coding_keeps_framing`]). Both field names and coding names are
+/// case-insensitive, and every comma-separated token is checked. The guest
+/// string-map ABI comma-joins duplicate fields in header order, which keeps
+/// the last-token information hyper's rule depends on.
 fn guest_body_encoding_is_opaque(headers_json: &str) -> bool {
     let Ok(map) = serde_json::from_str::<HashMap<String, String>>(headers_json) else {
         return true;
     };
     map.iter().any(|(name, value)| {
-        let allowed = if name.eq_ignore_ascii_case("content-encoding") {
-            "identity"
+        if name.eq_ignore_ascii_case("content-encoding") {
+            value.split(',').any(|token| {
+                !token.trim().is_empty() && !token.trim().eq_ignore_ascii_case("identity")
+            })
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
-            "chunked"
+            transfer_coding_keeps_framing(value)
         } else {
-            return false;
-        };
-        value
-            .split(',')
-            .any(|token| !token.trim().is_empty() && !token.trim().eq_ignore_ascii_case(allowed))
+            false
+        }
     })
+}
+
+/// hyper removes exactly one chunked layer, and only when the last list
+/// element of the last `Transfer-Encoding` field is `chunked`
+/// (`hyper::headers::transfer_encoding_is_chunked`). Anything else leaves
+/// chunk framing — or a coding — in the body, which can split an echoed
+/// credential past the byte-level scrub (WI#430; proxy IV-1 parity).
+///
+/// `guest_response_headers` joins duplicate fields with `", "` in header
+/// order, so this rule over the joined value matches hyper: `chunked,`
+/// (trailing empty element) and a `chunked` field followed by an empty field
+/// both leave the last element empty, while `,chunked` and an empty field
+/// followed by `chunked` still end in the single `chunked` token hyper
+/// de-chunks. Repeated `chunked` tokens count as more than one layer.
+fn transfer_coding_keeps_framing(value: &str) -> bool {
+    let tokens: Vec<&str> = value.split(',').map(str::trim).collect();
+    let non_empty = tokens.iter().filter(|token| !token.is_empty()).count();
+    let last_is_chunked = tokens
+        .last()
+        .is_some_and(|token| token.eq_ignore_ascii_case("chunked"));
+    !(non_empty == 1 && last_is_chunked)
 }
 
 /// Format a reqwest send error without exposing the request URL.
@@ -3981,7 +4007,7 @@ mod tests {
             ),
             (
                 encoded_response(&[("Transfer-Encoding", "Chunked, ")], "plain"),
-                false,
+                true,
             ),
             (
                 encoded_response(&[("transfer-encoding", "chunked, gzip")], "opaque"),
