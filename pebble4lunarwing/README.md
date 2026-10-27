@@ -108,17 +108,20 @@ LunarWing owns every public exposure path through the daemon's tunnel; the
 only instruction channel into this worker is the daemon's job dispatch → the
 bridge → pebble on loopback. Upstream pebble has no listener/pairing/sharing
 surface; its one outbound footgun is `pebble self-update` (fetches GitHub
-releases and replaces the binary). The image pins `USER 0:0` and every
-spawned pebble process drops to the task uid via setpriv (WI#400 — see
-"Task-uid split (WI#400)" in `docs/ops/WORKER-CONTAINERS.md`; the rootful
-launch runs the whole container as the tenant uid, WI#422 — on that lane
-the agent shares the bridge's uid and can still signal or trace the
-bridge and read its environment; no split, by design), so the agent
-no longer runs as container root and cannot replace the root-owned bridge
-binary on the rootless lane — `self-update` remains an egress concern for
-the (unprivileged) task uid. Keep the pinned `PEBBLE_LOCK_SHA256` build contract intact; the
-real fix for the egress half is the deferred egress allowlist
-(WI#357 control 1). Full policy, controls, and the per-bump checklist:
+releases and replaces the binary). A PATH wrapper refuses that command and
+honours no environment override; direct execution of
+`/usr/local/lib/pebble/pebble` remains possible, but the root-owned binary
+and parent directory prevent replacement. The wrapper is a naive-use guard,
+not a boundary, and the fetch remains subject to the deferred egress
+allowlist (WI#424). WI#425's non-root requirement applies to the agent
+process: spawned pebble processes drop to the task uid via setpriv
+(WI#400), while the rootful launch runs the whole container as the tenant
+uid (WI#422). The rootless bridge deliberately pins `USER 0:0` so it can
+create that credential boundary; changing it to the task uid would collapse
+the split. The rootless agent therefore cannot replace the bridge binary;
+on the rootful lane the agent shares the bridge's uid by design and can
+signal or trace it and read its environment. Keep the pinned `PEBBLE_LOCK_SHA256`
+build contract intact. Full policy, controls, and the per-bump checklist:
 `docs/ops/WORKER-CONTAINERS.md` → "Worker exposure policy (WI#357)".
 
 ## Tool proxy (WI#324)

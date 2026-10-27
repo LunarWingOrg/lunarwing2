@@ -17,6 +17,8 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / ".gitlab" / "scripts" / "check-worker-exposure-policy.sh"
+PARSER_DIR = ROOT / ".gitlab" / "go" / "dockerfile-parse"
+GO = shutil.which("go")
 
 EXECUTOR_RULESET = """
 function sessionPermissions() {
@@ -60,6 +62,31 @@ DOCKERFILE_LINES = (
 
 
 class WorkerExposurePolicyGuardTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.parser_binary = None
+        cls.parser_temp = None
+        if GO is not None:
+            cls.parser_temp = tempfile.TemporaryDirectory(dir=ROOT)
+            cls.parser_binary = pathlib.Path(cls.parser_temp.name) / "dockerfile-parse"
+            subprocess.run(
+                [GO, "build", "-o", str(cls.parser_binary), "."],
+                cwd=PARSER_DIR,
+                env=os.environ | {
+                    "GOTOOLCHAIN": "local",
+                    "GOFLAGS": "-mod=readonly",
+                    "GOPROXY": "https://proxy.golang.org",
+                    "GOSUMDB": "sum.golang.org",
+                },
+                check=True,
+                timeout=120,
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.parser_temp is not None:
+            cls.parser_temp.cleanup()
+
     def setUp(self):
         # Fixture trees must live on an exec-capable filesystem: /tmp is
         # mounted noexec on some dev hosts, and bash silently skips a
@@ -78,7 +105,11 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
         script_dir.mkdir(parents=True)
         shutil.copy(SCRIPT, script_dir / SCRIPT.name)
         # The guard drives the lane's own checker; both lanes travel.
-        shutil.copytree(ROOT / "opencode2.4lunarwing", self.root / "opencode2.4lunarwing")
+        shutil.copytree(
+            ROOT / "opencode2.4lunarwing",
+            self.root / "opencode2.4lunarwing",
+            ignore=shutil.ignore_patterns("node_modules", "__pycache__", "*.pyc"),
+        )
         shutil.copytree(
             ROOT / "opencode4lunarwing",
             self.root / "opencode4lunarwing",
@@ -116,7 +147,7 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
             if shutil.which("git", path=str(minimal)):
                 raise AssertionError("git reachable in the no-git lane")
             env["PATH"] = str(minimal)
-        return subprocess.run(
+        result = subprocess.run(
             ["bash", str(root / ".gitlab" / "scripts" / SCRIPT.name)],
             capture_output=True,
             text=True,
@@ -124,11 +155,24 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
             cwd=root,
             timeout=120,
         )
+        if result.returncode != 0:
+            return result
+        if GO is None:
+            raise unittest.SkipTest("Go toolchain unavailable; required parser CI job owns this lane")
+        parser_result = subprocess.run(
+            [str(self.parser_binary), str(root / "opencode2.4lunarwing" / "Dockerfile")],
+            capture_output=True,
+            text=True,
+            env=env | (env_extra or {}),
+            cwd=PARSER_DIR,
+            timeout=30,
+        )
+        parser_result.stdout = result.stdout + parser_result.stdout
+        parser_result.stderr = result.stderr + parser_result.stderr
+        return parser_result
 
     def test_real_tree_passes(self):
-        result = subprocess.run(
-            ["bash", str(SCRIPT)], capture_output=True, text=True, cwd=ROOT, timeout=120
-        )
+        result = self.run_guard(ROOT)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("worker exposure policy guard: ok", result.stdout)
 
@@ -569,7 +613,21 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
                 self.assertIn(reason, result.stderr)
         dockerfile.write_bytes(original)
 
-    def test_glued_continuation_splitting_a_token_is_refused(self):
+    def test_missing_dockerfile_names_the_real_cause(self):
+        # WI#425 GZ-2: a missing or unreadable Dockerfile used to surface as
+        # the misleading "contains NUL bytes" failure (the inline probe's
+        # open() raises before any byte is inspected; the `if !` branch then
+        # printed the NUL text). It failed closed; the message must now name
+        # the real cause. Mutation pin: removing the readability guard
+        # reverts the message to "NUL bytes".
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        original = dockerfile.read_bytes()
+        dockerfile.unlink()
+        result = self.run_guard(self.root)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("missing or unreadable", result.stderr)
+        self.assertNotIn("NUL bytes", result.stderr)
+        dockerfile.write_bytes(original)
         # Run-111 GZ-1: BuildKit keeps the character before a continuation
         # backslash and appends the next line with no separator, while the
         # guard joins with a space. `SHEL\` + `L [...]` therefore reached the
@@ -596,8 +654,8 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
         # Control: whitespace before the backslash is a legitimate multi-line
         # instruction and must keep passing.
         dockerfile.write_text(original.replace(
-            FILESYSTEM_ASSERTION,
-            "RUN echo one \\\n && echo two \\\n && echo three\n" + FILESYSTEM_ASSERTION,
+            WRAPPER_ANCHOR_ARG,
+            "RUN echo one \\\n && echo two \\\n && echo three\n" + WRAPPER_ANCHOR_ARG,
         ), encoding="utf-8")
         result = self.run_guard(self.root)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -713,9 +771,9 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
     def test_dockerfile_literal_env_keys_allow_expanded_and_quoted_values(self):
         dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
         dockerfile.write_text(dockerfile.read_text().replace(
-            FILESYSTEM_ASSERTION,
+            WRAPPER_ANCHOR_ARG,
             'ENV PATH=/opt/bin:$PATH NOTE="two words" OTHER="${BASE:-default}"\n'
-            + FILESYSTEM_ASSERTION,
+            + WRAPPER_ANCHOR_ARG,
         ), encoding="utf-8")
         result = self.run_guard(self.root, without_git=True)
         self.assertEqual(result.returncode, 0, result.stderr)

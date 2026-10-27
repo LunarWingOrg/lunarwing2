@@ -31,6 +31,11 @@
       - worker-image-metadata.json
       - worker-image-rebuild-metadata.json
       - worker-inputs.sha256
+      # WI#425: opencode2 candidate exports its final filesystem for the
+      # out-of-band exposure-policy verification job. Only opencode2 writes
+      # it; the other workers' candidate jobs log a harmless "no matching
+      # files" and continue.
+      - opencode2-rootfs-export
   rules:
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$/ && $CI_COMMIT_REF_PROTECTED == "true"'
       when: manual
@@ -245,6 +250,17 @@ worker-opencode2-candidate:
   extends: .worker-candidate
   script:
     - sh .gitlab/scripts/build-worker-image.sh opencode2
+  artifacts:
+    when: always
+    expire_in: 30 days
+    reports:
+      dotenv: worker-image.env
+    paths:
+      - worker-image.env
+      - worker-image-metadata.json
+      - worker-image-rebuild-metadata.json
+      - worker-inputs.sha256
+      - opencode2-rootfs.tar
 
 worker-opencode2-scan:
   extends: .worker-scan
@@ -262,6 +278,42 @@ worker-opencode2-promote:
       artifacts: true
     - job: worker-opencode2-scan
       artifacts: true
+    - job: worker-opencode2-exposure-verify
+      artifacts: false
+    - job: worker-buildkit-parser-policy-guard
+      artifacts: false
+
+# WI#425: verify the tar export with the CHECKOUT's checker and tar-header
+# ownership/modes, compare checkout-owned /app bytes, and pin the complete
+# fetched image config instead of trusting the in-Dockerfile assert.
+worker-opencode2-exposure-verify:
+  image:
+    name: "docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"
+  tags:
+    - container-build
+  stage: containers
+  interruptible: false
+  retry: 0
+  timeout: 30m
+  needs:
+    - job: worker-opencode2-candidate
+      artifacts: true
+  script:
+    - |
+      if [ ! -f ./worker-image.env ] || [ ! -s ./opencode2-rootfs.tar ]; then
+        echo "ERROR: the opencode2 candidate did not publish its image metadata and tar export." >&2
+        exit 1
+      fi
+    - set -a; . ./worker-image.env; set +a
+    - python3 .gitlab/scripts/verify-opencode2-exposure-out-of-band.py
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$/ && $CI_COMMIT_REF_PROTECTED == "true"'
+      when: on_success
+      allow_failure: false
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+      when: on_success
+      allow_failure: false
+    - when: never
 
 worker-kimi-candidate:
   extends: .worker-candidate

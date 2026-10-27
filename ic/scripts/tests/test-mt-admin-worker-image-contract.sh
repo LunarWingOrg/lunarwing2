@@ -129,6 +129,15 @@ sudo() {
   if [[ "${1:-}" == "-u" ]]; then shift 2; fi
   command "$@"
 }
+# The opencode2 image-config policy drops to nobody via setpriv (run-221
+# OK-1). The harness cannot change uid, so drop the setpriv options and run
+# the wrapped command as the invoking user; test-mt-admin-opencode2.sh pins
+# the drop itself.
+setpriv() {
+  while [[ $# -gt 0 && "$1" != -- ]]; do shift; done
+  shift
+  command "$@"
+}
 
 # WI#446 (run-174 LW-3): the sidecar directory must live OUTSIDE the tenant
 # home (root-owned host state), and a stale sidecar left by an older mt-admin
@@ -475,13 +484,42 @@ CONTAINER_EXISTS="true"
 
 # ── SOURCE_REVISION stamping ─────────────────────────────────────────────────
 repo="$fixture/src"
-for dir in kimicode4lunarwing opencode4lunarwing opencode2.4lunarwing/scripts pebble4lunarwing; do
+for dir in kimicode4lunarwing opencode4lunarwing opencode2.4lunarwing/scripts pebble4lunarwing .gitlab/scripts; do
   mkdir -p "$repo/$dir"
 done
 for dir in kimicode4lunarwing opencode4lunarwing opencode2.4lunarwing pebble4lunarwing; do
   printf 'FROM scratch\n' >"$repo/$dir/Dockerfile"
 done
 printf '#!/bin/sh\n' >"$repo/opencode2.4lunarwing/scripts/opencode-exposure-guard.sh"
+chmod 755 "$repo/opencode2.4lunarwing/scripts/opencode-exposure-guard.sh"
+cp -a "$HARNESS_REPO_ROOT/opencode2.4lunarwing/scripts/." "$repo/opencode2.4lunarwing/scripts/"
+cp -a "$HARNESS_REPO_ROOT/opencode2.4lunarwing/config" "$repo/opencode2.4lunarwing/"
+cp -a "$HARNESS_REPO_ROOT/opencode2.4lunarwing/entrypoint.sh" \
+  "$HARNESS_REPO_ROOT/opencode2.4lunarwing/health_server.py" \
+  "$HARNESS_REPO_ROOT/opencode2.4lunarwing/agent_comm_protocol.json" \
+  "$repo/opencode2.4lunarwing/"
+cp -a "$HARNESS_REPO_ROOT/.gitlab/scripts/verify-opencode2-exposure-out-of-band.py" \
+  "$repo/.gitlab/scripts/"
+printf '\x7fELF clean pinned build\n' >"$fixture/real-opencode"
+chmod 755 "$fixture/real-opencode"
+opencode2_rootfs="$fixture/opencode2-rootfs"
+mkdir -p "$opencode2_rootfs/app/node_modules" "$opencode2_rootfs/usr/bin" \
+  "$opencode2_rootfs/usr/local/bin" "$opencode2_rootfs/usr/local/lib/opencode2"
+cp -a "$repo/opencode2.4lunarwing/scripts" "$opencode2_rootfs/app/scripts"
+cp -a "$repo/opencode2.4lunarwing/config" "$opencode2_rootfs/app/config"
+cp -a "$repo/opencode2.4lunarwing/entrypoint.sh" \
+  "$repo/opencode2.4lunarwing/health_server.py" \
+  "$repo/opencode2.4lunarwing/agent_comm_protocol.json" "$opencode2_rootfs/app/"
+cp -a "$repo/opencode2.4lunarwing/scripts/opencode-exposure-guard.sh" \
+  "$opencode2_rootfs/usr/local/bin/opencode"
+cp -a "$fixture/real-opencode" "$opencode2_rootfs/usr/local/lib/opencode2/opencode"
+cp -a "$fixture/real-opencode" "$opencode2_rootfs/usr/bin/tini"
+find "$opencode2_rootfs" -type d -exec chmod 755 {} +
+find "$opencode2_rootfs" -type f -exec chmod 644 {} +
+chmod 755 "$opencode2_rootfs/app/entrypoint.sh" \
+  "$opencode2_rootfs/usr/local/bin/opencode" \
+  "$opencode2_rootfs/usr/local/lib/opencode2/opencode" \
+  "$opencode2_rootfs/usr/bin/tini"
 printf 'fixture\n' >"$repo/README"
 git_fx=(git -C "$repo" -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false)
 "${git_fx[@]}" init -q
@@ -509,8 +547,92 @@ else
   fail 'source lookup retries as the checkout owner when root is refused'
 fi
 
-podman() { CALLS+=("podman:$*"); return 0; }
-docker() { CALLS+=("docker:$*"); return 0; }
+fake_worker_runtime() {
+  local runtime="$1" previous='' argument
+  shift
+  CALLS+=("$runtime:$*")
+  case "${1:-}" in
+    build)
+      for argument in "$@"; do
+        if [[ "$previous" == --iidfile ]]; then
+          printf 'sha256:%064d\n' 0 > "$argument"
+        fi
+        previous="$argument"
+      done ;;
+    create) printf 'contractcid\n' ;;
+    export)
+      [[ "${2:-}" == --output && "${4:-}" == contractcid ]] || return 1
+      python3 - "$opencode2_rootfs" "$3" <<'PY'
+import pathlib
+import sys
+import tarfile
+root, output = pathlib.Path(sys.argv[1]), sys.argv[2]
+with tarfile.open(output, "w") as archive:
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        info = archive.gettarinfo(str(path), arcname=relative)
+        info.uid = info.gid = 0
+        if relative.startswith("app/") and not path.is_symlink() and path.is_file():
+            info.mode = 0o444
+        if path.is_dir() and (
+            relative in {"app/scripts", "app/config"}
+            or relative.startswith(("app/scripts/", "app/config/"))
+        ):
+            info.mode = 0o555
+        if path.is_symlink() or path.is_dir():
+            archive.addfile(info)
+        elif path.is_file():
+            with path.open("rb") as source:
+                archive.addfile(info, source)
+        else:
+            raise SystemExit(f"unsupported fixture entry: {path}")
+PY
+      ;;
+    image)
+      [[ "${2:-}" == inspect && $# -eq 3 ]] || return 1
+      python3 - "$runtime" <<'PY'
+import json
+import sys
+runtime = sys.argv[1]
+config = {
+    "Env": [
+        "PATH=/home/opencode2/.cargo/bin:/usr/local/cargo/bin:/usr/local/go/bin:/home/opencode2/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bun-node-fallback-bin",
+        "BUN_RUNTIME_TRANSPILER_CACHE_PATH=0",
+        "BUN_INSTALL_BIN=/usr/local/bin",
+        "OPENCODE_IMAGE_REF=v2.1.2@" + "a" * 40,
+        "OPENCODE_DISABLE_AUTOUPDATE=1",
+        "RUSTUP_HOME=/usr/local/rustup",
+        "GOROOT=/usr/local/go",
+        "GOPATH=/home/opencode2/go",
+        "CARGO_HOME=/home/opencode2/.cargo",
+    ],
+    "Entrypoint": ["/usr/bin/tini", "--", "/app/entrypoint.sh"],
+    "Cmd": ["--mode", "websocket"],
+    "User": "10003:10003",
+    "WorkingDir": "/app",
+    "ExposedPorts": {"8443/tcp": {}, "9090/tcp": {}},
+    "StopSignal": "SIGTERM",
+    "Shell": None,
+}
+healthcheck = {
+    "Test": ["CMD-SHELL", "curl -sf http://127.0.0.1:8443/health || exit 1"],
+    "Interval": 30000000000,
+    "Timeout": 5000000000,
+    "StartPeriod": 30000000000,
+    "Retries": 3,
+}
+if runtime == "podman":
+    print(json.dumps([{"Config": config, "Healthcheck": healthcheck}]))
+else:
+    config["Healthcheck"] = healthcheck
+    print(json.dumps([{"Config": config}]))
+PY
+      ;;
+  esac
+  return 0
+}
+podman() { fake_worker_runtime podman "$@"; }
+docker() { fake_worker_runtime docker "$@"; }
 build_arg_seen() {  # <image tag> <SOURCE_REVISION value>
   local call
   for call in "${CALLS[@]}"; do
@@ -519,18 +641,26 @@ build_arg_seen() {  # <image tag> <SOURCE_REVISION value>
   done
   return 1
 }
+# The non-root harness cannot chown the verifier's scratch work dir to nobody;
+# production keeps that ownership transition mandatory.
+chown() { :; }
 CALLS=()
 build_kimi_worker false false "" "$repo"
 build_opencode_worker false false "$repo"
 build_opencode2_worker false false "$repo"
 LUNARWING_ROOT="$repo" build_pebble_worker false false
 for worker in kimi opencode opencode2 pebble; do
-  if build_arg_seen "lunarwing-worker-${worker}:latest" "$head"; then
+  build_tag="lunarwing-worker-${worker}:latest"
+  [[ "$worker" != opencode2 ]] || build_tag="lunarwing-worker-opencode2:candidate-$$"
+  if build_arg_seen "$build_tag" "$head"; then
     pass "build-${worker}-worker stamps SOURCE_REVISION=HEAD"
   else
     fail "build-${worker}-worker stamps SOURCE_REVISION=HEAD"
   fi
 done
+expected_image_id="sha256:$(printf '%064d' 0)"
+assert_call "podman:tag $expected_image_id lunarwing-worker-opencode2:latest" \
+  'opencode2 promotion tags the verified immutable ID'
 printf 'FROM scratch\nLABEL fixture=2\n' >"$repo/kimicode4lunarwing/Dockerfile"
 CALLS=()
 build_kimi_worker false false "" "$repo"

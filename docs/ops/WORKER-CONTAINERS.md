@@ -728,72 +728,31 @@ Enforced controls (opencode2 lane unless noted):
    owner-write permission before the config writers run; the baked source
    stays read-only. Live runtime/project configs and operator-selected
    `OPENCODE_CONFIG` remain untrusted and mutable.
-4. **CI guard.** `.gitlab/scripts/check-worker-exposure-policy.sh` (job
-   `worker-exposure-policy-guard`, security stage) asserts the pins, the
-   ruleset ordering, the wrapper (every-token scan), the Dockerfile wiring
-   including the root-owned read-only boot files + `scripts/`+`config/`, and runs
-   git-free (the ci-config image ships no git). The Dockerfile checks are
-   anchored over comment-stripped, continuation-joined lines. The exact
-   compile-out source COPY and RUN must occur in `AS builder`, in that order,
-   before the native build RUN. The wrapper-install/binary-scan RUN and the
-   read-only chmod RUN (with optional exec-bit prefix) must each match a whole
-   instruction, so a suffix such as `|| true` cannot hide a failed scan.
-   After the final `--image-filesystem` RUN, only `EXPOSE`, `HEALTHCHECK`,
-   `USER`, `ENTRYPOINT`, `CMD`, `LABEL` and `STOPSIGNAL` are allowed
-   (case-insensitively). Later COPY/ADD/RUN steps or new stages are refused
-   regardless of command spelling; earlier filesystem changes are checked
-   by the in-image assertion, subject to the trust limitation in control 5
-   (run-96 FP-1, closing the run-90 FC-4 gaps).
-   Run-97 FQ-1: the wrapper-install/binary-scan RUN must sit in the *same
-   stage* as the final `--image-filesystem` assertion — build engines skip
-   unused stages, so the exact line in a dead or builder stage satisfies
-   presence checks while the shipped image has neither wrapper nor scan.
-   Run-97 FQ-2/FQ-3: the last `USER` instruction must be exactly
-   `USER 10003:10003`, and Dockerfile parser directives
-   (`# escape=`, `# syntax=`, `# check=`) are refused outright, since a
-   custom escape character would invalidate the guard's continuation
-   joining. Run-103 GD-1: the directive refusal also covers the grammar's
-   whitespace-around-`=` spellings (`# escape = \``) and a UTF-8 BOM prefix
-   (Docker strips a leading BOM before parsing) — either hid a directive
-   the old regex never matched. Run-106 GJ-1/GJ-2 close two additional
-   parser-divergence spellings: any non-empty line whose first byte is not
-   printable ASCII is refused (BuildKit trims Unicode whitespace such as
-   U+00A0/U+0085/U+202F before directive detection; the guard's
-   `[[:space:]]` trim is ASCII-only), and any line whose right-trimmed form
-   ends in two backslashes is refused (an escaped escape token is not a
-   continuation for BuildKit, but the guard — like buildah/podman — used to
-   join it, hiding the next instruction). Run-109 GW-2 also refuses trailing
-   whitespace (space/tab/CR) after a single continuation backslash and
-   heredocs (`<<`, including a token split across continued lines). Before
-   the assertion, those spellings can hide its RUN inside a previous
-   instruction or heredoc body; the earlier "safe over-refusal" claim was
-   incorrect. Run-110 GX-1: the BOM is stripped from the first line only, as
-   BuildKit does, so a BOM on a later line reaches the printable-ASCII
-   refusal, and NUL bytes are refused outright (bash `read` drops them,
-   BuildKit keeps them). Either one used to make the guard join the next
-   instruction into a `LABEL` while BuildKit ran it on its own. Run-111 GZ-1:
-   a continuation backslash must be preceded by a space or tab — a backslash
-   that is the line's whole content is refused too — because BuildKit keeps
-   the character before the backslash and appends the next line with no
-   separator, so `SHEL\` + `L [...]` used to
-   reach the guard as the word `SHEL` (never matching the SHELL refusal) and
-   `ARG LUNARWING_WRAPPER_\` + `SHA256=…` hid a protected name from the
-   literal checks, while BuildKit parsed each pair as one instruction.
-   Run-112 HD-1 narrows the accepted class to BuildKit's own (space/tab
-   only, via literal bracket expressions that no locale widens) and refuses
-   any line carrying a VT, FF or CR byte outright — bash's `[[:space:]]` is
-   wider than BuildKit's even in the C locale and locale-dependent under
-   C.UTF-8 (U+3000 et al. were accepted as glue there).
-   GW-3 refuses `SHELL`, any instruction naming
-   `LUNARWING_WRAPPER_SHA256`, `LUNARWING_REAL_OPENCODE` or `OPENCODE_BIN`
-   except the exact `ARG LUNARWING_WRAPPER_SHA256=`, and ENV keys that are
-   expanded or use legacy space-separated assignment syntax. Literal
-   `key=value` assignments may still have quoted or expanded values. The
-   anchor ARG must be in the final assertion's stage. These are drift
-   checks: an adversarial Dockerfile can still rewrite the in-image checker.
-   `.gitlab/tests/test_worker_exposure_policy.py` regression-covers it,
-   including no-git lanes. The guard also runs the exposure/wrapper,
-   compile-out, and non-root boot configuration suites on merge requests.
+4. **CI guards.** `.gitlab/scripts/check-worker-exposure-policy.sh` (job
+   `worker-exposure-policy-guard`) checks source/config pins, the every-token
+   wrapper, compile-out tests, non-root boot configuration, and bridge ruleset
+   ordering without git. Dockerfile wiring is owned by the required
+   `worker-buildkit-parser-policy-guard` job (WI#425): the bash grammar is
+   retired, and `.gitlab/go/dockerfile-parse` applies the policy to BuildKit
+   v0.25.1's own instruction tree. The parser requires the compile-out COPY
+   and RUN before the native build in `AS builder`, the wrapper/binary scan,
+   root-owned read-only `scripts/`+`config/` and boot files, and the wrapper
+   anchor ARG immediately above the final `--image-filesystem` assertion in
+   the same stage. The final stage's last USER must be `10003:10003`; after
+   the assertion only `EXPOSE`, `HEALTHCHECK`, `USER`, `ENTRYPOINT`, `CMD`,
+   `LABEL` and `STOPSIGNAL` are allowed. Parser directives and heredocs are
+   refused, and BuildKit's structured ENV parser rejects expanded, quoted,
+   legacy, or protected keys while literal keys may retain quoted/expanded
+   values. The FQ-3/GD-1/GJ-1/GJ-2/GW-2/GX-1/GZ-1/HD-1 divergence shapes have
+   direct policy fixtures alongside the broader Python fixture suite. The CI
+   job uses a digest-pinned Go 1.24.3 image with `GOTOOLCHAIN=local`,
+   `GOFLAGS=-mod=readonly`, and checksum-verified modules; it runs `gofmt`,
+   the Go policy tests, and the real Dockerfile check. `ci-config` installs
+   the same pinned Go through `.gitlab/scripts/fetch-go-toolchain.py`, so the
+   Python parser fixtures execute instead of skipping on its Python-only
+   image. OpenCode 2 promotion hard-needs both this parser job and the
+   out-of-band verifier. Out-of-band image verification remains the separate
+   control-5 backstop below, not a parser substitute.
 5. **Build-time assertion.** The opencode2 Dockerfile runs
    `scripts/exposure_policy_assert.py --binary …`: the image fails to build
    if the config lacks the pins, the entrypoint touches service mode or
@@ -805,10 +764,13 @@ Enforced controls (opencode2 lane unless noted):
    non-root replacement of its children. Run-103 GD-2: the v2
    `--image-filesystem` path additionally verifies the *installed wrapper*:
    `/usr/local/bin/opencode` must be a regular non-symlink, root-owned file
-   with no group/other write bit and the executable bit set, byte-identical
-   to `scripts/opencode-exposure-guard.sh`, and `shutil.which("opencode")`
-   must resolve to it (no earlier `PATH` dir shadows it); the real binary
-   at `/usr/local/lib/opencode2/opencode` is re-scanned for tunnel markers.
+   with no group/other write bit and all three execute bits (WI#425 GX-3),
+   byte-identical to `scripts/opencode-exposure-guard.sh`; `OPENCODE_BIN`
+   may not retarget it, and `shutil.which("opencode")` must resolve to it
+   (no earlier `PATH` dir shadows it). The real binary at
+   `/usr/local/lib/opencode2/opencode` is re-scanned for tunnel markers and
+   must itself be root-owned and non-group/other-writable; every parent of
+   both paths is checked through, but never above, the trusted root (GX-2).
    These checks detect accidental drift after the wrapper-install scan,
    provided the checker and its environment remain intact — pinned by unit
    tests with injected paths, since the image build itself is a
@@ -825,19 +787,45 @@ Enforced controls (opencode2 lane unless noted):
    **not unforgeable**: an adversarial Dockerfile edit can still defeat the
    check by replacing its environment or the checker itself (run-109 GW-3).
    The CI guard's ENV/SHELL refusals are an additional drift check.
-   **WI#357 follow-up:** verify the built image out of band with the
-   checkout's checker and wrapper bytes, including image-config `Env` and
-   `Shell`: export the BuildKit filesystem via a local/tar output in CI,
-   and use `podman create`/`podman cp` (or the Docker equivalents) plus
-   checkout-side comparison in mt-admin. This durable check is deferred;
-   it would also avoid relying on the partial Dockerfile parser for GW-2
-   and the remaining binary/boot-path checks in GW-4. Note the
-   `PATH` resolution is a *build-time* property: at runtime the agent-owned
-   `~/.cargo/bin` and `~/go/bin` (five PATH entries — the four toolchain
-   dirs plus an empty `/usr/local/sbin` — precede `/usr/local/bin`), so a
-   runtime `PATH` `opencode` need not hit the wrapper; the entrypoint is
-   unaffected (absolute `OPENCODE_BIN`) and the wrapper remains a
-   naive-use guard.
+   **WI#425 out-of-band verification (was the WI#357 follow-up, run-109
+   GW-3):** the opencode2 candidate exports its final filesystem through a
+   second BuildKit `--output type=tar`, preserving uid/gid/mode headers that
+   a local directory export rewrites. The required
+   `worker-opencode2-exposure-verify` job safely materializes only regular
+   files, checks those tar headers with the checkout's
+   `exposure_policy_assert.py --image-root`, compares checkout-owned `/app`
+   files byte for byte, and refuses unexpected source-tree entries. BuildKit
+   omits the `/` header, so only that root is a structural trust boundary;
+   every emitted entry uses its tar-header metadata. Its
+   shared `image_config_policy.py` allowlist covers the complete `Env`
+   (including PATH order and loader variables), `Entrypoint`, `Cmd`, `User`,
+   `WorkingDir`, `Healthcheck`, `ExposedPorts`, and `StopSignal`; `OnBuild`,
+   `Volumes`, and `Shell` must be empty. Promotion hard-needs the
+   non-optional job and the BuildKit parser guard.
+   In mt-admin, `build_opencode2_worker` uses a per-build candidate tag and
+   `--iidfile`, then `create --pull=never`, `export`, and full `image inspect`
+   feed the same tar/config verifier by immutable image ID. Docker's
+   `Config.Healthcheck` and Podman's top-level `Healthcheck` normalize to the
+   same policy; neither runtime can silently drop that field. The verifier
+   and checkout-owned reference files enter a root-owned snapshot only after
+   every source parent resolves beneath the canonical checkout; final links
+   and special files are refused. The snapshot Python runs as `nobody` via
+   `setpriv --clear-groups --no-new-privs`, `python3 -I`, and an empty
+   environment. The exported tar and inspect JSON stay under `/var/tmp` in a
+   `0700` `nobody`-owned input directory with `0600` files, and extraction
+   uses a separate `0700` work directory. Cleanup is trapped, and only the
+   verified ID is tagged `:latest`.
+   The mt-admin trust boundary is deliberately narrow: only the wrapper has a
+   build-time digest anchor; the other reference and verifier bytes are a
+   verify-time snapshot of the live checkout. A hostile tenant can change
+   both its checkout and the image that mt-admin builds as root from it, so
+   this is a drift/naive-use check, not a tenant-to-host security boundary.
+   Note the `PATH` resolution is a *build-time* property:
+   at runtime the agent-owned `~/.cargo/bin` and `~/go/bin` (five PATH
+   entries — the four toolchain dirs plus `/usr/local/sbin` — precede
+   `/usr/local/bin`), so a runtime `PATH` `opencode` need not hit the
+   wrapper; the entrypoint is unaffected (absolute `OPENCODE_BIN`) and the
+   wrapper remains a naive-use guard.
 6. **Runtime smoke (automated suite DEFERRED to WI#424, 2.1.7.0):** live
    `service.json`/`opentunnel` dir/listener assertions against a running
    container are required manually for WI#427 until that suite exists.
@@ -917,10 +905,25 @@ re-checked 2026-10-13):
   rootless lane; the rootful launch runs the whole container as the
   tenant uid ("Launch identity (WI#422)") — there the agent shares the
   bridge's uid, so it can still signal or trace the bridge and read its
-  environment (no split, by design per WI#422). Residual: `self-update` still
-  fetches over the network from the (now unprivileged) task uid, so the
-  real fix for that half remains control 1 (egress allowlist). Keep the
-  pinned `PEBBLE_LOCK_SHA256` build contract intact.
+  environment (no split, by design per WI#422). **Bump record (WI#425,
+  2026-10-26; no upstream ref change):** a PATH-visible refusal wrapper
+  (`pebble4lunarwing/scripts/pebble-self-update-guard.sh`) owns
+  `/usr/local/bin/pebble`; the reviewed binary moves to
+  `/usr/local/lib/pebble/pebble`. It refuses naive `self-update` and honours
+  no environment override. Direct execution remains possible, but the real
+  binary and its parent are root-owned and non-writable by the task uid, so
+  file permissions — not the wrapper — prevent replacement under either
+  launch identity. The wrapper is only a naive-use guard, and the GitHub
+  fetch remains an egress-allowlist concern (WI#424). Keep the pinned
+  `PEBBLE_LOCK_SHA256` build contract intact. **WI#425 AC4 interpretation
+  (run-221 OK9):** the original "non-root user" wording predates WI#400 and
+  WI#422 and is satisfied at the agent-execution boundary: every rootless
+  spawned pebble process uses the non-root task uid, and the rootful launch
+  runs the whole container as the tenant uid. The rootless bridge deliberately
+  keeps `USER 0:0` so it can drop tasks and protect the hub credential;
+  changing it to the task uid would collapse that newer boundary. This item
+  does not claim a non-root bridge. A rebuilt pebble candidate and a live
+  `mt-admin worker-listeners` audit remain protected-pipeline/deploy evidence.
 
 ## LunarWing Worker
 
@@ -1074,7 +1077,14 @@ userns identities on one host.
 
 ```bash
 cd opencode2.4lunarwing
-docker build -t lunarwing-worker-opencode2:latest .
+# The final --image-filesystem assert anchors the installed wrapper against
+# the checkout's scripts/opencode-exposure-guard.sh digest (WI#357 GJ-3a,
+# WI#425): a manual build must forward it or the image fails fail-closed.
+# Recompute it after any wrapper edit:
+#   sha256sum scripts/opencode-exposure-guard.sh
+docker build \
+  --build-arg LUNARWING_WRAPPER_SHA256=f2fc2ba6befc2d6d22dbae33029ab9a84ced4e6fa6927839ac636fdd42ca5b7b \
+  -t lunarwing-worker-opencode2:latest .
 
 # Select the worker per tenant, then build the shared image via mt-admin
 sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <name> --with-opencode2
