@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use futures::{Stream, StreamExt};
 
@@ -207,9 +208,30 @@ pub(crate) fn private_http_targets_allowed() -> bool {
     std::env::var("WASM_HTTP_ALLOW_PRIVATE_IPS").ok().as_deref() == Some("1")
 }
 
-/// Resolve every address before connecting so an allowlisted hostname cannot
-/// resolve to a private target through DNS rebinding.
+/// A public HTTP target and the exact DNS answers vetted for its connection.
+pub(crate) struct VettedHttpTarget {
+    dns_host: Option<String>,
+    addresses: Vec<SocketAddr>,
+}
+
+impl VettedHttpTarget {
+    /// Pin reqwest to the answers checked above, eliminating the second DNS lookup.
+    pub(crate) fn pin_client(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        match &self.dns_host {
+            Some(host) => builder.resolve_to_addrs(host, &self.addresses),
+            None => builder,
+        }
+    }
+}
+
+/// Validate an HTTP target without retaining its vetted DNS result.
 pub(crate) fn reject_private_ip(url: &str) -> Result<(), String> {
+    vet_http_target(url).map(|_| ())
+}
+
+/// Resolve and validate every address before connecting. HTTP callers must pass
+/// the result to [`VettedHttpTarget::pin_client`] on the same request's client.
+pub(crate) fn vet_http_target(url: &str) -> Result<VettedHttpTarget, String> {
     let parsed = url::Url::parse(url).map_err(|e| format!("Failed to parse URL: {e}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(format!("Unsupported URL scheme: {}", parsed.scheme()));
@@ -227,54 +249,166 @@ pub(crate) fn reject_private_ip(url: &str) -> Result<(), String> {
         })
         .ok_or_else(|| "Failed to parse host from URL".to_string())?;
 
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return if is_private_ip(ip) {
-            Err(format!(
-                "HTTP request to private/internal IP {} is not allowed",
-                ip
-            ))
-        } else {
-            Ok(())
-        };
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_private_ip(ip) {
+            return Err(format!(
+                "HTTP request to private/internal IP {ip} is not allowed"
+            ));
+        }
+        return Ok(VettedHttpTarget {
+            dns_host: None,
+            addresses: Vec::new(),
+        });
     }
 
     use std::net::ToSocketAddrs;
-    let addrs: Vec<_> = format!("{}:0", host)
+    let addresses: Vec<_> = format!("{host}:0")
         .to_socket_addrs()
-        .map_err(|e| format!("DNS resolution failed for {}: {}", host, e))?
+        .map_err(|e| format!("DNS resolution failed for {host}: {e}"))?
         .collect();
-
-    if addrs.is_empty() {
-        return Err(format!("DNS resolution returned no addresses for {}", host));
+    if addresses.is_empty() {
+        return Err(format!("DNS resolution returned no addresses for {host}"));
     }
-
-    for addr in &addrs {
+    for addr in &addresses {
         if is_private_ip(addr.ip()) {
             return Err(format!(
-                "DNS rebinding detected: {} resolved to private IP {}",
-                host,
+                "DNS rebinding detected: {host} resolved to private IP {}",
                 addr.ip()
             ));
         }
     }
 
-    Ok(())
+    Ok(VettedHttpTarget {
+        dns_host: Some(host.to_string()),
+        addresses,
+    })
 }
 
-pub(crate) fn is_private_ip(ip: std::net::IpAddr) -> bool {
+pub(crate) fn is_private_ip(ip: IpAddr) -> bool {
     match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64
-        }
-        std::net::IpAddr::V6(v6) => {
+        IpAddr::V4(v4) => is_private_ipv4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped().or_else(|| embedded_ipv4(&v6)) {
+                return is_private_ipv4(v4);
+            }
+            let first = v6.segments()[0];
             v6.is_loopback()
                 || v6.is_unspecified()
-                || (v6.segments()[0] & 0xFE00) == 0xFC00
-                || (v6.segments()[0] & 0xFFC0) == 0xFE80
+                || v6.is_multicast()
+                || (first & 0xFE00) == 0xFC00
+                || (first & 0xFFC0) == 0xFE80
+                || (first & 0xFFC0) == 0xFEC0
         }
+    }
+}
+
+fn is_private_ipv4(v4: Ipv4Addr) -> bool {
+    let octets = v4.octets();
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_multicast()
+        || octets[0] == 0
+        || octets[0] == 100 && (octets[1] & 0xC0) == 64
+        || octets[..3] == [192, 0, 0]
+        || octets[0] == 198 && (octets[1] & 0xFE) == 18
+        || octets[0] >= 240
+}
+
+fn embedded_ipv4(v6: &std::net::Ipv6Addr) -> Option<Ipv4Addr> {
+    let segments = v6.segments();
+    let compatible = segments[..6].iter().all(|segment| *segment == 0);
+    let nat64 = segments[0] == 0x64
+        && segments[1] == 0xFF9B
+        && segments[2..6].iter().all(|segment| *segment == 0);
+    if !compatible && !nat64 {
+        return None;
+    }
+    let bits = (u32::from(segments[6]) << 16) | u32::from(segments[7]);
+    Some(Ipv4Addr::from(bits))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+
+    use super::{VettedHttpTarget, is_private_ip, vet_http_target};
+
+    #[test]
+    fn special_and_embedded_addresses_are_classified_before_connection() {
+        let blocked = [
+            "0.0.0.1",
+            "192.0.0.1",
+            "198.18.0.1",
+            "198.19.255.255",
+            "240.0.0.1",
+            "255.255.255.255",
+            "224.0.0.1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::ffff:169.254.169.254",
+            "::127.0.0.1",
+            "64:ff9b::7f00:1",
+            "ff02::1",
+            "fec0::1",
+        ];
+        for text in blocked {
+            let ip = text.parse::<IpAddr>().expect("test IP");
+            assert!(is_private_ip(ip), "{text} must be refused");
+        }
+
+        let public = [
+            "8.8.8.8",
+            "192.0.1.1",
+            "198.20.0.1",
+            "::ffff:8.8.8.8",
+            "::8.8.8.8",
+            "64:ff9b::808:808",
+            "2606:4700::1111",
+        ];
+        for text in public {
+            let ip = text.parse::<IpAddr>().expect("test IP");
+            assert!(!is_private_ip(ip), "{text} must stay allowed");
+        }
+        assert!(vet_http_target("http://[::ffff:127.0.0.1]:8080/").is_err());
+    }
+
+    #[test]
+    fn vetted_addresses_are_used_for_the_actual_connection() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        let port = listener.local_addr().expect("address").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).expect("read request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .expect("write response");
+        });
+        let target = VettedHttpTarget {
+            dns_host: Some("pinned.test".to_string()),
+            addresses: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)],
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let status = runtime.block_on(async {
+            let client = target
+                .pin_client(reqwest::Client::builder().no_proxy())
+                .build()
+                .expect("client");
+            client
+                .get(format!("http://pinned.test:{port}/"))
+                .send()
+                .await
+                .expect("pinned request")
+                .status()
+        });
+
+        assert_eq!(status, reqwest::StatusCode::OK);
+        server.join().expect("server thread");
     }
 }
