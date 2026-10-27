@@ -917,10 +917,7 @@ mod tests {
     #[tokio::test]
     async fn external_threshold_applies_per_mode() {
         let manager = ContextManager::new(10);
-        let external_id = manager
-            .create_job("External silent", "desc")
-            .await
-            .unwrap();
+        let external_id = manager.create_job("External silent", "desc").await.unwrap();
         let internal_id = manager.create_job("Internal silent", "desc").await.unwrap();
 
         for (id, external) in [(external_id, true), (internal_id, false)] {

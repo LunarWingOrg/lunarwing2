@@ -922,11 +922,8 @@ mod jobs_isolation {
             .unwrap();
         cm.update_context(alice_job.id, |ctx| {
             ctx.repair_attempts = 2;
-            ctx.transition_to(
-                crate::context::JobState::Stuck,
-                Some("idle".to_string()),
-            )
-            .expect("InProgress -> Stuck must be allowed"); // safety: test
+            ctx.transition_to(crate::context::JobState::Stuck, Some("idle".to_string()))
+                .expect("InProgress -> Stuck must be allowed"); // safety: test
         })
         .await
         .unwrap();
@@ -944,7 +941,11 @@ mod jobs_isolation {
         let body = axum::body::to_bytes(resp.into_body(), 16384).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["stuck"], serde_json::json!(true), "body: {body}");
-        assert_eq!(body["repair_attempts"], serde_json::json!(2), "body: {body}");
+        assert_eq!(
+            body["repair_attempts"],
+            serde_json::json!(2),
+            "body: {body}"
+        );
     }
 
     /// WI#475: with no daemon context for the job (restart/eviction) the
