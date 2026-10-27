@@ -2166,6 +2166,46 @@ async fn resolve_pending_gate_for_user(
     select_pending_gate(candidates, hinted_uuid)
 }
 
+/// Find the live *approval* gate owned by `user_id` whose request id matches.
+///
+/// This is the server-side resolution the gateway approval endpoint needs when
+/// the caller omits `thread_id` (WI#472): the owning thread is derived from the
+/// gate itself rather than guessed. Gates are user-scoped here and re-checked by
+/// [`resolve_gate`]'s `take_verified` on the actual resolution path, so this can
+/// never clear another user's gate. Returns `Ok(None)` when engine v2 is off or
+/// no live approval gate carries that request id.
+pub async fn find_engine_approval_gate_for_request(
+    user_id: &str,
+    request_id: uuid::Uuid,
+) -> Result<Option<crate::gate::pending::PendingGateView>, Error> {
+    let Some(lock) = ENGINE_STATE.get() else {
+        return Ok(None);
+    };
+    let guard = lock.read().await;
+    let Some(state) = guard.as_ref() else {
+        return Ok(None);
+    };
+    let gates = filter_live_pending_gates(
+        &state.store,
+        state.pending_gates.list_for_user(user_id).await,
+    )
+    .await;
+    let matches: Vec<&PendingGate> = gates
+        .iter()
+        .filter(|gate| {
+            gate.request_id == request_id
+                && matches!(
+                    gate.resume_kind,
+                    lunarwing_engine::ResumeKind::Approval { .. }
+                )
+        })
+        .collect();
+    match matches.as_slice() {
+        [gate] => Ok(Some(crate::gate::pending::PendingGateView::from(*gate))),
+        _ => Ok(None),
+    }
+}
+
 pub async fn get_engine_pending_gate(
     user_id: &str,
     thread_id: Option<&str>,

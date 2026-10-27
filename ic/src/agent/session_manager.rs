@@ -276,6 +276,38 @@ impl SessionManager {
         mgr
     }
 
+    /// Find the thread in `user_id`'s session currently awaiting approval of
+    /// `request_id`.
+    ///
+    /// Used by the gateway approval endpoint to derive the owning thread when
+    /// the caller omits `thread_id` (WI#472). Scoped to the caller's own
+    /// session, so it can never resolve another user's approval. Returns `None`
+    /// for zero or (defensively) more than one match.
+    pub async fn find_awaiting_approval_thread(
+        &self,
+        user_id: &str,
+        request_id: Uuid,
+    ) -> Option<Uuid> {
+        let session = {
+            let sessions = self.sessions.read().await;
+            sessions.get(user_id).cloned()?
+        };
+        let sess = session.lock().await;
+        let mut matches = sess
+            .threads
+            .values()
+            .filter(|thread| {
+                thread.state == crate::agent::session::ThreadState::AwaitingApproval
+                    && thread
+                        .pending_approval
+                        .as_ref()
+                        .is_some_and(|pending| pending.request_id == request_id)
+            })
+            .map(|thread| thread.id);
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    }
+
     /// Remove sessions that have been idle for longer than the given duration.
     ///
     /// Returns the number of sessions pruned.

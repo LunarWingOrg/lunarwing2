@@ -40,6 +40,7 @@ pub use router::{
     // Query functions
     fire_engine_mission,
     fire_engine_webhook_mission,
+    find_engine_approval_gate_for_request,
     get_engine_mission,
     get_engine_mission_history_by_name,
     get_engine_pending_auth,
