@@ -169,10 +169,7 @@ pub(crate) fn replace_all_bytes(haystack: &mut Vec<u8>, needle: &[u8], marker: &
     }
 }
 
-pub(crate) fn enforce_response_size(
-    size: u64,
-    max_response_bytes: usize,
-) -> Result<(), String> {
+pub(crate) fn enforce_response_size(size: u64, max_response_bytes: usize) -> Result<(), String> {
     if size > max_response_bytes as u64 {
         return Err(format!(
             "Response body too large: {} bytes exceeds limit of {} bytes",
