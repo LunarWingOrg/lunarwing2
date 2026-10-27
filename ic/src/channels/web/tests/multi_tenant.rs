@@ -2170,8 +2170,7 @@ mod approval_resolution {
     #[tokio::test]
     async fn engine_approval_without_thread_id_resolves_gate_owner_for_each_action() {
         use crate::bridge::router::tests::{
-            engine_state_test_lock, install_engine_approval_for_tests,
-            reset_engine_state_for_tests,
+            engine_state_test_lock, install_engine_approval_for_tests, reset_engine_state_for_tests,
         };
 
         let _guard = engine_state_test_lock().await;
