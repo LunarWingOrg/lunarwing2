@@ -148,6 +148,23 @@ class RegistryRequestTests(unittest.TestCase):
         self.assertEqual(fetch.call_count, 3)
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [15, 30])
 
+    def test_registry_token_uses_the_bounded_retry_path(self):
+        environment = {
+            "CI_SERVER_HOST": "git.example",
+            "CI_REGISTRY_USER": "ci-user",
+            "CI_REGISTRY_PASSWORD": "test-password",
+        }
+        with mock.patch.dict(os.environ, environment), mock.patch.object(
+            self.module.urllib.request, "urlopen",
+            side_effect=[self.http_error(429), io.BytesIO(b'{"token": "pull-token"}')],
+        ) as fetch, mock.patch.object(self.module.time, "sleep") as sleep:
+            token = self.module.registry_token("group/worker-opencode2")
+        self.assertEqual(token, "pull-token")
+        self.assertEqual(fetch.call_count, 2)
+        sleep.assert_called_once_with(15)
+        request = fetch.call_args.args[0]
+        self.assertIn("scope=repository:group/worker-opencode2:pull", request.full_url)
+
     def test_persistent_rate_limit_fails_after_bounded_retries(self):
         with mock.patch.object(
             self.module.urllib.request, "urlopen", side_effect=self.http_error(429),
