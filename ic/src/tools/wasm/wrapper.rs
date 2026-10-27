@@ -358,33 +358,25 @@ impl StoreData {
         result
     }
 
-    /// Replace injected credential values with `[REDACTED]` in text.
-    ///
-    /// Prevents credentials from leaking through error messages or logs.
-    /// reqwest::Error includes the full URL in its Display output, so any
-    /// error from an injected-URL request will contain the raw credential
-    /// unless we scrub it. Query-param injection URL-encodes the value, so
-    /// the encoded form is scrubbed alongside the raw one (WI#395).
-    fn redact_credentials(&self, text: &str) -> String {
-        let mut result = text.to_string();
+    fn redaction_needles(&self) -> Vec<RedactionNeedle> {
+        let mut needles = Vec::new();
         for (name, value) in &self.credentials {
-            if !value.is_empty() {
-                let replacement = format!("[REDACTED:{}]", name);
-                result = result.replace(value.as_str(), &replacement);
-                replace_encoded_secret(&mut result, value, &replacement);
-            }
+            push_credential_needles(&mut needles, value, &format!("[REDACTED:{name}]"));
         }
         for cred in &self.host_credentials {
-            if !cred.secret_value.is_empty() {
-                result = result.replace(cred.secret_value.as_str(), "[REDACTED:host_credential]");
-                replace_encoded_secret(
-                    &mut result,
-                    &cred.secret_value,
-                    "[REDACTED:host_credential]",
-                );
+            for value in host_credential_needles(cred) {
+                push_credential_needles(&mut needles, value, "[REDACTED:host_credential]");
             }
         }
-        result
+        sort_redaction_needles(&mut needles);
+        needles
+    }
+
+    /// Replace injected credential values with `[REDACTED]` in text.
+    /// Longest-first ordering keeps one credential nested inside another from
+    /// leaving a visible remainder (WI#432).
+    fn redact_credentials(&self, text: &str) -> String {
+        redact_text_with_needles(text, &self.redaction_needles())
     }
 
     /// Inject pre-resolved host credentials into the request.
@@ -498,52 +490,37 @@ impl StoreData {
         }
     }
 
-    /// Redact credentials from a serialized headers map at the field level
-    /// (WI#395 run-111 HA-8): a secret containing `"` or `\` is JSON-escaped
-    /// in the serialized form, so string-level replacement can miss it, and a
-    /// blind string replace could even produce invalid JSON. Parsing first
-    /// and redacting each name and value keeps the output valid for any
-    /// secret bytes.
+    /// Redact credentials from a serialized headers map at the field level.
+    /// Cross-field echoes replace both complete values before per-field
+    /// scrubbing, so neither side of a split secret survives (WI#432).
     fn redact_headers_json(&self, headers_json: &str) -> String {
-        let Ok(map) = serde_json::from_str::<HashMap<String, String>>(headers_json) else {
-            return self.redact_credentials(headers_json);
+        let needles = self.redaction_needles();
+        let Ok(mut map) = serde_json::from_str::<HashMap<String, String>>(headers_json) else {
+            return redact_text_with_needles(headers_json, &needles);
         };
+        redact_cross_field_echoes(&mut map, &needles);
         let redacted: HashMap<String, String> = map
             .into_iter()
             .map(|(name, value)| {
                 (
-                    self.redact_credentials(&name),
-                    self.redact_credentials(&value),
+                    redact_text_with_needles(&name, &needles),
+                    redact_text_with_needles(&value, &needles),
                 )
             })
             .collect();
-        serde_json::to_string(&redacted).unwrap_or_else(|_| self.redact_credentials(headers_json))
+        serde_json::to_string(&redacted)
+            .unwrap_or_else(|_| redact_text_with_needles(headers_json, &needles))
     }
 
-    /// Byte-level credential scrub for response bodies (WI#395 run-111
-    /// HA-3): bodies are not guaranteed UTF-8, so the raw and urlencoded
-    /// spellings are replaced at the byte level rather than through lossy
-    /// string conversion.
+    /// Byte-level credential scrub for response bodies, including the raw,
+    /// URL/form, URL-parser, JSON-string and hexadecimal spellings (WI#432).
     fn redact_credential_bytes(&self, mut bytes: Vec<u8>) -> Vec<u8> {
-        for (name, value) in &self.credentials {
-            if !value.is_empty() {
-                let marker = format!("[REDACTED:{name}]").into_bytes();
-                replace_all_bytes(&mut bytes, value.as_bytes(), &marker);
-                let encoded = urlencoding::encode(value).to_string();
-                if encoded != *value {
-                    replace_all_bytes(&mut bytes, encoded.as_bytes(), &marker);
-                }
-            }
-        }
-        for cred in &self.host_credentials {
-            if !cred.secret_value.is_empty() {
-                const MARKER: &[u8] = b"[REDACTED:host_credential]";
-                replace_all_bytes(&mut bytes, cred.secret_value.as_bytes(), MARKER);
-                let encoded = urlencoding::encode(&cred.secret_value).to_string();
-                if encoded != cred.secret_value {
-                    replace_all_bytes(&mut bytes, encoded.as_bytes(), MARKER);
-                }
-            }
+        for needle in self.redaction_needles() {
+            replace_all_bytes(
+                &mut bytes,
+                needle.value.as_bytes(),
+                needle.marker.as_bytes(),
+            );
         }
         bytes
     }
@@ -877,7 +854,7 @@ async fn collect_guest_http_response(
     })
 }
 
-async fn collect_capped_response_body<S, E>(
+pub(crate) async fn collect_capped_response_body<S, E>(
     stream: S,
     content_length: Option<u64>,
     max_response_bytes: usize,
@@ -901,32 +878,177 @@ where
     Ok(body)
 }
 
-/// Also scrub the URL-encoded form of a secret. Query-param injection
-/// percent-encodes characters like `+`, `/` and `=` (typical of base64
-/// tokens), so a raw-value replace alone leaves the encoded copy intact
-/// (WI#395).
-fn replace_encoded_secret(result: &mut String, value: &str, replacement: &str) {
-    let encoded = urlencoding::encode(value).to_string();
-    if encoded != value {
-        *result = result.replace(encoded.as_str(), replacement);
+const MIN_CREDENTIAL_SCRUB_LEN: usize = 4;
+
+struct RedactionNeedle {
+    value: String,
+    marker: String,
+}
+
+fn push_credential_needles(needles: &mut Vec<RedactionNeedle>, secret: &str, marker: &str) {
+    if secret.len() < MIN_CREDENTIAL_SCRUB_LEN {
+        return;
+    }
+    let mut spellings = vec![secret.to_string()];
+    spellings.extend(encoded_spellings(secret));
+    for value in spellings {
+        if value.len() >= MIN_CREDENTIAL_SCRUB_LEN {
+            needles.push(RedactionNeedle {
+                value,
+                marker: marker.to_string(),
+            });
+        }
     }
 }
 
-/// Replace every occurrence of `needle` in `haystack` with `marker`, at the
-/// byte level (WI#395 run-111 HA-3 — response bodies are not guaranteed
-/// UTF-8, so string-level replacement cannot be used on them).
+fn sort_redaction_needles(needles: &mut Vec<RedactionNeedle>) {
+    needles.sort_by(|left, right| {
+        right
+            .value
+            .len()
+            .cmp(&left.value.len())
+            .then_with(|| left.value.cmp(&right.value))
+            .then_with(|| left.marker.cmp(&right.marker))
+    });
+    needles.dedup_by(|left, right| left.value == right.value);
+}
+
+fn redact_text_with_needles(text: &str, needles: &[RedactionNeedle]) -> String {
+    let mut result = text.to_string();
+    for needle in needles {
+        result = result.replace(&needle.value, &needle.marker);
+    }
+    result
+}
+
+fn redact_cross_field_echoes(fields: &mut HashMap<String, String>, needles: &[RedactionNeedle]) {
+    let snapshot: Vec<(String, String)> = fields
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    let mut replacements = HashMap::new();
+    for (index, (left_name, left_value)) in snapshot.iter().enumerate() {
+        for (right_name, right_value) in snapshot.iter().skip(index + 1) {
+            if let Some(needle) = cross_field_needle(left_value, right_value, needles) {
+                replacements
+                    .entry(left_name.clone())
+                    .or_insert_with(|| needle.marker.clone());
+                replacements
+                    .entry(right_name.clone())
+                    .or_insert_with(|| needle.marker.clone());
+            }
+        }
+    }
+    for (name, value) in fields {
+        if let Some(marker) = replacements.get(name) {
+            *value = marker.clone();
+        }
+    }
+}
+
+fn cross_field_needle<'a>(
+    left: &str,
+    right: &str,
+    needles: &'a [RedactionNeedle],
+) -> Option<&'a RedactionNeedle> {
+    needles.iter().find(|needle| {
+        let value = &needle.value;
+        (1..value.len()).any(|split| {
+            value.is_char_boundary(split)
+                && ((left.ends_with(&value[..split]) && right.starts_with(&value[split..]))
+                    || (right.ends_with(&value[..split]) && left.starts_with(&value[split..])))
+        })
+    })
+}
+
+fn host_credential_needles(cred: &ResolvedHostCredential) -> Vec<&str> {
+    let mut needles = Vec::new();
+    if !cred.secret_value.is_empty() {
+        needles.push(cred.secret_value.as_str());
+    }
+    for value in cred.headers.values() {
+        if let Some((_, token)) = value.split_once(' ') {
+            let token = token.trim();
+            if token.len() >= 8 && token != cred.secret_value && !token.contains(&cred.secret_value)
+            {
+                needles.push(token);
+            }
+        }
+    }
+    needles
+}
+
+fn form_encode_secret(secret: &str) -> String {
+    url::form_urlencoded::byte_serialize(secret.as_bytes()).collect()
+}
+
+fn encoded_spellings(secret: &str) -> Vec<String> {
+    let mut out = vec![
+        urlencoding::encode(secret).to_string(),
+        form_encode_secret(secret),
+    ];
+    if let Ok(mut parsed) = url::Url::parse("http://redaction.invalid/") {
+        parsed.set_query(Some(secret));
+        if let Some(query) = parsed.query() {
+            out.push(query.to_string());
+        }
+        parsed.set_query(None);
+        parsed.set_path(secret);
+        out.push(parsed.path().trim_start_matches('/').to_string());
+    }
+    for candidate in [secret.replace('+', " "), secret.to_string()] {
+        if let Ok(decoded) = urlencoding::decode(&candidate) {
+            out.push(decoded.into_owned());
+        }
+    }
+    if let Ok(json) = serde_json::to_string(secret)
+        && let Some(inner) = json.strip_prefix('"').and_then(|v| v.strip_suffix('"'))
+    {
+        out.push(inner.to_string());
+    }
+    out.push(hex_encode_secret(secret, false));
+    out.push(hex_encode_secret(secret, true));
+    out.retain(|spelling| !spelling.is_empty() && spelling != secret);
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn hex_encode_secret(secret: &str, uppercase: bool) -> String {
+    let digits = if uppercase {
+        b"0123456789ABCDEF"
+    } else {
+        b"0123456789abcdef"
+    };
+    let mut encoded = String::with_capacity(secret.len() * 2);
+    for byte in secret.bytes() {
+        encoded.push(digits[(byte >> 4) as usize] as char);
+        encoded.push(digits[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+/// Replace every occurrence of `needle` in `haystack` with `marker` in one
+/// pass into a fresh buffer, avoiding quadratic in-place splicing.
 fn replace_all_bytes(haystack: &mut Vec<u8>, needle: &[u8], marker: &[u8]) {
-    if needle.is_empty() {
+    if needle.is_empty() || haystack.len() < needle.len() {
         return;
     }
-    let mut search_from = 0;
-    while let Some(offset) = haystack[search_from..]
-        .windows(needle.len())
-        .position(|window| window == needle)
-    {
-        let at = search_from + offset;
-        haystack.splice(at..at + needle.len(), marker.iter().copied());
-        search_from = at + marker.len();
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut index = 0;
+    let mut changed = false;
+    while index < haystack.len() {
+        if haystack[index..].starts_with(needle) {
+            out.extend_from_slice(marker);
+            index += needle.len();
+            changed = true;
+        } else {
+            out.push(haystack[index]);
+            index += 1;
+        }
+    }
+    if changed {
+        *haystack = out;
     }
 }
 
@@ -2389,7 +2511,7 @@ fn extract_host_from_url(url: &str) -> Option<String> {
 /// Resolve the URL's hostname and reject connections to private/internal IP addresses.
 /// This prevents DNS rebinding attacks where an attacker's domain resolves to an
 /// internal IP after passing the allowlist check.
-fn reject_private_ip(url: &str) -> Result<(), String> {
+pub(crate) fn reject_private_ip(url: &str) -> Result<(), String> {
     let parsed = url::Url::parse(url).map_err(|e| format!("Failed to parse URL: {e}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(format!("Unsupported URL scheme: {}", parsed.scheme()));
@@ -2581,6 +2703,7 @@ mod tests {
     use crate::tools::tool::Tool;
     use crate::tools::wasm::capabilities::{Capabilities, WasmApprovalPolicy};
     use crate::tools::wasm::runtime::{WasmRuntimeConfig, WasmToolRuntime};
+    use crate::tools::wasm::wrapper::StoreData;
 
     fn response_chunks(
         sizes: &[usize],
@@ -3596,6 +3719,100 @@ mod tests {
         assert!(!redacted.contains("tok+/en=42"), "{redacted}");
         assert!(!redacted.contains(&encoded), "{redacted}");
         assert!(redacted.contains("[REDACTED:API_TOKEN]"), "{redacted}");
+    }
+
+    #[test]
+    fn wi432_needles_are_longest_first_and_skip_short_secrets() {
+        use super::{push_credential_needles, redact_text_with_needles, sort_redaction_needles};
+
+        let mut needles = Vec::new();
+        push_credential_needles(&mut needles, "prefix", "[REDACTED:SHORT]");
+        push_credential_needles(&mut needles, "prefixSuffix9", "[REDACTED:LONG]");
+        push_credential_needles(&mut needles, "utf", "[REDACTED:TINY]");
+        sort_redaction_needles(&mut needles);
+
+        let long = needles
+            .iter()
+            .position(|needle| needle.value == "prefixSuffix9")
+            .expect("long needle");
+        let short = needles
+            .iter()
+            .position(|needle| needle.value == "prefix")
+            .expect("short needle");
+        assert!(long < short);
+        assert!(!needles.iter().any(|needle| needle.value == "utf"));
+        assert!(!needles.iter().any(|needle| needle.value == "757474"));
+        assert_eq!(
+            redact_text_with_needles("prefixSuffix9 charset=utf-8", &needles),
+            "[REDACTED:LONG] charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn wi432_short_secret_does_not_mangle_tool_response() {
+        let mut credentials = HashMap::new();
+        credentials.insert("SHORT".to_string(), "utf".to_string());
+        credentials.insert("LONG".to_string(), "longsecret".to_string());
+        let store_data = StoreData::new(
+            1024 * 1024,
+            Capabilities::default(),
+            credentials,
+            Vec::new(),
+        );
+
+        assert_eq!(
+            store_data.redact_credentials("charset=utf-8 longsecret"),
+            "charset=utf-8 [REDACTED:LONG]"
+        );
+        assert_eq!(
+            store_data.redact_credential_bytes(b"charset=utf-8 longsecret".to_vec()),
+            b"charset=utf-8 [REDACTED:LONG]"
+        );
+    }
+
+    #[test]
+    fn wi432_body_scrub_covers_json_and_hex_spellings() {
+        let mut credentials = HashMap::new();
+        credentials.insert("API_TOKEN".to_string(), "A\"9z".to_string());
+        let store_data = StoreData::new(
+            1024 * 1024,
+            Capabilities::default(),
+            credentials,
+            Vec::new(),
+        );
+
+        let body = br#"raw=A"9z json=A\"9z lower=4122397a upper=4122397A"#.to_vec();
+        let redacted = store_data.redact_credential_bytes(body);
+        assert_eq!(
+            redacted,
+            br#"raw=[REDACTED:API_TOKEN] json=[REDACTED:API_TOKEN] lower=[REDACTED:API_TOKEN] upper=[REDACTED:API_TOKEN]"#
+        );
+    }
+
+    #[test]
+    fn wi432_header_scrub_covers_cross_field_echoes() {
+        let mut credentials = HashMap::new();
+        credentials.insert("API_TOKEN".to_string(), "s3cr3t-value".to_string());
+        let store_data = StoreData::new(
+            1024 * 1024,
+            Capabilities::default(),
+            credentials,
+            Vec::new(),
+        );
+        let headers = r#"{"x-first":"s3cr","x-second":"3t-value","x-other":"ok"}"#;
+
+        let redacted = store_data.redact_headers_json(headers);
+        let map: HashMap<String, String> =
+            serde_json::from_str(&redacted).expect("redacted headers remain valid JSON");
+        assert_eq!(
+            map.get("x-first").map(String::as_str),
+            Some("[REDACTED:API_TOKEN]")
+        );
+        assert_eq!(
+            map.get("x-second").map(String::as_str),
+            Some("[REDACTED:API_TOKEN]")
+        );
+        assert_eq!(map.get("x-other").map(String::as_str), Some("ok"));
     }
 
     /// WI#395 (GN-6/GN-7): the trait boundary applies one redaction over the
