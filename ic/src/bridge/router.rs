@@ -7053,6 +7053,69 @@ pub(crate) mod tests {
         );
     }
 
+    /// WI#472: the gateway approval endpoint resolves the owning thread from
+    /// `request_id` alone. The lookup is user-scoped, ignores non-approval
+    /// gates, and returns nothing for unknown or dead gates.
+    #[tokio::test]
+    async fn approval_gate_lookup_by_request_resolves_only_the_owner() {
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store.clone());
+
+        let thread = save_waiting_thread(&store, state.default_project_id, "alice").await;
+        let approval = sample_pending_gate(
+            "alice",
+            thread.id,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        let request_id = approval.request_id;
+        let auth = sample_pending_gate(
+            "alice",
+            lunarwing_engine::ThreadId::new(),
+            lunarwing_engine::ResumeKind::Authentication {
+                credential_name: "gitlab".into(),
+                instructions: "token".into(),
+                auth_url: None,
+            },
+        );
+        let auth_request = auth.request_id;
+        state.pending_gates.insert(approval).await.unwrap();
+        state.pending_gates.insert(auth).await.unwrap();
+
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = Some(state);
+
+        let found = find_engine_approval_gate_for_request("alice", request_id)
+            .await
+            .unwrap()
+            .expect("the owner resolves the approval by request id");
+        assert_eq!(found.thread_id, thread.id.to_string());
+
+        assert!(
+            find_engine_approval_gate_for_request("bob", request_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "another user must never resolve this approval"
+        );
+        assert!(
+            find_engine_approval_gate_for_request("alice", auth_request)
+                .await
+                .unwrap()
+                .is_none(),
+            "authentication gates are not approvals"
+        );
+        assert!(
+            find_engine_approval_gate_for_request("alice", uuid::Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_none(),
+            "an unknown request id resolves nothing"
+        );
+
+        *lock.write().await = None;
+    }
+
     /// WI#332 / MR !1528 DJ-1: the HTTP-facing lookups still return an
     /// authentication-fallback gate whose thread already terminated — the
     /// user must be able to fetch the token prompt and answer it.

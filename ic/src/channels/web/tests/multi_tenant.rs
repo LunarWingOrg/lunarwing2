@@ -2036,3 +2036,188 @@ mod memory_write_route {
         }
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Approval routing without thread_id (WI#472)
+// ═══════════════════════════════════════════════════════════════════════
+
+mod approval_resolution {
+    use super::*;
+    use crate::agent::{SessionManager, session::ThreadState};
+    use crate::channels::web::server::chat_approval_handler;
+    use axum::routing::post;
+
+    fn approval_router(state: Arc<GatewayState>, auth: MultiAuthState) -> Router {
+        Router::new()
+            .route("/api/chat/approval", post(chat_approval_handler))
+            .layer(middleware::from_fn_with_state(auth.into(), auth_middleware))
+            .with_state(state)
+    }
+
+    /// State with a live message sender and alice's session armed with one
+    /// pending approval for `request_id`.
+    async fn armed_state(
+        request_id: Uuid,
+    ) -> (
+        Arc<GatewayState>,
+        tokio::sync::mpsc::Receiver<crate::channels::IncomingMessage>,
+        Uuid,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let manager = Arc::new(SessionManager::new());
+        let (session, thread_id) = manager.resolve_thread("alice", "gateway", None).await;
+        {
+            let mut sess = session.lock().await;
+            let thread = sess
+                .threads
+                .get_mut(&thread_id)
+                .expect("resolved thread exists");
+            thread.state = ThreadState::AwaitingApproval;
+            thread.pending_approval = Some(crate::agent::session::PendingApproval {
+                request_id,
+                tool_name: "shell".into(),
+                parameters: serde_json::json!({"cmd": "ls"}),
+                display_parameters: serde_json::json!({"cmd": "ls"}),
+                description: "run shell".into(),
+                tool_call_id: "call_1".into(),
+                context_messages: Vec::new(),
+                deferred_tool_calls: Vec::new(),
+                user_timezone: None,
+                allow_always: true,
+            });
+        }
+        let state = Arc::new(GatewayState {
+            msg_tx: tokio::sync::RwLock::new(Some(tx)),
+            sse: Arc::new(SseManager::new()),
+            workspace: None,
+            workspace_pool: None,
+            session_manager: Some(manager),
+            log_broadcaster: None,
+            log_level_handle: None,
+            extension_manager: None,
+            tool_registry: None,
+            store: None,
+            job_manager: None,
+            external_worker_manager: None,
+            prompt_queue: None,
+            owner_id: "test".to_string(),
+            default_sender_id: "test".to_string(),
+            shutdown_tx: tokio::sync::RwLock::new(None),
+            ws_tracker: None,
+            llm_provider: None,
+            skill_registry: None,
+            skill_catalog: None,
+            scheduler: None,
+            chat_rate_limiter: PerUserRateLimiter::new(30, 60),
+            oauth_rate_limiter: RateLimiter::new(10, 60),
+            webhook_rate_limiter: RateLimiter::new(10, 60),
+            registry_entries: Vec::new(),
+            cost_guard: None,
+            routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
+            startup_time: std::time::Instant::now(),
+            active_config: ActiveConfigSnapshot::default(),
+            secrets_store: None,
+            db_auth: None,
+            channel_manager: None,
+            ws_ping_interval_secs: 30,
+            ws_idle_timeout_secs: 120,
+            voice: None,
+            voice_rate_limiter: PerUserRateLimiter::new(10, 60),
+        });
+        (state, rx, thread_id)
+    }
+
+    fn approval_request(token: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/chat/approval")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request builds") // safety: fixed literals and a serialized body
+    }
+
+    /// Every action resolves the owning thread from `request_id` alone and
+    /// forwards it, so the submission can match its gate (WI#472).
+    #[tokio::test]
+    async fn approval_without_thread_id_resolves_the_gate_owner_for_each_action() {
+        let auth = two_user_auth();
+        for action in ["approve", "always", "deny"] {
+            let request_id = Uuid::new_v4();
+            let (state, mut rx, thread_id) = armed_state(request_id).await;
+            let app = approval_router(state, auth.clone());
+
+            let resp = app
+                .oneshot(approval_request(
+                    "tok-alice",
+                    serde_json::json!({"request_id": request_id.to_string(), "action": action}),
+                ))
+                .await
+                .expect("handler responds");
+            assert_eq!(resp.status(), StatusCode::ACCEPTED, "action {action}");
+
+            let msg = rx.recv().await.expect("approval is forwarded");
+            assert_eq!(
+                msg.conversation_scope(),
+                Some(thread_id.to_string().as_str()),
+                "action {action} must target the gate's owning thread"
+            );
+        }
+    }
+
+    /// An unmatched request id must not report success — this was the 202 no-op.
+    #[tokio::test]
+    async fn unmatched_request_id_returns_404_and_sends_nothing() {
+        let request_id = Uuid::new_v4();
+        let (state, mut rx, _thread_id) = armed_state(request_id).await;
+        let app = approval_router(state, two_user_auth());
+
+        let resp = app
+            .oneshot(approval_request(
+                "tok-alice",
+                serde_json::json!({"request_id": Uuid::new_v4().to_string(), "action": "deny"}),
+            ))
+            .await
+            .expect("handler responds");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(rx.try_recv().is_err(), "no message may be forwarded");
+    }
+
+    /// Another user's approval is never resolvable, and a foreign thread id is
+    /// refused even for the owner.
+    #[tokio::test]
+    async fn approval_is_user_scoped_and_rejects_a_foreign_thread() {
+        let request_id = Uuid::new_v4();
+        let (state, mut rx, _thread_id) = armed_state(request_id).await;
+        let app = approval_router(state, two_user_auth());
+
+        let resp = app
+            .clone()
+            .oneshot(approval_request(
+                "tok-bob",
+                serde_json::json!({"request_id": request_id.to_string(), "action": "deny"}),
+            ))
+            .await
+            .expect("handler responds");
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "another user must not resolve alice's approval"
+        );
+        assert!(rx.try_recv().is_err());
+
+        let resp = app
+            .oneshot(approval_request(
+                "tok-alice",
+                serde_json::json!({
+                    "request_id": request_id.to_string(),
+                    "action": "deny",
+                    "thread_id": Uuid::new_v4().to_string(),
+                }),
+            ))
+            .await
+            .expect("handler responds");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(rx.try_recv().is_err());
+    }
+}
