@@ -88,6 +88,7 @@ mod capabilities_schema;
 pub(crate) mod credential_injector;
 mod error;
 mod host;
+pub(crate) mod http_security;
 mod limits;
 pub(crate) mod loader;
 mod rate_limiter;
