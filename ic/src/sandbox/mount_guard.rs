@@ -78,11 +78,58 @@ const ENV_SUFFIX: &str = ".env";
 /// directory), which are always included because they cover the single-node
 /// layout, where the env file genuinely is `<base>/.env`.
 pub fn resolve_protected_paths() -> Vec<PathBuf> {
+    static DEGRADE_LOGGED: AtomicBool = AtomicBool::new(false);
+    resolve_protected_paths_signalled(&DEGRADE_LOGGED)
+}
+
+/// [`resolve_protected_paths`] with an injectable once-per-boot flag.
+fn resolve_protected_paths_signalled(degrade_logged: &AtomicBool) -> Vec<PathBuf> {
     let explicit = explicit_protected_entries(
         std::env::var(PROTECTED_PATHS_ENV).ok().as_deref(),
         std::env::var(SERVICE_LOG_DIRS_ENV).ok().as_deref(),
     );
-    resolve_protected_paths_from(explicit.as_deref(), &crate::bootstrap::lunarwing_base_dir())
+    let base = crate::bootstrap::lunarwing_base_dir();
+    signal_degrade_once(
+        explicit.is_none(),
+        degrade_logged,
+        &base,
+        mt_base_name_is_nonstandard(&base),
+    );
+    resolve_protected_paths_from(explicit.as_deref(), &base)
+}
+
+/// Emit the WI#441 degrade signal at most once per process, and report whether
+/// this call was the one that emitted it.
+///
+/// An absent `SANDBOX_PROTECTED_PATHS` used to fall back to base-dir defaults
+/// with zero operator-visible trace. The fallback is correct for single-node
+/// installs but is a silent *degrade* in multi-tenant ones, so the boot log
+/// must name the base dir the daemon actually used and say whether the
+/// structural sibling heuristic (not the canonical `state/` name) is what
+/// supplied the tenant's `env/` + `run/` coverage.
+fn signal_degrade_once(
+    degraded: bool,
+    seen: &AtomicBool,
+    base: &Path,
+    nonstandard_base_name: bool,
+) -> bool {
+    if !degraded || seen.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    tracing::warn!(
+        base = %base.display(),
+        nonstandard_base_name,
+        "{PROTECTED_PATHS_ENV} is not set; sandbox mount guard is using base-dir \
+         defaults plus layout heuristics instead of an explicit protected list"
+    );
+    true
+}
+
+/// True when `base` is not itself named `state` yet its parent carries the MT
+/// tenant-root layout — i.e. coverage comes from the structural heuristic.
+fn mt_base_name_is_nonstandard(base: &Path) -> bool {
+    base.file_name().and_then(|n| n.to_str()) != Some("state")
+        && base.parent().is_some_and(looks_like_mt_tenant_root)
 }
 
 /// Union of the operator's `SANDBOX_PROTECTED_PATHS` and the init script's
@@ -153,21 +200,44 @@ fn resolve_protected_paths_from(env_raw: Option<&str>, base: &Path) -> Vec<PathB
 }
 
 /// Add `<root>/env`, `<root>/run` and `<root>/logs` when `base` looks like an
-/// MT state dir (`<root>/<something>/state`). The explicit list already
-/// protects the base itself, so `state/` is not repeated.
+/// MT state dir. The explicit list already protects the base itself, so
+/// `state/` is not repeated.
 ///
 /// `<root>/logs` (WI#287) holds the raw, unscrubbed OpenRC daemon and service
 /// logs; it was mountable read-write as a `workdir`, letting an agent read or
 /// rewrite them. The agent's sanctioned view is the scrubbed, read-only
 /// [`TENANT_LOGS_MOUNT`].
+///
+/// WI#441: the previous rule keyed on `base.file_name() == Some("state")`, so
+/// an MT install whose base component is named anything else (`data/state` is
+/// fine, `var`, `store`, `runtime`, ... are not) silently lost sibling
+/// coverage. The base name is still accepted as the canonical marker, but it
+/// is no longer the only signal: the parent is also probed structurally for
+/// the sibling `env/` + `run/`-or-`logs/` directories that the MT layout
+/// always has. Both branches fail safe (extra protected paths only ever deny
+/// or mask more), and a parent that merely *coincidentally* holds `env/` plus
+/// `run/` is over-protection, not a bypass.
 fn add_mt_tenant_siblings(base: &Path, paths: &mut Vec<PathBuf>) {
-    if base.file_name().and_then(|n| n.to_str()) == Some("state")
-        && let Some(tenant_root) = base.parent()
-    {
-        paths.push(tenant_root.join("env"));
-        paths.push(tenant_root.join("run"));
-        paths.push(tenant_root.join("logs"));
+    let Some(tenant_root) = base.parent() else {
+        return;
+    };
+    let named_state_marker = base.file_name().and_then(|n| n.to_str()) == Some("state");
+    if !named_state_marker && !looks_like_mt_tenant_root(tenant_root) {
+        return;
     }
+    paths.push(tenant_root.join("env"));
+    paths.push(tenant_root.join("run"));
+    paths.push(tenant_root.join("logs"));
+}
+
+/// True when `root` carries the MT tenant-root layout marker: a sibling `env/`
+/// directory plus at least one of `run/` or `logs/`.
+///
+/// Existence-based detection cannot see a tenant that has not been rendered
+/// yet, which is exactly why the literal `state/` base name is still honoured
+/// on its own (provisioners render `env/` before the daemon first starts).
+fn looks_like_mt_tenant_root(root: &Path) -> bool {
+    root.join("env").is_dir() && (root.join("run").is_dir() || root.join("logs").is_dir())
 }
 
 /// Container path where the daemon's sandbox-visible log directory is bound
@@ -764,6 +834,87 @@ mod tests {
             !paths.iter().any(|p| p.ends_with(Path::new("u/env"))),
             "no sibling env/ derived for a non-MT base: {paths:?}"
         );
+    }
+
+    /// WI#441 residual 2: an MT base whose component is *not* literally named
+    /// `state` still gets `<root>/env`, `<root>/run` and `<root>/logs` when the
+    /// parent carries the structural tenant-root marker.
+    #[test]
+    fn non_state_named_mt_base_gains_siblings_structurally() {
+        let fixture = Fixture::new();
+        // `<root>/lunarwing/var` instead of `<root>/lunarwing/state`.
+        let alt_base = fixture.root.join("lunarwing/var");
+        std::fs::create_dir_all(&alt_base).expect("alt base");
+        let paths = resolve_protected_paths_from(None, &alt_base);
+        for want in [
+            fixture.root.join("lunarwing/env"),
+            fixture.root.join("lunarwing/run"),
+            fixture.root.join("lunarwing/logs"),
+        ] {
+            let want = want.canonicalize().expect("exists");
+            assert!(paths.contains(&want), "missing {want:?} in {paths:?}");
+        }
+        // The siblings are real protection: the credential dir is denied.
+        assert!(
+            validate_mount_dir(&fixture.env_dir(), &paths).is_err(),
+            "env/ must be denied for a non-`state` MT base"
+        );
+    }
+
+    /// WI#441 residual 2: a non-`state` base under a parent with no tenant
+    /// layout is left alone (the broadened rule must not invent siblings).
+    #[test]
+    fn non_state_named_base_without_layout_marker_gains_no_siblings() {
+        let fixture = Fixture::new();
+        let ordinary = fixture.root.join("lunarwing/elsewhere");
+        std::fs::create_dir_all(&ordinary).expect("dir");
+        // Parent has env/ (from the fixture) but neither run/ nor logs/? It has
+        // both, so drop them to make the marker genuinely absent.
+        std::fs::remove_dir_all(fixture.root.join("lunarwing/run")).expect("remove run");
+        std::fs::remove_dir_all(fixture.root.join("lunarwing/logs")).expect("remove logs");
+        let paths = resolve_protected_paths_from(None, &ordinary);
+        assert!(
+            !paths.contains(&fixture.root.join("lunarwing/env")),
+            "no siblings without the layout marker: {paths:?}"
+        );
+    }
+
+    /// WI#441 residual 1: the degrade signal fires once when neither
+    /// protected-path variable names anything, and never when a list exists.
+    #[test]
+    fn degrade_signal_fires_once_and_only_when_unset() {
+        let seen = AtomicBool::new(false);
+        let base = Path::new("/home/tenant/lunarwing/state");
+        assert!(
+            signal_degrade_once(true, &seen, base, false),
+            "first degrade must emit"
+        );
+        assert!(
+            !signal_degrade_once(true, &seen, base, false),
+            "second degrade must be suppressed"
+        );
+
+        let seen = AtomicBool::new(false);
+        assert!(
+            !signal_degrade_once(false, &seen, base, false),
+            "an explicit list must not warn"
+        );
+        assert!(
+            !seen.load(Ordering::Relaxed),
+            "the once-flag must stay unset when nothing degraded"
+        );
+    }
+
+    /// WI#441 residual 1: the signal names whether coverage came from the
+    /// structural heuristic rather than the canonical `state/` base name.
+    #[test]
+    fn degrade_signal_reports_nonstandard_base_name() {
+        assert!(!mt_base_name_is_nonstandard(Path::new("/t/lunarwing/state")));
+        let fixture = Fixture::new();
+        let alt_base = fixture.root.join("lunarwing/var");
+        std::fs::create_dir_all(&alt_base).expect("alt base");
+        assert!(mt_base_name_is_nonstandard(&alt_base));
+        assert!(!mt_base_name_is_nonstandard(Path::new("/home/u/.ironclaw")));
     }
 
     /// Explicit SANDBOX_PROTECTED_PATHS entries are preserved alongside the
