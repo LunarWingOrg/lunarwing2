@@ -894,37 +894,37 @@ re-checked 2026-10-13):
   guard is the only in-CLI enforcement point and stays mandatory.
 - **pebble:** no listeners, pairing, or sharing in upstream
   (nanogpt-community/pebble) — the only `TcpListener` is test code.
-  **Finding (widened per run-79 EI-10; resolved by WI#400/WI#422):** the
-  image used to have no `USER` directive, so the agent ran as **root in
-  the container** — beyond `pebble self-update` (fetches GitHub releases,
-  replaces the binary), a root-in-container agent could replace the bridge
-  binary itself and forge audit/bridge output (why control 9 reads
-  `/proc` host-side). That shape is gone: the image now pins `USER 0:0`
-  and the WI#400 split (see "Task-uid split (WI#400)" above) drops every
-  spawned pebble process to the task uid via setpriv, so the bridge
-  binary and its root-owned state are out of the agent's reach on the
-  rootless lane; the rootful launch runs the whole container as the
-  tenant uid ("Launch identity (WI#422)") — there the agent shares the
-  bridge's uid, so it can still signal or trace the bridge and read its
-  environment (no split, by design per WI#422). **Bump record (WI#425,
-  2026-10-26; no upstream ref change):** a PATH-visible refusal wrapper
-  (`pebble4lunarwing/scripts/pebble-self-update-guard.sh`) owns
-  `/usr/local/bin/pebble`; the reviewed binary moves to
+  **Finding (widened per run-79 EI-10; agent side addressed by WI#400/WI#422,
+  WI#425 AC4 open):** the image used to have no `USER` directive, so the agent
+  ran as **root in the container** — beyond `pebble self-update` (fetches
+  GitHub releases, replaces the binary), a root-in-container agent could
+  replace the bridge binary itself and forge audit/bridge output (why control
+  9 reads `/proc` host-side). Today the image pins `USER 0:0`, and the WI#400
+  split (see "Task-uid split (WI#400)" above) drops every spawned pebble
+  process to the task uid via setpriv, so the bridge binary and its root-owned
+  state are out of the agent's reach on the rootless lane. The rootful launch
+  runs the whole container as the tenant uid ("Launch identity (WI#422)") —
+  there the agent shares the bridge's uid, so it can still signal or trace the
+  bridge and read its environment (no split, by design per WI#422). **Bump
+  record (WI#425, 2026-10-26; no upstream ref change):** a PATH-visible
+  refusal wrapper (`pebble4lunarwing/scripts/pebble-self-update-guard.sh`)
+  owns `/usr/local/bin/pebble`; the reviewed binary moves to
   `/usr/local/lib/pebble/pebble`. It refuses naive `self-update` and honours
   no environment override. Direct execution remains possible, but the real
   binary and its parent are root-owned and non-writable by the task uid, so
   file permissions — not the wrapper — prevent replacement under either
-  launch identity. The wrapper is only a naive-use guard, and the GitHub
-  fetch remains an egress-allowlist concern (WI#424). Keep the pinned
-  `PEBBLE_LOCK_SHA256` build contract intact. **WI#425 AC4 interpretation
-  (run-221 OK9):** the original "non-root user" wording predates WI#400 and
-  WI#422 and is satisfied at the agent-execution boundary: every rootless
-  spawned pebble process uses the non-root task uid, and the rootful launch
-  runs the whole container as the tenant uid. The rootless bridge deliberately
-  keeps `USER 0:0` so it can drop tasks and protect the hub credential;
-  changing it to the task uid would collapse that newer boundary. This item
-  does not claim a non-root bridge. A rebuilt pebble candidate and a live
-  `mt-admin worker-listeners` audit remain protected-pipeline/deploy evidence.
+  launch identity. The wrapper is only a naive-use guard, and the GitHub fetch
+  remains an egress-allowlist concern (WI#424). Keep the pinned
+  `PEBBLE_LOCK_SHA256` build contract intact. **WI#425 AC4 status: OPEN
+  (run-230 OW-1).** The rootless bridge still runs as container root, so the
+  original non-root-container criterion is not met. Simply changing the bridge
+  to the task uid would collapse WI#400's credential boundary; that trade-off
+  is not a reason to declare AC4 satisfied. The pending maintainer decision is
+  the split into separate non-root bridge and task containers that preserves
+  their distinct identities. The self-update wrapper and root-owned real
+  binary remain appropriate independently of that decision. A rebuilt pebble
+  candidate and a live `mt-admin worker-listeners` audit remain
+  protected-pipeline/deploy evidence.
 
 ## LunarWing Worker
 
