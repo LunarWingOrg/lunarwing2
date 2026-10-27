@@ -245,6 +245,13 @@ there. If a candidate still fails after all eight attempts, wait a few
 minutes and re-run the job manually — the scan follows once a candidate
 publishes `worker-image.env`.
 
+The opencode2 tar/config verifier reads a pull token, manifest and image
+config from the same auth realm. Its shared JSON fetch path retries HTTP 429,
+500, 502, 503 and 504 three times with 15/30/60-second backoff, then fails;
+permanent HTTP errors and invalid JSON are not retried. After final
+exhaustion, re-run `worker-opencode2-exposure-verify` once the realm recovers
+rather than bypassing the check.
+
 ## worker-kimi digest mismatch (directory mtime flake)
 
 Symptom — `worker-kimi-candidate` fails with:
