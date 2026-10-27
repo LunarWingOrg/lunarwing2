@@ -413,14 +413,15 @@ mod workspace_pool {
 mod jobs_isolation {
     use super::*;
     use crate::channels::web::handlers::jobs::{
-        jobs_cancel_handler, jobs_detail_handler, jobs_prompt_handler, jobs_restart_handler,
-        jobs_summary_handler,
+        jobs_cancel_handler, jobs_detail_handler, jobs_list_handler, jobs_prompt_handler,
+        jobs_restart_handler, jobs_summary_handler,
     };
     // SandboxStore methods are accessed through the Database supertrait.
 
     /// Build a router with job endpoints behind multi-user auth.
     fn jobs_router(state: Arc<GatewayState>, auth: MultiAuthState) -> Router {
         Router::new()
+            .route("/api/jobs", get(jobs_list_handler))
             .route("/api/jobs/summary", get(jobs_summary_handler))
             .route("/api/jobs/{id}", get(jobs_detail_handler))
             .route("/api/jobs/{id}/cancel", post(jobs_cancel_handler))
@@ -906,6 +907,121 @@ mod jobs_isolation {
             resp.status(),
             StatusCode::NOT_FOUND,
             "bob should not be able to cancel alice's job"
+        );
+    }
+
+    // ── WI#479: job_mode on the list endpoint ──────────────────────────
+
+    async fn list_jobs(app: Router, uri: &str) -> serde_json::Value {
+        let req = Request::builder()
+            .uri(uri)
+            .header("Authorization", "Bearer tok-alice")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "list request failed");
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn job_by_id(body: &serde_json::Value, id: Uuid) -> &serde_json::Value {
+        body["jobs"]
+            .as_array()
+            .expect("jobs array")
+            .iter()
+            .find(|j| j["id"] == id.to_string())
+            .unwrap_or_else(|| panic!("job {id} missing from list: {body}"))
+    }
+
+    /// An external-worker job shows `job_mode` + `worker_name`; a plain
+    /// sandbox job omits both, matching the detail response's omission rule.
+    #[tokio::test]
+    async fn test_jobs_list_reports_mode_and_worker_name() {
+        let (db, _dir) = test_db().await;
+
+        let mut external = make_sandbox_job("alice", "external task");
+        external.job_mode = "external:kimi".to_string();
+        let mut plain = make_sandbox_job("alice", "plain task");
+        plain.job_mode = "worker".to_string();
+        db.save_sandbox_job(&external).await.unwrap();
+        db.save_sandbox_job(&plain).await.unwrap();
+
+        let state = build_state(Some(db), None);
+        let app = jobs_router(state, two_user_auth());
+
+        let body = list_jobs(app, "/api/jobs").await;
+
+        let ext = job_by_id(&body, external.id);
+        assert_eq!(ext["job_mode"], "external:kimi", "external mode: {body}");
+        assert_eq!(ext["worker_name"], "kimi", "worker name: {body}");
+
+        let plain = job_by_id(&body, plain.id);
+        assert!(
+            plain.get("job_mode").is_none(),
+            "the default worker mode must be omitted: {body}"
+        );
+        assert!(
+            plain.get("worker_name").is_none(),
+            "non-external jobs have no worker_name: {body}"
+        );
+    }
+
+    /// `?mode=` filters the list: `external` selects every external lane,
+    /// `external:kimi` narrows to one, and other users' jobs never appear.
+    #[tokio::test]
+    async fn test_jobs_list_mode_filter() {
+        let (db, _dir) = test_db().await;
+
+        let mut kimi = make_sandbox_job("alice", "kimi task");
+        kimi.job_mode = "external:kimi".to_string();
+        let mut pebble = make_sandbox_job("alice", "pebble task");
+        pebble.job_mode = "external:pebble".to_string();
+        let plain = make_sandbox_job("alice", "plain task");
+        let mut bob_job = make_sandbox_job("bob", "bob task");
+        bob_job.job_mode = "external:kimi".to_string();
+        for job in [&kimi, &pebble, &plain, &bob_job] {
+            db.save_sandbox_job(job).await.unwrap();
+        }
+
+        let state = build_state(Some(db), None);
+        let auth = two_user_auth();
+
+        let external = list_jobs(
+            jobs_router(state.clone(), auth.clone()),
+            "/api/jobs?mode=external",
+        )
+        .await;
+        let ids: Vec<&str> = external["jobs"]
+            .as_array()
+            .expect("jobs array")
+            .iter()
+            .map(|j| j["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(ids.len(), 2, "only alice's two external jobs: {external}");
+        assert!(ids.contains(&kimi.id.to_string().as_str()));
+        assert!(ids.contains(&pebble.id.to_string().as_str()));
+
+        let only_kimi = list_jobs(
+            jobs_router(state.clone(), auth.clone()),
+            "/api/jobs?mode=external:kimi",
+        )
+        .await;
+        assert_eq!(only_kimi["jobs"].as_array().expect("jobs").len(), 1);
+        assert_eq!(job_by_id(&only_kimi, kimi.id)["worker_name"], "kimi");
+
+        let workers = list_jobs(jobs_router(state, auth), "/api/jobs?mode=worker").await;
+        let worker_ids: Vec<&str> = workers["jobs"]
+            .as_array()
+            .expect("jobs array")
+            .iter()
+            .map(|j| j["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(
+            worker_ids,
+            vec![plain.id.to_string().as_str()],
+            "worker filter returns only mode-less/default jobs: {workers}"
         );
     }
 }
