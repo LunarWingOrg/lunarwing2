@@ -414,6 +414,36 @@ fn spawn_pebble(
     spawn_pebble_with_options(config, request, proxy_env, llm_request_timeout_secs())
 }
 
+/// Install an executable test stub without the write-then-exec race.
+///
+/// `std::fs::write` immediately followed by `execve` can fail with
+/// `ETXTBSY` ("Text file busy") while the kernel still holds a write
+/// reference on the target inode. Pipeline 6562's first `worker-pebble-rust`
+/// attempt (job 138240) died exactly that way spawning `pebble-stub.sh`, and
+/// the manual retry hid the failure behind an otherwise-green pipeline.
+///
+/// Writing a sibling temp file, flushing it with `sync_data`, and renaming it
+/// into place hands the executor a fresh inode that was never opened for
+/// writing under its final name, so there is no window left to race.
+#[cfg(test)]
+pub(crate) fn write_executable_stub(path: &Path, contents: &str) {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static STUB_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = STUB_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp-{}-{seq}", std::process::id()));
+
+    let mut file = std::fs::File::create(&tmp).expect("create stub temp file");
+    file.write_all(contents.as_bytes()).expect("write stub");
+    // The rename is atomic, but without this flush the executor can still
+    // win the race against writeback on an overlayfs runner.
+    file.sync_data().expect("flush stub");
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).expect("chmod stub");
+    std::fs::rename(&tmp, path).expect("rename stub into place");
+}
+
 fn spawn_pebble_with_options(
     config: &ExecutorConfig,
     request: &protocol::TaskRequest,
@@ -801,7 +831,6 @@ enum Outcome {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::os::unix::fs::PermissionsExt;
 
     use super::*;
     use crate::protocol::{ConversationMessage, TaskContext, TaskRequest};
@@ -1164,13 +1193,10 @@ mod tests {
             .expect("exe directory")
             .to_path_buf();
         let stub = exe_dir.join("pebble-env-probe-stub.sh");
-        std::fs::write(
+        write_executable_stub(
             &stub,
             "#!/bin/sh\nif [ -n \"$AGENT_AUTH_TOKEN\" ]; then echo TOKEN_PRESENT; else echo TOKEN_OK; fi\n",
-        )
-        .expect("write probe stub");
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-            .expect("make probe stub executable");
+        );
 
         let root = exe_dir.join("pebble-wi373-root");
         std::fs::create_dir_all(&root).expect("create workspace root");
@@ -1223,13 +1249,10 @@ mod tests {
             .expect("exe directory")
             .to_path_buf();
         let stub = exe_dir.join(format!("{prefix}-probe.sh"));
-        std::fs::write(
+        write_executable_stub(
             &stub,
             "#!/bin/sh\necho \"TASK_ID=${LUNARWING_TASK_ID-UNSET}\"\necho \"SOCK=${LUNARWING_TOOL_PROXY_SOCKET-UNSET}\"\n",
-        )
-        .expect("write probe stub");
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-            .expect("make probe stub executable");
+        );
 
         let config = ExecutorConfig {
             pebble_bin: stub.to_str().expect("utf-8 stub path").to_string(),
@@ -1302,24 +1325,15 @@ mod tests {
             // Parent phase: install the fake setpriv, then re-exec with the
             // image-style env (task ids pinned, root HOME/GOPATH).
             std::fs::create_dir_all(&stub_dir).expect("create stub dir");
-            std::fs::write(
+            write_executable_stub(
                 &stub,
                 "#!/bin/sh\nprintf 'HOME=%s GOPATH=%s\\n' \"$HOME\" \"$GOPATH\"\nprintf '<%s>' \"$@\"\nprintf '\\n'\n",
-            )
-            .expect("write setpriv stub");
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-                .expect("make setpriv stub executable");
+            );
             // LP-12: a hostile `setpriv` that only runs if the program is
             // resolved through the task-supplied child PATH — the LD-11
             // absolute-path pin must be able to FAIL.
             std::fs::create_dir_all(&evil_dir).expect("create evil stub dir");
-            std::fs::write(evil_dir.join("setpriv"), "#!/bin/sh\necho EVIL\n")
-                .expect("write evil setpriv stub");
-            std::fs::set_permissions(
-                evil_dir.join("setpriv"),
-                std::fs::Permissions::from_mode(0o755),
-            )
-            .expect("make evil setpriv stub executable");
+            write_executable_stub(&evil_dir.join("setpriv"), "#!/bin/sh\necho EVIL\n");
 
             let exe = std::env::current_exe().expect("test binary path");
             let out = std::process::Command::new(exe)
@@ -1536,13 +1550,10 @@ mod tests {
         // loader-scrubbed in split mode, which the marker below pins without
         // needing real privileges.
         let stub = stub_dir.join("setpriv");
-        std::fs::write(
+        write_executable_stub(
             &stub,
             "#!/bin/sh\nprintf 'LD_PRELOAD=%s\\n' \"${LD_PRELOAD:-unset}\"\nprintf 'GCONV=%s\\n' \"${GCONV_PATH:-unset}\"\nprintf 'TZDIR=%s\\n' \"${TZDIR:-unset}\"\n",
-        )
-        .expect("write stub");
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-            .expect("make stub executable");
+        );
 
         if std::env::var_os(CHILD_MARKER).is_none() {
             let exe = std::env::current_exe().expect("test binary path");
@@ -1667,7 +1678,7 @@ mod tests {
         let root = exe_dir.join(format!("{prefix}-root"));
         let _cleanup = Cleanup(stub.clone(), root.clone());
         std::fs::create_dir_all(&root).expect("create workspace root");
-        std::fs::write(
+        write_executable_stub(
             &stub,
             r#"#!/bin/sh
 printf '%s\n' '[llm-request] request 1 started' >&2
@@ -1677,10 +1688,7 @@ printf 'timeout=%s events=%s\n' "${PEBBLE_API_TIMEOUT_SECS-unset}" "${PEBBLE_LUN
 printf '%s\n' '[llm-retry] attempt 1 failed; retrying' >&2
 exec sleep 1
 "#,
-        )
-        .expect("write request-event probe");
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-            .expect("make request-event probe executable");
+        );
 
         let config = ExecutorConfig {
             pebble_bin: stub.to_string_lossy().into_owned(),

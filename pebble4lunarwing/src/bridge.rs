@@ -741,9 +741,7 @@ mod tests {
     /// process in the killed pid so cancel tears the pipes down at once.
     fn sleeping_pebble_stub(dir: &Path) -> String {
         let stub = dir.join("pebble-stub.sh");
-        std::fs::write(&stub, "#!/bin/sh\nexec sleep 30\n").expect("write stub");
-        std::fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .expect("chmod stub");
+        crate::executor::write_executable_stub(&stub, "#!/bin/sh\nexec sleep 30\n");
         stub.to_str().expect("utf-8 stub").to_string()
     }
 
@@ -1280,9 +1278,7 @@ mod tests {
 echo "SOCK=$LUNARWING_TOOL_PROXY_SOCKET"
 echo "TASK=$LUNARWING_TASK_ID"
 "#;
-        std::fs::write(&stub, script).expect("write stub");
-        std::fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .expect("chmod stub");
+        crate::executor::write_executable_stub(&stub, script);
         let config = BridgeConfig {
             pebble_bin: stub.to_str().expect("utf-8 stub").to_string(),
             ..root
