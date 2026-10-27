@@ -3862,13 +3862,15 @@ mod tests {
         }
     }
 
+    const ENCODING_TEST_SECRET: &str = "gzipguestsecret6j7k8l+/==";
+
     fn encoding_test_store(
         responses: Vec<HttpExchangeResponse>,
     ) -> (super::StoreData, Arc<EncodingStub>) {
         use super::{ResolvedHostCredential, StoreData};
         use crate::tools::wasm::capabilities::{EndpointPattern, HttpCapability};
 
-        const SECRET: &str = "gzipguestsecret6j7k8l+/==";
+        const SECRET: &str = ENCODING_TEST_SECRET;
         let stub = Arc::new(EncodingStub {
             seen: Mutex::new(Vec::new()),
             responses: Mutex::new(responses.into()),
@@ -4041,6 +4043,58 @@ mod tests {
                 encoded_response(&[("transfer-encoding", "identity")], "plain"),
                 true,
             ),
+            // WI#430: hyper removes exactly one chunked layer, and only when
+            // the last element of the last field is `chunked`.
+            (
+                encoded_response(&[("transfer-encoding", "chunked")], "plain"),
+                false,
+            ),
+            (
+                encoded_response(&[("Transfer-Encoding", "Chunked")], "plain"),
+                false,
+            ),
+            (
+                encoded_response(&[("transfer-encoding", ",chunked")], "plain"),
+                false,
+            ),
+            (
+                encoded_response(&[("transfer-encoding", ", chunked")], "plain"),
+                false,
+            ),
+            (
+                encoded_response(&[("transfer-encoding", "chunked;x=1")], "plain"),
+                true,
+            ),
+            (
+                encoded_response(
+                    &[
+                        ("transfer-encoding", "chunked"),
+                        ("transfer-encoding", "chunked"),
+                    ],
+                    "opaque",
+                ),
+                true,
+            ),
+            (
+                encoded_response(
+                    &[
+                        ("transfer-encoding", "chunked"),
+                        ("transfer-encoding", ""),
+                    ],
+                    "opaque",
+                ),
+                true,
+            ),
+            (
+                encoded_response(
+                    &[
+                        ("transfer-encoding", ""),
+                        ("transfer-encoding", "chunked"),
+                    ],
+                    "plain",
+                ),
+                false,
+            ),
         ];
         let (mut store, stub) = encoding_test_store(cases.iter().map(|(r, _)| r.clone()).collect());
         for (response, opaque) in cases {
@@ -4165,6 +4219,143 @@ mod tests {
                 .redact_http_outcome_for_guest(Ok(response))
                 .unwrap_err();
             assert!(err.contains("encoded body cannot be inspected"), "{err}");
+        }
+    }
+
+    /// WI#430: a credential echo split across chunk boundaries must never
+    /// reach the guest. hyper removes exactly one chunked layer, and only when
+    /// the last element of the last `Transfer-Encoding` field is `chunked`;
+    /// every other framing form leaves the chunk bytes in place, so the
+    /// byte-level scrub cannot join the halves. The real reqwest/hyper
+    /// response path is driven end to end here, and each refused case keeps
+    /// both halves out of the delivered body.
+    #[tokio::test]
+    async fn split_credential_echo_across_chunk_framing_is_refused() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn exchange(headers: &str, body: Vec<u8>) -> reqwest::Response {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let head = format!("HTTP/1.1 200 OK\r\nConnection: close\r\n{headers}\r\n");
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(socket.read_u8().await.unwrap());
+                }
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.write_all(&body).await.unwrap();
+            });
+            let response = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .get(format!("http://{address}/"))
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+                .unwrap();
+            server.await.unwrap();
+            response
+        }
+
+        fn chunk_layer(parts: &[&str]) -> Vec<u8> {
+            let mut out = Vec::new();
+            for part in parts {
+                out.extend_from_slice(format!("{:x}\r\n{part}\r\n", part.len()).as_bytes());
+            }
+            out.extend_from_slice(b"0\r\n\r\n");
+            out
+        }
+
+        // The credential echo is split so neither chunk holds a scrubbable
+        // spelling on its own.
+        let form = urlencoding::encode(ENCODING_TEST_SECRET).to_string();
+        let (half1, half2) = form.split_at(form.len() / 2);
+        let echo1 = format!("echo={half1}");
+        let echo2 = format!("{half2};end");
+        let one_layer = chunk_layer(&[&echo1, &echo2]);
+        let two_layers = chunk_layer(&[&String::from_utf8_lossy(&one_layer)]);
+
+        let mut refused: Vec<(&str, String, Vec<u8>)> = vec![
+            (
+                "chunked,",
+                "Transfer-Encoding: chunked,\r\n".to_string(),
+                one_layer.clone(),
+            ),
+            (
+                "chunked field then empty field",
+                "Transfer-Encoding: chunked\r\nTransfer-Encoding: \r\n".to_string(),
+                one_layer.clone(),
+            ),
+            (
+                "chunked, chunked over a double-chunked body",
+                "Transfer-Encoding: chunked, chunked\r\n".to_string(),
+                two_layers.clone(),
+            ),
+            (
+                "two chunked fields over a double-chunked body",
+                "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n".to_string(),
+                two_layers.clone(),
+            ),
+        ];
+        refused.push((
+            "content-coding alongside chunked",
+            "Transfer-Encoding: gzip, chunked\r\n".to_string(),
+            chunk_layer(&[&echo1, &echo2]),
+        ));
+        refused.push((
+            "identity token alongside chunked",
+            "Transfer-Encoding: identity, chunked\r\n".to_string(),
+            chunk_layer(&[&echo1, &echo2]),
+        ));
+        for (label, headers, body) in refused {
+            let response = exchange(&headers, body).await;
+            let response =
+                super::collect_guest_http_response(response, 1024 * 1024, &super::LeakDetector::new())
+                    .await
+                    .unwrap();
+            let (mut store, _) = encoding_test_store(Vec::new());
+            store.last_http_exchange_had_credentials = true;
+            let err = store
+                .redact_http_outcome_for_guest(Ok(response))
+                .err()
+                .unwrap_or_else(|| panic!("{label}: framing left intact was delivered"));
+            assert!(err.contains("encoded body cannot be inspected"), "{label}: {err}");
+        }
+
+        // Controls: hyper really de-chunks these, so the contiguous echo is
+        // scrubbed in full — the complete body is asserted, not just a marker.
+        let inspectable: Vec<(&str, String)> = vec![
+            ("single chunked", "Transfer-Encoding: chunked\r\n".to_string()),
+            ("mixed-case Chunked", "Transfer-Encoding: Chunked\r\n".to_string()),
+            (",chunked", "Transfer-Encoding: ,chunked\r\n".to_string()),
+            (", chunked", "Transfer-Encoding: , chunked\r\n".to_string()),
+            (
+                "empty field then chunked",
+                "Transfer-Encoding: \r\nTransfer-Encoding: chunked\r\n".to_string(),
+            ),
+            (
+                "chunked with whitespace",
+                "Transfer-Encoding:   chunked   \r\n".to_string(),
+            ),
+        ];
+        for (label, headers) in inspectable {
+            let response = exchange(&headers, one_layer.clone()).await;
+            let response =
+                super::collect_guest_http_response(response, 1024 * 1024, &super::LeakDetector::new())
+                    .await
+                    .unwrap();
+            let (mut store, _) = encoding_test_store(Vec::new());
+            store.last_http_exchange_had_credentials = true;
+            let delivered = store
+                .redact_http_outcome_for_guest(Ok(response))
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(
+                delivered.body,
+                b"echo=[REDACTED:host_credential];end",
+                "{label}: the whole scrubbed body must be delivered"
+            );
         }
     }
 
