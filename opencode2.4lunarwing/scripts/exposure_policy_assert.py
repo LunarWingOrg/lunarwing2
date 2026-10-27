@@ -25,7 +25,9 @@ Assertions (opencode2 lane):
   6. --binary PATH: the built opencode binary contains no OpenTunnel client
      markers (controls 5 + 8).
   7. --image-filesystem: the installed boot files, scripts and config are
-     root-owned and read-only (image builds only). For the v2 profile the
+     root-owned and read-only (image builds only); every node_modules entry
+     must be a root-owned regular file/directory without setuid/setgid or
+     group/other write bits. For the v2 profile the
      installed wrapper is verified too: /usr/local/bin/opencode must be the
      byte-identical root-owned read-only executable exposure guard, PATH must
      resolve 'opencode' to it, the real binary is re-scanned for OpenTunnel
@@ -277,6 +279,60 @@ def _path_metadata(
     ))
 
 
+def _dependency_paths(
+    tree: pathlib.Path,
+    image_root: pathlib.Path | None,
+    records: dict[str, dict[str, int]] | None,
+) -> list[pathlib.Path]:
+    if records is None:
+        return [tree, *tree.rglob("*")]
+    if image_root is None:
+        raise OSError("tar-header metadata requires an image root")
+    try:
+        relative = pathlib.Path(os.path.abspath(tree)).relative_to(
+            pathlib.Path(os.path.abspath(image_root))
+        )
+    except ValueError as error:
+        raise OSError(f"path {tree} escapes image root {image_root}") from error
+    prefix = relative.as_posix()
+    descendants = sorted(name for name in records if name.startswith(f"{prefix}/"))
+    return [
+        tree,
+        *(image_root.joinpath(*pathlib.PurePosixPath(name).parts) for name in descendants),
+    ]
+
+
+def _check_dependency_tree(
+    lane: pathlib.Path,
+    image_root: pathlib.Path | None,
+    image_metadata: dict[str, dict[str, int]] | None,
+) -> None:
+    tree = lane / "node_modules"
+    try:
+        paths = _dependency_paths(tree, image_root, image_metadata)
+    except OSError as error:
+        fail(f"dependency tree {tree} is unreadable: {error}")
+        return
+    for path in paths:
+        try:
+            metadata = _path_metadata(path, image_root, image_metadata)
+        except OSError as error:
+            fail(f"dependency path {path} is missing or unreadable: {error}")
+            continue
+        if not (stat.S_ISREG(metadata.st_mode) or stat.S_ISDIR(metadata.st_mode)):
+            fail(f"dependency path {path} must be a regular file or directory, "
+                 "not a symlink or special file")
+            continue
+        if metadata.st_uid != 0 or metadata.st_gid != 0:
+            fail(f"dependency path {path} must be owned by root:root")
+            continue
+        mode = stat.S_IMODE(metadata.st_mode)
+        if mode & 0o6022:
+            fail(f"dependency path {path} has privilege or write bits {mode:o}")
+    if not failures:
+        check("image dependencies carry no privilege or group/other write bits")
+
+
 def check_image_filesystem(
     lane: pathlib.Path,
     *,
@@ -301,6 +357,7 @@ def check_image_filesystem(
             fail(f"image policy path must be root-owned and read-only: {path}")
     if not failures:
         check("image boot files, scripts and config are root-owned and read-only")
+    _check_dependency_tree(lane, image_root, image_metadata)
 
 
 def _check_real_binary_metadata(
