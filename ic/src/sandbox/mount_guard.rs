@@ -213,10 +213,10 @@ fn resolve_protected_paths_from(env_raw: Option<&str>, base: &Path) -> Vec<PathB
 /// fine, `var`, `store`, `runtime`, ... are not) silently lost sibling
 /// coverage. The base name is still accepted as the canonical marker, but it
 /// is no longer the only signal: the parent is also probed structurally for
-/// the sibling `env/` + `run/`-or-`logs/` directories that the MT layout
-/// always has. Both branches fail safe (extra protected paths only ever deny
-/// or mask more), and a parent that merely *coincidentally* holds `env/` plus
-/// `run/` is over-protection, not a bypass.
+/// the tenant's `env/lunarwing.env` file plus a `run/` or `logs/` directory.
+/// Requiring the credential-file marker avoids treating an ordinary home with
+/// a Python `env/` virtualenv and `run/` or `logs/` as an MT root (PC-2).
+/// Both branches only add protected paths, never remove explicit protection.
 fn add_mt_tenant_siblings(base: &Path, paths: &mut Vec<PathBuf>) {
     let Some(tenant_root) = base.parent() else {
         return;
@@ -230,14 +230,15 @@ fn add_mt_tenant_siblings(base: &Path, paths: &mut Vec<PathBuf>) {
     paths.push(tenant_root.join("logs"));
 }
 
-/// True when `root` carries the MT tenant-root layout marker: a sibling `env/`
-/// directory plus at least one of `run/` or `logs/`.
+/// True when `root` carries the MT tenant-root layout marker: the sibling
+/// `env/lunarwing.env` file plus at least one of `run/` or `logs/`.
 ///
 /// Existence-based detection cannot see a tenant that has not been rendered
 /// yet, which is exactly why the literal `state/` base name is still honoured
 /// on its own (provisioners render `env/` before the daemon first starts).
 fn looks_like_mt_tenant_root(root: &Path) -> bool {
-    root.join("env").is_dir() && (root.join("run").is_dir() || root.join("logs").is_dir())
+    root.join("env/lunarwing.env").is_file()
+        && (root.join("run").is_dir() || root.join("logs").is_dir())
 }
 
 /// Container path where the daemon's sandbox-visible log directory is bound
@@ -841,24 +842,68 @@ mod tests {
     /// parent carries the structural tenant-root marker.
     #[test]
     fn non_state_named_mt_base_gains_siblings_structurally() {
-        let fixture = Fixture::new();
-        // `<root>/lunarwing/var` instead of `<root>/lunarwing/state`.
-        let alt_base = fixture.root.join("lunarwing/var");
-        std::fs::create_dir_all(&alt_base).expect("alt base");
-        let paths = resolve_protected_paths_from(None, &alt_base);
-        for want in [
-            fixture.root.join("lunarwing/env"),
-            fixture.root.join("lunarwing/run"),
-            fixture.root.join("lunarwing/logs"),
-        ] {
-            let want = want.canonicalize().expect("exists");
-            assert!(paths.contains(&want), "missing {want:?} in {paths:?}");
+        // A rendered tenant can have only run/ (systemd) or only logs/.
+        for missing in [None, Some("run"), Some("logs")] {
+            let fixture = Fixture::new();
+            let tenant_root = fixture.repo_root();
+            if let Some(missing) = missing {
+                std::fs::remove_dir_all(tenant_root.join(missing)).expect("remove sibling");
+            }
+            // `<root>/lunarwing/var` instead of `<root>/lunarwing/state`.
+            let alt_base = tenant_root.join("var");
+            std::fs::create_dir_all(&alt_base).expect("alt base");
+            let paths = resolve_protected_paths_from(None, &alt_base);
+            for want in [
+                tenant_root.join("env"),
+                tenant_root.join("run"),
+                tenant_root.join("logs"),
+            ] {
+                let want = want.canonicalize().unwrap_or(want);
+                assert!(paths.contains(&want), "missing {want:?} in {paths:?}");
+            }
+            // The siblings are real protection: the credential dir is denied.
+            assert!(
+                validate_mount_dir(&fixture.env_dir(), &paths).is_err(),
+                "env/ must be denied for a non-`state` MT base"
+            );
         }
-        // The siblings are real protection: the credential dir is denied.
-        assert!(
-            validate_mount_dir(&fixture.env_dir(), &paths).is_err(),
-            "env/ must be denied for a non-`state` MT base"
-        );
+    }
+
+    /// PC-2: ordinary single-node homes must not acquire MT sibling masks just
+    /// because a Python virtualenv is named `env` beside `run/` and `logs/`.
+    #[test]
+    fn single_node_home_with_virtualenv_gains_no_tenant_siblings() {
+        for marker_is_directory in [false, true] {
+            let fixture = Fixture::new();
+            let home = fixture.repo_root();
+            let base = home.join(".ironclaw");
+            std::fs::create_dir_all(&base).expect("single-node base");
+            std::fs::remove_file(fixture.env_file()).expect("remove tenant credential marker");
+            std::fs::write(fixture.env_dir().join("pyvenv.cfg"), "home = /usr/bin\n")
+                .expect("virtualenv marker");
+            if marker_is_directory {
+                std::fs::create_dir(fixture.env_file()).expect("non-file marker");
+            }
+
+            assert!(!looks_like_mt_tenant_root(&home));
+            assert!(!mt_base_name_is_nonstandard(&base));
+            let paths = resolve_protected_paths_from(None, &base);
+            let mount_root = validate_mount_dir(&home, &paths).expect("home remains mountable");
+            let masked = masked_dirs_for_mount(&mount_root, &paths).expect("mask planning");
+            assert!(masked.contains(&base.canonicalize().expect("base exists")));
+            for sibling in [fixture.env_dir(), home.join("run"), home.join("logs")] {
+                let sibling = sibling.canonicalize().expect("sibling exists");
+                assert!(
+                    !paths.contains(&sibling),
+                    "unexpected protection: {paths:?}"
+                );
+                assert!(!masked.contains(&sibling), "unexpected mask: {masked:?}");
+                assert!(
+                    validate_mount_dir(&sibling, &paths).is_ok(),
+                    "ordinary home directory must remain mountable: {sibling:?}"
+                );
+            }
+        }
     }
 
     /// WI#441 residual 2: a non-`state` base under a parent with no tenant
@@ -909,7 +954,9 @@ mod tests {
     /// structural heuristic rather than the canonical `state/` base name.
     #[test]
     fn degrade_signal_reports_nonstandard_base_name() {
-        assert!(!mt_base_name_is_nonstandard(Path::new("/t/lunarwing/state")));
+        assert!(!mt_base_name_is_nonstandard(Path::new(
+            "/t/lunarwing/state"
+        )));
         let fixture = Fixture::new();
         let alt_base = fixture.root.join("lunarwing/var");
         std::fs::create_dir_all(&alt_base).expect("alt base");

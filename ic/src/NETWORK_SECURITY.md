@@ -745,12 +745,16 @@ rule. A custom redirect elsewhere belongs in `SANDBOX_PROTECTED_PATHS`.
 
 `add_mt_tenant_siblings` (WI#441) no longer depends on the base component being
 literally named `state`: that name is still honoured on its own, and a base
-whose parent carries the structural MT tenant-root marker (a sibling `env/`
-plus `run/` or `logs/`) gets `<root>/env`, `<root>/run` and `<root>/logs`
-covered too. A non-standard MT layout (`data/state`, `var`, `store`) therefore
+whose parent carries the structural MT tenant-root marker (the sibling
+`env/lunarwing.env` credential file plus a `run/` or `logs/` directory) gets
+`<root>/env`, `<root>/run` and `<root>/logs` covered too. A non-standard MT
+layout (`data/state`, `var`, `store`) therefore
 keeps sibling coverage instead of silently falling back to the unprotected
-condition WI#209 fixed. The rule can only add protected paths, so a parent that
-coincidentally holds `env/` and `run/` is over-protected, never exposed.
+condition WI#209 fixed. An ordinary single-node home containing a Python
+`env/` virtualenv and `run/` or `logs/` is not an MT root without that credential
+file; its unrelated sibling directories remain mountable and unmasked. The
+literal `state` base-name fallback remains available before tenant files exist,
+and explicit protected paths are never removed by the heuristic.
 
 When neither `SANDBOX_PROTECTED_PATHS` nor `LUNARWING_SERVICE_LOG_DIRS` names
 anything, `resolve_protected_paths` logs **one `warn!` per boot** naming the
