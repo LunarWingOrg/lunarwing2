@@ -70,6 +70,11 @@ impl PendingGate {
         Utc::now() > self.expires_at
     }
 
+    /// Whether this gate intentionally remains actionable after its thread ends.
+    pub fn outlives_thread(&self) -> bool {
+        self.action_name == "authentication_fallback" && self.original_message.is_some()
+    }
+
     /// Build the composite key for this gate.
     pub fn key(&self) -> PendingGateKey {
         PendingGateKey {

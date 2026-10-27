@@ -802,7 +802,11 @@ Enforced controls (opencode2 lane unless noted):
    (including PATH order and loader variables), `Entrypoint`, `Cmd`, `User`,
    `WorkingDir`, `Healthcheck`, `ExposedPorts`, and `StopSignal`; `OnBuild`,
    `Volumes`, and `Shell` must be empty. Promotion hard-needs the
-   non-optional job and the BuildKit parser guard.
+   non-optional job and the BuildKit parser guard. The Dockerfile strips
+   setuid/setgid and write bits throughout `/app/node_modules` after every
+   dependency `COPY` and before the wrapper anchor; the parser requires that
+   ordering so `cp -a` cannot carry privileged source-directory modes into
+   the published image.
    In mt-admin, `build_opencode2_worker` uses a per-build candidate tag and
    `--iidfile`, then `create --pull=never`, `export`, and full `image inspect`
    feed the same tar/config verifier by immutable image ID. Docker's
@@ -1937,6 +1941,25 @@ too. Invalid instructions retain valid task/sequence identifiers in refusal
 acks; invalid identifiers themselves cannot be correlated.
 
 Interop: pre-WI#328 workers that never send `task_prompt_ack` still function — the daemon tolerates missing acks and ignores unknown message types, and newer workers must likewise ignore `task_prompt` if they do not implement prompting (they simply omit the capability, and the daemon never sends them the frame).
+
+### Job list lane attribution (WI#479)
+
+`GET /api/jobs` now carries the lane on every entry, so attributing jobs during
+multi-job testing no longer needs a detail call per job. Each `JobInfo` gains:
+
+- `job_mode` — the same value the detail response reports (`external:kimi`,
+  `external:pebble`, `harness`, …), **omitted** when the job is in the default
+  `worker` mode, matching the detail response's omission rule.
+- `worker_name` — the lane name for `external:<name>` jobs only, omitted
+  otherwise.
+
+Both come from the `job_mode` column already selected by
+`list_sandbox_jobs_for_user` / the libSQL equivalent, so the list stays a
+single query per source. Agent (non-sandbox) jobs have no sandbox mode and
+report neither field. An optional `?mode=` filter accepts `worker`
+(the default, also matching mode-less rows), `harness`,
+`external` (any external lane) or `external:<name>`; the web Jobs table shows
+a Mode column fed from the same field.
 
 ### Rebuilt image rollout (image-ID contract)
 

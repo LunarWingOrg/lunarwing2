@@ -659,5 +659,44 @@ class BuildInputInventoryTests(unittest.TestCase):
         self.assertTrue(any("declared twice" in error for error in self.errors()))
 
 
+class TrackedLockfileCollectionTests(unittest.TestCase):
+    """WI#495 OX-4: the lockfile inventory reads git's tracked truth, so a
+    developer-local untracked `.cargo/git/checkouts/*` cache cannot turn a
+    dirty checkout red while the runner's clean tree stays green."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = pathlib.Path(temporary.name)
+
+    def collect(self, tracked):
+        with mock.patch.multiple(
+            config, ROOT=self.root, git_tracked_lockfiles=lambda: tracked
+        ):
+            return config.collect_tracked_lockfiles()
+
+    def plant(self, relative: str) -> None:
+        target = self.root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("", encoding="utf-8")
+
+    def test_untracked_scratch_lockfiles_are_not_collected(self):
+        self.plant("ic/Cargo.lock")
+        self.plant(".cargo/git/checkouts/dep/abc/Cargo.lock")
+        self.assertEqual(self.collect({"ic/Cargo.lock"}), {"ic/Cargo.lock"})
+
+    def test_vendor_lockfiles_stay_excluded(self):
+        self.assertEqual(
+            self.collect({"ic/vendor/dep/Cargo.lock", "pebble/Cargo.lock"}),
+            {"pebble/Cargo.lock"},
+        )
+
+    def test_glob_fallback_matches_the_clean_tree(self):
+        self.plant("ic/Cargo.lock")
+        self.plant("pebble/Cargo.lock")
+        self.plant("ic/vendor/dep/Cargo.lock")
+        self.assertEqual(self.collect(None), {"ic/Cargo.lock", "pebble/Cargo.lock"})
+
+
 if __name__ == "__main__":
     unittest.main()

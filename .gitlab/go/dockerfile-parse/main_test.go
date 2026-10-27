@@ -18,6 +18,7 @@ COPY scripts/ ./scripts/
 COPY config/ ./config/
 COPY entrypoint.sh health_server.py agent_comm_protocol.json ./
 RUN chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/health_server.py /app/agent_comm_protocol.json
+RUN chmod -R a-s,a-w /app/node_modules
 ARG LUNARWING_WRAPPER_SHA256=
 RUN python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --image-filesystem
 USER 10003:10003
@@ -69,6 +70,20 @@ func TestMetadataAfterAssertionPasses(t *testing.T) {
 		"cmd [\"--mode\", \"websocket\"]\nLABEL policy=\"WI357\"\nstopsignal SIGTERM\n"
 	if err := check([]byte(src)); err != nil {
 		t.Fatalf("metadata tail failed: %v", err)
+	}
+}
+
+func TestDependencyNormalizationAllowsUnrelatedInstructions(t *testing.T) {
+	for name, insertion := range map[string]string{
+		"ENV": "ENV PATH=/opt/bin:$PATH\n",
+		"RUN": "RUN echo one \\\n && echo two\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			src := strings.Replace(validDockerfile, anchorArg, insertion+anchorArg, 1)
+			if err := check([]byte(src)); err != nil {
+				t.Fatalf("unrelated instruction before the anchor was rejected: %v", err)
+			}
+		})
 	}
 }
 
@@ -137,6 +152,9 @@ func TestStructuralPolicyFixtures(t *testing.T) {
 		{"missing wrapper scan", strings.Replace(validDockerfile, "RUN install -D -m 0755", "RUN true # RUN install -D -m 0755", 1), "no longer installs the exposure-guard wrapper"},
 		{"compile-out after build", strings.Replace(validDockerfile, compileRun+"\n"+guardedBuild, guardedBuild+"\n"+compileRun, 1), "compile-out"},
 		{"missing read-only step", strings.Replace(validDockerfile, "RUN chmod -R a-w", "RUN true # chmod -R a-w", 1), "read-only chmod"},
+		{"missing dependency mode normalization", strings.Replace(validDockerfile, dependencyModes+"\n", "", 1), "strip dependency privilege and write bits"},
+		{"dependency mode normalization after anchor", strings.Replace(validDockerfile, dependencyModes+"\n"+anchorArg, anchorArg+"\n"+dependencyModes, 1), "before the wrapper anchor"},
+		{"dependency COPY after normalization", strings.Replace(validDockerfile, anchorArg, "COPY --from=builder /out/client /app/node_modules/@opencode/client\n"+anchorArg, 1), "after every dependency COPY"},
 		{"missing filesystem assertion", strings.Replace(validDockerfile, " --image-filesystem", "", 1), "verify installed policy-file ownership"},
 	}
 	for _, test := range cases {
