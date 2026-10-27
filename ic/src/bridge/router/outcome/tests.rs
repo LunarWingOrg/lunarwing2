@@ -360,7 +360,7 @@ async fn insert_shell_gate(rig: &Rig) -> PendingGate {
         .pending_gates
         .insert(gate.clone())
         .await
-        .unwrap();
+        .unwrap(); // safety: test-only gate fixture
     gate
 }
 
@@ -396,6 +396,77 @@ async fn terminal_turns_reap_shell_gates_from_memory_and_persistence() {
                 .is_none()
         );
     }
+}
+
+#[tokio::test]
+async fn gate_paused_turn_keeps_existing_and_new_shell_gates_pending() {
+    let rig = Rig::new(None, None).await;
+    // A separate user key lets the new paused gate coexist with this sentinel,
+    // which detects an accidental drain of every gate for the thread.
+    let mut sentinel = sample_pending_gate(
+        "bob",
+        rig.turn.thread_id,
+        lunarwing_engine::ResumeKind::Approval {
+            allow_always: false,
+        },
+    );
+    sentinel.conversation_id = rig.turn.conversation_id;
+    sentinel.source_channel = "xmpp".into();
+    rig.turn
+        .state
+        .pending_gates
+        .insert(sentinel.clone())
+        .await
+        .unwrap();
+
+    rig.turn
+        .complete(ThreadOutcome::GatePaused {
+            gate_name: "approval".into(),
+            action_name: "shell".into(),
+            call_id: "paused-call".into(),
+            parameters: serde_json::json!({"command":"ls"}),
+            resume_kind: lunarwing_engine::ResumeKind::Approval {
+                allow_always: false,
+            },
+            resume_output: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rig.turn
+            .state
+            .pending_gates
+            .peek(&sentinel.key())
+            .await
+            .map(|gate| gate.request_id),
+        Some(sentinel.request_id.to_string())
+    );
+    let sentinel_list = rig.turn.state.pending_gates.list_for_user("bob").await;
+    assert_eq!(sentinel_list.len(), 1);
+    assert_eq!(sentinel_list[0].request_id, sentinel.request_id);
+
+    let parked = matching_engine_approval_gate(&rig.turn.state, &rig.turn.message, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.turn
+            .state
+            .pending_gates
+            .peek(&parked.key())
+            .await
+            .map(|gate| gate.request_id),
+        Some(parked.request_id.to_string())
+    );
+    assert!(
+        rig.turn
+            .state
+            .pending_gates
+            .list_for_user("alice")
+            .await
+            .iter()
+            .any(|gate| gate.request_id == parked.request_id)
+    );
 }
 
 #[tokio::test]
