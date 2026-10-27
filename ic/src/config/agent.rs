@@ -345,6 +345,7 @@ fn agent_env_key_warning(key: &str) -> Option<&'static str> {
         "AGENT_MAX_PARALLEL_JOBS",
         "AGENT_JOB_TIMEOUT_SECS",
         "AGENT_STUCK_THRESHOLD_SECS",
+        "AGENT_EXTERNAL_STUCK_THRESHOLD_SECS",
         "AGENT_USE_PLANNING",
         "AGENT_MAX_TOOL_ITERATIONS",
         "AGENT_AUTO_APPROVE_TOOLS",
