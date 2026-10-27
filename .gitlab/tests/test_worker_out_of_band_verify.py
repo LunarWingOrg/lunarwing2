@@ -533,9 +533,9 @@ class GoParserPolicyTests(unittest.TestCase):
 
     def test_module_is_pinned_to_the_candidate_buildkit(self):
         go_mod = (self.PARSER_DIR / "go.mod").read_text(encoding="utf-8")
-        self.assertIn("github.com/moby/buildkit v0.25.1", go_mod)
+        self.assertIn("github.com/moby/buildkit v0.34.1", go_mod)
         go_sum = (self.PARSER_DIR / "go.sum").read_text(encoding="utf-8")
-        self.assertIn("github.com/moby/buildkit v0.25.1", go_sum)
+        self.assertIn("github.com/moby/buildkit v0.34.1", go_sum)
 
     def test_policy_source_applies_the_parser(self):
         main_go = (self.PARSER_DIR / "main.go").read_text(encoding="utf-8")
