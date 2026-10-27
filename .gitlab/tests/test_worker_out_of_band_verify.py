@@ -15,6 +15,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
@@ -499,6 +500,70 @@ class MainWiringTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 self.module.main([])
         fetch.assert_not_called()
+
+
+class RegistryRetryTests(unittest.TestCase):
+    """Pipeline 6540 lost only this verify job to a registry 429 burst."""
+
+    def setUp(self):
+        self.module = load_verify_module()
+
+    def _http_error(self, code: int) -> urllib.error.HTTPError:
+        return urllib.error.HTTPError("https://registry/v2/", code, "error", {}, None)
+
+    def test_429_is_retried_then_succeeds(self):
+        response = io.BytesIO(json.dumps({"token": "abc"}).encode())
+        response.__enter__ = lambda *_: response
+        response.__exit__ = lambda *_: False
+        with mock.patch.object(
+            self.module.urllib.request, "urlopen",
+            side_effect=[self._http_error(429), response],
+        ), mock.patch.object(self.module.time, "sleep") as sleep:
+            payload = self.module.fetch_json("https://x/jwt/auth", {}, 5, "a token")
+        self.assertEqual(payload, {"token": "abc"})
+        sleep.assert_called_once()
+
+    def test_service_errors_are_retried(self):
+        for code in (500, 502, 503, 504):
+            with self.subTest(code=code):
+                with mock.patch.object(
+                    self.module.urllib.request, "urlopen",
+                    side_effect=[self._http_error(code)] * self.module._RETRY_ATTEMPTS,
+                ), mock.patch.object(self.module.time, "sleep"), contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        self.module.fetch_json("https://x/manifests", {}, 5, "a manifest")
+
+    def test_non_retryable_http_error_fails_immediately(self):
+        with mock.patch.object(
+            self.module.urllib.request, "urlopen", side_effect=self._http_error(404),
+        ) as urlopen, mock.patch.object(self.module.time, "sleep") as sleep, \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.module.fetch_json("https://x/manifests", {}, 5, "a manifest")
+        self.assertEqual(urlopen.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_attempts_are_bounded(self):
+        with mock.patch.object(
+            self.module.urllib.request, "urlopen", side_effect=self._http_error(429),
+        ) as urlopen, mock.patch.object(self.module.time, "sleep"), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.module.fetch_json("https://x/jwt/auth", {}, 5, "a token")
+        self.assertEqual(urlopen.call_count, self.module._RETRY_ATTEMPTS)
+
+    def test_retry_budget_fits_the_job_timeout(self):
+        # 6 attempts, 15 s base: 15+30+60+120+240 = 465 s of sleeping, far
+        # inside the 30m (1800 s) job timeout.
+        total = sum(self.module._retry_delay(i) for i in range(1, self.module._RETRY_ATTEMPTS))
+        self.assertLess(total, 1800)
+
+    def test_network_errors_are_retried(self):
+        with mock.patch.object(
+            self.module.urllib.request, "urlopen",
+            side_effect=[urllib.error.URLError("timed out"), io.BytesIO(b"{}")],
+        ), mock.patch.object(self.module.time, "sleep") as sleep:
+            self.assertEqual(self.module.fetch_json("https://x/blobs", {}, 5, "a config"), {})
+        sleep.assert_called_once()
 
 
 class BuildScriptWiringTests(unittest.TestCase):

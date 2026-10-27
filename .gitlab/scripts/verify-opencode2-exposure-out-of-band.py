@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.request
 
@@ -41,6 +42,54 @@ def die(message: str) -> None:
     raise SystemExit(1)
 
 
+# Bounded retry for transient registry rate limits. The candidate/scan/verify
+# jobs all fetch registry tokens and blobs at once, and GitLab answers a burst
+# with `429 Too Many Requests`; pipeline 6540 lost only this verify job that
+# way while every other container job went green (WI#425). The build path
+# already retries its push on the same signature (build-worker-image.sh); this
+# is the read-side equivalent: retry only 429/5xx and URLError, exponential
+# backoff with a per-job-id jitter so concurrent jobs do not re-trip together,
+# and stay well inside the job's 30m timeout.
+_RETRY_ATTEMPTS = 6
+_RETRY_BASE_DELAY = 15
+_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+
+
+def _retry_delay(attempt: int) -> int:
+    jitter = 0
+    job_id = os.environ.get("CI_JOB_ID", "")
+    if job_id.isdigit():
+        jitter = int(job_id) % 30
+    return _RETRY_BASE_DELAY * (1 << (attempt - 1)) + jitter
+
+
+def _retryable(error: BaseException) -> bool:
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code in _RETRYABLE_STATUS
+    return isinstance(error, urllib.error.URLError)
+
+
+def fetch_json(url: str, headers: dict[str, str], timeout: int, what: str) -> object:
+    attempt = 1
+    while True:
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.load(response)
+        except (OSError, ValueError) as error:
+            if attempt < _RETRY_ATTEMPTS and _retryable(error):
+                delay = _retry_delay(attempt)
+                print(
+                    f"transient registry error fetching {what} "
+                    f"(attempt {attempt}/{_RETRY_ATTEMPTS}): {error}; retrying in {delay}s",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+                attempt += 1
+                continue
+            die(f"cannot fetch {what}: {error}")
+
+
 def registry_token(repo: str) -> str:
     host = os.environ.get("CI_SERVER_HOST", "")
     user = os.environ.get("CI_REGISTRY_USER", "")
@@ -51,12 +100,10 @@ def registry_token(repo: str) -> str:
     auth = base64.b64encode(f"{user}:{password}".encode()).decode()
     url = (f"https://{host}/jwt/auth?service=container_registry&"
            f"scope=repository:{repo}:pull")
-    request = urllib.request.Request(url, headers={"Authorization": f"Basic {auth}"})
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            payload = json.load(response)
-    except (OSError, ValueError) as error:
-        die(f"cannot obtain a registry pull token for {repo}: {error}")
+    payload = fetch_json(
+        url, {"Authorization": f"Basic {auth}"}, 60,
+        f"a registry pull token for {repo}",
+    )
     token = payload.get("token")
     if not token:
         die(f"registry auth response for {repo} carried no token")
@@ -68,13 +115,10 @@ def image_config(repo: str, digest: str, token: str) -> dict:
     if not registry:
         die("CI_REGISTRY is missing")
     url = f"https://{registry}/v2/{repo}/blobs/{digest}"
-    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-    try:
-        with urllib.request.urlopen(request, timeout=120) as response:
-            return json.load(response)
-    except (OSError, ValueError) as error:
-        die(f"cannot fetch image config {digest} from {repo}: {error}")
-    return {}
+    return fetch_json(
+        url, {"Authorization": f"Bearer {token}"}, 120,
+        f"image config {digest} from {repo}",
+    )
 
 
 def check_config_half(config: dict) -> None:
@@ -363,18 +407,15 @@ def _fetch_candidate_config(image_ref: str, image_digest: str) -> dict:
     repo = image_ref[len(prefix):].rsplit(":", 1)[0] if image_ref.startswith(prefix) else image_ref.rsplit(":", 1)[0]
     token = registry_token(repo)
     manifest_url = f"https://{os.environ['CI_REGISTRY']}/v2/{repo}/manifests/{image_digest}"
-    request = urllib.request.Request(
+    manifest = fetch_json(
         manifest_url,
-        headers={
+        {
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.docker.distribution.manifest.v2+json",
         },
+        120,
+        f"manifest {image_digest} from {repo}",
     )
-    try:
-        with urllib.request.urlopen(request, timeout=120) as response:
-            manifest = json.load(response)
-    except (OSError, ValueError) as error:
-        die(f"cannot fetch manifest {image_digest} from {repo}: {error}")
     config_digest = manifest.get("config", {}).get("digest")
     if not config_digest:
         die(f"manifest {image_digest} carries no config digest")
