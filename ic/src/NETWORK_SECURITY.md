@@ -741,8 +741,23 @@ silently shadow an operator's setting there. `lunarwing service install`
 xmpp-bridge, weechat, darkirc, babysitters), is protected by the
 `add_mt_tenant_siblings` rule and the mt-admin `SANDBOX_PROTECTED_PATHS`
 render, and the harness layout (`TEST_ROOT/{logs,state}`) by the same sibling
-rule. A custom redirect elsewhere belongs in `SANDBOX_PROTECTED_PATHS`. The
-boot banner prints the gateway URL with `?token=` on every start when the CLI
+rule. A custom redirect elsewhere belongs in `SANDBOX_PROTECTED_PATHS`.
+
+`add_mt_tenant_siblings` (WI#441) no longer depends on the base component being
+literally named `state`: that name is still honoured on its own, and a base
+whose parent carries the structural MT tenant-root marker (a sibling `env/`
+plus `run/` or `logs/`) gets `<root>/env`, `<root>/run` and `<root>/logs`
+covered too. A non-standard MT layout (`data/state`, `var`, `store`) therefore
+keeps sibling coverage instead of silently falling back to the unprotected
+condition WI#209 fixed. The rule can only add protected paths, so a parent that
+coincidentally holds `env/` and `run/` is over-protected, never exposed.
+
+When neither `SANDBOX_PROTECTED_PATHS` nor `LUNARWING_SERVICE_LOG_DIRS` names
+anything, `resolve_protected_paths` logs **one `warn!` per boot** naming the
+resolved base dir and whether coverage came from the structural heuristic
+(WI#441). An absent list is correct for single-node installs but is a degrade
+in multi-tenant ones, and it used to be invisible apart from reading source.
+The boot banner prints the gateway URL with `?token=` on every start when the CLI
 channel is enabled; when stdout is not a terminal (a redirect into one of
 these files) the token is replaced by
 `<hidden: GATEWAY_AUTH_TOKEN, or lunarwing config get channels.gateway_auth_token>`.
