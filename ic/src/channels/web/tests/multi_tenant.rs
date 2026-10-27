@@ -119,6 +119,7 @@ fn build_state_ex_with_context(
 
 /// Build a `GatewayState` with a context manager wired in but no
 /// external-worker wiring (WI#475).
+#[cfg(feature = "libsql")]
 fn build_state_with_context(
     store: Option<Arc<dyn crate::db::Database>>,
     context_manager: Option<Arc<crate::context::ContextManager>>,
