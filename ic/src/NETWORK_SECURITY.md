@@ -567,7 +567,7 @@ WASM tools execute HTTP requests through the host runtime, subject to:
 3. **Leak detection** — `LeakDetector` scans both outbound requests and inbound responses for secret patterns
    - Runs at two points: before sending and after receiving
    - Uses Aho-Corasick for fast multi-pattern matching
-   - Blocking errors name the matched pattern but omit secret-derived previews (WI#432)
+   - Blocking errors name only the matched pattern; error values and heuristic logs omit secret-derived previews (WI#432)
    - **Reference:** `crates/lunarwing_safety/src/leak_detector.rs`
 
 4. **Guest-facing redaction (WI#395)** — everything the WASM tool sees from
@@ -678,16 +678,24 @@ WI#432 closes the former WI#408 residuals. Credentialed exchanges also drop
 `Range` and `If-Range`, and a `206 Partial Content` response is refused at the
 redaction boundary, so a guest cannot reassemble an echo from byte ranges;
 ordinary exchanges retain their range semantics. Both hosts use the shared
-`reject_private_ip` guard. General private-target access requires the separate,
-default-off `WASM_HTTP_ALLOW_PRIVATE_IPS=1` opt-in; the daemon's
-`ALLOW_PRIVATE_IPS=1` setting for Postgres, TensorZero and other private
-infrastructure does not disable these WASM guards. The host-configured
-vision/voice sidecar is a narrow tool-host exception tied to its exact
-configured origin and `/v1/` scope (with the extension allowlist and method
-restrictions still applied). Response bodies stream through the same capped
-collector: declared lengths are checked up front, actual chunks are checked as
-they arrive, and reading stops at the first over-limit chunk instead of after
-full buffering. Stream errors still pass through `without_url()`.
+`vet_http_target` guard. It canonicalizes IPv4-mapped, IPv4-compatible and
+NAT64-embedded addresses before applying the special-use IPv4/IPv6 and
+multicast blocklists, and reqwest clients (including OAuth refresh) pin the
+exact vetted DNS answers instead of resolving a second time. General
+private-target access requires the separate, default-off
+`WASM_HTTP_ALLOW_PRIVATE_IPS=1` opt-in; the daemon's `ALLOW_PRIVATE_IPS=1`
+setting for Postgres, TensorZero and other private infrastructure does not
+disable these WASM guards. The host-configured vision/voice sidecar is a
+narrow tool-host exception tied to a **local** exact configured origin and
+`/v1/` scope (with the extension allowlist and method restrictions still
+applied). Each channel host independently exempts only the exact scheme, host
+and port of its configured loopback bridge, adapter, relay or Multica URL;
+other hostnames, wildcard targets and different origins stay guarded, so the
+shipped local channels work without a blanket private-target bypass. Response
+bodies stream through the same capped collector: declared lengths are checked
+up front, actual chunks are checked as they arrive, and reading stops at the
+first over-limit chunk instead of after full buffering. Stream errors still
+pass through `without_url()`.
 
 **Reference:** `src/channels/wasm/wrapper.rs` —
 `ChannelStoreData::redact_http_outcome_for_guest`
