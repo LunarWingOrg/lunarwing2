@@ -71,6 +71,41 @@ impl ConversationManager {
         Ok(count)
     }
 
+    /// Prepend imported v1-compatible history to an existing conversation.
+    ///
+    /// WI#442 F7: Engine V2's bridge dual-write is forward-only, so a tenant's
+    /// pre-switch v1 rows never reach the v2 surface on their own. The bridge
+    /// reads them once (gated on a per-conversation marker) and calls this to
+    /// seed the surface, so a new engine thread inherits the pre-switch context
+    /// instead of starting cold. Ownership is enforced here as on every other
+    /// conversation mutation; the caller owns idempotency.
+    pub async fn import_v1_history(
+        &self,
+        conversation_id: ConversationId,
+        user_id: &str,
+        entries: Vec<ConversationEntry>,
+    ) -> Result<usize, EngineError> {
+        let mut convs = self.conversations.write().await;
+        let conv = convs.get_mut(&conversation_id).ok_or(EngineError::Store {
+            reason: format!("conversation {conversation_id} not found"),
+        })?;
+        if conv.user_id != user_id {
+            return Err(EngineError::AccessDenied {
+                user_id: user_id.to_string(),
+                entity: format!("conversation {conversation_id}"),
+            });
+        }
+
+        let previous = conv.clone();
+        let count = conv.prepend_imported_entries(entries);
+        if let Err(error) = self.store.save_conversation(conv).await {
+            *conv = previous;
+            warn!(conversation_id = %conversation_id, %error, "failed to persist imported v1 history");
+            return Err(error);
+        }
+        Ok(count)
+    }
+
     /// Get or create a conversation for a channel+user pair.
     pub async fn get_or_create_conversation(
         &self,
@@ -629,9 +664,11 @@ fn build_history_from_entries(
         .iter()
         .filter_map(|entry| match &entry.sender {
             EntrySender::User => Some(crate::types::message::ThreadMessage::user(&entry.content)),
-            EntrySender::Agent { .. } => Some(crate::types::message::ThreadMessage::assistant(
-                &entry.content,
-            )),
+            EntrySender::Agent { .. } | EntrySender::ImportedAgent => {
+                Some(crate::types::message::ThreadMessage::assistant(
+                    &entry.content,
+                ))
+            }
             EntrySender::System => None, // skip system notifications
         })
         .collect()
@@ -672,6 +709,22 @@ mod tests {
         assert_eq!(history.len(), MAX_CONVERSATION_ENTRIES - 1);
         assert_eq!(history[0].content, "message 10");
         assert!(history.iter().all(|message| message.content != "message 9"));
+    }
+
+    #[test]
+    fn imported_v1_agent_entries_seed_as_assistant_history() {
+        use crate::types::conversation::ConversationEntry;
+
+        let mut conv = ConversationSurface::new("xmpp", "user");
+        conv.add_entry(ConversationEntry::imported_user("before", chrono::Utc::now()));
+        conv.add_entry(ConversationEntry::imported_agent("earlier answer", chrono::Utc::now()));
+        conv.add_entry(ConversationEntry::user("current"));
+
+        let history = build_history_from_entries(&conv.entries);
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, "before");
+        assert_eq!(history[1].content, "earlier answer");
     }
 
     // ── Mocks (same as manager tests) ───────────────────────

@@ -4,6 +4,7 @@ pub(crate) mod auth;
 #[cfg(test)]
 mod estimation_tests;
 mod outcome;
+mod v1_history_import;
 use outcome::await_thread_outcome;
 
 use std::sync::{Arc, OnceLock};
@@ -3754,6 +3755,22 @@ async fn handle_with_engine_inner(
         .get_or_create_conversation(&channel_key, &message.user_id)
         .await
         .map_err(|e| engine_err("conversation error", e))?;
+
+    // WI#442 F7: seed pre-switch v1 history into the surface once per v1
+    // conversation, so the first engine thread after an ENGINE_V2 switch
+    // inherits the tenant's earlier context. Best-effort — a failure only
+    // costs context, never the turn.
+    if let Some(ref db) = state.db
+        && let Some(v1_id) = resolve_v1_conversation_for_message(db.as_ref(), message).await
+    {
+        v1_history_import::import_v1_history_if_needed(
+            &state,
+            conv_id,
+            v1_id,
+            &message.user_id,
+        )
+        .await;
+    }
 
     // Resolve per-user project (creates if needed).
     let project_id =
