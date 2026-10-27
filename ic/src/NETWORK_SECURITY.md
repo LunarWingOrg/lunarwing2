@@ -583,13 +583,13 @@ WASM tools execute HTTP requests through the host runtime, subject to:
    decompress, a credential-injected exchange sends exactly one
    `accept-encoding: identity` (replacing every guest spelling) and removes
    every `TE` offer. A **non-empty** response with any non-identity
-   `Content-Encoding` or non-chunked `Transfer-Encoding` token is refused —
-   the guest could otherwise decode an echoed credential itself. Hyper
-   removes a single `chunked` layer when the last token of the last field
-   is `chunked`. The wrapper still accepts trailing-empty and repeated
-   `chunked` forms whose framing may remain and hide a split echo from the
-   byte scrub; this gap is tracked separately in
-   [WI#430](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/430).
+   `Content-Encoding` or a `Transfer-Encoding` that keeps chunk framing is
+   refused — the guest could otherwise decode an echoed credential itself.
+   hyper removes a single `chunked` layer only when the last element of the
+   last field is `chunked`, so only that form is inspectable: `chunked,`, a
+   `chunked` field followed by an empty field, repeated `chunked`, and
+   `gzip, chunked` are refused (WI#430), while `,chunked`, whitespace
+   variants, mixed case and an empty field followed by `chunked` pass.
    Empty bodies (including HEAD/204/304 responses) are exempt from this
    encoding refusal; ordinary exchanges keep the guest's own headers and answer.
    Duplicate response fields are comma-joined before the encoding check,
