@@ -223,6 +223,9 @@ impl TurnCompletion {
                 text.clear();
             }
         }
+        if !matches!(&outcome, ThreadOutcome::GatePaused { .. }) {
+            self.reap_terminal_gates().await;
+        }
         self.state
             .conversation_manager
             .record_thread_outcome(self.conversation_id, self.thread_id, &outcome)
@@ -250,6 +253,25 @@ impl TurnCompletion {
             self.write_history(text).await;
         }
         Ok(result)
+    }
+
+    async fn reap_terminal_gates(&self) {
+        let discarded = self
+            .state
+            .pending_gates
+            .drain_for_thread(self.thread_id)
+            .await;
+        for gate in &discarded {
+            tracing::warn!(
+                user_id = %gate.user_id,
+                thread_id = %gate.thread_id,
+                request_id = %gate.request_id,
+                gate = %gate.gate_name,
+                action = %gate.action_name,
+                "engine v2: discarded pending gate; owning turn reached a terminal outcome"
+            );
+        }
+        super::broadcast_dead_gate_resolutions(&self.state, &discarded);
     }
 
     async fn write_history(&self, text: &str) {
