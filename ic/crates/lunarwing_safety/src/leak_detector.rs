@@ -284,9 +284,6 @@ impl LeakDetector {
                 pattern: blocking_match
                     .map(|m| m.pattern_name.clone())
                     .unwrap_or_default(),
-                preview: blocking_match
-                    .map(|m| m.masked_preview.clone())
-                    .unwrap_or_default(),
             });
         }
 
@@ -299,14 +296,12 @@ impl LeakDetector {
                 tracing::warn!(
                     pattern = %leak_match.pattern_name,
                     severity = %leak_match.severity,
-                    preview = %leak_match.masked_preview,
                     "Potential secret leak detected (warning only)"
                 );
             } else {
                 tracing::debug!(
                     pattern = %leak_match.pattern_name,
                     severity = %leak_match.severity,
-                    preview = %leak_match.masked_preview,
                     "Potential secret-like value detected (heuristic only)"
                 );
             }
@@ -340,9 +335,8 @@ impl LeakDetector {
         // Scan each header value
         for (name, value) in headers {
             self.scan_and_clean(value)
-                .map_err(|e| LeakDetectionError::SecretLeakBlocked {
+                .map_err(|_| LeakDetectionError::SecretLeakBlocked {
                     pattern: format!("header:{}", name),
-                    preview: e.to_string(),
                 })?;
         }
 
@@ -378,7 +372,7 @@ impl Default for LeakDetector {
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum LeakDetectionError {
     #[error("Secret leak blocked: pattern '{pattern}' matched")]
-    SecretLeakBlocked { pattern: String, preview: String },
+    SecretLeakBlocked { pattern: String },
 }
 
 /// Mask a secret for safe display.
@@ -910,6 +904,10 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "Secret leak blocked: pattern 'openai_api_key' matched"
+        );
+        assert_eq!(
+            format!("{error:?}"),
+            "SecretLeakBlocked { pattern: \"openai_api_key\" }"
         );
     }
 
