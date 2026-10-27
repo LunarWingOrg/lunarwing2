@@ -4,6 +4,7 @@ pub(crate) mod auth;
 #[cfg(test)]
 mod estimation_tests;
 mod outcome;
+mod v1_history_import;
 use outcome::await_thread_outcome;
 
 use std::sync::{Arc, OnceLock};
@@ -3748,12 +3749,34 @@ async fn handle_with_engine_inner(
     // clear use the same key so they address this exact conversation.
     let channel_key = engine_conversation_key(message);
 
-    // Get or create conversation for this scoped channel+user
-    let conv_id = state
+    // Get or create conversation for this scoped channel+user. The created
+    // flag tells the WI#442 F7 import whether this message opened a brand-new
+    // surface (import pre-switch v1 history) or reused one the user has
+    // already been chatting on (marker only — see router/v1_history_import.rs).
+    let (conv_id, surface_created) = state
         .conversation_manager
-        .get_or_create_conversation(&channel_key, &message.user_id)
+        .get_or_create_conversation_with_created(&channel_key, &message.user_id)
         .await
         .map_err(|e| engine_err("conversation error", e))?;
+
+    // WI#442 F7: seed pre-switch v1 history into a freshly created surface
+    // once per v1 conversation, so the first engine thread after an ENGINE_V2
+    // switch inherits the tenant's earlier context. Ownership of the v1
+    // conversation is verified inside, so a forged `thread_id` cannot pull
+    // another user's history in. Best-effort — a failure only costs context,
+    // never the turn.
+    if let Some(ref db) = state.db
+        && let Some(v1_id) = resolve_v1_conversation_for_message(db.as_ref(), message).await
+    {
+        v1_history_import::import_v1_history_if_needed(
+            state,
+            conv_id,
+            v1_id,
+            &message.user_id,
+            surface_created,
+        )
+        .await;
+    }
 
     // Resolve per-user project (creates if needed).
     let project_id =
@@ -11169,5 +11192,260 @@ pub(crate) mod tests {
             .await;
         }
         *lock.write().await = None;
+    }
+
+    // ── WI#442 F7: v1-history import gates (run-237 PP-1/PP-2 fixes) ─────
+    //
+    // These drive the real `import_v1_history_if_needed` against a real
+    // libSQL v1 database, so they pin the ownership gate (a forged
+    // conversation UUID must not copy another user's history into the
+    // caller's surface) and the new-surface gate (a tenant already on
+    // Engine V2 records the marker without a backfill, so `/clear` and
+    // existing threads keep their context untouched).
+
+    /// Build an EngineState like `make_expected_test_state` but with a real
+    /// libSQL v1 `Database` attached to `state.db`.
+    #[cfg(feature = "libsql")]
+    async fn make_v1_import_test_state()
+    -> (EngineState, Arc<dyn crate::db::Database>, tempfile::TempDir) {
+        let store = Arc::new(TestStore::new());
+        let mut state = make_expected_test_state(store);
+        let (db, temp) = crate::testing::test_db().await;
+        state.db = Some(db.clone());
+        (state, db, temp)
+    }
+
+    /// Seed a v1 conversation owned by `owner` with the given rows. The caller
+    /// must create the engine surface afterwards so the surface's
+    /// `created_at` is strictly newer than every seeded row.
+    #[cfg(feature = "libsql")]
+    async fn seed_v1_history(
+        db: &Arc<dyn crate::db::Database>,
+        owner: &str,
+        rows: &[(&str, &str)],
+    ) -> uuid::Uuid {
+        use crate::db::ConversationStore;
+
+        let conv = db
+            .create_conversation("gateway", owner, None)
+            .await
+            .expect("create v1 conversation");
+        for (role, content) in rows {
+            db.add_conversation_message(conv, role, content)
+                .await
+                .expect("seed v1 message");
+        }
+        // libSQL stamps rows from the daemon clock; a small sleep keeps the
+        // surface-vs-row ordering deterministic without relying on clock
+        // resolution.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        conv
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn v1_history_import_never_copies_a_foreign_conversation() {
+        let (state, db, _temp) = make_v1_import_test_state().await;
+
+        let victim_conv = seed_v1_history(
+            &db,
+            "victim",
+            &[
+                ("user", "victim private question"),
+                ("assistant", "victim private answer"),
+            ],
+        )
+        .await;
+        assert!(
+            !crate::db::ConversationStore::conversation_belongs_to_user(
+                db.as_ref(),
+                victim_conv,
+                "attacker"
+            )
+            .await
+            .expect("ownership lookup"),
+            "precondition: the victim's conversation is not the attacker's"
+        );
+
+        let (conv_id, created) = state
+            .conversation_manager
+            .get_or_create_conversation_with_created("gateway", "attacker")
+            .await
+            .expect("attacker engine surface");
+        assert!(created, "the attacker's surface is brand new");
+
+        let imported = v1_history_import::import_v1_history_if_needed(
+            &state,
+            conv_id,
+            victim_conv,
+            "attacker",
+            true,
+        )
+        .await;
+
+        assert_eq!(imported, 0, "a foreign conversation imports nothing");
+        let surface = state
+            .conversation_manager
+            .get_conversation(conv_id)
+            .await
+            .expect("attacker surface");
+        assert!(
+            surface.entries.is_empty(),
+            "the victim's rows must not reach the attacker's surface: {:?}",
+            surface
+                .entries
+                .iter()
+                .map(|e| &e.content)
+                .collect::<Vec<_>>()
+        );
+        // The attacker must not even stamp the marker onto the victim's row.
+        let metadata = db
+            .get_conversation_metadata(victim_conv)
+            .await
+            .expect("victim metadata");
+        let marked = metadata
+            .as_ref()
+            .is_some_and(|m| m.get(v1_history_import::IMPORTED_MARKER).is_some());
+        assert!(!marked, "the victim's conversation must not be marked");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn v1_history_import_marks_an_existing_surface_without_backfilling() {
+        let (state, db, _temp) = make_v1_import_test_state().await;
+
+        let v1_conv = seed_v1_history(&db, "alice", &[("user", "pre-switch question")]).await;
+
+        // The surface already existed — this message did not create it, the
+        // shape every already-switched tenant hits on the first message after
+        // this lands.
+        let (conv_id, created) = state
+            .conversation_manager
+            .get_or_create_conversation_with_created("gateway", "alice")
+            .await
+            .expect("existing engine surface");
+        assert!(!created, "the second lookup reuses the surface");
+
+        let imported = v1_history_import::import_v1_history_if_needed(
+            &state, conv_id, v1_conv, "alice", false,
+        )
+        .await;
+
+        assert_eq!(imported, 0, "an existing surface never backfills");
+        let surface = state
+            .conversation_manager
+            .get_conversation(conv_id)
+            .await
+            .expect("engine surface");
+        assert!(
+            surface.entries.is_empty(),
+            "no pre-switch rows are prepended to a surface the user already chats on"
+        );
+        let metadata = db
+            .get_conversation_metadata(v1_conv)
+            .await
+            .expect("v1 metadata")
+            .expect("metadata row exists");
+        assert_eq!(
+            metadata.get(v1_history_import::IMPORTED_MARKER),
+            Some(&serde_json::json!(true)),
+            "the marker is recorded so later turns skip the read"
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn v1_history_import_seeds_a_new_surface_once() {
+        let (state, db, _temp) = make_v1_import_test_state().await;
+
+        let v1_conv = seed_v1_history(
+            &db,
+            "alice",
+            &[
+                ("user", "pre-switch question"),
+                ("assistant", "pre-switch answer"),
+                ("tool_calls", "[]"),
+            ],
+        )
+        .await;
+
+        let (conv_id, created) = state
+            .conversation_manager
+            .get_or_create_conversation_with_created("gateway", "alice")
+            .await
+            .expect("new engine surface");
+        assert!(created, "the first lookup creates the surface");
+
+        let imported =
+            v1_history_import::import_v1_history_if_needed(&state, conv_id, v1_conv, "alice", true)
+                .await;
+        assert_eq!(imported, 2, "only user/assistant rows import");
+
+        let surface = state
+            .conversation_manager
+            .get_conversation(conv_id)
+            .await
+            .expect("engine surface");
+        let contents: Vec<&str> = surface.entries.iter().map(|e| e.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            ["pre-switch question", "pre-switch answer"],
+            "imported rows precede live entries in v1 order"
+        );
+        assert!(matches!(
+            surface.entries[1].sender,
+            lunarwing_engine::EntrySender::ImportedAgent
+        ));
+
+        // The marker makes the second call a no-op (duplicate-free retry).
+        let again =
+            v1_history_import::import_v1_history_if_needed(&state, conv_id, v1_conv, "alice", true)
+                .await;
+        assert_eq!(again, 0, "the marker prevents a re-import");
+        let surface = state
+            .conversation_manager
+            .get_conversation(conv_id)
+            .await
+            .expect("engine surface");
+        assert_eq!(surface.entries.len(), 2, "no duplicated entries");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn v1_history_import_skips_rows_written_after_the_surface_existed() {
+        let (state, db, _temp) = make_v1_import_test_state().await;
+
+        use crate::db::ConversationStore;
+        let v1_conv = db
+            .create_conversation("gateway", "alice", None)
+            .await
+            .expect("create v1 conversation");
+
+        let (conv_id, created) = state
+            .conversation_manager
+            .get_or_create_conversation_with_created("gateway", "alice")
+            .await
+            .expect("new engine surface");
+        assert!(created);
+
+        // Forward dual-write rows from a v2 turn: created after the surface.
+        db.add_conversation_message(v1_conv, "user", "v2 question")
+            .await
+            .expect("add dual-write row");
+
+        let imported =
+            v1_history_import::import_v1_history_if_needed(&state, conv_id, v1_conv, "alice", true)
+                .await;
+
+        assert_eq!(
+            imported, 0,
+            "the forward dual-write's own rows stay out of the import"
+        );
+        let surface = state
+            .conversation_manager
+            .get_conversation(conv_id)
+            .await
+            .expect("engine surface");
+        assert!(surface.entries.is_empty());
     }
 }

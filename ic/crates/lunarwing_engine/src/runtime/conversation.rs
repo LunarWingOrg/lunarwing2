@@ -738,8 +738,14 @@ mod tests {
         use crate::types::conversation::ConversationEntry;
 
         let mut conv = ConversationSurface::new("xmpp", "user");
-        conv.add_entry(ConversationEntry::imported_user("before", chrono::Utc::now()));
-        conv.add_entry(ConversationEntry::imported_agent("earlier answer", chrono::Utc::now()));
+        conv.add_entry(ConversationEntry::imported_user(
+            "before",
+            chrono::Utc::now(),
+        ));
+        conv.add_entry(ConversationEntry::imported_agent(
+            "earlier answer",
+            chrono::Utc::now(),
+        ));
         conv.add_entry(ConversationEntry::user("current"));
 
         let history = build_history_from_entries(&conv.entries);

@@ -1580,10 +1580,11 @@ mod tests {
         db.add_conversation_message(victim, "user", "victim private question")
             .await
             .unwrap();
-        assert!(!db
-            .conversation_belongs_to_user(victim, "attacker")
-            .await
-            .unwrap());
+        assert!(
+            !db.conversation_belongs_to_user(victim, "attacker")
+                .await
+                .unwrap()
+        );
 
         // The attacker passes the victim's UUID as the scope.
         let resolved = db
