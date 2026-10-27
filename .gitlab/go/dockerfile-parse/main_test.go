@@ -73,6 +73,20 @@ func TestMetadataAfterAssertionPasses(t *testing.T) {
 	}
 }
 
+func TestDependencyNormalizationAllowsUnrelatedInstructions(t *testing.T) {
+	for name, insertion := range map[string]string{
+		"ENV": "ENV PATH=/opt/bin:$PATH\n",
+		"RUN": "RUN echo one \\\n && echo two\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			src := strings.Replace(validDockerfile, anchorArg, insertion+anchorArg, 1)
+			if err := check([]byte(src)); err != nil {
+				t.Fatalf("unrelated instruction before the anchor was rejected: %v", err)
+			}
+		})
+	}
+}
+
 func TestParserDivergenceFixtures(t *testing.T) {
 	postAssertRun := "RUN chown -R opencode2:opencode2 /app\n"
 	cases := []struct {
@@ -139,7 +153,8 @@ func TestStructuralPolicyFixtures(t *testing.T) {
 		{"compile-out after build", strings.Replace(validDockerfile, compileRun+"\n"+guardedBuild, guardedBuild+"\n"+compileRun, 1), "compile-out"},
 		{"missing read-only step", strings.Replace(validDockerfile, "RUN chmod -R a-w", "RUN true # chmod -R a-w", 1), "read-only chmod"},
 		{"missing dependency mode normalization", strings.Replace(validDockerfile, dependencyModes+"\n", "", 1), "strip dependency privilege and write bits"},
-		{"dependency mode normalization after anchor", strings.Replace(validDockerfile, dependencyModes+"\n"+anchorArg, anchorArg+"\n"+dependencyModes, 1), "immediately before the wrapper anchor"},
+		{"dependency mode normalization after anchor", strings.Replace(validDockerfile, dependencyModes+"\n"+anchorArg, anchorArg+"\n"+dependencyModes, 1), "before the wrapper anchor"},
+		{"dependency COPY after normalization", strings.Replace(validDockerfile, anchorArg, "COPY --from=builder /out/client /app/node_modules/@opencode/client\n"+anchorArg, 1), "after every dependency COPY"},
 		{"missing filesystem assertion", strings.Replace(validDockerfile, " --image-filesystem", "", 1), "verify installed policy-file ownership"},
 	}
 	for _, test := range cases {
