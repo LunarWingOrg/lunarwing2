@@ -433,6 +433,7 @@ case "${1:-}" in
   list)
     [[ "${FAKE_LIST_RC:-0}" == "0" ]] || exit 1
     chain="${!#}"
+    printf 'list %s\n' "$chain" >>"${FAKE_NFT_LOG:-/dev/null}"
     printf 'chain "%s" {\n' "$chain"
     case "${FAKE_MODE:-good}" in
       empty) ;;
@@ -446,8 +447,14 @@ esac
 STUB
 chmod +x "$guard_bin/nft"
 assert_rc_fail env PATH="$guard_bin:$PATH" "$guard" "$fixture/missing.nft" rootful fwd_alpha
-if PATH="$guard_bin:$PATH" "$guard" "$fixture/alpha.nft" rootful fwd_alpha >/dev/null; then
+# OQ-4: the guard derives the input chain as `in_<suffix>` (distinct from the
+# forward prefix), so a `worker_input_*` regression cannot pass silently.
+: >"$fixture/guard-chains.log"
+if PATH="$guard_bin:$PATH" FAKE_NFT_LOG="$fixture/guard-chains.log" \
+    "$guard" "$fixture/alpha.nft" rootful fwd_alpha >/dev/null; then
   pass "guard accepts both exact live chains"
+  assert_contains "$(cat "$fixture/guard-chains.log")" 'list in_alpha' "guard derives the in_<tenant> input chain (OQ-4)"
+  assert_absent "$(cat "$fixture/guard-chains.log")" 'worker_input_' "guard no longer derives worker_input_* chain names (OQ-4)"
 else
   fail "guard rejected both exact live chains"
 fi
