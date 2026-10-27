@@ -137,6 +137,7 @@ impl GatewayChannel {
             ws_idle_timeout_secs: config.ws_idle_timeout_secs,
             voice: None,
             voice_rate_limiter: server::PerUserRateLimiter::new(10, 60),
+            context_manager: None,
         });
 
         Self {
@@ -186,6 +187,7 @@ impl GatewayChannel {
             ws_idle_timeout_secs: self.state.ws_idle_timeout_secs,
             voice: self.state.voice.clone(),
             voice_rate_limiter: server::PerUserRateLimiter::new(10, 60),
+            context_manager: self.state.context_manager.clone(),
         };
         mutate(&mut new_state);
         self.state = Arc::new(new_state);
@@ -256,6 +258,14 @@ impl GatewayChannel {
         manager: Arc<crate::orchestrator::ExternalWorkerManager>,
     ) -> Self {
         self.rebuild_state(|state| state.external_worker_manager = Some(manager));
+        self
+    }
+
+    /// Inject the job context manager so the gateway can surface live runtime
+    /// state (`stuck`, `repair_attempts`) not stored on the sandbox record
+    /// (WI#475).
+    pub fn with_context_manager(mut self, cm: Arc<crate::context::ContextManager>) -> Self {
+        self.rebuild_state(|state| state.context_manager = Some(cm));
         self
     }
 
