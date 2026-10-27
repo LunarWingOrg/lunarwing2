@@ -1011,6 +1011,19 @@ mod jobs_isolation {
         assert_eq!(only_kimi["jobs"].as_array().expect("jobs").len(), 1);
         assert_eq!(job_by_id(&only_kimi, kimi.id)["worker_name"], "kimi");
 
+        // The filter is case-insensitive, so a differently-cased value still
+        // selects the same lanes instead of silently matching nothing.
+        let upper = list_jobs(
+            jobs_router(state.clone(), auth.clone()),
+            "/api/jobs?mode=External",
+        )
+        .await;
+        assert_eq!(
+            upper["jobs"].as_array().expect("jobs").len(),
+            2,
+            "case-insensitive filter returns alice's two external jobs: {upper}"
+        );
+
         let workers = list_jobs(jobs_router(state, auth), "/api/jobs?mode=worker").await;
         let worker_ids: Vec<&str> = workers["jobs"]
             .as_array()
