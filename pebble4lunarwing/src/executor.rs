@@ -414,6 +414,58 @@ fn spawn_pebble(
     spawn_pebble_with_options(config, request, proxy_env, llm_request_timeout_secs())
 }
 
+/// Install an executable test stub without the test process ever holding a
+/// write descriptor to the file it will exec.
+///
+/// Pipeline 6562's first `worker-pebble-rust` attempt (job 138240) died with
+/// `Text file busy (os error 26)` (`ETXTBSY`) while the executor spawned a
+/// freshly written shell stub. The cause is a fork/exec race, not writeback:
+/// the test binary runs many tests on parallel threads; while one test holds
+/// the stub's write descriptor, a sibling thread forks a child on the same
+/// process, and the child inherits the whole descriptor table until its own
+/// `exec` closes the `O_CLOEXEC` fds. If the stub is spawned inside that
+/// window, the kernel refuses the exec. `script_failure` is outside the CI
+/// default retry list, so the pipeline only looked green after a manual retry.
+///
+/// Because the error tracks a descriptor held by *this* process (and any
+/// process forked from it), no amount of flushing or `rename` can close the
+/// window — an inherited write fd follows the inode wherever it is renamed.
+/// The fix is to let a dedicated child write the stub: it opens the file,
+/// writes, `chmod`s and renames it into place, with the body supplied on
+/// stdin so it never travels through argv. Only that child ever holds the
+/// write fd, and sibling test threads fork *this* process, so they can never
+/// inherit it. The helper waits for the child to exit before returning, so
+/// callers only ever see a finished stub under its final name.
+#[cfg(test)]
+pub(crate) fn write_executable_stub(path: &Path, contents: &str) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("sh")
+        .arg("-c")
+        // `cat >"$tmp"` leaves the write fd owned by this child; `$$` keeps
+        // the temp name unique if two writers ever share a directory. The
+        // rename installs the finished file atomically under its final name.
+        .arg(r#"tmp="$1.tmp.$$"; cat >"$tmp" && chmod 0755 "$tmp" && mv -f "$tmp" "$1""#)
+        .arg("sh")
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn stub writer");
+    child
+        .stdin
+        .take()
+        .expect("stub writer stdin")
+        .write_all(contents.as_bytes())
+        .expect("write stub body to the writer child");
+    let status = child.wait().expect("stub writer exits");
+    assert!(
+        status.success(),
+        "stub writer failed for {path:?} with {status}"
+    );
+}
+
 fn spawn_pebble_with_options(
     config: &ExecutorConfig,
     request: &protocol::TaskRequest,
@@ -1164,13 +1216,10 @@ mod tests {
             .expect("exe directory")
             .to_path_buf();
         let stub = exe_dir.join("pebble-env-probe-stub.sh");
-        std::fs::write(
+        write_executable_stub(
             &stub,
             "#!/bin/sh\nif [ -n \"$AGENT_AUTH_TOKEN\" ]; then echo TOKEN_PRESENT; else echo TOKEN_OK; fi\n",
-        )
-        .expect("write probe stub");
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-            .expect("make probe stub executable");
+        );
 
         let root = exe_dir.join("pebble-wi373-root");
         std::fs::create_dir_all(&root).expect("create workspace root");
@@ -1223,13 +1272,10 @@ mod tests {
             .expect("exe directory")
             .to_path_buf();
         let stub = exe_dir.join(format!("{prefix}-probe.sh"));
-        std::fs::write(
+        write_executable_stub(
             &stub,
             "#!/bin/sh\necho \"TASK_ID=${LUNARWING_TASK_ID-UNSET}\"\necho \"SOCK=${LUNARWING_TOOL_PROXY_SOCKET-UNSET}\"\n",
-        )
-        .expect("write probe stub");
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-            .expect("make probe stub executable");
+        );
 
         let config = ExecutorConfig {
             pebble_bin: stub.to_str().expect("utf-8 stub path").to_string(),
@@ -1302,24 +1348,15 @@ mod tests {
             // Parent phase: install the fake setpriv, then re-exec with the
             // image-style env (task ids pinned, root HOME/GOPATH).
             std::fs::create_dir_all(&stub_dir).expect("create stub dir");
-            std::fs::write(
+            write_executable_stub(
                 &stub,
                 "#!/bin/sh\nprintf 'HOME=%s GOPATH=%s\\n' \"$HOME\" \"$GOPATH\"\nprintf '<%s>' \"$@\"\nprintf '\\n'\n",
-            )
-            .expect("write setpriv stub");
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-                .expect("make setpriv stub executable");
+            );
             // LP-12: a hostile `setpriv` that only runs if the program is
             // resolved through the task-supplied child PATH — the LD-11
             // absolute-path pin must be able to FAIL.
             std::fs::create_dir_all(&evil_dir).expect("create evil stub dir");
-            std::fs::write(evil_dir.join("setpriv"), "#!/bin/sh\necho EVIL\n")
-                .expect("write evil setpriv stub");
-            std::fs::set_permissions(
-                evil_dir.join("setpriv"),
-                std::fs::Permissions::from_mode(0o755),
-            )
-            .expect("make evil setpriv stub executable");
+            write_executable_stub(&evil_dir.join("setpriv"), "#!/bin/sh\necho EVIL\n");
 
             let exe = std::env::current_exe().expect("test binary path");
             let out = std::process::Command::new(exe)
@@ -1536,13 +1573,10 @@ mod tests {
         // loader-scrubbed in split mode, which the marker below pins without
         // needing real privileges.
         let stub = stub_dir.join("setpriv");
-        std::fs::write(
+        write_executable_stub(
             &stub,
             "#!/bin/sh\nprintf 'LD_PRELOAD=%s\\n' \"${LD_PRELOAD:-unset}\"\nprintf 'GCONV=%s\\n' \"${GCONV_PATH:-unset}\"\nprintf 'TZDIR=%s\\n' \"${TZDIR:-unset}\"\n",
-        )
-        .expect("write stub");
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-            .expect("make stub executable");
+        );
 
         if std::env::var_os(CHILD_MARKER).is_none() {
             let exe = std::env::current_exe().expect("test binary path");
@@ -1647,6 +1681,112 @@ mod tests {
         assert_eq!(resolved, abs_stub.as_os_str());
     }
 
+    /// Regression pin (item-28, pipeline 6562 job 138240): the pebble tests
+    /// install shell stubs and the executor spawns them immediately after, so
+    /// the installer must hand over a file this process holds no open write
+    /// descriptor to — a descriptor a sibling fork could inherit and turn
+    /// into `ETXTBSY` ("Text file busy") at exec time. `script_failure` is
+    /// outside the CI default retry list, so that job only looked green
+    /// after a manual retry.
+    ///
+    /// The positive control is the discriminating half: `execve` on a file
+    /// whose write handle is still open fails with exactly `ETXTBSY` on
+    /// Linux, so that assertion proves the kernel on this machine really
+    /// enforces the busy check rather than the test passing vacuously. The
+    /// fix's own assertion then reads `/proc/self/fd` and requires that no
+    /// descriptor in this process resolves to the installed stub (the actual
+    /// race, unlike an inode-identity check which `rename` defeats).
+    #[test]
+    fn installed_stub_leaves_no_write_descriptor_in_this_process() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("pebble-etxtbsy-{}-{seq}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create stub dir");
+
+        // Positive control: the rejected shape. Holding the write handle open
+        // across the spawn is what makes the kernel refuse the exec.
+        let busy = dir.join("busy.sh");
+        let mut handle = std::fs::File::create(&busy).expect("create busy stub");
+        handle.write_all(b"#!/bin/sh\nexit 0\n").expect("write busy stub");
+        std::fs::set_permissions(&busy, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod busy stub");
+        let refused = std::process::Command::new(&busy)
+            .output()
+            .expect_err("spawn with the write handle held open must be refused");
+        assert_eq!(
+            refused.raw_os_error(),
+            Some(libc::ETXTBSY),
+            "positive control must fail as ETXTBSY, got {refused:?}"
+        );
+        drop(handle);
+
+        // The helper installs a stub that runs cleanly and carries its body.
+        let stub = dir.join("pebble-stub.sh");
+        write_executable_stub(&stub, "#!/bin/sh\necho STUB_RAN\n");
+        let out = std::process::Command::new(&stub)
+            .output()
+            .expect("spawn the freshly installed stub");
+        assert!(
+            out.status.success(),
+            "freshly installed stub must exec cleanly, got {:?}",
+            out.status
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "STUB_RAN",
+            "the installed stub must carry its full body"
+        );
+        assert!(
+            std::fs::metadata(&stub)
+                .expect("stub metadata")
+                .permissions()
+                .mode()
+                & 0o111
+                != 0,
+            "the installed stub must be executable"
+        );
+
+        // The actual race PU-1 named: this process must hold no descriptor
+        // (read, write or otherwise) that resolves to the stub path. A
+        // leftover write descriptor is what a concurrently forked sibling can
+        // inherit and turn into ETXTBSY at spawn time.
+        let target = std::fs::canonicalize(&stub).expect("canonicalize stub");
+        let mut held = Vec::new();
+        let fd_dir = std::fs::read_dir("/proc/self/fd").expect("read /proc/self/fd");
+        for entry in fd_dir {
+            let link = entry.expect("fd entry").path();
+            if let Ok(resolved) = std::fs::read_link(&link) {
+                if resolved == target {
+                    held.push(resolved.display().to_string());
+                }
+            }
+        }
+        assert!(
+            held.is_empty(),
+            "this process must hold no descriptor to the installed stub, held: {held:?}"
+        );
+
+        // Re-installing over an existing stub must replace the body, not
+        // refuse or append — the tests reuse a workspace root across
+        // dispatches.
+        write_executable_stub(&stub, "#!/bin/sh\necho SECOND\n");
+        let out = std::process::Command::new(&stub)
+            .output()
+            .expect("spawn the re-installed stub");
+        assert!(out.status.success(), "re-installed stub must exec");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "SECOND",
+            "re-installing must replace the body, not append to it"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn request_events_drive_heartbeat_retry_and_timeout() {
         struct Cleanup(std::path::PathBuf, std::path::PathBuf);
@@ -1667,7 +1807,7 @@ mod tests {
         let root = exe_dir.join(format!("{prefix}-root"));
         let _cleanup = Cleanup(stub.clone(), root.clone());
         std::fs::create_dir_all(&root).expect("create workspace root");
-        std::fs::write(
+        write_executable_stub(
             &stub,
             r#"#!/bin/sh
 printf '%s\n' '[llm-request] request 1 started' >&2
@@ -1677,10 +1817,7 @@ printf 'timeout=%s events=%s\n' "${PEBBLE_API_TIMEOUT_SECS-unset}" "${PEBBLE_LUN
 printf '%s\n' '[llm-retry] attempt 1 failed; retrying' >&2
 exec sleep 1
 "#,
-        )
-        .expect("write request-event probe");
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-            .expect("make request-event probe executable");
+        );
 
         let config = ExecutorConfig {
             pebble_bin: stub.to_string_lossy().into_owned(),
