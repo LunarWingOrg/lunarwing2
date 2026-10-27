@@ -79,6 +79,10 @@ if mode == "fail_compile":
     sys.exit(1)
 metadata = pathlib.Path(args[args.index("--metadata-file") + 1])
 metadata.write_text(json.dumps({{"containerimage.digest": "sha256:" + "0" * 64}}))
+for index, argument in enumerate(args):
+    if argument == "--output" and args[index + 1].startswith("type=tar,dest="):
+        destination = pathlib.Path(args[index + 1].split("dest=", 1)[1])
+        destination.write_bytes(b"fixture rootfs tar")
 """)
         self.env = {
             **os.environ,
