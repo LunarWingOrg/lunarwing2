@@ -285,6 +285,69 @@ else
   fail "the health env reconciler runs (PB-1)"
 fi
 
+# PM-1: the reconciler pins above are mostly textual. Exercise the end-to-end
+# install path: run ensure_health_pipeline in a fixture with the runtime forced
+# rootful (LUNARWING_MT_ROOTLESS=false, a rootful-podman host's shape) and read
+# back health.env to confirm the launch-mode values the audit must observe were
+# actually written — not just that the reconcile lines are spelled correctly.
+PIPELINE_RUN="${FIXTURE}/pipeline.funcs"
+# A minimal stand-in for ic-infrastructure-health-check so the stable-copy step
+# has something to sync; the scheduling steps are no-ops so the fixture never
+# touches the host's cron/systemd.
+PIPELINE_SRC="${FIXTURE}/pm1-src"
+mkdir -p "$PIPELINE_SRC" "$FIXTURE/pm1-units"
+printf '#!/bin/sh\nexit 0\n' >"$PIPELINE_SRC/cron-wrapper.sh"
+# Pre-seed an existing health.env: the upgrade path is the one that matters
+# here, since a fresh install writes the values in the write-once block. The
+# stale "auto" pair is what a pre-WI#424 or misdetected host would carry, and
+# the operator line must survive.
+printf 'HEALTH_WORKER_EGRESS_RUNTIME=auto\nHEALTH_WORKER_EGRESS_ROOTLESS=auto\nGOTIFY_TOKEN=operator-secret\n' \
+  >"$FIXTURE/pm1.env"
+chmod 0600 "$FIXTURE/pm1.env"
+{
+  printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+  # The pipeline body references these; the path set is irrelevant beyond
+  # health.env, which is what the assertions read back.
+  printf 'say() { :; }\n'
+  printf 'ensure_init_system() { INIT_SYSTEM=systemd; HEALTH_INTERVAL_MIN=15; }\n'
+  # The fixture's shape: a rootful-podman host (LUNARWING_MT_ROOTLESS=false),
+  # which is exactly the case run-232 PB-1 said must not be audited through a
+  # rootless netns.
+  printf 'ensure_container_runtime() { CONTAINER_RT=podman; MT_ROOTLESS=false; }\n'
+  printf '_install_health_cron() { :; }\n'
+  printf '_install_health_systemd_timer() { :; }\n'
+  printf 'HEALTH_ENV_FILE=%q\n' "$FIXTURE/pm1.env"
+  printf 'HEALTH_SRC_DIR=%q\n' "$PIPELINE_SRC"
+  printf 'HEALTH_LIB_DIR=%q\n' "$FIXTURE/pm1-lib"
+  printf 'HEALTH_BASE_DIR=%q\n' "$FIXTURE/pm1-base"
+  printf 'HEALTH_LAUNCHER=%q\n' "$FIXTURE/pm1-launcher"
+  printf 'LUNARWING_MT_SYSTEMD_UNIT_DIR=%q\n' "$FIXTURE/pm1-units"
+  printf 'PORTS_REGISTRY=%q\n' "$FIXTURE/ports.json"
+  printf 'HEALTH_GOTIFY_URL=\nHEALTH_GOTIFY_TOKEN=\n'
+  # Pull the real ensure_health_pipeline and its reconciler helper, so this
+  # exercises the shipped code rather than a copy of it.
+  awk '/^ensure_health_pipeline\(\) \{/,/^\}/' \
+    "$SCRIPT_DIR/../../ic/scripts/mt-admin-lib/12-health-pipeline.sh"
+  awk '/^health_env_reconcile_line\(\) \{/,/^\}/' \
+    "$SCRIPT_DIR/../../ic/scripts/mt-admin-lib/12-health-pipeline.sh"
+  printf 'ensure_health_pipeline\n'
+} >"$PIPELINE_RUN"
+if bash "$PIPELINE_RUN"; then
+  env_text="$(cat "$FIXTURE/pm1.env" 2>/dev/null || true)"
+  assert_contains "$env_text" 'HEALTH_WORKER_EGRESS_RUNTIME=podman' \
+    "ensure_health_pipeline records the provisioned runtime (PM-1)"
+  assert_contains "$env_text" 'HEALTH_WORKER_EGRESS_ROOTLESS=false' \
+    "ensure_health_pipeline records rootless=false on a rootful host (PM-1)"
+  assert_absent "$env_text" 'HEALTH_WORKER_EGRESS_ROOTLESS=auto' \
+    "ensure_health_pipeline rewrites a stale rootless value (PM-1)"
+  assert_contains "$env_text" 'GOTIFY_TOKEN=operator-secret' \
+    "ensure_health_pipeline preserves operator credentials (PM-1)"
+  assert_eq "$(stat -c '%a' "$FIXTURE/pm1.env")" "600" \
+    "health.env keeps its 0600 mode through the reconcile (PM-1)"
+else
+  fail "ensure_health_pipeline runs end-to-end in the fixture (PM-1)"
+fi
+
 printf '%d passed, %d failed\n' "$passes" "$failures"
 if ((failures > 0)); then
   exit 1
