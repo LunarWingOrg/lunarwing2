@@ -2270,7 +2270,11 @@ async fn run_external_task(
                                 if let Some(cm) = context_manager {
                                     let _ = cm
                                         .update_context(job_id, |ctx| {
-                                            record_external_progress(ctx, &progress.delta);
+                                            record_external_progress_at(
+                                                ctx,
+                                                &progress.delta,
+                                                Utc::now(),
+                                            );
                                         })
                                         .await;
                                 }
@@ -4166,12 +4170,7 @@ fn is_genuine_progress(delta: &str) -> bool {
 }
 
 /// Route a real external-worker progress frame to the two idle stamps.
-/// Keeping this in the production read loop's path pins WI#475's heartbeat
-/// behavior instead of letting tests re-implement the routing.
-fn record_external_progress(ctx: &mut JobContext, delta: &str) {
-    record_external_progress_at(ctx, delta, Utc::now());
-}
-
+/// The production read loop and its regression tests share this exact path.
 fn record_external_progress_at(
     ctx: &mut JobContext,
     delta: &str,
@@ -4903,9 +4902,9 @@ mod tests {
 
     #[test]
     fn heartbeats_are_not_genuine_progress() {
-        // WI#263: the kimi executor's synthetic keep-alive must not refresh
-        // the idle baseline — a wedged CLI emits nothing while the heartbeat
-        // claims the task is active.
+        // WI#263/WI#475: keep-alives never refresh the genuine-activity
+        // stamp; they refresh only external executor liveness. A wedged CLI
+        // that keeps heartbeating is bounded by the outer task deadline.
         assert!(!is_genuine_progress(
             "[worker] Still waiting for Kimi Code response; task remains active."
         ));
@@ -5194,8 +5193,8 @@ mod tests {
         assert!(!is_heartbeat_only_frame(transient));
         assert!(!is_heartbeat_only_frame("[worker] initialized session"));
         // The two predicates intentionally disagree on the transient notice:
-        // it may not refresh the idle baseline (any `[worker] ` frame is
-        // executor-authored, not CLI-authored)…
+        // it refreshes external executor liveness but not genuine activity
+        // (any `[worker] ` frame is executor-authored, not CLI-authored)…
         assert!(!is_genuine_progress(transient));
         // …but it IS recoverable evidence.
         let mut buffer = String::new();
