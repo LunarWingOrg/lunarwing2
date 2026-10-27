@@ -201,7 +201,7 @@ running_worker_containers() {  # <tenant> — prints each running managed worker
 note() { printf 'ISSUE:%s\n' "$1"; }  # buffered for the parent process
 
 audit_tenant() {  # <tenant> — returns 0 healthy, 1 missing; issues on stdout
-  local tenant="$1" network subnet bridge gateway mode chains chain dump missing=0
+  local tenant="$1" network subnet bridge gateway mode chain dump missing=0
   local -a running=()
   network="lw-egress-$tenant"
   subnet="$(state_get "$tenant" SUBNET)"
