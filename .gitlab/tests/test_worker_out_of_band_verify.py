@@ -146,7 +146,7 @@ class RegistryRequestTests(unittest.TestCase):
             )
         self.assertEqual(payload, {"ok": True})
         self.assertEqual(fetch.call_count, 3)
-        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 4])
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [15, 30])
 
     def test_persistent_rate_limit_fails_after_bounded_retries(self):
         with mock.patch.object(
@@ -156,7 +156,7 @@ class RegistryRequestTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 self.module._registry_json(self.request, timeout=60, description="registry probe")
         self.assertEqual(fetch.call_count, 4)
-        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 4, 8])
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [15, 30, 60])
         self.assertIn("HTTP Error 429", stderr.getvalue())
 
     def test_permanent_http_error_is_not_retried(self):
