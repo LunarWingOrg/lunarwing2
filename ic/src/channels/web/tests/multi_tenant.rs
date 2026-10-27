@@ -924,7 +924,7 @@ mod jobs_isolation {
 
     #[tokio::test]
     async fn test_jobs_cancel_external_synchronizes_context_and_stuck_sweep() {
-        use crate::agent::self_repair::{DefaultSelfRepair, SelfRepair};
+        use crate::agent::{DefaultSelfRepair, SelfRepair};
         use crate::config::ExternalWorkerConfig;
         use crate::context::{ContextManager, JobState};
         use crate::orchestrator::ExternalWorkerManager;
