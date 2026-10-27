@@ -404,6 +404,22 @@ assert_rc_fail worker_egress_audit alpha
 NFT_LIST_RC=0
 assert_rc_fail env CTR_NETWORKS=default worker_egress_audit alpha
 assert_rc_fail worker_egress_audit unallocated
+# OQ-6: an idle tenant (no container) is reported without reading the netns.
+CTR_CONTAINER_EXISTS=false
+NFT_CALLS=()
+: >"$NFT_LOG"
+if (worker_egress_audit alpha) >"$fixture/audit-idle.out" 2>&1; then
+  pass "audit reports an idle tenant without a netns read (OQ-6)"
+else
+  fail "audit failed a healthy idle tenant"
+fi
+assert_contains "$(cat "$fixture/audit-idle.out")" 'rule state audited at next start' "the idle audit names the deferred rule check"
+if grep -q 'list chain' "$NFT_LOG"; then
+  fail "the idle audit still created a netns to read rules (OQ-6)"
+else
+  pass "the idle audit performs no nft read (OQ-6)"
+fi
+CTR_CONTAINER_EXISTS=true
 
 # ── the real guard with a hermetic nft executable ─────────────────────────────
 guard="$HARNESS_REPO_ROOT/ic/scripts/lunarwing-worker-egress-guard.sh"

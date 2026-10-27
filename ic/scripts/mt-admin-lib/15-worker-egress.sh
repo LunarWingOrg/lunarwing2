@@ -687,7 +687,12 @@ worker_egress_audit() {
       missing=1
     fi
   done
-  [[ "$attached" == "1" ]] || say "  containers: none present"
+  if [[ "$attached" != "1" ]]; then
+    # OQ-6: no netns is created merely to audit an idle tenant — its rules are
+    # (re)loaded by the guard at the next start.
+    say "  containers: none present (rule state audited at next start)"
+    return "$missing"
+  fi
   if dump="$(worker_egress_verify "$name")"; then
     say "  filter: live (tenant-specific forward + input reject rules verified)"
     awk '{print "    " $0}' <<<"$dump"
