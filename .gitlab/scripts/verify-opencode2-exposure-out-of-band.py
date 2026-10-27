@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.request
 
@@ -41,6 +42,32 @@ def die(message: str) -> None:
     raise SystemExit(1)
 
 
+REGISTRY_RETRY_DELAYS = (2, 4, 8)
+TRANSIENT_HTTP_STATUSES = frozenset((429, 500, 502, 503, 504))
+
+
+def _registry_json(request: urllib.request.Request, *, timeout: int, description: str) -> dict:
+    attempt = 0
+    while True:
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as error:
+            status = error.code
+            error.close()
+            if status not in TRANSIENT_HTTP_STATUSES or attempt == len(REGISTRY_RETRY_DELAYS):
+                die(f"{description}: HTTP Error {status}: {error.reason}")
+            delay = REGISTRY_RETRY_DELAYS[attempt]
+            attempt += 1
+            print(
+                f"WARNING: {description}: HTTP {status}; retrying in {delay} seconds",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+        except (OSError, ValueError) as error:
+            die(f"{description}: {error}")
+
+
 def registry_token(repo: str) -> str:
     host = os.environ.get("CI_SERVER_HOST", "")
     user = os.environ.get("CI_REGISTRY_USER", "")
@@ -52,11 +79,9 @@ def registry_token(repo: str) -> str:
     url = (f"https://{host}/jwt/auth?service=container_registry&"
            f"scope=repository:{repo}:pull")
     request = urllib.request.Request(url, headers={"Authorization": f"Basic {auth}"})
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            payload = json.load(response)
-    except (OSError, ValueError) as error:
-        die(f"cannot obtain a registry pull token for {repo}: {error}")
+    payload = _registry_json(
+        request, timeout=60, description=f"cannot obtain a registry pull token for {repo}",
+    )
     token = payload.get("token")
     if not token:
         die(f"registry auth response for {repo} carried no token")
@@ -69,12 +94,9 @@ def image_config(repo: str, digest: str, token: str) -> dict:
         die("CI_REGISTRY is missing")
     url = f"https://{registry}/v2/{repo}/blobs/{digest}"
     request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-    try:
-        with urllib.request.urlopen(request, timeout=120) as response:
-            return json.load(response)
-    except (OSError, ValueError) as error:
-        die(f"cannot fetch image config {digest} from {repo}: {error}")
-    return {}
+    return _registry_json(
+        request, timeout=120, description=f"cannot fetch image config {digest} from {repo}",
+    )
 
 
 def check_config_half(config: dict) -> None:
@@ -370,11 +392,9 @@ def _fetch_candidate_config(image_ref: str, image_digest: str) -> dict:
             "Accept": "application/vnd.docker.distribution.manifest.v2+json",
         },
     )
-    try:
-        with urllib.request.urlopen(request, timeout=120) as response:
-            manifest = json.load(response)
-    except (OSError, ValueError) as error:
-        die(f"cannot fetch manifest {image_digest} from {repo}: {error}")
+    manifest = _registry_json(
+        request, timeout=120, description=f"cannot fetch manifest {image_digest} from {repo}",
+    )
     config_digest = manifest.get("config", {}).get("digest")
     if not config_digest:
         die(f"manifest {image_digest} carries no config digest")
