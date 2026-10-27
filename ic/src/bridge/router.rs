@@ -3763,13 +3763,8 @@ async fn handle_with_engine_inner(
     if let Some(ref db) = state.db
         && let Some(v1_id) = resolve_v1_conversation_for_message(db.as_ref(), message).await
     {
-        v1_history_import::import_v1_history_if_needed(
-            &state,
-            conv_id,
-            v1_id,
-            &message.user_id,
-        )
-        .await;
+        v1_history_import::import_v1_history_if_needed(state, conv_id, v1_id, &message.user_id)
+            .await;
     }
 
     // Resolve per-user project (creates if needed).

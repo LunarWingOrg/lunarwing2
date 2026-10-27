@@ -664,11 +664,9 @@ fn build_history_from_entries(
         .iter()
         .filter_map(|entry| match &entry.sender {
             EntrySender::User => Some(crate::types::message::ThreadMessage::user(&entry.content)),
-            EntrySender::Agent { .. } | EntrySender::ImportedAgent => {
-                Some(crate::types::message::ThreadMessage::assistant(
-                    &entry.content,
-                ))
-            }
+            EntrySender::Agent { .. } | EntrySender::ImportedAgent => Some(
+                crate::types::message::ThreadMessage::assistant(&entry.content),
+            ),
             EntrySender::System => None, // skip system notifications
         })
         .collect()
@@ -716,8 +714,14 @@ mod tests {
         use crate::types::conversation::ConversationEntry;
 
         let mut conv = ConversationSurface::new("xmpp", "user");
-        conv.add_entry(ConversationEntry::imported_user("before", chrono::Utc::now()));
-        conv.add_entry(ConversationEntry::imported_agent("earlier answer", chrono::Utc::now()));
+        conv.add_entry(ConversationEntry::imported_user(
+            "before",
+            chrono::Utc::now(),
+        ));
+        conv.add_entry(ConversationEntry::imported_agent(
+            "earlier answer",
+            chrono::Utc::now(),
+        ));
         conv.add_entry(ConversationEntry::user("current"));
 
         let history = build_history_from_entries(&conv.entries);

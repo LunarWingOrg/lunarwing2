@@ -51,7 +51,11 @@ pub(crate) async fn import_v1_history_if_needed(
 
     // The surface's creation time is the cutoff: every v1 row at or after it is
     // a forward dual-write from a v2 turn, not pre-switch history.
-    let Some(surface) = state.conversation_manager.get_conversation(conversation_id).await else {
+    let Some(surface) = state
+        .conversation_manager
+        .get_conversation(conversation_id)
+        .await
+    else {
         return 0;
     };
     let cutoff = surface.created_at;
@@ -68,7 +72,10 @@ pub(crate) async fn import_v1_history_if_needed(
         .into_iter()
         .filter(|row| row.created_at < cutoff)
         .filter_map(|row| match row.role.as_str() {
-            "user" => Some(ConversationEntry::imported_user(&row.content, row.created_at)),
+            "user" => Some(ConversationEntry::imported_user(
+                &row.content,
+                row.created_at,
+            )),
             "assistant" => Some(ConversationEntry::imported_agent(
                 &row.content,
                 row.created_at,
