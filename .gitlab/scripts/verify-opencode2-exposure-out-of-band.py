@@ -42,7 +42,7 @@ def die(message: str) -> None:
     raise SystemExit(1)
 
 
-REGISTRY_RETRY_DELAYS = (2, 4, 8)
+REGISTRY_RETRY_DELAYS = (15, 30, 60)
 TRANSIENT_HTTP_STATUSES = frozenset((429, 500, 502, 503, 504))
 
 
