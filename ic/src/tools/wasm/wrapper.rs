@@ -28,13 +28,13 @@ use crate::tools::wasm::credential_injector::{
 };
 use crate::tools::wasm::error::WasmError;
 use crate::tools::wasm::host::{HostState, LogLevel};
+#[cfg(test)]
+use crate::tools::wasm::http_security::is_private_ip;
 use crate::tools::wasm::http_security::{
     RedactionNeedle, collect_capped_response_body, enforce_response_size,
     private_http_targets_allowed, push_credential_needles, redact_cross_field_echoes,
     redact_text_with_needles, replace_all_bytes, sort_redaction_needles, vet_http_target,
 };
-#[cfg(test)]
-use crate::tools::wasm::http_security::{is_private_ip, reject_private_ip};
 use crate::tools::wasm::limits::{ResourceLimits, WasmResourceLimiter};
 use crate::tools::wasm::runtime::{EPOCH_TICK_INTERVAL, PreparedModule, WasmToolRuntime};
 
@@ -5148,21 +5148,21 @@ mod tests {
 
     #[test]
     fn test_reject_private_ip_loopback() {
-        let result = super::reject_private_ip("https://127.0.0.1:8080/api");
+        let result = super::vet_http_target("https://127.0.0.1:8080/api");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("private/internal IP"));
     }
 
     #[test]
     fn test_reject_private_ip_internal() {
-        let result = super::reject_private_ip("https://192.168.1.1/admin");
+        let result = super::vet_http_target("https://192.168.1.1/admin");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_reject_private_ip_public_ok() {
         // 8.8.8.8 (Google DNS) is public
-        let result = super::reject_private_ip("https://8.8.8.8/dns-query");
+        let result = super::vet_http_target("https://8.8.8.8/dns-query");
         assert!(result.is_ok());
     }
 
