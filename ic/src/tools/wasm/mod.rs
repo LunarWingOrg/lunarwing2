@@ -93,7 +93,7 @@ pub(crate) mod loader;
 mod rate_limiter;
 mod runtime;
 pub(crate) mod storage;
-mod wrapper;
+pub(crate) mod wrapper;
 
 // Core types
 pub use error::WasmError;
