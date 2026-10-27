@@ -2268,14 +2268,9 @@ async fn run_external_task(
                                 // self-repair while a totally silent worker
                                 // still trips it.
                                 if let Some(cm) = context_manager {
-                                    let genuine = is_genuine_progress(&progress.delta);
                                     let _ = cm
                                         .update_context(job_id, |ctx| {
-                                            if genuine {
-                                                ctx.note_activity();
-                                            } else {
-                                                ctx.note_worker_heartbeat();
-                                            }
+                                            record_external_progress(ctx, &progress.delta);
                                         })
                                         .await;
                                 }
@@ -4160,16 +4155,33 @@ fn proxied_catalog_schema(resolved_name: &str, original: serde_json::Value) -> s
 
 /// Marker prefix workers use for synthetic keep-alive progress (WI#263).
 ///
-/// The kimi executor emits `"[worker] Still waiting …"` heartbeats on a timer
-/// while the underlying CLI runs. Those frames prove the *executor* is alive,
-/// not that the CLI is producing output, so they must not refresh the
-/// idle baseline used by stuck detection.
+/// These frames prove executor liveness, not CLI output. They stay out of the
+/// genuine-evidence stamp but feed the separate external heartbeat stamp.
 const WORKER_HEARTBEAT_PREFIX: &str = "[worker] ";
 
 /// Whether a streamed progress delta is genuine worker output rather than a
 /// synthetic heartbeat (WI#263).
 fn is_genuine_progress(delta: &str) -> bool {
     !delta.trim_start().starts_with(WORKER_HEARTBEAT_PREFIX)
+}
+
+/// Route a real external-worker progress frame to the two idle stamps.
+/// Keeping this in the production read loop's path pins WI#475's heartbeat
+/// behavior instead of letting tests re-implement the routing.
+fn record_external_progress(ctx: &mut JobContext, delta: &str) {
+    record_external_progress_at(ctx, delta, Utc::now());
+}
+
+fn record_external_progress_at(
+    ctx: &mut JobContext,
+    delta: &str,
+    observed_at: chrono::DateTime<Utc>,
+) {
+    if is_genuine_progress(delta) {
+        ctx.note_activity_at(observed_at);
+    } else {
+        ctx.note_worker_heartbeat_at(observed_at);
+    }
 }
 
 /// Structural shape of the synthetic keep-alive sentence every in-tree
@@ -4997,54 +5009,54 @@ mod tests {
         );
     }
 
+    /// WI#263/WI#475: the production router keeps heartbeat liveness separate
+    /// from genuine output. A heartbeating but wedged CLI is bounded by the
+    /// outer task deadline, not by self-repair (the !1980 PS-3 trade-off).
     #[tokio::test]
-    async fn heartbeat_only_streams_do_not_refresh_idle_baseline() {
-        // WI#263 end-to-end at the context level: only genuine deltas may
-        // note activity, so a wedged worker whose executor keeps sending
-        // heartbeats still crosses the idle threshold.
+    async fn heartbeat_refreshes_liveness_without_forging_genuine_activity() {
         let cm = std::sync::Arc::new(crate::context::ContextManager::new(10));
         let job_id = Uuid::new_v4();
         cm.register_sandbox_job(job_id, "user-1", "task", "desc")
             .await
             .unwrap();
 
-        // Backdate the start and record one genuine activity long ago…
-        cm.update_context(job_id, |ctx| -> Result<(), crate::error::JobError> {
-            ctx.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(3600));
-            ctx.last_activity_at = Some(chrono::Utc::now() - chrono::Duration::seconds(600));
-            Ok(())
+        let started_at = Utc::now() - chrono::Duration::seconds(3600);
+        let heartbeat_at = Utc::now() - chrono::Duration::seconds(120);
+        cm.update_context(job_id, |ctx| {
+            ctx.external_worker = Some("kimi".to_string());
+            ctx.started_at = Some(started_at);
+            ctx.last_activity_at = Some(started_at);
         })
         .await
-        .unwrap()
         .unwrap();
 
-        // …then simulate the orchestrator's progress handler on heartbeat
-        // frames only (mirrors the is_genuine_progress gate).
-        for _ in 0..3 {
-            let delta = "[worker] Still waiting for Kimi Code response; task remains active.";
-            if is_genuine_progress(delta) {
-                cm.update_context(job_id, |ctx| ctx.note_activity())
-                    .await
-                    .unwrap();
-            }
-        }
+        let heartbeat = "[worker] Still waiting for Kimi Code response; task remains active.";
+        cm.update_context(job_id, |ctx| {
+            record_external_progress_at(ctx, heartbeat, heartbeat_at);
+        })
+        .await
+        .unwrap();
 
-        let stuck = cm
-            .find_stuck_jobs_with_threshold(Some(std::time::Duration::from_secs(300)))
-            .await;
-        assert_eq!(
-            stuck.len(),
-            1,
-            "heartbeats must not keep a wedged job alive"
-        );
-        assert_eq!(stuck[0], job_id);
+        let ctx = cm.get_context(job_id).await.unwrap();
+        assert_eq!(ctx.last_activity_at, Some(started_at));
+        assert_eq!(ctx.last_worker_heartbeat_at, Some(heartbeat_at));
+        assert_eq!(ctx.idle_baseline(), Some(heartbeat_at));
+
+        let genuine_at = heartbeat_at + chrono::Duration::seconds(60);
+        cm.update_context(job_id, |ctx| {
+            record_external_progress_at(ctx, "genuine output", genuine_at);
+        })
+        .await
+        .unwrap();
+        let ctx = cm.get_context(job_id).await.unwrap();
+        assert_eq!(ctx.last_activity_at, Some(genuine_at));
+        assert_eq!(ctx.last_worker_heartbeat_at, Some(heartbeat_at));
     }
 
-    /// WI#475: a worker whose genuine evidence is stale, but that keeps
-    /// heartbeating every couple of minutes, is not declared stuck at the
-    /// external threshold. Heartbeats are routed to
-    /// `last_worker_heartbeat_at` and the external idle baseline takes the
-    /// latest of activity/heartbeat.
+    /// WI#475 PS-2: drive the production routing function through a 40-minute
+    /// wait with a heartbeat every two minutes. The start and genuine activity
+    /// are older than the 30-minute threshold, so only the heartbeats keep the
+    /// job out of repair. A silent-worker control must still be detected.
     #[tokio::test]
     async fn heartbeat_only_streams_keep_external_job_out_of_repair() {
         let cm = std::sync::Arc::new(crate::context::ContextManager::new(10));
@@ -5053,43 +5065,24 @@ mod tests {
             .await
             .unwrap();
 
-        // Mark the job as external and backdate start/genuine activity ten
-        // minutes ago (a slow LLM request waiting on first token).
-        cm.update_context(job_id, |ctx| -> Result<(), crate::error::JobError> {
-            ctx.external_worker = Some("kimi".to_string());
-            ctx.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(600));
-            ctx.last_activity_at = Some(chrono::Utc::now() - chrono::Duration::seconds(600));
-            Ok(())
-        })
-        .await
-        .unwrap()
-        .unwrap();
-
-        // Simulate the orchestrator's progress handler on heartbeat frames
-        // (WI#475: the new branch routes heartbeats to note_worker_heartbeat).
-        let delta = "[worker] Still waiting for Kimi Code response; task remains active.";
-        let genuine = is_genuine_progress(delta);
+        let started_at = Utc::now() - chrono::Duration::seconds(2400);
         cm.update_context(job_id, |ctx| {
-            if genuine {
-                ctx.note_activity();
-            } else {
-                ctx.note_worker_heartbeat();
-            }
+            ctx.external_worker = Some("kimi".to_string());
+            ctx.started_at = Some(started_at);
+            ctx.last_activity_at = Some(started_at);
         })
         .await
         .unwrap();
 
-        // Two minutes after start the most recent heartbeat is 120 s old, so
-        // an external threshold of 1800 s keeps the job alive while a 300 s
-        // internal threshold would catch a wedged executor.
-        cm.update_context(job_id, |ctx| -> Result<(), crate::error::JobError> {
-            ctx.last_worker_heartbeat_at =
-                Some(chrono::Utc::now() - chrono::Duration::seconds(120));
-            Ok(())
-        })
-        .await
-        .unwrap()
-        .unwrap();
+        let heartbeat = "[worker] Still waiting for Kimi Code response; task remains active.";
+        for heartbeat_index in 1..=20 {
+            let observed_at = started_at + chrono::Duration::seconds(120 * heartbeat_index);
+            cm.update_context(job_id, |ctx| {
+                record_external_progress_at(ctx, heartbeat, observed_at);
+            })
+            .await
+            .unwrap();
+        }
 
         let stuck = cm
             .find_stuck_jobs_with_thresholds(
@@ -5099,19 +5092,13 @@ mod tests {
             .await;
         assert!(
             !stuck.contains(&job_id),
-            "WI#475: heartbeat every 2 min during a 10-min LLM wait is healthy"
+            "heartbeats every 2 min during a 40-min LLM wait are healthy"
         );
 
-        // A totally silent external worker still trips its own threshold
-        // (both genuine activity and the heartbeat are now beyond 1800 s).
-        cm.update_context(job_id, |ctx| -> Result<(), crate::error::JobError> {
-            ctx.last_activity_at = Some(chrono::Utc::now() - chrono::Duration::seconds(2000));
-            ctx.last_worker_heartbeat_at =
-                Some(chrono::Utc::now() - chrono::Duration::seconds(2000));
-            Ok(())
+        cm.update_context(job_id, |ctx| {
+            ctx.last_worker_heartbeat_at = Some(Utc::now() - chrono::Duration::seconds(1801));
         })
         .await
-        .unwrap()
         .unwrap();
         let stuck = cm
             .find_stuck_jobs_with_thresholds(
@@ -5119,7 +5106,7 @@ mod tests {
                 Some(std::time::Duration::from_secs(1800)),
             )
             .await;
-        assert!(stuck.contains(&job_id));
+        assert!(stuck.contains(&job_id), "silent worker must be detected");
     }
 
     #[test]
