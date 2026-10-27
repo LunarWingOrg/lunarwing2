@@ -1612,6 +1612,28 @@ Wraps the `Workspace` as the engine's `Store` trait:
 The router dual-writes compatibility conversation history to the relational
 `Database` separately. That database is not the backing store for `HybridStore`.
 
+#### Pre-switch history import (WI#442 F7)
+
+The dual-write is forward-only: rows created before a tenant switched to
+Engine V2 are not in the engine surface that seeds each new thread, so without
+an import the first thread after the switch would start cold. On the first
+message of each v1 conversation the router runs one import
+(`router/v1_history_import.rs`) that reads that v1 conversation's `user` and
+`assistant` rows and prepends them to the surface as imported entries
+(`EntrySender::ImportedAgent` / `imported_from: v1` metadata).
+
+Two properties make it safe to retry:
+
+- **Marker gate** — `engine_v2_v1_history_imported` in the v1 conversation's
+  metadata short-circuits later messages.
+- **Creation-time cutoff** — only rows older than the engine surface's
+  `created_at` are imported, so the forward dual-write's own v2 rows can never
+  be re-imported even when the marker write fails.
+
+`tool_calls` and `interrupted` marker rows are skipped: they are v1 bookkeeping,
+not conversation context. The import is best-effort — a database or store
+failure is logged and the turn proceeds without the extra context.
+
 ### Channel Routing And Delivery
 
 `should_route_to_engine_v2()` owns the rollout policy. `ENGINE_V2=false`
@@ -1623,6 +1645,15 @@ Note there is no opt-out value: any entry that is not one of the eligible
 channel names — including
 something like `none` — is simply ignored, and the gateway always routes
 while `ENGINE_V2=true`. The only durable opt-out is `ENGINE_V2=false`.
+
+The exact-name allowlist is **by design** (WI#442 F8), not a gap: non-opted
+channels keep running the v1 loop until engine coverage for them lands under
+WI#221/#222. The consequence for operators is that v1-era findings remain
+relevant on those lanes even at full Engine V2 adoption — they are not
+retired by the switch. Expanding the set means adding an eligible channel to
+`ENGINE_V2_OPT_IN_CHANNELS` and the `ENGINE_V2_CHANNELS` docs together;
+retiring the v1 loop is a separate, larger decision. WI#442 F8's acceptance is
+the recorded decision to keep the allowlist, which this paragraph is.
 
 Engine `ResponseDelta` events flow through
 `ChannelManager::send_status(StatusUpdate::StreamChunk)`. The gateway maps each
