@@ -554,7 +554,7 @@ def validate_buildkit_parser_guard(merged: dict, errors: list[str]) -> None:
     expected = {
         "stage": "security",
         "needs": [],
-        "image": {"name": "docker.io/library/golang:1.24.3-bookworm@sha256:29d97266c1d341b7424e2f5085440b74654ae0b61ecdba206bc12d6264844e21"},
+        "image": {"name": "docker.io/library/golang:1.26.10-bookworm@sha256:632dff7351799a5a9954a48dc06670ade72ee44e8c351cdc0e5a57af2fea21af"},
         "tags": ["$CI_LINT_RUNNER_TAG"],
         "variables": {
             "GOTOOLCHAIN": "local",
