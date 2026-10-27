@@ -257,10 +257,10 @@ impl ContextManager {
     ///
     /// `external_threshold` applies to jobs dispatched to an external worker
     /// (`external:*`), whose idle baseline additionally includes synthetic
-    /// worker heartbeats (WI#475): a kimi/pebble task waiting on a slow LLM
-    /// request proves it is alive on every heartbeat, and the worker owns a
-    /// native per-attempt LLM deadline (WI#477), so the daemon must not
-    /// declare it stuck at the local-chat threshold. `None` falls back to
+    /// worker heartbeats (WI#475). A heartbeat proves executor liveness, not
+    /// CLI progress. The worker's native per-attempt deadline bounds its LLM
+    /// wait (WI#477); the outer task deadline remains the bound if the CLI
+    /// wedges elsewhere while the executor heartbeats. `None` falls back to
     /// `internal_threshold`.
     pub async fn find_stuck_jobs_with_thresholds(
         &self,
@@ -857,8 +857,9 @@ mod tests {
         assert_eq!(stuck[0], id);
     }
 
-    /// WI#475 acceptance: a worker that heartbeats every two minutes during a
-    /// ten-minute LLM wait is not declared stuck at the external threshold.
+    /// WI#475 acceptance: a two-minute-old heartbeat keeps a 40-minute LLM
+    /// wait out of repair even though start/activity exceed the 30-minute
+    /// external threshold. The production routing path is pinned separately.
     #[tokio::test]
     async fn external_heartbeat_every_two_minutes_is_not_stuck() {
         let manager = ContextManager::new(10);
@@ -876,10 +877,9 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            // Both silent since "start" ten minutes ago.
             manager
                 .update_context(id, |ctx| -> Result<(), crate::error::JobError> {
-                    ctx.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(600));
+                    ctx.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(2400));
                     Ok(())
                 })
                 .await
@@ -887,7 +887,6 @@ mod tests {
                 .unwrap();
         }
 
-        // The external job heartbeats (the last one two minutes ago).
         manager
             .update_context(external_id, |ctx| -> Result<(), crate::error::JobError> {
                 ctx.external_worker = Some("kimi".to_string());
@@ -907,7 +906,7 @@ mod tests {
             .await;
         assert!(
             !stuck.contains(&external_id),
-            "heartbeat every 2 min must keep a 10-min LLM wait out of repair"
+            "heartbeat must keep a 40-min LLM wait out of repair"
         );
         assert!(stuck.contains(&internal_id));
     }
