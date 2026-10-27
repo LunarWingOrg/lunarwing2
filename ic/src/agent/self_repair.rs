@@ -322,9 +322,28 @@ impl SelfRepair for DefaultSelfRepair {
     }
 
     async fn repair_stuck_job(&self, job: &StuckJob) -> Result<RepairResult, RepairError> {
-        // Check if we've exceeded max repair attempts (WI#475: one terminal
-        // alert per job per boot — a job past the limit used to warn every
-        // sweep forever).
+        // WI#475: the daemon cannot retry or restart an external task. Leave
+        // the job Stuck and ask for intervention once instead of performing a
+        // no-op Stuck -> InProgress flip that is detected again next sweep.
+        if let Some(worker) = job.external_worker.as_deref() {
+            if !self.note_job_manual_required(job.job_id) {
+                return Ok(RepairResult::Retry {
+                    message: format!(
+                        "Job {} remains stuck; manual alert already sent",
+                        job.job_id
+                    ),
+                });
+            }
+            return Ok(RepairResult::ManualRequired {
+                message: format!(
+                    "Job {job_id} exceeded the idle threshold for external worker '{worker}'; \
+                     the daemon cannot retry external tasks, so investigate or cancel the job",
+                    job_id = job.job_id
+                ),
+            });
+        }
+
+        // WI#475: a local job past the repair limit also alerts only once.
         if job.repair_attempts >= self.max_repair_attempts {
             if !self.note_job_manual_required(job.job_id) {
                 return Ok(RepairResult::Retry {
@@ -334,18 +353,11 @@ impl SelfRepair for DefaultSelfRepair {
                     ),
                 });
             }
-            let cause = match job.external_worker.as_deref() {
-                Some(worker) => format!(
-                    "external worker '{worker}' is still silent after {} repair attempts",
-                    job.repair_attempts
-                ),
-                None => format!(
-                    "exceeded maximum repair attempts ({})",
-                    self.max_repair_attempts
-                ),
-            };
             return Ok(RepairResult::ManualRequired {
-                message: format!("Job {} {cause}", job.job_id),
+                message: format!(
+                    "Job {} has exceeded maximum repair attempts ({})",
+                    job.job_id, self.max_repair_attempts
+                ),
             });
         }
 
@@ -365,17 +377,9 @@ impl SelfRepair for DefaultSelfRepair {
         match result {
             Ok(Ok(())) => {
                 tracing::info!("Successfully recovered job {}", job.job_id);
-                // WI#475: the external worker keeps running on its own; this
-                // state flip does not retry or restart it, so say so.
-                let message = match job.external_worker.as_deref() {
-                    Some(worker) => format!(
-                        "Job {} idle baseline reset (external worker '{worker}' keeps running; \
-                         the daemon does not retry external tasks)",
-                        job.job_id
-                    ),
-                    None => format!("Job {} recovered and will be retried", job.job_id),
-                };
-                Ok(RepairResult::Success { message })
+                Ok(RepairResult::Success {
+                    message: format!("Job {} recovered and will be retried", job.job_id),
+                })
             }
             Ok(Err(e)) => {
                 tracing::warn!("Failed to recover job {}: {}", job.job_id, e);
@@ -781,8 +785,8 @@ mod tests {
         );
     }
 
-    /// WI#475: an external job that exceeds the limit names the worker and
-    /// the daemon never claims it "will be retried".
+    /// WI#475: an external job names the worker and explains that the daemon
+    /// cannot retry it, even before the local repair-attempt limit.
     #[tokio::test]
     async fn repair_stuck_external_job_message_is_truthful() {
         let cm = Arc::new(ContextManager::new(10));
@@ -794,7 +798,7 @@ mod tests {
             last_activity: Utc::now(),
             stuck_duration: Duration::from_secs(2000),
             last_error: None,
-            repair_attempts: 2, // == max
+            repair_attempts: 0,
             external_worker: Some("kimi".to_string()),
         };
 
@@ -805,50 +809,48 @@ mod tests {
                     message.contains("kimi"),
                     "message names the worker: {message}"
                 );
-                assert!(
-                    !message.contains("will be retried"),
-                    "external jobs are not retried by the daemon: {message}"
-                );
+                assert!(message.contains("cannot retry external tasks"));
+                assert!(!message.contains("idle baseline reset"));
             }
             other => panic!("Expected ManualRequired, got: {other:?}"),
         }
     }
 
-    /// WI#475: a successful external recovery does not claim "retried".
+    /// WI#475 PS-1: external repair is a one-time manual outcome, not a no-op
+    /// state flip. Repeated sweeps never claim recovery or consume attempts.
     #[tokio::test]
-    async fn repair_stuck_external_job_success_is_not_retried() {
+    async fn external_stuck_job_stays_stuck_and_alerts_once_across_sweeps() {
         let cm = Arc::new(ContextManager::new(10));
         let job_id = cm.create_job("External recoverable", "desc").await.unwrap();
         cm.update_context(job_id, |ctx| ctx.transition_to(JobState::InProgress, None))
             .await
             .unwrap()
             .unwrap();
-        cm.update_context(job_id, |ctx| ctx.transition_to(JobState::Stuck, None))
-            .await
-            .unwrap()
-            .unwrap();
+        cm.update_context(job_id, |ctx| {
+            ctx.external_worker = Some("pebble".to_string());
+            ctx.started_at = Some(Utc::now() - chrono::Duration::seconds(2000));
+        })
+        .await
+        .unwrap();
 
-        let repair = DefaultSelfRepair::new(Arc::clone(&cm), Duration::from_secs(60), 3);
-        let stuck_job = StuckJob {
-            job_id,
-            last_activity: Utc::now(),
-            stuck_duration: Duration::from_secs(120),
-            last_error: None,
-            repair_attempts: 0,
-            external_worker: Some("pebble".to_string()),
-        };
+        let repair = DefaultSelfRepair::new(Arc::clone(&cm), Duration::from_secs(0), 3)
+            .with_external_stuck_threshold(Duration::from_secs(0));
+        let mut manual_alerts = 0;
 
-        let result = repair.repair_stuck_job(&stuck_job).await.unwrap();
-        match result {
-            RepairResult::Success { message } => {
-                assert!(message.contains("pebble"));
-                assert!(
-                    !message.contains("will be retried"),
-                    "external recovery must not claim retry: {message}"
-                );
+        for _ in 0..5 {
+            let detected = repair.detect_stuck_jobs().await;
+            for job in detected {
+                let result = repair.repair_stuck_job(&job).await.unwrap();
+                if matches!(result, RepairResult::ManualRequired { .. }) {
+                    manual_alerts += 1;
+                }
             }
-            other => panic!("Expected Success, got: {other:?}"),
+            let ctx = cm.get_context(job_id).await.unwrap();
+            assert_eq!(ctx.state, JobState::Stuck);
+            assert_eq!(ctx.repair_attempts, 0);
         }
+
+        assert_eq!(manual_alerts, 1, "only the first sweep may alert");
     }
 
     /// WI#475: once the manual alert went out, `detect_stuck_jobs` no longer
