@@ -126,6 +126,50 @@ class ConfigHalfTests(unittest.TestCase):
         self.assert_refused(config, "OPENCODE_DISABLE_AUTOUPDATE")
 
 
+class RegistryRequestTests(unittest.TestCase):
+    def setUp(self):
+        self.module = load_verify_module()
+        self.request = self.module.urllib.request.Request("https://registry.example/v2/test")
+
+    def http_error(self, status: int):
+        return self.module.urllib.error.HTTPError(
+            self.request.full_url, status, "request failed", {}, io.BytesIO(),
+        )
+
+    def test_transient_registry_errors_are_retried(self):
+        with mock.patch.object(
+            self.module.urllib.request, "urlopen",
+            side_effect=[self.http_error(429), self.http_error(503), io.BytesIO(b'{"ok": true}')],
+        ) as fetch, mock.patch.object(self.module.time, "sleep") as sleep:
+            payload = self.module._registry_json(
+                self.request, timeout=60, description="registry probe",
+            )
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(fetch.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 4])
+
+    def test_persistent_rate_limit_fails_after_bounded_retries(self):
+        with mock.patch.object(
+            self.module.urllib.request, "urlopen", side_effect=self.http_error(429),
+        ) as fetch, mock.patch.object(self.module.time, "sleep") as sleep, \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+            with self.assertRaises(SystemExit):
+                self.module._registry_json(self.request, timeout=60, description="registry probe")
+        self.assertEqual(fetch.call_count, 4)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 4, 8])
+        self.assertIn("HTTP Error 429", stderr.getvalue())
+
+    def test_permanent_http_error_is_not_retried(self):
+        with mock.patch.object(
+            self.module.urllib.request, "urlopen", side_effect=self.http_error(400),
+        ) as fetch, mock.patch.object(self.module.time, "sleep") as sleep, \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.module._registry_json(self.request, timeout=60, description="registry probe")
+        self.assertEqual(fetch.call_count, 1)
+        sleep.assert_not_called()
+
+
 class LocalImageInspectTests(unittest.TestCase):
     def setUp(self):
         self.module = load_verify_module()
@@ -382,6 +426,11 @@ class FilesystemExportTests(unittest.TestCase):
                     self.fixture.add_symlink(name, "/bin/sh")
                 self.fixture.write(self.archive)
                 self.assert_refused("protected path")
+
+    def test_node_modules_setgid_directory_is_refused(self):
+        self.fixture.add_dir("app/node_modules", mode=0o2755)
+        self.fixture.write(self.archive)
+        self.assert_refused("privilege or write bits 2755")
 
     def test_real_binary_privilege_bits_and_capabilities_are_refused(self):
         for mode in (0o4755, 0o2755):
