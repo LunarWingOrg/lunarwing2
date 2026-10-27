@@ -525,7 +525,9 @@ mod tests {
         }
 
         assert_eq!(
-            manager.find_awaiting_approval_thread("user-1", request_id).await,
+            manager
+                .find_awaiting_approval_thread("user-1", request_id)
+                .await,
             Some(thread_id),
             "the owning thread is derived from the pending request id"
         );

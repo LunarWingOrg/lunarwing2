@@ -1500,7 +1500,8 @@ pub(crate) async fn chat_approval_handler(
     // sent without `thread_id` matched no gate and still returned 202, leaving
     // the gate (and for `deny`, the action) untouched.
     let thread_id =
-        resolve_approval_thread(&state, &user.user_id, request_id, req.thread_id.as_deref()).await?;
+        resolve_approval_thread(&state, &user.user_id, request_id, req.thread_id.as_deref())
+            .await?;
 
     // Build a structured ExecApproval submission as JSON, sent through the
     // existing message pipeline so the agent loop picks it up.
