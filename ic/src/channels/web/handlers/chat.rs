@@ -77,77 +77,11 @@ pub async fn chat_send_handler(
 }
 
 pub async fn chat_approval_handler(
-    State(state): State<Arc<GatewayState>>,
-    AuthenticatedUser(identity): AuthenticatedUser,
-    Json(req): Json<ApprovalRequest>,
+    state: State<Arc<GatewayState>>,
+    user: AuthenticatedUser,
+    req: Json<ApprovalRequest>,
 ) -> Result<(StatusCode, Json<SendMessageResponse>), (StatusCode, String)> {
-    let (approved, always) = match req.action.as_str() {
-        "approve" => (true, false),
-        "always" => (true, true),
-        "deny" => (false, false),
-        other => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("Unknown action: {}", other),
-            ));
-        }
-    };
-
-    let request_id = Uuid::parse_str(&req.request_id).map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            "Invalid request_id (expected UUID)".to_string(),
-        )
-    })?;
-
-    // Build a structured ExecApproval submission as JSON, sent through the
-    // existing message pipeline so the agent loop picks it up.
-    let approval = crate::agent::submission::Submission::ExecApproval {
-        request_id,
-        approved,
-        always,
-    };
-    let content = serde_json::to_string(&approval).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to serialize approval: {}", e),
-        )
-    })?;
-
-    let mut msg = IncomingMessage::new("gateway", &identity.user_id, content);
-
-    if let Some(ref thread_id) = req.thread_id {
-        msg = msg.with_thread(thread_id);
-    }
-
-    let msg_id = msg.id;
-
-    // Clone sender to avoid holding RwLock read guard across send().await
-    let tx = {
-        let tx_guard = state.msg_tx.read().await;
-        tx_guard
-            .as_ref()
-            .ok_or((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Channel not started".to_string(),
-            ))?
-            .clone()
-    };
-
-    tx.send(msg).await.map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Channel closed".to_string(),
-        )
-    })?;
-
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(SendMessageResponse {
-            message_id: msg_id,
-            status: "accepted",
-        }),
-    ))
+    crate::channels::web::server::chat_approval_handler(state, user, req).await
 }
 
 /// Submit an auth token directly to the extension manager, bypassing the message pipeline.
