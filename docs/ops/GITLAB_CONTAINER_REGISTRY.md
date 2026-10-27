@@ -163,10 +163,19 @@ Details:
 - Candidate and promotion jobs are non-interruptible and have retries disabled,
   so redundant-pipeline cancellation or automatic timeout retries cannot hide a
   partial registry operation.
-- The digest-pinned `moby/buildkit:v0.31.1-rootless` image runs without a Docker
+- The digest-pinned `moby/buildkit:v0.34.1-rootless` image runs without a Docker
   daemon or privileged container. The protected `container-build` runner must
   allow the narrow user-namespace/mount syscall set BuildKit needs; never mount
   a Docker socket or disable seccomp wholesale.
+- WI#495 rollout remains pending until all four protected candidates (pebble,
+  opencode, opencode2 and kimi) pass on the new daemon. A green MR pipeline does
+  not exercise these jobs. Rootless output changed in BuildKit v0.33.0, so image
+  digests may differ from older-daemon builds; the reproducibility gate compares
+  two builds on the same daemon. If rollout fails, revert the complete MR with
+  `git revert -m 1 <MR-merge-commit>` (or `git revert <squash-commit>` if squashed),
+  not the YAML alone: validator, fixtures and docs must stay synchronized.
+  Rollback reinstates a daemon with known advisories; pause candidate publication
+  until repaired rather than weakening the runner's isolation or verification.
 - Worker source revisions, base images, npm/Bun/Cargo locks, Debian snapshots,
   and optional Rust/Go downloads are fixed in source. Build arguments are
   hard-coded in `.gitlab/scripts/build-worker-image.sh`, not pipeline variables.

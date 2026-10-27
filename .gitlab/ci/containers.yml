@@ -5,7 +5,7 @@
 .worker-candidate:
   image:
     # Trust-sensitive publication images are literal pins, not pipeline-overridable variables.
-    name: "docker.io/moby/buildkit:v0.31.1-rootless@sha256:946cf909534b789c9b84af75e6d4f8cb23c3b9cb387daec5ba0f4878a3e4647c"
+    name: "docker.io/moby/buildkit:v0.34.1-rootless@sha256:f68752a5a94acfcdad2d07867b7075601a421638e17fc5f28efc1c814d0c4f89"
     entrypoint: [""]
   tags:
     - container-build
