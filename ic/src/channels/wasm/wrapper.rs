@@ -59,6 +59,13 @@ use crate::tools::wasm::WasmResourceLimiter;
 use crate::tools::wasm::credential_injector::{
     InjectedCredentials, host_matches_pattern, inject_credential,
 };
+use crate::tools::wasm::http_security::{
+    RedactionNeedle, collect_capped_response_body, private_http_targets_allowed,
+    push_credential_needles, redact_cross_field_echoes, redact_text_with_needles,
+    replace_all_bytes, sort_redaction_needles, vet_http_target,
+};
+#[cfg(test)]
+use crate::tools::wasm::http_security::{encoded_spellings, form_encode_secret};
 
 // Generate component model bindings from the WIT file
 wasmtime::component::bindgen!({
@@ -86,6 +93,58 @@ struct ResolvedHostCredential {
     secret_value: String,
 }
 
+type SharedBridgeOrigins = Arc<std::sync::RwLock<Vec<String>>>;
+
+const BRIDGE_ORIGIN_KEYS: [&str; 5] = [
+    "bridge_url",
+    "adapter_url",
+    "relay_url",
+    "ws_adapter_url",
+    "multica_url",
+];
+
+fn configured_bridge_origins(config_json: &str) -> Vec<String> {
+    let Ok(config) = serde_json::from_str::<HashMap<String, serde_json::Value>>(config_json) else {
+        return Vec::new();
+    };
+    let mut origins: Vec<String> = BRIDGE_ORIGIN_KEYS
+        .iter()
+        .filter_map(|key| config.get(*key))
+        .filter_map(serde_json::Value::as_str)
+        .filter_map(loopback_bridge_origin)
+        .collect();
+    origins.sort();
+    origins.dedup();
+    origins
+}
+
+fn loopback_bridge_origin(raw_url: &str) -> Option<String> {
+    let url = url::Url::parse(raw_url).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    let loopback = match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    };
+    loopback.then(|| url.origin().ascii_serialization())
+}
+
+fn matches_bridge_origin(raw_url: &str, allowed_origins: &[String]) -> bool {
+    url::Url::parse(raw_url).ok().is_some_and(|url| {
+        url.username().is_empty()
+            && url.password().is_none()
+            && allowed_origins
+                .iter()
+                .any(|origin| origin == &url.origin().ascii_serialization())
+    })
+}
+
 /// Store data for WASM channel execution.
 ///
 /// Contains the resource limiter, channel-specific host state, and WASI context.
@@ -105,6 +164,11 @@ struct ChannelStoreData {
     /// Dedicated tokio runtime for HTTP requests, lazily initialized.
     /// Reused across multiple `http_request` calls within one execution.
     http_runtime: Option<tokio::runtime::Runtime>,
+    /// Explicit global escape hatch, captured at construction so tests never
+    /// mutate process-wide environment state.
+    allow_private_ips: bool,
+    /// Exact configured loopback bridge origins exempt from the private guard.
+    allowed_bridge_origins: SharedBridgeOrigins,
     /// Whether the most recent exchange had a credential injected
     /// (placeholder or host credential); scopes the identity-encoding
     /// request and the opaque-body refusal (HJ-1/HQ-2 parity).
@@ -132,8 +196,15 @@ impl ChannelStoreData {
             host_credentials,
             pairing_store,
             http_runtime: None,
+            allow_private_ips: private_http_targets_allowed(),
+            allowed_bridge_origins: Arc::new(std::sync::RwLock::new(Vec::new())),
             last_http_exchange_had_credentials: false,
         }
+    }
+
+    fn with_bridge_origins(mut self, origins: SharedBridgeOrigins) -> Self {
+        self.allowed_bridge_origins = origins;
+        self
     }
 
     /// Inject credentials into a string by replacing placeholders.
@@ -184,76 +255,60 @@ impl ChannelStoreData {
         result
     }
 
-    /// Replace injected credential values with `[REDACTED]` in text.
-    ///
-    /// Prevents credentials from leaking through error messages, logs, or
-    /// return values to WASM. reqwest::Error includes the full URL in its
-    /// Display output, so any error from an injected-URL request will
-    /// contain the raw credential unless we scrub it.
-    ///
-    /// Scrubs the raw spelling plus both encoded spellings of each secret
-    /// (WI#408): `urlencoding::encode` and the `application/x-www-form-urlencoded`
-    /// form produced by `query_pairs_mut` query-param injection. The two
-    /// encoders differ for space, `~` and `*`, so scrubbing only one leaves
-    /// the other intact in an echo.
-    fn redact_credentials(&self, text: &str) -> String {
-        let mut result = text.to_string();
+    fn redaction_needles(&self) -> Vec<RedactionNeedle> {
+        let mut needles = Vec::new();
         for (name, value) in &self.credentials {
-            if !value.is_empty() {
-                let tag = format!("[REDACTED:{}]", name);
-                result = result.replace(value, &tag);
-                result = replace_encoded_spellings(&result, value, &tag);
-            }
+            push_credential_needles(&mut needles, value, &format!("[REDACTED:{name}]"));
         }
         for cred in &self.host_credentials {
-            let tag = "[REDACTED:host_credential]";
-            for needle in host_credential_needles(cred) {
-                result = result.replace(needle, tag);
-                result = replace_encoded_spellings(&result, needle, tag);
+            for value in host_credential_needles(cred) {
+                push_credential_needles(&mut needles, value, "[REDACTED:host_credential]");
             }
         }
-        result
+        sort_redaction_needles(&mut needles);
+        needles
     }
 
-    /// Byte-level credential scrub for response bodies (WI#408): bodies are
-    /// not guaranteed UTF-8, so the raw and both encoded spellings are
-    /// replaced at the byte level rather than through lossy string
-    /// conversion.
+    /// Replace injected credential values with `[REDACTED]` in text.
+    /// Longest-first ordering keeps one credential nested inside another from
+    /// leaving a visible remainder (WI#432).
+    fn redact_credentials(&self, text: &str) -> String {
+        redact_text_with_needles(text, &self.redaction_needles())
+    }
+
+    /// Byte-level credential scrub for response bodies, including the raw,
+    /// URL/form, URL-parser, JSON-string and hexadecimal spellings (WI#432).
     fn redact_credential_bytes(&self, mut bytes: Vec<u8>) -> Vec<u8> {
-        for (name, value) in &self.credentials {
-            if !value.is_empty() {
-                let marker = format!("[REDACTED:{name}]").into_bytes();
-                scrub_secret_bytes(&mut bytes, value, &marker);
-            }
-        }
-        for cred in &self.host_credentials {
-            for needle in host_credential_needles(cred) {
-                scrub_secret_bytes(&mut bytes, needle, b"[REDACTED:host_credential]");
-            }
+        for needle in self.redaction_needles() {
+            replace_all_bytes(
+                &mut bytes,
+                needle.value.as_bytes(),
+                needle.marker.as_bytes(),
+            );
         }
         bytes
     }
 
-    /// Redact credentials from a serialized headers map at the field level
-    /// (WI#408): a secret containing `"` or `\` is JSON-escaped in the
-    /// serialized form, so string-level replacement can miss it, and a blind
-    /// string replace could even produce invalid JSON. Parsing first and
-    /// redacting each name and value keeps the output valid for any secret
-    /// bytes.
+    /// Redact credentials from a serialized headers map at the field level.
+    /// Cross-field echoes replace both complete values before per-field
+    /// scrubbing, so neither side of a split secret survives (WI#432).
     fn redact_headers_json(&self, headers_json: &str) -> String {
-        let Ok(map) = serde_json::from_str::<HashMap<String, String>>(headers_json) else {
-            return self.redact_credentials(headers_json);
+        let needles = self.redaction_needles();
+        let Ok(mut map) = serde_json::from_str::<HashMap<String, String>>(headers_json) else {
+            return redact_text_with_needles(headers_json, &needles);
         };
+        redact_cross_field_echoes(&mut map, &needles);
         let redacted: HashMap<String, String> = map
             .into_iter()
             .map(|(name, value)| {
                 (
-                    self.redact_credentials(&name),
-                    self.redact_credentials(&value),
+                    redact_text_with_needles(&name, &needles),
+                    redact_text_with_needles(&value, &needles),
                 )
             })
             .collect();
-        serde_json::to_string(&redacted).unwrap_or_else(|_| self.redact_credentials(headers_json))
+        serde_json::to_string(&redacted)
+            .unwrap_or_else(|_| redact_text_with_needles(headers_json, &needles))
     }
 
     /// Apply the guest-facing redaction to one HTTP exchange outcome
@@ -271,6 +326,15 @@ impl ChannelStoreData {
     ) -> Result<lunarwing::agent::channel_host::HttpResponse, String> {
         match outcome {
             Ok(mut resp) => {
+                if self.last_http_exchange_had_credentials && resp.status == 206 {
+                    tracing::warn!(
+                        "WASM channel http_request: refused partial response on a credentialed exchange"
+                    );
+                    return Err(
+                        "HTTP response refused: partial content cannot be inspected for echoed credentials"
+                            .to_string(),
+                    );
+                }
                 if self.last_http_exchange_had_credentials
                     && !resp.body.is_empty()
                     && guest_body_encoding_is_opaque(&resp.headers_json)
@@ -452,13 +516,14 @@ impl ChannelStoreData {
                 self.inject_host_credentials(&host, &mut headers, &mut url);
         }
 
-        // HJ-1/HQ-2 parity with the tool wrapper: a credential-injected
-        // exchange asks for identity only (every guest spelling replaced)
-        // and offers no transfer codings; opaque answers are refused at the
-        // boundary.
+        // Credentialed exchanges use inspectable identity responses and cannot
+        // split an echo across transfer codings or byte ranges (WI#432).
         if self.last_http_exchange_had_credentials {
             headers.retain(|k, _| {
-                !k.eq_ignore_ascii_case("accept-encoding") && !k.eq_ignore_ascii_case("te")
+                !k.eq_ignore_ascii_case("accept-encoding")
+                    && !k.eq_ignore_ascii_case("te")
+                    && !k.eq_ignore_ascii_case("range")
+                    && !k.eq_ignore_ascii_case("if-range")
             });
             headers.insert("accept-encoding".to_string(), "identity".to_string());
         }
@@ -472,6 +537,17 @@ impl ChannelStoreData {
             .as_ref()
             .map(|h| h.max_response_bytes)
             .unwrap_or(10 * 1024 * 1024);
+
+        let configured_bridge = self
+            .allowed_bridge_origins
+            .read()
+            .map(|origins| matches_bridge_origin(&url, &origins))
+            .unwrap_or(false);
+        let vetted_target = if !configured_bridge && !self.allow_private_ips {
+            Some(vet_http_target(&url)?)
+        } else {
+            None
+        };
 
         // Make the HTTP request using a dedicated single-threaded runtime.
         // We're inside spawn_blocking, so we can't rely on the main runtime's
@@ -491,9 +567,14 @@ impl ChannelStoreData {
             // Never follow redirects: reqwest's default policy keeps custom
             // credential headers across hosts and skips the allowlist; the
             // 3xx is returned to the guest (redacted) like the tool wrapper.
-            let client = reqwest::Client::builder()
+            let client_builder = reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))
-                .redirect(reqwest::redirect::Policy::none())
+                .redirect(reqwest::redirect::Policy::none());
+            let client_builder = match &vetted_target {
+                Some(target) => target.pin_client(client_builder),
+                None => client_builder,
+            };
+            let client = client_builder
                 .build()
                 .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 
@@ -542,28 +623,13 @@ impl ChannelStoreData {
             let response_headers = guest_response_headers(response.headers());
             let headers_json = serde_json::to_string(&response_headers).unwrap_or_default();
 
-            // Enforce max response body size to prevent memory exhaustion.
-            let max_response = max_response_bytes;
-            if let Some(cl) = response.content_length()
-                && cl as usize > max_response
-            {
-                return Err(format!(
-                    "Response body too large: {} bytes exceeds limit of {} bytes",
-                    cl, max_response
-                ));
-            }
-            let body = response
-                .bytes()
-                .await
-                .map_err(|e| format!("Failed to read response body: {}", e.without_url()))?;
-            if body.len() > max_response {
-                return Err(format!(
-                    "Response body too large: {} bytes exceeds limit of {} bytes",
-                    body.len(),
-                    max_response
-                ));
-            }
-            let body = body.to_vec();
+            let content_length = response.content_length();
+            let body_stream = futures::StreamExt::map(response.bytes_stream(), |chunk| {
+                chunk.map_err(|error| error.without_url())
+            });
+            let body =
+                collect_capped_response_body(body_stream, content_length, max_response_bytes)
+                    .await?;
 
             tracing::info!(
                 status = status,
@@ -840,6 +906,9 @@ pub struct WasmChannel {
     /// Wrapped in RwLock to allow updating before start.
     config_json: RwLock<String>,
 
+    /// Loopback bridge origins derived from the current channel configuration.
+    allowed_bridge_origins: SharedBridgeOrigins,
+
     /// Channel configuration returned by on_start.
     channel_config: RwLock<Option<ChannelConfig>>,
 
@@ -1099,6 +1168,9 @@ impl WasmChannel {
     ) -> Self {
         let name = prepared.name.clone();
         let rate_limiter = ChannelEmitRateLimiter::new(capabilities.emit_rate_limit.clone());
+        let allowed_bridge_origins = Arc::new(std::sync::RwLock::new(configured_bridge_origins(
+            &config_json,
+        )));
 
         Self {
             name,
@@ -1106,6 +1178,7 @@ impl WasmChannel {
             prepared,
             capabilities,
             config_json: RwLock::new(config_json),
+            allowed_bridge_origins,
             channel_config: RwLock::new(None),
             message_tx: Arc::new(RwLock::new(None)),
             pending_responses: RwLock::new(HashMap::new()),
@@ -1195,6 +1268,14 @@ impl WasmChannel {
 
         // Serialize back
         *config_guard = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
+        let origins = configured_bridge_origins(&config_guard);
+        match self.allowed_bridge_origins.write() {
+            Ok(mut allowed) => *allowed = origins,
+            Err(_) => tracing::error!(
+                channel = %self.name,
+                "Bridge-origin policy lock poisoned; configured exemptions unavailable"
+            ),
+        }
 
         // Log a sanitized summary only. The merged config frequently contains
         // host-injected secrets (xmpp_password, relay_password, adapter tokens),
@@ -1361,6 +1442,7 @@ impl WasmChannel {
         credentials: HashMap<String, String>,
         host_credentials: Vec<ResolvedHostCredential>,
         pairing_store: Arc<PairingStore>,
+        allowed_bridge_origins: SharedBridgeOrigins,
     ) -> Result<Store<ChannelStoreData>, WasmChannelError> {
         let engine = runtime.engine();
         let limits = &prepared.limits;
@@ -1373,7 +1455,8 @@ impl WasmChannel {
             credentials,
             host_credentials,
             pairing_store,
-        );
+        )
+        .with_bridge_origins(allowed_bridge_origins);
         let mut store = Store::new(engine, store_data);
 
         // Configure fuel if enabled
@@ -1541,6 +1624,7 @@ impl WasmChannel {
         )
         .await;
         let pairing_store = self.pairing_store.clone();
+        let allowed_bridge_origins = self.allowed_bridge_origins.clone();
         let workspace_store = self.workspace_store.clone();
 
         tokio::time::timeout(timeout, async move {
@@ -1552,6 +1636,7 @@ impl WasmChannel {
                     credentials,
                     host_credentials,
                     pairing_store,
+                    allowed_bridge_origins,
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -1702,6 +1787,7 @@ impl WasmChannel {
         )
         .await;
         let pairing_store = self.pairing_store.clone();
+        let allowed_bridge_origins = self.allowed_bridge_origins.clone();
         // Prepare request data
         let method = method.to_string();
         let path = path.to_string();
@@ -1721,6 +1807,7 @@ impl WasmChannel {
                     credentials,
                     host_credentials,
                     pairing_store,
+                    allowed_bridge_origins,
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -1848,6 +1935,7 @@ impl WasmChannel {
         )
         .await;
         let pairing_store = self.pairing_store.clone();
+        let allowed_bridge_origins = self.allowed_bridge_origins.clone();
 
         // Execute in blocking task with timeout
         let result = tokio::time::timeout(timeout, async move {
@@ -1859,6 +1947,7 @@ impl WasmChannel {
                     credentials,
                     host_credentials,
                     pairing_store,
+                    allowed_bridge_origins,
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -1949,6 +2038,7 @@ impl WasmChannel {
         )
         .await;
         let pairing_store = self.pairing_store.clone();
+        let allowed_bridge_origins = self.allowed_bridge_origins.clone();
 
         // Prepare response data
         let message_id_str = message_id.to_string();
@@ -1978,6 +2068,7 @@ impl WasmChannel {
                     credentials,
                     host_credentials,
                     pairing_store,
+                    allowed_bridge_origins,
                 )?;
 
                 tracing::info!("Instantiating WASM component for on_respond");
@@ -2093,6 +2184,7 @@ impl WasmChannel {
         )
         .await;
         let pairing_store = self.pairing_store.clone();
+        let allowed_bridge_origins = self.allowed_bridge_origins.clone();
 
         let user_id = user_id.to_string();
         let content = content.to_string();
@@ -2116,6 +2208,7 @@ impl WasmChannel {
                     credentials,
                     host_credentials,
                     pairing_store,
+                    allowed_bridge_origins,
                 )?;
 
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
@@ -2200,6 +2293,7 @@ impl WasmChannel {
         )
         .await;
         let pairing_store = self.pairing_store.clone();
+        let allowed_bridge_origins = self.allowed_bridge_origins.clone();
 
         let Some(wit_update) = status_to_wit(status, metadata) else {
             return Ok(());
@@ -2214,6 +2308,7 @@ impl WasmChannel {
                     credentials,
                     host_credentials,
                     pairing_store,
+                    allowed_bridge_origins,
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -2261,6 +2356,7 @@ impl WasmChannel {
         credentials: &RwLock<HashMap<String, String>>,
         host_credentials: Vec<ResolvedHostCredential>,
         pairing_store: Arc<PairingStore>,
+        allowed_bridge_origins: SharedBridgeOrigins,
         timeout: Duration,
         wit_update: wit_channel::StatusUpdate,
     ) -> Result<(), WasmChannelError> {
@@ -2283,6 +2379,7 @@ impl WasmChannel {
                     credentials_snapshot,
                     host_credentials,
                     pairing_store,
+                    allowed_bridge_origins,
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -2384,6 +2481,7 @@ impl WasmChannel {
                 )
                 .await;
                 let pairing_store = self.pairing_store.clone();
+                let allowed_bridge_origins = self.allowed_bridge_origins.clone();
                 let callback_timeout = self.runtime.config().callback_timeout;
                 let Some(wit_update) = status_to_wit(&status, metadata) else {
                     return Ok(());
@@ -2408,6 +2506,7 @@ impl WasmChannel {
                             &credentials,
                             hc,
                             pairing_store.clone(),
+                            allowed_bridge_origins.clone(),
                             callback_timeout,
                             wit_update_clone,
                         )
@@ -2578,6 +2677,7 @@ impl WasmChannel {
         let rate_limiter = self.rate_limiter.clone();
         let credentials = self.credentials.clone();
         let pairing_store = self.pairing_store.clone();
+        let allowed_bridge_origins = self.allowed_bridge_origins.clone();
         let callback_timeout = self.runtime.config().callback_timeout;
         let workspace_store = self.workspace_store.clone();
         let last_broadcast_metadata = self.last_broadcast_metadata.clone();
@@ -2604,6 +2704,7 @@ impl WasmChannel {
                     let rl = rate_limiter.clone();
                     let creds = credentials.clone();
                     let ps = pairing_store.clone();
+                    let bridge_origins = allowed_bridge_origins.clone();
                     let ws = workspace_store.clone();
                     let lbm = last_broadcast_metadata.clone();
                     let ss = settings_store.clone();
@@ -2639,6 +2740,7 @@ impl WasmChannel {
                                 &creds,
                                 host_credentials,
                                 ps.clone(),
+                                bridge_origins.clone(),
                                 callback_timeout,
                                 &ws,
                             )
@@ -2784,6 +2886,7 @@ impl WasmChannel {
         credentials: &RwLock<HashMap<String, String>>,
         host_credentials: Vec<ResolvedHostCredential>,
         pairing_store: Arc<PairingStore>,
+        allowed_bridge_origins: SharedBridgeOrigins,
         timeout: Duration,
         workspace_store: &Arc<ChannelWorkspaceStore>,
     ) -> Result<PollExecution, WasmChannelError> {
@@ -2812,6 +2915,7 @@ impl WasmChannel {
                     credentials_snapshot,
                     host_credentials,
                     pairing_store,
+                    allowed_bridge_origins,
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -3668,60 +3772,6 @@ impl HttpResponse {
     }
 }
 
-/// The `application/x-www-form-urlencoded` spelling of a secret, matching
-/// what `query_pairs_mut().append_pair()` produces when host query-param
-/// credentials are injected (WI#408). It differs from
-/// `urlencoding::encode` for space (`+` vs `%20`), `~` (`%7E` vs `~`) and
-/// `*` (`*` vs `%2A`), so an echo of the injected URL can carry this form.
-fn form_encode_secret(secret: &str) -> String {
-    url::form_urlencoded::byte_serialize(secret.as_bytes()).collect()
-}
-
-/// Replace every encoded spelling of a secret in text (WI#408): the
-/// `urlencoding::encode` form, the form (`query_pairs_mut`) form, and the
-/// URL-parser spellings (IO-3).
-fn replace_encoded_spellings(text: &str, secret: &str, tag: &str) -> String {
-    let mut result = text.to_string();
-    for encoded in encoded_spellings(secret) {
-        result = result.replace(encoded.as_str(), tag);
-    }
-    result
-}
-
-/// Every non-raw spelling the host itself can put on the wire for `secret`:
-/// `urlencoding::encode`, the form spelling (`append_pair` query injection)
-/// and the WHATWG URL parser spellings a placeholder substituted raw into a
-/// URL path or query takes when reqwest re-parses the injected URL. Empty
-/// and raw-identical spellings are dropped (an empty needle would match
-/// everywhere).
-fn encoded_spellings(secret: &str) -> Vec<String> {
-    let mut out = vec![
-        urlencoding::encode(secret).to_string(),
-        form_encode_secret(secret),
-    ];
-    if let Ok(mut parsed) = url::Url::parse("http://redaction.invalid/") {
-        parsed.set_query(Some(secret));
-        if let Some(query) = parsed.query() {
-            out.push(query.to_string());
-        }
-        parsed.set_query(None);
-        parsed.set_path(secret);
-        out.push(parsed.path().trim_start_matches('/').to_string());
-    }
-    // An upstream that parses a raw-substituted query placeholder reads '+'
-    // as a space and decodes %XX escapes; echoing the parsed value gives
-    // these spellings (run-143 JQ).
-    for candidate in [secret.replace('+', " "), secret.to_string()] {
-        if let Ok(decoded) = urlencoding::decode(&candidate) {
-            out.push(decoded.into_owned());
-        }
-    }
-    out.retain(|spelling| !spelling.is_empty() && spelling != secret);
-    out.sort();
-    out.dedup();
-    out
-}
-
 /// Needles for one host credential: the raw secret plus the credential
 /// token of every injected header value (the Basic-auth base64 of
 /// `user:secret` never contains the raw secret).
@@ -3808,41 +3858,6 @@ fn transfer_coding_keeps_framing(value: &str) -> bool {
         .last()
         .is_some_and(|token| token.eq_ignore_ascii_case("chunked"));
     !(non_empty == 1 && last_is_chunked)
-}
-
-/// Byte-level scrub of every spelling of `secret` (WI#408): response bodies
-/// are not guaranteed UTF-8, so string-level replacement cannot be used.
-fn scrub_secret_bytes(bytes: &mut Vec<u8>, secret: &str, marker: &[u8]) {
-    replace_all_bytes(bytes, secret.as_bytes(), marker);
-    for encoded in encoded_spellings(secret) {
-        replace_all_bytes(bytes, encoded.as_bytes(), marker);
-    }
-}
-
-/// Replace every occurrence of `needle` in `haystack` with `marker`, at the
-/// byte level (WI#408 — response bodies are not guaranteed UTF-8, so
-/// string-level replacement cannot be used on them).
-fn replace_all_bytes(haystack: &mut Vec<u8>, needle: &[u8], marker: &[u8]) {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return;
-    }
-    // One pass into a fresh buffer: splicing in place is O(body x matches).
-    let mut out = Vec::with_capacity(haystack.len());
-    let mut i = 0;
-    let mut changed = false;
-    while i < haystack.len() {
-        if haystack[i..].starts_with(needle) {
-            out.extend_from_slice(marker);
-            i += needle.len();
-            changed = true;
-        } else {
-            out.push(haystack[i]);
-            i += 1;
-        }
-    }
-    if changed {
-        *haystack = out;
-    }
 }
 
 /// Extract the hostname from a URL string.
@@ -4059,8 +4074,8 @@ mod tests {
     };
     use crate::channels::wasm::schema::ChannelCapabilitiesFile;
     use crate::channels::wasm::wrapper::{
-        EmitDispatchContext, HttpResponse, POLL_FAILURE_HEALTH_THRESHOLD, WasmChannel,
-        WasmChannelHealthState, resolve_owner_broadcast_target, status_to_wit,
+        ChannelStoreData, EmitDispatchContext, HttpResponse, POLL_FAILURE_HEALTH_THRESHOLD,
+        WasmChannel, WasmChannelHealthState, resolve_owner_broadcast_target, status_to_wit,
         uses_owner_broadcast_target,
     };
     use crate::pairing::PairingStore;
@@ -4563,6 +4578,7 @@ mod tests {
             &credentials,
             Vec::new(), // no host credentials in test
             Arc::new(PairingStore::new()),
+            Arc::new(std::sync::RwLock::new(Vec::new())),
             timeout,
             &workspace_store,
         )
@@ -6471,6 +6487,106 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wi432_needles_are_longest_first_and_skip_short_secrets() {
+        use super::{push_credential_needles, redact_text_with_needles, sort_redaction_needles};
+
+        let mut needles = Vec::new();
+        push_credential_needles(&mut needles, "prefix", "[REDACTED:SHORT]");
+        push_credential_needles(&mut needles, "prefixSuffix9", "[REDACTED:LONG]");
+        push_credential_needles(&mut needles, "utf", "[REDACTED:TINY]");
+        sort_redaction_needles(&mut needles);
+
+        let long = needles
+            .iter()
+            .position(|needle| needle.value == "prefixSuffix9")
+            .expect("long needle");
+        let short = needles
+            .iter()
+            .position(|needle| needle.value == "prefix")
+            .expect("short needle");
+        assert!(long < short);
+        assert!(!needles.iter().any(|needle| needle.value == "utf"));
+        assert!(!needles.iter().any(|needle| needle.value == "757474"));
+        assert_eq!(
+            redact_text_with_needles("prefixSuffix9 charset=utf-8", &needles),
+            "[REDACTED:LONG] charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn wi432_short_secret_does_not_mangle_channel_response() {
+        let mut credentials = HashMap::new();
+        credentials.insert("SHORT".to_string(), "utf".to_string());
+        credentials.insert("LONG".to_string(), "longsecret".to_string());
+        let store_data = ChannelStoreData::new(
+            1024 * 1024,
+            "test",
+            ChannelCapabilities::default(),
+            credentials,
+            Vec::new(),
+            Arc::new(PairingStore::new()),
+        );
+
+        assert_eq!(
+            store_data.redact_credentials("charset=utf-8 longsecret"),
+            "charset=utf-8 [REDACTED:LONG]"
+        );
+        assert_eq!(
+            store_data.redact_credential_bytes(b"charset=utf-8 longsecret".to_vec()),
+            b"charset=utf-8 [REDACTED:LONG]"
+        );
+    }
+
+    #[test]
+    fn wi432_body_scrub_covers_json_and_hex_spellings() {
+        let mut credentials = HashMap::new();
+        credentials.insert("API_TOKEN".to_string(), "A\"9z".to_string());
+        let store_data = ChannelStoreData::new(
+            1024 * 1024,
+            "test",
+            ChannelCapabilities::default(),
+            credentials,
+            Vec::new(),
+            Arc::new(PairingStore::new()),
+        );
+
+        let body = br#"raw=A"9z json=A\"9z lower=4122397a upper=4122397A"#.to_vec();
+        let redacted = store_data.redact_credential_bytes(body);
+        assert_eq!(
+            redacted,
+            br#"raw=[REDACTED:API_TOKEN] json=[REDACTED:API_TOKEN] lower=[REDACTED:API_TOKEN] upper=[REDACTED:API_TOKEN]"#
+        );
+    }
+
+    #[test]
+    fn wi432_header_scrub_covers_cross_field_echoes() {
+        let mut credentials = HashMap::new();
+        credentials.insert("API_TOKEN".to_string(), "s3cr3t-value".to_string());
+        let store_data = ChannelStoreData::new(
+            1024 * 1024,
+            "test",
+            ChannelCapabilities::default(),
+            credentials,
+            Vec::new(),
+            Arc::new(PairingStore::new()),
+        );
+        let headers = r#"{"x-first":"s3cr","x-second":"3t-value","x-other":"ok"}"#;
+
+        let redacted = store_data.redact_headers_json(headers);
+        let map: HashMap<String, String> =
+            serde_json::from_str(&redacted).expect("redacted headers remain valid JSON");
+        assert_eq!(
+            map.get("x-first").map(String::as_str),
+            Some("[REDACTED:API_TOKEN]")
+        );
+        assert_eq!(
+            map.get("x-second").map(String::as_str),
+            Some("[REDACTED:API_TOKEN]")
+        );
+        assert_eq!(map.get("x-other").map(String::as_str), Some("ok"));
+    }
+
     /// WI#408 finding 1: host query credentials are injected with
     /// `query_pairs_mut().append_pair` (form spelling) but redaction used to
     /// scrub only the `urlencoding::encode` spelling. The encoders differ
@@ -6744,6 +6860,7 @@ mod tests {
             host_credentials,
             Arc::new(PairingStore::new()),
         );
+        store_data.allow_private_ips = true;
 
         let url = format!("http://{address}/echo");
         let resp = tokio::task::spawn_blocking(move || {
@@ -6846,6 +6963,7 @@ mod tests {
             host_credentials,
             Arc::new(PairingStore::new()),
         );
+        store_data.allow_private_ips = true;
         let resp = store_data
             .http_request(
                 "GET".to_string(),
@@ -6897,6 +7015,7 @@ mod tests {
             Vec::new(),
             Arc::new(PairingStore::new()),
         );
+        store_data.allow_private_ips = true;
         let err = store_data
             .http_request(
                 "GET".to_string(),
@@ -7091,6 +7210,14 @@ mod tests {
         }
 
         fn store(credentials: HashMap<String, String>, host_credential: bool) -> ChannelStoreData {
+            store_with_response_cap(credentials, host_credential, 10 * 1024 * 1024)
+        }
+
+        fn store_with_response_cap(
+            credentials: HashMap<String, String>,
+            host_credential: bool,
+            max_response_bytes: usize,
+        ) -> ChannelStoreData {
             let mut query_params = HashMap::new();
             query_params.insert("api_key".to_string(), SECRET.to_string());
             let host_credentials = if host_credential {
@@ -7104,19 +7231,24 @@ mod tests {
                 Vec::new()
             };
             let mut capabilities = ChannelCapabilities::for_channel("test");
-            capabilities.tool_capabilities.http = Some(HttpCapability::new(vec![
-                EndpointPattern::host("127.0.0.1"),
-                EndpointPattern::host("localhost"),
-                EndpointPattern::host("api.example.com").with_path_prefix("/allowed/"),
-            ]));
-            ChannelStoreData::new(
+            capabilities.tool_capabilities.http = Some(
+                HttpCapability::new(vec![
+                    EndpointPattern::host("127.0.0.1"),
+                    EndpointPattern::host("localhost"),
+                    EndpointPattern::host("api.example.com").with_path_prefix("/allowed/"),
+                ])
+                .with_max_response_bytes(max_response_bytes),
+            );
+            let mut store = ChannelStoreData::new(
                 1024 * 1024,
                 "test",
                 capabilities,
                 credentials,
                 host_credentials,
                 Arc::new(PairingStore::new()),
-            )
+            );
+            store.allow_private_ips = true;
+            store
         }
 
         fn placeholder(value: &str) -> HashMap<String, String> {
@@ -7410,6 +7542,123 @@ mod tests {
             assert!(!err.contains("for url"), "{err}");
         }
 
+        #[test]
+        fn wi432_ranges_are_stripped_and_partial_content_is_refused() {
+            let ok = response("200 OK", &["Content-Length: 2"], "ok");
+            let partial = response("206 Partial Content", &["Content-Length: 4"], "part");
+            let (addr, heads) = serve(vec![ok.clone(), partial, ok]);
+            let guest = r#"{"Range":"bytes=0-1","If-Range":"\"tag\""}"#;
+
+            let first = store(HashMap::new(), true)
+                .http_request(
+                    "GET".to_string(),
+                    format!("http://{addr}/r"),
+                    guest.to_string(),
+                    None,
+                    Some(5000),
+                )
+                .expect("complete response");
+            assert_eq!(first.status, 200);
+            let error = store(HashMap::new(), true)
+                .http_request(
+                    "GET".to_string(),
+                    format!("http://{addr}/r"),
+                    guest.to_string(),
+                    None,
+                    Some(5000),
+                )
+                .expect_err("206 must be refused on a credentialed exchange");
+            assert!(error.contains("partial content"), "{error}");
+            store(HashMap::new(), false)
+                .http_request(
+                    "GET".to_string(),
+                    format!("http://{addr}/r"),
+                    guest.to_string(),
+                    None,
+                    Some(5000),
+                )
+                .expect("ordinary exchanges retain range semantics");
+
+            let heads = heads.lock().expect("lock");
+            assert_eq!(heads.len(), 3);
+            assert!(
+                !heads[0].to_ascii_lowercase().contains("range:"),
+                "{}",
+                heads[0]
+            );
+            let ordinary = heads[2].to_ascii_lowercase();
+            assert!(ordinary.contains("range: bytes=0-1"), "{ordinary}");
+            assert!(ordinary.contains("if-range: \"tag\""), "{ordinary}");
+        }
+
+        #[test]
+        fn wi432_private_targets_are_refused_without_the_opt_in() {
+            let mut store = store(HashMap::new(), true);
+            store.allow_private_ips = false;
+            let error = store
+                .http_request(
+                    "GET".to_string(),
+                    "http://127.0.0.1:9/r".to_string(),
+                    "{}".to_string(),
+                    None,
+                    Some(2000),
+                )
+                .expect_err("loopback must be refused before connecting");
+            assert!(error.contains("private/internal IP"), "{error}");
+            assert!(!error.contains("HTTP request failed"), "{error}");
+        }
+
+        #[test]
+        fn wi432_response_cap_disconnects_at_the_first_over_limit_chunk() {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(&[13, 10, 13, 10]) {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n8\r\nxxxxxxxx\r\n8\r\nyyyyyyyy\r\n",
+                    )
+                    .expect("write chunks");
+                stream.flush().expect("flush chunks");
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .expect("read timeout");
+                match stream.read(&mut byte) {
+                    Ok(0) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ) => {}
+                    other => panic!("client did not close the over-limit response: {other:?}"),
+                }
+            });
+
+            let error = store_with_response_cap(HashMap::new(), true, 8)
+                .http_request(
+                    "GET".to_string(),
+                    format!("http://{addr}/r"),
+                    "{}".to_string(),
+                    None,
+                    Some(5000),
+                )
+                .expect_err("the second chunk crosses the response cap");
+            assert!(
+                error.contains("16 bytes exceeds limit of 8 bytes"),
+                "{error}"
+            );
+            server.join().expect("upstream thread");
+        }
+
         /// Parsed-query spellings: an upstream reads '+' as a space and
         /// decodes escapes in a raw-substituted query placeholder.
         #[test]
@@ -7424,6 +7673,180 @@ mod tests {
                 url_parser.contains(&"P@ss%20word!".to_string()),
                 "{url_parser:?}"
             );
+        }
+    }
+
+    mod bridge_origin_pins {
+        use std::collections::HashMap;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::Arc;
+
+        use super::super::lunarwing::agent::channel_host::Host as _;
+        use super::super::{WasmChannel, configured_bridge_origins, matches_bridge_origin};
+        use crate::channels::wasm::runtime::{
+            PreparedChannelModule, WasmChannelRuntime, WasmChannelRuntimeConfig,
+        };
+        use crate::channels::wasm::schema::ChannelCapabilitiesFile;
+        use crate::pairing::PairingStore;
+        use crate::tools::wasm::ResourceLimits;
+
+        fn serve_ok() -> (u16, std::thread::JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("address").port();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut request = [0; 1024];
+                let _ = stream.read(&mut request).expect("read request");
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .expect("write response");
+            });
+            (port, server)
+        }
+
+        fn channel_for(
+            runtime: &Arc<WasmChannelRuntime>,
+            manifest: &ChannelCapabilitiesFile,
+        ) -> WasmChannel {
+            let prepared = Arc::new(PreparedChannelModule {
+                name: manifest.name.clone(),
+                description: "bridge-origin test".to_string(),
+                component: None,
+                limits: ResourceLimits::default(),
+            });
+            WasmChannel::new(
+                Arc::clone(runtime),
+                prepared,
+                manifest.to_capabilities(),
+                "default",
+                manifest.config_json(),
+                Arc::new(PairingStore::new()),
+                None,
+            )
+        }
+
+        #[test]
+        fn wi432_shipped_channel_defaults_reach_configured_loopback_bridges() {
+            let manifests: &[(&str, &[(&str, &str)])] = &[
+                (
+                    include_str!("../../../channels-src/xmpp/xmpp.capabilities.json"),
+                    &[("bridge_url", "/v1/messages")],
+                ),
+                (
+                    include_str!("../../../channels-src/darkirc/darkirc.capabilities.json"),
+                    &[("adapter_url", "/health")],
+                ),
+                (
+                    include_str!("../../../channels-src/weechat/weechat.capabilities.json"),
+                    &[
+                        ("relay_url", "/api/version"),
+                        ("ws_adapter_url", "/api/version"),
+                    ],
+                ),
+                (
+                    include_str!("../../../channels-src/multica/multica.capabilities.json"),
+                    &[("multica_url", "/api/daemon/register")],
+                ),
+            ];
+            let runtime = Arc::new(
+                WasmChannelRuntime::new(WasmChannelRuntimeConfig::for_testing())
+                    .expect("test runtime"),
+            );
+
+            for (manifest_json, endpoints) in manifests {
+                let mut manifest = ChannelCapabilitiesFile::from_json(manifest_json)
+                    .expect("shipped manifest parses");
+                for (key, path) in *endpoints {
+                    let configured = manifest
+                        .config
+                        .get(*key)
+                        .and_then(serde_json::Value::as_str)
+                        // Multica documents localhost:8080 but leaves its required
+                        // setup value null in the manifest.
+                        .unwrap_or("http://localhost:8080");
+                    let parsed = url::Url::parse(configured).expect("default bridge URL");
+                    let (port, server) = serve_ok();
+                    let origin = format!(
+                        "{}://{}:{}",
+                        parsed.scheme(),
+                        parsed.host_str().expect("default bridge host"),
+                        port
+                    );
+                    manifest
+                        .config
+                        .insert((*key).to_string(), serde_json::Value::String(origin));
+                    let channel = channel_for(&runtime, &manifest);
+                    let mut store = WasmChannel::create_store(
+                        &channel.runtime,
+                        &channel.prepared,
+                        &channel.capabilities,
+                        HashMap::new(),
+                        Vec::new(),
+                        channel.pairing_store.clone(),
+                        channel.allowed_bridge_origins.clone(),
+                    )
+                    .expect("store");
+                    store.data_mut().allow_private_ips = false;
+                    let bridge_url = manifest
+                        .config
+                        .get(*key)
+                        .and_then(serde_json::Value::as_str)
+                        .expect("inserted bridge URL");
+
+                    let response = store
+                        .data_mut()
+                        .http_request(
+                            "GET".to_string(),
+                            format!("{bridge_url}{path}"),
+                            "{}".to_string(),
+                            None,
+                            Some(5000),
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "{} {key} must reach its configured bridge: {error}",
+                                manifest.name
+                            )
+                        });
+                    assert_eq!(response.status, 200);
+                    server.join().expect("bridge server");
+                }
+            }
+        }
+
+        #[test]
+        fn wi432_bridge_exemption_is_exact_and_loopback_only() {
+            let origins = configured_bridge_origins(
+                r#"{
+                    "bridge_url":"http://127.0.0.1:8787/base",
+                    "adapter_url":"http://10.0.0.5:6680",
+                    "relay_url":"https://localhost:443"
+                }"#,
+            );
+            assert_eq!(
+                origins,
+                vec![
+                    "http://127.0.0.1:8787".to_string(),
+                    "https://localhost".to_string(),
+                ]
+            );
+            assert!(matches_bridge_origin(
+                "http://127.0.0.1:8787/v1/messages?cursor=1",
+                &origins
+            ));
+            assert!(matches_bridge_origin("https://localhost/v1", &origins));
+            for denied in [
+                "http://127.0.0.1:8788/v1/messages",
+                "https://127.0.0.1:8787/v1/messages",
+                "http://127.0.0.2:8787/v1/messages",
+                "http://user@127.0.0.1:8787/v1/messages",
+                "http://10.0.0.5:6680/health",
+            ] {
+                assert!(!matches_bridge_origin(denied, &origins), "{denied}");
+            }
         }
     }
 }

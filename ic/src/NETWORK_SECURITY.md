@@ -567,6 +567,7 @@ WASM tools execute HTTP requests through the host runtime, subject to:
 3. **Leak detection** — `LeakDetector` scans both outbound requests and inbound responses for secret patterns
    - Runs at two points: before sending and after receiving
    - Uses Aho-Corasick for fast multi-pattern matching
+   - Blocking errors name only the matched pattern; error values and heuristic logs omit secret-derived previews (WI#432)
    - **Reference:** `crates/lunarwing_safety/src/leak_detector.rs`
 
 4. **Guest-facing redaction (WI#395)** — everything the WASM tool sees from
@@ -601,11 +602,18 @@ WASM tools execute HTTP requests through the host runtime, subject to:
    This also applies to host-managed scoped-service Bearer credentials
    (for example the OCR sidecar): a local service that gzips unconditionally
    must honor the identity request or its non-empty answer will be refused.
-   Residuals, recorded on WI#395: re-encoded echo spellings beyond the
-   exact raw/`urlencoding::encode` pair are not detected in wrapper headers
-   or bodies. Only **proxy headers** get the two-round percent-decode
-   detector; proxy bodies and wrapper headers/bodies do not. The wrapper's
-   response leak detector also skips bodies that are not valid UTF-8.
+   WI#432 adds one deterministic needle plan for errors, headers and bodies:
+   raw secrets shorter than four bytes are excluded to prevent response
+   mangling, every raw/encoded needle is sorted longest-first, and the covered
+   spellings include URL/form encoding, URL-parser forms, JSON string content,
+   lower/uppercase hexadecimal, and injected-header credential tokens. An echo
+   split across two response header fields replaces both complete values.
+   Both hosts share the implementation in `src/tools/wasm/http_security.rs`
+   rather than maintaining independent needle plans.
+   Residuals: only **proxy headers** get the two-round percent-decode detector;
+   proxy bodies and wrapper headers/bodies do not. The wrapper's heuristic
+   response leak scan still skips bodies that are not valid UTF-8, but the
+   independent byte-level credential scrub does not.
    **Reference:** `src/tools/wasm/wrapper.rs` —
    `StoreData::redact_http_outcome_for_guest`
 
@@ -633,7 +641,10 @@ placeholder substituted raw into a URL path or query takes when reqwest
 re-parses the injected URL, the upstream-parsed spellings of a raw query
 placeholder (`+` read as a space, `%XX` escapes decoded), and the
 credential token of every injected header value (the Basic-auth
-`base64(user:secret)` token never contains the raw secret). Two further
+`base64(user:secret)` token never contains the raw secret). The WI#432 plan
+also covers JSON string content and lower/uppercase hexadecimal, excludes raw
+secrets shorter than four bytes, sorts every needle longest-first, and
+replaces both complete fields when an echo is split across two headers. Two further
 placeholder rules keep parsed spellings of the secret out of guest-visible
 text: a URL placeholder whose value contains `#` or an ASCII control
 character is refused before injection (the WHATWG parser cuts the URL at
@@ -663,16 +674,28 @@ encoding and answer. The client never follows redirects
 credential headers to the redirect target and would bypass the HTTP
 allowlist, so the guest receives the (redacted) 3xx instead.
 
-Residuals, recorded on WI#408: re-encoded echo spellings in the **body**
-are not detected (a JSON-escaped echo, or a lowercase-hex encoding of the
-secret, reaches the guest — headers are parsed per field, bodies are
-byte-scrubbed only); Range/If-Range requests are not stripped and a 206
-partial body is not refused, so an echo split across range requests
-reassembles; there is no private-IP rejection (`reject_private_ip` exists
-only in the tool wrapper); the response body is fully buffered
-(`.bytes()`) before the size check rather than read through the tool
-wrapper's capped collector, so an oversized answer costs the buffer before
-it is refused.
+WI#432 closes the former WI#408 residuals. Credentialed exchanges also drop
+`Range` and `If-Range`, and a `206 Partial Content` response is refused at the
+redaction boundary, so a guest cannot reassemble an echo from byte ranges;
+ordinary exchanges retain their range semantics. Both hosts use the shared
+`vet_http_target` guard. It canonicalizes IPv4-mapped, IPv4-compatible and
+NAT64-embedded addresses before applying the special-use IPv4/IPv6 and
+multicast blocklists, and reqwest clients (including OAuth refresh) pin the
+exact vetted DNS answers instead of resolving a second time. General
+private-target access requires the separate, default-off
+`WASM_HTTP_ALLOW_PRIVATE_IPS=1` opt-in; the daemon's `ALLOW_PRIVATE_IPS=1`
+setting for Postgres, TensorZero and other private infrastructure does not
+disable these WASM guards. The host-configured vision/voice sidecar is a
+narrow tool-host exception tied to a **local** exact configured origin and
+`/v1/` scope (with the extension allowlist and method restrictions still
+applied). Each channel host independently exempts only the exact scheme, host
+and port of its configured loopback bridge, adapter, relay or Multica URL;
+other hostnames, wildcard targets and different origins stay guarded, so the
+shipped local channels work without a blanket private-target bypass. Response
+bodies stream through the same capped collector: declared lengths are checked
+up front, actual chunks are checked as they arrive, and reading stops at the
+first over-limit chunk instead of after full buffering. Stream errors still
+pass through `without_url()`.
 
 **Reference:** `src/channels/wasm/wrapper.rs` —
 `ChannelStoreData::redact_http_outcome_for_guest`
