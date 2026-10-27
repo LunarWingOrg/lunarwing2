@@ -1277,7 +1277,7 @@ mod tests {
         fn stripe_key_pattern_100kb_near_miss() {
             let detector = LeakDetector::new();
             // Near-miss: "sk_live_" followed by short string (< 24 chars)
-            let chunk = "sk_live_short12345 ";
+            let chunk = "sk_live_short12345 "; // gitleaks:allow
             let payload = chunk.repeat(5500);
             assert!(payload.len() > 100_000);
 
