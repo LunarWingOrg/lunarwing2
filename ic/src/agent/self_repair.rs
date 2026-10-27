@@ -20,6 +20,9 @@ pub struct StuckJob {
     pub stuck_duration: Duration,
     pub last_error: Option<String>,
     pub repair_attempts: u32,
+    /// External worker running this job, when it is an `external:*` job
+    /// (WI#475). Recovery never retries those, so messages must not claim it.
+    pub external_worker: Option<String>,
 }
 
 /// A tool that has been detected as broken.
@@ -68,6 +71,14 @@ pub struct DefaultSelfRepair {
     context_manager: Arc<ContextManager>,
     /// Jobs in `InProgress` longer than this are treated as stuck.
     stuck_threshold: Duration,
+    /// Idle threshold for jobs dispatched to an external worker (WI#475).
+    ///
+    /// External workers block on their own LLM calls (a kimi request observed
+    /// at 508 s to first token) while their executor heartbeats. The worker
+    /// owns a native per-attempt deadline (WI#477), so self-repair must not
+    /// reuse the local-chat threshold for these jobs. `None` falls back to
+    /// `stuck_threshold` (the pre-WI#475 behavior).
+    external_stuck_threshold: Option<Duration>,
     max_repair_attempts: u32,
     store: Option<Arc<dyn Database>>,
     builder: Option<Arc<dyn SoftwareBuilder>>,
@@ -79,6 +90,10 @@ pub struct DefaultSelfRepair {
     /// do not consume an attempt (e.g. builder disabled), which would
     /// otherwise loop forever (work item #76).
     manual_alerts: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Jobs that already surfaced a terminal `ManualRequired` alert this boot
+    /// (WI#475). Without this a job past the repair limit produced
+    /// `Manual intervention needed: …` on every sweep forever.
+    job_manual_alerts: std::sync::Mutex<std::collections::HashSet<Uuid>>,
 }
 
 impl DefaultSelfRepair {
@@ -91,12 +106,20 @@ impl DefaultSelfRepair {
         Self {
             context_manager,
             stuck_threshold,
+            external_stuck_threshold: None,
             max_repair_attempts,
             store: None,
             builder: None,
             tools: None,
             manual_alerts: std::sync::Mutex::new(std::collections::HashSet::new()),
+            job_manual_alerts: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Set the idle threshold applied to `external:*` jobs (WI#475).
+    pub fn with_external_stuck_threshold(mut self, threshold: Duration) -> Self {
+        self.external_stuck_threshold = Some(threshold);
+        self
     }
 
     /// Add a Store for tool failure tracking.
@@ -164,6 +187,18 @@ impl DefaultSelfRepair {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         alerts.insert(tool_name.to_string());
     }
+
+    /// Record a terminal `ManualRequired` outcome for a stuck job this boot
+    /// (WI#475). Returns `true` only on the first call for a job, so the
+    /// caller emits the manual-intervention warning once instead of every
+    /// sweep.
+    fn note_job_manual_required(&self, job_id: Uuid) -> bool {
+        let mut alerts = self
+            .job_manual_alerts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        alerts.insert(job_id)
+    }
 }
 
 #[async_trait]
@@ -171,11 +206,27 @@ impl SelfRepair for DefaultSelfRepair {
     async fn detect_stuck_jobs(&self) -> Vec<StuckJob> {
         let stuck_ids = self
             .context_manager
-            .find_stuck_jobs_with_threshold(Some(self.stuck_threshold))
+            .find_stuck_jobs_with_thresholds(
+                Some(self.stuck_threshold),
+                self.external_stuck_threshold,
+            )
             .await;
+        let already_alerted = {
+            let alerts = self
+                .job_manual_alerts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            alerts.clone()
+        };
         let mut stuck_jobs = Vec::new();
 
         for job_id in stuck_ids {
+            // WI#475: a job whose terminal manual-intervention alert already
+            // went out this boot is not re-detected, so the warning cannot
+            // repeat every sweep.
+            if already_alerted.contains(&job_id) {
+                continue;
+            }
             if let Ok(ctx) = self.context_manager.get_context(job_id).await
                 && matches!(ctx.state, JobState::Stuck | JobState::InProgress)
             {
@@ -245,8 +296,13 @@ impl SelfRepair for DefaultSelfRepair {
 
                 // Only report already-Stuck jobs that have been stuck long enough.
                 // Jobs just transitioned from InProgress skip this check — they
-                // were already vetted by find_stuck_jobs_with_threshold.
-                if !just_transitioned && stuck_duration < self.stuck_threshold {
+                // were already vetted by find_stuck_jobs_with_thresholds.
+                let threshold = if ctx.is_external_worker_job() {
+                    self.external_stuck_threshold.unwrap_or(self.stuck_threshold)
+                } else {
+                    self.stuck_threshold
+                };
+                if !just_transitioned && stuck_duration < threshold {
                     continue;
                 }
 
@@ -256,6 +312,7 @@ impl SelfRepair for DefaultSelfRepair {
                     stuck_duration,
                     last_error: None,
                     repair_attempts: ctx.repair_attempts,
+                    external_worker: ctx.external_worker.clone(),
                 });
             }
         }
@@ -264,13 +321,27 @@ impl SelfRepair for DefaultSelfRepair {
     }
 
     async fn repair_stuck_job(&self, job: &StuckJob) -> Result<RepairResult, RepairError> {
-        // Check if we've exceeded max repair attempts
+        // Check if we've exceeded max repair attempts (WI#475: one terminal
+        // alert per job per boot — a job past the limit used to warn every
+        // sweep forever).
         if job.repair_attempts >= self.max_repair_attempts {
-            return Ok(RepairResult::ManualRequired {
-                message: format!(
-                    "Job {} has exceeded maximum repair attempts ({})",
-                    job.job_id, self.max_repair_attempts
+            if !self.note_job_manual_required(job.job_id) {
+                return Ok(RepairResult::Retry {
+                    message: format!("Job {} remains stuck; manual alert already sent", job.job_id),
+                });
+            }
+            let cause = match job.external_worker.as_deref() {
+                Some(worker) => format!(
+                    "external worker '{worker}' is still silent after {} repair attempts",
+                    job.repair_attempts
                 ),
+                None => format!(
+                    "exceeded maximum repair attempts ({})",
+                    self.max_repair_attempts
+                ),
+            };
+            return Ok(RepairResult::ManualRequired {
+                message: format!("Job {} {cause}", job.job_id),
             });
         }
 
@@ -290,9 +361,17 @@ impl SelfRepair for DefaultSelfRepair {
         match result {
             Ok(Ok(())) => {
                 tracing::info!("Successfully recovered job {}", job.job_id);
-                Ok(RepairResult::Success {
-                    message: format!("Job {} recovered and will be retried", job.job_id),
-                })
+                // WI#475: the external worker keeps running on its own; this
+                // state flip does not retry or restart it, so say so.
+                let message = match job.external_worker.as_deref() {
+                    Some(worker) => format!(
+                        "Job {} idle baseline reset (external worker '{worker}' keeps running; \
+                         the daemon does not retry external tasks)",
+                        job.job_id
+                    ),
+                    None => format!("Job {} recovered and will be retried", job.job_id),
+                };
+                Ok(RepairResult::Success { message })
             }
             Ok(Err(e)) => {
                 tracing::warn!("Failed to recover job {}: {}", job.job_id, e);
@@ -629,6 +708,7 @@ mod tests {
             stuck_duration: Duration::from_secs(120),
             last_error: None,
             repair_attempts: 0,
+            external_worker: None,
         };
 
         let result = repair.repair_stuck_job(&stuck_job).await.unwrap();
@@ -656,6 +736,7 @@ mod tests {
             stuck_duration: Duration::from_secs(300),
             last_error: Some("persistent failure".to_string()),
             repair_attempts: 2, // == max
+            external_worker: None,
         };
 
         let result = repair.repair_stuck_job(&stuck_job).await.unwrap();

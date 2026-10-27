@@ -702,6 +702,7 @@ mod tests {
             ws_idle_timeout_secs: 120,
             voice: None,
             voice_rate_limiter: crate::channels::web::server::PerUserRateLimiter::new(10, 60),
+            context_manager: None,
         }
     }
 }

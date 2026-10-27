@@ -409,6 +409,9 @@ pub struct GatewayState {
     pub voice: Option<Arc<crate::channels::web::voice::VoiceApi>>,
     /// Per-user rate limiter for voice endpoints (10 requests per 60 seconds).
     pub voice_rate_limiter: PerUserRateLimiter,
+    /// Job context manager for live runtime state (`stuck`, `repair_attempts`)
+    /// that is not persisted on the sandbox-job record (WI#475).
+    pub context_manager: Option<Arc<crate::context::ContextManager>>,
 }
 
 /// Start the gateway HTTP server.
@@ -3466,6 +3469,7 @@ mod tests {
             ws_idle_timeout_secs: 120,
             voice: None,
             voice_rate_limiter: PerUserRateLimiter::new(10, 60),
+            context_manager: None,
         })
     }
 

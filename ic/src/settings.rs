@@ -614,6 +614,14 @@ pub struct AgentSettings {
     #[serde(default = "default_stuck_threshold")]
     pub stuck_threshold_secs: u64,
 
+    /// Idle threshold in seconds for jobs dispatched to an external worker
+    /// (`external:*`) before self-repair flags them stuck (WI#475). These
+    /// jobs block on their own LLM calls while the executor heartbeats, and
+    /// the worker owns the per-attempt LLM deadline (WI#477), so the default
+    /// is far above the local-chat threshold.
+    #[serde(default = "default_external_stuck_threshold")]
+    pub external_stuck_threshold_secs: u64,
+
     /// Whether to use planning before tool execution.
     #[serde(default = "default_true")]
     pub use_planning: bool,
@@ -692,6 +700,10 @@ fn default_stuck_threshold() -> u64 {
     300 // 5 minutes
 }
 
+fn default_external_stuck_threshold() -> u64 {
+    1800 // 30 minutes (WI#475)
+}
+
 fn default_repair_interval() -> u64 {
     60 // 1 minute
 }
@@ -747,6 +759,7 @@ impl Default for AgentSettings {
             max_parallel_jobs: default_max_parallel_jobs(),
             job_timeout_secs: default_job_timeout(),
             stuck_threshold_secs: default_stuck_threshold(),
+            external_stuck_threshold_secs: default_external_stuck_threshold(),
             use_planning: true,
             repair_check_interval_secs: default_repair_interval(),
             max_repair_attempts: default_max_repair_attempts(),
