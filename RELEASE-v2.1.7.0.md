@@ -4,8 +4,8 @@
 
 **Release date:** 2026-10-27
 
-> Lights on dark water,  
-> no fire, yet the way opens,  
+> Lights on dark water,<br>
+> no fire, yet the way opens,<br>
 > we steer by their glow. 不知火
 
 *Lights on the water, with no flame behind them.*
@@ -56,6 +56,6 @@ The registry version bumps require rebuilt WASM artifacts; they do not by themse
 
 ---
 
-> Beyond charted lines,  
-> small lights show the open sea,  
+> Beyond charted lines,<br>
+> small lights show the open sea,<br>
 > we sail into dawn.
