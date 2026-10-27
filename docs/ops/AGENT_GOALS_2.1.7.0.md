@@ -1195,7 +1195,14 @@
 105. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/441
 106. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/455
 107. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/478
-108. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/479
+108. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/479
+    - DONE 2026-10-27 (SweetieBot, item-108, branch `sweetiebot/kimi-108-20261027-0605`): `GET /api/jobs` now reports each job's lane, so attributing jobs during multi-job testing no longer needs one detail call per job. `JobInfo` (`ic/src/channels/web/types.rs:716`) gains `job_mode` and `worker_name`, both `skip_serializing_if = "Option::is_none"` — `job_mode` omitted for the default `worker` mode (same omission rule as `JobDetailResponse`) and `worker_name` populated only for `external:<name>` via the new `worker_name_from_mode` helper
+    - **No extra query:** the list handler (`ic/src/channels/web/handlers/jobs.rs`) reads `SandboxJobRecord::job_mode`, which `list_sandbox_jobs_for_user` already selects in both backends (`ic/src/history/store.rs:671` postgres, `ic/src/db/libsql/sandbox.rs:220` libSQL) — the per-job `get_sandbox_job_mode` lookup is not reintroduced. Agent (non-sandbox) jobs have no sandbox mode and report neither field
+    - **Optional filter:** `?mode=` on the list endpoint — `worker` (the default, also matching mode-less rows), `harness`, `external` (any external lane) or `external:<name>`; unknown values simply match nothing. Filtering happens before the user-scoped dedupe across the two sources
+    - **UI:** the web Jobs table gains a Mode column (`app.js` header + row cell, `jobs.mode` in `en.js`/`zh-CN.js`), rendering `job_mode`, else `worker_name`, else `-`
+    - **Tests:** two new cases in `ic/src/channels/web/tests/multi_tenant.rs` `jobs_isolation` — `test_jobs_list_reports_mode_and_worker_name` (external job shows `external:kimi` + `worker_name: kimi`; a `worker`-mode job omits both) and `test_jobs_list_mode_filter` (`external` → both external lanes, `external:kimi` → one, `worker` → only the mode-less job, bob's job never visible to alice)
+    - **Verification on this tree (`taskset -c 0-17`, `-j18`):** `cargo check` clean on default, `--no-default-features --features libsql`, and `--features postgres`; `cargo check --tests --features libsql` clean; `cargo clippy --no-default-features --features libsql --lib --tests -D warnings` clean (one `needless_lifetimes` nit fixed); `cargo fmt --all -- --check` clean; the `jobs_isolation` module **14/14 pass** (12 pre-existing + both new); `node --check` clean on `app.js` and both i18n bundles. Docs: `docs/ops/WORKER-CONTAINERS.md` gains a "Job list lane attribution (WI#479)" section under Shared Protocol
+    - **On the tracker:** WI#479 stays open for maintainer acceptance of this branch, per the established pattern for these items
 109. [x] (S) RESERVED
 110. [x] (S) RESERVED
 111. [x] (S) RESERVED
