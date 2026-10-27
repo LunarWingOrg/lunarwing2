@@ -298,7 +298,8 @@ impl SelfRepair for DefaultSelfRepair {
                 // Jobs just transitioned from InProgress skip this check — they
                 // were already vetted by find_stuck_jobs_with_thresholds.
                 let threshold = if ctx.is_external_worker_job() {
-                    self.external_stuck_threshold.unwrap_or(self.stuck_threshold)
+                    self.external_stuck_threshold
+                        .unwrap_or(self.stuck_threshold)
                 } else {
                     self.stuck_threshold
                 };
@@ -327,7 +328,10 @@ impl SelfRepair for DefaultSelfRepair {
         if job.repair_attempts >= self.max_repair_attempts {
             if !self.note_job_manual_required(job.job_id) {
                 return Ok(RepairResult::Retry {
-                    message: format!("Job {} remains stuck; manual alert already sent", job.job_id),
+                    message: format!(
+                        "Job {} remains stuck; manual alert already sent",
+                        job.job_id
+                    ),
                 });
             }
             let cause = match job.external_worker.as_deref() {
@@ -797,7 +801,10 @@ mod tests {
         let result = repair.repair_stuck_job(&stuck_job).await.unwrap();
         match result {
             RepairResult::ManualRequired { message } => {
-                assert!(message.contains("kimi"), "message names the worker: {message}");
+                assert!(
+                    message.contains("kimi"),
+                    "message names the worker: {message}"
+                );
                 assert!(
                     !message.contains("will be retried"),
                     "external jobs are not retried by the daemon: {message}"
@@ -865,10 +872,7 @@ mod tests {
         let repair = DefaultSelfRepair::new(cm, Duration::from_secs(0), 2);
         let first = repair.detect_stuck_jobs().await;
         assert_eq!(first.len(), 1);
-        let _ = repair
-            .repair_stuck_job(&first[0])
-            .await
-            .unwrap();
+        let _ = repair.repair_stuck_job(&first[0]).await.unwrap();
         let second = repair.detect_stuck_jobs().await;
         assert!(
             second.is_empty(),

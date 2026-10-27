@@ -2635,7 +2635,7 @@ mod tests {
                     max_parallel_jobs: 1,
                     job_timeout: Duration::from_secs(60),
                     stuck_threshold: Duration::from_secs(60),
-                external_stuck_threshold: Duration::from_secs(1800),
+                    external_stuck_threshold: Duration::from_secs(1800),
                     repair_check_interval: Duration::from_secs(30),
                     max_repair_attempts: 1,
                     use_planning: false,
