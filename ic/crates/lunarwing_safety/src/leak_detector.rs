@@ -377,7 +377,7 @@ impl Default for LeakDetector {
 /// Error from leak detection.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum LeakDetectionError {
-    #[error("Secret leak blocked: pattern '{pattern}' matched '{preview}'")]
+    #[error("Secret leak blocked: pattern '{pattern}' matched")]
     SecretLeakBlocked { pattern: String, preview: String },
 }
 
@@ -900,12 +900,17 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_and_clean_blocks() {
+    fn test_scan_and_clean_blocks_without_secret_preview() {
         let detector = LeakDetector::new();
         let content = "sk-proj-test1234567890abcdefghij";
 
-        let result = detector.scan_and_clean(content);
-        assert!(result.is_err());
+        let error = detector
+            .scan_and_clean(content)
+            .expect_err("the credential pattern must still block");
+        assert_eq!(
+            error.to_string(),
+            "Secret leak blocked: pattern 'openai_api_key' matched"
+        );
     }
 
     #[test]
