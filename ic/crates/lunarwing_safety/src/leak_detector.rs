@@ -610,7 +610,7 @@ mod tests {
     #[test]
     fn test_detect_openai_key() {
         let detector = LeakDetector::new();
-        let content = "API key: sk-proj-abc123def456ghi789jkl012mno345pqrT3BlbkFJtest123";
+        let content = "API key: sk-proj-abc123def456ghi789jkl012mno345pqrT3BlbkFJtest123"; // gitleaks:allow
 
         let result = detector.scan(content);
         assert!(!result.is_clean());
