@@ -4438,6 +4438,7 @@ function loadJobs() {
       + '<th>' + escapeHtml(I18n.t('jobs.id')) + '</th>'
       + '<th>' + escapeHtml(I18n.t('jobs.title')) + '</th>'
       + '<th>' + escapeHtml(I18n.t('jobs.status')) + '</th>'
+      + '<th>' + escapeHtml(I18n.t('jobs.mode')) + '</th>'
       + '<th>' + escapeHtml(I18n.t('jobs.created')) + '</th>'
       + '<th>' + escapeHtml(I18n.t('jobs.actions')) + '</th>'
       + '</tr></thead><tbody id="jobs-tbody"></tbody></table>'
@@ -4496,6 +4497,7 @@ function renderJobsList(jobs) {
       + '<td title="' + escapeAttr(job.id) + '">' + shortId + '</td>'
       + '<td>' + escapeHtml(job.title) + '</td>'
       + '<td><span class="badge ' + stateClass + '">' + escapeHtml(job.state) + '</span></td>'
+      + '<td>' + escapeHtml(job.job_mode || job.worker_name || '-') + '</td>'
       + '<td>' + formatDate(job.created_at) + '</td>'
       + '<td>' + actionBtns + '</td>'
       + '</tr>';

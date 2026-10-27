@@ -720,6 +720,21 @@ pub struct JobInfo {
     pub user_id: String,
     pub created_at: String,
     pub started_at: Option<String>,
+    /// Job mode (`external:kimi`, `harness`, …), omitted when the job has no
+    /// non-default mode. Same omission rule as [`JobDetailResponse`] (WI#479).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_mode: Option<String>,
+    /// Worker lane name for external jobs (mirrors the `external:<name>`
+    /// suffix), omitted for every other mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_name: Option<String>,
+}
+
+/// Derive the worker lane name from an `external:<name>` job mode.
+pub fn worker_name_from_mode(mode: Option<&str>) -> Option<String> {
+    mode.and_then(|m| m.strip_prefix("external:"))
+        .map(|name| name.to_string())
+        .filter(|name| !name.is_empty())
 }
 
 #[derive(Debug, Serialize)]
