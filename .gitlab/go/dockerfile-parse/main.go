@@ -207,6 +207,8 @@ type policyState struct {
 	binaryStage         int
 	anchorStage         int
 	anchorIndex         int
+	dependencyCopyStage int
+	dependencyCopyIndex int
 	dependencyModeStage int
 	dependencyModeIndex int
 	filesystemSeen      bool
@@ -220,9 +222,9 @@ type policyState struct {
 func newPolicyState() *policyState {
 	return &policyState{
 		scanStage: -1, assertStage: -1, assertIndex: -1, binaryStage: -1,
-		anchorStage: -1, anchorIndex: -1, dependencyModeStage: -1,
-		dependencyModeIndex: -1, scriptsStage: -1, configStage: -1,
-		bootStage: -1, readonlyStage: -1,
+		anchorStage: -1, anchorIndex: -1, dependencyCopyStage: -1,
+		dependencyCopyIndex: -1, dependencyModeStage: -1, dependencyModeIndex: -1,
+		scriptsStage: -1, configStage: -1, bootStage: -1, readonlyStage: -1,
 	}
 }
 
@@ -239,6 +241,9 @@ func (s *policyState) process(line parsedLine, index int) error {
 	}
 	if line.name == "USER" {
 		s.lastUser = canonicalInstruction(line.text)
+	}
+	if line.name == "COPY" && strings.Contains(line.text, "/app/node_modules") {
+		s.dependencyCopyStage, s.dependencyCopyIndex = s.stage, index
 	}
 	switch {
 	case sameInstruction(line, compileCopy) && s.stageName == "builder":
@@ -302,8 +307,10 @@ func (s *policyState) validate() []error {
 	if s.anchorStage != s.assertStage || s.anchorIndex+1 != s.assertIndex {
 		errs = append(errs, fmt.Errorf("Dockerfile must declare ARG LUNARWING_WRAPPER_SHA256= immediately above the final assertion in its stage"))
 	}
-	if s.dependencyModeStage != s.assertStage || s.dependencyModeIndex+1 != s.anchorIndex {
-		errs = append(errs, fmt.Errorf("Dockerfile must strip dependency privilege and write bits immediately before the wrapper anchor"))
+	dependencyCopiesFinal := s.dependencyCopyIndex < 0 || s.dependencyCopyStage == s.assertStage
+	if s.dependencyModeStage != s.assertStage || !dependencyCopiesFinal ||
+		s.dependencyModeIndex <= s.dependencyCopyIndex || s.dependencyModeIndex >= s.anchorIndex {
+		errs = append(errs, fmt.Errorf("Dockerfile must strip dependency privilege and write bits after every dependency COPY and before the wrapper anchor"))
 	}
 	if s.lastUser != "USER 10003:10003" {
 		errs = append(errs, fmt.Errorf("Dockerfile's last USER instruction must be exactly 'USER 10003:10003'"))
