@@ -2165,6 +2165,56 @@ mod approval_resolution {
         }
     }
 
+    /// Engine-v2 gates resolve through the real HTTP handler without a legacy
+    /// session fallback, for every action and only for the owning user.
+    #[tokio::test]
+    async fn engine_approval_without_thread_id_resolves_gate_owner_for_each_action() {
+        use crate::bridge::router::tests::{
+            engine_state_test_lock, install_engine_approval_for_tests,
+            reset_engine_state_for_tests,
+        };
+
+        let _guard = engine_state_test_lock().await;
+        let auth = two_user_auth();
+        for action in ["approve", "always", "deny"] {
+            reset_engine_state_for_tests().await;
+            let (request_id, thread_id) = install_engine_approval_for_tests("alice").await;
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            let state = build_state(None, None);
+            *state.msg_tx.write().await = Some(tx);
+            let app = approval_router(state, auth.clone());
+
+            let resp = app
+                .clone()
+                .oneshot(approval_request(
+                    "tok-bob",
+                    serde_json::json!({"request_id": request_id.to_string(), "action": action}),
+                ))
+                .await
+                .expect("handler responds");
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "action {action}");
+            assert!(rx.try_recv().is_err(), "another user forwards nothing");
+
+            let resp = app
+                .oneshot(approval_request(
+                    "tok-alice",
+                    serde_json::json!({"request_id": request_id.to_string(), "action": action}),
+                ))
+                .await
+                .expect("handler responds");
+            assert_eq!(resp.status(), StatusCode::ACCEPTED, "action {action}");
+
+            let msg = rx.recv().await.expect("approval is forwarded");
+            let thread_id = thread_id.to_string();
+            assert_eq!(
+                msg.conversation_scope(),
+                Some(thread_id.as_str()),
+                "action {action} must target the engine gate's owning thread"
+            );
+        }
+        reset_engine_state_for_tests().await;
+    }
+
     /// An unmatched request id must not report success — this was the 202 no-op.
     #[tokio::test]
     async fn unmatched_request_id_returns_404_and_sends_nothing() {
