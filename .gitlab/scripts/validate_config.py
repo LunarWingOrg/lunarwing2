@@ -2309,14 +2309,38 @@ def validate_worker_input_manifest(errors: list[str]) -> None:
             )
 
 
+def git_tracked_lockfiles() -> set[str] | None:
+    """Cargo.lock paths git tracks, or None when git truth is unavailable.
+
+    `git ls-files` is the same truth the runner's clean checkout provides. A
+    filesystem glob instead also sees untracked scratch checkouts such as the
+    developer-local `.cargo/git/checkouts/*` caches (run-230 OX-4), which
+    turned a dirty checkout red while CI stayed green.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, text=True, check=False
+        )
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    if result.returncode != 0:
+        # No repository (fixtures and scratch trees) — the caller falls back
+        # to the glob, which is the same truth where git cannot speak.
+        return None
+    return {
+        path
+        for path in result.stdout.split("\0")
+        if path and (path == "Cargo.lock" or path.endswith("/Cargo.lock"))
+    }
+
+
 def collect_tracked_lockfiles() -> set[str]:
-    tracked = set()
-    for lockfile in ROOT.glob("**/Cargo.lock"):
-        relative = lockfile.relative_to(ROOT).as_posix()
-        if relative.startswith("ic/vendor/"):
-            continue
-        tracked.add(relative)
-    return tracked
+    tracked = git_tracked_lockfiles()
+    if tracked is None:
+        tracked = set()
+        for lockfile in ROOT.glob("**/Cargo.lock"):
+            tracked.add(lockfile.relative_to(ROOT).as_posix())
+    return {relative for relative in tracked if not relative.startswith("ic/vendor/")}
 
 
 def safe_relative_path(path: object) -> str | None:
