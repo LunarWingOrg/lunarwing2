@@ -139,13 +139,17 @@ UNITEOF
 # The key and value are interpolated into grep/awk patterns verbatim: callers
 # must pass fixed key names and value tokens that are regex/ERE-safe (today
 # podman/docker and true/false/auto). health.env holds notification
-# credentials, so the mktemp copy (mode 0600) is removed even when a step
-# fails midway — a partially-written original is left alone rather than
-# replaced with a truncated file.
+# credentials, so the scratch copy is created mode 0600 in the file's own
+# directory and removed on every failure path; the swap into place is a single
+# mv(2), so a step failing midway leaves the original intact rather than
+# truncated (run-242 PW-1).
 health_env_reconcile_line() {  # <KEY> <VALUE>
   local key="$1" value="$2" _tmp
   grep -q "^${key}=${value}$" "$HEALTH_ENV_FILE" && return 0
-  _tmp="$(mktemp)"
+  # Same directory as the target so the mv stays a rename on one filesystem.
+  # mktemp already creates it 0600; --reference restores the original's mode
+  # (and owner, when this runs as root) so the credential file never widens.
+  _tmp="$(mktemp "$(dirname "$HEALTH_ENV_FILE")/.health-env.XXXXXX")" || return 1
   if grep -q "^${key}=" "$HEALTH_ENV_FILE"; then
     awk -v k="$key" -v v="$value" 'index($0, k "=") == 1 {print k "=" v; next} {print}' \
       "$HEALTH_ENV_FILE" >"$_tmp" || { rm -f "$_tmp"; return 1; }
@@ -153,8 +157,11 @@ health_env_reconcile_line() {  # <KEY> <VALUE>
     cp "$HEALTH_ENV_FILE" "$_tmp" || { rm -f "$_tmp"; return 1; }
     printf '%s=%s\n' "$key" "$value" >>"$_tmp" || { rm -f "$_tmp"; return 1; }
   fi
-  cat "$_tmp" >"$HEALTH_ENV_FILE" || { rm -f "$_tmp"; return 1; }
-  rm -f "$_tmp"
+  chmod --reference="$HEALTH_ENV_FILE" "$_tmp" || { rm -f "$_tmp"; return 1; }
+  # Best-effort: a non-root caller cannot chown, and mktemp already left the
+  # scratch copy owned by whoever is reconciling the file.
+  chown --reference="$HEALTH_ENV_FILE" "$_tmp" 2>/dev/null || true
+  mv -f "$_tmp" "$HEALTH_ENV_FILE" || { rm -f "$_tmp"; return 1; }
   say "reconciled ${key}=${value} in $HEALTH_ENV_FILE"
 }
 
