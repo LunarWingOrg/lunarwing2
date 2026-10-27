@@ -28,13 +28,13 @@ use crate::tools::wasm::credential_injector::{
 };
 use crate::tools::wasm::error::WasmError;
 use crate::tools::wasm::host::{HostState, LogLevel};
+#[cfg(test)]
+use crate::tools::wasm::http_security::is_private_ip;
 use crate::tools::wasm::http_security::{
     RedactionNeedle, collect_capped_response_body, enforce_response_size,
     private_http_targets_allowed, push_credential_needles, redact_cross_field_echoes,
     redact_text_with_needles, reject_private_ip, replace_all_bytes, sort_redaction_needles,
 };
-#[cfg(test)]
-use crate::tools::wasm::http_security::is_private_ip;
 use crate::tools::wasm::limits::{ResourceLimits, WasmResourceLimiter};
 use crate::tools::wasm::runtime::{EPOCH_TICK_INTERVAL, PreparedModule, WasmToolRuntime};
 
