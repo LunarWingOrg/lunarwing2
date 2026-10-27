@@ -16,16 +16,17 @@ import (
 )
 
 const (
-	wrapperBinary = "COPY --from=builder /out/bin/opencode /usr/local/lib/opencode2/opencode"
-	wrapperScan   = "RUN install -D -m 0755 /app/scripts/opencode-exposure-guard.sh /usr/local/bin/opencode && python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --binary /usr/local/lib/opencode2/opencode"
-	filesystem    = "RUN python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --image-filesystem"
-	compileCopy   = "COPY scripts/compile_out_remote_tunnel.py /build/compile_out_remote_tunnel.py"
-	compileRun    = "RUN python3 /build/compile_out_remote_tunnel.py /build/opencode"
-	guardedBuild  = "RUN OPENCODE_VERSION=\"${OPENCODE_VERSION#v}\" bun run build -- --single"
-	anchorArg     = "ARG LUNARWING_WRAPPER_SHA256="
-	scriptsCopy   = "COPY scripts/ ./scripts/"
-	configCopy    = "COPY config/ ./config/"
-	bootCopy      = "COPY entrypoint.sh health_server.py agent_comm_protocol.json ./"
+	wrapperBinary   = "COPY --from=builder /out/bin/opencode /usr/local/lib/opencode2/opencode"
+	wrapperScan     = "RUN install -D -m 0755 /app/scripts/opencode-exposure-guard.sh /usr/local/bin/opencode && python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --binary /usr/local/lib/opencode2/opencode"
+	filesystem      = "RUN python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --image-filesystem"
+	compileCopy     = "COPY scripts/compile_out_remote_tunnel.py /build/compile_out_remote_tunnel.py"
+	compileRun      = "RUN python3 /build/compile_out_remote_tunnel.py /build/opencode"
+	guardedBuild    = "RUN OPENCODE_VERSION=\"${OPENCODE_VERSION#v}\" bun run build -- --single"
+	dependencyModes = "RUN chmod -R a-s,a-w /app/node_modules"
+	anchorArg       = "ARG LUNARWING_WRAPPER_SHA256="
+	scriptsCopy     = "COPY scripts/ ./scripts/"
+	configCopy      = "COPY config/ ./config/"
+	bootCopy        = "COPY entrypoint.sh health_server.py agent_comm_protocol.json ./"
 )
 
 var (
@@ -195,30 +196,35 @@ func checkCopyOwnership(line parsedLine) error {
 }
 
 type policyState struct {
-	stage          int
-	stageName      string
-	compileCopied  bool
-	compileRan     bool
-	guarded        bool
-	scanStage      int
-	assertStage    int
-	assertIndex    int
-	binaryStage    int
-	anchorStage    int
-	anchorIndex    int
-	filesystemSeen bool
-	lastUser       string
-	scriptsStage   int
-	configStage    int
-	bootStage      int
-	readonlyStage  int
+	stage               int
+	stageName           string
+	compileCopied       bool
+	compileRan          bool
+	guarded             bool
+	scanStage           int
+	assertStage         int
+	assertIndex         int
+	binaryStage         int
+	anchorStage         int
+	anchorIndex         int
+	dependencyCopyStage int
+	dependencyCopyIndex int
+	dependencyModeStage int
+	dependencyModeIndex int
+	filesystemSeen      bool
+	lastUser            string
+	scriptsStage        int
+	configStage         int
+	bootStage           int
+	readonlyStage       int
 }
 
 func newPolicyState() *policyState {
 	return &policyState{
 		scanStage: -1, assertStage: -1, assertIndex: -1, binaryStage: -1,
-		anchorStage: -1, anchorIndex: -1, scriptsStage: -1, configStage: -1,
-		bootStage: -1, readonlyStage: -1,
+		anchorStage: -1, anchorIndex: -1, dependencyCopyStage: -1,
+		dependencyCopyIndex: -1, dependencyModeStage: -1, dependencyModeIndex: -1,
+		scriptsStage: -1, configStage: -1, bootStage: -1, readonlyStage: -1,
 	}
 }
 
@@ -236,6 +242,9 @@ func (s *policyState) process(line parsedLine, index int) error {
 	if line.name == "USER" {
 		s.lastUser = canonicalInstruction(line.text)
 	}
+	if line.name == "COPY" && strings.Contains(line.text, "/app/node_modules") {
+		s.dependencyCopyStage, s.dependencyCopyIndex = s.stage, index
+	}
 	switch {
 	case sameInstruction(line, compileCopy) && s.stageName == "builder":
 		s.compileCopied = true
@@ -250,6 +259,8 @@ func (s *policyState) process(line parsedLine, index int) error {
 		s.binaryStage = s.stage
 	case sameInstruction(line, wrapperScan):
 		s.scanStage = s.stage
+	case sameInstruction(line, dependencyModes):
+		s.dependencyModeStage, s.dependencyModeIndex = s.stage, index
 	case sameInstruction(line, anchorArg):
 		s.anchorStage, s.anchorIndex = s.stage, index
 	case sameInstruction(line, filesystem):
@@ -295,6 +306,11 @@ func (s *policyState) validate() []error {
 	}
 	if s.anchorStage != s.assertStage || s.anchorIndex+1 != s.assertIndex {
 		errs = append(errs, fmt.Errorf("Dockerfile must declare ARG LUNARWING_WRAPPER_SHA256= immediately above the final assertion in its stage"))
+	}
+	dependencyCopiesFinal := s.dependencyCopyIndex < 0 || s.dependencyCopyStage == s.assertStage
+	if s.dependencyModeStage != s.assertStage || !dependencyCopiesFinal ||
+		s.dependencyModeIndex <= s.dependencyCopyIndex || s.dependencyModeIndex >= s.anchorIndex {
+		errs = append(errs, fmt.Errorf("Dockerfile must strip dependency privilege and write bits after every dependency COPY and before the wrapper anchor"))
 	}
 	if s.lastUser != "USER 10003:10003" {
 		errs = append(errs, fmt.Errorf("Dockerfile's last USER instruction must be exactly 'USER 10003:10003'"))

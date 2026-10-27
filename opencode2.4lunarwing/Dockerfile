@@ -388,6 +388,10 @@ RUN mkdir -p /home/opencode2/.local/share/opencode \
              /app/results \
     && chown -R opencode2:opencode2 /home/opencode2 /workspace /var/log/lunarwing /app/results
 
+# cp -a preserves setgid from the builder's source directories. Dependencies
+# stay root-owned and readable, with privilege and write bits stripped.
+RUN chmod -R a-s,a-w /app/node_modules
+
 # Check the final runtime filesystem, after all COPY/chown/chmod operations.
 # The wrapper anchor ARG (WI#357 run-106 GJ-3(a), WI#425 GX-3 layer-locality)
 # is declared here so the digest comparison is visible at the assert and a
