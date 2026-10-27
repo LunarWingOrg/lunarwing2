@@ -12,7 +12,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use futures::{Stream, StreamExt};
 use secrecy::{ExposeSecret, SecretString};
 use wasmtime::Store;
 use wasmtime::component::{Linker, ResourceTable};
@@ -29,6 +28,13 @@ use crate::tools::wasm::credential_injector::{
 };
 use crate::tools::wasm::error::WasmError;
 use crate::tools::wasm::host::{HostState, LogLevel};
+#[cfg(test)]
+use crate::tools::wasm::http_security::is_private_ip;
+use crate::tools::wasm::http_security::{
+    RedactionNeedle, collect_capped_response_body, enforce_response_size,
+    private_http_targets_allowed, push_credential_needles, redact_cross_field_echoes,
+    redact_text_with_needles, replace_all_bytes, sort_redaction_needles, vet_http_target,
+};
 use crate::tools::wasm::limits::{ResourceLimits, WasmResourceLimiter};
 use crate::tools::wasm::runtime::{EPOCH_TICK_INTERVAL, PreparedModule, WasmToolRuntime};
 
@@ -292,6 +298,8 @@ struct StoreData {
     host_credentials: Vec<ResolvedHostCredential>,
     /// Exact host-configured origin/path scope for built-in service clients.
     scoped_http_prefix: Option<String>,
+    /// Explicit WASM HTTP opt-in, independent of the daemon's network setting.
+    allow_private_ips: bool,
     /// Dedicated tokio runtime for HTTP requests, lazily initialized.
     /// Reused across multiple `http_request` calls within one execution.
     http_runtime: Option<tokio::runtime::Runtime>,
@@ -329,6 +337,7 @@ impl StoreData {
             credentials,
             host_credentials,
             scoped_http_prefix: None,
+            allow_private_ips: private_http_targets_allowed(),
             http_runtime: None,
             http_interceptor: None,
             ssh_bridge: Arc::new(std::sync::OnceLock::new()),
@@ -358,33 +367,25 @@ impl StoreData {
         result
     }
 
-    /// Replace injected credential values with `[REDACTED]` in text.
-    ///
-    /// Prevents credentials from leaking through error messages or logs.
-    /// reqwest::Error includes the full URL in its Display output, so any
-    /// error from an injected-URL request will contain the raw credential
-    /// unless we scrub it. Query-param injection URL-encodes the value, so
-    /// the encoded form is scrubbed alongside the raw one (WI#395).
-    fn redact_credentials(&self, text: &str) -> String {
-        let mut result = text.to_string();
+    fn redaction_needles(&self) -> Vec<RedactionNeedle> {
+        let mut needles = Vec::new();
         for (name, value) in &self.credentials {
-            if !value.is_empty() {
-                let replacement = format!("[REDACTED:{}]", name);
-                result = result.replace(value.as_str(), &replacement);
-                replace_encoded_secret(&mut result, value, &replacement);
-            }
+            push_credential_needles(&mut needles, value, &format!("[REDACTED:{name}]"));
         }
         for cred in &self.host_credentials {
-            if !cred.secret_value.is_empty() {
-                result = result.replace(cred.secret_value.as_str(), "[REDACTED:host_credential]");
-                replace_encoded_secret(
-                    &mut result,
-                    &cred.secret_value,
-                    "[REDACTED:host_credential]",
-                );
+            for value in host_credential_needles(cred) {
+                push_credential_needles(&mut needles, value, "[REDACTED:host_credential]");
             }
         }
-        result
+        sort_redaction_needles(&mut needles);
+        needles
+    }
+
+    /// Replace injected credential values with `[REDACTED]` in text.
+    /// Longest-first ordering keeps one credential nested inside another from
+    /// leaving a visible remainder (WI#432).
+    fn redact_credentials(&self, text: &str) -> String {
+        redact_text_with_needles(text, &self.redaction_needles())
     }
 
     /// Inject pre-resolved host credentials into the request.
@@ -501,52 +502,37 @@ impl StoreData {
         }
     }
 
-    /// Redact credentials from a serialized headers map at the field level
-    /// (WI#395 run-111 HA-8): a secret containing `"` or `\` is JSON-escaped
-    /// in the serialized form, so string-level replacement can miss it, and a
-    /// blind string replace could even produce invalid JSON. Parsing first
-    /// and redacting each name and value keeps the output valid for any
-    /// secret bytes.
+    /// Redact credentials from a serialized headers map at the field level.
+    /// Cross-field echoes replace both complete values before per-field
+    /// scrubbing, so neither side of a split secret survives (WI#432).
     fn redact_headers_json(&self, headers_json: &str) -> String {
-        let Ok(map) = serde_json::from_str::<HashMap<String, String>>(headers_json) else {
-            return self.redact_credentials(headers_json);
+        let needles = self.redaction_needles();
+        let Ok(mut map) = serde_json::from_str::<HashMap<String, String>>(headers_json) else {
+            return redact_text_with_needles(headers_json, &needles);
         };
+        redact_cross_field_echoes(&mut map, &needles);
         let redacted: HashMap<String, String> = map
             .into_iter()
             .map(|(name, value)| {
                 (
-                    self.redact_credentials(&name),
-                    self.redact_credentials(&value),
+                    redact_text_with_needles(&name, &needles),
+                    redact_text_with_needles(&value, &needles),
                 )
             })
             .collect();
-        serde_json::to_string(&redacted).unwrap_or_else(|_| self.redact_credentials(headers_json))
+        serde_json::to_string(&redacted)
+            .unwrap_or_else(|_| redact_text_with_needles(headers_json, &needles))
     }
 
-    /// Byte-level credential scrub for response bodies (WI#395 run-111
-    /// HA-3): bodies are not guaranteed UTF-8, so the raw and urlencoded
-    /// spellings are replaced at the byte level rather than through lossy
-    /// string conversion.
+    /// Byte-level credential scrub for response bodies, including the raw,
+    /// URL/form, URL-parser, JSON-string and hexadecimal spellings (WI#432).
     fn redact_credential_bytes(&self, mut bytes: Vec<u8>) -> Vec<u8> {
-        for (name, value) in &self.credentials {
-            if !value.is_empty() {
-                let marker = format!("[REDACTED:{name}]").into_bytes();
-                replace_all_bytes(&mut bytes, value.as_bytes(), &marker);
-                let encoded = urlencoding::encode(value).to_string();
-                if encoded != *value {
-                    replace_all_bytes(&mut bytes, encoded.as_bytes(), &marker);
-                }
-            }
-        }
-        for cred in &self.host_credentials {
-            if !cred.secret_value.is_empty() {
-                const MARKER: &[u8] = b"[REDACTED:host_credential]";
-                replace_all_bytes(&mut bytes, cred.secret_value.as_bytes(), MARKER);
-                let encoded = urlencoding::encode(&cred.secret_value).to_string();
-                if encoded != cred.secret_value {
-                    replace_all_bytes(&mut bytes, encoded.as_bytes(), MARKER);
-                }
-            }
+        for needle in self.redaction_needles() {
+            replace_all_bytes(
+                &mut bytes,
+                needle.value.as_bytes(),
+                needle.marker.as_bytes(),
+            );
         }
         bytes
     }
@@ -656,14 +642,18 @@ impl StoreData {
             .map(|h| h.max_response_bytes)
             .unwrap_or(10 * 1024 * 1024);
 
-        // Resolve hostname and reject private/internal IPs to prevent DNS rebinding.
-        // ALLOW_PRIVATE_IPS=1 opts out for local-dev / multi-tenant setups where WASM tools
-        // legitimately reach loopback services (e.g. the per-tenant OCR sidecar at 127.0.0.1:<port>).
-        // The MT admin script sets ALLOW_PRIVATE_IPS=1 in each tenant's lunarwing.env; this guard
-        // honors it. Without this, vision-analyze (and any loopback-bound WASM tool) is blocked.
-        if std::env::var("ALLOW_PRIVATE_IPS").ok().as_deref() != Some("1") {
-            reject_private_ip(&url)?;
-        }
+        // Only local host-scoped sidecars are exempt, tied to their exact
+        // configured origin and /v1/ path above. Other private targets require
+        // the WASM-specific opt-in, never the daemon's general network setting.
+        let host_scoped_service = self.scoped_http_prefix.as_deref().is_some_and(|prefix| {
+            url_matches_scoped_prefix(&url, prefix)
+                && url::Url::parse(prefix).is_ok_and(|parsed| is_local_service_url(&parsed))
+        });
+        let vetted_target = if !host_scoped_service && !self.allow_private_ips {
+            Some(vet_http_target(&url)?)
+        } else {
+            None
+        };
 
         // Make HTTP request using a dedicated single-threaded runtime.
         // We're inside spawn_blocking, so we can't rely on the main runtime's
@@ -737,6 +727,10 @@ impl StoreData {
             let client_builder = reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
                 .redirect(reqwest::redirect::Policy::none());
+            let client_builder = match &vetted_target {
+                Some(target) => target.pin_client(client_builder),
+                None => client_builder,
+            };
             let client_builder = if bypass_proxy {
                 client_builder.no_proxy()
             } else {
@@ -840,16 +834,6 @@ impl WasiView for StoreData {
     }
 }
 
-fn enforce_response_size(size: u64, max_response_bytes: usize) -> Result<(), String> {
-    if size > max_response_bytes as u64 {
-        return Err(format!(
-            "Response body too large: {} bytes exceeds limit of {} bytes",
-            size, max_response_bytes
-        ));
-    }
-    Ok(())
-}
-
 /// Shared live-response handling, also exercised by the loopback HTTP tests.
 async fn collect_guest_http_response(
     response: reqwest::Response,
@@ -880,57 +864,21 @@ async fn collect_guest_http_response(
     })
 }
 
-async fn collect_capped_response_body<S, E>(
-    stream: S,
-    content_length: Option<u64>,
-    max_response_bytes: usize,
-) -> Result<Vec<u8>, String>
-where
-    S: Stream<Item = Result<bytes::Bytes, E>>,
-    E: std::fmt::Display,
-{
-    if let Some(content_length) = content_length {
-        enforce_response_size(content_length, max_response_bytes)?;
+fn host_credential_needles(cred: &ResolvedHostCredential) -> Vec<&str> {
+    let mut needles = Vec::new();
+    if !cred.secret_value.is_empty() {
+        needles.push(cred.secret_value.as_str());
     }
-
-    let mut body = Vec::new();
-    futures::pin_mut!(stream);
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("Failed to read response body: {e}"))?;
-        let new_size = (body.len() as u64).saturating_add(chunk.len() as u64);
-        enforce_response_size(new_size, max_response_bytes)?;
-        body.extend_from_slice(&chunk);
+    for value in cred.headers.values() {
+        if let Some((_, token)) = value.split_once(' ') {
+            let token = token.trim();
+            if token.len() >= 8 && token != cred.secret_value && !token.contains(&cred.secret_value)
+            {
+                needles.push(token);
+            }
+        }
     }
-    Ok(body)
-}
-
-/// Also scrub the URL-encoded form of a secret. Query-param injection
-/// percent-encodes characters like `+`, `/` and `=` (typical of base64
-/// tokens), so a raw-value replace alone leaves the encoded copy intact
-/// (WI#395).
-fn replace_encoded_secret(result: &mut String, value: &str, replacement: &str) {
-    let encoded = urlencoding::encode(value).to_string();
-    if encoded != value {
-        *result = result.replace(encoded.as_str(), replacement);
-    }
-}
-
-/// Replace every occurrence of `needle` in `haystack` with `marker`, at the
-/// byte level (WI#395 run-111 HA-3 — response bodies are not guaranteed
-/// UTF-8, so string-level replacement cannot be used on them).
-fn replace_all_bytes(haystack: &mut Vec<u8>, needle: &[u8], marker: &[u8]) {
-    if needle.is_empty() {
-        return;
-    }
-    let mut search_from = 0;
-    while let Some(offset) = haystack[search_from..]
-        .windows(needle.len())
-        .position(|window| window == needle)
-    {
-        let at = search_from + offset;
-        haystack.splice(at..at + needle.len(), marker.iter().copied());
-        search_from = at + marker.len();
-    }
+    needles
 }
 
 /// Preserve every list-valued response field in the guest's string-map ABI.
@@ -1504,7 +1452,10 @@ impl WasmToolWrapper {
                 })
                 .map(|target| target.endpoint_prefix)
         } else {
-            None
+            service
+                .as_ref()
+                .and_then(|(service_url, _)| scoped_service_target(service_url))
+                .map(|target| target.endpoint_prefix)
         };
         let scoped_bearer_credential = service.and_then(|(service_url, token_var)| {
             crate::config::env_or_override(token_var).and_then(|token| {
@@ -2093,18 +2044,24 @@ async fn refresh_oauth_token(
         );
         return false;
     }
-    if let Err(reason) = reject_private_ip(&config.token_url) {
-        tracing::warn!(
-            token_url = %config.token_url,
-            reason = %reason,
-            "OAuth token_url points to a private/internal IP, refusing token refresh"
-        );
-        return false;
-    }
+    let vetted_target = match vet_http_target(&config.token_url) {
+        Ok(target) => target,
+        Err(reason) => {
+            tracing::warn!(
+                token_url = %config.token_url,
+                reason = %reason,
+                "OAuth token_url points to a private/internal IP, refusing token refresh"
+            );
+            return false;
+        }
+    };
 
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .redirect(reqwest::redirect::Policy::none())
+    let client = match vetted_target
+        .pin_client(
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .redirect(reqwest::redirect::Policy::none()),
+        )
         .build()
     {
         Ok(c) => c,
@@ -2412,86 +2369,6 @@ fn extract_host_from_url(url: &str) -> Option<String> {
     })
 }
 
-/// Resolve the URL's hostname and reject connections to private/internal IP addresses.
-/// This prevents DNS rebinding attacks where an attacker's domain resolves to an
-/// internal IP after passing the allowlist check.
-fn reject_private_ip(url: &str) -> Result<(), String> {
-    let parsed = url::Url::parse(url).map_err(|e| format!("Failed to parse URL: {e}"))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(format!("Unsupported URL scheme: {}", parsed.scheme()));
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err("URL contains userinfo (@) which is not allowed".to_string());
-    }
-
-    let host = parsed
-        .host_str()
-        .map(|h| {
-            h.strip_prefix('[')
-                .and_then(|v| v.strip_suffix(']'))
-                .unwrap_or(h)
-        })
-        .ok_or_else(|| "Failed to parse host from URL".to_string())?;
-
-    // If the host is already an IP, check it directly
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return if is_private_ip(ip) {
-            Err(format!(
-                "HTTP request to private/internal IP {} is not allowed",
-                ip
-            ))
-        } else {
-            Ok(())
-        };
-    }
-
-    // Resolve DNS and check all addresses
-    use std::net::ToSocketAddrs;
-    // Port 0 is a placeholder; ToSocketAddrs needs host:port but the port
-    // doesn't affect which IPs the hostname resolves to.
-    let addrs: Vec<_> = format!("{}:0", host)
-        .to_socket_addrs()
-        .map_err(|e| format!("DNS resolution failed for {}: {}", host, e))?
-        .collect();
-
-    if addrs.is_empty() {
-        return Err(format!("DNS resolution returned no addresses for {}", host));
-    }
-
-    for addr in &addrs {
-        if is_private_ip(addr.ip()) {
-            return Err(format!(
-                "DNS rebinding detected: {} resolved to private IP {}",
-                host,
-                addr.ip()
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-/// Check if an IP address belongs to a private/internal range.
-fn is_private_ip(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_loopback()           // 127.0.0.0/8
-            || v4.is_private()         // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-            || v4.is_link_local()      // 169.254.0.0/16
-            || v4.is_unspecified()     // 0.0.0.0
-            || v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64 // 100.64.0.0/10 (CGNAT)
-        }
-        std::net::IpAddr::V6(v6) => {
-            v6.is_loopback()           // ::1
-            || v6.is_unspecified()     // ::
-            // fc00::/7 (unique local)
-            || (v6.segments()[0] & 0xFE00) == 0xFC00
-            // fe80::/10 (link-local)
-            || (v6.segments()[0] & 0xFFC0) == 0xFE80
-        }
-    }
-}
-
 fn schema_contains_container_properties(schema: &serde_json::Value) -> bool {
     let has_container = |props: &serde_json::Map<String, serde_json::Value>| {
         props
@@ -2607,6 +2484,7 @@ mod tests {
     use crate::tools::tool::Tool;
     use crate::tools::wasm::capabilities::{Capabilities, WasmApprovalPolicy};
     use crate::tools::wasm::runtime::{WasmRuntimeConfig, WasmToolRuntime};
+    use crate::tools::wasm::wrapper::StoreData;
 
     fn response_chunks(
         sizes: &[usize],
@@ -3622,6 +3500,178 @@ mod tests {
         assert!(!redacted.contains("tok+/en=42"), "{redacted}");
         assert!(!redacted.contains(&encoded), "{redacted}");
         assert!(redacted.contains("[REDACTED:API_TOKEN]"), "{redacted}");
+    }
+
+    #[test]
+    fn wi432_needles_are_longest_first_and_skip_short_secrets() {
+        use super::{push_credential_needles, redact_text_with_needles, sort_redaction_needles};
+
+        let mut needles = Vec::new();
+        push_credential_needles(&mut needles, "prefix", "[REDACTED:SHORT]");
+        push_credential_needles(&mut needles, "prefixSuffix9", "[REDACTED:LONG]");
+        push_credential_needles(&mut needles, "utf", "[REDACTED:TINY]");
+        sort_redaction_needles(&mut needles);
+
+        let long = needles
+            .iter()
+            .position(|needle| needle.value == "prefixSuffix9")
+            .expect("long needle");
+        let short = needles
+            .iter()
+            .position(|needle| needle.value == "prefix")
+            .expect("short needle");
+        assert!(long < short);
+        assert!(!needles.iter().any(|needle| needle.value == "utf"));
+        assert!(!needles.iter().any(|needle| needle.value == "757474"));
+        assert_eq!(
+            redact_text_with_needles("prefixSuffix9 charset=utf-8", &needles),
+            "[REDACTED:LONG] charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn wi432_short_secret_does_not_mangle_tool_response() {
+        let mut credentials = HashMap::new();
+        credentials.insert("SHORT".to_string(), "utf".to_string());
+        credentials.insert("LONG".to_string(), "longsecret".to_string());
+        let store_data = StoreData::new(
+            1024 * 1024,
+            Capabilities::default(),
+            credentials,
+            Vec::new(),
+        );
+
+        assert_eq!(
+            store_data.redact_credentials("charset=utf-8 longsecret"),
+            "charset=utf-8 [REDACTED:LONG]"
+        );
+        assert_eq!(
+            store_data.redact_credential_bytes(b"charset=utf-8 longsecret".to_vec()),
+            b"charset=utf-8 [REDACTED:LONG]"
+        );
+    }
+
+    #[test]
+    fn wi432_body_scrub_covers_json_and_hex_spellings() {
+        let mut credentials = HashMap::new();
+        credentials.insert("API_TOKEN".to_string(), "A\"9z".to_string());
+        let store_data = StoreData::new(
+            1024 * 1024,
+            Capabilities::default(),
+            credentials,
+            Vec::new(),
+        );
+
+        let body = br#"raw=A"9z json=A\"9z lower=4122397a upper=4122397A"#.to_vec();
+        let redacted = store_data.redact_credential_bytes(body);
+        assert_eq!(
+            redacted,
+            br#"raw=[REDACTED:API_TOKEN] json=[REDACTED:API_TOKEN] lower=[REDACTED:API_TOKEN] upper=[REDACTED:API_TOKEN]"#
+        );
+    }
+
+    #[test]
+    fn wi432_header_scrub_covers_cross_field_echoes() {
+        let mut credentials = HashMap::new();
+        credentials.insert("API_TOKEN".to_string(), "s3cr3t-value".to_string());
+        let store_data = StoreData::new(
+            1024 * 1024,
+            Capabilities::default(),
+            credentials,
+            Vec::new(),
+        );
+        let headers = r#"{"x-first":"s3cr","x-second":"3t-value","x-other":"ok"}"#;
+
+        let redacted = store_data.redact_headers_json(headers);
+        let map: HashMap<String, String> =
+            serde_json::from_str(&redacted).expect("redacted headers remain valid JSON");
+        assert_eq!(
+            map.get("x-first").map(String::as_str),
+            Some("[REDACTED:API_TOKEN]")
+        );
+        assert_eq!(
+            map.get("x-second").map(String::as_str),
+            Some("[REDACTED:API_TOKEN]")
+        );
+        assert_eq!(map.get("x-other").map(String::as_str), Some("ok"));
+    }
+
+    #[test]
+    fn wi432_private_guard_allows_only_the_configured_sidecar_scope() {
+        use super::lunarwing::agent::host::Host as _;
+        use crate::tools::wasm::capabilities::{EndpointPattern, HttpCapability};
+
+        let capabilities = Capabilities::default().with_http(HttpCapability::new(vec![
+            EndpointPattern::host("127.0.0.1").with_path_prefix("/v1/"),
+        ]));
+        let mut store = StoreData::new(1024 * 1024, capabilities, HashMap::new(), Vec::new());
+        store.allow_private_ips = false;
+
+        let error = store
+            .http_request(
+                "POST".to_string(),
+                "http://127.0.0.1:8088/v1/ocr".to_string(),
+                "{}".to_string(),
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("private/internal IP"), "{error}");
+
+        store.scoped_http_prefix = Some("http://127.0.0.1:8088/v1/".to_string());
+        let error = store
+            .http_request(
+                "POST".to_string(),
+                "http://127.0.0.1:8088/other".to_string(),
+                "{}".to_string(),
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("host-configured service origin"), "{error}");
+
+        store.http_interceptor = Some(Arc::new(EncodingStub {
+            seen: Mutex::new(Vec::new()),
+            responses: Mutex::new(VecDeque::from([HttpExchangeResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: "ok".to_string(),
+            }])),
+        }));
+        let response = store
+            .http_request(
+                "POST".to_string(),
+                "http://127.0.0.1:8088/v1/ocr".to_string(),
+                "{}".to_string(),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(response.status, 200);
+    }
+
+    #[test]
+    fn wi432_remote_sidecar_scope_does_not_bypass_private_guard() {
+        use super::lunarwing::agent::host::Host as _;
+        use crate::tools::wasm::capabilities::{EndpointPattern, HttpCapability};
+
+        let capabilities = Capabilities::default().with_http(HttpCapability::new(vec![
+            EndpointPattern::host("192.168.1.20").with_path_prefix("/v1/"),
+        ]));
+        let mut store = StoreData::new(1024 * 1024, capabilities, HashMap::new(), Vec::new());
+        store.allow_private_ips = false;
+        store.scoped_http_prefix = Some("https://192.168.1.20/v1/".to_string());
+
+        let error = store
+            .http_request(
+                "POST".to_string(),
+                "https://192.168.1.20/v1/ocr".to_string(),
+                "{}".to_string(),
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("private/internal IP"), "{error}");
     }
 
     /// WI#395 (GN-6/GN-7): the trait boundary applies one redaction over the
@@ -5098,21 +5148,22 @@ mod tests {
 
     #[test]
     fn test_reject_private_ip_loopback() {
-        let result = super::reject_private_ip("https://127.0.0.1:8080/api");
+        let result = super::vet_http_target("https://127.0.0.1:8080/api");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("private/internal IP"));
+        let error = result.err().expect("loopback must be refused");
+        assert!(error.contains("private/internal IP"));
     }
 
     #[test]
     fn test_reject_private_ip_internal() {
-        let result = super::reject_private_ip("https://192.168.1.1/admin");
+        let result = super::vet_http_target("https://192.168.1.1/admin");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_reject_private_ip_public_ok() {
         // 8.8.8.8 (Google DNS) is public
-        let result = super::reject_private_ip("https://8.8.8.8/dns-query");
+        let result = super::vet_http_target("https://8.8.8.8/dns-query");
         assert!(result.is_ok());
     }
 

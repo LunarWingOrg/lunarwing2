@@ -479,6 +479,12 @@ pub trait ConversationStore: Send + Sync {
     /// so that non-UUID scopes (XMPP room JIDs, WeeChat buffers, etc.) get
     /// their own persistent conversation. The original scope string is stored
     /// in the `thread_id` column for traceability.
+    ///
+    /// Fails when the resolved conversation exists but belongs to a different
+    /// user or channel: a caller-supplied UUID scope is not proof of
+    /// ownership, and returning the id anyway would let the caller read and
+    /// append to someone else's history (WI#442 F7). The error is `NotFound`
+    /// so the failure does not confirm the conversation exists.
     async fn get_or_create_scoped_conversation(
         &self,
         channel: &str,
@@ -486,8 +492,15 @@ pub trait ConversationStore: Send + Sync {
         scope: &str,
     ) -> Result<Uuid, DatabaseError> {
         let conv_id = scoped_conversation_id(channel, user_id, scope);
-        self.ensure_conversation(conv_id, channel, user_id, Some(scope), Some(channel))
+        let ensured = self
+            .ensure_conversation(conv_id, channel, user_id, Some(scope), Some(channel))
             .await?;
+        if !ensured {
+            return Err(DatabaseError::NotFound {
+                entity: "conversation".to_string(),
+                id: conv_id.to_string(),
+            });
+        }
         Ok(conv_id)
     }
 }
@@ -1543,5 +1556,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(conv_a, conv_a2);
+    }
+
+    /// WI#442 F7: a caller-supplied UUID scope is not proof of ownership. A
+    /// scoped resolution for a conversation another user owns must fail
+    /// instead of handing back the id, so neither the forward dual-write nor
+    /// the v1-history import can read from or append to it.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn scoped_conversation_rejects_a_foreign_uuid_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let backend = crate::db::libsql::LibSqlBackend::new_local(&db_path)
+            .await
+            .unwrap();
+        Database::run_migrations(&backend).await.unwrap();
+        let db: &dyn ConversationStore = &backend;
+
+        let victim = db
+            .create_conversation("gateway", "victim", None)
+            .await
+            .unwrap();
+        db.add_conversation_message(victim, "user", "victim private question")
+            .await
+            .unwrap();
+        assert!(
+            !db.conversation_belongs_to_user(victim, "attacker")
+                .await
+                .unwrap()
+        );
+
+        // The attacker passes the victim's UUID as the scope.
+        let resolved = db
+            .get_or_create_scoped_conversation("gateway", "attacker", &victim.to_string())
+            .await;
+        assert!(
+            resolved.is_err(),
+            "a foreign UUID scope must not resolve: got {resolved:?}"
+        );
+        assert!(matches!(
+            resolved.unwrap_err(),
+            crate::error::DatabaseError::NotFound { .. }
+        ));
+
+        // The victim's history is untouched: no attacker row was appended.
+        let msgs = db.list_conversation_messages(victim).await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "victim private question");
+
+        // The victim still resolves their own conversation.
+        assert_eq!(
+            db.get_or_create_scoped_conversation("gateway", "victim", &victim.to_string())
+                .await
+                .unwrap(),
+            victim
+        );
     }
 }

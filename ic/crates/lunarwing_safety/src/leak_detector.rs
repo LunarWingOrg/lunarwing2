@@ -284,9 +284,6 @@ impl LeakDetector {
                 pattern: blocking_match
                     .map(|m| m.pattern_name.clone())
                     .unwrap_or_default(),
-                preview: blocking_match
-                    .map(|m| m.masked_preview.clone())
-                    .unwrap_or_default(),
             });
         }
 
@@ -299,14 +296,12 @@ impl LeakDetector {
                 tracing::warn!(
                     pattern = %leak_match.pattern_name,
                     severity = %leak_match.severity,
-                    preview = %leak_match.masked_preview,
                     "Potential secret leak detected (warning only)"
                 );
             } else {
                 tracing::debug!(
                     pattern = %leak_match.pattern_name,
                     severity = %leak_match.severity,
-                    preview = %leak_match.masked_preview,
                     "Potential secret-like value detected (heuristic only)"
                 );
             }
@@ -340,9 +335,8 @@ impl LeakDetector {
         // Scan each header value
         for (name, value) in headers {
             self.scan_and_clean(value)
-                .map_err(|e| LeakDetectionError::SecretLeakBlocked {
+                .map_err(|_| LeakDetectionError::SecretLeakBlocked {
                     pattern: format!("header:{}", name),
-                    preview: e.to_string(),
                 })?;
         }
 
@@ -377,8 +371,8 @@ impl Default for LeakDetector {
 /// Error from leak detection.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum LeakDetectionError {
-    #[error("Secret leak blocked: pattern '{pattern}' matched '{preview}'")]
-    SecretLeakBlocked { pattern: String, preview: String },
+    #[error("Secret leak blocked: pattern '{pattern}' matched")]
+    SecretLeakBlocked { pattern: String },
 }
 
 /// Mask a secret for safe display.
@@ -616,7 +610,7 @@ mod tests {
     #[test]
     fn test_detect_openai_key() {
         let detector = LeakDetector::new();
-        let content = "API key: sk-proj-abc123def456ghi789jkl012mno345pqrT3BlbkFJtest123";
+        let content = "API key: sk-proj-abc123def456ghi789jkl012mno345pqrT3BlbkFJtest123"; // gitleaks:allow
 
         let result = detector.scan(content);
         assert!(!result.is_clean());
@@ -900,12 +894,21 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_and_clean_blocks() {
+    fn test_scan_and_clean_blocks_without_secret_preview() {
         let detector = LeakDetector::new();
         let content = "sk-proj-test1234567890abcdefghij";
 
-        let result = detector.scan_and_clean(content);
-        assert!(result.is_err());
+        let error = detector
+            .scan_and_clean(content)
+            .expect_err("the credential pattern must still block");
+        assert_eq!(
+            error.to_string(),
+            "Secret leak blocked: pattern 'openai_api_key' matched"
+        );
+        assert_eq!(
+            format!("{error:?}"),
+            "SecretLeakBlocked { pattern: \"openai_api_key\" }"
+        );
     }
 
     #[test]
@@ -1272,7 +1275,7 @@ mod tests {
         fn stripe_key_pattern_100kb_near_miss() {
             let detector = LeakDetector::new();
             // Near-miss: "sk_live_" followed by short string (< 24 chars)
-            let chunk = "sk_live_short12345 ";
+            let chunk = "sk_live_short12345 "; // gitleaks:allow
             let payload = chunk.repeat(5500);
             assert!(payload.len() > 100_000);
 
