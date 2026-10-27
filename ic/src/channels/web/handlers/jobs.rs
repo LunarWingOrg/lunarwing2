@@ -18,7 +18,7 @@ use crate::channels::web::types::*;
 /// Query parameters for `GET /api/jobs`.
 #[derive(Debug, Deserialize)]
 pub struct JobListQuery {
-    /// Optional mode filter: `worker`, `harness`, `sandbox`, `external`, or
+    /// Optional mode filter: `worker`, `harness`, `external`, or
     /// `external:<worker>` (WI#479). Jobs with no stored mode match `worker`
     /// — the historical default — but never `external*`.
     pub mode: Option<String>,

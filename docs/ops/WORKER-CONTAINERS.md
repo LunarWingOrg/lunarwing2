@@ -1942,7 +1942,7 @@ Both come from the `job_mode` column already selected by
 `list_sandbox_jobs_for_user` / the libSQL equivalent, so the list stays a
 single query per source. Agent (non-sandbox) jobs have no sandbox mode and
 report neither field. An optional `?mode=` filter accepts `worker`
-(the default, also matching mode-less rows), `harness`, `sandbox`,
+(the default, also matching mode-less rows), `harness`,
 `external` (any external lane) or `external:<name>`; the web Jobs table shows
 a Mode column fed from the same field.
 
