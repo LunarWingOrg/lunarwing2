@@ -245,6 +245,19 @@ there. If a candidate still fails after all eight attempts, wait a few
 minutes and re-run the job manually — the scan follows once a candidate
 publishes `worker-image.env`.
 
+The read side has the same class of retry: the
+`worker-opencode2-exposure-verify` job fetches a registry pull token, the
+image manifest and the image config, and pipeline #6540 lost only that job
+to `429 Too Many Requests: Retry later` on the token fetch (every other
+container job went green). Since 2026-10-27
+`.gitlab/scripts/verify-opencode2-exposure-out-of-band.py` routes those
+three fetches through a bounded `fetch_json` retry — 6 attempts with
+exponential backoff from a 15 s base (15/30/60/120/240 s; 465 s of sleeping,
+inside the 30m timeout) plus `CI_JOB_ID % 30` jitter — that fires only on
+`429`/`5xx`/`URLError`; a genuine fetch failure (e.g. `404`) still exits on
+the first attempt. Pinned by `RegistryRetryTests` in
+`.gitlab/tests/test_worker_out_of_band_verify.py`.
+
 ## worker-kimi digest mismatch (directory mtime flake)
 
 Symptom — `worker-kimi-candidate` fails with:
