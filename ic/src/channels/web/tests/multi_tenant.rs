@@ -915,11 +915,11 @@ mod jobs_isolation {
             .uri(uri)
             .header("Authorization", "Bearer tok-alice")
             .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(resp.into_body(), 16384).await.unwrap();
-        serde_json::from_slice(&bytes).unwrap()
+            .unwrap(); // safety: test-only request builder
+        let resp = app.oneshot(req).await.unwrap(); // safety: test-only
+        assert_eq!(resp.status(), StatusCode::OK); // safety: test-only
+        let bytes = axum::body::to_bytes(resp.into_body(), 16384).await.unwrap(); // safety: test-only
+        serde_json::from_slice(&bytes).unwrap() // safety: test-only
     }
 
     #[tokio::test]
