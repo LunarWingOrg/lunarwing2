@@ -12,7 +12,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use futures::{Stream, StreamExt};
 use secrecy::{ExposeSecret, SecretString};
 use wasmtime::Store;
 use wasmtime::component::{Linker, ResourceTable};
@@ -29,6 +28,13 @@ use crate::tools::wasm::credential_injector::{
 };
 use crate::tools::wasm::error::WasmError;
 use crate::tools::wasm::host::{HostState, LogLevel};
+use crate::tools::wasm::http_security::{
+    RedactionNeedle, collect_capped_response_body, enforce_response_size,
+    private_http_targets_allowed, push_credential_needles, redact_cross_field_echoes,
+    redact_text_with_needles, reject_private_ip, replace_all_bytes, sort_redaction_needles,
+};
+#[cfg(test)]
+use crate::tools::wasm::http_security::is_private_ip;
 use crate::tools::wasm::limits::{ResourceLimits, WasmResourceLimiter};
 use crate::tools::wasm::runtime::{EPOCH_TICK_INTERVAL, PreparedModule, WasmToolRuntime};
 
@@ -633,12 +639,14 @@ impl StoreData {
             .map(|h| h.max_response_bytes)
             .unwrap_or(10 * 1024 * 1024);
 
-        // Resolve hostname and reject private/internal IPs to prevent DNS rebinding.
-        // ALLOW_PRIVATE_IPS=1 opts out for local-dev / multi-tenant setups where WASM tools
-        // legitimately reach loopback services (e.g. the per-tenant OCR sidecar at 127.0.0.1:<port>).
-        // The MT admin script sets ALLOW_PRIVATE_IPS=1 in each tenant's lunarwing.env; this guard
-        // honors it. Without this, vision-analyze (and any loopback-bound WASM tool) is blocked.
-        if std::env::var("ALLOW_PRIVATE_IPS").ok().as_deref() != Some("1") {
+        // Host-scoped sidecars are tied to an exact configured origin and /v1/
+        // path above. Other private targets require the WASM-specific opt-in;
+        // the daemon's database/network setting must not disable this guard.
+        let host_scoped_service = self
+            .scoped_http_prefix
+            .as_deref()
+            .is_some_and(|prefix| url_matches_scoped_prefix(&url, prefix));
+        if !host_scoped_service && !private_http_targets_allowed() {
             reject_private_ip(&url)?;
         }
 
@@ -817,16 +825,6 @@ impl WasiView for StoreData {
     }
 }
 
-fn enforce_response_size(size: u64, max_response_bytes: usize) -> Result<(), String> {
-    if size > max_response_bytes as u64 {
-        return Err(format!(
-            "Response body too large: {} bytes exceeds limit of {} bytes",
-            size, max_response_bytes
-        ));
-    }
-    Ok(())
-}
-
 /// Shared live-response handling, also exercised by the loopback HTTP tests.
 async fn collect_guest_http_response(
     response: reqwest::Response,
@@ -857,113 +855,6 @@ async fn collect_guest_http_response(
     })
 }
 
-pub(crate) async fn collect_capped_response_body<S, E>(
-    stream: S,
-    content_length: Option<u64>,
-    max_response_bytes: usize,
-) -> Result<Vec<u8>, String>
-where
-    S: Stream<Item = Result<bytes::Bytes, E>>,
-    E: std::fmt::Display,
-{
-    if let Some(content_length) = content_length {
-        enforce_response_size(content_length, max_response_bytes)?;
-    }
-
-    let mut body = Vec::new();
-    futures::pin_mut!(stream);
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("Failed to read response body: {e}"))?;
-        let new_size = (body.len() as u64).saturating_add(chunk.len() as u64);
-        enforce_response_size(new_size, max_response_bytes)?;
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
-const MIN_CREDENTIAL_SCRUB_LEN: usize = 4;
-
-struct RedactionNeedle {
-    value: String,
-    marker: String,
-}
-
-fn push_credential_needles(needles: &mut Vec<RedactionNeedle>, secret: &str, marker: &str) {
-    if secret.len() < MIN_CREDENTIAL_SCRUB_LEN {
-        return;
-    }
-    let mut spellings = vec![secret.to_string()];
-    spellings.extend(encoded_spellings(secret));
-    for value in spellings {
-        if value.len() >= MIN_CREDENTIAL_SCRUB_LEN {
-            needles.push(RedactionNeedle {
-                value,
-                marker: marker.to_string(),
-            });
-        }
-    }
-}
-
-fn sort_redaction_needles(needles: &mut Vec<RedactionNeedle>) {
-    needles.sort_by(|left, right| {
-        right
-            .value
-            .len()
-            .cmp(&left.value.len())
-            .then_with(|| left.value.cmp(&right.value))
-            .then_with(|| left.marker.cmp(&right.marker))
-    });
-    needles.dedup_by(|left, right| left.value == right.value);
-}
-
-fn redact_text_with_needles(text: &str, needles: &[RedactionNeedle]) -> String {
-    let mut result = text.to_string();
-    for needle in needles {
-        result = result.replace(&needle.value, &needle.marker);
-    }
-    result
-}
-
-fn redact_cross_field_echoes(fields: &mut HashMap<String, String>, needles: &[RedactionNeedle]) {
-    let snapshot: Vec<(String, String)> = fields
-        .iter()
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect();
-    let mut replacements = HashMap::new();
-    for (index, (left_name, left_value)) in snapshot.iter().enumerate() {
-        for (right_name, right_value) in snapshot.iter().skip(index + 1) {
-            if let Some(needle) = cross_field_needle(left_value, right_value, needles) {
-                replacements
-                    .entry(left_name.clone())
-                    .or_insert_with(|| needle.marker.clone());
-                replacements
-                    .entry(right_name.clone())
-                    .or_insert_with(|| needle.marker.clone());
-            }
-        }
-    }
-    for (name, value) in fields {
-        if let Some(marker) = replacements.get(name) {
-            *value = marker.clone();
-        }
-    }
-}
-
-fn cross_field_needle<'a>(
-    left: &str,
-    right: &str,
-    needles: &'a [RedactionNeedle],
-) -> Option<&'a RedactionNeedle> {
-    needles.iter().find(|needle| {
-        let value = &needle.value;
-        (1..value.len()).any(|split| {
-            value.is_char_boundary(split)
-                && ((left.ends_with(&value[..split]) && right.starts_with(&value[split..]))
-                    || (right.ends_with(&value[..split]) && left.starts_with(&value[split..])))
-        })
-    })
-}
-
 fn host_credential_needles(cred: &ResolvedHostCredential) -> Vec<&str> {
     let mut needles = Vec::new();
     if !cred.secret_value.is_empty() {
@@ -979,80 +870,6 @@ fn host_credential_needles(cred: &ResolvedHostCredential) -> Vec<&str> {
         }
     }
     needles
-}
-
-fn form_encode_secret(secret: &str) -> String {
-    url::form_urlencoded::byte_serialize(secret.as_bytes()).collect()
-}
-
-fn encoded_spellings(secret: &str) -> Vec<String> {
-    let mut out = vec![
-        urlencoding::encode(secret).to_string(),
-        form_encode_secret(secret),
-    ];
-    if let Ok(mut parsed) = url::Url::parse("http://redaction.invalid/") {
-        parsed.set_query(Some(secret));
-        if let Some(query) = parsed.query() {
-            out.push(query.to_string());
-        }
-        parsed.set_query(None);
-        parsed.set_path(secret);
-        out.push(parsed.path().trim_start_matches('/').to_string());
-    }
-    for candidate in [secret.replace('+', " "), secret.to_string()] {
-        if let Ok(decoded) = urlencoding::decode(&candidate) {
-            out.push(decoded.into_owned());
-        }
-    }
-    if let Ok(json) = serde_json::to_string(secret)
-        && let Some(inner) = json.strip_prefix('"').and_then(|v| v.strip_suffix('"'))
-    {
-        out.push(inner.to_string());
-    }
-    out.push(hex_encode_secret(secret, false));
-    out.push(hex_encode_secret(secret, true));
-    out.retain(|spelling| !spelling.is_empty() && spelling != secret);
-    out.sort();
-    out.dedup();
-    out
-}
-
-fn hex_encode_secret(secret: &str, uppercase: bool) -> String {
-    let digits = if uppercase {
-        b"0123456789ABCDEF"
-    } else {
-        b"0123456789abcdef"
-    };
-    let mut encoded = String::with_capacity(secret.len() * 2);
-    for byte in secret.bytes() {
-        encoded.push(digits[(byte >> 4) as usize] as char);
-        encoded.push(digits[(byte & 0x0f) as usize] as char);
-    }
-    encoded
-}
-
-/// Replace every occurrence of `needle` in `haystack` with `marker` in one
-/// pass into a fresh buffer, avoiding quadratic in-place splicing.
-fn replace_all_bytes(haystack: &mut Vec<u8>, needle: &[u8], marker: &[u8]) {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return;
-    }
-    let mut out = Vec::with_capacity(haystack.len());
-    let mut index = 0;
-    let mut changed = false;
-    while index < haystack.len() {
-        if haystack[index..].starts_with(needle) {
-            out.extend_from_slice(marker);
-            index += needle.len();
-            changed = true;
-        } else {
-            out.push(haystack[index]);
-            index += 1;
-        }
-    }
-    if changed {
-        *haystack = out;
-    }
 }
 
 /// Preserve every list-valued response field in the guest's string-map ABI.
@@ -1626,7 +1443,10 @@ impl WasmToolWrapper {
                 })
                 .map(|target| target.endpoint_prefix)
         } else {
-            None
+            service
+                .as_ref()
+                .and_then(|(service_url, _)| scoped_service_target(service_url))
+                .map(|target| target.endpoint_prefix)
         };
         let scoped_bearer_credential = service.and_then(|(service_url, token_var)| {
             crate::config::env_or_override(token_var).and_then(|token| {
@@ -2532,86 +2352,6 @@ fn extract_host_from_url(url: &str) -> Option<String> {
             .unwrap_or(h)
             .to_lowercase()
     })
-}
-
-/// Resolve the URL's hostname and reject connections to private/internal IP addresses.
-/// This prevents DNS rebinding attacks where an attacker's domain resolves to an
-/// internal IP after passing the allowlist check.
-pub(crate) fn reject_private_ip(url: &str) -> Result<(), String> {
-    let parsed = url::Url::parse(url).map_err(|e| format!("Failed to parse URL: {e}"))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(format!("Unsupported URL scheme: {}", parsed.scheme()));
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err("URL contains userinfo (@) which is not allowed".to_string());
-    }
-
-    let host = parsed
-        .host_str()
-        .map(|h| {
-            h.strip_prefix('[')
-                .and_then(|v| v.strip_suffix(']'))
-                .unwrap_or(h)
-        })
-        .ok_or_else(|| "Failed to parse host from URL".to_string())?;
-
-    // If the host is already an IP, check it directly
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return if is_private_ip(ip) {
-            Err(format!(
-                "HTTP request to private/internal IP {} is not allowed",
-                ip
-            ))
-        } else {
-            Ok(())
-        };
-    }
-
-    // Resolve DNS and check all addresses
-    use std::net::ToSocketAddrs;
-    // Port 0 is a placeholder; ToSocketAddrs needs host:port but the port
-    // doesn't affect which IPs the hostname resolves to.
-    let addrs: Vec<_> = format!("{}:0", host)
-        .to_socket_addrs()
-        .map_err(|e| format!("DNS resolution failed for {}: {}", host, e))?
-        .collect();
-
-    if addrs.is_empty() {
-        return Err(format!("DNS resolution returned no addresses for {}", host));
-    }
-
-    for addr in &addrs {
-        if is_private_ip(addr.ip()) {
-            return Err(format!(
-                "DNS rebinding detected: {} resolved to private IP {}",
-                host,
-                addr.ip()
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-/// Check if an IP address belongs to a private/internal range.
-fn is_private_ip(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_loopback()           // 127.0.0.0/8
-            || v4.is_private()         // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-            || v4.is_link_local()      // 169.254.0.0/16
-            || v4.is_unspecified()     // 0.0.0.0
-            || v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64 // 100.64.0.0/10 (CGNAT)
-        }
-        std::net::IpAddr::V6(v6) => {
-            v6.is_loopback()           // ::1
-            || v6.is_unspecified()     // ::
-            // fc00::/7 (unique local)
-            || (v6.segments()[0] & 0xFE00) == 0xFC00
-            // fe80::/10 (link-local)
-            || (v6.segments()[0] & 0xFFC0) == 0xFE80
-        }
-    }
 }
 
 fn schema_contains_container_properties(schema: &serde_json::Value) -> bool {
