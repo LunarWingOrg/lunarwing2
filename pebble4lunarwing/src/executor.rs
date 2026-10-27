@@ -414,17 +414,24 @@ fn spawn_pebble(
     spawn_pebble_with_options(config, request, proxy_env, llm_request_timeout_secs())
 }
 
-/// Install an executable test stub without the write-then-exec race.
+/// Install an executable test stub the way the kernel is guaranteed to accept.
 ///
-/// `std::fs::write` immediately followed by `execve` can fail with
-/// `ETXTBSY` ("Text file busy") while the kernel still holds a write
-/// reference on the target inode. Pipeline 6562's first `worker-pebble-rust`
-/// attempt (job 138240) died exactly that way spawning `pebble-stub.sh`, and
-/// the manual retry hid the failure behind an otherwise-green pipeline.
+/// Pipeline 6562's first `worker-pebble-rust` attempt (job 138240) died with
+/// `Text file busy (os error 26)` while the executor spawned the freshly
+/// written `pebble-stub.sh`; `script_failure` is deliberately outside the
+/// default retry list, so the pipeline only looked green after a manual retry.
+///
+/// `ETXTBSY` is the kernel refusing `execve` on an inode that is still busy
+/// being written. The tests wrote their stubs straight to the final path with
+/// `std::fs::write` and spawned it immediately after, so the exec raced the
+/// runner's filesystem settling that write — a window that is invisible on a
+/// quiet local checkout and wide on an overlayfs runner whose disk was 92%
+/// full.
 ///
 /// Writing a sibling temp file, flushing it with `sync_data`, and renaming it
-/// into place hands the executor a fresh inode that was never opened for
-/// writing under its final name, so there is no window left to race.
+/// into place closes that window: the executor only ever sees a directory
+/// entry whose inode is finished and closed, because `rename` installs it
+/// atomically instead of writing it in place.
 #[cfg(test)]
 pub(crate) fn write_executable_stub(path: &Path, contents: &str) {
     use std::io::Write;
@@ -441,6 +448,9 @@ pub(crate) fn write_executable_stub(path: &Path, contents: &str) {
     // win the race against writeback on an overlayfs runner.
     file.sync_data().expect("flush stub");
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).expect("chmod stub");
+    // Drop the write handle before the rename: an inode renamed while still
+    // open for write carries exactly the ETXTBSY condition being fixed.
+    drop(file);
     std::fs::rename(&tmp, path).expect("rename stub into place");
 }
 
@@ -1656,6 +1666,112 @@ mod tests {
         let path = std::ffi::OsString::from(format!("{rel_name}:{}", abs_dir.display()));
         let resolved = resolve_setpriv_in(&path).expect("absolute entry resolves");
         assert_eq!(resolved, abs_stub.as_os_str());
+    }
+
+    /// Regression pin (item-28, pipeline 6562 job 138240): the pebble tests
+    /// install shell stubs and the executor spawns them right after, so the
+    /// installer must hand over an inode the kernel is guaranteed to accept —
+    /// never one it can still reject with `ETXTBSY` ("Text file busy"), which
+    /// is what failed that job and only looked green after a manual retry.
+    ///
+    /// The positive control is the discriminating half: `execve` on a file
+    /// whose write handle is still open fails with exactly `ETXTBSY` on
+    /// Linux, so that assertion proves the kernel on this machine really does
+    /// enforce the busy check rather than the test passing vacuously.
+    #[test]
+    fn installed_stub_never_leaves_the_write_handle_open() {
+        use std::io::Write;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("pebble-etxtbsy-{}-{seq}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create stub dir");
+
+        // Positive control: the rejected shape. Holding the write handle open
+        // across the spawn is what makes the kernel refuse the exec.
+        let busy = dir.join("busy.sh");
+        let mut handle = std::fs::File::create(&busy).expect("create busy stub");
+        handle
+            .write_all(b"#!/bin/sh\nexit 0\n")
+            .expect("write busy stub");
+        std::fs::set_permissions(&busy, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod busy stub");
+        let refused = std::process::Command::new(&busy)
+            .output()
+            .expect_err("spawn with the write handle held open must be refused");
+        assert_eq!(
+            refused.raw_os_error(),
+            Some(libc::ETXTBSY),
+            "positive control must fail as ETXTBSY, got {refused:?}"
+        );
+        drop(handle);
+
+        // The story: the helper's stub spawns cleanly and runs its body.
+        let stub = dir.join("pebble-stub.sh");
+        write_executable_stub(&stub, "#!/bin/sh\necho STUB_RAN\n");
+        let out = std::process::Command::new(&stub)
+            .output()
+            .expect("spawn the freshly installed stub");
+        assert!(
+            out.status.success(),
+            "freshly installed stub must exec cleanly, got {:?}",
+            out.status
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "STUB_RAN",
+            "the installed stub must carry its full body"
+        );
+
+        // The helper must be executable, and must leave no sibling temp file
+        // behind — a leaked `*.tmp-*` would be the write side not being
+        // closed and renamed.
+        assert!(
+            std::fs::metadata(&stub).expect("stub metadata").mode() & 0o111 != 0,
+            "the installed stub must be executable"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read stub dir")
+            .map(|entry| entry.expect("dir entry").path().display().to_string())
+            .filter(|name| name.contains(".tmp-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the installer must rename its temp file away, left {leftovers:?}"
+        );
+
+        // Re-installing over an existing stub must replace it, not refuse or
+        // append — the tests reuse a workspace root across dispatches.
+        write_executable_stub(&stub, "#!/bin/sh\necho SECOND\n");
+        let out = std::process::Command::new(&stub)
+            .output()
+            .expect("spawn the re-installed stub");
+        assert!(out.status.success(), "re-installed stub must exec");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "SECOND",
+            "re-installing must replace the body, not append to it"
+        );
+
+        // The install must go through a rename, not a write to the final
+        // path: a rename hands the executor a DIFFERENT inode, while writing
+        // in place keeps the one the kernel may still consider busy. The
+        // marker inode below is what an in-place `fs::write` would reuse.
+        let marker = dir.join("marker.sh");
+        std::fs::write(&marker, "#!/bin/sh\nexit 0\n").expect("write marker");
+        let before = std::fs::metadata(&marker).expect("marker metadata").ino();
+        write_executable_stub(&marker, "#!/bin/sh\nexit 0\n");
+        let after = std::fs::metadata(&marker)
+            .expect("installed metadata")
+            .ino();
+        assert_ne!(
+            before, after,
+            "the installer must rename a finished inode into place, not rewrite the busy one"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
