@@ -59,7 +59,13 @@ use crate::tools::wasm::WasmResourceLimiter;
 use crate::tools::wasm::credential_injector::{
     InjectedCredentials, host_matches_pattern, inject_credential,
 };
-use crate::tools::wasm::wrapper::{collect_capped_response_body, reject_private_ip};
+use crate::tools::wasm::http_security::{
+    RedactionNeedle, collect_capped_response_body, private_http_targets_allowed,
+    push_credential_needles, redact_cross_field_echoes, redact_text_with_needles,
+    reject_private_ip, replace_all_bytes, sort_redaction_needles,
+};
+#[cfg(test)]
+use crate::tools::wasm::http_security::{encoded_spellings, form_encode_secret};
 
 // Generate component model bindings from the WIT file
 wasmtime::component::bindgen!({
@@ -136,7 +142,7 @@ impl ChannelStoreData {
             host_credentials,
             pairing_store,
             http_runtime: None,
-            allow_private_ips: std::env::var("ALLOW_PRIVATE_IPS").ok().as_deref() == Some("1"),
+            allow_private_ips: private_http_targets_allowed(),
             last_http_exchange_had_credentials: false,
         }
     }
@@ -3662,144 +3668,6 @@ impl HttpResponse {
     }
 }
 
-const MIN_CREDENTIAL_SCRUB_LEN: usize = 4;
-
-struct RedactionNeedle {
-    value: String,
-    marker: String,
-}
-
-fn push_credential_needles(needles: &mut Vec<RedactionNeedle>, secret: &str, marker: &str) {
-    if secret.len() < MIN_CREDENTIAL_SCRUB_LEN {
-        return;
-    }
-    let mut spellings = vec![secret.to_string()];
-    spellings.extend(encoded_spellings(secret));
-    for value in spellings {
-        if value.len() >= MIN_CREDENTIAL_SCRUB_LEN {
-            needles.push(RedactionNeedle {
-                value,
-                marker: marker.to_string(),
-            });
-        }
-    }
-}
-
-fn sort_redaction_needles(needles: &mut Vec<RedactionNeedle>) {
-    needles.sort_by(|left, right| {
-        right
-            .value
-            .len()
-            .cmp(&left.value.len())
-            .then_with(|| left.value.cmp(&right.value))
-            .then_with(|| left.marker.cmp(&right.marker))
-    });
-    needles.dedup_by(|left, right| left.value == right.value);
-}
-
-fn redact_text_with_needles(text: &str, needles: &[RedactionNeedle]) -> String {
-    let mut result = text.to_string();
-    for needle in needles {
-        result = result.replace(&needle.value, &needle.marker);
-    }
-    result
-}
-
-fn redact_cross_field_echoes(fields: &mut HashMap<String, String>, needles: &[RedactionNeedle]) {
-    let snapshot: Vec<(String, String)> = fields
-        .iter()
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect();
-    let mut replacements = HashMap::new();
-    for (index, (left_name, left_value)) in snapshot.iter().enumerate() {
-        for (right_name, right_value) in snapshot.iter().skip(index + 1) {
-            if let Some(needle) = cross_field_needle(left_value, right_value, needles) {
-                replacements
-                    .entry(left_name.clone())
-                    .or_insert_with(|| needle.marker.clone());
-                replacements
-                    .entry(right_name.clone())
-                    .or_insert_with(|| needle.marker.clone());
-            }
-        }
-    }
-    for (name, value) in fields {
-        if let Some(marker) = replacements.get(name) {
-            *value = marker.clone();
-        }
-    }
-}
-
-fn cross_field_needle<'a>(
-    left: &str,
-    right: &str,
-    needles: &'a [RedactionNeedle],
-) -> Option<&'a RedactionNeedle> {
-    needles.iter().find(|needle| {
-        let value = &needle.value;
-        (1..value.len()).any(|split| {
-            value.is_char_boundary(split)
-                && ((left.ends_with(&value[..split]) && right.starts_with(&value[split..]))
-                    || (right.ends_with(&value[..split]) && left.starts_with(&value[split..])))
-        })
-    })
-}
-
-/// The `application/x-www-form-urlencoded` spelling used by query-pair
-/// injection. It differs from `urlencoding::encode` for space, `~` and `*`.
-fn form_encode_secret(secret: &str) -> String {
-    url::form_urlencoded::byte_serialize(secret.as_bytes()).collect()
-}
-
-fn encoded_spellings(secret: &str) -> Vec<String> {
-    let mut out = vec![
-        urlencoding::encode(secret).to_string(),
-        form_encode_secret(secret),
-    ];
-    if let Ok(mut parsed) = url::Url::parse("http://redaction.invalid/") {
-        parsed.set_query(Some(secret));
-        if let Some(query) = parsed.query() {
-            out.push(query.to_string());
-        }
-        parsed.set_query(None);
-        parsed.set_path(secret);
-        out.push(parsed.path().trim_start_matches('/').to_string());
-    }
-    // An upstream that parses a raw-substituted query placeholder reads '+'
-    // as a space and decodes %XX escapes; echoing the parsed value gives
-    // these spellings (run-143 JQ).
-    for candidate in [secret.replace('+', " "), secret.to_string()] {
-        if let Ok(decoded) = urlencoding::decode(&candidate) {
-            out.push(decoded.into_owned());
-        }
-    }
-    if let Ok(json) = serde_json::to_string(secret)
-        && let Some(inner) = json.strip_prefix('"').and_then(|v| v.strip_suffix('"'))
-    {
-        out.push(inner.to_string());
-    }
-    out.push(hex_encode_secret(secret, false));
-    out.push(hex_encode_secret(secret, true));
-    out.retain(|spelling| !spelling.is_empty() && spelling != secret);
-    out.sort();
-    out.dedup();
-    out
-}
-
-fn hex_encode_secret(secret: &str, uppercase: bool) -> String {
-    let digits = if uppercase {
-        b"0123456789ABCDEF"
-    } else {
-        b"0123456789abcdef"
-    };
-    let mut encoded = String::with_capacity(secret.len() * 2);
-    for byte in secret.bytes() {
-        encoded.push(digits[(byte >> 4) as usize] as char);
-        encoded.push(digits[(byte & 0x0f) as usize] as char);
-    }
-    encoded
-}
-
 /// Needles for one host credential: the raw secret plus the credential
 /// token of every injected header value (the Basic-auth base64 of
 /// `user:secret` never contains the raw secret).
@@ -3886,32 +3754,6 @@ fn transfer_coding_keeps_framing(value: &str) -> bool {
         .last()
         .is_some_and(|token| token.eq_ignore_ascii_case("chunked"));
     !(non_empty == 1 && last_is_chunked)
-}
-
-/// Replace every occurrence of `needle` in `haystack` with `marker`, at the
-/// byte level (WI#408 — response bodies are not guaranteed UTF-8, so
-/// string-level replacement cannot be used on them).
-fn replace_all_bytes(haystack: &mut Vec<u8>, needle: &[u8], marker: &[u8]) {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return;
-    }
-    // One pass into a fresh buffer: splicing in place is O(body x matches).
-    let mut out = Vec::with_capacity(haystack.len());
-    let mut i = 0;
-    let mut changed = false;
-    while i < haystack.len() {
-        if haystack[i..].starts_with(needle) {
-            out.extend_from_slice(marker);
-            i += needle.len();
-            changed = true;
-        } else {
-            out.push(haystack[i]);
-            i += 1;
-        }
-    }
-    if changed {
-        *haystack = out;
-    }
 }
 
 /// Extract the hostname from a URL string.
