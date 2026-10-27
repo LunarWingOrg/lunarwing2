@@ -24,6 +24,12 @@
 # Rate-limit state directory (shared between gateway and health check).
 #RATELIMIT_DIR="/var/lib/lunarwing/ratelimit"
 
+# WI#424 worker egress audit: mt-admin performs the read-only host-side audit.
+# The installed health.env records the provisioning path; override only when
+# moving the admin entrypoint. Each tenant audit is bounded (default 8 seconds).
+#LUNARWING_MT_ADMIN="/usr/local/bin/lunarwing-mt-admin"
+#HEALTH_WORKER_EGRESS_TIMEOUT=8
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Notification
 # ═════════════════════════════════════════════════════════════════════════════

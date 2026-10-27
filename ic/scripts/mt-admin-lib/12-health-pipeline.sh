@@ -163,6 +163,7 @@ ensure_health_pipeline() {
 LUNARWING_BASE_DIR=$HEALTH_BASE_DIR
 LUNARWING_SERVICE_MANAGER=$INIT_SYSTEM
 SELF_HEAL_TENANTS_FILE=$PORTS_REGISTRY
+LUNARWING_MT_ADMIN=$SCRIPT_DIR/lunarwing-mt-admin.sh
 
 # MT hardening: remediate only auto-discovered per-tenant init units; disable
 # checks that are N/A host-globally; page only on self-heal escalation (not on
@@ -233,6 +234,10 @@ ENVEOF
       cat "$_tmp2" > "$HEALTH_ENV_FILE"   # overwrite content, preserve mode/owner
       rm -f "$_tmp2"
       say "reconciled SELF_HEAL_TENANTS_FILE=$PORTS_REGISTRY in $HEALTH_ENV_FILE"
+    fi
+    if ! grep -q '^LUNARWING_MT_ADMIN=' "$HEALTH_ENV_FILE"; then
+      printf 'LUNARWING_MT_ADMIN=%s\n' "$SCRIPT_DIR/lunarwing-mt-admin.sh" >>"$HEALTH_ENV_FILE"
+      say "added LUNARWING_MT_ADMIN for the worker egress health audit"
     fi
   fi
 

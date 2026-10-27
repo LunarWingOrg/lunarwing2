@@ -372,6 +372,7 @@ RUN set -eu; \
     && python3 scripts/exposure_policy_assert_test.py \
     && python3 scripts/entrypoint_config_test.py \
     && python3 scripts/compile_out_remote_tunnel_test.py \
+    && python3 scripts/runtime_smoke_test.py \
     && for leaked in /root/.bun /root/.local /root/.cache /root/.config; do \
            [ ! -e "$leaked" ] \
            || { echo "FATAL: build-time self-tests leaked per-build state at $leaked — refusing to bake a non-reproducible layer" >&2; exit 1; }; \
@@ -384,6 +385,10 @@ RUN mkdir -p /home/opencode2/.local/share/opencode \
              /var/log/lunarwing \
              /app/results \
     && chown -R opencode2:opencode2 /home/opencode2 /workspace /var/log/lunarwing /app/results
+
+# WI#424 control 6: run the smoke against a real started entrypoint, not the
+# empty process table and throwaway HOME of a Dockerfile RUN.
+RUN bash /app/scripts/runtime_smoke_entrypoint.sh
 
 # Check the final runtime filesystem, after all COPY/chown/chmod operations.
 RUN python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --image-filesystem

@@ -58,6 +58,17 @@ assert_no_call() { if has_call "$1"; then fail "$2 (unexpected call: $1)"; else 
 IMAGE_ID="sha256:aaaa"
 IMAGE_USER=""
 TRACK_EXISTENCE="false"
+# WI#424 control 1: the egress allowlist reads the tenant env through a
+# tenant-side read and needs a real netns; it fails closed without either. The
+# fixture tenant has no account, so stub the step (its own harness pins the
+# behaviour, and the recreate decision under test happens before the worker
+# start path runs the filter).
+# shellcheck disable=SC2034  # real lane run lines expand this launch-argument array.
+prepare_worker_egress() {
+  WORKER_EGRESS_LAUNCH_ARGS=(--network "lw-egress-$1" --dns 127.0.0.1)
+}
+worker_egress_container_attached() { return 0; }
+worker_egress_verify_after_start() { :; }
 CONTAINER_EXISTS="true"
 _ctr() {
   CALLS+=("ctr:$*")
@@ -83,12 +94,12 @@ _ctr() {
 
 # ── _worker_launch_contract ──────────────────────────────────────────────────
 assert_eq "$(_worker_launch_contract alice lunarwing-worker-kimi:latest "base;x")" \
-  "base;x;image=sha256:aaaa" 'contract appends the tenant-store image ID'
+  "base;x;egress=lw-egress-alice;image=sha256:aaaa" 'contract appends egress and the tenant-store image ID'
 assert_eq "$(_worker_launch_contract alice lunarwing-worker-kimi:latest)" \
-  "image=sha256:aaaa" 'empty base contract becomes the image segment alone'
+  "egress=lw-egress-alice;image=sha256:aaaa" 'empty base contract becomes egress plus image'
 IMAGE_ID=""
 assert_eq "$(_worker_launch_contract alice lunarwing-worker-kimi:latest "base;x")" \
-  "base;x" 'uninspectable image keeps the base contract (no forced recreate)'
+  "base;x;egress=lw-egress-alice" 'uninspectable image keeps base plus the required egress migration'
 IMAGE_ID="sha256:aaaa"
 
 # ── start-tenant through the real lane functions ─────────────────────────────
