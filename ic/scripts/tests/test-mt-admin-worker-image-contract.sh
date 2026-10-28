@@ -127,6 +127,8 @@ mkdir -p "$fixture/env" "$fixture/home" "$fixture/quadlets" "$fixture/workspace"
 env_file="$fixture/env/lunarwing.env"
 printf 'GATEWAY_AUTH_TOKEN=fixture\n' >"$env_file"
 : >"$fixture/env/kimi-runtime.env"
+chmod 700 "$fixture/env"
+chmod 600 "$env_file" "$fixture/env/kimi-runtime.env"
 # WI#446 (run-174 LW-3): the config-hash sidecar lives in root-owned host
 # state ($CONTAINER_HASH_DIR/<tenant>/), not the tenant home; the harness
 # points it at the fixture.
@@ -196,15 +198,13 @@ base_contract() {  # <worker>: the rootless-podman base contract the lane uses
   esac
 }
 image_user_for() {  # <worker>: the lane's real image Config.User
-  # Feed each lane the user its current image actually carries so each
-  # image-user guard is checked against its own expectation: WI#400 migrated
-  # the kimi, opencode and pebble lanes to a root bridge (USER 0:0) whose
-  # serve/tasks drop to the task uid, while the opencode2 lane is NOT
-  # migrated (its image still carries the task uid directly) — its guard
-  # must keep accepting exactly $OPENCODE2_CONTAINER_UID[:GID].
+  # WI#454: every image defaults to its task uid; mt-admin selects the
+  # distinct non-root bridge uid explicitly for the public container.
   case "$1" in
-    kimi|opencode|pebble) printf '0:0' ;;
+    kimi) printf '%s:%s' "$KIMI_CONTAINER_UID" "$KIMI_CONTAINER_GID" ;;
+    opencode) printf '%s:%s' "$OPENCODE_CONTAINER_UID" "$OPENCODE_CONTAINER_GID" ;;
     opencode2) printf '%s:%s' "$OPENCODE2_CONTAINER_UID" "$OPENCODE2_CONTAINER_GID" ;;
+    pebble) printf '%s:%s' "$PEBBLE_CONTAINER_UID" "$PEBBLE_CONTAINER_GID" ;;
     *) printf '' ;;
   esac
 }
@@ -345,26 +345,29 @@ for worker in kimi opencode opencode2 pebble; do
   quadlet_scenario "$worker"
 done
 
-# ── WI#400 LD-2: /app files must stay root-owned in the USER 0:0 lanes ───────
-# Container root executes the /app entrypoint, scripts and config, so files
-# the task uid can rewrite would run task-authored code as root on the next
-# container start (restart policy, daemon restart, health restart). A
-# COPY --chown=<task user> hands the tree over at build time — refuse it.
+# /app stays root-owned and read-only to both non-root identities. A
+# COPY --chown would hand executable bridge code to a writable uid.
 for lane in kimicode4lunarwing opencode4lunarwing pebble4lunarwing; do
   dockerfile="$HARNESS_REPO_ROOT/$lane/Dockerfile"
+  case "$lane" in
+    kimicode4lunarwing) task_uid=10002; bridge_uid=10102 ;;
+    opencode4lunarwing) task_uid=10001; bridge_uid=10101 ;;
+    pebble4lunarwing) task_uid=10004; bridge_uid=10104 ;;
+  esac
   if [[ ! -f "$dockerfile" ]]; then
     fail "$lane Dockerfile missing (WI#400 LD-2 pin)"
     continue
   fi
   if grep -Eq '^COPY --chown=' "$dockerfile"; then
-    fail "$lane: COPY --chown hands /app files to the task uid (WI#400 LD-2)"
+    fail "$lane: COPY --chown hands /app files to a runtime uid (WI#400 LD-2)"
   else
     pass "$lane: COPYed /app files stay root-owned (WI#400 LD-2)"
   fi
-  if grep -Eq '^USER 0:0[[:space:]]*$' "$dockerfile"; then
-    pass "$lane: Dockerfile pins the root bridge user (WI#400)"
+  if grep -Eq "^USER ${task_uid}:${task_uid}[[:space:]]*$" "$dockerfile" \
+      && grep -Eq "useradd --uid ${bridge_uid} " "$dockerfile"; then
+    pass "$lane: Dockerfile pins task default and distinct bridge uid (WI#454)"
   else
-    fail "$lane: Dockerfile must set USER 0:0 for the root bridge (WI#400)"
+    fail "$lane: Dockerfile must pin task uid ${task_uid} and bridge uid ${bridge_uid} (WI#454)"
   fi
 done
 
@@ -383,11 +386,17 @@ else
   fail 'opencode entrypoint: exec bun run of the bridge must be preceded by cd /app (WI#400 LP-1)'
 fi
 
-# WI#400 / WI#469: all four image-user guards refuse stale/uninspectable images
-# with the lane-local status 3, BEFORE any start/render/hash operation. Display
+# WI#400 / WI#469 / WI#454: image-user guards refuse stale images with the
+# lane-local status 3 before any start/render/hash operation. Display
 # tenant-store Config.User as bounded, escaped DATA, never a printf format.
 image_user_refusal() {  # <worker> <stale Config.User>
-  local worker="$1" stale="$2" out rc display unexpected="$fixture/refusal-unexpected"
+  local worker="$1" stale="$2" out rc display expected unexpected="$fixture/refusal-unexpected"
+  case "$worker" in
+    kimi) expected="$KIMI_CONTAINER_UID:$KIMI_CONTAINER_GID" ;;
+    opencode) expected="$OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID" ;;
+    opencode2) expected="$OPENCODE2_CONTAINER_UID:$OPENCODE2_CONTAINER_GID" ;;
+    pebble) expected="$PEBBLE_CONTAINER_UID:$PEBBLE_CONTAINER_GID" ;;
+  esac
   IMAGE_USER="$stale"
   display="$(sanitize_display_value "${stale:-unset}")"
   : >"$unexpected"
@@ -406,7 +415,7 @@ image_user_refusal() {  # <worker> <stale Config.User>
   )"
   rc=$?
   set -e
-  if [[ "$rc" == 3 && "$out" == *"image has user '$display', expected "* \
+  if [[ "$rc" == 3 && "$out" == *"image has user '$display', expected $expected (WI#454 task default)"* \
       && "$out" == *"rebuild it" && "$out" != *$'\033'* && "${#out}" -lt 600 \
       && ! -s "$unexpected" ]]; then
     pass "$INIT_SYSTEM $worker safely refuses image user '$display' with status 3"
@@ -427,6 +436,11 @@ for refusal_init in openrc systemd; do
 done
 use_init openrc
 IMAGE_USER="$(image_user_for pebble)"
+image_user_refusal kimi "0:0"
+image_user_refusal kimi ""
+image_user_refusal pebble "0:0"
+image_user_refusal pebble ""
+
 
 # WI#423 (run-171, the merge with !1784): the rootful create path below is the
 # one scenario in this harness that reaches the tenant-side credential reader,
@@ -439,19 +453,7 @@ chmod 700 "$fixture/env"
 chmod 600 "$env_file"
 printf 'WORKER_AUTH_TOKEN=fixture-worker\n' >>"$env_file"
 
-# ── WI#422: rootful pebble launches as the tenant uid ───────────────────────
-# The fixture tenant has no passwd entry, so `id` is shadowed for exactly the
-# two lookups the lane makes (everything else falls through to the real
-# binary) and the workspace prep is stubbed to a fixture path — the create
-# path under test is the `_ctr run` invocation, not the workspace handling
-# (pinned separately by the WI#390 tests).
-id() {
-  case "$*" in
-    '-u alice') printf '1042\n' ;;
-    '-g alice') printf '1042\n' ;;
-    *) command id "$@" ;;
-  esac
-}
+# WI#454: rootful Pebble uses the same non-root pair as rootless.
 prepare_pebble_workspace() { printf '%s/pebble-workspace\n' "$fixture"; }
 ensure_container_runtime() {
   # shellcheck disable=SC2034  # read by the sourced lane functions
@@ -468,57 +470,41 @@ IMAGE_ID="sha256:aaaa"
 if [[ "$PEBBLE_ROOTFUL_LAUNCH_CONTRACT" != "$PEBBLE_ROOTLESS_LAUNCH_CONTRACT" ]]; then
   pass 'pebble contract: the rootful base contract differs from the rootless one'
 else
-  fail 'pebble contract: rootful and rootless base contracts are identical (no forced recreate of root-running containers)'
+  fail 'pebble contract: rootful and rootless base contracts are identical'
 fi
 
-# A pre-fix rootful container was stored under the rootless base contract
-# (the old lane used one contract in every mode): the distinct rootful base
-# must force exactly one recreate, and the replacement must launch as the
-# tenant uid:gid with the toolchain env anchored inside /workspace.
 _store_container_hash alice lunarwing-pebble-alice "$env_file" \
   "$(_worker_launch_contract alice lunarwing-worker-pebble:latest "$PEBBLE_ROOTLESS_LAUNCH_CONTRACT")"
 CALLS=()
 start_tenant_pebble alice
-assert_call "ctr:alice rm -f lunarwing-pebble-alice" 'rootful pebble: pre-fix root-running container is force-recreated'
-if has_call_like "ctr:alice run -d --name lunarwing-pebble-alice --user 1042:1042 * lunarwing-worker-pebble:latest"; then
-  pass 'rootful pebble: fresh container launches with --user <tenant uid>:<gid>'
-else
-  fail 'rootful pebble: fresh container launches with --user <tenant uid>:<gid>'
-fi
-# LH-2 (run-167): the uid drop is one-way — no setuid/file-cap route back to
-# container root (the image ships Debian's standard setuid set).
-if has_call_like "ctr:alice run -d --name lunarwing-pebble-alice *--security-opt no-new-privileges * lunarwing-worker-pebble:latest"; then
-  pass 'rootful pebble: run carries --security-opt no-new-privileges'
-else
-  fail 'rootful pebble: run carries --security-opt no-new-privileges'
-fi
-# WI#400 x WI#422 (run-167 LH-1 / run-170 LP-2): the rootful container runs
-# as the tenant uid, so the bridge is told explicitly to run tasks as its own
-# identity (no split), and keep-id is a rootless-only mapping.
-for env_pin in '-e HOME=/workspace' '-e GOPATH=/workspace/go' \
-               '-e GOCACHE=/workspace/.cache/go-build' '-e CARGO_HOME=/workspace/.cargo' \
-               '-e PEBBLE_TASK_UID=inherit' '-e PEBBLE_TASK_GID=inherit'; do
-  if has_call_like "ctr:alice run -d --name lunarwing-pebble-alice *${env_pin} * lunarwing-worker-pebble:latest"; then
-    pass "rootful pebble: run carries ${env_pin}"
+assert_call "ctr:alice rm -f lunarwing-pebble-alice" 'rootful pebble: pre-split container is force-recreated'
+for pin in \
+  'lunarwing-pebble-alice *--user 10104:10004 *-e LUNARWING_CONTAINER_ROLE=split-bridge * lunarwing-worker-pebble:latest' \
+  'lunarwing-pebble-task-alice *--user 10004:10004 *-e LUNARWING_CONTAINER_ROLE=split-task * lunarwing-worker-pebble:latest' \
+  'lunarwing-pebble-alice *--security-opt no-new-privileges *--cap-drop ALL * lunarwing-worker-pebble:latest' \
+  'lunarwing-pebble-task-alice *lunarwing-pebble-alice-ipc:/run/lunarwing-shared:z*'; do
+  if has_call_like "ctr:alice run -d --name ${pin}"; then
+    pass "rootful pebble: $pin"
   else
-    fail "rootful pebble: run carries ${env_pin}"
+    fail "rootful pebble: missing launch pin: $pin"
   fi
 done
-
-if has_call_like "ctr:alice run -d --name lunarwing-pebble-alice *--userns * lunarwing-worker-pebble:latest"; then
-  fail 'rootful pebble: run must not pass --userns (keep-id is a rootless mapping)'
+if has_call_like "ctr:alice run -d --name lunarwing-pebble-alice *--cap-add *"; then
+  fail 'rootful pebble: bridge must not regain capabilities'
 else
-  pass 'rootful pebble: run does not pass --userns'
+  pass 'rootful pebble: bridge has no added capabilities'
+fi
+if has_call_like "ctr:alice run -d --name lunarwing-pebble-alice *--userns *" \
+    || has_call_like "ctr:alice run -d --name lunarwing-pebble-alice *PEBBLE_TASK_UID=inherit*"; then
+  fail 'rootful pebble: rootless userns and inherit identity are forbidden'
+else
+  pass 'rootful pebble: no userns mapping or inherited identity'
 fi
 
-# The recreate stores the rootful contract, so a second start-tenant on the
-# same image is quiet — the recreate is one-time, not per start.
 CALLS=()
 start_tenant_pebble alice
-assert_no_call "ctr:alice rm -f lunarwing-pebble-alice" 'rootful pebble: hash stored by the tenant-uid create keeps the next start quiet'
+assert_no_call "ctr:alice rm -f lunarwing-pebble-alice" 'rootful pebble: refreshed pair is quiet on the next start'
 
-# Rootless stays untouched: no --user (it would fight the rootless mapping)
-# and no workspace-anchored env overrides on that path.
 ensure_container_runtime() {
   # shellcheck disable=SC2034  # read by the sourced lane functions
   CONTAINER_RT="podman"
@@ -528,27 +514,22 @@ ensure_container_runtime() {
 command rm -rf "$(_hash_dir alice)"
 CALLS=()
 start_tenant_pebble alice
-if has_call_like "ctr:alice run -d --name lunarwing-pebble-alice *--user * lunarwing-worker-pebble:latest"; then
-  fail 'rootless pebble: run must not pass --user'
+for pin in \
+  'lunarwing-pebble-alice *--userns keep-id:uid=10004,gid=10004 *--user 10104:10004 * lunarwing-worker-pebble:latest' \
+  'lunarwing-pebble-task-alice *--userns keep-id:uid=10004,gid=10004 *--user 10004:10004 * lunarwing-worker-pebble:latest'; do
+  if has_call_like "ctr:alice run -d --name ${pin}"; then
+    pass "rootless pebble: $pin"
+  else
+    fail "rootless pebble: missing launch pin: $pin"
+  fi
+done
+if has_call_like "ctr:alice run -d --name lunarwing-pebble-alice *-e HOME=/workspace *" \
+    || has_call_like "ctr:alice run -d --name lunarwing-pebble-alice *PEBBLE_TASK_UID=inherit*"; then
+  fail 'rootless pebble: legacy tenant toolchain or inherit identity must stay retired'
 else
-  pass 'rootless pebble: run does not pass --user'
+  pass 'rootless pebble: keep-id split has no legacy tenant identity overrides'
 fi
-if has_call_like "ctr:alice run -d --name lunarwing-pebble-alice *-e HOME=/workspace * lunarwing-worker-pebble:latest"; then
-  fail 'rootless pebble: run must not override the toolchain env'
-else
-  pass 'rootless pebble: run does not override the toolchain env'
-fi
-if has_call_like "ctr:alice run -d --name lunarwing-pebble-alice *-e PEBBLE_TASK_UID=* lunarwing-worker-pebble:latest"; then
-  fail 'rootless pebble: run must not override the image task identity (the keep-id split stays on)'
-else
-  pass 'rootless pebble: run keeps the image task identity (keep-id split)'
-fi
-if has_call_like "ctr:alice run -d --name lunarwing-pebble-alice *--userns keep-id:uid=10004,gid=10004 * lunarwing-worker-pebble:latest"; then
-  pass 'rootless pebble: run carries the keep-id userns mapping'
-else
-  fail 'rootless pebble: run carries the keep-id userns mapping (WI#400)'
-fi
-unset -f id prepare_pebble_workspace
+unset -f prepare_pebble_workspace
 TRACK_EXISTENCE="false"
 CONTAINER_EXISTS="true"
 
@@ -565,6 +546,7 @@ chmod 755 "$repo/opencode2.4lunarwing/scripts/opencode-exposure-guard.sh"
 cp -a "$HARNESS_REPO_ROOT/opencode2.4lunarwing/scripts/." "$repo/opencode2.4lunarwing/scripts/"
 cp -a "$HARNESS_REPO_ROOT/opencode2.4lunarwing/config" "$repo/opencode2.4lunarwing/"
 cp -a "$HARNESS_REPO_ROOT/opencode2.4lunarwing/entrypoint.sh" \
+  "$HARNESS_REPO_ROOT/opencode2.4lunarwing/entrypoint-split.sh" \
   "$HARNESS_REPO_ROOT/opencode2.4lunarwing/health_server.py" \
   "$HARNESS_REPO_ROOT/opencode2.4lunarwing/agent_comm_protocol.json" \
   "$repo/opencode2.4lunarwing/"
@@ -578,6 +560,7 @@ mkdir -p "$opencode2_rootfs/app/node_modules" "$opencode2_rootfs/usr/bin" \
 cp -a "$repo/opencode2.4lunarwing/scripts" "$opencode2_rootfs/app/scripts"
 cp -a "$repo/opencode2.4lunarwing/config" "$opencode2_rootfs/app/config"
 cp -a "$repo/opencode2.4lunarwing/entrypoint.sh" \
+  "$repo/opencode2.4lunarwing/entrypoint-split.sh" \
   "$repo/opencode2.4lunarwing/health_server.py" \
   "$repo/opencode2.4lunarwing/agent_comm_protocol.json" "$opencode2_rootfs/app/"
 cp -a "$repo/opencode2.4lunarwing/scripts/opencode-exposure-guard.sh" \
@@ -675,6 +658,9 @@ config = {
         "GOROOT=/usr/local/go",
         "GOPATH=/home/opencode2/go",
         "CARGO_HOME=/home/opencode2/.cargo",
+        "OPENCODE2_TASK_UID=10003",
+        "OPENCODE2_TASK_GID=10003",
+        "OPENCODE2_BRIDGE_UID=10103",
     ],
     "Entrypoint": ["/usr/bin/tini", "--", "/app/entrypoint.sh"],
     "Cmd": ["--mode", "websocket"],
