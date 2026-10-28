@@ -569,7 +569,6 @@ Description=LunarWing ${worker} bridge container ($name)
 After=network-online.target lunarwing-${worker}-task-${name}.service
 Wants=network-online.target
 Requires=lunarwing-${worker}-task-${name}.service
-BindsTo=lunarwing-${worker}-task-${name}.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
