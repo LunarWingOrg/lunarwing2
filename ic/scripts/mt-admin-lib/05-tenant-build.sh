@@ -1277,7 +1277,7 @@ _opencode2_snapshot_checkout() {
     cp -R --no-dereference --no-preserve=ownership -- \
       "$source" "$lane/$name" || return 1
   done
-  for name in entrypoint.sh health_server.py agent_comm_protocol.json; do
+  for name in entrypoint.sh entrypoint-split.sh health_server.py agent_comm_protocol.json; do
     source="$(_opencode2_snapshot_source "$resolved_root" "$opencode2_dir/$name")" || return 1
     cp -R --no-dereference --no-preserve=ownership -- \
       "$source" "$lane/$name" || return 1
