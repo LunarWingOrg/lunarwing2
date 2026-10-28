@@ -806,6 +806,14 @@ remove_tenant() {
   ports_deallocate "$name"
   say ""
 
+  # WI#424 (run-226 OQ-6): drop the tenant's egress network, rendered state and
+  # live chains while the tenant account still exists (the rootless netns and
+  # rootless network are owned by it). Only when this tenant ever had egress.
+  if [[ -n "$(worker_egress_state_get "$name" SUBNET)" ]]; then
+    worker_egress_teardown "$name" || say "WARNING: worker egress teardown incomplete for '$name'" >&2
+    say ""
+  fi
+
   # WI#450 (run-181 MC-3): the config-hash sidecars now live in root-owned
   # host state, so remove-tenant no longer loses them with the home. The name
   # has already been through sanitize_name; the guard keeps an empty name
