@@ -258,6 +258,20 @@ assert_contains "$launch_args" '--add-host
 git.example.org:203.0.113.40' "launch installs the static host mapping"
 assert_contains "$launch_args" '--network
 lw-egress-alpha' "launch joins only the tenant network"
+
+# IP-only allowlist (no hostname -> no --add-host) must still succeed: the
+# launch-args loop body never runs, so the function used to return the last
+# false `[[ -n "$mapping" ]]` status and abort the worker start. Pin that the
+# bare network+DNS argument set is reported as success.
+printf '' >"$WORKER_EGRESS_DIR/alpha.hosts"
+if ip_only_args="$(worker_egress_launch_args alpha)"; then
+  pass "launch succeeds with no static host mappings (IP-only allowlist)"
+else
+  fail "launch failed with an empty host-mapping set"
+fi
+assert_contains "$ip_only_args" '--dns
+127.0.0.1' "empty-host launch still pins DNS"
+assert_absent "$ip_only_args" '--add-host' "empty-host launch emits no --add-host"
 if [[ "$(id -u)" == "0" ]]; then
   assert_eq "$(stat -c '%U:%G:%a' "$WORKER_EGRESS_GUARD")" 'root:root:755' "installed guard is root-owned 0755"
 else
