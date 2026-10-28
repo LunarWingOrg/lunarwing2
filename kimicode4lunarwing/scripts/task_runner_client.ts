@@ -52,6 +52,11 @@ export function bridgeRunnerSocketPath(): string {
   return process.env.LUNARWING_TASK_RUNNER_SOCKET || ""
 }
 
+/** A remote task container owns and reaps its own process tree on restart. */
+export function runnerProcessGroupReapRequired(): boolean {
+  return process.env.LUNARWING_TASK_RUNNER_REMOTE !== "1"
+}
+
 /**
  * Checks the runner socket before the bridge connects to it.
  *
@@ -83,8 +88,8 @@ export function verifyRunnerSocket(socketPath: string): void {
     }
     return
   }
-  const uid = process.env.KIMI_TASK_UID
-  const gid = process.env.KIMI_TASK_GID
+  const uid = process.env.LUNARWING_TASK_UID ?? process.env.KIMI_TASK_UID
+  const gid = process.env.LUNARWING_TASK_GID ?? process.env.KIMI_TASK_GID
   if (uid) {
     if (st.uid !== Number(uid)) {
       throw new Error(`task runner socket owned by uid ${st.uid}, expected task uid ${uid} (refused, NB-16)`)
@@ -161,14 +166,15 @@ export function delegateTaskToRunner(
       settle()
       resolve(result)
     }
-    // Every settlement WITHOUT a terminal result goes through here: the
-    // detached CLI may still be running, so its process group is reaped
-    // before the rejection lets the bridge free the workspace lock.
+    // A local rehearsal reaps the detached CLI before releasing the workspace
+    // lock. Across containers that process tree is neither visible nor
+    // signalable here; runner death instead terminates the task container,
+    // whose runtime tears down every task process before a restart.
     const finishWithError = (error: Error) => {
       if (settled) return
       settle()
       const pgid = spawnedPgid
-      if (pgid === undefined) {
+      if (pgid === undefined || !runnerProcessGroupReapRequired()) {
         reject(error)
         return
       }
