@@ -395,6 +395,50 @@ test_inner_worker_failure_stays_fatal() (
   }
 )
 
+test_lifecycle_lock_preserves_worker_errexit() (
+  local calls="$fixture/locked-worker-calls" messages="$fixture/locked-worker-messages"
+  local output rc expected=$'flock:-x\npebble\nctr:alice run lunarwing-pebble-alice\nflock:-u'
+  : >"$calls"
+  : >"$messages"
+  TENANT_LIFECYCLE_LOCK_DIR="$fixture/lifecycle-locks"
+  mkdir -p "$TENANT_LIFECYCLE_LOCK_DIR"
+  unset LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT
+  unset LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_FD LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_TENANT
+  require_cmd() { :; }
+  install() { :; }
+  stat() { printf '0:700\n'; }
+  flock() { printf 'flock:%s\n' "$1" >>"$calls"; }
+  INIT_SYSTEM=systemd
+  tenant_worker_enabled() { return 0; }
+  _ctr() { printf 'ctr:%s\n' "$*" >>"$calls"; return 125; }
+  start_tenant_pebble() {
+    printf 'pebble\n' >>"$calls"
+    _ctr alice run lunarwing-pebble-alice
+    printf 'pebble-ready\n' >>"$calls"
+  }
+  start_tenant_opencode() { printf 'opencode\n' >>"$calls"; }
+  start_tenant_kimi() { printf 'kimi\n' >>"$calls"; }
+  start_tenant_opencode2() { printf 'opencode2\n' >>"$calls"; }
+  say() { printf '%s\n' "$*" >>"$messages"; }
+
+  set +e
+  output="$(with_tenant_lifecycle_lock alice _start_tenant_workers alice 2>&1)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 125 ]] || {
+    printf 'locked inner failure returned %s, expected 125: %s\n' "$rc" "$output" >&2
+    return 1
+  }
+  [[ "$(<"$calls")" == "$expected" ]] || {
+    printf 'locked callback continued or skipped cleanup:\n%s\n' "$(<"$calls")" >&2
+    return 1
+  }
+  [[ ! -s "$messages" ]] || {
+    printf 'locked fatal failure was downgraded to a warning:\n%s\n' "$(<"$messages")" >&2
+    return 1
+  }
+)
+
 test_kimi_credential_failure_has_no_ready_side_effects() (
   local calls="$fixture/kimi-credential-calls" messages="$fixture/kimi-credential-messages"
   local output rc
@@ -466,6 +510,8 @@ run_worker_start_case test_stale_worker_failures_are_aggregated \
   'stale worker lanes continue and aggregate a nonzero status (WI#469)'
 run_worker_start_case test_inner_worker_failure_stays_fatal \
   'inner worker failures preserve errexit and their status (WI#469 QF-1)'
+run_worker_start_case test_lifecycle_lock_preserves_worker_errexit \
+  'lifecycle lock preserves inner errexit and unlocks after failure (WI#469 QF-1)'
 run_worker_start_case test_kimi_credential_failure_has_no_ready_side_effects \
   'kimi credential failure cannot report ready or register state (WI#469 QF-1)'
 
