@@ -16,6 +16,7 @@ source "$MT_ADMIN"
 _TWA_REAL_DEF="$(declare -f tenant_writers_active)"
 _AWAIT_QUIESCE_REAL_DEF="$(declare -f await_writer_quiescence)"
 _OPENRC_WORKER_STOP_REAL_DEF="$(declare -f openrc_worker_stop_disable)"
+_START_KIMI_REAL_DEF="$(declare -f start_tenant_kimi)"
 
 failures=0
 CALLS=()
@@ -308,6 +309,165 @@ stop_worker alice kimi
 assert_call "desired:alice kimi false"
 assert_call "rc:lunarwing-kimi-alice-sup stop"
 assert_call "rc:lunarwing-kimi-alice stop"
+
+# WI#469 QF-1: invoke these subshell tests without an `if test_fn` wrapper.
+# Such a wrapper suppresses errexit throughout the function under test.
+run_worker_start_case() {
+  local test_fn="$1" description="$2" rc
+  set +e
+  "$test_fn"
+  rc=$?
+  set -e
+  if [[ "$rc" -eq 0 ]]; then
+    printf 'PASS: %s\n' "$description"
+  else
+    fail "$description"
+  fi
+}
+
+test_stale_worker_failures_are_aggregated() (
+  local calls="$fixture/stale-worker-calls" messages="$fixture/stale-worker-messages"
+  local output rc expected=$'pebble\nopencode\nkimi\nopencode2'
+  : >"$calls"
+  : >"$messages"
+  INIT_SYSTEM=systemd
+  tenant_worker_enabled() { return 0; }
+  start_tenant_pebble() { printf 'pebble\n' >>"$calls"; return 3; }
+  start_tenant_opencode() { printf 'opencode\n' >>"$calls"; return 3; }
+  start_tenant_kimi() { printf 'kimi\n' >>"$calls"; }
+  start_tenant_opencode2() { printf 'opencode2\n' >>"$calls"; }
+  say() { printf '%s\n' "$*" >>"$messages"; }
+
+  set +e
+  output="$(_start_tenant_workers alice 2>&1)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 1 ]] || {
+    printf 'stale-image aggregate returned %s, expected 1: %s\n' "$rc" "$output" >&2
+    return 1
+  }
+  [[ "$(<"$calls")" == "$expected" ]] || {
+    printf 'worker start order/continuation mismatch:\n%s\n' "$(<"$calls")" >&2
+    return 1
+  }
+  [[ "$(grep -c '^WARNING: ' "$messages")" == 3 ]] || {
+    printf 'expected two lane warnings and one summary:\n%s\n' "$(<"$messages")" >&2
+    return 1
+  }
+  grep -Fxq 'WARNING: pebble worker failed to start for alice; continuing' "$messages" || return 1
+  grep -Fxq 'WARNING: opencode worker failed to start for alice; continuing' "$messages" || return 1
+  grep -Fxq 'WARNING: workers failed to start for alice: pebble opencode' "$messages" || return 1
+)
+
+test_inner_worker_failure_stays_fatal() (
+  local calls="$fixture/fatal-worker-calls" messages="$fixture/fatal-worker-messages"
+  local output rc expected=$'pebble\nctr:alice run lunarwing-pebble-alice'
+  : >"$calls"
+  : >"$messages"
+  INIT_SYSTEM=systemd
+  tenant_worker_enabled() { return 0; }
+  _ctr() { printf 'ctr:%s\n' "$*" >>"$calls"; return 125; }
+  start_tenant_pebble() {
+    printf 'pebble\n' >>"$calls"
+    _ctr alice run lunarwing-pebble-alice
+    printf 'pebble-ready\n' >>"$calls"
+  }
+  start_tenant_opencode() { printf 'opencode\n' >>"$calls"; }
+  start_tenant_kimi() { printf 'kimi\n' >>"$calls"; }
+  start_tenant_opencode2() { printf 'opencode2\n' >>"$calls"; }
+  say() { printf '%s\n' "$*" >>"$messages"; }
+
+  set +e
+  output="$(_start_tenant_workers alice 2>&1)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 125 ]] || {
+    printf 'inner container failure returned %s, expected 125: %s\n' "$rc" "$output" >&2
+    return 1
+  }
+  [[ "$(<"$calls")" == "$expected" ]] || {
+    printf 'inner failure was ignored or a later lane ran:\n%s\n' "$(<"$calls")" >&2
+    return 1
+  }
+  [[ ! -s "$messages" ]] || {
+    printf 'fatal inner failure was downgraded to a warning:\n%s\n' "$(<"$messages")" >&2
+    return 1
+  }
+)
+
+test_kimi_credential_failure_has_no_ready_side_effects() (
+  local calls="$fixture/kimi-credential-calls" messages="$fixture/kimi-credential-messages"
+  local output rc
+  : >"$calls"
+  : >"$messages"
+  eval "$_START_KIMI_REAL_DEF"
+  INIT_SYSTEM=openrc
+  WORKER_EGRESS_LAUNCH_ARGS=()
+  tenant_worker_enabled() { [[ "$2" == "kimi" ]]; }
+  tenant_worker_desired_running() { return 0; }
+  start_tenant_pebble() { printf 'unexpected-pebble\n' >>"$calls"; }
+  start_tenant_opencode() { printf 'unexpected-opencode\n' >>"$calls"; }
+  start_tenant_opencode2() { printf 'unexpected-opencode2\n' >>"$calls"; }
+  ensure_container_runtime() { CONTAINER_RT=podman; MT_ROOTLESS=true; }
+  ensure_init_system() { :; }
+  ports_get() {
+    case "$2" in
+      kimi_wss) printf '19092\n' ;;
+      kimi_health) printf '19093\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  _ensure_tenant_image() { return 0; }
+  _worker_launch_contract() { printf '%s' "${3:-cap-trim}"; }
+  prepare_worker_egress() { :; }
+  worker_egress_reconcile_container() { :; }
+  worker_egress_network_name() { printf 'lw-egress-alice\n'; }
+  _openrc_podman_uses_init_health() { return 1; }
+  tenant_env_dir() { printf '%s/env\n' "$fixture"; }
+  prepare_worker_workspace() { printf '%s/kimi-workspace\n' "$fixture"; }
+  write_kimi_runtime_env() { printf 'credential-resolution\n' >>"$calls"; return 1; }
+  _store_container_hash() { printf 'hash:%s\n' "$*" >>"$calls"; }
+  _register_worker_unit() { printf 'unit:%s\n' "$*" >>"$calls"; }
+  _ctr() {
+    if [[ "${2:-}" == image && "${3:-}" == inspect ]]; then
+      printf '0:0\n'
+      return 0
+    fi
+    if [[ "${2:-}" == inspect && "${3:-}" == lunarwing-kimi-alice ]]; then
+      return 1
+    fi
+    printf 'ctr:%s\n' "$*" >>"$calls"
+  }
+  say() { printf '%s\n' "$*" >>"$messages"; }
+
+  set +e
+  output="$(_start_tenant_workers alice 2>&1)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 1 ]] || {
+    printf 'kimi credential failure returned %s, expected 1: %s\n' "$rc" "$output" >&2
+    return 1
+  }
+  [[ "$(<"$calls")" == 'credential-resolution' ]] || {
+    printf 'kimi continued after credential failure:\n%s\n' "$(<"$calls")" >&2
+    return 1
+  }
+  if grep -q 'kimi worker ready' "$messages"; then
+    printf 'kimi printed a false ready message after credential failure\n' >&2
+    return 1
+  fi
+  if grep -q '^WARNING: workers failed to start' "$messages"; then
+    printf 'kimi credential failure was misclassified as lane-local\n' >&2
+    return 1
+  fi
+)
+
+run_worker_start_case test_stale_worker_failures_are_aggregated \
+  'stale worker lanes continue and aggregate a nonzero status (WI#469)'
+run_worker_start_case test_inner_worker_failure_stays_fatal \
+  'inner worker failures preserve errexit and their status (WI#469 QF-1)'
+run_worker_start_case test_kimi_credential_failure_has_no_ready_side_effects \
+  'kimi credential failure cannot report ready or register state (WI#469 QF-1)'
 
 # Destructive reconciliation requires explicit registry evidence. Unknown or
 # malformed state must not authorize stopping a live worker.
