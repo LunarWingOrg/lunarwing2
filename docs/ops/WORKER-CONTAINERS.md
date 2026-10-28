@@ -1190,10 +1190,13 @@ also differed between the candidate and clean rebuild. The two binaries had
 3,293 differing bytes in a table of per-build 64-bit IDs with stable
 `C0000xxxx` suffixes, despite identical Dockerfile, source ref, source SHA and
 `SOURCE_DATE_EPOCH` inputs. The checked `bytecode: false` / `splitting: false`
-profile remains required and fixes the older split/bytecode ID class, but it
-does not make this standalone Bun `compile` output deterministic. Do not mask
-or otherwise weaken the digest contract silently; the remaining fix is an
-upstream deterministic compile input or an explicit maintainer decision.
+profile is the source-level fix for that older split/bytecode ID class. It was
+re-verified here with two independently fresh v2.1.2 clones, rebuilt at the
+same absolute checkout path after clean installs: both binaries were
+byte-identical (local SHA-256 `6c41398f...`; the value is path-dependent and is
+not a portable artifact checksum). Do not mask or otherwise weaken the
+whole-image digest contract; the protected candidate/rebuild pipeline still
+must confirm the merged tree after the smoke tripwire lands.
 
 The build-time self-test `RUN` steps also run under a throwaway
 `HOME`/XDG environment rooted inside the trap-cleaned `/tmp/opencode2-build-tests`
