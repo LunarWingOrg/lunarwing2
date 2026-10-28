@@ -3131,9 +3131,12 @@ worker_listeners() {  # <tenant>
 
   local findings=0 lane container wss_port bindings bad listeners report rc
   local inspect_out state pid
+  local health_port role
   local -a lanes=(pebble opencode opencode2 kimi)
   for lane in "${lanes[@]}"; do
+    for role in bridge task; do
     container="lunarwing-${lane}-${name}"
+    [[ "$role" != "task" ]] || container="$(worker_task_container_name "$lane" "$name")"
     rc=0
     inspect_out="$(_ctr "$name" inspect -f '{{.State.Running}} {{.State.Pid}}' "$container" 2>&1)" || rc=$?
     if ((rc != 0)); then
@@ -3158,8 +3161,13 @@ worker_listeners() {  # <tenant>
       say "$lane: not running ($container) — skipped"
       continue
     fi
-    wss_port="$(ports_get "$name" "${lane}_wss" 2>/dev/null || true)"
-    say "$lane: $container pid $pid (bridge ws port ${wss_port:-unknown}, health 8443)"
+    wss_port=""
+    health_port=0
+    if [[ "$role" == "bridge" ]]; then
+      wss_port="$(ports_get "$name" "${lane}_wss" 2>/dev/null || true)"
+      health_port=8443
+    fi
+    say "$lane/$role: $container pid $pid"
 
     # Published mappings: every HostIp must be host loopback. Docker records
     # an all-interfaces publish as "HostIp":"" — treat empty/missing as
@@ -3196,7 +3204,7 @@ worker_listeners() {  # <tenant>
       findings=$((findings + 1))
       continue
     fi
-    report="$(printf '%s\n' "$listeners" | awk -v health=8443 -v wss="$wss_port" '
+    report="$(printf '%s\n' "$listeners" | awk -v health="$health_port" -v wss="$wss_port" '
       function hex2dec(h,   i, n) {
         n = 0
         for (i = 1; i <= length(h); i++)
@@ -3232,6 +3240,7 @@ worker_listeners() {  # <tenant>
     if [[ "$rc" -ne 0 ]]; then
       findings=$((findings + 1))
     fi
+    done
   done
 
   if ((findings > 0)); then
@@ -3248,24 +3257,25 @@ worker_listeners() {  # <tenant>
 # container's own /proc/net and the installed wrapper, so it needs no host
 # privileges beyond `podman exec` on the tenant store.
 worker_runtime_smoke() {  # <tenant> [opencode2]
-  local name worker container
+  local name worker container role failed=0
   name="$(sanitize_name "$1")"
   worker="${2:-opencode2}"
   require_worker_name "$worker"
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
   ensure_container_runtime
-  container="lunarwing-${worker}-${name}"
-  if ! _ctr "$name" inspect "$container" >/dev/null 2>&1; then
-    die "container $container is not running; start the $worker worker first"
-  fi
-  case "$worker" in
-    opencode2)
-      _ctr "$name" exec "$container" \
-        python3 /app/scripts/runtime_smoke.py --profile container \
-          --container "$container" --runtime "$CONTAINER_RT"
-      ;;
-    *)
-      die "runtime smoke is implemented for the opencode2 lane only (WI#424 control 6)"
-      ;;
-  esac
+  [[ "$worker" == "opencode2" ]] \
+    || die "runtime smoke is implemented for the opencode2 lane only (WI#424 control 6)"
+  for role in bridge task; do
+    container="lunarwing-${worker}-${name}"
+    [[ "$role" != "task" ]] || container="$(worker_task_container_name "$worker" "$name")"
+    if ! _ctr "$name" inspect "$container" >/dev/null 2>&1; then
+      say "container $container is not running; start the $worker worker first" >&2
+      failed=1
+      continue
+    fi
+    _ctr "$name" exec "$container" \
+      python3 /app/scripts/runtime_smoke.py --profile container \
+        --container "$container" --runtime "$CONTAINER_RT" || failed=1
+  done
+  return "$failed"
 }
