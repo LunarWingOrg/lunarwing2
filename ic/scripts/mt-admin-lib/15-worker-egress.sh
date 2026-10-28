@@ -558,17 +558,17 @@ install_worker_egress_guard() {
 }
 
 worker_egress_apply() {
-  local name="$1" ruleset_path verified
+  local name="$1" ruleset_path guard mode=rootful
   require_cmd nft
+  ensure_container_runtime
   ruleset_path="$(worker_egress_ruleset_path "$name")"
   _worker_egress_write_ruleset "$name" \
     || die "failed to render worker egress ruleset for '$name'; previous boot state removed"
   install_worker_egress_guard
-  worker_egress_nft "$name" -f "$ruleset_path" \
-    || die "failed to load worker egress ruleset for '$name'"
-  verified="$(worker_egress_verify "$name")" \
-    || die "worker egress filter for '$name' did not survive the load with both exact reject rules (fail closed)"
-  printf '%s\n' "$verified"
+  guard="$WORKER_EGRESS_GUARD"
+  [[ "$(id -u)" == 0 ]] || guard="$WORKER_EGRESS_GUARD_SRC"
+  [[ "$CONTAINER_RT" != podman || "$MT_ROOTLESS" != true ]] || mode=rootless
+  "$guard" "$ruleset_path" "$mode" "$(worker_egress_chain "$name")" "$name"
 }
 
 worker_egress_flush() {
@@ -579,6 +579,20 @@ worker_egress_flush() {
   done
 }
 
+worker_egress_stop_keeper() {
+  local name="$1" keeper purpose
+  _worker_egress_validate_name "$name"
+  ensure_container_runtime
+  [[ "$CONTAINER_RT" == podman && "$MT_ROOTLESS" == true ]] || return 0
+  keeper="lw-egress-keeper-$name"
+  _ctr "$name" pod exists "$keeper" || return 0
+  purpose="$(_ctr "$name" pod inspect --format '{{index .Labels "lunarwing.purpose"}}' "$keeper")" \
+    || die "cannot inspect namespace keeper $keeper"
+  [[ "$purpose" == worker-egress-keeper ]] || die "refusing to remove foreign keeper pod $keeper"
+  _ctr "$name" pod rm -f "$keeper" >/dev/null \
+    || die "cannot remove rootless namespace keeper $keeper"
+}
+
 # Tenant removal must not leave the egress network, the rendered state or the
 # live chains behind for a later tenant of the same name to inherit (OQ-6).
 # Every step is best-effort: the tenant account may already be gone.
@@ -586,6 +600,7 @@ worker_egress_teardown() {
   local name="$1" network conf ruleset hosts
   _worker_egress_validate_name "$name"
   worker_egress_flush "$name" || true
+  worker_egress_stop_keeper "$name" || true
   network="$(worker_egress_network_name "$name")"
   _ctr "$name" network rm "$network" >/dev/null 2>&1 || true
   _worker_egress_lock
