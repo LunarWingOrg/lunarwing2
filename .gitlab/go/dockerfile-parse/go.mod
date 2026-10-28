@@ -1,6 +1,6 @@
 module lunarwing/ci/dockerfile-parse
 
-go 1.26.8
+go 1.26.10
 
 require github.com/moby/buildkit v0.34.1
 
