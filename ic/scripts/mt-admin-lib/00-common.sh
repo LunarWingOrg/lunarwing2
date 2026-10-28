@@ -22,6 +22,7 @@
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+warn_err() { printf 'error: %s\n' "$*" >&2; }
 
 # WI#384 display hygiene: tenant-controlled values echoed into root-side
 # terminal output and logs must never carry control bytes or terminal escapes.
@@ -110,7 +111,8 @@ with_tenant_lifecycle_lock() {
   install -d -o root -g root -m 0700 "$TENANT_LIFECYCLE_LOCK_DIR"
   [[ "$(stat -c '%u:%a' "$TENANT_LIFECYCLE_LOCK_DIR" 2>/dev/null)" == "0:700" ]] \
     || die "unsafe tenant lifecycle lock directory"
-  local lock_fd result
+  local lock_fd result restore_errexit=false
+  [[ "$-" == *e* ]] && restore_errexit=true
   if [[ -n "${LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD:-}" ]]; then
     lock_fd="$LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD"
     [[ "${LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT:-}" == "$name" ]] \
@@ -126,7 +128,12 @@ with_tenant_lifecycle_lock() {
       || die "invalid inherited tenant lifecycle lock"
     LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD="$lock_fd"
     LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT="$name"
-    "$@" || result=$?
+    set +e
+    "$@"
+    result=$?
+    if [[ "$restore_errexit" == true ]]; then
+      set -e
+    fi
     result="${result:-0}"
     unset LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT
     return "$result"
@@ -138,7 +145,12 @@ with_tenant_lifecycle_lock() {
   fi
   LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD="$lock_fd"
   LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT="$name"
-  "$@" || result=$?
+  set +e
+  "$@"
+  result=$?
+  if [[ "$restore_errexit" == true ]]; then
+    set -e
+  fi
   result="${result:-0}"
   unset LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT
   flock -u "$lock_fd" || result=1
