@@ -76,7 +76,7 @@ fn serialize_bounded(mut value: Value, payload_key: Option<&str>) -> RunnerResul
         return Err(runner_error(format!("runner frame exceeds {cap} bytes")));
     };
     for field in ["output", "delta", "error"] {
-        let text = value[key][field].as_str().unwrap_or_default().to_string();
+        let text = value[key]["payload"][field].as_str().unwrap_or_default().to_string();
         if text.is_empty() {
             continue;
         }
@@ -85,7 +85,7 @@ fn serialize_bounded(mut value: Value, payload_key: Option<&str>) -> RunnerResul
         while low <= high {
             let middle = low + (high - low) / 2;
             let candidate = truncate_utf8(&text, middle);
-            value[key][field] = json!(candidate);
+            value[key]["payload"][field] = json!(candidate);
             let encoded = serde_json::to_string(&value)?;
             if encoded.len() <= cap {
                 best = candidate;
@@ -96,7 +96,7 @@ fn serialize_bounded(mut value: Value, payload_key: Option<&str>) -> RunnerResul
                 high = middle - 1;
             }
         }
-        value[key][field] = json!(best);
+        value[key]["payload"][field] = json!(best);
         serialized = serde_json::to_string(&value)?;
         if serialized.len() <= cap {
             return Ok(serialized);
