@@ -108,4 +108,52 @@ sudo bash ic/scripts/lunarwing-mt-admin.sh build-tenant mistyfly \
   --with-wasm --with-pebble --with-kimi --with-toolchains
 ```
 
-_(in progress — artifacts recorded below once `BUILD_EXIT` is known)_
+### F1 (confirmed still present on the 2.1.7 tree — worker source-root asymmetry)
+
+The item-99 (thunderlane) report recorded this as run-208 **NT-8** and left it
+as a follow-up candidate. It is **unchanged in the v2.1.7.0 tree**, and this
+pass reproduces it with two different live revisions, which the prior pass
+could not do:
+
+- `build_pebble_worker` (`ic/scripts/mt-admin-lib/05-tenant-build.sh:1142`)
+  builds from `${LUNARWING_ROOT}/pebble4lunarwing`, where
+  `LUNARWING_ROOT="$(cd -- "${REPO_ROOT}/.." && pwd)"`
+  (`ic/scripts/lunarwing-mt-admin.sh:16`) — i.e. the **operator's live
+  checkout**, and stamps `SOURCE_REVISION` from
+  `_worker_source_revision "$LUNARWING_ROOT" pebble4lunarwing`.
+- `build_kimi_worker` is instead called with the **tenant clone**:
+  `build_kimi_worker "false" "$with_toolchains" "" "$(tenant_lw_root "$name")"`
+  (`05-tenant-build.sh:574`), as are `build_opencode_worker` (`:568`) and
+  `build_opencode2_worker` (`:578`). pebble is the only worker lane that
+  ignores the tenant root.
+
+Measured during this build:
+
+| source root | revision | branch |
+| --- | --- | --- |
+| operator checkout `/home/sweetiebot/lunarwing2` (pebble builds from here) | `2c86f2bc6` | `sweetiebot/kimi-99-20261028-0605` |
+| tenant clone `/home/mistyfly/lunarwing` (kimi builds from here) | `62bed7142` | `sweetiebot/kimi-99-20261028-0605` |
+
+The two differ because `add-tenant` cloned at `62bed7142` and this report's
+skeleton commit `2c86f2bc6` landed afterwards. So the pebble image for this
+tenant is built from a **different, later, and dirty** tree than the kimi image
+and than the daemon binary that the tenant actually runs. Because
+`_worker_source_revision` appends `-dirty` when `git status --porcelain` over
+the subdir is non-empty, an operator's uncommitted `pebble4lunarwing/` edits
+silently land in a tenant's worker image — the reverse of what
+`upgrade-tenant`'s clean-tree gate is there to prevent. Consequence for
+reproducibility: the pebble image cannot be traced to the tenant's own pinned
+clone. Fix shape: give `build_pebble_worker` the same tenant-root parameter the
+other three worker builders take (and pass `$(tenant_lw_root "$name")` at
+`:562`), keeping the operator root only for the standalone
+`build-pebble-worker` subcommand.
+
+The same asymmetry exists on the **`upgrade-tenant`** path: at
+`05-tenant-build.sh:1074` `build_pebble_worker "false" "$with_toolchains"` again
+takes no source root, while `:1080`/`:1086`/`:1092` pass `$worker_source_root`.
+So an in-place upgrade re-builds kimi/opencode/opencode2 from the tenant's
+freshly checked-out `--target` ref but rebuilds pebble from whatever the
+operator's live checkout holds at that moment — defeating the target-pinning the
+upgrade path exists to give. Both call sites need the fix.
+
+_(build artifacts recorded below once `BUILD_EXIT` is known)_
