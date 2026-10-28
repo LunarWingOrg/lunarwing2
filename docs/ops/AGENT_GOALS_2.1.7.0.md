@@ -1334,7 +1334,12 @@
 
 ## Phase 6 - Misc Operations
 
-114. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/504 - last attempt was marked INCOMPLETE/SALVAGED: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2024
+114. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/504 - last attempt was marked INCOMPLETE/SALVAGED: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2024
+    - DONE 2026-10-28 (SweetieBot, item-114, branch `sweetiebot/kimi-114-20261028-1841`): WI#504 is fixed in-tree on the current target; !2024 was not cherry-picked.
+    - **Single-session fix:** `worker_egress_apply` now performs ruleset load and both chain reads inside one `podman unshare --rootless-netns` session. Load-vs-verification failures remain distinct, and diagnostics include the namespace read and keeper state. Code commit `cb22d9c9d`.
+    - **Guard parity:** inspection showed the installed guard also split load and reads across separate unshare invocations (the prior mistyfly report's assertion that it was already single-session was incorrect). The guard now runs load + both reads in one session, and `--verify` reads both chains in one session. Code commit `44a59b0f7`; report correction in `docs/ops/ITEM99_TEST_TENANT_MISTYFLY.md` commit `8c9ba4be4`.
+    - **Regression harness:** fake rootless Podman assigns a fresh namespace to every invocation; pins prove `worker_egress_apply` and the rootless pre-start guard both succeed when load + reads share one namespace. Load failure, missing/incomplete filter, OpenRC guard behavior, and babysitter post-guard stop remain covered. Executable fixture binaries use a temp directory that permits execution on this host's `noexec` `/tmp`. Test commits `eeb61df8c` and `cbddbf14b`.
+    - **Verification:** `bash ic/scripts/tests/test-worker-egress.sh` passes (optional live arm skipped); `bash -n` and `.ci-bin/shellcheck -S warning` pass on all three changed shell files; `PATH="$PWD/.ci-bin:$PATH" bash ic/scripts/check-mt-admin.sh` passes. No Rust code changed, so no cargo lane was needed. Live `start-tenant` on a real tenant was not repeated; WI#504 remains open on GitLab for maintainer review.
 115. [x] (S) Reserved
 116. [x] (S) Reserved
 117. [x] (H) Reserved
