@@ -2,8 +2,21 @@
 
 > Provisioned 2026-10-28 by SweetieBot (autonomous), branch
 > `sweetiebot/kimi-99-20261028-0605`, at tree `62bed7142` (LunarWing 2.1.7).
-> The tenant clone tracks this branch: mt-admin's `clone_tenant_repo` clones
-> the running checkout's current branch.
+> The tenant clone tracks that **`0605`** branch: mt-admin's `clone_tenant_repo`
+> clones the running checkout's current branch.
+>
+> **Re-MR provenance (2026-10-28, branch `sweetiebot/kimi-99-20261028-1523`).**
+> The `0605` MR was closed by the operator for merge conflicts, not for the
+> findings. This document and the `worker_egress_launch_args` fix it surfaced
+> were re-landed **unchanged** onto the current target `66e9433b1` — the test
+> was *not* repeated and the tenant was *not* reprovisioned. Consequently every
+> SHA and build-log excerpt below refers to the **original `0605` run's** trees
+> (`62bed7142`, `2c86f2bc6`, `5cbcf817a`): they are the measured evidence for
+> findings F1/F2/F2b/F4/F5 and are deliberately *not* rewritten to this
+> branch's SHAs, since rewriting them would invalidate the traceability gap F1
+> describes. Where this document says "this run" it means the `0605` run; the
+> only content added on `1523` is this provenance note and the goals-doc DONE
+> trail.
 >
 > **This tenant is deliberately left running.** `mistyfly` comes from the
 > sanctioned test-tenant list in
