@@ -55,12 +55,16 @@ RUN git -C /build/pebble apply --check /tmp/wi477-request-events.patch && \
 # and clipboard-win 5.4.1 -> 5.4.3 (yanked). Only those five packages'
 # version/checksum lines change; no dependency edge is re-pointed
 # (run-214 NX-1) and no package is added or removed.
+# 2026-10-28: pulldown-cmark 0.13.4 -> 0.13.5 (RUSTSEC-2026-0414, exponential
+# event growth with ENABLE_WIKILINKS; pebble renders model output through
+# Options::all(), so the option is on). Same dependency requirements and
+# MSRV; only its version/checksum lines change.
 # The build fails if the checked-out lock or the pinned digest drift from the
 # reviewed inputs, keeping the locked/reproducible-build guarantee.
 COPY pebble4lunarwing/upstream/Cargo.lock /tmp/pebble-upstream-Cargo.lock
 COPY pebble4lunarwing/scripts/verify_upstream_lock.py /tmp/verify-pebble-lock.py
 # Canonical reviewed pin also covers mt-admin, Compose and plain docker builds.
-ARG PEBBLE_LOCK_SHA256=24fc1c2284f5527634c4129542f01c2b11b438fbe1caa7c9bbc50f6dae8156a4
+ARG PEBBLE_LOCK_SHA256=19f4e96c4a64dbe062d0f2ae1ff2b6b2c128b6972d8e17f7a81f059341ec0b08
 RUN python3 /tmp/verify-pebble-lock.py pebble/Cargo.lock \
     /tmp/pebble-upstream-Cargo.lock "${PEBBLE_LOCK_SHA256}"
 RUN cp /tmp/pebble-upstream-Cargo.lock pebble/Cargo.lock && \
