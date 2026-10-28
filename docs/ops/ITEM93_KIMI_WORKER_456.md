@@ -192,8 +192,12 @@ self-healing).
 
 ## What this item does NOT change
 
-- The image-user guard's `die` stays (deliberate, WI#400); this item makes
-  sure a rebuilt image exists and documents the one-command remediation.
+- The image-user guard's refusal stayed deliberate in this item (WI#400),
+  which made sure a rebuilt image existed and documented the one-command
+  remediation. WI#469 later made that refusal lane-local: `start-tenant`
+  warns and attempts every later selected worker, then exits nonzero with a
+  summary of failed lanes. Other fatal starter errors are unchanged, and
+  `upgrade-tenant` returns the same failure after refreshing deployed health.
 - `_ensure_tenant_image`'s stale-accept branch (admin store empty → tenant's
   copy wins) is unchanged: the image-user guard is the loud backstop, and
   changing the accept rule would break offline fleets where only a tenant
