@@ -22,6 +22,7 @@
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+warn_err() { printf 'error: %s\n' "$*" >&2; }
 
 # WI#384 display hygiene: tenant-controlled values echoed into root-side
 # terminal output and logs must never carry control bytes or terminal escapes.
