@@ -708,6 +708,57 @@ assert_contains "$(cat "$systemd_lib")" 'ExecStartPost=${egress_guard} --verify 
 assert_contains "$(cat "$systemd_lib")" 'DNS=127.0.0.1' "Quadlet disables upstream DNS"
 assert_contains "$(cat "$systemd_lib")" 'AddHost=' "Quadlet installs static host mappings"
 
+# ── keeper cleanup follows verified worker shutdown, before network removal ──
+if (ensure_container_runtime() { exit 1; }; worker_egress_stop_keeper unallocated); then
+  pass "stopping a daemon-only tenant needs no container runtime"
+else
+  fail "daemon-only stop tried to require a container runtime"
+fi
+stop_fixture_tenant() {
+  local stub
+  for stub in stop_tenant_init_services stop_tenant_vision stop_tenant_voice stop_tenant_pebble \
+      stop_tenant_opencode stop_tenant_kimi stop_tenant_opencode2 stop_tenant_postgres retire_tenant_nanocode; do
+    eval "$stub() { :; }"
+  done
+  await_writer_quiescence() { printf 'quiesced\n' >>"$fixture/stop-order"; return "${STOP_WRITER_RC:-0}"; }
+  _ctr() { shift; printf '%s\n' "$*" >>"$fixture/stop-order"; "$session_bin/podman" "$@"; }
+  stop_tenant alpha
+}
+: >"$fixture/stop-order"
+assert_rc_fail env STOP_WRITER_RC=1 stop_fixture_tenant
+if [[ -e "$session_bin/keeper-running" ]]; then pass "active writers keep their namespace pinned"; else fail "keeper removed before writers stopped"; fi
+if (stop_fixture_tenant) >/dev/null; then
+  pass "tenant stop retires its namespace keeper"
+else
+  fail "tenant stop could not retire its namespace keeper"
+fi
+if [[ ! -e "$session_bin/keeper-created" ]] \
+    && awk '/quiesced/ { ready=1 } /pod rm/ { if (!ready) exit 1; found=1 } END { exit !found }' "$fixture/stop-order"; then
+  pass "keeper removal happens after writer quiescence"
+else
+  fail "tenant stop removed keeper out of order or left it behind"
+fi
+worker_egress_apply alpha >/dev/null
+touch "$session_bin/foreign-keeper"
+stop_fixture_keeper() {
+  _ctr() { shift; "$session_bin/podman" "$@"; }
+  worker_egress_stop_keeper alpha
+}
+assert_rc_fail stop_fixture_keeper
+rm -f "$session_bin/foreign-keeper"
+: >"$session_bin/podman.log"
+if (_ctr() { shift; "$session_bin/podman" "$@"; }; worker_egress_teardown alpha); then
+  pass "tenant teardown removes its keeper and rendered state"
+else
+  fail "tenant teardown failed"
+fi
+if [[ ! -e "$session_bin/keeper-created" && ! -e "$WORKER_EGRESS_DIR/alpha.conf" ]] \
+    && awk '/pod rm/ { removed=1 } /network rm/ { if (!removed) exit 1; found=1 } END { exit !found }' "$session_bin/podman.log"; then
+  pass "teardown releases the keeper before deleting the tenant network"
+else
+  fail "teardown left keeper state behind or deleted its network first"
+fi
+
 # ── optional live acceptance, never a default host-side nft mutation ─────────
 say_skip() { printf 'SKIP: %s\n' "$1"; }
 LIVE_NET=lw-egress-liveprobe
