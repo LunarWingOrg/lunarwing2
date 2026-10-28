@@ -121,7 +121,7 @@ sudo bash ic/scripts/lunarwing-mt-admin.sh build-tenant mistyfly \
   --with-wasm --with-pebble --with-kimi --with-toolchains
 ```
 
-### F1 (confirmed still present on the 2.1.7 tree — worker source-root asymmetry)
+### F1 (confirmed still present on the 2.1.7 tree — worker source-root asymmetry) — **WI#507**
 
 The item-99 (thunderlane) report recorded this as run-208 **NT-8** and left it
 as a follow-up candidate. It is **unchanged in the v2.1.7.0 tree**, and this
@@ -212,7 +212,7 @@ upgrade path exists to give. Both call sites need the fix.
 6. `=== Building kimi worker image ===` → fat.
 
 
-## F2 — BLOCKER: WI#424 egress fail-closed deadlocks worker start on rootless podman (never before exercised)
+## F2 — BLOCKER: WI#424 egress fail-closed deadlocks worker start on rootless podman (never before exercised) — **WI#504**
 
 This is the headline finding of the pass. `start-tenant mistyfly` **aborted
 before creating either worker container**, so a tenant provisioned exactly per
@@ -376,7 +376,7 @@ so the launch args were rejected. F2 (netns race) blocked the apply itself and
 is tracked separately at WI#504; F2a is fixed here and is the reason a docs-and-
 script MR is the right vehicle for the finding rather than a follow-up.
 
-### F2b — the fail-closed `die` also orphans the tenant lifecycle lock
+### F2b — the fail-closed `die` also orphans the tenant lifecycle lock — **WI#505**
 
 The `die` inside `worker_egress_apply` unwinds through `prepare_worker_egress`
 → the pebble worker create path → `_start_tenant_init_services`, which is
@@ -551,7 +551,7 @@ succeeded and is in permanent backoff:
 minutes of boot is the signature: the tenant is functional on its seeded corpus
 but can never pick up a corpus update.
 
-## F5 — WI#424 egress default allowlist has no pebble LLM host; every pebble job 401s/000s
+## F5 — WI#424 egress default allowlist has no pebble LLM host; every pebble job 401s/000s — **WI#506**
 
 The pebble worker's model backend is the NanoGPT API at `nano-gpt.com` (the
 `pebble` binary's baked-in default — no `PEBBLE_BASE_URL` is written by
@@ -752,6 +752,24 @@ arithmetic is verified by the exact-sum check.
 | Knowledge seed + sweep + study MCP | 1795 notes seeded / 20 failed; `study_notes` MCP active; sweep ran (F4 documents the refresh failure) |
 | WASM channel/tool suite | 3 channels + 9 tools; 13 extensions total |
 | Workspace-overlap exclusivity | second concurrent kimi dispatch refused with the exact ownership error |
+
+## Finding → owner index
+
+QQ-4 asked for the four target-side findings to be cited in their headings so
+they stay traceable once the tenant is gone. Filed at the maintainer's request
+after run 250 and confirmed open against this tree:
+
+| finding | work item | severity label | one-line mechanism |
+| --- | --- | --- | --- |
+| F1 — worker source-root asymmetry | [WI#507](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/507) | medium, mt-admin / tech-debt | `build_pebble_worker` takes no tenant source root, so tenant pebble images build from the operator's live checkout and stamp its moving, possibly dirty revision |
+| F2 — egress apply fail-closed deadlock | [WI#504](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/504) | high, mt-admin / security | `worker_egress_apply` loads and verifies in separate `podman unshare --rootless-netns` invocations, so the first worker start fails closed with no netns keeper running |
+| F2b — orphaned tenant lifecycle lock | [WI#505](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/505) | high, mt-admin / reliability | the lock descriptor is inherited by OpenRC daemons started inside the locked section, so a `die()` leaves the flock held and every later lifecycle command blocks |
+| F5 — no pebble backend in the allowlist | [WI#506](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/506) | medium, mt-admin / network | a `--with-pebble` tenant has no allowlist entry for pebble's model backend, so every pebble job fails on an egress-enforcing host |
+| F2a — launch-args status bug | **fixed on this branch** (`64442bffa`) | — | the IP-only allowlist made `worker_egress_launch_args` return 1 after printing valid args |
+| F3 — prior-pass findings (numbering is thunderlane's, not this report's) | WI#471 / WI#472 / WI#473 fixed, WI#436 item 1 still open | — | three of four named prior findings landed and are regression-verified live on mistyfly |
+| F4 — knowledge-sync seed/refresh asymmetry | WI#436 item 1 | — | one bad corpus note still poisons the whole refresh |
+
+F2a is closed by this MR; the other four are recorded here and owned upstream.
 
 ## Disposition
 
