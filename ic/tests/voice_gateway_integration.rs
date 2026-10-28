@@ -151,6 +151,7 @@ async fn start_gateway(voice: Option<Arc<VoiceApi>>) -> std::net::SocketAddr {
         ws_idle_timeout_secs: 120,
         voice,
         voice_rate_limiter: lunarwing::channels::web::server::PerUserRateLimiter::new(10, 60),
+        context_manager: None,
     });
     lunarwing::channels::web::server::start_server(
         addr,
