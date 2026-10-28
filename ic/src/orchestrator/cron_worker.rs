@@ -2254,18 +2254,21 @@ mod tests {
 
         let cm = Arc::new(crate::context::ContextManager::new(1));
         let (events, _) = broadcast::channel(8);
-        let manager =
-            Arc::new(ExternalWorkerManager::new(vec![]).with_event_deps(events, cm.clone()));
         let worker = ExternalWorkerConfig {
             name: "kimi".to_string(),
             ..Default::default()
         };
+        let manager = Arc::new(
+            ExternalWorkerManager::new(vec![worker.clone()]).with_event_deps(events, cm.clone()),
+        );
         let cron = test_cron();
         let last = Arc::new(std::sync::Mutex::new(None));
         let ctx = test_ctx(&manager, &worker, &cron, &last);
         let job_id = Uuid::new_v4();
         let outcome = register_tick_job(&ctx, 1, 0, job_id, "tick", "slow LLM wait").await;
-        assert!(matches!(outcome, DispatchOutcome::Fired));
+        if let DispatchOutcome::Capacity(reason) = outcome {
+            panic!("cron tick registration failed: {reason}");
+        }
 
         let registered = cm.get_context(job_id).await.unwrap(); // safety: test
         assert_eq!(registered.external_worker.as_deref(), Some("kimi"));
