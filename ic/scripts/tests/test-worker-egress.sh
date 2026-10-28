@@ -110,12 +110,16 @@ worker_egress_nft() {
       printf '%s\n' "$NFT_LIST_OUT"
       return 0
     fi
-    local chain="${!#}"
+    local chain state
+    state="$NFT_RULESET_FILE"
+    [[ -n "$state" ]] || state="$(worker_egress_ruleset_path "$name")"
+    [[ -f "$state" ]] || return 1
+    chain="${!#}"
     awk -v chain="$chain" '
       index($0, "chain " chain " {") { inside = 1; print; next }
       inside && /^    }/ { inside = 0; print; next }
       inside && /counter reject with icmpx type admin-prohibited/ { print }
-    ' "$NFT_RULESET_FILE"
+    ' "$state"
     return 0
   fi
   return 0
@@ -256,7 +260,15 @@ while [[ $# -gt 0 ]]; do
 done
 exec "$@"
 STUB
-chmod +x "$NETNS_BIN/nft" "$NETNS_BIN/podman" "$NETNS_BIN/sudo"
+cat >"$NETNS_BIN/readlink" <<'STUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "/proc/self/ns/net" && -n "${LW_FAKE_NETNS:-}" ]]; then
+  printf 'netns:%s\n' "$LW_FAKE_NETNS"
+else
+  exec /usr/bin/readlink "$@"
+fi
+STUB
+chmod +x "$NETNS_BIN/nft" "$NETNS_BIN/podman" "$NETNS_BIN/sudo" "$NETNS_BIN/readlink"
 
 netns_configure() {
   printf '%s\n' "$NFT_LOAD_RC" >"$NETNS_BIN/load_rc"
@@ -360,7 +372,7 @@ if netns_env worker_egress_apply alpha >/dev/null 2>"$fixture/apply.err"; then
 else
   pass "apply fails when the loaded chains disappear"
   assert_contains "$(cat "$fixture/apply.err")" 'did not survive the load' "apply refusal names the real cause"
-  assert_contains "$(cat "$fixture/apply.err")" 'network namespace netns-1' "apply identifies the namespace that was checked"
+  assert_contains "$(cat "$fixture/apply.err")" 'network namespace netns:netns-1' "apply identifies the namespace that was checked"
   assert_contains "$(cat "$fixture/apply.err")" 'keeper: absent' "apply identifies the absent rootless namespace keeper"
 fi
 netns_reset
@@ -586,14 +598,15 @@ guard_bin="$NETNS_BIN/guard-bin"
 mkdir -p "$guard_bin"
 cat >"$guard_bin/nft" <<'STUB'
 #!/usr/bin/env bash
+script_dir="$(cd "$(dirname "$0")" && pwd)"
 case "${1:-}" in
-  -f) exit "${FAKE_LOAD_RC:-0}" ;;
+  -f) exit "$(<"$script_dir/load_rc")" ;;
   list)
-    [[ "${FAKE_LIST_RC:-0}" == "0" ]] || exit 1
+    [[ "$(<"$script_dir/list_rc")" == "0" ]] || exit 1
     chain="${!#}"
-    printf 'list %s\n' "$chain" >>"${FAKE_NFT_LOG:-/dev/null}"
+    printf 'list %s\n' "$chain" >>"$script_dir/guard.log"
     printf 'chain "%s" {\n' "$chain"
-    case "${FAKE_MODE:-good}" in
+    case "$(<"$script_dir/mode")" in
       empty) ;;
       wrong) printf '  iifname "lweg11" ip saddr 10.89.11.0/24 counter packets 0 bytes 0 reject with icmpx type admin-prohibited\n' ;;
       narrow) printf '  iifname "lweg10" meta l4proto tcp ip saddr 10.89.10.0/24 counter packets 0 bytes 0 reject with icmpx type admin-prohibited\n' ;;
@@ -604,23 +617,50 @@ case "${1:-}" in
 esac
 STUB
 chmod +x "$guard_bin/nft"
+GUARD_LOAD_RC=0
+GUARD_LIST_RC=0
+GUARD_MODE=good
+guard_configure() {
+  printf '%s\n' "$GUARD_LOAD_RC" >"$guard_bin/load_rc"
+  printf '%s\n' "$GUARD_LIST_RC" >"$guard_bin/list_rc"
+  printf '%s\n' "$GUARD_MODE" >"$guard_bin/mode"
+}
+guard_reset() {
+  GUARD_LOAD_RC=0
+  GUARD_LIST_RC=0
+  GUARD_MODE=good
+  : >"$guard_bin/guard.log"
+  guard_configure
+}
+guard_reset
 assert_rc_fail env PATH="$guard_bin:$PATH" "$guard" "$fixture/missing.nft" rootful fwd_alpha
 # OQ-4: the guard derives the input chain as `in_<suffix>` (distinct from the
 # forward prefix), so a `worker_input_*` regression cannot pass silently.
-: >"$fixture/guard-chains.log"
-if PATH="$guard_bin:$PATH" FAKE_NFT_LOG="$fixture/guard-chains.log" \
-    "$guard" "$fixture/alpha.nft" rootful fwd_alpha >/dev/null; then
+if PATH="$guard_bin:$PATH" "$guard" "$fixture/alpha.nft" rootful fwd_alpha >/dev/null; then
   pass "guard accepts both exact live chains"
-  assert_contains "$(cat "$fixture/guard-chains.log")" 'list in_alpha' "guard derives the in_<tenant> input chain (OQ-4)"
-  assert_absent "$(cat "$fixture/guard-chains.log")" 'worker_input_' "guard no longer derives worker_input_* chain names (OQ-4)"
+  assert_contains "$(cat "$guard_bin/guard.log")" 'list in_alpha' "guard derives the in_<tenant> input chain (OQ-4)"
+  assert_absent "$(cat "$guard_bin/guard.log")" 'worker_input_' "guard no longer derives worker_input_* chain names (OQ-4)"
 else
   fail "guard rejected both exact live chains"
 fi
-assert_rc_fail env PATH="$guard_bin:$PATH" FAKE_LOAD_RC=1 "$guard" "$fixture/alpha.nft" rootful fwd_alpha
-assert_rc_fail env PATH="$guard_bin:$PATH" FAKE_LIST_RC=1 "$guard" "$fixture/alpha.nft" rootful fwd_alpha
-assert_rc_fail env PATH="$guard_bin:$PATH" FAKE_MODE=empty "$guard" "$fixture/alpha.nft" rootful fwd_alpha
-assert_rc_fail env PATH="$guard_bin:$PATH" FAKE_MODE=wrong "$guard" "$fixture/alpha.nft" rootful fwd_alpha
-assert_rc_fail env PATH="$guard_bin:$PATH" FAKE_MODE=narrow "$guard" "$fixture/alpha.nft" rootful fwd_alpha
+GUARD_LOAD_RC=1
+guard_configure
+assert_rc_fail env PATH="$guard_bin:$PATH" "$guard" "$fixture/alpha.nft" rootful fwd_alpha
+GUARD_LOAD_RC=0
+GUARD_LIST_RC=1
+guard_configure
+assert_rc_fail env PATH="$guard_bin:$PATH" "$guard" "$fixture/alpha.nft" rootful fwd_alpha
+GUARD_LIST_RC=0
+GUARD_MODE=empty
+guard_configure
+assert_rc_fail env PATH="$guard_bin:$PATH" "$guard" "$fixture/alpha.nft" rootful fwd_alpha
+GUARD_MODE=wrong
+guard_configure
+assert_rc_fail env PATH="$guard_bin:$PATH" "$guard" "$fixture/alpha.nft" rootful fwd_alpha
+GUARD_MODE=narrow
+guard_configure
+assert_rc_fail env PATH="$guard_bin:$PATH" "$guard" "$fixture/alpha.nft" rootful fwd_alpha
+guard_reset
 if PATH="$guard_bin:$PATH" "$guard" --verify "$fixture/alpha.nft" rootful fwd_alpha >/dev/null; then
   pass "guard --verify rechecks a started worker without reloading"
 else
