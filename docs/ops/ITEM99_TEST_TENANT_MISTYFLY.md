@@ -157,3 +157,42 @@ operator's live checkout holds at that moment — defeating the target-pinning t
 upgrade path exists to give. Both call sites need the fix.
 
 _(build artifacts recorded below once `BUILD_EXIT` is known)_
+
+## F2 — the four prior-run findings are all fixed in this tree (regression-verified)
+
+The v2.1.6.0 item-99 (`thunderlane`) pass filed four findings. Each has since
+landed, and every fix commit is an ancestor of this branch
+(`git merge-base --is-ancestor <sha> HEAD` → true for all of them):
+
+| prior finding | fix | landed commits |
+| --- | --- | --- |
+| **F2 / WI#472** — approval without `thread_id` returned `202` but no-op'd, leaving the turn wedged at the gate | `resolve_approval_thread()` resolves the owning thread from `request_id` server-side (engine gate first, then the legacy awaiting-approval session), **404** when no live gate matches, **400** when the supplied `thread_id` does not own it | `6e950cb85`, `cbab67643`, `27502a00a`, `9fc305597`, `bd91d2e28` |
+| **F5 / WI#471** — a quoted `NANOGPT_API_KEY` passed through `--env-file` verbatim, so pebble jobs failed with an opaque `401 Invalid session` | `configure_pebble` rejects literal quotes at either end, leading/trailing whitespace, embedded newlines, and a pasted `NANOGPT_API_KEY=` / `export NANOGPT_API_KEY=` assignment line | `adce2430b`, `73f308746` |
+| **F4 / WI#473** — stale `shell` gates lingered until the 30-minute expiry instead of being reaped when their turn ended | gates are reaped when turns terminate, with a shared fallback classification and paused-turn preservation | `c3b209b15`, `e51099bbc`, `201348350`, `29a480c52`, `6b5d2892a` |
+| **F1 / WI#436 item 1** — a raw NUL byte in one corpus note poisoned the whole additive knowledge refresh | **NOT fixed — reproduced again on this tenant** (see F3 below) | — |
+
+Code anchors verified on this tree:
+`ic/src/channels/web/server.rs:1565` (`resolve_approval_thread`, with the
+comment at `:1500` explicitly citing the 202-no-op defect),
+`ic/scripts/mt-admin-lib/09-worker-config.sh:1210-1229` (`configure_pebble`
+validation block), `ic/src/bridge/router.rs:3682` (`drain_expired` on ingress).
+
+### F2a — WI#471 guard regression-tested live on mistyfly
+
+Rather than trust the merge-base check, all four rejection arms were exercised
+against the freshly provisioned `mistyfly` (before any real key was configured),
+via `sudo bash ic/scripts/lunarwing-mt-admin.sh configure-pebble mistyfly
+--nanogpt-api-key <value> --model openai/gpt-5.2`:
+
+| supplied value | exit | message |
+| --- | --- | --- |
+| `"sk-nano-fakequoted"` | 1 | `configure-pebble: pass the raw NANOGPT_API_KEY without literal quotes at either end` |
+| `sk-nano-fake'` (trailing quote only) | 1 | same quote refusal |
+| `NANOGPT_API_KEY=sk-nano-fake` | 1 | `configure-pebble: pass only the raw NANOGPT_API_KEY value, not an env-file assignment` |
+| `<space>sk-nano-fake` | 1 | `configure-pebble: pass the raw NANOGPT_API_KEY without leading/trailing whitespace` |
+
+After all four refusals `env/pebble.env` still did **not** exist — the guard
+fails closed before writing, so the exact thunderlane F5 failure mode (a
+quoted key silently persisted, worker recreated, then opaque 401s on every
+job) is no longer reachable by accident. This is the prior pass's most
+operator-visible defect and it is now closed at the point of entry.
