@@ -22,6 +22,21 @@ READY=false
 # drain, escalate to SIGKILL, and only then return.
 SMOKE_DRAIN_SECS="${SMOKE_DRAIN_SECS:-10}"
 
+check_external_writes() {
+  local report="$SMOKE_ROOT/external-writes"
+  if ! find /tmp /var/log/lunarwing -xdev -mindepth 1 \
+      -newer "$SMOKE_ROOT/.marker" \
+      ! -path "$SMOKE_ROOT" ! -path "$SMOKE_ROOT/*" -print >"$report"; then
+    printf 'runtime smoke: external-write scan failed; refusing to certify the layer\n' >&2
+    return 1
+  fi
+  if [[ -s "$report" ]]; then
+    printf 'runtime smoke: writes outside %s detected:\n' "$SMOKE_ROOT" >&2
+    cat "$report" >&2
+    return 1
+  fi
+}
+
 runtime_user_pids() {
   # Live (non-zombie) pids whose real uid is the runtime user, except this shell.
   local status pid key value uid state
@@ -103,6 +118,7 @@ export WS_BIND_HOST=0.0.0.0
 export OPENCODE_SERVE_PORT=4096
 mkdir -p "$HOME" "$TMPDIR" "$WORKSPACE_ROOT"
 chown -R "$SMOKE_UID:$SMOKE_GID" "$SMOKE_ROOT"
+touch "$SMOKE_ROOT/.marker"
 
 as_runtime_user /app/entrypoint.sh --mode websocket >"$SMOKE_ROOT/entrypoint.log" 2>&1 &
 ENTRYPOINT_PID=$!
@@ -133,3 +149,4 @@ if [[ "$(as_runtime_user id -u)" != "$SMOKE_UID" ]]; then
 fi
 
 as_runtime_user python3 /app/scripts/runtime_smoke.py --profile container --health-port "$HEALTH_PORT"
+check_external_writes
