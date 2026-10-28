@@ -345,21 +345,32 @@ else
   fail 'opencode entrypoint: exec bun run of the bridge must be preceded by cd /app (WI#400 LP-1)'
 fi
 
-# ── WI#400 (run-170 LP-11): the kimi/pebble image-user guards refuse ──────
-# a pre-WI#400 image (task uid directly) and an uninspectable one — only the
-# opencode refusal was pinned (test-study-mcp-worker-mount.sh). The lane
-# function runs in a subshell so die() exits only it; a refusal must come
-# BEFORE any container start, which the message shape proves (the guard sits
-# ahead of every run/render path).
-image_user_refusal() {  # <worker> <stale Config.User>
-  local worker="$1" stale="$2" out
+# ── WI#400 / WI#469: every image-user guard refuses before container start ──
+# Status 3 is the lane-local stale-image outcome. Diagnostics must sanitize the
+# inspected Config.User, not pass it as a printf format or raw terminal text.
+image_user_refusal() {  # <worker> <stale Config.User> [expected wording]
+  local worker="$1" stale="$2" expected="${3:-expected 0:0}" out safe_stale rc
+  safe_stale="$(sanitize_display_value "${stale:-unset}")"
   IMAGE_USER="$stale"
-  if out="$("start_tenant_${worker}" alice 2>&1)"; then
-    fail "$worker accepted image user '${stale:-unset}' (WI#400 LP-11)"
-  elif [[ "$out" == *"expected 0:0"* ]]; then
-    pass "$worker refuses image user '${stale:-unset}' (WI#400 LP-11)"
+  CALLS=()
+  set +e
+  out="$(set -e; "start_tenant_${worker}" alice 2>&1)"
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 3 ]]; then
+    fail "$worker image-user refusal returned $rc instead of 3 for '${safe_stale}' (WI#469)"
+  elif [[ "$out" != *"$expected"* ]]; then
+    fail "$worker refusal for '${safe_stale}' missed the rebuild wording (WI#400 LP-11)"
+  elif [[ "$out" != *"user '${safe_stale}'"* ]]; then
+    fail "$worker refusal did not sanitize image user '${safe_stale}' (WI#469)"
+  elif [[ "$out" == *$'\033'* ]]; then
+    fail "$worker refusal emitted a terminal escape (WI#469)"
+  elif ((${#out} > 512)); then
+    fail "$worker refusal exceeded the bounded diagnostic size (WI#469)"
+  elif has_call_like "ctr:alice run *"; then
+    fail "$worker started a container after refusing its image user (WI#469)"
   else
-    fail "$worker refusal for image user '${stale:-unset}' missed the rebuild wording (WI#400 LP-11): $out"
+    pass "$worker safely refuses image user '${safe_stale}' with status 3 (WI#469)"
   fi
   IMAGE_USER="$(image_user_for "$worker")"
 }
@@ -368,6 +379,16 @@ image_user_refusal kimi "10002:10002"
 image_user_refusal kimi ""
 image_user_refusal pebble "10004:10004"
 image_user_refusal pebble ""
+image_user_refusal opencode "10001:10001"
+image_user_refusal opencode ""
+image_user_refusal opencode2 "0:0" "expected $OPENCODE2_CONTAINER_UID:$OPENCODE2_CONTAINER_GID"
+image_user_refusal opencode2 "" "expected $OPENCODE2_CONTAINER_UID:$OPENCODE2_CONTAINER_GID"
+image_user_refusal kimi 'x%sy%dz'
+image_user_refusal pebble 'x%sy%dz'
+image_user_refusal opencode 'x%sy%dz'
+image_user_refusal opencode2 'x%sy%dz' "expected $OPENCODE2_CONTAINER_UID:$OPENCODE2_CONTAINER_GID"
+image_user_refusal kimi "$(printf '10002\033[2J')"
+image_user_refusal pebble '%099999d'
 
 # WI#423 (run-171, the merge with !1784): the rootful create path below is the
 # one scenario in this harness that reaches the tenant-side credential reader,
