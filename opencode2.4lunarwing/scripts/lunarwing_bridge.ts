@@ -25,11 +25,13 @@ process.on("unhandledRejection", (reason) => {
   console.error("[bridge] unhandledRejection (surviving):", reason)
 })
 import { executeTask } from "./opencode_task_executor"
+import { readBridgeAuthToken } from "./bridge_auth"
 // The SDK type for the test seam only, derived from executeTask so this
 // file (outside the WI#369 tsgo gate) never references the client package.
 type OpenCodeClient = NonNullable<Parameters<typeof executeTask>[4]>
 import { resolveTaskWorkspace, workspacePathsOverlap } from "./workspace_path"
 import { ToolProxyRelay, type TaskProxyHandle } from "./lunarwing_tool_proxy.ts"
+import { bridgeRunnerSocketPath, delegateTaskToRunner, verifyRunnerSocket } from "./task_runner_client"
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -38,7 +40,7 @@ const WS_BIND_HOST = process.env.WS_BIND_HOST || "0.0.0.0"
 const WS_PORT = parseInt(process.env.WS_PORT || "9090", 10)
 const WS_PATH = process.env.WS_PATH || "/ws/agent"
 const WS_URL = process.env.WS_URL || ""
-const AGENT_AUTH_TOKEN = process.env.AGENT_AUTH_TOKEN || ""
+const AGENT_AUTH_TOKEN = readBridgeAuthToken(process.env)
 const RECONNECT_MS = parseInt(process.env.RECONNECT_MS || "3000", 10)
 const PING_INTERVAL_MS = parseInt(process.env.PING_INTERVAL_MS || "20000", 10)
 const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || "/workspace"
@@ -212,20 +214,45 @@ async function handleTaskRequest(
   let toolProxy: TaskProxyHandle | null = null
   try {
     toolProxy = await toolProxyRelay.startTask(request.task_id, ws)
-    await executeTask(
-      request,
-      (progress) => {
-        const msg = createEnvelope("task_progress", progress as unknown as Record<string, unknown>)
-        ws.send(JSON.stringify(msg))
-      },
-      (result) => {
-        const msg = createEnvelope("task_result", result as unknown as Record<string, unknown>)
-        ws.send(JSON.stringify(msg))
-        console.log(`[bridge] task ${request.task_id}: ${result.status} (${result.duration_ms}ms)`)
-      },
-      controller.signal,
-      sdkOverride,
-    )
+    const runnerSocket = bridgeRunnerSocketPath()
+    if (runnerSocket) {
+      verifyRunnerSocket(runnerSocket)
+      const result = await delegateTaskToRunner(
+        runnerSocket,
+        request,
+        undefined,
+        (progress) => {
+          ws.send(JSON.stringify(createEnvelope("task_progress", progress as unknown as Record<string, unknown>)))
+        },
+        controller.signal,
+      )
+      ws.send(JSON.stringify(createEnvelope("task_result", result as unknown as Record<string, unknown>)))
+      console.log(`[bridge] task ${request.task_id}: ${result.status} (${result.duration_ms}ms, delegated)`)
+    } else {
+      await executeTask(
+        request,
+        (progress) => {
+          const msg = createEnvelope("task_progress", progress as unknown as Record<string, unknown>)
+          ws.send(JSON.stringify(msg))
+        },
+        (result) => {
+          const msg = createEnvelope("task_result", result as unknown as Record<string, unknown>)
+          ws.send(JSON.stringify(msg))
+          console.log(`[bridge] task ${request.task_id}: ${result.status} (${result.duration_ms}ms)`)
+        },
+        controller.signal,
+        sdkOverride,
+      )
+    }
+  } catch (err) {
+    console.error(`[bridge] task ${request.task_id}: execution failed:`, err)
+    ws.send(JSON.stringify(createEnvelope("task_result", {
+      task_id: request.task_id,
+      status: "error",
+      output: "",
+      error: err instanceof Error ? err.message : String(err),
+      duration_ms: 0,
+    })))
   } finally {
     toolProxy?.close()
     activeTasks.delete(request.task_id)
