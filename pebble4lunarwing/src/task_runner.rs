@@ -303,7 +303,9 @@ async fn handle_connection(stream: UnixStream, config: Arc<ExecutorConfig>) -> R
             return Ok(());
         }
     };
-    let proxy_env = if request_value.get("proxy_env").is_some() {
+    let proxy_env = if request_value.get("proxy_env").is_some()
+        && !request_value["proxy_env"].is_null()
+    {
         match serde_json::from_value::<[(String, String); 2]>(request_value["proxy_env"].clone()) {
             Ok(pairs) => Some(pairs),
             Err(error) => {
@@ -471,5 +473,105 @@ mod tests {
         assert!(startup_refusal(10004, Some("token".into()), None).is_some());
         assert!(startup_refusal(0, None, None).is_some());
         assert_eq!(startup_refusal(10004, None, None), None);
+    }
+
+    #[tokio::test]
+    async fn real_runner_round_trip_returns_executor_result() {
+        let root = std::env::temp_dir().join(format!("pbr-roundtrip-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("create round-trip root");
+        let stub = root.join("pebble-stub");
+        crate::executor::write_executable_stub(
+            &stub,
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"assistant\",\"text\":\"delegated\"}'\nprintf '%s\\n' '{\"message\":\"delegated final\"}'\n",
+        );
+        let socket = root.join("runner.sock");
+        let config = ExecutorConfig {
+            pebble_bin: stub.to_string_lossy().into_owned(),
+            model: "test-model".to_string(),
+            permission_mode: "default".to_string(),
+            workspace_root: root.to_string_lossy().into_owned(),
+        };
+        let server = tokio::spawn(run(config, socket.clone()));
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        let request = TaskRequest {
+            task_id: "runner-roundtrip".to_string(),
+            prompt: "return the stub output".to_string(),
+            context: crate::protocol::TaskContext::default(),
+            timeout_ms: Some(5_000),
+        };
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            delegate_task(&socket, &request, None, event_tx, cancel_rx),
+        )
+        .await;
+        server.abort();
+        outcome
+            .expect("round-trip deadline")
+            .expect("runner result");
+        let mut result = None;
+        while let Some(event) = event_rx.recv().await {
+            if let ExecutorEvent::Result(envelope) = event {
+                result = Some(envelope);
+            }
+        }
+        let result = result.expect("terminal executor envelope");
+        assert_eq!(result.msg_type, "task_result");
+        assert_eq!(result.payload["status"], "success");
+        assert_eq!(result.payload["output"], "delegated final");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn delegated_cancel_returns_a_terminal_result() {
+        let root = std::env::temp_dir().join(format!("pbr-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("create cancel root");
+        let stub = root.join("pebble-stub");
+        crate::executor::write_executable_stub(&stub, "#!/bin/sh\nsleep 30\n");
+        let socket = root.join("runner.sock");
+        let config = ExecutorConfig {
+            pebble_bin: stub.to_string_lossy().into_owned(),
+            model: "test-model".to_string(),
+            permission_mode: "default".to_string(),
+            workspace_root: root.to_string_lossy().into_owned(),
+        };
+        let server = tokio::spawn(run(config, socket.clone()));
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        let request = TaskRequest {
+            task_id: "runner-cancel".to_string(),
+            prompt: "wait for cancellation".to_string(),
+            context: crate::protocol::TaskContext::default(),
+            timeout_ms: Some(30_000),
+        };
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let delegated = delegate_task(&socket, &request, None, event_tx, cancel_rx);
+        tokio::pin!(delegated);
+        sleep(Duration::from_millis(100)).await;
+        let _ = cancel_tx.send(());
+        let outcome = tokio::time::timeout(Duration::from_secs(5), delegated).await;
+        server.abort();
+        outcome.expect("cancel deadline").expect("delegated task");
+        let mut result = None;
+        while let Some(event) = event_rx.recv().await {
+            if let ExecutorEvent::Result(envelope) = event {
+                result = Some(envelope);
+            }
+        }
+        let result = result.expect("terminal cancel envelope");
+        assert_eq!(result.payload["status"], "cancelled");
+        assert_eq!(result.payload["task_id"], "runner-cancel");
+        std::fs::remove_dir_all(root).ok();
     }
 }
