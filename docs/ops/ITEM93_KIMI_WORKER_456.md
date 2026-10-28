@@ -8,6 +8,43 @@
 > The temporary test tenant used for verification is `kimi93test` on the
 > Gentoo dev VM (see below) and is **torn down** at the end of the run.
 
+## Goal 113 follow-up (2026-10-28): WI#469 startup amplification
+
+The live reproductions below are **historical evidence from 2026-10-22**, not
+proof that affected tenants on the reporting host are now healthy. WI#456's
+maintainer follow-up explicitly requires WI#469; the fresh WI#512 report
+(2026-10-28, v2.1.7.0 build #5) still describes three refused connections.
+No live tenant was restarted, rebuilt or repaired for this follow-up.
+
+WI#469's shared defect was the bare worker loop: a stale **pebble** image
+could `die` before Kimi was ever attempted, even when Kimi's own image had
+already been rebuilt. Goal 113 changes all four image-user guards from
+process-exiting `die` to safe diagnostics plus lane-local **return 3**, and
+runs each selected starter in a separate `set -e` subshell. Later selected
+lanes are attempted after a refusal; the completed pass names every refused
+lane and returns **1**. Runtime/auth/workspace/egress failures retain their
+fatal status and stop later attempts. Selection, unallocated-port and
+missing-image soft skips, and OpenRC desired-running intent are preserved.
+
+The lifecycle and DarkIRC writer wrappers capture callback status without
+Bash's ignored-errexit `||` context and restore caller options. Both upgrade
+layers now propagate startup status while releasing locks and refreshing the
+installed health pipeline; a failed startup names the lanes and reports
+`upgrade incomplete`, not success. The new version may already be installed
+and partially running — no automatic rollback is claimed. Userns repair and
+failed-checkout recovery use the same unguarded startup-status capture, so
+neither can swallow a worker's inner failure and report successful recovery.
+
+Verification uses the real start/restart dispatcher, real image guards, Kimi
+runtime-env staging and runtime-run paths, and real flock descriptors with
+mocked host ownership/init/runtime calls. See `test-mt-admin-worker-startup.sh`,
+`test-mt-admin-worker-image-contract.sh`, and the upgrade harness. These prove
+orchestration behavior on both init shapes, **not** live worker liveness.
+Operators still need a current rebuilt image, distribution/recreate on each
+affected tenant, and authenticated handshake/readiness/canary evidence. See
+the current [worker runbook](WORKER-CONTAINERS.md#shared-startup-isolation-wi469--goal-113).
+Daemon boot-time probing remains separate WI#464 work.
+
 ## The symptom (WI#456)
 
 Dispatched kimi canary jobs failed with:
@@ -37,11 +74,12 @@ images predate the WI#400 root-bridge shape**. Concretely, on this host:
   (`[[ -n "$tenant_id" ]] && return 0`) silently kept the tenant's old copy
   in play.
 - On the next `start-tenant`/worker start, mt-admin's image-user guard
-  (`ic/scripts/mt-admin-lib/09-worker-config.sh:2170`) then `die`s:
+  (`ic/scripts/mt-admin-lib/09-worker-config.sh`) then, in the investigated
+  version, called `die`:
   `kimi worker image has user '<actual>', expected 0:0 … rebuild it`. That
-  die is **deliberate** (fail loudly rather than silently run a pre-WI#400
-  bridge as the task uid — introduced with the WI#400 lanes, commit
-  `79a60ee22`).
+  refusal is **deliberate** (never run a pre-WI#400 bridge as the task uid —
+  introduced with the WI#400 lanes, commit `79a60ee22`). Goal 113 preserves
+  that boundary while making the outcome lane-local, as described above.
 - The failure class is exactly WI#456's: the worker never starts (or the
   already-running stale container wedges), the daemon-side
   `[[sandbox.external_workers]]` route stays hot, and the next
@@ -61,7 +99,9 @@ carried `USER unset`; kimi's stale copies carry the *old task uid*.
    stale-accept branch only applies while the admin store has *no* copy) and
    the launch contract (`_worker_launch_contract` pins the tenant-store
    image ID) force-recreates the running container on the next start — the
-   lane is self-healing after a rebuild. **Operators hitting WI#456: run
+   lane can recover after a rebuild **once the startup pass reaches it**
+   (the WI#469 fix above removes the earlier-lane refusal blocker).
+   **Operators hitting WI#456: run
    `sudo bash ic/scripts/lunarwing-mt-admin.sh build-kimi-worker`, then
    `start-tenant <name>` (or `start-worker <name> kimi`).**
 
@@ -190,10 +230,11 @@ image via the same demonstrated path.** Tenants known to hold stale kimi
 images at the time of writing: `scootaloo` (13da3b7, now demonstrably
 self-healing).
 
-## What this item does NOT change
+## What the original item did NOT change
 
-- The image-user guard's `die` stays (deliberate, WI#400); this item makes
-  sure a rebuilt image exists and documents the one-command remediation.
+- The original item kept the image-user guard's `die` (WI#400). Goal 113
+  supersedes only its process-exit behavior with lane-local refusal; the
+  expected image users and fail-closed check remain unchanged.
 - `_ensure_tenant_image`'s stale-accept branch (admin store empty → tenant's
   copy wins) is unchanged: the image-user guard is the loud backstop, and
   changing the accept rule would break offline fleets where only a tenant

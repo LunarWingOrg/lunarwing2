@@ -345,29 +345,50 @@ else
   fail 'opencode entrypoint: exec bun run of the bridge must be preceded by cd /app (WI#400 LP-1)'
 fi
 
-# ── WI#400 (run-170 LP-11): the kimi/pebble image-user guards refuse ──────
-# a pre-WI#400 image (task uid directly) and an uninspectable one — only the
-# opencode refusal was pinned (test-study-mcp-worker-mount.sh). The lane
-# function runs in a subshell so die() exits only it; a refusal must come
-# BEFORE any container start, which the message shape proves (the guard sits
-# ahead of every run/render path).
+# WI#400 / WI#469: all four image-user guards refuse stale/uninspectable images
+# with the lane-local status 3, BEFORE any start/render/hash operation. Display
+# tenant-store Config.User as bounded, escaped DATA, never a printf format.
 image_user_refusal() {  # <worker> <stale Config.User>
-  local worker="$1" stale="$2" out
+  local worker="$1" stale="$2" out rc display unexpected="$fixture/refusal-unexpected"
   IMAGE_USER="$stale"
-  if out="$("start_tenant_${worker}" alice 2>&1)"; then
-    fail "$worker accepted image user '${stale:-unset}' (WI#400 LP-11)"
-  elif [[ "$out" == *"expected 0:0"* ]]; then
-    pass "$worker refuses image user '${stale:-unset}' (WI#400 LP-11)"
+  display="$(sanitize_display_value "${stale:-unset}")"
+  : >"$unexpected"
+  set +e
+  out="$(
+    _ctr() {
+      case "$2 $3" in
+        'image inspect')
+          if [[ "$*" == *'{{.Config.User}}'* ]]; then printf '%s\n' "$IMAGE_USER";
+          else printf '%s\n' "$IMAGE_ID"; fi ;;
+        *) printf 'unexpected runtime call\n' >>"$unexpected" ;;
+      esac
+    }
+    render_worker_quadlet() { printf 'render\n' >>"$unexpected"; }
+    "start_tenant_${worker}" alice 2>&1
+  )"
+  rc=$?
+  set -e
+  if [[ "$rc" == 3 && "$out" == *"image has user '$display', expected "* \
+      && "$out" == *"rebuild it" && "$out" != *$'\033'* && "${#out}" -lt 600 \
+      && ! -s "$unexpected" ]]; then
+    pass "$INIT_SYSTEM $worker safely refuses image user '$display' with status 3"
   else
-    fail "$worker refusal for image user '${stale:-unset}' missed the rebuild wording (WI#400 LP-11): $out"
+    fail "$INIT_SYSTEM $worker unsafe/incorrect image refusal (status $rc)"
   fi
   IMAGE_USER="$(image_user_for "$worker")"
 }
+for refusal_init in openrc systemd; do
+  use_init "$refusal_init"
+  ensure_init_system
+  for worker in kimi pebble opencode opencode2; do
+    for stale_user in '12345:12345' '' 'x%sy%dz' '%099999d' '\033[2J' $'\033[2J\nforged\rline' \
+        "$(printf '%05000d' 0)"; do
+      image_user_refusal "$worker" "$stale_user"
+    done
+  done
+done
 use_init openrc
-image_user_refusal kimi "10002:10002"
-image_user_refusal kimi ""
-image_user_refusal pebble "10004:10004"
-image_user_refusal pebble ""
+IMAGE_USER="$(image_user_for pebble)"
 
 # WI#423 (run-171, the merge with !1784): the rootful create path below is the
 # one scenario in this harness that reaches the tenant-side credential reader,

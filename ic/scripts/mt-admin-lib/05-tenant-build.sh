@@ -1689,7 +1689,15 @@ recover_failed_tenant_checkout() {
     && dirty="$("${tgit[@]}" status --short --untracked-files=no 2>/dev/null)" \
     && [[ "$current_commit" == "$previous_commit" && -z "$dirty" ]]; then
     say "checkout failed before changing tracked tree; restarting previous tenant version ..."
-    if (start_tenant "$name"); then
+    # A conditional function call would suppress inner worker errexit and
+    # could falsely report the previous tenant version restarted (WI#469).
+    local restart_rc caller_errexit=false
+    [[ $- != *e* ]] || caller_errexit=true
+    set +e
+    ( start_tenant "$name" )
+    restart_rc=$?
+    if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
+    if [[ "$restart_rc" == 0 ]]; then
       die "git checkout $target failed; previous tenant version restarted"
     fi
     die "git checkout $target failed; tracked tree is unchanged but automatic tenant restart failed"

@@ -944,6 +944,7 @@ _restart_tenant_daemon() {
 
 start_tenant() {
   local name="$1"
+  TENANT_START_FAILED_WORKERS=()
   name="$(sanitize_name "$name")"
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
 
@@ -1069,24 +1070,53 @@ start_tenant() {
 
   # Workers start AFTER the daemon (and after any SSH-key bounce) so the SSH
   # agent socket is already a real, current Unix socket when podman bind-mounts it.
-  #
+  # Capture without `if`/`||`, which would disable the starters' inner errexit.
+  local worker_rc caller_errexit=false
+  [[ $- != *e* ]] || caller_errexit=true
+  set +e
+  _start_tenant_workers "$name"
+  worker_rc=$?
+  if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
+  _ssh_ready_summary "$name" || true
+  return "$worker_rc"
+}
+
+# Called with errexit off, outside an ignored-errexit context. Only the explicit
+# image-contract refusal (3) is lane-local; runtime/auth/config failures abort.
+_start_tenant_workers() {
+  local name="$1" _w worker_rc
+  # Shared with upgrade_tenant_locked's degraded summary; reset on every pass.
+  TENANT_START_FAILED_WORKERS=()
+
   # Gate each worker on the tenant's persisted selection (add-tenant --with-*).
   # Without this, start_tenant_<worker> would start every worker whose SHARED
   # host image happens to exist — regardless of what this tenant chose — because
   # its only guards are "port allocated" (always true) and "image present"
   # (host-wide). See tenant_worker_enabled / PER_TENANT_WORKER_GATING.md.
-  local _w
   for _w in pebble opencode kimi opencode2; do
     if tenant_worker_enabled "$name" "$_w" \
         && { [[ "$INIT_SYSTEM" != "openrc" ]] || tenant_worker_desired_running "$name" "$_w"; }; then
-      "start_tenant_${_w}" "$name"
+      ( set -e; "start_tenant_${_w}" "$name" )
+      worker_rc=$?
+      if [[ "$worker_rc" -ne 0 ]]; then
+        TENANT_START_FAILED_WORKERS+=("$_w")
+        if [[ "$worker_rc" -ne 3 ]]; then
+          warn_err "$_w worker startup failed for $name (status $worker_rc); aborting worker pass"
+          return "$worker_rc"
+        fi
+        say "WARNING: $_w worker image refused for $name; continuing with later selected lanes" >&2
+      fi
     elif [[ "$INIT_SYSTEM" == "openrc" ]] && tenant_worker_enabled "$name" "$_w"; then
       say "$_w worker intentionally stopped for $name (skipping; use 'start-worker $name $_w')"
     else
       say "$_w worker not selected for $name (skipping; enable with 'add-tenant $name --with-$_w')"
     fi
   done
-  _ssh_ready_summary "$name" || true
+  if [[ "${#TENANT_START_FAILED_WORKERS[@]}" -ne 0 ]]; then
+    say "WARNING: tenant '$name' startup degraded; failed worker lanes: ${TENANT_START_FAILED_WORKERS[*]}" >&2
+    return 1
+  fi
+  return 0
 }
 
 # Stop init-managed processes/supervisors without asking a potentially broken
@@ -1407,7 +1437,14 @@ _repair_tenant_podman_userns_locked() {
   fi
 
   stop_tenant "$name" || return 1
-  start_tenant "$name" || return 1
+  # Keep the worker subshells' errexit live on this recovery path too.
+  local startup_rc caller_errexit=false
+  [[ $- != *e* ]] || caller_errexit=true
+  set +e
+  start_tenant "$name"
+  startup_rc=$?
+  if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
+  [[ "$startup_rc" == 0 ]] || return 1
 
   rc=0
   probe="$(_ctr "$name" ps 2>&1)" || rc=$?
@@ -1471,18 +1508,24 @@ upgrade_tenant() {
 }
 
 _upgrade_tenant_lifecycle_locked() {
-  local name="$1" upgrade_lock_fd
+  local name="$1" upgrade_lock_fd upgrade_rc caller_errexit=false
   say "acquiring tenant upgrade lock ..."
   exec {upgrade_lock_fd}>"${BUILD_LOCK}.${name}.upgrade" \
     || die "failed to open tenant upgrade lock"
   flock -x "$upgrade_lock_fd" || die "failed to acquire tenant upgrade lock"
+  [[ $- != *e* ]] || caller_errexit=true
+  set +e
   if tenant_darkirc_enabled "$name" && darkirc_managed_state_exists "$name"; then
     with_darkirc_writer_lock "$name" upgrade_tenant_darkirc_locked "$@"
+    upgrade_rc=$?
   else
     upgrade_tenant_locked "$@"
+    upgrade_rc=$?
   fi
   flock -u "$upgrade_lock_fd" || die "failed to release tenant upgrade lock"
   exec {upgrade_lock_fd}>&-
+  if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
+  return "$upgrade_rc"
 }
 
 upgrade_tenant_locked() {
@@ -1591,7 +1634,13 @@ upgrade_tenant_locked() {
   fi
 
   patch_tenant_env "$name"
+  local startup_rc caller_errexit=false
+  TENANT_START_FAILED_WORKERS=()
+  [[ $- != *e* ]] || caller_errexit=true
+  set +e
   start_tenant "$name"
+  startup_rc=$?
+  if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
   refresh_deployed_health_pipeline
 
   # Pre-1.1.9 units embed renamed adapter paths that only keep working through
@@ -1606,6 +1655,11 @@ upgrade_tenant_locked() {
   fi
 
   say ""
+  if [[ "$startup_rc" -ne 0 ]]; then
+    warn_err "tenant '$name' upgrade incomplete: $before -> $("${tgit[@]}" describe --tags --always 2>/dev/null); startup failed (status $startup_rc); failed worker lanes: ${TENANT_START_FAILED_WORKERS[*]:-unknown}"
+    say "target is installed; repair the failed lanes and re-run start-tenant $name; verify with: $0 status $name"
+    return "$startup_rc"
+  fi
   say "tenant '$name' upgraded: $before -> $("${tgit[@]}" describe --tags --always 2>/dev/null)"
   say "verify with: $0 status $name"
 }
