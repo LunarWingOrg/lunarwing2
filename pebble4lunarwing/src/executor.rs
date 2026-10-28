@@ -1693,9 +1693,13 @@ mod tests {
     /// whose write handle is still open fails with exactly `ETXTBSY` on
     /// Linux, so that assertion proves the kernel on this machine really
     /// enforces the busy check rather than the test passing vacuously. The
-    /// fix's own assertion then reads `/proc/self/fd` and requires that no
-    /// descriptor in this process resolves to the installed stub (the actual
-    /// race, unlike an inode-identity check which `rename` defeats).
+    /// `/proc/self/fd` assertion guards against a descriptor leaked after the
+    /// helper returns. It does not detect a transient write descriptor that a
+    /// sibling fork inherited during installation: even the old in-process
+    /// writer closed its descriptor before returning (run-245 QC-1).
+    /// Preventing that race follows from the child-only writer's design;
+    /// repeated full-suite runs at parallelism are the empirical regression
+    /// check, not this post-return descriptor scan.
     #[test]
     fn installed_stub_leaves_no_write_descriptor_in_this_process() {
         use std::io::Write;
@@ -1751,10 +1755,9 @@ mod tests {
             "the installed stub must be executable"
         );
 
-        // The actual race PU-1 named: this process must hold no descriptor
-        // (read, write or otherwise) that resolves to the stub path. A
-        // leftover write descriptor is what a concurrently forked sibling can
-        // inherit and turn into ETXTBSY at spawn time.
+        // Leak guard only: no descriptor should remain after installation.
+        // This cannot observe a descriptor held temporarily during the write
+        // or an inherited copy that survives in another process.
         let target = std::fs::canonicalize(&stub).expect("canonicalize stub");
         let mut held = Vec::new();
         let fd_dir = std::fs::read_dir("/proc/self/fd").expect("read /proc/self/fd");
