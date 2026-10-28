@@ -1871,7 +1871,7 @@ start_tenant_opencode() {
     render_worker_quadlet "$name" opencode 8443
     _systemctl_user "$name" daemon-reload 2>/dev/null || true
     if ! reconcile_worker_task_quadlet "$name" opencode "$opencode_launch_contract"; then
-      return 0
+      return 3
     fi
     if _container_config_changed "$name" "lunarwing-opencode-${name}" "$quadlet_file" "$opencode_launch_contract"; then
       _recreate_quadlet_container "$name" "$opencode_service" "lunarwing-opencode-${name}"
@@ -2128,7 +2128,7 @@ start_tenant_opencode2() {
     render_worker_quadlet "$name" opencode2 8443
     _systemctl_user "$name" daemon-reload 2>/dev/null || true
     if ! reconcile_worker_task_quadlet "$name" opencode2 "$launch_contract"; then
-      return 0
+      return 3
     fi
     if _container_config_changed "$name" "lunarwing-opencode2-${name}" "$quadlet_file" "$launch_contract"; then
       _recreate_quadlet_container "$name" "$service" "lunarwing-opencode2-${name}"
@@ -2595,7 +2595,7 @@ start_tenant_kimi() {
     render_worker_quadlet "$name" kimi 8443
     _systemctl_user "$name" daemon-reload 2>/dev/null || true
     if ! reconcile_worker_task_quadlet "$name" kimi "$kimi_launch_contract"; then
-      return 0
+      return 3
     fi
     if _container_config_changed "$name" "lunarwing-kimi-${name}" "$quadlet_file" "$kimi_launch_contract"; then
       _recreate_quadlet_container "$name" "$kimi_service" "lunarwing-kimi-${name}"
@@ -2794,7 +2794,7 @@ start_tenant_pebble() {
     render_worker_quadlet "$name" pebble 8443
     _systemctl_user "$name" daemon-reload 2>/dev/null || true
     if ! reconcile_worker_task_quadlet "$name" pebble "$pebble_launch_contract"; then
-      return 0
+      return 3
     fi
     if _container_config_changed "$name" "lunarwing-pebble-${name}" "$quadlet_file" "$pebble_launch_contract"; then
       _recreate_quadlet_container "$name" "$pebble_service" "lunarwing-pebble-${name}"
