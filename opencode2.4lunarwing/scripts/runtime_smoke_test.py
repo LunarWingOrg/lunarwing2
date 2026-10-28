@@ -487,6 +487,7 @@ class CandidateBuildWiringTests(unittest.TestCase):
         self.assertIn("RUN bash /app/scripts/runtime_smoke_entrypoint.sh", dockerfile)
         self.assertNotIn("runtime_smoke.py --profile build", dockerfile)
         self.assertIn("/app/entrypoint.sh --mode websocket", runner)
+        self.assertIn('export WS_STATE_FILE="$SMOKE_ROOT/ws_state.json"', runner)
         self.assertIn("runtime_smoke.py --profile container", runner)
 
     def test_candidate_smoke_runs_as_the_image_runtime_user(self) -> None:

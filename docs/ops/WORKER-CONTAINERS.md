@@ -1166,6 +1166,13 @@ parses the bundled source at startup instead, so startup time may increase.
 The patch fails if either expected upstream setting is missing or duplicated,
 requiring review when upgrading OpenCode. Executable bytes are not rewritten.
 
+The started-entrypoint build smoke sets `WS_STATE_FILE` under
+`/tmp/opencode2-runtime-smoke-entrypoint`, removed by its EXIT trap. The bridge
+writes a timestamped WebSocket state file; leaving it at the default
+`/tmp/lunarwing_ws_state.json` changed the runtime layer digest between the
+candidate and clean rebuild (master pipeline #6658). Keep all smoke-generated
+state inside the cleaned tree.
+
 Image self-tests use `/tmp/opencode2-build-tests`, removed by an EXIT trap in
 the same Docker `RUN`, and disable Python bytecode writes. The workspace-path
 test also removes its own `oc2-ws-*` directory in `finally` for local runs.

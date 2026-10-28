@@ -76,8 +76,11 @@ OpenCode 2 appends a timestamped, randomly-IDed log line to
 run under the throwaway HOME/XDG environment rooted in the trap-cleaned
 `/tmp/opencode2-build-tests` tree (see the self-test `RUN`s), and the
 `/root/.bun` / `/root/.local` / `/root/.cache` / `/root/.config` leak
-tripwires must stay. Never invoke bun or the opencode binary in the image
-build with the default root HOME.
+tripwires must stay. The started-entrypoint smoke must also put `WS_STATE_FILE`
+under its trap-cleaned `/tmp/opencode2-runtime-smoke-entrypoint` tree; the bridge
+writes a timestamped state file, and leaving it at `/tmp/lunarwing_ws_state.json`
+changes the image layer digest between candidate and clean rebuild. Never invoke
+bun or the opencode binary in the image build with the default root HOME.
 
 ## Do Not
 
