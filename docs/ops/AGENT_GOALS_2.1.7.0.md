@@ -1325,9 +1325,9 @@
 112. [ ] verify this was completed https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/424
 113. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items?sort=created_date&state=opened&last_page_size=20&page_before=eyJjcmVhdGVkX2F0IjoiMjAyNi0xMC0wNSAwNToxNTo1OS40MzM5NzgwMDAgKzAwMDAiLCJpZCI6IjM2MiJ9&show=eyJpaWQiOiI0NTYiLCJmdWxsX3BhdGgiOiJsdW5hcndpbmcvbHVuYXJ3aW5nMiIsImlkIjo1MTJ9 and WI#469 as well
 
-## Phase 6 - Initial Operator Notes
+## Phase 6 - Misc Operations
 
-114. [x] (S) Reserved
+114. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/504
 115. [x] (S) Reserved
 116. [x] (S) Reserved
 117. [x] (H) Reserved
@@ -1349,7 +1349,7 @@
     - **F3 (do_longpoll watermark — verdict: stale-context in-tree, deployment-only):** re-verified on this tree — `grep -rn "do_longpoll\|LAST_SEEN_IDS" ic/src ic/crates darkirc_channel_for_lunarwing` has **no DarkIRC hits**; the only carrier is the **WeeChat** relay (`weechat_relay/src/lib.rs:496/:1235`), a different channel, which already persists its watermarks per tick. The DarkIRC lane's transport is an at-least-once opaque batch (`darkirc_adapter.py` `/poll` → `pending_batch_id`, `/ack`, `pending_ack` at lines 457–474), so there is no watermark mechanism to go stale. Any tenant running a pre-migration DarkIRC build from old source remains a per-deployment ops check, not an in-tree defect.
     - **F8 (allowlist — decision recorded):** `ENGINE_V2_OPT_IN_CHANNELS = ["xmpp","darkirc","weechat"]` (`router.rs:54`, gate at `engine_v2_channel_allowed`) kept **by design**, unchanged. The decision and its operator consequence (v1-era findings on non-opted channels are not retired by an ENGINE_V2 switch; expanding the set means constant + docs together; retiring the v1 loop is a separate decision) are recorded in `docs/ops/WI442_ENGINE_V2_TRANSITION.md` and `docs/architecture/ENGINE-V2.md`.
     - **Verification (taskset -c 0-17, -j18):** engine `cargo test -p lunarwing_engine --lib conversation` **36/36** incl. 4 new pins (`imported_v1_agent_entries_seed_as_assistant_history`, `imported_v1_entries_precede_live_entries_in_order`, `prepending_imported_entries_respects_the_retention_bounds`, `prepending_no_imported_entries_is_a_no_op`); bridge `cargo test --lib --features libsql bridge::router` **117/117** incl. 7 new pins (foreign-conversation, new-surface gate, seed-once idempotency, post-cutoff rows, plus the three `importable_entries` role tests); `scoped_conversation*` 9/9 incl. the foreign-UUID rejection; `cargo clippy -p lunarwing_engine --lib --tests -D warnings` clean; `cargo fmt --all -- --check` clean. Mutation-verified: neutering the ownership gate (Ok(false) → treated as owned) fails exactly `v1_history_import_never_copies_a_foreign_conversation` with `left: 2, right: 0` (the victim's two rows WOULD import without the gate); restored tree green.
-124. [x] (S) Reserved
+124. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/505
 
 ## Phase 8 - Advanced Operator Notes
 
