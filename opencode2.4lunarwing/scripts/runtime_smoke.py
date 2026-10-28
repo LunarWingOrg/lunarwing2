@@ -137,12 +137,9 @@ class LocalTransport(Transport):
         return "\n".join(parts)
 
     def home_dirs(self) -> Iterable[str]:
-        seen: set[str] = set()
-        for candidate in ("/root", "/home/opencode2"):
-            if candidate in seen:
-                continue
-            seen.add(candidate)
-            yield candidate
+        if os.geteuid() == 0:
+            yield "/root"
+        yield "/home/opencode2"
 
     def environment(self) -> dict[str, str]:
         return dict(os.environ)
