@@ -329,6 +329,53 @@ work while `worker_egress_apply` is not. The mt-admin function should either
 delegate to the same guard (it already installs it on the line above) or run
 load+verify in one netns session.
 
+### F2a — the launch-args status bug this pass actually fixes in mt-admin (QQ-1)
+
+F2 is the netns keeper race and is **not** the defect this MR patches; F5 calls
+the launch-args bug "F2's bug", which conflates them. They are distinct, so it
+gets its own finding here (run-250 review, QQ-1: the report never explained the
+bug its own commit fixes, and without it a reader cannot tell why an otherwise
+docs-only MR touches mt-admin at all).
+
+**Symptom.** `start-tenant` aborts *immediately after a successful egress apply*
+for any tenant whose allowlist resolves to **literal IPs only** — which is the
+common shape whenever the tenant's LLM endpoint is an address rather than a
+hostname, as it is on this host's WireGuard TensorZero endpoint
+`100.88.232.146:3000`. `prepare_worker_egress` dies with
+`cannot render worker egress launch arguments`, so the worker start is refused
+even though the egress ruleset is live and correct.
+
+**Mechanism.** In `worker_egress_launch_args`
+(`ic/scripts/mt-admin-lib/15-worker-egress.sh`), the host-mapping emission is a
+`while IFS= read -r mapping` loop over a here-string whose body is
+`[[ -n "$mapping" ]] && printf …`. With an IP-only allowlist
+`worker_egress_host_mappings` prints nothing, but the here-string still yields
+one empty line, so the body's `[[ -n "$mapping" ]]` test is **false** on that
+only iteration. Bash propagates the last command's status out of the `while`,
+and that loop is the function's final statement — so the function returns **1**
+*after* having already printed valid `--network`/`--dns` arguments. The caller
+sees a nonzero status and treats the (correct) output as unusable.
+
+Two sibling functions do **not** share the fault, which is why this is specific
+to the launch-args path: `worker_egress_host_mappings` on an empty hosts file
+and `_worker_egress_static_hosts` on IP-only records both return 0. And
+`_worker_egress_llm_targets` already ends in an explicit `return 0` — the
+convention this fix adopts.
+
+**Fix (landed on this branch, commit `64442bffa`).** Append the trailing
+`return 0`, with a comment naming the empty-mapping case and citing
+`_worker_egress_llm_targets` as the precedent. The printed arguments were never
+wrong; only the reported status was. Pinned by a four-assertion regression in
+`ic/scripts/tests/test-worker-egress.sh` that drives the real function through
+an emptied hosts file and asserts success, the DNS pin, and the absence of
+`--add-host`.
+
+**Relationship to F2 and F5.** This bug is what made F5's symptom *silent* on
+mistyfly: the tenant had no NanoGPT host mapping, so it hit the IP-only shape,
+so the launch args were rejected. F2 (netns race) blocked the apply itself and
+is tracked separately at WI#504; F2a is fixed here and is the reason a docs-and-
+script MR is the right vehicle for the finding rather than a follow-up.
+
 ### F2b — the fail-closed `die` also orphans the tenant lifecycle lock
 
 The `die` inside `worker_egress_apply` unwinds through `prepare_worker_egress`
@@ -530,8 +577,8 @@ Failed: pebble exited with code 1
 and from inside the container `getent hosts nano-gpt.com` returned nothing
 while `curl https://nano-gpt.com/api/v1/models` printed
 `Could not resolve host: nano-gpt.com` (`HTTP=000`). The container had no
-NanoGPT DNS entry because the egress host mapping was empty (see F2's
-`worker_egress_launch_args` bug) and the network's recursive DNS is disabled by
+NanoGPT DNS entry because the egress host mapping was empty (see F2a's
+`worker_egress_launch_args` status bug) and the network's recursive DNS is disabled by
 design. Every pebble job failed instantly with `pebble exited with code 1`
 (`external:pebble`, `elapsed 0`) — which reads as a worker crash but is really
 the fail-closed egress firewalling the worker's *only* model backend.
