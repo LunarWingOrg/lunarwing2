@@ -321,13 +321,33 @@ ruleset is correct and contains exactly the allowlist entry the tenant needs
 (the WireGuard TensorZero endpoint `100.88.232.146:3000`) plus the required
 exact reject arms.
 
-Note the contrast with the guard that OpenRC/Quadlet actually run:
-`lunarwing-worker-egress-guard.sh` does its load and both `verify_chain` calls
-in **one** process, with `nft_in_netns` resolving the namespace once per call
-inside that single invocation — which is why the *boot* path is designed to
-work while `worker_egress_apply` is not. The mt-admin function should either
-delegate to the same guard (it already installs it on the line above) or run
-load+verify in one netns session.
+**Correction (item 114, run-256 QV-1/QV-2):** the original contrast with
+OpenRC/Quadlet was wrong: the guard's one shell process still called
+`podman unshare --rootless-netns` three times (load, forward read, input read).
+The WI#504 description repeated that mistake. Both paths needed a single
+namespace session, and that alone was insufficient: without a running container,
+Podman destroys the loaded namespace on session exit, before the first worker
+starts. The rejected !2027 fixed the session split but not that lifetime gap.
+
+**2026-10-28 follow-up (SweetieBot, item 114):** mt-admin now delegates to the
+shared guard, whose load path first starts `lw-egress-keeper-<tenant>`, a pod on
+the tenant egress network using Podman's locally built pause infra image (no
+registry pull). It then loads and verifies both chains in one namespace session.
+The keeper survives into worker start; post-start verification remains read-only
+and fails closed. Tenant stop removes the keeper after writer quiescence;
+teardown removes it before deleting the network. The current harness passes
+147 hermetic checks plus 8 live checks on rootless Podman 5.8.2: an isolated
+`liveprobe` fixture with no running containers or pre-existing keeper completes
+real mt-admin apply → pre-guard → first container start → post-guard and
+`worker_egress_audit`, then a cold restart after stopping both worker and keeper.
+The namespace remains `net:[4026537014]` across the first start; allowlisted HTTP
+works, raw-IP/DNS probes fail, and teardown removes the fixture keeper/network.
+This is a BusyBox worker fixture under the agent's own rootless account, not a
+new mistyfly run or a fully provisioned daemon/LLM tenant. Its account and state
+paths are fixture bindings; the nft, Podman, apply, guard, post-start checks and
+audit are real. The OpenRC/Quadlet guard contracts are covered by the hermetic
+suite. The new sequence pin fails against the rejected guard and when only the
+keeper ensure call is removed.
 
 ### F2a — the launch-args status bug this pass actually fixes in mt-admin (QQ-1)
 
