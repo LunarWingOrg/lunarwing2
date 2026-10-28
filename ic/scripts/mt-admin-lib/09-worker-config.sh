@@ -20,15 +20,214 @@
 # body was rewritten.
 
 
+worker_task_container_name() {
+  printf 'lunarwing-%s-task-%s\n' "$1" "$2"
+}
+
+worker_ipc_volume_name() {
+  printf 'lunarwing-%s-%s-ipc\n' "$1" "$2"
+}
+
+worker_bridge_uid() {
+  case "$1" in
+    opencode) printf '%s\n' "$OPENCODE_BRIDGE_UID" ;;
+    kimi) printf '%s\n' "$KIMI_BRIDGE_UID" ;;
+    opencode2) printf '%s\n' "$OPENCODE2_BRIDGE_UID" ;;
+    pebble) printf '%s\n' "$PEBBLE_BRIDGE_UID" ;;
+    *) die "unsupported external worker '$1'" ;;
+  esac
+}
+
+worker_task_uid() {
+  case "$1" in
+    opencode) printf '%s\n' "$OPENCODE_CONTAINER_UID" ;;
+    kimi) printf '%s\n' "$KIMI_CONTAINER_UID" ;;
+    opencode2) printf '%s\n' "$OPENCODE2_CONTAINER_UID" ;;
+    pebble) printf '%s\n' "$PEBBLE_CONTAINER_UID" ;;
+    *) die "unsupported external worker '$1'" ;;
+  esac
+}
+
+write_worker_task_runtime_env() {
+  local name="$1" source="$2" target="$3" staged
+  staged="$(mktemp)" || return 1
+  if ! awk '!/^AGENT_AUTH_TOKEN(_FILE)?=/' "$source" >"$staged" \
+    || ! write_tenant_file_atomic "$name" "$target" 600 <"$staged"; then
+    rm -f -- "$staged"
+    return 1
+  fi
+  rm -f -- "$staged"
+  printf '%s\n' "$target"
+}
+
+prepare_worker_task_study_mounts() {
+  local name="$1" worker="$2"
+  [[ "$worker" == "opencode" || "$worker" == "opencode2" ]] || return 0
+  local home state allow_write
+  home="$(tenant_study_notes_home "$name")"
+  if [[ -n "$home" ]]; then
+    validate_study_notes_home "$home"
+    if ! study_notes_sync_home_trusted "$home"; then
+      say "WARNING: tenant '$name' Study Notes home is not trusted for the task mount; starting without Study Notes"
+      home=""
+    fi
+  fi
+  [[ -n "$home" ]] || return 0
+  state="$(tenant_study_notes_state_home "$name")"
+  allow_write="$(tenant_study_notes_allow_write "$name")"
+  if study_notes_write_enabled "$allow_write"; then
+    [[ -n "$state" ]] || die "Study Notes write mode requires LW2STUDYMCP_STATE_HOME"
+  fi
+  [[ -z "$state" ]] || validate_study_notes_state_home "$state"
+  TASK_MOUNTS+=(
+    -v "${home}:${STUDY_NOTES_CONTAINER_HOME}:ro,z"
+    -e "LW2STUDYMCP_HOME=${STUDY_NOTES_CONTAINER_HOME}"
+  )
+  if [[ -n "$state" ]]; then
+    TASK_MOUNTS+=(
+      -v "${state}:${STUDY_NOTES_CONTAINER_STATE_HOME}:ro,z"
+      -e "LW2STUDYMCP_STATE_HOME=${STUDY_NOTES_CONTAINER_STATE_HOME}"
+    )
+  fi
+}
+
+prepare_worker_task_launch() {
+  local name="$1" worker="$2" env_dir source snapshot value model base_url
+  local runtime_env override_env task_env ssh_agent_dir
+  env_dir="$(tenant_env_dir "$name")"
+  source="$env_dir/lunarwing.env"
+  TASK_WORKSPACE_DIR="$(prepare_worker_workspace "$name" "$worker")" \
+    || die "unsafe $worker workspace for tenant '$name'"
+  TASK_USERNS_ARGS=()
+  if [[ "$CONTAINER_RT" == "podman" && "$MT_ROOTLESS" == "true" ]]; then
+    case "$worker" in
+      opencode) TASK_USERNS_ARGS=(--userns "$OPENCODE_USERNS") ;;
+      kimi) TASK_USERNS_ARGS=(--userns "$KIMI_USERNS") ;;
+      opencode2) TASK_USERNS_ARGS=(--userns "$OPENCODE2_USERNS") ;;
+      pebble) TASK_USERNS_ARGS=(--userns "$PEBBLE_USERNS") ;;
+    esac
+  fi
+  TASK_RESTART_ARG=()
+  [[ "$MT_ROOTLESS" == "true" ]] || TASK_RESTART_ARG=(--restart unless-stopped)
+  TASK_ENV_FLAGS=()
+  TASK_MOUNTS=()
+
+  if [[ "$worker" == "kimi" ]]; then
+    runtime_env="$(write_kimi_runtime_env "$name")" || return 1
+    task_env="$(write_worker_task_runtime_env "$name" "$runtime_env" "$env_dir/kimi-task-runtime.env")" || return 1
+    TASK_ENV_FLAGS=(--env-file "$task_env")
+  elif [[ -f "$source" ]]; then
+    _snapshot_tenant_env "$name" "$source" snapshot
+    value="$(_read_env_value "$snapshot" LLM_API_KEY)"
+    [[ -n "$value" ]] && TASK_ENV_FLAGS+=(-e "TENSORZERO_API_KEY=$value")
+    case "$worker" in
+      opencode|opencode2)
+        model="$(_read_env_value "$snapshot" "${worker^^}_MODEL")"
+        base_url="$(_read_env_value "$snapshot" "${worker^^}_BASE_URL")"
+        [[ -n "$model" ]] && TASK_ENV_FLAGS+=(-e "${worker^^}_MODEL=$model")
+        [[ -n "$base_url" ]] && TASK_ENV_FLAGS+=(-e "${worker^^}_BASE_URL=$base_url")
+        ;;
+    esac
+    rm -f -- "$snapshot"
+  fi
+  override_env="$env_dir/${worker}.env"
+  if [[ -f "$override_env" ]]; then
+    task_env="$(write_worker_task_runtime_env "$name" "$override_env" "$env_dir/${worker}-task-overrides.env")" || return 1
+    TASK_ENV_FLAGS+=(--env-file "$task_env")
+  fi
+
+  if [[ "$worker" != "kimi" ]]; then
+    ssh_agent_dir="$(tenant_run_dir "$name")/ssh-agent"
+    TASK_MOUNTS+=(-v "${ssh_agent_dir}:/tmp/ssh-agent:ro,z" -e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock)
+  fi
+  prepare_worker_task_study_mounts "$name" "$worker"
+}
+
+start_worker_task_container() {
+  local name="$1" worker="$2" image="$3" workspace_dir="$4"
+  local userns_name="$5" env_name="$6" mounts_name="$7" restart_name="$8"
+  # shellcheck disable=SC2178
+  local -n userns_ref="$userns_name" env_ref="$env_name" mounts_ref="$mounts_name" restart_ref="$restart_name"
+  local task_container ipc_volume task_uid task_gid launch_contract env_file_for_hash
+  task_container="$(worker_task_container_name "$worker" "$name")"
+  ipc_volume="$(worker_ipc_volume_name "$worker" "$name")"
+  task_uid="$(worker_task_uid "$worker")"
+  task_gid="$task_uid"
+  launch_contract="$(_worker_launch_contract "$name" "$image" "non-root-split-v1")"
+  env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
+  worker_egress_reconcile_container "$name" "$task_container"
+
+  if _ctr "$name" inspect "$task_container" &>/dev/null; then
+    if _container_config_changed "$name" "$task_container" "$env_file_for_hash" "$launch_contract"; then
+      say "config changed for $task_container; force-recreating"
+      _ctr "$name" stop "$task_container" >/dev/null 2>&1 || true
+      _ctr "$name" rm -f "$task_container" >/dev/null 2>&1 || true
+    elif _ctr "$name" inspect -f '{{.State.Running}}' "$task_container" 2>/dev/null | grep -q true; then
+      worker_egress_verify_after_start "$name" "$task_container"
+      _store_container_hash "$name" "$task_container" "$env_file_for_hash" "$launch_contract"
+      return 0
+    else
+      _ctr "$name" start "$task_container" >/dev/null
+      worker_egress_verify_after_start "$name" "$task_container"
+      _store_container_hash "$name" "$task_container" "$env_file_for_hash" "$launch_contract"
+      return 0
+    fi
+  fi
+
+  local -a mode_args=(--mode websocket)
+  [[ "$worker" != "pebble" ]] || mode_args=()
+  say "creating $worker task container $task_container"
+  _ctr "$name" run -d \
+    --name "$task_container" \
+    --no-healthcheck \
+    "${userns_ref[@]}" \
+    --user "${task_uid}:${task_gid}" \
+    --security-opt no-new-privileges \
+    --cap-drop ALL \
+    -e LUNARWING_CONTAINER_ROLE=split-task \
+    -e WORKSPACE_ROOT=/workspace \
+    -e LUNARWING_TOOL_PROXY_DIR=/run/lunarwing-shared/tool-proxy \
+    "${env_ref[@]}" \
+    "${mounts_ref[@]}" \
+    -v "$workspace_dir:/workspace:z" \
+    -v "$ipc_volume:/run/lunarwing-shared:z" \
+    "${restart_ref[@]}" \
+    "${WORKER_EGRESS_LAUNCH_ARGS[@]}" \
+    --label "lunarwing.egress=$(worker_egress_network_name "$name")" \
+    --label "lunarwing.worker-role=task" \
+    "$image" "${mode_args[@]}" >/dev/null
+  worker_egress_verify_after_start "$name" "$task_container"
+  _store_container_hash "$name" "$task_container" "$env_file_for_hash" "$launch_contract"
+}
+
+stop_worker_task_container() {
+  local name="$1" worker="$2" task_container
+  task_container="$(worker_task_container_name "$worker" "$name")"
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == "openrc" && -f "/etc/init.d/${task_container}" ]]; then
+    _deregister_babysitter "$task_container"
+    _openrc_service "$task_container" stop >/dev/null 2>&1 || true
+  elif [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
+      && podman_supports_quadlet; then
+    _systemctl_user "$name" stop "${task_container}.service" >/dev/null 2>&1 \
+      || _ctr "$name" stop "$task_container" >/dev/null 2>&1 || true
+  elif _ctr "$name" inspect "$task_container" &>/dev/null; then
+    _ctr "$name" stop "$task_container" >/dev/null 2>&1 || true
+  fi
+  say "$worker task container stopped ($task_container)"
+}
+
 # Render a dedicated OpenRC unit for a tenant's supported external worker,
 # modeled on the lunarwing-pg-<t> unit. Health-aware status() checks the worker's
 # /health endpoint (curl is present in both worker images) so the host self-heal
 # pipeline — which auto-discovers /etc/init.d/lunarwing-* units — can detect and
 # remediate a crashed OR hung worker, and so it survives reboot. OpenRC only.
 render_worker_openrc_unit() {
-  local name="$1" worker="$2" health_port="${3:-8443}"
+  local name="$1" worker="$2" health_port="${3:-8443}" role="${4:-bridge}"
   ensure_container_runtime
-  local runtime_bin="" container="lunarwing-${worker}-${name}" uid home
+  local runtime_bin="" container="lunarwing-${worker}-${name}" uid home after=""
+  [[ "$role" != "task" ]] || container="$(worker_task_container_name "$worker" "$name")"
+  [[ "$role" != "bridge" ]] || after="lunarwing-${worker}-task-${name}"
   [[ -n "${CONTAINER_RT:-}" ]] && runtime_bin="$(command -v "$CONTAINER_RT" 2>/dev/null || true)"
   uid="$(id -u "$name" 2>/dev/null || echo "")"
   home="$(tenant_home "$name")"
@@ -45,10 +244,11 @@ render_worker_openrc_unit() {
   cat >"${initd}/${container}" <<INITEOF
 #!/sbin/openrc-run
 
-description="LunarWing ${worker} worker ($name)"
+description="LunarWing ${worker} ${role} container ($name)"
 
 : "\${wk_runtime:=$runtime_bin}"
 : "\${wk_container:=$container}"
+: "\${wk_role:=$role}"
 : "\${wk_rootless:=$MT_ROOTLESS}"
 : "\${wk_user:=$name}"
 : "\${wk_home:=$home}"
@@ -61,7 +261,7 @@ description="LunarWing ${worker} worker ($name)"
 
 depend() {
     need net localmount
-    after firewall lunarwing-${name}
+    after firewall lunarwing-${name} ${after}
 }
 
 # Run the container runtime as the owning user (rootless) or root (rootful).
@@ -73,10 +273,14 @@ _wk() {
     fi
 }
 
-# Healthy = container running AND its internal /health endpoint answers.
+# Healthy = container running and its role-specific liveness check passing.
 _wk_healthy() {
     [ "\$(_wk inspect -f '{{.State.Running}}' "\${wk_container}" 2>/dev/null)" = "true" ] || return 1
-    _wk exec "\${wk_container}" curl -sf -o /dev/null --max-time 3 "http://127.0.0.1:\${wk_health_port}/health" 2>/dev/null
+    if [ "\${wk_role}" = "task" ]; then
+        _wk exec "\${wk_container}" test -S /run/lunarwing-shared/runner/task-runner.sock 2>/dev/null
+    else
+        _wk exec "\${wk_container}" curl -sf -o /dev/null --max-time 3 "http://127.0.0.1:\${wk_health_port}/health" 2>/dev/null
+    fi
 }
 
 start() {
@@ -132,30 +336,44 @@ INITEOF
 # health-monitored, self-healed, and boot-persistent. No-op unless OpenRC.
 _register_worker_unit() {
   local name="$1" worker="$2"
-  local container="lunarwing-${worker}-${name}"
+  local container="lunarwing-${worker}-${name}" task_container
+  task_container="$(worker_task_container_name "$worker" "$name")"
   worker_egress_verify_after_start "$name" "$container"
+  worker_egress_verify_after_start "$name" "$task_container"
   ensure_init_system
   [[ "$INIT_SYSTEM" == "openrc" ]] || return 0
+  render_worker_openrc_unit "$name" "$worker" 8443 task
+  _openrc_update add "$task_container" default >/dev/null 2>&1 || true
+  _openrc_service "$task_container" start >/dev/null 2>&1 || true
   render_worker_openrc_unit "$name" "$worker"
   _openrc_update add "lunarwing-${worker}-${name}" default >/dev/null 2>&1 || true
   _openrc_service "lunarwing-${worker}-${name}" start >/dev/null 2>&1 || true
-  say "registered OpenRC unit lunarwing-${worker}-${name} (health-monitored, boot-persistent)"
+  say "registered OpenRC units $task_container and lunarwing-${worker}-${name} (health-monitored, boot-persistent)"
   local uid home
   uid="$(id -u "$name" 2>/dev/null || echo "")"
   home="$(tenant_home "$name")"
+  _register_babysitter "$name" "$worker" "$task_container" "$uid" "$home"
   _register_babysitter "$name" "$worker" "$container" "$uid" "$home"
 }
 
 # Tear down a worker's OpenRC unit (boot-disable + remove the init script).
 _deregister_worker_unit() {
-  local name="$1" worker="$2"
+  local name="$1" worker="$2" task_container
+  task_container="$(worker_task_container_name "$worker" "$name")"
   ensure_init_system
   [[ "$INIT_SYSTEM" == "openrc" ]] || return 0
-  [[ -f "/etc/init.d/lunarwing-${worker}-${name}" ]] || return 0
-  _deregister_babysitter "lunarwing-${worker}-${name}"
-  _openrc_service "lunarwing-${worker}-${name}" stop >/dev/null 2>&1 || true
-  _openrc_update del "lunarwing-${worker}-${name}" default >/dev/null 2>&1 || true
-  rm -f "/etc/init.d/lunarwing-${worker}-${name}" "/etc/conf.d/lunarwing-${worker}-${name}"
+  if [[ -f "/etc/init.d/lunarwing-${worker}-${name}" ]]; then
+    _deregister_babysitter "lunarwing-${worker}-${name}"
+    _openrc_service "lunarwing-${worker}-${name}" stop >/dev/null 2>&1 || true
+    _openrc_update del "lunarwing-${worker}-${name}" default >/dev/null 2>&1 || true
+    rm -f "/etc/init.d/lunarwing-${worker}-${name}" "/etc/conf.d/lunarwing-${worker}-${name}"
+  fi
+  if [[ -f "/etc/init.d/${task_container}" ]]; then
+    _deregister_babysitter "$task_container"
+    _openrc_service "$task_container" stop >/dev/null 2>&1 || true
+    _openrc_update del "$task_container" default >/dev/null 2>&1 || true
+    rm -f "/etc/init.d/${task_container}" "/etc/conf.d/${task_container}"
+  fi
 }
 
 # ── External-worker config.toml generation ────────────────────────────────────
@@ -1605,7 +1823,7 @@ start_tenant_opencode() {
   # Record the mount/policy shape even for rootful/OpenRC imperative
   # containers; cap-trim records the WI#400 KW-3 capability trim so existing
   # containers force-recreate onto it.
-  local opencode_launch_contract="ssh-agent-dir-ro;cap-trim"
+  local opencode_launch_contract="ssh-agent-dir-ro;cap-trim;non-root-split-v1"
   local -a opencode_userns_args=()
   if [[ "$CONTAINER_RT" == "podman" && "$MT_ROOTLESS" == "true" ]]; then
     opencode_launch_contract="$OPENCODE_ROOTLESS_LAUNCH_CONTRACT"
@@ -1637,9 +1855,9 @@ start_tenant_opencode() {
   image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
     lunarwing-worker-opencode:latest 2>/dev/null || true)"
   case "$image_user" in
-    "0:0"|"0") ;;
+    "$OPENCODE_CONTAINER_UID"|"$OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID") ;;
     *)
-      die "opencode worker image has user '${image_user:-unset}', expected 0:0 (WI#400 root entrypoint; serve/tasks drop to $OPENCODE_CONTAINER_UID); rebuild it"
+      die "opencode worker image has user '${image_user:-unset}', expected $OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID (WI#454 task default); rebuild it"
       ;;
   esac
 
@@ -1651,6 +1869,9 @@ start_tenant_opencode() {
     quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-opencode-${name}.container"
     render_worker_quadlet "$name" opencode 8443
     _systemctl_user "$name" daemon-reload 2>/dev/null || true
+    if ! reconcile_worker_task_quadlet "$name" opencode "$opencode_launch_contract"; then
+      return 0
+    fi
     if _container_config_changed "$name" "lunarwing-opencode-${name}" "$quadlet_file" "$opencode_launch_contract"; then
       _recreate_quadlet_container "$name" "$opencode_service" "lunarwing-opencode-${name}"
     fi
@@ -1667,6 +1888,10 @@ start_tenant_opencode() {
     fi
     return 0
   fi
+
+  prepare_worker_task_launch "$name" opencode
+  start_worker_task_container "$name" opencode lunarwing-worker-opencode:latest \
+    "$TASK_WORKSPACE_DIR" TASK_USERNS_ARGS TASK_ENV_FLAGS TASK_MOUNTS TASK_RESTART_ARG
 
   local -a healthcheck_args=()
   if _openrc_podman_uses_init_health; then
@@ -1795,8 +2020,11 @@ start_tenant_opencode() {
       --name "$container_name" \
       "${healthcheck_args[@]}" \
       "${opencode_userns_args[@]}" \
+      --user "$(worker_bridge_uid opencode):$OPENCODE_CONTAINER_GID" \
       --security-opt no-new-privileges \
-      --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add KILL --cap-add SETUID --cap-add SETGID \
+      --cap-drop ALL \
+      -e LUNARWING_CONTAINER_ROLE=split-bridge \
+      -e LUNARWING_TOOL_PROXY_DIR=/run/lunarwing-shared/tool-proxy \
       -e LUNARWING_WORKER_ID="worker-opencode-${name}" \
       -e WS_PORT="$wss_port" \
       -e HEALTH_PORT="8443" \
@@ -1805,14 +2033,14 @@ start_tenant_opencode() {
       -e WS_BIND_HOST=0.0.0.0 \
       -e WS_PATH=/ws/agent \
       "${env_flags[@]}" \
-      "${ssh_mount[@]}" \
-      "${study_notes_mount[@]}" \
       -p "127.0.0.1:${wss_port}:${wss_port}" \
       "${health_publish[@]}" \
       -v "$workspace_dir:/workspace:z" \
+      -v "$(worker_ipc_volume_name opencode "$name"):/run/lunarwing-shared:z" \
       "${restart_arg[@]}" \
       "${WORKER_EGRESS_LAUNCH_ARGS[@]}" \
       --label "lunarwing.egress=$(worker_egress_network_name "$name")" \
+      --label "lunarwing.worker-role=bridge" \
       lunarwing-worker-opencode:latest \
       --mode websocket >/dev/null
     _store_container_hash \
@@ -1846,6 +2074,7 @@ stop_tenant_opencode() {
     _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
     say "opencode worker stopped ($container_name)"
   fi
+  stop_worker_task_container "$name" opencode
 }
 
 start_tenant_opencode2() {
@@ -1853,7 +2082,7 @@ start_tenant_opencode2() {
   ensure_container_runtime
 
   # Record the mount policy even for rootful/OpenRC imperative containers.
-  local launch_contract="ssh-agent-dir-ro"
+  local launch_contract="ssh-agent-dir-ro;non-root-split-v1"
   local -a userns_args=()
   if [[ "$CONTAINER_RT" == "podman" && "$MT_ROOTLESS" == "true" ]]; then
     launch_contract="$OPENCODE2_ROOTLESS_LAUNCH_CONTRACT"
@@ -1884,7 +2113,7 @@ start_tenant_opencode2() {
   case "$image_user" in
     "$OPENCODE2_CONTAINER_UID"|"$OPENCODE2_CONTAINER_UID:$OPENCODE2_CONTAINER_GID") ;;
     *)
-      die "opencode2 worker image has user '${image_user:-unset}', expected $OPENCODE2_CONTAINER_UID:$OPENCODE2_CONTAINER_GID; rebuild it"
+      die "opencode2 worker image has user '${image_user:-unset}', expected $OPENCODE2_CONTAINER_UID:$OPENCODE2_CONTAINER_GID (WI#454 task default); rebuild it"
       ;;
   esac
 
@@ -1896,6 +2125,9 @@ start_tenant_opencode2() {
     quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-opencode2-${name}.container"
     render_worker_quadlet "$name" opencode2 8443
     _systemctl_user "$name" daemon-reload 2>/dev/null || true
+    if ! reconcile_worker_task_quadlet "$name" opencode2 "$launch_contract"; then
+      return 0
+    fi
     if _container_config_changed "$name" "lunarwing-opencode2-${name}" "$quadlet_file" "$launch_contract"; then
       _recreate_quadlet_container "$name" "$service" "lunarwing-opencode2-${name}"
     fi
@@ -1910,6 +2142,10 @@ start_tenant_opencode2() {
     fi
     return 0
   fi
+
+  prepare_worker_task_launch "$name" opencode2
+  start_worker_task_container "$name" opencode2 lunarwing-worker-opencode2:latest \
+    "$TASK_WORKSPACE_DIR" TASK_USERNS_ARGS TASK_ENV_FLAGS TASK_MOUNTS TASK_RESTART_ARG
 
   local -a healthcheck_args=()
   if _openrc_podman_uses_init_health; then
@@ -2000,6 +2236,11 @@ start_tenant_opencode2() {
       --name "$container_name" \
       "${healthcheck_args[@]}" \
       "${userns_args[@]}" \
+      --user "$(worker_bridge_uid opencode2):$OPENCODE2_CONTAINER_GID" \
+      --security-opt no-new-privileges \
+      --cap-drop ALL \
+      -e LUNARWING_CONTAINER_ROLE=split-bridge \
+      -e LUNARWING_TOOL_PROXY_DIR=/run/lunarwing-shared/tool-proxy \
       -e LUNARWING_WORKER_ID="worker-opencode2-${name}" \
       -e WS_PORT="$wss_port" \
       -e HEALTH_PORT="8443" \
@@ -2008,14 +2249,14 @@ start_tenant_opencode2() {
       -e WS_BIND_HOST=0.0.0.0 \
       -e WS_PATH=/ws/agent \
       "${env_flags[@]}" \
-      "${ssh_mount[@]}" \
-      "${study_notes_mount[@]}" \
       -p "127.0.0.1:${wss_port}:${wss_port}" \
       "${health_publish[@]}" \
       -v "$workspace_dir:/workspace:z" \
+      -v "$(worker_ipc_volume_name opencode2 "$name"):/run/lunarwing-shared:z" \
       "${restart_arg[@]}" \
       "${WORKER_EGRESS_LAUNCH_ARGS[@]}" \
       --label "lunarwing.egress=$(worker_egress_network_name "$name")" \
+      --label "lunarwing.worker-role=bridge" \
       lunarwing-worker-opencode2:latest \
       --mode websocket >/dev/null
     _store_container_hash \
@@ -2049,6 +2290,7 @@ stop_tenant_opencode2() {
     _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
     say "opencode2 worker stopped ($container_name)"
   fi
+  stop_worker_task_container "$name" opencode2
 }
 # ── Kimi Code worker container ────────────────────────────────────────────────
 
@@ -2115,6 +2357,10 @@ prepare_worker_workspace() {
     opencode2)
       container_uid="$OPENCODE2_CONTAINER_UID"
       container_gid="$OPENCODE2_CONTAINER_GID"
+      ;;
+    pebble)
+      container_uid="$PEBBLE_CONTAINER_UID"
+      container_gid="$PEBBLE_CONTAINER_GID"
       ;;
     *) die "unsupported private worker workspace: $worker" ;;
   esac
@@ -2204,51 +2450,11 @@ prepare_worker_workspace() {
   printf '%s\n' "$workspace_dir"
 }
 
-# WI#390 (review HH-4): the pebble workspace is tenant-writable scratch, so the
-# old root `mkdir -p` + `chown` + `chmod 777` let a tenant replace the directory
-# with a symlink and have root chown/chmod the symlink's target. Create and
-# tighten the directory AS the tenant instead, and refuse a symlinked or
-# foreign-owned path here. SCOPE LIMIT (run-130 review, IG-2): this check holds
-# only at container CREATE/render time — podman/docker re-resolves the bind
-# source at EVERY container start, and neither the existing-container branch
-# nor the OpenRC unit's start re-runs this check, so a tenant who swaps the
-# directory for a symlink afterwards still redirects the mount. WI#422 closed
-# the escalation that remained: on rootless podman the container runs as the
-# tenant uid, so the redirect grants nothing the tenant could not already
-# reach; on rootful hosts (docker default, or LUNARWING_MT_ROOTLESS=false)
-# start_tenant_pebble now launches with `--user <tenant uid>:<gid>`
-# (PEBBLE_ROOTFUL_LAUNCH_CONTRACT force-recreates pre-fix root-running
-# containers), so a redirected bind only ever exposes what the tenant account
-# itself can already reach.
-# The pebble workspace is tenant-owned 0700; 0777 was never load-bearing.
-prepare_pebble_workspace() {  # <tenant> — prints the workspace dir
-  local name="$1" lw_root workspace_dir
-  lw_root="$(tenant_lw_root "$name")"
-  workspace_dir="$lw_root/pebble-workspace"
-  if [[ "$(id -un)" == "$name" ]]; then
-    mkdir -p "$workspace_dir" || return 1
-  else
-    sudo -u "$name" mkdir -p "$workspace_dir" || return 1
-  fi
-  if [[ ! -d "$workspace_dir" || -L "$workspace_dir" ]]; then
-    printf 'error: pebble workspace is not a plain directory: %s\n' "$workspace_dir" >&2
-    return 1
-  fi
-  # Ownership is checked against the tenant root dir — provisioned
-  # tenant-owned by create_tenant_user — rather than by resolving the
-  # account's uid, so the check also holds for fixture tenants with no
-  # passwd entry. stat follows a symlinked lw_root on purpose: a tenant who
-  # points ~/lunarwing at other storage keeps working as long as the target
-  # stays tenant-owned.
-  if [[ "$(stat -c %u "$workspace_dir" 2>/dev/null || printf -- -1)" \
-      != "$(stat -c %u "$lw_root" 2>/dev/null || printf -- -2)" ]]; then
-    printf 'error: pebble workspace not owned like the tenant root: %s\n' "$workspace_dir" >&2
-    return 1
-  fi
-  # chmod as the tenant: chmod follows symlinks, and root has no business
-  # touching a mode under a tenant-writable parent (WI#390).
-  tenant_chmod "$name" 0700 "$workspace_dir" || return 1
-  printf '%s\n' "$workspace_dir"
+# WI#390/WI#453 path validation is shared with the other worker lanes. WI#454
+# additionally needs the setgid 2770 root so the non-root bridge and task
+# containers can both create and write files through their shared group.
+prepare_pebble_workspace() {
+  prepare_worker_workspace "$1" pebble
 }
 
 write_kimi_runtime_env() {
@@ -2342,7 +2548,7 @@ start_tenant_kimi() {
 
   # cap-trim records the WI#400 KW-3 capability trim so existing rootful
   # containers force-recreate onto it.
-  local kimi_launch_contract="cap-trim"
+  local kimi_launch_contract="cap-trim;non-root-split-v1"
   local -a kimi_userns_args=()
   if [[ "$CONTAINER_RT" == "podman" && "$MT_ROOTLESS" == "true" ]]; then
     kimi_launch_contract="$KIMI_ROOTLESS_LAUNCH_CONTRACT"
@@ -2371,9 +2577,9 @@ start_tenant_kimi() {
   image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
     lunarwing-worker-kimi:latest 2>/dev/null || true)"
   case "$image_user" in
-    "0:0"|"0") ;;
+    "$KIMI_CONTAINER_UID"|"$KIMI_CONTAINER_UID:$KIMI_CONTAINER_GID") ;;
     *)
-      die "kimi worker image has user '${image_user:-unset}', expected 0:0 (WI#400 root entrypoint; tasks drop to $KIMI_CONTAINER_UID); rebuild it"
+      die "kimi worker image has user '${image_user:-unset}', expected $KIMI_CONTAINER_UID:$KIMI_CONTAINER_GID (WI#454 task default); rebuild it"
       ;;
   esac
 
@@ -2385,6 +2591,9 @@ start_tenant_kimi() {
     quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-kimi-${name}.container"
     render_worker_quadlet "$name" kimi 8443
     _systemctl_user "$name" daemon-reload 2>/dev/null || true
+    if ! reconcile_worker_task_quadlet "$name" kimi "$kimi_launch_contract"; then
+      return 0
+    fi
     if _container_config_changed "$name" "lunarwing-kimi-${name}" "$quadlet_file" "$kimi_launch_contract"; then
       _recreate_quadlet_container "$name" "$kimi_service" "lunarwing-kimi-${name}"
     fi
@@ -2399,6 +2608,10 @@ start_tenant_kimi() {
     fi
     return 0
   fi
+
+  prepare_worker_task_launch "$name" kimi
+  start_worker_task_container "$name" kimi lunarwing-worker-kimi:latest \
+    "$TASK_WORKSPACE_DIR" TASK_USERNS_ARGS TASK_ENV_FLAGS TASK_MOUNTS TASK_RESTART_ARG
 
   local -a healthcheck_args=()
   if _openrc_podman_uses_init_health; then
@@ -2465,8 +2678,11 @@ start_tenant_kimi() {
       --name "$container_name" \
       "${healthcheck_args[@]}" \
       "${kimi_userns_args[@]}" \
+      --user "$(worker_bridge_uid kimi):$KIMI_CONTAINER_GID" \
       --security-opt no-new-privileges \
-      --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add KILL --cap-add SETUID --cap-add SETGID \
+      --cap-drop ALL \
+      -e LUNARWING_CONTAINER_ROLE=split-bridge \
+      -e LUNARWING_TOOL_PROXY_DIR=/run/lunarwing-shared/tool-proxy \
       -e LUNARWING_WORKER_ID="worker-kimi-${name}" \
       -e WS_PORT="$wss_port" \
       -e HEALTH_PORT="8443" \
@@ -2478,9 +2694,11 @@ start_tenant_kimi() {
       -p "127.0.0.1:${wss_port}:${wss_port}" \
       "${health_publish[@]}" \
       -v "$workspace_dir:/workspace:z" \
+      -v "$(worker_ipc_volume_name kimi "$name"):/run/lunarwing-shared:z" \
       "${restart_arg[@]}" \
       "${WORKER_EGRESS_LAUNCH_ARGS[@]}" \
       --label "lunarwing.egress=$(worker_egress_network_name "$name")" \
+      --label "lunarwing.worker-role=bridge" \
       lunarwing-worker-kimi:latest \
       --mode websocket >/dev/null
     _store_container_hash \
@@ -2514,6 +2732,7 @@ stop_tenant_kimi() {
     _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
     say "kimi worker stopped ($container_name)"
   fi
+  stop_worker_task_container "$name" kimi
 }
 
 # ── Pebble worker container ──────────────────────────────────────────────────
@@ -2554,9 +2773,9 @@ start_tenant_pebble() {
   image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
     lunarwing-worker-pebble:latest 2>/dev/null || true)"
   case "$image_user" in
-    "0:0"|"0") ;;
+    "$PEBBLE_CONTAINER_UID"|"$PEBBLE_CONTAINER_UID:$PEBBLE_CONTAINER_GID") ;;
     *)
-      die "pebble worker image has user '${image_user:-unset}', expected 0:0 (WI#400 root bridge; tasks drop to $PEBBLE_CONTAINER_UID); rebuild it"
+      die "pebble worker image has user '${image_user:-unset}', expected $PEBBLE_CONTAINER_UID:$PEBBLE_CONTAINER_GID (WI#454 task default); rebuild it"
       ;;
   esac
 
@@ -2570,6 +2789,9 @@ start_tenant_pebble() {
     quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-pebble-${name}.container"
     render_worker_quadlet "$name" pebble 8443
     _systemctl_user "$name" daemon-reload 2>/dev/null || true
+    if ! reconcile_worker_task_quadlet "$name" pebble "$pebble_launch_contract"; then
+      return 0
+    fi
     if _container_config_changed "$name" "lunarwing-pebble-${name}" "$quadlet_file" "$pebble_launch_contract"; then
       _recreate_quadlet_container "$name" "$pebble_service" "lunarwing-pebble-${name}"
     fi
@@ -2584,6 +2806,10 @@ start_tenant_pebble() {
     fi
     return 0
   fi
+
+  prepare_worker_task_launch "$name" pebble
+  start_worker_task_container "$name" pebble lunarwing-worker-pebble:latest \
+    "$TASK_WORKSPACE_DIR" TASK_USERNS_ARGS TASK_ENV_FLAGS TASK_MOUNTS TASK_RESTART_ARG
 
   local -a healthcheck_args=()
   if _openrc_podman_uses_init_health; then
@@ -2663,55 +2889,21 @@ start_tenant_pebble() {
     local ssh_agent_dir
     ssh_agent_dir="$(tenant_run_dir "$name")/ssh-agent"
     ssh_mount=(-v "${ssh_agent_dir}:/tmp/ssh-agent:ro,z" -e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock)
-    # WI#400: keep-id binds the in-container task uid to the tenant account
-    # (bridge stays container root; tasks drop via setpriv).
+    # Rootless keep-id maps the task identity to the tenant account. Rootful
+    # hosts use the same image uid/group and setgid workspace instead.
     local -a pebble_userns_args=()
     if [[ "$CONTAINER_RT" == "podman" && "$MT_ROOTLESS" == "true" ]]; then
       pebble_userns_args=(--userns "$PEBBLE_USERNS")
-    fi
-    # WI#422 (run-164 KY-1): rootful pebble runs as the tenant uid:gid. The
-    # image pins USER 0:0 (WI#400 LD-8), so without --user the container (and
-    # its --restart unless-stopped resurrects) runs as host root while the runtime
-    # re-resolves the /workspace bind source at every start — a tenant who
-    # swaps ~/lunarwing/pebble-workspace for a symlink redirects host-root
-    # writes through their own pebble tasks. The numeric tenant uid has no
-    # in-image passwd entry, and the fat image bakes root-owned toolchain
-    # homes (GOPATH=/root/go; cargo needs a writable CARGO_HOME), so HOME and
-    # the toolchain caches are anchored inside the tenant-owned /workspace
-    # mount — login shells pick the same values up through the image's
-    # /etc/profile.d/toolchain snippet, which defers to preset env.
-    # no-new-privileges (run-167 LH-2) is on the run line for both lanes.
-    local -a pebble_user_args=()
-    if [[ "$MT_ROOTLESS" != "true" ]]; then
-      local pebble_tenant_uid pebble_tenant_gid
-      pebble_tenant_uid="$(id -u "$name")" \
-        || die "cannot resolve uid for tenant '$name' (rootful pebble launch)"
-      pebble_tenant_gid="$(id -g "$name")" \
-        || die "cannot resolve gid for tenant '$name' (rootful pebble launch)"
-      pebble_user_args=(
-        --user "${pebble_tenant_uid}:${pebble_tenant_gid}"
-        -e HOME=/workspace
-        -e GOPATH=/workspace/go
-        -e GOCACHE=/workspace/.cache/go-build
-        -e CARGO_HOME=/workspace/.cargo
-        # WI#400 x WI#422 (run-167 LH-1 / run-170 LP-2): the container runs as
-        # the tenant uid, so there is no privilege split on this lane. The
-        # explicit `inherit` pair tells the bridge to run tasks as its own
-        # identity by design; it is distinct from the image's numeric pins
-        # (rootless keep-id split) and from the empty value (fail-closed),
-        # so the bridge can still refuse a rootless keep-id launch that
-        # happened to start as the task uid (LD-8).
-        -e PEBBLE_TASK_UID=inherit
-        -e PEBBLE_TASK_GID=inherit
-      )
     fi
     _ctr "$name" run -d \
       --name "$container_name" \
       "${healthcheck_args[@]}" \
       "${pebble_userns_args[@]}" \
-      "${pebble_user_args[@]}" \
+      --user "$(worker_bridge_uid pebble):$PEBBLE_CONTAINER_GID" \
       --security-opt no-new-privileges \
-      --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add KILL --cap-add SETUID --cap-add SETGID \
+      --cap-drop ALL \
+      -e LUNARWING_CONTAINER_ROLE=split-bridge \
+      -e LUNARWING_TOOL_PROXY_DIR=/run/lunarwing-shared/tool-proxy \
       -e LUNARWING_WORKER_ID="worker-pebble-${name}" \
       -e WS_PORT="$wss_port" \
       -e HEALTH_PORT="8443" \
@@ -2719,13 +2911,14 @@ start_tenant_pebble() {
       -e WS_BIND_HOST=0.0.0.0 \
       -e WS_PATH=/ws/agent \
       "${env_flags[@]}" \
-      "${ssh_mount[@]}" \
       -p "127.0.0.1:${wss_port}:${wss_port}" \
       "${health_publish[@]}" \
       -v "$workspace_dir:/workspace:z" \
+      -v "$(worker_ipc_volume_name pebble "$name"):/run/lunarwing-shared:z" \
       "${restart_arg[@]}" \
       "${WORKER_EGRESS_LAUNCH_ARGS[@]}" \
       --label "lunarwing.egress=$(worker_egress_network_name "$name")" \
+      --label "lunarwing.worker-role=bridge" \
       lunarwing-worker-pebble:latest >/dev/null
     _store_container_hash "$name" "$container_name" "$(tenant_env_dir "$name")/lunarwing.env" "$pebble_launch_contract"
   fi
@@ -2754,6 +2947,7 @@ stop_tenant_pebble() {
     _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
     say "pebble worker stopped ($container_name)"
   fi
+  stop_worker_task_container "$name" pebble
 }
 
 require_worker_name() {
@@ -2776,9 +2970,10 @@ prepare_worker_lifecycle() {
 # Stop both worker units and remove every boot path. Init scripts stay rendered
 # so an explicit start-worker can re-enable them without reprovisioning.
 openrc_worker_stop_disable() {
-  local name="$1" worker="$2" container svc
+  local name="$1" worker="$2" container task_container svc
   container="lunarwing-${worker}-${name}"
-  for svc in "${container}-sup" "$container"; do
+  task_container="$(worker_task_container_name "$worker" "$name")"
+  for svc in "${container}-sup" "$container" "${task_container}-sup" "$task_container"; do
     if [[ -x "$OPENRC_INITD_DIR/$svc" ]]; then
       _openrc_service "$svc" stop >/dev/null 2>&1 \
         || { say "failed to stop OpenRC service $svc" >&2; return 1; }
