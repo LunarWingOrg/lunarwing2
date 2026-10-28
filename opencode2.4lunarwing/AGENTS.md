@@ -79,8 +79,12 @@ run under the throwaway HOME/XDG environment rooted in the trap-cleaned
 tripwires must stay. The started-entrypoint smoke must also put `WS_STATE_FILE`
 under its trap-cleaned `/tmp/opencode2-runtime-smoke-entrypoint` tree; the bridge
 writes a timestamped state file, and leaving it at `/tmp/lunarwing_ws_state.json`
-changes the image layer digest between candidate and clean rebuild. Never invoke
-bun or the opencode binary in the image build with the default root HOME.
+changes the image layer digest between candidate and clean rebuild. Before the
+smoke exits, `check_external_writes` fails closed if anything outside that tree
+under `/tmp` or `/var/log/lunarwing` is newer than its marker. Every Dockerfile
+`RUN` must leave no per-build residue and consume deterministic, pinned inputs;
+the candidate/clean-rebuild digest gate remains mandatory. Never invoke bun or
+the opencode binary in the image build with the default root HOME.
 
 ## Do Not
 

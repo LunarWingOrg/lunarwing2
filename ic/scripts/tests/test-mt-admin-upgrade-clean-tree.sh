@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034  # fixture globals are consumed by sourced helpers.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lunarwing-mt-admin.sh
 source "$SCRIPT_DIR/../lunarwing-mt-admin.sh"
+REAL_LIFECYCLE_LOCK="$(declare -f with_tenant_lifecycle_lock)"
 export INIT_SYSTEM=systemd
 
 fixture="$(mktemp -d)"
@@ -329,6 +331,134 @@ elif [[ "$(cat "$events")" == $'neutralize\nbackup\nstop' && "$output" == *'not 
 else
   fail "stop failure was ignored: $output"
 fi
+
+# WI#469 / !2010 QN-1 / !2022 QT-2: drive both upgrade layers and the REAL
+# lifecycle/writer wrappers, worker pass and Kimi starter. Capture outside
+# `if`/`||` so inner worker errexit is actually tested. Stub other lanes and
+# host ownership/init/runtime operations; no live tenant is involved.
+eval "$REAL_LIFECYCLE_LOCK"
+TENANT_LIFECYCLE_LOCK_DIR="$fixture/lifecycle-locks"
+install() { command mkdir -p "$TENANT_LIFECYCLE_LOCK_DIR"; command chmod 700 "$TENANT_LIFECYCLE_LOCK_DIR"; }
+stat() {
+  if [[ "$*" == "-c %u:%a $TENANT_LIFECYCLE_LOCK_DIR" ]]; then printf '0:700\n';
+  else command stat "$@"; fi
+}
+stop_tenant() { printf 'stop\n' >>"$events"; }
+tenant_worker_enabled() { return 0; }
+tenant_darkirc_enabled() { [[ "$use_darkirc" == true ]]; }
+darkirc_managed_state_exists() { return 0; }
+darkirc_scope_id() { printf '%032d' 1; }
+validate_darkirc_scope_id() { :; }
+run_darkirc_key_helper() { :; }
+darkirc_writer_lock() {
+  exec {writer_fd}>"$fixture/darkirc.lock"
+  flock -x "$writer_fd"
+}
+darkirc_writer_unlock() { flock -u "$writer_fd"; exec {writer_fd}>&-; }
+# Keep the real helper and Kimi starter: a stale Kimi image must stay lane-local
+# through upgrades, whereas the real _ctr-run/credential-assignment failures
+# must not record a hash, report ready or attempt opencode2.
+start_tenant() { _start_tenant_workers "$1"; }
+start_tenant_pebble() { [[ "$startup_mode" != degraded ]] || return 3; }
+start_tenant_opencode() { :; }
+start_tenant_opencode2() { printf 'later-lane\n' >>"$events"; }
+tenant_worker_desired_running() { return 0; }
+ensure_container_runtime() { CONTAINER_RT=podman; MT_ROOTLESS=false; }
+ports_get() { printf '19091\n'; }
+_ensure_tenant_image() { return 0; }
+_worker_launch_contract() { printf fixture-contract; }
+prepare_worker_egress() { WORKER_EGRESS_LAUNCH_ARGS=(); }
+worker_egress_reconcile_container() { :; }
+worker_egress_network_name() { printf fixture-egress; }
+_openrc_podman_uses_init_health() { return 1; }
+_container_config_changed() { return 1; }
+_store_container_hash() { printf 'hash\n' >>"$events"; }
+_register_worker_unit() { printf 'unit\n' >>"$events"; }
+prepare_worker_workspace() { printf '%s/state' "$repo"; }
+write_kimi_runtime_env() { [[ "$startup_mode" != auth ]] || return 1; printf '%s/env/kimi-runtime.env' "$repo"; }
+_ctr() {
+  case "$2" in
+    image)
+      if [[ "$startup_mode" == degraded ]]; then printf '10002:10002\n';
+      else printf '0:0\n'; fi ;;
+    inspect)
+      [[ "$startup_mode" == clean ]] || return 1
+      printf 'true\n' ;;
+    run) printf 'run\n' >>"$events"; return 125 ;;
+  esac
+}
+for INIT_SYSTEM in systemd openrc; do
+  for use_darkirc in false true; do
+    for startup_mode in degraded runtime auth clean; do
+      : >"$events"
+      : >"$health_refresh_log"
+      # A subsequent clean pass must not retain a previous startup's failures.
+      TENANT_START_FAILED_WORKERS=(stale-previous-result)
+      set +e
+      output="$( {
+        upgrade_tenant fixture "$target" '' false false
+        result=$?
+        [[ -z "${LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD:-}" ]] || exit 96
+        flock -n "$TENANT_LIFECYCLE_LOCK_DIR/fixture.lock" true || exit 97
+        flock -n "${BUILD_LOCK}.fixture.upgrade" true || exit 98
+        flock -n "$fixture/darkirc.lock" true || exit 99
+        exit "$result"
+      } 2>&1)"
+      startup_rc=$?
+      set -e
+      label="$INIT_SYSTEM upgrade $startup_mode (DarkIRC=$use_darkirc)"
+      expected_rc=1
+      [[ "$startup_mode" != runtime ]] || expected_rc=125
+      [[ "$startup_mode" != clean ]] || expected_rc=0
+      if [[ "$startup_rc" == "$expected_rc" && "$(wc -l <"$health_refresh_log")" == 1 ]]; then
+        pass "$label preserves startup status and refreshes health, releasing all locks"
+      else
+        fail "$label status/health/lock contract (got $startup_rc): $output"
+      fi
+      if [[ "$startup_mode" == clean ]]; then
+        if [[ "$output" == *"tenant 'fixture' upgraded:"* && "$output" != *stale-previous-result* ]]; then
+          pass "$label reports success without stale failed lanes"
+        else fail "$label did not report clean success: $output"; fi
+      elif [[ "$output" == *"upgrade incomplete:"* && "$output" != *"tenant 'fixture' upgraded:"* \
+          && "$output" == *"failed worker lanes: "*kimi* ]]; then
+        pass "$label names failed lanes, not success"
+      else fail "$label has a misleading/missing degraded summary: $output"; fi
+      if [[ "$startup_mode" == degraded ]]; then
+        if grep -q later-lane "$events" && [[ "$output" == *'failed worker lanes: pebble kimi'* ]]; then
+          pass "$label attempts later selected lanes after two lane refusals"
+        else fail "$label aborted the worker pass early: $output"; fi
+      elif [[ "$startup_mode" != clean ]]; then
+        if ! grep -Eq 'hash|unit|later-lane' "$events" && [[ "$output" != *'kimi worker ready'* ]]; then
+          pass "$label keeps inner runtime/auth failures fatal"
+        else fail "$label continued after a fatal worker failure: $output"; fi
+      fi
+    done
+  done
+done
+
+# Failed-checkout recovery must never say the previous version restarted when
+# its real Kimi startup failed internally; the upgrade remains failed either way.
+INIT_SYSTEM=systemd
+use_darkirc=false
+fail_checkout=true
+for startup_mode in degraded runtime auth clean; do
+  : >"$events"
+  : >"$health_refresh_log"
+  set +e
+  output="$(upgrade_tenant fixture "$target" '' false false 2>&1)"
+  recovery_rc=$?
+  set -e
+  if [[ "$recovery_rc" == 1 && ! -s "$health_refresh_log" ]]; then
+    pass "failed checkout ($startup_mode) remains failed without post-upgrade health refresh"
+  else fail "failed checkout ($startup_mode) lost its failure: $output"; fi
+  if [[ "$startup_mode" == clean ]]; then
+    if [[ "$output" == *'previous tenant version restarted'* ]]; then
+      pass 'healthy old-version recovery is reported accurately'
+    else fail "healthy recovery was not reported: $output"; fi
+  elif [[ "$output" == *'automatic tenant restart failed'* && "$output" != *'previous tenant version restarted'* ]]; then
+    pass "failed checkout ($startup_mode) does not claim successful recovery"
+  else fail "failed checkout ($startup_mode) falsely reports recovery: $output"; fi
+done
 
 if [[ "$failures" -ne 0 ]]; then
   printf 'RESULT: %d failure(s)\n' "$failures"

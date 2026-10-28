@@ -1,11 +1,20 @@
 # Release Notes
 
+The current draft is [v2.1.7.0 — Shiranui (不知火)](../../RELEASE-v2.1.7.0.md)
+at the repository root. Its release date remains unset until tagging; draft
+coverage and remaining limitations are dated in that file.
+
+## Released versions
+
 Immutable historical release notes for each LunarWing version. Files are named
 `RELEASE-v<version>.md` and are never edited after the release tag is cut (except for
-typographical corrections that don't change meaning).
+typographical corrections that don't change meaning). Their work-item states
+are historical snapshots, not the current backlog.
 
 | Release | Codename | Date | Notes |
 |---------|----------|------|-------|
+| [v2.1.6.0](RELEASE-v2.1.6.0.md) | Tsuno (角) | 2026-10-24 | External-worker tool proxy and cron missions, credential boundaries, OpenRC proxy migration, dependency security refresh |
+| [v2.1.5.0](RELEASE-v2.1.5.0.md) | Bungei Fukkō (文芸復興) | 2026-10-10 | Engine recovery, honest failure reporting, memory tooling, dependency and security re-audit |
 | [v2.1.4.0](RELEASE-v2.1.4.0.md) | Kabuto (兜) | 2026-10-03 | Engine/mission recovery hardening, dependency re-audit, tenant system-prompt editor, tool runtime estimates, XMPP outbound spool |
 | [v2.1.3.0](RELEASE-v2.1.3.0.md) | Ō-Yoroi (大鎧) | 2026-09-29 | Secrets hardening, sealed engine output, relay-password rotation, operator ergonomics |
 | [v2.1.2.0](RELEASE-v2.1.2.0.md) | Yoroi (鎧) | 2026-09-25 | Generic Podman-first agent-shell sandbox, worker-contract hardening, health system parity, confabulation hardening |

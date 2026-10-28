@@ -210,6 +210,117 @@ class FullValidationTests(unittest.TestCase):
         self.assertIn("ci-config must run the pinned Go bootstrap before its parser fixtures", errors)
 
 
+class BuildkitParserGoVersionTests(unittest.TestCase):
+    """WI#500: the parser floor, CI image and bootstrap must move together."""
+
+    VERSION = "1.26.10"
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = pathlib.Path(temporary.name)
+        self.module = self.root / ".gitlab/go/dockerfile-parse/go.mod"
+        self.bootstrap = self.root / ".gitlab/scripts/fetch-go-toolchain.py"
+        for path in (self.module, self.bootstrap):
+            path.parent.mkdir(parents=True, exist_ok=True)
+        self.write_pins(self.VERSION)
+
+    def write_pins(self, version):
+        self.module.write_text(f"module fixture\n\ngo {version}\n", encoding="utf-8")
+        self.bootstrap.write_text(f'GO_VERSION = "{version}"\n', encoding="utf-8")
+        self.job = {"image": {"name": f"docker.io/library/golang:{version}-bookworm@sha256:" + "a" * 64}}
+
+    def errors(self):
+        errors = []
+        with mock.patch.object(config, "ROOT", self.root):
+            config.validate_buildkit_parser_go_version(self.job, errors)
+        return errors
+
+    def test_matching_pins_pass(self):
+        self.assertEqual(self.errors(), [])
+
+    def test_checked_in_pins_match(self):
+        job = config.load_yaml(ROOT / ".gitlab/ci/security.yml")["worker-buildkit-parser-policy-guard"]
+        errors = []
+        config.validate_buildkit_parser_go_version(job, errors)
+        self.assertEqual(errors, [])
+
+    def test_module_only_drift_fails_in_both_directions(self):
+        for version in ("1.26.8", "1.27.0"):
+            with self.subTest(version=version):
+                self.module.write_text(f"module fixture\n\ngo {version}\n", encoding="utf-8")
+                self.assertTrue(any("go.mod" in error and self.VERSION in error for error in self.errors()))
+
+    def test_bootstrap_only_drift_fails_in_both_directions(self):
+        for version in ("1.26.8", "1.27.0"):
+            with self.subTest(version=version):
+                self.bootstrap.write_text(f'GO_VERSION = "{version}"\n', encoding="utf-8")
+                self.assertTrue(any("fetch-go-toolchain.py" in error for error in self.errors()))
+
+    def test_image_only_bump_requires_both_files_to_move(self):
+        self.job["image"]["name"] = self.job["image"]["name"].replace(self.VERSION, "1.27.0")
+        errors = self.errors()
+        self.assertEqual(len(errors), 2, errors)
+        for path in ("go.mod", "fetch-go-toolchain.py"):
+            self.assertTrue(any(path in error and "1.27.0" in error for error in errors))
+
+    def test_coordinated_future_pins_pass_the_equality_check(self):
+        # The enclosing guard still requires a separately reviewed image+digest
+        # update; this cross-check should not introduce a fourth version pin.
+        self.write_pins("1.27.0")
+        self.assertEqual(self.errors(), [])
+
+    def test_missing_files_fail_closed(self):
+        for path in (self.module, self.bootstrap):
+            with self.subTest(file=path.name):
+                original = path.read_text(encoding="utf-8")
+                path.unlink()
+                self.assertTrue(any(path.name in error for error in self.errors()))
+                path.write_text(original, encoding="utf-8")
+
+    def test_missing_malformed_and_duplicate_go_directives_fail(self):
+        for declaration in (
+            "", "// go 1.26.10\n", "go\n", "go 1.26\n", "go latest\n",
+            "go 1.26.10 unexpected\n", "go 1.26.10\ngo 1.26.10\n",
+        ):
+            with self.subTest(declaration=declaration):
+                self.module.write_text("module fixture\n" + declaration, encoding="utf-8")
+                self.assertTrue(any("go.mod" in error for error in self.errors()))
+
+    def test_missing_malformed_dynamic_and_duplicate_bootstrap_pins_fail(self):
+        for source in (
+            "", '# GO_VERSION = "1.26.10"\n', 'GO_VERSION = "1.26.10\n',
+            "GO_VERSION = 12610\n", 'GO_VERSION = "1.26." + "10"\n',
+            'GO_VERSION = "1.26.10"\nGO_VERSION = "1.26.10"\n',
+            'GO_VERSION = "1.26.10"\nGO_VERSION += ".1"\n',
+        ):
+            with self.subTest(source=source):
+                self.bootstrap.write_text(source, encoding="utf-8")
+                self.assertTrue(any("fetch-go-toolchain.py" in error for error in self.errors()))
+
+    def test_comments_are_ignored_and_bootstrap_is_not_executed(self):
+        self.module.write_text(
+            "module fixture\n// go 1.26.8\n\tgo 1.26.10 // pinned toolchain\n", encoding="utf-8"
+        )
+        self.bootstrap.write_text(
+            '# GO_VERSION = "1.26.8"\nGO_VERSION = "1.26.10" # pinned toolchain\n'
+            'raise AssertionError("the validator must not execute the bootstrap")\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(self.errors(), [])
+
+    def test_invalid_or_unpinned_image_fails_closed(self):
+        for image in (None, "golang:latest", "docker.io/library/golang:1.26.10-bookworm", {"name": 42}):
+            with self.subTest(image=image):
+                self.job["image"] = image
+                self.assertTrue(self.errors())
+
+    def test_main_runs_the_go_version_check(self):
+        with mock.patch.object(config, "validate_buildkit_parser_go_version") as version_check:
+            self.assertEqual(config.main(), 0)
+        version_check.assert_called_once()
+
+
 class WorkerVersionPinTests(unittest.TestCase):
     """The worker pin cross-check must bind values to each worker's own case
     block (opencode and opencode2 share the OPENCODE_REF/OPENCODE_VERSION arg

@@ -1171,7 +1171,10 @@ The started-entrypoint build smoke sets `WS_STATE_FILE` under
 writes a timestamped WebSocket state file; leaving it at the default
 `/tmp/lunarwing_ws_state.json` changed the runtime layer digest between the
 candidate and clean rebuild (master pipeline #6658). Keep all smoke-generated
-state inside the cleaned tree.
+state inside the cleaned tree. The smoke creates a marker before starting the
+entrypoint and fails closed if anything outside that tree under `/tmp` or
+`/var/log/lunarwing` is newer when the checks finish, so a new residue path
+fails the smoke step instead of surfacing only at the image digest comparison.
 
 Image self-tests use `/tmp/opencode2-build-tests`, removed by an EXIT trap in
 the same Docker `RUN`, and disable Python bytecode writes. The workspace-path
@@ -1180,6 +1183,20 @@ These address the two reported sources of opencode2 digest drift: per-build
 chunk IDs in the executable and leftover randomly named test workspaces.
 The candidate versus uncached-rebuild **whole-image digest comparison remains
 mandatory**; a passing binary check alone does not establish image reproducibility.
+
+WI#510 records a second, current v2.1.2 failure from master pipeline 6658:
+the smoke residue was layer 29, but the Bun-compiled executable in layer 14
+also differed between the candidate and clean rebuild. The two binaries had
+3,293 differing bytes in a table of per-build 64-bit IDs with stable
+`C0000xxxx` suffixes, despite identical Dockerfile, source ref, source SHA and
+`SOURCE_DATE_EPOCH` inputs. The checked `bytecode: false` / `splitting: false`
+profile is the source-level fix for that older split/bytecode ID class. It was
+re-verified here with two independently fresh v2.1.2 clones, rebuilt at the
+same absolute checkout path after clean installs: both binaries were
+byte-identical (local SHA-256 `6c41398f...`; the value is path-dependent and is
+not a portable artifact checksum). Do not mask or otherwise weaken the
+whole-image digest contract; the protected candidate/rebuild pipeline still
+must confirm the merged tree after the smoke tripwire lands.
 
 The build-time self-test `RUN` steps also run under a throwaway
 `HOME`/XDG environment rooted inside the trap-cleaned `/tmp/opencode2-build-tests`
@@ -1779,19 +1796,64 @@ selection in `/etc/lunarwing/ports.json`. `build-tenant --with-<worker>` and the
 standalone build commands build shared images but do not select a worker for a
 tenant.
 
+### Shared startup isolation (WI#469 / goal 113)
+
+`start-tenant` and `restart-tenant` attempt selected workers in the existing
+`pebble opencode kimi opencode2` order, after starting the daemon. A stale
+image's user-contract refusal no longer exits the whole mt-admin process:
+each starter emits a bounded, escaped diagnostic and returns **3**. The worker
+pass warns, continues to later selected lanes, then names all refused lanes
+and returns **1** if any were refused. `start-worker` exposes the starter's
+status 3 directly. The image-user checks themselves remain fail-closed: no
+refused image is launched, rendered or recorded as ready.
+
+Other outcomes stay distinct:
+
+- Deselected workers, OpenRC intentionally stopped workers, unallocated ports
+  and unavailable images retain their existing soft-skip behavior.
+- Runtime, credential, workspace or egress failures are **not** stale-image
+  skips: any nonzero status other than 3 aborts the pass unchanged. Each
+  starter runs in its own `set -e` subshell so an inner failure cannot fall
+  through to hash storage, unit registration or a false `worker ready` line.
+- `upgrade-tenant` preserves startup failure through both upgrade layers and
+  the lifecycle/DarkIRC locks. It still refreshes an installed host health
+  pipeline, but reports **upgrade incomplete**, the startup status and failed
+  lanes, not `tenant upgraded`. This is **not an atomic rollback**: the new
+  checkout/binary is already installed, the daemon and successful lanes may
+  be running. Repair the failed lanes and retry `start-tenant`.
+
+Maintainers: capture lifecycle callbacks and startup results with errexit
+temporarily disabled, outside `if`/`||`. Putting the function on the left of
+`||` suppresses even explicit `set -e` in its nested worker subshells. Both
+lock wrappers restore the caller's errexit state; a nested/inherited lifecycle
+lock keeps its outer owner's descriptor and ownership. Userns repair and
+failed-checkout recovery also capture startup outside conditional-call contexts,
+so a failed restart cannot be reported as recovered. Regression coverage:
+`test-mt-admin-worker-startup.sh`, `test-mt-admin-worker-image-contract.sh` and
+`test-mt-admin-upgrade-clean-tree.sh`.
+
 **WI#456 runbook — kimi dispatch fails with `Connection refused (os error
-111)`, no kimi ERROR lines in daemon.log:** the kimi lane dies before the
+111)`, no kimi ERROR lines in daemon.log:** one verified cause is refusal before the
 container listens whenever a tenant store still holds a pre-WI#400 kimi
 image (`USER 10002:10002`, or `USER unset`) while the rootful admin store
 has no rebuilt copy — `_ensure_tenant_image`'s admin-store-empty branch keeps
 the stale tenant copy in play, and `start_tenant_kimi`'s image-user guard
-(`ic/scripts/mt-admin-lib/09-worker-config.sh`) then `die`s loudly, leaving
+(`ic/scripts/mt-admin-lib/09-worker-config.sh`) refuses it loudly, leaving
 the daemon-side `[[sandbox.external_workers]]` route hot against a dead
-socket. Same class as the pebble WI#452. **Remediation:**
+socket. WI#469 also allowed an earlier stale lane (especially pebble) to abort
+the startup pass before Kimi was attempted at all. The isolation above fixes
+that amplifier, **not** the stale image itself. Same class as the pebble
+WI#452. **Remediation:**
 `sudo ic/scripts/lunarwing-mt-admin.sh build-kimi-worker`, then
 `start-tenant <name>` (or `start-worker <name> kimi`) — image distribution to
 tenant stores plus the image-ID launch contract force-recreates the stale
-container on the next start. Verified end-to-end on temporary tenant
+container on the next start. Capture mt-admin's exit status and failed-lane
+summary; rebuild each refused lane, not just the first one. Check
+`sudo ic/scripts/lunarwing-mt-admin.sh status <name>` using the tenant's
+registry-allocated ports, then verify the worker's authenticated WebSocket
+handshake, readiness and a canary dispatch. Never substitute a bearer into
+logs or command arguments. The 2026-10-22 image-recovery path was verified
+end-to-end on temporary tenant
 `kimi93test` (2026-10-22, item 93): fresh image `USER 0:0` at CLI pin 2.3.0,
 container root with the setpriv task drop, WS handshake `101 Switching
 Protocols` with the scoped bearer (401 with a wrong one), `/ready` true —
@@ -1799,9 +1861,16 @@ see `docs/ops/ITEM93_KIMI_WORKER_456.md`. The item also hardened the three
 2026-10-22 hunter findings: WI#461 (the rootful workspace chown walk is
 `if !`-guarded with a clean rc-1 refusal instead of a bare-command
 set-e/errexit hazard), WI#462 (the task-uid PATH ordering at the setpriv
-drop is comment-pinned as intentional), and WI#463 (a bare-name `kimi` in
+drop now keeps root-owned entries ahead of task-writable toolchain dirs),
+and WI#463 (a bare-name `kimi` in
 the drop argv now resolves through the bridge's own root-ownership-checked
-PATH; absolute `KIMI_BIN` overrides pass through unchanged).
+PATH, failing closed on lookup failure; absolute `KIMI_BIN` overrides pass
+through unchanged).
+That historical reproduction is **not** evidence that today's reporting
+tenants are repaired. WI#456 remains deployment-gated; WI#512's 2026-10-28
+all-three-workers connection-refused report needs current host-side evidence.
+This change neither rebuilds fleet images nor adds daemon boot-time liveness
+probing (the latter remains WI#464).
 
 ### Headless permission contract (WI#195, WI#206)
 

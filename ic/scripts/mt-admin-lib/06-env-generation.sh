@@ -1978,11 +1978,17 @@ darkirc_writer_unlock() {
 }
 
 with_darkirc_writer_lock() {
-  local name="$1" result=0
+  local name="$1" result caller_errexit=false
   shift
   darkirc_writer_lock "$name"
-  "$@" || result=$?
+  # As with the lifecycle lock, do not suppress inner worker `set -e` during
+  # an upgrade by calling the callback on the left side of `||` (WI#469).
+  [[ $- != *e* ]] || caller_errexit=true
+  set +e
+  "$@"
+  result=$?
   darkirc_writer_unlock
+  if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
   return "$result"
 }
 

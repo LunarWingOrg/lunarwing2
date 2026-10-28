@@ -22,6 +22,7 @@
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+warn_err() { printf 'error: %s\n' "$*" >&2; }
 
 # WI#384 display hygiene: tenant-controlled values echoed into root-side
 # terminal output and logs must never carry control bytes or terminal escapes.
@@ -110,39 +111,47 @@ with_tenant_lifecycle_lock() {
   install -d -o root -g root -m 0700 "$TENANT_LIFECYCLE_LOCK_DIR"
   [[ "$(stat -c '%u:%a' "$TENANT_LIFECYCLE_LOCK_DIR" 2>/dev/null)" == "0:700" ]] \
     || die "unsafe tenant lifecycle lock directory"
-  local lock_fd result
+  local lock_fd result caller_errexit=false owns_lock=false active_lock_set=false
+  [[ $- != *e* ]] || caller_errexit=true
   if [[ -n "${LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD:-}" ]]; then
     lock_fd="$LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD"
     [[ "${LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT:-}" == "$name" ]] \
       && inherited_lock_fd_is_held "$lock_fd" "$TENANT_LIFECYCLE_LOCK_DIR/${name}.lock" \
       || die "invalid active tenant lifecycle lock"
-    "$@"
-    return
-  fi
-  if [[ -n "${LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_FD:-}" ]]; then
+  elif [[ -n "${LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_FD:-}" ]]; then
     lock_fd="$LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_FD"
     [[ "${LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_TENANT:-}" == "$name" ]] \
       && inherited_lock_fd_is_held "$lock_fd" "$TENANT_LIFECYCLE_LOCK_DIR/${name}.lock" \
       || die "invalid inherited tenant lifecycle lock"
     LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD="$lock_fd"
     LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT="$name"
-    "$@" || result=$?
-    result="${result:-0}"
+    active_lock_set=true
+  else
+    exec {lock_fd}>"$TENANT_LIFECYCLE_LOCK_DIR/${name}.lock" || return 1
+    if ! flock -x "$lock_fd"; then
+      exec {lock_fd}>&-
+      return 1
+    fi
+    LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD="$lock_fd"
+    LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT="$name"
+    active_lock_set=true
+    owns_lock=true
+  fi
+
+  # Do not use `"$@" || result=$?`: Bash would ignore even an explicit
+  # `set -e` in the callback's worker subshells (WI#469). Capture outside a
+  # conditional, then clean up before restoring the caller's errexit state.
+  set +e
+  "$@"
+  result=$?
+  if [[ "$active_lock_set" == true ]]; then
     unset LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT
-    return "$result"
   fi
-  exec {lock_fd}>"$TENANT_LIFECYCLE_LOCK_DIR/${name}.lock" || return 1
-  if ! flock -x "$lock_fd"; then
+  if [[ "$owns_lock" == true ]]; then
+    flock -u "$lock_fd" || result=1
     exec {lock_fd}>&-
-    return 1
   fi
-  LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD="$lock_fd"
-  LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT="$name"
-  "$@" || result=$?
-  result="${result:-0}"
-  unset LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT
-  flock -u "$lock_fd" || result=1
-  exec {lock_fd}>&-
+  if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
   return "$result"
 }
 

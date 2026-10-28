@@ -536,6 +536,16 @@ host's concurrent builds before retrying manually.
   retried successfully. OpenCode 2 promotion hard-needs both the BuildKit
   parser guard and the tar/config verifier; neither can be removed or made
   optional without failing validation.
+- The BuildKit parser gate intentionally requires its module's `go` directive
+  to equal the **exact patch version** in the reviewed Go image, not just a
+  compatible minimum (WI#500). `ci-config` also checks that
+  `fetch-go-toolchain.py` declares the same literal `GO_VERSION`, without
+  executing that script. A toolchain bump must update the image tag/digest in
+  `ci/security.yml` and its `validate_config.py` pin, the parser's `go.mod`, and
+  the bootstrap version/archive checksums together. Missing, malformed or
+  duplicate declarations fail closed; the equality check derives its version
+  from the CI image rather than adding another version constant. The parser
+  jobs retain `GOTOOLCHAIN=local` and `GOFLAGS=-mod=readonly`.
 - Worker promotion runs a 15-second registry auth-realm smoke test
   (`.gitlab/scripts/registry-realm-smoke.py`) before the promote script, so a
   broken realm fails cheaply instead of after the multi-hour candidate and
