@@ -1134,6 +1134,7 @@ stop_tenant() {
     1) die "tenant '$name' still has active writers after stop" ;;
     *) die "could not verify writer quiescence for tenant '$name' after stop" ;;
   esac
+  worker_egress_stop_keeper "$name"
 
   # Shutdown must not be blocked by malformed legacy config or an unsafe
   # rollback path. Retire Nanocode only after every supported service is down.
