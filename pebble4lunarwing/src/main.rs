@@ -27,9 +27,8 @@ async fn main() {
                 eprintln!("[pebble4lunarwing] task-runner requires a socket path");
                 std::process::exit(1);
             });
-        let env_or = |key: &str, default: &str| {
-            std::env::var(key).unwrap_or_else(|_| default.to_string())
-        };
+        let env_or =
+            |key: &str, default: &str| std::env::var(key).unwrap_or_else(|_| default.to_string());
         let config = executor::ExecutorConfig {
             pebble_bin: env_or("PEBBLE_BIN", "pebble"),
             model: env_or("PEBBLE_MODEL", "openai/gpt-5.2"),
