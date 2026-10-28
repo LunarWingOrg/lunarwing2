@@ -191,7 +191,9 @@ container_attached() {  # <tenant> <network> <container>
 running_worker_containers() {  # <tenant> — prints each running managed worker container
   local tenant="$1" container state
   for container in "lunarwing-pebble-$tenant" "lunarwing-opencode-$tenant" \
-                   "lunarwing-opencode2-$tenant" "lunarwing-kimi-$tenant"; do
+                   "lunarwing-opencode2-$tenant" "lunarwing-kimi-$tenant" \
+                   "lunarwing-pebble-task-$tenant" "lunarwing-opencode-task-$tenant" \
+                   "lunarwing-opencode2-task-$tenant" "lunarwing-kimi-task-$tenant"; do
     state="$(runtime_read "$tenant" inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" || continue
     [[ "$state" == "true" ]] && printf '%s\n' "$container"
   done
