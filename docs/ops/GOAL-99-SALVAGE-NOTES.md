@@ -40,7 +40,7 @@ Dry-run merge against `origin/aragents/kimil00p/v2.1.7.0` (9751abdd0):
    loop tick itself does the checkoff on SUCCESS per the normal path.
 
 ## OUTCOME — redo completed 2026-10-28 (branch `sweetiebot/kimi-99-20261028-1523`)
-**New MR: !2020** (target `aragents/kimil00p/v2.1.7.0`, head `6ee29bfe5`,
+**New MR: !2020** (target `aragents/kimil00p/v2.1.7.0`,
 `remove_source_branch` on). GitLab reports `merge_status: can_be_merged` /
 `detailed_merge_status: mergeable` — the conflict that closed !2013 is gone.
 
@@ -92,4 +92,8 @@ images present. Nothing was reprovisioned or destroyed.
   gitignored and would be swept into the commit. Stage explicitly.
 - A stale `.git/sequencer/` (an item-108 `no-commit` pick left by another
   session) blocked `git cherry-pick`; cleared with `git cherry-pick --quit`.
+- **Do not pin the MR head SHA inside the MR's own commits.** Every push that
+  fixes the pin invalidates it (the trail said `6ee29bfe5`, then the correcting
+  commit moved the head to `ecfd89bcc`). Reference the MR by iid and source
+  branch instead; GitLab tracks the head.
 
