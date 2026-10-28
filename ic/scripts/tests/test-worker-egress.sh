@@ -10,7 +10,7 @@ MT_ADMIN="$SCRIPT_DIR/../lunarwing-mt-admin.sh"
 source "$MT_ADMIN"
 
 failures=0
-fixture="$(mktemp -d)"
+fixture="$(mktemp -d "$HARNESS_REPO_ROOT/.worker-egress-test.XXXXXX")"
 trap 'command rm -rf "$fixture"' EXIT
 pass() { printf 'PASS: %s\n' "$1"; }
 fail() { printf 'FAIL: %s\n' "$1" >&2; failures=$((failures + 1)); }
@@ -103,6 +103,96 @@ worker_egress_nft() {
     return 0
   fi
   return 0
+}
+
+session_bin="$fixture/session-bin"
+mkdir -p "$session_bin"
+cat >"$session_bin/id" <<'STUB'
+#!/usr/bin/env bash
+printf '1000\n'
+STUB
+cat >"$session_bin/podman" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+state="$(dirname "$0")"
+printf '%s\n' "$*" >>"$state/podman.log"
+allocate_namespace() {
+  if [[ ! -e "$state/keeper-running" && ! -e "$state/worker-running" ]]; then
+    count=0
+    [[ ! -e "$state/count" ]] || read -r count <"$state/count"
+    printf '%s\n' "$((count + 1))" >"$state/count"
+    rm -f "$state/table"
+  fi
+}
+case "$1 $2" in
+  'pod exists') [[ -e "$state/keeper-created" ]] ;;
+  'pod create')
+    [[ ! -e "$state/create-fails" ]] || exit 1
+    touch "$state/keeper-created"
+    ;;
+  'pod inspect')
+    [[ -e "$state/keeper-created" ]] || exit 1
+    case "$4" in
+      *lunarwing.purpose*)
+        if [[ -e "$state/foreign-keeper" ]]; then printf foreign; else printf worker-egress-keeper; fi ;;
+      *InfraContainerID*) printf infra ;;
+      *State*) [[ ! -e "$state/keeper-running" ]] || printf Running ;;
+    esac
+    ;;
+  'pod start')
+    [[ ! -e "$state/start-fails" ]] || exit 1
+    if [[ ! -e "$state/keeper-running" ]]; then allocate_namespace; touch "$state/keeper-running"; fi
+    ;;
+  'pod rm') rm -f "$state/keeper-created" "$state/keeper-running" ;;
+  'inspect --format')
+    case "$3" in
+      *IsInfra*) printf true ;;
+      *State.Running*) [[ ! -e "$state/keeper-running" ]] || printf true ;;
+      *NetworkSettings.Networks*)
+        if [[ -e "$state/wrong-network" ]]; then printf default; else printf lw-egress-alpha; fi ;;
+    esac
+    ;;
+  'unshare --rootless-netns')
+    allocate_namespace
+    shift 2
+    "$@"
+    ;;
+  'start worker') allocate_namespace; touch "$state/worker-running" ;;
+  'stop worker') rm -f "$state/worker-running" ;;
+  *) exit 1 ;;
+esac
+STUB
+cat >"$session_bin/nft" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+state="$(dirname "$0")"
+source "$state/nft-state"
+printf '%s\n' "alpha $*" >>"$state/../nft.log"
+printf '%s %s\n' "$(cat "$state/count" 2>/dev/null || printf rootful)" "$*" >>"$state/session.log"
+case "$1" in
+  -f)
+    [[ "$NFT_LOAD_RC" == 0 ]] || exit 1
+    cp "$2" "$state/table"
+    ;;
+  list)
+    [[ "$NFT_LIST_RC" == 0 && -e "$state/table" ]] || exit 1
+    if [[ -n "$NFT_LIST_OUT" ]]; then printf '%s\n' "$NFT_LIST_OUT"; exit; fi
+    chain="${!#}"
+    awk -v chain="$chain" '
+      index($0, "chain " chain " {") { inside = 1; print; next }
+      inside && /^    }/ { inside = 0; print; next }
+      inside && /counter reject with icmpx type admin-prohibited/ { print }
+    ' "$state/table"
+    ;;
+esac
+STUB
+chmod +x "$session_bin/"*
+apply_definition="$(declare -f worker_egress_apply)"
+eval "${apply_definition/worker_egress_apply/real_worker_egress_apply}"
+worker_egress_apply() {
+  declare -p NFT_LOAD_RC NFT_LIST_RC NFT_LIST_OUT >"$session_bin/nft-state"
+  NFT_RULESET_FILE="$(worker_egress_ruleset_path "$1")"
+  PATH="$session_bin:$PATH" real_worker_egress_apply "$@"
 }
 
 CTR_NETWORK_EXISTS=false
@@ -248,7 +338,7 @@ if worker_egress_apply alpha >"$fixture/applied.dump" 2>"$fixture/apply-ok.err";
 else
   fail "apply rejected a valid ruleset: $(cat "$fixture/apply-ok.err")"
 fi
-assert_contains "$(printf '%s\n' "${NFT_CALLS[@]}")" '-f' "apply loads the rendered file"
+assert_contains "$(cat "$NFT_LOG")" '-f' "apply loads the rendered file"
 assert_eq "$(grep -c 'list chain' "$NFT_LOG")" "2" "apply verifies forward and input chains"
 assert_eq "$(cat "$WORKER_EGRESS_DIR/alpha.hosts")" 'git.example.org:203.0.113.40' "static hosts come from the same resolved answers"
 launch_args="$(worker_egress_launch_args alpha)"
@@ -272,12 +362,8 @@ fi
 assert_contains "$ip_only_args" '--dns
 127.0.0.1' "empty-host launch still pins DNS"
 assert_absent "$ip_only_args" '--add-host' "empty-host launch emits no --add-host"
-if [[ "$(id -u)" == "0" ]]; then
-  assert_eq "$(stat -c '%U:%G:%a' "$WORKER_EGRESS_GUARD")" 'root:root:755' "installed guard is root-owned 0755"
-else
-  assert_eq "$(stat -c '%a' "$HARNESS_REPO_ROOT/ic/scripts/lunarwing-worker-egress-guard.sh")" '755' "guard source is executable"
-  assert_contains "$(declare -f install_worker_egress_guard)" 'install -m 0755 -o root -g root' "root installation pins owner and mode"
-fi
+assert_eq "$(stat -c '%a' "$HARNESS_REPO_ROOT/ic/scripts/lunarwing-worker-egress-guard.sh")" '755' "guard source is executable"
+assert_contains "$(declare -f install_worker_egress_guard)" 'install -m 0755 -o root -g root' "root installation pins owner and mode"
 
 printf 'stale\n' >"$WORKER_EGRESS_DIR/alpha.nft"
 printf 'stale\n' >"$WORKER_EGRESS_DIR/alpha.hosts"
@@ -435,59 +521,88 @@ else
 fi
 CTR_CONTAINER_EXISTS=true
 
-# ── the real guard with a hermetic nft executable ─────────────────────────────
+# ── fresh namespaces through apply, boot guard, start, and post-start audit ────
 guard="$HARNESS_REPO_ROOT/ic/scripts/lunarwing-worker-egress-guard.sh"
 worker_egress_ruleset alpha >"$fixture/alpha.nft"
-guard_bin="$fixture/bin"
-mkdir -p "$guard_bin"
-cat >"$guard_bin/nft" <<'STUB'
-#!/usr/bin/env bash
-case "${1:-}" in
-  -f) exit "${FAKE_LOAD_RC:-0}" ;;
-  list)
-    [[ "${FAKE_LIST_RC:-0}" == "0" ]] || exit 1
-    chain="${!#}"
-    printf 'list %s\n' "$chain" >>"${FAKE_NFT_LOG:-/dev/null}"
-    printf 'chain "%s" {\n' "$chain"
-    case "${FAKE_MODE:-good}" in
-      empty) ;;
-      wrong) printf '  iifname "lweg11" ip saddr 10.89.11.0/24 counter packets 0 bytes 0 reject with icmpx type admin-prohibited\n' ;;
-      narrow) printf '  iifname "lweg10" meta l4proto tcp ip saddr 10.89.10.0/24 counter packets 0 bytes 0 reject with icmpx type admin-prohibited\n' ;;
-      *) printf '  iifname "lweg10" ip saddr 10.89.10.0/24 counter packets 0 bytes 0 reject with icmpx admin-prohibited\n' ;;
-    esac
-    printf '}\n'
-    ;;
-esac
-STUB
-chmod +x "$guard_bin/nft"
-assert_rc_fail env PATH="$guard_bin:$PATH" "$guard" "$fixture/missing.nft" rootful fwd_alpha
-# OQ-4: the guard derives the input chain as `in_<suffix>` (distinct from the
-# forward prefix), so a `worker_input_*` regression cannot pass silently.
-: >"$fixture/guard-chains.log"
-if PATH="$guard_bin:$PATH" FAKE_NFT_LOG="$fixture/guard-chains.log" \
-    "$guard" "$fixture/alpha.nft" rootful fwd_alpha >/dev/null; then
-  pass "guard accepts both exact live chains"
-  assert_contains "$(cat "$fixture/guard-chains.log")" 'list in_alpha' "guard derives the in_<tenant> input chain (OQ-4)"
-  assert_absent "$(cat "$fixture/guard-chains.log")" 'worker_input_' "guard no longer derives worker_input_* chain names (OQ-4)"
+rm -f "$session_bin/keeper-created" "$session_bin/keeper-running" "$session_bin/count" "$session_bin/table"
+: >"$session_bin/session.log"
+if worker_egress_apply alpha >/dev/null \
+    && PATH="$session_bin:$PATH" "$guard" "$fixture/alpha.nft" rootless fwd_alpha alpha >/dev/null \
+    && "$session_bin/podman" start worker \
+    && PATH="$session_bin:$PATH" "$guard" --verify "$fixture/alpha.nft" rootless fwd_alpha alpha >/dev/null; then
+  pass "fresh tenant survives apply, pre-guard, first worker start and post-guard"
 else
-  fail "guard rejected both exact live chains"
+  fail "fresh tenant lost its filter between apply and first start"
 fi
-assert_rc_fail env PATH="$guard_bin:$PATH" FAKE_LOAD_RC=1 "$guard" "$fixture/alpha.nft" rootful fwd_alpha
-assert_rc_fail env PATH="$guard_bin:$PATH" FAKE_LIST_RC=1 "$guard" "$fixture/alpha.nft" rootful fwd_alpha
-assert_rc_fail env PATH="$guard_bin:$PATH" FAKE_MODE=empty "$guard" "$fixture/alpha.nft" rootful fwd_alpha
-assert_rc_fail env PATH="$guard_bin:$PATH" FAKE_MODE=wrong "$guard" "$fixture/alpha.nft" rootful fwd_alpha
-assert_rc_fail env PATH="$guard_bin:$PATH" FAKE_MODE=narrow "$guard" "$fixture/alpha.nft" rootful fwd_alpha
-if PATH="$guard_bin:$PATH" "$guard" --verify "$fixture/alpha.nft" rootful fwd_alpha >/dev/null; then
-  pass "guard --verify rechecks a started worker without reloading"
+assert_eq "$(cat "$session_bin/count")" 1 "the keeper pins one namespace across the entire first-start sequence"
+assert_eq "$(awk '{print $1}' "$session_bin/session.log" | sort -u)" 1 "every load and chain read addresses the worker's namespace"
+assert_eq "$(grep -c ' -f ' "$session_bin/session.log")" 2 "post-start verify never reloads a lost filter"
+assert_absent "$(cat "$session_bin/podman.log")" '--infra-image' "keeper uses Podman local pause image without a registry pull"
+
+rm -f "$session_bin/table"
+if PATH="$session_bin:$PATH" "$guard" --verify "$fixture/alpha.nft" rootless fwd_alpha alpha \
+    >"$fixture/vanished.out" 2>"$fixture/vanished.err"; then
+  fail "post-start guard accepted missing chains"
+else
+  pass "post-start guard still fails closed on missing chains"
+fi
+assert_contains "$(cat "$fixture/vanished.err")" 'namespace read: net:[' "failure names the namespace actually read"
+assert_contains "$(cat "$fixture/vanished.err")" 'keeper: lw-egress-keeper-alpha Running' "failure reports the keeper state"
+assert_eq "$(grep -c ' -f ' "$session_bin/session.log")" 2 "verify failure does not repair or reload the filter"
+"$session_bin/podman" stop worker
+rm -f "$session_bin/keeper-created" "$session_bin/keeper-running"
+for condition in create-fails start-fails foreign-keeper wrong-network; do
+  touch "$session_bin/$condition"
+  assert_rc_fail worker_egress_apply alpha
+  rm -f "$session_bin/$condition" "$session_bin/keeper-created" "$session_bin/keeper-running"
+done
+worker_egress_apply alpha >/dev/null
+if (worker_egress_nft() { shift; "$session_bin/nft" "$@"; }; \
+    worker_egress_verify_after_start alpha lunarwing-opencode2-alpha); then
+  pass "mt-admin post-start audit reads the same pinned namespace"
+else
+  fail "mt-admin post-start audit lost the pinned filter"
+fi
+if compgen -G "$WORKER_EGRESS_DIR/.verified.*" >/dev/null; then
+  fail "apply failure leaked a verified-dump temporary file"
+else
+  pass "apply failure leaves no verified-dump temporary file"
+fi
+
+# ── rootful guard: exact rejects, exit codes, and verify-only semantics ─────────
+assert_rc_fail env PATH="$session_bin:$PATH" "$guard" "$fixture/missing.nft" rootful fwd_alpha
+: >"$session_bin/podman.log"
+if PATH="$session_bin:$PATH" "$guard" "$fixture/alpha.nft" rootful fwd_alpha >/dev/null; then
+  pass "rootful guard accepts both exact chains"
+else
+  fail "rootful guard rejected both exact chains"
+fi
+assert_eq "$(cat "$session_bin/podman.log")" '' "rootful guard never creates a keeper or enters Podman"
+assert_contains "$(cat "$NFT_LOG")" 'list chain inet lunarwing_worker_egress in_alpha' "guard derives the in_<tenant> input chain (OQ-4)"
+run_guard_case() {
+  local NFT_LOAD_RC="${1:-0}" NFT_LIST_RC="${2:-0}" NFT_LIST_OUT="${3:-}"
+  declare -p NFT_LOAD_RC NFT_LIST_RC NFT_LIST_OUT >"$session_bin/nft-state"
+  PATH="$session_bin:$PATH" "$guard" "$fixture/alpha.nft" rootful fwd_alpha
+}
+assert_rc_fail run_guard_case 1
+assert_rc_fail run_guard_case 0 1
+assert_rc_fail run_guard_case 0 0 'chain fwd_alpha {}'
+assert_rc_fail run_guard_case 0 0 'iifname "lweg11" ip saddr 10.89.11.0/24 counter packets 0 bytes 0 reject with icmpx type admin-prohibited'
+assert_rc_fail run_guard_case 0 0 'iifname "lweg10" meta l4proto tcp ip saddr 10.89.10.0/24 counter packets 0 bytes 0 reject with icmpx type admin-prohibited'
+run_guard_case 0 0 'iifname "lweg10" ip saddr 10.89.10.0/24 counter packets 0 bytes 0 reject with icmpx admin-prohibited' >/dev/null
+if PATH="$session_bin:$PATH" "$guard" --verify "$fixture/alpha.nft" rootful fwd_alpha >/dev/null; then
+  pass "guard --verify accepts live counter dumps without reloading"
 else
   fail "guard --verify rejected a live worker"
 fi
+declare -p NFT_LOAD_RC NFT_LIST_RC NFT_LIST_OUT >"$session_bin/nft-state"
 mkdir -p "$fixture/no-nft"
 assert_rc_fail env PATH="$fixture/no-nft" /bin/bash "$guard" "$fixture/alpha.nft" rootful fwd_alpha
-assert_rc_fail env PATH="$guard_bin:$PATH" /bin/bash "$guard" "$fixture/alpha.nft" rootless fwd_alpha 'bad;tenant'
+assert_rc_fail env PATH="$session_bin:$PATH" "$guard" "$fixture/alpha.nft" rootless fwd_alpha 'bad;tenant'
+assert_rc_fail env PATH="$session_bin:$PATH" "$guard" "$fixture/alpha.nft" rootless fwd_alpha beta
 sed 's/ip saddr 10.89.10.0\/24 counter reject/meta l4proto tcp ip saddr 10.89.10.0\/24 counter reject/' \
   "$fixture/alpha.nft" >"$fixture/narrow.nft"
-assert_rc_fail env PATH="$guard_bin:$PATH" "$guard" "$fixture/narrow.nft" rootful fwd_alpha
+assert_rc_fail env PATH="$session_bin:$PATH" "$guard" "$fixture/narrow.nft" rootful fwd_alpha
 
 # ── rendered OpenRC start behavior ────────────────────────────────────────────
 mkdir -p "$fixture/initd"
