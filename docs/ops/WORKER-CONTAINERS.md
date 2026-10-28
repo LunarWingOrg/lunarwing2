@@ -422,6 +422,47 @@ real-chown pins). That block needs euid 0 plus a mapped uid 10001 and a
 working uid switch, so it self-skips with a named reason elsewhere (the dev
 VM runs it under `podman unshare`).
 
+### Pebble task sandbox: procps is unsupported (WI#480)
+
+Upstream pebble enables its namespace sandbox by default. Its Bash tool runs
+commands through `unshare --user --map-root-user --mount --ipc --pid --uts
+--fork sh -lc …` (`pebble/crates/runtime/src/sandbox.rs`) without remounting
+`/proc`. The inherited procfs therefore belongs to the container's outer PID
+namespace, while `getpid()` in the command returns a PID from the new inner
+namespace. procps 4.0.2's `ps` self-select uses that inner PID and cannot
+reliably find its own entry in the outer `/proc`; it exits with `fatal library
+error, lookup self` when no such entry exists.
+
+This is not a deliberate `hidepid` control, and the WI#400 `setpriv` drop alone
+does not cause it. On the image's pinned bookworm runtime with procps
+`2:4.0.2-3`, the production keep-id/capability/no-new-privileges launch plus
+the production `setpriv` drop ran `ps aux` successfully; adding pebble's exact
+`unshare` argv reproduced the fatal error. Adding `--mount-proc` was rejected
+with `Operation not permitted` by that same production launch. Do not disable
+the PID namespace or relax the container security options merely to make `ps`
+available.
+
+For lifecycle checks of a child started by the same task shell, use the shell's
+namespace-local PID with `kill` and `wait`, not `/proc/$!`:
+
+```sh
+server-command &
+pid=$!
+kill -0 "$pid" 2>/dev/null  # liveness check
+kill -TERM "$pid"
+wait "$pid"                 # shutdown status (143 after SIGTERM)
+```
+
+If `set -e` is active, put `wait` in an `if` condition when a non-zero exit is
+expected. For metadata, `/proc/self/status`, `/proc/self/cmdline` and
+`/proc/self/fd` remain usable from the process they describe because the magic
+`self` link needs no numeric PID translation. `/proc/self/status` records the
+outer PID in `Pid:` and the outer-to-inner mapping in `NSpid:`. To inspect
+another process through `/proc/<pid>/status` or `/proc/<pid>/cmdline`, use its
+outer-namespace PID (for example, the first value in its `NSpid:` line), never
+an inner-namespace `$!`. Host-side diagnostics that already have the outer PID
+are unaffected.
+
 ## WebSocket message limits
 
 The daemon accepts external-worker messages and individual WebSocket frames
