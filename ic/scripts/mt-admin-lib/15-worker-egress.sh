@@ -582,6 +582,7 @@ worker_egress_flush() {
 worker_egress_stop_keeper() {
   local name="$1" keeper purpose
   _worker_egress_validate_name "$name"
+  worker_egress_enabled "$name" || return 0
   ensure_container_runtime
   [[ "$CONTAINER_RT" == podman && "$MT_ROOTLESS" == true ]] || return 0
   keeper="lw-egress-keeper-$name"
