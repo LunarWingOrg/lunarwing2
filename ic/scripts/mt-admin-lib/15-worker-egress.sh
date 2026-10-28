@@ -761,6 +761,13 @@ worker_egress_launch_args() {
   while IFS= read -r mapping; do
     [[ -n "$mapping" ]] && printf '%s\n' "--add-host" "$mapping"
   done <<<"$mappings"
+  # A tenant whose allowlist holds only literal-IP targets yields no static
+  # host mapping, so the loop body above never runs and the function's status
+  # would be the last (false) `[[ -n "$mapping" ]]` test. The launch arguments
+  # printed above are still valid — only network and pinned DNS — so report
+  # success explicitly rather than failing the worker start (see
+  # _worker_egress_llm_targets for the same trailing-return convention).
+  return 0
 }
 
 worker_egress_enabled() {
