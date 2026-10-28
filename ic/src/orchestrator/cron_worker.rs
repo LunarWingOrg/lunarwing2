@@ -1572,9 +1572,11 @@ async fn register_tick_job(
     }
     let mission = ctx.mission_id.to_string();
     let schedule = ctx.cron.schedule.clone();
+    let worker = ctx.worker.name.clone();
     let _ = cm
-        .update_context(job_id, |ctx| {
-            ctx.metadata = serde_json::json!({
+        .update_context(job_id, move |job| {
+            job.external_worker = Some(worker);
+            job.metadata = serde_json::json!({
                 "mission_id": mission,
                 "cron_schedule": schedule,
                 "tick_index": tick_index,
@@ -2241,6 +2243,51 @@ mod tests {
         assert!(TickOutcome::Missing.is_retryable());
         assert!(!TickOutcome::Completed.is_retryable());
         assert!(!TickOutcome::Cancelled.is_retryable());
+    }
+
+    /// WI#475 QI-1: cron registrations carry their external worker identity.
+    /// Their own watchdog owns recovery, so self-repair must not flip or alert
+    /// on an active tick even when it is past both ordinary idle thresholds.
+    #[tokio::test]
+    async fn cron_tick_registration_marks_external_without_self_repair_flips() {
+        use crate::agent::{DefaultSelfRepair, SelfRepair};
+
+        let cm = Arc::new(crate::context::ContextManager::new(1));
+        let (events, _) = broadcast::channel(8);
+        let manager =
+            Arc::new(ExternalWorkerManager::new(vec![]).with_event_deps(events, cm.clone()));
+        let worker = ExternalWorkerConfig {
+            name: "kimi".to_string(),
+            ..Default::default()
+        };
+        let cron = test_cron();
+        let last = Arc::new(std::sync::Mutex::new(None));
+        let ctx = test_ctx(&manager, &worker, &cron, &last);
+        let job_id = Uuid::new_v4();
+        let outcome = register_tick_job(&ctx, 1, 0, job_id, "tick", "slow LLM wait").await;
+        assert!(matches!(outcome, DispatchOutcome::Fired));
+
+        let registered = cm.get_context(job_id).await.unwrap(); // safety: test
+        assert_eq!(registered.external_worker.as_deref(), Some("kimi"));
+        assert_eq!(registered.state, JobState::InProgress);
+        cm.update_context(job_id, |job| {
+            job.started_at = Some(Utc::now() - chrono::Duration::seconds(2_000));
+        })
+        .await
+        .unwrap(); // safety: test
+
+        let repair = DefaultSelfRepair::new(cm.clone(), Duration::from_secs(300), 3)
+            .with_external_stuck_threshold(Duration::from_secs(1_800));
+        for _ in 0..5 {
+            let detected = repair.detect_stuck_jobs().await;
+            assert!(
+                detected.is_empty(),
+                "cron watchdog retains recovery ownership: {detected:?}"
+            );
+            let current = cm.get_context(job_id).await.unwrap(); // safety: test
+            assert_eq!(current.state, JobState::InProgress);
+            assert_eq!(current.repair_attempts, 0);
+        }
     }
 
     /// MR !1522 DE-5: busy and non-retryable classification must cover BOTH
