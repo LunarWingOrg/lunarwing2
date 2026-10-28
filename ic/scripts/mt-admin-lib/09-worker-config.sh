@@ -201,18 +201,23 @@ start_worker_task_container() {
 }
 
 stop_worker_task_container() {
-  local name="$1" worker="$2" task_container
+  local name="$1" worker="$2" grace="${3:-30}" task_container
   task_container="$(worker_task_container_name "$worker" "$name")"
   ensure_init_system
-  if [[ "$INIT_SYSTEM" == "openrc" && -f "/etc/init.d/${task_container}" ]]; then
+  if [[ "$INIT_SYSTEM" == "openrc" && -f "$OPENRC_INITD_DIR/${task_container}" ]]; then
     _deregister_babysitter "$task_container"
-    _openrc_service "$task_container" stop >/dev/null 2>&1 || true
+    _openrc_service "${task_container}-sup" stop >/dev/null 2>&1 || true
+    _openrc_service "$task_container" stop >/dev/null 2>&1 || return 1
   elif [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
       && podman_supports_quadlet; then
-    _systemctl_user "$name" stop "${task_container}.service" >/dev/null 2>&1 \
-      || _ctr "$name" stop "$task_container" >/dev/null 2>&1 || true
-  elif _ctr "$name" inspect "$task_container" &>/dev/null; then
-    _ctr "$name" stop "$task_container" >/dev/null 2>&1 || true
+    _systemctl_user "$name" stop --no-block "${task_container}.service" >/dev/null 2>&1 || true
+  fi
+  if _ctr "$name" inspect "$task_container" &>/dev/null; then
+    _ctr "$name" stop --time "$grace" "$task_container" >/dev/null 2>&1 || return 1
+  fi
+  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
+      && podman_supports_quadlet; then
+    _systemctl_user "$name" stop "${task_container}.service" >/dev/null 2>&1 || return 1
   fi
   say "$worker task container stopped ($task_container)"
 }
@@ -3022,6 +3027,7 @@ stop_worker() {
     _ctr "$name" stop "$container" >/dev/null 2>&1 \
       || die "failed to stop container $container"
   fi
+  stop_worker_task_container "$name" "$worker" || die "failed to stop $worker task container"
   say "$worker worker stopped for $name"
 }
 
@@ -3059,6 +3065,7 @@ kill_worker() {
   elif [[ "$INIT_SYSTEM" == "openrc" && -x "$OPENRC_INITD_DIR/${container}" ]]; then
     _openrc_service "$container" stop >/dev/null 2>&1 || true
   fi
+  stop_worker_task_container "$name" "$worker" 0 || die "failed to kill $worker task container"
   say "$worker worker killed and left stopped for $name"
 }
 
