@@ -1171,7 +1171,10 @@ The started-entrypoint build smoke sets `WS_STATE_FILE` under
 writes a timestamped WebSocket state file; leaving it at the default
 `/tmp/lunarwing_ws_state.json` changed the runtime layer digest between the
 candidate and clean rebuild (master pipeline #6658). Keep all smoke-generated
-state inside the cleaned tree.
+state inside the cleaned tree. The smoke creates a marker before starting the
+entrypoint and fails closed if anything outside that tree under `/tmp` or
+`/var/log/lunarwing` is newer when the checks finish, so a new residue path
+fails the smoke step instead of surfacing only at the image digest comparison.
 
 Image self-tests use `/tmp/opencode2-build-tests`, removed by an EXIT trap in
 the same Docker `RUN`, and disable Python bytecode writes. The workspace-path
@@ -1180,6 +1183,20 @@ These address the two reported sources of opencode2 digest drift: per-build
 chunk IDs in the executable and leftover randomly named test workspaces.
 The candidate versus uncached-rebuild **whole-image digest comparison remains
 mandatory**; a passing binary check alone does not establish image reproducibility.
+
+WI#510 records a second, current v2.1.2 failure from master pipeline 6658:
+the smoke residue was layer 29, but the Bun-compiled executable in layer 14
+also differed between the candidate and clean rebuild. The two binaries had
+3,293 differing bytes in a table of per-build 64-bit IDs with stable
+`C0000xxxx` suffixes, despite identical Dockerfile, source ref, source SHA and
+`SOURCE_DATE_EPOCH` inputs. The checked `bytecode: false` / `splitting: false`
+profile is the source-level fix for that older split/bytecode ID class. It was
+re-verified here with two independently fresh v2.1.2 clones, rebuilt at the
+same absolute checkout path after clean installs: both binaries were
+byte-identical (local SHA-256 `6c41398f...`; the value is path-dependent and is
+not a portable artifact checksum). Do not mask or otherwise weaken the
+whole-image digest contract; the protected candidate/rebuild pipeline still
+must confirm the merged tree after the smoke tripwire lands.
 
 The build-time self-test `RUN` steps also run under a throwaway
 `HOME`/XDG environment rooted inside the trap-cleaned `/tmp/opencode2-build-tests`
