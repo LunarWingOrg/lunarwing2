@@ -388,6 +388,14 @@ fd is inherited by every long-lived child started before it — the
 `supervise-daemon` babysitters for pg, vision, weechat-adapter, xmpp-bridge and
 the daemon itself.
 
+This is **OpenRC-specific**: on OpenRC the daemons are started inside the locked
+section as forked children of mt-admin, so they inherit the descriptor, whereas
+on systemd hosts they are started by the user manager rather than as children of
+the locked process and so do not. The `die` path wedges a tenant on OpenRC/Gentoo
+but not on systemd — which is exactly why the fix belongs inside
+`lunarwing-mt-admin.sh` behind its init abstraction rather than as a
+host-specific workaround.
+
 Verified: those daemons hold fd 10 pointing at the lock, and the fd flags are
 `0100001` — **`O_CLOEXEC` (`02000000`) is absent**:
 
@@ -419,14 +427,28 @@ leak exists on `thunderlane` — six of its daemons hold fd 10 on
 `thunderlane.lock` — it is simply not yet fatal there because that lock's
 holder exited cleanly enough that `/proc/locks` shows it free.
 
-Two-part fix shape:
-1. Open the lifecycle lock fd `O_CLOEXEC` (bash `exec {fd}>file` cannot set it
-   directly; use `flock`'s own fd handling, or `exec {lock_fd}<>"$lockfile"` in
-   a subshell that never execs a daemon), so it cannot be inherited by
-   `supervise-daemon`.
-2. Make `with_tenant_lifecycle_lock` release on the `die` path too (`trap` on
-   `ERR`/`EXIT` inside the wrapper), so a fail-closed abort does not wedge the
-   tenant.
+Fix shape — **one step, not two** (run-250 QQ-3). The original note here
+proposed both an `O_CLOEXEC` open *and* a `trap` release on the `die` path; the
+second half is unnecessary. A flock belongs to the open file description, so
+once the descriptor cannot be inherited, a `die` is a hard `exit` that closes it
+and the kernel releases the lock at process exit. No trap needed. Two
+equivalent shapes:
+
+1. **Close the descriptor in the subshell that starts each service** —
+   `exec {LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD}>&-` before the `rc-service` or
+   `systemctl` call — so `supervise-daemon` never sees it. (bash
+   `exec {fd}>file` cannot set `O_CLOEXEC` itself, hence closing explicitly.)
+2. **Hold the lock with `flock -o`** so the body runs with the descriptor
+   already closed. This one has a caveat: the nested-lock validation
+   `inherited_lock_fd_is_held` (`ic/scripts/mt-admin-lib/00-common.sh:84`,
+   called from `:117`, `:125`, `06-env-generation.sh:1949` and
+   `04-tenant-lifecycle.sh:1268`) must be kept working with the descriptor
+   closed, or re-entrant lifecycle calls lose their re-entrancy check.
+
+Either shape also removes the thunderlane-style latent leak noted above (six
+daemons holding fd 10 on `thunderlane.lock`). Note this reworks the same
+wrapper `with_tenant_lifecycle_lock` that the closed-unmerged !2010 (item 92)
+also touched, so whoever lands it should reconcile against that branch.
 
 ### Recovery used for this pass
 
@@ -590,13 +612,23 @@ Two-part fix shape:
    both worker containers to pick up the new `--add-host`. After that
    `curl https://nano-gpt.com/api/v1/models` in the container returned
    `HTTP=200` and the next pebble job completed.
-2. **Code:** when a tenant selects `--with-pebble`, mt-admin should
-   auto-include the NanoGPT host in the egress allowlist (or write a
-   `PEBBLE_BASE_URL` the pebble lane honours) rather than requiring a manual
-   `configure-worker-egress` step whose absence silently bricks every pebble
-   job. This is a real provisioning gap: a fresh `--with-pebble` tenant on a
-   host that already enforces WI#424 egress cannot run any pebble job until an
-   operator remembers to allow NanoGPT.
+2. **Code:** the pebble lane must not let a missing allowlist entry fail
+   silently. **Prefer the loud shape (run-250 QQ-2, security):** at
+   `configure-pebble` and at the pebble lane's start, check that the pebble
+   backend host is among the tenant's egress targets (or that `PEBBLE_BASE_URL`
+   is set, since `_worker_egress_llm_targets` already reads it) and **refuse**,
+   with a message naming `configure-worker-egress --allow`. The allow then shows
+   in the tenant's own allowlist where an operator can audit it.
+
+   The tempting alternative — auto-including the NanoGPT host whenever
+   `--with-pebble` is selected — is **not** recommended: it widens a fail-closed
+   allowlist implicitly, and a later backend change baked into the `pebble`
+   binary would widen it again without anyone choosing to. WI#424's whole value
+   is that the allowlist is deliberate; a hidden default erodes exactly that
+   property. This is a real provisioning gap either way: a fresh
+   `--with-pebble` tenant on a host that already enforces WI#424 egress cannot
+   run any pebble job until an operator allows NanoGPT — the question is only
+   whether it fails loudly at provision time or silently per job.
 
 This also explains why the prior-pebble tenants (thunderlane, silverzoom,
 scootaloo, barracuda) never saw it: none of them has an egress subnet, so their
