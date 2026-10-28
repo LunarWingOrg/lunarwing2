@@ -1,0 +1,124 @@
+import assert from "node:assert/strict"
+import { mkdtempSync, rmSync, statSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { after, test } from "node:test"
+import type { OpencodeClient } from "@opencode-ai/sdk/v2/client"
+
+import { TaskRunner, startupRefusal } from "./task_runner"
+import { delegateTaskToRunner, sendTaskPromptToRunner } from "./task_runner_client"
+import type { TaskRequest } from "./lunarwing_runtime"
+
+const scratchDirs: string[] = []
+function scratch(): string {
+  const dir = mkdtempSync(join(tmpdir(), "opencode-runner-"))
+  scratchDirs.push(dir)
+  return dir
+}
+after(() => {
+  for (const dir of scratchDirs) rmSync(dir, { recursive: true, force: true })
+})
+
+function makeSdk(options: { pendingPrompt?: boolean; firstPromptDelayMs?: number } = {}) {
+  const prompts: string[] = []
+  const sdk = {
+    session: {
+      create: async () => ({ data: { id: "session-1" } }),
+      prompt: async (...args: unknown[]) => {
+        const input = args[0] as { parts: Array<{ text: string }> }
+        prompts.push(input.parts[0]!.text)
+        if (prompts.length === 1 && options.firstPromptDelayMs) {
+          await new Promise((resolve) => setTimeout(resolve, options.firstPromptDelayMs))
+        }
+        if (options.pendingPrompt) await new Promise(() => {})
+        return { data: { info: {}, parts: [{ type: "text", text: `done ${prompts.length}` }] } }
+      },
+      abort: async () => ({ data: true }),
+    },
+    event: {
+      subscribe: async () => ({
+        stream: (async function* () {
+          if (!options.pendingPrompt) {
+            yield { type: "session.idle", properties: { sessionID: "session-1" } }
+          } else {
+            await new Promise(() => {})
+          }
+        })(),
+      }),
+    },
+    permission: { reply: async () => ({ data: true }) },
+    v2: { session: { permission: { reply: async () => ({ data: undefined }) } } },
+  } as unknown as OpencodeClient
+  return { sdk, prompts }
+}
+
+async function startRunner(sdk: OpencodeClient): Promise<{ runner: TaskRunner; path: string }> {
+  const runner = new TaskRunner(sdk)
+  const path = await runner.listen(join(scratch(), "runner.sock"))
+  assert.ok(path, "runner must listen")
+  return { runner, path }
+}
+
+function request(overrides: Partial<TaskRequest> = {}): TaskRequest {
+  return { task_id: "task-1", prompt: "start", ...overrides }
+}
+
+test("runner refuses credentials before its uid gate", () => {
+  const refusal = startupRefusal({
+    listenFd: null,
+    socketPath: "/tmp/runner.sock",
+    env: { AGENT_AUTH_TOKEN: "forbidden" },
+    uid: 0,
+  })
+  assert.match(String(refusal), /hub credential/)
+})
+
+test("delegated run and follow-up reach the same OpenCode session", async () => {
+  process.env.LUNARWING_TASK_RUNNER_REMOTE = "1"
+  const { sdk, prompts } = makeSdk({ firstPromptDelayMs: 500 })
+  const { runner, path } = await startRunner(sdk)
+  try {
+    const pending = delegateTaskToRunner(path, request(), undefined, () => {})
+    let forwarded = false
+    for (let attempt = 0; attempt < 100 && !forwarded; attempt++) {
+      forwarded = sendTaskPromptToRunner({ task_id: "task-1", seq: 1, prompt: "follow up", done: true })
+      if (!forwarded) await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    assert.equal(forwarded, true, "runner connection never accepted follow-up forwarding")
+    const result = await pending
+    assert.equal(result.status, "success", result.error ?? "")
+    assert.equal(result.output, "done 1\n\ndone 2")
+    assert.equal(prompts.length, 2)
+    assert.match(prompts[0]!, /start/)
+    assert.match(prompts[1]!, /follow up/)
+  } finally {
+    runner.close()
+    delete process.env.LUNARWING_TASK_RUNNER_REMOTE
+  }
+})
+
+test("delegated cancellation settles with a terminal cancelled result", async () => {
+  const { sdk } = makeSdk({ pendingPrompt: true })
+  const { runner, path } = await startRunner(sdk)
+  const controller = new AbortController()
+  try {
+    const pending = delegateTaskToRunner(path, request({ task_id: "cancel-me" }), undefined, () => {}, controller.signal)
+    setTimeout(() => controller.abort(), 100)
+    const result = await pending
+    assert.equal(result.status, "cancelled")
+    assert.equal(result.task_id, "cancel-me")
+  } finally {
+    runner.close()
+  }
+})
+
+test("shared runner sockets allow bridge-group access", async () => {
+  process.env.LUNARWING_TASK_RUNNER_REMOTE = "1"
+  const { runner, path } = await startRunner(makeSdk().sdk)
+  try {
+    assert.equal(statSync(path).mode & 0o777, 0o660)
+  } finally {
+    runner.close()
+    delete process.env.LUNARWING_TASK_RUNNER_REMOTE
+  }
+})
