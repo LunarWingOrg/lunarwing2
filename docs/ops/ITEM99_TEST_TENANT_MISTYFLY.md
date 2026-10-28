@@ -490,3 +490,224 @@ succeeded and is in permanent backoff:
 `completed_source_revision: null` with six consecutive failures inside ~37
 minutes of boot is the signature: the tenant is functional on its seeded corpus
 but can never pick up a corpus update.
+
+## F5 — WI#424 egress default allowlist has no pebble LLM host; every pebble job 401s/000s
+
+The pebble worker's model backend is the NanoGPT API at `nano-gpt.com` (the
+`pebble` binary's baked-in default — no `PEBBLE_BASE_URL` is written by
+mt-admin, and `_worker_egress_llm_targets`
+(`ic/scripts/mt-admin-lib/15-worker-egress.sh:241`) reads exactly
+`LLM_BASE_URL OPENCODE_BASE_URL OPENCODE2_BASE_URL KIMI_BASE_URL
+PEBBLE_BASE_URL`, so with none of those naming a NanoGPT endpoint the rendered
+egress ruleset only ever allowed the tenant's own TensorZero address
+`100.88.232.146:3000`).
+
+Result: on the first pebble dispatch after `start-tenant`, the container's
+stderr showed
+
+```
+[stderr] [llm-request] request 1 started
+[stderr] [llm-retry] attempt 1 failed; retrying
+[stderr] [llm-retry] attempt 2 failed; retrying
+[stderr] [llm-request] request 1 finished
+[stderr] api failed after 3 attempts: http error: error sending request for url (https://nano-gpt.com/api/v1/messages)
+Failed: pebble exited with code 1
+```
+
+and from inside the container `getent hosts nano-gpt.com` returned nothing
+while `curl https://nano-gpt.com/api/v1/models` printed
+`Could not resolve host: nano-gpt.com` (`HTTP=000`). The container had no
+NanoGPT DNS entry because the egress host mapping was empty (see F2's
+`worker_egress_launch_args` bug) and the network's recursive DNS is disabled by
+design. Every pebble job failed instantly with `pebble exited with code 1`
+(`external:pebble`, `elapsed 0`) — which reads as a worker crash but is really
+the fail-closed egress firewalling the worker's *only* model backend.
+
+Two-part fix shape:
+1. **Operational (applied here):** `configure-worker-egress mistyfly --allow
+   nano-gpt.com:443` re-rendered the ruleset with the NanoGPT static host
+   mapping (`nano-gpt.com:216.150.1.1`), and `restart-tenant` force-recreated
+   both worker containers to pick up the new `--add-host`. After that
+   `curl https://nano-gpt.com/api/v1/models` in the container returned
+   `HTTP=200` and the next pebble job completed.
+2. **Code:** when a tenant selects `--with-pebble`, mt-admin should
+   auto-include the NanoGPT host in the egress allowlist (or write a
+   `PEBBLE_BASE_URL` the pebble lane honours) rather than requiring a manual
+   `configure-worker-egress` step whose absence silently bricks every pebble
+   job. This is a real provisioning gap: a fresh `--with-pebble` tenant on a
+   host that already enforces WI#424 egress cannot run any pebble job until an
+   operator remembers to allow NanoGPT.
+
+This also explains why the prior-pebble tenants (thunderlane, silverzoom,
+scootaloo, barracuda) never saw it: none of them has an egress subnet, so their
+pebble containers still had default `pasta` DNS and reached NanoGPT directly.
+
+## Verification (runtime)
+
+`start-tenant mistyfly` → `START_EXIT=0` (after the F2 fix was in place), then
+`restart-tenant mistyfly` → `RESTART_EXIT=0` (after the F5 allowlist change).
+All services boot-persistent under OpenRC with `-sup` crash supervisors.
+
+- Windows/PG: `lunarwing-pg-mistyfly` (10043), daemon `lunarwing-mistyfly`,
+  `xmpp-bridge-mistyfly`, `lunarwing-weechat-mistyfly` +
+  `lunarwing-weechat-adapter-mistyfly`, LunarVision sidecar (20045/20046).
+- Gateway `:10040/api/health` → `{"status":"healthy","channel":"gateway"}`.
+- `/api/gateway/status` (bearer) → version `2.1.7`, `llm_backend`
+  `openai_compatible`, model `tensorzero::function_name::lunarwing`, channels
+  `unix_socket_repl`, `multica`, `weechat`, `xmpp`, `http`, `gateway`.
+  `multica` reports unhealthy (no multica server configured — cosmetic, as
+  every prior test tenant).
+- **13 extensions active**: `study_notes` MCP + 9 WASM tools
+  (`cavepony`, `gitlab`, `gotify`, `llm-context`, `multica-bridge`, `ssh`,
+  `vision-analyze`, `voice-transcribe`, `web-search`) + 3 WASM channels
+  (`multica`, `weechat`, `xmpp`).
+- **Workers** (both `external:`, health endpoints answer):
+  - pebble `:20044/health` → `{"mode":"websocket","status":"ok",…,
+    "version":"pebble-worker-0.1.0","worker_id":"worker-pebble-mistyfly"}`
+  - kimi `:30041/health` → `{"status":"ok",…,"version":"kimi-worker-1.0.0",
+    "kimi_code_version":"2.3.0","worker_id":"worker-kimi-mistyfly"}`
+- **WI#357 exposure audit**: `worker-listeners mistyfly` → `clean`. Both
+  workers publish host loopback only (10048/30040 + in-container 8443).
+- **WI#424 egress**: `worker-egress mistyfly` → both containers
+  `attached (exclusive, DNS pinned, static hosts current)`.
+
+## WI#472 / WI#471 / WI#473 — live regression check on mistyfly
+
+The three prior-run findings that had landed fixes were each exercised against
+the live gateway:
+
+- **WI#472 (approval thread resolution):** a bogus `request_id` approval now
+  returns `404 No pending approval matches this request_id` (was a silent
+  `202`); the valid id paired with the wrong `thread_id` returns
+  `400 thread_id does not own this approval request` (was a silent `202`).
+  Confirmed on both branches of `resolve_approval_thread`.
+- **WI#471 (pebble key quoting):** all four `configure-pebble` rejection arms
+  fire live (quotes each end, trailing quote only, `NANOGPT_API_KEY=` paste,
+  leading whitespace), each `exit 1` and leaving no `pebble.env` behind — see
+  F3a.
+- **WI#473 (gate reap on turn termination):** not re-exercised in isolation
+  because the dispatches used `action=always` with a pinned `thread_id` and no
+  long-lived `shell` gates were left; the code (`c3b209b15`) is in-tree and
+  the F4 gate was cleared on turn completion.
+
+## Worker task exercise
+
+Four distinct tasks (two per worker), deliberately harder and different from
+the prior passes. Every task was dispatched through the real path: gateway
+`POST /api/chat/send` → agent LLM loop → `create_job` (`mode: "<worker>"`,
+`wait: true`) → approval gate → `POST /api/chat/approval` (`action=always`
+with the owning `thread_id`) → resume → orchestrator WS dial → worker bridge →
+container executor → job events → assistant reply.
+
+### kimi — task A: thread-safe LRU cache with TTL (Rust, multi-module)
+
+Job `b7998c0c…` (`external:kimi`, `completed`, 187 s). Worker tool loop:
+
+- `[Bash] rustc --version; cargo --version …` → `rustc 1.96.1` / `cargo 1.96.1`
+- `cargo new mf_kimi_lru --bin`, then `[Write]` of `src/ttl.rs`, `src/cache.rs`,
+  `src/main.rs` across three modules, an `[Edit]` fixing `edition` 2024→2021,
+  `cargo build --release` and `cargo test --release`.
+- 8 unit tests **all pass**: `test result: ok. 8 passed; 0 failed`.
+- CLI exercise over the required stdin produced one result line per command,
+  all correct (`get a`→1, `get b`→2, first `len`→3, `evict`, second `len`→0,
+  `get c`→3).
+- The full `src/cache.rs` was returned and matches the spec (injected `Clock`
+  trait, `Arc`/`Mutex` not needed since the cache is single-owner, LRU via
+  `VecDeque`, capacity-bounded eviction).
+
+Evidence value: the fat kimi image's Rust toolchain works, module splits round
+trip, injected-clock TTL is tested without sleeping, and the answer carries the
+complete source and test summary.
+
+### kimi — task B: Go worker pool + token-bucket rate limiter + race detector
+
+Job `620f3fed…` (`external:kimi`, `completed`, 462 s). Correctness verified
+independently from the reported JSON:
+
+```json
+{"total":200,"succeeded":171,"permanently_failed":29,"total_attempts":287,
+ "duration_ms":2892,"throughput_per_sec":69.15,"rate_limit_ok":true}
+```
+
+- `29` jobs with `i % 7 == 0` in `0..200` is exactly right (there are 29 such
+  indices), each taking 4 attempts (1 + 3 retries) = `116`, plus `171`
+  single-attempt successes = `287` total attempts — matches verbatim.
+- `2892 ms >= 2870 ms` (the `287/100` s floor), so `rate_limit_ok` is truthful,
+  and the run was under `go run -race .` which reported **no data races**.
+- `go version go1.24.3 linux/amd64`; full `main.go` returned.
+
+A second concurrent dispatch of the same task (`93b837ac…`) was rejected in
+`0 s` with `Workspace /workspace is already being modified by task 620f3fed…
+Cancel or finish that task before dispatching another task to this workspace.`
+— the workspace-overlap exclusivity guard (the exact item-101 NW-1 concern)
+working as designed: two jobs resolving to the same `/workspace` cannot
+coexist, and the second is refused cleanly rather than corrupting the first.
+
+### pebble — task C: Dijkstra (C++17, heap vs brute-force + stress)
+
+Job `a938edb3…` (`external:pebble`, `completed`, 152 s).
+
+- `g++ (Debian 12.2.0-14+deb12u1) 12.2.0`, `-O2 -std=c++17 -Wall -Wextra`,
+  **zero compiler warnings**.
+- Test graph output was `0 5 9 / 0 3 4 / 0 4 7 / 5 0 unreachable / 2 5 8`,
+  and the worker *independently flagged that the prompt's* `0->5 = 7`
+  expectation was wrong, computing `0→2→1→3→4→5 = 9` — an integer-arithmetic
+  sanity check that the result is computed, not sycophantically echoed.
+- `STRESS_OK all_pairs=40000` — the heap and O(V²) implementations agreed on
+  all 200×200 pairs of a 200-node/2000-edge random graph.
+
+Evidence value: the fat pebble image's C++ toolchain works, `std::priority_queue`
+Dijkstra is proven correct against an independent brute force on 40,000 pairs,
+and the worker caught a genuine error in the (autonomous-agent-authored) task
+prompt rather than reproducing it.
+
+### pebble — task D: generic ring buffer with iterators + `Summarize` trait (Rust)
+
+Job `9a6c9aed…` (`external:pebble`, `completed`, 121 s).
+
+- `rustc 1.96.1` / `cargo 1.96.1`; `test result: ok. 12 passed; 0 failed`.
+- `summarize()` on the wrapped buffer holding the last 8 of `1..=100` returned
+  `n=8 sum=772 min=93 max=100` — `sum(93..=100) = 772`, arithmetically exact,
+  proving the 1000-push/16-capacity churn retained exactly the last 8 values in
+  order.
+- Full `src/ring.rs` returned, with safe `MaybeUninit` handling, wrap-aware
+  `phys_index`, `into_iter`/`Iter`, and a degenerate zero-capacity guard.
+
+Evidence value: the pebble lane's Rust toolchain works (same 1.96.1 pin), the
+generics + iterators + trait constraints all compile and test, and the wrap
+arithmetic is verified by the exact-sum check.
+
+## Landed-changes exercise matrix
+
+| Area | Evidence on mistyfly |
+| --- | --- |
+| kimi worker lane | fat image, kimi-code **2.3.0**, `job_mode=external:kimi`; two real jobs completed |
+| pebble worker lane | fat image, pebble **0.5.0** (`pebble-worker-0.1.0` bridge), `openai/gpt-5.2`; two real jobs completed after the F5 egress fix |
+| Full toolchains (the item's explicit ask) | kimi image: rustc 1.96.1, go 1.24.3 — both exercised in-container. pebble image: g++ 12.2.0, rustc 1.96.1 — both exercised in-container |
+| WI#357 workers never self-expose | `worker-listeners mistyfly` → `clean` |
+| WI#424 egress enforcement | first fresh tenant on this host to allocate a subnet; both workers `attached (exclusive, DNS pinned, static hosts current)` |
+| WI#330 no-default LLM endpoint | `KIMI_BASE_URL_SOURCE=inherited`; LLM endpoint inherited, jobs called it successfully |
+| WI#472 approval thread resolution | 404 (no gate) / 400 (wrong thread) verified live |
+| WI#471 pebble key quoting | all four rejection arms verified live, no `pebble.env` written |
+| Knowledge seed + sweep + study MCP | 1795 notes seeded / 20 failed; `study_notes` MCP active; sweep ran (F4 documents the refresh failure) |
+| WASM channel/tool suite | 3 channels + 9 tools; 13 extensions total |
+| Workspace-overlap exclusivity | second concurrent kimi dispatch refused with the exact ownership error |
+
+## Disposition
+
+The tenant is **left running** (all services boot-persistent under OpenRC) for
+maintainer inspection:
+
+```bash
+sudo bash ic/scripts/lunarwing-mt-admin.sh status mistyfly
+sudo -u mistyfly bash -c 'XDG_RUNTIME_DIR=/run/user/$(id -u mistyfly) podman ps'
+```
+
+`mistyfly` is not an animal name and comes from the WI#273 list, so the
+teardown routine must not target it. To decommission later anyway:
+`sudo bash ic/scripts/lunarwing-mt-admin.sh remove-tenant mistyfly --purge`.
+
+One operational note for whoever later decommissions: the F4 knowledge refresh
+is in permanent backoff (`consecutive_failures` climbing), because the shared
+corpus still carries the raw-NUL note; that does not block the tenant but means
+it serves a stale corpus until WI#436 item 1 lands upstream.
