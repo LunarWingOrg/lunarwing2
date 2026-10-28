@@ -257,9 +257,10 @@ ENV GOROOT=/usr/local/go \
 # ── non-root user ──────────────────────
 # Keep IDs synchronized with ic/scripts/lunarwing-mt-admin.sh (opencode2 =
 # 10003, distinct from opencode 10001 and kimi 10002) so two opencode lanes on
-# one tenant keep separate userns identities.
+# one tenant keep separate userns identities. WI#454 adds the bridge identity.
 RUN groupadd --gid 10003 opencode2 \
-    && useradd --uid 10003 --gid 10003 -m -d /home/opencode2 opencode2
+    && useradd --uid 10003 --gid 10003 -m -d /home/opencode2 opencode2 \
+    && useradd --uid 10103 --gid 10003 -m -d /home/opencode2-bridge opencode2-bridge
 
 # ── app layout ─────────────────────────
 WORKDIR /app
@@ -277,7 +278,7 @@ COPY --from=builder /build/opencode/packages/schema/package.json /app/node_modul
 COPY --from=builder /build/opencode/packages/protocol/src /app/node_modules/@opencode/protocol/src
 COPY --from=builder /build/opencode/packages/protocol/package.json /app/node_modules/@opencode/protocol/package.json
 
-COPY entrypoint.sh health_server.py agent_comm_protocol.json ./
+COPY entrypoint.sh entrypoint-split.sh health_server.py agent_comm_protocol.json ./
 # WI#357 (run-79 EI-5): the exposure controls (wrapper, policy assert,
 # compile-out guard, lane config) must be root-owned and read-only — the
 # agent user gets edit/write on the workspace, so an agent-writable config
@@ -290,8 +291,8 @@ COPY entrypoint.sh health_server.py agent_comm_protocol.json ./
 COPY scripts/ ./scripts/
 COPY config/ ./config/
 
-RUN chmod +x /app/entrypoint.sh /app/health_server.py \
-    && chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/health_server.py /app/agent_comm_protocol.json
+RUN chmod +x /app/entrypoint.sh /app/entrypoint-split.sh /app/health_server.py \
+    && chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/entrypoint-split.sh /app/health_server.py /app/agent_comm_protocol.json
 
 # WI#357: install the exposure-guard wrapper as the only PATH-visible
 # opencode entrypoint, then fail the BUILD when the policy regresses:
@@ -369,6 +370,7 @@ RUN set -eu; \
     && bun scripts/lunarwing_tool_proxy_test.ts \
     && bun scripts/lunarwing_tool_plugin_test.ts \
     && bun scripts/lunarwing_bridge_test.ts \
+    && bun test scripts/task_runner_test.ts \
     && python3 scripts/prepare_reproducible_build_test.py \
     && python3 scripts/study_notes_config_test.py \
     && python3 scripts/exposure_policy_assert_test.py \
@@ -388,6 +390,10 @@ RUN mkdir -p /home/opencode2/.local/share/opencode \
              /var/log/lunarwing \
              /app/results \
     && chown -R opencode2:opencode2 /home/opencode2 /workspace /var/log/lunarwing /app/results
+
+RUN mkdir -p /run/lunarwing-shared \
+    && chown root:opencode2 /run/lunarwing-shared \
+    && chmod 2770 /run/lunarwing-shared
 
 # cp -a preserves setgid from the builder's source directories. Dependencies
 # stay root-owned and readable, with privilege and write bits stripped.
@@ -415,6 +421,9 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
 
 STOPSIGNAL SIGTERM
 
+ENV OPENCODE2_TASK_UID=10003 \
+    OPENCODE2_TASK_GID=10003 \
+    OPENCODE2_BRIDGE_UID=10103
 USER 10003:10003
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
