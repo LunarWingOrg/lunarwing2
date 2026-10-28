@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { after, test } from "node:test"
 import { connect, type Socket } from "node:net"
-import { existsSync, mkdtempSync, rmSync, symlinkSync, mkdirSync, writeFileSync, chmodSync } from "node:fs"
+import { existsSync, mkdtempSync, rmSync, statSync, symlinkSync, mkdirSync, writeFileSync, chmodSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -363,6 +363,23 @@ test("listen replaces a stale socket file", async () => {
   const path = await runner.listen(join(socketDir, "runner.sock"))
   assert.ok(path, "listen must replace the stale socket")
   runner.close()
+})
+
+test("shared task container sockets allow bridge-group access", async () => {
+  const previous = process.env.LUNARWING_TASK_RUNNER_REMOTE
+  const socketDir = scratch()
+  const runner = new TaskRunner(scratch())
+  process.env.LUNARWING_TASK_RUNNER_REMOTE = "1"
+  try {
+    const path = await runner.listen(join(socketDir, "runner.sock"))
+    assert.ok(path, "shared runner must listen")
+    assert.equal(statSync(socketDir).mode & 0o777, 0o711)
+    assert.equal(statSync(path).mode & 0o777, 0o660)
+  } finally {
+    runner.close()
+    if (previous === undefined) delete process.env.LUNARWING_TASK_RUNNER_REMOTE
+    else process.env.LUNARWING_TASK_RUNNER_REMOTE = previous
+  }
 })
 
 test("NB-13: closing the bridge connection aborts the in-flight run", async () => {
