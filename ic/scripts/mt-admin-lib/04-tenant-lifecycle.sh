@@ -942,8 +942,53 @@ _restart_tenant_daemon() {
   fi
 }
 
+_start_tenant_workers() {
+  local name="$1" worker worker_rc restore_errexit=false failed_workers=""
+  START_TENANT_FAILED_WORKERS=()
+  [[ "$-" == *e* ]] && restore_errexit=true
+  set +e
+  for worker in pebble opencode kimi opencode2; do
+    if tenant_worker_enabled "$name" "$worker" \
+        && { [[ "$INIT_SYSTEM" != "openrc" ]] || tenant_worker_desired_running "$name" "$worker"; }; then
+      (
+        set -e
+        "start_tenant_${worker}" "$name"
+      )
+      worker_rc=$?
+      if [[ "$worker_rc" -eq 3 ]]; then
+        say "WARNING: $worker worker failed to start for $name; continuing" >&2
+        START_TENANT_FAILED_WORKERS+=("$worker")
+        failed_workers+="${failed_workers:+ }$worker"
+      elif [[ "$worker_rc" -ne 0 ]]; then
+        START_TENANT_FAILED_WORKERS+=("$worker")
+        if [[ "$restore_errexit" == true ]]; then
+          set -e
+        fi
+        return "$worker_rc"
+      fi
+    elif [[ "$INIT_SYSTEM" == "openrc" ]] && tenant_worker_enabled "$name" "$worker"; then
+      say "$worker worker intentionally stopped for $name (skipping; use 'start-worker $name $worker')"
+    else
+      say "$worker worker not selected for $name (skipping; enable with 'add-tenant $name --with-$worker')"
+    fi
+  done
+  if [[ -n "$failed_workers" ]]; then
+    say "WARNING: workers failed to start for $name: $failed_workers" >&2
+    worker_rc=1
+  else
+    worker_rc=0
+  fi
+  if [[ "$restore_errexit" == true ]]; then
+    set -e
+  else
+    set +e
+  fi
+  return "$worker_rc"
+}
+
 start_tenant() {
   local name="$1"
+  START_TENANT_FAILED_WORKERS=()
   name="$(sanitize_name "$name")"
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
 
@@ -1075,17 +1120,17 @@ start_tenant() {
   # host image happens to exist — regardless of what this tenant chose — because
   # its only guards are "port allocated" (always true) and "image present"
   # (host-wide). See tenant_worker_enabled / PER_TENANT_WORKER_GATING.md.
-  local _w
-  for _w in pebble opencode kimi opencode2; do
-    if tenant_worker_enabled "$name" "$_w" \
-        && { [[ "$INIT_SYSTEM" != "openrc" ]] || tenant_worker_desired_running "$name" "$_w"; }; then
-      "start_tenant_${_w}" "$name"
-    elif [[ "$INIT_SYSTEM" == "openrc" ]] && tenant_worker_enabled "$name" "$_w"; then
-      say "$_w worker intentionally stopped for $name (skipping; use 'start-worker $name $_w')"
-    else
-      say "$_w worker not selected for $name (skipping; enable with 'add-tenant $name --with-$_w')"
-    fi
-  done
+  local worker_start_rc restore_errexit=false
+  [[ "$-" == *e* ]] && restore_errexit=true
+  set +e
+  _start_tenant_workers "$name"
+  worker_start_rc=$?
+  if [[ "$restore_errexit" == true ]]; then
+    set -e
+  fi
+  if [[ "$worker_start_rc" -ne 0 ]]; then
+    return "$worker_start_rc"
+  fi
   _ssh_ready_summary "$name" || true
 }
 
@@ -1591,7 +1636,15 @@ upgrade_tenant_locked() {
   fi
 
   patch_tenant_env "$name"
+  local worker_start_rc=0 restore_errexit=false failed_workers=""
+  [[ "$-" == *e* ]] && restore_errexit=true
+  set +e
   start_tenant "$name"
+  worker_start_rc=$?
+  if [[ "$restore_errexit" == true ]]; then
+    set -e
+  fi
+  failed_workers="${START_TENANT_FAILED_WORKERS[*]:-}"
   refresh_deployed_health_pipeline
 
   # Pre-1.1.9 units embed renamed adapter paths that only keep working through
@@ -1605,8 +1658,18 @@ upgrade_tenant_locked() {
     say "$stale"
   fi
 
+  local upgraded_to
+  upgraded_to="$("${tgit[@]}" describe --tags --always 2>/dev/null)"
+  if [[ "$worker_start_rc" -ne 0 ]]; then
+    [[ -n "$failed_workers" ]] || failed_workers="none identified"
+    say ""
+    say "tenant '$name' reached $upgraded_to, but worker startup failed (status $worker_start_rc; failed workers: $failed_workers)"
+    say "verify with: $0 status $name"
+    return "$worker_start_rc"
+  fi
+
   say ""
-  say "tenant '$name' upgraded: $before -> $("${tgit[@]}" describe --tags --always 2>/dev/null)"
+  say "tenant '$name' upgraded: $before -> $upgraded_to"
   say "verify with: $0 status $name"
 }
 
