@@ -256,6 +256,25 @@ else
   fail "upgrade did not refresh an installed health pipeline: $output"
 fi
 
+# WI#469: the upgrade still refreshes health but returns the worker-start
+# failure instead of printing the success summary.
+move_ref_on_stop=false
+worker_failure_health_before="$(wc -l <"$health_refresh_log")"
+start_tenant() {
+  START_TENANT_FAILED_WORKERS=(pebble opencode)
+  return 1
+}
+if output="$(upgrade_tenant fixture "$target" '' false false 2>&1)"; then
+  fail 'upgrade succeeded after worker startup failed (WI#469 QT-2)'
+elif [[ "$output" == *'worker startup failed'* \
+    && "$output" == *'failed workers: pebble opencode'* \
+    && "$output" != *"tenant 'fixture' upgraded:"* \
+    && "$(wc -l <"$health_refresh_log")" -eq $((worker_failure_health_before + 1)) ]]; then
+  pass 'upgrade reports failed lanes, refreshes health and returns failure (WI#469 QT-2)'
+else
+  fail "upgrade lost worker failure status or summary: $output"
+fi
+
 # !1547 EG-1/EP-4: migration precedes backup probes; a proxy-enabled OpenRC
 # tenant is env-validated (not fully re-rendered) before stop, so stop keeps the
 # installed unit contract. --skip-render cannot bypass fleet neutralization.
