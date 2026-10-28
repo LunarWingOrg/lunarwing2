@@ -127,7 +127,10 @@ with_tenant_lifecycle_lock() {
       || die "invalid inherited tenant lifecycle lock"
     LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD="$lock_fd"
     LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT="$name"
-    "$@" || result=$?
+    set +e
+    "$@"
+    result=$?
+    set -e
     result="${result:-0}"
     unset LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT
     return "$result"
@@ -139,7 +142,10 @@ with_tenant_lifecycle_lock() {
   fi
   LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD="$lock_fd"
   LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT="$name"
-  "$@" || result=$?
+  set +e
+  "$@"
+  result=$?
+  set -e
   result="${result:-0}"
   unset LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT
   flock -u "$lock_fd" || result=1
