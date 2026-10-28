@@ -262,6 +262,7 @@ move_ref_on_stop=false
 worker_failure_health_before="$(wc -l <"$health_refresh_log")"
 start_tenant() {
   START_TENANT_FAILED_WORKERS=(pebble opencode)
+  printf '%s\n' "${START_TENANT_FAILED_WORKERS[*]}" >"$fixture/failed-start-workers"
   return 1
 }
 if output="$(upgrade_tenant fixture "$target" '' false false 2>&1)"; then
@@ -269,6 +270,7 @@ if output="$(upgrade_tenant fixture "$target" '' false false 2>&1)"; then
 elif [[ "$output" == *'worker startup failed'* \
     && "$output" == *'failed workers: pebble opencode'* \
     && "$output" != *"tenant 'fixture' upgraded:"* \
+    && "$(<"$fixture/failed-start-workers")" == 'pebble opencode' \
     && "$(wc -l <"$health_refresh_log")" -eq $((worker_failure_health_before + 1)) ]]; then
   pass 'upgrade reports failed lanes, refreshes health and returns failure (WI#469 QT-2)'
 else
