@@ -454,3 +454,39 @@ forever-stale corpus.
 
 This is not new work for this pass — it is the same open WI#436 item, now
 confirmed still open on the v2.1.7 tree.
+
+Live state on `mistyfly`, showing exactly the predicted seed-vs-refresh
+asymmetry:
+
+`state/knowledge_seed_state.json` — the one-shot seed **succeeded**, absorbing
+per-note failures as a count:
+
+```json
+{
+  "seeded_at": "2026-10-28T06:42:36.063977186Z",
+  "source_home": "/var/cache/lunarwing/lw2studymcp",
+  "notes_seeded": 1795,
+  "notes_skipped_existing": 26,
+  "notes_failed": 20
+}
+```
+
+`state/knowledge_sync_state.json` — the hourly additive refresh has **never**
+succeeded and is in permanent backoff:
+
+```json
+{
+  "schema_version": 1,
+  "completed_source_revision": null,
+  "last_attempt_at": "2026-10-28T07:19:09.313471829Z",
+  "last_success_at": null,
+  "consecutive_failures": 6,
+  "last_error_class": "note_import_failed",
+  "notes_added_last_run": 0,
+  "notes_deferred_last_run": 0
+}
+```
+
+`completed_source_revision: null` with six consecutive failures inside ~37
+minutes of boot is the signature: the tenant is functional on its seeded corpus
+but can never pick up a corpus update.
