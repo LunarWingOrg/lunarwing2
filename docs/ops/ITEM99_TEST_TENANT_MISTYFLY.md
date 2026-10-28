@@ -814,14 +814,16 @@ after run 250 and confirmed open against this tree:
 | finding | work item | severity label | one-line mechanism |
 | --- | --- | --- | --- |
 | F1 — worker source-root asymmetry | [WI#507](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/507) | medium, mt-admin / tech-debt | `build_pebble_worker` takes no tenant source root, so tenant pebble images build from the operator's live checkout and stamp its moving, possibly dirty revision |
-| F2 — egress apply fail-closed deadlock | [WI#504](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/504) | high, mt-admin / security | `worker_egress_apply` loads and verifies in separate `podman unshare --rootless-netns` invocations, so the first worker start fails closed with no netns keeper running |
+| F2 — egress apply fail-closed deadlock | [WI#504](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/504) | high, mt-admin / security | originally separate unshare sessions plus an unpinned namespace; item 114 adds the pause keeper and shared single-session guard, verified with the live cold-start fixture described in F2 above; full tenant deployment remains an operator check |
 | F2b — orphaned tenant lifecycle lock | [WI#505](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/505) | high, mt-admin / reliability | the lock descriptor is inherited by OpenRC daemons started inside the locked section, so a `die()` leaves the flock held and every later lifecycle command blocks |
 | F5 — no pebble backend in the allowlist | [WI#506](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/506) | medium, mt-admin / network | a `--with-pebble` tenant has no allowlist entry for pebble's model backend, so every pebble job fails on an egress-enforcing host |
 | F2a — launch-args status bug | **fixed on this branch** (`64442bffa`) | — | the IP-only allowlist made `worker_egress_launch_args` return 1 after printing valid args |
 | F3 — prior-pass findings (numbering is thunderlane's, not this report's) | WI#471 / WI#472 / WI#473 fixed, WI#436 item 1 still open | — | three of four named prior findings landed and are regression-verified live on mistyfly |
 | F4 — knowledge-sync seed/refresh asymmetry | WI#436 item 1 | — | one bad corpus note still poisons the whole refresh |
 
-F2a is closed by this MR; the other four are recorded here and owned upstream.
+F2a was closed by the original item-99 MR. Item 114 supplies the F2 fix and
+isolated live evidence above; WI#504 stays open for maintainer acceptance. F1,
+F2b and F5 remain owned by their separate upstream work items.
 
 ## Disposition
 
