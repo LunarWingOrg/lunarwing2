@@ -213,6 +213,43 @@ use_init() {  # <systemd|openrc>
   eval "ensure_init_system() { INIT_SYSTEM=\"$init\"; }"
 }
 
+# WI#469 QX-4: an unallocated port is still a successful skip with the real
+# starter under errexit. Do not invoke it in an if/|| condition, which would
+# suppress errexit and hide an unguarded ports_get assignment. Use a file for
+# runtime calls so observations survive the command-substitution subshell.
+missing_worker_port_skip() {  # <worker> <init>
+  local worker="$1" init="$2" out rc
+  local calls="$fixture/missing-port-${init}-${worker}-calls"
+  : >"$calls"
+  set +e
+  out="$(
+    set -e
+    ports_get() { return 1; }
+    say() { printf '%s\n' "$*"; }
+    _ctr() { printf 'ctr:%s\n' "$*" >>"$calls"; return 99; }
+    _systemctl_user() { printf 'systemctl:%s\n' "$*" >>"$calls"; return 99; }
+    "start_tenant_${worker}" alice
+  )"
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    fail "$worker $init: unallocated port returned $rc instead of a soft skip (WI#469 QX-4)"
+  elif [[ "$out" != "no ${worker}_wss port allocated for alice (skipping $worker worker)" ]]; then
+    fail "$worker $init: unallocated port missed its skip message (WI#469 QX-4)"
+  elif [[ -s "$calls" ]]; then
+    fail "$worker $init: unallocated port reached the container runtime (WI#469 QX-4)"
+  else
+    pass "$worker $init: unallocated port skips successfully before container start (WI#469 QX-4)"
+  fi
+}
+for init in systemd openrc; do
+  use_init "$init"
+  ensure_init_system
+  for worker in pebble opencode kimi opencode2; do
+    missing_worker_port_skip "$worker" "$init"
+  done
+done
+
 # Seed the stored hash exactly as a container created from image A leaves it,
 # then prove the next start-tenant is quiet on A and force-recreates on B.
 imperative_scenario() {  # <worker>
@@ -346,8 +383,9 @@ else
 fi
 
 # ── WI#400 / WI#469: every image-user guard refuses before container start ──
-# Status 3 is the lane-local stale-image outcome. Diagnostics must sanitize the
-# inspected Config.User, not pass it as a printf format or raw terminal text.
+# Image-user refusals retain status 3 for direct starters; the worker pass
+# aggregates all nonzero statuses alike. Diagnostics must sanitize the inspected
+# Config.User, not pass it as a printf format or raw terminal text.
 image_user_refusal() {  # <worker> <stale Config.User> [expected wording]
   local worker="$1" stale="$2" expected="${3:-expected 0:0}" out safe_stale rc
   safe_stale="$(sanitize_display_value "${stale:-unset}")"

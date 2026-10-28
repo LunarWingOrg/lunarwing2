@@ -196,8 +196,12 @@ self-healing).
   which made sure a rebuilt image existed and documented the one-command
   remediation. WI#469 later made that refusal lane-local: `start-tenant`
   warns and attempts every later selected worker, then exits nonzero with a
-  summary of failed lanes. Other fatal starter errors are unchanged, and
-  `upgrade-tenant` returns the same failure after refreshing deployed health.
+  summary of failed lanes. This applies to every nonzero lane-starter status,
+  not just the image refusal: each lane still stops at its first unhandled
+  error, while later selected lanes get independent guarded attempts. The
+  aggregate status is 1 if any lane failed. `upgrade-tenant` returns that
+  failure after refreshing deployed health; direct single-worker commands
+  retain their starter's original status.
 - `_ensure_tenant_image`'s stale-accept branch (admin store empty → tenant's
   copy wins) is unchanged: the image-user guard is the loud backstop, and
   changing the accept rule would break offline fleets where only a tenant

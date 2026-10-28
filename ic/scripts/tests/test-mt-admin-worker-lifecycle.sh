@@ -346,9 +346,9 @@ test_stale_worker_failures_are_aggregated() (
   grep -Fxq 'WARNING: workers failed to start for alice: pebble opencode' "$messages" || return 1
 )
 
-test_inner_worker_failure_stays_fatal() (
-  local calls="$fixture/fatal-worker-calls" messages="$fixture/fatal-worker-messages"
-  local expected=$'pebble\nctr:alice run lunarwing-pebble-alice' rc
+test_inner_worker_failure_is_lane_local() (
+  local calls="$fixture/inner-worker-calls" messages="$fixture/inner-worker-messages"
+  local expected=$'pebble\nctr:alice run lunarwing-pebble-alice\nopencode\nkimi\nopencode2' rc
   : >"$calls"
   : >"$messages"
   INIT_SYSTEM=systemd
@@ -366,15 +366,84 @@ test_inner_worker_failure_stays_fatal() (
 
   _start_tenant_workers alice
   rc=$?
-  [[ "$rc" -eq 125 ]] || return 1
+  [[ "$rc" -eq 1 ]] || return 1
   [[ "$(<"$calls")" == "$expected" ]] || return 1
   [[ "${START_TENANT_FAILED_WORKERS[*]}" == pebble ]] || return 1
-  [[ ! -s "$messages" ]]
+  [[ "$(grep -c '^WARNING: ' "$messages")" == 2 ]] || return 1
+  grep -Fxq 'WARNING: workers failed to start for alice: pebble' "$messages"
+)
+
+# QX-1/QX-2: unrelated guard statuses (including an exit-3 collision) must
+# never start the refused lane or silence the rest, on either init path.
+test_egress_failures_are_lane_local_for_both_inits() (
+  local calls="$fixture/egress-worker-calls" messages="$fixture/egress-worker-messages" rc
+  local expected=$'egress:pebble\negress:opencode\negress:kimi\negress:opencode2'
+  tenant_worker_enabled() { return 0; }
+  tenant_worker_desired_running() { return 0; }
+  prepare_worker_egress() {
+    printf 'egress:%s\n' "$2" >>"$calls"
+    case "$2" in
+      pebble) return 1 ;;
+      opencode) exit 3 ;;
+      kimi) return 125 ;;
+      opencode2) return 42 ;;
+    esac
+  }
+  guarded_starter() {
+    prepare_worker_egress "$@"
+    printf 'UNSAFE-CONTAINER-START:%s\n' "$2" >>"$calls"
+  }
+  start_tenant_pebble() { guarded_starter "$1" pebble; }
+  start_tenant_opencode() { guarded_starter "$1" opencode; }
+  start_tenant_kimi() { guarded_starter "$1" kimi; }
+  start_tenant_opencode2() { guarded_starter "$1" opencode2; }
+  say() { printf '%s\n' "$*" >>"$messages"; }
+
+  for INIT_SYSTEM in systemd openrc; do
+    : >"$calls"
+    : >"$messages"
+    _start_tenant_workers alice
+    rc=$?
+    [[ "$rc" -eq 1 ]] || return 1
+    [[ "$(<"$calls")" == "$expected" ]] || return 1
+    [[ "${START_TENANT_FAILED_WORKERS[*]}" == 'pebble opencode kimi opencode2' ]] || return 1
+    [[ "$(grep -c '^WARNING: ' "$messages")" == 5 ]] || return 1
+    grep -Fxq 'WARNING: workers failed to start for alice: pebble opencode kimi opencode2' "$messages" || return 1
+  done
+)
+
+test_worker_start_preserves_selection_and_desired_state() (
+  local calls="$fixture/selected-worker-calls" expected rc errexit_after
+  tenant_worker_enabled() { [[ "$2" != opencode ]]; }
+  tenant_worker_desired_running() { [[ "$2" != kimi ]]; }
+  start_tenant_pebble() { printf 'pebble\n' >>"$calls"; }
+  start_tenant_opencode() { printf 'opencode\n' >>"$calls"; }
+  start_tenant_kimi() { printf 'kimi\n' >>"$calls"; }
+  start_tenant_opencode2() { printf 'opencode2\n' >>"$calls"; }
+  say() { :; }
+
+  for INIT_SYSTEM in systemd openrc; do
+    : >"$calls"
+    START_TENANT_FAILED_WORKERS=(previous-failure)
+    set -e
+    _start_tenant_workers alice
+    rc=$?
+    errexit_after="$-"
+    set +e
+    [[ "$rc" -eq 0 && "$errexit_after" == *e* ]] || return 1
+    [[ "${#START_TENANT_FAILED_WORKERS[@]}" -eq 0 ]] || return 1
+    if [[ "$INIT_SYSTEM" == systemd ]]; then
+      expected=$'pebble\nkimi\nopencode2'
+    else
+      expected=$'pebble\nopencode2'
+    fi
+    [[ "$(<"$calls")" == "$expected" ]] || return 1
+  done
 )
 
 test_lifecycle_lock_preserves_worker_status_and_errexit() (
   local calls="$fixture/locked-worker-calls" messages="$fixture/locked-worker-messages"
-  local expected=$'flock:-x\npebble\nctr:alice run lunarwing-pebble-alice\nflock:-u' rc
+  local expected=$'flock:-x\npebble\nctr:alice run lunarwing-pebble-alice\nopencode\nkimi\nopencode2\nflock:-u' rc
   : >"$calls"
   : >"$messages"
   TENANT_LIFECYCLE_LOCK_DIR="$fixture/lifecycle-locks"
@@ -403,16 +472,21 @@ test_lifecycle_lock_preserves_worker_status_and_errexit() (
   rc=$?
   local errexit_after="$-"
   set -e
-  [[ "$rc" -eq 125 ]] || return 1
+  [[ "$rc" -eq 1 ]] || return 1
   [[ "$errexit_after" != *e* ]] || return 1
   [[ "$(<"$calls")" == "$expected" ]] || return 1
-  [[ ! -s "$messages" ]]
+  [[ "${START_TENANT_FAILED_WORKERS[*]}" == pebble ]] || return 1
+  [[ "$(grep -c '^WARNING: ' "$messages")" == 2 ]]
 )
 
 run_worker_start_case test_stale_worker_failures_are_aggregated \
   'stale workers continue and aggregate failed lanes (WI#469)'
-run_worker_start_case test_inner_worker_failure_stays_fatal \
-  'unexpected starter failures preserve status and stop later lanes (WI#469)'
+run_worker_start_case test_inner_worker_failure_is_lane_local \
+  'unexpected starter failure stops only its own lane (WI#469 QX-2)'
+run_worker_start_case test_egress_failures_are_lane_local_for_both_inits \
+  'egress failures of any status stay fail-closed and aggregate on both inits (WI#469 QX-1/QX-2)'
+run_worker_start_case test_worker_start_preserves_selection_and_desired_state \
+  'worker start pass preserves selection, desired state and caller errexit (WI#469)'
 run_worker_start_case test_lifecycle_lock_preserves_worker_status_and_errexit \
   'lifecycle lock preserves worker failure status and caller errexit (WI#469)'
 

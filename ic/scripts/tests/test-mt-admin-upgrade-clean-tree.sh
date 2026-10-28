@@ -257,20 +257,41 @@ else
 fi
 
 # WI#469: the upgrade still refreshes health but returns the worker-start
-# failure instead of printing the success summary.
+# failure instead of printing the success summary. Exercise the real worker
+# pass with mixed statuses, rather than pre-populating its failure array.
 move_ref_on_stop=false
 worker_failure_health_before="$(wc -l <"$health_refresh_log")"
-start_tenant() {
-  START_TENANT_FAILED_WORKERS=(pebble opencode)
-  printf '%s\n' "${START_TENANT_FAILED_WORKERS[*]}" >"$fixture/failed-start-workers"
-  return 1
+worker_attempts="$fixture/worker-attempts"
+: >"$worker_attempts"
+start_tenant_pebble() { printf 'pebble\n' >>"$worker_attempts"; }
+start_tenant_opencode() { printf 'opencode\n' >>"$worker_attempts"; return 3; }
+worker_guard_failure() { return 125; }
+start_tenant_kimi() {
+  printf 'kimi\n' >>"$worker_attempts"
+  worker_guard_failure
+  printf 'UNSAFE-KIMI-START\n' >>"$worker_attempts"
 }
-if output="$(upgrade_tenant fixture "$target" '' false false 2>&1)"; then
+start_tenant_opencode2() { printf 'opencode2\n' >>"$worker_attempts"; }
+start_tenant() {
+  local rc
+  _start_tenant_workers "$1"
+  rc=$?
+  printf '%s\n' "${START_TENANT_FAILED_WORKERS[*]}" >"$fixture/failed-start-workers"
+  return "$rc"
+}
+# Do not put the invocation in an if/|| test: that disables the inner lane's
+# errexit and would test a different execution context from the CLI.
+set +e
+output="$(upgrade_tenant fixture "$target" '' false false 2>&1)"
+worker_upgrade_rc=$?
+set -e
+if [[ "$worker_upgrade_rc" -eq 0 ]]; then
   fail 'upgrade succeeded after worker startup failed (WI#469 QT-2)'
-elif [[ "$output" == *'worker startup failed'* \
-    && "$output" == *'failed workers: pebble opencode'* \
+elif [[ "$worker_upgrade_rc" -eq 1 && "$output" == *'worker startup failed'* \
+    && "$output" == *'failed workers: opencode kimi'* \
     && "$output" != *"tenant 'fixture' upgraded:"* \
-    && "$(<"$fixture/failed-start-workers")" == 'pebble opencode' \
+    && "$(<"$fixture/failed-start-workers")" == 'opencode kimi' \
+    && "$(<"$worker_attempts")" == $'opencode\nkimi' \
     && "$(wc -l <"$health_refresh_log")" -eq $((worker_failure_health_before + 1)) ]]; then
   pass 'upgrade reports failed lanes, refreshes health and returns failure (WI#469 QT-2)'
 else

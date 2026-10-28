@@ -1787,10 +1787,14 @@ has no rebuilt copy — `_ensure_tenant_image`'s admin-store-empty branch keeps
 the stale tenant copy in play, and `start_tenant_kimi`'s image-user guard
 (`ic/scripts/mt-admin-lib/09-worker-config.sh`) refuses the lane, leaving
 the daemon-side `[[sandbox.external_workers]]` route hot against a dead
-socket. Same class as the pebble WI#452. Since WI#469, this refusal is
-lane-local: `start-tenant` emits a sanitized rebuild error, attempts every
-later selected worker, then exits nonzero with a summary naming failed lanes.
-Other starter failures still abort the pass with their original status.
+socket. Same class as the pebble WI#452. Since WI#469, worker startup failures
+are lane-local: `start-tenant` reports each failure, attempts every later
+selected worker, then exits 1 with a summary naming all failed lanes. No exit
+code is interpreted as a particular refusal reason: image, egress and runtime
+errors are aggregated uniformly. Each lane retains its errexit-enabled
+subshell, so an unhandled guard failure stops that lane before its subsequent
+container start; continuing other lanes does not bypass their guards.
+An unallocated worker WSS port remains a successful skip, not a failed lane.
 `upgrade-tenant` also refreshes deployed health, reports the failed lanes, and
 returns nonzero instead of claiming a full success. **Remediation:**
 `sudo ic/scripts/lunarwing-mt-admin.sh build-kimi-worker`, then

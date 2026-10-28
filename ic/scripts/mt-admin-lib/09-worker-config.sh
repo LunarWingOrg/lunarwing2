@@ -2526,7 +2526,7 @@ start_tenant_pebble() {
   ensure_container_runtime
 
   local wss_port container_name
-  wss_port="$(ports_get "$name" pebble_wss)"
+  wss_port="$(ports_get "$name" pebble_wss)" || true
   container_name="lunarwing-pebble-$name"
 
   if [[ -z "$wss_port" ]]; then

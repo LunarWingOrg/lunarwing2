@@ -942,6 +942,10 @@ _restart_tenant_daemon() {
   fi
 }
 
+# Keep failures local to the lane, not to a particular exit code: external
+# commands and guards can return the same status as an image-user refusal.
+# A failed lane still stops at its first unhandled error; later selected lanes
+# get their own attempt, and the whole pass fails if any attempt failed.
 _start_tenant_workers() {
   local name="$1" worker worker_rc restore_errexit=false failed_workers=""
   START_TENANT_FAILED_WORKERS=()
@@ -955,16 +959,10 @@ _start_tenant_workers() {
         "start_tenant_${worker}" "$name"
       )
       worker_rc=$?
-      if [[ "$worker_rc" -eq 3 ]]; then
+      if [[ "$worker_rc" -ne 0 ]]; then
         say "WARNING: $worker worker failed to start for $name; continuing" >&2
         START_TENANT_FAILED_WORKERS+=("$worker")
         failed_workers+="${failed_workers:+ }$worker"
-      elif [[ "$worker_rc" -ne 0 ]]; then
-        START_TENANT_FAILED_WORKERS+=("$worker")
-        if [[ "$restore_errexit" == true ]]; then
-          set -e
-        fi
-        return "$worker_rc"
       fi
     elif [[ "$INIT_SYSTEM" == "openrc" ]] && tenant_worker_enabled "$name" "$worker"; then
       say "$worker worker intentionally stopped for $name (skipping; use 'start-worker $name $worker')"
