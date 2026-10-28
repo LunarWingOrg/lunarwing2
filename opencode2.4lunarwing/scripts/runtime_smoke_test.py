@@ -461,7 +461,17 @@ class CliWiringTests(unittest.TestCase):
             self.assertEqual(len(payload["results"]), 5)
 
 
+# The image copies only scripts/ into /app; the Dockerfile and .gitlab/ stay
+# in the checkout. These wiring checks read them, so they run only there.
+_LANE = Path(__file__).resolve().parents[1]
+_IN_CHECKOUT = (_LANE / "Dockerfile").is_file() and (
+    _LANE.parent / ".gitlab/scripts/build-worker-image.sh"
+).is_file()
+_CHECKOUT_ONLY = "checkout-only wiring check: the image has no Dockerfile or .gitlab/"
+
+
 class CandidateBuildWiringTests(unittest.TestCase):
+    @unittest.skipUnless(_IN_CHECKOUT, _CHECKOUT_ONLY)
     def test_candidate_runs_smoke_against_the_started_entrypoint(self) -> None:
         lane = Path(__file__).resolve().parents[1]
         dockerfile = (lane / "Dockerfile").read_text()
@@ -486,6 +496,7 @@ class CandidateBuildWiringTests(unittest.TestCase):
         self.assertNotIn("su -s", runner)
         self.assertIn("setpriv is missing", runner)
 
+    @unittest.skipUnless(_IN_CHECKOUT, _CHECKOUT_ONLY)
     def test_candidate_input_manifest_includes_the_entrypoint_runner(self) -> None:
         repo = Path(__file__).resolve().parents[2]
         manifest = (repo / ".gitlab/scripts/build-worker-image.sh").read_text()
