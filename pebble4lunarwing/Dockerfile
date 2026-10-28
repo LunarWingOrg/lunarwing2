@@ -230,6 +230,7 @@ RUN chmod 0755 /usr/local/bin/pebble /usr/local/lib/pebble/pebble \
     && [ "$(stat -c %a /usr/local/bin/pebble)" = "755" ] \
     && [ "$(stat -c %U /usr/local/bin/pebble)" = "root" ]
 COPY pebble4lunarwing/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY pebble4lunarwing/entrypoint-split.sh /usr/local/bin/entrypoint-split.sh
 
 # WI#324: register the LunarWing tool-proxy MCP shim for `pebble` runs.
 # Pebble discovers mcpServers from $PEBBLE_CONFIG_HOME/settings.json
@@ -249,23 +250,26 @@ RUN chmod 0555 /etc/lunarwing/pebble && chmod 0444 /etc/lunarwing/pebble/setting
 
 RUN /usr/local/bin/pebble --version && \
     test -x /usr/local/bin/pebble4lunarwing && \
-    test -x /usr/local/bin/entrypoint.sh
+    test -x /usr/local/bin/entrypoint.sh && \
+    test -x /usr/local/bin/entrypoint-split.sh
 RUN mkdir -p /workspace && chmod 777 /workspace
 
-# WI#400: task identity, separate from the bridge (which runs as container
-# root). The bridge drops every spawned task to this uid/gid via setpriv
-# (flags pinned by the executor self-test), so the bridge's and PID 1's
-# environ are EACCES to task code. mt-admin maps this uid to the tenant
-# account (PEBBLE_USERNS keep-id), so workspace writes land tenant-owned
-# on the host exactly as before. setpriv must exist in the base image —
-# fail the build if a base bump ever drops it.
+# WI#454: task containers use the default non-root identity; mt-admin selects
+# the distinct bridge uid for the credential-holding container. Both share a group.
 RUN groupadd --gid 10004 pebbletask \
     && useradd --uid 10004 --gid 10004 -m -d /home/pebbletask pebbletask \
+    && useradd --uid 10104 --gid 10004 -m -d /home/pebble-bridge pebble-bridge \
     && mkdir -p /home/pebbletask/go \
     && chown -R pebbletask:pebbletask /home/pebbletask \
     && command -v setpriv >/dev/null
+
+RUN mkdir -p /run/lunarwing-shared \
+    && chown root:pebbletask /run/lunarwing-shared \
+    && chmod 2770 /run/lunarwing-shared
+
 ENV PEBBLE_TASK_UID=10004 \
-    PEBBLE_TASK_GID=10004
+    PEBBLE_TASK_GID=10004 \
+    PEBBLE_BRIDGE_UID=10104
 
 ENV PEBBLE_BIN=/usr/local/bin/pebble \
     PEBBLE_MODE=websocket \
@@ -279,13 +283,6 @@ EXPOSE 9090 8443
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD curl -sf http://127.0.0.1:8443/health || exit 1
 
-# WI#400 LD-8: pin the bridge to container root. Under rootless podman
-# keep-id (the default multi-tenant deployment) an image with no USER would
-# start the entrypoint and bridge as the keep-id uid — the SAME uid every
-# task drops to — making the whole split a no-op (the token file would be
-# task-owned and /proc/self/environ readable by task code). USER 0:0 wins
-# over keep-id, the bridge runs as root, and the entrypoint/executor refuse
-# to run the websocket lane if they ever land on the task uid instead.
-USER 0:0
+USER 10004:10004
 
 ENTRYPOINT ["entrypoint.sh"]
