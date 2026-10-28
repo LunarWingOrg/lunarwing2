@@ -29,7 +29,7 @@ COPY scripts/package.json scripts/package-lock.json scripts/tsconfig.json ./scri
 COPY scripts/*.ts ./scripts/
 # entrypoint_config_test.js reads ../entrypoint.sh — ship it in the build
 # stage so the in-build test gate validates the actual shipped entrypoint.
-COPY entrypoint.sh /build/entrypoint.sh
+COPY entrypoint.sh entrypoint-split.sh /build/
 # WI#400: entrypoint_config_test.js also reads ../entrypoint-task-setup.sh
 # (the config section moved there); ship it beside entrypoint.sh so the
 # in-build npm test gate validates the actual shipped setup script.
@@ -198,24 +198,23 @@ ENV GOROOT=/usr/local/go \
 # Keep IDs synchronized with ic/scripts/lunarwing-mt-admin.sh. Rootless Podman
 # maps the tenant's host identity onto these IDs so private read-only mounts
 # remain accessible without making state world-readable.
-# WI#400: this is the TASK identity only — the container starts as root (see
-# USER below), the bridge runs as root and drops every spawned task to this
-# uid/gid via setpriv (flags pinned by taskSetprivArgv + the executor
-# self-test), so the bridge's and PID 1's environ are EACCES to task code.
+# WI#454: the image defaults to the task identity. mt-admin starts a second
+# container as the distinct bridge uid; both share this group for the workspace
+# and IPC volume, and neither container runs its long-lived workload as root.
 RUN groupadd --gid 10002 kimi \
-    && useradd --uid 10002 --gid 10002 -m -d /home/kimi kimi
+    && useradd --uid 10002 --gid 10002 -m -d /home/kimi kimi \
+    && useradd --uid 10102 --gid 10002 -m -d /home/kimi-bridge kimi-bridge
 
 # ── app layout ─────────────────
 WORKDIR /app
 
 COPY --from=builder /build/scripts/ /app/scripts/
-# WI#400 LD-2: /app files stay root-owned — container root executes these,
-# so they must not be writable by the task uid the bridge drops to.
-COPY entrypoint.sh entrypoint-task-setup.sh health_server.py task_runner_bind.py agent_comm_protocol.json ./
+# /app stays root-owned and read-only to both runtime identities.
+COPY entrypoint.sh entrypoint-split.sh entrypoint-task-setup.sh health_server.py task_runner_bind.py agent_comm_protocol.json ./
 COPY config/ ./config/
 COPY hooks/ ./hooks/
 
-RUN chmod +x /app/entrypoint.sh /app/entrypoint-task-setup.sh /app/health_server.py \
+RUN chmod +x /app/entrypoint.sh /app/entrypoint-split.sh /app/entrypoint-task-setup.sh /app/health_server.py \
     && command -v setpriv >/dev/null
 
 # ── Kimi Code CLI ─────────────────────────────────────────────────────────────
@@ -250,28 +249,31 @@ RUN mkdir -p /home/kimi/.kimi-code \
              /app/results \
     && chown -R kimi:kimi /home/kimi /workspace /var/log/lunarwing /app/results
 
+# An empty named volume inherits this group-shared mountpoint. Only the bridge
+# and task containers of one lane mount it; the hub credential never lives here.
+RUN mkdir -p /run/lunarwing-shared \
+    && chown root:kimi /run/lunarwing-shared \
+    && chmod 2770 /run/lunarwing-shared
+
 # WI#206: the baked policy (guard config + PreToolUse hook) must not be
-# editable by the runtime user — tasks run as kimi, so dropping write
-# access means a task inside the container cannot strip its own guard.
-RUN chmod -R a-w /app/config /app/hooks && chmod a-w /app/entrypoint.sh /app/entrypoint-task-setup.sh
+# editable by either runtime identity.
+RUN chmod -R a-w /app/config /app/hooks \
+    && chmod a-w /app/entrypoint.sh /app/entrypoint-split.sh /app/entrypoint-task-setup.sh
 
 # ── ports ──────────────────────
 EXPOSE 8443
 EXPOSE 9090
 
 # ── health check ───────────────────────
-# WI#454/ME-1: absolute path — the healthcheck runs as the container user
-# (root), and a bare `curl` would resolve through the image PATH.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD /usr/bin/curl -sf http://127.0.0.1:8443/ready || exit 1
 
-# WI#400: root entrypoint — the launcher drops every task-side process to
-# the kimi uid (10002) itself; the WebSocket bridge stays root so it can
-# drop privileges per spawned task. Task identity is pinned for both the
-# launcher and the bridge executor.
+# WI#454: task containers use this default; mt-admin explicitly selects the
+# bridge uid and split-bridge role for the credential-holding container.
 ENV KIMI_TASK_UID=10002 \
-    KIMI_TASK_GID=10002
-USER 0:0
+    KIMI_TASK_GID=10002 \
+    KIMI_BRIDGE_UID=10102
+USER 10002:10002
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
 CMD ["--mode", "websocket"]
