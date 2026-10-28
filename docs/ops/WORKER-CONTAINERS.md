@@ -717,15 +717,45 @@ compromised agent can fetch an upstream opencode (tunnel included) or run
 pin. **Only control 1 (the egress allowlist) holds against a compromised
 agent**. The maintainer-approved WI#427 bump deliberately crosses on
 compile-out plus config alone; it does not turn the in-image guards into
-an egress boundary. Control 1 remains open as **WI#424 for 2.1.7.0**.
+an egress boundary. Control 1 subsequently landed for all four worker lanes
+under WI#424; the rootless first-start lifetime fix is WI#504 below.
 
 Enforced controls (opencode2 lane unless noted):
 
-1. **Egress allowlist (DEFERRED to WI#424, 2.1.7.0; maintainer's call):** mt-admin
-   restricting worker egress to the configured LLM endpoint + git hosts.
-   Not yet implemented; it is the only control that also covers future
-   phone-home features and `webfetch`/shell exfiltration, and the only one
-   that holds against a compromised agent (see the gate record above).
+1. **Egress allowlist (WI#424, all worker lanes):** mt-admin places workers on
+   `lw-egress-<tenant>` with tenant-specific nft forward/input reject chains,
+   IPv6 rejected, DNS pinned to an unserved loopback resolver, and static host
+   mappings derived from the same IPv4 answers as the allowlist. Only configured
+   LLM endpoints and operator-listed destinations are permitted. This is the
+   control that covers future phone-home features and shell exfiltration.
+
+   **Rootless Podman namespace lifetime (WI#504):** before loading the filter,
+   mt-admin and every OpenRC/Quadlet/babysitter pre-start guard ensure a running
+   `lw-egress-keeper-<tenant>` pod on that tenant's egress network. Its infra
+   container uses Podman's locally built pause image, without pulling an image,
+   exposing a listener, or receiving tenant secrets. A foreign-purpose pod or
+   an infra container on the wrong network is refused. The pause container keeps
+   the rootless network namespace alive between apply and the first worker
+   start; a single `unshare --rootless-netns` session alone cannot do that.
+   Load and both exact-reject reads then execute inside one session. Rootful
+   Docker/Podman still use host nft directly and create no keeper.
+
+   Post-start `--verify` remains read-only: missing rules stop the worker rather
+   than being silently reloaded. Failures identify the namespace read and the
+   keeper state. `stop-tenant` removes the keeper only after writer quiescence;
+   tenant teardown removes it before the network. Individual worker stops leave
+   it available to other lanes. On reboot the next pre-start guard recreates it;
+   after deploying this fix, restart tenants through mt-admin so the installed
+   guard is refreshed. Do not remove an active keeper manually.
+
+   `mt-admin worker-egress <tenant>` audits attachment, DNS/hosts and both live
+   reject chains. The regression harness covers apply → pre-guard → first start
+   → post-guard against disposable namespaces. For isolated rootless acceptance
+   with no running containers, run
+   `LUNARWING_MT_EGRESS_LIVE=1 bash ic/scripts/tests/test-worker-egress.sh`.
+   The opt-in arm creates and cleans up its own BusyBox container, keeper, network
+   and host HTTP server; it also tests cold restart, allowed HTTP and denied
+   raw-IP/DNS access. It refuses to overwrite existing fixture resources.
 2. **No self-exposure commands (naive-use guard).** The bridge session
    ruleset (`opencode2.4lunarwing/scripts/opencode_task_executor.ts`,
    `sessionPermissions()`) denies `shell` on `*opencode service *`,
