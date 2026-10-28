@@ -217,6 +217,14 @@ class OpentunnelIdentityTests(unittest.TestCase):
             smoke.check_opentunnel_identity(FixtureTransport(), _env()).ok
         )
 
+    def test_local_home_probes_follow_effective_user(self) -> None:
+        cases = ((0, ["/root", "/home/opencode2"]), (10003, ["/home/opencode2"]))
+        for euid, expected in cases:
+            with self.subTest(euid=euid), mock.patch(
+                "runtime_smoke.os.geteuid", return_value=euid
+            ):
+                self.assertEqual(list(smoke.LocalTransport().home_dirs()), expected)
+
     def test_state_dir_under_root_is_caught(self) -> None:
         transport = FixtureTransport(dirs={"/root/.local/state/opentunnel"})
         self.assertFalse(smoke.check_opentunnel_identity(transport, _env()).ok)
