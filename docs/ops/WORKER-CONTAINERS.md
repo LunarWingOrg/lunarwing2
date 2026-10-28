@@ -1778,9 +1778,14 @@ container listens whenever a tenant store still holds a pre-WI#400 kimi
 image (`USER 10002:10002`, or `USER unset`) while the rootful admin store
 has no rebuilt copy — `_ensure_tenant_image`'s admin-store-empty branch keeps
 the stale tenant copy in play, and `start_tenant_kimi`'s image-user guard
-(`ic/scripts/mt-admin-lib/09-worker-config.sh`) then `die`s loudly, leaving
-the daemon-side `[[sandbox.external_workers]]` route hot against a dead
-socket. Same class as the pebble WI#452. **Remediation:**
+(`ic/scripts/mt-admin-lib/09-worker-config.sh`) refuses to start the lane,
+leaving the daemon-side `[[sandbox.external_workers]]` route hot against a
+dead socket. Same class as the pebble WI#452. Since WI#469, this refusal is
+lane-local: `start-tenant` prints a sanitized rebuild error and a per-lane
+`WARNING`, attempts every later selected worker, then exits non-zero with a
+summary naming the failed lanes. Other fatal starter errors, including
+credential resolution, still abort with their original status.
+**Remediation:**
 `sudo ic/scripts/lunarwing-mt-admin.sh build-kimi-worker`, then
 `start-tenant <name>` (or `start-worker <name> kimi`) — image distribution to
 tenant stores plus the image-ID launch contract force-recreates the stale
