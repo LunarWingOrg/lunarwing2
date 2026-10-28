@@ -52,7 +52,7 @@ write_worker_task_runtime_env() {
   local name="$1" source="$2" target="$3" staged
   staged="$(mktemp)" || return 1
   if ! awk '!/^AGENT_AUTH_TOKEN(_FILE)?=/' "$source" >"$staged" \
-    || ! write_tenant_file_atomic "$name" "$target" 600 <"$staged"; then
+    || ! write_tenant_file_atomic "$name" "$target" 600 owned-parent <"$staged"; then
     rm -f -- "$staged"
     return 1
   fi
@@ -92,7 +92,7 @@ prepare_worker_task_study_mounts() {
 }
 
 prepare_worker_task_launch() {
-  local name="$1" worker="$2" env_dir source snapshot value model base_url
+  local name="$1" worker="$2" env_dir source snapshot="" value model base_url
   local runtime_env override_env task_env ssh_agent_dir
   env_dir="$(tenant_env_dir "$name")"
   source="$env_dir/lunarwing.env"
