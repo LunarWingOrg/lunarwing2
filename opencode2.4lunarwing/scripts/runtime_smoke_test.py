@@ -490,6 +490,15 @@ class CandidateBuildWiringTests(unittest.TestCase):
         self.assertIn('export WS_STATE_FILE="$SMOKE_ROOT/ws_state.json"', runner)
         self.assertIn("runtime_smoke.py --profile container", runner)
 
+    def test_candidate_smoke_fails_on_external_writes(self) -> None:
+        lane = Path(__file__).resolve().parents[1]
+        runner = (lane / "scripts/runtime_smoke_entrypoint.sh").read_text()
+        self.assertIn('touch "$SMOKE_ROOT/.marker"', runner)
+        self.assertIn("find /tmp /var/log/lunarwing", runner)
+        self.assertIn('-newer "$SMOKE_ROOT/.marker"', runner)
+        self.assertIn('! -path "$SMOKE_ROOT/*"', runner)
+        self.assertIn("check_external_writes", runner)
+
     def test_candidate_smoke_runs_as_the_image_runtime_user(self) -> None:
         # OQ-6: a root-run smoke observes root permissions and would certify a
         # worker shape the image never has. It must drop to uid 10003 and prove
