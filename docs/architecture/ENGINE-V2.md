@@ -1914,7 +1914,10 @@ precedence over the DB-backed setting `agent.pending_gate_expiry_secs`;
 default **1800s (30 minutes)**. Values outside the inclusive range **30s to
 2592000s (30 days)** fall back to the default. The lower bound prevents windows
 shorter than the 60-second gate sweep can observe; the upper bound prevents
-unsigned-to-signed wraparound and Chrono duration overflow (WI#115).
+unsigned-to-signed wraparound and Chrono duration overflow (WI#115). Expiry
+replies carry the pending gate's own thread id. A successful gateway broadcast
+emits the thread-scoped SSE response directly; the explicit SSE notification
+remains a fallback if channel delivery fails.
 
 **Prompt-overlay audit and operator lifecycle (WI#268).** The full contract —
 overlay storage identity and bridge path, the three gated writers, consumption
