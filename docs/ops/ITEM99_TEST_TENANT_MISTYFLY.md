@@ -212,7 +212,7 @@ upgrade path exists to give. Both call sites need the fix.
 6. `=== Building kimi worker image ===` → fat.
 
 
-## F2 — BLOCKER: WI#424 egress fail-closed deadlocks worker start on rootless podman (never before exercised) — **WI#504**
+## F2 — BLOCKER: WI#424 egress fail-closed deadlocks worker start on rootless podman (original finding; fixed in-tree 2026-10-28) — **WI#504**
 
 This is the headline finding of the pass. `start-tenant mistyfly` **aborted
 before creating either worker container**, so a tenant provisioned exactly per
@@ -321,13 +321,23 @@ ruleset is correct and contains exactly the allowlist entry the tenant needs
 (the WireGuard TensorZero endpoint `100.88.232.146:3000`) plus the required
 exact reject arms.
 
-Note the contrast with the guard that OpenRC/Quadlet actually run:
-`lunarwing-worker-egress-guard.sh` does its load and both `verify_chain` calls
-in **one** process, with `nft_in_netns` resolving the namespace once per call
-inside that single invocation — which is why the *boot* path is designed to
-work while `worker_egress_apply` is not. The mt-admin function should either
-delegate to the same guard (it already installs it on the line above) or run
-load+verify in one netns session.
+**Correction and remediation (2026-10-28, item 114 / WI#504):** the report's
+contrast above was incorrect: the installed guard also invoked
+`podman unshare --rootless-netns` separately for load and each chain read, so its
+rootless pre-start path shared the same no-keeper failure class. This branch
+changes both `worker_egress_apply` and `lunarwing-worker-egress-guard.sh` to run
+the load (when requested) and both chain reads in one session. Guard `--verify`
+likewise reads both chains in one session. Failures now report the namespace read
+and keeper state, while load failures remain distinct from verification failures.
+
+`ic/scripts/tests/test-worker-egress.sh` models every fake unshare invocation as
+a fresh empty namespace and proves both apply and the pre-start guard still
+succeed when they load and verify in one session. The same harness also covers
+missing/incomplete filters and runs with executable fixtures on a temp filesystem
+that is not mounted `noexec`. Verification on the remediation tree: the harness
+passes, as does `ic/scripts/check-mt-admin.sh`. The live `start-tenant`
+acceptance was not repeated; the fresh-namespace behavior is exercised by the
+hermetic fixture rather than mutating a live tenant.
 
 ### F2a — the launch-args status bug this pass actually fixes in mt-admin (QQ-1)
 
@@ -789,19 +799,22 @@ arithmetic is verified by the exact-sum check.
 
 QQ-4 asked for the four target-side findings to be cited in their headings so
 they stay traceable once the tenant is gone. Filed at the maintainer's request
-after run 250 and confirmed open against this tree:
+after run 250 and confirmed open against that run's tree; current status is
+noted below:
 
 | finding | work item | severity label | one-line mechanism |
 | --- | --- | --- | --- |
 | F1 — worker source-root asymmetry | [WI#507](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/507) | medium, mt-admin / tech-debt | `build_pebble_worker` takes no tenant source root, so tenant pebble images build from the operator's live checkout and stamp its moving, possibly dirty revision |
-| F2 — egress apply fail-closed deadlock | [WI#504](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/504) | high, mt-admin / security | `worker_egress_apply` loads and verifies in separate `podman unshare --rootless-netns` invocations, so the first worker start fails closed with no netns keeper running |
+| F2 — egress apply fail-closed deadlock | [WI#504](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/504) | high, mt-admin / security | fixed in-tree 2026-10-28: apply and the guard run load + both chain reads in one session; the fresh-namespace regression passes |
 | F2b — orphaned tenant lifecycle lock | [WI#505](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/505) | high, mt-admin / reliability | the lock descriptor is inherited by OpenRC daemons started inside the locked section, so a `die()` leaves the flock held and every later lifecycle command blocks |
 | F5 — no pebble backend in the allowlist | [WI#506](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/506) | medium, mt-admin / network | a `--with-pebble` tenant has no allowlist entry for pebble's model backend, so every pebble job fails on an egress-enforcing host |
 | F2a — launch-args status bug | **fixed on this branch** (`64442bffa`) | — | the IP-only allowlist made `worker_egress_launch_args` return 1 after printing valid args |
 | F3 — prior-pass findings (numbering is thunderlane's, not this report's) | WI#471 / WI#472 / WI#473 fixed, WI#436 item 1 still open | — | three of four named prior findings landed and are regression-verified live on mistyfly |
 | F4 — knowledge-sync seed/refresh asymmetry | WI#436 item 1 | — | one bad corpus note still poisons the whole refresh |
 
-F2a is closed by this MR; the other four are recorded here and owned upstream.
+F2 and F2a are fixed in-tree. WI#504 remains open for maintainer review; the
+live tenant start was not repeated on this branch. F1, F2b, and F5 remain as
+owned above; F3/F4 retain their recorded statuses.
 
 ## Disposition
 
