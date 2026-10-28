@@ -711,73 +711,87 @@ assert_contains "$(cat "$systemd_lib")" 'AddHost=' "Quadlet installs static host
 # ── optional live acceptance, never a default host-side nft mutation ─────────
 say_skip() { printf 'SKIP: %s\n' "$1"; }
 LIVE_NET=lw-egress-liveprobe
-LIVE_CONTAINER=egress-liveprobe
+LIVE_CONTAINER=lunarwing-kimi-liveprobe
 LIVE_HTTPD_PID=""
+cleanup_live() {
+  podman rm -f "$LIVE_CONTAINER" >/dev/null 2>&1 || true
+  worker_egress_teardown liveprobe >/dev/null 2>&1 || true
+  [[ -z "$LIVE_HTTPD_PID" ]] || kill "$LIVE_HTTPD_PID" >/dev/null 2>&1 || true
+}
 run_live_arm() {
-  local image=docker.io/library/busybox:stable subnet=10.89.249.0/24 port=18099
-  local addr_ok="${WORKER_EGRESS_HOST_ADDRS%% *}" addr_deny=203.0.113.10
-  command -v podman >/dev/null 2>&1 || { say_skip "live arm: podman missing"; return 0; }
-  command -v nft >/dev/null 2>&1 || { say_skip "live arm: nft missing"; return 0; }
-  command -v curl >/dev/null 2>&1 || { say_skip "live arm: curl missing"; return 0; }
+  local image=docker.io/library/busybox:stable subnet=10.89.249.0/24 port=18099 ruleset before after
+  command -v podman >/dev/null 2>&1 && command -v nft >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 \
+    || { fail "live arm: podman, nft and curl required"; return 1; }
+  [[ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" == true ]] \
+    || { fail "live arm: rootless podman required"; return 1; }
+  [[ -z "$(podman ps -q)" ]] \
+    || { fail "live arm: use an isolated account with no running containers (WI#504)"; return 1; }
+  if podman network exists "$LIVE_NET" || podman container exists "$LIVE_CONTAINER" \
+      || podman pod exists lw-egress-keeper-liveprobe; then
+    fail "live arm: refusing to touch existing fixture resources"; return 1
+  fi
   podman image exists "$image" 2>/dev/null || podman pull -q "$image" >/dev/null 2>&1 \
-    || { say_skip "live arm: image unavailable"; return 0; }
-  [[ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" == "true" ]] \
-    || { say_skip "live arm: rootless podman only"; return 0; }
-  cleanup_live() {
-    podman rm -f "$LIVE_CONTAINER" >/dev/null 2>&1 || true
-    podman network rm -f "$LIVE_NET" >/dev/null 2>&1 || true
-    [[ -z "$LIVE_HTTPD_PID" ]] || kill -9 "$LIVE_HTTPD_PID" >/dev/null 2>&1 || true
-    podman unshare --rootless-netns nft flush chain inet "$WORKER_EGRESS_TABLE" fwd_liveprobe >/dev/null 2>&1 || true
-    podman unshare --rootless-netns nft delete chain inet "$WORKER_EGRESS_TABLE" fwd_liveprobe >/dev/null 2>&1 || true
-    podman unshare --rootless-netns nft flush chain inet "$WORKER_EGRESS_TABLE" in_liveprobe >/dev/null 2>&1 || true
-    podman unshare --rootless-netns nft delete chain inet "$WORKER_EGRESS_TABLE" in_liveprobe >/dev/null 2>&1 || true
-  }
-  trap cleanup_live EXIT
+    || { fail "live arm: image unavailable"; return 1; }
+  _ctr() { shift; command podman "$@"; }
+  worker_egress_nft() { shift; command podman unshare --rootless-netns nft "$@"; }
+  _worker_egress_llm_targets() { return 0; }
+  _worker_egress_operator_allow() { worker_egress_state_get liveprobe ALLOW; }
+  trap 'cleanup_live; command rm -rf "$fixture"' EXIT
   (cd "$fixture" && exec python3 -m http.server "$port" --bind 0.0.0.0) >"$fixture/httpd.log" 2>&1 </dev/null &
   LIVE_HTTPD_PID=$!
   sleep 1
-  curl -sf -o /dev/null -m 2 "http://127.0.0.1:$port/" || { say_skip "live arm: fixture server failed"; return 0; }
+  curl -sf -o /dev/null -m 2 "http://127.0.0.1:$port/" \
+    || { fail "live arm: fixture server failed"; return 1; }
   podman network create --subnet "$subnet" --interface-name lweg249 --disable-dns "$LIVE_NET" >/dev/null \
     || { fail "live arm: network create failed"; return 1; }
   printf 'SUBNET=%s\nALLOW=localhost:%s\n' "$subnet" "$port" >"$WORKER_EGRESS_DIR/liveprobe.conf"
-  _worker_egress_llm_targets() { return 0; }
-  _worker_egress_operator_allow() { worker_egress_state_get liveprobe ALLOW; }
-  CONTAINER_RT=podman MT_ROOTLESS=true worker_egress_ruleset liveprobe >"$fixture/liveprobe.nft" \
-    || { fail "live arm: render failed"; return 1; }
-  _worker_egress_static_hosts "$(worker_egress_target_records liveprobe)" >"$WORKER_EGRESS_DIR/liveprobe.hosts"
-  if ! "$guard" "$fixture/liveprobe.nft" rootless fwd_liveprobe >"$fixture/live-guard.out" 2>"$fixture/live-guard.err"; then
-    cat "$fixture/live-guard.err" >&2
-    sed 's/^/  /' "$fixture/liveprobe.nft" >&2
-    fail "live arm: pre-start guard failed"; return 1
-  fi
+  ruleset="$(worker_egress_ruleset_path liveprobe)"
+  real_worker_egress_apply liveprobe >"$fixture/live-apply.out" \
+    || { fail "live arm: fresh-namespace mt-admin apply failed"; return 1; }
+  pass "live arm: mt-admin applies with no pre-existing keeper or worker"
+  before="$(podman unshare --rootless-netns readlink /proc/self/ns/net)"
+  "$guard" "$ruleset" rootless fwd_liveprobe \
+    || { fail "live arm: pre-start guard failed"; return 1; }
   local -a live_args=()
-  mapfile -t live_args < <(CONTAINER_RT=podman MT_ROOTLESS=true worker_egress_launch_args liveprobe)
+  mapfile -t live_args < <(worker_egress_launch_args liveprobe)
   podman run -d --name "$LIVE_CONTAINER" "${live_args[@]}" "$image" sleep 120 >/dev/null \
-    || { fail "live arm: container start failed"; return 1; }
-  sleep 2
-  "$guard" --verify "$fixture/liveprobe.nft" rootless fwd_liveprobe >/dev/null 2>&1 \
+    || { fail "live arm: first container start failed"; return 1; }
+  "$guard" --verify "$ruleset" rootless fwd_liveprobe \
     || { fail "live arm: post-start guard failed"; return 1; }
+  worker_egress_verify_after_start liveprobe "$LIVE_CONTAINER" \
+    || { fail "live arm: mt-admin post-start check failed"; return 1; }
+  after="$(podman unshare --rootless-netns readlink /proc/self/ns/net)"
+  assert_eq "$after" "$before" "live arm: first worker retains the loaded namespace"
+  if worker_egress_audit liveprobe; then pass "live arm: worker-egress audit passes"; else fail "live arm: audit failed"; fi
   if podman exec "$LIVE_CONTAINER" wget -q -O /dev/null -T 5 "http://localhost:$port/"; then
     pass "live arm: static-host allowlisted fetch succeeds"
   else
     fail "live arm: static-host allowlisted fetch failed"
   fi
-  if podman exec "$LIVE_CONTAINER" wget -q -O /dev/null -T 5 "https://$addr_deny/" >/dev/null 2>&1; then
-    fail "live arm: non-allowlisted fetch succeeded"
-  else
-    pass "live arm: non-allowlisted fetch fails"
-  fi
-  if podman exec "$LIVE_CONTAINER" wget -q -O /dev/null -T 5 "https://1.1.1.1/" >/dev/null 2>&1; then
+  if podman exec "$LIVE_CONTAINER" wget -q -O /dev/null -T 5 'https://1.1.1.1/' >/dev/null 2>&1; then
     fail "live arm: raw-IP fetch succeeded"
   else
-    pass "live arm: raw-IP fetch fails"
+    pass "live arm: non-allowlisted raw-IP fetch fails"
   fi
   if podman exec "$LIVE_CONTAINER" nslookup example.com >/dev/null 2>&1; then
-    fail "live arm: recursive DNS still works as an exfiltration path"
+    fail "live arm: recursive DNS still works"
   else
     pass "live arm: recursive DNS is disabled"
   fi
-  [[ -z "$addr_ok" ]] || pass "live arm: host alias under test was $addr_ok"
+  podman stop "$LIVE_CONTAINER" >/dev/null
+  worker_egress_stop_keeper liveprobe
+  real_worker_egress_apply liveprobe >/dev/null \
+    && "$guard" "$ruleset" rootless fwd_liveprobe >/dev/null \
+    && podman start "$LIVE_CONTAINER" >/dev/null \
+    && "$guard" --verify "$ruleset" rootless fwd_liveprobe >/dev/null \
+    || { fail "live arm: cold worker restart failed"; return 1; }
+  pass "live arm: cold restart succeeds after all workers and keeper stop"
+  cleanup_live
+  if podman pod exists lw-egress-keeper-liveprobe || podman network exists "$LIVE_NET"; then
+    fail "live arm: teardown left keeper or network behind"
+  else
+    pass "live arm: teardown removes keeper and network"
+  fi
 }
 if [[ "${LUNARWING_MT_EGRESS_LIVE:-0}" == "1" ]]; then
   run_live_arm || true
