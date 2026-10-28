@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import ast
 import calendar
 import datetime
 import fnmatch
@@ -546,11 +547,68 @@ def validate_worker_publication(merged: dict, errors: list[str]) -> None:
     validate_opencode2_exposure_verify(merged, errors)
 
 
+def validate_buildkit_parser_go_version(job: dict, errors: list[str]) -> None:
+    """WI#500: keep this security gate's module and both toolchains in lockstep.
+
+    A go directive normally sets only a minimum. This gate intentionally
+    requires the exact patch version used by its reviewed, digest-pinned image.
+    Read the bootstrap constant statically; never execute it during validation.
+    """
+    image = image_name(job.get("image"))
+    match = re.fullmatch(
+        r"docker\.io/library/golang:(\d+\.\d+\.\d+)-bookworm@sha256:[0-9a-f]{64}",
+        image if isinstance(image, str) else "",
+    )
+    if match is None:
+        errors.append("BuildKit parser Go version check requires a versioned, digest-pinned Go image")
+        return
+    version = match.group(1)
+    sources = {}
+    module_path = ".gitlab/go/dockerfile-parse/go.mod"
+    bootstrap_path = ".gitlab/scripts/fetch-go-toolchain.py"
+    for relative in (module_path, bootstrap_path):
+        try:
+            sources[relative] = (ROOT / relative).read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            errors.append(f"cannot read {relative} for the BuildKit parser Go version check: {error}")
+    if len(sources) != 2:
+        return
+
+    declarations = [line.split("//", 1)[0].split() for line in sources[module_path].splitlines()]
+    go_versions = [tokens[1:] for tokens in declarations if tokens[:1] == ["go"]]
+    if go_versions != [[version]]:
+        errors.append(
+            f"{module_path} must declare exactly one 'go {version}' directive to match "
+            f"worker-buildkit-parser-policy-guard's image; found {go_versions!r}"
+        )
+    try:
+        bootstrap = ast.parse(sources[bootstrap_path], filename=bootstrap_path)
+    except SyntaxError as error:
+        errors.append(f"cannot parse {bootstrap_path} for the BuildKit parser Go version check: {error}")
+        return
+    bindings = [
+        node for node in ast.walk(bootstrap)
+        if isinstance(node, ast.Name) and node.id == "GO_VERSION" and isinstance(node.ctx, ast.Store)
+    ]
+    pins = [
+        node.value.value for node in bootstrap.body
+        if isinstance(node, ast.Assign) and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "GO_VERSION"
+        and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+    ]
+    if len(bindings) != 1 or pins != [version]:
+        errors.append(
+            f"{bootstrap_path} must assign GO_VERSION exactly once to the literal {version!r} "
+            "to match worker-buildkit-parser-policy-guard's image"
+        )
+
+
 def validate_buildkit_parser_guard(merged: dict, errors: list[str]) -> None:
     job = merged.get("worker-buildkit-parser-policy-guard")
     if not isinstance(job, dict):
         errors.append("worker-buildkit-parser-policy-guard is required")
         return
+    validate_buildkit_parser_go_version(job, errors)
     expected = {
         "stage": "security",
         "needs": [],
