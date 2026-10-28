@@ -42,8 +42,8 @@ import { createServer, type Server, type Socket } from "node:net"
 import { chmodSync, lstatSync, mkdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs"
 import { dirname } from "node:path"
 
-import type { OpenCodeClient } from "@opencode/client/promise"
 import { executeTask } from "./opencode_task_executor"
+type OpenCodeClient = NonNullable<Parameters<typeof executeTask>[4]>
 import {
   isRecord,
   type TaskProgress,
