@@ -36,9 +36,16 @@ import tomllib
 # tokio 1.52.3 -> 1.53.3 clears RUSTSEC-2026-0386 (unsound safe AsyncFd
 # constructors) and clipboard-win 5.4.1 -> 5.4.3 replaces a yanked pin, the
 # same remediations already applied to the other roots on 2026-10-23.
+# 2026-10-28 (advisory-db 40f5be6f): pulldown-cmark 0.13.4 is affected by
+# RUSTSEC-2026-0414 (exponential event growth with ENABLE_WIKILINKS; patched
+# >= 0.13.5). pebble renders model output through Options::all(), so the
+# option is enabled and a few kilobytes of crafted Markdown can exhaust the
+# worker's memory. 0.13.5 keeps the same dependency requirements and MSRV;
+# only its version/checksum lines change (same recipe as the rows above).
 ALLOWED_PACKAGES = {
     "chacha20",
     "clipboard-win",
+    "pulldown-cmark",
     "quinn",
     "quinn-proto",
     "quinn-udp",
