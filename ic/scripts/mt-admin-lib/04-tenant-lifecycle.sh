@@ -240,11 +240,12 @@ tenant_writer_services() {
     [[ "$INIT_SYSTEM" != openrc ]] || printf '%s\n' "lunarwing-vision-${name}-sup"
     printf '%s\n' "lunarwing-vision-${name}"
   fi
-  local worker
+  local worker task_container
   for worker in pebble opencode kimi opencode2; do
+    task_container="$(worker_task_container_name "$worker" "$name")"
     if tenant_worker_enabled "$name" "$worker"; then
-      printf '%s\n' "lunarwing-${worker}-${name}"
-      [[ "$INIT_SYSTEM" != openrc ]] || printf '%s\n' "lunarwing-${worker}-${name}-sup"
+      printf '%s\n' "lunarwing-${worker}-${name}" "$task_container"
+      [[ "$INIT_SYSTEM" != openrc ]] || printf '%s\n' "lunarwing-${worker}-${name}-sup" "${task_container}-sup"
     elif [[ "$INIT_SYSTEM" == openrc ]]; then
       # A deselected worker may still have an old init script/supervisor.
       # Export must inspect it even though the registry no longer selects it.
@@ -252,6 +253,8 @@ tenant_writer_services() {
         || printf '%s\n' "lunarwing-${worker}-${name}"
       [[ ! -x "$OPENRC_INITD_DIR/lunarwing-${worker}-${name}-sup" ]] \
         || printf '%s\n' "lunarwing-${worker}-${name}-sup"
+      [[ ! -x "$OPENRC_INITD_DIR/${task_container}" ]] || printf '%s\n' "$task_container"
+      [[ ! -x "$OPENRC_INITD_DIR/${task_container}-sup" ]] || printf '%s\n' "${task_container}-sup"
     fi
   done
 }
@@ -260,6 +263,7 @@ tenant_writer_containers() {
   local name="$1" worker
   for worker in pebble opencode kimi opencode2; do
     printf 'lunarwing-%s-%s\n' "$worker" "$name"
+    worker_task_container_name "$worker" "$name"
   done
   tenant_vision_external "$name" || printf 'lunarwing-vision-%s\n' "$name"
 }
@@ -297,9 +301,13 @@ stop_tenant_writers() {
       # when the unit is already stopped.
       case "$service" in
         "lunarwing-pebble-${name}"|"lunarwing-pebble-${name}-sup"|\
+        "lunarwing-pebble-task-${name}"|"lunarwing-pebble-task-${name}-sup"|\
         "lunarwing-opencode-${name}"|"lunarwing-opencode-${name}-sup"|\
+        "lunarwing-opencode-task-${name}"|"lunarwing-opencode-task-${name}-sup"|\
         "lunarwing-kimi-${name}"|"lunarwing-kimi-${name}-sup"|\
-        "lunarwing-opencode2-${name}"|"lunarwing-opencode2-${name}-sup") continue ;;
+        "lunarwing-kimi-task-${name}"|"lunarwing-kimi-task-${name}-sup"|\
+        "lunarwing-opencode2-${name}"|"lunarwing-opencode2-${name}-sup"|\
+        "lunarwing-opencode2-task-${name}"|"lunarwing-opencode2-task-${name}-sup") continue ;;
       esac
       [[ -x "$OPENRC_INITD_DIR/$service" ]] || continue
       _openrc_service "$service" stop >/dev/null 2>&1 \
@@ -309,10 +317,13 @@ stop_tenant_writers() {
   fi
 
   for worker in pebble opencode kimi opencode2; do
+    container="$(worker_task_container_name "$worker" "$name")"
     if tenant_worker_enabled "$name" "$worker" \
         || { [[ "$INIT_SYSTEM" == openrc ]] \
           && { [[ -x "$OPENRC_INITD_DIR/lunarwing-${worker}-${name}" ]] \
-            || [[ -x "$OPENRC_INITD_DIR/lunarwing-${worker}-${name}-sup" ]]; }; }; then
+            || [[ -x "$OPENRC_INITD_DIR/lunarwing-${worker}-${name}-sup" ]] \
+            || [[ -x "$OPENRC_INITD_DIR/${container}" ]] \
+            || [[ -x "$OPENRC_INITD_DIR/${container}-sup" ]]; }; }; then
       stop_worker "$name" "$worker"
     fi
   done
