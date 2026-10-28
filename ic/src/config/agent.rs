@@ -11,6 +11,10 @@ pub struct AgentConfig {
     pub max_parallel_jobs: usize,
     pub job_timeout: Duration,
     pub stuck_threshold: Duration,
+    /// Idle threshold for `external:*` jobs (WI#475). Defaults far above
+    /// `stuck_threshold` because external workers block on their own LLM
+    /// calls and own a per-attempt deadline (WI#477).
+    pub external_stuck_threshold: Duration,
     pub repair_check_interval: Duration,
     pub max_repair_attempts: u32,
     /// Whether to use planning before tool execution.
@@ -197,6 +201,7 @@ impl AgentConfig {
             max_parallel_jobs: 1,
             job_timeout: Duration::from_secs(30),
             stuck_threshold: Duration::from_secs(300),
+            external_stuck_threshold: Duration::from_secs(1800),
             repair_check_interval: Duration::from_secs(3600),
             max_repair_attempts: 0,
             use_planning: false,
@@ -237,6 +242,10 @@ impl AgentConfig {
             stuck_threshold: Duration::from_secs(parse_optional_env(
                 "AGENT_STUCK_THRESHOLD_SECS",
                 settings.agent.stuck_threshold_secs,
+            )?),
+            external_stuck_threshold: Duration::from_secs(parse_optional_env(
+                "AGENT_EXTERNAL_STUCK_THRESHOLD_SECS",
+                settings.agent.external_stuck_threshold_secs,
             )?),
             repair_check_interval: Duration::from_secs(parse_optional_env(
                 "SELF_REPAIR_CHECK_INTERVAL_SECS",
@@ -336,6 +345,7 @@ fn agent_env_key_warning(key: &str) -> Option<&'static str> {
         "AGENT_MAX_PARALLEL_JOBS",
         "AGENT_JOB_TIMEOUT_SECS",
         "AGENT_STUCK_THRESHOLD_SECS",
+        "AGENT_EXTERNAL_STUCK_THRESHOLD_SECS",
         "AGENT_USE_PLANNING",
         "AGENT_MAX_TOOL_ITERATIONS",
         "AGENT_AUTO_APPROVE_TOOLS",

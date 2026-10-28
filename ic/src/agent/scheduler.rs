@@ -792,6 +792,7 @@ mod tests {
             max_parallel_jobs: 5,
             job_timeout: std::time::Duration::from_secs(30),
             stuck_threshold: std::time::Duration::from_secs(300),
+            external_stuck_threshold: std::time::Duration::from_secs(1800),
             repair_check_interval: std::time::Duration::from_secs(3600),
             max_repair_attempts: 0,
             use_planning: false,

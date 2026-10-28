@@ -65,6 +65,17 @@ fn build_state_ex(
     prompt_queue: Option<PromptQueue>,
     external_worker_manager: Option<Arc<crate::orchestrator::ExternalWorkerManager>>,
 ) -> Arc<GatewayState> {
+    build_state_ex_with_context(store, prompt_queue, external_worker_manager, None)
+}
+
+/// `build_state_ex` plus the job context manager, for the live runtime-state
+/// surfaces WI#475 adds to `/api/jobs/{id}`.
+fn build_state_ex_with_context(
+    store: Option<Arc<dyn crate::db::Database>>,
+    prompt_queue: Option<PromptQueue>,
+    external_worker_manager: Option<Arc<crate::orchestrator::ExternalWorkerManager>>,
+    context_manager: Option<Arc<crate::context::ContextManager>>,
+) -> Arc<GatewayState> {
     Arc::new(GatewayState {
         msg_tx: tokio::sync::RwLock::new(None),
         sse: Arc::new(SseManager::new()),
@@ -102,9 +113,19 @@ fn build_state_ex(
         ws_idle_timeout_secs: 120,
         voice: None,
         voice_rate_limiter: PerUserRateLimiter::new(10, 60),
+        context_manager,
     })
 }
 
+/// Build a `GatewayState` with a context manager wired in but no
+/// external-worker wiring (WI#475).
+#[cfg(feature = "libsql")]
+fn build_state_with_context(
+    store: Option<Arc<dyn crate::db::Database>>,
+    context_manager: Option<Arc<crate::context::ContextManager>>,
+) -> Arc<GatewayState> {
+    build_state_ex_with_context(store, None, None, context_manager)
+}
 fn gateway_config() -> GatewayConfig {
     GatewayConfig {
         host: "127.0.0.1".to_string(),
@@ -879,6 +900,82 @@ mod jobs_isolation {
             false,
         )
         .await;
+    }
+
+    /// WI#475: `/api/jobs/{id}` surfaces the live `stuck` flag and
+    /// `repair_attempts` from the daemon's in-memory context, which the
+    /// sandbox record does not carry. Without a context the fields are
+    /// omitted rather than defaulting to a false "healthy" reading.
+    #[tokio::test]
+    async fn test_jobs_detail_reports_stuck_and_repair_attempts() {
+        let (db, _dir) = test_db().await;
+
+        let mut alice_job = make_sandbox_job("alice", "detail runtime state");
+        alice_job.status = "running".to_string();
+        alice_job.success = None;
+        alice_job.completed_at = None;
+        db.save_sandbox_job(&alice_job).await.unwrap();
+
+        // A live context flagged Stuck with two repair attempts already made.
+        let cm = Arc::new(crate::context::ContextManager::new(5));
+        cm.register_sandbox_job(alice_job.id, "alice", "detail", "desc")
+            .await
+            .unwrap();
+        cm.update_context(alice_job.id, |ctx| {
+            ctx.repair_attempts = 2;
+            ctx.transition_to(crate::context::JobState::Stuck, Some("idle".to_string()))
+                .expect("InProgress -> Stuck must be allowed"); // safety: test
+        })
+        .await
+        .unwrap();
+
+        let state = build_state_with_context(Some(db), Some(cm));
+        let app = jobs_router(state, two_user_auth());
+
+        let req = Request::builder()
+            .uri(format!("/api/jobs/{}", alice_job.id))
+            .header("Authorization", "Bearer tok-alice")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 16384).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["stuck"], serde_json::json!(true), "body: {body}");
+        assert_eq!(
+            body["repair_attempts"],
+            serde_json::json!(2),
+            "body: {body}"
+        );
+    }
+
+    /// WI#475: with no daemon context for the job (restart/eviction) the
+    /// fields are absent instead of claiming the job is healthy.
+    #[tokio::test]
+    async fn test_jobs_detail_omits_runtime_fields_without_context() {
+        let (db, _dir) = test_db().await;
+
+        let mut alice_job = make_sandbox_job("alice", "detail no context");
+        alice_job.status = "running".to_string();
+        alice_job.success = None;
+        alice_job.completed_at = None;
+        db.save_sandbox_job(&alice_job).await.unwrap();
+
+        let cm = Arc::new(crate::context::ContextManager::new(5));
+        let state = build_state_with_context(Some(db), Some(cm));
+        let app = jobs_router(state, two_user_auth());
+
+        let req = Request::builder()
+            .uri(format!("/api/jobs/{}", alice_job.id))
+            .header("Authorization", "Bearer tok-alice")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 16384).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(body.get("stuck").is_none(), "body: {body}");
+        assert!(body.get("repair_attempts").is_none(), "body: {body}");
     }
 
     #[tokio::test]
@@ -2123,6 +2220,7 @@ mod approval_resolution {
             ws_idle_timeout_secs: 120,
             voice: None,
             voice_rate_limiter: PerUserRateLimiter::new(10, 60),
+            context_manager: None,
         });
         (state, rx, thread_id)
     }

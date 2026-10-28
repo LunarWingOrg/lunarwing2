@@ -128,6 +128,9 @@ impl JobStore for LibSqlBackend {
                     // Not persisted yet (WI#263): idle detection falls back to
                     // started_at for contexts reconstructed from the DB.
                     last_activity_at: None,
+                    // WI#475: runtime-only, same as Postgres reconstruction.
+                    external_worker: None,
+                    last_worker_heartbeat_at: None,
                     transitions: Vec::new(),
                     metadata: serde_json::Value::Null,
                     prompt_context: std::sync::Arc::from([]),

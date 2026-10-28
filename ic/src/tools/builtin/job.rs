@@ -1386,6 +1386,18 @@ impl CreateJobTool {
                 "failed to register external job: {error}"
             )));
         }
+        // WI#475: mark the job as external so stuck detection applies the
+        // external-worker idle threshold and heartbeat baseline, and so
+        // recovery messages can say truthfully that no daemon retry happens.
+        if let Err(error) = self
+            .context_manager
+            .update_context(job_id, |job| {
+                job.external_worker = Some(worker_name.to_string());
+            })
+            .await
+        {
+            tracing::warn!(job_id = %job_id, "Failed to mark job as external: {error}");
+        }
 
         let record = SandboxJobRecord {
             id: job_id,

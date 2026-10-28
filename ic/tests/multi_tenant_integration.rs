@@ -569,6 +569,7 @@ fn gateway_state_has_multi_tenant_fields() {
         ws_idle_timeout_secs: 120,
         voice: None,
         voice_rate_limiter: PerUserRateLimiter::new(10, 60),
+        context_manager: None,
     };
 
     assert_eq!(state.owner_id, "fallback");
@@ -651,6 +652,7 @@ async fn start_owner_scoped_sender_server() -> (
         ws_idle_timeout_secs: 120,
         voice: None,
         voice_rate_limiter: lunarwing::channels::web::server::PerUserRateLimiter::new(10, 60),
+        context_manager: None,
     });
 
     let auth = MultiAuthState::multi(tokens);
@@ -1044,6 +1046,7 @@ async fn start_multi_user_server_with_db() -> (
         ws_idle_timeout_secs: 120,
         voice: None,
         voice_rate_limiter: lunarwing::channels::web::server::PerUserRateLimiter::new(10, 60),
+        context_manager: None,
     });
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();

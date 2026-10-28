@@ -653,7 +653,8 @@ impl Agent {
             self.context_manager.clone(),
             self.config.stuck_threshold,
             self.config.max_repair_attempts,
-        );
+        )
+        .with_external_stuck_threshold(self.config.external_stuck_threshold);
         if let Some(ref store) = self.deps.store {
             self_repair = self_repair.with_store(Arc::clone(store));
         }
