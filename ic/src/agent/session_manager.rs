@@ -276,6 +276,38 @@ impl SessionManager {
         mgr
     }
 
+    /// Find the thread in `user_id`'s session currently awaiting approval of
+    /// `request_id`.
+    ///
+    /// Used by the gateway approval endpoint to derive the owning thread when
+    /// the caller omits `thread_id` (WI#472). Scoped to the caller's own
+    /// session, so it can never resolve another user's approval. Returns `None`
+    /// for zero or (defensively) more than one match.
+    pub async fn find_awaiting_approval_thread(
+        &self,
+        user_id: &str,
+        request_id: Uuid,
+    ) -> Option<Uuid> {
+        let session = {
+            let sessions = self.sessions.read().await;
+            sessions.get(user_id).cloned()?
+        };
+        let sess = session.lock().await;
+        let mut matches = sess
+            .threads
+            .values()
+            .filter(|thread| {
+                thread.state == crate::agent::session::ThreadState::AwaitingApproval
+                    && thread
+                        .pending_approval
+                        .as_ref()
+                        .is_some_and(|pending| pending.request_id == request_id)
+            })
+            .map(|thread| thread.id);
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    }
+
     /// Remove sessions that have been idle for longer than the given duration.
     ///
     /// Returns the number of sessions pruned.
@@ -463,6 +495,55 @@ mod tests {
             .prune_stale_sessions(std::time::Duration::from_secs(86400 * 365))
             .await;
         assert_eq!(pruned, 0);
+    }
+
+    #[tokio::test]
+    async fn test_find_awaiting_approval_thread_resolves_only_the_owner() {
+        use crate::agent::session::{PendingApproval, ThreadState};
+
+        let manager = SessionManager::new();
+        let (session, thread_id) = manager.resolve_thread("user-1", "gateway", None).await;
+        let request_id = Uuid::new_v4();
+        let foreign_request = Uuid::new_v4();
+
+        {
+            let mut sess = session.lock().await;
+            let thread = sess.threads.get_mut(&thread_id).expect("resolved thread");
+            thread.state = ThreadState::AwaitingApproval;
+            thread.pending_approval = Some(PendingApproval {
+                request_id,
+                tool_name: "shell".into(),
+                parameters: serde_json::json!({}),
+                display_parameters: serde_json::json!({}),
+                description: "run".into(),
+                tool_call_id: "call_1".into(),
+                context_messages: Vec::new(),
+                deferred_tool_calls: Vec::new(),
+                user_timezone: None,
+                allow_always: true,
+            });
+        }
+
+        assert_eq!(
+            manager
+                .find_awaiting_approval_thread("user-1", request_id)
+                .await,
+            Some(thread_id),
+            "the owning thread is derived from the pending request id"
+        );
+        assert_eq!(
+            manager
+                .find_awaiting_approval_thread("user-2", request_id)
+                .await,
+            None,
+            "another user's session never resolves this approval"
+        );
+        assert_eq!(
+            manager
+                .find_awaiting_approval_thread("user-1", foreign_request)
+                .await,
+            None
+        );
     }
 
     #[tokio::test]

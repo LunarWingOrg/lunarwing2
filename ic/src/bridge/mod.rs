@@ -37,6 +37,7 @@ pub use router::{
     approve_skill_patch,
     approve_skill_proposal,
     clear_engine_pending_auth,
+    find_engine_approval_gate_for_request,
     // Query functions
     fire_engine_mission,
     fire_engine_webhook_mission,

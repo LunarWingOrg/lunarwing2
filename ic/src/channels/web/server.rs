@@ -1472,7 +1472,7 @@ pub(crate) async fn chat_pending_gates_handler(
     ))
 }
 
-async fn chat_approval_handler(
+pub(crate) async fn chat_approval_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
     Json(req): Json<ApprovalRequest>,
@@ -1496,6 +1496,13 @@ async fn chat_approval_handler(
         )
     })?;
 
+    // WI#472: resolve the owning thread server-side. Without this an approval
+    // sent without `thread_id` matched no gate and still returned 202, leaving
+    // the gate (and for `deny`, the action) untouched.
+    let thread_id =
+        resolve_approval_thread(&state, &user.user_id, request_id, req.thread_id.as_deref())
+            .await?;
+
     // Build a structured ExecApproval submission as JSON, sent through the
     // existing message pipeline so the agent loop picks it up.
     let approval = crate::agent::submission::Submission::ExecApproval {
@@ -1515,9 +1522,7 @@ async fn chat_approval_handler(
         msg = msg.with_sender_id(&state.default_sender_id);
     }
 
-    if let Some(ref thread_id) = req.thread_id {
-        msg = msg.with_thread(thread_id);
-    }
+    msg = msg.with_thread(&thread_id);
 
     let msg_id = msg.id;
 
@@ -1547,6 +1552,67 @@ async fn chat_approval_handler(
             status: "accepted",
         }),
     ))
+}
+
+/// Resolve the engine/legacy thread that owns `request_id` for `user_id`.
+///
+/// Engine V2 pending gates are consulted first (they outlive the in-memory
+/// session for work that originated on another channel), then the caller's own
+/// legacy session. Both lookups are user-scoped, so an approval can never
+/// resolve another user's gate. Returns 404 when no live gate matches — the
+/// caller must not report success for an approval that would be a no-op — and
+/// 400 when the request names a `thread_id` that does not own the gate.
+async fn resolve_approval_thread(
+    state: &GatewayState,
+    user_id: &str,
+    request_id: Uuid,
+    requested_thread: Option<&str>,
+) -> Result<String, (StatusCode, String)> {
+    let requested = requested_thread.map(str::trim).filter(|id| !id.is_empty());
+    if requested_thread.is_some() && requested.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "thread_id must not be blank when supplied".to_string(),
+        ));
+    }
+
+    let engine_gate =
+        crate::bridge::find_engine_approval_gate_for_request(user_id, request_id)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, %user_id, %request_id, "Failed to inspect pending approval gate");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Failed to inspect pending approvals".to_string(),
+                )
+            })?;
+    if let Some(gate) = engine_gate {
+        return owned_thread(gate.thread_id, requested);
+    }
+
+    if let Some(session_manager) = state.session_manager.as_ref()
+        && let Some(thread_id) = session_manager
+            .find_awaiting_approval_thread(user_id, request_id)
+            .await
+    {
+        return owned_thread(thread_id.to_string(), requested);
+    }
+
+    Err((
+        StatusCode::NOT_FOUND,
+        "No pending approval matches this request_id".to_string(),
+    ))
+}
+
+/// Accept the resolved owner, or reject a caller-supplied thread that differs.
+fn owned_thread(owner: String, requested: Option<&str>) -> Result<String, (StatusCode, String)> {
+    match requested {
+        Some(requested) if requested != owner => Err((
+            StatusCode::BAD_REQUEST,
+            "thread_id does not own this approval request".to_string(),
+        )),
+        _ => Ok(owner),
+    }
 }
 
 /// Submit an auth token to the extension manager and resume a matching engine gate.
@@ -3275,6 +3341,30 @@ mod tests {
             parameters: "{}".to_string(),
             resume_kind,
         }
+    }
+
+    /// WI#472: a caller-supplied `thread_id` must name the gate's owner; any
+    /// other thread is refused rather than silently accepted, and the resolved
+    /// owner is used when the caller omits it.
+    #[test]
+    fn approval_thread_must_match_the_resolved_gate_owner() {
+        let owner = Uuid::new_v4().to_string();
+        let other = Uuid::new_v4().to_string();
+
+        assert_eq!(
+            owned_thread(owner.clone(), None),
+            Ok(owner.clone()),
+            "omitted thread_id resolves to the gate owner"
+        );
+        assert_eq!(
+            owned_thread(owner.clone(), Some(owner.as_str())),
+            Ok(owner.clone())
+        );
+
+        let error = owned_thread(owner, Some(other.as_str()))
+            .expect_err("a foreign thread_id must not be accepted");
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1.contains("does not own"));
     }
 
     #[test]

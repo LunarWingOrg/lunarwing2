@@ -632,6 +632,17 @@ broadcast. Approvals on engine-routed channels that match no engine gate fall
 through to the legacy path with a warn-level log naming the request id and
 conversation scope, so an unmatched approval is diagnosable from logs.
 
+`POST /api/chat/approval` resolves the owning thread server-side (WI#472).
+`thread_id` is optional: the handler looks up the live approval gate by
+`request_id` — engine pending gates first, then the caller's own legacy
+session — and scopes the submission to that thread, so `approve`, `always` and
+`deny` all reach their gate without the caller supplying it. Both lookups are
+user-scoped, so an approval never resolves another user's gate, and resolution
+still re-checks ownership in `take_verified`. A request id that matches no live
+approval returns 404 instead of the previous `202 accepted` no-op (which left
+the gate pending, most dangerously for `deny`); a supplied `thread_id` that is
+blank or does not name the resolved owner returns 400.
+
 Recovered authentication controls send both `request_id` and `thread_id` to
 `POST /api/chat/auth-token` and `POST /api/chat/auth-cancel`. The pair is optional
 for legacy clients, but an explicitly supplied pair must match a live auth gate
