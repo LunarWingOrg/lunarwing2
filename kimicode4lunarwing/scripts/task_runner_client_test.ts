@@ -13,6 +13,7 @@ import {
   delegateTaskToRunner,
   processGroupMembers,
   reapTaskProcessGroup,
+  runnerProcessGroupReapRequired,
   runnerSocketLabel,
   verifyRunnerSocket,
 } from "./task_runner_client.js"
@@ -60,6 +61,21 @@ test("bridgeRunnerSocketPath is env-driven and empty by default", () => {
   } finally {
     if (previous === undefined) delete process.env.LUNARWING_TASK_RUNNER_SOCKET
     else process.env.LUNARWING_TASK_RUNNER_SOCKET = previous
+  }
+})
+
+test("a remote task container owns process reaping", () => {
+  const previous = process.env.LUNARWING_TASK_RUNNER_REMOTE
+  try {
+    delete process.env.LUNARWING_TASK_RUNNER_REMOTE
+    assert.equal(runnerProcessGroupReapRequired(), true)
+    process.env.LUNARWING_TASK_RUNNER_REMOTE = "0"
+    assert.equal(runnerProcessGroupReapRequired(), true)
+    process.env.LUNARWING_TASK_RUNNER_REMOTE = "1"
+    assert.equal(runnerProcessGroupReapRequired(), false)
+  } finally {
+    if (previous === undefined) delete process.env.LUNARWING_TASK_RUNNER_REMOTE
+    else process.env.LUNARWING_TASK_RUNNER_REMOTE = previous
   }
 })
 
