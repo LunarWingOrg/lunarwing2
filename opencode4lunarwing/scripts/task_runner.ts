@@ -42,6 +42,7 @@ import { createServer, type Server, type Socket } from "node:net"
 import { chmodSync, lstatSync, mkdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs"
 import { dirname } from "node:path"
 
+import type { OpencodeClient } from "@opencode-ai/sdk/v2/client"
 import { executeTask } from "./opencode_task_executor"
 import {
   isRecord,
@@ -160,7 +161,7 @@ export class TaskRunner {
   // NL-8: one cap for both directions, following the hub's envelope cap.
   private readonly lineCap = runnerLineCapBytes()
 
-  constructor() {
+  constructor(private readonly sdkOverride?: OpencodeClient) {
     this.server = createServer((conn) => this.acceptConnection(conn))
   }
 
@@ -444,7 +445,7 @@ export class TaskRunner {
           conn.end()
         },
         controller.signal,
-        undefined,
+        this.sdkOverride,
         promptQueue,
       )
     } catch (err) {
