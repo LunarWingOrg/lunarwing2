@@ -91,6 +91,7 @@ export XDG_STATE_HOME="$HOME/.local/state"
 export XDG_CACHE_HOME="$HOME/.cache"
 export TMPDIR="$SMOKE_ROOT/tmp"
 export WORKSPACE_ROOT="$SMOKE_ROOT/workspace"
+export WS_STATE_FILE="$SMOKE_ROOT/ws_state.json"
 export PYTHONDONTWRITEBYTECODE=1
 export OPENCODE2_BASE_URL="http://127.0.0.1:1"
 export OPENCODE_PASSWORD="candidate-runtime-smoke-only"
