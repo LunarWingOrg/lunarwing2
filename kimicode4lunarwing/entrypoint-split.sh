@@ -7,6 +7,7 @@ die() { log "ERROR: $*" >&2; exit 1; }
 export PATH=/usr/local/cargo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 ROLE="${LUNARWING_CONTAINER_ROLE:?LUNARWING_CONTAINER_ROLE must be split-bridge or split-task}"
+APP_DIR="${LUNARWING_APP_DIR:-/app}"
 TASK_UID="${KIMI_TASK_UID:-10002}"
 TASK_GID="${KIMI_TASK_GID:-10002}"
 BRIDGE_UID="${KIMI_BRIDGE_UID:?KIMI_BRIDGE_UID is required for the split launcher}"
@@ -33,7 +34,7 @@ start_health() {
   export WS_STATE_FILE="${WS_STATE_FILE:-/tmp/lunarwing_ws_state.json}"
   export KIMI_MODE=websocket
   export KIMI_VERSION="kimi-worker-1.0.0"
-  /usr/bin/python3 /app/health_server.py --port "$health_port" &
+  /usr/bin/python3 "$APP_DIR"/health_server.py --port "$health_port" &
   HEALTH_PID=$!
 }
 
@@ -72,8 +73,8 @@ run_bridge() {
   done
   start_health
   trap stop_bridge EXIT INT TERM
-  cd /app
-  node /app/scripts/lunarwing_bridge.js &
+  cd "$APP_DIR"
+  node "$APP_DIR"/scripts/lunarwing_bridge.js &
   BRIDGE_PID=$!
   log "Kimi non-root bridge started as uid $(id -u)"
   wait "$BRIDGE_PID"
@@ -87,10 +88,10 @@ run_task() {
   unset AGENT_AUTH_TOKEN AGENT_AUTH_TOKEN_FILE KIMI_TASK_UID KIMI_TASK_GID
   export HOME=/home/kimi
   export KIMI_CODE_HOME="${KIMI_CODE_HOME:-/home/kimi/.kimi-code}"
-  KIMI_CODE_HOME="$KIMI_CODE_HOME" /app/entrypoint-task-setup.sh
+  KIMI_CODE_HOME="$KIMI_CODE_HOME" "$APP_DIR"/entrypoint-task-setup.sh
   export KIMI_API_KEY="${KIMI_API_KEY:-${TENSORZERO_API_KEY:-}}"
   log "Kimi task runner started as uid $(id -u)"
-  exec node /app/scripts/task_runner.js "$RUNNER_SOCKET"
+  exec node "$APP_DIR"/scripts/task_runner.js "$RUNNER_SOCKET"
 }
 
 case "$ROLE" in
