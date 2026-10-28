@@ -36,7 +36,7 @@
  */
 
 import { createServer, type Server, type Socket } from "node:net"
-import { mkdirSync, rmSync } from "node:fs"
+import { chmodSync, mkdirSync, rmSync } from "node:fs"
 import { createHash } from "node:crypto"
 import { dirname, join } from "node:path"
 
@@ -143,6 +143,19 @@ export class ToolProxyRelay {
     })
     if (!started) return null
     this.tasks.set(taskId, task)
+    if (process.env.LUNARWING_TASK_RUNNER_REMOTE === "1") {
+      try {
+        chmodSync(socketPath, 0o660)
+        chmodSync(dirname(socketPath), 0o711)
+      } catch (err) {
+        console.error(
+          `[tool-proxy] task ${taskId}: shared socket permission failed (task runs without tools):`,
+          err instanceof Error ? err.message : err,
+        )
+        this.closeTask(taskId)
+        return null
+      }
+    }
     return {
       socketPath,
       close: () => this.closeTask(taskId),
