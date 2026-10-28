@@ -407,6 +407,110 @@ worker_egress_nft() {
   fi
 }
 
+WORKER_EGRESS_SESSION_TOKEN='##LWEGRESS##'
+
+_worker_egress_session_script() {
+  cat <<'SESSION'
+ruleset="$1"; shift
+printf '%s %s\n' "$LW_TOKEN" "@netns"
+readlink /proc/self/ns/net 2>/dev/null || printf 'unknown\n'
+if [ -n "$ruleset" ]; then
+  "$LW_NFT" -f "$ruleset" >&2 || exit 11
+fi
+for chain in "$@"; do
+  printf '%s %s\n' "$LW_TOKEN" "$chain"
+  if ! "$LW_NFT" list chain inet "$LW_TABLE" "$chain" 2>/dev/null; then
+    printf '%s %s\n' "$LW_TOKEN" "@missing:$chain"
+  fi
+done
+SESSION
+}
+
+_worker_egress_session_section() {  # <combined-session-output> <section>
+  awk -v token="$WORKER_EGRESS_SESSION_TOKEN" -v want="$2" '
+    substr($0, 1, length(token)) == token { cur = substr($0, length(token) + 2); next }
+    cur == want { print }
+  ' <<<"$1"
+}
+
+_worker_egress_keeper_state() {
+  local name="$1" running=""
+  ensure_container_runtime
+  if [[ "$CONTAINER_RT" != "podman" || "$MT_ROOTLESS" != "true" ]]; then
+    printf 'not applicable (%s is not rootless podman)\n' "${CONTAINER_RT:-runtime}"
+    return 0
+  fi
+  running="$(_ctr "$name" ps -q 2>/dev/null)" || running=""
+  if [[ -n "${running//[[:space:]]/}" ]]; then
+    printf 'running (a container of %s is up)\n' "$name"
+  else
+    printf 'absent (no container of %s is up, so every podman unshare --rootless-netns invocation gets a fresh namespace)\n' \
+      "$name"
+  fi
+}
+
+_worker_egress_netns_session() {  # <tenant> <ruleset-or-empty> <chain>...
+  local name="$1"; shift
+  local nft_bin script
+  nft_bin="$(command -v nft 2>/dev/null)" || nft_bin=""
+  [[ -n "$nft_bin" ]] \
+    || die "nft not found; refusing to apply worker egress for '$name' without an egress filter"
+  local -a session_env=(
+    "PATH=$PATH"
+    "LW_NFT=$nft_bin"
+    "LW_TABLE=$WORKER_EGRESS_TABLE"
+    "LW_TOKEN=$WORKER_EGRESS_SESSION_TOKEN"
+  )
+  script="$(_worker_egress_session_script)"
+  ensure_container_runtime
+  if [[ "$CONTAINER_RT" != "podman" || "$MT_ROOTLESS" != "true" ]]; then
+    env -i "${session_env[@]}" bash -c "$script" bash "$@"
+    return
+  fi
+  local uid home
+  uid="$(id -u "$name")" || die "cannot resolve uid for tenant '$name'"
+  home="$(getent passwd "$name" | cut -d: -f6)"
+  (cd / && exec sudo -u "$name" env HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" \
+    podman unshare --rootless-netns env -i "${session_env[@]}" \
+    bash -c "$script" bash "$@")
+}
+
+_worker_egress_load_and_verify() {  # <tenant> <ruleset-path>
+  local name="$1" ruleset_path="$2" fwd_chain in_chain netns chain dump
+  local session_out="" session_rc=0
+  fwd_chain="$(worker_egress_chain "$name")"
+  in_chain="$(worker_egress_input_chain "$name")"
+  session_out="$(_worker_egress_netns_session "$name" "$ruleset_path" "$fwd_chain" "$in_chain")" \
+    || session_rc=$?
+  netns="$(_worker_egress_session_section "$session_out" "@netns")"
+  netns="${netns%%$'\n'*}"
+  [[ -n "$netns" ]] || netns="unknown"
+  if [[ "$session_rc" == "11" ]]; then
+    printf 'the ruleset %s failed to load in network namespace %s\n' "$ruleset_path" "$netns" >&2
+    return 11
+  fi
+  if [[ "$session_rc" != "0" ]]; then
+    printf 'nft could not run in the network namespace (exit %s; namespace %s; keeper: %s)\n' \
+      "$session_rc" "$netns" "$(_worker_egress_keeper_state "$name")" >&2
+    return 12
+  fi
+  for chain in "$fwd_chain" "$in_chain"; do
+    if [[ -n "$(_worker_egress_session_section "$session_out" "@missing:$chain")" ]]; then
+      printf 'chain %s is absent in network namespace %s (keeper: %s)\n' \
+        "$chain" "$netns" "$(_worker_egress_keeper_state "$name")" >&2
+      return 12
+    fi
+    dump="$(_worker_egress_session_section "$session_out" "$chain")"
+    if ! worker_egress_verify_dump "$name" "$dump"; then
+      printf '%s\n' "$dump" >&2
+      printf 'chain %s lacks the exact reject for the tenant subnet in network namespace %s (keeper: %s)\n' \
+        "$chain" "$netns" "$(_worker_egress_keeper_state "$name")" >&2
+      return 12
+    fi
+    printf '%s\n' "$dump"
+  done
+}
+
 worker_egress_verify_dump() {
   local name="$1" dump="$2" subnet
   subnet="$(worker_egress_state_get "$name" SUBNET)"
@@ -558,17 +662,24 @@ install_worker_egress_guard() {
 }
 
 worker_egress_apply() {
-  local name="$1" ruleset_path verified
+  local name="$1" ruleset_path verified_file rc=0
   require_cmd nft
   ruleset_path="$(worker_egress_ruleset_path "$name")"
   _worker_egress_write_ruleset "$name" \
     || die "failed to render worker egress ruleset for '$name'; previous boot state removed"
   install_worker_egress_guard
-  worker_egress_nft "$name" -f "$ruleset_path" \
-    || die "failed to load worker egress ruleset for '$name'"
-  verified="$(worker_egress_verify "$name")" \
-    || die "worker egress filter for '$name' did not survive the load with both exact reject rules (fail closed)"
-  printf '%s\n' "$verified"
+  verified_file="$(mktemp "${WORKER_EGRESS_DIR}/.verified.XXXXXX")"
+  _worker_egress_load_and_verify "$name" "$ruleset_path" >"$verified_file" || rc=$?
+  if [[ "$rc" == "11" ]]; then
+    rm -f -- "$verified_file"
+    die "failed to load worker egress ruleset for '$name'"
+  fi
+  if [[ "$rc" != "0" ]]; then
+    rm -f -- "$verified_file"
+    die "worker egress filter for '$name' did not survive the load with both exact reject rules (fail closed)"
+  fi
+  cat -- "$verified_file"
+  rm -f -- "$verified_file"
 }
 
 worker_egress_flush() {
