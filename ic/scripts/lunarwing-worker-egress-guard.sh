@@ -132,9 +132,9 @@ fi
 session="$(declare -f die verify_chain filter_session)"$'\n''filter_session "$@"'
 session_path="$(dirname "$NFT"):/usr/sbin:/usr/bin:/sbin:/bin"
 if [[ "$mode" == rootless ]]; then
-  podman_for_tenant unshare --rootless-netns env -i "PATH=$session_path" \
-    bash -c "$session" bash "$NFT" "$ruleset" "$chain" "$input_chain" "$subnet" "$VERIFY_ONLY" "$keeper_state"
+  podman_for_tenant unshare --rootless-netns env -i "PATH=$session_path" HOME=/ \
+    bash --noprofile --norc -c "$session" bash "$NFT" "$ruleset" "$chain" "$input_chain" "$subnet" "$VERIFY_ONLY" "$keeper_state"
 else
-  env -i "PATH=$session_path" bash -c "$session" bash \
+  env -i "PATH=$session_path" HOME=/ bash --noprofile --norc -c "$session" bash \
     "$NFT" "$ruleset" "$chain" "$input_chain" "$subnet" "$VERIFY_ONLY" "$keeper_state"
 fi
