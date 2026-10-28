@@ -34,6 +34,12 @@ import { executeTask } from "./opencode_task_executor"
 import type { OpencodeClient } from "@opencode-ai/sdk/v2/client"
 import { resolveTaskWorkspace } from "./workspace_path"
 import { ToolProxyRelay, type TaskProxyHandle } from "./lunarwing_tool_proxy"
+import {
+  bridgeRunnerSocketPath,
+  delegateTaskToRunner,
+  sendTaskPromptToRunner,
+  verifyRunnerSocket,
+} from "./task_runner_client"
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -233,21 +239,46 @@ async function handleTaskRequest(
   let toolProxy: TaskProxyHandle | null = null
   try {
     toolProxy = await toolProxyRelay.startTask(request.task_id, ws)
-    await executeTask(
-      request,
-      (progress) => {
-        const msg = createEnvelope("task_progress", progress as unknown as Record<string, unknown>)
-        ws.send(JSON.stringify(msg))
-      },
-      (result) => {
-        const msg = createEnvelope("task_result", result as unknown as Record<string, unknown>)
-        ws.send(JSON.stringify(msg))
-        console.log(`[bridge] task ${request.task_id}: ${result.status} (${result.duration_ms}ms)`)
-      },
-      controller.signal,
-      sdkOverride,
-      promptQueue,
-    )
+    const runnerSocket = bridgeRunnerSocketPath()
+    if (runnerSocket) {
+      verifyRunnerSocket(runnerSocket)
+      const result = await delegateTaskToRunner(
+        runnerSocket,
+        request,
+        undefined,
+        (progress) => {
+          ws.send(JSON.stringify(createEnvelope("task_progress", progress as unknown as Record<string, unknown>)))
+        },
+        controller.signal,
+      )
+      ws.send(JSON.stringify(createEnvelope("task_result", result as unknown as Record<string, unknown>)))
+      console.log(`[bridge] task ${request.task_id}: ${result.status} (${result.duration_ms}ms, delegated)`)
+    } else {
+      await executeTask(
+        request,
+        (progress) => {
+          const msg = createEnvelope("task_progress", progress as unknown as Record<string, unknown>)
+          ws.send(JSON.stringify(msg))
+        },
+        (result) => {
+          const msg = createEnvelope("task_result", result as unknown as Record<string, unknown>)
+          ws.send(JSON.stringify(msg))
+          console.log(`[bridge] task ${request.task_id}: ${result.status} (${result.duration_ms}ms)`)
+        },
+        controller.signal,
+        sdkOverride,
+        promptQueue,
+      )
+    }
+  } catch (err) {
+    console.error(`[bridge] task ${request.task_id}: execution failed:`, err)
+    ws.send(JSON.stringify(createEnvelope("task_result", {
+      task_id: request.task_id,
+      status: "error",
+      output: "",
+      error: err instanceof Error ? err.message : String(err),
+      duration_ms: 0,
+    })))
   } finally {
     toolProxy?.close()
     activeTasks.delete(request.task_id)
@@ -336,6 +367,10 @@ function handleTaskPrompt(payload: unknown, ws: BridgeSocket): void {
   }
   if (queue.prompts.length >= MAX_CONTROL_QUEUE_PER_TASK) {
     refuse("per-task control queue limit reached")
+    return
+  }
+  if (bridgeRunnerSocketPath() && !sendTaskPromptToRunner(prompt)) {
+    refuse("task runner control channel unavailable")
     return
   }
   seen.add(prompt.seq)
