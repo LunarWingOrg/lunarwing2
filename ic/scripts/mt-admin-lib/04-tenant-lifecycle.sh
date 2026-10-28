@@ -1516,18 +1516,26 @@ upgrade_tenant() {
 }
 
 _upgrade_tenant_lifecycle_locked() {
-  local name="$1" upgrade_lock_fd
+  local name="$1" upgrade_lock_fd upgrade_rc restore_errexit=false
   say "acquiring tenant upgrade lock ..."
   exec {upgrade_lock_fd}>"${BUILD_LOCK}.${name}.upgrade" \
     || die "failed to open tenant upgrade lock"
   flock -x "$upgrade_lock_fd" || die "failed to acquire tenant upgrade lock"
+  [[ "$-" == *e* ]] && restore_errexit=true
+  set +e
   if tenant_darkirc_enabled "$name" && darkirc_managed_state_exists "$name"; then
     with_darkirc_writer_lock "$name" upgrade_tenant_darkirc_locked "$@"
+    upgrade_rc=$?
   else
     upgrade_tenant_locked "$@"
+    upgrade_rc=$?
   fi
-  flock -u "$upgrade_lock_fd" || die "failed to release tenant upgrade lock"
+  if [[ "$restore_errexit" == true ]]; then
+    set -e
+  fi
+  flock -u "$upgrade_lock_fd" || upgrade_rc=1
   exec {upgrade_lock_fd}>&-
+  return "$upgrade_rc"
 }
 
 upgrade_tenant_locked() {
