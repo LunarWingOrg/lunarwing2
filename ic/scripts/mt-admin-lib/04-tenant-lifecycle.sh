@@ -956,12 +956,11 @@ _start_tenant_workers() {
         "start_tenant_${_w}" "$name"
       )
       rc=$?
-      set -e
       if [[ "$rc" -eq 3 ]]; then
         say "WARNING: $_w worker failed to start for $name; continuing" >&2
         failed_workers+="${failed_workers:+ }$_w"
       elif [[ "$rc" -ne 0 ]]; then
-        exit "$rc"
+        return "$rc"
       fi
     elif [[ "$INIT_SYSTEM" == "openrc" ]] && tenant_worker_enabled "$name" "$_w"; then
       say "$_w worker intentionally stopped for $name (skipping; use 'start-worker $name $_w')"
@@ -1108,7 +1107,15 @@ start_tenant() {
   # host image happens to exist — regardless of what this tenant chose — because
   # its only guards are "port allocated" (always true) and "image present"
   # (host-wide). See tenant_worker_enabled / PER_TENANT_WORKER_GATING.md.
+  local worker_start_rc restore_errexit=false
+  [[ "$-" == *e* ]] && restore_errexit=true
+  set +e
   _start_tenant_workers "$name"
+  worker_start_rc=$?
+  [[ "$restore_errexit" != true ]] || set -e
+  if [[ "$worker_start_rc" -ne 0 ]]; then
+    return "$worker_start_rc"
+  fi
   _ssh_ready_summary "$name" || true
 }
 
