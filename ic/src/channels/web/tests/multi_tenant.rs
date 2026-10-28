@@ -2220,6 +2220,7 @@ mod approval_resolution {
             ws_idle_timeout_secs: 120,
             voice: None,
             voice_rate_limiter: PerUserRateLimiter::new(10, 60),
+            context_manager: None,
         });
         (state, rx, thread_id)
     }
