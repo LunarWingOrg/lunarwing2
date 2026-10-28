@@ -96,4 +96,3 @@ images present. Nothing was reprovisioned or destroyed.
   fixes the pin invalidates it (the trail said `6ee29bfe5`, then the correcting
   commit moved the head to `ecfd89bcc`). Reference the MR by iid and source
   branch instead; GitLab tracks the head.
-
