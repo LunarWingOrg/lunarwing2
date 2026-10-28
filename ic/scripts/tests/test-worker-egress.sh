@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # WI#424 control 1 — hermetic worker egress boundary harness.
-# shellcheck disable=SC1091,SC2016,SC2034,SC2329  # generated sources, literal unit pins, indirect test doubles
+# shellcheck disable=SC1091,SC2016,SC2030,SC2031,SC2034,SC2329  # generated sources, scoped fixture PATH, literal unit pins, indirect test doubles
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,7 +11,12 @@ source "$MT_ADMIN"
 
 failures=0
 fixture="$(mktemp -d)"
-trap 'command rm -rf "$fixture"' EXIT
+WI504_NETNS_BIN=""
+cleanup_fixture() {
+  command rm -rf -- "$fixture"
+  [[ -z "$WI504_NETNS_BIN" ]] || command rm -rf -- "$WI504_NETNS_BIN"
+}
+trap cleanup_fixture EXIT
 pass() { printf 'PASS: %s\n' "$1"; }
 fail() { printf 'FAIL: %s\n' "$1" >&2; failures=$((failures + 1)); }
 assert_eq() {
@@ -70,7 +75,18 @@ getent() {
     esac
     return 0
   fi
+  if [[ "${1:-}" == "passwd" ]]; then
+    printf '%s:x:1000:1000:harness tenant:/home/%s:/bin/bash\n' "${2:-}" "${2:-}"
+    return 0
+  fi
   command getent "$@"
+}
+id() {
+  if [[ "${1:-}" == "-u" && -n "${2:-}" ]]; then
+    printf '1000\n'
+    return 0
+  fi
+  command id "$@"
 }
 
 NFT_LOAD_RC=0
@@ -153,6 +169,120 @@ _ctr() {
   esac
 }
 
+_wi504_exec_tmpdir() {
+  local parent dir
+  for parent in "${TMPDIR:-/tmp}" /var/tmp "$HOME"; do
+    [[ -w "$parent" ]] || continue
+    dir="$(mktemp -d "$parent/.wi504-netns.XXXXXX" 2>/dev/null)" || continue
+    printf '#!/bin/sh\nexit 0\n' >"$dir/.probe" || { rm -rf -- "$dir"; continue; }
+    chmod +x "$dir/.probe"
+    if "$dir/.probe" 2>/dev/null; then
+      rm -f -- "$dir/.probe"
+      printf '%s\n' "$dir"
+      return 0
+    fi
+    rm -rf -- "$dir"
+  done
+  return 1
+}
+if ! WI504_NETNS_BIN="$(_wi504_exec_tmpdir)"; then
+  fail "WI#504 fixture needs a temp directory that allows executable scripts"
+  WI504_NETNS_BIN="$fixture/netns-bin"
+fi
+NETNS_BIN="$WI504_NETNS_BIN"
+mkdir -p "$NETNS_BIN"
+NETNS_NFT_LOG="$NETNS_BIN/netns-nft.log"
+NETNS_LOG="$NETNS_BIN/netns.log"
+
+cat >"$NETNS_BIN/nft" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+namespace="${LW_FAKE_NETNS:-host}"
+state="$script_dir/netns-state/$namespace"
+printf '%s %s\n' "$namespace" "$*" >>"$script_dir/netns-nft.log"
+case "${1:-}" in
+  -f)
+    load_rc="$(<"$script_dir/load_rc")"
+    [[ "$load_rc" == "0" ]] || exit "$load_rc"
+    cat "$2" >"$state"
+    ;;
+  list)
+    [[ "$(<"$script_dir/list_rc")" == "0" ]] || exit 1
+    if [[ -s "$script_dir/list_out" ]]; then
+      cat "$script_dir/list_out"
+      exit 0
+    fi
+    [[ -f "$state" ]] || exit 1
+    chain="${!#}"
+    awk -v chain="$chain" '
+      index($0, "chain " chain " {") { inside = 1; print; next }
+      inside && /^    }/ { inside = 0; print; next }
+      inside {
+        sub(/counter reject with icmpx type admin-prohibited/, \
+            "counter packets 0 bytes 0 reject with icmpx admin-prohibited")
+        print
+      }
+    ' "$state"
+    ;;
+esac
+STUB
+cat >"$NETNS_BIN/podman" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+if [[ "${1:-}" == "unshare" && "${2:-}" == "--rootless-netns" ]]; then
+  shift 2
+  sequence=$(( $(wc -l <"$script_dir/netns.log") + 1 ))
+  namespace="netns-$sequence"
+  printf '%s\n' "$namespace" >>"$script_dir/netns.log"
+  if [[ "${1:-}" == "env" && "${2:-}" == "-i" ]]; then
+    shift 2
+    exec env -i "LW_FAKE_NETNS=$namespace" "$@"
+  fi
+  exec env "LW_FAKE_NETNS=$namespace" "$@"
+fi
+printf '%s\n' "$*" >>"${CTR_LOG:-/dev/null}"
+STUB
+cat >"$NETNS_BIN/sudo" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -u) shift 2 ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+exec "$@"
+STUB
+chmod +x "$NETNS_BIN/nft" "$NETNS_BIN/podman" "$NETNS_BIN/sudo"
+
+netns_configure() {
+  printf '%s\n' "$NFT_LOAD_RC" >"$NETNS_BIN/load_rc"
+  printf '%s\n' "$NFT_LIST_RC" >"$NETNS_BIN/list_rc"
+  printf '%s' "$NFT_LIST_OUT" >"$NETNS_BIN/list_out"
+}
+netns_reset() {
+  rm -rf -- "$NETNS_BIN/netns-state"
+  mkdir -p "$NETNS_BIN/netns-state"
+  : >"$NETNS_NFT_LOG"
+  : >"$NETNS_LOG"
+  NFT_LOAD_RC=0
+  NFT_LIST_RC=0
+  NFT_LIST_OUT=""
+  netns_configure
+}
+netns_env() {
+  (
+    export PATH="$NETNS_BIN:$PATH"
+    hash -r
+    "$@"
+  )
+}
+netns_count() { awk '{ print $1 }' "$NETNS_NFT_LOG" | sort -u | wc -l; }
+netns_reset
+
 # ── allocation, locking, and per-tenant rendering ─────────────────────────────
 subnet="$(_worker_egress_alloc_subnet alpha)"
 assert_eq "$subnet" "10.89.10.0/24" "first allocation takes the lowest free /24"
@@ -222,34 +352,46 @@ LLM_TARGETS=("http://127.0.0.1:3000/v1" "https://203.0.113.10:8443/v1" "https://
 assert_rc_fail env CONTAINER_RT=podman MT_ROOTLESS=true WORKER_EGRESS_HOST_ADDRS=not-an-ip _worker_egress_host_addrs 10.89.10.1
 
 # ── apply and static host launch contract ─────────────────────────────────────
+netns_reset
 NFT_LIST_RC=1
-if (worker_egress_apply alpha) >/dev/null 2>"$fixture/apply.err"; then
+netns_configure
+if netns_env worker_egress_apply alpha >/dev/null 2>"$fixture/apply.err"; then
   fail "apply accepted a filter that did not survive"
 else
   pass "apply fails when the loaded chains disappear"
   assert_contains "$(cat "$fixture/apply.err")" 'did not survive the load' "apply refusal names the real cause"
+  assert_contains "$(cat "$fixture/apply.err")" 'network namespace netns-1' "apply identifies the namespace that was checked"
+  assert_contains "$(cat "$fixture/apply.err")" 'keeper: absent' "apply identifies the absent rootless namespace keeper"
 fi
-NFT_LIST_RC=0
+netns_reset
 NFT_LIST_OUT=$'chain "fwd_alpha" {\n}'
-if (worker_egress_apply alpha) >/dev/null 2>"$fixture/no-reject.err"; then
+netns_configure
+if netns_env worker_egress_apply alpha >/dev/null 2>"$fixture/no-reject.err"; then
   fail "apply accepted a chain without its reject"
 else
   pass "apply rejects a chain without its reject"
   assert_contains "$(cat "$fixture/no-reject.err")" 'exact reject' "no-reject refusal names the exact-reject contract"
+  assert_absent "$(cat "$fixture/no-reject.err")" 'is absent' "a present but incomplete chain is not reported missing"
 fi
-NFT_LIST_OUT=""
+netns_reset
 NFT_LOAD_RC=1
-assert_rc_fail worker_egress_apply alpha
-NFT_LOAD_RC=0
-NFT_CALLS=()
-: >"$NFT_LOG"
-if worker_egress_apply alpha >"$fixture/applied.dump" 2>"$fixture/apply-ok.err"; then
+netns_configure
+if netns_env worker_egress_apply alpha >/dev/null 2>"$fixture/load.err"; then
+  fail "apply accepted a ruleset that failed to load"
+else
+  pass "apply fails when the ruleset cannot load"
+  assert_contains "$(cat "$fixture/load.err")" 'failed to load' "load failure remains distinct from verification failure"
+fi
+netns_reset
+if netns_env worker_egress_apply alpha >"$fixture/applied.dump" 2>"$fixture/apply-ok.err"; then
   pass "apply succeeds with both live tenant chains"
 else
   fail "apply rejected a valid ruleset: $(cat "$fixture/apply-ok.err")"
 fi
-assert_contains "$(printf '%s\n' "${NFT_CALLS[@]}")" '-f' "apply loads the rendered file"
-assert_eq "$(grep -c 'list chain' "$NFT_LOG")" "2" "apply verifies forward and input chains"
+assert_eq "$(netns_count)" "1" "apply loads and verifies inside one fresh rootless namespace"
+assert_eq "$(grep -c 'list chain' "$NETNS_NFT_LOG")" "2" "apply verifies both tenant chains in the same namespace"
+assert_contains "$(cat "$NETNS_NFT_LOG")" '-f ' "apply loads the rendered ruleset"
+assert_contains "$(cat "$fixture/applied.dump")" 'counter packets 0 bytes 0 reject with icmpx admin-prohibited' "apply prints the verified live chain dumps"
 assert_eq "$(cat "$WORKER_EGRESS_DIR/alpha.hosts")" 'git.example.org:203.0.113.40' "static hosts come from the same resolved answers"
 launch_args="$(worker_egress_launch_args alpha)"
 assert_contains "$launch_args" '--dns
@@ -290,7 +432,8 @@ else
   pass "render failure removes stale nft and host state"
 fi
 OPERATOR_ALLOW=("https://203.0.113.20:443/repo.git")
-worker_egress_apply alpha >/dev/null
+netns_reset
+netns_env worker_egress_apply alpha >/dev/null
 
 if (
   worker_egress_ensure() { printf 'ensure\n' >>"$fixture/prepare.log"; }
@@ -364,7 +507,8 @@ else
   fail "docker network ensure rejected an unverified-DNS contract"
 fi
 
-worker_egress_apply alpha >/dev/null
+netns_reset
+netns_env worker_egress_apply alpha >/dev/null
 CTR_NETWORKS=lw-egress-alpha
 CTR_DNS=127.0.0.1
 CTR_EXTRA_HOSTS=git.example.org:203.0.113.40
@@ -438,7 +582,7 @@ CTR_CONTAINER_EXISTS=true
 # ── the real guard with a hermetic nft executable ─────────────────────────────
 guard="$HARNESS_REPO_ROOT/ic/scripts/lunarwing-worker-egress-guard.sh"
 worker_egress_ruleset alpha >"$fixture/alpha.nft"
-guard_bin="$fixture/bin"
+guard_bin="$NETNS_BIN/guard-bin"
 mkdir -p "$guard_bin"
 cat >"$guard_bin/nft" <<'STUB'
 #!/usr/bin/env bash
@@ -482,6 +626,15 @@ if PATH="$guard_bin:$PATH" "$guard" --verify "$fixture/alpha.nft" rootful fwd_al
 else
   fail "guard --verify rejected a live worker"
 fi
+netns_reset
+if PATH="$NETNS_BIN:$PATH" "$guard" "$fixture/alpha.nft" rootless fwd_alpha \
+    >"$fixture/rootless-guard.out" 2>"$fixture/rootless-guard.err"; then
+  pass "rootless guard loads and verifies before the first container starts"
+  assert_eq "$(netns_count)" "1" "rootless guard uses one fresh namespace for load and both reads"
+  assert_eq "$(grep -c 'list chain' "$NETNS_NFT_LOG")" "2" "rootless guard reads both chains in its load namespace"
+else
+  fail "rootless guard rejected a valid fresh namespace: $(cat "$fixture/rootless-guard.err")"
+fi
 mkdir -p "$fixture/no-nft"
 assert_rc_fail env PATH="$fixture/no-nft" /bin/bash "$guard" "$fixture/alpha.nft" rootful fwd_alpha
 assert_rc_fail env PATH="$guard_bin:$PATH" /bin/bash "$guard" "$fixture/alpha.nft" rootless fwd_alpha 'bad;tenant'
@@ -494,16 +647,16 @@ mkdir -p "$fixture/initd"
 OPENRC_INITD_DIR="$fixture/initd"
 CONTAINER_RT=podman
 MT_ROOTLESS=true
-WORKER_EGRESS_GUARD="$fixture/openrc-guard"
+WORKER_EGRESS_GUARD="$NETNS_BIN/openrc-guard"
 render_worker_openrc_unit alpha opencode2
-cat >"$fixture/openrc-guard" <<'STUB'
+cat >"$NETNS_BIN/openrc-guard" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$GUARD_LOG"
 if [[ "${1:-}" == "--verify" ]]; then exit "${VERIFY_RC:-0}"; fi
 exit "${LOAD_RC:-0}"
 STUB
-chmod +x "$fixture/openrc-guard"
-cat >"$fixture/runtime" <<'STUB'
+chmod +x "$NETNS_BIN/openrc-guard"
+cat >"$NETNS_BIN/runtime" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$CTR_LOG"
 case "${1:-}" in
@@ -512,13 +665,13 @@ case "${1:-}" in
   exec) ;;
 esac
 STUB
-chmod +x "$fixture/runtime"
+chmod +x "$NETNS_BIN/runtime"
 openrc_start() {
   (
     ebegin() { :; }; eend() { return 0; }; ewarn() { :; }; einfo() { :; }; checkpath() { :; }
     source "$OPENRC_INITD_DIR/lunarwing-opencode2-alpha"
     wk_rootless=false
-    wk_runtime="$fixture/runtime"
+    wk_runtime="$NETNS_BIN/runtime"
     wk_wait=1
     start
   )
@@ -541,7 +694,7 @@ assert_contains "$(cat "$CTR_LOG")" 'stop lunarwing-opencode2-alpha' "OpenRC pos
 if (
   ebegin() { :; }; eend() { return 0; }; ewarn() { :; }; einfo() { :; }; checkpath() { :; }
   source "$OPENRC_INITD_DIR/lunarwing-opencode2-alpha"
-  wk_rootless=false; wk_runtime="$fixture/runtime"; wk_egress_guard="$fixture/missing-guard"
+  wk_rootless=false; wk_runtime="$NETNS_BIN/runtime"; wk_egress_guard="$fixture/missing-guard"
   start
 ) >/dev/null 2>&1; then
   fail "OpenRC accepted a missing guard"
@@ -557,30 +710,24 @@ render_container_babysitter_unit alpha opencode2 lunarwing-opencode2-alpha 1000 
 babysitter_unit="$OPENRC_INITD_DIR/lunarwing-opencode2-alpha-sup"
 assert_contains "$(cat "$babysitter_unit")" 'babysitter_egress_guard' "babysitter receives the root-owned guard"
 assert_contains "$(cat "$babysitter_unit")" 'need net localmount lunarwing-opencode2-alpha' "babysitter depends on the worker unit"
-cat >"$fixture/podman" <<'STUB'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >>"$CTR_LOG"
-exit 0
-STUB
-chmod +x "$fixture/podman"
 babysitter="$HARNESS_REPO_ROOT/ic/scripts/lunarwing-ctr-babysit.sh"
 : >"$GUARD_LOG"; : >"$CTR_LOG"
-if PATH="$fixture:$PATH" LOAD_RC=0 VERIFY_RC=0 GUARD_LOG="$GUARD_LOG" CTR_LOG="$CTR_LOG" \
-    "$babysitter" lunarwing-opencode2-alpha "$fixture/openrc-guard" "$fixture/alpha.nft" fwd_alpha >/dev/null 2>&1; then
+if PATH="$NETNS_BIN:$PATH" LOAD_RC=0 VERIFY_RC=0 GUARD_LOG="$GUARD_LOG" CTR_LOG="$CTR_LOG" \
+    "$babysitter" lunarwing-opencode2-alpha "$NETNS_BIN/openrc-guard" "$fixture/alpha.nft" fwd_alpha >/dev/null 2>&1; then
   pass "babysitter runs pre/post guards around podman start"
   assert_contains "$(cat "$CTR_LOG")" 'start lunarwing-opencode2-alpha' "babysitter starts the guarded container"
 else
   fail "babysitter rejected healthy guards"
 fi
 : >"$GUARD_LOG"; : >"$CTR_LOG"
-assert_rc_fail env PATH="$fixture:$PATH" LOAD_RC=1 VERIFY_RC=0 GUARD_LOG="$GUARD_LOG" CTR_LOG="$CTR_LOG" \
-  "$babysitter" lunarwing-opencode2-alpha "$fixture/openrc-guard" "$fixture/alpha.nft" fwd_alpha
+assert_rc_fail env PATH="$NETNS_BIN:$PATH" LOAD_RC=1 VERIFY_RC=0 GUARD_LOG="$GUARD_LOG" CTR_LOG="$CTR_LOG" \
+  "$babysitter" lunarwing-opencode2-alpha "$NETNS_BIN/openrc-guard" "$fixture/alpha.nft" fwd_alpha
 assert_absent "$(cat "$CTR_LOG")" 'start lunarwing-opencode2-alpha' "babysitter pre-guard failure prevents respawn"
 : >"$GUARD_LOG"; : >"$CTR_LOG"
-assert_rc_fail env PATH="$fixture:$PATH" LOAD_RC=0 VERIFY_RC=1 GUARD_LOG="$GUARD_LOG" CTR_LOG="$CTR_LOG" \
-  "$babysitter" lunarwing-opencode2-alpha "$fixture/openrc-guard" "$fixture/alpha.nft" fwd_alpha
+assert_rc_fail env PATH="$NETNS_BIN:$PATH" LOAD_RC=0 VERIFY_RC=1 GUARD_LOG="$GUARD_LOG" CTR_LOG="$CTR_LOG" \
+  "$babysitter" lunarwing-opencode2-alpha "$NETNS_BIN/openrc-guard" "$fixture/alpha.nft" fwd_alpha
 assert_contains "$(cat "$CTR_LOG")" 'stop lunarwing-opencode2-alpha' "babysitter post-guard failure stops the respawned worker"
-assert_rc_fail env PATH="$fixture:$PATH" "$babysitter" lunarwing-opencode2-alpha "$fixture/missing-guard" "$fixture/alpha.nft" fwd_alpha
+assert_rc_fail env PATH="$NETNS_BIN:$PATH" "$babysitter" lunarwing-opencode2-alpha "$fixture/missing-guard" "$fixture/alpha.nft" fwd_alpha
 
 # ── source wiring pins ────────────────────────────────────────────────────────
 worker_config="$HARNESS_REPO_ROOT/ic/scripts/mt-admin-lib/09-worker-config.sh"
