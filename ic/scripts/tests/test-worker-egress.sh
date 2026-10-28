@@ -11,7 +11,10 @@ source "$MT_ADMIN"
 
 failures=0
 fixture="$(mktemp -d)"
-trap 'command rm -rf "$fixture"' EXIT
+# WI504_NETNS_BIN holds the exec-capable shim dir created later; it is outside
+# $fixture because some hosts mount $TMPDIR noexec.
+WI504_NETNS_BIN=""
+trap 'command rm -rf "$fixture" ${WI504_NETNS_BIN:+"$WI504_NETNS_BIN"}' EXIT
 pass() { printf 'PASS: %s\n' "$1"; }
 fail() { printf 'FAIL: %s\n' "$1" >&2; failures=$((failures + 1)); }
 assert_eq() {
@@ -70,7 +73,20 @@ getent() {
     esac
     return 0
   fi
+  if [[ "${1:-}" == "passwd" ]]; then
+    # WI#504 fixture: harness tenants are synthetic users; the real netns session
+    # resolves their uid/home through these entries.
+    printf '%s:x:1000:1000:harness tenant:/home/%s:/bin/bash\n' "${2:-}" "${2:-}"
+    return 0
+  fi
   command getent "$@"
+}
+id() {
+  if [[ "${1:-}" == "-u" && -n "${2:-}" ]]; then
+    printf '1000\n'
+    return 0
+  fi
+  command id "$@"
 }
 
 NFT_LOAD_RC=0
@@ -80,6 +96,11 @@ NFT_RULESET_FILE=""
 NFT_CALLS=()
 NFT_LOG="$fixture/nft.log"
 : >"$NFT_LOG"
+# WI#504: the apply path now runs the real single-session script through the fake
+# `nft`/`podman` pair below, so its knobs travel in the environment rather than in
+# shell-local state. `worker_egress_nft` (the function stub) still serves the
+# read-only audit / post-start paths, which legitimately re-read the netns.
+export NFT_LOAD_RC NFT_LIST_RC NFT_LIST_OUT NFT_LOG
 worker_egress_nft() {
   local name="$1"; shift
   NFT_CALLS+=("$name $*")
@@ -94,12 +115,20 @@ worker_egress_nft() {
       printf '%s\n' "$NFT_LIST_OUT"
       return 0
     fi
-    local chain="${!#}"
+    local chain state
+    # WI#504: apply now loads through the fake netns binaries rather than this
+    # stub, so nothing seeds NFT_RULESET_FILE anymore. The rendered ruleset that
+    # apply persists is precisely what a loaded namespace holds, so fall back to
+    # it for these read-only probes.
+    state="$NFT_RULESET_FILE"
+    [[ -n "$state" ]] || state="$(worker_egress_ruleset_path "$name")"
+    [[ -f "$state" ]] || return 1
+    chain="${!#}"
     awk -v chain="$chain" '
       index($0, "chain " chain " {") { inside = 1; print; next }
       inside && /^    }/ { inside = 0; print; next }
       inside && /counter reject with icmpx type admin-prohibited/ { print }
-    ' "$NFT_RULESET_FILE"
+    ' "$state"
     return 0
   fi
   return 0
@@ -152,6 +181,152 @@ _ctr() {
     *) return 0 ;;
   esac
 }
+
+# ── WI#504: a fake rootless-netns stack where EVERY invocation is a fresh namespace ──
+#
+# podman's rootless netns keeper only lives while a container of that user is up,
+# so on a tenant's first worker start (and after any reboot) each
+# `podman unshare --rootless-netns` invocation gets its OWN empty namespace. The
+# old apply loaded in one invocation and verified in the next, which read an empty
+# table and fail-closed on a correct ruleset. These doubles model exactly that:
+# fake podman mints a new namespace per invocation, and fake nft keeps its state
+# per namespace — so a namespace that was never loaded into lists nothing.
+NETNS_STATE="$fixture/netns-state"
+NETNS_NFT_LOG="$fixture/netns-nft.log"
+NETNS_LOG="$fixture/netns.log"
+mkdir -p "$NETNS_STATE"
+: >"$NETNS_NFT_LOG"
+: >"$NETNS_LOG"
+
+# These doubles have to be real executables on PATH (the session runs them through
+# `sudo`/`podman unshare`/`env`), so their directory must allow execution. Some
+# hosts mount $TMPDIR (and /dev/shm) noexec, which would silently make every shim
+# unrunnable; pick the first candidate that can actually exec a script.
+_wi504_exec_tmpdir() {
+  local parent dir
+  for parent in "${TMPDIR:-/tmp}" /var/tmp "$HOME" /; do
+    [[ -w "$parent" ]] || continue
+    dir="$(mktemp -d "$parent/.wi504-netns.XXXXXX" 2>/dev/null)" || continue
+    printf '#!/bin/sh\nexit 0\n' >"$dir/.probe" || { rm -rf "$dir"; continue; }
+    chmod +x "$dir/.probe"
+    if "$dir/.probe" 2>/dev/null; then
+      rm -f "$dir/.probe"
+      printf '%s\n' "$dir"
+      return 0
+    fi
+    rm -rf "$dir"
+  done
+  return 1
+}
+if ! NETNS_BIN="$(_wi504_exec_tmpdir)"; then
+  fail "WI#504 netns fixture needs an executable temp dir (no candidate parent allowed exec)"
+  NETNS_BIN="$fixture/netns-bin"
+fi
+WI504_NETNS_BIN="$NETNS_BIN"
+mkdir -p "$NETNS_BIN"
+
+cat >"$NETNS_BIN/nft" <<'STUB'
+#!/usr/bin/env bash
+# WI#504 fixture: nft state belongs to the namespace it was loaded in.
+set -uo pipefail
+netns="${LW_FAKE_NETNS:-host}"
+state="${FAKE_NFT_STATE_DIR:?}/$netns"
+printf '%s %s\n' "$netns" "$*" >>"${FAKE_NFT_LOG:-/dev/null}"
+case "${1:-}" in
+  -f)
+    [[ "${NFT_LOAD_RC:-0}" == "0" ]] || exit "$NFT_LOAD_RC"
+    cat "$2" >"$state"
+    ;;
+  list)
+    [[ "${NFT_LIST_RC:-0}" == "0" ]] || exit 1
+    if [[ -n "${NFT_LIST_OUT:-}" ]]; then
+      printf '%s\n' "$NFT_LIST_OUT"
+      exit 0
+    fi
+    # A namespace that was never loaded into has no such chain.
+    [[ -f "$state" ]] || exit 1
+    chain="${!#}"
+    # Replay what the kernel reports for a loaded chain: live counters, and
+    # `icmpx admin-prohibited` without the `type` keyword. Verification must read
+    # this, not the rendered ruleset file.
+    awk -v chain="$chain" '
+      index($0, "chain " chain " {") { inside = 1; print; next }
+      inside && /^    }/ { inside = 0; print; next }
+      inside {
+        sub(/counter reject with icmpx type admin-prohibited/, \
+            "counter packets 0 bytes 0 reject with icmpx admin-prohibited")
+        print
+      }
+    ' "$state"
+    ;;
+esac
+STUB
+
+cat >"$NETNS_BIN/podman" <<'STUB'
+#!/usr/bin/env bash
+# WI#504 fixture: every `unshare --rootless-netns` invocation gets a FRESH
+# namespace, i.e. the no-keeper state that made load and verify disagree.
+set -uo pipefail
+if [[ "${1:-}" == "unshare" && "${2:-}" == "--rootless-netns" ]]; then
+  shift 2
+  seq=$(( $(wc -l <"${FAKE_NETNS_LOG:?}") + 1 ))
+  printf 'netns-%s\n' "$seq" >>"$FAKE_NETNS_LOG"
+  exec env "LW_FAKE_NETNS=netns-$seq" "$@"
+fi
+exit 0
+STUB
+
+cat >"$NETNS_BIN/sudo" <<'STUB'
+#!/usr/bin/env bash
+# WI#504 fixture: drop the `-u <tenant>` switch and run the command unchanged —
+# the harness is not root, and the tenant uid/home come from the harness `id` and
+# `getent` doubles below.
+set -uo pipefail
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -u) shift 2 ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+exec "$@"
+STUB
+chmod +x "$NETNS_BIN"/nft "$NETNS_BIN"/podman "$NETNS_BIN"/sudo
+
+# Harness tenants are synthetic accounts, so the session's uid/home lookups must
+# not depend on a real passwd entry.
+id() {
+  if [[ "${1:-}" == "-u" && -n "${2:-}" ]]; then
+    printf '1000\n'
+    return 0
+  fi
+  command id "$@"
+}
+
+# Run a command with the fake rootless-netns stack in front of PATH. The subshell
+# keeps the overridden PATH and fixture vars from leaking into later checks, and
+# `hash -r` clears bash's cached command paths so the shimmed sudo/podman/nft win.
+netns_env() {
+  (
+    export PATH="$NETNS_BIN:$PATH"
+    export FAKE_NFT_STATE_DIR="$NETNS_STATE"
+    export FAKE_NFT_LOG="$NETNS_NFT_LOG"
+    export FAKE_NETNS_LOG="$NETNS_LOG"
+    hash -r
+    "$@"
+  )
+}
+netns_reset() {
+  rm -rf "$NETNS_STATE"
+  mkdir -p "$NETNS_STATE"
+  : >"$NETNS_NFT_LOG"
+  : >"$NETNS_LOG"
+  NFT_LOAD_RC=0
+  NFT_LIST_RC=0
+  NFT_LIST_OUT=""
+}
+# How many distinct namespaces the fake nft was invoked in.
+netns_count() { awk '{ print $1 }' "$NETNS_NFT_LOG" | sort -u | wc -l; }
 
 # ── allocation, locking, and per-tenant rendering ─────────────────────────────
 subnet="$(_worker_egress_alloc_subnet alpha)"
@@ -222,34 +397,51 @@ LLM_TARGETS=("http://127.0.0.1:3000/v1" "https://203.0.113.10:8443/v1" "https://
 assert_rc_fail env CONTAINER_RT=podman MT_ROOTLESS=true WORKER_EGRESS_HOST_ADDRS=not-an-ip _worker_egress_host_addrs 10.89.10.1
 
 # ── apply and static host launch contract ─────────────────────────────────────
+# WI#504: apply now runs load + both verify reads through the fake rootless-netns
+# stack, where EVERY `podman unshare --rootless-netns` invocation gets a fresh
+# empty namespace. A single-session apply therefore still verifies; the pre-fix
+# two-invocation apply would have read an empty namespace and fail closed.
+netns_reset
 NFT_LIST_RC=1
-if (worker_egress_apply alpha) >/dev/null 2>"$fixture/apply.err"; then
+if netns_env worker_egress_apply alpha >/dev/null 2>"$fixture/apply.err"; then
   fail "apply accepted a filter that did not survive"
 else
   pass "apply fails when the loaded chains disappear"
   assert_contains "$(cat "$fixture/apply.err")" 'did not survive the load' "apply refusal names the real cause"
 fi
+netns_reset
 NFT_LIST_RC=0
 NFT_LIST_OUT=$'chain "fwd_alpha" {\n}'
-if (worker_egress_apply alpha) >/dev/null 2>"$fixture/no-reject.err"; then
+if netns_env worker_egress_apply alpha >/dev/null 2>"$fixture/no-reject.err"; then
   fail "apply accepted a chain without its reject"
 else
   pass "apply rejects a chain without its reject"
   assert_contains "$(cat "$fixture/no-reject.err")" 'exact reject' "no-reject refusal names the exact-reject contract"
+  assert_absent "$(cat "$fixture/no-reject.err")" 'is absent' "a present-but-incomplete chain is not reported missing"
 fi
+netns_reset
 NFT_LIST_OUT=""
 NFT_LOAD_RC=1
-assert_rc_fail worker_egress_apply alpha
+if netns_env worker_egress_apply alpha >/dev/null 2>"$fixture/load.err"; then
+  fail "apply accepted a ruleset that failed to load"
+else
+  pass "apply fails when the ruleset will not load"
+  assert_contains "$(cat "$fixture/load.err")" 'failed to load' "load refusal names the load failure, not a verify miss"
+fi
 NFT_LOAD_RC=0
-NFT_CALLS=()
-: >"$NFT_LOG"
-if worker_egress_apply alpha >"$fixture/applied.dump" 2>"$fixture/apply-ok.err"; then
+netns_reset
+if netns_env worker_egress_apply alpha >"$fixture/applied.dump" 2>"$fixture/apply-ok.err"; then
   pass "apply succeeds with both live tenant chains"
 else
   fail "apply rejected a valid ruleset: $(cat "$fixture/apply-ok.err")"
 fi
-assert_contains "$(printf '%s\n' "${NFT_CALLS[@]}")" '-f' "apply loads the rendered file"
-assert_eq "$(grep -c 'list chain' "$NFT_LOG")" "2" "apply verifies forward and input chains"
+# WI#504 acceptance pin: load + both chain reads happen in ONE namespace, even
+# though the fake hands every invocation a fresh empty one.
+assert_eq "$(netns_count)" "1" "apply loads and verifies inside a single netns session (WI#504)"
+assert_eq "$(grep -c 'list chain' "$NETNS_NFT_LOG")" "2" "apply verifies forward and input chains in that one session"
+assert_contains "$(grep -- '-f ' "$NETNS_NFT_LOG")" 'alpha.nft' "apply loads the rendered file in that session"
+assert_contains "$(cat "$fixture/applied.dump")" 'counter packets 0 bytes 0 reject with icmpx admin-prohibited' "apply prints the verified live chain dumps"
+assert_contains "$(cat "$fixture/applied.dump")" 'iifname "lweg10" ip saddr 10.89.10.0/24' "the verified dump carries the tenant's own reject rule"
 assert_eq "$(cat "$WORKER_EGRESS_DIR/alpha.hosts")" 'git.example.org:203.0.113.40' "static hosts come from the same resolved answers"
 launch_args="$(worker_egress_launch_args alpha)"
 assert_contains "$launch_args" '--dns
@@ -268,7 +460,7 @@ fi
 printf 'stale\n' >"$WORKER_EGRESS_DIR/alpha.nft"
 printf 'stale\n' >"$WORKER_EGRESS_DIR/alpha.hosts"
 OPERATOR_ALLOW=("https://does-not-exist.example.invalid:443/repo.git")
-if (worker_egress_apply alpha) >/dev/null 2>&1; then
+if netns_env worker_egress_apply alpha >/dev/null 2>&1; then
   fail "apply accepted an unresolvable operator entry"
 elif [[ -e "$WORKER_EGRESS_DIR/alpha.nft" || -e "$WORKER_EGRESS_DIR/alpha.hosts" ]]; then
   fail "render failure left stale boot state behind"
@@ -276,7 +468,8 @@ else
   pass "render failure removes stale nft and host state"
 fi
 OPERATOR_ALLOW=("https://203.0.113.20:443/repo.git")
-worker_egress_apply alpha >/dev/null
+netns_reset
+netns_env worker_egress_apply alpha >/dev/null
 
 if (
   worker_egress_ensure() { printf 'ensure\n' >>"$fixture/prepare.log"; }
@@ -350,7 +543,8 @@ else
   fail "docker network ensure rejected an unverified-DNS contract"
 fi
 
-worker_egress_apply alpha >/dev/null
+netns_reset
+netns_env worker_egress_apply alpha >/dev/null
 CTR_NETWORKS=lw-egress-alpha
 CTR_DNS=127.0.0.1
 CTR_EXTRA_HOSTS=git.example.org:203.0.113.40
