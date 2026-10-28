@@ -504,6 +504,22 @@ class CandidateBuildWiringTests(unittest.TestCase):
         self.assertNotIn("su -s", runner)
         self.assertIn("setpriv is missing", runner)
 
+    def test_candidate_smoke_cleanup_drains_the_runtime_user(self) -> None:
+        # Master pipelines 6644 and 6651: the smoke passed 5/5, but
+        # buildkit-runc could not remove the build container's cgroup because
+        # processes the entrypoint started as uid 10003 (opencode serve and
+        # its children) were still alive when the script returned, so the RUN
+        # failed with "device or resource busy". Killing the entrypoint and its
+        # direct children was not enough: the cleanup must terminate every live
+        # process of the runtime uid, wait for the set to drain, escalate to
+        # SIGKILL, and only then return.
+        lane = Path(__file__).resolve().parents[1]
+        runner = (lane / "scripts/runtime_smoke_entrypoint.sh").read_text()
+        self.assertIn("drain_runtime_user || true", runner)
+        self.assertIn('[[ "$uid" == "$SMOKE_UID" && "$state" != Z ]]', runner)
+        self.assertIn("for sig in TERM KILL; do", runner)
+        self.assertNotIn("/task/$ENTRYPOINT_PID/children", runner)
+
     @unittest.skipUnless(_IN_CHECKOUT, _CHECKOUT_ONLY)
     def test_candidate_input_manifest_includes_the_entrypoint_runner(self) -> None:
         repo = Path(__file__).resolve().parents[2]

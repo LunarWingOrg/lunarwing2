@@ -12,15 +12,61 @@ SMOKE_GID="${SMOKE_GID:-10003}"
 ENTRYPOINT_PID=""
 READY=false
 
+# The build container must be empty when this script returns: buildkit-runc
+# removes the container's cgroup right after the RUN, and any process still
+# alive in it (opencode serve finishing its shutdown, a child it spawned)
+# makes that rmdir fail with "device or resource busy" although every check
+# passed (master pipelines 6644 and 6651). Killing the entrypoint plus its
+# direct children and waiting for the entrypoint alone did not do it. So:
+# terminate every live process of the runtime user, wait for the set to
+# drain, escalate to SIGKILL, and only then return.
+SMOKE_DRAIN_SECS="${SMOKE_DRAIN_SECS:-10}"
+
+runtime_user_pids() {
+  # Live (non-zombie) pids whose real uid is the runtime user, except this shell.
+  local status pid key value uid state
+  for status in /proc/[0-9]*/status; do
+    pid="${status#/proc/}"
+    pid="${pid%/status}"
+    [[ "$pid" != "$$" ]] || continue
+    uid=""
+    state=""
+    while IFS=$' \t' read -r key value _; do
+      case "$key" in
+        Uid:) uid="$value" ;;
+        State:) state="$value" ;;
+      esac
+      [[ -z "$uid" || -z "$state" ]] || break
+    done <"$status" 2>/dev/null || continue
+    [[ "$uid" == "$SMOKE_UID" && "$state" != Z ]] || continue
+    printf '%s\n' "$pid"
+  done
+}
+
+drain_runtime_user() {
+  local sig deadline
+  local -a pids=()
+  for sig in TERM KILL; do
+    mapfile -t pids < <(runtime_user_pids)
+    (( ${#pids[@]} )) || return 0
+    kill "-$sig" "${pids[@]}" >/dev/null 2>&1 || true
+    deadline=$((SECONDS + SMOKE_DRAIN_SECS))
+    while (( SECONDS < deadline )); do
+      mapfile -t pids < <(runtime_user_pids)
+      (( ${#pids[@]} )) || return 0
+      sleep 0.2
+    done
+  done
+  mapfile -t pids < <(runtime_user_pids)
+  (( ${#pids[@]} )) || return 0
+  printf 'runtime smoke: %s process(es) of uid %s survived SIGKILL: %s\n' \
+    "${#pids[@]}" "$SMOKE_UID" "${pids[*]}" >&2
+  return 1
+}
+
 cleanup() {
-  local -a children=()
-  if [[ -n "$ENTRYPOINT_PID" && -r "/proc/$ENTRYPOINT_PID/task/$ENTRYPOINT_PID/children" ]]; then
-    read -r -a children <"/proc/$ENTRYPOINT_PID/task/$ENTRYPOINT_PID/children" || true
-  fi
-  if [[ -n "$ENTRYPOINT_PID" ]]; then
-    kill "${children[@]}" "$ENTRYPOINT_PID" >/dev/null 2>&1 || true
-    wait "$ENTRYPOINT_PID" >/dev/null 2>&1 || true
-  fi
+  drain_runtime_user || true
+  [[ -z "$ENTRYPOINT_PID" ]] || wait "$ENTRYPOINT_PID" >/dev/null 2>&1 || true
   rm -rf -- "$SMOKE_ROOT"
 }
 trap cleanup EXIT
