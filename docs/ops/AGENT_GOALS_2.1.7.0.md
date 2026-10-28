@@ -1347,7 +1347,7 @@
 
 ## Phase 6 - Misc Operations
 
-114. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/504 - last attempt was graded REQUEST CHANGES and can be found HERE: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2027 AND the last attempt before that was marked INCOMPLETE/SALVAGED and can be found HERE: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2024
+114. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/504 - last attempt was graded REQUEST CHANGES WITH BLOCKERS and can be found HERE: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2028 and older attempts are on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2027 AND https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2024
 115. [x] (S) Reserved
 116. [x] (S) Reserved
 117. [x] (H) Reserved
