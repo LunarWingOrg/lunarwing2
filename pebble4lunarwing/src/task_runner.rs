@@ -14,7 +14,7 @@ use crate::tool_proxy;
 
 const RUNNER_LINE_SLACK_BYTES: usize = 65_536;
 const CANCEL_DRAIN: Duration = Duration::from_secs(12);
-const RUN_MARGIN: Duration = Duration::from_secs(60);
+const RUN_MARGIN: Duration = Duration::from_mins(1);
 
 type RunnerResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -27,7 +27,9 @@ fn runner_line_cap() -> RunnerResult<usize> {
         Ok(raw) => {
             let parsed = raw.parse::<usize>()?;
             if !(1_024..=16_777_216).contains(&parsed) {
-                return Err(runner_error("WS_MAX_PAYLOAD_BYTES must be between 1024 and 16777216"));
+                return Err(runner_error(
+                    "WS_MAX_PAYLOAD_BYTES must be between 1024 and 16777216",
+                ));
             }
             parsed
         }
@@ -42,7 +44,8 @@ pub fn startup_refusal(
     token: Option<std::ffi::OsString>,
     token_file: Option<std::ffi::OsString>,
 ) -> Option<String> {
-    let leaked = !token.unwrap_or_default().is_empty() || !token_file.unwrap_or_default().is_empty();
+    let leaked =
+        !token.unwrap_or_default().is_empty() || !token_file.unwrap_or_default().is_empty();
     if leaked {
         return Some("hub credential variables must never reach the task runner".to_string());
     }
@@ -126,7 +129,9 @@ where
             return Ok(Some(text.trim().to_string()));
         }
         if buffer.len() > cap {
-            return Err(runner_error(format!("unterminated runner line exceeds {cap} bytes")));
+            return Err(runner_error(format!(
+                "unterminated runner line exceeds {cap} bytes"
+            )));
         }
         let mut chunk = [0_u8; 8192];
         let read = reader.read(&mut chunk).await?;
@@ -134,7 +139,9 @@ where
             if buffer.is_empty() {
                 return Ok(None);
             }
-            return Err(runner_error("runner connection ended with an unterminated line"));
+            return Err(runner_error(
+                "runner connection ended with an unterminated line",
+            ));
         }
         buffer.extend_from_slice(&chunk[..read]);
     }
@@ -148,7 +155,9 @@ fn prepare_listener(socket_path: &Path) -> RunnerResult<UnixListener> {
         .ok_or_else(|| runner_error("task runner socket needs a parent directory"))?;
     if let Ok(metadata) = std::fs::symlink_metadata(parent) {
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(runner_error("task runner socket directory is not a plain directory"));
+            return Err(runner_error(
+                "task runner socket directory is not a plain directory",
+            ));
         }
     }
     std::fs::create_dir_all(parent)?;
@@ -157,7 +166,9 @@ fn prepare_listener(socket_path: &Path) -> RunnerResult<UnixListener> {
     }
     if let Ok(metadata) = std::fs::symlink_metadata(socket_path) {
         if !metadata.file_type().is_socket() || metadata.uid() != tool_proxy::bridge_uid()? {
-            return Err(runner_error("stale runner socket is foreign or not a socket"));
+            return Err(runner_error(
+                "stale runner socket is foreign or not a socket",
+            ));
         }
         std::fs::remove_file(socket_path)?;
     }
@@ -201,7 +212,9 @@ pub async fn run(config: ExecutorConfig, socket_path: PathBuf) -> RunnerResult<(
     }
     if let Ok(expected) = std::env::var("PEBBLE_TASK_UID") {
         if expected.parse::<u32>().ok() != Some(tool_proxy::bridge_uid()?) {
-            return Err(runner_error("task runner uid does not match PEBBLE_TASK_UID"));
+            return Err(runner_error(
+                "task runner uid does not match PEBBLE_TASK_UID",
+            ));
         }
     }
     let listener = prepare_listener(&socket_path)?;
@@ -228,6 +241,33 @@ async fn accept_loop(listener: UnixListener, config: Arc<ExecutorConfig>) -> Run
     }
 }
 
+async fn write_executor_event<W>(
+    writer: &mut W,
+    event: Option<ExecutorEvent>,
+    task_id: &str,
+) -> RunnerResult<bool>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let (op, envelope) = match event {
+        Some(ExecutorEvent::Progress(envelope)) => ("progress", envelope),
+        Some(ExecutorEvent::Result(envelope)) => ("result", envelope),
+        None => (
+            "result",
+            protocol::result_envelope(
+                task_id,
+                "error",
+                "",
+                Some("executor ended without a result"),
+                0,
+            ),
+        ),
+    };
+    let line = serialize_bounded(json!({"op": op, "envelope": envelope}), Some("envelope"))?;
+    write_line(writer, &line).await?;
+    Ok(op == "result")
+}
+
 async fn handle_connection(stream: UnixStream, config: Arc<ExecutorConfig>) -> RunnerResult<()> {
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
@@ -237,17 +277,29 @@ async fn handle_connection(stream: UnixStream, config: Arc<ExecutorConfig>) -> R
     };
     let request_value: Value = serde_json::from_str(&line)?;
     if request_value["op"] == "ping" {
-        write_line(&mut write, &serde_json::to_string(&json!({"ok": true, "op": "pong"}))?).await?;
+        write_line(
+            &mut write,
+            &serde_json::to_string(&json!({"ok": true, "op": "pong"}))?,
+        )
+        .await?;
         return Ok(());
     }
     if request_value["op"] != "run" {
-        write_line(&mut write, &serde_json::to_string(&json!({"ok": false, "error": "expected run"}))?).await?;
+        write_line(
+            &mut write,
+            &serde_json::to_string(&json!({"ok": false, "error": "expected run"}))?,
+        )
+        .await?;
         return Ok(());
     }
     let request: TaskRequest = match serde_json::from_value(request_value["request"].clone()) {
         Ok(request) => request,
         Err(error) => {
-            write_line(&mut write, &serde_json::to_string(&json!({"ok": false, "error": error.to_string()}))?).await?;
+            write_line(
+                &mut write,
+                &serde_json::to_string(&json!({"ok": false, "error": error.to_string()}))?,
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -255,14 +307,22 @@ async fn handle_connection(stream: UnixStream, config: Arc<ExecutorConfig>) -> R
         match serde_json::from_value::<[(String, String); 2]>(request_value["proxy_env"].clone()) {
             Ok(pairs) => Some(pairs),
             Err(error) => {
-                write_line(&mut write, &serde_json::to_string(&json!({"ok": false, "error": error.to_string()}))?).await?;
+                write_line(
+                    &mut write,
+                    &serde_json::to_string(&json!({"ok": false, "error": error.to_string()}))?,
+                )
+                .await?;
                 return Ok(());
             }
         }
     } else {
         None
     };
-    write_line(&mut write, &serde_json::to_string(&json!({"ok": true, "op": "accepted", "task_id": request.task_id}))?).await?;
+    write_line(
+        &mut write,
+        &serde_json::to_string(&json!({"ok": true, "op": "accepted", "task_id": request.task_id}))?,
+    )
+    .await?;
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (cancel_tx, cancel_rx) = oneshot::channel();
     let mut cancel_tx = Some(cancel_tx);
@@ -274,23 +334,7 @@ async fn handle_connection(stream: UnixStream, config: Arc<ExecutorConfig>) -> R
     while !terminal {
         tokio::select! {
             event = event_rx.recv() => {
-                match event {
-                    Some(ExecutorEvent::Progress(envelope)) => {
-                        let line = serialize_bounded(json!({"op": "progress", "envelope": envelope}), Some("envelope"))?;
-                        write_line(&mut write, &line).await?;
-                    }
-                    Some(ExecutorEvent::Result(envelope)) => {
-                        let line = serialize_bounded(json!({"op": "result", "envelope": envelope}), Some("envelope"))?;
-                        write_line(&mut write, &line).await?;
-                        terminal = true;
-                    }
-                    None => {
-                        let envelope = protocol::result_envelope(&task_id, "error", "", Some("executor ended without a result"), 0);
-                        let line = serialize_bounded(json!({"op": "result", "envelope": envelope}), Some("envelope"))?;
-                        write_line(&mut write, &line).await?;
-                        terminal = true;
-                    }
-                }
+                terminal = write_executor_event(&mut write, event, &task_id).await?;
             }
             line = next_line(&mut reader, &mut buffer) => {
                 match line {
@@ -352,7 +396,8 @@ pub async fn delegate_task(
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
     let mut buffer = Vec::new();
-    let run = serde_json::to_string(&json!({"op": "run", "request": request, "proxy_env": proxy_env}))?;
+    let run =
+        serde_json::to_string(&json!({"op": "run", "request": request, "proxy_env": proxy_env}))?;
     write_line(&mut write, &run).await?;
     let timeout_ms = request.timeout_ms.unwrap_or(protocol::DEFAULT_TIMEOUT_MS);
     let deadline = sleep(Duration::from_millis(timeout_ms) + RUN_MARGIN);
@@ -396,7 +441,7 @@ pub async fn delegate_task(
                 cancelling = true;
                 deadline.as_mut().reset((Instant::now() + CANCEL_DRAIN).into());
             }
-            _ = &mut deadline => {
+            () = &mut deadline => {
                 if cancelling {
                     return Err(runner_error("runner did not finish after cancellation"));
                 }
@@ -414,7 +459,8 @@ mod tests {
 
     #[test]
     fn truncation_preserves_utf8_and_bounded_serialization() {
-        let value = json!({"op": "result", "envelope": {"payload": {"output": "a🦀".repeat(700_000)}}});
+        let value =
+            json!({"op": "result", "envelope": {"payload": {"output": "a🦀".repeat(700_000)}}});
         let encoded = serialize_bounded(value, Some("envelope")).expect("bounded result");
         assert!(encoded.len() <= runner_line_cap().expect("cap"));
         assert!(encoded.is_char_boundary(encoded.len()));
