@@ -199,11 +199,12 @@ harness_socket_path() {
 }
 
 generate_token() {
-  if command -v od >/dev/null 2>&1; then
-    dd if=/dev/urandom bs=32 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n'
-  else
-    printf 'replace-with-random-token-%s' "$(date +%s)"
-  fi
+  require_cmd od
+  local token
+  token="$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  [[ "$token" =~ ^[0-9a-f]{64}$ && "$token" != "0000000000000000000000000000000000000000000000000000000000000000" ]] \
+    || die "failed to generate secure token"
+  printf '%s' "$token"
 }
 
 database_kind() {

@@ -541,6 +541,21 @@ render_worker_quadlet() {
     fi
   fi
 
+  # WI#424 control 1: the container joins the tenant's egress network, and the
+  # tenant's rootless netns gets the allowlist loaded before the container
+  # starts at every boot (the netns is recreated when no container pins it, so
+  # a build-once rule set would be gone after a reboot). ExecStartPre failure
+  # refuses the unit start: fail closed.
+  local egress_network egress_ruleset egress_guard egress_chain egress_subnet egress_mappings
+  egress_network="$(worker_egress_network_name "$name")"
+  egress_ruleset="$(worker_egress_ruleset_path "$name")"
+  egress_guard="$WORKER_EGRESS_GUARD"
+  egress_chain="$(worker_egress_chain "$name")"
+  egress_subnet="$(worker_egress_state_get "$name" SUBNET)"
+  [[ -n "$egress_subnet" ]] || die "worker egress is not prepared for '$name'"
+  egress_mappings="$(worker_egress_host_mappings "$name")" \
+    || die "worker egress static hosts are not prepared for '$name'"
+
   local unit_staged
   # WI#446 (run-166 LF-8): the Quadlet embeds AGENT_AUTH_TOKEN/TENSORZERO_API_KEY,
   # and its ~/.config/containers destination is tenant-controlled — the producer
@@ -558,6 +573,8 @@ StartLimitBurst=5
 
 [Container]
 ContainerName=lunarwing-${worker}-${name}
+Network=${egress_network}
+DNS=127.0.0.1
 Image=lunarwing-worker-${worker}:latest
 PublishPort=127.0.0.1:${wss_port}:${wss_port}
 Volume=${workspace_dir}:/workspace:z
@@ -567,6 +584,10 @@ Environment=HEALTH_PORT=${health_port}
 Environment=WS_BIND_HOST=0.0.0.0
 Environment=WS_PATH=/ws/agent
 EOF
+    local egress_mapping
+    while IFS= read -r egress_mapping; do
+      [[ -n "$egress_mapping" ]] && printf 'AddHost=%s\n' "$egress_mapping"
+    done <<<"$egress_mappings"
     if [[ -n "$study_notes_home" ]]; then
       printf 'Volume=%s:%s:ro,z\n' "$study_notes_home" "$STUDY_NOTES_CONTAINER_HOME"
       printf 'Environment=LW2STUDYMCP_HOME=%s\n' "$STUDY_NOTES_CONTAINER_HOME"
@@ -673,6 +694,8 @@ HealthStartPeriod=30s
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=120
+ExecStartPre=${egress_guard} ${egress_ruleset} rootless ${egress_chain}
+ExecStartPost=${egress_guard} --verify ${egress_ruleset} rootless ${egress_chain}
 
 [Install]
 WantedBy=default.target

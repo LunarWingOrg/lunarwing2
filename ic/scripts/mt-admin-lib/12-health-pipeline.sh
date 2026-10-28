@@ -131,6 +131,40 @@ UNITEOF
   fi
 }
 
+# Reconcile one KEY=VALUE line in the host-global health env file, creating it
+# if absent. The file is otherwise write-once so operator edits survive; a
+# stale value here would silently misroute a root-side check, so managed keys
+# are rewritten line-by-line (file mode/owner preserved).
+#
+# The key and value are interpolated into grep/awk patterns verbatim: callers
+# must pass fixed key names and value tokens that are regex/ERE-safe (today
+# podman/docker and true/false/auto). health.env holds notification
+# credentials, so the scratch copy is created mode 0600 in the file's own
+# directory and removed on every failure path; the swap into place is a single
+# mv(2), so a step failing midway leaves the original intact rather than
+# truncated (run-242 PW-1).
+health_env_reconcile_line() {  # <KEY> <VALUE>
+  local key="$1" value="$2" _tmp
+  grep -q "^${key}=${value}$" "$HEALTH_ENV_FILE" && return 0
+  # Same directory as the target so the mv stays a rename on one filesystem.
+  # mktemp already creates it 0600; --reference restores the original's mode
+  # (and owner, when this runs as root) so the credential file never widens.
+  _tmp="$(mktemp "$(dirname "$HEALTH_ENV_FILE")/.health-env.XXXXXX")" || return 1
+  if grep -q "^${key}=" "$HEALTH_ENV_FILE"; then
+    awk -v k="$key" -v v="$value" 'index($0, k "=") == 1 {print k "=" v; next} {print}' \
+      "$HEALTH_ENV_FILE" >"$_tmp" || { rm -f "$_tmp"; return 1; }
+  else
+    cp "$HEALTH_ENV_FILE" "$_tmp" || { rm -f "$_tmp"; return 1; }
+    printf '%s=%s\n' "$key" "$value" >>"$_tmp" || { rm -f "$_tmp"; return 1; }
+  fi
+  chmod --reference="$HEALTH_ENV_FILE" "$_tmp" || { rm -f "$_tmp"; return 1; }
+  # Best-effort: a non-root caller cannot chown, and mktemp already left the
+  # scratch copy owned by whoever is reconciling the file.
+  chown --reference="$HEALTH_ENV_FILE" "$_tmp" 2>/dev/null || true
+  mv -f "$_tmp" "$HEALTH_ENV_FILE" || { rm -f "$_tmp"; return 1; }
+  say "reconciled ${key}=${value} in $HEALTH_ENV_FILE"
+}
+
 ensure_health_pipeline() {
   # Idempotently install + schedule the host-global health-check -> self-heal
   # pipeline. Auto-discovers all tenants, so one install covers every tenant.
@@ -155,6 +189,15 @@ ensure_health_pipeline() {
 
   # 3) Config env file (write-if-absent so operator edits survive).
   mkdir -p /etc/lunarwing
+  local egress_runtime="auto" egress_rootless="auto" _egress
+  # Subshell: ensure_container_runtime dies when no runtime is installed, and
+  # that must not abort a health-only install.
+  if _egress="$( ensure_container_runtime >/dev/null 2>&1 \
+        && printf '%s %s' "$CONTAINER_RT" "$MT_ROOTLESS" )" \
+     && [[ -n "$_egress" ]]; then
+    egress_runtime="${_egress%% *}"
+    egress_rootless="${_egress##* }"
+  fi
   if [[ ! -f "$HEALTH_ENV_FILE" ]]; then
     ( umask 077
       cat >"$HEALTH_ENV_FILE" <<ENVEOF
@@ -163,6 +206,18 @@ ensure_health_pipeline() {
 LUNARWING_BASE_DIR=$HEALTH_BASE_DIR
 LUNARWING_SERVICE_MANAGER=$INIT_SYSTEM
 SELF_HEAL_TENANTS_FILE=$PORTS_REGISTRY
+# WI#424 worker egress audit: the health lib performs its own read-only
+# root-owned audit (health-worker-egress.sh). Root cron must never execute or
+# source an operator checkout (2026-10-15 ruling), so no LUNARWING_MT_ADMIN is
+# recorded here.
+#
+# The audit must read the SAME launch mode mt-admin provisions with: on a
+# rootful host (docker, or LUNARWING_MT_ROOTLESS=false) workers live in the
+# host network namespace, so guessing "rootless whenever podman exists" audits
+# the wrong netns and reports every running tenant critical (run-232 PB-1).
+# Both lines are reconciled on every install/upgrade.
+HEALTH_WORKER_EGRESS_RUNTIME=${egress_runtime}
+HEALTH_WORKER_EGRESS_ROOTLESS=${egress_rootless}
 
 # MT hardening: remediate only auto-discovered per-tenant init units; disable
 # checks that are N/A host-globally; page only on self-heal escalation (not on
@@ -234,7 +289,24 @@ ENVEOF
       rm -f "$_tmp2"
       say "reconciled SELF_HEAL_TENANTS_FILE=$PORTS_REGISTRY in $HEALTH_ENV_FILE"
     fi
+    # WI#424 (run-226 OQ-1): root cron must not exec an operator-checkout path.
+    # Drop the previously recorded LUNARWING_MT_ADMIN so upgrades stop handing
+    # the health lib a user-owned mt-admin to run on every tick.
+    if grep -q '^LUNARWING_MT_ADMIN=' "$HEALTH_ENV_FILE"; then
+      local _tmp3; _tmp3="$(mktemp)"
+      grep -v '^LUNARWING_MT_ADMIN=' "$HEALTH_ENV_FILE" >"$_tmp3" || true
+      cat "$_tmp3" >"$HEALTH_ENV_FILE"
+      rm -f "$_tmp3"
+      say "removed LUNARWING_MT_ADMIN from $HEALTH_ENV_FILE (root cron must not run an operator checkout)"
+    fi
   fi
+
+  # WI#424 (run-232 PB-1): record the launch mode the audit must observe, on
+  # both the fresh-install and the upgrade path, so a rootful-podman host does
+  # not get rootless-netns audits. Reconciled separately from the write-once
+  # block because a fresh install already wrote the values above.
+  health_env_reconcile_line HEALTH_WORKER_EGRESS_RUNTIME "$egress_runtime"
+  health_env_reconcile_line HEALTH_WORKER_EGRESS_ROOTLESS "$egress_rootless"
 
   # 4) Launcher: source env, then run the pipeline (health-check -> self-heal LIVE).
   cat >"$HEALTH_LAUNCHER" <<LAUNCHEOF

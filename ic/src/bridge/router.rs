@@ -1602,14 +1602,14 @@ async fn deliver_expired_gate_text(
         _ => transformed,
     };
 
-    if let Err(error) = channels
+    let delivery = channels
         .broadcast(
             &gate.source_channel,
             &gate.user_id,
-            OutgoingResponse::text(outbound.clone()),
+            OutgoingResponse::text(outbound.clone()).in_thread(thread_id.clone()),
         )
-        .await
-    {
+        .await;
+    if let Err(error) = &delivery {
         debug!(
             channel = %gate.source_channel,
             %error,
@@ -1617,7 +1617,9 @@ async fn deliver_expired_gate_text(
         );
     }
 
-    if let Some(ref sse) = state.sse {
+    if (gate.source_channel != "gateway" || delivery.is_err())
+        && let Some(ref sse) = state.sse
+    {
         sse.broadcast_for_user(
             &gate.user_id,
             AppEvent::Response {
@@ -2165,6 +2167,46 @@ async fn resolve_pending_gate_for_user(
         .collect();
 
     select_pending_gate(candidates, hinted_uuid)
+}
+
+/// Find the live *approval* gate owned by `user_id` whose request id matches.
+///
+/// This is the server-side resolution the gateway approval endpoint needs when
+/// the caller omits `thread_id` (WI#472): the owning thread is derived from the
+/// gate itself rather than guessed. Gates are user-scoped here and re-checked by
+/// [`resolve_gate`]'s `take_verified` on the actual resolution path, so this can
+/// never clear another user's gate. Returns `Ok(None)` when engine v2 is off or
+/// no live approval gate carries that request id.
+pub async fn find_engine_approval_gate_for_request(
+    user_id: &str,
+    request_id: uuid::Uuid,
+) -> Result<Option<crate::gate::pending::PendingGateView>, Error> {
+    let Some(lock) = ENGINE_STATE.get() else {
+        return Ok(None);
+    };
+    let guard = lock.read().await;
+    let Some(state) = guard.as_ref() else {
+        return Ok(None);
+    };
+    let gates = filter_live_pending_gates(
+        &state.store,
+        state.pending_gates.list_for_user(user_id).await,
+    )
+    .await;
+    let matches: Vec<&PendingGate> = gates
+        .iter()
+        .filter(|gate| {
+            gate.request_id == request_id
+                && matches!(
+                    gate.resume_kind,
+                    lunarwing_engine::ResumeKind::Approval { .. }
+                )
+        })
+        .collect();
+    match matches.as_slice() {
+        [gate] => Ok(Some(crate::gate::pending::PendingGateView::from(*gate))),
+        _ => Ok(None),
+    }
 }
 
 pub async fn get_engine_pending_gate(
@@ -6289,6 +6331,24 @@ pub(crate) mod tests {
         *lock.write().await = None;
     }
 
+    /// Install one live approval gate; caller must hold the engine-state lock.
+    pub(crate) async fn install_engine_approval_for_tests(
+        user_id: &str,
+    ) -> (uuid::Uuid, lunarwing_engine::ThreadId) {
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store.clone());
+        let thread = save_waiting_thread(&store, state.default_project_id, user_id).await;
+        let gate = sample_pending_gate(
+            user_id,
+            thread.id,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        let request_id = gate.request_id;
+        state.pending_gates.insert(gate).await.unwrap(); // safety: test-only fixture
+        *ENGINE_STATE.get_or_init(|| RwLock::new(None)).write().await = Some(state);
+        (request_id, thread.id)
+    }
+
     #[test]
     fn engine_max_output_tokens_falls_back_to_the_default_for_bad_values() {
         let cases = [
@@ -7013,6 +7073,69 @@ pub(crate) mod tests {
         );
     }
 
+    /// WI#472: the gateway approval endpoint resolves the owning thread from
+    /// `request_id` alone. The lookup is user-scoped, ignores non-approval
+    /// gates, and returns nothing for unknown or dead gates.
+    #[tokio::test]
+    async fn approval_gate_lookup_by_request_resolves_only_the_owner() {
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store.clone());
+
+        let thread = save_waiting_thread(&store, state.default_project_id, "alice").await;
+        let approval = sample_pending_gate(
+            "alice",
+            thread.id,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        let request_id = approval.request_id;
+        let auth = sample_pending_gate(
+            "alice",
+            lunarwing_engine::ThreadId::new(),
+            lunarwing_engine::ResumeKind::Authentication {
+                credential_name: "gitlab".into(),
+                instructions: "token".into(),
+                auth_url: None,
+            },
+        );
+        let auth_request = auth.request_id;
+        state.pending_gates.insert(approval).await.unwrap();
+        state.pending_gates.insert(auth).await.unwrap();
+
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = Some(state);
+
+        let found = find_engine_approval_gate_for_request("alice", request_id)
+            .await
+            .unwrap()
+            .expect("the owner resolves the approval by request id");
+        assert_eq!(found.thread_id, thread.id.to_string());
+
+        assert!(
+            find_engine_approval_gate_for_request("bob", request_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "another user must never resolve this approval"
+        );
+        assert!(
+            find_engine_approval_gate_for_request("alice", auth_request)
+                .await
+                .unwrap()
+                .is_none(),
+            "authentication gates are not approvals"
+        );
+        assert!(
+            find_engine_approval_gate_for_request("alice", uuid::Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_none(),
+            "an unknown request id resolves nothing"
+        );
+
+        *lock.write().await = None;
+    }
+
     /// WI#332 / MR !1528 DJ-1: the HTTP-facing lookups still return an
     /// authentication-fallback gate whose thread already terminated — the
     /// user must be able to fetch the token prompt and answer it.
@@ -7220,19 +7343,39 @@ pub(crate) mod tests {
     }
 
     /// When the paused thread cannot be resumed, expiry still fails closed —
-    /// but the source channel must be told instead of going silent.
+    /// and the real gateway channel must route the reply to the gate's thread.
     #[tokio::test]
-    async fn expired_gate_resume_failure_fails_thread_and_notifies_channel() {
-        use crate::testing::RecordingBroadcastChannel;
+    async fn expired_gateway_gate_resume_failure_notifies_owning_thread() {
+        use crate::channels::web::{GatewayChannel, types::SseEvent};
+        use futures::StreamExt;
 
         let store = Arc::new(TestStore::new());
         let gates = Arc::new(crate::gate::store::PendingGateStore::in_memory());
         let mut state = make_expected_test_state(store.clone());
         state.pending_gates = Arc::clone(&gates);
 
+        let gateway = GatewayChannel::new(
+            crate::config::GatewayConfig {
+                host: "127.0.0.1".into(),
+                port: 0,
+                auth_token: Some("test-token".into()),
+                mascot_enabled: false,
+                user_id: "alice".into(),
+                workspace_read_scopes: vec![],
+                memory_layers: vec![],
+                user_tokens: None,
+                ws_ping_interval_secs: 30,
+                ws_idle_timeout_secs: 120,
+            },
+            "alice".into(),
+        );
+        let mut gateway_events = gateway
+            .state()
+            .sse
+            .subscribe_raw(Some("alice".into()))
+            .expect("gateway SSE subscription should be available");
         let channels = std::sync::Arc::new(crate::channels::ChannelManager::new());
-        let (recorder, broadcasts) = RecordingBroadcastChannel::new("web");
-        channels.add(Box::new(recorder)).await;
+        channels.add(Box::new(gateway)).await;
         let hooks = Arc::new(crate::hooks::HookRegistry::default());
 
         let thread = save_waiting_thread(&store, state.default_project_id, "alice").await;
@@ -7243,23 +7386,33 @@ pub(crate) mod tests {
                 allow_always: false,
             },
         );
+        gate.source_channel = "gateway".into();
         gate.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
         gates.insert(gate).await.unwrap();
         let expired = gates.drain_expired().await;
         assert_eq!(expired.len(), 1);
 
         // The resume's thread save fails; the fallback finalization's save
-        // succeeds (the flag is one-shot).
+        // succeeds (the flag is one-shot). No separate SSE fallback is installed,
+        // so only a correctly routed gateway broadcast can satisfy this test.
         store.fail_next_thread_save.store(true, Ordering::SeqCst);
         handle_expired_gates(&state, &channels, &hooks, &expired).await;
 
         let saved = store.load_thread(thread.id).await.unwrap().unwrap();
         assert_eq!(saved.state, lunarwing_engine::ThreadState::Failed);
-
-        let delivered = broadcasts.lock().await;
-        assert_eq!(delivered.len(), 1);
-        assert_eq!(delivered[0].0, "alice");
-        assert!(delivered[0].1.content.contains("could not be resumed"));
+        let delivered =
+            tokio::time::timeout(std::time::Duration::from_secs(1), gateway_events.next())
+                .await
+                .expect("expiry reply should reach the gateway")
+                .expect("gateway SSE stream should remain open");
+        assert!(matches!(
+            delivered,
+            SseEvent::Response {
+                content,
+                thread_id,
+                ..
+            } if content.contains("could not be resumed") && thread_id == thread.id.to_string()
+        ));
     }
 
     /// Work item #300 regression: when the wrap-up after an expiry resume
