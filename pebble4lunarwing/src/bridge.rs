@@ -508,6 +508,7 @@ async fn dispatch_task(
             )
             .await;
             forward_execution_error(&event_tx, &task_id, execution);
+            drop(event_tx);
             // The task is over: close its relay slot (fails any call still
             // in flight) before releasing the workspace claim.
             relay.close_task(&task_id).await;
