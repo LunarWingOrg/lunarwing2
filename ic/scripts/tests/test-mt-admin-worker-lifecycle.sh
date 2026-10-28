@@ -309,6 +309,113 @@ assert_call "desired:alice kimi false"
 assert_call "rc:lunarwing-kimi-alice-sup stop"
 assert_call "rc:lunarwing-kimi-alice stop"
 
+run_worker_start_case() {
+  local test_fn="$1" description="$2" rc
+  set +e
+  "$test_fn"
+  rc=$?
+  set -e
+  if [[ "$rc" -eq 0 ]]; then
+    printf 'PASS: %s\n' "$description"
+  else
+    fail "$description (status $rc)"
+  fi
+}
+
+test_stale_worker_failures_are_aggregated() (
+  local calls="$fixture/stale-worker-calls" messages="$fixture/stale-worker-messages"
+  local expected=$'pebble\nopencode\nkimi\nopencode2' rc
+  : >"$calls"
+  : >"$messages"
+  INIT_SYSTEM=systemd
+  tenant_worker_enabled() { return 0; }
+  start_tenant_pebble() { printf 'pebble\n' >>"$calls"; return 3; }
+  start_tenant_opencode() { printf 'opencode\n' >>"$calls"; return 3; }
+  start_tenant_kimi() { printf 'kimi\n' >>"$calls"; }
+  start_tenant_opencode2() { printf 'opencode2\n' >>"$calls"; }
+  say() { printf '%s\n' "$*" >>"$messages"; }
+
+  _start_tenant_workers alice
+  rc=$?
+  [[ "$rc" -eq 1 ]] || return 1
+  [[ "$(<"$calls")" == "$expected" ]] || return 1
+  [[ "${START_TENANT_FAILED_WORKERS[*]}" == "pebble opencode" ]] || return 1
+  [[ "$(grep -c '^WARNING: ' "$messages")" == 3 ]] || return 1
+  grep -Fxq 'WARNING: pebble worker failed to start for alice; continuing' "$messages" || return 1
+  grep -Fxq 'WARNING: opencode worker failed to start for alice; continuing' "$messages" || return 1
+  grep -Fxq 'WARNING: workers failed to start for alice: pebble opencode' "$messages" || return 1
+)
+
+test_inner_worker_failure_stays_fatal() (
+  local calls="$fixture/fatal-worker-calls" messages="$fixture/fatal-worker-messages"
+  local expected=$'pebble\nctr:alice run lunarwing-pebble-alice' rc
+  : >"$calls"
+  : >"$messages"
+  INIT_SYSTEM=systemd
+  tenant_worker_enabled() { return 0; }
+  _ctr() { printf 'ctr:%s\n' "$*" >>"$calls"; return 125; }
+  start_tenant_pebble() {
+    printf 'pebble\n' >>"$calls"
+    _ctr alice run lunarwing-pebble-alice
+    printf 'pebble-ready\n' >>"$calls"
+  }
+  start_tenant_opencode() { printf 'opencode\n' >>"$calls"; }
+  start_tenant_kimi() { printf 'kimi\n' >>"$calls"; }
+  start_tenant_opencode2() { printf 'opencode2\n' >>"$calls"; }
+  say() { printf '%s\n' "$*" >>"$messages"; }
+
+  _start_tenant_workers alice
+  rc=$?
+  [[ "$rc" -eq 125 ]] || return 1
+  [[ "$(<"$calls")" == "$expected" ]] || return 1
+  [[ "${START_TENANT_FAILED_WORKERS[*]}" == pebble ]] || return 1
+  [[ ! -s "$messages" ]]
+)
+
+test_lifecycle_lock_preserves_worker_status_and_errexit() (
+  local calls="$fixture/locked-worker-calls" messages="$fixture/locked-worker-messages"
+  local expected=$'flock:-x\npebble\nctr:alice run lunarwing-pebble-alice\nflock:-u' rc
+  : >"$calls"
+  : >"$messages"
+  TENANT_LIFECYCLE_LOCK_DIR="$fixture/lifecycle-locks"
+  mkdir -p "$TENANT_LIFECYCLE_LOCK_DIR"
+  unset LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT
+  unset LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_FD LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_TENANT
+  require_cmd() { :; }
+  install() { :; }
+  stat() { printf '0:700\n'; }
+  flock() { printf 'flock:%s\n' "$1" >>"$calls"; }
+  INIT_SYSTEM=systemd
+  tenant_worker_enabled() { return 0; }
+  _ctr() { printf 'ctr:%s\n' "$*" >>"$calls"; return 125; }
+  start_tenant_pebble() {
+    printf 'pebble\n' >>"$calls"
+    _ctr alice run lunarwing-pebble-alice
+    printf 'pebble-ready\n' >>"$calls"
+  }
+  start_tenant_opencode() { printf 'opencode\n' >>"$calls"; }
+  start_tenant_kimi() { printf 'kimi\n' >>"$calls"; }
+  start_tenant_opencode2() { printf 'opencode2\n' >>"$calls"; }
+  say() { printf '%s\n' "$*" >>"$messages"; }
+
+  set +e
+  with_tenant_lifecycle_lock alice _start_tenant_workers alice
+  rc=$?
+  local errexit_after="$-"
+  set -e
+  [[ "$rc" -eq 125 ]] || return 1
+  [[ "$errexit_after" != *e* ]] || return 1
+  [[ "$(<"$calls")" == "$expected" ]] || return 1
+  [[ ! -s "$messages" ]]
+)
+
+run_worker_start_case test_stale_worker_failures_are_aggregated \
+  'stale workers continue and aggregate failed lanes (WI#469)'
+run_worker_start_case test_inner_worker_failure_stays_fatal \
+  'unexpected starter failures preserve status and stop later lanes (WI#469)'
+run_worker_start_case test_lifecycle_lock_preserves_worker_status_and_errexit \
+  'lifecycle lock preserves worker failure status and caller errexit (WI#469)'
+
 # Destructive reconciliation requires explicit registry evidence. Unknown or
 # malformed state must not authorize stopping a live worker.
 PORTS_REGISTRY="$fixture/ports.json"
