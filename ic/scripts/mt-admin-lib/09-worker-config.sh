@@ -1639,7 +1639,8 @@ start_tenant_opencode() {
   case "$image_user" in
     "0:0"|"0") ;;
     *)
-      die "opencode worker image has user '${image_user:-unset}', expected 0:0 (WI#400 root entrypoint; serve/tasks drop to $OPENCODE_CONTAINER_UID); rebuild it"
+      warn_err "opencode worker image has user '$(sanitize_display_value "${image_user:-unset}")', expected 0:0 (WI#400 root entrypoint; serve/tasks drop to $OPENCODE_CONTAINER_UID); rebuild it"
+      return 3
       ;;
   esac
 
@@ -1884,7 +1885,8 @@ start_tenant_opencode2() {
   case "$image_user" in
     "$OPENCODE2_CONTAINER_UID"|"$OPENCODE2_CONTAINER_UID:$OPENCODE2_CONTAINER_GID") ;;
     *)
-      die "opencode2 worker image has user '${image_user:-unset}', expected $OPENCODE2_CONTAINER_UID:$OPENCODE2_CONTAINER_GID; rebuild it"
+      warn_err "opencode2 worker image has user '$(sanitize_display_value "${image_user:-unset}")', expected $OPENCODE2_CONTAINER_UID:$OPENCODE2_CONTAINER_GID; rebuild it"
+      return 3
       ;;
   esac
 
@@ -2373,7 +2375,8 @@ start_tenant_kimi() {
   case "$image_user" in
     "0:0"|"0") ;;
     *)
-      die "kimi worker image has user '${image_user:-unset}', expected 0:0 (WI#400 root entrypoint; tasks drop to $KIMI_CONTAINER_UID); rebuild it"
+      warn_err "kimi worker image has user '$(sanitize_display_value "${image_user:-unset}")', expected 0:0 (WI#400 root entrypoint; tasks drop to $KIMI_CONTAINER_UID); rebuild it"
+      return 3
       ;;
   esac
 
@@ -2556,7 +2559,8 @@ start_tenant_pebble() {
   case "$image_user" in
     "0:0"|"0") ;;
     *)
-      die "pebble worker image has user '${image_user:-unset}', expected 0:0 (WI#400 root bridge; tasks drop to $PEBBLE_CONTAINER_UID); rebuild it"
+      warn_err "pebble worker image has user '$(sanitize_display_value "${image_user:-unset}")', expected 0:0 (WI#400 root bridge; tasks drop to $PEBBLE_CONTAINER_UID); rebuild it"
+      return 3
       ;;
   esac
 
