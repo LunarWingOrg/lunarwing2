@@ -40,8 +40,17 @@ Dry-run merge against `origin/aragents/kimil00p/v2.1.7.0` (9751abdd0):
    loop tick itself does the checkoff on SUCCESS per the normal path.
 
 ## OUTCOME — redo completed 2026-10-28 (branch `sweetiebot/kimi-99-20261028-1523`)
+**New MR: !2020** (target `aragents/kimil00p/v2.1.7.0`, head `6ee29bfe5`,
+`remove_source_branch` on). GitLab reports `merge_status: can_be_merged` /
+`detailed_merge_status: mergeable` — the conflict that closed !2013 is gone.
+
 Recipe followed; the result is conflict-free (`git merge-tree --write-tree`
 against target `66e9433b1` reports no conflicts and lands all payload files).
+
+Tenant **mistyfly** re-confirmed running afterwards via
+`mt-admin status mistyfly`: pebble + kimi workers started (WSS 10048 / 30040),
+PostgreSQL running, LunarVision healthy, all OpenRC services started, worker
+images present. Nothing was reprovisioned or destroyed.
 
 - Target had moved again to **`66e9433b1`** (past `9751abdd0`); the seven
   payload commits cherry-picked onto it with **zero conflicts**, re-authored as
