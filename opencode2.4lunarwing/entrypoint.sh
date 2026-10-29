@@ -5,6 +5,12 @@ set -euo pipefail
 log()  { printf '[%s] %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
 die()  { log "ERROR: $*" >&2; exit 1; }
 
+if [[ "${LUNARWING_ROOTFUL_WORKSPACE:-}" == 1 ]]; then
+  [[ "${LUNARWING_WORKSPACE_ID:-}" =~ ^[0-9]+:[0-9]+$ ]] || die "rootful workspace identity is required"
+  [[ "$(stat -c '%d:%i' -- "${WORKSPACE_ROOT:-/workspace}")" == "$LUNARWING_WORKSPACE_ID" ]] \
+    || die "workspace mount changed identity; refusing redirected workspace"
+fi
+
 if [[ "${LUNARWING_CONTAINER_ROLE:-}" == "split-bridge" ]]; then
   exec /app/entrypoint-split.sh "$@"
 fi
