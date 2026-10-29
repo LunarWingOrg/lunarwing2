@@ -77,6 +77,18 @@ remove_untrusted_keeper() {
   die "namespace keeper $keeper uses unapproved infra image '$image'; pod removed"
 }
 
+keeper_uses_native_pause() {
+  local uid shape
+  if [[ -n "$tenant" ]]; then
+    uid="$(id -u -- "$tenant")" || return 1
+  else
+    uid="$(id -u)" || return 1
+  fi
+  shape="$(podman_for_tenant inspect --format '{{.Image}}|{{.Path}}|{{json .Args}}|{{json .Mounts}}|{{.Rootfs}}' "$keeper_infra")" \
+    || return 1
+  [[ "$shape" == "|/catatonit|[\"-P\"]|[]|/run/user/$uid/libpod/tmp/infra-container" ]]
+}
+
 validate_keeper() {
   local purpose count is_infra networks
   purpose="$(podman_for_tenant pod inspect --format '{{index .Labels "lunarwing.purpose"}}' "$keeper")" \
@@ -94,7 +106,9 @@ validate_keeper() {
   [[ "$is_infra" == true ]] || die "keeper $keeper is not a pause infra container"
   keeper_image="$(podman_for_tenant inspect --format '{{.ImageName}}' "$keeper_infra")" \
     || die "cannot inspect infra image for keeper $keeper"
-  if [[ "$keeper_image" != localhost/podman-pause:* || "$keeper_image" == localhost/podman-pause: ]]; then
+  if [[ -z "$keeper_image" ]]; then
+    keeper_uses_native_pause || remove_untrusted_keeper "native pause metadata mismatch"
+  elif [[ "$keeper_image" != localhost/podman-pause:* || "$keeper_image" == localhost/podman-pause: ]]; then
     remove_untrusted_keeper "$keeper_image"
   fi
   networks="$(podman_for_tenant inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{printf "%s\n" $name}}{{end}}' "$keeper_infra")" \
