@@ -5,10 +5,9 @@
  * LUNARWING_TASK_RUNNER_SOCKET is set, the bridge delegates each task to the
  * task-runner daemon (running as the task uid — a different identity that
  * never sees the hub-handshake credential) over a unix socket, instead of
- * spawning the CLI locally through setpriv. Rehearsed in the current
- * single-container image, the root launcher binds that socket in a root-only
- * directory and hands the runner only the listening descriptor (NL-7), so
- * the root bridge is the only party that can connect to it.
+ * spawning the CLI locally through setpriv. Managed containers use the
+ * task-owned socket on the IPC-v2 volume; jobs sharing the task uid can
+ * impersonate their runner, so this is not a job-to-job trust boundary.
  *
  * Wire contract mirrors task_runner.ts: one JSON object per line, `run`
  * streams {"op":"accepted"}, {"op":"spawned"}, {"op":"progress"} lines and
