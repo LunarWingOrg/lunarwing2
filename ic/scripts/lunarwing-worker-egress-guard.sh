@@ -77,6 +77,18 @@ remove_untrusted_keeper() {
   die "namespace keeper $keeper uses unapproved infra image '$image'; pod removed"
 }
 
+keeper_uses_native_pause() {
+  local uid shape
+  if [[ -n "$tenant" ]]; then
+    uid="$(id -u -- "$tenant")" || return 1
+  else
+    uid="$(id -u)" || return 1
+  fi
+  shape="$(podman_for_tenant inspect --format '{{.Image}}|{{.Path}}|{{json .Args}}|{{json .Mounts}}|{{.Rootfs}}' "$keeper_infra")" \
+    || return 1
+  [[ "$shape" == "|/catatonit|[\"-P\"]|[]|/run/user/$uid/libpod/tmp/infra-container" ]]
+}
+
 validate_keeper() {
   local purpose count is_infra networks
   purpose="$(podman_for_tenant pod inspect --format '{{index .Labels "lunarwing.purpose"}}' "$keeper")" \
