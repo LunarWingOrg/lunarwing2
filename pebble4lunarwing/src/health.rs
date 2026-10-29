@@ -81,7 +81,13 @@ pub async fn serve(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     eprintln!("[health] listening on http://{addr}");
+    serve_listener(listener, state).await
+}
 
+async fn serve_listener(
+    listener: TcpListener,
+    state: Arc<WorkerState>,
+) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let (stream, _) = listener.accept().await?;
         let state = Arc::clone(&state);
@@ -103,13 +109,13 @@ fn handle_request(
     req: Request<hyper::body::Incoming>,
     state: &WorkerState,
 ) -> Result<Response<http_body_util::Full<Bytes>>, Infallible> {
+    use http::StatusCode;
+
     if req.method() != Method::GET {
-        return Ok(Response::builder()
-            .status(405)
-            .body(http_body_util::Full::new(Bytes::from_static(
-                b"Method Not Allowed",
-            )))
-            .expect("response"));
+        return Ok(response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            Bytes::from_static(b"Method Not Allowed"),
+        ));
     }
 
     match req.uri().path() {
@@ -122,7 +128,14 @@ fn handle_request(
                 "version": WORKER_VERSION,
                 "mode": "websocket",
             });
-            Ok(json_response(if healthy { 200 } else { 503 }, &body))
+            Ok(json_response(
+                if healthy {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                },
+                &body,
+            ))
         }
         "/ready" => {
             let ready = state.is_ready();
@@ -131,28 +144,81 @@ fn handle_request(
                 "ready": ready,
                 "connections": connections,
             });
-            let status = if ready { 200 } else { 503 };
+            let status = if ready {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
             Ok(json_response(status, &body))
         }
-        _ => Ok(Response::builder()
-            .status(404)
-            .body(http_body_util::Full::new(Bytes::from_static(b"Not Found")))
-            .expect("response")),
+        _ => Ok(response(
+            StatusCode::NOT_FOUND,
+            Bytes::from_static(b"Not Found"),
+        )),
     }
 }
 
-fn json_response(status: u16, body: &serde_json::Value) -> Response<http_body_util::Full<Bytes>> {
-    let json = serde_json::to_string(body).unwrap_or_default();
-    Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .body(http_body_util::Full::new(Bytes::from(json)))
-        .expect("response")
+fn response(status: http::StatusCode, body: Bytes) -> Response<http_body_util::Full<Bytes>> {
+    let mut response = Response::new(http_body_util::Full::new(body));
+    *response.status_mut() = status;
+    response
+}
+
+fn json_response(
+    status: http::StatusCode,
+    body: &serde_json::Value,
+) -> Response<http_body_util::Full<Bytes>> {
+    let mut response = response(status, Bytes::from(body.to_string()));
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    response
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn http_health_refuses_a_missing_runner_heartbeat() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind health");
+        let addr = listener.local_addr().expect("health address");
+        let state = Arc::new(WorkerState {
+            worker_id: "http-probe".to_string(),
+            ready: AtomicBool::new(true),
+            connections: AtomicUsize::new(0),
+            start_time: Instant::now(),
+            runner_state_file: Some(
+                std::env::temp_dir().join(format!("pbr-missing-http-{}", std::process::id())),
+            ),
+        });
+        let server = tokio::spawn(async move { serve_listener(listener, state).await.is_ok() });
+        for path in ["/health", "/ready"] {
+            let mut stream = tokio::net::TcpStream::connect(addr)
+                .await
+                .expect("connect health");
+            stream
+                .write_all(
+                    format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .expect("send probe");
+            let mut reply = String::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                stream.read_to_string(&mut reply),
+            )
+            .await
+            .expect("probe deadline")
+            .expect("probe response");
+            assert!(reply.starts_with("HTTP/1.1 503"), "{reply}");
+        }
+        server.abort();
+    }
 
     #[test]
     fn runner_heartbeat_is_required_when_configured() {
