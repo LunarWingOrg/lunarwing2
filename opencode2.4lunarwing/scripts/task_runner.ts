@@ -422,7 +422,7 @@ export class TaskRunner {
       })
       conn.end()
     } finally {
-      this.runs.delete(taskId)
+      if (this.runs.get(taskId)?.conn === conn) this.runs.delete(taskId)
     }
   }
 }
