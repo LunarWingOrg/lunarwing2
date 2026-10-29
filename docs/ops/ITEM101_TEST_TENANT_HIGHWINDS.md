@@ -130,8 +130,16 @@ This is a traceability caveat; no worker image is claimed built yet.
 
 ## Planned worker exercise
 
-Six sequential jobs are prepared, each in a separate persistent worker
-workspace subdirectory. No job will launch subagents or inspect credentials.
+Six sequential jobs are prepared, each targeting a separate subdirectory in its
+worker workspace. mt-admin creates the host roots on worker startup (the
+read-only pre-start check correctly found them absent):
+`/home/highwinds/lunarwing/kimi-workspace` and
+`/home/highwinds/lunarwing/pebble-workspace`. The Kimi and Pebble start paths
+both bind their tenant-owned workspace at `/workspace`
+(`ic/scripts/mt-admin-lib/09-worker-config.sh:2483,2729`), matching each
+container's `WORKSPACE_ROOT`. Once started, these host paths allow independent
+inspection of the exact subdirectory results. No job will launch subagents or
+inspect credentials.
 
 | Lane | Toolchain | Task | Independent oracle |
 | --- | --- | --- | --- |
