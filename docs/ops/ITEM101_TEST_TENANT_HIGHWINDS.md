@@ -138,10 +138,34 @@ of source revision (WI#425/WI#507 provenance concerns).
 separate short-lived load/verify sessions saw different namespaces. A temporary
 operator-only `podman unshare --rootless-netns sleep 3600` keeper allowed the
 standard command to succeed; it was not a firewall bypass and is **not** a
-runbook step. In this re-attempt the old `item101-netns` tmux session is absent;
-`worker-egress highwinds` freshly verifies both running containers and exact
-forward/input rejects. The current tree carries the managed keeper path;
-its use will be recorded separately if applied. No new manual keeper is planned.
+runbook step. At this re-attempt's initial audit the old `item101-netns` tmux
+session was absent; `worker-egress highwinds` verified both running containers
+and exact forward/input rejects. No new manual keeper was started.
+
+**New live blocker: managed keeper rejects Podman 6.1.4's built-in infra
+container.** After the new Kimi image was distributed into highwinds's rootless
+store, standard `restart-worker highwinds kimi` stopped the old worker but
+failed closed before starting its replacement. The current guard requires a
+`localhost/podman-pause:<tag>` image and rejected `ImageName == ""` with
+`namespace keeper lw-egress-keeper-highwinds uses unapproved infra image '';
+pod removed`. A standard `start-worker highwinds kimi` retry failed identically.
+
+A separate disposable diagnostic pod on `--network none` reproduced Podman's
+actual contract: `IsInfra=true`, empty `ImageName` and image ID,
+`Path=/catatonit`, `Args=[-P]`, rootfs
+`/run/user/1010/libpod/tmp/infra-container`. The diagnostic pod was removed.
+This is a built-in image-less infra container, not evidence of a remote image.
+The guard's matching condition in `ic/scripts/lunarwing-worker-egress-guard.sh`
+therefore excludes the stock implementation on this host. The security fix
+must validate this built-in representation without admitting arbitrary
+image-less/rootfs containers; that guard change is not part of RG-1 here.
+
+Current state after these attempts: daemon, PostgreSQL, vision and Pebble stay
+running. Kimi is stopped/not created. `worker-egress highwinds` still verifies
+the exact live rejects, exclusive Pebble attachment, static hosts and disabled
+recursive DNS. No filter was bypassed, no image-user check relaxed, and no
+teardown run. The task's requirement to leave **both** workers running is not
+yet satisfied. Logs: `/tmp/lw-item101/rg1-{restart,start-retry,egress-audit}.log`.
 
 **WI#507: source-root asymmetry.** `build_pebble_worker` used the operator
 checkout (`67a96a9dd...`), while Kimi used the tenant clone (`05a2cd90f...`).
