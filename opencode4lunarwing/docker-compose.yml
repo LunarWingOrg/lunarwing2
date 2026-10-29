@@ -5,9 +5,10 @@ x-worker-base: &worker-base
     args:
       WITH_TOOLCHAINS: ${WITH_TOOLCHAINS:-false}
   image: lunarwing-worker-opencode:latest
-  working_dir: /workspace
-  group_add:
-    - "${HOST_GID:-1000}"
+  working_dir: /app
+  user: "10001:10001"
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
   volumes:
     - ${OPENCODE_CONFIG_FILE:-./config/opencode.json}:/app/config/opencode.json:ro,z
     - opencode-data:/home/opencode/.local/share/opencode:z
@@ -17,6 +18,7 @@ x-worker-base: &worker-base
     - ./results:/app/results:z
     - ${SSH_DIR:-./.ssh-placeholder}:/home/opencode/.host-ssh:ro
     - ${GITCONFIG_FILE:-./.gitconfig-placeholder}:/home/opencode/.host-gitconfig:ro
+    - opencode-ipc-v2:/run/lunarwing-shared:z
   env_file:
     - path: ${EXTRA_ENV_FILE:-.env.secrets}
       required: false
@@ -34,7 +36,8 @@ x-worker-base: &worker-base
     OPENCODE_PROVIDER_RETRY_DELAY_MS: ${OPENCODE_PROVIDER_RETRY_DELAY_MS:-5000}
     OPENCODE_PROGRESS_HEARTBEAT_MS: ${OPENCODE_PROGRESS_HEARTBEAT_MS:-60000}
     OPENCODE_SESSION_ABORT_TIMEOUT_MS: ${OPENCODE_SESSION_ABORT_TIMEOUT_MS:-5000}
-    AGENT_AUTH_TOKEN: ${AGENT_AUTH_TOKEN:-}
+    AGENT_AUTH_TOKEN: ""
+    AGENT_AUTH_TOKEN_FILE: ""
     LUNARWING_WORKER_ID: ${LUNARWING_WORKER_ID:-worker-opencode-01}
     WORKSPACE_ROOT: /workspace
     OPENCODE_BIN: ${OPENCODE_BIN:-/usr/local/bin/opencode}
@@ -49,11 +52,37 @@ x-worker-base: &worker-base
     PASEO_TOKEN: ${PASEO_TOKEN:-}
 
 services:
-  lunarwing-worker:
+  lunarwing-task:
     <<: *worker-base
     command: ["--mode", "websocket"]
     environment:
       <<: *worker-env
+      LUNARWING_CONTAINER_ROLE: split-task
+      OPENCODE_MODE: websocket
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/bun", "--cwd", "/app", "/app/scripts/task_runner.ts", "--healthcheck", "/run/lunarwing-shared/runner/task-runner.sock"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 90s
+    restart: unless-stopped
+
+  lunarwing-worker:
+    <<: *worker-base
+    user: "10101:10001"
+    env_file: []
+    volumes:
+      - ./workspace:/workspace:z
+      - opencode-ipc-v2:/run/lunarwing-shared:z
+    depends_on:
+      lunarwing-task:
+        condition: service_healthy
+    command: ["--mode", "websocket"]
+    environment:
+      LUNARWING_CONTAINER_ROLE: split-bridge
+      AGENT_AUTH_TOKEN: ${AGENT_AUTH_TOKEN:?AGENT_AUTH_TOKEN is required}
+      WORKSPACE_ROOT: /workspace
+      OPENCODE_SESSION_ABORT_TIMEOUT_MS: ${OPENCODE_SESSION_ABORT_TIMEOUT_MS:-5000}
       OPENCODE_MODE: websocket
       WS_ROLE: server
       HEALTH_PORT: ${HEALTH_PORT:-8443}
@@ -105,3 +134,4 @@ services:
 volumes:
   opencode-data:
   opencode-config-home:
+  opencode-ipc-v2:
