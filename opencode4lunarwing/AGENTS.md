@@ -25,6 +25,8 @@ The `lunarwing-agent-v1` WebSocket subprotocol is shared with Pebble and Kimi Co
 
 The Dockerfile fetches anomalyco/opencode at the full SHA in `OPENCODE_REF` and requires its committed Bun lock. Update the release-to-commit mapping deliberately. Base images, Debian package indexes, rustup, and Go archives are pinned; refresh their recorded digests/checksums rather than restoring tag-only or fallback installs. The models.dev catalog the build compiles into the binary is pinned the same way (WI#467): the committed `models-dev/api.json` snapshot plus the `MODELS_DEV_SNAPSHOT_SHA256` ARG, never a live fetch — update both together when refreshing. `validate_config.py` pins the builder-stage build steps exactly (`OPENCODE_MODELS_DEV_BUILD_STEPS`); update that tuple in the same commit when a bump changes them.
 
+Keep `ARG SOURCE_DATE_EPOCH=0` before runtime account creation and preserve the same-layer `/etc/shadow` epoch-day assertion (WI#510): timestamp rewriting cannot fix a wall-clock day embedded in file contents. All four worker snapshots and `CI_DEBIAN_SNAPSHOT` move together; `20261024T011300Z` includes the Bookworm/Trixie Brotli OS-package fixes.
+
 ## Do Not
 
 - Break the `lunarwing-agent-v1` envelope format

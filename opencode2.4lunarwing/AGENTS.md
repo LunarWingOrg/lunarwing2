@@ -86,6 +86,13 @@ under `/tmp` or `/var/log/lunarwing` is newer than its marker. Every Dockerfile
 the candidate/clean-rebuild digest gate remains mandatory. Never invoke bun or
 the opencode binary in the image build with the default root HOME.
 
+Keep `ARG SOURCE_DATE_EPOCH=0` in the runtime stage before `useradd` and keep
+the same-layer shadow-day assertion. Shadow-utils records the epoch day in
+`/etc/shadow`; without the ARG a candidate and rebuild spanning UTC midnight
+have different file contents, which BuildKit's timestamp rewrite cannot fix
+(WI#510). All four workers and `CI_DEBIAN_SNAPSHOT` use `20261024T011300Z`,
+which includes the Bookworm/Trixie Brotli security fixes; bump them together.
+
 ## Do Not
 
 - Break the `lunarwing-agent-v1` envelope format

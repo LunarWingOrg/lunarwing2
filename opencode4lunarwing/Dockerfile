@@ -7,7 +7,7 @@
 # this worker. Re-bump only after both are fixed upstream.
 ARG OPENCODE_VERSION=v1.18.25
 ARG OPENCODE_REF=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
-ARG DEBIAN_SNAPSHOT=20261017T082437Z
+ARG DEBIAN_SNAPSHOT=20261024T011300Z
 # WI#467: sha256 of the committed models.dev snapshot (models-dev/api.json)
 # the upstream build compiles into the binary instead of fetching live.
 # Refresh the file and this pin together in one deliberate commit (see the
@@ -256,8 +256,12 @@ ENV GOROOT=/usr/local/go \
 # USER below); the serve process (which runs all task code) and every
 # one-shot process drop to this uid/gid via setpriv, while the bridge stays
 # root, so the bridge's and PID 1's environ are EACCES to task code.
+ARG SOURCE_DATE_EPOCH=0
 RUN groupadd --gid 10001 opencode \
-    && useradd --uid 10001 --gid 10001 -m -d /home/opencode opencode
+    && useradd --uid 10001 --gid 10001 -m -d /home/opencode opencode \
+    && shadow_entry="$(getent shadow opencode)" \
+    && shadow_day="$(printf '%s' "$shadow_entry" | cut -d: -f3)" \
+    && test "${shadow_day:-0}" = "$((SOURCE_DATE_EPOCH / 86400))"
 
 # ── app layout ─────────────────
 WORKDIR /app
