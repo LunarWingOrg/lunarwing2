@@ -79,13 +79,31 @@ credential file was read or copied by the test harness.
   administrative commands use `/tmp` as their working directory and absolute
   paths to mt-admin; no permissions or rootless security settings were relaxed.
 
-The next standard sequence is running in tmux `item101-deploy`:
-`configure-pebble` → explicit `configure-worker-egress --allow nano-gpt.com:443`
-→ `build-tenant --with-wasm --with-pebble --with-kimi --with-toolchains`
-→ `start-tenant`. Explicitly allowing the chosen LLM endpoint preserves the
-fail-closed egress policy rather than bypassing it. The build is a deployment
-release build, not a full debug verification build. Redacted local logs:
-`/tmp/lw-item101/add.log` and `/tmp/lw-item101/deploy.log`.
+Pebble configuration succeeded with model `openai/gpt-5.2`. The explicit
+`configure-worker-egress highwinds --allow nano-gpt.com:443` first failed closed
+twice: rootless `podman unshare --rootless-netns` used a new network namespace
+for each short-lived invocation, so mt-admin's separate load and verify could
+not observe the same nftables chains. The per-tenant network is `lw-egress-
+highwinds`, subnet `10.89.10.0/24`, bridge `lweg10`, recursive DNS disabled. No
+worker was running and no firewall rule was bypassed.
+
+As the least-privilege operator-only recovery, a temporary tenant-owned
+`podman unshare --rootless-netns sleep 3600` process was started in tmux
+`item101-netns`. Before it, two short invocations reported different namespace
+inodes (`4026533526`, `4026533471`); with the keeper, repeated probes reported
+the same inode (`4026533471`). Retrying the *standard mt-admin command* then
+returned success and verified the exact forward and input-chain rejects. Its
+allowlist contains only `nano-gpt.com:443`; no broad/private network exception
+was added. This first-start rootless namespace-warmup requirement matches the
+item-99 mistyfly report's WI#504, reproduced independently on a systemd host.
+The temporary keeper will be removed only after the worker containers are
+running and their filter/network checks pass.
+
+The release/WASM/fat-worker sequence is running in tmux `item101-deploy2`:
+`build-tenant --with-wasm --with-pebble --with-kimi --with-toolchains` then
+`start-tenant`. `add-tenant` already built the vision and managed sandbox images.
+The build uses deployment release outputs, not full debug builds. Redacted local
+logs: `/tmp/lw-item101/add.log` and `/tmp/lw-item101/deploy.log`.
 
 ## Planned worker exercise
 
