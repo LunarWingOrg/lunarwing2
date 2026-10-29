@@ -287,6 +287,24 @@ impl ThreadEvent {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRecoveryState {
+    Retrying,
+    Recovered,
+    Failed,
+}
+
+impl ModelRecoveryState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Retrying => "retrying",
+            Self::Recovered => "recovered",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// The specific kind of event that occurred.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EventKind {
@@ -295,6 +313,11 @@ pub enum EventKind {
         from: ThreadState,
         to: ThreadState,
         reason: Option<String>,
+    },
+    ModelRecovery {
+        failure_kind: crate::types::error::ModelFailureKind,
+        recovery_state: ModelRecoveryState,
+        attempt: u64,
     },
 
     // ── Step lifecycle ──────────────────────────────────────
