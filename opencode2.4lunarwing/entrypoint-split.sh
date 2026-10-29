@@ -46,7 +46,7 @@ fi
 attempt=0
 while [[ ! -S "$RUNNER_SOCKET" ]]; do
   attempt=$((attempt + 1))
-  [[ "$attempt" -lt 30 ]] || die "task runner did not create $RUNNER_SOCKET"
+  [[ "$attempt" -lt 120 ]] || die "task runner did not create $RUNNER_SOCKET"
   sleep 1
 done
 
