@@ -281,6 +281,7 @@ cp -a "$HARNESS_REPO_ROOT/opencode2.4lunarwing/scripts" "$fixture/target/opencod
 cp -a "$HARNESS_REPO_ROOT/opencode2.4lunarwing/config" "$fixture/target/opencode2.4lunarwing/"
 cp -a "$HARNESS_REPO_ROOT/opencode2.4lunarwing/Dockerfile" \
   "$HARNESS_REPO_ROOT/opencode2.4lunarwing/entrypoint.sh" \
+  "$HARNESS_REPO_ROOT/opencode2.4lunarwing/entrypoint-split.sh" \
   "$HARNESS_REPO_ROOT/opencode2.4lunarwing/health_server.py" \
   "$HARNESS_REPO_ROOT/opencode2.4lunarwing/agent_comm_protocol.json" \
   "$fixture/target/opencode2.4lunarwing/"
@@ -314,6 +315,7 @@ oob_prepare_image() {
   cp -a "$fixture/target/opencode2.4lunarwing/scripts" "$oob_image_root/app/scripts"
   cp -a "$fixture/target/opencode2.4lunarwing/config" "$oob_image_root/app/config"
   cp -a "$fixture/target/opencode2.4lunarwing/entrypoint.sh" \
+    "$fixture/target/opencode2.4lunarwing/entrypoint-split.sh" \
     "$fixture/target/opencode2.4lunarwing/health_server.py" \
     "$fixture/target/opencode2.4lunarwing/agent_comm_protocol.json" \
     "$oob_image_root/app/"
@@ -405,6 +407,9 @@ env = [
     "GOROOT=/usr/local/go",
     "GOPATH=/home/opencode2/go",
     "CARGO_HOME=/home/opencode2/.cargo",
+    "OPENCODE2_TASK_UID=10003",
+    "OPENCODE2_TASK_GID=10003",
+    "OPENCODE2_BRIDGE_UID=10103",
 ] + extra
 if drop:
     env = [entry for entry in env if not entry.startswith(drop + "=")]
