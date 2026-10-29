@@ -2036,8 +2036,10 @@ async fn chat_history_handler(
         }));
     }
 
-    // Try in-memory first (freshest data for active threads)
+    // Engine V2 dual-writes history rather than updating legacy session turns.
+    let prefer_durable_history = state.store.is_some() && crate::bridge::is_engine_v2_enabled();
     if let Some(thread) = sess.threads.get(&thread_id)
+        && !prefer_durable_history
         && (!thread.turns.is_empty() || thread.pending_approval.is_some())
     {
         let turns: Vec<TurnInfo> = thread
