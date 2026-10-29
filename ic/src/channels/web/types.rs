@@ -65,6 +65,16 @@ pub struct TurnInfo {
     pub tool_calls: Vec<ToolCallInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ReasoningSummary>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<TurnRecoveryInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnRecoveryInfo {
+    pub failure_kind: String,
+    pub recovery_state: String,
+    pub recovery_attempt: u64,
+    pub error: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -361,6 +371,15 @@ pub enum SseEvent {
         thread_id: Option<String>,
     },
 
+    #[serde(rename = "turn_recovery")]
+    TurnRecovery {
+        thread_id: String,
+        failure_kind: String,
+        recovery_state: String,
+        recovery_attempt: u64,
+        message: String,
+    },
+
     /// Engine thread changed state.
     #[serde(rename = "thread_state_changed")]
     ThreadStateChanged {
@@ -596,6 +615,19 @@ impl From<lunarwing_common::AppEvent> for SseEvent {
                     })
                     .collect(),
                 thread_id,
+            },
+            AE::TurnRecovery {
+                thread_id,
+                failure_kind,
+                recovery_state,
+                recovery_attempt,
+                message,
+            } => SseEvent::TurnRecovery {
+                thread_id,
+                failure_kind,
+                recovery_state,
+                recovery_attempt,
+                message,
             },
             AE::ThreadStateChanged {
                 thread_id,
@@ -1473,6 +1505,7 @@ impl WsServerMessage {
             SseEvent::SkillActivated { .. } => "skill_activated",
             SseEvent::GateRequired { .. } => "gate_required",
             SseEvent::GateResolved { .. } => "gate_resolved",
+            SseEvent::TurnRecovery { .. } => "turn_recovery",
             SseEvent::ThreadStateChanged { .. } => "thread_state_changed",
             SseEvent::ChildThreadSpawned { .. } => "child_thread_spawned",
         };
