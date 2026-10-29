@@ -161,12 +161,17 @@ starting the entrypoint by running a `/bin/sh` probe as uid 10002 in the image:
 via `as_task`, which is the required task-uid boundary, so switching it back to
 root or bypassing `as_task` is not an acceptable workaround.
 
-**Fix committed, rebuild pending:** commit `5e041ea0f` changes the Kimi Dockerfile
+**Fix committed and rebuilt:** commit `5e041ea0f` changes the Kimi Dockerfile
 runtime mode to explicit root-owned `0555` for both entrypoint scripts and adds a
 build-time mode assertion for `entrypoint-task-setup.sh`. The corrected fat
-image is rebuilding in tmux `item101-kimi-rebuild`; mt-admin `restart-tenant`
-and post-fix Kimi health/worker-listener/egress checks must pass before any
-worker acceptance job. No policy or egress rule was weakened.
+image built successfully (`BUILD_EXIT=0`) from source revision
+`5e041ea0f82dd76d7b4286db6bdc3b8e00980780`, and its operator-store ID is
+`5491cbb1cfe425f7324c06e45035817c65b8e5b91cb6fef082750146e7861ffe` with
+`toolchain-profile=true`. An image-level read-only probe ran as uid 10002 and
+confirmed mode `555`, root ownership, readable + executable, and not writable.
+The managed `restart-tenant highwinds` is currently loading this image into the
+tenant's rootless store; Kimi runtime health/listener/egress checks must pass
+before any worker acceptance job. No policy or egress rule was weakened.
 
 Pebble-only live audit: `GET :20004/health` returns
 `{"mode":"websocket","status":"ok",...}`; `mt-admin worker-listeners`
