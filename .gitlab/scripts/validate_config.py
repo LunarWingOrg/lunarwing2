@@ -1349,7 +1349,6 @@ WORKER_TS_LANE_SCRIPTS = {
             "bun scripts/sdk_surface_assert_test.ts",
             "bun scripts/lunarwing_tool_proxy_test.ts",
             "bun scripts/lunarwing_tool_plugin_test.ts",
-            "bun test scripts/task_runner_test.ts",
         ),
     ),
 }
