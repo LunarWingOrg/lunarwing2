@@ -194,3 +194,37 @@ and G++ 16.2.1; these are **not** worker-image version claims. Job IDs, actual
 commands, worker versions, independent counts and the final hand-off will be
 added only after they are observed. Redacted operational logs and helpers from
 the previous pass remain under `/tmp/lw-item101/` on this host.
+
+## Re-attempt acceptance and blocked hand-off
+
+The surviving Pebble lane was given one real gateway request at 05:59Z on
+2026-10-29: title `hw101-pebble-cpp-assignment`, thread
+`31711f66-921e-4f7c-b9cf-c41dccb5f758`, message
+`80239868-5642-4861-b239-d49c9c056ca1`. It requested the prepared Hungarian
+assignment task, lane `pebble`, one `create_job`, no subagents, and real tests.
+`POST /api/chat/send` returned `accepted`, but subsequent history/thread/job
+queries showed no approval, no assistant response, an Idle thread, and zero
+jobs. History's `Failed` with `completed_at: null` is not evidence of a terminal
+worker failure. No duplicate dispatch was sent. The polling helper was stopped
+once this state was recorded; the thread remains available for diagnosis.
+No complex worker output or independent algorithm result is claimed.
+
+The final standard Kimi `start-worker` retry still fails at the same managed
+keeper image-name check, not at RG-1's task-uid file access. The fat fixed image
+is present in both the admin and tenant image stores, but Kimi cannot be
+recreated through the current guard on this Podman version. The daemon,
+PostgreSQL, vision and Pebble remain running; the tenant and allocated ports
+are retained. Kimi is stopped. No temporary namespace keeper is running, no
+security policy was bypassed, and no teardown was performed.
+
+**STOP / TRIED / BLOCKED BY / RECOMMEND:** RG-1 is fixed and image-tested;
+standard build, worker restart and repeated standard starts were attempted.
+Live acceptance and the both-workers-running hand-off are blocked by the
+managed keeper's exclusion of Podman 6.1.4's built-in image-less infra
+container; the gateway also produced no job from the Pebble request. First
+repair/validate that narrow keeper compatibility path without admitting
+arbitrary rootfs containers, then `start-worker highwinds kimi`, verify
+`worker-egress`/`worker-listeners`, and resume the six prepared tasks. Diagnose
+the retained gateway thread before duplicating its request. Item 101 stays
+unchecked until these actual requirements pass. No protected pipeline or
+full-image reproducibility acceptance is claimed by this branch.
