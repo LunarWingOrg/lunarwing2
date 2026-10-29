@@ -28,6 +28,17 @@ worker_ipc_volume_name() {
   printf 'lunarwing-%s-%s-ipc\n' "$1" "$2"
 }
 
+worker_task_health_command() {
+  case "$1" in
+    kimi) printf '/usr/local/bin/node /app/scripts/task_runner.js --healthcheck %s\n' \
+      /run/lunarwing-shared/runner/task-runner.sock ;;
+    opencode|opencode2) printf '/usr/local/bin/bun --cwd /app /app/scripts/task_runner.ts --healthcheck %s\n' \
+      /run/lunarwing-shared/runner/task-runner.sock ;;
+    pebble) printf '/usr/local/bin/pebble4lunarwing task-runner-ping /run/lunarwing-shared/runner/task-runner.sock\n' ;;
+    *) die "unsupported external worker '$1'" ;;
+  esac
+}
+
 worker_bridge_uid() {
   case "$1" in
     opencode) printf '%s\n' "$OPENCODE_BRIDGE_UID" ;;
@@ -148,12 +159,18 @@ start_worker_task_container() {
   local userns_name="$5" env_name="$6" mounts_name="$7" restart_name="$8"
   # shellcheck disable=SC2178
   local -n userns_ref="$userns_name" env_ref="$env_name" mounts_ref="$mounts_name" restart_ref="$restart_name"
-  local task_container ipc_volume task_uid task_gid launch_contract env_file_for_hash
+  local task_container ipc_volume task_uid task_gid launch_contract env_file_for_hash health_command
+  local -a health_args=()
   task_container="$(worker_task_container_name "$worker" "$name")"
   ipc_volume="$(worker_ipc_volume_name "$worker" "$name")"
   task_uid="$(worker_task_uid "$worker")"
   task_gid="$task_uid"
-  launch_contract="$(_worker_launch_contract "$name" "$image" "non-root-split-v1")"
+  health_command="$(worker_task_health_command "$worker" "$name")" || return 1
+  health_args=(--health-cmd "$health_command" --health-interval 15s --health-timeout 3s --health-retries 3)
+  if _openrc_podman_uses_init_health; then
+    health_args=(--no-healthcheck)
+  fi
+  launch_contract="$(_worker_launch_contract "$name" "$image" "non-root-split-v2-runner-ping")"
   env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
   worker_egress_reconcile_container "$name" "$task_container"
 
@@ -179,7 +196,7 @@ start_worker_task_container() {
   say "creating $worker task container $task_container"
   _ctr "$name" run -d \
     --name "$task_container" \
-    --no-healthcheck \
+    "${health_args[@]}" \
     "${userns_ref[@]}" \
     --user "${task_uid}:${task_gid}" \
     --security-opt no-new-privileges \
@@ -201,7 +218,7 @@ start_worker_task_container() {
 }
 
 stop_worker_task_container() {
-  local name="$1" worker="$2" grace="${3:-30}" task_container
+  local name="$1" worker="$2" grace="${3:-30}" task_container load_state managed=false
   task_container="$(worker_task_container_name "$worker" "$name")"
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "openrc" && -f "$OPENRC_INITD_DIR/${task_container}" ]]; then
@@ -210,13 +227,17 @@ stop_worker_task_container() {
     _openrc_service "$task_container" stop >/dev/null 2>&1 || return 1
   elif [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
       && podman_supports_quadlet; then
-    _systemctl_user "$name" stop --no-block "${task_container}.service" >/dev/null 2>&1 || true
+    load_state="$(_systemctl_user "$name" show --value -p LoadState "${task_container}.service" 2>/dev/null)" \
+      || return 1
+    if [[ "$load_state" != not-found ]]; then
+      managed=true
+      _systemctl_user "$name" stop --no-block "${task_container}.service" >/dev/null 2>&1 || return 1
+    fi
   fi
   if _ctr "$name" inspect "$task_container" &>/dev/null; then
     _ctr "$name" stop --time "$grace" "$task_container" >/dev/null 2>&1 || return 1
   fi
-  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
-      && podman_supports_quadlet; then
+  if [[ "$managed" == true ]]; then
     _systemctl_user "$name" stop "${task_container}.service" >/dev/null 2>&1 || return 1
   fi
   say "$worker task container stopped ($task_container)"
@@ -240,7 +261,10 @@ render_worker_openrc_unit() {
   # reload the egress filter before the container starts. The ruleset lives in
   # root-owned state and the netns is recreated across reboots, so a rule set
   # loaded once at provision time would not be there.
-  local egress_ruleset egress_guard egress_chain initd
+  local egress_ruleset egress_guard egress_chain initd health_command=""
+  if [[ "$role" == "task" ]]; then
+    health_command="$(worker_task_health_command "$worker" "$name")" || return 1
+  fi
   egress_ruleset="$(worker_egress_ruleset_path "$name")"
   egress_guard="$WORKER_EGRESS_GUARD"
   egress_chain="$(worker_egress_chain "$name")"
@@ -282,7 +306,7 @@ _wk() {
 _wk_healthy() {
     [ "\$(_wk inspect -f '{{.State.Running}}' "\${wk_container}" 2>/dev/null)" = "true" ] || return 1
     if [ "\${wk_role}" = "task" ]; then
-        _wk exec "\${wk_container}" test -S /run/lunarwing-shared/runner/task-runner.sock 2>/dev/null
+        _wk exec "\${wk_container}" ${health_command}
     else
         _wk exec "\${wk_container}" curl -sf -o /dev/null --max-time 3 "http://127.0.0.1:\${wk_health_port}/health" 2>/dev/null
     fi
