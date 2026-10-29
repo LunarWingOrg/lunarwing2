@@ -717,15 +717,32 @@ compromised agent can fetch an upstream opencode (tunnel included) or run
 pin. **Only control 1 (the egress allowlist) holds against a compromised
 agent**. The maintainer-approved WI#427 bump deliberately crosses on
 compile-out plus config alone; it does not turn the in-image guards into
-an egress boundary. Control 1 remains open as **WI#424 for 2.1.7.0**.
+an egress boundary. The mt-admin egress implementation is in-tree across the
+worker lanes; the cold rootless first-start follow-up is WI#504, with
+fresh-tenant acceptance and operator rollout still tracked separately.
 
 Enforced controls (opencode2 lane unless noted):
 
-1. **Egress allowlist (DEFERRED to WI#424, 2.1.7.0; maintainer's call):** mt-admin
-   restricting worker egress to the configured LLM endpoint + git hosts.
-   Not yet implemented; it is the only control that also covers future
-   phone-home features and `webfetch`/shell exfiltration, and the only one
-   that holds against a compromised agent (see the gate record above).
+1. **Egress allowlist (WI#424, 2.1.7.0; mt-admin implementation):** per-tenant
+   rootless/host firewall chains limit workers to the configured LLM endpoint
+   and operator allowlist. This remains the only control that also covers
+   future phone-home features and `webfetch`/shell exfiltration, and the only
+   one that holds against a compromised agent (see the gate record above).
+
+   **Rootless Podman first-start keeper (WI#504):** when no worker container is
+   running, mt-admin creates `lw-egress-keeper-<tenant>` on that tenant's
+   `lw-egress-<tenant>` network before applying the filter. The root-owned guard
+   verifies the keeper's ownership label, single infra-container shape, local
+   `localhost/podman-pause:<tag>` image and exclusive network attachment, then
+   loads the rules and reads both reject chains in one
+   `podman unshare --rootless-netns` session. `--verify` never creates a keeper
+   or loads rules; the imperative post-start and the OpenRC/Quadlet paths use
+   the same guard. A non-local infra image is refused and its keeper pod is
+   removed. Keep Podman's `infra_image` at its local default; the host must
+   have `catatonit` installed so Podman can build/use its local pause image.
+   This prerequisite applies on OpenRC/Gentoo as well as systemd hosts.
+   `stop-tenant` releases the keeper only after worker quiescence; cleanup
+   failure is a warning, not a reason to report a healthy stop as failed.
 2. **No self-exposure commands (naive-use guard).** The bridge session
    ruleset (`opencode2.4lunarwing/scripts/opencode_task_executor.ts`,
    `sessionPermissions()`) denies `shell` on `*opencode service *`,

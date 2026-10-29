@@ -51,3 +51,6 @@ junit-*.xml
 # node_modules tree has no manifest/lockfile pinning it in-tree, so a
 # prebuilt blob refresh has no review surface.
 node_modules/
+
+# Executable fallback for the worker-egress shell harness when temp mounts are noexec.
+.worker-egress-test.*/
