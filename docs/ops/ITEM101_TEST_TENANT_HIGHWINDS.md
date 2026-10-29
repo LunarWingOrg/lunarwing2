@@ -138,48 +138,40 @@ operator's Podman store confirms `lunarwing-worker-pebble:latest` image ID
 and `toolchain-profile=true`. It has not yet been distributed into the tenant's
 rootless store; that occurs during `start-tenant`.
 
-The fat Kimi image build completed successfully from the tenant clone at
-`05a2cd90fc34da616c9480b7e7a31ed1da6dc3ef`. The real Kimi CLI contract suite in
-the image build passed **178/178, 0 failed, 0 skipped**, including headless
-invocation/config-hook contracts. A read-only operator-store inspection confirms
-`lunarwing-worker-kimi:latest` image ID
-`ede188ca296411baece9f43e3fb75e0bbb035cd40a37597264654624ec9471da`, size
-2,689,862,622 bytes, OCI revision label
-`05a2cd90fc34da616c9480b7e7a31ed1da6dc3ef` and `toolchain-profile=true`.
+The initial fat Kimi image built from the tenant clone at
+`05a2cd90fc34da616c9480b7e7a31ed1da6dc3ef`. Its in-image real CLI contract
+suite passed **178/178, 0 failed, 0 skipped**, including headless
+invocation/config-hook contracts. That first image had root-owned
+`/app/entrypoint-task-setup.sh` mode `0511`; task uid 10002 could execute but
+could not read it. Startup's `as_task` handoff therefore failed with
+`/bin/bash: /app/entrypoint-task-setup.sh: Permission denied`, reaching the
+systemd start limit after five attempts. The pre-start and post-start egress
+guards nevertheless both passed. An image-level probe as uid 10002 reproduced
+`test -x` passing and `test -r` failing. `entrypoint.sh:136` requires this file
+to run through `as_task`, so changing its identity boundary was not acceptable.
 
-`start-tenant highwinds` reached `START_EXIT=0` with PostgreSQL, LunarVision,
-the daemon, and Pebble running; Kimi's image was distributed but its unit failed
-five starts and reached systemd `start-limit-hit`. The Kimi unit's rootless
-pre-start and post-start egress guards both succeeded. Its journal identified
-the actual failure: `/bin/bash: /app/entrypoint-task-setup.sh: Permission
-denied`. In the built image the script was root-owned mode `0511`; the task uid
-10002 had execute but no read permission. The source is tracked mode `100644`;
-the Dockerfile's `chmod +x` followed by `chmod a-w` did not produce a
-world-readable executable under the image-build mode/umask. Reproduced without
-starting the entrypoint by running a `/bin/sh` probe as uid 10002 in the image:
-`test -x` passed while `test -r` failed. `entrypoint.sh:136` executes this file
-via `as_task`, which is the required task-uid boundary, so switching it back to
-root or bypassing `as_task` is not an acceptable workaround.
-
-**Fix committed and rebuilt:** commit `5e041ea0f` changes the Kimi Dockerfile
-runtime mode to explicit root-owned `0555` for both entrypoint scripts and adds a
-build-time mode assertion for `entrypoint-task-setup.sh`. The corrected fat
-image built successfully (`BUILD_EXIT=0`) from source revision
-`5e041ea0f82dd76d7b4286db6bdc3b8e00980780`, and its operator-store ID is
+**Fix committed, rebuilt, and startup recovered:** commit `5e041ea0f` changes the
+Kimi Dockerfile to explicitly set both entrypoint scripts to root-owned mode
+`0555` and asserts the task setup script mode at image build. The fat image
+rebuilt successfully (`BUILD_EXIT=0`) from source revision
+`5e041ea0f82dd76d7b4286db6bdc3b8e00980780`; its image ID is
 `5491cbb1cfe425f7324c06e45035817c65b8e5b91cb6fef082750146e7861ffe` with
-`toolchain-profile=true`. An image-level read-only probe ran as uid 10002 and
-confirmed mode `555`, root ownership, readable + executable, and not writable.
-The managed `restart-tenant highwinds` is currently loading this image into the
-tenant's rootless store; Kimi runtime health/listener/egress checks must pass
-before any worker acceptance job. No policy or egress rule was weakened.
+`toolchain-profile=true`. A fresh image-level probe as uid 10002 verified mode
+`555`, root ownership, read/execute access, and no write access. The subsequent
+managed `restart-tenant highwinds` returned exit 0; the Kimi user unit is active
+with zero restarts and its `/ready` endpoint returned HTTP 200 with websocket
+listener and task-runner heartbeat ready. No policy or egress rule was weakened.
 
-Pebble-only live audit: `GET :20004/health` returns
-`{"mode":"websocket","status":"ok",...}`; `mt-admin worker-listeners`
-reports clean with loopback-only published mappings; `mt-admin worker-egress`
-reports exclusive attachment, DNS pinned, static hosts current, and both exact
-tenant-specific forward/input reject chains live. Its only forward allow is
-`216.150.1.1:443` (`nano-gpt.com:443`); no recursive DNS or broad egress is
-allowed. Redacted deployment log: `/tmp/lw-item101/deploy.log`.
+**Post-start security/health audit (current tree):** mt-admin status reports the
+tenant daemon, PG, Pebble, and Kimi active, both worker images present, and
+LunarVision healthy. `mt-admin worker-listeners highwinds` reports clean for
+both workers with host-loopback-only publications. `mt-admin worker-egress
+highwinds` confirms both containers exclusively attached, DNS pinned, static
+hosts current, and exact tenant-specific forward/input reject chains live; the
+only forward allow is `216.150.1.1:443` (`nano-gpt.com:443`). Pebble and Kimi
+health endpoints returned HTTP 200 (`pebble-worker-0.1.0` and Kimi Code `2.3.0`);
+no recursive DNS or broad egress is allowed. Acceptance jobs have not yet run.
+Redacted logs and the latest machine-readable audit: `/tmp/lw-item101/`.
 
 **Worker build source-root finding:** at provisioning, the tenant clone is at
 `05a2cd90fc34da616c9480b7e7a31ed1da6dc3ef`. At Pebble image build time, the
