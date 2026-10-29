@@ -136,8 +136,12 @@ async fn write_line<W>(writer: &mut W, line: &str) -> RunnerResult<()>
 where
     W: AsyncWriteExt + Unpin,
 {
-    writer.write_all(line.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        writer.write_all(line.as_bytes()).await?;
+        writer.write_all(b"\n").await
+    })
+    .await
+    .map_err(|_| runner_error("runner write timed out"))??;
     Ok(())
 }
 
@@ -303,7 +307,11 @@ async fn handle_connection(stream: UnixStream, config: Arc<ExecutorConfig>) -> R
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
     let mut buffer = Vec::new();
-    let Some(line) = next_line(&mut reader, &mut buffer).await? else {
+    let Some(line) =
+        tokio::time::timeout(Duration::from_secs(2), next_line(&mut reader, &mut buffer))
+            .await
+            .map_err(|_| runner_error("runner accept handshake timed out"))??
+    else {
         return Ok(());
     };
     let request_value: Value = serde_json::from_str(&line)?;
@@ -424,14 +432,30 @@ pub async fn delegate_task(
     event_tx: mpsc::UnboundedSender<ExecutorEvent>,
     mut cancel_rx: oneshot::Receiver<()>,
 ) -> RunnerResult<()> {
+    use std::os::unix::fs::MetadataExt;
+
     verify_socket(socket_path)?;
-    let stream = UnixStream::connect(socket_path).await?;
+    let before = std::fs::symlink_metadata(socket_path)?;
+    let stream = tokio::time::timeout(Duration::from_secs(2), UnixStream::connect(socket_path))
+        .await
+        .map_err(|_| runner_error("runner connect timed out"))??;
+    verify_socket(socket_path)?;
+    let after = std::fs::symlink_metadata(socket_path)?;
+    if before.dev() != after.dev() || before.ino() != after.ino() {
+        return Err(runner_error("runner socket changed during connect"));
+    }
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
     let mut buffer = Vec::new();
     let run =
         serde_json::to_string(&json!({"op": "run", "request": request, "proxy_env": proxy_env}))?;
-    write_line(&mut write, &run).await?;
+    if run.len() > runner_line_cap()? {
+        return Err(runner_error("runner request exceeds line cap"));
+    }
+    tokio::select! {
+        result = write_line(&mut write, &run) => result?,
+        _ = &mut cancel_rx => return Err(runner_error("task cancelled before runner dispatch")),
+    }
     let timeout_ms = request.timeout_ms.unwrap_or(protocol::DEFAULT_TIMEOUT_MS);
     let deadline = sleep(Duration::from_millis(timeout_ms) + RUN_MARGIN);
     tokio::pin!(deadline);
@@ -638,7 +662,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!("pbr-cancel-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("create cancel root");
         let stub = root.join("pebble-stub");
-        crate::executor::write_executable_stub(&stub, "#!/bin/sh\nsleep 30\n");
+        crate::executor::write_executable_stub(
+            &stub,
+            "#!/bin/sh\nsleep 30 &\nprintf 'ready:%s\\n' \"$!\"\nwait\n",
+        );
         let socket = root.join("runner.sock");
         let config = ExecutorConfig {
             pebble_bin: stub.to_string_lossy().into_owned(),
@@ -663,7 +690,23 @@ mod tests {
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let delegated = delegate_task(&socket, &request, None, event_tx, cancel_rx);
         tokio::pin!(delegated);
-        sleep(Duration::from_millis(100)).await;
+        let ready = async {
+            while let Some(event) = event_rx.recv().await {
+                if let ExecutorEvent::Progress(envelope) = event {
+                    if envelope.payload["delta"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("ready:"))
+                    {
+                        return;
+                    }
+                }
+            }
+            panic!("executor ended before spawning the child");
+        };
+        tokio::select! {
+            result = &mut delegated => panic!("delegation ended before cancellation: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(3), ready) => result.expect("spawn ready deadline"),
+        }
         let _ = cancel_tx.send(());
         let outcome = tokio::time::timeout(Duration::from_secs(5), delegated).await;
         server.abort();
