@@ -2809,9 +2809,6 @@ start_tenant_pebble() {
     pebble_launch_contract="$(_worker_launch_contract "$name" lunarwing-worker-pebble:latest "$PEBBLE_ROOTFUL_LAUNCH_CONTRACT")"
   fi
   prepare_worker_egress "$name" pebble
-  # WI#400 LD-8: the pebble bridge must run as container root (image USER
-  # 0:0) — under rootless keep-id an image without USER starts the bridge
-  # as the task uid and the credential split is a no-op.
   local image_user
   image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
     lunarwing-worker-pebble:latest 2>/dev/null || true)"
