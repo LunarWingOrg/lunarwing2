@@ -260,11 +260,11 @@ RUN set -eu; \
     probe_dir="$(mktemp -d)"; \
     trap 'rm -rf "$probe_dir"' EXIT; \
     chown 10002:10002 "$probe_dir"; \
-    test -z "$(find /app/config /app/hooks /app/scripts /app/entrypoint.sh /app/entrypoint-task-setup.sh \
+    test -z "$(find -L /app/config /app/hooks /app/scripts /app/entrypoint.sh /app/entrypoint-task-setup.sh \
       /app/health_server.py /app/task_runner_bind.py /app/agent_comm_protocol.json \
       \( ! -uid 0 -o -perm /222 \) -print)"; \
     setpriv --reuid=10002 --regid=10002 --clear-groups \
-      find /app/config /app/hooks /app/scripts /app/entrypoint.sh /app/entrypoint-task-setup.sh \
+      find -L /app/config /app/hooks /app/scripts /app/entrypoint.sh /app/entrypoint-task-setup.sh \
       /app/health_server.py /app/task_runner_bind.py /app/agent_comm_protocol.json \
       -type f -exec cat -- {} + >/dev/null; \
     setpriv --reuid=10002 --regid=10002 --clear-groups \
