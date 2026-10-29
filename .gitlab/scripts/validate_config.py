@@ -2975,6 +2975,7 @@ def main() -> int:
     validate_trivy_gate_inputs(merged_config, errors)
     validate_deliverables_manifest(merged_config, errors)
     validate_ci_tool_image_pins(merged_config, merged_variables, errors)
+    validate_worker_snapshots(merged_variables, errors)
     rust_image = extract_rust_image(defaults, ".rust-job", merged_variables)
     msrv_image = extract_rust_image(defaults, ".rust-msrv-job", merged_variables)
     if rust_image is None:
