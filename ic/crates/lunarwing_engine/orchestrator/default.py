@@ -1007,6 +1007,8 @@ def model_failure_result(state, response):
     message = response.get("terminal_message", "The model gateway failed. Retry later.")
     if not isinstance(message, str) or not message:
         message = "The model gateway failed. Retry later."
+    __emit_event__("model_recovery", failure_kind=kind, recovery_state="failed",
+                   attempt=ensure_failure_recovery(state).get("model_recovery_total_attempts", 0))
     __transition_to__("failed", "model failure: " + kind)
     return complete_result(
         state,
@@ -1292,8 +1294,16 @@ def run_loop(context, goal, actions, state, config):
                 "compaction_count": state.get("compaction_count", 0),
                 "obligation_nudge_count": state.get("_obligation_nudge_count", 0),
             })
+            __emit_event__("model_recovery", failure_kind=kind, recovery_state="retrying",
+                           attempt=total_attempts + 1)
             continue
 
+        recovery = ensure_failure_recovery(state)
+        pending_model_error = recovery.get("pending_model_error")
+        if isinstance(pending_model_error, dict):
+            __emit_event__("model_recovery", failure_kind=pending_model_error.get("kind", "internal"),
+                           recovery_state="recovered",
+                           attempt=recovery.get("model_recovery_total_attempts", 0))
         delivered_recovery = activate_delivered_recovery(state)
         observation = provider_stream_observation(response)
 

@@ -29,6 +29,27 @@ struct TurnCompletion {
     message: IncomingMessage,
     conversation_id: lunarwing_engine::ConversationId,
     thread_id: lunarwing_engine::ThreadId,
+    history: Option<HistoryReference>,
+}
+
+#[derive(serde::Deserialize)]
+struct HistoryReference {
+    thread_id: lunarwing_engine::ThreadId,
+    user_message_id: uuid::Uuid,
+    started_at: chrono::DateTime<chrono::Utc>,
+}
+
+async fn history_reference(
+    state: &EngineState,
+    message: &IncomingMessage,
+    thread_id: lunarwing_engine::ThreadId,
+) -> Option<HistoryReference> {
+    let db = state.db.as_ref()?;
+    let cid = resolve_v1_conversation_for_message(db.as_ref(), message).await?;
+    let metadata = db.get_conversation_metadata(cid).await.ok()??;
+    let reference: HistoryReference =
+        serde_json::from_value(metadata.get("engine_turn_history")?.clone()).ok()?;
+    (reference.thread_id == thread_id).then_some(reference)
 }
 
 pub(super) async fn await_thread_outcome(
@@ -45,6 +66,7 @@ pub(super) async fn await_thread_outcome(
         message: message.clone(),
         conversation_id,
         thread_id,
+        history: history_reference(state, message, thread_id).await,
     };
     let mut cancellation = turn.cancellation_guard();
     if !turn.wait(&mut events, OUTCOME_TIMEOUT).await {
@@ -105,6 +127,15 @@ impl TurnCompletion {
     }
 
     async fn forward(&self, event: &lunarwing_engine::ThreadEvent) {
+        if let Some(recovery) = super::model_recovery_info(event) {
+            let state = match recovery.recovery_state.as_str() {
+                "retrying" => "Retrying",
+                "failed" => "Failed",
+                _ => "Processing",
+            };
+            let completed_at = (state == "Failed").then(|| event.timestamp.to_rfc3339());
+            self.write_recovery(recovery, state, completed_at).await;
+        }
         deliver_thread_event(
             &self.delivery.channels,
             &self.state,
@@ -231,6 +262,7 @@ impl TurnCompletion {
             .record_thread_outcome(self.conversation_id, self.thread_id, &outcome)
             .await
             .map_err(|error| engine_err("conversation error", error))?;
+        self.write_recovery_outcome(&outcome).await;
 
         if let Some(credential) = auth_credential {
             return self.auth_fallback(credential).await;
@@ -272,6 +304,73 @@ impl TurnCompletion {
             );
         }
         super::broadcast_dead_gate_resolutions(&self.state, &discarded);
+    }
+
+    async fn write_recovery(
+        &self,
+        recovery: crate::channels::web::types::TurnRecoveryInfo,
+        state: &str,
+        completed_at: Option<String>,
+    ) {
+        let Some(reference) = &self.history else {
+            return;
+        };
+        let user_message_id = reference.user_message_id;
+        let Some(db) = &self.state.db else { return };
+        let Some(cid) = resolve_v1_conversation_for_message(db.as_ref(), &self.message).await
+        else {
+            return;
+        };
+        let marker = serde_json::json!({
+            "user_message_id": user_message_id,
+            "state": state,
+            "completed_at": completed_at,
+            "recovery": recovery,
+        });
+        if let Err(error) = db
+            .add_conversation_message(cid, "turn_recovery", &marker.to_string())
+            .await
+        {
+            tracing::warn!(%error, "failed to persist Engine V2 recovery status");
+        }
+    }
+
+    async fn write_recovery_outcome(&self, outcome: &ThreadOutcome) {
+        let Some(reference) = &self.history else {
+            return;
+        };
+        let Ok(Some(thread)) = self.state.store.load_thread(self.thread_id).await else {
+            return;
+        };
+        let Some(mut recovery) = thread
+            .events
+            .iter()
+            .rev()
+            .filter(|event| event.timestamp >= reference.started_at)
+            .find_map(super::model_recovery_info)
+        else {
+            return;
+        };
+        let state = match outcome {
+            ThreadOutcome::Completed { .. } => {
+                recovery.recovery_state = "recovered".into();
+                recovery.error = "The model recovered and the turn completed.".into();
+                "Completed"
+            }
+            ThreadOutcome::Failed { .. } => {
+                recovery.recovery_state = "failed".into();
+                recovery.error = "The turn failed after model recovery; no retry is running. Check for an existing job id before re-dispatching.".into();
+                "Failed"
+            }
+            ThreadOutcome::Stopped => {
+                recovery.recovery_state = "interrupted".into();
+                recovery.error = "The turn was interrupted during model recovery.".into();
+                "Interrupted"
+            }
+            _ => return,
+        };
+        self.write_recovery(recovery, state, Some(chrono::Utc::now().to_rfc3339()))
+            .await;
     }
 
     async fn write_history(&self, text: &str) {

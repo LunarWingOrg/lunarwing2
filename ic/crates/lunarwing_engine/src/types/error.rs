@@ -91,7 +91,7 @@ impl ModelFailureKind {
                 "Model failure observation: the previous provider response was invalid. Repair response shape and continue without repeating completed work."
             }
             Self::ReplArgumentCorruption => {
-                "REPL argument corruption: the previous draft was rejected before execution; no tools in that response ran. Emit a fresh, complete Python REPL block or valid structured tool arguments. Keep reasoning, think tags, XML argument tags, and nested fences out of executable code."
+                "REPL argument corruption: the previous draft was rejected before execution; no tools in that response ran. For a single create_job delegation, call the available structured create_job tool directly with a plain-prose description and no markdown fences. Otherwise emit a fresh, complete Python REPL block or valid structured tool arguments. Keep reasoning, think tags, XML argument tags, and nested fences out of executable code. Do not repeat earlier successful tool calls; wait for the job id before reporting dispatch success."
             }
             Self::ContextOverflow => {
                 "Model failure observation: context overflowed and older context was removed. Use remaining context, finish concisely, and do not reconstruct dropped details."

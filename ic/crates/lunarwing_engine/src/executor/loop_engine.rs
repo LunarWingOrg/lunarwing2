@@ -1768,6 +1768,26 @@ mod tests {
             }
         ));
         assert_eq!(llm.requests().len(), 2);
+        let recovery: Vec<_> = exec
+            .thread
+            .events
+            .iter()
+            .filter_map(|event| match event.kind {
+                EventKind::ModelRecovery {
+                    failure_kind,
+                    recovery_state,
+                    attempt,
+                } => Some((failure_kind, recovery_state.as_str(), attempt)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            recovery,
+            vec![
+                (ModelFailureKind::ReplArgumentCorruption, "retrying", 1),
+                (ModelFailureKind::ReplArgumentCorruption, "failed", 1),
+            ]
+        );
     }
 
     #[tokio::test]
