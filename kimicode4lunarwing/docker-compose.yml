@@ -105,6 +105,7 @@ services:
     command: []
     environment:
       <<: *worker-env
+      AGENT_AUTH_TOKEN: ${AGENT_AUTH_TOKEN:?AGENT_AUTH_TOKEN is required}
       SMOKE_WS_HOST: lunarwing-worker
       SMOKE_WS_PORT: ${WS_PORT:-9090}
       SMOKE_HEALTH_PORT: ${HEALTH_PORT:-8443}
