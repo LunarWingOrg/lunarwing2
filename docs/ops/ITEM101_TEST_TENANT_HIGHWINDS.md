@@ -126,7 +126,12 @@ legs** on `lunarwing-worker-pebble:candidate`: `/bin/sh -lc` (the actual Pebble
 task-shell spawn mode) and `env -i /bin/sh -c`, with networking disabled. Both
 reported Cargo/rustc 1.96.1, Go 1.24.3 and rustup 1.28.2. mt-admin then promoted
 the candidate to `lunarwing-worker-pebble:latest` (fat profile, source revision
-`67a96a9dd4380317dd05badda0f357a20c9085bb`).
+`67a96a9dd4380317dd05badda0f357a20c9085bb`). A read-only inspection in the
+operator's Podman store confirms `lunarwing-worker-pebble:latest` image ID
+`168667d144b4fce57985a430a554b2c53e42172f75220ea2a83e56f8a2bfe6e4`, size
+2,334,932,434 bytes, OCI revision label `67a96a9dd4380317dd05badda0f357a20c9085bb`
+and `toolchain-profile=true`. It has not yet been distributed into the tenant's
+rootless store; that occurs during `start-tenant`.
 
 The fat Kimi image build is in progress and its build command records source
 revision `05a2cd90fc34da616c9480b7e7a31ed1da6dc3ef` (the tenant clone); its
