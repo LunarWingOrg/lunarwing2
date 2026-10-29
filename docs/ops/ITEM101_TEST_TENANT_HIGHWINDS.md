@@ -1,7 +1,9 @@
 # Item 101 (v2.1.7.0) — persistent test tenant `highwinds`
 
-Status: RG-1 implementation verified locally; rebuilt-image and complex-job
-acceptance still in progress. Item 101 is not yet complete.
+Status: RG-1 implemented, fat image built and task-uid smoke verified. Live
+complex-job acceptance is blocked by the managed egress keeper's Podman 6.1.4
+compatibility refusal. Item 101 is not complete; the daemon and Pebble remain
+running, but Kimi is stopped after its guarded recreation failed.
 
 ## Scope and provenance
 
