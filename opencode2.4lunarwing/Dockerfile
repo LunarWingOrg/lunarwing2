@@ -261,7 +261,9 @@ ENV GOROOT=/usr/local/go \
 ARG SOURCE_DATE_EPOCH=0
 RUN groupadd --gid 10003 opencode2 \
     && useradd --uid 10003 --gid 10003 -m -d /home/opencode2 opencode2 \
-    && test "$(getent shadow opencode2 | cut -d: -f3)" = "$((SOURCE_DATE_EPOCH / 86400))"
+    && shadow_entry="$(getent shadow opencode2)" \
+    && shadow_day="$(printf '%s' "$shadow_entry" | cut -d: -f3)" \
+    && test "${shadow_day:-0}" = "$((SOURCE_DATE_EPOCH / 86400))"
 
 # ── app layout ─────────────────────────
 WORKDIR /app
