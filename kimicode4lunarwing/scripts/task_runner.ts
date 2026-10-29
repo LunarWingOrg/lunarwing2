@@ -38,7 +38,7 @@
  * (`node task_runner.js <socket-path>`) stays for host-side runs and tests.
  */
 
-import { createServer, type Server, type Socket } from "node:net"
+import { connect, createServer, type Server, type Socket } from "node:net"
 import { chmodSync, lstatSync, mkdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs"
 import { dirname } from "node:path"
 
@@ -456,12 +456,43 @@ export function inheritedListenFd(raw: string | undefined = process.env[RUNNER_L
   return Number(raw)
 }
 
-/**
- * CLI entrypoint. In the image: `node task_runner.js` with the listening
- * descriptor inherited from the root launcher (NL-7). Host runs and tests:
- * `node task_runner.js <socket-path>` (or LUNARWING_TASK_RUNNER_SOCKET).
- */
+export async function runnerHealthcheck(socketPath: string): Promise<number> {
+  if (!socketPath) return 1
+  return await new Promise((resolve) => {
+    const socket = connect(socketPath)
+    let data = Buffer.alloc(0)
+    let settled = false
+    const finish = (ok: boolean) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      socket.destroy()
+      resolve(ok ? 0 : 1)
+    }
+    const timer = setTimeout(() => finish(false), 2_000)
+    socket.once("error", () => finish(false))
+    socket.once("close", () => finish(false))
+    socket.on("data", (chunk: Buffer) => {
+      if (data.length + chunk.length > 1024) return finish(false)
+      data = Buffer.concat([data, chunk])
+      const newline = data.indexOf(10)
+      if (newline < 0) return
+      try {
+        const response: unknown = JSON.parse(data.subarray(0, newline).toString("utf8"))
+        finish(isRecord(response) && response.ok === true && response.op === "pong")
+      } catch {
+        finish(false)
+      }
+    })
+    socket.write('{"op":"ping"}\n')
+  })
+}
+
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
+  if (argv[0] === "--healthcheck") {
+    const socketPath = argv[1] ?? taskRunnerSocketPath()
+    return await runnerHealthcheck(socketPath)
+  }
   let listenFd: number | null
   try {
     listenFd = inheritedListenFd()
@@ -532,5 +563,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 }
 
 if (process.argv[1] && (process.argv[1].endsWith("task_runner.js") || process.argv[1].endsWith("task_runner.ts"))) {
-  void main()
+  void main().then((code) => {
+    process.exitCode = code
+  })
 }
