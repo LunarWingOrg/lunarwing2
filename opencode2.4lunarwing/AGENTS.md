@@ -95,6 +95,15 @@ have different file contents, which BuildKit's timestamp rewrite cannot fix
 (WI#510). All four workers and `CI_DEBIAN_SNAPSHOT` use `20261024T011300Z`,
 which includes the Bookworm/Trixie Brotli security fixes; bump them together.
 
+Bun 1.4.4 also requires the photon-node hunk-10 repair at this upstream pin:
+the builder runs `scripts/fix_photon_patch_context.py` after checkout, before
+`bun install --frozen-lockfile`. On the first bump whose patch already includes
+upstream `61845b0`, the fixer deliberately fails as redundant. Remove both
+`fix_photon_patch_context{,_test}.py` files, the Dockerfile fixer COPY/RUN and
+self-test invocation, and this lane's two `input_files` entries in
+`.gitlab/scripts/build-worker-image.sh` together; do not weaken the drift guard
+or downgrade Bun. See checklist item 7 in `docs/ops/WORKER-CONTAINERS.md`.
+
 ## Do Not
 
 - Break the `lunarwing-agent-v1` envelope format
@@ -144,6 +153,6 @@ candidate smoke; `scripts/runtime_smoke.py` also runs against a live container.
 - `scripts/image_config_policy.py` — checkout-owned allowlist for the complete image `Env` (PATH order included), `Entrypoint`, `Cmd`, `User`, `WorkingDir`, `Healthcheck`, `ExposedPorts`, and `StopSignal`, with `OnBuild`, `Volumes`, and `Shell` required empty; shared by the protected tar verifier and mt-admin. The verifier normalizes Docker's `Config.Healthcheck` and Podman's top-level `Healthcheck` before applying this policy.
 - `../.gitlab/go/dockerfile-parse` — required BuildKit-parser Dockerfile policy; the old bash grammar is retired. Keep its Go tests and divergence fixtures current, and preserve the pinned Go CI job.
 - `scripts/entrypoint_config_test.py` — non-root startup configuration regression tests using a 0444 baked config, including repeat boots, HOME/XDG/`OPENCODE_CONFIG_DIR` service defaults, and agent plants (FIFO/dir/symlink) at the reset path.
-- `scripts/runtime_smoke.py` — WI#424 control 6 runtime exposure suite. The candidate build runs `scripts/runtime_smoke_entrypoint.sh` against the real started entrypoint; `--profile container` runs inside a live worker and `--profile remote` reads the container's own environment from the host. Fails on a `remote` service config (including unreadable files), an opentunnel identity dir, a non-loopback listener beyond the health/WS ports, an enabled `share`, or a missing/crashing wrapper that does not produce the specific exit-77 `service set remote true` refusal; `scripts/runtime_smoke_test.py` pins each failure mode.
+- `scripts/runtime_smoke.py` — WI#424 control 6 runtime exposure suite. The candidate build runs `scripts/runtime_smoke_entrypoint.sh` against the real started entrypoint (scoped to a private netns via `RUN --network=none` in the Dockerfile — WI#511: mt-admin builds with `podman build --network=host`, so without the private netns the listener check reads the HOST's socket table and flags host sshd/NetBird as worker exposure); `--profile container` runs inside a live worker and `--profile remote` reads the container's own environment from the host. Fails on a `remote` service config (including unreadable files), an opentunnel identity dir, a non-loopback listener beyond the health/WS ports, an enabled `share`, or a missing/crashing wrapper that does not produce the specific exit-77 `service set remote true` refusal; `scripts/runtime_smoke_test.py` pins each failure mode, including the WI#511 netns-scoping and real-kernel-row fixtures.
 - `scripts/compile_out_remote_tunnel.py` — fail-closed build patch that compiles the OpenTunnel client out; drift scan over `packages/{cli,server,schema,core}/src` (ts+tsx, any quoted `@opentunnel/*` specifier, all workspace manifests).
 - `scripts/opencode_task_executor.ts` — `sessionPermissions()` carries the shell deny rules (after the allow-all rule; ordering matters).

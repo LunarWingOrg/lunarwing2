@@ -41,6 +41,14 @@ RUN printf '%s' "${OPENCODE_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
     git -C /build/opencode tag --force "${OPENCODE_VERSION}" "${OPENCODE_REF}"
 
 WORKDIR /build/opencode
+# Bun 1.4.4 (unlike <= 1.4.2) rejects the pinned photon-node patch's hunk-10
+# context lines that carry one stray leading space ("hunk #10 does not apply
+# to photon_rs.js"). Upstream commit 61845b0 trims the stray spaces; the
+# patched photon_rs.js is byte-identical under 1.3.14/1.4.2/1.4.4. Apply the
+# same whitespace repair before bun install. The script fails the build if
+# upstream ever lands the fix itself, so the in-tree repair can be dropped.
+COPY scripts/fix_photon_patch_context.py /build/fix_photon_patch_context.py
+RUN python3 /build/fix_photon_patch_context.py /build/opencode
 RUN bun install --frozen-lockfile && bun pm cache rm
 
 # WI#369 compile-time SDK gate: typecheck the bridge's SDK-facing scripts
@@ -298,8 +306,33 @@ COPY entrypoint.sh entrypoint-split.sh health_server.py agent_comm_protocol.json
 COPY scripts/ ./scripts/
 COPY config/ ./config/
 
+# RG-1: COPY preserves the build context's modes, so a checkout made under a
+# restrictive umask (mt-admin's private tenant clone has 0700 dirs / 0600 files)
+# ships /app/config and /app/scripts unreadable by the task uid 10003 even
+# though every root-side check passes. Add the read/traverse bits first so the
+# read-only pass below cannot turn 0600 into an unreadable 0400.
+RUN set -eu; \
+    command -v setpriv >/dev/null; \
+    chmod -R a+rX /app/config /app/scripts; \
+    chmod a+rx /app/entrypoint.sh /app/entrypoint-split.sh /app/health_server.py; \
+    chmod a+r /app/agent_comm_protocol.json
+
+# WI#357 (run-79 EI-5): the exposure controls must be root-owned and read-only.
+# Kept as the pinned instruction the BuildKit-parser policy gate matches.
 RUN chmod +x /app/entrypoint.sh /app/entrypoint-split.sh /app/health_server.py \
     && chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/entrypoint-split.sh /app/health_server.py /app/agent_comm_protocol.json
+
+# RG-1: prove the task uid can really read what it must, instead of relying on
+# root-side checks that pass even when the inputs are 0600 root:root. Fails the
+# BUILD on any EACCES or on a non-root-owned / world-writable policy input.
+RUN set -eu; \
+    test -z "$(find -L /app/scripts /app/config /app/entrypoint.sh /app/entrypoint-split.sh \
+      /app/health_server.py /app/agent_comm_protocol.json \
+      \( ! -uid 0 -o -perm /222 \) -print)"; \
+    setpriv --reuid=10003 --regid=10003 --clear-groups \
+      find -L /app/scripts /app/config /app/entrypoint.sh /app/entrypoint-split.sh \
+      /app/health_server.py /app/agent_comm_protocol.json \
+      -type f -exec cat -- {} + >/dev/null
 
 # WI#357: install the exposure-guard wrapper as the only PATH-visible
 # opencode entrypoint, then fail the BUILD when the policy regresses:
@@ -385,6 +418,7 @@ RUN set -eu; \
     && python3 scripts/entrypoint_config_test.py \
     && python3 scripts/compile_out_remote_tunnel_test.py \
     && python3 scripts/runtime_smoke_test.py \
+    && python3 scripts/fix_photon_patch_context_test.py \
     && for leaked in /root/.bun /root/.local /root/.cache /root/.config; do \
            [ ! -e "$leaked" ] \
            || { echo "FATAL: build-time self-tests leaked per-build state at $leaked — refusing to bake a non-reproducible layer" >&2; exit 1; }; \
@@ -408,7 +442,24 @@ RUN chmod -R a-s,a-w /app/node_modules
 
 # WI#424 control 6: run the smoke against a real started entrypoint, not the
 # empty process table and throwaway HOME of a Dockerfile RUN.
-RUN bash /app/scripts/runtime_smoke_entrypoint.sh
+#
+# WI#511: --network=none gives this step its OWN network namespace, so its
+# listener check judges only what the worker starts. mt-admin builds every
+# worker with `podman build --network=host` (the host netns is the only one
+# that can reach the network on those hosts), and a build step sharing it
+# reads the HOST's socket table — sshd, NetBird and every other host listener
+# then masquerade as worker exposure and fail the guard. The check logic was
+# always right; it was aimed at the wrong namespace.
+#
+# The step needs nothing but loopback, which both builders bring UP in the
+# private netns (verified under podman 5.8.2 rootless/rootful --network=host
+# and BuildKit v0.34.1-rootless). Attribution by uid is NOT used: Podman RUN
+# steps have a private PID namespace, hiding host socket owners; CI BuildKit
+# shares buildkitd's PID namespace with --oci-worker-no-process-sandbox, not
+# the host's. Any uid-based narrowing would also let a listener opened as
+# another in-container uid escape the gate.
+# This gate stays as strict as WI#424 wrote it; only its scope is corrected.
+RUN --network=none bash /app/scripts/runtime_smoke_entrypoint.sh
 
 # The split identities are part of the final image configuration. Declare them
 # before the filesystem assertion so the policy check validates the metadata

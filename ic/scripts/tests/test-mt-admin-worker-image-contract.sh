@@ -607,6 +607,7 @@ fake_worker_runtime() {
   shift
   CALLS+=("$runtime:$*")
   case "${1:-}" in
+    version) printf '6.1.4\n' ;;
     build)
       for argument in "$@"; do
         if [[ "$previous" == --iidfile ]]; then

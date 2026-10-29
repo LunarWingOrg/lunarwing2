@@ -1,9 +1,15 @@
 # Item 101 (v2.1.7.0) — persistent test tenant `highwinds`
 
-Status: RG-1 implemented, fat image built and task-uid smoke verified. Live
-complex-job acceptance is blocked by the managed egress keeper's Podman 6.1.4
-compatibility refusal. Item 101 is not complete; the daemon and Pebble remain
-running, but Kimi is stopped after its guarded recreation failed.
+Status: **PARTIAL — build-gate fixes and fresh Pebble acceptance verified.**
+Run 271 supersedes the earlier completion claim. The corrected Pebble image
+was built from `9bb1d942a`, deployed through mt-admin, and completed a fresh
+gateway-dispatched verification task in the hub. Its rebuilt artifact passed
+an independent oracle (evidence below). This does not fix the long-task
+buffering defect (WI#519), retroactively complete the old lost-result job, or
+execute the four remaining prepared algorithm tasks. Only 2 of the original
+6 prepared tasks ran; the new task is a bounded rebuild/reverification pass.
+Item 101 remains unchecked for that broader unfinished scope. No teardown is
+permitted; retain `highwinds` and its allocated ports.
 
 ## Scope and provenance
 
@@ -228,3 +234,314 @@ arbitrary rootfs containers, then `start-worker highwinds kimi`, verify
 the retained gateway thread before duplicating its request. Item 101 stays
 unchecked until these actual requirements pass. No protected pipeline or
 full-image reproducibility acceptance is claimed by this branch.
+
+## Original evening pass (2026-10-29): historical runtime results
+
+The keeper refusal and old harness's approval-discovery problem were resolved.
+The runtime observations below predate the Pebble Dockerfile changes and do not
+certify the changed images or completion of item 101.
+
+### Blocker 1 (egress keeper) was fixed by item-100, not by this branch
+
+The keeper's exclusion of Podman 6.1.4's built-in image-less infra container
+was closed on the target branch by item-100 commits `c7438ad75` (identify native
+pause keeper metadata) and `fb502652d` (accept constrained image-less keepers),
+which add `keeper_uses_native_pause()` to
+`ic/scripts/lunarwing-worker-egress-guard.sh`: when `ImageName` is empty the
+guard now accepts the infra container only if its exact shape is
+`|/catatonit|["-P"]|[]|/run/user/<uid>/libpod/tmp/infra-container`, still
+root-owned, still exclusively attached to the tenant's egress network. This
+admits the stock implementation without admitting arbitrary image-less/rootfs
+containers — exactly the repair the previous pass asked for. It landed after
+that pass ran, so its "blocked" record stands as accurate history.
+
+Verified live this pass: standard `start-worker highwinds kimi` now refreshes
+the image into the tenant's rootless store, enforces the egress filter, and
+reports `kimi worker ready via quadlet (... WSS port 30000)`. No guard bypass,
+no temporary keeper, no manual `podman unshare` netns pin was used.
+
+### Blocker 2 (retained gateway thread) was an approval-window expiry, not a gateway defect
+
+Thread `31711f66-921e-4f7c-b9cf-c41dccb5f758` was diagnosed from the tenant's
+Postgres `conversation_messages`, not inferred. Its assistant message exists
+and says the platform reported: *"The approval request for this action expired
+after 30 minute(s) without a user response. The action was NOT executed."*
+Timestamps confirm it: user message 05:59:09Z, assistant reply 06:29:44Z —
+exactly the 30-minute gate window. The previous pass's poller was interrupted
+(KeyboardInterrupt) at ~06:03, so it never saw the expiry.
+
+**Why the approval was never seen:** `GET /api/chat/history` only populates
+`pending_approval` from the in-memory legacy session
+(`ic/src/channels/web/handlers/chat.rs:259-314`). With `ENGINE_V2=true` —
+this tenant's configuration — `prefer_durable_history` is true, so the handler
+serves history from the durable store, which carries only completed
+user/assistant/tool_calls messages and no gate state. `pending_approval`
+therefore stays `null` for the whole life of an Engine V2 approval gate, and a
+client polling history can never learn the `request_id` needed to approve.
+
+This is **not** a daemon bug: the supported discovery surface is
+`GET /api/chat/pending-gates`
+(`ic/src/channels/web/server.rs:1460`, backed by
+`bridge::list_engine_pending_gates`), which lists live Engine V2 gates
+per-user, and the browser UI already uses it (`static/app.js:2268`) alongside
+the `approval_needed` SSE event. The previous pass's harness
+(`/tmp/lw-item101/exercise.py`) polled only `history`, so it missed a gate that
+was genuinely pending and approvable. A corrected harness
+(`/tmp/lw-item101/exercise2.py`) discovers gates via `pending-gates`, refuses
+any gate whose tool is not `create_job` or whose parameters do not name the
+expected title, and approves inside the window. **Follow-up:** the history
+envelope's silently-null `pending_approval` under Engine V2 is a footgun for
+any external automation; it should either be populated from the durable gate
+store or documented as legacy-only.
+
+### Worker acceptance results
+
+Both lanes were driven through the real gateway with one `create_job` each,
+approved inside the window, no subagents, no duplicate dispatch.
+
+| Lane | Job | Hub state | Elapsed | Hub events |
+| --- | --- | --- | --- | --- |
+| Kimi (fat image, uid 10002) | `hw101-kimi-rust-fenwick` / `98304950-7c5e-45e9-b6ee-e4a000ebe900` | **completed** | 342 s | 34 |
+| Pebble | `hw101-pebble-cpp-assignment` / `9e3a7172-aa71-40c5-8c80-5df1fc38900b` | in_progress → **Stuck** | 1807 s | **0** |
+
+**Kimi — success, independently verified.** The worker reported real toolchain
+versions from inside the container (`rustc 1.96.1`, `cargo 1.96.1`,
+`go1.24.3 linux/amd64`, `g++ 12.2.0`, `cc 12.2.0`), built a dependency-free
+Rust 2024 crate at `/workspace/hw101_kimi_rust` (two-Fenwick-tree inclusive
+range add/sum, signed i128), ran 8 library tests (`test result: ok. 8 passed;
+0 failed`) and a release build, and executed the real CLI. Artifacts are owned
+by `kimi:kimi` — confirming both the RG-1 mode normalization and the WI#454
+privilege drop landed in the built image. **Independent verification (not the
+worker's own claim):** 60 seeded randomized trials driven against the release
+binary and compared to a Python naive-array oracle produced **0 mismatches**,
+including negative deltas, 1e9-magnitude values, overlapping updates and
+singleton ranges.
+
+**Pebble — correct work, lost result (finding PE-1 below).** The worker ran
+16m16s, wrote `/workspace/hw101_pebble_cpp` (`src/main.cpp`, `tests/tests.cpp`,
+`tests_runner`, `tests_runner_asan`, `Makefile`, `README.md`, `assignment`),
+all owned by `pebbletask` (uid 10004). **Independent verification:** 40
+brute-force permutation trials over random rectangular matrices (N≤5, M≤6)
+gave **0 cost mismatches**, and 30 trials validated the full dual certificate
+(U[i]+V[j] ≤ cost[i][j] on every cell, equality on matched cells,
+sum(U)+sum(V) = COST, unmatched column potentials 0, COST equal to the matched
+total) with **0 failures**. So the algorithm the worker produced is correct.
+
+But the hub recorded **zero** events for the job and never transitioned it out
+of `in_progress`; at 20:26:42Z self-repair flagged it
+(`Job ... exceeded the idle threshold for external worker 'pebble'; the daemon
+cannot retry external tasks`). The container log shows the task did finish:
+`stdout stream ended` / `stderr stream ended` / `result built, forwarding` at
+20:12:19Z, then `[bridge] ... disconnected` **64 µs later**.
+
+### PE-1 (Medium, WI#519): pebble buffers all task events until the task ends, so the hub sees a silent socket
+
+`pebble4lunarwing/src/bridge.rs:499-528` awaits the whole task before draining:
+
+```rust
+let execution = execute_dispatch_task(...).await;   // runs the entire task
+forward_execution_error(&event_tx, &task_id, execution);
+drop(event_tx);
+...
+while let Some(event) = event_rx.recv().await {     // only now forwarded
+```
+
+Every `Progress` and the final `Result` the executor sends
+(`executor.rs:322,337,342,727,...`, all via `let _ = event_tx.send(...)`)
+accumulate in the unbounded channel and are flushed to the outbound socket only
+after the subprocess has exited. Two consequences, both observed here:
+
+1. **No progress reaches the hub during a long task.** The connection stays
+   silent for the full 16 minutes, so the hub's external-worker idle detector
+   (`ic/src/agent/self_repair.rs:300-343`, `external_stuck_threshold`) has no
+   activity to see and marks the job Stuck even though the worker is busy. Any
+   pebble task longer than that threshold will be misreported as stuck.
+2. **The final result can be lost.** `let _ =` discards every send error, so a
+   closed receiver drops the result with no diagnostic. Here the socket closed
+   in the same 64 µs window as the flush, the hub recorded 0 of the buffered
+   envelopes, and the job never completed.
+
+The Kimi lane does not have this shape — it streams `task_result` and progress
+envelopes through the socket as they occur, which is why the same exercise
+produced 34 hub events and a `completed` job. **Recommended fix:** drain
+`event_rx` concurrently with the task (forward each event as it arrives instead
+of after `.await`), and stop discarding the send error so a dropped result is
+logged rather than silently lost. This is a worker-protocol defect, out of
+RG-1's scope, and is reported here rather than fixed silently in an acceptance
+pass.
+
+### RG-1 implementation for the remaining three lanes (review corrected)
+
+RG-1's ask 3 explicitly named the Pebble, OpenCode 2 and OpenCode v1 images as
+sharing the context-dependent mode defect; the previous pass fixed only Kimi and
+recorded "This change fixes **Kimi**, not all workers". The initial follow-up
+added normalization and dropped-uid gates but was not image-built. Run 271 found
+two defects; the corrected implementation is:
+
+- `opencode4lunarwing/Dockerfile` (`c437692e9`) — had **no** normalization at
+  all: `COPY scripts/ config/` plus `chmod +x` only, so a restrictive context
+  left `/app/config` and `/app/scripts` unreadable by uid 10001 while its
+  `/app stays root-owned and read-only` comment was untrue. Now `a+rX` +
+  `a+r`, then `a-w`, then a uid-10001 `find -L ... -type f -exec cat` traversal.
+- `opencode2.4lunarwing/Dockerfile` (`47af22fae`) — stripped write bits with
+  `chmod -R a-w` but never added read/execute bits. Now `a+rX`/`a+r` before the
+  `a-w` pass, a `command -v setpriv` fail-closed guard, and the uid-10003
+  traversal gate. RV-3 adds `a+rx` for both entrypoints and the health script in the unpinned pre-pass;
+  otherwise a restrictive checkout still left them unreadable at 0511. The
+  existing pinned WI#357 read-only RUN remains unchanged and requires
+  root ownership and no write bits, and this change only adds read bits.
+- `pebble4lunarwing/Dockerfile` (`59e8f5097`, `c738cedab`) — `entrypoint.sh` and
+  `entrypoint-split.sh` were COPY'd to `/usr/local/bin` with **no** chmod, so a
+  restrictive context left them 0700 root:root while the image's `USER` is
+  10004; the existing `test -x` readiness check runs as root and passed
+  vacuously (precisely the class RG-1 named). Now pinned 0555, plus
+  `/etc/profile.d/lunarwing-toolchain.sh` and the rustup wrapper pinned 0644 —
+  the profile snippet is *sourced* by the task's `/bin/sh -lc` shells, so
+  0600 root:root would make dash silently skip it and drop the toolchain env
+  the WI#320 gauntlet (F6) depends on. Added a uid-10004 gate that reads every
+  baked task-side input and requires all four launchers to be executable as the
+  task uid. RV-1 corrects the ownership/write check to reject group/other write
+  (`/022`), not root owner-write (`/222`): the wrapper and bridge remain 0755
+  and the profile remains 0644, all root-owned and unwritable by task uid 10004.
+
+Kimi's own block (`kimicode4lunarwing/Dockerfile:258-294`) is unchanged. Its
+all-write-bit check is valid only after its explicit immutable-input write
+removal; copying that check alone to Pebble was not equivalent normalization.
+
+### Security posture after this pass
+
+`worker-egress highwinds` reports the filter live with the exact tenant
+forward/input rejects, and **all three** containers (`lunarwing-pebble-highwinds`,
+`lunarwing-kimi-highwinds`, `lunarwing-kimi-task-highwinds`) attached
+exclusively to `lw-egress-highwinds` with DNS pinned and static hosts current.
+`worker-listeners highwinds` reports **clean**: both bridges publish on host
+loopback only, and the kimi task container has no non-loopback listeners. The
+new uid gates can only make a build fail; they grant nothing. No egress rule,
+allowlist entry, capability, or WI#357 exposure control was relaxed, and no
+worker gained an inbound path (WI#357).
+
+### Verification
+
+- `start-worker highwinds kimi`: image refreshed into the tenant rootless
+  store, egress filter enforced, `kimi worker ready via quadlet`.
+- `mt-admin status highwinds`: Pebble running (WSS 10008), **Kimi running**
+  (WSS 30000), daemon/PostgreSQL/vision/WeeChat/XMPP-bridge all active. Both
+  workers running is the hand-off the previous pass could not reach.
+- `worker-egress highwinds` and `worker-listeners highwinds`: both clean, as
+  above.
+- Independent artifact verification: Kimi 60/60 vs a Python oracle; Pebble 40/40
+  brute-force cost plus 30/30 full dual-certificate checks.
+- `.gitlab/tests/test_pebble_build_inputs.py`: **41 tests OK** (4 root-required
+  skips). `.gitlab/tests/test_kimi_image_modes.py`: **4 tests OK** (2
+  root-required skips). `opencode2.4lunarwing/scripts/exposure_policy_assert_test.py`:
+  **68 tests OK**. `test_worker_exposure_policy.py`: **38 tests OK** (431s, run
+  in tmux). `.gitlab/scripts/check-worker-exposure-policy.sh`: green end to end,
+  which covers both the opencode2 and opencode-v1 profiles.
+- No Rust source or dependency changed in this Dockerfile follow-up, so no host
+  Cargo lane applies. These original checks did not execute the three changed
+  image RUN blocks, and no changed image was built by the original pass. The
+  pre-existing Pebble task above cannot be attributed to those later commits.
+
+Tenant `highwinds` and all its ports remain allocated and running. Both workers
+are up. No teardown, no animal-name rename, no credential was read or recorded.
+
+## Run-271 follow-up (RV-1 through RV-5)
+
+- RV-1/RV-3: corrected the Pebble write-bit predicate and OpenCode 2 entrypoint
+  pre-pass without changing the pinned read-only instruction or any egress,
+  exposure, capability or task-identity control.
+- `.gitlab/tests/test_worker_image_modes.py` executes the actual Dockerfile
+  normalization and gate blocks for 022/077 fixtures. Nine tests pass under
+  root, including real uid-10003/10004 reads, executable checks, forbidden
+  group/other writes, non-root ownership and unreadable nested-input rejection.
+  An unprivileged run explicitly skips the seven root-required cases; it does
+  not claim those probes ran. These tests do not replace a full image build.
+- RV-4: withdrew the premature completion claim and reopened the goal checkbox.
+  The fresh image/task evidence below now satisfies the narrow rebuild check;
+  the four remaining prepared tasks and broader gauntlet acceptance stay open.
+- RV-5: filed [WI#519](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/519)
+  for Pebble event buffering/result loss and
+  [WI#520](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/520) for the
+  Engine V2 history approval-discovery footgun (related to WI#436 finding 4).
+  Pending-gates/SSE remain the supported discovery paths. The socket-close
+  timestamp correlation does not establish the disconnect's exact cause.
+- RV-2: fresh image-build/deployment acceptance is recorded below. No protected
+  candidate or whole-image reproducibility success is claimed by block tests.
+- Follow-up validation: all nine new block tests and all four Kimi mode tests
+  pass under root (no dropped-uid skips). Three in-memory mutants fail their
+  intended assertions: restore Pebble `/222`, remove the entrypoint pre-pass,
+  or run the OpenCode 2 read probe as root. `test_pebble_build_inputs.py` passes
+  41 tests with four existing skips; `test_goal1_ci.py` passes 274/274;
+  `exposure_policy_assert_test.py` passes 68/68. CI config, the worker exposure
+  guard, and the Go parser suite/real OpenCode 2 Dockerfile check pass. These
+  results are separate from the full-image/runtime acceptance below.
+
+### RV-2 — new image built, deployed, and hub-completed task verified
+
+The standard `build-pebble-worker --with-toolchains` command completed with
+exit 0 from clean worker source at **`9bb1d942ab54d009d9dbaf1405ae8e4dbb4b3e3a`**.
+The new image is **`516d9fc32009ec50ca27bb50a191df0668a93eed0cdf9cac276e409da74044be`**,
+size **2,336,071,157 bytes**, toolchain profile `true`, default user
+`10004:10004`, with that exact revision label. The build ran 105 bridge tests
+successfully, passed the corrected dropped-uid read/execute gate, and passed
+both task-shell toolchain smoke legs (`/bin/sh -lc` and sanitized `env -i`).
+Reported tools included Rust/Cargo 1.96.1, Go 1.24.3 and rustup 1.28.2.
+
+This used the operator checkout, not the tenant clone (the standalone command's
+documented source root). Source modes were not rewritten to 077 for this full
+build; a 077 build-process umask does not change existing COPY input modes.
+Restrictive-context evidence remains the executed 022/077 Dockerfile-block
+tests. This is one successful image build, not a protected candidate/uncached
+rebuild digest comparison. OpenCode v1/2 full-image builds are **not** claimed.
+
+Standard `restart-worker highwinds pebble` refreshed the image into the tenant's
+rootless store, enforced the existing egress filter, and force-recreated both
+worker containers. Both running containers reference the new image ID:
+bridge `10104:10004`, task `10004:10004`. Kimi was not restarted. Final mt-admin
+status shows both workers running; `worker-egress` verifies all four split-role
+containers attached exclusively with pinned DNS/static hosts and the exact
+forward/input rejects; `worker-listeners` is clean. No allowlist, capability,
+approval rule or exposure control was relaxed.
+
+A single new gateway request created **`hw101-rv2-image-recheck-9bb1d942a`**:
+
+- Thread `9b9b7e79-1f7f-4c00-99e4-f1ede1096878`, message
+  `302692d4-66eb-4857-a700-1ebbae7cfb30`.
+- Job **`b00d8e8d-85dd-445c-825a-6af5960c76d3`**, started
+  `2026-10-29T21:41:37.455116Z`, hub **completed**
+  `2026-10-29T21:42:49.957706Z`, **72 seconds**, **17 hub events**, `stuck=false`.
+- Approval was discovered through `pending-gates` and issued once only after
+  matching this thread, `create_job`, the exact title, mode `pebble`, the new
+  workspace path, and absence of credential/context grants. No subagents or
+  duplicate job was used. The gateway bearer was consumed privately as the
+  tenant for API authentication, never printed, copied to the worker prompt,
+  or written to an artifact.
+- The task compiled the existing Hungarian C++17 sources into new
+  `/workspace/hw101_rv2_recheck_9bb1d942a` outputs without changing the old
+  project. `tests.log` reports 500 randomized exhaustive cases and
+  `ALL TESTS PASSED`; the saved sample returns `COST 3`. The compiler reports
+  Debian G++ 12.2.0. In-container artifact ownership is `10004:10004`.
+  `versions.txt` reports uid 0 for the task command, which conflicts with the
+  configured container user (`id` under `podman exec` reports
+  `uid=10004(pebbletask)`) and with the `10004`-owned files that same command
+  wrote. That worker-authored line is therefore treated as unreliable model
+  narration, not as evidence of either a privilege drop or a privilege gap;
+  nothing in this report is based on it. The inspected container user,
+  artifact ownership and the real dropped-uid build gates are the identity
+  evidence here.
+
+Independent verification reran the freshly built `assignment` binary on **50
+seeded rectangular matrices**, including negative costs, against a host-generated
+brute-force permutation oracle, checking both minimum costs and full dual
+certificates: **50/50 PASS**, zero mismatches. Execution used a separate
+network-disabled, read-only, credential-free container from the exact image,
+uid `10004:10004`, all capabilities dropped, and no-new-privileges. The first
+oracle attempt could not execute the private artifact under Podman's default
+UID mapping; repeating with the managed worker's
+`keep-id:uid=10004,gid=10004` mapping passed without changing file permissions.
+
+The original long-running job remains historical failed acceptance (its hub
+row still reports `in_progress`); the short new completion does not close
+WI#519 or claim long-task streaming works. `highwinds`, both workers, and all
+workspace artifacts remain in place. Logs are in
+`/tmp/opencode/mr2059-{validate2,pebble-build,pebble-restart,pebble-task,audit,oracle2}.log`.
