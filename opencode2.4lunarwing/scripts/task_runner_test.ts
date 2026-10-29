@@ -54,7 +54,7 @@ async function startRunner(sdk: OpenCodeClient): Promise<{ runner: TaskRunner; p
 }
 
 function request(overrides: Partial<TaskRequest> = {}): TaskRequest {
-  return { task_id: "task-1", prompt: "start", ...overrides }
+  return { task_id: "task-1", prompt: "start", context: { project_dir: scratch() }, ...overrides }
 }
 
 test("runner health probes require a bounded live pong and propagate CLI failure", async () => {
