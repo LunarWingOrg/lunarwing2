@@ -290,11 +290,13 @@ Key characteristics:
 - **Compact output metadata**: between code steps, only a summary is added to chat context (`[FULL OUTPUT: N chars]`, `[TRUNCATED: last 8000 of N chars shown]`, a short return-value preview, or `[code executed, no output]`) to prevent context bloat
 - **Explicit termination**: `FINAL(answer)` or `FINAL_VAR(name)` for output
 - **Missing-import repair (WI#364)**: before each model-generated block reaches
-  Monty, `auto_inject_imports` adds missing bare imports for dotted references to
-  `asyncio`, `json`, `re`, `math`, `datetime`, and `sys`. Imports do not persist
-  across fresh Monty runs. The bounded source scan recognizes imports that bind
-  the bare module name; an alias or `from module import name` does not bind it.
-  This is convenience preprocessing, not a Python parser or new host authority;
+  Monty, `inject_missing_imports` adds missing bare imports for dotted references
+  to `asyncio`, `json`, `re`, `math`, `datetime`, and `sys`. Imports do not persist
+  across fresh Monty runs. A differently named alias or `from module import name`
+  does not bind the module's bare name. A bare function call such as `json(...)`
+  suppresses injection for that name so the built-in tool is not shadowed.
+  Error line numbers are shifted back to the original block. The line/boundary
+  scan is not a Python parser and can add an extra import for literal text;
   arbitrary modules and OS access remain unavailable.
 - **Resource limits**: user CodeAct blocks default to a 30s timeout, 64MB memory,
   and 1M allocations. The orchestrator VM has a separate 600s/128MB/5M budget.
