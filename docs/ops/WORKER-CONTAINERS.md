@@ -220,9 +220,11 @@ Each launcher compares the mounted workspace before task setup or bridge
 credential staging, including ordinary runtime auto-restarts. A different
 inode, even with the same owner, refuses startup. The `workspace-inode-v1`
 launch-contract suffix recreates rootful containers lacking this pin. If an
-operator deliberately replaces a workspace directory, stop the pair and
-reconcile through mt-admin to record the new identity; a plain container
-restart keeps the old pin and must fail. The guard does not restore
+operator deliberately replaces a workspace directory, stop the pair via
+mt-admin, remove the stopped pair from that tenant's runtime store, then
+start it through mt-admin to record the new identity. Preserve the IPC-v2
+volume and workspace contents; a plain restart keeps the old pin and must
+fail. The guard does not restore
 per-tenant host uids after a container escape: rootful lanes still share
 fixed numeric task ids. Prefer rootless keep-id for that additional boundary.
 
