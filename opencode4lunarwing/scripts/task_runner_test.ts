@@ -144,6 +144,32 @@ test("delegated cancellation settles with a terminal cancelled result", async ()
   }
 })
 
+test("cron workspaces are validated by the bridge and created by the runner", async () => {
+  const { existsSync } = await import("node:fs")
+  const { resolveTaskWorkspace } = await import("./workspace_path")
+  const root = scratch()
+  const previousRoot = process.env.WORKSPACE_ROOT
+  process.env.WORKSPACE_ROOT = root
+  const { runner, path } = await startRunner(makeSdk().sdk)
+  const context = { project_dir: "scheduled/repository", cron_tick: { event: "cron.tick" } }
+  try {
+    assert.equal(resolveTaskWorkspace(context, root, undefined, false), join(root, context.project_dir))
+    assert.equal(existsSync(join(root, "scheduled")), false)
+    const result = await delegateTaskToRunner(path, request({ context }), undefined, () => {})
+    assert.equal(result.status, "success", result.error ?? "")
+    assert.equal(statSync(join(root, context.project_dir)).uid, process.getuid?.())
+    const invalid = await delegateTaskToRunner(path, request({
+      task_id: "invalid-cron", context: { ...context, project_dir: "../escape" },
+    }), undefined, () => {})
+    assert.equal(invalid.status, "error")
+    assert.match(invalid.error ?? "", /Invalid workspace path for cron tick/)
+  } finally {
+    runner.close()
+    if (previousRoot === undefined) delete process.env.WORKSPACE_ROOT
+    else process.env.WORKSPACE_ROOT = previousRoot
+  }
+})
+
 test("shared runner sockets allow bridge-group access", async () => {
   process.env.LUNARWING_TASK_RUNNER_REMOTE = "1"
   const { runner, path } = await startRunner(makeSdk().sdk)
