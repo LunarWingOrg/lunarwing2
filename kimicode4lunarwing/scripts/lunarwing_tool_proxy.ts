@@ -67,6 +67,10 @@ export function refuseSymlinkedProxyDir(dir: string): void {
   }
   if (st.isSymbolicLink()) throw new Error(`proxy dir ${dir} is a symlink (refused, WI#400 LP-5)`)
   if (!st.isDirectory()) throw new Error(`proxy dir ${dir} is not a directory (refused, WI#400 LP-5)`)
+  if (process.env.LUNARWING_TASK_RUNNER_REMOTE === "1" &&
+      (st.uid !== process.getuid?.() || (st.mode & 0o022) !== 0)) {
+    throw new Error("shared proxy directory must be bridge-owned and not group/other-writable")
+  }
 }
 
 /** Filesystem-safe per-task socket path. Task ids come from the hub but are
