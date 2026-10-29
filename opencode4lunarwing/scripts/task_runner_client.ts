@@ -151,6 +151,10 @@ export function delegateTaskToRunner(
   abortSignal?: AbortSignal,
 ): Promise<TaskResult> {
   return new Promise<TaskResult>((resolve, reject) => {
+    if (extraEnv && Object.keys(extraEnv).length) {
+      reject(new Error("OpenCode runner does not accept extra environment grants"))
+      return
+    }
     if (abortSignal?.aborted) {
       reject(new Error("task cancelled before the runner connection opened"))
       return
@@ -299,9 +303,12 @@ export function delegateTaskToRunner(
     })
     sock.once("connect", () => {
       connected = true
-      sock.write(
-        JSON.stringify({ op: "run", request, extra_env: extraEnv ?? {} }) + "\n",
-      )
+      const line = JSON.stringify({ op: "run", request })
+      if (Buffer.byteLength(line) > lineCap) {
+        finishWithError(new Error(`task runner request exceeds ${lineCap} bytes`))
+        return
+      }
+      sock.write(line + "\n")
       runnerConnections.set(request.task_id, sock)
     })
   })
@@ -356,7 +363,8 @@ function consumeLine(
   if (runnerLine.op === "progress") {
     if (isRecord(runnerLine.progress)
       && typeof (runnerLine.progress as Record<string, unknown>).task_id === "string"
-      && typeof (runnerLine.progress as Record<string, unknown>).delta === "string") {
+      && typeof (runnerLine.progress as Record<string, unknown>).delta === "string"
+      && typeof (runnerLine.progress as Record<string, unknown>).done === "boolean") {
       // NB-15: progress frames for a foreign task_id are dropped, exactly
       // like results — the runner reports only the run it was handed.
       if ((runnerLine.progress as Record<string, unknown>).task_id !== expectedTaskId) {
@@ -402,10 +410,8 @@ function consumeLine(
     handlers.onResult(result as unknown as TaskResult)
     return "terminal"
   }
+  if (runnerLine.op === "prompt_refused") return "ignored"
   if (runnerLine.ok === false) {
-    // While a cancel is draining, the runner may answer the cancel itself
-    // with "no run in flight" (the run ended first); its result line, or
-    // the close, settles the run.
     if (stopping) return "ignored"
     handlers.onError(new Error(`task runner refused the run: ${String(runnerLine.error ?? "unknown error")}`))
     return "terminal"
@@ -421,10 +427,9 @@ function runnerHandshakeTimeoutMs(): number {
   return Math.min(600_000, Math.max(1_000, raw))
 }
 
-/** The executor's kill grace (KIMI_KILL_GRACE_MS, same bounds and default). */
 function killGraceMs(): number {
-  const raw = Number.parseInt(process.env.KIMI_KILL_GRACE_MS ?? "", 10)
-  if (!Number.isFinite(raw)) return 7_000
+  const raw = Number.parseInt(process.env.OPENCODE_SESSION_ABORT_TIMEOUT_MS ?? "", 10)
+  if (!Number.isFinite(raw)) return 5_000
   return Math.min(30_000, Math.max(100, raw))
 }
 
