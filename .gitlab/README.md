@@ -841,6 +841,16 @@ with no assignments outside the blocks (IL-3); `export`, `declare`,
 `readonly` and `+=` assignment lines also count, so a later assignment
 cannot replace the checked list before hashing.
 
+Both OpenCode lanes also require every literal local `COPY scripts/<file>`
+source in the first (builder) stage to appear in that lane's manifest. This
+includes the photon-node whitespace fixer, the models.dev guard and v2's
+build/tunnel patchers; shell/JSON COPY forms, options and continuations are
+covered. Missing entries fail `ci-config` before a protected build. This
+narrow check does not claim completeness for directory/glob COPYs or replace
+the BuildKit-parser Dockerfile policy gate; cross-stage copies are not local
+checkout inputs. See `docs/ops/WORKER-CONTAINERS.md` checklist item 7 when retiring the
+photon fixer after an upstream bump.
+
 The former `rust-compile-16gb` lock serialized heavy Rust work across pipelines:
 for example, pipeline #3812 waited while #3811 ran its backend tests. That lock
 is now removed; ready jobs can run concurrently on eligible runners within their

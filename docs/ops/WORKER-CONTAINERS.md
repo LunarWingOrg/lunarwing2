@@ -25,6 +25,17 @@ The image's source revision `38afee6c` pins
 [Brotli v1.2.1](https://github.com/oven-sh/bun/blob/38afee6c84fcf48c0edb2466aa4b27d287a59c30/scripts/build/deps/brotli.ts),
 replacing Bun 1.4.2's vulnerable v1.1.0. Both OCI indexes include amd64 and arm64.
 
+At the current OpenCode v1.18.25 / v2.1.2 pins, Bun 1.4.4 rejects the upstream
+photon-node patch's hunk-10 context whitespace. Each builder runs
+`python3 /build/fix_photon_patch_context.py /build/opencode` immediately after
+checkout and before `bun install --frozen-lockfile`, backporting upstream
+`61845b0`'s three-space repair. The guard is byte-preserving, requires exactly
+one buggy block, and fails on drift or an already-fixed patch. The protected
+`worker-opencode2-candidate` run is the first v2.1.2 install/build proof: the
+recorded local install reproduction is v1.18.25 only. Neither a matching
+upstream patch blob nor the self-tests prove a reproducible compiled v2 image.
+See bump checklist item 7 below before moving either pin past the upstream fix.
+
 Rebuild worker images and recreate tenant containers to deploy these fixes.
 Protected candidate reproducibility and all four scan jobs must pass before
 promotion; local runtime/package checks do not replace those gates. WI#514
@@ -800,6 +811,17 @@ Enforced controls (opencode2 lane unless noted):
    surface. For opencode2 bumps past v2.0.24 the compile-out guard (8) plus
    these guards cover the *shipped binary*; against a compromised agent
    only control 1 makes the crossing safe (see the gate record above).
+   **Photon-node repair retirement:** when a new OpenCode pin includes
+   upstream `61845b0`, `fix_photon_patch_context.py` deliberately fails with
+   "already carries the fixed whitespace". For each affected lane, remove
+   both `scripts/fix_photon_patch_context{,_test}.py` files, the Dockerfile's
+   fixer COPY/RUN before `bun install`, its self-test invocation, and the two
+   corresponding `input_files` entries in `.gitlab/scripts/build-worker-image.sh`
+   in the same bump commit. Do not bypass the guard or downgrade Bun. Run the
+   manifest/CI checks, then require protected candidate == clean-rebuild digests,
+   both OpenCode scans and `worker-opencode2-exposure-verify` before claiming
+   acceptance; getting past install can still expose WI#510-class binary/layer
+   nondeterminism. Items 28 and 95 stay unchecked until that evidence exists.
 8. **Compile the tunnel out.** `scripts/compile_out_remote_tunnel.py` runs
    in the builder stage: the historical v2.0.24 path verifies there is no
    tunnel surface; at the current v2.1.2 pin it replaces `remote-tunnel.ts`

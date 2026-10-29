@@ -41,6 +41,14 @@ RUN printf '%s' "${OPENCODE_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
     git -C /build/opencode tag --force "${OPENCODE_VERSION}" "${OPENCODE_REF}"
 
 WORKDIR /build/opencode
+# Bun 1.4.4 (unlike <= 1.4.2) rejects the pinned photon-node patch's hunk-10
+# context lines that carry one stray leading space ("hunk #10 does not apply
+# to photon_rs.js"). Upstream commit 61845b0 trims the stray spaces; the
+# patched photon_rs.js is byte-identical under 1.3.14/1.4.2/1.4.4. Apply the
+# same whitespace repair before bun install. The script fails the build if
+# upstream ever lands the fix itself, so the in-tree repair can be dropped.
+COPY scripts/fix_photon_patch_context.py /build/fix_photon_patch_context.py
+RUN python3 /build/fix_photon_patch_context.py /build/opencode
 RUN bun install --frozen-lockfile && bun pm cache rm
 
 # WI#369 compile-time SDK gate: typecheck the bridge's SDK-facing scripts
@@ -385,6 +393,7 @@ RUN set -eu; \
     && python3 scripts/entrypoint_config_test.py \
     && python3 scripts/compile_out_remote_tunnel_test.py \
     && python3 scripts/runtime_smoke_test.py \
+    && python3 scripts/fix_photon_patch_context_test.py \
     && for leaked in /root/.bun /root/.local /root/.cache /root/.config; do \
            [ ! -e "$leaked" ] \
            || { echo "FATAL: build-time self-tests leaked per-build state at $leaked — refusing to bake a non-reproducible layer" >&2; exit 1; }; \

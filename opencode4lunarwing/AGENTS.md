@@ -29,6 +29,15 @@ The Dockerfile fetches anomalyco/opencode at the full SHA in `OPENCODE_REF` and 
 
 Keep `ARG SOURCE_DATE_EPOCH=0` before runtime account creation and preserve the same-layer `/etc/shadow` epoch-day assertion (WI#510): timestamp rewriting cannot fix a wall-clock day embedded in file contents. All four worker snapshots and `CI_DEBIAN_SNAPSHOT` move together; `20261024T011300Z` includes the Bookworm/Trixie Brotli OS-package fixes.
 
+Bun 1.4.4 also requires the photon-node hunk-10 repair at this upstream pin:
+the builder runs `scripts/fix_photon_patch_context.py` after checkout, before
+`bun install --frozen-lockfile`. On the first bump whose patch already includes
+upstream `61845b0`, the fixer deliberately fails as redundant. Remove both
+`fix_photon_patch_context{,_test}.py` files, the Dockerfile fixer COPY/RUN and
+self-test invocation, and this lane's two `input_files` entries in
+`.gitlab/scripts/build-worker-image.sh` together; do not weaken the drift guard
+or downgrade Bun. See checklist item 7 in `docs/ops/WORKER-CONTAINERS.md`.
+
 ## Do Not
 
 - Break the `lunarwing-agent-v1` envelope format
