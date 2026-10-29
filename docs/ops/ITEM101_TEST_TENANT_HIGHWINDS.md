@@ -125,8 +125,12 @@ pinned upstream `PEBBLE_REF` checkout at
 `2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b` completed; the WI#477 patch applied
 and `verify_upstream_lock.py` confirmed the reviewed lock SHA256/package delta.
 The upstream `cargo build --release --locked --bin pebble` finished successfully
-in 52.39s. The final image build and its required toolchain smoke check have not
-yet succeeded, and candidate promotion has not occurred. Redacted local build
+in 52.39s. The in-build full-profile layer installed Rust 1.96.1, Go 1.24.3,
+GCC/G++ and supporting native build packages; its two shell-resolution probes
+successfully found cargo/rustc/go/rustup in both `/bin/sh -lc` and `env -i`
+shells. This is build-stage evidence only. The completed image has not yet
+passed the separate WI#334 image-mode smoke probe, its candidate tag has not
+been promoted, and the final build remains in progress. Redacted local build
 log:
 `/tmp/lw-item101/deploy.log`.
 
