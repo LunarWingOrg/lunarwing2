@@ -3891,16 +3891,27 @@ async fn handle_with_engine_inner(
     .await?;
 
     // Dual-write to v1 database so the gateway history API shows messages.
+    let mut tracked_message = message.clone();
+    if !tracked_message.metadata.is_object() {
+        tracked_message.metadata = serde_json::json!({});
+    }
+    if let Some(metadata) = tracked_message.metadata.as_object_mut() {
+        metadata.remove("engine_history_message_id");
+    }
     if let Some(ref db) = state.db
         && let Some(cid) = resolve_v1_conversation_for_message(db.as_ref(), message).await
     {
-        let _ = db
+        match db
             .add_conversation_message(cid, "user", effective_content)
-            .await;
+            .await
+        {
+            Ok(id) => tracked_message.metadata["engine_history_message_id"] = serde_json::json!(id),
+            Err(error) => tracing::warn!(%error, "failed to persist Engine V2 user history"),
+        }
     }
 
     debug!(thread_id = %thread_id, "engine v2: thread spawned");
-    await_thread_outcome(agent, state, message, conv_id, thread_id, event_rx).await
+    await_thread_outcome(agent, state, &tracked_message, conv_id, thread_id, event_rx).await
 }
 
 struct EngineMessageRequest<'a> {
@@ -4479,21 +4490,55 @@ async fn forward_event_to_channel(
     }
 }
 
-/// Convert a ThreadEvent to AppEvents for the web gateway SSE stream.
-///
-/// Returns multiple events when needed (e.g., ToolStarted + ToolCompleted
-/// so the frontend creates the card then resolves it).
+fn model_recovery_info(
+    event: &lunarwing_engine::ThreadEvent,
+) -> Option<crate::channels::web::types::TurnRecoveryInfo> {
+    use lunarwing_engine::types::event::ModelRecoveryState;
+    let lunarwing_engine::EventKind::ModelRecovery {
+        failure_kind,
+        recovery_state,
+        attempt,
+    } = event.kind
+    else {
+        return None;
+    };
+    let error = match recovery_state {
+        ModelRecoveryState::Retrying => {
+            let reason = if failure_kind == lunarwing_engine::ModelFailureKind::ReplArgumentCorruption {
+                "The model draft was rejected before execution; no tools from that draft ran."
+            } else {
+                "The model request failed."
+            };
+            format!("{reason} Recovery attempt {attempt} is still running. Wait for the job id or terminal result; do not re-dispatch.")
+        }
+        ModelRecoveryState::Recovered => "The model recovered; the turn is still running. Wait for the job id or terminal result; do not re-dispatch.".into(),
+        ModelRecoveryState::Failed => failure_kind.terminal_message().into(),
+    };
+    Some(crate::channels::web::types::TurnRecoveryInfo {
+        failure_kind: failure_kind.as_str().into(),
+        recovery_state: recovery_state.as_str().into(),
+        recovery_attempt: attempt,
+        error,
+    })
+}
+
+/// Convert structural and recovery events to gateway SSE events.
 fn thread_event_to_app_events(
     event: &lunarwing_engine::ThreadEvent,
     thread_id: &str,
 ) -> Vec<AppEvent> {
     use lunarwing_engine::EventKind;
 
-    // Progress events (StepStarted, action started/completed/failed, step
-    // completion, interpreted message status, skill activation, response
-    // deltas) are delivered channel-neutrally via `send_status` — see
-    // `forward_event_to_channel`. Only structural gateway events with no
-    // `StatusUpdate` equivalent are emitted directly on the SSE stream here.
+    if let Some(recovery) = model_recovery_info(event) {
+        return vec![AppEvent::TurnRecovery {
+            thread_id: thread_id.into(),
+            failure_kind: recovery.failure_kind,
+            recovery_state: recovery.recovery_state,
+            recovery_attempt: recovery.recovery_attempt,
+            message: recovery.error,
+        }];
+    }
+    // Progress events are delivered through `forward_event_to_channel`.
     match &event.kind {
         EventKind::StateChanged { from, to, reason } => {
             vec![AppEvent::ThreadStateChanged {
