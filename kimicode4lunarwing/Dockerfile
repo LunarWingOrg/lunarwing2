@@ -280,9 +280,9 @@ RUN set -eu; \
 
 # An empty named volume inherits this group-shared mountpoint. Only the bridge
 # and task containers of one lane mount it; the hub credential never lives here.
-RUN mkdir -p /run/lunarwing-shared \
-    && chown root:kimi /run/lunarwing-shared \
-    && chmod 2770 /run/lunarwing-shared
+RUN install -d -o root -g kimi -m 3770 /run/lunarwing-shared \
+    && install -d -o kimi -g kimi -m 2711 /run/lunarwing-shared/runner \
+    && install -d -o kimi-bridge -g kimi -m 2711 /run/lunarwing-shared/tool-proxy
 
 # WI#206: the baked policy (guard config + PreToolUse hook) must not be
 # editable by either runtime identity.
