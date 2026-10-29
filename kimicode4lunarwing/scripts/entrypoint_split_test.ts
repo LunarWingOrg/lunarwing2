@@ -45,15 +45,16 @@ printf '%s' "\${AGENT_AUTH_TOKEN:+present}" > "$SETUP_REPORT"
 }
 
 function roleEnv(app: string, report: string, setupReport: string, role: string): NodeJS.ProcessEnv {
-  const uid = process.getuid?.() ?? 1000
-  const gid = process.getgid?.() ?? 1000
+  const currentUid = process.getuid?.() ?? 1000
+  const taskUid = role === "split-task" ? currentUid : currentUid + 1
+  const bridgeUid = role === "split-bridge" ? currentUid : currentUid + 2
   return {
     ...process.env,
     LUNARWING_CONTAINER_ROLE: role,
     LUNARWING_APP_DIR: app,
-    KIMI_TASK_UID: String(uid),
-    KIMI_TASK_GID: String(gid),
-    KIMI_BRIDGE_UID: String(uid + 1),
+    KIMI_TASK_UID: String(taskUid),
+    KIMI_TASK_GID: String(taskUid),
+    KIMI_BRIDGE_UID: String(bridgeUid),
     KIMI_TASK_RUNNER_SOCKET: join(app, "shared", "runner.sock"),
     KIMI_TASK_RUNNER_STATE_FILE: join(app, "shared", "state.json"),
     LUNARWING_TOOL_PROXY_DIR: join(app, "shared", "proxy"),
@@ -65,7 +66,17 @@ function roleEnv(app: string, report: string, setupReport: string, role: string)
   }
 }
 
-test("split-task refuses the hub credential before setup", () => {
+test("split roles refuse root when running as root", { skip: process.getuid?.() !== 0 }, () => {
+  const { app, report, setupReport } = makeApp()
+  const env = roleEnv(app, report, setupReport, "split-task")
+  const result = spawnSync(entrypoint, [], { env, encoding: "utf8", timeout: 10_000 })
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /split-task must run as uid 10002, not 0/)
+  assert.equal(existsSync(report), false)
+  assert.equal(existsSync(setupReport), false)
+})
+
+test("split-task refuses the hub credential before setup", { skip: process.getuid?.() === 0 }, () => {
   const { app, report, setupReport } = makeApp()
   const env = roleEnv(app, report, setupReport, "split-task")
   env.AGENT_AUTH_TOKEN = "must-not-reach-task"
@@ -76,7 +87,7 @@ test("split-task refuses the hub credential before setup", () => {
   assert.equal(existsSync(setupReport), false)
 })
 
-test("split-task runs setup and the runner without bridge identity or credential", () => {
+test("split-task runs setup and the runner without bridge identity or credential", { skip: process.getuid?.() === 0 }, () => {
   const { app, report, setupReport } = makeApp()
   const env = roleEnv(app, report, setupReport, "split-task")
   delete env.AGENT_AUTH_TOKEN
@@ -102,11 +113,9 @@ async function listen(path: string): Promise<Server> {
   return server
 }
 
-test("split-bridge moves the token to its private file and exports only the expected task identity", async () => {
+test("split-bridge moves the token to its private file and exports only the expected task identity", { skip: process.getuid?.() === 0 }, async () => {
   const { app, report, setupReport } = makeApp()
   const env = roleEnv(app, report, setupReport, "split-bridge")
-  env.KIMI_BRIDGE_UID = String(process.getuid?.() ?? 1000)
-  env.KIMI_TASK_UID = String((process.getuid?.() ?? 1000) + 1)
   env.AGENT_AUTH_TOKEN = "bridge-test-token"
   mkdirSync(env.HOME as string, { recursive: true })
   const server = await listen(env.KIMI_TASK_RUNNER_SOCKET as string)
