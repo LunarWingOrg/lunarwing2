@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep;
@@ -55,6 +55,30 @@ pub fn startup_refusal(
     None
 }
 
+pub async fn ping(socket_path: &Path) -> RunnerResult<()> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut stream = UnixStream::connect(socket_path).await?;
+        stream.write_all(b"{\"op\":\"ping\"}\n").await?;
+        let mut response = Vec::new();
+        BufReader::new(stream.take(1025))
+            .read_until(b'\n', &mut response)
+            .await?;
+        if response.len() > 1024 || response.last() != Some(&b'\n') {
+            return Err(runner_error(
+                "runner ping response must be a line of at most 1024 bytes",
+            ));
+        }
+        let value: Value = serde_json::from_slice(&response)?;
+        if value["ok"] == true && value["op"] == "pong" {
+            Ok(())
+        } else {
+            Err(runner_error("runner did not answer ping with pong"))
+        }
+    })
+    .await
+    .map_err(|_| runner_error("runner ping timed out"))?
+}
+
 fn truncate_utf8(value: &str, max_bytes: usize) -> String {
     if value.len() <= max_bytes {
         return value.to_string();
@@ -76,7 +100,10 @@ fn serialize_bounded(mut value: Value, payload_key: Option<&str>) -> RunnerResul
         return Err(runner_error(format!("runner frame exceeds {cap} bytes")));
     };
     for field in ["output", "delta", "error"] {
-        let text = value[key]["payload"][field].as_str().unwrap_or_default().to_string();
+        let text = value[key]["payload"][field]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         if text.is_empty() {
             continue;
         }
@@ -458,6 +485,80 @@ pub async fn delegate_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ping_requires_a_pong_on_a_live_socket() {
+        let root = std::env::temp_dir().join(format!("pbr-ping-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("create ping root");
+        let socket = root.join("runner.sock");
+        let listener = UnixListener::bind(&socket).expect("bind ping listener");
+        let responder = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept ping");
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read ping");
+            assert_eq!(line.trim(), r#"{"op":"ping"}"#);
+            stream = reader.into_inner();
+            stream
+                .write_all(b"{\"ok\":true,\"op\":\"pong\"}\n")
+                .await
+                .expect("write pong");
+        });
+        ping(&socket)
+            .await
+            .expect("healthy runner responds to ping");
+        responder.await.expect("responder completes");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn ping_rejects_a_socket_without_pong() {
+        let root = std::env::temp_dir().join(format!("pbr-ping-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("create ping root");
+        let socket = root.join("runner.sock");
+        let listener = UnixListener::bind(&socket).expect("bind ping listener");
+        let responder = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept ping");
+            stream
+                .write_all(b"stale\n")
+                .await
+                .expect("write stale reply");
+        });
+        assert!(ping(&socket).await.is_err());
+        responder.await.expect("responder completes");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn ping_rejects_oversized_unterminated_and_silent_peers() {
+        for (label, reply) in [
+            ("oversized", Some(vec![b' '; 2048])),
+            (
+                "unterminated",
+                Some(b"{\"ok\":true,\"op\":\"pong\"}".to_vec()),
+            ),
+            ("silent", None),
+        ] {
+            let root =
+                std::env::temp_dir().join(format!("pbr-ping-{label}-{}", std::process::id()));
+            std::fs::create_dir_all(&root).expect("create ping root");
+            let socket = root.join("runner.sock");
+            let listener = UnixListener::bind(&socket).expect("bind ping listener");
+            let responder = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept ping");
+                if let Some(reply) = reply {
+                    let _ = stream.write_all(&reply).await;
+                } else {
+                    sleep(Duration::from_secs(10)).await;
+                }
+            });
+            let start = Instant::now();
+            assert!(ping(&socket).await.is_err(), "{label} peer must fail");
+            assert!(start.elapsed() < Duration::from_secs(4));
+            responder.abort();
+            std::fs::remove_dir_all(root).ok();
+        }
+    }
 
     #[test]
     fn truncation_preserves_utf8_and_bounded_serialization() {
