@@ -89,3 +89,95 @@ and no completion. This pass is that work.
    here. Leave the tenant running; no teardown.
 
 No secret inspection, no unrelated project changes, no subagents.
+
+## Daemon start and LLM path
+
+`start-tenant windrider` brought PostgreSQL, the daemon, weechat and the WS
+adapter up. The XMPP bridge failed to start
+(`ic/bridges/xmpp-bridge/target/release/xmpp-bridge is not readable` — the
+binary was never built for this tenant); XMPP is unrelated to worker dispatch,
+and `build-tenant --with-wasm` rebuilds it, so this is recorded rather than
+worked around.
+
+- Gateway `:10010/api/health` → `{"status":"healthy","channel":"gateway"}`.
+- Daemon `lunarwing --version` → **2.1.7**.
+- Bearer token read via `mt-admin tokens windrider` at runtime; never printed
+  or committed.
+- **Agent LLM loop proven:** a plain gateway turn answered exactly `BOOT_OK`
+  in ~8 s with thread state `Completed`, so the tenant's own LLM path works
+  before any worker is involved.
+- Credentials were already present in the tenant env at provisioning time
+  (`LLM_API_KEY`, `KIMI_MODEL`, inherited `KIMI_BASE_URL` with
+  `KIMI_BASE_URL_SOURCE=inherited`, and `pebble.env` carrying
+  `NANOGPT_API_KEY`/`PEBBLE_MODEL`). Verified present and non-empty by key
+  name only, with values redacted.
+
+## Worker image builds (both fat / `--with-toolchains`)
+
+Both built through standard mt-admin in tmux, exit 0, no full debug daemon
+build anywhere.
+
+| lane | image id | size | source revision | toolchain profile |
+| --- | --- | --- | --- | --- |
+| pebble | `5813f4adecc367c19d7cb86773ddf33b083a849618140baa48932c1a2a30e9c2` | 2,354,485,090 B | `05688d65b09a8baed4879da0398fec96d46da7bc` | true |
+| kimi | `6d6cef28d720d7e554465c00843d63858bc0c326ec98fd37839a60e38acf69ac` | 2,737,280,633 B | `f84999b145936b2208e0cc288ccce365c1a74317` | true |
+
+**Provenance caveat, stated plainly (the WI#507 class):** the two images carry
+*different* source revisions. `f84999b14` is this pass's own findings-doc
+commit, made between the two builds, so `SOURCE_REVISION` differs although no
+worker source changed. Both builds used the operator checkout
+(`/home/rarity/lunarwing2_gitlab`), not the tenant clone — unlike item 101,
+where pebble used the operator checkout and kimi the tenant clone.
+
+- Pebble passed the **WI#334 toolchain smoke** in-build, on both legs — the
+  real `/bin/sh -lc` task shell *and* a fully sanitised `env -i /bin/sh -c`:
+  `cargo 1.96.1 (356927216 2026-06-26)`, `rustc 1.96.1 (31fca3adb 2026-06-26)`,
+  `go version go1.24.3 linux/amd64`, `rustup 1.28.2`. Final line
+  `smoke: PASS`.
+- Kimi ran its in-image suite: **186 tests, 183 pass, 0 fail, 3 skipped** (the
+  runtime-image leg; the earlier multi-arch leg reported 179 pass / 7 skipped
+  before the toolchain stage), including the real-CLI contract lane.
+- Rust in the kimi image installs from the SHA-256-pinned rustup archive
+  (`RUSTUP_SHA` checked with `sha256sum -c` before execution) with
+  `--default-toolchain 1.96.1`.
+- Debian packages come from the pinned snapshot
+  `snapshot.debian.org/archive/debian/20261024T011300Z`, not a live mirror.
+- Logs: `/tmp/lw-item100/{pebble,kimi}-build.log`.
+
+## Independent-oracle methodology (how "verified" is defined here)
+
+Item 100 says *extensive tests*, so this pass treats a result as verified only
+when a **host-side** implementation reproduces it. Concretely:
+
+1. Each task prompt requires the worker to **dump machine-readable artifacts**
+   (`ops.txt`, `instances.txt`, `data.csv`, `RESULTS.json`) describing the exact
+   inputs it solved — not just its own conclusions.
+2. `/tmp/lw-item100/oracles.py` re-derives every answer with an independent
+   Python implementation: naive replay for the Fenwick range-add/range-sum,
+   exhaustive s-t cut enumeration for max-flow, brute-force enumeration of all
+   injective maps for the assignment problem, and a stable-sort + inner-join
+   model for the CSV lane. It compares against the worker's reported numbers
+   and the worker's own in-container brute force.
+3. Artifacts are pulled out of the worker container with `podman cp`/`exec` and
+   checked on the host, so the worker cannot grade its own homework.
+4. **Every oracle was self-tested before use** — first on synthetic data to
+   prove it accepts a correct result, then against deliberately mutated inputs
+   (checksum off by one, one instance's flow bumped, one assignment optimum
+   bumped, a swapped sort row, a dropped join row). All six mutants were
+   rejected with a precise message. An oracle that only ever says OK would be
+   worthless; these do not.
+
+The six lanes (2 workers × 3 languages) are the item-101 plan, kept because
+item 101's own report never got to run them:
+
+| Lane | Task | Host-side oracle |
+| --- | --- | --- |
+| Kimi / Rust | Two-tree Fenwick inclusive range add/sum, signed i128 | Naive per-position replay of `ops.txt` |
+| Kimi / Go | Concurrent snapshot-isolation transactional store | `go test -race` plus host-run stress assertions |
+| Kimi / C++17 | Dinic max flow, parallel edges and residuals | Exhaustive small-graph min-cut enumeration |
+| Pebble / Rust | Segment tree + rollback DSU connectivity | Host naive `Vec` scan and root-set comparison |
+| Pebble / Go | External stable CSV sort + merge join | Host stable-sort and inner-join model over the dumped CSVs |
+| Pebble / C++17 | Rectangular Hungarian assignment | Brute force over all injective maps + dual-certificate check |
+
+Per item 101's F12 (task *size* mattered more than the lane there), these are
+six focused jobs rather than one oversized one, dispatched serially per lane.
