@@ -87,7 +87,10 @@ cmp -s "$fixture/expected" "$env_file" || fail 'clean key/model env-file output 
 [[ "$output" == *'stop-tenant alice'* && "$output" == *'start-tenant alice'* ]] \
   || fail 'existing container did not produce restart guidance'
 mapfile -t calls <"$calls_log"
-[[ ${#calls[@]} -eq 1 && "${calls[0]}" == 'alice inspect lunarwing-pebble-alice' ]] \
+# The typed subcommand is the point: a bare `inspect` resolves a container name
+# that is a prefix of the worker IPC volume (`*-ipc-v2`), a false-positive
+# existence match (see _ctr_inspect in mt-admin-lib/02-containers.sh).
+[[ ${#calls[@]} -eq 1 && "${calls[0]}" == 'alice container inspect lunarwing-pebble-alice' ]] \
   || fail 'clean configuration did not follow the existing-container inspection path'
 mapfile -t writes <"$writer_log"
 [[ ${#writes[@]} -eq 1 ]] || fail 'clean configuration did not commit exactly one env file'

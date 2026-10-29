@@ -124,7 +124,7 @@ test_task_unit_stop_states() (
       [[ "$state" != not-found && "$stop_fails" == false ]]
     fi
   }
-  _ctr() { [[ "$2" != inspect ]]; }
+  _ctr() { [[ "$2" == container && "$3" == inspect ]] && return 1; [[ "$2" != inspect ]]; }
   stop_worker_task_container alice kimi || return 1
   state=loaded
   stop_worker_task_container alice kimi || return 1
@@ -562,7 +562,7 @@ assert_before "stop-postgres:alice" "retire-nanocode:alice"
 # systems and Docker keep their runtime-native healthchecks.
 _ctr() {
   CALLS+=("ctr:$*")
-  if [[ "$2" == "inspect" ]]; then
+  if [[ "$2" == "inspect" || ("$2" == "container" && "$3" == "inspect") ]]; then
     printf '%s\n' "$HEALTHCHECK_JSON"
   fi
 }
