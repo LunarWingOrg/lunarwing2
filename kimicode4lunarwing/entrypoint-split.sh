@@ -52,6 +52,7 @@ stop_bridge() {
 
 run_bridge() {
   [[ "$(id -u)" == "$BRIDGE_UID" ]] || die "split-bridge must run as uid $BRIDGE_UID, not $(id -u)"
+  export HOME=/home/kimi-bridge
   local token_dir="${LUNARWING_TOKEN_DIR:-${HOME}/.local/state/lunarwing}"
   if [ -n "${AGENT_AUTH_TOKEN:-}" ]; then
     install -d -m 0700 "$token_dir"
