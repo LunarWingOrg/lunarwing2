@@ -262,7 +262,9 @@ RUN mkdir -p /workspace && chmod 777 /workspace
 ARG SOURCE_DATE_EPOCH=0
 RUN groupadd --gid 10004 pebbletask \
     && useradd --uid 10004 --gid 10004 -m -d /home/pebbletask pebbletask \
-    && test "$(getent shadow pebbletask | cut -d: -f3)" = "$((SOURCE_DATE_EPOCH / 86400))" \
+    && shadow_entry="$(getent shadow pebbletask)" \
+    && shadow_day="$(printf '%s' "$shadow_entry" | cut -d: -f3)" \
+    && test "${shadow_day:-0}" = "$((SOURCE_DATE_EPOCH / 86400))" \
     && mkdir -p /home/pebbletask/go \
     && chown -R pebbletask:pebbletask /home/pebbletask \
     && command -v setpriv >/dev/null
