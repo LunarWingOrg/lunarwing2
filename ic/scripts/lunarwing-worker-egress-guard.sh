@@ -3,7 +3,6 @@
 # Usage: lunarwing-worker-egress-guard [--verify] <ruleset> <rootless|rootful> <forward-chain> [tenant]
 set -euo pipefail
 
-TABLE="lunarwing_worker_egress"
 VERIFY_ONLY=false
 if [[ "${1:-}" == "--verify" ]]; then
   VERIFY_ONLY=true
@@ -137,7 +136,7 @@ subnet="$(awk '
 
 verify_chain() {
   local chain_name="$1" dump
-  dump="$("$NFT" list chain inet "$TABLE" "$chain_name" 2>/dev/null)" \
+  dump="$("$NFT" list chain inet lunarwing_worker_egress "$chain_name" 2>/dev/null)" \
     || die "egress chain $chain_name did not survive (namespace read: $netns; keeper running: $keeper_state)" 2
   awk -v subnet="$subnet" '
     $1 == "iifname" && $3 == "ip" && $4 == "saddr" && $5 == subnet {
