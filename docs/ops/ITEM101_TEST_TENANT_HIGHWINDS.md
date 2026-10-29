@@ -140,6 +140,11 @@ workspace subdirectory. No job will launch subagents or inspect credentials.
 | pebble | Go | External stable CSV sort/merge join with bounded sort chunks | Python CSV Cartesian-product join |
 | pebble | C++17 | Rectangular Hungarian minimum-cost assignment | Exhaustive small assignments plus dual certificates |
 
+The independent host-side verifier is ready on Python 3.11.17, Go 1.27.3,
+Rust/Cargo 1.96.1, and GCC/G++ 16.2.1. These are verifier-host versions, not
+claims about either worker image; worker-side versions will be captured from
+inside the dispatched tasks.
+
 These are planned checks, not claimed results. Job IDs, actual toolchain
 versions, test outputs, independent pass counts, and final service/security
 audits will be recorded after execution.
