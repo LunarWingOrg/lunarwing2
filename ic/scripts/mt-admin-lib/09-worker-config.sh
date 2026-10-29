@@ -211,9 +211,9 @@ start_worker_task_container() {
     -e LUNARWING_CONTAINER_ROLE=split-task \
     -e WORKSPACE_ROOT=/workspace \
     -e LUNARWING_TOOL_PROXY_DIR=/run/lunarwing-shared/tool-proxy \
-    "${TASK_WORKSPACE_ARGS[@]}" \
     "${env_ref[@]}" \
     "${mounts_ref[@]}" \
+    "${TASK_WORKSPACE_ARGS[@]}" \
     -v "$workspace_dir:/workspace:z" \
     -v "$ipc_volume:/run/lunarwing-shared:z" \
     "${restart_ref[@]}" \
@@ -2062,7 +2062,6 @@ start_tenant_opencode() {
       --security-opt no-new-privileges \
       --cap-drop ALL \
       -e LUNARWING_CONTAINER_ROLE=split-bridge \
-      "${TASK_WORKSPACE_ARGS[@]}" \
       -e LUNARWING_TOOL_PROXY_DIR=/run/lunarwing-shared/tool-proxy \
       -e LUNARWING_WORKER_ID="worker-opencode-${name}" \
       -e WS_PORT="$wss_port" \
@@ -2072,6 +2071,7 @@ start_tenant_opencode() {
       -e WS_BIND_HOST=0.0.0.0 \
       -e WS_PATH=/ws/agent \
       "${env_flags[@]}" \
+      "${TASK_WORKSPACE_ARGS[@]}" \
       -p "127.0.0.1:${wss_port}:${wss_port}" \
       "${health_publish[@]}" \
       -v "$workspace_dir:/workspace:z" \
@@ -2280,7 +2280,6 @@ start_tenant_opencode2() {
       --security-opt no-new-privileges \
       --cap-drop ALL \
       -e LUNARWING_CONTAINER_ROLE=split-bridge \
-      "${TASK_WORKSPACE_ARGS[@]}" \
       -e LUNARWING_TOOL_PROXY_DIR=/run/lunarwing-shared/tool-proxy \
       -e LUNARWING_WORKER_ID="worker-opencode2-${name}" \
       -e WS_PORT="$wss_port" \
@@ -2290,6 +2289,7 @@ start_tenant_opencode2() {
       -e WS_BIND_HOST=0.0.0.0 \
       -e WS_PATH=/ws/agent \
       "${env_flags[@]}" \
+      "${TASK_WORKSPACE_ARGS[@]}" \
       -p "127.0.0.1:${wss_port}:${wss_port}" \
       "${health_publish[@]}" \
       -v "$workspace_dir:/workspace:z" \
@@ -2724,7 +2724,6 @@ start_tenant_kimi() {
       --security-opt no-new-privileges \
       --cap-drop ALL \
       -e LUNARWING_CONTAINER_ROLE=split-bridge \
-      "${TASK_WORKSPACE_ARGS[@]}" \
       -e LUNARWING_TOOL_PROXY_DIR=/run/lunarwing-shared/tool-proxy \
       -e LUNARWING_WORKER_ID="worker-kimi-${name}" \
       -e WS_PORT="$wss_port" \
@@ -2734,6 +2733,7 @@ start_tenant_kimi() {
       -e WS_BIND_HOST=0.0.0.0 \
       -e WS_PATH=/ws/agent \
       "${env_flags[@]}" \
+      "${TASK_WORKSPACE_ARGS[@]}" \
       -p "127.0.0.1:${wss_port}:${wss_port}" \
       "${health_publish[@]}" \
       -v "$workspace_dir:/workspace:z" \
@@ -2947,7 +2947,6 @@ start_tenant_pebble() {
       --security-opt no-new-privileges \
       --cap-drop ALL \
       -e LUNARWING_CONTAINER_ROLE=split-bridge \
-      "${TASK_WORKSPACE_ARGS[@]}" \
       -e LUNARWING_TOOL_PROXY_DIR=/run/lunarwing-shared/tool-proxy \
       -e LUNARWING_WORKER_ID="worker-pebble-${name}" \
       -e WS_PORT="$wss_port" \
@@ -2956,6 +2955,7 @@ start_tenant_pebble() {
       -e WS_BIND_HOST=0.0.0.0 \
       -e WS_PATH=/ws/agent \
       "${env_flags[@]}" \
+      "${TASK_WORKSPACE_ARGS[@]}" \
       -p "127.0.0.1:${wss_port}:${wss_port}" \
       "${health_publish[@]}" \
       -v "$workspace_dir:/workspace:z" \
