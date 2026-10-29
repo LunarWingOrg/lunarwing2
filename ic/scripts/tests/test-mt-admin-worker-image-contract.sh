@@ -482,6 +482,8 @@ for pin in \
   'lunarwing-pebble-alice *--user 10104:10004 *-e LUNARWING_CONTAINER_ROLE=split-bridge * lunarwing-worker-pebble:latest' \
   'lunarwing-pebble-task-alice *--user 10004:10004 *-e LUNARWING_CONTAINER_ROLE=split-task * lunarwing-worker-pebble:latest' \
   'lunarwing-pebble-alice *--security-opt no-new-privileges *--cap-drop ALL * lunarwing-worker-pebble:latest' \
+  "lunarwing-pebble-alice *-e LUNARWING_ROOTFUL_WORKSPACE=1 -e LUNARWING_WORKSPACE_ID=$(stat -c '%d:%i' -- "$fixture/workspace") *" \
+  "lunarwing-pebble-task-alice *-e LUNARWING_ROOTFUL_WORKSPACE=1 -e LUNARWING_WORKSPACE_ID=$(stat -c '%d:%i' -- "$fixture/workspace") *" \
   'lunarwing-pebble-task-alice *lunarwing-pebble-alice-ipc-v2:/run/lunarwing-shared:z*'; do
   if has_call_like "ctr:alice run -d --name ${pin}"; then
     pass "rootful pebble: $pin"
@@ -725,6 +727,27 @@ if build_arg_seen lunarwing-worker-kimi:latest "${head}-dirty"; then
 else
   fail 'dirty worker dir stamps SOURCE_REVISION=HEAD-dirty'
 fi
+
+workspace_identity="$(stat -c '%d:%i' -- "$fixture/workspace")"
+mkdir -p "$fixture/other-workspace"
+ln -s "$fixture/other-workspace" "$fixture/redirected-workspace"
+for launcher in kimicode4lunarwing/entrypoint-split.sh opencode4lunarwing/entrypoint-split.sh \
+    opencode2.4lunarwing/entrypoint.sh pebble4lunarwing/entrypoint.sh; do
+  for mount_path in workspace redirected-workspace; do
+    output="$(env LUNARWING_ROOTFUL_WORKSPACE=1 LUNARWING_WORKSPACE_ID="$workspace_identity" \
+      LUNARWING_CONTAINER_ROLE=split-task WORKSPACE_ROOT="$fixture/$mount_path" \
+      KIMI_TASK_UID=59990 KIMI_BRIDGE_UID=59991 OPENCODE_TASK_UID=59990 OPENCODE_BRIDGE_UID=59991 \
+      OPENCODE2_TASK_UID=59990 PEBBLE_TASK_UID=59990 \
+      bash "$HARNESS_REPO_ROOT/$launcher" 2>&1)" && result=0 || result=$?
+    expected='split-task must run as uid'
+    [[ "$mount_path" == workspace ]] || expected='workspace mount changed identity'
+    if [[ "$result" -ne 0 && "$output" == *"$expected"* ]]; then
+      pass "$launcher checks $mount_path before task setup"
+    else
+      fail "$launcher did not enforce $mount_path identity ($result: $output)"
+    fi
+  done
+done
 
 if [[ "$failures" -ne 0 ]]; then
   printf 'RESULT: %d failure(s)\n' "$failures"
