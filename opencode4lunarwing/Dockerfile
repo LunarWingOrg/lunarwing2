@@ -276,8 +276,25 @@ COPY entrypoint.sh entrypoint-split.sh entrypoint-task-setup.sh health_server.py
 COPY scripts/ ./scripts/
 COPY config/ ./config/
 
-RUN chmod +x /app/entrypoint.sh /app/entrypoint-split.sh /app/entrypoint-task-setup.sh /app/health_server.py \
-    && command -v setpriv >/dev/null
+# WI#206/RG-1: task-side inputs must be readable by the task uid (10001) yet
+# stay root-owned and read-only. COPY preserves build-context modes, so a
+# checkout made under a restrictive umask (0700 dirs / 0600 files, the shape
+# mt-admin's private tenant clone has) would leave /app/config and /app/scripts
+# unreadable by 10001 while root-side boot still worked. Normalize the modes
+# here so the image is identical regardless of the builder's umask.
+RUN set -eu; \
+    chmod -R a+rX /app/config /app/scripts; \
+    chmod a+r /app/health_server.py /app/agent_comm_protocol.json; \
+    chmod 0555 /app/entrypoint.sh /app/entrypoint-split.sh /app/entrypoint-task-setup.sh /app/health_server.py; \
+    chmod -R a-w /app/config /app/scripts /app/agent_comm_protocol.json; \
+    command -v setpriv >/dev/null; \
+    test -z "$(find -L /app/config /app/scripts /app/entrypoint.sh /app/entrypoint-split.sh \
+      /app/entrypoint-task-setup.sh /app/health_server.py /app/agent_comm_protocol.json \
+      \( ! -uid 0 -o -perm /222 \) -print)"; \
+    setpriv --reuid=10001 --regid=10001 --clear-groups \
+      find -L /app/config /app/scripts /app/entrypoint.sh /app/entrypoint-split.sh \
+      /app/entrypoint-task-setup.sh /app/health_server.py /app/agent_comm_protocol.json \
+      -type f -exec cat -- {} + >/dev/null
 
 # Fail the BUILD (not container startup) if the bridge's SDK import can't
 # resolve — the SDK build above is best-effort, so verify the exact
