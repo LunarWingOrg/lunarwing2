@@ -298,18 +298,25 @@ COPY entrypoint.sh entrypoint-split.sh health_server.py agent_comm_protocol.json
 COPY scripts/ ./scripts/
 COPY config/ ./config/
 
-# WI#357 (run-79 EI-5) + RG-1: the exposure controls must stay root-owned and
-# read-only, AND the task uid (10003) must still be able to read them. COPY
-# preserves build-context modes, so a restrictive-umask checkout would ship
-# /app/config and /app/scripts unreadable by 10003. Normalize read bits before
-# stripping write bits, then prove the dropped uid can traverse and read every
-# input, so the image no longer depends on the builder's umask.
+# RG-1: COPY preserves the build context's modes, so a checkout made under a
+# restrictive umask (mt-admin's private tenant clone has 0700 dirs / 0600 files)
+# ships /app/config and /app/scripts unreadable by the task uid 10003 even
+# though every root-side check passes. Add the read/traverse bits first so the
+# read-only pass below cannot turn 0600 into an unreadable 0400.
 RUN set -eu; \
-    chmod -R a+rX /app/config /app/scripts; \
-    chmod a+r /app/health_server.py /app/agent_comm_protocol.json; \
-    chmod 0555 /app/entrypoint.sh /app/entrypoint-split.sh /app/health_server.py; \
-    chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/entrypoint-split.sh /app/health_server.py /app/agent_comm_protocol.json; \
     command -v setpriv >/dev/null; \
+    chmod -R a+rX /app/config /app/scripts; \
+    chmod a+r /app/health_server.py /app/agent_comm_protocol.json
+
+# WI#357 (run-79 EI-5): the exposure controls must be root-owned and read-only.
+# Kept as the pinned instruction the BuildKit-parser policy gate matches.
+RUN chmod +x /app/entrypoint.sh /app/entrypoint-split.sh /app/health_server.py \
+    && chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/entrypoint-split.sh /app/health_server.py /app/agent_comm_protocol.json
+
+# RG-1: prove the task uid can really read what it must, instead of relying on
+# root-side checks that pass even when the inputs are 0600 root:root. Fails the
+# BUILD on any EACCES or on a non-root-owned / world-writable policy input.
+RUN set -eu; \
     test -z "$(find -L /app/scripts /app/config /app/entrypoint.sh /app/entrypoint-split.sh \
       /app/health_server.py /app/agent_comm_protocol.json \
       \( ! -uid 0 -o -perm /222 \) -print)"; \
