@@ -2624,7 +2624,8 @@ def validate_worker_snapshots(variables: dict[str, str], errors: list[str]) -> N
     if not re.fullmatch(r"\d{8}T\d{6}Z", snapshot):
         errors.append("CI_DEBIAN_SNAPSHOT must be a snapshot timestamp")
         return
-    if snapshot < "20261024T011300Z":
+    minimum_snapshot = "20261024T011300Z"
+    if snapshot < minimum_snapshot:
         errors.append("CI_DEBIAN_SNAPSHOT predates the CVE-2026-111497 Brotli fixes")
     for dockerfile in (
         KIMI_DOCKERFILE, PEBBLE_DOCKERFILE, OPENCODE_DOCKERFILE, OPENCODE2_DOCKERFILE,
@@ -2636,9 +2637,17 @@ def validate_worker_snapshots(variables: dict[str, str], errors: list[str]) -> N
             r"(?m)^\s*(?i:ARG)\s+DEBIAN_SNAPSHOT=(\S+?)\s*$",
             dockerfile.read_text(encoding="utf-8"),
         )
-        if not values or {value.strip("\"'") for value in values} != {snapshot}:
+        normalized = {value.strip("\"'") for value in values}
+        if not normalized or normalized != {snapshot}:
             errors.append(
                 f"{dockerfile} ARG DEBIAN_SNAPSHOT must match CI_DEBIAN_SNAPSHOT"
+            )
+        if any(
+            not re.fullmatch(r"\d{8}T\d{6}Z", value) or value < minimum_snapshot
+            for value in normalized
+        ):
+            errors.append(
+                f"{dockerfile} ARG DEBIAN_SNAPSHOT predates the CVE-2026-111497 Brotli fixes"
             )
 
 
