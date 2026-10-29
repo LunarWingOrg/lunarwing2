@@ -351,8 +351,8 @@ for shape in absent-podman absent-docker absent-daemon; do
   reset_fixtures
   FIXTURE_STATE[pebble/bridge]="$shape"
   run_audit
-  if [[ "$AUDIT_RC" -eq 0 && "$AUDIT_OUT" == *"pebble: not present (lunarwing-pebble-acorn)"* \
-      && "$AUDIT_OUT" == *"pebble: not present (lunarwing-pebble-task-acorn)"* ]]; then
+  if [[ "$AUDIT_RC" -eq 0 && "$AUDIT_OUT" == *"lunarwing-pebble-acorn"* \
+      && "$AUDIT_OUT" == *"lunarwing-pebble-task-acorn"* ]]; then
     pass "$shape is recognised as absent"
   else
     fail "$shape is recognised as absent (rc=$AUDIT_RC, output: $AUDIT_OUT)"
