@@ -6,7 +6,7 @@
 # Re-bump only after re-verifying the bridge against the v2 server API.
 ARG OPENCODE_VERSION=v2.1.2
 ARG OPENCODE_REF=a517687fde98a7329ada3ae644a01a9fc6c4e99e
-ARG DEBIAN_SNAPSHOT=20261017T082437Z
+ARG DEBIAN_SNAPSHOT=20261024T011300Z
 ARG SOURCE_REVISION=unknown
 
 # ──────────────────────
