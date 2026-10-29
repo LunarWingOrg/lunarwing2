@@ -27,6 +27,7 @@ export LUNARWING_TASK_UID="$TASK_UID" LUNARWING_TASK_GID="$TASK_GID"
 export PEBBLE_MODE=websocket
 unset PEBBLE_TASK_UID PEBBLE_TASK_GID
 
+export HOME=/home/pebble-bridge
 TOKEN_DIR="${LUNARWING_TOKEN_DIR:-${HOME}/.local/state/lunarwing}"
 if [ -n "${AGENT_AUTH_TOKEN:-}" ]; then
   install -d -m 0700 "$TOKEN_DIR"
