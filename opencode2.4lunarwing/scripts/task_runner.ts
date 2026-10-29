@@ -32,10 +32,8 @@
  * their delta/output/error with the hub envelope's own rule, so a large
  * result arrives truncated, never as an over-cap line the client rejects.
  *
- * Listening (NL-7): in the image the root launcher binds the socket in a
- * root-only directory (task_runner_bind.py) and the runner inherits just the
- * listening descriptor (LUNARWING_TASK_RUNNER_LISTEN_FD); the path form
- * (`node task_runner.js <socket-path>`) stays for host-side runs and tests.
+ * Managed task containers bind the task-owned socket on the shared IPC-v2
+ * volume. Inherited-descriptor support remains for legacy host rehearsals.
  */
 
 import { connect, createServer, type Server, type Socket } from "node:net"
