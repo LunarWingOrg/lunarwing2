@@ -252,6 +252,15 @@ pub enum AppEvent {
     },
 
     // ── Engine v2 thread lifecycle events ──
+    #[serde(rename = "turn_recovery")]
+    TurnRecovery {
+        thread_id: String,
+        failure_kind: String,
+        recovery_state: String,
+        recovery_attempt: u64,
+        message: String,
+    },
+
     /// Engine thread changed state (e.g. Running → Completed).
     #[serde(rename = "thread_state_changed")]
     ThreadStateChanged {
@@ -332,6 +341,7 @@ impl AppEvent {
             Self::ExtensionStatus { .. } => "extension_status",
             Self::ReasoningUpdate { .. } => "reasoning_update",
             Self::JobReasoning { .. } => "job_reasoning",
+            Self::TurnRecovery { .. } => "turn_recovery",
             Self::ThreadStateChanged { .. } => "thread_state_changed",
             Self::ChildThreadSpawned { .. } => "child_thread_spawned",
             Self::MissionThreadSpawned { .. } => "mission_thread_spawned",
@@ -471,6 +481,13 @@ mod tests {
                 job_id: String::new(),
                 narrative: String::new(),
                 decisions: vec![],
+            },
+            AppEvent::TurnRecovery {
+                thread_id: String::new(),
+                failure_kind: "repl_argument_corruption".into(),
+                recovery_state: "retrying".into(),
+                recovery_attempt: 1,
+                message: "Waiting for recovery".into(),
             },
             AppEvent::ThreadStateChanged {
                 thread_id: String::new(),
