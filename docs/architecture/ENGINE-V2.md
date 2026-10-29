@@ -1364,8 +1364,8 @@ bounded `sanitized_at` marker is stamped on the thread metadata for
 observability. This is a deterministic synchronous hook at the execution
 boundary — not a mission trigger — so it applies to every thread type
 including Mission threads, and the first inference (and every repl-code step)
-sees sanitized state. See `docs/ops/v2.1.2.0_WI109_WI126_SANITIZE_MEMORY.md`
-for the full verification record.
+sees sanitized state. See the
+[verification record](../ops/history/v2.1.2.0_WI109_WI126_SANITIZE_MEMORY.md).
 Event payloads are seeded into the mission thread's initial persisted state as
 `state["trigger_payload"]` before execution. Terminal thread events are published
 after final thread persistence so listeners can load complete source state.
@@ -1747,7 +1747,7 @@ persisted on the conversation and injected into its next foreground turn,
 including resume from a waiting or suspended thread.
 
 Steer is deliberately **not** a tool-preemption control (the WI#105 scope
-decision, see `docs/ops/v2.1.1.0_GOAL18_WI105_STEER_PREEMPTION_CONTRACT.md`).
+decision, see the [steer contract](../ops/history/v2.1.1.0_GOAL18_WI105_STEER_PREEMPTION_CONTRACT.md)).
 A note queued while a tool future is pending does not abort that call: the
 inject signal only surfaces at the next `__check_signals__` poll, after the
 in-flight tool's result. Only `/interrupt` (`ThreadSignal::Stop` / the run
