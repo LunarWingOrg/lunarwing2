@@ -43,6 +43,7 @@ class KimiImageModesTests(unittest.TestCase):
         for name in ("scripts/task_runner.js", "scripts/nested directory/module.js"):
             (app / name).write_text("export const ready = true;\n")
             (app / name).chmod(0o666 & ~umask)
+        (app / "scripts/runner-link.js").symlink_to("task_runner.js")
         subprocess.run(["chmod", "+x", str(app / "entrypoint.sh"),
                         str(app / "entrypoint-task-setup.sh"),
                         str(app / "health_server.py")], check=True)
