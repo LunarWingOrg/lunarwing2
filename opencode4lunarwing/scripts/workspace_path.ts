@@ -75,6 +75,7 @@ export function resolveTaskWorkspace(
   context: { project_dir?: string; cron_tick?: unknown } | undefined,
   workspaceRoot: string,
   testHooks?: { beforeReresolve?: () => void; chown?: (fd: number, uid: number, gid: number) => void },
+  prepare = true,
 ): string {
   const tick = context?.cron_tick
   if (!tick || typeof tick !== "object" || !("event" in tick) || tick.event !== "cron.tick") {
@@ -86,6 +87,7 @@ export function resolveTaskWorkspace(
     throw new Error("Invalid workspace path for cron tick: expected relative directory components")
   }
   const root = realpathSync(resolve(workspaceRoot))
+  if (!prepare) return resolve(root, path)
   // DS-6: fail explicitly when the descriptor-walk transport is unavailable
   // (e.g. a sandbox masking /proc) instead of a misleading mkdir ENOENT.
   if (!existsSync("/proc/self/fd")) {
