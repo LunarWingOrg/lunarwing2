@@ -25,7 +25,7 @@ worker_task_container_name() {
 }
 
 worker_ipc_volume_name() {
-  printf 'lunarwing-%s-%s-ipc\n' "$1" "$2"
+  printf 'lunarwing-%s-%s-ipc-v2\n' "$1" "$2"
 }
 
 worker_task_health_command() {
