@@ -263,6 +263,9 @@ case "$MODE" in
     ;;
 
   websocket)
+    if [[ -n "${OPENCODE2_BRIDGE_UID:-}" && "${LUNARWING_CONTAINER_ROLE:-}" != split-task ]]; then
+      die "websocket images require LUNARWING_CONTAINER_ROLE=split-bridge or split-task"
+    fi
     log "Mode: WebSocket — starting opencode headless server"
 
     # v2 serve mandates Basic auth: without an explicit password it mints a
