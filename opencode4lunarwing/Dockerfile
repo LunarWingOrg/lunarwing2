@@ -305,9 +305,9 @@ RUN mkdir -p /home/opencode/.local/share/opencode \
              /app/results \
     && chown -R opencode:opencode /home/opencode /workspace /var/log/lunarwing /app/results
 
-RUN mkdir -p /run/lunarwing-shared \
-    && chown root:opencode /run/lunarwing-shared \
-    && chmod 2770 /run/lunarwing-shared
+RUN install -d -o root -g opencode -m 3770 /run/lunarwing-shared \
+    && install -d -o opencode -g opencode -m 2711 /run/lunarwing-shared/runner \
+    && install -d -o opencode-bridge -g opencode -m 2711 /run/lunarwing-shared/tool-proxy
 
 # ── ports ──────────────────────
 EXPOSE 8443
