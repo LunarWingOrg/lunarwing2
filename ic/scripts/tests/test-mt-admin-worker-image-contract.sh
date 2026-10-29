@@ -482,7 +482,7 @@ for pin in \
   'lunarwing-pebble-alice *--user 10104:10004 *-e LUNARWING_CONTAINER_ROLE=split-bridge * lunarwing-worker-pebble:latest' \
   'lunarwing-pebble-task-alice *--user 10004:10004 *-e LUNARWING_CONTAINER_ROLE=split-task * lunarwing-worker-pebble:latest' \
   'lunarwing-pebble-alice *--security-opt no-new-privileges *--cap-drop ALL * lunarwing-worker-pebble:latest' \
-  'lunarwing-pebble-task-alice *lunarwing-pebble-alice-ipc:/run/lunarwing-shared:z*'; do
+  'lunarwing-pebble-task-alice *lunarwing-pebble-alice-ipc-v2:/run/lunarwing-shared:z*'; do
   if has_call_like "ctr:alice run -d --name ${pin}"; then
     pass "rootful pebble: $pin"
   else
