@@ -15,7 +15,12 @@ function scratch(): string {
   scratchDirs.push(dir)
   return dir
 }
+const initialWorkspaceRoot = process.env.WORKSPACE_ROOT
+const testWorkspaceRoot = scratch()
+process.env.WORKSPACE_ROOT = testWorkspaceRoot
 after(() => {
+  if (initialWorkspaceRoot === undefined) delete process.env.WORKSPACE_ROOT
+  else process.env.WORKSPACE_ROOT = initialWorkspaceRoot
   for (const dir of scratchDirs) rmSync(dir, { recursive: true, force: true })
 })
 
@@ -54,7 +59,7 @@ async function startRunner(sdk: OpenCodeClient): Promise<{ runner: TaskRunner; p
 }
 
 function request(overrides: Partial<TaskRequest> = {}): TaskRequest {
-  return { task_id: "task-1", prompt: "start", context: { project_dir: scratch() }, ...overrides }
+  return { task_id: "task-1", prompt: "start", context: { project_dir: testWorkspaceRoot }, ...overrides }
 }
 
 test("runner health probes require a bounded live pong and propagate CLI failure", async () => {
