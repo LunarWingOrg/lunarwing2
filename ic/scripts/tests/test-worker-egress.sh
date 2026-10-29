@@ -678,6 +678,33 @@ else
   assert_absent "$(cat "$rootless_bin/nft.log")" '-f' "remote infra image is rejected before nft load"
 fi
 
+rm -rf -- "$rootless_state"
+mkdir -p "$rootless_state"
+if FAKE_INFRA_IMAGE='' PATH="$rootless_bin:$PATH" \
+    "$guard" "$fixture/alpha.nft" rootless fwd_alpha alpha >"$fixture/native-pause.out" 2>&1; then
+  pass "guard accepts the Podman native image-less pause keeper"
+else
+  fail "native pause keeper refused: $(cat "$fixture/native-pause.out")"
+fi
+for native_shape in \
+  'sha256:foreign|/catatonit|["-P"]|[]|/run/user/1000/libpod/tmp/infra-container' \
+  '|/bin/sh|["-P"]|[]|/run/user/1000/libpod/tmp/infra-container' \
+  '|/catatonit|["-P","extra"]|[]|/run/user/1000/libpod/tmp/infra-container' \
+  '|/catatonit|["-P"]|[{}]|/run/user/1000/libpod/tmp/infra-container' \
+  '|/catatonit|["-P"]|[]|/tmp/foreign-rootfs'; do
+  rm -rf -- "$rootless_state"
+  mkdir -p "$rootless_state"
+  : >"$rootless_bin/nft.log"
+  if FAKE_INFRA_IMAGE='' FAKE_NATIVE_PAUSE="$native_shape" PATH="$rootless_bin:$PATH" \
+      "$guard" "$fixture/alpha.nft" rootless fwd_alpha alpha >"$fixture/native-refused.out" 2>&1; then
+    fail "guard accepted unexpected native pause metadata: $native_shape"
+  else
+    pass "guard rejects unexpected native pause metadata: $native_shape"
+    assert_absent "$(cat "$rootless_bin/nft.log")" '-f' "invalid native pause is rejected before nft load"
+    [[ ! -e "$rootless_state/present" ]] || fail "invalid native keeper remains after refusal"
+  fi
+done
+
 locked_callback() {
   local result=0
   "$@" || result=$?
