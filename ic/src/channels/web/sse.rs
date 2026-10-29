@@ -227,6 +227,7 @@ impl SseManager {
                     SseEvent::SkillActivated { .. } => "skill_activated",
                     SseEvent::GateRequired { .. } => "gate_required",
                     SseEvent::GateResolved { .. } => "gate_resolved",
+                    SseEvent::TurnRecovery { .. } => "turn_recovery",
                     SseEvent::ThreadStateChanged { .. } => "thread_state_changed",
                     SseEvent::ChildThreadSpawned { .. } => "child_thread_spawned",
                 };
