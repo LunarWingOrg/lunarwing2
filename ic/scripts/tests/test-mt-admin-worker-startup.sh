@@ -82,8 +82,17 @@ read_tenant_env_value() { :; }
 resolve_worker_auth_token() { [[ "$failure_mode" != auth ]] || return 1; printf fixture-token; }
 write_tenant_file_atomic() { cat >"$2"; }
 _ctr() {
-  local lane
-  case "$2" in
+  local lane verb="$2"
+  # `_ctr_inspect` wraps this as `<runtime> container inspect ...`; keep the
+  # fixture's single-verb dispatch working and pin that the typed subcommand is
+  # what the real helper sends (a bare `inspect` would regress the volume-name
+  # prefix collision the wrapper exists to avoid).
+  if [[ "$verb" == container ]]; then
+    shift 2
+    verb="$1"
+    [[ "$verb" == inspect ]] || fail "typed container wrapper used for '$verb'"
+  fi
+  case "$verb" in
     ps)
       [[ ! -e "$fixture/repaired" ]] || return 0
       printf 'Try running "podman system migrate"\n' >&2

@@ -229,6 +229,12 @@ CONTAINER_HEALTHY=true
 _ctr() {
   local name="$1" action="$2"
   shift 2
+  # `_ctr_inspect` calls `<runtime> container inspect ...`; collapse the typed
+  # subcommand so the fixture's verb dispatch and recorded calls stay meaningful.
+  if [[ "$action" == container && "${1:-}" == inspect ]]; then
+    shift
+    action=inspect
+  fi
   CALLS+=("ctr:$name $action $*")
   case "$action" in
     inspect) [[ "$CONTAINER_EXISTS" == true ]] ;;

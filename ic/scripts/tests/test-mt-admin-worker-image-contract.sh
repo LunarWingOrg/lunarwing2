@@ -79,10 +79,10 @@ _ctr() {
       printf '%s\n' "$IMAGE_ID" ;;
     "image inspect --format {{.Config.User}} "*)
       printf '%s\n' "$IMAGE_USER" ;;
-    "inspect -f {{.State.Running}} "*)
+    "inspect -f {{.State.Running}} "*|"container inspect -f {{.State.Running}} "*)
       [[ "$CONTAINER_EXISTS" == "true" ]] || return 1
       printf 'true\n' ;;
-    "inspect "*)
+    "inspect "*|"container inspect "*)
       [[ "$CONTAINER_EXISTS" == "true" ]] ;;
     "rm -f "*)
       [[ "$TRACK_EXISTENCE" != "true" ]] || CONTAINER_EXISTS="false" ;;
