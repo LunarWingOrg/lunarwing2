@@ -114,25 +114,25 @@ The XMPP bridge's release compile also finished successfully in 10m27s. The
 standard WASM build completed successfully: all nine tool artifacts and all
 four channel artifacts built. Installation reports `12 installed, 1 skipped
 (not built)`; the skipped artifact is DarkIRC, correctly omitted because this
-tenant has DarkIRC disabled. The fat Pebble worker candidate image is currently
-assembling its final Debian image layers from the configured fat-toolchain
-Dockerfile; the protected toolchain smoke gate and Kimi fat image build remain.
-`start-tenant` and worker acceptance have not started. In the current final
-image build, Rust 1.96.1 was installed successfully and the Go 1.24.3 archive
-checksum passed. The build is still in its toolchain-image layers; this is not a
-completed image or a passed in-container smoke test. The Pebble Dockerfile's
-pinned upstream `PEBBLE_REF` checkout at
-`2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b` completed; the WI#477 patch applied
-and `verify_upstream_lock.py` confirmed the reviewed lock SHA256/package delta.
-The upstream `cargo build --release --locked --bin pebble` finished successfully
-in 52.39s. The in-build full-profile layer installed Rust 1.96.1, Go 1.24.3,
-GCC/G++ and supporting native build packages; its two shell-resolution probes
-successfully found cargo/rustc/go/rustup in both `/bin/sh -lc` and `env -i`
-shells. This is build-stage evidence only. The completed image has not yet
-passed the separate WI#334 image-mode smoke probe, its candidate tag has not
-been promoted, and the final build remains in progress. Redacted local build
-log:
-`/tmp/lw-item101/deploy.log`.
+tenant has DarkIRC disabled. The Pebble fat candidate image then built
+successfully from upstream pebble `2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b`;
+the WI#477 patch applied, `verify_upstream_lock.py` confirmed the reviewed lock
+SHA256/package delta, and `cargo build --release --locked --bin pebble`
+finished in 52.39s. Its final image layers installed Rust 1.96.1, Go 1.24.3,
+GCC/G++ and native build support. The Dockerfile's in-build probes found
+cargo/rustc/go/rustup both in `/bin/sh -lc` task-shell mode and in a sanitized
+`env -i` shell. **The separate WI#334 image-mode smoke gate also passed both
+legs** on `lunarwing-worker-pebble:candidate`: `/bin/sh -lc` (the actual Pebble
+task-shell spawn mode) and `env -i /bin/sh -c`, with networking disabled. Both
+reported Cargo/rustc 1.96.1, Go 1.24.3 and rustup 1.28.2. mt-admin then promoted
+the candidate to `lunarwing-worker-pebble:latest` (fat profile, source revision
+`67a96a9dd4380317dd05badda0f357a20c9085bb`).
+
+The fat Kimi image build has begun and its build command records source revision
+`05a2cd90fc34da616c9480b7e7a31ed1da6dc3ef` (the tenant clone); its image label
+and actual toolchain gate are pending. `start-tenant` has not run yet, so neither
+worker acceptance jobs nor their health/listener/egress runtime audits have
+started. Redacted local build log: `/tmp/lw-item101/deploy.log`.
 
 **Worker build source-root finding:** at provisioning, the tenant clone is at
 `05a2cd90fc34da616c9480b7e7a31ed1da6dc3ef`. At Pebble image build time, the
