@@ -115,14 +115,16 @@ standard WASM build completed successfully: all nine tool artifacts and all
 four channel artifacts built. Installation reports `12 installed, 1 skipped
 (not built)`; the skipped artifact is DarkIRC, correctly omitted because this
 tenant has DarkIRC disabled. The fat Pebble worker candidate image is currently
-building with Rust, Go, and C++ toolchains; its protected toolchain smoke gate
-and the Kimi fat image build remain. `start-tenant` and worker acceptance have
-not started. The Pebble Dockerfile's pinned upstream `PEBBLE_REF` checkout at
+assembling its final Debian image layers from the configured fat-toolchain
+Dockerfile; the protected toolchain smoke gate and Kimi fat image build remain.
+`start-tenant` and worker acceptance have not started. The Pebble Dockerfile's
+pinned upstream `PEBBLE_REF` checkout at
 `2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b` completed; the WI#477 patch applied
 and `verify_upstream_lock.py` confirmed the reviewed lock SHA256/package delta.
-The upstream `cargo build --release --locked --bin pebble` is still in progress
-inside candidate-image step 17/17; candidate promotion and its required smoke
-check have not occurred. Redacted local build log:
+The upstream `cargo build --release --locked --bin pebble` finished successfully
+in 52.39s. The final image build and its required toolchain smoke check have not
+yet succeeded, and candidate promotion has not occurred. Redacted local build
+log:
 `/tmp/lw-item101/deploy.log`.
 
 **Worker build source-root finding:** at provisioning, the tenant clone is at
