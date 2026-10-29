@@ -660,14 +660,19 @@ worker_egress_reconcile_container() {
 }
 
 worker_egress_verify_after_start() {
-  local name="$1" container="$2"
+  local name="$1" container="$2" guard mode=rootful
   if ! worker_egress_container_attached "$name" "$container"; then
     _ctr "$name" stop "$container" >/dev/null 2>&1 || true
     die "worker container $container is not exclusively on its egress network with pinned DNS/hosts; stopped it"
   fi
-  worker_egress_verify "$name" >/dev/null \
+  ensure_container_runtime
+  guard="$WORKER_EGRESS_GUARD"
+  [[ "$(id -u)" == 0 ]] || guard="$WORKER_EGRESS_GUARD_SRC"
+  [[ "$CONTAINER_RT" != podman || "$MT_ROOTLESS" != true ]] || mode=rootless
+  "$guard" --verify "$(worker_egress_ruleset_path "$name")" "$mode" \
+    "$(worker_egress_chain "$name")" "$name" >/dev/null \
     || { _ctr "$name" stop "$container" >/dev/null 2>&1 || true; \
-         die "worker egress filter vanished after $container started; stopped it"; }
+         die "worker egress filter verification failed after $container started; stopped it"; }
 }
 
 worker_egress_audit() {
