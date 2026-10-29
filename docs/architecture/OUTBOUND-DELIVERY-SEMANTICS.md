@@ -1,27 +1,30 @@
 # Outbound Message Delivery Semantics
 
-**Added 2026-10-01 (v2.1.4.0, WI#270). Updated 2026-10-01 (WI#277): the XMPP
-channel now persists outbound messages to a durable spool before acking, so
-restart/rebuild/crash no longer silently loses acked messages; post-enqueue
-failures retry with backoff instead of being dropped. Updated 2026-10-05
-(v2.1.5.0, WI#276): the mission-run ledger paragraph now describes the
-grace-expired shutdown stamp and boot-sweep resolution instead of the old
-record-only wording. Revalidated 2026-10-06 (v2.1.5.0): the `message`-tool
-ack wording, the XMPP enqueue gate / spool / drain / retry rules, and the
-`OUTBOUND_SHUTDOWN_DRAIN_TIMEOUT` (2s) anchor were re-checked against
-`ic/src/tools/builtin/message.rs` and `ic/src/channels/xmpp/mod.rs` and
-still hold. Revalidated 2026-10-14 (v2.1.6.0): the acceptance-not-delivery
-ack wording, the XMPP enqueue gate / spool / drain / retry rules, and the
-2s drain-timeout anchor were re-checked against the same files and still
-hold; the mission-run ledger paragraph is consistent with the model, and
-ENGINE-V2.md carries the full exception list beyond its two named
-exceptions (the 24 h stamp-age bound, already-owned/superseded stamps
-cleared without retry, and the accepted save→marker crash window).** Defines what a
-successful `message`-tool send means, and what the XMPP channel guarantees
-about outbound stanzas. Rooted in the PR Digest #59 incident: a scheduled
-mission recorded "Delivered via XMPP … Goal achieved" in its memory because
-the `message` tool returned a success-looking ack, then a rebuild/restart
-window ate the queued stanza and the user never received anything.
+**Source revalidated 2026-10-29 for v2.1.7.0.** Defines what a successful
+`message`-tool send means and what the native XMPP channel guarantees about
+outbound stanzas. WI#270 established acceptance wording; WI#277 added durable
+spooling. The initiating incident was a mission recording "Delivered via XMPP"
+after an enqueue acknowledgement, followed by a restart losing the queued stanza.
+
+Source anchors: `MessageTool::execute` and `resolve_message_target` in
+`ic/src/tools/builtin/message.rs`; `queue_outbound_with_attachments` and
+`OUTBOUND_SHUTDOWN_DRAIN_TIMEOUT` in `ic/src/channels/xmpp/mod.rs`;
+`OutboundSpool`, `SPOOL_MAX_ATTEMPTS`, and retry constants in
+`ic/src/channels/xmpp/spool.rs`. Mission recovery is a separate contract in
+[ENGINE-V2.md](ENGINE-V2.md).
+
+## Routing and partial acceptance
+
+Explicit tool parameters win. For autonomous executions, job-local
+`notify_channel`, `notify_user`, and `owner_id` metadata take precedence over
+shared interactive defaults. Switching channels does not reuse a target from a
+different source channel; channel-aware fallback resolves the owner or active
+conversation target. Gateway sends also carry `notify_thread_id` when present.
+
+A multi-channel broadcast succeeds if at least one channel accepts it; its ack
+names only successful channels. Failed channels are logged, and an all-failed
+or no-connected-channels result is an error. A success therefore does not imply
+that every configured channel accepted the message.
 
 ## The contract: acceptance, not delivery
 
@@ -61,16 +64,17 @@ client task, backed by a durable on-disk spool. Four hardening rules apply
    message is persisted to `<omemo_store_dir>/spool/<millis>-<seq>-<uuid>.json`
    (atomic tmp-write + fsync + rename; dir `0700`, files `0600`). If the
    spool write fails, the enqueue is refused — the channel never acks a
-   message it cannot keep. The client task claims a record by atomic rename
-   before sending (so a spool replay and a late in-memory copy can never
-   both send it), deletes it on send success, and on every `Event::Online`
-   bind replays everything still pending — which is how a restarted or
-   crashed process' acked messages get delivered. The hourly rate limiter
-   is not re-applied to replays: those sends were accepted and counted when
-   the original caller was acked. Spooled content is plaintext JSON, the
-   same on-disk exposure class as the adjacent OMEMO identity store.
-   Internal protocol sends (e.g. pairing prompts) are ephemeral and
-   deliberately not spooled.
+   message it cannot keep. A failed mpsc handoff discards the record because
+   that caller was never acknowledged. The client task claims a record by
+   atomic rename before sending, preventing simultaneous spool and queue
+   copies from sending it. It deletes the record on send success and replays
+   pending records that are due on each `Event::Online` bind and subsequent
+   retry ticks. Backoff still applies after reconnect; parked failures need
+   operator attention, so persistence is not an unconditional delivery promise.
+   The hourly rate limiter is checked before persistence and is not re-applied
+   to replays. Spooled content is plaintext JSON, the same on-disk exposure
+   class as the adjacent OMEMO identity store. Internal protocol sends
+   (e.g. pairing prompts) are ephemeral and deliberately not spooled.
 3. **Shutdown drain.** `shutdown()` gives the still-running client task a
    bounded window (`OUTBOUND_SHUTDOWN_DRAIN_TIMEOUT`, 2s) to finish
    processing already-acked stanzas, mirroring the coalesce-buffer flush.
