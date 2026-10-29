@@ -23,6 +23,7 @@ const (
 	compileRun      = "RUN python3 /build/compile_out_remote_tunnel.py /build/opencode"
 	guardedBuild    = "RUN OPENCODE_VERSION=\"${OPENCODE_VERSION#v}\" bun run build -- --single"
 	dependencyModes = "RUN chmod -R a-s,a-w /app/node_modules"
+	runtimeSmoke    = "RUN --network=none bash /app/scripts/runtime_smoke_entrypoint.sh"
 	anchorArg       = "ARG LUNARWING_WRAPPER_SHA256="
 	scriptsCopy     = "COPY scripts/ ./scripts/"
 	configCopy      = "COPY config/ ./config/"
@@ -211,6 +212,9 @@ type policyState struct {
 	dependencyCopyIndex int
 	dependencyModeStage int
 	dependencyModeIndex int
+	smokeStage          int
+	smokeIndex          int
+	smokeCount          int
 	filesystemSeen      bool
 	lastUser            string
 	scriptsStage        int
@@ -224,6 +228,7 @@ func newPolicyState() *policyState {
 		scanStage: -1, assertStage: -1, assertIndex: -1, binaryStage: -1,
 		anchorStage: -1, anchorIndex: -1, dependencyCopyStage: -1,
 		dependencyCopyIndex: -1, dependencyModeStage: -1, dependencyModeIndex: -1,
+		smokeStage: -1, smokeIndex: -1,
 		scriptsStage: -1, configStage: -1, bootStage: -1, readonlyStage: -1,
 	}
 }
@@ -245,6 +250,9 @@ func (s *policyState) process(line parsedLine, index int) error {
 	if line.name == "COPY" && strings.Contains(line.text, "/app/node_modules") {
 		s.dependencyCopyStage, s.dependencyCopyIndex = s.stage, index
 	}
+	if line.name == "RUN" && strings.Contains(line.text, "runtime_smoke_entrypoint.sh") && !sameInstruction(line, runtimeSmoke) {
+		return fmt.Errorf("Dockerfile runtime smoke must use exactly '%s' (WI#511 private netns)", runtimeSmoke)
+	}
 	switch {
 	case sameInstruction(line, compileCopy) && s.stageName == "builder":
 		s.compileCopied = true
@@ -261,6 +269,9 @@ func (s *policyState) process(line parsedLine, index int) error {
 		s.scanStage = s.stage
 	case sameInstruction(line, dependencyModes):
 		s.dependencyModeStage, s.dependencyModeIndex = s.stage, index
+	case sameInstruction(line, runtimeSmoke):
+		s.smokeStage, s.smokeIndex = s.stage, index
+		s.smokeCount++
 	case sameInstruction(line, anchorArg):
 		s.anchorStage, s.anchorIndex = s.stage, index
 	case sameInstruction(line, filesystem):
@@ -306,6 +317,10 @@ func (s *policyState) validate() []error {
 	}
 	if s.anchorStage != s.assertStage || s.anchorIndex+1 != s.assertIndex {
 		errs = append(errs, fmt.Errorf("Dockerfile must declare ARG LUNARWING_WRAPPER_SHA256= immediately above the final assertion in its stage"))
+	}
+	if s.smokeCount != 1 || s.smokeStage != s.assertStage ||
+		s.smokeIndex <= s.dependencyModeIndex || s.smokeIndex >= s.anchorIndex {
+		errs = append(errs, fmt.Errorf("Dockerfile must run exactly one private-netns runtime smoke in the final assertion stage, after dependency modes and before the wrapper anchor (WI#511)"))
 	}
 	dependencyCopiesFinal := s.dependencyCopyIndex < 0 || s.dependencyCopyStage == s.assertStage
 	if s.dependencyModeStage != s.assertStage || !dependencyCopiesFinal ||

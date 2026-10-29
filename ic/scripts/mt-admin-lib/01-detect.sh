@@ -145,6 +145,21 @@ ensure_container_runtime() {
   fi
 }
 
+# Inline RUN --network first shipped in Buildah 1.30, vendored by Podman 4.5.
+# Older hosts may still run existing workers; only building opencode2 needs
+# this floor so its smoke can use a private netns despite --network=host.
+podman_supports_run_network() {
+  ensure_container_runtime
+  [[ "$CONTAINER_RT" == "podman" ]] || return 1
+  local ver major minor
+  ver="$(podman version --format '{{.Client.Version}}' 2>/dev/null || true)"
+  [[ -n "$ver" ]] || ver="$(podman --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 || true)"
+  major="${ver%%.*}"
+  minor="${ver#*.}"; minor="${minor%%.*}"
+  [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] \
+    && { [[ "$major" -gt 4 ]] || { [[ "$major" -eq 4 && "$minor" -ge 5 ]]; }; }
+}
+
 # True if the active runtime is podman new enough for the Quadlet .container
 # features we emit. Floor is >= 4.6: Quadlet itself shipped in 4.4, but the
 # Health* keys render_pg_quadlet uses first exist in 4.5 (Quadlet hard-errors

@@ -109,6 +109,23 @@ def _row(address: str, port: int, state: str = "0A") -> str:
     )
 
 
+# WI#511: a kernel-layout /proc/net/tcp fixture, with synthetic addresses and
+# metadata. Its uid and inode are not read by parse_listeners; the tests pin
+# only address, port and state parsing in this layout. The row has
+# the owning uid at field 7 and the socket inode at field 9 (the retransmit
+# timeout value 99 sits at field 12). The kernel layout is:
+#   sl local rem st tx:rx tr:when retrnsmt uid timeout inode refcnt ...
+def _real_tcp_row(
+    address: str, port: int, uid: int, inode: int, state: str = "0A"
+) -> str:
+    hex_address = _ipv4_hex(address).rjust(8, "0")
+    return (
+        f"  0: {hex_address}:{port:04X} 00000000:0000 "
+        f"{state} 00000000:00000000 00:00000000 00000000  {uid:7d}        0 "
+        f"{inode} 2 00000000a0857056 99 0 0 10 0"
+    )
+
+
 class AddressDecodingTests(unittest.TestCase):
     def test_ipv4_is_little_endian(self) -> None:
         self.assertEqual(smoke._decode_address("0100007F"), "127.0.0.1")
@@ -148,6 +165,30 @@ class ListenerParsingTests(unittest.TestCase):
     def test_malformed_rows_are_skipped(self) -> None:
         table = "\n".join(["garbage", "  1: zzzz:yy 0:0 0A 0", _row("127.0.0.1", 80)])
         self.assertEqual(smoke.parse_listeners(table), [("127.0.0.1", 80)])
+
+    def test_real_kernel_row_is_parsed_correctly(self) -> None:
+        # WI#511 / RR-4: exercise address/port/state parsing on the kernel row
+        # layout. Unlike !2055's removed attribution code, parse_listeners does
+        # not read the uid or inode, so this is not an inode-column regression.
+        header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
+        row = _real_tcp_row("0.0.0.0", 22, uid=0, inode=376901965)
+        parsed = smoke.parse_listeners("\n".join([header, row]))
+        self.assertEqual(parsed, [("0.0.0.0", 22)])
+
+    def test_multiple_real_rows_keep_distinct_ports_and_addresses(self) -> None:
+        # Two synthetic kernel-layout rows must both parse so the guard can
+        # judge them by address+port; this fixture does not test netns isolation.
+        header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
+        rows = "\n".join(
+            [
+                _real_tcp_row("0.0.0.0", 22, uid=0, inode=376901965),
+                _real_tcp_row("127.0.0.1", 8443, uid=10003, inode=71467086),
+            ]
+        )
+        parsed = smoke.parse_listeners("\n".join([header, rows]))
+        self.assertEqual(
+            parsed, [("0.0.0.0", 22), ("127.0.0.1", 8443)]
+        )
 
 
 class ServiceConfigTests(unittest.TestCase):
@@ -484,11 +525,49 @@ class CandidateBuildWiringTests(unittest.TestCase):
         lane = Path(__file__).resolve().parents[1]
         dockerfile = (lane / "Dockerfile").read_text()
         runner = (lane / "scripts/runtime_smoke_entrypoint.sh").read_text()
-        self.assertIn("RUN bash /app/scripts/runtime_smoke_entrypoint.sh", dockerfile)
+        self.assertIn("bash /app/scripts/runtime_smoke_entrypoint.sh", dockerfile)
         self.assertNotIn("runtime_smoke.py --profile build", dockerfile)
         self.assertIn("/app/entrypoint.sh --mode websocket", runner)
         self.assertIn('export WS_STATE_FILE="$SMOKE_ROOT/ws_state.json"', runner)
         self.assertIn("runtime_smoke.py --profile container", runner)
+
+    @unittest.skipUnless(_IN_CHECKOUT, _CHECKOUT_ONLY)
+    def test_candidate_smoke_step_has_its_own_network_namespace(self) -> None:
+        # WI#511: mt-admin builds every worker with `podman build
+        # --network=host` (the only netns that can reach the network on those
+        # hosts), so the smoke step read the HOST's socket table and flagged
+        # host sshd/NetBird listeners as worker exposure. The guard logic was
+        # right; it was aimed at the wrong namespace.
+        #
+        # `RUN --network=none` gives the step a private netns with loopback up
+        # under BOTH builders (podman 5.8.2 rootless/rootful and rootless
+        # BuildKit), and needs no capability — `unshare -n` inside the step
+        # fails with EPERM because the build step has no CAP_SYS_ADMIN, and
+        # Podman steps have a private PID namespace, so /proc/<pid>/fd cannot
+        # attribute host sockets. CI BuildKit instead shares buildkitd's PID
+        # namespace with --oci-worker-no-process-sandbox, not the host's.
+        #
+        # This checkout test and the required BuildKit-parser policy pin the
+        # instruction: dropping --network=none re-aims the guard at the builder's
+        # default netns (the host's in mt-admin builds).
+        lane = Path(__file__).resolve().parents[1]
+        dockerfile = (lane / "Dockerfile").read_text()
+        self.assertIn(
+            "RUN --network=none bash /app/scripts/runtime_smoke_entrypoint.sh",
+            dockerfile,
+        )
+        # The netns pin must be on the smoke step itself, and no other RUN may
+        # silently re-introduce a host-shared smoke.
+        smoke_runs = [
+            line
+            for line in dockerfile.splitlines()
+            if "runtime_smoke_entrypoint.sh" in line and line.startswith("RUN")
+        ]
+        self.assertEqual(len(smoke_runs), 1, f"unexpected smoke RUN steps: {smoke_runs}")
+        self.assertTrue(
+            smoke_runs[0].startswith("RUN --network=none "),
+            f"smoke step lost its private netns: {smoke_runs[0]}",
+        )
 
     def test_candidate_smoke_fails_on_external_writes(self) -> None:
         lane = Path(__file__).resolve().parents[1]
