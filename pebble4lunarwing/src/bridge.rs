@@ -356,10 +356,9 @@ fn negotiate_subprotocol(offer: &str) -> Option<&'static str> {
 }
 
 fn reject(status: StatusCode) -> http::Response<Option<String>> {
-    http::Response::builder()
-        .status(status)
-        .body(None)
-        .expect("response")
+    let mut response = http::Response::new(None);
+    *response.status_mut() = status;
+    response
 }
 
 async fn execute_dispatch_task(
