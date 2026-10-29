@@ -306,8 +306,33 @@ COPY entrypoint.sh entrypoint-split.sh health_server.py agent_comm_protocol.json
 COPY scripts/ ./scripts/
 COPY config/ ./config/
 
+# RG-1: COPY preserves the build context's modes, so a checkout made under a
+# restrictive umask (mt-admin's private tenant clone has 0700 dirs / 0600 files)
+# ships /app/config and /app/scripts unreadable by the task uid 10003 even
+# though every root-side check passes. Add the read/traverse bits first so the
+# read-only pass below cannot turn 0600 into an unreadable 0400.
+RUN set -eu; \
+    command -v setpriv >/dev/null; \
+    chmod -R a+rX /app/config /app/scripts; \
+    chmod a+rx /app/entrypoint.sh /app/entrypoint-split.sh /app/health_server.py; \
+    chmod a+r /app/agent_comm_protocol.json
+
+# WI#357 (run-79 EI-5): the exposure controls must be root-owned and read-only.
+# Kept as the pinned instruction the BuildKit-parser policy gate matches.
 RUN chmod +x /app/entrypoint.sh /app/entrypoint-split.sh /app/health_server.py \
     && chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/entrypoint-split.sh /app/health_server.py /app/agent_comm_protocol.json
+
+# RG-1: prove the task uid can really read what it must, instead of relying on
+# root-side checks that pass even when the inputs are 0600 root:root. Fails the
+# BUILD on any EACCES or on a non-root-owned / world-writable policy input.
+RUN set -eu; \
+    test -z "$(find -L /app/scripts /app/config /app/entrypoint.sh /app/entrypoint-split.sh \
+      /app/health_server.py /app/agent_comm_protocol.json \
+      \( ! -uid 0 -o -perm /222 \) -print)"; \
+    setpriv --reuid=10003 --regid=10003 --clear-groups \
+      find -L /app/scripts /app/config /app/entrypoint.sh /app/entrypoint-split.sh \
+      /app/health_server.py /app/agent_comm_protocol.json \
+      -type f -exec cat -- {} + >/dev/null
 
 # WI#357: install the exposure-guard wrapper as the only PATH-visible
 # opencode entrypoint, then fail the BUILD when the policy regresses:
