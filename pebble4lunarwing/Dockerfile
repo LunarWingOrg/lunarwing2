@@ -263,9 +263,9 @@ RUN groupadd --gid 10004 pebbletask \
     && chown -R pebbletask:pebbletask /home/pebbletask \
     && command -v setpriv >/dev/null
 
-RUN mkdir -p /run/lunarwing-shared \
-    && chown root:pebbletask /run/lunarwing-shared \
-    && chmod 2770 /run/lunarwing-shared
+RUN install -d -o root -g pebbletask -m 3770 /run/lunarwing-shared \
+    && install -d -o pebbletask -g pebbletask -m 2711 /run/lunarwing-shared/runner \
+    && install -d -o pebble-bridge -g pebbletask -m 2711 /run/lunarwing-shared/tool-proxy
 
 ENV PEBBLE_TASK_UID=10004 \
     PEBBLE_TASK_GID=10004 \
