@@ -117,7 +117,10 @@ four channel artifacts built. Installation reports `12 installed, 1 skipped
 tenant has DarkIRC disabled. The fat Pebble worker candidate image is currently
 assembling its final Debian image layers from the configured fat-toolchain
 Dockerfile; the protected toolchain smoke gate and Kimi fat image build remain.
-`start-tenant` and worker acceptance have not started. The Pebble Dockerfile's
+`start-tenant` and worker acceptance have not started. In the current final
+image build, Rust 1.96.1 was installed successfully and the Go 1.24.3 archive
+checksum passed. The build is still in its toolchain-image layers; this is not a
+completed image or a passed in-container smoke test. The Pebble Dockerfile's
 pinned upstream `PEBBLE_REF` checkout at
 `2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b` completed; the WI#477 patch applied
 and `verify_upstream_lock.py` confirmed the reviewed lock SHA256/package delta.
