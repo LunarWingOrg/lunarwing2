@@ -58,7 +58,8 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         input_files='opencode4lunarwing/Dockerfile
 opencode4lunarwing/models-dev/api.json
 opencode4lunarwing/scripts/check_models_dev_snapshot.py
-opencode4lunarwing/scripts/fix_photon_patch_context.py'
+opencode4lunarwing/scripts/fix_photon_patch_context.py
+opencode4lunarwing/scripts/fix_photon_patch_context_test.py'
         source_ref=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
         build_args="OPENCODE_VERSION=v1.18.25
 OPENCODE_REF=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
@@ -81,6 +82,7 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
 opencode2.4lunarwing/entrypoint.sh
 opencode2.4lunarwing/scripts/prepare_reproducible_build.py
 opencode2.4lunarwing/scripts/fix_photon_patch_context.py
+opencode2.4lunarwing/scripts/fix_photon_patch_context_test.py
 opencode2.4lunarwing/scripts/path_expand_test.ts
 opencode2.4lunarwing/scripts/opencode_result_test.ts
 opencode2.4lunarwing/scripts/sdk_surface.ts

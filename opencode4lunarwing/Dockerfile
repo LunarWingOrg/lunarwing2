@@ -303,7 +303,8 @@ RUN test "$(/usr/local/bin/opencode --version)" = "${OPENCODE_VERSION}" \
     && bun scripts/lunarwing_tool_proxy_test.ts \
     && bun scripts/lunarwing_tool_plugin_test.ts \
     && bun test scripts/task_runner_test.ts \
-    && python3 scripts/study_notes_config_test.py
+    && python3 scripts/study_notes_config_test.py \
+    && python3 scripts/fix_photon_patch_context_test.py
 
 # ── XDG directories for opencode state ────────────────────────
 RUN mkdir -p /home/opencode/.local/share/opencode \
