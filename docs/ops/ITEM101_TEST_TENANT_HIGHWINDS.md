@@ -138,14 +138,20 @@ operator's Podman store confirms `lunarwing-worker-pebble:latest` image ID
 and `toolchain-profile=true`. It has not yet been distributed into the tenant's
 rootless store; that occurs during `start-tenant`.
 
-The fat Kimi image build is in progress and its build command records source
-revision `05a2cd90fc34da616c9480b7e7a31ed1da6dc3ef` (the tenant clone); its
-image label and final build remain pending. The real Kimi CLI contract suite in
+The fat Kimi image build completed successfully from the tenant clone at
+`05a2cd90fc34da616c9480b7e7a31ed1da6dc3ef`. The real Kimi CLI contract suite in
 the image build passed **178/178, 0 failed, 0 skipped**, including headless
-invocation/config-hook contracts. The final image's Debian build-toolchain layer
-is now running. `start-tenant` has not run yet, so neither worker acceptance jobs
-nor their health/listener/egress runtime audits have started. Redacted local
-build log: `/tmp/lw-item101/deploy.log`.
+invocation/config-hook contracts. A read-only operator-store inspection confirms
+`lunarwing-worker-kimi:latest` image ID
+`ede188ca296411baece9f43e3fb75e0bbb035cd40a37597264654624ec9471da`, size
+2,689,862,622 bytes, OCI revision label
+`05a2cd90fc34da616c9480b7e7a31ed1da6dc3ef` and `toolchain-profile=true`.
+
+`start-tenant highwinds` is now in progress: PG/vision are ready, the daemon was
+started/restarted successfully, and mt-admin is distributing the 2.33 GB Pebble
+image into the tenant's rootless store. Worker containers, post-start health,
+listener and egress audits, and worker acceptance jobs are not yet confirmed.
+Redacted local log: `/tmp/lw-item101/deploy.log`.
 
 **Worker build source-root finding:** at provisioning, the tenant clone is at
 `05a2cd90fc34da616c9480b7e7a31ed1da6dc3ef`. At Pebble image build time, the
@@ -158,9 +164,10 @@ root (`ic/scripts/mt-admin-lib/05-tenant-build.sh:562`); that builder reads
 `$(tenant_lw_root "$name")` (`:574`). The live Pebble build log confirms the
 fat candidate's `SOURCE_REVISION` is the operator checkout's
 `67a96a9dd4380317dd05badda0f357a20c9085bb`, not the tenant clone revision.
-The Kimi image's actual label will be inspected after its build. This reproduces
-the still-open WI#507 source-root asymmetry noted in item 99: both lanes are
-selected for the same tenant but are built from different source commits.
+The Kimi image's OCI revision label is now verified as
+`05a2cd90fc34da616c9480b7e7a31ed1da6dc3ef`, confirming the two workers for this
+same tenant were built from different source commits. This reproduces the still-
+open WI#507 source-root asymmetry noted in item 99.
 
 ## Planned worker exercise
 
