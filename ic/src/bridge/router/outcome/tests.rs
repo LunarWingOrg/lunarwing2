@@ -175,6 +175,7 @@ impl Rig {
                 message,
                 conversation_id,
                 thread_id: thread.id,
+                history_message_id: None,
             },
             llm,
             events,
