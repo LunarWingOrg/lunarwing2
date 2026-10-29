@@ -93,10 +93,37 @@ The replacement fix in `kimicode4lunarwing/Dockerfile`:
   runs setup as uid 10002 on root-capable runners, and confirms unreadable
   nested files/directories are rejected rather than silently skipped.
 
-Local regression evidence so far: all four tests pass under root, including
-both genuine dropped-uid cases. The unprivileged run has two passes and two
-explicit root-required skips. CI config validation and the worker exposure
-policy guard also pass. Full rebuilt-image evidence is still pending.
+Verification on the committed tree:
+
+- Four mode regressions pass under root, including both genuine dropped-uid
+  cases. Unprivileged: two passes, two explicit root-required skips. Three
+  in-memory mutations (drop read/traverse normalization, drop immutable-input
+  write removal, run the gate as root) each fail the real task-uid regression;
+  no tracked source was mutated.
+- Standard Kimi `npm run build` and `npm test`: 178 tests, 177 passes, one skip,
+  zero failures. CI configuration validation and the worker exposure policy
+  guard pass. `test_goal1_ci.py`: 267/267. Full `.gitlab/tests` discovery:
+  473 tests, six skips, zero failures (the two new root-required cases are among
+  those skips and were separately run under root).
+- Standard `build-kimi-worker --with-toolchains` finished with exit 0 in tmux.
+  Image ID `9d7e198a35113f72a1896947b29dd76ac6c8b5e520bf41f37375ca4c71de28e7`,
+  size 2,717,326,497 bytes, revision `0fe42ef3ffb3a3a671211cce1381ca571c27c2cd`,
+  toolchain profile true. Its final build layer passed the uid-10002 traversal,
+  reads and real task-setup gate. The earlier npm build/test layers were reused
+  from cache; the host suite above is a fresh run. This build used the operator
+  checkout (normal source modes); passing `umask 077` to the build process does
+  not change pre-existing context modes. Restrictive-context equivalence is
+  proved by the executed Dockerfile-block regressions, not misattributed to
+  this full-image build.
+- A separate network-disabled container, explicitly `--user 10002:10002`,
+  successfully read all policy/script files and executed the actual setup,
+  PreToolUse guard and stdio MCP shim. The shim answered initialize/tools-list
+  with no grant and zero advertised tools; final marker `RG1_TASK_UID_INPUTS_OK`.
+  No live credentials or tenant mounts were supplied to that smoke container.
+
+Logs: `/tmp/lw-item101/rg1-{build,npm-test,ci-tests,all-ci-tests}.log`.
+This certifies the RG-1 image behavior, not whole-image reproducibility or
+live gateway-to-worker acceptance.
 
 The same restrictive source context is relevant to the Pebble and OpenCode
 image `COPY`/read-only patterns. This change fixes **Kimi**, not all workers;
