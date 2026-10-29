@@ -2619,6 +2619,29 @@ def cross_check_image_digest(
         )
 
 
+def validate_worker_snapshots(variables: dict[str, str], errors: list[str]) -> None:
+    snapshot = variables.get("CI_DEBIAN_SNAPSHOT", "")
+    if not re.fullmatch(r"\d{8}T\d{6}Z", snapshot):
+        errors.append("CI_DEBIAN_SNAPSHOT must be a snapshot timestamp")
+        return
+    if snapshot < "20261024T011300Z":
+        errors.append("CI_DEBIAN_SNAPSHOT predates the CVE-2026-111497 Brotli fixes")
+    for dockerfile in (
+        KIMI_DOCKERFILE, PEBBLE_DOCKERFILE, OPENCODE_DOCKERFILE, OPENCODE2_DOCKERFILE,
+    ):
+        if not dockerfile.is_file():
+            errors.append(f"{dockerfile} missing; cannot cross-check CI_DEBIAN_SNAPSHOT")
+            continue
+        values = re.findall(
+            r"(?m)^\s*(?i:ARG)\s+DEBIAN_SNAPSHOT=(\S+?)\s*$",
+            dockerfile.read_text(encoding="utf-8"),
+        )
+        if not values or {value.strip("\"'") for value in values} != {snapshot}:
+            errors.append(
+                f"{dockerfile} ARG DEBIAN_SNAPSHOT must match CI_DEBIAN_SNAPSHOT"
+            )
+
+
 def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors: list[str]) -> None:
     trust_sensitive = (
         "CI_LINT_IMAGE",
