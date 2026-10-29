@@ -40,11 +40,10 @@ The launchd installer installs only its user-level service watchdog wrapper and
 LaunchAgent; mt-admin does not install the host-global self-heal pipeline on
 launchd.
 
-> **Scheduling ownership:** the self-heal pipeline is scheduled exclusively by
-> `add-tenant` / `ensure_health_pipeline()`. The `install-lunarwing-watchdog.sh`
-> installer copies the self-heal scripts to `/usr/local/sbin` on systemd and
-> OpenRC but never schedules them. On a host where the watchdog installer ran
-> but `add-tenant` has not, the scripts are on disk but unscheduled.
+> **Scheduling ownership:** `ensure_health_pipeline()` owns the schedule,
+> reached by `add-tenant`, the fleet enabler, and refresh of an already-installed
+> pipeline during upgrade. `install-lunarwing-watchdog.sh` only copies the
+> self-heal scripts on systemd/OpenRC; that copy alone does not schedule them.
 
 ## Two distinct "watchdogs" (don't conflate them)
 
@@ -107,9 +106,11 @@ of tenant provisioning (unless `--no-health` is passed). This function:
      (default: every 15 min). The oneshot is explicitly bounded with
      `TimeoutStartSec=max(900s, interval)` — the ~90s distro default can kill a
      legitimate multi-tenant remediation mid-restart, and a wedged tenant user
-     bus must never stall the pipeline forever (a killed run is replayed via
-     `Persistent=true`). Per-tenant user-bus calls inside self-heal are
-     individually bounded too (`SELF_HEAL_SYSTEMD_PROBE_TIMEOUT`, default 15s).
+     bus must never stall the pipeline forever. `Persistent=true` catches up a
+     calendar activation missed while the timer was inactive; it does not replay
+     a failed/killed oneshot immediately. The next scheduled run observes health
+     again. Per-tenant user-bus calls are individually bounded too
+     (`SELF_HEAL_SYSTEMD_PROBE_TIMEOUT`, default 15s).
    - **OpenRC**: installs a managed `fcron`/`crontab` entry every 5 min
      (managed block).
 
