@@ -425,22 +425,24 @@ Then restart the daemon so `on_start` re-resolves.
 
 ## 7. Rollout note
 
-These changes split across three artifacts:
+The channel has three separately deployed artifacts:
 
-- **Host** (log mapping, `MissedTickBehavior`): `cargo build --release --bin lunarwing` → deploy binary.
-- **WASM channel** (long-poll consumer, **mirror-loop tag filter `tags_allow_ingest`**, per-call
-  HTTP timeouts, `network_allowed`, caps key): `scripts/build-wasm-extensions.sh` →
-  `lunarwing-mt-admin.sh install-wasm <tenant>`.
-- **Adapter** (`ws_adapter.py`: `/api/wait`, global event log, `/api/health` cursor, **first-line
-  capture for new buffers**, **post-restart replay**): a plain Python file that runs from the
-  **tenant's own clone**, so it ships with a `git pull` in the tenant home and takes effect when
-  its service restarts.
+- **Daemon binary:** host callback scheduling, log-level mapping, and WASM runtime.
+- **WASM channel plus capabilities:** long-poll consumer, mirror-loop filtering,
+  HTTP timeouts, network selection, and setup defaults.
+- **Tenant-clone adapter:** `ws_adapter.py` owns `/api/wait`, the event log,
+  new-buffer first-line capture, and post-restart replay.
 
-The adapter and WASM must update **together** (the WASM probes `/api/health` for the adapter's
-`event_cursor` and only long-polls if present; otherwise it falls back to polling). Per tenant:
-`git pull` in the tenant home → `build-tenant <t> --with-wasm` → `install-wasm <t>` →
-`restart-tenant <t>` (restarts both the daemon and the adapter service). New tenants created via
-`add-tenant` get all three from the start. No behavior changes until they are redeployed.
+Use mt-admin's documented `upgrade-tenant <tenant> --target <reviewed-ref>` flow
+for an existing tenant rather than pulling or restarting individual services by
+hand. A deliberately staged build uses `build-tenant <tenant> --with-wasm`,
+`install-wasm <tenant>`, and `restart-tenant <tenant>` after the tenant source has
+been advanced through the supported lifecycle. The same entry point supports
+systemd user managers and OpenRC.
+
+Keep adapter and WASM versions coordinated: the guest probes `/api/health` for
+`event_cursor` and falls back to polling when absent. Updating this reference
+alone changes no deployed artifact.
 
 ---
 
