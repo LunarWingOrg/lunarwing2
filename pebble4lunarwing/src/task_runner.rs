@@ -495,7 +495,7 @@ pub async fn delegate_task(
                         let terminal = value["op"] == "result";
                         let event = if terminal {
                             if timed_out {
-                                envelope.payload["status"] = json!("timeout");
+                                envelope.payload["status"] = json!("timed_out");
                                 envelope.payload["error"] = json!("task exceeded its bridge deadline");
                             }
                             ExecutorEvent::Result(envelope)
@@ -605,6 +605,84 @@ mod tests {
             let start = Instant::now();
             assert!(ping(&socket).await.is_err(), "{label} peer must fail");
             assert!(start.elapsed() < Duration::from_secs(4));
+            responder.abort();
+            std::fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn framing_rejects_oversized_unterminated_and_non_utf8_lines() {
+        let cap = runner_line_cap().expect("line cap");
+        for bytes in [
+            vec![b'x'; cap + 1],
+            b"unterminated".to_vec(),
+            vec![0xff, b'\n'],
+        ] {
+            let mut reader = bytes.as_slice();
+            assert!(next_line(&mut reader, &mut Vec::new()).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn delegation_bounds_acceptance_and_rejects_invalid_frames() {
+        for (label, frames, succeeds) in [
+            ("silent", None, false),
+            ("malformed", Some("null\n".to_string()), false),
+            ("closed", Some(String::new()), false),
+            (
+                "foreign",
+                Some(format!(
+                    "{}\n{}\n",
+                    json!({"op":"result", "envelope":protocol::result_envelope("foreign", "success", "wrong", None, 0)}),
+                    json!({"op":"result", "envelope":protocol::result_envelope("expected", "success", "correct", None, 0)}),
+                )),
+                true,
+            ),
+        ] {
+            let root =
+                std::env::temp_dir().join(format!("pbr-client-{label}-{}", std::process::id()));
+            std::fs::create_dir_all(&root).expect("create client root");
+            let socket = root.join("runner.sock");
+            let listener = UnixListener::bind(&socket).expect("bind client listener");
+            let responder = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept client");
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.expect("read request");
+                let Some(frames) = frames else {
+                    sleep(Duration::from_secs(10)).await;
+                    return;
+                };
+                let mut stream = reader.into_inner();
+                stream
+                    .write_all(b"{\"op\":\"accepted\",\"ok\":true,\"task_id\":\"expected\"}\n")
+                    .await
+                    .expect("accept run");
+                stream
+                    .write_all(frames.as_bytes())
+                    .await
+                    .expect("write frames");
+            });
+            let request = TaskRequest {
+                task_id: "expected".to_string(),
+                prompt: "probe".to_string(),
+                context: crate::protocol::TaskContext::default(),
+                timeout_ms: Some(10_000),
+            };
+            let (events, mut received) = mpsc::unbounded_channel();
+            let (_cancel, cancellation) = oneshot::channel();
+            let start = Instant::now();
+            let result = delegate_task(&socket, &request, None, events, cancellation).await;
+            assert_eq!(result.is_ok(), succeeds, "{label}: {result:?}");
+            assert!(start.elapsed() < Duration::from_secs(4));
+            if succeeds {
+                let ExecutorEvent::Result(result) = received.recv().await.expect("result event")
+                else {
+                    panic!("expected result")
+                };
+                assert_eq!(result.payload["output"], "correct");
+                assert!(received.recv().await.is_none());
+            }
             responder.abort();
             std::fs::remove_dir_all(root).ok();
         }
