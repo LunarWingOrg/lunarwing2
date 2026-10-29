@@ -575,7 +575,7 @@ case "${1:-} ${2:-}" in
   'pod exists') [[ -f "$state/present" ]] ;;
   'pod create')
     touch "$state/present"
-    printf '%s\n' "${FAKE_INFRA_IMAGE:-localhost/podman-pause:5.8.2}" >"$state/image"
+    printf '%s\n' "${FAKE_INFRA_IMAGE-localhost/podman-pause:5.8.2}" >"$state/image"
     printf 'false\n' >"$state/running"
     ;;
   'pod start') printf 'true\n' >"$state/running" ;;
@@ -592,6 +592,7 @@ case "${1:-} ${2:-}" in
     case "${3:-}" in
       *IsInfra*) printf 'true\n' ;;
       *ImageName*) cat "$state/image" ;;
+      *Rootfs*) printf '%s\n' "${FAKE_NATIVE_PAUSE-|/catatonit|[\"-P\"]|[]|/run/user/1000/libpod/tmp/infra-container}" ;;
       *State.Running*) cat "$state/running" ;;
       *NetworkSettings.Networks*) printf 'lw-egress-alpha\n' ;;
       *) exit 64 ;;
