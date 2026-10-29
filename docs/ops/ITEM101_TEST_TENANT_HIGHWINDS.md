@@ -113,12 +113,12 @@ logs: `/tmp/lw-item101/add.log` and `/tmp/lw-item101/deploy.log`.
 The XMPP bridge's release compile also finished successfully in 10m27s. The
 current stage is building the tenant's WASM extensions; fat worker images and
 the subsequent `start-tenant` stage have not started. No worker acceptance task
-has been dispatched at this point. WASM compilation has reported eight tool
-artifacts complete (`cavepony-tool`, `gitlab`, `gotify`, `llm-context`,
-`multica-bridge`, `ssh`, `vision-analyze`, `voice-transcribe`); it is currently
-building `web-search`. One of nine tools and all four WASM channels are still
-pending. These are partial results only, not a claim that the WASM set is
-complete. Redacted local build log:
+has been dispatched at this point. All nine WASM tool artifacts are complete
+(`cavepony-tool`, `gitlab`, `gotify`, `llm-context`, `multica-bridge`, `ssh`,
+`vision-analyze`, `voice-transcribe`, `web-search`). Channel builds have begun:
+`darkirc` completed and `multica` is building; `weechat` and `xmpp` remain.
+These are partial results only, not a claim that the full WASM set is complete.
+Redacted local build log:
 `/tmp/lw-item101/deploy.log`.
 
 **Pre-build source-root finding (image labels pending):** the tenant clone is at
