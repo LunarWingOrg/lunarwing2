@@ -91,7 +91,7 @@ RUN set -eu; \
       "deb http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ bookworm-security main" \
       > /etc/apt/sources.list; \
     apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update; \
-    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install -y --no-install-recommends ca-certificates git curl; \
+    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install -y --no-install-recommends ca-certificates git curl procps tini; \
     rm -rf /var/lib/apt/lists/* \
       /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache
 
@@ -292,4 +292,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
 
 USER 10004:10004
 
-ENTRYPOINT ["entrypoint.sh"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
