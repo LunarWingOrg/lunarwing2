@@ -670,11 +670,12 @@ EOF
 
 render_worker_task_quadlet() {
   local name="$1" worker="$2" workspace_dir="$3"
-  local qdir task_container ipc_volume task_uid egress_network egress_ruleset egress_guard egress_chain egress_subnet egress_mappings
+  local qdir task_container ipc_volume task_uid egress_network egress_ruleset egress_guard egress_chain egress_subnet egress_mappings health_command
   qdir="$(tenant_quadlet_dir "$name")"
   task_container="$(worker_task_container_name "$worker" "$name")"
   ipc_volume="$(worker_ipc_volume_name "$worker" "$name")"
   task_uid="$(worker_task_uid "$worker")"
+  health_command="$(worker_task_health_command "$worker" "$name")" || return 1
   egress_network="$(worker_egress_network_name "$name")"
   egress_ruleset="$(worker_egress_ruleset_path "$name")"
   egress_guard="$WORKER_EGRESS_GUARD"
@@ -748,7 +749,7 @@ EOF
       index=$((index + 2))
     done
     cat <<EOF
-HealthCmd=test -S /run/lunarwing-shared/runner/task-runner.sock || exit 1
+HealthCmd=${health_command}
 HealthInterval=15s
 HealthTimeout=5s
 HealthRetries=3
