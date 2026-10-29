@@ -5,6 +5,31 @@ Several container images provide sandboxed and persistent job execution for Luna
 Nanocode is retired and has no active source, build, or runtime image definition.
 See [`NANOCODE-REMOVAL.md`](NANOCODE-REMOVAL.md) for upgrade behavior.
 
+## Brotli security refresh (WI#514, 2026-10-29)
+
+Master pipeline 6719's four worker scans each found CVE-2026-111497 in
+`libbrotli1`. All four Dockerfiles and `CI_DEBIAN_SNAPSHOT` now use
+`20261024T011300Z`: bookworm selects `1.0.9-2+deb12u1`, trixie
+`1.1.0-2+deb13u1`. The validator binds every worker's snapshot to CI and
+rejects older snapshots. The three existing scan suppressions were re-checked
+against these indexes and Debian's tracker; Brotli is not suppressed.
+
+The bundled decoders need separate pins because an OS-package scan does not
+cover them. Kimi's builder/runtime and `CI_NODE_IMAGE` use Node `22.23.4`
+(index `sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da`),
+whose [security release](https://nodejs.org/en/blog/release/v22.23.4) backports
+the Brotli fix; its `process.versions.brotli` still reports `1.1.0`. Both
+OpenCode builders/runtimes and `CI_BUN_IMAGE` use Bun `1.4.4`
+(index `sha256:93d5032fe06d163427822dc1598f420363759bb18155c9cc90eb1be05a64a19e`).
+The image's source revision `38afee6c` pins
+[Brotli v1.2.1](https://github.com/oven-sh/bun/blob/38afee6c84fcf48c0edb2466aa4b27d287a59c30/scripts/build/deps/brotli.ts),
+replacing Bun 1.4.2's vulnerable v1.1.0. Both OCI indexes include amd64 and arm64.
+
+Rebuild worker images and recreate tenant containers to deploy these fixes.
+Protected candidate reproducibility and all four scan jobs must pass before
+promotion; local runtime/package checks do not replace those gates. WI#514
+stays open until that protected pipeline acceptance is recorded.
+
 ## Hub-handshake credential boundary (WI#373)
 
 Every worker container receives `AGENT_AUTH_TOKEN` — the tenant-scoped
