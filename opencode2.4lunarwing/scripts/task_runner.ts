@@ -397,8 +397,11 @@ export class TaskRunner {
       }
     })
     try {
+      const { resolveTaskWorkspace } = await import("./workspace_path")
+      const workspace = resolveTaskWorkspace(taskRequest.context, process.env.WORKSPACE_ROOT || "/workspace")
+      const prepared = { ...taskRequest, context: { ...taskRequest.context, project_dir: workspace } }
       await executeTask(
-        taskRequest,
+        prepared,
         (progress: TaskProgress) => this.writeLine(conn, { op: "progress", progress }),
         (result: TaskResult) => {
           this.writeLine(conn, { op: "result", result })
