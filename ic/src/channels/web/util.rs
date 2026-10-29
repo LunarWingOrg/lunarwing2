@@ -451,6 +451,63 @@ mod tests {
     }
 
     #[test]
+    fn recovery_markers_are_bound_to_the_original_user_message() {
+        let first = make_msg("user", "delegate once", 0);
+        let second = make_msg("user", "later unrelated turn", 1000);
+        let marker = serde_json::json!({
+            "user_message_id": first.id, "state": "Retrying", "completed_at": null,
+            "recovery": {"failure_kind": "repl_argument_corruption", "recovery_state": "retrying",
+                "recovery_attempt": 1, "error": "Wait for the job id; do not re-dispatch."},
+        });
+        let turns = build_turns_from_db_messages(&[
+            first,
+            second,
+            make_msg("turn_recovery", &marker.to_string(), 2000),
+            make_msg("assistant", "second turn response", 3000),
+        ]);
+        assert_eq!(turns.len(), 2);
+        let first = serde_json::to_value(&turns[0]).unwrap();
+        assert_eq!(first["state"], "Retrying");
+        assert_eq!(first["failure_kind"], "repl_argument_corruption");
+        assert_eq!(first["recovery_state"], "retrying");
+        assert!(first["completed_at"].is_null());
+        assert_eq!(turns[1].state, "Completed");
+        assert!(turns[1].recovery.is_none());
+        assert_eq!(turns[1].response.as_deref(), Some("second turn response"));
+    }
+
+    #[test]
+    fn latest_recovery_marker_wins_without_breaking_tool_history() {
+        let user = make_msg("user", "delegate once", 0);
+        let mut messages = vec![user.clone()];
+        for (index, state, recovery_state) in [
+            (1, "Retrying", "retrying"),
+            (2, "Processing", "recovered"),
+            (3, "Failed", "failed"),
+        ] {
+            let marker = serde_json::json!({
+                "user_message_id": user.id, "state": state, "completed_at": "terminal timestamp",
+                "recovery": {"failure_kind": "repl_argument_corruption", "recovery_state": recovery_state,
+                    "recovery_attempt": 1, "error": "Safe classification"},
+            });
+            messages.push(make_msg("turn_recovery", &marker.to_string(), index));
+        }
+        messages.push(make_msg("turn_recovery", "malformed marker", 4));
+        messages.push(make_msg(
+            "tool_calls",
+            r#"[{"name":"create_job","result_preview":"job id"}]"#,
+            5,
+        ));
+        messages.push(make_msg("assistant", "terminal error", 6));
+        let turns = build_turns_from_db_messages(&messages);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].state, "Failed");
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        assert_eq!(turns[0].response.as_deref(), Some("terminal error"));
+        assert_eq!(turns[0].recovery.as_ref().unwrap().recovery_state, "failed");
+    }
+
+    #[test]
     fn test_build_turns_backward_compatible() {
         let messages = vec![
             make_msg("user", "Hello", 0),
