@@ -1403,6 +1403,12 @@ build_opencode2_worker() {
       fi
       layer_args=(--layers=false)
     fi
+    # --network=host: podman's default build network can't reach the internet
+    # for RUN steps on this host; the host netns has IPv4. Consequence (WI#511):
+    # every RUN step in the worker images shares the HOST socket table, so a
+    # build-time listener check must scope itself — the opencode2 runtime smoke
+    # does that with `RUN --network=none` (its own private netns, loopback up)
+    # rather than trying to attribute host listeners to a uid.
     podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" --build-arg "LUNARWING_WRAPPER_SHA256=$wrapper_anchor" --network=host --format docker "${identity_args[@]}" -t "$candidate_tag" "$opencode2_dir" \
       || { rm -f "$iid_file"; die "opencode2 worker image build failed"; }
   else

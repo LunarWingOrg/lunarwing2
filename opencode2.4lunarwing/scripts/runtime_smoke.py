@@ -3,10 +3,12 @@
 
 WI#357 control 6 said the runtime smoke "extends WI#345", and WI#345 was
 closed as a stub with no suite behind it, so nothing asserted the *running*
-lane's exposure surface. This suite is that check: it verifies the built
-image (``--profile build``, run from the Dockerfile's self-test chain, i.e.
-the protected candidate stage) and a live tenant container
-(``--profile container --container NAME``) against the same five assertions:
+lane's exposure surface. This suite is that check: it verifies a real started
+entrypoint (``--profile container``, driven by
+``scripts/runtime_smoke_entrypoint.sh`` from the Dockerfile's candidate-build
+RUN, and by ``mt-admin worker-smoke`` inside a live tenant) and a live tenant
+container driven from the host (``--profile remote --container NAME``) against
+the same five assertions:
 
 1. no ``service.json`` carrying ``remote`` (absent is the private default);
 2. no ``opentunnel`` identity directory under any XDG data/state home;
@@ -19,6 +21,21 @@ and only for a running container. Everything here is a naive-use guard of the
 same class as the wrapper and config pins: the real binary stays executable,
 so a compromised agent can still try. Only the egress allowlist (WI#424
 control 1) holds against that.
+
+WI#511 — the listener check is scoped by NETWORK NAMESPACE, not by uid.
+mt-admin builds every worker with ``podman build --network=host`` (the host
+netns is the only one that can reach the network on those hosts), so the
+candidate-build RUN once read the HOST's socket table and flagged host sshd
+and NetBird listeners as worker exposure. The check logic was always correct;
+only its scope was wrong, and the scope is now fixed at the Dockerfile level:
+the smoke RUN uses ``--network=none``, which gives the step its own private
+netns with loopback up under both podman and rootless BuildKit. Attribution
+by uid was deliberately NOT adopted: the build step also has a private PID
+namespace, so host socket owners are invisible (unattributed sockets would
+still be judged), and any uid-based narrowing would let a listener opened as
+another in-container uid escape the gate. The check itself therefore stays
+exactly as strict as WI#424 wrote it and judges every row of whatever socket
+table its namespace shows.
 
 Exit codes: 0 all checks passed, 1 a check failed, 2 usage/transport error.
 """
