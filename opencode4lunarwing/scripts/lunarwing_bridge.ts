@@ -81,7 +81,7 @@ const toolProxyRelay = new ToolProxyRelay()
 const activePromptQueues = new Map<string, FollowupQueue>()
 
 function taskWorkspace(request: TaskRequest): string {
-  return resolveTaskWorkspace(request.context, WORKSPACE_ROOT)
+  return resolveTaskWorkspace(request.context, WORKSPACE_ROOT, undefined, !bridgeRunnerSocketPath())
 }
 
 function abortSocketTasks(socket: BridgeSocket): void {
