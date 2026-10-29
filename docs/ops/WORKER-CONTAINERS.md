@@ -2035,6 +2035,51 @@ whole-image builds remain the protected worker publication gate.
 
 All worker images use the `lunarwing-agent-v1` WebSocket subprotocol; the legacy `ironclaw-agent-v1` alias is no longer accepted. Messages are JSON envelopes with `id`, `type`, `timestamp`, `payload`. The worker sends `ready` on connect, receives `task_request`, streams `task_progress`, and sends a final `task_result`.
 
+### Gateway delegation recovery: wait for the job id (WI#478)
+
+A rejected model draft is **not necessarily a terminal turn failure**. In
+particular, `repl_argument_corruption` rejects the entire malformed REPL/tool
+response before execution; no tool from that draft runs. The engine can still
+recover with a fresh provider response and dispatch the job minutes later.
+**Wait for the `create_job` result's `job_id` or a terminal turn outcome rather
+than re-dispatching the request.** If the wait is unwanted, use `/interrupt` and
+confirm the turn stopped; also check for an already-created job before retrying.
+This guidance does not add an idempotency key or change job/approval policy.
+
+Affected Engine V2 turns expose these additive, top-level fields in
+`GET /api/chat/history`, including DB-backed/paginated history:
+
+- `failure_kind`: the most recent model failure classification, such as
+  `repl_argument_corruption`; never the raw provider diagnostic or rejected draft.
+- `recovery_state`: `retrying`, `recovered`, `failed`, or `interrupted`.
+- `recovery_attempt`: the engine thread's cumulative model-recovery attempt count.
+- `error`: a safe explanation of the rejection/recovery and what to wait for.
+
+While retrying, the history turn has `state: "Retrying"` and no `completed_at`.
+A successful replacement draft changes it to `Processing` / `recovered`, which
+still does **not** mean a job was created or finished. The final outcome changes
+it to `Completed`, `Failed`, or `Interrupted` and supplies `completed_at`.
+Recovery markers are tied to the originating persisted user-message id, survive
+history reloads, and are not restored into model chat context. Older turns are
+not backfilled from journals.
+
+The user-scoped SSE event `turn_recovery` carries `thread_id`, `failure_kind`,
+`recovery_state`, `recovery_attempt`, and the same safe explanation as `message`:
+
+```json
+{"type":"turn_recovery","thread_id":"…","failure_kind":"repl_argument_corruption","recovery_state":"retrying","recovery_attempt":1,"message":"The model draft was rejected before execution; no tools from that draft ran. Recovery attempt 1 is still running. Wait for the job id or terminal result; do not re-dispatch."}
+```
+
+`retrying` keeps the turn open; `recovered` means provider recovery succeeded,
+not that the delegated job completed. `failed` means bounded model recovery is
+exhausted. Reconnect by reading history rather than treating a missing assistant
+response as permission to send the same delegation again.
+
+For a single delegation, the system/recovery prompt prefers the available
+structured `create_job` tool with a plain-prose `description` and acceptance
+criteria, without markdown fences or nested REPL drafts. Multi-step code work
+can still use the REPL, and malformed-draft rejection remains enabled.
+
 ### Runtime control channel (WI#328)
 
 External worker jobs are no longer fire-and-forget: while a task runs, the daemon can deliver follow-up prompts and text directives into it over the same per-task WebSocket connection. The channel is **capability-gated**: a worker advertises `capabilities: ["task_prompt"]` in its `ready` payload, and the daemon rejects prompts for jobs whose worker never advertised it (`ExternalWorkerControlUnsupported`, HTTP 400) instead of reporting a false "queued". Prompts submitted before the handshake completes are rejected as still-connecting (HTTP 409). Two envelope types extend the protocol:
