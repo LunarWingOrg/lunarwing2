@@ -2071,8 +2071,8 @@ The user-scoped SSE event `turn_recovery` carries `thread_id`, `failure_kind`,
 ```
 
 `retrying` keeps the turn open; `recovered` means provider recovery succeeded,
-not that the delegated job completed. `failed` means bounded model recovery is
-exhausted. Reconnect by reading history rather than treating a missing assistant
+not that the delegated job completed. `failed` means model recovery is unavailable
+or exhausted; no automatic retry is running. Reconnect by reading history rather than treating a missing assistant
 response as permission to send the same delegation again.
 
 For a single delegation, the system/recovery prompt prefers the available
