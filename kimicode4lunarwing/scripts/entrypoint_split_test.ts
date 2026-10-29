@@ -63,6 +63,7 @@ function roleEnv(app: string, report: string, setupReport: string, role: string)
     REPORT_FILE: report,
     SETUP_REPORT: setupReport,
     HOME: join(app, "home"),
+    LUNARWING_TOKEN_DIR: join(app, "home", ".local", "state", "lunarwing"),
     TENSORZERO_API_KEY: "test-llm-key",
   }
 }
