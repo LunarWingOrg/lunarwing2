@@ -5,10 +5,12 @@ x-worker-base: &worker-base
     args:
       WITH_TOOLCHAINS: ${WITH_TOOLCHAINS:-false}
   image: lunarwing-worker-kimi:latest
-  working_dir: /workspace
-  group_add:
-    - "${HOST_GID:-1000}"
+  working_dir: /app
+  user: "10002:10002"
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
   volumes:
+    - kimi-ipc-v2:/run/lunarwing-shared:z
     - kimi-data:/home/kimi/.kimi-code:z
     - ./workspace:/workspace:z
     - ./logs:/var/log/lunarwing:z
@@ -19,8 +21,8 @@ x-worker-base: &worker-base
     - path: ${EXTRA_ENV_FILE:-.env.secrets}
       required: false
   environment: &worker-env
-    # Required bridge bearer credential. KIMI_API_KEY remains optional.
-    AGENT_AUTH_TOKEN: ${AGENT_AUTH_TOKEN:?AGENT_AUTH_TOKEN is required}
+    AGENT_AUTH_TOKEN: ""
+    AGENT_AUTH_TOKEN_FILE: ""
     LUNARWING_WORKER_ID: ${LUNARWING_WORKER_ID:-worker-kimi-01}
     KIMI_API_KEY: ${KIMI_API_KEY:-}
     TENSORZERO_API_KEY: ${TENSORZERO_API_KEY:-}
@@ -43,11 +45,37 @@ x-worker-base: &worker-base
     KIMI_KILL_GRACE_MS: ${KIMI_KILL_GRACE_MS:-7000}
 
 services:
-  lunarwing-worker:
+  lunarwing-task:
     <<: *worker-base
     command: ["--mode", "websocket"]
     environment:
       <<: *worker-env
+      LUNARWING_CONTAINER_ROLE: split-task
+      KIMI_MODE: websocket
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/node", "/app/scripts/task_runner.js", "--healthcheck", "/run/lunarwing-shared/runner/task-runner.sock"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 90s
+    restart: unless-stopped
+
+  lunarwing-worker:
+    <<: *worker-base
+    user: "10102:10002"
+    env_file: []
+    volumes:
+      - ./workspace:/workspace:z
+      - kimi-ipc-v2:/run/lunarwing-shared:z
+    depends_on:
+      lunarwing-task:
+        condition: service_healthy
+    command: ["--mode", "websocket"]
+    environment:
+      LUNARWING_CONTAINER_ROLE: split-bridge
+      AGENT_AUTH_TOKEN: ${AGENT_AUTH_TOKEN:?AGENT_AUTH_TOKEN is required}
+      WORKSPACE_ROOT: /workspace
+      KIMI_KILL_GRACE_MS: ${KIMI_KILL_GRACE_MS:-7000}
       KIMI_MODE: websocket
       WS_ROLE: server
       HEALTH_PORT: ${HEALTH_PORT:-8443}
@@ -95,3 +123,4 @@ services:
 
 volumes:
   kimi-data:
+  kimi-ipc-v2:
