@@ -253,10 +253,28 @@ RUN mkdir -p /home/kimi/.kimi-code \
              /app/results \
     && chown -R kimi:kimi /home/kimi /workspace /var/log/lunarwing /app/results
 
-# WI#206: the baked policy (guard config + PreToolUse hook) must not be
-# editable by the runtime user — tasks run as kimi, so dropping write
-# access means a task inside the container cannot strip its own guard.
-RUN chmod -R a-w /app/config /app/hooks && chmod a-w /app/entrypoint.sh /app/entrypoint-task-setup.sh
+# WI#206: task-side inputs must be readable but remain root-owned and read-only.
+RUN set -eu; \
+    chmod -R a+rX /app/config /app/hooks /app/scripts; \
+    chmod a+r /app/health_server.py /app/task_runner_bind.py /app/agent_comm_protocol.json; \
+    chmod 0555 /app/entrypoint.sh /app/entrypoint-task-setup.sh /app/health_server.py; \
+    chmod -R a-w /app/config /app/hooks /app/scripts \
+      /app/health_server.py /app/task_runner_bind.py /app/agent_comm_protocol.json; \
+    probe_dir="$(mktemp -d)"; \
+    trap 'rm -rf "$probe_dir"' EXIT; \
+    chown 10002:10002 "$probe_dir"; \
+    test -z "$(find -L /app/config /app/hooks /app/scripts /app/entrypoint.sh /app/entrypoint-task-setup.sh \
+      /app/health_server.py /app/task_runner_bind.py /app/agent_comm_protocol.json \
+      \( ! -uid 0 -o -perm /222 \) -print)"; \
+    setpriv --reuid=10002 --regid=10002 --clear-groups \
+      find -L /app/config /app/hooks /app/scripts /app/entrypoint.sh /app/entrypoint-task-setup.sh \
+      /app/health_server.py /app/task_runner_bind.py /app/agent_comm_protocol.json \
+      -type f -exec cat -- {} + >/dev/null; \
+    setpriv --reuid=10002 --regid=10002 --clear-groups \
+      env -i PATH="$PATH" HOME="$probe_dir" KIMI_CODE_HOME="$probe_dir/state" \
+      KIMI_BASE_URL=https://example.test/v1 /app/entrypoint-task-setup.sh; \
+    test -s "$probe_dir/state/config.toml"; \
+    test -s "$probe_dir/state/mcp.json"
 
 # ── ports ──────────────────────
 EXPOSE 8443
