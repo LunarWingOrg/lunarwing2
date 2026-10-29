@@ -4,7 +4,7 @@
 
 - `darkirc_channel_for_lunarwing/darkirc/src/lib.rs`: `rfc1459_casefold`,
   `darkirc_principal`, and inbound DM scope construction.
-- `lunarwing_weechat_wss/weechat_relay/src/lib.rs`: `sender_identity`,
+- `lunarwing_weechat_wss/weechat_relay/src/lib.rs`: `weechat_sender_identity`,
   `extract_account_from_tags`, `sender_allowed_by_policy`, and inbound scope
   construction. These two channel trees are also exposed through symlinks under
   `ic/channels-src/`.
