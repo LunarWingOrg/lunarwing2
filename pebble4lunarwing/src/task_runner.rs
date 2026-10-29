@@ -578,6 +578,10 @@ mod tests {
 
     #[tokio::test]
     async fn real_runner_round_trip_returns_executor_result() {
+        if tool_proxy::bridge_uid().expect("test process uid") == 0 {
+            eprintln!("skipping real runner round-trip: task runner must not run as root");
+            return;
+        }
         let root = std::env::temp_dir().join(format!("pbr-roundtrip-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("create round-trip root");
         let stub = root.join("pebble-stub");
@@ -631,6 +635,10 @@ mod tests {
 
     #[tokio::test]
     async fn delegated_cancel_returns_a_terminal_result() {
+        if tool_proxy::bridge_uid().expect("test process uid") == 0 {
+            eprintln!("skipping delegated cancellation: task runner must not run as root");
+            return;
+        }
         let root = std::env::temp_dir().join(format!("pbr-cancel-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("create cancel root");
         let stub = root.join("pebble-stub");
