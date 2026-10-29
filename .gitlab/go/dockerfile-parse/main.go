@@ -26,7 +26,7 @@ const (
 	anchorArg       = "ARG LUNARWING_WRAPPER_SHA256="
 	scriptsCopy     = "COPY scripts/ ./scripts/"
 	configCopy      = "COPY config/ ./config/"
-	bootCopy        = "COPY entrypoint.sh health_server.py agent_comm_protocol.json ./"
+	bootCopy        = "COPY entrypoint.sh entrypoint-split.sh health_server.py agent_comm_protocol.json ./"
 )
 
 var (
