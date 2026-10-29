@@ -1394,7 +1394,7 @@
     - **Not claimed:** no live tenant was started or changed in this pass. Fresh-tenant acceptance on the target host and the protected pipeline remain unverified; WI#504 stays open pending operator/maintainer acceptance.
 115. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/516
 116. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/514
-117. [x] work on reserved
+117. [ ] work on WI #511 - this MR was last attempt of that but has REQUEST CHANGES verdict (see the comments in the actual closed MR for more info) - https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2055 
 118. [x] (H) Remaining polish items from massive changes introduced in `Tsuno`
 119. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/509
 120. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/510
