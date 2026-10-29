@@ -128,11 +128,14 @@ reported Cargo/rustc 1.96.1, Go 1.24.3 and rustup 1.28.2. mt-admin then promoted
 the candidate to `lunarwing-worker-pebble:latest` (fat profile, source revision
 `67a96a9dd4380317dd05badda0f357a20c9085bb`).
 
-The fat Kimi image build has begun and its build command records source revision
-`05a2cd90fc34da616c9480b7e7a31ed1da6dc3ef` (the tenant clone); its image label
-and actual toolchain gate are pending. `start-tenant` has not run yet, so neither
-worker acceptance jobs nor their health/listener/egress runtime audits have
-started. Redacted local build log: `/tmp/lw-item101/deploy.log`.
+The fat Kimi image build is in progress and its build command records source
+revision `05a2cd90fc34da616c9480b7e7a31ed1da6dc3ef` (the tenant clone); its
+image label and final build remain pending. The real Kimi CLI contract suite in
+the image build passed **178/178, 0 failed, 0 skipped**, including headless
+invocation/config-hook contracts. The final image's Debian build-toolchain layer
+is now running. `start-tenant` has not run yet, so neither worker acceptance jobs
+nor their health/listener/egress runtime audits have started. Redacted local
+build log: `/tmp/lw-item101/deploy.log`.
 
 **Worker build source-root finding:** at provisioning, the tenant clone is at
 `05a2cd90fc34da616c9480b7e7a31ed1da6dc3ef`. At Pebble image build time, the
