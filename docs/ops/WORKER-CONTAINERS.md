@@ -5,32 +5,51 @@ Several container images provide sandboxed and persistent job execution for Luna
 Nanocode is retired and has no active source, build, or runtime image definition.
 See [`NANOCODE-REMOVAL.md`](NANOCODE-REMOVAL.md) for upgrade behavior.
 
+## Brotli security refresh (WI#514, 2026-10-29)
+
+Master pipeline 6719's four worker scans each found CVE-2026-111497 in
+`libbrotli1`. All four Dockerfiles and `CI_DEBIAN_SNAPSHOT` now use
+`20261024T011300Z`: bookworm selects `1.0.9-2+deb12u1`, trixie
+`1.1.0-2+deb13u1`. The validator binds every worker's snapshot to CI and
+rejects older snapshots. The three existing scan suppressions were re-checked
+against these indexes and Debian's tracker; Brotli is not suppressed.
+
+The bundled decoders need separate pins because an OS-package scan does not
+cover them. Kimi's builder/runtime and `CI_NODE_IMAGE` use Node `22.23.4`
+(index `sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da`),
+whose [security release](https://nodejs.org/en/blog/release/v22.23.4) backports
+the Brotli fix; its `process.versions.brotli` still reports `1.1.0`. Both
+OpenCode builders/runtimes and `CI_BUN_IMAGE` use Bun `1.4.4`
+(index `sha256:93d5032fe06d163427822dc1598f420363759bb18155c9cc90eb1be05a64a19e`).
+The image's source revision `38afee6c` pins
+[Brotli v1.2.1](https://github.com/oven-sh/bun/blob/38afee6c84fcf48c0edb2466aa4b27d287a59c30/scripts/build/deps/brotli.ts),
+replacing Bun 1.4.2's vulnerable v1.1.0. Both OCI indexes include amd64 and arm64.
+
+Rebuild worker images and recreate tenant containers to deploy these fixes.
+Protected candidate reproducibility and all four scan jobs must pass before
+promotion; local runtime/package checks do not replace those gates. WI#514
+stays open until that protected pipeline acceptance is recorded.
+
 ## Hub-handshake credential boundary (WI#373)
 
-Every worker container receives `AGENT_AUTH_TOKEN` — the tenant-scoped
-`WORKER_AUTH_TOKEN` (WI#210: mt-admin mints and persists a scoped token on the
-first lifecycle pass; the gateway bearer is substituted only as a loudly warned
-last resort when the worker env file is unwritable) that authenticates the
-daemon→worker WebSocket handshake. Only the **bridge process** needs it. Task
-code is untrusted, so no task process may inherit it: one value is shared by
-all four worker lanes of the tenant, so a leaked token lets any job
-impersonate the daemon toward **every** worker WebSocket port of that tenant
-(and, where the last-resort fallback still applies, toward the whole gateway
-surface).
+Only the bridge container receives `AGENT_AUTH_TOKEN`, the tenant-scoped
+`WORKER_AUTH_TOKEN` used for the daemon→worker WebSocket handshake. mt-admin
+mints and persists that scoped token on the first lifecycle pass (WI#210);
+the gateway bearer remains a loudly warned last resort when the worker env
+file is unwritable. A leaked token would let a job impersonate the daemon
+toward every worker WebSocket port of that tenant.
 
-What follows is **env hygiene, not a confidentiality boundary** (MR !1586
-run-98 FY-1): the token still lives in the environment of long-lived
-processes that run as the task's own uid — tini (PID 1), the entrypoint
-shell, `health_server.py`, and the bridge (pebble runs as root in-container
-on rootless hosts, and as the tenant uid on rootful hosts since WI#422) —
-so task code can simply read `/proc/1/environ` (same-uid ptrace-read, which
-Yama does not block) and get it back. The strip blocks the *accidental* routes —
-env dumps into transcripts, logs, and LLM context, which is how WI#373 was
-observed — and is the same trust posture as the authority-domain rule below
-(one container = one uid = one authority domain). Real isolation (credential
-out of the container env; tasks under a separate uid from the bridge)
-landed as **WI#400** for the kimi/opencode/pebble lanes — see the
-"Task-uid split (WI#400)" subsection below.
+All four lanes use two non-root containers under different identities
+(WI#454). The bridge writes its token to a private `0400` file under its own
+home, removes the environment variable, and exports only the file pointer to
+the bridge process. The task container has neither that home nor the bridge
+PID namespace mounted. mt-admin filters both `AGENT_AUTH_TOKEN` and
+`AGENT_AUTH_TOKEN_FILE` from task environment files; the task launcher and
+runner refuse a non-empty copy of either before accepting work. Executor
+scrubbing remains defence in depth. The bridge's initial PID 1 environment
+can still carry its input token, but it belongs to the separate bridge
+container and is inaccessible from the task container. See the split
+contract below for IPC and shared-workspace limits.
 
 Each lane enforces the strip at its task-process boundary:
 
@@ -79,298 +98,174 @@ Each lane enforces the strip at its task-process boundary:
   two tool-proxy keys) before the child env is assembled.
   Pinned by a self-exec regression test that carries the token in the parent
   env and probes the real spawned environment through a stub. The one-shot
-  `cli` mode execs under `env -u AGENT_AUTH_TOKEN` (harness-pinned) — this is
-  the only mode today where the strip is total, because `exec env -u …`
-  replaces PID 1 and no long-lived carrier process remains.
+  `cli` mode also removes both hub credential names (harness-pinned).
 
-Residual, deliberate (run-98 FY-1): the strip does **not** hide the token
-from task code that goes looking for it — in lanes without the WI#400 split
-(opencode2 today; every lane's pre-WI#400 image), `/proc/1/environ` and the
-bridge process's environ still contain it (see the env-hygiene paragraph
-above and the authority-domain section below). The OpenCode serve password
-(`OPENCODE_SERVER_PASSWORD`) is necessarily present in the serve process env —
-the server enforces it itself, and task code already runs inside that trust
-boundary. The LLM provider keys (`KIMI_API_KEY`, `TENSORZERO_API_KEY`, …) are
-deliberately *not* stripped: task execution needs them.
+The OpenCode serve password (`OPENCODE_SERVER_PASSWORD`) is present in the
+serve process env because the server enforces it itself. Task code already
+runs inside that task-container authority domain. LLM provider keys
+(`KIMI_API_KEY`, `TENSORZERO_API_KEY`, …) are deliberately task-visible.
+Older images without the split exposed their bridge credentials through
+same-uid `/proc` reads; deploying a source update without rebuilding and
+recreating the worker pair does not repair that old image.
 
-### Task-uid split (WI#400)
+### Non-root bridge and task pairs (WI#454, supersedes WI#400)
 
-The kimi, opencode and pebble lanes now implement WI#400's real isolation on
-rootless podman (the multi-tenant default). The rootful pebble launch is the
-one exception: it runs the whole container as the tenant uid with no
-bridge/task split, by design — see the rootful paragraph at the end of this
-section and "Launch identity (WI#422)" further down.
+Each lane uses the same image for two containers. The image defaults to the
+task identity; mt-admin selects the bridge identity explicitly. Both roles
+run with `--cap-drop ALL` and `--security-opt no-new-privileges`, without
+capability additions or runtime uid switching.
 
-- **Credential out of the environment.** The container entrypoint (root)
-  writes the hub token to `/run/lunarwing/agent_auth_token` (directory
-  `0700` root, file `0400` root), unsets `AGENT_AUTH_TOKEN`, and exports
-  only `AGENT_AUTH_TOKEN_FILE`; the bridge reads the file. Nothing
-  long-lived carries the token in its environment any more.
-- **Tasks under a separate uid.** The bridge stays container root; every
-  spawned task process (and opencode's `serve`, which hosts task code) drops
-  to the image's task uid/gid via
-  `setpriv --reuid --regid --clear-groups --ambient-caps=-all --inh-caps=-all
-  --no-new-privs` (both capability clearances and `no_new_privs` are
-  mandatory: without them the task keeps ambient SETUID/SETGID or regains
-  privilege through a setuid/file-capability binary). `/proc/1/environ`,
-  the bridge's environ, and the token file all give the task uid EACCES.
-  The opencode bridge is exec-ed from the root-owned `/app`, never from the
-  task-writable workspace: bun loads `bunfig.toml` preloads and `.env` from
-  its working directory, so a task-planted file there would otherwise run
-  as root at the next container start (run-170 LP-1). The opencode bridge's
-  credential resolver fails closed when the file pointer is set but the
-  file is unreadable or empty (run-170 LP-4), like the kimi and pebble ones.
-  The pinned identities are validated everywhere they parse (the TS
-  `taskIdentity()` helpers, both entrypoints, the pebble executor): zero or
-  non-numeric ids fail closed, because a zero id would make the drop a
-  no-op while callers keep treating the split as active (LP-17 — added to
-  the WI#400 description 2026-10-20, numbered after the run-170 LP series;
-  the helpers also refuse partially numeric ids like `1000x`, LV-18).
-  Kimi task-side setup (`entrypoint-task-setup.sh`) runs as the task uid —
-  never as root — because everything it writes (`~/.gitconfig`, `~/.ssh`,
-  `$KIMI_CODE_HOME`) is task state.
-- **Trimmed root bridge.** The worker containers run with
-  `--cap-drop=ALL --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER
-  --cap-add=KILL --cap-add=SETUID --cap-add=SETGID` plus
-  `--security-opt no-new-privileges` (both the imperative `_ctr run` paths
-  and the Quadlet `PodmanArgs`; the contracts record `cap-trim` so existing
-  containers force-recreate). The bridge needs: CHOWN for the
-  relay-socket/cron-leaf handoff, SETUID/SETGID for the drop, KILL for
-  timeout/cancel of task-uid children, and DAC_OVERRIDE for cron workspace
-  creation inside the task-owned workspace root (on keep-id rootless, the
-  workspace presents as task-owned 2770). The run-166 root-bridge probe
-  showed each of those five individually required on the pebble lane;
-  FOWNER is not individually required there but is retained for metadata
-  passes (chmod/re-assert) over task-created files the bridge does not own
-  — dropping it is on the table the next time the set is re-proved end to
-  end on every lane. `--bounding-set=-all` is deliberately NOT added to the
-  setpriv drops and `CAP_SETPCAP` is deliberately NOT added to the trim
-  (WI#449 LP-7): the maintainer declined both on 2026-10-22 (run-195
-  follow-up #11230). The ruling states the decision and no reason, so none
-  is recorded here; treat the absence as settled and do not propose LP-7
-  again without a fresh ruling.
-- **Run-170 leftovers landed (WI#449, item 86).** LP-11 pins the kimi/pebble
-  image-user refusals and the opencode/pebble Quadlet `UserNS=` keep-id
-  lines; LP-12 makes the LD-11 absolute-path pins failable; LP-13 is a fix —
-  the socket handoff now chmods before it chowns, so the mode change runs
-  while root still owns the socket and needs no `CAP_FOWNER` (the old
-  lchown-first order made the handoff depend on a droppable capability);
-  LP-14 restricts the `setpriv` resolver to absolute `PATH` entries and
-  extends the loader denylist to glibc's full unsafe-environment list
-  (`GCONV_PATH`/`GLIBC_TUNABLES`/`LOCPATH`/`NLSPATH`/`HOSTALIASES`/
-  `RES_OPTIONS`/`LOCALDOMAIN`/`TZDIR`/`MALLOC_TRACE`, matching in pebble's
-  `is_loader_env_key` and kimi's `dropLoaderEnv` — that parity is ME-3);
-  LP-15 learns the bridge uid from the `Uid:` line of `/proc/self/status`
-  rather than the owner of `/proc/self`, which reads as root for a
-  non-dumpable process; NP-1 makes the *unmapped-task-uid* `EINVAL` from
-  `fchown` permanent, classified at the `fchown` call itself in the kimi and
-  opencode lanes, because no re-dispatch can map the id. The swap-race
-  `EINVAL` that `realpathSync`'s lstat→readlink pair produces stays
-  transient: run-204 NP-1 showed a blanket `EINVAL` rule abandoned a
-  deliberate DS-2 retry, so the classification sits at the errno's source.
-  LP-7 stays declined per #11230.
-  The opencode2 lane's own credential-isolation migration remains WI#454's
-  (the non-root split, item 91) and is not part of these leftovers.
-- **Root-resolved commands come from root-owned PATH entries only
-  (WI#454/ME-1).** The root-launcher images (kimi, opencode) carry NO
-  task-owned directory in the image-wide `ENV PATH` — the task uid's
-  toolchain directories (`/home/<lane>/.cargo/bin`, `/home/<lane>/go/bin`)
-  used to lead it, and since WI#400 the container runs as root: the image
-  HEALTHCHECK, the root entrypoint on an in-place restart, and the bridge's
-  setpriv lookup all resolved through that PATH, so a task-planted file
-  there would run as container root and read the hub credential file. The
-  entrypoints export a fixed root PATH before their first command; the
-  task gets its toolchain directories at the privilege drop instead
-  (`TASK_PATH` on every `as_task`/one-shot exec, the kimi executor's child
-  env), and each healthcheck pins the absolute `/usr/bin/curl`. The kimi
-  bridge's `resolveFromBridgePath` skips a candidate that is not root-owned
-  or sits in a group-/world-writable directory when the resolver itself
-  runs as root (unprivileged host dev runs keep the plain lookup). Pins:
-  the Dockerfile/entrypoint shape pins in `test-mt-admin-kimi.sh`
-  (mutation-verified), the TS resolver pin, and the harness's root-only
-  drop-argv pin. Pebble needed none of this (its PATH entries are
-  root-owned); opencode2 is unaffected (still `USER 10003:10003`). The
-  maintainer's no-root policy (note #10954 on !1829) retires this whole
-  root-bridge shape in favor of two non-root containers per lane — that
-  split is its own work item; until it lands, this closes the ME-1 gap.
-  MI-2 (run-186 review): the opencode image PATH retains
-  `/usr/local/bun-node-fallback-bin` (root-owned 0755, holding
-  `node -> /usr/local/bin/bun`) so task code calling `node`/`npx` still
-  resolves; kimi is unaffected (`node:22` base, `node` in
-  `/usr/local/bin`).
-- **Task-runner delegation (WI#454, kimi lane — first slice of the
-  two-container split).** The maintainer's no-root policy (note #10954 on
-  !1829) retires the root bridge: two non-root containers per lane, a
-  bridge container holding the hub credential and a task container
-  running all task code under a different uid, sharing the workspace
-  volume and talking over a unix socket. The kimi lane now carries the
-  worker-side machinery for that split: a task-runner daemon
-  (`kimicode4lunarwing/scripts/task_runner.ts`) that executes tasks as
-  the task uid (it refuses to start as root — the identity boundary is
-  the uid it runs under, so no setpriv drop is needed), and a bridge-side
-  client (`task_runner_client.ts`) that delegates each task over the
-  socket. The entrypoint rehearses the split inside the current
-  single-container image: with the credential handoff active,
-  `run_task_runner` has root bind the listening socket
-  `/run/lunarwing-runner-sock/task-runner.sock` in a root-only `0700`
-  directory (`kimicode4lunarwing/task_runner_bind.py`), then exec
-  `setpriv` → `/usr/bin/env` → `/usr/local/bin/node task_runner.js` as the
-  task uid with only the listening descriptor inherited
-  (`LUNARWING_TASK_RUNNER_LISTEN_FD`). The credential vars are stripped
-  from what the runner inherits, and the task-uid `0700` directory
-  `/run/lunarwing-runner` keeps only the runner's heartbeat state file.
-  The launcher exports `LUNARWING_TASK_RUNNER_SOCKET` to the bridge, which
-  then routes every task to the unprivileged runner instead of spawning
-  the CLI itself; `KIMI_TASK_RUNNER=skip` (or no credential handoff, the
-  host dev shape) keeps local execution. **Delegation is ON by default
-  whenever the credential handoff is active — maintainer decision,
-  2026-10-22 (run 195 follow-up on !1861): the runner starts whenever the
-  credential handoff is active, and `KIMI_TASK_RUNNER=skip` is the
-  explicit operator escape hatch for host-side dev runs.** The runner
-  never sees the hub credential: the token file is root-only `0400` and
-  the token var was unset before the runner spawn. That unset is now an
-  **enforced contract, not a convention** (WI#454): the runner is the
-  environment store for task code, so `main()` refuses to start when
-  `AGENT_AUTH_TOKEN` or `AGENT_AUTH_TOKEN_FILE` is present and non-empty in
-  its own environment (`presentCredentialKeys` / `startupRefusal`). The
-  credential gate runs before the uid gate, so a root launch that also
-  leaked the token reports the actionable configuration error rather than
-  the uid one, and the gate is pinned in both uid shapes (the image test
-  gate runs as root, where the uid gate would otherwise answer first). A
-  dead runner socket maps to an error `task_result` (the hub is never
-  stranded) and every delegation rejection surfaces as an error result.
-  - **Wire and bounds.** The runner acknowledges acceptance
-    (`{"op":"accepted"}`), reports the CLI's process group
-    (`{"op":"spawned"}`), streams progress and ends with exactly one
-    result. The bridge replaces its handshake deadline with a run deadline
-    of the task's own `timeout_ms` (default 4 h) plus a 60 s margin (no
-    delegated task dies at the 15 s default, NB-13). Delegated tasks
-    execute in the task's own `project_dir` (resolved with the same
-    `resolveTaskWorkspace` the bridge uses, NB-14). The bridge drops runner
-    frames carrying a foreign `task_id` and rejects unknown result
-    statuses (the protocol's `"timed_out"`, not `"timeout"`, NB-15/NC-6).
-    Every runner-socket line, in both directions, is capped at the hub's
-    `WS_MAX_PAYLOAD_BYTES` plus 64 KiB (the same env, so a larger hub cap
-    is honoured end to end); the runner serializes progress and result
-    lines within that cap with the hub envelope's own truncation rule, so
-    a large result reaches the hub truncated exactly as in local
-    execution, never refused (run-200 NL-2/NL-8).
-  - **Cancel, timeouts and runner death (run-200 NL-3).** The bridge frees
-    a task's workspace lock only once the task's CLI is gone. A cancel (or
-    hub disconnect, or an expired run deadline) is sent as
-    `{"op":"cancel"}` on the run's own connection, and the bridge waits
-    (the kill grace plus 5 s) for the run's terminal result, which the
-    runner writes after the executor's SIGTERM→SIGKILL escalation stopped
-    the CLI. The hub then gets `cancelled`, as in local execution (this
-    retires the NC-11 note). A run that ends without a terminal result
-    (the runner died or dropped the connection, the wait timed out) first
-    has its CLI process group SIGKILLed by the bridge and waited for; the
-    bridge signals it only when every live member belongs to the task uid.
-    As in local execution, a process that left the group on purpose
-    (`setsid`) is not tracked.
-  - **The runner's CLI environment (run-200 NL-1).** The runner gets the
-    root-owned launcher PATH, never `TASK_PATH`, and the executor applies
-    the WI#462 order to the CLI it spawns (that PATH first, the task
-    toolchain directories after) and resolves a bare `kimi` only to a
-    root-owned file in a root-owned, non-writable directory of the
-    runner's PATH (WI#463, fail-closed), exactly as on the setpriv path.
-    Without this, one task could plant a `kimi` (or a `node` for the
-    CLI's env-node line) in the task-owned `~/.cargo/bin` that every later
-    task then ran.
-  - **Socket ownership (run-200 NL-7, replaces the NC-10 note).** Because
-    root binds the socket in a root-only directory, the task uid can
-    neither replace the socket path nor connect to it, and a root bridge
-    refuses any runner socket that is not root-owned in a root-owned
-    directory that group and others cannot write. The old task-owned
-    directory let any task stand in for the runner without a race, and
-    the `task_id` checks above never authenticated anything: they only
-    keep one run's frames apart from another's. Node marks inherited
-    descriptors close-on-exec at startup, so the CLI and its tools never
-    inherit the listener (pinned by a test). **Residual (Low):** the
-    runner and every task still share one uid, so task code that may
-    ptrace the runner (or take its descriptor with `pidfd_getfd`) could
-    take the listener over; only the two-container split below removes
-    that.
-  - **Liveness and supervision.** The runner publishes a heartbeat state
-    file (`ready` and `heartbeat_at` only), and `/ready` fails unless it
-    is a JSON object with `ready: true` and a string `heartbeat_at` that
-    parses, is no older than 30 s (three missed 10 s beats) and is no more
-    than 5 s in the future. `/ready` publishes only that liveness, not the
-    socket path or pid (NB-17/NC-7, run-200 NL-6/NL-8). The runner env
-    vars are exported before the health server starts (NC-7). The
-    entrypoint supervises the runner: `$!` is the runner itself (every
-    step of `run_task_runner` execs, NL-4), a runner that exited, became a
-    zombie or was stopped (`SIGSTOP`, NL-5) is killed and restarted, the
-    attempt counter resets when a generation survives 30 s, and the pid
-    file lives in the root-only token directory (NC-9). After five failed
-    restarts the supervisor signals the launcher (`kill -TERM $$` — the
-    subshell forked before `BRIDGE_PID` existed, so it cannot signal the
-    bridge directly), which runs the cleanup trap and stops the bridge,
-    the runner and the health server so the container exits for the
-    orchestrator (run-198 NI-3).
-  - **What remains for the full split** (WI#454's own remaining scope):
-    the image-level separation (bridge container and task container as
-    two mt-admin units under two different non-root uids, with the socket
-    crossing the shared workspace volume and the bridge itself dropping
-    `USER 0:0`), plus the same machinery on the opencode and pebble lanes.
-- **Cron workspace ownership.** The cron bootstrap (`create_cron_workspace`
-  / the TS `resolveTaskWorkspace`) runs in the root bridge, so EVERY
-  directory the walk creates — intermediates and leaf alike, or the task
-  could not create siblings under a root-owned intermediate — is
-  `fchown`'d to the task identity through the `O_DIRECTORY|O_NOFOLLOW`
-  descriptor the walk just opened; pre-existing components are never
-  re-chowned.
-- **Tool-proxy socket directory.** The relay's socket directory stays
-  root-owned `0711` — traversable by the task uid so its shim can connect,
-  but neither listable nor writable, so task code cannot discover, rename,
-  delete, or plant entries among the root bridge's sockets. A symlinked
-  directory is refused instead of followed on every lane (the TS relays
-  check with `lstat` and re-assert ownership through an `O_NOFOLLOW`
-  directory descriptor, run-170 LP-5; pebble also refuses a foreign-owned
-  directory, while the TS relays return a leftover task-owned one to root
-  `0711`). Only the
-  per-task socket is handed to the task identity (mode `0600`, right after
-  bind and before the task spawns); with no identity pinned (host dev runs
-  and tests) the socket is left untouched.
-- **opencode2 is NOT migrated** (its image still runs `USER 10003:10003`
-  and mt-admin's image-user guard continues to require exactly that); it
-  gets its own lane migration, like the pebble split here.
+| Lane | Image task uid:gid | Bridge uid:gid | Task home |
+| --- | --- | --- | --- |
+| opencode | 10001:10001 | 10101:10001 | `/home/opencode` |
+| kimi | 10002:10002 | 10102:10002 | `/home/kimi` |
+| opencode2 | 10003:10003 | 10103:10003 | `/home/opencode2` |
+| pebble | 10004:10004 | 10104:10004 | `/home/pebbletask` |
 
-**Rootful pebble (run-164 KW-5, resolved by WI#422):** on rootful
-runtimes there is no user namespace, so an in-container task uid (10004)
-would be a bare host uid shared by every tenant's pebble lane, and a
-container escape from one tenant's lane would land on write access to every
-tenant's pebble workspace. That design is retired: rootful pebble now runs
-the whole container as the tenant's own uid (`--user`, "Launch identity
-(WI#422)" below) with `PEBBLE_TASK_UID=inherit` and
-`PEBBLE_TASK_GID=inherit`, so each tenant's lane is its own host identity
-and the workspace stays tenant-owned — `prepare_pebble_workspace` never
-chowns it, and a workspace an older create had handed to a task uid is
-refused rather than accepted (the run-166 LD-9 acceptance went away with
-the handoff). The trade-off is explicit: there is no bridge/task split on
-rootful hosts. Task code shares the bridge's identity and environment, so
-the credential boundary WI#400 provides exists on the rootless lane only.
-The entrypoint and the executor accept the `inherit` pair as that declared
-shared-identity launch (a mixed pair fails closed) and keep refusing an
-undeclared one. Rootless podman keep-id is unaffected on the task side (the
-task uid maps to the owning tenant account), and the bridge side is pinned
-by the image: the pebble image now sets `USER 0:0` like kimi and opencode,
-because under keep-id a USER-less image would start the entrypoint and
-bridge as the keep-id uid — the same uid every task drops to — making the
-split a no-op (run-166 LD-8). mt-admin's image-user guard requires `0:0`
-for pebble, and the websocket entrypoint plus the executor both refuse to
-run when the bridge lands on the task uid without the `inherit`
-declaration.
+Container names are `lunarwing-<lane>-<tenant>` for the bridge and
+`lunarwing-<lane>-task-<tenant>` for the runner. The explicit
+`LUNARWING_CONTAINER_ROLE=split-bridge|split-task` selects the launcher;
+wrong, equal or root identities fail closed. Split images refuse an
+unassigned websocket role rather than silently starting both halves under
+the image's task uid. Host development and one-shot CLI/ACP paths retain
+legacy support where no image bridge-identity pin is present.
 
-Note: before WI#400 the pebble image set no `USER`, so under rootless
-keep-id the bridge ran as the tenant uid (not root) even though the
-rootful path looked root-like; with `USER 0:0` the bridge side is now
-container root wherever nothing overrides it — the rootful pebble launch
-does override it with `--user <tenant uid>` (WI#422), which is why that lane
-declares `PEBBLE_TASK_UID=inherit` instead of a split.
+The bridge runs from root-owned `/app` (Pebble's launcher/binary lives in
+`/usr/local/bin`), with a bridge-owned home such as `/home/kimi-bridge`.
+Its default token directory is `$HOME/.local/state/lunarwing` (`0700`), with
+`agent_auth_token` at `0400`. That directory never enters the shared volume.
+The bridge PATH uses image-owned executable locations. Kimi boot files have
+explicit `0555` modes; its config, hooks and compiled scripts have `0555`
+directories and `0444` files independent of build-context umask. OpenCode2's
+parser and out-of-band tar/config checks cover its root-owned boot tree.
 
-**Host-side workspace prep (WI#453, the WI#446 closeout):** the
-kimi/opencode/opencode2 workspace directories live inside the
+**Mounts and environment.** Both roles mount the lane workspace at
+`/workspace` and the lane's private named volume at `/run/lunarwing-shared`.
+The task role receives the SSH-agent mount (except Kimi) and OpenCode Study
+Notes mounts. The bridge receives neither. Generated task runtime and
+override files strip both hub credential names; launchers and runners reject
+any that remain. Kimi and Pebble executors also scrub inherited and
+supplied hub credential keys after env merges. OpenCode bridges reject
+non-empty `context.environment` before delegation, since serve cannot apply
+per-task env grants. OpenCode clients reject non-empty `extraEnv` rather than
+silently dropping it. LLM provider keys remain task-visible because the
+agent needs them. The bridge still receives the lane env, including the LLM
+key, and runtime/override env files are not independently included in the
+container config hash; after changing them, force-recreate the pair through
+mt-admin rather than assuming an existing running container refreshed them.
+
+**IPC ownership.** The volume name is
+`lunarwing-<lane>-<tenant>-ipc-v2`. A fresh volume copies these image modes:
+
+- `/run/lunarwing-shared`: root:task-group `3770`, setgid plus sticky;
+- `runner/`: task:task-group `2711`, containing `task-runner.sock` (`0660`)
+  and the heartbeat state (`0640`);
+- `tool-proxy/`: bridge:task-group `2711`, containing per-task proxy sockets
+  that the task group can connect to.
+
+Sticky ownership prevents task code from replacing the bridge-owned proxy
+directory. Relays refuse symlinked, foreign-owned or writable proxy parents;
+a missing/refused shared proxy fails a delegated task instead of running
+without tools. The runner owns its socket and verifies stale entries before
+unlinking them. Clients check type and expected uid/gid; Pebble also compares
+the socket device/inode around connect. These checks detect drift and races,
+but do not authenticate a same-uid task pretending to be the runner.
+
+**Dispatch, cron and cleanup.** One Unix connection owns one run. It sends
+`run`, receives `accepted`, then bounded progress and one terminal result;
+cancel travels on that connection. Lines are capped at
+`WS_MAX_PAYLOAD_BYTES + 65536`, including a bounded unterminated remainder.
+Oversized output is truncated within the serialized envelope cap. Foreign
+task ids are ignored. OpenCode validates `progress.done` as a boolean;
+v1 follow-ups use the runner's queue without accumulating a second bridge
+queue, and `prompt_refused` leaves the run alive. Run-map cleanup checks
+connection identity before deleting a newer dispatch of the same job id.
+Cron path validation on the OpenCode bridge creates nothing: the task runner
+performs the descriptor-relative, no-symlink mkdir walk as the task uid and
+passes the prepared absolute path to the executor. Kimi and Pebble also
+prepare task workspaces on the task side.
+
+Kimi/OpenCode handshakes are bounded by
+`LUNARWING_TASK_RUNNER_TIMEOUT_MS` (default 15 s); their accepted-run deadline
+is the task timeout plus 60 s. OpenCode cancellation drains for its
+`OPENCODE_SESSION_ABORT_TIMEOUT_MS` (default 5 s, maximum 30 s) plus 5 s.
+Pebble bounds connect, writes and acceptance to 2 s, also polling cancellation
+while writing the run request; its accepted-run deadline is the task timeout
+plus 60 s, followed by at most 12 s cancellation drain. Pebble reports
+`timed_out` for executor/bridge deadlines and `cancelled` for hub cancel.
+Its executor starts a fresh process group, kills remaining group members at
+task end, bounds stderr drain, and the image uses Tini to reap orphans.
+Across separate PID namespaces the bridge cannot kill task processes;
+runner/container shutdown is responsible for them.
+
+**Health, lifecycle and audits.** Task health connects to the socket and
+requires a JSON pong within 2 s and a 1024-byte newline-terminated response;
+`test -S` or a heartbeat file alone is insufficient. Bridge HTTP health
+remains distinct; Python readiness also checks runner heartbeat freshness.
+Systemd user Quadlets start the task before the bridge using `Requires=` and
+`After=` (no `BindsTo=` stop-job trap). OpenRC uses paired health/supervisor
+units. Stop/kill and tenant export quiescence include both roles. A missing
+task unit is harmless, but failure to stop a loaded unit propagates.
+`worker-listeners`, `worker-egress`, host egress health and `worker-smoke`
+inspect both roles. Both are attached to the tenant egress network and
+verified after start; the item-114 namespace keeper remains in force.
+
+**Rootful workspace redirects (QP-4/RH-2).** Rootless keep-id maps the task
+uid to its tenant account. Rootful runtimes use fixed lane uids, so checking
+symlinks only during host preparation is insufficient: the runtime can
+re-resolve the bind source after a tenant replaces it. mt-admin records the
+verified source's device/inode in `LUNARWING_WORKSPACE_ID` and sets
+`LUNARWING_ROOTFUL_WORKSPACE=1` after env overrides on both containers.
+Each launcher compares the mounted workspace before task setup or bridge
+credential staging, including ordinary runtime auto-restarts. A different
+inode, even with the same owner, refuses startup. The `workspace-inode-v1`
+launch-contract suffix recreates rootful containers lacking this pin. If an
+operator deliberately replaces a workspace directory, stop the pair via
+mt-admin, remove the stopped pair from that tenant's runtime store, then
+start it through mt-admin to record the new identity. Preserve the IPC-v2
+volume and workspace contents; a plain restart keeps the old pin and must
+fail. The guard does not restore
+per-tenant host uids after a container escape: rootful lanes still share
+fixed numeric task ids. Prefer rootless keep-id for that additional boundary.
+
+**Authority limit (QP-9).** Every concurrent and successive task in one task
+container shares its uid, loopback serve API, workspace, runner socket and
+grants. A task can signal/trace its runner, replace a task-owned socket or
+leave a process that deliberately escapes the process group. Process-group
+cleanup and inode checks reduce accidental leftovers and races; they do not
+isolate jobs from each other. Use separate worker pairs for different users
+or grant domains. Splitting protects the bridge credential, not one task
+from another task inside the same pair.
+
+**Upgrade and rollback.** Rebuild the lane images, then use mt-admin
+`start-tenant`/`upgrade-tenant` to reconcile paired units and containers.
+Image-id and split launch contracts recreate old containers; the new
+`-ipc-v2` name avoids adopting old writable IPC directories. Never reuse the
+old volume by renaming it. Preserve the workspace; old IPC volumes may be
+removed only after both old roles are stopped. A rollback must restore
+matching image, mt-admin, unit and IPC contracts together, and reinstates the
+older credential model. Protected candidate builds, out-of-band OpenCode2
+verification, whole-image reproducibility and live tenant audits remain
+required before publishing/deploying rebuilt images; local source and runner
+tests do not establish those deployment results.
+
+**Local Compose examples.** Each lane's `docker-compose.yml` starts its
+non-root task service before its bridge using the same IPC-v2 modes and
+bounded task health probe. Only the bridge and the explicit smoke client
+receive the hub credential; task env overrides both hub credential names
+to empty even when an optional env file supplied them. Bridge ports publish
+on loopback. Compose does not install mt-admin's tenant egress firewall,
+init units or rootful workspace identity pin; use mt-admin for managed
+multi-tenant operation. Before running a bind-workspace example, create
+`workspace`, `logs` and `results` owned by the image's mapped task uid/gid
+and grant the workspace task-group access (`2770`). On rootless Podman,
+perform ownership preparation inside `podman unshare`; on Docker, use the
+image's numeric uid/gid. Do not pass the bridge credential to a one-shot CLI
+container. Recreate both services after image/env changes; do not reuse old
+IPC volumes.
+
+**Host-side workspace prep (WI#453, the WI#446 closeout):** all four lane
+workspace directories live inside the
 tenant-controlled `~/lunarwing` tree, so the historical root `mkdir -p` +
 unbounded `chown -R` is gone. `prepare_worker_workspace`
 (`ic/scripts/mt-admin-lib/09-worker-config.sh`) runs the
@@ -961,19 +856,12 @@ re-checked 2026-10-13):
   guard is the only in-CLI enforcement point and stays mandatory.
 - **pebble:** no listeners, pairing, or sharing in upstream
   (nanogpt-community/pebble) — the only `TcpListener` is test code.
-  **Finding (widened per run-79 EI-10; agent side addressed by WI#400/WI#422,
-  WI#425 AC4 open):** the image used to have no `USER` directive, so the agent
-  ran as **root in the container** — beyond `pebble self-update` (fetches
-  GitHub releases, replaces the binary), a root-in-container agent could
-  replace the bridge binary itself and forge audit/bridge output (why control
-  9 reads `/proc` host-side). Today the image pins `USER 0:0`, and the WI#400
-  split (see "Task-uid split (WI#400)" above) drops every spawned pebble
-  process to the task uid via setpriv, so the bridge binary and its root-owned
-  state are out of the agent's reach on the rootless lane. The rootful launch
-  runs the whole container as the tenant uid ("Launch identity (WI#422)") —
-  there the agent shares the bridge's uid, so it can still signal or trace the
-  bridge and read its environment (no split, by design per WI#422). **Bump
-  record (WI#425, 2026-10-26; no upstream ref change):** a PATH-visible
+  **Non-root runtime (WI#454):** the image defaults to `10004:10004`;
+  mt-admin launches a separate `10104:10004` bridge and a task runner with
+  all capabilities dropped on rootless and rootful hosts. The root-owned
+  binary is not writable by either identity. The earlier root-bridge and
+  rootful shared-identity models are superseded by the pair contract above.
+  **Bump record (WI#425, 2026-10-26; no upstream ref change):** a PATH-visible
   refusal wrapper (`pebble4lunarwing/scripts/pebble-self-update-guard.sh`)
   owns `/usr/local/bin/pebble`; the reviewed binary moves to
   `/usr/local/lib/pebble/pebble`. It refuses naive `self-update` and honours
@@ -982,16 +870,11 @@ re-checked 2026-10-13):
   file permissions — not the wrapper — prevent replacement under either
   launch identity. The wrapper is only a naive-use guard, and the GitHub fetch
   remains an egress-allowlist concern (WI#424). Keep the pinned
-  `PEBBLE_LOCK_SHA256` build contract intact. **WI#425 AC4 status: OPEN
-  (run-230 OW-1).** The rootless bridge still runs as container root, so the
-  original non-root-container criterion is not met. Simply changing the bridge
-  to the task uid would collapse WI#400's credential boundary; that trade-off
-  is not a reason to declare AC4 satisfied. The pending maintainer decision is
-  the split into separate non-root bridge and task containers that preserves
-  their distinct identities. The self-update wrapper and root-owned real
-  binary remain appropriate independently of that decision. A rebuilt pebble
-  candidate and a live `mt-admin worker-listeners` audit remain
-  protected-pipeline/deploy evidence.
+  `PEBBLE_LOCK_SHA256` build contract intact. WI#454 implements the non-root
+  container shape requested by WI#425 AC4 without combining bridge and task
+  identities. A rebuilt candidate and live `mt-admin worker-listeners` audit
+  remain protected-pipeline/deploy evidence; local tests do not attest to
+  deployed images.
 
 ## LunarWing Worker
 
@@ -1087,9 +970,17 @@ sudo ic/scripts/lunarwing-mt-admin.sh build-pebble-worker
 
 Persistent worker mode (`PEBBLE_MODE=websocket`). Requires `AGENT_AUTH_TOKEN` for WebSocket auth and optionally `NANOGPT_API_KEY` for the underlying NanoGPT backend (configure per-tenant via `configure-pebble <name> --nanogpt-api-key <key>`). Upstream Pebble v0.5.0 is fetched by its reviewed full commit, both Cargo builds use committed lockfiles, and base images/package indexes/toolchain downloads are pinned. See `pebble4lunarwing/` for details.
 
-Launch identity (WI#422): the image sets `USER 0:0` (WI#400 LD-8, so without an override the container is root), and the runtime re-resolves the `/workspace` bind source at every container start, so whoever the container runs as owns the escalation surface of a tenant-swapped workspace symlink. On rootless podman the bridge runs as in-container root, which maps to the invoking tenant uid — a redirected bind grants nothing the tenant could not already reach. On rootful hosts (docker, or `LUNARWING_MT_ROOTLESS=false`) `start-tenant pebble` therefore launches with `--user <tenant uid>:<gid>` plus `--security-opt no-new-privileges` (the image ships Debian's standard setuid set; with the container non-root the option closes the setuid/file-capability route back to container root, making the uid drop one-way), with `HOME`, `GOPATH`, `GOCACHE`, and `CARGO_HOME` anchored inside the tenant-owned `/workspace` mount (the numeric uid has no in-image passwd entry, and the fat image's `/root/go` and read-only `/usr/local/cargo` are unusable for caches); the distinct `PEBBLE_ROOTFUL_LAUNCH_CONTRACT` (now `tenant-uid-user;workspace-toolchain-home;no-new-privileges;task-uid-inherit`) force-recreates containers created under an older rootful shape once on their next start-tenant. The OpenRC worker unit only `podman start`s the container mt-admin created, so the create-time `--user` is what it runs. One runtime difference on the rootful path: podman synthesizes a passwd entry for `--user` (so `git` can auto-detect an identity), docker does not — `git commit` inside a docker-rootful task therefore fails with "unable to auto-detect email address" until the workspace carries a git identity (a `/workspace/.gitconfig` with `user.name`/`user.email` is enough); `HOME` is set explicitly, so nothing else depends on the missing entry (the image has `git` but no `ssh`).
-
-This is the rootful pebble identity model, and WI#400's bridge/task uid split applies to the rootless lane only. The two are reconciled (run-167 LH-1, run-170 LP-2): on rootful hosts mt-admin passes `-e PEBBLE_TASK_UID=inherit -e PEBBLE_TASK_GID=inherit`, which tells the bridge to run tasks as its own (tenant) identity — no `setpriv`, no root-only credential file (the credential stays in the container environment, the pre-WI#400 shape on this lane), no socket handoff — while the workspace stays tenant-owned (no task-uid `chown`). The pair is distinct from the image's numeric pins (the rootless keep-id split) and from the empty value (fail-closed), so the bridge still refuses a rootless keep-id launch that merely started as the task uid (LD-8). On rootless podman the image runs as container root under `--userns keep-id:uid=10004,gid=10004` and every task drops to 10004 through `setpriv`; both shapes are pinned in `test-mt-admin-worker-image-contract.sh`.
+Launch identity (WI#454, supersedes WI#422): the image defaults to
+`USER 10004:10004`; mt-admin runs the bridge as `10104:10004` and the task
+runner as `10004:10004`, with no capabilities and no new privileges.
+Rootless Podman keeps `--userns keep-id:uid=10004,gid=10004`. Rootful
+launches use the same pair plus the per-start mounted-workspace identity
+gate documented above, replacing the old `PEBBLE_TASK_UID=inherit` exception.
+Task caches live under `/home/pebbletask`; the bridge's private home is
+`/home/pebble-bridge`. The workspace remains shared and setgid. These runtime
+contracts and redirect refusals are pinned by
+`test-mt-admin-worker-image-contract.sh`; a runtime restart of an old image
+does not acquire them.
 
 In the fat (`--with-toolchains`) image the Rust/Go toolchains are anchored against the `/etc/profile` PATH reset in upstream pebble's `/bin/sh -lc` task shell (WI#334): an `/etc/profile.d` snippet plus real-binary `/usr/local/bin` symlinks and a `rustup` wrapper keep `cargo`/`go` on PATH after the reset, proven at build time in both the real spawn mode and a fully sanitised shell, and re-probed by the smoke script at the end of every fat mt-admin build (which targets a candidate tag and re-tags `:latest` only after the probe passes, using the build's own container runtime and `--pull=never`). Re-check any built image or running worker with `pebble4lunarwing/scripts/smoke-task-shell-toolchain.sh image [ref]` / `container <name>`; see `docs/ops/PEBBLE-WORKER.md` "Task-Shell Toolchain PATH".
 
@@ -1201,19 +1092,42 @@ chunk IDs in the executable and leftover randomly named test workspaces.
 The candidate versus uncached-rebuild **whole-image digest comparison remains
 mandatory**; a passing binary check alone does not establish image reproducibility.
 
-WI#510 records a second, current v2.1.2 failure from master pipeline 6658:
-the smoke residue was layer 29, but the Bun-compiled executable in layer 14
-also differed between the candidate and clean rebuild. The two binaries had
-3,293 differing bytes in a table of per-build 64-bit IDs with stable
-`C0000xxxx` suffixes, despite identical Dockerfile, source ref, source SHA and
-`SOURCE_DATE_EPOCH` inputs. The checked `bytecode: false` / `splitting: false`
-profile is the source-level fix for that older split/bytecode ID class. It was
-re-verified here with two independently fresh v2.1.2 clones, rebuilt at the
-same absolute checkout path after clean installs: both binaries were
-byte-identical (local SHA-256 `6c41398f...`; the value is path-dependent and is
-not a portable artifact checksum). Do not mask or otherwise weaken the
-whole-image digest contract; the protected candidate/rebuild pipeline still
-must confirm the merged tree after the smoke tripwire lands.
+WI#510 records the v2.1.2 failure from master pipeline 6658: the smoke
+residue was layer 29, but the Bun-compiled executable in layer 14 also differed
+between candidate and rebuild. The two binaries had 3,293 differing bytes in
+a table of per-build 64-bit IDs with stable `C0000xxxx` suffixes despite
+identical source inputs. The checked `bytecode: false` / `splitting: false`
+profile fixes the older split/bytecode ID class, but that does not establish
+the cause of this intermittent recurrence. Two independently fresh local
+v2.1.2 builds were byte-identical (`6c41398f...`, path-dependent, not a portable
+checksum). WI#510 notes #12550/#12560 record matching binary and smoke layers
+on master 6708; the binary cause remains open, not proven fixed by those
+passes. Never mask bytes or weaken the whole-image digest contract.
+
+Master 6708 exposed a third cause: candidate and rebuild crossed UTC midnight,
+changing the account-creation layer's `/etc/shadow` last-change day. **All four
+worker Dockerfiles now declare `ARG SOURCE_DATE_EPOCH=0` before runtime
+`useradd` and assert in the same `RUN` that the account's shadow day equals
+`SOURCE_DATE_EPOCH / 86400`.** Keep both the stage-local ARG and the assertion;
+a later ARG (the old Kimi layout) cannot affect an earlier `RUN`. CI supplies
+the source commit epoch; plain builds default to day zero. Shadow-utils encodes
+day zero as an empty last-change field; the assertion treats that as zero but
+still refuses a missing shadow entry. BuildKit's `rewrite-timestamp` normalizes
+metadata, not this file content. The regression
+suite `.gitlab/tests/test_worker_reproducibility.py` checks all four scopes,
+executes the shadow assertions with epoch-boundary/incorrect-day fixtures,
+and ties every snapshot to CI. Protected whole-image candidate/rebuild,
+scan and exposure verification on the changed tree remain required.
+
+The four `DEBIAN_SNAPSHOT` defaults and `CI_DEBIAN_SNAPSHOT` now use
+`20261024T011300Z`: its security indexes supply patched `libbrotli1`
+`1.0.9-2+deb12u1` (Bookworm) and `1.1.0-2+deb13u1` (Trixie), fixing
+CVE-2026-111497 without a new Trivy ignore. The three existing dated ignores
+were re-verified against these package indexes and the Debian tracker; their
+expiry dates are unchanged. This snapshot does **not** update Node's statically
+bundled decoder or establish Bun's decoder status: WI#514 still owns those
+base-runtime checks/upgrades and protected scan acceptance. Deployed tenants
+need rebuilt images and recreated containers before any image fix applies.
 
 The build-time self-test `RUN` steps also run under a throwaway
 `HOME`/XDG environment rooted inside the trap-cleaned `/tmp/opencode2-build-tests`
@@ -2034,6 +1948,51 @@ whole-image builds remain the protected worker publication gate.
 ## Shared Protocol
 
 All worker images use the `lunarwing-agent-v1` WebSocket subprotocol; the legacy `ironclaw-agent-v1` alias is no longer accepted. Messages are JSON envelopes with `id`, `type`, `timestamp`, `payload`. The worker sends `ready` on connect, receives `task_request`, streams `task_progress`, and sends a final `task_result`.
+
+### Gateway delegation recovery: wait for the job id (WI#478)
+
+A rejected model draft is **not necessarily a terminal turn failure**. In
+particular, `repl_argument_corruption` rejects the entire malformed REPL/tool
+response before execution; no tool from that draft runs. The engine can still
+recover with a fresh provider response and dispatch the job minutes later.
+**Wait for the `create_job` result's `job_id` or a terminal turn outcome rather
+than re-dispatching the request.** If the wait is unwanted, use `/interrupt` and
+confirm the turn stopped; also check for an already-created job before retrying.
+This guidance does not add an idempotency key or change job/approval policy.
+
+Affected Engine V2 turns expose these additive, top-level fields in
+`GET /api/chat/history`, including DB-backed/paginated history:
+
+- `failure_kind`: the most recent model failure classification, such as
+  `repl_argument_corruption`; never the raw provider diagnostic or rejected draft.
+- `recovery_state`: `retrying`, `recovered`, `failed`, or `interrupted`.
+- `recovery_attempt`: the engine thread's cumulative model-recovery attempt count.
+- `error`: a safe explanation of the rejection/recovery and what to wait for.
+
+While retrying, the history turn has `state: "Retrying"` and no `completed_at`.
+A successful replacement draft changes it to `Processing` / `recovered`, which
+still does **not** mean a job was created or finished. The final outcome changes
+it to `Completed`, `Failed`, or `Interrupted` and supplies `completed_at`.
+Recovery markers are tied to the originating persisted user-message id, survive
+history reloads, and are not restored into model chat context. Older turns are
+not backfilled from journals.
+
+The user-scoped SSE event `turn_recovery` carries `thread_id`, `failure_kind`,
+`recovery_state`, `recovery_attempt`, and the same safe explanation as `message`:
+
+```json
+{"type":"turn_recovery","thread_id":"…","failure_kind":"repl_argument_corruption","recovery_state":"retrying","recovery_attempt":1,"message":"The model draft was rejected before execution; no tools from that draft ran. Recovery attempt 1 is still running. Wait for the job id or terminal result; do not re-dispatch."}
+```
+
+`retrying` keeps the turn open; `recovered` means provider recovery succeeded,
+not that the delegated job completed. `failed` means model recovery is unavailable
+or exhausted; no automatic retry is running. Reconnect by reading history rather than treating a missing assistant
+response as permission to send the same delegation again.
+
+For a single delegation, the system/recovery prompt prefers the available
+structured `create_job` tool with a plain-prose `description` and acceptance
+criteria, without markdown fences or nested REPL drafts. Multi-step code work
+can still use the REPL, and malformed-draft rejection remains enabled.
 
 ### Runtime control channel (WI#328)
 

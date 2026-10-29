@@ -1329,6 +1329,7 @@ WORKER_TS_LANE_SCRIPTS = {
             "bun scripts/lunarwing_bridge_test.ts",
             "bun scripts/lunarwing_tool_proxy_test.ts",
             "bun scripts/lunarwing_tool_plugin_test.ts",
+            "bun test scripts/task_runner_test.ts",
             "bun scripts/opencode_task_executor_test.ts",
             "./node_modules/.bin/tsc --noEmit -p scripts/tsconfig.json",
         ),
@@ -2619,6 +2620,38 @@ def cross_check_image_digest(
         )
 
 
+def validate_worker_snapshots(variables: dict[str, str], errors: list[str]) -> None:
+    snapshot = variables.get("CI_DEBIAN_SNAPSHOT", "")
+    if not re.fullmatch(r"\d{8}T\d{6}Z", snapshot):
+        errors.append("CI_DEBIAN_SNAPSHOT must be a snapshot timestamp")
+        return
+    minimum_snapshot = "20261024T011300Z"
+    if snapshot < minimum_snapshot:
+        errors.append("CI_DEBIAN_SNAPSHOT predates the CVE-2026-111497 Brotli fixes")
+    for dockerfile in (
+        KIMI_DOCKERFILE, PEBBLE_DOCKERFILE, OPENCODE_DOCKERFILE, OPENCODE2_DOCKERFILE,
+    ):
+        if not dockerfile.is_file():
+            errors.append(f"{dockerfile} missing; cannot cross-check CI_DEBIAN_SNAPSHOT")
+            continue
+        values = re.findall(
+            r"(?m)^\s*(?i:ARG)\s+DEBIAN_SNAPSHOT=(\S+?)\s*$",
+            dockerfile.read_text(encoding="utf-8"),
+        )
+        normalized = {value.strip("\"'") for value in values}
+        if not normalized or normalized != {snapshot}:
+            errors.append(
+                f"{dockerfile} ARG DEBIAN_SNAPSHOT must match CI_DEBIAN_SNAPSHOT"
+            )
+        if any(
+            not re.fullmatch(r"\d{8}T\d{6}Z", value) or value < minimum_snapshot
+            for value in normalized
+        ):
+            errors.append(
+                f"{dockerfile} ARG DEBIAN_SNAPSHOT predates the CVE-2026-111497 Brotli fixes"
+            )
+
+
 def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors: list[str]) -> None:
     trust_sensitive = (
         "CI_LINT_IMAGE",
@@ -2952,6 +2985,7 @@ def main() -> int:
     validate_trivy_gate_inputs(merged_config, errors)
     validate_deliverables_manifest(merged_config, errors)
     validate_ci_tool_image_pins(merged_config, merged_variables, errors)
+    validate_worker_snapshots(merged_variables, errors)
     rust_image = extract_rust_image(defaults, ".rust-job", merged_variables)
     msrv_image = extract_rust_image(defaults, ".rust-msrv-job", merged_variables)
     if rust_image is None:

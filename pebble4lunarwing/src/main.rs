@@ -3,6 +3,7 @@ mod executor;
 mod health;
 mod mcp_shim;
 mod protocol;
+mod task_runner;
 mod tool_proxy;
 mod workspace_path;
 
@@ -15,6 +16,41 @@ async fn main() {
     // CLI spawns per task via the baked mcpServers.lunarwing registration.
     if std::env::args().nth(1).as_deref() == Some("mcp-shim") {
         mcp_shim::run().await;
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("task-runner-ping") {
+        let socket = std::env::args().nth(2).unwrap_or_default();
+        if socket.is_empty() {
+            eprintln!("[pebble4lunarwing] task-runner-ping requires a socket path");
+            std::process::exit(1);
+        }
+        if let Err(error) = task_runner::ping(std::path::Path::new(&socket)).await {
+            eprintln!("[pebble4lunarwing] task runner health check failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("task-runner") {
+        let socket = std::env::args()
+            .nth(2)
+            .or_else(|| std::env::var("LUNARWING_TASK_RUNNER_SOCKET").ok())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| {
+                eprintln!("[pebble4lunarwing] task-runner requires a socket path");
+                std::process::exit(1);
+            });
+        let env_or =
+            |key: &str, default: &str| std::env::var(key).unwrap_or_else(|_| default.to_string());
+        let config = executor::ExecutorConfig {
+            pebble_bin: env_or("PEBBLE_BIN", "pebble"),
+            model: env_or("PEBBLE_MODEL", "openai/gpt-5.2"),
+            permission_mode: env_or("PEBBLE_PERMISSION_MODE", "danger-full-access"),
+            workspace_root: env_or("WORKSPACE_ROOT", "/workspace"),
+        };
+        if let Err(error) = task_runner::run(config, socket.into()).await {
+            eprintln!("[pebble4lunarwing] task runner error: {error}");
+            std::process::exit(1);
+        }
         return;
     }
 

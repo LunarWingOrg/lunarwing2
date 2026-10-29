@@ -113,6 +113,33 @@ assert_before \
   "ctr:alice stop --time 0 lunarwing-opencode-alice" \
   "systemctl:alice stop lunarwing-opencode-alice.service"
 
+test_task_unit_stop_states() (
+  INIT_SYSTEM=systemd
+  MT_ROOTLESS=true
+  local state=not-found stop_fails=false
+  _systemctl_user() {
+    if [[ "$2" == show ]]; then
+      printf '%s\n' "$state"
+    elif [[ "$2" == stop ]]; then
+      [[ "$state" != not-found && "$stop_fails" == false ]]
+    fi
+  }
+  _ctr() { [[ "$2" != inspect ]]; }
+  stop_worker_task_container alice kimi || return 1
+  state=loaded
+  stop_worker_task_container alice kimi || return 1
+  stop_fails=true
+  if stop_worker_task_container alice kimi; then
+    printf 'loaded task unit stop failure was ignored\n' >&2
+    return 1
+  fi
+)
+if test_task_unit_stop_states; then
+  printf 'PASS: absent task units are harmless and loaded stop failures propagate\n'
+else
+  fail 'split task unit stop state handling'
+fi
+
 test_pebble_quadlet_bounce_recovery() (
   local systemctl_stop_fails="false"
   local call index reset_index=-1 start_index=-1
@@ -138,10 +165,8 @@ test_pebble_quadlet_bounce_recovery() (
   }
   _ctr() {
     CALLS+=("ctr:$*")
-    # WI#400 LD-8: start_tenant_pebble checks the image user; the image is
-    # the root-bridge build (run-170 LP-3).
     if [[ "${2:-}" == image && "${3:-}" == inspect ]]; then
-      printf '0:0'
+      printf '%s:%s' "$PEBBLE_CONTAINER_UID" "$PEBBLE_CONTAINER_GID"
     fi
     return 0
   }

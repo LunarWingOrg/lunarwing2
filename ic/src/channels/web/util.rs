@@ -94,19 +94,36 @@ pub fn truncate_preview_middle(s: &str, max_bytes: usize) -> String {
     result
 }
 
-/// Build TurnInfo pairs from flat DB messages (user/tool_calls/assistant triples).
-///
-/// Handles four message patterns:
-/// - `user → assistant` (legacy, no tool calls)
-/// - `user → tool_calls → assistant` (with persisted tool call summaries)
-/// - `user → [tool_calls] → interrupted` (turn stopped by `/interrupt`)
-/// - `user` alone (incomplete turn)
+#[derive(serde::Deserialize)]
+struct HistoryRecovery {
+    user_message_id: uuid::Uuid,
+    state: String,
+    completed_at: Option<String>,
+    recovery: crate::channels::web::types::TurnRecoveryInfo,
+}
+
+/// Pair user/tool/assistant rows and overlay recovery markers by user-message id.
 pub fn build_turns_from_db_messages(
     messages: &[crate::history::ConversationMessage],
 ) -> Vec<TurnInfo> {
+    let recoveries: std::collections::HashMap<_, _> = messages
+        .iter()
+        .filter(|msg| msg.role == "turn_recovery")
+        .filter_map(|msg| serde_json::from_str::<HistoryRecovery>(&msg.content).ok())
+        .filter(|status| {
+            matches!(
+                status.state.as_str(),
+                "Retrying" | "Processing" | "Completed" | "Failed" | "Interrupted"
+            )
+        })
+        .map(|status| (status.user_message_id, status))
+        .collect();
     let mut turns = Vec::new();
     let mut turn_number = 0;
-    let mut iter = messages.iter().peekable();
+    let mut iter = messages
+        .iter()
+        .filter(|msg| msg.role != "turn_recovery")
+        .peekable();
 
     while let Some(msg) = iter.next() {
         if msg.role == "user" {
@@ -119,36 +136,14 @@ pub fn build_turns_from_db_messages(
                 completed_at: None,
                 tool_calls: Vec::new(),
                 reasoning: None,
+                recovery: None,
             };
-
-            // Check if next message is a tool_calls record
             if let Some(next) = iter.peek()
                 && next.role == "tool_calls"
                 && let Some(tc_msg) = iter.next()
             {
-                match serde_json::from_str::<Vec<serde_json::Value>>(&tc_msg.content) {
-                    Ok(calls) => {
-                        turn.tool_calls = calls
-                            .iter()
-                            .map(|c| ToolCallInfo {
-                                name: c["name"].as_str().unwrap_or("unknown").to_string(),
-                                has_result: c.get("result_preview").is_some(),
-                                has_error: c.get("error").is_some(),
-                                result_preview: c["result_preview"].as_str().map(String::from),
-                                error: c["error"].as_str().map(String::from),
-                            })
-                            .collect();
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            message_id = %tc_msg.id,
-                            "Malformed tool_calls JSON in DB, skipping: {e}"
-                        );
-                    }
-                }
+                turn.tool_calls = history_tool_calls(tc_msg);
             }
-
-            // Check if next message is an assistant response
             if let Some(next) = iter.peek()
                 && next.role == "assistant"
                 && let Some(assistant_msg) = iter.next()
@@ -156,10 +151,6 @@ pub fn build_turns_from_db_messages(
                 turn.response = Some(assistant_msg.content.clone());
                 turn.completed_at = Some(assistant_msg.created_at.to_rfc3339());
             }
-
-            // Check if the turn was stopped by `/interrupt` (marker row written
-            // where the assistant response would have landed). A completed turn
-            // wins over a stray marker; an interrupted turn's marker is ignored.
             if turn.response.is_none()
                 && let Some(next) = iter.peek()
                 && next.role == INTERRUPTED_ROLE
@@ -167,11 +158,7 @@ pub fn build_turns_from_db_messages(
             {
                 turn.state = "Interrupted".to_string();
                 turn.completed_at = Some(marker.created_at.to_rfc3339());
-
-                // Race window: on rare ordering the engine dual-writes its
-                // final assistant row after the marker. Attach it so it does
-                // not render as a separate empty-input turn; the interrupted
-                // state still stands.
+                // A late assistant row stays on the interrupted turn.
                 if let Some(next) = iter.peek()
                     && next.role == "assistant"
                     && let Some(assistant_msg) = iter.next()
@@ -180,19 +167,20 @@ pub fn build_turns_from_db_messages(
                     turn.completed_at = Some(assistant_msg.created_at.to_rfc3339());
                 }
             }
-
-            // Incomplete turn (user message without response)
             if turn.response.is_none() && turn.state == "Completed" {
                 turn.state = "Failed".to_string();
             }
-
+            if let Some(status) = recoveries.get(&msg.id) {
+                if turn.state != "Interrupted" {
+                    turn.state = status.state.clone();
+                    turn.completed_at = status.completed_at.clone().or(turn.completed_at);
+                }
+                turn.recovery = Some(status.recovery.clone());
+            }
             turn.reasoning = reasoning_summary(&turn.tool_calls);
-
             turns.push(turn);
             turn_number += 1;
         } else if msg.role == "assistant" {
-            // Standalone assistant message (e.g. routine output, heartbeat)
-            // with no preceding user message — render as a turn with empty input.
             turns.push(TurnInfo {
                 turn_number,
                 user_input: String::new(),
@@ -202,12 +190,31 @@ pub fn build_turns_from_db_messages(
                 completed_at: Some(msg.created_at.to_rfc3339()),
                 tool_calls: Vec::new(),
                 reasoning: None,
+                recovery: None,
             });
             turn_number += 1;
         }
     }
-
     turns
+}
+
+fn history_tool_calls(msg: &crate::history::ConversationMessage) -> Vec<ToolCallInfo> {
+    match serde_json::from_str::<Vec<serde_json::Value>>(&msg.content) {
+        Ok(calls) => calls
+            .iter()
+            .map(|call| ToolCallInfo {
+                name: call["name"].as_str().unwrap_or("unknown").to_string(),
+                has_result: call.get("result_preview").is_some(),
+                has_error: call.get("error").is_some(),
+                result_preview: call["result_preview"].as_str().map(String::from),
+                error: call["error"].as_str().map(String::from),
+            })
+            .collect(),
+        Err(error) => {
+            tracing::warn!(message_id = %msg.id, "Malformed tool_calls JSON in DB, skipping: {error}");
+            Vec::new()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -441,6 +448,63 @@ mod tests {
             turns[1].response.as_deref(),
             Some("Routine executed: found 2 issues")
         );
+    }
+
+    #[test]
+    fn recovery_markers_are_bound_to_the_original_user_message() {
+        let first = make_msg("user", "delegate once", 0);
+        let second = make_msg("user", "later unrelated turn", 1000);
+        let marker = serde_json::json!({
+            "user_message_id": first.id, "state": "Retrying", "completed_at": null,
+            "recovery": {"failure_kind": "repl_argument_corruption", "recovery_state": "retrying",
+                "recovery_attempt": 1, "error": "Wait for the job id; do not re-dispatch."},
+        });
+        let turns = build_turns_from_db_messages(&[
+            first,
+            second,
+            make_msg("turn_recovery", &marker.to_string(), 2000),
+            make_msg("assistant", "second turn response", 3000),
+        ]);
+        assert_eq!(turns.len(), 2);
+        let first = serde_json::to_value(&turns[0]).unwrap();
+        assert_eq!(first["state"], "Retrying");
+        assert_eq!(first["failure_kind"], "repl_argument_corruption");
+        assert_eq!(first["recovery_state"], "retrying");
+        assert!(first["completed_at"].is_null());
+        assert_eq!(turns[1].state, "Completed");
+        assert!(turns[1].recovery.is_none());
+        assert_eq!(turns[1].response.as_deref(), Some("second turn response"));
+    }
+
+    #[test]
+    fn latest_recovery_marker_wins_without_breaking_tool_history() {
+        let user = make_msg("user", "delegate once", 0);
+        let mut messages = vec![user.clone()];
+        for (index, state, recovery_state) in [
+            (1, "Retrying", "retrying"),
+            (2, "Processing", "recovered"),
+            (3, "Failed", "failed"),
+        ] {
+            let marker = serde_json::json!({
+                "user_message_id": user.id, "state": state, "completed_at": "terminal timestamp",
+                "recovery": {"failure_kind": "repl_argument_corruption", "recovery_state": recovery_state,
+                    "recovery_attempt": 1, "error": "Safe classification"},
+            });
+            messages.push(make_msg("turn_recovery", &marker.to_string(), index));
+        }
+        messages.push(make_msg("turn_recovery", "malformed marker", 4));
+        messages.push(make_msg(
+            "tool_calls",
+            r#"[{"name":"create_job","result_preview":"job id"}]"#,
+            5,
+        ));
+        messages.push(make_msg("assistant", "terminal error", 6));
+        let turns = build_turns_from_db_messages(&messages);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].state, "Failed");
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        assert_eq!(turns[0].response.as_deref(), Some("terminal error"));
+        assert_eq!(turns[0].recovery.as_ref().unwrap().recovery_state, "failed");
     }
 
     #[test]

@@ -1950,6 +1950,9 @@ fn handle_emit_event(
     event_tx: Option<&tokio::sync::broadcast::Sender<ThreadEvent>>,
 ) -> ExtFunctionResult {
     let kind_str = args.first().map(monty_to_string).unwrap_or_default();
+    if kind_str == "model_recovery" {
+        return handle_model_recovery(kwargs, thread, event_tx);
+    }
 
     let kind = match kind_str.as_str() {
         "step_started" => {
@@ -2035,6 +2038,38 @@ fn handle_emit_event(
     thread.events.push(event);
     thread.updated_at = chrono::Utc::now();
 
+    ExtFunctionResult::Return(MontyObject::None)
+}
+
+fn handle_model_recovery(
+    kwargs: &[(MontyObject, MontyObject)],
+    thread: &mut Thread,
+    event_tx: Option<&tokio::sync::broadcast::Sender<ThreadEvent>>,
+) -> ExtFunctionResult {
+    use crate::types::event::ModelRecoveryState;
+
+    let failure_kind = extract_string_kwarg(kwargs, "failure_kind")
+        .and_then(|kind| ModelFailureKind::parse(&kind))
+        .unwrap_or(ModelFailureKind::Internal);
+    let recovery_state = match extract_string_kwarg(kwargs, "recovery_state").as_deref() {
+        Some("retrying") => ModelRecoveryState::Retrying,
+        Some("recovered") => ModelRecoveryState::Recovered,
+        Some("failed") => ModelRecoveryState::Failed,
+        _ => return ExtFunctionResult::Return(MontyObject::None),
+    };
+    let event = ThreadEvent::new(
+        thread.id,
+        EventKind::ModelRecovery {
+            failure_kind,
+            recovery_state,
+            attempt: extract_u64_kwarg(kwargs, "attempt").unwrap_or(0),
+        },
+    );
+    if let Some(tx) = event_tx {
+        let _ = tx.send(event.clone());
+    }
+    thread.events.push(event);
+    thread.updated_at = chrono::Utc::now();
     ExtFunctionResult::Return(MontyObject::None)
 }
 

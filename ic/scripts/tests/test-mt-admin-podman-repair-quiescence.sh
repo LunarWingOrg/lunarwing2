@@ -41,7 +41,7 @@ start_tenant() { printf 'START\n' >>"$calls"; }
 id() { if [[ "${1:-}" == -u && "${2:-}" == "$TENANT" ]]; then command id -u; else command id "$@"; fi; }
 stop_tenant_vision() { :; }
 stop_tenant_voice() { :; }
-stop_tenant_pebble() { native_stop "lunarwing-pebble-$1"; }
+stop_tenant_pebble() { native_stop "lunarwing-pebble-$1"; native_stop "lunarwing-pebble-task-$1"; }
 stop_tenant_opencode() { :; }
 stop_tenant_kimi() { :; }
 stop_tenant_opencode2() { :; }

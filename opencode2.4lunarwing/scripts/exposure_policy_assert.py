@@ -341,7 +341,7 @@ def check_image_filesystem(
 ) -> None:
     """FB-4: check image ownership/modes, from tar headers out of band."""
     paths = [lane, *(lane / name for name in (
-        "entrypoint.sh", "health_server.py", "agent_comm_protocol.json",
+        "entrypoint.sh", "entrypoint-split.sh", "health_server.py", "agent_comm_protocol.json",
     ))]
     for name in ("scripts", "config"):
         tree = lane / name

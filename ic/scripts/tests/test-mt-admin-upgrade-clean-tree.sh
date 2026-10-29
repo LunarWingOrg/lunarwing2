@@ -375,12 +375,17 @@ _container_config_changed() { return 1; }
 _store_container_hash() { printf 'hash\n' >>"$events"; }
 _register_worker_unit() { printf 'unit\n' >>"$events"; }
 prepare_worker_workspace() { printf '%s/state' "$repo"; }
+prepare_worker_task_launch() {
+  TASK_WORKSPACE_DIR="$repo/state"
+  TASK_USERNS_ARGS=() TASK_ENV_FLAGS=() TASK_MOUNTS=() TASK_RESTART_ARG=()
+}
+start_worker_task_container() { :; }
 write_kimi_runtime_env() { [[ "$startup_mode" != auth ]] || return 1; printf '%s/env/kimi-runtime.env' "$repo"; }
 _ctr() {
   case "$2" in
     image)
-      if [[ "$startup_mode" == degraded ]]; then printf '10002:10002\n';
-      else printf '0:0\n'; fi ;;
+      if [[ "$startup_mode" == degraded ]]; then printf '0:0\n';
+      else printf '%s:%s\n' "$KIMI_CONTAINER_UID" "$KIMI_CONTAINER_GID"; fi ;;
     inspect)
       [[ "$startup_mode" == clean ]] || return 1
       printf 'true\n' ;;

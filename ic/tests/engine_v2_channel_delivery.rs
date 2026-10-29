@@ -1783,6 +1783,318 @@ async fn engine_v2_channel_delivery_matrix() {
     assert_stopped_case().await;
     assert_approval_case().await;
     assert_auth_case().await;
+    env.set_channels(None);
+    assert_rejected_delegation_case(false).await;
+    assert_rejected_delegation_case(true).await;
 
     env.cleanup().await;
+}
+
+struct RecoveryDelegationLlm {
+    calls: AtomicUsize,
+    retry_started: Notify,
+    release_retry: Notify,
+    fail_again: bool,
+}
+
+impl RecoveryDelegationLlm {
+    fn worker_request(messages: &[ChatMessage]) -> bool {
+        messages.iter().any(|message| {
+            message.role == Role::System
+                && message
+                    .content
+                    .starts_with("You are an autonomous agent working on a job.")
+        })
+    }
+
+    fn rejected_draft() -> LlmStreamChunk {
+        LlmStreamChunk::TextDelta("```repl\nawait create_job(title='must-not-run', description='unsafe prefix')\n```repl\nprivate-draft-sentinel\n```".into())
+    }
+}
+
+#[async_trait]
+impl LlmProvider for RecoveryDelegationLlm {
+    fn model_name(&self) -> &str {
+        "wi478-delegation-smoke"
+    }
+    fn cost_per_token(&self) -> (Decimal, Decimal) {
+        (Decimal::ZERO, Decimal::ZERO)
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+        if Self::worker_request(&request.messages) {
+            future::pending::<()>().await;
+        }
+        Err(provider_failure())
+    }
+
+    async fn complete_with_tools(
+        &self,
+        request: ToolCompletionRequest,
+    ) -> Result<ToolCompletionResponse, LlmError> {
+        if Self::worker_request(&request.messages) {
+            future::pending::<()>().await;
+        }
+        Err(provider_failure())
+    }
+
+    async fn complete_with_tools_stream(
+        &self,
+        request: ToolCompletionRequest,
+    ) -> Result<LlmStream<'_>, LlmError> {
+        if Self::worker_request(&request.messages) {
+            future::pending::<()>().await;
+        }
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let chunk = match call {
+            0 => {
+                assert!(
+                    request
+                        .messages
+                        .iter()
+                        .any(|message| message.role == Role::System
+                            && message.content.contains("single `create_job` delegation"))
+                );
+                Self::rejected_draft()
+            }
+            1 => {
+                assert!(
+                    request
+                        .messages
+                        .iter()
+                        .any(|message| message.role == Role::System
+                            && message.content.contains("plain-prose description"))
+                );
+                assert!(
+                    !request
+                        .messages
+                        .iter()
+                        .any(|message| message.content.contains("private-draft-sentinel"))
+                );
+                self.retry_started.notify_one();
+                self.release_retry.notified().await;
+                if self.fail_again {
+                    Self::rejected_draft()
+                } else {
+                    LlmStreamChunk::ToolCallDelta {
+                        index: 0, id: Some("wi478-create".into()), name: Some("create_job".into()),
+                        args_delta: serde_json::json!({"title": "WI478 smoke job", "description": "Inspect the Rust handler and report the actual result; preserve existing behavior.", "mode": "worker"}).to_string(),
+                    }
+                }
+            }
+            2 => LlmStreamChunk::TextDelta(
+                "```repl\nFINAL('Delegation finished; use the returned job id.')\n```".into(),
+            ),
+            _ => return Err(provider_failure()),
+        };
+        let tool_call = matches!(chunk, LlmStreamChunk::ToolCallDelta { .. });
+        Ok(futures::stream::iter([
+            Ok(chunk),
+            Ok(LlmStreamChunk::Done {
+                usage: Some(TokenUsage::default()),
+                finish_reason: if tool_call { "tool_calls" } else { "stop" }.into(),
+            }),
+        ])
+        .boxed())
+    }
+}
+
+async fn recovery_history(
+    client: &reqwest::Client,
+    base: &str,
+    scope: &str,
+    paginated: bool,
+) -> serde_json::Value {
+    let mut request = client
+        .get(format!("{base}/api/chat/history"))
+        .bearer_auth("wi478-test-token")
+        .query(&[("thread_id", scope)]);
+    if paginated {
+        request = request.query(&[(
+            "before",
+            (chrono::Utc::now() + chrono::TimeDelta::seconds(1)).to_rfc3339(),
+        )]);
+    }
+    request
+        .send()
+        .await
+        .expect("history request")
+        .error_for_status()
+        .expect("history status")
+        .json()
+        .await
+        .expect("history JSON")
+}
+
+async fn assert_recovery_sse(stream: &mut reqwest::Response, state: &str) {
+    let wanted = format!("\"recovery_state\":\"{state}\"");
+    let wire = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut wire = String::new();
+        while !wire.contains(&wanted) {
+            let chunk = stream
+                .chunk()
+                .await
+                .expect("SSE chunk")
+                .expect("SSE remains open");
+            wire.push_str(&String::from_utf8_lossy(&chunk));
+            assert!(wire.len() < 65536, "bounded SSE capture");
+        }
+        wire
+    })
+    .await
+    .expect("recovery SSE delivered");
+    assert!(wire.contains("event: turn_recovery"));
+    assert!(wire.contains("repl_argument_corruption"));
+    assert!(
+        !wire.contains("private-draft-sentinel"),
+        "rejected code must not leak as a status"
+    );
+}
+
+fn assert_delegation_result(
+    rig: &support::test_rig::TestRig,
+    llm: &RecoveryDelegationLlm,
+    turn: &serde_json::Value,
+    fail_again: bool,
+) {
+    assert_eq!(
+        turn["state"],
+        if fail_again { "Failed" } else { "Completed" }
+    );
+    assert_eq!(
+        turn["recovery_state"],
+        if fail_again { "failed" } else { "recovered" }
+    );
+    assert_eq!(turn["failure_kind"], "repl_argument_corruption");
+    assert!(!turn["completed_at"].is_null());
+    let completed = rig.tool_calls_completed();
+    assert_eq!(completed.len(), usize::from(!fail_again), "{completed:?}");
+    assert!(
+        completed
+            .iter()
+            .all(|(name, ok)| name.starts_with("create_job(") && *ok),
+        "completed={completed:?}; statuses={:?}",
+        rig.captured_status_events()
+    );
+    if !fail_again {
+        let results = rig.tool_results();
+        let (_, output) = results
+            .iter()
+            .find(|(name, _)| name.starts_with("create_job("))
+            .expect("actual create_job result");
+        let result: serde_json::Value = serde_json::from_str(output).expect("job result JSON");
+        assert_eq!(result["title"], "WI478 smoke job");
+        assert_eq!(result["status"], "in_progress");
+        assert!(Uuid::parse_str(result["job_id"].as_str().expect("job id string")).is_ok());
+    }
+    assert_eq!(
+        llm.calls.load(Ordering::SeqCst),
+        if fail_again { 2 } else { 3 }
+    );
+}
+
+async fn seed_stale_gateway_cache(
+    state: &lunarwing::channels::web::server::GatewayState,
+    scope: &str,
+) {
+    let manager = state.session_manager.as_ref().expect("gateway sessions");
+    let session = manager.get_or_create_session("test-user").await;
+    let mut session = session.lock().await;
+    let id = Uuid::parse_str(scope).expect("scope UUID");
+    let mut thread = lunarwing::agent::session::Thread::with_id(id, session.id);
+    thread.start_turn("stale legacy snapshot");
+    thread.complete_turn("stale response must not hide live engine recovery");
+    session.threads.insert(id, thread);
+}
+
+async fn assert_rejected_delegation_case(fail_again: bool) {
+    use lunarwing::channels::web::{
+        auth::MultiAuthState, server::start_server, test_helpers::TestGatewayBuilder,
+    };
+    lunarwing::bridge::reset_engine_state().await;
+    let mut state = TestGatewayBuilder::new().build();
+    let llm = Arc::new(RecoveryDelegationLlm {
+        calls: AtomicUsize::new(0),
+        retry_started: Notify::new(),
+        release_retry: Notify::new(),
+        fail_again,
+    });
+    let rig = TestRigBuilder::new()
+        .with_channel_name("gateway")
+        .with_llm(llm.clone())
+        .with_sse(state.sse.clone())
+        .with_auto_approve_tools(true)
+        .build()
+        .await;
+    let inner = Arc::get_mut(&mut state).expect("exclusive gateway state");
+    inner.store = Some(rig.database().clone());
+    inner.session_manager = Some(Arc::new(lunarwing::agent::SessionManager::new()));
+    let addr = start_server(
+        "127.0.0.1:0".parse().expect("loopback address"),
+        state.clone(),
+        MultiAuthState::single("wi478-test-token".into(), "test-user".into()).into(),
+    )
+    .await
+    .expect("gateway starts");
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("HTTP client");
+    let mut stream = client
+        .get(format!("{base}/api/chat/events"))
+        .bearer_auth("wi478-test-token")
+        .send()
+        .await
+        .expect("SSE subscription");
+    let bob = state
+        .sse
+        .subscribe_raw(Some("bob".into()))
+        .expect("bob subscription");
+    futures::pin_mut!(bob);
+    let scope = Uuid::new_v4().to_string();
+    seed_stale_gateway_cache(&state, &scope).await;
+    rig.send_incoming(IncomingMessage::new("gateway", "test-user",
+        "Delegate one job to inspect this Rust handler and report actual results. Example:\n```rust\nfn handler() { println!(\"inspect me\"); }\n```\nUse a single create_job call.")
+        .with_thread(scope.clone()).with_conversation_scope(scope.clone())
+        .with_metadata(serde_json::json!({"thread_id": scope, "user_id": "test-user"}))).await;
+    tokio::time::timeout(Duration::from_secs(10), llm.retry_started.notified())
+        .await
+        .expect("retry starts");
+    assert_recovery_sse(&mut stream, "retrying").await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), bob.next())
+            .await
+            .is_err()
+    );
+    let history = recovery_history(&client, &base, &scope, false).await;
+    assert_eq!(history["turns"][0]["state"], "Retrying");
+    assert_eq!(
+        history["turns"][0]["failure_kind"],
+        "repl_argument_corruption"
+    );
+    assert_eq!(history["turns"][0]["recovery_attempt"], 1);
+    assert!(history["turns"][0]["completed_at"].is_null());
+    assert!(
+        history["turns"][0]["error"]
+            .as_str()
+            .expect("safe reason")
+            .contains("do not re-dispatch")
+    );
+    assert!(
+        rig.tool_calls_completed().is_empty(),
+        "no rejected prefix may execute"
+    );
+    llm.release_retry.notify_one();
+    let responses = rig.wait_for_responses(1, Duration::from_secs(15)).await;
+    assert_eq!(responses.len(), 1);
+    let history = recovery_history(&client, &base, &scope, true).await;
+    assert_delegation_result(&rig, &llm, &history["turns"][0], fail_again);
+    assert_recovery_sse(&mut stream, if fail_again { "failed" } else { "recovered" }).await;
+    drop(stream);
+    if let Some(shutdown) = state.shutdown_tx.write().await.take() {
+        let _ = shutdown.send(());
+    }
+    rig.shutdown_and_wait().await;
+    lunarwing::bridge::reset_engine_state().await;
 }

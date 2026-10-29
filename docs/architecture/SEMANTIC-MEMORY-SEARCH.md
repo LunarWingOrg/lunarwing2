@@ -2,28 +2,25 @@
 
 LunarWing provides persistent memory for agents with hybrid search combining full-text search (BM25-style keyword matching) and vector search (cosine similarity on embeddings). Results are fused using Reciprocal Rank Fusion (RRF) to produce a single ranked list.
 
-**Revalidated against source 2026-10-01 (v2.1.4.0); re-checked 2026-10-06
-(v2.1.5.0); re-checked 2026-10-14 (v2.1.6.0).** Pipeline structure,
-limits, tools, schema/migrations, and env
-vars were re-checked; no search/indexing changes were made in the 2.1.4.0
-cycle. The 2.1.5.0 cycle added migration V28
-(`V28__revoke_secret_delete_always_grants.sql`, WI#307) — a secrets-grant
-cleanup that does not touch the memory/search schema, so the pipeline below
-is unchanged; the write-guard paragraph already reflects this cycle's
-WI#290 rejection taxonomy, and WI#288/289 left the chunking and search
-paths untouched. The additive
-knowledge refresh cadence (item 6/WI#121) is now documented in Step 6, the
-WI#132 memory-index outbox (`indexed_at`, V27, repair sweep) is documented in
-Step 1, and the mission-subtree index exclusion (WI#135/WI#136) is documented
-in Step 1. The 2.1.4.0 cycle added operator-facing system-prompt editing
-(WI#220, gateway Settings → System Prompt) which flows through the same
-`Workspace::write()` ingestion, write guard, and indexing path described
-below — no pipeline change; see `ic/src/workspace/README.md` (Operator
-Prompt Editing) and `docs/guides/TENANT-SYSTEM-PROMPTS.md`. The 2.1.6.0
-cycle added no new migration (V28 remains the latest) and left chunking,
-search, and the knowledge layer untouched; the WI#335 daily-log backup
-guard (item 24) changed `memory_write` replace behavior and is documented
-in Step 5.
+**Source revalidated 2026-10-29 for v2.1.7.0.** The database-backed workspace
+remains the shared document/chunk store for memory and native knowledge tools.
+Current changes at its boundaries include:
+
+- WI#322 reserves all `engine/projects/**` documents from agent memory
+  reads/writes/tree listings and web writes, protecting boot-hydrated project and
+  mission state. This is broader than the mission-only search-index exclusion.
+- WI#493 rejects Unicode control characters in original write paths before
+  normalization, while preserving exact-path operator reads of legacy records.
+  Tree/list display names escape controls without changing lookup paths.
+- WI#336 records daily-log backup rotation/discard evidence with 128-bit blake3
+  fingerprint prefixes that survive the production log scrubber. The WI#335
+  agent-side cap refusal remains distinct from operator rotation.
+- WI#324 exposes explicitly granted memory/knowledge tools to external workers
+  through the daemon, with narrower memory-write policy described below.
+
+Implementation details and error/recovery contracts are in
+[the workspace spec](../../ic/src/workspace/README.md). V28 remains the latest
+SQL migration; its secret-grant cleanup does not alter memory search schema.
 
 The system lives in `ic/src/workspace/`. General memory is exposed through
 `memory_search`, `memory_write`, `memory_read`, and `memory_tree` in
@@ -287,11 +284,26 @@ valid UTF-8 and valid JSON. Queries over 1,024 UTF-8 bytes are rejected before
 embedding or database search. Results remain a ranked prefix, and `result_count`
 reports results actually emitted.
 
-All three path-based tools normalize paths before enforcing the internal runtime
-boundary. `memory_read` and `memory_write` reject exact or descendant
-`engine/.runtime/**` paths, while `memory_tree` also filters that subtree from
-recursive listings. This policy exists only at the agent-facing tool boundary;
-the Engine continues to use direct `Workspace` APIs for persistence and recovery.
+All three path-based tools reserve `engine/.runtime/**`, all
+`engine/projects/**`, `backups/`, and quarantined `daily/*.poisoned-*.md` records.
+Direct reads and writes are rejected after normalization; tree listings hide
+these paths. Web writes reserve the same destinations, while exact-path operator
+reads and internal `Workspace` APIs remain available for recovery. Search-index
+exclusions are separate: non-mission Engine documents that remain indexed can
+appear with `"provenance": "engine_internal"`.
+
+`memory_write` caps one payload at 256 KiB and calls `validate_write_path` on
+the original resolved path before normalization, rejecting C0/DEL/C1 controls.
+Existing control-bearing records remain operator-readable, and display escaping
+does not rewrite their stored paths.
+
+External workers receive no memory authority by default. With an explicit
+WI#324 tool grant, proxied `memory_read` can disclose owner-scope prompt files;
+proxied `memory_write` refuses prompt-visible files (including daily logs and
+lorebooks), all `engine/**` paths, and any explicit `layer` parameter. The daemon
+rechecks this policy after hook rewrites. These are tenant/container-wide grants,
+not isolation between concurrent jobs. See
+[the proxy contract](../proposals/EXTERNAL-WORKER-TOOL-PROXY.md).
 
 `memory_read` pages by UTF-8 byte offset. Each page consumes at most 6,000 source
 bytes while also respecting JSON escape expansion, and the complete response is

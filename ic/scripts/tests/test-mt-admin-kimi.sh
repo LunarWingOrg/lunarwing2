@@ -392,42 +392,37 @@ assert_contains "$quadlet" "EnvironmentFile=$fixture/env/kimi-runtime.env" 'syst
 assert_not_contains "$quadlet" 'ssh-agent.sock' 'systemd Kimi quadlet has no SSH agent mount (WI#206)'
 assert_not_contains "$quadlet" 'SSH_AUTH_SOCK' 'systemd Kimi quadlet has no SSH_AUTH_SOCK env (WI#206)'
 assert_contains "$quadlet" 'PodmanArgs=--security-opt=no-new-privileges' 'systemd Kimi quadlet sets no-new-privileges (WI#206)'
-assert_contains "$quadlet" '--cap-drop=ALL' 'systemd Kimi quadlet drops all capabilities (WI#400 KW-3)'
-assert_contains "$quadlet" '--cap-add=SETUID' 'systemd Kimi quadlet keeps SETUID for the setpriv task drop (WI#400 KW-3)'
-assert_contains "$quadlet" '--cap-add=SETGID' 'systemd Kimi quadlet keeps SETGID for the setpriv task drop (WI#400 KW-3)'
-assert_contains "$quadlet" '--cap-add=CHOWN' 'systemd Kimi quadlet keeps CHOWN for the task-uid handoff (WI#400 KW-3)'
-assert_contains "$quadlet" '--cap-add=KILL' 'systemd Kimi quadlet keeps KILL for task cancel/timeout (WI#400 KW-3)'
-assert_contains "$quadlet" '--cap-add=DAC_OVERRIDE' 'systemd Kimi quadlet keeps DAC_OVERRIDE for cron workspace creation (WI#400 KW-3/KW-4)'
+assert_contains "$quadlet" '--cap-drop=ALL' 'systemd Kimi bridge drops all capabilities (WI#454)'
+assert_not_contains "$quadlet" '--cap-add=' 'systemd Kimi bridge adds no capabilities (WI#454)'
+assert_contains "$quadlet" 'User=10102:10002' 'systemd Kimi bridge uses its distinct non-root uid (WI#454)'
+assert_contains "$quadlet" 'Environment=LUNARWING_CONTAINER_ROLE=split-bridge' 'systemd Kimi bridge role is explicit (WI#454)'
+assert_contains "$fixture/quadlets/lunarwing-kimi-task-root.container" 'User=10002:10002' 'systemd Kimi task uses its non-root uid (WI#454)'
+assert_contains "$fixture/quadlets/lunarwing-kimi-task-root.container" 'Environment=LUNARWING_CONTAINER_ROLE=split-task' 'systemd Kimi task role is explicit (WI#454)'
 assert_not_contains "$quadlet" 'SecurityOpt=' 'systemd Kimi quadlet avoids unsupported SecurityOpt key'
 # Non-kimi lanes mount only the socket directory (restart-safe), read-only so
 # a compromised worker cannot unlink/rebind the host agent socket (WI#226).
 for lane in opencode opencode2 pebble; do
   render_worker_quadlet root "$lane" 8443
-  worker_quadlet="$fixture/quadlets/lunarwing-${lane}-root.container"
-  assert_contains "$worker_quadlet" 'Volume='"$fixture"'/run/ssh-agent:/tmp/ssh-agent:ro,z' \
-    "$lane quadlet mounts the ssh-agent directory read-only"
-  assert_contains "$worker_quadlet" 'Environment=SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock' \
-    "$lane quadlet points SSH_AUTH_SOCK inside the mounted directory"
-  assert_not_contains "$worker_quadlet" 'Volume='"$fixture"'/run/ssh-agent:/tmp/ssh-agent:z' \
-    "$lane quadlet does not mount the agent directory read-write"
+  task_quadlet="$fixture/quadlets/lunarwing-${lane}-task-root.container"
+  assert_contains "$task_quadlet" 'Volume='"$fixture"'/run/ssh-agent:/tmp/ssh-agent:ro,z' \
+    "$lane task quadlet mounts the ssh-agent directory read-only"
+  assert_contains "$task_quadlet" 'Environment=SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock' \
+    "$lane task quadlet points SSH_AUTH_SOCK inside the mounted directory"
+  assert_not_contains "$task_quadlet" 'Volume='"$fixture"'/run/ssh-agent:/tmp/ssh-agent:z' \
+    "$lane task quadlet does not mount the agent directory read-write"
+  assert_not_contains "$fixture/quadlets/lunarwing-${lane}-root.container" 'SSH_AUTH_SOCK' \
+    "$lane bridge quadlet has no task SSH credential"
 done
-# WI#400 run-164 KW-2: the root-bridge lanes (opencode, pebble) get the same
-# container-level no-new-privileges kimi carries; the unmigrated opencode2
-# lane is deliberately excluded (KW-1). LD-7: pin the FULL trimmed set on
-# the Quadlet PodmanArgs — a single dropped cap must fail the pin.
-KW3_QUADLET_ARGS='PodmanArgs=--security-opt=no-new-privileges --cap-drop=ALL --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER --cap-add=KILL --cap-add=SETUID --cap-add=SETGID'
-assert_contains "$quadlet" "$KW3_QUADLET_ARGS" 'systemd Kimi quadlet carries the exact WI#400 capability trim (KW-3/LD-7)'
-for lane in opencode pebble; do
+# WI#454: every bridge uses the same non-root, no-capability contract.
+KW3_QUADLET_ARGS='PodmanArgs=--security-opt=no-new-privileges --cap-drop=ALL'
+for lane in kimi opencode opencode2 pebble; do
   assert_contains "$fixture/quadlets/lunarwing-${lane}-root.container" \
     "$KW3_QUADLET_ARGS" \
-    "$lane quadlet carries the exact WI#400 capability trim (KW-3/LD-7)"
+    "$lane bridge quadlet carries the exact non-root capability drop (WI#454)"
+  assert_not_contains "$fixture/quadlets/lunarwing-${lane}-root.container" \
+    '--cap-add=' \
+    "$lane bridge quadlet adds no capabilities (WI#454)"
 done
-assert_not_contains "$fixture/quadlets/lunarwing-opencode2-root.container" \
-  'no-new-privileges' \
-  'opencode2 quadlet stays off no-new-privileges until its own WI#400 migration'
-assert_not_contains "$fixture/quadlets/lunarwing-opencode2-root.container" \
-  '--cap-drop' \
-  'opencode2 quadlet stays off the WI#400 capability trim until its migration'
 
 # WI#400 (run-170 LP-11): the keep-id mapping was pinned only for kimi above
 # and on the pebble imperative path (image-contract harness) — pin the
@@ -439,6 +434,7 @@ assert_contains "$fixture/quadlets/lunarwing-pebble-root.container" \
   'UserNS=keep-id:uid=10004,gid=10004' \
   'pebble quadlet carries the keep-id task-uid mapping (WI#400 LP-11)'
 # Quadlet's full-file hash must also notice the mount policy change.
+worker_quadlet="$fixture/quadlets/lunarwing-opencode-task-root.container"
 legacy_quadlet="$fixture/quadlets/legacy-rw.container"
 sed 's#ssh-agent:ro,z#ssh-agent:z#' "$worker_quadlet" > "$legacy_quadlet"
 _store_container_hash root old-quadlet "$legacy_quadlet"
@@ -1138,61 +1134,52 @@ else
 fi
 # WI#400 KW-3/LD-7: the root-bridge lanes run the bridge with a trimmed
 # capability set instead of the default root set. The FULL string is pinned:
-# a dropped KILL or DAC_OVERRIDE would otherwise only show in production.
-KW3_CAP_TRIM='--cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add KILL --cap-add SETUID --cap-add SETGID'
-for lane in kimi opencode pebble; do
+# WI#454: every imperative bridge drops all capabilities and the task launch
+# helper carries the read-only SSH mount for non-kimi lanes.
+for lane in kimi opencode opencode2 pebble; do
   LANE_BLOCK="$(awk "/^start_tenant_${lane}\\(\\)/,/^stop_tenant_${lane}\\(\\)/" "$WORKER_LIB")"
-  if grep -Fq -- "$KW3_CAP_TRIM" <<<"$LANE_BLOCK"; then
-    pass "$lane imperative launch runs the exact WI#400 capability trim (KW-3/LD-7)"
+  if grep -Fq -- '--cap-drop ALL' <<<"$LANE_BLOCK" \
+    && ! grep -Fq -- '--cap-add' <<<"$LANE_BLOCK"; then
+    pass "$lane imperative bridge runs with no capabilities (WI#454)"
   else
-    fail "$lane imperative launch missing the exact WI#400 capability trim (KW-3/LD-7)"
+    fail "$lane imperative bridge has the wrong capability contract (WI#454)"
   fi
 done
-# The non-kimi imperative lanes mount the directory read-only, preserving
-# daemon restart recovery while blocking worker-side socket replacement.
 for lane in opencode opencode2 pebble; do
-  LANE_BLOCK="$(awk "/^start_tenant_${lane}\\(\\)/,/^stop_tenant_${lane}\\(\\)/" "$WORKER_LIB")"
-  if grep -Fq -- '-v "${ssh_agent_dir}:/tmp/ssh-agent:ro,z"' <<<"$LANE_BLOCK" \
-    && grep -Fq -- 'SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock' <<<"$LANE_BLOCK"; then
-    pass "$lane imperative launch mounts the ssh-agent directory read-only"
+  TASK_BLOCK="$(declare -f prepare_worker_task_launch)"
+  if grep -Fq -- '-v "${ssh_agent_dir}:/tmp/ssh-agent:ro,z"' <<<"$TASK_BLOCK" \
+    && grep -Fq -- 'SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock' <<<"$TASK_BLOCK"; then
+    pass "$lane imperative task launch mounts the ssh-agent directory read-only"
   else
-    fail "$lane imperative launch missing the read-only ssh-agent directory mount"
+    fail "$lane imperative task launch missing the read-only ssh-agent directory mount"
   fi
 done
-# WI#400 run-164 KW-2: opencode and pebble imperative launches set
-# no-new-privileges like kimi's; opencode2 stays off it until its lane
-# migrates (KW-1).
-for lane in opencode pebble; do
+# WI#454: every imperative bridge sets no-new-privileges.
+for lane in kimi opencode opencode2 pebble; do
   LANE_BLOCK="$(awk "/^start_tenant_${lane}\\(\\)/,/^stop_tenant_${lane}\\(\\)/" "$WORKER_LIB")"
   if grep -Fq -- '--security-opt no-new-privileges' <<<"$LANE_BLOCK"; then
-    pass "$lane imperative launch sets no-new-privileges (WI#400 KW-2)"
+    pass "$lane imperative bridge sets no-new-privileges (WI#454)"
   else
-    fail "$lane imperative launch missing no-new-privileges (WI#400 KW-2)"
+    fail "$lane imperative bridge missing no-new-privileges (WI#454)"
   fi
 done
-OPENCODE2_BLOCK="$(awk '/^start_tenant_opencode2\(\)/,/^stop_tenant_opencode2\(\)/' "$WORKER_LIB")"
-if grep -Fq -- '--security-opt no-new-privileges' <<<"$OPENCODE2_BLOCK"; then
-  fail 'opencode2 imperative launch picked up no-new-privileges before its WI#400 migration'
-else
-  pass 'opencode2 imperative launch unchanged by WI#400 (KW-1)'
-fi
 # The launch contract must carry the policy change so existing containers
 # force-recreate instead of surviving with the old mount.
 ROOT_SCRIPT="$(dirname "$MT_ADMIN")/lunarwing-mt-admin.sh"
-assert_contains "$ROOT_SCRIPT" 'KIMI_ROOTLESS_LAUNCH_CONTRACT="userns=${KIMI_USERNS};no-ssh-agent;no-new-privileges;cap-trim"' \
-  'kimi launch contract records the WI#206 policy change and the WI#400 cap-trim'
+assert_contains "$ROOT_SCRIPT" 'KIMI_ROOTLESS_LAUNCH_CONTRACT="userns=${KIMI_USERNS};no-ssh-agent;no-new-privileges;cap-trim;non-root-split-v1"' \
+  'kimi launch contract records the non-root split (WI#454)'
 # Contract changes recreate old RW-mount containers on rootless AND rootful
 # imperative lanes. Quadlet recreations hash the rendered Volume= line.
-assert_contains "$ROOT_SCRIPT" 'OPENCODE_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE_USERNS};ssh-agent-dir-ro;no-new-privileges;cap-trim"' \
-  'opencode rootless launch contract records the read-only SSH mount, WI#400 no-new-privileges, and cap-trim'
-assert_contains "$ROOT_SCRIPT" 'OPENCODE2_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE2_USERNS};ssh-agent-dir-ro"' \
-  'opencode2 rootless launch contract records the read-only SSH mount'
-assert_contains "$ROOT_SCRIPT" 'PEBBLE_ROOTLESS_LAUNCH_CONTRACT="userns=${PEBBLE_USERNS};ssh-agent-dir-ro;no-new-privileges;cap-trim"' \
-  'pebble launch contract records the WI#400 task-uid userns, read-only SSH mount, no-new-privileges, and cap-trim'
-assert_contains "$WORKER_LIB" 'local opencode_launch_contract="ssh-agent-dir-ro;cap-trim"' \
-  'rootful opencode includes the SSH mount and the WI#400 cap-trim in its launch contract'
-assert_contains "$WORKER_LIB" 'local launch_contract="ssh-agent-dir-ro"' \
-  'rootful opencode2 includes the SSH mount in its launch contract'
+assert_contains "$ROOT_SCRIPT" 'OPENCODE_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE_USERNS};ssh-agent-dir-ro;no-new-privileges;cap-trim;non-root-split-v1"' \
+  'opencode launch contract records the non-root split (WI#454)'
+assert_contains "$ROOT_SCRIPT" 'OPENCODE2_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE2_USERNS};ssh-agent-dir-ro;non-root-split-v1"' \
+  'opencode2 launch contract records the non-root split (WI#454)'
+assert_contains "$ROOT_SCRIPT" 'PEBBLE_ROOTLESS_LAUNCH_CONTRACT="userns=${PEBBLE_USERNS};ssh-agent-dir-ro;no-new-privileges;cap-trim;non-root-split-v1"' \
+  'pebble launch contract records the non-root split (WI#454)'
+assert_contains "$WORKER_LIB" 'local opencode_launch_contract="ssh-agent-dir-ro;cap-trim;non-root-split-v1"' \
+  'rootful opencode includes the non-root split in its launch contract'
+assert_contains "$WORKER_LIB" 'local launch_contract="ssh-agent-dir-ro;non-root-split-v1"' \
+  'rootful opencode2 includes the non-root split in its launch contract'
 
 _store_container_hash root old-rootless "$env_file" "userns=${OPENCODE_USERNS};ssh-agent-dir"
 if _container_config_changed root old-rootless "$env_file" "$OPENCODE_ROOTLESS_LAUNCH_CONTRACT"; then

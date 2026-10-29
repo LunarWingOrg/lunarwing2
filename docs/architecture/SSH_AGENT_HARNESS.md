@@ -1,6 +1,18 @@
 # SSH Agent Harness
 
-**Status:** As-built (revalidated against source 2026-09-28, v2.1.3.0; item-40 socket-directory mount; revalidated 2026-10-01, v2.1.4.0 — no `ic/src/bridge/ssh*.rs` or `ic/src/config/ssh.rs` change in the cycle; the WI#265 bridge work touched `router.rs` only, which this doc already notes is independent of the SSH harness; revalidated 2026-10-06, v2.1.5.0 — again no `ic/src/bridge/ssh*.rs` or `ic/src/config/ssh.rs` change in the cycle; WI#307 made daemon discovery and engine lease planning share one autonomous denylist, but `ssh`/`ssh_git`/`create_job` were already in it, so the exclusion this doc describes is unchanged. Component map, socket path, two-keystore note, API table, and test counts (38) re-verified against source. Substantive fix this pass: the §1 diagram still listed `kimi` among the socket-mounting workers although WI#206 removed that lane — corrected to match the prose (pebble, opencode, opencode2 only); revalidated 2026-10-14, v2.1.6.0 — no `ic/src/bridge/ssh*.rs` or `ic/src/config/ssh.rs` change in the cycle (the v2.1.6.0_CARGO_DENY_AUDIT.md rsa note describes accepted `rsa` crate advisories, not this harness: `russh` is still 0.62.7 and built-in/WASM russh execution still rejects `rsa` key type); WI#373's worker `AGENT_AUTH_TOKEN` env strips (item 30) changed worker entrypoints but no SSH mount or socket semantics; component map, socket path, two-keystore note, API table, russh 0.62 claim, and test counts (5+2+6+14+6+3+2 = 38) re-verified against source)
+**Status:** As-built; source revalidated 2026-10-29 for v2.1.7.0.
+The bridge/config implementation is unchanged since the socket-directory mount
+fix. Source symbols below define the contract; historical dependency versions
+and static test counts are not deployment health evidence.
+
+WI#424 adds a separate worker network boundary in
+`ic/scripts/mt-admin-lib/15-worker-egress.sh`: tenant workers use an egress network
+with allowed LLM endpoints and operator-approved host/port pairs. A mounted
+signing socket alone cannot reach an SSH server. Worker destinations must be
+allowed there as well as trusted by the worker's SSH client; `[[ssh.hosts]]`
+continues to constrain only the direct built-in/WASM tools. Audit live network
+policy through `lunarwing-mt-admin.sh worker-egress <tenant>`. Firewall health is
+monitor-only, so a failed audit does not repair the policy automatically.
 **Code:** `ic/src/bridge/ssh*.rs`, `ic/src/config/ssh.rs`
 **Operator guide:** [`docs/ops/SSH-HARNESS-SETUP.md`](../ops/SSH-HARNESS-SETUP.md)
 **Delivery mechanisms** (how the agent actually runs SSH work — worker mode, the `ssh`/`ssh_git` built-in tools, the WASM `ssh` tool): [`SSH_DELIVERY_MECHANISMS.md`](SSH_DELIVERY_MECHANISMS.md)

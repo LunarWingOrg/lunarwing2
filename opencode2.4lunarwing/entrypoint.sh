@@ -5,6 +5,30 @@ set -euo pipefail
 log()  { printf '[%s] %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
 die()  { log "ERROR: $*" >&2; exit 1; }
 
+if [[ "${LUNARWING_ROOTFUL_WORKSPACE:-}" == 1 ]]; then
+  [[ "${LUNARWING_WORKSPACE_ID:-}" =~ ^[0-9]+:[0-9]+$ ]] || die "rootful workspace identity is required"
+  [[ "$(stat -c '%d:%i' -- "${WORKSPACE_ROOT:-/workspace}")" == "$LUNARWING_WORKSPACE_ID" ]] \
+    || die "workspace mount changed identity; refusing redirected workspace"
+fi
+
+if [[ "${LUNARWING_CONTAINER_ROLE:-}" == "split-bridge" ]]; then
+  exec /app/entrypoint-split.sh "$@"
+fi
+if [[ "${LUNARWING_CONTAINER_ROLE:-}" == "split-task" ]]; then
+  SPLIT_TASK_UID="${OPENCODE2_TASK_UID:-10003}"
+  [[ "$(id -u)" == "$SPLIT_TASK_UID" ]] || die "split-task must run as uid $SPLIT_TASK_UID, not $(id -u)"
+  if [[ -n "${AGENT_AUTH_TOKEN:-}" || -n "${AGENT_AUTH_TOKEN_FILE:-}" ]]; then
+    die "hub credential variables must never reach the task container"
+  fi
+  unset AGENT_AUTH_TOKEN AGENT_AUTH_TOKEN_FILE
+  TASK_RUNNER_SOCKET="${OPENCODE2_TASK_RUNNER_SOCKET:-/run/lunarwing-shared/runner/task-runner.sock}"
+  export LUNARWING_TASK_RUNNER_REMOTE=1
+  export LUNARWING_TASK_RUNNER_SOCKET="$TASK_RUNNER_SOCKET"
+  export LUNARWING_TASK_RUNNER_STATE_FILE="${OPENCODE2_TASK_RUNNER_STATE_FILE:-$(dirname "$TASK_RUNNER_SOCKET")/task-runner-state.json}"
+  export LUNARWING_TOOL_PROXY_DIR="${LUNARWING_TOOL_PROXY_DIR:-/run/lunarwing-shared/tool-proxy}"
+  export FILE_UMASK=0007
+fi
+
 MODE="${OPENCODE_MODE:-websocket}"
 HEALTH_PORT="${HEALTH_PORT:-8443}"
 OPENCODE_SERVE_PORT="${OPENCODE_SERVE_PORT:-4096}"
@@ -239,6 +263,9 @@ case "$MODE" in
     ;;
 
   websocket)
+    if [[ -n "${OPENCODE2_BRIDGE_UID:-}" && "${LUNARWING_CONTAINER_ROLE:-}" != split-task ]]; then
+      die "websocket images require LUNARWING_CONTAINER_ROLE=split-bridge or split-task"
+    fi
     log "Mode: WebSocket — starting opencode headless server"
 
     # v2 serve mandates Basic auth: without an explicit password it mints a
@@ -280,13 +307,17 @@ case "$MODE" in
     done
     log "opencode server ready on http://$OPENCODE_SERVE_HOST:$OPENCODE_SERVE_PORT"
 
-    log "Starting LunarWing bridge — role: $WS_ROLE"
     export OPENCODE_SERVE_PORT
     export OPENCODE_SERVE_HOST
     export WS_ROLE
     export WS_STATE_FILE
     export WORKSPACE_ROOT
+    if [[ "${LUNARWING_CONTAINER_ROLE:-}" == "split-task" ]]; then
+      log "Starting LunarWing task runner as uid $(id -u)"
+      exec bun run /app/scripts/task_runner.ts
+    fi
 
+    log "Starting LunarWing bridge — role: $WS_ROLE"
     exec bun run /app/scripts/lunarwing_bridge.ts
     ;;
 

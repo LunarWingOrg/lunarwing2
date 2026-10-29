@@ -18,7 +18,7 @@ mkdir -p "$fixture/env" "$fixture/run/ssh-agent" "$fixture/workspace"
 pass() { printf 'PASS: %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*"; failures=$((failures + 1)); }
 record() { printf '%s\n' "$*" >>"$events"; }
-expect() { if "$@"; then pass "$*"; else fail "$*"; fi; }
+expect() { if "$@"; then pass "$*"; else fail "$*"; command cat "$output" >&2; fi; }
 
 # Only the root-owned directory metadata is mocked, so the harness also runs
 # unprivileged. The actual flock descriptors, inode checks and locks are real.
@@ -71,6 +71,11 @@ _register_worker_unit() { record "unit:$2"; }
 render_worker_quadlet() { record "render:$2"; }
 _systemctl_user() { record "systemctl:$2:${3:-}"; }
 prepare_worker_workspace() { printf '%s/workspace' "$fixture"; }
+_snapshot_tenant_env() { local -n target="$3"; target="$(mktemp "$fixture/snapshot.XXXXXX")"; cp "$2" "$target"; }
+prepare_worker_task_launch() {
+  TASK_WORKSPACE_DIR="$fixture/workspace"
+  TASK_USERNS_ARGS=() TASK_ENV_FLAGS=() TASK_MOUNTS=() TASK_RESTART_ARG=()
+}
 # Keep the real write_kimi_runtime_env: auth failure crosses its staging
 # subshell and the starter's command-substitution assignment (QF-1).
 read_tenant_env_value() { :; }
@@ -88,8 +93,7 @@ _ctr() {
       lane="${!#}"; lane="${lane#lunarwing-worker-}"; lane="${lane%:latest}"
       record "probe:$lane"
       if [[ " $refused " == *" $lane "* ]]; then printf '12345:12345\n';
-      elif [[ "$lane" == opencode2 ]]; then printf '%s:%s\n' "$OPENCODE2_CONTAINER_UID" "$OPENCODE2_CONTAINER_GID";
-      else printf '0:0\n'; fi ;;
+      else local uid; uid="$(worker_task_uid "$lane")"; printf '%s:%s\n' "$uid" "$uid"; fi ;;
     inspect)
       [[ "$failure_mode" == none || "$*" != *lunarwing-kimi-alice* ]] || return 1
       printf 'true\n' ;;
@@ -164,7 +168,7 @@ for INIT_SYSTEM in systemd openrc; do
     run_start start_tenant
     if [[ "$failure_mode" == runtime ]]; then expect test "$rc" = 125;
     else expect test "$rc" = 1; fi
-    expect test "$(grep -Ec 'hash:lunarwing-kimi|unit:kimi|probe:opencode2' "$events" || true)" = 0
+    expect test "$(grep -Ec 'hash:lunarwing-kimi-alice$|unit:kimi|probe:opencode2' "$events" || true)" = 0
     expect test "$(grep -c 'kimi worker ready' "$output" || true)" = 0
     if [[ "$failure_mode" == auth ]]; then
       expect test "$(grep -c run:kimi "$events" || true)" = 0
@@ -181,7 +185,7 @@ for INIT_SYSTEM in systemd openrc; do
     if [[ "$failure_mode" == none ]]; then expect test "$rc" = 0;
     else
       expect test "$rc" = 1  # repair's existing API maps a failed start to 1.
-      expect test "$(grep -Ec 'hash:lunarwing-kimi|unit:kimi|probe:opencode2' "$events" || true)" = 0
+      expect test "$(grep -Ec 'hash:lunarwing-kimi-alice$|unit:kimi|probe:opencode2' "$events" || true)" = 0
       expect test "$(grep -c 'kimi worker ready' "$output" || true)" = 0
     fi
   done

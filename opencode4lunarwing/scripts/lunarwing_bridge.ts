@@ -34,6 +34,12 @@ import { executeTask } from "./opencode_task_executor"
 import type { OpencodeClient } from "@opencode-ai/sdk/v2/client"
 import { resolveTaskWorkspace } from "./workspace_path"
 import { ToolProxyRelay, type TaskProxyHandle } from "./lunarwing_tool_proxy"
+import {
+  bridgeRunnerSocketPath,
+  delegateTaskToRunner,
+  sendTaskPromptToRunner,
+  verifyRunnerSocket,
+} from "./task_runner_client"
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -75,7 +81,7 @@ const toolProxyRelay = new ToolProxyRelay()
 const activePromptQueues = new Map<string, FollowupQueue>()
 
 function taskWorkspace(request: TaskRequest): string {
-  return resolveTaskWorkspace(request.context, WORKSPACE_ROOT)
+  return resolveTaskWorkspace(request.context, WORKSPACE_ROOT, undefined, !bridgeRunnerSocketPath())
 }
 
 function abortSocketTasks(socket: BridgeSocket): void {
@@ -177,6 +183,14 @@ async function handleTaskRequest(
     return
   }
 
+  if (request.context?.environment && Object.keys(request.context.environment).length > 0) {
+    ws.send(JSON.stringify(createEnvelope("task_result", {
+      task_id: request.task_id, status: "error", output: "",
+      error: "OpenCode credential grants are unsupported (WI#474)", duration_ms: 0,
+    })))
+    return
+  }
+
   console.log(`[bridge] task ${request.task_id}: starting`)
 
   if (activeTasks.has(request.task_id)) {
@@ -233,21 +247,47 @@ async function handleTaskRequest(
   let toolProxy: TaskProxyHandle | null = null
   try {
     toolProxy = await toolProxyRelay.startTask(request.task_id, ws)
-    await executeTask(
-      request,
-      (progress) => {
-        const msg = createEnvelope("task_progress", progress as unknown as Record<string, unknown>)
-        ws.send(JSON.stringify(msg))
-      },
-      (result) => {
-        const msg = createEnvelope("task_result", result as unknown as Record<string, unknown>)
-        ws.send(JSON.stringify(msg))
-        console.log(`[bridge] task ${request.task_id}: ${result.status} (${result.duration_ms}ms)`)
-      },
-      controller.signal,
-      sdkOverride,
-      promptQueue,
-    )
+    const runnerSocket = bridgeRunnerSocketPath()
+    if (runnerSocket) {
+      if (!toolProxy) throw new Error("shared tool proxy unavailable; refusing delegated task")
+      verifyRunnerSocket(runnerSocket)
+      const result = await delegateTaskToRunner(
+        runnerSocket,
+        request,
+        undefined,
+        (progress) => {
+          ws.send(JSON.stringify(createEnvelope("task_progress", progress as unknown as Record<string, unknown>)))
+        },
+        controller.signal,
+      )
+      ws.send(JSON.stringify(createEnvelope("task_result", result as unknown as Record<string, unknown>)))
+      console.log(`[bridge] task ${request.task_id}: ${result.status} (${result.duration_ms}ms, delegated)`)
+    } else {
+      await executeTask(
+        request,
+        (progress) => {
+          const msg = createEnvelope("task_progress", progress as unknown as Record<string, unknown>)
+          ws.send(JSON.stringify(msg))
+        },
+        (result) => {
+          const msg = createEnvelope("task_result", result as unknown as Record<string, unknown>)
+          ws.send(JSON.stringify(msg))
+          console.log(`[bridge] task ${request.task_id}: ${result.status} (${result.duration_ms}ms)`)
+        },
+        controller.signal,
+        sdkOverride,
+        promptQueue,
+      )
+    }
+  } catch (err) {
+    console.error(`[bridge] task ${request.task_id}: execution failed:`, err)
+    ws.send(JSON.stringify(createEnvelope("task_result", {
+      task_id: request.task_id,
+      status: "error",
+      output: "",
+      error: err instanceof Error ? err.message : String(err),
+      duration_ms: 0,
+    })))
   } finally {
     toolProxy?.close()
     activeTasks.delete(request.task_id)
@@ -338,8 +378,13 @@ function handleTaskPrompt(payload: unknown, ws: BridgeSocket): void {
     refuse("per-task control queue limit reached")
     return
   }
+  const delegated = Boolean(bridgeRunnerSocketPath())
+  if (delegated && !sendTaskPromptToRunner(prompt)) {
+    refuse("task runner control channel unavailable")
+    return
+  }
   seen.add(prompt.seq)
-  queue.prompts.push(prompt)
+  if (!delegated) queue.prompts.push(prompt)
   if (prompt.done) {
     // DW-4: `done` closes the channel the moment it is ACCEPTED, not when
     // the executor happens to consume it — a prompt accepted after this

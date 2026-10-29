@@ -575,7 +575,7 @@ case "${1:-} ${2:-}" in
   'pod exists') [[ -f "$state/present" ]] ;;
   'pod create')
     touch "$state/present"
-    printf '%s\n' "${FAKE_INFRA_IMAGE:-localhost/podman-pause:5.8.2}" >"$state/image"
+    printf '%s\n' "${FAKE_INFRA_IMAGE-localhost/podman-pause:5.8.2}" >"$state/image"
     printf 'false\n' >"$state/running"
     ;;
   'pod start') printf 'true\n' >"$state/running" ;;
@@ -592,6 +592,7 @@ case "${1:-} ${2:-}" in
     case "${3:-}" in
       *IsInfra*) printf 'true\n' ;;
       *ImageName*) cat "$state/image" ;;
+      *Rootfs*) printf '%s\n' "${FAKE_NATIVE_PAUSE-|/catatonit|[\"-P\"]|[]|/run/user/1000/libpod/tmp/infra-container}" ;;
       *State.Running*) cat "$state/running" ;;
       *NetworkSettings.Networks*) printf 'lw-egress-alpha\n' ;;
       *) exit 64 ;;
@@ -676,6 +677,33 @@ else
   [[ ! -e "$rootless_state/present" ]] || fail "remote-image keeper pod remains after refusal"
   assert_absent "$(cat "$rootless_bin/nft.log")" '-f' "remote infra image is rejected before nft load"
 fi
+
+rm -rf -- "$rootless_state"
+mkdir -p "$rootless_state"
+if FAKE_INFRA_IMAGE='' PATH="$rootless_bin:$PATH" \
+    "$guard" "$fixture/alpha.nft" rootless fwd_alpha alpha >"$fixture/native-pause.out" 2>&1; then
+  pass "guard accepts the Podman native image-less pause keeper"
+else
+  fail "native pause keeper refused: $(cat "$fixture/native-pause.out")"
+fi
+for native_shape in \
+  'sha256:foreign|/catatonit|["-P"]|[]|/run/user/1000/libpod/tmp/infra-container' \
+  '|/bin/sh|["-P"]|[]|/run/user/1000/libpod/tmp/infra-container' \
+  '|/catatonit|["-P","extra"]|[]|/run/user/1000/libpod/tmp/infra-container' \
+  '|/catatonit|["-P"]|[{}]|/run/user/1000/libpod/tmp/infra-container' \
+  '|/catatonit|["-P"]|[]|/tmp/foreign-rootfs'; do
+  rm -rf -- "$rootless_state"
+  mkdir -p "$rootless_state"
+  : >"$rootless_bin/nft.log"
+  if FAKE_INFRA_IMAGE='' FAKE_NATIVE_PAUSE="$native_shape" PATH="$rootless_bin:$PATH" \
+      "$guard" "$fixture/alpha.nft" rootless fwd_alpha alpha >"$fixture/native-refused.out" 2>&1; then
+    fail "guard accepted unexpected native pause metadata: $native_shape"
+  else
+    pass "guard rejects unexpected native pause metadata: $native_shape"
+    assert_absent "$(cat "$rootless_bin/nft.log")" '-f' "invalid native pause is rejected before nft load"
+    [[ ! -e "$rootless_state/present" ]] || fail "invalid native keeper remains after refusal"
+  fi
+done
 
 locked_callback() {
   local result=0
@@ -838,9 +866,12 @@ assert_rc_fail env PATH="$fixture:$PATH" "$babysitter" lunarwing-opencode2-alpha
 # ── source wiring pins ────────────────────────────────────────────────────────
 worker_config="$HARNESS_REPO_ROOT/ic/scripts/mt-admin-lib/09-worker-config.sh"
 systemd_lib="$HARNESS_REPO_ROOT/ic/scripts/mt-admin-lib/07-units-systemd.sh"
-assert_eq "$(grep -c 'WORKER_EGRESS_LAUNCH_ARGS' "$worker_config")" "4" "all four imperative workers use the complete egress launch args"
-assert_eq "$(grep -c 'worker_egress_reconcile_container' "$worker_config")" "4" "all four imperative workers recreate stale containers"
-assert_eq "$(grep -c 'worker_egress_verify_after_start' "$worker_config")" "5" "all Quadlet workers and the shared imperative registration verify after start"
+assert_eq "$(grep -c 'WORKER_EGRESS_LAUNCH_ARGS' "$worker_config")" "5" "all bridge and task imperative workers use the complete egress launch args"
+assert_eq "$(grep -c 'worker_egress_reconcile_container' "$worker_config")" "5" "all bridge and task imperative workers recreate stale containers"
+assert_eq "$(grep -c 'worker_egress_verify_after_start' "$worker_config")" "9" "all bridge and task starts and Quadlet registrations verify egress after start"
+task_start="$(awk '/^start_worker_task_container\(\)/ { in_fn=1 } in_fn { print } in_fn && /^}/ { exit }' "$worker_config")"
+assert_contains "$task_start" '"${WORKER_EGRESS_LAUNCH_ARGS[@]}"' "task container launch uses the tenant egress contract"
+assert_contains "$task_start" 'worker_egress_verify_after_start "$name" "$task_container"' "task container is verified after creation"
 assert_contains "$(cat "$systemd_lib")" 'ExecStartPre=${egress_guard} ${egress_ruleset} rootless ${egress_chain}' "Quadlet pre-start guard is mandatory"
 assert_contains "$(cat "$systemd_lib")" 'ExecStartPost=${egress_guard} --verify ${egress_ruleset} rootless ${egress_chain}' "Quadlet post-start guard is mandatory"
 assert_contains "$(cat "$systemd_lib")" 'DNS=127.0.0.1' "Quadlet disables upstream DNS"

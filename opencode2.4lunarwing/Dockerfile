@@ -6,13 +6,13 @@
 # Re-bump only after re-verifying the bridge against the v2 server API.
 ARG OPENCODE_VERSION=v2.1.2
 ARG OPENCODE_REF=a517687fde98a7329ada3ae644a01a9fc6c4e99e
-ARG DEBIAN_SNAPSHOT=20261017T082437Z
+ARG DEBIAN_SNAPSHOT=20261024T011300Z
 ARG SOURCE_REVISION=unknown
 
 # ──────────────────────
 # Stage 1: build opencode from source
 # ──────────────────────
-FROM docker.io/oven/bun:debian@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895 AS builder
+FROM docker.io/oven/bun:1.4.4-debian@sha256:93d5032fe06d163427822dc1598f420363759bb18155c9cc90eb1be05a64a19e AS builder
 
 ARG OPENCODE_VERSION
 ARG OPENCODE_REF
@@ -100,7 +100,7 @@ RUN set -e; \
 # ──────────────────────
 # Stage 2: runtime image
 # ──────────────────────
-FROM docker.io/oven/bun:debian@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895 AS runtime
+FROM docker.io/oven/bun:1.4.4-debian@sha256:93d5032fe06d163427822dc1598f420363759bb18155c9cc90eb1be05a64a19e AS runtime
 
 ARG DEBIAN_SNAPSHOT
 ARG SOURCE_REVISION
@@ -257,9 +257,17 @@ ENV GOROOT=/usr/local/go \
 # ── non-root user ──────────────────────
 # Keep IDs synchronized with ic/scripts/lunarwing-mt-admin.sh (opencode2 =
 # 10003, distinct from opencode 10001 and kimi 10002) so two opencode lanes on
-# one tenant keep separate userns identities.
+# one tenant keep separate userns identities. WI#454 adds the bridge identity.
+ARG SOURCE_DATE_EPOCH=0
 RUN groupadd --gid 10003 opencode2 \
-    && useradd --uid 10003 --gid 10003 -m -d /home/opencode2 opencode2
+    && useradd --uid 10003 --gid 10003 -m -d /home/opencode2 opencode2 \
+    && useradd --uid 10103 --gid 10003 -m -d /home/opencode2-bridge opencode2-bridge \
+    && shadow_entry="$(getent shadow opencode2)" \
+    && shadow_day="$(printf '%s' "$shadow_entry" | cut -d: -f3)" \
+    && test "${shadow_day:-0}" = "$((SOURCE_DATE_EPOCH / 86400))" \
+    && shadow_entry="$(getent shadow opencode2-bridge)" \
+    && shadow_day="$(printf '%s' "$shadow_entry" | cut -d: -f3)" \
+    && test "${shadow_day:-0}" = "$((SOURCE_DATE_EPOCH / 86400))"
 
 # ── app layout ─────────────────────────
 WORKDIR /app
@@ -277,7 +285,7 @@ COPY --from=builder /build/opencode/packages/schema/package.json /app/node_modul
 COPY --from=builder /build/opencode/packages/protocol/src /app/node_modules/@opencode/protocol/src
 COPY --from=builder /build/opencode/packages/protocol/package.json /app/node_modules/@opencode/protocol/package.json
 
-COPY entrypoint.sh health_server.py agent_comm_protocol.json ./
+COPY entrypoint.sh entrypoint-split.sh health_server.py agent_comm_protocol.json ./
 # WI#357 (run-79 EI-5): the exposure controls (wrapper, policy assert,
 # compile-out guard, lane config) must be root-owned and read-only — the
 # agent user gets edit/write on the workspace, so an agent-writable config
@@ -290,8 +298,8 @@ COPY entrypoint.sh health_server.py agent_comm_protocol.json ./
 COPY scripts/ ./scripts/
 COPY config/ ./config/
 
-RUN chmod +x /app/entrypoint.sh /app/health_server.py \
-    && chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/health_server.py /app/agent_comm_protocol.json
+RUN chmod +x /app/entrypoint.sh /app/entrypoint-split.sh /app/health_server.py \
+    && chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/entrypoint-split.sh /app/health_server.py /app/agent_comm_protocol.json
 
 # WI#357: install the exposure-guard wrapper as the only PATH-visible
 # opencode entrypoint, then fail the BUILD when the policy regresses:
@@ -369,6 +377,7 @@ RUN set -eu; \
     && bun scripts/lunarwing_tool_proxy_test.ts \
     && bun scripts/lunarwing_tool_plugin_test.ts \
     && bun scripts/lunarwing_bridge_test.ts \
+    && bun test scripts/task_runner_test.ts \
     && python3 scripts/prepare_reproducible_build_test.py \
     && python3 scripts/study_notes_config_test.py \
     && python3 scripts/exposure_policy_assert_test.py \
@@ -389,6 +398,10 @@ RUN mkdir -p /home/opencode2/.local/share/opencode \
              /app/results \
     && chown -R opencode2:opencode2 /home/opencode2 /workspace /var/log/lunarwing /app/results
 
+RUN install -d -o root -g opencode2 -m 3770 /run/lunarwing-shared \
+    && install -d -o opencode2 -g opencode2 -m 2711 /run/lunarwing-shared/runner \
+    && install -d -o opencode2-bridge -g opencode2 -m 2711 /run/lunarwing-shared/tool-proxy
+
 # cp -a preserves setgid from the builder's source directories. Dependencies
 # stay root-owned and readable, with privilege and write bits stripped.
 RUN chmod -R a-s,a-w /app/node_modules
@@ -396,6 +409,14 @@ RUN chmod -R a-s,a-w /app/node_modules
 # WI#424 control 6: run the smoke against a real started entrypoint, not the
 # empty process table and throwaway HOME of a Dockerfile RUN.
 RUN bash /app/scripts/runtime_smoke_entrypoint.sh
+
+# The split identities are part of the final image configuration. Declare them
+# before the filesystem assertion so the policy check validates the metadata
+# that the runtime image actually carries.
+ENV OPENCODE2_TASK_UID=10003 \
+    OPENCODE2_TASK_GID=10003 \
+    OPENCODE2_BRIDGE_UID=10103
+USER 10003:10003
 
 # Check the final runtime filesystem, after all COPY/chown/chmod operations.
 # The wrapper anchor ARG (WI#357 run-106 GJ-3(a), WI#425 GX-3 layer-locality)
@@ -414,8 +435,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD curl -sf http://127.0.0.1:8443/health || exit 1
 
 STOPSIGNAL SIGTERM
-
-USER 10003:10003
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
 CMD ["--mode", "websocket"]

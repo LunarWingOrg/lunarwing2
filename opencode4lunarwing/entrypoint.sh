@@ -14,6 +14,10 @@
 # task-uid read is EACCES — see docs/ops/WORKER-CONTAINERS.md.
 set -euo pipefail
 
+if [[ "${LUNARWING_CONTAINER_ROLE:-}" == "split-bridge" || "${LUNARWING_CONTAINER_ROLE:-}" == "split-task" ]]; then
+  exec /app/entrypoint-split.sh "$@"
+fi
+
 log()  { printf '[%s] %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
 die()  { log "ERROR: $*" >&2; exit 1; }
 
@@ -141,6 +145,7 @@ case "$MODE" in
     ;;
 
   websocket)
+    [[ -z "${OPENCODE_BRIDGE_UID:-}" ]] || die "websocket images require LUNARWING_CONTAINER_ROLE=split-bridge or split-task"
     log "Mode: WebSocket — starting opencode headless server"
 
     cd "$WORKSPACE_ROOT"

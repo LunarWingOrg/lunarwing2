@@ -402,6 +402,7 @@ pub struct TestRigBuilder {
     skills_to_seed: Vec<(String, String)>,
     extra_channels: Vec<Box<dyn lunarwing::channels::Channel>>,
     vision_enrichment: Option<Arc<lunarwing::vision_enrichment::VisionEnrichmentMiddleware>>,
+    sse_tx: Option<Arc<lunarwing::channels::web::sse::SseManager>>,
 }
 
 impl TestRigBuilder {
@@ -427,7 +428,13 @@ impl TestRigBuilder {
             skills_to_seed: Vec::new(),
             extra_channels: Vec::new(),
             vision_enrichment: None,
+            sse_tx: None,
         }
+    }
+
+    pub fn with_sse(mut self, sse: Arc<lunarwing::channels::web::sse::SseManager>) -> Self {
+        self.sse_tx = Some(sse);
+        self
     }
 
     /// Load a real WASM tool binary into the test rig.
@@ -616,6 +623,7 @@ impl TestRigBuilder {
             skills_to_seed,
             extra_channels,
             vision_enrichment,
+            sse_tx,
         } = self;
 
         // 1. Create temp dir and seed skill fixtures before AppBuilder discovery.
@@ -906,7 +914,7 @@ impl TestRigBuilder {
             skills_config: components.config.skills.clone(),
             hooks: components.hooks,
             cost_guard: components.cost_guard,
-            sse_tx: None,
+            sse_tx,
             http_interceptor,
             transcription: None,
             document_extraction: None,

@@ -487,6 +487,14 @@ pub(crate) fn bridge_uid() -> std::io::Result<u32> {
 /// capability the docs had marked droppable.
 fn hand_socket_to_task(socket_path: &Path, task_id: &str) {
     use std::os::unix::fs::PermissionsExt;
+    if std::env::var("LUNARWING_TASK_RUNNER_REMOTE").as_deref() == Ok("1") {
+        if let Err(error) =
+            std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o660))
+        {
+            eprintln!("[tool-proxy] task {task_id}: shared socket chmod failed: {error}");
+        }
+        return;
+    }
     let Ok(Some(ids)) = crate::executor::task_ids_from_env() else {
         return;
     };

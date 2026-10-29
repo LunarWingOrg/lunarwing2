@@ -434,6 +434,22 @@ test("the proxy dir is created bridge-owned 0711 (KW-6)", async () => {
   }
 })
 
+test("shared split sockets are group-writable and the directory stays non-writable", async () => {
+  const previous = process.env.LUNARWING_TASK_RUNNER_REMOTE
+  process.env.LUNARWING_TASK_RUNNER_REMOTE = "1"
+  const hub = new FakeHubSocket()
+  try {
+    const handle = await relay.startTask("task-shared-split", hub)
+    assert.ok(handle, "shared task proxy should start")
+    assert.equal(statSync(handle.socketPath).mode & 0o777, 0o660)
+    assert.equal(statSync(workDir).mode & 0o777, 0o711)
+    handle.close()
+  } finally {
+    if (previous === undefined) delete process.env.LUNARWING_TASK_RUNNER_REMOTE
+    else process.env.LUNARWING_TASK_RUNNER_REMOTE = previous
+  }
+})
+
 test("proxyEnvForTask carries the binding the shim reads", () => {
   const env = proxyEnvForTask("task-9", "/tmp/x.sock")
   assert.equal(env.LUNARWING_TASK_ID, "task-9")

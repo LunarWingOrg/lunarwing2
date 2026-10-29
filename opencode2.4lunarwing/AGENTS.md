@@ -19,7 +19,9 @@ internal opencode headless server.
 - `scripts/sdk_surface.ts` — Canonical list of the `@opencode/client` method paths the bridge calls and the event `type` literals it matches (WI#329). It drives the image-build gate (`scripts/sdk_surface_assert.ts`, run from the Dockerfile — asserts the method paths against the real pinned client and the event names against the pinned generated V2Event union, WI#369) and the executor self-test, which binds it to the injected mock, to the call sites/event literals extracted from every non-test `scripts/*.ts` source, and — via a recording Proxy over the mock — to every client leaf path the suite actually touches. ADD to this list whenever the bridge calls a new client method or matches a new event; never shrink it to force an assertion to pass.
 - `scripts/tsconfig.sdk-surface.json` — WI#369 compile-time gate: the Dockerfile builder stage runs `tsc --noEmit` (the monorepo's pinned `@typescript/native` npm:typescript@7.0.2 binary; v2.0.32's `@typescript/native-preview` shipped it as `tsgo`) over the SDK-facing scripts against the pinned generated client types, covering call argument and event payload shapes. Keep its `include` list covering every non-test script that imports `@opencode/client`. `scripts/gate-env.d.ts` carries the minimal runtime declarations the gate needs (the monorepo's bun install does not expose @types at a stable path); extend it when a gated script uses a new runtime API.
 - `scripts/lunarwing_runtime.ts` — Shared types and envelope helpers. Keep in sync with `agent_comm_protocol.json`.
-- `entrypoint.sh` — Startup orchestration. Three modes: websocket, cli, acp.
+- `entrypoint-split.sh` — WI#454 bridge uid 10103:10003, private token home `/home/opencode2-bridge`; task role stays in `entrypoint.sh` as uid 10003:10003 and owns loopback serve. Both use no-new-privileges and no capabilities, with role-owned sticky `-ipc-v2` IPC. Rootful starts pin the workspace device/inode before setup.
+- `scripts/task_runner.ts` / `scripts/task_runner_client.ts` — Bounded Unix task dispatch, cancellation and ping health. The task runner creates cron directories. Reject grants before delegation; jobs sharing this task container share authority. Keep the parser, image config and exported-source fixtures in sync with split identity ENV and boot files.
+- `entrypoint.sh` — Three modes: websocket, cli, acp. Split images require an explicit websocket role; managed split-task runs setup, serve and the runner, split-bridge dispatches to the private launcher. Host legacy paths remain for build/config fixtures. Full lifecycle and migration contract: `docs/ops/WORKER-CONTAINERS.md`.
 - `config/opencode2.json` — Mounted into container; controls LLM provider, MCP servers. v2 config shape (`providers`, `settings.baseURL`, `package`).
 
 ## Protocol Compatibility
@@ -85,6 +87,13 @@ under `/tmp` or `/var/log/lunarwing` is newer than its marker. Every Dockerfile
 `RUN` must leave no per-build residue and consume deterministic, pinned inputs;
 the candidate/clean-rebuild digest gate remains mandatory. Never invoke bun or
 the opencode binary in the image build with the default root HOME.
+
+Keep `ARG SOURCE_DATE_EPOCH=0` in the runtime stage before `useradd` and keep
+the same-layer shadow-day assertion. Shadow-utils records the epoch day in
+`/etc/shadow`; without the ARG a candidate and rebuild spanning UTC midnight
+have different file contents, which BuildKit's timestamp rewrite cannot fix
+(WI#510). All four workers and `CI_DEBIAN_SNAPSHOT` use `20261024T011300Z`,
+which includes the Bookworm/Trixie Brotli security fixes; bump them together.
 
 ## Do Not
 

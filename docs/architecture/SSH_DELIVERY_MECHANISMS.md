@@ -1,6 +1,12 @@
 # SSH Delivery Mechanisms
 
-**Status:** As-built (all three mechanisms shipped). Revalidated against source 2026-09-28 (v2.1.3.0; item-40 socket-directory mount), and again 2026-10-01 (v2.1.4.0 — no SSH harness/tool change this cycle; opencode2 worker image only moved pins 2.0.18 → 2.0.20, which does not affect the mount or socket contract), and again 2026-10-06 (v2.1.5.0 — no SSH harness/tool change this cycle; opencode2 worker pins stayed at v2.0.21 and the `ssh` registry package only bumped 0.1.2 → 0.1.3 with no contract change; WI#307's shared autonomous denylist already contained `ssh`/`ssh_git`, so the documented non-foreground denial is unchanged. Substantive fix this pass: the at-a-glance table still listed the kimi worker lane for SSH jobs although WI#206 removed its socket mount — corrected to match Mechanism 1), and again 2026-10-14 (v2.1.6.0 — no SSH harness/tool source change this cycle; the only tree change under `ic/tools-src/ssh/` was its `Cargo.lock` dependency refresh, the `ssh` registry package only bumped 0.1.3 → 0.1.4, the WIT package stays `lunarwing:agent@0.3.0`, and opencode2 worker pins stayed at v2.0.24 — the 2.1.5.0 cycle moved them v2.0.21 → v2.0.23 (`76712047f`, WI#303, merged fifteen minutes before the stamp above) and v2.0.23 → v2.0.24 (`ffa43625d`, merged 2026-10-07), so that stamp's "stayed at v2.0.21" was already stale when it merged; the 2.1.6.0 Dockerfile changes are the WI#329 sdk-surface build gates (`713e53ba9`, `6d418ce4e`) and the WI#357 exposure-policy controls (!1643: root-owned read-only config, the argv-scanning `opencode` wrapper, the OpenTunnel compile-out), none of which affects the mount, socket, or capability contract).
+**Status:** As-built; source revalidated 2026-10-29 for v2.1.7.0. Worker socket
+mounts are owned by `ic/scripts/mt-admin-lib/09-worker-config.sh` and generated
+units; direct execution by `ic/src/tools/builtin/{ssh,ssh_git}.rs` and
+`ic/src/bridge/ssh_client.rs`; WASM access by `ic/src/tools/wasm/wrapper.rs`.
+WI#424 adds a separate network requirement for worker SSH: the tenant's egress
+allowlist must permit the destination host and port. The signing socket does not
+grant network reachability. Kimi still receives no SSH-agent mount (WI#206).
 **Core design:** [`SSH_AGENT_HARNESS.md`](SSH_AGENT_HARNESS.md) — the per-tenant bridge, agent socket, secrets, and host-key verifier that all three mechanisms share.
 **Operator setup:** [`../ops/SSH-HARNESS-SETUP.md`](../ops/SSH-HARNESS-SETUP.md)
 
@@ -11,10 +17,12 @@ foundation there are **three ways the agent actually runs SSH work**. This doc
 covers all three as-built: what each is, when to use it, its security posture,
 and how to enable it.
 
-> **Shared key-handling invariant:** private keys live only in the encrypted
-> secrets store and are decrypted only inside the daemon; no mechanism hands raw
-> key bytes to the model or a worker container. Host targeting differs by
-> mechanism. Built-in `ssh`, `ssh_git`, and WASM `ssh` require a configured
+> **Shared key-handling invariant:** runtime credentials are loaded from the
+> encrypted secrets store inside the daemon; these mechanisms do not hand raw
+> private keys to the model or worker containers. Default mt-admin provisioning
+> still leaves a mode-0600 source key in the tenant's `~/.ssh/` and retains a
+> staging copy until upload succeeds; see the core design's provisioning caveat.
+> Host targeting differs by mechanism. Built-in `ssh`, `ssh_git`, and WASM `ssh` require a configured
 > `[[ssh.hosts]]` alias (and WASM narrows it again per tool). Worker mode receives
 > a generic signing socket: its ordinary SSH client chooses the destination, so
 > the configured host map is **not** an egress allowlist for that path.
@@ -210,8 +218,8 @@ host-key verification stay host-side — the guest never sees key material.
 
 ```bash
 cd ic
-cargo component build --release --target wasm32-wasip2 \
-  --manifest-path tools-src/ssh/Cargo.toml
+taskset -c 0-17 cargo component build --locked --release -j18 \
+  --target wasm32-wasip2 --manifest-path tools-src/ssh/Cargo.toml
 # -> tools-src/ssh/target/wasm32-wasip2/release/ssh_tool.wasm
 # or, registry-driven for all tools: scripts/build-wasm-extensions.sh --tools
 ```

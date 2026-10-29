@@ -73,6 +73,7 @@ pub struct BridgeConfig {
     /// Where this bridge's per-task relay sockets live
     /// (`LUNARWING_TOOL_PROXY_DIR`, default `/tmp/lunarwing-tool-proxy`).
     pub tool_proxy_dir: std::path::PathBuf,
+    pub task_runner_socket: Option<PathBuf>,
 }
 
 /// Outbound envelopes for one WebSocket connection, drained by the writer
@@ -96,6 +97,9 @@ impl BridgeConfig {
             permission_mode: env_or("PEBBLE_PERMISSION_MODE", "danger-full-access"),
             workspace_root: env_or("WORKSPACE_ROOT", "/workspace"),
             tool_proxy_dir: tool_proxy::tool_proxy_dir(),
+            task_runner_socket: std::env::var_os("LUNARWING_TASK_RUNNER_SOCKET")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
         })
     }
 }
@@ -352,10 +356,41 @@ fn negotiate_subprotocol(offer: &str) -> Option<&'static str> {
 }
 
 fn reject(status: StatusCode) -> http::Response<Option<String>> {
-    http::Response::builder()
-        .status(status)
-        .body(None)
-        .expect("response")
+    let mut response = http::Response::new(None);
+    *response.status_mut() = status;
+    response
+}
+
+async fn execute_dispatch_task(
+    exec_config: &ExecutorConfig,
+    runner_socket: Option<PathBuf>,
+    request: &TaskRequest,
+    proxy_env: Option<&[(String, String); 2]>,
+    event_tx: mpsc::UnboundedSender<ExecutorEvent>,
+    cancel_rx: oneshot::Receiver<()>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(socket) = runner_socket {
+        return crate::task_runner::delegate_task(&socket, request, proxy_env, event_tx, cancel_rx)
+            .await;
+    }
+    executor::run_task(exec_config, request, event_tx, cancel_rx, proxy_env).await;
+    Ok(())
+}
+
+fn forward_execution_error(
+    event_tx: &mpsc::UnboundedSender<ExecutorEvent>,
+    task_id: &str,
+    execution: Result<(), Box<dyn std::error::Error + Send + Sync>>,
+) {
+    if let Err(error) = execution {
+        let _ = event_tx.send(ExecutorEvent::Result(protocol::result_envelope(
+            task_id,
+            "error",
+            "",
+            Some(&error.to_string()),
+            0,
+        )));
+    }
 }
 
 async fn dispatch_task(
@@ -454,6 +489,7 @@ async fn dispatch_task(
     // removed on natural completion, leaking a dead `oneshot::Sender` per
     // task). It then forwards every executor envelope through the outbound
     // channel.
+    let task_runner_socket = config.task_runner_socket.clone();
     {
         let registry = Arc::clone(registry);
         let cancels = Arc::clone(cancels);
@@ -461,14 +497,17 @@ async fn dispatch_task(
         let task_id = request.task_id.clone();
         let out_tx = out_tx.clone();
         tokio::spawn(async move {
-            executor::run_task(
+            let execution = execute_dispatch_task(
                 &exec_config,
+                task_runner_socket,
                 &request,
-                event_tx,
-                cancel_rx,
                 proxy_env.as_ref(),
+                event_tx.clone(),
+                cancel_rx,
             )
             .await;
+            forward_execution_error(&event_tx, &task_id, execution);
+            drop(event_tx);
             // The task is over: close its relay slot (fails any call still
             // in flight) before releasing the workspace claim.
             relay.close_task(&task_id).await;
@@ -705,6 +744,7 @@ mod tests {
             permission_mode: "default".to_string(),
             workspace_root: workspace_root_str(),
             tool_proxy_dir: unique_proxy_dir(),
+            task_runner_socket: None,
         }
     }
 

@@ -38,8 +38,8 @@
  * (`node task_runner.js <socket-path>`) stays for host-side runs and tests.
  */
 
-import { createServer, type Server, type Socket } from "node:net"
-import { lstatSync, mkdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs"
+import { connect, createServer, type Server, type Socket } from "node:net"
+import { chmodSync, lstatSync, mkdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs"
 import { dirname } from "node:path"
 
 import { executeTask } from "./kimi_task_executor.js"
@@ -55,6 +55,11 @@ import {
 
 /** Env var carrying the inherited listening descriptor (NL-7). */
 export const RUNNER_LISTEN_FD_ENV = "LUNARWING_TASK_RUNNER_LISTEN_FD"
+
+/** True when a separate non-root bridge connects through the shared IPC volume. */
+export function sharedTaskContainer(): boolean {
+  return process.env.LUNARWING_TASK_RUNNER_REMOTE === "1"
+}
 
 /**
  * Hub-handshake credential names the runner must never see (WI#373/WI#400).
@@ -188,6 +193,7 @@ export class TaskRunner {
       refuseSymlinkedRunnerDir(dirname(socketPath))
       mkdirSync(dirname(socketPath), { recursive: true, mode: 0o700 })
       refuseSymlinkedRunnerDir(dirname(socketPath))
+      if (sharedTaskContainer()) chmodSync(dirname(socketPath), 0o711)
       // A stale socket from a crashed runner would make listen() fail with
       // EADDRINUSE; remove it (the path is owned by this daemon's uid).
       rmSync(socketPath, { force: true })
@@ -203,6 +209,16 @@ export class TaskRunner {
       this.server.listen(socketPath, () => resolve(true))
     })
     if (!started) return null
+    if (sharedTaskContainer()) {
+      try {
+        chmodSync(socketPath, 0o660)
+      } catch (err) {
+        console.error("[task-runner] shared socket chmod failed:", err instanceof Error ? err.message : err)
+        this.server.close()
+        rmSync(socketPath, { force: true })
+        return null
+      }
+    }
     this.socketPath = socketPath
     return socketPath
   }
@@ -440,12 +456,43 @@ export function inheritedListenFd(raw: string | undefined = process.env[RUNNER_L
   return Number(raw)
 }
 
-/**
- * CLI entrypoint. In the image: `node task_runner.js` with the listening
- * descriptor inherited from the root launcher (NL-7). Host runs and tests:
- * `node task_runner.js <socket-path>` (or LUNARWING_TASK_RUNNER_SOCKET).
- */
+export async function runnerHealthcheck(socketPath: string): Promise<number> {
+  if (!socketPath) return 1
+  return await new Promise((resolve) => {
+    const socket = connect(socketPath)
+    let data = Buffer.alloc(0)
+    let settled = false
+    const finish = (ok: boolean) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      socket.destroy()
+      resolve(ok ? 0 : 1)
+    }
+    const timer = setTimeout(() => finish(false), 2_000)
+    socket.once("error", () => finish(false))
+    socket.once("close", () => finish(false))
+    socket.on("data", (chunk: Buffer) => {
+      if (data.length + chunk.length > 1024) return finish(false)
+      data = Buffer.concat([data, chunk])
+      const newline = data.indexOf(10)
+      if (newline < 0) return
+      try {
+        const response: unknown = JSON.parse(data.subarray(0, newline).toString("utf8"))
+        finish(isRecord(response) && response.ok === true && response.op === "pong")
+      } catch {
+        finish(false)
+      }
+    })
+    socket.write('{"op":"ping"}\n')
+  })
+}
+
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
+  if (argv[0] === "--healthcheck") {
+    const socketPath = argv[1] ?? taskRunnerSocketPath()
+    return await runnerHealthcheck(socketPath)
+  }
   let listenFd: number | null
   try {
     listenFd = inheritedListenFd()
@@ -493,7 +540,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       writeFileSync(stateFile, JSON.stringify({
         ready: true,
         heartbeat_at: new Date().toISOString(),
-      }) + "\n", { mode: 0o600 })
+      }) + "\n", { mode: sharedTaskContainer() ? 0o640 : 0o600 })
+      if (sharedTaskContainer()) chmodSync(stateFile, 0o640)
     } catch (err) {
       console.error("[task-runner] state write failed:", err instanceof Error ? err.message : err)
     }
@@ -515,5 +563,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 }
 
 if (process.argv[1] && (process.argv[1].endsWith("task_runner.js") || process.argv[1].endsWith("task_runner.ts"))) {
-  void main()
+  void main().then((code) => {
+    process.exitCode = code
+  })
 }

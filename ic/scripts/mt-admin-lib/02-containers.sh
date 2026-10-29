@@ -168,6 +168,7 @@ _ensure_tenant_image() {
 _worker_launch_contract() {
   local name="$1" image="$2" base="${3:-}" image_id
   base="${base:+$base;}egress=$(worker_egress_network_name "$name")"
+  [[ "${MT_ROOTLESS:-true}" == true ]] || base="$base;workspace-inode-v1"
   image_id="$(_ctr "$name" image inspect -f '{{.Id}}' "$image" 2>/dev/null)" || image_id=""
   if [[ -z "$image_id" ]]; then
     printf '%s' "$base"
