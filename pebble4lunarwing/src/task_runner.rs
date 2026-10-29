@@ -342,23 +342,12 @@ async fn handle_connection(stream: UnixStream, config: Arc<ExecutorConfig>) -> R
             return Ok(());
         }
     };
-    let proxy_env = if request_value.get("proxy_env").is_some()
-        && !request_value["proxy_env"].is_null()
-    {
-        match serde_json::from_value::<[(String, String); 2]>(request_value["proxy_env"].clone()) {
-            Ok(pairs) => Some(pairs),
-            Err(error) => {
-                write_line(
-                    &mut write,
-                    &serde_json::to_string(&json!({"ok": false, "error": error.to_string()}))?,
-                )
-                .await?;
-                return Ok(());
-            }
-        }
-    } else {
-        None
-    };
+    let proxy_env = request_value
+        .get("proxy_env")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .map(serde_json::from_value::<[(String, String); 2]>)
+        .transpose()?;
     write_line(
         &mut write,
         &serde_json::to_string(&json!({"ok": true, "op": "accepted", "task_id": request.task_id}))?,
