@@ -92,9 +92,6 @@ services:
       WS_PORT: ${WS_PORT:-9090}
       WS_PATH: ${WS_PATH:-/ws/agent}
     ports:
-      # Loopback only — the bridge accepts tasks over WS and AGENT_AUTH_TOKEN
-      # defaults to empty, so publishing on all interfaces would let anyone on
-      # the LAN drive an auto-approving agent.
       - "127.0.0.1:${HEALTH_PORT:-8443}:${HEALTH_PORT:-8443}"
       - "127.0.0.1:${WS_PORT:-9090}:${WS_PORT:-9090}"
     healthcheck:
@@ -115,6 +112,7 @@ services:
     command: []
     environment:
       <<: *worker-env
+      AGENT_AUTH_TOKEN: ${AGENT_AUTH_TOKEN:?AGENT_AUTH_TOKEN is required}
       SMOKE_WS_HOST: lunarwing-worker
       SMOKE_WS_PORT: ${WS_PORT:-9090}
       SMOKE_HEALTH_PORT: ${HEALTH_PORT:-8443}
