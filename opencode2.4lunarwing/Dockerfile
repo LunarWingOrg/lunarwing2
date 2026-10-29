@@ -410,6 +410,14 @@ RUN chmod -R a-s,a-w /app/node_modules
 # empty process table and throwaway HOME of a Dockerfile RUN.
 RUN bash /app/scripts/runtime_smoke_entrypoint.sh
 
+# The split identities are part of the final image configuration. Declare them
+# before the filesystem assertion so the policy check validates the metadata
+# that the runtime image actually carries.
+ENV OPENCODE2_TASK_UID=10003 \
+    OPENCODE2_TASK_GID=10003 \
+    OPENCODE2_BRIDGE_UID=10103
+USER 10003:10003
+
 # Check the final runtime filesystem, after all COPY/chown/chmod operations.
 # The wrapper anchor ARG (WI#357 run-106 GJ-3(a), WI#425 GX-3 layer-locality)
 # is declared here so the digest comparison is visible at the assert and a
@@ -427,11 +435,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD curl -sf http://127.0.0.1:8443/health || exit 1
 
 STOPSIGNAL SIGTERM
-
-ENV OPENCODE2_TASK_UID=10003 \
-    OPENCODE2_TASK_GID=10003 \
-    OPENCODE2_BRIDGE_UID=10103
-USER 10003:10003
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
 CMD ["--mode", "websocket"]
