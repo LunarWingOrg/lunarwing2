@@ -144,6 +144,23 @@ where pebble used the operator checkout and kimi the tenant clone.
   `snapshot.debian.org/archive/debian/20261024T011300Z`, not a live mirror.
 - Logs: `/tmp/lw-item100/{pebble,kimi}-build.log`.
 
+## Egress-guard regression evidence (the enabler this pass depends on)
+
+The rootless worker egress guard refuses any keeper infra container whose
+metadata is not exactly the Podman native image-less pause shape. `test-worker-egress.sh`
+ran green on this tree: **144 PASS / 1 SKIP** (the skip is the opt-in live-
+acceptance arm, gated on `LUNARWING_MT_EGRESS_LIVE=1`). The Native-pause cases
+specifically:
+
+- PASS — guard accepts the Podman native image-less pause keeper.
+- PASS ×5 — guard rejects unexpected native pause metadata: `sha256:foreign|…`,
+  `|/bin/sh|…`, `|/catatonit|["-P","extra"]|…`, a non-empty mount list `|[{}]|…`,
+  and a foreign rootfs `/tmp/foreign-rootfs`. Each also proves the invalid
+  keeper is rejected **before** any `nft` load (no filter is ever bypassed).
+
+This is the exact guard that item 101 (on Podman 6.1.4) reported as the blocker;
+on this host podman is 5.8.2 and the fallback is exercised when a worker starts.
+
 ## Independent-oracle methodology (how "verified" is defined here)
 
 Item 100 says *extensive tests*, so this pass treats a result as verified only
