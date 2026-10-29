@@ -46,8 +46,9 @@ printf '%s' "\${AGENT_AUTH_TOKEN:+present}" > "$SETUP_REPORT"
 
 function roleEnv(app: string, report: string, setupReport: string, role: string): NodeJS.ProcessEnv {
   const currentUid = process.getuid?.() ?? 1000
-  const taskUid = role === "split-task" ? currentUid : currentUid + 1
-  const bridgeUid = role === "split-bridge" ? currentUid : currentUid + 2
+  const root = currentUid === 0
+  const taskUid = root ? 10002 : role === "split-task" ? currentUid : currentUid + 1
+  const bridgeUid = root ? 10102 : role === "split-bridge" ? currentUid : currentUid + 2
   return {
     ...process.env,
     LUNARWING_CONTAINER_ROLE: role,
@@ -71,7 +72,7 @@ test("split roles refuse root when running as root", { skip: process.getuid?.() 
   const env = roleEnv(app, report, setupReport, "split-task")
   const result = spawnSync(entrypoint, [], { env, encoding: "utf8", timeout: 10_000 })
   assert.equal(result.status, 1)
-  assert.match(result.stderr, /split-task must run as uid 10002, not 0/)
+  assert.match(result.stderr, new RegExp(`split-task must run as uid ${env.KIMI_TASK_UID}, not 0`))
   assert.equal(existsSync(report), false)
   assert.equal(existsSync(setupReport), false)
 })
