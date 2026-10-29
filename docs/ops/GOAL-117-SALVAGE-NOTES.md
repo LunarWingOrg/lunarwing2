@@ -62,8 +62,9 @@ RUN --network=none bash /app/scripts/runtime_smoke_entrypoint.sh
 ```
 
 `--network=none` gives the RUN step its **own private netns with loopback UP**,
-under both builders, with **no capability requirement**. Verified empirically
-on this host (podman 5.8.2, Gentoo):
+under both builders, with **no capability requirement**. The original branch
+recorded the following probes on its Podman 5.8.2/Gentoo reproduction host;
+the BuildKit loopback row cites upstream evidence, not an entrypoint run:
 
 | probe | result |
 | --- | --- |
@@ -72,7 +73,7 @@ on this host (podman 5.8.2, Gentoo):
 | `unshare -n` inside a plain RUN (rootless **and** rootful) | **EPERM** — no CAP_SYS_ADMIN; `--cap-add=SYS_ADMIN` required (build-invocation change, rejected) |
 | `RUN --network=none` loopback bind + connect | OK |
 | BuildKit v0.34.1 `RUN --network=none` lo state | `lo: <LOOPBACK,UP,LOWER_UP>` (upstream PR #1141) |
-| RUN step PID namespace | **private** (`HOST_PIDS=4`) — confirms RR-2 |
+| Podman RUN step PID namespace | **private** (`HOST_PIDS=4`) — confirms RR-2; CI BuildKit instead shares buildkitd's PID namespace with `--oci-worker-no-process-sandbox`, not the host's |
 | rootless build: host socket uid column | `65534` (overflow), never `10003` — confirms shape (b) alone would not attribute either |
 
 Why shape (b) (kernel uid column, `fields[7]`) was not used on its own: it
@@ -81,7 +82,7 @@ worker's, but it still narrows the gate exactly as RR-3 objects, and it depends
 on the uid mapping of whichever builder is in use. Private-netns scoping needs
 no attribution at all and keeps the check **as strict as WI#424 wrote it**.
 
-## Verification evidence (this host, real build shape)
+## Original parser-only namespace evidence (not entrypoint acceptance)
 
 Ran the **real** `runtime_smoke.py` parser inside `podman build --network=host`
 in both shapes (`/tmp/wi511-proof`):
@@ -94,9 +95,12 @@ AFTER  (RUN --network=none):     rows=0   offending=[]           -> PASS
 `BEFORE` reproduces the reported incident signature (host relay/DNS and SSH
 listeners), and `AFTER` shows the fix on the same host and build shape. Host
 addresses and service-port inventory are redacted from this evidence.
+The empty `AFTER` socket table proves namespace selection only: it does not
+start the entrypoint, serve or bridge, and does not prove their offline startup.
 
-Also green: `runtime_smoke_test.py` **50/50** (was 47/47; 3 pre-existing
-`CliWiringTests` failures on this dev box are caused by `/tmp` being mounted
+Also green in the original branch verification: `runtime_smoke_test.py`
+**50/50** (was 47/47; 3 pre-existing `CliWiringTests` failures on that
+reproduction host were caused by `/tmp` being mounted
 `noexec` — they pass with an exec-capable `TMPDIR`, identical before and
 after); BuildKit-parser gate `worker exposure policy (BuildKit parser): ok`
 plus `go test` in the CI-pinned `golang:1.26.10` image; Python syntax; bash
@@ -118,7 +122,59 @@ smoke RUN. Verified clean:
   `kimicode4lunarwing`, `gotify-wasm`) runs a listener guard in a RUN step.
 - Repo-wide `/proc/net` readers outside `ic/vendor/` are only the two above.
 
-## Not claimed
+## !2058 run-270 follow-up
+
+- **RU-1 (Medium):** the blocking Go BuildKit-parser policy now pins the exact
+  `RUN --network=none bash /app/scripts/runtime_smoke_entrypoint.sh` instruction.
+  It must appear exactly once in the final assertion stage, after dependency
+  modes and before the wrapper anchor. Go fixtures reject a missing flag,
+  host/default network, a missing/commented/duplicate smoke, an extra unsafe
+  smoke and wrong stage/order. The Python exposure-policy fixture includes
+  the pin too and tests removal of the network flag through the real guard.
+  This is not dependent on the checkout-only Python test running in an image.
+- **RU-2 (Medium):** `build_opencode2_worker` now preflights Podman >= 4.5.0
+  (its `go.mod` first vendors Buildah 1.30.0, which supports inline `RUN
+  --network`; Podman 4.4.4 still vendors 1.29.0). Unreadable versions fail
+  closed. Docker requires BuildKit/buildx; an explicit legacy-builder choice
+  is refused and the build command explicitly enables BuildKit. Preflight
+  refusals happen before pruning, building or promoting images. This does not
+  change the existing-image lifecycle or the older-Podman Quadlet fallback.
+- **RU-4 (Low, pre-merge blocker):** removed host addresses and host service
+  inventory from both evidence records by amending the commit that introduced
+  them, not by leaving the originals in an ancestor. The other three original
+  MR commits are unchanged. All four commits on the rewritten local branch
+  were checked for the disclosed inventory. The remote branch is not rewritten
+  until a maintainer publishes this local history; no force-push was performed.
+- **RU-5 (Info, accuracy):** kernel-row fixtures pin address/port/state parsing,
+  not inode attribution (`parse_listeners` never reads uid/inode). PID namespace
+  claims now distinguish Podman from CI's no-process-sandbox BuildKit setup;
+  the shared build comment describes the affected host class. The stale
+  deferred-smoke control in `WORKER-CONTAINERS.md` now describes the candidate
+  and live suites and the enforced network scope.
+
+### Review-fix verification (Arch/systemd host, tmux)
+
+- Checksum-verified Go **1.26.10**: `gofmt`, `go test ./...` and the real
+  Dockerfile parser command pass with `GOTOOLCHAIN=local` and
+  `GOFLAGS=-mod=readonly`; no Go dependency files changed.
+- Builder compatibility **27 PASS / 0 FAIL**, runtime-smoke unit tests
+  **50/50**, worker-image contract **168 / 0**, and opencode2 mt-admin
+  regressions **109 / 0**. The Docker matrix covers unset, `1` and `true`
+  BuildKit selections, explicit legacy selection and missing buildx.
+- **Ten mutations rejected** without modifying tracked sources: lowering or
+  bypassing the Podman floor, allowing Docker legacy mode, skipping buildx,
+  removing forced BuildKit, and five real-Dockerfile parser inputs with a
+  dropped/host/default network flag, missing smoke or duplicate smoke.
+- Full `.gitlab/tests` discovery: **487 tests, zero failures, six skips**.
+  The exposure-policy guard, 8 CI YAML files and Python syntax in 143 tracked
+  files pass (2 documented experimental copies excluded). Scoped mt-admin
+  and final repository ShellCheck pass; final Bash syntax covers **272
+  scripts and 3 hooks**, and `git diff --check` is clean. An overlapping lint
+  attempt raced with temporary-fixture cleanup; the final repository lint
+  ran after those tests finished and exited 0. No Rust code or dependencies
+  changed, and no Cargo lane was needed.
+
+## Not claimed (RU-3 acceptance remains pending)
 
 - **No full `mt-admin build-tenant`** was run for a live tenant (needs a
   provisioned tenant and a multi-minute image build from source). RR-5's
@@ -126,9 +182,24 @@ smoke RUN. Verified clean:
   on an affected host; the reproduction above is the same build shape, the same
   host and the real parser, but it is **not** a full tenant build.
 - **WI#511 and WI#515 stay open** pending operator/maintainer acceptance.
-- CI will not execute `runtime_smoke_test.py` on this MR (RR-6 stands: only the
-  protected candidate build runs it, and that lane is red for the unrelated
-  Bun 1.4.4 regression — WI#514).
+- No real started-entrypoint smoke under `--network=none` is claimed by the
+  original parser-only probe. The review-fix host has Podman 6.1.4 / Buildah
+  1.45.2, but neither its rootless nor rootful store had a cached opencode2
+  worker image. A full rootless candidate build was attempted from this tree
+  with `--network=host`, the checked-in Dockerfile and wrapper digest, and a
+  private temporary tag. It failed before the smoke at builder step 9/20:
+  `bun install --frozen-lockfile` (Bun 1.4.4) could not apply hunk #10 of the
+  `@silvia-odwyer/photon-node@0.3.4` patch (`photon_rs.js`, expected line 4509).
+  This reproduces the !2057/WI#514 dependency-install blocker; no lockfile,
+  dependency pin, MCP setting or guard was changed to work around it. No
+  existing tenant was rebuilt or modified; build-cache layers were created,
+  but no worker `:latest` image was promoted.
+- The blocking parser gate now enforces the namespace instruction on this MR.
+  Real offline entrypoint acceptance still needs an affected-host
+  `build-tenant` and the first protected candidate after !2057/WI#514 unblocks
+  that build. Keep the configured remote MCP servers, readiness checks and
+  listener assertions intact for that acceptance; do not disable them just
+  to obtain a passing smoke.
 - The reproducibility gate (candidate vs clean-rebuild digest) is unaffected in
   principle — `--network=none` removes network access, it adds no per-build
   state — but it was **not** re-proven here, since that needs two full builds.

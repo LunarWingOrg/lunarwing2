@@ -1364,6 +1364,17 @@ build_opencode2_worker() {
   [[ -d "$opencode2_dir" ]] || die "opencode2 worker dir not found at $opencode2_dir"
 
   ensure_container_runtime
+  if [[ "$CONTAINER_RT" == "podman" ]]; then
+    podman_supports_run_network \
+      || die "opencode2 worker builds require Podman >= 4.5 (Buildah >= 1.30) for RUN --network=none; upgrade Podman before rebuilding"
+  else
+    case "${DOCKER_BUILDKIT:-1}" in
+      1|true|True|TRUE|t|T) ;;
+      *) die "opencode2 worker builds require Docker BuildKit for RUN --network=none; enable DOCKER_BUILDKIT=1 (legacy builder unsupported)" ;;
+    esac
+    docker buildx version >/dev/null 2>&1 \
+      || die "opencode2 worker builds require Docker BuildKit with the buildx plugin; install buildx before rebuilding"
+  fi
 
   local toolchain_desc="slim (no toolchains)"
   [[ "$with_toolchains" == "true" ]] && toolchain_desc="fat (with Rust/Go/C++ toolchains)"
@@ -1403,8 +1414,8 @@ build_opencode2_worker() {
       fi
       layer_args=(--layers=false)
     fi
-    # --network=host: podman's default build network can't reach the internet
-    # for RUN steps on this host; the host netns has IPv4. Consequence (WI#511):
+    # --network=host: on affected tenant hosts, the default Podman build
+    # network cannot reach upstreams while the host netns can. Consequence (WI#511):
     # every RUN step in the worker images shares the HOST socket table, so a
     # build-time listener check must scope itself — the opencode2 runtime smoke
     # does that with `RUN --network=none` (its own private netns, loopback up)
@@ -1412,7 +1423,8 @@ build_opencode2_worker() {
     podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" --build-arg "LUNARWING_WRAPPER_SHA256=$wrapper_anchor" --network=host --format docker "${identity_args[@]}" -t "$candidate_tag" "$opencode2_dir" \
       || { rm -f "$iid_file"; die "opencode2 worker image build failed"; }
   else
-    docker build "${cache_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" --build-arg "LUNARWING_WRAPPER_SHA256=$wrapper_anchor" "${identity_args[@]}" -t "$candidate_tag" "$opencode2_dir" \
+    # Explicit opt-in prevents Docker silently falling back to the legacy builder.
+    DOCKER_BUILDKIT=1 docker build "${cache_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" --build-arg "LUNARWING_WRAPPER_SHA256=$wrapper_anchor" "${identity_args[@]}" -t "$candidate_tag" "$opencode2_dir" \
       || { rm -f "$iid_file"; die "opencode2 worker image build failed"; }
   fi
   image_id="$(<"$iid_file")"

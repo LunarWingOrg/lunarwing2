@@ -109,13 +109,12 @@ def _row(address: str, port: int, state: str = "0A") -> str:
     )
 
 
-# WI#511: a kernel-faithful /proc/net/tcp row copied from a real host, with
+# WI#511: a kernel-layout /proc/net/tcp fixture, with synthetic addresses and
+# metadata. Its uid and inode are not read by parse_listeners; the tests pin
+# only address, port and state parsing in this layout. The row has
 # the owning uid at field 7 and the socket inode at field 9 (the retransmit
 # timeout value 99 sits at field 12). The kernel layout is:
 #   sl local rem st tx:rx tr:when retrnsmt uid timeout inode refcnt ...
-# A parser that reads the inode from the wrong column (e.g. field 12) reports
-# 99 instead of the true inode, so attribution never matches any
-# /proc/<pid>/fd link keyed by a real inode.
 def _real_tcp_row(
     address: str, port: int, uid: int, inode: int, state: str = "0A"
 ) -> str:
@@ -168,23 +167,17 @@ class ListenerParsingTests(unittest.TestCase):
         self.assertEqual(smoke.parse_listeners(table), [("127.0.0.1", 80)])
 
     def test_real_kernel_row_is_parsed_correctly(self) -> None:
-        # WI#511 / RR-4: a row copied from a real /proc/net/tcp on the affected
-        # host. The kernel layout is
-        #   sl local rem st tx:rx tr:when retrnsmt uid timeout inode refcnt ...
-        # The owning uid is field 7 ($8 in awk) and the socket inode is field 9
-        # ($10). The retransmit-timeout value 99 sits at field 12 ($13) — which
-        # is what MR !2055 read as "the inode", so attribution never matched a
-        # real /proc/<pid>/fd link. This fixture pins the real columns so a
-        # parser that reads the wrong one fails here.
+        # WI#511 / RR-4: exercise address/port/state parsing on the kernel row
+        # layout. Unlike !2055's removed attribution code, parse_listeners does
+        # not read the uid or inode, so this is not an inode-column regression.
         header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
         row = _real_tcp_row("0.0.0.0", 22, uid=0, inode=376901965)
         parsed = smoke.parse_listeners("\n".join([header, row]))
         self.assertEqual(parsed, [("0.0.0.0", 22)])
 
     def test_multiple_real_rows_keep_distinct_ports_and_addresses(self) -> None:
-        # Two real rows (sshd on :22 and the worker health on :8443) must both
-        # parse so the guard can judge them by address+port — the netns scope
-        # means only the worker's row is present, not the host's.
+        # Two synthetic kernel-layout rows must both parse so the guard can
+        # judge them by address+port; this fixture does not test netns isolation.
         header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
         rows = "\n".join(
             [
@@ -550,11 +543,13 @@ class CandidateBuildWiringTests(unittest.TestCase):
         # under BOTH builders (podman 5.8.2 rootless/rootful and rootless
         # BuildKit), and needs no capability — `unshare -n` inside the step
         # fails with EPERM because the build step has no CAP_SYS_ADMIN, and
-        # /proc/<pid>/fd attribution cannot work either because the step also
-        # has a private PID namespace (host socket owners are invisible).
+        # Podman steps have a private PID namespace, so /proc/<pid>/fd cannot
+        # attribute host sockets. CI BuildKit instead shares buildkitd's PID
+        # namespace with --oci-worker-no-process-sandbox, not the host's.
         #
-        # This pin is what makes the regression detectable: a Dockerfile that
-        # drops --network=none re-aims the guard at the host netns.
+        # This checkout test and the required BuildKit-parser policy pin the
+        # instruction: dropping --network=none re-aims the guard at the builder's
+        # default netns (the host's in mt-admin builds).
         lane = Path(__file__).resolve().parents[1]
         dockerfile = (lane / "Dockerfile").read_text()
         self.assertIn(

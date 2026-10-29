@@ -789,10 +789,24 @@ Enforced controls (opencode2 lane unless noted):
    `/usr/local/bin`), so a runtime `PATH` `opencode` need not hit the
    wrapper; the entrypoint is unaffected (absolute `OPENCODE_BIN`) and the
    wrapper remains a naive-use guard.
-6. **Runtime smoke (automated suite DEFERRED to WI#424, 2.1.7.0):** live
-   `service.json`/`opentunnel` dir/listener assertions against a running
-   container are required manually for WI#427 until that suite exists.
-   Control 9 covers the listener half on live tenants.
+6. **Runtime smoke (WI#424 control 6, WI#511 namespace scope):**
+   `opencode2.4lunarwing/scripts/runtime_smoke_entrypoint.sh` starts the real
+   entrypoint, serve and bridge during the candidate build, waits for their
+   loopback readiness probes, and runs `runtime_smoke.py --profile container`
+   as the image runtime uid. It checks service configuration, tunnel identity
+   directories, all visible listener rows, sharing and the wrapper refusal.
+   The Dockerfile must use exactly
+   `RUN --network=none bash /app/scripts/runtime_smoke_entrypoint.sh`: only
+   loopback is needed, and this keeps host listeners out of the check even
+   when mt-admin builds with `--network=host`. The blocking BuildKit-parser
+   policy requires exactly one such RUN in the final assertion stage, after
+   dependency-mode normalization and before the wrapper anchor. Missing,
+   host/default-network, duplicate and misplaced smoke steps fail that gate.
+   `mt-admin worker-smoke <tenant>` runs the same suite inside live workers;
+   `--profile remote` drives it from the host. Control 9 remains the separate
+   host-side listener audit. These are naive-use checks, not a substitute for
+   the egress boundary. A passing parser-only namespace probe is not acceptance
+   of the real entrypoint smoke or of a full affected-host `build-tenant`.
 7. **Bump checklist (REQUIRED for every worker version bump).** The bump
    entry in this file must record the upstream features that add network
    exposure or outbound publication — tunnels, pairing, sharing, remote MCP,
@@ -1034,6 +1048,19 @@ v2 config file is `config/opencode2.json` (`providers` map,
 (opencode 10001, kimi 10002) so both opencode lanes keep separate
 userns identities on one host.
 
+OpenCode 2 **image builds require Podman >= 4.5.0** (the first release
+vendoring Buildah 1.30.0, which added inline `RUN --network`; Podman 4.4.4
+still vendors Buildah 1.29.0). This is independent of the >= 4.6 Quadlet
+supervision floor: older hosts may keep running existing worker images, but
+must upgrade their builder before rebuilding this lane. The mt-admin
+preflight rejects an older or unreadable Podman version before any image
+prune/build. Docker builds require **BuildKit with buildx installed**; mt-admin
+rejects `DOCKER_BUILDKIT=0` and explicitly sets `DOCKER_BUILDKIT=1` for the
+build. The legacy Docker builder cannot parse the per-RUN isolation flag and
+is unsupported. Sources: Podman
+[v4.5.0 go.mod](https://github.com/containers/podman/blob/v4.5.0/go.mod) and
+[v4.4.4 go.mod](https://github.com/containers/podman/blob/v4.4.4/go.mod).
+
 ```bash
 cd opencode2.4lunarwing
 # The final --image-filesystem assert anchors the installed wrapper against
@@ -1041,7 +1068,7 @@ cd opencode2.4lunarwing
 # WI#425): a manual build must forward it or the image fails fail-closed.
 # Recompute it after any wrapper edit:
 #   sha256sum scripts/opencode-exposure-guard.sh
-docker build \
+DOCKER_BUILDKIT=1 docker build \
   --build-arg LUNARWING_WRAPPER_SHA256=f2fc2ba6befc2d6d22dbae33029ab9a84ced4e6fa6927839ac636fdd42ca5b7b \
   -t lunarwing-worker-opencode2:latest .
 

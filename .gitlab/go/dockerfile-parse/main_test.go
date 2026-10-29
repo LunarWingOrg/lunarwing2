@@ -19,6 +19,7 @@ COPY config/ ./config/
 COPY entrypoint.sh entrypoint-split.sh health_server.py agent_comm_protocol.json ./
 RUN chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/entrypoint-split.sh /app/health_server.py /app/agent_comm_protocol.json
 RUN chmod -R a-s,a-w /app/node_modules
+RUN --network=none bash /app/scripts/runtime_smoke_entrypoint.sh
 ARG LUNARWING_WRAPPER_SHA256=
 RUN python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --image-filesystem
 USER 10003:10003
@@ -153,9 +154,34 @@ func TestStructuralPolicyFixtures(t *testing.T) {
 		{"compile-out after build", strings.Replace(validDockerfile, compileRun+"\n"+guardedBuild, guardedBuild+"\n"+compileRun, 1), "compile-out"},
 		{"missing read-only step", strings.Replace(validDockerfile, "RUN chmod -R a-w", "RUN true # chmod -R a-w", 1), "read-only chmod"},
 		{"missing dependency mode normalization", strings.Replace(validDockerfile, dependencyModes+"\n", "", 1), "strip dependency privilege and write bits"},
-		{"dependency mode normalization after anchor", strings.Replace(validDockerfile, dependencyModes+"\n"+anchorArg, anchorArg+"\n"+dependencyModes, 1), "before the wrapper anchor"},
+		{"dependency mode normalization after anchor", strings.Replace(strings.Replace(validDockerfile, dependencyModes+"\n", "", 1), anchorArg, anchorArg+"\n"+dependencyModes, 1), "before the wrapper anchor"},
 		{"dependency COPY after normalization", strings.Replace(validDockerfile, anchorArg, "COPY --from=builder /out/client /app/node_modules/@opencode/client\n"+anchorArg, 1), "after every dependency COPY"},
 		{"missing filesystem assertion", strings.Replace(validDockerfile, " --image-filesystem", "", 1), "verify installed policy-file ownership"},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			requireFailure(t, test.src, test.want)
+		})
+	}
+}
+
+func TestRuntimeSmokeNetworkNamespaceFixtures(t *testing.T) {
+	unsafeSmoke := "RUN bash /app/scripts/runtime_smoke_entrypoint.sh"
+	cases := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{"missing smoke", strings.Replace(validDockerfile, runtimeSmoke+"\n", "", 1), "exactly one private-netns runtime smoke"},
+		{"missing network flag", strings.Replace(validDockerfile, runtimeSmoke, unsafeSmoke, 1), "private netns"},
+		{"host network", strings.Replace(validDockerfile, "--network=none", "--network=host", 1), "private netns"},
+		{"default network", strings.Replace(validDockerfile, "--network=none", "--network=default", 1), "private netns"},
+		{"comment is not a smoke", strings.Replace(validDockerfile, runtimeSmoke, "# "+runtimeSmoke, 1), "exactly one private-netns runtime smoke"},
+		{"duplicate smoke", strings.Replace(validDockerfile, runtimeSmoke, runtimeSmoke+"\n"+runtimeSmoke, 1), "exactly one private-netns runtime smoke"},
+		{"extra host-shared smoke", strings.Replace(validDockerfile, runtimeSmoke, runtimeSmoke+"\n"+unsafeSmoke, 1), "private netns"},
+		{"builder-only smoke", strings.Replace(strings.Replace(validDockerfile, runtimeSmoke+"\n", "", 1), guardedBuild, guardedBuild+"\n"+runtimeSmoke, 1), "final assertion stage"},
+		{"smoke before dependency modes", strings.Replace(validDockerfile, dependencyModes+"\n"+runtimeSmoke, runtimeSmoke+"\n"+dependencyModes, 1), "after dependency modes"},
+		{"smoke after assertion", strings.Replace(validDockerfile, runtimeSmoke+"\n", "", 1) + runtimeSmoke + "\n", "after --image-filesystem"},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {

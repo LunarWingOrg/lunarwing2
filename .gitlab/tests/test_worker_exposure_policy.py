@@ -36,6 +36,7 @@ COMPILE_OUT_RUN = "RUN python3 /build/compile_out_remote_tunnel.py /build/openco
 BUILD_RUN = 'RUN OPENCODE_VERSION="${OPENCODE_VERSION#v}" bun run build -- --single\n'
 READONLY_RUN = "RUN chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/entrypoint-split.sh /app/health_server.py /app/agent_comm_protocol.json\n"
 DEPENDENCY_MODES_RUN = "RUN chmod -R a-s,a-w /app/node_modules\n"
+RUNTIME_SMOKE_RUN = "RUN --network=none bash /app/scripts/runtime_smoke_entrypoint.sh\n"
 FILESYSTEM_ASSERTION = "RUN python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --image-filesystem\n"
 WRAPPER_ANCHOR_ARG = "ARG LUNARWING_WRAPPER_SHA256=\n"
 BINARY_SCAN_RUN = (
@@ -57,6 +58,7 @@ DOCKERFILE_LINES = (
     "COPY entrypoint.sh entrypoint-split.sh health_server.py agent_comm_protocol.json ./\n",
     READONLY_RUN,
     DEPENDENCY_MODES_RUN,
+    RUNTIME_SMOKE_RUN,
     WRAPPER_ANCHOR_ARG,
     FILESYSTEM_ASSERTION,
     "USER 10003:10003\n",
@@ -224,6 +226,19 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
         result = self.run_guard(self.root)
         self.assertEqual(result.returncode, 1)
         self.assertIn("compile-out", result.stderr)
+
+    def test_dockerfile_smoke_without_network_isolation_fails(self):
+        dockerfile = self.root / "opencode2.4lunarwing" / "Dockerfile"
+        dockerfile.write_text(
+            dockerfile.read_text().replace(
+                RUNTIME_SMOKE_RUN,
+                "RUN bash /app/scripts/runtime_smoke_entrypoint.sh\n",
+            ),
+            encoding="utf-8",
+        )
+        result = self.run_guard(self.root)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("private netns", result.stderr)
 
     def test_dockerfile_agent_owned_scripts_fails(self):
         # run-79 EI-5: the controls must not live in agent-writable files.

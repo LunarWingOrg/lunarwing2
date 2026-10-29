@@ -344,6 +344,8 @@ fake_container_runtime() {
   local runtime="$1"
   shift
   case "${1:-}" in
+    version) printf '6.1.4\n' ;;
+    buildx) [[ "${2:-}" == version ]] ;;
     build)
       BUILD_CALL="$*"
       printf '%s\n' "$*" >> "$fixture/build-calls"
@@ -528,7 +530,7 @@ for CONTAINER_RT in docker podman; do
       "$CONTAINER_RT builder explains a missing wrapper"
   fi
   if [[ ! -s "$fixture/build-calls" ]]; then
-    pass "$CONTAINER_RT builder refuses a missing wrapper before invoking the runtime"
+    pass "$CONTAINER_RT builder refuses a missing wrapper before image operations"
   else
     fail "$CONTAINER_RT builder invoked the runtime without a wrapper digest"
   fi

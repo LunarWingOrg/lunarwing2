@@ -419,10 +419,11 @@ RUN chmod -R a-s,a-w /app/node_modules
 #
 # The step needs nothing but loopback, which both builders bring UP in the
 # private netns (verified under podman 5.8.2 rootless/rootful --network=host
-# and BuildKit v0.34.1-rootless). Attribution by uid is NOT used: the step
-# also has a private PID namespace, so host socket owners are invisible and
-# unattributed sockets would still be judged — and any uid-based narrowing
-# would let a listener opened as another in-container uid escape the gate.
+# and BuildKit v0.34.1-rootless). Attribution by uid is NOT used: Podman RUN
+# steps have a private PID namespace, hiding host socket owners; CI BuildKit
+# shares buildkitd's PID namespace with --oci-worker-no-process-sandbox, not
+# the host's. Any uid-based narrowing would also let a listener opened as
+# another in-container uid escape the gate.
 # This gate stays as strict as WI#424 wrote it; only its scope is corrected.
 RUN --network=none bash /app/scripts/runtime_smoke_entrypoint.sh
 

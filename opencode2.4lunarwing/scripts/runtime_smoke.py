@@ -30,10 +30,11 @@ and NetBird listeners as worker exposure. The check logic was always correct;
 only its scope was wrong, and the scope is now fixed at the Dockerfile level:
 the smoke RUN uses ``--network=none``, which gives the step its own private
 netns with loopback up under both podman and rootless BuildKit. Attribution
-by uid was deliberately NOT adopted: the build step also has a private PID
-namespace, so host socket owners are invisible (unattributed sockets would
-still be judged), and any uid-based narrowing would let a listener opened as
-another in-container uid escape the gate. The check itself therefore stays
+by uid was deliberately NOT adopted: Podman RUN steps have a private PID
+namespace, hiding host socket owners (unattributed sockets would still be
+judged). CI BuildKit uses ``--oci-worker-no-process-sandbox`` and shares
+buildkitd's PID namespace, not the host's. Any uid-based narrowing would also
+let a listener opened as another in-container uid escape the gate. The check stays
 exactly as strict as WI#424 wrote it and judges every row of whatever socket
 table its namespace shows.
 
