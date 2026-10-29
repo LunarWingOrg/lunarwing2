@@ -12,6 +12,11 @@ TASK_UID="${OPENCODE_TASK_UID:-10001}"
 TASK_GID="${OPENCODE_TASK_GID:-10001}"
 BRIDGE_UID="${OPENCODE_BRIDGE_UID:?OPENCODE_BRIDGE_UID is required for the split launcher}"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-/workspace}"
+if [[ "${LUNARWING_ROOTFUL_WORKSPACE:-}" == 1 ]]; then
+  [[ "${LUNARWING_WORKSPACE_ID:-}" =~ ^[0-9]+:[0-9]+$ ]] || die "rootful workspace identity is required"
+  [[ "$(stat -c '%d:%i' -- "$WORKSPACE_ROOT")" == "$LUNARWING_WORKSPACE_ID" ]] \
+    || die "workspace mount changed identity; refusing redirected workspace"
+fi
 RUNNER_SOCKET="${OPENCODE_TASK_RUNNER_SOCKET:-/run/lunarwing-shared/runner/task-runner.sock}"
 RUNNER_STATE_FILE="${OPENCODE_TASK_RUNNER_STATE_FILE:-$(dirname "$RUNNER_SOCKET")/task-runner-state.json}"
 OPENCODE_BIN="${OPENCODE_BIN:-/usr/local/bin/opencode}"
