@@ -1968,29 +1968,43 @@ fn assert_delegation_result(
     assert_eq!(turn["failure_kind"], "repl_argument_corruption");
     assert!(!turn["completed_at"].is_null());
     let completed = rig.tool_calls_completed();
-    assert_eq!(
+    assert_eq!(completed.len(), usize::from(!fail_again), "{completed:?}");
+    assert!(
         completed
             .iter()
-            .filter(|(name, ok)| name == "create_job" && *ok)
-            .count(),
-        usize::from(!fail_again),
-        "completed={completed:?}; statuses={:?}; results={:?}",
-        rig.captured_status_events(),
-        rig.tool_results()
+            .all(|(name, ok)| name.starts_with("create_job(") && *ok),
+        "completed={completed:?}; statuses={:?}",
+        rig.captured_status_events()
     );
     if !fail_again {
-        assert!(
-            rig.tool_results()
-                .iter()
-                .any(|(name, output)| name == "create_job"
-                    && output.contains("job_id")
-                    && output.contains("in_progress"))
-        );
+        let results = rig.tool_results();
+        let (_, output) = results
+            .iter()
+            .find(|(name, _)| name.starts_with("create_job("))
+            .expect("actual create_job result");
+        let result: serde_json::Value = serde_json::from_str(output).expect("job result JSON");
+        assert_eq!(result["title"], "WI478 smoke job");
+        assert_eq!(result["status"], "in_progress");
+        assert!(Uuid::parse_str(result["job_id"].as_str().expect("job id string")).is_ok());
     }
     assert_eq!(
         llm.calls.load(Ordering::SeqCst),
         if fail_again { 2 } else { 3 }
     );
+}
+
+async fn seed_stale_gateway_cache(
+    state: &lunarwing::channels::web::server::GatewayState,
+    scope: &str,
+) {
+    let manager = state.session_manager.as_ref().expect("gateway sessions");
+    let session = manager.get_or_create_session("test-user").await;
+    let mut session = session.lock().await;
+    let id = Uuid::parse_str(scope).expect("scope UUID");
+    let mut thread = lunarwing::agent::session::Thread::with_id(id, session.id);
+    thread.start_turn("stale legacy snapshot");
+    thread.complete_turn("stale response must not hide live engine recovery");
+    session.threads.insert(id, thread);
 }
 
 async fn assert_rejected_delegation_case(fail_again: bool) {
@@ -2039,6 +2053,7 @@ async fn assert_rejected_delegation_case(fail_again: bool) {
         .expect("bob subscription");
     futures::pin_mut!(bob);
     let scope = Uuid::new_v4().to_string();
+    seed_stale_gateway_cache(&state, &scope).await;
     rig.send_incoming(IncomingMessage::new("gateway", "test-user",
         "Delegate one job to inspect this Rust handler and report actual results. Example:\n```rust\nfn handler() { println!(\"inspect me\"); }\n```\nUse a single create_job call.")
         .with_thread(scope.clone()).with_conversation_scope(scope.clone())
