@@ -66,7 +66,9 @@ credential file was read or copied by the test harness.
 
 - New OS account: `highwinds`, uid 1010, linger enabled.
 - Registry allocation: gateway 10000, PostgreSQL 10003, orchestrator 10006,
-  pebble WebSocket 10008, kimi WebSocket 30000; primary block 10000–10009.
+  pebble WebSocket 10008/health 20004, kimi WebSocket 30000/health 30001;
+  primary block 10000–10009. Registry worker flags confirm pebble and kimi are
+  selected and all other external worker lanes are disabled.
 - Source: local branch clone from the operator checkout after scope commit
   `05a2cd90f` (before later report-only commits).
 - PostgreSQL: ready via tenant user Quadlet, not a system-bus tenant unit.
