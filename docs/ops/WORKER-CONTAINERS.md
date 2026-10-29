@@ -247,8 +247,23 @@ verification, whole-image reproducibility and live tenant audits remain
 required before publishing/deploying rebuilt images; local source and runner
 tests do not establish those deployment results.
 
-**Host-side workspace prep (WI#453, the WI#446 closeout):** the
-kimi/opencode/opencode2 workspace directories live inside the
+**Local Compose examples.** Each lane's `docker-compose.yml` starts its
+non-root task service before its bridge using the same IPC-v2 modes and
+bounded task health probe. Only the bridge and the explicit smoke client
+receive the hub credential; task env overrides both hub credential names
+to empty even when an optional env file supplied them. Bridge ports publish
+on loopback. Compose does not install mt-admin's tenant egress firewall,
+init units or rootful workspace identity pin; use mt-admin for managed
+multi-tenant operation. Before running a bind-workspace example, create
+`workspace`, `logs` and `results` owned by the image's mapped task uid/gid
+and grant the workspace task-group access (`2770`). On rootless Podman,
+perform ownership preparation inside `podman unshare`; on Docker, use the
+image's numeric uid/gid. Do not pass the bridge credential to a one-shot CLI
+container. Recreate both services after image/env changes; do not reuse old
+IPC volumes.
+
+**Host-side workspace prep (WI#453, the WI#446 closeout):** all four lane
+workspace directories live inside the
 tenant-controlled `~/lunarwing` tree, so the historical root `mkdir -p` +
 unbounded `chown -R` is gone. `prepare_worker_workspace`
 (`ic/scripts/mt-admin-lib/09-worker-config.sh`) runs the
