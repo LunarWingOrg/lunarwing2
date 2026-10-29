@@ -58,7 +58,7 @@ const activeWorkspaces = new Map<string, string>()
 const toolProxyRelay = new ToolProxyRelay()
 
 function taskWorkspace(request: TaskRequest): string {
-  return resolveTaskWorkspace(request.context, WORKSPACE_ROOT)
+  return resolveTaskWorkspace(request.context, WORKSPACE_ROOT, undefined, !bridgeRunnerSocketPath())
 }
 
 function abortSocketTasks(socket: BridgeSocket): void {
