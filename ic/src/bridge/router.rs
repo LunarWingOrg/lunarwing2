@@ -3891,13 +3891,6 @@ async fn handle_with_engine_inner(
     .await?;
 
     // Dual-write to v1 database so the gateway history API shows messages.
-    let mut tracked_message = message.clone();
-    if !tracked_message.metadata.is_object() {
-        tracked_message.metadata = serde_json::json!({});
-    }
-    if let Some(metadata) = tracked_message.metadata.as_object_mut() {
-        metadata.remove("engine_history_message_id");
-    }
     if let Some(ref db) = state.db
         && let Some(cid) = resolve_v1_conversation_for_message(db.as_ref(), message).await
     {
@@ -3905,13 +3898,23 @@ async fn handle_with_engine_inner(
             .add_conversation_message(cid, "user", effective_content)
             .await
         {
-            Ok(id) => tracked_message.metadata["engine_history_message_id"] = serde_json::json!(id),
+            Ok(id) => {
+                let reference = serde_json::json!({
+                    "thread_id": thread_id.to_string(), "user_message_id": id,
+                });
+                if let Err(error) = db
+                    .update_conversation_metadata_field(cid, "engine_turn_history", &reference)
+                    .await
+                {
+                    tracing::warn!(%error, "failed to persist Engine V2 turn history reference");
+                }
+            }
             Err(error) => tracing::warn!(%error, "failed to persist Engine V2 user history"),
         }
     }
 
     debug!(thread_id = %thread_id, "engine v2: thread spawned");
-    await_thread_outcome(agent, state, &tracked_message, conv_id, thread_id, event_rx).await
+    await_thread_outcome(agent, state, message, conv_id, thread_id, event_rx).await
 }
 
 struct EngineMessageRequest<'a> {
