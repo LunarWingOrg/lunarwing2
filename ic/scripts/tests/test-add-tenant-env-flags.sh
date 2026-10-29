@@ -982,11 +982,10 @@ fi
 assert_eq "pebble workspace symlink left in place" \
   "$(if [[ -L "$MT_FIXTURE/pebble-workspace" ]]; then echo symlink; else echo replaced; fi)" "symlink"
 rm -f "$MT_FIXTURE/pebble-workspace"
-# Clean control: an absent workspace is created tenant-private (0700, no 0777).
 ws_out="$(prepare_pebble_workspace "$hh4_tenant")" || ws_out=""
 assert_eq "pebble workspace created at the tenant path" "$ws_out" "$MT_FIXTURE/pebble-workspace"
-assert_eq "pebble workspace is tenant-private (0700)" \
-  "$(stat -c %a "$MT_FIXTURE/pebble-workspace")" "700"
+assert_eq "pebble workspace is private with inherited task group (2770)" \
+  "$(stat -c %a "$MT_FIXTURE/pebble-workspace")" "2770"
 
 # WI#400 x WI#422 (root-only, run-171): on a rootful runtime pebble runs as
 # the tenant uid (--user) and tasks inherit that identity, so the workspace
