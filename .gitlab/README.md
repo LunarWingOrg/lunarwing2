@@ -64,11 +64,14 @@ both Rust jobs to use same digest-pinned image and keeps README digest in sync.
 Job images are declared through the `CI_LINT_IMAGE`, `CI_RUST_IMAGE`,
 `CI_GITLEAKS_IMAGE`, `CI_BUN_IMAGE`, and `CI_NODE_IMAGE` variables in `defaults.yml`; `ci-config` expands those
 variables before checking pins, so overrides must stay digest-pinned too.
-`CI_DEBIAN_SNAPSHOT` (same file) is not an image but is tied the same way:
-it must equal the valued `ARG DEBIAN_SNAPSHOT` in
-`kimicode4lunarwing/Dockerfile`, and the `worker-kimi-ts` lane installs its
-python3 prerequisite from that snapshot archive instead of the live
-deb.debian.org mirror.
+`CI_DEBIAN_SNAPSHOT` (same file) must equal every worker Dockerfile's valued
+`ARG DEBIAN_SNAPSHOT`. `validate_worker_snapshots` rejects missing or divergent
+pins and any snapshot before `20261024T011300Z`, which includes Debian's
+CVE-2026-111497 Brotli fixes (WI#514). The `worker-kimi-ts` lane installs its
+python3 prerequisite from that archive instead of the live deb.debian.org mirror.
+The Node `22.23.4` and Bun `1.4.4` base images also contain the decoder fix;
+Trivy's OS-package scan does not certify their statically bundled libraries.
+Worker rebuilds and protected scans remain necessary before promotion.
 
 ### Rustup component downloads and runner DNS
 

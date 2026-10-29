@@ -12,7 +12,7 @@ ARG SOURCE_REVISION=unknown
 # ──────────────────────
 # Stage 1: build opencode from source
 # ──────────────────────
-FROM docker.io/oven/bun:debian@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895 AS builder
+FROM docker.io/oven/bun:1.4.4-debian@sha256:93d5032fe06d163427822dc1598f420363759bb18155c9cc90eb1be05a64a19e AS builder
 
 ARG OPENCODE_VERSION
 ARG OPENCODE_REF
@@ -100,7 +100,7 @@ RUN set -e; \
 # ──────────────────────
 # Stage 2: runtime image
 # ──────────────────────
-FROM docker.io/oven/bun:debian@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895 AS runtime
+FROM docker.io/oven/bun:1.4.4-debian@sha256:93d5032fe06d163427822dc1598f420363759bb18155c9cc90eb1be05a64a19e AS runtime
 
 ARG DEBIAN_SNAPSHOT
 ARG SOURCE_REVISION
