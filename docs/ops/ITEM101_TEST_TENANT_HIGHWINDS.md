@@ -1,15 +1,15 @@
 # Item 101 (v2.1.7.0) — persistent test tenant `highwinds`
 
-Status: **PARTIAL — run-271 review supersedes the earlier completion claim.**
-Both workers were running, and Kimi completed a real complex task with an
-independently verified artifact. Pebble produced a correct artifact on the
-previously installed image, but its result never completed in the hub (PE-1).
-Only 2 of the 6 prepared tasks ran. That is not acceptance of the three newly
-edited Dockerfiles: the original Pebble gate would fail every build, and the
-OpenCode 2 pre-pass missed its entrypoints. The follow-up fixes and actual new
-image-build/deployment evidence are recorded separately below. Item 101 remains
-unchecked until a branch-built Pebble image is running and completes a task.
-No teardown is permitted; retain `highwinds` and its allocated ports.
+Status: **PARTIAL — build-gate fixes and fresh Pebble acceptance verified.**
+Run 271 supersedes the earlier completion claim. The corrected Pebble image
+was built from `9bb1d942a`, deployed through mt-admin, and completed a fresh
+gateway-dispatched verification task in the hub. Its rebuilt artifact passed
+an independent oracle (evidence below). This does not fix the long-task
+buffering defect (WI#519), retroactively complete the old lost-result job, or
+execute the four remaining prepared algorithm tasks. Only 2 of the original
+6 prepared tasks ran; the new task is a bounded rebuild/reverification pass.
+Item 101 remains unchecked for that broader unfinished scope. No teardown is
+permitted; retain `highwinds` and its allocated ports.
 
 ## Scope and provenance
 
@@ -456,15 +456,16 @@ are up. No teardown, no animal-name rename, no credential was read or recorded.
   group/other writes, non-root ownership and unreadable nested-input rejection.
   An unprivileged run explicitly skips the seven root-required cases; it does
   not claim those probes ran. These tests do not replace a full image build.
-- RV-4: withdrew the completion claim and reopened the goal checkbox. New image
-  deployment and task completion still need to be recorded before acceptance.
+- RV-4: withdrew the premature completion claim and reopened the goal checkbox.
+  The fresh image/task evidence below now satisfies the narrow rebuild check;
+  the four remaining prepared tasks and broader gauntlet acceptance stay open.
 - RV-5: filed [WI#519](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/519)
   for Pebble event buffering/result loss and
   [WI#520](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/520) for the
   Engine V2 history approval-discovery footgun (related to WI#436 finding 4).
   Pending-gates/SSE remain the supported discovery paths. The socket-close
   timestamp correlation does not establish the disconnect's exact cause.
-- RV-2: fresh image-build/deployment acceptance is pending below; no protected
+- RV-2: fresh image-build/deployment acceptance is recorded below. No protected
   candidate or whole-image reproducibility success is claimed by block tests.
 - Follow-up validation: all nine new block tests and all four Kimi mode tests
   pass under root (no dropped-uid skips). Three in-memory mutants fail their
@@ -473,4 +474,74 @@ are up. No teardown, no animal-name rename, no credential was read or recorded.
   41 tests with four existing skips; `test_goal1_ci.py` passes 274/274;
   `exposure_policy_assert_test.py` passes 68/68. CI config, the worker exposure
   guard, and the Go parser suite/real OpenCode 2 Dockerfile check pass. These
-  results are separate from the still-pending full-image/runtime acceptance.
+  results are separate from the full-image/runtime acceptance below.
+
+### RV-2 — new image built, deployed, and hub-completed task verified
+
+The standard `build-pebble-worker --with-toolchains` command completed with
+exit 0 from clean worker source at **`9bb1d942ab54d009d9dbaf1405ae8e4dbb4b3e3a`**.
+The new image is **`516d9fc32009ec50ca27bb50a191df0668a93eed0cdf9cac276e409da74044be`**,
+size **2,336,071,157 bytes**, toolchain profile `true`, default user
+`10004:10004`, with that exact revision label. The build ran 105 bridge tests
+successfully, passed the corrected dropped-uid read/execute gate, and passed
+both task-shell toolchain smoke legs (`/bin/sh -lc` and sanitized `env -i`).
+Reported tools included Rust/Cargo 1.96.1, Go 1.24.3 and rustup 1.28.2.
+
+This used the operator checkout, not the tenant clone (the standalone command's
+documented source root). Source modes were not rewritten to 077 for this full
+build; a 077 build-process umask does not change existing COPY input modes.
+Restrictive-context evidence remains the executed 022/077 Dockerfile-block
+tests. This is one successful image build, not a protected candidate/uncached
+rebuild digest comparison. OpenCode v1/2 full-image builds are **not** claimed.
+
+Standard `restart-worker highwinds pebble` refreshed the image into the tenant's
+rootless store, enforced the existing egress filter, and force-recreated both
+worker containers. Both running containers reference the new image ID:
+bridge `10104:10004`, task `10004:10004`. Kimi was not restarted. Final mt-admin
+status shows both workers running; `worker-egress` verifies all four split-role
+containers attached exclusively with pinned DNS/static hosts and the exact
+forward/input rejects; `worker-listeners` is clean. No allowlist, capability,
+approval rule or exposure control was relaxed.
+
+A single new gateway request created **`hw101-rv2-image-recheck-9bb1d942a`**:
+
+- Thread `9b9b7e79-1f7f-4c00-99e4-f1ede1096878`, message
+  `302692d4-66eb-4857-a700-1ebbae7cfb30`.
+- Job **`b00d8e8d-85dd-445c-825a-6af5960c76d3`**, started
+  `2026-10-29T21:41:37.455116Z`, hub **completed**
+  `2026-10-29T21:42:49.957706Z`, **72 seconds**, **17 hub events**, `stuck=false`.
+- Approval was discovered through `pending-gates` and issued once only after
+  matching this thread, `create_job`, the exact title, mode `pebble`, the new
+  workspace path, and absence of credential/context grants. No subagents or
+  duplicate job was used. The gateway bearer was consumed privately as the
+  tenant for API authentication, never printed, copied to the worker prompt,
+  or written to an artifact.
+- The task compiled the existing Hungarian C++17 sources into new
+  `/workspace/hw101_rv2_recheck_9bb1d942a` outputs without changing the old
+  project. `tests.log` reports 500 randomized exhaustive cases and
+  `ALL TESTS PASSED`; the saved sample returns `COST 3`. The compiler reports
+  Debian G++ 12.2.0. In-container artifact ownership is `10004:10004`.
+  `versions.txt` reports uid 0 for the task command, which conflicts with the
+  configured container user (`id` under `podman exec` reports
+  `uid=10004(pebbletask)`) and with the `10004`-owned files that same command
+  wrote. That worker-authored line is therefore treated as unreliable model
+  narration, not as evidence of either a privilege drop or a privilege gap;
+  nothing in this report is based on it. The inspected container user,
+  artifact ownership and the real dropped-uid build gates are the identity
+  evidence here.
+
+Independent verification reran the freshly built `assignment` binary on **50
+seeded rectangular matrices**, including negative costs, against a host-generated
+brute-force permutation oracle, checking both minimum costs and full dual
+certificates: **50/50 PASS**, zero mismatches. Execution used a separate
+network-disabled, read-only, credential-free container from the exact image,
+uid `10004:10004`, all capabilities dropped, and no-new-privileges. The first
+oracle attempt could not execute the private artifact under Podman's default
+UID mapping; repeating with the managed worker's
+`keep-id:uid=10004,gid=10004` mapping passed without changing file permissions.
+
+The original long-running job remains historical failed acceptance (its hub
+row still reports `in_progress`); the short new completion does not close
+WI#519 or claim long-task streaming works. `highwinds`, both workers, and all
+workspace artifacts remain in place. Logs are in
+`/tmp/opencode/mr2059-{validate2,pebble-build,pebble-restart,pebble-task,audit,oracle2}.log`.
