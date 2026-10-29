@@ -260,10 +260,13 @@ RUN set -eu; \
     probe_dir="$(mktemp -d)"; \
     trap 'rm -rf "$probe_dir"' EXIT; \
     chown 10002:10002 "$probe_dir"; \
+    test -z "$(find /app/config /app/hooks /app/scripts /app/entrypoint.sh /app/entrypoint-task-setup.sh \
+      /app/health_server.py /app/task_runner_bind.py /app/agent_comm_protocol.json \
+      \( ! -uid 0 -o -perm /222 \) -print)"; \
     setpriv --reuid=10002 --regid=10002 --clear-groups \
-      python3 -c 'import os, sys; paths = sys.argv[1:]; paths += [os.path.join(root, name) for path in list(paths) if os.path.isdir(path) for root, dirs, files in os.walk(path) for name in dirs + files]; assert os.getuid() == 10002; assert all(os.stat(path).st_uid == 0 and not os.stat(path).st_mode & 0o222 for path in paths); assert all(not os.access(path, os.W_OK) for path in paths); [open(path, "rb").close() for path in paths if not os.path.isdir(path)]' \
-      /app/config /app/hooks /app/scripts /app/entrypoint.sh /app/entrypoint-task-setup.sh \
-      /app/health_server.py /app/task_runner_bind.py /app/agent_comm_protocol.json; \
+      find /app/config /app/hooks /app/scripts /app/entrypoint.sh /app/entrypoint-task-setup.sh \
+      /app/health_server.py /app/task_runner_bind.py /app/agent_comm_protocol.json \
+      -type f -exec cat -- {} + >/dev/null; \
     setpriv --reuid=10002 --regid=10002 --clear-groups \
       env -i PATH="$PATH" HOME="$probe_dir" KIMI_CODE_HOME="$probe_dir/state" \
       KIMI_BASE_URL=https://example.test/v1 /app/entrypoint-task-setup.sh; \
