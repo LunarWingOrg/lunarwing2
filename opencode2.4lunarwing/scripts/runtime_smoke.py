@@ -75,6 +75,12 @@ class Transport:
     def listening_sockets(self) -> str:
         raise NotImplementedError
 
+    def socket_owners(self) -> dict[int, int]:
+        """Map listening-socket inode -> owning uid. WI#511: lets the
+        listeners check ignore host-owned sockets when the inspected
+        namespace is shared with the host (image builds)."""
+        return {}
+
     def home_dirs(self) -> Iterable[str]:
         raise NotImplementedError
 
@@ -136,6 +142,41 @@ class LocalTransport(Transport):
         parts.append(_safe_read(self._resolve("/proc/net/tcp6")) or "")
         return "\n".join(parts)
 
+    def socket_owners(self) -> dict[int, int]:
+        # WI#511: image builds share the HOST netns, so the raw socket table
+        # is full of host listeners that are not the worker's. Attribute each
+        # listening socket inode to the uid of the process holding it, so the
+        # listeners check judges only sockets the runtime user itself owns.
+        owners: dict[int, int] = {}
+        for status in self._resolve("/proc").glob("[0-9]*/status"):
+            fd_dir = status.parent / "fd"
+            try:
+                uid_line = next(
+                    line
+                    for line in status.read_text(
+                        encoding="utf-8", errors="replace"
+                    ).splitlines()
+                    if line.startswith("Uid:")
+                ).split()[1]
+                uid = int(uid_line)
+            except (OSError, StopIteration, IndexError, ValueError):
+                continue
+            try:
+                links = os.listdir(fd_dir)
+            except OSError:
+                continue
+            for link in links:
+                try:
+                    target = os.readlink(fd_dir / link)
+                except OSError:
+                    continue
+                if target.startswith("socket:["):
+                    try:
+                        owners[int(target[len("socket:[") : -1])] = uid
+                    except ValueError:
+                        continue
+        return owners
+
     def home_dirs(self) -> Iterable[str]:
         if os.geteuid() == 0:
             yield "/root"
@@ -194,6 +235,45 @@ class ContainerTransport(Transport):
             raise OSError(f"cannot read container socket tables: {out.strip()}")
         return out
 
+    def socket_owners(self) -> dict[int, int]:
+        # WI#511: a tenant container may share the host netns too (or run
+        # beside host listeners the exec'd shell can see). Attribute listening
+        # socket inodes to owning uids the same way the build profile does.
+        owners: dict[int, int] = {}
+        proc_rc, pids = self._exec(["sh", "-c", "ls -d /proc/[0-9]* 2>/dev/null"])
+        if proc_rc != 0:
+            return owners
+        for entry in pids.split():
+            pid = entry.rsplit("/", 1)[-1]
+            status_rc, status = self._exec(["cat", f"/proc/{pid}/status"])
+            uid = -1
+            if status_rc == 0:
+                for line in status.splitlines():
+                    if line.startswith("Uid:"):
+                        fields = line.split()
+                        if len(fields) >= 2:
+                            try:
+                                uid = int(fields[1])
+                            except ValueError:
+                                pass
+                        break
+            if uid < 0:
+                continue
+            fds_rc, fds = self._exec(["sh", "-c", f"ls /proc/{pid}/fd 2>/dev/null"])
+            if fds_rc != 0:
+                continue
+            for fd in fds.split():
+                rc, out = self._exec(["readlink", f"/proc/{pid}/fd/{fd}"])
+                if rc != 0:
+                    continue
+                target = out.strip()
+                if target.startswith("socket:["):
+                    try:
+                        owners[int(target[len("socket:[") : -1])] = uid
+                    except ValueError:
+                        continue
+        return owners
+
     def home_dirs(self) -> Iterable[str]:
         return ("/root", "/home/opencode2")
 
@@ -204,12 +284,18 @@ class ContainerTransport(Transport):
         return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
 
 
-def parse_listeners(table: str) -> list[tuple[str, int]]:
-    """Return (address, port) for every TCP LISTEN row in /proc/net/tcp{,6}.
+def parse_listeners(
+    table: str,
+) -> list[tuple[str, int]] | list[tuple[str, int, int]]:
+    """Return (address, port[, inode]) for every TCP LISTEN row.
 
     Format (kernel): ``sl local_address rem_address st ...`` where
     ``local_address`` is ``HEXADDR:HEXPORT``. IPv4 addresses are little-endian
     hex; IPv6 is four little-endian 32-bit words.
+
+    The socket inode (field 10 of the kernel row) is included when present so
+    the listeners check can attribute sockets to the uid of the process
+    holding them (WI#511 — shared host netns during image builds).
     """
     listeners: list[tuple[str, int]] = []
     for line in table.splitlines():
@@ -223,7 +309,18 @@ def parse_listeners(table: str) -> list[tuple[str, int]]:
             port = int(port_hex, 16)
         except ValueError:
             continue
-        listeners.append((_decode_address(address_hex), port))
+        # Kernel row layout: sl, local, rem, st, tx:rx, tr:tm->when,
+        # retrnsmt, uid, timeout, INODE, ... The inode (index 12 in a data
+        # row, since field 0 is the slot number) is what /proc/<pid>/fd
+        # links name; report it so the listeners check can attribute
+        # sockets to owning uids (WI#511).
+        inode = 0
+        if len(fields) >= 13:
+            try:
+                inode = int(fields[12])
+            except ValueError:
+                inode = 0
+        listeners.append((_decode_address(address_hex), port, inode))
     return listeners
 
 
@@ -326,7 +423,10 @@ def check_opentunnel_identity(
 
 
 def check_listeners(
-    transport: Transport, health_port: int, ws_port: int | None = None
+    transport: Transport,
+    health_port: int,
+    ws_port: int | None = None,
+    smoke_uid: int | None = None,
 ) -> CheckResult:
     try:
         listeners = parse_listeners(transport.listening_sockets())
@@ -335,21 +435,43 @@ def check_listeners(
     allowed_ports = {health_port}
     if ws_port is not None:
         allowed_ports.add(ws_port)
+
+    # WI#511: during image builds (and any shared-netns container) the socket
+    # table is the HOST's, not the worker's. When the transport can attribute
+    # sockets to owning uids, judge only sockets owned by the smoke/runtime
+    # user; host listeners are not the worker's exposure surface. Without
+    # owner data (or with owner data but an unknown uid), fall back to
+    # judging every row — the guard stays fail-closed.
+    owners = transport.socket_owners()
+    if owners and smoke_uid is not None:
+        # WI#511 attribution: sockets owned by OTHER uids are host/peer
+        # processes, not the worker's exposure surface — ignore them.
+        # Sockets with NO owner entry are unknown provenance: keep judging
+        # them (fail-closed; an unreadable fd tree must not open a hole).
+        owned = [
+            row
+            for row in listeners
+            if not row[-1] or owners.get(row[-1], smoke_uid) == smoke_uid
+        ]
+        judged = f"{len(owned)} of {len(listeners)} listener(s) owned by or unattributed to uid {smoke_uid}"
+    else:
+        owned = list(listeners)
+        judged = f"{len(listeners)} listener(s); no uid attribution available"
     offending = [
         f"{address}:{port}"
-        for address, port in listeners
+        for address, port, *_rest in owned
         if not is_loopback(address) and port not in allowed_ports
     ]
     if offending:
         return CheckResult(
             "listeners",
             False,
-            f"listener beyond loopback (allowed ports {sorted(allowed_ports)}): {offending}",
+            f"({judged}) listener beyond loopback (allowed ports {sorted(allowed_ports)}): {offending}",
         )
     return CheckResult(
         "listeners",
         True,
-        f"{len(listeners)} listener(s); only health/WS ports {sorted(allowed_ports)} may be non-loopback",
+        f"{judged}; only health/WS ports {sorted(allowed_ports)} may be non-loopback",
     )
 
 
@@ -435,6 +557,7 @@ def run_checks(
     config_path: str,
     wrapper: str,
     env: dict[str, str],
+    smoke_uid: int | None = None,
 ) -> list[CheckResult]:
     try:
         ws_port = int(env.get("WS_PORT", "0"))
@@ -443,7 +566,7 @@ def run_checks(
     return [
         check_service_config(transport, env),
         check_opentunnel_identity(transport, env),
-        check_listeners(transport, health_port, ws_port or None),
+        check_listeners(transport, health_port, ws_port or None, smoke_uid),
         check_share_disabled(transport, config_path),
         check_remote_refused(transport, wrapper),
     ]
@@ -501,6 +624,15 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help=f"in-container health port excepted from the listener rule (default {DEFAULT_HEALTH_PORT})",
     )
     parser.add_argument("--json", action="store_true", help="emit machine-readable output")
+    parser.add_argument(
+        "--smoke-uid",
+        type=int,
+        default=None,
+        help=(
+            "runtime-user uid for listener attribution (WI#511); defaults to "
+            "the SMOKE_UID environment variable when set"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -526,7 +658,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     except OSError as exc:
         print(f"runtime-smoke: {exc}", file=sys.stderr)
         return 2
-    results = run_checks(transport, args.health_port, args.config, args.wrapper, env)
+    smoke_uid = args.smoke_uid
+    if smoke_uid is None and os.environ.get("SMOKE_UID"):
+        try:
+            smoke_uid = int(os.environ["SMOKE_UID"])
+        except ValueError:
+            smoke_uid = None
+    results = run_checks(
+        transport, args.health_port, args.config, args.wrapper, env, smoke_uid
+    )
     failures = [result for result in results if not result.ok]
     if args.json:
         print(

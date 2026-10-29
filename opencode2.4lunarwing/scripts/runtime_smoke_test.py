@@ -100,13 +100,26 @@ def _ipv4_hex(address: str) -> str:
     return bytes(reversed(octets)).hex().upper()
 
 
-def _row(address: str, port: int, state: str = "0A") -> str:
+def _row(
+    address: str, port: int, state: str = "0A", inode: int = 1000
+) -> str:
     hex_address = _ipv4_hex(address).rjust(8, "0")
     return (
         f"  0: {hex_address}:{port:04X} 00000000:0000 "
         f"{state} 00000000:00000000 00:00000000 00000000  1000        0 "
-        "0 1 0000000000000000 100 0 0 10 0"
+        f"0 1 0000000000000000 {inode} 0 0 10 0"
     )
+
+
+class _OwnersTransport(FixtureTransport):
+    """Fixture whose socket_owners() returns a uid map (WI#511 cases)."""
+
+    def __init__(self, *args, owners: dict[int, int] | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._owners = dict(owners or {})
+
+    def socket_owners(self) -> dict[int, int]:
+        return self._owners
 
 
 class AddressDecodingTests(unittest.TestCase):
@@ -142,12 +155,22 @@ class ListenerParsingTests(unittest.TestCase):
             ]
         )
         self.assertEqual(
-            smoke.parse_listeners(table), [("127.0.0.1", 8443), ("0.0.0.0", 4096)]
+            [(a, p) for a, p, _ in smoke.parse_listeners(table)],
+            [("127.0.0.1", 8443), ("0.0.0.0", 4096)],
         )
+
+    def test_socket_inode_is_parsed_when_present(self) -> None:
+        table = _row("127.0.0.1", 8443)
+        rows = smoke.parse_listeners(table)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][2], 1000)  # inode field from _row's filler
 
     def test_malformed_rows_are_skipped(self) -> None:
         table = "\n".join(["garbage", "  1: zzzz:yy 0:0 0A 0", _row("127.0.0.1", 80)])
-        self.assertEqual(smoke.parse_listeners(table), [("127.0.0.1", 80)])
+        self.assertEqual(
+            [(a, p) for a, p, _ in smoke.parse_listeners(table)],
+            [("127.0.0.1", 80)],
+        )
 
 
 class ServiceConfigTests(unittest.TestCase):
@@ -272,6 +295,59 @@ class ListenerCheckTests(unittest.TestCase):
         result = smoke.check_listeners(FixtureTransport(tcp="unreadable"), 8443)
         self.assertFalse(result.ok)
         self.assertIn("unreadable", result.detail)
+
+    # --- WI#511: shared host netns must not poison the verdict ---
+
+    def test_host_listeners_ignored_when_owner_data_says_other_uid(self) -> None:
+        # Host sshd + netbird own non-loopback listeners; the worker's own
+        # health port is the only socket uid 10003 holds. Must PASS.
+        table = "\n".join(
+            [
+                _row("0.0.0.0", 22, inode=111),
+                _row("100.88.11.142", 53, inode=222),
+                _row("0.0.0.0", 8443, inode=333),
+                _row("0.0.0.0", 4096, inode=444),  # serve port but HOST-owned
+            ]
+        )
+        transport = _OwnersTransport(
+            tcp=table, owners={111: 0, 222: 0, 333: 10003, 444: 0}
+        )
+        result = smoke.check_listeners(transport, 8443, smoke_uid=10003)
+        self.assertTrue(result.ok)
+        self.assertIn("1 of 4 listener(s) owned by or unattributed to uid 10003", result.detail)
+
+    def test_runtime_user_own_public_listener_still_fails(self) -> None:
+        # The mutation this must catch: the worker itself binding something
+        # beyond loopback/allowed ports. Ownership must NOT weaken the guard.
+        table = _row("0.0.0.0", 4096, inode=777)
+        transport = _OwnersTransport(tcp=table, owners={777: 10003})
+        result = smoke.check_listeners(transport, 8443, smoke_uid=10003)
+        self.assertFalse(result.ok)
+        self.assertIn("0.0.0.0:4096", result.detail)
+
+    def test_unknown_uid_ownership_falls_back_to_judging_everything(self) -> None:
+        # Owner data exists but doesn't cover a socket: fail-closed, judge it.
+        table = "\n".join([_row("0.0.0.0", 9000, inode=555), _row("0.0.0.0", 8443, inode=333)])
+        transport = _OwnersTransport(tcp=table, owners={333: 10003})
+        result = smoke.check_listeners(transport, 8443, smoke_uid=10003)
+        self.assertFalse(result.ok)
+        self.assertIn("0.0.0.0:9000", result.detail)
+
+    def test_smoke_uid_absent_judges_everything_like_before(self) -> None:
+        # No --smoke-uid / SMOKE_UID: legacy strict behavior must be intact.
+        table = "\n".join([_row("0.0.0.0", 22, inode=111), _row("0.0.0.0", 8443, inode=333)])
+        transport = _OwnersTransport(tcp=table, owners={111: 0, 333: 10003})
+        result = smoke.check_listeners(transport, 8443)
+        self.assertFalse(result.ok)
+        self.assertIn("0.0.0.0:22", result.detail)
+
+    def test_no_owner_data_judges_everything_like_before(self) -> None:
+        # Plain FixtureTransport (socket_owners -> {}): unchanged semantics.
+        table = _row("0.0.0.0", 9000)
+        result = smoke.check_listeners(FixtureTransport(tcp=table), 8443, smoke_uid=10003)
+        self.assertFalse(result.ok)
+        self.assertIn("0.0.0.0:9000", result.detail)
+        self.assertIn("no uid attribution", result.detail)
 
 
 class ShareTests(unittest.TestCase):
