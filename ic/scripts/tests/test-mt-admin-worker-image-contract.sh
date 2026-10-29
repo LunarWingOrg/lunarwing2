@@ -213,6 +213,44 @@ use_init() {  # <systemd|openrc>
   eval "ensure_init_system() { INIT_SYSTEM=\"$init\"; }"
 }
 
+missing_worker_port_skip() {
+  local worker="$1" init="$2" rc
+  local output="$fixture/missing-port-${init}-${worker}.out"
+  local calls="$fixture/missing-port-${init}-${worker}.calls"
+  : >"$calls"
+  set +e
+  (
+    set -e
+    use_init "$init"
+    ensure_init_system
+    ports_get() { return 1; }
+    say() { printf '%s\n' "$*"; }
+    _ctr() { printf 'ctr:%s\n' "$*" >>"$calls"; }
+    _systemctl_user() { printf 'systemctl:%s\n' "$*" >>"$calls"; }
+    _ensure_tenant_image() { printf 'image:%s\n' "$*" >>"$calls"; }
+    prepare_worker_egress() { printf 'egress:%s\n' "$*" >>"$calls"; }
+    render_worker_quadlet() { printf 'render:%s\n' "$*" >>"$calls"; }
+    _register_worker_unit() { printf 'unit:%s\n' "$*" >>"$calls"; }
+    "start_tenant_${worker}" alice
+  ) >"$output" 2>&1
+  rc=$?
+  set -e
+  assert_eq "$rc" 0 "$init $worker missing port: direct errexit start succeeds (WI#513)"
+  assert_eq "$(<"$output")" \
+    "no ${worker}_wss port allocated for alice (skipping $worker worker)" \
+    "$init $worker missing port: exact skip message (WI#513)"
+  if [[ ! -s "$calls" ]]; then
+    pass "$init $worker missing port: no runtime, image, egress or unit calls (WI#513)"
+  else
+    fail "$init $worker missing port: no runtime, image, egress or unit calls (WI#513) (got '$(<"$calls")')"
+  fi
+}
+for skip_init in systemd openrc; do
+  for worker in pebble opencode kimi opencode2; do
+    missing_worker_port_skip "$worker" "$skip_init"
+  done
+done
+
 # Seed the stored hash exactly as a container created from image A leaves it,
 # then prove the next start-tenant is quiet on A and force-recreates on B.
 imperative_scenario() {  # <worker>
