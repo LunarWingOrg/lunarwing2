@@ -29,22 +29,27 @@ struct TurnCompletion {
     message: IncomingMessage,
     conversation_id: lunarwing_engine::ConversationId,
     thread_id: lunarwing_engine::ThreadId,
-    history_message_id: Option<uuid::Uuid>,
+    history: Option<HistoryReference>,
 }
 
-async fn history_message_id(
+#[derive(serde::Deserialize)]
+struct HistoryReference {
+    thread_id: lunarwing_engine::ThreadId,
+    user_message_id: uuid::Uuid,
+    started_at: chrono::DateTime<chrono::Utc>,
+}
+
+async fn history_reference(
     state: &EngineState,
     message: &IncomingMessage,
     thread_id: lunarwing_engine::ThreadId,
-) -> Option<uuid::Uuid> {
+) -> Option<HistoryReference> {
     let db = state.db.as_ref()?;
     let cid = resolve_v1_conversation_for_message(db.as_ref(), message).await?;
     let metadata = db.get_conversation_metadata(cid).await.ok()??;
-    let reference = metadata.get("engine_turn_history")?;
-    if reference.get("thread_id")?.as_str()? != thread_id.to_string() {
-        return None;
-    }
-    uuid::Uuid::parse_str(reference.get("user_message_id")?.as_str()?).ok()
+    let reference: HistoryReference =
+        serde_json::from_value(metadata.get("engine_turn_history")?.clone()).ok()?;
+    (reference.thread_id == thread_id).then_some(reference)
 }
 
 pub(super) async fn await_thread_outcome(
@@ -61,7 +66,7 @@ pub(super) async fn await_thread_outcome(
         message: message.clone(),
         conversation_id,
         thread_id,
-        history_message_id: history_message_id(state, message, thread_id).await,
+        history: history_reference(state, message, thread_id).await,
     };
     let mut cancellation = turn.cancellation_guard();
     if !turn.wait(&mut events, OUTCOME_TIMEOUT).await {
@@ -307,9 +312,10 @@ impl TurnCompletion {
         state: &str,
         completed_at: Option<String>,
     ) {
-        let Some(user_message_id) = self.history_message_id else {
+        let Some(reference) = &self.history else {
             return;
         };
+        let user_message_id = reference.user_message_id;
         let Some(db) = &self.state.db else { return };
         let Some(cid) = resolve_v1_conversation_for_message(db.as_ref(), &self.message).await
         else {
@@ -330,6 +336,9 @@ impl TurnCompletion {
     }
 
     async fn write_recovery_outcome(&self, outcome: &ThreadOutcome) {
+        let Some(reference) = &self.history else {
+            return;
+        };
         let Ok(Some(thread)) = self.state.store.load_thread(self.thread_id).await else {
             return;
         };
@@ -337,7 +346,7 @@ impl TurnCompletion {
             .events
             .iter()
             .rev()
-            .filter(|event| event.timestamp >= self.message.received_at)
+            .filter(|event| event.timestamp >= reference.started_at)
             .find_map(super::model_recovery_info)
         else {
             return;
