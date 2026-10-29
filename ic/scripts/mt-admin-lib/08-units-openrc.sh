@@ -133,7 +133,7 @@ render_vision_openrc_assets() {
   direct="$OPENRC_INITD_DIR/$container"
   supervisor="$OPENRC_INITD_DIR/${container}-sup"
   if [[ ! -e "$direct" && ! -L "$direct" && ! -e "$supervisor" && ! -L "$supervisor" ]] \
-      && ! _ctr "$name" inspect "$container" &>/dev/null; then
+      && ! _ctr_inspect "$name" "$container" &>/dev/null; then
     return 0
   fi
   render_vision_openrc_unit "$name" || return 1
@@ -244,7 +244,7 @@ render_voice_openrc_assets() {
     return 0
   fi
   if [[ ! -e "$direct" && ! -L "$direct" && ! -e "$supervisor" && ! -L "$supervisor" ]] \
-      && ! _ctr "$name" inspect "$container" &>/dev/null; then
+      && ! _ctr_inspect "$name" "$container" &>/dev/null; then
     return 0
   fi
   render_voice_openrc_unit "$name" || return 1

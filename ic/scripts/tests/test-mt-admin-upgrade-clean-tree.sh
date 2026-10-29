@@ -386,6 +386,10 @@ _ctr() {
     image)
       if [[ "$startup_mode" == degraded ]]; then printf '0:0\n';
       else printf '%s:%s\n' "$KIMI_CONTAINER_UID" "$KIMI_CONTAINER_GID"; fi ;;
+    container)
+      [[ "$3" == inspect ]] || return 0
+      [[ "$startup_mode" == clean ]] || return 1
+      printf 'true\n' ;;
     inspect)
       [[ "$startup_mode" == clean ]] || return 1
       printf 'true\n' ;;

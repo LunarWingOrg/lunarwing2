@@ -44,6 +44,21 @@ _ctr() {
   fi
 }
 
+# Typed container inspect. `podman inspect`/`docker inspect` resolve a name
+# across containers, images, volumes, networks AND pods, and match a name that
+# is only a PREFIX of another object. Worker bridge containers are named
+# `lunarwing-<worker>-<tenant>` while their IPC volume is
+# `lunarwing-<worker>-<tenant>-ipc-v2`, so once that volume exists a generic
+# inspect of the (absent) bridge container resolves to the VOLUME and exits 0.
+# Existence gates then skip container creation entirely and the post-start
+# egress check fails closed on a container that was never created, leaving the
+# worker stopped. Every caller here means a container, so always use the typed
+# subcommand, which reports "no such container" instead.
+_ctr_inspect() {
+  local name="$1"; shift
+  _ctr "$name" container inspect "$@"
+}
+
 # Podman delegates periodic healthcheck scheduling to systemd timers. On OpenRC,
 # image-defined healthchecks therefore remain "starting" forever even while the
 # generated OpenRC units' active endpoint probes report healthy. Disable only
@@ -57,7 +72,7 @@ _openrc_podman_uses_init_health() {
 _reconcile_openrc_podman_healthcheck() {  # <tenant> <container>
   local name="$1" container="$2" healthcheck
   _openrc_podman_uses_init_health || return 0
-  healthcheck="$(_ctr "$name" inspect -f '{{json .Config.Healthcheck}}' "$container" 2>/dev/null || true)"
+  healthcheck="$(_ctr_inspect "$name" -f '{{json .Config.Healthcheck}}' "$container" 2>/dev/null || true)"
   case "$healthcheck" in
     ""|null|*'"NONE"'*) return 0 ;;
   esac
@@ -709,7 +724,7 @@ _vision_launch_contract() {
 
 _vision_container_healthy() {
   local name="$1" container="$2" running
-  running="$(_ctr "$name" inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" || return 1
+  running="$(_ctr_inspect "$name" -f '{{.State.Running}}' "$container" 2>/dev/null)" || return 1
   [[ "$running" == "true" ]] || return 1
   _ctr "$name" exec "$container" curl -sf -o /dev/null --max-time 3 \
     "http://127.0.0.1:${VISION_SIDECAR_HEALTH_PORT}/health" 2>/dev/null
@@ -751,7 +766,7 @@ _create_vision_container() {
 _vision_has_unsupported_openrc_healthcheck() {
   local name="$1" container="$2" healthcheck
   _openrc_podman_uses_init_health || return 1
-  healthcheck="$(_ctr "$name" inspect -f '{{json .Config.Healthcheck}}' "$container" 2>/dev/null || true)"
+  healthcheck="$(_ctr_inspect "$name" -f '{{json .Config.Healthcheck}}' "$container" 2>/dev/null || true)"
   case "$healthcheck" in
     ""|null|*'"NONE"'*) return 1 ;;
     *) return 0 ;;
@@ -778,7 +793,7 @@ _stop_vision_supervision() {
 
 _reconcile_vision_container() {
   local name="$1" container="$2" env_path="$3" contract="$4" recreate=false
-  if _ctr "$name" inspect "$container" &>/dev/null; then
+  if _ctr_inspect "$name" "$container" &>/dev/null; then
     if _vision_has_unsupported_openrc_healthcheck "$name" "$container" \
         || _container_config_changed "$name" "$container" "$env_path" "$contract"; then
       recreate=true
@@ -795,7 +810,7 @@ _reconcile_vision_container() {
     _ctr "$name" rm -f "$container" >/dev/null || return 1
   fi
 
-  if ! _ctr "$name" inspect "$container" &>/dev/null; then
+  if ! _ctr_inspect "$name" "$container" &>/dev/null; then
     _create_vision_container "$name" "$container" "$env_path" \
       "$(ports_get "$name" vision_service)" "$(ports_get "$name" vision_health)" || return 1
   elif ! _vision_container_healthy "$name" "$container"; then
@@ -895,9 +910,9 @@ stop_tenant_vision() {
   else
     _systemctl_user "$name" stop "${container}.service" >/dev/null 2>&1 || true
   fi
-  if _ctr "$name" inspect "$container" &>/dev/null; then
+  if _ctr_inspect "$name" "$container" &>/dev/null; then
     _ctr "$name" stop --time 30 "$container" >/dev/null 2>&1 || true
-    running="$(_ctr "$name" inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)"
+    running="$(_ctr_inspect "$name" -f '{{.State.Running}}' "$container" 2>/dev/null || true)"
     if [[ "$running" == "true" ]]; then
       say "ERROR: vision sidecar remained running after stop ($container)" >&2
       return 1
@@ -915,7 +930,7 @@ _retire_local_vision_runtime() {
   else
     remove_vision_openrc_assets "$name" || return 1
   fi
-  if _ctr "$name" inspect "$container" >/dev/null 2>&1; then
+  if _ctr_inspect "$name" "$container" >/dev/null 2>&1; then
     _ctr "$name" stop --time 30 "$container" >/dev/null 2>&1 || true
     _ctr "$name" rm -f "$container" >/dev/null || return 1
   fi
@@ -1060,7 +1075,7 @@ _voice_launch_contract() {
 
 _voice_container_healthy() {
   local name="$1" container="$2" running health_base
-  running="$(_ctr "$name" inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" || return 1
+  running="$(_ctr_inspect "$name" -f '{{.State.Running}}' "$container" 2>/dev/null)" || return 1
   [[ "$running" == "true" ]] || return 1
   health_base="http://127.0.0.1:${VOICE_SIDECAR_HEALTH_PORT}"
   _ctr "$name" exec "$container" curl -sf -o /dev/null --max-time 3 \
@@ -1107,7 +1122,7 @@ _create_voice_container() {
 _voice_has_unsupported_openrc_healthcheck() {
   local name="$1" container="$2" healthcheck
   _openrc_podman_uses_init_health || return 1
-  healthcheck="$(_ctr "$name" inspect -f '{{json .Config.Healthcheck}}' "$container" 2>/dev/null || true)"
+  healthcheck="$(_ctr_inspect "$name" -f '{{json .Config.Healthcheck}}' "$container" 2>/dev/null || true)"
   case "$healthcheck" in
     ""|null|*'"NONE"'*) return 1 ;;
     *) return 0 ;;
@@ -1140,7 +1155,7 @@ _stop_voice_supervision() {
 # when the sidecar never becomes healthy. Idempotent when nothing drifted.
 _reconcile_voice_container() {
   local name="$1" container="$2" env_path="$3" contract="$4" recreate=false
-  if _ctr "$name" inspect "$container" &>/dev/null; then
+  if _ctr_inspect "$name" "$container" &>/dev/null; then
     if _voice_has_unsupported_openrc_healthcheck "$name" "$container" \
         || _container_config_changed "$name" "$container" "$env_path" "$contract"; then
       recreate=true
@@ -1157,7 +1172,7 @@ _reconcile_voice_container() {
     _ctr "$name" rm -f "$container" >/dev/null || return 1
   fi
 
-  if ! _ctr "$name" inspect "$container" &>/dev/null; then
+  if ! _ctr_inspect "$name" "$container" &>/dev/null; then
     _create_voice_container "$name" "$container" "$env_path" \
       "$(ports_get "$name" voice_service)" "$(ports_get "$name" voice_health)" || return 1
   elif ! _voice_container_healthy "$name" "$container"; then
@@ -1252,9 +1267,9 @@ stop_tenant_voice() {
   else
     _systemctl_user "$name" stop "${container_name}.service" >/dev/null 2>&1 || true
   fi
-  if _ctr "$name" inspect "$container_name" &>/dev/null; then
+  if _ctr_inspect "$name" "$container_name" &>/dev/null; then
     _ctr "$name" stop --time 30 "$container_name" >/dev/null 2>&1 || true
-    running="$(_ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null || true)"
+    running="$(_ctr_inspect "$name" -f '{{.State.Running}}' "$container_name" 2>/dev/null || true)"
     if [[ "$running" == "true" ]]; then
       say "ERROR: voice sidecar remained running after stop ($container_name)" >&2
       return 1
@@ -1529,7 +1544,7 @@ _rollback_voice_activation() {
   configure_voice "$name" false
   stop_tenant_voice "$name" || true
   remove_tenant_voice_unit "$name" || true
-  if _ctr "$name" inspect "$container" >/dev/null 2>&1; then
+  if _ctr_inspect "$name" "$container" >/dev/null 2>&1; then
     _ctr "$name" rm -f "$container" >/dev/null 2>&1 || true
   fi
   _reload_voice_consumer_if_running "$name" || true
@@ -1607,7 +1622,7 @@ remove_tenant_voice() {
   _voice_remove_daemon_credentials "$(tenant_env_dir "$name")/lunarwing.env"
   _reload_voice_consumer_if_running "$name" || return 1
   ensure_container_runtime
-  if _ctr "$name" inspect "$container" >/dev/null 2>&1; then
+  if _ctr_inspect "$name" "$container" >/dev/null 2>&1; then
     _ctr "$name" rm -f "$container" >/dev/null \
       || { say "ERROR: failed to remove LunarVoice container $container" >&2; return 1; }
   fi
