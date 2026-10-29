@@ -3901,6 +3901,7 @@ async fn handle_with_engine_inner(
             Ok(id) => {
                 let reference = serde_json::json!({
                     "thread_id": thread_id.to_string(), "user_message_id": id,
+                    "started_at": message.received_at,
                 });
                 if let Err(error) = db
                     .update_conversation_metadata_field(cid, "engine_turn_history", &reference)
