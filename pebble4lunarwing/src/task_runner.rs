@@ -230,15 +230,19 @@ fn spawn_heartbeat(path: PathBuf) -> tokio::task::JoinHandle<()> {
 }
 
 pub async fn run(config: ExecutorConfig, socket_path: PathBuf) -> RunnerResult<()> {
+    run_with_uid(config, socket_path, tool_proxy::bridge_uid()?).await
+}
+
+async fn run_with_uid(config: ExecutorConfig, socket_path: PathBuf, uid: u32) -> RunnerResult<()> {
     if let Some(reason) = startup_refusal(
-        tool_proxy::bridge_uid()?,
+        uid,
         std::env::var_os("AGENT_AUTH_TOKEN"),
         std::env::var_os("AGENT_AUTH_TOKEN_FILE"),
     ) {
         return Err(runner_error(reason));
     }
     if let Ok(expected) = std::env::var("PEBBLE_TASK_UID") {
-        if expected.parse::<u32>().ok() != Some(tool_proxy::bridge_uid()?) {
+        if expected.parse::<u32>().ok() != Some(uid) {
             return Err(runner_error(
                 "task runner uid does not match PEBBLE_TASK_UID",
             ));
@@ -578,10 +582,6 @@ mod tests {
 
     #[tokio::test]
     async fn real_runner_round_trip_returns_executor_result() {
-        if tool_proxy::bridge_uid().expect("test process uid") == 0 {
-            eprintln!("skipping real runner round-trip: task runner must not run as root");
-            return;
-        }
         let root = std::env::temp_dir().join(format!("pbr-roundtrip-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("create round-trip root");
         let stub = root.join("pebble-stub");
@@ -596,7 +596,7 @@ mod tests {
             permission_mode: "default".to_string(),
             workspace_root: root.to_string_lossy().into_owned(),
         };
-        let server = tokio::spawn(run(config, socket.clone()));
+        let server = tokio::spawn(run_with_uid(config, socket.clone(), 10004));
         for _ in 0..100 {
             if socket.exists() {
                 break;
@@ -635,10 +635,6 @@ mod tests {
 
     #[tokio::test]
     async fn delegated_cancel_returns_a_terminal_result() {
-        if tool_proxy::bridge_uid().expect("test process uid") == 0 {
-            eprintln!("skipping delegated cancellation: task runner must not run as root");
-            return;
-        }
         let root = std::env::temp_dir().join(format!("pbr-cancel-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("create cancel root");
         let stub = root.join("pebble-stub");
@@ -650,7 +646,7 @@ mod tests {
             permission_mode: "default".to_string(),
             workspace_root: root.to_string_lossy().into_owned(),
         };
-        let server = tokio::spawn(run(config, socket.clone()));
+        let server = tokio::spawn(run_with_uid(config, socket.clone(), 10004));
         for _ in 0..100 {
             if socket.exists() {
                 break;
