@@ -170,6 +170,37 @@ test("cron workspaces are validated by the bridge and created by the runner", as
   }
 })
 
+test("runner clients reject malformed frames and keep control refusals non-terminal", async () => {
+  const { createServer } = await import("node:net")
+  const { delegateTaskToRunner: delegateV2 } = await import("../../opencode2.4lunarwing/scripts/task_runner_client")
+  const accepted = { ok: true, op: "accepted", task_id: "task-1" }
+  const result = { op: "result", result: { task_id: "task-1", status: "success", output: "correct", duration_ms: 1 } }
+  for (const delegate of [delegateTaskToRunner, delegateV2]) {
+    for (const [frames, error] of [
+      [[accepted, { op: "prompt_refused", ok: false, error: "queue full" }, result], null],
+      [[accepted, { ...result, result: { ...result.result, task_id: "foreign" } }, result], null],
+      [[accepted, { op: "progress", progress: { task_id: "task-1", delta: "x", done: "wrong" } }], /malformed progress/],
+      [[accepted, null], /non-object/],
+      [[accepted], /closed without a result/],
+    ] as const) {
+      const path = join(scratch(), "peer.sock")
+      const server = createServer((socket) => {
+        socket.on("error", () => {})
+        socket.once("data", () => socket.end(frames.map(frame => JSON.stringify(frame)).join("\n") + "\n"))
+      })
+      await new Promise<void>(resolve => server.listen(path, resolve))
+      try {
+        const pending = delegate(path, request(), undefined, () => {})
+        if (error) await assert.rejects(pending, error)
+        else assert.equal((await pending).output, "correct")
+      } finally {
+        await new Promise<void>(resolve => server.close(() => resolve()))
+      }
+    }
+    await assert.rejects(delegate("/missing.sock", request(), { FORBIDDEN: "grant" }, () => {}), /does not accept extra environment/)
+  }
+})
+
 test("shared runner sockets allow bridge-group access", async () => {
   process.env.LUNARWING_TASK_RUNNER_REMOTE = "1"
   const { runner, path } = await startRunner(makeSdk().sdk)
