@@ -60,14 +60,15 @@ worker_task_uid() {
 }
 
 write_worker_task_runtime_env() {
-  local name="$1" source="$2" target="$3" staged
-  staged="$(mktemp)" || return 1
-  if ! awk '!/^AGENT_AUTH_TOKEN(_FILE)?=/' "$source" >"$staged" \
+  local name="$1" source="$2" target="$3" staged env_snapshot=""
+  _snapshot_tenant_env "$name" "$source" env_snapshot
+  staged="$(mktemp)" || { rm -f -- "$env_snapshot"; return 1; }
+  if ! awk '!/^AGENT_AUTH_TOKEN(_FILE)?=/' "$env_snapshot" >"$staged" \
     || ! write_tenant_file_atomic "$name" "$target" 600 owned-parent <"$staged"; then
-    rm -f -- "$staged"
+    rm -f -- "$staged" "$env_snapshot"
     return 1
   fi
-  rm -f -- "$staged"
+  rm -f -- "$staged" "$env_snapshot"
   printf '%s\n' "$target"
 }
 
@@ -103,7 +104,7 @@ prepare_worker_task_study_mounts() {
 }
 
 prepare_worker_task_launch() {
-  local name="$1" worker="$2" env_dir source snapshot="" value model base_url
+  local name="$1" worker="$2" env_dir source env_snapshot="" value model base_url
   local runtime_env override_env task_env ssh_agent_dir
   env_dir="$(tenant_env_dir "$name")"
   source="$env_dir/lunarwing.env"
@@ -128,18 +129,18 @@ prepare_worker_task_launch() {
     task_env="$(write_worker_task_runtime_env "$name" "$runtime_env" "$env_dir/kimi-task-runtime.env")" || return 1
     TASK_ENV_FLAGS=(--env-file "$task_env")
   elif [[ -f "$source" ]]; then
-    _snapshot_tenant_env "$name" "$source" snapshot
-    value="$(_read_env_value "$snapshot" LLM_API_KEY)"
+    _snapshot_tenant_env "$name" "$source" env_snapshot
+    value="$(_read_env_value "$env_snapshot" LLM_API_KEY)"
     [[ -n "$value" ]] && TASK_ENV_FLAGS+=(-e "TENSORZERO_API_KEY=$value")
     case "$worker" in
       opencode|opencode2)
-        model="$(_read_env_value "$snapshot" "${worker^^}_MODEL")"
-        base_url="$(_read_env_value "$snapshot" "${worker^^}_BASE_URL")"
+        model="$(_read_env_value "$env_snapshot" "${worker^^}_MODEL")"
+        base_url="$(_read_env_value "$env_snapshot" "${worker^^}_BASE_URL")"
         [[ -n "$model" ]] && TASK_ENV_FLAGS+=(-e "${worker^^}_MODEL=$model")
         [[ -n "$base_url" ]] && TASK_ENV_FLAGS+=(-e "${worker^^}_BASE_URL=$base_url")
         ;;
     esac
-    rm -f -- "$snapshot"
+    rm -f -- "$env_snapshot"
   fi
   override_env="$env_dir/${worker}.env"
   if [[ -f "$override_env" ]]; then
