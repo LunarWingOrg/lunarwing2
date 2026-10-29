@@ -110,10 +110,11 @@ logs: `/tmp/lw-item101/add.log` and `/tmp/lw-item101/deploy.log`.
 **Build progress (observed):** the tenant's LunarWing binary finished its
 `--profile release` compile in 12m16s with Rust 1.96.1 and the configured
 18-job limit; output includes the default PostgreSQL and libSQL feature graph.
-The sequence is now compiling the XMPP bridge before proceeding to WASM and the
-fat worker images. Daemon/bridge services and worker containers are not started
-yet; mt-admin `status highwinds` still shows them inactive/missing, so no worker
-acceptance task has been dispatched at this point.
+The XMPP bridge's release compile also finished successfully in 10m27s. The
+current stage is building the tenant's WASM extensions; fat worker images and
+the subsequent `start-tenant` stage have not started. No worker acceptance task
+has been dispatched at this point. Redacted local build log:
+`/tmp/lw-item101/deploy.log`.
 
 **Pre-build source-root finding (image labels pending):** the tenant clone is at
 `05a2cd90fc34da616c9480b7e7a31ed1da6dc3ef`, while the clean operator checkout
