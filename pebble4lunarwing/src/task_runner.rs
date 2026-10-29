@@ -425,13 +425,7 @@ fn verify_socket(socket_path: &Path) -> RunnerResult<()> {
     Ok(())
 }
 
-pub async fn delegate_task(
-    socket_path: &Path,
-    request: &TaskRequest,
-    proxy_env: Option<&[(String, String); 2]>,
-    event_tx: mpsc::UnboundedSender<ExecutorEvent>,
-    mut cancel_rx: oneshot::Receiver<()>,
-) -> RunnerResult<()> {
+async fn connect_verified(socket_path: &Path) -> RunnerResult<UnixStream> {
     use std::os::unix::fs::MetadataExt;
 
     verify_socket(socket_path)?;
@@ -444,7 +438,17 @@ pub async fn delegate_task(
     if before.dev() != after.dev() || before.ino() != after.ino() {
         return Err(runner_error("runner socket changed during connect"));
     }
-    let (read, mut write) = stream.into_split();
+    Ok(stream)
+}
+
+pub async fn delegate_task(
+    socket_path: &Path,
+    request: &TaskRequest,
+    proxy_env: Option<&[(String, String); 2]>,
+    event_tx: mpsc::UnboundedSender<ExecutorEvent>,
+    mut cancel_rx: oneshot::Receiver<()>,
+) -> RunnerResult<()> {
+    let (read, mut write) = connect_verified(socket_path).await?.into_split();
     let mut reader = BufReader::new(read);
     let mut buffer = Vec::new();
     let run =
@@ -456,10 +460,23 @@ pub async fn delegate_task(
         result = write_line(&mut write, &run) => result?,
         _ = &mut cancel_rx => return Err(runner_error("task cancelled before runner dispatch")),
     }
+    let accepted =
+        tokio::time::timeout(Duration::from_secs(2), next_line(&mut reader, &mut buffer))
+            .await
+            .map_err(|_| runner_error("runner acceptance timed out"))??
+            .ok_or_else(|| runner_error("runner closed before acceptance"))?;
+    let accepted: Value = serde_json::from_str(&accepted)?;
+    if accepted["ok"] != true
+        || accepted["op"] != "accepted"
+        || accepted["task_id"] != request.task_id
+    {
+        return Err(runner_error("runner did not accept the requested task"));
+    }
     let timeout_ms = request.timeout_ms.unwrap_or(protocol::DEFAULT_TIMEOUT_MS);
     let deadline = sleep(Duration::from_millis(timeout_ms) + RUN_MARGIN);
     tokio::pin!(deadline);
     let mut cancelling = false;
+    let mut timed_out = false;
     loop {
         tokio::select! {
             line = next_line(&mut reader, &mut buffer) => {
@@ -470,13 +487,17 @@ pub async fn delegate_task(
                 match value["op"].as_str().unwrap_or_default() {
                     "accepted" => {}
                     "progress" | "result" => {
-                        let envelope: Envelope = serde_json::from_value(value["envelope"].clone())?;
+                        let mut envelope: Envelope = serde_json::from_value(value["envelope"].clone())?;
                         let envelope_task = envelope.payload["task_id"].as_str().unwrap_or_default();
                         if envelope_task != request.task_id {
                             continue;
                         }
                         let terminal = value["op"] == "result";
                         let event = if terminal {
+                            if timed_out {
+                                envelope.payload["status"] = json!("timeout");
+                                envelope.payload["error"] = json!("task exceeded its bridge deadline");
+                            }
                             ExecutorEvent::Result(envelope)
                         } else {
                             ExecutorEvent::Progress(envelope)
@@ -502,6 +523,7 @@ pub async fn delegate_task(
                 if cancelling {
                     return Err(runner_error("runner did not finish after cancellation"));
                 }
+                timed_out = true;
                 write_line(&mut write, &serde_json::to_string(&json!({"op": "cancel", "task_id": request.task_id}))?).await?;
                 cancelling = true;
                 deadline.as_mut().reset((Instant::now() + CANCEL_DRAIN).into());
