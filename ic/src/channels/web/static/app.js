@@ -759,6 +759,18 @@ function connectSSE() {
     }
   });
 
+  eventSource.addEventListener('turn_recovery', (e) => {
+    const data = JSON.parse(e.data);
+    if (!isCurrentThread(data.thread_id)) return;
+    showActivityThinking(data.failure_kind + ': ' + data.message);
+    if (data.recovery_state === 'failed') {
+      finishStreamingWork(data.thread_id);
+      finalizeActivityGroup();
+      addMessage('system', data.failure_kind + ': ' + data.message);
+      enableChatInput();
+    }
+  });
+
   eventSource.addEventListener('job_started', (e) => {
     const data = JSON.parse(e.data);
     showJobCard(data);
@@ -2329,6 +2341,9 @@ function loadHistory(before) {
         if (turn.tool_calls && turn.tool_calls.length > 0) {
           fragment.appendChild(createToolCallsSummaryElement(turn.tool_calls));
         }
+        if (turn.failure_kind && turn.error) {
+          fragment.appendChild(createMessageElement('system', turn.failure_kind + ': ' + turn.error));
+        }
         if (turn.response) {
           const responseTs = turn.completed_at || turn.started_at;
           maybeInsertTimeSeparator(fragment, responseTs);
@@ -2343,11 +2358,11 @@ function loadHistory(before) {
       }
       // Show processing indicator if the last turn is still in-progress
       var lastTurn = data.turns.length > 0 ? data.turns[data.turns.length - 1] : null;
-      if (lastTurn && !lastTurn.response && lastTurn.state === 'Processing') {
+      if (lastTurn && !lastTurn.response && (lastTurn.state === 'Processing' || lastTurn.state === 'Retrying')) {
         if (_streamSnapshots.has(requestedThreadId)) {
           getOrCreateStreamingMessage(requestedThreadId);
         } else {
-          showActivityThinking('Processing...');
+          showActivityThinking(lastTurn.error || 'Processing...');
         }
       } else {
         _streamSnapshots.delete(requestedThreadId);
@@ -2378,6 +2393,9 @@ function loadHistory(before) {
         }
         if (turn.tool_calls && turn.tool_calls.length > 0) {
           fragment.appendChild(createToolCallsSummaryElement(turn.tool_calls));
+        }
+        if (turn.failure_kind && turn.error) {
+          fragment.appendChild(createMessageElement('system', turn.failure_kind + ': ' + turn.error));
         }
         if (turn.response) {
           const assistantDiv = createMessageElement('assistant', turn.response, { timestamp: turn.completed_at || turn.started_at });
