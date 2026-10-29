@@ -36,7 +36,7 @@
  */
 
 import { createServer, type Server, type Socket } from "node:net"
-import { chmodSync, mkdirSync, rmSync } from "node:fs"
+import { chmodSync, lstatSync, mkdirSync, rmSync } from "node:fs"
 import { createHash } from "node:crypto"
 import { dirname, join } from "node:path"
 
@@ -113,7 +113,12 @@ export class ToolProxyRelay {
     if (this.tasks.has(taskId)) return null
     const socketPath = taskSocketPath(taskId)
     try {
-      mkdirSync(dirname(socketPath), { recursive: true, mode: 0o700 })
+      mkdirSync(dirname(socketPath), { recursive: true, mode: 0o711 })
+      const directory = lstatSync(dirname(socketPath))
+      if (directory.isSymbolicLink() || !directory.isDirectory() ||
+          directory.uid !== process.getuid?.() || (directory.mode & 0o022) !== 0) {
+        throw new Error("proxy directory must be a plain bridge-owned directory without group/other write access")
+      }
       // A stale socket file from a crashed earlier task would make listen()
       // fail with EADDRINUSE; remove it (the path is hash-bound to this task).
       rmSync(socketPath, { force: true })
