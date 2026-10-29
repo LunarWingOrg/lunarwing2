@@ -2,7 +2,7 @@
 """Self-test for fix_photon_patch_context.py (item-28).
 
 Builds synthetic upstream trees carrying the three pin shapes: the pinned
-buggy patch (the current v1.18.25 / v2.1.1 upstream), the already-fixed
+buggy patch (the current v1.18.25 / v2.1.2 upstream), the already-fixed
 patch (upstream commit 61845b0), and a drifted patch that no longer
 matches either form. The guard must repair the first, refuse the second,
 and fail closed on every drift shape.
@@ -79,6 +79,44 @@ class FixPhotonPatchContextTests(unittest.TestCase):
             rc, out, err = run_script(root)
             self.assertNotEqual(rc, 0)
             self.assertIn("already carries the fixed whitespace", err)
+
+    def test_unrelated_bytes_are_preserved(self) -> None:
+        """Only the three matched spaces change, with no newline/UTF-8 decoding."""
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            write_patch(root, "")
+            path = root / PATCH_REL
+            prefix, suffix = b"unrelated hunk\r\n\xff\xfe\n", b"trailer\r\n"
+            path.write_bytes(prefix + patch_text(BUGGY_HUNK_TAIL).encode() + suffix)
+            rc, out, err = run_script(root)
+            self.assertEqual(rc, 0, err or out)
+            self.assertEqual(
+                path.read_bytes(), prefix + patch_text(FIXED_HUNK_TAIL).encode() + suffix,
+            )
+
+    def test_crlf_context_fails_closed_without_rewriting(self) -> None:
+        """Unreviewed line endings are drift, not something to normalize away."""
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            write_patch(root, "")
+            path = root / PATCH_REL
+            before = patch_text(BUGGY_HUNK_TAIL).encode().replace(b"\n", b"\r\n")
+            path.write_bytes(before)
+            rc, out, err = run_script(root)
+            self.assertNotEqual(rc, 0)
+            self.assertIn("could not locate the buggy hunk-10", err)
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_duplicate_context_fails_closed_without_rewriting(self) -> None:
+        """The unanchored block still has to occur exactly once."""
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            before = patch_text(BUGGY_HUNK_TAIL) * 2
+            write_patch(root, before)
+            rc, out, err = run_script(root)
+            self.assertNotEqual(rc, 0)
+            self.assertIn("could not locate the buggy hunk-10", err)
+            self.assertEqual((root / PATCH_REL).read_bytes(), before.encode())
 
     def test_drifted_patch_fails_closed(self) -> None:
         """An unrecognised patch shape fails the build rather than passing."""

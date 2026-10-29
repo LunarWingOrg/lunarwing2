@@ -31,20 +31,20 @@ PATCH_REL = "patches/@silvia-odwyer%2Fphoton-node@0.3.4.patch"
 # prefix (five, one and one leading spaces), which is what Bun 1.4.4's
 # hunk-header integrity check requires.
 BUGGY_CONTEXT = (
-    "      ;\n",
-    "  };\n",
-    "  \n",
+    b"      ;\n",
+    b"  };\n",
+    b"  \n",
 )
 FIXED_CONTEXT = (
-    "     ;\n",
-    " };\n",
-    " \n",
+    b"     ;\n",
+    b" };\n",
+    b" \n",
 )
 
 
-def repair(patch_text: str) -> str:
-    if patch_text.count("".join(BUGGY_CONTEXT)) != 1:
-        if "".join(FIXED_CONTEXT) in patch_text:
+def repair(patch_bytes: bytes) -> bytes:
+    if patch_bytes.count(b"".join(BUGGY_CONTEXT)) != 1:
+        if b"".join(FIXED_CONTEXT) in patch_bytes:
             raise SystemExit(
                 f"{PATCH_REL}: hunk-10 context already carries the fixed "
                 "whitespace; drop this in-tree repair (upstream landed 61845b0)"
@@ -53,8 +53,8 @@ def repair(patch_text: str) -> str:
             f"{PATCH_REL}: could not locate the buggy hunk-10 context block; "
             "the pinned upstream patch may have drifted — re-review the fix"
         )
-    return patch_text.replace(
-        "".join(BUGGY_CONTEXT), "".join(FIXED_CONTEXT), 1,
+    return patch_bytes.replace(
+        b"".join(BUGGY_CONTEXT), b"".join(FIXED_CONTEXT), 1,
     )
 
 
@@ -67,8 +67,8 @@ def main() -> None:
     patch_path = root / PATCH_REL
     if not patch_path.is_file():
         raise SystemExit(f"{PATCH_REL}: not found under {root}")
-    patch_text = patch_path.read_text(encoding="utf-8")
-    patch_path.write_text(repair(patch_text), encoding="utf-8")
+    patch_bytes = patch_path.read_bytes()
+    patch_path.write_bytes(repair(patch_bytes))
 
 
 if __name__ == "__main__":
