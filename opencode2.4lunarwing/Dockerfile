@@ -398,9 +398,9 @@ RUN mkdir -p /home/opencode2/.local/share/opencode \
              /app/results \
     && chown -R opencode2:opencode2 /home/opencode2 /workspace /var/log/lunarwing /app/results
 
-RUN mkdir -p /run/lunarwing-shared \
-    && chown root:opencode2 /run/lunarwing-shared \
-    && chmod 2770 /run/lunarwing-shared
+RUN install -d -o root -g opencode2 -m 3770 /run/lunarwing-shared \
+    && install -d -o opencode2 -g opencode2 -m 2711 /run/lunarwing-shared/runner \
+    && install -d -o opencode2-bridge -g opencode2 -m 2711 /run/lunarwing-shared/tool-proxy
 
 # cp -a preserves setgid from the builder's source directories. Dependencies
 # stay root-owned and readable, with privilege and write bits stripped.
