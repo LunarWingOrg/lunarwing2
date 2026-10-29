@@ -1201,19 +1201,40 @@ chunk IDs in the executable and leftover randomly named test workspaces.
 The candidate versus uncached-rebuild **whole-image digest comparison remains
 mandatory**; a passing binary check alone does not establish image reproducibility.
 
-WI#510 records a second, current v2.1.2 failure from master pipeline 6658:
-the smoke residue was layer 29, but the Bun-compiled executable in layer 14
-also differed between the candidate and clean rebuild. The two binaries had
-3,293 differing bytes in a table of per-build 64-bit IDs with stable
-`C0000xxxx` suffixes, despite identical Dockerfile, source ref, source SHA and
-`SOURCE_DATE_EPOCH` inputs. The checked `bytecode: false` / `splitting: false`
-profile is the source-level fix for that older split/bytecode ID class. It was
-re-verified here with two independently fresh v2.1.2 clones, rebuilt at the
-same absolute checkout path after clean installs: both binaries were
-byte-identical (local SHA-256 `6c41398f...`; the value is path-dependent and is
-not a portable artifact checksum). Do not mask or otherwise weaken the
-whole-image digest contract; the protected candidate/rebuild pipeline still
-must confirm the merged tree after the smoke tripwire lands.
+WI#510 records the v2.1.2 failure from master pipeline 6658: the smoke
+residue was layer 29, but the Bun-compiled executable in layer 14 also differed
+between candidate and rebuild. The two binaries had 3,293 differing bytes in
+a table of per-build 64-bit IDs with stable `C0000xxxx` suffixes despite
+identical source inputs. The checked `bytecode: false` / `splitting: false`
+profile fixes the older split/bytecode ID class, but that does not establish
+the cause of this intermittent recurrence. Two independently fresh local
+v2.1.2 builds were byte-identical (`6c41398f...`, path-dependent, not a portable
+checksum). WI#510 notes #12550/#12560 record matching binary and smoke layers
+on master 6708; the binary cause remains open, not proven fixed by those
+passes. Never mask bytes or weaken the whole-image digest contract.
+
+Master 6708 exposed a third cause: candidate and rebuild crossed UTC midnight,
+changing the account-creation layer's `/etc/shadow` last-change day. **All four
+worker Dockerfiles now declare `ARG SOURCE_DATE_EPOCH=0` before runtime
+`useradd` and assert in the same `RUN` that the account's shadow day equals
+`SOURCE_DATE_EPOCH / 86400`.** Keep both the stage-local ARG and the assertion;
+a later ARG (the old Kimi layout) cannot affect an earlier `RUN`. CI supplies
+the source commit epoch; plain builds default to day zero. BuildKit's
+`rewrite-timestamp` normalizes metadata, not this file content. The regression
+suite `.gitlab/tests/test_worker_reproducibility.py` checks all four scopes,
+executes the shadow assertions with epoch-boundary/incorrect-day fixtures,
+and ties every snapshot to CI. Protected whole-image candidate/rebuild,
+scan and exposure verification on the changed tree remain required.
+
+The four `DEBIAN_SNAPSHOT` defaults and `CI_DEBIAN_SNAPSHOT` now use
+`20261024T011300Z`: its security indexes supply patched `libbrotli1`
+`1.0.9-2+deb12u1` (Bookworm) and `1.1.0-2+deb13u1` (Trixie), fixing
+CVE-2026-111497 without a new Trivy ignore. The three existing dated ignores
+were re-verified against these package indexes and the Debian tracker; their
+expiry dates are unchanged. This snapshot does **not** update Node's statically
+bundled decoder or establish Bun's decoder status: WI#514 still owns those
+base-runtime checks/upgrades and protected scan acceptance. Deployed tenants
+need rebuilt images and recreated containers before any image fix applies.
 
 The build-time self-test `RUN` steps also run under a throwaway
 `HOME`/XDG environment rooted inside the trap-cleaned `/tmp/opencode2-build-tests`
