@@ -202,8 +202,10 @@ ENV GOROOT=/usr/local/go \
 # USER below), the bridge runs as root and drops every spawned task to this
 # uid/gid via setpriv (flags pinned by taskSetprivArgv + the executor
 # self-test), so the bridge's and PID 1's environ are EACCES to task code.
+ARG SOURCE_DATE_EPOCH=0
 RUN groupadd --gid 10002 kimi \
-    && useradd --uid 10002 --gid 10002 -m -d /home/kimi kimi
+    && useradd --uid 10002 --gid 10002 -m -d /home/kimi kimi \
+    && test "$(getent shadow kimi | cut -d: -f3)" = "$((SOURCE_DATE_EPOCH / 86400))"
 
 # ── app layout ─────────────────
 WORKDIR /app
@@ -222,7 +224,6 @@ RUN chmod +x /app/entrypoint.sh /app/entrypoint-task-setup.sh /app/health_server
 # npm ci verifies every bridge and CLI dependency against committed integrity
 # hashes. An override that disagrees with the lock fails instead of re-resolving.
 ARG KIMI_CODE_VERSION
-ARG SOURCE_DATE_EPOCH=0
 ENV KIMI_CODE_IMAGE_VERSION="${KIMI_CODE_VERSION}"
 COPY kimi-cli/package.json kimi-cli/package-lock.json /opt/kimi-cli/
 # The stock npm bundled in the node base ships node-tar < 7.5.19
