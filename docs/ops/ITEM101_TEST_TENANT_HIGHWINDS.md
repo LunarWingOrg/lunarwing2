@@ -111,28 +111,28 @@ logs: `/tmp/lw-item101/add.log` and `/tmp/lw-item101/deploy.log`.
 `--profile release` compile in 12m16s with Rust 1.96.1 and the configured
 18-job limit; output includes the default PostgreSQL and libSQL feature graph.
 The XMPP bridge's release compile also finished successfully in 10m27s. The
-current stage is building the tenant's WASM extensions; fat worker images and
-the subsequent `start-tenant` stage have not started. No worker acceptance task
-has been dispatched at this point. All nine WASM tool artifacts are complete
-(`cavepony-tool`, `gitlab`, `gotify`, `llm-context`, `multica-bridge`, `ssh`,
-`vision-analyze`, `voice-transcribe`, `web-search`). Channel builds have begun:
-`darkirc` completed and `multica` is building; `weechat` and `xmpp` remain.
-These are partial results only, not a claim that the full WASM set is complete.
-Redacted local build log:
-`/tmp/lw-item101/deploy.log`.
+standard WASM build completed successfully: all nine tool artifacts and all
+four channel artifacts built. Installation reports `12 installed, 1 skipped
+(not built)`; the skipped artifact is DarkIRC, correctly omitted because this
+tenant has DarkIRC disabled. The fat Pebble worker candidate image is currently
+building with Rust, Go, and C++ toolchains; its protected toolchain smoke gate
+and the Kimi fat image build remain. `start-tenant` and worker acceptance have
+not started. Redacted local build log: `/tmp/lw-item101/deploy.log`.
 
-**Pre-build source-root finding (image labels pending):** the tenant clone is at
-`05a2cd90fc34da616c9480b7e7a31ed1da6dc3ef`, while the clean operator checkout
-used by this run is at `4847e8d6d8ecd1bb7f52297609b2bd0f403cf5be`. The current
-mt-admin code calls `build_pebble_worker` without a tenant-root argument
-(`ic/scripts/mt-admin-lib/05-tenant-build.sh:562`); that builder reads
+**Worker build source-root finding:** at provisioning, the tenant clone is at
+`05a2cd90fc34da616c9480b7e7a31ed1da6dc3ef`. At Pebble image build time, the
+clean operator checkout is at
+`67a96a9dd4380317dd05badda0f357a20c9085bb` (verified with `git rev-parse` and
+clean status). The mt-admin path calls `build_pebble_worker` without a tenant
+root (`ic/scripts/mt-admin-lib/05-tenant-build.sh:562`); that builder reads
 `${LUNARWING_ROOT}/pebble4lunarwing` and stamps its revision from
-`LUNARWING_ROOT` (`:1145`, `:1154`). Kimi, by contrast, receives
-`$(tenant_lw_root "$name")` (`:574`). Thus the build inputs are on different
-commits by construction on this run, matching the still-open WI#507 source-root
-asymmetry noted in item 99. The redacted build log will be checked for both
-actual `SOURCE_REVISION` labels before reporting this as an image-level result.
-This is a traceability caveat; no worker image is claimed built yet.
+`LUNARWING_ROOT` (`:1145`, `:1154`). Kimi instead receives
+`$(tenant_lw_root "$name")` (`:574`). The live Pebble build log confirms the
+fat candidate's `SOURCE_REVISION` is the operator checkout's
+`67a96a9dd4380317dd05badda0f357a20c9085bb`, not the tenant clone revision.
+The Kimi image's actual label will be inspected after its build. This reproduces
+the still-open WI#507 source-root asymmetry noted in item 99: both lanes are
+selected for the same tenant but are built from different source commits.
 
 ## Planned worker exercise
 
