@@ -67,6 +67,10 @@ export function refuseSymlinkedProxyDir(dir: string): void {
   }
   if (st.isSymbolicLink()) throw new Error(`proxy dir ${dir} is a symlink (refused, WI#400 LP-5)`)
   if (!st.isDirectory()) throw new Error(`proxy dir ${dir} is not a directory (refused, WI#400 LP-5)`)
+  if (process.env.LUNARWING_TASK_RUNNER_REMOTE === "1" &&
+      (st.uid !== process.getuid?.() || (st.mode & 0o022) !== 0)) {
+    throw new Error("shared proxy directory must be bridge-owned and not group/other-writable")
+  }
 }
 
 /** Filesystem-safe per-task socket path. Task ids come from the hub but are
@@ -149,6 +153,19 @@ export class ToolProxyRelay {
     })
     if (!started) return null
     this.tasks.set(taskId, task)
+    if (process.env.LUNARWING_TASK_RUNNER_REMOTE === "1") {
+      try {
+        chmodSync(socketPath, 0o660)
+        chmodSync(dirname(socketPath), 0o711)
+      } catch (err) {
+        console.error(
+          `[tool-proxy] task ${taskId}: shared socket permission failed (task runs without tools):`,
+          err instanceof Error ? err.message : err,
+        )
+        this.closeTask(taskId)
+        return null
+      }
+    }
     // WI#400: the bridge runs as container root, so the socket is
     // root-owned and the task uid could not connect to it. Hand the
     // per-task SOCKET to the pinned task identity, but keep the DIRECTORY

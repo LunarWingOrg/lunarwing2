@@ -26,13 +26,13 @@ const (
 	anchorArg       = "ARG LUNARWING_WRAPPER_SHA256="
 	scriptsCopy     = "COPY scripts/ ./scripts/"
 	configCopy      = "COPY config/ ./config/"
-	bootCopy        = "COPY entrypoint.sh health_server.py agent_comm_protocol.json ./"
+	bootCopy        = "COPY entrypoint.sh entrypoint-split.sh health_server.py agent_comm_protocol.json ./"
 )
 
 var (
 	directivePattern  = regexp.MustCompile(`(?i)#\s*(syntax|escape|check)\s*=`)
 	identifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
-	readonlyPattern   = regexp.MustCompile(`^RUN (chmod \+x /app/entrypoint\.sh /app/health_server\.py && )?chmod -R a-w /app/scripts /app/config /app/entrypoint\.sh /app/health_server\.py /app/agent_comm_protocol\.json$`)
+	readonlyPattern   = regexp.MustCompile(`^RUN (chmod \+x /app/entrypoint\.sh( /app/entrypoint-split\.sh)? /app/health_server\.py && )?chmod -R a-w /app/scripts /app/config /app/entrypoint\.sh( /app/entrypoint-split\.sh)? /app/health_server\.py /app/agent_comm_protocol\.json$`)
 )
 
 type parsedLine struct {

@@ -34,7 +34,7 @@ function sessionPermissions() {
 COMPILE_OUT_COPY = "COPY scripts/compile_out_remote_tunnel.py /build/compile_out_remote_tunnel.py\n"
 COMPILE_OUT_RUN = "RUN python3 /build/compile_out_remote_tunnel.py /build/opencode\n"
 BUILD_RUN = 'RUN OPENCODE_VERSION="${OPENCODE_VERSION#v}" bun run build -- --single\n'
-READONLY_RUN = "RUN chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/health_server.py /app/agent_comm_protocol.json\n"
+READONLY_RUN = "RUN chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/entrypoint-split.sh /app/health_server.py /app/agent_comm_protocol.json\n"
 DEPENDENCY_MODES_RUN = "RUN chmod -R a-s,a-w /app/node_modules\n"
 FILESYSTEM_ASSERTION = "RUN python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --image-filesystem\n"
 WRAPPER_ANCHOR_ARG = "ARG LUNARWING_WRAPPER_SHA256=\n"
@@ -54,7 +54,7 @@ DOCKERFILE_LINES = (
     BINARY_SCAN_RUN,
     "COPY scripts/ ./scripts/\n",
     "COPY config/ ./config/\n",
-    "COPY entrypoint.sh health_server.py agent_comm_protocol.json ./\n",
+    "COPY entrypoint.sh entrypoint-split.sh health_server.py agent_comm_protocol.json ./\n",
     READONLY_RUN,
     DEPENDENCY_MODES_RUN,
     WRAPPER_ANCHOR_ARG,

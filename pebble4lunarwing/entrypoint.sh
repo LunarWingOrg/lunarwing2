@@ -3,6 +3,34 @@ set -euo pipefail
 
 PEBBLE_MODE="${PEBBLE_MODE:-websocket}"
 
+if [[ "${LUNARWING_ROOTFUL_WORKSPACE:-}" == 1 ]]; then
+  [[ "${LUNARWING_WORKSPACE_ID:-}" =~ ^[0-9]+:[0-9]+$ ]] \
+    || { echo '[entrypoint] rootful workspace identity is required' >&2; exit 1; }
+  [[ "$(stat -c '%d:%i' -- "${WORKSPACE_ROOT:-/workspace}")" == "$LUNARWING_WORKSPACE_ID" ]] \
+    || { echo '[entrypoint] workspace mount changed identity; refusing redirected workspace' >&2; exit 1; }
+fi
+
+if [[ "${LUNARWING_CONTAINER_ROLE:-}" == "split-bridge" ]]; then
+  exec /usr/local/bin/entrypoint-split.sh "$@"
+fi
+if [[ "${LUNARWING_CONTAINER_ROLE:-}" == "split-task" ]]; then
+  SPLIT_TASK_UID="${PEBBLE_TASK_UID:-10004}"
+  [[ "$(id -u)" == "$SPLIT_TASK_UID" ]] || { echo "[entrypoint] split-task must run as uid $SPLIT_TASK_UID" >&2; exit 1; }
+  if [[ -n "${AGENT_AUTH_TOKEN:-}" || -n "${AGENT_AUTH_TOKEN_FILE:-}" ]]; then
+    echo "[entrypoint] hub credential variables must never reach the task container" >&2
+    exit 1
+  fi
+  TASK_RUNNER_SOCKET="${PEBBLE_TASK_RUNNER_SOCKET:-/run/lunarwing-shared/runner/task-runner.sock}"
+  export LUNARWING_TASK_RUNNER_REMOTE=1
+  export LUNARWING_TASK_RUNNER_SOCKET="$TASK_RUNNER_SOCKET"
+  export LUNARWING_TASK_RUNNER_STATE_FILE="${PEBBLE_TASK_RUNNER_STATE_FILE:-$(dirname "$TASK_RUNNER_SOCKET")/task-runner-state.json}"
+  export LUNARWING_TOOL_PROXY_DIR="${LUNARWING_TOOL_PROXY_DIR:-/run/lunarwing-shared/tool-proxy}"
+  export HOME=/home/pebbletask GOPATH=/home/pebbletask/go GOCACHE=/home/pebbletask/.cache/go-build
+  export CARGO_HOME=/home/pebbletask/.cargo
+  unset AGENT_AUTH_TOKEN AGENT_AUTH_TOKEN_FILE PEBBLE_TASK_UID PEBBLE_TASK_GID
+  umask 0007
+fi
+
 # WI#400 LD-8: the bridge must run as container root (image USER 0:0). On
 # rootless podman keep-id a USER-less image would land the whole entrypoint
 # on the task uid — the same uid every task drops to — and the credential
@@ -41,6 +69,14 @@ fi
 
 case "$PEBBLE_MODE" in
   websocket)
+    if [[ "${LUNARWING_CONTAINER_ROLE:-}" == "split-task" ]]; then
+      echo "[entrypoint] starting pebble4lunarwing task runner as uid $(id -u)"
+      exec pebble4lunarwing task-runner "$TASK_RUNNER_SOCKET"
+    fi
+    if [[ -n "${PEBBLE_BRIDGE_UID:-}" ]]; then
+      echo '[entrypoint] websocket images require LUNARWING_CONTAINER_ROLE=split-bridge or split-task' >&2
+      exit 1
+    fi
     echo "[entrypoint] starting pebble4lunarwing bridge (WebSocket mode)"
     exec pebble4lunarwing
     ;;

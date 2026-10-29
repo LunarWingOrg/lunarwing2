@@ -982,34 +982,36 @@ fi
 assert_eq "pebble workspace symlink left in place" \
   "$(if [[ -L "$MT_FIXTURE/pebble-workspace" ]]; then echo symlink; else echo replaced; fi)" "symlink"
 rm -f "$MT_FIXTURE/pebble-workspace"
-# Clean control: an absent workspace is created tenant-private (0700, no 0777).
 ws_out="$(prepare_pebble_workspace "$hh4_tenant")" || ws_out=""
 assert_eq "pebble workspace created at the tenant path" "$ws_out" "$MT_FIXTURE/pebble-workspace"
-assert_eq "pebble workspace is tenant-private (0700)" \
-  "$(stat -c %a "$MT_FIXTURE/pebble-workspace")" "700"
+assert_eq "pebble workspace is private with inherited task group (2770)" \
+  "$(stat -c %a "$MT_FIXTURE/pebble-workspace")" "2770"
 
-# WI#400 x WI#422 (root-only, run-171): on a rootful runtime pebble runs as
-# the tenant uid (--user) and tasks inherit that identity, so the workspace
-# stays tenant-owned: the first create never hands it to the task uid, and a
-# workspace owned by the task uid (the retired LD-9 handoff) is refused like
-# any other foreign owner. Root-only because the refusal needs a REAL chown.
+# WI#454 split identity (root-only): rootful task containers run as the baked
+# Pebble task uid, so the workspace must be handed to that uid and accepted on
+# the next start. A foreign lane owner must still be refused before chown.
 if [[ "$(id -u)" == "0" ]]; then
   rm -rf "$MT_FIXTURE/pebble-workspace"
   unset -f chown
   hh4_prior_rootless="${MT_ROOTLESS:-}"
   MT_ROOTLESS=false
-  hh4_lw_owner="$(stat -c %u "$(tenant_lw_root "$hh4_tenant")")"
   if ws_first="$(prepare_pebble_workspace "$hh4_tenant" 2>&1)" \
-     && [[ "$(stat -c %u "$MT_FIXTURE/pebble-workspace")" == "$hh4_lw_owner" ]]; then
-    echo "  PASS: rootful create keeps the workspace tenant-owned (no task-uid handoff)"
+     && [[ "$(stat -c %u "$MT_FIXTURE/pebble-workspace")" == "$PEBBLE_CONTAINER_UID" ]]; then
+    echo "  PASS: rootful create assigns the workspace to the Pebble task uid"
   else
-    echo "  FAIL: rootful create changed the workspace owner (owner=$(stat -c %u "$MT_FIXTURE/pebble-workspace" 2>/dev/null), out=$ws_first)"; failures=$((failures + 1))
+    echo "  FAIL: rootful create did not assign the workspace to the task uid (owner=$(stat -c %u "$MT_FIXTURE/pebble-workspace" 2>/dev/null), out=$ws_first)"; failures=$((failures + 1))
   fi
-  chown "$PEBBLE_CONTAINER_UID:$PEBBLE_CONTAINER_GID" "$MT_FIXTURE/pebble-workspace"
-  if ws_second="$(prepare_pebble_workspace "$hh4_tenant" 2>&1)"; then
-    echo "  FAIL: rootful re-create accepted a task-uid-owned workspace: $ws_second"; failures=$((failures + 1))
+  if ws_second="$(prepare_pebble_workspace "$hh4_tenant" 2>&1)" \
+     && [[ "$(stat -c %u "$MT_FIXTURE/pebble-workspace")" == "$PEBBLE_CONTAINER_UID" ]]; then
+    echo "  PASS: rootful re-create accepts the existing task-owned workspace"
   else
-    echo "  PASS: rootful re-create refuses a task-uid-owned workspace"
+    echo "  FAIL: rootful re-create rejected the existing task-owned workspace: $ws_second"; failures=$((failures + 1))
+  fi
+  chown 10001:10001 "$MT_FIXTURE/pebble-workspace"
+  if ws_foreign="$(prepare_pebble_workspace "$hh4_tenant" 2>&1)"; then
+    echo "  FAIL: rootful re-create accepted a foreign lane workspace: $ws_foreign"; failures=$((failures + 1))
+  else
+    echo "  PASS: rootful re-create refuses a foreign lane workspace"
   fi
   MT_ROOTLESS="$hh4_prior_rootless"
   chown() { :; }  # restore the harness no-op stub

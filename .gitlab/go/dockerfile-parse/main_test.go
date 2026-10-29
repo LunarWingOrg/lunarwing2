@@ -16,8 +16,8 @@ RUN install -D -m 0755 /app/scripts/opencode-exposure-guard.sh /usr/local/bin/op
     && python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --binary /usr/local/lib/opencode2/opencode
 COPY scripts/ ./scripts/
 COPY config/ ./config/
-COPY entrypoint.sh health_server.py agent_comm_protocol.json ./
-RUN chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/health_server.py /app/agent_comm_protocol.json
+COPY entrypoint.sh entrypoint-split.sh health_server.py agent_comm_protocol.json ./
+RUN chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/entrypoint-split.sh /app/health_server.py /app/agent_comm_protocol.json
 RUN chmod -R a-s,a-w /app/node_modules
 ARG LUNARWING_WRAPPER_SHA256=
 RUN python3 /app/scripts/exposure_policy_assert.py --lane /app --profile opencode2 --image-filesystem

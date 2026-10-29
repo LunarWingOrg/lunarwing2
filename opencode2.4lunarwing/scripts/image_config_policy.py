@@ -18,6 +18,9 @@ EXPECTED_ENV = {
     "GOROOT": "/usr/local/go",
     "GOPATH": "/home/opencode2/go",
     "CARGO_HOME": "/home/opencode2/.cargo",
+    "OPENCODE2_TASK_UID": "10003",
+    "OPENCODE2_TASK_GID": "10003",
+    "OPENCODE2_BRIDGE_UID": "10103",
 }
 EXPECTED_FIELDS = {
     "Entrypoint": ["/usr/bin/tini", "--", "/app/entrypoint.sh"],

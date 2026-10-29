@@ -1,25 +1,53 @@
 services:
-  pebble-worker:
+  pebble-task:
     build:
       context: ..
       dockerfile: pebble4lunarwing/Dockerfile
+    user: "10004:10004"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
     environment:
+      - LUNARWING_CONTAINER_ROLE=split-task
       - PEBBLE_MODE=websocket
       - PEBBLE_MODEL=${PEBBLE_MODEL:-openai/gpt-5.2}
       - PEBBLE_PERMISSION_MODE=${PEBBLE_PERMISSION_MODE:-danger-full-access}
       - PEBBLE_PROGRESS_HEARTBEAT_MS=${PEBBLE_PROGRESS_HEARTBEAT_MS:-120000}
       - PEBBLE_API_TIMEOUT_SECS=${PEBBLE_API_TIMEOUT_SECS:-600}
-      - AGENT_AUTH_TOKEN=${AGENT_AUTH_TOKEN:-}
+      - NANOGPT_API_KEY=${NANOGPT_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    volumes:
+      - workspace:/workspace
+      - pebble-ipc-v2:/run/lunarwing-shared
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/pebble4lunarwing", "task-runner-ping", "/run/lunarwing-shared/runner/task-runner.sock"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  pebble-worker:
+    build:
+      context: ..
+      dockerfile: pebble4lunarwing/Dockerfile
+    user: "10104:10004"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      pebble-task:
+        condition: service_healthy
+    environment:
+      - LUNARWING_CONTAINER_ROLE=split-bridge
+      - PEBBLE_MODE=websocket
+      - AGENT_AUTH_TOKEN=${AGENT_AUTH_TOKEN:?AGENT_AUTH_TOKEN is required}
       - LUNARWING_WORKER_ID=${LUNARWING_WORKER_ID:-worker-pebble-01}
       - WS_PORT=9090
       - HEALTH_PORT=8443
-      - NANOGPT_API_KEY=${NANOGPT_API_KEY:-}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
     ports:
-      - "${WS_PORT:-9090}:9090"
-      - "${HEALTH_PORT:-8443}:8443"
+      - "127.0.0.1:${WS_PORT:-9090}:9090"
+      - "127.0.0.1:${HEALTH_PORT:-8443}:8443"
     volumes:
       - workspace:/workspace
+      - pebble-ipc-v2:/run/lunarwing-shared
     restart: unless-stopped
 
   pebble-cli:
@@ -40,3 +68,4 @@ services:
 
 volumes:
   workspace:
+  pebble-ipc-v2:

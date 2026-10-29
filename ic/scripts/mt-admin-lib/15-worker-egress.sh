@@ -701,7 +701,9 @@ worker_egress_audit() {
     missing=1
   fi
   for container in "lunarwing-pebble-$name" "lunarwing-opencode-$name" \
-                   "lunarwing-opencode2-$name" "lunarwing-kimi-$name"; do
+                   "lunarwing-opencode2-$name" "lunarwing-kimi-$name" \
+                   "lunarwing-pebble-task-$name" "lunarwing-opencode-task-$name" \
+                   "lunarwing-opencode2-task-$name" "lunarwing-kimi-task-$name"; do
     _ctr "$name" inspect "$container" >/dev/null 2>&1 || continue
     attached=1
     if worker_egress_container_attached "$name" "$container"; then

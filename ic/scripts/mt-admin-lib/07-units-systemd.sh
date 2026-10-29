@@ -565,9 +565,10 @@ render_worker_quadlet() {
   {
     cat <<EOF
 [Unit]
-Description=LunarWing ${worker} worker ($name)
-After=network-online.target
+Description=LunarWing ${worker} bridge container ($name)
+After=network-online.target lunarwing-${worker}-task-${name}.service
 Wants=network-online.target
+Requires=lunarwing-${worker}-task-${name}.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
@@ -576,27 +577,23 @@ ContainerName=lunarwing-${worker}-${name}
 Network=${egress_network}
 DNS=127.0.0.1
 Image=lunarwing-worker-${worker}:latest
+User=$(worker_bridge_uid "$worker"):$(worker_task_uid "$worker")
 PublishPort=127.0.0.1:${wss_port}:${wss_port}
 Volume=${workspace_dir}:/workspace:z
+Volume=$(worker_ipc_volume_name "$worker" "$name"):/run/lunarwing-shared:z
+Environment=LUNARWING_CONTAINER_ROLE=split-bridge
+Environment=LUNARWING_TOOL_PROXY_DIR=/run/lunarwing-shared/tool-proxy
 Environment=LUNARWING_WORKER_ID=worker-${worker}-${name}
 Environment=WS_PORT=${wss_port}
 Environment=HEALTH_PORT=${health_port}
 Environment=WS_BIND_HOST=0.0.0.0
 Environment=WS_PATH=/ws/agent
+PodmanArgs=--security-opt=no-new-privileges --cap-drop=ALL
 EOF
     local egress_mapping
     while IFS= read -r egress_mapping; do
       [[ -n "$egress_mapping" ]] && printf 'AddHost=%s\n' "$egress_mapping"
     done <<<"$egress_mappings"
-    if [[ -n "$study_notes_home" ]]; then
-      printf 'Volume=%s:%s:ro,z\n' "$study_notes_home" "$STUDY_NOTES_CONTAINER_HOME"
-      printf 'Environment=LW2STUDYMCP_HOME=%s\n' "$STUDY_NOTES_CONTAINER_HOME"
-      if [[ -n "$study_notes_state_home" ]]; then
-        printf 'Volume=%s:%s:ro,z\n' \
-          "$study_notes_state_home" "$STUDY_NOTES_CONTAINER_STATE_HOME"
-        printf 'Environment=LW2STUDYMCP_STATE_HOME=%s\n' "$STUDY_NOTES_CONTAINER_STATE_HOME"
-      fi
-    fi
     if [[ "$worker" == "opencode" ]]; then
       printf 'UserNS=%s\n' "$OPENCODE_USERNS"
     elif [[ "$worker" == "kimi" ]]; then
@@ -604,46 +601,7 @@ EOF
     elif [[ "$worker" == "opencode2" ]]; then
       printf 'UserNS=%s\n' "$OPENCODE2_USERNS"
     elif [[ "$worker" == "pebble" ]]; then
-      # WI#400: pebble tasks run under a uid separate from the bridge;
-      # keep-id binds that task uid to the tenant account.
       printf 'UserNS=%s\n' "$PEBBLE_USERNS"
-    fi
-    # WI#206: the kimi lane gets no SSH-agent socket and no privilege
-    # escalation — it is an auto-approved headless task executor, and a
-    # mounted host agent turns prompt injection into credential use. Other
-    # worker lanes keep the socket (their permission model is interactive).
-    if [[ "$worker" == "kimi" ]]; then
-      # Quadlet has no `SecurityOpt` key: the generator rejects the whole file
-      # ("unsupported key 'SecurityOpt' in group 'Container'"), so the unit is
-      # never created and the worker is unreachable (connection refused). Use
-      # the spelling the other quadlets in this file already use.
-      printf 'PodmanArgs=--security-opt=no-new-privileges --cap-drop=ALL --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER --cap-add=KILL --cap-add=SETUID --cap-add=SETGID\n'
-    else
-      # SSH agent DIRECTORY mount + env (always included — the daemon creates
-      # the socket at startup; if SSH isn't configured, the socket won't exist
-      # and SSH commands from the worker will fail with a clear "no agent"
-      # error). Mounting the directory (not the socket file) means a daemon
-      # restart's fresh socket inode is picked up automatically — no worker
-      # recreate needed. :ro prevents workers from unlinking or replacing the
-      # host socket; :z shares its SELinux label across the worker lanes.
-      printf 'Volume=%s:/tmp/ssh-agent:ro,z\n' "$ssh_agent_dir"
-      printf 'Environment=SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock\n'
-      # WI#400 run-164 KW-2: the WI#400 root-bridge lanes get the same
-      # container-level no-new-privileges kimi has carried since WI#206 —
-      # with a root bridge, the setting keeps setuid/file-capability
-      # binaries from handing privilege back to task code. opencode2 is NOT
-      # a WI#400 root-bridge lane yet, so it is deliberately excluded.
-      # KW-3: the same lanes' root bridge also runs with the default
-      # capability set otherwise — on rootful runtimes that is host root.
-      # Trim to the set the bridge actually uses: CHOWN (relay-socket and
-      # cron-leaf handoff to the task uid), SETUID/SETGID (the setpriv task
-      # drop), KILL (timeout/cancel kills of the task-uid children),
-      # DAC_OVERRIDE+FOWNER (cron workspace creation and mode management
-      # inside the task-owned workspace root; without them the bridge's own
-      # mkdir/chmod there fails).
-      case "$worker" in
-        opencode|pebble) printf 'PodmanArgs=--security-opt=no-new-privileges --cap-drop=ALL --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER --cap-add=KILL --cap-add=SETUID --cap-add=SETGID\n' ;;
-      esac
     fi
     # Publish the per-tenant dedicated health port (v8) -> container's 8443, so
     # the host self-heal pipeline can probe the worker directly. Container still
@@ -706,6 +664,132 @@ EOF
     die "could not safely write the ${worker} Quadlet as tenant '$name'"
   fi
   rm -f -- "$unit_staged"
+  prepare_worker_task_launch "$name" "$worker"
+  render_worker_task_quadlet "$name" "$worker" "$workspace_dir"
+}
+
+render_worker_task_quadlet() {
+  local name="$1" worker="$2" workspace_dir="$3"
+  local qdir task_container ipc_volume task_uid egress_network egress_ruleset egress_guard egress_chain egress_subnet egress_mappings health_command
+  qdir="$(tenant_quadlet_dir "$name")"
+  task_container="$(worker_task_container_name "$worker" "$name")"
+  ipc_volume="$(worker_ipc_volume_name "$worker" "$name")"
+  task_uid="$(worker_task_uid "$worker")"
+  health_command="$(worker_task_health_command "$worker" "$name")" || return 1
+  egress_network="$(worker_egress_network_name "$name")"
+  egress_ruleset="$(worker_egress_ruleset_path "$name")"
+  egress_guard="$WORKER_EGRESS_GUARD"
+  egress_chain="$(worker_egress_chain "$name")"
+  egress_subnet="$(worker_egress_state_get "$name" SUBNET)"
+  [[ -n "$egress_subnet" ]] || die "worker egress is not prepared for '$name'"
+  egress_mappings="$(worker_egress_host_mappings "$name")" \
+    || die "worker egress static hosts are not prepared for '$name'"
+  tenant_mkdir_p "$name" "$qdir" \
+    || die "could not safely create $qdir as tenant '$name'"
+
+  local unit_staged
+  unit_staged="$(mktemp)" || return 1
+  {
+    cat <<EOF
+[Unit]
+Description=LunarWing ${worker} task container ($name)
+After=network-online.target
+Wants=network-online.target
+Before=lunarwing-${worker}-${name}.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Container]
+ContainerName=${task_container}
+Network=${egress_network}
+DNS=127.0.0.1
+Image=lunarwing-worker-${worker}:latest
+User=${task_uid}:${task_uid}
+Volume=${workspace_dir}:/workspace:z
+Volume=${ipc_volume}:/run/lunarwing-shared:z
+Environment=LUNARWING_CONTAINER_ROLE=split-task
+Environment=WORKSPACE_ROOT=/workspace
+Environment=LUNARWING_TOOL_PROXY_DIR=/run/lunarwing-shared/tool-proxy
+PodmanArgs=--security-opt=no-new-privileges --cap-drop=ALL
+EOF
+    local mapping
+    while IFS= read -r mapping; do
+      [[ -n "$mapping" ]] && printf 'AddHost=%s\n' "$mapping"
+    done <<<"$egress_mappings"
+    case "$worker" in
+      opencode) printf 'UserNS=%s\n' "$OPENCODE_USERNS" ;;
+      kimi) printf 'UserNS=%s\n' "$KIMI_USERNS" ;;
+      opencode2) printf 'UserNS=%s\n' "$OPENCODE2_USERNS" ;;
+      pebble) printf 'UserNS=%s\n' "$PEBBLE_USERNS" ;;
+    esac
+
+    local index key value
+    index=0
+    while [[ "$index" -lt "${#TASK_ENV_FLAGS[@]}" ]]; do
+      key="${TASK_ENV_FLAGS[$index]}"
+      value="${TASK_ENV_FLAGS[$((index + 1))]}"
+      [[ "$value" != AGENT_AUTH_TOKEN=* && "$value" != AGENT_AUTH_TOKEN_FILE=* ]] \
+        || die "hub credential reached the task Quadlet environment"
+      case "$key" in
+        -e) printf 'Environment=%s\n' "${value//%/%%}" ;;
+        --env-file) printf 'EnvironmentFile=%s\n' "$value" ;;
+        *) die "unknown task environment argument '$key'" ;;
+      esac
+      index=$((index + 2))
+    done
+    index=0
+    while [[ "$index" -lt "${#TASK_MOUNTS[@]}" ]]; do
+      key="${TASK_MOUNTS[$index]}"
+      value="${TASK_MOUNTS[$((index + 1))]}"
+      case "$key" in
+        -v) printf 'Volume=%s\n' "$value" ;;
+        -e) printf 'Environment=%s\n' "${value//%/%%}" ;;
+        *) die "unknown task mount argument '$key'" ;;
+      esac
+      index=$((index + 2))
+    done
+    cat <<EOF
+HealthCmd=${health_command}
+HealthInterval=15s
+HealthTimeout=5s
+HealthRetries=3
+HealthStartPeriod=30s
+
+[Service]
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+ExecStartPre=${egress_guard} ${egress_ruleset} rootless ${egress_chain}
+ExecStartPost=${egress_guard} --verify ${egress_ruleset} rootless ${egress_chain}
+
+[Install]
+WantedBy=default.target
+EOF
+  } >"$unit_staged"
+  if ! write_tenant_file_atomic "$name" "$qdir/${task_container}.container" 600 owned-parent <"$unit_staged"; then
+    rm -f -- "$unit_staged"
+    die "could not safely write the ${worker} task Quadlet as tenant '$name'"
+  fi
+  rm -f -- "$unit_staged"
+}
+
+reconcile_worker_task_quadlet() {
+  local name="$1" worker="$2" launch_contract="$3"
+  local task_container task_service task_file
+  task_container="$(worker_task_container_name "$worker" "$name")"
+  task_service="${task_container}.service"
+  task_file="$(tenant_quadlet_dir "$name")/${task_container}.container"
+  if _container_config_changed "$name" "$task_container" "$task_file" "$launch_contract"; then
+    _recreate_quadlet_container "$name" "$task_service" "$task_container"
+  fi
+  _systemctl_user "$name" reset-failed "$task_service" >/dev/null 2>&1 || true
+  if ! _systemctl_user "$name" start "$task_service" >/dev/null 2>&1; then
+    say "WARNING: $task_service failed to start" >&2
+    _systemctl_user "$name" status "$task_service" --no-pager --full >&2 || true
+    return 1
+  fi
+  worker_egress_verify_after_start "$name" "$task_container"
+  _store_container_hash "$name" "$task_container" "$task_file" "$launch_contract"
 }
 
 # Render the WeeChat systemd user unit into <out_dir>.
@@ -1124,9 +1208,13 @@ uninstall_tenant_systemd() {
   rm -f "$qdir/lunarwing-pg-${name}.container" \
         "$qdir/lunarwing-nanocode-${name}.container" \
         "$qdir/lunarwing-pebble-${name}.container" \
+        "$qdir/lunarwing-pebble-task-${name}.container" \
         "$qdir/lunarwing-opencode-${name}.container" \
+        "$qdir/lunarwing-opencode-task-${name}.container" \
         "$qdir/lunarwing-opencode2-${name}.container" \
+        "$qdir/lunarwing-opencode2-task-${name}.container" \
         "$qdir/lunarwing-kimi-${name}.container" \
+        "$qdir/lunarwing-kimi-task-${name}.container" \
         "$qdir/lunarwing-vision-${name}.container" \
         "$qdir/lunarwing-voice-${name}.container"
   if id -u "$name" >/dev/null 2>&1; then
@@ -1135,6 +1223,8 @@ uninstall_tenant_systemd() {
     # in bind-mounted workspaces.
     for w in pebble opencode kimi opencode2; do
       _ctr "$name" rm -f "lunarwing-${w}-${name}" >/dev/null 2>&1 || true
+      _ctr "$name" rm -f "$(worker_task_container_name "$w" "$name")" >/dev/null 2>&1 || true
+      _ctr "$name" volume rm "$(worker_ipc_volume_name "$w" "$name")" >/dev/null 2>&1 || true
     done
     _ctr "$name" rm -f "lunarwing-vision-${name}" >/dev/null 2>&1 || true
     _ctr "$name" rm -f "lunarwing-voice-${name}" >/dev/null 2>&1 || true

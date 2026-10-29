@@ -265,33 +265,25 @@ async fn run_task_with_options(
         }
     };
 
-    let stdout = child.stdout.take().expect("stdout piped");
-    let stderr = child.stderr.take().expect("stderr piped");
+    let process_group = child.id();
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill().await;
+        return;
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let _ = child.kill().await;
+        return;
+    };
 
     let task_id = request.task_id.clone();
     let tx_stderr = event_tx.clone();
-    let task_id_stderr = task_id.clone();
     let request_state = Arc::new(Mutex::new(RequestState::new()));
-    let request_state_stderr = Arc::clone(&request_state);
-
-    let stderr_handle = tokio::spawn(async move {
-        let mut reader = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            if !line.trim().is_empty() {
-                let retry = request_marker(&request_state_stderr, &line);
-                let _ = tx_stderr.send(ExecutorEvent::Progress(protocol::progress_envelope(
-                    &task_id_stderr,
-                    &format!("[stderr] {line}"),
-                )));
-                if let Some(retry) = retry {
-                    let _ = tx_stderr.send(ExecutorEvent::Progress(protocol::progress_envelope(
-                        &task_id_stderr,
-                        &retry,
-                    )));
-                }
-            }
-        }
-    });
+    let stderr_handle = tokio::spawn(stream_stderr(
+        stderr,
+        task_id.clone(),
+        tx_stderr,
+        Arc::clone(&request_state),
+    ));
 
     let (outcome, accumulated_output, final_message) = stream_stdout(
         stdout,
@@ -308,7 +300,10 @@ async fn run_task_with_options(
     .await;
     eprintln!("[exec] {}: stdout stream ended", request.task_id);
 
-    let _ = stderr_handle.await;
+    let outcome = match finish_task_processes(&mut child, process_group, stderr_handle).await {
+        Ok(()) => outcome,
+        Err(error) => Outcome::Error(format!("task process cleanup failed: {error}")),
+    };
     eprintln!("[exec] {}: stderr stream ended", request.task_id);
 
     let duration_ms = elapsed_ms(start);
@@ -325,6 +320,60 @@ async fn run_task_with_options(
     .await;
     eprintln!("[exec] {}: result built, forwarding", request.task_id);
     let _ = event_tx.send(ExecutorEvent::Result(result));
+}
+
+async fn stream_stderr(
+    stderr: tokio::process::ChildStderr,
+    task_id: String,
+    event_tx: mpsc::UnboundedSender<ExecutorEvent>,
+    request_state: SharedRequestState,
+) {
+    let mut reader = BufReader::new(stderr).lines();
+    while let Ok(Some(line)) = reader.next_line().await {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let retry = request_marker(&request_state, &line);
+        let _ = event_tx.send(ExecutorEvent::Progress(protocol::progress_envelope(
+            &task_id,
+            &format!("[stderr] {line}"),
+        )));
+        if let Some(retry) = retry {
+            let _ = event_tx.send(ExecutorEvent::Progress(protocol::progress_envelope(
+                &task_id, &retry,
+            )));
+        }
+    }
+}
+
+async fn finish_task_processes(
+    child: &mut tokio::process::Child,
+    process_group: Option<u32>,
+    mut stderr: tokio::task::JoinHandle<()>,
+) -> Result<(), std::io::Error> {
+    if let Some(group) = process_group {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            Command::new("/bin/kill")
+                .args(["-KILL", "--", &format!("-{group}")])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status(),
+        )
+        .await??;
+    }
+    child.wait().await?;
+    if tokio::time::timeout(Duration::from_secs(2), &mut stderr)
+        .await
+        .is_err()
+    {
+        stderr.abort();
+        return Err(std::io::Error::other(
+            "stderr remained open after process-group cleanup",
+        ));
+    }
+    Ok(())
 }
 
 /// LD-11: locate setpriv through the bridge's own PATH, never the child's.
@@ -536,6 +585,7 @@ fn spawn_pebble_with_options(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .kill_on_drop(true);
 
     // WI#373: the child env is rebuilt from the bridge env with the
@@ -825,7 +875,7 @@ async fn build_result(
         }
         Outcome::Timeout => protocol::result_envelope(
             task_id,
-            "error",
+            "timed_out",
             output,
             Some(&format!("task timed out after {timeout_ms}ms")),
             duration_ms,
@@ -1872,7 +1922,7 @@ exec sleep 1
             .any(|delta| delta == "[stderr] timeout=17 events=1"));
         assert!(!progress.iter().any(|delta| delta.contains("timeout=999")));
         let result = result.expect("terminal result");
-        assert_eq!(result["status"].as_str(), Some("error"));
+        assert_eq!(result["status"].as_str(), Some("timed_out"));
         assert_eq!(result["error"].as_str(), Some("task timed out after 120ms"));
     }
 }

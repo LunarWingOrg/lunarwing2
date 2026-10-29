@@ -397,8 +397,10 @@ class ImageFilesystemDependencyTests(unittest.TestCase):
         (self.package / "index.js").write_text("module.exports = {};\n", encoding="utf-8")
         for name in ("health_server.py", "agent_comm_protocol.json"):
             (self.lane / name).write_text("{}\n", encoding="utf-8")
+        (self.lane / "entrypoint-split.sh").write_text("# split bridge\n", encoding="utf-8")
         for path in (
             self.lane / "entrypoint.sh",
+            self.lane / "entrypoint-split.sh",
             self.lane / "health_server.py",
             self.lane / "agent_comm_protocol.json",
             self.lane / "scripts",

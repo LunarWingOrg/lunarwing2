@@ -252,14 +252,16 @@ ENV GOROOT=/usr/local/go \
 # Keep IDs synchronized with ic/scripts/lunarwing-mt-admin.sh. Rootless Podman
 # maps the tenant's host identity onto these IDs so private read-only mounts
 # remain accessible without making Study Notes state world-readable.
-# WI#400: this is the TASK identity only — the container starts as root (see
-# USER below); the serve process (which runs all task code) and every
-# one-shot process drop to this uid/gid via setpriv, while the bridge stays
-# root, so the bridge's and PID 1's environ are EACCES to task code.
+# WI#454: the image defaults to the task identity. mt-admin selects the
+# distinct bridge uid for the credential-holding container; both share one group.
 ARG SOURCE_DATE_EPOCH=0
 RUN groupadd --gid 10001 opencode \
     && useradd --uid 10001 --gid 10001 -m -d /home/opencode opencode \
+    && useradd --uid 10101 --gid 10001 -m -d /home/opencode-bridge opencode-bridge \
     && shadow_entry="$(getent shadow opencode)" \
+    && shadow_day="$(printf '%s' "$shadow_entry" | cut -d: -f3)" \
+    && test "${shadow_day:-0}" = "$((SOURCE_DATE_EPOCH / 86400))" \
+    && shadow_entry="$(getent shadow opencode-bridge)" \
     && shadow_day="$(printf '%s' "$shadow_entry" | cut -d: -f3)" \
     && test "${shadow_day:-0}" = "$((SOURCE_DATE_EPOCH / 86400))"
 
@@ -269,13 +271,12 @@ WORKDIR /app
 COPY --from=builder /out/bin/opencode /usr/local/bin/opencode
 COPY --from=builder /out/sdk /app/node_modules/@opencode-ai/sdk
 
-# WI#400 LD-2: /app files stay root-owned — container root executes these,
-# so they must not be writable by the task uid the bridge drops to.
-COPY entrypoint.sh entrypoint-task-setup.sh health_server.py agent_comm_protocol.json ./
+# /app stays root-owned and read-only to both runtime identities.
+COPY entrypoint.sh entrypoint-split.sh entrypoint-task-setup.sh health_server.py agent_comm_protocol.json ./
 COPY scripts/ ./scripts/
 COPY config/ ./config/
 
-RUN chmod +x /app/entrypoint.sh /app/entrypoint-task-setup.sh /app/health_server.py \
+RUN chmod +x /app/entrypoint.sh /app/entrypoint-split.sh /app/entrypoint-task-setup.sh /app/health_server.py \
     && command -v setpriv >/dev/null
 
 # Fail the BUILD (not container startup) if the bridge's SDK import can't
@@ -293,6 +294,7 @@ RUN test "$(/usr/local/bin/opencode --version)" = "${OPENCODE_VERSION}" \
     && bun scripts/lunarwing_bridge_test.ts \
     && bun scripts/lunarwing_tool_proxy_test.ts \
     && bun scripts/lunarwing_tool_plugin_test.ts \
+    && bun test scripts/task_runner_test.ts \
     && python3 scripts/study_notes_config_test.py
 
 # ── XDG directories for opencode state ────────────────────────
@@ -303,24 +305,24 @@ RUN mkdir -p /home/opencode/.local/share/opencode \
              /app/results \
     && chown -R opencode:opencode /home/opencode /workspace /var/log/lunarwing /app/results
 
+RUN install -d -o root -g opencode -m 3770 /run/lunarwing-shared \
+    && install -d -o opencode -g opencode -m 2711 /run/lunarwing-shared/runner \
+    && install -d -o opencode-bridge -g opencode -m 2711 /run/lunarwing-shared/tool-proxy
+
 # ── ports ──────────────────────
 EXPOSE 8443
 EXPOSE 9090
 
 # ── health check ───────────────────────
-# WI#454/ME-1: absolute path — the healthcheck runs as the container user
-# (root), and a bare `curl` would resolve through the image PATH.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD /usr/bin/curl -sf http://127.0.0.1:8443/health || exit 1
 
-# WI#400: root entrypoint — the launcher drops the serve process and every
-# one-shot process to the opencode uid (10001) itself; the WebSocket bridge
-# stays root so its per-task resources (tool-proxy sockets) can be handed
-# to the task identity. Task identity is pinned for the launcher and the
-# bridge relay.
+# WI#454: task containers use this default; mt-admin selects the bridge uid
+# and split-bridge role for the credential-holding container.
 ENV OPENCODE_TASK_UID=10001 \
-    OPENCODE_TASK_GID=10001
-USER 0:0
+    OPENCODE_TASK_GID=10001 \
+    OPENCODE_BRIDGE_UID=10101
+USER 10001:10001
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
 CMD ["--mode", "websocket"]

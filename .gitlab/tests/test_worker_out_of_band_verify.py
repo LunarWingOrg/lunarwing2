@@ -46,6 +46,9 @@ def clean_config() -> dict:
                 "GOROOT=/usr/local/go",
                 "GOPATH=/home/opencode2/go",
                 "CARGO_HOME=/home/opencode2/.cargo",
+                "OPENCODE2_TASK_UID=10003",
+                "OPENCODE2_TASK_GID=10003",
+                "OPENCODE2_BRIDGE_UID=10103",
             ],
             "Entrypoint": ["/usr/bin/tini", "--", "/app/entrypoint.sh"],
             "Cmd": ["--mode", "websocket"],
@@ -226,7 +229,7 @@ class TarFixture:
             self.add_dir(name)
         self.add_dir("app/scripts", mode=0o555)
         self.add_dir("app/config", mode=0o555)
-        for name in ("entrypoint.sh", "health_server.py", "agent_comm_protocol.json"):
+        for name in ("entrypoint.sh", "entrypoint-split.sh", "health_server.py", "agent_comm_protocol.json"):
             self.add_file(f"app/{name}", (lane / name).read_bytes(), mode=0o444)
         for directory in ("scripts", "config"):
             for path in (lane / directory).rglob("*"):
