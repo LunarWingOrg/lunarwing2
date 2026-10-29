@@ -206,6 +206,7 @@ case "$MODE" in
     ;;
 
   websocket)
+    [[ -z "${KIMI_BRIDGE_UID:-}" ]] || die "websocket images require LUNARWING_CONTAINER_ROLE=split-bridge or split-task"
     log "Mode: WebSocket — starting bridge"
 
     # WI#454: start the task-runner daemon as the task uid BEFORE the bridge.
