@@ -231,6 +231,13 @@ RUN chmod 0755 /usr/local/bin/pebble /usr/local/lib/pebble/pebble \
     && [ "$(stat -c %U /usr/local/bin/pebble)" = "root" ]
 COPY pebble4lunarwing/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY pebble4lunarwing/entrypoint-split.sh /usr/local/bin/entrypoint-split.sh
+# RG-1: COPY preserves the build context's modes, so a checkout made under a
+# restrictive umask ships these as 0700 root:root. The `test -x` readiness
+# below runs as root and passes vacuously, but the image's USER is 10004, which
+# could then not exec its own entrypoint. Pin the modes independently of the
+# context and keep them root-owned and non-writable so task code cannot edit
+# the launcher it runs under.
+RUN chmod 0555 /usr/local/bin/entrypoint.sh /usr/local/bin/entrypoint-split.sh
 
 # WI#324: register the LunarWing tool-proxy MCP shim for `pebble` runs.
 # Pebble discovers mcpServers from $PEBBLE_CONFIG_HOME/settings.json
