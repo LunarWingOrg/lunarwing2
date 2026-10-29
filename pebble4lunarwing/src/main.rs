@@ -18,6 +18,18 @@ async fn main() {
         mcp_shim::run().await;
         return;
     }
+    if std::env::args().nth(1).as_deref() == Some("task-runner-ping") {
+        let socket = std::env::args().nth(2).unwrap_or_default();
+        if socket.is_empty() {
+            eprintln!("[pebble4lunarwing] task-runner-ping requires a socket path");
+            std::process::exit(1);
+        }
+        if let Err(error) = task_runner::ping(std::path::Path::new(&socket)).await {
+            eprintln!("[pebble4lunarwing] task runner health check failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("task-runner") {
         let socket = std::env::args()
             .nth(2)
