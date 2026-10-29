@@ -253,7 +253,11 @@ RUN mkdir -p /home/kimi/.kimi-code \
 # WI#206: the baked policy (guard config + PreToolUse hook) must not be
 # editable by the runtime user — tasks run as kimi, so dropping write
 # access means a task inside the container cannot strip its own guard.
-RUN chmod -R a-w /app/config /app/hooks && chmod a-w /app/entrypoint.sh /app/entrypoint-task-setup.sh
+# entrypoint-task-setup.sh runs after the privilege drop and must stay readable
+# to the task uid while remaining root-owned and non-writable.
+RUN chmod -R a-w /app/config /app/hooks \
+    && chmod 0555 /app/entrypoint.sh /app/entrypoint-task-setup.sh \
+    && test "$(stat -c %a /app/entrypoint-task-setup.sh)" = 555
 
 # ── ports ──────────────────────
 EXPOSE 8443
