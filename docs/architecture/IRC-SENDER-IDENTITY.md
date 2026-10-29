@@ -1,26 +1,25 @@
 # IRC Sender Identity
 
-**Revalidated against source 2026-10-01 (v2.1.4.0); re-checked 2026-10-06
-(v2.1.5.0); re-checked 2026-10-14 (v2.1.6.0).** Principal formats
-(`darkirc:nick:<case-folded-nick>`, `account:<network>:…` /
-`nick:<network>:…`, `weechat:dm:v2:<principal>`,
-`weechat:group:<network>:<target>`), the owner-actor settings, and the
-migration/retention policy below were re-checked against
-`ic/channels-src/{darkirc,weechat}` and `ic/src/extensions/manager.rs` and
-still hold. The 2.1.2.0 release only bumped the channel crate/registry
-versions (darkirc 0.1.8, weechat 0.2.9); no principal-format or pairing
-logic changed. The 2.1.3.0 release again only bumped the channel
-crate/registry versions (darkirc 0.1.9, weechat 0.2.10); no
-principal-format or pairing logic changed. The 2.1.4.0 release again only
-bumped the channel crate/registry versions (darkirc 0.1.10, weechat
-0.2.11; channel crates now at workspace version 2.1.4); no
-principal-format or pairing logic changed. The 2.1.5.0 release again only
-bumped the channel crate/registry versions (darkirc 0.1.11, weechat
-0.2.12; channel crates now at workspace version 2.1.5); no
-principal-format or pairing logic changed. The 2.1.6.0 release again only
-bumped the channel crate/registry versions (darkirc 0.1.12, weechat
-0.2.13; channel crates now at workspace version 2.1.6); no
-principal-format or pairing logic changed.
+**Source revalidated 2026-10-29 for v2.1.7.0.** The source of truth is:
+
+- `darkirc_channel_for_lunarwing/darkirc/src/lib.rs`: `rfc1459_casefold`,
+  `darkirc_principal`, and inbound DM scope construction.
+- `lunarwing_weechat_wss/weechat_relay/src/lib.rs`: `sender_identity`,
+  `extract_account_from_tags`, `sender_allowed_by_policy`, and inbound scope
+  construction. These two channel trees are also exposed through symlinks under
+  `ic/channels-src/`.
+- `ic/src/config/channels.rs::wasm_channel_owner_actor_id` and
+  `ic/src/extensions/manager.rs::current_channel_owner_actor_id`: string-owner
+  precedence and runtime setting lookup.
+- `ic/src/channels/wasm/wrapper.rs`: owner-scoped dispatch, validated routing
+  metadata, and `respond`/`broadcast` translation.
+
+A configured owner actor is required for the owner-match routing update below.
+With no owner actor configured, the wrapper maps senders to the instance owner
+scope for dispatch; that fallback does not authenticate their IRC identity or
+satisfy the explicit owner-match check that updates stored broadcast metadata.
+Registry package versions are release metadata, not principal-format versions;
+the `v2` in DM keys describes the identity schema.
 
 LunarWing treats IRC sender identity as a routing and continuity hint, not as
 cryptographic proof of a person. DarkIRC and WeeChat use versioned,
