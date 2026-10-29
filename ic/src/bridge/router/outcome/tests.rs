@@ -175,7 +175,7 @@ impl Rig {
                 message,
                 conversation_id,
                 thread_id: thread.id,
-                history_message_id: None,
+                history: None,
             },
             llm,
             events,
@@ -627,5 +627,96 @@ async fn late_gateway_response_uses_real_channel_once_with_original_thread() {
     assert_eq!(
         replies,
         vec![("late gateway answer".into(), "client-conversation".into())]
+    );
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn recovery_history_reference_survives_gate_resume_and_is_user_scoped() {
+    use lunarwing_engine::types::event::ModelRecoveryState;
+    use lunarwing_engine::{EventKind, ModelFailureKind, ThreadEvent};
+
+    let mut rig = Rig::new(None, None).await;
+    let db = rig.turn.state.db.as_ref().unwrap().clone();
+    let cid = resolve_v1_conversation_for_message(db.as_ref(), &rig.turn.message)
+        .await
+        .unwrap();
+    let user_message_id = db
+        .add_conversation_message(cid, "user", "delegate once")
+        .await
+        .unwrap();
+    let started_at = rig.turn.message.received_at;
+    db.update_conversation_metadata_field(
+        cid,
+        "engine_turn_history",
+        &serde_json::json!({
+            "thread_id": rig.turn.thread_id.to_string(), "user_message_id": user_message_id,
+            "started_at": started_at,
+        }),
+    )
+    .await
+    .unwrap();
+    let mut callback = rig.turn.message.clone();
+    callback.id = uuid::Uuid::new_v4();
+    callback.received_at = started_at + chrono::TimeDelta::minutes(1);
+    let reference = history_reference(&rig.turn.state, &callback, rig.turn.thread_id)
+        .await
+        .unwrap();
+    assert_eq!(reference.user_message_id, user_message_id);
+    assert_eq!(reference.started_at, started_at);
+    assert!(
+        history_reference(
+            &rig.turn.state,
+            &callback,
+            lunarwing_engine::ThreadId::new()
+        )
+        .await
+        .is_none()
+    );
+    let mut foreign = callback.clone();
+    foreign.user_id = "bob".into();
+    assert!(
+        history_reference(&rig.turn.state, &foreign, rig.turn.thread_id)
+            .await
+            .is_none()
+    );
+
+    let mut thread = rig
+        .turn
+        .state
+        .store
+        .load_thread(rig.turn.thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut event = ThreadEvent::new(
+        thread.id,
+        EventKind::ModelRecovery {
+            failure_kind: ModelFailureKind::ReplArgumentCorruption,
+            recovery_state: ModelRecoveryState::Recovered,
+            attempt: 1,
+        },
+    );
+    event.timestamp = started_at + chrono::TimeDelta::seconds(1);
+    thread.events.push(event);
+    rig.turn.state.store.save_thread(&thread).await.unwrap();
+    rig.turn.message = callback;
+    rig.turn.history = Some(reference);
+    rig.turn
+        .write_recovery_outcome(&ThreadOutcome::Completed {
+            response: Some("job id".into()),
+        })
+        .await;
+    let messages = db.list_conversation_messages(cid).await.unwrap();
+    let turns = crate::channels::web::util::build_turns_from_db_messages(&messages);
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].state, "Completed");
+    assert_eq!(
+        turns[0].recovery.as_ref().unwrap().failure_kind,
+        "repl_argument_corruption"
+    );
+    assert_eq!(
+        turns[0].recovery.as_ref().unwrap().recovery_state,
+        "recovered"
     );
 }
