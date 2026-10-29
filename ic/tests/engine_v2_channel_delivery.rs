@@ -1926,6 +1926,73 @@ async fn recovery_history(
         .expect("history JSON")
 }
 
+async fn assert_recovery_sse(stream: &mut reqwest::Response, state: &str) {
+    let wanted = format!("\"recovery_state\":\"{state}\"");
+    let wire = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut wire = String::new();
+        while !wire.contains(&wanted) {
+            let chunk = stream
+                .chunk()
+                .await
+                .expect("SSE chunk")
+                .expect("SSE remains open");
+            wire.push_str(&String::from_utf8_lossy(&chunk));
+            assert!(wire.len() < 65536, "bounded SSE capture");
+        }
+        wire
+    })
+    .await
+    .expect("recovery SSE delivered");
+    assert!(wire.contains("event: turn_recovery"));
+    assert!(wire.contains("repl_argument_corruption"));
+    assert!(
+        !wire.contains("private-draft-sentinel"),
+        "rejected code must not leak as a status"
+    );
+}
+
+fn assert_delegation_result(
+    rig: &support::test_rig::TestRig,
+    llm: &RecoveryDelegationLlm,
+    turn: &serde_json::Value,
+    fail_again: bool,
+) {
+    assert_eq!(
+        turn["state"],
+        if fail_again { "Failed" } else { "Completed" }
+    );
+    assert_eq!(
+        turn["recovery_state"],
+        if fail_again { "failed" } else { "recovered" }
+    );
+    assert_eq!(turn["failure_kind"], "repl_argument_corruption");
+    assert!(!turn["completed_at"].is_null());
+    let completed = rig.tool_calls_completed();
+    assert_eq!(
+        completed
+            .iter()
+            .filter(|(name, ok)| name == "create_job" && *ok)
+            .count(),
+        usize::from(!fail_again),
+        "completed={completed:?}; statuses={:?}; results={:?}",
+        rig.captured_status_events(),
+        rig.tool_results()
+    );
+    if !fail_again {
+        assert!(
+            rig.tool_results()
+                .iter()
+                .any(|(name, output)| name == "create_job"
+                    && output.contains("job_id")
+                    && output.contains("in_progress"))
+        );
+    }
+    assert_eq!(
+        llm.calls.load(Ordering::SeqCst),
+        if fail_again { 2 } else { 3 }
+    );
+}
+
 async fn assert_rejected_delegation_case(fail_again: bool) {
     use lunarwing::channels::web::{
         auth::MultiAuthState, server::start_server, test_helpers::TestGatewayBuilder,
@@ -1979,27 +2046,7 @@ async fn assert_rejected_delegation_case(fail_again: bool) {
     tokio::time::timeout(Duration::from_secs(10), llm.retry_started.notified())
         .await
         .expect("retry starts");
-    let wire = tokio::time::timeout(Duration::from_secs(5), async {
-        let mut wire = String::new();
-        while !wire.contains("\"recovery_state\":\"retrying\"") {
-            let chunk = stream
-                .chunk()
-                .await
-                .expect("SSE chunk")
-                .expect("SSE remains open");
-            wire.push_str(&String::from_utf8_lossy(&chunk));
-            assert!(wire.len() < 65536, "bounded SSE capture");
-        }
-        wire
-    })
-    .await
-    .expect("retry SSE delivered");
-    assert!(wire.contains("event: turn_recovery"));
-    assert!(wire.contains("repl_argument_corruption"));
-    assert!(
-        !wire.contains("private-draft-sentinel"),
-        "rejected code must not leak as a status"
-    );
+    assert_recovery_sse(&mut stream, "retrying").await;
     assert!(
         tokio::time::timeout(Duration::from_millis(30), bob.next())
             .await
@@ -2027,37 +2074,8 @@ async fn assert_rejected_delegation_case(fail_again: bool) {
     let responses = rig.wait_for_responses(1, Duration::from_secs(15)).await;
     assert_eq!(responses.len(), 1);
     let history = recovery_history(&client, &base, &scope, true).await;
-    let turn = &history["turns"][0];
-    assert_eq!(
-        turn["state"],
-        if fail_again { "Failed" } else { "Completed" }
-    );
-    assert_eq!(
-        turn["recovery_state"],
-        if fail_again { "failed" } else { "recovered" }
-    );
-    assert_eq!(turn["failure_kind"], "repl_argument_corruption");
-    assert!(!turn["completed_at"].is_null());
-    assert_eq!(
-        rig.tool_calls_completed()
-            .iter()
-            .filter(|(name, ok)| name == "create_job" && *ok)
-            .count(),
-        usize::from(!fail_again)
-    );
-    if !fail_again {
-        assert!(
-            rig.tool_results()
-                .iter()
-                .any(|(name, output)| name == "create_job"
-                    && output.contains("job_id")
-                    && output.contains("in_progress"))
-        );
-    }
-    assert_eq!(
-        llm.calls.load(Ordering::SeqCst),
-        if fail_again { 2 } else { 3 }
-    );
+    assert_delegation_result(&rig, &llm, &history["turns"][0], fail_again);
+    assert_recovery_sse(&mut stream, if fail_again { "failed" } else { "recovered" }).await;
     drop(stream);
     if let Some(shutdown) = state.shutdown_tx.write().await.take() {
         let _ = shutdown.send(());
