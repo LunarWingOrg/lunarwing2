@@ -6,7 +6,7 @@
 # Re-bump only after re-verifying the bridge against the v2 server API.
 ARG OPENCODE_VERSION=v2.1.2
 ARG OPENCODE_REF=a517687fde98a7329ada3ae644a01a9fc6c4e99e
-ARG DEBIAN_SNAPSHOT=20261017T082437Z
+ARG DEBIAN_SNAPSHOT=20261024T011300Z
 ARG SOURCE_REVISION=unknown
 
 # ──────────────────────
@@ -258,8 +258,12 @@ ENV GOROOT=/usr/local/go \
 # Keep IDs synchronized with ic/scripts/lunarwing-mt-admin.sh (opencode2 =
 # 10003, distinct from opencode 10001 and kimi 10002) so two opencode lanes on
 # one tenant keep separate userns identities.
+ARG SOURCE_DATE_EPOCH=0
 RUN groupadd --gid 10003 opencode2 \
-    && useradd --uid 10003 --gid 10003 -m -d /home/opencode2 opencode2
+    && useradd --uid 10003 --gid 10003 -m -d /home/opencode2 opencode2 \
+    && shadow_entry="$(getent shadow opencode2)" \
+    && shadow_day="$(printf '%s' "$shadow_entry" | cut -d: -f3)" \
+    && test "${shadow_day:-0}" = "$((SOURCE_DATE_EPOCH / 86400))"
 
 # ── app layout ─────────────────────────
 WORKDIR /app

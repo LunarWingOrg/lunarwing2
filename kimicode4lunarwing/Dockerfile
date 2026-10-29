@@ -1,7 +1,7 @@
 # Keep release inputs immutable: the CLI version is cross-checked against the
 # committed npm lock, and package indexes come from one Debian snapshot.
 ARG KIMI_CODE_VERSION=2.3.0
-ARG DEBIAN_SNAPSHOT=20261017T082437Z
+ARG DEBIAN_SNAPSHOT=20261024T011300Z
 ARG SOURCE_REVISION=unknown
 
 # ──────────────────────────────
@@ -202,8 +202,12 @@ ENV GOROOT=/usr/local/go \
 # USER below), the bridge runs as root and drops every spawned task to this
 # uid/gid via setpriv (flags pinned by taskSetprivArgv + the executor
 # self-test), so the bridge's and PID 1's environ are EACCES to task code.
+ARG SOURCE_DATE_EPOCH=0
 RUN groupadd --gid 10002 kimi \
-    && useradd --uid 10002 --gid 10002 -m -d /home/kimi kimi
+    && useradd --uid 10002 --gid 10002 -m -d /home/kimi kimi \
+    && shadow_entry="$(getent shadow kimi)" \
+    && shadow_day="$(printf '%s' "$shadow_entry" | cut -d: -f3)" \
+    && test "${shadow_day:-0}" = "$((SOURCE_DATE_EPOCH / 86400))"
 
 # ── app layout ─────────────────
 WORKDIR /app
@@ -222,7 +226,6 @@ RUN chmod +x /app/entrypoint.sh /app/entrypoint-task-setup.sh /app/health_server
 # npm ci verifies every bridge and CLI dependency against committed integrity
 # hashes. An override that disagrees with the lock fails instead of re-resolving.
 ARG KIMI_CODE_VERSION
-ARG SOURCE_DATE_EPOCH=0
 ENV KIMI_CODE_IMAGE_VERSION="${KIMI_CODE_VERSION}"
 COPY kimi-cli/package.json kimi-cli/package-lock.json /opt/kimi-cli/
 # The stock npm bundled in the node base ships node-tar < 7.5.19

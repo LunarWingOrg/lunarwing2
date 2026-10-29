@@ -1,5 +1,5 @@
 ARG PEBBLE_REF=2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b
-ARG DEBIAN_SNAPSHOT=20261017T082437Z
+ARG DEBIAN_SNAPSHOT=20261024T011300Z
 ARG SOURCE_REVISION=unknown
 
 FROM docker.io/library/rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS builder
@@ -259,8 +259,12 @@ RUN mkdir -p /workspace && chmod 777 /workspace
 # account (PEBBLE_USERNS keep-id), so workspace writes land tenant-owned
 # on the host exactly as before. setpriv must exist in the base image —
 # fail the build if a base bump ever drops it.
+ARG SOURCE_DATE_EPOCH=0
 RUN groupadd --gid 10004 pebbletask \
     && useradd --uid 10004 --gid 10004 -m -d /home/pebbletask pebbletask \
+    && shadow_entry="$(getent shadow pebbletask)" \
+    && shadow_day="$(printf '%s' "$shadow_entry" | cut -d: -f3)" \
+    && test "${shadow_day:-0}" = "$((SOURCE_DATE_EPOCH / 86400))" \
     && mkdir -p /home/pebbletask/go \
     && chown -R pebbletask:pebbletask /home/pebbletask \
     && command -v setpriv >/dev/null
