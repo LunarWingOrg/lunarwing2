@@ -205,7 +205,9 @@ ENV GOROOT=/usr/local/go \
 ARG SOURCE_DATE_EPOCH=0
 RUN groupadd --gid 10002 kimi \
     && useradd --uid 10002 --gid 10002 -m -d /home/kimi kimi \
-    && test "$(getent shadow kimi | cut -d: -f3)" = "$((SOURCE_DATE_EPOCH / 86400))"
+    && shadow_entry="$(getent shadow kimi)" \
+    && shadow_day="$(printf '%s' "$shadow_entry" | cut -d: -f3)" \
+    && test "${shadow_day:-0}" = "$((SOURCE_DATE_EPOCH / 86400))"
 
 # ── app layout ─────────────────
 WORKDIR /app
