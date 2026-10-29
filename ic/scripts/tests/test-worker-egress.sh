@@ -10,7 +10,32 @@ MT_ADMIN="$SCRIPT_DIR/../lunarwing-mt-admin.sh"
 source "$MT_ADMIN"
 
 failures=0
-fixture="$(mktemp -d)"
+fixture=""
+make_executable_fixture() {
+  local base probe
+  local -a candidates=()
+  [[ -z "${TMPDIR:-}" ]] || candidates+=("$TMPDIR")
+  candidates+=(/tmp /dev/shm "$HARNESS_REPO_ROOT")
+  for base in "${candidates[@]}"; do
+    [[ -d "$base" && -w "$base" && -x "$base" ]] || continue
+    if [[ "$base" == "$HARNESS_REPO_ROOT" ]]; then
+      fixture="$(mktemp -d "$base/.worker-egress-test.XXXXXX" 2>/dev/null)" || continue
+    else
+      fixture="$(mktemp -d "$base/worker-egress-test.XXXXXX" 2>/dev/null)" || continue
+    fi
+    probe="$fixture/.exec-probe"
+    printf '#!/bin/sh\nexit 0\n' >"$probe"
+    chmod 0700 "$probe"
+    if "$probe" >/dev/null 2>&1; then
+      rm -f -- "$probe"
+      return 0
+    fi
+    command rm -rf -- "$fixture"
+    fixture=""
+  done
+  return 1
+}
+make_executable_fixture || { printf 'FAIL: no writable executable fixture directory\n' >&2; exit 1; }
 trap 'command rm -rf "$fixture"' EXIT
 pass() { printf 'PASS: %s\n' "$1"; }
 fail() { printf 'FAIL: %s\n' "$1" >&2; failures=$((failures + 1)); }
@@ -222,34 +247,34 @@ LLM_TARGETS=("http://127.0.0.1:3000/v1" "https://203.0.113.10:8443/v1" "https://
 assert_rc_fail env CONTAINER_RT=podman MT_ROOTLESS=true WORKER_EGRESS_HOST_ADDRS=not-an-ip _worker_egress_host_addrs 10.89.10.1
 
 # ── apply and static host launch contract ─────────────────────────────────────
-NFT_LIST_RC=1
-if (worker_egress_apply alpha) >/dev/null 2>"$fixture/apply.err"; then
-  fail "apply accepted a filter that did not survive"
+install_worker_egress_guard
+apply_guard="$fixture/apply-guard"
+cat >"$apply_guard" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >>"$fixture/apply-guard.log"
+exit "\${APPLY_GUARD_RC:-0}"
+EOF
+chmod +x "$apply_guard"
+test_apply() (
+  install_worker_egress_guard() { :; }
+  WORKER_EGRESS_GUARD="$apply_guard" WORKER_EGRESS_GUARD_SRC="$apply_guard" \
+    worker_egress_apply "$@"
+)
+: >"$fixture/apply-guard.log"
+if (APPLY_GUARD_RC=2 test_apply alpha) >/dev/null 2>"$fixture/apply.err"; then
+  fail "apply accepted a filter that the guard did not verify"
 else
-  pass "apply fails when the loaded chains disappear"
-  assert_contains "$(cat "$fixture/apply.err")" 'did not survive the load' "apply refusal names the real cause"
+  pass "apply fails closed when the shared guard rejects the filter"
+  assert_contains "$(cat "$fixture/apply.err")" 'failed to load or verify (fail closed)' "apply refusal preserves the fail-closed contract"
 fi
-NFT_LIST_RC=0
-NFT_LIST_OUT=$'chain "fwd_alpha" {\n}'
-if (worker_egress_apply alpha) >/dev/null 2>"$fixture/no-reject.err"; then
-  fail "apply accepted a chain without its reject"
-else
-  pass "apply rejects a chain without its reject"
-  assert_contains "$(cat "$fixture/no-reject.err")" 'exact reject' "no-reject refusal names the exact-reject contract"
-fi
-NFT_LIST_OUT=""
-NFT_LOAD_RC=1
-assert_rc_fail worker_egress_apply alpha
-NFT_LOAD_RC=0
-NFT_CALLS=()
-: >"$NFT_LOG"
-if worker_egress_apply alpha >"$fixture/applied.dump" 2>"$fixture/apply-ok.err"; then
-  pass "apply succeeds with both live tenant chains"
+: >"$fixture/apply-guard.log"
+if test_apply alpha >"$fixture/applied.dump" 2>"$fixture/apply-ok.err"; then
+  pass "apply succeeds when the shared guard verifies both tenant chains"
 else
   fail "apply rejected a valid ruleset: $(cat "$fixture/apply-ok.err")"
 fi
-assert_contains "$(printf '%s\n' "${NFT_CALLS[@]}")" '-f' "apply loads the rendered file"
-assert_eq "$(grep -c 'list chain' "$NFT_LOG")" "2" "apply verifies forward and input chains"
+assert_contains "$(cat "$fixture/apply-guard.log")" 'rootless fwd_alpha alpha' "apply gives the guard its mode, chain, and tenant"
+assert_eq "$(wc -l <"$fixture/apply-guard.log" | tr -d ' ')" "1" "apply delegates once to the load-and-verify guard"
 assert_eq "$(cat "$WORKER_EGRESS_DIR/alpha.hosts")" 'git.example.org:203.0.113.40' "static hosts come from the same resolved answers"
 launch_args="$(worker_egress_launch_args alpha)"
 assert_contains "$launch_args" '--dns
@@ -282,7 +307,7 @@ fi
 printf 'stale\n' >"$WORKER_EGRESS_DIR/alpha.nft"
 printf 'stale\n' >"$WORKER_EGRESS_DIR/alpha.hosts"
 OPERATOR_ALLOW=("https://does-not-exist.example.invalid:443/repo.git")
-if (worker_egress_apply alpha) >/dev/null 2>&1; then
+if (test_apply alpha) >/dev/null 2>&1; then
   fail "apply accepted an unresolvable operator entry"
 elif [[ -e "$WORKER_EGRESS_DIR/alpha.nft" || -e "$WORKER_EGRESS_DIR/alpha.hosts" ]]; then
   fail "render failure left stale boot state behind"
@@ -290,7 +315,7 @@ else
   pass "render failure removes stale nft and host state"
 fi
 OPERATOR_ALLOW=("https://203.0.113.20:443/repo.git")
-worker_egress_apply alpha >/dev/null
+test_apply alpha >/dev/null
 
 if (
   worker_egress_ensure() { printf 'ensure\n' >>"$fixture/prepare.log"; }
@@ -364,7 +389,8 @@ else
   fail "docker network ensure rejected an unverified-DNS contract"
 fi
 
-worker_egress_apply alpha >/dev/null
+test_apply alpha >/dev/null
+NFT_RULESET_FILE="$WORKER_EGRESS_DIR/alpha.nft"
 CTR_NETWORKS=lw-egress-alpha
 CTR_DNS=127.0.0.1
 CTR_EXTRA_HOSTS=git.example.org:203.0.113.40
@@ -442,14 +468,19 @@ guard_bin="$fixture/bin"
 mkdir -p "$guard_bin"
 cat >"$guard_bin/nft" <<'STUB'
 #!/usr/bin/env bash
+base="$(cd "$(dirname "$0")" && pwd)"
 case "${1:-}" in
-  -f) exit "${FAKE_LOAD_RC:-0}" ;;
+  -f)
+    [[ ! -f "$base/load-fail" ]] || exit 1
+    ;;
   list)
-    [[ "${FAKE_LIST_RC:-0}" == "0" ]] || exit 1
+    [[ ! -f "$base/list-fail" ]] || exit 1
     chain="${!#}"
-    printf 'list %s\n' "$chain" >>"${FAKE_NFT_LOG:-/dev/null}"
+    mode=good
+    [[ ! -f "$base/mode" ]] || mode="$(cat "$base/mode")"
+    printf 'list %s\n' "$chain" >>"$base/guard-nft.log"
     printf 'chain "%s" {\n' "$chain"
-    case "${FAKE_MODE:-good}" in
+    case "$mode" in
       empty) ;;
       wrong) printf '  iifname "lweg11" ip saddr 10.89.11.0/24 counter packets 0 bytes 0 reject with icmpx type admin-prohibited\n' ;;
       narrow) printf '  iifname "lweg10" meta l4proto tcp ip saddr 10.89.10.0/24 counter packets 0 bytes 0 reject with icmpx type admin-prohibited\n' ;;
@@ -463,20 +494,25 @@ chmod +x "$guard_bin/nft"
 assert_rc_fail env PATH="$guard_bin:$PATH" "$guard" "$fixture/missing.nft" rootful fwd_alpha
 # OQ-4: the guard derives the input chain as `in_<suffix>` (distinct from the
 # forward prefix), so a `worker_input_*` regression cannot pass silently.
-: >"$fixture/guard-chains.log"
-if PATH="$guard_bin:$PATH" FAKE_NFT_LOG="$fixture/guard-chains.log" \
-    "$guard" "$fixture/alpha.nft" rootful fwd_alpha >/dev/null; then
+: >"$guard_bin/guard-nft.log"
+if PATH="$guard_bin:$PATH" "$guard" "$fixture/alpha.nft" rootful fwd_alpha >/dev/null; then
   pass "guard accepts both exact live chains"
-  assert_contains "$(cat "$fixture/guard-chains.log")" 'list in_alpha' "guard derives the in_<tenant> input chain (OQ-4)"
-  assert_absent "$(cat "$fixture/guard-chains.log")" 'worker_input_' "guard no longer derives worker_input_* chain names (OQ-4)"
+  assert_contains "$(cat "$guard_bin/guard-nft.log")" 'list in_alpha' "guard derives the in_<tenant> input chain (OQ-4)"
+  assert_absent "$(cat "$guard_bin/guard-nft.log")" 'worker_input_' "guard no longer derives worker_input_* chain names (OQ-4)"
 else
   fail "guard rejected both exact live chains"
 fi
-assert_rc_fail env PATH="$guard_bin:$PATH" FAKE_LOAD_RC=1 "$guard" "$fixture/alpha.nft" rootful fwd_alpha
-assert_rc_fail env PATH="$guard_bin:$PATH" FAKE_LIST_RC=1 "$guard" "$fixture/alpha.nft" rootful fwd_alpha
-assert_rc_fail env PATH="$guard_bin:$PATH" FAKE_MODE=empty "$guard" "$fixture/alpha.nft" rootful fwd_alpha
-assert_rc_fail env PATH="$guard_bin:$PATH" FAKE_MODE=wrong "$guard" "$fixture/alpha.nft" rootful fwd_alpha
-assert_rc_fail env PATH="$guard_bin:$PATH" FAKE_MODE=narrow "$guard" "$fixture/alpha.nft" rootful fwd_alpha
+touch "$guard_bin/load-fail"
+assert_rc_fail env PATH="$guard_bin:$PATH" "$guard" "$fixture/alpha.nft" rootful fwd_alpha
+rm -f -- "$guard_bin/load-fail"
+touch "$guard_bin/list-fail"
+assert_rc_fail env PATH="$guard_bin:$PATH" "$guard" "$fixture/alpha.nft" rootful fwd_alpha
+rm -f -- "$guard_bin/list-fail"
+for mode in empty wrong narrow; do
+  printf '%s\n' "$mode" >"$guard_bin/mode"
+  assert_rc_fail env PATH="$guard_bin:$PATH" "$guard" "$fixture/alpha.nft" rootful fwd_alpha
+done
+rm -f -- "$guard_bin/mode"
 if PATH="$guard_bin:$PATH" "$guard" --verify "$fixture/alpha.nft" rootful fwd_alpha >/dev/null; then
   pass "guard --verify rechecks a started worker without reloading"
 else
@@ -488,6 +524,214 @@ assert_rc_fail env PATH="$guard_bin:$PATH" /bin/bash "$guard" "$fixture/alpha.nf
 sed 's/ip saddr 10.89.10.0\/24 counter reject/meta l4proto tcp ip saddr 10.89.10.0\/24 counter reject/' \
   "$fixture/alpha.nft" >"$fixture/narrow.nft"
 assert_rc_fail env PATH="$guard_bin:$PATH" "$guard" "$fixture/narrow.nft" rootful fwd_alpha
+
+# ── rootless namespace keeper and cold-start sequence ─────────────────────────
+rootless_bin="$fixture/rootless-bin"
+rootless_state="$rootless_bin/state"
+mkdir -p "$rootless_state"
+cat >"$rootless_bin/id" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  '-u') printf '0\n' ;;
+  '-u -- alpha') printf '1000\n' ;;
+  *) exec /usr/bin/id "$@" ;;
+esac
+STUB
+cat >"$rootless_bin/getent" <<'STUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == passwd && "${2:-}" == alpha ]]; then
+  printf 'alpha:x:1000:1000::/home/alpha:/bin/bash\n'
+else
+  exec /usr/bin/getent "$@"
+fi
+STUB
+cat >"$rootless_bin/sudo" <<'STUB'
+#!/usr/bin/env bash
+base="$(cd "$(dirname "$0")" && pwd)"
+printf '%s\n' "$*" >>"$base/sudo.log"
+[[ "${1:-}" != -u ]] || shift 2
+if [[ "${1:-}" == env ]]; then
+  shift
+  while [[ $# -gt 0 && "$1" == *=* ]]; do shift; done
+fi
+exec "$@"
+STUB
+cat >"$rootless_bin/podman" <<'STUB'
+#!/usr/bin/env bash
+base="$(cd "$(dirname "$0")" && pwd)"
+state="$base/state"
+mkdir -p "$state"
+printf '%s\n' "$*" >>"$base/podman.log"
+case "${1:-} ${2:-}" in
+  'pod exists') [[ -f "$state/present" ]] ;;
+  'pod create')
+    touch "$state/present"
+    printf '%s\n' "${FAKE_INFRA_IMAGE:-localhost/podman-pause:5.8.2}" >"$state/image"
+    printf 'false\n' >"$state/running"
+    ;;
+  'pod start') printf 'true\n' >"$state/running" ;;
+  'pod inspect')
+    case "${4:-}" in
+      *Labels*) printf 'worker-egress-keeper\n' ;;
+      *NumContainers*) printf '1\n' ;;
+      *InfraContainerID*) printf 'fake-infra\n' ;;
+      *) exit 64 ;;
+    esac
+    ;;
+  'pod rm') rm -f "$state/present" "$state/running" "$state/image" ;;
+  'inspect --format')
+    case "${3:-}" in
+      *IsInfra*) printf 'true\n' ;;
+      *ImageName*) cat "$state/image" ;;
+      *State.Running*) cat "$state/running" ;;
+      *NetworkSettings.Networks*) printf 'lw-egress-alpha\n' ;;
+      *) exit 64 ;;
+    esac
+    ;;
+  'unshare --rootless-netns')
+    if [[ -f "$state/present" ]]; then
+      printf 'keeper-alpha\n' >"$state/current-namespace"
+    elif [[ -f "$state/worker-namespace" ]]; then
+      cat "$state/worker-namespace" >"$state/current-namespace"
+    else
+      count=0
+      [[ ! -f "$state/count" ]] || count="$(cat "$state/count")"
+      count=$((count + 1))
+      printf '%s\n' "$count" >"$state/count"
+      printf 'fresh-%s\n' "$count" >"$state/current-namespace"
+    fi
+    shift 2
+    exec "$@"
+    ;;
+  *) exit 64 ;;
+esac
+STUB
+cat >"$rootless_bin/nft" <<'STUB'
+#!/usr/bin/env bash
+base="$(cd "$(dirname "$0")" && pwd)"
+state="$base/state"
+namespace="$(cat "$state/current-namespace")"
+printf '%s %s\n' "$namespace" "$*" >>"$base/nft.log"
+case "${1:-}" in
+  -f) touch "$state/rules-$namespace" ;;
+  list)
+    [[ -f "$state/rules-$namespace" ]] || exit 1
+    chain="${!#}"
+    printf 'chain "%s" {\n' "$chain"
+    printf '  iifname "lweg10" ip saddr 10.89.10.0/24 counter packets 0 bytes 0 reject with icmpx type admin-prohibited\n'
+    printf '}\n'
+    ;;
+  *) exit 64 ;;
+esac
+STUB
+chmod +x "$rootless_bin/id" "$rootless_bin/getent" "$rootless_bin/sudo" "$rootless_bin/podman" "$rootless_bin/nft"
+rootless_guard="$fixture/rootless-guard"
+cat >"$rootless_guard" <<EOF
+#!/usr/bin/env bash
+PATH="$rootless_bin:\$PATH" exec "$guard" "\$@"
+EOF
+chmod +x "$rootless_guard"
+: >"$rootless_bin/podman.log"
+: >"$rootless_bin/nft.log"
+if (
+  install_worker_egress_guard() { :; }
+  WORKER_EGRESS_GUARD="$rootless_guard"
+  WORKER_EGRESS_GUARD_SRC="$rootless_guard"
+  prepare_worker_egress alpha opencode2 >/dev/null
+  if [[ -f "$rootless_state/present" ]]; then
+    printf 'keeper-alpha\n' >"$rootless_state/worker-namespace"
+  else
+    printf 'worker-alpha\n' >"$rootless_state/worker-namespace"
+  fi
+  "$rootless_guard" --verify "$fixture/alpha.nft" rootless fwd_alpha alpha >/dev/null
+); then
+  pass "cold apply, first worker start, and post-start verify retain the keeper namespace"
+else
+  fail "cold rootless egress start failed: $(cat "$rootless_bin/podman.log" "$rootless_bin/nft.log")"
+fi
+assert_eq "$(grep -c '^unshare ' "$rootless_bin/podman.log")" "2" "apply and post-start verify each use one rootless namespace session"
+assert_eq "$(awk '{print $1}' "$rootless_bin/nft.log" | sort -u | wc -l | tr -d ' ')" "1" "load and both verifications stay in the namespace the worker inherits"
+assert_contains "$(cat "$rootless_bin/sudo.log")" '-u alpha env HOME=/home/alpha XDG_RUNTIME_DIR=/run/user/1000' "root-owned guard runs Podman through the tenant sudo contract"
+
+rm -rf -- "$rootless_state"
+mkdir -p "$rootless_state"
+: >"$rootless_bin/podman.log"
+: >"$rootless_bin/nft.log"
+if FAKE_INFRA_IMAGE=docker.io/library/pause:latest PATH="$rootless_bin:$PATH" \
+    "$guard" "$fixture/alpha.nft" rootless fwd_alpha alpha >"$fixture/remote-image.out" 2>&1; then
+  fail "guard accepted a non-local infra image"
+else
+  pass "guard refuses a configured remote infra image"
+  assert_contains "$(cat "$fixture/remote-image.out")" 'unapproved infra image' "remote image refusal names its provenance"
+  assert_contains "$(cat "$rootless_bin/podman.log")" 'pod rm -f lw-egress-keeper-alpha' "remote-image keeper pod is removed"
+  [[ ! -e "$rootless_state/present" ]] || fail "remote-image keeper pod remains after refusal"
+  assert_absent "$(cat "$rootless_bin/nft.log")" '-f' "remote infra image is rejected before nft load"
+fi
+
+locked_callback() {
+  local result=0
+  "$@" || result=$?
+  return "$result"
+}
+if (
+  install_worker_egress_guard() { :; }
+  WORKER_EGRESS_GUARD="$apply_guard"
+  WORKER_EGRESS_GUARD_SRC="$apply_guard"
+  worker_egress_ensure() { :; }
+  worker_egress_launch_args() {
+    : >"$fixture/launch-args-reached"
+    printf '%s\n' --network lw-egress-alpha
+  }
+  export APPLY_GUARD_RC=1
+  locked_callback prepare_worker_egress alpha opencode2
+  : >"$fixture/worker-launch-reached"
+) >"$fixture/locked-apply.out" 2>&1; then
+  fail "failed egress guard did not abort worker preparation under lifecycle callback semantics"
+else
+  pass "failed egress guard aborts worker preparation under lifecycle callback semantics"
+fi
+assert_absent "$(cat "$fixture/locked-apply.out")" 'worker egress filter enforced' "failed apply never reports egress enforced"
+[[ ! -e "$fixture/launch-args-reached" ]] || fail "failed apply reached launch-argument rendering"
+[[ ! -e "$fixture/worker-launch-reached" ]] || fail "failed apply reached worker launch"
+
+stop_order="$fixture/stop-order.log"
+if (
+  record_stop_step() { printf '%s\n' "$1" >>"$stop_order"; }
+  tenant_exists_in_registry() { return 0; }
+  stop_tenant_init_services() { record_stop_step services-stopped; }
+  stop_tenant_vision() { :; }
+  stop_tenant_voice() { :; }
+  stop_tenant_pebble() { :; }
+  stop_tenant_opencode() { :; }
+  stop_tenant_kimi() { :; }
+  stop_tenant_opencode2() { :; }
+  stop_tenant_postgres() { :; }
+  await_writer_quiescence() { record_stop_step quiescent; }
+  retire_tenant_nanocode() { record_stop_step retired; }
+  worker_egress_enabled() { return 0; }
+  ensure_container_runtime() { :; }
+  _ctr() {
+    local tenant="$1"; shift
+    case "$1 $2" in
+      'pod exists') return 0 ;;
+      'pod inspect') printf 'worker-egress-keeper\n' ;;
+      'pod rm') record_stop_step keeper-removed ;;
+      *) return 1 ;;
+    esac
+  }
+  stop_tenant alpha >/dev/null
+); then
+  quiescent_line="$(awk '$0 == "quiescent" { print NR }' "$stop_order")"
+  keeper_line="$(awk '$0 == "keeper-removed" { print NR }' "$stop_order")"
+  retired_line="$(awk '$0 == "retired" { print NR }' "$stop_order")"
+  if ((quiescent_line < keeper_line && keeper_line < retired_line)); then
+    pass "stop-tenant releases the namespace keeper only after writer quiescence"
+  else
+    fail "stop-tenant keeper release order is wrong: $(cat "$stop_order")"
+  fi
+else
+  fail "stop-tenant failed while releasing the namespace keeper"
+fi
 
 # ── rendered OpenRC start behavior ────────────────────────────────────────────
 mkdir -p "$fixture/initd"
