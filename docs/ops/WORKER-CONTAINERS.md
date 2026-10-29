@@ -1219,8 +1219,10 @@ worker Dockerfiles now declare `ARG SOURCE_DATE_EPOCH=0` before runtime
 `useradd` and assert in the same `RUN` that the account's shadow day equals
 `SOURCE_DATE_EPOCH / 86400`.** Keep both the stage-local ARG and the assertion;
 a later ARG (the old Kimi layout) cannot affect an earlier `RUN`. CI supplies
-the source commit epoch; plain builds default to day zero. BuildKit's
-`rewrite-timestamp` normalizes metadata, not this file content. The regression
+the source commit epoch; plain builds default to day zero. Shadow-utils encodes
+day zero as an empty last-change field; the assertion treats that as zero but
+still refuses a missing shadow entry. BuildKit's `rewrite-timestamp` normalizes
+metadata, not this file content. The regression
 suite `.gitlab/tests/test_worker_reproducibility.py` checks all four scopes,
 executes the shadow assertions with epoch-boundary/incorrect-day fixtures,
 and ties every snapshot to CI. Protected whole-image candidate/rebuild,
