@@ -57,6 +57,38 @@ function request(overrides: Partial<TaskRequest> = {}): TaskRequest {
   return { task_id: "task-1", prompt: "start", ...overrides }
 }
 
+test("runner health probes require a bounded live pong and propagate CLI failure", async () => {
+  const { createServer } = await import("node:net")
+  const { spawn } = await import("node:child_process")
+  const { runnerHealthcheck } = await import("./task_runner")
+  for (const [label, reply, expected] of [
+    ["pong", '{"ok":true,"op":"pong"}\n', 0],
+    ["invalid", 'null\n', 1],
+    ["oversized", "x".repeat(2048), 1],
+    ["unterminated", '{"ok":true,"op":"pong"}', 1],
+    ["silent", null, 1],
+  ] as const) {
+    const path = join(scratch(), "health.sock")
+    const server = createServer((socket) => {
+      socket.on("error", () => {})
+      socket.once("data", () => { if (reply !== null) socket.end(reply) })
+    })
+    await new Promise<void>((resolve) => server.listen(path, resolve))
+    try {
+      assert.equal(await runnerHealthcheck(path), expected, label)
+      if (label === "pong" || label === "invalid") {
+        const child = spawn(process.execPath, [new URL("./task_runner.ts", import.meta.url).pathname, "--healthcheck", path], { stdio: "ignore" })
+        assert.equal(await new Promise((resolve, reject) => {
+          child.once("error", reject)
+          child.once("exit", resolve)
+        }), expected, `${label} CLI exit status`)
+      }
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  }
+})
+
 test("runner refuses credentials before its uid gate", () => {
   const refusal = startupRefusal({
     listenFd: null,
