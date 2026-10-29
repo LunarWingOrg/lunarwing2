@@ -66,9 +66,7 @@ worker_egress_state_get() {
   return 0
 }
 worker_egress_host_mappings() { :; }
-# WI#400: the opencode lane runs a root entrypoint (image USER 0:0) whose
-# serve/tasks drop to the task uid, so the stubbed image user is 0:0.
-container_image_user="0:0"
+container_image_user="$OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID"
 _ctr() {
   printf '%s\n' "$*" >> "$ctr_calls"
   if [[ "$2" == "image" && "$3" == "inspect" ]]; then
@@ -220,7 +218,7 @@ if grep -q -- 'LW2STUDYMCP_ALLOW_WRITE' "$ctr_calls"; then
 fi
 
 render_worker_quadlet test opencode 8443
-opencode_unit="$(tenant_quadlet_dir test)/lunarwing-opencode-test.container"
+opencode_unit="$(tenant_quadlet_dir test)/lunarwing-opencode-task-test.container"
 grep -Fq "Volume=$(tenant_run_dir test)/ssh-agent:/tmp/ssh-agent:ro,z" "$opencode_unit"
 # WI#453: rootless hosts run no chown at all for the workspace directory
 # (keep-id maps the tenant identity), so the old "-R test:test <workspace>"
@@ -331,19 +329,17 @@ fi
 dockerfile="$SCRIPT_DIR/../../opencode4lunarwing/Dockerfile"
 grep -Fq "groupadd --gid $OPENCODE_CONTAINER_GID opencode" "$dockerfile"
 grep -Fq "useradd --uid $OPENCODE_CONTAINER_UID --gid $OPENCODE_CONTAINER_GID" "$dockerfile"
-# WI#400: the bridge runs as container root and drops tasks to the task uid.
 grep -Eq '^ENV OPENCODE_TASK_UID=' "$dockerfile"
 grep -Eq '^    OPENCODE_TASK_GID=' "$dockerfile"
-grep -Eq '^USER 0:0[[:space:]]*$' "$dockerfile"
+grep -Eq "^USER ${OPENCODE_CONTAINER_UID}:${OPENCODE_CONTAINER_GID}[[:space:]]*$" "$dockerfile"
 
-# The pre-WI#400 image user (the task uid directly) must now be refused.
-container_image_user="10001:10001"
+container_image_user="0:0"
 : > "$ctr_calls"
 if stale_output="$(start_tenant_opencode test 2>&1)"; then
   printf 'OpenCode worker accepted stale image user contract\n' >&2
   exit 1
 fi
-if [[ "$stale_output" != *"expected 0:0 (WI#400 root entrypoint; serve/tasks drop to $OPENCODE_CONTAINER_UID); rebuild it"* ]]; then
+if [[ "$stale_output" != *"expected $OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID (WI#454 task default); rebuild it"* ]]; then
   printf 'OpenCode stale image error omitted rebuild instruction\n' >&2
   exit 1
 fi
@@ -353,7 +349,8 @@ if grep -Fq -- ' run -d ' "$ctr_calls"; then
 fi
 
 # A rebuilt image must escape any StartLimitBurst lockout left by old failures.
-container_image_user="0:0"
+container_image_user="$OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID"
+reconcile_worker_task_quadlet() { return 0; }
 CONTAINER_RT="podman"
 # Override consumed by sourced worker startup.
 # shellcheck disable=SC2034
