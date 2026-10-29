@@ -113,6 +113,19 @@ fat worker images. Daemon/bridge services and worker containers are not started
 yet; mt-admin `status highwinds` still shows them inactive/missing, so no worker
 acceptance task has been dispatched at this point.
 
+**Pre-build source-root finding (image labels pending):** the tenant clone is at
+`05a2cd90fc34da616c9480b7e7a31ed1da6dc3ef`, while the clean operator checkout
+used by this run is at `4847e8d6d8ecd1bb7f52297609b2bd0f403cf5be`. The current
+mt-admin code calls `build_pebble_worker` without a tenant-root argument
+(`ic/scripts/mt-admin-lib/05-tenant-build.sh:562`); that builder reads
+`${LUNARWING_ROOT}/pebble4lunarwing` and stamps its revision from
+`LUNARWING_ROOT` (`:1145`, `:1154`). Kimi, by contrast, receives
+`$(tenant_lw_root "$name")` (`:574`). Thus the build inputs are on different
+commits by construction on this run, matching the still-open WI#507 source-root
+asymmetry noted in item 99. The redacted build log will be checked for both
+actual `SOURCE_REVISION` labels before reporting this as an image-level result.
+This is a traceability caveat; no worker image is claimed built yet.
+
 ## Planned worker exercise
 
 Six sequential jobs are prepared, each in a separate persistent worker
