@@ -73,6 +73,10 @@ case "$PEBBLE_MODE" in
       echo "[entrypoint] starting pebble4lunarwing task runner as uid $(id -u)"
       exec pebble4lunarwing task-runner "$TASK_RUNNER_SOCKET"
     fi
+    if [[ -n "${PEBBLE_BRIDGE_UID:-}" ]]; then
+      echo '[entrypoint] websocket images require LUNARWING_CONTAINER_ROLE=split-bridge or split-task' >&2
+      exit 1
+    fi
     echo "[entrypoint] starting pebble4lunarwing bridge (WebSocket mode)"
     exec pebble4lunarwing
     ;;
