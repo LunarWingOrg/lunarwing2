@@ -875,7 +875,7 @@ async fn build_result(
         }
         Outcome::Timeout => protocol::result_envelope(
             task_id,
-            "error",
+            "timed_out",
             output,
             Some(&format!("task timed out after {timeout_ms}ms")),
             duration_ms,
@@ -1922,7 +1922,7 @@ exec sleep 1
             .any(|delta| delta == "[stderr] timeout=17 events=1"));
         assert!(!progress.iter().any(|delta| delta.contains("timeout=999")));
         let result = result.expect("terminal result");
-        assert_eq!(result["status"].as_str(), Some("error"));
+        assert_eq!(result["status"].as_str(), Some("timed_out"));
         assert_eq!(result["error"].as_str(), Some("task timed out after 120ms"));
     }
 }
