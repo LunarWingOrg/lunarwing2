@@ -306,7 +306,8 @@ COPY config/ ./config/
 RUN set -eu; \
     command -v setpriv >/dev/null; \
     chmod -R a+rX /app/config /app/scripts; \
-    chmod a+r /app/health_server.py /app/agent_comm_protocol.json
+    chmod a+rx /app/entrypoint.sh /app/entrypoint-split.sh /app/health_server.py; \
+    chmod a+r /app/agent_comm_protocol.json
 
 # WI#357 (run-79 EI-5): the exposure controls must be root-owned and read-only.
 # Kept as the pinned instruction the BuildKit-parser policy gate matches.

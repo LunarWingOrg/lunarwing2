@@ -288,13 +288,15 @@ RUN groupadd --gid 10004 pebbletask \
 # left these 0700 root:root, which is exactly how the Kimi lane's 0511 entrypoint
 # and unreadable config/hooks shipped unnoticed. Drop to 10004 and require it to
 # read the sourced profile snippet and the baked config, and to traverse+execute
-# both launchers. Fails the BUILD on any EACCES.
+# both launchers. Root may retain owner-write on binaries and the profile;
+# group/other writes are forbidden, so the task uid cannot alter these inputs.
+# Fails the BUILD on any EACCES.
 RUN set -eu; \
     task_inputs="/usr/local/bin/entrypoint.sh /usr/local/bin/entrypoint-split.sh \
       /usr/local/bin/pebble /usr/local/bin/pebble4lunarwing \
       /etc/profile.d/lunarwing-toolchain.sh /etc/lunarwing/pebble \
       /etc/lunarwing/pebble/settings.json"; \
-    test -z "$(find -L $task_inputs \( ! -uid 0 -o -perm /222 \) -print)"; \
+    test -z "$(find -L $task_inputs \( ! -uid 0 -o -perm /022 \) -print)"; \
     setpriv --reuid=10004 --regid=10004 --clear-groups \
       find -L $task_inputs -type f -exec cat -- {} + >/dev/null; \
     setpriv --reuid=10004 --regid=10004 --clear-groups \

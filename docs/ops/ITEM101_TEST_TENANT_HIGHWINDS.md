@@ -1,17 +1,15 @@
 # Item 101 (v2.1.7.0) — persistent test tenant `highwinds`
 
-Status: **both workers running; acceptance unblocked.** RG-1 is fully landed
-across all four worker lanes, the previously-blocking egress-keeper refusal was
-fixed by item-100 (native-pause infra is accepted in-tree), Kimi was rebuilt
-with the WI#454 task uid and completed a real complex task whose artifact is
-independently verified. Pebble executed its complex task and produced a correct,
-independently verified artifact, but its result was lost by a worker-side
-forwarding defect (PE-1, recorded below). **Scope:** one complex task per lane
-was driven end-to-end and independently verified (2 of the 6 prepared tasks);
-the remaining four were not run this pass. Item 101's acceptance bar — both
-workers running, complex tasks actually executed with independent verification —
-is met for those two lanes, and two genuine findings are reported for follow-up.
-Tenant `highwinds` is retained and still running; no teardown was performed.
+Status: **PARTIAL — run-271 review supersedes the earlier completion claim.**
+Both workers were running, and Kimi completed a real complex task with an
+independently verified artifact. Pebble produced a correct artifact on the
+previously installed image, but its result never completed in the hub (PE-1).
+Only 2 of the 6 prepared tasks ran. That is not acceptance of the three newly
+edited Dockerfiles: the original Pebble gate would fail every build, and the
+OpenCode 2 pre-pass missed its entrypoints. The follow-up fixes and actual new
+image-build/deployment evidence are recorded separately below. Item 101 remains
+unchecked until a branch-built Pebble image is running and completes a task.
+No teardown is permitted; retain `highwinds` and its allocated ports.
 
 ## Scope and provenance
 
@@ -237,10 +235,11 @@ the retained gateway thread before duplicating its request. Item 101 stays
 unchecked until these actual requirements pass. No protected pipeline or
 full-image reproducibility acceptance is claimed by this branch.
 
-## This pass (2026-10-29 evening): acceptance unblocked
+## Original evening pass (2026-10-29): historical runtime results
 
-Both named blockers from the previous pass are now closed, and the item's real
-acceptance bar — both workers running, complex tasks actually executed — is met.
+The keeper refusal and old harness's approval-discovery problem were resolved.
+The runtime observations below predate the Pebble Dockerfile changes and do not
+certify the changed images or completion of item 101.
 
 ### Blocker 1 (egress keeper) was fixed by item-100, not by this branch
 
@@ -335,7 +334,7 @@ cannot retry external tasks`). The container log shows the task did finish:
 `stdout stream ended` / `stderr stream ended` / `result built, forwarding` at
 20:12:19Z, then `[bridge] ... disconnected` **64 µs later**.
 
-### PE-1 (Medium): pebble buffers all task events until the task ends, so the hub sees a silent socket
+### PE-1 (Medium, WI#519): pebble buffers all task events until the task ends, so the hub sees a silent socket
 
 `pebble4lunarwing/src/bridge.rs:499-528` awaits the whole task before draining:
 
@@ -371,13 +370,13 @@ logged rather than silently lost. This is a worker-protocol defect, out of
 RG-1's scope, and is reported here rather than fixed silently in an acceptance
 pass.
 
-### RG-1 completed for the remaining three lanes
+### RG-1 implementation for the remaining three lanes (review corrected)
 
 RG-1's ask 3 explicitly named the Pebble, OpenCode 2 and OpenCode v1 images as
 sharing the context-dependent mode defect; the previous pass fixed only Kimi and
-recorded "This change fixes **Kimi**, not all workers". All four lanes are now
-normalized, each with the mode arithmetic made independent of the builder's
-umask and a dropped-uid build gate:
+recorded "This change fixes **Kimi**, not all workers". The initial follow-up
+added normalization and dropped-uid gates but was not image-built. Run 271 found
+two defects; the corrected implementation is:
 
 - `opencode4lunarwing/Dockerfile` (`c437692e9`) — had **no** normalization at
   all: `COPY scripts/ config/` plus `chmod +x` only, so a restrictive context
@@ -387,7 +386,9 @@ umask and a dropped-uid build gate:
 - `opencode2.4lunarwing/Dockerfile` (`47af22fae`) — stripped write bits with
   `chmod -R a-w` but never added read/execute bits. Now `a+rX`/`a+r` before the
   `a-w` pass, a `command -v setpriv` fail-closed guard, and the uid-10003
-  traversal gate. Its existing WI#357 policy assert still holds: it requires
+  traversal gate. RV-3 adds `a+rx` for both entrypoints and the health script in the unpinned pre-pass;
+  otherwise a restrictive checkout still left them unreadable at 0511. The
+  existing pinned WI#357 read-only RUN remains unchanged and requires
   root ownership and no write bits, and this change only adds read bits.
 - `pebble4lunarwing/Dockerfile` (`59e8f5097`, `c738cedab`) — `entrypoint.sh` and
   `entrypoint-split.sh` were COPY'd to `/usr/local/bin` with **no** chmod, so a
@@ -399,10 +400,13 @@ umask and a dropped-uid build gate:
   0600 root:root would make dash silently skip it and drop the toolchain env
   the WI#320 gauntlet (F6) depends on. Added a uid-10004 gate that reads every
   baked task-side input and requires all four launchers to be executable as the
-  task uid.
+  task uid. RV-1 corrects the ownership/write check to reject group/other write
+  (`/022`), not root owner-write (`/222`): the wrapper and bridge remain 0755
+  and the profile remains 0644, all root-owned and unwritable by task uid 10004.
 
-Kimi's own block (`kimicode4lunarwing/Dockerfile:258-294`) is unchanged this
-pass; it was already the reference shape.
+Kimi's own block (`kimicode4lunarwing/Dockerfile:258-294`) is unchanged. Its
+all-write-bit check is valid only after its explicit immutable-input write
+removal; copying that check alone to Pebble was not equivalent normalization.
 
 ### Security posture after this pass
 
@@ -433,9 +437,40 @@ worker gained an inbound path (WI#357).
   **68 tests OK**. `test_worker_exposure_policy.py`: **38 tests OK** (431s, run
   in tmux). `.gitlab/scripts/check-worker-exposure-policy.sh`: green end to end,
   which covers both the opencode2 and opencode-v1 profiles.
-- No Rust source or dependency changed this pass, so no cargo lane applies; the
-  worker-image changes are Dockerfile-only and are exercised by their lanes'
-  build-time gates.
+- No Rust source or dependency changed in this Dockerfile follow-up, so no host
+  Cargo lane applies. These original checks did not execute the three changed
+  image RUN blocks, and no changed image was built by the original pass. The
+  pre-existing Pebble task above cannot be attributed to those later commits.
 
 Tenant `highwinds` and all its ports remain allocated and running. Both workers
 are up. No teardown, no animal-name rename, no credential was read or recorded.
+
+## Run-271 follow-up (RV-1 through RV-5)
+
+- RV-1/RV-3: corrected the Pebble write-bit predicate and OpenCode 2 entrypoint
+  pre-pass without changing the pinned read-only instruction or any egress,
+  exposure, capability or task-identity control.
+- `.gitlab/tests/test_worker_image_modes.py` executes the actual Dockerfile
+  normalization and gate blocks for 022/077 fixtures. Nine tests pass under
+  root, including real uid-10003/10004 reads, executable checks, forbidden
+  group/other writes, non-root ownership and unreadable nested-input rejection.
+  An unprivileged run explicitly skips the seven root-required cases; it does
+  not claim those probes ran. These tests do not replace a full image build.
+- RV-4: withdrew the completion claim and reopened the goal checkbox. New image
+  deployment and task completion still need to be recorded before acceptance.
+- RV-5: filed [WI#519](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/519)
+  for Pebble event buffering/result loss and
+  [WI#520](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/520) for the
+  Engine V2 history approval-discovery footgun (related to WI#436 finding 4).
+  Pending-gates/SSE remain the supported discovery paths. The socket-close
+  timestamp correlation does not establish the disconnect's exact cause.
+- RV-2: fresh image-build/deployment acceptance is pending below; no protected
+  candidate or whole-image reproducibility success is claimed by block tests.
+- Follow-up validation: all nine new block tests and all four Kimi mode tests
+  pass under root (no dropped-uid skips). Three in-memory mutants fail their
+  intended assertions: restore Pebble `/222`, remove the entrypoint pre-pass,
+  or run the OpenCode 2 read probe as root. `test_pebble_build_inputs.py` passes
+  41 tests with four existing skips; `test_goal1_ci.py` passes 274/274;
+  `exposure_policy_assert_test.py` passes 68/68. CI config, the worker exposure
+  guard, and the Go parser suite/real OpenCode 2 Dockerfile check pass. These
+  results are separate from the still-pending full-image/runtime acceptance.
