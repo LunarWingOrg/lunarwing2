@@ -23,23 +23,28 @@ import sys
 
 PATCH_REL = "patches/@silvia-odwyer%2Fphoton-node@0.3.4.patch"
 
-# Lines as they live in the pinned upstream patch (one stray leading space
-# on each context line of hunk 10). The upstream fix trims the stray space.
+# Hunk-10 context lines as they live in the pinned upstream patch: each
+# carries one stray leading space beyond the unified-diff context prefix, so
+# the three lines hold six, two and two leading spaces where photon_rs.js
+# really has four-space indented `;`, column-zero `};` and an empty line.
+# The upstream fix trims the stray space and keeps the one-space context
+# prefix (five, one and one leading spaces), which is what Bun 1.4.4's
+# hunk-header integrity check requires.
 BUGGY_CONTEXT = (
     "      ;\n",
     "  };\n",
     "  \n",
 )
 FIXED_CONTEXT = (
-    "    ;\n",
-    "};\n",
-    "\n",
+    "     ;\n",
+    " };\n",
+    " \n",
 )
 
 
 def repair(patch_text: str) -> str:
     if patch_text.count("".join(BUGGY_CONTEXT)) != 1:
-        if "    ;\n};\n\n" in patch_text:
+        if "".join(FIXED_CONTEXT) in patch_text:
             raise SystemExit(
                 f"{PATCH_REL}: hunk-10 context already carries the fixed "
                 "whitespace; drop this in-tree repair (upstream landed 61845b0)"
