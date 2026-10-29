@@ -147,16 +147,34 @@ invocation/config-hook contracts. A read-only operator-store inspection confirms
 2,689,862,622 bytes, OCI revision label
 `05a2cd90fc34da616c9480b7e7a31ed1da6dc3ef` and `toolchain-profile=true`.
 
-`start-tenant highwinds` is in progress: PostgreSQL, LunarVision, and the daemon
-are ready. Pebble is running in its tenant rootless store; Kimi image distribution
-is still in progress. Pebble-only live audit so far: `GET :20004/health` returns
+`start-tenant highwinds` reached `START_EXIT=0` with PostgreSQL, LunarVision,
+the daemon, and Pebble running; Kimi's image was distributed but its unit failed
+five starts and reached systemd `start-limit-hit`. The Kimi unit's rootless
+pre-start and post-start egress guards both succeeded. Its journal identified
+the actual failure: `/bin/bash: /app/entrypoint-task-setup.sh: Permission
+denied`. In the built image the script was root-owned mode `0511`; the task uid
+10002 had execute but no read permission. The source is tracked mode `100644`;
+the Dockerfile's `chmod +x` followed by `chmod a-w` did not produce a
+world-readable executable under the image-build mode/umask. Reproduced without
+starting the entrypoint by running a `/bin/sh` probe as uid 10002 in the image:
+`test -x` passed while `test -r` failed. `entrypoint.sh:136` executes this file
+via `as_task`, which is the required task-uid boundary, so switching it back to
+root or bypassing `as_task` is not an acceptable workaround.
+
+**Fix committed, rebuild pending:** commit `5e041ea0f` changes the Kimi Dockerfile
+runtime mode to explicit root-owned `0555` for both entrypoint scripts and adds a
+build-time mode assertion for `entrypoint-task-setup.sh`. The corrected fat
+image is rebuilding in tmux `item101-kimi-rebuild`; mt-admin `restart-tenant`
+and post-fix Kimi health/worker-listener/egress checks must pass before any
+worker acceptance job. No policy or egress rule was weakened.
+
+Pebble-only live audit: `GET :20004/health` returns
 `{"mode":"websocket","status":"ok",...}`; `mt-admin worker-listeners`
 reports clean with loopback-only published mappings; `mt-admin worker-egress`
 reports exclusive attachment, DNS pinned, static hosts current, and both exact
 tenant-specific forward/input reject chains live. Its only forward allow is
 `216.150.1.1:443` (`nano-gpt.com:443`); no recursive DNS or broad egress is
-allowed. Kimi runtime health/listener/egress checks and both lanes' acceptance
-jobs are pending. Redacted local log: `/tmp/lw-item101/deploy.log`.
+allowed. Redacted deployment log: `/tmp/lw-item101/deploy.log`.
 
 **Worker build source-root finding:** at provisioning, the tenant clone is at
 `05a2cd90fc34da616c9480b7e7a31ed1da6dc3ef`. At Pebble image build time, the
