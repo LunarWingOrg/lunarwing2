@@ -110,6 +110,12 @@ prepare_worker_task_launch() {
   source="$env_dir/lunarwing.env"
   TASK_WORKSPACE_DIR="$(prepare_worker_workspace "$name" "$worker")" \
     || die "unsafe $worker workspace for tenant '$name'"
+  TASK_WORKSPACE_ARGS=()
+  if [[ "$MT_ROOTLESS" != "true" ]]; then
+    local workspace_identity
+    workspace_identity="$(stat -c '%d:%i' -- "$TASK_WORKSPACE_DIR")" || return 1
+    TASK_WORKSPACE_ARGS=(-e LUNARWING_ROOTFUL_WORKSPACE=1 -e "LUNARWING_WORKSPACE_ID=$workspace_identity")
+  fi
   TASK_USERNS_ARGS=()
   if [[ "$CONTAINER_RT" == "podman" && "$MT_ROOTLESS" == "true" ]]; then
     case "$worker" in
@@ -205,6 +211,7 @@ start_worker_task_container() {
     -e LUNARWING_CONTAINER_ROLE=split-task \
     -e WORKSPACE_ROOT=/workspace \
     -e LUNARWING_TOOL_PROXY_DIR=/run/lunarwing-shared/tool-proxy \
+    "${TASK_WORKSPACE_ARGS[@]}" \
     "${env_ref[@]}" \
     "${mounts_ref[@]}" \
     -v "$workspace_dir:/workspace:z" \
@@ -2055,6 +2062,7 @@ start_tenant_opencode() {
       --security-opt no-new-privileges \
       --cap-drop ALL \
       -e LUNARWING_CONTAINER_ROLE=split-bridge \
+      "${TASK_WORKSPACE_ARGS[@]}" \
       -e LUNARWING_TOOL_PROXY_DIR=/run/lunarwing-shared/tool-proxy \
       -e LUNARWING_WORKER_ID="worker-opencode-${name}" \
       -e WS_PORT="$wss_port" \
@@ -2272,6 +2280,7 @@ start_tenant_opencode2() {
       --security-opt no-new-privileges \
       --cap-drop ALL \
       -e LUNARWING_CONTAINER_ROLE=split-bridge \
+      "${TASK_WORKSPACE_ARGS[@]}" \
       -e LUNARWING_TOOL_PROXY_DIR=/run/lunarwing-shared/tool-proxy \
       -e LUNARWING_WORKER_ID="worker-opencode2-${name}" \
       -e WS_PORT="$wss_port" \
@@ -2715,6 +2724,7 @@ start_tenant_kimi() {
       --security-opt no-new-privileges \
       --cap-drop ALL \
       -e LUNARWING_CONTAINER_ROLE=split-bridge \
+      "${TASK_WORKSPACE_ARGS[@]}" \
       -e LUNARWING_TOOL_PROXY_DIR=/run/lunarwing-shared/tool-proxy \
       -e LUNARWING_WORKER_ID="worker-kimi-${name}" \
       -e WS_PORT="$wss_port" \
@@ -2937,6 +2947,7 @@ start_tenant_pebble() {
       --security-opt no-new-privileges \
       --cap-drop ALL \
       -e LUNARWING_CONTAINER_ROLE=split-bridge \
+      "${TASK_WORKSPACE_ARGS[@]}" \
       -e LUNARWING_TOOL_PROXY_DIR=/run/lunarwing-shared/tool-proxy \
       -e LUNARWING_WORKER_ID="worker-pebble-${name}" \
       -e WS_PORT="$wss_port" \
