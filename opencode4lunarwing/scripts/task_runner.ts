@@ -356,19 +356,20 @@ export class TaskRunner {
   }
 
   private handlePrompt(conn: Socket, request: Record<string, unknown>): void {
+    const refuse = (error: string) => this.writeLine(conn, { ok: false, op: "prompt_refused", error })
     const prompt = parseTaskPrompt(request.prompt)
     if (!prompt) {
-      this.writeLine(conn, { ok: false, error: "prompt is malformed" })
+      refuse("prompt is malformed")
       return
     }
     const run = this.runs.get(prompt.task_id)
     if (!run || run.conn !== conn) {
-      this.writeLine(conn, { ok: false, error: `no run in flight for task ${prompt.task_id} on this connection` })
+      refuse(`no run in flight for task ${prompt.task_id} on this connection`)
       return
     }
     const queue = run.promptQueue
     if (queue.closed) {
-      this.writeLine(conn, { ok: false, error: "control queue closed" })
+      refuse("control queue closed")
       return
     }
     const seen = queue.seenSeqs ?? new Set<number>()
@@ -378,7 +379,7 @@ export class TaskRunner {
       return
     }
     if (queue.prompts.length >= MAX_CONTROL_QUEUE_PER_TASK) {
-      this.writeLine(conn, { ok: false, error: "per-task control queue limit reached" })
+      refuse("per-task control queue limit reached")
       return
     }
     seen.add(prompt.seq)
