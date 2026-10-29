@@ -70,8 +70,26 @@ class WorkerSnapshotSecurityTests(unittest.TestCase):
             path.write_text(f"ARG DEBIAN_SNAPSHOT={stale}\n", encoding="utf-8")
         self.assertEqual(
             self.errors(stale),
-            ["CI_DEBIAN_SNAPSHOT predates the CVE-2026-111497 Brotli fixes"],
+            [
+                "CI_DEBIAN_SNAPSHOT predates the CVE-2026-111497 Brotli fixes",
+                *(
+                    f"{path} ARG DEBIAN_SNAPSHOT predates the CVE-2026-111497 Brotli fixes"
+                    for path in self.dockerfiles.values()
+                ),
+            ],
         )
+
+    def test_every_worker_rejects_a_consistent_stale_override(self):
+        stale = "20261017T082437Z"
+        for name, path in self.dockerfiles.items():
+            original = path.read_text(encoding="utf-8")
+            path.write_text(f"ARG DEBIAN_SNAPSHOT={stale}\n", encoding="utf-8")
+            with self.subTest(worker=name):
+                self.assertTrue(
+                    any(str(path) in error and "Brotli fixes" in error for error in self.errors()),
+                    self.errors(),
+                )
+            path.write_text(original, encoding="utf-8")
 
     def test_missing_or_malformed_ci_snapshot_is_rejected(self):
         for snapshot in ("", "latest", "2026-10-24"):
