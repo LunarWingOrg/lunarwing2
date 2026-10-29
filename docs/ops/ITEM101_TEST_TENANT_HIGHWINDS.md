@@ -147,11 +147,16 @@ invocation/config-hook contracts. A read-only operator-store inspection confirms
 2,689,862,622 bytes, OCI revision label
 `05a2cd90fc34da616c9480b7e7a31ed1da6dc3ef` and `toolchain-profile=true`.
 
-`start-tenant highwinds` is now in progress: PG/vision are ready, the daemon was
-started/restarted successfully, and mt-admin is distributing the 2.33 GB Pebble
-image into the tenant's rootless store. Worker containers, post-start health,
-listener and egress audits, and worker acceptance jobs are not yet confirmed.
-Redacted local log: `/tmp/lw-item101/deploy.log`.
+`start-tenant highwinds` is in progress: PostgreSQL, LunarVision, and the daemon
+are ready. Pebble is running in its tenant rootless store; Kimi image distribution
+is still in progress. Pebble-only live audit so far: `GET :20004/health` returns
+`{"mode":"websocket","status":"ok",...}`; `mt-admin worker-listeners`
+reports clean with loopback-only published mappings; `mt-admin worker-egress`
+reports exclusive attachment, DNS pinned, static hosts current, and both exact
+tenant-specific forward/input reject chains live. Its only forward allow is
+`216.150.1.1:443` (`nano-gpt.com:443`); no recursive DNS or broad egress is
+allowed. Kimi runtime health/listener/egress checks and both lanes' acceptance
+jobs are pending. Redacted local log: `/tmp/lw-item101/deploy.log`.
 
 **Worker build source-root finding:** at provisioning, the tenant clone is at
 `05a2cd90fc34da616c9480b7e7a31ed1da6dc3ef`. At Pebble image build time, the
