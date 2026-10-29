@@ -8,6 +8,7 @@ import hashlib
 import json
 import pathlib
 import re
+import shlex
 import subprocess
 import sys
 import tomllib
@@ -168,6 +169,10 @@ FULL_VALIDATION_JOBS = (
     "satellite-advisory-sweep",
 )
 WORKER_NAMES = ("pebble", "opencode", "opencode2", "kimi")
+OPENCODE_BUILD_CONTEXTS = {
+    "opencode": "opencode4lunarwing",
+    "opencode2": "opencode2.4lunarwing",
+}
 # Fixed build-read inputs of the kimi worker image build (the Dockerfile
 # cross-checks kimi-cli/package.json, npm-ci's both package dirs, tsc reads
 # tsconfig.json, and the in-build test gate reads entrypoint.sh, hooks/,
@@ -2300,6 +2305,39 @@ def input_files_assignments(build_script: str) -> int:
     return count
 
 
+def opencode_builder_script_inputs(text: str) -> set[str]:
+    """Literal local COPY scripts/<file> sources in the first (builder) stage.
+
+    Handle shell/JSON COPY forms, options and continuations using the existing
+    logical-instruction reader. Directory/glob COPY completeness is outside
+    this narrow provenance check; cross-stage sources are not checkout files.
+    This is not a replacement for the BuildKit-parser Dockerfile policy gate.
+    """
+    inputs: set[str] = set()
+    stage = -1
+    for instruction in dockerfile_instructions(text):
+        if instruction.startswith("FROM "):
+            stage += 1
+        if stage != 0 or not instruction.startswith("COPY "):
+            continue
+        arguments = instruction.removeprefix("COPY ")
+        from_stage = False
+        while arguments.startswith("--"):
+            option, _, arguments = arguments.partition(" ")
+            from_stage |= option.startswith("--from=")
+        if from_stage:
+            continue
+        paths = json.loads(arguments) if arguments.startswith("[") else shlex.split(arguments)
+        if not isinstance(paths, list) or len(paths) < 2 or not all(isinstance(path, str) for path in paths):
+            raise ValueError("COPY must have source paths and a destination")
+        for source in paths[:-1]:
+            path = pathlib.PurePosixPath(source)
+            if (len(path.parts) > 1 and path.parts[0] == "scripts"
+                    and not source.endswith("/") and not any(char in source for char in "*?[")):
+                inputs.add(path.as_posix())
+    return inputs
+
+
 def validate_worker_input_manifest(errors: list[str]) -> None:
     """The worker-inputs manifest is the promotion evidence of what went
     into a candidate image (CY-4: build-executed scripts must hash into it).
@@ -2313,6 +2351,8 @@ def validate_worker_input_manifest(errors: list[str]) -> None:
     `scripts/*.ts` via its in-build test gate, the manifest must additionally
     cover the fixed build-read set and every on-disk scripts/*.ts, so the Dockerfile's
     `COPY scripts/*.ts` glob cannot silently outgrow the recorded inputs.
+    For both OpenCode lanes, literal builder COPY scripts/<file> inputs must
+    also be listed, so a new build-time patcher cannot lose its provenance.
     The on-disk glob reads the working tree; CI checkouts are clean, so an
     untracked scratch .ts only ever fails a local run."""
     build_script = WORKER_BUILD_SCRIPT.read_text(encoding="utf-8")
@@ -2348,6 +2388,23 @@ def validate_worker_input_manifest(errors: list[str]) -> None:
             elif not (ROOT / entry).is_file():
                 errors.append(
                     f"build-worker-image.sh {worker} input {entry!r} does not exist"
+                )
+        context = OPENCODE_BUILD_CONTEXTS.get(worker)
+        if context is None:
+            continue
+        dockerfile = ROOT / context / "Dockerfile"
+        if not dockerfile.is_file():
+            continue  # missing listed files are reported above
+        try:
+            builder_scripts = opencode_builder_script_inputs(dockerfile.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            errors.append(f"{worker} cannot inspect builder COPY inputs: {exc}")
+            continue
+        for source in sorted(builder_scripts):
+            required = f"{context}/{source}"
+            if required not in entries:
+                errors.append(
+                    f"{worker} worker-inputs manifest omits builder COPY input {required!r}"
                 )
     kimi_block = blocks.get("kimi")
     if kimi_block is None:

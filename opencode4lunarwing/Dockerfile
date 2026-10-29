@@ -53,6 +53,14 @@ RUN printf '%s' "${OPENCODE_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
     git -C /build/opencode tag --force "${OPENCODE_VERSION}" "${OPENCODE_REF}"
 
 WORKDIR /build/opencode
+# Bun 1.4.4 (unlike <= 1.4.2) rejects the pinned photon-node patch's hunk-10
+# context lines that carry one stray leading space ("hunk #10 does not apply
+# to photon_rs.js"). Upstream commit 61845b0 trims the stray spaces; the
+# patched photon_rs.js is byte-identical under 1.3.14/1.4.2/1.4.4. Apply the
+# same whitespace repair before bun install. The script fails the build if
+# upstream ever lands the fix itself, so the in-tree repair can be dropped.
+COPY scripts/fix_photon_patch_context.py /build/fix_photon_patch_context.py
+RUN python3 /build/fix_photon_patch_context.py /build/opencode
 RUN bun install --frozen-lockfile && bun pm cache rm
 
 WORKDIR /build/opencode/packages/sdk/js
@@ -276,8 +284,25 @@ COPY entrypoint.sh entrypoint-split.sh entrypoint-task-setup.sh health_server.py
 COPY scripts/ ./scripts/
 COPY config/ ./config/
 
-RUN chmod +x /app/entrypoint.sh /app/entrypoint-split.sh /app/entrypoint-task-setup.sh /app/health_server.py \
-    && command -v setpriv >/dev/null
+# WI#206/RG-1: task-side inputs must be readable by the task uid (10001) yet
+# stay root-owned and read-only. COPY preserves build-context modes, so a
+# checkout made under a restrictive umask (0700 dirs / 0600 files, the shape
+# mt-admin's private tenant clone has) would leave /app/config and /app/scripts
+# unreadable by 10001 while root-side boot still worked. Normalize the modes
+# here so the image is identical regardless of the builder's umask.
+RUN set -eu; \
+    chmod -R a+rX /app/config /app/scripts; \
+    chmod a+r /app/health_server.py /app/agent_comm_protocol.json; \
+    chmod 0555 /app/entrypoint.sh /app/entrypoint-split.sh /app/entrypoint-task-setup.sh /app/health_server.py; \
+    chmod -R a-w /app/config /app/scripts /app/agent_comm_protocol.json; \
+    command -v setpriv >/dev/null; \
+    test -z "$(find -L /app/config /app/scripts /app/entrypoint.sh /app/entrypoint-split.sh \
+      /app/entrypoint-task-setup.sh /app/health_server.py /app/agent_comm_protocol.json \
+      \( ! -uid 0 -o -perm /222 \) -print)"; \
+    setpriv --reuid=10001 --regid=10001 --clear-groups \
+      find -L /app/config /app/scripts /app/entrypoint.sh /app/entrypoint-split.sh \
+      /app/entrypoint-task-setup.sh /app/health_server.py /app/agent_comm_protocol.json \
+      -type f -exec cat -- {} + >/dev/null
 
 # Fail the BUILD (not container startup) if the bridge's SDK import can't
 # resolve — the SDK build above is best-effort, so verify the exact
@@ -295,7 +320,8 @@ RUN test "$(/usr/local/bin/opencode --version)" = "${OPENCODE_VERSION}" \
     && bun scripts/lunarwing_tool_proxy_test.ts \
     && bun scripts/lunarwing_tool_plugin_test.ts \
     && bun test scripts/task_runner_test.ts \
-    && python3 scripts/study_notes_config_test.py
+    && python3 scripts/study_notes_config_test.py \
+    && python3 scripts/fix_photon_patch_context_test.py
 
 # ── XDG directories for opencode state ────────────────────────
 RUN mkdir -p /home/opencode/.local/share/opencode \

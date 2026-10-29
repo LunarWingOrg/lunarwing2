@@ -197,6 +197,12 @@ ENV GOROOT=/usr/local/go \
 #     `go install`ed tools resolve from the very first task command.
 COPY pebble4lunarwing/scripts/toolchain-profile.sh /etc/profile.d/lunarwing-toolchain.sh
 COPY pebble4lunarwing/scripts/rustup-wrapper.sh /usr/local/share/lunarwing/rustup-wrapper.sh
+# RG-1: this profile snippet is *sourced* by the task's `/bin/sh -lc` shells, so
+# the task uid (10004) must be able to read it. A restrictive-umask checkout would
+# leave it 0600 root:root and dash would silently skip it, dropping the toolchain
+# env the WI#320 gauntlet (F6) relies on. Pin the mode independently of context.
+RUN chmod 0644 /etc/profile.d/lunarwing-toolchain.sh \
+      /usr/local/share/lunarwing/rustup-wrapper.sh
 
 # Build-time proof, two legs mirroring smoke-task-shell-toolchain.sh:
 #   1. the real spawn mode — /bin/sh -lc with the image env (login PATH
@@ -231,6 +237,13 @@ RUN chmod 0755 /usr/local/bin/pebble /usr/local/lib/pebble/pebble \
     && [ "$(stat -c %U /usr/local/bin/pebble)" = "root" ]
 COPY pebble4lunarwing/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY pebble4lunarwing/entrypoint-split.sh /usr/local/bin/entrypoint-split.sh
+# RG-1: COPY preserves the build context's modes, so a checkout made under a
+# restrictive umask ships these as 0700 root:root. The `test -x` readiness
+# below runs as root and passes vacuously, but the image's USER is 10004, which
+# could then not exec its own entrypoint. Pin the modes independently of the
+# context and keep them root-owned and non-writable so task code cannot edit
+# the launcher it runs under.
+RUN chmod 0555 /usr/local/bin/entrypoint.sh /usr/local/bin/entrypoint-split.sh
 
 # WI#324: register the LunarWing tool-proxy MCP shim for `pebble` runs.
 # Pebble discovers mcpServers from $PEBBLE_CONFIG_HOME/settings.json
@@ -269,6 +282,29 @@ RUN groupadd --gid 10004 pebbletask \
     && mkdir -p /home/pebbletask/go \
     && chown -R pebbletask:pebbletask /home/pebbletask \
     && command -v setpriv >/dev/null
+
+# RG-1: prove the baked task-side inputs really work as the task uid, not just as
+# root. The root-run `test -x` above passes even when a restrictive build context
+# left these 0700 root:root, which is exactly how the Kimi lane's 0511 entrypoint
+# and unreadable config/hooks shipped unnoticed. Drop to 10004 and require it to
+# read the sourced profile snippet and the baked config, and to traverse+execute
+# both launchers. Root may retain owner-write on binaries and the profile;
+# group/other writes are forbidden, so the task uid cannot alter these inputs.
+# Fails the BUILD on any EACCES.
+RUN set -eu; \
+    task_inputs="/usr/local/bin/entrypoint.sh /usr/local/bin/entrypoint-split.sh \
+      /usr/local/bin/pebble /usr/local/bin/pebble4lunarwing \
+      /etc/profile.d/lunarwing-toolchain.sh /etc/lunarwing/pebble \
+      /etc/lunarwing/pebble/settings.json"; \
+    test -z "$(find -L $task_inputs \( ! -uid 0 -o -perm /022 \) -print)"; \
+    setpriv --reuid=10004 --regid=10004 --clear-groups \
+      find -L $task_inputs -type f -exec cat -- {} + >/dev/null; \
+    setpriv --reuid=10004 --regid=10004 --clear-groups \
+      /bin/sh -c 'for f in /usr/local/bin/entrypoint.sh \
+        /usr/local/bin/entrypoint-split.sh /usr/local/bin/pebble \
+        /usr/local/bin/pebble4lunarwing; do \
+        [ -x "$f" ] || { printf "not executable as task uid: %s\n" "$f" >&2; exit 1; }; \
+      done'
 
 RUN install -d -o root -g pebbletask -m 3770 /run/lunarwing-shared \
     && install -d -o pebbletask -g pebbletask -m 2711 /run/lunarwing-shared/runner \

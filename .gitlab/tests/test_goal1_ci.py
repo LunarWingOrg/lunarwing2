@@ -774,12 +774,13 @@ class ModelsDevSnapshotGuardTests(unittest.TestCase):
         self.assertIn("usage:", result.stderr)
 
 class WorkerInputManifestTests(unittest.TestCase):
-    """Item 35: the kimi worker-inputs manifest must cover every build-read
+    """Item 35 / !2057 RT-4: the kimi manifest must cover every build-read
     input (CY-4 precedent — the builder stage compiles and executes every
     scripts/*.ts and the in-build test gate reads entrypoint.sh, hooks/ and
     config/), and every listed entry in every lane must be a safe relative
     path that exists under the repo root, so a stale or escaping entry fails
-    at ci-config time instead of the manual protected candidate build."""
+    at ci-config time instead of the manual protected candidate build. OpenCode
+    manifests must include literal builder COPY scripts/<file> inputs too."""
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -796,18 +797,36 @@ class WorkerInputManifestTests(unittest.TestCase):
         pebble_dockerfile = self.root / "pebble4lunarwing/Dockerfile"
         pebble_dockerfile.parent.mkdir(parents=True, exist_ok=True)
         pebble_dockerfile.write_text("FROM scratch\n", encoding="utf-8")
+        self.opencode_files = {}
+        for worker, context in (("opencode", "opencode4lunarwing"), ("opencode2", "opencode2.4lunarwing")):
+            directory = self.root / context
+            (directory / "scripts").mkdir(parents=True)
+            (directory / "scripts/fix_photon_patch_context.py").write_text("# fixture\n", encoding="utf-8")
+            (directory / "Dockerfile").write_text(
+                "FROM scratch AS builder\n"
+                "COPY scripts/fix_photon_patch_context.py /build/fix.py\n"
+                "FROM scratch AS runtime\n", encoding="utf-8",
+            )
+            self.opencode_files[worker] = [
+                f"{context}/Dockerfile", f"{context}/scripts/fix_photon_patch_context.py",
+            ]
         self.build_script = self.root / "build-worker-image.sh"
         self.write_build_script(kimi_files=self.kimi_files)
 
-    def write_build_script(self, *, kimi_files, pebble_files=("pebble4lunarwing/Dockerfile",)):
+    def write_build_script(self, *, kimi_files, pebble_files=("pebble4lunarwing/Dockerfile",), opencode_files=None):
         kimi_list = "\n".join(kimi_files)
         pebble_list = "\n".join(pebble_files)
+        opencode_blocks = ""
+        for worker, paths in (self.opencode_files if opencode_files is None else opencode_files).items():
+            entries = "\n".join(paths)
+            opencode_blocks += f"    {worker})\n        input_files='{entries}'\n        ;;\n"
         self.build_script.write_text(
             "case \"$1\" in\n"
             "    pebble)\n"
             f"        input_files='{pebble_list}'\n"
             "        ;;\n"
-            "    kimi)\n"
+            + opencode_blocks
+            + "    kimi)\n"
             f"        input_files='{kimi_list}'\n"
             "        ;;\n"
             "esac\n",
@@ -956,6 +975,78 @@ class WorkerInputManifestTests(unittest.TestCase):
         errors = []
         config.validate_worker_input_manifest(errors)
         self.assertEqual(errors, [])
+
+    def test_opencode_builder_script_omissions_are_caught(self):
+        for worker in self.opencode_files:
+            with self.subTest(worker=worker):
+                entries = copy.deepcopy(self.opencode_files)
+                missing = entries[worker].pop()
+                self.write_build_script(kimi_files=self.kimi_files, opencode_files=entries)
+                self.assertTrue(any(
+                    f"{worker} worker-inputs" in error and missing in error for error in self.errors()
+                ))
+
+    def test_new_literal_builder_script_requires_manifest_entry(self):
+        for worker, paths in self.opencode_files.items():
+            with self.subTest(worker=worker):
+                context = pathlib.PurePosixPath(paths[0]).parent.as_posix()
+                dockerfile = self.root / context / "Dockerfile"
+                original = dockerfile.read_text(encoding="utf-8")
+                dockerfile.write_text(original.replace(
+                    "FROM scratch AS runtime", "COPY scripts/new_helper.py /build/new.py\nFROM scratch AS runtime",
+                ), encoding="utf-8")
+                (self.root / context / "scripts/new_helper.py").write_text("# fixture\n", encoding="utf-8")
+                self.assertTrue(any("new_helper.py" in error for error in self.errors()))
+                entries = copy.deepcopy(self.opencode_files)
+                entries[worker].append(f"{context}/scripts/new_helper.py")
+                self.write_build_script(kimi_files=self.kimi_files, opencode_files=entries)
+                self.assertEqual(self.errors(), [])
+                dockerfile.write_text(original, encoding="utf-8")
+                self.write_build_script(kimi_files=self.kimi_files)
+
+    def test_builder_copy_shell_json_options_and_continuations(self):
+        for instruction in (
+            "COPY scripts/helper.py /build/helper.py",
+            "COPY --chown=0:0 ./scripts/helper.py /build/helper.py",
+            'copy ["scripts/helper.py", "/build/helper.py"]',
+            'COPY --chmod=0444 ["scripts/helper.py", "/build/helper.py"]',
+            "COPY scripts/helper.py \\\n    scripts/second.py /build/",
+        ):
+            with self.subTest(instruction=instruction):
+                text = f"FROM scratch AS builder\n{instruction}\nFROM scratch AS runtime\n"
+                expected = {"scripts/helper.py"}
+                if "second.py" in instruction:
+                    expected.add("scripts/second.py")
+                self.assertEqual(config.opencode_builder_script_inputs(text), expected)
+
+    def test_builder_copy_skips_cross_stage_runtime_and_directory_sources(self):
+        self.assertEqual(config.opencode_builder_script_inputs(
+            "FROM scratch AS builder\n"
+            "COPY --from=tools scripts/not-local.py /build/\n"
+            "COPY scripts/ /build/scripts/\n"
+            "COPY scripts/*.ts /build/scripts/\n"
+            "FROM scratch AS runtime\n"
+            "COPY scripts/not-a-builder-input.py /app/\n"
+        ), set())
+
+    def test_malformed_builder_copy_fails_closed(self):
+        path = self.root / "opencode4lunarwing/Dockerfile"
+        path.write_text('FROM scratch AS builder\nCOPY ["scripts/unclosed.py"\n', encoding="utf-8")
+        self.assertTrue(any("cannot inspect builder COPY" in error for error in self.errors()))
+
+    def test_real_opencode_fixer_manifest_omissions_are_caught(self):
+        original = config.WORKER_BUILD_SCRIPT.read_text(encoding="utf-8")
+        for worker, context in (("opencode", "opencode4lunarwing"), ("opencode2", "opencode2.4lunarwing")):
+            with self.subTest(worker=worker):
+                missing = f"{context}/scripts/fix_photon_patch_context.py"
+                self.assertIn(missing + "\n", original)
+                self.build_script.write_text(original.replace(missing + "\n", ""), encoding="utf-8")
+                errors = []
+                with mock.patch.object(config, "WORKER_BUILD_SCRIPT", self.build_script):
+                    config.validate_worker_input_manifest(errors)
+                self.assertTrue(any(
+                    "omits builder COPY input" in error and missing in error for error in errors
+                ))
 
 
 class BunImageTieTests(unittest.TestCase):

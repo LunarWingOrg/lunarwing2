@@ -95,6 +95,15 @@ have different file contents, which BuildKit's timestamp rewrite cannot fix
 (WI#510). All four workers and `CI_DEBIAN_SNAPSHOT` use `20261024T011300Z`,
 which includes the Bookworm/Trixie Brotli security fixes; bump them together.
 
+Bun 1.4.4 also requires the photon-node hunk-10 repair at this upstream pin:
+the builder runs `scripts/fix_photon_patch_context.py` after checkout, before
+`bun install --frozen-lockfile`. On the first bump whose patch already includes
+upstream `61845b0`, the fixer deliberately fails as redundant. Remove both
+`fix_photon_patch_context{,_test}.py` files, the Dockerfile fixer COPY/RUN and
+self-test invocation, and this lane's two `input_files` entries in
+`.gitlab/scripts/build-worker-image.sh` together; do not weaken the drift guard
+or downgrade Bun. See checklist item 7 in `docs/ops/WORKER-CONTAINERS.md`.
+
 ## Do Not
 
 - Break the `lunarwing-agent-v1` envelope format
