@@ -106,7 +106,9 @@ validate_keeper() {
   [[ "$is_infra" == true ]] || die "keeper $keeper is not a pause infra container"
   keeper_image="$(podman_for_tenant inspect --format '{{.ImageName}}' "$keeper_infra")" \
     || die "cannot inspect infra image for keeper $keeper"
-  if [[ "$keeper_image" != localhost/podman-pause:* || "$keeper_image" == localhost/podman-pause: ]]; then
+  if [[ -z "$keeper_image" ]]; then
+    keeper_uses_native_pause || remove_untrusted_keeper "native pause metadata mismatch"
+  elif [[ "$keeper_image" != localhost/podman-pause:* || "$keeper_image" == localhost/podman-pause: ]]; then
     remove_untrusted_keeper "$keeper_image"
   fi
   networks="$(podman_for_tenant inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{printf "%s\n" $name}}{{end}}' "$keeper_infra")" \
