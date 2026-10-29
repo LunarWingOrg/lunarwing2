@@ -286,8 +286,12 @@ RUN install -d -o root -g kimi -m 3770 /run/lunarwing-shared \
 
 # WI#206: the baked policy (guard config + PreToolUse hook) must not be
 # editable by either runtime identity.
-RUN chmod -R a-w /app/config /app/hooks \
-    && chmod a-w /app/entrypoint.sh /app/entrypoint-split.sh /app/entrypoint-task-setup.sh
+RUN find /app/config /app/hooks /app/scripts -type d -exec chmod 0555 {} + \
+    && find /app/config /app/hooks /app/scripts -type f -exec chmod 0444 {} + \
+    && chmod 0555 /app/entrypoint.sh /app/entrypoint-split.sh /app/entrypoint-task-setup.sh \
+    && test "$(stat -c %a /app/entrypoint.sh)" = 555 \
+    && test "$(stat -c %a /app/entrypoint-split.sh)" = 555 \
+    && test "$(stat -c %a /app/entrypoint-task-setup.sh)" = 555
 
 # ── ports ──────────────────────
 EXPOSE 8443
