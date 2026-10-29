@@ -3,6 +3,13 @@ set -euo pipefail
 
 PEBBLE_MODE="${PEBBLE_MODE:-websocket}"
 
+if [[ "${LUNARWING_ROOTFUL_WORKSPACE:-}" == 1 ]]; then
+  [[ "${LUNARWING_WORKSPACE_ID:-}" =~ ^[0-9]+:[0-9]+$ ]] \
+    || { echo '[entrypoint] rootful workspace identity is required' >&2; exit 1; }
+  [[ "$(stat -c '%d:%i' -- "${WORKSPACE_ROOT:-/workspace}")" == "$LUNARWING_WORKSPACE_ID" ]] \
+    || { echo '[entrypoint] workspace mount changed identity; refusing redirected workspace' >&2; exit 1; }
+fi
+
 if [[ "${LUNARWING_CONTAINER_ROLE:-}" == "split-bridge" ]]; then
   exec /usr/local/bin/entrypoint-split.sh "$@"
 fi
