@@ -1390,11 +1390,11 @@
     - **Run-258 blockers:** `worker_egress_apply` delegates to the installed guard and explicitly `|| die`s on any guard failure, including under lifecycle callback errexit suppression. The guard ensures the per-tenant rootless namespace keeper, verifies its keeper label, single infra-container shape, `localhost/podman-pause:<tag>` image and exclusive egress network, removes/refuses an unapproved image, and does filter load plus both chain verifications in one `podman unshare --rootless-netns` session. Guard failures include the namespace read and keeper-running state.
     - **Lifecycle and root-safe test coverage:** imperative post-start verification now uses the guard's `--verify`; `stop-tenant` releases the keeper after writer quiescence (warning-only cleanup failure), and teardown tries keeper removal before network removal. The harness covers lifecycle-callback failure, cold apply → first start → post-start verify in the retained namespace, remote-image rejection/removal, root/sudo Podman dispatch, root-only guard-install mode, and stop ordering. Executable temp storage is probed with an ignored repo-root fallback.
     - **Docs:** the mistyfly report records the in-tree change without rewriting its historical trace; `WORKER-CONTAINERS.md` documents the keeper contract and the host `catatonit` prerequisite, including OpenRC/Gentoo.
-    - **Verification:** `ic/scripts/tests/test-worker-egress.sh` passes; Bash syntax, the full `check-mt-admin.sh` gate, ShellCheck, and `git diff --check` pass. The harness ran as non-root: fake `id`/`sudo` stubs exercised the guard's root dispatch, but the root-only installed-file ownership assertion was not executed locally. No Rust code or dependency changed, so no Cargo lane was needed.
+    - **Verification:** `ic/scripts/tests/test-worker-egress.sh` passes; Bash syntax, the full `check-mt-admin.sh` gate, ShellCheck, and `git diff --check` pass. The harness ran as non-root: fake `id`/`sudo` stubs exercised the guard's root dispatch, but the root-only installed-file ownership assertion was not executed locally. No Rust code or dependency changed, so no Cargo lane was needed
     - **Not claimed:** no live tenant was started or changed in this pass. Fresh-tenant acceptance on the target host and the protected pipeline remain unverified; WI#504 stays open pending operator/maintainer acceptance.
-115. [x] (S) Reserved
-116. [x] (S) Reserved
-117. [x] (H) Reserved
+115. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/516
+116. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/514
+117. [x] work on reserved
 118. [x] (H) Remaining polish items from massive changes introduced in `Tsuno`
 119. [x] (H) Reserved
 120. [x] (H) Reserved
