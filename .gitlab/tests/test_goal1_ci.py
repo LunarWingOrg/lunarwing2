@@ -22,6 +22,75 @@ config = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(config)
 
 
+class WorkerSnapshotSecurityTests(unittest.TestCase):
+    SNAPSHOT = "20261024T011300Z"
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = pathlib.Path(temporary.name)
+        self.dockerfiles = {
+            name: self.root / f"{name}.Dockerfile"
+            for name in (
+                "KIMI_DOCKERFILE", "PEBBLE_DOCKERFILE",
+                "OPENCODE_DOCKERFILE", "OPENCODE2_DOCKERFILE",
+            )
+        }
+        for path in self.dockerfiles.values():
+            path.write_text(f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n", encoding="utf-8")
+
+    def errors(self, snapshot=SNAPSHOT):
+        errors = []
+        with mock.patch.multiple(config, **self.dockerfiles):
+            config.validate_worker_snapshots({"CI_DEBIAN_SNAPSHOT": snapshot}, errors)
+        return errors
+
+    def test_matching_fixed_snapshot_passes(self):
+        self.assertEqual(self.errors(), [])
+
+    def test_every_worker_rejects_missing_stale_or_shadowed_snapshot(self):
+        for name, path in self.dockerfiles.items():
+            original = path.read_text(encoding="utf-8")
+            for text in (
+                "", "ARG DEBIAN_SNAPSHOT=20261017T082437Z\n",
+                original + "ARG DEBIAN_SNAPSHOT=20261017T082437Z\n",
+            ):
+                with self.subTest(worker=name, text=text):
+                    path.write_text(text, encoding="utf-8")
+                    self.assertTrue(any(str(path) in error for error in self.errors()))
+                    path.write_text(original, encoding="utf-8")
+            with self.subTest(worker=name, missing=True):
+                path.unlink()
+                self.assertTrue(any(str(path) in error for error in self.errors()))
+                path.write_text(original, encoding="utf-8")
+
+    def test_consistent_but_vulnerable_snapshot_is_rejected(self):
+        stale = "20261017T082437Z"
+        for path in self.dockerfiles.values():
+            path.write_text(f"ARG DEBIAN_SNAPSHOT={stale}\n", encoding="utf-8")
+        self.assertEqual(
+            self.errors(stale),
+            ["CI_DEBIAN_SNAPSHOT predates the CVE-2026-111497 Brotli fixes"],
+        )
+
+    def test_missing_or_malformed_ci_snapshot_is_rejected(self):
+        for snapshot in ("", "latest", "2026-10-24"):
+            with self.subTest(snapshot=snapshot):
+                self.assertTrue(self.errors(snapshot))
+
+    def test_checked_in_snapshots_pass(self):
+        variables = config.load_yaml(ROOT / ".gitlab/ci/defaults.yml")["variables"]
+        errors = []
+        config.validate_worker_snapshots(variables, errors)
+        self.assertEqual(errors, [])
+
+    def test_main_enforces_snapshot_security(self):
+        with mock.patch.object(config, "validate_worker_snapshots") as validator:
+            with mock.patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(config.main(), 0)
+        validator.assert_called_once()
+
+
 class CaveponyReleaseTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
