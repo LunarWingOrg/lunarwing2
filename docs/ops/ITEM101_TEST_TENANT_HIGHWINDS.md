@@ -98,8 +98,13 @@ returned success and verified the exact forward and input-chain rejects. Its
 allowlist contains only `nano-gpt.com:443`; no broad/private network exception
 was added. This first-start rootless namespace-warmup requirement matches the
 item-99 mistyfly report's WI#504, reproduced independently on a systemd host.
-The temporary keeper will be removed only after the worker containers are
-running and their filter/network checks pass.
+Immediately before tenant startup, the temporary keeper is still running in
+tmux, and two additional non-mutating `podman unshare --rootless-netns` probes
+both returned `net:[4026533471]`. `mt-admin worker-egress highwinds` confirms
+the expected network/subnet/bridge and disabled recursive DNS; no worker
+containers exist yet, so that command correctly says live rule state will be
+audited at next start. The temporary keeper will be removed only after both
+worker containers are running and their filter/network checks pass.
 
 The release/WASM/fat-worker sequence is running in tmux `item101-deploy2`:
 `build-tenant --with-wasm --with-pebble --with-kimi --with-toolchains` then
