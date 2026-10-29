@@ -22,8 +22,8 @@
 #   5.40.1-6+deb13u1) and are no longer listed.
 # - bookworm (kimi, pebble images) still ships vulnerable libsqlite3-0
 #   3.40.1-2+deb12u2 and zlib1g 1:1.2.13.dfsg-1; trixie (opencode,
-#   opencode2 images) is unaffected (libsqlite3-0 3.46.1-7+deb13u2,
-#   CVE-2025-7458 fixed in sqlite3 3.42.0; zlib
+#   opencode2 images) is unaffected (libsqlite3-0 3.46.1-7+deb13u2 in the
+#   package indexes, CVE-2025-7458 fixed in sqlite3 3.42.0; zlib
 #   1:1.3.dfsg+really1.3.1-1+b1).
 # - openssh-client is still vulnerable in BOTH distros (bookworm
 #   1:9.2p1-2+deb12u10, trixie 1:10.0p1-7+deb13u4).
