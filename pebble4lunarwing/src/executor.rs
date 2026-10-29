@@ -265,8 +265,15 @@ async fn run_task_with_options(
         }
     };
 
-    let stdout = child.stdout.take().expect("stdout piped");
-    let stderr = child.stderr.take().expect("stderr piped");
+    let process_group = child.id();
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill().await;
+        return;
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let _ = child.kill().await;
+        return;
+    };
 
     let task_id = request.task_id.clone();
     let tx_stderr = event_tx.clone();
@@ -308,6 +315,16 @@ async fn run_task_with_options(
     .await;
     eprintln!("[exec] {}: stdout stream ended", request.task_id);
 
+    if let Some(group) = process_group {
+        let _ = Command::new("/bin/kill")
+            .args(["-KILL", "--", &format!("-{group}")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+    let _ = child.wait().await;
     let _ = stderr_handle.await;
     eprintln!("[exec] {}: stderr stream ended", request.task_id);
 
@@ -536,6 +553,7 @@ fn spawn_pebble_with_options(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .kill_on_drop(true);
 
     // WI#373: the child env is rebuilt from the bridge env with the
