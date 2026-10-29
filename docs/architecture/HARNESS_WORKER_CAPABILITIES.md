@@ -1,16 +1,26 @@
 # Harness Worker Capabilities (WI#326)
 
-Status: implemented in v2.1.6.0. Owner: `ic/src/orchestrator/harness.rs`.
-Re-checked 2026-10-14 for the v2.1.6.0 docs pass: the only harness.rs
-changes after the EE-doc update (`f084624a1`) were a `cargo fmt`
-normalization and the run-84 ET-3 test-only repairs (the `#[cfg(test)]`
-find-counter probe pinning the EE-1 guard, the suffixed EE-3 offset-1/2
-test blobs, and the new `redactor_contains_secret_folds_compact_json_escapes`
-pin) — no
-production behavior change; the capability contract, redaction coverage,
-write-back pipeline, and WI#383 residual list below are current (the
-residual list refreshed from the WI's run-84 state, which added EE-14 and
-the widened EE-1 betterment and corrected EE-9's both-passes shape).
+Status: implemented; source revalidated 2026-10-29 for v2.1.7.0.
+Owner: `ic/src/orchestrator/harness.rs`, with lifecycle ownership in
+`job_manager.rs` and HTTP completion handling in `api.rs`.
+
+The v2.1.7.0 WI#383 changes close two formerly documented gaps:
+
+- Staged relative paths are scanned for mounted secret representations before
+  promotion. `scrub_promotion_summary` also scrubs record/backup paths,
+  rejection paths and reasons, and the skip reason before the direct audit and
+  synchronous result are stored.
+- `complete_job` returns `JobAlreadyCompleted` when another terminal path has
+  claimed the job. `report_complete` acknowledges that duplicate and returns
+  before status persistence, SSE result broadcast, or parent-context updates.
+  A late `/complete` therefore cannot overwrite a claimed stop/cancel outcome.
+  `JobFinalizing` separately identifies a stop refused during promotion.
+
+Regression anchors are `promotion_rejects_staged_paths_embedding_mounted_secrets`,
+`scrub_promotion_summary_redacts_leaked_paths_and_reasons`, and
+`report_complete_after_terminal_claim_skips_side_effects`. The remaining
+limitations below describe source behavior, not a promise of exhaustive secret
+redaction.
 
 The conventional LunarWing Docker worker can run in **harness mode**
 (`create_job` with `mode: "harness"`), adding three optional capability
@@ -268,16 +278,13 @@ cannot be listed).
 
 ## Explicitly out of scope (follow-ups)
 
-- !1542 residual Low/Info findings: structured-field extraction redaction
-  gaps (`jq -r .field` output is decoded text, not an armed encoding) and
-  low-entropy line over-redaction; staged paths bypassing value scans
-  and direct audit/result scrubbing; duplicate `/complete` handler side
-  effects beyond the manager's idempotence (including a late `/complete`
-  turning a claimed `Stopped` into a persisted `completed` — EE-6, under
-  DZ-7); temporary plaintext copies;
-  remaining preparation/cleanup orphans;
-  no promotion deadline; remaining synchronous filesystem cleanup on async
-  tasks; and stronger delivery, sparse-file and persisted-insert tests.
+- Remaining !1542 Low/Info findings: structured-field extraction redaction
+  gaps (`jq -r .field` output is decoded text, not an armed encoding),
+  low-entropy line over-redaction, temporary plaintext copies,
+  preparation/cleanup orphans, no promotion deadline, remaining synchronous
+  filesystem cleanup on async tasks, and stronger delivery, sparse-file and
+  persisted-insert tests. Staged-path/audit scrubbing (DZ-6) and duplicate
+  `/complete` side effects (DZ-7/EA-7/EE-6) are fixed as described above.
 - !1548 run-78 residuals (WI#383): per-event scrubbing runs synchronously
   inside the async `/event` handler — beyond the landed needle-length guard
   the proper shape is one per-job `aho-corasick` automaton over the folded

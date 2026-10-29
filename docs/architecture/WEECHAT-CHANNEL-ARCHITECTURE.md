@@ -4,30 +4,18 @@ How LunarWing connects to IRC through WeeChat: the components, the end-to-end me
 flow, the ingestion/latency model, the configuration-precedence rules (and the trap they
 create), and the known issues with their fix status.
 
-**Revalidated against source 2026-10-01 (v2.1.4.0); re-checked 2026-10-06
-(v2.1.5.0); re-checked 2026-10-14 (v2.1.6.0).** All component paths,
-limits, and fix statuses below were re-checked against the current tree; the only change
-is the `dm_policy` default note in §4 (see below). The 2.1.2.0 release bumped the
-channel crate and its registry entry (`ic/registry/channels/weechat.json`) to
-0.2.9; no component paths, limits, or fix statuses changed. The 2.1.3.0
-release again only bumped the channel crate/registry version to 0.2.10; no
-component paths, limits, or fix statuses changed. The 2.1.4.0 release bumped
-the registry entry to 0.2.11 and the channel crates (including the
-`lunarwing_weechat_wss/weechat_relay` mirror crate) to workspace version
-2.1.4; no component paths, limits, or fix statuses changed. The 2.1.5.0
-release bumped the registry entry to 0.2.12 and the channel crates
-(including the `lunarwing_weechat_wss/weechat_relay` mirror crate) to
-workspace version 2.1.5; no component paths, limits, or fix statuses
-changed (re-verified: `MIN_POLL_INTERVAL_MS` still 30_000 at
-`capabilities.rs:14`, guest still requests 3s, `default_dm_policy()` still
-`pairing`, `max_chunk_length` still 420, `tags_allow_ingest` still the
-shared choke point). The 2.1.6.0 release again only bumped the registry
-entry to 0.2.13 and the channel crates to workspace version 2.1.6; no
-component paths, limits, or fix statuses changed (re-verified:
-`MIN_POLL_INTERVAL_MS` still 30_000 at `capabilities.rs:14`,
-`default_dm_policy()` still `pairing`, `max_chunk_length` still 420,
-`tags_allow_ingest` unchanged; `ws_adapter.py` and `ic/src/channels/wasm/`
-untouched in the cycle).
+**Source revalidated 2026-10-29 for v2.1.7.0.** The host minimum remains
+30,000 ms (`MIN_POLL_INTERVAL_MS`); the guest requests 3 seconds. Long-poll
+delivery is immediate only while a wait is active. `default_dm_policy` is
+`pairing`, the default chunk length is 420, and `tags_allow_ingest` remains the
+shared filter for both ingestion modes.
+
+`ic/channels-src/weechat` is a tracked symlink to
+`lunarwing_weechat_wss/weechat_relay`, not a second source copy. The registry
+build path and tenant adapter path therefore refer to the same channel tree.
+Operational changes must go through mt-admin for both systemd user managers and
+OpenRC. Relay password rotation uses the shared credential start barrier;
+[WeeChat operations](../ops/WEECHAT-SERVICES.md) owns its deployment/recovery steps.
 
 > **Why this doc exists.** A multi-hour debugging session upgrading the `sunburst` tenant
 > showed that message delivery through this channel has several independent, *invisible*
@@ -38,8 +26,8 @@ untouched in the cycle).
 Line numbers below drift; treat them as hints, not contracts. Source of truth:
 `ic/channels-src/weechat/src/lib.rs` (the WASM channel — the registry entry
 `ic/registry/channels/weechat.json` points `build-wasm-extensions.sh` at
-`channels-src/weechat`; `lunarwing_weechat_wss/weechat_relay/src/lib.rs` is a
-mirror kept for the tenant-clone layout), `lunarwing_weechat_wss/weechat_relay/ws_adapter.py`
+`channels-src/weechat`, which resolves to
+`lunarwing_weechat_wss/weechat_relay/src/lib.rs`), `lunarwing_weechat_wss/weechat_relay/ws_adapter.py`
 (the adapter — mt-admin runs it from that path in the tenant clone), and
 `ic/src/channels/wasm/` (the host runtime).
 
@@ -51,7 +39,7 @@ mirror kept for the tenant-clone layout), `lunarwing_weechat_wss/weechat_relay/w
 |-----------|-------|------|
 | **WeeChat** | per-tenant, runs in `tmux` (`lunarwing-weechat-<tenant>.service`) | The actual IRC client. Exposes the **relay `api`** plugin on the `weechat` port (MT: base+5). |
 | **`ws_adapter.py`** | per-tenant Python process (`lunarwing-weechat-adapter-<tenant>.service`), `lunarwing_weechat_wss/weechat_relay/ws_adapter.py` | Holds a **WebSocket** to WeeChat's relay, subscribes to updates, buffers lines, and re-serves them over a small **HTTP API** on the `weechat_adapter` port (MT: base+9). |
-| **WeeChat WASM channel** | in the LunarWing daemon; source `ic/channels-src/weechat/src/lib.rs` (registry-driven build; mirrored at `lunarwing_weechat_wss/weechat_relay/src/lib.rs`) → `wasm32-wasip2`; loaded/run by `ic/src/channels/wasm/{loader,wrapper,runtime,setup}.rs` | Sandboxed channel that **long-polls (or polls) the adapter over HTTP**, applies policy, and emits `IncomingMessage`s to the agent; sends replies back to WeeChat. |
+| **WeeChat WASM channel** | in the LunarWing daemon; source `ic/channels-src/weechat/src/lib.rs` (registry-driven build; symlink target `lunarwing_weechat_wss/weechat_relay/src/lib.rs`) → `wasm32-wasip2`; loaded/run by `ic/src/channels/wasm/{loader,wrapper,runtime,setup}.rs` | Sandboxed channel that **long-polls (or polls) the adapter over HTTP**, applies policy, and emits `IncomingMessage`s to the agent; sends replies back to WeeChat. |
 
 ### The three hops — only one is a WebSocket
 
@@ -348,20 +336,20 @@ every field it contains**. The classic symptom: *"I edited the installed `capabi
 (or the env) and nothing changed."* This caused hours of confusion on `sunburst` — stale
 `dm_policy` and `networks` values in that row overrode every edit.
 
-Inspect and clear it (the `value` column is **`jsonb`**):
+Use mt-admin's tenant-local database entry point; no connection URL needs to be
+copied from the secret-bearing env file. First inspect the owner scope (the
+`value` column is `jsonb`; it can contain a relay password, so keep output private):
 
 ```bash
-PGURL=$(sudo grep '^DATABASE_URL=' /home/<tenant>/lunarwing/env/lunarwing.env | cut -d= -f2-)
-# inspect
-sudo env PGSSLMODE=disable psql "$PGURL" -c \
-  "SELECT value FROM settings WHERE key='extensions.weechat.setup_fields';"
-# clear (caps + env then govern) OR surgically fix one key:
-sudo env PGSSLMODE=disable psql "$PGURL" -c \
-  "DELETE FROM settings WHERE key='extensions.weechat.setup_fields';"
-sudo env PGSSLMODE=disable psql "$PGURL" -c \
-  "UPDATE settings SET value = value || '{\"dm_policy\":\"pairing\"}'::jsonb \
+ic/scripts/lunarwing-mt-admin.sh psql <tenant> -c \
+  "SELECT user_id, jsonb_object_keys(value) AS field FROM settings \
    WHERE key='extensions.weechat.setup_fields';"
 ```
+
+After confirming the intended `user_id`, use a transaction to review either a
+single-field update or removal of that owner's override. Do not delete every
+owner's row by key alone. Restart with `restart-tenant <tenant>` to reload startup
+values; also check adapter `/api/config`, which still wins for runtime policy.
 
 > **Note:** WeeChat's new-install `dm_policy` default is now `pairing` (previously `pairing` was the documented safe default while the implementation defaulted to `open`; see rationale in this section). Operators who intentionally want open DMs should set `"dm_policy":"open"` explicitly in their adapter config or `setup_fields` row. Verified 2026-09-11: `default_dm_policy()` in `channels-src/weechat/src/lib.rs` returns `pairing`, the shipped caps default is `pairing`, and the item-16 live check confirmed `dm_policy=open` set durably via the settings store admits unpaired senders.
 
@@ -437,22 +425,24 @@ Then restart the daemon so `on_start` re-resolves.
 
 ## 7. Rollout note
 
-These changes split across three artifacts:
+The channel has three separately deployed artifacts:
 
-- **Host** (log mapping, `MissedTickBehavior`): `cargo build --release --bin lunarwing` → deploy binary.
-- **WASM channel** (long-poll consumer, **mirror-loop tag filter `tags_allow_ingest`**, per-call
-  HTTP timeouts, `network_allowed`, caps key): `scripts/build-wasm-extensions.sh` →
-  `lunarwing-mt-admin.sh install-wasm <tenant>`.
-- **Adapter** (`ws_adapter.py`: `/api/wait`, global event log, `/api/health` cursor, **first-line
-  capture for new buffers**, **post-restart replay**): a plain Python file that runs from the
-  **tenant's own clone**, so it ships with a `git pull` in the tenant home and takes effect when
-  its service restarts.
+- **Daemon binary:** host callback scheduling, log-level mapping, and WASM runtime.
+- **WASM channel plus capabilities:** long-poll consumer, mirror-loop filtering,
+  HTTP timeouts, network selection, and setup defaults.
+- **Tenant-clone adapter:** `ws_adapter.py` owns `/api/wait`, the event log,
+  new-buffer first-line capture, and post-restart replay.
 
-The adapter and WASM must update **together** (the WASM probes `/api/health` for the adapter's
-`event_cursor` and only long-polls if present; otherwise it falls back to polling). Per tenant:
-`git pull` in the tenant home → `build-tenant <t> --with-wasm` → `install-wasm <t>` →
-`restart-tenant <t>` (restarts both the daemon and the adapter service). New tenants created via
-`add-tenant` get all three from the start. No behavior changes until they are redeployed.
+Use mt-admin's documented `upgrade-tenant <tenant> --target <reviewed-ref>` flow
+for an existing tenant rather than pulling or restarting individual services by
+hand. A deliberately staged build uses `build-tenant <tenant> --with-wasm`,
+`install-wasm <tenant>`, and `restart-tenant <tenant>` after the tenant source has
+been advanced through the supported lifecycle. The same entry point supports
+systemd user managers and OpenRC.
+
+Keep adapter and WASM versions coordinated: the guest probes `/api/health` for
+`event_cursor` and falls back to polling when absent. Updating this reference
+alone changes no deployed artifact.
 
 ---
 
@@ -467,7 +457,7 @@ The adapter and WASM must update **together** (the WASM probes `/api/health` for
    dependency + automation.
 - `ic/scripts/lunarwing-weechat-preflight.sh` — read-only pre-flight that validates the generated
   relay configuration and dedicated minimal env without sourcing either file.
-- Code: `ic/channels-src/weechat/src/lib.rs` (mirrored at
+- Code: `ic/channels-src/weechat/src/lib.rs` (symlink target
   `lunarwing_weechat_wss/weechat_relay/src/lib.rs`),
   `lunarwing_weechat_wss/weechat_relay/ws_adapter.py`,
   `ic/src/channels/wasm/{setup,wrapper,runtime,loader}.rs`.

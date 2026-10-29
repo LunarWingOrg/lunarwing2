@@ -1,72 +1,31 @@
 # Engine V2 Architecture
 
-The V2 engine is a unified thread-capability-CodeAct execution model that lives in `ic/crates/lunarwing_engine/`. It replaces approximately 10 separate v1 abstractions (Session, Job, Routine, Channel, Tool, Skill, Hook, Observer, Extension, LoopDelegate) with 5 core primitives.
+The V2 engine is a thread/capability/CodeAct execution model in
+`ic/crates/lunarwing_engine/`, organized around five core primitives. The host
+bridges it to the existing channel, tool, workspace, and approval systems;
+legacy execution remains active on channels outside the rollout allowlist.
 
-**Revalidated against source 2026-10-01 (v2.1.4.0); re-checked 2026-10-06
-(v2.1.5.0); re-checked 2026-10-14 (v2.1.6.0).** Module map, gate types,
-mission seeding, lease/policy behavior, env knobs, and bridge boundaries were
-re-checked against the current tree, including the landed WI#227 sealed step
-records; updates for 2.1.1.0 include the
-best-effort `thread_start` event dispatch (item 9/WI#109 scope A) and the
-`ENGINE_V2_CHANNELS` routing-policy clarification (there is no `none`
-opt-out; unknown entries are ignored). Updates for 2.1.2.0 include the
-WI#132 authenticity hardening (labeled/neutralized memory retrieval,
-compaction summaries, and system-role content), the removal of the dead
-`executor/context.rs` module, and the Goal 8 insights hardening
-(host-validated `save_conversation_insight` writes, eligible-user-evidence
-batching, project-scoped mission dispatch, restart-safe `InsightCursor`
-batching, and explicit insight-mission opt-out with a Paused tombstone).
-Updates for 2.1.3.0 include the WI#227 sealed step records (interpreter step
-output carries the `SealedStepRecord` role through the inference transcript
-only; `Thread::add_message` reroutes it out of the user-visible transcript,
-the trace analyzer keeps `code_error` detection over sealed records, and all
-wire surfaces use `MessageRole::wire_name()`). Updates for 2.1.4.0 include
-the WI#243 recurrence fix (store-level global mission listings enumerate the
-missions map directly so missions with a missing/unparseable `project.json`
-stay bootstrapped, dispatched, and rollover-swept), the WI#244 bounded
-mid-stream recovery (documented under Failure Recovery), the WI#265
-`routine_history` Engine V2 mission-name fallback, the WI#268 prompt-overlay
-audit cross-link, and the WI#282 new-tenant
-`ORCHESTRATOR_SELF_MODIFY=true` default. Updates for 2.1.5.0 include the
-WI#301 global boot recovery (orphan-project threads, preserved Waiting
-approvals and resumable checkpoints, restart-lost mission fires recorded and
-notified without replaying side effects), the WI#302 terminal-accounting
-hardening (malformed orchestrator outcomes fail loud, budget exhaustion stops
-without fresh-budget retries, stopped threads persist Failed/Cancelled), the
-WI#299 pending-gates atomic persistence and corrupt-file quarantine layout
-(documented under gate resolution), the WI#297 `ContentFiltered` /
-`OutputBudgetExhausted` terminal kinds with empty-stream discarded-usage
-accounting, the WI#298 context-overflow clamp exemption, the WI#295 mission
-`tool_info` engine-capability answers, the WI#278 v1 `routine_*` redirect and
-union mission listing, the WI#276 grace-expired shutdown stamp plus boot-sweep
-resolution (the stop is non-cooperative; re-fire is at-least-once), the
-WI#307 non-foreground execution/resume gate and shared discovery/lease
-denylist, the WI#309 resume-lease mission catalog, the WI#311 no-auto-complete
-rule for non-manual missions, the WI#319 pre-2026-07-26
-`Completed`-as-delete caveat in recovery guidance, and the WI#308 mission-verb
-dispatch gate subset (Research-thread refusal, permission, supervision, rate
-limit, hooks) with its documented unsupervised-mission-run scope. Updates
-for 2.1.6.0 include the WI#356 Mission-thread bounds on that gate
-(`mission_create`/`mission_delete`/`mission_resume` refused to Mission
-threads, the run-107 GM-1 steering-field limit on a Mission thread's
-`mission_update`, and the fan-out disclosure on the run-spawning approval
-prompts), the WI#332 pending-gate liveness rules (listing and the
-60s sweep drop gates whose thread vanished/left Waiting/changed owner, with
-the authentication-fallback exemption, request-id-checked sweep discards
-protecting replacement gates, and the resolve-time liveness re-check that
-fails closed), the WI#337/WI#339/WI#341 shutdown-interruption resolution
-work (parity-checked stamp resolution, the per-thread interruption-stamp
-map, per-mission/per-stamp sweep isolation, marker-persists-before-notice
-ordering with acknowledged notices, and the 24h stamp-age bound), the
-WI#338 scan-time parity checks as defense in depth (full `mission.json`
-forges remain out of scope until WI#322), and the WI#359
-webhook/rate-limit hardening (the usable-secret predicate so an
-empty/whitespace stored secret never authenticates a fire, the serialized
-webhook claim check-then-save across create/update/resume, the shared
-recursive credential-key redaction over summaries/events/http surfaces,
-and the corrected aggregate/stop-bucket limiter wording). Updates for
-2.1.7.0 include the WI#394 settled-stop dedup-key boot heal documented
-under mission retries.
+**Source revalidated 2026-10-29 for v2.1.7.0.** Read the behavior sections below
+as the current contract. Relevant release changes include:
+
+- Mission persistence: WI#317 serializes boot/reconciliation writes with fires;
+  WI#321 warns when stored records cannot load and when default projects
+  duplicate; WI#322 reserves Engine project/mission documents from memory-tool
+  and web-write mutation; WI#394 heals settled-stop dedup keys without refiring.
+- CodeAct: WI#364 pre-injects missing imports for the supported standard-library
+  module set before Monty execution. Sealed step records remain inference-only.
+- Gates: WI#392 shares tool-sensitive/HTTP display redaction across hooks and
+  approval prompts; WI#473 drains turn-bound gates on terminal outcomes;
+  WI#472 resolves approval threads server-side; WI#481 routes expiry replies to
+  the gate's own gateway thread, with SSE only as delivery fallback there.
+- Conversation continuity: WI#442 imports bounded pre-switch v1 history only
+  into a newly created Engine surface after ownership checks. The import is
+  best-effort and never replays v1 tool-call bookkeeping.
+
+Source ownership: `runtime/mission.rs` and `runtime/manager.rs` in the engine;
+`ic/src/bridge/{router,effect_adapter,store_adapter}.rs` and the `router/`
+submodules in the host; `ic/src/gate/` for pending-gate storage; and
+`ic/src/channels/web/handlers/chat.rs` for HTTP approval routing.
 
 Enabled at runtime via the `ENGINE_V2=true` environment variable. The gateway
 uses Engine V2 by default when enabled. The bridge router (`ic/src/bridge/router.rs`)
@@ -103,10 +62,12 @@ ic/crates/lunarwing_engine/src/
     provenance.rs         Provenance enum (User/System/ToolOutput/LlmGenerated/etc.)
     conversation.rs       ConversationSurface, ConversationEntry, EntrySender
     mission.rs            Mission, MissionId, MissionCadence, MissionStatus
+    insight.rs            Captured source evidence, insight records, durable batch cursor
+    repl.rs               REPL argument validation and fenced-code parsing
     error.rs              EngineError, ModelFailureKind, ThreadError, StepError, CapabilityError
   traits/                 External dependency abstractions (host implements these)
     llm.rs                LlmBackend trait
-    store.rs              Store trait (33 CRUD methods)
+    store.rs              Store trait (persistence, scoped listings, evidence-checked insights)
     effect.rs             EffectExecutor trait
   capability/             Capability management
     registry.rs           CapabilityRegistry (register/get/list capabilities)
@@ -122,6 +83,7 @@ ic/crates/lunarwing_engine/src/
     manager.rs            ThreadManager (spawn, stop, inject messages, join threads)
     conversation.rs       ConversationManager (routes UI messages to threads)
     mission.rs            MissionManager (long-running goals that spawn threads on cadence)
+    insights.rs           Insight-mission source selection and lifecycle helpers
     tree.rs               ThreadTree (parent-child relationships)
     messaging.rs          ThreadSignal, ThreadOutcome, ThreadFailureKind, signal channels
     skill_feedback.rs     Skill usage feedback events (feature-gated)
@@ -137,6 +99,7 @@ ic/crates/lunarwing_engine/src/
   memory/                 Memory document system
     store.rs              MemoryStore (project-scoped doc CRUD)
     retrieval.rs          RetrievalEngine (keyword-based context retrieval from project docs)
+    insights.rs           Evidence validation and insight recall eligibility
     skill_tracker.rs      SkillTracker (confidence tracking, versioned updates, rollback)
   reliability.rs          ReliabilityTracker (per-action success rate and latency via EMA)
 ```
@@ -326,6 +289,15 @@ Key characteristics:
 - **Recursive LLM calls**: `llm_query(prompt, context)` suspends the VM, spawns a single-shot LLM call, returns text as a Python string. Results stay as variables (symbolic composition), not injected into the parent's attention window
 - **Compact output metadata**: between code steps, only a summary is added to chat context (`[FULL OUTPUT: N chars]`, `[TRUNCATED: last 8000 of N chars shown]`, a short return-value preview, or `[code executed, no output]`) to prevent context bloat
 - **Explicit termination**: `FINAL(answer)` or `FINAL_VAR(name)` for output
+- **Missing-import repair (WI#364)**: before each model-generated block reaches
+  Monty, `inject_missing_imports` adds missing bare imports for dotted references
+  to `asyncio`, `json`, `re`, `math`, `datetime`, and `sys`. Imports do not persist
+  across fresh Monty runs. A differently named alias or `from module import name`
+  does not bind the module's bare name. A bare function call such as `json(...)`
+  suppresses injection for that name so the built-in tool is not shadowed.
+  Error line numbers are shifted back to the original block. The line/boundary
+  scan is not a Python parser and can add an extra import for literal text;
+  arbitrary modules and OS access remain unavailable.
 - **Resource limits**: user CodeAct blocks default to a 30s timeout, 64MB memory,
   and 1M allocations. The orchestrator VM has a separate 600s/128MB/5M budget.
   Monty execution is wrapped in `catch_unwind` for panic safety.
@@ -631,6 +603,15 @@ terminal-outcome broadcast or, for out-of-band termination, the next sweep
 broadcast. Approvals on engine-routed channels that match no engine gate fall
 through to the legacy path with a warn-level log naming the request id and
 conversation scope, so an unmatched approval is diagnosable from logs.
+
+Approval prompts and `ToolCall` hook payloads use the shared
+`redact_display_params` path (WI#392): registered tool-sensitive fields and HTTP
+headers, URLs, and bodies are redacted, including JSON embedded in string-form
+arguments. An unregistered-tool fallback still applies the shared credential
+redactor. This protects display/hook copies; the mode-0600 pending-gate file
+retains executable parameters, and transcript storage has its own at-rest
+exposure class. A redacted prompt is not evidence that credentials were removed
+from every persisted surface.
 
 `POST /api/chat/approval` resolves the owning thread server-side (WI#472).
 `thread_id` is optional: the handler looks up the live approval gate by
@@ -984,11 +965,20 @@ the mission is shared) and listed in the mission's `thread_history`; a
 mismatch clears the stamp silently (a warn log only — no approach-history
 entry, retry marker or notice), and the retry-marker sweep and the
 recoverable-thread resume skip history threads that fail the same
-project/owner checks. These checks stop partial forgeries (only the stamp
-or `thread_history` edited) and store corruption, not a forger who
-rewrites the whole `mission.json` (`user_id`, `project_id`,
-`thread_history`); WI#322 is the fix. The
-upgrade direction has its own wrinkle: every live retry marker written by
+project/owner checks. These checks remain defense in depth against partial
+forgeries and store corruption. WI#322 now reserves the complete
+`engine/projects/**` tree from memory-tool reads/writes/tree listings and web
+writes, so those lanes cannot replace a boot-hydrated `mission.json` to bypass
+mission creation gates. Internal Store writes and exact-path operator recovery
+remain available; direct database/operator mutation is still a trusted boundary.
+
+Boot/reconciliation writers also reload each mission under its per-mission fire
+lock before saving (WI#317), preserving a concurrent fire's history, budget,
+dedup keys, and recovery metadata. This applies to managed-definition
+reconciliation, retry/shutdown recovery, restart recording, and owed notices;
+it does not make already-applied external side effects transactional.
+
+The upgrade direction has its own wrinkle: every live retry marker written by
 a build before WI#276 (pre-v2.1.5.0) deserializes with `notified: false`
 (the field is newer than those markers), so the first boot after the
 upgrade emits "Mission fire
@@ -1374,8 +1364,8 @@ bounded `sanitized_at` marker is stamped on the thread metadata for
 observability. This is a deterministic synchronous hook at the execution
 boundary — not a mission trigger — so it applies to every thread type
 including Mission threads, and the first inference (and every repl-code step)
-sees sanitized state. See `docs/ops/v2.1.2.0_WI109_WI126_SANITIZE_MEMORY.md`
-for the full verification record.
+sees sanitized state. See the
+[verification record](../ops/history/v2.1.2.0_WI109_WI126_SANITIZE_MEMORY.md).
 Event payloads are seeded into the mission thread's initial persisted state as
 `state["trigger_payload"]` before execution. Terminal thread events are published
 after final thread persistence so listeners can load complete source state.
@@ -1606,14 +1596,19 @@ Wraps tool execution and safety layer as `EffectExecutor`:
 ### HybridStore (`ic/src/bridge/store_adapter.rs`)
 
 Wraps the `Workspace` as the engine's `Store` trait:
-- 34 Store-trait methods for threads, steps, events, projects, docs, leases,
-  missions, and conversations (29 overridden by `HybridStore`; five shared-scope
-  and global-list helpers use trait defaults)
+- Implements persistence and scoped listings for threads, steps, events,
+  projects, docs, leases, missions, and conversations, including evidence-checked
+  insight writes. Shared-scope helpers can use Store defaults; global thread and
+  mission enumeration use the store's own maps so orphan-project rows remain visible.
 - In-memory `HashMap` caches backed by workspace files under `engine/`
 - Human-readable knowledge/orchestrator files plus JSON runtime state under
   `engine/.runtime/`
 - Fallback to workspace files on cache miss; terminal cleanup evicts memory but
-  preserves persisted output
+  preserves persisted output.
+- Boot read/parse failures warn with escaped stored paths and validated UUID
+  identities, excluding record content (WI#321/WI#493). Duplicate `default`
+  projects warn once per owner at boot; selection consistently chooses the
+  oldest, with UUID as tie-breaker. The warning does not merge or repair rows.
 - MemoryDoc saves propagate workspace content-write failures. Persistence must
   succeed before publishing the document/cache path or deleting a rename's old
   file. Writes are serialized through a store-local lock so cache publication
@@ -1752,7 +1747,7 @@ persisted on the conversation and injected into its next foreground turn,
 including resume from a waiting or suspended thread.
 
 Steer is deliberately **not** a tool-preemption control (the WI#105 scope
-decision, see `docs/ops/v2.1.1.0_GOAL18_WI105_STEER_PREEMPTION_CONTRACT.md`).
+decision, see the [steer contract](../ops/history/v2.1.1.0_GOAL18_WI105_STEER_PREEMPTION_CONTRACT.md)).
 A note queued while a tool future is pending does not abort that call: the
 inject signal only surfaces at the next `__check_signals__` poll, after the
 in-flight tool's result. Only `/interrupt` (`ThreadSignal::Stop` / the run
@@ -1832,7 +1827,7 @@ The engine defines three traits that the host crate implements. This boundary en
 | Trait | Signature | Host wraps |
 |-------|-----------|------------|
 | `LlmBackend` | `complete(...) -> LlmOutput`; `complete_stream(...) -> LlmStream` | `LlmProvider` |
-| `Store` | 34 CRUD methods for all engine types | Workspace-backed `HybridStore` |
+| `Store` | Persistence, scoped enumeration, leases, missions, and atomic insight validation | Workspace-backed `HybridStore` |
 | `EffectExecutor` | `execute_action(name, params, lease, ctx) -> ActionResult` | `ToolRegistry` + `SafetyLayer` |
 
 ## Data Retention Policy
@@ -1955,13 +1950,18 @@ The engine inherits most configuration from the host daemon (LLM provider settin
 
 ## Build & Test
 
-Run these commands from `ic/`:
+Run from `ic/`, using the vendored lockfile. These examples use the current
+18-thread development host; lower the affinity/job count on smaller machines.
+Use tmux for long runs and `cargo check` for compile verification.
 
 ```bash
-taskset -c 0-11 cargo check -j12 -p lunarwing_engine
-taskset -c 0-11 cargo clippy -j12 -p lunarwing_engine --all-targets -- -D warnings
-taskset -c 0-11 cargo test -j12 -p lunarwing_engine -- --test-threads=12
+taskset -c 0-17 cargo check --locked --offline -j18 -p lunarwing_engine
+taskset -c 0-17 cargo test --locked --offline -j18 -p lunarwing_engine --lib -- --test-threads=18
 ```
+
+Host bridge/HTTP gate tests live in the daemon crate and are separate from the
+engine suite. A compile check alone does not verify approval ownership,
+protocol-channel delivery, or recovery across a real tenant restart.
 
 ## Key Design Decisions
 

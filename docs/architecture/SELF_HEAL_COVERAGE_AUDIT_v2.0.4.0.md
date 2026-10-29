@@ -1,13 +1,34 @@
 # Self-Heal Coverage Audit v2.0.4.0
 
-**Date:** 2026-08-03 (ported and hardened on v2.0.5.0 on 2026-08-05; 435/435 assertions were green at that audit point; suite registration re-verified 2026-09-28, again 2026-10-01 for v2.1.4.0, again 2026-10-06 for v2.1.5.0, and again 2026-10-14 for v2.1.6.0)
-**Status:** Goal 2 implementation complete; residual gaps documented below
+**Audit date:** 2026-08-03; ported and hardened on v2.0.5.0, 2026-08-05.
+**Status:** Historical audit, with source/registration update for v2.1.7.0 on 2026-10-29.
 **Reference reviewed:** `origin/aj/kimi-24-20260801-1203`
 **Ported from:** `origin/shexpansion/cmc/v2.0.4.0` (commit `d1d3c52`)
 
-## Outcome
+## Current coverage (v2.1.7.0)
 
-Current branch ports useful reference behavior without importing unsafe defaults.
+`ic-infrastructure-health-check/tests/run-all.sh` registers **20 suites**, adding
+`worker-egress` to the previous 19. Run `bash tests/run-all.sh --list` from that
+directory for the authoritative ordered list. The original **435/435** assertion
+result below is historical evidence, not a result for the current release.
+
+WI#424 adds `health-worker-egress.sh`, a read-only host audit of registry-selected
+workers. It reads root-owned egress state, inspects the tenant network, DNS and
+static-host configuration, container attachment, and live nftables reject chains.
+It reports missing enforcement as critical; it does not repair firewall policy
+or dispatch commands to an agent. Podman rootless rules are observed in the
+tenant's rootless network namespace; Docker recursive DNS remains unverified.
+The health audit never sources an operator checkout as root. Its mock suite is
+`tests/test-health-worker-egress.sh`.
+
+Current deployment ownership and init routing are described in
+[SELF_HEAL_DEPLOYMENT_WIRING.md](SELF_HEAL_DEPLOYMENT_WIRING.md). The dated
+updates below preserve the audit trail; their suite counts describe their own
+source snapshots, with the 2026-09-19 overcount corrected by the 2026-09-28 entry.
+
+## Original audit outcome
+
+The v2.0.5.0 port adopted useful reference behavior without importing unsafe defaults.
 NetBird remains operator-owned and disabled by default. Escalation cooldown is
 per service, collision-resistant, and starts only after confirmed notification
 delivery. Restart history survives healthy observations, preserving flap guard

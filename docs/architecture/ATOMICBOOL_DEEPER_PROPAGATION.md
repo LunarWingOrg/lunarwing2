@@ -1,15 +1,24 @@
 # AtomicBool Deeper Propagation - Future Work
 
 **Date:** 2026-05-19  
-**Status:** Design Note - Not Implemented (revalidated 2026-10-01, v2.1.4.0; revalidated 2026-10-06, v2.1.5.0; revalidated 2026-10-14, v2.1.6.0)
+**Status:** Design note — deeper propagation remains unimplemented; source revalidated 2026-10-29 for v2.1.7.0.
 **Related:** [RESPONSE_SUPPRESSION_IMPLEMENTATION.md](../internal/history/architecture/RESPONSE_SUPPRESSION_IMPLEMENTATION.md), [HANDLE_MESSAGE_FIX.md](../internal/history/architecture/HANDLE_MESSAGE_FIX.md)
 
-## Current State (revalidated 2026-10-01, v2.1.4.0; revalidated 2026-10-06, v2.1.5.0; revalidated 2026-10-14, v2.1.6.0)
+## Current State (v2.1.7.0)
 
-`agent_loop.rs::run()` creates one `Arc<AtomicBool>` for the active inbound
-message and passes it to `handle_message()`. On the legacy ordinary-user-input
-path, `handle_message()` passes a reference into `process_user_input()` and into
-subsequent turns drained from that same message queue.
+`ic/src/agent/agent_loop.rs::supervise_message()` creates one
+`Arc<AtomicBool>` per scheduled inbound message and passes it to
+`handle_message()`. The scheduler can supervise multiple conversation scopes;
+there is no single process-wide active-message flag. On the legacy
+ordinary-user-input path, `handle_message()` passes a reference into
+`process_user_input()` and subsequent turns drained from that message queue.
+`handle_priority_interrupt()` creates its own unsuppressed flag and calls
+`handle_message()` directly, outside the ordinary soft-timeout supervisor.
+
+Source anchors: `supervise_message`, `handle_soft_timeout`, and
+`HARD_KILL_GRACE_SECS` in `ic/src/agent/agent_loop.rs`; `process_user_input`
+and `process_approval` in `ic/src/agent/thread_ops.rs`. Use these symbols rather
+than the historical line numbers in the decision log.
 
 The flag currently guards only selected legacy-path behavior:
 

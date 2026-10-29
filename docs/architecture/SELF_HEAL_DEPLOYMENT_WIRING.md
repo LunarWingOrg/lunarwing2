@@ -1,8 +1,19 @@
 # Infrastructure Self-Healing — Deployment & Provisioning Wiring
 
-**Date:** 2026-06-13 (revalidated 2026-09-28, v2.1.3.0; WI#180 health parity — opencode2 container-health role, monitor-only runtime/knowledge diagnostics; revalidated 2026-10-01, v2.1.4.0 — pipeline wiring, scheduling ownership, and role mappings unchanged this cycle; revalidated 2026-10-06, v2.1.5.0 — `ensure_health_pipeline()` still lives in `mt-admin-lib/12-health-pipeline.sh` and is still invoked from `add_tenant()`; writer-quiescence stop path and watchdog installer ownership unchanged; the only pipeline-script change this cycle is the `health-llm-streams.sh` `retry_reason_empty_total` export (WI#297), which does not touch this wiring; revalidated 2026-10-14, v2.1.6.0 — no change under `ic-infrastructure-health-check/` in the cycle; `ensure_health_pipeline()` still at `mt-admin-lib/12-health-pipeline.sh` and still invoked from `add_tenant()` in `mt-admin-lib/04-tenant-lifecycle.sh`; the WI#376 mt-admin hardening (FL-1 init-detection preflight, FL-2 restore probe rc+state classification, FL-3 symlinked/non-regular OpenRC units never "already stopped") lives in `mt-admin-lib/08-units-openrc.sh` (FL-1 at the OpenRC dispatch preflight, FL-3 in the stop helper) and `mt-admin-lib/11-postgres.sh` (FL-2 in the restore probe); WI#376 also touched `mt-admin-lib/12-health-pipeline.sh` (`efd94ba21`, `72b3b698f`): `_ensure_cron_runlevel` now runs rc-update/rc-service through the `_openrc_update`/`_openrc_service` proxy-unit guards and returns 1 on a refused or failed call instead of ignoring it (`add-tenant` continues because the lifecycle lock suspends errexit; `enable-health-fleet.sh`, `set -euo pipefail`, stops). None of this changes the pipeline structure, scheduling ownership, or the two-watchdog split; `ic/scripts/enable-health-fleet.sh` (the standalone fleet enabler that calls `ensure_health_pipeline` itself) additionally gained a WI#376 EQ-3 refusal gate: beside a legacy OpenRC proxy unit it refuses with the `render-units --all-proxies` remedy instead of provisioning; the WI#180 suite-count sentence is corrected to 19, matching the audit's canonical correction)
-**Status:** Reference (as-is) — documents current behavior, not a proposal
-**Related:** `ic-infrastructure-health-check/README.md`, `docs/ops/MULTITENANCY-PRODUCTION.md`, `docs/internal/history/proposals/CHAOS_ENGINEERING_TEST_PLAN.md`
+**Created:** 2026-06-13. **Source revalidated:** 2026-10-29, v2.1.7.0.
+**Status:** Reference — documents current behavior, not a proposal.
+**Related:** [health pipeline README](../../ic-infrastructure-health-check/README.md),
+[multi-tenant operations](../ops/MULTITENANCY-PRODUCTION.md),
+[historical chaos plan](../internal/history/proposals/CHAOS_ENGINEERING_TEST_PLAN.md).
+
+Current ownership: `ensure_health_pipeline`, `health_env_reconcile_line`, and
+`refresh_deployed_health_pipeline` in `ic/scripts/mt-admin-lib/12-health-pipeline.sh`;
+tenant provisioning/upgrade in `04-tenant-lifecycle.sh`; runtime egress policy in
+`15-worker-egress.sh`. WI#424 adds a monitor-only worker-egress healthpoint and
+refreshes already-installed host health assets during tenant upgrades. Init
+operations remain inside mt-admin and the dedicated health tooling; tenant
+systemd units use the tenant user manager, while the host health timer uses the
+system manager.
 
 ## Summary
 
@@ -29,11 +40,10 @@ The launchd installer installs only its user-level service watchdog wrapper and
 LaunchAgent; mt-admin does not install the host-global self-heal pipeline on
 launchd.
 
-> **Scheduling ownership:** the self-heal pipeline is scheduled exclusively by
-> `add-tenant` / `ensure_health_pipeline()`. The `install-lunarwing-watchdog.sh`
-> installer copies the self-heal scripts to `/usr/local/sbin` on systemd and
-> OpenRC but never schedules them. On a host where the watchdog installer ran
-> but `add-tenant` has not, the scripts are on disk but unscheduled.
+> **Scheduling ownership:** `ensure_health_pipeline()` owns the schedule,
+> reached by `add-tenant`, the fleet enabler, and refresh of an already-installed
+> pipeline during upgrade. `install-lunarwing-watchdog.sh` only copies the
+> self-heal scripts on systemd/OpenRC; that copy alone does not schedule them.
 
 ## Two distinct "watchdogs" (don't conflate them)
 
@@ -81,29 +91,43 @@ of tenant provisioning (unless `--no-health` is passed). This function:
 1. Copies the pipeline scripts from `ic-infrastructure-health-check/` to a stable
    lib dir (`$HEALTH_LIB_DIR`) that survives repo/worktree moves.
 2. Creates the host-level report/state dir.
-3. Writes a config env file (`/etc/lunarwing/health.env`, mode 0600) if absent —
-   includes `LUNARWING_BASE_DIR`, `LUNARWING_SERVICE_MANAGER`, tenant registry
-   path, `SELF_HEAL_SYSTEMD_SCOPE=system`, disabled-by-default NetBird probing,
-   and MT-hardening flags. If the file already exists, only the
-   `LUNARWING_SERVICE_MANAGER` and `SELF_HEAL_TENANTS_FILE` lines are
-   reconciled (preserving operator edits).
+3. Writes `/etc/lunarwing/health.env` (mode 0600) if absent, including the base
+   dir, init system, registry path, `SELF_HEAL_SYSTEMD_SCOPE=system`, disabled
+   NetBird probing, and MT flags. Re-renders preserve operator edits while
+   reconciling `LUNARWING_SERVICE_MANAGER`, `SELF_HEAL_TENANTS_FILE`,
+   `HEALTH_WORKER_EGRESS_RUNTIME`, and `HEALTH_WORKER_EGRESS_ROOTLESS`.
+   A stale `LUNARWING_MT_ADMIN` checkout path is removed: root cron runs the
+   installed read-only `health-worker-egress.sh`, never a user-owned checkout.
+   Egress launch-mode updates use `health_env_reconcile_line` with a mode-0600
+   same-directory scratch file and atomic rename, preserving file mode/owner.
 4. Writes a launcher script that sources the env file and execs `cron-wrapper.sh`.
 5. Schedules the launcher:
    - **systemd**: installs + enables `lunarwing-mt-health.{service,timer}`
      (default: every 15 min). The oneshot is explicitly bounded with
      `TimeoutStartSec=max(900s, interval)` — the ~90s distro default can kill a
      legitimate multi-tenant remediation mid-restart, and a wedged tenant user
-     bus must never stall the pipeline forever (a killed run is replayed via
-     `Persistent=true`). Per-tenant user-bus calls inside self-heal are
-     individually bounded too (`SELF_HEAL_SYSTEMD_PROBE_TIMEOUT`, default 15s).
+     bus must never stall the pipeline forever. `Persistent=true` catches up a
+     calendar activation missed while the timer was inactive; it does not replay
+     a failed/killed oneshot immediately. The next scheduled run observes health
+     again. Per-tenant user-bus calls are individually bounded too
+     (`SELF_HEAL_SYSTEMD_PROBE_TIMEOUT`, default 15s).
    - **OpenRC**: installs a managed `fcron`/`crontab` entry every 5 min
      (managed block).
 
    Set `LUNARWING_MT_HEALTH_INTERVAL_MIN` to override either default.
 
-Because the pipeline is host-global and auto-discovers tenants, the scheduling
-is idempotent — subsequent `add-tenant` calls re-run `ensure_health_pipeline()`
-without duplicating the schedule.
+Because the pipeline is host-global and auto-discovers tenants, scheduling is
+idempotent. Subsequent `add-tenant` calls re-run `ensure_health_pipeline()`.
+`enable-health-fleet.sh` is the explicit fleet installation path.
+`upgrade-tenant` calls `refresh_deployed_health_pipeline`, which refreshes and
+reconciles only when the managed launcher exists; an old script copy alone does
+not re-arm a removed schedule.
+
+Worker-egress failures use monitor-only `worker_egress@<tenant>` escalation,
+including when `SELF_HEAL_REMEDY_LOGICAL=false`. The pipeline does not repair
+firewall policy. Network creation, fail-closed launch checks, and policy repair
+belong to mt-admin's worker-egress module. See
+[worker operations](../ops/WORKER-CONTAINERS.md) for the audit and repair surface.
 
 ### Path 2: `install-lunarwing-watchdog.sh` (manual, complementary)
 
