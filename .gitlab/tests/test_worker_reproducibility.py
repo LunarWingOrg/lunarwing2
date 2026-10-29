@@ -54,21 +54,26 @@ class WorkerReproducibilityTests(unittest.TestCase):
                 ]
                 self.assertEqual(len(runs), 1)
                 self.assertIn(
-                    f'&& test "$(getent shadow {account} | cut -d: -f3)" '
-                    '= "$((SOURCE_DATE_EPOCH / 86400))"',
-                    runs[0],
+                    f'&& shadow_entry="$(getent shadow {account})" '
+                    '&& shadow_day="$(printf \'%s\' "$shadow_entry" | cut -d: -f3)" '
+                    '&& test "${shadow_day:-0}" = "$((SOURCE_DATE_EPOCH / 86400))"',
+                    " ".join(runs[0].split()),
                 )
 
     def shadow_check(self, lane, account, epoch, day):
         text = (ROOT / lane / "Dockerfile").read_text()
-        guard = next(
+        guard = " && ".join(
             line.strip().removeprefix("&& ").removesuffix(" \\")
             for line in text.splitlines()
-            if f"getent shadow {account}" in line
+            if any(token in line for token in ('shadow_entry=', 'shadow_day=', 'test "${shadow_day'))
         )
         shadow = f"{account}:!:{day}:0:99999:7:::" if day is not None else ""
+        script = (
+            f"getent() {{ printf '%s\\n' {shlex.quote(shadow)}; return {int(day is None)}; }}; "
+            + guard
+        )
         return subprocess.run(
-            ["/bin/sh", "-ec", f"getent() {{ printf '%s\\n' {shlex.quote(shadow)}; }}; {guard}"],
+            ["/bin/sh", "-ec", script],
             env={"PATH": "/usr/bin:/bin", "SOURCE_DATE_EPOCH": str(epoch)},
             capture_output=True,
             text=True,
@@ -83,6 +88,14 @@ class WorkerReproducibilityTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout, "")
 
+    def test_shadow_checks_accept_empty_only_in_epoch_day_zero(self):
+        for lane, account in WORKERS.items():
+            for epoch in (0, 1, 86399, 86400):
+                with self.subTest(lane=lane, epoch=epoch):
+                    result = self.shadow_check(lane, account, epoch, "")
+                    self.assertEqual(result.returncode == 0, epoch < 86400, result.stderr)
+                    self.assertEqual(result.stdout, "")
+
     def test_shadow_checks_refuse_wall_clock_days_and_missing_accounts(self):
         today = (datetime.date.today() - datetime.date(1970, 1, 1)).days
         for lane, account in WORKERS.items():
@@ -91,6 +104,7 @@ class WorkerReproducibilityTests(unittest.TestCase):
                     result = self.shadow_check(lane, account, 172799, day)
                     self.assertNotEqual(result.returncode, 0)
                     self.assertEqual(result.stdout, "")
+            self.assertNotEqual(self.shadow_check(lane, account, 0, None).returncode, 0)
 
     def test_all_worker_snapshots_match_ci_and_include_the_brotli_fix(self):
         defaults = yaml.safe_load((ROOT / ".gitlab/ci/defaults.yml").read_text())
