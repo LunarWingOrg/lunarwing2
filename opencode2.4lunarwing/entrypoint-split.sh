@@ -30,6 +30,7 @@ export LUNARWING_TOOL_PROXY_DIR="${LUNARWING_TOOL_PROXY_DIR:-/run/lunarwing-shar
 export LUNARWING_TASK_UID="$TASK_UID" LUNARWING_TASK_GID="$TASK_GID"
 export OPENCODE_MODE=websocket WS_ROLE="${WS_ROLE:-server}"
 
+export HOME=/home/opencode2-bridge
 TOKEN_DIR="${LUNARWING_TOKEN_DIR:-${HOME}/.local/state/lunarwing}"
 if [ -n "${AGENT_AUTH_TOKEN:-}" ]; then
   install -d -m 0700 "$TOKEN_DIR"
