@@ -277,28 +277,13 @@ async fn run_task_with_options(
 
     let task_id = request.task_id.clone();
     let tx_stderr = event_tx.clone();
-    let task_id_stderr = task_id.clone();
     let request_state = Arc::new(Mutex::new(RequestState::new()));
-    let request_state_stderr = Arc::clone(&request_state);
-
-    let stderr_handle = tokio::spawn(async move {
-        let mut reader = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            if !line.trim().is_empty() {
-                let retry = request_marker(&request_state_stderr, &line);
-                let _ = tx_stderr.send(ExecutorEvent::Progress(protocol::progress_envelope(
-                    &task_id_stderr,
-                    &format!("[stderr] {line}"),
-                )));
-                if let Some(retry) = retry {
-                    let _ = tx_stderr.send(ExecutorEvent::Progress(protocol::progress_envelope(
-                        &task_id_stderr,
-                        &retry,
-                    )));
-                }
-            }
-        }
-    });
+    let stderr_handle = tokio::spawn(stream_stderr(
+        stderr,
+        task_id.clone(),
+        tx_stderr,
+        Arc::clone(&request_state),
+    ));
 
     let (outcome, accumulated_output, final_message) = stream_stdout(
         stdout,
@@ -315,17 +300,10 @@ async fn run_task_with_options(
     .await;
     eprintln!("[exec] {}: stdout stream ended", request.task_id);
 
-    if let Some(group) = process_group {
-        let _ = Command::new("/bin/kill")
-            .args(["-KILL", "--", &format!("-{group}")])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-    }
-    let _ = child.wait().await;
-    let _ = stderr_handle.await;
+    let outcome = match finish_task_processes(&mut child, process_group, stderr_handle).await {
+        Ok(()) => outcome,
+        Err(error) => Outcome::Error(format!("task process cleanup failed: {error}")),
+    };
     eprintln!("[exec] {}: stderr stream ended", request.task_id);
 
     let duration_ms = elapsed_ms(start);
@@ -342,6 +320,60 @@ async fn run_task_with_options(
     .await;
     eprintln!("[exec] {}: result built, forwarding", request.task_id);
     let _ = event_tx.send(ExecutorEvent::Result(result));
+}
+
+async fn stream_stderr(
+    stderr: tokio::process::ChildStderr,
+    task_id: String,
+    event_tx: mpsc::UnboundedSender<ExecutorEvent>,
+    request_state: SharedRequestState,
+) {
+    let mut reader = BufReader::new(stderr).lines();
+    while let Ok(Some(line)) = reader.next_line().await {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let retry = request_marker(&request_state, &line);
+        let _ = event_tx.send(ExecutorEvent::Progress(protocol::progress_envelope(
+            &task_id,
+            &format!("[stderr] {line}"),
+        )));
+        if let Some(retry) = retry {
+            let _ = event_tx.send(ExecutorEvent::Progress(protocol::progress_envelope(
+                &task_id, &retry,
+            )));
+        }
+    }
+}
+
+async fn finish_task_processes(
+    child: &mut tokio::process::Child,
+    process_group: Option<u32>,
+    mut stderr: tokio::task::JoinHandle<()>,
+) -> Result<(), std::io::Error> {
+    if let Some(group) = process_group {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            Command::new("/bin/kill")
+                .args(["-KILL", "--", &format!("-{group}")])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status(),
+        )
+        .await??;
+    }
+    child.wait().await?;
+    if tokio::time::timeout(Duration::from_secs(2), &mut stderr)
+        .await
+        .is_err()
+    {
+        stderr.abort();
+        return Err(std::io::Error::other(
+            "stderr remained open after process-group cleanup",
+        ));
+    }
+    Ok(())
 }
 
 /// LD-11: locate setpriv through the bridge's own PATH, never the child's.
