@@ -293,6 +293,7 @@ pub async fn chat_history_handler(
                         completed_at: t.completed_at.map(|dt| dt.to_rfc3339()),
                         tool_calls,
                         reasoning,
+                        recovery: None,
                     }
                 })
                 .collect();
