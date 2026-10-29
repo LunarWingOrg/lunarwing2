@@ -138,10 +138,8 @@ test_pebble_quadlet_bounce_recovery() (
   }
   _ctr() {
     CALLS+=("ctr:$*")
-    # WI#400 LD-8: start_tenant_pebble checks the image user; the image is
-    # the root-bridge build (run-170 LP-3).
     if [[ "${2:-}" == image && "${3:-}" == inspect ]]; then
-      printf '0:0'
+      printf '%s:%s' "$PEBBLE_CONTAINER_UID" "$PEBBLE_CONTAINER_GID"
     fi
     return 0
   }
