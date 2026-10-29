@@ -152,6 +152,14 @@ async function handleTaskRequest(
     return
   }
 
+  if (request.context?.environment && Object.keys(request.context.environment).length > 0) {
+    ws.send(JSON.stringify(createEnvelope("task_result", {
+      task_id: request.task_id, status: "error", output: "",
+      error: "OpenCode2 credential grants are unsupported (WI#474)", duration_ms: 0,
+    })))
+    return
+  }
+
   console.log(`[bridge] task ${request.task_id}: starting`)
 
   if (activeTasks.has(request.task_id)) {
@@ -216,6 +224,7 @@ async function handleTaskRequest(
     toolProxy = await toolProxyRelay.startTask(request.task_id, ws)
     const runnerSocket = bridgeRunnerSocketPath()
     if (runnerSocket) {
+      if (!toolProxy) throw new Error("shared tool proxy unavailable; refusing delegated task")
       verifyRunnerSocket(runnerSocket)
       const result = await delegateTaskToRunner(
         runnerSocket,
