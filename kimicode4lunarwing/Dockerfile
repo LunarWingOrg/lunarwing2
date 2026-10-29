@@ -7,7 +7,7 @@ ARG SOURCE_REVISION=unknown
 # ──────────────────────────────
 # Stage 1: build the bridge + tests
 # ──────────────────────────────
-FROM docker.io/library/node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS builder
+FROM docker.io/library/node:22.23.4-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS builder
 
 ARG DEBIAN_SNAPSHOT
 WORKDIR /build
@@ -69,7 +69,7 @@ RUN npm ci --omit=dev --prefix /opt/kimi-cli && \
 # ──────────────────────────────
 # Stage 2: runtime image
 # ──────────────────────────────
-FROM docker.io/library/node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS runtime
+FROM docker.io/library/node:22.23.4-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS runtime
 
 ARG DEBIAN_SNAPSHOT
 ARG SOURCE_REVISION
