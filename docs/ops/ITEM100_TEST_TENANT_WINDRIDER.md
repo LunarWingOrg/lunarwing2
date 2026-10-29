@@ -161,6 +161,15 @@ specifically:
 This is the exact guard that item 101 (on Podman 6.1.4) reported as the blocker;
 on this host podman is 5.8.2 and the fallback is exercised when a worker starts.
 
+**Live confirmation on this host (not just the fixture):** after `start-worker`
+succeeded, windrider's keeper pod `lw-egress-keeper-windrider` has infra
+container `0fd45486c44f6c9b4b374e76bc4c3800834aaffbd14bf2966acf38523f69dcc7`
+with `ImageName` **empty**, `Path=/catatonit`, `IsInfra=true` — precisely the
+shape `keeper_uses_native_pause()` accepts. So the image-less built-in infra
+container is **podman's default on 5.8.2 as well**, not a Podman 6.1.4 quirk as
+item 101's report assumed; without the `c7438ad75`/`fb502652d` fallback this
+tenant's workers could not have started either.
+
 ## Independent-oracle methodology (how "verified" is defined here)
 
 Item 100 says *extensive tests*, so this pass treats a result as verified only
@@ -198,3 +207,109 @@ item 101's own report never got to run them:
 
 Per item 101's F12 (task *size* mattered more than the lane there), these are
 six focused jobs rather than one oversized one, dispatched serially per lane.
+
+## New blocker found and fixed this pass — podman `inspect` prefix cross-match
+
+`start-worker windrider pebble` failed closed at the first attempt. Root cause,
+isolated with `bash -x` and a live podman probe:
+
+- The pebble **bridge container** is named `lunarwing-pebble-windrider`; its
+  IPC **volume** is `lunarwing-pebble-windrider-ipc-v2`.
+- `podman inspect <name>` (and docker's) resolves a name across **containers,
+  images, volumes, networks and pods**, and matches a name that is only a
+  **prefix** of another object. With no bridge container yet present, a generic
+  `inspect lunarwing-pebble-windrider` resolved to the *volume* and returned 0.
+- The existence gate `if ! _ctr inspect "$container_name"` therefore read
+  "container exists", **skipped container creation**, then
+  `_register_worker_unit` → `worker_egress_verify_after_start` failed closed on a
+  container that was never created, stopping the worker.
+- `podman container inspect lunarwing-pebble-windrider` correctly reports
+  "no such container" (rc 125), and `podman rm -f lunarwing-pebble-windrider`
+  does **not** match-remove the volume (proven with a throwaway volume), so the
+  reconcile path could never corrupt the IPC volume — the bug is solely a
+  false-positive existence check.
+
+Fix: added `_ctr_inspect` in `ic/scripts/mt-admin-lib/02-containers.sh` that runs
+the portable typed subcommand `container inspect`, and routed all 82 container
+existence/state/health checks in `mt-admin-lib` through it. This is a podman 5.8.2
+OpenRC-path bug — on systemd hosts the Quadlet path does not hit these imperative
+`inspect` gates (which is why item 101's systemd silverzoom never saw it). The
+affected mt-admin fixtures were updated to model the typed subcommand; the worker,
+vision, voice, image-contract, lifecycle, startup, upgrade and pebble-configure
+test suites all pass on this tree.
+
+## Blocker that remains — gateway model does not follow the CodeAct contract
+
+Both workers run healthy, but a **real `create_job` dispatch through the gateway
+LLM loop never fires**. Evidence (daemon run at `debug` log level):
+
+- A plain `Reply with exactly BOOT_OK` and `What is 2+2` turn both complete
+  fine, so the model answers text normally.
+- A delegation turn — even the preamble's own documented exception form, a bare
+  `create_job(title=..., mode="kimi", description=...)` structured call — yields
+  `response: null`, no `tool_calls`, and the engine logs
+  `NOTE: 1 text response(s) without code blocks — model may not be following
+  CodeAct prompt` then `Suppressed empty response (not sent to channel)`.
+
+The tenant's gateway LLM is `LLM_MODEL=openai/gpt-5.2` pointed **directly** at
+`https://nano-gpt.com/api/v1` (no TensorZero proxy). That model does not honour
+the CodeAct ` ```repl ` / structured-tool contract the engine (v2) expects, so it
+never emits the `create_job` tool call that is the only way a job is created
+(`/api/jobs` is read-only; jobs are created solely by the agent's `create_job`
+tool). The working sibling tenant `dash` uses `LLM_MODEL=…tensorzero::function_name::lunarwing`
+(the local TensorZero proxy), which is a CodeAct-following surface.
+
+This is a **tenant-configuration** blocker, not a worker or daemon defect. The
+workers themselves are proven healthy on their published ports (pebble `:20014`,
+kimi `:30011`, both `{"status":"ok"}`), the egress filter is live, and the
+listener audit is clean — the gap is purely that this tenant's gateway model
+cannot drive `create_job`. Fixing it means re-pointing the tenant at a CodeAct
+LLM (the TensorZero `lunarwing` function), which is an operator configuration
+decision, not something this pass silently rewrites.
+
+## Live health at hand-off
+
+- Tenant `windrider` is **left running**: PostgreSQL, daemon
+  (`lunarwing 2.1.7`), weechat + adapter, and both workers
+  (`lunarwing-pebble-windrider` `:10018`/`:20014`,
+  `lunarwing-kimi-windrider` `:30010`/`:30011`) all `started`, boot-persistent.
+- WASM: 12 tools/channels installed, 1 skipped (not built).
+- `worker-egress windrider` exit 0 — 4 containers exclusively on
+  `lw-egress-windrider`, DNS pinned to 127.0.0.1, static host
+  `nano-gpt.com:216.150.1.1`, only `tcp dport 443` allowed, all else reject.
+- `worker-listeners windrider` → `worker listener audit: clean` (host loopback
+  only; no worker self-exposure).
+- `worker-smoke windrider` was not run to completion: it first demands the
+  non-selected opencode2 worker. Kimi/pebble bridge health was instead checked
+  directly (both `{"status":"ok"}`).
+- Verification harness lives in `/tmp/lw-item100/` (`lw.py`, `dispatch.py`,
+  `verify.py`, `oracles.py`, six task prompts, build logs).
+
+## Status and STOP report
+
+**Item 100 is not fully complete.** The tenant, toolchains and both workers are
+up, permanently named `windrider` (non-animal, from WI#273), and left running
+with no teardown — the bulk of the item. Two findings were produced and the code
+fix committed. What is **not** done is the complex-task dispatch, because the
+tenant's gateway model (`openai/gpt-5.2` via nano-gpt.com, no TensorZero proxy)
+does not follow the CodeAct contract, so `create_job` never fires and no job can
+be created through the real path.
+
+**STOP / TRIED / BLOCKED BY / RECOMMEND**
+- STOP: 8 attempts to produce a `create_job` through the gateway LLM loop all
+  yielded `response: null` with the engine logging "model may not be following
+  CodeAct prompt"; the same shape failed for a trivial smoke and for the
+  preamble's own documented structured-call exception form. Identical-root-cause
+  repeats, not a new error each time.
+- TRIED: CodeAct-friendly and structured-form prompts; raised log level to
+  `debug` to capture the real reason; confirmed the workers are healthy on their
+  ports and the egress/listener audits are clean.
+- BLOCKED BY: `windrider`'s gateway LLM is `openai/gpt-5.2` pointed straight at
+  `nano-gpt.com/api/v1` with no TensorZero proxy; that model does not emit the
+  `create_job` tool call the engine requires to create a job.
+- RECOMMEND: re-point the tenant's gateway LLM at a CodeAct-following surface
+  (the TensorZero `lunarwing` function, as `dash` uses), then run the six
+  prepared tasks through `dispatch.py` and verify with `verify.py`/`oracles.py`.
+  This is an operator config decision I will not make silently.
+
+The item checkbox stays `[ ]`. Tenant and ports retained; no teardown.
