@@ -407,7 +407,16 @@ CTR_NETWORKS=default
 worker_egress_reconcile_container alpha lunarwing-opencode2-alpha
 assert_contains "$(cat "$CTR_LOG")" 'rm -f lunarwing-opencode2-alpha' "stale pre-WI#424 container is force-recreated"
 CTR_NETWORKS=lw-egress-alpha
-if (worker_egress_verify() { return 1; }; worker_egress_verify_after_start alpha lunarwing-opencode2-alpha) >/dev/null 2>&1; then
+cat >"$fixture/failing-verify-guard" <<'STUB'
+#!/usr/bin/env bash
+exit 2
+STUB
+chmod +x "$fixture/failing-verify-guard"
+if (
+  WORKER_EGRESS_GUARD="$fixture/failing-verify-guard"
+  WORKER_EGRESS_GUARD_SRC="$fixture/failing-verify-guard"
+  worker_egress_verify_after_start alpha lunarwing-opencode2-alpha
+) >/dev/null 2>&1; then
   fail "post-start check accepted a vanished filter"
 else
   pass "post-start check fails when the filter vanishes"
@@ -643,7 +652,7 @@ if (
   else
     printf 'worker-alpha\n' >"$rootless_state/worker-namespace"
   fi
-  "$rootless_guard" --verify "$fixture/alpha.nft" rootless fwd_alpha alpha >/dev/null
+  worker_egress_verify_after_start alpha lunarwing-opencode2-alpha >/dev/null
 ); then
   pass "cold apply, first worker start, and post-start verify retain the keeper namespace"
 else
