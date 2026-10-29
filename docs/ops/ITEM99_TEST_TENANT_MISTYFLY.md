@@ -329,6 +329,34 @@ work while `worker_egress_apply` is not. The mt-admin function should either
 delegate to the same guard (it already installs it on the line above) or run
 load+verify in one netns session.
 
+### WI#504 implementation follow-up (item #114, 2026-10-29)
+
+This is an in-tree code follow-up to F2, not a re-run of the mistyfly incident;
+the original traces and their source SHAs above remain historical evidence.
+
+- `worker_egress_apply` now delegates to the installed guard and translates any
+guard failure with an explicit `|| die`, preserving fail-closed behavior even
+when called under the lifecycle lock's callback pattern.
+- Before a rootless load, the guard ensures `lw-egress-keeper-<tenant>` on the
+matching `lw-egress-<tenant>` network, requires a single infra container with
+`localhost/podman-pause:<tag>` as its image, and removes/refuses a keeper using
+any other image. It loads the rules and verifies both chains in one
+`podman unshare --rootless-netns` session. Filter failures report the network
+namespace read and whether the keeper was running. `--verify` does not create a
+keeper or load rules.
+- `stop-tenant` releases the keeper only after writer quiescence; a cleanup
+failure is warned about rather than converting a successful stop into an
+abort. Tenant teardown also attempts keeper removal before removing the egress
+network.
+- `test-worker-egress.sh` now models the root/sudo path and namespace state
+across apply, the first worker start, and post-start verification; it also pins
+remote-image refusal, keeper cleanup ordering, and guard failure under the
+lifecycle callback semantics. Its temp-dir picker probes for executable mounts
+and has an ignored repository-root fallback.
+- Local verification: the focused harness passes, with Bash syntax and
+ShellCheck clean. This pass did not start or alter a live tenant; fresh-tenant
+acceptance on the target host and the protected pipeline remain unverified.
+
 ### F2a — the launch-args status bug this pass actually fixes in mt-admin (QQ-1)
 
 F2 is the netns keeper race and is **not** the defect this MR patches; F5 calls
@@ -789,19 +817,23 @@ arithmetic is verified by the exact-sum check.
 
 QQ-4 asked for the four target-side findings to be cited in their headings so
 they stay traceable once the tenant is gone. Filed at the maintainer's request
-after run 250 and confirmed open against this tree:
+after run 250, when these findings were open; the F2 row below records the
+later item-114 in-tree code update:
 
 | finding | work item | severity label | one-line mechanism |
 | --- | --- | --- | --- |
 | F1 — worker source-root asymmetry | [WI#507](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/507) | medium, mt-admin / tech-debt | `build_pebble_worker` takes no tenant source root, so tenant pebble images build from the operator's live checkout and stamp its moving, possibly dirty revision |
-| F2 — egress apply fail-closed deadlock | [WI#504](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/504) | high, mt-admin / security | `worker_egress_apply` loads and verifies in separate `podman unshare --rootless-netns` invocations, so the first worker start fails closed with no netns keeper running |
+| F2 — egress apply fail-closed deadlock | [WI#504](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/504) | high, mt-admin / security | In-tree fix (item #114): a local-image namespace keeper plus same-session guard apply/verify; harness passes, fresh-tenant acceptance remains pending |
 | F2b — orphaned tenant lifecycle lock | [WI#505](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/505) | high, mt-admin / reliability | the lock descriptor is inherited by OpenRC daemons started inside the locked section, so a `die()` leaves the flock held and every later lifecycle command blocks |
 | F5 — no pebble backend in the allowlist | [WI#506](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/506) | medium, mt-admin / network | a `--with-pebble` tenant has no allowlist entry for pebble's model backend, so every pebble job fails on an egress-enforcing host |
 | F2a — launch-args status bug | **fixed on this branch** (`64442bffa`) | — | the IP-only allowlist made `worker_egress_launch_args` return 1 after printing valid args |
 | F3 — prior-pass findings (numbering is thunderlane's, not this report's) | WI#471 / WI#472 / WI#473 fixed, WI#436 item 1 still open | — | three of four named prior findings landed and are regression-verified live on mistyfly |
 | F4 — knowledge-sync seed/refresh asymmetry | WI#436 item 1 | — | one bad corpus note still poisons the whole refresh |
 
-F2a is closed by this MR; the other four are recorded here and owned upstream.
+F2a is closed by this MR. F2's in-tree fix and harness evidence are recorded
+above; the live fresh-tenant start has not been repeated, and WI#504 remains
+open for that acceptance. WI#505, WI#506, WI#507 and WI#436 item 1 remain
+separately tracked.
 
 ## Disposition
 

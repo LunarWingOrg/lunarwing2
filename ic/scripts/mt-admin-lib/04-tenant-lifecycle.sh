@@ -1165,6 +1165,11 @@ stop_tenant() {
     *) die "could not verify writer quiescence for tenant '$name' after stop" ;;
   esac
 
+  # WI#504: keep the rootless namespace alive through the final writer check,
+  # then release its infra pod so the next start recreates a verified keeper.
+  worker_egress_stop_keeper "$name" \
+    || say "WARNING: could not release worker egress namespace keeper for '$name'" >&2
+
   # Shutdown must not be blocked by malformed legacy config or an unsafe
   # rollback path. Retire Nanocode only after every supported service is down.
   retire_tenant_nanocode "$name" \
