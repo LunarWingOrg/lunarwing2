@@ -256,8 +256,10 @@ ENV GOROOT=/usr/local/go \
 # USER below); the serve process (which runs all task code) and every
 # one-shot process drop to this uid/gid via setpriv, while the bridge stays
 # root, so the bridge's and PID 1's environ are EACCES to task code.
+ARG SOURCE_DATE_EPOCH=0
 RUN groupadd --gid 10001 opencode \
-    && useradd --uid 10001 --gid 10001 -m -d /home/opencode opencode
+    && useradd --uid 10001 --gid 10001 -m -d /home/opencode opencode \
+    && test "$(getent shadow opencode | cut -d: -f3)" = "$((SOURCE_DATE_EPOCH / 86400))"
 
 # ── app layout ─────────────────
 WORKDIR /app
