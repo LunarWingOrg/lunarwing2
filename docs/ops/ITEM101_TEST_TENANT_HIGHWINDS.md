@@ -105,6 +105,14 @@ The release/WASM/fat-worker sequence is running in tmux `item101-deploy2`:
 The build uses deployment release outputs, not full debug builds. Redacted local
 logs: `/tmp/lw-item101/add.log` and `/tmp/lw-item101/deploy.log`.
 
+**Build progress (observed):** the tenant's LunarWing binary finished its
+`--profile release` compile in 12m16s with Rust 1.96.1 and the configured
+18-job limit; output includes the default PostgreSQL and libSQL feature graph.
+The sequence is now compiling the XMPP bridge before proceeding to WASM and the
+fat worker images. Daemon/bridge services and worker containers are not started
+yet; mt-admin `status highwinds` still shows them inactive/missing, so no worker
+acceptance task has been dispatched at this point.
+
 ## Planned worker exercise
 
 Six sequential jobs are prepared, each in a separate persistent worker
