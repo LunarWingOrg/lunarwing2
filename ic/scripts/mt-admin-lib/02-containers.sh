@@ -315,7 +315,7 @@ _openrc_stop_worker_nondestructive() {
   local container="$1"
   ensure_init_system
   [[ "$INIT_SYSTEM" == "openrc" ]] || return 0
-  if [[ -f "/etc/init.d/${container}-sup" ]]; then
+  if [[ -f "$OPENRC_INITD_DIR/${container}-sup" ]]; then
     _openrc_service "${container}-sup" stop >/dev/null 2>&1 || true
   fi
   _openrc_service "$container" stop >/dev/null 2>&1 || true
