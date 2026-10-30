@@ -599,6 +599,12 @@ if [[ "${1:-}" == "inspect" ]]; then
   [[ "${2:-}" == "-f" ]] && printf 'true\n'
   exit 0
 fi
+if [[ "${1:-}" == "container" && "${2:-}" == "inspect" ]]; then
+  # Typed subcommand form used by export-tenant.sh; same answers as the
+  # legacy bare-inspect arm above.
+  [[ "${3:-}" == "-f" ]] && printf 'true\n'
+  exit 0
+fi
 if [[ "${1:-}" == "exec" ]]; then
   printf 'PGDMP-test-export\n'
   exit 0
