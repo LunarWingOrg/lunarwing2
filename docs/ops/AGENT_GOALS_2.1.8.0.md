@@ -97,7 +97,7 @@
 32. [x] (H) General Agent Loop Engine Polish
 33. [x] (H) OPERATOR NOTE: Start the gallop
 34. [x] (H) Deploy the stoplight system
-35. [x] (S) Reserved
+35. [x] (H) Dive back in to LunarDepth
 36. [x] (S) Reserved
 37. [x] (S) Reserved
 38. [x] (S) Reserved
