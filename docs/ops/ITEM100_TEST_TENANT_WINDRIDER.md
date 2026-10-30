@@ -412,39 +412,69 @@ recommendation (2): both changes are the documented "edit
 - Verification harness lives in `/tmp/lw-item100/` (`lw.py`, `dispatch.py`,
   `verify.py`, `oracles.py`, six task prompts, build logs).
 
+## Complex-task results — all six prepared tasks completed and verified
+
+All six prepared tasks (three kimi, three pebble) were dispatched through the
+real gateway → engine → `create_job` → approval → worker bridge path on
+2026-10-30 and completed; every verifiable artifact was pulled from the task
+container and re-derived with an independent host implementation.
+
+| # | lane | task | job | events | host verification |
+| --- | --- | --- | --- | --- | --- |
+| 1 | kimi/Rust | two-tree Fenwick BIT, range-add/range-sum over i128, xorshift self-check + ops dump | `8b86805c` | 38 | 300/300 ops replayed with host naive array, checksum 467930364 matches; xorshift64 sequence reproduced byte-for-byte, final state matches RESULTS.json |
+| 2 | kimi/Go | MVCC transaction store, 24 goroutines, race detector | `2598d5e0` | 43 | `go vet` clean, `go test -race -count=2` passes (`ok txstore`); SELFCHECK variance documented by the contract; worker fixed its own failing ReadYourWrites test mid-run |
+| 3 | kimi/C++17 | Dinic max-flow, exhaustive min-cut cross-check, scaling | `c0dc8c2b` | 58 | 40/40 dumped instances re-derived by host min-cut enumeration, all match; RESULTS graphs=1600 mismatches=0; deterministic across two runs; worker caught and repaired its own 1053/1600 mismatch state mid-run |
+| 4 | pebble/Rust | rollback DSU + iterative segtree, checkpoint/rollback cross-check | `b2b5cc5a` | 35 | deterministic SELFCHECK (dsu_ops=400, segtree_ops=1000, 0 mismatches, verified over two direct runs in-container); cargo test 8/8 |
+| 5 | pebble/Go | external stable merge sort (2500-row chunks, k-way heap merge) + merge join | `d8393006` | 65 | sorted.csv (20,000 rows) matches the host's stable sort byte-for-byte, 0 adjacent stability violations; joined.csv matches the full host inner join (1239 rows incl. 13 duplicate lookup keys); `go test` file-set invocation passes |
+| 6 | pebble/C++17 | rectangular Hungarian assignment, brute-force + dual-certificate validation | `8cd1050a` | 28 | 30/30 dumped instances re-derived by host brute force over all injective maps, all match; RESULTS small=4050 mismatches=0 dual_violations=0, SCALE n=200 m=250 optimum=1075095 |
+
+One earlier job (`4a2c3cb9`, "capture-2") failed before the worker-credential
+fix (above) with the kimi lane's `provider.auth_error: 401 Invalid session`;
+it is retained in the DB as the historical record of that fix, not as a task
+failure.
+
+Artifacts and harness live in `/tmp/lw-item100/` on this host
+(`dispatch.py` with the `/api/chat/pending-gates` discovery fix,
+`oracles.py`/`verify.py`, `llm-capture-proxy.py`, `pulled/<lane>/*` for the
+verified artifacts, `events-<jobid>.json` for every job's event list).
+
 ## Test harness verification
 
-All mt-admin + worker harnesses were re-run on this tree:
+The **entire** `ic/scripts/tests/` directory was executed on this tree (per
+the run-280 RZ-1 ask — not just the mt-admin/worker subset):
 
-- **Previously broken (RW-1)**: `test-mt-admin-worker-listeners.sh` 30 PASS,
-  `test-mt-admin-tenant-capability-writers.sh` rc 0,
-  `test-worker-egress.sh` 144 PASS / 1 SKIP — all green.
-- **RW-3 pins**: `test-mt-admin-worker-startup.sh` — all existing tests
-  pass + static pin passes + 4 behavioural IPC-volume pins pass.
-- **Full suite**: 26/28 mt-admin + worker harnesses pass. The 2 failures
-  (`test-mt-admin-daemon-pid.sh`, `test-mt-admin-ssh-key-upload.sh`) are
-  **pre-existing** — byte-identical rc=1 on the unmodified target
-  `af270a192` (verified in a temporary worktree). The daemon-pid failure
-  is a `/proc/<pid>/exe` exec-timing fixture artifact; the ssh-key failure
-  expects env mode 640 but the fixture produces 600. Neither is caused by or
-  related to the typed-inspect diff.
-- **Repo gates**: `check-mt-admin.sh` shellcheck-clean (17 modules);
-  `shell-syntax.sh` validated 272 scripts + 3 hooks; `shellcheck.sh` clean;
-  `python_syntax.py` clean; `validate_config.py` clean (8 CI YAML files).
-  `gitleaks` not installed on this host (pre-existing env gap, rc=127).
+- **67/70 harnesses pass** (`RC=0`), including every harness this pass
+  touched: `test-darkirc-migration-safeguards.sh`, `test-kawarimi-import-flags.sh`,
+  `test-study-mcp-worker-mount.sh`, `test-mt-admin-worker-startup.sh` (232
+  assertions incl. the widened static pin, 4 bridge and 4 task-gate
+  behavioural pins), `test-mt-admin-pg-data-orphan-guard.sh` (new, 10 cases),
+  `test-mt-admin-worker-lifecycle.sh`, `test-mt-admin-worker-listeners.sh`,
+  `test-mt-admin-tenant-capability-writers.sh`, `test-worker-egress.sh`
+  (144 PASS / 1 SKIP).
+- **3 failures, all pre-existing and byte-identical on the untouched base**
+  `11f8bb218` (verified in a temporary worktree):
+  `test-coord-knowledge-matrix.sh` rc=2 ("FATAL: run as root" — refuses
+  unprivileged, an environmental fixture contract),
+  `test-mt-admin-daemon-pid.sh` rc=1 (`/proc/<pid>/exe` exec-timing fixture
+  artifact), `test-mt-admin-ssh-key-upload.sh` rc=1 (expects env mode 640,
+  fixture produces 600). None is caused by or related to this diff.
+- **Repo gates**: `check-mt-admin.sh` shellcheck-clean over the mt-admin
+  library; `bash -n` clean on every touched script.
 
 ## Findings (new or carried)
 
-- **F1 — Gateway model not following CodeAct (blocking, shared)**: both
-  `openai/gpt-5.2` and `tensorzero::function_name::lunarwing` (kimi-k3
-  variant) return text, not repl blocks, so `create_job` never fires. The
-  TensorZero route DID produce CodeAct tool calls (`time`, `memory_tree`)
-  but stalled on a workspace error before reaching `create_job`. Confirmed
-  on `dash` too. **Next pass**: fix the `memory_tree` workspace error or
-  find a model variant that reliably dispatches `create_job`.
+- **F1 — CLOSED by this pass (was "gateway model not following CodeAct")**:
+  reversed above; the model and engine CodeAct path work, the blocker was
+  the dispatch harness's gate discovery. The correction carries the
+  `/api/chat/pending-gates` endpoint as the discovery contract.
+- **F1a (new) — worker LLM credentials must be provisioned, not inherited
+  by silence**: the old pass provisioned `KIMI_BASE_URL`/`KIMI_MODEL` against
+  the public nano-gpt service without an API key; the first real worker call
+  then died with `provider.auth_error: 401`. mt-admin's `configure-kimi` and
+  `configure-pebble` are the credential path; both are exercised and live.
 - **F2 — RW-4 `volume rm` by partial name (pre-existing, worth a WI)**:
   two sites remove volumes by name with errors suppressed
-  (`11-postgres.sh:219`, `07-units-systemd.sh:1227`). On a shared rootful
+  (`11-postgres.sh:253`, `07-units-systemd.sh:1227`). On a shared rootful
   store, purging `alice` can delete `lunarwing-pg-alice2`. Compare the exact
   name before removing. Default rootless stores are per-tenant and
   unaffected.
@@ -453,51 +483,41 @@ All mt-admin + worker harnesses were re-run on this tree:
   `vision-`, `voice-`, `darkirc-`. Tenant `task-alice`'s pebble bridge
   `lunarwing-pebble-task-alice` collides with tenant `alice`'s pebble task
   container; OpenRC `init.d` names are global.
-- **F4 — `memory_tree` workspace error**: the engine's `memory_tree` tool
-  fails with "workspace tree changed since the previous page; restart from
-  offset 0" even at offset 0 — blocking multi-step CodeAct turns on the
-  TensorZero route. Worth a separate WI.
+- **F4 — STALE (`memory_tree` workspace error)**: not re-observed this
+  pass; dispatches complete in one step via the structured tool call, so
+  the multi-step turn the old pass stalled on never ran.
+- **F6 (new) — the engine's gate-expiry trace pair is misleading**: an
+  expired approval-gate turn emits "No assistant message in thread" +
+  "N text response(s) without code blocks — model may not be following
+  CodeAct prompt", which reads as a model defect but is really "the
+  approval was never posted". A more precise issue category (e.g.
+  `gate_expired_no_approval`) would have saved three passes. Worth a WI.
 
-## Status and STOP report
+## Status
 
-**Item 100 is not fully complete.** The code fix (RW-1/RW-2/RW-3/RW-5) is
-landed, all review findings are addressed, all harnesses are green, and the
-tenant + both workers are up and left running. What is **not** done is the
-complex-task dispatch, because the gateway model (shared with `dash`) does
-not follow the CodeAct contract, so `create_job` never fires and no job can
-be created through the real path.
-
-**STOP / TRIED / BLOCKED BY / RECOMMEND**
-- STOP: 12+ attempts across two model routes (`openai/gpt-5.2` direct and
-  `tensorzero::function_name::lunarwing`), all yielded `response: null` with
-  the engine logging "model may not be following CodeAct prompt"; the
-  TensorZero route produced CodeAct tool calls but stalled on a workspace
-  error before `create_job`. Identical root-cause repeats, not a new error
-  each time.
-- TRIED: both model routes; explicit CodeAct demonstration prompt; raised
-  log level to `debug` to capture the real reason; ruled out the Engine V2
-  output budget (RW-8: `ENGINE_V2_MAX_OUTPUT_TOKENS=8192` = the default);
-  confirmed the workers are healthy and the egress/listener audits are clean;
-  confirmed `dash` fails the same way.
-- BLOCKED BY: the gateway LLM model does not emit the CodeAct ```` ```repl
-  ```` block with a `create_job` call that the engine requires. On the
-  TensorZero route, a `memory_tree` workspace error stalls the turn before
-  `create_job` fires. This is a shared, model-level impasse affecting both
-  `windrider` and `dash`.
-- RECOMMEND: (1) fix the `memory_tree` workspace "tree changed since the
-  previous page" error (F4) so the TensorZero route's multi-step turns can
-  reach `create_job`; or (2) find a model variant in the TensorZero
-  `lunarwing` function's experimentation set that reliably dispatches
-  `create_job`. Then run the six prepared tasks through `dispatch.py` and
-  verify with `verify.py`/`oracles.py`.
-
-The item checkbox stays `[ ]`. Tenant and ports retained; no teardown.
+**Item 100's deliverable is complete**: the tenant `windrider` (WI#273
+non-animal name, OpenRC/podman, uid 1004, port block 10010-10019) runs with
+both external workers on fat toolchain images; all six prepared complex
+tasks completed through the real dispatch path and were independently
+verified with host oracles; the run-271 and run-280 review findings are
+addressed in-tree with mutation-verified pins. The tenant is left running
+and boot-persistent.
 
 ## Commits on this branch
 
 | commit | description |
 | --- | --- |
-| `2b1714899` | fix podman inspect cross-matching worker volume by prefix (the core bug) |
-| `a55aabbf4` | guard PG volume data presence, typed inspects for root-store probes (RW-2, RW-5) |
-| `d5ca84d09` | fix three CI harness stubs for the typed container inspect (RW-1) |
-| `d8206f556` | pin the typed container inspect — static grep + IPC-volume behavioural (RW-3) |
+| `07d7c9a59` | fix podman inspect cross-matching worker volume by prefix (the core bug, carried from !2072) |
+| `d9198d8ce` | guard PG volume data presence, typed inspects for root-store probes (RW-2, RW-5, carried) |
+| `2603628bf` | fix three CI harness stubs for the typed container inspect (RW-1, carried) |
+| `fc3a7fefb` | pin the typed container inspect — static grep + IPC-volume behavioural (RW-3, carried) |
+| `4c5c8fc04` | record findings — code fix landed, gateway model blocked (carried; superseded by later edits) |
+| `67a493db3` | type the root-store PG probe (RZ-2) |
+| `6ac48e0a5` | teach darkirc/kawarimi export shims the typed container inspect (RZ-1) |
+| `e824d6b8d` | normalise study-mcp stub to typed container inspect (RZ-9) |
+| `7d3231963` | widen the typed-inspect pin to every runtime form, pin the task gate behaviourally, type rendered-unit helpers (RZ-4) |
+| `e676dbc42` | harness pinning the PG data-orphan guard probes and decision (RZ-3) |
+| `dd8a81df6` | teach the worker-egress OpenRC runtime stub the typed container inspect (RZ-4 fallout) |
+| `d2658df31` | startup fixture rejects the legacy bare inspect (RZ-4) |
+| `ddc811811` | report — run-280 RZ-1..RZ-9 responses recorded |
+| `e18d9a247` | report — F1 root cause reversed (harness gate discovery, not model) |
