@@ -316,65 +316,85 @@ Built by the prior pass through standard mt-admin in tmux, exit 0:
 
 Both images are still loaded in the tenant rootless store and running.
 
-## Gateway dispatch blocker — confirmed shared model impasse
+## Gateway dispatch blocker — root cause REVERSED by this pass
 
-Both workers are healthy on their published ports (pebble `:20014`,
-kimi `:30010`, both `{"status":"ok"}`), the egress filter is live
-(4 containers exclusively on `lw-egress-windrider`, DNS pinned to
-127.0.0.1, static host `nano-gpt.com:216.150.1.1`, only `tcp dport 443`
-allowed), and the listener audit is clean. The gap is purely that the
-gateway model cannot drive `create_job`.
+**The !2072 F1 diagnosis was wrong.** This pass proved end-to-end that the
+model, the engine's CodeAct path, and `create_job` all work on this host
+today; the blocker was the **dispatch harness's gate discovery**, not the
+model. The full corrected chain:
 
-### Diagnosis (this pass, with debug log level)
+1. **Direct probes** (curl + the engine's real `codeact_preamble.md`/
+   `codeact_postamble.md` system prompt + the full task text): the
+   TensorZero `lunarwing` function reliably emits
+   `finish_reason: tool_calls` with a structured `create_job(...)` call —
+   8/9 attempts across two prompt shapes. The one failure was a 12-token
+   prose-only sample; the model is nondeterministic at the edges but
+   reliably CodeAct-capable.
+2. **Capture proxy** (`/tmp/lw-item100/llm-capture-proxy.py`): a local
+   HTTP capture proxy sat between the daemon and the TensorZero upstream.
+   The daemon's actual outbound request carries the v1 "Agent Instructions"
+   system prompt (not the CodeAct preamble — the bridge adapts engine
+   threads that already hold the v1 surface's system message) plus an
+   OpenAI `tools` array with `create_job` among 59 tools and
+   `tool_choice: auto`. The captured response streams show the model
+   returning text ("I'll delegate this task to the external worker 'kimi'…")
+   **plus** a structured `create_job` tool call in every attempt.
+3. **Engine path executes**: the engine accumulator collects the
+   `ToolCallDelta` chunks into a `from_action_calls` response, the
+   orchestrator's `actions` branch runs `__execute_actions_parallel__`, and
+   `create_job` executes — pausing on the approval gate.
+4. **The gates were invisible to the old harness**: `pending-gates.json`
+   held live `create_job` approval gates (request ids
+   `3132c4c2…` for the `windrider-kimi-fenwick2-a1` turn and
+   `a723a1dc…` for the `windrider-capture-2` turn) — the real pipeline
+   state. The old `dispatch.py` polled the chat history for a
+   `"request_id"` field that never appears there, so approvals were never
+   posted, the turns expired after 30 min, and the engine trace showed the
+   retrospective "No assistant message in thread" (the turn failed before
+   the assistant message was committed) + "1 text response(s) without code
+   blocks" (the model's prose lead-in, which the orchestrator's actions
+   branch appends with `action_calls`). Read together, those two issues
+   described an expired gate turn, not a CodeAct-incapable model.
+5. **Approvals unblock the whole chain**: posting
+   `POST /api/chat/approval` for both live request ids created real jobs
+   immediately, and `action="always"` persists a create_job grant so later
+   dispatches need no approval at all.
 
-The engine logs `routing user input through engine v2` → `__llm_complete__`
-→ `Engine V2 Trace Summary: state=Waiting, tokens=17681, messages=3,
-issues=2` → `WARNING: No assistant message in thread — model may not have
-generated output` → `NOTE: 1 text response(s) without code blocks — model may
-not be following CodeAct prompt` → `Suppressed empty response`.
+The corrected harness uses the dedicated endpoint
+`GET /api/chat/pending-gates` for discovery (item-101 pass-3's proven
+shape) instead of history polling. This is why the item-101
+`pending-gates` discovery correction mattered — the same footgun.
 
-The model (whether `openai/gpt-5.2` directly at `nano-gpt.com/api/v1`, or
-the `tensorzero::function_name::lunarwing` variant which routes 99% to
-`kimi_k3_nanogpt_tee_entry`) returns plain text, not a ```` ```repl ````
-code block, so the engine's CodeAct parser finds no tool call and the turn
-ends in `Waiting` with `response: null`.
+### Correction note on the tenant's daemon and worker models
 
-### RW-8 ruled out
+The old pass also never exercised the worker-side LLM path, so its
+`KIMI_BASE_URL=https://nano-gpt.com/api/v1` survived: the public nano-gpt
+service requires a real bearer key, none was provisioned for the tenant,
+and the first real kimi job therefore failed inside the worker with
+`provider.auth_error: 401 Invalid session`. This pass retargeted the kimi
+lane at the private TensorZero overlay
+(`configure-kimi windrider --base-url http://100.88.232.146:3000/openai/v1
+--model tensorzero::function_name::FrontierCODEK`) — the lane's baked
+default provider per `kimicode4lunarwing/config/config.toml`, which accepts
+any bearer on the private overlay — and recreated the worker containers.
+The daemon's own `LLM_BASE_URL`/`LLM_MODEL` were moved to the same overlay
+(`tensorzero::function_name::lunarwing`) per the old report's own
+recommendation (2): both changes are the documented "edit
+`lunarwing.env` + restart-tenant" operator override path.
 
-`ENGINE_V2_MAX_OUTPUT_TOKENS=8192` = the engine default. The output budget
-is not the cause.
+### What remains of the old F1/F4 findings
 
-### Cross-tenant confirmation
-
-The sibling tenant `dash` (same `tensorzero::function_name::lunarwing`
-model, same TensorZero upstream `http://100.88.232.146:3000/openai/v1`)
-fails the identical way: `response: null`, `state: Failed`, 0 jobs. This is
-a shared model-level impasse, not windrider-specific.
-
-### What was tried
-
-- `openai/gpt-5.2` direct: 8 attempts, all `response: null`, engine logs
-  "model may not be following CodeAct prompt".
-- `tensorzero::function_name::lunarwing`: the kimi-k3 variant **did** emit
-  CodeAct code blocks (engine logs show `Tool call started tool=time` and
-  `tool=memory_tree` succeeded/failed), confirming the engine's CodeAct
-  contract is working and the model CAN follow it. But the turn stalled on
-  a `memory_tree` workspace error ("workspace tree changed since the
-  previous page; restart from offset 0" even at offset 0) and never reached
-  `create_job`.
-- Explicit CodeAct demonstration prompt (with a ```` ```repl ```` example
-  in the user message): still `response: null` on `openai/gpt-5.2`.
-- The `/job <title>` submission-parse path does not help: Engine V2 routes
-  all gateway `UserInput` through `handle_with_engine` before the legacy
-  `handle_job_or_command` path, so slash commands go to the LLM too.
-
-### What remains
-
-The turn stalls on the `memory_tree` workspace error before `create_job`
-fires on the TensorZero route. Fixing that workspace error or finding a
-model variant that reliably emits `create_job` is the next pass's work.
-This is a genuine, shared, model-level impasse — not a configuration decision
-this pass can silently resolve.
+- **F4 (`memory_tree` workspace error)**: not re-observed this pass; the
+  old pass saw it on the kimi-k3 variant's multi-step turn, which this
+  pass did not reproduce (the dispatch completes in one step via the
+  structured tool call). Recorded as stale.
+- **"model may not be following CodeAct prompt" engine trace note**: now
+  understood as the orchestrator's actions-branch assistant message (prose
+  lead-in with `action_calls`) counted by the retrospective classifier on
+  an expired-gate turn. Not a model defect.
+- The `No assistant message in thread` warning fires because an expired
+  gate turn fails before the assistant message is committed to
+  `thread.messages` — a sequencing property of the gate-expiry path.
 
 ## Live health at hand-off
 
