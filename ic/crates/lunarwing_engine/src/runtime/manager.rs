@@ -324,9 +324,29 @@ impl ThreadManager {
         }
         // Adopt a caller-supplied thread id (e.g. the gateway UI's thread_id) so
         // downstream event/SSE routing lands on the thread the client is already
-        // subscribed to. Only honored for genuinely new threads — repeat messages
-        // on an existing thread never reach here (see handle_user_message).
+        // subscribed to.
+        //
+        // WI#502: the id is caller-controlled, so it is an ownership boundary.
+        // A record owned by somebody else is refused here (same shape as the v1
+        // `FORGED_THREAD_ID_ERROR` path) — adopting it would overwrite the
+        // victim's record and register the attacker's live thread under their
+        // id. Overwriting the caller's *own* record stays allowed: the gateway
+        // reuses one UI thread id across turns, so each new turn legitimately
+        // replaces the previous completed thread record of that same user.
         if let Some(pid) = preferred_thread_id {
+            if let Some(existing) = self.store.load_thread(pid).await?
+                && !existing.is_owned_by(&user_id)
+            {
+                debug!(
+                    thread_id = %pid,
+                    user_id = %user_id,
+                    "refusing to adopt a preferred thread id owned by another user"
+                );
+                return Err(EngineError::AccessDenied {
+                    user_id: user_id.clone(),
+                    entity: format!("thread {pid}"),
+                });
+            }
             thread.id = pid;
         }
         // Seed initial orchestrator state (e.g. a mission's trigger_payload).
@@ -1784,6 +1804,125 @@ mod tests {
         if let Some(running) = mgr.running.write().await.remove(&thread_id) {
             running.handle.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn spawn_refuses_a_preferred_thread_id_owned_by_another_user() {
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(MockLlm::text("FINAL(\"ok\")"), Arc::clone(&store));
+        let project = ProjectId::new();
+
+        let mut victim = Thread::new(
+            "victim goal",
+            ThreadType::Foreground,
+            project,
+            "victim",
+            ThreadConfig::default(),
+        );
+        victim.state = ThreadState::Done;
+        let victim_id = victim.id;
+        victim.add_message(ThreadMessage::user("victim private question"));
+        store.save_thread(&victim).await.unwrap();
+        let before = serde_json::to_value(store.load_thread(victim_id).await.unwrap().unwrap())
+            .expect("serialize victim thread");
+
+        let error = mgr
+            .spawn_thread_with_history_and_message(
+                ThreadMessage::user("attacker message"),
+                ThreadType::Foreground,
+                project,
+                ThreadConfig::default(),
+                None,
+                "attacker",
+                Vec::new(),
+                Some(victim_id),
+                None,
+            )
+            .await
+            .expect_err("a foreign preferred thread id must be refused");
+        match error {
+            EngineError::AccessDenied { user_id, entity } => {
+                assert_eq!(user_id, "attacker");
+                assert!(
+                    entity.contains(&victim_id.to_string()),
+                    "the refusal names the collided thread: {entity}"
+                );
+            }
+            other => panic!("expected AccessDenied, got {other:?}"),
+        }
+
+        let after = serde_json::to_value(store.load_thread(victim_id).await.unwrap().unwrap())
+            .expect("serialize victim thread");
+        assert_eq!(after, before, "the victim's thread record is untouched");
+        assert!(
+            !mgr.is_running(victim_id).await,
+            "no live thread was registered under the victim's id"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_adopts_a_preferred_thread_id_the_caller_owns() {
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(MockLlm::text("FINAL(\"ok\")"), Arc::clone(&store));
+        let project = ProjectId::new();
+
+        // The gateway reuses one UI thread id across turns, so overwriting the
+        // caller's own previous record must keep working.
+        let mut mine = Thread::new(
+            "earlier goal",
+            ThreadType::Foreground,
+            project,
+            "alice",
+            ThreadConfig::default(),
+        );
+        mine.state = ThreadState::Done;
+        let id = mine.id;
+        store.save_thread(&mine).await.unwrap();
+
+        let tid = mgr
+            .spawn_thread_with_history_and_message(
+                ThreadMessage::user("next turn"),
+                ThreadType::Foreground,
+                project,
+                ThreadConfig::default(),
+                None,
+                "alice",
+                Vec::new(),
+                Some(id),
+                None,
+            )
+            .await
+            .expect("owning the preferred id allows adoption");
+        assert_eq!(tid, id);
+        assert_eq!(
+            store.load_thread(id).await.unwrap().unwrap().user_id,
+            "alice"
+        );
+        let _ = mgr.join_thread(tid).await;
+    }
+
+    #[tokio::test]
+    async fn spawn_adopts_an_unused_preferred_thread_id() {
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(MockLlm::text("FINAL(\"ok\")"), Arc::clone(&store));
+        let preferred = ThreadId::new();
+
+        let tid = mgr
+            .spawn_thread_with_history_and_message(
+                ThreadMessage::user("fresh"),
+                ThreadType::Foreground,
+                ProjectId::new(),
+                ThreadConfig::default(),
+                None,
+                "alice",
+                Vec::new(),
+                Some(preferred),
+                None,
+            )
+            .await
+            .expect("a free preferred id is adopted");
+        assert_eq!(tid, preferred);
+        let _ = mgr.join_thread(tid).await;
     }
 
     #[tokio::test]

@@ -637,13 +637,27 @@ Enforced controls (opencode2 lane unless noted):
 
    **Rootless Podman first-start keeper (WI#504):** when no worker container is
    running, mt-admin creates `lw-egress-keeper-<tenant>` on that tenant's
-   `lw-egress-<tenant>` network before applying the filter. The root-owned guard
+   `lw-egress-<tenant>` network before applying the filter. Where the tenant's
+   local Podman store holds a `localhost/podman-pause:<tag>` image, creation is
+   pinned to that exact reference via `--infra-image`, so creation and
+   validation agree by construction; on hosts with no local pause image
+   (Podman 6.x's image-less native pause, or a 5.x host that has not prebuilt
+   one) no pin is passed and the native-pause shape check remains the gate.
+   The reference is never invented — a pinned `--infra-image` always names an
+   image the store already holds, and the `LUNARWING_WORKER_EGRESS_INFRA_IMAGE`
+   override is refused unless it is a `localhost/podman-pause:<tag>` reference
+   present locally (WI#516). The derived reference prefers the pause tag built
+   by the running Podman client and falls back to the newest local
+   `localhost/podman-pause:<tag>` when no tag matches (e.g. after a Podman
+   upgrade leaves the previous version's image behind). The root-owned guard
    verifies the keeper's ownership label, single infra-container shape, local
    `localhost/podman-pause:<tag>` image and exclusive network attachment, then
    loads the rules and reads both reject chains in one
    `podman unshare --rootless-netns` session. `--verify` never creates a keeper
    or loads rules; the imperative post-start and the OpenRC/Quadlet paths use
-   the same guard. A non-local infra image is refused and its keeper pod is
+   the same guard. Any infra image that is not a local pause reference with an
+   explicit non-empty tag — including the malformed tag-stripped spelling
+   `localhost/podman-pause:` — is refused and its keeper pod is
    removed. Keep Podman's `infra_image` at its local default; the host must
    have `catatonit` installed so Podman can build/use its local pause image.
    This prerequisite applies on OpenRC/Gentoo as well as systemd hosts.
@@ -1079,7 +1093,18 @@ preflight rejects an older or unreadable Podman version before any image
 prune/build. Docker builds require **BuildKit with buildx installed**; mt-admin
 rejects `DOCKER_BUILDKIT=0` and explicitly sets `DOCKER_BUILDKIT=1` for the
 build. The legacy Docker builder cannot parse the per-RUN isolation flag and
-is unsupported. Sources: Podman
+is unsupported. `upgrade-tenant` also runs this floor check **before it
+stops the tenant** (WI#456): `build_tenant` rebuilds pebble/opencode/kimi
+first, so on a below-floor host the opencode2 gate used to fail only after
+every lane was already down. The probe is `opencode2_builder_supported`
+(non-dieing; `build_opencode2_worker` and the upgrade preflight both consume
+its reason), so the refusal names the operator action and states the tenant
+was not stopped. Both stop paths enforce it: mt-admin's own
+`upgrade-tenant` before `stop_tenant`, and `stop-tenant-for-upgrade` — the
+boundary `ic/scripts/upgrade-tenant.sh` uses before it runs `build-tenant`
+(run-284 review SR-1) — so the external wrapper cannot bypass the check.
+This covers only the opencode2 floor; a kimi/pebble build failure after the
+stop can still strand a tenant, tracked as WI#527. Sources: Podman
 [v4.5.0 go.mod](https://github.com/containers/podman/blob/v4.5.0/go.mod) and
 [v4.4.4 go.mod](https://github.com/containers/podman/blob/v4.4.4/go.mod).
 

@@ -1,3 +1,4 @@
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::gitlab::{GitlabClient, page, project_path, require_nonempty, url_encode};
@@ -693,6 +694,52 @@ pub fn get_pipeline(
     client.request_json("GET", &endpoint, None)
 }
 
+/// Per-page clamp for `list_jobs` (WI#525). Even with typed deserialization,
+/// fewer jobs per page means fewer retained objects and a smaller raw body to
+/// buffer in typical responses. This limits job count, not response bytes or
+/// peak guest memory; the host call still buffers the entire body.
+const LIST_JOBS_MAX_PER_PAGE: u32 = 50;
+
+/// The flat investigation surface of one GitLab CI job (WI#525).
+///
+/// GitLab's full job object nests heavy `pipeline`, `commit`, `runner`,
+/// `user`, `artifacts`, and `project` sub-objects. Deserializing straight into
+/// this type makes `serde` **skip** every unmodelled field while streaming
+/// tokens, avoiding a full parsed job tree in addition to the buffered raw
+/// body. This reduces parse-time allocations, not the raw-body allocation.
+/// Everything dropped here is one `web_url` hop away when present.
+#[derive(Debug, serde::Serialize, Deserialize)]
+struct JobSummary {
+    #[serde(default)]
+    id: Option<u64>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    stage: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    failure_reason: Option<String>,
+    #[serde(default, rename = "ref")]
+    ref_: Option<String>,
+    #[serde(default)]
+    tag: Option<bool>,
+    #[serde(default)]
+    allow_failure: Option<bool>,
+    #[serde(default)]
+    started_at: Option<String>,
+    #[serde(default)]
+    finished_at: Option<String>,
+    #[serde(default)]
+    duration: Option<f64>,
+    #[serde(default)]
+    queued_duration: Option<f64>,
+    #[serde(default)]
+    web_url: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+}
+
 pub fn list_jobs(
     client: &GitlabClient,
     project: &str,
@@ -700,12 +747,24 @@ pub fn list_jobs(
     per_page: u32,
     page_number: u32,
 ) -> Result<Value, String> {
+    let endpoint = jobs_endpoint(project, pipeline_id, per_page, page_number)?;
+    client.request_typed_page::<JobSummary>(&endpoint)
+}
+
+/// Build the `list_jobs` endpoint with the global `page()` clamp applied and
+/// then the tighter WI#525 per-page clamp on top.
+fn jobs_endpoint(
+    project: &str,
+    pipeline_id: u64,
+    per_page: u32,
+    page_number: u32,
+) -> Result<String, String> {
     let (per_page, page_number) = page(per_page, page_number);
-    let endpoint = format!(
+    let per_page = per_page.min(LIST_JOBS_MAX_PER_PAGE);
+    Ok(format!(
         "/projects/{}/pipelines/{pipeline_id}/jobs?per_page={per_page}&page={page_number}",
         project_path(project)?
-    );
-    client.request_json("GET", &endpoint, None)
+    ))
 }
 
 fn validate_choice(field: &str, value: &str, allowed: &[&str]) -> Result<(), String> {
@@ -765,7 +824,7 @@ fn nonempty_optional(value: Option<&str>) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::Map;
+    use serde_json::{Map, json};
 
     use super::{
         project_search_endpoint, require_changes, search_blobs_endpoint, validate_choice,
@@ -862,5 +921,140 @@ mod tests {
             "/projects/35/search?scope=issues&search=refactor&per_page=20&page=2"
         );
         assert!(!issues.contains("ref="));
+    }
+
+    /// WI#525: a full GitLab job object deserializes into `JobSummary` while
+    /// every heavy nested field is skipped without allocation; the retained
+    /// surface carries the CI-triage fields intact.
+    #[test]
+    fn job_summary_skips_heavy_nested_fields_but_keeps_triage_surface() {
+        let full_job = serde_json::json!({
+            "id": 103070,
+            "name": "cargo-deny",
+            "stage": "test",
+            "status": "failed",
+            "failure_reason": "script_failure",
+            "ref": "main",
+            "tag": false,
+            "allow_failure": false,
+            "started_at": "2026-10-30T14:00:00.000Z",
+            "finished_at": "2026-10-30T14:05:00.000Z",
+            "duration": 300.5,
+            "queued_duration": 1.25,
+            "web_url": "https://git.lunarwing.org/lunarwing/lunarwing2/-/jobs/103070",
+            "created_at": "2026-10-30T13:59:00.000Z",
+            "pipeline": {"id": 6843, "project_id": 35, "sha": "d8bcc5262", "web_url": "https://..."},
+            "commit": {"id": "d8bcc5262", "message": "very long message", "author_name": "a"},
+            "runner": {"id": 1, "description": "shared", "tag_list": ["docker"]},
+            "user": {"id": 4, "username": "kageho", "name": "kageho"},
+            "artifacts": [{"file_type": "trace", "size": 123456, "filename": "trace.log"}],
+            "artifacts_file": {"filename": "trace.log", "size": 123456},
+            "runner_manager": {"id": 9, "system_id": "s1"},
+            "project": {"ci_job_token_scope_enabled": false}
+        });
+        let summary: super::JobSummary = serde_json::from_value(full_job).unwrap();
+        assert_eq!(summary.id, Some(103070));
+        assert_eq!(summary.name.as_deref(), Some("cargo-deny"));
+        assert_eq!(summary.status.as_deref(), Some("failed"));
+        assert_eq!(summary.failure_reason.as_deref(), Some("script_failure"));
+        assert_eq!(summary.ref_.as_deref(), Some("main"));
+        assert_eq!(summary.tag, Some(false));
+        assert_eq!(summary.allow_failure, Some(false));
+        assert_eq!(summary.duration, Some(300.5));
+        // Re-serialising yields only the flat surface — the heavy nested
+        // objects are gone, bounding the retained response.
+        let rendered = serde_json::to_value(&summary).unwrap();
+        for key in [
+            "pipeline",
+            "commit",
+            "runner",
+            "user",
+            "artifacts",
+            "project",
+        ] {
+            assert!(rendered.get(key).is_none(), "heavy field {key} retained");
+        }
+        assert_eq!(
+            rendered["web_url"],
+            "https://git.lunarwing.org/lunarwing/lunarwing2/-/jobs/103070"
+        );
+    }
+
+    /// Missing optional triage fields default to `None`.
+    #[test]
+    fn job_summary_tolerates_a_minimal_object() {
+        let summary: super::JobSummary = serde_json::from_value(json!({ "id": 7 })).unwrap();
+        assert_eq!(summary.id, Some(7));
+        assert!(summary.name.is_none());
+        assert!(summary.failure_reason.is_none());
+    }
+
+    /// SO-2: an omitted or null ID must not reject an otherwise usable job.
+    #[test]
+    fn job_summary_tolerates_missing_or_null_id() {
+        for body in [r#"{"name":"partial"}"#, r#"{"id":null,"name":"partial"}"#] {
+            let summary: super::JobSummary = serde_json::from_str(body).unwrap();
+            assert!(summary.id.is_none());
+            assert_eq!(summary.name.as_deref(), Some("partial"));
+            let rendered = serde_json::to_value(summary).unwrap();
+            assert_eq!(rendered.get("id"), Some(&serde_json::Value::Null));
+            assert_eq!(rendered["name"], "partial");
+        }
+        // Optional does not mean accepting an ID with an invalid JSON type.
+        assert!(serde_json::from_str::<super::JobSummary>(r#"{"id":"not-an-id"}"#).is_err());
+    }
+
+    /// A partial job in the middle must preserve the whole page and its order.
+    #[test]
+    fn job_summary_keeps_mixed_page_with_missing_ids() {
+        let body = br#"[
+            {"id":1,"name":"first","status":"success"},
+            {"name":"missing-id","pipeline":{"id":42},"commit":{"message":"ignored"}},
+            {"id":null,"name":"null-id"},
+            {},
+            {"id":5,"name":"last","status":"failed","failure_reason":"script_failure"}
+        ]"#;
+        let summaries: Vec<super::JobSummary> = serde_json::from_slice(body).unwrap();
+        let items = serde_json::to_value(summaries).unwrap();
+        let items = items.as_array().unwrap();
+        assert_eq!(items.len(), 5);
+        assert_eq!(
+            items
+                .iter()
+                .map(|job| job["id"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!(1), json!(null), json!(null), json!(null), json!(5)]
+        );
+        assert_eq!(items[0]["name"], "first");
+        assert_eq!(items[1]["name"], "missing-id");
+        assert_eq!(items[2]["name"], "null-id");
+        assert!(items[3]["name"].is_null());
+        assert_eq!(items[4]["name"], "last");
+        assert_eq!(items[4]["status"], "failed");
+        assert_eq!(items[4]["failure_reason"], "script_failure");
+        assert!(items[1].get("pipeline").is_none());
+        assert!(items[1].get("commit").is_none());
+    }
+
+    /// WI#525: `list_jobs` applies a tighter per-page clamp than the global
+    /// `page()` ceiling, and still encodes the project and rejects page 0.
+    #[test]
+    fn jobs_endpoint_clamps_per_page_and_encodes_project() {
+        let clamped = super::jobs_endpoint("group/project", 6843, 100, 1).unwrap();
+        assert_eq!(
+            clamped,
+            "/projects/group%2Fproject/pipelines/6843/jobs?per_page=50&page=1"
+        );
+        let numeric = super::jobs_endpoint("35", 6842, 20, 3).unwrap();
+        assert_eq!(
+            numeric,
+            "/projects/35/pipelines/6842/jobs?per_page=20&page=3"
+        );
+        // page 0 normalises to page 1.
+        let normalised = super::jobs_endpoint("35", 6842, 0, 0).unwrap();
+        assert_eq!(
+            normalised,
+            "/projects/35/pipelines/6842/jobs?per_page=1&page=1"
+        );
     }
 }
