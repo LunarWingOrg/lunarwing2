@@ -1079,7 +1079,13 @@ preflight rejects an older or unreadable Podman version before any image
 prune/build. Docker builds require **BuildKit with buildx installed**; mt-admin
 rejects `DOCKER_BUILDKIT=0` and explicitly sets `DOCKER_BUILDKIT=1` for the
 build. The legacy Docker builder cannot parse the per-RUN isolation flag and
-is unsupported. Sources: Podman
+is unsupported. `upgrade-tenant` also runs this floor check **before it
+stops the tenant** (WI#456): `build_tenant` rebuilds pebble/opencode/kimi
+first, so on a below-floor host the opencode2 gate used to fail only after
+every lane was already down. The probe is `opencode2_builder_supported`
+(non-dieing; `build_opencode2_worker` and the upgrade preflight both consume
+its reason), so the refusal names the operator action and states the tenant
+was not stopped. Sources: Podman
 [v4.5.0 go.mod](https://github.com/containers/podman/blob/v4.5.0/go.mod) and
 [v4.4.4 go.mod](https://github.com/containers/podman/blob/v4.4.4/go.mod).
 
