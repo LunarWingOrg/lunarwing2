@@ -1,8 +1,8 @@
-# PRE-RELEASE CHECKLIST for LunarWing v2.1.7.0
+# PRE-RELEASE CHECKLIST for LunarWing v2.1.8.0
 
-## Codename: Shiranui (不知火)
+## Codename: UNKNOWN
 
-**Open TODOs (v2.1.7.0) — To be done before release**
+**Open TODOs (v2.1.8.0) — To be done before release**
 
 ~~Old parity~~
 ~~Rares = odd (1, 3, 5, 7, ...)~~
