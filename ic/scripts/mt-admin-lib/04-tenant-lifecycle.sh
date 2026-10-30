@@ -1621,6 +1621,16 @@ upgrade_tenant_locked() {
   if [[ "$INIT_SYSTEM" == openrc ]] && tenant_proxy_enabled "$name"; then
     validate_openrc_proxy_env "$name" || die "proxy validation failed; tenant was not stopped"
   fi
+
+  # WI#456: preflight the opencode2 builder floor while the tenant still runs.
+  # build_tenant rebuilds pebble/opencode/kimi first and only then reaches the
+  # opencode2 build gate, so a below-floor builder used to surface after
+  # stop_tenant had already taken every lane down. Refuse here instead.
+  if tenant_worker_enabled "$name" opencode2; then
+    opencode2_builder_supported \
+      || die "$OPENCODE2_BUILDER_FLOOR_PROBLEM; tenant '$name' was not stopped"
+  fi
+
   stop_tenant "$name" || die "stop failed; not upgrading '$name'"
 
   say "checking out $target at $target_commit (as $name) ..."
