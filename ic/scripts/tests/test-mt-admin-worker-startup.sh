@@ -82,12 +82,15 @@ read_tenant_env_value() { :; }
 resolve_worker_auth_token() { [[ "$failure_mode" != auth ]] || return 1; printf fixture-token; }
 write_tenant_file_atomic() { cat >"$2"; }
 _ctr() {
-  local lane verb="$2"
+  local lane typed=0 verb="$2"
   # `_ctr_inspect` wraps this as `<runtime> container inspect ...`; keep the
   # fixture's single-verb dispatch working and pin that the typed subcommand is
   # what the real helper sends (a bare `inspect` would regress the volume-name
-  # prefix collision the wrapper exists to avoid).
+  # prefix collision the wrapper exists to avoid). The bare form is REJECTED
+  # here (RZ-4/run-280): a production caller reverting to a generic inspect
+  # must fail loudly in this fixture, not silently "succeed".
   if [[ "$verb" == container ]]; then
+    typed=1
     shift 2
     verb="$1"
     [[ "$verb" == inspect ]] || fail "typed container wrapper used for '$verb'"
@@ -104,8 +107,18 @@ _ctr() {
       if [[ " $refused " == *" $lane "* ]]; then printf '12345:12345\n';
       else local uid; uid="$(worker_task_uid "$lane")"; printf '%s:%s\n' "$uid" "$uid"; fi ;;
     inspect)
-      [[ "$failure_mode" == none || "$*" != *lunarwing-kimi-alice* ]] || return 1
-      printf 'true\n' ;;
+      if [[ "$typed" == 1 ]]; then
+        # Typed container inspect: model "bridge container exists" for the
+        # kimi bridge under test only when not in a failure mode.
+        [[ "$failure_mode" == none || "$*" != *lunarwing-kimi-alice* ]] || return 1
+        printf 'true\n'
+      else
+        # Legacy bare inspect: fail loudly — the store model here has no
+        # cross-object prefix resolution, so silently answering "true" would
+        # hide exactly the regression the pins below exist to catch.
+        fail "legacy bare _ctr inspect reached the fixture: $*"
+        return 1
+      fi ;;
     run)
       record run:kimi
       [[ "$failure_mode" != runtime ]] || return 125 ;;
