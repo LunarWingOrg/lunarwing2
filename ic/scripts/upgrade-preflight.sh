@@ -200,8 +200,8 @@ assess_tenant() {
   # --- THE critical check: where does the live PG data live? ---
   local pg="lunarwing-pg-$name"
   local root_state rootless_state
-  root_state="$(probe podman inspect -f '{{.State.Running}}' "$pg" || true)"   # root store
-  rootless_state="$(probe _tctr "$name" inspect -f '{{.State.Running}}' "$pg" || true)"
+  root_state="$(probe podman container inspect -f '{{.State.Running}}' "$pg" || true)"   # root store
+  rootless_state="$(probe _tctr "$name" container inspect -f '{{.State.Running}}' "$pg" || true)"
 
   if [[ "$RUNTIME" == podman && "$KEEP_ROOTFUL" == false ]]; then
     if [[ -n "$root_state" ]]; then

@@ -59,6 +59,16 @@ _ctr_inspect() {
   _ctr "$name" container inspect "$@"
 }
 
+# Run the container runtime against ROOT's store (no tenant sudo drop). Used
+# only for the legacy v1.1.0 rootful-data probes (the data-orphan guard in
+# 11-postgres.sh and friends); everything per-tenant must go through `_ctr`.
+# Typed subcommands only: a generic `inspect` here would cross-match root-store
+# volumes/pods by prefix, the hazard `_ctr_inspect` removes for tenant calls.
+_root_ctr() {
+  ensure_container_runtime
+  "$CONTAINER_RT" "$@"
+}
+
 # Podman delegates periodic healthcheck scheduling to systemd timers. On OpenRC,
 # image-defined healthchecks therefore remain "starting" forever even while the
 # generated OpenRC units' active endpoint probes report healthy. Disable only

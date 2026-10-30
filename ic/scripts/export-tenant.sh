@@ -484,11 +484,11 @@ pick_runtime() {
   # First try root-visible containers (rootful docker/podman)
   for rt in podman docker; do
     command -v "$rt" >/dev/null 2>&1 || continue
-    "$rt" inspect "$PG" >/dev/null 2>&1 && { echo "$rt"; return 0; }
+    "$rt" container inspect "$PG" >/dev/null 2>&1 && { echo "$rt"; return 0; }
   done
   # Fall back to rootless podman as the tenant user
   if command -v podman >/dev/null 2>&1; then
-    _ctr podman inspect "$PG" >/dev/null 2>&1 && { echo "podman"; return 0; }
+    _ctr podman container inspect "$PG" >/dev/null 2>&1 && { echo "podman"; return 0; }
   fi
   return 1
 }
@@ -535,7 +535,7 @@ fi
 
 # Determine if the tenant's containers are rootless (need _ctr wrapper).
 _is_rootless() {
-  "$RUNTIME" inspect "$PG" >/dev/null 2>&1 && return 1 || return 0
+  "$RUNTIME" container inspect "$PG" >/dev/null 2>&1 && return 1 || return 0
 }
 
 SRC_VER="$(sudo -u "$TENANT" git -C "$LWROOT" describe --tags --always 2>/dev/null || echo unknown)"
@@ -607,12 +607,12 @@ if $DRY_RUN; then
 else
   ROOTLESS="$(_is_rootless && echo true || echo false)"
   if [[ "$ROOTLESS" == "true" ]]; then
-    _ctr podman inspect -f '{{.State.Running}}' "$PG" 2>/dev/null | grep -q true \
+    _ctr podman container inspect -f '{{.State.Running}}' "$PG" 2>/dev/null | grep -q true \
       || die "DB container $PG is not running — start just the PG container so pg_dump can run, then re-export"
     ( umask 077; _ctr podman exec "$PG" pg_dump -U "$PG_ROLE" -Fc "$PG_DB" > "$WORK/db.dump" ) \
       || die "pg_dump failed (role=$PG_ROLE db=$PG_DB) — check the names parsed from DATABASE_URL"
   else
-    "$RUNTIME" inspect -f '{{.State.Running}}' "$PG" 2>/dev/null | grep -q true \
+    "$RUNTIME" container inspect -f '{{.State.Running}}' "$PG" 2>/dev/null | grep -q true \
       || die "DB container $PG is not running — start just the PG container so pg_dump can run, then re-export"
     ( umask 077; "$RUNTIME" exec "$PG" pg_dump -U "$PG_ROLE" -Fc "$PG_DB" > "$WORK/db.dump" ) \
       || die "pg_dump failed (role=$PG_ROLE db=$PG_DB) — check the names parsed from DATABASE_URL"
