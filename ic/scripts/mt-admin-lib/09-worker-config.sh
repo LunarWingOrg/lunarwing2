@@ -2098,8 +2098,7 @@ stop_tenant_opencode() {
   local container_name="lunarwing-opencode-$name"
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "openrc" && -f "/etc/init.d/${container_name}" ]]; then
-    _deregister_babysitter "$container_name"
-    _openrc_service "$container_name" stop >/dev/null 2>&1 || true
+    _openrc_stop_worker_nondestructive "$container_name"
     say "opencode worker stopped ($container_name)"
   elif [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
       && podman_supports_quadlet; then
@@ -2316,8 +2315,7 @@ stop_tenant_opencode2() {
   local container_name="lunarwing-opencode2-$name"
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "openrc" && -f "/etc/init.d/${container_name}" ]]; then
-    _deregister_babysitter "$container_name"
-    _openrc_service "$container_name" stop >/dev/null 2>&1 || true
+    _openrc_stop_worker_nondestructive "$container_name"
     say "opencode2 worker stopped ($container_name)"
   elif [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
       && podman_supports_quadlet; then
@@ -2760,8 +2758,7 @@ stop_tenant_kimi() {
   local container_name="lunarwing-kimi-$name"
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "openrc" && -f "/etc/init.d/${container_name}" ]]; then
-    _deregister_babysitter "$container_name"
-    _openrc_service "$container_name" stop >/dev/null 2>&1 || true
+    _openrc_stop_worker_nondestructive "$container_name"
     say "kimi worker stopped ($container_name)"
   elif [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
       && podman_supports_quadlet; then
@@ -2976,8 +2973,7 @@ stop_tenant_pebble() {
   local container_name="lunarwing-pebble-$name"
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "openrc" && -f "/etc/init.d/${container_name}" ]]; then
-    _deregister_babysitter "$container_name"
-    _openrc_service "$container_name" stop >/dev/null 2>&1 || true
+    _openrc_stop_worker_nondestructive "$container_name"
     say "pebble worker stopped ($container_name)"
   elif [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
       && podman_supports_quadlet; then

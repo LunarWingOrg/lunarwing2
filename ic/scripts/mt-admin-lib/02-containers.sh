@@ -305,6 +305,22 @@ _register_babysitter() {
   _openrc_service "${container}-sup" start >/dev/null 2>&1 || true
 }
 
+# Stop a worker's OpenRC services (container + babysitter) without removing
+# the init scripts. Used by stop_tenant_<worker> during restart_tenant: the
+# init scripts must survive so start_tenant can re-register and start them
+# even when the image-contract check refuses (WI#486). The destructive
+# deletion (stop + boot-disable + rm) is reserved for explicit operator
+# stop_worker/kill_worker via _deregister_babysitter + openrc_worker_stop_disable.
+_openrc_stop_worker_nondestructive() {
+  local container="$1"
+  ensure_init_system
+  [[ "$INIT_SYSTEM" == "openrc" ]] || return 0
+  if [[ -f "/etc/init.d/${container}-sup" ]]; then
+    _openrc_service "${container}-sup" stop >/dev/null 2>&1 || true
+  fi
+  _openrc_service "$container" stop >/dev/null 2>&1 || true
+}
+
 # Deregister a babysitter unit (stop + boot-disable + remove).
 _deregister_babysitter() {
   local container="$1"
