@@ -1600,6 +1600,13 @@ Wraps the `Workspace` as the engine's `Store` trait:
   projects, docs, leases, missions, and conversations, including evidence-checked
   insight writes. Shared-scope helpers can use Store defaults; global thread and
   mission enumeration use the store's own maps so orphan-project rows remain visible.
+- **Thread ownership on write (WI#502).** `save_thread` is a keyed write
+  (`thread_path(thread.id)`), so it refuses to replace a record whose owner is a
+  different real user — the durable half of the forged-`thread_id` boundary,
+  independent of which caller reaches it. Same-owner rewrites stay allowed (the
+  gateway reuses one UI thread id across turns), as does stamping the serde
+  default `legacy` owner that `migrate_legacy_user_ids` rewrites at boot, and
+  shared-owner records.
 - In-memory `HashMap` caches backed by workspace files under `engine/`
 - Human-readable knowledge/orchestrator files plus JSON runtime state under
   `engine/.runtime/`
