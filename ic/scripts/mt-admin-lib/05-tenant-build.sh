@@ -1355,6 +1355,28 @@ _verify_opencode2_image_out_of_band() (
   say "out-of-band verify: $image_ref passes the shared tar/config exposure policy"
 )
 
+# Builder capability floor for the opencode2 image's inline `RUN --network=none`
+# smoke step. Kept separate from build_opencode2_worker so upgrade-tenant can
+# preflight it BEFORE stopping the tenant (WI#456): on a host below the floor
+# the build's own die fires only after pebble/opencode/kimi images are rebuilt
+# and the tenant is already stopped, stranding every lane. Dies with an
+# actionable diagnostic when the active builder is below the floor.
+opencode2_builder_supported() {
+  ensure_container_runtime
+  if [[ "$CONTAINER_RT" == "podman" ]]; then
+    podman_supports_run_network \
+      || die "opencode2 worker builds require Podman >= 4.5 (Buildah >= 1.30) for RUN --network=none; upgrade Podman before rebuilding"
+    return 0
+  fi
+  case "${DOCKER_BUILDKIT:-1}" in
+    1|true|True|TRUE|t|T) ;;
+    *) die "opencode2 worker builds require Docker BuildKit for RUN --network=none; enable DOCKER_BUILDKIT=1 (legacy builder unsupported)" ;;
+  esac
+  docker buildx version >/dev/null 2>&1 \
+    || die "opencode2 worker builds require Docker BuildKit with the buildx plugin; install buildx before rebuilding"
+  return 0
+}
+
 build_opencode2_worker() {
   local no_cache="${1:-false}"
   local with_toolchains="${2:-false}"
@@ -1363,18 +1385,7 @@ build_opencode2_worker() {
 
   [[ -d "$opencode2_dir" ]] || die "opencode2 worker dir not found at $opencode2_dir"
 
-  ensure_container_runtime
-  if [[ "$CONTAINER_RT" == "podman" ]]; then
-    podman_supports_run_network \
-      || die "opencode2 worker builds require Podman >= 4.5 (Buildah >= 1.30) for RUN --network=none; upgrade Podman before rebuilding"
-  else
-    case "${DOCKER_BUILDKIT:-1}" in
-      1|true|True|TRUE|t|T) ;;
-      *) die "opencode2 worker builds require Docker BuildKit for RUN --network=none; enable DOCKER_BUILDKIT=1 (legacy builder unsupported)" ;;
-    esac
-    docker buildx version >/dev/null 2>&1 \
-      || die "opencode2 worker builds require Docker BuildKit with the buildx plugin; install buildx before rebuilding"
-  fi
+  opencode2_builder_supported
 
   local toolchain_desc="slim (no toolchains)"
   [[ "$with_toolchains" == "true" ]] && toolchain_desc="fat (with Rust/Go/C++ toolchains)"

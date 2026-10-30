@@ -1611,6 +1611,18 @@ upgrade_tenant_locked() {
   if [[ "$INIT_SYSTEM" == openrc ]] && tenant_proxy_enabled "$name"; then
     validate_openrc_proxy_env "$name" || die "proxy validation failed; tenant was not stopped"
   fi
+
+  # WI#456: preflight the opencode2 builder floor BEFORE stopping the tenant.
+  # build_tenant rebuilds pebble/opencode/kimi first and only then hits
+  # build_opencode2_worker's Podman >= 4.5 / BuildKit gate; without this check
+  # a below-floor host aborts the upgrade after the tenant is already stopped,
+  # leaving pebble/opencode down and the kimi/opencode2 images missing/refused
+  # (the barracuda inttest regression). Fail fast here while still running.
+  if tenant_worker_enabled "$name" opencode2; then
+    opencode2_builder_supported \
+      || die "opencode2 worker cannot be rebuilt on this host; tenant was not stopped"
+  fi
+
   stop_tenant "$name" || die "stop failed; not upgrading '$name'"
 
   say "checking out $target at $target_commit (as $name) ..."
