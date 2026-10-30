@@ -10224,6 +10224,90 @@ pub(crate) mod tests {
         *lock.write().await = None;
     }
 
+    // ── WI#502: forged gateway thread id ────────────────────────
+
+    /// The gateway router hands the caller-supplied `thread_id` straight to the
+    /// engine as `preferred_thread_id`. A second user sending with the first
+    /// user's UUID must be refused and the victim's record left byte-identical
+    /// (WI#502 acceptance, exercised through the same
+    /// `conversation_manager.handle_user_message` entry the router uses).
+    #[tokio::test]
+    async fn forged_gateway_thread_id_cannot_overwrite_another_users_thread() {
+        let store = Arc::new(TestStore::new());
+        let state = make_interrupt_test_state(Arc::clone(&store));
+        let project_id = state.default_project_id;
+
+        let mut victim = lunarwing_engine::Thread::new(
+            "victim goal",
+            lunarwing_engine::ThreadType::Foreground,
+            project_id,
+            "victim",
+            ThreadConfig::default(),
+        );
+        victim.state = lunarwing_engine::ThreadState::Done;
+        victim.add_message(lunarwing_engine::ThreadMessage::user("victim private"));
+        let victim_id = victim.id;
+        store.save_thread(&victim).await.unwrap();
+        let before = serde_json::to_value(store.load_thread(victim_id).await.unwrap().unwrap())
+            .expect("serialize victim thread");
+
+        let attacker_conv = state
+            .conversation_manager
+            .get_or_create_conversation("gateway:attacker-thread", "attacker")
+            .await
+            .unwrap();
+        // Exactly what the router derives from the gateway message scope
+        // (`parse_engine_thread_id(message.conversation_scope())`).
+        let forged = IncomingMessage::new("gateway", "attacker", "attacker message")
+            .with_conversation_scope(&victim_id.to_string());
+        let preferred_thread_id = parse_engine_thread_id(forged.conversation_scope());
+        assert_eq!(preferred_thread_id, Some(victim_id));
+
+        let error = state
+            .conversation_manager
+            .handle_user_message(
+                attacker_conv,
+                "attacker message",
+                project_id,
+                "attacker",
+                ThreadConfig::default(),
+                preferred_thread_id,
+            )
+            .await
+            .expect_err("a forged gateway thread_id must be refused");
+        assert!(
+            matches!(error, lunarwing_engine::EngineError::AccessDenied { .. }),
+            "expected AccessDenied, got {error:?}"
+        );
+
+        let after = serde_json::to_value(store.load_thread(victim_id).await.unwrap().unwrap())
+            .expect("serialize victim thread");
+        assert_eq!(
+            after, before,
+            "the victim's thread record is byte-identical"
+        );
+        assert!(
+            !state.thread_manager.is_running(victim_id).await,
+            "no live thread may be registered under the victim's id"
+        );
+
+        // The attacker still gets a working (fresh) thread for the same turn.
+        let fresh = state
+            .conversation_manager
+            .handle_user_message(
+                attacker_conv,
+                "attacker message",
+                project_id,
+                "attacker",
+                ThreadConfig::default(),
+                None,
+            )
+            .await
+            .expect("the attacker's own turn still proceeds");
+        assert_ne!(fresh, victim_id);
+        let _ = state.thread_manager.stop_thread(fresh, "attacker").await;
+    }
+
     #[tokio::test]
     async fn completed_thread_gate_makes_scoped_engine_state_interruptible() {
         let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
