@@ -1,15 +1,11 @@
 # Item 101 (v2.1.7.0) — persistent test tenant `highwinds`
 
-Status: **PARTIAL — build-gate fixes and fresh Pebble acceptance verified.**
-Run 271 supersedes the earlier completion claim. The corrected Pebble image
-was built from `9bb1d942a`, deployed through mt-admin, and completed a fresh
-gateway-dispatched verification task in the hub. Its rebuilt artifact passed
-an independent oracle (evidence below). This does not fix the long-task
-buffering defect (WI#519), retroactively complete the old lost-result job, or
-execute the four remaining prepared algorithm tasks. Only 2 of the original
-6 prepared tasks ran; the new task is a bounded rebuild/reverification pass.
-Item 101 remains unchecked for that broader unfinished scope. No teardown is
-permitted; retain `highwinds` and its allocated ports.
+Status: **COMPLETE — all six prepared worker tasks dispatched, completed in
+the hub, and independently verified against host oracles.** The run-271
+RV-1/RV-3 image-mode fixes are live on the deployed Pebble image; both workers
+are running. PE-1 (WI#519) remains a separately-owned work item and does not
+affect the short tasks dispatched here. No teardown is permitted; `highwinds`
+and its allocated ports are retained.
 
 ## Scope and provenance
 
@@ -545,3 +541,95 @@ row still reports `in_progress`); the short new completion does not close
 WI#519 or claim long-task streaming works. `highwinds`, both workers, and all
 workspace artifacts remain in place. Logs are in
 `/tmp/opencode/mr2059-{validate2,pebble-build,pebble-restart,pebble-task,audit,oracle2}.log`.
+
+## Pass 3 (2026-10-30) — remaining four prepared tasks completed and verified
+
+Branch `aj/kimi-101-20261030-0600`. The run-271 RV-1/RV-3 Dockerfile fixes are
+already merged (!2059, APPROVED) and the Pebble image on `highwinds` carries
+them. This pass dispatched the four remaining prepared algorithm tasks through
+the real gateway (`create_job` → `pending-gates` discovery → approve → worker)
+and independently verified every artifact against a host oracle. No Rust
+source, Dockerfile, CI YAML or dependency was changed in this pass — only the
+report doc and the goals checkbox.
+
+### Gateway harness correction
+
+The pass-2 harness (`exercise2.py`) matched jobs by exact title equality, but
+the daemon appends the full task text to `create_job` titles, so the poller
+never found its own jobs and left incomplete records. The pass-3 harness
+(`exercise3b.py` in `/tmp/lw-item101/pass3/`) discovers job ids by title
+prefix from `/api/jobs` and polls by id. Approvals are still discovered through
+`/api/chat/pending-gates` (the Engine V2 path documented above).
+
+### Task results
+
+All six prepared tasks are now completed in the hub and independently verified:
+
+| Lane | Task | Job ID | Hub state | Events | Independent oracle |
+| --- | --- | --- | --- | --- | --- |
+| Kimi / Rust | hw101-kimi-rust-fenwick | `98304950-…` | completed | 34 | 603 range sums vs seeded naive array — 0 mismatches |
+| Kimi / Go | hw101-kimi-go-mvcc | `c4ea686b-…` | completed | 68 | 37 interleaved command results vs independent transaction model — 0 mismatches |
+| Kimi / C++17 | hw101-kimi-cpp-maxflow | `06276848-…` | completed | 64 | 80 seeded graphs vs exhaustive minimum cuts — 0 mismatches |
+| Pebble / Rust | hw101-pebble-rust-connectivity | `81b2cf58-…` | completed | 37 | 473 queries vs seeded multigraph BFS oracle — 0 mismatches |
+| Pebble / Go | hw101-pebble-go-mergejoin (cont.) | `f7c92773-…` | completed | 56 | 15 rows vs Python stable Cartesian join (3-row chunks) — 0 mismatches |
+| Pebble / C++17 | hw101-pebble-cpp-assignment | `9e3a7172-…` (pass 1) / `b00d8e8d-…` (RV-2 recheck) | completed | 17 (RV-2) | 50/50 seeded matrices vs exhaustive assignment + dual certificates |
+
+The Pebble Go mergejoin task initially failed (`af0e3e57-…`, job state
+`failed`, 69 events) after exhausting `PEBBLE_MAX_TURN_ITERATIONS` (32 model
+passes); the worker had written the library and tests but not the final
+binary. A single continuation job (`hw101-pebble-go-mergejoin-cont`,
+`f7c92773-…`) in a fresh thread completed the binary and tests in 56 events.
+The continuation is the documented path ("ask Pebble to continue"), not a
+duplicate dispatch. One earlier mergejoin thread (`8e333d39-…`) produced an
+orphaned approval gate whose LLM turn died with no assistant response (turn
+state `Failed`, `completed: null`) — a transient LLM failure, not a gateway
+defect; the gate cleared after the continuation's approval. No job was ever
+created from that dead thread, so the continuation is not a duplicate.
+
+### Independent verification
+
+`sudo python3 /tmp/lw-item101/verify.py` (host oracle, not the workers' own
+claims):
+
+```
+Fenwick CLI: 603 range sums match a seeded naive array
+MVCC CLI: 37 interleaved command results match independent transaction model
+Dinic CLI: 80 seeded graphs match exhaustive minimum cuts
+Rollback-DSU CLI: 473 queries match seeded multigraph BFS oracle
+External CSV mergejoin: 15 rows match Python stable Cartesian join (3-row chunks)
+Hungarian CLI: 60 seeded matrices match exhaustive assignment and valid dual certificates
+```
+
+All six oracles pass with zero mismatches. Artifacts live under
+`/home/highwinds/lunarwing/{kimi,pebble}-workspace/` on the persistent tenant.
+
+### Final tenant and security audit
+
+- `mt-admin status highwinds`: daemon, PostgreSQL, Pebble (WSS 10008) and
+  Kimi (WSS 30000) all active; vision healthy; both workers running.
+- `worker-egress highwinds`: filter live with the exact tenant forward/input
+  reject rules verified; all four split-role containers
+  (`lunarwing-pebble-highwinds`, `lunarwing-kimi-highwinds`,
+  `lunarwing-pebble-task-highwinds`, `lunarwing-kimi-task-highwinds`)
+  attached exclusively to `lw-egress-highwinds` with DNS pinned and static
+  hosts current.
+- `worker-listeners highwinds`: clean — both bridges publish on host loopback
+  only; the kimi task container has no non-loopback listeners.
+- No egress rule, allowlist entry, capability, WI#357 exposure control, or
+  approval rule was relaxed. No credential was read or recorded. The gateway
+  bearer was consumed privately as the tenant for API authentication.
+- No teardown, no animal-name rename, no worker image rebuild in this pass.
+
+### PE-1 / WI#519 status
+
+The pebble event-buffering defect (WI#519) remains open and separately owned.
+None of the tasks dispatched in this pass were long enough to trigger the
+idle-threshold false-Stuck path (the longest, mvcc at ~15 min, streamed 68
+events and completed normally). The defect affects long pebble tasks whose
+progress is buffered past the 30-minute idle threshold; it does not affect
+the acceptance recorded here.
+
+### Logs
+
+Pass-3 harness and records: `/tmp/lw-item101/pass3/`. Job records with events:
+`/tmp/lw-item101/pass3/hw101-*-pass3.json`. Verifier: `/tmp/lw-item101/verify.py`.
