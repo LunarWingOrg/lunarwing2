@@ -442,6 +442,11 @@ _openrc_service() {
   # worker, sidecar and cron operations which can also trigger a deptree rebuild.
   # 125 is a refused operation, never an OpenRC service state.
   require_safe_openrc_proxy_units || return 125
+  # WI#505: rc-service and supervise-daemon start as children of mt-admin, so
+  # they inherit the tenant lifecycle lock descriptor and would keep the flock
+  # held for their whole lifetime. Drop the descriptor before exec; the lock
+  # is then released when mt-admin exits, even on a die() inside the lock.
+  scrub_active_lifecycle_lock_fd
   rc-service "$@"
 }
 
