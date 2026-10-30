@@ -3,9 +3,10 @@
 ## Scope and status
 
 This is the v2.1.7.0 item-100 pass on branch
-`rarity/kimi-100-20261030-0600`, continuing the earlier
-`rarity/kimi-100-20261029-1936` pass (MR !2060, closed/rejected — run-271
-review findings RW-1..RW-9). Started 2026-10-30 by Rarity. No subagents are used.
+`rarity/kimi-100-20261030-1630`, continuing the closed MR !2072
+(`rarity/kimi-100-20261030-0600`, rejected by run-280 with findings
+RZ-1..RZ-9, which itself continued the !2060/run-271 pass). Started
+2026-10-30 by Rarity. No subagents are used.
 
 The deliverable is a **new** tenant with kimi and pebble external workers,
 full toolchains, complex tasks executed through the real worker dispatch path,
@@ -20,18 +21,162 @@ item 101's (`highwinds`, `silverzoom`) or their results.
 
 ### What this pass landed
 
-This pass re-landed the rejected !2060's core code fix (the `_ctr_inspect`
-typed-container-inspect bug fix) and addressed every blocking and applicable
-review finding from the run-271 adversarial review. The tenant, toolchains,
-and both workers were already provisioned and running from the prior pass;
-this pass's work is the code fix + review response + gateway-blocker
-diagnosis, not a re-provision.
+This pass re-landed the !2072 payload (the `_ctr_inspect`
+typed-container-inspect fix plus the run-271 responses) onto the current
+target and addressed every run-280 finding RZ-1..RZ-9. The tenant,
+toolchains, and both workers were already provisioned and running from the
+prior passes; this pass's work is the payload re-land + run-280 review
+response + the gateway-dispatch diagnosis, not a re-provision.
 
-## Run-271 review findings — all addressed
+## Run-280 review findings — all addressed
+
+The closed MR !2072 was rejected by run-280 (reviewer fable, note #12920)
+with findings RZ-1 (High, blocking) through RZ-9 (Info). Every finding is
+addressed in-tree here; the item stays `[ ]` because the complex-task
+dispatch through the real gateway path remains model-blocked (below).
+
+### RZ-1 (High, blocking) — two export-shims broke outside the re-run subset
+
+The typed `container inspect` in `export-tenant.sh` (`:487`, `:491`, `:538`,
+`:610`, `:615`) reaches two harness shims that only dispatched the legacy
+bare `inspect`:
+
+- `test-darkirc-migration-safeguards.sh` — its PATH `podman` shim's default
+  arm exited 0 for `container inspect <pg>`, so `pick_runtime` selected
+  podman, `_is_rootless` read rootful, and the `:615`
+  `container inspect -f '{{.State.Running}}'` probe printed nothing —
+  `grep -q true` failed and the export died
+  "DB container lunarwing-pg-alpha is not running" (CI failures:
+  "export fixture completed", "partial final archive starts owner-only").
+- `test-kawarimi-import-flags.sh` — same shape on its `docker` shim
+  (CI failure: "production export writes an encrypted archive").
+
+Both shims now handle the typed form alongside the legacy one, and both
+harnesses pass at this head (`ALL TESTS PASSED` each). The **whole**
+`ic/scripts/tests/` directory was then re-run per the review's ask — see the
+verification section; every harness in the directory was executed, not just
+the mt-admin/worker subset.
+
+### RZ-2 (Medium) — `_root_store_pg_container_present` still generic
+
+`11-postgres.sh:45` used `_root_ctr inspect` while its own comment, the
+`_root_ctr` contract ("typed subcommands only") and the RW-5 claim all said
+`container inspect`. The scenario the review named (rootless data absent +
+a root-store *object* whose name starts with `lunarwing-pg-<t>` that is not
+a container) would make the generic inspect exit 0 and fire the DATA-ORPHAN
+guard on a container that does not exist. Fixed to
+`_root_ctr container inspect "$container_name"` (commit `67a493db3`).
+
+### RZ-3 (Medium) — the RW-2 guard was untested
+
+New harness `ic/scripts/tests/test-mt-admin-pg-data-orphan-guard.sh` pins
+both probes and the guard decision:
+
+- `_rootless_pg_data_present`: empty store → absent; container → present;
+  exact-name volume → present (the Quadlet `--rm` restart case); **prefix
+  volume** (`lunarwing-pg-<t>2` exists, `lunarwing-pg-<t>` does not) →
+  absent, because `volume inspect` returns the longer name and the guard
+  compares `{{.Name}}` for equality.
+- `_root_store_pg_container_present`: a root-store *volume* named
+  `lunarwing-pg-<t>-rollback` does NOT satisfy the probe (the RZ-2 typed
+  form), a real root container does.
+- The full `start_tenant_postgres` guard decision runs in a child bash
+  (die() exits its shell by design): it dies exactly in the
+  rootless-absent + root-container window, is silenced by
+  `LUNARWING_MT_ACK_ROOTLESS_FLIP`, does not fire when the exact-name
+  rootless volume exists (RW-2 fix holds), and never fires on a fresh
+  tenant.
+
+Mutation-verified: the `{{.Name}}` equality replaced by a non-empty test
+fails the prefix case; inverting both probes fails three cases; reverting
+the typed root-store probe to generic inspect fails the root-volume case
+and re-fires the guard on a fresh tenant. All mutants killed; the library
+file restored byte-identical after each run.
+
+### RZ-4 (Medium) — pins widened to every runtime form
+
+- **Static pin widened**: the old regex only matched `_ctr "<var>" inspect`
+  (missing brace forms, `$1`, uppercase, wrapped calls, `_root_ctr`, `tctr`,
+  bare `podman`/`docker`). The pin now greps every `inspect` in
+  `mt-admin-lib/` and rejects any that is not a typed subcommand
+  (`container|image|volume|network|pod inspect`), excluding comments,
+  prose die-messages and the `_worker_inspect_absent` helper name. To make
+  the lib clean under the widened pin, the four rendered-unit health probes
+  (`_vis`/`_voice`/`_pg` in `08-units-openrc.sh`, `_wk` in
+  `09-worker-config.sh:313`) are typed as well — they were the last generic
+  runtime inspects in the library.
+- **Task gate pinned behaviourally**: a third pin in
+  `test-mt-admin-worker-startup.sh` models the same store shape for
+  `start_worker_task_container` (generic `inspect <task>` prefix-resolves
+  to the task's own `-ipc-v2` volume; typed `container inspect` reports
+  absent) and requires `run -d --name <task-container>` for all four lanes.
+- **Stubs reject the legacy form**: the startup harness's main `_ctr`
+  fixture now fails loudly on a bare `inspect` (the typed arm still models
+  the bridge-exists case), and the lifecycle harness's gate stub
+  (`[[ "$2" != inspect ]]`) plus its `assert_no_call "ctr:… inspect …"`
+  assertions already refused it.
+- **Fallout fixed**: `test-worker-egress.sh`'s OpenRC unit runtime stub
+  only handled the legacy form, so typing `_wk` broke its
+  "OpenRC start passes pre/post guards" case — the stub now dispatches the
+  typed form too (144 PASS / 1 SKIP again).
+
+Mutation-verified on the widened pin: a brace-form revert of the egress
+reconcile gate (`15-worker-egress.sh:655` → `_ctr "${name}" inspect`), the
+RZ-2 `_root_ctr inspect` revert, and a bare `podman inspect` in
+`_ctr_inspect` are each caught.
+
+### RZ-5 (Low) — escaped quotes in the maintainer's item-100 line
+
+The defect lived in the dropped !2072 goals commit, which never landed
+here: this branch re-lands only the payload commits and re-authors the
+trail against the live document, so the item-100 line keeps the target's
+plain `"animal name"` quoting (verified: no `\"` sequence on the line).
+
+### RZ-6 (Low) — trail and report inaccuracies
+
+- "re-ran every harness … all harnesses are green" was false at !2072's
+  head (RZ-1). This pass actually ran the whole directory and reports the
+  real numbers below, including the failures and their base-identical
+  proof.
+- The RW-4 reference `11-postgres.sh:219` is corrected to the current
+  line 253 (the new `_rootless_pg_data_present`/`_root_store_pg_container_present`
+  functions shifted it).
+- The startup harness still prints two `RESULT:` lines (they are two
+  distinct phases: the dispatcher matrix and the pins); the junit wrapper
+  keys on exit status, which is 0 for both. Recorded here rather than
+  silently changed.
+- No commit on this branch is titled "record DONE trail": the item is
+  PARTIAL and the trail below says so.
+
+### RZ-7 (Info) — security and semantics
+
+No new hazard introduced. The remaining generic inspects that mean a
+container live outside `_ctr` (fault-inject and legacy upgrade scripts,
+the health-check egress script's keeper probe by ID) are unchanged; the
+rendered-unit helpers named above are now typed, so RZ-7's list shrinks
+further. All 82 converted tenant sites pass container names; no image,
+volume, network or pod inspect was retyped.
+
+### RZ-8 (Info) — empty leftover volume counts as data present
+
+Unchanged (pre-existing, same as base): a `podman run` that failed before
+initdb can leave an empty named volume that satisfies the equality probe.
+The harness models the volume shape but not the PG_VERSION check; the
+report's F-level recommendation for a `PG_VERSION` presence check inside
+the mountpoint stands as the stronger future shape.
+
+### RZ-9 (Info) — `test-study-mcp-worker-mount.sh:76` stub
+
+Normalised: the stub now answers the typed `container inspect` arm
+explicitly and keeps failing the legacy bare `inspect`, consistent with
+the other stubs.
+
+## Run-271 review findings — all addressed (carried from !2072)
 
 The closed MR !2060 was rejected by run-271 (reviewer fable, note #12747)
 with findings RW-1 (High, blocking) through RW-9 (Info). Every applicable
 finding is addressed in-tree here.
+
 
 ### RW-1 (High, blocking) — three CI harness stubs broke
 
