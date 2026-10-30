@@ -101,6 +101,66 @@ inherited_lock_fd_is_held() {
   flock -x -n "$lock_fd"
 }
 
+# WI#505: scrub the active lifecycle lock descriptor from a child process that
+# may exec or spawn a long-lived daemon. bash's `exec {fd}>` has no
+# close-on-exec, and an flock belongs to the open-file description, so an
+# inherited descriptor keeps the tenant lock held after mt-admin dies (a `die`
+# inside the locked section skips the unlock/close). Closing the fd here drops
+# the child's reference; the lock is released when the last holder exits.
+# Closing an already-closed fd is a silent no-op, so test-only stubs that
+# shadow `_openrc_service`/`_systemctl_user` without the helper stay harmless.
+scrub_active_lifecycle_lock_fd() {
+  local fd="${LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD:-}"
+  [[ "$fd" =~ ^[0-9]+$ ]] || return 0
+  eval "exec ${fd}>&-" 2>/dev/null || true
+}
+
+# Best-effort /proc/locks lookup of pids holding an flock on the given inode,
+# for stale-holder diagnosis. Dead holder pids disappear from /proc/locks once
+# every inheriting process closes its reference, so a listed pid is a live
+# inheritor keeping the lock held (WI#505). Output: space-separated pids.
+_lifecycle_lock_holder_pids() {
+  local lock_file="$1" dev_inode line pid holder_pids=""
+  [[ -r /proc/locks && -e "$lock_file" ]] || return 0
+  dev_inode="$(stat -Lc '%d:%i' "$lock_file" 2>/dev/null)" || return 0
+  [[ -n "$dev_inode" ]] || return 0
+  while read -r line; do
+    case "$line" in
+      *" $dev_inode "*|*" $dev_inode") ;;
+      *) continue ;;
+    esac
+    [[ "$line" =~ ^[0-9]+:\ FLOCK\  ]] || continue
+    line="${line#*: FLOCK }"
+    line="${line#ADVISORY }"
+    line="${line#MANDATORY }"
+    line="${line#WRITE }"
+    line="${line#READ }"
+    pid="${line%% *}"
+    [[ "$pid" =~ ^[0-9]+$ && "$pid" != "$$" ]] || continue
+    case " $holder_pids " in
+      *" $pid "*) ;;
+      *) holder_pids="${holder_pids:+$holder_pids }$pid" ;;
+    esac
+  done </proc/locks || true
+  printf '%s' "$holder_pids"
+}
+
+# Fail fast instead of blocking on a stale lock held only by leaked
+# descriptors (WI#505). A live competing mt-admin command fails loudly here
+# too; wait for it to finish before retrying.
+_lifecycle_lock_preflight() {
+  local name="$1" probe_fd holder_pids
+  exec {probe_fd}>"$TENANT_LIFECYCLE_LOCK_DIR/${name}.lock" || return 1
+  if flock -x -n "$probe_fd"; then
+    flock -u "$probe_fd" || true
+    exec {probe_fd}>&-
+    return 0
+  fi
+  exec {probe_fd}>&-
+  holder_pids="$(_lifecycle_lock_holder_pids "$TENANT_LIFECYCLE_LOCK_DIR/${name}.lock")"
+  die "tenant lifecycle lock for '$name' is already held${holder_pids:+ by pids: $holder_pids}; wait for the competing mt-admin command to finish, or stop leftover tenant daemons if they inherited the descriptor (WI#505)"
+}
+
 with_tenant_lifecycle_lock() {
   local name="$1"
   shift
@@ -127,6 +187,7 @@ with_tenant_lifecycle_lock() {
     LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT="$name"
     active_lock_set=true
   else
+    _lifecycle_lock_preflight "$name"
     exec {lock_fd}>"$TENANT_LIFECYCLE_LOCK_DIR/${name}.lock" || return 1
     if ! flock -x "$lock_fd"; then
       exec {lock_fd}>&-
