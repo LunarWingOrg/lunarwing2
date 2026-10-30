@@ -120,22 +120,27 @@ scrub_active_lifecycle_lock_fd() {
 # every inheriting process closes its reference, so a listed pid is a live
 # inheritor keeping the lock held (WI#505). Output: space-separated pids.
 _lifecycle_lock_holder_pids() {
-  local lock_file="$1" dev_inode line pid holder_pids=""
+  local lock_file="$1" dev_hex maj min inode line pid rest dev_id holder_pids=""
   [[ -r /proc/locks && -e "$lock_file" ]] || return 0
-  dev_inode="$(stat -Lc '%d:%i' "$lock_file" 2>/dev/null)" || return 0
-  [[ -n "$dev_inode" ]] || return 0
+  # /proc/locks carries device as hex major:minor; stat %d is the decimal
+  # device. Convert stat's decimal device to hex major/minor and pair it with
+  # the inode so the comparison matches the /proc/locks tuple exactly.
+  dev_hex="$(stat -Lc '%D' "$lock_file" 2>/dev/null)" || return 0
+  inode="$(stat -Lc '%i' "$lock_file" 2>/dev/null)" || return 0
+  [[ -n "$dev_hex" && -n "$inode" ]] || return 0
+  maj="$((16#${dev_hex:0:${#dev_hex}/2}))"
+  min="$((16#${dev_hex:${#dev_hex}/2}))"
+  dev_id="$(printf '%02x:%02x:%s' "$maj" "$min" "$inode")"
   while read -r line; do
     case "$line" in
-      *" $dev_inode "*|*" $dev_inode") ;;
+      *" $dev_id "*) ;;
       *) continue ;;
     esac
-    [[ "$line" =~ ^[0-9]+:\ FLOCK\  ]] || continue
-    line="${line#*: FLOCK }"
-    line="${line#ADVISORY }"
-    line="${line#MANDATORY }"
-    line="${line#WRITE }"
-    line="${line#READ }"
-    pid="${line%% *}"
+    [[ "$line" =~ ^[0-9]+:\ FLOCK\ + ]] || continue
+    # Tokenize on whitespace: fields are id, type, class, rw, pid, dev:inode.
+    local _id _type _class _rw
+    read -r _id _type _class _rw pid _rest <<<"$line"
+    [[ "$_type" == "FLOCK" && -n "$pid" ]] || continue
     [[ "$pid" =~ ^[0-9]+$ && "$pid" != "$$" ]] || continue
     case " $holder_pids " in
       *" $pid "*) ;;

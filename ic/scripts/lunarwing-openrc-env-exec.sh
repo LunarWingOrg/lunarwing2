@@ -37,6 +37,8 @@ links="$(stat -c '%h' "$env_file" 2>/dev/null || true)"
 # lifetime (a die() inside the locked section then orphans the lock). Close
 # every fd that resolves into the lock directory; a same-path fd opened
 # without the lock is closed too, which no daemon needs.
+# Lock descriptors point at <lockdir>/<tenant>.lock, so compare each fd's
+# target against the directory's dev:inode after resolving the fd's own path.
 lifecycle_lock_dir="${LUNARWING_MT_LIFECYCLE_LOCK_DIR:-/run/lock/lunarwing-tenants}"
 if [[ -d "$lifecycle_lock_dir" ]]; then
   lock_dir_id="$(stat -Lc '%d:%i' "$lifecycle_lock_dir" 2>/dev/null || true)"
@@ -44,13 +46,15 @@ if [[ -d "$lifecycle_lock_dir" ]]; then
     for fd_path in /proc/self/fd/*; do
       fd="${fd_path##*/}"
       [[ "$fd" =~ ^[0-9]+$ && "$fd" -ge 3 ]] || continue
-      target="$(stat -Lc '%d:%i' "$fd_path" 2>/dev/null || true)"
-      [[ -n "$target" && "$target" == "$lock_dir_id" ]] || continue
+      fd_target="$(readlink "$fd_path" 2>/dev/null || true)"
+      [[ -n "$fd_target" && "$fd_target" == "$lifecycle_lock_dir"/* ]] || continue
+      target_dir_id="$(stat -Lc '%d:%i' "${fd_target%/*}" 2>/dev/null || true)"
+      [[ -n "$target_dir_id" && "$target_dir_id" == "$lock_dir_id" ]] || continue
       eval "exec ${fd}>&-" 2>/dev/null || true
     done
   fi
 fi
-unset lifecycle_lock_dir lock_dir_id fd_path fd target
+unset lifecycle_lock_dir lock_dir_id fd_path fd fd_target target_dir_id
 
 while IFS= read -r line || [[ -n "$line" ]]; do
   line="${line%$'\r'}"

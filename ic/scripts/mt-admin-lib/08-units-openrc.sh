@@ -444,10 +444,14 @@ _openrc_service() {
   require_safe_openrc_proxy_units || return 125
   # WI#505: rc-service and supervise-daemon start as children of mt-admin, so
   # they inherit the tenant lifecycle lock descriptor and would keep the flock
-  # held for their whole lifetime. Drop the descriptor before exec; the lock
-  # is then released when mt-admin exits, even on a die() inside the lock.
-  scrub_active_lifecycle_lock_fd
-  rc-service "$@"
+  # held for their whole lifetime. Drop the descriptor in a subshell so the
+  # child never carries it; mt-admin keeps its own fd and still owns the
+  # unlock. The lock is then released when mt-admin exits, even on a die()
+  # inside the locked section.
+  (
+    scrub_active_lifecycle_lock_fd
+    rc-service "$@"
+  )
 }
 
 _openrc_update() {
@@ -1250,7 +1254,12 @@ start_pre() {
                 case "\${_lw_fd}" in
                     ''|*[!0-9]*|0|1|2) continue ;;
                 esac
-                _lw_target=\$(stat -Lc '%d:%i' "\${_lw_fd_path}" 2>/dev/null || true)
+                _lw_fd_target=\$(readlink "\${_lw_fd_path}" 2>/dev/null || true)
+                case "\${_lw_fd_target}" in
+                    "\${_lw_lock_dir}"/*) ;;
+                    *) continue ;;
+                esac
+                _lw_target=\$(stat -Lc '%d:%i' "\${_lw_fd_target%/*}" 2>/dev/null || true)
                 [ -n "\${_lw_target}" ] && [ "\${_lw_target}" = "\${_lw_lock_id}" ] || continue
                 eval "exec \${_lw_fd}>&-" 2>/dev/null || true
             done

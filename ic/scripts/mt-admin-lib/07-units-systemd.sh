@@ -1107,8 +1107,11 @@ _systemctl_user() {
   uid="$(id -u "$name")"
   # WI#505: never let user-manager units inherit the tenant lifecycle lock
   # descriptor; an inherited fd keeps the flock held after mt-admin dies.
-  scrub_active_lifecycle_lock_fd
-  sudo -u "$name" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user "$@"
+  # Scrub in a subshell so mt-admin keeps its own fd and still owns the unlock.
+  (
+    scrub_active_lifecycle_lock_fd
+    sudo -u "$name" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user "$@"
+  )
 }
 
 # Best-effort wait for the tenant's `systemd --user` manager + bus to be ready,
