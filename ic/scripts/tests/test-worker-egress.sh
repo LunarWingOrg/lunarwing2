@@ -678,6 +678,51 @@ else
   assert_absent "$(cat "$rootless_bin/nft.log")" '-f' "remote infra image is rejected before nft load"
 fi
 
+assert_contains "$(grep '^pod create' "$rootless_bin/podman.log")" '--infra-image localhost/podman-pause:5.8.2' \
+  "keeper pod create pins the local pause infra image"
+
+rm -rf -- "$rootless_state"
+mkdir -p "$rootless_state"
+: >"$rootless_bin/podman.log"
+: >"$rootless_bin/nft.log"
+if FAKE_INFRA_IMAGE='localhost/podman-pause:' PATH="$rootless_bin:$PATH" \
+    "$guard" "$fixture/alpha.nft" rootless fwd_alpha alpha >"$fixture/tagless-image.out" 2>&1; then
+  fail "guard accepted the tag-stripped pause image name"
+else
+  pass "guard refuses the tag-stripped pause image name"
+  assert_contains "$(cat "$fixture/tagless-image.out")" "unapproved infra image 'localhost/podman-pause:'" \
+    "tag-stripped refusal names the malformed provenance"
+  assert_contains "$(cat "$rootless_bin/podman.log")" 'pod rm -f lw-egress-keeper-alpha' \
+    "tag-stripped keeper pod is removed"
+  [[ ! -e "$rootless_state/present" ]] || fail "tag-stripped keeper pod remains after refusal"
+  assert_absent "$(cat "$rootless_bin/nft.log")" '-f' "tag-stripped image is rejected before nft load"
+fi
+
+rm -rf -- "$rootless_state"
+mkdir -p "$rootless_state"
+: >"$rootless_bin/podman.log"
+: >"$rootless_bin/nft.log"
+if LUNARWING_WORKER_EGRESS_INFRA_IMAGE='docker.io/library/pause:3.9' PATH="$rootless_bin:$PATH" \
+    "$guard" "$fixture/alpha.nft" rootless fwd_alpha alpha >"$fixture/bad-override.out" 2>&1; then
+  fail "guard accepted a remote pinned infra-image override"
+else
+  pass "guard refuses a remote pinned infra-image override"
+  assert_absent "$(cat "$rootless_bin/podman.log")" 'pod create' "invalid pinned image never reaches pod create"
+fi
+
+rm -rf -- "$rootless_state"
+mkdir -p "$rootless_state"
+: >"$rootless_bin/podman.log"
+: >"$rootless_bin/nft.log"
+if LUNARWING_WORKER_EGRESS_INFRA_IMAGE='localhost/podman-pause:9.9.9' PATH="$rootless_bin:$PATH" \
+    "$guard" "$fixture/alpha.nft" rootless fwd_alpha alpha >"$fixture/good-override.out" 2>&1; then
+  pass "guard accepts a local pinned infra-image override"
+  assert_contains "$(grep '^pod create' "$rootless_bin/podman.log")" '--infra-image localhost/podman-pause:9.9.9' \
+    "pod create carries the overridden pinned infra image"
+else
+  fail "local pinned override refused: $(cat "$fixture/good-override.out")"
+fi
+
 rm -rf -- "$rootless_state"
 mkdir -p "$rootless_state"
 if FAKE_INFRA_IMAGE='' PATH="$rootless_bin:$PATH" \
