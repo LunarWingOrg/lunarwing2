@@ -1285,6 +1285,9 @@ upgrade_wrapper_boundary_locked() {
   local name="$1" upgrade_lock_fd result=0
   shift
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  # WI#505: fail fast instead of blocking on an upgrade lock orphaned by
+  # leaked descriptors in tenant daemons started under the lock.
+  _lock_held_preflight "upgrade for '$name'" "${BUILD_LOCK}.${name}.upgrade"
   exec {upgrade_lock_fd}>"${BUILD_LOCK}.${name}.upgrade" \
     || die "failed to open tenant upgrade lock"
   flock -x "$upgrade_lock_fd" || die "failed to acquire tenant upgrade lock"
@@ -1526,9 +1529,15 @@ upgrade_tenant() {
 _upgrade_tenant_lifecycle_locked() {
   local name="$1" upgrade_lock_fd upgrade_rc caller_errexit=false
   say "acquiring tenant upgrade lock ..."
+  # WI#505: fail fast instead of blocking on an upgrade lock orphaned by
+  # leaked descriptors in tenant daemons started under the lock.
+  _lock_held_preflight "upgrade for '$name'" "${BUILD_LOCK}.${name}.upgrade"
   exec {upgrade_lock_fd}>"${BUILD_LOCK}.${name}.upgrade" \
     || die "failed to open tenant upgrade lock"
   flock -x "$upgrade_lock_fd" || die "failed to acquire tenant upgrade lock"
+  # Track the descriptor so OpenRC service starts inside the locked section
+  # close it before exec; an inherited fd would orphan the lock on a die.
+  LUNARWING_MT_UPGRADE_LOCK_FD="$upgrade_lock_fd"
   [[ $- != *e* ]] || caller_errexit=true
   set +e
   if tenant_darkirc_enabled "$name" && darkirc_managed_state_exists "$name"; then
@@ -1538,6 +1547,7 @@ _upgrade_tenant_lifecycle_locked() {
     upgrade_tenant_locked "$@"
     upgrade_rc=$?
   fi
+  unset LUNARWING_MT_UPGRADE_LOCK_FD
   flock -u "$upgrade_lock_fd" || die "failed to release tenant upgrade lock"
   exec {upgrade_lock_fd}>&-
   if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
