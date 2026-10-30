@@ -56,15 +56,18 @@ The registry bumps require rebuilt WASM artifacts; they do not by themselves cha
 5. **Expect bounded Engine V2 history import and thread ownership.** The first message on a newly created Engine V2 surface may import eligible pre-switch history once. Existing surfaces are not backfilled; failed imports are best-effort. Engine V2 routing remains opt-in for XMPP, DarkIRC, and WeeChat, not a replacement of every v1 channel loop. A forged or foreign `preferred_thread_id` is refused at engine spawn and at the hybrid store's keyed write.
 6. **Review the dated security evidence.** The [v2.1.7.0 cargo-deny audit](docs/ops/v2.1.7.0_CARGO_DENY_AUDIT.md) records the post-sweep advisory, ban, license, and source results, including the October 28 Pebble fix. Accepted advisories and graph exclusions still apply.
 
+> Green light feeds the swarm,<br>
+> plankton drift like scattered stars;<br>
+> the whole sea breathes here.<br>
+
 ## Known Limitations
 
 - **Worker isolation has a documented boundary.** The split separates bridge credentials from task code, but every job inside one task container remains one authority domain. The task uid owns the runner and its socket, so task code can impersonate the runner or deliberately escape its process group. The bridge still receives the lane's LLM environment, and runtime/override environment files are not independently config-hashed; force-recreate the pair after changing them. Rootful fixed IDs provide less host-escape separation than per-tenant mappings; rootless keep-id is unchanged.
-- **OpenCode v1 fails at two independent points.** The upstream `SystemPrompt.environment` crash is present at the pinned `v1.18.25` (WI#333). The split image also makes `/app/config` read-only, while `entrypoint-task-setup.sh` rewrites the copied config in place, so its task container exits with `EACCES` on current master (WI#523). Use OpenCode 2, Kimi, or Pebble; retire or re-pin the v1 lane before relying on it.
-- **Worker rollout can strand a tenant.** WI#456 and WI#512 record `connection refused (os error 111)` on some tenants; the startup loop isolates per-lane image refusals (WI#469), while fleet rebuild/distribution and boot-time liveness probing are tracked as WI#464/WI#512. Upgrade wrappers stop a tenant before building worker images, so a later lane build failure can leave it down (WI#527); the opencode2 builder-floor preflight covers only that class. Pebble tenant images are built from the operator checkout and stamped with its revision (WI#507); build from a clean checkout.
 - **Egress is explicit for Pebble.** A `--with-pebble` tenant has no automatic allowlist entry for Pebble's model backend. Grant it with `configure-worker-egress <tenant> --allow <backend-host>:443` and restart. Old running containers are not retroactively filtered by a source update. The rootless keeper and local infra-image pin are hardened (WI#504/WI#516).
-- **OpenCode 2 reproducibility has a compiled-binary variable.** The clean-rebuild candidate gate passed on master pipeline 6768 (digest `6c681b5a…`). The intermittent compiled-binary layer is tracked as WI#510; a digest mismatch is a promotion stop.
-- **Engine and worker observability have edges.** Engine V2 chat history can report `pending_approval=null` while a live approval gate is waiting (WI#520). Pebble's bridge buffers progress events until task completion, which can produce false `Stuck` signals and lose results on abrupt termination (WI#519). External-worker cancellation synchronizes context before persistence; the sandbox cancellation path uses the existing path (WI#476).
-- **Security boundaries have tracked residuals.** A configured HTTP proxy bypasses the vetted-DNS pin on WASM host requests (WI#503). Concurrent first messages can create duplicate `default` projects; resolution is deterministic and warns, but creation is not atomic (WI#490). The harness redaction/lifecycle backlog in WI#383 includes shell-capture truncation fragments and structured-field extraction. A low-severity OpenRC upgrade-wrapper lock-descriptor residual is tracked as WI#526.
+
+> Dusk sinks into blue. <br>
+> Lanternfish climb to the moon, <br>
+> the largest journey. <br>
 
 The [v2.1.6.0 security and deployment boundaries](docs/releases/RELEASE-v2.1.6.0.md#security-deployment-and-release-limitations) apply where not superseded above. Worker tool grants remain empty by default and must be assigned deliberately.
 
