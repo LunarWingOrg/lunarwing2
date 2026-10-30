@@ -261,3 +261,89 @@ done
 
 if [[ "$failures" -ne 0 ]]; then printf 'RESULT: %s failure(s)\n' "$failures"; exit 1; fi
 printf 'RESULT: all worker startup tests passed\n'
+
+# ── RW-3/run-271 pins: the typed-inspect fix must be enforced, not just present ──
+# NOTE: sourcing lunarwing-mt-admin.sh reassigns SCRIPT_DIR to ic/scripts, so
+# resolve the library dir from BASH_SOURCE, not SCRIPT_DIR.
+LIB_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../mt-admin-lib" && pwd)"
+# Pin 1 (static): no generic `_ctr "<var>" inspect` may remain anywhere in
+# mt-admin-lib — a generic inspect resolves a name across containers AND
+# volumes, and prefix-matches, so the worker bridge container
+# `lunarwing-<worker>-<tenant>` cross-matches its IPC volume
+# `lunarwing-<worker>-<tenant>-ipc-v2` and the existence gate skips creation.
+generic_hits="$(grep -rnE '_ctr "[$][a-z_]+" inspect' "$LIB_DIR/" || true)"
+if [[ -n "$generic_hits" ]]; then
+  fail "generic _ctr inspect remains in mt-admin-lib (would prefix-match volumes): $generic_hits"
+else
+  pass 'static pin: no generic _ctr "<var>" inspect in mt-admin-lib'
+fi
+
+# Pin 2 (behavioural): a store where generic `inspect X` prefix-resolves to the
+# volume `X-ipc-v2` (exit 0) while `container inspect X` correctly reports "no
+# such container". With the bug, the existence gate read the VOLUME as the
+# container, skipped `run -d --name`, and the worker never started; the typed
+# subcommand must reach the run. Each of the four starters is exercised.
+_ipc_volume_trap() {  # <worker> <tenant>
+  local worker="$1" tenant="$2"
+  local bridge="lunarwing-${worker}-${tenant}"
+  local volume="${bridge}-ipc-v2"
+  : >"$events"
+  unset _ctr
+  _ctr() {
+    local name="$1"; shift
+    case "${1:-}" in
+      container)
+        # Typed inspect: the bridge container does not exist yet.
+        [[ "${2:-}" == inspect && "${3:-}" == "$bridge" ]] && return 1
+        return 0 ;;
+      inspect)
+        # GENERIC inspect: podman matches the bridge name as a PREFIX of the
+        # IPC volume name, so this arm is exactly the production bug shape.
+        [[ "${2:-}" == "$bridge" ]] && { printf 'volume %s\n' "$volume"; return 0; }
+        return 1 ;;
+      image)
+        # The image-uid gate probes the worker image; return the lane's uid.
+        local uid
+        uid="$(worker_task_uid "$worker")"; printf '%s:%s\n' "$uid" "$uid" ;;
+      run)
+        [[ "${2:-}" == -d ]] || return 0
+        record "run-reached:$4"
+        return 0 ;;
+      *) return 0 ;;
+    esac
+  }
+  # Reuse the harness's stubs for everything the starters call besides _ctr.
+  start_tenant_postgres() { :; }
+  start_tenant_vision() { :; }
+  start_tenant_voice() { :; }
+  start_tenant_systemd() { record daemon:systemd; }
+  start_tenant_openrc() { record daemon:openrc; }
+  set +e
+  case "$worker" in
+    pebble)   start_tenant_pebble "$tenant" >"$output" 2>&1 ;;
+    opencode) start_tenant_opencode "$tenant" >"$output" 2>&1 ;;
+    kimi)     start_tenant_kimi "$tenant" >"$output" 2>&1 ;;
+    opencode2) start_tenant_opencode2 "$tenant" >"$output" 2>&1 ;;
+  esac
+  local src=$?
+  set -e
+  if grep -q "run-reached:$bridge" "$events"; then
+    pass "typed inspect reaches run -d for $worker despite the $volume prefix-match"
+  else
+    fail "$worker existence gate was fooled by the IPC volume (no run -d reached); rc=$src"
+    command cat "$output" >&2
+  fi
+}
+selected='pebble opencode kimi opencode2'
+intentionally_stopped=''
+unallocated=''
+missing_image=''
+refused=''
+failure_mode=none
+INIT_SYSTEM=openrc
+for lane in pebble opencode kimi opencode2; do
+  _ipc_volume_trap "$lane" alice
+done
+
+if [[ "$failures" -ne 0 ]]; then printf 'RESULT: %s failure(s)\n' "$failures"; exit 1; fi
+printf 'RESULT: RW-3 pins passed (typed inspect static + IPC-volume behavioural)\n'
