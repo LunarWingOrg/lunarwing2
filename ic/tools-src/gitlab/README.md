@@ -94,6 +94,16 @@ first. The merged `pagination` object reports `fetched_pages`, `returned_items`,
 `complete`, and `truncated`; when truncated it also carries `resume_page`, which
 can be passed as `page` to a normal paged `list_issues` call.
 
+`list_jobs` returns a **flat** per-job surface rather than GitLab's full job
+object (which nests heavy `pipeline`, `commit`, `runner`, `user`, and
+`artifacts` sub-objects). Each job carries `id`, `name`, `stage`, `status`,
+`failure_reason`, `ref`, `tag`, `allow_failure`, `started_at`, `finished_at`,
+`duration`, `queued_duration`, `web_url`, and `created_at`; anything else is one
+`web_url` hop away. The response is deserialized straight into that typed shape
+(unknown fields are skipped, not materialized) and `per_page` is clamped to 50
+for this action, so a failing-pipeline page stays within the sandboxed guest's
+memory ceiling. The `pagination` object is preserved.
+
 Use `list_work_items` when Tasks and other Work Item types must be included.
 GitLab Work Items use opaque keyset cursors rather than page numbers. A normal
 call reports `has_next`, `complete`, `returned_items`, and (when present)

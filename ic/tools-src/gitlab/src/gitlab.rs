@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use url::Url;
 
@@ -131,6 +132,22 @@ impl GitlabClient {
         let value: Value = serde_json::from_slice(&bytes)
             .map_err(|_| format!("GitLab returned invalid JSON (HTTP {status})"))?;
         Ok(Some(with_pagination(value, &headers)))
+    }
+
+    /// Fetch a single GET endpoint and deserialize each array element straight
+    /// into `T` (WI#525). Unlike `request_json`, this never materialises the
+    /// full `serde_json::Value` tree: `serde` maps tokens into the typed
+    /// elements and **skips** unknown fields without allocating them. For
+    /// bulk endpoints whose objects nest heavy sub-objects, that bounds peak
+    /// guest memory to the retained fields instead of the whole page payload.
+    /// The `pagination` wrapper from `with_pagination` is preserved.
+    pub fn request_typed_page<T: DeserializeOwned + serde::Serialize>(
+        &self,
+        endpoint: &str,
+    ) -> Result<Value, String> {
+        let (status, bytes, headers) = self.send("GET", endpoint, None)?;
+        ensure_success(status, &bytes)?;
+        Ok(with_pagination(typed_page_value::<T>(&bytes)?, &headers))
     }
 
     pub fn resource_exists(&self, endpoint: &str) -> Result<bool, String> {
@@ -336,6 +353,20 @@ fn ensure_success(status: u16, body: &[u8]) -> Result<(), String> {
     }
     let reason = extract_error(body).unwrap_or_else(|| "request failed".to_string());
     Err(format!("GitLab API returned HTTP {status}: {reason}"))
+}
+
+/// Deserialize a raw `GET` body straight into `Vec<T>` without ever building
+/// a full `serde_json::Value` tree (WI#525). `serde` streams tokens into the
+/// typed elements and skips unknown fields without allocating them, so peak
+/// memory tracks the retained fields rather than the whole page. Returns
+/// `Value::Null` for a genuinely empty body.
+fn typed_page_value<T: DeserializeOwned + serde::Serialize>(bytes: &[u8]) -> Result<Value, String> {
+    if bytes.is_empty() {
+        return Ok(Value::Null);
+    }
+    let items: Vec<T> = serde_json::from_slice(bytes)
+        .map_err(|error| format!("GitLab returned an unexpected shape: {error}"))?;
+    serde_json::to_value(items).map_err(|error| format!("Failed to encode GitLab result: {error}"))
 }
 
 fn with_pagination(value: Value, headers_json: &str) -> Value {
@@ -711,7 +742,8 @@ mod tests {
     use super::{
         MAX_AUTO_BYTES, all_keyset_pages_value, collect_all_keyset_pages, collect_all_pages,
         endpoint_cursor, extract_error, keyset_page_value, normalize_api_base, page,
-        parse_next_link, parse_next_page, project_path, url_encode, with_pagination,
+        parse_next_link, parse_next_page, project_path, typed_page_value, url_encode,
+        with_pagination,
     };
     use serde_json::{Value, json};
 
@@ -1083,5 +1115,43 @@ mod tests {
         assert_eq!(merged["pagination"]["complete"], false);
         assert_eq!(merged["pagination"]["truncated"], true);
         assert!(merged["pagination"].get("total").is_none());
+    }
+
+    /// WI#525: `typed_page_value` deserializes the raw body straight into the
+    /// typed element list, dropping every field the type does not model — so
+    /// the returned tree carries only the retained surface, not the source.
+    #[test]
+    fn typed_page_value_retains_only_modelled_fields() {
+        #[derive(serde::Deserialize, serde::Serialize)]
+        struct Slim {
+            id: u64,
+        }
+        let body = br#"[
+            {"id": 1, "pipeline": {"id": 6843, "sha": "abc"}, "commit": {"message": "long"}},
+            {"id": 2, "artifacts": [{"filename": "trace.log", "size": 99}]}
+        ]"#;
+        let retained = typed_page_value::<Slim>(body).unwrap();
+        let Value::Array(items) = &retained else {
+            panic!("expected an array");
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], json!({"id": 1}));
+        assert_eq!(items[1], json!({"id": 2}));
+        assert!(items[0].get("pipeline").is_none());
+        assert!(items[1].get("artifacts").is_none());
+    }
+
+    /// An empty body stays `Null`, and a non-array body is a clear error
+    /// rather than a silent misfire.
+    #[test]
+    fn typed_page_value_handles_empty_and_non_array_bodies() {
+        #[derive(serde::Deserialize, serde::Serialize)]
+        struct Slim {
+            #[allow(dead_code)]
+            id: u64,
+        }
+        assert_eq!(typed_page_value::<Slim>(b"").unwrap(), Value::Null);
+        let error = typed_page_value::<Slim>(br#"{"message":"nope"}"#).unwrap_err();
+        assert!(error.contains("unexpected shape"), "got: {error}");
     }
 }
