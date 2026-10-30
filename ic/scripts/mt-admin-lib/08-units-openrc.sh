@@ -444,14 +444,11 @@ _openrc_service() {
   require_safe_openrc_proxy_units || return 125
   # WI#505: rc-service and supervise-daemon start as children of mt-admin, so
   # they inherit the tenant lifecycle lock descriptor and would keep the flock
-  # held for their whole lifetime. Drop the descriptor in a subshell so the
-  # child never carries it; mt-admin keeps its own fd and still owns the
-  # unlock. The lock is then released when mt-admin exits, even on a die()
-  # inside the locked section.
-  (
-    scrub_active_lifecycle_lock_fd
-    rc-service "$@"
-  )
+  # held for their whole lifetime. Run rc-service with the descriptor closed
+  # so the child never carries it; mt-admin keeps its own fd and still owns
+  # the unlock. The lock is then released when mt-admin exits, even on a
+  # die() inside the locked section.
+  with_active_lifecycle_lock_fd_closed rc-service "$@"
 }
 
 _openrc_update() {

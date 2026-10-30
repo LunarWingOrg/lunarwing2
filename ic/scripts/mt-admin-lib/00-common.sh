@@ -101,18 +101,20 @@ inherited_lock_fd_is_held() {
   flock -x -n "$lock_fd"
 }
 
-# WI#505: scrub the active lifecycle lock descriptor from a child process that
-# may exec or spawn a long-lived daemon. bash's `exec {fd}>` has no
-# close-on-exec, and an flock belongs to the open-file description, so an
-# inherited descriptor keeps the tenant lock held after mt-admin dies (a `die`
-# inside the locked section skips the unlock/close). Closing the fd here drops
-# the child's reference; the lock is released when the last holder exits.
-# Closing an already-closed fd is a silent no-op, so test-only stubs that
-# shadow `_openrc_service`/`_systemctl_user` without the helper stay harmless.
-scrub_active_lifecycle_lock_fd() {
-  local fd="${LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD:-}"
-  [[ "$fd" =~ ^[0-9]+$ ]] || return 0
-  eval "exec ${fd}>&-" 2>/dev/null || true
+# WI#505: run a command with the active lifecycle lock descriptor closed.
+# bash's `exec {fd}>` has no close-on-exec, and an flock belongs to the
+# open-file description, so a descriptor inherited by a daemon started inside
+# the locked section keeps the tenant lock held after mt-admin dies (a `die`
+# inside the section skips the unlock/close). A per-command redirection closes
+# the fd only for that command's child, so mt-admin keeps its own fd and still
+# owns the unlock, and shell-function stubs in harnesses keep working.
+with_active_lifecycle_lock_fd_closed() {
+  local lw_lock_fd="${LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD:-}"
+  if [[ "$lw_lock_fd" =~ ^[0-9]+$ ]]; then
+    "$@" {lw_lock_fd}>&-
+  else
+    "$@"
+  fi
 }
 
 # Best-effort /proc/locks lookup of pids holding an flock on the given inode,
