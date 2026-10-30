@@ -442,7 +442,13 @@ _openrc_service() {
   # worker, sidecar and cron operations which can also trigger a deptree rebuild.
   # 125 is a refused operation, never an OpenRC service state.
   require_safe_openrc_proxy_units || return 125
-  rc-service "$@"
+  # WI#505: rc-service and supervise-daemon start as children of mt-admin, so
+  # they inherit every tracked lock descriptor and would keep the flocks held
+  # for their whole lifetime (a die inside the locked section then orphans
+  # the locks). Run rc-service with every tracked lock fd closed so the child
+  # never carries them; mt-admin keeps its own fds and still owns the
+  # unlocks, which then release at process exit even on a die.
+  with_tracked_lock_fds_closed rc-service "$@"
 }
 
 _openrc_update() {
@@ -1231,6 +1237,32 @@ start_pre() {
     checkpath -f -m 0640 -o "\${darkirc_user}:\${darkirc_group}" "\${output_log}"
     checkpath -f -m 0640 -o "\${darkirc_user}:\${darkirc_group}" "\${error_log}"
     umask "\${darkirc_umask}"
+    # WI#505: this unit execs supervise-daemon directly (no env-exec), so
+    # close any descriptor inherited from mt-admin that resolves into the
+    # tenant lifecycle or DarkIRC writer lock directories before the daemon
+    # is spawned; an inherited fd would keep the flock held for the daemon
+    # lifetime and orphan the lock when mt-admin dies inside the section.
+    for _lw_lock_dir in \
+        "\${LUNARWING_MT_LIFECYCLE_LOCK_DIR:-/run/lock/lunarwing-tenants}" \
+        "\${LUNARWING_MT_DARKIRC_WRITER_LOCK_DIR:-/run/lock/lunarwing-darkirc}"; do
+        [ -d "\${_lw_lock_dir}" ] || continue
+        _lw_lock_id=\$(stat -Lc '%d:%i' "\${_lw_lock_dir}" 2>/dev/null || true)
+        [ -n "\${_lw_lock_id}" ] || continue
+        for _lw_fd_path in /proc/self/fd/*; do
+            _lw_fd="\${_lw_fd_path##*/}"
+            case "\${_lw_fd}" in
+                ''|*[!0-9]*|0|1|2) continue ;;
+            esac
+            _lw_fd_target=\$(readlink "\${_lw_fd_path}" 2>/dev/null || true)
+            case "\${_lw_fd_target}" in
+                "\${_lw_lock_dir}"/*) ;;
+                *) continue ;;
+            esac
+            _lw_target=\$(stat -Lc '%d:%i' "\${_lw_fd_target%/*}" 2>/dev/null || true)
+            [ -n "\${_lw_target}" ] && [ "\${_lw_target}" = "\${_lw_lock_id}" ] || continue
+            eval "exec \${_lw_fd}>&-" 2>/dev/null || true
+        done
+    done
 }
 INITEOF
   chmod 0755 "$OPENRC_INITD_DIR/lunarwing-darkirc-${name}"
