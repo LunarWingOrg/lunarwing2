@@ -375,6 +375,14 @@ case "${1:-}" in
   inspect)
     if [[ "${2:-}" == -f ]]; then printf 'true\n'; else exit 0; fi
     ;;
+  container)
+    # Typed subcommand form (`container inspect`) used by export-tenant.sh:
+    # same answers as the legacy bare-inspect arm above.
+    if [[ "${2:-}" == "inspect" ]]; then
+      if [[ "${3:-}" == -f ]]; then printf 'true\n'; else exit 0; fi
+    fi
+    exit 0
+    ;;
   exec) printf 'PGDMP-test-dump\n' ;;
   *) exit 0 ;;
 esac

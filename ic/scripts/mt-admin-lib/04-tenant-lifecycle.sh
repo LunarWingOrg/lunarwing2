@@ -334,7 +334,7 @@ stop_tenant_writers() {
     || die "could not inspect tenant container store"
   while IFS= read -r container; do
     container_name_list_has "$names" "$container" || continue
-    running="$(_ctr "$name" inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" \
+    running="$(_ctr_inspect "$name" -f '{{.State.Running}}' "$container" 2>/dev/null)" \
       || die "could not inspect writer container $container"
     case "$running" in
       true) _ctr "$name" stop --time 0 "$container" >/dev/null \
@@ -415,7 +415,7 @@ tenant_writers_active() {
   names="$(_ctr "$name" ps -a --format '{{.Names}}' 2>/dev/null)" || return 2
   while IFS= read -r container; do
     container_name_list_has "$names" "$container" || continue
-    running="$(_ctr "$name" inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" \
+    running="$(_ctr_inspect "$name" -f '{{.State.Running}}' "$container" 2>/dev/null)" \
       || return 2
     [[ "$running" != true ]] || return 0
     [[ "$running" == false ]] || return 2
@@ -1285,6 +1285,9 @@ upgrade_wrapper_boundary_locked() {
   local name="$1" upgrade_lock_fd result=0
   shift
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  # WI#505: fail fast instead of blocking on an upgrade lock orphaned by
+  # leaked descriptors in tenant daemons started under the lock.
+  _lock_held_preflight "upgrade for '$name'" "${BUILD_LOCK}.${name}.upgrade"
   exec {upgrade_lock_fd}>"${BUILD_LOCK}.${name}.upgrade" \
     || die "failed to open tenant upgrade lock"
   flock -x "$upgrade_lock_fd" || die "failed to acquire tenant upgrade lock"
@@ -1526,9 +1529,15 @@ upgrade_tenant() {
 _upgrade_tenant_lifecycle_locked() {
   local name="$1" upgrade_lock_fd upgrade_rc caller_errexit=false
   say "acquiring tenant upgrade lock ..."
+  # WI#505: fail fast instead of blocking on an upgrade lock orphaned by
+  # leaked descriptors in tenant daemons started under the lock.
+  _lock_held_preflight "upgrade for '$name'" "${BUILD_LOCK}.${name}.upgrade"
   exec {upgrade_lock_fd}>"${BUILD_LOCK}.${name}.upgrade" \
     || die "failed to open tenant upgrade lock"
   flock -x "$upgrade_lock_fd" || die "failed to acquire tenant upgrade lock"
+  # Track the descriptor so OpenRC service starts inside the locked section
+  # close it before exec; an inherited fd would orphan the lock on a die.
+  LUNARWING_MT_UPGRADE_LOCK_FD="$upgrade_lock_fd"
   [[ $- != *e* ]] || caller_errexit=true
   set +e
   if tenant_darkirc_enabled "$name" && darkirc_managed_state_exists "$name"; then
@@ -1538,6 +1547,7 @@ _upgrade_tenant_lifecycle_locked() {
     upgrade_tenant_locked "$@"
     upgrade_rc=$?
   fi
+  unset LUNARWING_MT_UPGRADE_LOCK_FD
   flock -u "$upgrade_lock_fd" || die "failed to release tenant upgrade lock"
   exec {upgrade_lock_fd}>&-
   if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
@@ -1823,52 +1833,52 @@ status_tenant() {
 
   ensure_container_runtime
   local container_name="lunarwing-pg-$name"
-  if _ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true; then
+  if _ctr_inspect "$name" -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true; then
     say "PostgreSQL: running ($container_name)"
   else
     say "PostgreSQL: stopped ($container_name)"
   fi
 
   local nanocode_container="lunarwing-nanocode-$name"
-  if _ctr "$name" inspect -f '{{.State.Running}}' "$nanocode_container" 2>/dev/null | grep -q true; then
+  if _ctr_inspect "$name" -f '{{.State.Running}}' "$nanocode_container" 2>/dev/null | grep -q true; then
     say "Nanocode (retired): WARNING still running ($nanocode_container)"
-  elif _ctr "$name" inspect "$nanocode_container" &>/dev/null; then
+  elif _ctr_inspect "$name" "$nanocode_container" &>/dev/null; then
     say "Nanocode (retired): stopped container preserved ($nanocode_container)"
   else
     say "Nanocode (retired): no container in active runtime store"
   fi
 
   local pebble_container="lunarwing-pebble-$name"
-  if _ctr "$name" inspect -f '{{.State.Running}}' "$pebble_container" 2>/dev/null | grep -q true; then
+  if _ctr_inspect "$name" -f '{{.State.Running}}' "$pebble_container" 2>/dev/null | grep -q true; then
     say "Pebble worker: running ($pebble_container, WSS port $(ports_get "$name" pebble_wss))"
-  elif _ctr "$name" inspect "$pebble_container" &>/dev/null; then
+  elif _ctr_inspect "$name" "$pebble_container" &>/dev/null; then
     say "Pebble worker: stopped ($pebble_container)"
   else
     say "Pebble worker: not created"
   fi
 
   local opencode_container="lunarwing-opencode-$name"
-  if _ctr "$name" inspect -f '{{.State.Running}}' "$opencode_container" 2>/dev/null | grep -q true; then
+  if _ctr_inspect "$name" -f '{{.State.Running}}' "$opencode_container" 2>/dev/null | grep -q true; then
     say "OpenCode worker: running ($opencode_container, WSS port $(ports_get "$name" opencode_wss))"
-  elif _ctr "$name" inspect "$opencode_container" &>/dev/null; then
+  elif _ctr_inspect "$name" "$opencode_container" &>/dev/null; then
     say "OpenCode worker: stopped ($opencode_container)"
   else
     say "OpenCode worker: not created"
   fi
 
   local opencode2_container="lunarwing-opencode2-$name"
-  if _ctr "$name" inspect -f '{{.State.Running}}' "$opencode2_container" 2>/dev/null | grep -q true; then
+  if _ctr_inspect "$name" -f '{{.State.Running}}' "$opencode2_container" 2>/dev/null | grep -q true; then
     say "OpenCode 2 worker: running ($opencode2_container, WSS port $(ports_get "$name" opencode2_wss))"
-  elif _ctr "$name" inspect "$opencode2_container" &>/dev/null; then
+  elif _ctr_inspect "$name" "$opencode2_container" &>/dev/null; then
     say "OpenCode 2 worker: stopped ($opencode2_container)"
   else
     say "OpenCode 2 worker: not created"
   fi
 
   local kimi_container="lunarwing-kimi-$name"
-  if _ctr "$name" inspect -f '{{.State.Running}}' "$kimi_container" 2>/dev/null | grep -q true; then
+  if _ctr_inspect "$name" -f '{{.State.Running}}' "$kimi_container" 2>/dev/null | grep -q true; then
     say "Kimi worker: running ($kimi_container, WSS port $(ports_get "$name" kimi_wss))"
-  elif _ctr "$name" inspect "$kimi_container" &>/dev/null; then
+  elif _ctr_inspect "$name" "$kimi_container" &>/dev/null; then
     say "Kimi worker: stopped ($kimi_container)"
   else
     say "Kimi worker: not created"
@@ -1900,9 +1910,9 @@ status_tenant() {
     fi
   elif _vision_container_healthy "$name" "$vision_container"; then
     say "LunarVision: healthy ($vision_container, API/health ports $(ports_get "$name" vision_service)/$(ports_get "$name" vision_health))"
-  elif _ctr "$name" inspect -f '{{.State.Running}}' "$vision_container" 2>/dev/null | grep -q true; then
+  elif _ctr_inspect "$name" -f '{{.State.Running}}' "$vision_container" 2>/dev/null | grep -q true; then
     say "LunarVision: running but unhealthy ($vision_container)"
-  elif _ctr "$name" inspect "$vision_container" &>/dev/null; then
+  elif _ctr_inspect "$name" "$vision_container" &>/dev/null; then
     say "LunarVision: stopped ($vision_container)"
   else
     say "LunarVision: not created"
@@ -1911,9 +1921,9 @@ status_tenant() {
   local voice_container="lunarwing-voice-$name"
   if _voice_container_healthy "$name" "$voice_container"; then
     say "LunarVoice: ready ($voice_container, API/health ports $(ports_get "$name" voice_service)/$(ports_get "$name" voice_health))"
-  elif _ctr "$name" inspect -f '{{.State.Running}}' "$voice_container" 2>/dev/null | grep -q true; then
+  elif _ctr_inspect "$name" -f '{{.State.Running}}' "$voice_container" 2>/dev/null | grep -q true; then
     say "LunarVoice: running but unready ($voice_container)"
-  elif _ctr "$name" inspect "$voice_container" &>/dev/null; then
+  elif _ctr_inspect "$name" "$voice_container" &>/dev/null; then
     say "LunarVoice: stopped ($voice_container)"
   else
     say "LunarVoice: not created (enabled=$(tenant_voice_enabled "$name" && echo true || echo false))"

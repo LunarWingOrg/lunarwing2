@@ -101,6 +101,106 @@ inherited_lock_fd_is_held() {
   flock -x -n "$lock_fd"
 }
 
+# WI#505: run a command with every tracked mt-admin lock descriptor closed.
+# bash's `exec {fd}>` has no close-on-exec, and an flock belongs to the
+# open-file description, so a descriptor inherited by a daemon started inside
+# a locked section keeps the tenant lock held after mt-admin dies (a `die`
+# inside the section skips the unlock/close). On OpenRC, rc-service and
+# supervise-daemon are children of mt-admin, so they carry every tracked fd —
+# the lifecycle fd, the upgrade fd (04-tenant-lifecycle.sh) and the DarkIRC
+# writer fd (06-env-generation.sh) — not just the lifecycle one. Per-command
+# redirections close the fds only for that command's child, so mt-admin keeps
+# its own fds and still owns the unlocks, and shell-function stubs in
+# harnesses keep working.
+with_tracked_lock_fds_closed() {
+  local -a lw_fds=()
+  local lw_fd lw_close_args=""
+  for lw_fd in "${LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD:-}" \
+    "${LUNARWING_MT_ACTIVE_UPGRADE_LOCK_FD:-}" \
+    "${LUNARWING_MT_UPGRADE_LOCK_FD:-}" \
+    "${DARKIRC_WRITER_LOCK_FD:-}"; do
+    [[ "$lw_fd" =~ ^[0-9]+$ ]] && lw_fds+=("$lw_fd")
+  done
+  if ((${#lw_fds[@]} == 0)); then
+    "$@"
+    return
+  fi
+  for lw_fd in "${lw_fds[@]}"; do
+    lw_close_args+=" ${lw_fd}>&-"
+  done
+  # eval is required: per-command fd redirections must be literal in the
+  # parsed command, and the tracked values are digit-validated above, so no
+  # tenant-controlled value can reach the eval string.
+  eval '"$@"'"$lw_close_args"
+}
+
+# WI#505: decode a file's device as the "major:minor" pair /proc/locks uses.
+# The dev_t layout is NOT a hex string split in half: the minor is bits 0-7
+# plus 20-31 and the major is bits 8-19 (linux/kdev_t.h), so splitting
+# `stat -c %D` at the midpoint misreads tmpfs/overlay/nvme devices (e.g. a
+# tmpfs `2e` is 0:46, not 02:0e, and a one-character hex device breaks the
+# arithmetic entirely). `stat -c %d` is the decimal dev_t; coreutils
+# `%Hd:%Ld` already decodes the layout directly, with an awk fallback.
+_lock_file_dev_id() {
+  local lock_file="$1" dev inode
+  dev="$(stat -Lc '%Hd:%Ld' "$lock_file" 2>/dev/null || true)"
+  if [[ ! "$dev" =~ ^[0-9]+:[0-9]+$ ]]; then
+    dev="$(stat -Lc '%d' "$lock_file" 2>/dev/null)" || return 1
+    dev="$(awk -v d="$dev" 'BEGIN { printf "%d:%d", int(d / 256) % 4096, (d % 256) + int(d / 1048576) * 256 }')"
+  fi
+  inode="$(stat -Lc '%i' "$lock_file" 2>/dev/null)" || return 1
+  printf '%s:%s' "$dev" "$inode"
+}
+
+# WI#505: best-effort list of LIVE processes holding a descriptor open on the
+# given lock file, for stale-holder diagnosis. /proc/locks names the original
+# flock(2) acquirer (for mt-admin the transient `flock -x` child), which is
+# usually dead and can be recycled — never kill by that value. The processes
+# that actually keep the lock held are the live inheritors, so scan
+# /proc/[0-9]/fd for open descriptors on the lock path instead (fd targets
+# keep the path even after the file is unlinked, suffixed " (deleted)").
+_lock_file_live_inheritor_pids() {
+  local lock_file="$1" pids="" pid_path pid fd_path fd_target
+  for pid_path in /proc/[0-9]*; do
+    pid="${pid_path##*/}"
+    for fd_path in "$pid_path"/fd/*; do
+      fd_target="$(readlink "$fd_path" 2>/dev/null || true)"
+      case "$fd_target" in
+        "$lock_file"|"$lock_file (deleted)") ;;
+        *) continue ;;
+      esac
+      case " $pids " in
+        *" $pid "*) ;;
+        *) pids="${pids:+$pids }$pid" ;;
+      esac
+      break
+    done
+  done
+  printf '%s' "$pids"
+}
+
+# Fail fast instead of blocking on a lock held only by leaked descriptors
+# (WI#505). A live competing mt-admin command fails loudly here too; wait for
+# it to finish before retrying. The holder list names live inheritor pids
+# (processes keeping the flock held via an inherited descriptor), never the
+# dead original acquirer from /proc/locks.
+_lock_held_preflight() {
+  local kind="$1" lock_file="$2" probe_fd holder_pids
+  exec {probe_fd}>"$lock_file" || return 1
+  if flock -x -n "$probe_fd"; then
+    flock -u "$probe_fd" || true
+    exec {probe_fd}>&-
+    return 0
+  fi
+  exec {probe_fd}>&-
+  holder_pids="$(_lock_file_live_inheritor_pids "$lock_file")"
+  die "tenant $kind lock is already held${holder_pids:+ by live inheritor pids: $holder_pids}; wait for the competing mt-admin command to finish, or stop leftover tenant daemons if they inherited the descriptor (WI#505)"
+}
+
+_lifecycle_lock_preflight() {
+  _lock_held_preflight "lifecycle for '$1'" "$TENANT_LIFECYCLE_LOCK_DIR/${1}.lock"
+}
+
 with_tenant_lifecycle_lock() {
   local name="$1"
   shift
@@ -127,6 +227,9 @@ with_tenant_lifecycle_lock() {
     LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT="$name"
     active_lock_set=true
   else
+    # WI#505: fail fast (naming any live inheritor pids) instead of blocking
+    # forever on a lock orphaned by a die inside an earlier locked section.
+    _lifecycle_lock_preflight "$name"
     exec {lock_fd}>"$TENANT_LIFECYCLE_LOCK_DIR/${name}.lock" || return 1
     if ! flock -x "$lock_fd"; then
       exec {lock_fd}>&-

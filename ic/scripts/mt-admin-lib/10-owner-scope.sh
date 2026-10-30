@@ -42,7 +42,7 @@ owner_scope_rows() {
   ensure_container_runtime
 
   local container_name="lunarwing-pg-$name"
-  _ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true \
+  _ctr_inspect "$name" -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true \
     || die "PostgreSQL not running for '$name' — start the tenant's pg container first"
 
   local psql_cmd="psql -U lunarwing -d lunarwing"
@@ -75,7 +75,7 @@ _owner_scope_needs_migration() {
   ports_get "$name" postgres >/dev/null 2>&1 || return 1
 
   # If the PG container isn't running, can't check — assume clean.
-  _ctr "$name" inspect -f '{{.State.Running}}' "lunarwing-pg-$name" 2>/dev/null | grep -q true || return 1
+  _ctr_inspect "$name" -f '{{.State.Running}}' "lunarwing-pg-$name" 2>/dev/null | grep -q true || return 1
 
   local count
   count="$(cd / && _ctr "$name" exec lunarwing-pg-$name \

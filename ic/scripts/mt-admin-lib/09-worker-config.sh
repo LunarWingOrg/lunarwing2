@@ -181,12 +181,12 @@ start_worker_task_container() {
   env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
   worker_egress_reconcile_container "$name" "$task_container"
 
-  if _ctr "$name" inspect "$task_container" &>/dev/null; then
+  if _ctr_inspect "$name" "$task_container" &>/dev/null; then
     if _container_config_changed "$name" "$task_container" "$env_file_for_hash" "$launch_contract"; then
       say "config changed for $task_container; force-recreating"
       _ctr "$name" stop "$task_container" >/dev/null 2>&1 || true
       _ctr "$name" rm -f "$task_container" >/dev/null 2>&1 || true
-    elif _ctr "$name" inspect -f '{{.State.Running}}' "$task_container" 2>/dev/null | grep -q true; then
+    elif _ctr_inspect "$name" -f '{{.State.Running}}' "$task_container" 2>/dev/null | grep -q true; then
       worker_egress_verify_after_start "$name" "$task_container"
       _store_container_hash "$name" "$task_container" "$env_file_for_hash" "$launch_contract"
       return 0
@@ -240,7 +240,7 @@ stop_worker_task_container() {
       _systemctl_user "$name" stop --no-block "${task_container}.service" >/dev/null 2>&1 || return 1
     fi
   fi
-  if _ctr "$name" inspect "$task_container" &>/dev/null; then
+  if _ctr_inspect "$name" "$task_container" &>/dev/null; then
     _ctr "$name" stop --time "$grace" "$task_container" >/dev/null 2>&1 || return 1
   fi
   if [[ "$managed" == true ]]; then
@@ -310,7 +310,7 @@ _wk() {
 
 # Healthy = container running and its role-specific liveness check passing.
 _wk_healthy() {
-    [ "\$(_wk inspect -f '{{.State.Running}}' "\${wk_container}" 2>/dev/null)" = "true" ] || return 1
+    [ "\$(_wk container inspect -f '{{.State.Running}}' "\${wk_container}" 2>/dev/null)" = "true" ] || return 1
     if [ "\${wk_role}" = "task" ]; then
         _wk exec "\${wk_container}" ${health_command}
     else
@@ -1297,12 +1297,12 @@ _stop_nanocode_container_store() {
   local label="$1" container="$2"
   shift 2
   local -a runtime=("$@")
-  "${runtime[@]}" inspect "$container" >/dev/null 2>&1 || return 0
+  "${runtime[@]}" container inspect "$container" >/dev/null 2>&1 || return 0
   if ! "${runtime[@]}" stop --time 30 "$container" >/dev/null 2>&1; then
     say "failed to stop legacy $container in $label" >&2
     return 1
   fi
-  if [[ "$("${runtime[@]}" inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)" == "true" ]]; then
+  if [[ "$("${runtime[@]}" container inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)" == "true" ]]; then
     say "legacy $container still running in $label" >&2
     return 1
   fi
@@ -1512,7 +1512,7 @@ configure_pebble() {
   say "pebble configured for tenant '$name' at $env_path"
 
   local container_name="lunarwing-pebble-$name"
-  if _ctr "$name" inspect "$container_name" &>/dev/null 2>&1; then
+  if _ctr_inspect "$name" "$container_name" &>/dev/null 2>&1; then
     say "note: restart the pebble worker to pick up new config:"
     say "  sudo $0 stop-tenant $name && sudo $0 start-tenant $name"
   fi
@@ -1570,7 +1570,7 @@ configure_opencode() {
   say "opencode LLM overrides written to $env_path for tenant '$name'"
 
   local container_name="lunarwing-opencode-$name"
-  if _ctr "$name" inspect "$container_name" &>/dev/null 2>&1; then
+  if _ctr_inspect "$name" "$container_name" &>/dev/null 2>&1; then
     say "note: restart the opencode worker to pick up the new config:"
     say "  sudo $0 stop-tenant $name && sudo $0 start-tenant $name"
   fi
@@ -1620,7 +1620,7 @@ configure_opencode2() {
   say "opencode2 LLM overrides written to $env_path for tenant '$name'"
 
   local container_name="lunarwing-opencode2-$name"
-  if _ctr "$name" inspect "$container_name" &>/dev/null 2>&1; then
+  if _ctr_inspect "$name" "$container_name" &>/dev/null 2>&1; then
     say "note: restart the opencode2 worker to pick up the new config:"
     say "  sudo $0 stop-tenant $name && sudo $0 start-tenant $name"
   fi
@@ -1936,7 +1936,7 @@ start_tenant_opencode() {
   fi
 
   worker_egress_reconcile_container "$name" "$container_name"
-  if _ctr "$name" inspect "$container_name" &>/dev/null; then
+  if _ctr_inspect "$name" "$container_name" &>/dev/null; then
     local env_file_for_hash
     env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
     if _container_config_changed \
@@ -1944,7 +1944,7 @@ start_tenant_opencode() {
       say "config changed for $container_name; force-recreating"
       _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
       _ctr "$name" rm -f "$container_name" >/dev/null 2>&1 || true
-    elif _ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true; then
+    elif _ctr_inspect "$name" -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true; then
       say "opencode worker already running ($container_name, WSS port $wss_port)"
       _store_container_hash \
         "$name" "$container_name" "$env_file_for_hash" "$opencode_launch_contract"
@@ -1961,7 +1961,7 @@ start_tenant_opencode() {
     fi
   fi
 
-  if ! _ctr "$name" inspect "$container_name" &>/dev/null; then
+  if ! _ctr_inspect "$name" "$container_name" &>/dev/null; then
     say "creating opencode worker container $container_name on WSS port $wss_port"
 
     local tenant_env_path
@@ -2106,7 +2106,7 @@ stop_tenant_opencode() {
         || _ctr "$name" stop "$container_name" >/dev/null 2>&1; then
       say "opencode worker stopped ($container_name)"
     fi
-  elif _ctr "$name" inspect "$container_name" &>/dev/null; then
+  elif _ctr_inspect "$name" "$container_name" &>/dev/null; then
     _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
     say "opencode worker stopped ($container_name)"
   fi
@@ -2191,7 +2191,7 @@ start_tenant_opencode2() {
   fi
 
   worker_egress_reconcile_container "$name" "$container_name"
-  if _ctr "$name" inspect "$container_name" &>/dev/null; then
+  if _ctr_inspect "$name" "$container_name" &>/dev/null; then
     local env_file_for_hash
     env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
     if _container_config_changed \
@@ -2199,7 +2199,7 @@ start_tenant_opencode2() {
       say "config changed for $container_name; force-recreating"
       _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
       _ctr "$name" rm -f "$container_name" >/dev/null 2>&1 || true
-    elif _ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true; then
+    elif _ctr_inspect "$name" -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true; then
       say "opencode2 worker already running ($container_name, WSS port $wss_port)"
       _store_container_hash \
         "$name" "$container_name" "$env_file_for_hash" "$launch_contract"
@@ -2216,7 +2216,7 @@ start_tenant_opencode2() {
     fi
   fi
 
-  if ! _ctr "$name" inspect "$container_name" &>/dev/null; then
+  if ! _ctr_inspect "$name" "$container_name" &>/dev/null; then
     say "creating opencode2 worker container $container_name on WSS port $wss_port"
 
     local tenant_env_path
@@ -2323,7 +2323,7 @@ stop_tenant_opencode2() {
         || _ctr "$name" stop "$container_name" >/dev/null 2>&1; then
       say "opencode2 worker stopped ($container_name)"
     fi
-  elif _ctr "$name" inspect "$container_name" &>/dev/null; then
+  elif _ctr_inspect "$name" "$container_name" &>/dev/null; then
     _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
     say "opencode2 worker stopped ($container_name)"
   fi
@@ -2573,7 +2573,7 @@ configure_kimi() {
   say "kimi LLM overrides written to $env_path for tenant '$name'"
 
   local container_name="lunarwing-kimi-$name"
-  if _ctr "$name" inspect "$container_name" &>/dev/null 2>&1; then
+  if _ctr_inspect "$name" "$container_name" &>/dev/null 2>&1; then
     say "note: restart the kimi worker to pick up the new config:"
     say "  sudo $0 stop-tenant $name && sudo $0 start-tenant $name"
   fi
@@ -2658,7 +2658,7 @@ start_tenant_kimi() {
   fi
 
   worker_egress_reconcile_container "$name" "$container_name"
-  if _ctr "$name" inspect "$container_name" &>/dev/null; then
+  if _ctr_inspect "$name" "$container_name" &>/dev/null; then
     local env_file_for_hash
     env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
     if _container_config_changed \
@@ -2666,7 +2666,7 @@ start_tenant_kimi() {
       say "config changed for $container_name; force-recreating"
       _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
       _ctr "$name" rm -f "$container_name" >/dev/null 2>&1 || true
-    elif _ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true; then
+    elif _ctr_inspect "$name" -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true; then
       say "kimi worker already running ($container_name, WSS port $wss_port)"
       _store_container_hash \
         "$name" "$container_name" "$env_file_for_hash" "$kimi_launch_contract"
@@ -2683,7 +2683,7 @@ start_tenant_kimi() {
     fi
   fi
 
-  if ! _ctr "$name" inspect "$container_name" &>/dev/null; then
+  if ! _ctr_inspect "$name" "$container_name" &>/dev/null; then
     say "creating kimi worker container $container_name on WSS port $wss_port"
 
     local kimi_env_path
@@ -2766,7 +2766,7 @@ stop_tenant_kimi() {
         || _ctr "$name" stop "$container_name" >/dev/null 2>&1; then
       say "kimi worker stopped ($container_name)"
     fi
-  elif _ctr "$name" inspect "$container_name" &>/dev/null; then
+  elif _ctr_inspect "$name" "$container_name" &>/dev/null; then
     _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
     say "kimi worker stopped ($container_name)"
   fi
@@ -2854,14 +2854,14 @@ start_tenant_pebble() {
   fi
 
   worker_egress_reconcile_container "$name" "$container_name"
-  if _ctr "$name" inspect "$container_name" &>/dev/null; then
+  if _ctr_inspect "$name" "$container_name" &>/dev/null; then
     local env_file_for_hash
     env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
     if _container_config_changed "$name" "$container_name" "$env_file_for_hash" "$pebble_launch_contract"; then
       say "config changed for $container_name; force-recreating"
       _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
       _ctr "$name" rm -f "$container_name" >/dev/null 2>&1 || true
-    elif _ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true; then
+    elif _ctr_inspect "$name" -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true; then
       say "pebble worker already running ($container_name, WSS port $wss_port)"
       _store_container_hash "$name" "$container_name" "$env_file_for_hash" "$pebble_launch_contract"
       _register_worker_unit "$name" pebble
@@ -2876,7 +2876,7 @@ start_tenant_pebble() {
     fi
   fi
 
-  if ! _ctr "$name" inspect "$container_name" &>/dev/null; then
+  if ! _ctr_inspect "$name" "$container_name" &>/dev/null; then
     say "creating pebble worker container $container_name on WSS port $wss_port"
 
     local tenant_env_path
@@ -2979,7 +2979,7 @@ stop_tenant_pebble() {
         || _ctr "$name" stop "$container_name" >/dev/null 2>&1; then
       say "pebble worker stopped ($container_name)"
     fi
-  elif _ctr "$name" inspect "$container_name" &>/dev/null; then
+  elif _ctr_inspect "$name" "$container_name" &>/dev/null; then
     _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
     say "pebble worker stopped ($container_name)"
   fi
@@ -3050,11 +3050,11 @@ stop_worker() {
     openrc_worker_stop_disable "$name" "$worker" \
       || die "failed to stop and disable OpenRC worker $worker for tenant '$name'"
     if [[ ! -x "$OPENRC_INITD_DIR/$container" ]] \
-        && _ctr "$name" inspect "$container" &>/dev/null; then
+        && _ctr_inspect "$name" "$container" &>/dev/null; then
       _ctr "$name" stop "$container" >/dev/null 2>&1 \
         || die "failed to stop container $container"
     fi
-  elif _ctr "$name" inspect "$container" &>/dev/null; then
+  elif _ctr_inspect "$name" "$container" &>/dev/null; then
     _ctr "$name" stop "$container" >/dev/null 2>&1 \
       || die "failed to stop container $container"
   fi
@@ -3085,7 +3085,7 @@ kill_worker() {
       || die "failed to disable OpenRC service $container"
   fi
 
-  if _ctr "$name" inspect "$container" &>/dev/null; then
+  if _ctr_inspect "$name" "$container" &>/dev/null; then
     _ctr "$name" stop --time 0 "$container" >/dev/null 2>&1 \
       || die "failed to kill container $container"
   fi
@@ -3165,7 +3165,7 @@ worker_listeners() {  # <tenant>
     container="lunarwing-${lane}-${name}"
     [[ "$role" != "task" ]] || container="$(worker_task_container_name "$lane" "$name")"
     rc=0
-    inspect_out="$(_ctr "$name" inspect -f '{{.State.Running}} {{.State.Pid}}' "$container" 2>&1)" || rc=$?
+    inspect_out="$(_ctr_inspect "$name" -f '{{.State.Running}} {{.State.Pid}}' "$container" 2>&1)" || rc=$?
     if ((rc != 0)); then
       if _worker_inspect_absent "$container" "$inspect_out"; then
         say "$lane: not present ($container) — skipped"
@@ -3199,7 +3199,7 @@ worker_listeners() {  # <tenant>
     # Published mappings: every HostIp must be host loopback. Docker records
     # an all-interfaces publish as "HostIp":"" — treat empty/missing as
     # all-interfaces (run-79 EI-6), never as "nothing to check".
-    if ! bindings="$(_ctr "$name" inspect -f '{{json .HostConfig.PortBindings}}' "$container" 2>/dev/null)"; then
+    if ! bindings="$(_ctr_inspect "$name" -f '{{json .HostConfig.PortBindings}}' "$container" 2>/dev/null)"; then
       say "  INSPECT FAILED: could not read PortBindings for $container"
       findings=$((findings + 1))
     elif [[ -n "$bindings" && "$bindings" != "null" ]]; then
@@ -3295,7 +3295,7 @@ worker_runtime_smoke() {  # <tenant> [opencode2]
   for role in bridge task; do
     container="lunarwing-${worker}-${name}"
     [[ "$role" != "task" ]] || container="$(worker_task_container_name "$worker" "$name")"
-    if ! _ctr "$name" inspect "$container" >/dev/null 2>&1; then
+    if ! _ctr_inspect "$name" "$container" >/dev/null 2>&1; then
       say "container $container is not running; start the $worker worker first" >&2
       failed=1
       continue

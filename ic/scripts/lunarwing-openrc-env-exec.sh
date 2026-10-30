@@ -30,6 +30,34 @@ mode="$(stat -c '%a' "$env_file" 2>/dev/null || true)"
 links="$(stat -c '%h' "$env_file" 2>/dev/null || true)"
 [[ "$owner" == "$EUID" && "$links" == 1 && "$mode" == 600 ]] || fail
 
+# WI#505: never carry a descriptor for an mt-admin lock into the daemon.
+# supervise-daemon starts this wrapper as a descendant of mt-admin's
+# rc-service call, and bash's `exec {fd}>` has no close-on-exec, so an
+# inherited fd would keep the tenant flock held for the daemon's whole
+# lifetime (a die() inside the locked section then orphans the lock). Close
+# every fd that resolves into the lifecycle or DarkIRC writer lock
+# directories; a same-path fd opened without the lock is closed too, which no
+# daemon needs. Lock descriptors point at <lockdir>/<name>.lock, so compare
+# each fd's target against the directory's dev:inode after resolving the fd's
+# own path.
+for lifecycle_lock_dir in \
+  "${LUNARWING_MT_LIFECYCLE_LOCK_DIR:-/run/lock/lunarwing-tenants}" \
+  "${LUNARWING_MT_DARKIRC_WRITER_LOCK_DIR:-/run/lock/lunarwing-darkirc}"; do
+  [[ -d "$lifecycle_lock_dir" ]] || continue
+  lock_dir_id="$(stat -Lc '%d:%i' "$lifecycle_lock_dir" 2>/dev/null || true)"
+  [[ -n "$lock_dir_id" ]] || continue
+  for fd_path in /proc/self/fd/*; do
+    fd="${fd_path##*/}"
+    [[ "$fd" =~ ^[0-9]+$ && "$fd" -ge 3 ]] || continue
+    fd_target="$(readlink "$fd_path" 2>/dev/null || true)"
+    [[ -n "$fd_target" && "$fd_target" == "$lifecycle_lock_dir"/* ]] || continue
+    target_dir_id="$(stat -Lc '%d:%i' "${fd_target%/*}" 2>/dev/null || true)"
+    [[ -n "$target_dir_id" && "$target_dir_id" == "$lock_dir_id" ]] || continue
+    eval "exec ${fd}>&-" 2>/dev/null || true
+  done
+done
+unset lifecycle_lock_dir lock_dir_id fd_path fd fd_target target_dir_id
+
 while IFS= read -r line || [[ -n "$line" ]]; do
   line="${line%$'\r'}"
   case "$line" in

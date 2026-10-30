@@ -92,9 +92,9 @@ dependencies = [
 
 [[package]]
 name = "wiggle-generate"
-version = "36.0.19"
+version = "36.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec6473357375246350a366d58ea11a38564651e472209edf224a8f1e3fc839c1"
+checksum = "fda6ac6e2611fd16ceddafc8b693fdc2e5f78fb721d2a10e596053cc0849581d"
 dependencies = [
  "anyhow",
  "heck",
@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "wiggle-macro"
-version = "36.0.19"
+version = "36.0.20"
 dependencies = [
  "proc-macro2",
  "quote",

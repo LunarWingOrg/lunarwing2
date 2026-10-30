@@ -551,7 +551,11 @@ the env file is a non-symlink, single-link, tenant-owned regular file mode
 
 Existing OpenRC fleets must first complete the [proxy migration below](#proxy-url-boundary-wi376).
 After that, tenants adopt other unit changes with `render-units <name>` followed
-by `restart-tenant <name>`. Check ownership and modes before restarting.
+by `restart-tenant <name>`. Check ownership and modes before restarting, and
+verify the rendered env and unit ports against the registry with the read-only
+`sudo ic/scripts/lunarwing-port-drift-preflight.sh <name>` (WI#509) — a wrong
+*existing* env value is never auto-corrected by `patch-env`, so it must be
+resolved before the restart rather than discovered after it.
 
 ```bash
 rc-service lunarwing-<name> start

@@ -94,6 +94,11 @@ _ctr() {
     printf 'Error: invalid internal status. Try running "podman system migrate"\n' >&2
     return 125
   fi
+  # `_ctr_inspect` sends `<runtime> container inspect ...`; collapse the typed
+  # subcommand so the fixture's verb dispatch below stays meaningful.
+  if [[ "$1 ${2:-}" == 'container inspect' ]]; then
+    shift
+  fi
   case "$1" in
     ps) printf 'PROBE\n' >>"$calls"; printf 'lunarwing-pebble-acorn\n' ;;
     inspect)

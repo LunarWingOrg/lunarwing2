@@ -183,7 +183,7 @@ render_vision_systemd_assets() {
     render_vision_systemd_fallback_unit "$name"
   elif [[ "$has_quadlet" == "true" ]]; then
     render_vision_quadlet "$name"
-  elif ! _ctr "$name" inspect "$container" &>/dev/null; then
+  elif ! _ctr_inspect "$name" "$container" &>/dev/null; then
     return 0
   elif podman_supports_quadlet; then
     render_vision_quadlet "$name"
@@ -352,7 +352,7 @@ render_voice_systemd_assets() {
     render_voice_systemd_fallback_unit "$name"
   elif [[ "$has_quadlet" == "true" ]]; then
     render_voice_quadlet "$name"
-  elif ! _ctr "$name" inspect "$container" &>/dev/null; then
+  elif ! _ctr_inspect "$name" "$container" &>/dev/null; then
     return 0
   elif podman_supports_quadlet; then
     render_voice_quadlet "$name"
@@ -1105,7 +1105,13 @@ _systemctl_user() {
   shift
   local uid
   uid="$(id -u "$name")"
-  sudo -u "$name" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user "$@"
+  # WI#505: never let user-manager units inherit tracked mt-admin lock
+  # descriptors; an inherited fd keeps the flock held after mt-admin dies.
+  # Run systemctl with the descriptors closed; mt-admin keeps its own fds and
+  # still owns the unlocks. (sudo already closes fds above 2 by default, so
+  # this is defense-in-depth for the systemd path.)
+  with_tracked_lock_fds_closed \
+    sudo -u "$name" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user "$@"
 }
 
 # Best-effort wait for the tenant's `systemd --user` manager + bus to be ready,

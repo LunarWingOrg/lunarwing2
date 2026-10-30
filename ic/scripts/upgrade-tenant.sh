@@ -177,7 +177,7 @@ if $PRUNE_OLD_ROOT; then
   # the migrated rootless PG must be healthy AND actually hold restored DATA first
   # (row count, not table count: migrations create the schema with zero data, so a
   # never-restored DB would otherwise pass and we'd delete the only copy).
-  rootless_state="$(tctr inspect -f '{{.State.Running}}' "lunarwing-pg-$TENANT" 2>/dev/null || true)"
+  rootless_state="$(tctr container inspect -f '{{.State.Running}}' "lunarwing-pg-$TENANT" 2>/dev/null || true)"
   [[ "$rootless_state" == true ]] || die "rootless PG for '$TENANT' is not running — refusing to prune (migrate + verify first)"
   tctr exec "lunarwing-pg-$TENANT" pg_isready -U lunarwing -q 2>/dev/null \
     || die "rootless PG for '$TENANT' is not accepting connections — refusing to prune"
@@ -186,11 +186,11 @@ if $PRUNE_OLD_ROOT; then
   note "rootless PG is up, ready, and holds $data_rows conversation rows (restored data is live)"
 
   # the old root-store container must exist to prune
-  if ! podman inspect "lunarwing-pg-$TENANT" >/dev/null 2>&1; then
+  if ! podman container inspect "lunarwing-pg-$TENANT" >/dev/null 2>&1; then
     say "no root-store container lunarwing-pg-$TENANT found — nothing to prune."
     exit 0
   fi
-  root_state="$(podman inspect -f '{{.State.Running}}' "lunarwing-pg-$TENANT" 2>/dev/null || true)"
+  root_state="$(podman container inspect -f '{{.State.Running}}' "lunarwing-pg-$TENANT" 2>/dev/null || true)"
   note "root-store container present (Running=$root_state) — holds the pre-upgrade v1.1.0 data"
 
   say ""
@@ -317,7 +317,7 @@ if ! $DRY_RUN; then
 fi
 
 if [[ "$KEEP_ROOTFUL" == false ]] && ! $DRY_RUN; then
-  pg_state="$(tctr inspect -f '{{.State.Running}}' "lunarwing-pg-$TENANT" 2>/dev/null || true)"
+  pg_state="$(tctr container inspect -f '{{.State.Running}}' "lunarwing-pg-$TENANT" 2>/dev/null || true)"
   [[ "$pg_state" == true ]] || die "rootless PG container for '$TENANT' is not running after add-tenant (state='${pg_state:-none}'); investigate before restore"
   note "rootless PG container is up (empty) — ready for restore"
 fi

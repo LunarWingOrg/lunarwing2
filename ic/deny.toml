@@ -207,6 +207,10 @@ unused-allowed-license = "allow"
 multiple-versions = "allow"
 wildcards = "allow"
 deny = [
+    # WI#524 (2026-10-30): RUSTSEC-2026-0424 is fixed in Wasmtime 36.0.20.
+    # Ban downgrades within our supported 36.x line, not the patched versions.
+    # No advisory ignore: other Wasmtime release lines retain RustSec coverage.
+    { name = "wasmtime", version = ">=36.0.0, <36.0.20" },
     # Version floors protecting the patched copies of advisory-pinned crates
     # against silent downgrade (MR !1371 review A3): the advisory ignores
     # above are keyed by ID, which would not fire if a future lockfile

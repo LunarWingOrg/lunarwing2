@@ -157,7 +157,14 @@ tenant_exists_in_registry() { :; }
 generate_token() { printf '0123456789abcdef0123456789abcdef\n'; }
 ports_get() { printf '10003\n'; }
 _ctr() {
-  if [[ "$2" == inspect ]]; then printf 'true\n'; else cat >/dev/null; fi
+  # RW-1/run-271: accept both the typed `_ctr_inspect` form
+  # (_ctr <name> container inspect -f <fmt> <container>) and the legacy
+  # `_ctr <name> inspect -f <fmt> <container>` form.
+  if [[ "${2:-}" == "container" && "${3:-}" == inspect ]] || [[ "${2:-}" == inspect ]]; then
+    printf 'true\n'
+  else
+    cat >/dev/null
+  fi
 }
 rotate_tenant_pg_password "$name" >/dev/null
 grep -q '^PRESERVE=yes$' "$env_file"

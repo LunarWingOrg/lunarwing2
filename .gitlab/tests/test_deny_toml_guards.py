@@ -9,12 +9,16 @@ fallback for the git-less ci-config image. The online owner-liveness half of
 MR !1795 was dropped by the scope decision: no owner-liveness job or network
 call exists. Registered in .gitlab/scripts/python_tests.py as well, so the
 suite also runs in python-unit.
+
+WI#524 also pins the Wasmtime 36.x security floor and the advisory-fixed
+cache/zstd selection in both affected lockfiles.
 """
 
 import importlib.util
 import io
 import pathlib
 import tempfile
+import tomllib
 import unittest
 from unittest import mock
 
@@ -30,6 +34,43 @@ def load_module(name: str, relative: str):
 
 
 config = load_module("validate_config", ".gitlab/scripts/validate_config.py")
+
+
+class WasmtimeSecurityFloorTests(unittest.TestCase):
+    """WI#524: fix both graphs without undoing the advisory-fixed cache patch."""
+
+    def test_policy_bans_vulnerable_36_x_not_the_fixed_release(self):
+        policy = tomllib.loads((ROOT / "ic/deny.toml").read_text(encoding="utf-8"))
+        self.assertIn(
+            {"name": "wasmtime", "version": ">=36.0.0, <36.0.20"},
+            policy["bans"]["deny"],
+        )
+        self.assertNotIn(
+            "RUSTSEC-2026-0424",
+            [entry["id"] for entry in policy["advisories"]["ignore"]],
+        )
+
+    def test_both_lockfiles_keep_the_patched_cache_and_zstd_chain(self):
+        for relative in ("ic/Cargo.lock", "ic/bridges/xmpp-bridge/Cargo.lock"):
+            with self.subTest(lockfile=relative):
+                packages = tomllib.loads(
+                    (ROOT / relative).read_text(encoding="utf-8")
+                )["package"]
+                for name, floor in (
+                    ("wasmtime", (36, 0, 20)),
+                    ("zstd", (0, 14, 3)),
+                    ("zstd-safe", (8, 2, 0)),
+                ):
+                    selected = [p for p in packages if p["name"] == name]
+                    self.assertTrue(selected, name)
+                    for package in selected:
+                        version = tuple(map(int, package["version"].split(".")))
+                        self.assertGreaterEqual(version, floor, package)
+                wasmtime = next(p for p in packages if p["name"] == "wasmtime")
+                caches = [p for p in packages if p["name"] == "wasmtime-internal-cache"]
+                self.assertEqual(len(caches), 1)
+                self.assertEqual(caches[0]["version"], wasmtime["version"])
+                self.assertNotIn("source", caches[0], "registry cache bypasses our patch")
 
 
 class DenyTomlAdvisoryGuardTests(unittest.TestCase):
