@@ -230,9 +230,7 @@ stop_worker_task_container() {
   task_container="$(worker_task_container_name "$worker" "$name")"
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "openrc" && -f "$OPENRC_INITD_DIR/${task_container}" ]]; then
-    _deregister_babysitter "$task_container"
-    _openrc_service "${task_container}-sup" stop >/dev/null 2>&1 || true
-    _openrc_service "$task_container" stop >/dev/null 2>&1 || return 1
+    _openrc_stop_worker_nondestructive "$task_container"
   elif [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
       && podman_supports_quadlet; then
     load_state="$(_systemctl_user "$name" show --value -p LoadState "${task_container}.service" 2>/dev/null)" \
