@@ -791,6 +791,10 @@ cat >"$fixture/runtime" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$CTR_LOG"
 case "${1:-}" in
+  container)
+    # Typed subcommand form used by the generated unit's health probes.
+    [[ "${2:-}" == "inspect" ]] && printf 'true\n'
+    ;;
   inspect) printf 'true\n' ;;
   start|stop) ;;
   exec) ;;
