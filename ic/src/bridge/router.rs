@@ -10259,7 +10259,7 @@ pub(crate) mod tests {
         // Exactly what the router derives from the gateway message scope
         // (`parse_engine_thread_id(message.conversation_scope())`).
         let forged = IncomingMessage::new("gateway", "attacker", "attacker message")
-            .with_conversation_scope(&victim_id.to_string());
+            .with_conversation_scope(victim_id.to_string());
         let preferred_thread_id = parse_engine_thread_id(forged.conversation_scope());
         assert_eq!(preferred_thread_id, Some(victim_id));
 
