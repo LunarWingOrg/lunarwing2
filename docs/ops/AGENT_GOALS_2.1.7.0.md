@@ -1496,25 +1496,26 @@
     - **Draft refresh (`5f99d3943`):** the landed WI#475 heartbeat-aware idle detection, once-per-boot alerts and job-detail fields replace its stale open/unreliable claim, without promising automatic external-task recovery. Added the October 28 pulldown-cmark 0.13.5 fix and Pebble digest `19f4e96c…`, the patched Wasmtime/zstd chain, WI#488 supply-chain cleanup, WI#355/WI#383 scoped backstops, WI#379 migration guard, and OpenCode 2 smoke-state cleanup. Current tracker checks keep WI#383/#425/#454/#469/#476/#490/#502/#503 and the mistyfly rollout/provenance findings WI#504–#507 separate from completed work. WI#510 clean-rebuild reproducibility is not certified by the smoke fixes. No proposed worker-version upgrade is represented as a shipped pin
     - **Release index (`f68ef3b23`):** `docs/releases/README.md` links the live Shiranui draft and lists the missing v2.1.5.0/v2.1.6.0 releases with their recorded dates. Archived release notes are immutable historical snapshots and were not rewritten to change their old work-item states.
     - **Verification on the committed drafts:** release-version self-tests **4/4** and the real-tree `v2.1.7.0` version/notes guard pass (local CI-environment inputs only; no tag created); `validate_config.py` validates **8 CI YAML files**; **34 relative links/fragments** resolve; headings are unique; all **11 owned package versions**, **13 registry versions**, worker pins, Pebble override SHA256, patched pulldown-cmark/zstd lock levels, V28 SQL, v17 ports, BuildKit daemon/parser pins, idle defaults, index dates and unchanged haiku pass source checks. The draft stays concise at **71 lines / 1505 words**. `git diff --check` clean. Markdown-only change set: no cargo build/test, container build, deployment or new runtime acceptance claimed; all task commits authored and committed as SweetieBot
+128. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/502
 
 ## Phase 8 - Advanced Operator Notes
 
-128. [x] (S) NOTE TO RECHECK ALL WIS WITH TAG FOR 2.1.6.0
-129. [x] (H) Revamped LunarWing TUI REPLv3 utilizing OpenTUI, Multimodal input/output, and more
-130. [x] (H) Remaining polish items from massive changes introduced in `Tsuno`
-131. [x] (H) General Agent Loop Engine Polish
-132. [x] (H) OPERATOR NOTE: Start the gallop
-133. [x] (S) Reserved
-134. [x] (H) operator kim config adjustments
-135. [x] (H) cadence adjustments
-136. [x] (H) check earlier ops notes i left from before
-137. [x] (H) Deploy the stoplight system
-138. [x] (H) NOTE TO LOOK AT ALL GOALS AGAIN AND REORG
-139. [x] (H) update release notes
-140. [x] (H) test build 6
-141. [x] (H) Deploy the stoplight system
+129. [x] (S) NOTE TO RECHECK ALL WIS WITH TAG FOR 2.1.6.0
+130. [x] (H) Revamped LunarWing TUI REPLv3 utilizing OpenTUI, Multimodal input/output, and more
+131. [x] (H) Remaining polish items from massive changes introduced in `Tsuno`
+132. [x] (H) General Agent Loop Engine Polish
+133. [x] (H) OPERATOR NOTE: Start the gallop
+134. [x] (S) Reserved
+135. [x] (H) operator kim config adjustments
+136. [x] (H) cadence adjustments
+137. [x] (H) check earlier ops notes i left from before
+138. [x] (H) Deploy the stoplight system
+139. [x] (H) NOTE TO LOOK AT ALL GOALS AGAIN AND REORG
+140. [x] (H) update release notes
+141. [x] (H) test build 6
 142. [x] (H) Deploy the stoplight system
-143. [x] (H} Go over all pending 2.1.7.0 Work items
-144. [x] (S) Reserved
+143. [x] (H) Deploy the stoplight system
+144. [x] (H} Go over all pending 2.1.7.0 Work items
+145. [x] (S) Reserved
 
 ---
