@@ -116,6 +116,20 @@ impl SafetyLayer {
     /// repository-file metadata. At most two 2 KiB windows are scanned per
     /// cut, keeping WI#75's bound; the byte walk is linear in the run and
     /// cheaper than the format! copy that follows.
+    ///
+    /// WI#491 (accepted boundary condition, LOW — availability/truncation,
+    /// never disclosure): the second-window discard discharges on a detector
+    /// span straddling the walked-to boundary — such a span pushes the second
+    /// window's snap to its own edge, `window_exhausted` fires, and the
+    /// legitimate retained side is discarded anyway. Consequently a >2 KiB
+    /// pure token run adjacent to an out-of-window secret span is unreachable
+    /// by both windows in one cut. Both shapes are deliberate, bounded-work
+    /// limitations: the discard is never silent (the elision notice names the
+    /// full-output recovery path) and only ever keeps LESS, so no secret can
+    /// leak through it. A third scan window would not change the observable
+    /// outcome — the straddling span would force the discard at the third
+    /// edge too. The straddle behavior is pinned head and tail by
+    /// `adversarial::second_window_exhaustion_still_discards_the_side`.
     fn secret_safe_cut(&self, output: &str, cut: usize, tail: bool) -> usize {
         let first = self.scan_cut_window(output, cut, tail);
         if !Self::window_exhausted(output, &first, tail) {
