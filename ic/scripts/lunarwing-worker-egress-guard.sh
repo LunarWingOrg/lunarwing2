@@ -68,13 +68,23 @@ keeper_image=""
 keeper_infra_image=""
 keeper_state="not applicable (rootful)"
 
+# Running client's pause-image tag prefix (`5.8.2` for a
+# `localhost/podman-pause:5.8.2-<epoch>` image). Empty when unreadable; the
+# caller then falls back to the newest local pause image.
+podman_client_version() {
+  podman_for_tenant version --format '{{.Client.Version}}' 2>/dev/null || true
+}
+
 # Pins the keeper at creation only to a local `localhost/podman-pause:<tag>`
 # image the store actually holds (override must also exist locally; a remote
 # reference is refused fail-closed). On an empty store no --infra-image is
 # passed and the validate-side keeper_uses_native_pause shape check stays the
-# gate, so creation matches the host's real pause mode.
+# gate, so creation matches the host's real pause mode. A Podman upgrade can
+# leave the previous version's pause image behind, so the derived reference
+# prefers the tag built by the running client and only then falls back to the
+# newest local `localhost/podman-pause:<tag>`.
 resolve_keeper_infra_image() {
-  local override image
+  local override image version
   override="${LUNARWING_WORKER_EGRESS_INFRA_IMAGE:-}"
   if [[ -n "$override" ]]; then
     [[ "$override" =~ ^localhost/podman-pause:.+$ ]] \
@@ -84,8 +94,14 @@ resolve_keeper_infra_image() {
     printf '%s\n' "$override"
     return 0
   fi
+  version="$(podman_client_version)"
   image="$(podman_for_tenant images --format '{{.Repository}}:{{.Tag}}' \
-    | awk -F: '$1 == "localhost/podman-pause" && $2 != "" { print; exit }')" \
+    | awk -F: -v want="$version" '
+        $1 == "localhost/podman-pause" && $2 != "" {
+          if (want != "" && ($2 == want || index($2, want "-") == 1)) { print; found = 1; exit }
+          if (first == "") first = $0
+        }
+        END { if (!found && first != "") print first }')" \
     || die "cannot read the local podman image store to resolve the keeper infra image"
   printf '%s\n' "$image"
 }

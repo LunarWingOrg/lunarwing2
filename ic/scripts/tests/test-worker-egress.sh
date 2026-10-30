@@ -585,6 +585,7 @@ case "${1:-} ${2:-}" in
     if [[ -f "$state/store" ]]; then cat "$state/store"; fi
     exit 0
     ;;
+  'version --format') printf '%s\n' "${FAKE_PODMAN_VERSION-5.8.2}" ;;
   'pod create')
     shift 2
     infra=""
@@ -755,6 +756,39 @@ if PATH="$rootless_bin:$PATH" \
     "pod create carries the local store's pause image"
 else
   fail "store-derived pin refused: $(cat "$fixture/store-pin.out")"
+fi
+
+# SQ-1 (!2092 run-284): a Podman upgrade can leave the previous version's
+# pause image in the store. Prefer the tag built by the running client.
+rm -rf -- "$rootless_state"
+mkdir -p "$rootless_state"
+printf 'localhost/podman-pause:5.9.0-1800000000\nlocalhost/podman-pause:5.8.2-1730000000\n' >"$rootless_state/store"
+: >"$rootless_bin/podman.log"
+: >"$rootless_bin/nft.log"
+if FAKE_PODMAN_VERSION='5.9.0' PATH="$rootless_bin:$PATH" \
+    "$guard" "$fixture/alpha.nft" rootless fwd_alpha alpha >"$fixture/version-pin.out" 2>&1; then
+  pass "store-derived pin prefers the running Podman version"
+  assert_contains "$(grep '^pod create' "$rootless_bin/podman.log")" \
+    '--infra-image localhost/podman-pause:5.9.0-1800000000' \
+    "pod create pins the running version's pause image, not the older one"
+else
+  fail "version-preferred pin refused: $(cat "$fixture/version-pin.out")"
+fi
+
+# With no local tag matching the running version, the newest image is used.
+rm -rf -- "$rootless_state"
+mkdir -p "$rootless_state"
+printf 'localhost/podman-pause:5.8.2-1730000000\n' >"$rootless_state/store"
+: >"$rootless_bin/podman.log"
+: >"$rootless_bin/nft.log"
+if FAKE_PODMAN_VERSION='6.1.4' PATH="$rootless_bin:$PATH" \
+    "$guard" "$fixture/alpha.nft" rootless fwd_alpha alpha >"$fixture/version-fallback.out" 2>&1; then
+  pass "store-derived pin falls back to the newest local pause image"
+  assert_contains "$(grep '^pod create' "$rootless_bin/podman.log")" \
+    '--infra-image localhost/podman-pause:5.8.2-1730000000' \
+    "fallback pins the newest local pause image when the version has no match"
+else
+  fail "version-fallback pin refused: $(cat "$fixture/version-fallback.out")"
 fi
 
 # The operator override must exist locally; a remote reference never reaches

@@ -646,7 +646,10 @@ Enforced controls (opencode2 lane unless noted):
    The reference is never invented — a pinned `--infra-image` always names an
    image the store already holds, and the `LUNARWING_WORKER_EGRESS_INFRA_IMAGE`
    override is refused unless it is a `localhost/podman-pause:<tag>` reference
-   present locally (WI#516). The root-owned guard
+   present locally (WI#516). The derived reference prefers the pause tag built
+   by the running Podman client and falls back to the newest local
+   `localhost/podman-pause:<tag>` when no tag matches (e.g. after a Podman
+   upgrade leaves the previous version's image behind). The root-owned guard
    verifies the keeper's ownership label, single infra-container shape, local
    `localhost/podman-pause:<tag>` image and exclusive network attachment, then
    loads the rules and reads both reject chains in one
