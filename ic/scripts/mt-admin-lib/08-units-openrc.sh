@@ -73,7 +73,7 @@ _vis() {
 }
 
 _vis_healthy() {
-    [ "\$(_vis inspect -f '{{.State.Running}}' "\${vis_container}" 2>/dev/null)" = "true" ] || return 1
+    [ "\$(_vis container inspect -f '{{.State.Running}}' "\${vis_container}" 2>/dev/null)" = "true" ] || return 1
     _vis exec "\${vis_container}" curl -sf -o /dev/null --max-time 3 "http://127.0.0.1:\${vis_health_internal_port}/health" 2>/dev/null
 }
 
@@ -194,7 +194,7 @@ _voice() {
 }
 
 _voice_healthy() {
-    [ "\$(_voice inspect -f '{{.State.Running}}' "\${voice_container}" 2>/dev/null)" = "true" ] || return 1
+    [ "\$(_voice container inspect -f '{{.State.Running}}' "\${voice_container}" 2>/dev/null)" = "true" ] || return 1
     _voice exec "\${voice_container}" curl -sf -o /dev/null --max-time 3 "http://127.0.0.1:\${voice_health_internal_port}/health" 2>/dev/null \
         && _voice exec "\${voice_container}" curl -sf -o /dev/null --max-time 3 "http://127.0.0.1:\${voice_health_internal_port}/ready" 2>/dev/null
 }
@@ -872,7 +872,7 @@ status() {
     # connections (pg_isready) — a Running-but-wedged DB (crash recovery, disk
     # full, max_connections) otherwise reports healthy and is never remediated.
     # Mirrors the worker units' _wk_healthy and this unit's own start() gate.
-    if [ "\$(_pg inspect -f '{{.State.Running}}' "\${pg_container}" 2>/dev/null)" = "true" ] \\
+    if [ "\$(_pg container inspect -f '{{.State.Running}}' "\${pg_container}" 2>/dev/null)" = "true" ] \\
        && _pg exec "\${pg_container}" pg_isready -U lunarwing -q -t 3 2>/dev/null; then
         einfo "\${pg_container}: started"; return 0
     fi

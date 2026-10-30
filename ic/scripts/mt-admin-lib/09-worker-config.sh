@@ -310,7 +310,7 @@ _wk() {
 
 # Healthy = container running and its role-specific liveness check passing.
 _wk_healthy() {
-    [ "\$(_wk inspect -f '{{.State.Running}}' "\${wk_container}" 2>/dev/null)" = "true" ] || return 1
+    [ "\$(_wk container inspect -f '{{.State.Running}}' "\${wk_container}" 2>/dev/null)" = "true" ] || return 1
     if [ "\${wk_role}" = "task" ]; then
         _wk exec "\${wk_container}" ${health_command}
     else

@@ -266,16 +266,27 @@ printf 'RESULT: all worker startup tests passed\n'
 # NOTE: sourcing lunarwing-mt-admin.sh reassigns SCRIPT_DIR to ic/scripts, so
 # resolve the library dir from BASH_SOURCE, not SCRIPT_DIR.
 LIB_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../mt-admin-lib" && pwd)"
-# Pin 1 (static): no generic `_ctr "<var>" inspect` may remain anywhere in
-# mt-admin-lib — a generic inspect resolves a name across containers AND
-# volumes, and prefix-matches, so the worker bridge container
-# `lunarwing-<worker>-<tenant>` cross-matches its IPC volume
-# `lunarwing-<worker>-<tenant>-ipc-v2` and the existence gate skips creation.
-generic_hits="$(grep -rnE '_ctr "[$][a-z_]+" inspect' "$LIB_DIR/" || true)"
+# Pin 1 (static, widened per run-280 RZ-4): NO generic runtime `inspect` may
+# remain anywhere in mt-admin-lib — not just `_ctr "<var>" inspect`, but every
+# form (brace variables, `$1`, uppercase, wrapped calls, `_root_ctr`, `tctr`,
+# bare `podman`/`docker`, `"$CONTAINER_RT"`, `"${runtime[@]}"`). A generic
+# inspect resolves a name across containers AND volumes, and prefix-matches,
+# so the worker bridge container `lunarwing-<worker>-<tenant>` cross-matches
+# its IPC volume `lunarwing-<worker>-<tenant>-ipc-v2` and the existence gate
+# skips creation. Every runtime inspect must use a typed subcommand
+# (container/image/volume/network/pod); comments, prose ("cannot inspect ...")
+# and the `_worker_inspect_absent` helper name are excluded by construction.
+generic_hits="$(
+  grep -rnw 'inspect' "$LIB_DIR/" 2>/dev/null \
+    | grep -vE '(container|image|volume|network|pod)[[:space:]]+inspect' \
+    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' \
+    | grep -vE '(_worker_inspect_absent|could not inspect|cannot inspect|failed to inspect|inspect the output|inspect status|inspect before|inspect and move)' \
+    || true
+)"
 if [[ -n "$generic_hits" ]]; then
-  fail "generic _ctr inspect remains in mt-admin-lib (would prefix-match volumes): $generic_hits"
+  fail "generic runtime inspect remains in mt-admin-lib (would prefix-match volumes): $generic_hits"
 else
-  pass 'static pin: no generic _ctr "<var>" inspect in mt-admin-lib'
+  pass 'static pin: every runtime inspect in mt-admin-lib is a typed subcommand'
 fi
 
 # Pin 2 (behavioural): a store where generic `inspect X` prefix-resolves to the
@@ -345,5 +356,60 @@ for lane in pebble opencode kimi opencode2; do
   _ipc_volume_trap "$lane" alice
 done
 
+# Pin 3 (behavioural, run-280 RZ-4): the TASK-container existence gate in
+# start_worker_task_container (09-worker-config.sh) must use the typed
+# `container inspect` too. A generic `inspect <task>` prefix-resolves to the
+# task container's own IPC volume `...-task-<t>-ipc-v2`, the gate would read
+# the volume as the container, skip `run -d --name`, and the split-task role
+# would never start. Same store shape as Pin 2, applied to the task gate:
+# every lane must still reach `run -d --name <task-container>`.
+_task_gate_trap() {  # <worker> <tenant>
+  local worker="$1" tenant="$2"
+  local task_bridge="lunarwing-${worker}-task-${tenant}"
+  local task_volume="${task_bridge}-ipc-v2"
+  : >"$events"
+  unset _ctr
+  _ctr() {
+    local name="$1"; shift
+    case "${1:-}" in
+      container)
+        # Typed inspect: the task container does not exist yet.
+        [[ "${2:-}" == inspect && "${3:-}" == "$task_bridge" ]] && return 1
+        return 0 ;;
+      inspect)
+        # GENERIC inspect: prefix-resolves the task bridge name to its IPC
+        # volume — the exact production-bug shape for the task gate.
+        [[ "${2:-}" == "$task_bridge" ]] && { printf 'volume %s\n' "$task_volume"; return 0; }
+        return 1 ;;
+      image)
+        local uid
+        uid="$(worker_task_uid "$worker")"; printf '%s:%s\n' "$uid" "$uid" ;;
+      run)
+        [[ "${2:-}" == -d ]] || return 0
+        record "task-run-reached:$4"
+        return 0 ;;
+      *) return 0 ;;
+    esac
+  }
+  start_tenant_postgres() { :; }
+  start_tenant_vision() { :; }
+  start_tenant_voice() { :; }
+  set +e
+  start_worker_task_container "$tenant" "$worker" "lunarwing-worker-${worker}:latest" \
+    "$fixture/workspace" TASK_USERNS_ARGS TASK_ENV_FLAGS TASK_MOUNTS TASK_RESTART_ARG \
+    >"$output" 2>&1
+  local src=$?
+  set -e
+  if grep -q "task-run-reached:$task_bridge" "$events"; then
+    pass "task gate typed inspect reaches run -d for $worker despite the $task_volume prefix-match"
+  else
+    fail "$worker task gate was fooled by the IPC volume (no run -d reached); rc=$src"
+    command cat "$output" >&2
+  fi
+}
+for lane in pebble opencode kimi opencode2; do
+  _task_gate_trap "$lane" alice
+done
+
 if [[ "$failures" -ne 0 ]]; then printf 'RESULT: %s failure(s)\n' "$failures"; exit 1; fi
-printf 'RESULT: RW-3 pins passed (typed inspect static + IPC-volume behavioural)\n'
+printf 'RESULT: RW-3/RZ-4 pins passed (typed inspect static + bridge/task behavioural)\n'
