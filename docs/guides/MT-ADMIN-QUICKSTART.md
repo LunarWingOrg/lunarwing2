@@ -263,6 +263,17 @@ sudo ic/scripts/lunarwing-mt-admin.sh restart-worker ruffles kimi
 sudo ic/scripts/lunarwing-mt-admin.sh restart-worker ruffles opencode2
 ```
 
+### Port drift pre-flight
+
+`ic/scripts/lunarwing-port-drift-preflight.sh` (WI#509) generalizes the WeeChat preflight's env-vs-registry comparison to every service whose port lands in a rendered file. It is read-only, covers both init systems, and never prints secret values (env content is reduced to a port or a strict loopback URL before display):
+
+```bash
+sudo ic/scripts/lunarwing-port-drift-preflight.sh          # every tenant
+sudo ic/scripts/lunarwing-port-drift-preflight.sh ruffles  # one tenant
+```
+
+It cross-checks `lunarwing.env` (gateway/http/orchestrator/coord_admin/adapter/worker WSS ports, the XMPP/relay/adapter/darkirc/vision/voice URLs, and the `DATABASE_URL` port), `xmpp-bridge.env`'s `XMPP_BRIDGE_BIND`, `proxy.env` plus the rendered proxy unit's `--port` on either init, `darkirc-adapter.env` and `darkirc_config.toml` for darkirc tenants, and every systemd Quadlet's `PublishPort` host ports. A wrong *existing* value is a FAIL (patch-env will not overwrite it); a missing value is a WARN (the next render back-fills it); a missing Quadlet is INFO (OpenRC and docker-rootful hosts legitimately have none). Run it after manual env edits, restores, or partial upgrades, and resolve FAILs before restarting. The WeeChat relay credential checks stay in `lunarwing-weechat-preflight.sh`.
+
 For init-agnostic diagnostics, prefer the read-only inspection verbs over raw `psql`/`ps`/`pgrep` against tenant state (WI#268):
 
 ```bash
@@ -310,6 +321,7 @@ sudo ic/scripts/lunarwing-mt-admin.sh remove-tenant ruffles --purge
 - [ ] PostgreSQL backup and restore were rehearsed.
 - [ ] Worker, channel, tunnel, and OCR ports come from the registry.
 - [ ] WeeChat relay and adapter pass preflight when enabled.
+- [ ] Port drift pre-flight passes (env files and rendered units match the registry).
 - [ ] DarkIRC contacts use the typed exchange/fingerprint workflow when enabled.
 - [ ] Host health pipeline is installed through MT admin and discovers every tenant.
 - [ ] [`TESTING_GUIDE.md`](TESTING_GUIDE.md) checks pass or have explicit reviewed deferrals.
