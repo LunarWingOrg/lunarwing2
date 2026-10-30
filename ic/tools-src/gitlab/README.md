@@ -20,6 +20,15 @@ injection, bounded errors, and approval gating.
 - CI/CD: `list_pipelines`, `get_pipeline`, `list_jobs`
 - Profile: `current_user`
 
+`list_jobs` returns each job reduced to a flat field set (`id`, `name`,
+`stage`, `status`, `failure_reason`, `ref`, `tag`, `allow_failure`,
+`started_at`, `finished_at`, `duration`, `queued_duration`, `web_url`,
+`created_at`). GitLab's full job payload nests large `pipeline`, `commit`,
+`runner`, `user`, and `artifacts` objects; a full page of them exceeded the
+sandboxed guest's memory ceiling and trapped the tool against failing
+pipelines (WI#525). The kept set is the surface CI-failure investigation
+actually needs; follow a job's `web_url` for anything else.
+
 `project` accepts a numeric project ID or `group/project`, as a JSON string or
 number, and may also be spelled `project_id`. Issue, Work Item, and merge
 request `iid` values are project-local IDs shown by GitLab, not global IDs.
