@@ -458,6 +458,8 @@ as an unprivileged user with WeeChat and tmux installed.
 
 Preflight reports the password only as `set (<N> chars)` or `missing` — it never prints the value. Absent relay config or missing minimal env are classified as FAIL with explicit recovery guidance.
 
+For the other services' env-vs-registry port checks (gateway, HTTP, XMPP bridge, proxy, darkirc, vision/voice, worker WSS/health, Quadlet `PublishPort`s), run the generalized drift verifier `ic/scripts/lunarwing-port-drift-preflight.sh` (WI#509) — the WeeChat relay credential checks stay here.
+
 ## DM Access Control (`dm_policy`)
 
 WeeChat's `dm_policy` defaults to `pairing`: an unpaired IRC sender receives pairing instructions and does **not** execute under owner scope. This matches the capabilities/setup prompt and the audit-corrected code default.
