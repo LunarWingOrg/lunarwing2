@@ -56,6 +56,13 @@ const EVENTS_PREFIX: &str = "engine/.runtime/events";
 const LEASES_PREFIX: &str = "engine/.runtime/leases";
 const CONVERSATIONS_PREFIX: &str = "engine/.runtime/conversations";
 
+/// Owner stamped by `#[serde(default)]` onto pre-multi-tenancy thread records.
+///
+/// Must match `lunarwing_engine::types`'s private `default_user_id`; the boot
+/// `migrate_legacy_user_ids` pass rewrites these to the real owner, so
+/// `save_thread` must still allow overwriting them (WI#502).
+const LEGACY_THREAD_OWNER: &str = "legacy";
+
 // Well-known titles for special-case routing (must match engine crate constants)
 const ORCHESTRATOR_MAIN_TITLE: &str = "orchestrator:main";
 const ORCHESTRATOR_FAILURES_TITLE: &str = "orchestrator:failures";
@@ -1528,6 +1535,19 @@ fn thread_path(thread_id: ThreadId) -> String {
     format!("{THREADS_PREFIX}/{}.json", thread_id.0)
 }
 
+/// Whether `save_thread` may replace a record owned by `existing_owner` with
+/// one owned by `incoming_owner`.
+///
+/// Only a *distinct real user* is a collision. Two rewrites are legitimate:
+/// pre-multi-tenancy data still carrying the serde default owner (the
+/// `migrate_legacy_user_ids` boot pass stamps the real owner onto it), and
+/// shared-owner records, which are global by construction.
+fn thread_owners_compatible(existing_owner: &str, incoming_owner: &str) -> bool {
+    existing_owner == incoming_owner
+        || existing_owner == LEGACY_THREAD_OWNER
+        || lunarwing_engine::types::is_shared_owner(existing_owner)
+}
+
 fn conversation_path(conversation_id: ConversationId) -> String {
     format!("{CONVERSATIONS_PREFIX}/{}.json", conversation_id.0)
 }
@@ -1893,6 +1913,25 @@ fn truncate_for_readme(s: &str, max: usize) -> String {
 #[async_trait::async_trait]
 impl Store for HybridStore {
     async fn save_thread(&self, thread: &Thread) -> Result<(), EngineError> {
+        // WI#502: `save_thread` is a keyed write — it replaces whatever record
+        // occupies `thread_path(thread.id)`. Refuse to overwrite a thread that
+        // belongs to a different owner, so a forged/colliding ThreadId can never
+        // replace another user's persisted record (the engine-trait contract
+        // gap; every `Store` impl keyed by ThreadId has the same shape).
+        if let Some(existing) = self.load_thread(thread.id).await?
+            && !thread_owners_compatible(&existing.user_id, &thread.user_id)
+        {
+            warn!(
+                thread_id = %thread.id,
+                existing_owner = %existing.user_id,
+                incoming_owner = %thread.user_id,
+                "refusing to overwrite a thread owned by another user"
+            );
+            return Err(EngineError::AccessDenied {
+                user_id: thread.user_id.clone(),
+                entity: format!("thread {}", thread.id),
+            });
+        }
         self.persist_json_result(&thread_path(thread.id), thread)
             .await?;
         self.threads.write().await.insert(thread.id, thread.clone());
@@ -3504,6 +3543,112 @@ title: \"old doc\"\n\
         assert_eq!(
             reloaded_lease.revoked_reason.as_deref(),
             Some("owning thread reached terminal state")
+        );
+    }
+
+    /// WI#502: `save_thread` is keyed by thread id, so it must refuse to
+    /// replace a record owned by a different user. This is the durable half of
+    /// the "forged gateway thread_id" boundary — even if some future caller
+    /// bypassed the engine-entry check, the store cannot clobber the victim.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn save_thread_refuses_to_overwrite_another_users_thread() {
+        use lunarwing_engine::types::thread::{ThreadConfig, ThreadType};
+
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let store = HybridStore::new(Some(Arc::new(Workspace::new_with_db(
+            "thread-owner-guard",
+            db,
+        ))));
+
+        let mut victim = Thread::new(
+            "victim goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "victim",
+            ThreadConfig::default(),
+        );
+        victim.state = ThreadState::Done;
+        victim.add_message(lunarwing_engine::ThreadMessage::user("victim secret"));
+        store
+            .save_thread(&victim)
+            .await
+            .expect("seed victim thread");
+
+        let mut forged = Thread::new(
+            "attacker goal",
+            ThreadType::Foreground,
+            victim.project_id,
+            "attacker",
+            ThreadConfig::default(),
+        );
+        forged.id = victim.id;
+        forged.add_message(lunarwing_engine::ThreadMessage::user("attacker content"));
+
+        let error = store
+            .save_thread(&forged)
+            .await
+            .expect_err("a foreign-owner overwrite must be refused");
+        assert!(
+            matches!(error, EngineError::AccessDenied { .. }),
+            "expected AccessDenied, got {error:?}"
+        );
+
+        let persisted = store
+            .load_thread(victim.id)
+            .await
+            .expect("load victim thread")
+            .expect("victim thread still present");
+        assert_eq!(persisted.user_id, "victim");
+        assert_eq!(persisted.goal, "victim goal");
+        assert_eq!(
+            persisted.messages.last().map(|m| m.content.as_str()),
+            Some("victim secret"),
+            "the victim's messages must not be replaced"
+        );
+
+        // The same user may still rewrite their own record (the gateway reuses
+        // one UI thread id across turns).
+        let mut rewritten = persisted.clone();
+        rewritten.state = ThreadState::Running;
+        store
+            .save_thread(&rewritten)
+            .await
+            .expect("a same-owner rewrite is allowed");
+    }
+
+    /// Pre-multi-tenancy records carry the serde default owner until
+    /// `migrate_legacy_user_ids` stamps the real one, so that rewrite must
+    /// still pass the ownership guard.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn save_thread_allows_stamping_the_legacy_owner() {
+        use lunarwing_engine::types::thread::{ThreadConfig, ThreadType};
+
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let store = HybridStore::new(Some(Arc::new(Workspace::new_with_db("thread-legacy", db))));
+
+        let mut legacy = Thread::new(
+            "old goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            LEGACY_THREAD_OWNER,
+            ThreadConfig::default(),
+        );
+        legacy.state = ThreadState::Done;
+        store
+            .save_thread(&legacy)
+            .await
+            .expect("seed legacy thread");
+
+        legacy.user_id = "alice".to_string();
+        store
+            .save_thread(&legacy)
+            .await
+            .expect("the legacy sentinel may be stamped with the real owner");
+        assert_eq!(
+            store.load_thread(legacy.id).await.unwrap().unwrap().user_id,
+            "alice"
         );
     }
 
