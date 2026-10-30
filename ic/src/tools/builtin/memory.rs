@@ -111,21 +111,23 @@ pub(crate) fn resolve_memory_write_target(target: &str, tz: chrono_tz::Tz) -> St
 
 pub(crate) fn normalize_memory_tool_path(path: &str) -> Result<String, ToolError> {
     let normalized = normalize_path(path);
-    if is_engine_runtime_path(&normalized) {
+    // The whole `engine/**` tree is engine-owned, boot-loaded state. Beyond
+    // the runtime state (`engine/.runtime`) and the mission records
+    // (`engine/projects/*/missions/**/mission.json`, which `HybridStore`
+    // loads through `Mission::from_value` at boot, bypassing every
+    // `create_mission` check — cadence validation, webhook-secret
+    // references, ownership, dedup — and can resurrect deleted missions),
+    // `load_knowledge_docs` boot-loads `engine/knowledge/**` and
+    // `engine/orchestrator/**` into `doc_paths`/`docs` keyed by
+    // `memory_doc.id`. A forged doc there with a colliding id REPLACES the
+    // real doc's id→path mapping at boot (engine-doc shadowing), is surfaced
+    // in memory_search wearing the `engine_internal` provenance label, and
+    // can outrank real orchestrator code versions. Reserve the whole tree,
+    // matching the harness write-back and external-worker lanes (WI#322,
+    // widened to the full tree for WI#455).
+    if is_engine_internal_path(&normalized) {
         return Err(ToolError::NotAuthorized(
-            "internal Engine runtime state is not accessible through memory tools".to_string(),
-        ));
-    }
-    // The engine projects tree holds engine-owned state, most critically the
-    // mission records (`engine/projects/*/missions/**/mission.json`) that
-    // HybridStore loads through `Mission::from_value` at boot — a memory
-    // write here would bypass every `create_mission` check (cadence
-    // validation, webhook-secret references, ownership, dedup) and can
-    // resurrect deleted missions. The whole tree is reserved, project
-    // documents included, not just the missions subtree (WI#322).
-    if is_engine_projects_path(&normalized) {
-        return Err(ToolError::NotAuthorized(
-            "engine project and mission records (engine/projects/) are Engine-owned state"
+            "engine-managed paths (engine/**) are Engine-owned state and not writable through memory tools"
                 .to_string(),
         ));
     }
@@ -1370,24 +1372,34 @@ mod tests {
             ));
         }
 
-        assert_eq!(
-            normalize_memory_tool_path(" engine//.runtime-notes.md/ ").expect("near match"),
-            "engine/.runtime-notes.md"
-        );
+        // A nested engine-looking path outside the root `engine/` prefix
+        // stays ordinary; `engine/.runtime-notes.md` still enters the
+        // engine tree, so it is reserved like any other `engine/` path.
+        assert!(matches!(
+            normalize_memory_tool_path(" engine//.runtime-notes.md/ "),
+            Err(ToolError::NotAuthorized(_))
+        ));
         assert_eq!(
             normalize_memory_tool_path("foo/engine/.runtime/file.json").expect("nested path"),
             "foo/engine/.runtime/file.json"
         );
     }
 
-    /// WI#322: memory tools must not touch the engine projects tree — a
-    /// memory write under `engine/projects/*/missions/**/mission.json` is
-    /// loaded through `Mission::from_value` at boot, bypassing every
-    /// `create_mission` check. The whole tree is reserved, and traversal
-    /// (`..`) that escapes it stays an ordinary path.
+    /// WI#322 reserved the engine projects tree; WI#455 widened the
+    /// reservation to the whole `engine/**` tree. A memory write under
+    /// `engine/projects/*/missions/**/mission.json` is loaded through
+    /// `Mission::from_value` at boot, bypassing every `create_mission`
+    /// check, and `load_knowledge_docs` boot-loads `engine/knowledge/**` +
+    /// `engine/orchestrator/**` keyed by `memory_doc.id`, so a forged doc
+    /// shadows the real doc's id→path mapping at boot. Traversal (`..`)
+    /// that stays inside the tree is still reserved; only traversal that
+    /// escapes the tree entirely stays an ordinary path.
     #[test]
-    fn memory_tool_paths_reserve_engine_projects_tree() {
+    fn memory_tool_paths_reserve_engine_tree() {
         for path in [
+            "engine",
+            "engine/.runtime",
+            "engine/.runtime/events/id.json",
             "engine/projects",
             "engine/projects/foo",
             " engine//projects/foo/project.json/ ",
@@ -1396,6 +1408,12 @@ mod tests {
             "engine/projects/foo/missions/bar/mission.json.bak",
             "engine/projects/foo/missions/bar/other.json",
             "engine/./projects/../projects/foo/missions/bar/mission.json",
+            "engine/knowledge/notes/x.json",
+            "engine/knowledge/summaries/id.json",
+            "engine/orchestrator/v3.py",
+            "engine/orchestrator/failures.json",
+            "engine/MEMORY.md",
+            "engine/projects/../MEMORY.md",
         ] {
             assert!(
                 matches!(
@@ -1406,9 +1424,10 @@ mod tests {
             );
         }
 
-        // Near matches and escaped traversal stay ordinary paths.
+        // Sibling trees, nested engine-looking paths outside the root
+        // `engine/` prefix, and traversal that escapes the tree entirely
+        // stay ordinary paths.
         for (path, expected) in [
-            ("engine/projects-notes.md", "engine/projects-notes.md"),
             (
                 "projects/foo/missions/bar/mission.json",
                 "projects/foo/missions/bar/mission.json",
@@ -1417,11 +1436,7 @@ mod tests {
                 "foo/engine/projects/file.json",
                 "foo/engine/projects/file.json",
             ),
-            ("engine/projects/../MEMORY.md", "engine/MEMORY.md"),
-            (
-                "engine/projectz/x/mission.json",
-                "engine/projectz/x/mission.json",
-            ),
+            ("engine/../MEMORY.md", "MEMORY.md"),
         ] {
             assert_eq!(
                 normalize_memory_tool_path(path).expect("ordinary path"),
