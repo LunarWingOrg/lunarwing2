@@ -148,12 +148,15 @@ pub async fn memory_write_handler(
     // Shadow backup files (backups/) are written only by the shadow-backup
     // rotation itself, and quarantined daily logs (daily/*.poisoned-*.md)
     // hold live injection evidence; neither may be overwritten or erased
-    // through this route (WI#288 review T-2/J-2). The engine projects tree
-    // (engine/projects/**, most critically the mission records) is
-    // Engine-owned state loaded at boot without create_mission validation;
-    // writing it through memory tools would forge or resurrect mission
-    // records, so it is reserved the same way (WI#322). Reads stay open for
-    // operator recovery.
+    // through this route (WI#288 review T-2/J-2). The whole engine tree
+    // (engine/**) is Engine-owned, boot-loaded state: the mission records
+    // under engine/projects/** load at boot without create_mission
+    // validation, and engine/knowledge/** + engine/orchestrator/** are
+    // boot-loaded by load_knowledge_docs keyed by memory_doc.id, so a forged
+    // doc shadows the real doc's id→path mapping at boot. The full tree is
+    // reserved the same way, matching the harness write-back and
+    // external-worker lanes (WI#322, widened to the full tree for WI#455).
+    // Reads stay open for operator recovery.
     let normalized_path = crate::workspace::normalize_path(&req.path);
     if crate::workspace::is_backup_path(&normalized_path) {
         return Err((
@@ -161,10 +164,10 @@ pub async fn memory_write_handler(
             "backups/ paths are reserved for the shadow-backup rotation".to_string(),
         ));
     }
-    if crate::workspace::is_engine_projects_path(&normalized_path) {
+    if crate::workspace::is_engine_internal_path(&normalized_path) {
         return Err((
             StatusCode::FORBIDDEN,
-            "engine/projects/ paths are Engine-owned project and mission records".to_string(),
+            "engine-managed paths (engine/**) are Engine-owned state".to_string(),
         ));
     }
     if crate::workspace::is_quarantined_daily_log(&normalized_path) {
