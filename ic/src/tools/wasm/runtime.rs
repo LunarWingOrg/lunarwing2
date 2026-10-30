@@ -431,6 +431,43 @@ mod tests {
         );
     }
 
+    /// Exercise the patched zstd cache through Wasmtime, not just TOML loading.
+    /// A fresh engine/cache must load and execute the compressed component.
+    #[test]
+    fn test_compilation_cache_component_round_trip() -> anyhow::Result<()> {
+        use wasmtime::component::{Component, Linker};
+        use wasmtime::{Cache, CacheConfig, Config, Engine, Store};
+
+        let tmp = tempfile::tempdir()?;
+        let mut config = Config::new();
+        // Keep configuration out of the directory the cache worker cleans.
+        let mut cache_config = CacheConfig::new();
+        cache_config.with_directory(tmp.path().join("artifacts"));
+        let component_wat = r#"
+            (component
+                (core module $m
+                    (func (export "answer") (result i32) i32.const 42))
+                (core instance $i (instantiate $m))
+                (func (export "answer") (result u32)
+                    (canon lift (core func $i "answer"))))
+        "#;
+
+        for cached in [false, true] {
+            let cache = Cache::new(cache_config.clone())?;
+            config.cache(Some(cache.clone()));
+            let engine = Engine::new(&config)?;
+            let component = Component::new(&engine, component_wat)?;
+            let mut store = Store::new(&engine, ());
+            let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+            let answer = instance.get_typed_func::<(), (u32,)>(&mut store, "answer")?;
+            assert_eq!(answer.call(&mut store, ())?, (42,));
+            answer.post_return(&mut store)?;
+            assert_eq!(cache.cache_hits(), usize::from(cached));
+            assert_eq!(cache.cache_misses(), usize::from(!cached));
+        }
+        Ok(())
+    }
+
     /// Two engines with different labels must get independent cache directories
     /// so that their file locks do not conflict. Regression test for #448.
     #[test]
