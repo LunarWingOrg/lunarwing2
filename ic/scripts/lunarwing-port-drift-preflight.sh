@@ -18,19 +18,22 @@
 #   darkirc-adapter.env DARKIRC_PORT, ADAPTER_PORT        (darkirc enabled)
 #   darkirc_config.toml irc_listen, rpc_listen             (darkirc enabled)
 #   systemd Quadlets    PublishPort host ports for the pg / vision / voice
-#                       containers and every enabled external worker
-#   systemd proxy unit  ExecStart --port                   (proxy enabled)
-#   OpenRC proxy unit   proxy_args --port                  (proxy enabled)
+#                       containers and every enabled external worker (must be
+#                       strict 127.0.0.1 mappings; a host-less or 0.0.0.0
+#                       publish FAILs instead of hiding as "no host ports")
+#   systemd proxy unit  ExecStart --port + --bind 127.0.0.1  (proxy enabled)
+#   OpenRC proxy unit   proxy_args --port + --bind 127.0.0.1 (proxy enabled)
 #
 # The WeeChat relay.conf / weechat.env credential checks stay in
 # lunarwing-weechat-preflight.sh; this script covers the same lunarwing.env
 # WeeChat keys plus every other service.
 #
 # Strictly read-only: never writes, never restarts a service, and never
-# prints secret values. Env content is reduced to a port (or a strict
-# loopback URL) before it is displayed; anything else is reported as
-# '<unexpected value (not printed)>' so operator-controlled env bytes can
-# never reach the log.
+# prints secret values. Env content is reduced to a port, a host-shaped
+# token, or a strict loopback URL before it is displayed; anything else is
+# reported as '<… (not printed)>' so operator-controlled env bytes can never
+# reach the log. A listener/URL host that is not 127.0.0.1 FAILs (the WI#357
+# self-exposure class) instead of being accepted because the port matched.
 #
 # Severity mirrors the WeeChat preflight's rationale: `mt-admin patch-env`
 # is idempotent and SKIPS variables already present, so a WRONG existing
@@ -92,7 +95,7 @@ tenant_lw_root() { printf '%s/%s/lunarwing' "$TENANT_HOME_BASE" "$1"; }
 tenant_systemd_user_dir() { printf '%s/%s/.config/systemd/user' "$TENANT_HOME_BASE" "$1"; }
 tenant_quadlet_dir() { printf '%s/%s/.config/containers/systemd' "$TENANT_HOME_BASE" "$1"; }
 
-valid_tenant_name() { [[ "$1" =~ ^[a-z0-9][a-z0-9-]*$ ]]; }
+valid_tenant_name() { [[ "$1" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; }
 
 # Extract the trailing :PORT from a URL (tolerates a trailing slash).
 # Prints nothing unless the remainder is 1-5 ASCII digits (the ASCII class
@@ -116,26 +119,34 @@ env_get() {
   printf '%s' "$line"
 }
 
-# Port of a postgres://user:pass@host:PORT/db URL. Prints only the port —
+# Port of a postgres://user:pass@host:PORT/db URL. The port comes from the
+# matched host:PORT group, never from "after the last colon of the whole URL":
+# a `/db:tag` suffix used to be reported as the port. Prints only the port —
 # the password never reaches the output. Prints nothing when unparseable.
 db_url_port() {
   local u="$1"
-  if [[ "$u" =~ ^postgres(ql)?://[^/@[:space:]]+@[^/:[:space:]]+:[0123456789]{1,5} ]]; then
-    u="${u##*:}"
-    printf '%s' "${u%%/*}"
-  fi
+  local re='^postgres(ql)?://[^/@[:space:]]+@[^/:[:space:]]+:([0123456789]{1,5})(/|[?]|$)'
+  if [[ "$u" =~ $re ]]; then printf '%s' "${BASH_REMATCH[2]}"; fi
   return 0
 }
 
-# Display discipline: only port-shaped values and strict loopback URLs are
-# ever echoed; anything else (operator-controlled env content) is replaced.
+# Display discipline: only port-shaped values, host-shaped tokens and strict
+# loopback URLs are ever echoed; anything else (operator-controlled env
+# content) is replaced.
 display_port() {
   if [[ "$1" =~ ^[0123456789]{1,5}$ ]]; then printf '%s' "$1"
   else printf '<unexpected value (not printed)>'; fi
 }
 
+# A host token read from a listen/bind directive. Realistic drift values
+# (0.0.0.0, ::, a hostname or IPv4) are shown; arbitrary env bytes are not.
+display_host() {
+  if [[ "$1" =~ ^[A-Za-z0-9_.:-]{1,64}$ ]]; then printf '%s' "$1"
+  else printf '<unexpected host (not printed)>'; fi
+}
+
 display_url() {
-  if [[ "$1" =~ ^https?://127[.]0[.]0[.]1:[0123456789]{1,5}/?$ ]]; then printf '%s' "$1"
+  if [[ "$1" =~ ^https?://127[.]0[.]0[.]1:[0123456789]{1,5}(/[A-Za-z0-9._~%+/-]*)?$ ]]; then printf '%s' "$1"
   else printf '<non-loopback value (not printed)>'; fi
 }
 
@@ -227,11 +238,12 @@ check_port_key() { # <env_file> <env_key> <registry_slot> [soft]
   fi
 }
 
-# URL-valued env key: only its port is compared, and only the port or a
-# strict loopback URL is ever displayed.
+# URL-valued env key: the scheme/host:port is parsed, the host must be
+# loopback (a non-loopback listener is the WI#357 drift class, not an OK),
+# and only the port is compared. Only a verified loopback URL is displayed.
 check_url_port() { # <env_file> <env_key> <registry_slot>
   local file="$1" key="$2" slot="$3"
-  local expected value port
+  local expected value host="" port=""
   expected="$(registry_port "$slot")"
   [[ -n "$expected" ]] || return 0
   value="$(env_get "$file" "$key")"
@@ -239,13 +251,19 @@ check_url_port() { # <env_file> <env_key> <registry_slot>
     mark WARN "$key" "missing — the next render adds http://127.0.0.1:$expected"
     return 0
   fi
-  port="$(url_port "$value")"
+  local url_re='^(https?)://([^/:[:space:]@]+):([0123456789]{1,5})(/[^[:space:]]*)?$'
+  if [[ "$value" =~ $url_re ]]; then
+    host="${BASH_REMATCH[2]}"
+    port="${BASH_REMATCH[3]}"
+  fi
   if [[ -z "$port" ]]; then
-    mark FAIL "$key" "no port in value (registry $slot=$expected)"
+    mark FAIL "$key" "no scheme://host:port in value (registry $slot=$expected)"
+  elif [[ "$host" != "127.0.0.1" ]]; then
+    mark FAIL "$key" "host $(display_host "$host") is not loopback (registry $slot=$expected)"
   elif [[ "$port" == "$expected" ]]; then
     mark OK "$key" "$(display_url "$value")"
   else
-    mark FAIL "$key" "port $port (registry $slot=$expected) — patch-env will NOT overwrite this"
+    mark FAIL "$key" "port $(display_port "$port") (registry $slot=$expected) — patch-env will NOT overwrite this"
   fi
 }
 
@@ -264,9 +282,9 @@ check_db_port() { # <env_file> <env_key> <registry_slot>
   if [[ -z "$port" ]]; then
     mark FAIL "$key" "unparseable database URL (expected port $expected)"
   elif [[ "$port" == "$expected" ]]; then
-    mark OK "$key" "postgres port $port"
+    mark OK "$key" "postgres port $(display_port "$port")"
   else
-    mark FAIL "$key" "postgres port $port (registry $slot=$expected) — patch-env will NOT overwrite this"
+    mark FAIL "$key" "postgres port $(display_port "$port") (registry $slot=$expected) — patch-env will NOT overwrite this"
   fi
 }
 
@@ -284,7 +302,7 @@ check_bind_port() { # <env_file> <env_key> <registry_slot>
   host="${value%%:*}"
   port="$(url_port "$value")"
   if [[ "$host" != "127.0.0.1" ]]; then
-    mark FAIL "$key" "bind host is not loopback (registry $slot=$expected)"
+    mark FAIL "$key" "bind host $(display_host "$host") is not loopback (registry $slot=$expected)"
   elif [[ "$port" == "$expected" ]]; then
     mark OK "$key" "127.0.0.1:$port"
   else
@@ -292,10 +310,12 @@ check_bind_port() { # <env_file> <env_key> <registry_slot>
   fi
 }
 
-# A `listen = "tcp://127.0.0.1:PORT"` directive in darkirc_config.toml.
+# A `listen = "tcp://127.0.0.1:PORT"` directive in darkirc_config.toml. The
+# host must be loopback; on drift the host that was read is reported, never
+# a reconstructed 127.0.0.1 (a `tcp://0.0.0.0:PORT` value used to print OK).
 check_toml_listen() { # <toml_file> <directive> <registry_slot>
   local file="$1" directive="$2" slot="$3"
-  local expected line port
+  local expected line scheme="" host="" port=""
   expected="$(registry_port "$slot")"
   [[ -n "$expected" ]] || return 0
   line="$(grep -E "^[[:space:]]*${directive}[[:space:]]*=" "$file" 2>/dev/null | tail -n1 || true)"
@@ -303,30 +323,43 @@ check_toml_listen() { # <toml_file> <directive> <registry_slot>
     mark WARN "$directive" "missing in $(basename "$file") — regenerate the darkirc config"
     return 0
   fi
-  port=""
-  local port_re
-  # Loopback listen URLs end with :PORT" (TOML string) — match the digits
-  # immediately before the closing quote. A variable keeps the quoting sane.
-  port_re=':([0123456789]{1,5})"'
-  if [[ "$line" =~ $port_re ]]; then
-    port="${BASH_REMATCH[1]}"
+  local listen_re='^[[:space:]]*'"$directive"'[[:space:]]*=[[:space:]]*"(tcp|udp)://([^:"[:space:]]+):([0123456789]{1,5})"'
+  if [[ "$line" =~ $listen_re ]]; then
+    scheme="${BASH_REMATCH[1]}"
+    host="${BASH_REMATCH[2]}"
+    port="${BASH_REMATCH[3]}"
   fi
-  if [[ "$port" == "$expected" ]]; then
-    mark OK "$directive" "tcp://127.0.0.1:$port"
+  if [[ -z "$port" ]]; then
+    mark FAIL "$directive" "no tcp://host:port listen (registry $slot=$expected) — regenerate the darkirc config"
+  elif [[ "$host" != "127.0.0.1" ]]; then
+    mark FAIL "$directive" "listen host $(display_host "$host") is not loopback (registry $slot=$expected)"
+  elif [[ "$port" == "$expected" ]]; then
+    mark OK "$directive" "$scheme://127.0.0.1:$port"
   else
     mark FAIL "$directive" "port $(display_port "$port") (registry $slot=$expected) — regenerate the darkirc config"
   fi
 }
 
-# Host-side ports of every PublishPort line in a Quadlet.
+# Host-side ports of every strictly loopback PublishPort line in a Quadlet.
 quadlet_host_ports() { # <file>
   grep -oE 'PublishPort=127[.]0[.]0[.]1:[0123456789]{1,5}:[0123456789]{1,5}' "$1" 2>/dev/null \
     | cut -d: -f2 || true
 }
 
-# Every expected registry host port must appear among the Quadlet's
-# PublishPort host ports. Extra published ports are not drift (an operator
-# may add one); a re-mapped expected port is.
+# Every PublishPort line that is NOT a strict 127.0.0.1 mapping. A host-less
+# `PORT:CONTAINER` mapping or an explicit `0.0.0.0`/other-address mapping
+# publishes on all interfaces; matching only loopback lines used to hide that
+# as "host ports [none] lack registry port(s)".
+quadlet_nonloopback_publishes() { # <file>
+  grep -E '^[[:space:]]*PublishPort=' "$1" 2>/dev/null \
+    | grep -vE '^[[:space:]]*PublishPort=127[.]0[.]0[.]1:[0123456789]{1,5}:[0123456789]{1,5}$' \
+    || true
+}
+
+# Every expected registry host port must appear among the Quadlet's loopback
+# PublishPort host ports, and no PublishPort may bind beyond 127.0.0.1.
+# Extra loopback ports are not drift (an operator may add one); a re-mapped
+# expected port or a non-loopback/all-interfaces mapping is.
 check_quadlet_ports() { # <file> <label> <expected-host-ports...>
   local file="$1" label="$2"
   shift 2
@@ -338,8 +371,9 @@ check_quadlet_ports() { # <file> <label> <expected-host-ports...>
     mark WARN "$label" "not readable — run with sudo: $file"
     return 0
   fi
-  local -a have=() missing=()
+  local -a have=() missing=() unsafe=()
   mapfile -t have < <(quadlet_host_ports "$file")
+  mapfile -t unsafe < <(quadlet_nonloopback_publishes "$file")
   local want h found
   for want in "$@"; do
     [[ -n "$want" ]] || continue
@@ -349,23 +383,38 @@ check_quadlet_ports() { # <file> <label> <expected-host-ports...>
     done
     [[ "$found" == true ]] || missing+=("$want")
   done
-  if [[ "${#missing[@]}" -eq 0 ]]; then
+  if [[ "${#missing[@]}" -eq 0 && "${#unsafe[@]}" -eq 0 ]]; then
     mark OK "$label" "PublishPort covers registry port(s): $*"
-  else
-    mark FAIL "$label" "PublishPort host ports [${have[*]:-none}] lack registry port(s): ${missing[*]} — re-render units"
+    return 0
   fi
+  local detail=""
+  if [[ "${#unsafe[@]}" -gt 0 ]]; then
+    detail+="${#unsafe[@]} PublishPort line(s) are not strict 127.0.0.1 mappings (published on all interfaces or another address)"
+    [[ "${#missing[@]}" -eq 0 ]] || detail+="; "
+  fi
+  if [[ "${#missing[@]}" -gt 0 ]]; then
+    detail+="host ports [${have[*]:-none}] lack registry port(s): ${missing[*]}"
+  fi
+  mark FAIL "$label" "${detail} — re-render units"
 }
 
-# Port from the first `--port <digits>` occurrence in a rendered proxy unit
-# (the systemd ExecStart and the OpenRC proxy_args line share the flag).
-unit_cli_port() { # <file>
-  grep -oE -- '--port [0123456789]{1,5}' "$1" 2>/dev/null | head -n1 \
-    | grep -oE '[0123456789]{1,5}$' || true
+# Port and bind host from the line carrying `--port <digits>` in a rendered
+# proxy unit (the systemd ExecStart and the OpenRC proxy_args line share the
+# flag). Mirrors the OpenRC safe-unit contract's strictness: the same line
+# must carry `--bind 127.0.0.1`; a bare first `--port` anywhere is not enough.
+unit_cli_bind() { # <file> -> "PORT<TAB>HOST" (HOST may be empty), or nothing
+  local file="$1" line port="" host=""
+  line="$(grep -E -- '--port [0123456789]{1,5}' "$file" 2>/dev/null | head -n1 || true)"
+  [[ -n "$line" ]] || return 0
+  if [[ "$line" =~ --port\ ([0123456789]{1,5}) ]]; then port="${BASH_REMATCH[1]}"; fi
+  if [[ "$line" =~ --bind\ ([^[:space:]]+) ]]; then host="${BASH_REMATCH[1]}"; fi
+  [[ -n "$port" ]] && printf '%s\t%s\n' "$port" "$host"
+  return 0
 }
 
 check_unit_port() { # <file> <label> <registry_slot>
   local file="$1" label="$2" slot="$3"
-  local expected port
+  local expected parsed port host=""
   expected="$(registry_port "$slot")"
   [[ -n "$expected" ]] || return 0
   if [[ ! -e "$file" ]]; then
@@ -376,13 +425,19 @@ check_unit_port() { # <file> <label> <registry_slot>
     mark WARN "$label" "not readable — run with sudo: $file"
     return 0
   fi
-  port="$(unit_cli_port "$file")"
+  parsed="$(unit_cli_bind "$file")"
+  port="${parsed%%$'\t'*}"
+  [[ "$parsed" == *$'\t'* ]] && host="${parsed#*$'\t'}"
   if [[ -z "$port" ]]; then
     mark WARN "$label" "no --port in $file — not an mt-admin-rendered proxy unit?"
+  elif [[ -z "$host" ]]; then
+    mark FAIL "$label" "no --bind on the --port line — expected 127.0.0.1 (registry $slot=$expected)"
+  elif [[ "$host" != "127.0.0.1" ]]; then
+    mark FAIL "$label" "binds $(display_host "$host") instead of 127.0.0.1 (registry $slot=$expected)"
   elif [[ "$port" == "$expected" ]]; then
-    mark OK "$label" "binds --port $port"
+    mark OK "$label" "binds --port $port on 127.0.0.1"
   else
-    mark FAIL "$label" "binds --port $port (registry $slot=$expected) — re-render units"
+    mark FAIL "$label" "binds --port $(display_port "$port") (registry $slot=$expected) — re-render units"
   fi
 }
 

@@ -197,6 +197,19 @@ assess_tenant() {
     stop "tenant env not found: $envf"; verdict="STOP"
   fi
 
+  # --- port drift (WI#509): run the read-only env-vs-registry verifier --------
+  # Non-fatal and informational: it surfaces drift here rather than only when
+  # an operator remembers to run it, but it never changes the STOP/GO verdict.
+  local drift_script="$SCRIPT_DIR/lunarwing-port-drift-preflight.sh" drift_rc=0
+  if [[ -f "$drift_script" ]]; then
+    probe bash "$drift_script" "$name" >/dev/null 2>&1 || drift_rc=$?
+    case "$drift_rc" in
+      0) note "port drift pre-flight: env files and rendered units match the registry" ;;
+      1) note "port drift pre-flight reports FAIL(s) — run 'sudo ic/scripts/lunarwing-port-drift-preflight.sh $name'" ;;
+      *) note "port drift pre-flight could not run (rc $drift_rc)" ;;
+    esac
+  fi
+
   # --- THE critical check: where does the live PG data live? ---
   local pg="lunarwing-pg-$name"
   local root_state rootless_state

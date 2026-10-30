@@ -26,6 +26,11 @@
 #  14. missing lunarwing.env for enabled service — exit 1
 #  15. worker quadlet absent (OpenRC host) — INFO, not FAIL
 #  16. setup-error exit 2
+#  17. non-loopback URL host — FAIL, host named (SI-1)
+#  18. non-loopback TOML listen host — FAIL, host named (SI-1)
+#  19. DATABASE_URL /db:tag suffix is not the port (SI-2)
+#  20. Quadlet PublishPort beyond loopback — FAIL, named (SI-3)
+#  21. proxy unit non-loopback or missing --bind — FAIL (SI-5)
 #
 set -euo pipefail
 
@@ -546,6 +551,98 @@ PREFLIGHT_OUT="$(LUNARWING_PORTS_REGISTRY="$REGISTRY" \
 PREFLIGHT_EXIT=$?
 set -e
 assert_exit "unknown tenant → exit 2" 2 "$PREFLIGHT_EXIT"
+cleanup_fixture
+trap - EXIT
+
+# ============================================================
+# 19. Non-loopback URL host with a matching port is a FAIL (SI-1)
+# ============================================================
+echo "=== 19. url host drift ==="
+create_fixture valid
+sed -i "s|^XMPP_BRIDGE_URL=.*|XMPP_BRIDGE_URL=http://0.0.0.0:$BR|" \
+  "$TENANT_HOME/$TENANT_NAME/lunarwing/env/lunarwing.env"
+run_preflight "$TENANT_NAME"
+assert_exit "non-loopback url host → exit 1" 1 "$PREFLIGHT_EXIT"
+assert_in  "url host FAIL" "$PREFLIGHT_OUT" "[FAIL] XMPP_BRIDGE_URL"
+assert_in  "url host named" "$PREFLIGHT_OUT" "host 0.0.0.0 is not loopback"
+assert_not_in "url host not OK" "$PREFLIGHT_OUT" "[OK  ] XMPP_BRIDGE_URL"
+cleanup_fixture
+trap - EXIT
+
+# ============================================================
+# 20. Non-loopback TOML listen host with a matching port is a FAIL (SI-1)
+# ============================================================
+echo "=== 20. toml host drift ==="
+create_fixture valid
+sed -i "s|tcp://127.0.0.1:$DIRC|tcp://0.0.0.0:$DIRC|" \
+  "$TENANT_HOME/$TENANT_NAME/lunarwing/state/darkirc/darkirc_config.toml"
+run_preflight "$TENANT_NAME"
+assert_exit "non-loopback toml host → exit 1" 1 "$PREFLIGHT_EXIT"
+assert_in  "toml host FAIL" "$PREFLIGHT_OUT" "[FAIL] irc_listen"
+assert_in  "toml host named" "$PREFLIGHT_OUT" "listen host 0.0.0.0 is not loopback"
+assert_not_in "toml host not OK" "$PREFLIGHT_OUT" "[OK  ] irc_listen"
+cleanup_fixture
+trap - EXIT
+
+# ============================================================
+# 21. DATABASE_URL /db:tag suffix is not the port (SI-2)
+# ============================================================
+echo "=== 21. db-name suffix ==="
+create_fixture valid
+sed -i "s|^DATABASE_URL=.*|DATABASE_URL=postgres://lunarwing:${DB_SECRET}@127.0.0.1:${PG}/lunarwing:ext|" \
+  "$TENANT_HOME/$TENANT_NAME/lunarwing/env/lunarwing.env"
+run_preflight "$TENANT_NAME"
+assert_exit "db suffix → exit 0" 0 "$PREFLIGHT_EXIT"
+assert_in  "db port from host:PORT" "$PREFLIGHT_OUT" "postgres port $PG"
+assert_not_in "db suffix not the port" "$PREFLIGHT_OUT" "postgres port ext"
+assert_not_in "no db password" "$PREFLIGHT_OUT" "$DB_SECRET"
+cleanup_fixture
+trap - EXIT
+
+# ============================================================
+# 22. Quadlet PublishPort beyond loopback is a FAIL (SI-3)
+# ============================================================
+for publish in "0.0.0.0:$PG:5432" "$PG:5432"; do
+  echo "=== 22. quadlet publish beyond loopback ($publish) ==="
+  create_fixture valid
+  write_quadlet "$TENANT_HOME/$TENANT_NAME/.config/containers/systemd/lunarwing-pg-${TENANT_NAME}.container" \
+    "PublishPort=$publish"
+  run_preflight "$TENANT_NAME"
+  assert_exit "non-loopback publish $publish → exit 1" 1 "$PREFLIGHT_EXIT"
+  assert_in  "pg quadlet FAIL ($publish)" "$PREFLIGHT_OUT" "[FAIL] pg quadlet"
+  assert_in  "publish drift named ($publish)" "$PREFLIGHT_OUT" "not strict 127.0.0.1"
+  cleanup_fixture
+  trap - EXIT
+done
+
+# ============================================================
+# 23. Proxy unit must bind 127.0.0.1 on its --port line (SI-5)
+# ============================================================
+echo "=== 23. proxy unit non-loopback bind ==="
+create_fixture valid
+cat >"$TENANT_HOME/$TENANT_NAME/.config/systemd/user/lunarwing-proxy-${TENANT_NAME}.service" <<E
+[Service]
+ExecStart=/usr/bin/python3 /bin/lunarwing-proxy.py --port $PRX --bind 0.0.0.0
+E
+run_preflight "$TENANT_NAME"
+assert_exit "non-loopback proxy bind → exit 1" 1 "$PREFLIGHT_EXIT"
+assert_in  "proxy unit FAIL" "$PREFLIGHT_OUT" "[FAIL] proxy unit (systemd)"
+assert_in  "proxy bind named" "$PREFLIGHT_OUT" "binds 0.0.0.0 instead of 127.0.0.1"
+cleanup_fixture
+trap - EXIT
+
+# ============================================================
+# 24. Proxy unit without --bind on the --port line is a FAIL
+# ============================================================
+echo "=== 24. proxy unit missing bind ==="
+create_fixture valid
+cat >"$TENANT_HOME/$TENANT_NAME/.config/systemd/user/lunarwing-proxy-${TENANT_NAME}.service" <<E
+[Service]
+ExecStart=/usr/bin/python3 /bin/lunarwing-proxy.py --port $PRX
+E
+run_preflight "$TENANT_NAME"
+assert_exit "proxy unit without bind → exit 1" 1 "$PREFLIGHT_EXIT"
+assert_in  "missing bind FAIL" "$PREFLIGHT_OUT" "no --bind on the --port line"
 cleanup_fixture
 trap - EXIT
 
