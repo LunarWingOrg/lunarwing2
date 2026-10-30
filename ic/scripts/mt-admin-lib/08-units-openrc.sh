@@ -1236,6 +1236,26 @@ start_pre() {
     checkpath -f -m 0640 -o "\${darkirc_user}:\${darkirc_group}" "\${output_log}"
     checkpath -f -m 0640 -o "\${darkirc_user}:\${darkirc_group}" "\${error_log}"
     umask "\${darkirc_umask}"
+    # WI#505: this unit execs supervise-daemon directly (no env-exec), so
+    # close any descriptor inherited from mt-admin that resolves into the
+    # tenant lifecycle lock directory before the daemon is spawned; an
+    # inherited fd would keep the tenant flock held for the daemon's
+    # lifetime and orphan the lock when mt-admin dies inside the section.
+    _lw_lock_dir="\${LUNARWING_MT_LIFECYCLE_LOCK_DIR:-/run/lock/lunarwing-tenants}"
+    if [ -d "\${_lw_lock_dir}" ]; then
+        _lw_lock_id=\$(stat -Lc '%d:%i' "\${_lw_lock_dir}" 2>/dev/null || true)
+        if [ -n "\${_lw_lock_id}" ]; then
+            for _lw_fd_path in /proc/self/fd/*; do
+                _lw_fd="\${_lw_fd_path##*/}"
+                case "\${_lw_fd}" in
+                    ''|*[!0-9]*|0|1|2) continue ;;
+                esac
+                _lw_target=\$(stat -Lc '%d:%i' "\${_lw_fd_path}" 2>/dev/null || true)
+                [ -n "\${_lw_target}" ] && [ "\${_lw_target}" = "\${_lw_lock_id}" ] || continue
+                eval "exec \${_lw_fd}>&-" 2>/dev/null || true
+            done
+        fi
+    fi
 }
 INITEOF
   chmod 0755 "$OPENRC_INITD_DIR/lunarwing-darkirc-${name}"
