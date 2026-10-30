@@ -576,9 +576,35 @@ mkdir -p "$state"
 printf '%s\n' "$*" >>"$base/podman.log"
 case "${1:-} ${2:-}" in
   'pod exists') [[ -f "$state/present" ]] ;;
+  'image exists')
+    shift 2
+    [[ "${1:-}" == -- ]] && shift
+    [[ -f "$state/store" ]] && grep -Fqx -- "${1:-}" "$state/store"
+    ;;
+  'images --format')
+    if [[ -f "$state/store" ]]; then cat "$state/store"; fi
+    exit 0
+    ;;
+  'version --format') printf '%s\n' "${FAKE_PODMAN_VERSION-5.8.2}" ;;
   'pod create')
+    shift 2
+    infra=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --infra-image) infra="${2:-}"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    if [[ -n "$infra" ]]; then
+      if [[ ! -f "$state/store" ]] || ! grep -Fqx -- "$infra" "$state/store"; then
+        printf 'fake pod create: --infra-image %s not in local store\n' "$infra" >&2
+        exit 125
+      fi
+    else
+      infra="${FAKE_INFRA_IMAGE-localhost/podman-pause:5.8.2}"
+    fi
     touch "$state/present"
-    printf '%s\n' "${FAKE_INFRA_IMAGE-localhost/podman-pause:5.8.2}" >"$state/image"
+    printf '%s\n' "$infra" >"$state/image"
     printf 'false\n' >"$state/running"
     ;;
   'pod start') printf 'true\n' >"$state/running" ;;
@@ -679,6 +705,130 @@ else
   assert_contains "$(cat "$rootless_bin/podman.log")" 'pod rm -f lw-egress-keeper-alpha' "remote-image keeper pod is removed"
   [[ ! -e "$rootless_state/present" ]] || fail "remote-image keeper pod remains after refusal"
   assert_absent "$(cat "$rootless_bin/nft.log")" '-f' "remote infra image is rejected before nft load"
+fi
+
+# WI#516 Finding 1: the tag-stripped bare name is not a valid provenance.
+rm -rf -- "$rootless_state"
+mkdir -p "$rootless_state"
+: >"$rootless_bin/podman.log"
+: >"$rootless_bin/nft.log"
+if FAKE_INFRA_IMAGE='localhost/podman-pause:' PATH="$rootless_bin:$PATH" \
+    "$guard" "$fixture/alpha.nft" rootless fwd_alpha alpha >"$fixture/tagless-image.out" 2>&1; then
+  fail "guard accepted the tag-stripped pause image name"
+else
+  pass "guard refuses the tag-stripped pause image name"
+  assert_contains "$(cat "$fixture/tagless-image.out")" "unapproved infra image 'localhost/podman-pause:'" \
+    "tag-stripped refusal names the malformed provenance"
+  assert_contains "$(cat "$rootless_bin/podman.log")" 'pod rm -f lw-egress-keeper-alpha' \
+    "tag-stripped keeper pod is removed"
+  [[ ! -e "$rootless_state/present" ]] || fail "tag-stripped keeper pod remains after refusal"
+  assert_absent "$(cat "$rootless_bin/nft.log")" '-f' "tag-stripped image is rejected before nft load"
+fi
+
+# WI#516 Finding 2 / SD-1: the creation-time pin is derived from the local
+# store, never invented. A host with no local pause image passes no
+# --infra-image (native pause), so first rootless start cannot fail closed on
+# a fabricate tag.
+rm -rf -- "$rootless_state"
+mkdir -p "$rootless_state"
+: >"$rootless_bin/podman.log"
+: >"$rootless_bin/nft.log"
+if FAKE_INFRA_IMAGE='' PATH="$rootless_bin:$PATH" \
+    "$guard" "$fixture/alpha.nft" rootless fwd_alpha alpha >"$fixture/no-store.out" 2>&1; then
+  pass "empty local store creates the keeper without a fabricated infra-image pin"
+  assert_absent "$(grep '^pod create' "$rootless_bin/podman.log")" '--infra-image' \
+    "no --infra-image is passed when the host has no local pause image"
+else
+  fail "empty-store keeper refused: $(cat "$fixture/no-store.out")"
+fi
+
+# A host whose store holds a real pause image (podman 4.x/5.x shape) pins it.
+rm -rf -- "$rootless_state"
+mkdir -p "$rootless_state"
+printf 'localhost/podman-pause:5.8.2-1730000000\n' >"$rootless_state/store"
+: >"$rootless_bin/podman.log"
+: >"$rootless_bin/nft.log"
+if PATH="$rootless_bin:$PATH" \
+    "$guard" "$fixture/alpha.nft" rootless fwd_alpha alpha >"$fixture/store-pin.out" 2>&1; then
+  pass "store-derived pause image pins the keeper at creation"
+  assert_contains "$(grep '^pod create' "$rootless_bin/podman.log")" \
+    '--infra-image localhost/podman-pause:5.8.2-1730000000' \
+    "pod create carries the local store's pause image"
+else
+  fail "store-derived pin refused: $(cat "$fixture/store-pin.out")"
+fi
+
+# SQ-1 (!2092 run-284): a Podman upgrade can leave the previous version's
+# pause image in the store. Prefer the tag built by the running client.
+rm -rf -- "$rootless_state"
+mkdir -p "$rootless_state"
+printf 'localhost/podman-pause:5.9.0-1800000000\nlocalhost/podman-pause:5.8.2-1730000000\n' >"$rootless_state/store"
+: >"$rootless_bin/podman.log"
+: >"$rootless_bin/nft.log"
+if FAKE_PODMAN_VERSION='5.9.0' PATH="$rootless_bin:$PATH" \
+    "$guard" "$fixture/alpha.nft" rootless fwd_alpha alpha >"$fixture/version-pin.out" 2>&1; then
+  pass "store-derived pin prefers the running Podman version"
+  assert_contains "$(grep '^pod create' "$rootless_bin/podman.log")" \
+    '--infra-image localhost/podman-pause:5.9.0-1800000000' \
+    "pod create pins the running version's pause image, not the older one"
+else
+  fail "version-preferred pin refused: $(cat "$fixture/version-pin.out")"
+fi
+
+# With no local tag matching the running version, the newest image is used.
+rm -rf -- "$rootless_state"
+mkdir -p "$rootless_state"
+printf 'localhost/podman-pause:5.8.2-1730000000\n' >"$rootless_state/store"
+: >"$rootless_bin/podman.log"
+: >"$rootless_bin/nft.log"
+if FAKE_PODMAN_VERSION='6.1.4' PATH="$rootless_bin:$PATH" \
+    "$guard" "$fixture/alpha.nft" rootless fwd_alpha alpha >"$fixture/version-fallback.out" 2>&1; then
+  pass "store-derived pin falls back to the newest local pause image"
+  assert_contains "$(grep '^pod create' "$rootless_bin/podman.log")" \
+    '--infra-image localhost/podman-pause:5.8.2-1730000000' \
+    "fallback pins the newest local pause image when the version has no match"
+else
+  fail "version-fallback pin refused: $(cat "$fixture/version-fallback.out")"
+fi
+
+# The operator override must exist locally; a remote reference never reaches
+# pod create, and a non-local spelling is refused outright.
+rm -rf -- "$rootless_state"
+mkdir -p "$rootless_state"
+: >"$rootless_bin/podman.log"
+if LUNARWING_WORKER_EGRESS_INFRA_IMAGE='docker.io/library/pause:3.9' PATH="$rootless_bin:$PATH" \
+    "$guard" "$fixture/alpha.nft" rootless fwd_alpha alpha >"$fixture/bad-override.out" 2>&1; then
+  fail "guard accepted a remote pinned infra-image override"
+else
+  pass "guard refuses a remote pinned infra-image override"
+  assert_absent "$(cat "$rootless_bin/podman.log")" 'pod create' "invalid pinned image never reaches pod create"
+fi
+
+rm -rf -- "$rootless_state"
+mkdir -p "$rootless_state"
+: >"$rootless_bin/podman.log"
+if LUNARWING_WORKER_EGRESS_INFRA_IMAGE='localhost/podman-pause:9.9.9' PATH="$rootless_bin:$PATH" \
+    "$guard" "$fixture/alpha.nft" rootless fwd_alpha alpha >"$fixture/absent-override.out" 2>&1; then
+  fail "guard accepted an override that is absent from the local store"
+else
+  pass "guard refuses an override absent from the local store"
+  assert_contains "$(cat "$fixture/absent-override.out")" 'is not present in the local image store' \
+    "absent override refusal names the local store"
+  assert_absent "$(cat "$rootless_bin/podman.log")" 'pod create' "absent override pin never reaches pod create"
+fi
+
+rm -rf -- "$rootless_state"
+mkdir -p "$rootless_state"
+printf 'localhost/podman-pause:9.9.9\n' >"$rootless_state/store"
+: >"$rootless_bin/podman.log"
+: >"$rootless_bin/nft.log"
+if LUNARWING_WORKER_EGRESS_INFRA_IMAGE='localhost/podman-pause:9.9.9' PATH="$rootless_bin:$PATH" \
+    "$guard" "$fixture/alpha.nft" rootless fwd_alpha alpha >"$fixture/good-override.out" 2>&1; then
+  pass "guard accepts a local pinned infra-image override"
+  assert_contains "$(grep '^pod create' "$rootless_bin/podman.log")" '--infra-image localhost/podman-pause:9.9.9' \
+    "pod create carries the overridden pinned infra image"
+else
+  fail "local pinned override refused: $(cat "$fixture/good-override.out")"
 fi
 
 rm -rf -- "$rootless_state"
