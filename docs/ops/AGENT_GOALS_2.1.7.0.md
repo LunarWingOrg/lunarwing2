@@ -1464,7 +1464,7 @@
 136. [x] (H) Deploy the stoplight system
 137. [x] (H) NOTE TO LOOK AT ALL GOALS AGAIN AND REORG
 138. [x] (H) update release notes
-139. [x] (H) Deploy the stoplight system
+139. [x] (H) test build 6
 140. [x] (H) Deploy the stoplight system
 141. [x] (H) Deploy the stoplight system
 142. [x] (H} Go over all pending 2.1.7.0 Work items
