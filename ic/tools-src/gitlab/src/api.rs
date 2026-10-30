@@ -696,7 +696,8 @@ pub fn get_pipeline(
 
 /// Per-page clamp for `list_jobs` (WI#525). Even with typed deserialization,
 /// fewer jobs per page means fewer retained objects and a smaller raw body to
-/// buffer in the sandboxed guest; 50 still covers any realistic CI page.
+/// buffer in typical responses. This limits job count, not response bytes or
+/// peak guest memory; the host call still buffers the entire body.
 const LIST_JOBS_MAX_PER_PAGE: u32 = 50;
 
 /// The flat investigation surface of one GitLab CI job (WI#525).
@@ -704,11 +705,13 @@ const LIST_JOBS_MAX_PER_PAGE: u32 = 50;
 /// GitLab's full job object nests heavy `pipeline`, `commit`, `runner`,
 /// `user`, `artifacts`, and `project` sub-objects. Deserializing straight into
 /// this type makes `serde` **skip** every unmodelled field while streaming
-/// tokens, so peak guest memory tracks the retained fields rather than the
-/// whole page. Everything dropped here is one `web_url` hop away.
+/// tokens, avoiding a full parsed job tree in addition to the buffered raw
+/// body. This reduces parse-time allocations, not the raw-body allocation.
+/// Everything dropped here is one `web_url` hop away when present.
 #[derive(Debug, serde::Serialize, Deserialize)]
 struct JobSummary {
-    id: u64,
+    #[serde(default)]
+    id: Option<u64>,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
@@ -950,7 +953,7 @@ mod tests {
             "project": {"ci_job_token_scope_enabled": false}
         });
         let summary: super::JobSummary = serde_json::from_value(full_job).unwrap();
-        assert_eq!(summary.id, 103070);
+        assert_eq!(summary.id, Some(103070));
         assert_eq!(summary.name.as_deref(), Some("cargo-deny"));
         assert_eq!(summary.status.as_deref(), Some("failed"));
         assert_eq!(summary.failure_reason.as_deref(), Some("script_failure"));
@@ -977,14 +980,60 @@ mod tests {
         );
     }
 
-    /// A job object missing most fields still parses: only `id` is required,
-    /// so a schema surprise cannot drop the whole page.
+    /// Missing optional triage fields default to `None`.
     #[test]
     fn job_summary_tolerates_a_minimal_object() {
         let summary: super::JobSummary = serde_json::from_value(json!({ "id": 7 })).unwrap();
-        assert_eq!(summary.id, 7);
+        assert_eq!(summary.id, Some(7));
         assert!(summary.name.is_none());
         assert!(summary.failure_reason.is_none());
+    }
+
+    /// SO-2: an omitted or null ID must not reject an otherwise usable job.
+    #[test]
+    fn job_summary_tolerates_missing_or_null_id() {
+        for body in [r#"{"name":"partial"}"#, r#"{"id":null,"name":"partial"}"#] {
+            let summary: super::JobSummary = serde_json::from_str(body).unwrap();
+            assert!(summary.id.is_none());
+            assert_eq!(summary.name.as_deref(), Some("partial"));
+            let rendered = serde_json::to_value(summary).unwrap();
+            assert_eq!(rendered.get("id"), Some(&serde_json::Value::Null));
+            assert_eq!(rendered["name"], "partial");
+        }
+        // Optional does not mean accepting an ID with an invalid JSON type.
+        assert!(serde_json::from_str::<super::JobSummary>(r#"{"id":"not-an-id"}"#).is_err());
+    }
+
+    /// A partial job in the middle must preserve the whole page and its order.
+    #[test]
+    fn job_summary_keeps_mixed_page_with_missing_ids() {
+        let body = br#"[
+            {"id":1,"name":"first","status":"success"},
+            {"name":"missing-id","pipeline":{"id":42},"commit":{"message":"ignored"}},
+            {"id":null,"name":"null-id"},
+            {},
+            {"id":5,"name":"last","status":"failed","failure_reason":"script_failure"}
+        ]"#;
+        let summaries: Vec<super::JobSummary> = serde_json::from_slice(body).unwrap();
+        let items = serde_json::to_value(summaries).unwrap();
+        let items = items.as_array().unwrap();
+        assert_eq!(items.len(), 5);
+        assert_eq!(
+            items
+                .iter()
+                .map(|job| job["id"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!(1), json!(null), json!(null), json!(null), json!(5)]
+        );
+        assert_eq!(items[0]["name"], "first");
+        assert_eq!(items[1]["name"], "missing-id");
+        assert_eq!(items[2]["name"], "null-id");
+        assert!(items[3]["name"].is_null());
+        assert_eq!(items[4]["name"], "last");
+        assert_eq!(items[4]["status"], "failed");
+        assert_eq!(items[4]["failure_reason"], "script_failure");
+        assert!(items[1].get("pipeline").is_none());
+        assert!(items[1].get("commit").is_none());
     }
 
     /// WI#525: `list_jobs` applies a tighter per-page clamp than the global

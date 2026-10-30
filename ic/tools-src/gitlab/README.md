@@ -100,9 +100,16 @@ object (which nests heavy `pipeline`, `commit`, `runner`, `user`, and
 `failure_reason`, `ref`, `tag`, `allow_failure`, `started_at`, `finished_at`,
 `duration`, `queued_duration`, `web_url`, and `created_at`; anything else is one
 `web_url` hop away. The response is deserialized straight into that typed shape
-(unknown fields are skipped, not materialized) and `per_page` is clamped to 50
-for this action, so a failing-pipeline page stays within the sandboxed guest's
-memory ceiling. The `pagination` object is preserved.
+(unknown fields are skipped, not materialized), avoiding a full parsed job
+tree alongside the raw response. `per_page` is clamped to 50 for this action
+to reduce the typical page footprint, but the host call still buffers the
+entire response body before parsing. This is a job-count cap, not a byte limit
+or a measured guarantee that every response fits the sandboxed guest's memory
+ceiling. The reported 2.1.5.0 trap remains unreproduced on this tree; excessive
+memory use is a candidate cause, not a confirmed diagnosis. The `pagination`
+object is preserved. A missing or null job `id` is returned as `null` rather
+than rejecting the entire page; available triage fields and job order remain
+intact.
 
 Use `list_work_items` when Tasks and other Work Item types must be included.
 GitLab Work Items use opaque keyset cursors rather than page numbers. A normal

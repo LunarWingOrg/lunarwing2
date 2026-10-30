@@ -137,9 +137,9 @@ impl GitlabClient {
     /// Fetch a single GET endpoint and deserialize each array element straight
     /// into `T` (WI#525). Unlike `request_json`, this never materialises the
     /// full `serde_json::Value` tree: `serde` maps tokens into the typed
-    /// elements and **skips** unknown fields without allocating them. For
-    /// bulk endpoints whose objects nest heavy sub-objects, that bounds peak
-    /// guest memory to the retained fields instead of the whole page payload.
+    /// elements and **skips** unknown fields without allocating their trees.
+    /// The complete raw body returned by `send` still occupies guest memory;
+    /// this reduces parse-time allocations, not that buffered-body footprint.
     /// The `pagination` wrapper from `with_pagination` is preserved.
     pub fn request_typed_page<T: DeserializeOwned + serde::Serialize>(
         &self,
@@ -357,8 +357,9 @@ fn ensure_success(status: u16, body: &[u8]) -> Result<(), String> {
 
 /// Deserialize a raw `GET` body straight into `Vec<T>` without ever building
 /// a full `serde_json::Value` tree (WI#525). `serde` streams tokens into the
-/// typed elements and skips unknown fields without allocating them, so peak
-/// memory tracks the retained fields rather than the whole page. Returns
+/// typed elements and skips unknown fields without allocating their trees.
+/// The caller still holds the full raw body while parsing and constructing
+/// the retained result; this is not a fixed peak-memory bound. Returns
 /// `Value::Null` for a genuinely empty body.
 fn typed_page_value<T: DeserializeOwned + serde::Serialize>(bytes: &[u8]) -> Result<Value, String> {
     if bytes.is_empty() {
