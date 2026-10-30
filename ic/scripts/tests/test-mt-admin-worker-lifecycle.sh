@@ -360,6 +360,61 @@ else
   printf 'PASS: malformed registry fails safe\n'
 fi
 
+# WI#486: stop_tenant_<worker> must stop worker + babysitter services on OpenRC
+# WITHOUT deleting the init scripts. A restart_tenant (stop_tenant ->
+# start_tenant) where the image-contract check refuses leaves the worker
+# un-recoverable if the -sup init script was deleted. Only explicit
+# stop_worker/kill_worker (which set desired_running=false) may remove them.
+test_stop_tenant_worker_openrc_nondestructive() (
+  local worker call sup_seen container_seen task_container
+  for worker in pebble opencode kimi opencode2; do
+    local container="lunarwing-${worker}-alice"
+    task_container="lunarwing-${worker}-task-alice"
+    # Create the init scripts as if a running tenant had them installed.
+    touch "$OPENRC_INITD_DIR/$container" "$OPENRC_INITD_DIR/${container}-sup" \
+          "$OPENRC_INITD_DIR/$task_container" "$OPENRC_INITD_DIR/${task_container}-sup"
+    chmod +x "$OPENRC_INITD_DIR/$container" "$OPENRC_INITD_DIR/${container}-sup" \
+             "$OPENRC_INITD_DIR/$task_container" "$OPENRC_INITD_DIR/${task_container}-sup"
+
+    CALLS=()
+    sup_seen=false
+    container_seen=false
+    "stop_tenant_${worker}" alice
+    for call in "${CALLS[@]}"; do
+      [[ "$call" == "rc:${container}-sup stop" ]] && sup_seen=true
+      [[ "$call" == "rc:${container} stop" ]] && container_seen=true
+    done
+    # Both services must be stopped.
+    [[ "$sup_seen" == true ]] \
+      || { printf '%s: -sup stop not called\n' "$worker" >&2; return 1; }
+    [[ "$container_seen" == true ]] \
+      || { printf '%s: container stop not called\n' "$worker" >&2; return 1; }
+    # Init scripts must still exist (non-destructive): worker, worker -sup,
+    # task container, and task container -sup.
+    local f
+    for f in "$container" "${container}-sup" "$task_container" "${task_container}-sup"; do
+      [[ -f "$OPENRC_INITD_DIR/$f" ]] \
+        || { printf '%s: init script %s was deleted\n' "$worker" "$f" >&2; return 1; }
+    done
+    # No runlevel removal or init script deletion must happen.
+    for call in "${CALLS[@]}"; do
+      case "$call" in
+        "rc-update:del "*) { printf '%s: unexpected del: %s\n' "$worker" "$call" >&2; return 1; } ;;
+      esac
+    done
+    # Cleanup for next iteration.
+    rm -f "$OPENRC_INITD_DIR/$container" "$OPENRC_INITD_DIR/${container}-sup" \
+          "$OPENRC_INITD_DIR/$task_container" "$OPENRC_INITD_DIR/${task_container}-sup"
+    printf 'PASS: stop_tenant_%s OpenRC non-destructive stop\n' "$worker"
+  done
+)
+
+if test_stop_tenant_worker_openrc_nondestructive; then
+  :
+else
+  fail "stop_tenant_<worker> OpenRC non-destructive stop"
+fi
+
 # start-tenant must clean stale supervisors instead of starting workers whose
 # selection or desired-running state says they should stay down.
 tenant_worker_openrc_stop_requested() { [[ "$2" != "pebble" ]]; }

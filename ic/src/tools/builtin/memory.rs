@@ -157,6 +157,32 @@ pub(crate) fn normalize_memory_tool_path(path: &str) -> Result<String, ToolError
     Ok(normalized)
 }
 
+/// Guard a resolved write target against the engine-owned tree.
+///
+/// Writes are reserved against the WHOLE `engine/**` tree — broader than
+/// the read/tree guard above, which keeps `engine/knowledge/**`
+/// readable/searchable (with the `engine_internal` provenance label). The
+/// whole tree is engine-owned, boot-loaded state: `engine/.runtime` is
+/// internal runtime state; `engine/projects/*/missions/**/mission.json`
+/// loads through `Mission::from_value` at boot, bypassing every
+/// `create_mission` check; and `load_knowledge_docs` boot-loads
+/// `engine/knowledge/**` + `engine/orchestrator/**` into `doc_paths`/`docs`
+/// keyed by `memory_doc.id`, so a forged doc there with a colliding id
+/// REPLACES the real doc's id→path mapping at boot (engine-doc shadowing),
+/// is surfaced in memory_search wearing the `engine_internal` provenance
+/// label, and can outrank real orchestrator code versions. Reserve the
+/// whole tree on writes, matching the harness write-back and
+/// external-worker lanes (WI#322, widened to the full tree for WI#455).
+fn guard_memory_write_path(normalized: &str) -> Result<(), ToolError> {
+    if is_engine_internal_path(normalized) {
+        return Err(ToolError::NotAuthorized(
+            "engine-managed paths (engine/**) are Engine-owned state and not writable through memory tools"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn pretty_json_len(value: &serde_json::Value) -> usize {
     serde_json::to_vec_pretty(value).map_or(usize::MAX, |encoded| encoded.len())
 }
@@ -747,6 +773,7 @@ impl Tool for MemoryWriteTool {
         let resolved_path = resolve_memory_write_target(target, tz);
         validate_write_path(&resolved_path).map_err(map_write_err)?;
         let normalized_path = normalize_memory_tool_path(&resolved_path)?;
+        guard_memory_write_path(&normalized_path)?;
         let workspace = self.resolver.resolve(&ctx.user_id).await;
 
         // When a layer is specified, route through layer-aware methods for ALL targets.
@@ -1370,6 +1397,9 @@ mod tests {
             ));
         }
 
+        // Near matches that normalize OUT of the reserved runtime prefix
+        // stay ordinary on the read/tree guard; the write lane reserves
+        // them separately (see memory_write_paths_reserve_engine_tree).
         assert_eq!(
             normalize_memory_tool_path(" engine//.runtime-notes.md/ ").expect("near match"),
             "engine/.runtime-notes.md"
@@ -1380,11 +1410,12 @@ mod tests {
         );
     }
 
-    /// WI#322: memory tools must not touch the engine projects tree — a
-    /// memory write under `engine/projects/*/missions/**/mission.json` is
-    /// loaded through `Mission::from_value` at boot, bypassing every
-    /// `create_mission` check. The whole tree is reserved, and traversal
-    /// (`..`) that escapes it stays an ordinary path.
+    /// WI#322: memory tools must not touch the engine projects tree on the
+    /// read/tree guard — a memory write under
+    /// `engine/projects/*/missions/**/mission.json` is loaded through
+    /// `Mission::from_value` at boot, bypassing every `create_mission`
+    /// check. The whole tree is reserved, and traversal (`..`) that escapes
+    /// it stays an ordinary path.
     #[test]
     fn memory_tool_paths_reserve_engine_projects_tree() {
         for path in [
@@ -1418,15 +1449,55 @@ mod tests {
                 "foo/engine/projects/file.json",
             ),
             ("engine/projects/../MEMORY.md", "engine/MEMORY.md"),
-            (
-                "engine/projectz/x/mission.json",
-                "engine/projectz/x/mission.json",
-            ),
         ] {
             assert_eq!(
                 normalize_memory_tool_path(path).expect("ordinary path"),
                 expected,
                 "path should stay writable: {path}"
+            );
+        }
+    }
+
+    /// WI#455: the WRITE lane reserves the whole `engine/**` tree (broader
+    /// than the read/tree guard), because `load_knowledge_docs` boot-loads
+    /// `engine/knowledge/**` + `engine/orchestrator/**` keyed by
+    /// `memory_doc.id` — a forged doc shadows the real id→path mapping at
+    /// boot and surfaces wearing the `engine_internal` provenance label.
+    /// Traversal (`..`) that stays inside the tree is still reserved; only
+    /// traversal that escapes the tree entirely stays an ordinary write.
+    #[test]
+    fn memory_write_paths_reserve_engine_tree() {
+        for path in [
+            "engine",
+            "engine/.runtime",
+            "engine/.runtime/events/id.json",
+            "engine/.runtime-notes.md",
+            "engine/projects",
+            "engine/projects/foo/missions/bar/mission.json",
+            "engine/knowledge/notes/x.json",
+            "engine/knowledge/summaries/id.json",
+            "engine/orchestrator/v3.py",
+            "engine/orchestrator/failures.json",
+            "engine/MEMORY.md",
+            "engine/projects/../MEMORY.md",
+        ] {
+            let normalized = normalize_path(path);
+            assert!(
+                matches!(
+                    guard_memory_write_path(&normalized),
+                    Err(ToolError::NotAuthorized(_))
+                ),
+                "write path should be reserved: {path} (normalized {normalized})"
+            );
+        }
+
+        // Sibling trees and traversal that escapes the engine tree entirely
+        // stay writable.
+        for path in ["MEMORY.md", "engine/../MEMORY.md", "foo/engine/x.md"] {
+            let normalized = normalize_path(path);
+            assert!(
+                guard_memory_write_path(&normalized).is_ok(),
+                "write path should stay writable: {path} (normalized {normalized})"
             );
         }
     }
@@ -2013,11 +2084,15 @@ mod tests {
                 "original runtime state"
             );
 
+            // A near-match that normalizes OUT of the engine tree entirely
+            // (`engine/../`) stays an ordinary write; `engine/.runtime-notes.md`
+            // still enters the engine tree and is reserved like any other
+            // `engine/` path.
             write
                 .execute(
                     serde_json::json!({
                         "content": "ordinary note",
-                        "target": "engine/.runtime-notes.md",
+                        "target": "engine/../runtime-notes.md",
                         "append": false,
                     }),
                     &context,
@@ -2025,13 +2100,22 @@ mod tests {
                 .await
                 .expect("near-match write");
             let output = read
-                .execute(
-                    serde_json::json!({"path": "engine/.runtime-notes.md"}),
-                    &context,
-                )
+                .execute(serde_json::json!({"path": "runtime-notes.md"}), &context)
                 .await
                 .expect("near-match read");
             assert_eq!(output.result["content"], "ordinary note");
+            assert_not_authorized(
+                write
+                    .execute(
+                        serde_json::json!({
+                            "content": "ordinary note",
+                            "target": "engine/.runtime-notes.md",
+                            "append": false,
+                        }),
+                        &context,
+                    )
+                    .await,
+            );
         }
 
         /// WI#322: `memory_write`/`memory_read`/`memory_tree` refuse the
