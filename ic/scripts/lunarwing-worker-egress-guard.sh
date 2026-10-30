@@ -58,6 +58,12 @@ network_tenant="${network_tenant//_/-}"
   || die "tenant and forward chain do not match"
 network="lw-egress-$network_tenant"
 keeper="lw-egress-keeper-$network_tenant"
+# The keeper's infra image must be a local pause image carrying an explicit
+# non-empty tag; pod create pins the same reference so creation and validation
+# agree by construction (WI#516).
+keeper_infra_image="${LUNARWING_WORKER_EGRESS_INFRA_IMAGE:-localhost/podman-pause:5.8.2}"
+[[ "$keeper_infra_image" =~ ^localhost/podman-pause:.+$ ]] \
+  || die "invalid pinned keeper infra image '$keeper_infra_image'"
 keeper_infra=""
 keeper_image=""
 keeper_state="not applicable (rootful)"
@@ -108,7 +114,9 @@ validate_keeper() {
     || die "cannot inspect infra image for keeper $keeper"
   if [[ -z "$keeper_image" ]]; then
     keeper_uses_native_pause || remove_untrusted_keeper "native pause metadata mismatch"
-  elif [[ "$keeper_image" != localhost/podman-pause:* || "$keeper_image" == localhost/podman-pause: ]]; then
+  elif [[ "$keeper_image" =~ ^localhost/podman-pause:.+$ ]]; then
+    : # provenance accepted: local pause image with an explicit non-empty tag
+  else
     remove_untrusted_keeper "$keeper_image"
   fi
   networks="$(podman_for_tenant inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{printf "%s\n" $name}}{{end}}' "$keeper_infra")" \
@@ -121,6 +129,7 @@ ensure_keeper() {
   local running
   if ! keeper_exists; then
     podman_for_tenant pod create --name "$keeper" --network "$network" --dns 127.0.0.1 \
+      --infra-image "$keeper_infra_image" \
       --label "lunarwing.tenant=$network_tenant" --label lunarwing.purpose=worker-egress-keeper >/dev/null \
       || keeper_exists \
       || die "cannot create rootless namespace keeper $keeper (refusing unfiltered start)"
