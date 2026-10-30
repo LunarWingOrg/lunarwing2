@@ -137,6 +137,69 @@ else
   fail "build_opencode2_worker floor failure missing probe reason (rc=$rc): $output"
 fi
 
+# WI#456 review SR-1: the external upgrade wrapper
+# (ic/scripts/upgrade-tenant.sh) goes upgrade-preflight.sh ->
+# `stop-tenant-for-upgrade` -> build-tenant, so the floor must be enforced at
+# that stop boundary too. Those cases stub stop_tenant directly, so re-enable
+# the real stop_tenant_for_upgrade body plus its minimal dependencies.
+tenant_exists_in_registry() { :; }
+tenant_darkirc_enabled() { return 1; }
+stop_tenant() { printf 'stop\n' >>"$events"; }
+unset -f tenant_worker_enabled
+tenant_worker_enabled() { [[ "$1" == "fixture" && "$2" == "opencode2" ]]; }
+
+opencode2_builder_supported() {
+  OPENCODE2_BUILDER_FLOOR_PROBLEM="fixture floor below Podman 4.5"
+  return 1
+}
+: >"$events"
+set +e
+output="$(stop_tenant_for_upgrade fixture 2>&1)"
+rc=$?
+set -e
+if [[ "$rc" -eq 0 ]]; then
+  fail 'stop-tenant-for-upgrade accepted a below-floor opencode2 builder'
+elif grep -q '^stop$' "$events"; then
+  fail 'stop-tenant-for-upgrade stopped the tenant before the builder-floor check'
+elif [[ "$output" == *"fixture floor below Podman 4.5"* \
+    && "$output" == *"tenant 'fixture' was not stopped"* ]]; then
+  pass 'wrapper stop boundary refuses a below-floor builder before stopping'
+else
+  fail "wrapper stop boundary floor error lacked floor/safe-stop wording: $output"
+fi
+
+opencode2_builder_supported() { OPENCODE2_BUILDER_FLOOR_PROBLEM=""; return 0; }
+: >"$events"
+set +e
+output="$(stop_tenant_for_upgrade fixture 2>&1)"
+rc=$?
+set -e
+if [[ "$rc" -eq 0 ]] && grep -q '^stop$' "$events"; then
+  pass 'wrapper stop boundary proceeds when the opencode2 builder meets the floor'
+else
+  fail "wrapper stop boundary blocked a supported builder (rc=$rc): $output"
+fi
+
+# SR-3: no container runtime at all must die in the probe's own words with the
+# tenant still running, rather than falling through to the stop.
+tenant_worker_enabled() { [[ "$1" == "fixture" && "$2" == "opencode2" ]]; }
+ensure_container_runtime() { die "neither docker nor podman found; install one"; }
+eval "$REAL_OPENCODE2_PROBE"
+: >"$events"
+set +e
+output="$(stop_tenant_for_upgrade fixture 2>&1)"
+rc=$?
+set -e
+if [[ "$rc" -eq 0 ]]; then
+  fail 'stop-tenant-for-upgrade accepted a host with no container runtime'
+elif grep -q '^stop$' "$events"; then
+  fail 'stop-tenant-for-upgrade stopped the tenant with no container runtime'
+elif [[ "$output" == *"neither docker nor podman found"* ]]; then
+  pass 'missing container runtime fails closed before the tenant is stopped'
+else
+  fail "missing-runtime failure did not carry the runtime message: $output"
+fi
+
 if [[ "$failures" -ne 0 ]]; then
   printf 'RESULT: %d failure(s)\n' "$failures"
   exit 1

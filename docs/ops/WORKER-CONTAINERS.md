@@ -1085,7 +1085,12 @@ first, so on a below-floor host the opencode2 gate used to fail only after
 every lane was already down. The probe is `opencode2_builder_supported`
 (non-dieing; `build_opencode2_worker` and the upgrade preflight both consume
 its reason), so the refusal names the operator action and states the tenant
-was not stopped. Sources: Podman
+was not stopped. Both stop paths enforce it: mt-admin's own
+`upgrade-tenant` before `stop_tenant`, and `stop-tenant-for-upgrade` — the
+boundary `ic/scripts/upgrade-tenant.sh` uses before it runs `build-tenant`
+(run-284 review SR-1) — so the external wrapper cannot bypass the check.
+This covers only the opencode2 floor; a kimi/pebble build failure after the
+stop can still strand a tenant, tracked as WI#527. Sources: Podman
 [v4.5.0 go.mod](https://github.com/containers/podman/blob/v4.5.0/go.mod) and
 [v4.4.4 go.mod](https://github.com/containers/podman/blob/v4.4.4/go.mod).
 

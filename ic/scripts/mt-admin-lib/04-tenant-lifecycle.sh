@@ -1194,6 +1194,17 @@ stop_tenant_for_upgrade() {
   name="$(sanitize_name "$name")"
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
 
+  # WI#456 review SR-1: this is the stop boundary the external upgrade wrapper
+  # (ic/scripts/upgrade-tenant.sh) uses — it runs upgrade-preflight.sh, then
+  # `stop-tenant-for-upgrade`, then `build-tenant`, so it never reaches
+  # upgrade_tenant_locked's own preflight. Check the opencode2 builder floor
+  # here too, or a below-floor host strands the tenant on that path exactly as
+  # before. Runs root-side and read-only; nothing has been stopped yet.
+  if tenant_worker_enabled "$name" opencode2; then
+    opencode2_builder_supported \
+      || die "$OPENCODE2_BUILDER_FLOOR_PROBLEM; tenant '$name' was not stopped"
+  fi
+
   if tenant_darkirc_enabled "$name"; then
     if [[ "$DARKIRC_WRITER_LOCK_HELD" != true ]]; then
       darkirc_writer_lock "$name"
