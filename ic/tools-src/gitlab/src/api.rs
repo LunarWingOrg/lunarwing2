@@ -693,6 +693,29 @@ pub fn get_pipeline(
     client.request_json("GET", &endpoint, None)
 }
 
+/// Fields kept from each GitLab job object (WI#525). GitLab's full job
+/// payload carries large nested `pipeline`, `commit`, `runner`, `user`, and
+/// `artifacts` objects; a full page of 20–100 of them parses into a
+/// `serde_json::Value` tree several times its JSON text size and traps the
+/// sandboxed guest (10 MiB memory ceiling) while agents investigate failing
+/// pipelines. The investigation-relevant surface is this flat set.
+const JOB_FIELDS: &[&str] = &[
+    "id",
+    "name",
+    "stage",
+    "status",
+    "failure_reason",
+    "ref",
+    "tag",
+    "allow_failure",
+    "started_at",
+    "finished_at",
+    "duration",
+    "queued_duration",
+    "web_url",
+    "created_at",
+];
+
 pub fn list_jobs(
     client: &GitlabClient,
     project: &str,
@@ -705,7 +728,35 @@ pub fn list_jobs(
         "/projects/{}/pipelines/{pipeline_id}/jobs?per_page={per_page}&page={page_number}",
         project_path(project)?
     );
-    client.request_json("GET", &endpoint, None)
+    let value = client.request_json("GET", &endpoint, None)?;
+    Ok(project_job_fields(value))
+}
+
+/// Reduce every job object in a `list_jobs` response to `JOB_FIELDS`,
+/// preserving array order and any sibling `pagination` object.
+fn project_job_fields(value: Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.into_iter().map(project_job).collect()),
+        Value::Object(mut map) => {
+            if let Some(Value::Array(items)) = map.remove("items") {
+                map.insert(
+                    "items".to_string(),
+                    Value::Array(items.into_iter().map(project_job).collect()),
+                );
+            }
+            Value::Object(map)
+        }
+        other => other,
+    }
+}
+
+fn project_job(job: Value) -> Value {
+    let Value::Object(map) = job else {
+        return job;
+    };
+    map.into_iter()
+        .filter(|(key, _)| JOB_FIELDS.contains(&key.as_str()))
+        .collect()
 }
 
 fn validate_choice(field: &str, value: &str, allowed: &[&str]) -> Result<(), String> {
@@ -862,5 +913,112 @@ mod tests {
             "/projects/35/search?scope=issues&search=refactor&per_page=20&page=2"
         );
         assert!(!issues.contains("ref="));
+    }
+
+    /// WI#525: the heavy nested objects in GitLab's full job payload
+    /// (`pipeline`, `commit`, `runner`, `user`, `artifacts`) are dropped
+    /// before the response tree is returned, keeping a full page within the
+    /// sandboxed guest's memory ceiling.
+    #[test]
+    fn list_jobs_projects_each_job_to_the_flat_field_set() {
+        let full_job = serde_json::json!({
+            "id": 103070,
+            "name": "cargo-deny",
+            "stage": "test",
+            "status": "failed",
+            "failure_reason": "script_failure",
+            "ref": "main",
+            "tag": false,
+            "allow_failure": false,
+            "started_at": "2026-10-30T14:00:00.000Z",
+            "finished_at": "2026-10-30T14:05:00.000Z",
+            "duration": 300.5,
+            "queued_duration": 1.25,
+            "web_url": "https://git.lunarwing.org/lunarwing/lunarwing2/-/jobs/103070",
+            "created_at": "2026-10-30T13:59:00.000Z",
+            "pipeline": {"id": 6843, "project_id": 35, "sha": "d8bcc5262", "web_url": "https://..."},
+            "commit": {"id": "d8bcc5262", "message": "very long message", "author_name": "a"},
+            "runner": {"id": 1, "description": "shared", "tag_list": ["docker"]},
+            "user": {"id": 4, "username": "kageho", "name": "kageho"},
+            "artifacts": [{"file_type": "trace", "size": 123456, "filename": "trace.log"}],
+            "artifacts_file": {"filename": "trace.log", "size": 123456},
+            "runner_manager": {"id": 9, "system_id": "s1"},
+            "erase_at": null,
+            "project": {"ci_job_token_scope_enabled": false}
+        });
+        let value = serde_json::json!([full_job]);
+        let projected = super::project_job_fields(value);
+        let serde_json::Value::Array(items) = projected else {
+            panic!("array must stay an array");
+        };
+        assert_eq!(items.len(), 1);
+        let serde_json::Value::Object(job) = &items[0] else {
+            panic!("job must stay an object");
+        };
+        // The flat investigation surface survives in full.
+        for key in super::JOB_FIELDS {
+            assert!(job.contains_key(*key), "missing kept field {key}");
+        }
+        assert_eq!(job["name"], "cargo-deny");
+        assert_eq!(job["status"], "failed");
+        assert_eq!(job["failure_reason"], "script_failure");
+        // Every heavy nested object is gone.
+        for key in [
+            "pipeline",
+            "commit",
+            "runner",
+            "user",
+            "artifacts",
+            "artifacts_file",
+            "runner_manager",
+            "project",
+            "erase_at",
+        ] {
+            assert!(!job.contains_key(key), "heavy field {key} must be dropped");
+        }
+    }
+
+    /// The `with_pagination` wrapper shape (`{items, pagination}`) is
+    /// projected item-by-item while the pagination object passes through
+    /// untouched; non-array/non-object bodies pass through unchanged.
+    #[test]
+    fn list_jobs_projection_preserves_the_pagination_wrapper() {
+        let value = serde_json::json!({
+            "items": [
+                {"id": 1, "name": "a", "pipeline": {"id": 6842}, "status": "failed"},
+                {"id": 2, "name": "b", "commit": {"id": "abc"}, "status": "success"},
+            ],
+            "pagination": {"page": 1, "per_page": 20, "total": 2}
+        });
+        let projected = super::project_job_fields(value);
+        assert_eq!(
+            projected["pagination"],
+            serde_json::json!({"page": 1, "per_page": 20, "total": 2}),
+            "pagination must pass through untouched"
+        );
+        let serde_json::Value::Array(items) = &projected["items"] else {
+            panic!("items must stay an array");
+        };
+        assert_eq!(items.len(), 2, "order and count are preserved");
+        assert_eq!(items[0]["name"], "a");
+        assert_eq!(items[1]["name"], "b");
+        assert!(items[0].get("pipeline").is_none());
+        assert!(items[1].get("commit").is_none());
+
+        // An unexpected scalar body is returned as-is, never mangled.
+        let scalar = serde_json::json!("unexpected");
+        assert_eq!(super::project_job_fields(scalar.clone()), scalar);
+    }
+
+    /// Non-object entries inside the items array are passed through
+    /// unchanged rather than dropped, so a schema surprise can never lose
+    /// data silently.
+    #[test]
+    fn list_jobs_projection_keeps_non_object_entries() {
+        let value = serde_json::json!(["not-a-job", 42]);
+        assert_eq!(
+            super::project_job_fields(value),
+            serde_json::json!(["not-a-job", 42])
+        );
     }
 }
