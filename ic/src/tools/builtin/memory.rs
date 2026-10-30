@@ -1483,7 +1483,10 @@ mod tests {
         ] {
             let normalized = normalize_path(path);
             assert!(
-                matches!(guard_memory_write_path(&normalized), Err(ToolError::NotAuthorized(_))),
+                matches!(
+                    guard_memory_write_path(&normalized),
+                    Err(ToolError::NotAuthorized(_))
+                ),
                 "write path should be reserved: {path} (normalized {normalized})"
             );
         }
@@ -2097,10 +2100,7 @@ mod tests {
                 .await
                 .expect("near-match write");
             let output = read
-                .execute(
-                    serde_json::json!({"path": "runtime-notes.md"}),
-                    &context,
-                )
+                .execute(serde_json::json!({"path": "runtime-notes.md"}), &context)
                 .await
                 .expect("near-match read");
             assert_eq!(output.result["content"], "ordinary note");
