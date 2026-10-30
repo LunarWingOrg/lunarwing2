@@ -1,8 +1,7 @@
 # Release Notes
 
-The current draft is [v2.1.7.0 — Shiranui (不知火)](../../RELEASE-v2.1.7.0.md)
-at the repository root. Its release date remains unset until tagging; draft
-coverage and remaining limitations are dated in that file.
+The current release notes are [v2.1.7.0 — Shiranui (不知火)](../../RELEASE-v2.1.7.0.md)
+at the repository root.
 
 ## Released versions
 
