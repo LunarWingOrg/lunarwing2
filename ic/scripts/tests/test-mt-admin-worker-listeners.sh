@@ -63,8 +63,16 @@ declare -A FIXTURE_STATE FIXTURE_BINDINGS FIXTURE_LISTENERS
  declare -A PID_LANE
 NEXT_PID=41000
 
-_ctr() {  # <tenant> inspect -f <format> <container> -> $1 $2 $3 $4 $5
-  local fmt="$4" container="$5" lane role key state
+# Accept both the typed `_ctr_inspect` form (_ctr <name> container inspect -f <fmt> <container>)
+# and the legacy `_ctr <name> inspect -f <fmt> <container>` form (RW-1/run-271: the typed
+# subcommand shifts every argument by one, so a position-only stub broke all 30 cases).
+_ctr() {  # <tenant> [container] inspect -f <format> <container> -> $1 $2 $3 $4 $5 | $1 $2 $3 $4
+  local fmt container lane role key state
+  if [[ "${2:-}" == "container" ]]; then          # typed _ctr_inspect form
+    fmt="$5"; container="$6"
+  else                                           # legacy `inspect` form
+    fmt="$4"; container="$5"
+  fi
   lane="${container#lunarwing-}"
   lane="${lane%%-*}"
   role=bridge

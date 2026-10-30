@@ -153,6 +153,9 @@ _ctr() {
   local name="$1"; shift
   CTR_CALLS+=("$name $*")
   printf '%s\n' "$name $*" >>"$CTR_LOG"
+  # RW-1/run-271: `_ctr_inspect` sends the typed `container inspect` form, so
+  # normalize it to the bare `inspect` arm below before the positional parsing.
+  [[ "${1:-}" == "container" ]] && shift
   case "${1:-}" in
     network)
       case "${2:-}" in
