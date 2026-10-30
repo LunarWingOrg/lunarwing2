@@ -183,7 +183,7 @@ render_vision_systemd_assets() {
     render_vision_systemd_fallback_unit "$name"
   elif [[ "$has_quadlet" == "true" ]]; then
     render_vision_quadlet "$name"
-  elif ! _ctr "$name" inspect "$container" &>/dev/null; then
+  elif ! _ctr_inspect "$name" "$container" &>/dev/null; then
     return 0
   elif podman_supports_quadlet; then
     render_vision_quadlet "$name"
@@ -352,7 +352,7 @@ render_voice_systemd_assets() {
     render_voice_systemd_fallback_unit "$name"
   elif [[ "$has_quadlet" == "true" ]]; then
     render_voice_quadlet "$name"
-  elif ! _ctr "$name" inspect "$container" &>/dev/null; then
+  elif ! _ctr_inspect "$name" "$container" &>/dev/null; then
     return 0
   elif podman_supports_quadlet; then
     render_voice_quadlet "$name"

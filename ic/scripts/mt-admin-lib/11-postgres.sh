@@ -21,6 +21,30 @@
 
 # ── PostgreSQL container ─────────────────────────────────────────────────────
 
+# Rootless PG data is present when the container exists OR the exact-name data
+# volume exists (Quadlet's --rm removes the container on every unit stop while
+# keeping the named volume, so container-only would false-negative a migrated
+# tenant's restart — RW-2/run-271). The volume probe compares `{{.Name}}` for
+# equality because `volume inspect <name>` itself prefix-matches a longer
+# volume (e.g. lunarwing-pg-<t> resolves to lunarwing-pg-<t>2), the same
+# cross-object hazard `_ctr_inspect` removes for containers.
+_rootless_pg_data_present() {  # <tenant> <container_name> -> 0 if data present
+  local name="$1" container_name="$2" volume_name
+  _ctr_inspect "$name" "$container_name" &>/dev/null && return 0
+  volume_name="$(_ctr "$name" volume inspect --format '{{.Name}}' \
+    "lunarwing-pg-${name}" 2>/dev/null || true)"
+  [[ "$volume_name" == "lunarwing-pg-${name}" ]]
+}
+
+# The legacy v1.1.0 rootful PG lived in root's container store. Probe it with
+# the typed subcommand so a root-store *volume* named lunarwing-pg-<t>-... can
+# never satisfy the "root container still exists" arm (RW-5/run-271); the guard
+# fails closed either way — a miss here only means "no root data to protect".
+_root_store_pg_container_present() {  # <tenant> <container_name> -> 0 if present
+  local name="$1" container_name="$2"
+  _root_ctr container inspect "$container_name" &>/dev/null
+}
+
 start_tenant_postgres() {
   local name="$1"
   ensure_container_runtime
@@ -52,9 +76,19 @@ start_tenant_postgres() {
   # break every legitimate restart. That case is surfaced by upgrade-preflight.sh
   # and blocked by `upgrade-tenant.sh --prune-old-root` (refuses to delete the root
   # copy while the rootless DB is empty).
+  #
+  # Rootless-data presence is "container OR exact-name volume", not container-only:
+  # on systemd+Quadlet the user-generator runs PG with `--rm`, so every unit stop
+  # removes the container while the named data volume `lunarwing-pg-<t>` stays.
+  # A container-only probe would then see "no rootless data" on a legitimately
+  # migrated tenant's next start-tenant and trip this guard on its kept root
+  # rollback container. `volume inspect` compares `{{.Name}}` for equality, so the
+  # prefix cross-match that motivated `_ctr_inspect` cannot re-enter here
+  # (RW-2/run-271: a plain volume-name existence check also prefix-matches, e.g.
+  # lunarwing-pg-<t> vs lunarwing-pg-<t>2).
   if [[ "$MT_ROOTLESS" == "true" && "$CONTAINER_RT" == "podman" ]] \
-     && ! _ctr "$name" inspect "$container_name" &>/dev/null \
-     && "$CONTAINER_RT" inspect "$container_name" &>/dev/null; then
+     && ! _rootless_pg_data_present "$name" "$container_name" \
+     && _root_store_pg_container_present "$name" "$container_name"; then
     {
       say "############################################################"
       say "# DATA-ORPHAN GUARD — tenant '$name'"
@@ -96,7 +130,7 @@ start_tenant_postgres() {
     # units and installs the pipeline.
     local q_attempts=0 q_ready=false q_health=""
     while (( q_attempts < 120 )); do
-      q_health="$(_ctr "$name" inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container_name" 2>/dev/null || true)"
+      q_health="$(_ctr_inspect "$name" -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container_name" 2>/dev/null || true)"
       if [[ "$q_health" == healthy ]] || _ctr "$name" exec "$container_name" pg_isready -U lunarwing -q 2>/dev/null; then
         q_ready=true; break
       fi
@@ -116,8 +150,8 @@ start_tenant_postgres() {
     healthcheck_args=(--no-healthcheck)
   fi
 
-  if _ctr "$name" inspect "$container_name" &>/dev/null; then
-    if _ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true; then
+  if _ctr_inspect "$name" "$container_name" &>/dev/null; then
+    if _ctr_inspect "$name" -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true; then
       say "PostgreSQL already running ($container_name, port $pg_port)"
       return 0
     fi
@@ -201,7 +235,7 @@ stop_tenant_postgres() {
     _systemctl_user "$name" stop "${container_name}.service" >/dev/null 2>&1 \
       || _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
   fi
-  if _ctr "$name" inspect "$container_name" &>/dev/null; then
+  if _ctr_inspect "$name" "$container_name" &>/dev/null; then
     _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
     say "PostgreSQL stopped ($container_name)"
   fi
@@ -232,7 +266,7 @@ rotate_tenant_pg_password() {
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
 
   local container_name="lunarwing-pg-$name"
-  _ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true \
+  _ctr_inspect "$name" -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true \
     || die "PostgreSQL container $container_name is not running; start the tenant first"
 
   local envf pg_port new_pw secret_file
@@ -285,7 +319,7 @@ tenant_psql() {
   ensure_container_runtime
 
   local container_name="lunarwing-pg-$name"
-  _ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true \
+  _ctr_inspect "$name" -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true \
     || die "PostgreSQL container $container_name is not running; start the tenant first"
 
   _ctr "$name" exec -i "$container_name" psql -U lunarwing -d lunarwing "$@"
@@ -304,7 +338,7 @@ backup_tenant_postgres() {
   ensure_container_runtime
   local container_name="lunarwing-pg-$name"
 
-  _ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true \
+  _ctr_inspect "$name" -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true \
     || die "PostgreSQL not running for '$name' ($container_name) — start the tenant first"
 
   local dir ts dest tmp
@@ -378,7 +412,7 @@ restore_tenant_postgres() {
   ensure_init_system
   local container_name="lunarwing-pg-$name"
 
-  _ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true \
+  _ctr_inspect "$name" -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true \
     || die "PostgreSQL not running for '$name' — start the tenant's pg container first"
 
   # Refuse unless we can POSITIVELY confirm the daemon is stopped (concurrent

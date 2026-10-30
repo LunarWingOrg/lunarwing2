@@ -635,13 +635,13 @@ worker_egress_container_attached() {
   local name="$1" container="$2" network networks dns hosts mappings mapping
   network="$(worker_egress_network_name "$name")"
   # shellcheck disable=SC2016  # $name is a Go-template key, not a shell expansion.
-  networks="$(_ctr "$name" inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{printf "%s\n" $name}}{{end}}' \
+  networks="$(_ctr_inspect "$name" --format '{{range $name, $_ := .NetworkSettings.Networks}}{{printf "%s\n" $name}}{{end}}' \
     "$container" 2>/dev/null)" || return 1
   [[ "$networks" == "$network" ]] || return 1
-  dns="$(_ctr "$name" inspect --format '{{range .HostConfig.Dns}}{{printf "%s\n" .}}{{end}}' \
+  dns="$(_ctr_inspect "$name" --format '{{range .HostConfig.Dns}}{{printf "%s\n" .}}{{end}}' \
     "$container" 2>/dev/null)" || return 1
   [[ "$dns" == "127.0.0.1" ]] || return 1
-  hosts="$(_ctr "$name" inspect --format '{{range .HostConfig.ExtraHosts}}{{printf "%s\n" .}}{{end}}' \
+  hosts="$(_ctr_inspect "$name" --format '{{range .HostConfig.ExtraHosts}}{{printf "%s\n" .}}{{end}}' \
     "$container" 2>/dev/null)" || return 1
   mappings="$(worker_egress_host_mappings "$name")" || return 1
   while IFS= read -r mapping; do
@@ -652,7 +652,7 @@ worker_egress_container_attached() {
 
 worker_egress_reconcile_container() {
   local name="$1" container="$2"
-  _ctr "$name" inspect "$container" >/dev/null 2>&1 || return 0
+  _ctr_inspect "$name" "$container" >/dev/null 2>&1 || return 0
   worker_egress_container_attached "$name" "$container" && return 0
   say "worker container $container has a stale egress network/DNS/hosts contract; force-recreating"
   _ctr "$name" rm -f "$container" >/dev/null 2>&1 \
@@ -704,7 +704,7 @@ worker_egress_audit() {
                    "lunarwing-opencode2-$name" "lunarwing-kimi-$name" \
                    "lunarwing-pebble-task-$name" "lunarwing-opencode-task-$name" \
                    "lunarwing-opencode2-task-$name" "lunarwing-kimi-task-$name"; do
-    _ctr "$name" inspect "$container" >/dev/null 2>&1 || continue
+    _ctr_inspect "$name" "$container" >/dev/null 2>&1 || continue
     attached=1
     if worker_egress_container_attached "$name" "$container"; then
       say "  container $container: attached (exclusive, DNS pinned, static hosts current)"
