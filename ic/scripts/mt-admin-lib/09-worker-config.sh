@@ -1297,12 +1297,12 @@ _stop_nanocode_container_store() {
   local label="$1" container="$2"
   shift 2
   local -a runtime=("$@")
-  "${runtime[@]}" inspect "$container" >/dev/null 2>&1 || return 0
+  "${runtime[@]}" container inspect "$container" >/dev/null 2>&1 || return 0
   if ! "${runtime[@]}" stop --time 30 "$container" >/dev/null 2>&1; then
     say "failed to stop legacy $container in $label" >&2
     return 1
   fi
-  if [[ "$("${runtime[@]}" inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)" == "true" ]]; then
+  if [[ "$("${runtime[@]}" container inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)" == "true" ]]; then
     say "legacy $container still running in $label" >&2
     return 1
   fi

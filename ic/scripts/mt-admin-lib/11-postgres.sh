@@ -21,6 +21,30 @@
 
 # ── PostgreSQL container ─────────────────────────────────────────────────────
 
+# Rootless PG data is present when the container exists OR the exact-name data
+# volume exists (Quadlet's --rm removes the container on every unit stop while
+# keeping the named volume, so container-only would false-negative a migrated
+# tenant's restart — RW-2/run-271). The volume probe compares `{{.Name}}` for
+# equality because `volume inspect <name>` itself prefix-matches a longer
+# volume (e.g. lunarwing-pg-<t> resolves to lunarwing-pg-<t>2), the same
+# cross-object hazard `_ctr_inspect` removes for containers.
+_rootless_pg_data_present() {  # <tenant> <container_name> -> 0 if data present
+  local name="$1" container_name="$2" volume_name
+  _ctr_inspect "$name" "$container_name" &>/dev/null && return 0
+  volume_name="$(_ctr "$name" volume inspect --format '{{.Name}}' \
+    "lunarwing-pg-${name}" 2>/dev/null || true)"
+  [[ "$volume_name" == "lunarwing-pg-${name}" ]]
+}
+
+# The legacy v1.1.0 rootful PG lived in root's container store. Probe it with
+# the typed subcommand so a root-store *volume* named lunarwing-pg-<t>-... can
+# never satisfy the "root container still exists" arm (RW-5/run-271); the guard
+# fails closed either way — a miss here only means "no root data to protect".
+_root_store_pg_container_present() {  # <tenant> <container_name> -> 0 if present
+  local name="$1" container_name="$2"
+  _root_ctr inspect "$container_name" &>/dev/null
+}
+
 start_tenant_postgres() {
   local name="$1"
   ensure_container_runtime
@@ -52,9 +76,19 @@ start_tenant_postgres() {
   # break every legitimate restart. That case is surfaced by upgrade-preflight.sh
   # and blocked by `upgrade-tenant.sh --prune-old-root` (refuses to delete the root
   # copy while the rootless DB is empty).
+  #
+  # Rootless-data presence is "container OR exact-name volume", not container-only:
+  # on systemd+Quadlet the user-generator runs PG with `--rm`, so every unit stop
+  # removes the container while the named data volume `lunarwing-pg-<t>` stays.
+  # A container-only probe would then see "no rootless data" on a legitimately
+  # migrated tenant's next start-tenant and trip this guard on its kept root
+  # rollback container. `volume inspect` compares `{{.Name}}` for equality, so the
+  # prefix cross-match that motivated `_ctr_inspect` cannot re-enter here
+  # (RW-2/run-271: a plain volume-name existence check also prefix-matches, e.g.
+  # lunarwing-pg-<t> vs lunarwing-pg-<t>2).
   if [[ "$MT_ROOTLESS" == "true" && "$CONTAINER_RT" == "podman" ]] \
-     && ! _ctr_inspect "$name" "$container_name" &>/dev/null \
-     && "$CONTAINER_RT" inspect "$container_name" &>/dev/null; then
+     && ! _rootless_pg_data_present "$name" "$container_name" \
+     && _root_store_pg_container_present "$name" "$container_name"; then
     {
       say "############################################################"
       say "# DATA-ORPHAN GUARD — tenant '$name'"
