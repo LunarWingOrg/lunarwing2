@@ -2049,12 +2049,16 @@ mod memory_write_route {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    /// WI#322: the write route reserves the engine projects tree — mission
-    /// records written here would load through `Mission::from_value` at
-    /// boot, bypassing every `create_mission` check — while a path that
-    /// merely normalizes out of the tree writes normally.
+    /// WI#322 reserved the engine projects tree; WI#455 widened the
+    /// reservation to the whole `engine/**` tree. Mission records written
+    /// here would load through `Mission::from_value` at boot, bypassing
+    /// every `create_mission` check, and `load_knowledge_docs` boot-loads
+    /// `engine/knowledge/**` + `engine/orchestrator/**` keyed by
+    /// `memory_doc.id`, so a forged doc shadows the real id→path mapping at
+    /// boot. Only a path that normalizes OUT of the tree entirely writes
+    /// normally.
     #[tokio::test]
-    async fn memory_write_reserves_engine_projects_mission_records() {
+    async fn memory_write_reserves_engine_tree() {
         let (app, _dir) = setup().await;
 
         for path in [
@@ -2064,6 +2068,12 @@ mod memory_write_route {
             "engine/projects/foo/missions/bar/mission.json",
             "engine/projects/foo/missions/bar/mission.json.bak",
             "engine/projects/foo/missions/bar/other.json",
+            "engine/knowledge/notes/x.json",
+            "engine/knowledge/summaries/id.json",
+            "engine/orchestrator/v3.py",
+            "engine/orchestrator/failures.json",
+            "engine/MEMORY.md",
+            "engine/projects/../MEMORY.md",
         ] {
             let resp = app
                 .clone()
@@ -2080,23 +2090,20 @@ mod memory_write_route {
             assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path}");
         }
 
-        // `engine/projects/../MEMORY.md` normalizes to engine/MEMORY.md, an
-        // ordinary write; `engine/projects-notes.md` never enters the tree.
-        for path in ["engine/projects/../MEMORY.md", "engine/projects-notes.md"] {
-            let resp = app
-                .clone()
-                .oneshot(write_request(
-                    "tok-alice",
-                    serde_json::json!({
-                        "path": path,
-                        "content": "ordinary memory note",
-                        "append": false,
-                    }),
-                ))
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), StatusCode::OK, "{path}");
-        }
+        // `engine/../MEMORY.md` normalizes to MEMORY.md, an ordinary write
+        // that escapes the engine tree entirely.
+        let resp = app
+            .oneshot(write_request(
+                "tok-alice",
+                serde_json::json!({
+                    "path": "engine/../MEMORY.md",
+                    "content": "ordinary memory note",
+                    "append": false,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
