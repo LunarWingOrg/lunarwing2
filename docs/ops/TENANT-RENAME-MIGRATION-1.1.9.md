@@ -49,7 +49,11 @@ upgrade aliases, not as permission to defer unit regeneration indefinitely.
    checkout `<ref>` as the tenant user → rebuild with WASM → `render-units` →
    `patch-env` → start. Fetched target resolves to an immutable commit, and the
    build lock covers the clean-tree gate through checkout. Per-tenant upgrade
-   lock serializes full operation through restart.
+   lock serializes full operation through restart. Since WI#505 the lifecycle
+   and upgrade locks fail fast (naming any live lock-inheritor pids) instead of
+   blocking when another lifecycle command or a leaked daemon descriptor holds
+   them, so `export-tenant` writer-state probes and onboarding web jobs fail
+   fast rather than serialising behind a held lock.
    Dirty tracked files abort before the tenant stops and remain untouched;
    untracked runtime directories are ignored unless the target ref would
    overwrite one of their paths. That collision also aborts before stop. The
