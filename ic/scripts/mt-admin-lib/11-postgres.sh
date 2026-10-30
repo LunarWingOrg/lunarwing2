@@ -42,7 +42,7 @@ _rootless_pg_data_present() {  # <tenant> <container_name> -> 0 if data present
 # fails closed either way — a miss here only means "no root data to protect".
 _root_store_pg_container_present() {  # <tenant> <container_name> -> 0 if present
   local name="$1" container_name="$2"
-  _root_ctr inspect "$container_name" &>/dev/null
+  _root_ctr container inspect "$container_name" &>/dev/null
 }
 
 start_tenant_postgres() {
