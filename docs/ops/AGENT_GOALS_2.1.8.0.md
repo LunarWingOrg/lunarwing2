@@ -19,7 +19,7 @@
 
 1. [ ] Crate sweep for v2.1.8.0: bump every LunarWing-owned package from 2.1.7 to 2.1.8, update every external crate that can be updated, regenerate `ic/vendor/` and every lockfile, and keep CI/CD and the docs in step. Exit criteria: no LunarWing-owned package or path dependency left at 2.1.7; `cargo check` clean on all four feature combos; `cargo deny check` clean with no new advisory ignores; every advisory gate green; and a fully green MR pipeline (all jobs, worker lanes included) on the exact head being merged. Start from the current `aragents/kimil00p/v2.1.8.0` head, never a stale base, and read the spec below plus the v2.1.7.0 worked example before starting.
     - **Spec: LunarWing-owned packages (11).** Bump `version = "2.1.7"` to `"2.1.8"` in the daemon (`ic/Cargo.toml`), the five workspace crates (`ic/crates/lunarwing_{common,engine,health_metrics,safety,skills}`), the XMPP bridge (`ic/bridges/xmpp-bridge`) and the four WASM channels (`darkirc_channel_for_lunarwing/darkirc`, `ic/channels-src/multica`, `ic/channels-src/xmpp`, `lunarwing_weechat_wss/weechat_relay`; `ic/channels-src/{darkirc,weechat}` are symlinks), plus every inter-crate path-dependency requirement and the affected lockfiles. `.gitlab/scripts/verify_release_version.py` checks the six `ic/` manifests against the release tag, so they must all agree.
-    - **Spec: registry packages.** Patch-bump every channel registry entry (`ic/registry/channels/*.json`) together with its crate. Bump a tool registry entry (`ic/registry/tools/*.json`) only when that tool's source or dependencies change in this sweep. Keep each tool's four version pins identical (crate `Cargo.toml`, its `Cargo.lock`, `*.capabilities.json`, registry JSON) and prove it with `BASE_SHA=<target head> bash ic/scripts/check-version-bumps.sh` (the script reads the base from the environment, not from an argument).
+    - **Spec: registry packages.** Patch-bump every channel registry entry (`ic/registry/channels/*.json`) together with its crate. Bump a tool registry entry (`ic/registry/tools/*.json`) only when that tool's source or dependencies change in this sweep. Keep each tool's four version pins identical (crate `Cargo.toml`, its `Cargo.lock`, `*.capabilities.json`, registry JSON) and prove it with `BASE_SHA=<target head> bash ic/scripts/check-version-bumps.sh` (the script reads the base from the environment, not from an argument)
     - **Spec: external crates.** Run a semver-compatible `cargo update` (resolver v3 with the MSRV fallback; toolchain and `rust-version` stay 1.96.1) on the `ic` workspace and every tracked satellite lock root: 27 tracked `Cargo.lock` files outside `ic/vendor/`; `pebble4lunarwing/upstream` is manifest-less and gated by `pebble4lunarwing/scripts/verify_upstream_lock.py`. Semver-incompatible major bumps are out of scope: list each available one in the trail with the reason it was not taken, and file a WI for any that matters. Do not raise the MSRV here.
     - **Spec: vendor tree.** Regenerate `ic/vendor/` only through `ic/scripts/refresh-vendor.sh`. Never hand-edit or delete vendored entries, keep the `libsignal-protocol{,-sys}` path dependencies, and let the script restore the WI#292 `rig-core` patch. The `[patch.crates-io]` override `ic/patches/wasmtime-internal-cache` is cut from one wasmtime release: if wasmtime moves, rebase the patch onto the new release in the same change (as WI#524 did for 36.0.20), keep its `LUNARWING-PATCH.md` current and keep the `zstd` acceptance it carries. Run `ic/scripts/vendor-artifact-guard.sh` on any reused target dir.
     - **Spec: advisories and policy.** `bash .gitlab/scripts/cargo-deny-check.sh` (advisories, bans, licenses, sources) and `check-satellite-advisories.sh`, `check-default-graph-advisories.sh` and `check-lockfile-only-advisories.sh` must all pass with zero new `ignore` entries in `ic/deny.toml`. Keep every existing version floor, for example the WI#524 wasmtime ban `>=36.0.0, <36.0.20`, and raise a floor only alongside its fix; make no other `ic/deny.toml` change. An advisory that lands mid-sweep is fixed by a bump, never an ignore, and recorded in the trail. Record the gate results in the trail; the audit doc `docs/ops/v2.1.8.0_CARGO_DENY_AUDIT.md` belongs to item 2.
@@ -92,5 +92,17 @@
 26. [x] (S) Reserved
 27. [x] (S) Reserved
 28. [x] (S) Reserved
+29. [x] (S) NOTE TO RECHECK ALL WIS WITH TAG FOR 2.1.6.0
+30. [x] (H) Revamped LunarWing TUI REPLv3 utilizing OpenTUI, Multimodal input/output, and more
+31. [x] (H) Remaining polish items from massive changes introduced in Tsuno
+32. [x] (H) General Agent Loop Engine Polish
+33. [x] (H) OPERATOR NOTE: Start the gallop
+34. [x] (H) Deploy the stoplight system
+35. [x] (S) Reserved
+36. [x] (S) Reserved
+37. [x] (S) Reserved
+38. [x] (S) Reserved
+39. [x] (S) Reserved
+40. [x] (S) Reserved
 
 ---
