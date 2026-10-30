@@ -637,13 +637,24 @@ Enforced controls (opencode2 lane unless noted):
 
    **Rootless Podman first-start keeper (WI#504):** when no worker container is
    running, mt-admin creates `lw-egress-keeper-<tenant>` on that tenant's
-   `lw-egress-<tenant>` network before applying the filter. The root-owned guard
+   `lw-egress-<tenant>` network before applying the filter. Where the tenant's
+   local Podman store holds a `localhost/podman-pause:<tag>` image, creation is
+   pinned to that exact reference via `--infra-image`, so creation and
+   validation agree by construction; on hosts with no local pause image
+   (Podman 6.x's image-less native pause, or a 5.x host that has not prebuilt
+   one) no pin is passed and the native-pause shape check remains the gate.
+   The reference is never invented — a pinned `--infra-image` always names an
+   image the store already holds, and the `LUNARWING_WORKER_EGRESS_INFRA_IMAGE`
+   override is refused unless it is a `localhost/podman-pause:<tag>` reference
+   present locally (WI#516). The root-owned guard
    verifies the keeper's ownership label, single infra-container shape, local
    `localhost/podman-pause:<tag>` image and exclusive network attachment, then
    loads the rules and reads both reject chains in one
    `podman unshare --rootless-netns` session. `--verify` never creates a keeper
    or loads rules; the imperative post-start and the OpenRC/Quadlet paths use
-   the same guard. A non-local infra image is refused and its keeper pod is
+   the same guard. Any infra image that is not a local pause reference with an
+   explicit non-empty tag — including the malformed tag-stripped spelling
+   `localhost/podman-pause:` — is refused and its keeper pod is
    removed. Keep Podman's `infra_image` at its local default; the host must
    have `catatonit` installed so Podman can build/use its local pause image.
    This prerequisite applies on OpenRC/Gentoo as well as systemd hosts.
