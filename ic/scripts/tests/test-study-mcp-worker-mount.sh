@@ -73,6 +73,12 @@ _ctr() {
     printf '%s\n' "$container_image_user"
     return 0
   fi
+  # Typed container inspect: report the container as absent (exit 0) only for
+  # the typed form; the legacy bare `inspect` must not silently "succeed"
+  # (it resolves volumes/networks by prefix in the real runtime).
+  if [[ "$2" == "container" && "$3" == "inspect" ]]; then
+    return 0
+  fi
   [[ "$2" != "inspect" ]]
 }
 
