@@ -118,7 +118,7 @@
 33. [x] (H) OPERATOR NOTE: Start the gallop
 34. [x] (H) Deploy the stoplight system
 35. [x] (H) Dive back in to LunarDepth and open worker lanes across the fleet for it get it running and up again patches too
-36. [x] (S) Reserved
+36. [x] (H) follow up on some earlier endeavors
 37. [x] (S) Reserved
 38. [x] (S) Reserved
 39. [x] (S) Reserved
