@@ -5,13 +5,24 @@ The V2 engine is a thread/capability/CodeAct execution model in
 bridges it to the existing channel, tool, workspace, and approval systems;
 legacy execution remains active on channels outside the rollout allowlist.
 
-**Source revalidated 2026-10-29 for v2.1.7.0.** Read the behavior sections below
+**Source revalidated 2026-10-31 for v2.1.8.0.** Read the behavior sections below
 as the current contract. Relevant release changes include:
 
 - Mission persistence: WI#317 serializes boot/reconciliation writes with fires;
   WI#321 warns when stored records cannot load and when default projects
   duplicate; WI#322 reserves Engine project/mission documents from memory-tool
   and web-write mutation; WI#394 heals settled-stop dedup keys without refiring.
+- Memory write-lane reservation: WI#455 (v2.1.8.0) widens the memory-tool and
+  web-write reservation from `engine/projects/**` +
+  `engine/.runtime/**` to the whole `engine/**` tree, so a forged
+  `engine/knowledge/**` or `engine/orchestrator/**` document cannot shadow the
+  id→path mapping boot-loaded by `load_knowledge_docs`. Reads/tree listings
+  keep the narrower WI#322 reservation, so those Engine documents stay
+  searchable. See SEMANTIC-MEMORY-SEARCH.md for the memory-tool view.
+- Thread ownership: WI#502 (v2.1.8.0) pins thread ownership on store write
+  (`save_thread` refuses to replace a record owned by a different real user),
+  refuses a foreign `preferred_thread_id` at engine spawn, and closes the
+  gateway forged-`thread_id` path — see the Store section below.
 - CodeAct: WI#364 pre-injects missing imports for the supported standard-library
   module set before Monty execution. Sealed step records remain inference-only.
 - Gates: WI#392 shares tool-sensitive/HTTP display redaction across hooks and
@@ -966,11 +977,15 @@ mismatch clears the stamp silently (a warn log only — no approach-history
 entry, retry marker or notice), and the retry-marker sweep and the
 recoverable-thread resume skip history threads that fail the same
 project/owner checks. These checks remain defense in depth against partial
-forgeries and store corruption. WI#322 now reserves the complete
+forgeries and store corruption. WI#322 reserves the complete
 `engine/projects/**` tree from memory-tool reads/writes/tree listings and web
-writes, so those lanes cannot replace a boot-hydrated `mission.json` to bypass
-mission creation gates. Internal Store writes and exact-path operator recovery
-remain available; direct database/operator mutation is still a trusted boundary.
+writes; WI#455 (v2.1.8.0) widens the *write* reservation to the whole
+`engine/**` tree on the same lanes (reads/tree keep the narrow WI#322 set), so
+those lanes cannot replace a boot-hydrated `mission.json` to bypass mission
+creation gates and cannot forge an `engine/knowledge/**` or
+`engine/orchestrator/**` document that shadows the boot-loaded id→path mapping.
+Internal Store writes and exact-path operator recovery remain available; direct
+database/operator mutation is still a trusted boundary.
 
 Boot/reconciliation writers also reload each mission under its per-mission fire
 lock before saving (WI#317), preserving a concurrent fire's history, budget,
