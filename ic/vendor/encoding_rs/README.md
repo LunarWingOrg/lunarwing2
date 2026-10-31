@@ -552,6 +552,22 @@ To regenerate the generated code:
 
 ## Release Notes
 
+### 0.8.44
+
+* Restore the observable behavior of `mem::convert_latin1_to_utf8_partial` with `simd-accel` enabled to the 0.8.35 behavior.
+* As a consequence of the above item, fix a soundness (UB) bug in `mem::convert_latin1_to_str_partial` with `simd-accel` enabled.
+
+### 0.8.43
+
+* Restore the observable behavior of `mem::convert_utf16_to_utf8_partial` with `simd-accel` enabled to the 0.8.35 behavior.
+* As a consequence of the above item, fix a soundness (UB) bug in `mem::convert_utf16_to_str_partial` with `simd-accel` enabled.
+* Fix ISO-2022-JP decoder behavior at the output buffer boundary.
+* Fix decoder behavior when the output buffer is small and bytes that could be part of a BOM have been seen.
+* Fix max buffer length queries.
+* Fix a size computation panic on 32-bit targets.
+* Make it possible to enable the `serde` feature without enabling `alloc`.
+* Add a defense-in-depth guard in case of crate-internal bugs to `mem::convert_latin1_to_str_partial`.
+
 ### 0.8.42
 
 * Include the `multiversion` dependency in the dependency graph only if the `std` feature has been enabled and the architecture is either x86 or x86_64. (For the `multiversion` dependency to actually _do_ something, the `simd-accel` feature needs to be enabled in addition to enabling the `std` feature.)

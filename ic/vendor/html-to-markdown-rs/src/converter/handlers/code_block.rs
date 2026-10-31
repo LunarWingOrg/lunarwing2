@@ -7,6 +7,9 @@
 //! - The lines of a code block as they are in the page
 //! - Visitor callback integration
 
+mod delimiters;
+
+use self::delimiters::{longest_consecutive_run, min_safe_code_span_delimiter_length};
 use crate::converter::Context;
 use crate::converter::dom_context::DomContext;
 use crate::converter::inline::HandlerContext;
@@ -25,53 +28,6 @@ use std::borrow::Cow;
 /// Minimum length of a Markdown code fence (```` ``` ```` or `~~~`) per CommonMark.
 const MIN_FENCE_LENGTH: usize = 3;
 
-/// Compute the length of the longest consecutive run of `marker` in `content`.
-fn longest_consecutive_run(content: &str, marker: char) -> usize {
-    content
-        .chars()
-        .fold((0usize, 0usize), |(max, current), c| {
-            if c == marker {
-                let next = current + 1;
-                (max.max(next), next)
-            } else {
-                (max, 0)
-            }
-        })
-        .0
-}
-
-/// Smallest backtick-run length (starting at 1) that does not occur as a run inside `content`.
-///
-/// CommonMark closes an inline code span at the next backtick string of the *same* length as
-/// the opening delimiter (6.1) — a longer or shorter run never matches. So the delimiter only
-/// needs to avoid colliding with a run length that actually appears in `content`; it does not
-/// need to exceed the longest run (unlike a fenced block, whose closing rule matches on *any*
-/// run at least as long as the fence). Picking `longest_run + 1` unconditionally over-escapes:
-/// content `` `` `` (a single length-2 run, no length-1 run) is valid with a single backtick.
-fn min_safe_code_span_delimiter_length(content: &str) -> usize {
-    let mut run_lengths = std::collections::HashSet::new();
-    let mut current = 0usize;
-    for c in content.chars() {
-        if c == '`' {
-            current += 1;
-        } else {
-            if current > 0 {
-                run_lengths.insert(current);
-            }
-            current = 0;
-        }
-    }
-    if current > 0 {
-        run_lengths.insert(current);
-    }
-
-    let mut candidate = 1usize;
-    while run_lengths.contains(&candidate) {
-        candidate += 1;
-    }
-    candidate
-}
-
 /// Open an inline `<code>` element, or a `<kbd>` or a `<samp>` that holds a link. Lists its
 /// children in `children`.
 ///
@@ -89,7 +45,7 @@ pub fn open_code(
         return Open::children_only();
     }
     let links = Rc::new(std::cell::RefCell::new(Vec::new()));
-    let breaks = Rc::new(std::cell::Cell::new(0));
+    let breaks = Rc::new(std::cell::RefCell::new(Vec::new()));
     let code_ctx = Context {
         in_code: true,
         inline_code_breaks: Some((node_handle.get_inner(), breaks.clone())),
@@ -104,14 +60,22 @@ pub fn open_code(
     };
     Open {
         scope: Some(Rc::new(code_ctx)),
-        close: Close::Capture(CaptureEnd::Code(CodeEnd { links, breaks })),
+        close: Close::Capture(CaptureEnd::Code(CodeEnd {
+            links,
+            breaks,
+            source_whitespace_only: children.iter().all(|child| {
+                matches!(child.get(parser), Some(tl::Node::Raw(raw))
+                    if crate::text::decode_html_entities_cow(&raw.as_utf8_str()).trim().is_empty())
+            }),
+        })),
     }
 }
 
 /// What [`open_code`] leaves for [`close_code`]: the links that the children wrote.
 pub struct CodeEnd {
     links: Rc<std::cell::RefCell<Vec<crate::converter::context::InlineCodeLink>>>,
-    breaks: Rc<std::cell::Cell<usize>>,
+    breaks: Rc<std::cell::RefCell<Vec<usize>>>,
+    source_whitespace_only: bool,
 }
 
 /// Write `content`, the text of the children of a code element, as inline code:
@@ -135,13 +99,46 @@ pub fn close_code(end: &CodeEnd, content: &str, mut handler: HandlerContext<'_>)
     }
     // ~keep Empty source line endings also reach this buffer (#868). Only retained BR
     // ~keep emissions can turn a newline-only body into actual hard breaks (#921).
-    if content.bytes().all(|byte| byte == b'\n') && end.breaks.get() > 0 {
-        for _ in 0..end.breaks.get() {
+    if content.bytes().all(|byte| byte == b'\n') && !end.breaks.borrow().is_empty() {
+        for _ in 0..end.breaks.borrow().len() {
             emit_collected_code_break(&mut handler);
         }
         return;
     }
+    if end.source_whitespace_only
+        && content.bytes().all(|byte| byte == b'\n')
+        && end.breaks.borrow().is_empty()
+        && handler.options.whitespace_mode == crate::options::WhitespaceMode::Normalized
+    {
+        crate::converter::inline::wrapped::emit_whitespace_only_inline_body(content, handler.output);
+        return;
+    }
+    if end
+        .breaks
+        .borrow()
+        .first()
+        .is_some_and(|offset| content[..*offset].bytes().all(|byte| byte == b'\n'))
+        && content.starts_with('\n')
+        && !handler.output.is_empty()
+        && crate::converter::utility::white_space::space_is_owed(handler.output)
+    {
+        emit_collected_code_break(&mut handler);
+    }
     emit_inline_code_with_links(content, &end.links.borrow(), &mut handler);
+    if end
+        .breaks
+        .borrow()
+        .last()
+        .is_some_and(|offset| content[*offset + 1..].bytes().all(|byte| byte == b'\n'))
+        && content.ends_with('\n')
+        && crate::converter::utility::siblings::following_sibling_content(
+            handler.node_handle.get_inner(),
+            handler.parser,
+            handler.dom_context,
+        ) == crate::converter::utility::siblings::FollowingContent::Inline
+    {
+        emit_collected_code_break(&mut handler);
+    }
 }
 
 /// Whether the element holds a link. An `<a>` with no `href` is no link: it is text of the code.

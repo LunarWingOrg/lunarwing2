@@ -29,7 +29,8 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct ZipArchiveMetadata {
     pub(crate) files: IndexMap<Box<[u8]>, ZipFileData>,
-    pub(crate) has_duplicate_names: bool,
+    /// The raw file count (before inserting in the IndexMap) - used to detect duplicates
+    pub(crate) raw_file_count: usize,
     pub(crate) offset: u64,
     pub(crate) dir_start: u64,
     // This isn't yet used anywhere, but it is here for use cases in the future.
@@ -64,13 +65,14 @@ impl ZipArchiveMetadata {
     /// Whether the central directory contains duplicate file names.
     #[must_use]
     pub fn has_duplicate_names(&self) -> bool {
-        self.has_duplicate_names
+        self.raw_file_count > self.files.len()
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct SharedBuilder {
-    pub(crate) files: Vec<(Box<[u8]>, ZipFileData)>,
+    pub(crate) files: IndexMap<Box<[u8]>, ZipFileData>,
+    pub(crate) raw_file_count: usize,
     pub(super) offset: u64,
     pub(super) dir_start: u64,
     // This isn't yet used anywhere, but it is here for use cases in the future.
@@ -84,15 +86,9 @@ impl SharedBuilder {
         comment: Box<[u8]>,
         zip64_extensible_data_sector: Option<Box<[u8]>>,
     ) -> ZipArchiveMetadata {
-        let raw_file_count = self.files.len();
-        let mut index_map = IndexMap::with_capacity(raw_file_count);
-        self.files.into_iter().for_each(|(file_name_raw, file)| {
-            index_map.insert(file_name_raw, file);
-        });
-        let has_duplicate_names = index_map.len() != raw_file_count;
         ZipArchiveMetadata {
-            files: index_map,
-            has_duplicate_names,
+            files: self.files,
+            raw_file_count: self.raw_file_count,
             offset: self.offset,
             dir_start: self.dir_start,
             config: self.config,
@@ -141,9 +137,10 @@ impl<R> ZipArchive<R> {
             Some((_, file)) => file.header_start,
             None => central_start,
         };
+        let raw_file_count = files.len();
         let shared = Arc::new(ZipArchiveMetadata {
             files,
-            has_duplicate_names: false,
+            raw_file_count,
             offset: initial_offset,
             dir_start: central_start,
             config: Config {
@@ -185,14 +182,14 @@ struct CentralDirectoryChains {
 }
 
 impl CentralDirectoryChains {
-    /// Marks the headers in `files` as followed by `tail` and returns its error.
-    fn fail(&mut self, files: &[(Box<[u8]>, ZipFileData)], tail: FailedRun) -> ZipError {
-        for (i, (_, file)) in files.iter().enumerate() {
+    /// Marks the headers in `chain` as followed by `tail` and returns its error.
+    fn fail(&mut self, chain: &[u64], tail: FailedRun) -> ZipError {
+        for (i, &central_header_start) in chain.iter().enumerate() {
             let run = FailedRun {
-                valid: files.len() - i + tail.valid,
+                valid: chain.len() - i + tail.valid,
                 error: tail.error.clone(),
             };
-            self.runs.insert(file.central_header_start, run);
+            self.runs.insert(central_header_start, run);
         }
         tail.error
     }
@@ -300,10 +297,13 @@ impl<R: Read + Seek> ZipArchive<R> {
     ) -> Result<SharedBuilder, ZipError> {
         // If the parsed number of files is greater than the offset then
         // something fishy is going on and we shouldn't trust number_of_files.
-        let file_capacity = if dir_info.number_of_files > dir_info.directory_start as usize {
+        // Furthermore, each CDFH requires at least 46 bytes (4 bytes magic + 42 bytes ZipCentralEntryBlock).
+        let max_files = usize::try_from(dir_info.directory_size / 46).unwrap_or(usize::MAX);
+        let dir_start_bound = usize::try_from(dir_info.directory_start).unwrap_or(usize::MAX);
+        let file_capacity = if dir_info.number_of_files > dir_start_bound {
             0
         } else {
-            dir_info.number_of_files
+            dir_info.number_of_files.min(max_files)
         };
 
         if dir_info.disk_number != dir_info.disk_with_central_directory {
@@ -317,20 +317,22 @@ impl<R: Read + Seek> ZipArchive<R> {
         }
 
         // Decode independently of the candidate so later candidates can reuse `cd_chains`.
-        let mut files = Vec::new();
+        let mut files = IndexMap::with_capacity(file_capacity);
+        let mut chain = Vec::with_capacity(file_capacity);
         let mut central_header_start = dir_info.directory_start;
         reader.seek(SeekFrom::Start(central_header_start))?;
-        while files.len() < dir_info.number_of_files {
+        while chain.len() < dir_info.number_of_files {
             // An earlier candidate dropped these headers; decode them again for this last one.
             if let Some(run) = cd_chains.runs.get(&central_header_start)
-                && files.len() + run.valid < dir_info.number_of_files
+                && chain.len() + run.valid < dir_info.number_of_files
             {
                 let run = run.clone();
-                return Err(cd_chains.fail(&files, run));
+                return Err(cd_chains.fail(&chain, run));
             }
             match Self::read_one_central_header(reader, central_header_start) {
                 Ok((file_name_raw, file, next)) => {
-                    files.push((file_name_raw, file));
+                    chain.push(central_header_start);
+                    files.insert(file_name_raw, file);
                     central_header_start = next;
                 }
                 Err(e) => {
@@ -338,12 +340,12 @@ impl<R: Read + Seek> ZipArchive<R> {
                     cd_chains
                         .runs
                         .insert(central_header_start, failed_here.clone());
-                    return Err(cd_chains.fail(&files, failed_here));
+                    return Err(cd_chains.fail(&chain, failed_here));
                 }
             }
         }
 
-        for (_, file) in &mut files {
+        for file in files.values_mut() {
             file.header_start = file
                 .header_start
                 .checked_add(dir_info.archive_offset)
@@ -352,6 +354,7 @@ impl<R: Read + Seek> ZipArchive<R> {
 
         Ok(SharedBuilder {
             files,
+            raw_file_count: chain.len(),
             offset: dir_info.archive_offset,
             dir_start: dir_info.directory_start,
             config,
@@ -483,7 +486,7 @@ impl<R: Read + Seek> ZipArchive<R> {
     /// Whether this zip archive contains duplicate file names in its central directory.
     #[must_use]
     pub fn has_duplicate_names(&self) -> bool {
-        self.shared.has_duplicate_names
+        self.shared.has_duplicate_names()
     }
 
     /// Get the offset from the beginning of the underlying reader that this zip begins at, in bytes.
@@ -793,7 +796,7 @@ impl<R: Read + Seek> ZipArchive<R> {
             .get_index(file_number)
             .ok_or(ZipError::FileNotFound)?;
         if options.enforce_header_consistency {
-            if self.shared.has_duplicate_names {
+            if self.shared.has_duplicate_names() {
                 return Err(invalid!(
                     "header inconsistency detected: duplicate file names in central directory"
                 ));
@@ -811,7 +814,7 @@ impl<R: Read + Seek> ZipArchive<R> {
 
     /// Validates that all local file headers in the archive match their corresponding central directory headers.
     pub fn validate_header_consistency(&mut self) -> ZipResult<()> {
-        if self.shared.has_duplicate_names {
+        if self.shared.has_duplicate_names() {
             return Err(invalid!(
                 "header inconsistency detected: duplicate file names in central directory"
             ));

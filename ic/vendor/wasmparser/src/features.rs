@@ -371,6 +371,18 @@ define_wasm_features! {
         /// Corresponds to the 📡 character in
         /// <https://github.com/WebAssembly/component-model/blob/main/design/mvp/Explainer.md>.
         pub cm_accessors: CM_ACCESSORS(1 << 43) = false;
+
+        /// The WebAssembly [acquire-release-atomics proposal][proposal] which
+        /// adds an `acqrel` memory ordering to atomic instructions and the
+        /// `pause` instruction.
+        ///
+        /// [proposal]: https://github.com/WebAssembly/acquire-release-atomics
+        pub acquire_release_atomics: ACQUIRE_RELEASE_ATOMICS(1 << 44) = false;
+
+        /// The WebAssembly [multibyte-array-access proposal][proposal].
+        ///
+        /// [proposal]: https://github.com/WebAssembly/multibyte-array-access
+        pub multibyte_array_access: MULTIBYTE_ARRAY_ACCESS(1 << 45) = false;
     }
 }
 

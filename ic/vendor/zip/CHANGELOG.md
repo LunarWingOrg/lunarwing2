@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [9.1.3](https://github.com/zip-rs/zip2/compare/v9.1.2...v9.1.3) - 2026-10-27
+
+### <!-- 0 -->🚀 Features
+
+- *(extra_fields)* support 0xd935 Android ZIP alignment extra field ([#928](https://github.com/zip-rs/zip2/pull/928)) ([#1198](https://github.com/zip-rs/zip2/pull/1198))
+
+### <!-- 1 -->🐛 Bug Fixes
+
+- *(format)* record correct 32-bit EOCD offset in ZIP64 archives ([#1205](https://github.com/zip-rs/zip2/pull/1205))
+- *(aes)* wipe AES round keys when the cipher is dropped ([#1204](https://github.com/zip-rs/zip2/pull/1204))
+- *(fuzz)* treat a comment change in a merged sub-writer as non-streamable ([#1188](https://github.com/zip-rs/zip2/pull/1188))
+- *(aes)* zeroize AesCtrZipKeyStream buffer and counter on drop ([#1196](https://github.com/zip-rs/zip2/pull/1196))
+- *(extract)* prevent symlink-follow truncation via FILE_FLAG_OPEN_REPARSE_POINT ([#1195](https://github.com/zip-rs/zip2/pull/1195))
+- *(write)* drop a stale Unicode Path extra field when copying an entry ([#1187](https://github.com/zip-rs/zip2/pull/1187))
+- *(write)* don't leave a stale tail that completes a fake EOCD in the comment ([#1186](https://github.com/zip-rs/zip2/pull/1186))
+- *(write)* reject deflate levels below 10 when only zopfli is enabled ([#1182](https://github.com/zip-rs/zip2/pull/1182))
+
+### <!-- 4 -->⚡ Performance
+
+- *(read)* accelerate extraction with 64 KiB reusable buffer ([#1206](https://github.com/zip-rs/zip2/pull/1206))
+- *(aes)* encrypt AES-CTR counter blocks in batches ([#1203](https://github.com/zip-rs/zip2/pull/1203))
+- *(read)* eliminate double allocation by populating IndexMap directly ([#1200](https://github.com/zip-rs/zip2/pull/1200))
+- *(read)* preallocate files vector in read_central_header ([#1199](https://github.com/zip-rs/zip2/pull/1199))
+
+## [9.1.2](https://github.com/zip-rs/zip2/compare/v9.1.1...v9.1.2) - 2026-10-26
+
+### <!-- 1 -->🐛 Bug Fixes
+
+- preserve the file kind (normal/directory/symlink) in raw_copy_file_touch ([#1179](https://github.com/zip-rs/zip2/pull/1179))
+- *(write)* reject a Unicode Path extra field that would rename the entry ([#1177](https://github.com/zip-rs/zip2/pull/1177))
+- *(extract)* prevent following symbolic links during file creation ([#1116](https://github.com/zip-rs/zip2/pull/1116))
+
+## [9.1.1](https://github.com/zip-rs/zip2/compare/v9.1.0...v9.1.1) - 2026-10-25
+
+### <!-- 1 -->🐛 Bug Fixes
+
+- store the raw count instead of a bool ([#1174](https://github.com/zip-rs/zip2/pull/1174))
+- preserve extra fields in raw_copy_file_touch ([#1172](https://github.com/zip-rs/zip2/pull/1172))
+- *(write)* flag a non-ASCII file comment as UTF-8 when writing it ([#1160](https://github.com/zip-rs/zip2/pull/1160))
+- *(write)* reject duplicate names in merge_archive, blank stale footers, and add opt-in extra-field validation ([#1159](https://github.com/zip-rs/zip2/pull/1159))
+
 ## [9.1.0](https://github.com/zip-rs/zip2/compare/v9.0.5...v9.1.0) - 2026-10-24
 
 ### <!-- 0 -->🚀 Features
