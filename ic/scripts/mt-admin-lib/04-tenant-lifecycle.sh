@@ -1594,11 +1594,21 @@ upgrade_restore_previous_tenant() {  # <name> <lw_root> <previous_commit> <lane>
   local restart_rc caller_errexit=false
 
   case "$lane" in
-    pebble|opencode|opencode2|kimi)
-      say "worker lane '$lane' failed; restarting tenant '$name' on its previous images (WI#527) ..." ;;
-    *)
+    lunarwing|xmpp-bridge)
+      # The daemon binary itself failed to build: target/release/lunarwing is
+      # still the previous binary, so restarting in the new checkout would run
+      # old code against new source. Restore the previous commit first.
       say "restoring tenant '$name' to its previous version (WI#527) ..."
       "${tgit[@]}" checkout "$previous_commit" || return 1 ;;
+    pebble|opencode|opencode2|kimi)
+      # Worker images are independent of the daemon binary; the previous
+      # :latest tags are intact (every builder promotes only on success).
+      say "worker lane '$lane' failed; restarting tenant '$name' on its previous images (WI#527) ..." ;;
+    *)
+      # WASM / render / env failure after a successful daemon build: the new
+      # binary is in place and the old units are still enabled, which is exactly
+      # what start_tenant already runs. Restart in place.
+      say "restarting tenant '$name' in place (WI#527) ..." ;;
   esac
 
   [[ $- != *e* ]] || caller_errexit=true
@@ -1735,13 +1745,15 @@ upgrade_tenant_locked() {
   # WI#527: build in a subshell and capture the log, so a failure in any lane
   # returns here instead of exiting mt-admin mid-stop. Without this the tenant
   # stayed stopped after a pebble/kimi/opencode/opencode2 image or binary
-  # failure; now the failure converges back to a running tenant.
+  # failure; now the failure converges back to a running tenant. The inner
+  # `set -e` is load-bearing: the caller disabled errexit to capture the status,
+  # and build_tenant's own guards (`|| die`, bare commands) rely on it.
   local build_log build_rc=0 caller_errexit=false
   build_log="$(mktemp "${TMPDIR:-/tmp}/lw-upgrade-build.XXXXXX")" \
     || die "cannot create upgrade build log"
   [[ $- != *e* ]] || caller_errexit=true
   set +e
-  ( build_tenant "$name" "true" "false" "$with_opencode" "$with_kimi" "false" "true" "$with_opencode2" ) 2>&1 \
+  ( set -e; build_tenant "$name" "true" "false" "$with_opencode" "$with_kimi" "false" "true" "$with_opencode2" ) 2>&1 \
     | tee "$build_log"
   build_rc=${PIPESTATUS[0]}
   if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
@@ -1750,13 +1762,22 @@ upgrade_tenant_locked() {
   fi
   rm -f "$build_log"
 
+  # WI#527: render and env-patch failures are also post-stop. A broken unit
+  # render leaves the tenant down, so converge on it too.
+  local post_rc=0
+  set +e
   if [[ "$do_render" == "true" ]]; then
     render_tenant_units "$name"
   else
     say "skipping ordinary render-units (--skip-render)"
   fi
+  post_rc=$?
+  if [[ "$post_rc" -eq 0 ]]; then patch_tenant_env "$name"; post_rc=$?; fi
+  if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
+  if [[ "$post_rc" -ne 0 ]]; then
+    upgrade_converge_after_failure "$name" "$lw_root" "$previous_commit" /dev/null "unit render/env patch failed"
+  fi
 
-  patch_tenant_env "$name"
   local startup_rc caller_errexit=false
   TENANT_START_FAILED_WORKERS=()
   [[ $- != *e* ]] || caller_errexit=true

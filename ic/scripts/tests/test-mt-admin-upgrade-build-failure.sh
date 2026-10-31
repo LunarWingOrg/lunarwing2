@@ -145,7 +145,55 @@ else
   fail "daemon-failure path did not restore-then-start (rc=$rc, checkout=$([[ -f "$checkout_marker" ]] && echo yes || echo no)): $output"
 fi
 
-# ── 4. external wrapper: build-tenant failure after stop restores the tenant ─
+# ── 4. a non-die failure inside build_tenant still converges ────────────────
+# The caller disables errexit to capture the status; without the subshell's own
+# `set -e` a bare failing command in build_tenant would be ignored and the
+# upgrade would continue into a broken start.
+build_tenant() {
+  printf 'build\n' >>"$events"
+  false
+  printf 'continued-past-failure\n' >>"$events"
+  return 0
+}
+start_tenant() { printf 'start\n' >>"$events"; return 0; }
+: >"$events"
+set +e
+output="$(upgrade_tenant_locked fixture "$target" '' false false 2>&1)"
+rc=$?
+set -e
+if [[ "$rc" -eq 0 ]] && grep -q 'continued-past-failure' "$events"; then
+  fail 'build_tenant errexit was disabled by the capturing subshell'
+elif [[ "$rc" -ne 0 && "$(grep -c '^start$' "$events")" == 1 ]]; then
+  pass 'a bare failure in build_tenant aborts and converges'
+else
+  fail "bare build failure did not converge (rc=$rc): $output"
+fi
+
+# ── 5. a unit-render failure converges without reverting the source ──────────
+build_tenant() { printf 'build\n' >>"$events"; return 0; }
+render_tenant_units() { printf 'render\n' >>"$events"; return 1; }
+patch_tenant_env() { printf 'patch\n' >>"$events"; }
+start_tenant() { printf 'start\n' >>"$events"; }
+rm -f "$checkout_marker"
+: >"$events"
+set +e
+output="$(upgrade_tenant_locked fixture "$target" '' false true 2>&1)"
+rc=$?
+set -e
+head_now="$(git -C "$fixture_repo" rev-parse HEAD)"
+if [[ "$rc" -eq 0 ]]; then
+  fail 'a unit-render failure was ignored'
+elif [[ "$head_now" != "$target" ]]; then
+  fail "a unit-render failure reverted the checked-out source (HEAD=$head_now)"
+elif grep -q '^patch$' "$events"; then
+  fail 'env patching ran even though the unit render failed'
+elif [[ "$(grep -c '^start$' "$events")" == 1 && "$output" == *'automatically restored'* ]]; then
+  pass 'a unit-render failure restarts in place and reports the restore'
+else
+  fail "render-failure path behaved unexpectedly (rc=$rc): $output"
+fi
+
+# ── 6. external wrapper: build-tenant failure after stop restores the tenant ─
 # ic/scripts/upgrade-tenant.sh re-enters mt-admin via upgrade-wrapper-boundary,
 # so exercise its step-3 convergence function directly with the real body.
 export LUNARWING_MT_ADMIN="$fixture/mt-admin-stub.sh"
