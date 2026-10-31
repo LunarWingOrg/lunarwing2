@@ -1103,8 +1103,32 @@ was not stopped. Both stop paths enforce it: mt-admin's own
 `upgrade-tenant` before `stop_tenant`, and `stop-tenant-for-upgrade` — the
 boundary `ic/scripts/upgrade-tenant.sh` uses before it runs `build-tenant`
 (run-284 review SR-1) — so the external wrapper cannot bypass the check.
-This covers only the opencode2 floor; a kimi/pebble build failure after the
-stop can still strand a tenant, tracked as WI#527. Sources: Podman
+This covers only the opencode2 floor. Any other post-stop failure — a kimi,
+pebble or opencode image build, the daemon/xmpp/WASM build, a registry pull or
+a disk-full condition — used to strand the tenant with every lane down and the
+daemon off (WI#527). Both upgrade paths now **converge back to a running
+tenant** instead of leaving it stopped:
+
+- mt-admin `upgrade-tenant` runs the post-stop `build_tenant` in a subshell and
+  tees its log (`/tmp/lw-upgrade-build.*`). On failure
+  `upgrade_converge_after_failure` classifies the failed stage from that log
+  (pebble/opencode/opencode2/kimi/daemon/xmpp/WASM), then restarting is safe:
+  a worker-image lane restarts the tenant in the target checkout on its
+  previous images; a daemon/xmpp/WASM failure checks the previous commit back
+  out first. A failed restart is reported as "remains stopped" — never as a
+  clean restore.
+- the external `ic/scripts/upgrade-tenant.sh` converges the same way at every
+  post-stop step it runs itself (`build-tenant`, `install-wasm`,
+  `ensure-darkirc-release`): it returns to the recorded `PRIOR_REV` and starts
+  the tenant **rootful**, the store its `stop-tenant-for-upgrade` targeted.
+  From step 4 on the upgrade mutates the new rootless DB, where the documented
+  backup-based rollback (printed at the end of the script) still applies.
+
+The existing opencode2 floor preflight is preserved as the cheap early check —
+it refuses *before* any stop, so the convergence path never runs for that
+class. Harness: `ic/scripts/tests/test-mt-admin-upgrade-build-failure.sh`
+(forced kimi failure for both paths, plus the restore-failure and
+daemon-binary cases). Sources: Podman
 [v4.5.0 go.mod](https://github.com/containers/podman/blob/v4.5.0/go.mod) and
 [v4.4.4 go.mod](https://github.com/containers/podman/blob/v4.4.4/go.mod).
 
