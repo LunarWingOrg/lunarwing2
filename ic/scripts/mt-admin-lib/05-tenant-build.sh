@@ -752,32 +752,74 @@ build_candidate_workers() {
   done
 }
 
-# Promote every recorded candidate lane to :latest. Idempotent and re-runnable;
-# only a successful candidate build is ever promoted, so a failed run can never
-# leave :latest pointing at a partial image.
+# Promote every recorded candidate lane to :latest. Idempotent and re-runnable.
+# TD-4: record old :latest image IDs before promoting and re-tag them on
+# failure; skip a lane whose :latest already equals its candidate; update the
+# lane file per lane so a re-run only promotes what remains. Only a successful
+# candidate build is ever promoted, so a failed run can never leave :latest
+# pointing at a partial image.
+#
+# Old :latest IDs are recorded to $(_tenant_marker_dir)/$name-promote-rollback
+# so upgrade_converge_after_failure (a separate invocation) can restore them
+# after a mid-promote die.
+_promote_rollback_file() {  # <name>
+  printf '%s/%s-promote-rollback' "$(_tenant_marker_dir)" "$1"
+}
+
+restore_promoted_workers() {  # <name> — best-effort re-tag of old :latest IDs
+  local name="$1" file lane old_id latest_ref
+  file="$(_promote_rollback_file "$name")"
+  [[ -r "$file" ]] || return 0
+  while IFS=$'\t' read -r lane old_id; do
+    [[ -n "$lane" && -n "$old_id" ]] || continue
+    _upgrade_validate_lane "$lane" || continue
+    latest_ref="$(worker_image_ref "$lane" latest)"
+    "$CONTAINER_RT" tag "$old_id" "$latest_ref" >/dev/null 2>&1 || true
+    say "rolled back $latest_ref to $old_id"
+  done <"$file"
+  rm -f "$file"
+}
+
 promote_candidate_workers() {  # <tenant>
-  local name="$1" lane candidate_ref latest_ref
+  local name="$1" lane candidate_ref latest_ref old_id candidate_id
   local -a lanes=()
+  local -A promoted_lanes=()
   mapfile -t lanes < <(upgrade_candidate_lanes "$name")
   if [[ "${#lanes[@]}" -eq 0 ]]; then
     say "no candidate worker images to promote for '$name'"
     return 0
   fi
   ensure_container_runtime
+  _ensure_marker_dir
+  : >"$(_promote_rollback_file "$name")"
   for lane in "${lanes[@]}"; do
     _upgrade_validate_lane "$lane"
     candidate_ref="$(upgrade_candidate_image_ref "$name" "$lane")"
     latest_ref="$(worker_image_ref "$lane" latest)"
-    if ! "$CONTAINER_RT" image inspect "$candidate_ref" >/dev/null 2>&1; then
+    candidate_id="$("$CONTAINER_RT" image inspect --format '{{.Id}}' "$candidate_ref" 2>/dev/null || true)"
+    old_id="$("$CONTAINER_RT" image inspect --format '{{.Id}}' "$latest_ref" 2>/dev/null || true)"
+    # Skip if :latest already equals the candidate (already promoted).
+    if [[ -n "$candidate_id" && "$old_id" == "$candidate_id" ]]; then
+      say "$latest_ref already at candidate, skipping"
+      promoted_lanes["$lane"]=1
+      continue
+    fi
+    if [[ -z "$candidate_id" ]]; then
       die "candidate image $candidate_ref is missing; cannot promote lane '$lane'"
     fi
+    # TD-4: record old :latest ID for rollback before overwriting the tag.
+    [[ -n "$old_id" ]] && printf '%s\t%s\n' "$lane" "$old_id" >>"$(_promote_rollback_file "$name")"
     "$CONTAINER_RT" tag "$candidate_ref" "$latest_ref" \
       || die "cannot promote $candidate_ref to $latest_ref"
-    "$CONTAINER_RT" rmi "$candidate_ref" >/dev/null 2>&1 || true
+    promoted_lanes["$lane"]=1
     say "promoted $latest_ref"
+    # TD-4: update the lane file per lane so a mid-loop failure is recoverable.
+    grep -vx "$lane" "$(tenant_candidate_lanes_file "$name")" >"${LUNARWING_MT_CANDIDATE_LANES_FILE}.tmp" 2>/dev/null || true
+    mv "${LUNARWING_MT_CANDIDATE_LANES_FILE}.tmp" "$(tenant_candidate_lanes_file "$name")"
+    "$CONTAINER_RT" rmi "$candidate_ref" >/dev/null 2>&1 || true
   done
-  _ensure_marker_dir
   : >"$(tenant_candidate_lanes_file "$name")"
+  rm -f "$(_promote_rollback_file "$name")"
 }
 
 # ── Darkirc daemon build (shared, not per-tenant) ────────────────────────────

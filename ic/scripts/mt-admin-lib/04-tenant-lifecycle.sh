@@ -1643,6 +1643,8 @@ upgrade_converge_after_failure() {  # <name> <lw_root> <previous_commit> <cause>
   if ! upgrade_daemon_stage_completed "$name"; then
     say "" >&2
     say "upgrade aborted: $cause; the new daemon was not built, restarting tenant '$name' on its previous build (WI#527) ..." >&2
+    # TD-4: restore any already-promoted worker :latest tags before restarting.
+    restore_promoted_workers "$name" 2>/dev/null || true
     set +e
     ( start_tenant "$name" )
     rc=$?
@@ -1656,6 +1658,9 @@ upgrade_converge_after_failure() {  # <name> <lw_root> <previous_commit> <cause>
 
   say "" >&2
   say "upgrade aborted: $cause; the new daemon was built, so restoring tenant '$name' to $describe_prev by rebuilding it (WI#527) ..." >&2
+  # TD-4: restore old worker :latest tags before rebuilding the previous daemon
+  # so a "restored" report never leaves new worker images beside the old daemon.
+  restore_promoted_workers "$name" 2>/dev/null || true
   set +e
   (
     set -e
