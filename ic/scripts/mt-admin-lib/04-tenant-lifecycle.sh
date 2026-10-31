@@ -1574,7 +1574,12 @@ _upgrade_failed_lane() {
   match="$(grep -oE '(pebble|opencode2|opencode|kimi) worker image build failed|lunarwing build failed|xmpp-bridge build failed|WASM extension build failed' \
     "$log" 2>/dev/null | head -n 1 || true)"
   [[ -n "$match" ]] || return 0
-  printf '%s\n' "${match%% build failed*}"
+  case "$match" in
+    'lunarwing build failed')      printf 'lunarwing' ;;
+    'xmpp-bridge build failed')    printf 'xmpp-bridge' ;;
+    'WASM extension build failed') printf 'WASM' ;;
+    *)                             printf '%s' "${match%% worker*}" ;;
+  esac
 }
 
 # WI#527: a post-stop upgrade failure must not leave every lane down. Restart
