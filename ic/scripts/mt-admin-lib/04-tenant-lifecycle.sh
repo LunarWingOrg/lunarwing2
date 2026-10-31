@@ -1814,18 +1814,23 @@ upgrade_tenant_locked() {
   # Promote only after the daemon binary exists, so the new daemon and the new
   # worker images switch together. A promote failure is recoverable by re-running
   # `$0 promote-worker-images <name>`.
-  promote_candidate_workers "$name" \
-    || upgrade_converge_after_failure "$name" "$lw_root" "$previous_commit" "worker image promotion failed"
+  # TD-3: run in a subshell so die() exits the subshell, not this process; the
+  # || branch can then converge the tenant instead of leaving it stopped.
+  local promote_rc=0
+  ( set -e; promote_candidate_workers "$name" ) || promote_rc=$?
+  if [[ "$promote_rc" -ne 0 ]]; then
+    upgrade_converge_after_failure "$name" "$lw_root" "$previous_commit" \
+      "worker image promotion failed (exit $promote_rc)"
+  fi
 
   local post_rc=0
   set +e
   if [[ "$do_render" == "true" ]]; then
-    render_tenant_units "$name"
+    ( set -e; render_tenant_units "$name" ) || post_rc=$?
   else
     say "skipping ordinary render-units (--skip-render)"
   fi
-  post_rc=$?
-  if [[ "$post_rc" -eq 0 ]]; then patch_tenant_env "$name"; post_rc=$?; fi
+  if [[ "$post_rc" -eq 0 ]]; then ( set -e; patch_tenant_env "$name" ) || post_rc=$?; fi
   if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
   if [[ "$post_rc" -ne 0 ]]; then
     upgrade_converge_after_failure "$name" "$lw_root" "$previous_commit" \
