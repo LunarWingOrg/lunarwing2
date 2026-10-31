@@ -80,6 +80,16 @@ if [ -f /app/config/opencode.json ]; then
       || [ -n "${LW2STUDYMCP_STATE_HOME:-}" ]; then
     rm -f "$WORKSPACE_ROOT/.opencode/opencode.json"
     cp /app/config/opencode.json "$WORKSPACE_ROOT/.opencode/opencode.json"
+    # WI#523: the Dockerfile hardens /app/config with `chmod -R a-w` and a
+    # build-time assertion that no writable bit survives, so `cp` (no -p)
+    # births the workspace copy at 0444 — owned by the task uid, but still
+    # not writable to it (owner w-bit is what matters). The model/baseURL
+    # heredoc (:117) and the Paseo heredoc (:151) both rewrite this copy
+    # in place via open(path,"w"), which dies EACCES on a 0444 file. Widen
+    # the owner write bit right after the copy so every in-place rewrite
+    # downstream succeeds; the image hardening and its assertion are left
+    # intact (they guard the baked original, not this task-owned copy).
+    chmod u+w "$WORKSPACE_ROOT/.opencode/opencode.json"
     config_materialized=true
   else
     ln -sfn /app/config/opencode.json "$WORKSPACE_ROOT/.opencode/opencode.json"

@@ -23,7 +23,7 @@ workers = {
 }
 
 
-def run_config(worker, overrides=None, mounted=False, custom=None):
+def run_config(worker, overrides=None, mounted=False, custom=None, hardened=False):
     directory, filename = workers[worker]
     source = repo / directory
     entrypoint = (source / "entrypoint.sh").read_text()
@@ -42,6 +42,14 @@ def run_config(worker, overrides=None, mounted=False, custom=None):
         assert placeholder in baked, f"{worker}: expected baked placeholder"
         config = app / "config" / filename
         config.write_text(baked.replace(placeholder, endpoint) if mounted else baked)
+        # WI#523: the Dockerfile hardens /app/config with chmod -R a-w, so
+        # the baked config is 0444 root-owned. `cp` (no -p) of a 0444 source
+        # births the workspace copy at 0444 task-uid-owned; the model/baseURL
+        # and Paseo heredocs then rewrite it in place via open(path,"w"),
+        # which dies EACCES on a 0444 file (every v1-lane create_job fails).
+        # Simulate the hardened image when `hardened` is set.
+        if hardened:
+            config.chmod(0o444)
         env = {
             "PATH": os.environ["PATH"], "HOME": str(home), "TMPDIR": temp,
             "WORKSPACE_ROOT": str(workspace), "KIMI_CODE_HOME": str(home / ".kimi-code"),
@@ -767,6 +775,18 @@ if os.geteuid() == 0:
 for worker in ("kimi", "opencode"):
     run_task_zero_uid_refusal(worker)
     print(f"PASS: {worker} entrypoint refuses zero/non-numeric task ids (WI#400 LP-17)")
+
+# WI#523: the opencode v1 Dockerfile hardens /app/config with chmod -R a-w,
+# so the baked config is 0444 root-owned. entrypoint-task-setup.sh copies
+# it (without -p) into the workspace; the copy inherits 0444, and the
+# model/baseURL heredoc's open(path,"w") then dies EACCES — killing every
+# v1-lane create_job. Verify the chmod u+w after cp survives a hardened
+# source. opencode2's lane already had the chmod u+w and is unaffected.
+result, _ = run_config("opencode", overrides={"OPENCODE_BASE_URL": f" {endpoint} "},
+                       hardened=True)
+assert result.returncode == 0, \
+    f"opencode v1 EACCES on a 0444 source config (WI#523): {result.stderr}"
+print("PASS: opencode v1 materializes a 0444 (hardened) source config without EACCES (WI#523)")
 run_pebble_websocket_refusal()
 print("PASS: pebble websocket entrypoint refuses to run as the task uid (WI#400 LD-8)")
 run_pebble_websocket_inherit()
