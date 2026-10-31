@@ -1,11 +1,11 @@
 # Self-Heal Coverage Audit v2.0.4.0
 
 **Audit date:** 2026-08-03; ported and hardened on v2.0.5.0, 2026-08-05.
-**Status:** Historical audit, with source/registration update for v2.1.7.0 on 2026-10-29.
+**Status:** Historical audit, with source/registration update for v2.1.8.0 on 2026-10-31.
 **Reference reviewed:** `origin/aj/kimi-24-20260801-1203`
 **Ported from:** `origin/shexpansion/cmc/v2.0.4.0` (commit `d1d3c52`)
 
-## Current coverage (v2.1.7.0)
+## Current coverage (v2.1.8.0)
 
 `ic-infrastructure-health-check/tests/run-all.sh` registers **20 suites**, adding
 `worker-egress` to the previous 19. Run `bash tests/run-all.sh --list` from that
@@ -190,4 +190,20 @@ suites. CI invokes aggregate once through `.gitlab/scripts/shell-harnesses.sh`.
 > pipeline, and is documented in `SELF_HEAL_DEPLOYMENT_WIRING.md`. The
 > audit's detection/remedy table still describes the self-heal pipeline
 > itself.
+>
+> **Update (2026-10-29, v2.1.7.0):** the `ORDER` list grew from 19 to 20
+> suites with the WI#424 `worker-egress` suite (`test-health-worker-egress.sh`),
+> the read-only host audit of registry-selected workers described in the
+> coverage section above (`bash tests/run-all.sh --list` registers the 20
+> suites live, verified). The health pipeline scripts are otherwise
+> unchanged this cycle.
+>
+> **Update (2026-10-31, v2.1.8.0):** the `ORDER` list is unchanged in the
+> 2.1.8.0 cycle (`bash tests/run-all.sh --list` still registers the same 20
+> suites, verified live: `regression matrix chaos openrc systemd lunarvision
+> init-templates lunarvoice voice-init-templates netbird llm-streams
+> metrics-exporter metrics-unit watchdog watchdog-openrc cron-wrapper runtime
+> knowledge worker-egress gateway`). `health-worker-egress.sh` gained the
+> task-role egress check on host health ticks (WI#91 item QP-3); the audit's
+> detection/remedy table still describes the self-heal pipeline itself.
 
