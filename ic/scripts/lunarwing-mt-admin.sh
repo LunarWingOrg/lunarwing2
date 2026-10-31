@@ -369,6 +369,10 @@ Commands:
     --with-toolchains              Include Rust/Go/C++ toolchains (default: slim)
     --kimi-code-version <version>  Override kimi-code package version
 
+  promote-worker-images <name>     Promote this run's candidate worker images
+                                   (WI#527) to :latest; re-runnable after a
+                                   failed promotion
+
   build-opencode2-worker           Build the OpenCode 2 worker Docker image
     --no-cache                     Force a full rebuild without Docker cache
     --with-toolchains              Include Rust/Go/C++ toolchains (default: slim)
@@ -938,6 +942,19 @@ main() {
     build-vision-sidecar)
       require_root
       build_vision_sidecar_image
+      ;;
+
+    promote-worker-images)
+      # WI#527: promote this run's candidate worker images to :latest. Re-runnable:
+      # a promote failure never removes a candidate, so an operator can retry it
+      # after fixing the underlying image-store problem.
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: promote-worker-images <name>"
+      local promote_name
+      promote_name="$(sanitize_name "$1")"
+      ports_registry_init
+      tenant_exists_in_registry "$promote_name" || die "tenant '$promote_name' not found in registry"
+      promote_candidate_workers "$promote_name"
       ;;
 
     build-sandbox-image)
