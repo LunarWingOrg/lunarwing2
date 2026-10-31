@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.87"
 name = "elliptic-curve"
-version = "0.14.2"
+version = "0.14.3"
 authors = ["RustCrypto Developers"]
 build = false
 autolib = false
@@ -125,7 +125,7 @@ package = "hybrid-array"
 version = "1"
 
 [dependencies.bigint]
-version = "0.7.7"
+version = "0.7.8"
 features = [
     "hybrid-array",
     "rand_core",

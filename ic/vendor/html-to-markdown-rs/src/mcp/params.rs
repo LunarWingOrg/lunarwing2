@@ -96,6 +96,8 @@ pub struct ConvertConfig {
     pub preserve_tags: Option<Vec<String>>,
     /// Omit all `<img>` elements from the output. Default `false`.
     pub skip_images: Option<bool>,
+    /// Use link accessibility-name fallbacks and SVG labels. Default `true`.
+    pub use_accessible_names: Option<bool>,
     /// What to write for an image or media element whose address is a `data:` URL:
     /// `"keep"` (default, the URL with its payload), `"alt_text_only"`, or `"drop_element"`.
     pub inline_data_media: Option<String>,
@@ -483,16 +485,20 @@ mod tests {
     /// Drift guard: every settable `ConversionOptions` field must be mirrored by
     /// `ConvertConfig`. `ConversionOptions` serialises every field except the
     /// serde-skipped `visitor`, and `ConvertConfig` serialises every field as
-    /// `null` (no `skip_serializing_if`), so the key sets must match exactly.
+    /// `null` (no `skip_serializing_if`). The wire-only accessible-name policy is the
+    /// sole extra key; all remaining keys must match exactly.
     /// Fails loudly, naming the offending field, if a core option is added
     /// without being mirrored here.
     #[test]
     fn mirror_covers_all_core_fields() {
         let core = serde_json::to_value(ConversionOptions::default()).unwrap();
         let mirror = serde_json::to_value(ConvertConfig::default()).unwrap();
+        let mut mirror_keys = json_keys(&mirror);
+        assert!(mirror_keys.remove("use_accessible_names"));
+        assert!(!json_keys(&core).contains("use_accessible_names"));
         assert_eq!(
             json_keys(&core),
-            json_keys(&mirror),
+            mirror_keys,
             "ConvertConfig drifted from ConversionOptions — add/remove the mismatched field(s)"
         );
     }
@@ -694,6 +700,39 @@ mod tests {
         let opts: ConversionOptions = config.try_into().expect("no enum fields set");
         assert!(!opts.expand_abbreviations);
         assert!(!opts.include_blockquote_citations);
+    }
+
+    #[test]
+    fn should_pass_accessible_name_policy_from_schema_to_conversion() {
+        let html = r##"<p>see <a href="https://example.com/x">GitHub<svg aria-label="(opens in new tab)"><use href="#ext"></use></svg></a> now</p>"##;
+        for (config, enabled, expected) in [
+            (
+                serde_json::json!({"inline_data_media": "alt_text_only"}),
+                true,
+                "see [GitHub (opens in new tab)](https://example.com/x) now\n",
+            ),
+            (
+                serde_json::json!({"inline_data_media": "alt_text_only", "use_accessible_names": false}),
+                false,
+                "see [GitHub](https://example.com/x) now\n",
+            ),
+        ] {
+            let config: ConvertConfig = serde_json::from_value(config).expect("accessible-name policy is accepted");
+            assert_eq!(config.use_accessible_names.unwrap_or(true), enabled);
+            let options = ConversionOptions::try_from(config).expect("valid options");
+            assert_eq!(
+                crate::convert_with_accessible_names(html, enabled, Some(options))
+                    .unwrap()
+                    .content
+                    .as_deref(),
+                Some(expected)
+            );
+        }
+        let schema = serde_json::to_value(schemars::schema_for!(ConvertConfig)).unwrap();
+        assert_eq!(
+            schema["properties"]["use_accessible_names"]["type"],
+            serde_json::json!(["boolean", "null"])
+        );
     }
 
     #[test]

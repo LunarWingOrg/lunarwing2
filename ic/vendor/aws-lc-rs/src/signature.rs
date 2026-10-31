@@ -284,7 +284,7 @@
 //! }
 //! ```
 use crate::aws_lc::EVP_PKEY;
-pub use crate::rsa::signature::{RsaEncoding, RsaSignatureEncoding};
+pub use crate::rsa::signature::{RsaEncoding, RsaPssSaltLength, RsaSignatureEncoding};
 pub use crate::rsa::{
     KeyPair as RsaKeyPair, PublicKey as RsaSubjectPublicKey,
     PublicKeyComponents as RsaPublicKeyComponents, RsaParameters,
@@ -393,7 +393,10 @@ pub trait VerificationAlgorithm: Debug + Sync + Any + sealed::Sealed {
     /// # Errors
     /// `error::Unspecified` if inputs not verified.
     #[cfg(feature = "ring-sig-verify")]
-    #[deprecated(note = "please use `VerificationAlgorithm::verify_sig` instead")]
+    #[deprecated(
+        since = "1.0.0",
+        note = "please use `VerificationAlgorithm::verify_sig` instead"
+    )]
     fn verify(
         &self,
         public_key: Input<'_>,

@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.81"
 name = "wasm-bindgen-futures"
-version = "0.4.79"
+version = "0.4.80"
 authors = ["The wasm-bindgen Developers"]
 build = false
 include = [
@@ -52,11 +52,11 @@ name = "wasm_bindgen_futures"
 path = "src/lib.rs"
 
 [dependencies.js-sys]
-version = "=0.3.106"
+version = "=0.3.107"
 default-features = false
 
 [dependencies.wasm-bindgen]
-version = "=0.2.129"
+version = "=0.2.130"
 default-features = false
 
 [target.'cfg(all(target_os = "emscripten", wasm_bindgen_unstable_tokio))'.dependencies.tokio]
@@ -96,4 +96,5 @@ check-cfg = [
     "cfg(tokio_unstable)",
     "cfg(wasm_bindgen_unstable_tokio)",
     "cfg(wasm_bindgen_unstable_jspi)",
+    "cfg(wasm_bindgen_unstable_try_trait)",
 ]

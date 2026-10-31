@@ -34,24 +34,43 @@ pub fn handle(node_handle: &NodeHandle, parser: &Parser, output: &mut String, ha
         return;
     }
 
-    // ~keep Nested-wrapper BRs keep the established empty-boundary policy (#868).
-    // ~keep Only a retained direct code child opts into the break-only correction (#921).
-    if ctx.in_code
-        && !ctx.in_code_block
-        && let Some((owner, breaks)) = &ctx.inline_code_breaks
-        && handler.dom_ctx.parent_of(node_handle.get_inner()) == Some(*owner)
-    {
-        breaks.set(breaks.get().saturating_add(1));
-    }
-
     if let Some(rule_like_text) = &ctx.djot_rule_like_text {
         rule_like_text.advance();
     }
 
+    record_structure_break(ctx);
     if write_special_break(output, ctx) {
+        // ~keep Heading/cell code can fold BR to space; record only actual split markers (#937).
+        // ~keep Nested-wrapper BRs retain the established empty-boundary policy (#868).
+        if ctx.in_code
+            && !ctx.in_code_block
+            && output.ends_with('\n')
+            && let Some((owner, breaks)) = &ctx.inline_code_breaks
+            && handler.dom_ctx.parent_of(node_handle.get_inner()) == Some(*owner)
+        {
+            breaks.borrow_mut().push(output.len() - 1);
+        }
         return;
     }
     write_flow_break(output, options, ctx);
+}
+
+// ~keep Inline code belongs to its enclosing capture; blocks and cells collect their own text.
+fn record_structure_break(ctx: &Context) {
+    if ctx.in_code_block || ctx.in_table_cell || ctx.in_layout_cell {
+        return;
+    }
+    let Some(collector) = ctx.structure_collector.as_ref() else {
+        return;
+    };
+    let mut collector = collector.borrow_mut();
+    if ctx.in_heading && ctx.in_code {
+        collector.append_text(" ");
+    } else if ctx.in_heading {
+        collector.append_heading_break();
+    } else {
+        collector.append_text("\n");
+    }
 }
 
 fn write_special_break(output: &mut String, ctx: &Context) -> bool {

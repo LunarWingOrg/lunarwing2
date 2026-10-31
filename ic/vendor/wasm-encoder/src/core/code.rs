@@ -384,19 +384,73 @@ pub struct MemArg {
     /// The expected alignment of the instruction's dynamic address operand
     /// (expressed the exponent of a power of two).
     pub align: u32,
-    /// The index of the memory this instruction is operating upon.
-    pub memory_index: u32,
+    /// What this instruction operates on: a linear memory or a GC array.
+    pub target: MemArgTarget,
+    /// The memory ordering of this instruction, from the
+    /// acquire-release-atomics proposal.
+    ///
+    /// This should be `None` for non-atomic instructions.
+    pub ordering: Option<MemArgOrdering>,
+}
+
+/// What a memory instruction's [`MemArg`] immediate operates on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemArgTarget {
+    /// The instruction operates on the linear memory at this index.
+    Memory(u32),
+    /// The instruction operates on the payload of a GC array whose type is at
+    /// this index, from the multibyte-array-access proposal.
+    Array(u32),
+}
+
+impl Default for MemArgTarget {
+    fn default() -> MemArgTarget {
+        MemArgTarget::Memory(0)
+    }
 }
 
 impl Encode for MemArg {
     fn encode(&self, sink: &mut Vec<u8>) {
-        if self.memory_index == 0 {
-            self.align.encode(sink);
-            self.offset.encode(sink);
-        } else {
-            (self.align | (1 << 6)).encode(sink);
-            self.memory_index.encode(sink);
-            self.offset.encode(sink);
+        let mut flags = self.align;
+        if self.ordering.is_some() {
+            flags |= 1 << 4;
+        }
+        match self.target {
+            MemArgTarget::Memory(0) => {}
+            MemArgTarget::Memory(_) => flags |= 1 << 6,
+            MemArgTarget::Array(_) => flags |= 1 << 5,
+        }
+        flags.encode(sink);
+        match self.target {
+            MemArgTarget::Memory(0) => {}
+            MemArgTarget::Memory(i) | MemArgTarget::Array(i) => i.encode(sink),
+        }
+        if let Some(ordering) = self.ordering {
+            ordering.encode(sink);
+        }
+        self.offset.encode(sink);
+    }
+}
+
+/// The ordering immediate of a [`MemArg`], part of the
+/// acquire-release-atomics proposal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemArgOrdering {
+    /// The ordering immediate of an atomic load or store.
+    Op(Ordering),
+    /// The ordering immediate of an atomic read-modify-write instruction.
+    Rmw(Ordering),
+}
+
+impl Encode for MemArgOrdering {
+    fn encode(&self, sink: &mut Vec<u8>) {
+        let nibble = |o: Ordering| match o {
+            Ordering::SeqCst => 0x0,
+            Ordering::AcqRel => 0x1,
+        };
+        match self {
+            MemArgOrdering::Op(o) => sink.push(nibble(*o)),
+            MemArgOrdering::Rmw(o) => sink.push(nibble(*o) | (nibble(*o) << 4)),
         }
     }
 }
@@ -408,7 +462,7 @@ impl Encode for MemArg {
 ///
 /// [`memory_order`]: https://en.cppreference.com/w/cpp/atomic/memory_order
 /// [`atomic::Ordering`]: https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Ordering {
     /// For a load, it acquires; this orders all operations before the last
     /// "releasing" store. For a store, it releases; this orders all operations
@@ -1074,7 +1128,7 @@ pub enum Instruction<'a> {
     MemoryAtomicNotify(MemArg),
     MemoryAtomicWait32(MemArg),
     MemoryAtomicWait64(MemArg),
-    AtomicFence,
+    AtomicFence(Ordering),
     I32AtomicLoad(MemArg),
     I64AtomicLoad(MemArg),
     I32AtomicLoad8U(MemArg),
@@ -1322,6 +1376,9 @@ pub enum Instruction<'a> {
     I64Sub128,
     I64MulWideS,
     I64MulWideU,
+
+    // Acquire-release atomics
+    Pause,
 
     RefGetDesc(u32),
     RefCastDescEqNonNull(HeapType),
@@ -1927,7 +1984,7 @@ impl Encode for Instruction<'_> {
             Instruction::MemoryAtomicNotify(memarg) => sink.memory_atomic_notify(memarg),
             Instruction::MemoryAtomicWait32(memarg) => sink.memory_atomic_wait32(memarg),
             Instruction::MemoryAtomicWait64(memarg) => sink.memory_atomic_wait64(memarg),
-            Instruction::AtomicFence => sink.atomic_fence(),
+            Instruction::AtomicFence(ordering) => sink.atomic_fence(ordering),
             Instruction::I32AtomicLoad(memarg) => sink.i32_atomic_load(memarg),
             Instruction::I64AtomicLoad(memarg) => sink.i64_atomic_load(memarg),
             Instruction::I32AtomicLoad8U(memarg) => sink.i32_atomic_load8_u(memarg),
@@ -2172,6 +2229,9 @@ impl Encode for Instruction<'_> {
             Instruction::I64Sub128 => sink.i64_sub128(),
             Instruction::I64MulWideS => sink.i64_mul_wide_s(),
             Instruction::I64MulWideU => sink.i64_mul_wide_u(),
+
+            // Acquire-release atomics
+            Instruction::Pause => sink.pause(),
             Instruction::RefGetDesc(type_index) => sink.ref_get_desc(type_index),
             Instruction::RefCastDescEqNonNull(hty) => sink.ref_cast_desc_eq_non_null(hty),
             Instruction::RefCastDescEqNullable(hty) => sink.ref_cast_desc_eq_nullable(hty),

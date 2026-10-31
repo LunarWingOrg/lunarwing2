@@ -3,7 +3,7 @@
 use crate::result::{ZipResult, invalid};
 use crate::{ZipArchive, result::ZipError};
 use std::ffi::OsStr;
-use std::io::{self, Read, Seek};
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 
 use indexmap::IndexMap;
@@ -15,6 +15,28 @@ use indexmap::IndexMap;
 /// uncompressed size stored in the central directory is attacker-controlled,
 /// so entries above this bound are rejected rather than pre-allocated.
 pub(crate) const MAX_SYMLINK_TARGET_LEN: u64 = 4096;
+
+/// Buffer capacity for file extraction streams (64 KiB), reducing syscall overhead
+/// and optimizing page cache utilization during archive extraction.
+pub(crate) const EXTRACT_BUFFER_SIZE: usize = 64 * 1024;
+
+/// Copies decompressed data from `reader` into `writer` using `buf` as a reusable transfer buffer.
+pub(crate) fn copy_into<R: Read + ?Sized, W: Write + ?Sized>(
+    reader: &mut R,
+    writer: &mut W,
+    buf: &mut [u8],
+) -> std::io::Result<u64> {
+    let mut written = 0u64;
+    loop {
+        let n = reader.read(buf)?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buf[..n])?;
+        written = written.saturating_add(n as u64);
+    }
+    Ok(written)
+}
 
 /// Symlink extract action
 #[derive(Debug, Default, Copy, Clone)]
@@ -241,23 +263,71 @@ pub(crate) fn make_symlink<T>(
     #[cfg_attr(not(any(windows, unix)), allow(unused))] existing_files: &IndexMap<Box<[u8]>, T>,
     _symlink_action: SymlinkExtractAction,
 ) -> ZipResult<()> {
-    make_symlink_as_file_utf8(outpath, target)?;
+    make_symlink_as_file_utf8(outpath, target, None)?;
     Ok(())
 }
 
-pub(crate) fn make_symlink_as_file_utf8(outpath: &Path, target: &[u8]) -> ZipResult<()> {
+pub(crate) fn make_symlink_as_file_utf8(
+    outpath: &Path,
+    target: &[u8],
+    unix_mode: Option<u32>,
+) -> ZipResult<()> {
     let Ok(_) = std::str::from_utf8(target) else {
         return Err(invalid!("Invalid UTF-8 as symlink target"));
     };
-    make_symlink_as_file(outpath, target)?;
+    make_symlink_as_file(outpath, target, unix_mode)?;
     Ok(())
 }
 
-pub(crate) fn make_symlink_as_file(outpath: &Path, target: &[u8]) -> std::io::Result<()> {
-    use std::fs::File;
+/// Create an output file for extraction securely.
+///
+/// If `outpath` already exists as a symbolic link, it is removed before creating the regular
+/// file so that extraction will not follow the link and overwrite a target file outside the
+/// destination directory. After creation, the file is verified to ensure it was not swapped
+/// for a symbolic link.
+#[cfg_attr(not(unix), allow(unused_variables))]
+pub(crate) fn create_outfile(
+    outpath: &Path,
+    unix_mode: Option<u32>,
+) -> std::io::Result<std::fs::File> {
+    if let Ok(meta) = std::fs::symlink_metadata(outpath)
+        && meta.file_type().is_symlink()
+    {
+        std::fs::remove_file(outpath)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true); // Default for `fs::File::create`
+    #[cfg(unix)]
+    if let Some(mode) = unix_mode {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(outpath)?;
+
+    if file.metadata()?.file_type().is_symlink()
+        || std::fs::symlink_metadata(outpath).is_ok_and(|meta| meta.file_type().is_symlink())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Extracted file cannot be written through a symbolic link",
+        ));
+    }
+    Ok(file)
+}
+
+pub(crate) fn make_symlink_as_file(
+    outpath: &Path,
+    target: &[u8],
+    unix_mode: Option<u32>,
+) -> std::io::Result<()> {
     use std::io::Write;
-    let output = File::create(outpath);
-    output?.write_all(target)?;
+    let mut output = create_outfile(outpath, unix_mode)?;
+    output.write_all(target)?;
     Ok(())
 }
 
@@ -493,6 +563,7 @@ impl<R: Read + Seek> ZipArchive<R> {
             .transpose()?;
 
         let mut files_by_unix_mode = UnixFileModes::default();
+        let mut extract_buf = vec![0u8; EXTRACT_BUFFER_SIZE];
 
         for i in 0..self.len() {
             let read_options = crate::read::ZipReadOptions::new()
@@ -523,16 +594,17 @@ impl<R: Read + Seek> ZipArchive<R> {
                 }
                 let mut target = Vec::with_capacity(declared_len as usize);
                 file.read_to_end(&mut target)?;
+                let unix_mode = file.unix_mode();
                 drop(file);
                 match extract_options.symlink_action {
                     SymlinkExtractAction::NoExtract => {
                         // do nothing
                     }
                     SymlinkExtractAction::ExtractAsFile => {
-                        make_symlink_as_file(&outpath, &target)?;
+                        make_symlink_as_file(&outpath, &target, unix_mode)?;
                     }
                     SymlinkExtractAction::ExtractAsFileUtf8 => {
-                        make_symlink_as_file_utf8(&outpath, &target)?;
+                        make_symlink_as_file_utf8(&outpath, &target, unix_mode)?;
                     }
                     #[cfg(any(unix, windows))]
                     SymlinkExtractAction::ExtractRecursiveInFolder => {
@@ -569,15 +641,8 @@ impl<R: Read + Seek> ZipArchive<R> {
                     files_by_unix_mode.add_mode(outpath, mode);
                 }
             } else {
-                let mut options = fs::OpenOptions::new();
-                options.create(true).write(true).truncate(true); // Default for `fs::File::create`
-                #[cfg(unix)]
-                if let Some(mode) = file.unix_mode() {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    options.mode(mode);
-                }
-                let mut outfile = options.open(&outpath)?;
-                io::copy(&mut file, &mut outfile)?;
+                let mut outfile = create_outfile(&outpath, file.unix_mode())?;
+                copy_into(&mut file, &mut outfile, &mut extract_buf)?;
                 #[cfg(unix)]
                 if let Some(mode) = file.unix_mode() {
                     // OpenOptions::mode only applies when the file is created. Record modes

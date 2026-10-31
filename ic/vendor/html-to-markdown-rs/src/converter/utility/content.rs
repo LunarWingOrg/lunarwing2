@@ -5,7 +5,7 @@
 
 use crate::converter::utility::escaping::is_block_level_name;
 use crate::converter::utility::white_space::{FORM_FEED, is_collapsible, mark_edges, owed_part};
-use crate::options::HiddenContent;
+use crate::options::{ConversionOptions, HiddenContent};
 use crate::text;
 use std::borrow::Cow;
 #[cfg(feature = "visitor")]
@@ -228,36 +228,9 @@ pub(in crate::converter) fn get_math_text_content(
     node_handle: &tl::NodeHandle,
     parser: &tl::Parser,
     dom_ctx: &DomContext,
+    hidden_content: HiddenContent,
 ) -> String {
-    let mut text = String::new();
-    let mut stack = vec![*node_handle];
-    while let Some(handle) = stack.pop() {
-        match handle.get(parser) {
-            Some(tl::Node::Raw(bytes)) => {
-                let raw = bytes.as_utf8_str();
-                let decoded = text::decode_html_entities_cow(raw.as_ref());
-                // ~keep MathML ignores indentation between elements, while token text keeps its word spaces (#925).
-                text.push_str(&decoded.split_ascii_whitespace().collect::<Vec<_>>().join(" "));
-            }
-            Some(tl::Node::Tag(tag)) => {
-                let name = tag.name().as_utf8_str();
-                if matches!(name.as_ref(), "mi" | "mo" | "mn" | "mtext" | "ms") {
-                    let token = get_text_content(&handle, parser, dom_ctx);
-                    text.push_str(&token.split_ascii_whitespace().collect::<Vec<_>>().join(" "));
-                    continue;
-                }
-                if let Some(children) = dom_ctx.children_of(handle.get_inner()) {
-                    stack.extend(children.iter().rev().copied());
-                } else {
-                    let start = stack.len();
-                    stack.extend(tag.children().top().iter().copied());
-                    stack[start..].reverse();
-                }
-            }
-            _ => {}
-        }
-    }
-    text
+    super::math::text_content(node_handle, parser, dom_ctx, hidden_content)
 }
 
 /// Writes the white space that an inline element starts with (`prefix` of [`chomp_inline`])
@@ -427,10 +400,11 @@ pub fn collect_link_label_text(
     children: &[tl::NodeHandle],
     parser: &tl::Parser,
     dom_ctx: &DomContext,
-    hidden_content: HiddenContent,
+    options: &ConversionOptions,
+    policy: crate::convert_api::AccessibleNamePolicy,
 ) -> (LinkText, Vec<tl::NodeHandle>, bool) {
     let mut block_nodes = Vec::new();
-    let text = walk_link_text(children, parser, dom_ctx, hidden_content, |handle| {
+    let text = walk_link_text(children, parser, dom_ctx, options, policy, |handle| {
         block_nodes.push(handle);
         false
     });
@@ -443,9 +417,10 @@ pub fn link_text_content(
     children: &[tl::NodeHandle],
     parser: &tl::Parser,
     dom_ctx: &DomContext,
-    hidden_content: HiddenContent,
+    options: &ConversionOptions,
+    policy: crate::convert_api::AccessibleNamePolicy,
 ) -> LinkText {
-    walk_link_text(children, parser, dom_ctx, hidden_content, |_| true)
+    walk_link_text(children, parser, dom_ctx, options, policy, |_| true)
 }
 
 /// The name of a link apart from its content: its `aria-label`, else its `title`. A value of
@@ -472,7 +447,8 @@ fn walk_link_text(
     children: &[tl::NodeHandle],
     parser: &tl::Parser,
     dom_ctx: &DomContext,
-    hidden_content: HiddenContent,
+    options: &ConversionOptions,
+    policy: crate::convert_api::AccessibleNamePolicy,
     mut enter_block: impl FnMut(tl::NodeHandle) -> bool,
 ) -> LinkText {
     let mut text = String::new();
@@ -490,7 +466,9 @@ fn walk_link_text(
                 text.push_str(decoded.as_ref());
             }
             tl::Node::Tag(tag) if tag.name().as_utf8_str().eq_ignore_ascii_case("svg") => {
-                text.push_str(&crate::converter::media::svg::graphic_text(tag, parser, hidden_content));
+                text.push_str(&crate::converter::media::svg::graphic_text(
+                    tag, parser, options, policy,
+                ));
             }
             tl::Node::Tag(tag) if tag.name().as_utf8_str().eq_ignore_ascii_case("br") => {
                 breaks = Some((breaks.map_or(text.len(), |(first, _)| first), text.len()));

@@ -81,6 +81,7 @@ impl KeySize {
 }
 
 /// An RSA key pair, used for signing.
+#[derive(Clone)]
 #[allow(clippy::module_name_repetitions)]
 pub struct KeyPair {
     // https://github.com/aws/aws-lc/blob/ebaa07a207fee02bd68fe8d65f6b624afbf29394/include/openssl/evp.h#L295
@@ -169,7 +170,10 @@ impl KeyPair {
     /// # Errors
     /// * `Unspecified`: Any key generation failure.
     #[cfg(feature = "fips")]
-    #[deprecated]
+    #[deprecated(
+        since = "1.12.3",
+        note = "Equivalent to `KeyPair::generate`; use that instead."
+    )]
     pub fn generate_fips(size: KeySize) -> Result<Self, Unspecified> {
         Self::generate(size)
     }
@@ -242,7 +246,14 @@ impl KeyPair {
     ) -> Result<(), Unspecified> {
         let encoding = padding_alg.encoding();
         let padding_fn = if let RsaPadding::RSA_PKCS1_PSS_PADDING = encoding.padding() {
-            Some(configure_rsa_pkcs1_pss_padding)
+            Some(|pctx: *mut EVP_PKEY_CTX| {
+                configure_rsa_pkcs1_pss_padding(
+                    pctx,
+                    encoding.pss_salt_length(),
+                    encoding.digest_algorithm(),
+                    &self.evp_pkey,
+                )
+            })
         } else {
             None
         };
@@ -287,7 +298,12 @@ impl KeyPair {
                     return Err(());
                 }
                 if let RsaPadding::RSA_PKCS1_PSS_PADDING = encoding.padding() {
-                    configure_rsa_pkcs1_pss_padding(pctx)
+                    configure_rsa_pkcs1_pss_padding(
+                        pctx,
+                        encoding.pss_salt_length(),
+                        encoding.digest_algorithm(),
+                        &self.evp_pkey,
+                    )
                 } else {
                     Ok(())
                 }
@@ -642,6 +658,7 @@ where
         super::signature::verify_rsa_signature(
             params.digest_algorithm(),
             params.padding(),
+            params.pss_salt_length(),
             &rsa,
             message,
             signature,

@@ -1,9 +1,4 @@
-use std::{
-    fmt::Display,
-    iter::Peekable,
-    ops::Deref,
-    str::{CharIndices, FromStr},
-};
+use std::{fmt::Display, iter::Peekable, ops::Deref, str::CharIndices};
 
 use serde::{Deserialize, de::Visitor, forward_to_deserialize_any};
 
@@ -273,25 +268,20 @@ impl<'de> Deserializer<'de> {
             self.next();
             offset = o;
         }
-        if !neg && let Ok(u) = self.parse_from_str::<u128>(start, offset) {
-            Ok(NumberResult::U128(u))
-        } else if neg && let Ok(i) = self.parse_from_str::<i128>(start, offset) {
-            Ok(NumberResult::I128(i))
-        } else {
-            Ok(NumberResult::F64(
-                self.parse_from_str::<f64>(start, offset)?,
-            ))
-        }
-    }
 
-    fn parse_from_str<N>(&self, start: usize, offset: usize) -> Result<N>
-    where
-        N: FromStr,
-        N::Err: Display,
-    {
-        self.input[start..=offset]
-            .parse()
-            .map_err(|err: N::Err| self.custom_err_at(start, err))
+        Ok(
+            if !neg && let Ok(u) = self.input[start..=offset].parse::<u128>() {
+                NumberResult::U128(u)
+            } else if neg && let Ok(i) = self.input[start..=offset].parse::<i128>() {
+                NumberResult::I128(i)
+            } else {
+                NumberResult::F64(
+                    self.input[start..=offset]
+                        .parse::<f64>()
+                        .map_err(|err| self.custom_err_at(start, err))?,
+                )
+            },
+        )
     }
 
     fn parse_hex_number(&mut self, neg: bool, start: usize) -> Result<NumberResult> {

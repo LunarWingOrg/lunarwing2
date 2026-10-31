@@ -548,6 +548,7 @@ impl ComponentState {
             info: TypeInfo::core(module.type_size),
             imports,
             exports: module.exports.clone(),
+            types: module.types.clone(),
         };
 
         let mod_id = types.push_ty(mod_ty);
@@ -3039,6 +3040,7 @@ impl ComponentState {
             info: TypeInfo::core(state.type_size),
             imports,
             exports: state.exports,
+            types: state.types,
         })
     }
 
@@ -4039,6 +4041,11 @@ impl ComponentState {
                     }
                 }
                 let value = self.create_component_val_type(value, offset)?;
+                // Bindings may drop the values of duplicate keys, so values
+                // can't contain handles that would need disposing.
+                if value.abi(types).contains_handle() {
+                    bail!(offset, "map value type cannot contain a handle")
+                }
                 let mut info = TypeInfo::new();
                 info.combine(key.info(types), offset)?;
                 info.combine(value.info(types), offset)?;

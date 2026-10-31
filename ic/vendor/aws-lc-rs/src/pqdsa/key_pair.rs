@@ -17,6 +17,7 @@ use core::fmt::{Debug, Formatter};
 use std::ffi::c_int;
 
 /// A PQDSA (Post-Quantum Digital Signature Algorithm) key pair, used for signing and verification.
+#[derive(Clone)]
 #[allow(clippy::module_name_repetitions)]
 pub struct PqdsaKeyPair {
     algorithm: &'static PqdsaSigningAlgorithm,
@@ -222,7 +223,7 @@ impl PqdsaKeyPair {
     /// # Errors
     /// Returns `Unspecified` if serialization fails.
     #[cfg(feature = "unstable")]
-    #[deprecated(note = "use `PqdsaKeyPair::to_pkcs8v1`")]
+    #[deprecated(since = "1.18.0", note = "use `PqdsaKeyPair::to_pkcs8v1`")]
     pub fn to_pkcs8(&self) -> Result<Document, Unspecified> {
         self.to_pkcs8v1()
     }

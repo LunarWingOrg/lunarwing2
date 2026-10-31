@@ -81,6 +81,11 @@ impl HtmlToMarkdownMcp {
         span.record("json", params.json);
         span.record("config_present", params.config.is_some());
 
+        let use_accessible_names = params
+            .config
+            .as_ref()
+            .and_then(|config| config.use_accessible_names)
+            .unwrap_or(true);
         let opts: ConversionOptions = match params.config {
             Some(config) => config.try_into().map_err(|error: super::params::InvalidEnumValue| {
                 tracing::warn!(
@@ -104,7 +109,7 @@ impl HtmlToMarkdownMcp {
         let mcp_span = tracing::Span::current();
         let result = tokio::task::spawn_blocking(move || {
             let _guard = mcp_span.enter();
-            crate::convert(&html, opts)
+            crate::convert_with_accessible_names(&html, use_accessible_names, opts)
         })
         .await
         .map_err(|e| {
@@ -213,10 +218,7 @@ impl ServerHandler for HtmlToMarkdownMcp {
             .with_website_url("https://github.com/xberg-io/html-to-markdown");
 
         InitializeResult::new(capabilities)
-            // Advertise the newest supported MCP revision; rmcp negotiates down for older
-            // clients. `ProtocolVersion::LATEST`/`default()` still resolves to 2025-11-25 as of
-            // rmcp 3.4.0 (`LATEST = V_2025_11_25`), so select 2026-07-28 explicitly. Re-check
-            // this on every rmcp bump: if LATEST advances, this pin becomes the older choice. ~keep
+            // ~keep Pin the advertised revision so an SDK upgrade cannot change protocol compatibility implicitly.
             .with_protocol_version(ProtocolVersion::V_2026_07_28)
             .with_server_info(server_info)
             .with_instructions(
@@ -446,6 +448,29 @@ mod tests {
         assert!(!result.content.is_empty(), "result must have content");
         let text = text_of(&result);
         assert!(text.contains("# Hello"), "markdown must contain heading; got: {text}");
+    }
+
+    #[tokio::test]
+    async fn should_apply_accessible_name_policy_at_the_server_boundary() {
+        for (policy, expected) in [
+            (None, "Name Drawn\n"),
+            (Some(true), "Name Drawn\n"),
+            (Some(false), "Drawn\n"),
+        ] {
+            let server = HtmlToMarkdownMcp::new();
+            let params = ConvertHtmlParams {
+                html: r#"<svg aria-label="Name"><text>Drawn</text></svg>"#.into(),
+                config: Some(ConvertConfig {
+                    use_accessible_names: policy,
+                    inline_data_media: Some("alt_text_only".into()),
+                    ..ConvertConfig::default()
+                }),
+                json: true,
+            };
+            let result = server.convert_html(Parameters(params)).await.unwrap();
+            let value: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+            assert_eq!(value["content"], expected);
+        }
     }
 
     #[tokio::test]

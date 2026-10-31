@@ -112,6 +112,7 @@ impl TextProcessor<'_, '_, '_> {
         }
         let decoded = self.without_line_end_before_zero_width_space(decoded);
         let escape_asterisks = self.escape_asterisks();
+        crate::converter::structure_capture::begin_loose_paragraph(self.handler.ctx);
         let capture_semantic = crate::converter::structure_capture::is_text_capture_active(self.handler.ctx);
         let processed = self.process_content(decoded, escape_asterisks, facts.was_fresh_block_start, capture_semantic);
         #[cfg(feature = "visitor")]
@@ -249,7 +250,11 @@ impl TextProcessor<'_, '_, '_> {
     /// no-break space in such a text is written as it is when it is the only one.
     fn emit_newline_whitespace(&mut self, value: &str, was_fresh: bool) {
         if self.output.is_empty() {
-            if !was_fresh && self.handler.ctx.inline_depth > 0 {
+            if !was_fresh
+                && (self.handler.ctx.inline_depth > 0
+                    || self.handler.ctx.in_marker_span
+                    || self.handler.ctx.text_in_markers)
+            {
                 self.output.push(' ');
             }
             return;
@@ -774,10 +779,11 @@ fn push_processed_text(output: &mut String, final_text: &str, site: TextSite<'_>
             output.push_str(&indent);
         }
         // ~keep The last text fragment can owe its trailing space to the next inline element (#920).
-        output.push_str(if parts.peek().is_none() {
-            part.trim_start()
-        } else {
-            part.trim()
+        output.push_str(match (index, parts.peek().is_none()) {
+            (0, true) => part,
+            (0, false) => part.trim_end(),
+            (_, true) => part.trim_start(),
+            (_, false) => part.trim(),
         });
     }
 }

@@ -28,7 +28,7 @@ When in doubt about where a change belongs, read [`AGENTS.md`](../../AGENTS.md) 
 
 ## 2. What's hot lava right now (freeze status)
 
-**Current state (updated 2026-10-25, target release 2.1.7.0):**
+**Current state (updated 2026-10-31, target release 2.1.8.0):**
 
 - v2.1.5.0 (Bungei Fukkō) shipped 2026-10-10: recovery paths and honest
   failure messages, the workspace daily-log backup gate, the routine/mission
@@ -41,9 +41,9 @@ When in doubt about where a change belongs, read [`AGENTS.md`](../../AGENTS.md) 
   remote-replica feature gate (WI#331), and the worker credential/
   exposure-policy hardening landed; see
   `docs/releases/RELEASE-v2.1.6.0.md`.
-- The v2.1.7.0 pre-release checklist is being worked through
-  (`docs/ops/AGENT_GOALS_2.1.7.0.md`). The crate/pin state already moved
-  (all LunarWing crates at 2.1.7 per checklist item #1, along with the
+- The v2.1.8.0 pre-release checklist is being worked through
+  (`docs/ops/AGENT_GOALS_2.1.8.0.md`). The crate/pin state already moved
+  (all LunarWing crates at 2.1.8 per checklist item #1, along with the
   XMPP bridge, the four WASM channels, and their registry packages;
   kimi worker 2.3.0
   per items #4 and #83; opencode2 at v2.1.2 per item #83 — the v2.0.26
@@ -156,4 +156,4 @@ have you find out after 6 hours of work.
 
 ---
 
-*Last updated: 2026-10-25 (v2.1.7.0 freeze status). Update §2 whenever freeze status changes.*
+*Last updated: 2026-10-31 (v2.1.8.0 freeze status). Update §2 whenever freeze status changes.*
