@@ -1,6 +1,6 @@
 # Outbound Message Delivery Semantics
 
-**Source revalidated 2026-10-29 for v2.1.7.0.** Defines what a successful
+**Source revalidated 2026-10-31 for v2.1.8.0.** Defines what a successful
 `message`-tool send means and what the native XMPP channel guarantees about
 outbound stanzas. WI#270 established acceptance wording; WI#277 added durable
 spooling. The initiating incident was a mission recording "Delivered via XMPP"
