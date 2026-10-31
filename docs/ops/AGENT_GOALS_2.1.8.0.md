@@ -42,7 +42,7 @@
     - **Verification (all on this tree, `taskset -c 0-17`):** `cargo check --locked` clean on all four feature combos (default `--all-targets`, postgres-only, libsql-only, all-features); `cargo clippy --locked --all --benches --tests --examples -- -D warnings` clean on default and `--all-features`; `cargo fmt --all -- --check` clean; all 13 WASM extensions (9 tools + 4 channels) build green via `build-wasm-extensions.sh --strict`; `version-policy.sh` ok against both `v2.1.7.0` and the target head; `standalone-deliverables.py` 11 units ok; `verify_release_version.py --self-test` 6/6; `validate_config.py` 8 YAML; `registry_json.py` 14 files; `shell-syntax.sh` 277 scripts + 3 hooks; `python_syntax.py` 148 files; `panic-policy.sh` ok; `test_goal1_ci.py` **280/280**; `cargo test --lib registry::` **169 passed**.
     - **Honest gaps:** the full `.gitlab/tests` discovery shows 3 failures + 39 errors on this host — all in `test_worker_image_modes.py` (1, the opencode2 umask-normalize case), `test_worker_out_of_band_verify.py` (2, `go` 1.26.7 vs a go.mod floor of 1.26.10) and `test_worker_exposure_policy.py` (39 errors, the same go-toolchain error) — and **every one reproduces identically on the untouched base `838025826`** (verified in a clean `git worktree`), so they are this dev VM's environment, not this change; no Rust or worker file was touched by them. The MR pipeline on the exact head is CI-only and cannot be run from here — this branch's push pipeline is the remaining step for the maintainer.
     - **!2100 run-288 follow-up (SY-1/SY-2, Low):** aligned the gitlab tool's remaining three pins to 0.1.13 (Cargo package, `Cargo.lock` entry, capabilities) so all four surfaces match its registry entry again; `cargo check --locked --offline` passes on the tool crate. Corrected the `ic/Cargo.lock` diff to **36 in-place upgrades, 4 added blocks** (`utf_types 1.0.0` plus second copies of `addr2line 0.27.1`, `gimli 0.34.0`, `object 0.40.0`) **and 1 removed** (`miniz_oxide 0.8.9`), with the addr2line/object/gimli additions described as second copies beside wasmtime's pinned 0.25.1/0.32.3/0.37.3 rather than replacements; the vendor count is **1,155**. SY-3 (Info; one RustCrypto-family tracking WI) remains a suggestion.
-2. [ ] Crate security audit for v2.1.8.0, run on the tree after item 1's crate sweep has merged: audit every tracked lockfile for vulnerable, unsound and yanked crates, fix what can be fixed, re-verify every accepted advisory, and record it all in `docs/ops/v2.1.8.0_CARGO_DENY_AUDIT.md`. Exit criteria: all four advisory gates and the guard tests green on the post-sweep tree against the current advisory-db; every `ic/deny.toml` acceptance re-justified or removed; no new acceptance without the maintainer's sign-off; and a fully green MR pipeline on the exact head being merged. If item 1 has not merged yet, wait for it: an audit of the pre-sweep tree has to be redone, which is why the v2.1.7.0 audit needed a second pass.
+2. [ ] Crate security audit for v2.1.8.0, run on the tree after item 1's crate sweep has merged: audit every tracked lockfile for vulnerable, unsound and yanked crates, fix what can be fixed, re-verify every accepted advisory, and record it all in `docs/ops/v2.1.8.0_CARGO_DENY_AUDIT.md`. Exit criteria: all four advisory gates and the guard tests green on the post-sweep tree against the current advisory-db; every `ic/deny.toml` acceptance re-justified or removed; no new acceptance without the maintainer's sign-off; and a fully green MR pipeline on the exact head being merged. If item 1 has not merged yet, wait for it: an audit of the pre-sweep tree has to be redone, which is why the v2.1.7.0 audit needed a second pass. last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2098 but you were auditing the old crates so need to try it again ty
     - **Spec: scope.** The `ic` workspace graph (`--workspace --all-features`) and all 27 tracked `Cargo.lock` roots outside `ic/vendor/`, including the shipped worker locks (`pebble4lunarwing/Cargo.lock`, and `pebble4lunarwing/upstream` through `pebble4lunarwing/scripts/verify_upstream_lock.py`), the tool and channel crates, the bridges and the sidecars. Record the advisory-db commit and date used, and confirm it is the upstream head at audit time.
     - **Spec: gates.** `bash .gitlab/scripts/cargo-deny-check.sh` (advisories, bans, licenses, sources), `check-satellite-advisories.sh`, `check-default-graph-advisories.sh` and `check-lockfile-only-advisories.sh`, plus the guard tests `.gitlab/tests/test_deny_toml_guards.py`, `test_cargo_deny_gate.py`, `test_lockfile_only_advisory_guard.py` and `test_pebble_build_inputs.py` (`LockDeltaTests`). Report warnings as well as failures, each with a count and a classification.
     - **Spec: findings.** Fix a vulnerable, unsound or yanked crate with a lock bump or dependency change in the root where it lives; a shipped worker lock counts (in v2.1.7.0 the pebble lock carried five quinn-proto advisories). Re-verify the root you changed: `cargo check` for that root, the pebble build-input tests for the pebble lock, and the pinned lock digest (`PEBBLE_LOCK_SHA256` in `pebble4lunarwing/Dockerfile`) refreshed wherever it is pinned. Where no patched release exists, document the exposure and propose an acceptance; never add an `ignore` without its reason and exposure in `ic/deny.toml` and in the audit doc, and flag it for the maintainer.
@@ -54,7 +54,7 @@
 
 ## Phase 2 — Features & Polish (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
 
-3. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/527
+3. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/527 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2099 but has some issues. please see the comments on the closed MR and address
 
 ## Phase 3 — Carried Known-Issues from RELEASE-v2.1.3.0.md (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
 
@@ -64,7 +64,7 @@
 
 ## Phase 4 - Documentation and Misc goal items (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
 
-7. [x] (S) Reserved
+7. [ ] update any outdated docs in docs/architecture
 
 ## Phase 5 - Misc Operations (ALWAYS READ ALL COMMENTS FOR EACH WORK ITEM WHEN A WORK ITEM IS REFERENCED - ALSO ALWAYS READ LINKED WORK ITEMS FOR EACH WORK ITEM REFERENCED)
 
@@ -110,7 +110,7 @@
 32. [x] (H) General Agent Loop Engine Polish
 33. [x] (H) OPERATOR NOTE: Start the gallop
 34. [x] (H) Deploy the stoplight system
-35. [x] (H) Dive back in to LunarDepth
+35. [x] (H) Dive back in to LunarDepth and open worker lanes across the fleet for it get it running and up again patches too
 36. [x] (S) Reserved
 37. [x] (S) Reserved
 38. [x] (S) Reserved
