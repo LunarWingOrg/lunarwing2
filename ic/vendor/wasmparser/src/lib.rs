@@ -90,29 +90,29 @@ macro_rules! _for_each_operator_group {
                 LocalTee { local_index: u32 } => visit_local_tee (arity 1 -> 1)
                 GlobalGet { global_index: u32 } => visit_global_get (arity 0 -> 1)
                 GlobalSet { global_index: u32 } => visit_global_set (arity 1 -> 0)
-                I32Load { memarg: $crate::MemArg } => visit_i32_load (arity 1 -> 1)
-                I64Load { memarg: $crate::MemArg } => visit_i64_load (arity 1 -> 1)
-                F32Load { memarg: $crate::MemArg } => visit_f32_load (arity 1 -> 1)
-                F64Load { memarg: $crate::MemArg } => visit_f64_load (arity 1 -> 1)
-                I32Load8S { memarg: $crate::MemArg } => visit_i32_load8_s (arity 1 -> 1)
-                I32Load8U { memarg: $crate::MemArg } => visit_i32_load8_u (arity 1 -> 1)
-                I32Load16S { memarg: $crate::MemArg } => visit_i32_load16_s (arity 1 -> 1)
-                I32Load16U { memarg: $crate::MemArg } => visit_i32_load16_u (arity 1 -> 1)
-                I64Load8S { memarg: $crate::MemArg } => visit_i64_load8_s (arity 1 -> 1)
-                I64Load8U { memarg: $crate::MemArg } => visit_i64_load8_u (arity 1 -> 1)
-                I64Load16S { memarg: $crate::MemArg } => visit_i64_load16_s (arity 1 -> 1)
-                I64Load16U { memarg: $crate::MemArg } => visit_i64_load16_u (arity 1 -> 1)
-                I64Load32S { memarg: $crate::MemArg } => visit_i64_load32_s (arity 1 -> 1)
-                I64Load32U { memarg: $crate::MemArg } => visit_i64_load32_u (arity 1 -> 1)
-                I32Store { memarg: $crate::MemArg } => visit_i32_store (arity 2 -> 0)
-                I64Store { memarg: $crate::MemArg } => visit_i64_store (arity 2 -> 0)
-                F32Store { memarg: $crate::MemArg } => visit_f32_store (arity 2 -> 0)
-                F64Store { memarg: $crate::MemArg } => visit_f64_store (arity 2 -> 0)
-                I32Store8 { memarg: $crate::MemArg } => visit_i32_store8 (arity 2 -> 0)
-                I32Store16 { memarg: $crate::MemArg } => visit_i32_store16 (arity 2 -> 0)
-                I64Store8 { memarg: $crate::MemArg } => visit_i64_store8 (arity 2 -> 0)
-                I64Store16 { memarg: $crate::MemArg } => visit_i64_store16 (arity 2 -> 0)
-                I64Store32 { memarg: $crate::MemArg } => visit_i64_store32 (arity 2 -> 0)
+                I32Load { memarg: $crate::MemArg } => visit_i32_load (arity memarg 1 -> 1)
+                I64Load { memarg: $crate::MemArg } => visit_i64_load (arity memarg 1 -> 1)
+                F32Load { memarg: $crate::MemArg } => visit_f32_load (arity memarg 1 -> 1)
+                F64Load { memarg: $crate::MemArg } => visit_f64_load (arity memarg 1 -> 1)
+                I32Load8S { memarg: $crate::MemArg } => visit_i32_load8_s (arity memarg 1 -> 1)
+                I32Load8U { memarg: $crate::MemArg } => visit_i32_load8_u (arity memarg 1 -> 1)
+                I32Load16S { memarg: $crate::MemArg } => visit_i32_load16_s (arity memarg 1 -> 1)
+                I32Load16U { memarg: $crate::MemArg } => visit_i32_load16_u (arity memarg 1 -> 1)
+                I64Load8S { memarg: $crate::MemArg } => visit_i64_load8_s (arity memarg 1 -> 1)
+                I64Load8U { memarg: $crate::MemArg } => visit_i64_load8_u (arity memarg 1 -> 1)
+                I64Load16S { memarg: $crate::MemArg } => visit_i64_load16_s (arity memarg 1 -> 1)
+                I64Load16U { memarg: $crate::MemArg } => visit_i64_load16_u (arity memarg 1 -> 1)
+                I64Load32S { memarg: $crate::MemArg } => visit_i64_load32_s (arity memarg 1 -> 1)
+                I64Load32U { memarg: $crate::MemArg } => visit_i64_load32_u (arity memarg 1 -> 1)
+                I32Store { memarg: $crate::MemArg } => visit_i32_store (arity memarg 2 -> 0)
+                I64Store { memarg: $crate::MemArg } => visit_i64_store (arity memarg 2 -> 0)
+                F32Store { memarg: $crate::MemArg } => visit_f32_store (arity memarg 2 -> 0)
+                F64Store { memarg: $crate::MemArg } => visit_f64_store (arity memarg 2 -> 0)
+                I32Store8 { memarg: $crate::MemArg } => visit_i32_store8 (arity memarg 2 -> 0)
+                I32Store16 { memarg: $crate::MemArg } => visit_i32_store16 (arity memarg 2 -> 0)
+                I64Store8 { memarg: $crate::MemArg } => visit_i64_store8 (arity memarg 2 -> 0)
+                I64Store16 { memarg: $crate::MemArg } => visit_i64_store16 (arity memarg 2 -> 0)
+                I64Store32 { memarg: $crate::MemArg } => visit_i64_store32 (arity memarg 2 -> 0)
                 MemorySize { mem: u32 } => visit_memory_size (arity 0 -> 1)
                 MemoryGrow { mem: u32 } => visit_memory_grow (arity 1 -> 1)
                 I32Const { value: i32 } => visit_i32_const (arity 0 -> 1)
@@ -381,7 +381,7 @@ macro_rules! _for_each_operator_group {
                 MemoryAtomicNotify { memarg: $crate::MemArg } => visit_memory_atomic_notify (arity 2 -> 1)
                 MemoryAtomicWait32 { memarg: $crate::MemArg } => visit_memory_atomic_wait32 (arity 3 -> 1)
                 MemoryAtomicWait64 { memarg: $crate::MemArg } => visit_memory_atomic_wait64 (arity 3 -> 1)
-                AtomicFence => visit_atomic_fence (arity 0 -> 0)
+                AtomicFence { ordering: $crate::Ordering } => visit_atomic_fence (arity 0 -> 0)
                 I32AtomicLoad { memarg: $crate::MemArg } => visit_i32_atomic_load (arity 1 -> 1)
                 I64AtomicLoad { memarg: $crate::MemArg } => visit_i64_atomic_load (arity 1 -> 1)
                 I32AtomicLoad8U { memarg: $crate::MemArg } => visit_i32_atomic_load8_u (arity 1 -> 1)
@@ -452,28 +452,28 @@ macro_rules! _for_each_operator_group {
             // - https://github.com/webassembly/simd
             // - https://webassembly.github.io/simd/core/binary/instructions.html
             @simd {
-                V128Load { memarg: $crate::MemArg } => visit_v128_load (arity 1 -> 1)
-                V128Load8x8S { memarg: $crate::MemArg } => visit_v128_load8x8_s (arity 1 -> 1)
-                V128Load8x8U { memarg: $crate::MemArg } => visit_v128_load8x8_u (arity 1 -> 1)
-                V128Load16x4S { memarg: $crate::MemArg } => visit_v128_load16x4_s (arity 1 -> 1)
-                V128Load16x4U { memarg: $crate::MemArg } => visit_v128_load16x4_u (arity 1 -> 1)
-                V128Load32x2S { memarg: $crate::MemArg } => visit_v128_load32x2_s (arity 1 -> 1)
-                V128Load32x2U { memarg: $crate::MemArg } => visit_v128_load32x2_u (arity 1 -> 1)
-                V128Load8Splat { memarg: $crate::MemArg } => visit_v128_load8_splat (arity 1 -> 1)
-                V128Load16Splat { memarg: $crate::MemArg } => visit_v128_load16_splat (arity 1 -> 1)
-                V128Load32Splat { memarg: $crate::MemArg } => visit_v128_load32_splat (arity 1 -> 1)
-                V128Load64Splat { memarg: $crate::MemArg } => visit_v128_load64_splat (arity 1 -> 1)
-                V128Load32Zero { memarg: $crate::MemArg } => visit_v128_load32_zero (arity 1 -> 1)
-                V128Load64Zero { memarg: $crate::MemArg } => visit_v128_load64_zero (arity 1 -> 1)
-                V128Store { memarg: $crate::MemArg } => visit_v128_store (arity 2 -> 0)
-                V128Load8Lane { memarg: $crate::MemArg, lane: u8 } => visit_v128_load8_lane (arity 2 -> 1)
-                V128Load16Lane { memarg: $crate::MemArg, lane: u8 } => visit_v128_load16_lane (arity 2 -> 1)
-                V128Load32Lane { memarg: $crate::MemArg, lane: u8 } => visit_v128_load32_lane (arity 2 -> 1)
-                V128Load64Lane { memarg: $crate::MemArg, lane: u8 } => visit_v128_load64_lane (arity 2 -> 1)
-                V128Store8Lane { memarg: $crate::MemArg, lane: u8 } => visit_v128_store8_lane (arity 2 -> 0)
-                V128Store16Lane { memarg: $crate::MemArg, lane: u8 } => visit_v128_store16_lane (arity 2 -> 0)
-                V128Store32Lane { memarg: $crate::MemArg, lane: u8 } => visit_v128_store32_lane (arity 2 -> 0)
-                V128Store64Lane { memarg: $crate::MemArg, lane: u8 } => visit_v128_store64_lane (arity 2 -> 0)
+                V128Load { memarg: $crate::MemArg } => visit_v128_load (arity memarg 1 -> 1)
+                V128Load8x8S { memarg: $crate::MemArg } => visit_v128_load8x8_s (arity memarg 1 -> 1)
+                V128Load8x8U { memarg: $crate::MemArg } => visit_v128_load8x8_u (arity memarg 1 -> 1)
+                V128Load16x4S { memarg: $crate::MemArg } => visit_v128_load16x4_s (arity memarg 1 -> 1)
+                V128Load16x4U { memarg: $crate::MemArg } => visit_v128_load16x4_u (arity memarg 1 -> 1)
+                V128Load32x2S { memarg: $crate::MemArg } => visit_v128_load32x2_s (arity memarg 1 -> 1)
+                V128Load32x2U { memarg: $crate::MemArg } => visit_v128_load32x2_u (arity memarg 1 -> 1)
+                V128Load8Splat { memarg: $crate::MemArg } => visit_v128_load8_splat (arity memarg 1 -> 1)
+                V128Load16Splat { memarg: $crate::MemArg } => visit_v128_load16_splat (arity memarg 1 -> 1)
+                V128Load32Splat { memarg: $crate::MemArg } => visit_v128_load32_splat (arity memarg 1 -> 1)
+                V128Load64Splat { memarg: $crate::MemArg } => visit_v128_load64_splat (arity memarg 1 -> 1)
+                V128Load32Zero { memarg: $crate::MemArg } => visit_v128_load32_zero (arity memarg 1 -> 1)
+                V128Load64Zero { memarg: $crate::MemArg } => visit_v128_load64_zero (arity memarg 1 -> 1)
+                V128Store { memarg: $crate::MemArg } => visit_v128_store (arity memarg 2 -> 0)
+                V128Load8Lane { memarg: $crate::MemArg, lane: u8 } => visit_v128_load8_lane (arity memarg 2 -> 1)
+                V128Load16Lane { memarg: $crate::MemArg, lane: u8 } => visit_v128_load16_lane (arity memarg 2 -> 1)
+                V128Load32Lane { memarg: $crate::MemArg, lane: u8 } => visit_v128_load32_lane (arity memarg 2 -> 1)
+                V128Load64Lane { memarg: $crate::MemArg, lane: u8 } => visit_v128_load64_lane (arity memarg 2 -> 1)
+                V128Store8Lane { memarg: $crate::MemArg, lane: u8 } => visit_v128_store8_lane (arity memarg 2 -> 0)
+                V128Store16Lane { memarg: $crate::MemArg, lane: u8 } => visit_v128_store16_lane (arity memarg 2 -> 0)
+                V128Store32Lane { memarg: $crate::MemArg, lane: u8 } => visit_v128_store32_lane (arity memarg 2 -> 0)
+                V128Store64Lane { memarg: $crate::MemArg, lane: u8 } => visit_v128_store64_lane (arity memarg 2 -> 0)
                 V128Const { value: $crate::V128 } => visit_v128_const (arity 0 -> 1)
                 I8x16Shuffle { lanes: [u8; 16] } => visit_i8x16_shuffle (arity 2 -> 1)
                 I8x16ExtractLaneS { lane: u8 } => visit_i8x16_extract_lane_s (arity 1 -> 1)
@@ -797,6 +797,10 @@ macro_rules! _for_each_operator_group {
                 I64MulWideS => visit_i64_mul_wide_s (arity 2 -> 2)
                 I64MulWideU => visit_i64_mul_wide_u (arity 2 -> 2)
             }
+
+            @acquire_release_atomics {
+                Pause => visit_pause (arity 0 -> 0)
+            }
         }
     };
 }
@@ -974,43 +978,22 @@ _for_each_operator_group!(define_for_each_simd_operator);
 /// - `@gc`: [Wasm `gc` proposal]
 /// - `@stack_switching`: [Wasm `stack-switching` proposal]
 /// - `@wide_arithmetic`: [Wasm `wide-arithmetic` proposal]
+/// - `@acquire_release_atomics`: [Wasm `acquire-release-atomics` proposal]
 /// - `@custom_descriptors` : [Wasm `custom-descriptors` proposal]
 ///
-/// [Wasm `exception-handling` proposal]:
-/// https://github.com/WebAssembly/exception-handling
-///
-/// [Wasm `tail-calls` proposal]:
-/// https://github.com/WebAssembly/tail-call
-///
-/// [Wasm `reference-types` proposal]:
-/// https://github.com/WebAssembly/reference-types
-///
-/// [Wasm `sign-extension-ops` proposal]:
-/// https://github.com/WebAssembly/sign-extension-ops
-///
-/// [Wasm `non_trapping_float-to-int-conversions` proposal]:
-/// https://github.com/WebAssembly/nontrapping-float-to-int-conversions
-///
-/// [Wasm `bulk-memory` proposal]:
-/// https://github.com/WebAssembly/bulk-memory-operations
-///
-/// [Wasm `simd` proposal]:
-/// https://github.com/webassembly/simd
-///
-/// [Wasm `relaxed-simd` proposal]:
-/// https://github.com/WebAssembly/relaxed-simd
-///
-/// [Wasm `threads` proposal]:
-/// https://github.com/webassembly/threads
-///
-/// [Wasm `gc` proposal]:
-/// https://github.com/WebAssembly/gc
-///
-/// [Wasm `stack-switching` proposal]:
-/// https://github.com/WebAssembly/stack-switching
-///
-/// [Wasm `wide-arithmetic` proposal]:
-/// https://github.com/WebAssembly/wide-arithmetic
+/// [Wasm `exception-handling` proposal]: https://github.com/WebAssembly/exception-handling
+/// [Wasm `tail-calls` proposal]: https://github.com/WebAssembly/tail-call
+/// [Wasm `reference-types` proposal]: https://github.com/WebAssembly/reference-types
+/// [Wasm `sign-extension-ops` proposal]: https://github.com/WebAssembly/sign-extension-ops
+/// [Wasm `non_trapping_float-to-int-conversions` proposal]: https://github.com/WebAssembly/nontrapping-float-to-int-conversions
+/// [Wasm `bulk-memory` proposal]: https://github.com/WebAssembly/bulk-memory-operations
+/// [Wasm `simd` proposal]: https://github.com/webassembly/simd
+/// [Wasm `relaxed-simd` proposal]: https://github.com/WebAssembly/relaxed-simd
+/// [Wasm `threads` proposal]: https://github.com/webassembly/threads
+/// [Wasm `gc` proposal]: https://github.com/WebAssembly/gc
+/// [Wasm `stack-switching` proposal]: https://github.com/WebAssembly/stack-switching
+/// [Wasm `wide-arithmetic` proposal]: https://github.com/WebAssembly/wide-arithmetic
+/// [Wasm `acquire-release-atomics` proposal]: https://github.com/WebAssembly/acquire-release-atomics
 ///
 /// ```
 /// fn do_nothing(op: &wasmparser::Operator) {
@@ -1103,46 +1086,26 @@ pub use _for_each_operator_impl as for_each_operator;
 /// - `@gc`: [Wasm `gc` proposal]
 /// - `@stack_switching`: [Wasm `stack-switching` proposal]
 /// - `@wide_arithmetic`: [Wasm `wide-arithmetic` proposal]
+/// - `@acquire_release_atomics`: [Wasm `acquire-release-atomics` proposal]
 ///
 /// Note that this macro does not iterate over the SIMD-related proposals. Those
 /// are provided in [`VisitSimdOperator`] and [`for_each_visit_simd_operator`].
 /// This macro only handles non-SIMD related operators and so users wanting to
 /// handle the SIMD-class of operators need to use that trait/macro as well.
 ///
-/// [Wasm `exception-handling` proposal]:
-/// https://github.com/WebAssembly/exception-handling
-///
-/// [Wasm `tail-calls` proposal]:
-/// https://github.com/WebAssembly/tail-call
-///
-/// [Wasm `reference-types` proposal]:
-/// https://github.com/WebAssembly/reference-types
-///
-/// [Wasm `sign-extension-ops` proposal]:
-/// https://github.com/WebAssembly/sign-extension-ops
-///
-/// [Wasm `non_trapping_float-to-int-conversions` proposal]:
-/// https://github.com/WebAssembly/nontrapping-float-to-int-conversions
-///
-/// [Wasm `bulk-memory` proposal]:
-/// https://github.com/WebAssembly/bulk-memory-operations
-/// [Wasm `simd` proposal]:
-/// https://github.com/webassembly/simd
-///
-/// [Wasm `relaxed-simd` proposal]:
-/// https://github.com/WebAssembly/relaxed-simd
-///
-/// [Wasm `threads` proposal]:
-/// https://github.com/webassembly/threads
-///
-/// [Wasm `gc` proposal]:
-/// https://github.com/WebAssembly/gc
-///
-/// [Wasm `stack-switching` proposal]:
-/// https://github.com/WebAssembly/stack-switching
-///
-/// [Wasm `wide-arithmetic` proposal]:
-/// https://github.com/WebAssembly/wide-arithmetic
+/// [Wasm `exception-handling` proposal]: https://github.com/WebAssembly/exception-handling
+/// [Wasm `tail-calls` proposal]: https://github.com/WebAssembly/tail-call
+/// [Wasm `reference-types` proposal]: https://github.com/WebAssembly/reference-types
+/// [Wasm `sign-extension-ops` proposal]: https://github.com/WebAssembly/sign-extension-ops
+/// [Wasm `non_trapping_float-to-int-conversions` proposal]: https://github.com/WebAssembly/nontrapping-float-to-int-conversions
+/// [Wasm `bulk-memory` proposal]: https://github.com/WebAssembly/bulk-memory-operations
+/// [Wasm `simd` proposal]: https://github.com/webassembly/simd
+/// [Wasm `relaxed-simd` proposal]: https://github.com/WebAssembly/relaxed-simd
+/// [Wasm `threads` proposal]: https://github.com/webassembly/threads
+/// [Wasm `gc` proposal]: https://github.com/WebAssembly/gc
+/// [Wasm `stack-switching` proposal]: https://github.com/WebAssembly/stack-switching
+/// [Wasm `wide-arithmetic` proposal]: https://github.com/WebAssembly/wide-arithmetic
+/// [Wasm `acquire-release-atomics` proposal]: https://github.com/WebAssembly/acquire-release-atomics
 ///
 /// ```
 /// macro_rules! define_visit_operator {

@@ -13,9 +13,10 @@
 //! - IDs are deterministic hashes of `(node_type, text_prefix, index)`.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
-use super::document::{DocumentNode, DocumentStructure, NodeContent, TextAnnotation};
+use super::document::{AnnotationKind, DocumentNode, DocumentStructure, NodeContent, TextAnnotation};
 use super::tables::{TableData, TableGrid};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -25,13 +26,13 @@ pub(crate) enum TextCaptureKind {
     ListItem,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct TextCaptureId(u64);
 
 struct OpenAnnotation {
     token: u64,
     start: usize,
-    kind: super::document::AnnotationKind,
+    kind: AnnotationKind,
 }
 
 struct TextCapture {
@@ -41,6 +42,8 @@ struct TextCapture {
     annotations: Vec<TextAnnotation>,
     open_annotations: Vec<OpenAnnotation>,
     suspended: bool,
+    after_heading_break: bool,
+    checkpoint_refs: usize,
 }
 
 struct CaptureSnapshot {
@@ -49,6 +52,7 @@ struct CaptureSnapshot {
     annotations_len: usize,
     open_annotations_len: usize,
     suspended: bool,
+    after_heading_break: bool,
 }
 
 enum ElementCaptureResult {
@@ -57,8 +61,9 @@ enum ElementCaptureResult {
 }
 
 struct ElementCapture {
+    loose_paragraph: Option<TextCaptureId>,
     snapshots: Vec<CaptureSnapshot>,
-    annotation_token: Option<u64>,
+    annotation: Option<(u64, AnnotationKind)>,
     result: ElementCaptureResult,
     nodes_len: usize,
     section_stack: Vec<(u8, u32)>,
@@ -86,7 +91,10 @@ pub struct StructureCollector {
     /// Populated by [`push_table_data`] when document structure extraction is enabled.
     tables: Vec<TableData>,
     text_captures: Vec<TextCapture>,
+    completed_captures: Option<HashMap<TextCaptureId, TextCapture>>,
     element_captures: Vec<ElementCapture>,
+    /// The paragraph collecting text that no paragraph, heading or list item holds.
+    loose_paragraph: Option<TextCaptureId>,
     next_capture_id: u64,
     next_annotation_token: u64,
 }
@@ -115,7 +123,9 @@ impl StructureCollector {
             list_stack: Vec::new(),
             tables: Vec::new(),
             text_captures: Vec::new(),
+            completed_captures: None,
             element_captures: Vec::new(),
+            loose_paragraph: None,
             next_capture_id: 0,
             next_annotation_token: 0,
         }
@@ -129,8 +139,19 @@ impl StructureCollector {
             kind,
             text: String::new(),
             annotations: Vec::new(),
-            open_annotations: Vec::new(),
+            open_annotations: self
+                .element_captures
+                .iter()
+                .filter_map(|element| element.annotation.as_ref())
+                .map(|(token, kind)| OpenAnnotation {
+                    token: *token,
+                    start: 0,
+                    kind: kind.clone(),
+                })
+                .collect(),
             suspended: false,
+            after_heading_break: false,
+            checkpoint_refs: 0,
         });
         id
     }
@@ -139,13 +160,63 @@ impl StructureCollector {
         let Some(position) = self.text_captures.iter().position(|capture| capture.id == id) else {
             return (String::new(), Vec::new());
         };
-        let capture = self.text_captures.remove(position);
-        super::structure_builder::trim_annotated_text(&capture.text, capture.annotations)
+        let mut capture = self.text_captures.remove(position);
+        let mut annotations = if capture.checkpoint_refs == 0 {
+            std::mem::take(&mut capture.annotations)
+        } else {
+            capture.annotations.clone()
+        };
+        annotations.extend(
+            capture
+                .open_annotations
+                .iter()
+                .rev()
+                .filter(|annotation| annotation.start < capture.text.len())
+                .map(|annotation| TextAnnotation {
+                    start: annotation.start as u32,
+                    end: capture.text.len() as u32,
+                    kind: annotation.kind.clone(),
+                }),
+        );
+        let result = super::structure_builder::trim_annotated_text(&capture.text, annotations);
+        if capture.checkpoint_refs > 0 {
+            // ~keep A visitor may still roll back an enclosing element after this block closes.
+            self.completed_captures
+                .get_or_insert_with(HashMap::new)
+                .insert(id, capture);
+        }
+        result
     }
 
     pub(crate) fn append_text(&mut self, text: &str) {
         for capture in self.text_captures.iter_mut().filter(|capture| !capture.suspended) {
             capture.text.push_str(text);
+            if !text.is_empty() {
+                capture.after_heading_break = false;
+            }
+        }
+    }
+
+    pub(crate) fn append_heading_text(&mut self, text: &str) {
+        for capture in self.text_captures.iter_mut().filter(|capture| !capture.suspended) {
+            let text = if capture.after_heading_break {
+                text.trim_start_matches([' ', '\t', '\n', '\r'])
+            } else {
+                text
+            };
+            capture.text.push_str(text);
+            if !text.is_empty() {
+                capture.after_heading_break = false;
+            }
+        }
+    }
+
+    pub(crate) fn append_heading_break(&mut self) {
+        for capture in self.text_captures.iter_mut().filter(|capture| !capture.suspended) {
+            if !capture.text.ends_with([' ', '\t']) {
+                capture.text.push(' ');
+            }
+            capture.after_heading_break = true;
         }
     }
 
@@ -153,22 +224,49 @@ impl StructureCollector {
         self.text_captures.iter().any(|capture| !capture.suspended)
     }
 
-    pub(crate) fn begin_element(&mut self, kind: Option<super::document::AnnotationKind>) {
+    /// Start a paragraph for text outside any paragraph, heading or list item, such as the text
+    /// of `<div>Words</div>` or the text after a list. A list container keeps its own text, so
+    /// nothing starts inside one.
+    pub(crate) fn begin_loose_paragraph(&mut self) {
+        if self.has_active_text_capture() || !self.list_stack.is_empty() {
+            return;
+        }
+        self.loose_paragraph = Some(self.begin_text_capture(TextCaptureKind::Paragraph));
+    }
+
+    /// Record the open loose paragraph, if it holds any text. A block element begins or ends
+    /// here, so the loose text before it is a paragraph of its own.
+    pub(crate) fn finish_loose_paragraph(&mut self) {
+        let Some(id) = self.loose_paragraph.take() else {
+            return;
+        };
+        let (text, annotations) = self.finish_text_capture(id);
+        if !text.is_empty() {
+            self.push_paragraph_with_annotations(&text, annotations);
+        }
+    }
+
+    pub(crate) fn begin_element(&mut self, kind: Option<AnnotationKind>) {
         let snapshots = self
             .text_captures
-            .iter()
-            .map(|capture| CaptureSnapshot {
-                id: capture.id,
-                text_len: capture.text.len(),
-                annotations_len: capture.annotations.len(),
-                open_annotations_len: capture.open_annotations.len(),
-                suspended: capture.suspended,
+            .iter_mut()
+            .map(|capture| {
+                capture.checkpoint_refs += 1;
+                CaptureSnapshot {
+                    id: capture.id,
+                    text_len: capture.text.len(),
+                    annotations_len: capture.annotations.len(),
+                    open_annotations_len: capture.open_annotations.len(),
+                    suspended: capture.suspended,
+                    after_heading_break: capture.after_heading_break,
+                }
             })
             .collect();
-        let annotation_token = kind.map(|kind| self.begin_annotation(kind));
+        let annotation = kind.map(|kind| (self.begin_annotation(kind.clone()), kind));
         self.element_captures.push(ElementCapture {
+            loose_paragraph: self.loose_paragraph,
             snapshots,
-            annotation_token,
+            annotation,
             result: ElementCaptureResult::Keep,
             nodes_len: self.nodes.len(),
             section_stack: self.section_stack.clone(),
@@ -184,24 +282,29 @@ impl StructureCollector {
         }
     }
 
-    pub(crate) fn finish_element(&mut self) {
+    pub(crate) fn finish_element(&mut self, allow_loose_text: bool) {
         let Some(element) = self.element_captures.pop() else {
             return;
         };
         match &element.result {
             ElementCaptureResult::Keep => {
-                if let Some(token) = element.annotation_token {
-                    self.finish_annotation(token);
+                if let Some((token, _)) = element.annotation.as_ref() {
+                    self.finish_annotation(*token);
                 }
             }
             ElementCaptureResult::Replace(replacement) => {
                 self.restore_captures(&element.snapshots);
                 self.restore_structure(&element);
+                self.loose_paragraph = element.loose_paragraph;
                 if let Some(replacement) = replacement.as_deref() {
+                    if allow_loose_text {
+                        self.begin_loose_paragraph();
+                    }
                     self.append_text(replacement);
                 }
             }
         }
+        self.release_checkpoints(&element.snapshots);
     }
 
     pub(crate) fn suspend_list_item_captures(&mut self) -> Vec<TextCaptureId> {
@@ -427,6 +530,14 @@ impl StructureCollector {
     ///
     /// Returns the node index.
     pub fn push_image(&mut self, src: Option<&str>, alt: Option<&str>) -> u32 {
+        self.push_image_with_index(src, alt, None)
+    }
+
+    /// Record an image element whose bytes, when extracted, are entry `image_index` of
+    /// `ConversionResult::images`.
+    ///
+    /// Returns the node index.
+    pub fn push_image_with_index(&mut self, src: Option<&str>, alt: Option<&str>, image_index: Option<u32>) -> u32 {
         let parent = self.current_structural_parent();
         let label = src.unwrap_or("img");
         let id = Self::generate_id("image", label, self.nodes.len() as u32);
@@ -435,7 +546,7 @@ impl StructureCollector {
             content: NodeContent::Image {
                 description: alt.filter(|s| !s.is_empty()).map(str::to_string),
                 src: src.map(str::to_string),
-                image_index: None,
+                image_index,
             },
             parent,
             children: Vec::new(),
@@ -526,7 +637,8 @@ impl StructureCollector {
     /// Returns `(DocumentStructure, Vec<TableData>)`.  The tables vec contains one entry per
     /// `<table>` element that was processed via [`Self::push_table_data`].
     #[must_use]
-    pub fn finish(self) -> (DocumentStructure, Vec<TableData>) {
+    pub fn finish(mut self) -> (DocumentStructure, Vec<TableData>) {
+        self.finish_loose_paragraph();
         let doc = DocumentStructure {
             nodes: self.nodes,
             source_format: Some("html".to_string()),
@@ -534,7 +646,7 @@ impl StructureCollector {
         (doc, self.tables)
     }
 
-    fn begin_annotation(&mut self, kind: super::document::AnnotationKind) -> u64 {
+    fn begin_annotation(&mut self, kind: AnnotationKind) -> u64 {
         let token = self.next_annotation_token;
         self.next_annotation_token = self.next_annotation_token.wrapping_add(1);
         for capture in self.text_captures.iter_mut().filter(|capture| !capture.suspended) {
@@ -570,17 +682,36 @@ impl StructureCollector {
     fn restore_captures(&mut self, snapshots: &[CaptureSnapshot]) {
         let mut restored = Vec::with_capacity(snapshots.len());
         for snapshot in snapshots {
-            let Some(position) = self.text_captures.iter().position(|capture| capture.id == snapshot.id) else {
-                continue;
-            };
-            let mut capture = self.text_captures.remove(position);
+            let capture = self
+                .text_captures
+                .iter()
+                .position(|capture| capture.id == snapshot.id)
+                .map(|position| self.text_captures.remove(position))
+                .or_else(|| self.completed_captures.as_mut()?.remove(&snapshot.id));
+            let Some(mut capture) = capture else { continue };
             capture.text.truncate(snapshot.text_len);
             capture.annotations.truncate(snapshot.annotations_len);
             capture.open_annotations.truncate(snapshot.open_annotations_len);
             capture.suspended = snapshot.suspended;
+            capture.after_heading_break = snapshot.after_heading_break;
             restored.push(capture);
         }
         self.text_captures = restored;
+    }
+
+    fn release_checkpoints(&mut self, snapshots: &[CaptureSnapshot]) {
+        for snapshot in snapshots {
+            if let Some(capture) = self.text_captures.iter_mut().find(|capture| capture.id == snapshot.id) {
+                capture.checkpoint_refs -= 1;
+            } else if let Some(completed) = self.completed_captures.as_mut()
+                && let std::collections::hash_map::Entry::Occupied(mut entry) = completed.entry(snapshot.id)
+            {
+                entry.get_mut().checkpoint_refs -= 1;
+                if entry.get().checkpoint_refs == 0 {
+                    entry.remove();
+                }
+            }
+        }
     }
 
     fn restore_structure(&mut self, element: &ElementCapture) {

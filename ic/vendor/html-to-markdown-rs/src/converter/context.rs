@@ -37,6 +37,7 @@ pub type InlineCollectorHandle = ();
 pub type ImageMetadataPayload = (BTreeMap<String, String>, Option<u32>, Option<u32>);
 
 pub struct ContextParameters {
+    pub accessible_names: crate::convert_api::AccessibleNamePolicy,
     pub inline_collector: Option<InlineCollectorHandle>,
     #[cfg(feature = "metadata")]
     pub metadata_collector: Option<crate::metadata::MetadataCollectorHandle>,
@@ -153,6 +154,7 @@ pub struct MediaBoundaryState {
 /// about the current position in the document tree, nesting levels, and enabled features.
 #[derive(Clone, Default)]
 pub struct Context {
+    pub(crate) accessible_names: crate::convert_api::AccessibleNamePolicy,
     /// Are we inside a code-like element (pre, code, kbd, samp)?
     pub(crate) in_code: bool,
     /// Are we inside a `<pre>` code BLOCK specifically, as opposed to an inline code SPAN
@@ -168,8 +170,8 @@ pub struct Context {
     pub(crate) in_code_block: bool,
     /// ~keep Link ranges refer to the raw inline-code buffer, before delimiters are emitted (#813).
     pub(super) inline_code_links: Option<Rc<RefCell<Vec<InlineCodeLink>>>>,
-    /// ~keep Direct BR emissions distinguish code split markers from authored newlines (#921, #868).
-    pub(crate) inline_code_breaks: Option<(u32, Rc<Cell<usize>>)>,
+    /// ~keep Direct BR offsets distinguish retained edge breaks from authored newlines (#937, #921, #868).
+    pub(crate) inline_code_breaks: Option<(u32, Rc<RefCell<Vec<usize>>>)>,
     /// ~keep Rendered media labels own a word boundary; recursive walks save their parent state.
     pub(crate) media_boundary: Option<Rc<Cell<MediaBoundaryState>>>,
     /// Output offsets of real `<br>` nodes while a table-cell `<pre>` is collected. ~keep
@@ -477,6 +479,7 @@ impl Context {
         #[cfg(feature = "metadata")]
         let metadata = metadata_preferences(parameters.metadata_collector.as_ref());
         let mut context = Self {
+            accessible_names: parameters.accessible_names,
             convert_as_inline: options.convert_as_inline,
             #[cfg(feature = "inline-images")]
             inline_collector: parameters.inline_collector,
@@ -751,6 +754,7 @@ mod inline_buffer_tests {
         Context::new(
             &crate::ConversionOptions::default(),
             ContextParameters {
+                accessible_names: Default::default(),
                 inline_collector: None,
                 #[cfg(feature = "metadata")]
                 metadata_collector: None,

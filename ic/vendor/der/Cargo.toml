@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.85"
 name = "der"
-version = "0.8.2"
+version = "0.8.3"
 authors = ["RustCrypto Developers"]
 build = false
 autolib = false
@@ -81,6 +81,10 @@ name = "der"
 path = "src/lib.rs"
 
 [[test]]
+name = "ber"
+path = "tests/ber.rs"
+
+[[test]]
 name = "datetime"
 path = "tests/datetime.rs"
 
@@ -93,6 +97,10 @@ name = "derive_no_alloc"
 path = "tests/derive_no_alloc.rs"
 
 [[test]]
+name = "document"
+path = "tests/document.rs"
+
+[[test]]
 name = "nesting"
 path = "tests/nesting.rs"
 
@@ -103,6 +111,10 @@ path = "tests/pem.rs"
 [[test]]
 name = "set_of"
 path = "tests/set_of.rs"
+
+[[test]]
+name = "value_ord"
+path = "tests/value_ord.rs"
 
 [dependencies.arbitrary]
 version = "1.4.2"

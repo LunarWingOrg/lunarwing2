@@ -693,7 +693,7 @@ pub mod utils {
             let data_range = start as usize..end;
             data.get(data_range).ok_or(Error::InvalidCodeSectionSize)
         };
-        for section in parser.parse_all(data) {
+        for section in parser.clone().parse_all(data) {
             match section? {
                 wasmparser::Payload::Version {
                     encoding: wasmparser::Encoding::Module,
@@ -849,7 +849,7 @@ pub mod utils {
                     // that users overriding `parse_code_section` always get
                     // that function called.
                     let section = get_original_section(unchecked_range.clone())?;
-                    let reader = wasmparser::BinaryReader::new(section, unchecked_range.start);
+                    let reader = parser.binary_reader(section, unchecked_range.start);
                     let section = wasmparser::CodeSectionReader::new(reader)?;
                     reencoder.parse_code_section(&mut codes, section)?;
                     module.section(&codes);
@@ -945,7 +945,23 @@ pub mod utils {
         Ok(crate::MemArg {
             offset: arg.offset,
             align: arg.align.into(),
-            memory_index: reencoder.memory_index(arg.memory)?,
+            target: match arg.target {
+                wasmparser::MemArgTarget::Memory(i) => {
+                    crate::MemArgTarget::Memory(reencoder.memory_index(i)?)
+                }
+                wasmparser::MemArgTarget::Array(ty) => {
+                    crate::MemArgTarget::Array(reencoder.type_index(ty)?)
+                }
+            },
+            ordering: match arg.ordering {
+                None => None,
+                Some(wasmparser::MemArgOrdering::Op(o)) => {
+                    Some(crate::MemArgOrdering::Op(reencoder.ordering(o)?))
+                }
+                Some(wasmparser::MemArgOrdering::Rmw(o)) => {
+                    Some(crate::MemArgOrdering::Rmw(reencoder.ordering(o)?))
+                }
+            },
         })
     }
 
