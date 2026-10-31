@@ -1596,7 +1596,8 @@ cleanup_candidate_workers() {  # <name>
   [[ "${#lanes[@]}" -gt 0 ]] || return 0
   if [[ -n "${CONTAINER_RT:-}" && -n "$(command -v "$CONTAINER_RT" 2>/dev/null)" ]]; then
     for lane in "${lanes[@]}"; do
-      candidate_ref="$(upgrade_candidate_tag_prefix "$name")-$lane"
+      _upgrade_validate_lane "$lane" || continue
+      candidate_ref="$(upgrade_candidate_image_ref "$name" "$lane")"
       "$CONTAINER_RT" rmi "$candidate_ref" >/dev/null 2>&1 || true
     done
   fi

@@ -665,9 +665,28 @@ build_tenant() {
 # Promotion is a retag of the already-built image, so a promote failure is still
 # recoverable by re-running it.
 
-# Candidate tag prefix for this run. One per upgrade attempt; re-runs replace it.
-upgrade_candidate_tag_prefix() {  # <tenant>
-  printf '%s/worker-candidate' "$(tenant_state_dir "$1")"
+# Candidate image tag suffix for this upgrade run. Uses a per-tenant tag
+# (wi527-<tenant>) rather than a filesystem path so the result is a valid image
+# reference — a tag cannot contain '/' (run-291 TD-1). One per upgrade attempt;
+# re-runs replace it via the promote/cleanup cycle.
+_upgrade_candidate_tag_suffix() {  # <tenant>
+  printf 'wi527-%s' "$1"
+}
+
+# Full candidate image reference for <lane> on <tenant>. Built by
+# build_candidate_worker, promoted by promote_candidate_workers, removed by
+# cleanup_candidate_workers — all share this one helper (run-291 TD-1).
+upgrade_candidate_image_ref() {  # <tenant> <lane>
+  printf 'lunarwing-worker-%s:%s' "$2" "$(_upgrade_candidate_tag_suffix "$1")"
+}
+
+# Validate a lane name against the fixed set (run-291 TD-2: lane names flow into
+# podman tag/rmi and must not be attacker-controlled).
+_upgrade_validate_lane() {  # <lane>
+  case "$1" in
+    pebble|opencode|kimi|opencode2) return 0 ;;
+    *) die "unknown worker lane '$1'" ;;
+  esac
 }
 
 # Build <lane>'s image to this run's candidate tag and record it.
@@ -675,8 +694,9 @@ upgrade_candidate_tag_prefix() {  # <tenant>
 build_candidate_worker() {
   local name="$1" lane="$2" with_toolchains="${3:-false}"
   local lw_root tag rc=0
+  _upgrade_validate_lane "$lane"
   lw_root="$(tenant_lw_root "$name")"
-  tag="$(upgrade_candidate_tag_prefix "$name")-$lane"
+  tag="$(upgrade_candidate_image_ref "$name" "$lane")"
   case "$lane" in
     pebble)    LUNARWING_WORKER_IMAGE_TAG="$tag" build_pebble_worker "false" "$with_toolchains" || rc=$? ;;
     opencode)  LUNARWING_WORKER_IMAGE_TAG="$tag" build_opencode_worker "false" "$with_toolchains" "$lw_root" || rc=$? ;;
@@ -724,7 +744,8 @@ promote_candidate_workers() {  # <tenant>
   fi
   ensure_container_runtime
   for lane in "${lanes[@]}"; do
-    candidate_ref="$(upgrade_candidate_tag_prefix "$name")-$lane"
+    _upgrade_validate_lane "$lane"
+    candidate_ref="$(upgrade_candidate_image_ref "$name" "$lane")"
     latest_ref="$(worker_image_ref "$lane" latest)"
     if ! "$CONTAINER_RT" image inspect "$candidate_ref" >/dev/null 2>&1; then
       die "candidate image $candidate_ref is missing; cannot promote lane '$lane'"
