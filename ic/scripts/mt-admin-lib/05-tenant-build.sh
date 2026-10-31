@@ -492,6 +492,64 @@ _vendor_guarded_cargo_build() {  # <repo> <cargo-root> [extra cargo build args..
     "$root" "$guard" "$guard" "$guard_args" "$build" "$guard" "$guard_args" "$build"
 }
 
+# WI#527: which build stages a `build_tenant` run has completed. Recorded to a
+# per-tenant file rather than a shell array because the upgrade path runs
+# build_tenant inside a captured subshell (to keep errexit and return a status)
+# and the external wrapper (ic/scripts/upgrade-tenant.sh) is a separate process
+# that must classify the same failure. build_tenant truncates the file on entry
+# and appends one line per completed stage. Stage names: daemon, bridge, wasm,
+# worker:<lane>. Callers use this to decide whether an in-place restart would
+# start the NEW daemon binary, instead of parsing error prose (run-287 SX-1/SX-4).
+# Worker lanes built to candidate tags before the stop are recorded separately
+# (see TENANT_CANDIDATE_LANES_FILE) so the post-stop build cannot erase them.
+tenant_build_stage_file() {
+  printf '%s' "${LUNARWING_MT_BUILD_STAGE_FILE:-$(tenant_state_dir "$1")/last-build-stages}"
+}
+
+tenant_candidate_lanes_file() {
+  printf '%s' "${LUNARWING_MT_CANDIDATE_LANES_FILE:-$(tenant_state_dir "$1")/last-candidate-lanes}"
+}
+
+_build_stage_log_path() {  # <name>
+  local path
+  path="$(tenant_build_stage_file "$1")"
+  mkdir -p "$(dirname "$path")"
+  printf '%s' "$path"
+}
+
+_record_build_stage() {  # <name> <stage>
+  printf '%s\n' "$2" >>"$(_build_stage_log_path "$1")"
+}
+
+# WI#527: the last stage a build_tenant run completed for <name>:
+# "daemon", "bridge", "wasm", "worker:<lane>", or "none" when nothing completed.
+upgrade_last_completed_stage() {  # <name>
+  local file last=""
+  file="$(tenant_build_stage_file "$1")"
+  [[ -r "$file" ]] || { printf 'none'; return 0; }
+  last="$(grep -v '^[[:space:]]*$' "$file" 2>/dev/null | tail -n 1 || true)"
+  printf '%s' "${last:-none}"
+}
+
+# WI#527: did the run build (and therefore leave on disk) the new lunarwing
+# daemon binary? When true, an in-place restart starts the new code and applies
+# the target commit's migrations, so a failure must never be reported as
+# "restored to previous".
+upgrade_daemon_stage_completed() {  # <name>
+  local file
+  file="$(tenant_build_stage_file "$1")"
+  [[ -r "$file" ]] || return 1
+  grep -qx 'daemon' "$file" 2>/dev/null
+}
+
+# WI#527: worker lanes built to candidate tags before the stop, oldest first.
+upgrade_candidate_lanes() {  # <name>
+  local file
+  file="$(tenant_candidate_lanes_file "$1")"
+  [[ -r "$file" ]] || return 0
+  grep -v '^[[:space:]]*$' "$file" 2>/dev/null || true
+}
+
 build_tenant() {
   local name="$1"
   local with_wasm="${2:-false}"
@@ -504,6 +562,8 @@ build_tenant() {
   local repo
   repo="$(tenant_repo "$name")"
 
+  # WI#527: stage markers are per-run; an empty file means "nothing built yet".
+  : >"$(_build_stage_log_path "$name")"
   if [[ "$require_wasm" == "true" && "$with_wasm" != "true" ]]; then
     die "--require-wasm requires --with-wasm"
   fi
@@ -519,10 +579,12 @@ build_tenant() {
     say "building lunarwing for $name ..."
     _run_tenant_build "$name" "$cargo_env $(_vendor_guarded_cargo_build "$repo" "$repo" --bin lunarwing)" \
       || die "lunarwing build failed for $name"
+    _record_build_stage "$name" daemon
 
     say "building xmpp-bridge for $name ..."
     _run_tenant_build "$name" "$cargo_env $(_vendor_guarded_cargo_build "$repo" "$repo/bridges/xmpp-bridge")" \
       || die "xmpp-bridge build failed for $name"
+    _record_build_stage "$name" bridge
 
     if [[ "$with_wasm" == "true" ]]; then
       if ensure_tenant_wasm_toolchain "$name"; then
@@ -539,6 +601,7 @@ build_tenant() {
         if [[ "$wasm_build_ok" == "true" ]]; then
           say "installing WASM extensions for $name ..."
           install_wasm_tenant "$name"
+          _record_build_stage "$name" wasm
         else
           say "WARNING: skipping WASM install for $name; existing installed artifacts were preserved" >&2
         fi
@@ -591,6 +654,87 @@ build_tenant() {
     say "--- Auto-migrating owner scope ---"
     migrate_owner_scope "$name" || say "WARNING: owner-scope migration failed (run 'migrate-owner-scope $name' manually)"
   fi
+}
+
+# ── WI#527: pre-stop candidate worker images ─────────────────────────────────
+# The upgrade path builds every selected worker image to a per-run candidate tag
+# WHILE the tenant still runs, then stops, rebuilds the daemon, and promotes the
+# candidates only after every selected lane succeeded (run-287 SX-2). Image
+# builds never needed the tenant down; building them before the stop means a
+# lane build failure leaves the tenant running on its untouched :latest images.
+# Promotion is a retag of the already-built image, so a promote failure is still
+# recoverable by re-running it.
+
+# Candidate tag prefix for this run. One per upgrade attempt; re-runs replace it.
+upgrade_candidate_tag_prefix() {  # <tenant>
+  printf '%s/worker-candidate' "$(tenant_state_dir "$1")"
+}
+
+# Build <lane>'s image to this run's candidate tag and record it.
+# Usage: build_candidate_worker <tenant> <lane> <with_toolchains>
+build_candidate_worker() {
+  local name="$1" lane="$2" with_toolchains="${3:-false}"
+  local lw_root tag rc=0
+  lw_root="$(tenant_lw_root "$name")"
+  tag="$(upgrade_candidate_tag_prefix "$name")-$lane"
+  case "$lane" in
+    pebble)    LUNARWING_WORKER_IMAGE_TAG="$tag" build_pebble_worker "false" "$with_toolchains" || rc=$? ;;
+    opencode)  LUNARWING_WORKER_IMAGE_TAG="$tag" build_opencode_worker "false" "$with_toolchains" "$lw_root" || rc=$? ;;
+    kimi)      LUNARWING_WORKER_IMAGE_TAG="$tag" build_kimi_worker "false" "$with_toolchains" "" "$lw_root" || rc=$? ;;
+    opencode2) LUNARWING_WORKER_IMAGE_TAG="$tag" build_opencode2_worker "false" "$with_toolchains" "$lw_root" || rc=$? ;;
+    *)         die "unknown worker lane '$lane'" ;;
+  esac
+  [[ "$rc" -eq 0 ]] || return "$rc"
+  mkdir -p "$(dirname "$(tenant_candidate_lanes_file "$name")")"
+  printf '%s\n' "$lane" >>"$(tenant_candidate_lanes_file "$name")"
+}
+
+# Build every selected lane's candidate image, recording each success. Fails at
+# the first failing lane with that lane named, leaving the tenant untouched.
+# Usage: build_candidate_workers <tenant> <with_opencode> <with_kimi> <with_opencode2> [with_pebble] [with_toolchains]
+build_candidate_workers() {
+  local name="$1" with_opencode="$2" with_kimi="$3" with_opencode2="$4"
+  local with_pebble="${5:-false}" with_toolchains="${6:-false}"
+  : >"$(tenant_candidate_lanes_file "$name")"
+  local lane
+  for lane in pebble opencode kimi opencode2; do
+    case "$lane" in
+      pebble)    [[ "$with_pebble" == true ]] || continue ;;
+      opencode)  [[ "$with_opencode" == true ]] || continue ;;
+      kimi)      [[ "$with_kimi" == true ]] || continue ;;
+      opencode2) [[ "$with_opencode2" == true ]] || continue ;;
+    esac
+    say ""
+    say "=== Building $lane worker candidate image (tenant still running) ==="
+    build_candidate_worker "$name" "$lane" "$with_toolchains" \
+      || die "$lane worker image candidate build failed; tenant '$name' has not been stopped"
+  done
+}
+
+# Promote every recorded candidate lane to :latest. Idempotent and re-runnable;
+# only a successful candidate build is ever promoted, so a failed run can never
+# leave :latest pointing at a partial image.
+promote_candidate_workers() {  # <tenant>
+  local name="$1" lane candidate_ref latest_ref
+  local -a lanes=()
+  mapfile -t lanes < <(upgrade_candidate_lanes "$name")
+  if [[ "${#lanes[@]}" -eq 0 ]]; then
+    say "no candidate worker images to promote for '$name'"
+    return 0
+  fi
+  ensure_container_runtime
+  for lane in "${lanes[@]}"; do
+    candidate_ref="$(upgrade_candidate_tag_prefix "$name")-$lane"
+    latest_ref="$(worker_image_ref "$lane" latest)"
+    if ! "$CONTAINER_RT" image inspect "$candidate_ref" >/dev/null 2>&1; then
+      die "candidate image $candidate_ref is missing; cannot promote lane '$lane'"
+    fi
+    "$CONTAINER_RT" tag "$candidate_ref" "$latest_ref" \
+      || die "cannot promote $candidate_ref to $latest_ref"
+    "$CONTAINER_RT" rmi "$candidate_ref" >/dev/null 2>&1 || true
+    say "promoted $latest_ref"
+  done
+  : >"$(tenant_candidate_lanes_file "$name")"
 }
 
 # ── Darkirc daemon build (shared, not per-tenant) ────────────────────────────
@@ -1139,6 +1283,19 @@ _worker_source_revision() {
   printf '%s' "$revision"
 }
 
+# WI#527: the image tag a worker build writes. Defaults to :latest so every
+# existing caller (build-tenant, build-all, per-lane verbs) is unchanged; the
+# upgrade path sets LUNARWING_WORKER_IMAGE_TAG to a candidate tag so the images
+# build while the tenant still runs and are promoted only after every selected
+# lane has succeeded (run-287 SX-2).
+worker_image_tag() {
+  printf '%s' "${LUNARWING_WORKER_IMAGE_TAG:-latest}"
+}
+
+worker_image_ref() {  # <lane> [tag]
+  printf 'lunarwing-worker-%s:%s' "$1" "${2:-$(worker_image_tag)}"
+}
+
 build_pebble_worker() {
   local no_cache="${1:-false}"
   local with_toolchains="${2:-false}"
@@ -1161,20 +1318,24 @@ build_pebble_worker() {
   [[ "$with_toolchains" == "true" ]] && toolchain_args=(--build-arg WITH_TOOLCHAINS=true)
 
   # Fat builds target a candidate tag first: the toolchain smoke gate below
-  # must pass before the image is re-tagged :latest, so a failed probe can
-  # never replace the previous good image (WI#334).
-  local target_tag="lunarwing-worker-pebble:latest"
-  local candidate_tag="lunarwing-worker-pebble:candidate"
-  [[ "$with_toolchains" == "true" ]] && target_tag="$candidate_tag"
+  # must pass before the image is re-tagged to the build's output tag, so a
+  # failed probe can never replace the previous good image (WI#334).
+  # WI#527: the output tag honours LUNARWING_WORKER_IMAGE_TAG (upgrade builds
+  # write a candidate tag and promote after every lane succeeded).
+  local output_tag fat_candidate build_tag
+  output_tag="$(worker_image_ref pebble)"
+  fat_candidate="$(worker_image_ref pebble candidate)"
+  build_tag="$output_tag"
+  [[ "$with_toolchains" == "true" ]] && build_tag="$fat_candidate"
 
   if [[ "$CONTAINER_RT" == "podman" ]]; then
     # --network=host: podman's default build network
     # can't reach the internet for RUN steps on this host; the host netns has IPv4.
     # --format docker (O4): preserve the Dockerfile HEALTHCHECK (podman OCI drops it).
-    podman build $cache_flag "${toolchain_args[@]}" "${revision_args[@]}" --network=host --format docker -t "$target_tag" -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
+    podman build $cache_flag "${toolchain_args[@]}" "${revision_args[@]}" --network=host --format docker -t "$build_tag" -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
       || die "pebble worker image build failed"
   else
-    docker build $cache_flag "${toolchain_args[@]}" "${revision_args[@]}" -t "$target_tag" -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
+    docker build $cache_flag "${toolchain_args[@]}" "${revision_args[@]}" -t "$build_tag" -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
       || die "pebble worker image build failed"
   fi
 
@@ -1191,14 +1352,14 @@ build_pebble_worker() {
     # script.
     local smoke_script="${LUNARWING_PEBBLE_TOOLCHAIN_SMOKE:-$pebble_dir/scripts/smoke-task-shell-toolchain.sh}"
     say "smoke-checking task-shell toolchain anchors (WI#334) ..."
-    CONTAINER_RT="$CONTAINER_RT" "$smoke_script" image "$candidate_tag" \
+    CONTAINER_RT="$CONTAINER_RT" "$smoke_script" image "$fat_candidate" \
       || die "pebble worker task-shell toolchain smoke check failed (WI#334)"
-    "$CONTAINER_RT" tag "$candidate_tag" lunarwing-worker-pebble:latest \
+    "$CONTAINER_RT" tag "$fat_candidate" "$output_tag" \
       || die "pebble worker image tag failed"
-    "$CONTAINER_RT" rmi "$candidate_tag" >/dev/null 2>&1 || true
+    "$CONTAINER_RT" rmi "$fat_candidate" >/dev/null 2>&1 || true
   fi
 
-  say "pebble worker image built: lunarwing-worker-pebble:latest [$toolchain_desc] (revision $source_revision)"
+  say "pebble worker image built: $output_tag [$toolchain_desc] (revision $source_revision)"
 }
 
 build_opencode_worker() {
@@ -1224,6 +1385,11 @@ build_opencode_worker() {
   local -a toolchain_args=()
   [[ "$with_toolchains" == "true" ]] && toolchain_args=(--build-arg WITH_TOOLCHAINS=true)
 
+  local -a toolchain_args=()
+  [[ "$with_toolchains" == "true" ]] && toolchain_args=(--build-arg WITH_TOOLCHAINS=true)
+  local output_tag
+  output_tag="$(worker_image_ref opencode)"
+
   if [[ "$CONTAINER_RT" == "podman" ]]; then
     local -a layer_args=()
     if [[ "$no_cache" == "true" ]]; then
@@ -1236,14 +1402,14 @@ build_opencode_worker() {
       fi
       layer_args=(--layers=false)
     fi
-    podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" --network=host --format docker -t lunarwing-worker-opencode:latest "$opencode_dir" \
+    podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" --network=host --format docker -t "$output_tag" "$opencode_dir" \
       || die "opencode worker image build failed"
   else
-    docker build "${cache_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" -t lunarwing-worker-opencode:latest "$opencode_dir" \
+    docker build "${cache_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" -t "$output_tag" "$opencode_dir" \
       || die "opencode worker image build failed"
   fi
 
-  say "opencode worker image built: lunarwing-worker-opencode:latest [$toolchain_desc] (revision $source_revision)"
+  say "opencode worker image built: $output_tag [$toolchain_desc] (revision $source_revision)"
 }
 
 _opencode2_snapshot_source() {
@@ -1427,7 +1593,11 @@ build_opencode2_worker() {
 
   # A per-build tag and --iidfile avoid cross-build verification races. Verify
   # and promote only the immutable ID; the friendly tag is never trusted.
-  local candidate_tag="lunarwing-worker-opencode2:candidate-$$" iid_file image_id
+  # WI#527: the verified ID is tagged at the build's output tag (candidate on the
+  # upgrade path, :latest otherwise) so a pre-stop build never disturbs the
+  # running lane's image until every selected lane succeeded.
+  local candidate_tag="lunarwing-worker-opencode2:candidate-$$" iid_file image_id output_tag
+  output_tag="$(worker_image_ref opencode2)"
   iid_file="$(mktemp "${TMPDIR:-/tmp}/lw-opencode2-iid.XXXXXX")" \
     || die "cannot create opencode2 image-id file"
   local -a identity_args=(--iidfile "$iid_file")
@@ -1462,11 +1632,11 @@ build_opencode2_worker() {
     "$CONTAINER_RT" rmi "$candidate_tag" >/dev/null 2>&1 || true
     die "out-of-band opencode2 image verification FAILED for $image_id (WI#425)"
   fi
-  "$CONTAINER_RT" tag "$image_id" lunarwing-worker-opencode2:latest \
-    || die "cannot re-tag verified $image_id as lunarwing-worker-opencode2:latest"
+  "$CONTAINER_RT" tag "$image_id" "$output_tag" \
+    || die "cannot re-tag verified $image_id as $output_tag"
   "$CONTAINER_RT" rmi "$candidate_tag" >/dev/null 2>&1 || true
 
-  say "opencode2 worker image built: lunarwing-worker-opencode2:latest [$toolchain_desc] (revision $source_revision)"
+  say "opencode2 worker image built: $output_tag [$toolchain_desc] (revision $source_revision)"
 }
 
 build_kimi_worker() {
@@ -1497,6 +1667,8 @@ build_kimi_worker() {
 
   local -a version_args=()
   [[ -z "$kimi_code_version" ]] || version_args=(--build-arg KIMI_CODE_VERSION="${kimi_code_version}")
+  local output_tag
+  output_tag="$(worker_image_ref kimi)"
 
   if [[ "$CONTAINER_RT" == "podman" ]]; then
     local -a layer_args=()
@@ -1507,14 +1679,14 @@ build_kimi_worker() {
       fi
       layer_args=(--layers=false)
     fi
-    podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" "${version_args[@]}" "${revision_args[@]}" --network=host --format docker -t lunarwing-worker-kimi:latest "$kimi_dir" \
+    podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" "${version_args[@]}" "${revision_args[@]}" --network=host --format docker -t "$output_tag" "$kimi_dir" \
       || die "kimi worker image build failed"
   else
-    docker build "${cache_args[@]}" "${toolchain_args[@]}" "${version_args[@]}" "${revision_args[@]}" -t lunarwing-worker-kimi:latest "$kimi_dir" \
+    docker build "${cache_args[@]}" "${toolchain_args[@]}" "${version_args[@]}" "${revision_args[@]}" -t "$output_tag" "$kimi_dir" \
       || die "kimi worker image build failed"
   fi
 
-  say "kimi worker image built: lunarwing-worker-kimi:latest [$toolchain_desc] (revision $source_revision)"
+  say "kimi worker image built: $output_tag [$toolchain_desc] (revision $source_revision)"
 }
 
 # ── WASM install ─────────────────────────────────────────────────────────────

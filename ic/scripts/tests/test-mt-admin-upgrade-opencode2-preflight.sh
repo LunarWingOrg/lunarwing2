@@ -54,6 +54,14 @@ render_tenant_units() { :; }
 patch_tenant_env() { :; }
 refresh_deployed_health_pipeline() { :; }
 recover_failed_tenant_checkout() { :; }
+# WI#527: candidates build pre-stop; stubbed here (this harness pins the floor
+# preflight, not the candidate build itself).
+tenant_state_dir() { printf '%s\n' "$fixture/state"; }
+mkdir -p "$fixture/state"
+build_candidate_workers() { printf 'candidates\n' >>"$events"; }
+promote_candidate_workers() { :; }
+cleanup_candidate_workers() { :; }
+upgrade_candidate_lanes() { :; }
 
 # opencode2 is the ONLY enabled worker in this fixture.
 tenant_worker_enabled() { [[ "$1" == "fixture" && "$2" == "opencode2" ]]; }

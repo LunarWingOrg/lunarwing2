@@ -1565,6 +1565,113 @@ _upgrade_tenant_lifecycle_locked() {
   return "$upgrade_rc"
 }
 
+# ── WI#527: pre-stop candidate builds and post-stop convergence ──────────────
+# upgrade-tenant used to stop first and rebuild second, so any lane build failure
+# stranded the tenant with every lane down (WI#456 SF-4). The upgrade now checks
+# out the target and builds every selected worker image to a candidate tag while
+# the tenant still runs, stops, rebuilds only the daemon/bridge/WASM, promotes
+# the candidates once all of them exist, and converges on a failure by what was
+# actually built (stage markers), never by matching die prose.
+
+# Check out <commit> as the tenant user. Returns non-zero instead of dying so a
+# pre-stop abort can restore the previous commit and a recovery can report it.
+_upgrade_checkout() {  # <name> <lw_root> <ref-name> <commit> <create-branch:true|false>
+  local name="$1" lw_root="$2" ref_name="$3" commit="$4" create_branch="${5:-false}"
+  local tgit=(sudo -u "$name" git -c safe.directory="$lw_root" -C "$lw_root")
+  if [[ "$create_branch" == true ]]; then
+    # Branch on origin: (re)create the local branch on the pinned fetched commit
+    # so concurrent ref updates cannot change the deployed source.
+    "${tgit[@]}" checkout -B "$ref_name" "$commit"
+  else
+    "${tgit[@]}" checkout "$commit"
+  fi
+}
+
+# Discard this run's candidate worker images. Best effort: a stale candidate
+# never affects the running lanes, which still point at :latest.
+cleanup_candidate_workers() {  # <name>
+  local name="$1" lane candidate_ref
+  local -a lanes=()
+  mapfile -t lanes < <(upgrade_candidate_lanes "$name")
+  [[ "${#lanes[@]}" -gt 0 ]] || return 0
+  if [[ -n "${CONTAINER_RT:-}" && -n "$(command -v "$CONTAINER_RT" 2>/dev/null)" ]]; then
+    for lane in "${lanes[@]}"; do
+      candidate_ref="$(upgrade_candidate_tag_prefix "$name")-$lane"
+      "$CONTAINER_RT" rmi "$candidate_ref" >/dev/null 2>&1 || true
+    done
+  fi
+  : >"$(tenant_candidate_lanes_file "$name")"
+}
+
+# Build every selected worker image to a candidate tag while the tenant runs.
+# On failure, discard the candidates and return the clone to <previous_commit>,
+# so the running tenant is exactly as it was. Never dies.
+upgrade_build_candidates_prestop() {  # <name> <lw_root> <previous_commit> <pebble> <oc> <kimi> <oc2>
+  local name="$1" lw_root="$2" previous_commit="$3"
+  local pebble="$4" oc="$5" kimi="$6" oc2="$7"
+  local rc=0 caller_errexit=false
+  [[ $- != *e* ]] || caller_errexit=true
+  set +e
+  ( set -e; build_candidate_workers "$name" "$oc" "$kimi" "$oc2" "$pebble" "false" )
+  rc=$?
+  if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
+  [[ "$rc" -eq 0 ]] && return 0
+  say "worker candidate build failed; discarding candidates and restoring the previous checkout (tenant was not stopped)" >&2
+  cleanup_candidate_workers "$name"
+  _upgrade_checkout "$name" "$lw_root" "$previous_commit" "$previous_commit" false \
+    || say "WARNING: could not return the clone to $previous_commit; tenant '$name' is still running its previous build" >&2
+  return "$rc"
+}
+
+# Converge after a post-stop upgrade step failed: restart the tenant on its
+# previous build, then die with a message naming the cause and the real state.
+#
+# run-287 SX-1: an in-place restart is only honest while the NEW daemon binary
+# has not been built. Once the daemon stage completed, a restart runs the target
+# binary and applies the target's migrations, so this path rebuilds the previous
+# commit before starting. If even that fails, the tenant is reported stopped
+# with explicit rollback commands — never as "restored".
+upgrade_converge_after_failure() {  # <name> <lw_root> <previous_commit> <cause>
+  local name="$1" lw_root="$2" previous_commit="$3" cause="$4"
+  local repo describe_prev rc=0 caller_errexit=false
+  repo="$(tenant_repo "$name")"  describe_prev="$(sudo -u "$name" git -c safe.directory="$lw_root" -C "$lw_root" \
+    describe --tags --always "$previous_commit" 2>/dev/null || printf '%s' "$previous_commit")"
+  [[ $- != *e* ]] || caller_errexit=true
+
+  if ! upgrade_daemon_stage_completed "$name"; then
+    say "" >&2
+    say "upgrade aborted: $cause; the new daemon was not built, restarting tenant '$name' on its previous build (WI#527) ..." >&2
+    set +e
+    ( start_tenant "$name" )
+    rc=$?
+    if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
+    cleanup_candidate_workers "$name"
+    if [[ "$rc" -eq 0 ]]; then
+      die "upgrade aborted: $cause; tenant '$name' is running its previous build ($describe_prev)"
+    fi
+    die "upgrade aborted: $cause; automatic restart FAILED — tenant '$name' remains stopped. Fix the failure and run: $0 start-tenant $name"
+  fi
+
+  say "" >&2
+  say "upgrade aborted: $cause; the new daemon was built, so restoring tenant '$name' to $describe_prev by rebuilding it (WI#527) ..." >&2
+  set +e
+  (
+    set -e
+    _upgrade_checkout "$name" "$lw_root" "$previous_commit" "$previous_commit" false
+    build_tenant "$name" "true" "false" "false" "false" "false" "true" "false"
+    render_tenant_units "$name"
+    patch_tenant_env "$name"
+    start_tenant "$name"
+  )
+  rc=$?
+  if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
+  cleanup_candidate_workers "$name"
+  if [[ "$rc" -eq 0 ]]; then
+    die "upgrade aborted: $cause; tenant '$name' was automatically restored and is running $describe_prev"
+  fi
+  die "upgrade aborted: $cause; automatic restore FAILED — tenant '$name' remains stopped. Roll back with: sudo -u $name git -C $lw_root checkout $previous_commit && $0 build-tenant $name --with-wasm --require-wasm && $0 start-tenant $name"
+}
+
 upgrade_tenant_locked() {
   local name="$1" target="$2" source_repo="$3" do_backup="$4" do_render="$5"
   local lw_root repo
@@ -1634,30 +1741,12 @@ upgrade_tenant_locked() {
   fi
 
   # WI#456: preflight the opencode2 builder floor while the tenant still runs.
-  # build_tenant rebuilds pebble/opencode/kimi first and only then reaches the
-  # opencode2 build gate, so a below-floor builder used to surface after
-  # stop_tenant had already taken every lane down. Refuse here instead.
+  # build_opencode2_worker refuses a below-floor builder; the pre-stop candidate
+  # build below would otherwise surface it after every lane was built.
   if tenant_worker_enabled "$name" opencode2; then
     opencode2_builder_supported \
       || die "$OPENCODE2_BUILDER_FLOOR_PROBLEM; tenant '$name' was not stopped"
   fi
-
-  stop_tenant "$name" || die "stop failed; not upgrading '$name'"
-
-  say "checking out $target at $target_commit (as $name) ..."
-  if [[ "$checkout_ref" != "$target" ]]; then
-    # Branch on origin: (re)create the local branch on the pinned fetched
-    # commit so concurrent ref updates cannot change the deployed source.
-    "${tgit[@]}" checkout -B "$target" "$target_commit" \
-      || recover_failed_tenant_checkout "$name" "$lw_root" "$target" "$previous_commit"
-  else
-    "${tgit[@]}" checkout "$target_commit" \
-      || recover_failed_tenant_checkout "$name" "$lw_root" "$target" "$previous_commit"
-  fi
-  [[ -d "$repo/migrations" ]] || die "ic/migrations missing after checkout — wrong ref?"
-  say "  now at: $("${tgit[@]}" describe --tags --always 2>/dev/null)"
-  flock -u "$build_lock_fd" || die "failed to release build lock after checkout"
-  exec {build_lock_fd}>&-
 
   local with_opencode="false"
   if tenant_worker_enabled "$name" opencode; then
@@ -1671,19 +1760,78 @@ upgrade_tenant_locked() {
   if tenant_worker_enabled "$name" opencode2; then
     with_opencode2="true"
   fi
-  build_tenant "$name" "true" "false" "$with_opencode" "$with_kimi" "false" "true" "$with_opencode2" \
-    || die "build failed for $name; aborting upgrade (tenant left stopped at $target_commit; fix the build and re-run upgrade-tenant)"
+  local with_pebble="false"
+  if tenant_worker_enabled "$name" pebble; then
+    with_pebble="true"
+  fi
 
+  # WI#527 (run-287 SX-2): check out the target and build every selected worker
+  # image to a candidate tag WHILE the tenant still runs. Image builds do not
+  # need the tenant down, so any lane build failure is now a no-op for a running
+  # tenant (the checkout is reverted and the candidates discarded) instead of a
+  # stranding stop-then-fail.
+  say "checking out $target at $target_commit (as $name) ..."
+  if [[ "$checkout_ref" != "$target" ]]; then
+    _upgrade_checkout "$name" "$lw_root" "$target" "$target_commit" true
+  else
+    _upgrade_checkout "$name" "$lw_root" "$target" "$target_commit" false
+  fi || recover_failed_tenant_checkout "$name" "$lw_root" "$target" "$previous_commit"
+  [[ -d "$repo/migrations" ]] || die "ic/migrations missing after checkout — wrong ref?"
+  say "  now at: $("${tgit[@]}" describe --tags --always 2>/dev/null)"
+
+  upgrade_build_candidates_prestop "$name" "$lw_root" "$previous_commit" \
+    "$with_pebble" "$with_opencode" "$with_kimi" "$with_opencode2" \
+    || die "worker image candidate build failed; tenant '$name' was not stopped and is unchanged"
+
+  # The candidate builds only read the checkout; the build lock guards the
+  # checkout/build sequence, which is over. Release it before build_tenant,
+  # which takes it again for the daemon build (a nested flock would deadlock).
+  flock -u "$build_lock_fd" || die "failed to release build lock after candidate build"
+  exec {build_lock_fd}>&-
+
+  # The whole candidate build ran while the tenant was up; only now is it taken
+  # down. Everything past this point converges through upgrade_converge_after_failure.
+  stop_tenant "$name" || die "stop failed; not upgrading '$name'"
+  say "building the target daemon, bridge and WASM for $name (tenant stopped) ..."
+  local build_log
+  build_log="$(mktemp "${TMPDIR:-/tmp}/lw-upgrade-build.XXXXXX")" \
+    || die "cannot create upgrade build log; tenant '$name' remains stopped"
+  local build_rc=0 caller_errexit=false
+  [[ $- != *e* ]] || caller_errexit=true
+  set +e
+  ( set -e; build_tenant "$name" "true" "false" "false" "false" "false" "true" "false" ) 2>&1 \
+    | tee "$build_log"
+  build_rc=${PIPESTATUS[0]}
+  if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
+  if [[ "$build_rc" -ne 0 ]]; then
+    upgrade_converge_after_failure "$name" "$lw_root" "$previous_commit" \
+      "target build failed (exit $build_rc); build log: $build_log"
+  fi
+  rm -f "$build_log"
+
+  # Promote only after the daemon binary exists, so the new daemon and the new
+  # worker images switch together. A promote failure is recoverable by re-running
+  # `$0 promote-worker-images <name>`.
+  promote_candidate_workers "$name" \
+    || upgrade_converge_after_failure "$name" "$lw_root" "$previous_commit" "worker image promotion failed"
+
+  local post_rc=0
+  set +e
   if [[ "$do_render" == "true" ]]; then
     render_tenant_units "$name"
   else
     say "skipping ordinary render-units (--skip-render)"
   fi
+  post_rc=$?
+  if [[ "$post_rc" -eq 0 ]]; then patch_tenant_env "$name"; post_rc=$?; fi
+  if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
+  if [[ "$post_rc" -ne 0 ]]; then
+    upgrade_converge_after_failure "$name" "$lw_root" "$previous_commit" \
+      "unit render/env patch failed (exit $post_rc)"
+  fi
 
-  patch_tenant_env "$name"
-  local startup_rc caller_errexit=false
+  local startup_rc=0
   TENANT_START_FAILED_WORKERS=()
-  [[ $- != *e* ]] || caller_errexit=true
   set +e
   start_tenant "$name"
   startup_rc=$?
