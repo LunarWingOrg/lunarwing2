@@ -270,6 +270,24 @@ fi
 PRIOR_REV="$(sudo -u "$TENANT" git -C "$LWROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 note "prior clone rev recorded for rollback: $PRIOR_REV"
 
+# WI#527: a failure after stop-tenant-for-upgrade (build, WASM, registry pull)
+# must not leave the tenant down. Return to the recorded previous clone revision
+# and start the tenant on its previous images — rootful, the same store the
+# stop above targeted — then fail with a message naming the failed lane. Never
+# dies itself: the caller writes the final error so the operator sees both the
+# lane and the resulting tenant state.
+converge_after_failed_upgrade() {  # <lane-description>
+  local cause="$1"
+  say "" >&2
+  say "upgrade aborted: $cause; restoring tenant '$TENANT' to $PRIOR_REV (WI#527) ..." >&2
+  if [[ "$PRIOR_REV" != unknown ]] \
+    && run sudo -u "$TENANT" git -C "$LWROOT" checkout "$PRIOR_REV" \
+    && run mt_rootful start-tenant "$TENANT"; then
+    die "$cause; tenant '$TENANT' was automatically restored and is running on its previous images (fix the failure and re-run)"
+  fi
+  die "$cause; automatic restore FAILED — tenant '$TENANT' remains stopped. Fix the failure and run: $MT start-tenant $TENANT"
+}
+
 # ---- 2. STOP the OLD model (daemon + old PG); old container/volume preserved --
 banner "2/8  Stop tenant (old model)"
 run mt_rootful stop-tenant-for-upgrade "$TENANT"
@@ -288,10 +306,36 @@ else
   run sudo -u "$TENANT" git -C "$LWROOT" checkout "$TARGET_REF"
   build_args=(build-tenant "$TENANT" --with-wasm --require-wasm)
   $WITH_PEBBLE  && build_args+=(--with-pebble)
+  # Capture without `if`/`!` so neither the run helper nor mt-admin's own
+  # errexit is masked; the tenant is already stopped here (WI#527).
+  build_rc=0
+  set +e
   run mt "${build_args[@]}"
+  build_rc=$?
+  set -e
+  if [[ "$build_rc" -ne 0 ]]; then
+    converge_after_failed_upgrade "tenant build failed (exit $build_rc)"
+  fi
+  wasm_rc=0
+  set +e
   run mt install-wasm "$TENANT"
+  wasm_rc=$?
+  set -e
+  if [[ "$wasm_rc" -ne 0 ]]; then
+    converge_after_failed_upgrade "WASM install failed (exit $wasm_rc)"
+  fi
 fi
+# DarkIRC release is still pre-provisioning (no data has moved); a failure here
+# converges like a build failure. Everything from step 4 on mutates the new
+# rootless DB, where the documented backup-based rollback still applies.
+darkirc_rc=0
+set +e
 run mt ensure-darkirc-release "$TENANT"
+darkirc_rc=$?
+set -e
+if [[ "$darkirc_rc" -ne 0 ]]; then
+  converge_after_failed_upgrade "DarkIRC release build failed (exit $darkirc_rc)"
+fi
 
 # ---- 4. PROVISION rootless + render units + bring up EMPTY PG (NO daemon) -----
 banner "4/8  Provision + render (add-tenant --no-health, idempotent)"

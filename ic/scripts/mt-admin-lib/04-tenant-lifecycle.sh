@@ -1565,6 +1565,62 @@ _upgrade_tenant_lifecycle_locked() {
   return "$upgrade_rc"
 }
 
+# WI#527: name the worker lane (or build stage) that failed, from the captured
+# upgrade build log. Best effort — an unmatched failure prints nothing and the
+# caller still reports the generic cause.
+_upgrade_failed_lane() {
+  local log="$1" match
+  [[ -r "$log" ]] || return 0
+  match="$(grep -oE '(pebble|opencode2|opencode|kimi) worker image build failed|lunarwing build failed|xmpp-bridge build failed|WASM extension build failed' \
+    "$log" 2>/dev/null | head -n 1 || true)"
+  [[ -n "$match" ]] || return 0
+  printf '%s\n' "${match%% build failed*}"
+}
+
+# WI#527: a post-stop upgrade failure must not leave every lane down. Restart
+# the tenant on the previous worker images. A worker-image lane leaves the
+# daemon binary and worker tags from the last good build in place, so restarting
+# in the target checkout is the accurate previous state. A daemon/xmpp/WASM
+# failure leaves an old binary under a new checkout, so restore the previous
+# commit first. Never dies: the caller writes the final error.
+upgrade_restore_previous_tenant() {  # <name> <lw_root> <previous_commit> <lane>
+  local name="$1" lw_root="$2" previous_commit="$3" lane="$4"
+  local tgit=(sudo -u "$name" git -c safe.directory="$lw_root" -C "$lw_root")
+  local restart_rc caller_errexit=false
+
+  case "$lane" in
+    pebble|opencode|opencode2|kimi)
+      say "worker lane '$lane' failed; restarting tenant '$name' on its previous images (WI#527) ..." ;;
+    *)
+      say "restoring tenant '$name' to its previous version (WI#527) ..."
+      "${tgit[@]}" checkout "$previous_commit" || return 1 ;;
+  esac
+
+  [[ $- != *e* ]] || caller_errexit=true
+  set +e
+  ( start_tenant "$name" )
+  restart_rc=$?
+  if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
+  return "$restart_rc"
+}
+
+# WI#527: converge after a post-stop upgrade step failed, then die with an
+# error that names the failed lane and the resulting tenant state.
+upgrade_converge_after_failure() {  # <name> <lw_root> <previous_commit> <log> <cause>
+  local name="$1" lw_root="$2" previous_commit="$3" log="$4" cause="$5"
+  local lane detail
+  lane="$(_upgrade_failed_lane "$log")"
+  detail="$cause"
+  [[ -z "$lane" ]] || detail="$lane lane $cause"
+
+  if upgrade_restore_previous_tenant "$name" "$lw_root" "$previous_commit" "$lane"; then
+    say "build log: $log"
+    die "upgrade aborted: $detail; tenant '$name' was automatically restored and is running on its previous images (fix the failure and re-run upgrade-tenant)"
+  fi
+  say "build log: $log" >&2
+  die "upgrade aborted: $detail; automatic restore FAILED — tenant '$name' remains stopped. Fix the failure and run 'start-tenant $name' (or re-run upgrade-tenant)"
+}
+
 upgrade_tenant_locked() {
   local name="$1" target="$2" source_repo="$3" do_backup="$4" do_render="$5"
   local lw_root repo
@@ -1671,8 +1727,23 @@ upgrade_tenant_locked() {
   if tenant_worker_enabled "$name" opencode2; then
     with_opencode2="true"
   fi
-  build_tenant "$name" "true" "false" "$with_opencode" "$with_kimi" "false" "true" "$with_opencode2" \
-    || die "build failed for $name; aborting upgrade (tenant left stopped at $target_commit; fix the build and re-run upgrade-tenant)"
+  # WI#527: build in a subshell and capture the log, so a failure in any lane
+  # returns here instead of exiting mt-admin mid-stop. Without this the tenant
+  # stayed stopped after a pebble/kimi/opencode/opencode2 image or binary
+  # failure; now the failure converges back to a running tenant.
+  local build_log build_rc=0 caller_errexit=false
+  build_log="$(mktemp "${TMPDIR:-/tmp}/lw-upgrade-build.XXXXXX")" \
+    || die "cannot create upgrade build log"
+  [[ $- != *e* ]] || caller_errexit=true
+  set +e
+  ( build_tenant "$name" "true" "false" "$with_opencode" "$with_kimi" "false" "true" "$with_opencode2" ) 2>&1 \
+    | tee "$build_log"
+  build_rc=${PIPESTATUS[0]}
+  if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
+  if [[ "$build_rc" -ne 0 ]]; then
+    upgrade_converge_after_failure "$name" "$lw_root" "$previous_commit" "$build_log" "build failed"
+  fi
+  rm -f "$build_log"
 
   if [[ "$do_render" == "true" ]]; then
     render_tenant_units "$name"
