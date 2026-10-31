@@ -1,6 +1,6 @@
 # SSH Agent Harness
 
-**Status:** As-built; source revalidated 2026-10-29 for v2.1.7.0.
+**Status:** As-built; source revalidated 2026-10-31 for v2.1.8.0.
 The bridge/config implementation is unchanged since the socket-directory mount
 fix. Source symbols below define the contract; historical dependency versions
 and static test counts are not deployment health evidence.
