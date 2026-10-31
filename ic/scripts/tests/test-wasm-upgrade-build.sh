@@ -140,14 +140,17 @@ fi
 # root dispatcher sources the library).
 UPGRADE_LIB="$TEST_DIR/../mt-admin-lib/04-tenant-lifecycle.sh"
 # shellcheck disable=SC2016
-if grep -Fq 'build_tenant "$name" "true" "false" "$with_opencode" "$with_kimi" "false" "true"' "$UPGRADE_LIB"; then
+# WI#527/TD-14: the post-stop build_tenant call in upgrade_tenant_locked now
+# passes all worker flags as "false" (workers are built to candidates pre-stop)
+# but strict WASM mode (argument 7, require_wasm) stays "true".
+if grep -Fq 'build_tenant "$name" "true" "false" "false" "false" "false" "true" "false"' "$UPGRADE_LIB"; then
   pass 'upgrade-tenant requires successful WASM build'
 else
   fail 'upgrade-tenant does not enable strict WASM build mode'
 fi
 # shellcheck disable=SC2016
 if grep -Fq 'tenant_worker_enabled "$name" opencode' "$UPGRADE_LIB"; then
-  pass 'upgrade-tenant rebuilds selected OpenCode worker'
+  pass 'upgrade-tenant honours persisted OpenCode worker selection'
 else
   fail 'upgrade-tenant ignores persisted OpenCode worker selection'
 fi
