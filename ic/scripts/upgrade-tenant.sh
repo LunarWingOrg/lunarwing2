@@ -337,14 +337,53 @@ if [[ "$darkirc_rc" -ne 0 ]]; then
   converge_after_failed_upgrade "DarkIRC release build failed (exit $darkirc_rc)"
 fi
 
+# Print the operator rollback steps for this tenant. Used both on success (as a
+# reference) and on any post-provisioning failure (WI#527) so a failed upgrade
+# never ends with the tenant down and no recovery instructions.
+print_rollback() {
+  say ""
+  say "ROLLBACK for '$TENANT':"
+  say "    sudo $MT stop-tenant $TENANT"
+  say "    sudo -u $TENANT git -C $LWROOT checkout $PRIOR_REV"
+  say "    sudo $MT build-tenant $TENANT --with-wasm --require-wasm"
+  if [[ "$KEEP_ROOTFUL" == false ]]; then
+    say "    # start the preserved old root container (still has original data):"
+    say "    sudo LUNARWING_MT_ROOTLESS=false $MT start-tenant $TENANT"
+  else
+    say "    sudo LUNARWING_MT_ROOTLESS=false $MT restart-tenant $TENANT"
+  fi
+  say "    # env backup: $BACKUP_DIR/${TENANT}-env.$STAMP   ports: $BACKUP_DIR/ports.json.$STAMP"
+  [[ -n "$DUMP" ]] && say "    # DB dump:  $DUMP"
+}
+
+# WI#527: from step 4 the upgrade has started rewriting the new rootless DB, so
+# an automatic restart could boot the tenant against a half-provisioned store.
+# Do not guess: fail with the cause, the tenant's state, and the rollback steps.
+abort_after_db_change() {  # <cause>
+  local cause="$1"
+  say "" >&2
+  say "upgrade aborted: $cause; tenant '$TENANT' remains stopped (WI#527)." >&2
+  say "Data has not been switched over: the old root-store container and your" >&2
+  say "pre-upgrade backup are intact. Recover with the ROLLBACK steps below." >&2
+  print_rollback >&2
+  exit 1
+}
+
 # ---- 4. PROVISION rootless + render units + bring up EMPTY PG (NO daemon) -----
 banner "4/8  Provision + render (add-tenant --no-health, idempotent)"
 # Preserve the existing XMPP JID so the idempotent env writer doesn't default it.
 XMPP_JID="$(grep -m1 '^XMPP_JID=' "$ENVF" 2>/dev/null | cut -d= -f2- || true)"
 add_args=(add-tenant "$TENANT" --no-health)
 [[ -n "$XMPP_JID" ]] && add_args+=(--xmpp-jid "$XMPP_JID")
+provision_rc=0
+set +e
 run mt "${add_args[@]}"      # rootless: ensure_rootless_prereqs + empty PG quadlet + render; daemon NOT started
+provision_rc=$?
+set -e
                              # keep-rootful: reuses existing root PG; back-fills HTTP_HOST/secret
+if [[ "$provision_rc" -ne 0 ]]; then
+  abort_after_db_change "tenant provisioning failed (add-tenant exit $provision_rc)"
+fi
 
 # add-tenant rewrote the env files and reset operator-customizable XMPP/LLM config
 # to defaults. Re-apply those specific keys from the step-1 backup (both modes).
@@ -373,7 +412,14 @@ if [[ "$KEEP_ROOTFUL" == false ]]; then
     note "[dry-run] would run: $MT restore-tenant $TENANT <verified-dump> --yes"
   else
     confirm "Restore $DUMP into the rootless DB for '$TENANT'? (DROP + recreate)" || die "aborted before restore"
+    restore_rc=0
+    set +e
     "$MT" restore-tenant "$TENANT" "$DUMP" --yes
+    restore_rc=$?
+    set -e
+    if [[ "$restore_rc" -ne 0 ]]; then
+      abort_after_db_change "restore failed (exit $restore_rc)"
+    fi
   fi
 else
   banner "5/8  Restore — skipped (keep-rootful reuses the existing data in place)"
@@ -381,7 +427,14 @@ fi
 
 # ---- 6. START the tenant (PG already up, then workers + daemon) --------------
 banner "6/8  Start tenant"
+start_rc=0
+set +e
 run mt start-tenant "$TENANT"
+start_rc=$?
+set -e
+if [[ "$start_rc" -ne 0 ]]; then
+  abort_after_db_change "tenant start failed (exit $start_rc)"
+fi
 
 # ---- 7. VERIFY ---------------------------------------------------------------
 banner "7/8  Verify"
@@ -406,16 +459,4 @@ say "        sudo podman rm -f lunarwing-pg-$TENANT      # root store"
 fi
 say "  • Self-heal was NOT enabled (used --no-health). Enable it fleet-wide only"
 say "    after ALL tenants are migrated and verified (see the proposal, §7)."
-say ""
-say "ROLLBACK for '$TENANT':"
-say "    sudo $MT stop-tenant $TENANT"
-say "    sudo -u $TENANT git -C $LWROOT checkout $PRIOR_REV"
-say "    sudo $MT build-tenant $TENANT --with-wasm --require-wasm"
-if [[ "$KEEP_ROOTFUL" == false ]]; then
-say "    # start the preserved old root container (still has original data):"
-say "    sudo LUNARWING_MT_ROOTLESS=false $MT start-tenant $TENANT"
-else
-say "    sudo LUNARWING_MT_ROOTLESS=false $MT restart-tenant $TENANT"
-fi
-say "    # env backup: $BACKUP_DIR/${TENANT}-env.$STAMP   ports: $BACKUP_DIR/ports.json.$STAMP"
-[[ -n "$DUMP" ]] && say "    # DB dump:  $DUMP"
+print_rollback
