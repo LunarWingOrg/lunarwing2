@@ -414,7 +414,7 @@ Commands:
   stop-tenant <name>              Stop all services for a tenant
   cleanup-legacy-weechat <name>   Remove obsolete weechat-<name> service
   restart-weechat-adapter <name>  Restart adapter through detected init system
-  stop-tenant-for-upgrade <name>  Verify settled DarkIRC state and stop atomically
+  stop-tenant-for-upgrade <name>  Verify settled DarkIRC state and stop atomically (preflights opencode2 builder floor)
   migration-export-boundary <name> [export options]
                                   Run export under retained lifecycle/DarkIRC locks
   restart-tenant <name>           Stop then start
