@@ -2,13 +2,21 @@
 
 LunarWing provides persistent memory for agents with hybrid search combining full-text search (BM25-style keyword matching) and vector search (cosine similarity on embeddings). Results are fused using Reciprocal Rank Fusion (RRF) to produce a single ranked list.
 
-**Source revalidated 2026-10-29 for v2.1.7.0.** The database-backed workspace
+**Source revalidated 2026-10-31 for v2.1.8.0.** The database-backed workspace
 remains the shared document/chunk store for memory and native knowledge tools.
 Current changes at its boundaries include:
 
 - WI#322 reserves all `engine/projects/**` documents from agent memory
   reads/writes/tree listings and web writes, protecting boot-hydrated project and
   mission state. This is broader than the mission-only search-index exclusion.
+- WI#455 (v2.1.8.0) widens the *write* lane reservation from
+  `engine/projects/**` + `engine/.runtime/**` to the whole `engine/**` tree
+  (via `is_engine_internal_path`), matching the harness write-back and
+  external-worker lanes, so a forged `engine/knowledge/**` or
+  `engine/orchestrator/**` document cannot shadow the real id→path mapping
+  boot-loaded by `load_knowledge_docs`. The read/tree guard stays narrow
+  (`engine/.runtime` + `engine/projects`), so those Engine documents remain
+  searchable; only the write lane is full-tree.
 - WI#493 rejects Unicode control characters in original write paths before
   normalization, while preserving exact-path operator reads of legacy records.
   Tree/list display names escape controls without changing lookup paths.
@@ -287,10 +295,13 @@ reports results actually emitted.
 All three path-based tools reserve `engine/.runtime/**`, all
 `engine/projects/**`, `backups/`, and quarantined `daily/*.poisoned-*.md` records.
 Direct reads and writes are rejected after normalization; tree listings hide
-these paths. Web writes reserve the same destinations, while exact-path operator
-reads and internal `Workspace` APIs remain available for recovery. Search-index
-exclusions are separate: non-mission Engine documents that remain indexed can
-appear with `"provenance": "engine_internal"`.
+these paths. **Writes** (WI#455, v2.1.8.0) reserve the wider `engine/**` tree
+so `engine/knowledge/**` and `engine/orchestrator/**` cannot be forged through
+the memory tool or web write route; the read/tree guard stays narrow so those
+Engine documents remain searchable. Web writes reserve the same destinations,
+while exact-path operator reads and internal `Workspace` APIs remain available
+for recovery. Search-index exclusions are separate: non-mission Engine
+documents that remain indexed can appear with `"provenance": "engine_internal"`.
 
 `memory_write` caps one payload at 256 KiB and calls `validate_write_path` on
 the original resolved path before normalization, rejecting C0/DEL/C1 controls.
