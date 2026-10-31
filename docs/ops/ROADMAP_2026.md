@@ -4,6 +4,7 @@
 | Feature | Target |
 |---------|--------|
 | New still not named interactive TUI application for LunarWing | v2.1.9.0 |
+| Both Alpha Releases for Desktop/Mobile companion applications for LunarWing | v2.1.9.0 |
 | Further Podman Sandbox refinements, improvements, and proper tunnel networking support | v2.2.0.0 |
 | Part two of Mission Improvements with enhanced metric evaluations and external worker adjacent looping | v2.2.0.0 |
 | Introduction of new external worker, LunarDepth | v2.2.0.0 |
