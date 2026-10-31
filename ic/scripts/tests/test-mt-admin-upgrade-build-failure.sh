@@ -55,7 +55,14 @@ git -C "$fixture_repo" push -q origin HEAD:refs/heads/moving
 git -C "$fixture_repo" reset -q --hard "$source_rev"
 
 export BUILD_LOCK="$fixture/build.lock"
-# Stage/candidate marker files live under a fixture state dir, not /home.
+# TD-2: stage/candidate marker files live in the root-owned lifecycle lock
+# directory, not the tenant-writable state directory. The harness exports the
+# env overrides so the real mt-admin functions find them in the fixture.
+TENANT_LIFECYCLE_LOCK_DIR="$fixture/locks"
+export TENANT_LIFECYCLE_LOCK_DIR
+export LUNARWING_MT_BUILD_STAGE_FILE="$TENANT_LIFECYCLE_LOCK_DIR/test-build-stages"
+export LUNARWING_MT_CANDIDATE_LANES_FILE="$TENANT_LIFECYCLE_LOCK_DIR/test-candidate-lanes"
+mkdir -p "$TENANT_LIFECYCLE_LOCK_DIR"
 tenant_state_dir() { printf '%s/state' "$fixture"; }
 mkdir -p "$fixture/state"
 
@@ -191,7 +198,7 @@ fi
 # migrations while claiming a restore. The converge path must rebuild the
 # previous commit first; if that rebuild fails the tenant is reported stopped.
 : >"$events"; : >"$cand_events"
-stage_file="$fixture/state/last-build-stages"
+stage_file="$LUNARWING_MT_BUILD_STAGE_FILE"
 checkout_marker="$fixture/checkout-seen"
 rm -f "$checkout_marker"
 build_tenant() {
