@@ -144,12 +144,17 @@ pub enum HeartbeatResult {
     Failed(String),
 }
 
-/// Compute how long to sleep until the next occurrence of `fire_at` in `tz`.
+/// Compute how long to sleep until the next occurrence of `fire_at` in `tz`,
+/// measured from `now`.
 ///
 /// If the target time today is still in the future, sleep until then.
-/// Otherwise sleep until the same time tomorrow.
-fn duration_until_next_fire(fire_at: chrono::NaiveTime, tz: Tz) -> Duration {
-    let now = chrono::Utc::now().with_timezone(&tz);
+/// Otherwise sleep until the same time tomorrow.  On a DST fall-back day the
+/// local day is 25 hours long, so the maximum interval can reach 25 h.
+fn duration_until_next_fire_at(
+    fire_at: chrono::NaiveTime,
+    tz: Tz,
+    now: chrono::DateTime<Tz>,
+) -> Duration {
     let today = now.date_naive();
 
     // Try to build today's target datetime in the given timezone.
@@ -169,6 +174,14 @@ fn duration_until_next_fire(fire_at: chrono::NaiveTime, tz: Tz) -> Duration {
 
     let secs = (target - now).num_seconds().max(1) as u64;
     Duration::from_secs(secs)
+}
+
+/// Compute how long to sleep until the next occurrence of `fire_at` in `tz`.
+///
+/// Thin wrapper around [`duration_until_next_fire_at`] using the current time.
+fn duration_until_next_fire(fire_at: chrono::NaiveTime, tz: Tz) -> Duration {
+    let now = chrono::Utc::now().with_timezone(&tz);
+    duration_until_next_fire_at(fire_at, tz, now)
 }
 
 /// Heartbeat runner for proactive periodic execution.
@@ -823,28 +836,107 @@ mod tests {
 
     #[test]
     fn test_duration_until_next_fire_is_bounded() {
-        // Result must always be between 1 second and ~24 hours
+        // Result must always be between 1 second and ~24 hours (25 h + 1 s on
+        // DST fall-back days, where the local day is 25 hours long)
         let time = chrono::NaiveTime::from_hms_opt(14, 0, 0).unwrap();
         let dur = duration_until_next_fire(time, chrono_tz::UTC);
         assert!(dur.as_secs() >= 1, "duration must be at least 1 second");
         assert!(
-            dur.as_secs() <= 86_401,
-            "duration must be at most ~24 hours, got {}s",
+            dur.as_secs() <= 25 * 3600 + 1,
+            "duration must be at most ~25 hours, got {}s",
             dur.as_secs()
         );
     }
 
     #[test]
-    fn test_duration_until_next_fire_dst_timezone_no_panic() {
-        // Use a timezone with DST (US Eastern) — should never panic
+    fn test_duration_until_next_fire_dst_fall_back_same_day() {
+        // America/New_York falls back on 2026-11-01 at 02:00 EDT: the local
+        // day is 25 h long.  Run from 2026-10-31 00:20 (a normal 24 h day)
+        // with a 00:30 fire — 10 minutes away, unaffected by the future fold.
         let tz: Tz = "America/New_York".parse().unwrap();
-        // Test a range of times including midnight boundaries
-        for hour in [0, 2, 3, 12, 23] {
-            let time = chrono::NaiveTime::from_hms_opt(hour, 30, 0).unwrap();
-            let dur = duration_until_next_fire(time, tz);
-            assert!(dur.as_secs() >= 1);
-            assert!(dur.as_secs() <= 86_401);
-        }
+        let now = tz
+            .with_ymd_and_hms(2026, 10, 31, 0, 20, 0)
+            .earliest()
+            .unwrap();
+        let fire_at = chrono::NaiveTime::from_hms_opt(0, 30, 0).unwrap();
+        let dur = duration_until_next_fire_at(fire_at, tz, now);
+        assert_eq!(dur, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn test_duration_until_next_fire_dst_fall_back_rolls_over() {
+        // Run just after 00:30 on the 25 h fold day (2026-11-01): the next
+        // 00:30 is tomorrow, so the interval spans the rest of this 25 h day
+        // (now 00:40 EDT = 04:40Z) plus 23 h 50 m to tomorrow's 00:30 EST
+        // (05:30Z) = 24 h 50 m.
+        let tz: Tz = "America/New_York".parse().unwrap();
+        let now = tz
+            .with_ymd_and_hms(2026, 11, 1, 0, 40, 0)
+            .earliest()
+            .unwrap();
+        let fire_at = chrono::NaiveTime::from_hms_opt(0, 30, 0).unwrap();
+        let dur = duration_until_next_fire_at(fire_at, tz, now);
+        assert_eq!(dur, Duration::from_secs(24 * 3600 + 50 * 60));
+    }
+
+    #[test]
+    fn test_duration_until_next_fire_dst_ambiguous_time_fires_today() {
+        // On the fall-back day 01:30 local occurs twice; `.earliest()` picks
+        // the first (EDT) occurrence.  Run at 01:00 EDT and the fire is 30 min
+        // away on the same day.
+        let tz: Tz = "America/New_York".parse().unwrap();
+        let now = tz
+            .with_ymd_and_hms(2026, 11, 1, 1, 0, 0)
+            .earliest()
+            .unwrap();
+        let fire_at = chrono::NaiveTime::from_hms_opt(1, 30, 0).unwrap();
+        let dur = duration_until_next_fire_at(fire_at, tz, now);
+        assert_eq!(dur, Duration::from_secs(30 * 60));
+    }
+
+    #[test]
+    fn test_duration_until_next_fire_dst_spring_forward_same_day() {
+        // 2027-03-14 springs forward at 02:00 EST, so 03:30 EDT exists.  Run
+        // from 01:00 EST (06:00Z) and the fire is 03:30 EDT (07:30Z) — 90 min.
+        let tz: Tz = "America/New_York".parse().unwrap();
+        let now = tz
+            .with_ymd_and_hms(2027, 3, 14, 1, 0, 0)
+            .earliest()
+            .unwrap();
+        let fire_at = chrono::NaiveTime::from_hms_opt(3, 30, 0).unwrap();
+        let dur = duration_until_next_fire_at(fire_at, tz, now);
+        assert_eq!(dur, Duration::from_secs(90 * 60));
+    }
+
+    #[test]
+    fn test_duration_until_next_fire_dst_spring_forward_missing_tomorrow() {
+        // 02:30 local does not exist on 2027-03-14 (the skipped hour), so
+        // `.earliest()` returns None for tomorrow and the code falls back to
+        // `now + 1 day` (an absolute 24 h).  Run from 2027-03-13 12:30 EST.
+        let tz: Tz = "America/New_York".parse().unwrap();
+        let now = tz
+            .with_ymd_and_hms(2027, 3, 13, 12, 30, 0)
+            .earliest()
+            .unwrap();
+        let fire_at = chrono::NaiveTime::from_hms_opt(2, 30, 0).unwrap();
+        let dur = duration_until_next_fire_at(fire_at, tz, now);
+        assert_eq!(dur, Duration::from_secs(24 * 3600));
+    }
+
+    #[test]
+    fn test_duration_until_next_fire_dst_skips_nonexistent_day() {
+        // Documented behavior (TC-3 Info point): on the spring-forward day
+        // itself, a fire time inside the skipped hour cannot fire that day, so
+        // the heartbeat skips it and waits for the next day's occurrence —
+        // 23 h from 03:30 EDT on 2027-03-14 to 02:30 EDT on 2027-03-15.
+        let tz: Tz = "America/New_York".parse().unwrap();
+        let now = tz
+            .with_ymd_and_hms(2027, 3, 14, 3, 30, 0)
+            .earliest()
+            .unwrap();
+        let fire_at = chrono::NaiveTime::from_hms_opt(2, 30, 0).unwrap();
+        let dur = duration_until_next_fire_at(fire_at, tz, now);
+        assert_eq!(dur, Duration::from_secs(23 * 3600));
     }
 
     #[test]
