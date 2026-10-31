@@ -1,10 +1,11 @@
 # Harness Worker Capabilities (WI#326)
 
-Status: implemented; source revalidated 2026-10-29 for v2.1.7.0.
+Status: implemented; source revalidated 2026-10-31 for v2.1.8.0.
 Owner: `ic/src/orchestrator/harness.rs`, with lifecycle ownership in
 `job_manager.rs` and HTTP completion handling in `api.rs`.
 
-The v2.1.7.0 WI#383 changes close two formerly documented gaps:
+The v2.1.7.0 WI#383 changes (carried into v2.1.8.0) close two formerly
+documented gaps:
 
 - Staged relative paths are scanned for mounted secret representations before
   promotion. `scrub_promotion_summary` also scrubs record/backup paths,
