@@ -270,15 +270,63 @@ fi
 PRIOR_REV="$(sudo -u "$TENANT" git -C "$LWROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 note "prior clone rev recorded for rollback: $PRIOR_REV"
 
+# WI#527: converge after a post-stop upgrade step failed. The wrapper is the
+# second upgrade path (upgrade-preflight -> stop-tenant-for-upgrade ->
+# build-tenant); run-287 SX-1 found it always checked out PRIOR_REV and started
+# the tenant whatever stage failed, which in rootless-adopt mode starts a newly
+# built binary against the preserved root store and migrates it. So classify by
+# the build's stage markers: before the daemon stage, restore the previous
+# revision and restart; past it, never auto-start — report the tenant stopped
+# with the rollback steps. Never dies itself; the caller writes the final error.
+converge_after_failed_upgrade() {  # <cause>
+  local cause="$1" stage
+  stage="unknown"
+  if ! $DRY_RUN; then
+    # stdout only: the stage value. A failing probe is "unknown", which the
+    # post-daemon branch below treats as fail-closed (no auto-start).
+    stage="$("$MT" last-build-stage "$TENANT" 2>/dev/null </dev/null || printf 'unknown')"
+    [[ "$stage" =~ ^(none|daemon|bridge|wasm|worker:[a-z0-9]+)$ ]] || stage="unknown"
+  fi
+  say "" >&2
+  if [[ "$stage" == none || "$stage" == unknown ]]; then
+    say "upgrade aborted: $cause; the target daemon was not built, restoring tenant '$TENANT' to $PRIOR_REV (WI#527) ..." >&2
+    if [[ "$PRIOR_REV" != unknown ]] \
+      && run sudo -u "$TENANT" git -C "$LWROOT" checkout "$PRIOR_REV" \
+      && run mt_rootful start-tenant "$TENANT"; then
+      die "$cause; tenant '$TENANT' was automatically restored and is running $PRIOR_REV"
+    fi
+    die "$cause; automatic restore FAILED — tenant '$TENANT' remains stopped. Fix the failure and run: $MT start-tenant $TENANT"
+  fi
+  say "upgrade aborted: $cause; the target daemon was built ($stage), so a restart would run the new binary against the preserved store." >&2
+  say "Tenant '$TENANT' remains stopped. Data has not been switched over: the old" >&2
+  say "root-store container and your pre-upgrade backup are intact. Recover with:" >&2
+  say "    sudo $MT stop-tenant $TENANT" >&2
+  say "    sudo -u $TENANT git -C $LWROOT checkout $PRIOR_REV" >&2
+  say "    sudo $MT build-tenant $TENANT --with-wasm --require-wasm" >&2
+  say "    sudo LUNARWING_MT_ROOTLESS=false $MT start-tenant $TENANT" >&2
+  die "$cause; tenant '$TENANT' remains stopped (stage: $stage)"
+}
+
+# WI#527: stop the old model, after the worker candidate images were built while
+# the tenant still ran (step 2 below). Only the daemon/bridge/WASM remain to be
+# built post-stop, and those converge through converge_after_failed_upgrade.
+stop_and_rebuild() {
+  run mt_rootful stop-tenant-for-upgrade "$TENANT" || converge_after_failed_upgrade "stop-tenant-for-upgrade failed"
+  run mt cleanup-legacy-weechat "$TENANT"
+}
+
 # ---- 2. STOP the OLD model (daemon + old PG); old container/volume preserved --
 banner "2/8  Stop tenant (old model)"
-run mt_rootful stop-tenant-for-upgrade "$TENANT"
-run mt cleanup-legacy-weechat "$TENANT"
+# The stop happens in step 3, after the pre-stop worker candidate build.
+note "stop deferred until after the pre-stop worker candidate build (WI#527)"
 
 # ---- 3. UPDATE the tenant clone + REBUILD (mt-admin does NOT auto-update) -----
 banner "3/8  Update clone + build"
 if $SKIP_BUILD; then
   note "--skip-build: assuming $LWROOT is already at $TARGET_REF and built"
+  stop_and_rebuild
+  run mt ensure-darkirc-release "$TENANT" \
+    || converge_after_failed_upgrade "DarkIRC release build failed"
 else
   if [[ -n "$(sudo -u "$TENANT" git -C "$LWROOT" status --porcelain 2>/dev/null || true)" ]]; then
     if $AUTO_YES; then run sudo -u "$TENANT" git -C "$LWROOT" stash push -u -m "pre-upgrade-$STAMP"
@@ -286,12 +334,38 @@ else
   fi
   run sudo -u "$TENANT" git -C "$LWROOT" fetch --tags --prune
   run sudo -u "$TENANT" git -C "$LWROOT" checkout "$TARGET_REF"
+  # WI#527: build the worker candidate images WHILE the tenant still runs. A
+  # lane failure here leaves the running tenant untouched.
+  cand_args=(build-worker-candidates "$TENANT")
+  $WITH_PEBBLE && cand_args+=(--with-pebble)
+  run mt "${cand_args[@]}" \
+    || die "worker image candidate build failed; tenant '$TENANT' was not stopped and is unchanged"
+
+  stop_and_rebuild
+  run mt ensure-darkirc-release "$TENANT" \
+    || converge_after_failed_upgrade "DarkIRC release build failed"
+
   build_args=(build-tenant "$TENANT" --with-wasm --require-wasm)
   $WITH_PEBBLE  && build_args+=(--with-pebble)
+  build_rc=0
+  set +e
   run mt "${build_args[@]}"
+  build_rc=$?
+  set -e
+  if [[ "$build_rc" -ne 0 ]]; then
+    converge_after_failed_upgrade "tenant build failed (exit $build_rc)"
+  fi
+  wasm_rc=0
+  set +e
   run mt install-wasm "$TENANT"
+  wasm_rc=$?
+  set -e
+  if [[ "$wasm_rc" -ne 0 ]]; then
+    converge_after_failed_upgrade "WASM install failed (exit $wasm_rc)"
+  fi
+  run mt promote-worker-images "$TENANT" \
+    || converge_after_failed_upgrade "worker image promotion failed"
 fi
-run mt ensure-darkirc-release "$TENANT"
 
 # ---- 4. PROVISION rootless + render units + bring up EMPTY PG (NO daemon) -----
 banner "4/8  Provision + render (add-tenant --no-health, idempotent)"

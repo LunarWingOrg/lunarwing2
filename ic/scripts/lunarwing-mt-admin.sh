@@ -369,6 +369,17 @@ Commands:
     --with-toolchains              Include Rust/Go/C++ toolchains (default: slim)
     --kimi-code-version <version>  Override kimi-code package version
 
+  promote-worker-images <name>     Promote this run's candidate worker images
+                                   (WI#527) to :latest; re-runnable after a
+                                   failed promotion
+
+  build-worker-candidates <name>   Build selected worker images to WI#527
+                                   candidate tags without stopping the tenant
+    --with-pebble --with-opencode --with-kimi --with-opencode2
+
+  last-build-stage <name>          Print the last completed build stage
+                                   (daemon|bridge|wasm|worker:<lane>|none)
+
   build-opencode2-worker           Build the OpenCode 2 worker Docker image
     --no-cache                     Force a full rebuild without Docker cache
     --with-toolchains              Include Rust/Go/C++ toolchains (default: slim)
@@ -938,6 +949,54 @@ main() {
     build-vision-sidecar)
       require_root
       build_vision_sidecar_image
+      ;;
+
+    promote-worker-images)
+      # WI#527: promote this run's candidate worker images to :latest. Re-runnable:
+      # a promote failure never removes a candidate, so an operator can retry it
+      # after fixing the underlying image-store problem.
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: promote-worker-images <name>"
+      local promote_name
+      promote_name="$(sanitize_name "$1")"
+      ports_registry_init
+      tenant_exists_in_registry "$promote_name" || die "tenant '$promote_name' not found in registry"
+      promote_candidate_workers "$promote_name"
+      ;;
+
+    build-worker-candidates)
+      # WI#527: build selected worker images to this run's candidate tags without
+      # stopping the tenant. The upgrade wrapper (ic/scripts/upgrade-tenant.sh)
+      # calls this before its stop so a lane build failure cannot strand it.
+      require_root
+      local cand_name="" cand_pebble="false" cand_oc="false" cand_kimi="false" cand_oc2="false"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --with-pebble)    cand_pebble="true"; shift ;;
+          --with-opencode)  cand_oc="true"; shift ;;
+          --with-kimi)      cand_kimi="true"; shift ;;
+          --with-opencode2) cand_oc2="true"; shift ;;
+          -*)               die "unknown flag: $1" ;;
+          *)
+            if [[ -z "$cand_name" ]]; then cand_name="$1"; shift
+            else die "unexpected argument: $1"
+            fi
+            ;;
+        esac
+      done
+      [[ -n "$cand_name" ]] || die "usage: build-worker-candidates <name> [--with-pebble] [--with-opencode] [--with-kimi] [--with-opencode2]"
+      cand_name="$(sanitize_name "$cand_name")"
+      ports_registry_init
+      tenant_exists_in_registry "$cand_name" || die "tenant '$cand_name' not found in registry"
+      build_candidate_workers "$cand_name" "$cand_oc" "$cand_kimi" "$cand_oc2" "$cand_pebble" "false"
+      ;;
+
+    last-build-stage)
+      # WI#527: the last build stage completed for <name> (daemon, bridge, wasm,
+      # worker:<lane>, or none). Read by the upgrade wrapper to decide whether a
+      # restart would start a newly built binary.
+      [[ -n "${1:-}" ]] || die "usage: last-build-stage <name>"
+      upgrade_last_completed_stage "$(sanitize_name "$1")"
       ;;
 
     build-sandbox-image)

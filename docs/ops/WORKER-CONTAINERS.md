@@ -1108,6 +1108,32 @@ stop can still strand a tenant, tracked as WI#527. Sources: Podman
 [v4.5.0 go.mod](https://github.com/containers/podman/blob/v4.5.0/go.mod) and
 [v4.4.4 go.mod](https://github.com/containers/podman/blob/v4.4.4/go.mod).
 
+**WI#527 — upgrade build ordering and convergence.** The upgrade no longer
+stops first and rebuilds second. Both paths check out the target and build
+every *selected worker image* to a per-run candidate tag
+(`<tenant-state>/worker-candidate-<lane>`) **while the tenant still runs**, then
+stop, build only the daemon/bridge/WASM, and promote the candidates to
+`:latest` once the target daemon exists. Consequences:
+
+- A worker-lane build failure is a no-op for a running tenant: the clone is
+  returned to the previous commit, the candidates are discarded, and the error
+  says the tenant was not stopped. (The only post-stop build is the daemon,
+  bridge and WASM.)
+- `build_tenant` records each completed stage (`daemon`, `bridge`, `wasm`) to
+  `<tenant-state>/last-build-stages`. Post-stop convergence classifies the
+  failure by that marker, never by matching die prose: before the daemon stage
+  the previous build is restarted in place; once the target daemon was built a
+  restart would run the *new* binary and apply the target's migrations, so the
+  previous commit is rebuilt before starting, and if that fails the tenant is
+  reported **stopped** with explicit rollback commands — never as "restored".
+- `promote-worker-images <tenant>` re-runs a promotion that failed after the
+  daemon build; a failed promote never removes a candidate.
+- The post-stop build log is a root-only `mktemp` file under `${TMPDIR:-/tmp}`
+  that is kept on failure (`build log: <path>` in the error). It is not pruned
+  automatically; on a long-lived host the operator should clear `/tmp` of
+  `lw-upgrade-build.*` files. Candidate tags are removed on both the success
+  and failure paths.
+
 ```bash
 cd opencode2.4lunarwing
 # The final --image-filesystem assert anchors the installed wrapper against
@@ -1834,8 +1860,9 @@ lock wrappers restore the caller's errexit state; a nested/inherited lifecycle
 lock keeps its outer owner's descriptor and ownership. Userns repair and
 failed-checkout recovery also capture startup outside conditional-call contexts,
 so a failed restart cannot be reported as recovered. Regression coverage:
-`test-mt-admin-worker-startup.sh`, `test-mt-admin-worker-image-contract.sh` and
-`test-mt-admin-upgrade-clean-tree.sh`.
+`test-mt-admin-worker-startup.sh`, `test-mt-admin-worker-image-contract.sh`,
+`test-mt-admin-upgrade-clean-tree.sh` and
+`test-mt-admin-upgrade-build-failure.sh` (WI#527).
 
 **WI#456 runbook — kimi dispatch fails with `Connection refused (os error
 111)`, no kimi ERROR lines in daemon.log:** one verified cause is refusal before the
