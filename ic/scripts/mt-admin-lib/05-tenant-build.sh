@@ -502,18 +502,35 @@ _vendor_guarded_cargo_build() {  # <repo> <cargo-root> [extra cargo build args..
 # start the NEW daemon binary, instead of parsing error prose (run-287 SX-1/SX-4).
 # Worker lanes built to candidate tags before the stop are recorded separately
 # (see TENANT_CANDIDATE_LANES_FILE) so the post-stop build cannot erase them.
+#
+# run-291 TD-2: marker files live in the root-owned 0700 lifecycle lock
+# directory, NOT in the tenant-writable state directory. Root truncating or
+# appending a file inside tenant-writable space follows tenant symlinks (WI#446
+# class), so the markers are kept root-owned alongside the build lock.
+_tenant_marker_dir() {
+  printf '%s' "${TENANT_LIFECYCLE_LOCK_DIR:-/run/lock/lunarwing-tenants}"
+}
+
 tenant_build_stage_file() {
-  printf '%s' "${LUNARWING_MT_BUILD_STAGE_FILE:-$(tenant_state_dir "$1")/last-build-stages}"
+  printf '%s' "${LUNARWING_MT_BUILD_STAGE_FILE:-$(_tenant_marker_dir)/$1-build-stages}"
 }
 
 tenant_candidate_lanes_file() {
-  printf '%s' "${LUNARWING_MT_CANDIDATE_LANES_FILE:-$(tenant_state_dir "$1")/last-candidate-lanes}"
+  printf '%s' "${LUNARWING_MT_CANDIDATE_LANES_FILE:-$(_tenant_marker_dir)/$1-candidate-lanes}"
+}
+
+# Ensure the root-owned marker directory exists and is safe (root:root 0700).
+# Callers must run as root; the dir is shared with the lifecycle lock path.
+_ensure_marker_dir() {
+  local dir
+  dir="$(_tenant_marker_dir)"
+  [[ -d "$dir" ]] || install -d -o root -g root -m 0700 "$dir"
 }
 
 _build_stage_log_path() {  # <name>
   local path
   path="$(tenant_build_stage_file "$1")"
-  mkdir -p "$(dirname "$path")"
+  _ensure_marker_dir
   printf '%s' "$path"
 }
 
@@ -563,7 +580,9 @@ build_tenant() {
   repo="$(tenant_repo "$name")"
 
   # WI#527: stage markers are per-run; an empty file means "nothing built yet".
-  : >"$(_build_stage_log_path "$name")"
+  # TD-11: truncate inside the build lock so a concurrent build-tenant or
+  # build-all cannot blank another run's markers mid-build.
+  _ensure_marker_dir
   if [[ "$require_wasm" == "true" && "$with_wasm" != "true" ]]; then
     die "--require-wasm requires --with-wasm"
   fi
@@ -573,6 +592,7 @@ build_tenant() {
   say "acquiring build lock (only one tenant builds at a time) ..."
   (
     flock -x 200
+    : >"$(tenant_build_stage_file "$name")"
 
     local cargo_env="if [ -f \"\$HOME/.cargo/env\" ]; then . \"\$HOME/.cargo/env\"; else export PATH=\"\$HOME/.cargo/bin:\$PATH\"; fi;"
 
@@ -705,7 +725,7 @@ build_candidate_worker() {
     *)         die "unknown worker lane '$lane'" ;;
   esac
   [[ "$rc" -eq 0 ]] || return "$rc"
-  mkdir -p "$(dirname "$(tenant_candidate_lanes_file "$name")")"
+  _ensure_marker_dir
   printf '%s\n' "$lane" >>"$(tenant_candidate_lanes_file "$name")"
 }
 
@@ -715,6 +735,7 @@ build_candidate_worker() {
 build_candidate_workers() {
   local name="$1" with_opencode="$2" with_kimi="$3" with_opencode2="$4"
   local with_pebble="${5:-false}" with_toolchains="${6:-false}"
+  _ensure_marker_dir
   : >"$(tenant_candidate_lanes_file "$name")"
   local lane
   for lane in pebble opencode kimi opencode2; do
@@ -755,6 +776,7 @@ promote_candidate_workers() {  # <tenant>
     "$CONTAINER_RT" rmi "$candidate_ref" >/dev/null 2>&1 || true
     say "promoted $latest_ref"
   done
+  _ensure_marker_dir
   : >"$(tenant_candidate_lanes_file "$name")"
 }
 
