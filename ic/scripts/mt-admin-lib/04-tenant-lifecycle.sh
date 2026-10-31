@@ -1601,6 +1601,7 @@ cleanup_candidate_workers() {  # <name>
       "$CONTAINER_RT" rmi "$candidate_ref" >/dev/null 2>&1 || true
     done
   fi
+  _ensure_marker_dir
   : >"$(tenant_candidate_lanes_file "$name")"
 }
 
