@@ -216,8 +216,8 @@ if output="$(upgrade_tenant fixture checkout-failure '' false false 2>&1)"; then
   fail 'upgrade should reject failed checkout'
 elif [[ -e "$stopped_marker" ]]; then
   fail 'upgrade stopped the tenant before a checkout it could not complete'
-elif [[ "$output" == *'simulated checkout failure'* && "$output" == *'previous tenant version restarted'* ]]; then
-  pass 'actual checkout failure restarts previous tenant version'
+elif [[ "$output" == *'simulated checkout failure'* && "$output" == *'still running its previous build'* ]]; then
+  pass 'actual checkout failure reports tenant still running its previous build'
 else
   fail "upgrade checkout error lacked recovery result: $output"
 fi
@@ -481,10 +481,10 @@ for startup_mode in degraded runtime auth clean; do
     pass "failed checkout ($startup_mode) remains failed without post-upgrade health refresh"
   else fail "failed checkout ($startup_mode) lost its failure: $output"; fi
   if [[ "$startup_mode" == clean ]]; then
-    if [[ "$output" == *'previous tenant version restarted'* ]]; then
+    if [[ "$output" == *'still running its previous build'* ]]; then
       pass 'healthy old-version recovery is reported accurately'
     else fail "healthy recovery was not reported: $output"; fi
-  elif [[ "$output" == *'automatic tenant restart failed'* && "$output" != *'previous tenant version restarted'* ]]; then
+  elif [[ "$output" == *'still running its previous build'* && "$output" != *'automatic tenant restart failed'* ]]; then
     pass "failed checkout ($startup_mode) does not claim successful recovery"
   else fail "failed checkout ($startup_mode) falsely reports recovery: $output"; fi
 done
