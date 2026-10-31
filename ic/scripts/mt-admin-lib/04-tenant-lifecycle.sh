@@ -1635,8 +1635,8 @@ upgrade_build_candidates_prestop() {  # <name> <lw_root> <previous_commit> <pebb
 # with explicit rollback commands — never as "restored".
 upgrade_converge_after_failure() {  # <name> <lw_root> <previous_commit> <cause>
   local name="$1" lw_root="$2" previous_commit="$3" cause="$4"
-  local repo describe_prev rc=0 caller_errexit=false
-  repo="$(tenant_repo "$name")"  describe_prev="$(sudo -u "$name" git -c safe.directory="$lw_root" -C "$lw_root" \
+  local describe_prev rc=0 caller_errexit=false
+  describe_prev="$(sudo -u "$name" git -c safe.directory="$lw_root" -C "$lw_root" \
     describe --tags --always "$previous_commit" 2>/dev/null || printf '%s' "$previous_commit")"
   [[ $- != *e* ]] || caller_errexit=true
 
@@ -1783,7 +1783,13 @@ upgrade_tenant_locked() {
   else
     _upgrade_checkout "$name" "$lw_root" "$target" "$target_commit" false
   fi || recover_failed_tenant_checkout "$name" "$lw_root" "$target" "$previous_commit"
-  [[ -d "$repo/migrations" ]] || die "ic/migrations missing after checkout — wrong ref?"
+  # TD-6: revert the checkout on pre-stop exits so the next attempt's
+  # previous_commit is honest and the running tenant's clone is unchanged.
+  if [[ ! -d "$repo/migrations" ]]; then
+    _upgrade_checkout "$name" "$lw_root" "$previous_commit" "$previous_commit" false \
+      || say "WARNING: could not return the clone to $previous_commit" >&2
+    die "ic/migrations missing after checkout — wrong ref?"
+  fi
   say "  now at: $("${tgit[@]}" describe --tags --always 2>/dev/null)"
 
   upgrade_build_candidates_prestop "$name" "$lw_root" "$previous_commit" \
@@ -1798,7 +1804,13 @@ upgrade_tenant_locked() {
 
   # The whole candidate build ran while the tenant was up; only now is it taken
   # down. Everything past this point converges through upgrade_converge_after_failure.
-  stop_tenant "$name" || die "stop failed; not upgrading '$name'"
+  # TD-6: on stop failure, revert the checkout so the running tenant's clone is
+  # unchanged and a later "restore" rebuilds what was actually running.
+  if ! stop_tenant "$name"; then
+    _upgrade_checkout "$name" "$lw_root" "$previous_commit" "$previous_commit" false \
+      || say "WARNING: could not return the clone to $previous_commit" >&2
+    die "stop failed; not upgrading '$name'"
+  fi
   say "building the target daemon, bridge and WASM for $name (tenant stopped) ..."
   local build_log
   build_log="$(mktemp "${TMPDIR:-/tmp}/lw-upgrade-build.XXXXXX")" \
