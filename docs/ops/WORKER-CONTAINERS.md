@@ -1110,29 +1110,37 @@ stop can still strand a tenant, tracked as WI#527. Sources: Podman
 
 **WI#527 — upgrade build ordering and convergence.** The upgrade no longer
 stops first and rebuilds second. Both paths check out the target and build
-every *selected worker image* to a per-run candidate tag
-(`<tenant-state>/worker-candidate-<lane>`) **while the tenant still runs**, then
+every *selected worker image* to a per-tenant candidate tag
+(`lunarwing-worker-<lane>:wi527-<tenant>`) **while the tenant still runs**, then
 stop, build only the daemon/bridge/WASM, and promote the candidates to
 `:latest` once the target daemon exists. Consequences:
 
 - A worker-lane build failure is a no-op for a running tenant: the clone is
   returned to the previous commit, the candidates are discarded, and the error
-  says the tenant was not stopped. (The only post-stop build is the daemon,
-  bridge and WASM.)
+  says the tenant was not stopped. The only post-stop build is the daemon,
+  bridge and WASM — no worker lane is rebuilt after the stop, on either path.
 - `build_tenant` records each completed stage (`daemon`, `bridge`, `wasm`) to
-  `<tenant-state>/last-build-stages`. Post-stop convergence classifies the
-  failure by that marker, never by matching die prose: before the daemon stage
-  the previous build is restarted in place; once the target daemon was built a
-  restart would run the *new* binary and apply the target's migrations, so the
-  previous commit is rebuilt before starting, and if that fails the tenant is
-  reported **stopped** with explicit rollback commands — never as "restored".
+  a root-owned marker file in the tenant lifecycle lock directory
+  (`/run/lock/lunarwing-tenants/<tenant>-build-stages` by default), never in
+  tenant-writable state. Post-stop convergence classifies the failure by that
+  marker, never by matching die prose: before the daemon stage the previous
+  build is restarted in place; once the target daemon was built a restart would
+  run the *new* binary and apply the target's migrations, so the previous
+  commit is rebuilt before starting, and if that fails the tenant is reported
+  **stopped** with explicit rollback commands — never as "restored". An
+  unreadable or unknown marker is treated as past-the-daemon (fail closed).
 - `promote-worker-images <tenant>` re-runs a promotion that failed after the
-  daemon build; a failed promote never removes a candidate.
+  daemon build: already-promoted lanes are skipped, old `:latest` image IDs are
+  recorded to a rollback file and re-tagged by convergence, and the lane list
+  is updated per lane, so a re-run only promotes what remains.
 - The post-stop build log is a root-only `mktemp` file under `${TMPDIR:-/tmp}`
   that is kept on failure (`build log: <path>` in the error). It is not pruned
   automatically; on a long-lived host the operator should clear `/tmp` of
-  `lw-upgrade-build.*` files. Candidate tags are removed on both the success
-  and failure paths.
+  `lw-upgrade-build.*` files. Candidate tags are removed on the success path
+  and by `cleanup_candidate_workers` on the pre-stop failure path; a stale
+  candidate left by a mid-promote failure is cleaned by the next promote or
+  `promote-worker-images` re-run and never affects the running lanes, which
+  still point at `:latest`.
 
 ```bash
 cd opencode2.4lunarwing
