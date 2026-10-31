@@ -1634,12 +1634,11 @@ upgrade_build_candidates_prestop() {  # <name> <lw_root> <previous_commit> <pebb
 upgrade_converge_after_failure() {  # <name> <lw_root> <previous_commit> <cause>
   local name="$1" lw_root="$2" previous_commit="$3" cause="$4"
   local repo describe_prev rc=0 caller_errexit=false
-  repo="$(tenant_repo "$name")"
-  describe_prev="$(sudo -u "$name" git -c safe.directory="$lw_root" -C "$lw_root" \
+  repo="$(tenant_repo "$name")"  describe_prev="$(sudo -u "$name" git -c safe.directory="$lw_root" -C "$lw_root" \
     describe --tags --always "$previous_commit" 2>/dev/null || printf '%s' "$previous_commit")"
   [[ $- != *e* ]] || caller_errexit=true
 
-  if ! upgrade_daemon_stage_completed "$name" && [[ -x "$repo/target/$PROFILE/lunarwing" ]]; then
+  if ! upgrade_daemon_stage_completed "$name"; then
     say "" >&2
     say "upgrade aborted: $cause; the new daemon was not built, restarting tenant '$name' on its previous build (WI#527) ..." >&2
     set +e

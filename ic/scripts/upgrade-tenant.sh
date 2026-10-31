@@ -282,7 +282,10 @@ converge_after_failed_upgrade() {  # <cause>
   local cause="$1" stage
   stage="unknown"
   if ! $DRY_RUN; then
-    stage="$("$MT" last-build-stage "$TENANT" 2>/dev/null || printf 'unknown')"
+    # stdout only: the stage value. A failing probe is "unknown", which the
+    # post-daemon branch below treats as fail-closed (no auto-start).
+    stage="$("$MT" last-build-stage "$TENANT" 2>/dev/null </dev/null || printf 'unknown')"
+    [[ "$stage" =~ ^(none|daemon|bridge|wasm|worker:[a-z0-9]+)$ ]] || stage="unknown"
   fi
   say "" >&2
   if [[ "$stage" == none || "$stage" == unknown ]]; then
