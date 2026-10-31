@@ -380,6 +380,9 @@ Commands:
   last-build-stage <name>          Print the last completed build stage
                                    (daemon|bridge|wasm|worker:<lane>|none)
 
+  reset-build-stage <name>         Reset the build stage marker to "nothing built"
+                                   (TD-5: called by upgrade-tenant.sh before the stop)
+
   build-opencode2-worker           Build the OpenCode 2 worker Docker image
     --no-cache                     Force a full rebuild without Docker cache
     --with-toolchains              Include Rust/Go/C++ toolchains (default: slim)
@@ -997,6 +1000,17 @@ main() {
       # restart would start a newly built binary.
       [[ -n "${1:-}" ]] || die "usage: last-build-stage <name>"
       upgrade_last_completed_stage "$(sanitize_name "$1")"
+      ;;
+
+    reset-build-stage)
+      # TD-5: reset the build stage marker so a stale marker from a prior run
+      # cannot mislead convergence. Called by the upgrade wrapper before the stop.
+      [[ -n "${1:-}" ]] || die "usage: reset-build-stage <name>"
+      local rbs_name rbs_file
+      rbs_name="$(sanitize_name "$1")"
+      rbs_file="$(tenant_build_stage_file "$rbs_name")"
+      _ensure_marker_dir
+      : >"$rbs_file"
       ;;
 
     build-sandbox-image)
