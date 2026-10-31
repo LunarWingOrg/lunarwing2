@@ -51,9 +51,19 @@ def validate_release(tag: str, protected: bool, root: pathlib.Path) -> list[str]
                 f"{manifest} has version {version!r}; expected {crate_version!r}"
             )
 
-    notes = root / f"RELEASE-v{release_version}.md"
-    if not notes.is_file():
-        errors.append(f"missing release notes: {notes.name}")
+    notes = next(
+        (
+            candidate
+            for candidate in (
+                root / f"RELEASE-v{release_version}.md",
+                root / "docs" / "releases" / f"RELEASE-v{release_version}.md",
+            )
+            if candidate.is_file()
+        ),
+        None,
+    )
+    if notes is None:
+        errors.append(f"missing release notes: RELEASE-v{release_version}.md")
     else:
         content = notes.read_text(encoding="utf-8")
         if release_version not in content:
@@ -98,6 +108,7 @@ class ReleaseVersionTests(unittest.TestCase):
         root: pathlib.Path,
         crate_version: str = "2.0.1",
         codename: str = "Togishi",
+        notes_dir: pathlib.Path | None = None,
     ) -> None:
         for manifest in MANIFESTS:
             path = root / manifest
@@ -106,10 +117,32 @@ class ReleaseVersionTests(unittest.TestCase):
                 f'[package]\nname = "fixture"\nversion = "{crate_version}"\n',
                 encoding="utf-8",
             )
-        (root / "RELEASE-v2.0.1.0.md").write_text(
+        if notes_dir is None:
+            notes_path = root / "RELEASE-v2.0.1.0.md"
+        else:
+            notes_path = root / "docs" / "releases" / "RELEASE-v2.0.1.0.md"
+            notes_path.parent.mkdir(parents=True, exist_ok=True)
+        notes_path.write_text(
             f"# LunarWing v2.0.1.0 - Codename `{codename}`\n",
             encoding="utf-8",
         )
+
+    def test_release_notes_in_docs_releases_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            self.make_release_tree(root, notes_dir=root)
+
+            self.assertEqual(validate_release("v2.0.1.0", True, root), [])
+
+    def test_missing_release_notes_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            self.make_release_tree(root)
+            (root / "RELEASE-v2.0.1.0.md").unlink()
+
+            errors = validate_release("v2.0.1.0", True, root)
+
+        self.assertTrue(any("missing release notes" in error for error in errors))
 
     def test_final_and_rc_tags_pass_complete_fixture(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
