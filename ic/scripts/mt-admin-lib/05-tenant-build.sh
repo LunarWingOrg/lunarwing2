@@ -1470,8 +1470,6 @@ build_opencode_worker() {
   local -a toolchain_args=()
   [[ "$with_toolchains" == "true" ]] && toolchain_args=(--build-arg WITH_TOOLCHAINS=true)
 
-  local -a toolchain_args=()
-  [[ "$with_toolchains" == "true" ]] && toolchain_args=(--build-arg WITH_TOOLCHAINS=true)
   local output_tag
   output_tag="$(worker_image_ref opencode)"
 
@@ -1989,20 +1987,10 @@ recover_failed_tenant_checkout() {
   if current_commit="$("${tgit[@]}" rev-parse --verify HEAD 2>/dev/null)" \
     && dirty="$("${tgit[@]}" status --short --untracked-files=no 2>/dev/null)" \
     && [[ "$current_commit" == "$previous_commit" && -z "$dirty" ]]; then
-    say "checkout failed before changing tracked tree; restarting previous tenant version ..."
-    # A conditional function call would suppress inner worker errexit and
-    # could falsely report the previous tenant version restarted (WI#469).
-    local restart_rc caller_errexit=false
-    [[ $- != *e* ]] || caller_errexit=true
-    set +e
-    ( start_tenant "$name" )
-    restart_rc=$?
-    if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
-    if [[ "$restart_rc" == 0 ]]; then
-      die "git checkout $target failed; previous tenant version restarted"
-    fi
-    die "git checkout $target failed; tracked tree is unchanged but automatic tenant restart failed"
+    # TD-9: this runs before the stop (WI#527 candidate build), so the tenant
+    # is still running — don't try to restart it.
+    die "git checkout $target failed; tracked tree is unchanged, tenant '$name' is still running its previous build"
   fi
 
-  die "git checkout $target failed after repository state changed; tenant remains stopped for inspection"
+  die "git checkout $target failed after repository state changed; tenant '$name' is still running — stop it and inspect: $0 stop-tenant $name"
 }
