@@ -2,16 +2,9 @@
 
 use crate::channels::StatusUpdate;
 use crate::channels::web::types::{ReasoningSummary, ToolCallInfo, ToolDecisionDto, TurnInfo};
-
-/// Conversation-history role written when a turn is stopped by `/interrupt`.
-///
-/// The classic loop (agent/thread_ops.rs) and the Engine V2 bridge
-/// (bridge/router.rs) append one row with this role after the interrupted
-/// turn's user message. Without it, an interrupted turn has its user message
-/// persisted but no assistant response, and was rendered as `Failed` —
-/// operator-misleading, since no error occurred. `rebuild_chat_messages_from_db`
-/// skips unknown roles, so markers never leak into restored LLM context.
-const INTERRUPTED_ROLE: &str = "interrupted";
+use crate::history::roles::{
+    ASSISTANT_ROLE, INTERRUPTED_ROLE, TOOL_CALLS_ROLE, TURN_RECOVERY_ROLE, USER_ROLE,
+};
 
 pub fn reasoning_summary(tool_calls: &[ToolCallInfo]) -> Option<ReasoningSummary> {
     let names: Vec<String> = tool_calls.iter().map(|call| call.name.clone()).collect();
@@ -108,7 +101,7 @@ pub fn build_turns_from_db_messages(
 ) -> Vec<TurnInfo> {
     let recoveries: std::collections::HashMap<_, _> = messages
         .iter()
-        .filter(|msg| msg.role == "turn_recovery")
+        .filter(|msg| msg.role == TURN_RECOVERY_ROLE)
         .filter_map(|msg| serde_json::from_str::<HistoryRecovery>(&msg.content).ok())
         .filter(|status| {
             matches!(
@@ -122,11 +115,11 @@ pub fn build_turns_from_db_messages(
     let mut turn_number = 0;
     let mut iter = messages
         .iter()
-        .filter(|msg| msg.role != "turn_recovery")
+        .filter(|msg| msg.role != TURN_RECOVERY_ROLE)
         .peekable();
 
     while let Some(msg) = iter.next() {
-        if msg.role == "user" {
+        if msg.role == USER_ROLE {
             let mut turn = TurnInfo {
                 turn_number,
                 user_input: msg.content.clone(),
@@ -139,13 +132,13 @@ pub fn build_turns_from_db_messages(
                 recovery: None,
             };
             if let Some(next) = iter.peek()
-                && next.role == "tool_calls"
+                && next.role == TOOL_CALLS_ROLE
                 && let Some(tc_msg) = iter.next()
             {
                 turn.tool_calls = history_tool_calls(tc_msg);
             }
             if let Some(next) = iter.peek()
-                && next.role == "assistant"
+                && next.role == ASSISTANT_ROLE
                 && let Some(assistant_msg) = iter.next()
             {
                 turn.response = Some(assistant_msg.content.clone());
@@ -160,7 +153,7 @@ pub fn build_turns_from_db_messages(
                 turn.completed_at = Some(marker.created_at.to_rfc3339());
                 // A late assistant row stays on the interrupted turn.
                 if let Some(next) = iter.peek()
-                    && next.role == "assistant"
+                    && next.role == ASSISTANT_ROLE
                     && let Some(assistant_msg) = iter.next()
                 {
                     turn.response = Some(assistant_msg.content.clone());
@@ -180,7 +173,7 @@ pub fn build_turns_from_db_messages(
             turn.reasoning = reasoning_summary(&turn.tool_calls);
             turns.push(turn);
             turn_number += 1;
-        } else if msg.role == "assistant" {
+        } else if msg.role == ASSISTANT_ROLE {
             turns.push(TurnInfo {
                 turn_number,
                 user_input: String::new(),
@@ -360,6 +353,35 @@ mod tests {
             role: role.to_string(),
             content: content.to_string(),
             created_at: chrono::Utc::now() + chrono::TimeDelta::milliseconds(offset_ms),
+        }
+    }
+
+    #[test]
+    fn census_bookkeeping_roles_never_become_turns() {
+        // WI#518: a bookkeeping row may sit anywhere in the history, but it
+        // must never open a turn, become a response, or leak its payload.
+        for role in crate::history::roles::BOOKKEEPING_ROLES {
+            let payload = format!("{role} payload");
+            let messages = vec![
+                make_msg(role, &payload, 0),
+                make_msg(USER_ROLE, "question", 1),
+                make_msg(ASSISTANT_ROLE, "answer", 2),
+                make_msg(role, &payload, 3),
+            ];
+
+            let turns = build_turns_from_db_messages(&messages);
+
+            assert_eq!(turns.len(), 1, "role {role} created a turn");
+            assert_eq!(turns[0].user_input, "question", "role {role}");
+            assert_eq!(
+                turns[0].response.as_deref(),
+                Some("answer"),
+                "role {role} replaced the response"
+            );
+            assert!(
+                !format!("{turns:?}").contains(&payload),
+                "role {role} leaked its payload into the rendered turn"
+            );
         }
     }
 

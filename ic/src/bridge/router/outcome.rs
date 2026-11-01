@@ -10,6 +10,7 @@ use crate::agent::response_delivery::ResponseDelivery;
 use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::error::Error;
 use crate::gate::pending::PendingGate;
+use crate::history::roles::{ASSISTANT_ROLE, TOOL_CALLS_ROLE, TURN_RECOVERY_ROLE};
 
 use super::{
     AwaitThreadCancellationGuard, EngineState, deliver_thread_event, drain_pending_thread_events,
@@ -343,7 +344,7 @@ impl TurnCompletion {
             "recovery": recovery,
         });
         if let Err(error) = db
-            .add_conversation_message(cid, "turn_recovery", &marker.to_string())
+            .add_conversation_message(cid, TURN_RECOVERY_ROLE, &marker.to_string())
             .await
         {
             tracing::warn!(%error, "failed to persist Engine V2 recovery status");
@@ -395,11 +396,11 @@ impl TurnCompletion {
             return;
         };
         if let Some(json) = load_tool_calls_json(&self.state.store, self.thread_id).await
-            && let Err(error) = db.add_conversation_message(cid, "tool_calls", &json).await
+            && let Err(error) = db.add_conversation_message(cid, TOOL_CALLS_ROLE, &json).await
         {
             tracing::warn!(%error, "failed to persist Engine V2 tool history");
         }
-        if let Err(error) = db.add_conversation_message(cid, "assistant", text).await {
+        if let Err(error) = db.add_conversation_message(cid, ASSISTANT_ROLE, text).await {
             tracing::warn!(%error, "failed to persist Engine V2 assistant history");
         }
     }

@@ -22,7 +22,8 @@ use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::context::JobContext;
 use crate::error::Error;
 use crate::history::roles::{
-    ConversationRole, INTERRUPTED_ROLE, TOOL_CALLS_ROLE, classify_conversation_role,
+    ASSISTANT_ROLE, ConversationRole, INTERRUPTED_ROLE, TOOL_CALLS_ROLE, USER_ROLE,
+    classify_conversation_role,
 };
 use crate::llm::{ChatMessage, ToolCall};
 use crate::tools::permissions::PermissionState;
@@ -893,7 +894,7 @@ impl Agent {
         }
 
         if let Err(e) = store
-            .add_conversation_message(thread_id, "user", user_input)
+            .add_conversation_message(thread_id, USER_ROLE, user_input)
             .await
         {
             tracing::warn!("Failed to persist user message: {}", e);
@@ -925,7 +926,7 @@ impl Agent {
         }
 
         if let Err(e) = store
-            .add_conversation_message(thread_id, "assistant", response)
+            .add_conversation_message(thread_id, ASSISTANT_ROLE, response)
             .await
         {
             tracing::warn!("Failed to persist assistant message: {}", e);
