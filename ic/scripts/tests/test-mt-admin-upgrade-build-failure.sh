@@ -179,10 +179,15 @@ fi
 : >"$events"; : >"$cand_events"
 build_tenant() {
   printf 'build\n' >>"$events"
+  # The real build_tenant resets the stage marker on entry (start sentinel)
+  # before the first cargo build; mirror that so convergence sees "nothing
+  # built yet" instead of fail-closing on a missing marker (run-294 TJ-9).
+  printf 'start\n' >"$(tenant_build_stage_file fixture)"
   printf 'WASM toolchain incomplete for fixture\n' >&2
   return 1
 }
 capture run_upgrade
+rm -f "$(tenant_build_stage_file fixture)"
 if [[ "$rc" -eq 0 ]]; then
   fail 'a post-stop build failure was ignored'
 elif [[ "$(grep -c '^start$' "$events")" != 1 ]]; then
@@ -275,8 +280,13 @@ mt_admin_stub() {
 MT=mt_admin_stub
 
 wrapper="$SCRIPT_DIR/../upgrade-tenant.sh"
-converge="$(awk '/^converge_after_failed_upgrade\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' "$wrapper")"
-[[ -n "$converge" ]] || fail 'wrapper has no converge_after_failed_upgrade helper'
+# converge_after_failed_upgrade delegates the clone restore to
+# revert_clone_position, so both real helpers are extracted (run-294 TJ-11).
+converge="$(awk '/^(converge_after_failed_upgrade|revert_clone_position)\(\) \{/{f=1} f{print} f&&/^\}$/{f=0}' "$wrapper")"
+[[ "$converge" == *'converge_after_failed_upgrade() {'* ]] \
+  || fail 'wrapper has no converge_after_failed_upgrade helper'
+[[ "$converge" == *'revert_clone_position() {'* ]] \
+  || fail 'wrapper has no revert_clone_position helper'
 
 TENANT=fixture
 LWROOT="$fixture/lwroot"
