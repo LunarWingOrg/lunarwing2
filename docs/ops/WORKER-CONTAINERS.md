@@ -1133,6 +1133,79 @@ stop can still strand a tenant, tracked as WI#527. Sources: Podman
 [v4.5.0 go.mod](https://github.com/containers/podman/blob/v4.5.0/go.mod) and
 [v4.4.4 go.mod](https://github.com/containers/podman/blob/v4.4.4/go.mod).
 
+**WI#527 — upgrade build ordering and convergence.** The upgrade no longer
+stops first and rebuilds second. Both paths check out the target and build
+every *selected worker image* to a per-tenant candidate tag
+(`lunarwing-worker-<lane>:wi527-<tenant>`) **while the tenant still runs**, then
+stop, build only the daemon/bridge/WASM, and promote the candidates to
+`:latest` once the target daemon exists. Consequences:
+
+- A worker-lane build failure is a no-op for a running tenant: the clone is
+  returned to its recorded position (branch or detached HEAD, and a pre-upgrade
+  stash is popped back), the candidates are discarded, and the error says the
+  tenant was not stopped. The only post-stop build is the daemon, bridge and
+  WASM — no worker lane is rebuilt after the stop, on either path. The external
+  wrapper's live path runs `build-tenant --with-wasm --require-wasm` after the
+  stop and asks for every *enabled* lane as a candidate
+  (`build-worker-candidates <tenant> --enabled`, `--with-pebble` still
+  available as an explicit opt-in), so the restarted daemon is always the newly
+  built one and no enabled lane silently keeps its previous image.
+- Every pre-stop exit on the wrapper path now puts the clone back and pops the
+  pre-upgrade stash — including a DarkIRC refusal and a failed `git fetch` /
+  `git checkout`, not only a candidate-build failure — and a candidate-build
+  failure also discards the partial candidate images and lane record, so a
+  later manual promote cannot promote images built from the checkout that
+  failure reverted (run-300 TO-4).
+- `build_tenant` records each completed stage (`daemon`, `bridge`, `wasm`) to
+  a root-owned marker file in the tenant lifecycle lock directory
+  (`/run/lock/lunarwing-tenants/<tenant>-build-stages` by default), never in
+  tenant-writable state; the directory is created with the same hardened
+  no-symlink, root-owned 0700 sequence as the lifecycle locks. Each run starts
+  with a `start` sentinel, so "nothing built yet" is distinguishable from an
+  unreadable marker. Post-stop convergence classifies the failure by that
+  marker, never by matching die prose: before the daemon stage the previous
+  build is restarted in place; once the target daemon was built a restart would
+  run the *new* binary and apply the target's migrations, so the previous
+  commit is rebuilt before starting (non-strict WASM: a broken WASM toolchain
+  must not block restoring a binary whose artifacts are already installed), and
+  if that fails the tenant is reported **stopped** with explicit rollback
+  commands — never as "restored". A missing, unreadable or unknown marker is
+  treated as past-the-daemon (fail closed) on both paths (run-300 TO-7 closed
+  the wrapper's missing-marker read as "none").
+- `promote-worker-images <tenant>` re-runs a promotion that failed after the
+  daemon build: already-promoted lanes are skipped, the rollback file keeps the
+  **first** pre-promotion `:latest` ID per lane (so a re-run never records an
+  already-promoted candidate as the old image), and the lane list is updated
+  per lane, so a re-run only promotes what remains. `restore-worker-images
+  <tenant>` re-tags those recorded IDs; both upgrade paths call it on a failed
+  upgrade, and it is printed in the wrapper's rollback steps. A rollback is
+  only reported when the re-tag actually succeeded. The record is cleared by
+  `clear-promote-rollback` only when the **whole** upgrade has succeeded
+  (both paths), and a new candidate run discards any record from an earlier
+  run, so a later failure can never re-tag a lane to an image this run never
+  had. `build-worker-candidates` and `promote-worker-images` serialise with a
+  running upgrade by **holding** the tenant upgrade lock for the whole verb
+  (a bare preflight was a check-then-run race); when they run inside the
+  upgrade wrapper's own locked boundary they reuse the inherited descriptor
+  instead of re-flocking — a second open-file description would deadlock
+  against that parent, which was the run-300 TO-1 blocker.
+- A pebble candidate keeps the toolchain profile of the `:latest` image it will
+  replace (the image's `org.opencontainers.image.toolchain-profile` label), so
+  an upgrade no longer downgrades an operator's fat (`--with-toolchains`) image
+  to slim. The fat build's staging tag is derived from this build's output tag
+  (`<output-tag>-candidate`), so two concurrent builds cannot retag each
+  other's image between the smoke gate and the final retag.
+- The post-stop build log is a root-only `mktemp` file under `${TMPDIR:-/tmp}`
+  that is kept on failure (`build log: <path>` in the error). It is not pruned
+  automatically; on a long-lived host the operator should clear `/tmp` of
+  `lw-upgrade-build.*` files. Candidate tags are removed on the success path
+  and by `cleanup_candidate_workers` on the pre-stop failure path; a lane whose
+  `rmi` fails stays in the lane file (visible to `cleanup-worker-candidates
+  <tenant>`, which retries it) and never affects the running lanes, which still
+  point at `:latest`. `last-build-stage` and `reset-build-stage` require root,
+  because the marker (and the candidate lane list) live in the root-only lock
+  directory and are not persistent across a reboot.
+
 ```bash
 cd opencode2.4lunarwing
 # The final --image-filesystem assert anchors the installed wrapper against
@@ -1859,8 +1932,9 @@ lock wrappers restore the caller's errexit state; a nested/inherited lifecycle
 lock keeps its outer owner's descriptor and ownership. Userns repair and
 failed-checkout recovery also capture startup outside conditional-call contexts,
 so a failed restart cannot be reported as recovered. Regression coverage:
-`test-mt-admin-worker-startup.sh`, `test-mt-admin-worker-image-contract.sh` and
-`test-mt-admin-upgrade-clean-tree.sh`.
+`test-mt-admin-worker-startup.sh`, `test-mt-admin-worker-image-contract.sh`,
+`test-mt-admin-upgrade-clean-tree.sh` and
+`test-mt-admin-upgrade-build-failure.sh` (WI#527).
 
 **WI#456 runbook — kimi dispatch fails with `Connection refused (os error
 111)`, no kimi ERROR lines in daemon.log:** one verified cause is refusal before the

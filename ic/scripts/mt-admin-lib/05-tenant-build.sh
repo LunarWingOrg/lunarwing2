@@ -492,6 +492,117 @@ _vendor_guarded_cargo_build() {  # <repo> <cargo-root> [extra cargo build args..
     "$root" "$guard" "$guard" "$guard_args" "$build" "$guard" "$guard_args" "$build"
 }
 
+# WI#527: which build stages a `build_tenant` run has completed. Recorded to a
+# per-tenant file rather than a shell array because the upgrade path runs
+# build_tenant inside a captured subshell (to keep errexit and return a status)
+# and the external wrapper (ic/scripts/upgrade-tenant.sh) is a separate process
+# that must classify the same failure. build_tenant starts the file with a
+# "start" sentinel and appends one line per completed stage. Stage names:
+# daemon, bridge, wasm. Callers use this to decide whether an in-place restart
+# would start the NEW daemon binary, instead of parsing error prose (run-287
+# SX-1/SX-4). Worker lanes are never built after the stop: they are built to
+# candidate tags before it and recorded separately (see
+# TENANT_CANDIDATE_LANES_FILE), so a post-stop stage record never names a lane
+# (run-294 TJ-14).
+#
+# run-291 TD-2: marker files live in the root-owned 0700 lifecycle lock
+# directory, NOT in the tenant-writable state directory. Root truncating or
+# appending a file inside tenant-writable space follows tenant symlinks (WI#446
+# class), so the markers are kept root-owned alongside the build lock.
+_tenant_marker_dir() {
+  printf '%s' "${TENANT_LIFECYCLE_LOCK_DIR:-/run/lock/lunarwing-tenants}"
+}
+
+tenant_build_stage_file() {
+  printf '%s' "${LUNARWING_MT_BUILD_STAGE_FILE:-$(_tenant_marker_dir)/$1-build-stages}"
+}
+
+tenant_candidate_lanes_file() {
+  printf '%s' "${LUNARWING_MT_CANDIDATE_LANES_FILE:-$(_tenant_marker_dir)/$1-candidate-lanes}"
+}
+
+# Ensure the root-owned marker directory exists and is safe (root:root 0700).
+# Callers must run as root; the dir is shared with the lifecycle lock path.
+# run-294 TJ-4: same hardened sequence as the lifecycle lock directory in
+# 00-common.sh. `[[ -d ]] || install -d` follows a symlink planted in a
+# world-writable /run/lock and then truncates/appends through it (WI#446 class);
+# this helper is reached without the lifecycle lock by build-tenant, build-all,
+# build-worker-candidates, promote-worker-images and reset-build-stage.
+_ensure_marker_dir() {
+  local dir
+  dir="$(_tenant_marker_dir)"
+  [[ ! -L "$dir" ]] || die "unsafe marker directory $dir (symlink)"
+  install -d -o root -g root -m 0700 "$dir"
+  [[ "$(stat -c '%u:%a' "$dir" 2>/dev/null)" == "0:700" ]] \
+    || die "unsafe marker directory $dir (must be root-owned mode 0700)"
+}
+
+_build_stage_log_path() {  # <name>
+  local path
+  path="$(tenant_build_stage_file "$1")"
+  _ensure_marker_dir
+  printf '%s' "$path"
+}
+
+# Start a fresh per-run stage file. The literal "start" sentinel keeps "nothing
+# built yet" distinguishable from "marker unreadable" (run-294 TJ-9).
+_reset_build_stage_file() {  # <name>
+  local path
+  path="$(_build_stage_log_path "$1")"
+  : >"$path"
+  printf 'start\n' >>"$path"
+}
+
+_record_build_stage() {  # <name> <stage>
+  printf '%s\n' "$2" >>"$(_build_stage_log_path "$1")"
+}
+
+# WI#527: the last stage a build_tenant run completed for <name>:
+# "daemon", "bridge", "wasm", or "none" when nothing completed (worker lanes are
+# pre-stop candidates and never appear here).
+# A missing or existing-but-unreadable marker reports "unknown" so the external
+# wrapper fails closed instead of restarting a possibly-new binary (run-294 TJ-9,
+# run-300 TO-7: a missing marker used to read as "none", the one fail-open shape
+# left on the wrapper path).
+upgrade_last_completed_stage() {  # <name>
+  local file last=""
+  file="$(tenant_build_stage_file "$1")"
+  [[ -e "$file" ]] || { printf 'unknown'; return 0; }
+  last="$(grep -v '^[[:space:]]*$' "$file" 2>/dev/null | tail -n 1 || true)"
+  case "$last" in
+    start) printf 'none' ;;
+    "") printf 'unknown' ;;
+    *) printf '%s' "$last" ;;
+  esac
+}
+
+# WI#527: tri-state view of the daemon stage for convergence (run-294 TJ-9).
+# "none"    — the marker exists and this run has not reached the daemon stage.
+# "built"   — the run built (and therefore left on disk) the new binary.
+# "unknown" — the marker is missing or unreadable; treated as past the daemon so
+#             a recording failure after cargo replaced the binary can never be
+#             reported as "restored to the previous build".
+upgrade_daemon_stage_state() {  # <name>
+  local file
+  file="$(tenant_build_stage_file "$1")"
+  [[ -e "$file" ]] || { printf 'unknown'; return 0; }
+  if grep -qx 'daemon' "$file" 2>/dev/null; then
+    printf 'built'
+  elif grep -q '[^[:space:]]' "$file" 2>/dev/null; then
+    printf 'none'
+  else
+    printf 'unknown'
+  fi
+}
+
+# WI#527: worker lanes built to candidate tags before the stop, oldest first.
+upgrade_candidate_lanes() {  # <name>
+  local file
+  file="$(tenant_candidate_lanes_file "$1")"
+  [[ -r "$file" ]] || return 0
+  grep -v '^[[:space:]]*$' "$file" 2>/dev/null || true
+}
+
 build_tenant() {
   local name="$1"
   local with_wasm="${2:-false}"
@@ -504,6 +615,10 @@ build_tenant() {
   local repo
   repo="$(tenant_repo "$name")"
 
+  # WI#527: stage markers are per-run; an empty file means "nothing built yet".
+  # TD-11: truncate inside the build lock so a concurrent build-tenant or
+  # build-all cannot blank another run's markers mid-build.
+  _ensure_marker_dir
   if [[ "$require_wasm" == "true" && "$with_wasm" != "true" ]]; then
     die "--require-wasm requires --with-wasm"
   fi
@@ -513,16 +628,21 @@ build_tenant() {
   say "acquiring build lock (only one tenant builds at a time) ..."
   (
     flock -x 200
+    # Fresh per-run marker ("start" = nothing built yet, distinguishable from an
+    # unreadable marker; run-294 TJ-9).
+    _reset_build_stage_file "$name"
 
     local cargo_env="if [ -f \"\$HOME/.cargo/env\" ]; then . \"\$HOME/.cargo/env\"; else export PATH=\"\$HOME/.cargo/bin:\$PATH\"; fi;"
 
     say "building lunarwing for $name ..."
     _run_tenant_build "$name" "$cargo_env $(_vendor_guarded_cargo_build "$repo" "$repo" --bin lunarwing)" \
       || die "lunarwing build failed for $name"
+    _record_build_stage "$name" daemon
 
     say "building xmpp-bridge for $name ..."
     _run_tenant_build "$name" "$cargo_env $(_vendor_guarded_cargo_build "$repo" "$repo/bridges/xmpp-bridge")" \
       || die "xmpp-bridge build failed for $name"
+    _record_build_stage "$name" bridge
 
     if [[ "$with_wasm" == "true" ]]; then
       if ensure_tenant_wasm_toolchain "$name"; then
@@ -539,6 +659,7 @@ build_tenant() {
         if [[ "$wasm_build_ok" == "true" ]]; then
           say "installing WASM extensions for $name ..."
           install_wasm_tenant "$name"
+          _record_build_stage "$name" wasm
         else
           say "WARNING: skipping WASM install for $name; existing installed artifacts were preserved" >&2
         fi
@@ -591,6 +712,220 @@ build_tenant() {
     say "--- Auto-migrating owner scope ---"
     migrate_owner_scope "$name" || say "WARNING: owner-scope migration failed (run 'migrate-owner-scope $name' manually)"
   fi
+}
+
+# ── WI#527: pre-stop candidate worker images ─────────────────────────────────
+# The upgrade path builds every selected worker image to a per-run candidate tag
+# WHILE the tenant still runs, then stops, rebuilds the daemon, and promotes the
+# candidates only after every selected lane succeeded (run-287 SX-2). Image
+# builds never needed the tenant down; building them before the stop means a
+# lane build failure leaves the tenant running on its untouched :latest images.
+# Promotion is a retag of the already-built image, so a promote failure is still
+# recoverable by re-running it.
+
+# Candidate image tag suffix for this upgrade run. Uses a per-tenant tag
+# (wi527-<tenant>) rather than a filesystem path so the result is a valid image
+# reference — a tag cannot contain '/' (run-291 TD-1). One per upgrade attempt;
+# re-runs replace it via the promote/cleanup cycle.
+_upgrade_candidate_tag_suffix() {  # <tenant>
+  printf 'wi527-%s' "$1"
+}
+
+# Full candidate image reference for <lane> on <tenant>. Built by
+# build_candidate_worker, promoted by promote_candidate_workers, removed by
+# cleanup_candidate_workers — all share this one helper (run-291 TD-1).
+upgrade_candidate_image_ref() {  # <tenant> <lane>
+  printf 'lunarwing-worker-%s:%s' "$2" "$(_upgrade_candidate_tag_suffix "$1")"
+}
+
+# Validate a lane name against the fixed set (run-291 TD-2: lane names flow into
+# podman tag/rmi and must not be attacker-controlled). Returns non-zero instead
+# of dying so callers iterating the lane file can skip a bad line and keep
+# converging (run-294 TJ-10).
+_upgrade_validate_lane() {  # <lane>
+  case "$1" in
+    pebble|opencode|kimi|opencode2) return 0 ;;
+    *)
+      say "WARNING: ignoring unknown worker lane '$1'" >&2
+      return 1
+      ;;
+  esac
+}
+
+# Build <lane>'s image to this run's candidate tag and record it.
+# Usage: build_candidate_worker <tenant> <lane> <with_toolchains>
+build_candidate_worker() {
+  local name="$1" lane="$2" with_toolchains="${3:-false}"
+  local lw_root tag rc=0 profile
+  _upgrade_validate_lane "$lane" || die "unknown worker lane '$lane'"
+  ensure_container_runtime
+  lw_root="$(tenant_lw_root "$name")"
+  tag="$(upgrade_candidate_image_ref "$name" "$lane")"
+  # run-294 TJ-6: the upgrade used to rebuild pebble slim unconditionally. The
+  # image carries its build profile as a label (pebble4lunarwing/Dockerfile), so
+  # a candidate keeps the profile of the :latest it will replace instead of
+  # silently downgrading a fat (--with-toolchains) image.
+  if [[ "$lane" == pebble && "$with_toolchains" != true ]]; then
+    profile="$(_worker_toolchain_profile pebble)"
+    with_toolchains="$profile"
+  fi
+  case "$lane" in
+    pebble)    LUNARWING_WORKER_IMAGE_TAG="$tag" build_pebble_worker "false" "$with_toolchains" || rc=$? ;;
+    opencode)  LUNARWING_WORKER_IMAGE_TAG="$tag" build_opencode_worker "false" "$with_toolchains" "$lw_root" || rc=$? ;;
+    kimi)      LUNARWING_WORKER_IMAGE_TAG="$tag" build_kimi_worker "false" "$with_toolchains" "" "$lw_root" || rc=$? ;;
+    opencode2) LUNARWING_WORKER_IMAGE_TAG="$tag" build_opencode2_worker "false" "$with_toolchains" "$lw_root" || rc=$? ;;
+  esac
+  [[ "$rc" -eq 0 ]] || return "$rc"
+  _ensure_marker_dir
+  printf '%s\n' "$lane" >>"$(tenant_candidate_lanes_file "$name")"
+}
+
+# The toolchain profile of a lane's current :latest image ("true" for a fat
+# image). Anything unreadable or unlabelled is slim, matching the Dockerfile
+# default and pre-label images.
+_worker_toolchain_profile() {  # <lane>
+  local latest
+  latest="$(worker_image_ref "$1" latest)"
+  [[ -n "${CONTAINER_RT:-}" ]] || return 0
+  local profile
+  profile="$("$CONTAINER_RT" image inspect \
+    --format '{{ index .Config.Labels "org.opencontainers.image.toolchain-profile" }}' \
+    "$latest" 2>/dev/null || true)"
+  [[ "$profile" == true ]] && printf 'true'
+  # run-300 TO-8: every current caller uses this in a `||` context, but a
+  # profile helper must not report failure just because the image is slim.
+  return 0
+}
+
+# Build every selected lane's candidate image, recording each success. Fails at
+# the first failing lane with that lane named, leaving the tenant untouched.
+# Usage: build_candidate_workers <tenant> <with_opencode> <with_kimi> <with_opencode2> [with_pebble] [with_toolchains]
+build_candidate_workers() {
+  local name="$1" with_opencode="$2" with_kimi="$3" with_opencode2="$4"
+  local with_pebble="${5:-false}" with_toolchains="${6:-false}"
+  _ensure_marker_dir
+  : >"$(tenant_candidate_lanes_file "$name")"
+  # run-300 TO-3: a new run must not inherit a prior run's pre-promotion ids, or
+  # a later failed run could "restore" a lane to an image this run never had.
+  clear_promote_rollback "$name"
+  local lane
+  for lane in pebble opencode kimi opencode2; do
+    case "$lane" in
+      pebble)    [[ "$with_pebble" == true ]] || continue ;;
+      opencode)  [[ "$with_opencode" == true ]] || continue ;;
+      kimi)      [[ "$with_kimi" == true ]] || continue ;;
+      opencode2) [[ "$with_opencode2" == true ]] || continue ;;
+    esac
+    say ""
+    say "=== Building $lane worker candidate image (tenant still running) ==="
+    build_candidate_worker "$name" "$lane" "$with_toolchains" \
+      || die "$lane worker image candidate build failed; tenant '$name' has not been stopped"
+  done
+}
+
+# Promote every recorded candidate lane to :latest. Idempotent and re-runnable.
+# TD-4: record old :latest image IDs before promoting and re-tag them on
+# failure; skip a lane whose :latest already equals its candidate; update the
+# lane file per lane so a re-run only promotes what remains. Only a successful
+# candidate build is ever promoted, so a failed run can never leave :latest
+# pointing at a partial image.
+#
+# run-294 TJ-5: the rollback record appends one line per lane and keeps the
+# FIRST pre-promotion id, so re-running after a mid-promote die never rewrites
+# the record with an already-promoted candidate. run-300 TO-2: it is NOT removed
+# by a successful promote — the new :latest tags are only safe to keep once the
+# whole upgrade finished, so the removal happens there (or in
+# restore_promoted_workers, which consumes it on a rollback).
+#
+# Old :latest IDs are recorded to $(_tenant_marker_dir)/$name-promote-rollback
+# so upgrade_converge_after_failure (a separate invocation) can restore them
+# after a mid-promote die.
+_promote_rollback_file() {  # <name>
+  printf '%s/%s-promote-rollback' "$(_tenant_marker_dir)" "$1"
+}
+
+# run-300 TO-2: drop the pre-promotion record once the upgrade as a whole has
+# succeeded (the wrapper, upgrade_tenant_locked). Never called by a promote.
+clear_promote_rollback() {  # <name>
+  rm -f "$(_promote_rollback_file "$1")"
+}
+
+# Append <lane>'s pre-promotion image id unless this run already recorded one.
+_promote_rollback_record() {  # <name> <lane> <old_id>
+  local name="$1" lane="$2" old_id="$3" file
+  file="$(_promote_rollback_file "$name")"
+  _ensure_marker_dir
+  [[ -f "$file" ]] || : >"$file"
+  awk -F'\t' -v lane="$lane" '$1 == lane { found = 1 } END { exit !found }' "$file" \
+    || printf '%s\t%s\n' "$lane" "$old_id" >>"$file"
+}
+
+restore_promoted_workers() {  # <name> — re-tag the pre-promotion :latest ids
+  local name="$1" file lane old_id latest_ref rc=0
+  file="$(_promote_rollback_file "$name")"
+  [[ -r "$file" ]] || return 0
+  while IFS=$'\t' read -r lane old_id; do
+    [[ -n "$lane" && -n "$old_id" ]] || continue
+    if ! _upgrade_validate_lane "$lane"; then rc=1; continue; fi
+    latest_ref="$(worker_image_ref "$lane" latest)"
+    # TD-10: only claim a rollback when the re-tag actually succeeded (a pruned
+    # old image must not be reported as restored).
+    if "$CONTAINER_RT" tag "$old_id" "$latest_ref" >/dev/null 2>&1; then
+      say "rolled back $latest_ref to $old_id"
+    else
+      say "WARNING: could not roll back $latest_ref to $old_id (old image may be pruned)" >&2
+      rc=1
+    fi
+  done <"$file"
+  [[ "$rc" -eq 0 ]] && rm -f "$file"
+  return "$rc"
+}
+
+promote_candidate_workers() {  # <tenant>
+  local name="$1" lane candidate_ref latest_ref old_id candidate_id
+  local lanes_file rollback_file
+  local -a lanes=()
+  lanes_file="$(tenant_candidate_lanes_file "$name")"
+  mapfile -t lanes < <(upgrade_candidate_lanes "$name")
+  if [[ "${#lanes[@]}" -eq 0 ]]; then
+    say "no candidate worker images to promote for '$name'"
+    return 0
+  fi
+  ensure_container_runtime
+  _ensure_marker_dir
+  rollback_file="$(_promote_rollback_file "$name")"
+  [[ -f "$rollback_file" ]] || : >"$rollback_file"
+  for lane in "${lanes[@]}"; do
+    # run-294 TJ-1: resolve the path through the helper, never the bare env
+    # override (production does not export it), and never concatenate an unset
+    # variable under `set -u`.
+    _upgrade_validate_lane "$lane" || die "candidate lane file for '$name' names an unknown lane"
+    candidate_ref="$(upgrade_candidate_image_ref "$name" "$lane")"
+    latest_ref="$(worker_image_ref "$lane" latest)"
+    candidate_id="$("$CONTAINER_RT" image inspect --format '{{.Id}}' "$candidate_ref" 2>/dev/null || true)"
+    old_id="$("$CONTAINER_RT" image inspect --format '{{.Id}}' "$latest_ref" 2>/dev/null || true)"
+    # Skip if :latest already equals the candidate (already promoted).
+    if [[ -n "$candidate_id" && "$old_id" == "$candidate_id" ]]; then
+      say "$latest_ref already at candidate, skipping"
+      continue
+    fi
+    if [[ -z "$candidate_id" ]]; then
+      die "candidate image $candidate_ref is missing; cannot promote lane '$lane'"
+    fi
+    # TD-4: record the old :latest id before overwriting the tag (first wins).
+    [[ -n "$old_id" ]] && _promote_rollback_record "$name" "$lane" "$old_id"
+    "$CONTAINER_RT" tag "$candidate_ref" "$latest_ref" \
+      || die "cannot promote $candidate_ref to $latest_ref"
+    say "promoted $latest_ref"
+    # TD-4: update the lane file per lane so a mid-loop failure is recoverable.
+    grep -vx "$lane" "$lanes_file" >"$lanes_file.tmp" 2>/dev/null || true
+    mv "$lanes_file.tmp" "$lanes_file"
+    "$CONTAINER_RT" rmi "$candidate_ref" >/dev/null 2>&1 || true
+  done
+  : >"$lanes_file"
+  # run-300 TO-2: the rollback record stays until the whole upgrade succeeds;
+  # deleting it here made a later render/env/start failure report "restored"
+  # while the new worker images stayed on :latest.
 }
 
 # ── Darkirc daemon build (shared, not per-tenant) ────────────────────────────
@@ -1139,6 +1474,19 @@ _worker_source_revision() {
   printf '%s' "$revision"
 }
 
+# WI#527: the image tag a worker build writes. Defaults to :latest so every
+# existing caller (build-tenant, build-all, per-lane verbs) is unchanged; the
+# upgrade path sets LUNARWING_WORKER_IMAGE_TAG to a candidate tag so the images
+# build while the tenant still runs and are promoted only after every selected
+# lane has succeeded (run-287 SX-2).
+worker_image_tag() {
+  printf '%s' "${LUNARWING_WORKER_IMAGE_TAG:-latest}"
+}
+
+worker_image_ref() {  # <lane> [tag]
+  printf 'lunarwing-worker-%s:%s' "$1" "${2:-$(worker_image_tag)}"
+}
+
 build_pebble_worker() {
   local no_cache="${1:-false}"
   local with_toolchains="${2:-false}"
@@ -1161,20 +1509,28 @@ build_pebble_worker() {
   [[ "$with_toolchains" == "true" ]] && toolchain_args=(--build-arg WITH_TOOLCHAINS=true)
 
   # Fat builds target a candidate tag first: the toolchain smoke gate below
-  # must pass before the image is re-tagged :latest, so a failed probe can
-  # never replace the previous good image (WI#334).
-  local target_tag="lunarwing-worker-pebble:latest"
-  local candidate_tag="lunarwing-worker-pebble:candidate"
-  [[ "$with_toolchains" == "true" ]] && target_tag="$candidate_tag"
+  # must pass before the image is re-tagged to the build's output tag, so a
+  # failed probe can never replace the previous good image (WI#334).
+  # WI#527: the output tag honours LUNARWING_WORKER_IMAGE_TAG (upgrade builds
+  # write a candidate tag and promote after every lane succeeded).
+  local output_tag fat_candidate build_tag
+  output_tag="$(worker_image_ref pebble)"
+  # run-300 TO-6: the fat staging tag is derived from this build's output tag
+  # (candidate -> wi527-<tenant>-candidate), so two concurrent builds — another
+  # tenant's upgrade or a build-pebble-worker --with-toolchains — can never
+  # retag each other's image between the smoke gate and the final retag.
+  fat_candidate="${output_tag}-candidate"
+  build_tag="$output_tag"
+  [[ "$with_toolchains" == "true" ]] && build_tag="$fat_candidate"
 
   if [[ "$CONTAINER_RT" == "podman" ]]; then
     # --network=host: podman's default build network
     # can't reach the internet for RUN steps on this host; the host netns has IPv4.
     # --format docker (O4): preserve the Dockerfile HEALTHCHECK (podman OCI drops it).
-    podman build $cache_flag "${toolchain_args[@]}" "${revision_args[@]}" --network=host --format docker -t "$target_tag" -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
+    podman build $cache_flag "${toolchain_args[@]}" "${revision_args[@]}" --network=host --format docker -t "$build_tag" -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
       || die "pebble worker image build failed"
   else
-    docker build $cache_flag "${toolchain_args[@]}" "${revision_args[@]}" -t "$target_tag" -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
+    docker build $cache_flag "${toolchain_args[@]}" "${revision_args[@]}" -t "$build_tag" -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
       || die "pebble worker image build failed"
   fi
 
@@ -1191,14 +1547,14 @@ build_pebble_worker() {
     # script.
     local smoke_script="${LUNARWING_PEBBLE_TOOLCHAIN_SMOKE:-$pebble_dir/scripts/smoke-task-shell-toolchain.sh}"
     say "smoke-checking task-shell toolchain anchors (WI#334) ..."
-    CONTAINER_RT="$CONTAINER_RT" "$smoke_script" image "$candidate_tag" \
+    CONTAINER_RT="$CONTAINER_RT" "$smoke_script" image "$fat_candidate" \
       || die "pebble worker task-shell toolchain smoke check failed (WI#334)"
-    "$CONTAINER_RT" tag "$candidate_tag" lunarwing-worker-pebble:latest \
+    "$CONTAINER_RT" tag "$fat_candidate" "$output_tag" \
       || die "pebble worker image tag failed"
-    "$CONTAINER_RT" rmi "$candidate_tag" >/dev/null 2>&1 || true
+    "$CONTAINER_RT" rmi "$fat_candidate" >/dev/null 2>&1 || true
   fi
 
-  say "pebble worker image built: lunarwing-worker-pebble:latest [$toolchain_desc] (revision $source_revision)"
+  say "pebble worker image built: $output_tag [$toolchain_desc] (revision $source_revision)"
 }
 
 build_opencode_worker() {
@@ -1224,6 +1580,9 @@ build_opencode_worker() {
   local -a toolchain_args=()
   [[ "$with_toolchains" == "true" ]] && toolchain_args=(--build-arg WITH_TOOLCHAINS=true)
 
+  local output_tag
+  output_tag="$(worker_image_ref opencode)"
+
   if [[ "$CONTAINER_RT" == "podman" ]]; then
     local -a layer_args=()
     if [[ "$no_cache" == "true" ]]; then
@@ -1236,14 +1595,14 @@ build_opencode_worker() {
       fi
       layer_args=(--layers=false)
     fi
-    podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" --network=host --format docker -t lunarwing-worker-opencode:latest "$opencode_dir" \
+    podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" --network=host --format docker -t "$output_tag" "$opencode_dir" \
       || die "opencode worker image build failed"
   else
-    docker build "${cache_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" -t lunarwing-worker-opencode:latest "$opencode_dir" \
+    docker build "${cache_args[@]}" "${toolchain_args[@]}" "${revision_args[@]}" -t "$output_tag" "$opencode_dir" \
       || die "opencode worker image build failed"
   fi
 
-  say "opencode worker image built: lunarwing-worker-opencode:latest [$toolchain_desc] (revision $source_revision)"
+  say "opencode worker image built: $output_tag [$toolchain_desc] (revision $source_revision)"
 }
 
 _opencode2_snapshot_source() {
@@ -1427,7 +1786,11 @@ build_opencode2_worker() {
 
   # A per-build tag and --iidfile avoid cross-build verification races. Verify
   # and promote only the immutable ID; the friendly tag is never trusted.
-  local candidate_tag="lunarwing-worker-opencode2:candidate-$$" iid_file image_id
+  # WI#527: the verified ID is tagged at the build's output tag (candidate on the
+  # upgrade path, :latest otherwise) so a pre-stop build never disturbs the
+  # running lane's image until every selected lane succeeded.
+  local candidate_tag="lunarwing-worker-opencode2:candidate-$$" iid_file image_id output_tag
+  output_tag="$(worker_image_ref opencode2)"
   iid_file="$(mktemp "${TMPDIR:-/tmp}/lw-opencode2-iid.XXXXXX")" \
     || die "cannot create opencode2 image-id file"
   local -a identity_args=(--iidfile "$iid_file")
@@ -1462,11 +1825,11 @@ build_opencode2_worker() {
     "$CONTAINER_RT" rmi "$candidate_tag" >/dev/null 2>&1 || true
     die "out-of-band opencode2 image verification FAILED for $image_id (WI#425)"
   fi
-  "$CONTAINER_RT" tag "$image_id" lunarwing-worker-opencode2:latest \
-    || die "cannot re-tag verified $image_id as lunarwing-worker-opencode2:latest"
+  "$CONTAINER_RT" tag "$image_id" "$output_tag" \
+    || die "cannot re-tag verified $image_id as $output_tag"
   "$CONTAINER_RT" rmi "$candidate_tag" >/dev/null 2>&1 || true
 
-  say "opencode2 worker image built: lunarwing-worker-opencode2:latest [$toolchain_desc] (revision $source_revision)"
+  say "opencode2 worker image built: $output_tag [$toolchain_desc] (revision $source_revision)"
 }
 
 build_kimi_worker() {
@@ -1497,6 +1860,8 @@ build_kimi_worker() {
 
   local -a version_args=()
   [[ -z "$kimi_code_version" ]] || version_args=(--build-arg KIMI_CODE_VERSION="${kimi_code_version}")
+  local output_tag
+  output_tag="$(worker_image_ref kimi)"
 
   if [[ "$CONTAINER_RT" == "podman" ]]; then
     local -a layer_args=()
@@ -1507,14 +1872,14 @@ build_kimi_worker() {
       fi
       layer_args=(--layers=false)
     fi
-    podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" "${version_args[@]}" "${revision_args[@]}" --network=host --format docker -t lunarwing-worker-kimi:latest "$kimi_dir" \
+    podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" "${version_args[@]}" "${revision_args[@]}" --network=host --format docker -t "$output_tag" "$kimi_dir" \
       || die "kimi worker image build failed"
   else
-    docker build "${cache_args[@]}" "${toolchain_args[@]}" "${version_args[@]}" "${revision_args[@]}" -t lunarwing-worker-kimi:latest "$kimi_dir" \
+    docker build "${cache_args[@]}" "${toolchain_args[@]}" "${version_args[@]}" "${revision_args[@]}" -t "$output_tag" "$kimi_dir" \
       || die "kimi worker image build failed"
   fi
 
-  say "kimi worker image built: lunarwing-worker-kimi:latest [$toolchain_desc] (revision $source_revision)"
+  say "kimi worker image built: $output_tag [$toolchain_desc] (revision $source_revision)"
 }
 
 # ── WASM install ─────────────────────────────────────────────────────────────
@@ -1732,20 +2097,10 @@ recover_failed_tenant_checkout() {
   if current_commit="$("${tgit[@]}" rev-parse --verify HEAD 2>/dev/null)" \
     && dirty="$("${tgit[@]}" status --short --untracked-files=no 2>/dev/null)" \
     && [[ "$current_commit" == "$previous_commit" && -z "$dirty" ]]; then
-    say "checkout failed before changing tracked tree; restarting previous tenant version ..."
-    # A conditional function call would suppress inner worker errexit and
-    # could falsely report the previous tenant version restarted (WI#469).
-    local restart_rc caller_errexit=false
-    [[ $- != *e* ]] || caller_errexit=true
-    set +e
-    ( start_tenant "$name" )
-    restart_rc=$?
-    if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
-    if [[ "$restart_rc" == 0 ]]; then
-      die "git checkout $target failed; previous tenant version restarted"
-    fi
-    die "git checkout $target failed; tracked tree is unchanged but automatic tenant restart failed"
+    # TD-9: this runs before the stop (WI#527 candidate build), so the tenant
+    # is still running — don't try to restart it.
+    die "git checkout $target failed; tracked tree is unchanged, tenant '$name' is still running its previous build"
   fi
 
-  die "git checkout $target failed after repository state changed; tenant remains stopped for inspection"
+  die "git checkout $target failed after repository state changed; tenant '$name' is still running — stop it and check the checkout manually: $0 stop-tenant $name"
 }

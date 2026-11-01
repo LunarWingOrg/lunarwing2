@@ -155,6 +155,15 @@ stop_tenant() {
 }
 start_tenant() { : >"$restarted_marker"; }
 build_tenant() { printf '%s\n' "$*" >"$build_args_file"; }
+# WI#527: worker candidates build to candidate tags before the stop, and the
+# post-stop build_tenant call carries the daemon/bridge/WASM flags only.
+tenant_state_dir() { printf '%s\n' "$fixture/state"; }
+candidate_log="$fixture/candidate-events"
+: >"$candidate_log"
+build_candidate_workers() { printf 'candidates\n' >>"$candidate_log"; }
+promote_candidate_workers() { :; }
+cleanup_candidate_workers() { :; }
+upgrade_candidate_lanes() { :; }
 patch_tenant_env() { :; }
 target="$(git -C "$repo" rev-parse HEAD)"
 if output="$(upgrade_tenant fixture "$target" '' false false 2>&1)"; then
@@ -205,10 +214,10 @@ printf 'LLM_BASE_URL=http://tz-fixture:3030/openai/v1\n' >"$repo/env/lunarwing.e
 fail_checkout=true
 if output="$(upgrade_tenant fixture checkout-failure '' false false 2>&1)"; then
   fail 'upgrade should reject failed checkout'
-elif [[ ! -e "$stopped_marker" || ! -e "$restarted_marker" ]]; then
-  fail 'upgrade did not restart tenant after checkout failed'
-elif [[ "$output" == *'simulated checkout failure'* && "$output" == *'previous tenant version restarted'* ]]; then
-  pass 'actual checkout failure restarts previous tenant version'
+elif [[ -e "$stopped_marker" ]]; then
+  fail 'upgrade stopped the tenant before a checkout it could not complete'
+elif [[ "$output" == *'simulated checkout failure'* && "$output" == *'still running its previous build'* ]]; then
+  pass 'actual checkout failure reports tenant still running its previous build'
 else
   fail "upgrade checkout error lacked recovery result: $output"
 fi
@@ -224,9 +233,12 @@ if output="$(upgrade_tenant fixture moving '' false false 2>&1)" \
 else
   fail "upgrade did not pin moving target commit: $output"
 fi
+# WI#527: the post-stop build_tenant builds only the daemon/bridge/WASM; the
+# selected worker lanes build to candidate tags before the stop.
 if [[ -f "$build_args_file" ]] \
-  && [[ "$(<"$build_args_file")" == "fixture true false true true false true false" ]]; then
-  pass 'upgrade rebuilds selected OpenCode and Kimi workers with strict WASM build'
+  && [[ "$(<"$build_args_file")" == "fixture true false false false false true false" ]] \
+  && grep -qx 'candidates' "$candidate_log"; then
+  pass 'upgrade rebuilds selected worker lanes as pre-stop candidates with strict WASM'
 else
   fail "upgrade forwarded wrong build flags: $(cat "$build_args_file" 2>/dev/null || true)"
 fi
@@ -262,6 +274,8 @@ fi
 # tenant is env-validated (not fully re-rendered) before stop, so stop keeps the
 # installed unit contract. --skip-render cannot bypass fleet neutralization.
 events="$fixture/rollout-events"
+# WI#527: from here on the candidate build is part of the observable order.
+build_candidate_workers() { printf 'candidates\n' >>"$events"; }
 render_all_openrc_proxy_units() { printf 'neutralize\n' >>"$events"; }
 render_tenant_units() { printf 'render\n' >>"$events"; }
 backup_tenant_postgres() { printf 'backup\n' >>"$events"; }
@@ -274,6 +288,7 @@ for init in openrc systemd; do
     expected=""
     [[ "$init" != openrc ]] || expected+=$'neutralize\n'
     expected+=$'backup\n'
+    expected+=$'candidates\n'
     expected+=$'stop\n'
     [[ "$do_render" != true ]] || expected+=$'render\n'
     expected+='start'
@@ -294,7 +309,7 @@ tenant_proxy_enabled() { [[ "$PROXY_FIXTURE_ENABLED" == "true" ]]; }
 validate_openrc_proxy_env() { printf 'validate\n' >>"$events"; }
 : >"$events"
 if output="$(upgrade_tenant fixture "$target" '' true true 2>&1)" \
-  && [[ "$(cat "$events")" == $'neutralize\nbackup\nvalidate\nstop\nrender\nstart' ]]; then
+  && [[ "$(cat "$events")" == $'neutralize\nbackup\nvalidate\ncandidates\nstop\nrender\nstart' ]]; then
   pass 'proxy-enabled OpenRC upgrade validates env before stop without pre-stop render'
 else
   fail "proxy-enabled upgrade order wrong: $output"
@@ -326,7 +341,7 @@ stop_tenant() { printf 'stop\n' >>"$events"; return 1; }
 : >"$events"
 if output="$(upgrade_tenant fixture "$target" '' true true 2>&1)"; then
   fail 'stop failure did not block upgrade'
-elif [[ "$(cat "$events")" == $'neutralize\nbackup\nstop' && "$output" == *'not upgrading'* ]]; then
+elif [[ "$(cat "$events")" == $'neutralize\nbackup\ncandidates\nstop' && "$output" == *'not upgrading'* ]]; then
   pass 'stop failure aborts upgrade before checkout and start'
 else
   fail "stop failure was ignored: $output"
@@ -466,10 +481,10 @@ for startup_mode in degraded runtime auth clean; do
     pass "failed checkout ($startup_mode) remains failed without post-upgrade health refresh"
   else fail "failed checkout ($startup_mode) lost its failure: $output"; fi
   if [[ "$startup_mode" == clean ]]; then
-    if [[ "$output" == *'previous tenant version restarted'* ]]; then
+    if [[ "$output" == *'still running its previous build'* ]]; then
       pass 'healthy old-version recovery is reported accurately'
     else fail "healthy recovery was not reported: $output"; fi
-  elif [[ "$output" == *'automatic tenant restart failed'* && "$output" != *'previous tenant version restarted'* ]]; then
+  elif [[ "$output" == *'still running its previous build'* && "$output" != *'automatic tenant restart failed'* ]]; then
     pass "failed checkout ($startup_mode) does not claim successful recovery"
   else fail "failed checkout ($startup_mode) falsely reports recovery: $output"; fi
 done
