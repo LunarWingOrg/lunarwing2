@@ -6622,18 +6622,22 @@ mod tests {
     async fn spawn_ready_worker() -> std::net::SocketAddr {
         use futures::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
-        use tokio_tungstenite::tungstenite::handshake::server::{
-            ErrorResponse, Request, Response,
-        };
+        use tokio_tungstenite::tungstenite::http::HeaderValue;
+        use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Response};
 
         // Real workers echo the negotiated `Sec-WebSocket-Protocol`; the
         // client (connect_and_handshake) rejects a server that omits it.
-        let callback = |_req: &Request, mut response: Response| {
+        // SUBPROTOCOL is a static str, so HeaderValue cannot fail here.
+        let subprotocol = HeaderValue::from_static(SUBPROTOCOL);
+        // The accept callback's signature mandates Result<Response,
+        // ErrorResponse> where the Err variant is a large http::Response; the
+        // closure here never errors, so the lint is a false positive.
+        #[allow(clippy::result_large_err)]
+        let callback = move |_req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                             mut response: Response| {
             response
                 .headers_mut()
-                .insert("Sec-WebSocket-Protocol", SUBPROTOCOL.parse().map_err(
-                    |_| ErrorResponse::new(Some("bad subprotocol header".to_string())),
-                )?);
+                .insert("Sec-WebSocket-Protocol", subprotocol.clone());
             Ok::<Response, ErrorResponse>(response)
         };
 
