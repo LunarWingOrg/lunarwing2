@@ -678,10 +678,11 @@ WI#432 closes the former WI#408 residuals. Credentialed exchanges also drop
 `Range` and `If-Range`, and a `206 Partial Content` response is refused at the
 redaction boundary, so a guest cannot reassemble an echo from byte ranges;
 ordinary exchanges retain their range semantics. Both hosts use the shared
-`vet_http_target` guard. It canonicalizes IPv4-mapped, IPv4-compatible and
-NAT64-embedded addresses before applying the special-use IPv4/IPv6 and
-multicast blocklists, and reqwest clients (including OAuth refresh) pin the
-exact vetted DNS answers instead of resolving a second time. General
+`vet_http_target` guard. It canonicalizes IPv4-mapped, IPv4-compatible,
+NAT64-embedded, 6to4 and Teredo-embedded addresses before applying the
+special-use IPv4/IPv6 and multicast blocklists, and reqwest clients (including
+OAuth refresh) pin the exact vetted DNS answers instead of resolving a second
+time. General
 private-target access requires the separate, default-off
 `WASM_HTTP_ALLOW_PRIVATE_IPS=1` opt-in; the daemon's `ALLOW_PRIVATE_IPS=1`
 setting for Postgres, TensorZero and other private infrastructure does not
