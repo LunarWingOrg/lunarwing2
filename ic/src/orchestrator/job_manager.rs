@@ -719,6 +719,14 @@ impl ContainerJobManager {
         }
     }
 
+    /// Test-only Docker injection so cancellation tests can drive `stop_job`
+    /// without a live container runtime. The client is only touched when a
+    /// request is made, so a closed endpoint fails fast instead of hanging.
+    #[cfg(test)]
+    pub(crate) async fn use_docker_for_test(&self, docker: bollard::Docker) {
+        *self.docker.write().await = Some(docker);
+    }
+
     pub fn with_completion_deps(
         mut self,
         event_tx: tokio::sync::broadcast::Sender<(

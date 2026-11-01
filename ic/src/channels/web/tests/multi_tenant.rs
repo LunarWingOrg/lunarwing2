@@ -76,6 +76,24 @@ fn build_state_ex_with_context(
     external_worker_manager: Option<Arc<crate::orchestrator::ExternalWorkerManager>>,
     context_manager: Option<Arc<crate::context::ContextManager>>,
 ) -> Arc<GatewayState> {
+    build_state_full(
+        store,
+        prompt_queue,
+        external_worker_manager,
+        context_manager,
+        None,
+    )
+}
+
+/// `build_state_ex_with_context` plus a container job manager, for the
+/// cancellation tests that must stop a real handle (WI#476).
+fn build_state_full(
+    store: Option<Arc<dyn crate::db::Database>>,
+    prompt_queue: Option<PromptQueue>,
+    external_worker_manager: Option<Arc<crate::orchestrator::ExternalWorkerManager>>,
+    context_manager: Option<Arc<crate::context::ContextManager>>,
+    job_manager: Option<Arc<crate::orchestrator::job_manager::ContainerJobManager>>,
+) -> Arc<GatewayState> {
     Arc::new(GatewayState {
         msg_tx: tokio::sync::RwLock::new(None),
         sse: Arc::new(SseManager::new()),
@@ -87,7 +105,7 @@ fn build_state_ex_with_context(
         extension_manager: None,
         tool_registry: None,
         store,
-        job_manager: None,
+        job_manager,
         external_worker_manager,
         prompt_queue,
         owner_id: "test".to_string(),
@@ -1079,6 +1097,191 @@ mod jobs_isolation {
         assert_eq!(summary["stuck"], 0);
         assert_eq!(summary["failed"], 1);
         assert!(repair.detect_stuck_jobs().await.is_empty());
+    }
+
+    /// A running container handle for the cancellation tests.
+    fn running_container_handle(
+        job_id: Uuid,
+    ) -> crate::orchestrator::job_manager::ContainerHandle {
+        use crate::orchestrator::job_manager::{ContainerHandle, ContainerState, JobMode};
+        ContainerHandle {
+            job_id,
+            container_id: "cancel-container".to_string(),
+            state: ContainerState::Running,
+            mode: JobMode::Worker,
+            owner_id: "alice".to_string(),
+            mcp_servers: Vec::new(),
+            created_at: chrono::Utc::now(),
+            project_dir: None,
+            task_description: "container cancellation".to_string(),
+            last_worker_status: None,
+            worker_iteration: 0,
+            completion_result: None,
+            harness: None,
+        }
+    }
+
+    /// A container manager holding `job_id` as running, with a fail-fast
+    /// Docker client so `stop_job` claims the terminal handle without a live
+    /// runtime (its teardown errors are logged, not propagated).
+    async fn running_container_manager(
+        job_id: Uuid,
+    ) -> Arc<crate::orchestrator::job_manager::ContainerJobManager> {
+        use crate::orchestrator::TokenStore;
+        use crate::orchestrator::job_manager::{ContainerJobConfig, ContainerJobManager};
+
+        let manager = Arc::new(ContainerJobManager::new(
+            ContainerJobConfig::default(),
+            TokenStore::new(),
+        ));
+        manager
+            .containers
+            .write()
+            .await
+            .insert(job_id, running_container_handle(job_id));
+        let docker =
+            bollard::Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
+                .unwrap(); // safety: test-only
+        manager.use_docker_for_test(docker).await;
+        manager
+    }
+
+    /// PZ-1 (WI#476): a container sandbox cancel used to leave the context
+    /// `InProgress` — `stop_job` claims `Stopped` before the exit watcher runs,
+    /// so `claim_unreported_exit` skipped its context update and the stuck
+    /// sweep kept flagging the job. The handler now moves both stores, and the
+    /// container handle is still stopped.
+    #[tokio::test]
+    async fn test_jobs_cancel_container_synchronizes_context_and_stuck_sweep() {
+        use crate::agent::{DefaultSelfRepair, SelfRepair};
+        use crate::context::{ContextManager, JobState};
+        use crate::orchestrator::job_manager::ContainerState;
+
+        let (db, _dir) = test_db().await;
+        let mut job = make_sandbox_job("alice", "container cancellation");
+        job.status = "running".to_string();
+        job.success = None;
+        job.completed_at = None;
+        job.job_mode = "worker".to_string();
+        db.save_sandbox_job(&job).await.unwrap();
+
+        let cm = Arc::new(ContextManager::new(10));
+        // `register_sandbox_job` already moves the entry to InProgress.
+        cm.register_sandbox_job(job.id, "alice", "container cancellation", "desc")
+            .await
+            .unwrap();
+        assert_eq!(
+            cm.get_context(job.id).await.unwrap().state,
+            JobState::InProgress
+        );
+        let repair = DefaultSelfRepair::new(Arc::clone(&cm), Duration::from_secs(0), 3);
+
+        let jm = running_container_manager(job.id).await;
+
+        let state = build_state_full(
+            Some(db.clone()),
+            None,
+            None,
+            Some(Arc::clone(&cm)),
+            Some(Arc::clone(&jm)),
+        );
+        let app = jobs_router(state, two_user_auth());
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/jobs/{}/cancel", job.id))
+            .header("Authorization", "Bearer tok-alice")
+            .body(Body::empty())
+            .unwrap(); // safety: test-only
+        let resp = app.clone().oneshot(req).await.unwrap(); // safety: test-only
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let stored = db.get_sandbox_job(job.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, "cancelled");
+        let context = cm.get_context(job.id).await.unwrap();
+        assert_eq!(context.state, JobState::Cancelled);
+        let handle = jm
+            .get_handle(job.id)
+            .await
+            .expect("the handle stays registered after stop"); // safety: test-only
+        assert_eq!(handle.state, ContainerState::Stopped);
+
+        let detail = get_job_endpoint(app.clone(), &format!("/api/jobs/{}", job.id)).await;
+        assert_eq!(detail["state"], "cancelled");
+        let summary = get_job_endpoint(app, "/api/jobs/summary").await;
+        assert_eq!(summary["total"], 1);
+        assert_eq!(summary["in_progress"], 0);
+        assert_eq!(summary["stuck"], 0);
+        // `cancelled` is reported in the failed bucket, as before.
+        assert_eq!(summary["failed"], 1);
+        assert!(repair.detect_stuck_jobs().await.is_empty());
+    }
+
+    /// PZ-2 (WI#476): once the cancel is delivered, a context failure must
+    /// not skip the durable `cancelled` write. A completion that raced the
+    /// cancel leaves the context terminal; the handler reports that half
+    /// separately while the runtime and the row are already cancelled.
+    #[tokio::test]
+    async fn test_jobs_cancel_container_persists_when_context_raced_terminal() {
+        use crate::context::{ContextManager, JobState};
+
+        let (db, _dir) = test_db().await;
+        let mut job = make_sandbox_job("alice", "raced container cancellation");
+        job.status = "running".to_string();
+        job.success = None;
+        job.completed_at = None;
+        job.job_mode = "worker".to_string();
+        db.save_sandbox_job(&job).await.unwrap();
+
+        let cm = Arc::new(ContextManager::new(10));
+        cm.register_sandbox_job(job.id, "alice", "raced container cancellation", "desc")
+            .await
+            .unwrap();
+        // The worker reported completion between the DB check and the cancel:
+        // the context is terminal and refuses the Cancelled transition.
+        cm.update_context(job.id, |ctx| {
+            ctx.transition_to(JobState::Completed, Some("finished".to_string()))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        let jm = running_container_manager(job.id).await;
+        let state = build_state_full(
+            Some(db.clone()),
+            None,
+            None,
+            Some(Arc::clone(&cm)),
+            Some(Arc::clone(&jm)),
+        );
+        let app = jobs_router(state, two_user_auth());
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/jobs/{}/cancel", job.id))
+            .header("Authorization", "Bearer tok-alice")
+            .body(Body::empty())
+            .unwrap(); // safety: test-only
+        let resp = app.clone().oneshot(req).await.unwrap(); // safety: test-only
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(resp.into_body(), 16384)
+            .await
+            .unwrap(); // safety: test-only
+        let message = String::from_utf8_lossy(&body);
+        assert!(
+            message.contains("delivered and persisted"),
+            "context failure must be reported separately, got: {message}"
+        );
+
+        // The delivered cancel is durable even though the context refused it.
+        let stored = db.get_sandbox_job(job.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, "cancelled");
+        assert_eq!(
+            cm.get_context(job.id).await.unwrap().state,
+            JobState::Completed
+        );
+        let detail = get_job_endpoint(app, &format!("/api/jobs/{}", job.id)).await;
+        assert_eq!(detail["state"], "cancelled");
     }
 
     // ── WI#479: job_mode on the list endpoint ──────────────────────────
