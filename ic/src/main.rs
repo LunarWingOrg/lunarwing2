@@ -1215,16 +1215,14 @@ async fn async_main() -> anyhow::Result<()> {
         // WI#325: mission supervisors for cron-mode external workers.
         mgr.spawn_cron_supervisors(&config.owner_id, shutdown_tx.subscribe());
 
-        // WI#464: probe every configured external worker once at boot so a
-        // dead socket is an ERROR line in daemon.log instead of an invisible
-        // dispatch failure.  The daemon's listeners are already up here, and
-        // the probe runs in a background task so a slow or dead worker never
-        // delays boot.  Observability only — it never fails boot, disables a
-        // worker, or changes dispatch.
-        let boot_probe_mgr = Arc::clone(mgr);
-        tokio::spawn(async move {
-            boot_probe_mgr.probe_all_workers().await;
-        });
+        // WI#464: probe every configured external worker so a dead socket is
+        // an ERROR line in daemon.log instead of an invisible dispatch
+        // failure.  The probe runs in a background task and waits out a
+        // startup grace first: mt-admin starts this service before it starts
+        // the worker containers, so probing immediately would log routine
+        // noise on every cold start.  Observability only — it never fails
+        // boot, disables a worker, or changes dispatch.
+        mgr.spawn_boot_liveness_probe(shutdown_tx.subscribe());
 
         // WI#464 (ask #2): re-probe on an interval, logging only on a state
         // change, so a worker that dies after boot also produces an ERROR
