@@ -648,7 +648,7 @@ async fn recovery_history_reference_survives_gate_resume_and_is_user_scoped() {
     let started_at = rig.turn.message.received_at;
     db.update_conversation_metadata_field(
         cid,
-        "engine_turn_history",
+        &turn_history_metadata_key(rig.turn.thread_id),
         &serde_json::json!({
             "thread_id": rig.turn.thread_id.to_string(), "user_message_id": user_message_id,
             "started_at": started_at,
@@ -718,5 +718,102 @@ async fn recovery_history_reference_survives_gate_resume_and_is_user_scoped() {
     assert_eq!(
         turns[0].recovery.as_ref().unwrap().recovery_state,
         "recovered"
+    );
+}
+
+/// WI#517: two overlapping turns on one conversation write distinct metadata
+/// keys, so the later turn cannot overwrite the earlier turn's reference.
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn overlapping_turns_keep_separate_history_references() {
+    let rig = Rig::new(None, None).await;
+    let db = rig.turn.state.db.as_ref().unwrap().clone();
+    let cid = resolve_v1_conversation_for_message(db.as_ref(), &rig.turn.message)
+        .await
+        .unwrap();
+    let first_id = db
+        .add_conversation_message(cid, "user", "first turn")
+        .await
+        .unwrap();
+    let second_id = db
+        .add_conversation_message(cid, "user", "second turn")
+        .await
+        .unwrap();
+    let thread_a = lunarwing_engine::ThreadId::new();
+    let thread_b = lunarwing_engine::ThreadId::new();
+    let started_a = rig.turn.message.received_at;
+    let started_b = started_a + chrono::TimeDelta::seconds(3);
+    for (thread_id, user_message_id, started_at) in [
+        (thread_a, first_id, started_a),
+        (thread_b, second_id, started_b),
+    ] {
+        db.update_conversation_metadata_field(
+            cid,
+            &turn_history_metadata_key(thread_id),
+            &serde_json::json!({
+                "thread_id": thread_id.to_string(), "user_message_id": user_message_id,
+                "started_at": started_at,
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    let reference_a = history_reference(&rig.turn.state, &rig.turn.message, thread_a)
+        .await
+        .unwrap();
+    assert_eq!(reference_a.user_message_id, first_id);
+    assert_eq!(reference_a.started_at, started_a);
+    let reference_b = history_reference(&rig.turn.state, &rig.turn.message, thread_b)
+        .await
+        .unwrap();
+    assert_eq!(reference_b.user_message_id, second_id);
+    assert_eq!(reference_b.started_at, started_b);
+
+    let metadata = db.get_conversation_metadata(cid).await.unwrap().unwrap();
+    assert!(
+        metadata.get("engine_turn_history").is_none(),
+        "overlapping turns must not share the legacy single slot"
+    );
+}
+
+/// A turn that started before the per-thread key existed still resolves its
+/// reference from the legacy single slot, guarded by the thread match.
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn legacy_history_slot_resolves_only_for_its_thread() {
+    let rig = Rig::new(None, None).await;
+    let db = rig.turn.state.db.as_ref().unwrap().clone();
+    let cid = resolve_v1_conversation_for_message(db.as_ref(), &rig.turn.message)
+        .await
+        .unwrap();
+    let user_message_id = db
+        .add_conversation_message(cid, "user", "pre-upgrade turn")
+        .await
+        .unwrap();
+    db.update_conversation_metadata_field(
+        cid,
+        "engine_turn_history",
+        &serde_json::json!({
+            "thread_id": rig.turn.thread_id.to_string(), "user_message_id": user_message_id,
+            "started_at": rig.turn.message.received_at,
+        }),
+    )
+    .await
+    .unwrap();
+
+    let reference = history_reference(&rig.turn.state, &rig.turn.message, rig.turn.thread_id)
+        .await
+        .unwrap();
+    assert_eq!(reference.user_message_id, user_message_id);
+    assert!(
+        history_reference(
+            &rig.turn.state,
+            &rig.turn.message,
+            lunarwing_engine::ThreadId::new()
+        )
+        .await
+        .is_none(),
+        "the legacy slot must not serve a different thread"
     );
 }

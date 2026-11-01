@@ -39,6 +39,18 @@ struct HistoryReference {
     started_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Single-slot key written before WI#517. Read-only fallback so a turn that
+/// started under the old write path can still record its terminal markers.
+const LEGACY_HISTORY_KEY: &str = "engine_turn_history";
+const HISTORY_KEY_PREFIX: &str = "engine_turn_history.";
+
+/// Per-thread metadata key (WI#517). Every turn writes its own key, and both
+/// backends merge a single key atomically, so overlapping turns on one
+/// conversation can never overwrite each other's reference.
+pub(super) fn turn_history_metadata_key(thread_id: lunarwing_engine::ThreadId) -> String {
+    format!("{HISTORY_KEY_PREFIX}{thread_id}")
+}
+
 async fn history_reference(
     state: &EngineState,
     message: &IncomingMessage,
@@ -47,8 +59,11 @@ async fn history_reference(
     let db = state.db.as_ref()?;
     let cid = resolve_v1_conversation_for_message(db.as_ref(), message).await?;
     let metadata = db.get_conversation_metadata(cid).await.ok()??;
-    let reference: HistoryReference =
-        serde_json::from_value(metadata.get("engine_turn_history")?.clone()).ok()?;
+    let key = turn_history_metadata_key(thread_id);
+    let stored = metadata
+        .get(key.as_str())
+        .or_else(|| metadata.get(LEGACY_HISTORY_KEY))?;
+    let reference: HistoryReference = serde_json::from_value(stored.clone()).ok()?;
     (reference.thread_id == thread_id).then_some(reference)
 }
 

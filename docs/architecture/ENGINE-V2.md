@@ -1650,6 +1650,16 @@ Wraps the `Workspace` as the engine's `Store` trait:
 The router dual-writes compatibility conversation history to the relational
 `Database` separately. That database is not the backing store for `HybridStore`.
 
+The turn-history reference the completion path uses to correlate recovery
+markers is stored per engine thread: `engine_turn_history.<thread_id>` in the v1
+conversation's metadata, holding `{thread_id, user_message_id, started_at}` for
+the turn's persisted v1 user row. Both backends merge a single metadata key
+atomically, so overlapping engine turns on one conversation cannot overwrite
+each other's reference (WI#517). The pre-WI#517 single `engine_turn_history`
+slot is still read as a fallback, guarded by a `thread_id` match, so a turn that
+started before an upgrade still records its terminal markers. Keys are written
+once per thread and never reused.
+
 #### Pre-switch history import (WI#442 F7)
 
 The dual-write is forward-only: rows created before a tenant switched to
