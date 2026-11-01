@@ -74,20 +74,30 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
   denylist (`LD_PRELOAD`, `PATH`, …), and must not use the reserved
   `LUNARWING_`/`IRONCLAW_` prefixes (CV-4) — enforced daemon-side and
   re-checked worker-side. Bytes are written exactly (no newline trimming).
-- **Redaction (CV-7, DG-1/DG-2, DZ-1/DZ-4, EB-3/EB-4):** the conventional
-  worker scrubs selected value representations at the **serialized
-  tool-result boundary, before worker event truncation**, and reuses that
-  text for `last_output` and the LLM context. Examples include raw text,
-  lines of multi-line values, JSON-escaped and URL-encoded text,
+- **Redaction (CV-7, DG-1/DG-2, DZ-1/DZ-4, EB-3/EB-4, EE-8/EE-9, DZ-5):** the
+  conventional worker scrubs selected value representations at the
+  **serialized tool-result boundary, before worker event truncation**, and
+  reuses that text for `last_output` and the LLM context. Examples include raw
+  text, lines of multi-line values, JSON-escaped and URL-encoded text,
   lowercase/uppercase hex, and base64 (standard/URL-safe, padded/unpadded,
-  and standard-alphabet offset-1/2 stream cores). Encoded forms are matched
-  with line breaks folded out (real newlines and JSON-escaped `\n`/`\r`), so
-  **any** CLI wrap width is covered from one contiguous variant — the
-  `base64` 76-column default, `openssl base64` / `base64 -w 64`, `xxd -p` at
-  60 columns, etc. For secrets whose encoded form is at most 4096 chars,
-  individual wrap lines at the canonical widths are armed as well (a tool
-  returning one line at a time); larger secrets rely on whole-blob fold
-  matching so the variant count stays bounded.
+  and standard-alphabet offset-1/2 stream cores). Encoded forms and the raw
+  value itself are matched with line breaks folded out (real newlines and
+  JSON-escaped `\n`/`\r`), so **any** CLI wrap width is covered from one
+  contiguous variant — the `base64` 76-column default, `openssl base64` /
+  `base64 -w 64`, `xxd -p` at 60 columns, etc. — and so is a token re-wrapped
+  by `fold -w N` or `fmt` (EE-8). Folded matches are translated back to
+  original offsets per character, so a value ending in a multi-byte character
+  (a password ending in `é` or `€`) is redacted instead of panicking the
+  replacement sweep. Every direct and folded match is collected before any
+  replacement and merged in one sweep (EE-9), so a second value sharing a
+  substring cannot leave its non-overlapping tail behind. For secrets whose
+  encoded form is at most 4096 chars, individual wrap lines at the canonical
+  widths are armed as well (a tool returning one line at a time); larger
+  secrets rely on whole-blob fold matching so the variant count stays
+  bounded. Per-line variants skip RFC 7468 armor delimiters and lines with no
+  alphanumeric byte (DZ-5): a punctuation-only line of a multi-line value is
+  therefore not armed on its own, though its whole value and its other lines
+  still are.
   - Size limit, stated plainly (EE-2): partial coverage of a truncated
     print exists ONLY at the canonical wrap widths — 76-column base64 and
     60-column hex, whose individual lines are the ones armed — and only up
@@ -122,15 +132,7 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
     hex that covers secrets up to 3072 / 2048 raw bytes and leaks above;
     at any other width (`openssl base64` at 64, `base64 -w 32`) the whole
     encoding leaks for every secret from about 56 bytes up, with no upper
-    bound. The raw value itself is matched only directly, never
-    fold-matched (EE-8): `fold -w N` of an unencoded token leaks from 16
-    bytes up to fully. Two mounted values sharing a substring: on the
-    folding slow path the sweep merges overlapping matches, but both
-    fold-free passes — the `scrub_folded` fast path (encoded forms) and
-    the direct pass (raw values) — still replace sequentially, so in
-    fold-free text the non-overlapping tail of the second value can
-    survive when only the overlapping form is printed (EE-9 residual,
-    WI#383).
+    bound.
   - Tools can truncate **before** this boundary: shell capture is capped at
     64 KiB and then reduced to a 32 KiB head/tail result. Fragments at those
     internal cuts may survive. The partial-prefix check only protects the
@@ -280,7 +282,10 @@ cannot be listed).
 
 - Remaining !1542 Low/Info findings: structured-field extraction redaction
   gaps (`jq -r .field` output is decoded text, not an armed encoding),
-  low-entropy line over-redaction, temporary plaintext copies,
+  low-entropy line over-redaction beyond the landed filter (armor delimiters
+  and lines with no alphanumeric byte are skipped, but short structural lines
+  such as `apiVersion: v1` and `kind: Config` are still armed), temporary
+  plaintext copies,
   preparation/cleanup orphans, no promotion deadline, remaining synchronous
   filesystem cleanup on async tasks, and stronger delivery, sparse-file and
   persisted-insert tests. Staged-path/audit scrubbing (DZ-6) and duplicate
@@ -294,11 +299,10 @@ cannot be listed).
   near-wholly above the 4096-char arming cap and, at non-canonical widths,
   below it too (EE-2 — needs that automaton with
   aligned chunks); line-prefixed views (`read_file`, `cat -n`) defeat
-  folding (EE-7); the raw value is never fold-matched (EE-8); both
-  fold-free passes — the `scrub_folded` fast path (encoded forms) and the
-  direct pass (raw values) — still replace sequentially, so the
-  non-overlapping tail of a second secret sharing a substring can survive
-  in fold-free text (EE-9 residual);
+  folding (EE-7); partial/truncated prints leak
+  near-wholly above the 4096-char arming cap and, at non-canonical widths,
+  below it too (EE-2 — needs that automaton with
+  aligned chunks);
   an event body uploaded slowly past a token revoke is persisted
   daemon-side without the value scrub (EE-10); a per-line variant can split
   a JSON escape and leave malformed scrubbed text for the model (EE-11); a

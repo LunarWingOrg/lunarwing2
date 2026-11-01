@@ -1960,6 +1960,32 @@ struct HistoryQuery {
     before: Option<String>,
 }
 
+/// Engine V2 approval gate for this thread, shaped for the history envelope
+/// (WI#520).
+///
+/// Engine V2 parks approvals in the shared gate store instead of the legacy
+/// in-memory session turn, so durable history carried no approval state and a
+/// client polling only `/api/chat/history` could never learn the `request_id`
+/// while a gate was live. The lookup is user-scoped and thread-scoped and a
+/// failure here degrades to `None` (logged): history must still render.
+async fn engine_pending_approval(user_id: &str, thread_id: Uuid) -> Option<PendingApprovalInfo> {
+    if !crate::bridge::is_engine_v2_enabled() {
+        return None;
+    }
+    match crate::bridge::get_engine_pending_approval(user_id, thread_id).await {
+        Ok(pending) => pending.as_ref().map(PendingApprovalInfo::from),
+        Err(error) => {
+            tracing::warn!(
+                %user_id,
+                %thread_id,
+                %error,
+                "Failed to read the engine approval gate for chat history"
+            );
+            None
+        }
+    }
+}
+
 async fn chat_history_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
@@ -2027,12 +2053,13 @@ async fn chat_history_handler(
 
         let oldest_timestamp = messages.first().map(|m| m.created_at.to_rfc3339());
         let turns = build_turns_from_db_messages(&messages);
+        let pending_approval = engine_pending_approval(&user.user_id, thread_id).await;
         return Ok(Json(HistoryResponse {
             thread_id,
             turns,
             has_more,
             oldest_timestamp,
-            pending_approval: None,
+            pending_approval,
         }));
     }
 
@@ -2102,23 +2129,25 @@ async fn chat_history_handler(
         if !messages.is_empty() {
             let oldest_timestamp = messages.first().map(|m| m.created_at.to_rfc3339());
             let turns = build_turns_from_db_messages(&messages);
+            let pending_approval = engine_pending_approval(&user.user_id, thread_id).await;
             return Ok(Json(HistoryResponse {
                 thread_id,
                 turns,
                 has_more,
                 oldest_timestamp,
-                pending_approval: None,
+                pending_approval,
             }));
         }
     }
 
-    // Empty thread (just created, no messages yet)
+    // Empty thread (just created, no messages yet).
+    let pending_approval = engine_pending_approval(&user.user_id, thread_id).await;
     Ok(Json(HistoryResponse {
         thread_id,
         turns: Vec::new(),
         has_more: false,
         oldest_timestamp: None,
-        pending_approval: None,
+        pending_approval,
     }))
 }
 

@@ -635,6 +635,18 @@ Enforced controls (opencode2 lane unless noted):
    future phone-home features and `webfetch`/shell exfiltration, and the only
    one that holds against a compromised agent (see the gate record above).
 
+   The allowlist is derived, never guessed: `worker_egress_target_records`
+   reads `LLM_BASE_URL`, the three worker `*_BASE_URL` overrides and
+   `PEBBLE_BASE_URL` from `lunarwing.env`, plus the pebble lane's own
+   `PEBBLE_BASE_URL`/`NANOGPT_BASE_URL` from `pebble.env` (WI#506). A target
+   the host cannot resolve is silently omitted from the ruleset, so the
+   pebble lane refuses to start when its model backend is undeclared or
+   unresolvable (`worker_egress_require_pebble_backend`) and names the exact
+   remediation instead of letting every dispatched job fail with an opaque
+   connect error. `worker-egress <tenant>` prints the derived targets under
+   `allowlist targets:`; see `docs/ops/PEBBLE-WORKER.md` for the pebble
+   backend pin.
+
    **Rootless Podman first-start keeper (WI#504):** when no worker container is
    running, mt-admin creates `lw-egress-keeper-<tenant>` on that tenant's
    `lw-egress-<tenant>` network before applying the filter. Where the tenant's
@@ -831,7 +843,20 @@ Enforced controls (opencode2 lane unless noted):
    `--profile remote` drives it from the host. Control 9 remains the separate
    host-side listener audit. These are naive-use checks, not a substitute for
    the egress boundary. A passing parser-only namespace probe is not acceptance
-   of the real entrypoint smoke or of a full affected-host `build-tenant`.
+   of the real entrypoint smoke or of a full affected-host `build-tenant`; the
+   acceptance run is recorded below.
+   **Affected-host acceptance (WI#511, 2026-11-01):**
+   `mt-admin build-opencode2-worker --no-cache` on a Gentoo 2.18 / OpenRC
+   0.63.3 host (Podman 5.8.2, above the 4.5 floor) built the
+   candidate through `podman build --network=host` and step 38/48
+   (`RUN --network=none bash /app/scripts/runtime_smoke_entrypoint.sh`)
+   printed `runtime-smoke: 5/5 checks passed` — 3 listeners, only health/WS
+   8443 and 19090 non-loopback — before the out-of-band verify and the
+   `:latest` tag. The build's own step-34 self-tests include
+   `runtime_smoke_test.py`. On the same host and build shape a plain `RUN`
+   read the host netns (105 TCP + 3 TCP6 rows) while `RUN --network=none`
+   read a private netns (0 rows) with loopback still bindable and
+   connectable, which is the premise this step relies on.
 7. **Bump checklist (REQUIRED for every worker version bump).** The bump
    entry in this file must record the upstream features that add network
    exposure or outbound publication — tunnels, pairing, sharing, remote MCP,
@@ -1018,7 +1043,7 @@ sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <name> --with-pebble
 sudo ic/scripts/lunarwing-mt-admin.sh build-pebble-worker
 ```
 
-Persistent worker mode (`PEBBLE_MODE=websocket`). Requires `AGENT_AUTH_TOKEN` for WebSocket auth and optionally `NANOGPT_API_KEY` for the underlying NanoGPT backend (configure per-tenant via `configure-pebble <name> --nanogpt-api-key <key>`). Upstream Pebble v0.5.0 is fetched by its reviewed full commit, both Cargo builds use committed lockfiles, and base images/package indexes/toolchain downloads are pinned. See `pebble4lunarwing/` for details.
+Persistent worker mode (`PEBBLE_MODE=websocket`). Requires `AGENT_AUTH_TOKEN` for WebSocket auth and optionally `NANOGPT_API_KEY` for the underlying NanoGPT backend (configure per-tenant via `configure-pebble <name> --nanogpt-api-key <key>`). That command also pins the model backend into `pebble.env` as `PEBBLE_BASE_URL` (declaration) and `NANOGPT_BASE_URL` (the key the binary honours), defaulting to `https://nano-gpt.com/api`, so the tenant's egress allowlist derives the backend the worker really dials (WI#506); an undeclared or unresolvable backend refuses the lane at start instead of failing every job. Upstream Pebble v0.5.0 is fetched by its reviewed full commit, both Cargo builds use committed lockfiles, and base images/package indexes/toolchain downloads are pinned. See `pebble4lunarwing/` for details.
 
 Launch identity (WI#454, supersedes WI#422): the image defaults to
 `USER 10004:10004`; mt-admin runs the bridge as `10104:10004` and the task
@@ -1107,6 +1132,79 @@ This covers only the opencode2 floor; a kimi/pebble build failure after the
 stop can still strand a tenant, tracked as WI#527. Sources: Podman
 [v4.5.0 go.mod](https://github.com/containers/podman/blob/v4.5.0/go.mod) and
 [v4.4.4 go.mod](https://github.com/containers/podman/blob/v4.4.4/go.mod).
+
+**WI#527 — upgrade build ordering and convergence.** The upgrade no longer
+stops first and rebuilds second. Both paths check out the target and build
+every *selected worker image* to a per-tenant candidate tag
+(`lunarwing-worker-<lane>:wi527-<tenant>`) **while the tenant still runs**, then
+stop, build only the daemon/bridge/WASM, and promote the candidates to
+`:latest` once the target daemon exists. Consequences:
+
+- A worker-lane build failure is a no-op for a running tenant: the clone is
+  returned to its recorded position (branch or detached HEAD, and a pre-upgrade
+  stash is popped back), the candidates are discarded, and the error says the
+  tenant was not stopped. The only post-stop build is the daemon, bridge and
+  WASM — no worker lane is rebuilt after the stop, on either path. The external
+  wrapper's live path runs `build-tenant --with-wasm --require-wasm` after the
+  stop and asks for every *enabled* lane as a candidate
+  (`build-worker-candidates <tenant> --enabled`, `--with-pebble` still
+  available as an explicit opt-in), so the restarted daemon is always the newly
+  built one and no enabled lane silently keeps its previous image.
+- Every pre-stop exit on the wrapper path now puts the clone back and pops the
+  pre-upgrade stash — including a DarkIRC refusal and a failed `git fetch` /
+  `git checkout`, not only a candidate-build failure — and a candidate-build
+  failure also discards the partial candidate images and lane record, so a
+  later manual promote cannot promote images built from the checkout that
+  failure reverted (run-300 TO-4).
+- `build_tenant` records each completed stage (`daemon`, `bridge`, `wasm`) to
+  a root-owned marker file in the tenant lifecycle lock directory
+  (`/run/lock/lunarwing-tenants/<tenant>-build-stages` by default), never in
+  tenant-writable state; the directory is created with the same hardened
+  no-symlink, root-owned 0700 sequence as the lifecycle locks. Each run starts
+  with a `start` sentinel, so "nothing built yet" is distinguishable from an
+  unreadable marker. Post-stop convergence classifies the failure by that
+  marker, never by matching die prose: before the daemon stage the previous
+  build is restarted in place; once the target daemon was built a restart would
+  run the *new* binary and apply the target's migrations, so the previous
+  commit is rebuilt before starting (non-strict WASM: a broken WASM toolchain
+  must not block restoring a binary whose artifacts are already installed), and
+  if that fails the tenant is reported **stopped** with explicit rollback
+  commands — never as "restored". A missing, unreadable or unknown marker is
+  treated as past-the-daemon (fail closed) on both paths (run-300 TO-7 closed
+  the wrapper's missing-marker read as "none").
+- `promote-worker-images <tenant>` re-runs a promotion that failed after the
+  daemon build: already-promoted lanes are skipped, the rollback file keeps the
+  **first** pre-promotion `:latest` ID per lane (so a re-run never records an
+  already-promoted candidate as the old image), and the lane list is updated
+  per lane, so a re-run only promotes what remains. `restore-worker-images
+  <tenant>` re-tags those recorded IDs; both upgrade paths call it on a failed
+  upgrade, and it is printed in the wrapper's rollback steps. A rollback is
+  only reported when the re-tag actually succeeded. The record is cleared by
+  `clear-promote-rollback` only when the **whole** upgrade has succeeded
+  (both paths), and a new candidate run discards any record from an earlier
+  run, so a later failure can never re-tag a lane to an image this run never
+  had. `build-worker-candidates` and `promote-worker-images` serialise with a
+  running upgrade by **holding** the tenant upgrade lock for the whole verb
+  (a bare preflight was a check-then-run race); when they run inside the
+  upgrade wrapper's own locked boundary they reuse the inherited descriptor
+  instead of re-flocking — a second open-file description would deadlock
+  against that parent, which was the run-300 TO-1 blocker.
+- A pebble candidate keeps the toolchain profile of the `:latest` image it will
+  replace (the image's `org.opencontainers.image.toolchain-profile` label), so
+  an upgrade no longer downgrades an operator's fat (`--with-toolchains`) image
+  to slim. The fat build's staging tag is derived from this build's output tag
+  (`<output-tag>-candidate`), so two concurrent builds cannot retag each
+  other's image between the smoke gate and the final retag.
+- The post-stop build log is a root-only `mktemp` file under `${TMPDIR:-/tmp}`
+  that is kept on failure (`build log: <path>` in the error). It is not pruned
+  automatically; on a long-lived host the operator should clear `/tmp` of
+  `lw-upgrade-build.*` files. Candidate tags are removed on the success path
+  and by `cleanup_candidate_workers` on the pre-stop failure path; a lane whose
+  `rmi` fails stays in the lane file (visible to `cleanup-worker-candidates
+  <tenant>`, which retries it) and never affects the running lanes, which still
+  point at `:latest`. `last-build-stage` and `reset-build-stage` require root,
+  because the marker (and the candidate lane list) live in the root-only lock
+  directory and are not persistent across a reboot.
 
 ```bash
 cd opencode2.4lunarwing
@@ -1834,8 +1932,9 @@ lock wrappers restore the caller's errexit state; a nested/inherited lifecycle
 lock keeps its outer owner's descriptor and ownership. Userns repair and
 failed-checkout recovery also capture startup outside conditional-call contexts,
 so a failed restart cannot be reported as recovered. Regression coverage:
-`test-mt-admin-worker-startup.sh`, `test-mt-admin-worker-image-contract.sh` and
-`test-mt-admin-upgrade-clean-tree.sh`.
+`test-mt-admin-worker-startup.sh`, `test-mt-admin-worker-image-contract.sh`,
+`test-mt-admin-upgrade-clean-tree.sh` and
+`test-mt-admin-upgrade-build-failure.sh` (WI#527).
 
 **WI#456 runbook — kimi dispatch fails with `Connection refused (os error
 111)`, no kimi ERROR lines in daemon.log:** one verified cause is refusal before the

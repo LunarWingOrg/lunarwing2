@@ -243,6 +243,17 @@ _worker_egress_llm_targets() {
       || die "unsafe tenant env path for worker egress ($key)"
     [[ -n "$value" ]] && printf '%s\n' "$value"
   done
+  # WI#506: the pebble lane's model backend lives in its own worker env file
+  # (configure-pebble writes it there, and it is the same value the pebble
+  # binary honours as NANOGPT_BASE_URL). Derive it from that file so the
+  # allowlist covers the backend the worker really dials; a tenant that has no
+  # pebble.env contributes nothing.
+  env_path="$(tenant_env_dir "$name")/pebble.env"
+  for key in PEBBLE_BASE_URL NANOGPT_BASE_URL; do
+    value="$(read_tenant_env_value "$name" "$env_path" "$key")" \
+      || die "unsafe tenant env path for worker egress ($key)"
+    [[ -n "$value" ]] && printf '%s\n' "$value"
+  done
   return 0
 }
 
@@ -297,6 +308,50 @@ worker_egress_targets() {
     seen["$address $port"]=1
     printf '%s %s\n' "$address" "$port"
   done <<<"$records"
+}
+
+# WI#506: the pebble lane declares its model backend in pebble.env. Return the
+# first declaration found — PEBBLE_BASE_URL (written by configure-pebble), then
+# the pebble binary's own NANOGPT_BASE_URL for a hand-configured tenant — or
+# nothing when the lane was never given one.
+worker_egress_pebble_backend() {
+  local name="$1" env_path key value
+  env_path="$(tenant_env_dir "$name")/pebble.env"
+  for key in PEBBLE_BASE_URL NANOGPT_BASE_URL; do
+    value="$(read_tenant_env_value "$name" "$env_path" "$key")" \
+      || die "unsafe pebble env path for worker egress ($key)"
+    if [[ -n "$value" ]]; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# Refuse the pebble lane before its container exists when the model backend is
+# not declared or not resolvable here. `_worker_egress_llm_targets` is the one
+# source of the allowlist, so a backend it cannot resolve is silently dropped
+# from the rendered ruleset and static host mappings — and then every
+# dispatched job dies seconds later with an opaque connect error that reads
+# like a worker crash.
+worker_egress_require_pebble_backend() {
+  local name="$1" backend split host port subnet gateway resolved
+  worker_egress_enabled "$name" || return 0
+  backend="$(worker_egress_pebble_backend "$name")" || return 1
+  if [[ -z "$backend" ]]; then
+    die "pebble worker for '$name' has no declared model backend, so the worker egress filter would block every job; pin it with 'configure-pebble $name --nanogpt-api-key <key> --base-url <url>' (default $PEBBLE_DEFAULT_BASE_URL), or allow the backend host yourself with 'configure-worker-egress $name --allow <host>:443'"
+  fi
+  split="$(_worker_egress_split_target "$backend" true)" \
+    || die "invalid pebble model backend '$(sanitize_display_value "$backend")' for tenant '$name'"
+  read -r host port <<<"$split"
+  subnet="$(worker_egress_state_get "$name" SUBNET)"
+  gateway="$(_worker_egress_gateway "$subnet")"
+  resolved="$(_worker_egress_resolve_target "$backend" "$gateway" false)" || return 1
+  if [[ -z "$resolved" ]]; then
+    die "pebble worker for '$name' cannot resolve its model backend '$host:$port' to IPv4 from this host, so the worker egress filter would omit it and every job would fail; fix DNS for '$host' here or point 'configure-pebble $name --base-url' at a resolvable endpoint (a literal address still has to be allowed with 'configure-worker-egress $name --allow <address>:$port')"
+  fi
+  say "pebble model backend $host:$port is derived into $name's worker egress allowlist"
+  return 0
 }
 
 _worker_egress_static_hosts() {
@@ -676,7 +731,7 @@ worker_egress_verify_after_start() {
 }
 
 worker_egress_audit() {
-  local name="$1" network subnet container attached=0 missing=0 dump details
+  local name="$1" network subnet container attached=0 missing=0 dump details targets line
   name="$(sanitize_name "$1")"
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
   network="$(worker_egress_network_name "$name")"
@@ -699,6 +754,20 @@ worker_egress_audit() {
   else
     say "  network: MISSING"
     missing=1
+  fi
+  # WI#506: show the derived allowlist itself. For a --with-pebble tenant this
+  # is where the pebble model backend appears (derived from pebble.env's
+  # PEBBLE_BASE_URL), which is what makes the lane's traffic path auditable.
+  if targets="$(worker_egress_target_records "$name" 2>/dev/null)"; then
+    say "  allowlist targets:"
+    if [[ -z "$targets" ]]; then
+      say "    (none derived; set LLM_BASE_URL, an OPENCODE*/KIMI_BASE_URL, or PEBBLE_BASE_URL)"
+    else
+      while read -r line; do
+        [[ -n "$line" ]] || continue
+        say "    $line"
+      done <<<"$targets"
+    fi
   fi
   for container in "lunarwing-pebble-$name" "lunarwing-opencode-$name" \
                    "lunarwing-opencode2-$name" "lunarwing-kimi-$name" \
@@ -804,6 +873,10 @@ prepare_worker_egress() {
   local name="$1" worker="$2" launch_text
   require_cmd nft
   worker_egress_ensure "$name" >/dev/null
+  # WI#506: refuse a pebble lane whose backend the filter would block before
+  # any container exists, rather than letting every dispatched job fail with
+  # an opaque connect error minutes later.
+  [[ "$worker" != pebble ]] || worker_egress_require_pebble_backend "$name"
   worker_egress_apply "$name" >/dev/null
   launch_text="$(worker_egress_launch_args "$name")" \
     || die "cannot render worker egress launch arguments for '$name'"

@@ -595,6 +595,37 @@ resolved request IDs cannot be resurrected by stale responses. Engine startup
 unavailability and transient recovery failures are retried. Authentication is by
 bearer header (query-token fallback is reserved for streaming routes).
 
+**Approval state in `GET /api/chat/history` (WI#520).** The `pending_approval`
+envelope is populated for Engine V2 threads too. Engine V2 dual-writes history
+and leaves the legacy in-memory session turn untouched, so before WI#520 the
+field was `null` for the whole life of a Live Engine V2 approval gate and a
+client polling only history could never learn the `request_id` required by
+`POST /api/chat/approval` — a live highwinds gate expired at its 30-minute
+window that way. Both history handlers now run
+`bridge::get_engine_pending_approval(user, thread)` for every return path
+(including paginated and DB-backed history) and map the matching gate into
+`PendingApprovalInfo` (`request_id`, `tool_name`, `description`, and the
+**redacted** display parameters; the executable parameters never reach the
+envelope). The lookup is:
+
+- **user-scoped** — another user's gate is invisible, and the endpoint still
+  never resolves another user's gate on approval;
+- **thread-exact** — the gate's own `thread_id` must equal the requested
+  thread, so a sibling thread that only shares the conversation cannot surface
+  an approvable id;
+- **live-only** — expired gates and gates parked on a thread that is gone or
+  no longer `Waiting` are dropped (the same WI#332 filter the pending-gates
+  endpoint uses);
+- **approval-only** — `ResumeKind::Approval` gates. Authentication and
+  external gates are not resolvable through the approval endpoint and appear
+  only in `pending-gates`/SSE.
+
+A gate-store read failure degrades to `null` with a warn-level log: history must
+still render. `null` therefore means "no live approval gate for this thread in
+this envelope", not "nothing is pending anywhere" — automation that needs every
+gate (auth included) must poll `GET /api/chat/pending-gates` or follow the
+`approval_needed` SSE event, exactly as the browser UI does.
+
 Pending gates are filtered by live thread state (WI#332): a gate parked on a
 thread is only listed while that thread exists, is still `Waiting`, and belongs
 to the gate's user — the same validity rule boot-time reconciliation enforces.
@@ -1650,6 +1681,16 @@ Wraps the `Workspace` as the engine's `Store` trait:
 The router dual-writes compatibility conversation history to the relational
 `Database` separately. That database is not the backing store for `HybridStore`.
 
+The turn-history reference the completion path uses to correlate recovery
+markers is stored per engine thread: `engine_turn_history.<thread_id>` in the v1
+conversation's metadata, holding `{thread_id, user_message_id, started_at}` for
+the turn's persisted v1 user row. Both backends merge a single metadata key
+atomically, so overlapping engine turns on one conversation cannot overwrite
+each other's reference (WI#517). The pre-WI#517 single `engine_turn_history`
+slot is still read as a fallback, guarded by a `thread_id` match, so a turn that
+started before an upgrade still records its terminal markers. Keys are written
+once per thread and never reused.
+
 #### Pre-switch history import (WI#442 F7)
 
 The dual-write is forward-only: rows created before a tenant switched to
@@ -1696,6 +1737,32 @@ bookkeeping, not conversation context. The import is best-effort — a database
 or store failure is logged and the turn proceeds without the extra context. The
 marker lookup costs one extra query on each turn of a conversation that has not
 been imported yet.
+
+#### Durable role census (WI#518)
+
+`conversation_messages.role` is free text shared by the classic loop, the
+engine dual-write, and the turn-recovery train. The vocabulary lives in one
+place, `ic/src/history/roles.rs`:
+
+- **Conversation roles** (`user`, `assistant`) — replayed into model context
+  and importable into an engine surface.
+- **Tool transcripts** (`tool_calls`) — JSON reconstructed into tool messages
+  by the v1 hydration path, never replayed as text.
+- **Markers** (`interrupted`, `turn_recovery`) — display state only; never
+  replayed, never used as a title or message count.
+
+Every consumer classifies through `classify_conversation_role` /
+`is_bookkeeping_role`: the v1 history import, `rebuild_chat_messages_from_db`,
+the gateway turns builder, and the FIFO status interpreter
+(`router.rs::interpret_message_event`, which rejects bookkeeping roles before
+its wire-role ladder). Conversation previews and counts keep the SQL
+`role = 'user'` predicate, which is safe by construction because markers can
+never be a user row. Engine `MessageAdded` wire roles are a separate namespace
+(`MessageRole::wire_name()`), classified by `classify_engine_role` with a
+positive ladder, so an unregistered wire role is never surfaced.
+
+A new durable role is added to `ALL_ROLES` **and** `classify_conversation_role`;
+the census tests fail until both agree and until all four consumers handle it.
 
 ### Channel Routing And Delivery
 

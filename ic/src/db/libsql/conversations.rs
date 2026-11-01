@@ -775,4 +775,65 @@ mod tests {
             "Expected same heartbeat conversation on repeated calls"
         );
     }
+
+    #[tokio::test]
+    async fn bookkeeping_roles_never_surface_as_titles_or_counts() {
+        use crate::history::roles::{
+            ASSISTANT_ROLE, BOOKKEEPING_ROLES, USER_ROLE, classify_conversation_role,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_role_census.db");
+        let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let user_id = "census_user";
+        let channel = "cli";
+        let conv = backend
+            .create_conversation(channel, user_id, None)
+            .await
+            .unwrap();
+
+        // Bookkeeping rows land first: none may become the title.
+        for role in BOOKKEEPING_ROLES {
+            assert!(!matches!(
+                classify_conversation_role(role),
+                crate::history::roles::ConversationRole::User
+                    | crate::history::roles::ConversationRole::Assistant
+            ));
+            backend
+                .add_conversation_message(conv, role, &format!("{role} payload"))
+                .await
+                .unwrap();
+        }
+        backend
+            .add_conversation_message(conv, USER_ROLE, "real question")
+            .await
+            .unwrap();
+        backend
+            .add_conversation_message(conv, ASSISTANT_ROLE, "real answer")
+            .await
+            .unwrap();
+
+        for summaries in [
+            backend
+                .list_conversations_with_preview(user_id, channel, 10)
+                .await
+                .unwrap(),
+            backend
+                .list_conversations_all_channels(user_id, 10)
+                .await
+                .unwrap(),
+        ] {
+            let summary = summaries
+                .iter()
+                .find(|s| s.id == conv)
+                .expect("conversation listed");
+            assert_eq!(
+                summary.message_count, 1,
+                "only the user row counts as a message"
+            );
+            assert_eq!(summary.title.as_deref(), Some("real question"));
+        }
+    }
 }

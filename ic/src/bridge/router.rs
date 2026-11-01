@@ -5,7 +5,7 @@ pub(crate) mod auth;
 mod estimation_tests;
 mod outcome;
 mod v1_history_import;
-use outcome::await_thread_outcome;
+use outcome::{await_thread_outcome, turn_history_metadata_key};
 
 use std::sync::{Arc, OnceLock};
 
@@ -33,6 +33,10 @@ use crate::db::Database;
 use crate::error::Error;
 use crate::extensions::naming::legacy_extension_alias;
 use crate::gate::pending::{PendingGate, PendingGateKey};
+use crate::history::roles::{
+    ASSISTANT_ROLE, EngineRole, INTERRUPTED_ROLE, USER_ROLE, classify_engine_role,
+    is_bookkeeping_role,
+};
 
 #[cfg(test)]
 use std::collections::HashMap;
@@ -1678,7 +1682,7 @@ async fn deliver_expired_gate_text(
         };
         if let Some(cid) = v1_conv_id
             && let Err(error) = db
-                .add_conversation_message(cid, "assistant", &outbound)
+                .add_conversation_message(cid, ASSISTANT_ROLE, &outbound)
                 .await
         {
             tracing::warn!(%error, "failed to persist expired-gate reply to v1 history");
@@ -2279,6 +2283,47 @@ pub async fn get_engine_pending_gate(
         )),
         PendingGateResolution::None | PendingGateResolution::Ambiguous => Ok(None),
     }
+}
+
+/// History-facing lookup (WI#520): the live Engine V2 *approval* gate parked
+/// on exactly `thread_id` for `user_id`.
+///
+/// `GET /api/chat/history` uses this to populate its `pending_approval`
+/// envelope, because Engine V2 parks approvals in this store instead of the
+/// legacy in-memory session and durable history carries no gate state. The
+/// match is strict on the gate's own thread: a hint that matches only a
+/// sibling thread's conversation must never surface here, since the envelope
+/// is rendered for one thread and the returned `request_id` is approvable.
+/// Only `ResumeKind::Approval` gates surface: authentication and external
+/// gates are not resolvable through the approval endpoint and keep their
+/// dedicated pending-gates/SSE flows. User scoping, expiry pruning and the
+/// live-thread filter match [`get_engine_pending_gate`].
+pub async fn get_engine_pending_approval(
+    user_id: &str,
+    thread_id: uuid::Uuid,
+) -> Result<Option<crate::gate::pending::PendingGateView>, Error> {
+    let Some(lock) = ENGINE_STATE.get() else {
+        return Ok(None);
+    };
+    let guard = lock.read().await;
+    let Some(state) = guard.as_ref() else {
+        return Ok(None);
+    };
+    let gates = filter_live_pending_gates(
+        &state.store,
+        state.pending_gates.list_for_user(user_id).await,
+    )
+    .await;
+    Ok(gates
+        .iter()
+        .find(|gate| {
+            gate.thread_id.0 == thread_id
+                && matches!(
+                    gate.resume_kind,
+                    lunarwing_engine::ResumeKind::Approval { .. }
+                )
+        })
+        .map(crate::gate::pending::PendingGateView::from))
 }
 
 /// Recover live approval/auth prompts lost during a gateway disconnect.
@@ -3227,7 +3272,7 @@ async fn interrupt_engine_conversation(
         // classic rebuild path, so markers never reach restored LLM context.
         if let Some(ref db) = state.db
             && let Some(cid) = resolve_v1_conversation_for_message(db.as_ref(), message).await
-            && let Err(error) = db.add_conversation_message(cid, "interrupted", "").await
+            && let Err(error) = db.add_conversation_message(cid, INTERRUPTED_ROLE, "").await
         {
             debug!(%error, "engine v2: failed to persist interrupted-turn marker");
         }
@@ -3931,7 +3976,7 @@ async fn handle_with_engine_inner(
         && let Some(cid) = resolve_v1_conversation_for_message(db.as_ref(), message).await
     {
         match db
-            .add_conversation_message(cid, "user", effective_content)
+            .add_conversation_message(cid, USER_ROLE, effective_content)
             .await
         {
             Ok(id) => {
@@ -3940,7 +3985,11 @@ async fn handle_with_engine_inner(
                     "started_at": message.received_at,
                 });
                 if let Err(error) = db
-                    .update_conversation_metadata_field(cid, "engine_turn_history", &reference)
+                    .update_conversation_metadata_field(
+                        cid,
+                        &turn_history_metadata_key(thread_id),
+                        &reference,
+                    )
                     .await
                 {
                     tracing::warn!(%error, "failed to persist Engine V2 turn history reference");
@@ -4201,18 +4250,31 @@ fn format_action_display_name(action_name: &str, params_summary: &Option<String>
 /// Interpreter step output arrives under either the legacy `User` role
 /// (pre-WI#227 transcripts) or the sealed `StepRecord` wire spelling — the
 /// status hints are derived from the preview shape in both cases.
+///
+/// Every bookkeeping role in the durable-role census is rejected before the
+/// wire-role ladder runs. The wire namespace cannot carry those roles today,
+/// but a caller that forwards a persisted row must never have its JSON
+/// surface as a status hint (WI#518), and the positive classification of the
+/// ladder means an unregistered wire role is never surfaced either.
 fn interpret_message_event(role: &str, content_preview: &str) -> Option<&'static str> {
-    let step_output = role == "User" || role == "StepRecord";
-    if step_output
-        && (content_preview.contains("Error") || content_preview.starts_with("Traceback"))
-    {
+    if is_bookkeeping_role(role) {
+        return None;
+    }
+    match classify_engine_role(role) {
+        EngineRole::User | EngineRole::StepRecord => interpret_step_preview(content_preview),
+        EngineRole::Assistant => Some("Executing code..."),
+        EngineRole::Other => None,
+    }
+}
+
+/// Status hints for interpreter step output, keyed on the preview shape.
+fn interpret_step_preview(content_preview: &str) -> Option<&'static str> {
+    if content_preview.contains("Error") || content_preview.starts_with("Traceback") {
         Some("Code error — retrying...")
-    } else if step_output && content_preview.starts_with("[stdout]") {
+    } else if content_preview.starts_with("[stdout]") {
         Some("Code executed")
-    } else if step_output && content_preview.starts_with("[code ") {
+    } else if content_preview.starts_with("[code ") {
         Some("Code executed (no output)")
-    } else if role == "Assistant" {
-        Some("Executing code...")
     } else {
         None
     }
@@ -4348,7 +4410,7 @@ async fn handle_mission_notification(
             .await
     {
         let _ = db
-            .add_conversation_message(conv_id, "assistant", &accepted_text)
+            .add_conversation_message(conv_id, ASSISTANT_ROLE, &accepted_text)
             .await;
     }
 }
@@ -6494,7 +6556,29 @@ pub(crate) mod tests {
             Some("Executing code...")
         );
         assert_eq!(interpret_message_event("System", "anything"), None);
+        assert_eq!(interpret_message_event("ActionResult", "anything"), None);
         assert_eq!(interpret_message_event("User", "a human question"), None);
+    }
+
+    #[test]
+    fn interpret_message_event_never_surfaces_a_census_bookkeeping_role() {
+        // WI#518: every durable bookkeeping role must stay off the status
+        // surface even if a caller forwards a persisted row instead of a wire
+        // event — the marker JSON must never be mistaken for step output.
+        for role in crate::history::roles::BOOKKEEPING_ROLES {
+            for preview in [
+                "[stdout] leaked",
+                "{\"state\":\"Retrying\"}",
+                "[code 42]",
+                "Traceback (most recent call last)",
+            ] {
+                assert_eq!(
+                    interpret_message_event(role, preview),
+                    None,
+                    "bookkeeping role {role:?} surfaced {preview:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -7327,6 +7411,193 @@ pub(crate) mod tests {
         );
 
         *lock.write().await = None;
+    }
+
+    /// WI#520: the history envelope surfaces the live Engine V2 approval gate
+    /// parked on exactly this thread, with the request id the approval
+    /// endpoint accepts and only redacted display parameters.
+    #[tokio::test]
+    async fn history_approval_lookup_returns_the_gate_parked_on_the_thread() {
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store.clone());
+
+        let thread = save_waiting_thread(&store, state.default_project_id, "alice").await;
+        let mut gate = sample_pending_gate(
+            "alice",
+            thread.id,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        gate.parameters = serde_json::json!({"token": "must-not-leak"});
+        gate.display_parameters = Some(serde_json::json!({"cmd": "ls"}));
+        let request_id = gate.request_id;
+        state.pending_gates.insert(gate).await.unwrap();
+
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = Some(state);
+
+        let found = get_engine_pending_approval("alice", thread.id.0)
+            .await
+            .unwrap()
+            .expect("a live approval gate must be discoverable from history");
+        assert_eq!(found.request_id, request_id.to_string());
+        assert_eq!(found.thread_id, thread.id.to_string());
+        assert_eq!(found.tool_name, "shell");
+        assert!(
+            !found.parameters.contains("must-not-leak"),
+            "history must only carry the redacted display snapshot"
+        );
+
+        *lock.write().await = None;
+    }
+
+    /// WI#520 acceptance: user/thread isolation, cleared or expired gates, and
+    /// non-approval gates never reach the history envelope.
+    #[tokio::test]
+    async fn history_approval_lookup_is_isolated_cleared_and_approval_only() {
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store.clone());
+
+        let alice_thread = save_waiting_thread(&store, state.default_project_id, "alice").await;
+        let sibling = save_waiting_thread(&store, state.default_project_id, "alice").await;
+
+        // Both gates share one conversation: a per-thread history envelope must
+        // still never surface the sibling thread's gate.
+        let conversation_id = lunarwing_engine::ConversationId::new();
+        let mut approval = sample_pending_gate(
+            "alice",
+            alice_thread.id,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        approval.conversation_id = conversation_id;
+        let request_id = approval.request_id;
+        state.pending_gates.insert(approval).await.unwrap();
+
+        let mut auth = sample_pending_gate(
+            "alice",
+            sibling.id,
+            lunarwing_engine::ResumeKind::Authentication {
+                credential_name: "gitlab".into(),
+                instructions: "token".into(),
+                auth_url: None,
+            },
+        );
+        auth.conversation_id = conversation_id;
+        state.pending_gates.insert(auth).await.unwrap();
+
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = Some(state);
+
+        assert_eq!(
+            get_engine_pending_approval("alice", alice_thread.id.0)
+                .await
+                .unwrap()
+                .map(|view| view.request_id),
+            Some(request_id.to_string())
+        );
+        assert!(
+            get_engine_pending_approval("bob", alice_thread.id.0)
+                .await
+                .unwrap()
+                .is_none(),
+            "another user must never see this approval in their history"
+        );
+        assert!(
+            get_engine_pending_approval("alice", sibling.id.0)
+                .await
+                .unwrap()
+                .is_none(),
+            "an authentication gate is not an approvable tool approval"
+        );
+        assert!(
+            get_engine_pending_approval("alice", uuid::Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_none(),
+            "an unrelated thread surfaces nothing"
+        );
+
+        // A gate cleared by approval or cancellation disappears from history.
+        state_discard(lock, "alice", alice_thread.id).await;
+        assert!(
+            get_engine_pending_approval("alice", alice_thread.id.0)
+                .await
+                .unwrap()
+                .is_none(),
+            "a resolved gate must not reappear in history"
+        );
+
+        *lock.write().await = None;
+    }
+
+    /// WI#520: an expired gate and a gate whose thread already terminated are
+    /// not offered to history as approvable.
+    #[tokio::test]
+    async fn history_approval_lookup_skips_expired_and_dead_thread_gates() {
+        use chrono::Duration;
+
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store.clone());
+
+        let live_thread = save_waiting_thread(&store, state.default_project_id, "alice").await;
+
+        let mut expired = sample_pending_gate(
+            "alice",
+            live_thread.id,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        expired.expires_at = chrono::Utc::now() - Duration::seconds(1);
+        state.pending_gates.insert(expired).await.unwrap();
+
+        let mut terminal = save_waiting_thread(&store, state.default_project_id, "alice").await;
+        terminal
+            .transition_to(lunarwing_engine::ThreadState::Failed, None)
+            .unwrap();
+        store.save_thread(&terminal).await.unwrap();
+        let dead_gate = sample_pending_gate(
+            "alice",
+            terminal.id,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        state.pending_gates.insert(dead_gate).await.unwrap();
+
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = Some(state);
+
+        assert!(
+            get_engine_pending_approval("alice", live_thread.id.0)
+                .await
+                .unwrap()
+                .is_none(),
+            "an expired gate cannot be approved and must not be advertised"
+        );
+        assert!(
+            get_engine_pending_approval("alice", terminal.id.0)
+                .await
+                .unwrap()
+                .is_none(),
+            "a gate parked on a terminal thread must not be advertised"
+        );
+
+        *lock.write().await = None;
+    }
+
+    /// Discard a thread's gate the way a resolution does, so the history
+    /// lookup sees the same store the approval endpoint would.
+    async fn state_discard(
+        lock: &RwLock<Option<EngineState>>,
+        user_id: &str,
+        thread_id: lunarwing_engine::ThreadId,
+    ) {
+        let guard = lock.read().await;
+        let state = guard.as_ref().expect("engine state installed");
+        let key = crate::gate::pending::PendingGateKey {
+            user_id: user_id.to_string(),
+            thread_id,
+        };
+        state.pending_gates.discard(&key).await.unwrap();
     }
 
     /// Work item #108 regression: an expired gate must resume the paused

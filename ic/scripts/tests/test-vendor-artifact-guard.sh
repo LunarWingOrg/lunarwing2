@@ -208,6 +208,12 @@ check 'path-like profile names are rejected' test "$rc" -ne 0
   source "$ADMIN_SCRIPT"
   # shellcheck disable=SC2034  # consumed by the sourced mt-admin library
   BUILD_LOCK="$fixture/build.lock" PROFILE=release BUILD_JOBS=2
+  # run-294 TJ-13: the real build_tenant touches the root-owned marker/lock
+  # directory; keep it inside the fixture in a non-root harness run.
+  TENANT_LIFECYCLE_LOCK_DIR="$fixture/locks"
+  mkdir -p "$TENANT_LIFECYCLE_LOCK_DIR"
+  install() { command mkdir -p "${!#}"; }
+  stat() { printf '0:700\n'; }
   tenant_repo() { printf '%s\n' "$ic"; }
   tenant_env_dir() { printf '%s/env\n' "$fixture"; }
   flock() { return 0; }

@@ -1464,6 +1464,7 @@ configure_pebble() {
   local name="$1"
   local nanogpt_api_key="$2"
   local model="$3"
+  local base_url="${4:-}"
 
   [[ "$nanogpt_api_key" != *$'\n'* && "$nanogpt_api_key" != *$'\r'* ]] \
     || die "configure-pebble: NANOGPT_API_KEY must be a single-line raw token"
@@ -1490,6 +1491,24 @@ configure_pebble() {
 
   mkdir -p "$env_dir"
 
+  # WI#506: pin the model backend into pebble.env. The worker egress filter
+  # derives this tenant's allowlist from the same key, so the address the
+  # worker dials and the address the firewall admits cannot drift apart. An
+  # omitted --base-url preserves the configured backend (rotating a key must
+  # not silently re-point the lane) and only a first configuration falls back
+  # to the pebble binary's own NanoGPT default. Values are read tenant-side:
+  # root never opens the tenant-writable env file.
+  if [[ -z "$base_url" ]]; then
+    base_url="$(read_tenant_env_value "$name" "$env_path" PEBBLE_BASE_URL)" \
+      || die "configure-pebble: could not safely read $env_path"
+    if [[ -z "$base_url" ]]; then
+      base_url="$(read_tenant_env_value "$name" "$env_path" NANOGPT_BASE_URL)" \
+        || die "configure-pebble: could not safely read $env_path"
+    fi
+    base_url="${base_url:-$PEBBLE_DEFAULT_BASE_URL}"
+  fi
+  validate_llm_url "$base_url" "--base-url"
+
   # WI#390: build the content off to the side and commit it as the tenant
   # through the atomic writer — root never opens pebble.env inside the
   # tenant-writable env dir.
@@ -1502,6 +1521,11 @@ configure_pebble() {
     if [[ -n "$model" ]]; then
       printf 'PEBBLE_MODEL=%s\n' "$model"
     fi
+    # PEBBLE_BASE_URL is the LunarWing-side declaration the egress derivation
+    # reads; NANOGPT_BASE_URL is the same value in the key the pebble binary
+    # honours, so the pinned backend is the one that is actually dialled.
+    printf 'PEBBLE_BASE_URL=%s\n' "$base_url"
+    printf 'NANOGPT_BASE_URL=%s\n' "$base_url"
   } >"$staged"
 
   if ! write_tenant_file_atomic "$name" "$env_path" 600 <"$staged"; then
@@ -1509,7 +1533,10 @@ configure_pebble() {
     return 1
   fi
   rm -f -- "$staged"
-  say "pebble configured for tenant '$name' at $env_path"
+  say "pebble configured for tenant '$name' at $env_path (model backend $base_url)"
+  if worker_egress_enabled "$name"; then
+    say "worker egress: $base_url is derived into $name's allowlist; restart the tenant to apply the static host mapping"
+  fi
 
   local container_name="lunarwing-pebble-$name"
   if _ctr_inspect "$name" "$container_name" &>/dev/null 2>&1; then

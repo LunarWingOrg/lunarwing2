@@ -81,17 +81,17 @@ for CONTAINER_RT in docker podman; do
       if [[ "$profile" == true ]]; then
         [[ $smoke_calls -eq $((smoke_before + 1)) ]] \
           || fail "$CONTAINER_RT fat build skipped the toolchain smoke check"
-        [[ "$built_tag" == lunarwing-worker-pebble:candidate ]] \
+        [[ "$built_tag" == lunarwing-worker-pebble:latest-candidate ]] \
           || fail "$CONTAINER_RT fat build did not target the candidate tag"
-        [[ "$smoke_ref" == lunarwing-worker-pebble:candidate ]] \
+        [[ "$smoke_ref" == lunarwing-worker-pebble:latest-candidate ]] \
           || fail "$CONTAINER_RT smoke probed '$smoke_ref', not the candidate"
         [[ "$smoke_rt" == "$CONTAINER_RT" ]] \
           || fail "$CONTAINER_RT smoke ran with CONTAINER_RT='$smoke_rt'"
         [[ ${#tag_calls[@]} -eq $((tag_before + 1)) ]] \
           || fail "$CONTAINER_RT fat build did not re-tag :latest after the smoke"
-        [[ "${tag_calls[-1]}" == "lunarwing-worker-pebble:candidate lunarwing-worker-pebble:latest" ]] \
+        [[ "${tag_calls[-1]}" == "lunarwing-worker-pebble:latest-candidate lunarwing-worker-pebble:latest" ]] \
           || fail "$CONTAINER_RT unexpected tag: ${tag_calls[-1]}"
-        [[ ${#rmi_calls[@]} -eq $((rmi_before + 1)) && "${rmi_calls[-1]}" == "lunarwing-worker-pebble:candidate" ]] \
+        [[ ${#rmi_calls[@]} -eq $((rmi_before + 1)) && "${rmi_calls[-1]}" == "lunarwing-worker-pebble:latest-candidate" ]] \
           || fail "$CONTAINER_RT fat build did not drop the candidate tag"
       else
         [[ $smoke_calls -eq $smoke_before ]] \

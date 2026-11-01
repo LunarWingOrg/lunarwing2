@@ -10,6 +10,7 @@ use crate::agent::response_delivery::ResponseDelivery;
 use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::error::Error;
 use crate::gate::pending::PendingGate;
+use crate::history::roles::{ASSISTANT_ROLE, TOOL_CALLS_ROLE, TURN_RECOVERY_ROLE};
 
 use super::{
     AwaitThreadCancellationGuard, EngineState, deliver_thread_event, drain_pending_thread_events,
@@ -39,6 +40,18 @@ struct HistoryReference {
     started_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Single-slot key written before WI#517. Read-only fallback so a turn that
+/// started under the old write path can still record its terminal markers.
+const LEGACY_HISTORY_KEY: &str = "engine_turn_history";
+const HISTORY_KEY_PREFIX: &str = "engine_turn_history.";
+
+/// Per-thread metadata key (WI#517). Every turn writes its own key, and both
+/// backends merge a single key atomically, so overlapping turns on one
+/// conversation can never overwrite each other's reference.
+pub(super) fn turn_history_metadata_key(thread_id: lunarwing_engine::ThreadId) -> String {
+    format!("{HISTORY_KEY_PREFIX}{thread_id}")
+}
+
 async fn history_reference(
     state: &EngineState,
     message: &IncomingMessage,
@@ -47,8 +60,11 @@ async fn history_reference(
     let db = state.db.as_ref()?;
     let cid = resolve_v1_conversation_for_message(db.as_ref(), message).await?;
     let metadata = db.get_conversation_metadata(cid).await.ok()??;
-    let reference: HistoryReference =
-        serde_json::from_value(metadata.get("engine_turn_history")?.clone()).ok()?;
+    let key = turn_history_metadata_key(thread_id);
+    let stored = metadata
+        .get(key.as_str())
+        .or_else(|| metadata.get(LEGACY_HISTORY_KEY))?;
+    let reference: HistoryReference = serde_json::from_value(stored.clone()).ok()?;
     (reference.thread_id == thread_id).then_some(reference)
 }
 
@@ -328,7 +344,7 @@ impl TurnCompletion {
             "recovery": recovery,
         });
         if let Err(error) = db
-            .add_conversation_message(cid, "turn_recovery", &marker.to_string())
+            .add_conversation_message(cid, TURN_RECOVERY_ROLE, &marker.to_string())
             .await
         {
             tracing::warn!(%error, "failed to persist Engine V2 recovery status");
@@ -380,11 +396,13 @@ impl TurnCompletion {
             return;
         };
         if let Some(json) = load_tool_calls_json(&self.state.store, self.thread_id).await
-            && let Err(error) = db.add_conversation_message(cid, "tool_calls", &json).await
+            && let Err(error) = db
+                .add_conversation_message(cid, TOOL_CALLS_ROLE, &json)
+                .await
         {
             tracing::warn!(%error, "failed to persist Engine V2 tool history");
         }
-        if let Err(error) = db.add_conversation_message(cid, "assistant", text).await {
+        if let Err(error) = db.add_conversation_message(cid, ASSISTANT_ROLE, text).await {
             tracing::warn!(%error, "failed to persist Engine V2 assistant history");
         }
     }

@@ -179,6 +179,10 @@ OPENCODE2_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE2_USERNS};ssh-agent-dir-ro;
 
 PEBBLE_CONTAINER_UID="10004"
 PEBBLE_CONTAINER_GID="10004"
+# WI#506: the pebble binary's baked-in NanoGPT default. configure-pebble pins
+# the backend into pebble.env so the worker egress allowlist derives from the
+# same value the worker actually uses.
+PEBBLE_DEFAULT_BASE_URL="https://nano-gpt.com/api"
 PEBBLE_BRIDGE_UID="10104"
 PEBBLE_USERNS="keep-id:uid=${PEBBLE_CONTAINER_UID},gid=${PEBBLE_CONTAINER_GID}"
 PEBBLE_ROOTLESS_LAUNCH_CONTRACT="userns=${PEBBLE_USERNS};ssh-agent-dir-ro;no-new-privileges;cap-trim;non-root-split-v1"
@@ -369,6 +373,31 @@ Commands:
     --with-toolchains              Include Rust/Go/C++ toolchains (default: slim)
     --kimi-code-version <version>  Override kimi-code package version
 
+  promote-worker-images <name>     Promote this run's candidate worker images
+                                   (WI#527) to :latest; re-runnable after a
+                                   failed promotion
+
+  restore-worker-images <name>     Re-tag the :latest worker images recorded
+                                   before a promotion (rollback without a rebuild)
+
+  clear-promote-rollback <name>    Drop the pre-promotion record once the whole
+                                   upgrade succeeded (WI#527)
+
+  cleanup-worker-candidates <name> Discard this run's WI#527 candidate images;
+                                   lanes whose rmi fails stay listed for retry
+
+  build-worker-candidates <name>   Build selected worker images to WI#527
+                                   candidate tags without stopping the tenant
+    --enabled                      Build every lane the tenant has enabled
+    --with-pebble --with-opencode --with-kimi --with-opencode2
+
+  last-build-stage <name>          Print the last completed build stage
+                                   (daemon|bridge|wasm|none, or unknown when the
+                                   marker is missing or unreadable)
+
+  reset-build-stage <name>         Reset the build stage marker to "nothing built"
+                                   (TD-5: called by upgrade-tenant.sh before the stop)
+
   build-opencode2-worker           Build the OpenCode 2 worker Docker image
     --no-cache                     Force a full rebuild without Docker cache
     --with-toolchains              Include Rust/Go/C++ toolchains (default: slim)
@@ -468,6 +497,10 @@ Commands:
   configure-pebble <name>          Configure pebble worker for a tenant
     --nanogpt-api-key <key>        NanoGPT API key
     --model <model>                Pebble model (default: openai/gpt-5.2)
+    --base-url <url>               Model backend (PEBBLE_BASE_URL; default:
+                                   https://nano-gpt.com/api). It is written to
+                                   pebble.env and derived into the tenant's
+                                   worker egress allowlist.
 
   configure-opencode <name>        Set opencode worker LLM overrides for a tenant
     --model <model>                TensorZero model (OPENCODE_MODEL; any string)
@@ -940,6 +973,119 @@ main() {
       build_vision_sidecar_image
       ;;
 
+    promote-worker-images)
+      # WI#527: promote this run's candidate worker images to :latest. Re-runnable:
+      # a promote failure never removes a candidate, so an operator can retry it
+      # after fixing the underlying image-store problem.
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: promote-worker-images <name>"
+      local promote_name
+      promote_name="$(sanitize_name "$1")"
+      ports_registry_init
+      tenant_exists_in_registry "$promote_name" || die "tenant '$promote_name' not found in registry"
+      # run-294 TJ-5: serialise with a running upgrade of the same tenant (a
+      # promote could otherwise race its candidate build). run-300 TO-1: the
+      # upgrade wrapper's own run already holds this lock (inherited fd), so the
+      # verb uses that instead of meeting itself.
+      with_tenant_upgrade_lock "$promote_name" promote_candidate_workers "$promote_name"
+      ;;
+
+    restore-worker-images)
+      # run-294 TJ-5: re-tag the worker images recorded before a promote so a
+      # failed upgrade can be rolled back without rebuilding them.
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: restore-worker-images <name>"
+      local restore_name
+      restore_name="$(sanitize_name "$1")"
+      ensure_container_runtime
+      _ensure_marker_dir
+      restore_promoted_workers "$restore_name"
+      ;;
+
+    clear-promote-rollback)
+      # run-300 TO-2: the pre-promotion record outlives a successful promote;
+      # the upgrade wrapper drops it only once the whole upgrade has finished.
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: clear-promote-rollback <name>"
+      _ensure_marker_dir
+      clear_promote_rollback "$(sanitize_name "$1")"
+      ;;
+
+    cleanup-worker-candidates)
+      # run-294 TJ-13: discard this run's candidate images (and keep the ones that
+      # could not be removed visible in the lane file for a later retry).
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: cleanup-worker-candidates <name>"
+      local cleanup_name
+      cleanup_name="$(sanitize_name "$1")"
+      ensure_container_runtime
+      _ensure_marker_dir
+      cleanup_candidate_workers "$cleanup_name"
+      ;;
+
+    build-worker-candidates)
+      # WI#527: build selected worker images to this run's candidate tags without
+      # stopping the tenant. The upgrade wrapper (ic/scripts/upgrade-tenant.sh)
+      # calls this before its stop so a lane build failure cannot strand it.
+      require_root
+      local cand_name="" cand_pebble="false" cand_oc="false" cand_kimi="false" cand_oc2="false"
+      local cand_all_enabled="false"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --enabled)        cand_all_enabled="true"; shift ;;
+          --with-pebble)    cand_pebble="true"; shift ;;
+          --with-opencode)  cand_oc="true"; shift ;;
+          --with-kimi)      cand_kimi="true"; shift ;;
+          --with-opencode2) cand_oc2="true"; shift ;;
+          -*)               die "unknown flag: $1" ;;
+          *)
+            if [[ -z "$cand_name" ]]; then cand_name="$1"; shift
+            else die "unexpected argument: $1"
+            fi
+            ;;
+        esac
+      done
+      [[ -n "$cand_name" ]] || die "usage: build-worker-candidates <name> [--enabled] [--with-pebble] [--with-opencode] [--with-kimi] [--with-opencode2]"
+      cand_name="$(sanitize_name "$cand_name")"
+      ports_registry_init
+      tenant_exists_in_registry "$cand_name" || die "tenant '$cand_name' not found in registry"
+      # run-300 TO-5: let mt-admin decide which lanes this tenant has enabled, so
+      # the wrapper rebuilds exactly the lanes the mt-admin path does instead of
+      # claiming skew protection while it only rebuilt pebble.
+      if [[ "$cand_all_enabled" == true ]]; then
+        cand_pebble="false" cand_oc="false" cand_kimi="false" cand_oc2="false"
+        tenant_worker_enabled "$cand_name" pebble    && cand_pebble="true"
+        tenant_worker_enabled "$cand_name" opencode  && cand_oc="true"
+        tenant_worker_enabled "$cand_name" kimi      && cand_kimi="true"
+        tenant_worker_enabled "$cand_name" opencode2 && cand_oc2="true"
+      fi
+      # run-294 TJ-5: a candidate build may not race a running upgrade of the
+      # same tenant (they share the candidate tag). run-300 TO-1: inside the
+      # upgrade wrapper that run's inherited lock is used, not re-acquired.
+      with_tenant_upgrade_lock "$cand_name" \
+        build_candidate_workers "$cand_name" "$cand_oc" "$cand_kimi" "$cand_oc2" "$cand_pebble" "false"
+      ;;
+
+    last-build-stage)
+      # WI#527: the last build stage completed for <name> (daemon, bridge, wasm,
+      # worker:<lane>, or none). Read by the upgrade wrapper to decide whether a
+      # restart would start a newly built binary. Read-only, but the marker lives
+      # in the root-owned lock dir (TJ-13 keeps root-only access explicit).
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: last-build-stage <name>"
+      upgrade_last_completed_stage "$(sanitize_name "$1")"
+      ;;
+
+    reset-build-stage)
+      # TD-5: reset the build stage marker so a stale marker from a prior run
+      # cannot mislead convergence. Called by the upgrade wrapper before the stop.
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: reset-build-stage <name>"
+      local rbs_name
+      rbs_name="$(sanitize_name "$1")"
+      _reset_build_stage_file "$rbs_name"
+      ;;
+
     build-sandbox-image)
       require_root
       [[ $# -le 1 ]] || die "usage: $0 build-sandbox-image [name]"
@@ -1393,11 +1539,12 @@ main() {
 
     configure-pebble)
       require_root
-      local name="" nanogpt_key="" pebble_model=""
+      local name="" nanogpt_key="" pebble_model="" pebble_base_url=""
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --nanogpt-api-key) nanogpt_key="$2"; shift 2 ;;
           --model)           pebble_model="$2"; shift 2 ;;
+          --base-url)        pebble_base_url="$2"; shift 2 ;;
           -*)                die "unknown flag: $1" ;;
           *)
             if [[ -z "$name" ]]; then name="$1"; shift
@@ -1406,10 +1553,10 @@ main() {
             ;;
         esac
       done
-      [[ -n "$name" ]] || die "usage: configure-pebble <name> --nanogpt-api-key <key> [--model <model>]"
+      [[ -n "$name" ]] || die "usage: configure-pebble <name> --nanogpt-api-key <key> [--model <model>] [--base-url <url>]"
       [[ -n "$nanogpt_key" ]] || die "configure-pebble requires --nanogpt-api-key"
       ports_registry_init
-      configure_pebble "$(sanitize_name "$name")" "$nanogpt_key" "$pebble_model"
+      configure_pebble "$(sanitize_name "$name")" "$nanogpt_key" "$pebble_model" "$pebble_base_url"
       ;;
 
     configure-nanocode)

@@ -21,6 +21,10 @@ use crate::channels::web::util::{truncate_preview, truncate_preview_middle};
 use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::context::JobContext;
 use crate::error::Error;
+use crate::history::roles::{
+    ASSISTANT_ROLE, ConversationRole, INTERRUPTED_ROLE, TOOL_CALLS_ROLE, USER_ROLE,
+    classify_conversation_role,
+};
 use crate::llm::{ChatMessage, ToolCall};
 use crate::tools::permissions::PermissionState;
 use crate::tools::redact_display_params;
@@ -890,7 +894,7 @@ impl Agent {
         }
 
         if let Err(e) = store
-            .add_conversation_message(thread_id, "user", user_input)
+            .add_conversation_message(thread_id, USER_ROLE, user_input)
             .await
         {
             tracing::warn!("Failed to persist user message: {}", e);
@@ -922,7 +926,7 @@ impl Agent {
         }
 
         if let Err(e) = store
-            .add_conversation_message(thread_id, "assistant", response)
+            .add_conversation_message(thread_id, ASSISTANT_ROLE, response)
             .await
         {
             tracing::warn!("Failed to persist assistant message: {}", e);
@@ -958,7 +962,7 @@ impl Agent {
         }
 
         if let Err(e) = store
-            .add_conversation_message(thread_id, "interrupted", "")
+            .add_conversation_message(thread_id, INTERRUPTED_ROLE, "")
             .await
         {
             tracing::warn!("Failed to persist interrupted-turn marker: {}", e);
@@ -1035,7 +1039,7 @@ impl Agent {
         }
 
         if let Err(e) = store
-            .add_conversation_message(thread_id, "tool_calls", &content)
+            .add_conversation_message(thread_id, TOOL_CALLS_ROLE, &content)
             .await
         {
             tracing::warn!("Failed to persist tool calls: {}", e);
@@ -2186,10 +2190,10 @@ fn rebuild_chat_messages_from_db(
     let mut result = Vec::new();
 
     for msg in db_messages {
-        match msg.role.as_str() {
-            "user" => result.push(ChatMessage::user(&msg.content)),
-            "assistant" => result.push(ChatMessage::assistant(&msg.content)),
-            "tool_calls" => {
+        match classify_conversation_role(&msg.role) {
+            ConversationRole::User => result.push(ChatMessage::user(&msg.content)),
+            ConversationRole::Assistant => result.push(ChatMessage::assistant(&msg.content)),
+            ConversationRole::ToolCalls => {
                 // Try to parse the enriched JSON and rebuild tool messages.
                 if let Ok(calls) = serde_json::from_str::<Vec<serde_json::Value>>(&msg.content) {
                     if calls.is_empty() {
@@ -2246,7 +2250,9 @@ fn rebuild_chat_messages_from_db(
                     // simple user/assistant pairs, same as before this fix).
                 }
             }
-            _ => {} // Skip unknown roles
+            // Display markers never reach the model, and an unregistered role
+            // is treated exactly like a marker.
+            ConversationRole::Marker | ConversationRole::Unknown => {}
         }
     }
 
@@ -2568,6 +2574,45 @@ mod tests {
     fn test_rebuild_chat_messages_empty() {
         let result = rebuild_chat_messages_from_db(&[]);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_rebuild_chat_messages_classifies_every_census_role() {
+        use crate::history::roles::{ALL_ROLES, ASSISTANT_ROLE, USER_ROLE};
+
+        // One row per census role. A new durable role either classifies as
+        // conversation (this test fails until the expectation is updated) or
+        // is skipped by `ConversationRole::Marker`/`Unknown`.
+        let tool_json = serde_json::json!([
+            {"name": "echo", "call_id": "call_0", "parameters": {}, "result": "ok"}
+        ]);
+        let messages: Vec<_> = ALL_ROLES
+            .iter()
+            .map(|role| {
+                let content = if *role == TOOL_CALLS_ROLE {
+                    tool_json.to_string()
+                } else {
+                    format!("{role} text")
+                };
+                make_db_msg(role, &content)
+            })
+            .collect();
+
+        let result = rebuild_chat_messages_from_db(&messages);
+
+        // user + assistant + assistant_with_tool_calls + tool_result.
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0].content, format!("{USER_ROLE} text"));
+        assert_eq!(result[1].content, format!("{ASSISTANT_ROLE} text"));
+        assert!(result[2].tool_calls.is_some());
+        assert_eq!(result[3].role, crate::llm::Role::Tool);
+        // Marker content must never reach the model.
+        for marker in ["interrupted text", "turn_recovery text"] {
+            assert!(
+                result.iter().all(|message| message.content != marker),
+                "bookkeeping text {marker:?} leaked into restored context"
+            );
+        }
     }
 
     #[test]

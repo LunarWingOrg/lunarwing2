@@ -678,10 +678,11 @@ WI#432 closes the former WI#408 residuals. Credentialed exchanges also drop
 `Range` and `If-Range`, and a `206 Partial Content` response is refused at the
 redaction boundary, so a guest cannot reassemble an echo from byte ranges;
 ordinary exchanges retain their range semantics. Both hosts use the shared
-`vet_http_target` guard. It canonicalizes IPv4-mapped, IPv4-compatible and
-NAT64-embedded addresses before applying the special-use IPv4/IPv6 and
-multicast blocklists, and reqwest clients (including OAuth refresh) pin the
-exact vetted DNS answers instead of resolving a second time. General
+`vet_http_target` guard. It canonicalizes IPv4-mapped, IPv4-compatible,
+NAT64-embedded, 6to4 and Teredo-embedded addresses before applying the
+special-use IPv4/IPv6 and multicast blocklists, and reqwest clients (including
+OAuth refresh) pin the exact vetted DNS answers instead of resolving a second
+time. General
 private-target access requires the separate, default-off
 `WASM_HTTP_ALLOW_PRIVATE_IPS=1` opt-in; the daemon's `ALLOW_PRIVATE_IPS=1`
 setting for Postgres, TensorZero and other private infrastructure does not
@@ -696,6 +697,17 @@ bodies stream through the same capped collector: declared lengths are checked
 up front, actual chunks are checked as they arrive, and reading stops at the
 first over-limit chunk instead of after full buffering. Stream errors still
 pass through `without_url()`.
+
+**Proxy behaviour of vetted requests (WI#503).** A vetted WASM HTTP target is
+always connected to directly: `VettedHttpTarget::pin_client` clears every
+proxy (`reqwest::ClientBuilder::no_proxy()`) in addition to pinning the vetted
+answers, so `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` in the daemon environment
+cannot route the request to a proxy that resolves the hostname itself and
+reopens the DNS-rebinding gap. The tool host, the channel host and the OAuth
+refresh client all build their client through `pin_client`, so all three are
+covered. Requests that are not vetted (the explicit
+`WASM_HTTP_ALLOW_PRIVATE_IPS=1` opt-in, channel bridge/loopback exemptions,
+and the host-scoped local sidecar) keep their normal proxy handling.
 
 **Reference:** `src/channels/wasm/wrapper.rs` —
 `ChannelStoreData::redact_http_outcome_for_guest`

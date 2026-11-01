@@ -269,29 +269,188 @@ else
 fi
 PRIOR_REV="$(sudo -u "$TENANT" git -C "$LWROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 note "prior clone rev recorded for rollback: $PRIOR_REV"
+# TD-11: record the clone position exactly (full sha + branch, empty when
+# detached) so a pre-stop revert restores it instead of leaving a detached HEAD,
+# and remember whether a pre-upgrade stash was taken so it can be popped back.
+PRE_CHECKOUT_REV="$(sudo -u "$TENANT" git -C "$LWROOT" rev-parse HEAD 2>/dev/null || true)"
+CLONE_BRANCH="$(sudo -u "$TENANT" git -C "$LWROOT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+STASHED=false
+
+# WI#527: converge after a post-stop upgrade step failed. The wrapper is the
+# second upgrade path (upgrade-preflight -> stop-tenant-for-upgrade ->
+# build-tenant); run-287 SX-1 found it always checked out PRIOR_REV and started
+# the tenant whatever stage failed, which in rootless-adopt mode starts a newly
+# built binary against the preserved root store and migrates it. So classify by
+# the build's stage markers: before the daemon stage, restore the previous
+# revision and restart; past it, never auto-start — report the tenant stopped
+# with the rollback steps. Never dies itself; the caller writes the final error.
+# TD-10: an unknown/unreadable stage is treated as past-the-daemon (fail closed),
+# not as "none" (restore and start), so a recording failure after cargo replaced
+# the binary cannot start the new binary and claim "restored".
+converge_after_failed_upgrade() {  # <cause> [refused_before_stop]
+  local cause="$1" refused_before_stop="${2:-false}" stage
+  stage="unknown"
+  if ! $DRY_RUN; then
+    # stdout only: the stage value. A failing probe is "unknown", which the
+    # post-daemon branch below treats as fail-closed (no auto-start).
+    stage="$("$MT" last-build-stage "$TENANT" 2>/dev/null </dev/null || printf 'unknown')"
+    [[ "$stage" =~ ^(none|daemon|bridge|wasm)$ ]] || stage="unknown"
+  fi
+  say "" >&2
+  # TD-5: a refusal before the stop (opencode2 floor, DarkIRC) leaves the tenant
+  # running; don't try to restore or start it. run-300 TO-4: the clone was
+  # already checked out to the target and the pre-upgrade changes stashed, so
+  # return both — otherwise the next attempt's PRIOR_REV is the wrong revision.
+  if $refused_before_stop; then
+    if ! $SKIP_BUILD; then
+      revert_clone_position \
+        || say "WARNING: could not return the clone to $PRIOR_REV; check: git -C $LWROOT status" >&2
+    fi
+    die "$cause; tenant '$TENANT' was not stopped and is running its previous build"
+  fi
+  # TJ-5: put back any worker :latest tag this run already promoted, so a
+  # restored daemon never runs beside newer worker images (the SX-1 class).
+  if ! $DRY_RUN; then
+    run mt restore-worker-images "$TENANT" >/dev/null 2>&1 \
+      || say "WARNING: could not restore every worker :latest tag; check 'podman images'" >&2
+  fi
+  # TD-10: "unknown" is treated as past-the-daemon (fail closed), not as "none".
+  if [[ "$stage" == none ]]; then
+    say "upgrade aborted: $cause; the target daemon was not built, restoring tenant '$TENANT' to $PRIOR_REV (WI#527) ..." >&2
+    if [[ "$PRIOR_REV" != unknown ]] \
+      && revert_clone_position \
+      && run mt_rootful start-tenant "$TENANT"; then
+      die "$cause; tenant '$TENANT' was automatically restored and is running $PRIOR_REV"
+    fi
+    die "$cause; automatic restore FAILED — tenant '$TENANT' remains stopped. Fix the failure and run: $MT start-tenant $TENANT"
+  fi
+  say "upgrade aborted: $cause; the target daemon was built ($stage), so a restart would run the new binary against the preserved store." >&2
+  say "Tenant '$TENANT' remains stopped. Data has not been switched over: the old" >&2
+  say "root-store container and your pre-upgrade backup are intact. Recover with:" >&2
+  say "    sudo $MT stop-tenant $TENANT" >&2
+  say "    sudo $MT restore-worker-images $TENANT" >&2
+  say "    sudo -u $TENANT git -C $LWROOT checkout $PRIOR_REV" >&2
+  say "    sudo $MT build-tenant $TENANT --with-wasm --require-wasm" >&2
+  say "    sudo LUNARWING_MT_ROOTLESS=false $MT start-tenant $TENANT" >&2
+  die "$cause; tenant '$TENANT' remains stopped (stage: $stage)"
+}
+
+# TD-11: return the clone to the position recorded before the target checkout
+# (branch or detached HEAD, full sha) and pop the pre-upgrade stash if one was
+# taken. Falls back to PRIOR_REV when the recorded position is unavailable.
+revert_clone_position() {
+  local target="${PRE_CHECKOUT_REV:-${PRIOR_REV:-}}"
+  [[ -n "$target" && "$target" != unknown ]] || return 1
+  if [[ -n "${CLONE_BRANCH:-}" ]]; then
+    run sudo -u "$TENANT" git -C "$LWROOT" checkout -B "$CLONE_BRANCH" "$target" || return 1
+  else
+    run sudo -u "$TENANT" git -C "$LWROOT" checkout "$target" || return 1
+  fi
+  if [[ "${STASHED:-false}" == true ]]; then
+    if run sudo -u "$TENANT" git -C "$LWROOT" stash pop; then
+      STASHED=false
+    else
+      say "WARNING: the pre-upgrade changes are still stashed; recover them with: git -C $LWROOT stash list" >&2
+    fi
+  fi
+}
+
+# WI#527: stop the old model, after the worker candidate images were built while
+# the tenant still ran (step 2 below). Only the daemon/bridge/WASM remain to be
+# built post-stop, and those converge through converge_after_failed_upgrade.
+# TD-5: reset stage markers before the stop so a stale marker from a prior
+# build run cannot mislead convergence.
+stop_and_rebuild() {
+  # TD-5: reset the stage marker so convergence starts from "nothing built".
+  $DRY_RUN || "$MT" reset-build-stage "$TENANT" 2>/dev/null || true
+  # TD-5: run ensure-darkirc-release BEFORE the stop so a refusal leaves the
+  # tenant running, not stopped.
+  run mt ensure-darkirc-release "$TENANT" \
+    || converge_after_failed_upgrade "DarkIRC release build failed" true
+  run mt_rootful stop-tenant-for-upgrade "$TENANT" \
+    || converge_after_failed_upgrade "stop-tenant-for-upgrade failed"
+  run mt cleanup-legacy-weechat "$TENANT"
+}
 
 # ---- 2. STOP the OLD model (daemon + old PG); old container/volume preserved --
 banner "2/8  Stop tenant (old model)"
-run mt_rootful stop-tenant-for-upgrade "$TENANT"
-run mt cleanup-legacy-weechat "$TENANT"
+# The stop happens in step 3, after the pre-stop worker candidate build.
+note "stop deferred until after the pre-stop worker candidate build (WI#527)"
 
 # ---- 3. UPDATE the tenant clone + REBUILD (mt-admin does NOT auto-update) -----
 banner "3/8  Update clone + build"
 if $SKIP_BUILD; then
   note "--skip-build: assuming $LWROOT is already at $TARGET_REF and built"
+  stop_and_rebuild
+  wasm_rc=0
+  set +e
+  run mt install-wasm "$TENANT"
+  wasm_rc=$?
+  set -e
+  if [[ "$wasm_rc" -ne 0 ]]; then
+    converge_after_failed_upgrade "WASM install failed (exit $wasm_rc)"
+  fi
+  run mt promote-worker-images "$TENANT" \
+    || converge_after_failed_upgrade "worker image promotion failed"
 else
   if [[ -n "$(sudo -u "$TENANT" git -C "$LWROOT" status --porcelain 2>/dev/null || true)" ]]; then
-    if $AUTO_YES; then run sudo -u "$TENANT" git -C "$LWROOT" stash push -u -m "pre-upgrade-$STAMP"
+    if $AUTO_YES; then
+      run sudo -u "$TENANT" git -C "$LWROOT" stash push -u -m "pre-upgrade-$STAMP"
+      STASHED=true
     else die "tenant clone $LWROOT has uncommitted changes; commit/stash them or re-run with --yes"; fi
   fi
-  run sudo -u "$TENANT" git -C "$LWROOT" fetch --tags --prune
-  run sudo -u "$TENANT" git -C "$LWROOT" checkout "$TARGET_REF"
+  run sudo -u "$TENANT" git -C "$LWROOT" fetch --tags --prune \
+    || { revert_clone_position || say "WARNING: could not return the clone to $PRIOR_REV" >&2
+         die "git fetch failed; tenant '$TENANT' was not stopped"; }
+  run sudo -u "$TENANT" git -C "$LWROOT" checkout "$TARGET_REF" \
+    || { revert_clone_position || say "WARNING: could not return the clone to $PRIOR_REV" >&2
+         die "git checkout $TARGET_REF failed; tenant '$TENANT' was not stopped"; }
+  # WI#527: build the worker candidate images WHILE the tenant still runs. A
+  # lane failure here leaves the running tenant untouched.
+  # run-300 TO-5: --enabled rebuilds every lane this tenant has enabled (the
+  # same selection the mt-admin path makes), instead of only pebble — which left
+  # enabled kimi/opencode/opencode2 lanes on their previous images while the
+  # comment claimed the step prevented daemon/worker skew. --with-pebble is kept
+  # as an explicit opt-in for a pebble lane the registry does not list.
+  # TD-6/TD-11: on candidate build failure revert the checkout and pop the stash
+  # so the running tenant's clone is exactly as it was.
+  cand_args=(build-worker-candidates "$TENANT" --enabled)
+  $WITH_PEBBLE && cand_args+=(--with-pebble)
+  cand_rc=0
+  set +e
+  run mt "${cand_args[@]}"
+  cand_rc=$?
+  set -e
+  if [[ "$cand_rc" -ne 0 ]]; then
+    # run-300 TO-4: discard the partial candidate images and lane record,
+    # otherwise a later manual promote could promote images built from the
+    # checkout this failure just reverts.
+    run mt cleanup-worker-candidates "$TENANT" \
+      || say "WARNING: could not discard this run's candidate worker images; run: $MT cleanup-worker-candidates $TENANT" >&2
+    if revert_clone_position; then
+      die "worker image candidate build failed; tenant '$TENANT' was not stopped and its clone was restored"
+    fi
+    die "worker image candidate build failed; tenant '$TENANT' was not stopped, but the clone could not be restored to $PRIOR_REV (check: git -C $LWROOT status)"
+  fi
+
+  stop_and_rebuild
+  # TJ-2: the live path MUST rebuild the daemon/bridge/WASM after the stop.
+  # Without it the tenant restarts on the OLD binary with the NEW checkout and
+  # new worker images — the daemon/worker skew WI#527 exists to prevent — and
+  # the strict-fresh-WASM invariant is violated. Pebble is a candidate now, so
+  # no --with-pebble here.
   build_args=(build-tenant "$TENANT" --with-wasm --require-wasm)
-  $WITH_PEBBLE  && build_args+=(--with-pebble)
+  build_rc=0
+  set +e
   run mt "${build_args[@]}"
-  run mt install-wasm "$TENANT"
+  build_rc=$?
+  set -e
+  if [[ "$build_rc" -ne 0 ]]; then
+    converge_after_failed_upgrade "tenant build failed (exit $build_rc)"
+  fi
+  run mt promote-worker-images "$TENANT" \
+    || converge_after_failed_upgrade "worker image promotion failed"
 fi
-run mt ensure-darkirc-release "$TENANT"
 
 # ---- 4. PROVISION rootless + render units + bring up EMPTY PG (NO daemon) -----
 banner "4/8  Provision + render (add-tenant --no-health, idempotent)"
@@ -338,6 +497,11 @@ fi
 # ---- 6. START the tenant (PG already up, then workers + daemon) --------------
 banner "6/8  Start tenant"
 run mt start-tenant "$TENANT"
+# run-300 TO-2: the promotion is only final once the tenant runs on the new
+# build; until then a failure must still be able to re-tag the old worker
+# images, so the pre-promotion record lives until here.
+run mt clear-promote-rollback "$TENANT" \
+  || say "WARNING: could not clear the worker promotion rollback record for '$TENANT'" >&2
 
 # ---- 7. VERIFY ---------------------------------------------------------------
 banner "7/8  Verify"
