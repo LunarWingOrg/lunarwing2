@@ -27,9 +27,11 @@
 #
 # Usage (run as root on the new host):
 #   sudo ic/scripts/import-tenant.sh <bundle.7z|bundle.tar> [--name <t>] [--start] [--old-stopped]
-#        [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains]
+#        [--with-pebble] [--with-kimi] [--with-toolchains]
 #        [--with-vision] [--docker-group]
 #        [--owner-scope <old_scope>] [--dry-run] [--yes] [--resume] [--force]
+# `--with-opencode` is still accepted for a bundle/migration note that predates
+# WI#333 but is dropped with a warning: the opencode v1 lane is retired.
 # Encrypted bundles read their passphrase from KAWARIMI_PASS_FD, KAWARIMI_PASS,
 # KAWARIMI_PASS_FILE, or an interactive prompt, in that order. The passphrase is
 # fed to 7z over stdin and never placed in command argv.
@@ -68,7 +70,6 @@ DO_START=false
 OLD_STOPPED=false
 WITH_DOCKER_GROUP=false
 WITH_PEBBLE=false
-WITH_OPENCODE=false
 WITH_KIMI=false
 WITH_TOOLCHAINS=false
 WITH_VISION=false
@@ -81,6 +82,9 @@ MAX_BUNDLE_BYTES="${KAWARIMI_MAX_BUNDLE_BYTES:-107374182400}"
 MAX_STATE_BYTES="${KAWARIMI_MAX_STATE_BYTES:-107374182400}"
 MAX_STATE_ENTRIES="${KAWARIMI_MAX_STATE_ENTRIES:-1000000}"
 IMPORT_STAGE_ROOT="${KAWARIMI_IMPORT_STAGE_ROOT:-/var/lib/lunarwing-import-stage}"
+# WI#333: set when the bundle/argv still asks for the retired opencode v1 lane.
+# Warned about once, and never forwarded to mt-admin (which now refuses it).
+RETIRED_OPENCODE_REQUESTED=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -90,7 +94,11 @@ while [[ $# -gt 0 ]]; do
     --docker-group)  WITH_DOCKER_GROUP=true; shift ;;
     --with-nanocode) printf 'error: Nanocode worker is retired; remove --with-nanocode\n' >&2; exit 2 ;;
     --with-pebble)   WITH_PEBBLE=true; shift ;;
-    --with-opencode)   WITH_OPENCODE=true; shift ;;
+    # WI#333 retired the opencode v1 lane. A bundle exported before the
+    # retirement (or the migration guide) can still carry this flag; accept it
+    # and drop it so a legacy import is not stranded at step 1/8. The warning is
+    # emitted once, after argument parsing, by warn_retired_opencode_once.
+    --with-opencode)   RETIRED_OPENCODE_REQUESTED=true; shift ;;
     --with-kimi)       WITH_KIMI=true; shift ;;
     --with-toolchains) WITH_TOOLCHAINS=true; shift ;;
     --with-vision)     WITH_VISION=true; shift ;;
@@ -110,6 +118,14 @@ banner() { printf '\n========== %s ==========\n' "$*"; }
 note()   { printf '  · %s\n' "$*"; }
 confirm() { $AUTO_YES && return 0; local a; read -r -p "$1 [y/N] " a; [[ "$a" == y || "$a" == Y ]]; }
 run()    { if $DRY_RUN; then printf '  [dry-run] %s\n' "$*"; return 0; fi; printf '  + %s\n' "$*"; "$@"; }
+
+# WI#333: the opencode v1 lane is retired and mt-admin refuses to select it, so a
+# bundle (or --with-opencode) that still asks for it would otherwise strand the
+# import at step 1/8. Accept the request, drop it here, and say so once.
+warn_retired_opencode_once() {
+  $RETIRED_OPENCODE_REQUESTED || return 0
+  printf 'warning: opencode v1 worker lane is retired (WI#333); dropping the inherited opencode settings for this import — the tenant is imported without a v1 lane (use --with-opencode2 or `mt-admin add-tenant <t> --with-opencode2` for the supported lane)\n' >&2
+}
 
 bundle_owner_is_trusted() {
   local owner="$1" sudo_uid="${SUDO_UID:-}" sudo_user="${SUDO_USER:-}" resolved_uid
@@ -743,7 +759,7 @@ reconcile_owner_scope() {
   note "owner-scope continuity verified for '$TENANT'"
 }
 
-[[ -n "$BUNDLE" ]] || die "usage: $0 <bundle.7z|bundle.tar> [--name <t>] [--start] [--old-stopped] [--resume] [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains] [--with-vision] [--docker-group] [--owner-scope <old_scope>] [--dry-run] [--yes] [--force]"
+[[ -n "$BUNDLE" ]] || die "usage: $0 <bundle.7z|bundle.tar> [--name <t>] [--start] [--old-stopped] [--resume] [--with-pebble] [--with-kimi] [--with-toolchains] [--with-vision] [--docker-group] [--owner-scope <old_scope>] [--dry-run] [--yes] [--force]"
 [[ -f "$BUNDLE" ]] || die "bundle not found: $BUNDLE"
 [[ ! -L "$BUNDLE" ]] || die "bundle path must not be a symlink"
 [[ "$(id -u)" -eq 0 ]] || die "run as root (sudo) — mt-admin needs root"
@@ -1005,10 +1021,14 @@ LLM_MODEL="$(manifest_value LLM_MODEL)"
 LLM_BASE_URL="$(manifest_value LLM_BASE_URL)"
 OPENCODE_MODEL="$(manifest_value OPENCODE_MODEL)"
 OPENCODE_BASE_URL="$(manifest_value OPENCODE_BASE_URL)"
+if [[ -n "$OPENCODE_MODEL$OPENCODE_BASE_URL" ]]; then
+  RETIRED_OPENCODE_REQUESTED=true
+fi
 KIMI_MODEL="$(manifest_value KIMI_MODEL)"
 KIMI_BASE_URL="$(manifest_value KIMI_BASE_URL)"
 GOTIFY_URL="$(manifest_value GOTIFY_URL)"
 
+warn_retired_opencode_once
 confirm "Stage tenant '$TENANT' on THIS host from the bundle?" || die "aborted by user"
 
 # ---- 1. provision fresh (no daemon, no health) -------------------------------
@@ -1021,8 +1041,9 @@ $DARKIRC_ENABLED && add_args+=(--enable-darkirc --darkirc-scope-id "$DARKIRC_SCO
 [[ -n "$GATEWAY_HOST" ]] && add_args+=(--gateway-host "$GATEWAY_HOST")
 [[ -n "$LLM_MODEL" ]] && add_args+=(--llm-model "$LLM_MODEL")
 [[ -n "$LLM_BASE_URL" ]] && add_args+=(--llm-base-url "$LLM_BASE_URL")
-[[ -n "$OPENCODE_MODEL" ]] && add_args+=(--opencode-model "$OPENCODE_MODEL")
-[[ -n "$OPENCODE_BASE_URL" ]] && add_args+=(--opencode-base-url "$OPENCODE_BASE_URL")
+# WI#333: OPENCODE_MODEL/OPENCODE_BASE_URL and WITH_OPENCODE are deliberately not
+# forwarded — mt-admin refuses the retired v1 lane. warn_retired_opencode_once
+# already told the operator that the selection is dropped.
 [[ -n "$KIMI_MODEL" ]] && add_args+=(--kimi-model "$KIMI_MODEL")
 [[ -n "$KIMI_BASE_URL" ]] && add_args+=(--kimi-base-url "$KIMI_BASE_URL")
 # KIMI_API_KEY is secret-bearing. add-tenant generates placeholder config;
@@ -1034,7 +1055,6 @@ $DARKIRC_ENABLED && add_args+=(--enable-darkirc --darkirc-scope-id "$DARKIRC_SCO
 # selection is recorded here too. Mirrors the --with-* flags passed to
 # build-tenant below. See PER_TENANT_WORKER_GATING.md.
 $WITH_PEBBLE  && add_args+=(--with-pebble)
-$WITH_OPENCODE && add_args+=(--with-opencode)
 $WITH_KIMI && add_args+=(--with-kimi)
 if $RESUME; then
   note "trusted matching partial import found; skipping add-tenant"
