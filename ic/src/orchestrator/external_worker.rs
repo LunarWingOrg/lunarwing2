@@ -629,6 +629,28 @@ pub struct ExternalWorkerManager {
     /// surface cannot be used to probe which workers are cron-mode (MR
     /// !1522 DE-9).
     pub(crate) cron_owner_id: std::sync::RwLock<Option<String>>,
+    /// WI#464: last-known liveness state per worker name, recorded by the
+    /// boot-time probe and the periodic re-probe so `lunarwing doctor` and
+    /// the agent status endpoint can surface it without a fresh dial.
+    probe_state: Arc<std::sync::RwLock<HashMap<String, WorkerProbeState>>>,
+}
+
+/// WI#464: liveness snapshot for a single configured worker, recorded by
+/// the boot-time and periodic probes.  Observability only — never gates
+/// boot, dispatch, or the worker itself.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerProbeState {
+    /// Worker name from config.
+    pub worker: String,
+    /// `true` if the last probe reached the endpoint (WS handshake ok).
+    pub reachable: bool,
+    /// Human-readable reason when unreachable (connection refused, timeout,
+    /// protocol error).  Never contains the auth token.
+    pub reason: Option<String>,
+    /// Host:port display string (no token, no path) for log lines.
+    pub endpoint_display: String,
+    /// RFC3339 timestamp of the last probe.
+    pub last_probe: chrono::DateTime<chrono::Utc>,
 }
 
 /// Cron entries grouped by normalized endpoint-listener key
@@ -872,6 +894,7 @@ impl ExternalWorkerManager {
             active_handles: Arc::new(RwLock::new(HashMap::new())),
             cron_controls: Arc::new(std::sync::RwLock::new(HashMap::new())),
             cron_owner_id: std::sync::RwLock::new(None),
+            probe_state: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -1504,6 +1527,175 @@ impl ExternalWorkerManager {
         });
     }
 
+    /// WI#464: probe every configured external worker concurrently and log
+    /// the result.  Call after the daemon's own listeners are up so a slow
+    /// or dead worker never delays boot.  Never fails boot, never disables
+    /// a worker, never changes dispatch — observability only.
+    ///
+    /// Each endpoint gets its own [`WORKER_LIVENESS_PROBE_TIMEOUT`] deadline
+    /// and a real WebSocket handshake (bearer + subprotocol + `ready`), so a
+    /// worker that rejects non-WS clients reads as unreachable.  The auth
+    /// token is never logged.  Results are written to the shared probe-state
+    /// map so `lunarwing doctor` and the agent status endpoint can surface
+    /// them without a fresh dial.
+    pub async fn probe_all_workers(&self) {
+        let configs: Vec<(String, Vec<WorkerEndpoint>)> = self
+            .workers
+            .iter()
+            .map(|(name, config)| (name.clone(), config.endpoints()))
+            .collect();
+
+        if configs.is_empty() {
+            return;
+        }
+
+        // Probe each worker concurrently; each task resolves with the state
+        // to record.  A worker with multiple endpoints is reachable if any
+        // endpoint is reachable (matches the dispatch LB-fallback shape).
+        let mut probes = Vec::with_capacity(configs.len());
+        for (worker_name, endpoints) in &configs {
+            let worker_name = worker_name.clone();
+            let endpoints = endpoints.clone();
+            probes.push(tokio::spawn(async move {
+                probe_worker_config(&worker_name, &endpoints).await
+            }));
+        }
+
+        let mut reachable_count = 0usize;
+        let mut unreachable_count = 0usize;
+
+        for probe in probes {
+            let state = probe.await.unwrap_or_else(|join_error| {
+                WorkerProbeState {
+                    worker: "?".to_string(),
+                    reachable: false,
+                    reason: Some(format!("probe task panicked: {join_error}")),
+                    endpoint_display: "unknown".to_string(),
+                    last_probe: Utc::now(),
+                }
+            });
+            if state.reachable {
+                reachable_count += 1;
+            } else {
+                unreachable_count += 1;
+                tracing::error!(
+                    "External worker '{}' unreachable at {}: {}",
+                    state.worker,
+                    state.endpoint_display,
+                    state.reason.as_deref().unwrap_or("unknown error")
+                );
+            }
+            self.record_probe_state(state);
+        }
+
+        if unreachable_count == 0 {
+            tracing::info!(
+                "External worker liveness probe: all {} worker(s) reachable",
+                reachable_count
+            );
+        } else {
+            tracing::warn!(
+                "External worker liveness probe: {} reachable, {} unreachable",
+                reachable_count,
+                unreachable_count
+            );
+        }
+    }
+
+    /// WI#464 (ask #2): spawn a background task that re-probes on an
+    /// interval, logging only on a state change (reachable→unreachable and
+    /// back).  Cancelled when the shutdown receiver fires.  The interval is
+    /// 5 minutes by default.
+    pub fn spawn_periodic_reprobe(
+        &self,
+        mut shutdown_rx: broadcast::Receiver<()>,
+        interval: Duration,
+    ) {
+        // Snapshot the configs so the spawned task does not borrow `self`.
+        let configs: Vec<(String, Vec<WorkerEndpoint>)> = self
+            .workers
+            .iter()
+            .map(|(name, config)| (name.clone(), config.endpoints()))
+            .collect();
+        let probe_state = Arc::clone(&self.probe_state);
+
+        tokio::spawn(async move {
+            let mut timer = tokio::time::interval(interval);
+            timer.tick().await; // skip immediate first tick
+            loop {
+                tokio::select! {
+                    _ = timer.tick() => {
+                        periodic_reprobe_once(&configs, &probe_state).await;
+                    }
+                    _ = shutdown_rx.recv() => {
+                        tracing::debug!("worker re-probe task shutting down");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    /// WI#464 (ask #3): return a snapshot of the last-known liveness state
+    /// for every configured worker.  Safe to call from any thread; the
+    /// read lock is held only for the clone.
+    pub fn worker_probe_states(&self) -> Vec<WorkerProbeState> {
+        let guard = self
+            .probe_state
+            .read()
+            .expect("probe_state lock poisoned");
+        let mut states: Vec<WorkerProbeState> = guard.values().cloned().collect();
+        states.sort_by(|a, b| a.worker.cmp(&b.worker));
+        states
+    }
+
+    /// Record a single worker's probe result into the shared state map and
+    /// log a state-change warning for the periodic re-probe path.
+    fn record_probe_state(&self, state: WorkerProbeState) {
+        let worker_name = state.worker.clone();
+        let was_reachable = {
+            let guard = self
+                .probe_state
+                .read()
+                .expect("probe_state lock poisoned");
+            guard.get(&worker_name).map(|s| s.reachable)
+        };
+
+        let changed = was_reachable.is_some() && was_reachable != Some(state.reachable);
+        {
+            let mut guard = self
+                .probe_state
+                .write()
+                .expect("probe_state lock poisoned");
+            guard.insert(worker_name, state);
+        }
+
+        // The boot probe already logged the ERROR line; the periodic re-probe
+        // logs only on state change (reachable→unreachable or back).
+        if changed {
+            let guard = self
+                .probe_state
+                .read()
+                .expect("probe_state lock poisoned");
+            if let Some(s) = guard.get(&worker_name) {
+                if s.reachable {
+                    tracing::info!(
+                        "External worker '{}' is reachable again at {}",
+                        s.worker,
+                        s.endpoint_display
+                    );
+                } else {
+                    tracing::error!(
+                        "External worker '{}' became unreachable at {}: {}",
+                        s.worker,
+                        s.endpoint_display,
+                        s.reason.as_deref().unwrap_or("unknown error")
+                    );
+                }
+            }
+        }
+    }
+
     /// Gracefully drain the pool (send WS Close frames, bounded per-connection).
     ///
     /// WI#149: in-flight tasks get a bounded cancel handoff first. Every active
@@ -1795,6 +1987,12 @@ pub struct WorkerConnectionPool {
 
 const POOLED_CONNECTION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// WI#464: boot/periodic probe uses a short deadline distinct from the
+/// worker's dispatch `timeout_ms` (which defaults to one hour).  A dead
+/// socket fails fast; a slow worker is given this much and then reported
+/// unreachable without ever delaying boot.
+const WORKER_LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl WorkerConnectionPool {
     pub fn new(max_idle_per_endpoint: usize, idle_timeout: Duration) -> Self {
         Self {
@@ -2032,6 +2230,118 @@ async fn connect_and_handshake(
             })?;
 
     Ok((stream, ready.worker_id, ready.capabilities))
+}
+
+/// WI#464: dial one worker endpoint and complete the real WebSocket
+/// handshake (bearer + `lunarwing-agent-v1` subprotocol + `ready` frame),
+/// then drop the socket.  This is deliberately a full handshake rather than
+/// a plain TCP connect: a worker that rejects non-WS clients or the
+/// subprotocol would otherwise read as reachable when it is not.
+///
+/// Observability only — the result is logged and recorded in the manager's
+/// probe state; it never fails boot, disables a worker, or changes dispatch.
+/// The auth token is never included in any returned string.
+///
+/// Bounded by [`WORKER_LIVENESS_PROBE_TIMEOUT`], separate from the worker's
+/// dispatch `timeout_ms`.  Sends no job content.
+async fn probe_worker_endpoint(url: &str, auth_token: Option<&str>) -> Result<(), String> {
+    let probe = async {
+        // Reuse the exact handshake used for dispatch so a reachable result
+        // means "a job could connect now".  The returned stream is dropped
+        // at the end of this block, which closes the socket.
+        let (stream, _worker_id, _capabilities) = connect_and_handshake(url, auth_token, "probe").await
+            .map_err(|error| error.to_string())?;
+        drop(stream);
+        Ok::<(), String>(())
+    };
+
+    match tokio::time::timeout(WORKER_LIVENESS_PROBE_TIMEOUT, probe).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "probe timed out after {}s",
+            WORKER_LIVENESS_PROBE_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+/// WI#464: rendered `host:port` (scheme-default port applied) for probe log
+/// lines and state.  Never includes the path, query, userinfo or token.
+fn probe_endpoint_display(url: &str) -> String {
+    endpoint_container_key(url)
+}
+
+/// WI#464: probe one worker's endpoint list.  The worker is reachable if
+/// *any* endpoint completes the handshake (matches the dispatch LB-fallback
+/// shape).  When every endpoint fails, the first failure's reason and the
+/// endpoint that was tried are returned so the log names a concrete host.
+async fn probe_worker_config(worker_name: &str, endpoints: &[WorkerEndpoint]) -> WorkerProbeState {
+    let mut last_reason: Option<String> = None;
+    let mut last_display = String::from("no endpoint");
+
+    for endpoint in endpoints {
+        let display = probe_endpoint_display(&endpoint.url);
+        let token = endpoint.auth_token.as_ref().map(|s| s.expose_secret());
+        match probe_worker_endpoint(&endpoint.url, token).await {
+            Ok(()) => {
+                return WorkerProbeState {
+                    worker: worker_name.to_string(),
+                    reachable: true,
+                    reason: None,
+                    endpoint_display: display,
+                    last_probe: Utc::now(),
+                };
+            }
+            Err(reason) => {
+                last_display = display;
+                last_reason = Some(reason);
+            }
+        }
+    }
+
+    WorkerProbeState {
+        worker: worker_name.to_string(),
+        reachable: false,
+        reason: last_reason,
+        endpoint_display: last_display,
+        last_probe: Utc::now(),
+    }
+}
+
+/// WI#464: one periodic re-probe pass.  Logs only on a state change
+/// (reachable→unreachable and back) so a healthy daemon does not spam the
+/// log every interval.
+async fn periodic_reprobe_once(
+    configs: &[(String, Vec<WorkerEndpoint>)],
+    probe_state: &std::sync::RwLock<HashMap<String, WorkerProbeState>>,
+) {
+    for (worker_name, endpoints) in configs {
+        let state = probe_worker_config(worker_name, endpoints).await;
+        let was_reachable = probe_state
+            .read()
+            .ok()
+            .and_then(|guard| guard.get(worker_name).map(|s| s.reachable));
+
+        if was_reachable != Some(state.reachable) {
+            if state.reachable {
+                tracing::info!(
+                    "External worker '{}' is reachable again at {}",
+                    state.worker,
+                    state.endpoint_display
+                );
+            } else {
+                tracing::error!(
+                    "External worker '{}' became unreachable at {}: {}",
+                    state.worker,
+                    state.endpoint_display,
+                    state.reason.as_deref().unwrap_or("unknown error")
+                );
+            }
+        }
+
+        if let Ok(mut guard) = probe_state.write() {
+            guard.insert(worker_name.clone(), state);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
