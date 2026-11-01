@@ -286,11 +286,9 @@ Commands:
     --enable-darkirc               Provision DarkIRC daemon + adapter for this tenant
                                    (disabled by default; darkirc services are NOT created)
     --with-pebble                  Select the pebble worker for this tenant (as above)
-    --with-opencode                Select the opencode worker for this tenant (as above)
     --with-kimi                    Select the kimi worker for this tenant (as above)
     --with-opencode2               Select the OpenCode 2 worker for this tenant
-                                   (v2 lane; keep off tenants that already run
-                                   the proven v1 opencode worker)
+                                   (v2 lane; the v1 opencode lane is retired, WI#333)
     --with-study-mcp               Auto-configure the shared lw2studymcp Study Notes
                                    MCP for this tenant (read-only) so it starts with
                                    knowledge of the LunarWing codebase. The shared
@@ -304,10 +302,6 @@ Commands:
                                    Existing knowledge paths are never overwritten.
     --study-mcp-home <path>        Use this checkout instead of the default shared one
                                    ($STUDY_NOTES_DEFAULT_HOME; still synced to latest)
-    --opencode-model <model>       Override the opencode worker's LLM model
-                                   (written to lunarwing.env as OPENCODE_MODEL)
-    --opencode-base-url <url>      Override the opencode worker's TensorZero baseURL
-                                   (written to lunarwing.env as OPENCODE_BASE_URL)
     --opencode2-model <model>      Override the OpenCode 2 worker's LLM model
                                    (written to lunarwing.env as OPENCODE2_MODEL)
     --opencode2-base-url <url>     Override the OpenCode 2 worker's TensorZero baseURL
@@ -328,7 +322,7 @@ Commands:
 
    add-tenants <names> [options]    Comma-separated list (e.g. "Ruffles,Miyuki")
      (same options as add-tenant apply to all, including --enable-darkirc,
-       --opencode-model/--opencode-base-url, --kimi-model/--kimi-base-url/
+       --kimi-model/--kimi-base-url/
        --kimi-api-key-file, --with-study-mcp/--study-mcp-home,
       --llm-model, --gateway-host, --xmpp-allow-from, and --no-weechat-bootstrap)
 
@@ -339,30 +333,23 @@ Commands:
     --with-wasm                    Also build WASM extensions
     --require-wasm                 Fail instead of preserving stale WASM (requires --with-wasm)
     --with-pebble                  Also build the pebble worker Docker image
-    --with-opencode                Also build the opencode worker Docker image
     --with-kimi                    Also build the kimi worker Docker image
     --with-opencode2               Also build the OpenCode 2 worker Docker image
-    --with-toolchains              Include toolchains in selected pebble, opencode,
+    --with-toolchains              Include toolchains in selected pebble, opencode2,
                                    and kimi worker images (default: slim)
 
   build-all                        Build each tenant sequentially
     --with-wasm                    Also build WASM extensions
     --with-pebble                  Also build the pebble worker Docker image
-    --with-opencode                Also build the opencode worker Docker image
     --with-kimi                    Also build the kimi worker Docker image
     --with-opencode2               Also build the OpenCode 2 worker Docker image
-    --with-toolchains              Include toolchains in selected pebble, opencode,
+    --with-toolchains              Include toolchains in selected pebble, opencode2,
                                    and kimi worker images (default: slim)
 
   build-pebble-worker             Build the pebble worker Docker image
     --no-cache                     Force a full rebuild without Docker cache
     --with-toolchains              Include Rust/Go/C++ toolchains (default: slim)
 
-  build-opencode-worker            Build the opencode worker Docker image
-    --no-cache                     Force a full rebuild without Docker cache
-                                   (Podman also prunes dangling images and avoids
-                                   caching intermediate build layers)
-    --with-toolchains              Include Rust/Go/C++ toolchains (default: slim)
 
   build-kimi-worker                Build the kimi worker Docker image
     --no-cache                     Force a full rebuild without container cache
@@ -683,7 +670,7 @@ main() {
           --enable-proxy)    enable_proxy="true"; shift ;;
           --with-nanocode|--nanocode-model|--nanocode-base-url) die "Nanocode worker is retired; remove $1" ;;
           --with-pebble)     with_pebble="true"; shift ;;
-          --with-opencode)   with_opencode="true"; shift ;;
+          --with-opencode)   die "opencode v1 worker lane is retired (WI#333); use --with-opencode2" ;;
           --with-kimi)       with_kimi="true"; shift ;;
           --with-opencode2)  with_opencode2="true"; shift ;;
           --with-study-mcp)  with_study_mcp="true"; shift ;;
@@ -694,8 +681,7 @@ main() {
           --tensorzero-url)  tz_url="$2"; shift 2 ;;
           --gotify-url)      gotify_url="$2"; shift 2 ;;
           --gotify-title)    gotify_title="$2"; shift 2 ;;
-          --opencode-model)    opencode_model="$2"; shift 2 ;;
-          --opencode-base-url) opencode_base_url="$2"; shift 2 ;;
+          --opencode-model|--opencode-base-url) die "opencode v1 worker lane is retired (WI#333); use --opencode2-model/--opencode2-base-url" ;;
           --opencode2-model)    [[ $# -ge 2 ]] || die "--opencode2-model requires a value"; opencode2_model="$2"; shift 2 ;;
           --opencode2-base-url) [[ $# -ge 2 ]] || die "--opencode2-base-url requires a value"; opencode2_base_url="$2"; shift 2 ;;
           --kimi-model)        kimi_model="$2"; shift 2 ;;
@@ -737,7 +723,7 @@ main() {
           --enable-proxy)    enable_proxy="true"; shift ;;
           --with-nanocode|--nanocode-model|--nanocode-base-url) die "Nanocode worker is retired; remove $1" ;;
           --with-pebble)     with_pebble="true"; shift ;;
-          --with-opencode)   with_opencode="true"; shift ;;
+          --with-opencode)   die "opencode v1 worker lane is retired (WI#333); use --with-opencode2" ;;
           --with-kimi)       with_kimi="true"; shift ;;
           --with-opencode2)  with_opencode2="true"; shift ;;
           --with-study-mcp)  with_study_mcp="true"; shift ;;
@@ -747,8 +733,7 @@ main() {
           --tensorzero-url)  tz_url="$2"; shift 2 ;;
           --gotify-url)      gotify_url="$2"; shift 2 ;;
           --gotify-title)    gotify_title="$2"; shift 2 ;;
-          --opencode-model)    opencode_model="$2"; shift 2 ;;
-          --opencode-base-url) opencode_base_url="$2"; shift 2 ;;
+          --opencode-model|--opencode-base-url) die "opencode v1 worker lane is retired (WI#333); use --opencode2-model/--opencode2-base-url" ;;
           --opencode2-model)    [[ $# -ge 2 ]] || die "--opencode2-model requires a value"; opencode2_model="$2"; shift 2 ;;
           --opencode2-base-url) [[ $# -ge 2 ]] || die "--opencode2-base-url requires a value"; opencode2_base_url="$2"; shift 2 ;;
           --kimi-model)        kimi_model="$2"; shift 2 ;;
@@ -813,7 +798,7 @@ main() {
           --require-wasm)    require_wasm="true"; shift ;;
           --with-nanocode)   die "Nanocode worker is retired; remove --with-nanocode" ;;
           --with-pebble)     with_pebble="true"; shift ;;
-          --with-opencode)   with_opencode="true"; shift ;;
+          --with-opencode)   die "opencode v1 worker lane is retired (WI#333); use --with-opencode2" ;;
           --with-kimi)       with_kimi="true"; shift ;;
           --with-opencode2)  with_opencode2="true"; shift ;;
           --with-toolchains) with_toolchains="true"; shift ;;
@@ -825,7 +810,7 @@ main() {
             ;;
         esac
       done
-      [[ -n "$name" ]] || die "usage: build-tenant <name> [--with-wasm] [--require-wasm] [--with-pebble] [--with-opencode] [--with-kimi] [--with-opencode2] [--with-toolchains]"
+      [[ -n "$name" ]] || die "usage: build-tenant <name> [--with-wasm] [--require-wasm] [--with-pebble] [--with-kimi] [--with-opencode2] [--with-toolchains]"
       [[ "$require_wasm" != "true" || "$with_wasm" == "true" ]] || die "--require-wasm requires --with-wasm"
       build_tenant "$(sanitize_name "$name")" "$with_wasm" "$with_pebble" "$with_opencode" "$with_kimi" "$with_toolchains" "$require_wasm" "$with_opencode2"
       ;;
@@ -838,7 +823,7 @@ main() {
           --with-wasm)       with_wasm="true"; shift ;;
           --with-nanocode)   die "Nanocode worker is retired; remove --with-nanocode" ;;
           --with-pebble)     with_pebble="true"; shift ;;
-          --with-opencode)   with_opencode="true"; shift ;;
+          --with-opencode)   die "opencode v1 worker lane is retired (WI#333); use --with-opencode2" ;;
           --with-kimi)       with_kimi="true"; shift ;;
           --with-opencode2)  with_opencode2="true"; shift ;;
           --with-toolchains) with_toolchains="true"; shift ;;
@@ -889,18 +874,7 @@ main() {
       ;;
 
     build-opencode-worker)
-      require_root
-      local no_cache="false"
-      local with_toolchains="false"
-      while [[ $# -gt 0 ]]; do
-        case "$1" in
-          --no-cache)         no_cache="true"; shift ;;
-          --with-toolchains)  with_toolchains="true"; shift ;;
-          -*)                 die "unknown flag: $1" ;;
-          *)                  die "unexpected argument: $1" ;;
-        esac
-      done
-      build_opencode_worker "$no_cache" "$with_toolchains"
+      die "opencode v1 worker lane is retired (WI#333); build-opencode2-worker replaces it"
       ;;
 
     build-opencode2-worker)
