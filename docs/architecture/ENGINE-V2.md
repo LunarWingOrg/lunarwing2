@@ -1707,6 +1707,32 @@ or store failure is logged and the turn proceeds without the extra context. The
 marker lookup costs one extra query on each turn of a conversation that has not
 been imported yet.
 
+#### Durable role census (WI#518)
+
+`conversation_messages.role` is free text shared by the classic loop, the
+engine dual-write, and the turn-recovery train. The vocabulary lives in one
+place, `ic/src/history/roles.rs`:
+
+- **Conversation roles** (`user`, `assistant`) — replayed into model context
+  and importable into an engine surface.
+- **Tool transcripts** (`tool_calls`) — JSON reconstructed into tool messages
+  by the v1 hydration path, never replayed as text.
+- **Markers** (`interrupted`, `turn_recovery`) — display state only; never
+  replayed, never used as a title or message count.
+
+Every consumer classifies through `classify_conversation_role` /
+`is_bookkeeping_role`: the v1 history import, `rebuild_chat_messages_from_db`,
+the gateway turns builder, and the FIFO status interpreter
+(`router.rs::interpret_message_event`, which rejects bookkeeping roles before
+its wire-role ladder). Conversation previews and counts keep the SQL
+`role = 'user'` predicate, which is safe by construction because markers can
+never be a user row. Engine `MessageAdded` wire roles are a separate namespace
+(`MessageRole::wire_name()`), classified by `classify_engine_role` with a
+positive ladder, so an unregistered wire role is never surfaced.
+
+A new durable role is added to `ALL_ROLES` **and** `classify_conversation_role`;
+the census tests fail until both agree and until all four consumers handle it.
+
 ### Channel Routing And Delivery
 
 `should_route_to_engine_v2()` owns the rollout policy. `ENGINE_V2=false`
