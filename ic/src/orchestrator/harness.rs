@@ -800,11 +800,17 @@ fn sweep_harness_dirs_in(
 /// matched against the text with line breaks folded out (both real newlines
 /// and the JSON-escaped `\n`/`\r` two-character forms), so ANY CLI wrap width
 /// is covered — the `base64` 76-column default, `openssl base64` /
-/// `base64 -w 64`, `xxd -p` at 60 columns, etc. (EB-3). For secrets whose
-/// encoded form is at most [`WRAP_LINE_VARIANT_CHAR_CAP`] chars, individual
-/// wrap lines at the canonical widths are armed as well (a tool returning one
-/// line at a time); larger secrets rely on whole-blob fold matching to keep
-/// the variant count bounded (EB-4).
+/// `base64 -w 64`, `xxd -p` at 60 columns, etc. (EB-3). The raw value is
+/// fold-matched too, so `fold -w N` of an unencoded token is caught (EE-8).
+/// Every folded and direct match is collected before replacement and merged
+/// in one sweep, so a second value sharing a substring cannot leave its
+/// non-overlapping tail behind (EE-9). Multi-line values are also armed one
+/// line at a time, except lines that carry no key material — armor delimiters
+/// and lines with no alphanumeric byte (DZ-5). For secrets whose encoded form
+/// is at most [`WRAP_LINE_VARIANT_CHAR_CAP`] chars, individual wrap lines at
+/// the canonical widths are armed as well (a tool returning one line at a
+/// time); larger secrets rely on whole-blob fold matching to keep the variant
+/// count bounded (EB-4).
 ///
 /// NOT covered (documented gaps): offset/grouped dump formats such as plain
 /// `xxd`, `od`, or `hexdump -C`, which interleave offsets and ASCII columns
@@ -826,9 +832,10 @@ pub struct SecretValueRedactor {
     /// splits of multi-line values, JSON-escaped and URL-encoded forms, and
     /// capped per-width wrap lines.
     direct_variants: Vec<SecretString>,
-    /// Contiguous ASCII encodings (hex lower/upper, base64 standard and
-    /// URL-safe plus offset cores) matched against the text with line breaks
-    /// folded out, covering every wrap width with O(1) variants (EB-3/EB-4).
+    /// Variants matched against the text with line breaks folded out:
+    /// contiguous ASCII encodings (hex lower/upper, base64 standard and
+    /// URL-safe plus offset cores) and the raw value itself (EE-8), covering
+    /// every wrap width with O(1) variants (EB-3/EB-4).
     folded_variants: Vec<SecretString>,
     /// Longest variant length in bytes; bounds the truncation-cut scan.
     max_variant_bytes: usize,
@@ -924,11 +931,24 @@ fn push_base64_variants(
     push_variant(folded, seen_folded, encoded);
 }
 
+/// True when a raw-value line carries no distinctive key material: an RFC 7468
+/// armor delimiter (`-----BEGIN …-----` / `-----END …-----`) or a line with no
+/// ASCII alphanumeric byte. Arming such lines as per-line variants over-redacts
+/// whitespace-only and structural lines in unrelated files, which corrupts the
+/// sub-agent's view and causes promotion rejections (DZ-5).
+fn is_low_entropy_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.starts_with("-----BEGIN ") || trimmed.starts_with("-----END ") {
+        return true;
+    }
+    !line.bytes().any(|b| b.is_ascii_alphanumeric())
+}
+
 /// Selected encodings of one secret value (DG-2), split into variants matched
-/// directly against the text and contiguous encodings matched with line
-/// breaks folded out (EB-3/EB-4). The two lists dedup independently (EE-3):
-/// wrap-line pieces and folded cores can coincide (58-62 byte values), and a
-/// core missing from the fold list is exactly the leak fold matching closes.
+/// directly against the text and variants matched with line breaks folded out
+/// (EB-3/EB-4/EE-8). The two lists dedup independently (EE-3): wrap-line
+/// pieces and folded cores can coincide (58-62 byte values), and a core
+/// missing from the fold list is exactly the leak fold matching closes.
 fn secret_variants(raw: &str) -> (Vec<SecretString>, Vec<SecretString>) {
     use base64::Engine;
     use secrecy::ExposeSecret;
@@ -938,9 +958,18 @@ fn secret_variants(raw: &str) -> (Vec<SecretString>, Vec<SecretString>) {
     let mut seen_folded = std::collections::HashSet::new();
 
     push_variant(&mut direct, &mut seen_direct, raw.to_string());
-    // Multi-line values (PEM keys, service-account JSON) also leak one line
-    // at a time.
+    // EE-8: the raw value is fold-matched too, so `fold -w N` or any tool that
+    // inserts line breaks into an unencoded token is caught. The needle is
+    // folded with the same rules as the text, so a multi-line value matches
+    // its break-free concatenation as well.
+    push_variant(&mut folded, &mut seen_folded, fold_line_breaks(raw).text);
+    // Multi-line values (PEM blocks, service-account JSON) also leak one line
+    // at a time. Lines with no distinctive key material are not armed on
+    // their own (DZ-5).
     for line in raw.lines() {
+        if is_low_entropy_line(line) {
+            continue;
+        }
         push_variant(&mut direct, &mut seen_direct, line.to_string());
         let trimmed = line.trim();
         if trimmed != line {
@@ -1036,17 +1065,52 @@ fn fold_line_breaks(text: &str) -> FoldedText {
 }
 
 fn push_mapped(folded: &mut String, map: &mut Vec<usize>, orig_idx: usize, ch: char) {
-    // One map entry per folded BYTE; variants are pure ASCII and UTF-8
-    // continuation bytes are >= 0x80, so match boundaries never land on a
-    // continuation entry.
+    // One map entry per folded BYTE, each holding the ORIGINAL start offset of
+    // the char it belongs to. Variants may contain non-ASCII text (the raw
+    // value is fold-matched, EE-8), so a match end can land on a continuation
+    // entry; callers resolve the original end with `char_end_at` instead of
+    // adding one.
     for _ in 0..ch.len_utf8() {
         map.push(orig_idx);
     }
     folded.push(ch);
 }
 
+/// Original-text end offset of the char starting at `start`, which must be a
+/// char boundary. The folded map records char START offsets only, and a folded
+/// match can end on a multi-byte char (EE-8), so `map[end - 1] + 1` can land
+/// inside that char and panic the replacement sweep (TP-1).
+fn char_end_at(text: &str, start: usize) -> usize {
+    text[start..]
+        .chars()
+        .next()
+        .map_or(text.len(), |ch| start + ch.len_utf8())
+}
+
+/// Replace every range in `ranges` with the marker in one sweep. Overlapping
+/// ranges merge (the cursor advances to the furthest end) so the
+/// non-overlapping tail of a second value sharing a substring cannot survive
+/// the redaction (EE-9). Breaks inside a matched span are swallowed; breaks
+/// before or after it survive.
+fn replace_ranges(text: &str, mut ranges: Vec<(usize, usize)>) -> String {
+    ranges.sort_unstable_by_key(|&(start, end)| (start, std::cmp::Reverse(end)));
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for (start, end) in ranges {
+        if start < cursor {
+            cursor = cursor.max(end);
+            continue;
+        }
+        out.push_str(&text[cursor..start]);
+        out.push_str("[redacted-secret]");
+        cursor = end;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
 // Test-only probe for the EE-1 needle-length guard in
-// `SecretValueRedactor::scrub_folded`: bumped immediately before every
+// `SecretValueRedactor::folded_match_ranges`: bumped immediately before every
 // `find` call so a test can prove the guard skipped the searcher setup
 // entirely (a behavioral assertion on the output cannot — the guarded and
 // unguarded paths produce identical text).
@@ -1123,40 +1187,47 @@ impl SecretValueRedactor {
     }
 
     pub fn scrub(&self, text: &str) -> String {
-        use secrecy::ExposeSecret;
-        // Folded pass first: whole wrapped encodings are the longest matches;
-        // once they are replaced, the direct per-line pieces find nothing.
-        let mut out = self.scrub_folded(text);
-        for variant in &self.direct_variants {
-            let variant = variant.expose_secret();
-            if out.contains(variant) {
-                out = out.replace(variant, "[redacted-secret]");
-            }
-        }
-        out
-    }
-
-    /// Replace every folded-variant match in `text`, with line breaks folded
-    /// out for matching and mapped back for replacement (EB-3/EB-4).
-    fn scrub_folded(&self, text: &str) -> String {
-        use secrecy::ExposeSecret;
-        if self.folded_variants.is_empty() {
+        let ranges = self.match_ranges(text);
+        if ranges.is_empty() {
             return text.to_string();
         }
-        // Fast path: nothing to fold — match against the text as-is with an
-        // identity mapping, skipping the folded copy and index map.
-        if !text.bytes().any(|b| matches!(b, b'\n' | b'\r' | b'\\')) {
-            let mut out = text.to_string();
-            for variant in &self.folded_variants {
-                let variant = variant.expose_secret();
-                if out.contains(variant) {
-                    out = out.replace(variant, "[redacted-secret]");
-                }
+        replace_ranges(text, ranges)
+    }
+
+    /// Original-text byte ranges of every folded and direct variant match.
+    /// Both passes are collected BEFORE any replacement, so a match that
+    /// starts inside another match merges with it instead of being evaluated
+    /// against already-replaced text — in either direction (EE-9).
+    fn match_ranges(&self, text: &str) -> Vec<(usize, usize)> {
+        use secrecy::ExposeSecret;
+        let mut ranges = self.folded_match_ranges(text);
+        for variant in &self.direct_variants {
+            let needle = variant.expose_secret();
+            let mut from = 0usize;
+            while needle.len() <= text.len().saturating_sub(from) {
+                let Some(pos) = text[from..].find(needle) else {
+                    break;
+                };
+                let start = from + pos;
+                ranges.push((start, start + needle.len()));
+                from = start + needle.len();
             }
-            return out;
         }
-        let folded = fold_line_breaks(text);
-        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        ranges
+    }
+
+    /// Ranges of every folded-variant match, mapped back to original offsets.
+    /// Line breaks are folded out for matching (EB-3/EB-4); when the text has
+    /// none to fold, the text is searched as-is with an identity mapping.
+    fn folded_match_ranges(&self, text: &str) -> Vec<(usize, usize)> {
+        use secrecy::ExposeSecret;
+        let mut ranges = Vec::new();
+        if self.folded_variants.is_empty() {
+            return ranges;
+        }
+        let folds = text.bytes().any(|b| matches!(b, b'\n' | b'\r' | b'\\'));
+        let folded = folds.then(|| fold_line_breaks(text));
+        let haystack = folded.as_ref().map_or(text, |f| f.text.as_str());
         for variant in &self.folded_variants {
             let needle = variant.expose_secret();
             let mut from = 0usize;
@@ -1166,49 +1237,27 @@ impl SecretValueRedactor {
                 // needle length (EE-1 — without this guard every folded
                 // variant costs its own length per JSON leaf, even when the
                 // leaf is far smaller than the variant).
-                if needle.len() > folded.text.len().saturating_sub(from) {
+                if needle.len() > haystack.len().saturating_sub(from) {
                     break;
                 }
                 #[cfg(test)]
                 FOLDED_FIND_CALLS.with(|c| c.set(c.get() + 1));
-                let Some(pos) = folded.text[from..].find(needle) else {
+                let Some(pos) = haystack[from..].find(needle) else {
                     break;
                 };
                 let start = from + pos;
                 let end = start + needle.len();
-                ranges.push((start, end));
+                let (os, oe) = match &folded {
+                    // The match ends on a char boundary of the folded text,
+                    // but that char may be multi-byte in the original.
+                    Some(f) => (f.map[start], char_end_at(text, f.map[end - 1])),
+                    None => (start, end),
+                };
+                ranges.push((os, oe));
                 from = end;
             }
         }
-        if ranges.is_empty() {
-            return text.to_string();
-        }
-        // Variants are longest-first; folded and original offsets are both
-        // monotonic, so an ascending sweep can skip overlaps by comparing
-        // original coordinates.
-        ranges.sort_unstable_by_key(|&(start, end)| (start, std::cmp::Reverse(end)));
-        let mut out = String::with_capacity(text.len());
-        let mut cursor = 0usize;
-        for (fs, fe) in ranges {
-            let os = folded.map[fs];
-            // The replaced span ends right after the last matched char
-            // (variants are pure ASCII, so it is one byte): interior line
-            // breaks between matched chars are swallowed, but break
-            // characters BEFORE or AFTER the blob survive the redaction.
-            let oe = folded.map[fe - 1] + 1;
-            if os < cursor {
-                // Overlapping an already-redacted range: merge instead of
-                // dropping, so the non-overlapping tail of a second value
-                // that shares a substring cannot survive (EE-9).
-                cursor = cursor.max(oe);
-                continue;
-            }
-            out.push_str(&text[cursor..os]);
-            out.push_str("[redacted-secret]");
-            cursor = oe;
-        }
-        out.push_str(&text[cursor..]);
-        out
+        ranges
     }
 
     /// Scrub before this helper's truncation (DG-2). A variant prefix (≥
@@ -2722,6 +2771,157 @@ mod tests {
         let tail = &hex_right[hex_right.len() - 32..];
         assert!(!scrubbed.contains(tail), "overlapping tail leaked: {tail}");
         assert!(!scrubbed.contains(&hex_joined[..64]));
+    }
+
+    #[test]
+    fn redactor_fast_path_merges_overlapping_encodings() {
+        // EE-9: fold-free text takes the identity-mapping path, which used to
+        // replace variant by variant. A second value whose encoding overlaps
+        // the first one loses its head to that replacement and never matches
+        // again, so its non-overlapping head survived. Matches are now
+        // collected first and merged, so the whole overlap is redacted.
+        let shared = "shared-fixture-segment-0123456789";
+        let head = "left-pad-fixture-padding-with-extra-bytes";
+        let left = format!("{head}-{shared}");
+        let right = format!("{shared}-right-tail-fixture-bytes");
+        let redactor = SecretValueRedactor::new(
+            [
+                SecretString::from(left.clone()),
+                SecretString::from(right.clone()),
+            ]
+            .as_slice(),
+        );
+        let hex_left: String = left.bytes().map(|b| format!("{b:02x}")).collect();
+        let hex_right: String = right.bytes().map(|b| format!("{b:02x}")).collect();
+        // Longest-first: hex(left) is replaced first and swallows the start of
+        // hex(right), which begins inside it.
+        assert!(hex_left.len() > hex_right.len(), "left must sort first");
+        // hex(left + "-right-tail-fixture-bytes") contains both encodings,
+        // hex_right starting inside hex_left; no line break, no backslash.
+        let hex_text: String = format!("{left}-right-tail-fixture-bytes")
+            .bytes()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert!(hex_text.contains(&hex_left) && hex_text.contains(&hex_right));
+        let scrubbed = redactor.scrub(&hex_text);
+        // Replacing hex_left first leaves the hex of right's non-overlapping
+        // tail behind, so that tail is what leaks under the sequential sweep.
+        let leaked_tail = &hex_right[hex_right.len() - 48..];
+        assert!(
+            !scrubbed.contains(leaked_tail),
+            "non-overlapping tail of the shorter encoding leaked: {leaked_tail}"
+        );
+        assert_eq!(scrubbed, "[redacted-secret]");
+    }
+
+    #[test]
+    fn redactor_merges_direct_and_folded_matches_across_passes() {
+        // EE-9: a direct (raw) match that starts before, and extends into, a
+        // folded (encoded) match used to be tested against the text AFTER the
+        // folded pass replaced it, so its head survived. Both passes now
+        // contribute ranges and the sweep merges them.
+        use base64::Engine;
+        let encoded_blob = "harness-fixture-ee9-encoded-tail-material-bytes";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(encoded_blob);
+        assert!(b64.len() > 32);
+        let prefix = "leak-prefix-fixture-material";
+        let overlapping = format!("{prefix}{}", &b64[..20]);
+        let redactor = SecretValueRedactor::new(
+            [
+                SecretString::from(encoded_blob.to_string()),
+                SecretString::from(overlapping),
+            ]
+            .as_slice(),
+        );
+        // The raw variant matches contiguously at the head; the line break at
+        // column 32 forces the folded pass over the encoding behind it.
+        let wrapped = format!("{}\n{}", &b64[..32], &b64[32..]);
+        let text = format!("{prefix}{wrapped}");
+        let scrubbed = redactor.scrub(&text);
+        assert!(
+            !scrubbed.contains(prefix),
+            "head of the overlapping raw value leaked: {scrubbed}"
+        );
+        assert_eq!(scrubbed, "[redacted-secret]");
+    }
+
+    #[test]
+    fn redactor_fold_matches_reflowed_raw_value() {
+        // EE-8: `fold -w N` (or any tool that re-wraps output) inserts line
+        // breaks into an UNENCODED token. No per-line raw pieces are armed, so
+        // only fold-matching the raw value catches it.
+        let value = "harness-fixture-ee8-raw-value-with-no-encoding";
+        assert!(value.len() >= MIN_REDACTED_SECRET_BYTES);
+        let redactor = SecretValueRedactor::new([SecretString::from(value.to_string())].as_slice());
+        let wrapped = value
+            .as_bytes()
+            .chunks(16)
+            .map(|c| std::str::from_utf8(c).unwrap()) // safety: test
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(wrapped.lines().count() > 1);
+        let text = format!("prefix\n{wrapped}\nsuffix");
+        assert!(redactor.contains_secret(&text));
+        let scrubbed = redactor.scrub(&text);
+        assert!(!scrubbed.contains(value));
+        for line in wrapped.lines() {
+            assert!(!scrubbed.contains(line), "reflowed piece leaked: {line}");
+        }
+        assert!(scrubbed.contains("prefix"));
+        assert!(scrubbed.contains("suffix"));
+    }
+
+    #[test]
+    fn redactor_folded_raw_value_with_multibyte_tail_does_not_panic() {
+        // TP-1: the folded map stores char START offsets. Once the raw value
+        // is fold-matched (EE-8), a value ending in a multi-byte char puts a
+        // match end inside that char; deriving the original end as
+        // `map[end - 1] + 1` panics on the replacement slice.
+        let value = "härness-fixture-pässwörd-€";
+        assert!(value.ends_with('€'));
+        let redactor = SecretValueRedactor::new([SecretString::from(value.to_string())].as_slice());
+        for separator in ["\n", "\r\n"] {
+            // The line break makes this the folded slow path.
+            let text = format!("prefix{separator}{value}{separator}suffix");
+            let scrubbed = redactor.scrub(&text);
+            assert!(scrubbed.contains("[redacted-secret]"));
+            assert!(!scrubbed.contains(value));
+            assert!(!scrubbed.contains("pässwörd"));
+            assert!(scrubbed.contains("prefix"));
+            assert!(scrubbed.contains("suffix"));
+        }
+    }
+
+    #[test]
+    fn redactor_dz5_skips_armor_and_punctuation_lines_when_arming() {
+        // DZ-5: arming armor delimiters and punctuation-only lines redacted
+        // unrelated files the sub-agent read. Asserted on the DIRECT variant
+        // list, because the folded raw value legitimately contains the whole
+        // multi-line text (so `contains_secret` on one of its lines is not a
+        // statement about per-line arming).
+        use secrecy::ExposeSecret;
+        let value = "-----BEGIN FIXTURE-----\nslug-fixture-key-material\n:::---:::---:::----\n-----END FIXTURE-----";
+        let redactor = SecretValueRedactor::new([SecretString::from(value.to_string())].as_slice());
+        let armed_line = |line: &str| {
+            redactor
+                .direct_variants
+                .iter()
+                .any(|v| v.expose_secret() == line)
+        };
+        assert!(armed_line("slug-fixture-key-material"));
+        for line in [
+            "-----BEGIN FIXTURE-----",
+            "-----END FIXTURE-----",
+            ":::---:::---:::----",
+        ] {
+            assert!(
+                !armed_line(line),
+                "low-entropy line must not be armed on its own: {line}"
+            );
+        }
+        // The value as a whole is still redacted, and its key material with it.
+        assert_eq!(redactor.scrub(value), "[redacted-secret]");
+        assert!(redactor.contains_secret("slug-fixture-key-material"));
     }
 
     #[test]
