@@ -591,6 +591,17 @@ else
   pass 'a standalone candidate build takes and releases the upgrade lock itself'
 fi
 
+# TO-7: a missing stage marker is fail-closed on the wrapper path too. It used
+# to read as "none" (restart the previous build), the one shape where a failed
+# marker write after cargo replaced the binary could start the new binary.
+rm -f "$(tenant_build_stage_file fixture)"
+stage_missing="$(upgrade_last_completed_stage fixture)"
+if [[ "$stage_missing" != unknown ]]; then
+  fail "a missing build-stage marker read as '$stage_missing' (expected unknown)"
+else
+  pass 'a missing build-stage marker is fail-closed (unknown), not none'
+fi
+
 if [[ "$failures" -ne 0 ]]; then
   printf 'RESULT: %d failure(s)\n' "$failures"
   exit 1

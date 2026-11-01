@@ -560,12 +560,14 @@ _record_build_stage() {  # <name> <stage>
 # WI#527: the last stage a build_tenant run completed for <name>:
 # "daemon", "bridge", "wasm", or "none" when nothing completed (worker lanes are
 # pre-stop candidates and never appear here).
-# An existing-but-unreadable marker reports "unknown" so the external wrapper
-# fails closed instead of restarting a possibly-new binary (run-294 TJ-9).
+# A missing or existing-but-unreadable marker reports "unknown" so the external
+# wrapper fails closed instead of restarting a possibly-new binary (run-294 TJ-9,
+# run-300 TO-7: a missing marker used to read as "none", the one fail-open shape
+# left on the wrapper path).
 upgrade_last_completed_stage() {  # <name>
   local file last=""
   file="$(tenant_build_stage_file "$1")"
-  [[ -e "$file" ]] || { printf 'none'; return 0; }
+  [[ -e "$file" ]] || { printf 'unknown'; return 0; }
   last="$(grep -v '^[[:space:]]*$' "$file" 2>/dev/null | tail -n 1 || true)"
   case "$last" in
     start) printf 'none' ;;
