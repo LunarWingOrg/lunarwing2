@@ -1584,7 +1584,7 @@ err="$(bash "$ADMIN_SCRIPT" add-tenant \
   --llm-model glm-5-air \
   --gateway-host 0.0.0.0 \
   --xmpp-allow-from admin@xmpp.org \
-  --with-pebble --with-opencode \
+  --with-pebble --with-opencode2 \
   2>&1 || true)"
 if echo "$err" | grep -q 'unknown flag'; then
   echo "  FAIL: a new flag was rejected as unknown"
@@ -1603,6 +1603,61 @@ else
   echo "  FAIL: retired Nanocode flag was not rejected explicitly"
   echo "        $retired_err"
   failures=$((failures + 1))
+fi
+
+# WI#333 retired the opencode v1 lane. Assert the refusal by message (not just
+# "not unknown flag", which would also pass for a wiring bug), for the worker
+# flag, both override flags, and the standalone builder.
+opencode_retired_err="$(
+  ( require_root() { :; }; main add-tenant --with-opencode fixture ) 2>&1 || true
+)"
+if echo "$opencode_retired_err" | grep -q 'opencode v1 worker lane is retired (WI#333)'; then
+  echo "  PASS: retired --with-opencode rejected explicitly"
+else
+  echo "  FAIL: retired --with-opencode was not rejected explicitly"
+  echo "        $opencode_retired_err"
+  failures=$((failures + 1))
+fi
+
+opencode_override_err="$(
+  ( require_root() { :; }; main add-tenant fixture --opencode-model fixture-model ) 2>&1 || true
+)"
+if echo "$opencode_override_err" | grep -q 'opencode v1 worker lane is retired (WI#333)'; then
+  echo "  PASS: retired --opencode-model rejected explicitly"
+else
+  echo "  FAIL: retired --opencode-model was not rejected explicitly"
+  echo "        $opencode_override_err"
+  failures=$((failures + 1))
+fi
+
+opencode_base_err="$(
+  ( require_root() { :; }; main add-tenant fixture --opencode-base-url http://127.0.0.1:4000 ) 2>&1 || true
+)"
+if echo "$opencode_base_err" | grep -q 'opencode v1 worker lane is retired (WI#333)'; then
+  echo "  PASS: retired --opencode-base-url rejected explicitly"
+else
+  echo "  FAIL: retired --opencode-base-url was not rejected explicitly"
+  echo "        $opencode_base_err"
+  failures=$((failures + 1))
+fi
+
+build_opencode_err="$(
+  ( require_root() { :; }; main build-opencode-worker ) 2>&1 || true
+)"
+if echo "$build_opencode_err" | grep -q 'opencode v1 worker lane is retired (WI#333)'; then
+  echo "  PASS: retired build-opencode-worker rejected explicitly"
+else
+  echo "  FAIL: retired build-opencode-worker was not rejected explicitly"
+  echo "        $build_opencode_err"
+  failures=$((failures + 1))
+fi
+
+# The refusal must never echo the value it was given.
+if echo "$opencode_override_err$opencode_base_err" | grep -q 'fixture-model\|127.0.0.1:4000'; then
+  echo "  FAIL: retired opencode refusal echoed an operator-supplied value"
+  failures=$((failures + 1))
+else
+  echo "  PASS: retired opencode refusal echoes no value"
 fi
 
 # Verify --no-weechat-bootstrap is accepted by add-tenant dispatch.
