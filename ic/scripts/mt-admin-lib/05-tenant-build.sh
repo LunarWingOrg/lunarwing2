@@ -559,7 +559,7 @@ build_tenant() {
   if [[ "$with_pebble" == "true" ]]; then
     say ""
     say "=== Building pebble worker image ==="
-    build_pebble_worker "false" "$with_toolchains"
+    build_pebble_worker "false" "$with_toolchains" "$(tenant_lw_root "$name")"
   fi
 
   if [[ "$with_opencode" == "true" ]]; then
@@ -1021,13 +1021,18 @@ ensure_darkirc_release() {
     || die "DarkIRC release remained invalid after rebuild"
 }
 
-shared_worker_source_root() {  # <names> <with-opencode> <with-kimi> <with-opencode2>
-  local names="$1" with_opencode="$2" with_kimi="$3" with_opencode2="${4:-false}"
+# WI#507: pebble is in worker_paths too. build_all is the one command that
+# publishes shared worker images from verified-clean tenant checkouts; pebble
+# used to be built from the operator's unverified checkout while the other
+# three lanes were proven clean.
+shared_worker_source_root() {  # <names> <with-opencode> <with-kimi> <with-opencode2> <with-pebble>
+  local names="$1" with_opencode="$2" with_kimi="$3" with_opencode2="${4:-false}" with_pebble="${5:-false}"
   local name root commit dirty expected_commit="" selected_root=""
   local -a worker_paths=()
   [[ "$with_opencode" != "true" ]] || worker_paths+=(opencode4lunarwing)
   [[ "$with_opencode2" != "true" ]] || worker_paths+=(opencode2.4lunarwing)
   [[ "$with_kimi" != "true" ]] || worker_paths+=(kimicode4lunarwing)
+  [[ "$with_pebble" != "true" ]] || worker_paths+=(pebble4lunarwing)
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     root="$(tenant_lw_root "$name")"
@@ -1064,14 +1069,14 @@ build_all() {
   fi
 
   local worker_source_root=""
-  if [[ "$with_opencode" == "true" || "$with_kimi" == "true" || "$with_opencode2" == "true" ]]; then
-    worker_source_root="$(shared_worker_source_root "$names" "$with_opencode" "$with_kimi" "$with_opencode2")"
+  if [[ "$with_opencode" == "true" || "$with_kimi" == "true" || "$with_opencode2" == "true" || "$with_pebble" == "true" ]]; then
+    worker_source_root="$(shared_worker_source_root "$names" "$with_opencode" "$with_kimi" "$with_opencode2" "$with_pebble")"
   fi
 
   if [[ "$with_pebble" == "true" ]]; then
     say ""
     say "=== Building pebble worker image ==="
-    build_pebble_worker "false" "$with_toolchains"
+    build_pebble_worker "false" "$with_toolchains" "$worker_source_root"
   fi
 
   if [[ "$with_opencode" == "true" ]]; then
@@ -1139,10 +1144,19 @@ _worker_source_revision() {
   printf '%s' "$revision"
 }
 
+# Usage: build_pebble_worker <no-cache> <with-toolchains> [source-root]
+#
+# WI#507: the source root is a parameter like the opencode/kimi/opencode2
+# builders. Tenant builds pass the tenant clone so a tenant image is built
+# from — and stamped with — the tenant's pinned checkout, never the operator's
+# live working tree (whose uncommitted pebble4lunarwing/ edits used to land in
+# tenant images silently). The standalone build-pebble-worker subcommand keeps
+# the operator root by default.
 build_pebble_worker() {
   local no_cache="${1:-false}"
   local with_toolchains="${2:-false}"
-  local pebble_dir="${LUNARWING_ROOT}/pebble4lunarwing"
+  local source_root="${3:-$LUNARWING_ROOT}"
+  local pebble_dir="${source_root}/pebble4lunarwing"
 
   [[ -d "$pebble_dir" ]] || die "pebble worker dir not found at $pebble_dir"
 
@@ -1151,7 +1165,7 @@ build_pebble_worker() {
   local toolchain_desc="slim (no toolchains)"
   [[ "$with_toolchains" == "true" ]] && toolchain_desc="fat (with Rust/Go/C++ toolchains)"
   local source_revision
-  source_revision="$(_worker_source_revision "$LUNARWING_ROOT" pebble4lunarwing)"
+  source_revision="$(_worker_source_revision "$source_root" pebble4lunarwing)"
   local -a revision_args=(--build-arg "SOURCE_REVISION=$source_revision")
   say "building pebble worker Docker image [$toolchain_desc] (source revision: $source_revision) ..."
   local cache_flag=""
@@ -1167,14 +1181,17 @@ build_pebble_worker() {
   local candidate_tag="lunarwing-worker-pebble:candidate"
   [[ "$with_toolchains" == "true" ]] && target_tag="$candidate_tag"
 
+  # The Dockerfile's COPY paths are rooted at pebble4lunarwing/, so the build
+  # context is the chosen source root itself; both -f and the context follow
+  # the root so a tenant build can never read the operator's checkout.
   if [[ "$CONTAINER_RT" == "podman" ]]; then
     # --network=host: podman's default build network
     # can't reach the internet for RUN steps on this host; the host netns has IPv4.
     # --format docker (O4): preserve the Dockerfile HEALTHCHECK (podman OCI drops it).
-    podman build $cache_flag "${toolchain_args[@]}" "${revision_args[@]}" --network=host --format docker -t "$target_tag" -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
+    podman build $cache_flag "${toolchain_args[@]}" "${revision_args[@]}" --network=host --format docker -t "$target_tag" -f "$pebble_dir/Dockerfile" "$source_root" \
       || die "pebble worker image build failed"
   else
-    docker build $cache_flag "${toolchain_args[@]}" "${revision_args[@]}" -t "$target_tag" -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
+    docker build $cache_flag "${toolchain_args[@]}" "${revision_args[@]}" -t "$target_tag" -f "$pebble_dir/Dockerfile" "$source_root" \
       || die "pebble worker image build failed"
   fi
 
