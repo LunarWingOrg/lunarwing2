@@ -3231,9 +3231,7 @@ async fn interrupt_engine_conversation(
         // classic rebuild path, so markers never reach restored LLM context.
         if let Some(ref db) = state.db
             && let Some(cid) = resolve_v1_conversation_for_message(db.as_ref(), message).await
-            && let Err(error) = db
-                .add_conversation_message(cid, INTERRUPTED_ROLE, "")
-                .await
+            && let Err(error) = db.add_conversation_message(cid, INTERRUPTED_ROLE, "").await
         {
             debug!(%error, "engine v2: failed to persist interrupted-turn marker");
         }

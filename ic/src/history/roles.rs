@@ -127,14 +127,14 @@ mod tests {
     fn every_census_role_classifies_without_falling_through() {
         for role in ALL_ROLES {
             assert!(
-                !matches!(
-                    classify_conversation_role(role),
-                    ConversationRole::Unknown
-                ),
+                !matches!(classify_conversation_role(role), ConversationRole::Unknown),
                 "role {role:?} is in the census but classify_conversation_role does not know it"
             );
         }
-        assert_eq!(ALL_ROLES.len(), CONVERSATION_ROLES.len() + BOOKKEEPING_ROLES.len());
+        assert_eq!(
+            ALL_ROLES.len(),
+            CONVERSATION_ROLES.len() + BOOKKEEPING_ROLES.len()
+        );
     }
 
     #[test]
@@ -164,7 +164,10 @@ mod tests {
 
     #[test]
     fn conversation_roles_classify_to_their_own_variant() {
-        assert_eq!(classify_conversation_role(USER_ROLE), ConversationRole::User);
+        assert_eq!(
+            classify_conversation_role(USER_ROLE),
+            ConversationRole::User
+        );
         assert_eq!(
             classify_conversation_role(ASSISTANT_ROLE),
             ConversationRole::Assistant
@@ -174,16 +177,20 @@ mod tests {
             ConversationRole::ToolCalls
         );
         for role in MARKER_ROLES {
-            assert_eq!(
-                classify_conversation_role(role),
-                ConversationRole::Marker
-            );
+            assert_eq!(classify_conversation_role(role), ConversationRole::Marker);
         }
     }
 
     #[test]
     fn unknown_roles_are_not_conversation() {
-        for role in ["", "system", "User", "assistant ", "tool_call", "future_role"] {
+        for role in [
+            "",
+            "system",
+            "User",
+            "assistant ",
+            "tool_call",
+            "future_role",
+        ] {
             assert_eq!(
                 classify_conversation_role(role),
                 ConversationRole::Unknown,

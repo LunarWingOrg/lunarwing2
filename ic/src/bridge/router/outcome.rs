@@ -396,7 +396,9 @@ impl TurnCompletion {
             return;
         };
         if let Some(json) = load_tool_calls_json(&self.state.store, self.thread_id).await
-            && let Err(error) = db.add_conversation_message(cid, TOOL_CALLS_ROLE, &json).await
+            && let Err(error) = db
+                .add_conversation_message(cid, TOOL_CALLS_ROLE, &json)
+                .await
         {
             tracing::warn!(%error, "failed to persist Engine V2 tool history");
         }
