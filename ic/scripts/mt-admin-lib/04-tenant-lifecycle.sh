@@ -1613,6 +1613,29 @@ cleanup_candidate_workers() {  # <name>
   fi
 }
 
+# WI#527 (run-300 TO-1): run a candidate-build or promote verb under the tenant
+# upgrade lock. The upgrade wrapper holds that lock for its whole run and
+# re-enters this script for these verbs, so an inherited descriptor is used as
+# is: the parent already serialises the run, and a second open-file description
+# would block against it forever. Any other caller holds the lock for the whole
+# verb, which closes the check-then-run race the old preflight left open (it
+# released the probe immediately).
+with_tenant_upgrade_lock() {  # <name> <cmd> [args...]
+  local name="$1" lock_fd rc=0
+  shift
+  if upgrade_lock_inherited_for "$name"; then
+    "$@"
+    return
+  fi
+  _lock_held_preflight "upgrade for '$name'" "${BUILD_LOCK}.${name}.upgrade" || return 1
+  exec {lock_fd}>"${BUILD_LOCK}.${name}.upgrade" || return 1
+  flock -x "$lock_fd" || { exec {lock_fd}>&-; return 1; }
+  "$@" || rc=$?
+  flock -u "$lock_fd" || rc=1
+  exec {lock_fd}>&-
+  return "$rc"
+}
+
 # Build every selected worker image to a candidate tag while the tenant runs.
 # On failure, discard the candidates and return the clone to <previous_commit>,
 # so the running tenant is exactly as it was. Never dies.

@@ -971,10 +971,11 @@ main() {
       promote_name="$(sanitize_name "$1")"
       ports_registry_init
       tenant_exists_in_registry "$promote_name" || die "tenant '$promote_name' not found in registry"
-      # run-294 TJ-5: refuse to promote under a running upgrade of the same
-      # tenant (a promote could otherwise race its candidate build).
-      _lock_held_preflight "upgrade for '$promote_name'" "${BUILD_LOCK}.${promote_name}.upgrade"
-      promote_candidate_workers "$promote_name"
+      # run-294 TJ-5: serialise with a running upgrade of the same tenant (a
+      # promote could otherwise race its candidate build). run-300 TO-1: the
+      # upgrade wrapper's own run already holds this lock (inherited fd), so the
+      # verb uses that instead of meeting itself.
+      with_tenant_upgrade_lock "$promote_name" promote_candidate_workers "$promote_name"
       ;;
 
     restore-worker-images)
@@ -1026,9 +1027,10 @@ main() {
       ports_registry_init
       tenant_exists_in_registry "$cand_name" || die "tenant '$cand_name' not found in registry"
       # run-294 TJ-5: a candidate build may not race a running upgrade of the
-      # same tenant (they share the candidate tag).
-      _lock_held_preflight "upgrade for '$cand_name'" "${BUILD_LOCK}.${cand_name}.upgrade"
-      build_candidate_workers "$cand_name" "$cand_oc" "$cand_kimi" "$cand_oc2" "$cand_pebble" "false"
+      # same tenant (they share the candidate tag). run-300 TO-1: inside the
+      # upgrade wrapper that run's inherited lock is used, not re-acquired.
+      with_tenant_upgrade_lock "$cand_name" \
+        build_candidate_workers "$cand_name" "$cand_oc" "$cand_kimi" "$cand_oc2" "$cand_pebble" "false"
       ;;
 
     last-build-stage)
