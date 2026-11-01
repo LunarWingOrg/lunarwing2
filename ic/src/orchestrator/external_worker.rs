@@ -6616,11 +6616,26 @@ mod tests {
     }
 
     /// Spawn a minimal `lunarwing-agent-v1` worker on a loopback port: it
-    /// accepts one connection, sends a `ready` envelope, and keeps the socket
-    /// open long enough for the probe to complete the handshake.
+    /// negotiates the offered subprotocol (as a real worker does), sends a
+    /// `ready` envelope, and keeps the socket open long enough for the probe
+    /// to complete the handshake.
     async fn spawn_ready_worker() -> std::net::SocketAddr {
         use futures::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::tungstenite::handshake::server::{
+            ErrorResponse, Request, Response,
+        };
+
+        // Real workers echo the negotiated `Sec-WebSocket-Protocol`; the
+        // client (connect_and_handshake) rejects a server that omits it.
+        let callback = |_req: &Request, mut response: Response| {
+            response
+                .headers_mut()
+                .insert("Sec-WebSocket-Protocol", SUBPROTOCOL.parse().map_err(
+                    |_| ErrorResponse::new(Some("bad subprotocol header".to_string())),
+                )?);
+            Ok::<Response, ErrorResponse>(response)
+        };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -6630,7 +6645,7 @@ mod tests {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
-            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+            let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(stream, callback).await else {
                 return;
             };
             let ready = serde_json::json!({
