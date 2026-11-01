@@ -1229,10 +1229,7 @@ async fn async_main() -> anyhow::Result<()> {
         // WI#464 (ask #2): re-probe on an interval, logging only on a state
         // change, so a worker that dies after boot also produces an ERROR
         // line before the next dispatch.
-        mgr.spawn_periodic_reprobe(
-            shutdown_tx.subscribe(),
-            std::time::Duration::from_secs(300),
-        );
+        mgr.spawn_periodic_reprobe(shutdown_tx.subscribe(), std::time::Duration::from_secs(300));
     }
 
     // Bundled MCP gateway control plane (opt-in via environment; see

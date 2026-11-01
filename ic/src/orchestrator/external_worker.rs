@@ -1557,14 +1557,12 @@ impl ExternalWorkerManager {
         let mut unreachable_count = 0usize;
 
         for probe in probes {
-            let state = probe.await.unwrap_or_else(|join_error| {
-                WorkerProbeState {
-                    worker: "?".to_string(),
-                    reachable: false,
-                    reason: Some(format!("probe task panicked: {join_error}")),
-                    endpoint_display: "unknown".to_string(),
-                    last_probe: Utc::now(),
-                }
+            let state = probe.await.unwrap_or_else(|join_error| WorkerProbeState {
+                worker: "?".to_string(),
+                reachable: false,
+                reason: Some(format!("probe task panicked: {join_error}")),
+                endpoint_display: "unknown".to_string(),
+                last_probe: Utc::now(),
             });
             if state.reachable {
                 reachable_count += 1;
@@ -1651,9 +1649,7 @@ impl ExternalWorkerManager {
 
         let previous = match self.probe_state.write() {
             Ok(mut guard) => guard.insert(worker_name.clone(), state),
-            Err(poisoned) => poisoned
-                .into_inner()
-                .insert(worker_name.clone(), state),
+            Err(poisoned) => poisoned.into_inner().insert(worker_name.clone(), state),
         };
         let was_reachable = previous.map(|s| s.reachable);
 
@@ -2231,7 +2227,8 @@ async fn probe_worker_endpoint(url: &str, auth_token: Option<&str>) -> Result<()
         // Reuse the exact handshake used for dispatch so a reachable result
         // means "a job could connect now".  The returned stream is dropped
         // at the end of this block, which closes the socket.
-        let (stream, _worker_id, _capabilities) = connect_and_handshake(url, auth_token, "probe").await
+        let (stream, _worker_id, _capabilities) = connect_and_handshake(url, auth_token, "probe")
+            .await
             .map_err(|error| error.to_string())?;
         drop(stream);
         Ok::<(), String>(())
@@ -2331,9 +2328,7 @@ async fn periodic_reprobe_once(
 /// read the running daemon's in-memory probe state).  Probes all workers
 /// concurrently; each gets its own [`WORKER_LIVENESS_PROBE_TIMEOUT`] deadline.
 /// Never returns an error: an unreachable worker is reported in its state.
-pub async fn probe_configured_workers(
-    configs: &[ExternalWorkerConfig],
-) -> Vec<WorkerProbeState> {
+pub async fn probe_configured_workers(configs: &[ExternalWorkerConfig]) -> Vec<WorkerProbeState> {
     let mut handles = Vec::with_capacity(configs.len());
     for config in configs {
         let worker_name = config.name.clone();
@@ -6622,8 +6617,8 @@ mod tests {
     async fn spawn_ready_worker() -> std::net::SocketAddr {
         use futures::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
-        use tokio_tungstenite::tungstenite::http::HeaderValue;
         use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Response};
+        use tokio_tungstenite::tungstenite::http::HeaderValue;
 
         // Real workers echo the negotiated `Sec-WebSocket-Protocol`; the
         // client (connect_and_handshake) rejects a server that omits it.
@@ -6751,14 +6746,7 @@ mod tests {
 
         let job_id = Uuid::new_v4();
         let result = mgr
-            .execute_task(
-                job_id,
-                "dead",
-                "hello",
-                None,
-                true,
-                TaskContext::default(),
-            )
+            .execute_task(job_id, "dead", "hello", None, true, TaskContext::default())
             .await;
 
         match result {
