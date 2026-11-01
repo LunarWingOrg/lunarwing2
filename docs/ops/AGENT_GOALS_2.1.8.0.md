@@ -116,23 +116,28 @@
 23. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/519
 24. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/520
 25. [x] (S) Reserved
+26. [ ] work on the following work items: #532 + #534 — Engine V2 “thread not found” during join on brightdawn, and its root cause (join_thread only consults the in-memory maps; take-once outcome). Live bug, fix shape agreed in the notes. I would add this one first, as a single line pointing at both.
+27. [ ] work on WI#529
+28. [ ] work on WI#508
+29. [ ] work on WI#526
+30. [ ] work on WI#531
 
 ## Phase 7 - Advanced Operator Notes
 
-26. [x] (S) Reserved
-27. [x] (S) Reserved
-28. [x] (S) Reserved
-29. [x] (S) NOTE TO RECHECK ALL WIS WITH TAG FOR 2.1.6.0
-30. [x] (H) Revamped LunarWing TUI REPLv3 utilizing OpenTUI, Multimodal input/output, and more
-31. [x] (H) Remaining polish items from massive changes introduced in Tsuno
-32. [x] (H) General Agent Loop Engine Polish
-33. [x] (H) OPERATOR NOTE: Start the gallop
-34. [x] (H) Deploy the stoplight system
-35. [x] (H) Dive back in to LunarDepth and open worker lanes across the fleet for it get it running and up again patches too
-36. [x] (H) follow up on some earlier endeavors
-37. [x] (S) Reserved
-38. [x] (S) Reserved
-39. [x] (S) Reserved
-40. [x] (S) Reserved
+31. [x] (S) Reserved
+32. [x] (S) Reserved
+33. [x] (S) Reserved
+34. [x] (S) NOTE TO RECHECK ALL WIS WITH TAG FOR 2.1.6.0
+35. [x] (H) Revamped LunarWing TUI REPLv3 utilizing OpenTUI, Multimodal input/output, and more
+36. [x] (H) Remaining polish items from massive changes introduced in Tsuno
+37. [x] (H) General Agent Loop Engine Polish
+38. [x] (H) OPERATOR NOTE: Start the gallop
+39. [x] (H) Deploy the stoplight system
+40. [x] (H) Dive back in to LunarDepth and open worker lanes across the fleet for it get it running and up again patches too
+41. [x] (H) follow up on some earlier endeavors
+42. [x] (S) Reserved
+43. [x] (S) Reserved
+44. [x] (S) Reserved
+45. [x] (S) Reserved
 
 ---
