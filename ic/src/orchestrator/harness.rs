@@ -938,6 +938,10 @@ fn secret_variants(raw: &str) -> (Vec<SecretString>, Vec<SecretString>) {
     let mut seen_folded = std::collections::HashSet::new();
 
     push_variant(&mut direct, &mut seen_direct, raw.to_string());
+    // EE-8: the raw value was matched only directly, never fold-matched, so
+    // `fold -w N` of an unencoded token leaks from 16 bytes up to fully. Add
+    // it to the folded list as well; the direct list keeps the exact match.
+    push_variant(&mut folded, &mut seen_folded, raw.to_string());
     // Multi-line values (PEM keys, service-account JSON) also leak one line
     // at a time.
     for line in raw.lines() {
@@ -2694,6 +2698,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn redactor_fold_matches_raw_value_at_any_width() {
+        // EE-8: `fold -w N` of a raw token leaked because the raw value was
+        // only matched directly, never fold-matched.  Now the raw value is in
+        // the folded list, so a wrapped raw value is caught at any width.
+        let value = "raw-fixture-secret-value-0123456789";
+        let redactor = SecretValueRedactor::new(&[SecretString::from(value.to_string())]);
+        // Simulate `fold -w 16` of the raw value — a newline every 16 chars.
+        let folded_raw: String = value
+            .as_bytes()
+            .chunks(16)
+            .map(|c| std::str::from_utf8(c).unwrap_or("")) // safety: test
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = format!("prefix\n{folded_raw}\nsuffix");
+        let scrubbed = redactor.scrub(&text);
+        // Every 16-byte chunk of the raw value must be gone; asserting only
+        // `!scrubbed.contains(value)` would be vacuous, because the text
+        // never carries the unfolded value (TL-5).
+        for chunk in value.as_bytes().chunks(16) {
+            let chunk = std::str::from_utf8(chunk).unwrap_or(""); // safety: test
+            assert!(
+                !chunk.is_empty() && !scrubbed.contains(chunk),
+                "wrapped raw chunk survived: {chunk}"
+            );
+        }
+        assert!(scrubbed.contains("[redacted-secret]"));
     }
 
     #[test]
