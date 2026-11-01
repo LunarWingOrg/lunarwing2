@@ -2654,7 +2654,7 @@ mod tests {
             .await
             .expect("a durable Done record must answer the join");
         assert!(
-            matches!(recovered, ThreadOutcome::Completed { response: Some(text) } if text == "Hello!"),
+            matches!(recovered, ThreadOutcome::Completed { response: Some(ref text) } if text == "Hello!"),
             "the stored reply is recovered, got {recovered:?}"
         );
     }
@@ -2685,7 +2685,7 @@ mod tests {
             .await
             .expect("the second joiner is answered from the store");
         assert!(
-            matches!(second, ThreadOutcome::Completed { response: Some(text) } if text == "Hello!"),
+            matches!(second, ThreadOutcome::Completed { response: Some(ref text) } if text == "Hello!"),
             "got {second:?}"
         );
     }
@@ -2710,7 +2710,7 @@ mod tests {
 
         let outcome = mgr.join_thread(id).await.unwrap();
         assert!(
-            matches!(outcome, ThreadOutcome::Failed { error, .. } if error == "provider refused"),
+            matches!(outcome, ThreadOutcome::Failed { ref error, .. } if error == "provider refused"),
             "got {outcome:?}"
         );
     }
@@ -2870,7 +2870,7 @@ mod tests {
 
         let outcome = mgr.join_thread(id).await.unwrap();
         assert!(
-            matches!(outcome, ThreadOutcome::Completed { response: Some(text) } if text == "fresh"),
+            matches!(outcome, ThreadOutcome::Completed { response: Some(ref text) } if text == "fresh"),
             "the new turn answers its own join, got {outcome:?}"
         );
     }
