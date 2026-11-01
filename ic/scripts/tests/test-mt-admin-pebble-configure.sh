@@ -18,6 +18,15 @@ mkdir -p "$env_dir"
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 tenant_exists_in_registry() { return 0; }
 tenant_env_dir() { printf '%s/env\n' "$fixture"; }
+# WI#506: configure_pebble reads the existing backend tenant-side before
+# rewriting pebble.env; the fixture supplies it directly.
+EXISTING_BASE_URL=""
+read_tenant_env_value() {
+  [[ "$1" == alice && "$3" == PEBBLE_BASE_URL ]] || return 0
+  [[ -n "$EXISTING_BASE_URL" ]] && printf '%s\n' "$EXISTING_BASE_URL"
+  return 0
+}
+worker_egress_enabled() { return 1; }
 _ctr() {
   printf '%s\n' "$*" >>"$calls_log"
   return "${container_inspect_rc:-0}"
@@ -81,18 +90,50 @@ fi
 
 output="$(configure_pebble alice "$secret" openai/test-model 2>&1)" \
   || fail 'clean key was rejected'
-printf 'NANOGPT_API_KEY=%s\nPEBBLE_MODEL=openai/test-model\n' "$secret" >"$fixture/expected"
+printf 'NANOGPT_API_KEY=%s\nPEBBLE_MODEL=openai/test-model\nPEBBLE_BASE_URL=https://nano-gpt.com/api\nNANOGPT_BASE_URL=https://nano-gpt.com/api\n' \
+  "$secret" >"$fixture/expected"
 cmp -s "$fixture/expected" "$env_file" || fail 'clean key/model env-file output differs'
 [[ "$output" != *"$secret"* ]] || fail 'clean configuration leaked key material'
 [[ "$output" == *'stop-tenant alice'* && "$output" == *'start-tenant alice'* ]] \
   || fail 'existing container did not produce restart guidance'
+
+# WI#506: an omitted --base-url preserves a configured backend, so rotating the
+# API key cannot silently re-point the lane at a different provider.
+EXISTING_BASE_URL='https://backend.example/v1'
+configure_pebble alice "$secret" '' >/dev/null 2>&1 || fail 'preserved-backend reconfigure was rejected'
+printf 'NANOGPT_API_KEY=%s\nPEBBLE_BASE_URL=%s\nNANOGPT_BASE_URL=%s\n' \
+  "$secret" "$EXISTING_BASE_URL" "$EXISTING_BASE_URL" >"$fixture/expected"
+cmp -s "$fixture/expected" "$env_file" || fail 'configured backend was not preserved on reconfigure'
+
+EXISTING_BASE_URL=""
+output="$(configure_pebble alice "$secret" openai/test-model https://explicit.example/api 2>&1)" \
+  || fail 'explicit --base-url was rejected'
+grep -Fxq 'PEBBLE_BASE_URL=https://explicit.example/api' "$env_file" \
+  || fail 'explicit backend missing from pebble.env'
+grep -Fxq 'NANOGPT_BASE_URL=https://explicit.example/api' "$env_file" \
+  || fail 'explicit backend was not written in the key pebble honours'
+[[ "$output" == *'model backend https://explicit.example/api'* ]] \
+  || fail 'configure did not report the pinned backend'
+
+before_sha="$(sha256sum "$env_file" | cut -d' ' -f1)"
+if output="$(configure_pebble alice "$secret" openai/test-model 'ftp://insecure.example/api' 2>&1)"; then
+  fail 'non-http backend URL was accepted'
+fi
+[[ "$output" == *'--base-url'* && "$output" == *'http(s)'* ]] \
+  || fail 'invalid backend rejection is not actionable'
+[[ "$(sha256sum "$env_file" | cut -d' ' -f1)" == "$before_sha" ]] \
+  || fail 'invalid backend rejection changed pebble.env'
+
 mapfile -t calls <"$calls_log"
 # The typed subcommand is the point: a bare `inspect` resolves a container name
 # that is a prefix of the worker IPC volume (`*-ipc-v2`), a false-positive
 # existence match (see _ctr_inspect in mt-admin-lib/02-containers.sh).
-[[ ${#calls[@]} -eq 1 && "${calls[0]}" == 'alice container inspect lunarwing-pebble-alice' ]] \
-  || fail 'clean configuration did not follow the existing-container inspection path'
+[[ ${#calls[@]} -eq 3 ]] || fail "expected three container inspections (got ${#calls[@]})"
+for call in "${calls[@]}"; do
+  [[ "$call" == 'alice container inspect lunarwing-pebble-alice' ]] \
+    || fail "unexpected container call: $call"
+done
 mapfile -t writes <"$writer_log"
-[[ ${#writes[@]} -eq 1 ]] || fail 'clean configuration did not commit exactly one env file'
+[[ ${#writes[@]} -eq 3 ]] || fail "clean configuration did not commit three env files (got ${#writes[@]})"
 
-printf 'PASS: Pebble raw-key validation, env-file output, secret hygiene, and restart guidance\n'
+printf 'PASS: Pebble raw-key validation, env-file output, backend pinning, secret hygiene, and restart guidance\n'
