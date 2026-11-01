@@ -138,6 +138,14 @@ pub async fn run_doctor_command() -> anyhow::Result<()> {
         &mut skipped,
     );
 
+    check(
+        "External workers",
+        check_external_workers(&settings).await,
+        &mut passed,
+        &mut failed,
+        &mut skipped,
+    );
+
     let (tunnel_name, tunnel_result) = check_tunnel_provider(&settings).await;
     check(
         tunnel_name,
@@ -776,6 +784,39 @@ async fn check_docker_daemon() -> CheckResult {
 
 // ── External binary ─────────────────────────────────────────
 
+/// WI#464 (ask #3): list each configured external worker with a live
+/// reachable/unreachable result and its endpoint.  Doctor runs as its own
+/// process, so it probes live rather than reading the running daemon's
+/// in-memory state.
+async fn check_external_workers(settings: &Settings) -> CheckResult {
+    let configs = crate::config::ExternalWorkerConfig::resolve_from_settings(settings);
+    if configs.is_empty() {
+        return CheckResult::Skip("no external workers configured".into());
+    }
+
+    let states = crate::orchestrator::probe_configured_workers(&configs).await;
+    let unreachable: Vec<&crate::orchestrator::WorkerProbeState> =
+        states.iter().filter(|s| !s.reachable).collect();
+
+    if unreachable.is_empty() {
+        let names: Vec<&str> = states.iter().map(|s| s.worker.as_str()).collect();
+        return CheckResult::Pass(format!("all reachable: {}", names.join(", ")));
+    }
+
+    let details: Vec<String> = unreachable
+        .iter()
+        .map(|s| {
+            format!(
+                "{} at {}: {}",
+                s.worker,
+                s.endpoint_display,
+                s.reason.as_deref().unwrap_or("unreachable")
+            )
+        })
+        .collect();
+    CheckResult::Fail(details.join("; "))
+}
+
 async fn check_tunnel_provider(settings: &Settings) -> (&'static str, CheckResult) {
     let static_url = crate::config::helpers::env_or_override("TUNNEL_URL")
         .or_else(|| settings.tunnel.public_url.clone());
@@ -1158,6 +1199,19 @@ mod tests {
         let result = check_skills().await;
         match result {
             CheckResult::Pass(_) | CheckResult::Fail(_) | CheckResult::Skip(_) => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn check_external_workers_skips_when_none_configured() {
+        // A default Settings has no external workers; the check must skip
+        // rather than dial anything.
+        let settings = Settings::default();
+        match check_external_workers(&settings).await {
+            CheckResult::Skip(_) => {}
+            CheckResult::Pass(msg) | CheckResult::Fail(msg) => {
+                panic!("expected Skip with no workers, got {msg}")
+            }
         }
     }
 
