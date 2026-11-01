@@ -2336,6 +2336,40 @@ async fn periodic_reprobe_once(
     }
 }
 
+/// WI#464 (ask #3): probe the configured external workers live and return
+/// their state, for `lunarwing doctor` (a separate process, so it cannot
+/// read the running daemon's in-memory probe state).  Probes all workers
+/// concurrently; each gets its own [`WORKER_LIVENESS_PROBE_TIMEOUT`] deadline.
+/// Never returns an error: an unreachable worker is reported in its state.
+pub async fn probe_configured_workers(
+    configs: &[ExternalWorkerConfig],
+) -> Vec<WorkerProbeState> {
+    let mut handles = Vec::with_capacity(configs.len());
+    for config in configs {
+        let worker_name = config.name.clone();
+        let endpoints = config.endpoints();
+        handles.push(tokio::spawn(async move {
+            probe_worker_config(&worker_name, &endpoints).await
+        }));
+    }
+
+    let mut states = Vec::with_capacity(handles.len());
+    for handle in handles {
+        match handle.await {
+            Ok(state) => states.push(state),
+            Err(join_error) => states.push(WorkerProbeState {
+                worker: "?".to_string(),
+                reachable: false,
+                reason: Some(format!("probe task panicked: {join_error}")),
+                endpoint_display: "unknown".to_string(),
+                last_probe: Utc::now(),
+            }),
+        }
+    }
+    states.sort_by(|a, b| a.worker.cmp(&b.worker));
+    states
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_external_task(
     job_id: Uuid,

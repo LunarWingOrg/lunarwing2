@@ -50,7 +50,9 @@ pub mod reaper;
 
 pub use api::OrchestratorApi;
 pub use auth::{CredentialGrant, McpCredentialGrant, TokenStore};
-pub use external_worker::{ExternalTaskResult, ExternalWorkerManager};
+pub use external_worker::{
+    ExternalTaskResult, ExternalWorkerManager, WorkerProbeState, probe_configured_workers,
+};
 pub use harness::{
     HarnessError, HarnessJobOptions, InjectedFileProvenance, InjectionManifest, InjectionSpec,
     PromotionRecord, PromotionRejection, PromotionSummary, ResolvedSecretFile, SecretFileMount,
