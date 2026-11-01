@@ -1401,6 +1401,7 @@ impl ExternalWorkerManager {
                 if let Err(error) = &result {
                     record_external_task_error(
                         job_id,
+                        &worker_name_owned,
                         error,
                         event_tx.as_ref(),
                         context_manager.as_ref(),
@@ -1449,6 +1450,7 @@ impl ExternalWorkerManager {
                 if let Err(error) = &result {
                     record_external_task_error(
                         job_id,
+                        &worker_name_owned,
                         error,
                         event_tx.as_ref(),
                         context_manager.as_ref(),
@@ -1457,23 +1459,13 @@ impl ExternalWorkerManager {
                     .await;
                 }
 
-                match &result {
-                    Ok(r) => {
-                        tracing::info!(
-                            "External worker '{}' job {} completed: status={}",
-                            worker_name_owned,
-                            job_id,
-                            r.status
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "External worker '{}' job {} failed: {}",
-                            worker_name_owned,
-                            job_id,
-                            e
-                        );
-                    }
+                if let Ok(r) = &result {
+                    tracing::info!(
+                        "External worker '{}' job {} completed: status={}",
+                        worker_name_owned,
+                        job_id,
+                        r.status
+                    );
                 }
             });
 
@@ -4667,12 +4659,24 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
 
 async fn record_external_task_error(
     job_id: Uuid,
+    worker_name: &str,
     error: &OrchestratorError,
     event_tx: Option<&broadcast::Sender<(Uuid, String, SseEvent)>>,
     context_manager: Option<&Arc<ContextManager>>,
     store: Option<&Arc<dyn Database>>,
 ) {
     let reason = error.to_string();
+    // WI#464 (note #11332): the blocking (wait=true) dispatch path had no
+    // tracing on final connect failure, so a dead worker was invisible in
+    // daemon.log until an operator noticed the failed job.  This function is
+    // the single shared failure record for both the blocking and spawned
+    // paths, so the ERROR line lives here and both paths emit it exactly once.
+    tracing::error!(
+        "External worker '{}' job {} failed: {}",
+        worker_name,
+        job_id,
+        error
+    );
     let status = if matches!(error, OrchestratorError::ExternalWorkerTimeout { .. }) {
         "timed_out"
     } else {
