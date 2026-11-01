@@ -1514,4 +1514,204 @@ echo "TASK=$LUNARWING_TASK_ID"
         server.abort();
         std::fs::remove_dir_all(&workspace_root).ok();
     }
+
+    /// WI#519 acceptance: a delayed task's progress must reach the hub while
+    /// the task is still running. The stub prints one progress line and then
+    /// blocks on a gate file until the test has read that line off a real
+    /// WebSocket connection, so a bridge that buffers envelopes until the task
+    /// is terminal cannot pass — its progress read would time out before the
+    /// gate ever opens. The bounded gate loop keeps the stub from leaking if
+    /// the test fails.
+    #[tokio::test]
+    async fn progress_reaches_a_real_hub_before_the_task_finishes() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let root = test_config();
+        let gate = Path::new(&root.workspace_root).join("release-gate");
+        let script = format!(
+            "#!/bin/sh\necho 'step 1'\ni=0\nwhile [ ! -f '{}' ] && [ $i -lt 600 ]; do sleep 0.1; \
+             i=$((i+1)); done\necho '{{\"type\":\"result\",\"message\":\"gated done\"}}'\n",
+            gate.display()
+        );
+        let stub = Path::new(&root.workspace_root).join("pebble-gated-stub.sh");
+        crate::executor::write_executable_stub(&stub, &script);
+        let config = BridgeConfig {
+            pebble_bin: stub.to_str().expect("utf-8 stub").to_string(),
+            ..root
+        };
+        let state = crate::health::WorkerState::new(&config.worker_id);
+        let registry = Arc::new(WorkspaceRegistry::new());
+        let workspace_root = config.workspace_root.clone();
+        let proxy_dir = config.tool_proxy_dir.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server_registry = Arc::clone(&registry);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let _ = handle_connection(stream, &config, &state, &server_registry).await;
+        });
+
+        let stream = TcpStream::connect(addr).await.expect("connect");
+        let mut request = format!("ws://{addr}/ws/agent")
+            .into_client_request()
+            .expect("client request");
+        request.headers_mut().insert(
+            "sec-websocket-protocol",
+            tokio_tungstenite::tungstenite::http::HeaderValue::from_static("lunarwing-agent-v1"),
+        );
+        let (mut ws, _) = tokio_tungstenite::client_async(request, stream)
+            .await
+            .expect("ws handshake");
+        let _ = ws_read_until(&mut ws, "ready", 5).await;
+
+        let task_id = format!("ws-progress-{}", std::process::id());
+        ws_send_envelope(&mut ws, &request_envelope(&task_id, None)).await;
+
+        // The progress frame arrives while the stub is still gated: the task
+        // has not finished, because only this test opens the gate.
+        let progress = ws_read_until(&mut ws, "task_progress", 10).await;
+        assert_eq!(progress.payload["task_id"], task_id.as_str());
+        assert!(
+            progress.payload["delta"]
+                .as_str()
+                .unwrap_or("")
+                .contains("step 1"),
+            "unexpected progress delta: {progress:?}"
+        );
+        assert!(
+            !gate.exists(),
+            "the stub must still be gated when its progress reaches the hub"
+        );
+
+        std::fs::write(&gate, b"go").expect("open gate");
+        let result = ws_read_until(&mut ws, "task_result", 10).await;
+        assert_eq!(result.payload["task_id"], task_id.as_str());
+        assert_eq!(result.payload["status"], "success");
+        assert_eq!(result.payload["output"], "gated done");
+
+        // Exactly one terminal result on normal completion.
+        let extra = tokio::time::timeout(std::time::Duration::from_millis(400), ws.next()).await;
+        assert!(
+            extra.is_err(),
+            "a completed task must send exactly one terminal result: {extra:?}"
+        );
+
+        // Completion releases the workspace claim and the relay slot.
+        let workspace = PathBuf::from(
+            Path::new(&workspace_root)
+                .canonicalize()
+                .expect("canonical root"),
+        );
+        let mut released = false;
+        for _ in 0..100 {
+            if registry
+                .try_register(workspace.clone(), "task-next")
+                .await
+                .is_ok()
+            {
+                registry.unregister(&workspace, "task-next").await;
+                released = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(released, "workspace claim never released after completion");
+
+        let socket = crate::tool_proxy::task_socket_path_in(&proxy_dir, &task_id);
+        for _ in 0..100 {
+            if !socket.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(!socket.exists(), "relay slot removed after completion");
+
+        drop(ws);
+        server.abort();
+        std::fs::remove_dir_all(&workspace_root).ok();
+    }
+
+    /// WI#519 acceptance: a closed outbound channel must not orphan the rest
+    /// of the stream. The forwarder keeps draining after the first failed
+    /// send, so a terminal result cannot be stranded behind a stopped
+    /// receiver, and it reports the loss with counts plus the terminal
+    /// classification only — never the payload.
+    #[tokio::test]
+    async fn closed_outbound_drains_events_and_reports_the_lost_terminal() {
+        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        drop(out_rx);
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        event_tx
+            .send(ExecutorEvent::Progress(protocol::progress_envelope(
+                "task-gone",
+                "progress payload",
+            )))
+            .expect("send progress");
+        event_tx
+            .send(ExecutorEvent::Result(protocol::result_envelope(
+                "task-gone",
+                "success",
+                "out",
+                None,
+                7,
+            )))
+            .expect("send result");
+        drop(event_tx);
+
+        let report = forward_executor_events(event_rx, out_tx, "task-gone".to_string()).await;
+        assert_eq!(
+            report,
+            ForwardReport {
+                dropped: 2,
+                terminal_lost: true,
+            }
+        );
+    }
+
+    /// The healthy path keeps executor order: progress frames first, exactly
+    /// one terminal result last, nothing dropped.
+    #[tokio::test]
+    async fn forwarder_preserves_order_and_sends_one_terminal_result() {
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        event_tx
+            .send(ExecutorEvent::Progress(protocol::progress_envelope(
+                "task-ok",
+                "first",
+            )))
+            .expect("send first progress");
+        event_tx
+            .send(ExecutorEvent::Progress(protocol::progress_envelope(
+                "task-ok",
+                "second",
+            )))
+            .expect("send second progress");
+        event_tx
+            .send(ExecutorEvent::Result(protocol::result_envelope(
+                "task-ok",
+                "success",
+                "done",
+                None,
+                3,
+            )))
+            .expect("send result");
+        drop(event_tx);
+
+        let report = forward_executor_events(event_rx, out_tx, "task-ok".to_string()).await;
+        assert_eq!(report, ForwardReport::default());
+
+        let mut msg_types = Vec::new();
+        while let Some(msg) = out_rx.recv().await {
+            let Message::Text(text) = msg else {
+                panic!("expected text frame");
+            };
+            let envelope: Envelope = serde_json::from_str(text.as_str()).expect("envelope");
+            msg_types.push(envelope.msg_type);
+        }
+        assert_eq!(
+            msg_types,
+            ["task_progress", "task_progress", "task_result"]
+        );
+    }
 }
