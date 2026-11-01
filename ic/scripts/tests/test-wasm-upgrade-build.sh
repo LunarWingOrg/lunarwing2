@@ -98,6 +98,12 @@ mv "$fixture/build/ic/tools-src/demo-missing" "$fixture/build/ic/tools-src/demo"
 # shellcheck disable=SC1090
 source "$ADMIN_SCRIPT"
 mkdir -p "$fixture/tenant/repo/bridges/xmpp-bridge" "$fixture/tenant/env"
+# run-294 TJ-13: keep the production /run/lock marker/lock directory out of a
+# non-root harness run; the real build_tenant creates its marker here.
+TENANT_LIFECYCLE_LOCK_DIR="$fixture/locks"
+mkdir -p "$TENANT_LIFECYCLE_LOCK_DIR"
+install() { command mkdir -p "${!#}"; }
+stat() { printf '0:700\n'; }
 # shellcheck disable=SC2034
 BUILD_LOCK="$fixture/build.lock"
 tenant_repo() { printf '%s/tenant/repo\n' "$fixture"; }
