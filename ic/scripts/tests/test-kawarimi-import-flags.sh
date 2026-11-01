@@ -214,6 +214,7 @@ worker_output="$(
   KAWARIMI_TEST_WORK="$tmp" \
   bash "$tmp/scripts/import-tenant.sh" "$tmp/kawarimi.tar" \
     --dry-run --yes \
+    --with-kimi \
     --with-opencode \
     2>&1
 )" || {
@@ -228,9 +229,15 @@ worker_output="$(
 add_line="$(printf '%s\n' "$worker_output" | grep -m1 '\[dry-run\].* add-tenant ' || true)"
 build_line="$(printf '%s\n' "$worker_output" | grep -m1 '\[dry-run\].* build-tenant ' || true)"
 assert_not_contains "add-tenant omits retired --with-nanocode" "$add_line" "--with-nanocode"
-assert_contains "add-tenant carries --with-opencode" "$add_line" "--with-opencode"
+assert_contains "add-tenant carries --with-kimi" "$add_line" "--with-kimi"
 assert_not_contains "build-tenant omits retired --with-nanocode" "$build_line" "--with-nanocode"
-assert_contains "build-tenant carries --with-opencode" "$build_line" "--with-opencode"
+assert_contains "build-tenant carries --with-kimi" "$build_line" "--with-kimi"
+# WI#333 retired the opencode v1 lane. The flag must still PARSE (a migration
+# note written before the retirement still passes it) but must never be
+# forwarded to mt-admin, which refuses it, and the drop must be announced.
+assert_not_contains "add-tenant omits retired --with-opencode" "$add_line" "--with-opencode"
+assert_not_contains "build-tenant omits retired --with-opencode" "$build_line" "--with-opencode"
+assert_contains "import warns that the opencode v1 lane is retired" "$worker_output" "opencode v1 worker lane is retired (WI#333)"
 # Unselected worker must NOT appear on either planned call.
 if [[ "$add_line" == *"--with-pebble"* ]]; then
   fail "add-tenant leaked --with-pebble (not selected)"
@@ -811,7 +818,10 @@ roundtrip_output="$(
 }
 assert_contains "production encrypted export can be imported" "$roundtrip_output" "DRY RUN"
 assert_not_contains "production export omits retired Nanocode model" "$roundtrip_output" "--nanocode-model"
-assert_contains "production export preserves OpenCode model" "$roundtrip_output" "--opencode-model roundtrip-opencode"
+# WI#333: the exported bundle still carries OPENCODE_MODEL, but the import must
+# drop it rather than forward a flag mt-admin refuses.
+assert_not_contains "import drops the retired OpenCode model override" "$roundtrip_output" "--opencode-model"
+assert_contains "import announces the retired opencode v1 lane" "$roundtrip_output" "opencode v1 worker lane is retired (WI#333)"
 if [[ "$full_export_output$roundtrip_output" == *"encrypted-roundtrip-kimi-secret"* ]]; then
   fail "encrypted Kimi round-trip does not log plaintext key"
 else

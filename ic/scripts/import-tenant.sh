@@ -1077,7 +1077,7 @@ VISION_ENVF="$LWROOT/env/vision.env"
 banner "2/8  Build"
 build_args=(build-tenant "$TENANT" --with-wasm)
 $WITH_PEBBLE  && build_args+=(--with-pebble)
-$WITH_OPENCODE && build_args+=(--with-opencode)
+# WI#333: no --with-opencode here either; mt-admin refuses the retired lane.
 $WITH_KIMI && build_args+=(--with-kimi)
 $WITH_TOOLCHAINS && build_args+=(--with-toolchains)
 run "$MT" "${build_args[@]}"
