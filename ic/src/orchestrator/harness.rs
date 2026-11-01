@@ -924,6 +924,34 @@ fn push_base64_variants(
     push_variant(folded, seen_folded, encoded);
 }
 
+/// DZ-5: per-line variants over-redact structural content. Whitespace-only
+/// lines, punctuation-only lines (YAML/JQ structure, separators) and PEM/armor
+/// delimiters (RFC 7468) carry no secret material, so arming them corrupts the
+/// model's view of unrelated files and rejects promotion of staged files that
+/// merely share the same structure. A line needs at least
+/// [`MIN_REDACTED_SECRET_BYTES`] bytes, one alphanumeric byte and three
+/// distinct non-whitespace bytes to be armed.
+fn is_low_entropy_line(line: &str) -> bool {
+    if line.len() < MIN_REDACTED_SECRET_BYTES {
+        return true;
+    }
+    let trimmed = line.trim();
+    // Armor delimiters are constant text shared by every key and certificate
+    // (`-----BEGIN PRIVATE KEY-----`), never key material itself.
+    if (trimmed.starts_with("-----BEGIN ") || trimmed.starts_with("-----END "))
+        && trimmed.ends_with("-----")
+    {
+        return true;
+    }
+    let mut distinct = std::collections::HashSet::new();
+    let mut has_alphanumeric = false;
+    for byte in line.bytes().filter(|b| !b.is_ascii_whitespace()) {
+        has_alphanumeric |= byte.is_ascii_alphanumeric();
+        distinct.insert(byte);
+    }
+    !has_alphanumeric || distinct.len() < 3
+}
+
 /// Selected encodings of one secret value (DG-2), split into variants matched
 /// directly against the text and contiguous encodings matched with line
 /// breaks folded out (EB-3/EB-4). The two lists dedup independently (EE-3):
@@ -945,9 +973,14 @@ fn secret_variants(raw: &str) -> (Vec<SecretString>, Vec<SecretString>) {
     // Multi-line values (PEM keys, service-account JSON) also leak one line
     // at a time.
     for line in raw.lines() {
-        push_variant(&mut direct, &mut seen_direct, line.to_string());
+        // DZ-5: skip whitespace-only and other structural lines (armor
+        // delimiters, punctuation-only structure) — arming them over-redacts
+        // unrelated files and causes promotion rejections.
+        if !is_low_entropy_line(line) {
+            push_variant(&mut direct, &mut seen_direct, line.to_string());
+        }
         let trimmed = line.trim();
-        if trimmed != line {
+        if trimmed != line && !is_low_entropy_line(trimmed) {
             push_variant(&mut direct, &mut seen_direct, trimmed.to_string());
         }
     }
@@ -2865,6 +2898,57 @@ mod tests {
             assert_eq!(redactor.scrub(&url), "[redacted-secret]");
             assert_eq!(redactor.scrub(password), "[redacted-secret]");
         }
+    }
+
+    #[test]
+    fn redactor_does_not_over_redact_structural_lines() {
+        // DZ-5: armor delimiters and punctuation-only lines carry no key
+        // material. Arming them corrupts unrelated keys and certificates the
+        // worker reads and rejects staged files that share the structure.
+        let value = "-----BEGIN PRIVATE KEY-----\n\
+                     MIIEfixturematerialline0123456789abcdef\n\
+                     -----END PRIVATE KEY-----";
+        let redactor = SecretValueRedactor::new(&[SecretString::from(value.to_string())]);
+        for structural in [
+            "-----BEGIN PRIVATE KEY-----",
+            "-----END PRIVATE KEY-----",
+            "  -----BEGIN CERTIFICATE-----  ",
+            "{{{{{{{{",
+            ",,,,,,,,",
+            "          ",
+        ] {
+            let text = format!("unrelated content\n{structural}\nhere");
+            assert_eq!(
+                redactor.scrub(&text),
+                text,
+                "structural line must not be armed: {structural:?}"
+            );
+        }
+        // The key material line is still armed when printed on its own.
+        let material = "MIIEfixturematerialline0123456789abcdef";
+        let scrubbed = redactor.scrub(&format!("leaked {material} here"));
+        assert!(
+            !scrubbed.contains(material),
+            "material line must still be scrubbed"
+        );
+    }
+
+    #[test]
+    fn is_low_entropy_line_classifies_correctly() {
+        // Whitespace-only and punctuation-only lines are low-entropy.
+        assert!(is_low_entropy_line("        "));
+        assert!(is_low_entropy_line("\t\t\t\t\t\t\t\t"));
+        assert!(is_low_entropy_line("{{{{{{{{"));
+        assert!(is_low_entropy_line(",,,,,,,,"));
+        // PEM/armor delimiters are structural, not key material.
+        assert!(is_low_entropy_line("-----BEGIN PRIVATE KEY-----"));
+        assert!(is_low_entropy_line("-----END PRIVATE KEY-----"));
+        assert!(is_low_entropy_line("  -----BEGIN CERTIFICATE-----  "));
+        // Short lines are low-entropy (below MIN_REDACTED_SECRET_BYTES).
+        assert!(is_low_entropy_line("short"));
+        // Material lines are NOT low-entropy.
+        assert!(!is_low_entropy_line("line-one-fixture-material"));
+        assert!(!is_low_entropy_line("harness-fixture-password"));
     }
 
     #[test]
