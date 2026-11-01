@@ -342,7 +342,7 @@ worker_egress_require_pebble_backend() {
     die "pebble worker for '$name' has no declared model backend, so the worker egress filter would block every job; pin it with 'configure-pebble $name --nanogpt-api-key <key> --base-url <url>' (default $PEBBLE_DEFAULT_BASE_URL), or allow the backend host yourself with 'configure-worker-egress $name --allow <host>:443'"
   fi
   split="$(_worker_egress_split_target "$backend" true)" \
-    || die "invalid pebble model backend '$backend' for tenant '$name'"
+    || die "invalid pebble model backend '$(sanitize_display_value "$backend")' for tenant '$name'"
   read -r host port <<<"$split"
   subnet="$(worker_egress_state_get "$name" SUBNET)"
   gateway="$(_worker_egress_gateway "$subnet")"
