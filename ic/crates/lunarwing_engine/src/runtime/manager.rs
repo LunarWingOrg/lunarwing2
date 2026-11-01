@@ -668,6 +668,11 @@ impl ThreadManager {
     ) -> Result<ThreadId, EngineError> {
         let thread_id = thread.id;
 
+        // A finished run's outcome is kept only for its own waiter. Reusing the
+        // id — a new turn on an adopted gateway/XMPP thread id, or a resume —
+        // must not let that stale outcome answer the new waiter (WI#534).
+        self.completed.write().await.remove(&thread_id);
+
         // Create signal channel
         let (tx, rx) = messaging::signal_channel(32);
 
@@ -1128,6 +1133,13 @@ impl ThreadManager {
 
     /// Wait for a thread to finish and return its outcome.
     /// Removes the thread from the running set.
+    ///
+    /// The in-memory registry is consulted first, but it is process-local: a
+    /// daemon restart between spawn and join (WI#532/WI#534), or a second
+    /// awaiter that arrives after the first consumed the take-once outcome,
+    /// leaves only the durable thread record. Both cases reconstruct the
+    /// outcome from the store via [`Self::stored_thread_outcome`] instead of
+    /// reporting `ThreadNotFound` for a thread that plainly exists.
     pub async fn join_thread(&self, thread_id: ThreadId) -> Result<ThreadOutcome, EngineError> {
         if let Some(outcome) = self.completed.write().await.remove(&thread_id) {
             return Ok(outcome);
@@ -1153,8 +1165,113 @@ impl ThreadManager {
                 self.completed.write().await.remove(&thread_id);
                 result
             }
-            None => Err(EngineError::ThreadNotFound(thread_id)),
+            None => self.stored_thread_outcome(thread_id).await,
         }
+    }
+
+    /// Reconstruct a join outcome from the durable thread record.
+    ///
+    /// A terminal record synthesizes the outcome its run produced: the last
+    /// assistant message for `Done`/`Completed` (the orchestrator persists the
+    /// visible response before the final save, so it survives a restart), and
+    /// the recorded `Failed` reason otherwise. `Waiting` is owned by gate
+    /// recovery, so it reports the waiting error and the record is left
+    /// untouched — a restart-time join must never fake a terminal outcome for a
+    /// thread whose approval is still answerable. Any other non-terminal record
+    /// has no live task behind it: it is finalized as `Failed` with
+    /// [`crate::types::thread::EXECUTION_STOPPED_REASON`] so the turn ends
+    /// cleanly. `Suspended` is the exception — it is deliberately resumable, so
+    /// it reports an interrupted-turn failure without mutating the checkpoint.
+    async fn stored_thread_outcome(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<ThreadOutcome, EngineError> {
+        let Some(mut thread) = self.store.load_thread(thread_id).await? else {
+            return Err(EngineError::ThreadNotFound(thread_id));
+        };
+
+        match thread.state {
+            ThreadState::Done | ThreadState::Completed => {
+                debug!(
+                    thread_id = %thread_id,
+                    state = %thread.state,
+                    "join recovered a completed outcome from the durable record"
+                );
+                Ok(ThreadOutcome::Completed {
+                    response: last_assistant_response(&thread),
+                })
+            }
+            ThreadState::Failed => {
+                debug!(
+                    thread_id = %thread_id,
+                    "join recovered a failed outcome from the durable record"
+                );
+                Ok(ThreadOutcome::Failed {
+                    kind: ThreadFailureKind::Unknown,
+                    error: terminal_failure_reason(&thread),
+                })
+            }
+            ThreadState::Waiting => {
+                debug!(
+                    thread_id = %thread_id,
+                    "join found a gate-paused thread; gate recovery owns the resume"
+                );
+                Err(EngineError::Thread(
+                    crate::types::error::ThreadError::Waiting(thread_id),
+                ))
+            }
+            ThreadState::Suspended => {
+                debug!(
+                    thread_id = %thread_id,
+                    "join found a suspended (resumable) thread with no live task"
+                );
+                Ok(ThreadOutcome::Failed {
+                    kind: ThreadFailureKind::Unknown,
+                    error: INTERRUPTED_TURN_ERROR.into(),
+                })
+            }
+            ThreadState::Created | ThreadState::Running => {
+                self.finalize_orphaned_thread(&mut thread).await?;
+                Ok(ThreadOutcome::Failed {
+                    kind: ThreadFailureKind::Unknown,
+                    error: INTERRUPTED_TURN_ERROR.into(),
+                })
+            }
+        }
+    }
+
+    /// Finalize a non-terminal record that no live task backs (restart while
+    /// the process-local registry held the only handle).
+    async fn finalize_orphaned_thread(&self, thread: &mut Thread) -> Result<(), EngineError> {
+        let thread_id = thread.id;
+        let new_event_start = thread.events.len();
+        thread.transition_to(
+            ThreadState::Failed,
+            Some(crate::types::thread::EXECUTION_STOPPED_REASON.into()),
+        )?;
+        if let Some(metadata) = thread.metadata.as_object_mut() {
+            metadata.remove(RUNTIME_CHECKPOINT_METADATA_KEY);
+            metadata.remove(INITIAL_PERSISTED_STATE_METADATA_KEY);
+        }
+        self.store.save_thread(thread).await?;
+        if let Err(error) = self
+            .store
+            .append_events(&thread.events[new_event_start..])
+            .await
+        {
+            debug!(thread_id = %thread_id, %error, "failed to append orphaned-join events");
+        }
+        self.revoke_lease_ids(&thread.capability_leases, "joined without a live task")
+            .await;
+        self.completed.write().await.remove(&thread_id);
+        if let Some(event) = thread.events.last().cloned() {
+            let _ = self.event_tx.send(event);
+        }
+        debug!(
+            thread_id = %thread_id,
+            "join finalized an orphaned thread as failed"
+        );
+        Ok(())
     }
 
     /// Get children of a thread.
@@ -1281,6 +1398,43 @@ impl ThreadManager {
 
         Ok(recovered)
     }
+}
+
+/// User-facing failure text for a turn whose in-flight run vanished (restart
+/// or an unrecoverable non-terminal record). It never names internal ids.
+const INTERRUPTED_TURN_ERROR: &str =
+    "The turn was interrupted before it finished. Please send your request again.";
+
+/// Last visible assistant message of a thread.
+///
+/// The orchestrator appends the completed response to the visible transcript
+/// (with a dedup guard) before the final save, so this is the restart-safe copy
+/// of the reply a `Done` record represents.
+fn last_assistant_response(thread: &Thread) -> Option<String> {
+    thread
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::Assistant)
+        .map(|message| message.content.clone())
+}
+
+/// Reason recorded by the thread's last transition to `Failed`, with a stable
+/// user-facing fallback for records that predate reason recording.
+fn terminal_failure_reason(thread: &Thread) -> String {
+    thread
+        .events
+        .iter()
+        .rev()
+        .find_map(|event| match &event.kind {
+            EventKind::StateChanged {
+                to: ThreadState::Failed,
+                reason,
+                ..
+            } => reason.clone(),
+            _ => None,
+        })
+        .unwrap_or_else(|| "The turn failed before it finished. Please try again.".to_string())
 }
 
 fn is_resolved_call_message(message: &ThreadMessage, call_id: &str) -> bool {
@@ -2465,6 +2619,260 @@ mod tests {
             .expect("stop should be prompt")
             .expect("thread should join");
         assert!(matches!(outcome, ThreadOutcome::Stopped));
+    }
+
+    // ── Join across registry loss (WI#532/WI#534) ────────────
+
+    #[tokio::test]
+    async fn join_recovers_a_completed_outcome_from_the_store_after_registry_loss() {
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(MockLlm::text("FINAL(\"Hello!\")"), Arc::clone(&store));
+
+        let tid = mgr
+            .spawn_thread(
+                "test",
+                ThreadType::Foreground,
+                ProjectId::new(),
+                ThreadConfig::default(),
+                None,
+                "user",
+            )
+            .await
+            .unwrap();
+        let outcome = mgr.join_thread(tid).await.unwrap();
+        assert!(
+            matches!(outcome, ThreadOutcome::Completed { response: Some(text) } if text == "Hello!")
+        );
+
+        // A daemon restart wipes both process-local maps; only the durable
+        // record (Done plus the visible assistant reply) survives.
+        mgr.completed.write().await.clear();
+        mgr.running.write().await.clear();
+
+        let recovered = mgr
+            .join_thread(tid)
+            .await
+            .expect("a durable Done record must answer the join");
+        assert!(
+            matches!(recovered, ThreadOutcome::Completed { response: Some(text) } if text == "Hello!"),
+            "the stored reply is recovered, got {recovered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_joiner_gets_the_stored_outcome_instead_of_thread_not_found() {
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(MockLlm::text("FINAL(\"Hello!\")"), Arc::clone(&store));
+        let tid = mgr
+            .spawn_thread(
+                "test",
+                ThreadType::Foreground,
+                ProjectId::new(),
+                ThreadConfig::default(),
+                None,
+                "user",
+            )
+            .await
+            .unwrap();
+
+        let first = mgr.join_thread(tid).await.unwrap();
+        assert!(matches!(first, ThreadOutcome::Completed { .. }));
+
+        // `completed` is take-once; a second awaiter (late watcher, gate
+        // watcher) must not be told the thread does not exist.
+        let second = mgr
+            .join_thread(tid)
+            .await
+            .expect("the second joiner is answered from the store");
+        assert!(
+            matches!(second, ThreadOutcome::Completed { response: Some(text) } if text == "Hello!"),
+            "got {second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_recovers_the_recorded_failure_reason_from_the_store() {
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(MockLlm::text("unused"), Arc::clone(&store));
+        let mut thread = Thread::new(
+            "failed",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+        thread
+            .transition_to(ThreadState::Failed, Some("provider refused".into()))
+            .unwrap();
+        let id = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        let outcome = mgr.join_thread(id).await.unwrap();
+        assert!(
+            matches!(outcome, ThreadOutcome::Failed { error, .. } if error == "provider refused"),
+            "got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_never_fails_a_gate_paused_thread() {
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(MockLlm::text("unused"), Arc::clone(&store));
+        let mut thread = Thread::new(
+            "waiting",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+        thread.transition_to(ThreadState::Waiting, None).unwrap();
+        let id = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        let error = mgr
+            .join_thread(id)
+            .await
+            .expect_err("a thread paused on a live gate is not a terminal outcome");
+        assert!(
+            matches!(
+                error,
+                EngineError::Thread(crate::types::error::ThreadError::Waiting(seen)) if seen == id
+            ),
+            "got {error:?}"
+        );
+        assert_eq!(
+            store.load_thread(id).await.unwrap().unwrap().state,
+            ThreadState::Waiting,
+            "gate recovery still owns the record"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_finalizes_an_orphaned_running_thread_instead_of_dropping() {
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(MockLlm::text("unused"), Arc::clone(&store));
+        let mut thread = Thread::new(
+            "orphan",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+        let id = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        let outcome = mgr
+            .join_thread(id)
+            .await
+            .expect("an orphaned record must not drop the turn");
+        assert!(matches!(outcome, ThreadOutcome::Failed { .. }));
+
+        let stored = store.load_thread(id).await.unwrap().unwrap();
+        assert_eq!(stored.state, ThreadState::Failed);
+        assert!(
+            stored.events.iter().any(|event| matches!(
+                &event.kind,
+                EventKind::StateChanged {
+                    to: ThreadState::Failed,
+                    reason: Some(reason),
+                    ..
+                } if reason == crate::types::thread::EXECUTION_STOPPED_REASON
+            )),
+            "the finalize transition records the host-stop reason"
+        );
+        // A second join now reads the terminal record, not an error.
+        assert!(matches!(
+            mgr.join_thread(id).await.unwrap(),
+            ThreadOutcome::Failed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn join_leaves_a_resumable_suspended_thread_untouched() {
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(MockLlm::text("unused"), Arc::clone(&store));
+        let mut thread = Thread::new(
+            "suspended",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+        thread.transition_to(ThreadState::Suspended, None).unwrap();
+        let id = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        let outcome = mgr.join_thread(id).await.unwrap();
+        assert!(matches!(outcome, ThreadOutcome::Failed { .. }));
+        assert_eq!(
+            store.load_thread(id).await.unwrap().unwrap().state,
+            ThreadState::Suspended,
+            "a resumable checkpoint must not be failed by a join"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_of_an_unknown_thread_is_still_thread_not_found() {
+        let mgr = make_manager_with_store(MockLlm::text("unused"), Arc::new(MockStore::new()));
+        let id = ThreadId::new();
+        assert!(matches!(
+            mgr.join_thread(id).await,
+            Err(EngineError::ThreadNotFound(seen)) if seen == id
+        ));
+    }
+
+    #[tokio::test]
+    async fn readopting_a_thread_id_does_not_resurrect_a_stale_outcome() {
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(MockLlm::text("FINAL(\"fresh\")"), Arc::clone(&store));
+        let project = ProjectId::new();
+        let mut previous = Thread::new(
+            "previous",
+            ThreadType::Foreground,
+            project,
+            "user",
+            ThreadConfig::default(),
+        );
+        previous.transition_to(ThreadState::Running, None).unwrap();
+        previous
+            .transition_to(ThreadState::Completed, None)
+            .unwrap();
+        previous.transition_to(ThreadState::Done, None).unwrap();
+        let id = previous.id;
+        store.save_thread(&previous).await.unwrap();
+        // Simulate an abandoned waiter's outcome for the previous turn.
+        mgr.completed.write().await.insert(
+            id,
+            ThreadOutcome::Completed {
+                response: Some("stale".into()),
+            },
+        );
+
+        let adopted = mgr
+            .spawn_thread_with_history_and_message(
+                ThreadMessage::user("next turn"),
+                ThreadType::Foreground,
+                project,
+                ThreadConfig::default(),
+                None,
+                "user",
+                Vec::new(),
+                Some(id),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(adopted, id);
+
+        let outcome = mgr.join_thread(id).await.unwrap();
+        assert!(
+            matches!(outcome, ThreadOutcome::Completed { response: Some(text) } if text == "fresh"),
+            "the new turn answers its own join, got {outcome:?}"
+        );
     }
 
     // ── Streaming cancellation mocks ─────────────────────────
