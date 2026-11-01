@@ -1036,43 +1036,54 @@ In the fat (`--with-toolchains`) image the Rust/Go toolchains are anchored again
 
 Upstream's pinned lockfile ships rustls 0.23.41. The reviewed override now pins **0.23.46** (WI#409), fixing RUSTSEC-2026-0285 and RUSTSEC-2026-0346/0347/0348/0349; `pebble4lunarwing/upstream/Cargo.lock` is copied over the checkout during the image build. It also retires upstream's yanked `chacha20 0.10.1` pin (0.10.2) and, for CVE-2026-111943 (2026-10-20), raises rustls-webpki to **0.103.16** (RUSTSEC-2026-0382) and webpki-roots to **1.0.10** (RUSTSEC-2026-0381) — the distrusted emSign intermediates pair. The Dockerfile supplies the canonical reviewed `PEBBLE_LOCK_SHA256` default for CI, mt-admin, Compose, and plain Docker builds. `scripts/verify_upstream_lock.py` verifies that digest and compares complete parsed package records (including additions/removals, source, checksum, and dependencies; records are keyed by `(name, version, source)` so multi-version crates such as `cpufeatures`/`getrandom` are fully covered), allowing changes only to the reviewed allowlist (rustls/rustls-webpki/webpki-roots/chacha20, plus the 2026-10-24 set: quinn/quinn-proto/quinn-udp, tokio and clipboard-win; run-214 NX-1 keeps errno/rustix/winapi-util out of the allowlist because no dependency edge is re-pointed) and rejecting a no-op override so the input is retired once upstream ships its own fix. The 2026-10-24 refresh (v2.1.7.0 item 3) also raises quinn-proto **0.11.16 → 0.11.19** (RUSTSEC-2026-0338/0339/0340/0341/0342, QUIC denial-of-service; quinn is locked through reqwest's weak `quinn?/ring` edge with `http3` off by default, so it is lockfile-only for every pebble build — fixed so enabling that feature cannot turn the advisories live), quinn **0.11.11 → 0.11.12**, quinn-udp **0.5.15 → 0.5.16**, tokio **1.52.3 → 1.53.3** (RUSTSEC-2026-0386, unsound safe `AsyncFd` constructors), and clipboard-win **5.4.1 → 5.4.3** (yanked), matching the levels already pinned by every other audited root; only those five packages' version/checksum lines change and no package is added or removed. Because this override is manifest-less, the satellite advisory sweep skips it by design — its advisory state is verified by resolving the override against the pinned upstream ref and scanning that graph, in addition to the digest/delta gate. `.gitlab/deliverables.json` explicitly classifies this lock-only override under `build_inputs`, with ci-config regression checks and worker-image candidate coverage; it is not a standalone Cargo root. Rebuild the Pebble image and verify the protected candidate/scan before promotion; changing the lock alone does not patch deployed images. On 2026-10-28 the override also moved pulldown-cmark 0.13.4 to 0.13.5 (RUSTSEC-2026-0414: exponential event growth with the wikilinks option, which pebble enables through `Options::all()` when rendering model output); `PEBBLE_LOCK_SHA256` and the verifier allowlist were re-pinned with it.
 
-## Opencode Worker
+## Opencode Worker (v1) — RETIRED
+
+**Retired in v2.1.8.0 (WI#333).** The v1 lane is no longer selectable and no
+longer published:
+
+- `add-tenant` / `add-tenants` / `build-tenant` / `build-all` reject
+  `--with-opencode`, `--opencode-model`, `--opencode-base-url` and point at
+  the opencode2 lane; `build-opencode-worker` is refused the same way.
+- CI publishes no `worker-opencode-candidate`/`-scan`/`-promote` job, so no
+  new `lunarwing-worker-opencode` image is released. `opencode2` is the
+  supported lane.
+- Tenants already carrying `workers.opencode=true` keep their existing image
+  and lifecycle; `mt-admin` still rebuilds that image from
+  `opencode4lunarwing/` on `upgrade-tenant`, and the Dockerfile and
+  `worker-inputs.sha256` manifest stay validated (`BUILDABLE_WORKERS` in
+  `validate_config.py`). Provision new tenants with `--with-opencode2`.
+
+The reason is unchanged and upstream (WI#320 F4, WI#333): at the pinned
+v1.18.25 every task fails at session start. The retired-lane reference
+material follows.
 
 [opencode](https://opencode.ai) (anomalyco/opencode, formerly sst/opencode) integrated as a persistent LunarWing external worker. A Bun/TypeScript bridge wraps the `@opencode-ai/sdk` and translates between the opencode session/event model and the `lunarwing-agent-v1` WebSocket protocol. The opencode headless server runs internally on `127.0.0.1:4096` (not exposed). Health on 8443, WebSocket on 9090.
 
 **Dockerfile:** `opencode4lunarwing/Dockerfile`
 
 ```bash
+# Legacy tenants only: the mt-admin selection and build entrypoints are
+# retired (see above). A direct build still works for an existing container:
 cd opencode4lunarwing
 docker build -t lunarwing-worker-opencode:latest .
-
-# Select the worker per tenant, then build the shared image via mt-admin
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <name> --with-opencode
-sudo ic/scripts/lunarwing-mt-admin.sh build-opencode-worker
-
-# Or build the shared image as part of a per-tenant build
-sudo ic/scripts/lunarwing-mt-admin.sh build-tenant <name> --with-opencode
-
-# Include Rust, Go, and C/C++ compilers for build/test jobs
-sudo ic/scripts/lunarwing-mt-admin.sh build-opencode-worker --with-toolchains
 ```
 
 The default image is slim and does not contain Rust, Go, or C/C++ toolchains. Build with `--with-toolchains` when worker jobs must compile or test code; the toolchain image uses Rust 1.96.1. Modes: `--mode websocket` (default, persistent) or `--mode cli` (one-shot; prompt via `TASK_PROMPT`). Requires `AGENT_AUTH_TOKEN` for WebSocket auth. Supports per-tenant model/base-URL overrides via `configure-opencode <name> [--model <m>] [--base-url <url>]`, optional Paseo MCP integration (`PASEO_URL`/`PASEO_TOKEN`), and SSH agent socket bind-mounting. `configure-study-mcp <name> [--home <absolute-checkout>]` gives core and OpenCode the same lw2studymcp data. Without `--home` it uses the shared default checkout (`/var/cache/lunarwing/lw2studymcp`, override with `LUNARWING_MT_STUDY_NOTES_HOME`) and always syncs it to the latest upstream (`LUNARWING_MT_STUDY_NOTES_REPO`, default `https://git.lunarwing.org/cmc/lw2studymcp.git`) first — cloning when missing, fast-forwarding a clean checkout, and refusing to touch a dirty or non-git directory. `--sync` applies the same update to an explicit `--home`. `add-tenant <name> --with-study-mcp [--study-mcp-home <path>]` runs this auto-configuration (read-only) during provisioning so a new tenant starts with current knowledge of the LunarWing codebase. `--allow-write` enables approved core-agent mutations in separate state; OpenCode always receives code and state read-only at `/opt/lw2studymcp` and `/var/lib/lw2studymcp`. OpenCode is pinned to **v1.18.25**, fetched by reviewed full commit `cb7d8b2f5e44876ef98b661dc10590c915af3a9f` (reverted from v1.18.29 on 2026-09-07: that release crashes on model entries lacking full metadata shape and dies silently in its ai-sdk stream path — see the Dockerfile pin note; re-bump only after both regressions are fixed upstream); `OPENCODE_REF` accepts only a full SHA, the checkout is verified, and a frozen Bun lock is mandatory. The release and SHA are baked into `OPENCODE_IMAGE_REF` as `v1.18.25@<full-sha>` and reported together as `opencode_ref`. Base images, Debian indexes, and optional toolchain downloads are also pinned. See `opencode4lunarwing/README.md` for the full environment reference.
 
 Agent-facing dispatch uses `create_job(title: "...", description: "...", mode: "opencode")` in both legacy and Engine V2 chat paths. `opencode` is a named job execution backend, not an extension, MCP server, skill, routine, or SSH host; no registry search or installation is involved.
 
-**Known issue (WI#320 F4, tracked as WI#333; WI#374 reported the same crash on a 2.1.6.0 test tenant):** at the pinned v1.18.25 the `mode: "opencode"` lane is broken in the LunarWing worker shape — every task fails with `external worker 'opencode' failed: Unexpected server error` because `opencode serve` crashes in `SystemPrompt.environment` (`undefined is not an object (evaluating 'a.name')`) while assembling the prompt, before any model call, and answers the SDK with that bare HTTP 500 wrapper. No config remediation (base-URL override, MCP/plugin strip, git-init workspace) avoids it, and v1.18.29 is worse (see the pin note above), so the lane cannot be fixed from this repo until upstream ships a fix; the opencode2 lane below is the working one. To surface the root cause, the worker attaches a bounded, ref-correlated, error-level tail of serve's own structured log (`$XDG_DATA_HOME|~/.local/share/opencode/log/opencode.log` — verified at the pinned ref: serve logs 500 causes there as `level=ERROR` lines with a unique `ref=` id, and the 500 body carries the same ref) to these job errors — only the failing request's line attaches, and a 500 without a ref attaches nothing — so the crash's real stack line reaches `list_jobs`/`job_status`. The v1 lane is expected to be retired in v2.1.7.0 (goals item 34: "prob rm opencode v1 in .1.7.0").
+**Known issue (WI#320 F4, tracked as WI#333; WI#374 reported the same crash on a 2.1.6.0 test tenant):** at the pinned v1.18.25 the `mode: "opencode"` lane is broken in the LunarWing worker shape — every task fails with `external worker 'opencode' failed: Unexpected server error` because `opencode serve` crashes in `SystemPrompt.environment` (`undefined is not an object (evaluating 'a.name')`) while assembling the prompt, before any model call, and answers the SDK with that bare HTTP 500 wrapper. No config remediation (base-URL override, MCP/plugin strip, git-init workspace) avoids it, and v1.18.29 is worse (see the pin note above), so the lane cannot be fixed from this repo until upstream ships a fix; the opencode2 lane below is the working one. To surface the root cause, the worker attaches a bounded, ref-correlated, error-level tail of serve's own structured log (`$XDG_DATA_HOME|~/.local/share/opencode/log/opencode.log` — verified at the pinned ref: serve logs 500 causes there as `level=ERROR` lines with a unique `ref=` id, and the 500 body carries the same ref) to these job errors — only the failing request's line attaches, and a 500 without a ref attaches nothing — so the crash's real stack line reaches `list_jobs`/`job_status`. The v1 lane was **retired in v2.1.8.0** (WI#333; goals item 34 anticipated it): selection and CI publication are gone, and only existing tenants keep the image.
 
 **Reproducible build input (WI#467, 2026-10-23):** the pinned v1.18.25 build compiles a models.dev catalog into the binary. At `cb7d8b2f`, `packages/opencode/script/generate.ts` reads it from the file named by `MODELS_DEV_API_JSON` when set, and otherwise fetches `${OPENCODE_MODELS_URL:-https://models.dev}/api.json` live; `script/build.ts` then passes the text to `Bun.build` as the `OPENCODE_MODELS_DEV` define, so the catalog is compiled in as code. Until WI#467 the Dockerfile never set the variable, so the binary changed whenever models.dev published between the candidate build and the `--no-cache` rebuild, and the clean-rebuild gate failed on master. The lane now carries a reviewed snapshot at `opencode4lunarwing/models-dev/api.json` (fetched from models.dev @ `a051b3ca330b`, 2026-10-23), committed pretty-printed so a refresh diffs line by line; the minified bundle is byte-identical to the one built from the one-line form. Its sha256 is pinned as the Dockerfile's `MODELS_DEV_SNAPSHOT_SHA256` ARG (not `*_API_JSON_*`: gitleaks' generic-api-key rule reads an ARG whose name contains `API` and whose value is 64 hex as a leaked key). `validate_config.py` cross-checks the pin, requires the snapshot to be strict JSON (one non-empty object, no duplicate keys, no NaN/Infinity) in the canonical pretty layout, and pins the builder-stage tail from `WORKDIR /build/opencode/packages/opencode` to the next `FROM` instruction by instruction (`OPENCODE_MODELS_DEV_BUILD_STEPS`). The build RUN verifies the hash, runs `scripts/check_models_dev_snapshot.py` (strict JSON, and `generate.ts` must still read both env vars), and builds with `OPENCODE_MODELS_URL=http://127.0.0.1:9`, so an upstream that ignores the snapshot and fetches anyway fails the build instead of compiling a live catalog. Both files hash into the opencode `worker-inputs.sha256`. **Bump checklist addition:** refreshing the snapshot is a deliberate commit: write the canonical form (`curl -fsS https://models.dev/api.json | python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin), indent=1, ensure_ascii=False))' > opencode4lunarwing/models-dev/api.json`), update `MODELS_DEV_SNAPSHOT_SHA256` to match (`sha256sum opencode4lunarwing/models-dev/api.json`), and record the models.dev commit/date here. An `OPENCODE_REF` bump re-checks `generate.ts` and updates `OPENCODE_MODELS_DEV_BUILD_STEPS` in the same commit if the build step changes.
 
 ## OpenCode 2 Worker (opencode2)
 
 The OpenCode **2** lane, run as a separate external worker per
-`docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md`. v1 stays the default and
-keeps its v1.18.25 pin (last dispatch-verified release; see the known
-issue above); v2 is opt-in per tenant until upstream's
-2.0.x patch stack settles. Do not configure both lanes on the same
-tenant during the transition (agent routing confusion — plan §5).
+`docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md`. v2 is now the only
+OpenCode lane an operator can select: the v1 lane is retired (WI#333, see
+above), and its pinned v1.18.25 image survives only for tenants that were
+provisioned before the retirement. Do not configure both lanes on the same
+tenant (agent routing confusion — plan §5).
 
 **Dockerfile:** `opencode2.4lunarwing/Dockerfile` — pinned to
 **v2.1.2** at reviewed full commit
@@ -2152,7 +2163,7 @@ podman image inspect -f '{{index .Config.Labels "org.opencontainers.image.revisi
 
 ### Upgrade ordering
 
-Since the `ironclaw-agent-v1` alias was removed (2.1.1), a 2.1.1 daemon offers only `lunarwing-agent-v1` and cannot connect to a worker container that still only accepts the legacy name — every dispatch to such a worker fails the WebSocket upgrade (HTTP 400, no echoed subprotocol) and surfaces as an external-worker connection failure whose reason includes the `lunarwing-agent-v1` / `ironclaw-agent-v1` hint. Workers are protocol-compatible in the other direction (2.1.1 workers accept the primary name only, which pre-2.1.1 daemons also offer), so the safe upgrade order is **workers first, then the daemon**, or — simplest — recreate worker containers in the same maintenance window as the daemon. mt-admin managed upgrades (`build-tenant`, `build-pebble-worker`, `build-opencode-worker`, `build-opencode2-worker`, `build-kimi-worker`, each followed by `restart-tenant`) rebuild the image and, through the image-ID contract above, recreate the worker containers; only manual deployments can strand a legacy-only worker.
+Since the `ironclaw-agent-v1` alias was removed (2.1.1), a 2.1.1 daemon offers only `lunarwing-agent-v1` and cannot connect to a worker container that still only accepts the legacy name — every dispatch to such a worker fails the WebSocket upgrade (HTTP 400, no echoed subprotocol) and surfaces as an external-worker connection failure whose reason includes the `lunarwing-agent-v1` / `ironclaw-agent-v1` hint. Workers are protocol-compatible in the other direction (2.1.1 workers accept the primary name only, which pre-2.1.1 daemons also offer), so the safe upgrade order is **workers first, then the daemon**, or — simplest — recreate worker containers in the same maintenance window as the daemon. mt-admin managed upgrades (`build-tenant`, `build-pebble-worker`, `build-opencode2-worker`, `build-kimi-worker`, each followed by `restart-tenant`) rebuild the image and, through the image-ID contract above, recreate the worker containers; only manual deployments can strand a legacy-only worker.
 
 ## Proxy Note
 
