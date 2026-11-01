@@ -179,6 +179,10 @@ OPENCODE2_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE2_USERNS};ssh-agent-dir-ro;
 
 PEBBLE_CONTAINER_UID="10004"
 PEBBLE_CONTAINER_GID="10004"
+# WI#506: the pebble binary's baked-in NanoGPT default. configure-pebble pins
+# the backend into pebble.env so the worker egress allowlist derives from the
+# same value the worker actually uses.
+PEBBLE_DEFAULT_BASE_URL="https://nano-gpt.com/api"
 PEBBLE_BRIDGE_UID="10104"
 PEBBLE_USERNS="keep-id:uid=${PEBBLE_CONTAINER_UID},gid=${PEBBLE_CONTAINER_GID}"
 PEBBLE_ROOTLESS_LAUNCH_CONTRACT="userns=${PEBBLE_USERNS};ssh-agent-dir-ro;no-new-privileges;cap-trim;non-root-split-v1"
@@ -468,6 +472,10 @@ Commands:
   configure-pebble <name>          Configure pebble worker for a tenant
     --nanogpt-api-key <key>        NanoGPT API key
     --model <model>                Pebble model (default: openai/gpt-5.2)
+    --base-url <url>               Model backend (PEBBLE_BASE_URL; default:
+                                   https://nano-gpt.com/api). It is written to
+                                   pebble.env and derived into the tenant's
+                                   worker egress allowlist.
 
   configure-opencode <name>        Set opencode worker LLM overrides for a tenant
     --model <model>                TensorZero model (OPENCODE_MODEL; any string)
@@ -1393,11 +1401,12 @@ main() {
 
     configure-pebble)
       require_root
-      local name="" nanogpt_key="" pebble_model=""
+      local name="" nanogpt_key="" pebble_model="" pebble_base_url=""
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --nanogpt-api-key) nanogpt_key="$2"; shift 2 ;;
           --model)           pebble_model="$2"; shift 2 ;;
+          --base-url)        pebble_base_url="$2"; shift 2 ;;
           -*)                die "unknown flag: $1" ;;
           *)
             if [[ -z "$name" ]]; then name="$1"; shift
@@ -1406,10 +1415,10 @@ main() {
             ;;
         esac
       done
-      [[ -n "$name" ]] || die "usage: configure-pebble <name> --nanogpt-api-key <key> [--model <model>]"
+      [[ -n "$name" ]] || die "usage: configure-pebble <name> --nanogpt-api-key <key> [--model <model>] [--base-url <url>]"
       [[ -n "$nanogpt_key" ]] || die "configure-pebble requires --nanogpt-api-key"
       ports_registry_init
-      configure_pebble "$(sanitize_name "$name")" "$nanogpt_key" "$pebble_model"
+      configure_pebble "$(sanitize_name "$name")" "$nanogpt_key" "$pebble_model" "$pebble_base_url"
       ;;
 
     configure-nanocode)
