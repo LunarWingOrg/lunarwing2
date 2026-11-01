@@ -1,7 +1,7 @@
 # Harness Worker Capabilities (WI#326)
 
-Status: implemented; source revalidated 2026-11-01 for v2.1.8.0 (EE-8 and
-DZ-5 fixed).
+Status: implemented; source revalidated 2026-11-01 for v2.1.8.0 (EE-8, EE-9
+and DZ-5 fixed).
 Owner: `ic/src/orchestrator/harness.rs`, with lifecycle ownership in
 `job_manager.rs` and HTTP completion handling in `api.rs`.
 
@@ -125,13 +125,13 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
     encoding leaks for every secret from about 56 bytes up, with no upper
     bound. The raw value itself is now fold-matched as well (EE-8 fixed
     in v2.1.8.0): `fold -w N` of an unencoded token is caught at any
-    width. Two mounted values sharing a substring: on the
-    folding slow path the sweep merges overlapping matches, but both
-    fold-free passes — the `scrub_folded` fast path (encoded forms) and
-    the direct pass (raw values) — still replace sequentially, so in
-    fold-free text the non-overlapping tail of the second value can
-    survive when only the overlapping form is printed (EE-9 residual,
-    WI#383). Per-line variants skip whitespace-only and low-entropy
+    width. Two mounted values sharing a substring: every pass — the
+    folding slow path and both fold-free passes (the `scrub_folded` fast
+    path for encoded forms and the direct pass for raw values) — now takes
+    the union of match ranges through `replace_all_merged`, so the
+    non-overlapping tail of the second value cannot survive when only the
+    overlapping form is printed (EE-9 fixed in v2.1.8.0). Per-line
+    variants skip whitespace-only and low-entropy
     lines (DZ-5 fixed in v2.1.8.0): lines with fewer than 3 distinct
     non-whitespace characters are not armed, preventing over-redaction
     of structural content and the resulting promotion rejections.
@@ -288,7 +288,8 @@ cannot be listed).
   preparation/cleanup orphans, no promotion deadline, remaining synchronous
   filesystem cleanup on async tasks, and stronger delivery, sparse-file and
   persisted-insert tests. Low-entropy line over-redaction (DZ-5),
-  raw-value fold matching (EE-8), staged-path/audit scrubbing (DZ-6) and
+  raw-value fold matching (EE-8), overlapping-match merge on every redaction
+  pass (EE-9), staged-path/audit scrubbing (DZ-6) and
   duplicate `/complete` side effects (DZ-7/EA-7/EE-6) are fixed as described
   above.
 - !1548 run-78 residuals (WI#383): per-event scrubbing runs synchronously
@@ -300,11 +301,7 @@ cannot be listed).
   near-wholly above the 4096-char arming cap and, at non-canonical widths,
   below it too (EE-2 — needs that automaton with
   aligned chunks); line-prefixed views (`read_file`, `cat -n`) defeat
-  folding (EE-7); both
-  fold-free passes — the `scrub_folded` fast path (encoded forms) and the
-  direct pass (raw values) — still replace sequentially, so the
-  non-overlapping tail of a second secret sharing a substring can survive
-  in fold-free text (EE-9 residual);
+  folding (EE-7);
   an event body uploaded slowly past a token revoke is persisted
   daemon-side without the value scrub (EE-10); a per-line variant can split
   a JSON escape and leave malformed scrubbed text for the model (EE-11); a

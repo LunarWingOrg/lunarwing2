@@ -1073,6 +1073,51 @@ fn push_mapped(folded: &mut String, map: &mut Vec<usize>, orig_idx: usize, ch: c
     folded.push(ch);
 }
 
+/// Replace every occurrence of every variant in `text`, merging overlapping
+/// matches instead of replacing sequentially. Sequential `str::replace` calls
+/// drop any match that starts inside an already-redacted span, so the
+/// non-overlapping tail of a second value sharing a substring survives
+/// (EE-9). The merge sweep takes the union of all match ranges and replaces
+/// each maximal run once. Variants are longest-first, so a longer match that
+/// contains a shorter one wins.
+fn replace_all_merged<'a>(text: &str, variants: impl Iterator<Item = &'a str>) -> String {
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for needle in variants {
+        let mut from = 0usize;
+        loop {
+            if needle.len() > text.len().saturating_sub(from) {
+                break;
+            }
+            let Some(pos) = text[from..].find(needle) else {
+                break;
+            };
+            let start = from + pos;
+            let end = start + needle.len();
+            ranges.push((start, end));
+            from = end;
+        }
+    }
+    if ranges.is_empty() {
+        return text.to_string();
+    }
+    ranges.sort_unstable_by_key(|&(start, end)| (start, std::cmp::Reverse(end)));
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for (start, end) in ranges {
+        if start < cursor {
+            // Overlaps an already-redacted range: extend the span instead of
+            // dropping the match whole (EE-9).
+            cursor = cursor.max(end);
+            continue;
+        }
+        out.push_str(&text[cursor..start]);
+        out.push_str("[redacted-secret]");
+        cursor = end;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
 // Test-only probe for the EE-1 needle-length guard in
 // `SecretValueRedactor::scrub_folded`: bumped immediately before every
 // `find` call so a test can prove the guard skipped the searcher setup
@@ -1154,14 +1199,11 @@ impl SecretValueRedactor {
         use secrecy::ExposeSecret;
         // Folded pass first: whole wrapped encodings are the longest matches;
         // once they are replaced, the direct per-line pieces find nothing.
-        let mut out = self.scrub_folded(text);
-        for variant in &self.direct_variants {
-            let variant = variant.expose_secret();
-            if out.contains(variant) {
-                out = out.replace(variant, "[redacted-secret]");
-            }
-        }
-        out
+        let out = self.scrub_folded(text);
+        // EE-9: the direct pass also merges overlapping matches instead of
+        // replacing sequentially, so the non-overlapping tail of a second
+        // value that shares a substring cannot survive in fold-free text.
+        replace_all_merged(&out, self.direct_variants.iter().map(|v| v.expose_secret()))
     }
 
     /// Replace every folded-variant match in `text`, with line breaks folded
@@ -1172,16 +1214,13 @@ impl SecretValueRedactor {
             return text.to_string();
         }
         // Fast path: nothing to fold — match against the text as-is with an
-        // identity mapping, skipping the folded copy and index map.
+        // identity mapping, skipping the folded copy and index map. EE-9: use
+        // the merge sweep so a second value sharing a substring is not lost.
         if !text.bytes().any(|b| matches!(b, b'\n' | b'\r' | b'\\')) {
-            let mut out = text.to_string();
-            for variant in &self.folded_variants {
-                let variant = variant.expose_secret();
-                if out.contains(variant) {
-                    out = out.replace(variant, "[redacted-secret]");
-                }
-            }
-            return out;
+            return replace_all_merged(
+                text,
+                self.folded_variants.iter().map(|v| v.expose_secret()),
+            );
         }
         let folded = fold_line_breaks(text);
         let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -2974,6 +3013,22 @@ mod tests {
             "raw value wrapped at non-canonical width must be scrubbed"
         );
         assert!(scrubbed.contains("[redacted-secret]"));
+    }
+
+    #[test]
+    fn replace_all_merged_swallows_overlapping_tails() {
+        // EE-9: a match starting inside an already-redacted span must be
+        // MERGED (its tail swallowed), not dropped whole.  Without merging,
+        // a sequential replace leaves the non-overlapping tail of a second
+        // value that shares a substring.
+        let text = "AAAABBBBCCCC";
+        // "AAAABBBB" (0..8) and "BBBBCCCC" (4..12) overlap at "BBBB".
+        let out = replace_all_merged(text, ["AAAABBBB", "BBBBCCCC"].into_iter());
+        assert_eq!(out, "[redacted-secret]");
+        assert!(!out.contains("CCCC"));
+        // Non-overlapping matches are each replaced.
+        let out = replace_all_merged("left XX mid YY right", ["XX", "YY"].into_iter());
+        assert_eq!(out, "left [redacted-secret] mid [redacted-secret] right");
     }
 
     #[test]
