@@ -168,7 +168,15 @@ FULL_VALIDATION_JOBS = (
     "cargo-deny",
     "satellite-advisory-sweep",
 )
-WORKER_NAMES = ("pebble", "opencode", "opencode2", "kimi")
+# WI#333 retired the opencode v1 lane, so it no longer publishes a candidate,
+# scan or promotion job. "opencode" still appears in OPENCODE_BUILD_CONTEXTS
+# and in build-worker-image.sh because the legacy builder stays available to
+# tenants that already have workers.opencode=true in their registry.
+WORKER_NAMES = ("pebble", "opencode2", "kimi")
+# WI#333 retired the opencode v1 lane's publication jobs, but mt-admin keeps its
+# builder for tenants that already have workers.opencode=true in the registry.
+# Its Dockerfile and worker-inputs manifest therefore stay validated.
+BUILDABLE_WORKERS = WORKER_NAMES + ("opencode",)
 OPENCODE_BUILD_CONTEXTS = {
     "opencode": "opencode4lunarwing",
     "opencode2": "opencode2.4lunarwing",
@@ -2364,7 +2372,7 @@ def validate_worker_input_manifest(errors: list[str]) -> None:
             f"block ({len(blocks)}), found {assignments}; a reassignment can change "
             "the hashed manifest behind this check"
         )
-    for worker in WORKER_NAMES:
+    for worker in BUILDABLE_WORKERS:
         block = blocks.get(worker)
         if block is None:
             continue  # validate_worker_versions already reports the missing block

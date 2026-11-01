@@ -224,27 +224,8 @@ worker-pebble-promote:
     - job: worker-pebble-scan
       artifacts: true
 
-worker-opencode-candidate:
-  extends: .worker-candidate
-  script:
-    - sh .gitlab/scripts/build-worker-image.sh opencode
-
-worker-opencode-scan:
-  extends: .worker-scan
-  needs:
-    - job: worker-opencode-candidate
-      artifacts: true
-
-worker-opencode-promote:
-  extends: .worker-promotion
-  variables:
-    WORKER_PROMOTION_TAG: "$CI_COMMIT_TAG-opencode"
-  resource_group: worker-opencode-promotion
-  needs:
-    - job: worker-opencode-candidate
-      artifacts: true
-    - job: worker-opencode-scan
-      artifacts: true
+# WI#333 retired the opencode v1 lane: no candidate, scan or promotion job
+# exists for it any more. The opencode2 jobs below are the supported lane.
 
 worker-opencode2-candidate:
   extends: .worker-candidate
