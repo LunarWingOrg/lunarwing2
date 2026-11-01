@@ -135,7 +135,7 @@
 39. [x] (H) Deploy the stoplight system
 40. [x] (H) Dive back in to LunarDepth and open worker lanes across the fleet for it get it running and up again patches too
 41. [x] (H) follow up on some earlier endeavors
-42. [x] (S) Reserved
+42. [x] (S) check older goals for others that may be not done yet
 43. [x] (S) Reserved
 44. [x] (S) Reserved
 45. [x] (S) Reserved
