@@ -1848,7 +1848,8 @@ the daemon-side `[[sandbox.external_workers]]` route hot against a dead
 socket. WI#469 also allowed an earlier stale lane (especially pebble) to abort
 the startup pass before Kimi was attempted at all. The isolation above fixes
 that amplifier, **not** the stale image itself. Same class as the pebble
-WI#452. **Remediation:**
+WI#452 — the boot-time liveness probe below covers both lanes.
+**Remediation:**
 `sudo ic/scripts/lunarwing-mt-admin.sh build-kimi-worker`, then
 `start-tenant <name>` (or `start-worker <name> kimi`) — image distribution to
 tenant stores plus the image-ID launch contract force-recreates the stale
@@ -1886,30 +1887,53 @@ means the config parsed, and the first dial happened on the first dispatch,
 where a refusal surfaced as a failed job and (on the blocking `wait=true`
 path, fixed in the same change) produced no ERROR line at all.
 
-The daemon now probes every configured external worker once at boot, after
-its own listeners are up, in a background task: one real WebSocket handshake
-per endpoint (bearer + `lunarwing-agent-v1` subprotocol + the worker's
-`ready` frame), bounded by a 5-second deadline that is separate from the
-worker's dispatch `timeout_ms`. A dead or non-WS socket therefore reads as
-unreachable, and the daemon logs:
+The daemon now probes every configured external worker in a background task:
+one real WebSocket handshake per endpoint (bearer + `lunarwing-agent-v1`
+subprotocol + the worker's `ready` frame), bounded by a 5-second deadline
+that is separate from the worker's dispatch `timeout_ms`. A dead or non-WS
+socket therefore reads as unreachable.
+
+Timing matters here. `start-tenant` and `restart-tenant` start the daemon
+first and the worker containers afterwards (there is no
+`After=lunarwing-<tenant>.service` on the worker units), so an immediate
+probe would log a fault on every cold start and host reboot. The first pass
+therefore waits a **30-second grace**, reports an unreachable worker as:
+
+```
+WARN External worker '<name>' not yet reachable at <host>:<port> (still starting?): <reason>
+```
+
+and confirms **30 seconds later**; a worker still dead then is promoted to:
 
 ```
 ERROR External worker '<name>' unreachable at <host>:<port>: <reason>
 ```
 
-when one is dead, or `INFO External worker liveness probe: all N worker(s)
-reachable` when every lane is up. The probe never sends job content, never
-logs the bearer token, never fails boot, never disables a worker, and never
-changes dispatch: a dead configured worker still lets the daemon start, and
-its first dispatch still reports `ExternalWorkerConnectionFailed` exactly as
-before. It works single-node and multi-tenant from the WS URL the daemon
-already has; it does not consult the mt-admin ports registry.
+Every endpoint of a load-balanced worker is dialed, so one line is emitted
+per dead endpoint; when the worker is still usable through another endpoint
+the line is `WARN ... endpoint <host>:<port> is unreachable (worker reachable
+via another endpoint)`. A healthy fleet logs one summary line,
+`INFO External worker liveness probe: all N worker(s) reachable`.
+
+The probe never sends job content, never logs the bearer token, never fails
+boot, never disables a worker, and never changes dispatch: a dead configured
+worker still lets the daemon start, and its first dispatch still reports
+`ExternalWorkerConnectionFailed` exactly as before. It works single-node and
+multi-tenant from the WS URL the daemon already has; it does not consult the
+mt-admin ports registry.
 
 A 5-minute re-probe logs only on a state change (reachable→unreachable and
 back), so a worker that dies after boot also produces an ERROR line before
 the next dispatch. `lunarwing doctor` lists each configured worker with a
 live reachable/unreachable result and endpoint under the External-workers
-check (it probes live because doctor is its own process).
+check (it probes live because doctor is its own process; the daemon's own
+in-memory snapshot is not readable across processes).
+
+Cosmetic note for the opencode and opencode2 lanes: the probe connection is
+a hub client, so their bridge state file can flip `ready` to false while the
+probe was the only connection (`updateState(connectionCount > 0)` on close).
+Their units and the image HEALTHCHECK read `/health`, not `/ready`, so this
+has no lifecycle effect; only kimi's health check reads `ready`.
 
 When you see a boot ERROR naming a worker, the cause is host-side: a stale
 pre-WI#400 image in the tenant store, a crash-looping container, or a port
