@@ -924,6 +924,25 @@ fn push_base64_variants(
     push_variant(folded, seen_folded, encoded);
 }
 
+/// DZ-5: whitespace-only and low-entropy lines (≥8 bytes of only spaces, tabs,
+/// or common structural characters like `{`, `}`, `[`, `]`, `,`, `:`, `"`)
+/// should not be armed as per-line variants — they over-redact unrelated
+/// files and cause promotion rejections. A line with at least 3 distinct
+/// non-whitespace characters is considered high-entropy enough to arm.
+fn is_low_entropy_line(line: &str) -> bool {
+    let len = line.len();
+    if len < MIN_REDACTED_SECRET_BYTES {
+        return true;
+    }
+    let mut distinct: std::collections::HashSet<u8> = std::collections::HashSet::new();
+    for b in line.bytes() {
+        if !b.is_ascii_whitespace() {
+            distinct.insert(b);
+        }
+    }
+    distinct.len() < 3
+}
+
 /// Selected encodings of one secret value (DG-2), split into variants matched
 /// directly against the text and contiguous encodings matched with line
 /// breaks folded out (EB-3/EB-4). The two lists dedup independently (EE-3):
@@ -938,12 +957,21 @@ fn secret_variants(raw: &str) -> (Vec<SecretString>, Vec<SecretString>) {
     let mut seen_folded = std::collections::HashSet::new();
 
     push_variant(&mut direct, &mut seen_direct, raw.to_string());
+    // EE-8: the raw value is matched only directly, never fold-matched, so
+    // `fold -w N` of a raw token leaks. Add the raw value to the folded list
+    // so a wrapped raw value is caught at any width.
+    push_variant(&mut folded, &mut seen_folded, raw.to_string());
     // Multi-line values (PEM keys, service-account JSON) also leak one line
     // at a time.
     for line in raw.lines() {
-        push_variant(&mut direct, &mut seen_direct, line.to_string());
+        // DZ-5: skip whitespace-only and low-entropy lines (≥8 bytes of only
+        // spaces, tabs, or structural characters) — arming them over-redacts
+        // unrelated files and causes promotion rejections.
+        if !is_low_entropy_line(line) {
+            push_variant(&mut direct, &mut seen_direct, line.to_string());
+        }
         let trimmed = line.trim();
-        if trimmed != line {
+        if trimmed != line && !is_low_entropy_line(trimmed) {
             push_variant(&mut direct, &mut seen_direct, trimmed.to_string());
         }
     }
