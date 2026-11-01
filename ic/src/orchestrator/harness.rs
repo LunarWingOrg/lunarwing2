@@ -2781,7 +2781,7 @@ mod tests {
         // again, so its non-overlapping head survived. Matches are now
         // collected first and merged, so the whole overlap is redacted.
         let shared = "shared-fixture-segment-0123456789";
-        let head = "left-pad-fixture-padding";
+        let head = "left-pad-fixture-padding-with-extra-bytes";
         let left = format!("{head}-{shared}");
         let right = format!("{shared}-right-tail-fixture-bytes");
         let redactor = SecretValueRedactor::new(
@@ -2793,7 +2793,9 @@ mod tests {
         );
         let hex_left: String = left.bytes().map(|b| format!("{b:02x}")).collect();
         let hex_right: String = right.bytes().map(|b| format!("{b:02x}")).collect();
-        assert!(hex_right.len() > hex_left.len(), "right must sort first");
+        // Longest-first: hex(left) is replaced first and swallows the start of
+        // hex(right), which begins inside it.
+        assert!(hex_left.len() > hex_right.len(), "left must sort first");
         // hex(left + "-right-tail-fixture-bytes") contains both encodings,
         // hex_right starting inside hex_left; no line break, no backslash.
         let hex_text: String = format!("{left}-right-tail-fixture-bytes")
@@ -2802,15 +2804,12 @@ mod tests {
             .collect();
         assert!(hex_text.contains(&hex_left) && hex_text.contains(&hex_right));
         let scrubbed = redactor.scrub(&hex_text);
-        // Replacing the longer encoding first leaves exactly this much of the
-        // shorter one: `head` plus its join character.
-        let leaked_head: String = format!("{head}-")
-            .bytes()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        // Replacing hex_left first leaves the hex of right's non-overlapping
+        // tail behind, so that tail is what leaks under the sequential sweep.
+        let leaked_tail = &hex_right[hex_right.len() - 48..];
         assert!(
-            !scrubbed.contains(&leaked_head),
-            "non-overlapping head of the shorter encoding leaked: {leaked_head}"
+            !scrubbed.contains(leaked_tail),
+            "non-overlapping tail of the shorter encoding leaked: {leaked_tail}"
         );
         assert_eq!(scrubbed, "[redacted-secret]");
     }
@@ -2896,22 +2895,33 @@ mod tests {
     #[test]
     fn redactor_dz5_skips_armor_and_punctuation_lines_when_arming() {
         // DZ-5: arming armor delimiters and punctuation-only lines redacted
-        // unrelated files the sub-agent read. The whole value and lines that
-        // carry key material stay armed.
+        // unrelated files the sub-agent read. Asserted on the DIRECT variant
+        // list, because the folded raw value legitimately contains the whole
+        // multi-line text (so `contains_secret` on one of its lines is not a
+        // statement about per-line arming).
+        use secrecy::ExposeSecret;
         let value = "-----BEGIN FIXTURE-----\nslug-fixture-key-material\n:::---:::---:::----\n-----END FIXTURE-----";
         let redactor = SecretValueRedactor::new([SecretString::from(value.to_string())].as_slice());
-        assert_eq!(redactor.scrub(value), "[redacted-secret]");
-        assert!(redactor.contains_secret("slug-fixture-key-material"));
+        let armed_line = |line: &str| {
+            redactor
+                .direct_variants
+                .iter()
+                .any(|v| v.expose_secret() == line)
+        };
+        assert!(armed_line("slug-fixture-key-material"));
         for line in [
             "-----BEGIN FIXTURE-----",
             "-----END FIXTURE-----",
             ":::---:::---:::----",
         ] {
             assert!(
-                !redactor.contains_secret(line),
+                !armed_line(line),
                 "low-entropy line must not be armed on its own: {line}"
             );
         }
+        // The value as a whole is still redacted, and its key material with it.
+        assert_eq!(redactor.scrub(value), "[redacted-secret]");
+        assert!(redactor.contains_secret("slug-fixture-key-material"));
     }
 
     #[test]
