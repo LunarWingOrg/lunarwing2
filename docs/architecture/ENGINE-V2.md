@@ -595,6 +595,37 @@ resolved request IDs cannot be resurrected by stale responses. Engine startup
 unavailability and transient recovery failures are retried. Authentication is by
 bearer header (query-token fallback is reserved for streaming routes).
 
+**Approval state in `GET /api/chat/history` (WI#520).** The `pending_approval`
+envelope is populated for Engine V2 threads too. Engine V2 dual-writes history
+and leaves the legacy in-memory session turn untouched, so before WI#520 the
+field was `null` for the whole life of a Live Engine V2 approval gate and a
+client polling only history could never learn the `request_id` required by
+`POST /api/chat/approval` — a live highwinds gate expired at its 30-minute
+window that way. Both history handlers now run
+`bridge::get_engine_pending_approval(user, thread)` for every return path
+(including paginated and DB-backed history) and map the matching gate into
+`PendingApprovalInfo` (`request_id`, `tool_name`, `description`, and the
+**redacted** display parameters; the executable parameters never reach the
+envelope). The lookup is:
+
+- **user-scoped** — another user's gate is invisible, and the endpoint still
+  never resolves another user's gate on approval;
+- **thread-exact** — the gate's own `thread_id` must equal the requested
+  thread, so a sibling thread that only shares the conversation cannot surface
+  an approvable id;
+- **live-only** — expired gates and gates parked on a thread that is gone or
+  no longer `Waiting` are dropped (the same WI#332 filter the pending-gates
+  endpoint uses);
+- **approval-only** — `ResumeKind::Approval` gates. Authentication and
+  external gates are not resolvable through the approval endpoint and appear
+  only in `pending-gates`/SSE.
+
+A gate-store read failure degrades to `null` with a warn-level log: history must
+still render. `null` therefore means "no live approval gate for this thread in
+this envelope", not "nothing is pending anywhere" — automation that needs every
+gate (auth included) must poll `GET /api/chat/pending-gates` or follow the
+`approval_needed` SSE event, exactly as the browser UI does.
+
 Pending gates are filtered by live thread state (WI#332): a gate parked on a
 thread is only listed while that thread exists, is still `Waiting`, and belongs
 to the gate's user — the same validity rule boot-time reconciliation enforces.

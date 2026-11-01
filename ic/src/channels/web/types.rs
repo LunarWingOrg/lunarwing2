@@ -106,8 +106,17 @@ pub struct HistoryResponse {
     pub oldest_timestamp: Option<String>,
     /// Pending tool approval that needs user action (re-rendered on thread switch).
     ///
-    /// Only populated from in-memory state; not persisted to DB.
-    /// Server restart clears pending approvals.
+    /// Populated from the legacy in-memory session turns, or from the Engine V2
+    /// pending-gate store when durable history is served (WI#520); the carried
+    /// `request_id` is what `POST /api/chat/approval` accepts. Only
+    /// `ResumeKind::Approval` gates surface here: authentication and external
+    /// gates are not resolvable as approvals and live solely on
+    /// `GET /api/chat/pending-gates`. `None` therefore means "no live approval
+    /// gate for this thread in this envelope", not "nothing is pending
+    /// anywhere" — clients that need every gate must poll `pending-gates` or
+    /// follow the `approval_needed` SSE event. A legacy in-memory approval is
+    /// dropped by a server restart; Engine V2 gates persist until resolved or
+    /// expired.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_approval: Option<PendingApprovalInfo>,
 }
@@ -131,6 +140,18 @@ impl From<&crate::agent::session::PendingApproval> for PendingApprovalInfo {
             // with no display parameters: never fall back to raw credentials.
             parameters: serde_json::to_string_pretty(&pending.display_parameters)
                 .unwrap_or_default(),
+        }
+    }
+}
+
+impl From<&crate::gate::pending::PendingGateView> for PendingApprovalInfo {
+    fn from(gate: &crate::gate::pending::PendingGateView) -> Self {
+        Self {
+            request_id: gate.request_id.clone(),
+            tool_name: gate.tool_name.clone(),
+            description: gate.description.clone(),
+            // The view already carries only redacted display parameters.
+            parameters: gate.parameters.clone(),
         }
     }
 }
@@ -1721,6 +1742,28 @@ mod tests {
             );
             assert_eq!(pending.parameters["token"], "must-not-leak");
         }
+    }
+
+    /// WI#520: an Engine V2 gate view converts into the same history DTO the
+    /// legacy in-memory approval uses, carrying the redacted display snapshot
+    /// and the request id `POST /api/chat/approval` accepts.
+    #[test]
+    fn engine_gate_view_converts_to_history_pending_approval() {
+        let view = crate::gate::pending::PendingGateView {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            thread_id: uuid::Uuid::new_v4().to_string(),
+            gate_name: "approval".to_string(),
+            tool_name: "shell".to_string(),
+            description: "Run shell command".to_string(),
+            parameters: "{\n  \"cmd\": \"ls\"\n}".to_string(),
+            resume_kind: lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        };
+
+        let info = super::PendingApprovalInfo::from(&view);
+        assert_eq!(info.request_id, view.request_id);
+        assert_eq!(info.tool_name, "shell");
+        assert_eq!(info.description, "Run shell command");
+        assert_eq!(info.parameters, view.parameters);
     }
 
     use super::*;
