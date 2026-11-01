@@ -54,12 +54,12 @@ pub use auth::{CredentialGrant, McpCredentialGrant, TokenStore};
 pub use external_worker::{
     ExternalTaskResult, ExternalWorkerManager, WorkerProbeState, probe_configured_workers,
 };
-pub use job_cancel::{CancelPolicy, CancelReport, JobCancelError, JobCanceller};
 pub use harness::{
     HarnessError, HarnessJobOptions, InjectedFileProvenance, InjectionManifest, InjectionSpec,
     PromotionRecord, PromotionRejection, PromotionSummary, ResolvedSecretFile, SecretFileMount,
     SecretValueRedactor, WriteBackPolicy,
 };
+pub use job_cancel::{CancelPolicy, CancelReport, JobCancelError, JobCanceller};
 pub use job_manager::{
     CompletionResult, ContainerHandle, ContainerJobConfig, ContainerJobManager,
     ContainerJobRequest, HarnessJobRequest, HarnessJobState, JobMode, snapshot_worker_mcp,

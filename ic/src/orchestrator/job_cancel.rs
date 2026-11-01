@@ -171,12 +171,14 @@ impl JobCanceller {
             // scheduler's own awaits.
             let scheduler = slot.read().await.clone();
             if let Some(scheduler) = scheduler {
-                delivered |= scheduler.stop(job_id).await.map_err(|error| {
-                    JobCancelError::Scheduler {
-                        job_id,
-                        message: error.to_string(),
-                    }
-                })?;
+                delivered |=
+                    scheduler
+                        .stop(job_id)
+                        .await
+                        .map_err(|error| JobCancelError::Scheduler {
+                            job_id,
+                            message: error.to_string(),
+                        })?;
             }
         }
 
@@ -238,10 +240,7 @@ impl JobCanceller {
                 if context.state == JobState::Cancelled {
                     Ok(())
                 } else {
-                    context.transition_to(
-                        JobState::Cancelled,
-                        Some(USER_CANCEL_REASON.to_string()),
-                    )
+                    context.transition_to(JobState::Cancelled, Some(USER_CANCEL_REASON.to_string()))
                 }
             })
             .await
@@ -289,7 +288,10 @@ mod tests {
         assert!(!report.delivered);
         assert!(report.persisted);
         assert!(report.context_synced);
-        assert_eq!(manager.get_context(job_id).await.unwrap().state, JobState::Cancelled);
+        assert_eq!(
+            manager.get_context(job_id).await.unwrap().state,
+            JobState::Cancelled
+        );
     }
 
     #[tokio::test]
@@ -303,6 +305,9 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, JobCancelError::NoActiveRuntime { .. }));
-        assert_eq!(manager.get_context(job_id).await.unwrap().state, JobState::InProgress);
+        assert_eq!(
+            manager.get_context(job_id).await.unwrap().state,
+            JobState::InProgress
+        );
     }
 }

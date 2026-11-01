@@ -1100,9 +1100,7 @@ mod jobs_isolation {
     }
 
     /// A running container handle for the cancellation tests.
-    fn running_container_handle(
-        job_id: Uuid,
-    ) -> crate::orchestrator::job_manager::ContainerHandle {
+    fn running_container_handle(job_id: Uuid) -> crate::orchestrator::job_manager::ContainerHandle {
         use crate::orchestrator::job_manager::{ContainerHandle, ContainerState, JobMode};
         ContainerHandle {
             job_id,
@@ -1139,9 +1137,12 @@ mod jobs_isolation {
             .write()
             .await
             .insert(job_id, running_container_handle(job_id));
-        let docker =
-            bollard::Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
-                .unwrap(); // safety: test-only
+        let docker = bollard::Docker::connect_with_http(
+            "http://127.0.0.1:1",
+            1,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .unwrap(); // safety: test-only
         manager.use_docker_for_test(docker).await;
         manager
     }
@@ -1264,9 +1265,7 @@ mod jobs_isolation {
             .unwrap(); // safety: test-only
         let resp = app.clone().oneshot(req).await.unwrap(); // safety: test-only
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let body = axum::body::to_bytes(resp.into_body(), 16384)
-            .await
-            .unwrap(); // safety: test-only
+        let body = axum::body::to_bytes(resp.into_body(), 16384).await.unwrap(); // safety: test-only
         let message = String::from_utf8_lossy(&body);
         assert!(
             message.contains("delivered and persisted"),
