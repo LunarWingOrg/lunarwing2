@@ -1121,8 +1121,16 @@ stop, build only the daemon/bridge/WASM, and promote the candidates to
   tenant was not stopped. The only post-stop build is the daemon, bridge and
   WASM — no worker lane is rebuilt after the stop, on either path. The external
   wrapper's live path runs `build-tenant --with-wasm --require-wasm` after the
-  stop (pebble is a candidate now, never `--with-pebble`), so the restarted
-  daemon is always the newly built one.
+  stop and asks for every *enabled* lane as a candidate
+  (`build-worker-candidates <tenant> --enabled`, `--with-pebble` still
+  available as an explicit opt-in), so the restarted daemon is always the newly
+  built one and no enabled lane silently keeps its previous image.
+- Every pre-stop exit on the wrapper path now puts the clone back and pops the
+  pre-upgrade stash — including a DarkIRC refusal and a failed `git fetch` /
+  `git checkout`, not only a candidate-build failure — and a candidate-build
+  failure also discards the partial candidate images and lane record, so a
+  later manual promote cannot promote images built from the checkout that
+  failure reverted (run-300 TO-4).
 - `build_tenant` records each completed stage (`daemon`, `bridge`, `wasm`) to
   a root-owned marker file in the tenant lifecycle lock directory
   (`/run/lock/lunarwing-tenants/<tenant>-build-stages` by default), never in
@@ -1136,8 +1144,9 @@ stop, build only the daemon/bridge/WASM, and promote the candidates to
   commit is rebuilt before starting (non-strict WASM: a broken WASM toolchain
   must not block restoring a binary whose artifacts are already installed), and
   if that fails the tenant is reported **stopped** with explicit rollback
-  commands — never as "restored". An unreadable or unknown marker is treated as
-  past-the-daemon (fail closed) on both paths.
+  commands — never as "restored". A missing, unreadable or unknown marker is
+  treated as past-the-daemon (fail closed) on both paths (run-300 TO-7 closed
+  the wrapper's missing-marker read as "none").
 - `promote-worker-images <tenant>` re-runs a promotion that failed after the
   daemon build: already-promoted lanes are skipped, the rollback file keeps the
   **first** pre-promotion `:latest` ID per lane (so a re-run never records an
@@ -1145,13 +1154,22 @@ stop, build only the daemon/bridge/WASM, and promote the candidates to
   per lane, so a re-run only promotes what remains. `restore-worker-images
   <tenant>` re-tags those recorded IDs; both upgrade paths call it on a failed
   upgrade, and it is printed in the wrapper's rollback steps. A rollback is
-  only reported when the re-tag actually succeeded. `build-worker-candidates`
-  and `promote-worker-images` refuse to run under a live upgrade lock of the
-  same tenant.
+  only reported when the re-tag actually succeeded. The record is cleared by
+  `clear-promote-rollback` only when the **whole** upgrade has succeeded
+  (both paths), and a new candidate run discards any record from an earlier
+  run, so a later failure can never re-tag a lane to an image this run never
+  had. `build-worker-candidates` and `promote-worker-images` serialise with a
+  running upgrade by **holding** the tenant upgrade lock for the whole verb
+  (a bare preflight was a check-then-run race); when they run inside the
+  upgrade wrapper's own locked boundary they reuse the inherited descriptor
+  instead of re-flocking — a second open-file description would deadlock
+  against that parent, which was the run-300 TO-1 blocker.
 - A pebble candidate keeps the toolchain profile of the `:latest` image it will
   replace (the image's `org.opencontainers.image.toolchain-profile` label), so
   an upgrade no longer downgrades an operator's fat (`--with-toolchains`) image
-  to slim.
+  to slim. The fat build's staging tag is derived from this build's output tag
+  (`<output-tag>-candidate`), so two concurrent builds cannot retag each
+  other's image between the smoke gate and the final retag.
 - The post-stop build log is a root-only `mktemp` file under `${TMPDIR:-/tmp}`
   that is kept on failure (`build log: <path>` in the error). It is not pruned
   automatically; on a long-lived host the operator should clear `/tmp` of
