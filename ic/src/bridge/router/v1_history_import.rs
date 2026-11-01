@@ -37,6 +37,8 @@ use tracing::{debug, warn};
 use lunarwing_engine::{ConversationEntry, ConversationId};
 use uuid::Uuid;
 
+use crate::history::roles::{ConversationRole, classify_conversation_role};
+
 use super::EngineState;
 
 /// Marker key in the v1 conversation metadata once history has been imported.
@@ -180,23 +182,26 @@ async fn record_marker(db: &dyn crate::db::Database, v1_conversation_id: Uuid) {
 
 /// Map v1 rows to importable conversation entries.
 ///
-/// Only `user` and `assistant` rows are conversation context. `tool_calls`,
-/// `interrupted`, and any other v1 bookkeeping role are skipped: the engine
-/// does not replay them, and importing them would put non-conversational text
-/// into the seeded history. The caller has already bounded the rows to those
-/// created before the surface cutoff.
+/// Only conversation roles ([`crate::history::roles::CONVERSATION_ROLES`]) are
+/// context. `tool_calls`, `interrupted`, `turn_recovery`, and any other v1
+/// bookkeeping role are skipped: the engine does not replay them, and
+/// importing them would put non-conversational text into the seeded history.
+/// The caller has already bounded the rows to those created before the surface
+/// cutoff.
 fn importable_entries(rows: Vec<crate::history::ConversationMessage>) -> Vec<ConversationEntry> {
     rows.into_iter()
-        .filter_map(|row| match row.role.as_str() {
-            "user" => Some(ConversationEntry::imported_user(
+        .filter_map(|row| match classify_conversation_role(&row.role) {
+            ConversationRole::User => Some(ConversationEntry::imported_user(
                 &row.content,
                 row.created_at,
             )),
-            "assistant" => Some(ConversationEntry::imported_agent(
+            ConversationRole::Assistant => Some(ConversationEntry::imported_agent(
                 &row.content,
                 row.created_at,
             )),
-            _ => None,
+            ConversationRole::ToolCalls | ConversationRole::Marker | ConversationRole::Unknown => {
+                None
+            }
         })
         .collect()
 }
@@ -222,17 +227,24 @@ mod tests {
     #[test]
     fn only_user_and_assistant_rows_are_imported() {
         let now = Utc::now();
-        let rows = vec![
-            row("user", "old question", now - Duration::minutes(10)),
-            row("assistant", "old answer", now - Duration::minutes(9)),
-            row("tool_calls", "[]", now - Duration::minutes(8)),
-            row("interrupted", "", now - Duration::minutes(7)),
-        ];
+        // Built from the census: a new durable role automatically exercises
+        // this filter, and only conversation roles may come through.
+        let rows: Vec<_> = crate::history::roles::ALL_ROLES
+            .iter()
+            .enumerate()
+            .map(|(index, role)| {
+                row(
+                    role,
+                    &format!("{role} content"),
+                    now - Duration::minutes(10 - index as i64),
+                )
+            })
+            .collect();
 
         let entries = importable_entries(rows);
 
         let contents: Vec<&str> = entries.iter().map(|e| e.content.as_str()).collect();
-        assert_eq!(contents, ["old question", "old answer"]);
+        assert_eq!(contents, ["user content", "assistant content"]);
         assert!(matches!(
             entries[0].sender,
             lunarwing_engine::EntrySender::User

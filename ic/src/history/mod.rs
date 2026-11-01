@@ -7,6 +7,8 @@
 
 #[cfg(feature = "postgres")]
 mod analytics;
+/// Durable conversation-role census shared by every history reader and writer.
+pub mod roles;
 mod store;
 
 #[cfg(feature = "postgres")]

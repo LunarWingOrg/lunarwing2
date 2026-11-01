@@ -33,6 +33,10 @@ use crate::db::Database;
 use crate::error::Error;
 use crate::extensions::naming::legacy_extension_alias;
 use crate::gate::pending::{PendingGate, PendingGateKey};
+use crate::history::roles::{
+    ASSISTANT_ROLE, EngineRole, INTERRUPTED_ROLE, USER_ROLE, classify_engine_role,
+    is_bookkeeping_role,
+};
 
 #[cfg(test)]
 use std::collections::HashMap;
@@ -1678,7 +1682,7 @@ async fn deliver_expired_gate_text(
         };
         if let Some(cid) = v1_conv_id
             && let Err(error) = db
-                .add_conversation_message(cid, "assistant", &outbound)
+                .add_conversation_message(cid, ASSISTANT_ROLE, &outbound)
                 .await
         {
             tracing::warn!(%error, "failed to persist expired-gate reply to v1 history");
@@ -3227,7 +3231,7 @@ async fn interrupt_engine_conversation(
         // classic rebuild path, so markers never reach restored LLM context.
         if let Some(ref db) = state.db
             && let Some(cid) = resolve_v1_conversation_for_message(db.as_ref(), message).await
-            && let Err(error) = db.add_conversation_message(cid, "interrupted", "").await
+            && let Err(error) = db.add_conversation_message(cid, INTERRUPTED_ROLE, "").await
         {
             debug!(%error, "engine v2: failed to persist interrupted-turn marker");
         }
@@ -3931,7 +3935,7 @@ async fn handle_with_engine_inner(
         && let Some(cid) = resolve_v1_conversation_for_message(db.as_ref(), message).await
     {
         match db
-            .add_conversation_message(cid, "user", effective_content)
+            .add_conversation_message(cid, USER_ROLE, effective_content)
             .await
         {
             Ok(id) => {
@@ -4205,18 +4209,31 @@ fn format_action_display_name(action_name: &str, params_summary: &Option<String>
 /// Interpreter step output arrives under either the legacy `User` role
 /// (pre-WI#227 transcripts) or the sealed `StepRecord` wire spelling — the
 /// status hints are derived from the preview shape in both cases.
+///
+/// Every bookkeeping role in the durable-role census is rejected before the
+/// wire-role ladder runs. The wire namespace cannot carry those roles today,
+/// but a caller that forwards a persisted row must never have its JSON
+/// surface as a status hint (WI#518), and the positive classification of the
+/// ladder means an unregistered wire role is never surfaced either.
 fn interpret_message_event(role: &str, content_preview: &str) -> Option<&'static str> {
-    let step_output = role == "User" || role == "StepRecord";
-    if step_output
-        && (content_preview.contains("Error") || content_preview.starts_with("Traceback"))
-    {
+    if is_bookkeeping_role(role) {
+        return None;
+    }
+    match classify_engine_role(role) {
+        EngineRole::User | EngineRole::StepRecord => interpret_step_preview(content_preview),
+        EngineRole::Assistant => Some("Executing code..."),
+        EngineRole::Other => None,
+    }
+}
+
+/// Status hints for interpreter step output, keyed on the preview shape.
+fn interpret_step_preview(content_preview: &str) -> Option<&'static str> {
+    if content_preview.contains("Error") || content_preview.starts_with("Traceback") {
         Some("Code error — retrying...")
-    } else if step_output && content_preview.starts_with("[stdout]") {
+    } else if content_preview.starts_with("[stdout]") {
         Some("Code executed")
-    } else if step_output && content_preview.starts_with("[code ") {
+    } else if content_preview.starts_with("[code ") {
         Some("Code executed (no output)")
-    } else if role == "Assistant" {
-        Some("Executing code...")
     } else {
         None
     }
@@ -4352,7 +4369,7 @@ async fn handle_mission_notification(
             .await
     {
         let _ = db
-            .add_conversation_message(conv_id, "assistant", &accepted_text)
+            .add_conversation_message(conv_id, ASSISTANT_ROLE, &accepted_text)
             .await;
     }
 }
@@ -6498,7 +6515,29 @@ pub(crate) mod tests {
             Some("Executing code...")
         );
         assert_eq!(interpret_message_event("System", "anything"), None);
+        assert_eq!(interpret_message_event("ActionResult", "anything"), None);
         assert_eq!(interpret_message_event("User", "a human question"), None);
+    }
+
+    #[test]
+    fn interpret_message_event_never_surfaces_a_census_bookkeeping_role() {
+        // WI#518: every durable bookkeeping role must stay off the status
+        // surface even if a caller forwards a persisted row instead of a wire
+        // event — the marker JSON must never be mistaken for step output.
+        for role in crate::history::roles::BOOKKEEPING_ROLES {
+            for preview in [
+                "[stdout] leaked",
+                "{\"state\":\"Retrying\"}",
+                "[code 42]",
+                "Traceback (most recent call last)",
+            ] {
+                assert_eq!(
+                    interpret_message_event(role, preview),
+                    None,
+                    "bookkeeping role {role:?} surfaced {preview:?}"
+                );
+            }
+        }
     }
 
     #[test]

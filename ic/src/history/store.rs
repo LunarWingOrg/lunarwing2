@@ -2104,7 +2104,7 @@ impl Store {
         let mut take_count = (rows.len() as i64).min(limit) as usize;
         while take_count > 0 && take_count < rows.len() {
             let oldest_role: String = rows[take_count - 1].get("role");
-            if oldest_role == "user" {
+            if oldest_role == crate::history::roles::USER_ROLE {
                 break;
             }
             take_count += 1;
