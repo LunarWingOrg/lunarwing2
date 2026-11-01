@@ -1082,8 +1082,59 @@ fn push_mapped(folded: &mut String, map: &mut Vec<usize>, orig_idx: usize, ch: c
     folded.push(ch);
 }
 
+/// Collect every match of every needle in `text` as byte ranges. A needle
+/// consumes the bytes it matched before searching again, which is the
+/// pre-EE-9 same-needle behaviour (self-overlap such as `AAA` in `AAAA` is
+/// left as before).
+fn collect_ranges<'a>(text: &str, needles: impl Iterator<Item = &'a str>) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    for needle in needles {
+        if needle.is_empty() {
+            continue;
+        }
+        let mut from = 0usize;
+        loop {
+            if needle.len() > text.len().saturating_sub(from) {
+                break;
+            }
+            let Some(pos) = text[from..].find(needle) else {
+                break;
+            };
+            let start = from + pos;
+            let end = start + needle.len();
+            ranges.push((start, end));
+            from = end;
+        }
+    }
+    ranges
+}
+
+/// Replace the union of `ranges` in `text` with one marker per merged span.
+/// A match that starts inside an already-redacted span extends that span
+/// instead of being dropped, so the non-overlapping tail of a second value
+/// sharing a substring cannot survive (EE-9).
+fn replace_ranges(text: &str, mut ranges: Vec<(usize, usize)>) -> String {
+    if ranges.is_empty() {
+        return text.to_string();
+    }
+    ranges.sort_unstable_by_key(|&(start, end)| (start, std::cmp::Reverse(end)));
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for (start, end) in ranges {
+        if start < cursor {
+            cursor = cursor.max(end);
+            continue;
+        }
+        out.push_str(&text[cursor..start]);
+        out.push_str("[redacted-secret]");
+        cursor = end;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
 // Test-only probe for the EE-1 needle-length guard in
-// `SecretValueRedactor::scrub_folded`: bumped immediately before every
+// `SecretValueRedactor::folded_ranges`: bumped immediately before every
 // `find` call so a test can prove the guard skipped the searcher setup
 // entirely (a behavioral assertion on the output cannot — the guarded and
 // unguarded paths produce identical text).
@@ -1159,40 +1210,36 @@ impl SecretValueRedactor {
             .any(|v| folded.text.contains(v.expose_secret()))
     }
 
+    /// Scrub every armed variant in one sweep over the original text. Folded
+    /// matches are mapped back to original byte ranges so they merge with
+    /// direct matches (EE-9): replacing pass by pass loses the non-overlapping
+    /// tail of a direct variant that overlaps a folded match already replaced
+    /// by the marker.
     pub fn scrub(&self, text: &str) -> String {
         use secrecy::ExposeSecret;
-        // Folded pass first: whole wrapped encodings are the longest matches;
-        // once they are replaced, the direct per-line pieces find nothing.
-        let mut out = self.scrub_folded(text);
-        for variant in &self.direct_variants {
-            let variant = variant.expose_secret();
-            if out.contains(variant) {
-                out = out.replace(variant, "[redacted-secret]");
-            }
-        }
-        out
+        let mut ranges = self.folded_ranges(text);
+        ranges.extend(collect_ranges(
+            text,
+            self.direct_variants.iter().map(|v| v.expose_secret()),
+        ));
+        replace_ranges(text, ranges)
     }
 
-    /// Replace every folded-variant match in `text`, with line breaks folded
-    /// out for matching and mapped back for replacement (EB-3/EB-4).
-    fn scrub_folded(&self, text: &str) -> String {
+    /// Folded-variant matches mapped back to original byte ranges, with line
+    /// breaks folded out for matching (EB-3/EB-4).
+    fn folded_ranges(&self, text: &str) -> Vec<(usize, usize)> {
         use secrecy::ExposeSecret;
         if self.folded_variants.is_empty() {
-            return text.to_string();
+            return Vec::new();
         }
-        // Fast path: nothing to fold — match against the text as-is with an
-        // identity mapping, skipping the folded copy and index map.
-        if !text.bytes().any(|b| matches!(b, b'\n' | b'\r' | b'\\')) {
-            let mut out = text.to_string();
-            for variant in &self.folded_variants {
-                let variant = variant.expose_secret();
-                if out.contains(variant) {
-                    out = out.replace(variant, "[redacted-secret]");
-                }
-            }
-            return out;
-        }
-        let folded = fold_line_breaks(text);
+        // Fast path: nothing to fold — match the text as-is with an identity
+        // mapping, skipping the folded copy and index map.
+        let folded = text
+            .bytes()
+            .any(|b| matches!(b, b'\n' | b'\r' | b'\\'))
+            .then(|| fold_line_breaks(text));
+        let haystack = folded.as_ref().map_or(text, |f| f.text.as_str());
+        let map = folded.as_ref().map(|f| f.map.as_slice());
         let mut ranges: Vec<(usize, usize)> = Vec::new();
         for variant in &self.folded_variants {
             let needle = variant.expose_secret();
@@ -1203,49 +1250,29 @@ impl SecretValueRedactor {
                 // needle length (EE-1 — without this guard every folded
                 // variant costs its own length per JSON leaf, even when the
                 // leaf is far smaller than the variant).
-                if needle.len() > folded.text.len().saturating_sub(from) {
+                if needle.len() > haystack.len().saturating_sub(from) {
                     break;
                 }
                 #[cfg(test)]
                 FOLDED_FIND_CALLS.with(|c| c.set(c.get() + 1));
-                let Some(pos) = folded.text[from..].find(needle) else {
+                let Some(pos) = haystack[from..].find(needle) else {
                     break;
                 };
                 let start = from + pos;
                 let end = start + needle.len();
-                ranges.push((start, end));
+                ranges.push(match map {
+                    // The replaced span ends right after the last matched
+                    // char (variants are pure ASCII, so it is one byte):
+                    // interior line breaks between matched chars are
+                    // swallowed, but break characters before or after the
+                    // blob survive the redaction.
+                    Some(map) => (map[start], map[end - 1] + 1),
+                    None => (start, end),
+                });
                 from = end;
             }
         }
-        if ranges.is_empty() {
-            return text.to_string();
-        }
-        // Variants are longest-first; folded and original offsets are both
-        // monotonic, so an ascending sweep can skip overlaps by comparing
-        // original coordinates.
-        ranges.sort_unstable_by_key(|&(start, end)| (start, std::cmp::Reverse(end)));
-        let mut out = String::with_capacity(text.len());
-        let mut cursor = 0usize;
-        for (fs, fe) in ranges {
-            let os = folded.map[fs];
-            // The replaced span ends right after the last matched char
-            // (variants are pure ASCII, so it is one byte): interior line
-            // breaks between matched chars are swallowed, but break
-            // characters BEFORE or AFTER the blob survive the redaction.
-            let oe = folded.map[fe - 1] + 1;
-            if os < cursor {
-                // Overlapping an already-redacted range: merge instead of
-                // dropping, so the non-overlapping tail of a second value
-                // that shares a substring cannot survive (EE-9).
-                cursor = cursor.max(oe);
-                continue;
-            }
-            out.push_str(&text[cursor..os]);
-            out.push_str("[redacted-secret]");
-            cursor = oe;
-        }
-        out.push_str(&text[cursor..]);
-        out
+        ranges
     }
 
     /// Scrub before this helper's truncation (DG-2). A variant prefix (≥
@@ -2788,6 +2815,40 @@ mod tests {
         let tail = &hex_right[hex_right.len() - 32..];
         assert!(!scrubbed.contains(tail), "overlapping tail leaked: {tail}");
         assert!(!scrubbed.contains(&hex_joined[..64]));
+    }
+
+    #[test]
+    fn redactor_merges_direct_and_folded_matches_in_one_sweep() {
+        // EE-9 / TL-2: the passes used to replace sequentially, so a direct
+        // match that overlapped a folded match already replaced by the
+        // marker lost its non-overlapping tail. Here A's raw value is also a
+        // folded variant and a full line of B is a direct-only variant; both
+        // overlap in fold-free text.
+        let first = "ABCDEFGHIJKLMNOP";
+        let second = "head-line-material\nIJKLMNOPQRSTUVWX";
+        let redactor = SecretValueRedactor::new(
+            [
+                SecretString::from(first.to_string()),
+                SecretString::from(second.to_string()),
+            ]
+            .as_slice(),
+        );
+        let text = "ABCDEFGHIJKLMNOPQRSTUVWX";
+        // No newlines or escapes, so the folded pass takes its identity path.
+        assert!(!text.bytes().any(|b| matches!(b, b'\n' | b'\r' | b'\\')));
+        assert_eq!(redactor.scrub(text), "[redacted-secret]");
+        assert!(
+            !redactor.scrub(text).contains("QRSTUVWX"),
+            "tail of the direct match must be merged, not lost"
+        );
+    }
+
+    #[test]
+    fn replace_ranges_merges_overlaps_and_keeps_disjoint_matches() {
+        let out = replace_ranges("AAAABBBBCCCC", vec![(0, 8), (4, 12)]);
+        assert_eq!(out, "[redacted-secret]");
+        let out = replace_ranges("left XX mid YY right", vec![(5, 7), (12, 14)]);
+        assert_eq!(out, "left [redacted-secret] mid [redacted-secret] right");
     }
 
     #[test]
