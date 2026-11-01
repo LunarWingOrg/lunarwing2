@@ -30,8 +30,9 @@ class WorkerFlagsTest(unittest.TestCase):
         self.assertIn("--with-pebble", _worker_flags(plan))
 
     def test_opencode_flag(self) -> None:
+        # WI#333 retired the v1 lane; the flag is never forwarded.
         plan = ImportPlan(with_opencode=True)
-        self.assertIn("--with-opencode", _worker_flags(plan))
+        self.assertNotIn("--with-opencode", _worker_flags(plan))
 
     def test_kimi_flag(self) -> None:
         plan = ImportPlan(with_kimi=True)

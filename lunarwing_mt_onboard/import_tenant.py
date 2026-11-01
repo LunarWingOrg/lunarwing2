@@ -51,6 +51,8 @@ class ImportConfig:
     old_stopped: bool = False
     with_nanocode: bool = False
     with_pebble: bool = False
+    # WI#333: kept only so a saved plan from before the retirement still loads.
+    # It is never forwarded; import-tenant.sh drops it with its own warning.
     with_opencode: bool = False
     with_kimi: bool = False
     with_toolchains: bool = False
@@ -161,8 +163,7 @@ def build_import_args(cfg: ImportConfig) -> list[str]:
         args.append("--old-stopped")
     if cfg.with_pebble:
         args.append("--with-pebble")
-    if cfg.with_opencode:
-        args.append("--with-opencode")
+    # WI#333: the opencode v1 lane is retired, so with_opencode is not forwarded.
     if cfg.with_kimi:
         args.append("--with-kimi")
     if cfg.with_toolchains:

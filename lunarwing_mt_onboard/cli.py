@@ -35,10 +35,19 @@ console = Console()
 
 WORKER_LABELS = {
     WorkerType.PEBBLE: "pebble (Rust harness)",
-    WorkerType.OPENCODE: "opencode (anomalyco/opencode)",
+    # WI#333: opencode v1 is retired and no longer offered; the key stays so a
+    # saved plan that still names the lane can be rendered.
+    WorkerType.OPENCODE: "opencode (anomalyco/opencode) — RETIRED, WI#333",
     WorkerType.KIMI: "kimi (MoonshotAI/kimi-code)",
     WorkerType.OPENCODE2: "opencode2 (OpenCode 2 lane)",
 }
+
+# Workers the interactive picker offers. WI#333 removed the opencode v1 lane.
+SELECTABLE_WORKERS = (
+    WorkerType.PEBBLE,
+    WorkerType.KIMI,
+    WorkerType.OPENCODE2,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -364,31 +373,20 @@ def _configure_channels(config: TenantConfig) -> None:
 
 
 def _configure_workers(config: TenantConfig) -> None:
-    labels = [
-        WORKER_LABELS[WorkerType.PEBBLE],
-        WORKER_LABELS[WorkerType.OPENCODE],
-        WORKER_LABELS[WorkerType.KIMI],
-        WORKER_LABELS[WorkerType.OPENCODE2],
-    ]
+    # WI#333 retired the opencode v1 lane, so it is not offered here any more:
+    # selecting it would only fail later when mt-admin refuses --with-opencode.
+    labels = [WORKER_LABELS[w] for w in SELECTABLE_WORKERS]
     selected = _q_checkbox("External workers (space to toggle, enter to confirm)", labels)
     config.workers = []
     for label in selected:
-        for wt, wl in WORKER_LABELS.items():
-            if label == wl:
+        for wt in SELECTABLE_WORKERS:
+            if label == WORKER_LABELS[wt]:
                 config.workers.append(wt)
                 break
     if config.workers:
         config.toolchains = _q_confirm(
             "Include Rust/Go/C++ toolchains in workers? (increases image size ~5GB)",
             default=config.toolchains,
-        )
-    if WorkerType.OPENCODE in config.workers:
-        config.opencode_model = _q_text(
-            "OpenCode model override (optional)", default=config.opencode_model
-        )
-        config.opencode_base_url = _q_text(
-            "OpenCode base URL override (optional)",
-            default=config.opencode_base_url,
         )
     if WorkerType.OPENCODE2 in config.workers:
         config.opencode2_model = _q_text(

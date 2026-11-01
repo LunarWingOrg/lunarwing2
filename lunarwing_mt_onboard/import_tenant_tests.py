@@ -175,7 +175,8 @@ class TestImportArgs(unittest.TestCase):
         self.assertIn("alpha-new", args)
         self.assertNotIn("--with-nanocode", args)
         self.assertIn("--with-pebble", args)
-        self.assertIn("--with-opencode", args)
+        # WI#333: the retired opencode v1 selection must not be forwarded.
+        self.assertNotIn("--with-opencode", args)
         self.assertIn("--with-kimi", args)
         self.assertIn("--with-toolchains", args)
         self.assertIn("--with-vision", args)

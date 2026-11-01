@@ -260,11 +260,15 @@ def _add_tenant_args(mt: str, plan: ImportPlan) -> list[str]:
 
 
 def _worker_flags(plan: ImportPlan) -> list[str]:
+    """Worker selection flags for add-tenant/build-tenant.
+
+    WI#333 retired the opencode v1 lane, so ``plan.with_opencode`` is never
+    forwarded — mt-admin refuses the flag. Existing tenants keep their lane via
+    ``upgrade-tenant``.
+    """
     flags: list[str] = []
     if plan.with_pebble:
         flags.append("--with-pebble")
-    if plan.with_opencode:
-        flags.append("--with-opencode")
     if plan.with_kimi:
         flags.append("--with-kimi")
     return flags

@@ -58,7 +58,7 @@ class TestConfigSerialization(unittest.TestCase):
             gateway_host="0.0.0.0",
             xmpp_enabled=True,
             xmpp_jid="alpha@xmpp.localhost",
-            workers=[WorkerType.PEBBLE, WorkerType.OPENCODE, WorkerType.KIMI],
+            workers=[WorkerType.PEBBLE, WorkerType.KIMI],
             secrets_master_key="ab" * 32,
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -70,7 +70,7 @@ class TestConfigSerialization(unittest.TestCase):
         self.assertTrue(loaded.xmpp_enabled)
         self.assertEqual(
             loaded.workers,
-            [WorkerType.PEBBLE, WorkerType.OPENCODE, WorkerType.KIMI],
+            [WorkerType.PEBBLE, WorkerType.KIMI],
         )
         self.assertEqual(loaded.secrets_master_key, "ab" * 32)
 
@@ -98,12 +98,23 @@ class TestConfigSerialization(unittest.TestCase):
     def test_from_dict_accepts_supported_string_workers(self):
         data = {
             "name": "gamma",
-            "workers": ["pebble", "opencode", "kimi", "opencode2"],
+            "workers": ["pebble", "kimi", "opencode2"],
         }
         config = TenantConfig.from_dict(data)
         self.assertEqual(
             config.workers,
-            [WorkerType.PEBBLE, WorkerType.OPENCODE, WorkerType.KIMI, WorkerType.OPENCODE2],
+            [WorkerType.PEBBLE, WorkerType.KIMI, WorkerType.OPENCODE2],
+        )
+
+    def test_from_dict_drops_retired_opencode_worker(self):
+        # WI#333: a plan saved before the retirement still loads, without the
+        # retired lane, and says why instead of failing at provisioning time.
+        with self.assertWarnsRegex(RuntimeWarning, "opencode v1 worker lane is retired"):
+            config = TenantConfig.from_dict(
+                {"name": "gamma", "workers": ["pebble", "opencode", "kimi"]}
+            )
+        self.assertEqual(
+            config.workers, [WorkerType.PEBBLE, WorkerType.KIMI]
         )
 
     def test_from_dict_rejects_retired_nanocode_worker(self):
@@ -325,8 +336,6 @@ class TestProvisionerArgs(unittest.TestCase):
 
         for flag, value in (
             ("--llm-base-url", "http://llm.test/v1"),
-            ("--opencode-model", "open-model"),
-            ("--opencode-base-url", "http://open.test/v1"),
             ("--opencode2-model", "open2-model"),
             ("--opencode2-base-url", "http://open2.test/v1"),
             ("--kimi-model", "kimi-model"),
@@ -334,6 +343,10 @@ class TestProvisionerArgs(unittest.TestCase):
         ):
             self.assertIn(flag, args)
             self.assertIn(value, args)
+        # WI#333 retired the opencode v1 lane, so its overrides are not emitted
+        # even when a saved plan still carries them.
+        self.assertNotIn("--opencode-model", args)
+        self.assertNotIn("--opencode-base-url", args)
 
     def test_kimi_api_key_uses_secret_injection_not_argv(self):
         secret = "kimi-secret-value"
@@ -384,13 +397,14 @@ class TestProvisionerArgs(unittest.TestCase):
                 provisioner.MT_ADMIN_SCRIPT = previous
 
         # Selected workers appear on add-tenant (the persisted selection).
-        self.assertIn("--with-opencode", add_args)
+        # WI#333: OPENCODE is retired, so it is dropped rather than forwarded.
+        self.assertNotIn("--with-opencode", add_args)
         self.assertIn("--with-kimi", add_args)
         # Unselected workers are omitted from add-tenant.
         self.assertNotIn("--with-pebble", add_args)
         self.assertNotIn("--with-opencode2", add_args)
         # build-tenant still gets the same selection (to build the images).
-        self.assertIn("--with-opencode", build_args)
+        self.assertNotIn("--with-opencode", build_args)
         self.assertIn("--with-kimi", build_args)
         self.assertNotIn("--with-pebble", build_args)
         self.assertNotIn("--with-opencode2", build_args)

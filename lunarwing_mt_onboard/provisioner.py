@@ -162,10 +162,8 @@ def build_add_tenant_args(config: "TenantConfig") -> list[str]:
         args.extend(["--llm-base-url", config.llm_base_url])
     if config.llm_model:
         args.extend(["--llm-model", config.llm_model])
-    if config.opencode_model:
-        args.extend(["--opencode-model", config.opencode_model])
-    if config.opencode_base_url:
-        args.extend(["--opencode-base-url", config.opencode_base_url])
+    # WI#333 retired the opencode v1 lane: mt-admin refuses --opencode-model and
+    # --opencode-base-url, so a saved plan's opencode overrides are not emitted.
     if config.opencode2_model:
         args.extend(["--opencode2-model", config.opencode2_model])
     if config.opencode2_base_url:
@@ -183,8 +181,6 @@ def build_add_tenant_args(config: "TenantConfig") -> list[str]:
     # build_build_tenant_args and docs/proposals/PER_TENANT_WORKER_GATING.md.
     if WorkerType.PEBBLE in config.workers:
         args.append("--with-pebble")
-    if WorkerType.OPENCODE in config.workers:
-        args.append("--with-opencode")
     if WorkerType.OPENCODE2 in config.workers:
         args.append("--with-opencode2")
     if WorkerType.KIMI in config.workers:
@@ -204,8 +200,6 @@ def build_build_tenant_args(config: "TenantConfig") -> list[str]:
     args: list[str] = [script, "build-tenant", config.name, "--with-wasm"]
     if WorkerType.PEBBLE in config.workers:
         args.append("--with-pebble")
-    if WorkerType.OPENCODE in config.workers:
-        args.append("--with-opencode")
     if WorkerType.OPENCODE2 in config.workers:
         args.append("--with-opencode2")
     if WorkerType.KIMI in config.workers:

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import warnings
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from pathlib import Path
@@ -33,9 +34,28 @@ class WorkerType(str, Enum):
     """Selectable external worker container types."""
 
     PEBBLE = "pebble"
+    # WI#333 retired the opencode v1 lane in v2.1.8.0. The member stays so an
+    # older saved plan still parses; from_dict drops it with a notice.
     OPENCODE = "opencode"
     KIMI = "kimi"
     OPENCODE2 = "opencode2"
+
+
+# WI#333: one wording for every caller that drops the retired v1 selection.
+RETIRED_OPENCODE_NOTICE = (
+    "opencode v1 worker lane is retired (WI#333); dropping the opencode "
+    "selection — use opencode2 for the supported lane"
+)
+
+
+def warn_retired_opencode() -> None:
+    """Announce that a retired opencode v1 selection is being dropped."""
+    warnings.warn(RETIRED_OPENCODE_NOTICE, RuntimeWarning, stacklevel=3)
+
+
+def without_retired_opencode(workers: list[WorkerType]) -> list[WorkerType]:
+    """Return *workers* minus the retired opencode v1 lane (WI#333)."""
+    return [w for w in workers if w is not WorkerType.OPENCODE]
 
 
 @dataclass
@@ -115,6 +135,11 @@ class TenantConfig:
         if "nanocode" in workers_raw:
             raise ValueError("Nanocode worker is retired; remove it from the saved plan")
         workers = [WorkerType(w) for w in workers_raw]
+        if WorkerType.OPENCODE in workers:
+            # WI#333: a plan saved before the retirement keeps loading, minus the
+            # retired lane, so a resumed provisioning run does not die later.
+            warn_retired_opencode()
+            workers = without_retired_opencode(workers)
         return cls(
             name=data.get("name", ""),
             gateway_host=data.get("gateway_host", "127.0.0.1"),

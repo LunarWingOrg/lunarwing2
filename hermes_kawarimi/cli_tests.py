@@ -8,6 +8,7 @@ from __future__ import annotations
 import unittest
 
 from hermes_kawarimi.cli import _plan_from_args, build_parser
+from hermes_kawarimi.loader import _worker_flags
 
 
 def _plan(argv: list[str]):
@@ -30,7 +31,8 @@ class PlanFromArgsTest(unittest.TestCase):
         )
         self.assertFalse(plan.with_nanocode)
         self.assertTrue(plan.with_pebble)
-        self.assertTrue(plan.with_opencode)
+        # WI#333 retired the v1 lane: the flag still parses but is not forwarded.
+        self.assertFalse(_worker_flags(plan).count("--with-opencode"))
         self.assertTrue(plan.with_kimi)
         self.assertTrue(plan.with_toolchains)
 

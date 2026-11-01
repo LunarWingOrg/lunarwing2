@@ -180,6 +180,10 @@ def _plan_from_args(args: argparse.Namespace) -> ImportPlan:
     plan.force = plan.force or bool(args.force)
     plan.docker_group = plan.docker_group or bool(args.docker_group)
     plan.with_pebble = plan.with_pebble or bool(args.with_pebble)
+    if args.with_opencode and not plan.with_opencode:
+        # WI#333: accept the flag so an old command line still parses, then drop
+        # it — loader._worker_flags never forwards it to mt-admin.
+        out("note: opencode v1 worker lane is retired (WI#333); ignoring --with-opencode")
     plan.with_opencode = plan.with_opencode or bool(args.with_opencode)
     plan.with_kimi = plan.with_kimi or bool(args.with_kimi)
     plan.with_toolchains = plan.with_toolchains or bool(args.with_toolchains)
@@ -216,7 +220,11 @@ def build_parser() -> argparse.ArgumentParser:
     imp.add_argument("--force", action="store_true", help="reuse an existing tenant name")
     imp.add_argument("--docker-group", action="store_true", help="pass --docker-group to add-tenant")
     imp.add_argument("--with-pebble", action="store_true")
-    imp.add_argument("--with-opencode", action="store_true")
+    imp.add_argument(
+        "--with-opencode",
+        action="store_true",
+        help="RETIRED (WI#333) — the opencode v1 lane is gone; use opencode2 via mt-admin",
+    )
     imp.add_argument("--with-kimi", action="store_true")
     imp.add_argument("--with-toolchains", action="store_true", help="pass --with-toolchains to build-tenant")
     imp.add_argument("--with-vision", action="store_true", help="unsupported by mt-admin — will fail in preflight")
