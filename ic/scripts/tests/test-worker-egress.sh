@@ -91,6 +91,7 @@ getent() {
   if [[ "${1:-}" == "ahostsv4" ]]; then
     case "${2:-}" in
       git.example.org) printf '203.0.113.40 STREAM git.example.org\n' ;;
+      nano-gpt.com)    printf '198.51.100.7 STREAM nano-gpt.com\n' ;;
       *) return 1 ;;
     esac
     return 0
@@ -1019,6 +1020,88 @@ assert_rc_fail env PATH="$fixture:$PATH" LOAD_RC=0 VERIFY_RC=1 GUARD_LOG="$GUARD
   "$babysitter" lunarwing-opencode2-alpha "$fixture/openrc-guard" "$fixture/alpha.nft" fwd_alpha
 assert_contains "$(cat "$CTR_LOG")" 'stop lunarwing-opencode2-alpha' "babysitter post-guard failure stops the respawned worker"
 assert_rc_fail env PATH="$fixture:$PATH" "$babysitter" lunarwing-opencode2-alpha "$fixture/missing-guard" "$fixture/alpha.nft" fwd_alpha
+
+# ── WI#506: pebble backend derivation and the fail-closed start guard ─────────
+# A --with-pebble tenant's model backend lives in pebble.env. The ruleset is
+# rendered from the derivation, so the backend must appear in the allowlist;
+# a lane whose backend is missing or unresolvable must refuse before its
+# container exists instead of failing every job with an opaque connect error.
+# The shipped derivation is exercised directly (the harness stub is lifted
+# here), over a fixture tenant env dir.
+pebble_env_dir="$fixture/env"
+mkdir -p "$pebble_env_dir"
+tenant_env_dir() { printf '%s\n' "$pebble_env_dir"; }
+read_tenant_env_value() {  # <tenant> <file> <KEY>
+  [[ -f "$2" && ! -L "$2" ]] || return 0
+  sed -n "s/^$3=//p" "$2" | tail -1
+}
+eval "$(awk '/^_worker_egress_llm_targets\(\) \{/,/^}/' \
+  "$HARNESS_REPO_ROOT/ic/scripts/mt-admin-lib/15-worker-egress.sh")"
+pebble_env="$pebble_env_dir/pebble.env"
+apply_log="$fixture/pebble-apply.log"
+worker_egress_apply() { printf '%s\n' "$1" >>"$apply_log"; }
+: >"$apply_log"
+rm -f "$pebble_env"
+if output="$(prepare_worker_egress alpha pebble 2>&1)"; then
+  fail "pebble lane started with no declared model backend"
+else
+  assert_contains "$output" 'configure-pebble alpha' "undeclared pebble backend names configure-pebble"
+  assert_contains "$output" 'configure-worker-egress alpha --allow' "undeclared pebble backend names the egress remediation"
+  assert_eq "$(cat "$apply_log")" "" "an undeclared pebble backend never renders an allowlist"
+fi
+printf 'PEBBLE_BASE_URL=https://nano-gpt.com/api\n' >"$pebble_env"
+if output="$(prepare_worker_egress alpha pebble 2>&1)"; then
+  pass "declared pebble backend is accepted by the start guard"
+  assert_contains "$output" 'pebble model backend nano-gpt.com:443' "start guard reports the derived backend"
+else
+  fail "declared pebble backend was refused: $output"
+fi
+assert_contains "$(worker_egress_target_records alpha)" 'nano-gpt.com 198.51.100.7 443' \
+  "pebble backend is derived into the tenant's own allowlist"
+printf 'PEBBLE_BASE_URL=https://missing.invalid/api\n' >"$pebble_env"
+if output="$(prepare_worker_egress alpha pebble 2>&1)"; then
+  fail "unresolvable pebble backend was accepted"
+else
+  assert_contains "$output" 'cannot resolve its model backend' "unresolvable pebble backend is a start-time refusal"
+  assert_contains "$output" 'missing.invalid:443' "unresolvable refusal names the backend host"
+fi
+printf 'PEBBLE_BASE_URL=not-a-url\n' >"$pebble_env"
+if output="$(prepare_worker_egress alpha pebble 2>&1)"; then
+  fail "malformed pebble backend was accepted"
+else
+  assert_contains "$output" "invalid pebble model backend 'not-a-url'" "malformed pebble backend is refused"
+fi
+printf 'PEBBLE_BASE_URL=https://198.51.100.9:8443/api\n' >"$pebble_env"
+if prepare_worker_egress alpha pebble >/dev/null 2>&1; then
+  pass "a literal-address pebble backend is accepted"
+else
+  fail "a literal-address pebble backend was refused"
+fi
+printf 'NANOGPT_BASE_URL=https://nano-gpt.com/api\n' >"$pebble_env"
+if prepare_worker_egress alpha pebble >/dev/null 2>&1; then
+  pass "a hand-configured NANOGPT_BASE_URL satisfies the start guard"
+else
+  fail "a hand-configured NANOGPT_BASE_URL was refused"
+fi
+rm -f "$pebble_env"
+if prepare_worker_egress alpha opencode >/dev/null 2>&1; then
+  pass "the guard applies to the pebble lane only"
+else
+  fail "the pebble guard refused another worker lane"
+fi
+printf 'PEBBLE_BASE_URL=https://nano-gpt.com/api\n' >"$pebble_env"
+saved_extra_hosts="$CTR_EXTRA_HOSTS"
+CTR_EXTRA_HOSTS=$'git.example.org:203.0.113.40\nnano-gpt.com:198.51.100.7'
+if (worker_egress_audit alpha) >"$fixture/audit-pebble.out" 2>&1; then
+  pass "audit passes a pebble tenant whose backend is allowlisted"
+else
+  fail "audit rejected a pebble tenant with an allowlisted backend: $(cat "$fixture/audit-pebble.out")"
+fi
+assert_contains "$(cat "$fixture/audit-pebble.out")" 'allowlist targets:' \
+  "worker-egress shows the derived allowlist"
+assert_contains "$(cat "$fixture/audit-pebble.out")" 'nano-gpt.com 198.51.100.7 443' \
+  "worker-egress shows the pebble backend in the allowlist"
+CTR_EXTRA_HOSTS="$saved_extra_hosts"
 
 # ── source wiring pins ────────────────────────────────────────────────────────
 worker_config="$HARNESS_REPO_ROOT/ic/scripts/mt-admin-lib/09-worker-config.sh"
