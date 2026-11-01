@@ -1632,58 +1632,48 @@ impl ExternalWorkerManager {
     /// for every configured worker.  Safe to call from any thread; the
     /// read lock is held only for the clone.
     pub fn worker_probe_states(&self) -> Vec<WorkerProbeState> {
-        let guard = self
-            .probe_state
-            .read()
-            .expect("probe_state lock poisoned");
-        let mut states: Vec<WorkerProbeState> = guard.values().cloned().collect();
+        let mut states: Vec<WorkerProbeState> = match self.probe_state.read() {
+            Ok(guard) => guard.values().cloned().collect(),
+            Err(poisoned) => poisoned.into_inner().values().cloned().collect(),
+        };
         states.sort_by(|a, b| a.worker.cmp(&b.worker));
         states
     }
 
     /// Record a single worker's probe result into the shared state map and
-    /// log a state-change warning for the periodic re-probe path.
+    /// log a state-change line.  A poisoned lock is recovered rather than
+    /// panicked on — this is an observability path, not a correctness one.
     fn record_probe_state(&self, state: WorkerProbeState) {
         let worker_name = state.worker.clone();
-        let was_reachable = {
-            let guard = self
-                .probe_state
-                .read()
-                .expect("probe_state lock poisoned");
-            guard.get(&worker_name).map(|s| s.reachable)
+        let now_reachable = state.reachable;
+        let reason = state.reason.clone();
+        let endpoint_display = state.endpoint_display.clone();
+
+        let previous = match self.probe_state.write() {
+            Ok(mut guard) => guard.insert(worker_name.clone(), state),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .insert(worker_name.clone(), state),
         };
+        let was_reachable = previous.map(|s| s.reachable);
 
-        let changed = was_reachable.is_some() && was_reachable != Some(state.reachable);
-        {
-            let mut guard = self
-                .probe_state
-                .write()
-                .expect("probe_state lock poisoned");
-            guard.insert(worker_name, state);
-        }
-
-        // The boot probe already logged the ERROR line; the periodic re-probe
-        // logs only on state change (reachable→unreachable or back).
-        if changed {
-            let guard = self
-                .probe_state
-                .read()
-                .expect("probe_state lock poisoned");
-            if let Some(s) = guard.get(&worker_name) {
-                if s.reachable {
-                    tracing::info!(
-                        "External worker '{}' is reachable again at {}",
-                        s.worker,
-                        s.endpoint_display
-                    );
-                } else {
-                    tracing::error!(
-                        "External worker '{}' became unreachable at {}: {}",
-                        s.worker,
-                        s.endpoint_display,
-                        s.reason.as_deref().unwrap_or("unknown error")
-                    );
-                }
+        // The boot probe already logs its own per-worker ERROR; only a
+        // genuine state change from a known prior value is logged here (the
+        // periodic re-probe path, and the first boot record has no prior).
+        if was_reachable.is_some() && was_reachable != Some(now_reachable) {
+            if now_reachable {
+                tracing::info!(
+                    "External worker '{}' is reachable again at {}",
+                    worker_name,
+                    endpoint_display
+                );
+            } else {
+                tracing::error!(
+                    "External worker '{}' became unreachable at {}: {}",
+                    worker_name,
+                    endpoint_display,
+                    reason.as_deref().unwrap_or("unknown error")
+                );
             }
         }
     }
