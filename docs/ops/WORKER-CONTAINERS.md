@@ -635,6 +635,18 @@ Enforced controls (opencode2 lane unless noted):
    future phone-home features and `webfetch`/shell exfiltration, and the only
    one that holds against a compromised agent (see the gate record above).
 
+   The allowlist is derived, never guessed: `worker_egress_target_records`
+   reads `LLM_BASE_URL`, the three worker `*_BASE_URL` overrides and
+   `PEBBLE_BASE_URL` from `lunarwing.env`, plus the pebble lane's own
+   `PEBBLE_BASE_URL`/`NANOGPT_BASE_URL` from `pebble.env` (WI#506). A target
+   the host cannot resolve is silently omitted from the ruleset, so the
+   pebble lane refuses to start when its model backend is undeclared or
+   unresolvable (`worker_egress_require_pebble_backend`) and names the exact
+   remediation instead of letting every dispatched job fail with an opaque
+   connect error. `worker-egress <tenant>` prints the derived targets under
+   `allowlist targets:`; see `docs/ops/PEBBLE-WORKER.md` for the pebble
+   backend pin.
+
    **Rootless Podman first-start keeper (WI#504):** when no worker container is
    running, mt-admin creates `lw-egress-keeper-<tenant>` on that tenant's
    `lw-egress-<tenant>` network before applying the filter. Where the tenant's
@@ -1031,7 +1043,7 @@ sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <name> --with-pebble
 sudo ic/scripts/lunarwing-mt-admin.sh build-pebble-worker
 ```
 
-Persistent worker mode (`PEBBLE_MODE=websocket`). Requires `AGENT_AUTH_TOKEN` for WebSocket auth and optionally `NANOGPT_API_KEY` for the underlying NanoGPT backend (configure per-tenant via `configure-pebble <name> --nanogpt-api-key <key>`). Upstream Pebble v0.5.0 is fetched by its reviewed full commit, both Cargo builds use committed lockfiles, and base images/package indexes/toolchain downloads are pinned. See `pebble4lunarwing/` for details.
+Persistent worker mode (`PEBBLE_MODE=websocket`). Requires `AGENT_AUTH_TOKEN` for WebSocket auth and optionally `NANOGPT_API_KEY` for the underlying NanoGPT backend (configure per-tenant via `configure-pebble <name> --nanogpt-api-key <key>`). That command also pins the model backend into `pebble.env` as `PEBBLE_BASE_URL` (declaration) and `NANOGPT_BASE_URL` (the key the binary honours), defaulting to `https://nano-gpt.com/api`, so the tenant's egress allowlist derives the backend the worker really dials (WI#506); an undeclared or unresolvable backend refuses the lane at start instead of failing every job. Upstream Pebble v0.5.0 is fetched by its reviewed full commit, both Cargo builds use committed lockfiles, and base images/package indexes/toolchain downloads are pinned. See `pebble4lunarwing/` for details.
 
 Launch identity (WI#454, supersedes WI#422): the image defaults to
 `USER 10004:10004`; mt-admin runs the bridge as `10104:10004` and the task
