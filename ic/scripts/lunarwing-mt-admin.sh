@@ -384,7 +384,8 @@ Commands:
     --with-pebble --with-opencode --with-kimi --with-opencode2
 
   last-build-stage <name>          Print the last completed build stage
-                                   (daemon|bridge|wasm|worker:<lane>|none)
+                                   (daemon|bridge|wasm|none, or unknown when the
+                                   marker is unreadable)
 
   reset-build-stage <name>         Reset the build stage marker to "nothing built"
                                    (TD-5: called by upgrade-tenant.sh before the stop)

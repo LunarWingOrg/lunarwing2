@@ -496,12 +496,14 @@ _vendor_guarded_cargo_build() {  # <repo> <cargo-root> [extra cargo build args..
 # per-tenant file rather than a shell array because the upgrade path runs
 # build_tenant inside a captured subshell (to keep errexit and return a status)
 # and the external wrapper (ic/scripts/upgrade-tenant.sh) is a separate process
-# that must classify the same failure. build_tenant truncates the file on entry
-# and appends one line per completed stage. Stage names: daemon, bridge, wasm,
-# worker:<lane>. Callers use this to decide whether an in-place restart would
-# start the NEW daemon binary, instead of parsing error prose (run-287 SX-1/SX-4).
-# Worker lanes built to candidate tags before the stop are recorded separately
-# (see TENANT_CANDIDATE_LANES_FILE) so the post-stop build cannot erase them.
+# that must classify the same failure. build_tenant starts the file with a
+# "start" sentinel and appends one line per completed stage. Stage names:
+# daemon, bridge, wasm. Callers use this to decide whether an in-place restart
+# would start the NEW daemon binary, instead of parsing error prose (run-287
+# SX-1/SX-4). Worker lanes are never built after the stop: they are built to
+# candidate tags before it and recorded separately (see
+# TENANT_CANDIDATE_LANES_FILE), so a post-stop stage record never names a lane
+# (run-294 TJ-14).
 #
 # run-291 TD-2: marker files live in the root-owned 0700 lifecycle lock
 # directory, NOT in the tenant-writable state directory. Root truncating or
@@ -556,7 +558,8 @@ _record_build_stage() {  # <name> <stage>
 }
 
 # WI#527: the last stage a build_tenant run completed for <name>:
-# "daemon", "bridge", "wasm", "worker:<lane>", or "none" when nothing completed.
+# "daemon", "bridge", "wasm", or "none" when nothing completed (worker lanes are
+# pre-stop candidates and never appear here).
 # An existing-but-unreadable marker reports "unknown" so the external wrapper
 # fails closed instead of restarting a possibly-new binary (run-294 TJ-9).
 upgrade_last_completed_stage() {  # <name>
