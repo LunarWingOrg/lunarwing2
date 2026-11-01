@@ -181,10 +181,7 @@ impl TurnCompletion {
             Err(error) => {
                 tracing::error!(thread_id = %self.thread_id, %error, "Late turn completion failed");
                 self.delivery
-                    .deliver(
-                        &self.message,
-                        format!("Error completing the pending turn: {error}"),
-                    )
+                    .deliver(&self.message, error.user_facing_message())
                     .await;
             }
         }
