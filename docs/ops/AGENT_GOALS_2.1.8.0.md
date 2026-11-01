@@ -59,7 +59,7 @@
 
 ## Phase 3 — Carried Known-Issues from RELEASE-v2.1.3.0.md (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
 
-4. [ ] Fix any issues in CI/CD (if any) - See Pipeline for LATEST MASTER pipeline (you can use gitlab mcp) and see if anything is not GREEN. If there are problems, fix them - always check last dozen or so Work Items for TIPS as to why master pipelines are actually red. Kageho is watching and posting WIs with explanations now usually (fairly frequently) - last attempt had some issues please see https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2104 and comment review in comments of closed MR for details on re-attempting this
+4. [ ] Fix any issues in CI/CD (if any) - See Pipeline for LATEST MASTER pipeline (you can use gitlab mcp) and see if anything is not GREEN. If there are problems, fix them - always check last dozen or so Work Items for TIPS as to why master pipelines are actually red. Kageho is watching and posting WIs with explanations now usually (fairly frequently)
 5. [x] (S) (H MR) release alpha of droid and desk repo projs LATER near end of dev cycle
 6. [x] (S) (H MR) prob rm opencode v1 in .1.7.0 and add lunardepth in .1.8.0
 
