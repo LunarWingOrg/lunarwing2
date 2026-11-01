@@ -216,11 +216,18 @@ pub(crate) struct VettedHttpTarget {
 
 impl VettedHttpTarget {
     /// Pin reqwest to the answers checked above, eliminating the second DNS lookup.
+    ///
+    /// Proxy support is disabled unconditionally (WI#503): reqwest honours
+    /// `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` from the environment and sends
+    /// the request to the proxy, which resolves the hostname itself. The
+    /// pinned answers then would not be the ones connected to, reopening the
+    /// DNS-rebinding gap. A vetted target always connects directly.
     pub(crate) fn pin_client(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
-        match &self.dns_host {
+        let builder = match &self.dns_host {
             Some(host) => builder.resolve_to_addrs(host, &self.addresses),
             None => builder,
-        }
+        };
+        builder.no_proxy()
     }
 }
 
@@ -316,11 +323,22 @@ fn embedded_ipv4(v6: &std::net::Ipv6Addr) -> Option<Ipv4Addr> {
     let nat64 = segments[0] == 0x64
         && segments[1] == 0xFF9B
         && segments[2..6].iter().all(|segment| *segment == 0);
-    if !compatible && !nat64 {
-        return None;
+    if compatible || nat64 {
+        let bits = (u32::from(segments[6]) << 16) | u32::from(segments[7]);
+        return Some(Ipv4Addr::from(bits));
     }
-    let bits = (u32::from(segments[6]) << 16) | u32::from(segments[7]);
-    Some(Ipv4Addr::from(bits))
+    // 6to4 (2002::/16) embeds the IPv4 address directly in bits 16..48.
+    if segments[0] == 0x2002 {
+        let bits = (u32::from(segments[1]) << 16) | u32::from(segments[2]);
+        return Some(Ipv4Addr::from(bits));
+    }
+    // Teredo (2001:0000::/32) stores the client IPv4 obfuscated (bitwise
+    // inverted) in the last 32 bits.
+    if segments[0] == 0x2001 && segments[1] == 0 {
+        let bits = (u32::from(segments[6]) << 16) | u32::from(segments[7]);
+        return Some(Ipv4Addr::from(!bits));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -345,6 +363,9 @@ mod tests {
             "::ffff:169.254.169.254",
             "::127.0.0.1",
             "64:ff9b::7f00:1",
+            "2002:7f00:1::",
+            "2002:a00:1::",
+            "2001:0:4136:e378:8000:63bf:f5ff:fffe",
             "ff02::1",
             "fec0::1",
         ];
@@ -360,6 +381,8 @@ mod tests {
             "::ffff:8.8.8.8",
             "::8.8.8.8",
             "64:ff9b::808:808",
+            "2002:808:808::",
+            "2001:0:4136:e378:8000:63bf:f7f7:f7f7",
             "2606:4700::1111",
         ];
         for text in public {
@@ -404,6 +427,51 @@ mod tests {
         });
 
         assert_eq!(status, reqwest::StatusCode::OK);
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn vetted_client_bypasses_a_configured_proxy() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        let port = listener.local_addr().expect("address").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).expect("read request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\npinned",
+                )
+                .expect("write response");
+        });
+        let target = VettedHttpTarget {
+            dns_host: Some("pinned.test".to_string()),
+            addresses: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)],
+        };
+        // Nothing listens on port 1: a request that honoured the proxy would
+        // fail to connect instead of reaching the pinned address.
+        let proxy = reqwest::Proxy::http("http://127.0.0.1:1").expect("proxy");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let body = runtime.block_on(async {
+            let client = target
+                .pin_client(reqwest::Client::builder().proxy(proxy))
+                .build()
+                .expect("client");
+            client
+                .get(format!("http://pinned.test:{port}/"))
+                .send()
+                .await
+                .expect("pinned request")
+                .text()
+                .await
+                .expect("response body")
+        });
+
+        assert_eq!(body, "pinned");
         server.join().expect("server thread");
     }
 }
