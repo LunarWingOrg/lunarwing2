@@ -376,11 +376,15 @@ Commands:
   restore-worker-images <name>     Re-tag the :latest worker images recorded
                                    before a promotion (rollback without a rebuild)
 
+  clear-promote-rollback <name>    Drop the pre-promotion record once the whole
+                                   upgrade succeeded (WI#527)
+
   cleanup-worker-candidates <name> Discard this run's WI#527 candidate images;
                                    lanes whose rmi fails stay listed for retry
 
   build-worker-candidates <name>   Build selected worker images to WI#527
                                    candidate tags without stopping the tenant
+    --enabled                      Build every lane the tenant has enabled
     --with-pebble --with-opencode --with-kimi --with-opencode2
 
   last-build-stage <name>          Print the last completed build stage
@@ -990,6 +994,15 @@ main() {
       restore_promoted_workers "$restore_name"
       ;;
 
+    clear-promote-rollback)
+      # run-300 TO-2: the pre-promotion record outlives a successful promote;
+      # the upgrade wrapper drops it only once the whole upgrade has finished.
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: clear-promote-rollback <name>"
+      _ensure_marker_dir
+      clear_promote_rollback "$(sanitize_name "$1")"
+      ;;
+
     cleanup-worker-candidates)
       # run-294 TJ-13: discard this run's candidate images (and keep the ones that
       # could not be removed visible in the lane file for a later retry).
@@ -1008,8 +1021,10 @@ main() {
       # calls this before its stop so a lane build failure cannot strand it.
       require_root
       local cand_name="" cand_pebble="false" cand_oc="false" cand_kimi="false" cand_oc2="false"
+      local cand_all_enabled="false"
       while [[ $# -gt 0 ]]; do
         case "$1" in
+          --enabled)        cand_all_enabled="true"; shift ;;
           --with-pebble)    cand_pebble="true"; shift ;;
           --with-opencode)  cand_oc="true"; shift ;;
           --with-kimi)      cand_kimi="true"; shift ;;
@@ -1022,10 +1037,20 @@ main() {
             ;;
         esac
       done
-      [[ -n "$cand_name" ]] || die "usage: build-worker-candidates <name> [--with-pebble] [--with-opencode] [--with-kimi] [--with-opencode2]"
+      [[ -n "$cand_name" ]] || die "usage: build-worker-candidates <name> [--enabled] [--with-pebble] [--with-opencode] [--with-kimi] [--with-opencode2]"
       cand_name="$(sanitize_name "$cand_name")"
       ports_registry_init
       tenant_exists_in_registry "$cand_name" || die "tenant '$cand_name' not found in registry"
+      # run-300 TO-5: let mt-admin decide which lanes this tenant has enabled, so
+      # the wrapper rebuilds exactly the lanes the mt-admin path does instead of
+      # claiming skew protection while it only rebuilt pebble.
+      if [[ "$cand_all_enabled" == true ]]; then
+        cand_pebble="false" cand_oc="false" cand_kimi="false" cand_oc2="false"
+        tenant_worker_enabled "$cand_name" pebble    && cand_pebble="true"
+        tenant_worker_enabled "$cand_name" opencode  && cand_oc="true"
+        tenant_worker_enabled "$cand_name" kimi      && cand_kimi="true"
+        tenant_worker_enabled "$cand_name" opencode2 && cand_oc2="true"
+      fi
       # run-294 TJ-5: a candidate build may not race a running upgrade of the
       # same tenant (they share the candidate tag). run-300 TO-1: inside the
       # upgrade wrapper that run's inherited lock is used, not re-acquired.

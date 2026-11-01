@@ -1925,6 +1925,10 @@ upgrade_tenant_locked() {
     return "$startup_rc"
   fi
   say "tenant '$name' upgraded: $before -> $("${tgit[@]}" describe --tags --always 2>/dev/null)"
+  # run-300 TO-2: only now is the promotion final. Removing the rollback record
+  # at the end of promote reported "restored" while new worker images stayed on
+  # :latest when a later render/env/start step failed.
+  clear_promote_rollback "$name"
   say "verify with: $0 status $name"
 }
 

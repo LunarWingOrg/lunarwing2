@@ -298,8 +298,14 @@ converge_after_failed_upgrade() {  # <cause> [refused_before_stop]
   fi
   say "" >&2
   # TD-5: a refusal before the stop (opencode2 floor, DarkIRC) leaves the tenant
-  # running; don't try to restore or start it.
+  # running; don't try to restore or start it. run-300 TO-4: the clone was
+  # already checked out to the target and the pre-upgrade changes stashed, so
+  # return both — otherwise the next attempt's PRIOR_REV is the wrong revision.
   if $refused_before_stop; then
+    if ! $SKIP_BUILD; then
+      revert_clone_position \
+        || say "WARNING: could not return the clone to $PRIOR_REV; check: git -C $LWROOT status" >&2
+    fi
     die "$cause; tenant '$TENANT' was not stopped and is running its previous build"
   fi
   # TJ-5: put back any worker :latest tag this run already promoted, so a
@@ -393,13 +399,22 @@ else
       STASHED=true
     else die "tenant clone $LWROOT has uncommitted changes; commit/stash them or re-run with --yes"; fi
   fi
-  run sudo -u "$TENANT" git -C "$LWROOT" fetch --tags --prune
-  run sudo -u "$TENANT" git -C "$LWROOT" checkout "$TARGET_REF"
+  run sudo -u "$TENANT" git -C "$LWROOT" fetch --tags --prune \
+    || { revert_clone_position || say "WARNING: could not return the clone to $PRIOR_REV" >&2
+         die "git fetch failed; tenant '$TENANT' was not stopped"; }
+  run sudo -u "$TENANT" git -C "$LWROOT" checkout "$TARGET_REF" \
+    || { revert_clone_position || say "WARNING: could not return the clone to $PRIOR_REV" >&2
+         die "git checkout $TARGET_REF failed; tenant '$TENANT' was not stopped"; }
   # WI#527: build the worker candidate images WHILE the tenant still runs. A
   # lane failure here leaves the running tenant untouched.
+  # run-300 TO-5: --enabled rebuilds every lane this tenant has enabled (the
+  # same selection the mt-admin path makes), instead of only pebble — which left
+  # enabled kimi/opencode/opencode2 lanes on their previous images while the
+  # comment claimed the step prevented daemon/worker skew. --with-pebble is kept
+  # as an explicit opt-in for a pebble lane the registry does not list.
   # TD-6/TD-11: on candidate build failure revert the checkout and pop the stash
   # so the running tenant's clone is exactly as it was.
-  cand_args=(build-worker-candidates "$TENANT")
+  cand_args=(build-worker-candidates "$TENANT" --enabled)
   $WITH_PEBBLE && cand_args+=(--with-pebble)
   cand_rc=0
   set +e
@@ -407,6 +422,11 @@ else
   cand_rc=$?
   set -e
   if [[ "$cand_rc" -ne 0 ]]; then
+    # run-300 TO-4: discard the partial candidate images and lane record,
+    # otherwise a later manual promote could promote images built from the
+    # checkout this failure just reverts.
+    run mt cleanup-worker-candidates "$TENANT" \
+      || say "WARNING: could not discard this run's candidate worker images; run: $MT cleanup-worker-candidates $TENANT" >&2
     if revert_clone_position; then
       die "worker image candidate build failed; tenant '$TENANT' was not stopped and its clone was restored"
     fi
@@ -477,6 +497,11 @@ fi
 # ---- 6. START the tenant (PG already up, then workers + daemon) --------------
 banner "6/8  Start tenant"
 run mt start-tenant "$TENANT"
+# run-300 TO-2: the promotion is only final once the tenant runs on the new
+# build; until then a failure must still be able to re-tag the old worker
+# images, so the pre-promotion record lives until here.
+run mt clear-promote-rollback "$TENANT" \
+  || say "WARNING: could not clear the worker promotion rollback record for '$TENANT'" >&2
 
 # ---- 7. VERIFY ---------------------------------------------------------------
 banner "7/8  Verify"

@@ -790,6 +790,9 @@ _worker_toolchain_profile() {  # <lane>
     --format '{{ index .Config.Labels "org.opencontainers.image.toolchain-profile" }}' \
     "$latest" 2>/dev/null || true)"
   [[ "$profile" == true ]] && printf 'true'
+  # run-300 TO-8: every current caller uses this in a `||` context, but a
+  # profile helper must not report failure just because the image is slim.
+  return 0
 }
 
 # Build every selected lane's candidate image, recording each success. Fails at
@@ -800,6 +803,9 @@ build_candidate_workers() {
   local with_pebble="${5:-false}" with_toolchains="${6:-false}"
   _ensure_marker_dir
   : >"$(tenant_candidate_lanes_file "$name")"
+  # run-300 TO-3: a new run must not inherit a prior run's pre-promotion ids, or
+  # a later failed run could "restore" a lane to an image this run never had.
+  clear_promote_rollback "$name"
   local lane
   for lane in pebble opencode kimi opencode2; do
     case "$lane" in
@@ -824,14 +830,22 @@ build_candidate_workers() {
 #
 # run-294 TJ-5: the rollback record appends one line per lane and keeps the
 # FIRST pre-promotion id, so re-running after a mid-promote die never rewrites
-# the record with an already-promoted candidate. It is removed only after a
-# fully successful promote (or by restore_promoted_workers).
+# the record with an already-promoted candidate. run-300 TO-2: it is NOT removed
+# by a successful promote — the new :latest tags are only safe to keep once the
+# whole upgrade finished, so the removal happens there (or in
+# restore_promoted_workers, which consumes it on a rollback).
 #
 # Old :latest IDs are recorded to $(_tenant_marker_dir)/$name-promote-rollback
 # so upgrade_converge_after_failure (a separate invocation) can restore them
 # after a mid-promote die.
 _promote_rollback_file() {  # <name>
   printf '%s/%s-promote-rollback' "$(_tenant_marker_dir)" "$1"
+}
+
+# run-300 TO-2: drop the pre-promotion record once the upgrade as a whole has
+# succeeded (the wrapper, upgrade_tenant_locked). Never called by a promote.
+clear_promote_rollback() {  # <name>
+  rm -f "$(_promote_rollback_file "$1")"
 }
 
 # Append <lane>'s pre-promotion image id unless this run already recorded one.
@@ -907,7 +921,9 @@ promote_candidate_workers() {  # <tenant>
     "$CONTAINER_RT" rmi "$candidate_ref" >/dev/null 2>&1 || true
   done
   : >"$lanes_file"
-  rm -f "$rollback_file"
+  # run-300 TO-2: the rollback record stays until the whole upgrade succeeds;
+  # deleting it here made a later render/env/start failure report "restored"
+  # while the new worker images stayed on :latest.
 }
 
 # ── Darkirc daemon build (shared, not per-tenant) ────────────────────────────
@@ -1497,7 +1513,11 @@ build_pebble_worker() {
   # write a candidate tag and promote after every lane succeeded).
   local output_tag fat_candidate build_tag
   output_tag="$(worker_image_ref pebble)"
-  fat_candidate="$(worker_image_ref pebble candidate)"
+  # run-300 TO-6: the fat staging tag is derived from this build's output tag
+  # (candidate -> wi527-<tenant>-candidate), so two concurrent builds — another
+  # tenant's upgrade or a build-pebble-worker --with-toolchains — can never
+  # retag each other's image between the smoke gate and the final retag.
+  fat_candidate="${output_tag}-candidate"
   build_tag="$output_tag"
   [[ "$with_toolchains" == "true" ]] && build_tag="$fat_candidate"
 

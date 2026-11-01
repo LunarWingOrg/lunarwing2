@@ -251,10 +251,11 @@ class TaskShellToolchainPathTests(unittest.TestCase):
         # fat builds target a candidate tag, the smoke runs against it with
         # the build's own container runtime, and the output tag is only
         # re-tagged after the probe passes (WI#334). WI#527/TD-14: the output
-        # tag honours LUNARWING_WORKER_IMAGE_TAG via worker_image_ref, and the
-        # fat candidate is resolved through the same helper.
+        # tag honours LUNARWING_WORKER_IMAGE_TAG via worker_image_ref. WI#527
+        # TO-6: the fat staging tag is derived from that output tag, so two
+        # concurrent builds (another tenant's upgrade) cannot share it.
         build_lib = (ROOT / "ic/scripts/mt-admin-lib/05-tenant-build.sh").read_text(encoding="utf-8")
-        self.assertIn('fat_candidate="$(worker_image_ref pebble candidate)"', build_lib)
+        self.assertIn('fat_candidate="${output_tag}-candidate"', build_lib)
         self.assertIn('CONTAINER_RT="$CONTAINER_RT" "$smoke_script" image "$fat_candidate"', build_lib)
         self.assertIn('"$CONTAINER_RT" tag "$fat_candidate" "$output_tag"', build_lib)
         self.assertIn('output_tag="$(worker_image_ref pebble)"', build_lib)

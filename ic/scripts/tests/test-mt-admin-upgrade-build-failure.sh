@@ -509,6 +509,88 @@ else
   pass 'real promote is re-runnable (an already-promoted lane is skipped)'
 fi
 
+# ── 7. the upgrade wrapper's own verbs must not deadlock (run-300 TO-1) ──────
+# The wrapper's boundary takes flock on <build lock>.<tenant>.upgrade for the
+# whole run and re-enters mt-admin for build-worker-candidates and
+# promote-worker-images. Before TO-1 both verbs preflighted that lock, met their
+# own parent, and died — so no wrapper upgrade could ever succeed. This part
+# runs the REAL dispatch (main) with an inherited upgrade descriptor.
+require_root() { :; }
+ports_registry_init() { :; }
+tenant_exists_in_registry() { return 0; }
+
+upgrade_lock_file="${BUILD_LOCK}.fixture.upgrade"
+exec {inherited_upgrade_fd}>"$upgrade_lock_file"
+flock -x "$inherited_upgrade_fd"
+export LUNARWING_MT_INHERITED_UPGRADE_LOCK_FD="$inherited_upgrade_fd"
+
+: >"$lane_file"
+rm -f "$tag_file"
+register_image "$candidate_ref" sha256:kimi-candidate
+register_image "lunarwing-worker-kimi:latest" sha256:kimi-old
+capture main build-worker-candidates fixture --with-kimi
+if [[ "$rc" -ne 0 ]]; then
+  fail "build-worker-candidates failed under the inherited upgrade lock (rc=$rc): $output"
+elif [[ "$output" == *'lock is already held'* ]]; then
+  fail 'build-worker-candidates preflighted the lock its own parent holds (TO-1)'
+elif [[ "$(cat "$tag_file" 2>/dev/null)" != *:wi527-fixture ]]; then
+  fail "build-worker-candidates never built the lane under the inherited lock: $(cat "$tag_file" 2>/dev/null)"
+else
+  pass 'build-worker-candidates uses the inherited upgrade lock instead of deadlocking'
+fi
+
+capture main promote-worker-images fixture
+rollback_file="$(_promote_rollback_file fixture)"
+if [[ "$rc" -ne 0 ]]; then
+  fail "promote-worker-images failed under the inherited upgrade lock (rc=$rc): $output"
+elif [[ "$output" == *'lock is already held'* ]]; then
+  fail 'promote-worker-images preflighted the lock its own parent holds (TO-1)'
+elif ! grep -qx "tag $candidate_ref lunarwing-worker-kimi:latest" "$runtime_log"; then
+  fail "promote-worker-images did not promote under the inherited lock: $(cat "$runtime_log")"
+else
+  pass 'promote-worker-images uses the inherited upgrade lock instead of deadlocking'
+fi
+
+# TO-2: a successful promote no longer deletes the rollback record; the record
+# lives until the whole upgrade succeeds (or a restore consumes it).
+if [[ ! -s "$rollback_file" ]]; then
+  fail 'a successful promote dropped the rollback record (TO-2)'
+else
+  capture clear_promote_rollback fixture
+  if [[ "$rc" -ne 0 || -e "$rollback_file" ]]; then
+    fail 'clear_promote_rollback did not remove the record at the end of the upgrade'
+  else
+    pass 'the rollback record survives promote and is cleared when the upgrade finishes'
+  fi
+fi
+
+# The preflight is still real for any caller that does not inherit the lock.
+: >"$lane_file"
+(
+  unset LUNARWING_MT_INHERITED_UPGRADE_LOCK_FD
+  main build-worker-candidates fixture --with-kimi
+) >"$fixture/to1-external.out" 2>&1 && external_rc=0 || external_rc=$?
+if [[ "$external_rc" -eq 0 ]]; then
+  fail 'an external candidate build succeeded while another process held the upgrade lock'
+elif ! grep -q 'lock is already held' "$fixture/to1-external.out"; then
+  fail "an external candidate build did not refuse on the held lock: $(cat "$fixture/to1-external.out")"
+else
+  pass 'an external caller still fails fast on a held upgrade lock'
+fi
+
+flock -u "$inherited_upgrade_fd"
+exec {inherited_upgrade_fd}>&-
+unset LUNARWING_MT_INHERITED_UPGRADE_LOCK_FD
+
+# Without the inherited descriptor the verb acquires the lock for itself.
+: >"$lane_file"
+capture main build-worker-candidates fixture
+if [[ "$rc" -ne 0 ]]; then
+  fail "a standalone candidate build could not take the upgrade lock (rc=$rc): $output"
+else
+  pass 'a standalone candidate build takes and releases the upgrade lock itself'
+fi
+
 if [[ "$failures" -ne 0 ]]; then
   printf 'RESULT: %d failure(s)\n' "$failures"
   exit 1
