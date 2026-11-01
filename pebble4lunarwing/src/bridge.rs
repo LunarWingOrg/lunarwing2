@@ -468,7 +468,7 @@ async fn dispatch_task(
         .as_ref()
         .map(|handle| tool_proxy::proxy_env_for_task(&request.task_id, &handle.socket_path));
 
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (cancel_tx, cancel_rx) = oneshot::channel();
     cancels
         .lock()
@@ -487,15 +487,28 @@ async fn dispatch_task(
     // pebble subprocess runs. The handler owns the workspace claim and removes
     // its own cancel-map entry on exit (WI#158: previously the entry was never
     // removed on natural completion, leaking a dead `oneshot::Sender` per
-    // task). It then forwards every executor envelope through the outbound
-    // channel.
+    // task).
+    //
+    // WI#519: the executor envelopes are drained by a forwarder that starts
+    // with the task, not after it. Previously the drain loop ran only once
+    // `execute_dispatch_task` had returned, so progress and the executor's
+    // keep-alive heartbeats accumulated in the unbounded channel and never
+    // reached the hub while the subprocess was alive; a busy task longer than
+    // the hub's external-worker idle threshold was flagged Stuck. The handler
+    // joins the forwarder before releasing the workspace claim, so every
+    // envelope (including the terminal result) is handed to the outbound
+    // writer first.
     let task_runner_socket = config.task_runner_socket.clone();
     {
         let registry = Arc::clone(registry);
         let cancels = Arc::clone(cancels);
         let relay = Arc::clone(relay);
         let task_id = request.task_id.clone();
-        let out_tx = out_tx.clone();
+        let forwarder = tokio::spawn(forward_executor_events(
+            event_rx,
+            out_tx.clone(),
+            task_id.clone(),
+        ));
         tokio::spawn(async move {
             let execution = execute_dispatch_task(
                 &exec_config,
@@ -508,6 +521,10 @@ async fn dispatch_task(
             .await;
             forward_execution_error(&event_tx, &task_id, execution);
             drop(event_tx);
+            // The executor is terminal: let the forwarder drain what is left
+            // so the terminal result is on the writer before the task's relay
+            // slot closes and its workspace is released for the next task.
+            let _ = forwarder.await;
             // The task is over: close its relay slot (fails any call still
             // in flight) before releasing the workspace claim.
             relay.close_task(&task_id).await;
@@ -516,24 +533,86 @@ async fn dispatch_task(
             // cancel arriving after this point finds `None` and logs
             // "not found or already finished" — which is then accurate.
             cancels.lock().await.remove(&task_id);
-            while let Some(event) = event_rx.recv().await {
-                let env = match &event {
-                    ExecutorEvent::Progress(e) | ExecutorEvent::Result(e) => e,
-                };
-                let json = serde_json::to_string(env).unwrap_or_default();
-                if out_tx.send(Message::Text(json.into())).is_err() {
-                    break;
-                }
-            }
         });
     }
+}
+
+/// What a terminated forwarder did with envelopes it could not deliver.
+/// The detail is counts plus the terminal-result classification only: task
+/// payloads are never logged (WI#519).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ForwardReport {
+    dropped: usize,
+    terminal_lost: bool,
+}
+
+/// Forward executor envelopes to the connection as they are produced
+/// (WI#519). Runs concurrently with the task so progress and keep-alive
+/// heartbeats reach the hub while the subprocess is still working; the loop
+/// ends when the executor drops its sender.
+///
+/// A closed outbound channel does not stop the loop: the channel is drained
+/// to empty so the terminal result is not stranded behind a receiver that
+/// stopped reading, and the loss is diagnosed once with the task id and the
+/// failure class only.
+async fn forward_executor_events(
+    mut events: mpsc::UnboundedReceiver<ExecutorEvent>,
+    out_tx: Outbound,
+    task_id: String,
+) -> ForwardReport {
+    let mut report = ForwardReport::default();
+    let mut close_logged = false;
+    while let Some(event) = events.recv().await {
+        let envelope = match &event {
+            ExecutorEvent::Progress(e) | ExecutorEvent::Result(e) => e,
+        };
+        let json = match serde_json::to_string(envelope) {
+            Ok(json) => json,
+            Err(error) => {
+                eprintln!(
+                    "[bridge] task {task_id}: failed to serialize {} envelope: {error}",
+                    envelope.msg_type
+                );
+                continue;
+            }
+        };
+        if out_tx.send(Message::Text(json.into())).is_err() {
+            if !close_logged {
+                close_logged = true;
+                eprintln!(
+                    "[bridge] task {task_id}: outbound channel closed; \
+                     dropping executor envelopes until the task ends"
+                );
+            }
+            report.dropped += 1;
+            if matches!(event, ExecutorEvent::Result(_)) {
+                report.terminal_lost = true;
+            }
+        }
+    }
+    if report.dropped > 0 {
+        eprintln!(
+            "[bridge] task {task_id}: {} executor envelope(s) dropped after outbound close; \
+             terminal result lost: {}",
+            report.dropped, report.terminal_lost
+        );
+    }
+    report
 }
 
 fn send_result(out_tx: &Outbound, envelope: &Envelope) {
     match serde_json::to_string(&envelope) {
         Ok(json) => {
             if out_tx.send(Message::Text(json.into())).is_err() {
-                eprintln!("[bridge] outbound channel closed; result dropped");
+                let task_id = envelope
+                    .payload
+                    .get("task_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                eprintln!(
+                    "[bridge] task {task_id}: outbound channel closed; {} dropped",
+                    envelope.msg_type
+                );
             }
         }
         Err(e) => eprintln!("[bridge] failed to serialize result envelope: {e}"),
