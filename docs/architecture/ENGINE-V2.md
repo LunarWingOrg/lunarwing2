@@ -1743,6 +1743,25 @@ joins a still-running handle, which would hide it from
 addressable. These are in-process delivery guarantees; the watcher is not a
 durable cross-restart outbox.
 
+**Join contract (WI#532/WI#534).** `ThreadManager::join_thread` serves a
+thread's outcome from the process-local registry first (`completed`, then
+`running`). Both maps are process-local, so a restart between spawn and join —
+or a second awaiter that arrives after the take-once outcome was consumed —
+used to fail with `thread not found` even though the thread record was durable.
+On a both-maps miss the manager now falls back to `store.load_thread`:
+`Done`/`Completed` synthesizes `Completed` from the last visible assistant
+message (the orchestrator persists the reply before the final save), `Failed`
+carries the recorded failure reason, `Waiting` reports the waiting error and
+leaves the live gate to gate recovery, a `Suspended` thread reports an
+interrupted turn without touching its resumable checkpoint, and an orphaned
+`Created`/`Running` record is finalized as `Failed("execution stopped")` so the
+turn ends instead of being dropped. Re-adopting a thread id clears the previous
+run's `completed` entry, so an abandoned outcome cannot answer the new waiter.
+Engine errors no longer reach channel users verbatim: both the message loop and
+the late watcher route failures through `Error::user_facing_message`, which
+replaces an `Engine` error with a stable actionable sentence and keeps the raw
+context (thread UUID included) in the log.
+
 Engine `message` tool calls receive execution-local `notify_thread_id`; gateway
 calls also carry their execution's user/channel instead of mutable conversation
 defaults. Proactive gateway delivery therefore meets the channel's required
