@@ -1744,6 +1744,28 @@ mod tests {
         }
     }
 
+    /// WI#520: an Engine V2 gate view converts into the same history DTO the
+    /// legacy in-memory approval uses, carrying the redacted display snapshot
+    /// and the request id `POST /api/chat/approval` accepts.
+    #[test]
+    fn engine_gate_view_converts_to_history_pending_approval() {
+        let view = crate::gate::pending::PendingGateView {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            thread_id: uuid::Uuid::new_v4().to_string(),
+            gate_name: "approval".to_string(),
+            tool_name: "shell".to_string(),
+            description: "Run shell command".to_string(),
+            parameters: "{\n  \"cmd\": \"ls\"\n}".to_string(),
+            resume_kind: lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        };
+
+        let info = super::PendingApprovalInfo::from(&view);
+        assert_eq!(info.request_id, view.request_id);
+        assert_eq!(info.tool_name, "shell");
+        assert_eq!(info.description, "Run shell command");
+        assert_eq!(info.parameters, view.parameters);
+    }
+
     use super::*;
 
     // ---- WsClientMessage deserialization tests ----

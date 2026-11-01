@@ -7413,6 +7413,193 @@ pub(crate) mod tests {
         *lock.write().await = None;
     }
 
+    /// WI#520: the history envelope surfaces the live Engine V2 approval gate
+    /// parked on exactly this thread, with the request id the approval
+    /// endpoint accepts and only redacted display parameters.
+    #[tokio::test]
+    async fn history_approval_lookup_returns_the_gate_parked_on_the_thread() {
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store.clone());
+
+        let thread = save_waiting_thread(&store, state.default_project_id, "alice").await;
+        let mut gate = sample_pending_gate(
+            "alice",
+            thread.id,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        gate.parameters = serde_json::json!({"token": "must-not-leak"});
+        gate.display_parameters = Some(serde_json::json!({"cmd": "ls"}));
+        let request_id = gate.request_id;
+        state.pending_gates.insert(gate).await.unwrap();
+
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = Some(state);
+
+        let found = get_engine_pending_approval("alice", thread.id.0)
+            .await
+            .unwrap()
+            .expect("a live approval gate must be discoverable from history");
+        assert_eq!(found.request_id, request_id.to_string());
+        assert_eq!(found.thread_id, thread.id.to_string());
+        assert_eq!(found.tool_name, "shell");
+        assert!(
+            !found.parameters.contains("must-not-leak"),
+            "history must only carry the redacted display snapshot"
+        );
+
+        *lock.write().await = None;
+    }
+
+    /// WI#520 acceptance: user/thread isolation, cleared or expired gates, and
+    /// non-approval gates never reach the history envelope.
+    #[tokio::test]
+    async fn history_approval_lookup_is_isolated_cleared_and_approval_only() {
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store.clone());
+
+        let alice_thread = save_waiting_thread(&store, state.default_project_id, "alice").await;
+        let sibling = save_waiting_thread(&store, state.default_project_id, "alice").await;
+
+        // Both gates share one conversation: a per-thread history envelope must
+        // still never surface the sibling thread's gate.
+        let conversation_id = lunarwing_engine::ConversationId::new();
+        let mut approval = sample_pending_gate(
+            "alice",
+            alice_thread.id,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        approval.conversation_id = conversation_id;
+        let request_id = approval.request_id;
+        state.pending_gates.insert(approval).await.unwrap();
+
+        let mut auth = sample_pending_gate(
+            "alice",
+            sibling.id,
+            lunarwing_engine::ResumeKind::Authentication {
+                credential_name: "gitlab".into(),
+                instructions: "token".into(),
+                auth_url: None,
+            },
+        );
+        auth.conversation_id = conversation_id;
+        state.pending_gates.insert(auth).await.unwrap();
+
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = Some(state);
+
+        assert_eq!(
+            get_engine_pending_approval("alice", alice_thread.id.0)
+                .await
+                .unwrap()
+                .map(|view| view.request_id),
+            Some(request_id.to_string())
+        );
+        assert!(
+            get_engine_pending_approval("bob", alice_thread.id.0)
+                .await
+                .unwrap()
+                .is_none(),
+            "another user must never see this approval in their history"
+        );
+        assert!(
+            get_engine_pending_approval("alice", sibling.id.0)
+                .await
+                .unwrap()
+                .is_none(),
+            "an authentication gate is not an approvable tool approval"
+        );
+        assert!(
+            get_engine_pending_approval("alice", uuid::Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_none(),
+            "an unrelated thread surfaces nothing"
+        );
+
+        // A gate cleared by approval or cancellation disappears from history.
+        state_discard(&lock, "alice", alice_thread.id).await;
+        assert!(
+            get_engine_pending_approval("alice", alice_thread.id.0)
+                .await
+                .unwrap()
+                .is_none(),
+            "a resolved gate must not reappear in history"
+        );
+
+        *lock.write().await = None;
+    }
+
+    /// WI#520: an expired gate and a gate whose thread already terminated are
+    /// not offered to history as approvable.
+    #[tokio::test]
+    async fn history_approval_lookup_skips_expired_and_dead_thread_gates() {
+        use chrono::Duration;
+
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store.clone());
+
+        let live_thread = save_waiting_thread(&store, state.default_project_id, "alice").await;
+
+        let mut expired = sample_pending_gate(
+            "alice",
+            live_thread.id,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        expired.expires_at = chrono::Utc::now() - Duration::seconds(1);
+        state.pending_gates.insert(expired).await.unwrap();
+
+        let mut terminal = save_waiting_thread(&store, state.default_project_id, "alice").await;
+        terminal
+            .transition_to(lunarwing_engine::ThreadState::Failed, None)
+            .unwrap();
+        store.save_thread(&terminal).await.unwrap();
+        let dead_gate = sample_pending_gate(
+            "alice",
+            terminal.id,
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        state.pending_gates.insert(dead_gate).await.unwrap();
+
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = Some(state);
+
+        assert!(
+            get_engine_pending_approval("alice", live_thread.id.0)
+                .await
+                .unwrap()
+                .is_none(),
+            "an expired gate cannot be approved and must not be advertised"
+        );
+        assert!(
+            get_engine_pending_approval("alice", terminal.id.0)
+                .await
+                .unwrap()
+                .is_none(),
+            "a gate parked on a terminal thread must not be advertised"
+        );
+
+        *lock.write().await = None;
+    }
+
+    /// Discard a thread's gate the way a resolution does, so the history
+    /// lookup sees the same store the approval endpoint would.
+    async fn state_discard(
+        lock: &RwLock<Option<EngineState>>,
+        user_id: &str,
+        thread_id: lunarwing_engine::ThreadId,
+    ) {
+        let guard = lock.read().await;
+        let state = guard.as_ref().expect("engine state installed");
+        let key = crate::gate::pending::PendingGateKey {
+            user_id: user_id.to_string(),
+            thread_id,
+        };
+        state.pending_gates.discard(&key).await.unwrap();
+    }
+
     /// Work item #108 regression: an expired gate must resume the paused
     /// thread with an injected expiry result and deliver the wrap-up reply to
     /// the gate's source channel — not silently fail the thread.
