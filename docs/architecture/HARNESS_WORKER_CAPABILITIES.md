@@ -1,6 +1,7 @@
 # Harness Worker Capabilities (WI#326)
 
-Status: implemented; source revalidated 2026-10-29 for v2.1.7.0.
+Status: implemented; source revalidated 2026-11-01 for v2.1.8.0 (EE-8 and
+DZ-5 fixed).
 Owner: `ic/src/orchestrator/harness.rs`, with lifecycle ownership in
 `job_manager.rs` and HTTP completion handling in `api.rs`.
 
@@ -122,15 +123,18 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
     hex that covers secrets up to 3072 / 2048 raw bytes and leaks above;
     at any other width (`openssl base64` at 64, `base64 -w 32`) the whole
     encoding leaks for every secret from about 56 bytes up, with no upper
-    bound. The raw value itself is matched only directly, never
-    fold-matched (EE-8): `fold -w N` of an unencoded token leaks from 16
-    bytes up to fully. Two mounted values sharing a substring: on the
+    bound. The raw value itself is now fold-matched as well (EE-8 fixed
+    in v2.1.8.0): `fold -w N` of an unencoded token is caught at any
+    width. Two mounted values sharing a substring: on the
     folding slow path the sweep merges overlapping matches, but both
     fold-free passes — the `scrub_folded` fast path (encoded forms) and
     the direct pass (raw values) — still replace sequentially, so in
     fold-free text the non-overlapping tail of the second value can
     survive when only the overlapping form is printed (EE-9 residual,
-    WI#383).
+    WI#383). Per-line variants skip whitespace-only and low-entropy
+    lines (DZ-5 fixed in v2.1.8.0): lines with fewer than 3 distinct
+    non-whitespace characters are not armed, preventing over-redaction
+    of structural content and the resulting promotion rejections.
   - Tools can truncate **before** this boundary: shell capture is capped at
     64 KiB and then reduced to a 32 KiB head/tail result. Fragments at those
     internal cuts may survive. The partial-prefix check only protects the
@@ -280,11 +284,13 @@ cannot be listed).
 
 - Remaining !1542 Low/Info findings: structured-field extraction redaction
   gaps (`jq -r .field` output is decoded text, not an armed encoding),
-  low-entropy line over-redaction, temporary plaintext copies,
+  temporary plaintext copies,
   preparation/cleanup orphans, no promotion deadline, remaining synchronous
   filesystem cleanup on async tasks, and stronger delivery, sparse-file and
-  persisted-insert tests. Staged-path/audit scrubbing (DZ-6) and duplicate
-  `/complete` side effects (DZ-7/EA-7/EE-6) are fixed as described above.
+  persisted-insert tests. Low-entropy line over-redaction (DZ-5),
+  raw-value fold matching (EE-8), staged-path/audit scrubbing (DZ-6) and
+  duplicate `/complete` side effects (DZ-7/EA-7/EE-6) are fixed as described
+  above.
 - !1548 run-78 residuals (WI#383): per-event scrubbing runs synchronously
   inside the async `/event` handler — beyond the landed needle-length guard
   the proper shape is one per-job `aho-corasick` automaton over the folded
@@ -294,7 +300,7 @@ cannot be listed).
   near-wholly above the 4096-char arming cap and, at non-canonical widths,
   below it too (EE-2 — needs that automaton with
   aligned chunks); line-prefixed views (`read_file`, `cat -n`) defeat
-  folding (EE-7); the raw value is never fold-matched (EE-8); both
+  folding (EE-7); both
   fold-free passes — the `scrub_folded` fast path (encoded forms) and the
   direct pass (raw values) — still replace sequentially, so the
   non-overlapping tail of a second secret sharing a substring can survive
