@@ -97,6 +97,14 @@ cmp -s "$fixture/expected" "$env_file" || fail 'clean key/model env-file output 
 [[ "$output" == *'stop-tenant alice'* && "$output" == *'start-tenant alice'* ]] \
   || fail 'existing container did not produce restart guidance'
 
+# WI#506 migration: a tenant configured before this change has no backend key;
+# re-running configure-pebble pins the default without touching the key/model.
+printf 'NANOGPT_API_KEY=%s\nPEBBLE_MODEL=openai/test-model\n' "$secret" >"$env_file"
+configure_pebble alice "$secret" openai/test-model >/dev/null 2>&1 \
+  || fail 'legacy env-file migration was rejected'
+grep -Fxq 'PEBBLE_BASE_URL=https://nano-gpt.com/api' "$env_file" \
+  || fail 'legacy env file did not gain the default backend'
+
 # WI#506: an omitted --base-url preserves a configured backend, so rotating the
 # API key cannot silently re-point the lane at a different provider.
 EXISTING_BASE_URL='https://backend.example/v1'
@@ -128,12 +136,12 @@ mapfile -t calls <"$calls_log"
 # The typed subcommand is the point: a bare `inspect` resolves a container name
 # that is a prefix of the worker IPC volume (`*-ipc-v2`), a false-positive
 # existence match (see _ctr_inspect in mt-admin-lib/02-containers.sh).
-[[ ${#calls[@]} -eq 3 ]] || fail "expected three container inspections (got ${#calls[@]})"
+[[ ${#calls[@]} -eq 4 ]] || fail "expected four container inspections (got ${#calls[@]})"
 for call in "${calls[@]}"; do
   [[ "$call" == 'alice container inspect lunarwing-pebble-alice' ]] \
     || fail "unexpected container call: $call"
 done
 mapfile -t writes <"$writer_log"
-[[ ${#writes[@]} -eq 3 ]] || fail "clean configuration did not commit three env files (got ${#writes[@]})"
+[[ ${#writes[@]} -eq 4 ]] || fail "clean configuration did not commit four env files (got ${#writes[@]})"
 
 printf 'PASS: Pebble raw-key validation, env-file output, backend pinning, secret hygiene, and restart guidance\n'
