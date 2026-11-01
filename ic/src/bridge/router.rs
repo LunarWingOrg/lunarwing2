@@ -2285,6 +2285,47 @@ pub async fn get_engine_pending_gate(
     }
 }
 
+/// History-facing lookup (WI#520): the live Engine V2 *approval* gate parked
+/// on exactly `thread_id` for `user_id`.
+///
+/// `GET /api/chat/history` uses this to populate its `pending_approval`
+/// envelope, because Engine V2 parks approvals in this store instead of the
+/// legacy in-memory session and durable history carries no gate state. The
+/// match is strict on the gate's own thread: a hint that matches only a
+/// sibling thread's conversation must never surface here, since the envelope
+/// is rendered for one thread and the returned `request_id` is approvable.
+/// Only `ResumeKind::Approval` gates surface: authentication and external
+/// gates are not resolvable through the approval endpoint and keep their
+/// dedicated pending-gates/SSE flows. User scoping, expiry pruning and the
+/// live-thread filter match [`get_engine_pending_gate`].
+pub async fn get_engine_pending_approval(
+    user_id: &str,
+    thread_id: uuid::Uuid,
+) -> Result<Option<crate::gate::pending::PendingGateView>, Error> {
+    let Some(lock) = ENGINE_STATE.get() else {
+        return Ok(None);
+    };
+    let guard = lock.read().await;
+    let Some(state) = guard.as_ref() else {
+        return Ok(None);
+    };
+    let gates = filter_live_pending_gates(
+        &state.store,
+        state.pending_gates.list_for_user(user_id).await,
+    )
+    .await;
+    Ok(gates
+        .iter()
+        .find(|gate| {
+            gate.thread_id.0 == thread_id
+                && matches!(
+                    gate.resume_kind,
+                    lunarwing_engine::ResumeKind::Approval { .. }
+                )
+        })
+        .map(crate::gate::pending::PendingGateView::from))
+}
+
 /// Recover live approval/auth prompts lost during a gateway disconnect.
 ///
 /// Gates whose owning thread is gone or no longer `Waiting` are filtered out
