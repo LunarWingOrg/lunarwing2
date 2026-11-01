@@ -185,14 +185,30 @@ impl JobCanceller {
         if let Some(manager) = &self.job_manager {
             match manager.stop_job(job_id).await {
                 Ok(()) => delivered = true,
-                // Nothing to stop: another backend or the agent owns it.
-                Err(OrchestratorError::ContainerNotFound { .. }) => {}
+                // Nothing to stop: another backend or the agent owns it, or
+                // the container has not been created yet (empty container id).
+                Err(
+                    OrchestratorError::ContainerNotFound { .. }
+                    | OrchestratorError::InvalidContainerState { .. },
+                ) => {}
                 Err(OrchestratorError::JobFinalizing { .. }) => {
                     return Err(JobCancelError::Finalizing { job_id });
                 }
+                Err(OrchestratorError::Docker { .. }) => {
+                    // `stop_job` claims the terminal container state before
+                    // any Docker I/O, so this error lands after the claim and
+                    // the watcher will never complete this job. Treat the
+                    // cancellation as delivered — otherwise the context would
+                    // stay InProgress and the stuck sweep would flag a job
+                    // whose container handle is already Stopped. The reaper
+                    // cleans up a container that outlived the stop request.
+                    tracing::warn!(
+                        job_id = %job_id,
+                        "Container stop failed after claiming its terminal state during cancellation"
+                    );
+                    delivered = true;
+                }
                 Err(error) => {
-                    // The terminal container state is claimed before I/O, so
-                    // this is teardown noise (the runtime already went away).
                     tracing::warn!(
                         job_id = %job_id,
                         %error,
