@@ -6611,4 +6611,152 @@ mod tests {
         assert!(!is_loopback("worker.example.com"));
         assert!(!is_loopback("192.168.1.100"));
     }
+
+    // ── WI#464: external worker liveness probe ──────────────────────
+
+    /// Read the bound address of a fresh listener, then drop it so a
+    /// subsequent dial gets `Connection refused`.
+    async fn closed_loopback_addr() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral"); // safety: test
+        let addr = listener.local_addr().expect("local addr"); // safety: test
+        drop(listener);
+        addr
+    }
+
+    /// Spawn a minimal `lunarwing-agent-v1` worker on a loopback port: it
+    /// accepts one connection, sends a `ready` envelope, and keeps the socket
+    /// open long enough for the probe to complete the handshake.
+    async fn spawn_ready_worker() -> std::net::SocketAddr {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind worker"); // safety: test
+        let addr = listener.local_addr().expect("worker addr"); // safety: test
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let ready = serde_json::json!({
+                "id": "ready-1",
+                "type": "ready",
+                "timestamp": Utc::now().to_rfc3339(),
+                "payload": {
+                    "worker_id": "test-worker",
+                    "version": "test",
+                    "mode": "task",
+                    "capabilities": []
+                }
+            });
+            let _ = ws.send(Message::Text(ready.to_string().into())).await;
+            // Hold the socket briefly; the probe drops its side after ready.
+            let _ = ws.next().await;
+        });
+        addr
+    }
+
+    #[test]
+    fn probe_endpoint_display_has_no_token_or_path() {
+        // The display is host:port only — never the token, path or query.
+        assert_eq!(
+            probe_endpoint_display("ws://127.0.0.1:9000/ws/agent?token=secret"),
+            "loopback:9000"
+        );
+        assert_eq!(
+            probe_endpoint_display("ws://worker.example.com/kimi"),
+            "worker.example.com:80"
+        );
+        assert_eq!(
+            probe_endpoint_display("wss://worker.example.com/kimi"),
+            "worker.example.com:443"
+        );
+        // No userinfo/token material leaks through the display.
+        assert!(!probe_endpoint_display("ws://127.0.0.1:9000@host/ws").contains('@'));
+    }
+
+    #[tokio::test]
+    async fn probe_dead_socket_is_unreachable_with_reason() {
+        let addr = closed_loopback_addr().await;
+        let url = format!("ws://{addr}/ws/agent");
+        let result = probe_worker_endpoint(&url, None).await;
+        assert!(result.is_err(), "a closed listener must be unreachable");
+        // The reason names the transport failure, never a token.
+        let reason = result.unwrap_err();
+        assert!(!reason.contains("Bearer"));
+    }
+
+    #[tokio::test]
+    async fn probe_live_worker_completes_the_real_handshake() {
+        let addr = spawn_ready_worker().await;
+        let url = format!("ws://{addr}/ws/agent");
+        // Give the accept task a moment to be listening.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let result = probe_worker_endpoint(&url, Some("test-token")).await;
+        assert!(
+            result.is_ok(),
+            "a live worker must complete the ready handshake: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_probe_records_reachable_and_unreachable_state() {
+        // One live worker and one dead socket: the live one is reachable,
+        // the dead one is recorded unreachable, and startup is never gated.
+        let live = spawn_ready_worker().await;
+        let dead = closed_loopback_addr().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mgr = ExternalWorkerManager::new(vec![
+            ExternalWorkerConfig::test_config("live", &format!("ws://{live}/ws/agent")),
+            ExternalWorkerConfig::test_config("dead", &format!("ws://{dead}/ws/agent")),
+        ]);
+
+        // The probe returns normally (it never propagates a failure).
+        mgr.probe_all_workers().await;
+
+        let states = mgr.worker_probe_states();
+        assert_eq!(states.len(), 2, "both workers recorded");
+        let live_state = states.iter().find(|s| s.worker == "live").expect("live");
+        let dead_state = states.iter().find(|s| s.worker == "dead").expect("dead");
+        assert!(live_state.reachable, "live worker must read reachable");
+        assert!(!dead_state.reachable, "dead worker must read unreachable");
+        assert!(
+            dead_state.reason.is_some(),
+            "unreachable state carries a reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_worker_still_lets_dispatch_report_connection_failed() {
+        // The probe does not disable the worker or change dispatch: the first
+        // dispatch to a dead worker still returns ExternalWorkerConnectionFailed.
+        let dead = closed_loopback_addr().await;
+        let config = ExternalWorkerConfig::test_config("dead", &format!("ws://{dead}/ws/agent"));
+        let mgr = ExternalWorkerManager::new(vec![config]);
+
+        let job_id = Uuid::new_v4();
+        let result = mgr
+            .execute_task(
+                job_id,
+                "dead",
+                "hello",
+                None,
+                true,
+                TaskContext::default(),
+            )
+            .await;
+
+        match result {
+            Err(OrchestratorError::ExternalWorkerConnectionFailed { worker_name, .. }) => {
+                assert_eq!(worker_name, "dead");
+            }
+            other => panic!("expected ExternalWorkerConnectionFailed, got {other:?}"),
+        }
+    }
 }
