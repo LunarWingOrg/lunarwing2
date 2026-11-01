@@ -5,7 +5,7 @@ pub(crate) mod auth;
 mod estimation_tests;
 mod outcome;
 mod v1_history_import;
-use outcome::await_thread_outcome;
+use outcome::{await_thread_outcome, turn_history_metadata_key};
 
 use std::sync::{Arc, OnceLock};
 
@@ -3940,7 +3940,11 @@ async fn handle_with_engine_inner(
                     "started_at": message.received_at,
                 });
                 if let Err(error) = db
-                    .update_conversation_metadata_field(cid, "engine_turn_history", &reference)
+                    .update_conversation_metadata_field(
+                        cid,
+                        &turn_history_metadata_key(thread_id),
+                        &reference,
+                    )
                     .await
                 {
                     tracing::warn!(%error, "failed to persist Engine V2 turn history reference");
