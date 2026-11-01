@@ -45,6 +45,7 @@ pub mod auth;
 pub mod cron_worker;
 pub mod external_worker;
 pub mod harness;
+pub mod job_cancel;
 pub mod job_manager;
 pub mod reaper;
 
@@ -53,6 +54,7 @@ pub use auth::{CredentialGrant, McpCredentialGrant, TokenStore};
 pub use external_worker::{
     ExternalTaskResult, ExternalWorkerManager, WorkerProbeState, probe_configured_workers,
 };
+pub use job_cancel::{CancelPolicy, CancelReport, JobCancelError, JobCanceller};
 pub use harness::{
     HarnessError, HarnessJobOptions, InjectedFileProvenance, InjectionManifest, InjectionSpec,
     PromotionRecord, PromotionRejection, PromotionSummary, ResolvedSecretFile, SecretFileMount,
