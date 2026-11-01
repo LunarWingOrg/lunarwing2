@@ -834,8 +834,8 @@ Enforced controls (opencode2 lane unless noted):
    of the real entrypoint smoke or of a full affected-host `build-tenant`; the
    acceptance run is recorded below.
    **Affected-host acceptance (WI#511, 2026-11-01):**
-   `mt-admin build-opencode2-worker --no-cache` on a Gentoo/OpenRC host
-   (OpenRC 0.63.3/2.18, Podman 5.8.2, above the 4.5 floor) built the
+   `mt-admin build-opencode2-worker --no-cache` on a Gentoo 2.18 / OpenRC
+   0.63.3 host (Podman 5.8.2, above the 4.5 floor) built the
    candidate through `podman build --network=host` and step 38/48
    (`RUN --network=none bash /app/scripts/runtime_smoke_entrypoint.sh`)
    printed `runtime-smoke: 5/5 checks passed` — 3 listeners, only health/WS
