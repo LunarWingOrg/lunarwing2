@@ -1119,6 +1119,11 @@ _start_tenant_workers() {
       fi
     elif [[ "$INIT_SYSTEM" == "openrc" ]] && tenant_worker_enabled "$name" "$_w"; then
       say "$_w worker intentionally stopped for $name (skipping; use 'start-worker $name $_w')"
+    elif [[ "$_w" == "opencode" ]]; then
+      # WI#333 retired the v1 lane, so the historical --with-opencode hint would
+      # only lead the operator to a die. Existing tenants keep a selected lane;
+      # new ones use opencode2.
+      say "opencode v1 worker lane is retired (WI#333) and not selected for $name (use 'add-tenant $name --with-opencode2' for the supported lane)"
     else
       say "$_w worker not selected for $name (skipping; enable with 'add-tenant $name --with-$_w')"
     fi
