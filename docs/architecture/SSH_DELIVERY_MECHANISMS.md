@@ -1,12 +1,15 @@
 # SSH Delivery Mechanisms
 
-**Status:** As-built; source revalidated 2026-10-29 for v2.1.7.0. Worker socket
+**Status:** As-built; source revalidated 2026-11-01 for v2.1.8.0. Worker socket
 mounts are owned by `ic/scripts/mt-admin-lib/09-worker-config.sh` and generated
 units; direct execution by `ic/src/tools/builtin/{ssh,ssh_git}.rs` and
 `ic/src/bridge/ssh_client.rs`; WASM access by `ic/src/tools/wasm/wrapper.rs`.
-WI#424 adds a separate network requirement for worker SSH: the tenant's egress
-allowlist must permit the destination host and port. The signing socket does not
-grant network reachability. Kimi still receives no SSH-agent mount (WI#206).
+Since the WI#454 non-root split, the agent-socket mount is attached to the
+lane's **task** container (`TASK_MOUNTS` in `09-worker-config.sh`), not a single
+worker container. WI#424 adds a separate network requirement for worker SSH: the
+tenant's egress allowlist must permit the destination host and port. The signing
+socket does not grant network reachability. Kimi still receives no SSH-agent
+mount (WI#206).
 **Core design:** [`SSH_AGENT_HARNESS.md`](SSH_AGENT_HARNESS.md) — the per-tenant bridge, agent socket, secrets, and host-key verifier that all three mechanisms share.
 **Operator setup:** [`../ops/SSH-HARNESS-SETUP.md`](../ops/SSH-HARNESS-SETUP.md)
 
@@ -57,22 +60,27 @@ and how to enable it.
 
 **What it is.** The agent creates a background job on an external worker
 (pebble/opencode/opencode2; the kimi lane no longer mounts the agent socket —
-WI#206) with `create_job(mode="opencode", …)`. The worker
-container has the harness's ssh-agent socket directory bind-mounted and
-`SSH_AUTH_SOCK` set, so ordinary `git`/`ssh` inside the container authenticate
-through the daemon's agent. Keys stay in the daemon; the worker only gets
-signing capability via the socket.
+WI#206) with `create_job(mode="opencode", …)`. Since WI#454 each lane runs as a
+non-root **bridge/task pair** rather than a single container: the task
+container — the one that runs agent code — has the harness's ssh-agent socket
+directory bind-mounted and `SSH_AUTH_SOCK` set, so ordinary `git`/`ssh` inside
+it authenticate through the daemon's agent. The bridge identity holds the hub
+credential and does not get the agent socket, while the task container gets
+neither the bridge home nor its PID namespace; keys stay in the daemon, and only
+the task identity gets signing capability via the socket.
 
 **How it's enabled.** `ic/scripts/lunarwing-mt-admin.sh` wires this (post-split
 implementation in `mt-admin-lib/04-tenant-lifecycle.sh` and
 `mt-admin-lib/09-worker-config.sh`): it
 pre-creates the socket directory, starts the daemon (which binds the real
-socket inside it), then starts workers with `-v <run_dir>/ssh-agent:/tmp/ssh-agent:ro,z
--e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock`. `<run_dir>` is
+socket inside it), then starts the lane's task container with `-v
+<run_dir>/ssh-agent:/tmp/ssh-agent:ro,z
+-e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock` (the `TASK_MOUNTS` the
+`lunarwing-<lane>-task-<tenant>` container is launched with). `<run_dir>` is
 `/home/<tenant>/lunarwing/run`. The directory mount means a daemon restart's
 fresh socket inode is picked up at connect time — no worker recreate needed.
-Read-only prevents a worker from unlinking/replacing the host socket while
-preserving connections to the socket inode.
+Read-only prevents the task container from unlinking/replacing the host socket
+while preserving connections to the socket inode.
 Nothing for the operator to do beyond provisioning the host + key (see the ops
 guide).
 

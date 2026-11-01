@@ -1,11 +1,11 @@
 # Self-Heal Coverage Audit v2.0.4.0
 
 **Audit date:** 2026-08-03; ported and hardened on v2.0.5.0, 2026-08-05.
-**Status:** Historical audit, with source/registration update for v2.1.7.0 on 2026-10-29.
+**Status:** Historical audit, with source/registration update for v2.1.8.0 on 2026-11-01.
 **Reference reviewed:** `origin/aj/kimi-24-20260801-1203`
 **Ported from:** `origin/shexpansion/cmc/v2.0.4.0` (commit `d1d3c52`)
 
-## Current coverage (v2.1.7.0)
+## Current coverage (v2.1.8.0)
 
 `ic-infrastructure-health-check/tests/run-all.sh` registers **20 suites**, adding
 `worker-egress` to the previous 19. Run `bash tests/run-all.sh --list` from that
@@ -190,4 +190,26 @@ suites. CI invokes aggregate once through `.gitlab/scripts/shell-harnesses.sh`.
 > pipeline, and is documented in `SELF_HEAL_DEPLOYMENT_WIRING.md`. The
 > audit's detection/remedy table still describes the self-heal pipeline
 > itself.
+>
+> **Update (2026-11-01, covering the v2.1.7.0 cycle):** the `ORDER` list grew
+> from 19 to 20 suites with the WI#424 `worker-egress` suite
+> (`test-health-worker-egress.sh`, `e3a41b3c1`), the read-only host audit of
+> registry-selected workers described in the coverage section above. Within
+> the same v2.1.7.0 work item (goals item 46 of v2.1.7.0), `da1b80ca7` moved
+> the audit inside the root-owned health library and `a7075bf5c` dropped an
+> unused local. Later in the v2.1.7.0 cycle (goals item 91, the WI#454
+> worker split; `6e9652a2e`), `health-worker-egress.sh` extended
+> `running_worker_containers` to also enumerate the four per-lane
+> `lunarwing-<lane>-task-<tenant>` container names, so the audit covers both
+> halves of the non-root bridge/task pair. That change only widens the
+> container list; it adds no role-specific egress logic (`role` does not occur
+> in the script). `bash tests/run-all.sh --list` registers the same 20 suites
+> on the current tree (verified live). The audit's detection/remedy table
+> still describes the self-heal pipeline itself.
+>
+> **Update (2026-11-01, v2.1.8.0):** no file under
+> `ic-infrastructure-health-check/` changed in the 2.1.8.0 cycle to date
+> (`git log 578a8344b..HEAD -- ic-infrastructure-health-check/` is empty), so
+> the `ORDER` list and the pipeline scripts are unchanged from the end of
+> the 2.1.7.0 cycle.
 

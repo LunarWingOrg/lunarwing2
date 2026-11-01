@@ -1,11 +1,17 @@
 # SSH Agent Harness
 
-**Status:** As-built; source revalidated 2026-10-29 for v2.1.7.0.
+**Status:** As-built; source revalidated 2026-11-01 for v2.1.8.0.
 The bridge/config implementation is unchanged since the socket-directory mount
 fix. Source symbols below define the contract; historical dependency versions
 and static test counts are not deployment health evidence.
 
-WI#424 adds a separate worker network boundary in
+WI#454 split each worker lane into a non-root bridge/task pair. The SSH-agent
+socket directory now mounts into the lane's **task** container
+(`TASK_MOUNTS` in `ic/scripts/mt-admin-lib/09-worker-config.sh`), which runs the
+agent code; the bridge identity holds the hub credential and does not get the
+agent socket, while the task container gets neither the bridge home nor its PID
+namespace. WI#424 adds a separate worker
+network boundary in
 `ic/scripts/mt-admin-lib/15-worker-egress.sh`: tenant workers use an egress network
 with allowed LLM endpoints and operator-approved host/port pairs. A mounted
 signing socket alone cannot reach an SSH server. Worker destinations must be
@@ -28,7 +34,8 @@ verification, see the operator guide linked above.
 
 ## 1. What it is
 
-The SSH Agent harness gives LunarWing worker containers (Pebble, OpenCode, and
+The SSH Agent harness gives LunarWing worker **task** containers (the second half
+of each lane's non-root bridge/task pair — Pebble, OpenCode, and
 OpenCode 2; the Kimi Code lane no longer mounts the socket — WI#206 removed it
 because a headless auto-approved executor must not hold host credentials) a
 signing socket and gives interactive chat the built-in `ssh`,
@@ -73,7 +80,7 @@ provisioning may have different disk behavior.
 └───────────────────────────────────────┬─────────────────────────────────────────┘
                                          │  bind-mount (podman) + SSH_AUTH_SOCK
                                          ▼
-                        ┌──────────── worker container ────────────┐
+                        ┌──────────── task container ────────────┐
                         │  git / ssh  ──►  SSH_AUTH_SOCK  ──►  sign │
                         │  (pebble, opencode, opencode2)           │
                         └──────────────────────────────────────────┘
@@ -244,8 +251,9 @@ socket pre-creation and daemon-first ordering live in
    russh's signing keystore. Before daemon start, mt-admin preserves or
    atomically backfills the tenant's dedicated `SSH_API_TOKEN`; an upload
    failure retains the staged key and stops startup before workers launch.
-4. **Start workers** with the socket **directory** bind-mounted and
-   `SSH_AUTH_SOCK` set (including generated container service definitions):
+4. **Start the worker's task container** with the socket **directory**
+   bind-mounted and `SSH_AUTH_SOCK` set (including generated container service
+   definitions):
 
    ```
    -v <run_dir>/ssh-agent:/tmp/ssh-agent:ro,z -e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock
@@ -259,7 +267,7 @@ socket pre-creation and daemon-first ordering live in
    self-heals. The read-only mount prevents a compromised worker from unlinking
    the host socket and binding a fake agent for sibling workers; `connect(2)`
    still uses the socket inode's `0o666` permission. Shared `:z` relabeling
-   continues to allow multiple worker containers to access the socket. The
+   continues to allow multiple task containers to access the socket. The
    bumped launch contracts (`OPENCODE_/OPENCODE2_/PEBBLE_ROOTLESS_LAUNCH_CONTRACT`,
    marker `ssh-agent-dir-ro`) force-recreate imperative containers still
    carrying the old writable mount, including rootful/OpenRC launches. A
