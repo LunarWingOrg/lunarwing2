@@ -2213,6 +2213,18 @@ mt-admin builds also stamp `org.opencontainers.image.revision` with the source c
 podman image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' lunarwing-worker-kimi:latest
 ```
 
+WI#507 closed the one lane that did not follow this. `build_pebble_worker` used
+to take no source root and built from `${LUNARWING_ROOT}` — the operator's live
+checkout — so a tenant's pebble image could be stamped with a commit made in
+that checkout while the build ran, and uncommitted `pebble4lunarwing/` edits
+entered the image with only a `-dirty` suffix as evidence. It now takes a
+source root like the other three builders: `build-tenant` passes
+`tenant_lw_root <name>`, `build-all` passes the shared verified root (and its
+dirty-source refusal finally covers `pebble4lunarwing/`), and only the
+standalone `build-pebble-worker` subcommand keeps the operator root.
+`ic/scripts/tests/test-mt-admin-pebble-build-inputs.sh` pins both call sites
+and proves the tenant stamp is the tenant clone's HEAD.
+
 ### Upgrade ordering
 
 Since the `ironclaw-agent-v1` alias was removed (2.1.1), a 2.1.1 daemon offers only `lunarwing-agent-v1` and cannot connect to a worker container that still only accepts the legacy name — every dispatch to such a worker fails the WebSocket upgrade (HTTP 400, no echoed subprotocol) and surfaces as an external-worker connection failure whose reason includes the `lunarwing-agent-v1` / `ironclaw-agent-v1` hint. Workers are protocol-compatible in the other direction (2.1.1 workers accept the primary name only, which pre-2.1.1 daemons also offer), so the safe upgrade order is **workers first, then the daemon**, or — simplest — recreate worker containers in the same maintenance window as the daemon. mt-admin managed upgrades (`build-tenant`, `build-pebble-worker`, `build-opencode-worker`, `build-opencode2-worker`, `build-kimi-worker`, each followed by `restart-tenant`) rebuild the image and, through the image-ID contract above, recreate the worker containers; only manual deployments can strand a legacy-only worker.

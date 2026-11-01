@@ -170,6 +170,15 @@ shared image alone does not select it. Run long worker-image builds in `tmux`:
 sudo ic/scripts/lunarwing-mt-admin.sh build-pebble-worker
 ```
 
+That standalone command builds from the operator checkout. Tenant builds
+(`build-tenant <name> --with-pebble`, `build-all --with-pebble`) instead take
+the tenant clone: the Dockerfile, the build context and the `SOURCE_REVISION`
+stamp all follow `tenant_lw_root <name>`, so the image carries the tenant's
+pinned revision — the same commit the kimi lane on that tenant is stamped
+with — and an operator's uncommitted `pebble4lunarwing/` edits can never reach
+it (WI#507). `build-all --with-pebble` also refuses a dirty
+`pebble4lunarwing/` in a tenant checkout, like the other three lanes.
+
 ### Port Allocation
 
 `lunarwing-mt-admin.sh` initializes and migrates the ports registry before its
