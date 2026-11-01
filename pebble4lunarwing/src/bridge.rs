@@ -1598,11 +1598,9 @@ echo "TASK=$LUNARWING_TASK_ID"
         );
 
         // Completion releases the workspace claim and the relay slot.
-        let workspace = PathBuf::from(
-            Path::new(&workspace_root)
-                .canonicalize()
-                .expect("canonical root"),
-        );
+        let workspace = Path::new(&workspace_root)
+            .canonicalize()
+            .expect("canonical root");
         let mut released = false;
         for _ in 0..100 {
             if registry
@@ -1677,23 +1675,17 @@ echo "TASK=$LUNARWING_TASK_ID"
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         event_tx
             .send(ExecutorEvent::Progress(protocol::progress_envelope(
-                "task-ok",
-                "first",
+                "task-ok", "first",
             )))
             .expect("send first progress");
         event_tx
             .send(ExecutorEvent::Progress(protocol::progress_envelope(
-                "task-ok",
-                "second",
+                "task-ok", "second",
             )))
             .expect("send second progress");
         event_tx
             .send(ExecutorEvent::Result(protocol::result_envelope(
-                "task-ok",
-                "success",
-                "done",
-                None,
-                3,
+                "task-ok", "success", "done", None, 3,
             )))
             .expect("send result");
         drop(event_tx);
@@ -1709,9 +1701,6 @@ echo "TASK=$LUNARWING_TASK_ID"
             let envelope: Envelope = serde_json::from_str(text.as_str()).expect("envelope");
             msg_types.push(envelope.msg_type);
         }
-        assert_eq!(
-            msg_types,
-            ["task_progress", "task_progress", "task_result"]
-        );
+        assert_eq!(msg_types, ["task_progress", "task_progress", "task_result"]);
     }
 }
