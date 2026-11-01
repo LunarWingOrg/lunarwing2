@@ -7519,7 +7519,7 @@ pub(crate) mod tests {
         );
 
         // A gate cleared by approval or cancellation disappears from history.
-        state_discard(&lock, "alice", alice_thread.id).await;
+        state_discard(lock, "alice", alice_thread.id).await;
         assert!(
             get_engine_pending_approval("alice", alice_thread.id.0)
                 .await
