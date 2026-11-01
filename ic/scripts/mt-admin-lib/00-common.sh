@@ -201,6 +201,17 @@ _lifecycle_lock_preflight() {
   _lock_held_preflight "lifecycle for '$1'" "$TENANT_LIFECYCLE_LOCK_DIR/${1}.lock"
 }
 
+# WI#527 (run-300 TO-1): true when this process inherited the tenant's upgrade
+# lock — i.e. it is a child of the upgrade wrapper's own boundary, which holds
+# that inode for the whole run. A verb running there must never preflight the
+# lock (it would meet its own parent) and must never re-acquire it from a fresh
+# open-file description (a second description blocks even for the same process).
+upgrade_lock_inherited_for() {  # <name>
+  local name="$1" upgrade_fd="${LUNARWING_MT_INHERITED_UPGRADE_LOCK_FD:-}"
+  [[ "$upgrade_fd" =~ ^[0-9]+$ ]] || return 1
+  inherited_lock_fd_is_held "$upgrade_fd" "${BUILD_LOCK}.${name}.upgrade"
+}
+
 with_tenant_lifecycle_lock() {
   local name="$1"
   shift
