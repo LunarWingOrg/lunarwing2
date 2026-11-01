@@ -874,6 +874,38 @@ async fn execute_pending_gate_action(
     }
 }
 
+/// Fixed namespace for the deterministic user-default project id (WI#490).
+///
+/// Both default-project creation sites derive the id from the owner's user id
+/// alone, so two concurrent first messages (or a boot racing a message) mint
+/// the *same* record instead of two rows with different `ProjectId`s. The
+/// value is arbitrary but frozen: changing it would give a user with no
+/// existing default a different id, which is harmless but pointless.
+const DEFAULT_PROJECT_ID_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x3f1f_7a52_9c4e_4f6b_8d21_5e0c_9b7a_1d64);
+
+/// The id a user's `"default"` project always gets (WI#490).
+///
+/// Deterministic across processes and restarts, so the unlocked
+/// check-then-create in [`resolve_user_project`] is idempotent: every racer
+/// writes the same record (same id ⇒ same map key ⇒ same
+/// `engine/projects/default--<id8>/` directory), and a later resolution sees
+/// exactly one `"default"` project. It also keeps missions attached to that
+/// directory when a project.json that failed to load is rewritten at boot.
+fn default_project_id(user_id: &str) -> lunarwing_engine::ProjectId {
+    lunarwing_engine::ProjectId(uuid::Uuid::new_v5(
+        &DEFAULT_PROJECT_ID_NAMESPACE,
+        user_id.as_bytes(),
+    ))
+}
+
+/// A fresh `"default"` project carrying the deterministic per-user id.
+fn new_default_project(user_id: &str, description: &str) -> Project {
+    let mut project = Project::new(user_id, "default", description);
+    project.id = default_project_id(user_id);
+    project
+}
+
 /// Resolve the default project for a user, creating one if needed.
 ///
 /// In multi-user deployments each user gets their own project so threads,
@@ -907,8 +939,10 @@ async fn resolve_user_project(
         return Ok(project.id);
     }
 
-    // Create a new default project for this user
-    let project = lunarwing_engine::Project::new(user_id, "default", "Default project");
+    // Create a new default project for this user. The id is derived from the
+    // user id (WI#490) so a concurrent first message that reached the same
+    // "no default" answer writes the same record instead of a second one.
+    let project = new_default_project(user_id, "Default project");
     let pid = project.id;
     store
         .save_project(&project)
@@ -934,7 +968,9 @@ async fn resolve_owner_default_project(
         return Ok(project.id);
     }
 
-    let project = Project::new(owner_id, "default", "Default project for engine v2");
+    // Same deterministic id as the message path (WI#490), so boot and a
+    // first message can never split the owner's default project.
+    let project = new_default_project(owner_id, "Default project for engine v2");
     let project_id = project.id;
     store
         .save_project(&project)
@@ -6545,6 +6581,10 @@ pub(crate) mod tests {
         thread_load_started: Notify,
         continue_thread_load: Notify,
         fail_next_thread_save: AtomicBool,
+        /// Widen the default-project check-then-create window (WI#490): every
+        /// `save_project` yields before inserting, so concurrent racers all see
+        /// "no default" before any of them persists one.
+        yield_on_project_save: AtomicBool,
     }
 
     impl TestStore {
@@ -6559,6 +6599,7 @@ pub(crate) mod tests {
                 thread_load_started: Notify::new(),
                 continue_thread_load: Notify::new(),
                 fail_next_thread_save: AtomicBool::new(false),
+                yield_on_project_save: AtomicBool::new(false),
             }
         }
     }
@@ -6629,6 +6670,9 @@ pub(crate) mod tests {
             &self,
             project: &lunarwing_engine::Project,
         ) -> Result<(), lunarwing_engine::EngineError> {
+            if self.yield_on_project_save.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
             self.projects
                 .write()
                 .await
@@ -7941,6 +7985,72 @@ pub(crate) mod tests {
             let shuffled_dyn: Arc<dyn Store> = shuffled;
             assert_oldest_default_at_every_call_site(&shuffled_dyn, fallback, oldest.id).await;
         }
+    }
+
+    /// WI#490: the id a user's `"default"` project is created with depends only
+    /// on the owner, so the unlocked check-then-create is idempotent instead of
+    /// minting a second `"default"` project per racer.
+    #[test]
+    fn default_project_ids_are_deterministic_per_user() {
+        assert_eq!(default_project_id("bob"), default_project_id("bob"));
+        assert_ne!(default_project_id("bob"), default_project_id("carol"));
+
+        let created = new_default_project("bob", "Default project");
+        assert_eq!(created.id, default_project_id("bob"));
+        assert_eq!(created.name, "default");
+        assert_eq!(created.user_id, "bob");
+    }
+
+    /// WI#490: concurrent first messages, and a boot racing them, must leave
+    /// exactly one `"default"` project for the user — the split the issue
+    /// describes attached missions and conversations to whichever duplicate a
+    /// resolution happened to pick.
+    ///
+    /// `yield_on_project_save` widens the window so a pre-fix build reliably
+    /// fails here: every racer lists (empty) before any racer persists.
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_default_project_creation_leaves_one_project() {
+        let store = Arc::new(TestStore::new());
+        store.yield_on_project_save.store(true, Ordering::SeqCst);
+        let store_dyn: Arc<dyn Store> = store.clone();
+        let fallback = Project::new("alice", "default", "engine default").id;
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let store = store_dyn.clone();
+            handles.push(tokio::spawn(async move {
+                let routed = resolve_user_project(&store, "bob", fallback)
+                    .await
+                    .expect("resolve routing project");
+                let boot = resolve_owner_default_project(&store, "bob")
+                    .await
+                    .expect("resolve owner project");
+                (routed, boot)
+            }));
+        }
+
+        let mut resolved = HashSet::new();
+        for handle in handles {
+            let (routed, boot) = handle.await.expect("join project resolution");
+            assert_eq!(routed, boot, "boot and message paths must agree");
+            resolved.insert(routed);
+        }
+        assert_eq!(resolved.len(), 1, "every racer must resolve one project");
+
+        let defaults: Vec<Project> = store
+            .projects
+            .read()
+            .await
+            .values()
+            .filter(|project| project.user_id == "bob" && project.name == "default")
+            .cloned()
+            .collect();
+        assert_eq!(
+            defaults.len(),
+            1,
+            "exactly one default project may persist per user"
+        );
+        assert_eq!(defaults[0].id, default_project_id("bob"));
     }
 
     #[tokio::test]
