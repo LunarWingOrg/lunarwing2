@@ -52,7 +52,8 @@ sudo ic/scripts/lunarwing-mt-admin.sh add-tenants "Ruffles,Miyuki,Sparkie,Starfo
 
 > **Optional services are explicit selections.** Add `--enable-proxy` or
 > `--enable-darkirc` to provision those sidecars. Add `--with-pebble`,
-> `--with-opencode`, or `--with-kimi` to select workers for these tenants.
+> `--with-opencode2`, or `--with-kimi` to select workers for these tenants
+> (the opencode v1 lane is retired, WI#333).
 > Building a shared worker image does not select that worker. Re-running
 > `add-tenant <name>` with one of these flags enables it for an existing tenant;
 > omitting a flag never disables an already-selected service. Selection is
@@ -86,7 +87,7 @@ Include WASM extensions and/or shared worker images:
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh build-all --with-wasm
-sudo ic/scripts/lunarwing-mt-admin.sh build-all --with-pebble --with-opencode --with-kimi
+sudo ic/scripts/lunarwing-mt-admin.sh build-all --with-pebble --with-opencode2 --with-kimi
 ```
 
 Use `--with-toolchains` with the OpenCode or Kimi image flags when those workers
@@ -531,7 +532,7 @@ OpenRC scripts live in `/etc/init.d/`; the baseline is
 `lunarwing-<name>`, `xmpp-bridge-<name>`, and `lunarwing-pg-<name>`.
 WeeChat and its adapter are present by default. Proxy and DarkIRC scripts are
 rendered only when selected, while LunarVision, LunarVoice, and selected
-Pebble/OpenCode/Kimi workers get container services when provisioned. Rootless
+Pebble/OpenCode 2/Kimi workers get container services when provisioned. Rootless
 Podman PostgreSQL, LunarVision, LunarVoice, and worker containers also get
 `<container>-sup` babysitter services. For LunarVision,
 `lunarwing-vision-<name>` provides health-aware status and
@@ -826,11 +827,11 @@ sudo scripts/lunarwing-mt-admin.sh build-all
 sudo scripts/lunarwing-mt-admin.sh build-all --with-wasm
 
 # Include worker images
-sudo scripts/lunarwing-mt-admin.sh build-all --with-pebble --with-opencode --with-kimi
+sudo scripts/lunarwing-mt-admin.sh build-all --with-pebble --with-opencode2 --with-kimi
 
 # Build worker images standalone
 sudo scripts/lunarwing-mt-admin.sh build-pebble-worker
-sudo scripts/lunarwing-mt-admin.sh build-opencode-worker
+sudo scripts/lunarwing-mt-admin.sh build-opencode2-worker
 sudo scripts/lunarwing-mt-admin.sh build-kimi-worker
 ```
 
@@ -882,7 +883,7 @@ add-tenants <names> [options]    Apply the same options to comma-separated names
   --enable-proxy                 Provision the optional TensorZero proxy
   --enable-darkirc               Provision DarkIRC daemon and adapter
   --with-pebble                  Select Pebble for these tenants
-  --with-opencode                Select OpenCode for these tenants
+  --with-opencode2               Select OpenCode 2 for these tenants
   --with-kimi                    Select Kimi Code for these tenants
   --xmpp-jid <jid>               XMPP JID for add-tenant
   --xmpp-domain <domain>         XMPP domain for add-tenants
@@ -899,12 +900,11 @@ build-all                        Build registered tenants sequentially
   --with-wasm                    Also build WASM extensions
   --require-wasm                 Fail rather than preserve stale WASM (build-tenant)
   --with-pebble                  Also build the shared Pebble image
-  --with-opencode                Also build the shared OpenCode image
+  --with-opencode2               Also build the shared OpenCode 2 image
   --with-kimi                    Also build the shared Kimi Code image
-  --with-toolchains              Use full toolchain OpenCode/Kimi images
+  --with-toolchains              Use full toolchain OpenCode 2/Kimi images
 
 build-pebble-worker              Build the Pebble image
-build-opencode-worker            Build the OpenCode image
 build-opencode2-worker           Build the OpenCode 2 image
 build-kimi-worker                Build the Kimi Code image
   --no-cache                     Force a clean image rebuild

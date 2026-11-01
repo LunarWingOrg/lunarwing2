@@ -161,7 +161,6 @@ Build optional shared components before starting tenants that require them:
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh build-darkirc
 sudo ic/scripts/lunarwing-mt-admin.sh build-pebble-worker
-sudo ic/scripts/lunarwing-mt-admin.sh build-opencode-worker
 sudo ic/scripts/lunarwing-mt-admin.sh build-opencode2-worker
 sudo ic/scripts/lunarwing-mt-admin.sh build-kimi-worker
 sudo ic/scripts/lunarwing-mt-admin.sh build-vision-sidecar

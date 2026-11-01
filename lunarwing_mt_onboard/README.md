@@ -11,7 +11,8 @@ Guides an operator through the full provisioning lifecycle for a new tenant:
 2. Secrets generation (gateway token, PG password, SECRETS_MASTER_KEY)
 3. LLM provider configuration
 4. XMPP and Gotify channel setup
-5. External worker selection (Pebble, OpenCode, OpenCode 2, Kimi Code)
+5. External worker selection (Pebble, OpenCode 2, Kimi Code — the opencode
+   v1 lane is retired, WI#333)
 6. Build (with live log output)
 7. Start and post-start verification
 
@@ -278,7 +279,7 @@ rootful daemon socket):
   "gotify_enabled": false,
   "gotify_url": "",
   "gotify_title": "",
-  "workers": ["pebble", "opencode"],
+  "workers": ["pebble", "opencode2"],
   "toolchains": false,
   "llm_base_url": "",
   "llm_model": "tensorzero::function_name::FrontierCODE",

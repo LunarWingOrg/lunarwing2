@@ -74,7 +74,7 @@ sudo LUNARWING_SERVICE_MANAGER=systemd LUNARWING_CONTAINER_RUNTIME=podman \
 ```
 
 Important boolean flags include `--enable-proxy`, `--enable-darkirc`,
-`--with-pebble`, `--with-opencode`, `--with-kimi`, `--no-health`, `--no-ssh`,
+`--with-pebble`, `--with-opencode2`, `--with-kimi`, `--no-health`, `--no-ssh`,
 and `--no-weechat-bootstrap`. Value flags include `--xmpp-jid`,
 `--xmpp-password`, `--llm-api-key`, `--llm-base-url`, `--llm-model`,
 `--tensorzero-url`, `--gotify-url`, `--gateway-host`, and worker model/base-URL

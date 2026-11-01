@@ -183,7 +183,7 @@ keep mode `0600`, and delete it from both hosts once the import is verified.
 ```bash
 sudo ic/scripts/import-tenant.sh /var/lib/lunarwing-migrate/<tenant>-migrate-<stamp>.7z \
      --start --old-stopped \
-     [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains] \
+     [--with-pebble] [--with-kimi] [--with-toolchains] \
      [--with-vision] [--docker-group]   # --dry-run first
 ```
 Import accepts only a single-link bundle owned by root or the validated invoking
@@ -194,7 +194,16 @@ injects carried secrets (including verbatim-verified `SECRETS_MASTER_KEY`) →
 restore under one lifecycle/writer-lock boundary when present → restores generic
 `state/` (never `state/darkirc`) →
 `install-wasm` → WeeChat preflight → optional start. Supported worker flags and
-`--with-toolchains` are passed through to `build-tenant`. `--with-vision` builds the LunarVision sidecar image before start; if
+`--with-toolchains` are passed through to `build-tenant`.
+
+**`--with-opencode` is retired (WI#333).** Import still accepts the flag so a
+migration note written before v2.1.8.0 does not fail, but it warns and drops the
+v1 lane: the tenant is imported without it, and neither a carried
+`OPENCODE_MODEL`/`OPENCODE_BASE_URL` nor `--with-opencode` reaches `add-tenant`
+or `build-tenant` (both refuse the retired lane). Select the supported lane
+instead — `mt-admin add-tenant <tenant> --with-opencode2` — and note that a
+legacy tenant carrying `workers.opencode=true` keeps that selection only on its
+original host; a cross-host migration brings no v1 lane across. `--with-vision` builds the LunarVision sidecar image before start; if
 the bundle contains `manifest-vision.env`, import injects the carried `VL_URL`,
 `VL_MODEL` into the target `vision.env`. Import deliberately ignores auth tokens
 from older bundles so the target-generated `LUNARWING_AUTH_TOKEN` and daemon
