@@ -1052,10 +1052,24 @@ longer published:
   `opencode4lunarwing/` on `upgrade-tenant`, and the Dockerfile and
   `worker-inputs.sha256` manifest stay validated (`BUILDABLE_WORKERS` in
   `validate_config.py`). Provision new tenants with `--with-opencode2`.
+- `build-all` no longer accepts the flag either, so on a host with several
+  legacy tenants `upgrade-tenant` is the only path that rebuilds a v1 image.
+  Their lane still starts and stops normally.
+- Import does not die on a pre-retirement bundle: `import-tenant.sh` (and the
+  Kawarimi and `lunarwing_mt_onboard` drivers) accept `--with-opencode` and a
+  carried `OPENCODE_MODEL`/`OPENCODE_BASE_URL`, warn once naming WI#333, and
+  drop them. An import therefore stages a tenant with **no** v1 lane, and a
+  cross-host move brings no v1 lane across — users still on v1 must be moved to
+  opencode2 as part of the migration.
 
 The reason is unchanged and upstream (WI#320 F4, WI#333): at the pinned
 v1.18.25 every task fails at session start. The retired-lane reference
 material follows.
+
+> **Release-notes entry owed:** there is no `docs/releases/RELEASE-v2.1.8.0.md`
+> yet. Whoever writes it must carry this retirement as a user-visible change
+> (lane removed, selection refused, CI publication stopped, import drops an
+> inherited selection) — WI#333's ask names the release notes explicitly.
 
 [opencode](https://opencode.ai) (anomalyco/opencode, formerly sst/opencode) integrated as a persistent LunarWing external worker. A Bun/TypeScript bridge wraps the `@opencode-ai/sdk` and translates between the opencode session/event model and the `lunarwing-agent-v1` WebSocket protocol. The opencode headless server runs internally on `127.0.0.1:4096` (not exposed). Health on 8443, WebSocket on 9090.
 
