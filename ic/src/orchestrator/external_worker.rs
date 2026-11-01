@@ -2425,47 +2425,56 @@ struct WorkerProbeOutcome {
     failures: Vec<(String, String)>,
 }
 
-/// WI#464: probe one worker's endpoint list.  The worker is reachable if
-/// *any* endpoint completes the handshake (matches the dispatch LB-fallback
-/// shape).  When every endpoint fails, the first failure's reason and
-/// endpoint are reported, along with every failed endpoint for logging.
+/// WI#464: probe one worker's endpoint list.  Every endpoint is dialed (not
+/// just until the first success) so a dead endpoint beside a live one is
+/// visible; the worker is reachable if *any* endpoint completes the handshake,
+/// matching the dispatch LB-fallback shape.  All endpoints are dialed
+/// concurrently and each is bounded by [`WORKER_LIVENESS_PROBE_TIMEOUT`], so
+/// the pass costs one probe timeout per worker, not per endpoint.
 async fn probe_worker_config(
     worker_name: &str,
     endpoints: &[WorkerEndpoint],
 ) -> WorkerProbeOutcome {
-    let mut failures: Vec<(String, String)> = Vec::new();
-
-    for endpoint in endpoints {
+    let probes = endpoints.iter().map(|endpoint| {
         let display = probe_endpoint_display(&endpoint.url);
         let token = endpoint.auth_token.as_ref().map(|s| s.expose_secret());
-        match probe_worker_endpoint(worker_name, &endpoint.url, token).await {
+        async move {
+            let result = probe_worker_endpoint(worker_name, &endpoint.url, token).await;
+            (display, result)
+        }
+    });
+    let results = futures::future::join_all(probes).await;
+
+    let mut failures: Vec<(String, String)> = Vec::new();
+    let mut reachable_display: Option<String> = None;
+    for (display, result) in results {
+        match result {
             Ok(()) => {
-                return WorkerProbeOutcome {
-                    state: WorkerProbeState {
-                        worker: worker_name.to_string(),
-                        reachable: true,
-                        reason: None,
-                        endpoint_display: display,
-                        last_probe: Utc::now(),
-                    },
-                    failures,
-                };
+                if reachable_display.is_none() {
+                    reachable_display = Some(display);
+                }
             }
             Err(reason) => failures.push((display, reason)),
         }
     }
 
-    let (endpoint_display, reason) = failures
-        .first()
-        .cloned()
-        .map(|(display, reason)| (display, Some(reason)))
-        .unwrap_or_else(|| ("no endpoint".to_string(), None));
+    // Reachable if at least one endpoint answered (an empty endpoint list is
+    // unreachable).  Prefer an endpoint that answered; otherwise report the
+    // first failure so the log still names a concrete host.
+    let reachable = endpoints.len() > failures.len();
+    let endpoint_display = match reachable_display {
+        Some(display) => display,
+        None => failures
+            .first()
+            .map(|(display, _)| display.clone())
+            .unwrap_or_else(|| "no endpoint".to_string()),
+    };
 
     WorkerProbeOutcome {
         state: WorkerProbeState {
             worker: worker_name.to_string(),
-            reachable: false,
-            reason,
+            reachable,
+            reason: failures.first().map(|(_, reason)| reason.clone()),
             endpoint_display,
             last_probe: Utc::now(),
         },
