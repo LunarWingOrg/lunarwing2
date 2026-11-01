@@ -1591,18 +1591,26 @@ _upgrade_checkout() {  # <name> <lw_root> <ref-name> <commit> <create-branch:tru
 # never affects the running lanes, which still point at :latest.
 cleanup_candidate_workers() {  # <name>
   local name="$1" lane candidate_ref
-  local -a lanes=()
+  local -a lanes=() kept=()
   mapfile -t lanes < <(upgrade_candidate_lanes "$name")
   [[ "${#lanes[@]}" -gt 0 ]] || return 0
   if [[ -n "${CONTAINER_RT:-}" && -n "$(command -v "$CONTAINER_RT" 2>/dev/null)" ]]; then
     for lane in "${lanes[@]}"; do
       _upgrade_validate_lane "$lane" || continue
       candidate_ref="$(upgrade_candidate_image_ref "$name" "$lane")"
-      "$CONTAINER_RT" rmi "$candidate_ref" >/dev/null 2>&1 || true
+      "$CONTAINER_RT" rmi "$candidate_ref" >/dev/null 2>&1 || kept+=("$lane")
     done
+  else
+    kept=("${lanes[@]}")
   fi
   _ensure_marker_dir
-  : >"$(tenant_candidate_lanes_file "$name")"
+  # TD-13: only forget lanes whose image was actually removed, so a skipped rmi
+  # stays visible to the next cleanup instead of leaking a stale candidate.
+  if [[ "${#kept[@]}" -eq 0 ]]; then
+    : >"$(tenant_candidate_lanes_file "$name")"
+  else
+    printf '%s\n' "${kept[@]}" >"$(tenant_candidate_lanes_file "$name")"
+  fi
 }
 
 # Build every selected worker image to a candidate tag while the tenant runs.
@@ -1635,16 +1643,22 @@ upgrade_build_candidates_prestop() {  # <name> <lw_root> <previous_commit> <pebb
 # with explicit rollback commands — never as "restored".
 upgrade_converge_after_failure() {  # <name> <lw_root> <previous_commit> <cause>
   local name="$1" lw_root="$2" previous_commit="$3" cause="$4"
-  local describe_prev rc=0 caller_errexit=false
+  local describe_prev rc=0 caller_errexit=false stage_state stage_note=""
   describe_prev="$(sudo -u "$name" git -c safe.directory="$lw_root" -C "$lw_root" \
     describe --tags --always "$previous_commit" 2>/dev/null || printf '%s' "$previous_commit")"
   [[ $- != *e* ]] || caller_errexit=true
 
-  if ! upgrade_daemon_stage_completed "$name"; then
+  # run-294 TJ-9: tri-state, never fail-open on a missing/unreadable marker.
+  stage_state="$(upgrade_daemon_stage_state "$name")"
+  [[ "$stage_state" == unknown ]] \
+    && stage_note=" (build stage unreadable; treating it as past the daemon build)"
+
+  if [[ "$stage_state" == none ]]; then
     say "" >&2
     say "upgrade aborted: $cause; the new daemon was not built, restarting tenant '$name' on its previous build (WI#527) ..." >&2
     # TD-4: restore any already-promoted worker :latest tags before restarting.
-    restore_promoted_workers "$name" 2>/dev/null || true
+    restore_promoted_workers "$name" \
+      || say "WARNING: could not restore every worker :latest tag; see the warnings above" >&2
     set +e
     ( start_tenant "$name" )
     rc=$?
@@ -1657,15 +1671,20 @@ upgrade_converge_after_failure() {  # <name> <lw_root> <previous_commit> <cause>
   fi
 
   say "" >&2
-  say "upgrade aborted: $cause; the new daemon was built, so restoring tenant '$name' to $describe_prev by rebuilding it (WI#527) ..." >&2
+  say "upgrade aborted: $cause; the new daemon was built$stage_note, so restoring tenant '$name' to $describe_prev by rebuilding it (WI#527) ..." >&2
   # TD-4: restore old worker :latest tags before rebuilding the previous daemon
   # so a "restored" report never leaves new worker images beside the old daemon.
-  restore_promoted_workers "$name" 2>/dev/null || true
+  restore_promoted_workers "$name" \
+    || say "WARNING: could not restore every worker :latest tag; see the warnings above" >&2
   set +e
   (
     set -e
     _upgrade_checkout "$name" "$lw_root" "$previous_commit" "$previous_commit" false
-    build_tenant "$name" "true" "false" "false" "false" "false" "true" "false"
+    # TJ-8: non-strict WASM. If the target build failed *because* the WASM
+    # toolchain is broken, a strict restore fails the same way and leaves the
+    # tenant stopped although the previous binary and its installed artifacts
+    # are fine.
+    build_tenant "$name" "true" "false" "false" "false" "false" "false" "false"
     render_tenant_units "$name"
     patch_tenant_env "$name"
     start_tenant "$name"
@@ -1729,6 +1748,9 @@ upgrade_tenant_locked() {
 
   local build_lock_fd migrations_type previous_commit
   say "acquiring build lock for checkout ..."
+  # run-294 TJ-12: fail fast instead of blocking silently on an inherited build
+  # lock (WI#526 class) while other tenants wait.
+  _lock_held_preflight "candidate build for '$name'" "$BUILD_LOCK"
   exec {build_lock_fd}>"$BUILD_LOCK" || die "failed to open build lock for checkout"
   flock -x "$build_lock_fd" || die "failed to acquire build lock for checkout"
   prepare_tenant_checkout "$name" "$lw_root" "$target_commit"
