@@ -2236,16 +2236,18 @@ async fn run_probe_pass(
     let mut reachable_count = 0usize;
     let mut unreachable_count = 0usize;
     for handle in handles {
-        let outcome = handle.await.unwrap_or_else(|join_error| WorkerProbeOutcome {
-            state: WorkerProbeState {
-                worker: "?".to_string(),
-                reachable: false,
-                reason: Some(format!("probe task panicked: {join_error}")),
-                endpoint_display: "unknown".to_string(),
-                last_probe: Utc::now(),
-            },
-            failures: Vec::new(),
-        });
+        let outcome = handle
+            .await
+            .unwrap_or_else(|join_error| WorkerProbeOutcome {
+                state: WorkerProbeState {
+                    worker: "?".to_string(),
+                    reachable: false,
+                    reason: Some(format!("probe task panicked: {join_error}")),
+                    endpoint_display: "unknown".to_string(),
+                    last_probe: Utc::now(),
+                },
+                failures: Vec::new(),
+            });
         if outcome.state.reachable {
             reachable_count += 1;
         } else {
@@ -6910,7 +6912,8 @@ mod tests {
         let dead = closed_loopback_addr().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let mut config = ExternalWorkerConfig::test_config("kimi", &format!("ws://{live}/ws/agent"));
+        let mut config =
+            ExternalWorkerConfig::test_config("kimi", &format!("ws://{live}/ws/agent"));
         config.endpoints = vec![
             WorkerEndpoint {
                 url: format!("ws://{live}/ws/agent"),
