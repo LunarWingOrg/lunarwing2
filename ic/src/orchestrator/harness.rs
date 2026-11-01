@@ -2952,4 +2952,65 @@ mod tests {
         assert_eq!(removed, 0);
         assert!(tmp.path().join(stale_a.to_string()).exists());
     }
+
+    #[test]
+    fn redactor_fold_matches_raw_value_at_any_width() {
+        // EE-8: `fold -w N` of a raw token leaked because the raw value was
+        // only matched directly, never fold-matched.  Now the raw value is in
+        // the folded list, so a wrapped raw value is caught at any width.
+        let value = "raw-fixture-secret-value-0123456789";
+        let redactor = SecretValueRedactor::new(&[SecretString::from(value.to_string())]);
+        // Simulate `fold -w 16` of the raw value — a newline every 16 chars.
+        let folded_raw: String = value
+            .as_bytes()
+            .chunks(16)
+            .map(|c| std::str::from_utf8(c).unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = format!("prefix\n{folded_raw}\nsuffix");
+        let scrubbed = redactor.scrub(&text);
+        assert!(
+            !scrubbed.contains(value),
+            "raw value wrapped at non-canonical width must be scrubbed"
+        );
+        assert!(scrubbed.contains("[redacted-secret]"));
+    }
+
+    #[test]
+    fn redactor_does_not_over_redact_low_entropy_lines() {
+        // DZ-5: whitespace-only and structural lines (≥8 bytes) should not
+        // be armed as per-line variants — they over-redact unrelated files.
+        let value =
+            "-----BEGIN FIXTURE-----\n        \nline-one-fixture-material\n-----END FIXTURE-----";
+        let redactor = SecretValueRedactor::new(&[SecretString::from(value.to_string())]);
+        // A line of 10 spaces is ≥8 bytes but low-entropy: it must NOT be
+        // armed as a variant, so unrelated text containing 10 spaces
+        // survives un-redacted.
+        let spaces = "          "; // 10 spaces
+        let text = format!("unrelated content{spaces}here");
+        let scrubbed = redactor.scrub(&text);
+        assert!(
+            scrubbed.contains(spaces),
+            "whitespace-only line must not be armed as a variant"
+        );
+        assert_eq!(
+            scrubbed, text,
+            "no redaction should occur on unrelated text"
+        );
+    }
+
+    #[test]
+    fn is_low_entropy_line_classifies_correctly() {
+        // Whitespace-only lines are low-entropy.
+        assert!(is_low_entropy_line("        "));
+        assert!(is_low_entropy_line("\t\t\t\t\t\t\t\t"));
+        // Short lines are low-entropy (below MIN_REDACTED_SECRET_BYTES).
+        assert!(is_low_entropy_line("short"));
+        // Structural lines with few distinct non-whitespace chars.
+        assert!(is_low_entropy_line("{{{{{{{{"));
+        assert!(is_low_entropy_line(",,,,,,,,"));
+        // High-entropy lines are NOT low-entropy.
+        assert!(!is_low_entropy_line("line-one-fixture-material"));
+        assert!(!is_low_entropy_line("harness-fixture-password"));
+    }
 }
