@@ -964,7 +964,34 @@ main() {
       promote_name="$(sanitize_name "$1")"
       ports_registry_init
       tenant_exists_in_registry "$promote_name" || die "tenant '$promote_name' not found in registry"
+      # run-294 TJ-5: refuse to promote under a running upgrade of the same
+      # tenant (a promote could otherwise race its candidate build).
+      _lock_held_preflight "upgrade for '$promote_name'" "${BUILD_LOCK}.${promote_name}.upgrade"
       promote_candidate_workers "$promote_name"
+      ;;
+
+    restore-worker-images)
+      # run-294 TJ-5: re-tag the worker images recorded before a promote so a
+      # failed upgrade can be rolled back without rebuilding them.
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: restore-worker-images <name>"
+      local restore_name
+      restore_name="$(sanitize_name "$1")"
+      ensure_container_runtime
+      _ensure_marker_dir
+      restore_promoted_workers "$restore_name"
+      ;;
+
+    cleanup-worker-candidates)
+      # run-294 TJ-13: discard this run's candidate images (and keep the ones that
+      # could not be removed visible in the lane file for a later retry).
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: cleanup-worker-candidates <name>"
+      local cleanup_name
+      cleanup_name="$(sanitize_name "$1")"
+      ensure_container_runtime
+      _ensure_marker_dir
+      cleanup_candidate_workers "$cleanup_name"
       ;;
 
     build-worker-candidates)
@@ -991,13 +1018,18 @@ main() {
       cand_name="$(sanitize_name "$cand_name")"
       ports_registry_init
       tenant_exists_in_registry "$cand_name" || die "tenant '$cand_name' not found in registry"
+      # run-294 TJ-5: a candidate build may not race a running upgrade of the
+      # same tenant (they share the candidate tag).
+      _lock_held_preflight "upgrade for '$cand_name'" "${BUILD_LOCK}.${cand_name}.upgrade"
       build_candidate_workers "$cand_name" "$cand_oc" "$cand_kimi" "$cand_oc2" "$cand_pebble" "false"
       ;;
 
     last-build-stage)
       # WI#527: the last build stage completed for <name> (daemon, bridge, wasm,
       # worker:<lane>, or none). Read by the upgrade wrapper to decide whether a
-      # restart would start a newly built binary.
+      # restart would start a newly built binary. Read-only, but the marker lives
+      # in the root-owned lock dir (TJ-13 keeps root-only access explicit).
+      require_root
       [[ -n "${1:-}" ]] || die "usage: last-build-stage <name>"
       upgrade_last_completed_stage "$(sanitize_name "$1")"
       ;;
@@ -1005,12 +1037,11 @@ main() {
     reset-build-stage)
       # TD-5: reset the build stage marker so a stale marker from a prior run
       # cannot mislead convergence. Called by the upgrade wrapper before the stop.
+      require_root
       [[ -n "${1:-}" ]] || die "usage: reset-build-stage <name>"
-      local rbs_name rbs_file
+      local rbs_name
       rbs_name="$(sanitize_name "$1")"
-      rbs_file="$(tenant_build_stage_file "$rbs_name")"
-      _ensure_marker_dir
-      : >"$rbs_file"
+      _reset_build_stage_file "$rbs_name"
       ;;
 
     build-sandbox-image)
