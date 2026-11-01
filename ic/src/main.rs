@@ -1214,6 +1214,20 @@ async fn async_main() -> anyhow::Result<()> {
         mgr.spawn_eviction_task(shutdown_tx.subscribe());
         // WI#325: mission supervisors for cron-mode external workers.
         mgr.spawn_cron_supervisors(&config.owner_id, shutdown_tx.subscribe());
+
+        // WI#464: probe every configured external worker so a dead socket is
+        // an ERROR line in daemon.log instead of an invisible dispatch
+        // failure.  The probe runs in a background task and waits out a
+        // startup grace first: mt-admin starts this service before it starts
+        // the worker containers, so probing immediately would log routine
+        // noise on every cold start.  Observability only — it never fails
+        // boot, disables a worker, or changes dispatch.
+        mgr.spawn_boot_liveness_probe(shutdown_tx.subscribe());
+
+        // WI#464 (ask #2): re-probe on an interval, logging only on a state
+        // change, so a worker that dies after boot also produces an ERROR
+        // line before the next dispatch.
+        mgr.spawn_periodic_reprobe(shutdown_tx.subscribe(), std::time::Duration::from_secs(300));
     }
 
     // Bundled MCP gateway control plane (opt-in via environment; see

@@ -10,8 +10,9 @@ as the current contract. Relevant release changes include:
 
 - Mission persistence: WI#317 serializes boot/reconciliation writes with fires;
   WI#321 warns when stored records cannot load and when default projects
-  duplicate; WI#322 reserves Engine project/mission documents from memory-tool
-  and web-write mutation; WI#394 heals settled-stop dedup keys without refiring.
+  duplicate; WI#490 makes default-project creation idempotent; WI#322 reserves
+  Engine project/mission documents from memory-tool and web-write mutation;
+  WI#394 heals settled-stop dedup keys without refiring.
 - Memory write-lane reservation: WI#455 (v2.1.7.0) widens the memory-tool and
   web-write reservation from `engine/projects/**` + `engine/.runtime/**` to the
   whole `engine/**` tree, so a forged `engine/knowledge/**` or
@@ -1631,6 +1632,13 @@ Wraps the `Workspace` as the engine's `Store` trait:
   identities, excluding record content (WI#321/WI#493). Duplicate `default`
   projects warn once per owner at boot; selection consistently chooses the
   oldest, with UUID as tie-breaker. The warning does not merge or repair rows.
+  New `default` projects cannot appear in pairs any more (WI#490): both
+  creation sites derive the id as `uuid v5` of the owner's user id under a
+  fixed namespace, so concurrent first messages and a boot racing them write
+  the same record instead of two. The deterministic id applies only when the
+  owner has no default yet, so existing projects (and the missions already
+  under them) are untouched; an existing duplicate pair is left in place and
+  keeps resolving to the oldest.
 - MemoryDoc saves propagate workspace content-write failures. Persistence must
   succeed before publishing the document/cache path or deleting a rename's old
   file. Writes are serialized through a store-local lock so cache publication
