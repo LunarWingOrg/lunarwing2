@@ -1875,7 +1875,46 @@ That historical reproduction is **not** evidence that today's reporting
 tenants are repaired. WI#456 remains deployment-gated; WI#512's 2026-10-28
 all-three-workers connection-refused report needs current host-side evidence.
 This change neither rebuilds fleet images nor adds daemon boot-time liveness
-probing (the latter remains WI#464).
+probing (the latter is WI#464 — see "Dead worker socket is logged at boot"
+below).
+
+### Dead worker socket is logged at boot (WI#464)
+
+A configured external worker whose socket is dead at daemon start used to
+be invisible: `External workers configured: kimi, pebble, opencode` only
+means the config parsed, and the first dial happened on the first dispatch,
+where a refusal surfaced as a failed job and (on the blocking `wait=true`
+path, fixed in the same change) produced no ERROR line at all.
+
+The daemon now probes every configured external worker once at boot, after
+its own listeners are up, in a background task: one real WebSocket handshake
+per endpoint (bearer + `lunarwing-agent-v1` subprotocol + the worker's
+`ready` frame), bounded by a 5-second deadline that is separate from the
+worker's dispatch `timeout_ms`. A dead or non-WS socket therefore reads as
+unreachable, and the daemon logs:
+
+```
+ERROR External worker '<name>' unreachable at <host>:<port>: <reason>
+```
+
+when one is dead, or `INFO External worker liveness probe: all N worker(s)
+reachable` when every lane is up. The probe never sends job content, never
+logs the bearer token, never fails boot, never disables a worker, and never
+changes dispatch: a dead configured worker still lets the daemon start, and
+its first dispatch still reports `ExternalWorkerConnectionFailed` exactly as
+before. It works single-node and multi-tenant from the WS URL the daemon
+already has; it does not consult the mt-admin ports registry.
+
+A 5-minute re-probe logs only on a state change (reachable→unreachable and
+back), so a worker that dies after boot also produces an ERROR line before
+the next dispatch. `lunarwing doctor` lists each configured worker with a
+live reachable/unreachable result and endpoint under the External-workers
+check (it probes live because doctor is its own process).
+
+When you see a boot ERROR naming a worker, the cause is host-side: a stale
+pre-WI#400 image in the tenant store, a crash-looping container, or a port
+mismatch (the same class as WI#452 for pebble and WI#456 for kimi — follow
+those runbooks above). The probe is the detection signal, not the fix.
 
 ### Headless permission contract (WI#195, WI#206)
 
