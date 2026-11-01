@@ -294,7 +294,7 @@ converge_after_failed_upgrade() {  # <cause> [refused_before_stop]
     # stdout only: the stage value. A failing probe is "unknown", which the
     # post-daemon branch below treats as fail-closed (no auto-start).
     stage="$("$MT" last-build-stage "$TENANT" 2>/dev/null </dev/null || printf 'unknown')"
-    [[ "$stage" =~ ^(none|daemon|bridge|wasm|worker:[a-z0-9]+)$ ]] || stage="unknown"
+    [[ "$stage" =~ ^(none|daemon|bridge|wasm)$ ]] || stage="unknown"
   fi
   say "" >&2
   # TD-5: a refusal before the stop (opencode2 floor, DarkIRC) leaves the tenant
