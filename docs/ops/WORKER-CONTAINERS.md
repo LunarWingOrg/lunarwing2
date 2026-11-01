@@ -831,7 +831,20 @@ Enforced controls (opencode2 lane unless noted):
    `--profile remote` drives it from the host. Control 9 remains the separate
    host-side listener audit. These are naive-use checks, not a substitute for
    the egress boundary. A passing parser-only namespace probe is not acceptance
-   of the real entrypoint smoke or of a full affected-host `build-tenant`.
+   of the real entrypoint smoke or of a full affected-host `build-tenant`; the
+   acceptance run is recorded below.
+   **Affected-host acceptance (WI#511, 2026-11-01):**
+   `mt-admin build-opencode2-worker --no-cache` on a Gentoo/OpenRC host
+   (OpenRC 0.63.3/2.18, Podman 5.8.2, above the 4.5 floor) built the
+   candidate through `podman build --network=host` and step 38/48
+   (`RUN --network=none bash /app/scripts/runtime_smoke_entrypoint.sh`)
+   printed `runtime-smoke: 5/5 checks passed` — 3 listeners, only health/WS
+   8443 and 19090 non-loopback — before the out-of-band verify and the
+   `:latest` tag. The build's own step-34 self-tests include
+   `runtime_smoke_test.py`. On the same host and build shape a plain `RUN`
+   read the host netns (105 TCP + 3 TCP6 rows) while `RUN --network=none`
+   read a private netns (0 rows) with loopback still bindable and
+   connectable, which is the premise this step relies on.
 7. **Bump checklist (REQUIRED for every worker version bump).** The bump
    entry in this file must record the upstream features that add network
    exposure or outbound publication — tunnels, pairing, sharing, remote MCP,
