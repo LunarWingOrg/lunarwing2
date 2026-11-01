@@ -124,7 +124,7 @@ run()    { if $DRY_RUN; then printf '  [dry-run] %s\n' "$*"; return 0; fi; print
 # import at step 1/8. Accept the request, drop it here, and say so once.
 warn_retired_opencode_once() {
   $RETIRED_OPENCODE_REQUESTED || return 0
-  printf 'warning: opencode v1 worker lane is retired (WI#333); dropping the inherited opencode settings for this import — the tenant is imported without a v1 lane (use --with-opencode2 or `mt-admin add-tenant <t> --with-opencode2` for the supported lane)\n' >&2
+  printf 'warning: opencode v1 worker lane is retired (WI#333); dropping the inherited opencode settings for this import — the tenant is imported without a v1 lane; after this import, run `mt-admin add-tenant <t> --with-opencode2` to select the supported lane\n' >&2
 }
 
 bundle_owner_is_trusted() {

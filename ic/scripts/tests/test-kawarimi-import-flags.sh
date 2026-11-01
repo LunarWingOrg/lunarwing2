@@ -238,6 +238,8 @@ assert_contains "build-tenant carries --with-kimi" "$build_line" "--with-kimi"
 assert_not_contains "add-tenant omits retired --with-opencode" "$add_line" "--with-opencode"
 assert_not_contains "build-tenant omits retired --with-opencode" "$build_line" "--with-opencode"
 assert_contains "import warns that the opencode v1 lane is retired" "$worker_output" "opencode v1 worker lane is retired (WI#333)"
+assert_contains "import names the supported post-import mt-admin command" "$worker_output" 'after this import, run `mt-admin add-tenant <t> --with-opencode2`'
+assert_not_contains "import does not suggest its unsupported --with-opencode2 flag" "$worker_output" "use --with-opencode2"
 # Unselected worker must NOT appear on either planned call.
 if [[ "$add_line" == *"--with-pebble"* ]]; then
   fail "add-tenant leaked --with-pebble (not selected)"
