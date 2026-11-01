@@ -373,6 +373,12 @@ Commands:
                                    (WI#527) to :latest; re-runnable after a
                                    failed promotion
 
+  restore-worker-images <name>     Re-tag the :latest worker images recorded
+                                   before a promotion (rollback without a rebuild)
+
+  cleanup-worker-candidates <name> Discard this run's WI#527 candidate images;
+                                   lanes whose rmi fails stay listed for retry
+
   build-worker-candidates <name>   Build selected worker images to WI#527
                                    candidate tags without stopping the tenant
     --with-pebble --with-opencode --with-kimi --with-opencode2

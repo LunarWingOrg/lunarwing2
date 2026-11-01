@@ -24,8 +24,24 @@ source "$SCRIPT_DIR/../lunarwing-mt-admin.sh"
 SCRIPT_DIR="$TEST_DIR"
 export INIT_SYSTEM=systemd
 
+# run-294 TJ-7: keep the real candidate/promote/restore implementations. Parts
+# 1-5 replace them with event-recording stubs; part 6 evals these back so the
+# real promote path (the TJ-1 blocker) actually runs.
+REAL_BUILD_CANDIDATE_WORKER="$(declare -f build_candidate_worker)"
+REAL_BUILD_CANDIDATE_WORKERS="$(declare -f build_candidate_workers)"
+REAL_PROMOTE_CANDIDATE_WORKERS="$(declare -f promote_candidate_workers)"
+REAL_RESTORE_PROMOTED_WORKERS="$(declare -f restore_promoted_workers)"
+REAL_CLEANUP_CANDIDATE_WORKERS="$(declare -f cleanup_candidate_workers)"
+
+# The marker dir is root-owned in production; a non-root harness cannot chown it.
+install() { command mkdir -p "${!#}"; }
+stat() { printf '0:700\n'; }
+
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
+# run-294 TJ-14: upgrade build logs (mktemp under TMPDIR) stay behind on the
+# convergence paths; keep them inside the fixture so the trap removes them.
+export TMPDIR="$fixture"
 fixture_repo="$fixture/repo"
 events="$fixture/events"
 failures=0
@@ -288,6 +304,14 @@ converge="$(awk '/^(converge_after_failed_upgrade|revert_clone_position)\(\) \{/
 [[ "$converge" == *'revert_clone_position() {'* ]] \
   || fail 'wrapper has no revert_clone_position helper'
 
+# run-294 TJ-2: the live branch must rebuild the daemon after the stop. Without
+# this the tenant restarts on the OLD binary beside the NEW worker images.
+if grep -qF 'build_args=(build-tenant "$TENANT" --with-wasm --require-wasm)' "$wrapper"; then
+  pass 'wrapper live path rebuilds the daemon after the stop (TJ-2)'
+else
+  fail 'wrapper live path has no build-tenant call after the stop'
+fi
+
 TENANT=fixture
 LWROOT="$fixture/lwroot"
 PRIOR_REV=deadbeef
@@ -354,6 +378,135 @@ if [[ "$rc" -eq 0 || "$output" != *'automatic restore FAILED'* ]]; then
   fail "wrapper misreported a failed restart (rc=$rc): $output"
 else
   pass 'wrapper reports a failed restart as the tenant remaining stopped'
+fi
+
+# ── 6. the REAL promote path (run-294 TJ-7) ──────────────────────────────────
+# Run-291 shipped a promote that aborted on an unset
+# ${LUNARWING_MT_CANDIDATE_LANES_FILE} because every harness stubbed it. Here the
+# real builder, promote and restore run with the env override UNSET (production
+# shape) against a reference-validating runtime stub that rejects any image
+# reference containing '/'.
+unset LUNARWING_MT_CANDIDATE_LANES_FILE
+eval "$REAL_BUILD_CANDIDATE_WORKER"
+eval "$REAL_BUILD_CANDIDATE_WORKERS"
+eval "$REAL_PROMOTE_CANDIDATE_WORKERS"
+eval "$REAL_RESTORE_PROMOTED_WORKERS"
+eval "$REAL_CLEANUP_CANDIDATE_WORKERS"
+
+runtime_log="$fixture/runtime-log"
+ids_dir="$fixture/runtime-ids"
+by_id_dir="$fixture/runtime-ids-by-id"
+mkdir -p "$ids_dir" "$by_id_dir"
+register_image() {  # <ref> <id>
+  printf '%s\n' "$2" >"$ids_dir/$1"
+  printf '%s\n' "$1" >"$by_id_dir/$2"
+}
+# Function, not an executable: /tmp is noexec on some hosts.
+podman() {
+  case "${1:-}" in
+    image)
+      [[ "${2:-}" == inspect ]] || return 64
+      local ref="${5:-}"
+      printf 'image inspect %s\n' "$ref" >>"$runtime_log"
+      [[ -n "$ref" && "$ref" != */* ]] || return 65
+      [[ -f "$ids_dir/$ref" ]] && cat "$ids_dir/$ref"
+      ;;
+    tag)
+      local src="${2:-}" dst="${3:-}" id=""
+      printf 'tag %s %s\n' "$src" "$dst" >>"$runtime_log"
+      [[ "$src" != */* && "$dst" != */* ]] || return 65
+      if [[ -f "$ids_dir/$src" ]]; then id="$(cat "$ids_dir/$src")"
+      elif [[ -f "$by_id_dir/$src" ]]; then id="$src"
+      else return 66
+      fi
+      printf '%s\n' "$id" >"$ids_dir/$dst"
+      printf '%s\n' "$dst" >"$by_id_dir/$id"
+      ;;
+    rmi)
+      printf 'rmi %s\n' "${2:-}" >>"$runtime_log"
+      rm -f "$ids_dir/${2:-}"
+      ;;
+    *) return 64 ;;
+  esac
+}
+CONTAINER_RT=podman
+MT_ROOTLESS=false
+
+lane_file="$(tenant_candidate_lanes_file fixture)"
+candidate_ref="$(upgrade_candidate_image_ref fixture kimi)"
+mkdir -p "$(dirname "$lane_file")"
+
+# 6a. the real builder builds to the per-tenant tag and records the lane.
+# The builder runs inside capture's subshell, so the tag is recorded in a file.
+tag_file="$fixture/built-tag"
+rm -f "$tag_file"
+build_kimi_worker() { printf '%s\n' "${LUNARWING_WORKER_IMAGE_TAG:-}" >"$tag_file"; return 0; }
+: >"$lane_file"
+rm -f "$runtime_log"
+capture build_candidate_workers fixture false true false false false
+if [[ "$rc" -ne 0 ]]; then
+  fail "real candidate builder failed (rc=$rc): $output"
+elif [[ "$(cat "$tag_file" 2>/dev/null)" != *:wi527-fixture ]]; then
+  fail "real candidate builder used a wrong image tag: '$(cat "$tag_file" 2>/dev/null)'"
+elif ! grep -qx kimi "$lane_file"; then
+  fail "real candidate builder did not record the lane: $(cat "$lane_file")"
+else
+  pass 'real candidate builder builds to the per-tenant tag and records the lane'
+fi
+
+# 6b. the real promote path must not abort on unset env overrides (TJ-1) and
+# must tag candidate -> :latest for every recorded lane.
+register_image "$candidate_ref" sha256:kimi-candidate
+register_image "lunarwing-worker-kimi:latest" sha256:kimi-old
+: >"$runtime_log"
+capture promote_candidate_workers fixture
+if [[ "$rc" -ne 0 ]]; then
+  fail "real promote aborted (rc=$rc): $output"
+elif [[ "$output" == *'unbound variable'* ]]; then
+  fail 'real promote hit an unbound variable with the env override unset'
+elif ! grep -qx "tag $candidate_ref lunarwing-worker-kimi:latest" "$runtime_log"; then
+  fail "real promote did not tag the candidate: $(cat "$runtime_log")"
+elif [[ -s "$lane_file" ]]; then
+  fail "real promote did not clear the lane file: $(cat "$lane_file")"
+else
+  pass 'real promote tags candidate -> :latest with the env override unset'
+fi
+
+# 6c. a mid-promote failure keeps the rollback record, and the real restore
+# re-tags the pre-promotion id (never claims a rollback it did not do).
+printf 'kimi\nopencode\n' >"$lane_file"
+register_image "$candidate_ref" sha256:kimi-candidate
+register_image "lunarwing-worker-kimi:latest" sha256:kimi-old
+: >"$runtime_log"
+capture promote_candidate_workers fixture
+rollback_file="$(_promote_rollback_file fixture)"
+if [[ "$rc" -eq 0 ]]; then
+  fail 'real promote reported success although the opencode candidate is missing'
+elif [[ ! -s "$rollback_file" ]]; then
+  fail 'a mid-promote failure did not keep the rollback record'
+else
+  capture restore_promoted_workers fixture
+  if [[ "$rc" -ne 0 ]]; then
+    fail "real restore failed (rc=$rc): $output"
+  elif ! grep -qx 'tag sha256:kimi-old lunarwing-worker-kimi:latest' "$runtime_log"; then
+    fail "real restore did not re-tag the old id: $(cat "$runtime_log")"
+  else
+    pass 'real restore re-tags the pre-promotion image id after a mid-promote failure'
+  fi
+fi
+
+# 6d. a promote whose :latest already equals the candidate is a no-op re-run.
+printf 'kimi\n' >"$lane_file"
+register_image "$candidate_ref" sha256:kimi-candidate
+register_image "lunarwing-worker-kimi:latest" sha256:kimi-candidate
+: >"$runtime_log"
+capture promote_candidate_workers fixture
+if [[ "$rc" -ne 0 ]]; then
+  fail "an already-promoted lane failed the re-run (rc=$rc): $output"
+elif grep -q '^tag ' "$runtime_log"; then
+  fail "an already-promoted lane was re-tagged: $(cat "$runtime_log")"
+else
+  pass 'real promote is re-runnable (an already-promoted lane is skipped)'
 fi
 
 if [[ "$failures" -ne 0 ]]; then

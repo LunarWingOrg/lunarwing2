@@ -1116,31 +1116,52 @@ stop, build only the daemon/bridge/WASM, and promote the candidates to
 `:latest` once the target daemon exists. Consequences:
 
 - A worker-lane build failure is a no-op for a running tenant: the clone is
-  returned to the previous commit, the candidates are discarded, and the error
-  says the tenant was not stopped. The only post-stop build is the daemon,
-  bridge and WASM — no worker lane is rebuilt after the stop, on either path.
+  returned to its recorded position (branch or detached HEAD, and a pre-upgrade
+  stash is popped back), the candidates are discarded, and the error says the
+  tenant was not stopped. The only post-stop build is the daemon, bridge and
+  WASM — no worker lane is rebuilt after the stop, on either path. The external
+  wrapper's live path runs `build-tenant --with-wasm --require-wasm` after the
+  stop (pebble is a candidate now, never `--with-pebble`), so the restarted
+  daemon is always the newly built one.
 - `build_tenant` records each completed stage (`daemon`, `bridge`, `wasm`) to
   a root-owned marker file in the tenant lifecycle lock directory
   (`/run/lock/lunarwing-tenants/<tenant>-build-stages` by default), never in
-  tenant-writable state. Post-stop convergence classifies the failure by that
+  tenant-writable state; the directory is created with the same hardened
+  no-symlink, root-owned 0700 sequence as the lifecycle locks. Each run starts
+  with a `start` sentinel, so "nothing built yet" is distinguishable from an
+  unreadable marker. Post-stop convergence classifies the failure by that
   marker, never by matching die prose: before the daemon stage the previous
   build is restarted in place; once the target daemon was built a restart would
   run the *new* binary and apply the target's migrations, so the previous
-  commit is rebuilt before starting, and if that fails the tenant is reported
-  **stopped** with explicit rollback commands — never as "restored". An
-  unreadable or unknown marker is treated as past-the-daemon (fail closed).
+  commit is rebuilt before starting (non-strict WASM: a broken WASM toolchain
+  must not block restoring a binary whose artifacts are already installed), and
+  if that fails the tenant is reported **stopped** with explicit rollback
+  commands — never as "restored". An unreadable or unknown marker is treated as
+  past-the-daemon (fail closed) on both paths.
 - `promote-worker-images <tenant>` re-runs a promotion that failed after the
-  daemon build: already-promoted lanes are skipped, old `:latest` image IDs are
-  recorded to a rollback file and re-tagged by convergence, and the lane list
-  is updated per lane, so a re-run only promotes what remains.
+  daemon build: already-promoted lanes are skipped, the rollback file keeps the
+  **first** pre-promotion `:latest` ID per lane (so a re-run never records an
+  already-promoted candidate as the old image), and the lane list is updated
+  per lane, so a re-run only promotes what remains. `restore-worker-images
+  <tenant>` re-tags those recorded IDs; both upgrade paths call it on a failed
+  upgrade, and it is printed in the wrapper's rollback steps. A rollback is
+  only reported when the re-tag actually succeeded. `build-worker-candidates`
+  and `promote-worker-images` refuse to run under a live upgrade lock of the
+  same tenant.
+- A pebble candidate keeps the toolchain profile of the `:latest` image it will
+  replace (the image's `org.opencontainers.image.toolchain-profile` label), so
+  an upgrade no longer downgrades an operator's fat (`--with-toolchains`) image
+  to slim.
 - The post-stop build log is a root-only `mktemp` file under `${TMPDIR:-/tmp}`
   that is kept on failure (`build log: <path>` in the error). It is not pruned
   automatically; on a long-lived host the operator should clear `/tmp` of
   `lw-upgrade-build.*` files. Candidate tags are removed on the success path
-  and by `cleanup_candidate_workers` on the pre-stop failure path; a stale
-  candidate left by a mid-promote failure is cleaned by the next promote or
-  `promote-worker-images` re-run and never affects the running lanes, which
-  still point at `:latest`.
+  and by `cleanup_candidate_workers` on the pre-stop failure path; a lane whose
+  `rmi` fails stays in the lane file (visible to `cleanup-worker-candidates
+  <tenant>`, which retries it) and never affects the running lanes, which still
+  point at `:latest`. `last-build-stage` and `reset-build-stage` require root,
+  because the marker (and the candidate lane list) live in the root-only lock
+  directory and are not persistent across a reboot.
 
 ```bash
 cd opencode2.4lunarwing
