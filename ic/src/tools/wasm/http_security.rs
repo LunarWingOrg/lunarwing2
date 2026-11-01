@@ -216,11 +216,18 @@ pub(crate) struct VettedHttpTarget {
 
 impl VettedHttpTarget {
     /// Pin reqwest to the answers checked above, eliminating the second DNS lookup.
+    ///
+    /// Proxy support is disabled unconditionally (WI#503): reqwest honours
+    /// `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` from the environment and sends
+    /// the request to the proxy, which resolves the hostname itself. The
+    /// pinned answers then would not be the ones connected to, reopening the
+    /// DNS-rebinding gap. A vetted target always connects directly.
     pub(crate) fn pin_client(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
-        match &self.dns_host {
+        let builder = match &self.dns_host {
             Some(host) => builder.resolve_to_addrs(host, &self.addresses),
             None => builder,
-        }
+        };
+        builder.no_proxy()
     }
 }
 
@@ -404,6 +411,51 @@ mod tests {
         });
 
         assert_eq!(status, reqwest::StatusCode::OK);
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn vetted_client_bypasses_a_configured_proxy() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        let port = listener.local_addr().expect("address").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).expect("read request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\npinned",
+                )
+                .expect("write response");
+        });
+        let target = VettedHttpTarget {
+            dns_host: Some("pinned.test".to_string()),
+            addresses: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)],
+        };
+        // Nothing listens on port 1: a request that honoured the proxy would
+        // fail to connect instead of reaching the pinned address.
+        let proxy = reqwest::Proxy::http("http://127.0.0.1:1").expect("proxy");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let body = runtime.block_on(async {
+            let client = target
+                .pin_client(reqwest::Client::builder().proxy(proxy))
+                .build()
+                .expect("client");
+            client
+                .get(format!("http://pinned.test:{port}/"))
+                .send()
+                .await
+                .expect("pinned request")
+                .text()
+                .await
+                .expect("response body")
+        });
+
+        assert_eq!(body, "pinned");
         server.join().expect("server thread");
     }
 }

@@ -697,6 +697,17 @@ up front, actual chunks are checked as they arrive, and reading stops at the
 first over-limit chunk instead of after full buffering. Stream errors still
 pass through `without_url()`.
 
+**Proxy behaviour of vetted requests (WI#503).** A vetted WASM HTTP target is
+always connected to directly: `VettedHttpTarget::pin_client` clears every
+proxy (`reqwest::ClientBuilder::no_proxy()`) in addition to pinning the vetted
+answers, so `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` in the daemon environment
+cannot route the request to a proxy that resolves the hostname itself and
+reopens the DNS-rebinding gap. The tool host, the channel host and the OAuth
+refresh client all build their client through `pin_client`, so all three are
+covered. Requests that are not vetted (the explicit
+`WASM_HTTP_ALLOW_PRIVATE_IPS=1` opt-in, channel bridge/loopback exemptions,
+and the host-scoped local sidecar) keep their normal proxy handling.
+
 **Reference:** `src/channels/wasm/wrapper.rs` —
 `ChannelStoreData::redact_http_outcome_for_guest`
 
