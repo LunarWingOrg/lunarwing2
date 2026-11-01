@@ -118,7 +118,7 @@
 25. [x] (S) Reserved
 26. [ ] work on the following work items: #532 + #534 — Engine V2 “thread not found” during join on brightdawn, and its root cause (join_thread only consults the in-memory maps; take-once outcome). Live bug, fix shape agreed in the notes. I would add this one first, as a single line pointing at both.
 27. [ ] work on WI#529
-28. [ ] work on WI#508
+28. [x] work on WI#508
 29. [ ] work on WI#526
 30. [ ] work on WI#531
 
