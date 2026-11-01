@@ -217,6 +217,39 @@ The current command accepts the NanoGPT key on argv, so run it only from a
 private administrative shell and avoid recording the command in shared history
 or logs.
 
+#### Model backend and the worker egress allowlist (WI#506)
+
+On a multi-tenant host every worker runs behind the per-tenant egress filter
+(`lw-egress-<tenant>`, recursive DNS disabled), so the pebble lane can reach
+only hosts that are in its allowlist. `configure-pebble` therefore pins the
+model backend into `pebble.env`:
+
+| key | role |
+| --- | --- |
+| `PEBBLE_BASE_URL` | LunarWing-side declaration; `worker-egress <name>` derives it into the allowlist |
+| `NANOGPT_BASE_URL` | the same value in the key the pebble binary honours, so the declared backend is the one that is dialled |
+
+The default is the binary's own NanoGPT endpoint (`https://nano-gpt.com/api`).
+Point the lane elsewhere with `--base-url`; an omitted `--base-url` preserves
+the current backend, so rotating a key never silently re-points the worker.
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh configure-pebble <name> \
+  --nanogpt-api-key '<key>' --base-url https://nano-gpt.com/api
+sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant <name>   # re-renders the static host mapping
+sudo ic/scripts/lunarwing-mt-admin.sh worker-egress <name>    # shows the derived allowlist targets
+```
+
+The allowlist is never widened automatically: the backend is derived only from
+what `configure-pebble` (or an operator) declared. If a tenant has no declared
+backend, or the host does not resolve to IPv4 on the tenant host, the pebble
+lane refuses to start and names the exact remediation — it does not start and
+then fail every dispatched job with an opaque connect error. A worker that was
+provisioned before this change carries no backend key; re-run `configure-pebble`
+(or allow the host yourself with
+`configure-worker-egress <name> --allow nano-gpt.com:443`) before the next
+pebble start.
+
 ### Status
 
 ```bash
