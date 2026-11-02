@@ -252,6 +252,93 @@ impl Rig {
 }
 
 #[tokio::test]
+async fn two_waiters_complete_one_run_and_record_one_response() {
+    let rig = Rig::new(Some("raw answer"), None).await;
+    rig.llm.release.notify_one();
+    let first = rig.turn.join().await.unwrap().unwrap();
+    let second = rig.turn.join().await.unwrap().unwrap();
+
+    assert_eq!(
+        rig.turn.complete_once(first).await.unwrap().as_deref(),
+        Some("raw answer")
+    );
+    assert_eq!(
+        rig.turn.complete_once(second).await.unwrap().as_deref(),
+        Some("")
+    );
+    let conversation = rig
+        .turn
+        .state
+        .conversation_manager
+        .get_conversation(rig.turn.conversation_id)
+        .await
+        .unwrap();
+    let responses: Vec<_> = conversation
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.sender, lunarwing_engine::EntrySender::Agent { .. }))
+        .map(|entry| entry.content.as_str())
+        .collect();
+    assert_eq!(responses, ["raw answer"]);
+}
+
+#[tokio::test]
+async fn two_waiters_persist_only_one_gate_for_one_run() {
+    let rig = Rig::new(Some("unused"), None).await;
+    rig.llm.release.notify_one();
+    rig.turn.join().await.unwrap().unwrap();
+    rig.turn.join().await.unwrap().unwrap();
+    let paused = ThreadOutcome::GatePaused {
+        gate_name: "approval".into(),
+        action_name: "shell".into(),
+        call_id: "shared-call".into(),
+        parameters: serde_json::json!({"command":"ls"}),
+        resume_kind: lunarwing_engine::ResumeKind::Approval {
+            allow_always: false,
+        },
+        resume_output: None,
+    };
+
+    rig.turn.complete_once(paused.clone()).await.unwrap();
+    rig.turn.complete_once(paused).await.unwrap();
+    assert_eq!(
+        rig.turn
+            .state
+            .pending_gates
+            .list_for_user("alice")
+            .await
+            .len(),
+        1
+    );
+    assert_eq!(
+        rig.statuses
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|status| matches!(status, StatusUpdate::ApprovalNeeded { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn foreground_gate_waiting_join_is_silent() {
+    let rig = Rig::new(None, None).await;
+    assert!(rig.turn.join().await.unwrap().is_none());
+    assert_eq!(
+        rig.turn
+            .state
+            .store
+            .load_thread(rig.turn.thread_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        lunarwing_engine::ThreadState::Waiting
+    );
+}
+
+#[tokio::test]
 async fn gate_waiting_join_is_silent_and_preserves_the_thread() {
     let mut rig = Rig::new(None, None).await;
     let result = rig
