@@ -1838,33 +1838,49 @@ waiters use `join_thread_for_run` with the generation captured at spawn/resume.
 Their polling, timeout stops, and abandoned-waiter cancellation use that same
 key, so a stale watcher cannot consume, stop, or finalize a newer turn.
 
-Running handles are shared and completed outcomes are retained per generation,
-so joining is multi-consumer rather than take-once. Joining does not unregister
-live work. A per-thread lifecycle lock covers durable creation through running
-registration and the join fallback; terminal unregistration also checks the
-generation. This closes the re-adoption window where a stale join could see a
-new `Created` record without its task and fail that live task.
+Running completions are cloneable shared futures and completed outcomes are
+retained per generation, so joining is multi-consumer rather than take-once.
+Joining does not unregister live work, and dropping one joiner cannot consume or
+cancel the shared completion. The per-thread lifecycle lock covers registry
+snapshots, durable creation through running registration, and the store
+fallback, but is never held across a live await. Terminal unregistration and
+final persistence check the generation; re-adopting an id over another live
+generation is refused. This closes the re-adoption window where a stale join
+could see a new `Created` record without its task and fail that live task.
+
+Completed entries expire after 22 minutes and are pruned on insertion and read,
+covering the longest foreground/late-waiter budget without retaining every turn
+for the daemon's lifetime. Every joiner can read an outcome, but an atomic
+per-generation completion claim permits only one channel/history/gate
+completion pass. Foreground, late, and expired-gate waiters all use that claim;
+later waiters return the empty sentinel instead of duplicating a reply, history
+entry, or pending gate.
 
 When neither registry has the requested generation, `store.load_thread` is the
 restart-safe fallback. `Done`/`Completed` reconstructs `Completed` from the last
 visible assistant message, which the orchestrator persists before the final
-save. `Failed` returns `Stopped` for a recorded host-stop reason and otherwise
-returns generic failure text rather than replaying internal store, I/O, or
-engine reasons. `Waiting` returns `ThreadError::Waiting` without modifying the
-record; the foreground completion path suppresses an immediate reply and leaves
-resume to gate recovery. `Suspended` reports an interrupted turn without
-touching its checkpoint. Only a `Created`/`Running` record for the requested
-generation with no live task is finalized as `Failed("execution stopped")`,
-with checkpoint cleanup, event persistence, lease revocation, and broadcast.
-An id with no matching durable record still returns `ThreadNotFound`.
+save; a terminal record with no assistant message recovers as the empty
+response sentinel, not as an agent shutdown. `Failed` returns `Stopped` for a
+recorded host-stop reason and otherwise returns generic failure text rather
+than replaying internal store, I/O, or engine reasons. `Waiting` returns
+`ThreadError::Waiting` without modifying the record; foreground and late
+completion paths suppress an immediate reply and leave resume to gate recovery.
+`Suspended` reports an interrupted turn without touching its checkpoint. Only a
+`Created`/`Running` record for the requested generation with no live task is
+finalized as `Failed("engine task absent when its outcome was joined")`, with
+checkpoint cleanup, event persistence, lease revocation, and broadcast. That
+reason is deliberately distinct from a host stop, so a later recovery still
+classifies the orphan as a failure. An id with no matching durable record still
+returns `ThreadNotFound`.
 
-Recovered outcomes populate the same per-generation slot before return, so
-later joiners see the same representation. These process-local entries still
-have no bounded-retention sweeper; bounding them is separate from the recovery
-fix and they are not a durable outbox. Join/stop failures delivered by the agent
-message loop or late watcher pass through `Error::user_facing_message`, which
-keeps engine context and thread UUIDs in logs while sending a stable retry
-message to channel users.
+Recovered outcomes populate the same bounded per-generation slot before return,
+so later joiners see the same representation; they are not a durable outbox.
+Join/stop/thread-lookup failures delivered by the agent message loop or late
+watcher pass through `Error::user_facing_message`, which keeps engine context
+and thread UUIDs in logs while sending a stable retry message to channel users.
+Actionable gate errors such as stale or expired approvals keep their original
+messages. Terminal failures classified as `Unknown` also use generic text;
+classified model and orchestration messages remain unchanged.
 
 Engine `message` tool calls receive execution-local `notify_thread_id`; gateway
 calls also carry their execution's user/channel instead of mutable conversation
