@@ -577,8 +577,8 @@ impl RoutineError {
 }
 
 impl Error {
-    /// Text that is safe to deliver to a channel user. Engine errors retain
-    /// their context and identifiers in logs, not in the outbound reply.
+    /// Text that is safe to deliver to a channel user. Internal engine
+    /// join/stop/lookup details stay in logs; actionable errors keep their text.
     pub fn user_facing_message(&self) -> String {
         match self {
             Self::Engine { context, .. }
