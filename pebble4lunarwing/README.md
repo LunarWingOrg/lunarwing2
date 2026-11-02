@@ -33,9 +33,9 @@ differ: `rustls`, `rustls-webpki`, `webpki-roots`, `chacha20`, `quinn`,
 raise, rustls-webpki 0.103.16 and webpki-roots 1.0.10 for CVE-2026-111943 —
 RUSTSEC-2026-0382/0381, the distrusted emSign intermediates pair — chacha20 to
 retire upstream's yanked 0.10.1 pin, the quinn/tokio/clipboard-win set from the
-2026-10-24 security refresh, and pulldown-cmark 0.13.5 for RUSTSEC-2026-0414,
-exponential event growth with the wikilinks option pebble enables through
-`Options::all()`).
+2026-10-24 security refresh, pulldown-cmark 0.13.5 for RUSTSEC-2026-0414,
+and 0.13.6 for RUSTSEC-2026-0433; both advisories require the wikilinks option
+pebble enables through `Options::all()`).
 Package additions, removals, or source/checksum/dependency edits outside that
 allowlist fail even when a caller supplies a matching digest override, and a
 no-op override fails too, so the input is retired once upstream ships its own
