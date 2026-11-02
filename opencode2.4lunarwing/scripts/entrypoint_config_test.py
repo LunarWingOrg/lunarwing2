@@ -52,7 +52,7 @@ class EntrypointConfigTests(unittest.TestCase):
                 os.chown(path, 10003, 10003)
             self.identity = {"user": 10003, "group": 10003, "extra_groups": []}
 
-    def boot(self, **overrides: str) -> dict:
+    def run_boot(self, **overrides: str) -> subprocess.CompletedProcess:
         entrypoint = (LANE / "entrypoint.sh").read_text()
         boundary = "# ── always start the health server"
         self.assertIn(boundary, entrypoint)
@@ -62,10 +62,13 @@ class EntrypointConfigTests(unittest.TestCase):
         # Do not let a root CI invocation accidentally bypass the permissions
         # regression this harness exists to catch.
         script = 'test "$EUID" -ne 0 || exit 99\n' + script
-        result = subprocess.run(
+        return subprocess.run(
             ["bash"], input=script, text=True, capture_output=True, timeout=15,
             env={**self.env, **overrides}, cwd=self.root, **self.identity,
         )
+
+    def boot(self, **overrides: str) -> dict:
+        result = self.run_boot(**overrides)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.source.stat().st_mode & 0o777, 0o444)
         self.assertEqual(self.source.read_text(), self.baked)
@@ -161,6 +164,29 @@ class EntrypointConfigTests(unittest.TestCase):
                 self.assertEqual(json.loads(service.read_text()), {"disabled": True})
                 if plant == "symlink":
                     self.assertEqual(agent_file.read_text(), '{"agent": "kept"}')
+
+    def test_placeholder_alias_must_resolve_to_the_baked_config(self) -> None:
+        # WI#529 consumer (a): the no-override path links the workspace config
+        # at the immutable baked file and the placeholder sentinel reads
+        # through that alias. An alias pointing anywhere else must fail loudly
+        # rather than have the sentinel grep an unintended file.
+        foreign = self.root / "foreign.json"
+        foreign.write_text(json.dumps({"share": "disabled"}))
+        alias = self.root / "alias.json"
+        alias.symlink_to(foreign)
+        if os.geteuid() == 0:
+            os.chown(alias, 10003, 10003, follow_symlinks=False)
+            os.chown(foreign, 10003, 10003)
+        result = self.run_boot(OPENCODE_CONFIG=str(alias))
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("not the baked config", result.stdout + result.stderr)
+        self.assertEqual(foreign.read_text(), json.dumps({"share": "disabled"}))
+
+    def test_default_linked_config_is_accepted(self) -> None:
+        # The same assertion must not refuse the real no-override alias.
+        self.boot()
+        self.assertTrue(self.target.is_symlink())
+        self.assertEqual(self.target.resolve(), self.source.resolve())
 
     def test_study_notes_only_can_materialize_config(self) -> None:
         study = self.root / "study-notes"
