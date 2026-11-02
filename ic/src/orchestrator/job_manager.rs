@@ -725,6 +725,11 @@ impl ContainerJobManager {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn use_docker_for_test(&self, docker: bollard::Docker) {
+        *self.docker.write().await = Some(docker);
+    }
+
     pub fn with_completion_deps(
         mut self,
         event_tx: tokio::sync::broadcast::Sender<(
