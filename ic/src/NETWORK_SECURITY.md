@@ -698,16 +698,22 @@ up front, actual chunks are checked as they arrive, and reading stops at the
 first over-limit chunk instead of after full buffering. Stream errors still
 pass through `without_url()`.
 
-**Proxy behaviour of vetted requests (WI#503).** A vetted WASM HTTP target is
-always connected to directly: `VettedHttpTarget::pin_client` clears every
-proxy (`reqwest::ClientBuilder::no_proxy()`) in addition to pinning the vetted
-answers, so `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` in the daemon environment
-cannot route the request to a proxy that resolves the hostname itself and
-reopens the DNS-rebinding gap. The tool host, the channel host and the OAuth
-refresh client all build their client through `pin_client`, so all three are
-covered. Requests that are not vetted (the explicit
-`WASM_HTTP_ALLOW_PRIVATE_IPS=1` opt-in, channel bridge/loopback exemptions,
-and the host-scoped local sidecar) keep their normal proxy handling.
+**Proxy behaviour of vetted requests (WI#503, WI#536).** A vetted WASM HTTP
+target is always connected to directly: `VettedHttpTarget::pin_client` clears
+every proxy (`reqwest::ClientBuilder::no_proxy()`) in addition to pinning the
+vetted answers, so `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` in the daemon
+environment cannot route the request to a proxy that resolves the hostname
+itself and reopens the DNS-rebinding gap. The tool host, the channel host and
+the OAuth refresh client all build their client through `pin_client`, so all
+three are covered. The built-in skill fetch lane also clears every proxy on
+its client, whether the URL contains a literal address or the client is pinned
+to validated DNS answers. It delegates address classification to the same
+`http_security::is_private_ip` helper as the WASM lane, including the 6to4,
+Teredo and other embedded or special-use address checks; it has no
+`WASM_HTTP_ALLOW_PRIVATE_IPS` opt-out. Requests that are not vetted (the
+explicit `WASM_HTTP_ALLOW_PRIVATE_IPS=1` opt-in, channel bridge/loopback
+exemptions, and the host-scoped local sidecar) keep their normal proxy
+handling.
 
 **Reference:** `src/channels/wasm/wrapper.rs` —
 `ChannelStoreData::redact_http_outcome_for_guest`
