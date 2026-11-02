@@ -345,8 +345,10 @@ The contract, binding:
 - **Baked originals never change.** Consumers write a task-owned workspace
   copy. `opencode4lunarwing/entrypoint-task-setup.sh` owns the two helpers
   that carry the knowledge — `materialize_config_copy` (`cp` then
-  `chmod u+w` on the copy) and `ensure_config_rewritable` (alias or
-  non-writable target becomes a private copy) — and every consumer uses
+  `chmod u+w` on the copy) and `ensure_config_rewritable` (an alias or a
+  missing target is materialized from the baked source; a non-writable
+  regular file is widened from **its own** content, so an earlier
+  injector's rewrite is never reverted) — and every consumer uses
   them: the model/baseURL rewrite, the Paseo MCP injector and the Study
   Notes MCP injector. `opencode2.4lunarwing/entrypoint.sh` performs the
   same sequence for `opencode2.json`; the Kimi lane writes
