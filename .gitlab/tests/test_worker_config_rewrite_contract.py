@@ -181,6 +181,12 @@ class LiveBootTests(unittest.TestCase):
         script = script.replace("/home/opencode/", str(self.home) + "/")
         (self.workspace / ".opencode").mkdir()
         self.target.symlink_to(self.source)
+        if self.identity:
+            # The runner creates the dir and link as root; the helper runs as
+            # the task uid, so both must belong to it (UL-6). chown the link
+            # itself, not its baked target.
+            os.chown(self.workspace / ".opencode", TASK_UID, TASK_UID)
+            os.chown(self.target, TASK_UID, TASK_UID, follow_symlinks=False)
         result = subprocess.run(
             ["bash", "-c", script, "helper", str(self.source), str(self.target)],
             text=True, capture_output=True, timeout=15, env=self.env,
@@ -189,6 +195,37 @@ class LiveBootTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(self.target.is_symlink())
         self.assertEqual(self.source.read_text(), self.baked().replace(PLACEHOLDER, ENDPOINT))
+
+    def test_ensure_helper_keeps_an_earlier_rewrite_on_a_regular_file(self) -> None:
+        # UL-1: a non-writable regular copy may already carry the model/baseURL
+        # rewrite. Widening it must preserve that content, not re-materialize
+        # the pristine baked source.
+        self.bake(self.baked().replace(PLACEHOLDER, ENDPOINT))
+        helper = HELPERS.search(SETUP.read_text())
+        self.assertIsNotNone(helper)
+        script = (
+            "set -euo pipefail\n"
+            + helper.group(0)
+            + f'\nensure_config_rewritable {self.source} {self.target}\n'
+            + 'test ! -L "$2" && test -w "$2"\n'
+        )
+        (self.workspace / ".opencode").mkdir()
+        self.target.write_text(self.baked().replace(PLACEHOLDER, "https://earlier.example.test/v1/"))
+        self.target.chmod(0o444)
+        if self.identity:
+            os.chown(self.workspace / ".opencode", TASK_UID, TASK_UID)
+            os.chown(self.target, TASK_UID, TASK_UID)
+        result = subprocess.run(
+            ["bash", "-c", script, "helper", str(self.source), str(self.target)],
+            text=True, capture_output=True, timeout=15, env=self.env,
+            cwd=self.root, **self.identity,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        config = json.loads(self.target.read_text())
+        provider = next(iter(config["provider"].values()))
+        self.assertEqual(provider["options"]["baseURL"], "https://earlier.example.test/v1/")
+        self.assertTrue(self.target.stat().st_mode & 0o200)
+        self.assertEqual(self.source.stat().st_mode & 0o777, 0o444)
 
     def test_study_notes_only_materializes_over_readonly_source(self) -> None:
         self.bake(self.baked().replace(PLACEHOLDER, ENDPOINT))

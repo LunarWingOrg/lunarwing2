@@ -45,8 +45,16 @@ ensure_config_rewritable() {
   # the alias with a private copy so no consumer depends on another consumer
   # having widened the mode first (WI#529 consumer c).
   local source="$1" target="$2"
-  if [ -L "$target" ] || [ ! -w "$target" ]; then
+  if [ -L "$target" ] || [ ! -e "$target" ]; then
     materialize_config_copy "$source" "$target"
+  elif [ ! -w "$target" ]; then
+    # A non-writable regular file may already carry an earlier injector's
+    # rewrite (the model/baseURL pass). Widen a copy of ITS content; copying
+    # the baked source here would silently drop that override (WI#529 UL-1).
+    local replacement="${target}.rewrite.$$"
+    cp "$target" "$replacement"
+    chmod u+w "$replacement"
+    mv -f "$replacement" "$target"
   fi
 }
 
