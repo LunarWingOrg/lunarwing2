@@ -158,6 +158,10 @@ fn thread_outcome_response(outcome: &ThreadOutcome) -> Option<String> {
             "Reached maximum iterations after a final recovery attempt. Retry with narrower scope or a higher iteration limit."
                 .into(),
         ),
+        ThreadOutcome::Failed {
+            kind: lunarwing_engine::ThreadFailureKind::Unknown,
+            ..
+        } => Some("Error: The turn failed before it finished. Please try again.".into()),
         ThreadOutcome::Failed { error, .. } => Some(format!("Error: {error}")),
         ThreadOutcome::GatePaused { .. } => None,
     }
@@ -1495,6 +1499,17 @@ async fn await_expired_gate_resume_outcome(
             return;
         }
     };
+    if !state
+        .thread_manager
+        .claim_thread_completion(gate.thread_id, run_started_at)
+        .await
+    {
+        debug!(
+            thread_id = %gate.thread_id,
+            "another waiter already completed the expired-gate resume"
+        );
+        return;
+    }
 
     if let ThreadOutcome::GatePaused {
         ref action_name, ..
@@ -10807,9 +10822,16 @@ pub(crate) mod tests {
         assert_eq!(
             thread_outcome_response(&ThreadOutcome::Failed {
                 kind: lunarwing_engine::ThreadFailureKind::Unknown,
-                error: "boom".into()
+                error: "private engine detail".into()
             }),
-            Some("Error: boom".into())
+            Some("Error: The turn failed before it finished. Please try again.".into())
+        );
+        assert_eq!(
+            thread_outcome_response(&ThreadOutcome::Failed {
+                kind: lunarwing_engine::ThreadFailureKind::Orchestrator,
+                error: "actionable failure".into()
+            }),
+            Some("Error: actionable failure".into())
         );
     }
 
