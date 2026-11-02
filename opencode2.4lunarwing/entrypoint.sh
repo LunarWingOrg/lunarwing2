@@ -188,6 +188,19 @@ PY
   # survives to the EFFECTIVE runtime config (an operator-set OPENCODE_CONFIG
   # wins, so that file is what gets checked) means a hand-rolled deployment
   # forgot the override. Fail loudly at startup, not at the first LLM request.
+  #
+  # WI#529 consumer (a) parity: on the no-override path this reads a symlink
+  # to the 0444 baked file. Bind the alias to the baked original so a future
+  # mode, ownership or layout change fails loudly instead of silently grepping
+  # an unintended file.
+  if [ -L "$OPENCODE_CONFIG" ]; then
+    resolved_config="$(readlink -f "$OPENCODE_CONFIG")"
+    baked_config="$(readlink -f /app/config/opencode2.json)"
+    [ "$resolved_config" = "$baked_config" ] \
+      || die "OPENCODE_CONFIG alias points at $resolved_config, not the baked config $baked_config (WI#529)"
+    [ -r "$resolved_config" ] \
+      || die "baked config $resolved_config is not readable by the task uid (WI#529)"
+  fi
   if grep -q 'set-opencode2-base-url\.invalid' "$OPENCODE_CONFIG" 2>/dev/null; then
     die "OPENCODE2_BASE_URL is unset and the baked config is a placeholder; set it (mt-admin: configure-opencode2 <tenant> --base-url <url>) to a container-reachable OpenAI-compatible endpoint"
   fi

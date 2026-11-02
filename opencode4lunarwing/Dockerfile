@@ -290,6 +290,16 @@ COPY config/ ./config/
 # mt-admin's private tenant clone has) would leave /app/config and /app/scripts
 # unreadable by 10001 while root-side boot still worked. Normalize the modes
 # here so the image is identical regardless of the builder's umask.
+#
+# WI#529 REWRITE CONTRACT (binding, do not relax): the baked inputs under
+# /app/config are immutable — root-owned, no write bit, asserted below.
+# In-container consumers that need to change their config (the model/baseURL
+# override, the Paseo MCP entry, the Study Notes MCP entry in
+# entrypoint-task-setup.sh) write a TASK-OWNED WORKSPACE COPY, never the baked
+# original: they call materialize_config_copy/ensure_config_rewritable, which
+# copy and then `chmod u+w` the copy because `cp` inherits this 0444 mode.
+# Adding an in-place writer? Bind it to those helpers; the static + live
+# contract test is .gitlab/tests/test_worker_config_rewrite_contract.py.
 RUN set -eu; \
     chmod -R a+rX /app/config /app/scripts; \
     chmod a+r /app/health_server.py /app/agent_comm_protocol.json; \
@@ -302,7 +312,24 @@ RUN set -eu; \
     setpriv --reuid=10001 --regid=10001 --clear-groups \
       find -L /app/config /app/scripts /app/entrypoint.sh /app/entrypoint-split.sh \
       /app/entrypoint-task-setup.sh /app/health_server.py /app/agent_comm_protocol.json \
-      -type f -exec cat -- {} + >/dev/null
+      -type f -exec cat -- {} + >/dev/null; \
+    probe_dir="$(mktemp -d)"; \
+    trap 'rm -rf "$probe_dir"' EXIT; \
+    chown 10001:10001 "$probe_dir"; \
+    install -d -o 10001 -g 10001 -m 0755 "$probe_dir/home" "$probe_dir/workspace"; \
+    setpriv --reuid=10001 --regid=10001 --clear-groups \
+      env -i PATH="$PATH" HOME="$probe_dir/home" WORKSPACE_ROOT="$probe_dir/workspace" \
+      OPENCODE_BASE_URL=https://probe.example.test/openai/v1/ \
+      /app/entrypoint-task-setup.sh; \
+    test -s "$probe_dir/workspace/.opencode/opencode.json"; \
+    test -n "$(find "$probe_dir/workspace/.opencode/opencode.json" -perm -0200 -print)"; \
+    setpriv --reuid=10001 --regid=10001 --clear-groups \
+      env -i PATH="$PATH" HOME="$probe_dir/home" WORKSPACE_ROOT="$probe_dir/workspace" \
+      OPENCODE_BASE_URL=https://probe.example.test/openai/v1/ \
+      PASEO_URL=https://paseo.example.test/ PASEO_TOKEN=probe \
+      /app/entrypoint-task-setup.sh; \
+    grep -q '"paseo"' "$probe_dir/workspace/.opencode/opencode.json"; \
+    test "$(stat -c %a /app/config/opencode.json)" = 444
 
 # Fail the BUILD (not container startup) if the bridge's SDK import can't
 # resolve — the SDK build above is best-effort, so verify the exact

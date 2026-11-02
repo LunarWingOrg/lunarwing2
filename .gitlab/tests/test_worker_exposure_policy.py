@@ -140,8 +140,11 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
             # a PATH of just the tools the guard needs, with no git in it.
             minimal = self.root / "nogit-bin"
             minimal.mkdir(exist_ok=True)
+            # readlink: the lane entrypoints resolve their config alias with
+            # `readlink -f` (WI#529 consumer (a)); the image has coreutils, so
+            # the guard lane must model that, not a PATH without it (UL-5).
             for tool in ("bash", "sh", "python3", "grep", "dirname", "cp", "mkdir",
-                         "chmod", "rm", "ln", "date"):
+                         "chmod", "rm", "ln", "date", "readlink"):
                 target = shutil.which(tool)
                 if target is None:
                     raise AssertionError(f"required tool {tool!r} not found")
