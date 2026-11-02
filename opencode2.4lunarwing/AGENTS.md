@@ -3,8 +3,8 @@
 ## What This Is
 
 Persistent container worker for upstream OpenCode **2** (the `v2` line, pinned
-v2.1.2). This is a separate worker lane from `opencode4lunarwing/` (the proven
-v1 worker, pinned v1.18.25) per
+v2.2.5). This is a separate worker lane from `opencode4lunarwing/` (the proven
+v1 worker, pinned v1.19.5) per
 `docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md`. Tenants opt in explicitly; v1
 stays the default until v2 earns trust. The WebSocket bridge is
 TypeScript/Bun and uses `@opencode/client/promise` to communicate with the
@@ -95,14 +95,13 @@ have different file contents, which BuildKit's timestamp rewrite cannot fix
 (WI#510). All four workers and `CI_DEBIAN_SNAPSHOT` use `20261024T011300Z`,
 which includes the Bookworm/Trixie Brotli security fixes; bump them together.
 
-Bun 1.4.4 also requires the photon-node hunk-10 repair at this upstream pin:
-the builder runs `scripts/fix_photon_patch_context.py` after checkout, before
-`bun install --frozen-lockfile`. On the first bump whose patch already includes
-upstream `61845b0`, the fixer deliberately fails as redundant. Remove both
-`fix_photon_patch_context{,_test}.py` files, the Dockerfile fixer COPY/RUN and
-self-test invocation, and this lane's two `input_files` entries in
-`.gitlab/scripts/build-worker-image.sh` together; do not weaken the drift guard
-or downgrade Bun. See checklist item 7 in `docs/ops/WORKER-CONTAINERS.md`.
+The Bun 1.4.4 photon-node hunk-10 repair that this lane used to apply at the
+v2.1.2 pin is retired: v2.2.5 already carries upstream `61845b0`, so
+`fix_photon_patch_context.py` would fail as redundant. The two fixer files,
+their Dockerfile `COPY`/`RUN` and self-test invocation, and this lane's two
+`input_files` entries in `.gitlab/scripts/build-worker-image.sh` were removed
+together in the WI#531 bump; do not weaken the drift guard or downgrade Bun.
+See checklist item 7 in `docs/ops/WORKER-CONTAINERS.md`.
 
 ## Do Not
 
@@ -136,11 +135,11 @@ or downgrade Bun. See checklist item 7 in `docs/ops/WORKER-CONTAINERS.md`.
 Workers must never self-expose; LunarWing owns every public path through the
 daemon's tunnel. See `docs/ops/WORKER-CONTAINERS.md` → "Worker exposure
 policy" for the full control set, the !1490 gate record, and the bump
-checklist. This lane pins v2.1.2 (the v2.0.26 boundary was crossed at
+checklist. This lane pins v2.2.5 (the v2.0.26 boundary was crossed at
 v2.0.32 under the maintainer-approved WI#427):
 v2.0.26 introduced OpenTunnel remote access (hosted relay, no self-host
 option). The compile-out guard stubs `remote-tunnel.ts` at build time,
-re-verified against v2.1.2, and CI + the build assertions fail if the tunnel
+re-verified against v2.2.5, and CI + the build assertions fail if the tunnel
 survives. Future bumps remain deliberate-only. WI#369's SDK-gate blind spots remain
 open; WI#424's egress allowlist is implemented (mt-admin `worker-egress`) and
 `scripts/runtime_smoke_entrypoint.sh` starts the real entrypoint for the
