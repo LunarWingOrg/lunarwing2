@@ -1727,8 +1727,17 @@ drift guard was not weakened.
   password, cors, env}` shape with the legacy boolean-`remote` reader, so the
   boot reset stays valid; `pair --remote` consent still exists and the
   wrapper refusals cover it; `updater.ts` still honours
-  `OPENCODE_DISABLE_AUTOUPDATE`. The exposure wrapper still refuses
+  `OPENCODE_DISABLE_AUTOUPDATE` (the live switch — the lane config's
+  `update: "disable"` is not read by `readPolicy()`, which only reads the
+  global config dir). The exposure wrapper still refuses
   `service set remote true` with exit 77.
+- new binary input: v2.2.5 replaces the separate `@opencode-ai/pty` 0.3.1
+  package with the in-tree `packages/process-daemon` (the Rust `opencode-pty`
+  0.4.0 service), shipped through npm optional platform packages
+  (`@opencode/pty` 0.4.0). It listens on a private per-uid Unix socket under
+  `/tmp/opencode-pty-<uid>/` with a token from a 0600 registration file and
+  opens no inbound network path, so the runtime listener check is unaffected.
+  The candidate/clean-rebuild digest comparison covers the new binary input.
 - in-host lane suites: `compile_out_remote_tunnel_test` 10/10,
   `exposure_policy_assert_test` pass, `sdk_surface{,_assert}_test` pass.
 
