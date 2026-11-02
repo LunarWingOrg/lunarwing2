@@ -576,6 +576,19 @@ impl RoutineError {
     }
 }
 
+impl Error {
+    /// Text that is safe to deliver to a channel user. Engine errors retain
+    /// their context and identifiers in logs, not in the outbound reply.
+    pub fn user_facing_message(&self) -> String {
+        match self {
+            Self::Engine { .. } => {
+                "The request could not be completed because of an internal engine error. Please try again; if it keeps happening, ask the operator to check the daemon log.".to_string()
+            }
+            other => format!("Error: {other}"),
+        }
+    }
+}
+
 /// Result type alias for the agent.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -819,5 +832,20 @@ mod tests {
             }
             .is_retryable()
         );
+    }
+
+    #[test]
+    fn engine_errors_never_reach_channel_users_verbatim() {
+        let error = Error::Engine {
+            context: "join error".into(),
+            reason: "thread not found: 3bfdad4f-78df-52c2-9fe1-4a1c42466559".into(),
+        };
+        let message = error.user_facing_message();
+        assert!(!message.contains("3bfdad4f"), "{message}");
+        assert!(!message.contains("join error"), "{message}");
+        assert!(message.contains("Please try again"), "{message}");
+
+        let other = Error::Config(ConfigError::MissingEnvVar("X".into()));
+        assert_eq!(other.user_facing_message(), format!("Error: {other}"));
     }
 }
