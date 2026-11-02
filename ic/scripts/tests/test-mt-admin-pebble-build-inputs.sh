@@ -143,7 +143,7 @@ git_fixture "$tenant_root" commit -qam tenant
 tenant_head="$(git -C "$tenant_root" rev-parse HEAD)"
 
 expected_root="$tenant_root"
-build_pebble_worker false false "$tenant_root"
+LUNARWING_ROOT="$operator_root" build_pebble_worker false false "$tenant_root"
 [[ "$effective_revision" == "$tenant_head" ]] \
   || fail "tenant build stamp '$effective_revision' is not the tenant clone HEAD $tenant_head"
 [[ "$build_context" == "$tenant_root" ]] \
