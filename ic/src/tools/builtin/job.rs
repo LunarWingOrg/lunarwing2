@@ -4108,6 +4108,67 @@ mod tests {
         assert_eq!(updated.state, JobState::Cancelled); // safety: test
     }
 
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_cancel_job_retries_persistence_after_context_cancelled() {
+        use crate::testing::TestHarnessBuilder;
+
+        let harness = TestHarnessBuilder::new().build().await;
+        let store = Arc::clone(&harness.db);
+        let manager = Arc::new(ContextManager::new(5));
+        let job_id = manager
+            .create_job_for_user(
+                "default",
+                "Retry cancellation",
+                "persist after context update",
+            )
+            .await
+            .unwrap(); // safety: test-only
+        manager
+            .update_context(job_id, |ctx| {
+                ctx.transition_to(JobState::InProgress, None)?;
+                ctx.transition_to(JobState::Cancelled, None)
+            })
+            .await
+            .unwrap() // safety: test-only
+            .unwrap(); // safety: test-only
+        store
+            .save_sandbox_job(&SandboxJobRecord {
+                id: job_id,
+                task: "Retry cancellation".to_string(),
+                status: "running".to_string(),
+                user_id: "default".to_string(),
+                project_dir: "/workspace/lunarwing2".to_string(),
+                success: None,
+                failure_reason: None,
+                created_at: Utc::now(),
+                started_at: Some(Utc::now()),
+                completed_at: None,
+                credential_grants_json: "[]".to_string(),
+                job_mode: "worker".to_string(),
+            })
+            .await
+            .unwrap(); // safety: test-only
+
+        let containers = Arc::new(ContainerJobManager::new(
+            crate::orchestrator::job_manager::ContainerJobConfig::default(),
+            crate::orchestrator::TokenStore::new(),
+        ));
+        let tool = CancelJobTool::new(Arc::clone(&manager))
+            .with_sandbox(containers, Some(Arc::clone(&store)));
+        let result = tool
+            .execute(
+                serde_json::json!({ "job_id": job_id.to_string() }),
+                &JobContext::default(),
+            )
+            .await
+            .unwrap(); // safety: test-only
+
+        assert_eq!(result.result["status"], "cancelled");
+        let stored = store.get_sandbox_job(job_id).await.unwrap().unwrap(); // safety: test-only
+        assert_eq!(stored.status, "cancelled");
+    }
+
     #[tokio::test]
     async fn test_cancel_job_completed() {
         let manager = Arc::new(ContextManager::new(5));
