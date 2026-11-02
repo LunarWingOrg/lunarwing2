@@ -1316,6 +1316,7 @@ async fn handle_expired_gates(
         if resumed {
             spawn_expired_gate_outcome_watcher(
                 gate.clone(),
+                thread.created_at,
                 std::sync::Arc::clone(channels),
                 Arc::clone(hooks),
             );
@@ -1431,6 +1432,7 @@ async fn begin_expired_gate_resume(
 /// borrow cannot enter a spawned task.
 fn spawn_expired_gate_outcome_watcher(
     gate: PendingGate,
+    run_started_at: chrono::DateTime<chrono::Utc>,
     channels: std::sync::Arc<crate::channels::ChannelManager>,
     hooks: Arc<crate::hooks::HookRegistry>,
 ) {
@@ -1442,7 +1444,7 @@ fn spawn_expired_gate_outcome_watcher(
         let Some(state) = guard.as_ref() else {
             return;
         };
-        await_expired_gate_resume_outcome(state, &channels, &hooks, &gate).await;
+        await_expired_gate_resume_outcome(state, &channels, &hooks, &gate, run_started_at).await;
     });
 }
 
@@ -1453,15 +1455,20 @@ async fn await_expired_gate_resume_outcome(
     channels: &std::sync::Arc<crate::channels::ChannelManager>,
     hooks: &Arc<crate::hooks::HookRegistry>,
     gate: &PendingGate,
+    run_started_at: chrono::DateTime<chrono::Utc>,
 ) {
     const OUTCOME_TIMEOUT_SECS: u64 =
         lunarwing_engine::executor::orchestrator::ORCHESTRATOR_TIMEOUT_SECS + 10;
     let deadline =
         tokio::time::Instant::now() + std::time::Duration::from_secs(OUTCOME_TIMEOUT_SECS);
 
-    // Poll-then-join like `await_thread_outcome`: joining a live thread would
-    // remove it from the running map and hide it from /interrupt and /steer.
-    while state.thread_manager.is_running(gate.thread_id).await {
+    // Poll-then-join like `await_thread_outcome`, scoped to this resume rather
+    // than a later turn that may adopt the same thread id.
+    while state
+        .thread_manager
+        .is_run_running(gate.thread_id, run_started_at)
+        .await
+    {
         if tokio::time::Instant::now() >= deadline {
             tracing::warn!(
                 thread_id = %gate.thread_id,
@@ -1473,7 +1480,11 @@ async fn await_expired_gate_resume_outcome(
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
-    let outcome = match state.thread_manager.join_thread(gate.thread_id).await {
+    let outcome = match state
+        .thread_manager
+        .join_thread_for_run(gate.thread_id, run_started_at)
+        .await
+    {
         Ok(outcome) => outcome,
         Err(error) => {
             debug!(
@@ -4019,6 +4030,7 @@ struct EngineMessageRequest<'a> {
 struct AwaitThreadCancellationGuard {
     thread_manager: Arc<ThreadManager>,
     thread_id: lunarwing_engine::ThreadId,
+    run_started_at: chrono::DateTime<chrono::Utc>,
     user_id: String,
     armed: bool,
 }
@@ -4027,11 +4039,13 @@ impl AwaitThreadCancellationGuard {
     fn new(
         thread_manager: Arc<ThreadManager>,
         thread_id: lunarwing_engine::ThreadId,
+        run_started_at: chrono::DateTime<chrono::Utc>,
         user_id: String,
     ) -> Self {
         Self {
             thread_manager,
             thread_id,
+            run_started_at,
             user_id,
             armed: true,
         }
@@ -4056,9 +4070,12 @@ impl Drop for AwaitThreadCancellationGuard {
         };
         let thread_manager = Arc::clone(&self.thread_manager);
         let thread_id = self.thread_id;
+        let run_started_at = self.run_started_at;
         let user_id = self.user_id.clone();
         runtime.spawn(async move {
-            if let Err(error) = thread_manager.stop_thread(thread_id, &user_id).await
+            if let Err(error) = thread_manager
+                .stop_thread_for_run(thread_id, run_started_at, &user_id)
+                .await
                 && !matches!(error, lunarwing_engine::EngineError::ThreadNotFound(_))
             {
                 tracing::warn!(
@@ -7651,7 +7668,13 @@ pub(crate) mod tests {
         // global engine state, which unit tests do not install.
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            await_expired_gate_resume_outcome(&state, &channels, &hooks, &expired[0]),
+            await_expired_gate_resume_outcome(
+                &state,
+                &channels,
+                &hooks,
+                &expired[0],
+                thread.created_at,
+            ),
         )
         .await
         .expect("resumed thread should reach a terminal outcome promptly");
@@ -7934,7 +7957,13 @@ pub(crate) mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            await_expired_gate_resume_outcome(&state, &channels, &hooks, &expired[0]),
+            await_expired_gate_resume_outcome(
+                &state,
+                &channels,
+                &hooks,
+                &expired[0],
+                thread.created_at,
+            ),
         )
         .await
         .expect("re-gated wrap-up should reach the watcher finalize promptly");
