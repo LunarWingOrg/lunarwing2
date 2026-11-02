@@ -1036,11 +1036,22 @@ class WorkerInputManifestTests(unittest.TestCase):
 
     def test_real_opencode_fixer_manifest_omissions_are_caught(self):
         original = config.WORKER_BUILD_SCRIPT.read_text(encoding="utf-8")
-        for worker, context in (("opencode", "opencode4lunarwing"), ("opencode2", "opencode2.4lunarwing")):
+        # WI#531 retired the photon-node fixer from both lanes, so the live
+        # fixture is each lane's remaining builder-executed patch script: a
+        # literal builder COPY input that must keep its provenance hash.
+        for worker, missing in (
+            ("opencode", "opencode4lunarwing/scripts/check_models_dev_snapshot.py"),
+            ("opencode2", "opencode2.4lunarwing/scripts/prepare_reproducible_build.py"),
+        ):
             with self.subTest(worker=worker):
-                missing = f"{context}/scripts/fix_photon_patch_context.py"
-                self.assertIn(missing + "\n", original)
-                self.build_script.write_text(original.replace(missing + "\n", ""), encoding="utf-8")
+                # A manifest entry is either followed by another entry or ends
+                # the single-quoted list, where the next byte is the quote.
+                for terminator in ("\n", "'"):
+                    if missing + terminator in original:
+                        break
+                else:
+                    self.fail(f"{missing} is not a manifest entry")
+                self.build_script.write_text(original.replace(missing + terminator, terminator), encoding="utf-8")
                 errors = []
                 with mock.patch.object(config, "WORKER_BUILD_SCRIPT", self.build_script):
                     config.validate_worker_input_manifest(errors)
