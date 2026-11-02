@@ -1662,14 +1662,33 @@ Wraps the `Workspace` as the engine's `Store` trait:
 - Boot read/parse failures warn with escaped stored paths and validated UUID
   identities, excluding record content (WI#321/WI#493). Duplicate `default`
   projects warn once per owner at boot; selection consistently chooses the
-  oldest, with UUID as tie-breaker. The warning does not merge or repair rows.
+  oldest, with UUID as tie-breaker. The duplicate warning does not merge rows.
   New `default` projects cannot appear in pairs any more (WI#490): both
   creation sites derive the id as `uuid v5` of the owner's user id under a
   fixed namespace, so concurrent first messages and a boot racing them write
   the same record instead of two. The deterministic id applies only when the
-  owner has no default yet, so existing projects (and the missions already
-  under them) are untouched; an existing duplicate pair is left in place and
-  keeps resolving to the oldest.
+  owner has no loaded default, so existing loaded projects (and the missions
+  already under them) are untouched; an existing duplicate pair is left in
+  place and keeps resolving to the oldest.
+- **Unloadable default-project recovery (WI#535).** On owner boot or a user's
+  next message, re-creating a default at its deterministic path first preserves
+  any existing unloaded or unparseable `project.json` content byte-for-byte at
+  `backups/engine/projects/default--<id8>/project.json.unloadable-<UTC>-<UUID>`.
+  These are workspace documents, not host filesystem files. The reserved
+  backup namespace keeps the evidence out of search, model writes and the
+  project loader; operators can read it by exact workspace path. Copying before
+  replacing keeps the original in place if the replacement fails. A read or
+  backup-write failure aborts the save; an unreadable record is never treated
+  as absent. Empty, truncated and schema-invalid records are preserved too.
+  A record skipped by a transient boot-read failure is also preserved even if
+  the pre-write read now succeeds.
+  After successful persistence, a `warn!` names the project id, original path
+  and backup path without logging record content. The id and mission paths
+  stay unchanged, so missions re-attach. Each recovery gets a new backup;
+  earlier evidence is retained without automatic pruning.
+  Project saves serialize preservation, persistence and cache publication
+  within the store, and propagate persistence failures before changing the
+  cache. This is not a cross-process lock against external workspace edits.
 - MemoryDoc saves propagate workspace content-write failures. Persistence must
   succeed before publishing the document/cache path or deleting a rename's old
   file. Writes are serialized through a store-local lock so cache publication

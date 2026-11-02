@@ -84,6 +84,8 @@ pub struct HybridStore {
     steps: RwLock<HashMap<ThreadId, Vec<Step>>>,
     events: RwLock<HashMap<ThreadId, Vec<ThreadEvent>>>,
     projects: RwLock<HashMap<ProjectId, Project>>,
+    /// Serialize preservation, persistence and publication of project records.
+    project_write_lock: Mutex<()>,
     conversations: RwLock<HashMap<ConversationId, ConversationSurface>>,
     leases: RwLock<HashMap<LeaseId, CapabilityLease>>,
     missions: RwLock<HashMap<MissionId, Mission>>,
@@ -122,6 +124,7 @@ impl HybridStore {
             steps: RwLock::new(HashMap::new()),
             events: RwLock::new(HashMap::new()),
             projects: RwLock::new(HashMap::new()),
+            project_write_lock: Mutex::new(()),
             conversations: RwLock::new(HashMap::new()),
             leases: RwLock::new(HashMap::new()),
             missions: RwLock::new(HashMap::new()),
@@ -150,10 +153,9 @@ impl HybridStore {
             self.projects.write().await.insert(project.id, project);
         })
         .await;
-        // WI#321: a project whose project.json failed to load is absent from
-        // the map, so the unlocked check-then-create can mint a second
-        // "default" project for the same user. Surface that here, before any
-        // mission/thread resolution has to pick between them.
+        // WI#321: report existing duplicate defaults before resolution picks
+        // between them. WI#490 makes new defaults deterministic; WI#535
+        // preserves an unloadable record before recreating it at the same path.
         self.warn_duplicate_default_projects().await;
         // Consolidation runs after projects load so legacy-identity duplicates
         // (nil project) can be adopted by the sole known project when one
@@ -234,11 +236,10 @@ impl HybridStore {
 
     /// Warn once per user holding more than one `"default"` project (WI#321).
     ///
-    /// Two unlocked check-then-create windows (`resolve_user_project` and the
-    /// engine boot path) can each mint a `"default"` project when the first
-    /// one's `project.json` has not loaded or the lookup raced. Missions and
-    /// conversations are then attached to whichever project the shared picker
-    /// chose, which reads as "the mission disappeared". Boot is the earliest
+    /// Pre-WI#490 creation races or unloadable legacy (random-id) records can
+    /// leave several defaults. Missions and conversations are then attached to
+    /// whichever project the shared picker chose, which reads as "the mission
+    /// disappeared". Boot is the earliest
     /// point where every loaded project is visible, and the only place that
     /// reports the duplicate — the picker itself runs per message and stays
     /// silent (NY-19).
@@ -776,6 +777,55 @@ impl HybridStore {
         if let Err(error) = self.persist_json_result(&path, value).await {
             debug!(path = %path, %error, "failed to persist engine state");
         }
+    }
+
+    /// Preserve an unloadable default before replacement (WI#535). Workspace
+    /// paths are DB documents, so copy first rather than deleting the source:
+    /// a failed replacement must leave the original available at its old path.
+    /// The reserved backup namespace keeps evidence out of search/model writes
+    /// and the project boot scan. Called under `project_write_lock`.
+    async fn preserve_unloadable_default_project(
+        &self,
+        path: &str,
+        project_id: ProjectId,
+    ) -> Result<Option<String>, EngineError> {
+        let Some(ws) = self.workspace.as_ref() else {
+            return Ok(None);
+        };
+        // Only preserve the scope that the subsequent write will replace.
+        let existing = match self.read_workspace_primary(ws, path).await {
+            Ok(doc) => doc,
+            Err(crate::error::WorkspaceError::DocumentNotFound { .. }) => return Ok(None),
+            Err(_) => {
+                return Err(EngineError::Store {
+                    reason: format!("cannot read default project before replacement at {path:?}"),
+                });
+            }
+        };
+        // A transient boot-read failure can leave a now-readable record out
+        // of the map too. Preserve that evidence instead of overwriting its
+        // custom metadata just because the second read succeeded.
+        if self.projects.read().await.contains_key(&project_id)
+            && serde_json::from_str::<Project>(&existing.content).is_ok()
+        {
+            return Ok(None);
+        }
+
+        // A UUID suffix prevents a second recovery (even in the same clock
+        // tick or after a clock rollback) from overwriting earlier evidence.
+        let backup_path = format!(
+            "backups/{path}.unloadable-{}-{}",
+            chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ"),
+            Uuid::new_v4()
+        );
+        ws.write_backup_snapshot(&backup_path, &existing.content)
+            .await
+            .map_err(|_| EngineError::Store {
+                reason: format!(
+                    "cannot preserve unloadable default project at {path:?} in {backup_path:?}"
+                ),
+            })?;
+        Ok(Some(backup_path))
     }
 
     async fn persist_json_result<T: serde::Serialize>(
@@ -2066,12 +2116,32 @@ impl Store for HybridStore {
     }
 
     async fn save_project(&self, project: &Project) -> Result<(), EngineError> {
+        let _guard = self.project_write_lock.lock().await;
+        let path = project_path(&project.name, project.id);
+        let backup_path = if project.name == "default" {
+            self.preserve_unloadable_default_project(&path, project.id)
+                .await
+                .inspect_err(|error| {
+                    warn!(path = ?path, project_id = %project.id, %error,
+                        "refusing default project replacement: preservation failed");
+                })?
+        } else {
+            None
+        };
+        self.persist_json_result(&path, project)
+            .await
+            .inspect_err(|_| {
+                warn!(path = ?path, project_id = %project.id, backup_path = ?backup_path,
+                    "failed to persist project; cached project unchanged");
+            })?;
         self.projects
             .write()
             .await
             .insert(project.id, project.clone());
-        self.persist_json(project_path(&project.name, project.id), project)
-            .await;
+        if let Some(backup_path) = backup_path {
+            warn!(path = ?path, project_id = %project.id, backup_path = ?backup_path,
+                "re-created default project; unloadable record preserved");
+        }
         Ok(())
     }
 
@@ -3193,6 +3263,96 @@ mod tests {
                 ],
             )?;
             assert_no_log_carries_at_or_above(lines, "this is not json", "WARN")
+        });
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    #[traced_test]
+    async fn unreadable_default_project_refuses_replacement() {
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("unreadable-default", db));
+        let project = Project::new("user", "default", "must not overwrite");
+        let path = project_path(&project.name, project.id);
+        workspace
+            .write(&path, "{unreadable original")
+            .await
+            .unwrap();
+        let store = HybridStore::new(Some(workspace.clone()));
+        store.fail_workspace_reads.lock().await.insert(path.clone());
+        store.load_state_from_workspace().await.unwrap();
+
+        assert!(store.save_project(&project).await.is_err());
+        assert!(store.load_project(project.id).await.unwrap().is_none());
+        assert_eq!(
+            workspace.read_primary(&path).await.unwrap().content,
+            "{unreadable original"
+        );
+        logs_assert(|lines| {
+            assert_logged_at(
+                lines,
+                "WARN",
+                &[
+                    "refusing default project replacement: preservation failed",
+                    &path,
+                    &project.id.to_string(),
+                ],
+            )?;
+            assert_no_log_carries_at_or_above(lines, "unreadable original", "WARN")
+        });
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    #[traced_test]
+    async fn default_project_skipped_by_transient_read_failure_is_preserved() {
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("transient-default", db));
+        let mut project = Project::new("user", "default", "original custom description");
+        let path = project_path(&project.name, project.id);
+        let original = serde_json::to_string_pretty(&project).unwrap();
+        workspace.write(&path, &original).await.unwrap();
+        let store = HybridStore::new(Some(workspace.clone()));
+        store.fail_workspace_reads.lock().await.insert(path.clone());
+        store.load_state_from_workspace().await.unwrap();
+        assert!(store.load_project(project.id).await.unwrap().is_none());
+
+        store.fail_workspace_reads.lock().await.clear();
+        project.description = "re-created default".into();
+        store.save_project(&project).await.unwrap();
+        let backups: Vec<_> = workspace
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|candidate| candidate.starts_with(&format!("backups/{path}.unloadable-")))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            workspace.read_primary(&backups[0]).await.unwrap().content,
+            original
+        );
+        assert_eq!(
+            store
+                .load_project(project.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .description,
+            project.description
+        );
+        logs_assert(|lines| {
+            assert_logged_at(
+                lines,
+                "WARN",
+                &[
+                    "re-created default project; unloadable record preserved",
+                    &path,
+                    &backups[0],
+                    &project.id.to_string(),
+                ],
+            )?;
+            assert_no_log_carries_at_or_above(lines, "original custom description", "WARN")
         });
     }
 

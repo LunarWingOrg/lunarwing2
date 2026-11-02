@@ -256,6 +256,10 @@ RUN mkdir -p /home/kimi/.kimi-code \
     && chown -R kimi:kimi /home/kimi /workspace /var/log/lunarwing /app/results
 
 # WI#206: task-side inputs must be readable but remain root-owned and read-only.
+# WI#529 rewrite contract: consumers never write these inputs. The task setup
+# writes $KIMI_CODE_HOME/config.toml from a temp file and leaves the baked
+# /app/config/config.toml untouched; see docs/ops/WORKER-CONTAINERS.md →
+# "Baked-config rewrite contract (WI#529)".
 RUN set -eu; \
     chmod -R a+rX /app/config /app/hooks /app/scripts; \
     chmod a+r /app/health_server.py /app/task_runner_bind.py /app/agent_comm_protocol.json; \

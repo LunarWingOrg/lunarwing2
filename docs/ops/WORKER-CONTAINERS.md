@@ -328,6 +328,50 @@ real-chown pins). That block needs euid 0 plus a mapped uid 10001 and a
 working uid switch, so it self-skips with a named reason elsewhere (the dev
 VM runs it under `podman unshare`).
 
+### Baked-config rewrite contract (WI#529)
+
+The worker images make their task-side inputs immutable: `/app/config` (and
+the hooks/scripts trees) are root-owned `0555` directories with `0444` files,
+and the image build fails if any write bit or non-root owner survives
+(`opencode4lunarwing/Dockerfile`, `kimicode4lunarwing/Dockerfile`,
+`opencode2.4lunarwing/Dockerfile`). That hardening is the image layer's
+inventory guarantee, not a promise about the consumer's workspace copy.
+Because `cp` inherits the source mode, every in-container consumer that
+rewrites a config got a `0444` file and died `EACCES` on the first write —
+WI#523 was that shape for the OpenCode v1 model/baseURL block.
+
+The contract, binding:
+
+- **Baked originals never change.** Consumers write a task-owned workspace
+  copy. `opencode4lunarwing/entrypoint-task-setup.sh` owns the two helpers
+  that carry the knowledge — `materialize_config_copy` (`cp` then
+  `chmod u+w` on the copy) and `ensure_config_rewritable` (an alias or a
+  missing target is materialized from the baked source; a non-writable
+  regular file is widened from **its own** content, so an earlier
+  injector's rewrite is never reverted) — and every consumer uses
+  them: the model/baseURL rewrite, the Paseo MCP injector and the Study
+  Notes MCP injector. `opencode2.4lunarwing/entrypoint.sh` performs the
+  same sequence for `opencode2.json`; the Kimi lane writes
+  `$KIMI_CODE_HOME/config.toml` from a temp file and never touches the
+  baked source.
+- **The no-override path is a symlink to the baked original**, and the
+  WI#330 placeholder sentinel reads through it. The task setup asserts the
+  alias resolves to the baked config and that it is readable by the task
+  uid, so a future mode, ownership or layout change fails loudly instead of
+  silently grepping something else. `opencode2.4lunarwing/entrypoint.sh`
+  carries the same alias binding for its `$OPENCODE_CONFIG` sentinel.
+- **One test binds the three copies of the knowledge.**
+  `.gitlab/tests/test_worker_config_rewrite_contract.py` statically pins
+  the Dockerfile gate, the helper use at every in-place write, and the Kimi
+  lane's write shape, then runs the real task setup as the task uid against
+  a `0444` fixture (overrides, Paseo-only, Study-Notes-only, sentinel and
+  linked no-override paths). Both OpenCode v1 and Kimi image builds also
+  execute the real task setup as their task uid and assert the materialized
+  copy is writable while the baked file stays `0444`.
+
+Adding an in-place writer? Route it through the helpers and add a live
+fixture; do not widen the baked file's mode to make a consumer work.
+
 ### Pebble task sandbox: procps is unsupported (WI#480)
 
 Upstream pebble enables its namespace sandbox by default. Its Bash tool runs
@@ -717,7 +761,10 @@ Enforced controls (opencode2 lane unless noted):
    runtime config from the baked source at every boot. An override copy gets
    owner-write permission before the config writers run; the baked source
    stays read-only. Live runtime/project configs and operator-selected
-   `OPENCODE_CONFIG` remain untrusted and mutable.
+   `OPENCODE_CONFIG` remain untrusted and mutable. WI#529: that copy
+   permission is owned by `entrypoint-task-setup.sh`'s
+   `materialize_config_copy`/`ensure_config_rewritable` helpers, which every
+   config writer calls — see "Baked-config rewrite contract" above.
 4. **CI guards.** `.gitlab/scripts/check-worker-exposure-policy.sh` (job
    `worker-exposure-policy-guard`) checks source/config pins, the every-token
    wrapper, compile-out tests, non-root boot configuration, and bridge ruleset

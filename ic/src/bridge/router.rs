@@ -4,6 +4,8 @@ pub(crate) mod auth;
 #[cfg(test)]
 mod estimation_tests;
 mod outcome;
+#[cfg(all(test, feature = "libsql"))]
+mod project_recovery_tests;
 mod v1_history_import;
 use outcome::{await_thread_outcome, turn_history_metadata_key};
 
@@ -895,7 +897,8 @@ const DEFAULT_PROJECT_ID_NAMESPACE: uuid::Uuid =
 /// writes the same record (same id ⇒ same map key ⇒ same
 /// `engine/projects/default--<id8>/` directory), and a later resolution sees
 /// exactly one `"default"` project. It also keeps missions attached to that
-/// directory when a project.json that failed to load is rewritten at boot.
+/// directory when an unloadable project.json is re-created at boot or on a
+/// user's next message. HybridStore preserves that record first (WI#535).
 fn default_project_id(user_id: &str) -> lunarwing_engine::ProjectId {
     lunarwing_engine::ProjectId(uuid::Uuid::new_v5(
         &DEFAULT_PROJECT_ID_NAMESPACE,

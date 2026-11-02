@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::channels::web::auth::AuthenticatedUser;
 use crate::channels::web::server::GatewayState;
 use crate::channels::web::types::*;
+use crate::orchestrator::job_cancel::{CancelPolicy, JobCancelError, JobCanceller};
 
 /// Query parameters for `GET /api/jobs`.
 #[derive(Debug, Deserialize)]
@@ -360,47 +361,82 @@ pub async fn jobs_detail_handler(
     }
 }
 
-async fn cancel_external_job(
+/// Cancel either sandbox runtime kind through the shared sequencer.
+async fn cancel_sandbox_job(
     state: &GatewayState,
     job_id: Uuid,
-) -> Result<bool, (StatusCode, String)> {
-    let manager = state.external_worker_manager.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "External worker manager not available".to_string(),
-    ))?;
-    let context_manager = manager.context_manager_handle().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Job context manager not available".to_string(),
-    ))?;
-    if !manager.cancel_task(job_id).await {
-        return Ok(false);
+    job_mode: Option<&str>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let external = job_mode.is_some_and(|mode| mode.starts_with("external:"));
+    if external && state.external_worker_manager.is_none() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "External worker manager not available".to_string(),
+        ));
     }
 
-    context_manager
-        .update_context(job_id, |context| {
-            if context.state == crate::context::JobState::Cancelled {
-                Ok(())
-            } else {
-                context.transition_to(
-                    crate::context::JobState::Cancelled,
-                    Some("Cancelled by user".to_string()),
-                )
-            }
-        })
+    let context_manager = state.context_manager.clone().or_else(|| {
+        state
+            .external_worker_manager
+            .as_ref()
+            .and_then(|manager| manager.context_manager_handle().cloned())
+    });
+    if external && context_manager.is_none() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Job context manager not available".to_string(),
+        ));
+    }
+
+    let mut canceller = JobCanceller::new(context_manager);
+    if let Some(scheduler) = &state.scheduler {
+        canceller = canceller.with_scheduler(Arc::clone(scheduler));
+    }
+    if let Some(manager) = &state.job_manager {
+        canceller = canceller.with_container_jobs(Arc::clone(manager));
+    }
+    if let Some(manager) = &state.external_worker_manager {
+        canceller = canceller.with_external_workers(Arc::clone(manager));
+    }
+    if let Some(store) = &state.store {
+        canceller = canceller.with_store(Arc::clone(store));
+    }
+
+    let report = canceller
+        .cancel(job_id, CancelPolicy::RequireRuntime)
         .await
         .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to load job context for cancellation: {error}"),
-            )
-        })?
-        .map_err(|reason| {
-            (
-                StatusCode::CONFLICT,
-                format!("Job context cannot be cancelled: {reason}"),
-            )
+            let status = match &error {
+                JobCancelError::Finalizing { .. }
+                | JobCancelError::NoActiveRuntime { .. }
+                | JobCancelError::ContextConflict { .. } => StatusCode::CONFLICT,
+                JobCancelError::Scheduler { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, error.to_string())
         })?;
-    Ok(true)
+
+    if let Some(error) = report.persistence_error {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "Cancellation was delivered, but the terminal status could not be persisted: {error}"
+            ),
+        ));
+    }
+    if let Some(error) = report.context_error {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "Cancellation was delivered and persisted, but the in-memory job context could not be synchronized: {error}"
+            ),
+        ));
+    }
+
+    Ok(Json(serde_json::json!({
+        "status": "cancelled",
+        "job_id": job_id,
+        "runtime_stop_deferred": report.runtime_stop_deferred,
+    })))
 }
 
 pub async fn jobs_cancel_handler(
@@ -429,42 +465,7 @@ pub async fn jobs_cancel_handler(
                     .get_sandbox_job_mode(job_id)
                     .await
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-                let delivered = if mode.as_deref().is_some_and(|m| m.starts_with("external:")) {
-                    cancel_external_job(state.as_ref(), job_id).await?
-                } else if let Some(ref manager) = state.job_manager {
-                    manager.stop_job(job_id).await.map_err(|error| {
-                        (
-                            StatusCode::CONFLICT,
-                            format!("Job runtime is not active: {error}"),
-                        )
-                    })?;
-                    true
-                } else {
-                    false
-                };
-
-                if !delivered {
-                    return Err((
-                        StatusCode::CONFLICT,
-                        "Job has no active runtime; cancellation was not delivered".to_string(),
-                    ));
-                }
-
-                store
-                    .update_sandbox_job_status(
-                        job_id,
-                        "cancelled",
-                        Some(false),
-                        Some("Cancelled by user"),
-                        None,
-                        Some(chrono::Utc::now()),
-                    )
-                    .await
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-                return Ok(Json(serde_json::json!({
-                    "status": "cancelled",
-                    "job_id": job_id,
-                })));
+                return cancel_sandbox_job(state.as_ref(), job_id, mode.as_deref()).await;
             }
             Ok(None) => {}
             Err(e) => {
