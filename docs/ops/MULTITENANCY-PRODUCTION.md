@@ -898,7 +898,7 @@ build-tenant <name>              Build one tenant (flock-serialized)
 build-all                        Build registered tenants sequentially
   --with-wasm                    Also build WASM extensions
   --require-wasm                 Fail rather than preserve stale WASM (build-tenant)
-  --with-pebble                  Also build the shared Pebble image
+  --with-pebble                  Also build the shared Pebble image (clean tenant checkout)
   --with-opencode                Also build the shared OpenCode image
   --with-kimi                    Also build the shared Kimi Code image
   --with-toolchains              Use full toolchain OpenCode/Kimi images
