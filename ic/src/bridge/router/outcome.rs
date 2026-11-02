@@ -112,7 +112,7 @@ pub(super) async fn await_thread_outcome(
         return Ok(Some(String::new()));
     };
     cancellation.disarm();
-    turn.complete(outcome).await
+    turn.complete_once(outcome).await
 }
 
 impl TurnCompletion {
@@ -271,6 +271,18 @@ impl TurnCompletion {
                     "The turn exceeded its extended time limit and was stopped. Please try again."
                         .into(),
             };
+        }
+        self.complete_once(outcome).await
+    }
+
+    async fn complete_once(&self, outcome: ThreadOutcome) -> Result<Option<String>, Error> {
+        if !self
+            .state
+            .thread_manager
+            .claim_thread_completion(self.thread_id, self.run_started_at)
+            .await
+        {
+            return Ok(Some(String::new()));
         }
         self.complete(outcome).await
     }
