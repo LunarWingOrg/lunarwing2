@@ -115,7 +115,11 @@ See checklist item 7 in `docs/ops/WORKER-CONTAINERS.md`.
 - Let the worker self-expose (WI#357): never start service mode
   (`opencode service …`, `serve --service`), pairing (`opencode pair …`),
   or a non-loopback `serve`; never enable session sharing (`share` stays
-  `"disabled"`) or self-update (`update` stays `"disable"`). Keep the
+  `"disabled"`) or self-update. The `update` pin in the lane config is *not*
+  the guard (the updater reads only the global config dir, never
+  `OPENCODE_CONFIG`); the live controls are the image env
+  `OPENCODE_DISABLE_AUTOUPDATE=1` and the wrapper's `upgrade`/`update`
+  refusal. Keep both. Keep the
   guards in place: the every-token wrapper at `/usr/local/bin/opencode`,
   the boot-time `service.json` reset (`disabled: true`, resolved via
   `OPENCODE_CONFIG_DIR` or `${XDG_CONFIG_HOME:-~/.config}/opencode` like
