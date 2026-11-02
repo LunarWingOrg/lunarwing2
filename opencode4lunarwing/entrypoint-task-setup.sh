@@ -19,6 +19,37 @@ WORKSPACE_ROOT="${WORKSPACE_ROOT:-/workspace}"
 
 umask "$FILE_UMASK"
 
+# ── WI#529 baked-config rewrite contract ──────────────────────────────────────
+# /app/config is immutable by construction: the Dockerfile runs
+# `chmod -R a-w /app/config` and then fails the build if any write bit
+# survives (`find -perm /222`). `cp` preserves that 0444 mode, so a consumer
+# that rewrites its workspace copy in place must widen the owner write bit on
+# THAT copy — never on the baked original. Both helpers below are the single
+# place this contract lives; every materialization and every injector calls
+# them instead of repeating the chmod. Guarded by
+# .gitlab/tests/test_worker_config_rewrite_contract.py (static binding + a live
+# non-root boot against a 0444 fixture).
+materialize_config_copy() {
+  # <baked-source> <workspace-target>: task-owned, rewritable copy.
+  local source="$1" target="$2"
+  [ -f "$source" ] || die "baked config not found: $source (WI#529)"
+  rm -f "$target"
+  cp "$source" "$target"
+  chmod u+w "$target"
+}
+
+ensure_config_rewritable() {
+  # <baked-source> <workspace-target>: precondition for an in-place rewrite.
+  # The no-override fast path leaves a symlink to the immutable baked file;
+  # a rewrite through that alias would try to write the image layer. Replace
+  # the alias with a private copy so no consumer depends on another consumer
+  # having widened the mode first (WI#529 consumer c).
+  local source="$1" target="$2"
+  if [ -L "$target" ] || [ ! -w "$target" ]; then
+    materialize_config_copy "$source" "$target"
+  fi
+}
+
 # ── git / SSH credential setup ────────────────────────────────────────────────
 if [ -n "${GIT_AUTHOR_NAME:-}" ] && ! git config --global user.name >/dev/null 2>&1; then
   git config --global user.name "$GIT_AUTHOR_NAME"
@@ -78,18 +109,14 @@ if [ -f /app/config/opencode.json ]; then
       || [ -n "${PASEO_URL:-}" ] || [ -n "${PASEO_TOKEN:-}" ] \
       || [ -n "${LW2STUDYMCP_HOME:-}" ] \
       || [ -n "${LW2STUDYMCP_STATE_HOME:-}" ]; then
-    rm -f "$WORKSPACE_ROOT/.opencode/opencode.json"
-    cp /app/config/opencode.json "$WORKSPACE_ROOT/.opencode/opencode.json"
-    # WI#523: the Dockerfile hardens /app/config with `chmod -R a-w` and a
-    # build-time assertion that no writable bit survives, so `cp` (no -p)
-    # births the workspace copy at 0444 — owned by the task uid, but still
-    # not writable to it (owner w-bit is what matters). The model/baseURL
-    # heredoc (:117) and the Paseo heredoc (:151) both rewrite this copy
-    # in place via open(path,"w"), which dies EACCES on a 0444 file. Widen
-    # the owner write bit right after the copy so every in-place rewrite
-    # downstream succeeds; the image hardening and its assertion are left
-    # intact (they guard the baked original, not this task-owned copy).
-    chmod u+w "$WORKSPACE_ROOT/.opencode/opencode.json"
+    # WI#523/WI#529: the Dockerfile hardens /app/config with `chmod -R a-w`
+    # and a build-time assertion that no writable bit survives, so `cp` (no
+    # -p) births the workspace copy at 0444 — owned by the task uid, but
+    # still not writable to it. Every consumer that rewrites its copy goes
+    # through materialize_config_copy, which widens the owner write bit on
+    # the COPY only; the image hardening is left intact.
+    materialize_config_copy /app/config/opencode.json \
+      "$WORKSPACE_ROOT/.opencode/opencode.json"
     config_materialized=true
   else
     ln -sfn /app/config/opencode.json "$WORKSPACE_ROOT/.opencode/opencode.json"
@@ -138,13 +165,37 @@ PY
   # defaulting to the tenant's own LLM endpoint — so a placeholder that
   # survives to the runtime config means a hand-rolled deployment forgot the
   # override. Fail loudly at startup instead of at the first LLM request.
-  if grep -q 'set-opencode-base-url\.invalid' "$WORKSPACE_ROOT/.opencode/opencode.json" 2>/dev/null; then
+  #
+  # WI#529 consumer (a): the no-override path leaves a symlink to the baked
+  # file, and grep follows it, so this sentinel reads the BAKED original — a
+  # mode-blind read on a path that is 0444-root-owned BY CONSTRUCTION of the
+  # image hardening. That is correct only while the alias resolves to the
+  # baked original; bind it here so a future mode, ownership or layout change
+  # re-surfaces as a reviewed delta instead of a silent grep of something
+  # else.
+  runtime_config="$WORKSPACE_ROOT/.opencode/opencode.json"
+  if [ -L "$runtime_config" ]; then
+    resolved_config="$(readlink -f "$runtime_config")"
+    baked_config="$(readlink -f /app/config/opencode.json)"
+    [ "$resolved_config" = "$baked_config" ] \
+      || die "workspace config alias points at $resolved_config, not the baked config $baked_config (WI#529)"
+    [ -r "$resolved_config" ] \
+      || die "baked config $resolved_config is not readable by the task uid (WI#529)"
+  fi
+  if grep -q 'set-opencode-base-url\.invalid' "$runtime_config" 2>/dev/null; then
     die "OPENCODE_BASE_URL is unset and the baked config is a placeholder; set it (mt-admin: configure-opencode <tenant> --base-url <url>) to a container-reachable OpenAI-compatible endpoint"
   fi
 fi
 
 # ── optional Paseo MCP integration ────────────────────────────────────────────
 if [ -n "${PASEO_URL:-}" ] && [ -n "${PASEO_TOKEN:-}" ] && [ -f "$WORKSPACE_ROOT/.opencode/opencode.json" ]; then
+  # WI#529 consumer (c): this injector rewrites the SAME workspace config as
+  # the model/baseURL block above, but through an independent path. Materialize
+  # a writable copy here too rather than relying on the other block having run
+  # (it can be skipped by an operator-set symlink target), so the readonly
+  # contract is enforced by the injector that needs it.
+  ensure_config_rewritable /app/config/opencode.json \
+    "$WORKSPACE_ROOT/.opencode/opencode.json"
   python3 - "$WORKSPACE_ROOT/.opencode/opencode.json" <<'PY'
 import json, os, sys
 path = sys.argv[1]
@@ -166,6 +217,11 @@ fi
 
 # ── optional LunarWing Study Notes MCP integration ────────────────────────────
 if [ -n "${LW2STUDYMCP_HOME:-}" ] && [ -f "$WORKSPACE_ROOT/.opencode/opencode.json" ]; then
+  # WI#529 consumer (c) shape: an independent injector on the same copy. The
+  # writer is atomic (temp file + rename) so a readonly target would survive,
+  # but bind it to the same contract so no consumer assumes a writer ran first.
+  ensure_config_rewritable /app/config/opencode.json \
+    "$WORKSPACE_ROOT/.opencode/opencode.json"
   study_args=(
     --config "$WORKSPACE_ROOT/.opencode/opencode.json"
     --home "$LW2STUDYMCP_HOME"

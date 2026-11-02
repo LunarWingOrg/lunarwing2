@@ -290,6 +290,16 @@ COPY config/ ./config/
 # mt-admin's private tenant clone has) would leave /app/config and /app/scripts
 # unreadable by 10001 while root-side boot still worked. Normalize the modes
 # here so the image is identical regardless of the builder's umask.
+#
+# WI#529 REWRITE CONTRACT (binding, do not relax): the baked inputs under
+# /app/config are immutable — root-owned, no write bit, asserted below.
+# In-container consumers that need to change their config (the model/baseURL
+# override, the Paseo MCP entry, the Study Notes MCP entry in
+# entrypoint-task-setup.sh) write a TASK-OWNED WORKSPACE COPY, never the baked
+# original: they call materialize_config_copy/ensure_config_rewritable, which
+# copy and then `chmod u+w` the copy because `cp` inherits this 0444 mode.
+# Adding an in-place writer? Bind it to those helpers; the static + live
+# contract test is .gitlab/tests/test_worker_config_rewrite_contract.py.
 RUN set -eu; \
     chmod -R a+rX /app/config /app/scripts; \
     chmod a+r /app/health_server.py /app/agent_comm_protocol.json; \
