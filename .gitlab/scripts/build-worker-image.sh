@@ -55,7 +55,12 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         # WI#467: the models.dev snapshot is compiled into the binary and the
         # guard script executes during the build (CY-4 precedent: build-read
         # inputs and build-executed scripts must hash into worker-inputs).
+        # WI#529: the mode-normalization RUN now executes the real
+        # entrypoint-task-setup.sh as the task uid against the baked config,
+        # so both are build-read inputs.
         input_files='opencode4lunarwing/Dockerfile
+opencode4lunarwing/entrypoint-task-setup.sh
+opencode4lunarwing/config/opencode.json
 opencode4lunarwing/models-dev/api.json
 opencode4lunarwing/scripts/check_models_dev_snapshot.py
 opencode4lunarwing/scripts/fix_photon_patch_context.py
