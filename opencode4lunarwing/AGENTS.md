@@ -15,6 +15,7 @@ Persistent container worker for upstream opencode. The WebSocket bridge is TypeS
 - `entrypoint-split.sh` — WI#454 managed pair: bridge uid 10101:10001 holds the token under `/home/opencode-bridge`; task uid 10001:10001 owns serve and task execution. Both drop all capabilities. IPC is role-owned on the sticky `-ipc-v2` volume; rootful launchers verify the mounted workspace inode.
 - `scripts/task_runner.ts` / `scripts/task_runner_client.ts` — Bounded Unix task dispatch, cancellation, follow-ups and ping health. Cron directory creation runs in the task container. Reject credential grants before delegation; prompt refusal must not abort the run. Jobs inside one task container still share authority.
 - `entrypoint.sh` — Dispatches managed roles to the split launcher; retains cli/acp and host legacy paths. Split images require an explicit websocket role. See `docs/ops/WORKER-CONTAINERS.md` for paired lifecycle, mounts and migration.
+- `entrypoint-task-setup.sh` — Task-uid setup (git/SSH, config materialization, MCP injection). WI#529: the baked `/app/config` is immutable (`chmod -R a-w` + build assertion), so every consumer that rewrites a config calls `materialize_config_copy`/`ensure_config_rewritable` — those two helpers own the rewrite contract, and `.gitlab/tests/test_worker_config_rewrite_contract.py` binds them to the Dockerfile gate and the live boot. Do not add an in-place writer that skips them.
 - `config/opencode.json` — Mounted into container; controls LLM provider, plugins, MCP servers.
 - `models-dev/api.json` — WI#467 reviewed models.dev catalog snapshot compiled into the binary at build time (`MODELS_DEV_API_JSON`), committed pretty-printed (`json.dumps` indent=1, `ensure_ascii=False`); sha256 pinned as the Dockerfile's `MODELS_DEV_SNAPSHOT_SHA256` ARG and cross-checked by `validate_config.py`, which also enforces strict JSON in that layout. Refresh both in one deliberate commit (command in `docs/ops/WORKER-CONTAINERS.md`).
 - `scripts/check_models_dev_snapshot.py` — WI#467 fail-closed build assert: the pinned upstream `generate.ts` must still read `MODELS_DEV_API_JSON` and `OPENCODE_MODELS_URL` (the build points the latter at a closed loopback port, so any live fetch fails), and the snapshot must be strict JSON.
@@ -49,3 +50,6 @@ or downgrade Bun. See checklist item 7 in `docs/ops/WORKER-CONTAINERS.md`.
   pinned `"share": "disabled"` in `config/opencode.json`. Workers must never
   open their own inbound path or publish sessions; see
   `docs/ops/WORKER-CONTAINERS.md` → "Worker exposure policy".
+- Widen the baked `/app/config` modes to make a config writer work (WI#529).
+  The image hardening is the contract; consumers widen their own workspace
+  copy through the task-setup helpers instead.
