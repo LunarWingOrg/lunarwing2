@@ -30,8 +30,10 @@ photon-node patch's hunk-10 context whitespace, and each builder ran
 `python3 /build/fix_photon_patch_context.py /build/opencode` immediately after
 checkout and before `bun install --frozen-lockfile`, backporting upstream
 `61845b0`'s three-space repair. **That repair is retired as of the v1.19.5 /
-v2.2.5 pins (WI#531):** both trees already carry `61845b0`, so the fixer's
-exact-match guard reports the repair as redundant. The fixer files, their
+v2.2.5 pins (WI#531):** both trees carry the repair in content (a
+content-equivalent backport — neither tag contains the commit itself, so do
+not test it with `merge-base --is-ancestor`), so the fixer's exact-match
+guard reports the repair as redundant. The fixer files, their
 Dockerfile `COPY`/`RUN` and self-test invocations, and the two `input_files`
 entries per lane are gone together; Bun was not downgraded and the drift
 guard was not weakened. See bump checklist item 7 below before moving either
@@ -912,8 +914,9 @@ Enforced controls (opencode2 lane unless noted):
    surface. For opencode2 bumps past v2.0.24 the compile-out guard (8) plus
    these guards cover the *shipped binary*; against a compromised agent
    only control 1 makes the crossing safe (see the gate record above).
-   **Photon-node repair retirement:** when a new OpenCode pin includes
-   upstream `61845b0`, `fix_photon_patch_context.py` deliberately fails with
+   **Photon-node repair retirement:** when a new OpenCode pin carries the
+   `61845b0` whitespace repair in content (a backport; the tag need not
+   contain the commit), `fix_photon_patch_context.py` deliberately fails with
    "already carries the fixed whitespace". For each affected lane, remove
    both `scripts/fix_photon_patch_context{,_test}.py` files, the Dockerfile's
    fixer COPY/RUN before `bun install`, its self-test invocation, and the two
@@ -1680,7 +1683,8 @@ directly to the commit; the `--depth 1` clone's HEAD matches). Dockerfile
 defaults and the CI case block moved together. The Bun base digest and
 `DEBIAN_SNAPSHOT` are unchanged (WI#361 owns those).
 
-**Photon-node repair retired.** v2.2.5 carries upstream `61845b0`, so
+**Photon-node repair retired.** v2.2.5 carries the `61845b0` whitespace
+repair as a content-equivalent backport, so
 `fix_photon_patch_context.py` fails its exact-match guard with "already
 carries the fixed whitespace" — the documented retirement signal. Removed in
 this bump: both `scripts/fix_photon_patch_context{,_test}.py` files, the

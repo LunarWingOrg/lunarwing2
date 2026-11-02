@@ -31,7 +31,8 @@ The Dockerfile fetches anomalyco/opencode at the full SHA in `OPENCODE_REF` and 
 Keep `ARG SOURCE_DATE_EPOCH=0` before runtime account creation and preserve the same-layer `/etc/shadow` epoch-day assertion (WI#510): timestamp rewriting cannot fix a wall-clock day embedded in file contents. All four worker snapshots and `CI_DEBIAN_SNAPSHOT` move together; `20261024T011300Z` includes the Bookworm/Trixie Brotli OS-package fixes.
 
 The Bun 1.4.4 photon-node hunk-10 repair that this lane used to apply at the
-v1.18.25 pin is retired: v1.19.5 already carries upstream `61845b0`, so
+v1.18.25 pin is retired: v1.19.5 carries the `61845b0` whitespace repair as a
+content-equivalent backport (the tag does not contain that commit), so
 `fix_photon_patch_context.py` would fail as redundant. The two fixer files,
 their Dockerfile `COPY`/`RUN` and self-test invocation, and this lane's two
 `input_files` entries in `.gitlab/scripts/build-worker-image.sh` were removed

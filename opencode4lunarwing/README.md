@@ -96,8 +96,11 @@ against a hostile agent on the same uid.
 > **The v1.19.5 bump (WI#531) does not fix this:** the `sys.environment(model)`
 > call site and its surrounding prompt assembly are unchanged between the two
 > tags, so the crash path is carried forward untested — no live dispatch has
-> been run at v1.19.5. The opencode2 worker (`mode: "opencode2"`) remains the
-> working lane, and the v1 lane is expected to be retired (goals item 34). The
+> been run at v1.19.5. Neither v1.18.29 regression is verified fixed at
+> v1.19.5 either; both are open risks carried with this pin. The opencode2
+> worker (`mode: "opencode2"`) remains the working lane, and the v1 lane is
+> expected to be retired (goals item 34). Run one live v1 dispatch on a test
+> tenant after the first master candidate build to settle both. The
 > enrichment above is what surfaces this crash in the job error instead of
 > the bare 500 wrapper.
 

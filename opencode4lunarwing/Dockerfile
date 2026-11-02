@@ -1,9 +1,15 @@
 # v1.19.5 resolves to this reviewed commit. Both must move together.
 # v1.18.29 was reverted on 2026-09-07 because it shipped two regressions: the
 # provider/model metadata-shape crash ("a.name" TypeError) and a silent death
-# in the ai-sdk stream path. v1.19.5 supersedes the v1.18.25 pin (WI#531) and
-# carries upstream 61845b0, so the in-tree photon-node hunk repair is gone.
-# Re-bump only after re-verifying the bridge against the v1 server API.
+# in the ai-sdk stream path. WI#531 moves to v1.19.5 on the WI's authorization;
+# neither v1.18.29 regression has been verified fixed upstream at v1.19.5 and
+# no live dispatch has run, so both remain open risks on this pin. The lane is
+# expected to be retired (goals item 34); re-bump only after re-verifying the
+# bridge against the v1 server API, and run one live v1 dispatch on a test
+# tenant after the first master candidate build.
+# The pin also carries the 61845b0 whitespace repair (content-equivalent
+# backport, not the commit itself), so the in-tree photon-node hunk repair is
+# gone.
 ARG OPENCODE_VERSION=v1.19.5
 ARG OPENCODE_REF=810c0eba1a7348036f8bdf61e6632d0c36c6876c
 ARG DEBIAN_SNAPSHOT=20261024T011300Z
@@ -53,7 +59,8 @@ RUN printf '%s' "${OPENCODE_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
 
 WORKDIR /build/opencode
 # The Bun 1.4.4 photon-node hunk-10 repair (upstream 61845b0) that this lane
-# used to apply at the v1.18.25 pin is retired: v1.19.5 already carries it.
+# used to apply at the v1.18.25 pin is retired: v1.19.5 carries that whitespace
+# repair as a content-equivalent backport, so the fixer is redundant.
 RUN bun install --frozen-lockfile && bun pm cache rm
 
 WORKDIR /build/opencode/packages/sdk/js

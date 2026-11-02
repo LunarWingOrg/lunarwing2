@@ -96,7 +96,8 @@ have different file contents, which BuildKit's timestamp rewrite cannot fix
 which includes the Bookworm/Trixie Brotli security fixes; bump them together.
 
 The Bun 1.4.4 photon-node hunk-10 repair that this lane used to apply at the
-v2.1.2 pin is retired: v2.2.5 already carries upstream `61845b0`, so
+v2.1.2 pin is retired: v2.2.5 carries the `61845b0` whitespace repair as a
+content-equivalent backport (the tag does not contain that commit), so
 `fix_photon_patch_context.py` would fail as redundant. The two fixer files,
 their Dockerfile `COPY`/`RUN` and self-test invocation, and this lane's two
 `input_files` entries in `.gitlab/scripts/build-worker-image.sh` were removed
