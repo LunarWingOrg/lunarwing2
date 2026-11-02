@@ -252,6 +252,31 @@ impl Rig {
 }
 
 #[tokio::test]
+async fn gate_waiting_join_is_silent_and_preserves_the_thread() {
+    let mut rig = Rig::new(None, None).await;
+    let result = rig
+        .turn
+        .late_result(
+            &mut rig.events,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+    assert!(result.is_none());
+    assert!(rig.replies.lock().unwrap().is_empty());
+    let saved = rig
+        .turn
+        .state
+        .store
+        .load_thread(rig.turn.thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.state, lunarwing_engine::ThreadState::Waiting);
+}
+
+#[tokio::test]
 async fn late_response_transforms_history_and_preserves_reply_route() {
     Rig::new(Some("raw answer"), Some(Policy::Modify))
         .await
