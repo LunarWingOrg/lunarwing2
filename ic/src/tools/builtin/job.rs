@@ -33,6 +33,7 @@ use crate::orchestrator::external_worker::{
 use crate::orchestrator::harness::{
     self, HarnessJobOptions, InjectionSpec, ResolvedSecretFile, SecretFileMount, WriteBackPolicy,
 };
+use crate::orchestrator::job_cancel::{CancelPolicy, JobCanceller};
 use crate::orchestrator::job_manager::{
     ContainerJobManager, ContainerJobRequest, HarnessJobRequest, JobMode, MAX_WORKER_MCP_SERVERS,
     snapshot_worker_mcp,
@@ -2668,6 +2669,21 @@ impl CancelJobTool {
         self.store = Some(store);
         self
     }
+
+    async fn is_persistence_retry(&self, job_id: Uuid, state: JobState) -> Result<bool, ToolError> {
+        if state != JobState::Cancelled {
+            return Ok(false);
+        }
+        let Some(store) = &self.store else {
+            return Ok(false);
+        };
+        let record = store.get_sandbox_job(job_id).await.map_err(|error| {
+            ToolError::ExecutionFailed(format!(
+                "failed to check persisted cancellation state for job {job_id}: {error}"
+            ))
+        })?;
+        Ok(record.is_some_and(|job| matches!(job.status.as_str(), "running" | "creating")))
+    }
 }
 
 #[async_trait]
@@ -2714,83 +2730,47 @@ impl Tool for CancelJobTool {
         if job.user_id != requester_id {
             return Err(ToolError::ExecutionFailed("Job not found".to_string()));
         }
-        if !job.state.is_parallel_blocking() {
+        let persistence_retry = self.is_persistence_retry(job_id, job.state).await?;
+        if !job.state.is_parallel_blocking() && !persistence_retry {
             return Err(ToolError::ExecutionFailed(format!(
                 "job {job_id} is {} and cannot be cancelled",
                 job.state
             )));
         }
 
-        let mut stopped = false;
-        if let Some(ref ewm) = self.external_worker_manager {
-            stopped |= ewm.cancel_task(job_id).await;
+        let mut canceller = JobCanceller::new(Some(Arc::clone(&self.context_manager)));
+        if let Some(scheduler) = self.scheduler.clone() {
+            canceller = canceller.with_scheduler(scheduler);
         }
-        if let Some(ref slot) = self.scheduler
-            && let Some(ref scheduler) = *slot.read().await
-        {
-            stopped |= scheduler.stop(job_id).await.map_err(|e| {
-                ToolError::ExecutionFailed(format!("failed to stop scheduled job: {e}"))
-            })?;
+        if let Some(manager) = self.job_manager.clone() {
+            canceller = canceller.with_container_jobs(manager);
         }
-        if let Some(ref jm) = self.job_manager {
-            match jm.stop_job(job_id).await {
-                Ok(()) => stopped = true,
-                Err(crate::error::OrchestratorError::ContainerNotFound { .. }) => {}
-                // DG-4: write-back promotion is running; cancellation must
-                // not clear the secrets its secret-scan needs or remove the
-                // staging dir mid-walk. Structural refusal variant (DH-4
-                // nit) — no error-string matching.
-                Err(crate::error::OrchestratorError::JobFinalizing { .. }) => {
-                    return Err(ToolError::ExecutionFailed(format!(
-                        "job {job_id} is finalizing write-back promotion; cancellation is refused — retry once it completes"
-                    )));
-                }
-                Err(error) => {
-                    tracing::warn!(%job_id, "Failed to stop container during cancellation: {error}");
-                }
-            }
+        if let Some(manager) = self.external_worker_manager.clone() {
+            canceller = canceller.with_external_workers(manager);
         }
-
-        let runtime_backends_configured = self.scheduler.is_some()
-            || self.job_manager.is_some()
-            || self.external_worker_manager.is_some();
-        if !stopped && runtime_backends_configured {
+        if let Some(store) = self.store.clone() {
+            canceller = canceller.with_store(store);
+        }
+        let report = canceller
+            .cancel(job_id, CancelPolicy::AllowContextOnly)
+            .await
+            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+        if let Some(error) = report.persistence_error {
             return Err(ToolError::ExecutionFailed(format!(
-                "job {job_id} has no active runtime to cancel"
+                "job {job_id} cancellation was delivered, but the terminal status could not be persisted: {error}"
             )));
         }
-
-        self.context_manager
-            .update_context(job_id, |ctx| {
-                if ctx.state == JobState::Cancelled {
-                    Ok(())
-                } else {
-                    ctx.transition_to(JobState::Cancelled, Some("Cancelled by user".to_string()))
-                }
-            })
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("failed to update job: {e}")))?
-            .map_err(|e| ToolError::ExecutionFailed(format!("cannot cancel job: {e}")))?;
-
-        if let Some(ref store) = self.store
-            && let Err(error) = store
-                .update_sandbox_job_status(
-                    job_id,
-                    "cancelled",
-                    Some(false),
-                    Some("Cancelled by user"),
-                    None,
-                    Some(Utc::now()),
-                )
-                .await
-        {
-            tracing::warn!(%job_id, "Failed to persist job cancellation: {error}");
+        if let Some(error) = report.context_error {
+            return Err(ToolError::ExecutionFailed(format!(
+                "job {job_id} cancellation was delivered and persisted, but the in-memory context could not be synchronized: {error}"
+            )));
         }
 
         let result = serde_json::json!({
             "job_id": job_id.to_string(),
             "status": "cancelled",
-            "message": "Job cancellation requested"
+            "message": "Job cancellation requested",
+            "runtime_stop_deferred": report.runtime_stop_deferred,
         });
         Ok(ToolOutput::success(result, start.elapsed()))
     }
