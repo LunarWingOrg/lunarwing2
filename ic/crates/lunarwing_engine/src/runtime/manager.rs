@@ -1,8 +1,11 @@
 //! Thread manager — top-level orchestrator for thread lifecycle.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
+use futures::FutureExt;
+use futures::future::{BoxFuture, Shared};
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
@@ -36,9 +39,23 @@ const WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 /// Poll interval while a stopped run settles inside its grace period.
 const STOP_SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
-type SharedJoinHandle =
-    Arc<AsyncMutex<Option<tokio::task::JoinHandle<Result<ThreadOutcome, EngineError>>>>>;
-type CompletedOutcomes = HashMap<ThreadId, HashMap<chrono::DateTime<chrono::Utc>, ThreadOutcome>>;
+const COMPLETED_OUTCOME_RETENTION: std::time::Duration = std::time::Duration::from_secs(22 * 60);
+
+type RunStartedAt = chrono::DateTime<chrono::Utc>;
+type SharedJoin = Shared<BoxFuture<'static, RunCompletion>>;
+type CompletedOutcomes = HashMap<ThreadId, HashMap<RunStartedAt, CompletedOutcome>>;
+
+#[derive(Clone)]
+enum RunCompletion {
+    Outcome(ThreadOutcome),
+    TaskPanicked,
+}
+
+struct CompletedOutcome {
+    outcome: ThreadOutcome,
+    finished_at: tokio::time::Instant,
+    completion_claimed: bool,
+}
 
 /// Handle to one incarnation of a running thread.
 #[derive(Clone)]
@@ -49,11 +66,77 @@ struct RunningThread {
     cancellation: CancellationToken,
     /// `created_at` changes when a caller re-adopts an id for a new turn, and
     /// stays stable when the same logical turn resumes from a gate.
-    run_started_at: chrono::DateTime<chrono::Utc>,
-    /// The first joiner takes the Tokio handle; later joiners read the outcome
-    /// retained in `completed`. The running entry itself stays registered so
-    /// interruption and steering remain available until the task finishes.
-    handle: SharedJoinHandle,
+    run_started_at: RunStartedAt,
+    completion: SharedJoin,
+    finished: Arc<AtomicBool>,
+}
+
+fn shared_completion(
+    thread_id: ThreadId,
+    handle: tokio::task::JoinHandle<Result<ThreadOutcome, EngineError>>,
+) -> (SharedJoin, Arc<AtomicBool>) {
+    let finished = Arc::new(AtomicBool::new(false));
+    let completion = {
+        let finished = Arc::clone(&finished);
+        async move {
+            let completion = match handle.await {
+                Ok(Ok(outcome)) => RunCompletion::Outcome(outcome),
+                Ok(Err(error)) => RunCompletion::Outcome(ThreadOutcome::Failed {
+                    kind: ThreadFailureKind::Unknown,
+                    error: error.to_string(),
+                }),
+                Err(error) => {
+                    error!(thread_id = %thread_id, "thread task panicked: {error}");
+                    RunCompletion::TaskPanicked
+                }
+            };
+            finished.store(true, Ordering::Release);
+            completion
+        }
+        .boxed()
+        .shared()
+    };
+    (completion, finished)
+}
+
+fn prune_completed_outcomes(completed: &mut CompletedOutcomes) {
+    let now = tokio::time::Instant::now();
+    completed.retain(|_, outcomes| {
+        outcomes.retain(|_, completed| {
+            now.duration_since(completed.finished_at) < COMPLETED_OUTCOME_RETENTION
+        });
+        !outcomes.is_empty()
+    });
+}
+
+fn remember_completed_outcome(
+    completed: &mut CompletedOutcomes,
+    thread_id: ThreadId,
+    run_started_at: RunStartedAt,
+    outcome: ThreadOutcome,
+) {
+    prune_completed_outcomes(completed);
+    completed.entry(thread_id).or_default().insert(
+        run_started_at,
+        CompletedOutcome {
+            outcome,
+            finished_at: tokio::time::Instant::now(),
+            completion_claimed: false,
+        },
+    );
+}
+
+fn remove_completed_outcome(
+    completed: &mut CompletedOutcomes,
+    thread_id: ThreadId,
+    run_started_at: RunStartedAt,
+) {
+    if let Some(outcomes) = completed.get_mut(&thread_id) {
+        outcomes.remove(&run_started_at);
+        if outcomes.is_empty() {
+            completed.remove(&thread_id);
+        }
+    }
 }
 
 fn clear_waiting_checkpoint_preserving_recovery(
@@ -447,6 +530,16 @@ impl ThreadManager {
         // record before its running entry exists and finalize live work.
         let resume_lock = self.resume_lock(thread_id).await;
         let _resume_guard = resume_lock.lock().await;
+        if self.is_running(thread_id).await {
+            self.revoke_lease_ids(
+                &thread.capability_leases,
+                "thread spawn collided with a live incarnation",
+            )
+            .await;
+            return Err(EngineError::Thread(
+                crate::types::error::ThreadError::AlreadyRunning(thread_id),
+            ));
+        }
 
         // Persist before publishing tree state or starting execution. If this
         // fails, revoke every lease granted for the uncreated thread.
@@ -833,27 +926,45 @@ impl ThreadManager {
                 );
             }
 
-            // Save final thread state to store
-            let thread_saved = match store_for_task.save_thread(&exec.thread).await {
-                Ok(()) => true,
-                Err(e) => {
+            let record_is_current = match store_for_task.load_thread(thread_id).await {
+                Ok(Some(stored)) => stored.created_at == run_started_at,
+                Ok(None) => false,
+                Err(error) => {
                     tracing::debug!(
                         thread_id = %thread_id,
-                        "failed to save final thread state: {e}"
+                        "failed to verify final thread generation: {error}"
                     );
                     false
+                }
+            };
+            let thread_saved = if !record_is_current {
+                tracing::debug!(
+                    thread_id = %thread_id,
+                    "skipping final save over a different thread generation"
+                );
+                false
+            } else {
+                match store_for_task.save_thread(&exec.thread).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::debug!(
+                            thread_id = %thread_id,
+                            "failed to save final thread state: {e}"
+                        );
+                        false
+                    }
                 }
             };
             if thread_saved && let Some(event) = terminal_event {
                 let _ = event_tx.send(event);
             }
 
-            completed
-                .write()
-                .await
-                .entry(thread_id)
-                .or_default()
-                .insert(run_started_at, outcome.clone());
+            remember_completed_outcome(
+                &mut *completed.write().await,
+                thread_id,
+                run_started_at,
+                outcome.clone(),
+            );
             let mut running = running.write().await;
             if running
                 .get(&thread_id)
@@ -864,13 +975,15 @@ impl ThreadManager {
             Ok(outcome)
         });
 
+        let (completion, finished) = shared_completion(thread_id, handle);
         running_registry.insert(
             thread_id,
             RunningThread {
                 signal_tx: tx,
                 cancellation,
                 run_started_at,
-                handle: Arc::new(AsyncMutex::new(Some(handle))),
+                completion,
+                finished,
             },
         );
         drop(running_registry);
@@ -912,6 +1025,7 @@ impl ThreadManager {
                 .filter(|current| {
                     run_started_at.is_none_or(|expected| current.run_started_at == expected)
                 })
+                .filter(|current| running_thread_is_live(current))
                 .ok_or(EngineError::ThreadNotFound(thread_id))?;
             (
                 running_thread.signal_tx.clone(),
@@ -1019,7 +1133,11 @@ impl ThreadManager {
             "owning thread externally stopped",
         )
         .await;
-        self.completed.write().await.remove(&thread_id);
+        remove_completed_outcome(
+            &mut *self.completed.write().await,
+            thread_id,
+            thread.created_at,
+        );
         if let Some(event) = thread.events.last().cloned() {
             let _ = self.event_tx.send(event);
         }
@@ -1073,7 +1191,11 @@ impl ThreadManager {
             "owning thread finalized as failed",
         )
         .await;
-        self.completed.write().await.remove(&thread_id);
+        remove_completed_outcome(
+            &mut *self.completed.write().await,
+            thread_id,
+            thread.created_at,
+        );
         if let Some(event) = thread.events.last().cloned() {
             let _ = self.event_tx.send(event);
         }
@@ -1124,7 +1246,7 @@ impl ThreadManager {
             let thread = running
                 .get(&thread_id)
                 .ok_or(EngineError::ThreadNotFound(thread_id))?;
-            if thread.cancellation.is_cancelled() {
+            if thread.cancellation.is_cancelled() || !running_thread_is_live(thread) {
                 return Err(EngineError::ThreadNotFound(thread_id));
             }
             thread.signal_tx.clone()
@@ -1214,13 +1336,15 @@ impl ThreadManager {
     /// Wait for the current incarnation of a thread and return its outcome.
     /// Every joiner receives the outcome; none unregisters live work.
     pub async fn join_thread(&self, thread_id: ThreadId) -> Result<ThreadOutcome, EngineError> {
-        let resume_lock = self.resume_lock(thread_id).await;
-        let _resume_guard = resume_lock.lock().await;
-        let Some(run_started_at) = self.current_run_started_at(thread_id).await? else {
+        let run_started_at = {
+            let resume_lock = self.resume_lock(thread_id).await;
+            let _resume_guard = resume_lock.lock().await;
+            self.current_run_started_at(thread_id).await?
+        };
+        let Some(run_started_at) = run_started_at else {
             return Err(EngineError::ThreadNotFound(thread_id));
         };
-        self.join_thread_for_run_locked(thread_id, run_started_at)
-            .await
+        self.join_thread_for_run(thread_id, run_started_at).await
     }
 
     /// Join one particular thread incarnation. Detached waiters use this so a
@@ -1229,11 +1353,26 @@ impl ThreadManager {
     pub async fn join_thread_for_run(
         &self,
         thread_id: ThreadId,
-        run_started_at: chrono::DateTime<chrono::Utc>,
+        run_started_at: RunStartedAt,
     ) -> Result<ThreadOutcome, EngineError> {
         let resume_lock = self.resume_lock(thread_id).await;
-        let _resume_guard = resume_lock.lock().await;
-        self.join_thread_for_run_locked(thread_id, run_started_at)
+        let running = {
+            let _resume_guard = resume_lock.lock().await;
+            self.running_for_run(thread_id, run_started_at).await
+        };
+        if let Some(running) = running {
+            return self.await_running_outcome(thread_id, running).await;
+        }
+
+        let resume_guard = resume_lock.lock().await;
+        if let Some(outcome) = self.completed_outcome(thread_id, run_started_at).await {
+            return Ok(outcome);
+        }
+        if let Some(running) = self.running_for_run(thread_id, run_started_at).await {
+            drop(resume_guard);
+            return self.await_running_outcome(thread_id, running).await;
+        }
+        self.recover_and_remember_outcome(thread_id, run_started_at)
             .await
     }
 
@@ -1241,7 +1380,7 @@ impl ThreadManager {
     pub async fn thread_run_started_at(
         &self,
         thread_id: ThreadId,
-    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, EngineError> {
+    ) -> Result<Option<RunStartedAt>, EngineError> {
         let resume_lock = self.resume_lock(thread_id).await;
         let _resume_guard = resume_lock.lock().await;
         self.current_run_started_at(thread_id).await
@@ -1250,7 +1389,7 @@ impl ThreadManager {
     async fn current_run_started_at(
         &self,
         thread_id: ThreadId,
-    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, EngineError> {
+    ) -> Result<Option<RunStartedAt>, EngineError> {
         if let Some(run_started_at) = self
             .running
             .read()
@@ -1272,26 +1411,17 @@ impl ThreadManager {
         Ok(latest_completed)
     }
 
-    async fn join_thread_for_run_locked(
+    async fn running_for_run(
         &self,
         thread_id: ThreadId,
-        run_started_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<ThreadOutcome, EngineError> {
-        let running = self
-            .running
+        run_started_at: RunStartedAt,
+    ) -> Option<RunningThread> {
+        self.running
             .read()
             .await
             .get(&thread_id)
             .filter(|current| current.run_started_at == run_started_at)
-            .cloned();
-        if let Some(running) = running {
-            return self.await_running_outcome(thread_id, running).await;
-        }
-        if let Some(outcome) = self.completed_outcome(thread_id, run_started_at).await {
-            return Ok(outcome);
-        }
-        self.recover_and_remember_outcome(thread_id, run_started_at)
-            .await
+            .cloned()
     }
 
     async fn await_running_outcome(
@@ -1300,22 +1430,22 @@ impl ThreadManager {
         running: RunningThread,
     ) -> Result<ThreadOutcome, EngineError> {
         let run_started_at = running.run_started_at;
-        let mut handle_slot = running.handle.lock().await;
-        let Some(handle) = handle_slot.take() else {
-            drop(handle_slot);
-            if let Some(outcome) = self.completed_outcome(thread_id, run_started_at).await {
-                return Ok(outcome);
-            }
-            return self
-                .recover_and_remember_outcome(thread_id, run_started_at)
-                .await;
-        };
-        let joined = handle.await;
-        drop(handle_slot);
-        match joined {
-            Ok(result) => result,
-            Err(error) => {
-                error!(thread_id = %thread_id, "thread task panicked: {error}");
+        match running.completion.await {
+            RunCompletion::Outcome(outcome) => Ok(outcome),
+            RunCompletion::TaskPanicked => {
+                let resume_lock = self.resume_lock(thread_id).await;
+                let _resume_guard = resume_lock.lock().await;
+                let mut registry = self.running.write().await;
+                if registry
+                    .get(&thread_id)
+                    .is_some_and(|current| current.run_started_at == run_started_at)
+                {
+                    registry.remove(&thread_id);
+                }
+                drop(registry);
+                if let Some(outcome) = self.completed_outcome(thread_id, run_started_at).await {
+                    return Ok(outcome);
+                }
                 self.recover_and_remember_outcome(thread_id, run_started_at)
                     .await
             }
@@ -1325,30 +1455,52 @@ impl ThreadManager {
     async fn completed_outcome(
         &self,
         thread_id: ThreadId,
-        run_started_at: chrono::DateTime<chrono::Utc>,
+        run_started_at: RunStartedAt,
     ) -> Option<ThreadOutcome> {
-        self.completed
-            .read()
-            .await
+        let mut completed = self.completed.write().await;
+        prune_completed_outcomes(&mut completed);
+        completed
             .get(&thread_id)
             .and_then(|outcomes| outcomes.get(&run_started_at))
-            .cloned()
+            .map(|completed| completed.outcome.clone())
+    }
+
+    /// Claim the single channel-delivery/history-completion pass for one run.
+    /// Other joiners still receive the outcome, but must not complete it again.
+    pub async fn claim_thread_completion(
+        &self,
+        thread_id: ThreadId,
+        run_started_at: RunStartedAt,
+    ) -> bool {
+        let mut completed = self.completed.write().await;
+        prune_completed_outcomes(&mut completed);
+        let Some(completed) = completed
+            .get_mut(&thread_id)
+            .and_then(|outcomes| outcomes.get_mut(&run_started_at))
+        else {
+            return false;
+        };
+        if completed.completion_claimed {
+            return false;
+        }
+        completed.completion_claimed = true;
+        true
     }
 
     async fn recover_and_remember_outcome(
         &self,
         thread_id: ThreadId,
-        run_started_at: chrono::DateTime<chrono::Utc>,
+        run_started_at: RunStartedAt,
     ) -> Result<ThreadOutcome, EngineError> {
         let outcome = self
             .recover_stored_outcome(thread_id, run_started_at)
             .await?;
-        self.completed
-            .write()
-            .await
-            .entry(thread_id)
-            .or_default()
-            .insert(run_started_at, outcome.clone());
+        remember_completed_outcome(
+            &mut *self.completed.write().await,
+            thread_id,
+            run_started_at,
+            outcome.clone(),
+        );
         Ok(outcome)
     }
 
@@ -1375,7 +1527,7 @@ impl ThreadManager {
             ThreadState::Done | ThreadState::Completed => {
                 debug!(thread_id = %thread_id, "join recovered a completed outcome from the store");
                 Ok(ThreadOutcome::Completed {
-                    response: last_assistant_response(&thread),
+                    response: Some(last_assistant_response(&thread).unwrap_or_default()),
                 })
             }
             ThreadState::Failed => {
@@ -1411,10 +1563,7 @@ impl ThreadManager {
     async fn finalize_orphaned_thread(&self, thread: &mut Thread) -> Result<(), EngineError> {
         let thread_id = thread.id;
         let new_event_start = thread.events.len();
-        thread.transition_to(
-            ThreadState::Failed,
-            Some(crate::types::thread::EXECUTION_STOPPED_REASON.into()),
-        )?;
+        thread.transition_to(ThreadState::Failed, Some(ORPHANED_JOIN_REASON.into()))?;
         if let Some(metadata) = thread.metadata.as_object_mut() {
             metadata.remove(RUNTIME_CHECKPOINT_METADATA_KEY);
             metadata.remove(INITIAL_PERSISTED_STATE_METADATA_KEY);
@@ -1565,13 +1714,10 @@ impl ThreadManager {
 const INTERRUPTED_TURN_ERROR: &str =
     "The turn was interrupted before it finished. Please send your request again.";
 const RECOVERED_FAILURE_ERROR: &str = "The turn failed before it finished. Please try again.";
+const ORPHANED_JOIN_REASON: &str = "engine task absent when its outcome was joined";
 
 fn running_thread_is_live(running: &RunningThread) -> bool {
-    match running.handle.try_lock() {
-        Ok(handle) => handle.as_ref().is_some_and(|handle| !handle.is_finished()),
-        // A joiner holds the slot while awaiting the task; that task is live.
-        Err(_) => true,
-    }
+    !running.finished.load(Ordering::Acquire)
 }
 
 fn last_assistant_response(thread: &Thread) -> Option<String> {
@@ -2074,13 +2220,15 @@ mod tests {
         let handle = tokio::spawn(async {
             std::future::pending::<Result<ThreadOutcome, EngineError>>().await
         });
+        let (completion, finished) = shared_completion(thread_id, handle);
         mgr.running.write().await.insert(
             thread_id,
             RunningThread {
                 signal_tx,
                 cancellation,
                 run_started_at: chrono::Utc::now(),
-                handle: Arc::new(AsyncMutex::new(Some(handle))),
+                completion,
+                finished,
             },
         );
 
@@ -2088,12 +2236,6 @@ mod tests {
             .inject_message_system(thread_id, ThreadMessage::user("steer"))
             .await;
         assert!(matches!(result, Err(EngineError::ThreadNotFound(id)) if id == thread_id));
-
-        if let Some(running) = mgr.running.write().await.remove(&thread_id)
-            && let Some(handle) = running.handle.lock().await.take()
-        {
-            handle.abort();
-        }
     }
 
     #[tokio::test]
@@ -2105,13 +2247,15 @@ mod tests {
         let handle = tokio::spawn(async {
             std::future::pending::<Result<ThreadOutcome, EngineError>>().await
         });
+        let (completion, finished) = shared_completion(thread_id, handle);
         mgr.running.write().await.insert(
             thread_id,
             RunningThread {
                 signal_tx,
                 cancellation: CancellationToken::new(),
                 run_started_at: chrono::Utc::now(),
-                handle: Arc::new(AsyncMutex::new(Some(handle))),
+                completion,
+                finished,
             },
         );
 
@@ -2119,12 +2263,6 @@ mod tests {
             .inject_message_system(thread_id, ThreadMessage::user("steer"))
             .await;
         assert!(matches!(result, Err(EngineError::ThreadNotFound(id)) if id == thread_id));
-
-        if let Some(running) = mgr.running.write().await.remove(&thread_id)
-            && let Some(handle) = running.handle.lock().await.take()
-        {
-            handle.abort();
-        }
     }
 
     #[tokio::test]
@@ -2862,6 +3000,169 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn joined_outcomes_expire_after_retention() {
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(MockLlm::text("FINAL(\"done\")"), store);
+        let tid = mgr
+            .spawn_thread(
+                "test",
+                ThreadType::Foreground,
+                ProjectId::new(),
+                ThreadConfig::default(),
+                None,
+                "user",
+            )
+            .await
+            .unwrap();
+        let run = mgr.thread_run_started_at(tid).await.unwrap().unwrap();
+        mgr.join_thread_for_run(tid, run).await.unwrap();
+        assert!(mgr.completed_outcome(tid, run).await.is_some());
+
+        tokio::time::advance(COMPLETED_OUTCOME_RETENTION + Duration::from_secs(1)).await;
+        assert!(mgr.completed_outcome(tid, run).await.is_none());
+        assert!(mgr.completed.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropped_live_join_keeps_the_run_addressable() {
+        let llm = Arc::new(ControlledLlm {
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        });
+        let mgr = Arc::new(make_manager_with_store(
+            llm.clone(),
+            Arc::new(MockStore::new()),
+        ));
+        let tid = mgr
+            .spawn_thread(
+                "test",
+                ThreadType::Foreground,
+                ProjectId::new(),
+                ThreadConfig::default(),
+                None,
+                "user",
+            )
+            .await
+            .unwrap();
+        let run = mgr.thread_run_started_at(tid).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), llm.entered.notified())
+            .await
+            .unwrap();
+        let join = tokio::spawn({
+            let mgr = Arc::clone(&mgr);
+            async move { mgr.join_thread_for_run(tid, run).await }
+        });
+        tokio::task::yield_now().await;
+        join.abort();
+        let _ = join.await;
+
+        assert!(mgr.is_run_running(tid, run).await);
+        let current =
+            tokio::time::timeout(Duration::from_millis(100), mgr.thread_run_started_at(tid))
+                .await
+                .expect("a dropped join must not hold the lifecycle lock")
+                .unwrap();
+        assert_eq!(current, Some(run));
+        llm.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), mgr.join_thread_for_run(tid, run))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn completion_claim_is_single_consumer_per_run() {
+        let mgr = make_manager(MockLlm::text("FINAL(\"done\")"));
+        let tid = mgr
+            .spawn_thread(
+                "test",
+                ThreadType::Foreground,
+                ProjectId::new(),
+                ThreadConfig::default(),
+                None,
+                "user",
+            )
+            .await
+            .unwrap();
+        let run = mgr.thread_run_started_at(tid).await.unwrap().unwrap();
+        mgr.join_thread_for_run(tid, run).await.unwrap();
+        assert!(mgr.claim_thread_completion(tid, run).await);
+        assert!(!mgr.claim_thread_completion(tid, run).await);
+    }
+
+    #[tokio::test]
+    async fn completed_record_without_assistant_recovers_an_empty_response() {
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(MockLlm::text("unused"), Arc::clone(&store));
+        let mut thread = Thread::new(
+            "empty",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+        thread.transition_to(ThreadState::Completed, None).unwrap();
+        thread.transition_to(ThreadState::Done, None).unwrap();
+        let id = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        let outcome = mgr.join_thread(id).await.unwrap();
+        assert!(
+            matches!(outcome, ThreadOutcome::Completed { response: Some(ref text) } if text.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_refuses_readoption_while_the_previous_run_is_live() {
+        let llm = Arc::new(ControlledLlm {
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        });
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(llm.clone(), Arc::clone(&store));
+        let project = ProjectId::new();
+        let id = ThreadId::new();
+        mgr.spawn_thread_with_history_and_message(
+            ThreadMessage::user("first"),
+            ThreadType::Foreground,
+            project,
+            ThreadConfig::default(),
+            None,
+            "user",
+            Vec::new(),
+            Some(id),
+            None,
+        )
+        .await
+        .unwrap();
+        let first_run = mgr.thread_run_started_at(id).await.unwrap().unwrap();
+
+        let error = mgr
+            .spawn_thread_with_history_and_message(
+                ThreadMessage::user("second"),
+                ThreadType::Foreground,
+                project,
+                ThreadConfig::default(),
+                None,
+                "user",
+                Vec::new(),
+                Some(id),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            EngineError::Thread(crate::types::error::ThreadError::AlreadyRunning(seen)) if seen == id
+        ));
+        let stored = store.load_thread(id).await.unwrap().unwrap();
+        assert_eq!(stored.created_at, first_run);
+        llm.release.notify_one();
+        mgr.join_thread_for_run(id, first_run).await.unwrap();
+    }
+
     #[tokio::test]
     async fn join_recovers_failure_without_raw_engine_reason() {
         let store = Arc::new(MockStore::new());
@@ -2970,6 +3271,14 @@ mod tests {
         );
         let second = mgr.join_thread(id).await.unwrap();
         assert_eq!(format!("{first:?}"), format!("{second:?}"));
+
+        mgr.completed.write().await.clear();
+        let recovered = mgr.join_thread(id).await.unwrap();
+        assert!(matches!(recovered, ThreadOutcome::Failed { .. }));
+        let saved = store.load_thread(id).await.unwrap().unwrap();
+        assert!(!crate::types::thread::is_host_stop_reason(
+            terminal_failure_reason(&saved).as_deref()
+        ));
     }
 
     #[tokio::test]
@@ -3033,7 +3342,9 @@ mod tests {
         let id = previous.id;
         let old_run = previous.created_at;
         store.save_thread(&previous).await.unwrap();
-        mgr.completed.write().await.entry(id).or_default().insert(
+        remember_completed_outcome(
+            &mut *mgr.completed.write().await,
+            id,
             old_run,
             ThreadOutcome::Completed {
                 response: Some("old".into()),
