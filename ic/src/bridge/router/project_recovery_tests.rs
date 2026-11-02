@@ -18,6 +18,7 @@ fn default_path(project: &Project) -> String {
     )
 }
 
+#[cfg(test)]
 async fn backup_paths(workspace: &Workspace, path: &str) -> Vec<String> {
     let prefix = format!("backups/{path}.unloadable-");
     workspace
@@ -29,12 +30,14 @@ async fn backup_paths(workspace: &Workspace, path: &str) -> Vec<String> {
         .collect()
 }
 
+#[cfg(test)]
 async fn reloaded_store(workspace: &Arc<Workspace>) -> Arc<HybridStore> {
     let store = Arc::new(HybridStore::new(Some(workspace.clone())));
     store.load_state_from_workspace().await.unwrap();
     store
 }
 
+#[cfg(test)]
 async fn assert_recovery(owner_boot: bool, damaged: &str) -> (String, String, ProjectId) {
     let db = FaultInjectingTestDb::new().await;
     let workspace = Arc::new(Workspace::new_with_db("recovery", db.database()));
@@ -107,6 +110,7 @@ async fn assert_recovery(owner_boot: bool, damaged: &str) -> (String, String, Pr
     (path, backup.clone(), project.id)
 }
 
+#[cfg(test)]
 fn assert_recovery_warning(
     lines: &[&str],
     path: &str,
