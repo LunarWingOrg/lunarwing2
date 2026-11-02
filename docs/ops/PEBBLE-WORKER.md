@@ -170,6 +170,15 @@ shared image alone does not select it. Run long worker-image builds in `tmux`:
 sudo ic/scripts/lunarwing-mt-admin.sh build-pebble-worker
 ```
 
+That standalone command builds from the operator checkout. Tenant builds
+(`build-tenant <name> --with-pebble`, `build-all --with-pebble`, and worker
+candidate builds during `upgrade-tenant`) instead use the tenant clone for the
+Dockerfile, build context, and `SOURCE_REVISION` stamp. Tenant builds refuse a
+dirty or unverifiable `pebble4lunarwing/` source tree, so uncommitted operator
+edits cannot enter a tenant image and a shared image always names a clean
+tenant commit. The fat-build toolchain smoke helper still executes from the
+operator checkout, never from the tenant-writable clone (WI#507).
+
 ### Port Allocation
 
 `lunarwing-mt-admin.sh` initializes and migrates the ports registry before its
