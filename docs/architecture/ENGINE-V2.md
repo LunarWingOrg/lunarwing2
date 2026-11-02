@@ -5,7 +5,7 @@ The V2 engine is a thread/capability/CodeAct execution model in
 bridges it to the existing channel, tool, workspace, and approval systems;
 legacy execution remains active on channels outside the rollout allowlist.
 
-**Source revalidated 2026-11-01 for v2.1.8.0.** Read the behavior sections below
+**Source revalidated 2026-11-02 for v2.1.8.0.** Read the behavior sections below
 as the current contract. Relevant release changes include:
 
 - Mission persistence: WI#317 serializes boot/reconciliation writes with fires;
@@ -1828,6 +1828,43 @@ joins a still-running handle, which would hide it from
 `/interrupt`. Cancellation failure reports an error and leaves the live handle
 addressable. These are in-process delivery guarantees; the watcher is not a
 durable cross-restart outbox.
+
+**Join and restart recovery (WI#532/WI#534).** A thread id names a reusable
+conversation surface, not a unique execution. `Thread.created_at` is therefore
+the generation key for each incarnation: it changes when a new turn adopts the
+id and stays stable when the same logical turn resumes from a gate.
+`join_thread` selects the current generation, while foreground and expired-gate
+waiters use `join_thread_for_run` with the generation captured at spawn/resume.
+Their polling, timeout stops, and abandoned-waiter cancellation use that same
+key, so a stale watcher cannot consume, stop, or finalize a newer turn.
+
+Running handles are shared and completed outcomes are retained per generation,
+so joining is multi-consumer rather than take-once. Joining does not unregister
+live work. A per-thread lifecycle lock covers durable creation through running
+registration and the join fallback; terminal unregistration also checks the
+generation. This closes the re-adoption window where a stale join could see a
+new `Created` record without its task and fail that live task.
+
+When neither registry has the requested generation, `store.load_thread` is the
+restart-safe fallback. `Done`/`Completed` reconstructs `Completed` from the last
+visible assistant message, which the orchestrator persists before the final
+save. `Failed` returns `Stopped` for a recorded host-stop reason and otherwise
+returns generic failure text rather than replaying internal store, I/O, or
+engine reasons. `Waiting` returns `ThreadError::Waiting` without modifying the
+record; the foreground completion path suppresses an immediate reply and leaves
+resume to gate recovery. `Suspended` reports an interrupted turn without
+touching its checkpoint. Only a `Created`/`Running` record for the requested
+generation with no live task is finalized as `Failed("execution stopped")`,
+with checkpoint cleanup, event persistence, lease revocation, and broadcast.
+An id with no matching durable record still returns `ThreadNotFound`.
+
+Recovered outcomes populate the same per-generation slot before return, so
+later joiners see the same representation. These process-local entries still
+have no bounded-retention sweeper; bounding them is separate from the recovery
+fix and they are not a durable outbox. Join/stop failures delivered by the agent
+message loop or late watcher pass through `Error::user_facing_message`, which
+keeps engine context and thread UUIDs in logs while sending a stable retry
+message to channel users.
 
 Engine `message` tool calls receive execution-local `notify_thread_id`; gateway
 calls also carry their execution's user/channel instead of mutable conversation
