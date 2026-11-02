@@ -193,8 +193,8 @@ kimicode4lunarwing/scripts/task_runner_client.ts
 kimicode4lunarwing/scripts/task_runner_client_test.ts
 kimicode4lunarwing/scripts/task_prompt_test.ts
 kimicode4lunarwing/scripts/workspace_path.ts'
-        source_ref=2.3.0
-        build_args="KIMI_CODE_VERSION=2.3.0
+        source_ref=2.4.1
+        build_args="KIMI_CODE_VERSION=2.4.1
 WITH_TOOLCHAINS=false
 SOURCE_REVISION=$CI_COMMIT_SHA"
         ;;
