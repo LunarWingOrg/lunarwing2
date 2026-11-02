@@ -3,6 +3,6 @@
   "version": "2.3.0",
   "private": true,
   "dependencies": {
-    "@moonshot-ai/kimi-code": "2.3.0"
+    "@moonshot-ai/kimi-code": "2.4.1"
   }
 }
