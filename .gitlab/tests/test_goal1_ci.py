@@ -801,14 +801,16 @@ class WorkerInputManifestTests(unittest.TestCase):
         for worker, context in (("opencode", "opencode4lunarwing"), ("opencode2", "opencode2.4lunarwing")):
             directory = self.root / context
             (directory / "scripts").mkdir(parents=True)
-            (directory / "scripts/fix_photon_patch_context.py").write_text("# fixture\n", encoding="utf-8")
+            # Synthetic builder-executed patcher; the real lanes carry
+            # check_models_dev_snapshot.py and prepare_reproducible_build.py.
+            (directory / "scripts" / "builder_patcher.py").write_text("# fixture\n", encoding="utf-8")
             (directory / "Dockerfile").write_text(
                 "FROM scratch AS builder\n"
-                "COPY scripts/fix_photon_patch_context.py /build/fix.py\n"
+                "COPY scripts/builder_patcher.py /build/patch.py\n"
                 "FROM scratch AS runtime\n", encoding="utf-8",
             )
             self.opencode_files[worker] = [
-                f"{context}/Dockerfile", f"{context}/scripts/fix_photon_patch_context.py",
+                f"{context}/Dockerfile", f"{context}/scripts/builder_patcher.py",
             ]
         self.build_script = self.root / "build-worker-image.sh"
         self.write_build_script(kimi_files=self.kimi_files)
