@@ -57,12 +57,10 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         # inputs and build-executed scripts must hash into worker-inputs).
         input_files='opencode4lunarwing/Dockerfile
 opencode4lunarwing/models-dev/api.json
-opencode4lunarwing/scripts/check_models_dev_snapshot.py
-opencode4lunarwing/scripts/fix_photon_patch_context.py
-opencode4lunarwing/scripts/fix_photon_patch_context_test.py'
-        source_ref=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
-        build_args="OPENCODE_VERSION=v1.18.25
-OPENCODE_REF=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
+opencode4lunarwing/scripts/check_models_dev_snapshot.py'
+        source_ref=810c0eba1a7348036f8bdf61e6632d0c36c6876c
+        build_args="OPENCODE_VERSION=v1.19.5
+OPENCODE_REF=810c0eba1a7348036f8bdf61e6632d0c36c6876c
 WITH_TOOLCHAINS=false
 SOURCE_REVISION=$CI_COMMIT_SHA"
         ;;
