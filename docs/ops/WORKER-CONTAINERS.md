@@ -926,6 +926,12 @@ Enforced controls (opencode2 lane unless noted):
    both OpenCode scans and `worker-opencode2-exposure-verify` before claiming
    acceptance; getting past install can still expose WI#510-class binary/layer
    nondeterminism. Items 28 and 95 stay unchecked until that evidence exists.
+   **WI#369 typecheck compiler:** the gate runs whatever `@typescript/native`
+   the upstream lock pins. Check its version on every bump: v2.2.5 moved it
+   from `npm:typescript@7.0.2` to a `7.1.0-beta`; a beta compiler in a build
+   gate is acceptable only while it is upstream's own pinned devDependency,
+   resolved through the committed lock, and still exposes `tsc` at `bin/tsc`.
+   Record the version and the binary path in the bump entry.
 8. **Compile the tunnel out.** `scripts/compile_out_remote_tunnel.py` runs
    in the builder stage: the historical v2.0.24 path verifies there is no
    tunnel surface; at the current v2.1.2 pin it replaces `remote-tunnel.ts`
