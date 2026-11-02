@@ -88,8 +88,8 @@ that uid's full access to it (it could read other refs or forge a line);
 the enrichment defends against accidents and cross-task leakage, not
 against a hostile agent on the same uid.
 
-> **Known issue (WI#320 F4, tracked as WI#333):** at the pinned v1.18.25,
-> every task dispatch failed in the LunarWing worker shape — `opencode serve`
+> **Known issue (WI#320 F4, tracked as WI#333):** at v1.18.25 (the last
+> dispatch-verified pin), every task dispatch failed in the LunarWing worker shape — `opencode serve`
 > crashes in `SystemPrompt.environment` (`undefined is not an object
 > (evaluating 'a.name')`) while building the prompt, before any model call.
 > v1.18.29 shipped two further regressions (see the Dockerfile pin note).
