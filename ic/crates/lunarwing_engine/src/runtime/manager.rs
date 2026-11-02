@@ -1287,7 +1287,8 @@ impl ThreadManager {
         if let Some(outcome) = self.completed_outcome(thread_id, run_started_at).await {
             return Ok(outcome);
         }
-        self.recover_stored_outcome(thread_id, run_started_at).await
+        self.recover_and_remember_outcome(thread_id, run_started_at)
+            .await
     }
 
     async fn await_running_outcome(
@@ -1302,7 +1303,9 @@ impl ThreadManager {
             if let Some(outcome) = self.completed_outcome(thread_id, run_started_at).await {
                 return Ok(outcome);
             }
-            return self.recover_stored_outcome(thread_id, run_started_at).await;
+            return self
+                .recover_and_remember_outcome(thread_id, run_started_at)
+                .await;
         };
         let joined = handle.await;
         drop(handle_slot);
@@ -1310,7 +1313,8 @@ impl ThreadManager {
             Ok(result) => result,
             Err(error) => {
                 error!(thread_id = %thread_id, "thread task panicked: {error}");
-                self.recover_stored_outcome(thread_id, run_started_at).await
+                self.recover_and_remember_outcome(thread_id, run_started_at)
+                    .await
             }
         }
     }
@@ -1326,6 +1330,23 @@ impl ThreadManager {
             .get(&thread_id)
             .and_then(|outcomes| outcomes.get(&run_started_at))
             .cloned()
+    }
+
+    async fn recover_and_remember_outcome(
+        &self,
+        thread_id: ThreadId,
+        run_started_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<ThreadOutcome, EngineError> {
+        let outcome = self
+            .recover_stored_outcome(thread_id, run_started_at)
+            .await?;
+        self.completed
+            .write()
+            .await
+            .entry(thread_id)
+            .or_default()
+            .insert(run_started_at, outcome.clone());
+        Ok(outcome)
     }
 
     async fn recover_stored_outcome(
@@ -2762,6 +2783,299 @@ mod tests {
             .expect("stop should be prompt")
             .expect("thread should join");
         assert!(matches!(outcome, ThreadOutcome::Stopped));
+    }
+
+    // ── Join across registry loss and id re-adoption (WI#532/WI#534) ──
+
+    #[tokio::test]
+    async fn join_recovers_completed_outcome_after_registry_loss() {
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(MockLlm::text("FINAL(\"Hello!\")"), Arc::clone(&store));
+        let tid = mgr
+            .spawn_thread(
+                "test",
+                ThreadType::Foreground,
+                ProjectId::new(),
+                ThreadConfig::default(),
+                None,
+                "user",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            mgr.join_thread(tid).await.unwrap(),
+            ThreadOutcome::Completed { .. }
+        ));
+
+        mgr.completed.write().await.clear();
+        mgr.running.write().await.clear();
+        let recovered = mgr.join_thread(tid).await.unwrap();
+        assert!(
+            matches!(recovered, ThreadOutcome::Completed { response: Some(ref text) } if text == "Hello!"),
+            "got {recovered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_joiners_share_one_live_outcome() {
+        let store = Arc::new(MockStore::new());
+        let llm = Arc::new(ControlledLlm {
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        });
+        let mgr = Arc::new(make_manager_with_store(llm.clone(), store));
+        let tid = mgr
+            .spawn_thread(
+                "test",
+                ThreadType::Foreground,
+                ProjectId::new(),
+                ThreadConfig::default(),
+                None,
+                "user",
+            )
+            .await
+            .unwrap();
+        let run = mgr.thread_run_started_at(tid).await.unwrap().unwrap();
+        let first = tokio::spawn({
+            let mgr = Arc::clone(&mgr);
+            async move { mgr.join_thread_for_run(tid, run).await }
+        });
+        let second = tokio::spawn({
+            let mgr = Arc::clone(&mgr);
+            async move { mgr.join_thread_for_run(tid, run).await }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), llm.entered.notified())
+            .await
+            .unwrap();
+        llm.release.notify_one();
+        let first = first.await.unwrap().unwrap();
+        let second = second.await.unwrap().unwrap();
+        for outcome in [first, second] {
+            assert!(
+                matches!(outcome, ThreadOutcome::Completed { response: Some(ref text) } if text == "done"),
+                "got {outcome:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn join_recovers_failure_without_raw_engine_reason() {
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(MockLlm::text("unused"), Arc::clone(&store));
+        let mut thread = Thread::new(
+            "failed",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+        thread
+            .transition_to(
+                ThreadState::Failed,
+                Some("private store path and uuid".into()),
+            )
+            .unwrap();
+        let id = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        let outcome = mgr.join_thread(id).await.unwrap();
+        assert!(
+            matches!(outcome, ThreadOutcome::Failed { ref error, .. } if error == RECOVERED_FAILURE_ERROR),
+            "got {outcome:?}"
+        );
+        let ThreadOutcome::Failed { error, .. } = outcome else {
+            unreachable!()
+        };
+        assert!(!error.contains("private store path"));
+    }
+
+    #[tokio::test]
+    async fn join_recovers_a_host_stop_as_stopped() {
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(MockLlm::text("unused"), Arc::clone(&store));
+        let mut thread = Thread::new(
+            "stopped",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+        thread
+            .transition_to(
+                ThreadState::Failed,
+                Some(crate::types::thread::EXECUTION_STOPPED_REASON.into()),
+            )
+            .unwrap();
+        let id = thread.id;
+        store.save_thread(&thread).await.unwrap();
+        assert!(matches!(
+            mgr.join_thread(id).await.unwrap(),
+            ThreadOutcome::Stopped
+        ));
+    }
+
+    #[tokio::test]
+    async fn join_never_fails_a_gate_paused_thread() {
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(MockLlm::text("unused"), Arc::clone(&store));
+        let mut thread = Thread::new(
+            "waiting",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+        thread.transition_to(ThreadState::Waiting, None).unwrap();
+        let id = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        let error = mgr.join_thread(id).await.unwrap_err();
+        assert!(matches!(
+            error,
+            EngineError::Thread(crate::types::error::ThreadError::Waiting(seen)) if seen == id
+        ));
+        assert_eq!(
+            store.load_thread(id).await.unwrap().unwrap().state,
+            ThreadState::Waiting
+        );
+    }
+
+    #[tokio::test]
+    async fn join_finalizes_an_orphan_and_replays_the_same_outcome() {
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(MockLlm::text("unused"), Arc::clone(&store));
+        let mut thread = Thread::new(
+            "orphan",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+        let id = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        let first = mgr.join_thread(id).await.unwrap();
+        assert!(matches!(first, ThreadOutcome::Failed { .. }));
+        assert_eq!(
+            store.load_thread(id).await.unwrap().unwrap().state,
+            ThreadState::Failed
+        );
+        let second = mgr.join_thread(id).await.unwrap();
+        assert_eq!(format!("{first:?}"), format!("{second:?}"));
+    }
+
+    #[tokio::test]
+    async fn join_leaves_a_resumable_suspended_thread_untouched() {
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(MockLlm::text("unused"), Arc::clone(&store));
+        let mut thread = Thread::new(
+            "suspended",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+        thread.transition_to(ThreadState::Suspended, None).unwrap();
+        let id = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        assert!(matches!(
+            mgr.join_thread(id).await.unwrap(),
+            ThreadOutcome::Failed { .. }
+        ));
+        assert_eq!(
+            store.load_thread(id).await.unwrap().unwrap().state,
+            ThreadState::Suspended
+        );
+    }
+
+    #[tokio::test]
+    async fn join_of_an_unknown_thread_is_still_thread_not_found() {
+        let mgr = make_manager_with_store(MockLlm::text("unused"), Arc::new(MockStore::new()));
+        let id = ThreadId::new();
+        assert!(matches!(
+            mgr.join_thread(id).await,
+            Err(EngineError::ThreadNotFound(seen)) if seen == id
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_waiter_cannot_consume_or_finalize_a_readopted_run() {
+        let store = Arc::new(MockStore::new());
+        let llm = Arc::new(ControlledLlm {
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        });
+        let mgr = make_manager_with_store(llm.clone(), Arc::clone(&store));
+        let project = ProjectId::new();
+        let mut previous = Thread::new(
+            "previous",
+            ThreadType::Foreground,
+            project,
+            "user",
+            ThreadConfig::default(),
+        );
+        previous.transition_to(ThreadState::Running, None).unwrap();
+        previous
+            .transition_to(ThreadState::Completed, None)
+            .unwrap();
+        previous.transition_to(ThreadState::Done, None).unwrap();
+        previous.add_message(ThreadMessage::assistant("old"));
+        let id = previous.id;
+        let old_run = previous.created_at;
+        store.save_thread(&previous).await.unwrap();
+        mgr.completed.write().await.entry(id).or_default().insert(
+            old_run,
+            ThreadOutcome::Completed {
+                response: Some("old".into()),
+            },
+        );
+
+        let adopted = mgr
+            .spawn_thread_with_history_and_message(
+                ThreadMessage::user("next turn"),
+                ThreadType::Foreground,
+                project,
+                ThreadConfig::default(),
+                None,
+                "user",
+                Vec::new(),
+                Some(id),
+                None,
+            )
+            .await
+            .unwrap();
+        let new_run = mgr.thread_run_started_at(id).await.unwrap().unwrap();
+        assert_eq!(adopted, id);
+        assert_ne!(old_run, new_run);
+
+        let old = mgr.join_thread_for_run(id, old_run).await.unwrap();
+        assert!(
+            matches!(old, ThreadOutcome::Completed { response: Some(ref text) } if text == "old")
+        );
+        assert!(mgr.is_run_running(id, new_run).await);
+        assert_ne!(
+            store.load_thread(id).await.unwrap().unwrap().state,
+            ThreadState::Failed,
+            "the stale join must not finalize the live new turn"
+        );
+
+        llm.release.notify_one();
+        let new =
+            tokio::time::timeout(Duration::from_secs(5), mgr.join_thread_for_run(id, new_run))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(
+            matches!(new, ThreadOutcome::Completed { response: Some(ref text) } if text == "done"),
+            "got {new:?}"
+        );
     }
 
     // ── Streaming cancellation mocks ─────────────────────────
