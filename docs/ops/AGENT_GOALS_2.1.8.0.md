@@ -257,7 +257,10 @@
 26. [ ] work on the following work items: #532 + #534 — Engine V2 “thread not found” during join on brightdawn, and its root cause (join_thread only consults the in-memory maps; take-once outcome). Live bug, fix shape agreed in the notes. I would add this one first, as a single line pointing at both. - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2146 but has some issues. please see the comments on the closed MR and address
 27. [ ] work on WI#529 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2151 and has some issues that need to be addressed. see the comments on the MR for more information
 28. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/536
-29. [ ] work on WI#526
+29. [x] work on WI#526
+    - **DONE 2026-11-02 (Rarity, item-29, branch `aj/kimi-29-20261102-1200`):** closed the WI#505 wrapper-path residual. `with_tracked_lock_fds_closed` now tracks `LUNARWING_MT_INHERITED_UPGRADE_LOCK_FD`, so `rc-service` and `systemctl --user` children cannot retain the upgrade-wrapper descriptor. The OpenRC env-exec backstop now also closes `${BUILD_LOCK}.<tenant>.upgrade` descriptors after confirming the target parent and build-lock directory by device/inode. Existing tracked names and lock ownership are unchanged; `MULTITENANCY-PRODUCTION.md` documents the service-side scrub.
+    - **Regression coverage and verification:** `test-mt-admin-lifecycle-lock.sh` now drives both the inherited-wrapper `rc-service` path and the env-exec build-lock path; all **19/19 checks pass, 0 skipped**. `check-mt-admin.sh` is shellcheck-clean over the root plus 16 modules; `test-mt-admin-openrc-status.sh`, `test-mt-admin-worker-lifecycle.sh`, `test-mt-admin-upgrade-build-failure.sh` (21 checks), and `test-mt-admin-upgrade-clean-tree.sh` all pass. `bash -n`, targeted shellcheck, and `git diff --check` are clean. Shell/harness/docs only — no Rust or dependency change, so no cargo lane applies.
+    - **Deploy-side acceptance:** no live OpenRC `upgrade-tenant` run or daemon `/proc/<pid>/fd` inspection was performed in this session; the hermetic harness exercises the real scrub functions with held locks and external service stubs.
 30. [ ] work on WI#531
 
 ## Phase 7 - Advanced Operator Notes
