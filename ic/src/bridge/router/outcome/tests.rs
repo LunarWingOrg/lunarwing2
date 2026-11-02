@@ -175,6 +175,7 @@ impl Rig {
                 message,
                 conversation_id,
                 thread_id: thread.id,
+                run_started_at: thread.created_at,
                 history: None,
             },
             llm,
