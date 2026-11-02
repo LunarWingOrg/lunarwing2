@@ -36,6 +36,10 @@ const WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 /// Poll interval while a stopped run settles inside its grace period.
 const STOP_SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
+type SharedJoinHandle =
+    Arc<AsyncMutex<Option<tokio::task::JoinHandle<Result<ThreadOutcome, EngineError>>>>>;
+type CompletedOutcomes = HashMap<ThreadId, HashMap<chrono::DateTime<chrono::Utc>, ThreadOutcome>>;
+
 /// Handle to one incarnation of a running thread.
 #[derive(Clone)]
 struct RunningThread {
@@ -49,7 +53,7 @@ struct RunningThread {
     /// The first joiner takes the Tokio handle; later joiners read the outcome
     /// retained in `completed`. The running entry itself stays registered so
     /// interruption and steering remain available until the task finishes.
-    handle: Arc<AsyncMutex<Option<tokio::task::JoinHandle<Result<ThreadOutcome, EngineError>>>>>,
+    handle: SharedJoinHandle,
 }
 
 fn clear_waiting_checkpoint_preserving_recovery(
@@ -92,8 +96,7 @@ pub struct ThreadManager {
     running: Arc<RwLock<HashMap<ThreadId, RunningThread>>>,
     /// Outcomes are retained per thread incarnation so every joiner can read
     /// its own run, even after another turn adopts the same thread id.
-    completed:
-        Arc<RwLock<HashMap<ThreadId, HashMap<chrono::DateTime<chrono::Utc>, ThreadOutcome>>>>,
+    completed: Arc<RwLock<CompletedOutcomes>>,
     /// Threads whose approved gate action is executing inline in the
     /// approval-handling task (the "resolving" window between gate removal
     /// and thread resume). Lets interrupt see and cancel that window instead
