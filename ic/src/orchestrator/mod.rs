@@ -45,6 +45,7 @@ pub mod auth;
 pub mod cron_worker;
 pub mod external_worker;
 pub mod harness;
+pub mod job_cancel;
 pub mod job_manager;
 pub mod reaper;
 

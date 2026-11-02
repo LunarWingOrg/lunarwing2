@@ -444,6 +444,12 @@ pub struct CompletionResult {
     pub message: Option<String>,
 }
 
+/// Terminal-claim result for a container cancellation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContainerStopOutcome {
+    pub runtime_stop_deferred: bool,
+}
+
 /// Validate that a project directory is under `~/.lunarwing/projects/`.
 ///
 /// Returns the canonicalized path if valid. Creates the base directory if
@@ -717,6 +723,11 @@ impl ContainerJobManager {
             write_back_workspace: None,
             store: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn use_docker_for_test(&self, docker: bollard::Docker) {
+        *self.docker.write().await = Some(docker);
     }
 
     pub fn with_completion_deps(
@@ -1276,6 +1287,14 @@ impl ContainerJobManager {
 
     /// Stop a running container job.
     pub async fn stop_job(&self, job_id: Uuid) -> Result<(), OrchestratorError> {
+        self.stop_job_with_outcome(job_id).await.map(|_| ())
+    }
+
+    /// Stop a container job and report whether runtime teardown was deferred.
+    pub async fn stop_job_with_outcome(
+        &self,
+        job_id: Uuid,
+    ) -> Result<ContainerStopOutcome, OrchestratorError> {
         let container_id = {
             let mut containers = self.containers.write().await;
             let handle = containers
@@ -1305,7 +1324,15 @@ impl ContainerJobManager {
             handle.container_id.clone()
         };
 
+        // Cancellation is terminal for authentication and harness state even
+        // when Docker cannot be reached. Revoke before any container I/O so a
+        // deferred runtime stop cannot leave usable credentials behind.
+        self.token_store.revoke(job_id).await;
+        self.token_store.clear_harness_secrets(job_id).await;
+        harness::cleanup_harness_job_dir(job_id);
+
         let docker = self.docker().await?;
+        let mut runtime_stop_deferred = false;
 
         // Stop the container (10 second grace period)
         if let Err(e) = docker
@@ -1315,6 +1342,7 @@ impl ContainerJobManager {
             )
             .await
         {
+            runtime_stop_deferred = true;
             tracing::warn!(job_id = %job_id, error = %e, "Failed to stop container (may already be stopped)");
         }
 
@@ -1329,19 +1357,19 @@ impl ContainerJobManager {
             )
             .await
         {
+            runtime_stop_deferred = true;
             tracing::warn!(job_id = %job_id, error = %e, "Failed to remove container (may require manual cleanup)");
         }
 
-        // Revoke the auth token
-        self.token_store.revoke(job_id).await;
+        if runtime_stop_deferred {
+            tracing::warn!(job_id = %job_id, "Container runtime teardown deferred to the reaper");
+        } else {
+            tracing::info!(job_id = %job_id, "Stopped worker container");
+        }
 
-        // CW-8: stop/cancel is a terminal path — clean up harness state.
-        self.token_store.clear_harness_secrets(job_id).await;
-        harness::cleanup_harness_job_dir(job_id);
-
-        tracing::info!(job_id = %job_id, "Stopped worker container");
-
-        Ok(())
+        Ok(ContainerStopOutcome {
+            runtime_stop_deferred,
+        })
     }
 
     /// Mark a job as complete with a result. The container is stopped but the
