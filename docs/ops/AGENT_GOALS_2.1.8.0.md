@@ -254,7 +254,7 @@
     - **Honest gaps:** the live end-to-end acceptance (a real Engine V2 tenant where an automation client polls `GET /api/chat/history` and approves inside the window before expiry) needs a live tenant, a tenant owner account and a token-consuming tool, and is deploy-gated — the same limitation prior items recorded. The pre-existing `handlers/chat.rs` twin is still not wired into the router (its module is `#[allow(dead_code)]`); it was updated anyway so the two implementations cannot drift further.
 25. [ ] work on WI #535
 26. [ ] work on the following work items: #532 + #534 — Engine V2 “thread not found” during join on brightdawn, and its root cause (join_thread only consults the in-memory maps; take-once outcome). Live bug, fix shape agreed in the notes. I would add this one first, as a single line pointing at both. - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2146 but has some issues. please see the comments on the closed MR and address
-27. [ ] work on WI#529
+27. [ ] work on WI#529 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2151 and has some issues that need to be addressed. see the comments on the MR for more information
 28. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/536
 29. [ ] work on WI#526
 30. [ ] work on WI#531
