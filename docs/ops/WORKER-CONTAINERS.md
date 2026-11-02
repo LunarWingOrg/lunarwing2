@@ -748,8 +748,8 @@ Enforced controls (opencode2 lane unless noted):
    invoke the real binary directly.
 3. **Session sharing pinned off; auto-update silenced.** `"share": "disabled"` in both
    `opencode2.4lunarwing/config/opencode2.json` and
-   `opencode4lunarwing/config/opencode.json` (v1 schema supports it at
-   v1.18.25), plus `"update": "disable"` in the v2 lane config so an upstream
+   `opencode4lunarwing/config/opencode.json` (v1's `ConfigV1.Info` still
+   declares `share` at v1.19.5), plus `"update": "disable"` in the v2 lane config so an upstream
    default flip cannot re-enable publication. **The `update` pin does not
    reach the updater** (run-158 KG-3 / !1699 JE-3): the updater's
    `readPolicy()` reads only the global config dir, never `OPENCODE_CONFIG`.
