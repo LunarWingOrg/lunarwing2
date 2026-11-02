@@ -96,6 +96,7 @@ fn shared_completion(
         .boxed()
         .shared()
     };
+    let _driver = tokio::spawn(completion.clone());
     (completion, finished)
 }
 
@@ -2263,6 +2264,39 @@ mod tests {
             .inject_message_system(thread_id, ThreadMessage::user("steer"))
             .await;
         assert!(matches!(result, Err(EngineError::ThreadNotFound(id)) if id == thread_id));
+    }
+
+    #[tokio::test]
+    async fn panicked_run_is_not_reported_live_or_stoppable() {
+        let mgr = make_manager(MockLlm::text("done"));
+        let thread_id = ThreadId::new();
+        let (signal_tx, _signal_rx) = messaging::signal_channel(1);
+        let handle: tokio::task::JoinHandle<Result<ThreadOutcome, EngineError>> =
+            tokio::spawn(async { panic!("test panic") });
+        let (completion, finished) = shared_completion(thread_id, handle);
+        let run_started_at = chrono::Utc::now();
+        mgr.running.write().await.insert(
+            thread_id,
+            RunningThread {
+                signal_tx,
+                cancellation: CancellationToken::new(),
+                run_started_at,
+                completion,
+                finished,
+            },
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while mgr.is_run_running(thread_id, run_started_at).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            mgr.request_stop(thread_id).await,
+            Err(EngineError::ThreadNotFound(seen)) if seen == thread_id
+        ));
     }
 
     #[tokio::test]
