@@ -30,7 +30,7 @@ mode="$(stat -c '%a' "$env_file" 2>/dev/null || true)"
 links="$(stat -c '%h' "$env_file" 2>/dev/null || true)"
 [[ "$owner" == "$EUID" && "$links" == 1 && "$mode" == 600 ]] || fail
 
-# WI#505: never carry a descriptor for an mt-admin lock into the daemon.
+# WI#505/WI#526: never carry a descriptor for an mt-admin lock into the daemon.
 # supervise-daemon starts this wrapper as a descendant of mt-admin's
 # rc-service call, and bash's `exec {fd}>` has no close-on-exec, so an
 # inherited fd would keep the tenant flock held for the daemon's whole
@@ -56,7 +56,28 @@ for lifecycle_lock_dir in \
     eval "exec ${fd}>&-" 2>/dev/null || true
   done
 done
-unset lifecycle_lock_dir lock_dir_id fd_path fd fd_target target_dir_id
+
+# Tenant upgrade locks live beside BUILD_LOCK rather than in either dedicated
+# lock directory. Match only their <tenant>.upgrade suffix and require the
+# target's parent to be the same directory as BUILD_LOCK by dev:inode.
+build_lock_base="${BUILD_LOCK:-/var/lock/lunarwing-build.lock}"
+build_lock_dir="${build_lock_base%/*}"
+if [[ "$build_lock_base" == /* && -d "$build_lock_dir" ]]; then
+  build_lock_dir_id="$(stat -Lc '%d:%i' "$build_lock_dir" 2>/dev/null || true)"
+  if [[ -n "$build_lock_dir_id" ]]; then
+    for fd_path in /proc/self/fd/*; do
+      fd="${fd_path##*/}"
+      [[ "$fd" =~ ^[0-9]+$ && "$fd" -ge 3 ]] || continue
+      fd_target="$(readlink "$fd_path" 2>/dev/null || true)"
+      [[ -n "$fd_target" && "$fd_target" == "$build_lock_base".*.upgrade ]] || continue
+      target_dir_id="$(stat -Lc '%d:%i' "${fd_target%/*}" 2>/dev/null || true)"
+      [[ -n "$target_dir_id" && "$target_dir_id" == "$build_lock_dir_id" ]] || continue
+      eval "exec ${fd}>&-" 2>/dev/null || true
+    done
+  fi
+fi
+unset lifecycle_lock_dir lock_dir_id fd_path fd fd_target target_dir_id \
+  build_lock_base build_lock_dir build_lock_dir_id
 
 while IFS= read -r line || [[ -n "$line" ]]; do
   line="${line%$'\r'}"
