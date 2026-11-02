@@ -581,7 +581,12 @@ impl Error {
     /// their context and identifiers in logs, not in the outbound reply.
     pub fn user_facing_message(&self) -> String {
         match self {
-            Self::Engine { .. } => {
+            Self::Engine { context, .. }
+                if matches!(
+                    context.as_str(),
+                    "join error" | "stop late thread" | "late turn timeout" | "thread lookup"
+                ) =>
+            {
                 "The request could not be completed because of an internal engine error. Please try again; if it keeps happening, ask the operator to check the daemon log.".to_string()
             }
             other => format!("Error: {other}"),
@@ -835,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn engine_errors_never_reach_channel_users_verbatim() {
+    fn internal_engine_join_errors_are_sanitized_for_channels() {
         let error = Error::Engine {
             context: "join error".into(),
             reason: "thread not found: 3bfdad4f-78df-52c2-9fe1-4a1c42466559".into(),
@@ -847,5 +852,14 @@ mod tests {
 
         let other = Error::Config(ConfigError::MissingEnvVar("X".into()));
         assert_eq!(other.user_facing_message(), format!("Error: {other}"));
+    }
+
+    #[test]
+    fn actionable_engine_errors_keep_their_channel_message() {
+        let error = Error::Engine {
+            context: "stale".into(),
+            reason: "Approval request is stale or already resolved".into(),
+        };
+        assert_eq!(error.user_facing_message(), format!("Error: {error}"));
     }
 }
