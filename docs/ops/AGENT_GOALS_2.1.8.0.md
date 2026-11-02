@@ -243,10 +243,10 @@
     - **Tests (4 new, all passing):** `history_approval_lookup_returns_the_gate_parked_on_the_thread` (the parked gate is found with its request id, `tool_name`, and only the redacted snapshot); `history_approval_lookup_is_isolated_cleared_and_approval_only` (another user sees nothing; an authentication gate is not an approval; a sibling thread sharing the conversation surfaces nothing; an unrelated thread surfaces nothing; a discarded — i.e. approved or cancelled — gate disappears); `history_approval_lookup_skips_expired_and_dead_thread_gates` (expired gate and gate on a terminal thread are never advertised); `engine_gate_view_converts_to_history_pending_approval` (the DTO conversion, so older clients parse one envelope shape). The isolation test puts both gates in the *same* conversation on purpose, pinning the thread-exact rule.
     - **Verification on this tree (`taskset -c 0-17`, `-j18` per this run's operator directive; AGENTS.md caps at 12 threads):** `cargo check --lib --tests` clean (exit 0); `cargo clippy --lib --tests -- -D warnings` clean (exit 0); `cargo fmt --all -- --check` clean (exit 0); the 4 WI#520 tests pass (4 passed, 0 failed, 5887 filtered). Three commits: implementation, docs, tests. One clippy pass in between caught a `needless_borrow` in the new test helper, fixed before the final run.
     - **Honest gaps:** the live end-to-end acceptance (a real Engine V2 tenant where an automation client polls `GET /api/chat/history` and approves inside the window before expiry) needs a live tenant, a tenant owner account and a token-consuming tool, and is deploy-gated — the same limitation prior items recorded. The pre-existing `handlers/chat.rs` twin is still not wired into the router (its module is `#[allow(dead_code)]`); it was updated anyway so the two implementations cannot drift further.
-25. [x] (S) Reserved
+25. [ ] work on WI #535
 26. [ ] work on the following work items: #532 + #534 — Engine V2 “thread not found” during join on brightdawn, and its root cause (join_thread only consults the in-memory maps; take-once outcome). Live bug, fix shape agreed in the notes. I would add this one first, as a single line pointing at both. - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2146 but has some issues. please see the comments on the closed MR and address
 27. [ ] work on WI#529
-28. [x] work on WI#508
+28. [ ] work on 
 29. [ ] work on WI#526
 30. [ ] work on WI#531
 
