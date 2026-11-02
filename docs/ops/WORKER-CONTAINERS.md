@@ -25,16 +25,17 @@ The image's source revision `38afee6c` pins
 [Brotli v1.2.1](https://github.com/oven-sh/bun/blob/38afee6c84fcf48c0edb2466aa4b27d287a59c30/scripts/build/deps/brotli.ts),
 replacing Bun 1.4.2's vulnerable v1.1.0. Both OCI indexes include amd64 and arm64.
 
-At the current OpenCode v1.18.25 / v2.1.2 pins, Bun 1.4.4 rejects the upstream
-photon-node patch's hunk-10 context whitespace. Each builder runs
+At the OpenCode v1.18.25 / v2.1.2 pins, Bun 1.4.4 rejected the upstream
+photon-node patch's hunk-10 context whitespace, and each builder ran
 `python3 /build/fix_photon_patch_context.py /build/opencode` immediately after
 checkout and before `bun install --frozen-lockfile`, backporting upstream
-`61845b0`'s three-space repair. The guard is byte-preserving, requires exactly
-one buggy block, and fails on drift or an already-fixed patch. The protected
-`worker-opencode2-candidate` run is the first v2.1.2 install/build proof: the
-recorded local install reproduction is v1.18.25 only. Neither a matching
-upstream patch blob nor the self-tests prove a reproducible compiled v2 image.
-See bump checklist item 7 below before moving either pin past the upstream fix.
+`61845b0`'s three-space repair. **That repair is retired as of the v1.19.5 /
+v2.2.5 pins (WI#531):** both trees already carry `61845b0`, so the fixer's
+exact-match guard reports the repair as redundant. The fixer files, their
+Dockerfile `COPY`/`RUN` and self-test invocations, and the two `input_files`
+entries per lane are gone together; Bun was not downgraded and the drift
+guard was not weakened. See bump checklist item 7 below before moving either
+pin.
 
 Rebuild worker images and recreate tenant containers to deploy these fixes.
 Protected candidate reproducibility and all four scan jobs must pass before
@@ -611,8 +612,8 @@ plus `opencode service set remote true` and `opencode pair` surfaces. !1490
 completed analysis and approval to cross that boundary at v2.0.32**, through
 the existing compile-out, wrapper, config and image assertions. See the
 v2.0.32 bump entry below for the source review and verification status; the
-lane has since advanced to **v2.1.2** (2026-10-21, goals item 83) with every
-gate re-verified against a fresh clone — see the v2.1.2 bump entry.
+lane has since advanced to **v2.2.5** (2026-11-02, WI#531) with every gate
+re-verified against a fresh clone — see the v2.2.5 bump entry.
 
 **Gate record for !1490 (run-79 EI-2):** the in-image layers below (ruleset,
 wrapper, config pins, compile-out) are **naive-use guards, not a boundary**
@@ -1619,6 +1620,70 @@ boot. Upstream adds the `project.time_archived` column and migrates Azure
 CLI credential records from OAuth tokens to external credentials. An image
 downgrade alone is not a verified database rollback; restore the matching
 pre-upgrade state with the prior image if rollback is needed.
+
+### v2.2.5 bump — WI#531, item 30 (2026-11-02)
+
+**Authorization:** the WI#427 boundary crossing (OpenTunnel compile-out,
+wrapper, config and image assertions) remains the standing control set for
+every v2 pin; this bump re-verified each gate against the pinned source
+rather than trusting the previous pin's review. The tag was independently
+resolved with `git ls-remote` to
+`9bbb8ce18c80f099e0e448775f59d965ead40a21` (lightweight tag resolving
+directly to the commit; the `--depth 1` clone's HEAD matches). Dockerfile
+defaults and the CI case block moved together. The Bun base digest and
+`DEBIAN_SNAPSHOT` are unchanged (WI#361 owns those).
+
+**Photon-node repair retired.** v2.2.5 carries upstream `61845b0`, so
+`fix_photon_patch_context.py` fails its exact-match guard with "already
+carries the fixed whitespace" — the documented retirement signal. Removed in
+this bump: both `scripts/fix_photon_patch_context{,_test}.py` files, the
+Dockerfile fixer `COPY`/`RUN` before `bun install`, its runtime self-test
+invocation, and this lane's two `input_files` entries in
+`.gitlab/scripts/build-worker-image.sh`. Bun was not downgraded and the
+drift guard was not weakened.
+
+**Gate re-verification on the fresh v2.2.5 clone:**
+
+- compile-out guard: `packages/cli/src/services/remote-tunnel.ts` unchanged
+  in path and importer surface (`run`/`ensure`/`hostname` exactly); after
+  stubbing, no scanned source under `packages/{cli,server,schema,core}/src`
+  keeps an `@opentunnel` specifier. `@opentunnel/client` stays
+  declared-but-unimported, and the runtime binary marker scan remains
+  mandatory.
+- reproducible-build anchors: `script/build.ts` still sets `bytecode`/`splitting`
+  and takes `--single`; the patch script exits 0 on the pinned tree.
+- SDK surface (`sdk_surface_assert` against the pinned client): 6 bridge
+  method paths present (`session.create/prompt/interrupt`, `permission.reply`,
+  `event.subscribe`, top-level `message.list`), the 2 known-stale paths still
+  absent (`session.message` exposes only `get`; `permission` is a top-level
+  group), and all 8 bridge event names are member literals of the pinned
+  generated V2Event union (98 members; only `V2EventRpc` is a dynamic
+  template family and is correctly not gateable).
+- builder-stage WI#369 typecheck gate: **version move, same binary** —
+  upstream's compiler pin is `@typescript/native` (npm:typescript@7.1.0-beta
+  at this pin, was 7.0.2 at v2.1.2). Its bin is still `tsc` at `bin/tsc`, so
+  the Dockerfile invocation is unchanged; `tsc --noEmit -p
+  tsconfig.sdk-surface.json` exits **0** against the pinned types.
+- behavior pins: Code Mode `session_move`/`session_rename` still carry no
+  permission assert of their own (KL-1/KL-2 deny rules stay required);
+  `service.json` keeps the `{disabled, remote: {route}, hostname, port,
+  password, cors, env}` shape with the legacy boolean-`remote` reader, so the
+  boot reset stays valid; `pair --remote` consent still exists and the
+  wrapper refusals cover it; `updater.ts` still honours
+  `OPENCODE_DISABLE_AUTOUPDATE`. The exposure wrapper still refuses
+  `service set remote true` with exit 77.
+- in-host lane suites: `compile_out_remote_tunnel_test` 10/10,
+  `exposure_policy_assert_test` pass, `sdk_surface{,_assert}_test` pass.
+
+**Not verified here (honest gaps):** the bridge/executor/plugin suite needs
+the `@opencode/client` workspace link that only a full Bun 1.4.4 image build
+creates; this host runs Bun 1.3.1, so `opencode_task_executor_test.ts` fails
+to resolve `@opencode/client/promise` and was not counted as evidence. The
+protected `worker-opencode2-candidate` digest comparison,
+`worker-opencode2-scan`, and `worker-opencode2-exposure-verify` jobs remain
+the acceptance gate, followed by `mt-admin build-opencode2-worker` +
+`restart-tenant` and the live listener audit. No image has been built from
+this pin yet.
 
 ### v2.1.2 bump — item 83 (2026-10-21)
 
