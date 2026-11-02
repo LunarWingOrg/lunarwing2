@@ -30,6 +30,7 @@ struct TurnCompletion {
     message: IncomingMessage,
     conversation_id: lunarwing_engine::ConversationId,
     thread_id: lunarwing_engine::ThreadId,
+    run_started_at: chrono::DateTime<chrono::Utc>,
     history: Option<HistoryReference>,
 }
 
@@ -76,12 +77,24 @@ pub(super) async fn await_thread_outcome(
     thread_id: lunarwing_engine::ThreadId,
     mut events: tokio::sync::broadcast::Receiver<lunarwing_engine::ThreadEvent>,
 ) -> Result<Option<String>, Error> {
+    let run_started_at = state
+        .thread_manager
+        .thread_run_started_at(thread_id)
+        .await
+        .map_err(|error| engine_err("thread lookup", error))?
+        .ok_or_else(|| {
+            engine_err(
+                "thread lookup",
+                lunarwing_engine::EngineError::ThreadNotFound(thread_id),
+            )
+        })?;
     let turn = TurnCompletion {
         state: state.clone(),
         delivery: agent.response_delivery(),
         message: message.clone(),
         conversation_id,
         thread_id,
+        run_started_at,
         history: history_reference(state, message, thread_id).await,
     };
     let mut cancellation = turn.cancellation_guard();
@@ -94,7 +107,10 @@ pub(super) async fn await_thread_outcome(
         cancellation.disarm();
         return Ok(Some(String::new()));
     }
-    let outcome = turn.join().await?;
+    let Some(outcome) = turn.join().await? else {
+        cancellation.disarm();
+        return Ok(Some(String::new()));
+    };
     cancellation.disarm();
     turn.complete(outcome).await
 }
@@ -104,6 +120,7 @@ impl TurnCompletion {
         AwaitThreadCancellationGuard::new(
             Arc::clone(&self.state.thread_manager),
             self.thread_id,
+            self.run_started_at,
             self.message.user_id.clone(),
         )
     }
@@ -122,7 +139,7 @@ impl TurnCompletion {
             loop {
                 tokio::select! {
                     _ = tick.tick() => {
-                        if !self.state.thread_manager.is_running(self.thread_id).await {
+                        if !self.state.thread_manager.is_run_running(self.thread_id, self.run_started_at).await {
                             for event in drain_pending_thread_events(events, self.thread_id) {
                                 self.forward(&event).await;
                             }
@@ -162,12 +179,19 @@ impl TurnCompletion {
         .await;
     }
 
-    async fn join(&self) -> Result<ThreadOutcome, Error> {
-        self.state
+    async fn join(&self) -> Result<Option<ThreadOutcome>, Error> {
+        match self
+            .state
             .thread_manager
-            .join_thread(self.thread_id)
+            .join_thread_for_run(self.thread_id, self.run_started_at)
             .await
-            .map_err(|error| engine_err("join error", error))
+        {
+            Ok(outcome) => Ok(Some(outcome)),
+            Err(lunarwing_engine::EngineError::Thread(lunarwing_engine::ThreadError::Waiting(
+                _,
+            ))) => Ok(None),
+            Err(error) => Err(engine_err("join error", error)),
+        }
     }
 
     async fn deliver_late(
@@ -188,7 +212,12 @@ impl TurnCompletion {
             ),
         ).await;
         let result = self.late_result(events, budget, stop_grace).await;
-        if !self.state.thread_manager.is_running(self.thread_id).await {
+        if !self
+            .state
+            .thread_manager
+            .is_run_running(self.thread_id, self.run_started_at)
+            .await
+        {
             cancellation.disarm();
         }
         match result {
@@ -218,7 +247,7 @@ impl TurnCompletion {
             let stopped = tokio::time::timeout(stop_grace, async {
                 self.state
                     .thread_manager
-                    .stop_thread(self.thread_id, &self.message.user_id)
+                    .stop_thread_for_run(self.thread_id, self.run_started_at, &self.message.user_id)
                     .await
                     .map_err(|error| engine_err("stop late thread", error))?;
                 Ok::<_, Error>(self.wait(events, stop_grace).await)
@@ -233,7 +262,9 @@ impl TurnCompletion {
                 ));
             }
         }
-        let mut outcome = self.join().await?;
+        let Some(mut outcome) = self.join().await? else {
+            return Ok(None);
+        };
         if timed_out && matches!(outcome, ThreadOutcome::Stopped) {
             // A watchdog stop must finish the pending turn visibly; the empty
             // stopped sentinel is reserved for a user-initiated interrupt.
