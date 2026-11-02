@@ -319,6 +319,10 @@ RUN set -eu; \
 
 # WI#357 (run-79 EI-5): the exposure controls must be root-owned and read-only.
 # Kept as the pinned instruction the BuildKit-parser policy gate matches.
+# WI#529 rewrite contract: consumers never write these inputs. entrypoint.sh
+# copies config/opencode2.json into the workspace and chmods u+w the COPY; the
+# baked file stays read-only. See docs/ops/WORKER-CONTAINERS.md →
+# "Baked-config rewrite contract (WI#529)".
 RUN chmod +x /app/entrypoint.sh /app/entrypoint-split.sh /app/health_server.py \
     && chmod -R a-w /app/scripts /app/config /app/entrypoint.sh /app/entrypoint-split.sh /app/health_server.py /app/agent_comm_protocol.json
 
