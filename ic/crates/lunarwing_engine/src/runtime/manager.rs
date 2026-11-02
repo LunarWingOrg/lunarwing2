@@ -3297,8 +3297,8 @@ mod tests {
             .expect("wait result");
         assert!(outcome.is_none(), "{outcome:?}");
 
-        // The stop request still lands, and the outcome was left in place: a
-        // waiter that had joined would make this a ThreadNotFound.
+        // Waiting never removes the live handle, so the stop request still
+        // lands and the outcome remains available to every joiner.
         let stopped = tokio::time::timeout(Duration::from_secs(2), mgr.join_thread(tid))
             .await
             .expect("the stop request still lands")
