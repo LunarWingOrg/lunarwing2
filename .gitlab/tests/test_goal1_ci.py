@@ -1036,7 +1036,7 @@ class WorkerInputManifestTests(unittest.TestCase):
         path.write_text('FROM scratch AS builder\nCOPY ["scripts/unclosed.py"\n', encoding="utf-8")
         self.assertTrue(any("cannot inspect builder COPY" in error for error in self.errors()))
 
-    def test_real_opencode_fixer_manifest_omissions_are_caught(self):
+    def test_real_builder_patch_manifest_omissions_are_caught(self):
         original = config.WORKER_BUILD_SCRIPT.read_text(encoding="utf-8")
         # WI#531 retired the photon-node fixer from both lanes, so the live
         # fixture is each lane's remaining builder-executed patch script: a
