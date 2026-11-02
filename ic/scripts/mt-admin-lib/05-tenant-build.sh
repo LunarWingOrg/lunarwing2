@@ -680,7 +680,7 @@ build_tenant() {
   if [[ "$with_pebble" == "true" ]]; then
     say ""
     say "=== Building pebble worker image ==="
-    build_pebble_worker "false" "$with_toolchains"
+    build_pebble_worker "false" "$with_toolchains" "$(tenant_lw_root "$name")"
   fi
 
   if [[ "$with_opencode" == "true" ]]; then
@@ -770,7 +770,7 @@ build_candidate_worker() {
     with_toolchains="$profile"
   fi
   case "$lane" in
-    pebble)    LUNARWING_WORKER_IMAGE_TAG="$tag" build_pebble_worker "false" "$with_toolchains" || rc=$? ;;
+    pebble)    LUNARWING_WORKER_IMAGE_TAG="$tag" build_pebble_worker "false" "$with_toolchains" "$lw_root" || rc=$? ;;
     opencode)  LUNARWING_WORKER_IMAGE_TAG="$tag" build_opencode_worker "false" "$with_toolchains" "$lw_root" || rc=$? ;;
     kimi)      LUNARWING_WORKER_IMAGE_TAG="$tag" build_kimi_worker "false" "$with_toolchains" "" "$lw_root" || rc=$? ;;
     opencode2) LUNARWING_WORKER_IMAGE_TAG="$tag" build_opencode2_worker "false" "$with_toolchains" "$lw_root" || rc=$? ;;
@@ -1356,13 +1356,14 @@ ensure_darkirc_release() {
     || die "DarkIRC release remained invalid after rebuild"
 }
 
-shared_worker_source_root() {  # <names> <with-opencode> <with-kimi> <with-opencode2>
-  local names="$1" with_opencode="$2" with_kimi="$3" with_opencode2="${4:-false}"
+shared_worker_source_root() {  # <names> <with-opencode> <with-kimi> <with-opencode2> <with-pebble>
+  local names="$1" with_opencode="$2" with_kimi="$3" with_opencode2="${4:-false}" with_pebble="${5:-false}"
   local name root commit dirty expected_commit="" selected_root=""
   local -a worker_paths=()
   [[ "$with_opencode" != "true" ]] || worker_paths+=(opencode4lunarwing)
   [[ "$with_opencode2" != "true" ]] || worker_paths+=(opencode2.4lunarwing)
   [[ "$with_kimi" != "true" ]] || worker_paths+=(kimicode4lunarwing)
+  [[ "$with_pebble" != "true" ]] || worker_paths+=(pebble4lunarwing)
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     root="$(tenant_lw_root "$name")"
@@ -1399,14 +1400,14 @@ build_all() {
   fi
 
   local worker_source_root=""
-  if [[ "$with_opencode" == "true" || "$with_kimi" == "true" || "$with_opencode2" == "true" ]]; then
-    worker_source_root="$(shared_worker_source_root "$names" "$with_opencode" "$with_kimi" "$with_opencode2")"
+  if [[ "$with_opencode" == "true" || "$with_kimi" == "true" || "$with_opencode2" == "true" || "$with_pebble" == "true" ]]; then
+    worker_source_root="$(shared_worker_source_root "$names" "$with_opencode" "$with_kimi" "$with_opencode2" "$with_pebble")"
   fi
 
   if [[ "$with_pebble" == "true" ]]; then
     say ""
     say "=== Building pebble worker image ==="
-    build_pebble_worker "false" "$with_toolchains"
+    build_pebble_worker "false" "$with_toolchains" "$worker_source_root"
   fi
 
   if [[ "$with_opencode" == "true" ]]; then
@@ -1490,7 +1491,8 @@ worker_image_ref() {  # <lane> [tag]
 build_pebble_worker() {
   local no_cache="${1:-false}"
   local with_toolchains="${2:-false}"
-  local pebble_dir="${LUNARWING_ROOT}/pebble4lunarwing"
+  local source_root="${3:-$LUNARWING_ROOT}"
+  local pebble_dir="${source_root}/pebble4lunarwing"
 
   [[ -d "$pebble_dir" ]] || die "pebble worker dir not found at $pebble_dir"
 
@@ -1499,7 +1501,10 @@ build_pebble_worker() {
   local toolchain_desc="slim (no toolchains)"
   [[ "$with_toolchains" == "true" ]] && toolchain_desc="fat (with Rust/Go/C++ toolchains)"
   local source_revision
-  source_revision="$(_worker_source_revision "$LUNARWING_ROOT" pebble4lunarwing)"
+  source_revision="$(_worker_source_revision "$source_root" pebble4lunarwing)"
+  if [[ "$source_root" != "$LUNARWING_ROOT" && ! "$source_revision" =~ ^[0-9a-f]{40}$ ]]; then
+    die "refusing to build a shared pebble worker image from a dirty or unverifiable tenant checkout: $source_root"
+  fi
   local -a revision_args=(--build-arg "SOURCE_REVISION=$source_revision")
   say "building pebble worker Docker image [$toolchain_desc] (source revision: $source_revision) ..."
   local cache_flag=""
@@ -1527,10 +1532,10 @@ build_pebble_worker() {
     # --network=host: podman's default build network
     # can't reach the internet for RUN steps on this host; the host netns has IPv4.
     # --format docker (O4): preserve the Dockerfile HEALTHCHECK (podman OCI drops it).
-    podman build $cache_flag "${toolchain_args[@]}" "${revision_args[@]}" --network=host --format docker -t "$build_tag" -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
+    podman build $cache_flag "${toolchain_args[@]}" "${revision_args[@]}" --network=host --format docker -t "$build_tag" -f "$pebble_dir/Dockerfile" "$source_root" \
       || die "pebble worker image build failed"
   else
-    docker build $cache_flag "${toolchain_args[@]}" "${revision_args[@]}" -t "$build_tag" -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
+    docker build $cache_flag "${toolchain_args[@]}" "${revision_args[@]}" -t "$build_tag" -f "$pebble_dir/Dockerfile" "$source_root" \
       || die "pebble worker image build failed"
   fi
 
@@ -1544,8 +1549,8 @@ build_pebble_worker() {
     # LUNARWING_PEBBLE_TOOLCHAIN_SMOKE is a test hook for harnesses to stub
     # the probe; it is undocumented on purpose and only settable from the
     # build operator's own environment. Production runs use the committed
-    # script.
-    local smoke_script="${LUNARWING_PEBBLE_TOOLCHAIN_SMOKE:-$pebble_dir/scripts/smoke-task-shell-toolchain.sh}"
+    # script from the operator checkout, never the tenant source root.
+    local smoke_script="${LUNARWING_PEBBLE_TOOLCHAIN_SMOKE:-$LUNARWING_ROOT/pebble4lunarwing/scripts/smoke-task-shell-toolchain.sh}"
     say "smoke-checking task-shell toolchain anchors (WI#334) ..."
     CONTAINER_RT="$CONTAINER_RT" "$smoke_script" image "$fat_candidate" \
       || die "pebble worker task-shell toolchain smoke check failed (WI#334)"
