@@ -454,6 +454,30 @@ else
   pass 'real candidate builder builds to the per-tenant tag and records the lane'
 fi
 
+# WI#507: the pebble candidate must use the tenant checkout too. Keep this
+# functional pin beside the other lanes so a merge cannot drop the third arg.
+pebble_root_file="$fixture/pebble-source-root"
+pebble_tag_file="$fixture/pebble-built-tag"
+build_pebble_worker() {
+  printf '%s\n' "${3:-}" >"$pebble_root_file"
+  printf '%s\n' "${LUNARWING_WORKER_IMAGE_TAG:-}" >"$pebble_tag_file"
+  return 0
+}
+: >"$lane_file"
+capture build_candidate_workers fixture false false false true false
+if [[ "$rc" -ne 0 ]]; then
+  fail "real pebble candidate builder failed (rc=$rc): $output"
+elif [[ "$(cat "$pebble_root_file" 2>/dev/null)" != "$fixture_repo" ]]; then
+  fail "pebble candidate used source root '$(cat "$pebble_root_file" 2>/dev/null)' instead of the tenant checkout"
+elif [[ "$(cat "$pebble_tag_file" 2>/dev/null)" != lunarwing-worker-pebble:wi527-fixture ]]; then
+  fail "pebble candidate used a wrong image tag: '$(cat "$pebble_tag_file" 2>/dev/null)'"
+elif ! grep -qx pebble "$lane_file"; then
+  fail "pebble candidate builder did not record the lane: $(cat "$lane_file")"
+else
+  pass 'real pebble candidate builder uses the tenant source root and per-tenant tag'
+fi
+printf 'kimi\n' >"$lane_file"
+
 # 6b. the real promote path must not abort on unset env overrides (TJ-1) and
 # must tag candidate -> :latest for every recorded lane.
 register_image "$candidate_ref" sha256:kimi-candidate

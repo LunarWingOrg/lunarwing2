@@ -2312,6 +2312,17 @@ mt-admin builds also stamp `org.opencontainers.image.revision` with the source c
 podman image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' lunarwing-worker-kimi:latest
 ```
 
+For Pebble, `build-tenant`, `build-all`, and pre-stop upgrade candidate builds
+pass the tenant checkout to `build_pebble_worker`; only the standalone
+`build-pebble-worker` command uses the operator checkout. Tenant Pebble sources
+must resolve to a clean commit, so the shared image cannot silently include a
+dirty tenant tree or the operator's uncommitted `pebble4lunarwing/` edits.
+`build-all` also includes Pebble in its dirty-source and mixed-revision checks.
+The fat-build smoke script is host-executed by root and therefore always comes
+from the operator checkout, even when the image context comes from a tenant
+(WI#507). `test-mt-admin-pebble-build-inputs.sh` pins these boundaries and the
+upgrade harness exercises the candidate call site.
+
 ### Upgrade ordering
 
 Since the `ironclaw-agent-v1` alias was removed (2.1.1), a 2.1.1 daemon offers only `lunarwing-agent-v1` and cannot connect to a worker container that still only accepts the legacy name — every dispatch to such a worker fails the WebSocket upgrade (HTTP 400, no echoed subprotocol) and surfaces as an external-worker connection failure whose reason includes the `lunarwing-agent-v1` / `ironclaw-agent-v1` hint. Workers are protocol-compatible in the other direction (2.1.1 workers accept the primary name only, which pre-2.1.1 daemons also offer), so the safe upgrade order is **workers first, then the daemon**, or — simplest — recreate worker containers in the same maintenance window as the daemon. mt-admin managed upgrades (`build-tenant`, `build-pebble-worker`, `build-opencode-worker`, `build-opencode2-worker`, `build-kimi-worker`, each followed by `restart-tenant`) rebuild the image and, through the image-ID contract above, recreate the worker containers; only manual deployments can strand a legacy-only worker.

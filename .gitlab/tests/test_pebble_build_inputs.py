@@ -253,13 +253,15 @@ class TaskShellToolchainPathTests(unittest.TestCase):
         # re-tagged after the probe passes (WI#334). WI#527/TD-14: the output
         # tag honours LUNARWING_WORKER_IMAGE_TAG via worker_image_ref. WI#527
         # TO-6: the fat staging tag is derived from that output tag, so two
-        # concurrent builds (another tenant's upgrade) cannot share it.
+        # concurrent builds (another tenant's upgrade) cannot share it. WI#507:
+        # the host-executed helper stays in the operator checkout even when the
+        # image build context is a tenant-writable checkout.
         build_lib = (ROOT / "ic/scripts/mt-admin-lib/05-tenant-build.sh").read_text(encoding="utf-8")
         self.assertIn('fat_candidate="${output_tag}-candidate"', build_lib)
         self.assertIn('CONTAINER_RT="$CONTAINER_RT" "$smoke_script" image "$fat_candidate"', build_lib)
         self.assertIn('"$CONTAINER_RT" tag "$fat_candidate" "$output_tag"', build_lib)
         self.assertIn('output_tag="$(worker_image_ref pebble)"', build_lib)
-        self.assertIn('LUNARWING_PEBBLE_TOOLCHAIN_SMOKE:-$pebble_dir/scripts/smoke-task-shell-toolchain.sh', build_lib)
+        self.assertIn('LUNARWING_PEBBLE_TOOLCHAIN_SMOKE:-$LUNARWING_ROOT/pebble4lunarwing/scripts/smoke-task-shell-toolchain.sh', build_lib)
 
     def test_ci_image_build_tracks_the_new_inputs(self):
         build_script = (ROOT / ".gitlab/scripts/build-worker-image.sh").read_text(encoding="utf-8")
