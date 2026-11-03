@@ -39,6 +39,9 @@ const WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 /// Poll interval while a stopped run settles inside its grace period.
 const STOP_SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
+/// Covers the longest current waiter budget (21 minutes 10 seconds). After
+/// expiry, store recovery creates a fresh unclaimed entry; claims are not a
+/// durable exactly-once mechanism for arbitrary later joiners.
 const COMPLETED_OUTCOME_RETENTION: std::time::Duration = std::time::Duration::from_secs(22 * 60);
 
 type RunStartedAt = chrono::DateTime<chrono::Utc>;
@@ -71,9 +74,26 @@ struct RunningThread {
     finished: Arc<AtomicBool>,
 }
 
+async fn unregister_running_generation(
+    running: &RwLock<HashMap<ThreadId, RunningThread>>,
+    thread_id: ThreadId,
+    run_started_at: RunStartedAt,
+) {
+    let mut registry = running.write().await;
+    if registry
+        .get(&thread_id)
+        .is_some_and(|current| current.run_started_at == run_started_at)
+    {
+        registry.remove(&thread_id);
+    }
+}
+
 fn shared_completion(
     thread_id: ThreadId,
+    run_started_at: RunStartedAt,
     handle: tokio::task::JoinHandle<Result<ThreadOutcome, EngineError>>,
+    completed: Arc<RwLock<CompletedOutcomes>>,
+    running: Arc<RwLock<HashMap<ThreadId, RunningThread>>>,
 ) -> (SharedJoin, Arc<AtomicBool>) {
     let finished = Arc::new(AtomicBool::new(false));
     let completion = {
@@ -81,12 +101,23 @@ fn shared_completion(
         async move {
             let completion = match handle.await {
                 Ok(Ok(outcome)) => RunCompletion::Outcome(Box::new(outcome)),
-                Ok(Err(error)) => RunCompletion::Outcome(Box::new(ThreadOutcome::Failed {
-                    kind: ThreadFailureKind::Unknown,
-                    error: error.to_string(),
-                })),
+                Ok(Err(error)) => {
+                    let outcome = ThreadOutcome::Failed {
+                        kind: ThreadFailureKind::Unknown,
+                        error: error.to_string(),
+                    };
+                    remember_completed_outcome(
+                        &mut *completed.write().await,
+                        thread_id,
+                        run_started_at,
+                        outcome.clone(),
+                    );
+                    unregister_running_generation(&running, thread_id, run_started_at).await;
+                    RunCompletion::Outcome(Box::new(outcome))
+                }
                 Err(error) => {
                     error!(thread_id = %thread_id, "thread task panicked: {error}");
+                    unregister_running_generation(&running, thread_id, run_started_at).await;
                     RunCompletion::TaskPanicked
                 }
             };
@@ -966,17 +997,17 @@ impl ThreadManager {
                 run_started_at,
                 outcome.clone(),
             );
-            let mut running = running.write().await;
-            if running
-                .get(&thread_id)
-                .is_some_and(|current| current.run_started_at == run_started_at)
-            {
-                running.remove(&thread_id);
-            }
+            unregister_running_generation(&running, thread_id, run_started_at).await;
             Ok(outcome)
         });
 
-        let (completion, finished) = shared_completion(thread_id, handle);
+        let (completion, finished) = shared_completion(
+            thread_id,
+            run_started_at,
+            handle,
+            Arc::clone(&self.completed),
+            Arc::clone(&self.running),
+        );
         running_registry.insert(
             thread_id,
             RunningThread {
@@ -2215,19 +2246,26 @@ mod tests {
     async fn inject_message_rejects_thread_after_stop_requested() {
         let mgr = make_manager(MockLlm::text("done"));
         let thread_id = ThreadId::new();
+        let run_started_at = chrono::Utc::now();
         let (signal_tx, _signal_rx) = messaging::signal_channel(1);
         let cancellation = CancellationToken::new();
         cancellation.cancel();
         let handle = tokio::spawn(async {
             std::future::pending::<Result<ThreadOutcome, EngineError>>().await
         });
-        let (completion, finished) = shared_completion(thread_id, handle);
+        let (completion, finished) = shared_completion(
+            thread_id,
+            run_started_at,
+            handle,
+            Arc::clone(&mgr.completed),
+            Arc::clone(&mgr.running),
+        );
         mgr.running.write().await.insert(
             thread_id,
             RunningThread {
                 signal_tx,
                 cancellation,
-                run_started_at: chrono::Utc::now(),
+                run_started_at,
                 completion,
                 finished,
             },
@@ -2243,18 +2281,25 @@ mod tests {
     async fn inject_message_reports_closed_signal_channel() {
         let mgr = make_manager(MockLlm::text("done"));
         let thread_id = ThreadId::new();
+        let run_started_at = chrono::Utc::now();
         let (signal_tx, signal_rx) = messaging::signal_channel(1);
         drop(signal_rx);
         let handle = tokio::spawn(async {
             std::future::pending::<Result<ThreadOutcome, EngineError>>().await
         });
-        let (completion, finished) = shared_completion(thread_id, handle);
+        let (completion, finished) = shared_completion(
+            thread_id,
+            run_started_at,
+            handle,
+            Arc::clone(&mgr.completed),
+            Arc::clone(&mgr.running),
+        );
         mgr.running.write().await.insert(
             thread_id,
             RunningThread {
                 signal_tx,
                 cancellation: CancellationToken::new(),
-                run_started_at: chrono::Utc::now(),
+                run_started_at,
                 completion,
                 finished,
             },
@@ -2270,12 +2315,19 @@ mod tests {
     async fn panicked_run_is_not_reported_live_or_stoppable() {
         let mgr = make_manager(MockLlm::text("done"));
         let thread_id = ThreadId::new();
+        let run_started_at = chrono::Utc::now();
         let (signal_tx, _signal_rx) = messaging::signal_channel(1);
         let handle: tokio::task::JoinHandle<Result<ThreadOutcome, EngineError>> =
             tokio::spawn(async { panic!("test panic") });
-        let (completion, finished) = shared_completion(thread_id, handle);
-        let run_started_at = chrono::Utc::now();
-        mgr.running.write().await.insert(
+        let mut running = mgr.running.write().await;
+        let (completion, finished) = shared_completion(
+            thread_id,
+            run_started_at,
+            handle,
+            Arc::clone(&mgr.completed),
+            Arc::clone(&mgr.running),
+        );
+        running.insert(
             thread_id,
             RunningThread {
                 signal_tx,
@@ -2285,6 +2337,7 @@ mod tests {
                 finished,
             },
         );
+        drop(running);
 
         tokio::time::timeout(Duration::from_secs(1), async {
             while mgr.is_run_running(thread_id, run_started_at).await {
@@ -2293,10 +2346,53 @@ mod tests {
         })
         .await
         .unwrap();
+        assert!(!mgr.running.read().await.contains_key(&thread_id));
         assert!(matches!(
             mgr.request_stop(thread_id).await,
             Err(EngineError::ThreadNotFound(seen)) if seen == thread_id
         ));
+    }
+
+    #[tokio::test]
+    async fn task_error_outcome_is_claimable() {
+        let mgr = make_manager(MockLlm::text("done"));
+        let thread_id = ThreadId::new();
+        let run_started_at = chrono::Utc::now();
+        let (signal_tx, _signal_rx) = messaging::signal_channel(1);
+        let handle: tokio::task::JoinHandle<Result<ThreadOutcome, EngineError>> =
+            tokio::spawn(async {
+                Err(EngineError::Store {
+                    reason: "injected task error".into(),
+                })
+            });
+        let mut running = mgr.running.write().await;
+        let (completion, finished) = shared_completion(
+            thread_id,
+            run_started_at,
+            handle,
+            Arc::clone(&mgr.completed),
+            Arc::clone(&mgr.running),
+        );
+        running.insert(
+            thread_id,
+            RunningThread {
+                signal_tx,
+                cancellation: CancellationToken::new(),
+                run_started_at,
+                completion,
+                finished,
+            },
+        );
+        drop(running);
+
+        let outcome = mgr
+            .join_thread_for_run(thread_id, run_started_at)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ThreadOutcome::Failed { .. }));
+        assert!(!mgr.running.read().await.contains_key(&thread_id));
+        assert!(mgr.claim_thread_completion(thread_id, run_started_at).await);
+        assert!(!mgr.claim_thread_completion(thread_id, run_started_at).await);
     }
 
     #[tokio::test]
@@ -3376,14 +3472,6 @@ mod tests {
         let id = previous.id;
         let old_run = previous.created_at;
         store.save_thread(&previous).await.unwrap();
-        remember_completed_outcome(
-            &mut *mgr.completed.write().await,
-            id,
-            old_run,
-            ThreadOutcome::Completed {
-                response: Some("old".into()),
-            },
-        );
 
         let adopted = mgr
             .spawn_thread_with_history_and_message(
@@ -3403,10 +3491,11 @@ mod tests {
         assert_eq!(adopted, id);
         assert_ne!(old_run, new_run);
 
-        let old = mgr.join_thread_for_run(id, old_run).await.unwrap();
-        assert!(
-            matches!(old, ThreadOutcome::Completed { response: Some(ref text) } if text == "old")
-        );
+        let error = mgr.join_thread_for_run(id, old_run).await.unwrap_err();
+        assert!(matches!(
+            error,
+            EngineError::ThreadNotFound(seen) if seen == id
+        ));
         assert!(mgr.is_run_running(id, new_run).await);
         assert_ne!(
             store.load_thread(id).await.unwrap().unwrap().state,
