@@ -47,7 +47,7 @@ type CompletedOutcomes = HashMap<ThreadId, HashMap<RunStartedAt, CompletedOutcom
 
 #[derive(Clone)]
 enum RunCompletion {
-    Outcome(ThreadOutcome),
+    Outcome(Box<ThreadOutcome>),
     TaskPanicked,
 }
 
@@ -80,11 +80,11 @@ fn shared_completion(
         let finished = Arc::clone(&finished);
         async move {
             let completion = match handle.await {
-                Ok(Ok(outcome)) => RunCompletion::Outcome(outcome),
-                Ok(Err(error)) => RunCompletion::Outcome(ThreadOutcome::Failed {
+                Ok(Ok(outcome)) => RunCompletion::Outcome(Box::new(outcome)),
+                Ok(Err(error)) => RunCompletion::Outcome(Box::new(ThreadOutcome::Failed {
                     kind: ThreadFailureKind::Unknown,
                     error: error.to_string(),
-                }),
+                })),
                 Err(error) => {
                     error!(thread_id = %thread_id, "thread task panicked: {error}");
                     RunCompletion::TaskPanicked
@@ -1432,7 +1432,7 @@ impl ThreadManager {
     ) -> Result<ThreadOutcome, EngineError> {
         let run_started_at = running.run_started_at;
         match running.completion.await {
-            RunCompletion::Outcome(outcome) => Ok(outcome),
+            RunCompletion::Outcome(outcome) => Ok(*outcome),
             RunCompletion::TaskPanicked => {
                 let resume_lock = self.resume_lock(thread_id).await;
                 let _resume_guard = resume_lock.lock().await;
