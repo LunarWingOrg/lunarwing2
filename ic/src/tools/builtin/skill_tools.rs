@@ -405,8 +405,8 @@ pub fn validate_fetch_url(url_str: &str) -> Result<reqwest::Url, ToolError> {
     // Check if host is an IP address and reject private ranges.
     // Use reqwest::Url host variants to get proper IpAddr values -- host_str()
     // returns bracketed IPv6 (e.g. "[::1]") which IpAddr cannot parse.
-    // Unwrap IPv4-mapped IPv6 addresses (e.g. ::ffff:192.168.1.1) to catch
-    // SSRF bypasses that encode private IPv4 addresses as IPv6.
+    // IPv4-mapped and other embedded IPv4 forms are classified by
+    // `http_security::is_private_ip`.
     if let Some(ip) = host_ip_addr(&host) {
         validate_fetch_ip(&ip, &host.to_string())?;
     }
@@ -430,23 +430,13 @@ pub fn validate_fetch_url(url_str: &str) -> Result<reqwest::Url, ToolError> {
 fn host_ip_addr(host: &url::Host<&str>) -> Option<std::net::IpAddr> {
     match host {
         url::Host::Ipv4(v4) => Some(std::net::IpAddr::V4(*v4)),
-        url::Host::Ipv6(v6) => Some(normalize_ip(std::net::IpAddr::V6(*v6))),
+        url::Host::Ipv6(v6) => Some(std::net::IpAddr::V6(*v6)),
         url::Host::Domain(_) => None,
     }
 }
 
-fn normalize_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
-    match ip {
-        std::net::IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(std::net::IpAddr::V4)
-            .unwrap_or(std::net::IpAddr::V6(v6)),
-        other => other,
-    }
-}
-
 fn validate_fetch_ip(ip: &std::net::IpAddr, display_host: &str) -> Result<(), ToolError> {
-    if ip.is_loopback() || ip.is_unspecified() || is_private_ip(ip) || is_link_local_ip(ip) {
+    if ip.is_loopback() || ip.is_unspecified() || is_private_ip(ip) {
         return Err(ToolError::ExecutionFailed(format!(
             "URL points to a private/loopback/link-local address: {}",
             display_host
@@ -469,18 +459,22 @@ fn validate_resolved_addrs(host: &str, addrs: &[std::net::SocketAddr]) -> Result
     }
 
     for addr in addrs {
-        let ip = normalize_ip(addr.ip());
-        validate_fetch_ip(&ip, host)?;
+        validate_fetch_ip(&addr.ip(), host)?;
     }
 
     Ok(())
 }
 
 fn build_fetch_client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
+    configure_fetch_client_builder(reqwest::Client::builder())
+}
+
+fn configure_fetch_client_builder(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    builder
         .timeout(std::time::Duration::from_secs(15))
         .user_agent("lunarwing/0.1")
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
 }
 
 async fn build_safe_fetch_client(parsed: &reqwest::Url) -> Result<reqwest::Client, ToolError> {
@@ -519,28 +513,7 @@ async fn build_safe_fetch_client(parsed: &reqwest::Url) -> Result<reqwest::Clien
 }
 
 fn is_private_ip(ip: &std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16
-            v4.is_private() || v4.is_link_local()
-        }
-        std::net::IpAddr::V6(v6) => {
-            // Unique local (fc00::/7)
-            let segments = v6.segments();
-            (segments[0] & 0xfe00) == 0xfc00
-        }
-    }
-}
-
-fn is_link_local_ip(ip: &std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => v4.is_link_local(),
-        std::net::IpAddr::V6(v6) => {
-            // fe80::/10
-            let segments = v6.segments();
-            (segments[0] & 0xffc0) == 0xfe80
-        }
-    }
+    crate::tools::wasm::http_security::is_private_ip(*ip)
 }
 
 /// Fetch SKILL.md content from a URL with SSRF protection.
@@ -1147,11 +1120,69 @@ mod tests {
     #[test]
     fn test_is_private_ip_blocks_loopback() {
         let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
-        // is_private_ip checks v4.is_private() which does NOT include loopback,
-        // but validate_fetch_url checks is_loopback() separately. Test the full flow.
         assert!(loopback.is_loopback());
-        // Also verify via validate_fetch_url
+        assert!(super::is_private_ip(&loopback));
         assert!(super::validate_fetch_url("https://127.0.0.1/skill.md").is_err());
+    }
+
+    #[test]
+    fn test_validate_fetch_url_rejects_embedded_private_ipv4() {
+        let urls = [
+            "https://[2002:a00:1::]/skill.md",
+            "https://[2001:0:4136:e378:8000:63bf:f5ff:fffe]/skill.md",
+        ];
+
+        for url in urls {
+            let err = super::validate_fetch_url(url).unwrap_err();
+            assert!(
+                err.to_string().contains("private"),
+                "embedded private IPv4 should be blocked for {url}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn skill_client_bypasses_a_configured_proxy() {
+        use std::io::{Read, Write};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        let port = listener.local_addr().expect("address").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).expect("read request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\npinned",
+                )
+                .expect("write response");
+        });
+        let proxy = reqwest::Proxy::http("http://127.0.0.1:1").expect("proxy");
+        let addresses = [SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)];
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let body = runtime.block_on(async {
+            let client =
+                super::configure_fetch_client_builder(reqwest::Client::builder().proxy(proxy))
+                    .resolve_to_addrs("pinned.test", &addresses)
+                    .build()
+                    .expect("client");
+            client
+                .get(format!("http://pinned.test:{port}/"))
+                .send()
+                .await
+                .expect("pinned request")
+                .text()
+                .await
+                .expect("response body")
+        });
+
+        assert_eq!(body, "pinned");
+        server.join().expect("server thread");
     }
 
     #[test]
