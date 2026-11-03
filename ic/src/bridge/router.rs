@@ -175,6 +175,16 @@ fn engine_err(context: &str, e: impl std::fmt::Display) -> Error {
     }
 }
 
+fn engine_thread_err(error: lunarwing_engine::EngineError) -> Error {
+    if matches!(
+        &error,
+        lunarwing_engine::EngineError::Thread(lunarwing_engine::ThreadError::AlreadyRunning(_))
+    ) {
+        return engine_err("thread still stopping", error);
+    }
+    engine_err("thread error", error)
+}
+
 /// Convert a local v1 `LoadedSkill` to an `lunarwing_skills::LoadedSkill` for migration.
 ///
 /// The local `SkillManifest` does not have a `credentials` field, so the
@@ -4126,7 +4136,7 @@ async fn handle_user_message_with_event_receiver(
             request.preferred_thread_id,
         )
         .await
-        .map_err(|error| engine_err("thread error", error))?;
+        .map_err(engine_thread_err)?;
     Ok((thread_id, event_rx))
 }
 
@@ -8993,6 +9003,102 @@ pub(crate) mod tests {
             auth_manager: None,
             pending_gate_expiry: DEFAULT_PENDING_GATE_EXPIRY,
         }
+    }
+
+    #[tokio::test]
+    async fn live_thread_collision_has_an_actionable_channel_error() {
+        struct BlockingLlm {
+            entered: Arc<Notify>,
+            release: Arc<Notify>,
+        }
+
+        #[async_trait::async_trait]
+        impl lunarwing_engine::LlmBackend for BlockingLlm {
+            async fn complete(
+                &self,
+                _: &[lunarwing_engine::ThreadMessage],
+                _: &[lunarwing_engine::ActionDef],
+                _: &lunarwing_engine::LlmCallConfig,
+            ) -> Result<lunarwing_engine::LlmOutput, lunarwing_engine::EngineError> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(lunarwing_engine::LlmOutput {
+                    response: lunarwing_engine::LlmResponse::Text("FINAL(\"done\")".into()),
+                    usage: lunarwing_engine::TokenUsage::default(),
+                    finish_reason: "stop".to_string(),
+                })
+            }
+
+            fn model_name(&self) -> &str {
+                "blocking"
+            }
+        }
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let store = Arc::new(TestStore::new());
+        let fixture = make_expected_test_state(store.clone());
+        let manager = ThreadManager::new(
+            Arc::new(BlockingLlm {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+            fixture.effect_adapter.clone(),
+            store,
+            Arc::new(CapabilityRegistry::new()),
+            Arc::new(LeaseManager::new()),
+            Arc::new(PolicyEngine::new()),
+        );
+        let project = lunarwing_engine::ProjectId::new();
+        let id = lunarwing_engine::ThreadId::new();
+        manager
+            .spawn_thread_with_history(
+                "first",
+                lunarwing_engine::ThreadType::Foreground,
+                project,
+                ThreadConfig::default(),
+                None,
+                "alice",
+                Vec::new(),
+                Some(id),
+                None,
+            )
+            .await
+            .unwrap();
+        let first_run = manager.thread_run_started_at(id).await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+
+        let collision = manager
+            .spawn_thread_with_history(
+                "second",
+                lunarwing_engine::ThreadType::Foreground,
+                project,
+                ThreadConfig::default(),
+                None,
+                "alice",
+                Vec::new(),
+                Some(id),
+                None,
+            )
+            .await
+            .unwrap_err();
+        let error = engine_thread_err(collision);
+        assert!(error.to_string().contains(&id.to_string()));
+        assert_eq!(
+            error.user_facing_message(),
+            "The previous turn is still stopping. Please send your message again in a moment."
+        );
+
+        release.notify_one();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            manager.join_thread_for_run(id, first_run),
+        )
+        .await
+        .unwrap()
+        .unwrap();
     }
 
     async fn serve_registry_responses(responses: Vec<(&'static str, Vec<u8>)>) -> String {
