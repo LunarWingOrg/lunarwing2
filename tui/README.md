@@ -75,11 +75,12 @@ tenant's gateway with the mt-admin verb `tui-access`. It needs root, so Christop
 The TUI never calls it.
 
 ```bash
-# Today's tenant daemons predate client tokens: copy the tenant's master token (prints a warning)
-sudo ic/scripts/lunarwing-mt-admin.sh tui-access <tenant> --for-user <user> --use-master-token
-
-# Daemons with client-token support (M2b): a dedicated, revocable client token, optionally expiring
+# A dedicated, revocable client token, optionally expiring. Refused (nothing written) unless the
+# running daemon lists `client_tokens` in GET /api/chat/capabilities (M2b; today's daemons do not)
 sudo ic/scripts/lunarwing-mt-admin.sh tui-access <tenant> --for-user <user> --expires-in-days 90
+
+# Stopgap for daemons that predate client tokens: copy the tenant's master token (prints a warning)
+sudo ic/scripts/lunarwing-mt-admin.sh tui-access <tenant> --for-user <user> --use-master-token
 
 # Registered client-token labels and dates (never tokens or digests)
 sudo ic/scripts/lunarwing-mt-admin.sh tui-access <tenant> --list
@@ -90,15 +91,17 @@ sudo ic/scripts/lunarwing-mt-admin.sh tui-access <tenant> --for-user <user> --re
 
 - A grant writes `~<user>/.config/lunarwing-tui/tenants/<tenant>.json` (mode 0600, owned by `<user>`,
   in 0700 directories) with the gateway URL, the tenant's uid and the token. Nothing prints the token.
-- Without `--use-master-token` the grant registers only the token's SHA-256 with the tenant. A daemon
-  that predates client tokens then rejects it, and the verb exits 2 with the advice to run
-  `upgrade-tenant <tenant>` or to re-grant with `--use-master-token`.
-- The master token carries full gateway API access and stays valid until it is rotated by hand. The
-  TUI shows the sticky warning "this TUI uses the tenant master token" while it uses one.
+- Without `--use-master-token` the grant first asks the running daemon, with the master token, whether
+  it authenticates client tokens (`GET /api/chat/capabilities` must list `client_tokens`) and refuses,
+  writing nothing, when it does not; otherwise it registers only the token's SHA-256 with the tenant.
+- The master token carries full gateway API access and stays valid until the operator runs
+  `rotate-gateway-token <tenant>`, which restarts the tenant and invalidates every copy. The TUI shows
+  the sticky warning "this TUI uses the tenant master token" while it uses one.
 - Running the grant again rotates the token. `--revoke` removes the tenant-side entry and the desktop
   file. A connected TUI then goes offline with a hint that names `tui-access`.
-- Other options: `--url-host <host>` overrides the URL host, and `--no-verify` skips the post-grant
-  probes. Exit status: 0 done, 1 refused, 2 files written but the running daemon rejected the token.
+- Other options: `--url-host <host>` overrides the URL host, and `--no-verify` skips the capability
+  check and the post-grant probes. Exit status: 0 done, 1 refused (including a client grant the daemon
+  cannot authenticate), 2 files written but the running daemon rejected the token.
   The details are in `docs/guides/MT-ADMIN-QUICKSTART.md` ("TUI access for a desktop user").
 - Never copy the output of `mt-admin tokens` into a file for the TUI. That verb is for the web login.
 

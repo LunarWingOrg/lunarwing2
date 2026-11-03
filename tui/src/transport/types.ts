@@ -53,10 +53,12 @@ export function toFinishOutcome(wire: unknown): FinishOutcome {
 }
 
 /** Feature names advertised by GET /api/chat/capabilities `features` and REPLv3 Welcome.features (4.1). */
-export type WireFeature = "status" | "attachments" | "transcribe" | "stream"
+export type WireFeature = "status" | "attachments" | "transcribe" | "stream" | "client_tokens"
 
 /** Canonical order used whenever features are listed (FEATURES_CANONICAL). */
-export const WIRE_FEATURES: readonly WireFeature[] = ["status", "attachments", "transcribe", "stream"]
+// `client_tokens`: the daemon authenticates the client tokens `mt-admin tui-access` registers (M2b);
+// `tui-access` refuses to mint one unless the daemon advertises it. The client itself ignores it.
+export const WIRE_FEATURES: readonly WireFeature[] = ["status", "attachments", "transcribe", "stream", "client_tokens"]
 
 /**
  * lunarwing_common::WireLimits (4.1, 4.2.12), snake_case as on the wire. transport/gateway-wire.ts and

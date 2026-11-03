@@ -626,16 +626,26 @@ Commands:
                                    gateway: writes ~<user>/.config/lunarwing-tui/
                                    tenants/<name>.json (0600, owned by <user>)
                                    with a new client token whose SHA-256 is
-                                   registered in the tenant's state dir (needs
-                                   a daemon with client-token support).
-                                   --use-master-token copies GATEWAY_AUTH_TOKEN
-                                   instead (today's daemons; full API access).
-                                   Prints no token. Exit 2: files written but
-                                   the running daemon rejected the token
+                                   registered in the tenant's state dir. Refused
+                                   (nothing written) unless the running daemon
+                                   lists the client_tokens feature in
+                                   GET /api/chat/capabilities; --no-verify skips
+                                   that check and the probe. --use-master-token
+                                   copies GATEWAY_AUTH_TOKEN instead: a stopgap
+                                   (full API access, revocable only by
+                                   rotate-gateway-token). Prints no token.
+                                   Exit 2: files written but the daemon
+                                   rejected the token
   tui-access <name> --for-user <user> --revoke
                                    Remove the user's client token tenant-side
-                                   (effective within ~2 s) and the desktop file
+                                   (effective within ~2 s on a daemon with
+                                   client-token support) and the desktop file
   tui-access <name> --list         List registered client-token labels and dates
+  rotate-gateway-token <name>      Replace GATEWAY_AUTH_TOKEN with a fresh
+                                   256-bit value and restart a running tenant;
+                                   invalidates every copy of the old token
+                                   (web login, master-token TUI files, worker
+                                   fallback, DarkIRC and Brave uploads)
   doctor                           System dependency and health checks
   coord-doctor <name>              Read-only coordination knowledge-share
                                    (KNOW:) validation: room join/receive
@@ -1549,6 +1559,16 @@ main() {
       require_root
       [[ -n "${1:-}" ]] || die "usage: tui-access <name> --for-user <user> [--revoke] | --list"
       tui_access_command "$@"
+      ;;
+
+    rotate-gateway-token)
+      [[ -n "${1:-}" && $# -eq 1 ]] || die "usage: rotate-gateway-token <name>"
+      require_root
+      local name
+      name="$(sanitize_name "$1")"
+      ports_registry_init
+      tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+      with_tenant_lifecycle_lock "$name" rotate_tenant_gateway_token "$name"
       ;;
 
     configure-gotify)

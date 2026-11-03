@@ -185,13 +185,16 @@ sha256sum() {
 }
 # Scripted gateway: $fixture/health-code holds the /api/health answer;
 # $fixture/status-codes one /api/gateway/status answer per line (the last
-# line repeats). 000 means nothing answered.
+# line repeats); $fixture/capabilities-code and capabilities-body answer
+# /api/chat/capabilities (the body lands in the -o file). 000 means nothing
+# answered.
 curl() {
-  local arg prev="" url="" cfg="" n code
+  local arg prev="" url="" cfg="" out="" n code
   printf '%s\n' "$*" >>"$calls/curl.argv"
   n="$(wc -l <"$calls/curl.argv")"
   for arg in "$@"; do
     [[ "$prev" != -K ]] || cfg="$arg"
+    [[ "$prev" != -o ]] || out="$arg"
     prev="$arg"
     url="$arg"
   done
@@ -200,6 +203,12 @@ curl() {
   fi
   case "$url" in
     */api/health) code="$(<"$fixture/health-code")" ;;
+    */api/chat/capabilities)
+      code="$(<"$fixture/capabilities-code")"
+      if [[ -n "$out" && "$out" != /dev/null ]]; then
+        cat -- "$fixture/capabilities-body" >"$out"
+      fi
+      ;;
     */api/gateway/status)
       code="$(head -n 1 "$fixture/status-codes")"
       if (($(wc -l <"$fixture/status-codes") > 1)); then
@@ -256,9 +265,24 @@ gateway_answers() {  # <health code> <status code...>
   printf '%s\n' "$@" >"$fixture/status-codes"
 }
 
+gateway_capabilities() {  # <code> [body]: the /api/chat/capabilities answer
+  printf '%s\n' "$1" >"$fixture/capabilities-code"
+  printf '%s\n' "${2:-}" >"$fixture/capabilities-body"
+}
+CAPS_WITH_CLIENT_TOKENS='{"api_version":1,"features":["status","attachments","client_tokens"],"credential":"master"}'
+CAPS_WITHOUT_CLIENT_TOKENS='{"api_version":1,"features":["status","attachments"],"credential":"master"}'
+# Default: a daemon that authenticates client tokens, so every grant below
+# passes the UZ-1 capability check unless a scenario says otherwise.
+gateway_capabilities 200 "$CAPS_WITH_CLIENT_TOKENS"
+
 seed_registry() {  # <exact file content>
   printf '%s\n' "$1" >"$registry"
   chmod 600 "$registry"
+}
+
+clean_grant_state() {
+  rm -f -- "$desk_file"
+  seed_registry '{"version":1,"tokens":[]}'
 }
 
 reset_calls() {
@@ -573,7 +597,8 @@ assert_12() {
   run_tui alpha --for-user desk
   refused_with "exit 73" || ok=false
   [[ -L "$desk_file" && "$(cat "$fixture/victim")" == victim ]] || ok=false
-  [[ "$(file_sum "$registry")" == "$before" && ! -s "$calls/curl.argv" ]] || ok=false
+  # The UZ-1 capability check may run first; the token probe must not.
+  [[ "$(file_sum "$registry")" == "$before" && "$(status_calls)" == 0 ]] || ok=false
   rm -- "$desk_file"
   [[ "$ok" == true ]]
 }
@@ -612,13 +637,13 @@ check "revoke of a master-token grant warns that the master token stays valid" \
 gateway_answers 200 401
 run_tui alpha --for-user desk
 assert_14() {
-  ((RC == 2)) && grep -q "upgrade-tenant alpha" "$ERR" && grep -q -- "--use-master-token" "$ERR" \
+  ((RC == 2)) && grep -q "re-run the grant" "$ERR" && grep -q -- "--use-master-token" "$ERR" \
     && [[ -f "$desk_file" ]] \
     && [[ "$(command jq -r '.tokens[] | select(.label == "tui:desk") | .sha256' "$registry")" == "$(digest_of "$(desk_json .token)")" ]] \
     && [[ "$(status_calls)" == 4 && "$(wc -l <"$calls/sleep.argv")" == 3 ]] \
     && ! contains_secret "$ERR" "$(desk_json .token)"
 }
-check "14. 401 on every verify attempt -> exit 2 with upgrade/--use-master-token guidance; files kept" assert_14
+check "14. 401 on every verify attempt -> exit 2 with re-run/--use-master-token guidance; files kept" assert_14
 
 # The documented fallback for today's daemons: the exit-2 grant above left
 # its digest under tui:desk; the master-token re-grant must not leave it live.
@@ -632,12 +657,58 @@ assert_master_fallback() {
 }
 check "--use-master-token after an exit-2 client grant removes the earlier tui:desk digest" assert_master_fallback
 
+# ── Scenario I2: the daemon does not authenticate client tokens (UZ-1) ───────
+
+gate_refuses() {  # <capabilities code> <capabilities body>: a client-mode grant is refused before anything is written
+  local before
+  clean_grant_state
+  before="$(file_sum "$registry")"
+  gateway_capabilities "$1" "$2"
+  gateway_answers 200 200
+  run_tui alpha --for-user desk
+  refused_with "does not authenticate client tokens" && grep -q -- "--use-master-token" "$ERR" \
+    && grep -q "rotate-gateway-token alpha" "$ERR" \
+    && [[ ! -e "$desk_file" && "$(file_sum "$registry")" == "$before" ]] \
+    && [[ "$(status_calls)" == 0 ]] \
+    && grep -q '/api/chat/capabilities' "$calls/curl.argv" \
+    && ! grep -q 'Authorization' "$calls/curl.argv"
+}
+check "UZ-1: capabilities without client_tokens -> client grant refused, nothing written, no token probe" \
+  gate_refuses 200 "$CAPS_WITHOUT_CLIENT_TOKENS"
+check "UZ-1: no capabilities route (404) -> client grant refused the same way" \
+  gate_refuses 404 ''
+assert_gate_master_cfg() {
+  local cfg found=false
+  for cfg in "$calls"/curl-config.*; do
+    [[ -e "$cfg" ]] || continue
+    contains_secret "$cfg" "Authorization: Bearer $FIX_MASTER_TOKEN" && found=true
+  done
+  [[ "$found" == true ]] && ! contains_secret "$calls/curl.argv" "$FIX_MASTER_TOKEN" \
+    && ! contains_secret "$OUT" "$FIX_MASTER_TOKEN" && ! contains_secret "$ERR" "$FIX_MASTER_TOKEN"
+}
+check "UZ-1: the capability check sends the master token only through a curl -K config" assert_gate_master_cfg
+gateway_capabilities 200 "$CAPS_WITHOUT_CLIENT_TOKENS"
+gateway_answers 200 200
+run_tui alpha --for-user desk --use-master-token
+check "UZ-1: --use-master-token still works against such a daemon and is called a stopgap" \
+  eval '((RC == 0)) && [[ "$(desk_json .token_kind)" == master ]] && grep -q "stopgap" "$ERR" && grep -q "rotate-gateway-token alpha" "$ERR"'
+clean_grant_state
+gateway_capabilities 200 "$CAPS_WITH_CLIENT_TOKENS"
+gateway_answers 000
+run_tui alpha --for-user desk
+check "UZ-1: an unreachable gateway leaves support undetermined: files written, reason printed, exit 0" \
+  eval '((RC == 0)) && [[ -f "$desk_file" ]] && grep -q "support: not checked (gateway not reachable now" "$OUT" && [[ "$(status_calls)" == 0 ]]'
+clean_grant_state
+gateway_capabilities 200 "$CAPS_WITHOUT_CLIENT_TOKENS"
+gateway_answers 200 200
+run_tui alpha --for-user desk --no-verify
+check "UZ-1: --no-verify skips the capability check (warned) and the probe, and writes the files" \
+  eval '((RC == 0)) && [[ -f "$desk_file" ]] && grep -q "not checking whether the daemon" "$ERR" && [[ ! -s "$calls/curl.argv" ]]'
+gateway_capabilities 200 "$CAPS_WITH_CLIENT_TOKENS"
+clean_grant_state
+
 # ── Scenario J: tenant env policy ────────────────────────────────────────────
 
-clean_grant_state() {
-  rm -f -- "$desk_file"
-  seed_registry '{"version":1,"tokens":[]}'
-}
 refuses_without_writing() {  # <pattern> <env overrides...>
   local pattern="$1" before
   shift

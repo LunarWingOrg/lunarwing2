@@ -12,8 +12,13 @@
 # with the gateway URL, the tenant uid and the bearer token. The default
 # client-token mode also registers, AS the tenant, only the SHA-256 of a fresh
 # 256-bit token in <state>/gateway-client-tokens.json (0600), which daemons
-# with client-token support reload every 2 s. --use-master-token copies
-# GATEWAY_AUTH_TOKEN instead, for daemons that predate client tokens.
+# with client-token support reload every 2 s. Before minting, the verb reads
+# GET /api/chat/capabilities with the master token (same SEC-01 rules as the
+# probe) and refuses, writing nothing, unless the running daemon lists the
+# `client_tokens` feature: a daemon without the loader would otherwise leave
+# a dormant credential that comes alive on a later upgrade. --use-master-token
+# copies GATEWAY_AUTH_TOKEN instead: a stopgap for daemons that predate client
+# tokens, revocable only by `rotate-gateway-token`.
 #
 # Init-agnostic by construction: the verb never starts, stops or probes a unit
 # (no systemctl, no rc-service). Grants and revocations take effect through
@@ -813,6 +818,77 @@ _tui_gateway_probe() {  # <tenant> <url> <token>
   return 0
 }
 
+# Like _tui_http_code, but the body (at most 64 KiB) lands in <file>.
+_tui_http_body() {  # <url> <file> [extra curl args...]
+  local url="$1" file="$2" code=""
+  shift 2
+  code="$(curl -q -s -g -o "$file" -w '%{http_code}' --max-time 3 --max-filesize 65536 --noproxy '*' "$@" "$url" 2>/dev/null)" || true
+  [[ "$code" =~ ^[0-9]{3}$ ]] || code=000
+  printf '%s' "$code"
+}
+
+# Whether the running daemon authenticates client tokens (UZ-1): GET
+# /api/chat/capabilities, sent with the master token under the same SEC-01
+# rules as the probe, must list the `client_tokens` feature. Returns 0
+# (supported), 2 (the daemon answered without it, or predates the route) or 3
+# (undetermined: gateway down, non-loopback URL, listener owner check failed,
+# master token unreadable); TUI_SUPPORT_REASON says why. The body never
+# reaches stdout; the master token travels only in the curl -K config.
+_tui_client_tokens_supported() {  # <tenant> <env_path> <url>
+  local tenant="$1" env_path="$2" url="$3" code hostport host port tenant_uid owner token="" body features rc=3
+  TUI_SUPPORT_REASON=""
+  code="$(_tui_http_code "$url/api/health")"
+  if [[ "$code" != 200 ]]; then
+    TUI_SUPPORT_REASON="gateway not reachable now (GET /api/health -> $code)"
+    return 3
+  fi
+  hostport="${url#http://}"
+  host="${hostport%:*}"
+  port="${hostport##*:}"
+  if ! _tui_host_is_loopback "$host"; then
+    TUI_SUPPORT_REASON="non-loopback URL; the master token is not sent off-host"
+    return 3
+  fi
+  tenant_uid="$(id -u "$tenant" 2>/dev/null)" || tenant_uid=""
+  owner="$(_tui_port_owner_uid "$port" "$host")"
+  if [[ ! "$tenant_uid" =~ ^[1-9][0-9]*$ || "$owner" != "$tenant_uid" ]]; then
+    _tui_owner_warning "$port" "$owner" "$tenant" "$tenant_uid" "$host"
+    TUI_SUPPORT_REASON="listener owner check failed; the master token was not sent"
+    return 3
+  fi
+  token="$(read_tenant_env_value "$tenant" "$env_path" GATEWAY_AUTH_TOKEN)" || token=""
+  if ! _tui_master_token_valid "$token"; then
+    token=""
+    TUI_SUPPORT_REASON="GATEWAY_AUTH_TOKEN of the tenant could not be read or is malformed"
+    return 3
+  fi
+  body="$(mktemp)" || { token=""; TUI_SUPPORT_REASON="could not create a temporary file"; return 3; }
+  code="$(_tui_http_body "$url/api/chat/capabilities" "$body" \
+    -K <(printf 'header = "Authorization: Bearer %s"\n' "$token"))"
+  token=""
+  case "$code" in
+    200)
+      features="$(jq -r '(.features // []) | map(select(type == "string")) | join(",")' "$body" 2>/dev/null)" || features=""
+      if [[ ",$features," == *",client_tokens,"* ]]; then
+        rc=0
+      else
+        TUI_SUPPORT_REASON="GET /api/chat/capabilities does not list the client_tokens feature"
+        rc=2
+      fi
+      ;;
+    404)
+      TUI_SUPPORT_REASON="GET /api/chat/capabilities -> 404 (the daemon predates the chat contract)"
+      rc=2
+      ;;
+    *)
+      TUI_SUPPORT_REASON="GET /api/chat/capabilities -> $code"
+      rc=3
+      ;;
+  esac
+  rm -f -- "$body"
+  return "$rc"
+}
+
 # ── Grant ────────────────────────────────────────────────────────────────────
 
 # Sets TUI_ISSUED_AT and TUI_EXPIRES_AT (empty without --expires-in-days).
@@ -855,7 +931,7 @@ _tui_grant_report() {  # <tenant> <user> <kind> <label> <tenant_uid>
 
 _tui_rejected_guidance() {  # <tenant> <kind>
   if [[ "$2" == client ]]; then
-    warn_err "the running daemon of tenant '$1' rejected the new client token; its binary probably predates client tokens. The files are kept: run 'upgrade-tenant $1' (the token then works without a new grant), or re-run tui-access with --use-master-token for today's daemons"
+    warn_err "the running daemon of tenant '$1' rejected the new client token after 4 probes. The files are kept: if the daemon was just upgraded or restarted, re-run the grant (it rotates the digest and re-checks client-token support); otherwise check the daemon log for the reload of $TUI_CLIENT_TOKENS_FILE. --use-master-token remains the stopgap (full gateway API access, revocable only by 'rotate-gateway-token $1')"
   else
     warn_err "the running daemon of tenant '$1' rejected GATEWAY_AUTH_TOKEN from its env file; it may still hold an older value. The files are kept: run 'restart-tenant $1', then re-run tui-access with --use-master-token"
   fi
@@ -863,7 +939,7 @@ _tui_rejected_guidance() {  # <tenant> <kind>
 
 _tui_access_grant() {  # <tenant> <user> <url_host> <expires_days> <use_master> <no_verify>
   local tenant="$1" user="$2" url_host="$3" expires_days="$4" use_master="$5" no_verify="$6"
-  local label="tui:$user" env_path tenant_uid kind token="" digest="" json expires_json="" tokens_rc=0 probe_rc=0
+  local label="tui:$user" env_path tenant_uid kind token="" digest="" json expires_json="" tokens_rc=0 probe_rc=0 support_rc=0
   TUI_REGISTRY_RESULT=""
   _tui_desktop_user_resolve "$user" || die "unknown user '$user' (no passwd entry)"
   tenant_uid="$(id -u "$tenant" 2>/dev/null)" || tenant_uid=""
@@ -877,7 +953,7 @@ _tui_access_grant() {  # <tenant> <user> <url_host> <expires_days> <use_master> 
 
   if [[ "$use_master" == true ]]; then
     kind=master
-    say "WARNING: --use-master-token copies the GATEWAY_AUTH_TOKEN of tenant '$tenant' into the desktop config: full gateway API access (settings, extensions, logs), valid until it is rotated by hand plus 'restart-tenant $tenant'. Re-grant without --use-master-token once the tenant runs a binary with client-token support." >&2
+    say "WARNING: --use-master-token copies the GATEWAY_AUTH_TOKEN of tenant '$tenant' into the desktop config: full gateway API access (settings, extensions, logs), a stopgap for daemons that predate client tokens. It stays valid until 'rotate-gateway-token $tenant', which restarts the tenant and invalidates every copy of the old token (web login, worker fallback, DarkIRC and Brave uploads included). Re-grant without --use-master-token once the tenant runs a binary with client-token support." >&2
     token="$(read_tenant_env_value "$tenant" "$env_path" GATEWAY_AUTH_TOKEN)" \
       || die "could not read GATEWAY_AUTH_TOKEN for tenant '$tenant' (tenant-side read of $env_path refused)"
     _tui_master_token_valid "$token" \
@@ -890,6 +966,17 @@ _tui_access_grant() {  # <tenant> <user> <url_host> <expires_days> <use_master> 
       3) die "client tokens are disabled for tenant '$tenant' (GATEWAY_CLIENT_TOKENS_FILE=none); re-run with --use-master-token" ;;
       *) die "$TUI_REGISTRY_PATH_ERROR; refusing client-token mode (--use-master-token does not use the registry)" ;;
     esac
+    # UZ-1: never register a client token that no running daemon authenticates.
+    if [[ "$no_verify" == true ]]; then
+      say "WARNING: --no-verify: not checking whether the daemon of tenant '$tenant' authenticates client tokens; the registered token becomes live only on a daemon that loads $TUI_CLIENT_TOKENS_FILE" >&2
+    else
+      _tui_client_tokens_supported "$tenant" "$env_path" "$TUI_GATEWAY_URL" || support_rc=$?
+      case "$support_rc" in
+        0) ;;
+        2) die "the running daemon of tenant '$tenant' does not authenticate client tokens ($TUI_SUPPORT_REASON); nothing was written. Upgrade the tenant to a binary with client-token support first, or re-run with --use-master-token (a stopgap: full gateway API access, revocable only by 'rotate-gateway-token $tenant')" ;;
+        *) say "  support: not checked ($TUI_SUPPORT_REASON); the registered token becomes live only on a daemon that loads $TUI_CLIENT_TOKENS_FILE" ;;
+      esac
+    fi
     token="$(generate_token)" || die "failed to generate a client token"
     digest="$(printf '%s' "$token" | sha256sum | cut -d' ' -f1)" || digest=""
     [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die "failed to digest the client token"
@@ -945,7 +1032,7 @@ _tui_access_grant() {  # <tenant> <user> <url_host> <expires_days> <use_master> 
 
 _tui_revoke_report() {  # <tenant> <user> <label> <desktop: checked|no-account|unusable>
   local tenant="$1" user="$2" label="$3" desktop="$4" master_note
-  master_note="it stays valid until GATEWAY_AUTH_TOKEN is rotated by hand in $(tenant_env_dir "$tenant")/lunarwing.env followed by 'restart-tenant $tenant'"
+  master_note="it stays valid until 'rotate-gateway-token $tenant', which restarts the tenant and invalidates every copy of the old token (web login, master-token TUI files, worker fallback, DarkIRC and Brave uploads)"
   if [[ "$TUI_REGISTRY_RESULT" == failed ]]; then
     say "tui-access: revocation of tenant '$tenant' for user '$user' is incomplete"
   elif [[ "$TUI_REGISTRY_RESULT" == removed || "$TUI_DESKTOP_RESULT" == removed ]]; then

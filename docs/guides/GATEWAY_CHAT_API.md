@@ -162,10 +162,15 @@ Protected, not rate-limited.
 - `engine`: `"v2"` when Engine V2 routing is enabled (`ENGINE_V2`), else
   `"v1"`. Gateway turns route through V2 only when the engine is enabled.
 - `features`, always in the canonical order `status, attachments, transcribe,
-  stream`: `status` and `attachments` always; `transcribe` when the voice API
-  is configured (`TRANSCRIPTION_PROVIDER=lunarvoice` plus
+  stream, client_tokens`: `status` and `attachments` always; `transcribe` when
+  the voice API is configured (`TRANSCRIPTION_PROVIDER=lunarvoice` plus
   `VOICE_AUTH_TOKEN`); `stream` when `engine` is `"v2"` (`stream_chunk`
-  events are produced only by Engine V2).
+  events are produced only by Engine V2); `client_tokens` only when the daemon
+  loads `state/gateway-client-tokens.json` and authenticates the client tokens
+  registered there (M2b; never in this version). `mt-admin tui-access` reads
+  this document with the master token before minting a client token and
+  refuses, writing nothing, when the feature is absent or the route answers
+  404.
 - `voice.provider`: `"lunarvoice"` when the voice API exists, else `null`, and
   then `stt` and `tts` are `false`.
 - `credential`: always `"master"` in this version (M2b adds `"client"`).

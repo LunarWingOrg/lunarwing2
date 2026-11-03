@@ -30,12 +30,18 @@ pub const FEATURE_ATTACHMENTS: &str = "attachments";
 pub const FEATURE_TRANSCRIBE: &str = "transcribe";
 /// Reply text streams as `stream_chunk` events.
 pub const FEATURE_STREAM: &str = "stream";
+/// The daemon loads `state/gateway-client-tokens.json` and authenticates the client
+/// tokens `mt-admin tui-access` registers there (M2b). `tui-access` reads the
+/// capabilities document with the master token before minting a client token and
+/// refuses, writing nothing, unless the running daemon advertises this feature.
+pub const FEATURE_CLIENT_TOKENS: &str = "client_tokens";
 /// Canonical order used whenever a server lists features.
-pub const FEATURES_CANONICAL: [&str; 4] = [
+pub const FEATURES_CANONICAL: [&str; 5] = [
     FEATURE_STATUS,
     FEATURE_ATTACHMENTS,
     FEATURE_TRANSCRIBE,
     FEATURE_STREAM,
+    FEATURE_CLIENT_TOKENS,
 ];
 
 /// How the agent finished handling one inbound message (TUI design 8.2).
@@ -266,7 +272,13 @@ mod tests {
     fn features_are_listed_in_canonical_order() {
         assert_eq!(
             FEATURES_CANONICAL,
-            ["status", "attachments", "transcribe", "stream"]
+            [
+                "status",
+                "attachments",
+                "transcribe",
+                "stream",
+                "client_tokens"
+            ]
         );
     }
 }

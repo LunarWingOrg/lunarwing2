@@ -19,8 +19,8 @@ use axum::{
     routing::{get, post},
 };
 use lunarwing_common::client_caps::{
-    FEATURE_ATTACHMENTS, FEATURE_STATUS, FEATURE_STREAM, FEATURE_TRANSCRIBE, FEATURES_CANONICAL,
-    is_valid_client_id,
+    FEATURE_ATTACHMENTS, FEATURE_CLIENT_TOKENS, FEATURE_STATUS, FEATURE_STREAM, FEATURE_TRANSCRIBE,
+    FEATURES_CANONICAL, is_valid_client_id,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -1530,6 +1530,9 @@ fn chat_capabilities(voice: bool, engine_v2: bool) -> ChatCapabilitiesResponse {
             FEATURE_STATUS | FEATURE_ATTACHMENTS => true,
             FEATURE_TRANSCRIBE => voice,
             FEATURE_STREAM => engine_v2,
+            // M2b: true once the daemon loads `state/gateway-client-tokens.json`;
+            // until then `mt-admin tui-access` refuses to mint client tokens.
+            FEATURE_CLIENT_TOKENS => false,
             _ => false,
         })
         .collect();
