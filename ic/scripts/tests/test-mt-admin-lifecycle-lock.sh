@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# WI#505 harness: tracked mt-admin lock descriptors must not be inherited by
-# daemons started inside a locked section, a die inside the section must
-# release the lock at process exit, and a stale holder must be reported (not
-# blocked on) with its live inheritor pids. Uses
-# LUNARWING_MT_LIFECYCLE_LOCK_DIR / LUNARWING_MT_DARKIRC_WRITER_LOCK_DIR to
-# redirect the lock directories into a fixture (no OpenRC required). Runs
+# WI#505/WI#526 harness: tracked mt-admin lock descriptors must not be
+# inherited by daemons started inside a locked section, a die inside the
+# section must release the lock at process exit, and a stale holder must be
+# reported (not blocked on) with its live inheritor pids. Uses
+# LUNARWING_MT_LIFECYCLE_LOCK_DIR / LUNARWING_MT_DARKIRC_WRITER_LOCK_DIR and
+# BUILD_LOCK to redirect locks into a fixture (no OpenRC required). Runs
 # identically as root and non-root: the env-exec probes (which refuse EUID 0
 # by design) drop privileges when the harness runs as root.
 set -uo pipefail
@@ -21,6 +21,8 @@ export LUNARWING_MT_LIFECYCLE_LOCK_DIR="$fixture_dir/locks"
 export LUNARWING_MT_DARKIRC_WRITER_LOCK_DIR="$fixture_dir/darkirc-locks"
 # shellcheck source=../lunarwing-mt-admin.sh
 source "$SCRIPT_DIR/../lunarwing-mt-admin.sh"
+# mt-admin fixes BUILD_LOCK to its production path; redirect it after sourcing.
+export BUILD_LOCK="$fixture_dir/lunarwing-build.lock"
 
 mkdir -p "$LUNARWING_MT_LIFECYCLE_LOCK_DIR" "$LUNARWING_MT_DARKIRC_WRITER_LOCK_DIR"
 chmod 700 "$LUNARWING_MT_LIFECYCLE_LOCK_DIR" "$LUNARWING_MT_DARKIRC_WRITER_LOCK_DIR"
@@ -130,7 +132,7 @@ for fd_path in /proc/self/fd/*; do
   [[ "\$fd" =~ ^[0-9]+\$ ]] || continue
   target="\$(readlink "\$fd_path" 2>/dev/null || true)"
   case "\$target" in
-    *"/alice.lock") printf 'inherited\n'; exit 0 ;;
+    *"/alice.lock"|*"/lunarwing-build.lock.alice.upgrade") printf 'inherited\n'; exit 0 ;;
   esac
 done
 printf 'scrubbed\n'
@@ -144,6 +146,19 @@ child_result="$(child_sees_lock_fd)"
 assert "rc-service child does not inherit the lifecycle lock descriptor" \
   test "$child_result" = "scrubbed"
 assert "lock is free after a guarded rc-service call" flock -n "$lock_file" true
+
+upgrade_lock_file="${BUILD_LOCK}.alice.upgrade"
+exec {inherited_upgrade_fd}>"$upgrade_lock_file"
+flock -x "$inherited_upgrade_fd"
+export LUNARWING_MT_INHERITED_UPGRADE_LOCK_FD="$inherited_upgrade_fd"
+wrapper_result="$(_openrc_service lunarwing-alice start)"
+assert "rc-service child does not inherit the wrapper upgrade lock descriptor" \
+  test "$wrapper_result" = "scrubbed"
+flock -u "$inherited_upgrade_fd"
+exec {inherited_upgrade_fd}>&-
+unset LUNARWING_MT_INHERITED_UPGRADE_LOCK_FD
+assert "upgrade lock is free after the wrapper rc-service call" \
+  flock -n "$upgrade_lock_file" true
 
 # ── 3. _systemctl_user drops the tracked lock descriptors before exec ───────
 id() {
@@ -245,7 +260,9 @@ for fd_path in /proc/self/fd/*; do
   fd="${fd_path##*/}"
   [[ "$fd" =~ ^[0-9]+$ ]] || continue
   target="$(readlink "$fd_path" 2>/dev/null || true)"
-  case "$target" in *"/alice.lock") leaked="$fd" ;; esac
+  case "$target" in
+    *"/alice.lock"|*"/lunarwing-build.lock.alice.upgrade") leaked="$fd" ;;
+  esac
 done
 if [[ -n "$leaked" ]]; then
   printf 'leaked fd %s\n' "$leaked"
@@ -281,6 +298,52 @@ else
   fail "env-exec closes a leaked lock descriptor before exec (rc=$env_exec_rc out='$env_exec_out')"
 fi
 assert "lock is free after the env-exec probe" flock -n "$lock_file" true
+
+build_env_exec_rc=0
+build_env_exec_out="$(
+  export BUILD_LOCK
+  exec 8>"$upgrade_lock_file"
+  flock -x 8
+  as_unpriv bash "$ENV_EXEC_RUN" \
+    --env-file "$tenant_home/lunarwing.env" -- "$env_exec_probe"
+)" || build_env_exec_rc=$?
+exec 8>&-
+if [[ "$build_env_exec_rc" -eq 127 ]]; then
+  skip "env-exec closes a leaked upgrade lock descriptor before exec (no privilege-drop tool/user)"
+elif [[ "$build_env_exec_rc" -eq 0 && "$build_env_exec_out" == "clean marker=present" ]]; then
+  pass "env-exec closes a leaked upgrade lock descriptor before exec"
+else
+  fail "env-exec closes a leaked upgrade lock descriptor before exec (rc=$build_env_exec_rc out='$build_env_exec_out')"
+fi
+assert "upgrade lock is free after the env-exec probe" flock -n "$upgrade_lock_file" true
+
+# UO-1: /var/lock is a symlink to /run/lock on standard OpenRC hosts. The
+# kernel reports the resolved fd target, so an unresolved BUILD_LOCK prefix
+# must not prevent the backstop from closing the descriptor.
+build_lock_real="$fixture_dir/build-lock-real"
+build_lock_link="$fixture_dir/build-lock-link"
+mkdir -p "$build_lock_real"
+ln -s "$build_lock_real" "$build_lock_link"
+symlinked_build_lock="$build_lock_link/lunarwing-build.lock"
+symlinked_upgrade_lock="${symlinked_build_lock}.alice.upgrade"
+symlinked_env_exec_rc=0
+symlinked_env_exec_out="$(
+  export BUILD_LOCK="$symlinked_build_lock"
+  exec 8>"$symlinked_upgrade_lock"
+  flock -x 8
+  as_unpriv bash "$ENV_EXEC_RUN" \
+    --env-file "$tenant_home/lunarwing.env" -- "$env_exec_probe"
+)" || symlinked_env_exec_rc=$?
+exec 8>&-
+if [[ "$symlinked_env_exec_rc" -eq 127 ]]; then
+  skip "env-exec closes an upgrade lock reached through a symlink (no privilege-drop tool/user)"
+elif [[ "$symlinked_env_exec_rc" -eq 0 && "$symlinked_env_exec_out" == "clean marker=present" ]]; then
+  pass "env-exec closes an upgrade lock reached through a symlink"
+else
+  fail "env-exec closes an upgrade lock reached through a symlink (rc=$symlinked_env_exec_rc out='$symlinked_env_exec_out')"
+fi
+assert "symlinked upgrade lock is free after the env-exec probe" \
+  flock -n "$symlinked_upgrade_lock" true
 
 # ── 7. env-exec leaves unrelated inherited fds alone ────────────────────────
 unrelated="$fixture_dir/unrelated.txt"
