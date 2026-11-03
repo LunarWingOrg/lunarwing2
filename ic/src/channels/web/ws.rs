@@ -247,10 +247,15 @@ async fn handle_client_message(
                 incoming = incoming.with_thread(tid);
             }
 
-            // Convert uploaded images to IncomingAttachments
-            if !images.is_empty() {
-                let attachments = crate::channels::web::server::images_to_attachments(&images);
-                incoming = incoming.with_attachments(attachments);
+            // Same validation as POST /api/chat/send: an invalid image refuses the
+            // whole message instead of being dropped silently.
+            match crate::channels::web::server::gateway_image_attachments(&images) {
+                Ok(attachments) if attachments.is_empty() => {}
+                Ok(attachments) => incoming = incoming.with_attachments(attachments),
+                Err((_, message)) => {
+                    let _ = direct_tx.send(WsServerMessage::Error { message }).await;
+                    return;
+                }
             }
 
             // Clone sender to avoid holding RwLock read guard across send().await
@@ -659,6 +664,74 @@ mod tests {
             }
             _ => panic!("Expected Error variant"),
         }
+    }
+
+    /// A 1x1 PNG.
+    const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    fn ws_image_message(media_type: &str, data: &str) -> WsClientMessage {
+        WsClientMessage::Message {
+            content: "look".to_string(),
+            thread_id: Some("t1".to_string()),
+            timezone: None,
+            images: vec![crate::channels::web::types::ImageData {
+                media_type: media_type.to_string(),
+                data: data.to_string(),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn ws_message_with_invalid_image_is_refused_not_forwarded() {
+        use base64::Engine;
+
+        let (agent_tx, mut agent_rx) = mpsc::channel(16);
+        let state = make_test_state(Some(agent_tx)).await;
+        let (direct_tx, mut direct_rx) = mpsc::channel(16);
+        let svg = base64::engine::general_purpose::STANDARD.encode("<svg xmlns=\"x\"/>");
+
+        handle_client_message(
+            ws_image_message("image/svg+xml", &svg),
+            &state,
+            "user1",
+            &direct_tx,
+        )
+        .await;
+
+        match direct_rx.recv().await.expect("error frame") {
+            WsServerMessage::Error { message } => assert_eq!(
+                message,
+                "image 1 rejected: unsupported image type (allowed: png, jpeg, gif, webp)"
+            ),
+            other => panic!("expected an error, got {other:?}"),
+        }
+        assert!(
+            agent_rx.try_recv().is_err(),
+            "a refused message must not reach the agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_message_image_uses_sniffed_type_and_unique_id() {
+        let (agent_tx, mut agent_rx) = mpsc::channel(16);
+        let state = make_test_state(Some(agent_tx)).await;
+        let (direct_tx, _direct_rx) = mpsc::channel(16);
+
+        handle_client_message(
+            ws_image_message("image/jpeg", TINY_PNG_B64),
+            &state,
+            "user1",
+            &direct_tx,
+        )
+        .await;
+
+        let incoming = agent_rx.recv().await.expect("forwarded message");
+        let [attachment] = incoming.attachments.as_slice() else {
+            panic!("expected one attachment");
+        };
+        assert_eq!(attachment.mime_type, "image/png");
+        assert!(attachment.id.starts_with("web-image-"), "{}", attachment.id);
+        assert_eq!(attachment.filename.as_deref(), Some("image-1.png"));
     }
 
     /// Helper to create a GatewayState for testing.

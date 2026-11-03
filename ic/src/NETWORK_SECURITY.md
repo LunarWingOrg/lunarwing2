@@ -2,7 +2,7 @@
 
 This document catalogs every network-facing surface in LunarWing, its authentication mechanism, bind address, security controls, and known findings. Use this as the authoritative reference during code reviews that touch network-facing code.
 
-**Last updated:** 2026-02-18
+**Last updated:** 2026-11-03 (web gateway: trust table, chat client contract, rate and body limits)
 
 ---
 
@@ -12,14 +12,15 @@ LunarWing operates across four trust boundaries:
 
 | Boundary | Trust Level | Examples |
 |----------|------------|---------|
-| **Local user** | Fully trusted | TUI, web gateway (loopback), CLI commands |
-| **Browser client** | Authenticated | Web UI connected via bearer token; subject to CORS, Origin validation, CSRF protections |
+| **Local user** | Fully trusted | In-process REPL, CLI commands, Unix-socket REPL clients (`lunarwing repl`) |
+| **Gateway client** | Authenticated (bearer token) | Web UI in a browser and the terminal client (`tui/`) over HTTP + SSE; the gateway is loopback-bound by default, but multi-tenant gateways can listen on every interface (below). Browsers are additionally subject to CORS, Origin validation, CSRF protections |
 | **Docker containers** | Untrusted (sandboxed) | Worker containers executing user jobs; isolated via per-job tokens, allowlisted egress, dropped capabilities |
 | **External services** | Untrusted | Webhook senders (XMPP bridge); authenticated via shared secret |
 
 **Key assumptions:**
 
 - The local machine is single-user. The web gateway and OAuth listener bind to loopback and do not defend against other local users.
+- **Multi-tenant hosts break that assumption.** Every tenant runs as its own uid on one host, so other local users exist: each tenant gateway's loopback port is reachable from every other tenant uid, and the bearer token is the only barrier between them. A tenant gateway can also listen on every interface (`lunarwing-mt-admin.sh add-tenant ... --gateway-host 0.0.0.0`, or a preserved `GATEWAY_HOST`), which is how NetBird peers reach it. Keep the host firewall closed to the gateway ports on the LAN side: on any interface the firewall leaves open, the bearer token is again the only barrier, and there is no TLS (F-2). Rebind a tenant to `127.0.0.1` only if nothing reaches it from another host, including over NetBird. Local clients use loopback URLs and check the listening socket's owner uid before sending a token (the TUI and `tui-access` do), because another uid can bind the port while the daemon restarts.
 - Docker containers are adversarial. A compromised container should not be able to access other jobs, exfiltrate secrets, or reach the host network beyond the orchestrator API.
 - Webhook senders must prove knowledge of the shared secret. The secret is never transmitted in the clear by LunarWing itself.
 - MCP server URLs are operator-configured and treated as trusted destinations (see [MCP Client](#mcp-client)).
@@ -45,6 +46,8 @@ LunarWing operates across four trust boundaries:
 ### Bind Address
 
 Configurable via `GATEWAY_HOST` (default `127.0.0.1`) and `GATEWAY_PORT` (default `3000`). The gateway is designed as a local-first, single-user service.
+
+On multi-tenant hosts each tenant has its own gateway on its ports-registry port. mt-admin renders `GATEWAY_HOST=127.0.0.1` unless `--gateway-host` is given (for example `0.0.0.0`, the bind NetBird peers use) or an existing value is preserved; see the multi-tenant assumption under [Threat Model](#threat-model) and the 0.0.0.0 note in `docs/ops/MULTITENANCY-PRODUCTION.md`.
 
 **Reference:** `src/config.rs` — `gateway_host` default (`"127.0.0.1"`), `gateway_port` default (`3000`)
 
@@ -121,14 +124,34 @@ The `/api/chat/ws` endpoint has two layers of protection:
 
 ### Rate Limiting
 
-Chat endpoint (`/api/chat/send`) enforces a sliding-window rate limit: **30 requests per 60 seconds** (global, not per-IP — single-user gateway).
+Chat and voice use **per-user** sliding windows (`PerUserRateLimiter`, keyed by the authenticated `user_id`, not by IP or by credential). The window sizes are `CHAT_RATE_LIMIT` and `VOICE_RATE_LIMIT` in `src/channels/web/mod.rs`; `GET /api/chat/capabilities` advertises them.
 
-**Reference:** `src/channels/web/server.rs` — `RateLimiter` struct, `chat_rate_limiter` field
+| Bucket | Routes | Window |
+|--------|--------|--------|
+| Chat | `POST /api/chat/send` (messages and the `/interrupt`, `/stop`, `/steer` controls) and `POST /v1/chat/completions` | **30 requests per 60 s** per user |
+| Voice | `POST /api/voice/transcribe` and `POST /api/voice/synthesize` together | **10 requests per 60 s** per user; the slot is taken before the handler checks that voice is configured and before validation |
+
+A user's buckets are shared by all of that user's clients (web UI, TUI, desktop) and every token that authenticates as that user, so one client can exhaust the budget of the others. Not rate-limited: `POST /api/chat/approval`, `auth-token`, `auth-cancel`, the read routes (`events`, `history`, `threads`, `pending-gates`, `capabilities`, `GET /api/voice/status`) and WebSocket messages.
+
+**Reference:** `src/channels/web/server.rs` — `PerUserRateLimiter`, `chat_send_handler()`; `src/channels/web/voice.rs` — `voice_transcribe_handler()`, `voice_synthesize_handler()`
 
 ### Body Limits
 
-- Global: **1 MB** max request body (`DefaultBodyLimit::max(1024 * 1024)`)
-- **Reference:** `src/channels/web/server.rs` — `.layer(DefaultBodyLimit::max(...))`
+- Global: **10 MiB** max request body (`MAX_REQUEST_BODY_BYTES`, sized for image uploads in `POST /api/chat/send`; advertised as `max_request_bytes`)
+- Per-route overrides: `POST /api/voice/transcribe` **32 MiB**, `POST /api/voice/synthesize` **1 MiB**
+- Inside the chat body: at most 5 images, 5 MiB each and 7 MiB in total (decoded), base64 lengths checked before decoding (see below)
+- **Reference:** `src/channels/web/server.rs` — `.layer(DefaultBodyLimit::max(...))`; `src/channels/image_mime.rs` — `GATEWAY_IMAGE_LIMITS`
+
+### Chat client contract (TUI design, milestone M2a)
+
+The normative contract is [`docs/guides/GATEWAY_CHAT_API.md`](../../docs/guides/GATEWAY_CHAT_API.md). Security-relevant points:
+
+- **Capabilities route.** `GET /api/chat/capabilities` is protected, read-only and not rate-limited. It reveals the daemon version, the engine, voice availability and the limits, to authenticated callers only.
+- **Correlation ids.** `client_turn_id` must match `^[A-Za-z0-9_-]{1,64}$` (`lunarwing_common::client_caps::is_valid_client_id`); anything else is rejected with 400, never rewritten. The ids are opaque, not secrets, and echoed only in the owning user's SSE events; `Correlation::from_metadata` drops an invalid id instead of echoing it. `message_id` is a server UUID. WebSocket frames carry no ids.
+- **Narrower scoping.** Approval continuations (`POST /api/chat/approval`) used to be queued without metadata, so their events went to every subscriber; they now carry the same metadata as a send and their events are scoped to the user. Engine V2 credential resumes (`POST /api/chat/auth-token`) were already user-scoped and only gain the correlation ids.
+- **Image validation.** Images are identified by magic bytes; only PNG, JPEG, GIF and WebP pass. SVG (active content that would otherwise be stored in the search-indexed workspace), BMP, TIFF and everything else are refused, the sniffed type replaces the declared one, attachment ids are random (`web-image-<uuid>`) and file names are server-generated. A rejection fails the whole request (413 for size, 422 otherwise) and is logged at debug level with positions and limits only. The WebSocket path applies the same validation. Accepted images are stored in the tenant workspace.
+- **Generated images.** `image_generated` events forward only `data:image/{png,jpeg,gif,webp};base64,` URLs of at most 16 MiB, on both engines. The server does not sniff the bytes, so clients must; the optional `path` is informational and must never be fetched or opened by a client.
+- **No remote daemon stop.** `/quit`, `/exit` and `/shutdown` from the `gateway` and `unix_socket_repl` channels are refused with an `Error: ...` reply. With the DEC-1 guard (`none_result_control` in `src/agent/agent_loop.rs`), a model reply that maps to "stop" (a V1 `NO_REPLY`, V2 `Completed { response: None }`) cannot stop the daemon from these two channels either. Every other channel keeps today's behaviour; the two producers are tracked separately.
 
 ### Project File Serving
 

@@ -49,7 +49,9 @@ use crate::channels::wasm::host::{
 use crate::channels::wasm::router::RegisteredEndpoint;
 use crate::channels::wasm::runtime::{PreparedChannelModule, WasmChannelRuntime};
 use crate::channels::wasm::schema::ChannelConfig;
-use crate::channels::{Channel, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate};
+use crate::channels::{
+    Channel, IncomingMessage, MessageLifecycle, MessageStream, OutgoingResponse, StatusUpdate,
+};
 use crate::error::ChannelError;
 use crate::pairing::PairingStore;
 use crate::safety::LeakDetector;
@@ -3472,6 +3474,10 @@ impl Channel for SharedWasmChannel {
         metadata: &serde_json::Value,
     ) -> Result<(), ChannelError> {
         self.inner.send_status(status, metadata).await
+    }
+
+    async fn message_lifecycle(&self, msg: &IncomingMessage, event: MessageLifecycle) {
+        self.inner.message_lifecycle(msg, event).await;
     }
 
     async fn health_check(&self) -> Result<(), ChannelError> {

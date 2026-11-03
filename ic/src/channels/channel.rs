@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use futures::Stream;
 use uuid::Uuid;
 
+use crate::channels::lifecycle::MessageLifecycle;
 use crate::error::ChannelError;
 
 /// Kind of attachment carried on an incoming message.
@@ -516,6 +517,17 @@ pub trait Channel: Send + Sync {
     ) -> Result<(), ChannelError> {
         Ok(())
     }
+
+    /// Agent-side lifecycle of a message this channel produced (TUI design 8.2).
+    ///
+    /// `Started` fires when the agent dequeues the message; `Finished` fires after any
+    /// reply was handed to [`Channel::respond`], exactly once per message, except that
+    /// `Finished(Detached)` is followed by exactly one more `Finished` from the late
+    /// watcher. Priority controls and scheduler rejections may report `Finished` without
+    /// `Started`. Outcome hints recorded on the `ChannelManager` are already applied.
+    ///
+    /// Must not block: enqueue and return. Default implementation does nothing.
+    async fn message_lifecycle(&self, _msg: &IncomingMessage, _event: MessageLifecycle) {}
 
     /// Send a proactive message without a prior incoming message.
     ///

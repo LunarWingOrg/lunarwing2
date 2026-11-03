@@ -18,6 +18,10 @@ use axum::{
     },
     routing::{get, post},
 };
+use lunarwing_common::client_caps::{
+    FEATURE_ATTACHMENTS, FEATURE_STATUS, FEATURE_STREAM, FEATURE_TRANSCRIBE, FEATURES_CANONICAL,
+    is_valid_client_id,
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
@@ -30,6 +34,9 @@ use uuid::Uuid;
 use crate::agent::SessionManager;
 use crate::bootstrap::lunarwing_base_dir;
 use crate::channels::IncomingMessage;
+use crate::channels::image_mime::{
+    GATEWAY_IMAGE_LIMITS, IMAGE_MIME_ALLOWLIST, ImageInput, ImageRejection, decode_images,
+};
 use crate::channels::web::auth::{AuthenticatedUser, UserIdentity, auth_middleware};
 use crate::channels::web::handlers::cron_workers::{
     cron_worker_control_handler, cron_worker_status_handler,
@@ -63,8 +70,10 @@ use crate::channels::web::util::{
     build_turns_from_db_messages, reasoning_summary, truncate_preview,
 };
 use crate::channels::web::voice::{
-    voice_status_handler, voice_synthesize_handler, voice_transcribe_handler,
+    AUDIO_FORMATS, MAX_AUDIO_B64_LEN, VOICE_PROVIDER, voice_status_handler,
+    voice_synthesize_handler, voice_transcribe_handler,
 };
+use crate::channels::web::{CHAT_RATE_LIMIT, VOICE_RATE_LIMIT};
 use crate::db::Database;
 use crate::extensions::ExtensionManager;
 use crate::orchestrator::job_manager::ContainerJobManager;
@@ -84,6 +93,14 @@ pub type PromptQueue = Arc<
 /// Slot for the routine engine, filled at runtime after the agent starts.
 pub type RoutineEngineSlot =
     Arc<tokio::sync::RwLock<Option<Arc<crate::agent::routine_engine::RoutineEngine>>>>;
+
+/// Global request body limit (image uploads ride in `POST /api/chat/send`).
+const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024;
+/// Largest chat message the agent's input validator accepts (`lunarwing_safety`
+/// `Validator` default, applied to every channel); advertised to clients.
+const MAX_CHAT_CONTENT_BYTES: u64 = 100_000;
+/// Version of the TUI chat contract served by `GET /api/chat/capabilities`.
+const CHAT_API_VERSION: u32 = 1;
 
 fn redact_oauth_state_for_logs(state: &str) -> String {
     let digest = Sha256::digest(state.as_bytes());
@@ -463,6 +480,7 @@ pub(super) async fn start_server_with_mascot(
     let protected = Router::new()
         // Chat
         .route("/api/chat/send", post(chat_send_handler))
+        .route("/api/chat/capabilities", get(chat_capabilities_handler))
         .route("/api/chat/approval", post(chat_approval_handler))
         .route("/api/chat/pending-gates", get(chat_pending_gates_handler))
         .route("/api/chat/auth-token", post(chat_auth_token_handler))
@@ -699,7 +717,7 @@ pub(super) async fn start_server_with_mascot(
         .merge(statics)
         .merge(projects)
         .merge(protected)
-        .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MB max request body (image uploads)
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(cors)
         .layer(SetResponseHeaderLayer::if_not_present(
             header::X_CONTENT_TYPE_OPTIONS,
@@ -1315,54 +1333,88 @@ pub async fn oauth_callback_for_test(
 
 // --- Chat handlers ---
 
-/// Convert web gateway `ImageData` to `IncomingAttachment` objects.
-pub(crate) fn images_to_attachments(
+/// Validates and decodes the images of a chat message (TUI design 6.2).
+///
+/// Any invalid image fails the whole message: 413 for the size limits, 422 for the
+/// count, the type and the encoding, with a plain-text reason naming the image. The
+/// attachment type is sniffed from the bytes; ids are `web-image-<uuid>`.
+pub(crate) fn gateway_image_attachments(
     images: &[ImageData],
-) -> Vec<crate::channels::IncomingAttachment> {
-    use base64::Engine;
-    images
+) -> Result<Vec<crate::channels::IncomingAttachment>, (StatusCode, String)> {
+    let inputs: Vec<ImageInput<'_>> = images
         .iter()
-        .enumerate()
-        .filter_map(|(i, img)| {
-            if !img.media_type.starts_with("image/") {
-                tracing::warn!(
-                    "Skipping image {i}: invalid media type '{}' (must start with 'image/')",
-                    img.media_type
-                );
-                return None;
-            }
-            let data = match base64::engine::general_purpose::STANDARD.decode(&img.data) {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!("Skipping image {i}: invalid base64 data: {e}");
-                    return None;
-                }
-            };
-            Some(crate::channels::IncomingAttachment {
-                id: format!("web-image-{i}"),
-                kind: crate::channels::AttachmentKind::Image,
-                mime_type: img.media_type.clone(),
-                filename: Some(format!("image-{i}.{}", mime_to_ext(&img.media_type))),
-                size_bytes: Some(data.len() as u64),
-                source_url: None,
-                storage_key: None,
-                extracted_text: None,
-                data,
-                duration_secs: None,
-            })
+        .map(|image| ImageInput {
+            declared_mime: &image.media_type,
+            data_b64: &image.data,
+            filename: None,
         })
-        .collect()
+        .collect();
+    decode_images(&inputs, GATEWAY_IMAGE_LIMITS, "web-image").map_err(|rejection| {
+        // Positions and limits only: client data never reaches the logs.
+        tracing::debug!(%rejection, "Rejected chat image upload");
+        image_rejection_response(&rejection)
+    })
 }
 
-/// Map MIME type to file extension.
-fn mime_to_ext(mime: &str) -> &str {
-    match mime {
-        "image/png" => "png",
-        "image/gif" => "gif",
-        "image/webp" => "webp",
-        "image/svg+xml" => "svg",
-        _ => "jpg",
+/// `image <i> rejected: <reason>`, with 413 for the size limits and 422 otherwise.
+fn image_rejection_response(rejection: &ImageRejection) -> (StatusCode, String) {
+    let reason = match rejection {
+        ImageRejection::TooMany { count, max } => format!(
+            "image {} rejected: too many images ({count}, at most {max})",
+            max.saturating_add(1)
+        ),
+        ImageRejection::TooLarge { index, max } => {
+            format!("image {index} rejected: larger than {max} bytes")
+        }
+        ImageRejection::TotalTooLarge { max } => {
+            format!("images rejected: the images exceed {max} bytes in total")
+        }
+        ImageRejection::BadBase64 { index } => format!("image {index} rejected: invalid base64"),
+        ImageRejection::Unsupported { index } => format!(
+            "image {index} rejected: unsupported image type (allowed: png, jpeg, gif, webp)"
+        ),
+        ImageRejection::Empty { index } => format!("image {index} rejected: no image data"),
+    };
+    let status = if rejection.is_size_limit() {
+        StatusCode::PAYLOAD_TOO_LARGE
+    } else {
+        StatusCode::UNPROCESSABLE_ENTITY
+    };
+    (status, reason)
+}
+
+/// `client_turn_id` must satisfy `is_valid_client_id` when present (TUI design 4.1);
+/// an invalid id is rejected, never rewritten.
+fn validate_client_turn_id(id: Option<&str>) -> Result<Option<&str>, (StatusCode, String)> {
+    match id {
+        Some(id) if !is_valid_client_id(id) => Err((
+            StatusCode::BAD_REQUEST,
+            "invalid client_turn_id".to_string(),
+        )),
+        id => Ok(id),
     }
+}
+
+/// Metadata of a message the chat handlers queue for the agent (TUI design 8.3.1).
+///
+/// `user_id` scopes the message's SSE events to its user; `message_id` (the message's
+/// own id) and the optional `client_turn_id` are merged into every event it causes,
+/// and their presence enables the `turn_started` / `turn_finished` events.
+pub(crate) fn gateway_message_metadata(
+    user_id: &str,
+    thread_id: &str,
+    message_id: Uuid,
+    client_turn_id: Option<&str>,
+) -> serde_json::Value {
+    let mut meta = serde_json::json!({
+        "user_id": user_id,
+        "thread_id": thread_id,
+        "message_id": message_id.to_string(),
+    });
+    if let Some(id) = client_turn_id {
+        meta["client_turn_id"] = serde_json::json!(id);
+    }
+    meta
 }
 
 fn require_chat_thread_id(thread_id: Option<&str>) -> Result<&str, (StatusCode, String)> {
@@ -1385,6 +1437,7 @@ async fn chat_send_handler(
     );
 
     let thread_id = require_chat_thread_id(req.thread_id.as_deref())?;
+    let client_turn_id = validate_client_turn_id(req.client_turn_id.as_deref())?;
 
     if !state.chat_rate_limiter.check(&user.user_id) {
         return Err((
@@ -1392,6 +1445,9 @@ async fn chat_send_handler(
             "Rate limit exceeded. Try again shortly.".to_string(),
         ));
     }
+
+    // Decoded only after the rate limit: a refused request costs no decoding.
+    let attachments = gateway_image_attachments(&req.images)?;
 
     let mut msg = IncomingMessage::new("gateway", &user.user_id, &req.content);
     if state.owner_id != state.default_sender_id && user.user_id == state.owner_id {
@@ -1406,15 +1462,11 @@ async fn chat_send_handler(
         msg = msg.with_timezone(tz);
     }
 
-    // Always include user_id in metadata so downstream SSE broadcasts can scope events.
-    let mut meta = serde_json::json!({"user_id": &user.user_id});
-    msg = msg.with_thread(thread_id);
-    meta["thread_id"] = serde_json::json!(thread_id);
-    msg = msg.with_metadata(meta);
+    // user_id scopes the message's SSE events; the ids correlate them (G1).
+    let meta = gateway_message_metadata(&user.user_id, thread_id, msg.id, client_turn_id);
+    msg = msg.with_thread(thread_id).with_metadata(meta);
 
-    // Convert uploaded images to IncomingAttachments
-    if !req.images.is_empty() {
-        let attachments = images_to_attachments(&req.images);
+    if !attachments.is_empty() {
         msg = msg.with_attachments(attachments);
     }
 
@@ -1455,6 +1507,70 @@ async fn chat_send_handler(
             status: "accepted",
         }),
     ))
+}
+
+/// `GET /api/chat/capabilities` (TUI design 4.2.2): the chat contract this gateway
+/// serves. Protected and not rate-limited. Without client tokens (M2b) every request
+/// carries the master token.
+async fn chat_capabilities_handler(
+    State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(_user): AuthenticatedUser,
+) -> Json<ChatCapabilitiesResponse> {
+    Json(chat_capabilities(
+        state.voice.is_some(),
+        crate::bridge::is_engine_v2_enabled(),
+    ))
+}
+
+/// The capabilities document for a gateway with or without the voice API and Engine V2.
+fn chat_capabilities(voice: bool, engine_v2: bool) -> ChatCapabilitiesResponse {
+    let features = FEATURES_CANONICAL
+        .into_iter()
+        .filter(|feature| match *feature {
+            FEATURE_STATUS | FEATURE_ATTACHMENTS => true,
+            FEATURE_TRANSCRIBE => voice,
+            FEATURE_STREAM => engine_v2,
+            _ => false,
+        })
+        .collect();
+    let limits = lunarwing_common::WireLimits {
+        max_content_bytes: MAX_CHAT_CONTENT_BYTES,
+        max_attachments: u32::try_from(GATEWAY_IMAGE_LIMITS.max_count).unwrap_or(u32::MAX),
+        max_attachment_bytes: GATEWAY_IMAGE_LIMITS.max_bytes as u64,
+        max_total_attachment_bytes: GATEWAY_IMAGE_LIMITS.max_total_bytes as u64,
+        attachment_mime_types: IMAGE_MIME_ALLOWLIST.into_iter().map(String::from).collect(),
+        max_transcribe_b64_bytes: if voice { MAX_AUDIO_B64_LEN as u64 } else { 0 },
+        transcribe_formats: if voice {
+            AUDIO_FORMATS.into_iter().map(String::from).collect()
+        } else {
+            Vec::new()
+        },
+        messages_per_minute: per_minute(CHAT_RATE_LIMIT),
+        transcribes_per_minute: per_minute(VOICE_RATE_LIMIT),
+        max_request_bytes: Some(MAX_REQUEST_BODY_BYTES as u64),
+        max_frame_bytes: None,
+        max_in_flight: None,
+        idle_timeout_secs: None,
+    };
+    ChatCapabilitiesResponse {
+        api_version: CHAT_API_VERSION,
+        server_version: env!("CARGO_PKG_VERSION"),
+        engine: if engine_v2 { "v2" } else { "v1" },
+        features,
+        limits,
+        voice: VoiceCapabilities {
+            provider: voice.then_some(VOICE_PROVIDER),
+            stt: voice,
+            tts: voice,
+        },
+        credential: "master",
+    }
+}
+
+/// Requests per minute of a `(requests, window_secs)` limit, rounded down.
+fn per_minute((requests, window_secs): (u32, u64)) -> u32 {
+    let per_minute = u64::from(requests).saturating_mul(60) / window_secs.max(1);
+    u32::try_from(per_minute).unwrap_or(u32::MAX)
 }
 
 pub(crate) async fn chat_pending_gates_handler(
@@ -1498,6 +1614,8 @@ pub(crate) async fn chat_approval_handler(
             "Invalid request_id (expected UUID)".to_string(),
         )
     })?;
+    // The owning turn's client id: the resumed turn's events carry it.
+    let client_turn_id = validate_client_turn_id(req.client_turn_id.as_deref())?;
 
     // WI#472: resolve the owning thread server-side. Without this an approval
     // sent without `thread_id` matched no gate and still returned 202, leaving
@@ -1525,7 +1643,9 @@ pub(crate) async fn chat_approval_handler(
         msg = msg.with_sender_id(&state.default_sender_id);
     }
 
-    msg = msg.with_thread(&thread_id);
+    // Same metadata as a send, so the continuation is user-scoped and correlated.
+    let meta = gateway_message_metadata(&user.user_id, &thread_id, msg.id, client_turn_id);
+    msg = msg.with_thread(&thread_id).with_metadata(meta);
 
     let msg_id = msg.id;
 
@@ -1627,6 +1747,7 @@ pub(crate) async fn chat_auth_token_handler(
     AuthenticatedUser(user): AuthenticatedUser,
     Json(req): Json<AuthTokenRequest>,
 ) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let client_turn_id = validate_client_turn_id(req.client_turn_id.as_deref())?;
     let pending = requested_engine_auth_gate(
         &user.user_id,
         &req.extension_name,
@@ -1661,44 +1782,20 @@ pub(crate) async fn chat_auth_token_handler(
                     &req.extension_name,
                     &req.token,
                     pending.as_ref(),
+                    client_turn_id,
                 )
                 .await?
             } else {
                 false
             };
-
-            if result.verification.is_some() {
-                state.sse.broadcast_for_user(
-                    &user.user_id,
-                    SseEvent::AuthRequired {
-                        extension_name: req.extension_name.clone(),
-                        instructions: Some(result.message),
-                        auth_url: None,
-                        setup_url: None,
-                    },
-                );
-            } else if result.activated {
-                if !engine_resume_queued {
-                    clear_auth_mode(&state, &user.user_id).await;
-                    state.sse.broadcast_for_user(
-                        &user.user_id,
-                        SseEvent::AuthCompleted {
-                            extension_name: req.extension_name.clone(),
-                            success: true,
-                            message: result.message,
-                        },
-                    );
-                }
-            } else {
-                state.sse.broadcast_for_user(
-                    &user.user_id,
-                    SseEvent::AuthCompleted {
-                        extension_name: req.extension_name.clone(),
-                        success: false,
-                        message: result.message,
-                    },
-                );
-            }
+            announce_configured_token(
+                &state,
+                &user.user_id,
+                &req.extension_name,
+                result,
+                engine_resume_queued,
+            )
+            .await;
 
             Ok(Json(resp))
         }
@@ -1718,6 +1815,50 @@ pub(crate) async fn chat_auth_token_handler(
             }
             Ok(Json(ActionResponse::fail(msg)))
         }
+    }
+}
+
+/// Tells the user's clients how a submitted credential was handled.
+///
+/// A queued Engine V2 resume reports the outcome through the resumed turn instead.
+async fn announce_configured_token(
+    state: &GatewayState,
+    user_id: &str,
+    extension_name: &str,
+    result: crate::extensions::ConfigureResult,
+    engine_resume_queued: bool,
+) {
+    if result.verification.is_some() {
+        state.sse.broadcast_for_user(
+            user_id,
+            SseEvent::AuthRequired {
+                extension_name: extension_name.to_string(),
+                instructions: Some(result.message),
+                auth_url: None,
+                setup_url: None,
+            },
+        );
+    } else if result.activated {
+        if !engine_resume_queued {
+            clear_auth_mode(state, user_id).await;
+            state.sse.broadcast_for_user(
+                user_id,
+                SseEvent::AuthCompleted {
+                    extension_name: extension_name.to_string(),
+                    success: true,
+                    message: result.message,
+                },
+            );
+        }
+    } else {
+        state.sse.broadcast_for_user(
+            user_id,
+            SseEvent::AuthCompleted {
+                extension_name: extension_name.to_string(),
+                success: false,
+                message: result.message,
+            },
+        );
     }
 }
 
@@ -1777,12 +1918,18 @@ async fn requested_engine_auth_gate(
     Ok(pending)
 }
 
+/// Queues the Engine V2 resume of the gate waiting for `extension_name`.
+///
+/// The resume message carries gateway metadata with its own `message_id` and the
+/// owning turn's `client_turn_id`, so the resumed turn's events and lifecycle belong
+/// to that turn (TUI design 8.3.1, F1).
 async fn queue_engine_auth_resume(
     state: &GatewayState,
     user_id: &str,
     extension_name: &str,
     token: &str,
     pending: Option<&crate::gate::pending::PendingGateView>,
+    client_turn_id: Option<&str>,
 ) -> Result<bool, (StatusCode, String)> {
     let Some(pending) = pending else {
         return Ok(false);
@@ -1796,12 +1943,9 @@ async fn queue_engine_auth_resume(
             )
         })
     };
-    let mut message = IncomingMessage::new("gateway", user_id, "")
-        .with_thread(thread_id)
-        .with_metadata(serde_json::json!({
-            "thread_id": thread_id,
-            "user_id": user_id,
-        }));
+    let mut message = IncomingMessage::new("gateway", user_id, "").with_thread(thread_id);
+    let meta = gateway_message_metadata(user_id, thread_id, message.id, client_turn_id);
+    message = message.with_metadata(meta);
     message.auth_gate_submission = Some(crate::bridge::router::auth::AuthGateSubmission {
         request_id: parse_id(&pending.request_id)?,
         thread_id: lunarwing_engine::ThreadId(parse_id(thread_id)?),
@@ -1838,6 +1982,9 @@ pub(crate) async fn chat_auth_cancel_handler(
     AuthenticatedUser(user): AuthenticatedUser,
     Json(req): Json<AuthCancelRequest>,
 ) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    // Validated like the other chat requests; the cancellation emits no lifecycle
+    // events (on Engine V2 the gate announces `gate_resolved{cancelled}`).
+    validate_client_turn_id(req.client_turn_id.as_deref())?;
     let pending = requested_engine_auth_gate(
         &user.user_id,
         &req.extension_name,
@@ -4465,5 +4612,534 @@ mod tests {
     fn test_is_local_origin_rejects_garbage() {
         assert!(!is_local_origin("not-a-url"));
         assert!(!is_local_origin(""));
+    }
+
+    // ---- TUI gateway contract (design 4.2, 8.3.1-8.3.4) ----
+
+    use crate::channels::web::sse::Correlation;
+    use crate::channels::web::test_helpers::TestGatewayBuilder;
+
+    const CHAT_TOKEN: &str = "chat-contract-test-token";
+    const THREAD: &str = "5f0e4a52-6a3e-4a8f-9a1e-2b9d6c1e7a10";
+    const TURN: &str = "0193f2a1-7c3e-4d4a-b1e2-6f0c9a8b7d6e";
+    /// A 1x1 PNG.
+    const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    async fn chat_gateway() -> (SocketAddr, mpsc::Receiver<IncomingMessage>) {
+        let (tx, rx) = mpsc::channel(8);
+        let (addr, _state) = TestGatewayBuilder::new()
+            .msg_tx(tx)
+            .start(CHAT_TOKEN)
+            .await
+            .expect("gateway starts");
+        (addr, rx)
+    }
+
+    async fn post_chat(
+        addr: SocketAddr,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, String) {
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}{path}"))
+            .bearer_auth(CHAT_TOKEN)
+            .json(&body)
+            .send()
+            .await
+            .expect("request reaches the gateway");
+        let status = response.status();
+        (status, response.text().await.expect("response body"))
+    }
+
+    async fn next_message(rx: &mut mpsc::Receiver<IncomingMessage>) -> IncomingMessage {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a message is queued in time")
+            .expect("message channel open")
+    }
+
+    fn image(media_type: &str, data: &str) -> ImageData {
+        ImageData {
+            media_type: media_type.to_string(),
+            data: data.to_string(),
+        }
+    }
+
+    fn test_user() -> UserIdentity {
+        UserIdentity {
+            user_id: "test-user".to_string(),
+            workspace_read_scopes: Vec::new(),
+        }
+    }
+
+    /// A gateway whose state has a session manager (for V1 approval lookups).
+    fn session_gateway(sessions: Arc<SessionManager>) -> crate::channels::web::GatewayChannel {
+        let config = crate::config::GatewayConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            auth_token: Some(CHAT_TOKEN.to_string()),
+            mascot_enabled: false,
+            user_id: "test-user".to_string(),
+            workspace_read_scopes: Vec::new(),
+            memory_layers: Vec::new(),
+            user_tokens: None,
+            ws_ping_interval_secs: 30,
+            ws_idle_timeout_secs: 120,
+        };
+        crate::channels::web::GatewayChannel::new(config, "test-user".to_string())
+            .with_session_manager(sessions)
+    }
+
+    #[test]
+    fn validate_client_turn_id_accepts_absent_and_valid_ids_only() {
+        assert_eq!(validate_client_turn_id(None), Ok(None));
+        assert_eq!(validate_client_turn_id(Some(TURN)), Ok(Some(TURN)));
+        assert_eq!(validate_client_turn_id(Some("c-0007")), Ok(Some("c-0007")));
+        let too_long = "a".repeat(65);
+        for bad in ["", "a.b", "a:b", "a b", "caf\u{e9}", too_long.as_str()] {
+            assert_eq!(
+                validate_client_turn_id(Some(bad)),
+                Err((
+                    StatusCode::BAD_REQUEST,
+                    "invalid client_turn_id".to_string()
+                )),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_message_metadata_shape() {
+        let id = Uuid::new_v4();
+        assert_eq!(
+            gateway_message_metadata("alice", THREAD, id, Some(TURN)),
+            serde_json::json!({
+                "user_id": "alice",
+                "thread_id": THREAD,
+                "message_id": id.to_string(),
+                "client_turn_id": TURN,
+            })
+        );
+        assert_eq!(
+            gateway_message_metadata("alice", THREAD, id, None),
+            serde_json::json!({"user_id": "alice", "thread_id": THREAD, "message_id": id.to_string()})
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_send_stamps_message_id_and_client_turn_id_in_metadata() {
+        let (addr, mut rx) = chat_gateway().await;
+        let (status, body) = post_chat(
+            addr,
+            "/api/chat/send",
+            serde_json::json!({"content": "hi", "thread_id": THREAD, "client_turn_id": TURN}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let accepted: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+
+        let msg = next_message(&mut rx).await;
+        assert_eq!(
+            accepted["message_id"],
+            serde_json::json!(msg.id.to_string())
+        );
+        assert_eq!(msg.thread_id.as_deref(), Some(THREAD));
+        assert_eq!(
+            msg.metadata,
+            gateway_message_metadata("test-user", THREAD, msg.id, Some(TURN))
+        );
+        assert_eq!(
+            Correlation::from_metadata(&msg.metadata),
+            Some(Correlation {
+                message_id: msg.id.to_string(),
+                client_turn_id: Some(TURN.to_string()),
+            })
+        );
+
+        // Without a client id the server id alone correlates the message.
+        let (status, _) = post_chat(
+            addr,
+            "/api/chat/send",
+            serde_json::json!({"content": "hi", "thread_id": THREAD}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let msg = next_message(&mut rx).await;
+        assert_eq!(
+            msg.metadata,
+            gateway_message_metadata("test-user", THREAD, msg.id, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_send_rejects_invalid_client_turn_id() {
+        let (addr, mut rx) = chat_gateway().await;
+        let too_long = "a".repeat(65);
+        for bad in ["", "a.b", "a b", "../x", too_long.as_str()] {
+            let (status, body) = post_chat(
+                addr,
+                "/api/chat/send",
+                serde_json::json!({"content": "hi", "thread_id": THREAD, "client_turn_id": bad}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?}");
+            assert_eq!(body, "invalid client_turn_id");
+        }
+        // A non-string id is a JSON shape error, rejected by the extractor.
+        let (status, _) = post_chat(
+            addr,
+            "/api/chat/send",
+            serde_json::json!({"content": "hi", "thread_id": THREAD, "client_turn_id": 7}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(rx.try_recv().is_err(), "rejected sends are not queued");
+    }
+
+    #[tokio::test]
+    async fn approval_stamps_owner_metadata_and_original_client_turn_id() {
+        use crate::agent::session::{PendingApproval, ThreadState};
+
+        let sessions = Arc::new(SessionManager::new());
+        let (session, thread_id) = sessions.resolve_thread("test-user", "gateway", None).await;
+        let request_id = Uuid::new_v4();
+        {
+            let mut sess = session.lock().await;
+            let thread = sess.threads.get_mut(&thread_id).expect("resolved thread");
+            thread.state = ThreadState::AwaitingApproval;
+            thread.pending_approval = Some(PendingApproval {
+                request_id,
+                tool_name: "shell".into(),
+                parameters: serde_json::json!({}),
+                display_parameters: serde_json::json!({}),
+                description: "run".into(),
+                tool_call_id: "call_1".into(),
+                context_messages: Vec::new(),
+                deferred_tool_calls: Vec::new(),
+                user_timezone: None,
+                allow_always: true,
+            });
+        }
+        let gateway = session_gateway(sessions);
+        let state = Arc::clone(gateway.state());
+        let (tx, mut rx) = mpsc::channel(4);
+        *state.msg_tx.write().await = Some(tx);
+
+        let request = |client_turn_id: Option<&str>| ApprovalRequest {
+            request_id: request_id.to_string(),
+            action: "approve".to_string(),
+            thread_id: None,
+            client_turn_id: client_turn_id.map(str::to_string),
+        };
+        let error = chat_approval_handler(
+            State(Arc::clone(&state)),
+            AuthenticatedUser(test_user()),
+            Json(request(Some("a.b"))),
+        )
+        .await
+        .expect_err("an invalid client id is refused");
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(rx.try_recv().is_err());
+
+        let (status, Json(accepted)) = chat_approval_handler(
+            State(Arc::clone(&state)),
+            AuthenticatedUser(test_user()),
+            Json(request(Some(TURN))),
+        )
+        .await
+        .expect("approval accepted");
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let msg = next_message(&mut rx).await;
+        assert_eq!(accepted.message_id, msg.id);
+        let thread = thread_id.to_string();
+        assert_eq!(msg.thread_id.as_deref(), Some(thread.as_str()));
+        // The approval gets its own message id but the owning turn's client id.
+        assert_eq!(
+            msg.metadata,
+            gateway_message_metadata("test-user", &thread, msg.id, Some(TURN))
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_token_resume_stamps_client_turn_id() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let state = TestGatewayBuilder::new().msg_tx(tx).build();
+        let pending = pending_gate_view(lunarwing_engine::ResumeKind::Authentication {
+            credential_name: "notion".to_string(),
+            instructions: "Paste a token".to_string(),
+            auth_url: None,
+        });
+
+        let queued = queue_engine_auth_resume(
+            &state,
+            "test-user",
+            "notion",
+            "fixture-credential",
+            Some(&pending),
+            Some(TURN),
+        )
+        .await
+        .expect("resume queued");
+        assert!(queued);
+        let msg = next_message(&mut rx).await;
+        assert_eq!(msg.thread_id.as_deref(), Some(pending.thread_id.as_str()));
+        assert_eq!(
+            msg.metadata,
+            gateway_message_metadata("test-user", &pending.thread_id, msg.id, Some(TURN))
+        );
+        let submission = msg.auth_gate_submission.as_ref().expect("gate submission");
+        assert_eq!(submission.credential_name, "notion");
+        assert_eq!(submission.request_id.to_string(), pending.request_id);
+
+        // Without an owning turn the resume still carries its own message id.
+        queue_engine_auth_resume(
+            &state,
+            "test-user",
+            "notion",
+            "fixture-credential",
+            Some(&pending),
+            None,
+        )
+        .await
+        .expect("resume queued");
+        let msg = next_message(&mut rx).await;
+        assert_eq!(
+            msg.metadata,
+            gateway_message_metadata("test-user", &pending.thread_id, msg.id, None)
+        );
+
+        // No pending engine gate: nothing to resume.
+        let queued = queue_engine_auth_resume(
+            &state,
+            "test-user",
+            "notion",
+            "fixture-credential",
+            None,
+            Some(TURN),
+        )
+        .await
+        .expect("no resume needed");
+        assert!(!queued);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn auth_cancel_rejects_invalid_client_turn_id() {
+        let (addr, _rx) = chat_gateway().await;
+        for path in ["/api/chat/auth-cancel", "/api/chat/auth-token"] {
+            let (status, body) = post_chat(
+                addr,
+                path,
+                serde_json::json!({"extension_name": "notion", "token": "x", "client_turn_id": "a.b"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+            assert_eq!(body, "invalid client_turn_id", "{path}");
+        }
+        // A valid id is accepted; with nothing pending the cancel succeeds.
+        let (status, body) = post_chat(
+            addr,
+            "/api/chat/auth-cancel",
+            serde_json::json!({"extension_name": "notion", "client_turn_id": TURN}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test]
+    async fn gateway_images_reject_svg_with_422() {
+        use base64::Engine;
+
+        let (addr, mut rx) = chat_gateway().await;
+        let svg = base64::engine::general_purpose::STANDARD
+            .encode("<svg xmlns=\"http://www.w3.org/2000/svg\"/>");
+        let (status, body) = post_chat(
+            addr,
+            "/api/chat/send",
+            serde_json::json!({
+                "content": "", "thread_id": THREAD,
+                "images": [{"media_type": "image/png", "data": TINY_PNG_B64},
+                           {"media_type": "image/svg+xml", "data": svg}],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body,
+            "image 2 rejected: unsupported image type (allowed: png, jpeg, gif, webp)"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "an invalid image refuses the whole message"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_images_reject_oversize_with_413() {
+        let (addr, mut rx) = chat_gateway().await;
+        // One base64 quad over 5 MiB decoded: refused before decoding.
+        let oversize = "A".repeat(4 * (5 * 1024 * 1024usize).div_ceil(3) + 4);
+        let (status, body) = post_chat(
+            addr,
+            "/api/chat/send",
+            serde_json::json!({
+                "content": "", "thread_id": THREAD,
+                "images": [{"media_type": "image/png", "data": oversize}],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body, "image 1 rejected: larger than 5242880 bytes");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn gateway_images_reject_count_total_and_encoding() {
+        let png = image("image/png", TINY_PNG_B64);
+        let six = vec![png.clone(); 6];
+        assert_eq!(
+            gateway_image_attachments(&six).err(),
+            Some((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "image 6 rejected: too many images (6, at most 5)".to_string()
+            ))
+        );
+
+        // Each image is under 5 MiB, together they exceed 7 MiB: refused before decoding.
+        let half = "A".repeat(4_893_360);
+        let total = [image("image/png", &half), image("image/png", &half)];
+        assert_eq!(
+            gateway_image_attachments(&total).err(),
+            Some((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "images rejected: the images exceed 7340032 bytes in total".to_string()
+            ))
+        );
+
+        let cases = [
+            (
+                image("image/png", "not base64!!"),
+                "image 1 rejected: invalid base64",
+            ),
+            (image("image/png", ""), "image 1 rejected: no image data"),
+            (
+                image("text/plain", TINY_PNG_B64),
+                "image 1 rejected: unsupported image type (allowed: png, jpeg, gif, webp)",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                gateway_image_attachments(&[input]).err(),
+                Some((StatusCode::UNPROCESSABLE_ENTITY, expected.to_string()))
+            );
+        }
+        assert_eq!(gateway_image_attachments(&[]).map(|a| a.len()), Ok(0));
+    }
+
+    #[tokio::test]
+    async fn gateway_images_use_sniffed_mime() {
+        let (addr, mut rx) = chat_gateway().await;
+        let (status, body) = post_chat(
+            addr,
+            "/api/chat/send",
+            serde_json::json!({
+                "content": "what is this?", "thread_id": THREAD, "client_turn_id": TURN,
+                "images": [{"media_type": "image/jpeg", "data": TINY_PNG_B64}],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let msg = next_message(&mut rx).await;
+        let [attachment] = msg.attachments.as_slice() else {
+            panic!("expected one attachment, got {}", msg.attachments.len());
+        };
+        assert_eq!(attachment.mime_type, "image/png");
+        assert_eq!(attachment.filename.as_deref(), Some("image-1.png"));
+        assert_eq!(attachment.kind, crate::channels::AttachmentKind::Image);
+        assert_eq!(attachment.size_bytes, Some(attachment.data.len() as u64));
+    }
+
+    #[tokio::test]
+    async fn gateway_image_ids_are_unique_across_requests() {
+        let (addr, mut rx) = chat_gateway().await;
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..2 {
+            let (status, body) = post_chat(
+                addr,
+                "/api/chat/send",
+                serde_json::json!({
+                    "content": "", "thread_id": THREAD,
+                    "images": [{"media_type": "image/png", "data": TINY_PNG_B64},
+                               {"media_type": "image/png", "data": TINY_PNG_B64}],
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+            for attachment in next_message(&mut rx).await.attachments {
+                let uuid = attachment
+                    .id
+                    .strip_prefix("web-image-")
+                    .expect("web-image- prefix");
+                assert!(Uuid::parse_str(uuid).is_ok(), "{}", attachment.id);
+                assert!(ids.insert(attachment.id), "attachment ids must be unique");
+            }
+        }
+        assert_eq!(ids.len(), 4);
+    }
+
+    #[test]
+    fn chat_capabilities_reports_engine_features_limits_voice() {
+        let full = serde_json::to_value(chat_capabilities(true, true)).expect("JSON");
+        assert_eq!(
+            full,
+            serde_json::json!({
+                "api_version": 1,
+                "server_version": env!("CARGO_PKG_VERSION"),
+                "engine": "v2",
+                "features": ["status", "attachments", "transcribe", "stream"],
+                "limits": {
+                    "max_content_bytes": 100000,
+                    "max_attachments": 5,
+                    "max_attachment_bytes": 5242880,
+                    "max_total_attachment_bytes": 7340032,
+                    "attachment_mime_types": ["image/png", "image/jpeg", "image/gif", "image/webp"],
+                    "max_transcribe_b64_bytes": 25165824,
+                    "transcribe_formats": ["wav", "ogg", "opus", "mp3", "mp4", "webm", "flac", "m4a", "aac"],
+                    "messages_per_minute": 30,
+                    "transcribes_per_minute": 10,
+                    "max_request_bytes": 10485760
+                },
+                "voice": {"provider": "lunarvoice", "stt": true, "tts": true},
+                "credential": "master"
+            })
+        );
+
+        let bare = serde_json::to_value(chat_capabilities(false, false)).expect("JSON");
+        assert_eq!(bare["engine"], "v1");
+        assert_eq!(
+            bare["features"],
+            serde_json::json!(["status", "attachments"])
+        );
+        assert_eq!(bare["limits"]["max_transcribe_b64_bytes"], 0);
+        assert_eq!(bare["limits"]["transcribe_formats"], serde_json::json!([]));
+        assert_eq!(
+            bare["voice"],
+            serde_json::json!({"provider": null, "stt": false, "tts": false})
+        );
+        assert_eq!(bare["credential"], "master");
+
+        let v2_without_voice = serde_json::to_value(chat_capabilities(false, true)).expect("JSON");
+        assert_eq!(
+            v2_without_voice["features"],
+            serde_json::json!(["status", "attachments", "stream"])
+        );
+    }
+
+    #[test]
+    fn per_minute_scales_the_window() {
+        assert_eq!(per_minute((30, 60)), 30);
+        assert_eq!(per_minute((10, 30)), 20);
+        assert_eq!(per_minute((10, 120)), 5);
+        assert_eq!(per_minute((10, 0)), 600);
     }
 }

@@ -244,15 +244,19 @@ impl MessageScheduler {
     /// (goal #9 documented-not-fixed race). A lane with an active turn keeps
     /// its queued follow-ups — the engine stops the running turn and the
     /// follow-ups still run afterward, preserving the pinned interrupt-ack
-    /// ordering. Returns the number of queued messages removed.
-    pub(super) fn cancel_lane(&mut self, lane: &LaneKey) -> usize {
+    /// ordering. Returns the removed messages in queue order, so the caller
+    /// can report each one as cancelled (TUI design 8.2.2); the rest of the
+    /// queue keeps its order.
+    pub(super) fn cancel_lane(&mut self, lane: &LaneKey) -> Vec<IncomingMessage> {
         if self.lane_is_active(lane) {
-            return 0;
+            return Vec::new();
         }
-        let before = self.queue.len();
-        self.queue
-            .retain(|queued| LaneKey::from_message(&queued.message) != *lane);
-        before - self.queue.len()
+        let (cancelled, kept): (VecDeque<QueuedMessage>, VecDeque<QueuedMessage>) =
+            std::mem::take(&mut self.queue)
+                .into_iter()
+                .partition(|queued| LaneKey::from_message(&queued.message) == *lane);
+        self.queue = kept;
+        cancelled.into_iter().map(|queued| queued.message).collect()
     }
 
     pub(super) fn has_active(&self) -> bool {
@@ -323,7 +327,7 @@ mod tests {
         // Interrupt aimed at thread "one" for user "user": cancels only that
         // lane, leaving thread "two" and the other user's turn untouched.
         let lane = LaneKey::from_message(&thread_message("user", "one", "/interrupt"));
-        assert_eq!(scheduler.cancel_lane(&lane), 1);
+        assert_eq!(scheduler.cancel_lane(&lane).len(), 1);
 
         let first = scheduler.next_ready().expect("thread two is ready");
         assert_eq!(first.message.content, "second");
@@ -349,7 +353,7 @@ mod tests {
         // An unscoped interrupt (no thread id) cancels only the unscoped
         // queued message.
         let lane = LaneKey::from_message(&message("/interrupt"));
-        assert_eq!(scheduler.cancel_lane(&lane), 1);
+        assert_eq!(scheduler.cancel_lane(&lane).len(), 1);
 
         let next = scheduler.next_ready().expect("scoped message remains");
         assert_eq!(next.message.content, "scoped");
@@ -376,11 +380,45 @@ mod tests {
         // the engine stops the running turn and the follow-up runs afterward
         // (pinned by the interrupt-ack ordering integration test).
         let lane = LaneKey::from_message(&thread_message("user", "one", "/interrupt"));
-        assert_eq!(scheduler.cancel_lane(&lane), 0);
+        assert!(scheduler.cancel_lane(&lane).is_empty());
 
         scheduler.complete(&first.ticket);
         let second = scheduler.next_ready().expect("follow-up still queued");
         assert_eq!(second.message.content, "second");
+    }
+
+    #[test]
+    fn cancel_lane_returns_removed_messages() {
+        let mut scheduler = MessageScheduler::with_limits_for_test(8, 1);
+        let first = thread_message("user", "one", "first");
+        let other = thread_message("user", "two", "other-thread");
+        let second = thread_message("user", "one", "second");
+        let expected_ids = [first.id, second.id];
+        for queued in [first, other, second] {
+            assert!(scheduler.defer(queued, true).is_none());
+        }
+
+        // The agent reports `Finished(Cancelled)` for each returned message, so the
+        // scheduler must hand back the messages themselves, in queue order.
+        let lane = LaneKey::from_message(&thread_message("user", "one", "/interrupt"));
+        let cancelled = scheduler.cancel_lane(&lane);
+        let contents: Vec<&str> = cancelled.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, ["first", "second"]);
+        assert_eq!(
+            cancelled.iter().map(|m| m.id).collect::<Vec<_>>(),
+            expected_ids
+        );
+
+        // A second interrupt finds nothing left in the lane.
+        assert!(scheduler.cancel_lane(&lane).is_empty());
+
+        // The other lane keeps its message and runs normally.
+        let next = scheduler
+            .next_ready()
+            .expect("other thread is still queued");
+        assert_eq!(next.message.content, "other-thread");
+        scheduler.complete(&next.ticket);
+        assert!(scheduler.is_drained());
     }
 
     #[test]

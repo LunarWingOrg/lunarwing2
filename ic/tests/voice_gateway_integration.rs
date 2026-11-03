@@ -3,7 +3,8 @@
 //! These tests start a real Axum gateway on a random port plus a mock
 //! LunarVoice sidecar on another random port, and verify the full flow:
 //! - Auth middleware protects all `/api/voice/*` routes
-//! - Status reports configured/unconfigured capability
+//! - Status reports configured/unconfigured capability, and
+//!   `GET /api/chat/capabilities` advertises the same voice capability
 //! - Transcribe and synthesize proxy to the loopback sidecar with the
 //!   server-held credential
 //! - Bounds are enforced (oversize audio, bad format, empty/long text,
@@ -162,6 +163,39 @@ async fn start_gateway(voice: Option<Arc<VoiceApi>>) -> std::net::SocketAddr {
     .expect("gateway should start")
 }
 
+/// The voice status fields added for the TUI (design 4.2.2).
+fn voice_capability_fields(status: &Value) -> Value {
+    json!({
+        "stt": status["stt"],
+        "tts": status["tts"],
+        "provider": status["provider"],
+        "rate_limit": status["rate_limit"],
+    })
+}
+
+/// The parts of `GET /api/chat/capabilities` that follow the voice configuration.
+/// `stream` is left out: it follows `ENGINE_V2`, which these tests do not control.
+fn chat_voice_capabilities(caps: &Value) -> Value {
+    let features: Vec<Value> = caps["features"]
+        .as_array()
+        .map(|features| {
+            features
+                .iter()
+                .filter(|feature| *feature != "stream")
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({
+        "voice": caps["voice"],
+        "features": features,
+        "max_transcribe_b64_bytes": caps["limits"]["max_transcribe_b64_bytes"],
+        "transcribe_formats": caps["limits"]["transcribe_formats"],
+        "transcribes_per_minute": caps["limits"]["transcribes_per_minute"],
+        "credential": caps["credential"],
+    })
+}
+
 async fn get_json(url: &str, token: &str) -> (StatusCode, Value) {
     let client = reqwest::Client::new();
     let response = client.get(url).bearer_auth(token).send().await.unwrap();
@@ -211,6 +245,54 @@ async fn status_reports_unconfigured_without_credential() {
     let (status, body) = get_json(&format!("http://{addr}/api/voice/status"), AUTH_TOKEN).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["configured"], json!(false));
+    // TUI design 4.2.2: additive capability fields, present without voice too.
+    let expected = json!({"stt": false, "tts": false, "provider": null,
+                          "rate_limit": {"requests": 10, "window_secs": 60}});
+    assert_eq!(voice_capability_fields(&body), expected); // safety: test-only assertion
+
+    // The chat capabilities document agrees: no transcription offered.
+    let caps_url = format!("http://{addr}/api/chat/capabilities");
+    let (status, caps) = get_json(&caps_url, AUTH_TOKEN).await;
+    assert_eq!(status, StatusCode::OK); // safety: test-only assertion
+    let expected = json!({
+        "voice": {"provider": null, "stt": false, "tts": false},
+        "features": ["status", "attachments"],
+        "max_transcribe_b64_bytes": 0,
+        "transcribe_formats": [],
+        "transcribes_per_minute": 10,
+        "credential": "master",
+    });
+    assert_eq!(chat_voice_capabilities(&caps), expected); // safety: test-only assertion
+}
+
+#[tokio::test]
+async fn chat_capabilities_require_auth_and_advertise_configured_voice() {
+    let (sidecar_addr, _) = start_mock_sidecar().await;
+    let api = VoiceApi::from_config(&voice_config(&format!("http://{sidecar_addr}")))
+        .map(Arc::new)
+        .expect("voice api should construct for loopback url"); // safety: test-only
+    let addr = start_gateway(Some(api)).await;
+    let url = format!("http://{addr}/api/chat/capabilities");
+
+    let (status, _) = get_json(&url, "wrong-token").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "auth-gated"); // safety: test-only assertion
+
+    let (status, caps) = get_json(&url, AUTH_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "body: {caps}"); // safety: test-only assertion
+    let expected = json!({
+        "voice": {"provider": "lunarvoice", "stt": true, "tts": true},
+        "features": ["status", "attachments", "transcribe"],
+        "max_transcribe_b64_bytes": 24 * 1024 * 1024,
+        "transcribe_formats": ["wav", "ogg", "opus", "mp3", "mp4", "webm", "flac", "m4a", "aac"],
+        "transcribes_per_minute": 10,
+        "credential": "master",
+    });
+    assert_eq!(chat_voice_capabilities(&caps), expected); // safety: test-only assertion
+    let version = json!({"api_version": 1, "server_version": env!("CARGO_PKG_VERSION"),
+                         "max_request_bytes": 10 * 1024 * 1024});
+    let actual = json!({"api_version": caps["api_version"], "server_version": caps["server_version"],
+                        "max_request_bytes": caps["limits"]["max_request_bytes"]});
+    assert_eq!(actual, version); // safety: test-only assertion
 }
 
 #[tokio::test]
@@ -226,6 +308,9 @@ async fn transcribe_proxies_to_sidecar_with_server_held_credential() {
     assert_eq!(body["configured"], json!(true));
     assert_eq!(body["model"], json!("whisper-tiny"));
     assert_eq!(body["max_synth_audio_secs"], json!(300));
+    let expected = json!({"stt": true, "tts": true, "provider": "lunarvoice",
+                          "rate_limit": {"requests": 10, "window_secs": 60}});
+    assert_eq!(voice_capability_fields(&body), expected); // safety: test-only assertion
 
     let audio = base64::engine::general_purpose::STANDARD.encode(b"RIFFfake");
     let (status, body) = post_json(

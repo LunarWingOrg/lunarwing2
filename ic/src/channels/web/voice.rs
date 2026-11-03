@@ -54,9 +54,78 @@ pub const TRANSCRIBE_BODY_LIMIT: usize = 32 * 1024 * 1024;
 pub const SYNTHESIZE_BODY_LIMIT: usize = 1024 * 1024;
 
 /// Audio container formats the sidecar accepts (`lowercase` wire form).
-const AUDIO_FORMATS: [&str; 9] = [
+pub(crate) const AUDIO_FORMATS: [&str; 9] = [
     "wav", "ogg", "opus", "mp3", "mp4", "webm", "flac", "m4a", "aac",
 ];
+
+/// The only transcription provider the voice API serves (`TRANSCRIPTION_PROVIDER`).
+pub(crate) const VOICE_PROVIDER: &str = "lunarvoice";
+
+/// Why speech-to-text input was refused before reaching the sidecar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum SttInputError {
+    #[error("audio must not be empty")]
+    Empty,
+    #[error("audio exceeds the base64 size limit")]
+    TooLarge,
+    #[error("audio must be valid base64")]
+    BadBase64,
+    #[error("unsupported audio format")]
+    BadFormat,
+}
+
+/// Bounds of one transcription request, checked in this order: not empty, at most
+/// `max_b64_len` base64 bytes, valid base64, a format from [`AUDIO_FORMATS`].
+pub(crate) fn validate_stt_input(
+    audio_b64: &str,
+    format: &str,
+    max_b64_len: usize,
+) -> Result<(), SttInputError> {
+    if audio_b64.is_empty() {
+        return Err(SttInputError::Empty);
+    }
+    if audio_b64.len() > max_b64_len {
+        return Err(SttInputError::TooLarge);
+    }
+    if base64::engine::general_purpose::STANDARD
+        .decode(audio_b64.as_bytes())
+        .is_err()
+    {
+        return Err(SttInputError::BadBase64);
+    }
+    if !AUDIO_FORMATS.contains(&format) {
+        return Err(SttInputError::BadFormat);
+    }
+    Ok(())
+}
+
+/// A transcription as returned by [`VoiceApi::transcribe_b64`].
+///
+/// The STT surface for the REPLv3 `Transcribe` frame (TUI design 8.6.3, M4); until
+/// that channel lands only tests use it, hence the `dead_code` allowance.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SttTranscript {
+    pub(crate) text: String,
+    pub(crate) language: String,
+    pub(crate) model: String,
+}
+
+/// Why [`VoiceApi::transcribe_b64`] failed, without sidecar details.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SttFailure {
+    /// The sidecar's rate limiter refused the call (429).
+    RateLimited,
+    /// The sidecar is busy with another call (503); retryable.
+    Busy,
+    /// The sidecar or the proxy timed out.
+    Timeout,
+    /// The sidecar rejected the audio or the request (400, 422).
+    Rejected,
+    /// Anything else: credential rejected, unreachable, malformed response.
+    Unavailable,
+}
 
 #[derive(Debug, thiserror::Error)]
 enum VoiceProxyError {
@@ -244,7 +313,7 @@ impl VoiceApi {
     /// loopback token is present. Independent of `TRANSCRIPTION_ENABLED`,
     /// which only gates the agent-side attachment middleware.
     pub fn from_config(config: &crate::config::TranscriptionConfig) -> Option<Self> {
-        if config.provider != "lunarvoice" {
+        if config.provider != VOICE_PROVIDER {
             return None;
         }
         let token = config.voice_auth_token.clone()?;
@@ -283,6 +352,58 @@ impl VoiceApi {
 
     fn max_synth_audio_secs(&self) -> u64 {
         self.max_synth_audio_secs
+    }
+
+    /// Transcribes base64 audio with the configured model (`language: "auto"`).
+    ///
+    /// Callers validate the input with [`validate_stt_input`] first. Failures are
+    /// logged here with their sidecar detail and returned without it. Used by the
+    /// REPLv3 `Transcribe` frame (M4); `voice_transcribe_handler` keeps its own path.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn transcribe_b64(
+        &self,
+        audio_b64: &str,
+        format: &str,
+    ) -> Result<SttTranscript, SttFailure> {
+        let model = self.client.model();
+        let request = SidecarTranscribeRequest {
+            audio: audio_b64,
+            format,
+            language: "auto",
+            model,
+        };
+        match self.client.transcribe(request).await {
+            Ok(response) => Ok(SttTranscript {
+                text: response.text,
+                language: response.language,
+                // The sidecar may omit the model; it serves the requested one.
+                model: if response.model.is_empty() {
+                    model.to_string()
+                } else {
+                    response.model
+                },
+            }),
+            Err(error) => {
+                tracing::warn!(error = %error, "LunarVoice transcription failed");
+                Err(stt_failure(&error))
+            }
+        }
+    }
+}
+
+/// Maps a proxy error to the client-facing transcription failure.
+fn stt_failure(error: &VoiceProxyError) -> SttFailure {
+    match error {
+        VoiceProxyError::Upstream { status: 429, .. } => SttFailure::RateLimited,
+        VoiceProxyError::Upstream { status: 503, .. } => SttFailure::Busy,
+        VoiceProxyError::Upstream { status: 504, .. } => SttFailure::Timeout,
+        VoiceProxyError::Request(error) if error.is_timeout() => SttFailure::Timeout,
+        VoiceProxyError::Upstream {
+            status: 400 | 422, ..
+        } => SttFailure::Rejected,
+        VoiceProxyError::Upstream { .. }
+        | VoiceProxyError::Request(_)
+        | VoiceProxyError::InvalidResponse => SttFailure::Unavailable,
     }
 }
 
@@ -355,6 +476,21 @@ pub struct VoiceStatusResponse {
     /// Maximum synthesized audio duration the sidecar returns; text estimated
     /// to exceed it is rejected with `text_too_long` (422).
     pub max_synth_audio_secs: u64,
+    /// Speech-to-text is available (`POST /api/voice/transcribe`).
+    pub stt: bool,
+    /// Text-to-speech is available (`POST /api/voice/synthesize`).
+    pub tts: bool,
+    /// `"lunarvoice"` when configured, else `null`.
+    pub provider: Option<&'static str>,
+    /// The per-user limit shared by transcribe and synthesize.
+    pub rate_limit: VoiceRateLimit,
+}
+
+/// `rate_limit` of [`VoiceStatusResponse`].
+#[derive(Debug, Serialize)]
+pub struct VoiceRateLimit {
+    pub requests: u32,
+    pub window_secs: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -434,7 +570,11 @@ pub async fn voice_status_handler(
     State(state): State<Arc<GatewayState>>,
     _user: AuthenticatedUser,
 ) -> Json<VoiceStatusResponse> {
-    let (configured, model, max_synth_audio_secs) = match state.voice.as_ref() {
+    Json(voice_status(state.voice.as_deref()))
+}
+
+fn voice_status(api: Option<&VoiceApi>) -> VoiceStatusResponse {
+    let (configured, model, max_synth_audio_secs) = match api {
         Some(api) => (
             true,
             Some(api.client().model().to_string()),
@@ -442,13 +582,21 @@ pub async fn voice_status_handler(
         ),
         None => (false, None, MAX_SYNTH_AUDIO_SECS),
     };
-    Json(VoiceStatusResponse {
+    let (requests, window_secs) = crate::channels::web::VOICE_RATE_LIMIT;
+    VoiceStatusResponse {
         configured,
         model,
         max_audio_b64_len: MAX_AUDIO_B64_LEN,
         max_text_chars: MAX_SYNTH_TEXT_CHARS,
         max_synth_audio_secs,
-    })
+        stt: configured,
+        tts: configured,
+        provider: configured.then_some(VOICE_PROVIDER),
+        rate_limit: VoiceRateLimit {
+            requests,
+            window_secs,
+        },
+    }
 }
 
 /// POST /api/voice/transcribe — bounded audio-to-text proxy.
@@ -616,37 +764,30 @@ fn map_proxy_error(error: VoiceProxyError) -> HandlerError {
 }
 
 fn validate_transcribe_request(request: &VoiceTranscribeRequest) -> Result<(), HandlerError> {
-    if request.audio.is_empty() {
-        return Err(error_response(
-            StatusCode::BAD_REQUEST,
-            "bad_request",
-            "audio must not be empty".to_string(),
-        ));
-    }
-    if request.audio.len() > MAX_AUDIO_B64_LEN {
-        return Err(error_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "payload_too_large",
-            format!("audio exceeds {} base64 bytes", MAX_AUDIO_B64_LEN),
-        ));
-    }
-    if base64::engine::general_purpose::STANDARD
-        .decode(request.audio.as_bytes())
-        .is_err()
-    {
-        return Err(error_response(
-            StatusCode::BAD_REQUEST,
-            "bad_request",
-            "audio must be valid base64".to_string(),
-        ));
-    }
-    if !AUDIO_FORMATS.contains(&request.format.as_str()) {
-        return Err(error_response(
-            StatusCode::BAD_REQUEST,
-            "bad_request",
-            format!("format must be one of: {}", AUDIO_FORMATS.join(", ")),
-        ));
-    }
+    validate_stt_input(&request.audio, &request.format, MAX_AUDIO_B64_LEN).map_err(|error| {
+        match error {
+            SttInputError::Empty => error_response(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "audio must not be empty".to_string(),
+            ),
+            SttInputError::TooLarge => error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                format!("audio exceeds {} base64 bytes", MAX_AUDIO_B64_LEN),
+            ),
+            SttInputError::BadBase64 => error_response(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "audio must be valid base64".to_string(),
+            ),
+            SttInputError::BadFormat => error_response(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                format!("format must be one of: {}", AUDIO_FORMATS.join(", ")),
+            ),
+        }
+    })?;
     if request
         .language
         .as_deref()
@@ -1285,5 +1426,200 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, VoiceProxyError::InvalidResponse));
+    }
+
+    // ---- TUI design 4.2.2 and 8.3.7 ----
+
+    fn loopback_voice_api(addr: std::net::SocketAddr) -> VoiceApi {
+        let config = crate::config::TranscriptionConfig {
+            provider: "lunarvoice".to_string(),
+            voice_auth_token: Some(SecretString::from("secret")),
+            voice_service_url: Some(format!("http://{addr}")),
+            model: "whisper-tiny".to_string(),
+            ..Default::default()
+        };
+        VoiceApi::from_config(&config).expect("voice api for a loopback sidecar")
+    }
+
+    /// A sidecar whose transcribe route always answers `status` with `body`.
+    async fn stub_sidecar(status: StatusCode, body: serde_json::Value) -> std::net::SocketAddr {
+        use axum::routing::post;
+
+        let sidecar = axum::Router::new().route(
+            "/v1/voice/transcribe",
+            post(move || async move { (status, Json(body)) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, sidecar).await;
+        });
+        addr
+    }
+
+    #[test]
+    fn voice_status_reports_stt_tts_and_rate_limit() {
+        let status = serde_json::to_value(voice_status(None)).unwrap();
+        assert_eq!(status["configured"], false);
+        assert_eq!(status["stt"], false);
+        assert_eq!(status["tts"], false);
+        assert_eq!(status["provider"], serde_json::Value::Null);
+        assert_eq!(
+            status["rate_limit"],
+            serde_json::json!({"requests": 10, "window_secs": 60})
+        );
+        assert_eq!(status["max_audio_b64_len"], MAX_AUDIO_B64_LEN);
+        assert!(status.get("model").is_none());
+
+        let config = crate::config::TranscriptionConfig {
+            provider: "lunarvoice".to_string(),
+            voice_auth_token: Some(SecretString::from("secret")),
+            model: "parakeet".to_string(),
+            ..Default::default()
+        };
+        let api = VoiceApi::from_config(&config).expect("voice api");
+        let status = serde_json::to_value(voice_status(Some(&api))).unwrap();
+        assert_eq!(status["configured"], true);
+        assert_eq!(status["stt"], true);
+        assert_eq!(status["tts"], true);
+        assert_eq!(status["provider"], "lunarvoice");
+        assert_eq!(status["model"], "parakeet");
+        assert_eq!(status["rate_limit"]["requests"], 10);
+    }
+
+    #[test]
+    fn validate_stt_input_rejects_empty_oversize_bad_base64_bad_format() {
+        assert_eq!(validate_stt_input("AAAA", "wav", 8), Ok(()));
+        assert_eq!(validate_stt_input("AAAA", "flac", 4), Ok(()));
+        assert_eq!(validate_stt_input("", "wav", 8), Err(SttInputError::Empty));
+        assert_eq!(
+            validate_stt_input("AAAAAAAA", "wav", 4),
+            Err(SttInputError::TooLarge)
+        );
+        assert_eq!(
+            validate_stt_input("not base64!!", "wav", 64),
+            Err(SttInputError::BadBase64)
+        );
+        assert_eq!(
+            validate_stt_input("AAAA", "exe", 8),
+            Err(SttInputError::BadFormat)
+        );
+        // Formats are matched exactly in their lowercase wire form.
+        assert_eq!(
+            validate_stt_input("AAAA", "WAV", 8),
+            Err(SttInputError::BadFormat)
+        );
+        // The size bound is checked before decoding: oversize invalid base64 is TooLarge.
+        assert_eq!(
+            validate_stt_input(&"!".repeat(9), "wav", 8),
+            Err(SttInputError::TooLarge)
+        );
+    }
+
+    #[tokio::test]
+    async fn transcribe_b64_returns_text_language_and_model() {
+        let addr = stub_sidecar(
+            StatusCode::OK,
+            serde_json::json!({"text": "turn on the lights", "language": "en", "model": "parakeet"}),
+        )
+        .await;
+        let api = loopback_voice_api(addr);
+        assert_eq!(
+            api.transcribe_b64("AAAA", "wav").await,
+            Ok(SttTranscript {
+                text: "turn on the lights".to_string(),
+                language: "en".to_string(),
+                model: "parakeet".to_string(),
+            })
+        );
+
+        // Without a model in the response, the requested model is reported.
+        let addr = stub_sidecar(
+            StatusCode::OK,
+            serde_json::json!({"text": "hi", "language": "de"}),
+        )
+        .await;
+        let transcript = loopback_voice_api(addr)
+            .transcribe_b64("AAAA", "wav")
+            .await
+            .expect("transcript");
+        assert_eq!(transcript.model, "whisper-tiny");
+    }
+
+    #[tokio::test]
+    async fn transcribe_b64_maps_sidecar_failures() {
+        for (status, expected) in [
+            (StatusCode::TOO_MANY_REQUESTS, SttFailure::RateLimited),
+            (StatusCode::SERVICE_UNAVAILABLE, SttFailure::Busy),
+            (StatusCode::GATEWAY_TIMEOUT, SttFailure::Timeout),
+            (StatusCode::BAD_REQUEST, SttFailure::Rejected),
+            (StatusCode::UNPROCESSABLE_ENTITY, SttFailure::Rejected),
+            (StatusCode::UNAUTHORIZED, SttFailure::Unavailable),
+            (StatusCode::INTERNAL_SERVER_ERROR, SttFailure::Unavailable),
+        ] {
+            let addr = stub_sidecar(
+                status,
+                serde_json::json!({"error": "x", "detail": "sidecar detail"}),
+            )
+            .await;
+            assert_eq!(
+                loopback_voice_api(addr).transcribe_b64("AAAA", "wav").await,
+                Err(expected),
+                "sidecar {status}"
+            );
+        }
+
+        // A malformed success body is an invalid response.
+        let addr = stub_sidecar(StatusCode::OK, serde_json::json!({"unexpected": true})).await;
+        assert_eq!(
+            loopback_voice_api(addr).transcribe_b64("AAAA", "wav").await,
+            Err(SttFailure::Unavailable)
+        );
+
+        // Connection refused: bind, then drop the listener.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed = listener.local_addr().unwrap();
+        drop(listener);
+        assert_eq!(
+            loopback_voice_api(closed)
+                .transcribe_b64("AAAA", "wav")
+                .await,
+            Err(SttFailure::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn stt_failure_maps_proxy_timeout_to_timeout() {
+        use axum::routing::post;
+
+        let sidecar = axum::Router::new().route(
+            "/v1/voice/transcribe",
+            post(|| async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                (StatusCode::OK, Json(serde_json::json!({"text": "late"})))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, sidecar).await;
+        });
+        let client = VoiceProxyClient::with_timeout(
+            &format!("http://{addr}"),
+            SecretString::from("secret"),
+            "whisper-tiny",
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        let err = client
+            .transcribe(SidecarTranscribeRequest {
+                audio: "AAAA",
+                format: "wav",
+                language: "auto",
+                model: "whisper-tiny",
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(stt_failure(&err), SttFailure::Timeout);
     }
 }

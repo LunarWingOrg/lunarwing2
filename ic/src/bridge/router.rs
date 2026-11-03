@@ -30,7 +30,7 @@ use crate::bridge::effect_adapter::{
 use crate::bridge::llm_adapter::{DEFAULT_MAX_OUTPUT_TOKENS, LlmBridgeAdapter};
 use crate::bridge::store_adapter::{HybridStore, canonical_default_project};
 use crate::channels::web::sse::SseManager;
-use crate::channels::{IncomingMessage, OutgoingResponse, StatusUpdate};
+use crate::channels::{IncomingMessage, OutgoingResponse, StatusUpdate, TurnOutcome};
 use crate::db::Database;
 use crate::error::Error;
 use crate::extensions::naming::legacy_extension_alias;
@@ -39,6 +39,7 @@ use crate::history::roles::{
     ASSISTANT_ROLE, EngineRole, INTERRUPTED_ROLE, USER_ROLE, classify_engine_role,
     is_bookkeeping_role,
 };
+use crate::tools::builtin::image_gen::{GeneratedImage, is_image_tool_name};
 
 #[cfg(test)]
 use std::collections::HashMap;
@@ -359,10 +360,12 @@ async fn insert_and_notify_pending_gate(
     }
 
     // GateRequired is a structural engine-gate event with no `StatusUpdate`
-    // equivalent, so it stays on the direct SSE path.
+    // equivalent, so it stays on the direct SSE path, correlated to the message
+    // whose turn paused (TUI design 8.3.1).
     if let Some(ref sse) = state.sse {
-        sse.broadcast_for_user(
-            &message.user_id,
+        sse.broadcast_correlated(
+            Some(&message.user_id),
+            &message.metadata,
             AppEvent::GateRequired {
                 request_id: pending.request_id.to_string(),
                 gate_name: pending.gate_name.clone(),
@@ -380,44 +383,24 @@ async fn insert_and_notify_pending_gate(
     // it from ApprovalNeeded/AuthRequired). The bridge returns the empty
     // sentinel so the outer outbound handler does not also send a prompt as a
     // terminal message — that would double-prompt on WASM channels.
-    match &pending.resume_kind {
-        lunarwing_engine::ResumeKind::Approval { allow_always } => {
-            let _ = channels
-                .send_status(
-                    &message.channel,
-                    StatusUpdate::ApprovalNeeded {
-                        request_id: pending.request_id.to_string(),
-                        tool_name: pending.action_name.clone(),
-                        description: pending.description.clone(),
-                        parameters: display_parameters,
-                        allow_always: *allow_always,
-                    },
-                    &message.metadata,
-                )
-                .await;
-
-            Ok(Some(String::new()))
-        }
+    let prompt = match &pending.resume_kind {
+        lunarwing_engine::ResumeKind::Approval { allow_always } => StatusUpdate::ApprovalNeeded {
+            request_id: pending.request_id.to_string(),
+            tool_name: pending.action_name.clone(),
+            description: pending.description.clone(),
+            parameters: display_parameters,
+            allow_always: *allow_always,
+        },
         lunarwing_engine::ResumeKind::Authentication {
             credential_name,
             instructions,
             auth_url,
-        } => {
-            let _ = channels
-                .send_status(
-                    &message.channel,
-                    StatusUpdate::AuthRequired {
-                        extension_name: credential_name.clone(),
-                        instructions: Some(instructions.clone()),
-                        auth_url: auth_url.clone(),
-                        setup_url: None,
-                    },
-                    &message.metadata,
-                )
-                .await;
-
-            Ok(Some(String::new()))
-        }
+        } => StatusUpdate::AuthRequired {
+            extension_name: credential_name.clone(),
+            instructions: Some(instructions.clone()),
+            auth_url: auth_url.clone(),
+            setup_url: None,
+        },
         lunarwing_engine::ResumeKind::External { callback_id } => {
             tracing::debug!(
                 gate = %pending.gate_name,
@@ -426,19 +409,18 @@ async fn insert_and_notify_pending_gate(
             );
             // External gates emit no Approval/Auth status; send one best-effort
             // waiting indication so non-gateway users are not left without any.
-            let _ = channels
-                .send_status(
-                    &message.channel,
-                    StatusUpdate::ExternalWaiting {
-                        gate_name: pending.gate_name.clone(),
-                    },
-                    &message.metadata,
-                )
-                .await;
-
-            Ok(Some(String::new()))
+            StatusUpdate::ExternalWaiting {
+                gate_name: pending.gate_name.clone(),
+            }
         }
-    }
+    };
+    let _ = channels
+        .send_status(&message.channel, prompt, &message.metadata)
+        .await;
+    // The turn stopped at the gate; a continuation follows the decision, so the
+    // message finishes `paused` rather than `no_reply` (TUI design 8.2.3).
+    channels.note_turn_outcome(message.id, TurnOutcome::Paused);
+    Ok(Some(String::new()))
 }
 
 async fn persist_and_notify_thread_gate(
@@ -4172,14 +4154,46 @@ async fn deliver_thread_event(
     // channel (gateway included). The gateway status metadata carries the
     // engine thread id so SSE events route to the correct thread. Only
     // structural events with no status equivalent still go through the direct
-    // SSE `AppEvent` path below.
+    // SSE `AppEvent` path below, correlated to the message like its statuses
+    // (TUI design 8.3.1).
     let status_metadata = engine_status_metadata(message, thread_id);
-    forward_event_to_channel(event, channels, &message.channel, &status_metadata).await;
+    let generated = generated_image_for_event(state, event);
+    forward_event_to_channel(
+        event,
+        channels,
+        &message.channel,
+        &status_metadata,
+        generated,
+    )
+    .await;
     if let Some(sse) = state.sse.as_ref() {
         for app_event in thread_event_to_app_events(event, thread_id) {
-            sse.broadcast_for_user(&message.user_id, app_event);
+            sse.broadcast_correlated(Some(&message.user_id), &message.metadata, app_event);
         }
     }
+}
+
+/// The image an image tool's `ActionExecuted` event stands for, parked by the effect
+/// adapter (TUI design 8.3.6). Only image-tool calls with an id take one, so an image
+/// left behind under a reused call id can never replace another tool's result.
+fn generated_image_for_event(
+    state: &EngineState,
+    event: &lunarwing_engine::ThreadEvent,
+) -> Option<GeneratedImage> {
+    let lunarwing_engine::EventKind::ActionExecuted {
+        action_name,
+        call_id,
+        ..
+    } = &event.kind
+    else {
+        return None;
+    };
+    if call_id.is_empty() || !is_image_tool_name(action_name) {
+        return None;
+    }
+    state
+        .effect_adapter
+        .take_generated_image(event.thread_id, call_id)
 }
 
 fn drain_pending_thread_events(
@@ -4461,11 +4475,15 @@ async fn handle_mission_notification(
 }
 
 /// Forward an engine ThreadEvent to the channel as a StatusUpdate.
+///
+/// `generated` is the image an image-tool `ActionExecuted` event produced; it is sent
+/// as `ImageGenerated` instead of the event's preview.
 async fn forward_event_to_channel(
     event: &lunarwing_engine::ThreadEvent,
     channels: &std::sync::Arc<crate::channels::ChannelManager>,
     channel_name: &str,
     metadata: &serde_json::Value,
+    generated: Option<GeneratedImage>,
 ) {
     use lunarwing_engine::EventKind;
 
@@ -4503,17 +4521,10 @@ async fn forward_event_to_channel(
                     metadata,
                 )
                 .await;
-            if let Some(preview) = result_preview.as_deref().filter(|value| !value.is_empty()) {
-                let _ = channels
-                    .send_status(
-                        channel_name,
-                        StatusUpdate::ToolResult {
-                            name: display_name.clone(),
-                            preview: preview.to_string(),
-                        },
-                        metadata,
-                    )
-                    .await;
+            if let Some(result) =
+                action_result_status(&display_name, generated, result_preview.as_deref())
+            {
+                let _ = channels.send_status(channel_name, result, metadata).await;
             }
             let _ = channels
                 .send_status(
@@ -4635,6 +4646,28 @@ async fn forward_event_to_channel(
         }
         _ => {}
     }
+}
+
+/// What an executed action shows between `ToolStarted` and `ToolCompleted`: the image
+/// it generated, which replaces its preview as on Engine V1 (TUI design 8.3.6), else its
+/// non-empty result preview.
+fn action_result_status(
+    display_name: &str,
+    generated: Option<GeneratedImage>,
+    preview: Option<&str>,
+) -> Option<StatusUpdate> {
+    if let Some(image) = generated {
+        return Some(StatusUpdate::ImageGenerated {
+            data_url: image.data_url,
+            path: image.path,
+        });
+    }
+    preview
+        .filter(|preview| !preview.is_empty())
+        .map(|preview| StatusUpdate::ToolResult {
+            name: display_name.to_string(),
+            preview: preview.to_string(),
+        })
 }
 
 fn model_recovery_info(
@@ -9786,8 +9819,8 @@ pub(crate) mod tests {
 
         // Both gateway and non-gateway channels get exactly one StreamChunk
         // status; the gateway is no longer special-cased.
-        forward_event_to_channel(&evt, &manager, "gateway", &metadata).await;
-        forward_event_to_channel(&evt, &manager, "xmpp", &metadata).await;
+        forward_event_to_channel(&evt, &manager, "gateway", &metadata, None).await;
+        forward_event_to_channel(&evt, &manager, "xmpp", &metadata, None).await;
 
         for (name, statuses) in [("gateway", &gateway_statuses), ("xmpp", &xmpp_statuses)] {
             let captured = statuses.lock().expect("poisoned");
@@ -9827,8 +9860,8 @@ pub(crate) mod tests {
         );
         let metadata = serde_json::json!({});
 
-        forward_event_to_channel(&event, &manager, "gateway", &metadata).await;
-        forward_event_to_channel(&event, &manager, "xmpp", &metadata).await;
+        forward_event_to_channel(&event, &manager, "gateway", &metadata, None).await;
+        forward_event_to_channel(&event, &manager, "xmpp", &metadata, None).await;
 
         for (name, statuses) in [("gateway", &gateway_statuses), ("xmpp", &xmpp_statuses)] {
             let captured = statuses.lock().expect("poisoned");
@@ -9869,7 +9902,7 @@ pub(crate) mod tests {
             },
         );
 
-        forward_event_to_channel(&event, &manager, "gateway", &serde_json::json!({})).await;
+        forward_event_to_channel(&event, &manager, "gateway", &serde_json::json!({}), None).await;
 
         let captured = statuses.lock().expect("poisoned");
         assert_eq!(captured.len(), 3);
@@ -9879,6 +9912,484 @@ pub(crate) mod tests {
             captured[2],
             StatusUpdate::ToolCompleted { success: true, .. }
         ));
+    }
+
+    // ── TUI design 8.2.3, 8.3.1, 8.3.6: outcome hints, correlation, images ──
+
+    /// `(message id, event)` pairs a [`LifecycleProbe`] recorded.
+    pub(super) type LifecycleLog =
+        Arc<std::sync::Mutex<Vec<(uuid::Uuid, crate::channels::MessageLifecycle)>>>;
+
+    /// A channel that records the lifecycle events reported for its messages.
+    pub(super) struct LifecycleProbe {
+        name: String,
+        log: LifecycleLog,
+    }
+
+    impl LifecycleProbe {
+        pub(super) fn new(name: &str) -> (Self, LifecycleLog) {
+            let log = LifecycleLog::default();
+            let probe = Self {
+                name: name.to_string(),
+                log: Arc::clone(&log),
+            };
+            (probe, log)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::channels::Channel for LifecycleProbe {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn start(
+            &self,
+        ) -> Result<crate::channels::MessageStream, crate::error::ChannelError> {
+            Ok(Box::pin(futures::stream::empty::<IncomingMessage>()))
+        }
+
+        async fn respond(
+            &self,
+            _msg: &IncomingMessage,
+            _response: OutgoingResponse,
+        ) -> Result<(), crate::error::ChannelError> {
+            Ok(())
+        }
+
+        async fn health_check(&self) -> Result<(), crate::error::ChannelError> {
+            Ok(())
+        }
+
+        async fn message_lifecycle(
+            &self,
+            msg: &IncomingMessage,
+            event: crate::channels::MessageLifecycle,
+        ) {
+            self.log.lock().expect("poisoned").push((msg.id, event));
+        }
+    }
+
+    /// The outcome `channels` reports for `message` when the agent loop finishes it
+    /// with `computed`, after the hints the code under test recorded.
+    pub(super) async fn reported_finish(
+        channels: &crate::channels::ChannelManager,
+        log: &LifecycleLog,
+        message: &IncomingMessage,
+        computed: TurnOutcome,
+    ) -> Option<TurnOutcome> {
+        channels
+            .message_lifecycle(
+                message,
+                crate::channels::MessageLifecycle::Finished(computed),
+            )
+            .await;
+        let log = log.lock().expect("poisoned");
+        log.iter().rev().find_map(|(id, event)| match event {
+            crate::channels::MessageLifecycle::Finished(outcome) if *id == message.id => {
+                Some(*outcome)
+            }
+            _ => None,
+        })
+    }
+
+    /// A gateway message carrying the ids the chat handlers stamp (TUI design 8.3.1).
+    fn correlated_gateway_message(client_turn_id: &str) -> IncomingMessage {
+        let mut message =
+            IncomingMessage::new("gateway", "alice", "hello").with_thread("client-thread");
+        message.metadata = serde_json::json!({
+            "user_id": "alice",
+            "thread_id": "client-thread",
+            "message_id": message.id.to_string(),
+            "client_turn_id": client_turn_id,
+        });
+        message
+    }
+
+    async fn next_correlated<S>(events: &mut S) -> crate::channels::web::sse::CorrelatedEvent
+    where
+        S: futures::Stream<Item = crate::channels::web::sse::CorrelatedEvent> + Unpin,
+    {
+        use futures::StreamExt;
+        tokio::time::timeout(std::time::Duration::from_secs(1), events.next())
+            .await
+            .expect("an SSE event should be broadcast")
+            .expect("the SSE stream should stay open")
+    }
+
+    #[tokio::test]
+    async fn gate_pause_reports_paused_hint() {
+        let resume_kinds = [
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+            lunarwing_engine::ResumeKind::Authentication {
+                credential_name: "gitlab".into(),
+                instructions: "Paste a GitLab token".into(),
+                auth_url: None,
+            },
+            lunarwing_engine::ResumeKind::External {
+                callback_id: "callback-1".into(),
+            },
+        ];
+        for resume_kind in resume_kinds {
+            let kind = resume_kind.kind_name();
+            let manager = Arc::new(crate::channels::ChannelManager::new());
+            let (probe, log) = LifecycleProbe::new("xmpp");
+            manager.add(Box::new(probe)).await;
+            let state = make_expected_test_state(Arc::new(TestStore::new()));
+            let message = IncomingMessage::new("xmpp", "alice", "run a tool");
+            let gate = sample_pending_gate("alice", lunarwing_engine::ThreadId::new(), resume_kind);
+
+            let result = insert_and_notify_pending_gate(&manager, &state, &message, gate)
+                .await
+                .expect("the gate should be announced");
+
+            assert_eq!(result, Some(String::new()), "{kind}");
+            // The loop reads the empty sentinel as `no_reply`; the hint reports the
+            // pause, once.
+            assert_eq!(
+                reported_finish(&manager, &log, &message, TurnOutcome::NoReply).await,
+                Some(TurnOutcome::Paused),
+                "{kind}"
+            );
+            assert_eq!(
+                reported_finish(&manager, &log, &message, TurnOutcome::NoReply).await,
+                Some(TurnOutcome::NoReply),
+                "{kind}"
+            );
+        }
+
+        // A gate that cannot be stored fails the turn and records no pause.
+        let manager = Arc::new(crate::channels::ChannelManager::new());
+        let (probe, log) = LifecycleProbe::new("xmpp");
+        manager.add(Box::new(probe)).await;
+        let state = make_expected_test_state(Arc::new(TestStore::new()));
+        let thread_id = lunarwing_engine::ThreadId::new();
+        let approval = lunarwing_engine::ResumeKind::Approval {
+            allow_always: false,
+        };
+        state
+            .pending_gates
+            .insert(sample_pending_gate("alice", thread_id, approval.clone()))
+            .await
+            .expect("first gate");
+        let message = IncomingMessage::new("xmpp", "alice", "run another tool");
+        let duplicate = sample_pending_gate("alice", thread_id, approval);
+        assert!(
+            insert_and_notify_pending_gate(&manager, &state, &message, duplicate)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            reported_finish(&manager, &log, &message, TurnOutcome::NoReply).await,
+            Some(TurnOutcome::NoReply)
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_required_carries_the_paused_message_correlation() {
+        let manager = Arc::new(crate::channels::ChannelManager::new());
+        let mut state = make_expected_test_state(Arc::new(TestStore::new()));
+        let sse = Arc::new(SseManager::new());
+        let mut events = sse
+            .subscribe_raw_correlated(Some("alice".into()))
+            .expect("SSE subscription");
+        state.sse = Some(sse);
+        let message = correlated_gateway_message("c-0007");
+        let gate = sample_pending_gate(
+            "alice",
+            lunarwing_engine::ThreadId::new(),
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        let request_id = gate.request_id.to_string();
+
+        insert_and_notify_pending_gate(&manager, &state, &message, gate)
+            .await
+            .expect("the gate should be announced");
+
+        let item = next_correlated(&mut events).await;
+        assert!(matches!(
+            &item.event,
+            crate::channels::web::types::SseEvent::GateRequired { request_id: id, .. }
+                if *id == request_id
+        ));
+        let correlation = item.correlation.expect("GateRequired is correlated");
+        assert_eq!(correlation.message_id, message.id.to_string());
+        assert_eq!(correlation.client_turn_id.as_deref(), Some("c-0007"));
+    }
+
+    #[tokio::test]
+    async fn deliver_thread_event_correlates_state_changes() {
+        use lunarwing_engine::EventKind;
+
+        let manager = Arc::new(crate::channels::ChannelManager::new());
+        let mut state = make_expected_test_state(Arc::new(TestStore::new()));
+        let sse = Arc::new(SseManager::new());
+        let mut events = sse
+            .subscribe_raw_correlated(Some("alice".into()))
+            .expect("SSE subscription");
+        state.sse = Some(sse);
+        let message = correlated_gateway_message("c-0001");
+        let expected = crate::channels::web::sse::Correlation::from_metadata(&message.metadata);
+        assert!(expected.is_some());
+        let thread_id = lunarwing_engine::ThreadId::new();
+        let state_change = || EventKind::StateChanged {
+            from: lunarwing_engine::ThreadState::Created,
+            to: lunarwing_engine::ThreadState::Running,
+            reason: None,
+        };
+        let structural = [
+            state_change(),
+            EventKind::ChildSpawned {
+                child_id: lunarwing_engine::ThreadId::new(),
+                goal: "summarize the log".into(),
+            },
+            EventKind::ModelRecovery {
+                failure_kind: lunarwing_engine::ModelFailureKind::ReplArgumentCorruption,
+                recovery_state: lunarwing_engine::types::event::ModelRecoveryState::Retrying,
+                attempt: 1,
+            },
+        ];
+        for kind in structural {
+            let event = lunarwing_engine::ThreadEvent::new(thread_id, kind);
+            deliver_thread_event(&manager, &state, &message, &thread_id.to_string(), &event).await;
+        }
+
+        for name in [
+            "thread_state_changed",
+            "child_thread_spawned",
+            "turn_recovery",
+        ] {
+            let item = next_correlated(&mut events).await;
+            assert_eq!(item.event.event_name(), name);
+            assert_eq!(item.correlation, expected, "{name}");
+        }
+
+        // A turn without the gateway ids (an XMPP message) stays uncorrelated.
+        let xmpp = IncomingMessage::new("xmpp", "alice", "hello")
+            .with_metadata(serde_json::json!({"xmpp_room": "room@example.org"}));
+        let event = lunarwing_engine::ThreadEvent::new(thread_id, state_change());
+        deliver_thread_event(&manager, &state, &xmpp, &thread_id.to_string(), &event).await;
+        let item = next_correlated(&mut events).await;
+        assert_eq!(item.event.event_name(), "thread_state_changed");
+        assert_eq!(item.correlation, None);
+    }
+
+    /// A 1x1 PNG, as the image tools return it.
+    const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    /// Returns the image tools' sentinel without calling an image API.
+    struct SentinelImageTool;
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for SentinelImageTool {
+        fn name(&self) -> &str {
+            "image_generate"
+        }
+
+        fn description(&self) -> &str {
+            "Return the image sentinel"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {"prompt": {"type": "string"}}})
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &crate::context::JobContext,
+        ) -> Result<crate::tools::ToolOutput, crate::tools::ToolError> {
+            Ok(crate::tools::builtin::image_gen::image_sentinel_output(
+                TINY_PNG_B64,
+                "a cat",
+                "1024x1024",
+                std::time::Duration::from_millis(1),
+            ))
+        }
+    }
+
+    /// Runs the image tool through the effect adapter in a `channel` thread and
+    /// returns the `ActionExecuted` event the engine emits for it.
+    async fn run_image_action(
+        state: &EngineState,
+        thread_id: lunarwing_engine::ThreadId,
+        call_id: &str,
+        channel: &str,
+    ) -> lunarwing_engine::ThreadEvent {
+        use lunarwing_engine::EffectExecutor;
+
+        let context = lunarwing_engine::ThreadExecutionContext {
+            thread_id,
+            thread_type: lunarwing_engine::ThreadType::Foreground,
+            project_id: lunarwing_engine::ProjectId::new(),
+            user_id: "alice".into(),
+            step_id: lunarwing_engine::StepId::new(),
+            current_call_id: Some(call_id.to_string()),
+            source_channel: Some(channel.to_string()),
+            supervised_mode: false,
+            shared_conversation: false,
+            supervised_timeout_secs: 300,
+            prompt_context: Arc::from([]),
+        };
+        let lease = lunarwing_engine::CapabilityLease {
+            id: lunarwing_engine::types::capability::LeaseId::new(),
+            thread_id,
+            capability_name: "tools".into(),
+            granted_actions: lunarwing_engine::GrantedActions::All,
+            granted_at: chrono::Utc::now(),
+            expires_at: None,
+            max_uses: None,
+            uses_remaining: None,
+            revoked: false,
+            revoked_reason: None,
+        };
+        let result = state
+            .effect_adapter
+            .execute_action(
+                "image_generate",
+                serde_json::json!({"prompt": "a cat"}),
+                &lease,
+                &context,
+            )
+            .await
+            .expect("the image action should run");
+        lunarwing_engine::ThreadEvent::new(
+            thread_id,
+            lunarwing_engine::EventKind::ActionExecuted {
+                step_id: context.step_id,
+                action_name: "image_generate".into(),
+                call_id: call_id.into(),
+                duration_ms: 7,
+                params_summary: Some("a cat".into()),
+                result_preview: lunarwing_engine::types::event::preview_from_output(&result.output),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn image_action_reaches_channels_as_image_generated_without_preview() {
+        use crate::testing::StubChannel;
+
+        let manager = Arc::new(crate::channels::ChannelManager::new());
+        let mut captures = Vec::new();
+        for name in ["gateway", "xmpp"] {
+            let (stub, _tx) = StubChannel::new(name);
+            captures.push((name, stub.captured_statuses_handle()));
+            manager.add(Box::new(stub)).await;
+        }
+        let state = make_expected_test_state(Arc::new(TestStore::new()));
+        state
+            .effect_adapter
+            .tools()
+            .register(Arc::new(SentinelImageTool))
+            .await;
+        let data_url = format!("data:image/png;base64,{TINY_PNG_B64}");
+
+        for (channel, statuses) in &captures {
+            let thread_id = lunarwing_engine::ThreadId::new();
+            let event = run_image_action(&state, thread_id, "image-call", channel).await;
+            // The engine's own event still carries the (truncated) preview.
+            assert!(matches!(
+                &event.kind,
+                lunarwing_engine::EventKind::ActionExecuted { result_preview: Some(preview), .. }
+                    if !preview.is_empty()
+            ));
+            let message = IncomingMessage::new(*channel, "alice", "draw a cat");
+
+            deliver_thread_event(&manager, &state, &message, &thread_id.to_string(), &event).await;
+
+            let captured = std::mem::take(&mut *statuses.lock().expect("poisoned"));
+            let started = captured
+                .iter()
+                .position(|status| matches!(status, StatusUpdate::ToolStarted { .. }));
+            let image = captured.iter().position(|status| {
+                matches!(status, StatusUpdate::ImageGenerated { data_url: url, path: None }
+                    if *url == data_url)
+            });
+            let completed = captured.iter().position(|status| {
+                matches!(status, StatusUpdate::ToolCompleted { success: true, .. })
+            });
+            let (Some(started), Some(image), Some(completed)) = (started, image, completed) else {
+                panic!("{channel}: tool start, image and completion expected, got {captured:?}");
+            };
+            assert!(
+                started < image && image < completed,
+                "{channel}: {captured:?}"
+            );
+            assert!(
+                !captured
+                    .iter()
+                    .any(|status| matches!(status, StatusUpdate::ToolResult { .. })),
+                "{channel}: the preview must not be sent with the image"
+            );
+
+            // The image is delivered once; the same event again shows the preview.
+            deliver_thread_event(&manager, &state, &message, &thread_id.to_string(), &event).await;
+            let repeated = std::mem::take(&mut *statuses.lock().expect("poisoned"));
+            assert!(
+                repeated
+                    .iter()
+                    .any(|status| matches!(status, StatusUpdate::ToolResult { .. })),
+                "{channel}: {repeated:?}"
+            );
+            assert!(
+                !repeated
+                    .iter()
+                    .any(|status| matches!(status, StatusUpdate::ImageGenerated { .. })),
+                "{channel}: {repeated:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn parked_image_never_replaces_another_tools_result() {
+        use crate::testing::StubChannel;
+
+        let manager = Arc::new(crate::channels::ChannelManager::new());
+        let (stub, _tx) = StubChannel::new("gateway");
+        let statuses = stub.captured_statuses_handle();
+        manager.add(Box::new(stub)).await;
+        let state = make_expected_test_state(Arc::new(TestStore::new()));
+        state
+            .effect_adapter
+            .tools()
+            .register(Arc::new(SentinelImageTool))
+            .await;
+        let thread_id = lunarwing_engine::ThreadId::new();
+        run_image_action(&state, thread_id, "reused-id", "gateway").await;
+
+        // A model that reuses call ids: a later shell call with the same id keeps its
+        // own result, and the parked image stays for its own event.
+        let shell = lunarwing_engine::ThreadEvent::new(
+            thread_id,
+            lunarwing_engine::EventKind::ActionExecuted {
+                step_id: lunarwing_engine::StepId::new(),
+                action_name: "shell".into(),
+                call_id: "reused-id".into(),
+                duration_ms: 3,
+                params_summary: Some("ls".into()),
+                result_preview: Some("file.txt".into()),
+            },
+        );
+        let message = IncomingMessage::new("gateway", "alice", "list files");
+        deliver_thread_event(&manager, &state, &message, &thread_id.to_string(), &shell).await;
+
+        let captured = statuses.lock().expect("poisoned").clone();
+        assert!(captured.iter().any(|status| matches!(
+            status,
+            StatusUpdate::ToolResult { preview, .. } if preview == "file.txt"
+        )));
+        assert!(
+            !captured
+                .iter()
+                .any(|status| matches!(status, StatusUpdate::ImageGenerated { .. }))
+        );
+        assert!(
+            state
+                .effect_adapter
+                .take_generated_image(thread_id, "reused-id")
+                .is_some()
+        );
     }
 
     #[test]
