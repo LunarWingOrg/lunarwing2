@@ -547,7 +547,9 @@ installs `/usr/local/libexec/lunarwing-openrc-env-exec`; after dropping to the
 tenant, that root-owned launcher validates and literally parses `KEY=value`
 files. It fails closed unless the env directory is tenant-owned mode `0700` and
 the env file is a non-symlink, single-link, tenant-owned regular file mode
-`0600`.
+`0600`. Before executing the service it also closes inherited descriptors for
+lifecycle, DarkIRC writer, and per-tenant upgrade locks (WI#505/WI#526), so a
+service cannot keep those flocks alive after mt-admin exits.
 
 Existing OpenRC fleets must first complete the [proxy migration below](#proxy-url-boundary-wi376).
 After that, tenants adopt other unit changes with `render-units <name>` followed
