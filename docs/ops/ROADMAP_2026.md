@@ -3,15 +3,13 @@
 ## Official LunarWing2 Roadmap:
 | Feature | Target |
 |---------|--------|
-| New still not named interactive TUI application for LunarWing | v2.1.9.0 |
-| Both Alpha Releases for Desktop/Mobile companion applications for LunarWing | v2.1.9.0 |
 | Further Podman Sandbox refinements, improvements, and proper tunnel networking support | v2.2.0.0 |
-| Part two of Mission Improvements with enhanced metric evaluations and external worker adjacent looping | v2.2.0.0 |
 | Introduction of new external worker, LunarDepth | v2.2.0.0 |
 | Beta for Desktop/Mobile companion applications for LunarWing (first alpha versions of both should all be available by 2.1.9.0) | v2.2.2.0 |
 | Lightweight external workers and external worker loops with timers | v2.2.2.0 |
 | LunarVision Polish | v2.2.3.0 |
 | Part 2 of planned overhaul of some LLM engine functionality | v2.2.4.0 |
+| Part two of Mission Improvements with enhanced metric evaluations and external worker adjacent looping | v2.2.4.0 |
 | LunarVoice Two Way Voice Communication Full Completion and dedicated multi-agent server support | v2.2.4.0 |
 | Lunartica improvements/polish | v2.2.5.0 |
 | Agent Team Coordination improvements | v2.2.5.0 |
