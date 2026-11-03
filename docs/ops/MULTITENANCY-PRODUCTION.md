@@ -192,6 +192,32 @@ ssh -L 10000:127.0.0.1:10000 -L 10010:127.0.0.1:10010 \
 
 Then access `http://localhost:10000`, `http://localhost:10010`, etc.
 
+#### Terminal UI access (`tui-access`)
+
+The multimodal TUI runs as a desktop user (for example `sun`), who cannot read tenant env files, sockets or tokens. Grant access per user and tenant instead of handing out `tokens` output:
+
+```bash
+# Today's tenant daemons predate client tokens: copy the master token (warned)
+sudo ic/scripts/lunarwing-mt-admin.sh tui-access ruffles --for-user sun --use-master-token
+
+# Tenants on a binary with client-token support: dedicated, revocable client token
+sudo ic/scripts/lunarwing-mt-admin.sh tui-access ruffles --for-user sun --expires-in-days 90
+
+# Labels and dates of the registered client tokens; revoke one user
+sudo ic/scripts/lunarwing-mt-admin.sh tui-access ruffles --list
+sudo ic/scripts/lunarwing-mt-admin.sh tui-access ruffles --for-user sun --revoke
+```
+
+- **Files.** Desktop side: `~sun/.config/lunarwing-tui/tenants/ruffles.json` (0600, owned by `sun`, 0700 directories) with the URL, `tenant_uid` and the token. Tenant side, client-token mode only: `/home/ruffles/lunarwing/state/gateway-client-tokens.json` (0600, owned by the tenant) with the label `tui:sun`, the token's SHA-256 and timestamps, never the token. The command prints neither tokens nor digests.
+- **Init-agnostic.** `tui-access` never starts, stops or probes a unit. Client-token grants and revocations take effect through the daemon's 2 s reload of the token file (daemons with client-token support), identically under systemd user units and OpenRC. Its only network action is an HTTP probe of the registry `gateway` port.
+- **Revocation.** `--revoke` removes the tenant-side entry first (a daemon with client-token support stops accepting the token within about 2 s and ends that credential's open event streams), then the desktop file. Neither side blocks the other: a desktop home that is missing, owned by another uid (for example after `chown -R root: ~sun` during an incident) or path-unsafe still lets the tenant-side entry go, and the report names the desktop file to delete by hand; a registry that cannot be rewritten still lets the desktop file go, and the command then exits 1. A master-token grant cannot be revoked this way: the master token stays valid until `GATEWAY_AUTH_TOKEN` is rotated by hand in the tenant env followed by `restart-tenant`, which also affects the web login, workers and the DarkIRC and Brave key uploads. Emergency cut-off for one user: `--revoke`; for everything: `stop-tenant <tenant>`.
+- **Registry reads.** The tenant-written registry is read as the tenant, and only if the daemon would load it too: a regular file with one link, owned by the tenant, without group or other access, at most 64 KiB. Anything else (a symlink, FIFO, device, hard link, looser mode or larger file) is refused without blocking and left unchanged.
+- **Rotation.** Re-run the grant. It replaces the digest for the same label atomically and rewrites the desktop file; a running TUI reconnects with the new token.
+- **Expiry.** `--expires-in-days <n>` (1 to 3650) writes `expires_at` on both sides. There is no default expiry; 90 days is recommended on laptops.
+- **Master-token fallback.** Until a tenant runs a binary with client-token support, a default grant writes the files and then exits 2 because the daemon rejects the token. Either `upgrade-tenant <tenant>` (the registered token then works without a new grant) or re-grant with `--use-master-token`, which works with today's daemons but hands the desktop user full gateway access. The master-token re-grant also removes the `tui:<user>` digest the rejected grant registered, so that client token cannot come back to life after a later `upgrade-tenant`.
+- **The 0.0.0.0 note.** Tenants whose `GATEWAY_HOST` is `0.0.0.0` (set with `add-tenant --gateway-host 0.0.0.0` or carried forward from an older env) are reachable from the LAN and NetBird with the bearer token as the only barrier. `tui-access` still writes `http://127.0.0.1:<port>` for them, so the TUI's token never leaves the host, and it sends a token-bearing probe only after `/proc/net/tcp` and `tcp6` show the tenant uid alone holding the port with a listener that covers the probed address (that address, its wildcard or its v4-mapped form), because another local uid can bind it while the daemon restarts, or bind an address the tenant does not hold. Rebinding tenants that do not need LAN access to `127.0.0.1` is recommended as a separate change.
+- Keep `~/.config/lunarwing-tui/tenants/` out of dotfile sync and backups.
+
 ### Step 7: Manage
 
 ```bash
@@ -466,6 +492,7 @@ every DarkIRC-enabled tenant a stable, unique, non-secret `darkirc_scope_id`.
     pebble.env                   # Pebble worker env (optional, mode 0600)
     nanocode.env.retired*        # Archived legacy Nanocode env, when present
   state/                         # LUNARWING_BASE_DIR
+    gateway-client-tokens.json   # tui-access client-token digests, no tokens (optional, mode 0600)
     channels/                    # WASM channel artifacts
     tools/                       # WASM tool artifacts
     xmpp/                        # XMPP/OMEMO state

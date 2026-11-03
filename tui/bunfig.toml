@@ -1,0 +1,11 @@
+# LunarWing TUI (design 3.1, 11.3.1).
+
+[install]
+# `bun add` writes exact versions; the pins in package.json are never ranges (3.1).
+exact = true
+# Flat node_modules on every Bun version (host 1.3.14, CI oven/bun:1.4.4).
+linker = "hoisted"
+
+[test]
+# Fails the run on unhandled rejections and uncaught errors, cleans temp dirs, guards host binaries.
+preload = ["./test/setup.ts"]

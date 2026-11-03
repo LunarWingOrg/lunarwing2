@@ -253,6 +253,8 @@ source "$MT_ADMIN_LIB_DIR/13-cgroups-openrc.sh"
 source "$MT_ADMIN_LIB_DIR/14-knowledge-sync.sh"
 # shellcheck source=mt-admin-lib/15-worker-egress.sh
 source "$MT_ADMIN_LIB_DIR/15-worker-egress.sh"
+# shellcheck source=mt-admin-lib/16-tui-access.sh
+source "$MT_ADMIN_LIB_DIR/16-tui-access.sh"
 
 usage() {
   cat <<'EOF'
@@ -616,7 +618,24 @@ Commands:
                                    endpoints); applies immediately
   worker-smoke <name> [opencode2]  WI#424 control 6: run the runtime exposure
                                    smoke suite inside a running worker container
-  tokens [name]                    Print gateway auth tokens (all or one)
+  tokens [name]                    Print gateway auth tokens (all or one) for
+                                   the web login; the TUI uses tui-access
+  tui-access <name> --for-user <user> [--url-host <host>]
+             [--expires-in-days <n>] [--use-master-token] [--no-verify]
+                                   Give a desktop user TUI access to the tenant
+                                   gateway: writes ~<user>/.config/lunarwing-tui/
+                                   tenants/<name>.json (0600, owned by <user>)
+                                   with a new client token whose SHA-256 is
+                                   registered in the tenant's state dir (needs
+                                   a daemon with client-token support).
+                                   --use-master-token copies GATEWAY_AUTH_TOKEN
+                                   instead (today's daemons; full API access).
+                                   Prints no token. Exit 2: files written but
+                                   the running daemon rejected the token
+  tui-access <name> --for-user <user> --revoke
+                                   Remove the user's client token tenant-side
+                                   (effective within ~2 s) and the desktop file
+  tui-access <name> --list         List registered client-token labels and dates
   doctor                           System dependency and health checks
   coord-doctor <name>              Read-only coordination knowledge-share
                                    (KNOW:) validation: room join/receive
@@ -1524,6 +1543,12 @@ main() {
 
     tokens)
       show_tokens "${1:-}"
+      ;;
+
+    tui-access)
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: tui-access <name> --for-user <user> [--revoke] | --list"
+      tui_access_command "$@"
       ;;
 
     configure-gotify)

@@ -24,6 +24,7 @@ Each tenant's configuration lives under their home directory:
 │   ├── tools/              # Installed WASM tools
 │   ├── channels/           # Installed WASM channels
 │   ├── darkirc/            # DarkIRC state when enabled
+│   ├── gateway-client-tokens.json # tui-access client-token digests (optional, 0600)
 │   └── xmpp/               # OMEMO key store
 ├── logs/                   # OpenRC service log output
 ├── run/                    # Runtime sockets and PID files
@@ -285,6 +286,19 @@ The auth token is generated during tenant creation. To retrieve it:
 ```bash
 grep GATEWAY_AUTH_TOKEN /home/<tenant>/lunarwing/env/lunarwing.env
 ```
+
+That lookup serves the web login. To give a desktop user's terminal UI (`tui/`) access, do not copy the token by hand: run `tui-access` as root. It writes the token into `~<user>/.config/lunarwing-tui/tenants/<tenant>.json` (0600, owned by that user) and never prints it.
+
+```bash
+# Grant. Today's daemons predate client tokens, so copy the master token:
+sudo ic/scripts/lunarwing-mt-admin.sh tui-access <tenant> --for-user <user> --use-master-token
+# Grant on a daemon with client-token support (dedicated, revocable token):
+sudo ic/scripts/lunarwing-mt-admin.sh tui-access <tenant> --for-user <user> --expires-in-days 90
+# Revoke:
+sudo ic/scripts/lunarwing-mt-admin.sh tui-access <tenant> --for-user <user> --revoke
+```
+
+A client-token grant registers only the token's SHA-256 in `state/gateway-client-tokens.json`, which daemons with client-token support reload every 2 s, so neither the grant nor the revocation needs a restart. A master-token grant removes any earlier client-token entry of the same user from that file, and stays valid until `GATEWAY_AUTH_TOKEN` is changed in `lunarwing.env` and the tenant is restarted with `lunarwing-mt-admin.sh restart-tenant <tenant>`. That rotation is disruptive: the web login, every master-token TUI file, the worker token fallback and the DarkIRC and Brave key uploads all use the old value. Flags, exit codes and file details: [MT-ADMIN-QUICKSTART](../guides/MT-ADMIN-QUICKSTART.md#tui-access-for-a-desktop-user).
 
 ## Engine V2 Channel Rollout
 

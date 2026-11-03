@@ -207,6 +207,31 @@ sudo ic/scripts/lunarwing-mt-admin.sh tokens ruffles
 
 Do not capture that output in shared logs. The gateway binds to the tenant's registry `gateway` port on loopback by default. Use an SSH tunnel or an approved tunnel provider for remote access.
 
+### TUI access for a desktop user
+
+The terminal UI (`tui/`) runs as a desktop user, who owns the microphone, clipboard and Hex session but cannot read tenant env files, sockets or tokens. Give that user access to one tenant gateway with `tui-access`; `tokens` stays the web-login path.
+
+```bash
+# Today's tenant daemons predate client tokens: copy the master token (prints a warning)
+sudo ic/scripts/lunarwing-mt-admin.sh tui-access ruffles --for-user sun --use-master-token
+# Tenants on a binary with client-token support: a dedicated, revocable client token
+sudo ic/scripts/lunarwing-mt-admin.sh tui-access ruffles --for-user sun --expires-in-days 90
+# Registered client-token labels and dates (never tokens or digests)
+sudo ic/scripts/lunarwing-mt-admin.sh tui-access ruffles --list
+# Remove one user's access
+sudo ic/scripts/lunarwing-mt-admin.sh tui-access ruffles --for-user sun --revoke
+```
+
+- **Desktop file.** A grant writes `~sun/.config/lunarwing-tui/tenants/ruffles.json` (0600, owned by `sun`, in 0700 directories) with the gateway URL, `tenant_uid` and the token. Root writes it as `sun` and refuses a symlinked path component or destination. Nothing prints a token or a digest.
+- **Who.** `--for-user` is required (no `$SUDO_USER` default); root, accounts below `UID_MIN` and tenant accounts are refused.
+- **Client tokens (default).** The grant mints a token and registers only its SHA-256 under the label `tui:<user>` in `/home/<tenant>/lunarwing/state/gateway-client-tokens.json` (0600, owned by the tenant). Daemons with client-token support reload that file every 2 s, so grants and revocations need no restart on systemd or OpenRC. Client-token mode is refused when the tenant env sets `GATEWAY_CLIENT_TOKENS_FILE` to `none` or to another file, or when `LUNARWING_BASE_DIR` is not the tenant state directory. The registry is read as the tenant and only if the daemon would load it too: a regular file with one link, owned by the tenant, without group or other access, at most 64 KiB; a symlink, FIFO, hard link, looser mode or larger file is refused and left unchanged, and a grant never writes a registry over 64 KiB.
+- **Master token.** `--use-master-token` copies `GATEWAY_AUTH_TOKEN` and records `token_kind: "master"`. It works with today's daemons but carries full gateway API access and stays valid until the master token is rotated by hand. `--expires-in-days` is refused with it. It also removes an earlier `tui:<user>` client-token entry from the registry (reported as `removed:`), so a superseded client token cannot come back to life after `upgrade-tenant`; a registry that cannot be rewritten only produces a warning, because the master token does not use it.
+- **URL.** A tenant bound to `0.0.0.0`, `::` or `localhost` gets `http://127.0.0.1:<gateway port>`; `::1` becomes `[::1]`; a specific address is kept (with a clear-text warning). `--url-host` overrides.
+- **Verification.** `GET /api/health` without the token, then up to four `GET /api/gateway/status` probes 2 s apart with the token in a `curl -K` config (never argv). The token goes only to a loopback URL (`127.x.y.z` as a plain dotted quad, or `[::1]`) and only while `/proc/net/tcp` and `tcp6` show the gateway port held by the tenant uid alone, with one of its listeners on the URL's address, its wildcard (`0.0.0.0`, `::`) or its v4-mapped form. A tenant listening on `127.0.0.5` does not cover `--url-host 127.0.0.1`, nor an IPv4 socket `[::1]`. `--no-verify` skips the probes.
+- **Exit status.** 0: done, also when the gateway is down or the owner check fails (warned, token not sent, files kept). 1: refused, or a `--revoke` whose tenant-side step failed. 2: files written, but the running daemon rejected the token after 4 probes; its binary predates client tokens, so run `upgrade-tenant <tenant>` (the registered token then works without a new grant) or re-grant with `--use-master-token`.
+- **Rotation and revocation.** Re-running the grant rotates: the digest for the same label is replaced atomically and the desktop file is rewritten. `--revoke` removes the tenant-side entry first, then the desktop file; for a master-token file it warns that the master token stays valid until rotated. Neither side blocks the other: when the desktop home is missing, owned by another uid or path-unsafe, the tenant-side entry is still removed and the report says to delete `~<user>/.config/lunarwing-tui/tenants/<tenant>.json` by hand; when the registry is refused, the desktop file is still removed and the command exits 1. A second `--revoke` is a no-op.
+- **Hygiene.** Keep `~/.config/lunarwing-tui/tenants/` out of dotfile sync and backups; 90-day expiry is recommended on laptops.
+
 ## 7. WeeChat Relay
 
 Fresh tenants bootstrap WeeChat's version-4 `api` relay automatically when dependencies are present. The bootstrap:
@@ -317,6 +342,7 @@ sudo ic/scripts/lunarwing-mt-admin.sh remove-tenant ruffles --purge
 - [ ] MT admin `status <tenant>` reports the tenant service graph healthy.
 - [ ] Protected environment and secret files retain restrictive ownership/modes.
 - [ ] Gateway and webhook authentication are enabled.
+- [ ] Desktop TUI access is granted with `tui-access`, never by copying `tokens` output.
 - [ ] systemd-user or OpenRC service graph matches the host.
 - [ ] PostgreSQL backup and restore were rehearsed.
 - [ ] Worker, channel, tunnel, and OCR ports come from the registry.
