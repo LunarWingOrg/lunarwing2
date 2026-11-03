@@ -581,6 +581,10 @@ impl Error {
     /// join/stop/lookup details stay in logs; actionable errors keep their text.
     pub fn user_facing_message(&self) -> String {
         match self {
+            Self::Engine { context, .. } if context == "thread still stopping" => {
+                "The previous turn is still stopping. Please send your message again in a moment."
+                    .to_string()
+            }
             Self::Engine { context, .. }
                 if matches!(
                     context.as_str(),
@@ -861,5 +865,21 @@ mod tests {
             reason: "Approval request is stale or already resolved".into(),
         };
         assert_eq!(error.user_facing_message(), format!("Error: {error}"));
+    }
+
+    #[test]
+    fn thread_stopping_errors_hide_the_internal_reason() {
+        let error = Error::Engine {
+            context: "thread still stopping".into(),
+            reason: "thread already running: 3bfdad4f-78df-52c2-9fe1-4a1c42466559".into(),
+        };
+        let message = error.user_facing_message();
+        assert!(
+            message.contains("previous turn is still stopping"),
+            "{message}"
+        );
+        assert!(message.contains("again in a moment"), "{message}");
+        assert!(!message.contains("3bfdad4f"), "{message}");
+        assert!(!message.contains("thread already running"), "{message}");
     }
 }
