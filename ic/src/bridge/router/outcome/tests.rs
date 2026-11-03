@@ -11,7 +11,10 @@ use super::*;
 use crate::bridge::router::{
     PendingGateResolution, engine_conversation_key, matching_engine_approval_gate,
     matching_engine_auth_gate,
-    tests::{TestStore, make_expected_test_state, sample_pending_gate, save_waiting_thread},
+    tests::{
+        LifecycleLog, LifecycleProbe, TestStore, make_expected_test_state, reported_finish,
+        sample_pending_gate, save_waiting_thread,
+    },
 };
 use crate::channels::OutgoingResponse;
 use crate::hooks::{
@@ -743,6 +746,195 @@ async fn late_gateway_response_uses_real_channel_once_with_original_thread() {
     );
 }
 
+// Keep the helper's test-only boundary explicit for per-file CI source checks.
+#[cfg(test)]
+impl Rig {
+    /// Replaces the channels with a lifecycle probe named like the message's channel.
+    async fn probe_lifecycle(&mut self) -> LifecycleLog {
+        let channels = Arc::new(crate::channels::ChannelManager::new());
+        let (probe, log) = LifecycleProbe::new(&self.turn.message.channel);
+        channels.add(Box::new(probe)).await;
+        self.turn.delivery.channels = channels;
+        log
+    }
+
+    /// The outcome reported when the agent loop finishes the message with `computed`.
+    async fn reported(&self, log: &LifecycleLog, computed: TurnOutcome) -> Option<TurnOutcome> {
+        reported_finish(
+            &self.turn.delivery.channels,
+            log,
+            &self.turn.message,
+            computed,
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
+fn test_gateway() -> crate::channels::web::GatewayChannel {
+    crate::channels::web::GatewayChannel::new(
+        crate::config::GatewayConfig {
+            host: "127.0.0.1".into(),
+            port: 0,
+            auth_token: Some("test-token".into()),
+            mascot_enabled: false,
+            user_id: "alice".into(),
+            workspace_read_scopes: vec![],
+            memory_layers: vec![],
+            user_tokens: None,
+            ws_ping_interval_secs: 30,
+            ws_idle_timeout_secs: 120,
+        },
+        "alice".into(),
+    )
+}
+
+#[tokio::test]
+async fn stopped_turn_reports_interrupted_hint() {
+    let mut rig = Rig::new(None, None).await;
+    let log = rig.probe_lifecycle().await;
+
+    let result = rig.turn.complete(ThreadOutcome::Stopped).await;
+
+    // The stopped sentinel reads as `no_reply`; the hint reports the interrupt.
+    assert_eq!(result.ok().flatten().as_deref(), Some("")); // safety: test-only assertion
+    let reported = rig.reported(&log, TurnOutcome::NoReply).await;
+    assert_eq!(reported, Some(TurnOutcome::Interrupted)); // safety: test-only assertion
+}
+
+#[tokio::test]
+async fn failed_turn_reports_failed_hint() {
+    let failures = [
+        ThreadOutcome::Failed {
+            kind: lunarwing_engine::ThreadFailureKind::Orchestrator,
+            error: "the model call failed".into(),
+        },
+        ThreadOutcome::MaxIterations,
+    ];
+    for outcome in failures {
+        let mut rig = Rig::new(None, None).await;
+        let log = rig.probe_lifecycle().await;
+
+        let result = rig.turn.complete(outcome).await.ok().flatten();
+
+        // The error text reads as a reply; the hint reports the failure.
+        assert!(result.is_some_and(|text| !text.is_empty())); // safety: test-only assertion
+        let reported = rig.reported(&log, TurnOutcome::Replied).await;
+        assert_eq!(reported, Some(TurnOutcome::Failed)); // safety: test-only assertion
+    }
+
+    // A completed turn leaves no hint: its reply stays `replied`.
+    let mut rig = Rig::new(None, None).await;
+    let log = rig.probe_lifecycle().await;
+    let completed = ThreadOutcome::Completed {
+        response: Some("done".into()),
+    };
+    let result = rig.turn.complete(completed).await.ok().flatten();
+    assert_eq!(result.as_deref(), Some("done")); // safety: test-only assertion
+    let reported = rig.reported(&log, TurnOutcome::Replied).await;
+    assert_eq!(reported, Some(TurnOutcome::Replied)); // safety: test-only assertion
+}
+
+#[tokio::test]
+async fn detached_turn_reports_detached_then_late_finish() {
+    use crate::channels::web::sse::{CorrelatedEvent, Correlation};
+    use crate::channels::web::types::SseEvent;
+    use futures::StreamExt;
+
+    let mut rig = Rig::new(Some("late gateway answer"), None).await;
+    let gateway = test_gateway();
+    let sse = Arc::clone(&gateway.state().sse);
+    let mut events = sse
+        .subscribe_raw_correlated(Some("alice".into()))
+        .expect("SSE subscription"); // safety: test-only fixture
+    let channels = Arc::new(crate::channels::ChannelManager::new());
+    channels.add(Box::new(gateway)).await;
+    rig.turn.delivery.channels = Arc::clone(&channels);
+    rig.turn.state.sse = Some(sse);
+    let mut message = IncomingMessage::new("gateway", "alice", "original request")
+        .with_thread("client-conversation");
+    message.metadata = serde_json::json!({
+        "user_id": "alice",
+        "thread_id": "client-conversation",
+        "message_id": message.id.to_string(),
+        "client_turn_id": "c-0001",
+    });
+    rig.turn.message = message.clone();
+    let turn = rig.turn;
+    let thread_events = rig.events;
+
+    // The model call is still blocked, so a 1 ms budget detaches the turn.
+    let detached = turn
+        .await_outcome(thread_events, Duration::from_millis(1))
+        .await
+        .ok()
+        .flatten();
+    assert_eq!(detached.as_deref(), Some("")); // safety: test-only assertion
+    // The agent loop reads the empty sentinel as `no_reply`; the hint makes it
+    // `detached`. Then the model answers and the late watcher finishes the turn.
+    channels
+        .message_lifecycle(&message, MessageLifecycle::Finished(TurnOutcome::NoReply))
+        .await;
+    rig.llm.release.notify_one();
+
+    let mut seen: Vec<CorrelatedEvent> = Vec::new();
+    let finished = tokio::time::timeout(Duration::from_secs(10), async {
+        let finishes = |seen: &[CorrelatedEvent]| {
+            seen.iter()
+                .filter(|item| matches!(item.event, SseEvent::TurnFinished { .. }))
+                .count()
+        };
+        while finishes(&seen) < 2 {
+            match events.next().await {
+                Some(item) => seen.push(item),
+                None => break,
+            }
+        }
+    })
+    .await;
+    assert!(finished.is_ok(), "late finish missing: {seen:?}"); // safety: test-only assertion
+
+    let finishes: Vec<(usize, &str, TurnOutcome)> = seen
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| match &item.event {
+            SseEvent::TurnFinished { thread_id, outcome } => {
+                Some((index, thread_id.as_str(), *outcome))
+            }
+            _ => None,
+        })
+        .collect();
+    let outcomes: Vec<_> = finishes
+        .iter()
+        .map(|(_, thread, outcome)| (*thread, *outcome))
+        .collect();
+    let expected_outcomes = [
+        ("client-conversation", TurnOutcome::Detached),
+        ("client-conversation", TurnOutcome::Replied),
+    ];
+    assert_eq!(outcomes, expected_outcomes); // safety: test-only assertion
+    let is_late_reply = |item: &CorrelatedEvent| match &item.event {
+        SseEvent::Response { content, .. } => content == "late gateway answer",
+        _ => false,
+    };
+    let replies: Vec<usize> = seen
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| is_late_reply(item))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(replies.len(), 1, "{seen:?}"); // safety: test-only assertion
+    let (detach, late, reply) = (finishes[0].0, finishes[1].0, replies[0]);
+    // The late reply is delivered before the late finish, never before the detach.
+    assert!(detach < reply && reply < late, "{seen:?}"); // safety: test-only assertion
+    // Both finishes and the reply belong to the original turn.
+    let expected = Correlation::from_metadata(&message.metadata);
+    assert!(expected.is_some()); // safety: test-only assertion
+    for index in [detach, reply, late] {
+        assert_eq!(seen[index].correlation, expected, "{:?}", seen[index].event); // safety: test-only assertion
+    }
+}
+
 #[cfg(feature = "libsql")]
 #[tokio::test]
 async fn recovery_history_reference_survives_gate_resume_and_is_user_scoped() {
@@ -929,4 +1121,116 @@ async fn legacy_history_slot_resolves_only_for_its_thread() {
         .is_none(),
         "the legacy slot must not serve a different thread"
     );
+}
+
+/// A gateway message carrying the ids the chat handlers stamp, so the gateway emits its
+/// lifecycle events.
+#[cfg(test)]
+fn stamped_gateway_message(client_turn_id: &str) -> IncomingMessage {
+    let mut message = IncomingMessage::new("gateway", "alice", "original request")
+        .with_thread("client-conversation");
+    message.metadata = serde_json::json!({
+        "user_id": "alice",
+        "thread_id": "client-conversation",
+        "message_id": message.id.to_string(),
+        "client_turn_id": client_turn_id,
+    });
+    message
+}
+
+/// TUI design 8.2.3: when the agent loop's soft timeout finished the message before the
+/// V2 wait budget ran out, `timed_out` stays its last finish. The late watcher still
+/// delivers the reply but reports no second `turn_finished` (the stale `detached` hint
+/// used to become one).
+#[tokio::test]
+async fn timed_out_message_gets_no_late_finish() {
+    use crate::channels::web::types::SseEvent;
+    use futures::StreamExt;
+
+    let mut rig = Rig::new(Some("late gateway answer"), None).await;
+    let gateway = test_gateway();
+    let sse = Arc::clone(&gateway.state().sse);
+    let mut events = sse
+        .subscribe_raw(Some("alice".into()))
+        .expect("SSE subscription"); // safety: test-only fixture
+    let channels = Arc::new(crate::channels::ChannelManager::new());
+    channels.add(Box::new(gateway)).await;
+    rig.turn.delivery.channels = Arc::clone(&channels);
+    rig.turn.state.sse = Some(sse);
+    let message = stamped_gateway_message("c-0002");
+    rig.turn.message = message.clone();
+    let turn = rig.turn;
+    let thread_events = rig.events;
+
+    // The soft timeout fired first: the loop sent its notice and finished the message.
+    channels
+        .message_lifecycle(&message, MessageLifecycle::Finished(TurnOutcome::TimedOut))
+        .await;
+    // The model call is still blocked, so a 1 ms budget detaches the turn afterwards.
+    let detached = turn
+        .await_outcome(thread_events, Duration::from_millis(1))
+        .await
+        .ok()
+        .flatten();
+    assert_eq!(detached.as_deref(), Some("")); // safety: test-only assertion
+    rig.llm.release.notify_one();
+
+    let mut seen: Vec<SseEvent> = Vec::new();
+    let is_late_reply = |event: &SseEvent| matches!(event, SseEvent::Response { content, .. } if content == "late gateway answer");
+    let delivered = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = events.next().await {
+            let done = is_late_reply(&event);
+            seen.push(event);
+            if done {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(delivered.is_ok(), "late reply missing: {seen:?}"); // safety: test-only assertion
+    // A late finish would follow the reply at once, on the watcher's task.
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_millis(300), events.next()).await
+    {
+        seen.push(event);
+    }
+
+    let finishes: Vec<TurnOutcome> = seen
+        .iter()
+        .filter_map(|event| match event {
+            SseEvent::TurnFinished { outcome, .. } => Some(*outcome),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(finishes, [TurnOutcome::TimedOut], "{seen:?}"); // safety: test-only assertion
+    let replies = seen.iter().filter(|event| is_late_reply(event)).count();
+    assert_eq!(replies, 1); // safety: test-only assertion
+}
+
+/// TUI design 8.2.2: a late reply that a `BeforeOutbound` hook suppresses never reached
+/// the channel, so the late finish is `no_reply`, not `replied`.
+#[tokio::test]
+async fn late_reply_suppressed_by_outbound_hook_finishes_no_reply() {
+    let mut rig = Rig::new(Some("raw answer"), Some(Policy::OutboundReject)).await;
+    let log = rig.probe_lifecycle().await;
+    let message_id = rig.turn.message.id;
+    rig.llm.release.notify_one();
+
+    rig.turn
+        .deliver_late(
+            &mut rig.events,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        )
+        .await;
+
+    let finishes: Vec<MessageLifecycle> = log
+        .lock()
+        .expect("poisoned") // safety: test-only lock
+        .iter()
+        .filter(|(id, _)| *id == message_id)
+        .map(|(_, event)| *event)
+        .collect();
+    let expected = [MessageLifecycle::Finished(TurnOutcome::NoReply)];
+    assert_eq!(finishes, expected); // safety: test-only assertion
 }

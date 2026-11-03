@@ -27,6 +27,31 @@ fn format_count(n: u64, suffix: &str) -> String {
     }
 }
 
+/// Channels whose clients attach to a running service: `/quit`, `/exit`, `/shutdown`
+/// must not stop the daemon from them (TUI design 8.4). Channel-gated like `/restart`
+/// in `Agent::handle_system_command`; the in-process REPL (`repl`) and every other
+/// channel keep today's behaviour.
+const QUIT_REFUSED_CHANNELS: &[&str] = &[
+    crate::channels::GATEWAY_CHANNEL,
+    crate::channels::UNIX_SOCKET_REPL_CHANNEL,
+];
+
+/// Reply to a refused `/quit`, `/exit` or `/shutdown`.
+pub(super) const QUIT_REFUSED_MESSAGE: &str = concat!(
+    "/quit, /exit and /shutdown cannot stop the LunarWing daemon from this channel. ",
+    "Close the client instead; operators use the service manager ",
+    "(lunarwing-mt-admin.sh stop-tenant).",
+);
+
+/// The refusal text when `channel` may not stop the daemon with `/quit`, `/exit` or
+/// `/shutdown`; `None` when the command keeps stopping the agent.
+pub(super) fn quit_refusal(channel: &str) -> Option<&'static str> {
+    QUIT_REFUSED_CHANNELS
+        .iter()
+        .any(|refused| refused.eq_ignore_ascii_case(channel))
+        .then_some(QUIT_REFUSED_MESSAGE)
+}
+
 impl Agent {
     /// Handle job-related intents without turn tracking.
     pub(super) async fn handle_job_or_command(
@@ -971,6 +996,43 @@ impl Agent {
         .await
         {
             tracing::warn!("Model persistence task failed: {}", e);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{QUIT_REFUSED_MESSAGE, quit_refusal};
+
+    #[test]
+    fn quit_refused_for_gateway_and_unix_socket_repl() {
+        for channel in [
+            crate::channels::GATEWAY_CHANNEL,
+            crate::channels::UNIX_SOCKET_REPL_CHANNEL,
+            "Gateway",
+            "UNIX_SOCKET_REPL",
+        ] {
+            let refusal = quit_refusal(channel);
+            assert_eq!(refusal, Some(QUIT_REFUSED_MESSAGE), "{channel}: refused"); // safety: test-only assertion
+        }
+        assert!(QUIT_REFUSED_MESSAGE.contains("cannot stop")); // safety: test-only assertion
+    }
+
+    #[test]
+    fn quit_permitted_for_local_repl_and_other_channels() {
+        // The in-process REPL (`ReplChannel`) owns the process: `/quit` still exits.
+        for channel in [
+            "repl",
+            "cli",
+            "http",
+            "signal",
+            "xmpp",
+            "test",
+            "",
+            "gateway2",
+            "unix_socket",
+        ] {
+            assert_eq!(quit_refusal(channel), None, "{channel}: permitted"); // safety: test-only assertion
         }
     }
 }

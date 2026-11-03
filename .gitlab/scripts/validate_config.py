@@ -1356,6 +1356,18 @@ WORKER_TS_LANE_SCRIPTS = {
             "bun scripts/lunarwing_tool_plugin_test.ts",
         ),
     ),
+    # TUI design 11.3.6 (M1a, F10): the multimodal TUI client lane. Same shape
+    # as worker-opencode-ts: digest-tied bun image, lint runner tags, no
+    # extends; the four commands run in tui/.
+    "tui-ts": (
+        "$CI_BUN_IMAGE",
+        (
+            "cd tui",
+            "bun install --frozen-lockfile",
+            "./node_modules/.bin/tsc --noEmit",
+            "bun test",
+        ),
+    ),
 }
 
 # MR !1647 review HP-1: environment variables (including parallel matrices)

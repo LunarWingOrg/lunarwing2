@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use futures::stream;
 use tokio::sync::{RwLock, mpsc};
+use uuid::Uuid;
 
+use crate::channels::lifecycle::{MessageLifecycle, OutcomeHints, TurnOutcome};
 use crate::channels::{
     Channel, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate,
     routing_target_from_metadata,
@@ -115,6 +117,8 @@ pub struct ChannelManager {
     /// Taken once in `start_all()` and merged into the stream.
     inject_rx: tokio::sync::Mutex<Option<mpsc::Receiver<IncomingMessage>>>,
     coordination_status_policy: CoordinationStatusPolicy,
+    /// Turn outcome refinements applied when a message reports `Finished`.
+    outcome_hints: OutcomeHints,
 }
 
 impl ChannelManager {
@@ -133,6 +137,7 @@ impl ChannelManager {
             inject_tx,
             inject_rx: tokio::sync::Mutex::new(Some(inject_rx)),
             coordination_status_policy,
+            outcome_hints: OutcomeHints::default(),
         }
     }
 
@@ -301,6 +306,42 @@ impl ChannelManager {
         } else {
             // Silently ignore if channel not found (status is best-effort)
             Ok(())
+        }
+    }
+
+    /// Record a refinement of how message `message_id` finished (TUI design 8.2).
+    ///
+    /// Called by the code that knows more than the agent loop's result: the V1 result
+    /// arms (`Paused`, `Interrupted`, `Failed`), the V2 completion and the V2 detach.
+    /// The hint is applied once, by the next `Finished` reported for the message; a hint
+    /// for a message that already finished is dropped.
+    pub fn note_turn_outcome(&self, message_id: Uuid, hint: TurnOutcome) {
+        self.outcome_hints.note(message_id, hint);
+    }
+
+    /// True once a `Finished` other than `Detached` was reported for message `message_id`
+    /// (remembered for the 1024 most recent finishes, at most 30 minutes each).
+    ///
+    /// The Engine V2 late watcher reports a second `Finished` only after `Detached`: when
+    /// the agent loop's soft timeout fired first, `timed_out` was the message's last one.
+    pub fn has_finished(&self, message_id: Uuid) -> bool {
+        self.outcome_hints.has_finished(message_id)
+    }
+
+    /// Report a lifecycle event of `msg` to the channel that produced it.
+    ///
+    /// Applies a recorded outcome hint to `Finished`, then delegates through
+    /// `get_channel` (an `Arc` clone), so no registry lock is held while the channel
+    /// handles the event. Unknown channels are ignored.
+    pub async fn message_lifecycle(&self, msg: &IncomingMessage, event: MessageLifecycle) {
+        let event = match event {
+            MessageLifecycle::Finished(computed) => {
+                MessageLifecycle::Finished(self.outcome_hints.resolve(msg.id, computed))
+            }
+            MessageLifecycle::Started => MessageLifecycle::Started,
+        };
+        if let Some(channel) = self.get_channel(&msg.channel).await {
+            channel.message_lifecycle(msg, event).await;
         }
     }
 
@@ -673,5 +714,249 @@ mod tests {
         let channels = manager.channels.read().await;
         assert_eq!(channels.len(), 1);
         assert!(channels.contains_key("relay"));
+    }
+
+    type LifecycleCapture = Arc<std::sync::Mutex<Vec<(Uuid, MessageLifecycle)>>>;
+
+    /// Records `message_lifecycle` calls; optionally blocks each call until released.
+    struct LifecycleRecorder {
+        name: &'static str,
+        events: LifecycleCapture,
+        gate: Option<Arc<tokio::sync::Notify>>,
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    impl LifecycleRecorder {
+        fn new(name: &'static str) -> (Self, LifecycleCapture) {
+            let events: LifecycleCapture = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorder = Self {
+                name,
+                events: Arc::clone(&events),
+                gate: None,
+                entered: Arc::new(tokio::sync::Notify::new()),
+            };
+            (recorder, events)
+        }
+
+        fn gated(mut self, gate: Arc<tokio::sync::Notify>) -> Self {
+            self.gate = Some(gate);
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for LifecycleRecorder {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        async fn start(&self) -> Result<MessageStream, ChannelError> {
+            Ok(Box::pin(futures::stream::empty::<IncomingMessage>()))
+        }
+
+        async fn respond(
+            &self,
+            _msg: &IncomingMessage,
+            _response: OutgoingResponse,
+        ) -> Result<(), ChannelError> {
+            Ok(())
+        }
+
+        async fn health_check(&self) -> Result<(), ChannelError> {
+            Ok(())
+        }
+
+        async fn message_lifecycle(&self, msg: &IncomingMessage, event: MessageLifecycle) {
+            self.entered.notify_one();
+            if let Some(gate) = &self.gate {
+                gate.notified().await;
+            }
+            self.events.lock().expect("poisoned").push((msg.id, event));
+        }
+    }
+
+    fn recorded(events: &LifecycleCapture) -> Vec<(Uuid, MessageLifecycle)> {
+        events.lock().expect("poisoned").clone()
+    }
+
+    #[tokio::test]
+    async fn message_lifecycle_reaches_owning_channel() {
+        let manager = ChannelManager::new();
+        let (gateway, gateway_events) = LifecycleRecorder::new("gateway");
+        let (other, other_events) = LifecycleRecorder::new("other");
+        manager.add(Box::new(gateway)).await;
+        manager.add(Box::new(other)).await;
+        // A channel that keeps the default no-op implementation is unaffected.
+        let (stub, _) = StubChannel::new("stub");
+        manager.add(Box::new(stub)).await;
+
+        let msg = IncomingMessage::new("gateway", "user1", "hello");
+        manager
+            .message_lifecycle(&msg, MessageLifecycle::Started)
+            .await;
+        manager
+            .message_lifecycle(&msg, MessageLifecycle::Finished(TurnOutcome::Replied))
+            .await;
+        let stub_msg = IncomingMessage::new("stub", "user1", "hello");
+        manager
+            .message_lifecycle(&stub_msg, MessageLifecycle::Started)
+            .await;
+
+        assert_eq!(
+            recorded(&gateway_events),
+            vec![
+                (msg.id, MessageLifecycle::Started),
+                (msg.id, MessageLifecycle::Finished(TurnOutcome::Replied)),
+            ]
+        );
+        assert!(recorded(&other_events).is_empty());
+    }
+
+    #[tokio::test]
+    async fn message_lifecycle_applies_outcome_hint() {
+        let manager = ChannelManager::new();
+        let (channel, events) = LifecycleRecorder::new("gateway");
+        manager.add(Box::new(channel)).await;
+        let paused = IncomingMessage::new("gateway", "user1", "needs approval");
+        let timed_out = IncomingMessage::new("gateway", "user1", "slow");
+
+        manager.note_turn_outcome(paused.id, TurnOutcome::Paused);
+        manager.note_turn_outcome(timed_out.id, TurnOutcome::Interrupted);
+        // `Started` leaves the hint in place for the finish.
+        manager
+            .message_lifecycle(&paused, MessageLifecycle::Started)
+            .await;
+        manager
+            .message_lifecycle(&paused, MessageLifecycle::Finished(TurnOutcome::NoReply))
+            .await;
+        // Consumed: a second finish reports the computed outcome.
+        manager
+            .message_lifecycle(&paused, MessageLifecycle::Finished(TurnOutcome::NoReply))
+            .await;
+        // An authoritative computed outcome wins over the hint.
+        manager
+            .message_lifecycle(
+                &timed_out,
+                MessageLifecycle::Finished(TurnOutcome::TimedOut),
+            )
+            .await;
+
+        assert_eq!(
+            recorded(&events),
+            vec![
+                (paused.id, MessageLifecycle::Started),
+                (paused.id, MessageLifecycle::Finished(TurnOutcome::Paused)),
+                (paused.id, MessageLifecycle::Finished(TurnOutcome::NoReply)),
+                (
+                    timed_out.id,
+                    MessageLifecycle::Finished(TurnOutcome::TimedOut)
+                ),
+            ]
+        );
+        assert_eq!(manager.outcome_hints.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn message_lifecycle_for_unknown_channel_is_noop() {
+        let manager = ChannelManager::new();
+        let (channel, events) = LifecycleRecorder::new("gateway");
+        manager.add(Box::new(channel)).await;
+        let stray = IncomingMessage::new("nonexistent", "user1", "hello");
+        manager.note_turn_outcome(stray.id, TurnOutcome::Paused);
+
+        manager
+            .message_lifecycle(&stray, MessageLifecycle::Started)
+            .await;
+        manager
+            .message_lifecycle(&stray, MessageLifecycle::Finished(TurnOutcome::NoReply))
+            .await;
+
+        assert!(recorded(&events).is_empty());
+        // The finish still consumed the hint, so nothing lingers for that id.
+        assert_eq!(manager.outcome_hints.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn has_finished_after_any_finish_but_detached() {
+        let manager = ChannelManager::new();
+        let (channel, events) = LifecycleRecorder::new("gateway");
+        manager.add(Box::new(channel)).await;
+        let detached = IncomingMessage::new("gateway", "user1", "long task");
+        let timed_out = IncomingMessage::new("gateway", "user1", "slow task");
+
+        manager.note_turn_outcome(detached.id, TurnOutcome::Detached);
+        manager
+            .message_lifecycle(&detached, MessageLifecycle::Finished(TurnOutcome::NoReply))
+            .await;
+        // `detached` is followed by the late finish, so the message is still open.
+        assert!(!manager.has_finished(detached.id));
+        manager
+            .message_lifecycle(&detached, MessageLifecycle::Finished(TurnOutcome::Replied))
+            .await;
+        assert!(manager.has_finished(detached.id));
+
+        manager
+            .message_lifecycle(
+                &timed_out,
+                MessageLifecycle::Finished(TurnOutcome::TimedOut),
+            )
+            .await;
+        assert!(manager.has_finished(timed_out.id));
+        // A hint recorded after the finish is dropped, not kept for a finish to come.
+        manager.note_turn_outcome(timed_out.id, TurnOutcome::Detached);
+        assert_eq!(manager.outcome_hints.len(), 0);
+
+        assert_eq!(
+            recorded(&events),
+            vec![
+                (
+                    detached.id,
+                    MessageLifecycle::Finished(TurnOutcome::Detached)
+                ),
+                (
+                    detached.id,
+                    MessageLifecycle::Finished(TurnOutcome::Replied)
+                ),
+                (
+                    timed_out.id,
+                    MessageLifecycle::Finished(TurnOutcome::TimedOut)
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn message_lifecycle_does_not_hold_registry_lock() {
+        let manager = Arc::new(ChannelManager::new());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (channel, events) = LifecycleRecorder::new("gateway");
+        let channel = channel.gated(Arc::clone(&gate));
+        let entered = Arc::clone(&channel.entered);
+        manager.add(Box::new(channel)).await;
+
+        let msg = IncomingMessage::new("gateway", "user1", "hello");
+        let msg_id = msg.id;
+        let task = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                manager
+                    .message_lifecycle(&msg, MessageLifecycle::Started)
+                    .await;
+            }
+        });
+        entered.notified().await;
+
+        // The registry write lock is free while the channel is still handling the event.
+        let (extra, _) = StubChannel::new("extra");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            manager.add(Box::new(extra)),
+        )
+        .await
+        .expect("registry lock must not be held across the channel await");
+
+        gate.notify_one();
+        task.await.expect("lifecycle task");
+        assert_eq!(recorded(&events), vec![(msg_id, MessageLifecycle::Started)]);
     }
 }

@@ -22,12 +22,41 @@ pub struct SendMessageRequest {
     /// Optional images attached to the message.
     #[serde(default)]
     pub images: Vec<ImageData>,
+    /// Client id of the turn (`^[A-Za-z0-9_-]{1,64}$`), echoed on every SSE event the
+    /// message causes (TUI design 4.1). An invalid id is rejected with 400.
+    #[serde(default)]
+    pub client_turn_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct SendMessageResponse {
     pub message_id: Uuid,
     pub status: &'static str,
+}
+
+/// `GET /api/chat/capabilities` (TUI design 4.2.2). A daemon that answers 404 predates
+/// correlation, lifecycle events and image validation; clients then use legacy mode.
+#[derive(Debug, Serialize)]
+pub struct ChatCapabilitiesResponse {
+    pub api_version: u32,
+    pub server_version: &'static str,
+    /// `"v2"` when Engine V2 handles chat, else `"v1"`.
+    pub engine: &'static str,
+    /// Names from `lunarwing_common::client_caps::FEATURES_CANONICAL`, in that order.
+    pub features: Vec<&'static str>,
+    pub limits: lunarwing_common::WireLimits,
+    pub voice: VoiceCapabilities,
+    /// `"master"` for the gateway auth token; `"client"` for a client token.
+    pub credential: &'static str,
+}
+
+/// The `voice` object of [`ChatCapabilitiesResponse`].
+#[derive(Debug, Serialize)]
+pub struct VoiceCapabilities {
+    /// `"lunarvoice"` when the voice API is configured, else `null`.
+    pub provider: Option<&'static str>,
+    pub stt: bool,
+    pub tts: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -171,6 +200,10 @@ pub struct ApprovalRequest {
     pub action: String,
     /// Thread that owns the pending approval (so the agent loop finds the right session).
     pub thread_id: Option<String>,
+    /// Client id of the turn that paused at this approval: the resumed turn's events
+    /// carry it (TUI design 4.1, rule 4). Validated like `SendMessageRequest`.
+    #[serde(default)]
+    pub client_turn_id: Option<String>,
 }
 
 // --- SSE Event Types ---
@@ -181,11 +214,30 @@ pub struct ToolDecisionDto {
     pub rationale: String,
 }
 
+impl From<crate::channels::ToolDecision> for ToolDecisionDto {
+    fn from(decision: crate::channels::ToolDecision) -> Self {
+        Self {
+            tool_name: decision.tool_name,
+            rationale: decision.rationale,
+        }
+    }
+}
+
 pub type AppEvent = SseEvent;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
 pub enum SseEvent {
+    /// The agent started handling a gateway message (TUI design 8.2.4).
+    #[serde(rename = "turn_started")]
+    TurnStarted { thread_id: String },
+    /// The agent finished handling a gateway message. Any `response` for the
+    /// message was broadcast before this event.
+    #[serde(rename = "turn_finished")]
+    TurnFinished {
+        thread_id: String,
+        outcome: lunarwing_common::TurnOutcome,
+    },
     #[serde(rename = "response")]
     Response {
         content: String,
@@ -418,6 +470,46 @@ pub enum SseEvent {
         child_thread_id: String,
         goal: String,
     },
+}
+
+impl SseEvent {
+    /// The SSE `event:` name, identical to the `type` tag of the JSON payload.
+    pub fn event_name(&self) -> &'static str {
+        match self {
+            SseEvent::TurnStarted { .. } => "turn_started",
+            SseEvent::TurnFinished { .. } => "turn_finished",
+            SseEvent::Response { .. } => "response",
+            SseEvent::Thinking { .. } => "thinking",
+            SseEvent::ToolStarted { .. } => "tool_started",
+            SseEvent::ToolCompleted { .. } => "tool_completed",
+            SseEvent::ToolResult { .. } => "tool_result",
+            SseEvent::StreamChunk { .. } => "stream_chunk",
+            SseEvent::StreamGap { .. } => "stream_gap",
+            SseEvent::Status { .. } => "status",
+            SseEvent::JobStarted { .. } => "job_started",
+            SseEvent::ApprovalNeeded { .. } => "approval_needed",
+            SseEvent::AuthRequired { .. } => "auth_required",
+            SseEvent::AuthCompleted { .. } => "auth_completed",
+            SseEvent::Error { .. } => "error",
+            SseEvent::Heartbeat => "heartbeat",
+            SseEvent::JobMessage { .. } => "job_message",
+            SseEvent::JobToolUse { .. } => "job_tool_use",
+            SseEvent::JobToolResult { .. } => "job_tool_result",
+            SseEvent::JobStatus { .. } => "job_status",
+            SseEvent::JobResult { .. } => "job_result",
+            SseEvent::ImageGenerated { .. } => "image_generated",
+            SseEvent::Suggestions { .. } => "suggestions",
+            SseEvent::TurnCost { .. } => "turn_cost",
+            SseEvent::ExtensionStatus { .. } => "extension_status",
+            SseEvent::ReasoningUpdate { .. } => "reasoning_update",
+            SseEvent::SkillActivated { .. } => "skill_activated",
+            SseEvent::GateRequired { .. } => "gate_required",
+            SseEvent::GateResolved { .. } => "gate_resolved",
+            SseEvent::TurnRecovery { .. } => "turn_recovery",
+            SseEvent::ThreadStateChanged { .. } => "thread_state_changed",
+            SseEvent::ChildThreadSpawned { .. } => "child_thread_spawned",
+        }
+    }
 }
 
 impl From<lunarwing_common::AppEvent> for SseEvent {
@@ -1426,6 +1518,10 @@ pub struct AuthTokenRequest {
     /// Exact recovered gate identity. Both IDs must be supplied together.
     pub request_id: Option<Uuid>,
     pub thread_id: Option<Uuid>,
+    /// Client id of the turn waiting for this credential: the resumed Engine V2 turn's
+    /// events carry it (TUI design 8.3.1, F1). Validated like `SendMessageRequest`.
+    #[serde(default)]
+    pub client_turn_id: Option<String>,
 }
 
 /// Request to cancel an in-progress auth flow.
@@ -1434,6 +1530,10 @@ pub struct AuthCancelRequest {
     pub extension_name: String,
     pub request_id: Option<Uuid>,
     pub thread_id: Option<Uuid>,
+    /// Client id of the turn waiting for the credential. Validated, otherwise unused:
+    /// a cancellation runs outside the agent loop and emits no lifecycle events.
+    #[serde(default)]
+    pub client_turn_id: Option<String>,
 }
 
 // --- WebSocket ---
@@ -1497,42 +1597,12 @@ pub enum WsServerMessage {
 
 impl WsServerMessage {
     /// Create a WsServerMessage from an SseEvent.
+    ///
+    /// WebSocket clients receive no correlation fields; only the SSE stream merges them.
     pub fn from_sse_event(event: &SseEvent) -> Self {
-        let event_type = match event {
-            SseEvent::Response { .. } => "response",
-            SseEvent::Thinking { .. } => "thinking",
-            SseEvent::ToolStarted { .. } => "tool_started",
-            SseEvent::ToolCompleted { .. } => "tool_completed",
-            SseEvent::ToolResult { .. } => "tool_result",
-            SseEvent::StreamChunk { .. } => "stream_chunk",
-            SseEvent::StreamGap { .. } => "stream_gap",
-            SseEvent::Status { .. } => "status",
-            SseEvent::JobStarted { .. } => "job_started",
-            SseEvent::ApprovalNeeded { .. } => "approval_needed",
-            SseEvent::AuthRequired { .. } => "auth_required",
-            SseEvent::AuthCompleted { .. } => "auth_completed",
-            SseEvent::Error { .. } => "error",
-            SseEvent::Heartbeat => "heartbeat",
-            SseEvent::JobMessage { .. } => "job_message",
-            SseEvent::JobToolUse { .. } => "job_tool_use",
-            SseEvent::JobToolResult { .. } => "job_tool_result",
-            SseEvent::JobStatus { .. } => "job_status",
-            SseEvent::JobResult { .. } => "job_result",
-            SseEvent::ImageGenerated { .. } => "image_generated",
-            SseEvent::Suggestions { .. } => "suggestions",
-            SseEvent::TurnCost { .. } => "turn_cost",
-            SseEvent::ExtensionStatus { .. } => "extension_status",
-            SseEvent::ReasoningUpdate { .. } => "reasoning_update",
-            SseEvent::SkillActivated { .. } => "skill_activated",
-            SseEvent::GateRequired { .. } => "gate_required",
-            SseEvent::GateResolved { .. } => "gate_resolved",
-            SseEvent::TurnRecovery { .. } => "turn_recovery",
-            SseEvent::ThreadStateChanged { .. } => "thread_state_changed",
-            SseEvent::ChildThreadSpawned { .. } => "child_thread_spawned",
-        };
         let data = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
         WsServerMessage::Event {
-            event_type: event_type.to_string(),
+            event_type: event.event_name().to_string(),
             data,
         }
     }
@@ -2374,5 +2444,72 @@ mod tests {
         let json = serde_json::to_string(&info).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(parsed.get("channel").is_none());
+    }
+
+    // ---- TUI gateway contract (design 4.2) ----
+
+    #[test]
+    fn turn_lifecycle_events_serialize_with_type_tag_and_outcome() {
+        let started = SseEvent::TurnStarted {
+            thread_id: "t-1".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&started).unwrap(),
+            serde_json::json!({"type": "turn_started", "thread_id": "t-1"})
+        );
+        assert_eq!(started.event_name(), "turn_started");
+
+        let finished = SseEvent::TurnFinished {
+            thread_id: "t-1".to_string(),
+            outcome: lunarwing_common::TurnOutcome::NoReply,
+        };
+        assert_eq!(
+            serde_json::to_value(&finished).unwrap(),
+            serde_json::json!({"type": "turn_finished", "thread_id": "t-1", "outcome": "no_reply"})
+        );
+        match WsServerMessage::from_sse_event(&finished) {
+            WsServerMessage::Event { event_type, data } => {
+                assert_eq!(event_type, "turn_finished");
+                assert_eq!(data["outcome"], "no_reply");
+            }
+            other => panic!("expected an event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chat_requests_accept_an_optional_client_turn_id() {
+        let send: SendMessageRequest =
+            serde_json::from_str(r#"{"content":"hi","thread_id":"t"}"#).unwrap();
+        assert_eq!(send.client_turn_id, None);
+        let send: SendMessageRequest =
+            serde_json::from_str(r#"{"content":"hi","thread_id":"t","client_turn_id":"c-0007"}"#)
+                .unwrap();
+        assert_eq!(send.client_turn_id.as_deref(), Some("c-0007"));
+
+        let approval: ApprovalRequest =
+            serde_json::from_str(r#"{"request_id":"r","action":"approve","client_turn_id":null}"#)
+                .unwrap();
+        assert_eq!(approval.client_turn_id, None);
+
+        let token: AuthTokenRequest =
+            serde_json::from_str(r#"{"extension_name":"x","token":"y","client_turn_id":"t-0003"}"#)
+                .unwrap();
+        assert_eq!(token.client_turn_id.as_deref(), Some("t-0003"));
+        let cancel: AuthCancelRequest =
+            serde_json::from_str(r#"{"extension_name":"x","client_turn_id":"t-0003"}"#).unwrap();
+        assert_eq!(cancel.client_turn_id.as_deref(), Some("t-0003"));
+    }
+
+    #[test]
+    fn voice_capabilities_serialize_a_null_provider() {
+        let voice = VoiceCapabilities {
+            provider: None,
+            stt: false,
+            tts: false,
+        };
+        assert_eq!(
+            serde_json::to_value(&voice).unwrap(),
+            serde_json::json!({"provider": null, "stt": false, "tts": false})
+        );
     }
 }

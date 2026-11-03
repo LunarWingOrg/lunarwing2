@@ -438,16 +438,27 @@ mkdir -p "$(dirname "$lane_file")"
 
 # 6a. the real builder builds to the per-tenant tag and records the lane.
 # The builder runs inside capture's subshell, so the tag is recorded in a file.
+# LUNARWING_WORKER_IMAGE_TAG must be the bare tag: the real builders name their
+# output worker_image_ref <lane>, and that ref must be the candidate ref that
+# promote and cleanup use. A full ref in the variable built
+# "lunarwing-worker-kimi:lunarwing-worker-kimi:wi527-fixture" (invalid).
 tag_file="$fixture/built-tag"
-rm -f "$tag_file"
-build_kimi_worker() { printf '%s\n' "${LUNARWING_WORKER_IMAGE_TAG:-}" >"$tag_file"; return 0; }
+ref_file="$fixture/built-ref"
+rm -f "$tag_file" "$ref_file"
+build_kimi_worker() {
+  printf '%s\n' "${LUNARWING_WORKER_IMAGE_TAG:-}" >"$tag_file"
+  worker_image_ref kimi >"$ref_file"
+  return 0
+}
 : >"$lane_file"
 rm -f "$runtime_log"
 capture build_candidate_workers fixture false true false false false
 if [[ "$rc" -ne 0 ]]; then
   fail "real candidate builder failed (rc=$rc): $output"
-elif [[ "$(cat "$tag_file" 2>/dev/null)" != *:wi527-fixture ]]; then
-  fail "real candidate builder used a wrong image tag: '$(cat "$tag_file" 2>/dev/null)'"
+elif [[ "$(cat "$tag_file" 2>/dev/null)" != wi527-fixture ]]; then
+  fail "real candidate builder passed a wrong image tag: '$(cat "$tag_file" 2>/dev/null)'"
+elif [[ "$(cat "$ref_file" 2>/dev/null)" != "$candidate_ref" ]]; then
+  fail "real candidate builder would build '$(cat "$ref_file" 2>/dev/null)', not the promoted candidate '$candidate_ref'"
 elif ! grep -qx kimi "$lane_file"; then
   fail "real candidate builder did not record the lane: $(cat "$lane_file")"
 else
@@ -458,9 +469,11 @@ fi
 # functional pin beside the other lanes so a merge cannot drop the third arg.
 pebble_root_file="$fixture/pebble-source-root"
 pebble_tag_file="$fixture/pebble-built-tag"
+pebble_ref_file="$fixture/pebble-built-ref"
 build_pebble_worker() {
   printf '%s\n' "${3:-}" >"$pebble_root_file"
   printf '%s\n' "${LUNARWING_WORKER_IMAGE_TAG:-}" >"$pebble_tag_file"
+  worker_image_ref pebble >"$pebble_ref_file"
   return 0
 }
 : >"$lane_file"
@@ -469,8 +482,10 @@ if [[ "$rc" -ne 0 ]]; then
   fail "real pebble candidate builder failed (rc=$rc): $output"
 elif [[ "$(cat "$pebble_root_file" 2>/dev/null)" != "$fixture_repo" ]]; then
   fail "pebble candidate used source root '$(cat "$pebble_root_file" 2>/dev/null)' instead of the tenant checkout"
-elif [[ "$(cat "$pebble_tag_file" 2>/dev/null)" != lunarwing-worker-pebble:wi527-fixture ]]; then
-  fail "pebble candidate used a wrong image tag: '$(cat "$pebble_tag_file" 2>/dev/null)'"
+elif [[ "$(cat "$pebble_tag_file" 2>/dev/null)" != wi527-fixture ]]; then
+  fail "pebble candidate passed a wrong image tag: '$(cat "$pebble_tag_file" 2>/dev/null)'"
+elif [[ "$(cat "$pebble_ref_file" 2>/dev/null)" != "$(upgrade_candidate_image_ref fixture pebble)" ]]; then
+  fail "pebble candidate would build '$(cat "$pebble_ref_file" 2>/dev/null)', not lunarwing-worker-pebble:wi527-fixture"
 elif ! grep -qx pebble "$lane_file"; then
   fail "pebble candidate builder did not record the lane: $(cat "$lane_file")"
 else
@@ -549,7 +564,7 @@ flock -x "$inherited_upgrade_fd"
 export LUNARWING_MT_INHERITED_UPGRADE_LOCK_FD="$inherited_upgrade_fd"
 
 : >"$lane_file"
-rm -f "$tag_file"
+rm -f "$tag_file" "$ref_file"
 register_image "$candidate_ref" sha256:kimi-candidate
 register_image "lunarwing-worker-kimi:latest" sha256:kimi-old
 capture main build-worker-candidates fixture --with-kimi
@@ -557,8 +572,8 @@ if [[ "$rc" -ne 0 ]]; then
   fail "build-worker-candidates failed under the inherited upgrade lock (rc=$rc): $output"
 elif [[ "$output" == *'lock is already held'* ]]; then
   fail 'build-worker-candidates preflighted the lock its own parent holds (TO-1)'
-elif [[ "$(cat "$tag_file" 2>/dev/null)" != *:wi527-fixture ]]; then
-  fail "build-worker-candidates never built the lane under the inherited lock: $(cat "$tag_file" 2>/dev/null)"
+elif [[ "$(cat "$tag_file" 2>/dev/null)" != wi527-fixture || "$(cat "$ref_file" 2>/dev/null)" != "$candidate_ref" ]]; then
+  fail "build-worker-candidates never built the lane under the inherited lock: tag '$(cat "$tag_file" 2>/dev/null)', ref '$(cat "$ref_file" 2>/dev/null)'"
 else
   pass 'build-worker-candidates uses the inherited upgrade lock instead of deadlocking'
 fi

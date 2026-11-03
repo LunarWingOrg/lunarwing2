@@ -1,4 +1,9 @@
 //! One completion path for on-time and detached foreground turns (WI#164).
+//!
+//! It also refines how the agent loop reports the message (TUI design 8.2.3): the loop
+//! only sees the returned text, so the completion records an outcome hint for stopped,
+//! failed and detached turns, and the late watcher reports the second `Finished` of a
+//! detached turn itself.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,7 +12,7 @@ use lunarwing_engine::ThreadOutcome;
 
 use crate::agent::Agent;
 use crate::agent::response_delivery::ResponseDelivery;
-use crate::channels::{IncomingMessage, StatusUpdate};
+use crate::channels::{IncomingMessage, MessageLifecycle, StatusUpdate, TurnOutcome};
 use crate::error::Error;
 use crate::gate::pending::PendingGate;
 use crate::history::roles::{ASSISTANT_ROLE, TOOL_CALLS_ROLE, TURN_RECOVERY_ROLE};
@@ -75,7 +80,7 @@ pub(super) async fn await_thread_outcome(
     message: &IncomingMessage,
     conversation_id: lunarwing_engine::ConversationId,
     thread_id: lunarwing_engine::ThreadId,
-    mut events: tokio::sync::broadcast::Receiver<lunarwing_engine::ThreadEvent>,
+    events: tokio::sync::broadcast::Receiver<lunarwing_engine::ThreadEvent>,
 ) -> Result<Option<String>, Error> {
     let run_started_at = state
         .thread_manager
@@ -97,25 +102,41 @@ pub(super) async fn await_thread_outcome(
         run_started_at,
         history: history_reference(state, message, thread_id).await,
     };
-    let mut cancellation = turn.cancellation_guard();
-    if !turn.wait(&mut events, OUTCOME_TIMEOUT).await {
-        tracing::warn!(%thread_id, "Turn wait budget exhausted; transferring delivery to late watcher");
-        tokio::spawn(async move {
-            turn.deliver_late(&mut events, LATE_TIMEOUT, STOP_GRACE)
-                .await;
-        });
-        cancellation.disarm();
-        return Ok(Some(String::new()));
-    }
-    let Some(outcome) = turn.join().await? else {
-        cancellation.disarm();
-        return Ok(Some(String::new()));
-    };
-    cancellation.disarm();
-    turn.complete_once(outcome).await
+    turn.await_outcome(events, OUTCOME_TIMEOUT).await
 }
 
 impl TurnCompletion {
+    /// Waits up to `budget` for the thread, then completes the turn. Past the budget
+    /// the late watcher takes over delivery, and the agent loop reports this message
+    /// `Finished(Detached)` (the hint below); the watcher reports its real finish. When
+    /// the loop's soft timeout already finished the message, the hint is dropped and the
+    /// watcher only delivers.
+    async fn await_outcome(
+        self,
+        mut events: tokio::sync::broadcast::Receiver<lunarwing_engine::ThreadEvent>,
+        budget: Duration,
+    ) -> Result<Option<String>, Error> {
+        let mut cancellation = self.cancellation_guard();
+        if !self.wait(&mut events, budget).await {
+            tracing::warn!(thread_id = %self.thread_id, "Turn wait budget exhausted; transferring delivery to late watcher");
+            self.delivery
+                .channels
+                .note_turn_outcome(self.message.id, TurnOutcome::Detached);
+            tokio::spawn(async move {
+                self.deliver_late(&mut events, LATE_TIMEOUT, STOP_GRACE)
+                    .await;
+            });
+            cancellation.disarm();
+            return Ok(Some(String::new()));
+        }
+        let Some(outcome) = self.join().await? else {
+            cancellation.disarm();
+            return Ok(Some(String::new()));
+        };
+        cancellation.disarm();
+        self.complete_once(outcome).await
+    }
+
     fn cancellation_guard(&self) -> AwaitThreadCancellationGuard {
         AwaitThreadCancellationGuard::new(
             Arc::clone(&self.state.thread_manager),
@@ -220,16 +241,45 @@ impl TurnCompletion {
         {
             cancellation.disarm();
         }
+        let outcome = self.deliver_late_result(result).await;
+        self.report_late_finish(outcome).await;
+    }
+
+    /// Delivers the late result and rates it like the agent loop rates a handler result
+    /// (TUI design 8.2.2): a reply is `replied` only once it reached the channel.
+    async fn deliver_late_result(&self, result: Result<Option<String>, Error>) -> TurnOutcome {
         match result {
-            Ok(Some(text)) => self.delivery.deliver(&self.message, text).await,
-            Ok(None) => {}
+            Ok(Some(text)) if !text.is_empty() => {
+                self.delivery.deliver(&self.message, text).await.outcome()
+            }
+            Ok(_) => TurnOutcome::NoReply,
             Err(error) => {
                 tracing::error!(thread_id = %self.thread_id, %error, "Late turn completion failed");
                 self.delivery
                     .deliver(&self.message, error.user_facing_message())
                     .await;
+                TurnOutcome::Failed
             }
         }
+    }
+
+    /// The one `Finished` that follows `Detached`, after the late reply; hints the late
+    /// completion recorded (interrupted, failed, paused) apply. Skipped when the agent
+    /// loop already ended the message otherwise: its soft timeout can fire before this
+    /// turn detached, and then `timed_out` was the message's last `Finished`.
+    async fn report_late_finish(&self, outcome: TurnOutcome) {
+        let channels = &self.delivery.channels;
+        if channels.has_finished(self.message.id) {
+            tracing::debug!(
+                thread_id = %self.thread_id,
+                %outcome,
+                "Late turn finished after the agent loop ended its message; no second finish"
+            );
+            return;
+        }
+        channels
+            .message_lifecycle(&self.message, MessageLifecycle::Finished(outcome))
+            .await;
     }
 
     async fn late_result(
@@ -323,6 +373,7 @@ impl TurnCompletion {
         if let Some(credential) = auth_credential {
             return self.auth_fallback(credential).await;
         }
+        self.note_outcome_hint(&outcome);
         let result = match outcome {
             gate @ ThreadOutcome::GatePaused { .. } => {
                 persist_and_notify_thread_gate(
@@ -341,6 +392,20 @@ impl TurnCompletion {
             self.write_history(text).await;
         }
         Ok(result)
+    }
+
+    /// The returned text alone reads as a reply or no reply, so stopped and failed
+    /// turns leave a hint for the `Finished` of this message (TUI design 8.2.3). A
+    /// pause is noted where its gate is announced (`insert_and_notify_pending_gate`).
+    fn note_outcome_hint(&self, outcome: &ThreadOutcome) {
+        let hint = match outcome {
+            ThreadOutcome::Stopped => TurnOutcome::Interrupted,
+            ThreadOutcome::Failed { .. } | ThreadOutcome::MaxIterations => TurnOutcome::Failed,
+            ThreadOutcome::Completed { .. } | ThreadOutcome::GatePaused { .. } => return,
+        };
+        self.delivery
+            .channels
+            .note_turn_outcome(self.message.id, hint);
     }
 
     async fn reap_terminal_gates(&self) {

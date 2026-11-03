@@ -779,6 +779,43 @@ _relay_env_set_password() {  # <tenant> <lunarwing.env> <password>
   _tenant_env_replace "$1" "$2" RELAY_PASSWORD "$3"
 }
 
+# rotate-gateway-token: replaces GATEWAY_AUTH_TOKEN with a fresh 256-bit value
+# through the tenant-side atomic env rewrite and restarts a running tenant so
+# the daemon serves the new value (UZ-2 of the TUI review: master-token TUI
+# files could not be revoked before this verb existed). Every copy of the old
+# token stops working: the web login (`tokens` shows the new value), every
+# master-token TUI file (re-run `tui-access --use-master-token` for users who
+# keep access), the worker token fallback of tenants without WORKER_AUTH_TOKEN
+# and the DarkIRC and Brave key uploads. Runs under the tenant lifecycle lock;
+# neither token reaches argv, stdout or stderr.
+rotate_tenant_gateway_token() {  # <tenant>
+  local name="$1" env_path old="" new="" active=false
+  name="$(sanitize_name "$name")"
+  env_path="$(tenant_env_dir "$name")/lunarwing.env"
+  [[ -f "$env_path" && ! -L "$env_path" ]] || die "missing or unsafe env file for tenant '$name'"
+  old="$(read_tenant_env_value "$name" "$env_path" GATEWAY_AUTH_TOKEN)" \
+    || die "could not read GATEWAY_AUTH_TOKEN of tenant '$name' (tenant-side read of $env_path refused)"
+  new="$(generate_token)" || die "failed to generate a gateway token"
+  [[ "$new" =~ ^[0-9a-f]{64}$ && "$new" != "$old" ]] || die "failed to generate a fresh gateway token"
+  ensure_init_system || return 1
+  if _relay_service_active "$name" "lunarwing-$name"; then
+    active=true
+  fi
+  _tenant_env_replace "$name" "$env_path" GATEWAY_AUTH_TOKEN "$new" \
+    || die "could not rewrite GATEWAY_AUTH_TOKEN in $env_path as tenant '$name'; the old token is unchanged"
+  [[ "$(read_tenant_env_value "$name" "$env_path" GATEWAY_AUTH_TOKEN)" == "$new" ]] \
+    || die "GATEWAY_AUTH_TOKEN of tenant '$name' did not read back as the new value; check $env_path before restarting"
+  old="" new=""
+  if [[ "$active" == true ]]; then
+    restart_tenant "$name" \
+      || die "GATEWAY_AUTH_TOKEN of tenant '$name' is rotated but the restart failed; run 'restart-tenant $name'"
+    say "Rotated GATEWAY_AUTH_TOKEN of tenant '$name' and restarted it."
+  else
+    say "Rotated GATEWAY_AUTH_TOKEN of tenant '$name'; the tenant is not running, the new value applies at its next start."
+  fi
+  say "Every copy of the old token is now invalid: the web login ('tokens $name' shows the new value), every master-token TUI file (re-run 'tui-access $name --for-user <user> --use-master-token' for users who keep access), the worker token fallback of tenants without WORKER_AUTH_TOKEN, and the DarkIRC and Brave key uploads."
+}
+
 _relay_service_active() {  # <tenant> <service basename>
   if [[ "$INIT_SYSTEM" == systemd ]]; then
     _systemctl_user "$1" is-active --quiet "$2.service"

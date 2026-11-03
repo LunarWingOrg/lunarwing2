@@ -27,7 +27,9 @@ use crate::agent::session::ThreadState;
 use crate::agent::session_manager::SessionManager;
 use crate::agent::submission::{Submission, SubmissionParser, SubmissionResult};
 use crate::agent::{HeartbeatConfig as AgentHeartbeatConfig, Router, Scheduler, SchedulerDeps};
-use crate::channels::{ChannelManager, IncomingMessage, OutgoingResponse};
+use crate::channels::{
+    ChannelManager, IncomingMessage, MessageLifecycle, OutgoingResponse, TurnOutcome,
+};
 use crate::config::clamp_pending_gate_expiry_secs;
 use crate::config::{AgentConfig, HeartbeatConfig, RoutineConfig, SkillsConfig};
 use crate::context::ContextManager;
@@ -121,6 +123,37 @@ async fn recv_sigterm(_receiver: &mut SigtermReceiver) {
 async fn abort_and_wait<T>(handle: &mut tokio::task::JoinHandle<T>) {
     handle.abort();
     let _ = handle.await;
+}
+
+/// The outcome a V1 submission result implies beyond its reply text (TUI design 8.2.2):
+/// the turn stopped at an approval gate, was interrupted, or ended in an `Error: ...`
+/// reply.
+fn submission_outcome_hint(result: &SubmissionResult) -> Option<TurnOutcome> {
+    match result {
+        SubmissionResult::NeedApproval { .. } => Some(TurnOutcome::Paused),
+        SubmissionResult::Interrupted => Some(TurnOutcome::Interrupted),
+        SubmissionResult::Error { .. } => Some(TurnOutcome::Failed),
+        SubmissionResult::Response { .. }
+        | SubmissionResult::Ok { .. }
+        | SubmissionResult::Suppressed => None,
+    }
+}
+
+/// DEC-1 guard (TUI design 8.4): `Ok(None)` stops the loop except on channels whose
+/// clients attach to a running service. There, model output that maps to `Ok(None)`
+/// (a V1 `NO_REPLY` reply, V2 `Completed { response: None }`) must not stop the daemon;
+/// the producers themselves are tracked separately. To revert, give `Ok(None)` the
+/// `Shutdown` control in `deliver_message_result` again.
+fn none_result_control(channel: &str) -> MessageLoopControl {
+    if crate::agent::commands::quit_refusal(channel).is_some() {
+        tracing::warn!(
+            channel = %channel,
+            "Refused a shutdown requested through a client channel"
+        );
+        MessageLoopControl::Continue
+    } else {
+        MessageLoopControl::Shutdown
+    }
 }
 
 /// Static greeting persisted to DB and broadcast on first launch.
@@ -1222,44 +1255,9 @@ impl Agent {
                 incoming = message_stream.next(), if channels_open => {
                     match incoming {
                         Some(incoming) if is_priority_control(&incoming) => {
-                            // Priority controls overtake the message scheduler
-                            // by design. An interrupt that overtakes a queued
-                            // prompt must also cancel that prompt in the
-                            // scheduler, or the user gets "Nothing to
-                            // interrupt." followed by the very turn they
-                            // cancelled (goal #9 documented-not-fixed race).
-                            // A lane with an active turn keeps its queued
-                            // follow-ups: the interrupt stops the running turn
-                            // and the follow-ups still run afterward (pinned by
-                            // `queued_same_thread_message_starts_after_interrupt_acknowledgement`).
-                            if matches!(
-                                SubmissionParser::parse(&incoming.content),
-                                Submission::Interrupt
-                            ) {
-                                let lane = LaneKey::from_message(&incoming);
-                                let cancelled = scheduler.cancel_lane(&lane);
-                                if cancelled > 0 {
-                                    tracing::debug!(
-                                        channel = %incoming.channel,
-                                        user = %incoming.user_id,
-                                        cancelled,
-                                        "priority interrupt cancelled queued prompt(s)"
-                                    );
-                                    let result =
-                                        Ok(Some(crate::bridge::INTERRUPTED_RESPONSE.to_string()));
-                                    let _ = self.deliver_message_result(&incoming, result).await;
-                                    continue 'message_loop;
-                                }
-                            }
-                            self.handle_priority_interrupt(incoming).await;
+                            self.handle_priority_control(&mut scheduler, incoming).await;
                         }
-                        Some(incoming) => {
-                            let allow_parallel = allows_parallel_dispatch(&incoming);
-                            if let Some(rejected) = scheduler.defer(incoming, allow_parallel) {
-                                let result = Ok(Some(DEFERRED_QUEUE_FULL_RESPONSE.to_string()));
-                                let _ = self.deliver_message_result(&rejected, result).await;
-                            }
-                        }
+                        Some(incoming) => self.defer_message(&mut scheduler, incoming).await,
                         None => channels_open = false,
                     }
                 }
@@ -1323,11 +1321,15 @@ impl Agent {
         }
     }
 
+    /// Runs one dequeued message under the soft timeout and reports its lifecycle: `Started`
+    /// first, then exactly one `Finished` with the outcome of whichever arm ends it, after
+    /// that arm's reply or notice (TUI design 8.2.2).
     async fn supervise_message(
         self: Arc<Self>,
         message: IncomingMessage,
         shutdown: tokio_util::sync::CancellationToken,
     ) -> MessageLoopControl {
+        self.report_started(&message).await;
         let suppressed = Arc::new(AtomicBool::new(false));
         let agent = Arc::clone(&self);
         let task_message = message.clone();
@@ -1349,25 +1351,27 @@ impl Agent {
             _ = &mut deadline => ActiveMessageResult::TimedOut,
         };
 
-        match active_result {
+        let (control, outcome) = match active_result {
             ActiveMessageResult::Completed(Ok(result)) => {
                 self.deliver_message_result(&message, result).await
             }
             ActiveMessageResult::Completed(Err(join_error)) => {
                 self.handle_message_panic(&message, &join_error).await;
-                MessageLoopControl::Continue
+                (MessageLoopControl::Continue, TurnOutcome::Failed)
             }
             ActiveMessageResult::TimedOut => {
                 self.handle_soft_timeout(&message, &suppressed, soft_timeout, abort_handle)
                     .await;
                 abort_guard.disarm();
-                MessageLoopControl::Continue
+                (MessageLoopControl::Continue, TurnOutcome::TimedOut)
             }
             ActiveMessageResult::Cancelled => {
                 abort_and_wait(&mut handle).await;
-                MessageLoopControl::Continue
+                (MessageLoopControl::Continue, TurnOutcome::Cancelled)
             }
-        }
+        };
+        self.report_finished(&message, outcome).await;
+        control
     }
 
     async fn prepare_message(&self, mut message: IncomingMessage) -> IncomingMessage {
@@ -1384,21 +1388,108 @@ impl Agent {
         message
     }
 
-    async fn handle_priority_interrupt(&self, message: IncomingMessage) {
-        let suppressed = AtomicBool::new(false);
-        let result = self.handle_message(&message, &suppressed).await;
-        let _ = self.deliver_message_result(&message, result).await;
+    /// Handles a priority control (`/interrupt`, `/steer`) on the main loop instead of
+    /// deferring it behind the scheduler.
+    ///
+    /// Priority controls overtake the message scheduler by design. An interrupt that
+    /// overtakes a queued prompt must also cancel that prompt in the scheduler, or the
+    /// user gets "Nothing to interrupt." followed by the very turn they cancelled (goal #9
+    /// documented-not-fixed race). A lane with an active turn keeps its queued follow-ups:
+    /// the interrupt stops the running turn and the follow-ups still run afterward (pinned
+    /// by `queued_same_thread_message_starts_after_interrupt_acknowledgement`).
+    async fn handle_priority_control(
+        &self,
+        scheduler: &mut MessageScheduler,
+        incoming: IncomingMessage,
+    ) {
+        if matches!(
+            SubmissionParser::parse(&incoming.content),
+            Submission::Interrupt
+        ) {
+            let lane = LaneKey::from_message(&incoming);
+            let cancelled = scheduler.cancel_lane(&lane);
+            if !cancelled.is_empty() {
+                tracing::debug!(
+                    channel = %incoming.channel,
+                    user = %incoming.user_id,
+                    cancelled = cancelled.len(),
+                    "priority interrupt cancelled queued prompt(s)"
+                );
+                self.acknowledge_cancelled_lane(&incoming, &cancelled).await;
+                return;
+            }
+        }
+        self.handle_priority_interrupt(incoming).await;
     }
 
+    /// Lifecycle of an interrupt that removed queued prompts: each removed prompt never
+    /// ran and finishes `Cancelled`; the interrupt itself is answered `Interrupted.`.
+    async fn acknowledge_cancelled_lane(
+        &self,
+        interrupt: &IncomingMessage,
+        cancelled: &[IncomingMessage],
+    ) {
+        for dropped in cancelled {
+            self.report_finished(dropped, TurnOutcome::Cancelled).await;
+        }
+        self.report_started(interrupt).await;
+        let result = Ok(Some(crate::bridge::INTERRUPTED_RESPONSE.to_string()));
+        let (_, outcome) = self.deliver_message_result(interrupt, result).await;
+        self.report_finished(interrupt, outcome).await;
+    }
+
+    /// Queues an ordinary message. When the deferred queue is full the message is
+    /// answered with a busy notice and finishes `Cancelled`, since it never ran.
+    async fn defer_message(&self, scheduler: &mut MessageScheduler, incoming: IncomingMessage) {
+        let allow_parallel = allows_parallel_dispatch(&incoming);
+        if let Some(rejected) = scheduler.defer(incoming, allow_parallel) {
+            let result = Ok(Some(DEFERRED_QUEUE_FULL_RESPONSE.to_string()));
+            let _ = self.deliver_message_result(&rejected, result).await;
+            self.report_finished(&rejected, TurnOutcome::Cancelled)
+                .await;
+        }
+    }
+
+    async fn handle_priority_interrupt(&self, message: IncomingMessage) {
+        self.report_started(&message).await;
+        let suppressed = AtomicBool::new(false);
+        let result = self.handle_message(&message, &suppressed).await;
+        let (_, outcome) = self.deliver_message_result(&message, result).await;
+        self.report_finished(&message, outcome).await;
+    }
+
+    /// Reports that the agent started handling `message` (TUI design 8.2.2).
+    async fn report_started(&self, message: &IncomingMessage) {
+        self.channels
+            .message_lifecycle(message, MessageLifecycle::Started)
+            .await;
+    }
+
+    /// Reports how `message` finished; called after any reply was handed to `respond()`.
+    /// `ChannelManager::message_lifecycle` applies a recorded outcome hint first.
+    async fn report_finished(&self, message: &IncomingMessage, outcome: TurnOutcome) {
+        self.channels
+            .message_lifecycle(message, MessageLifecycle::Finished(outcome))
+            .await;
+    }
+
+    /// Delivers a handler result and rates how the message finished (TUI design 8.2.2).
+    ///
+    /// A non-empty reply is `replied` once it reached `respond()` or the coalescing
+    /// buffer, and `no_reply` when a `BeforeOutbound` hook suppressed it. An empty reply
+    /// (the suppression sentinels: approval prompt, inbound hook rejection, stale
+    /// approval) and `Ok(None)` are `no_reply`; an error is `failed`. Outcome hints
+    /// recorded with `ChannelManager::note_turn_outcome` refine `replied` and `no_reply`
+    /// when the outcome is reported.
     async fn deliver_message_result(
         &self,
         message: &IncomingMessage,
         result: Result<Option<String>, Error>,
-    ) -> MessageLoopControl {
+    ) -> (MessageLoopControl, TurnOutcome) {
         match result {
             Ok(Some(response)) if !response.is_empty() => {
-                self.deliver_outbound_with_hooks(message, response).await;
-                MessageLoopControl::Continue
+                let delivery = self.deliver_outbound_with_hooks(message, response).await;
+                (MessageLoopControl::Continue, delivery.outcome())
             }
             Ok(Some(empty)) => {
                 tracing::debug!(
@@ -1407,9 +1498,10 @@ impl Agent {
                     empty_len = empty.len(),
                     "Suppressed empty response (not sent to channel)"
                 );
-                MessageLoopControl::Continue
+                (MessageLoopControl::Continue, TurnOutcome::NoReply)
             }
-            Ok(None) => MessageLoopControl::Shutdown,
+            // DEC-1 (TUI design 8.4): the control was `MessageLoopControl::Shutdown`.
+            Ok(None) => (none_result_control(&message.channel), TurnOutcome::NoReply),
             Err(error) => {
                 tracing::error!("Error handling message: {error}");
                 if let Err(send_error) = self
@@ -1423,13 +1515,17 @@ impl Agent {
                         "Failed to send error response to channel"
                     );
                 }
-                MessageLoopControl::Continue
+                (MessageLoopControl::Continue, TurnOutcome::Failed)
             }
         }
     }
 
-    async fn deliver_outbound_with_hooks(&self, message: &IncomingMessage, response: String) {
-        self.response_delivery().deliver(message, response).await;
+    async fn deliver_outbound_with_hooks(
+        &self,
+        message: &IncomingMessage,
+        response: String,
+    ) -> super::response_delivery::Delivery {
+        self.response_delivery().deliver(message, response).await
     }
 
     pub(crate) fn response_delivery(&self) -> super::response_delivery::ResponseDelivery {
@@ -1860,6 +1956,9 @@ impl Agent {
                 "Hydrating thread from DB"
             );
             if let Some(rejection) = self.maybe_hydrate_thread(message, external_thread_id).await {
+                // An `Error: ...` reply like the `SubmissionResult::Error` arm below.
+                self.channels
+                    .note_turn_outcome(message.id, TurnOutcome::Failed);
                 return Ok(Some(format!("Error: {}", rejection)));
             }
         }
@@ -2148,7 +2247,18 @@ impl Agent {
             Submission::JobCancel { job_id } => {
                 self.process_job_cancel(&message.user_id, &job_id).await
             }
-            Submission::Quit => return Ok(None),
+            // TUI design 8.4: clients attached to a running service may not stop the
+            // daemon; the refusal is delivered as `Error: ...` and finishes `Failed`.
+            Submission::Quit => match crate::agent::commands::quit_refusal(&message.channel) {
+                Some(reason) => {
+                    tracing::warn!(
+                        channel = %message.channel,
+                        "Refused /quit from a channel that may not stop the daemon"
+                    );
+                    Ok(SubmissionResult::error(reason))
+                }
+                None => return Ok(None),
+            },
             Submission::SwitchThread { thread_id: target } => {
                 self.process_switch_thread(message, target).await
             }
@@ -2176,8 +2286,18 @@ impl Agent {
             }
         };
 
+        let result = result?;
+        // Record what the reply text alone cannot tell the agent loop (TUI design 8.2.2).
+        // After a soft timeout the loop has already reported `TimedOut`, so a hint from
+        // this late result would never be consumed.
+        if let Some(hint) = submission_outcome_hint(&result)
+            && !suppressed.load(Ordering::SeqCst)
+        {
+            self.channels.note_turn_outcome(message.id, hint);
+        }
+
         // Convert SubmissionResult to response string
-        match result? {
+        match result {
             SubmissionResult::Response { content } => {
                 // Suppress silent replies (e.g. from group chat "nothing to say" responses)
                 if crate::llm::is_silent_reply(&content) {
@@ -2238,13 +2358,14 @@ mod tests {
     #[cfg(feature = "libsql")]
     use super::Agent;
     use super::{
-        abort_and_wait, chat_tool_execution_metadata, coalesced_reply_context,
-        coordination_activity_is_denied, resolve_routine_notification_user,
-        should_fallback_routine_notification, truncate_for_preview,
+        MessageLoopControl, abort_and_wait, chat_tool_execution_metadata, coalesced_reply_context,
+        coordination_activity_is_denied, none_result_control, resolve_routine_notification_user,
+        should_fallback_routine_notification, submission_outcome_hint, truncate_for_preview,
     };
+    use crate::agent::submission::SubmissionResult;
     #[cfg(feature = "libsql")]
     use crate::channels::ChannelManager;
-    use crate::channels::{AttachmentKind, IncomingAttachment, IncomingMessage};
+    use crate::channels::{AttachmentKind, IncomingAttachment, IncomingMessage, TurnOutcome};
     #[cfg(feature = "libsql")]
     use crate::config::AgentConfig;
     use crate::error::ChannelError;
@@ -2408,6 +2529,173 @@ mod tests {
 
         assert!(handle.is_finished());
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    /// Rejects every reply at `BeforeOutbound`.
+    #[cfg(feature = "libsql")]
+    struct RejectOutbound;
+
+    #[cfg(feature = "libsql")]
+    #[async_trait::async_trait]
+    impl crate::hooks::Hook for RejectOutbound {
+        fn name(&self) -> &str {
+            "agent-loop-reject-outbound"
+        }
+
+        fn hook_points(&self) -> &[crate::hooks::HookPoint] {
+            &[crate::hooks::HookPoint::BeforeOutbound]
+        }
+
+        async fn execute(
+            &self,
+            _event: &crate::hooks::HookEvent,
+            _ctx: &crate::hooks::HookContext,
+        ) -> Result<crate::hooks::HookOutcome, crate::hooks::HookError> {
+            Ok(crate::hooks::HookOutcome::reject("blocked by the test"))
+        }
+    }
+
+    /// Replies a `StubChannel` captured.
+    #[cfg(feature = "libsql")]
+    type StubReplies =
+        Arc<std::sync::Mutex<Vec<(IncomingMessage, crate::channels::OutgoingResponse)>>>;
+
+    /// An agent whose channels hold one `StubChannel` named `stub`, its replies, and the
+    /// directory of its database (keep it alive while the agent is used).
+    #[cfg(feature = "libsql")]
+    async fn stub_channel_agent() -> (Agent, StubReplies, tempfile::TempDir) {
+        let (db, db_dir) = crate::testing::test_db().await;
+        let harness = crate::testing::TestHarnessBuilder::new()
+            .with_db(db)
+            .build()
+            .await;
+        let channels = Arc::new(ChannelManager::new());
+        let (stub, _sender) = crate::testing::StubChannel::new("stub");
+        let replies = stub.captured_responses_handle();
+        channels.add(Box::new(stub)).await;
+        let agent = Agent::new(
+            AgentConfig::for_testing(),
+            harness.deps,
+            channels,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        (agent, replies, db_dir)
+    }
+
+    /// Delivers `result` for `message`: whether the loop continues, and the outcome.
+    #[cfg(feature = "libsql")]
+    async fn rate(
+        agent: &Agent,
+        message: &IncomingMessage,
+        result: Result<Option<String>, crate::error::Error>,
+    ) -> (bool, TurnOutcome) {
+        let (control, outcome) = agent.deliver_message_result(message, result).await;
+        (matches!(control, MessageLoopControl::Continue), outcome)
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn deliver_message_result_rates_what_reached_the_channel() {
+        let (agent, replies, _db_dir) = stub_channel_agent().await;
+        let message = IncomingMessage::new("stub", "alice", "hello");
+        let reply_count = || replies.lock().map_or(0, |replies| replies.len());
+
+        let reply = Ok(Some("hi there".to_string()));
+        assert_eq!(
+            rate(&agent, &message, reply).await,
+            (true, TurnOutcome::Replied)
+        );
+        assert_eq!(reply_count(), 1);
+        // Empty suppression sentinels (approval prompt, inbound hook rejection, stale
+        // approval) are no reply.
+        let empty = Ok(Some(String::new()));
+        assert_eq!(
+            rate(&agent, &message, empty).await,
+            (true, TurnOutcome::NoReply)
+        );
+        // `Ok(None)` is the shutdown signal (and the silent `NO_REPLY` reply).
+        assert_eq!(
+            rate(&agent, &message, Ok(None)).await,
+            (false, TurnOutcome::NoReply)
+        );
+        let error = crate::error::Error::from(crate::error::JobError::NotFound {
+            id: uuid::Uuid::new_v4(),
+        });
+        assert_eq!(
+            rate(&agent, &message, Err(error)).await,
+            (true, TurnOutcome::Failed)
+        );
+        assert_eq!(reply_count(), 2, "the error reply");
+    }
+
+    /// A reply that a `BeforeOutbound` hook suppresses never reached `respond()`: the
+    /// message finishes `no_reply`, not `replied`.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn deliver_message_result_rates_a_hook_suppressed_reply_no_reply() {
+        let (agent, replies, _db_dir) = stub_channel_agent().await;
+        agent.hooks().register(Arc::new(RejectOutbound)).await;
+        let message = IncomingMessage::new("stub", "alice", "hello");
+
+        let reply = Ok(Some("hi there".to_string()));
+        assert_eq!(
+            rate(&agent, &message, reply).await,
+            (true, TurnOutcome::NoReply)
+        );
+        assert_eq!(replies.lock().map_or(0, |replies| replies.len()), 0);
+    }
+
+    #[test]
+    fn submission_outcome_hints_cover_paused_interrupted_and_error() {
+        let paused = SubmissionResult::NeedApproval {
+            request_id: uuid::Uuid::new_v4(),
+            tool_name: "shell".to_string(),
+            description: "Run a command".to_string(),
+            parameters: serde_json::json!({}),
+            allow_always: true,
+        };
+        assert_eq!(submission_outcome_hint(&paused), Some(TurnOutcome::Paused));
+        assert_eq!(
+            submission_outcome_hint(&SubmissionResult::Interrupted),
+            Some(TurnOutcome::Interrupted)
+        );
+        assert_eq!(
+            submission_outcome_hint(&SubmissionResult::error("boom")),
+            Some(TurnOutcome::Failed)
+        );
+        for plain in [
+            SubmissionResult::response("hello"),
+            SubmissionResult::ok_with_message(""),
+            SubmissionResult::Ok { message: None },
+            SubmissionResult::Suppressed,
+        ] {
+            assert_eq!(submission_outcome_hint(&plain), None);
+        }
+    }
+
+    /// DEC-1 (TUI design 8.4): remove together with `none_result_control` if declined.
+    #[test]
+    fn none_result_is_continue_for_client_channels() {
+        for channel in [
+            crate::channels::GATEWAY_CHANNEL,
+            crate::channels::UNIX_SOCKET_REPL_CHANNEL,
+        ] {
+            assert!(
+                matches!(none_result_control(channel), MessageLoopControl::Continue),
+                "{channel} must not stop the agent on Ok(None)"
+            );
+        }
+        // The in-process REPL's `/quit` and every other channel keep stopping the agent.
+        for channel in ["repl", "test", "xmpp", "http"] {
+            assert!(
+                matches!(none_result_control(channel), MessageLoopControl::Shutdown),
+                "{channel} must keep Ok(None) as the shutdown signal"
+            );
+        }
     }
 
     #[test]

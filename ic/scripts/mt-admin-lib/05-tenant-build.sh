@@ -760,7 +760,12 @@ build_candidate_worker() {
   _upgrade_validate_lane "$lane" || die "unknown worker lane '$lane'"
   ensure_container_runtime
   lw_root="$(tenant_lw_root "$name")"
-  tag="$(upgrade_candidate_image_ref "$name" "$lane")"
+  # LUNARWING_WORKER_IMAGE_TAG is the tag alone: every builder names its output
+  # worker_image_ref <lane> = lunarwing-worker-<lane>:<tag>, which is exactly
+  # upgrade_candidate_image_ref, the ref promote and cleanup use. Passing that
+  # full ref here built "lunarwing-worker-<lane>:lunarwing-worker-<lane>:wi527-
+  # <tenant>", an invalid reference, so every upgrade with a worker lane failed.
+  tag="$(_upgrade_candidate_tag_suffix "$name")"
   # run-294 TJ-6: the upgrade used to rebuild pebble slim unconditionally. The
   # image carries its build profile as a label (pebble4lunarwing/Dockerfile), so
   # a candidate keeps the profile of the :latest it will replace instead of

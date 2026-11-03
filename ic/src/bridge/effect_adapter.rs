@@ -21,9 +21,11 @@ use lunarwing_engine::{
 };
 
 use crate::bridge::auth_manager::{AuthCheckResult, AuthManager};
+use crate::bridge::generated_images::GeneratedImageStash;
 use crate::context::JobContext;
 use crate::db::{Database, SettingsStore};
 use crate::hooks::{HookEvent, HookOutcome, HookRegistry};
+use crate::tools::builtin::image_gen::{GeneratedImage, parse_image_sentinel};
 use crate::tools::permissions::PermissionState;
 use crate::tools::rate_limiter::RateLimiter;
 use crate::tools::{ApprovalRequirement, ToolRegistry};
@@ -52,6 +54,9 @@ pub struct EffectBridgeAdapter {
     /// Coordination gate: silently blocks all tool execution for agents
     /// disabled by coordination violations (ISSUE-003).
     coordination_gate: RwLock<Option<Arc<crate::gate::coordination::CoordinationGate>>>,
+    /// Images returned by image tools in channel threads, until the router
+    /// forwards their `ActionExecuted` event (TUI design 8.3.6).
+    generated_images: GeneratedImageStash,
 }
 
 impl EffectBridgeAdapter {
@@ -71,6 +76,7 @@ impl EffectBridgeAdapter {
             mission_manager: RwLock::new(None),
             auth_manager: RwLock::new(None),
             coordination_gate: RwLock::new(None),
+            generated_images: GeneratedImageStash::default(),
         }
     }
 
@@ -137,6 +143,42 @@ impl EffectBridgeAdapter {
     /// Get the mission manager if available.
     pub async fn mission_manager(&self) -> Option<Arc<lunarwing_engine::MissionManager>> {
         self.mission_manager.read().await.clone()
+    }
+
+    /// Takes the image the call `call_id` of `thread_id` returned, parked until the
+    /// router forwards that call's `ActionExecuted` event (TUI design 8.3.6).
+    pub(crate) fn take_generated_image(
+        &self,
+        thread_id: ThreadId,
+        call_id: &str,
+    ) -> Option<GeneratedImage> {
+        self.generated_images.take(thread_id, call_id)
+    }
+
+    /// Parks the image an image tool returned, read from the raw output before
+    /// sanitizing truncates it; the output the engine receives is unchanged. Only a
+    /// call with an id in a thread with a source channel is kept: no other call has a
+    /// channel event to deliver the image with.
+    fn stash_generated_image(
+        &self,
+        lookup_name: &str,
+        output: &str,
+        context: &ThreadExecutionContext,
+    ) {
+        if context.source_channel.is_none() {
+            return;
+        }
+        let Some(call_id) = context
+            .current_call_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+        else {
+            return;
+        };
+        if let Some(image) = parse_image_sentinel(lookup_name, output) {
+            self.generated_images
+                .put(context.thread_id, call_id.to_string(), image);
+        }
     }
 
     fn gate_paused(
@@ -1556,6 +1598,8 @@ impl EffectBridgeAdapter {
 
         match result {
             Ok(output) => {
+                // Before sanitizing truncates the sentinel (TUI design 8.3.6).
+                self.stash_generated_image(lookup_name, &output, context);
                 let sanitized = self.safety.sanitize_tool_output(lookup_name, &output);
                 // Parsing the original JSON would bypass truncation and redaction. Parsing
                 // sanitized but non-neutralized JSON would preserve role-token openers.
@@ -2463,6 +2507,156 @@ mod tests {
             Arc::new(SafetyLayer::new(&config)),
             Arc::new(HookRegistry::default()),
         )
+    }
+
+    /// A 1x1 PNG.
+    const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    /// Returns the image tools' sentinel under `name` without calling an image API.
+    struct SentinelTool(&'static str);
+
+    #[async_trait]
+    impl Tool for SentinelTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "Return the image sentinel"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {"prompt": {"type": "string"}}})
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &JobContext,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(crate::tools::builtin::image_gen::image_sentinel_output(
+                TINY_PNG_B64,
+                "a cat",
+                "1024x1024",
+                std::time::Duration::from_millis(1),
+            ))
+        }
+    }
+
+    async fn sentinel_adapter() -> EffectBridgeAdapter {
+        let adapter = make_adapter();
+        adapter
+            .tools
+            .register(Arc::new(SentinelTool("image_generate")))
+            .await;
+        adapter
+            .tools
+            .register(Arc::new(SentinelTool("sentinel_echo")))
+            .await;
+        adapter
+    }
+
+    fn channel_ctx(
+        thread_id: lunarwing_engine::ThreadId,
+        call_id: Option<&str>,
+        source_channel: Option<&str>,
+    ) -> lunarwing_engine::ThreadExecutionContext {
+        let mut context = exec_ctx(thread_id, call_id);
+        context.source_channel = source_channel.map(str::to_string);
+        context
+    }
+
+    async fn run_sentinel_tool(
+        adapter: &EffectBridgeAdapter,
+        tool: &str,
+        context: &lunarwing_engine::ThreadExecutionContext,
+    ) -> ActionResult {
+        adapter
+            .execute_action(
+                tool,
+                serde_json::json!({"prompt": "a cat"}),
+                &lease(),
+                context,
+            )
+            .await
+            .expect("sentinel tool should execute")
+    }
+
+    #[tokio::test]
+    async fn image_sentinel_is_stashed_for_channel_threads_only() {
+        let adapter = sentinel_adapter().await;
+        let thread_id = lunarwing_engine::ThreadId::new();
+
+        // A channel thread's image call is parked under its thread and call id.
+        let gateway = channel_ctx(thread_id, Some("img-1"), Some("gateway"));
+        run_sentinel_tool(&adapter, "image_generate", &gateway).await;
+        let image = adapter
+            .take_generated_image(thread_id, "img-1")
+            .expect("image parked for the router");
+        assert_eq!(
+            image.data_url,
+            format!("data:image/png;base64,{TINY_PNG_B64}")
+        );
+        assert_eq!(adapter.take_generated_image(thread_id, "img-1"), None);
+
+        // No channel to deliver to (missions, background threads), no call id to
+        // match, or a tool other than an image tool: nothing is parked.
+        let cases = [
+            (
+                "image_generate",
+                channel_ctx(thread_id, Some("img-2"), None),
+            ),
+            (
+                "image_generate",
+                channel_ctx(thread_id, None, Some("gateway")),
+            ),
+            (
+                "image_generate",
+                channel_ctx(thread_id, Some(""), Some("gateway")),
+            ),
+            (
+                "sentinel_echo",
+                channel_ctx(thread_id, Some("img-3"), Some("gateway")),
+            ),
+        ];
+        for (tool, context) in &cases {
+            run_sentinel_tool(&adapter, tool, context).await;
+            assert_eq!(adapter.generated_images.len(), 0, "{tool} {context:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn image_sentinel_output_to_engine_unchanged() {
+        let adapter = sentinel_adapter().await;
+        let thread_id = lunarwing_engine::ThreadId::new();
+        let stashed = run_sentinel_tool(
+            &adapter,
+            "image_generate",
+            &channel_ctx(thread_id, Some("img-1"), Some("gateway")),
+        )
+        .await;
+        let plain = run_sentinel_tool(
+            &adapter,
+            "image_generate",
+            &channel_ctx(thread_id, Some("img-2"), None),
+        )
+        .await;
+        assert!(adapter.take_generated_image(thread_id, "img-1").is_some());
+
+        // Parking the image changes nothing the engine (and the model) receives.
+        assert!(!stashed.is_error);
+        assert_eq!(stashed.output, plain.output);
+        let text = stashed
+            .output
+            .as_str()
+            .expect("the text sentinel crosses the boundary as a string");
+        let sentinel: serde_json::Value =
+            serde_json::from_str(text).expect("the sentinel is still JSON");
+        assert_eq!(sentinel["type"], "image_generated");
+        assert_eq!(
+            sentinel["data"],
+            format!("data:image/png;base64,{TINY_PNG_B64}")
+        );
     }
 
     fn parsed_cron_expression(value: &str) -> String {
