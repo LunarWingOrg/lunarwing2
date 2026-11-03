@@ -1,11 +1,11 @@
-# v2.1.2 resolves to this reviewed commit. Both must move together.
+# v2.2.5 resolves to this reviewed commit. Both must move together.
 # OpenCode 2 is beta in practice (upstream's own migration doc: "server and
 # plugin APIs may continue to change"). This lane is deliberately SEPARATE
-# from the proven v1 worker (opencode4lunarwing, pinned v1.18.25) so tenants
+# from the proven v1 worker (opencode4lunarwing, pinned v1.19.5) so tenants
 # opt into v2 explicitly — see docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md.
 # Re-bump only after re-verifying the bridge against the v2 server API.
-ARG OPENCODE_VERSION=v2.1.2
-ARG OPENCODE_REF=a517687fde98a7329ada3ae644a01a9fc6c4e99e
+ARG OPENCODE_VERSION=v2.2.5
+ARG OPENCODE_REF=9bbb8ce18c80f099e0e448775f59d965ead40a21
 ARG DEBIAN_SNAPSHOT=20261024T011300Z
 ARG SOURCE_REVISION=unknown
 
@@ -41,14 +41,9 @@ RUN printf '%s' "${OPENCODE_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
     git -C /build/opencode tag --force "${OPENCODE_VERSION}" "${OPENCODE_REF}"
 
 WORKDIR /build/opencode
-# Bun 1.4.4 (unlike <= 1.4.2) rejects the pinned photon-node patch's hunk-10
-# context lines that carry one stray leading space ("hunk #10 does not apply
-# to photon_rs.js"). Upstream commit 61845b0 trims the stray spaces; the
-# patched photon_rs.js is byte-identical under 1.3.14/1.4.2/1.4.4. Apply the
-# same whitespace repair before bun install. The script fails the build if
-# upstream ever lands the fix itself, so the in-tree repair can be dropped.
-COPY scripts/fix_photon_patch_context.py /build/fix_photon_patch_context.py
-RUN python3 /build/fix_photon_patch_context.py /build/opencode
+# The Bun 1.4.4 photon-node hunk-10 repair (upstream 61845b0) that this lane
+# used to apply at the v2.1.2 pin is retired: v2.2.5 carries that whitespace
+# repair as a content-equivalent backport, so the fixer is redundant.
 RUN bun install --frozen-lockfile && bun pm cache rm
 
 # WI#369 compile-time SDK gate: typecheck the bridge's SDK-facing scripts
@@ -57,10 +52,9 @@ RUN bun install --frozen-lockfile && bun pm cache rm
 # sdk_surface_assert.ts existence/membership gate cannot see). A pinned-SDK
 # argument or payload rename now fails the image build here instead of at
 # runtime. The native TypeScript compiler ships in the monorepo's pinned
-# devDependencies (@typescript/native, npm:typescript@7.0.2, see bun.lock)
-# so no new fetch is introduced; at v2.1.2 the binary is tsc — v2.0.32's
-# @typescript/native-preview shipped it as tsgo — and --noEmit writes
-# nothing into the layer.
+# devDependencies (@typescript/native, npm:typescript@7.1.0-beta at this pin,
+# see bun.lock) so no new fetch is introduced; the binary is tsc and --noEmit
+# writes nothing into the layer.
 COPY scripts/ /build/lunarwing/scripts/
 RUN /build/opencode/node_modules/.bin/tsc --noEmit \
       -p /build/lunarwing/scripts/tsconfig.sdk-surface.json
@@ -422,7 +416,6 @@ RUN set -eu; \
     && python3 scripts/entrypoint_config_test.py \
     && python3 scripts/compile_out_remote_tunnel_test.py \
     && python3 scripts/runtime_smoke_test.py \
-    && python3 scripts/fix_photon_patch_context_test.py \
     && for leaked in /root/.bun /root/.local /root/.cache /root/.config; do \
            [ ! -e "$leaked" ] \
            || { echo "FATAL: build-time self-tests leaked per-build state at $leaked — refusing to bake a non-reproducible layer" >&2; exit 1; }; \

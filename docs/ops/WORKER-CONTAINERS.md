@@ -25,16 +25,19 @@ The image's source revision `38afee6c` pins
 [Brotli v1.2.1](https://github.com/oven-sh/bun/blob/38afee6c84fcf48c0edb2466aa4b27d287a59c30/scripts/build/deps/brotli.ts),
 replacing Bun 1.4.2's vulnerable v1.1.0. Both OCI indexes include amd64 and arm64.
 
-At the current OpenCode v1.18.25 / v2.1.2 pins, Bun 1.4.4 rejects the upstream
-photon-node patch's hunk-10 context whitespace. Each builder runs
+At the OpenCode v1.18.25 / v2.1.2 pins, Bun 1.4.4 rejected the upstream
+photon-node patch's hunk-10 context whitespace, and each builder ran
 `python3 /build/fix_photon_patch_context.py /build/opencode` immediately after
 checkout and before `bun install --frozen-lockfile`, backporting upstream
-`61845b0`'s three-space repair. The guard is byte-preserving, requires exactly
-one buggy block, and fails on drift or an already-fixed patch. The protected
-`worker-opencode2-candidate` run is the first v2.1.2 install/build proof: the
-recorded local install reproduction is v1.18.25 only. Neither a matching
-upstream patch blob nor the self-tests prove a reproducible compiled v2 image.
-See bump checklist item 7 below before moving either pin past the upstream fix.
+`61845b0`'s three-space repair. **That repair is retired as of the v1.19.5 /
+v2.2.5 pins (WI#531):** both trees carry the repair in content (a
+content-equivalent backport — neither tag contains the commit itself, so do
+not test it with `merge-base --is-ancestor`), so the fixer's exact-match
+guard reports the repair as redundant. The fixer files, their
+Dockerfile `COPY`/`RUN` and self-test invocations, and the two `input_files`
+entries per lane are gone together; Bun was not downgraded and the drift
+guard was not weakened. See bump checklist item 7 below before moving either
+pin.
 
 Rebuild worker images and recreate tenant containers to deploy these fixes.
 Protected candidate reproducibility and all four scan jobs must pass before
@@ -655,8 +658,8 @@ plus `opencode service set remote true` and `opencode pair` surfaces. !1490
 completed analysis and approval to cross that boundary at v2.0.32**, through
 the existing compile-out, wrapper, config and image assertions. See the
 v2.0.32 bump entry below for the source review and verification status; the
-lane has since advanced to **v2.1.2** (2026-10-21, goals item 83) with every
-gate re-verified against a fresh clone — see the v2.1.2 bump entry.
+lane has since advanced to **v2.2.5** (2026-11-02, WI#531) with every gate
+re-verified against a fresh clone — see the v2.2.5 bump entry.
 
 **Gate record for !1490 (run-79 EI-2):** the in-image layers below (ruleset,
 wrapper, config pins, compile-out) are **naive-use guards, not a boundary**
@@ -745,8 +748,8 @@ Enforced controls (opencode2 lane unless noted):
    invoke the real binary directly.
 3. **Session sharing pinned off; auto-update silenced.** `"share": "disabled"` in both
    `opencode2.4lunarwing/config/opencode2.json` and
-   `opencode4lunarwing/config/opencode.json` (v1 schema supports it at
-   v1.18.25), plus `"update": "disable"` in the v2 lane config so an upstream
+   `opencode4lunarwing/config/opencode.json` (v1's `ConfigV1.Info` still
+   declares `share` at v1.19.5), plus `"update": "disable"` in the v2 lane config so an upstream
    default flip cannot re-enable publication. **The `update` pin does not
    reach the updater** (run-158 KG-3 / !1699 JE-3): the updater's
    `readPolicy()` reads only the global config dir, never `OPENCODE_CONFIG`.
@@ -911,8 +914,9 @@ Enforced controls (opencode2 lane unless noted):
    surface. For opencode2 bumps past v2.0.24 the compile-out guard (8) plus
    these guards cover the *shipped binary*; against a compromised agent
    only control 1 makes the crossing safe (see the gate record above).
-   **Photon-node repair retirement:** when a new OpenCode pin includes
-   upstream `61845b0`, `fix_photon_patch_context.py` deliberately fails with
+   **Photon-node repair retirement:** when a new OpenCode pin carries the
+   `61845b0` whitespace repair in content (a backport; the tag need not
+   contain the commit), `fix_photon_patch_context.py` deliberately fails with
    "already carries the fixed whitespace". For each affected lane, remove
    both `scripts/fix_photon_patch_context{,_test}.py` files, the Dockerfile's
    fixer COPY/RUN before `bun install`, its self-test invocation, and the two
@@ -922,10 +926,16 @@ Enforced controls (opencode2 lane unless noted):
    both OpenCode scans and `worker-opencode2-exposure-verify` before claiming
    acceptance; getting past install can still expose WI#510-class binary/layer
    nondeterminism. Items 28 and 95 stay unchecked until that evidence exists.
+   **WI#369 typecheck compiler:** the gate runs whatever `@typescript/native`
+   the upstream lock pins. Check its version on every bump: v2.2.5 moved it
+   from `npm:typescript@7.0.2` to a `7.1.0-beta`; a beta compiler in a build
+   gate is acceptable only while it is upstream's own pinned devDependency,
+   resolved through the committed lock, and still exposes `tsc` at `bin/tsc`.
+   Record the version and the binary path in the bump entry.
 8. **Compile the tunnel out.** `scripts/compile_out_remote_tunnel.py` runs
    in the builder stage: the historical v2.0.24 path verifies there is no
-   tunnel surface; at the current v2.1.2 pin it replaces `remote-tunnel.ts`
-   with a fail-closed stub (re-verified against the real v2.1.2 tree:
+   tunnel surface; at the current v2.2.5 pin it replaces `remote-tunnel.ts`
+   with a fail-closed stub (re-verified against the real v2.2.5 tree:
    importers still use exactly
    `run`/`ensure`/`hostname`). Drift detection scans
    `packages/{cli,server,schema,core}/src` (`*.ts` and `*.tsx`), matches
@@ -965,11 +975,15 @@ The service-config reset is not an egress boundary.
 Control 11 audit of the other lanes (2026-10-12, against pinned sources;
 re-checked 2026-10-13):
 
-- **opencode v1 (v1.18.25):** no service mode, no pairing, no tunnel (all
-  v2-era surfaces). Session sharing existed and is now pinned
-  `"share": "disabled"`. v1.18.25's `serve` has **no auth support at all**
-  (no password — the containment is the loopback bind plus host-loopback
-  publishing, verified live under control 9).
+- **opencode v1 (v1.19.5):** no service mode, no pairing, no tunnel (all
+  v2-era surfaces). Session sharing exists and is pinned
+  `"share": "disabled"`. v1's `serve` does honour
+  `OPENCODE_SERVER_PASSWORD`, but this lane never sets one and its bridge
+  sends no credential, so the containment is the loopback bind plus
+  host-loopback publishing, verified live under control 9 — the same reason
+  the v2-only password invariant in `exposure_policy_assert.py` is scoped
+  that way. Adopting the v2 lane's per-boot shared password is an option if
+  the in-pod loopback ever needs hardening.
 - **kimi (2.1.1):** no server mode, pairing, sharing, or tunnel in the lane;
   `kimi -p` is spawned per task. `telemetry = false` is pinned in
   `config/config.toml`, and so is `max_output_size = 131072` on the baked
@@ -1129,27 +1143,30 @@ sudo ic/scripts/lunarwing-mt-admin.sh build-tenant <name> --with-opencode
 sudo ic/scripts/lunarwing-mt-admin.sh build-opencode-worker --with-toolchains
 ```
 
-The default image is slim and does not contain Rust, Go, or C/C++ toolchains. Build with `--with-toolchains` when worker jobs must compile or test code; the toolchain image uses Rust 1.96.1. Modes: `--mode websocket` (default, persistent) or `--mode cli` (one-shot; prompt via `TASK_PROMPT`). Requires `AGENT_AUTH_TOKEN` for WebSocket auth. Supports per-tenant model/base-URL overrides via `configure-opencode <name> [--model <m>] [--base-url <url>]`, optional Paseo MCP integration (`PASEO_URL`/`PASEO_TOKEN`), and SSH agent socket bind-mounting. `configure-study-mcp <name> [--home <absolute-checkout>]` gives core and OpenCode the same lw2studymcp data. Without `--home` it uses the shared default checkout (`/var/cache/lunarwing/lw2studymcp`, override with `LUNARWING_MT_STUDY_NOTES_HOME`) and always syncs it to the latest upstream (`LUNARWING_MT_STUDY_NOTES_REPO`, default `https://git.lunarwing.org/cmc/lw2studymcp.git`) first — cloning when missing, fast-forwarding a clean checkout, and refusing to touch a dirty or non-git directory. `--sync` applies the same update to an explicit `--home`. `add-tenant <name> --with-study-mcp [--study-mcp-home <path>]` runs this auto-configuration (read-only) during provisioning so a new tenant starts with current knowledge of the LunarWing codebase. `--allow-write` enables approved core-agent mutations in separate state; OpenCode always receives code and state read-only at `/opt/lw2studymcp` and `/var/lib/lw2studymcp`. OpenCode is pinned to **v1.18.25**, fetched by reviewed full commit `cb7d8b2f5e44876ef98b661dc10590c915af3a9f` (reverted from v1.18.29 on 2026-09-07: that release crashes on model entries lacking full metadata shape and dies silently in its ai-sdk stream path — see the Dockerfile pin note; re-bump only after both regressions are fixed upstream); `OPENCODE_REF` accepts only a full SHA, the checkout is verified, and a frozen Bun lock is mandatory. The release and SHA are baked into `OPENCODE_IMAGE_REF` as `v1.18.25@<full-sha>` and reported together as `opencode_ref`. Base images, Debian indexes, and optional toolchain downloads are also pinned. See `opencode4lunarwing/README.md` for the full environment reference.
+The default image is slim and does not contain Rust, Go, or C/C++ toolchains. Build with `--with-toolchains` when worker jobs must compile or test code; the toolchain image uses Rust 1.96.1. Modes: `--mode websocket` (default, persistent) or `--mode cli` (one-shot; prompt via `TASK_PROMPT`). Requires `AGENT_AUTH_TOKEN` for WebSocket auth. Supports per-tenant model/base-URL overrides via `configure-opencode <name> [--model <m>] [--base-url <url>]`, optional Paseo MCP integration (`PASEO_URL`/`PASEO_TOKEN`), and SSH agent socket bind-mounting. `configure-study-mcp <name> [--home <absolute-checkout>]` gives core and OpenCode the same lw2studymcp data. Without `--home` it uses the shared default checkout (`/var/cache/lunarwing/lw2studymcp`, override with `LUNARWING_MT_STUDY_NOTES_HOME`) and always syncs it to the latest upstream (`LUNARWING_MT_STUDY_NOTES_REPO`, default `https://git.lunarwing.org/cmc/lw2studymcp.git`) first — cloning when missing, fast-forwarding a clean checkout, and refusing to touch a dirty or non-git directory. `--sync` applies the same update to an explicit `--home`. `add-tenant <name> --with-study-mcp [--study-mcp-home <path>]` runs this auto-configuration (read-only) during provisioning so a new tenant starts with current knowledge of the LunarWing codebase. `--allow-write` enables approved core-agent mutations in separate state; OpenCode always receives code and state read-only at `/opt/lw2studymcp` and `/var/lib/lw2studymcp`. OpenCode is pinned to **v1.19.5** (WI#531), fetched by reviewed full commit `810c0eba1a7348036f8bdf61e6632d0c36c6876c` (v1.18.29 was reverted on 2026-09-07: that release crashes on model entries lacking full metadata shape and dies silently in its ai-sdk stream path — see the Dockerfile pin note. Neither regression is verified fixed at v1.19.5; the WI#531 move is authorized while the lane is expected to retire, and one live v1 dispatch on a test tenant after the first master candidate build is the settling step); `OPENCODE_REF` accepts only a full SHA, the checkout is verified, and a frozen Bun lock is mandatory. The release and SHA are baked into `OPENCODE_IMAGE_REF` as `v1.19.5@<full-sha>` and reported together as `opencode_ref`. Base images, Debian indexes, and optional toolchain downloads are also pinned. See `opencode4lunarwing/README.md` for the full environment reference.
 
 Agent-facing dispatch uses `create_job(title: "...", description: "...", mode: "opencode")` in both legacy and Engine V2 chat paths. `opencode` is a named job execution backend, not an extension, MCP server, skill, routine, or SSH host; no registry search or installation is involved.
 
-**Known issue (WI#320 F4, tracked as WI#333; WI#374 reported the same crash on a 2.1.6.0 test tenant):** at the pinned v1.18.25 the `mode: "opencode"` lane is broken in the LunarWing worker shape — every task fails with `external worker 'opencode' failed: Unexpected server error` because `opencode serve` crashes in `SystemPrompt.environment` (`undefined is not an object (evaluating 'a.name')`) while assembling the prompt, before any model call, and answers the SDK with that bare HTTP 500 wrapper. No config remediation (base-URL override, MCP/plugin strip, git-init workspace) avoids it, and v1.18.29 is worse (see the pin note above), so the lane cannot be fixed from this repo until upstream ships a fix; the opencode2 lane below is the working one. To surface the root cause, the worker attaches a bounded, ref-correlated, error-level tail of serve's own structured log (`$XDG_DATA_HOME|~/.local/share/opencode/log/opencode.log` — verified at the pinned ref: serve logs 500 causes there as `level=ERROR` lines with a unique `ref=` id, and the 500 body carries the same ref) to these job errors — only the failing request's line attaches, and a 500 without a ref attaches nothing — so the crash's real stack line reaches `list_jobs`/`job_status`. The v1 lane is expected to be retired in v2.1.7.0 (goals item 34: "prob rm opencode v1 in .1.7.0").
+**Known issue (WI#320 F4, tracked as WI#333; WI#374 reported the same crash on a 2.1.6.0 test tenant):** at the v1.18.25 pin the `mode: "opencode"` lane was broken in the LunarWing worker shape — every task fails with `external worker 'opencode' failed: Unexpected server error` because `opencode serve` crashes in `SystemPrompt.environment` (`undefined is not an object (evaluating 'a.name')`) while assembling the prompt, before any model call, and answers the SDK with that bare HTTP 500 wrapper. No config remediation (base-URL override, MCP/plugin strip, git-init workspace) avoids it, and v1.18.29 is worse (see the pin note above), so the lane cannot be fixed from this repo until upstream ships a fix; the opencode2 lane below is the working one. To surface the root cause, the worker attaches a bounded, ref-correlated, error-level tail of serve's own structured log (`$XDG_DATA_HOME|~/.local/share/opencode/log/opencode.log` — verified at the pinned ref: serve logs 500 causes there as `level=ERROR` lines with a unique `ref=` id, and the 500 body carries the same ref) to these job errors — only the failing request's line attaches, and a 500 without a ref attaches nothing — so the crash's real stack line reaches `list_jobs`/`job_status`. **The v1.19.5 bump (WI#531) does not change this:** `sys.environment(model)` and the surrounding prompt assembly are byte-identical at both tags, so the crash path is carried forward untested and no live dispatch has run at v1.19.5. The v1 lane is expected to be retired (goals item 34: "prob rm opencode v1 in .1.7.0").
 
-**Reproducible build input (WI#467, 2026-10-23):** the pinned v1.18.25 build compiles a models.dev catalog into the binary. At `cb7d8b2f`, `packages/opencode/script/generate.ts` reads it from the file named by `MODELS_DEV_API_JSON` when set, and otherwise fetches `${OPENCODE_MODELS_URL:-https://models.dev}/api.json` live; `script/build.ts` then passes the text to `Bun.build` as the `OPENCODE_MODELS_DEV` define, so the catalog is compiled in as code. Until WI#467 the Dockerfile never set the variable, so the binary changed whenever models.dev published between the candidate build and the `--no-cache` rebuild, and the clean-rebuild gate failed on master. The lane now carries a reviewed snapshot at `opencode4lunarwing/models-dev/api.json` (fetched from models.dev @ `a051b3ca330b`, 2026-10-23), committed pretty-printed so a refresh diffs line by line; the minified bundle is byte-identical to the one built from the one-line form. Its sha256 is pinned as the Dockerfile's `MODELS_DEV_SNAPSHOT_SHA256` ARG (not `*_API_JSON_*`: gitleaks' generic-api-key rule reads an ARG whose name contains `API` and whose value is 64 hex as a leaked key). `validate_config.py` cross-checks the pin, requires the snapshot to be strict JSON (one non-empty object, no duplicate keys, no NaN/Infinity) in the canonical pretty layout, and pins the builder-stage tail from `WORKDIR /build/opencode/packages/opencode` to the next `FROM` instruction by instruction (`OPENCODE_MODELS_DEV_BUILD_STEPS`). The build RUN verifies the hash, runs `scripts/check_models_dev_snapshot.py` (strict JSON, and `generate.ts` must still read both env vars), and builds with `OPENCODE_MODELS_URL=http://127.0.0.1:9`, so an upstream that ignores the snapshot and fetches anyway fails the build instead of compiling a live catalog. Both files hash into the opencode `worker-inputs.sha256`. **Bump checklist addition:** refreshing the snapshot is a deliberate commit: write the canonical form (`curl -fsS https://models.dev/api.json | python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin), indent=1, ensure_ascii=False))' > opencode4lunarwing/models-dev/api.json`), update `MODELS_DEV_SNAPSHOT_SHA256` to match (`sha256sum opencode4lunarwing/models-dev/api.json`), and record the models.dev commit/date here. An `OPENCODE_REF` bump re-checks `generate.ts` and updates `OPENCODE_MODELS_DEV_BUILD_STEPS` in the same commit if the build step changes.
+**Reproducible build input (WI#467, 2026-10-23):** the pinned v1.19.5 build compiles a models.dev catalog into the binary. At `810c0eba` (and identically at the previous `cb7d8b2f`), `packages/opencode/script/generate.ts` reads it from the file named by `MODELS_DEV_API_JSON` when set, and otherwise fetches `${OPENCODE_MODELS_URL:-https://models.dev}/api.json` live; `script/build.ts` then passes the text to `Bun.build` as the `OPENCODE_MODELS_DEV` define, so the catalog is compiled in as code. Until WI#467 the Dockerfile never set the variable, so the binary changed whenever models.dev published between the candidate build and the `--no-cache` rebuild, and the clean-rebuild gate failed on master. The lane now carries a reviewed snapshot at `opencode4lunarwing/models-dev/api.json` (fetched from models.dev @ `a051b3ca330b`, 2026-10-23), committed pretty-printed so a refresh diffs line by line; the minified bundle is byte-identical to the one built from the one-line form. Its sha256 is pinned as the Dockerfile's `MODELS_DEV_SNAPSHOT_SHA256` ARG (not `*_API_JSON_*`: gitleaks' generic-api-key rule reads an ARG whose name contains `API` and whose value is 64 hex as a leaked key). `validate_config.py` cross-checks the pin, requires the snapshot to be strict JSON (one non-empty object, no duplicate keys, no NaN/Infinity) in the canonical pretty layout, and pins the builder-stage tail from `WORKDIR /build/opencode/packages/opencode` to the next `FROM` instruction by instruction (`OPENCODE_MODELS_DEV_BUILD_STEPS`). The build RUN verifies the hash, runs `scripts/check_models_dev_snapshot.py` (strict JSON, and `generate.ts` must still read both env vars), and builds with `OPENCODE_MODELS_URL=http://127.0.0.1:9`, so an upstream that ignores the snapshot and fetches anyway fails the build instead of compiling a live catalog. Both files hash into the opencode `worker-inputs.sha256`. `scripts/check_models_dev_snapshot.py` exits 0 against
+v1.19.5's `generate.ts` and the committed snapshot, so the WI#531 bump left
+the pin, the file and `OPENCODE_MODELS_DEV_BUILD_STEPS` unchanged.
+**Bump checklist addition:** refreshing the snapshot is a deliberate commit: write the canonical form (`curl -fsS https://models.dev/api.json | python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin), indent=1, ensure_ascii=False))' > opencode4lunarwing/models-dev/api.json`), update `MODELS_DEV_SNAPSHOT_SHA256` to match (`sha256sum opencode4lunarwing/models-dev/api.json`), and record the models.dev commit/date here. An `OPENCODE_REF` bump re-checks `generate.ts` and updates `OPENCODE_MODELS_DEV_BUILD_STEPS` in the same commit if the build step changes.
 
 ## OpenCode 2 Worker (opencode2)
 
 The OpenCode **2** lane, run as a separate external worker per
 `docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md`. v1 stays the default and
-keeps its v1.18.25 pin (last dispatch-verified release; see the known
-issue above); v2 is opt-in per tenant until upstream's
-2.0.x patch stack settles. Do not configure both lanes on the same
+keeps its v1.19.5 pin (v1.18.25 was the last dispatch-verified release; see
+the known issue above); v2 is opt-in per tenant until upstream's patch
+stack settles. Do not configure both lanes on the same
 tenant during the transition (agent routing confusion — plan §5).
 
 **Dockerfile:** `opencode2.4lunarwing/Dockerfile` — pinned to
-**v2.1.2** at reviewed full commit
-`a517687fde98a7329ada3ae644a01a9fc6c4e99e` (WI#427 boundary crossing first
-crossed at v2.0.32/`843a6c514e606b436a7fe713422ace0a93ad3d61`); the v2 bridge uses
+**v2.2.5** at reviewed full commit
+`9bbb8ce18c80f099e0e448775f59d965ead40a21` (WI#531; WI#427 boundary crossing
+first crossed at v2.0.32/`843a6c514e606b436a7fe713422ace0a93ad3d61`); the v2 bridge uses
 `@opencode/client` (promise API) instead of `@opencode-ai/sdk`, and the
 v2 config file is `config/opencode2.json` (`providers` map,
 `settings.baseURL`, `package`). Container UID/GID is **10003**
@@ -1666,6 +1683,80 @@ boot. Upstream adds the `project.time_archived` column and migrates Azure
 CLI credential records from OAuth tokens to external credentials. An image
 downgrade alone is not a verified database rollback; restore the matching
 pre-upgrade state with the prior image if rollback is needed.
+
+### v2.2.5 bump — WI#531, item 30 (2026-11-02)
+
+**Authorization:** the WI#427 boundary crossing (OpenTunnel compile-out,
+wrapper, config and image assertions) remains the standing control set for
+every v2 pin; this bump re-verified each gate against the pinned source
+rather than trusting the previous pin's review. The tag was independently
+resolved with `git ls-remote` to
+`9bbb8ce18c80f099e0e448775f59d965ead40a21` (lightweight tag resolving
+directly to the commit; the `--depth 1` clone's HEAD matches). Dockerfile
+defaults and the CI case block moved together. The Bun base digest and
+`DEBIAN_SNAPSHOT` are unchanged (WI#361 owns those).
+
+**Photon-node repair retired.** v2.2.5 carries the `61845b0` whitespace
+repair as a content-equivalent backport, so
+`fix_photon_patch_context.py` fails its exact-match guard with "already
+carries the fixed whitespace" — the documented retirement signal. Removed in
+this bump: both `scripts/fix_photon_patch_context{,_test}.py` files, the
+Dockerfile fixer `COPY`/`RUN` before `bun install`, its runtime self-test
+invocation, and this lane's two `input_files` entries in
+`.gitlab/scripts/build-worker-image.sh`. Bun was not downgraded and the
+drift guard was not weakened.
+
+**Gate re-verification on the fresh v2.2.5 clone:**
+
+- compile-out guard: `packages/cli/src/services/remote-tunnel.ts` unchanged
+  in path and importer surface (`run`/`ensure`/`hostname` exactly); after
+  stubbing, no scanned source under `packages/{cli,server,schema,core}/src`
+  keeps an `@opentunnel` specifier. `@opentunnel/client` stays
+  declared-but-unimported, and the runtime binary marker scan remains
+  mandatory.
+- reproducible-build anchors: `script/build.ts` still sets `bytecode`/`splitting`
+  and takes `--single`; the patch script exits 0 on the pinned tree.
+- SDK surface (`sdk_surface_assert` against the pinned client): 6 bridge
+  method paths present (`session.create/prompt/interrupt`, `permission.reply`,
+  `event.subscribe`, top-level `message.list`), the 2 known-stale paths still
+  absent (`session.message` exposes only `get`; `permission` is a top-level
+  group), and all 8 bridge event names are member literals of the pinned
+  generated V2Event union (98 members; only `V2EventRpc` is a dynamic
+  template family and is correctly not gateable).
+- builder-stage WI#369 typecheck gate: **version move, same binary** —
+  upstream's compiler pin is `@typescript/native` (npm:typescript@7.1.0-beta
+  at this pin, was 7.0.2 at v2.1.2). Its bin is still `tsc` at `bin/tsc`, so
+  the Dockerfile invocation is unchanged; `tsc --noEmit -p
+  tsconfig.sdk-surface.json` exits **0** against the pinned types.
+- behavior pins: Code Mode `session_move`/`session_rename` still carry no
+  permission assert of their own (KL-1/KL-2 deny rules stay required);
+  `service.json` keeps the `{disabled, remote: {route}, hostname, port,
+  password, cors, env}` shape with the legacy boolean-`remote` reader, so the
+  boot reset stays valid; `pair --remote` consent still exists and the
+  wrapper refusals cover it; `updater.ts` still honours
+  `OPENCODE_DISABLE_AUTOUPDATE` (the live switch — the lane config's
+  `update: "disable"` is not read by `readPolicy()`, which only reads the
+  global config dir). The exposure wrapper still refuses
+  `service set remote true` with exit 77.
+- new binary input: v2.2.5 replaces the separate `@opencode-ai/pty` 0.3.1
+  package with the in-tree `packages/process-daemon` (the Rust `opencode-pty`
+  0.4.0 service), shipped through npm optional platform packages
+  (`@opencode/pty` 0.4.0). It listens on a private per-uid Unix socket under
+  `/tmp/opencode-pty-<uid>/` with a token from a 0600 registration file and
+  opens no inbound network path, so the runtime listener check is unaffected.
+  The candidate/clean-rebuild digest comparison covers the new binary input.
+- in-host lane suites: `compile_out_remote_tunnel_test` 10/10,
+  `exposure_policy_assert_test` pass, `sdk_surface{,_assert}_test` pass.
+
+**Not verified here (honest gaps):** the bridge/executor/plugin suite needs
+the `@opencode/client` workspace link that only a full Bun 1.4.4 image build
+creates; this host runs Bun 1.3.1, so `opencode_task_executor_test.ts` fails
+to resolve `@opencode/client/promise` and was not counted as evidence. The
+protected `worker-opencode2-candidate` digest comparison,
+`worker-opencode2-scan`, and `worker-opencode2-exposure-verify` jobs remain
+the acceptance gate, followed by `mt-admin build-opencode2-worker` +
+`restart-tenant` and the live listener audit. No image has been built from
+this pin yet.
 
 ### v2.1.2 bump — item 83 (2026-10-21)
 

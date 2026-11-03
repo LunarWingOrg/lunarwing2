@@ -1,12 +1,17 @@
-# v1.18.25 resolves to this reviewed commit. Both must move together.
-# PINNED BACK from v1.18.29: that release ships two regressions hit live on
-# brightdawn 2026-09-07 — (1) provider/model resolution crashes on config
-# model entries lacking the full metadata shape ("a.name" TypeError), and
-# (2) the ai-sdk stream path dies silently between "llm runtime selected"
-# and the first chunk. v1.18.25 is the last version proven end-to-end in
-# this worker. Re-bump only after both are fixed upstream.
-ARG OPENCODE_VERSION=v1.18.25
-ARG OPENCODE_REF=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
+# v1.19.5 resolves to this reviewed commit. Both must move together.
+# v1.18.29 was reverted on 2026-09-07 because it shipped two regressions: the
+# provider/model metadata-shape crash ("a.name" TypeError) and a silent death
+# in the ai-sdk stream path. WI#531 moves to v1.19.5 on the WI's authorization;
+# neither v1.18.29 regression has been verified fixed upstream at v1.19.5 and
+# no live dispatch has run, so both remain open risks on this pin. The lane is
+# expected to be retired (goals item 34); re-bump only after re-verifying the
+# bridge against the v1 server API, and run one live v1 dispatch on a test
+# tenant after the first master candidate build.
+# The pin also carries the 61845b0 whitespace repair (content-equivalent
+# backport, not the commit itself), so the in-tree photon-node hunk repair is
+# gone.
+ARG OPENCODE_VERSION=v1.19.5
+ARG OPENCODE_REF=810c0eba1a7348036f8bdf61e6632d0c36c6876c
 ARG DEBIAN_SNAPSHOT=20261024T011300Z
 # WI#467: sha256 of the committed models.dev snapshot (models-dev/api.json)
 # the upstream build compiles into the binary instead of fetching live.
@@ -53,14 +58,9 @@ RUN printf '%s' "${OPENCODE_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
     git -C /build/opencode tag --force "${OPENCODE_VERSION}" "${OPENCODE_REF}"
 
 WORKDIR /build/opencode
-# Bun 1.4.4 (unlike <= 1.4.2) rejects the pinned photon-node patch's hunk-10
-# context lines that carry one stray leading space ("hunk #10 does not apply
-# to photon_rs.js"). Upstream commit 61845b0 trims the stray spaces; the
-# patched photon_rs.js is byte-identical under 1.3.14/1.4.2/1.4.4. Apply the
-# same whitespace repair before bun install. The script fails the build if
-# upstream ever lands the fix itself, so the in-tree repair can be dropped.
-COPY scripts/fix_photon_patch_context.py /build/fix_photon_patch_context.py
-RUN python3 /build/fix_photon_patch_context.py /build/opencode
+# The Bun 1.4.4 photon-node hunk-10 repair (upstream 61845b0) that this lane
+# used to apply at the v1.18.25 pin is retired: v1.19.5 carries that whitespace
+# repair as a content-equivalent backport, so the fixer is redundant.
 RUN bun install --frozen-lockfile && bun pm cache rm
 
 WORKDIR /build/opencode/packages/sdk/js
@@ -347,8 +347,7 @@ RUN test "$(/usr/local/bin/opencode --version)" = "${OPENCODE_VERSION}" \
     && bun scripts/lunarwing_tool_proxy_test.ts \
     && bun scripts/lunarwing_tool_plugin_test.ts \
     && bun test scripts/task_runner_test.ts \
-    && python3 scripts/study_notes_config_test.py \
-    && python3 scripts/fix_photon_patch_context_test.py
+    && python3 scripts/study_notes_config_test.py
 
 # ── XDG directories for opencode state ────────────────────────
 RUN mkdir -p /home/opencode/.local/share/opencode \

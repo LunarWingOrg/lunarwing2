@@ -2,7 +2,7 @@
 
 WebSocket bridge that integrates [OpenCode 2](https://opencode.ai)
 (anomalyco/opencode, `v2` line) as a LunarWing external worker — the v2 lane
-alongside the proven v1 worker (`opencode4lunarwing/`, pinned v1.18.25).
+alongside the proven v1 worker (`opencode4lunarwing/`, pinned v1.19.5).
 See `docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md` for the lane's rationale:
 v1 stays the default; v2 is opt-in per tenant until upstream's 2.0.x patch
 stack settles.
@@ -55,7 +55,7 @@ workspace work.
 
 | Area | v1 (`opencode4lunarwing`) | v2 (this worker) |
 |---|---|---|
-| Pin | v1.18.25 (proven) | v2.1.2 (beta in practice) |
+| Pin | v1.19.5 (proven) | v2.2.5 (beta in practice) |
 | Client SDK | `@opencode-ai/sdk/v2/client` | `@opencode/client/promise` |
 | Config file | `config/opencode.json` | `config/opencode2.json` |
 | Config shape | `provider.<id>.{npm,options.baseURL}` | `providers.<id>.{package,settings.baseURL}` |
@@ -67,8 +67,8 @@ workspace work.
 | Worker env overrides | `OPENCODE_MODEL` / `OPENCODE_BASE_URL` | `OPENCODE2_MODEL` / `OPENCODE2_BASE_URL` |
 
 WI#427 approved crossing the OpenTunnel boundary at
-`843a6c514e606b436a7fe713422ace0a93ad3d61` (v2.0.32); the current v2.1.2 pin
-is `a517687fde98a7329ada3ae644a01a9fc6c4e99e` (tag resolved via git
+`843a6c514e606b436a7fe713422ace0a93ad3d61` (v2.0.32); the current v2.2.5 pin
+is `9bbb8ce18c80f099e0e448775f59d965ead40a21` (tag resolved via git
 ls-remote, every gate re-verified on the fresh clone).
 The build compiles OpenTunnel out; the wrapper refuses service/pairing,
 self-upgrade (`upgrade`/`update`), and non-loopback serving, and sharing
