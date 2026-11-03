@@ -1414,7 +1414,7 @@ impl Agent {
                 tracing::error!("Error handling message: {error}");
                 if let Err(send_error) = self
                     .channels
-                    .respond(message, OutgoingResponse::text(format!("Error: {error}")))
+                    .respond(message, OutgoingResponse::text(error.user_facing_message()))
                     .await
                 {
                     tracing::error!(

@@ -158,6 +158,10 @@ fn thread_outcome_response(outcome: &ThreadOutcome) -> Option<String> {
             "Reached maximum iterations after a final recovery attempt. Retry with narrower scope or a higher iteration limit."
                 .into(),
         ),
+        ThreadOutcome::Failed {
+            kind: lunarwing_engine::ThreadFailureKind::Unknown,
+            ..
+        } => Some("Error: The turn failed before it finished. Please try again.".into()),
         ThreadOutcome::Failed { error, .. } => Some(format!("Error: {error}")),
         ThreadOutcome::GatePaused { .. } => None,
     }
@@ -169,6 +173,16 @@ fn engine_err(context: &str, e: impl std::fmt::Display) -> Error {
         context: context.to_string(),
         reason: e.to_string(),
     }
+}
+
+fn engine_thread_err(error: lunarwing_engine::EngineError) -> Error {
+    if matches!(
+        &error,
+        lunarwing_engine::EngineError::Thread(lunarwing_engine::ThreadError::AlreadyRunning(_))
+    ) {
+        return engine_err("thread still stopping", error);
+    }
+    engine_err("thread error", error)
 }
 
 /// Convert a local v1 `LoadedSkill` to an `lunarwing_skills::LoadedSkill` for migration.
@@ -1316,6 +1330,7 @@ async fn handle_expired_gates(
         if resumed {
             spawn_expired_gate_outcome_watcher(
                 gate.clone(),
+                thread.created_at,
                 std::sync::Arc::clone(channels),
                 Arc::clone(hooks),
             );
@@ -1431,6 +1446,7 @@ async fn begin_expired_gate_resume(
 /// borrow cannot enter a spawned task.
 fn spawn_expired_gate_outcome_watcher(
     gate: PendingGate,
+    run_started_at: chrono::DateTime<chrono::Utc>,
     channels: std::sync::Arc<crate::channels::ChannelManager>,
     hooks: Arc<crate::hooks::HookRegistry>,
 ) {
@@ -1442,7 +1458,7 @@ fn spawn_expired_gate_outcome_watcher(
         let Some(state) = guard.as_ref() else {
             return;
         };
-        await_expired_gate_resume_outcome(state, &channels, &hooks, &gate).await;
+        await_expired_gate_resume_outcome(state, &channels, &hooks, &gate, run_started_at).await;
     });
 }
 
@@ -1453,15 +1469,20 @@ async fn await_expired_gate_resume_outcome(
     channels: &std::sync::Arc<crate::channels::ChannelManager>,
     hooks: &Arc<crate::hooks::HookRegistry>,
     gate: &PendingGate,
+    run_started_at: chrono::DateTime<chrono::Utc>,
 ) {
     const OUTCOME_TIMEOUT_SECS: u64 =
         lunarwing_engine::executor::orchestrator::ORCHESTRATOR_TIMEOUT_SECS + 10;
     let deadline =
         tokio::time::Instant::now() + std::time::Duration::from_secs(OUTCOME_TIMEOUT_SECS);
 
-    // Poll-then-join like `await_thread_outcome`: joining a live thread would
-    // remove it from the running map and hide it from /interrupt and /steer.
-    while state.thread_manager.is_running(gate.thread_id).await {
+    // Poll-then-join like `await_thread_outcome`, scoped to this resume rather
+    // than a later turn that may adopt the same thread id.
+    while state
+        .thread_manager
+        .is_run_running(gate.thread_id, run_started_at)
+        .await
+    {
         if tokio::time::Instant::now() >= deadline {
             tracing::warn!(
                 thread_id = %gate.thread_id,
@@ -1473,7 +1494,11 @@ async fn await_expired_gate_resume_outcome(
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
-    let outcome = match state.thread_manager.join_thread(gate.thread_id).await {
+    let outcome = match state
+        .thread_manager
+        .join_thread_for_run(gate.thread_id, run_started_at)
+        .await
+    {
         Ok(outcome) => outcome,
         Err(error) => {
             debug!(
@@ -1484,6 +1509,17 @@ async fn await_expired_gate_resume_outcome(
             return;
         }
     };
+    if !state
+        .thread_manager
+        .claim_thread_completion(gate.thread_id, run_started_at)
+        .await
+    {
+        debug!(
+            thread_id = %gate.thread_id,
+            "another waiter already completed the expired-gate resume"
+        );
+        return;
+    }
 
     if let ThreadOutcome::GatePaused {
         ref action_name, ..
@@ -4019,6 +4055,7 @@ struct EngineMessageRequest<'a> {
 struct AwaitThreadCancellationGuard {
     thread_manager: Arc<ThreadManager>,
     thread_id: lunarwing_engine::ThreadId,
+    run_started_at: chrono::DateTime<chrono::Utc>,
     user_id: String,
     armed: bool,
 }
@@ -4027,11 +4064,13 @@ impl AwaitThreadCancellationGuard {
     fn new(
         thread_manager: Arc<ThreadManager>,
         thread_id: lunarwing_engine::ThreadId,
+        run_started_at: chrono::DateTime<chrono::Utc>,
         user_id: String,
     ) -> Self {
         Self {
             thread_manager,
             thread_id,
+            run_started_at,
             user_id,
             armed: true,
         }
@@ -4056,9 +4095,12 @@ impl Drop for AwaitThreadCancellationGuard {
         };
         let thread_manager = Arc::clone(&self.thread_manager);
         let thread_id = self.thread_id;
+        let run_started_at = self.run_started_at;
         let user_id = self.user_id.clone();
         runtime.spawn(async move {
-            if let Err(error) = thread_manager.stop_thread(thread_id, &user_id).await
+            if let Err(error) = thread_manager
+                .stop_thread_for_run(thread_id, run_started_at, &user_id)
+                .await
                 && !matches!(error, lunarwing_engine::EngineError::ThreadNotFound(_))
             {
                 tracing::warn!(
@@ -4094,7 +4136,7 @@ async fn handle_user_message_with_event_receiver(
             request.preferred_thread_id,
         )
         .await
-        .map_err(|error| engine_err("thread error", error))?;
+        .map_err(engine_thread_err)?;
     Ok((thread_id, event_rx))
 }
 
@@ -7651,7 +7693,13 @@ pub(crate) mod tests {
         // global engine state, which unit tests do not install.
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            await_expired_gate_resume_outcome(&state, &channels, &hooks, &expired[0]),
+            await_expired_gate_resume_outcome(
+                &state,
+                &channels,
+                &hooks,
+                &expired[0],
+                thread.created_at,
+            ),
         )
         .await
         .expect("resumed thread should reach a terminal outcome promptly");
@@ -7934,7 +7982,13 @@ pub(crate) mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            await_expired_gate_resume_outcome(&state, &channels, &hooks, &expired[0]),
+            await_expired_gate_resume_outcome(
+                &state,
+                &channels,
+                &hooks,
+                &expired[0],
+                thread.created_at,
+            ),
         )
         .await
         .expect("re-gated wrap-up should reach the watcher finalize promptly");
@@ -8949,6 +9003,102 @@ pub(crate) mod tests {
             auth_manager: None,
             pending_gate_expiry: DEFAULT_PENDING_GATE_EXPIRY,
         }
+    }
+
+    #[tokio::test]
+    async fn live_thread_collision_has_an_actionable_channel_error() {
+        struct BlockingLlm {
+            entered: Arc<Notify>,
+            release: Arc<Notify>,
+        }
+
+        #[async_trait::async_trait]
+        impl lunarwing_engine::LlmBackend for BlockingLlm {
+            async fn complete(
+                &self,
+                _: &[lunarwing_engine::ThreadMessage],
+                _: &[lunarwing_engine::ActionDef],
+                _: &lunarwing_engine::LlmCallConfig,
+            ) -> Result<lunarwing_engine::LlmOutput, lunarwing_engine::EngineError> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(lunarwing_engine::LlmOutput {
+                    response: lunarwing_engine::LlmResponse::Text("FINAL(\"done\")".into()),
+                    usage: lunarwing_engine::TokenUsage::default(),
+                    finish_reason: "stop".to_string(),
+                })
+            }
+
+            fn model_name(&self) -> &str {
+                "blocking"
+            }
+        }
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let store = Arc::new(TestStore::new());
+        let fixture = make_expected_test_state(store.clone());
+        let manager = ThreadManager::new(
+            Arc::new(BlockingLlm {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+            fixture.effect_adapter.clone(),
+            store,
+            Arc::new(CapabilityRegistry::new()),
+            Arc::new(LeaseManager::new()),
+            Arc::new(PolicyEngine::new()),
+        );
+        let project = lunarwing_engine::ProjectId::new();
+        let id = lunarwing_engine::ThreadId::new();
+        manager
+            .spawn_thread_with_history(
+                "first",
+                lunarwing_engine::ThreadType::Foreground,
+                project,
+                ThreadConfig::default(),
+                None,
+                "alice",
+                Vec::new(),
+                Some(id),
+                None,
+            )
+            .await
+            .unwrap();
+        let first_run = manager.thread_run_started_at(id).await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+
+        let collision = manager
+            .spawn_thread_with_history(
+                "second",
+                lunarwing_engine::ThreadType::Foreground,
+                project,
+                ThreadConfig::default(),
+                None,
+                "alice",
+                Vec::new(),
+                Some(id),
+                None,
+            )
+            .await
+            .unwrap_err();
+        let error = engine_thread_err(collision);
+        assert!(error.to_string().contains(&id.to_string()));
+        assert_eq!(
+            error.user_facing_message(),
+            "The previous turn is still stopping. Please send your message again in a moment."
+        );
+
+        release.notify_one();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            manager.join_thread_for_run(id, first_run),
+        )
+        .await
+        .unwrap()
+        .unwrap();
     }
 
     async fn serve_registry_responses(responses: Vec<(&'static str, Vec<u8>)>) -> String {
@@ -10778,9 +10928,16 @@ pub(crate) mod tests {
         assert_eq!(
             thread_outcome_response(&ThreadOutcome::Failed {
                 kind: lunarwing_engine::ThreadFailureKind::Unknown,
-                error: "boom".into()
+                error: "private engine detail".into()
             }),
-            Some("Error: boom".into())
+            Some("Error: The turn failed before it finished. Please try again.".into())
+        );
+        assert_eq!(
+            thread_outcome_response(&ThreadOutcome::Failed {
+                kind: lunarwing_engine::ThreadFailureKind::Orchestrator,
+                error: "actionable failure".into()
+            }),
+            Some("Error: actionable failure".into())
         );
     }
 
