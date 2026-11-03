@@ -59,12 +59,14 @@ RUN git -C /build/pebble apply --check /tmp/wi477-request-events.patch && \
 # event growth with ENABLE_WIKILINKS; pebble renders model output through
 # Options::all(), so the option is on). Same dependency requirements and
 # MSRV; only its version/checksum lines change.
+# 2026-11-02: pulldown-cmark 0.13.5 -> 0.13.6 (RUSTSEC-2026-0433, quadratic
+# parsing of nested image wikilinks with the same enabled option).
 # The build fails if the checked-out lock or the pinned digest drift from the
 # reviewed inputs, keeping the locked/reproducible-build guarantee.
 COPY pebble4lunarwing/upstream/Cargo.lock /tmp/pebble-upstream-Cargo.lock
 COPY pebble4lunarwing/scripts/verify_upstream_lock.py /tmp/verify-pebble-lock.py
 # Canonical reviewed pin also covers mt-admin, Compose and plain docker builds.
-ARG PEBBLE_LOCK_SHA256=19f4e96c4a64dbe062d0f2ae1ff2b6b2c128b6972d8e17f7a81f059341ec0b08
+ARG PEBBLE_LOCK_SHA256=47ab4b8dd909778c6dd6b5f15e2e0c6289240ecc7ecf5c116ef7395209d93ce4
 RUN python3 /tmp/verify-pebble-lock.py pebble/Cargo.lock \
     /tmp/pebble-upstream-Cargo.lock "${PEBBLE_LOCK_SHA256}"
 RUN cp /tmp/pebble-upstream-Cargo.lock pebble/Cargo.lock && \

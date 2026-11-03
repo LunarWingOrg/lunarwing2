@@ -62,12 +62,10 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
 opencode4lunarwing/entrypoint-task-setup.sh
 opencode4lunarwing/config/opencode.json
 opencode4lunarwing/models-dev/api.json
-opencode4lunarwing/scripts/check_models_dev_snapshot.py
-opencode4lunarwing/scripts/fix_photon_patch_context.py
-opencode4lunarwing/scripts/fix_photon_patch_context_test.py'
-        source_ref=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
-        build_args="OPENCODE_VERSION=v1.18.25
-OPENCODE_REF=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
+opencode4lunarwing/scripts/check_models_dev_snapshot.py'
+        source_ref=810c0eba1a7348036f8bdf61e6632d0c36c6876c
+        build_args="OPENCODE_VERSION=v1.19.5
+OPENCODE_REF=810c0eba1a7348036f8bdf61e6632d0c36c6876c
 WITH_TOOLCHAINS=false
 SOURCE_REVISION=$CI_COMMIT_SHA"
         ;;
@@ -86,8 +84,6 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         input_files='opencode2.4lunarwing/Dockerfile
 opencode2.4lunarwing/entrypoint.sh
 opencode2.4lunarwing/scripts/prepare_reproducible_build.py
-opencode2.4lunarwing/scripts/fix_photon_patch_context.py
-opencode2.4lunarwing/scripts/fix_photon_patch_context_test.py
 opencode2.4lunarwing/scripts/path_expand_test.ts
 opencode2.4lunarwing/scripts/opencode_result_test.ts
 opencode2.4lunarwing/scripts/sdk_surface.ts
@@ -116,7 +112,7 @@ opencode2.4lunarwing/scripts/compile_out_remote_tunnel_test.py
 opencode2.4lunarwing/scripts/runtime_smoke.py
 opencode2.4lunarwing/scripts/runtime_smoke_test.py
 opencode2.4lunarwing/scripts/runtime_smoke_entrypoint.sh'
-        source_ref=a517687fde98a7329ada3ae644a01a9fc6c4e99e
+        source_ref=9bbb8ce18c80f099e0e448775f59d965ead40a21
         # WI#357 run-106 GJ-3(a): the checkout's wrapper digest, compared by
         # the in-image --image-filesystem assert against the installed wrapper.
         # Detects accidental drift; an adversarial Dockerfile can still defeat
@@ -133,8 +129,8 @@ opencode2.4lunarwing/scripts/runtime_smoke_entrypoint.sh'
         [ "${#wrapper_anchor}" -eq 64 ] || {
             echo "invalid wrapper sha256 for $wrapper_file" >&2; exit 1;
         }
-        build_args="OPENCODE_VERSION=v2.1.2
-OPENCODE_REF=a517687fde98a7329ada3ae644a01a9fc6c4e99e
+        build_args="OPENCODE_VERSION=v2.2.5
+OPENCODE_REF=9bbb8ce18c80f099e0e448775f59d965ead40a21
 WITH_TOOLCHAINS=false
 LUNARWING_WRAPPER_SHA256=$wrapper_anchor
 SOURCE_REVISION=$CI_COMMIT_SHA"
@@ -193,8 +189,8 @@ kimicode4lunarwing/scripts/task_runner_client.ts
 kimicode4lunarwing/scripts/task_runner_client_test.ts
 kimicode4lunarwing/scripts/task_prompt_test.ts
 kimicode4lunarwing/scripts/workspace_path.ts'
-        source_ref=2.3.0
-        build_args="KIMI_CODE_VERSION=2.3.0
+        source_ref=2.4.1
+        build_args="KIMI_CODE_VERSION=2.4.1
 WITH_TOOLCHAINS=false
 SOURCE_REVISION=$CI_COMMIT_SHA"
         ;;

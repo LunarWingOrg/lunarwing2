@@ -43,7 +43,7 @@ Assertions (opencode2 lane):
      separately pins the complete runtime config, including PATH order.
 
 v1 lane (--lane opencode4lunarwing): only the share-disabled and
-entrypoint-loopback checks apply (v1.18.25 has no service mode or
+entrypoint-loopback checks apply (v1 has no service mode or
 tunnel; pairing is a v2 surface).
 """
 
@@ -172,9 +172,11 @@ def check_entrypoint(lane: pathlib.Path, is_v2: bool) -> None:
         else:
             fail(f"{entrypoint} must default OPENCODE_BIN to the wrapper at "
                  "/usr/local/bin/opencode (not the real binary)")
-        # v2 mandates Basic auth on serve; v1.18.25's serve has no auth
-        # support, so the password invariant is v2-only. Structural: the
-        # export must be executable code, not prose naming the variable
+        # v2's serve authenticates; the password invariant is v2-only because
+        # the v1 bridge sends no credential (v1's cli/cmd/serve.ts does honour
+        # OPENCODE_SERVER_PASSWORD at v1.19.5, so a future v1 hardening could
+        # adopt the same per-boot shared password this lane exports). Structural:
+        # the export must be executable code, not prose naming the variable
         # (run-79 EI-8 — a comment could satisfy a substring check).
         if re.search(r'^\s*export OPENCODE_PASSWORD\b', code, re.MULTILINE):
             check("entrypoint.sh sets a server password")

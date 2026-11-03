@@ -801,14 +801,16 @@ class WorkerInputManifestTests(unittest.TestCase):
         for worker, context in (("opencode", "opencode4lunarwing"), ("opencode2", "opencode2.4lunarwing")):
             directory = self.root / context
             (directory / "scripts").mkdir(parents=True)
-            (directory / "scripts/fix_photon_patch_context.py").write_text("# fixture\n", encoding="utf-8")
+            # Synthetic builder-executed patcher; the real lanes carry
+            # check_models_dev_snapshot.py and prepare_reproducible_build.py.
+            (directory / "scripts" / "builder_patcher.py").write_text("# fixture\n", encoding="utf-8")
             (directory / "Dockerfile").write_text(
                 "FROM scratch AS builder\n"
-                "COPY scripts/fix_photon_patch_context.py /build/fix.py\n"
+                "COPY scripts/builder_patcher.py /build/patch.py\n"
                 "FROM scratch AS runtime\n", encoding="utf-8",
             )
             self.opencode_files[worker] = [
-                f"{context}/Dockerfile", f"{context}/scripts/fix_photon_patch_context.py",
+                f"{context}/Dockerfile", f"{context}/scripts/builder_patcher.py",
             ]
         self.build_script = self.root / "build-worker-image.sh"
         self.write_build_script(kimi_files=self.kimi_files)
@@ -1034,13 +1036,24 @@ class WorkerInputManifestTests(unittest.TestCase):
         path.write_text('FROM scratch AS builder\nCOPY ["scripts/unclosed.py"\n', encoding="utf-8")
         self.assertTrue(any("cannot inspect builder COPY" in error for error in self.errors()))
 
-    def test_real_opencode_fixer_manifest_omissions_are_caught(self):
+    def test_real_builder_patch_manifest_omissions_are_caught(self):
         original = config.WORKER_BUILD_SCRIPT.read_text(encoding="utf-8")
-        for worker, context in (("opencode", "opencode4lunarwing"), ("opencode2", "opencode2.4lunarwing")):
+        # WI#531 retired the photon-node fixer from both lanes, so the live
+        # fixture is each lane's remaining builder-executed patch script: a
+        # literal builder COPY input that must keep its provenance hash.
+        for worker, missing in (
+            ("opencode", "opencode4lunarwing/scripts/check_models_dev_snapshot.py"),
+            ("opencode2", "opencode2.4lunarwing/scripts/prepare_reproducible_build.py"),
+        ):
             with self.subTest(worker=worker):
-                missing = f"{context}/scripts/fix_photon_patch_context.py"
-                self.assertIn(missing + "\n", original)
-                self.build_script.write_text(original.replace(missing + "\n", ""), encoding="utf-8")
+                # A manifest entry is either followed by another entry or ends
+                # the single-quoted list, where the next byte is the quote.
+                for terminator in ("\n", "'"):
+                    if missing + terminator in original:
+                        break
+                else:
+                    self.fail(f"{missing} is not a manifest entry")
+                self.build_script.write_text(original.replace(missing + terminator, terminator), encoding="utf-8")
                 errors = []
                 with mock.patch.object(config, "WORKER_BUILD_SCRIPT", self.build_script):
                     config.validate_worker_input_manifest(errors)

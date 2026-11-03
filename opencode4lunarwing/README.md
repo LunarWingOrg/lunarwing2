@@ -61,7 +61,7 @@ When `opencode serve` fails a request with its bare HTTP 500 wrapper
 ("Unexpected server error. Check server logs for details."), the task error
 returned to LunarWing automatically includes the real root cause, read from
 serve's own structured log (`$XDG_DATA_HOME|~/.local/share/opencode/log/
-opencode.log`; at the pinned v1.18.25 that is where the server's error
+opencode.log`; at the pinned v1.19.5 that is where the server's error
 middleware logs the cause — container stdout does not carry it). Only
 `level=ERROR` lines (the formatter uppercases the level token) appended
 after the task started are considered, and enrichment is fail-closed on a
@@ -88,14 +88,19 @@ that uid's full access to it (it could read other refs or forge a line);
 the enrichment defends against accidents and cross-task leakage, not
 against a hostile agent on the same uid.
 
-> **Known issue (WI#320 F4, tracked as WI#333):** at the pinned v1.18.25,
-> every task dispatch fails in the LunarWing worker shape — `opencode serve`
+> **Known issue (WI#320 F4, tracked as WI#333):** at v1.18.25 (the last
+> dispatch-verified pin), every task dispatch failed in the LunarWing worker shape — `opencode serve`
 > crashes in `SystemPrompt.environment` (`undefined is not an object
 > (evaluating 'a.name')`) while building the prompt, before any model call.
-> v1.18.29 ships two further regressions (see the Dockerfile pin note), so
-> the lane stays at v1.18.25 and is effectively unusable until upstream fixes
-> land; the opencode2 worker (`mode: "opencode2"`) is the working lane, and
-> the v1 lane is expected to be retired in v2.1.7.0 (goals item 34). The
+> v1.18.29 shipped two further regressions (see the Dockerfile pin note).
+> **The v1.19.5 bump (WI#531) does not fix this:** the `sys.environment(model)`
+> call site and its surrounding prompt assembly are unchanged between the two
+> tags, so the crash path is carried forward untested — no live dispatch has
+> been run at v1.19.5. Neither v1.18.29 regression is verified fixed at
+> v1.19.5 either; both are open risks carried with this pin. The opencode2
+> worker (`mode: "opencode2"`) remains the working lane, and the v1 lane is
+> expected to be retired (goals item 34). Run one live v1 dispatch on a test
+> tenant after the first master candidate build to settle both. The
 > enrichment above is what surfaces this crash in the job error instead of
 > the bare 500 wrapper.
 
@@ -118,7 +123,7 @@ turn. Set `wait: true` only for short tasks that must return synchronously.
 ## Health Endpoints
 
 - `GET /health` — Worker status, uptime, version, and `opencode_ref` (release
-  plus immutable upstream commit, currently `v1.18.25@cb7d8b2f…` — reverted from v1.18.29 2026-09-07 due to upstream stream-path and config-shape regressions)
+  plus immutable upstream commit, currently `v1.19.5@810c0eba…`)
 - `GET /ready` — WebSocket readiness and connection count
 
 ## Protocol

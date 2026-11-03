@@ -11,9 +11,9 @@
 
 [package]
 edition = "2021"
-rust-version = "1.65"
+rust-version = "1.63"
 name = "async-executor"
-version = "1.14.0"
+version = "1.14.1"
 authors = [
     "Stjepan Glavina <stjepang@gmail.com>",
     "John Nunley <dev@notgull.net>",
