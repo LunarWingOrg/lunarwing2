@@ -10,7 +10,7 @@ import type { ThreadLister } from "../../src/controller/session.ts"
 import { NOTES } from "../../src/state/correlate.ts"
 import type { TurnId } from "../../src/state/model.ts"
 import { startGatewayRuntime, type GatewayRig } from "../helpers/render.tsx"
-import { fixtureToken, type MockEvent, type MockSendContext } from "../mocks/mock-gateway.ts"
+import { echoReply, fixtureToken, type MockEvent, type MockSendContext } from "../mocks/mock-gateway.ts"
 
 let rig: GatewayRig | null = null
 
@@ -259,17 +259,59 @@ describe("legacy gateway", () => {
     expect(r.store.getState().composer.credential).toMatchObject({ extensionName: "linear", requestId, threadId })
   })
 
-  test("a bare keyword is marked unanswered after 15 s", async () => {
+  test("a bare keyword the daemon consumes: 'no reply yet' after 15 s, unanswered after 10 min", async () => {
     const r = await ready({ mode: "legacy", mock: { engine: "v1", replies: () => [] } })
     await r.run("ok")
     expect(r.mock.requestsTo("POST /api/chat/send")).toHaveLength(0)
     await r.enter()
     await r.until(() => phase(r, T1) === "sent", "sent")
     await r.advance(14_000)
-    expect(phase(r, T1)).toBe("sent")
+    expect(r.store.getState().turns[T1]).toMatchObject({ phase: "sent", notes: [] })
     await r.advance(2_000)
-    expect(phase(r, T1)).toBe("unanswered")
-    expect(r.store.getState().turns[T1]?.notes).toContain(NOTES.unanswered)
+    expect(r.store.getState().turns[T1]).toMatchObject({ phase: "sent", notes: [NOTES.noReplyYet] })
+    await r.advance(600_000, 10_000)
+    expect(r.store.getState().turns[T1]).toMatchObject({ phase: "unanswered", notes: [NOTES.unanswered] })
+  })
+
+  test("Ctrl+S cancels a turn that still waits: the daemon says 'Nothing to interrupt.' and the turn is unanswered", async () => {
+    const replies = (ctx: MockSendContext): MockEvent[] => (ctx.content === "ok" ? [] : echoReply(ctx))
+    const r = await ready({ mode: "legacy", mock: { engine: "v1", replies } })
+    await r.run("ok")
+    await r.enter()
+    await r.advance(20_000)
+    expect(r.store.getState().turns[T1]?.notes).toEqual([NOTES.noReplyYet])
+    // Ctrl+S with an empty composer: interrupt only
+    r.runtime.session.interruptAndSend()
+    await r.until(() => phase(r, T1) === "unanswered", "cancelled")
+    expect(r.store.getState().turns[T1]?.notes).toEqual([NOTES.nothingToInterrupt])
+    expect(r.mock.requestsTo("POST /api/chat/send").map((rec) => (rec.body as { content: string }).content)).toEqual(["ok", "/interrupt"])
+    // the next message is first in line and takes its own reply
+    await r.run("status please")
+    await r.until(() => r.store.getState().turns["t-3" as TurnId]?.phase === "done", "next reply")
+    expect(r.store.getState().turns["t-3" as TurnId]?.finalText).toBe("echo: status please")
+  })
+
+  test("a message the daemon's scheduler held back for 20 s still gets its own reply; the next one gets its own", async () => {
+    // Another channel's exclusive turn runs on the daemon: the message waits in the MessageScheduler without a word.
+    const held: MockSendContext[] = []
+    const replies = (ctx: MockSendContext): MockEvent[] => {
+      if (ctx.content !== "check the backup status") return echoReply(ctx)
+      held.push(ctx)
+      return []
+    }
+    const r = await ready({ mode: "legacy", mock: { engine: "v2", replies } })
+    await r.run("check the backup status")
+    await r.until(() => phase(r, T1) === "sent", "sent")
+    await r.advance(20_000, 1_000)
+    expect(r.store.getState().turns[T1]).toMatchObject({ phase: "sent", notes: [NOTES.noReplyYet] })
+    // the held message finally runs: its reply lands on it, not on a later turn
+    const ctx = held[0] as MockSendContext
+    for (const event of echoReply({ ...ctx, content: "Backups: all green." })) r.mock.emit(event)
+    await r.until(() => phase(r, T1) === "done", "late reply")
+    expect(r.store.getState().turns[T1]).toMatchObject({ finalText: "echo: Backups: all green.", notes: [] })
+    await r.run("also list disk usage")
+    await r.until(() => phase(r, T2) === "done", "second reply")
+    expect(r.store.getState().turns[T2]?.finalText).toBe("echo: also list disk usage")
   })
 
   test("other-thread events only bump the counter", async () => {

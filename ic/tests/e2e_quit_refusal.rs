@@ -137,28 +137,62 @@ mod tests {
         true
     }
 
+    /// Sends `command` on `channel` as the rig's message number `index` (from 0); it must
+    /// be refused with an `Error: ...` reply and finish `failed`.
+    async fn assert_command_refused(rig: &TestRig, channel: &str, command: &str, index: usize) {
+        let id = send(rig, channel, command).await;
+        let responses = rig.wait_for_responses(index + 1, TIMEOUT).await;
+        assert_eq!(responses.len(), index + 1, "{command} got no reply");
+        let reply = &responses[index].content;
+        assert!(
+            reply.starts_with("Error: ") && reply.contains("cannot stop"),
+            "{command} on {channel}: unexpected reply {reply:?}"
+        );
+        assert_eq!(
+            wait_for_finish(rig, id).await,
+            [
+                MessageLifecycle::Started,
+                MessageLifecycle::Finished(TurnOutcome::Failed)
+            ],
+            "{command} on {channel}"
+        );
+    }
+
+    /// After `earlier` replies, a `hello` on `channel` is still answered with `expected`
+    /// and finishes `replied`, and the channels were never shut down.
+    async fn assert_still_answering(
+        rig: &TestRig,
+        channel: &str,
+        stopped: &AtomicBool,
+        earlier: usize,
+        expected: &str,
+    ) {
+        let hello = send(rig, channel, "hello").await;
+        let responses = rig.wait_for_responses(earlier + 1, TIMEOUT).await;
+        assert_eq!(
+            responses.len(),
+            earlier + 1,
+            "the agent stopped answering on {channel}"
+        );
+        assert_eq!(responses[earlier].content, expected);
+        assert_eq!(
+            wait_for_finish(rig, hello).await,
+            [
+                MessageLifecycle::Started,
+                MessageLifecycle::Finished(TurnOutcome::Replied)
+            ]
+        );
+        assert!(!stopped.load(Ordering::SeqCst));
+    }
+
     /// Sends `/quit`, `/exit` and `/shutdown` on `channel`; each must be refused with a
     /// reply and finish `failed`, and a later `hello` must still be answered.
     async fn assert_quit_is_refused(channel: &str) {
         let (rig, stopped) = rig_for(channel, fixture("simple_text.json")).await;
 
-        for (index, command) in ["/quit", "/exit", "/shutdown"].into_iter().enumerate() {
-            let id = send(&rig, channel, command).await;
-            let responses = rig.wait_for_responses(index + 1, TIMEOUT).await;
-            assert_eq!(responses.len(), index + 1, "{command} got no reply");
-            let reply = &responses[index].content;
-            assert!(
-                reply.starts_with("Error: ") && reply.contains("cannot stop"),
-                "{command} on {channel}: unexpected reply {reply:?}"
-            );
-            assert_eq!(
-                wait_for_finish(&rig, id).await,
-                [
-                    MessageLifecycle::Started,
-                    MessageLifecycle::Finished(TurnOutcome::Failed)
-                ],
-                "{command} on {channel}"
-            );
+        let commands = ["/quit", "/exit", "/shutdown"];
+        for (index, command) in commands.into_iter().enumerate() {
+            assert_command_refused(&rig, channel, command, index).await;
         }
         tokio::time::sleep(SETTLE).await;
         assert!(
@@ -166,22 +200,8 @@ mod tests {
             "a refused command shut the channels down"
         );
 
-        let hello = send(&rig, channel, "hello").await;
-        let responses = rig.wait_for_responses(4, TIMEOUT).await;
-        assert_eq!(
-            responses.len(),
-            4,
-            "the agent stopped answering on {channel}"
-        );
-        assert_eq!(responses[3].content, "Hello from fixture file!");
-        assert_eq!(
-            wait_for_finish(&rig, hello).await,
-            [
-                MessageLifecycle::Started,
-                MessageLifecycle::Finished(TurnOutcome::Replied)
-            ]
-        );
-        assert!(!stopped.load(Ordering::SeqCst));
+        let expected = "Hello from fixture file!";
+        assert_still_answering(&rig, channel, &stopped, commands.len(), expected).await;
 
         rig.shutdown();
     }
@@ -209,22 +229,8 @@ mod tests {
             "a silent reply shut the channels down"
         );
 
-        let hello = send(&rig, channel, "hello").await;
-        let responses = rig.wait_for_responses(1, TIMEOUT).await;
-        assert_eq!(
-            responses.len(),
-            1,
-            "the agent stopped answering on {channel}"
-        );
-        assert_eq!(responses[0].content, "Still here after a silent reply.");
-        assert_eq!(
-            wait_for_finish(&rig, hello).await,
-            [
-                MessageLifecycle::Started,
-                MessageLifecycle::Finished(TurnOutcome::Replied)
-            ]
-        );
-        assert!(!stopped.load(Ordering::SeqCst));
+        let expected = "Still here after a silent reply.";
+        assert_still_answering(&rig, channel, &stopped, 0, expected).await;
 
         rig.shutdown();
     }

@@ -97,12 +97,12 @@ The client generates one id per user turn and per control (`/interrupt`,
 | `outcome` | Meaning |
 | --- | --- |
 | `replied` | A non-empty reply was delivered before this event. |
-| `no_reply` | Handling ended without a reply: suppressed or silent reply (`NO_REPLY`), a consumed control, a stale or bare approval keyword, a hook rejection. |
+| `no_reply` | Handling ended without a reply: suppressed or silent reply (`NO_REPLY`), a consumed control, a stale or bare approval keyword, a hook rejection (an inbound hook, or an outbound hook that rejected the reply, failed or emptied it). |
 | `paused` | The turn stopped at a gate (approval, credential, external callback). A continuation follows the decision with its own `turn_started` and finish. |
-| `interrupted` | A running turn was stopped by `/interrupt` (or `/stop`). |
+| `interrupted` | A running turn was stopped by `/interrupt` (or `/stop`); on Engine V2 also an approval continuation whose approved action was still running. |
 | `detached` | The turn outlived its wait budget and continues in the background. Not terminal: exactly one more `turn_finished` follows when it ends. |
-| `failed` | The handler returned an error or an `Error: ...` reply, panicked, or the engine reported failure (including max iterations). |
-| `timed_out` | The agent loop's soft timeout fired; the timeout notice was sent. |
+| `failed` | The handler returned an error or an `Error: ...` reply or panicked, the engine reported failure (including max iterations), or the input was refused (see [Limits](#limits-wirelimits)). |
+| `timed_out` | The agent loop's soft timeout fired; the timeout notice was sent. Terminal: an Engine V2 turn that keeps running may still deliver a late `response`, but no further `turn_finished`. |
 | `cancelled` | The message did not complete: removed from the queue by an interrupt or refused by a full queue (it never ran), or cancelled by daemon shutdown while it ran. |
 
 Readers map any other string to "unknown" (`#[serde(other)] Unknown`;
@@ -123,7 +123,13 @@ producers never emit it).
 
 Content over `max_content_bytes` is not refused by the HTTP layer (only by
 the 10 MiB body limit): the agent's input validation rejects it and the turn
-ends with an `Error: ...` reply. Clients enforce the limit before sending.
+finishes `failed`. Engine V1 replies `Error: Input rejected by safety
+validation: ...`; Engine V2 replies the same text without the `Error: `
+prefix. Input that a blocking safety policy rule or the secret scanner refuses
+ends the same way (V1 `Error: <reason>`, V2 the bare reason). On Engine V2 the
+validated text includes the `<attachments>` block that describes attached
+images, so content just under the limit plus images can still be refused.
+Clients enforce the limit before sending.
 
 ## `GET /api/chat/capabilities`
 
@@ -222,7 +228,8 @@ whole list with `decode_images(GATEWAY_IMAGE_LIMITS, "web-image")` before the
 message is queued, in this order:
 
 1. at most 5 images;
-2. the total base64 length fits 7 MiB decoded;
+2. the decoded total that the base64 lengths imply (exact for valid,
+   padded base64) is at most 7 MiB;
 3. per image: the base64 length fits 5 MiB decoded; the declared
    `media_type` starts with `image/` (case-insensitive); the data decodes; it
    is not empty; it is at most 5 MiB; the running total is at most 7 MiB;
@@ -257,8 +264,9 @@ stored in the tenant workspace (the TUI discloses this); there is no expiry.
   45 s without bytes.
 - Scope: events for the authenticated user plus global events. One stream
   per client is enough; filter by `thread_id`.
-- Cap: 100 SSE and WebSocket connections per gateway; beyond it **503**
-  `Too many connections`.
+- Cap: 100 connections per gateway, SSE streams and WebSockets together. A
+  new SSE stream beyond it answers **503** `Too many connections`; a
+  WebSocket beyond it is upgraded (101) and then closed at once.
 - Lag: the broadcast buffer holds 256 events. A subscriber that falls behind
   receives `stream_gap {"missed_events": n}` and continues. There is no `id:`
   field and no `Last-Event-ID`; recover by resynchronizing (history and
@@ -335,9 +343,13 @@ WebSocket sends emit neither. The rules (the daemon-side contract is in
    finish of its message.
 2. `detached` is followed by exactly one more `turn_finished` (the late
    result); a client keeps the turn open in the background until then.
+   `timed_out` is never followed by another finish: when an Engine V2 turn
+   outlives the soft timeout, its late reply arrives as a correlated
+   `response` only.
 3. `paused` is followed, after the decision, by the continuation's
    `turn_started` (new `message_id`, the original `client_turn_id`) and its
-   own finish.
+   own finish. On Engine V2 the uncorrelated `gate_resolved` of the decision
+   comes after that `turn_started`.
 4. Some messages finish without starting: queued prompts removed by an
    interrupt (`cancelled`), and a message refused because the deferred queue
    (256 messages) is full (`response` "Agent is busy and its deferred message
@@ -409,7 +421,10 @@ V2 it stops every running thread of the conversation. The control gets
 `response` "Interrupted." or "Nothing to interrupt." and
 `turn_finished{replied}` under its own id; the interrupted turn finishes
 `interrupted` (on V1 it also gets a `response` "Interrupted."); queued prompts
-of the lane removed by the interrupt finish `cancelled`. Steer with
+of the lane removed by the interrupt finish `cancelled`. On Engine V2 an
+approval continuation whose approved action is still running is interrupted
+too: the action's effects stand, the thread is not resumed, and the
+continuation finishes `interrupted`. Steer with
 `/steer <note>`; its acknowledgement is a `response` under the steer's id.
 Both count against the chat rate limit.
 
@@ -430,11 +445,12 @@ no `message_id` or `client_turn_id`.
   (lunarwing-mt-admin.sh stop-tenant)." and `turn_finished{failed}`; the
   daemon keeps running. Legacy daemons stop on these commands, so clients
   intercept them locally on every daemon.
-- A reply that the agent maps to "stop" (a V1 reply that is exactly
-  `NO_REPLY`, or Engine V2 `Completed{response: None}`) does not stop the
-  daemon from these two channels either (DEC-1 guard); it finishes
-  `no_reply`. Other channels keep the old behaviour, and the two producers
-  are tracked as separate bugs.
+- A reply that the agent maps to "stop" (a V1 reply that `is_silent_reply`
+  reads as silent: `NO_REPLY`, optionally followed by up to four whitespace
+  or ASCII punctuation characters, for example `NO_REPLY.`; or Engine V2
+  `Completed{response: None}`) does not stop the daemon from these two
+  channels either (DEC-1 guard); it finishes `no_reply`. Other channels keep
+  the old behaviour, and the two producers are tracked as separate bugs.
 - `/restart`: an operator action (`lunarwing-mt-admin.sh restart-tenant`); the
   TUI refuses it locally.
 - Bare approval keywords (for example `yes`, `ok`, `no`, `deny`, `always`;
@@ -444,11 +460,17 @@ no `message_id` or `client_turn_id`.
 
 ## WebSocket (`/api/chat/ws`)
 
-The WebSocket path is for the web UI. It has no rate limit, its messages carry
-no correlation metadata (so no lifecycle events), and its events never carry
-`message_id`/`client_turn_id`. Images sent over it are validated like
-`send`; a rejection answers a WebSocket `error` frame with the same text and
-the message is not forwarded.
+The WebSocket path serves browser-origin clients; the bundled web UI does not
+use it (it uses SSE and `fetch`), and machine clients use SSE plus
+`POST /api/chat/send`. The upgrade must carry an `Origin` header whose host
+is `localhost`, `127.0.0.1` or `[::1]`: without one the gateway answers
+**403** `WebSocket Origin header required`, with another host **403**
+`WebSocket origin not allowed`. Over the connection cap the upgrade still
+succeeds (101) and the socket is closed at once; there is no 503. It has no
+rate limit, its messages carry no correlation metadata (so no lifecycle
+events), and its events never carry `message_id`/`client_turn_id`. Images
+sent over it are validated like `send`; a rejection answers a WebSocket
+`error` frame with the same text and the message is not forwarded.
 
 ## Testing
 

@@ -22,6 +22,7 @@ mod tests {
 
     use lunarwing::channels::{IncomingMessage, MessageLifecycle, StatusUpdate, TurnOutcome};
     use lunarwing::error::LlmError;
+    use lunarwing::hooks::{Hook, HookContext, HookError, HookEvent, HookOutcome, HookPoint};
     use lunarwing::llm::{
         CompletionRequest, CompletionResponse, FinishReason, LlmProvider, ToolCompletionRequest,
         ToolCompletionResponse,
@@ -212,6 +213,60 @@ mod tests {
         assert_eq!(rig.llm_call_count(), 0, "no LLM call expected");
 
         rig.shutdown();
+    }
+
+    /// Stops every reply at `BeforeOutbound`: rejects it, or rewrites it to nothing.
+    struct SuppressOutbound {
+        reject: bool,
+    }
+
+    #[async_trait]
+    impl Hook for SuppressOutbound {
+        fn name(&self) -> &str {
+            "lifecycle-suppress-outbound"
+        }
+
+        fn hook_points(&self) -> &[HookPoint] {
+            &[HookPoint::BeforeOutbound]
+        }
+
+        async fn execute(
+            &self,
+            _event: &HookEvent,
+            _ctx: &HookContext,
+        ) -> Result<HookOutcome, HookError> {
+            Ok(if self.reject {
+                HookOutcome::reject("blocked by the lifecycle test")
+            } else {
+                HookOutcome::modify(String::new())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_finished_no_reply_when_outbound_hook_suppresses_reply() {
+        for reject in [true, false] {
+            let rig = TestRigBuilder::new()
+                .with_trace(fixture("simple_text.json"))
+                .with_hook(Arc::new(SuppressOutbound { reject }))
+                .build()
+                .await;
+
+            // The model answers, but the reply never reaches `respond()`: the turn
+            // finishes `no_reply`, not `replied`.
+            let id = send(&rig, "hello").await;
+            let events = wait_for_finish(&rig, id).await;
+            assert_eq!(
+                events,
+                [STARTED, finished(TurnOutcome::NoReply)],
+                "reject: {reject}"
+            );
+            assert!(rig.llm_call_count() > 0, "the model was asked");
+            tokio::time::sleep(SETTLE).await;
+            assert!(rig.captured_responses().is_empty(), "reject: {reject}");
+
+            rig.shutdown();
+        }
     }
 
     #[tokio::test]

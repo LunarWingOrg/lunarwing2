@@ -313,9 +313,19 @@ impl ChannelManager {
     ///
     /// Called by the code that knows more than the agent loop's result: the V1 result
     /// arms (`Paused`, `Interrupted`, `Failed`), the V2 completion and the V2 detach.
-    /// The hint is applied once, by the next `Finished` reported for the message.
+    /// The hint is applied once, by the next `Finished` reported for the message; a hint
+    /// for a message that already finished is dropped.
     pub fn note_turn_outcome(&self, message_id: Uuid, hint: TurnOutcome) {
         self.outcome_hints.note(message_id, hint);
+    }
+
+    /// True once a `Finished` other than `Detached` was reported for message `message_id`
+    /// (remembered for the 1024 most recent finishes, at most 30 minutes each).
+    ///
+    /// The Engine V2 late watcher reports a second `Finished` only after `Detached`: when
+    /// the agent loop's soft timeout fired first, `timed_out` was the message's last one.
+    pub fn has_finished(&self, message_id: Uuid) -> bool {
+        self.outcome_hints.has_finished(message_id)
     }
 
     /// Report a lifecycle event of `msg` to the channel that produced it.
@@ -864,6 +874,55 @@ mod tests {
         assert!(recorded(&events).is_empty());
         // The finish still consumed the hint, so nothing lingers for that id.
         assert_eq!(manager.outcome_hints.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn has_finished_after_any_finish_but_detached() {
+        let manager = ChannelManager::new();
+        let (channel, events) = LifecycleRecorder::new("gateway");
+        manager.add(Box::new(channel)).await;
+        let detached = IncomingMessage::new("gateway", "user1", "long task");
+        let timed_out = IncomingMessage::new("gateway", "user1", "slow task");
+
+        manager.note_turn_outcome(detached.id, TurnOutcome::Detached);
+        manager
+            .message_lifecycle(&detached, MessageLifecycle::Finished(TurnOutcome::NoReply))
+            .await;
+        // `detached` is followed by the late finish, so the message is still open.
+        assert!(!manager.has_finished(detached.id));
+        manager
+            .message_lifecycle(&detached, MessageLifecycle::Finished(TurnOutcome::Replied))
+            .await;
+        assert!(manager.has_finished(detached.id));
+
+        manager
+            .message_lifecycle(
+                &timed_out,
+                MessageLifecycle::Finished(TurnOutcome::TimedOut),
+            )
+            .await;
+        assert!(manager.has_finished(timed_out.id));
+        // A hint recorded after the finish is dropped, not kept for a finish to come.
+        manager.note_turn_outcome(timed_out.id, TurnOutcome::Detached);
+        assert_eq!(manager.outcome_hints.len(), 0);
+
+        assert_eq!(
+            recorded(&events),
+            vec![
+                (
+                    detached.id,
+                    MessageLifecycle::Finished(TurnOutcome::Detached)
+                ),
+                (
+                    detached.id,
+                    MessageLifecycle::Finished(TurnOutcome::Replied)
+                ),
+                (
+                    timed_out.id,
+                    MessageLifecycle::Finished(TurnOutcome::TimedOut)
+                ),
+            ]
+        );
     }
 
     #[tokio::test]

@@ -9,7 +9,7 @@
  * - Every server string is sanitized (sanitize.ts) before it is stored.
  */
 import type { Action } from "./actions.ts"
-import type { FinishOutcome, ServerInfo } from "../transport/types.ts"
+import type { DaemonStart, FinishOutcome, ServerInfo } from "../transport/types.ts"
 import { createInitialVoiceUiState, type VoiceUiState } from "../voice/types.ts"
 
 /** Client-generated correlation id: crypto.randomUUID() (state/ids.ts). */
@@ -50,9 +50,9 @@ export type TurnPhase =
   | "done"
   | "interrupted"
   | "failed"
-  /** connection dropped and the transport cannot resume (legacy socket) */
+  /** connection dropped and the transport cannot resume (legacy socket), or the daemon restarted meanwhile */
   | "lost"
-  /** legacy daemons only: no event within 15 s of acceptance */
+  /** legacy daemons only: no event for 10 min after acceptance, or cancelled while still waiting */
   | "unanswered"
 
 export type TurnOrigin = "user" | "control" | "background" | "history"
@@ -221,6 +221,13 @@ export interface AppState {
   conn: ConnState
   /** Kept while reconnecting. */
   server: ServerInfo | null
+  /** When the daemon process started, from the newest connect that could tell (ServerInfo.daemonStart). */
+  daemonStart: DaemonStart | null
+  /**
+   * A daemon restart seen at conn/ready, applied by the next resync of the thread: what the old process was still
+   * handling is sealed lost, after history had its chance to show finished turns (3.5, restart rule).
+   */
+  daemonRestart: { bootedAfter: number } | null
   threadId: ThreadId | null
   turns: Readonly<Record<TurnId, TurnRecord>>
   /** Render order, newest 500. */
@@ -298,6 +305,8 @@ export function createInitialState(opts: InitialStateOptions): AppState {
     tenant: opts.tenant,
     conn: { kind: "connecting", attempt: 0, since: opts.at },
     server: null,
+    daemonStart: null,
+    daemonRestart: null,
     threadId: null,
     turns: {},
     order: [],

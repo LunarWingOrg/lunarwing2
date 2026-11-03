@@ -17,7 +17,7 @@
  * control/created). Its tap sees every event: legacy settle hints start the 10 s resync grace (3.5 rule 11),
  * resync.required resyncs at once, and `onEvent` forwards to the notifier.
  *
- * The supervisor also runs the 1 s notice/tick (notice expiry, legacy 15 s unanswered, stray-ack window,
+ * The supervisor also runs the 1 s notice/tick (notice expiry, the legacy waiting rule, stray-ack window,
  * confirmation, guard and credential Esc expiries) and calls `onTick` for the session's own timers.
  */
 import type { Clock, TimerHandle } from "@opentui/core"

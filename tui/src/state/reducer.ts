@@ -25,6 +25,7 @@ import {
   failControl,
   failSend,
   markSent,
+  noteDaemonStart,
   noteTurn,
   pushComposerHistory,
   pushNotice,
@@ -129,8 +130,9 @@ export const rootReducer: Reducer = reduce
 
 // ---------------------------------------------------------------------------------------------------------
 
+/** A daemon start later than the known one marks a restart; the resync that follows applies it (3.5 rule 13). */
 function connReady(state: AppState, action: ActionOf<"conn/ready">): AppState {
-  const next: AppState = { ...state, conn: { kind: "ready", since: action.at }, server: action.info }
+  const next = noteDaemonStart({ ...state, conn: { kind: "ready", since: action.at }, server: action.info }, action.info)
   return action.info.threadId === null ? next : selectThread(next, action.info.threadId)
 }
 

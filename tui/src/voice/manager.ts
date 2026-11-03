@@ -39,7 +39,14 @@ import {
 } from "./errors.ts"
 import { LevelMeterModel } from "./levels.ts"
 import { createPttState, pttConfigFromVoice, pttReduce, type PttCancelReason, type PttConfig, type PttEffect, type PttEvent, type PttState } from "./ptt.ts"
-import { isDeviceAware, isDisposableRecorder, matchCaptureDevice, recordingDevice, type CaptureStartOptions } from "./recorder.ts"
+import {
+  isDeviceAware,
+  isDisposableRecorder,
+  matchCaptureDevice,
+  recordingDevice,
+  type CaptureStartOptions,
+  type RecordingDevice,
+} from "./recorder.ts"
 import {
   isVoiceSourceId,
   VOICE_SOURCE_IDS,
@@ -1057,7 +1064,7 @@ class VoiceManager implements VoiceController {
         }
         rec.handle = handle
         this.ctx.patch({ recorder: recorder.kind })
-        this.noteDevice(handle)
+        this.noteDevice(recordingDevice(handle))
         if (rec.pendingFinish) void this.stopRecording(rec)
         return
       } catch (error) {
@@ -1080,6 +1087,10 @@ class VoiceManager implements VoiceController {
         if (rec.index === index) this.onFirstChunk(rec)
       },
       onFailure: (error) => this.recorderFailed(rec, index, error.message),
+      // parec gave up the requested source after start() returned: the same notice as a fallback at start.
+      onDeviceFallback: (device) => {
+        if (this.isCurrent(rec) && rec.index === index) this.noteDevice(device)
+      },
       signal: rec.abort.signal,
     }
   }
@@ -1217,8 +1228,7 @@ class VoiceManager implements VoiceController {
     ])
   }
 
-  private noteDevice(handle: RecorderHandle): void {
-    const device = recordingDevice(handle)
+  private noteDevice(device: RecordingDevice): void {
     if (!device.deviceFallback) return
     const requested = this.deviceName() ?? "the configured device"
     this.ctx.notice("warn", `capture device "${requested}" not found; using the default source - /voice device`, { id: VOICE_NOTICE_IDS.device })
@@ -1257,9 +1267,12 @@ class VoiceManager implements VoiceController {
     return this.storedDevice ?? (this.deps.config.device?.trim() || null)
   }
 
+  /** The device a recording used: its own name, "the default source" after a fallback, else the requested one. */
   private deviceLabel(handle: RecorderHandle | null): string {
-    const used = handle === null ? null : recordingDevice(handle).deviceName
-    return used ?? this.deviceName() ?? "the default source"
+    const used = handle === null ? null : recordingDevice(handle)
+    if (used?.deviceName) return used.deviceName
+    if (used?.deviceFallback === true) return "the default source"
+    return this.deviceName() ?? "the default source"
   }
 
   private deviceStatus(): VoiceStatusReport["device"] {

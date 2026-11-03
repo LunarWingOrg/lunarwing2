@@ -115,6 +115,33 @@ describe("checkImageBytes", () => {
     expect(refused.message).toBe("image: this daemon does not accept JPEG images (allowed: PNG, WebP)")
   })
 
+  test("animated WebP is refused by name, before the decoder; still WebP keeps working", () => {
+    // PIL 11.3 samples: OpenTUI 0.8.1's imageInfo throws ImageError "unsupported-feature" for animated WebP.
+    const animatedLossy = b64(
+      "UklGRmYBAABXRUJQVlA4WAoAAAACAAAAPwAALwAAQU5JTQYAAAAAAAAAAABBTk1GaAAAAAAAAAAAAD8AAC8AAGQAAAJWUDggUAAAAHAEAJ0BKkAAMAA+bTaYSSQjIqEiqACADYlnBigAmQH4AAkxIbTtucyOZDQAAP7wm0P//kFywuuRr//8gP+QH/ID/+QH5U2ZzF5GiqoJ8IAAQU5NRmQAAAAAAAAAAAA/AAAvAABkAAAAVlA4IEwAAAD0AwCdASpAADAAPm0wkkkCKgAA2JZwDUBoB+AH4AAluY4Zdcxso2QQAP7lhz//a0Bwar/M///33wojt1/oS/TC1fjP8ALfj/d0C4AAQU5NRl4AAAAAAAAAAAA/AAAvAABkAAAAVlA4IEYAAACUAwCdASpAADAAPm0wkkkCKgAA2JZwYoAJkACH36zfsYD/4BcAAP75Hdv//kB//kB//kB//ID//iF3shz8Hdpv277cgAAA",
+    )
+    const animatedLossless = b64(
+      "UklGRrQAAABXRUJQVlA4WAoAAAACAAAAPwAALwAAQU5JTQYAAAAAAAAAAABBTk1GKAAAAAAAAAAAAD8AAC8AAGQAAAJWUDhMDwAAAC8/wAsABxD9j/4HIqL/AQBBTk1GKAAAAAAAAAAAAD8AAC8AAGQAAABWUDhMDwAAAC8/wAsAB9D/iP4HIqL/AQBBTk1GKAAAAAAAAAAAAD8AAC8AAGQAAABWUDhMDwAAAC8/wAsABxDR//4HIqL/AQA=",
+    )
+    const stillWithAlpha = b64(
+      "UklGRn4AAABXRUJQVlA4WAoAAAAQAAAAPwAALwAAQUxQSBAAAAABB1DAiAgACeH/ejGi/6kfVlA4IEgAAADwAwCdASpAADAAPm02mEkkIyKhIqgAgA2JZwDU9oB+AAAVGmMcPgzAAP7wm0P/8guWF1yNf/8gP+QH/ID/+PfFDYqwyAAAAAA=",
+    )
+    for (const animated of [animatedLossy, animatedLossless]) {
+      const error = rejection(() => checkImageBytes(animated, ALL, { label: "sticker.webp" }))
+      expect([error.kind, error.message]).toEqual(["unsupported", "sticker.webp: animated WebP is not supported; convert it to PNG or GIF"])
+      // the decoder is never asked
+      const inspect = () => {
+        throw new Error("the decoder must not run for an animated WebP")
+      }
+      expect(rejection(() => checkImageBytes(animated, ALL, { inspect })).message).toBe("image: animated WebP is not supported; convert it to PNG or GIF")
+    }
+    expect(checkImageBytes(WEBP, ALL)).toEqual({ mime: "image/webp", width: 2, height: 2 })
+    expect(checkImageBytes(stillWithAlpha, ALL)).toEqual({ mime: "image/webp", width: 64, height: 48 })
+    // a server that does not take WebP still says so first
+    const refused = rejection(() => checkImageBytes(animatedLossless, { maxImageBytes: 5 * MIB, imageMimeTypes: ["image/png"] }))
+    expect(refused.message).toBe("image: this daemon does not accept WebP images (allowed: PNG)")
+  })
+
   test("decodability: a valid signature with malformed data is rejected", () => {
     const broken = PNG.slice(0, 40)
     const error = rejection(() => checkImageBytes(broken, ALL, { label: "a.png" }))

@@ -2,10 +2,12 @@
  * Image validation and limits (design 6.2, 3.7, 3.8, 10.5).
  *
  * Every image the client attaches passes checkImageBytes(): non-empty, within the per-image byte limit, sniffed
- * as PNG, JPEG, GIF or WebP (sniff.ts) and accepted by the server (Limits.imageMimeTypes), decodable by OpenTUI's
- * imageInfo() (ot081:image.d.ts:84) with width and height >= 1 and at most 40 megapixels. The pixel cap is the
- * client's decode-bomb guard; OpenTUI 0.8.1 is stricter still: imageInfo() throws ImageError "dimension-limit"
- * above 25,000,000 pixels or 16384 pixels per side (measured with probe images), and that is reported the same way.
+ * as PNG, JPEG, GIF or WebP (sniff.ts) and accepted by the server (Limits.imageMimeTypes), not an animated WebP,
+ * decodable by OpenTUI's imageInfo() (ot081:image.d.ts:84) with width and height >= 1 and at most 40 megapixels.
+ * The pixel cap is the client's decode-bomb guard; OpenTUI 0.8.1 is stricter still: imageInfo() throws ImageError
+ * "dimension-limit" above 25,000,000 pixels or 16384 pixels per side (measured with probe images), and that is
+ * reported the same way. Animated WebP is refused by name before decoding: imageInfo() throws "unsupported-feature"
+ * for it, which would read like a corrupt file (animated GIF decodes fine).
  *
  * Limits come from ServerInfo.limits and are checked when attaching (checkAttachLimits) and again at send time
  * (checkSendLimits), because a reconnect can change them. There is no client-side downscaling: OpenTUI exposes no
@@ -14,7 +16,7 @@
 import { ImageError, imageInfo } from "@opentui/core"
 import { IMAGE_MIME_TYPES, type ImageMime, type PendingImage } from "../state/model.ts"
 import type { Limits, ServerInfo, TransportKind } from "../transport/types.ts"
-import { imageTypeName, sniffImageMime, UNSUPPORTED_IMAGE_MESSAGE } from "./sniff.ts"
+import { ANIMATED_WEBP_MESSAGE, imageTypeName, isAnimatedWebp, sniffImageMime, UNSUPPORTED_IMAGE_MESSAGE } from "./sniff.ts"
 
 const KIB = 1024
 const MIB = 1024 * 1024
@@ -168,6 +170,7 @@ export function checkImageBytes(
   const mime = sniffImageMime(bytes)
   if (mime === null) throw new ImageInputError("unsupported", `${label}: ${UNSUPPORTED_IMAGE_MESSAGE}`)
   if (!limits.imageMimeTypes.includes(mime)) throw notAccepted(label, mime, limits.imageMimeTypes)
+  if (isAnimatedWebp(bytes)) throw new ImageInputError("unsupported", `${label}: ${ANIMATED_WEBP_MESSAGE}`)
   let dimensions: ImageDimensions
   try {
     dimensions = (options.inspect ?? inspectImage)(bytes)

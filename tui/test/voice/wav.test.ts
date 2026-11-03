@@ -6,8 +6,14 @@ import { describe, expect, test } from "bun:test"
 import { ManualClock } from "@opentui/core/testing"
 import { cancelledError, isVoiceError, VoiceError } from "../../src/voice/errors.ts"
 import { createOpenTuiRecorder, CAPTURE_OPTIONS, ENGINE_OPTIONS, type AudioEngineLike, type CaptureStreamLike } from "../../src/voice/recorder-opentui.ts"
-import { createParecRecorder, parecArgv, PAREC_STOP_GRACE_MS } from "../../src/voice/recorder-parec.ts"
-import { CaptureSession, matchCaptureDevice, type CaptureHandle } from "../../src/voice/recorder.ts"
+import {
+  createParecRecorder,
+  looksLikePulseSource,
+  parecArgv,
+  parsePactlSources,
+  PAREC_STOP_GRACE_MS,
+} from "../../src/voice/recorder-parec.ts"
+import { CaptureSession, matchCaptureDevice, type CaptureHandle, type RecordingDevice } from "../../src/voice/recorder.ts"
 import type { CaptureDevice, LevelSample, WavClip } from "../../src/voice/types.ts"
 import {
   createWavClip,
@@ -156,11 +162,13 @@ describe("capture session", () => {
 function recorderCallbacks() {
   const levels: LevelSample[] = []
   const failures: VoiceError[] = []
+  const fallbacks: RecordingDevice[] = []
   const state = { firstChunks: 0 }
   const abort = new AbortController()
   return {
     levels,
     failures,
+    fallbacks,
     state,
     abort,
     options: (extra: { device?: string; maxDurationMs?: number } = {}) => ({
@@ -171,6 +179,7 @@ function recorderCallbacks() {
         state.firstChunks += 1
       },
       onFailure: (e: VoiceError) => failures.push(e),
+      onDeviceFallback: (device: RecordingDevice) => fallbacks.push(device),
       signal: abort.signal,
     }),
   }
@@ -255,6 +264,133 @@ describe("parec recorder", () => {
     await recorder.start(second.options())
     await flushAsync()
     expect(second.failures.map((e) => [e.kind, e.message])).toEqual([["recorder", "parec exited (code 1): Stream error: No such entity"]])
+  })
+
+  test("a PulseAudio source name, or something shaped like one, is all that ever reaches --device", () => {
+    for (const name of [
+      "alsa_input.usb-046d_C922_Pro_Stream_Webcam_ABC123-02.analog-stereo",
+      "alsa_input.usb-C922",
+      "alsa_output.pci-0000_00_1f.3.analog-stereo.monitor",
+      "bluez_input.00:1B:66:AA:BB:CC.0",
+      "@DEFAULT_SOURCE@",
+      "@DEFAULT_MONITOR@",
+    ]) {
+      expect([name, looksLikePulseSource(name)]).toEqual([name, true])
+    }
+    // OpenTUI device names, [voice] device substrings and anything with spaces or shell characters are not.
+    for (const name of ["C922", "C922 Pro Stream Webcam Analog Stereo", "Built-in Audio Analog Stereo", "echo-cancel-source", "", "a;b.c", "--device=x.y", ".monitor"]) {
+      expect([name, looksLikePulseSource(name)]).toEqual([name, false])
+    }
+    const short = "0\talsa_output.pci-0000_00_1f.3.analog-stereo.monitor\tPipeWire\ts32le 2ch 48000Hz\tSUSPENDED\n1\tmic1\tPipeWire\ts16le 1ch 16000Hz\tRUNNING\n\n"
+    expect(parsePactlSources(short)).toEqual(["alsa_output.pci-0000_00_1f.3.analog-stereo.monitor", "mic1"])
+  })
+
+  test("an OpenTUI device name or substring is not passed: parec records the default source and reports the fallback", async () => {
+    const clock = new ManualClock()
+    const fake = createFakeSpawn({ clock })
+    fake.on("parec", { stayAlive: true })
+    const listed: string[] = []
+    const listSources = async () => {
+      listed.push("pactl")
+      return ["alsa_input.usb-046d_C922-02.analog-stereo", "mic1"]
+    }
+    const recorder = createParecRecorder({ clock, env: ENV, spawn: fake.spawn, which: () => "/usr/bin/parec", listSources })
+    for (const device of ["C922", "C922 Pro Stream Webcam Analog Stereo"]) {
+      const handle = (await recorder.start(recorderCallbacks().options({ device }))) as CaptureHandle
+      expect(fake.lastCall?.argv.some((arg) => arg.startsWith("--device"))).toBe(false)
+      expect([handle.deviceName, handle.deviceFallback]).toEqual([null, true])
+      handle.cancel()
+    }
+    // A name the server lists exactly is passed, even though it does not look like a source name.
+    const exact = (await recorder.start(recorderCallbacks().options({ device: "mic1" }))) as CaptureHandle
+    expect(fake.lastCall?.argv.at(-1)).toBe("--device=mic1")
+    expect([exact.deviceName, exact.deviceFallback]).toEqual(["mic1", false])
+    exact.cancel()
+    expect(listed).toHaveLength(3)
+    // A name shaped like a source goes straight to parec, without asking pactl.
+    const named = (await recorder.start(recorderCallbacks().options({ device: "alsa_input.usb-C922" }))) as CaptureHandle
+    expect(fake.lastCall?.argv.at(-1)).toBe("--device=alsa_input.usb-C922")
+    expect(listed).toHaveLength(3)
+    named.cancel()
+  })
+
+  test("the default source list comes from `pactl list short sources` (injected spawn); without pactl nothing is passed", async () => {
+    const clock = new ManualClock()
+    const fake = createFakeSpawn({ clock })
+    fake.once(["pactl", "list", "short", "sources"], { stdout: ["0\tmic1\tPipeWire\ts16le 1ch 16000Hz\tIDLE\n"] })
+    fake.on("parec", { stayAlive: true })
+    const recorder = createParecRecorder({ clock, env: ENV, spawn: fake.spawn, which: () => "/usr/bin/parec" })
+    const handle = (await recorder.start(recorderCallbacks().options({ device: "mic1" }))) as CaptureHandle
+    const pactl = fake.callsFor("pactl")[0]
+    expect(pactl?.argv).toEqual(["pactl", "list", "short", "sources"])
+    expect(pactl?.env).toEqual(ENV)
+    expect(pactl?.options).toMatchObject({ stdin: "ignore", stdout: "pipe", stderr: "ignore" })
+    expect(fake.lastCall?.argv.at(-1)).toBe("--device=mic1")
+    expect(handle.deviceFallback).toBe(false)
+    handle.cancel()
+    // pactl is not installed (ENOENT): the source list is empty, so the name is not passed.
+    const fallback = (await recorder.start(recorderCallbacks().options({ device: "mic1" }))) as CaptureHandle
+    expect(fake.lastCall?.argv.some((arg) => arg.startsWith("--device"))).toBe(false)
+    expect(fallback.deviceFallback).toBe(true)
+    fallback.cancel()
+  })
+
+  test("a named source that fails before the first chunk is retried once without --device, as a device fallback", async () => {
+    const clock = new ManualClock()
+    const fake = createFakeSpawn({ clock })
+    fake.once("parec", { stderr: ["Stream error: No such entity\n"], exitCode: 1 })
+    fake.once("parec", { stayAlive: true, ignoreSignals: ["SIGINT"] })
+    const recorder = createParecRecorder({ clock, env: ENV, spawn: fake.spawn, which: () => "/usr/bin/parec" })
+    const cb = recorderCallbacks()
+    const handle = (await recorder.start(cb.options({ device: "alsa_input.usb-gone-00.analog-stereo" }))) as CaptureHandle
+    await flushAsync()
+    expect(fake.calls.map((call) => call.argv.at(-1))).toEqual(["--device=alsa_input.usb-gone-00.analog-stereo", "--stream-name=dictation"])
+    expect(cb.failures).toEqual([])
+    expect(cb.fallbacks).toEqual([{ deviceName: null, deviceFallback: true }])
+    expect([handle.deviceName, handle.deviceFallback]).toEqual([null, true])
+    // The default source records; stop() stops the second child.
+    const child = fake.calls[1]?.process as FakeChildProcess
+    child.pushStdout(s16le(new Array(320).fill(1_000)))
+    await flushAsync()
+    expect(cb.state.firstChunks).toBe(1)
+    const stopping = handle.stop()
+    await flushAsync()
+    clock.advance(PAREC_STOP_GRACE_MS)
+    const clip = await stopping
+    expect(child.kills).toEqual(["SIGINT", "SIGKILL"])
+    expect(clip.durationMs).toBe(20)
+  })
+
+  test("the retry happens once and only before the first chunk; without a device a failure is reported at once", async () => {
+    const clock = new ManualClock()
+    const fake = createFakeSpawn({ clock })
+    fake.on("parec", { stderr: ["Connection failure: Connection refused\n"], exitCode: 1 })
+    const recorder = createParecRecorder({ clock, env: ENV, spawn: fake.spawn, which: () => "/usr/bin/parec" })
+    const twice = recorderCallbacks()
+    await recorder.start(twice.options({ device: "alsa_input.usb-gone" }))
+    await flushAsync()
+    expect(fake.calls).toHaveLength(2)
+    expect(twice.fallbacks).toHaveLength(1)
+    expect(twice.failures.map((e) => e.message)).toEqual(["parec exited (code 1): Connection failure: Connection refused"])
+
+    const plain = recorderCallbacks()
+    await recorder.start(plain.options())
+    await flushAsync()
+    expect(fake.calls).toHaveLength(3)
+    expect(plain.fallbacks).toEqual([])
+    expect(plain.failures).toHaveLength(1)
+
+    // After audio arrived, an exit is a failure of the recording, never a retry.
+    const late = createFakeSpawn({ clock })
+    late.once("parec", { stdout: [s16le(new Array(320).fill(1_000))], stderr: ["Stream error: Device unplugged\n"], exitCode: 1 })
+    const lateRecorder = createParecRecorder({ clock, env: ENV, spawn: late.spawn, which: () => "/usr/bin/parec" })
+    const after = recorderCallbacks()
+    await lateRecorder.start(after.options({ device: "alsa_input.usb-C922" }))
+    await flushAsync()
+    expect(late.calls).toHaveLength(1)
+    expect(after.state.firstChunks).toBe(1)
+    expect(after.fallbacks).toEqual([])
+    expect(after.failures.map((e) => e.message)).toEqual(["parec exited (code 1): Stream error: Device unplugged"])
   })
 
   test("missing parec: available() says so and start() throws a recorder error", async () => {

@@ -6,8 +6,8 @@
  *    the reason, forces a failing exit code, and the global afterEach fails the test that leaked it.
  * 2. Temp directories from test/helpers/tmp.ts are removed after each test (makeTempDir) and at the end of the
  *    run (makeRunTempDir).
- * 3. Host safety: Bun.spawn and Bun.spawnSync refuse the real desktop helpers (recorders, clipboard, screenshot,
- *    notifier, opener, Hex) and privilege or service tools; tests inject test/helpers/fake-spawn.ts. An absolute
+ * 3. Host safety: Bun.spawn and Bun.spawnSync refuse the real desktop helpers (recorders and pactl, clipboard,
+ *    screenshot, notifier, opener, Hex) and privilege or service tools; tests inject test/helpers/fake-spawn.ts. An absolute
  *    path that resolves inside os.tmpdir() (a fake a test wrote) or inside tui/test/ (a committed fake, e.g. a
  *    fixture named `hex`) is allowed. Async node:child_process spawn/execFile route through Bun.spawn and are
  *    guarded too; its *Sync functions are bound before any preload runs and cannot be guarded, so tests must not
@@ -53,6 +53,7 @@ afterAll(async () => {
 
 const GUARDED_COMMANDS: ReadonlySet<string> = new Set([
   "parec",
+  "pactl",
   "pw-record",
   "pw-cat",
   "arecord",

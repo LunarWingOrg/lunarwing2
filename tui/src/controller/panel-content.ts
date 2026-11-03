@@ -16,7 +16,7 @@ import type { ImageProtocolStatus } from "../images/protocol.ts"
 import { formatBytes } from "../images/limits.ts"
 import { imageStorageNotice } from "../images/attach.ts"
 import { truncatedNotice } from "./approval-reply.ts"
-import { KEYMAP, keyLabel, pttLabel } from "./keymap.ts"
+import { KEYMAP, KKP_ONLY_LEGEND, KKP_ONLY_MARK, keyLabel, pttLabel, type KeymapEntry } from "./keymap.ts"
 import { cellWidth, formatClock, formatSeconds, truncate, wrapText } from "../util.ts"
 
 export interface ThreadRow {
@@ -123,7 +123,7 @@ const COMMAND_HELP: readonly (readonly [string, string])[] = [
   ["/copy [n]", "copy the newest (n-th newest) reply"],
   ["/voice [status|use <id>|auto|order <ids>|device [name]|test|privacy|retry]", "voice sources and devices"],
   ["/transport [status|reconnect]", "connection details; reconnect now"],
-  ["/interrupt, /stop, /steer <note>", "stop the running turn; add a note to it"],
+  ["/interrupt, /stop, /steer <note>", "stop the running turn (or cancel a message that shows \"no reply yet\"); add a note to it"],
   ["/approve, /always, /deny, /approval view", "answer or view the focused approval"],
   ["/thread [list|new|<id prefix>]", "threads of this gateway"],
   ["/clear, /new", "forwarded to the daemon"],
@@ -138,14 +138,22 @@ function hangingLines(label: string, text: string, labelWidth: number, width: nu
   return parts.map((part, index) => (index === 0 ? `  ${label.padEnd(labelWidth)} ${part}` : `${" ".repeat(indent)}${part}`))
 }
 
+/** "Ctrl+S, Ctrl+Enter (KKP)": a key that needs the kitty keyboard protocol carries the mark. */
+function keyLabels(entry: KeymapEntry, env: PanelEnv): string {
+  if (entry.action === "ptt") return env.pttKeys.map(keyLabel).join(", ")
+  const kkpOnly = entry.kkpOnly ?? []
+  return entry.keys.map((key) => (kkpOnly.includes(key) ? `${key} ${KKP_ONLY_MARK}` : key)).join(", ")
+}
+
 function helpLines(state: AppState, env: PanelEnv): string[] {
-  const labels = KEYMAP.map((entry) => (entry.action === "ptt" ? env.pttKeys.map(keyLabel) : [...entry.keys]).join(", "))
-  const labelWidth = Math.min(30, Math.max(...labels.map((label) => label.length)))
+  const labels = KEYMAP.map((entry) => keyLabels(entry, env))
+  const labelWidth = Math.min(36, Math.max(...labels.map((label) => label.length)))
   const keys = KEYMAP.flatMap((entry, index) => hangingLines(labels[index] ?? "", entry.help, labelWidth, env.width))
   const commands = COMMAND_HELP.flatMap(([command, help]) => wrapIndented(`  ${command} - ${help}`, env.width))
   return [
     "Keys",
     ...keys,
+    ...wrapIndented(`  ${KKP_ONLY_LEGEND}`, env.width),
     "",
     "Push-to-talk",
     ...wrapIndented(`  ${pttHelp(state, env.pttKeys)}`, env.width),

@@ -10,7 +10,9 @@ import { createInitialState, type Store } from "../../src/state/model.ts"
 import { createStore } from "../../src/state/store.ts"
 import { VoiceError } from "../../src/voice/errors.ts"
 import { createVoiceController, VOICE_TIMING } from "../../src/voice/manager.ts"
+import { createParecRecorder } from "../../src/voice/recorder-parec.ts"
 import type { Recorder, VoiceController, VoiceUiState } from "../../src/voice/types.ts"
+import { createFakeSpawn, type FakeChildProcess, type FakeSpawn } from "../helpers/fake-spawn.ts"
 import { FakeRecorder, type FakeRecorderOptions } from "../mocks/fake-recorder.ts"
 import { ALL_VOICE_ACKS, FakeComposer, FakeSource, FakeStateFile, flushAsync, isZeroed } from "../mocks/fake-sources.ts"
 
@@ -325,6 +327,60 @@ describe("devices, privacy and status", () => {
     expect(r.voice.status().device).toEqual({ name: null, origin: "default" })
     press(r)
     expect(r.recorder.startCalls[1]?.device).toBeUndefined()
+  })
+
+  test("parec: a configured source it cannot open is retried on the default source, with the fallback notice", async () => {
+    let fake: FakeSpawn | null = null
+    const r = rig({
+      config: { device: "alsa_input.usb-gone-00.analog-stereo" },
+      recorder: { startError: "OpenTUI audio is unavailable" },
+      extraRecorders: (clock) => {
+        fake = createFakeSpawn({ clock })
+        fake.once("parec", { stderr: ["Stream error: No such entity\n"], exitCode: 1 })
+        fake.once("parec", { stayAlive: true })
+        return [createParecRecorder({ clock, env: { PATH: "/usr/bin" }, spawn: fake.spawn, which: () => "/usr/bin/parec" })]
+      },
+    })
+    await flushAsync()
+    press(r)
+    await flushAsync()
+    const spawned = (fake as FakeSpawn | null)?.calls ?? []
+    expect(spawned.map((call) => call.argv.some((arg) => arg.startsWith("--device=")))).toEqual([true, false])
+    expect(notices(r)).toContain('capture device "alsa_input.usb-gone-00.analog-stereo" not found; using the default source - /voice device')
+    expect(notices(r).some((text) => text.startsWith("voice unavailable"))).toBe(false)
+    const child = spawned[1]?.process as FakeChildProcess
+    // half a second of digital silence: the clip is discarded, naming the source that really recorded it
+    child.pushStdout(new Uint8Array(16_000))
+    await flushAsync()
+    expect(voice(r)).toMatchObject({ phase: "recording", captureLive: true, recorder: "parec" })
+    // past the key-repeat window the second tap stops the toggle recording
+    r.clock.advance(1_000)
+    await flushAsync()
+    press(r)
+    await flushAsync()
+    await flushAsync()
+    expect(notices(r)).toContain("no signal from the default source - /voice device")
+  })
+
+  test("parec: an OpenTUI device name is never passed to --device; the default source records with the notice", async () => {
+    let fake: FakeSpawn | null = null
+    const r = rig({
+      state: { voiceDevice: "C922 Pro Stream Webcam Analog Stereo" },
+      recorder: { startError: "OpenTUI audio is unavailable" },
+      extraRecorders: (clock) => {
+        fake = createFakeSpawn({ clock })
+        fake.on("parec", { stayAlive: true })
+        const listSources = async () => ["alsa_input.usb-046d_C922_Pro_Stream_Webcam-02.analog-stereo"]
+        return [createParecRecorder({ clock, env: { PATH: "/usr/bin" }, spawn: fake.spawn, which: () => "/usr/bin/parec", listSources })]
+      },
+    })
+    await flushAsync()
+    press(r)
+    await flushAsync()
+    const spawned = (fake as FakeSpawn | null)?.calls ?? []
+    expect(spawned).toHaveLength(1)
+    expect(spawned[0]?.argv.some((arg) => arg.startsWith("--device"))).toBe(false)
+    expect(notices(r)).toContain('capture device "C922 Pro Stream Webcam Analog Stereo" not found; using the default source - /voice device')
   })
 
   test("a stored device wins over [voice] device", async () => {

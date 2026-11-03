@@ -408,10 +408,11 @@ export interface GatewayRig extends RuntimeHarness {
 export const TEST_UID = process.getuid?.() ?? 1000
 
 export async function startGatewayRuntime(opts: GatewayRigOptions): Promise<GatewayRig> {
-  const mock = await MockGateway.start({ mode: opts.mode, token: GATEWAY_TEST_TOKEN, ...opts.mock })
-  opts.setup?.(mock)
   const clock = new ManualClock()
   clock.setTime(opts.clockStart ?? TEST_START_MS)
+  // The mock's uptime_secs counts on the same clock, so a mock restart() reads as one to the client.
+  const mock = await MockGateway.start({ mode: opts.mode, token: GATEWAY_TEST_TOKEN, now: () => clock.now(), ...opts.mock })
+  opts.setup?.(mock)
   const token = new MemoryTokenSource(opts.clientToken ?? GATEWAY_TEST_TOKEN, opts.tokenKind ?? "client", "tenants/derpy.json")
   const stateFile = new MemoryStateFile(opts.state ?? {})
   const gateway = new GatewayTransport({

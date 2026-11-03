@@ -108,7 +108,9 @@ pub(super) async fn await_thread_outcome(
 impl TurnCompletion {
     /// Waits up to `budget` for the thread, then completes the turn. Past the budget
     /// the late watcher takes over delivery, and the agent loop reports this message
-    /// `Finished(Detached)` (the hint below); the watcher reports its real finish.
+    /// `Finished(Detached)` (the hint below); the watcher reports its real finish. When
+    /// the loop's soft timeout already finished the message, the hint is dropped and the
+    /// watcher only delivers.
     async fn await_outcome(
         self,
         mut events: tokio::sync::broadcast::Receiver<lunarwing_engine::ThreadEvent>,
@@ -239,21 +241,43 @@ impl TurnCompletion {
         {
             cancellation.disarm();
         }
-        let outcome = late_outcome(&result);
+        let outcome = self.deliver_late_result(result).await;
+        self.report_late_finish(outcome).await;
+    }
+
+    /// Delivers the late result and rates it like the agent loop rates a handler result
+    /// (TUI design 8.2.2): a reply is `replied` only once it reached the channel.
+    async fn deliver_late_result(&self, result: Result<Option<String>, Error>) -> TurnOutcome {
         match result {
-            Ok(Some(text)) => self.delivery.deliver(&self.message, text).await,
-            Ok(None) => {}
+            Ok(Some(text)) if !text.is_empty() => {
+                self.delivery.deliver(&self.message, text).await.outcome()
+            }
+            Ok(_) => TurnOutcome::NoReply,
             Err(error) => {
                 tracing::error!(thread_id = %self.thread_id, %error, "Late turn completion failed");
                 self.delivery
                     .deliver(&self.message, error.user_facing_message())
                     .await;
+                TurnOutcome::Failed
             }
         }
-        // The one `Finished` that follows `Detached`, after the late reply; hints the
-        // late completion recorded (interrupted, failed, paused) apply.
-        self.delivery
-            .channels
+    }
+
+    /// The one `Finished` that follows `Detached`, after the late reply; hints the late
+    /// completion recorded (interrupted, failed, paused) apply. Skipped when the agent
+    /// loop already ended the message otherwise: its soft timeout can fire before this
+    /// turn detached, and then `timed_out` was the message's last `Finished`.
+    async fn report_late_finish(&self, outcome: TurnOutcome) {
+        let channels = &self.delivery.channels;
+        if channels.has_finished(self.message.id) {
+            tracing::debug!(
+                thread_id = %self.thread_id,
+                %outcome,
+                "Late turn finished after the agent loop ended its message; no second finish"
+            );
+            return;
+        }
+        channels
             .message_lifecycle(&self.message, MessageLifecycle::Finished(outcome))
             .await;
     }
@@ -519,16 +543,6 @@ impl TurnCompletion {
         };
         insert_and_notify_pending_gate(&self.delivery.channels, &self.state, &self.message, pending)
             .await
-    }
-}
-
-/// The outcome of a late result, rated like the agent loop rates a handler result
-/// (TUI design 8.2.2); hints recorded by the late completion refine it.
-fn late_outcome(result: &Result<Option<String>, Error>) -> TurnOutcome {
-    match result {
-        Ok(Some(text)) if !text.is_empty() => TurnOutcome::Replied,
-        Ok(_) => TurnOutcome::NoReply,
-        Err(_) => TurnOutcome::Failed,
     }
 }
 

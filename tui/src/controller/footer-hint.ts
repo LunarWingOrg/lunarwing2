@@ -13,9 +13,11 @@
  * | idle, no voice (--no-voice) | Ctrl+V image - /shot - Enter send - F1 help                           |
  *
  * Refinements: an armed credential Esc reads "press Esc again to cancel the credential"; a send guard (approval
- * keyword, //restart) uses the confirmation row; "opening mic..." while the capture starts. "next" reads Alt+]
- * only where that key arrives (KKP outside tmux; in the legacy encoding Alt+] is ESC ], which the input parser
- * drops), else Alt+J. While an info panel covers a pending prompt, or the full view shows a settled one, the
+ * keyword, //restart) uses the confirmation row; "opening mic..." while the capture starts. Every key offered
+ * arrives in the legacy encoding too (inside tmux): the KKP-only keys of KEYMAP (Ctrl+Enter, Shift+Enter, Ctrl+-,
+ * Ctrl+.) never appear here, so the running-turn row offers Ctrl+S, not Ctrl+Enter. "next" reads Alt+] only where
+ * that key arrives (KKP outside tmux; in the legacy encoding Alt+] is ESC ], which the input parser drops), else
+ * Alt+J. While an info panel covers a pending prompt, or the full view shows a settled one, the
  * approval keys answer nothing (controller/session.ts), so the row says how to get the prompt back on screen.
  * While the focused prompt has hidden text (approving needs the full view, SEC-04) "Alt+V view" comes first.
  */

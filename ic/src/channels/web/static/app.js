@@ -981,6 +981,44 @@ function sendMessage() {
   sendChatPayload(body, userMsg);
 }
 
+// The server refused the payload itself: an image it does not accept
+// (422), images over the size limits (413), or a malformed field (400).
+// Sending the same body again fails the same way, so these get no Retry.
+function isRefusedPayload(status) {
+  return status === 400 || status === 413 || status === 415 || status === 422;
+}
+
+// The refusal reason is the server's plain-text body (apiFetch puts it in
+// err.message); keep the toast to a readable length.
+function refusalReason(err) {
+  const reason = String((err && err.message) || '').trim();
+  return reason.length > 300 ? reason.slice(0, 300) + '…' : reason;
+}
+
+// Hand a refused message back to the composer so the user can drop the
+// image the server named and send again. The text comes back only into an
+// empty input, the images only into free staging slots, and nothing comes
+// back once the user has switched to another thread.
+function restoreRefusedDraft(body) {
+  if (body.thread_id && body.thread_id !== currentThreadId) return;
+  const input = document.getElementById('chat-input');
+  if (input && !input.value && body.content) {
+    input.value = body.content;
+    autoResizeTextarea(input);
+  }
+  const images = Array.isArray(body.images) ? body.images : [];
+  images.forEach((img) => {
+    if (stagedImages.length + _pendingImageReads >= MAX_STAGED_IMAGES) return;
+    stagedImages.push({
+      media_type: img.media_type,
+      data: img.data,
+      dataUrl: 'data:' + img.media_type + ';base64,' + img.data,
+      bytes: Math.floor((img.data.length * 3) / 4),
+    });
+  });
+  if (images.length > 0) renderImagePreviews();
+}
+
 function sendChatPayload(body, userMsg) {
   apiFetch('/api/chat/send', {
     method: 'POST',
@@ -996,6 +1034,15 @@ function sendChatPayload(body, userMsg) {
         _sendCooldown = false;
         if (sendBtn) sendBtn.disabled = false;
       }, 2000);
+    }
+    if (isRefusedPayload(err.status)) {
+      showToast(I18n.t('chat.sendRefused', { reason: refusalReason(err) }), 'error');
+      if (userMsg) {
+        userMsg.classList.add('send-failed');
+        userMsg.style.borderStyle = 'dashed';
+      }
+      restoreRefusedDraft(body);
+      return;
     }
     // Keep the user message in DOM, add a retry link. M10: the retry
     // resubmits the original payload, including any image attachments.
@@ -1056,23 +1103,41 @@ function renderImagePreviews() {
   });
 }
 
+// The gateway's image limits (GATEWAY_CHAT_API.md, Images): at most 5
+// images, 5 MiB each and 7 MiB in total, and only PNG, JPEG, GIF or WebP
+// by their magic bytes. file.type is only the browser's guess, so the
+// server can still refuse a file; sendChatPayload shows that refusal.
 const MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB per image
+const MAX_TOTAL_IMAGE_BYTES = 7 * 1024 * 1024; // 7 MB per message
 const MAX_STAGED_IMAGES = 5;
+const SUPPORTED_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/jpg', 'image/pjpeg', 'image/gif', 'image/webp'];
 // Readers that have been started but not yet pushed into stagedImages.
 // Counting them reserves slots so concurrent batches cannot exceed the
-// staging limit (M11).
+// staging limit (M11). Their sizes are reserved the same way.
 let _pendingImageReads = 0;
+let _pendingImageBytes = 0;
+
+function stagedImageBytes() {
+  return stagedImages.reduce((sum, img) => sum + (img.bytes || 0), 0) + _pendingImageBytes;
+}
 
 function handleImageFiles(files) {
   // Validate and slice synchronously: stagedImages only grows inside async
   // FileReader callbacks, so checking it per file in this loop would let a
   // multi-file selection overshoot MAX_STAGED_IMAGES.
   const available = MAX_STAGED_IMAGES - stagedImages.length - _pendingImageReads;
+  let totalBytes = stagedImageBytes();
   const accepted = [];
+  let rejectedType = 0;
   let rejectedSize = 0;
+  let rejectedTotal = 0;
   let rejectedOverflow = 0;
   Array.from(files).forEach(file => {
     if (!file.type.startsWith('image/')) return;
+    if (!SUPPORTED_IMAGE_TYPES.includes(file.type.toLowerCase())) {
+      rejectedType++;
+      return;
+    }
     if (file.size > MAX_IMAGE_SIZE_BYTES) {
       rejectedSize++;
       return;
@@ -1081,29 +1146,43 @@ function handleImageFiles(files) {
       rejectedOverflow++;
       return;
     }
+    if (totalBytes + file.size > MAX_TOTAL_IMAGE_BYTES) {
+      rejectedTotal++;
+      return;
+    }
+    totalBytes += file.size;
     accepted.push(file);
   });
+  if (rejectedType > 0) {
+    showToast(I18n.t('chat.imageUnsupported', { count: rejectedType }), 'error');
+  }
   if (rejectedSize > 0) {
     showToast(I18n.t('chat.imageTooLarge', { count: rejectedSize }), 'error');
   }
   if (rejectedOverflow > 0) {
     showToast(I18n.t('chat.imageLimit', { max: MAX_STAGED_IMAGES }), 'error');
   }
+  if (rejectedTotal > 0) {
+    showToast(I18n.t('chat.imageTotalTooLarge', { count: rejectedTotal, max: MAX_TOTAL_IMAGE_BYTES / (1024 * 1024) }), 'error');
+  }
   accepted.forEach(file => {
     _pendingImageReads++;
+    _pendingImageBytes += file.size;
     const reader = new FileReader();
     reader.onload = function(e) {
       _pendingImageReads--;
+      _pendingImageBytes -= file.size;
       const dataUrl = e.target.result;
       const commaIdx = dataUrl.indexOf(',');
       const meta = dataUrl.substring(0, commaIdx); // e.g. "data:image/png;base64"
       const base64 = dataUrl.substring(commaIdx + 1);
       const mediaType = meta.replace('data:', '').replace(';base64', '');
-      stagedImages.push({ media_type: mediaType, data: base64, dataUrl: dataUrl });
+      stagedImages.push({ media_type: mediaType, data: base64, dataUrl: dataUrl, bytes: file.size });
       renderImagePreviews();
     };
     reader.onerror = function() {
       _pendingImageReads--;
+      _pendingImageBytes -= file.size;
       showToast(I18n.t('chat.imageReadFailed'), 'error');
     };
     reader.readAsDataURL(file);

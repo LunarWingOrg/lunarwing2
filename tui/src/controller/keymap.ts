@@ -12,7 +12,10 @@
  *
  * Legacy encodings: Alt+] arrives as ESC ], the start of an OSC string, which OpenTUI's input parser drops after its
  * 20 ms timeout (verified on 0.8.1), so "next approval" also has Alt+J. Only Alt+<letter or digit> combinations
- * are reported in the legacy encoding.
+ * are reported in the legacy encoding. tmux always delivers the legacy encoding, and kitty sends Ctrl+Enter there as
+ * a plain CR (Enter: the message is queued, not interrupting), Ctrl+- as "-" and Ctrl+. as ".". KEYMAP marks such
+ * keys `kkpOnly`; every action that has one also has a key that arrives in the legacy encoding (Ctrl+S, Ctrl+_,
+ * Ctrl+Y, Alt+J, Ctrl+J), and the help shows the mark.
  */
 import { decodePasteBytes, type KeyEvent, type PasteEvent } from "@opentui/core"
 import type { Clock } from "@opentui/core"
@@ -45,6 +48,11 @@ export type KeyAction =
 
 export interface KeymapEntry {
   readonly keys: readonly string[]
+  /**
+   * Keys of `keys` that arrive only with the kitty keyboard protocol (KKP): never inside tmux, nor in terminals
+   * without it. The help marks them "(KKP)"; the other keys of the entry work everywhere.
+   */
+  readonly kkpOnly?: readonly string[]
   readonly action: KeyAction
   /** When the binding applies, in words (help panel). */
   readonly when: string
@@ -52,11 +60,23 @@ export interface KeymapEntry {
   readonly help: string
 }
 
+/** The help's suffix for a KKP-only key, and the legend line that explains it. */
+export const KKP_ONLY_MARK = "(KKP)"
+export const KKP_ONLY_LEGEND =
+  "(KKP): only with the kitty keyboard protocol; inside tmux and in terminals without it these keys arrive as plain " +
+  "keys (Ctrl+Enter as Enter, Ctrl+- as \"-\"), so use the other key of the same line"
+
 /** The 3.10.4 table. "F9" and "Ctrl+Space" stand for the configured push-to-talk keys. */
 export const KEYMAP: readonly KeymapEntry[] = Object.freeze([
   { keys: ["Enter"], action: "submit", when: "always", help: "send (queued while a turn runs); confirm a guarded send or a typed approval; send the credential" },
-  { keys: ["Ctrl+J", "Alt+Enter", "Shift+Enter"], action: "newline", when: "composer", help: "new line in the message (Shift+Enter needs the kitty keyboard protocol)" },
-  { keys: ["Ctrl+S", "Ctrl+Enter"], action: "interrupt_send", when: "always", help: "interrupt the running turn, then send; with an empty message interrupt only" },
+  { keys: ["Ctrl+J", "Alt+Enter", "Shift+Enter"], kkpOnly: ["Shift+Enter"], action: "newline", when: "composer", help: "new line in the message" },
+  {
+    keys: ["Ctrl+S", "Ctrl+Enter"],
+    kkpOnly: ["Ctrl+Enter"],
+    action: "interrupt_send",
+    when: "always",
+    help: "interrupt the running turn, then send; with an empty message interrupt only; also cancels a message that shows \"no reply yet\"",
+  },
   { keys: ["F9", "Ctrl+Space"], action: "ptt", when: "voice", help: "push-to-talk (tap to start and stop, or hold)" },
   { keys: ["F1"], action: "help", when: "always", help: "this help" },
   { keys: ["Esc"], action: "escape", when: "always", help: "close the panel; cancel a confirmation; cancel dictation; dismiss the newest notice" },
@@ -67,11 +87,11 @@ export const KEYMAP: readonly KeymapEntry[] = Object.freeze([
   { keys: ["Alt+A"], action: "always", when: "approval pending", help: "approve and always allow this tool (otherwise Alt+A is line start)" },
   { keys: ["Alt+N"], action: "deny", when: "approval pending", help: "deny the focused tool call" },
   { keys: ["Alt+V"], action: "view_approval", when: "approval pending", help: "view the full approval text" },
-  { keys: ["Alt+]", "Alt+J"], action: "next_approval", when: "several approvals", help: "focus the next pending approval" },
+  { keys: ["Alt+]", "Alt+J"], kkpOnly: ["Alt+]"], action: "next_approval", when: "several approvals", help: "focus the next pending approval" },
   { keys: ["Alt+R"], action: "voice_retry", when: "voice clip kept", help: "retry the kept voice clip" },
   { keys: ["Up", "Down"], action: "history", when: "first / last line", help: "previous / next sent message or cleared draft" },
-  { keys: ["Ctrl+_"], action: "undo", when: "composer", help: "undo (what Ctrl+- sends, also inside tmux)" },
-  { keys: ["Ctrl+."], action: "redo", when: "composer", help: "redo" },
+  { keys: ["Ctrl+_", "Ctrl+/", "Ctrl+-"], kkpOnly: ["Ctrl+-"], action: "undo", when: "composer", help: "undo (Ctrl+_ is Ctrl+Shift+- on most layouts)" },
+  { keys: ["Ctrl+Y", "Ctrl+."], kkpOnly: ["Ctrl+."], action: "redo", when: "composer", help: "redo" },
   { keys: ["PageUp", "PageDown"], action: "scroll", when: "always", help: "scroll the panel or the transcript; the end follows new text again" },
   { keys: ["Ctrl+C"], action: "cancel_or_quit", when: "always", help: "cancel dictation; else clear the message (Ctrl+_ restores it); else press twice to quit" },
 ])

@@ -3542,14 +3542,20 @@ fn truncate_status_text(input: &str, max_chars: usize) -> String {
 }
 
 /// Whether a status update is tool-activity progress (ToolStarted /
-/// ToolCompleted / ToolResult). WASM guests only receive these when the
-/// global `tool_activity` flag routes them.
+/// ToolCompleted / ToolResult / ImageGenerated). WASM guests only receive
+/// these when the global `tool_activity` flag routes them.
+///
+/// ImageGenerated counts as tool activity because it stands in for the
+/// image tool's ToolResult: both engines used to send that ToolResult,
+/// which this gate dropped by default. Without it here, every image tool
+/// call would post an "[image generated]" line to the guest's chat.
 fn is_tool_activity_status(status: &StatusUpdate) -> bool {
     matches!(
         status,
         StatusUpdate::ToolStarted { .. }
             | StatusUpdate::ToolCompleted { .. }
             | StatusUpdate::ToolResult { .. }
+            | StatusUpdate::ImageGenerated { .. }
     )
 }
 
@@ -5616,6 +5622,11 @@ mod tests {
         assert!(is_tool_activity_status(&StatusUpdate::ToolResult {
             name: "shell".to_string(),
             preview: "ok".to_string(),
+        }));
+        // Stands in for the image tool's ToolResult, so it is gated the same way.
+        assert!(is_tool_activity_status(&StatusUpdate::ImageGenerated {
+            data_url: "data:image/png;base64,iVBORw0KGgo=".to_string(),
+            path: None,
         }));
 
         assert!(!is_tool_activity_status(&StatusUpdate::Thinking(

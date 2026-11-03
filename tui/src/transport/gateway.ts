@@ -33,6 +33,7 @@ import type {
   AuthCancelRequest,
   AuthTokenRequest,
   ControlRequest,
+  DaemonStart,
   OutgoingImage,
   ResyncSnapshot,
   SendRequest,
@@ -60,6 +61,8 @@ export const GATEWAY_TIMEOUTS = Object.freeze({
   transcribeMs: 150_000,
   /** Until the event-stream response headers arrive; afterwards the watchdog applies. */
   streamOpenMs: 10_000,
+  /** The daemon-start probe (GET /api/gateway/status runs every channel's health check, Signal's over HTTP). */
+  statusMs: 3_000,
 })
 
 /** Three missed 15 s keepalives (ic/src/channels/web/sse.rs). */
@@ -396,12 +399,15 @@ export class GatewayTransport implements Transport {
       if (signal.aborted) throw cancelled()
       await this.checkHealth(signal)
       await this.openEventStream(conn, signal)
+      // Alongside the other steps: best effort, it never fails or holds up the connect for long.
+      const daemon = this.probeDaemonStart(signal)
       const threadId = await this.ensureThread(signal)
       const caps = await this.fetchCapabilities(signal)
       const voice = await this.fetchVoiceStatus(signal)
       const seed = await this.fetchSnapshot(threadId, signal)
+      const daemonStart = await daemon
       if (conn.ended) throw conn.failure ?? new TransportError("closed", "the connection ended while connecting")
-      const info = this.buildServerInfo(caps, voice, threadId)
+      const info = this.buildServerInfo(caps, voice, threadId, daemonStart)
       this.release(conn, caps !== null, seed)
       conn.seed = seed
       this.info = info
@@ -753,6 +759,32 @@ export class GatewayTransport implements Transport {
     })
   }
 
+  /**
+   * When this daemon process started, from GET /api/gateway/status `uptime_secs` (authenticated, owner-checked like
+   * every token-bearing request; client tokens may read it, design 8.3.5). The status was computed between the two
+   * Clock readings, from whole seconds, so the start lies in (sent - (uptime + 1) s, answered - uptime s]. A later
+   * connect whose start is later talks to a restarted daemon (state/correlate.ts rule 13). Never rejects: null on any
+   * failure, a non-200 or an answer without uptime_secs, and after GATEWAY_TIMEOUTS.statusMs.
+   */
+  private async probeDaemonStart(signal: AbortSignal): Promise<DaemonStart | null> {
+    const spec: CallSpec = { ...this.readSpec("/api/gateway/status", undefined, signal), timeoutMs: GATEWAY_TIMEOUTS.statusMs }
+    try {
+      const sentAt = this.opts.clock.now()
+      const uptime = await this.call(spec, async (res) => {
+        if (res.status !== 200) {
+          discard(res)
+          return null
+        }
+        return wire.parseGatewayStatus(await readJson(res, labelOf(spec)))?.uptime_secs ?? null
+      })
+      if (uptime === null) return null
+      const answeredAt = this.opts.clock.now()
+      return { earliest: sentAt - (uptime + 1) * 1000, latest: answeredAt - uptime * 1000, measuredAt: answeredAt }
+    } catch {
+      return null
+    }
+  }
+
   /** Not rate-limited, and checked before any transcription: the voice limiter counts before its config check. */
   private async fetchVoiceStatus(signal: AbortSignal): Promise<wire.VoiceStatusResponse | null> {
     const spec = this.readSpec("/api/voice/status", undefined, signal)
@@ -822,6 +854,7 @@ export class GatewayTransport implements Transport {
     caps: wire.ChatCapabilities | null,
     voice: wire.VoiceStatusResponse | null,
     threadId: ThreadId,
+    daemonStart: DaemonStart | null,
   ): ServerInfo {
     const credential = caps ? caps.credential : legacyCredential(this.opts.token.kind())
     const warnings = [...(this.opts.warnings ?? []), ...this.pendingWarnings.splice(0)]
@@ -844,6 +877,7 @@ export class GatewayTransport implements Transport {
       capabilities: caps ? wire.capabilitiesFromChat(caps, voice) : wire.legacyGatewayCapabilities(voice),
       limits: caps ? wire.limitsFromWire(caps.limits) : wire.legacyGatewayLimits(voice),
       warnings: [...new Set(warnings)],
+      daemonStart,
     }
   }
 

@@ -4,8 +4,13 @@
  *
  * OpenTUI merges COMPOSER_KEY_BINDINGS over defaultTextareaKeyBindings keyed by name + modifiers, so they replace
  * the defaults return -> newline and kpenter -> newline (ot081:index.bun.js:8540-8605; mergeKeyBindings). Enter
- * submits; Ctrl+J (LF), Alt+Enter (ESC CR, also inside tmux) and Shift+Enter (KKP only) insert a newline; Ctrl+_
- * (0x1F, what Ctrl+- sends in the legacy encoding, also inside tmux) undoes, Ctrl+. redoes (the default).
+ * submits; Ctrl+J (LF), Alt+Enter (ESC CR, also inside tmux) and Shift+Enter (KKP only) insert a newline.
+ *
+ * Undo and redo work in both key encodings. In the legacy encoding (tmux, terminals without the kitty keyboard
+ * protocol) Ctrl+_, Ctrl+/ and Ctrl+Shift+- send 0x1F, parsed as ctrl+"_", and Ctrl+Y sends 0x19; kitty sends
+ * Ctrl+- as "-" and Ctrl+. as "." there, so the OpenTUI defaults ctrl+"-" (undo) and ctrl+"." (redo) are KKP only.
+ * Under KKP the same physical keys arrive by name: ctrl+"/", ctrl+shift+"-" and ctrl+"y" are bound for them too.
+ * Ctrl+Y is free: OpenTUI binds nothing to it and the composer has no kill ring to yank from.
  *
  * reportMetrics() (from onContentChange) dispatches the visual line count and UTF-8 size, marks the start and end
  * of a draft (composer/started, composer/cleared: used by the approval freshness rules, 3.6.2) and cancels a
@@ -22,7 +27,13 @@ export const COMPOSER_KEY_BINDINGS: KeyBinding[] = [
   { name: "return", shift: true, action: "newline" },
   { name: "return", meta: true, action: "newline" },
   { name: "linefeed", action: "newline" },
+  // 0x1F: Ctrl+_, Ctrl+/ and Ctrl+Shift+- in the legacy encoding (also inside tmux).
   { name: "_", ctrl: true, action: "undo" },
+  // The same keys under KKP.
+  { name: "/", ctrl: true, action: "undo" },
+  { name: "-", ctrl: true, shift: true, action: "undo" },
+  // 0x19 in the legacy encoding, ctrl+"y" under KKP: the redo key that tmux delivers (Ctrl+. is KKP only).
+  { name: "y", ctrl: true, action: "redo" },
 ]
 
 /** Text rows of the composer before it scrolls inside the textarea. */

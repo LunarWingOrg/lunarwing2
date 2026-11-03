@@ -18,6 +18,8 @@ import {
 import { reduce } from "../../src/state/reducer.ts"
 import {
   NOTES,
+  NO_REPLY_YET_MS,
+  UNANSWERED_AFTER_MS,
   activeUserTurnCount,
   canStartTurn,
   focusedApproval,
@@ -710,33 +712,138 @@ describe("legacy daemons: FIFO and control acks (rule 5)", () => {
     expect(h.turn(a).finalText).toBeNull()
   })
 
-  test("legacy: 15 s without events marks unanswered", () => {
+  test("legacy: 15 s without events shows 'no reply yet' and keeps the turn first in line; 610 s marks unanswered", () => {
     const h = new Harness("legacy")
     const a = h.send("ok")
     h.advance(14_999)
     h.dispatch({ type: "notice/tick" })
+    expect(h.turn(a)).toMatchObject({ phase: "sent", notes: [] })
+    h.advance(1)
+    h.dispatch({ type: "notice/tick" })
+    expect(h.turn(a)).toMatchObject({ phase: "sent", notes: [NOTES.noReplyYet] })
+    expect(h.state.inflight).toEqual([a])
+    h.advance(UNANSWERED_AFTER_MS - NO_REPLY_YET_MS - 1)
+    h.dispatch({ type: "notice/tick" })
     expect(h.turn(a).phase).toBe("sent")
     h.advance(1)
     h.dispatch({ type: "notice/tick" })
-    expect(h.turn(a).phase).toBe("unanswered")
-    expect(h.turn(a).notes).toContain(NOTES.unanswered)
+    expect(h.turn(a)).toMatchObject({ phase: "unanswered", notes: [NOTES.unanswered] })
     expect(h.state.inflight).toEqual([])
+    expect(UNANSWERED_AFTER_MS).toBe(610_000)
 
-    // a turn that produced an event is never unanswered
+    // a turn that produced an event never waits
     const b = h.send("real question")
     h.evt({ kind: "turn.activity", turnId: null, activity: { kind: "thinking", text: "Processing..." } })
-    h.advance(60_000)
+    h.advance(700_000)
     h.dispatch({ type: "notice/tick" })
-    expect(h.turn(b).phase).toBe("running")
+    expect(h.turn(b)).toMatchObject({ phase: "running", notes: [] })
 
     // correlated transports and the silent legacy socket do not use the rule
     for (const mode of ["current", "legacy-socket"] as const) {
       const other = new Harness(mode)
       const c = other.send("ok")
-      other.advance(60_000)
+      other.advance(700_000)
       other.dispatch({ type: "notice/tick" })
-      expect(other.turn(c).phase).toBe("sent")
+      expect(other.turn(c)).toMatchObject({ phase: "sent", notes: [] })
     }
+  })
+
+  test("legacy: a message the daemon's scheduler held back still gets its own late reply (client-correctness-4)", () => {
+    // Another channel's exclusive turn runs on the daemon (dispatch.rs: parallel only for gateway V2 UserInput); the
+    // TUI message waits in the MessageScheduler and produces no SSE event at all until it is dispatched.
+    const h = new Harness("legacy")
+    const a = h.send("check the backup status")
+    for (let i = 0; i < 20; i += 1) {
+      h.advance(1_000)
+      h.dispatch({ type: "notice/tick" })
+    }
+    expect(h.turn(a)).toMatchObject({ phase: "sent", notes: [NOTES.noReplyYet] })
+    const b = h.send("also list disk usage")
+    expect(h.turn(b).phase).toBe("queued")
+    // the other channel's turn ends, A runs and is answered
+    h.sse({ type: "thinking", message: "Processing..." })
+    expect(h.turn(a)).toMatchObject({ phase: "running", notes: [] })
+    h.sse({ type: "stream_chunk", content: "Backups: all green." })
+    h.sse({ type: "thread_state_changed", from_state: "Running", to_state: "Completed" })
+    h.sse({ type: "response", content: "Backups: all green." })
+    expect(h.turn(a)).toMatchObject({ phase: "done", finalText: "Backups: all green." })
+    expect(h.turn(b)).toMatchObject({ phase: "queued", finalText: null })
+    h.sse({ type: "thinking", message: "Processing..." })
+    h.sse({ type: "response", content: "/dev/sda1 is 42% full." })
+    expect(h.turn(b)).toMatchObject({ phase: "done", finalText: "/dev/sda1 is 42% full." })
+    expect(h.records().filter((record) => record.origin === "background")).toHaveLength(0)
+  })
+
+  test("legacy: a waiting turn that a history resync shows answered is recovered without the 'no reply yet' note", () => {
+    const h = new Harness("legacy")
+    const a = h.send("check the backup status")
+    h.advance(20_000)
+    h.dispatch({ type: "notice/tick" })
+    expect(h.turn(a).notes).toEqual([NOTES.noReplyYet])
+    // the live events were missed (a stream gap); history has the answer
+    const turns = [historyTurn("check the backup status", "Backups: all green.", "Completed", BASE + 5_000)]
+    h.dispatch({ type: "resync/applied", snapshot: { threadId: THREAD, turns, approvals: [] } })
+    expect(h.turn(a)).toMatchObject({ phase: "done", finalText: "Backups: all green.", recovered: true, notes: [] })
+  })
+
+  test("legacy: Ctrl+S cancels a waiting turn: 'Nothing to interrupt.' ends it unanswered, a running turn is left alone", () => {
+    const h = new Harness("legacy")
+    const ok = h.send("ok")
+    h.advance(20_000)
+    h.dispatch({ type: "notice/tick" })
+    expect(h.turn(ok).notes).toEqual([NOTES.noReplyYet])
+    const stop = h.control("interrupt", "/interrupt")
+    const next = h.send("what is the weather?")
+    h.sse({ type: "response", content: "Nothing to interrupt." })
+    expect(h.turn(stop)).toMatchObject({ phase: "done", control: { ack: "Nothing to interrupt." } })
+    expect(h.turn(ok)).toMatchObject({ phase: "unanswered", notes: [NOTES.nothingToInterrupt] })
+    // the message sent after the interrupt is first in line now and takes its own reply
+    expect(h.turn(next).phase).toBe("queued")
+    expect(h.state.inflight).toEqual([next])
+    h.sse({ type: "response", content: "Sunny." })
+    expect(h.turn(next)).toMatchObject({ phase: "done", finalText: "Sunny." })
+
+    // a turn that saw an event is not cancelled by "Nothing to interrupt."
+    const busy = new Harness("legacy")
+    const running = busy.send("long task")
+    busy.sse({ type: "thinking", message: "Processing..." })
+    const idle = busy.control("interrupt", "/interrupt")
+    busy.sse({ type: "response", content: "Nothing to interrupt." })
+    expect(busy.turn(idle).phase).toBe("done")
+    expect(busy.turn(running).phase).toBe("running")
+  })
+
+  test("legacy: 'Interrupted.' stops the running turn, or drops every turn that was only waiting (scheduler cancel_lane)", () => {
+    // Only queued in the daemon: its interrupt removes them all and answers "Interrupted." once.
+    const h = new Harness("legacy", { engine: "v2" })
+    const first = h.send("first")
+    const second = h.send("second")
+    const stop = h.control("interrupt", "/interrupt")
+    const after = h.send("after the interrupt")
+    h.sse({ type: "response", content: "Interrupted." })
+    expect(h.turn(stop).phase).toBe("done")
+    for (const id of [first, second]) expect(h.turn(id)).toMatchObject({ phase: "interrupted", notes: [NOTES.cancelled] })
+    expect(h.state.inflight).toEqual([after])
+
+    // A turn of the thread is running: that one is stopped, and the one queued behind it still runs afterwards.
+    const mixed = new Harness("legacy", { engine: "v2" })
+    const working = mixed.send("long task")
+    mixed.sse({ type: "stream_chunk", content: "partial" })
+    const queued = mixed.send("then this")
+    mixed.control("interrupt", "/interrupt")
+    mixed.sse({ type: "response", content: "Interrupted." })
+    expect(mixed.turn(working)).toMatchObject({ phase: "interrupted", deltas: "partial" })
+    expect(mixed.turn(queued)).toMatchObject({ phase: "queued", notes: [] })
+    mixed.sse({ type: "response", content: "done with this" })
+    expect(mixed.turn(queued)).toMatchObject({ phase: "done", finalText: "done with this" })
+
+    // The legacy socket has no progress events: a running turn looks silent, so the oldest is the one stopped.
+    const socket = new Harness("legacy-socket")
+    const one = socket.send("one")
+    const two = socket.send("two")
+    socket.control("interrupt", "/interrupt")
+    socket.evt({ kind: "turn.final", turnId: null, text: "Interrupted." })
+    expect([socket.turn(one).phase, socket.turn(two).phase]).toEqual(["interrupted", "queued"])
   })
 })
 

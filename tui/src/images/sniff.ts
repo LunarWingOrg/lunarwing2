@@ -12,6 +12,8 @@
 import type { ImageMime } from "../state/model.ts"
 
 export const UNSUPPORTED_IMAGE_MESSAGE = "unsupported image type (allowed: PNG, JPEG, GIF, WebP)"
+/** OpenTUI 0.8.1 cannot decode animated WebP (ImageError "unsupported-feature"); the gateway would take it. */
+export const ANIMATED_WEBP_MESSAGE = "animated WebP is not supported; convert it to PNG or GIF"
 
 export type ImageExtension = "png" | "jpg" | "gif" | "webp"
 
@@ -24,6 +26,11 @@ const GIF89A_SIGNATURE = [0x47, 0x49, 0x46, 0x38, 0x39, 0x61] as const
 /** "RIFF" at 0, then a 4-byte size, then "WEBP" at 8. */
 const RIFF_SIGNATURE = [0x52, 0x49, 0x46, 0x46] as const
 const WEBP_SIGNATURE = [0x57, 0x45, 0x42, 0x50] as const
+/** "VP8X", the extended-format header chunk; when present it is the first chunk, at offset 12. */
+const VP8X_SIGNATURE = [0x56, 0x50, 0x38, 0x58] as const
+/** VP8X payload byte 0 (file offset 20): Rsv Rsv ICC Alpha EXIF XMP Animation Rsv. */
+const VP8X_FLAGS_OFFSET = 20
+const VP8X_ANIMATION_FLAG = 0x02
 
 function hasSignature(bytes: Uint8Array, signature: readonly number[], offset = 0): boolean {
   if (bytes.length < offset + signature.length) return false
@@ -37,6 +44,16 @@ export function sniffImageMime(bytes: Uint8Array): ImageMime | null {
   if (hasSignature(bytes, GIF87A_SIGNATURE) || hasSignature(bytes, GIF89A_SIGNATURE)) return "image/gif"
   if (hasSignature(bytes, RIFF_SIGNATURE) && hasSignature(bytes, WEBP_SIGNATURE, 8)) return "image/webp"
   return null
+}
+
+/**
+ * An animated WebP: RIFF/WEBP whose VP8X header has the animation flag set (WebP container specification). A
+ * still WebP (VP8, VP8L, or VP8X without the flag: alpha, ICC, EXIF, XMP) is not.
+ */
+export function isAnimatedWebp(bytes: Uint8Array): boolean {
+  if (sniffImageMime(bytes) !== "image/webp" || !hasSignature(bytes, VP8X_SIGNATURE, 12)) return false
+  const flags = bytes[VP8X_FLAGS_OFFSET]
+  return flags !== undefined && (flags & VP8X_ANIMATION_FLAG) !== 0
 }
 
 const EXTENSIONS: Readonly<Record<ImageMime, ImageExtension>> = Object.freeze({

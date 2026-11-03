@@ -401,7 +401,7 @@ WASM_CHANNELS_DIR=/home/<tenant>/lunarwing/state/channels
 
 WASM tools and channels are installed into the tenant's state directory. Disable WASM entirely by setting `WASM_ENABLED=false`.
 
-Set `TOOL_ACTIVITY=true` to route tool-activity status updates (`ToolStarted` / `ToolCompleted` / `ToolResult`) to the WASM channels. Off by default: the host drops those events before they reach a guest, so channels stay quiet. When enabled, the XMPP guest renders them in DMs and the DarkIRC/WeeChat guests emit them as `[status]` lines. Native channels (REPL, Signal) keep their own per-channel `/debug` toggles regardless of this flag.
+Set `TOOL_ACTIVITY=true` to route tool-activity status updates (`ToolStarted` / `ToolCompleted` / `ToolResult`, plus `ImageGenerated`, which replaces the image tool's `ToolResult`) to the WASM channels. Off by default: the host drops those events before they reach a guest, so channels stay quiet. When enabled, the XMPP guest renders them in DMs and the DarkIRC/WeeChat guests emit them as `[status]` lines. Native channels (REPL, Signal) keep their own per-channel `/debug` toggles regardless of this flag.
 
 ## WeeChat Relay Configuration
 

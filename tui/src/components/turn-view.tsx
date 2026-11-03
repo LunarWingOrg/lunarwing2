@@ -5,8 +5,9 @@
  * A user turn shows its input (sent images below it), the reply text (the canonical final, else the streamed
  * deltas: state/turn-text.ts visibleText), the last three activity lines, generated images, then one status word
  * line ("queued #2", "waiting for reply, 12 s", "interrupted", "failed: ..."; background_running reads "still
- * running; the result will arrive here"), notes and steer notes. Control records are one dim line. Every state is
- * a word, never colour alone.
+ * running; the result will arrive here", a turn a daemon restart took "lost (daemon restarted)"), notes (one that
+ * repeats the status line is not shown twice) and steer notes. Control records are one dim line. Every state is a
+ * word, never colour alone.
  *
  * Images: the source handed to <image> is always validated bytes (images/protocol.ts imageRenderSource); a server
  * path is caption text only. Generated images are at most 56 x 12 cells with fit="fit"; evicted ones (only the
@@ -61,7 +62,7 @@ export function turnStatusLabel(record: TurnRecord, input: TurnStatusInput): str
     case "failed":
       return `failed: ${firstLine(record.error?.message ?? "error")}`
     case "lost":
-      return "lost"
+      return record.notes.includes(NOTES.daemonRestarted) ? NOTES.daemonRestarted : "lost"
     case "unanswered":
       return "unanswered"
   }
@@ -198,9 +199,11 @@ function StatusParts(props: TurnViewProps): ReactNode {
       {record.steerNotes.map((note, index) => (
         <Dim key={`s${index}`} theme={theme} text={`  steer: ${note.text}${note.ack === undefined ? " (sending)" : ` - ${note.ack}`}`} />
       ))}
-      {record.notes.map((note, index) => (
-        <Dim key={`n${index}`} theme={theme} role={note === NOTES.imageNotDelivered ? "warn" : "dim"} text={`  - ${note}`} />
-      ))}
+      {record.notes
+        .filter((note) => note !== status)
+        .map((note, index) => (
+          <Dim key={`n${index}`} theme={theme} role={note === NOTES.imageNotDelivered ? "warn" : "dim"} text={`  - ${note}`} />
+        ))}
       {record.phase === "failed" && record.error !== undefined && record.error.message.includes("\n") && (
         <Dim theme={theme} role="error" text={record.error.message} />
       )}

@@ -224,6 +224,18 @@ export interface Capabilities {
   resume: boolean
 }
 
+/**
+ * When the daemon process started, in the injected Clock's domain: it started in (earliest, latest]. The gateway
+ * derives it from GET /api/gateway/status `uptime_secs` (whole seconds, read between two Clock readings);
+ * `measuredAt` is the Clock time of the answer. A later connect whose start lies after this one's (beyond a slack
+ * for the two hosts' clocks) talks to a restarted daemon (state/correlate.ts daemonRestarted).
+ */
+export interface DaemonStart {
+  earliest: number
+  latest: number
+  measuredAt: number
+}
+
 export interface ServerInfo {
   transport: TransportKind
   protocol: ProtocolFlavor
@@ -240,6 +252,8 @@ export interface ServerInfo {
   limits: Limits
   /** Sticky warnings, e.g. "listener owner not verified (remote URL)", "this TUI uses the tenant master token". */
   warnings: readonly string[]
+  /** The daemon process's start; null or absent when this connect could not tell (no restart detection then). */
+  daemonStart?: DaemonStart | null
 }
 
 // ---------------------------------------------------------------------------------------------------------

@@ -22,6 +22,11 @@ export interface CaptureStartOptions extends RecorderStartOptions {
    * recorder; afterwards the recording is cancelled with the message.
    */
   onFailure?: (error: VoiceError) => void
+  /**
+   * After start() resolved, the requested device could not be opened and the default source records instead (the
+   * parec retry without --device). The handle's RecordingDevice says the same from then on.
+   */
+  onDeviceFallback?: (device: RecordingDevice) => void
 }
 
 /** The device a handle actually records from (5.5). */

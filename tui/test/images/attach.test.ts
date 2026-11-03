@@ -135,6 +135,26 @@ describe("readImageFile", () => {
     expect((await rejection(readImageFile("  ''  ", opts))).kind).toBe("bad_path")
   })
 
+  test("an animated WebP (/img, a drop, a copied file) names the problem instead of a decoder code", async () => {
+    // PIL 11.3: 3 lossless frames; OpenTUI 0.8.1 cannot decode it ("unsupported-feature").
+    const animated = new Uint8Array(
+      Buffer.from(
+        "UklGRrQAAABXRUJQVlA4WAoAAAACAAAAPwAALwAAQU5JTQYAAAAAAAAAAABBTk1GKAAAAAAAAAAAAD8AAC8AAGQAAAJWUDhMDwAAAC8/wAsABxD9j/4HIqL/AQBBTk1GKAAAAAAAAAAAAD8AAC8AAGQAAABWUDhMDwAAAC8/wAsAB9D/iP4HIqL/AQBBTk1GKAAAAAAAAAAAAD8AAC8AAGQAAABWUDhMDwAAAC8/wAsABxDR//4HIqL/AQA=",
+        "base64",
+      ),
+    )
+    const { dir, path } = await fixture("sticker.webp", animated)
+    const error = await rejection(readImageFile(path, { maxImageBytes: 5 * MIB, cwd: dir, home: dir }))
+    expect([error.kind, error.message]).toEqual(["unsupported", "sticker.webp: animated WebP is not supported; convert it to PNG or GIF"])
+    let clipboard: unknown
+    try {
+      createPendingImage(animated, { source: "clipboard", filename: null, maxImageBytes: 5 * MIB })
+    } catch (caught) {
+      clipboard = caught
+    }
+    expect((clipboard as ImageInputError).message).toBe("clipboard image: animated WebP is not supported; convert it to PNG or GIF")
+  })
+
   test("symbolic links are followed: the user named the file", async () => {
     const { dir, path } = await fixture("real.png")
     await symlink(path, join(dir, "link.png"))

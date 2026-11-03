@@ -2,21 +2,32 @@
  * Mock LunarWing web gateway (design 11.3.1) on Bun.serve, 127.0.0.1 and an ephemeral port.
  *
  * Routes: /api/health, /api/chat/{events,send,approval,history,threads,thread/new,pending-gates,capabilities,
- * auth-token,auth-cancel}, /api/voice/{status,transcribe}. Request and response shapes, status codes and the
- * plain-text or JSON error bodies follow ic/src/channels/web/{server,sse,types,voice,auth}.rs.
+ * auth-token,auth-cancel}, /api/gateway/status, /api/voice/{status,transcribe}. Request and response shapes,
+ * status codes and the plain-text or JSON error bodies follow ic/src/channels/web/{server,sse,types,voice,auth}.rs.
  *
  * Modes:
  * - "legacy": today's daemons. No GET /api/chat/capabilities (404), no correlation fields, no turn_started /
  *   turn_finished, client_turn_id ignored, images accepted without validation (today's server.rs
  *   images_to_attachments drops invalid items silently instead of refusing the request).
  * - "current": the M2a contract (4.2). Capabilities document, `message_id` and `client_turn_id` merged into every
- *   event a message causes, turn_started before progress and turn_finished after the response, client_turn_id
- *   validated (400 "invalid client_turn_id"), G5 image validation (413/422 naming the image).
+ *   event a message causes, turn_started before progress and turn_finished after the response (a V2 approval or
+ *   credential continuation starts with turn_started, before its gate_resolved), client_turn_id validated (a
+ *   non-string is axum's 422, an invalid string 400 "invalid client_turn_id"), G5 image validation in the order
+ *   and with the bodies of ic/src/channels/image_mime.rs decode_images and server.rs image_rejection_response
+ *   (count, then the base64 length bounds before anything is decoded; 413 for the size limits, 422 otherwise).
+ *
+ * Both modes reject request bodies whose shape does not fit the server's request type with axum's 422 before any
+ * handler check (ic/src/channels/web/types.rs SendMessageRequest, ApprovalRequest, AuthTokenRequest, ...).
+ *
+ * GET /api/gateway/status reports `uptime_secs` (server.rs gateway_status_handler) from `uptimeSecs()`; restart()
+ * plays a daemon restart: the streams drop, the uptime starts again from 0, in-flight history turns become Failed
+ * without a reply (the V2 restart sweep, ic/src/bridge/router.rs) and, unless the gates were persisted (V2),
+ * pending approvals and authentication gates are gone.
  *
  * Replies are scripted per send (`replies`, default `echoReply`): events are emitted to every open event stream
  * on a zero-delay timer after the 202 (or before it with `emitBeforeAccept`), correlated automatically in current
  * mode. Tests drive everything else with emit(), emitRaw(), emitComment(), dropStreams(), override() and onRequest();
- * every request is recorded with method, path, query, headers and body.
+ * every request is recorded with method, path, query, headers and body, and every emit() payload in `emitted`.
  *
  * Deviation from the real server: Bun.serve sends the response head only with the first body chunk, so each event
  * stream starts with one empty comment (":\n\n", the bytes of axum's 15 s keepalive).
@@ -125,6 +136,8 @@ export interface MockGatewayOptions {
   keepaliveMs?: number | null
   /** GET /api/chat/threads has an assistant thread (a DB-backed daemon). Default true. */
   assistantThread?: boolean
+  /** The clock uptime_secs is measured on (the test's ManualClock); default performance.now. */
+  now?: () => number
 }
 
 const MIB = 1024 * 1024
@@ -180,17 +193,94 @@ function nowIso(): string {
   return new Date().toISOString()
 }
 
+/** ic/src/channels/image_mime.rs sniff_image_mime: the full PNG magic, GIF87a/GIF89a, RIFF....WEBP. */
 function sniff(bytes: Uint8Array): string | null {
-  const at = (i: number) => bytes[i]
-  if (at(0) === 0x89 && at(1) === 0x50 && at(2) === 0x4e && at(3) === 0x47) return "image/png"
-  if (at(0) === 0xff && at(1) === 0xd8 && at(2) === 0xff) return "image/jpeg"
-  if (at(0) === 0x47 && at(1) === 0x49 && at(2) === 0x46 && at(3) === 0x38) return "image/gif"
-  if (at(0) === 0x52 && at(1) === 0x49 && at(8) === 0x57 && at(9) === 0x45) return "image/webp"
+  const starts = (prefix: readonly number[], offset = 0) => prefix.every((byte, i) => bytes[offset + i] === byte)
+  if (starts([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) return "image/png"
+  if (starts([0xff, 0xd8, 0xff])) return "image/jpeg"
+  if (starts([0x47, 0x49, 0x46, 0x38]) && (bytes[4] === 0x37 || bytes[4] === 0x39) && bytes[5] === 0x61) return "image/gif"
+  if (starts([0x52, 0x49, 0x46, 0x46]) && starts([0x57, 0x45, 0x42, 0x50], 8)) return "image/webp"
   return null
+}
+
+/** image_mime.rs base64_len_bound: the padded base64 length of `decoded` bytes. */
+function base64Bound(decoded: number): number {
+  return 4 * Math.ceil(decoded / 3)
+}
+
+/**
+ * The Rust base64 STANDARD engine: the standard alphabet, canonical padding, no trailing bits, no whitespace; null
+ * where it fails. Buffer.from alone is lenient, so the result must encode back to the same text.
+ */
+function strictBase64(data: string): Uint8Array | null {
+  if (data.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(data)) return null
+  const bytes = Buffer.from(data, "base64")
+  return bytes.toString("base64") === data ? new Uint8Array(bytes) : null
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+/** axum's Json extractor: a body that parses but does not fit the request type is a plain-text 422 (serde's reason). */
+function shapeError(reason: string): Response {
+  return text(422, `Failed to deserialize the JSON body into the target type: ${reason}`)
+}
+
+/** serde's name for the JSON value in an "invalid type" error. */
+function serdeType(value: unknown): string {
+  if (value === null) return "null"
+  if (typeof value === "boolean") return `boolean \`${value}\``
+  if (typeof value === "number") return Number.isInteger(value) ? `integer \`${value}\`` : `floating point \`${value}\``
+  if (typeof value === "string") return `string ${JSON.stringify(value)}`
+  return Array.isArray(value) ? "sequence" : "map"
+}
+
+/** The fields of a request type as serde sees them: `String` (required) and `Option<String>` (optional). */
+interface BodyShape {
+  required?: readonly string[]
+  optional?: readonly string[]
+}
+
+/** serde's reason for the first field that does not deserialize; null when the object fits. */
+function shapeReason(body: Record<string, unknown>, shape: BodyShape): string | null {
+  for (const field of shape.required ?? []) {
+    const value = body[field]
+    if (value === undefined) return `missing field \`${field}\``
+    if (typeof value !== "string") return `${field}: invalid type: ${serdeType(value)}, expected a string`
+  }
+  for (const field of shape.optional ?? []) {
+    const value = body[field]
+    if (value !== undefined && value !== null && typeof value !== "string") {
+      return `${field}: invalid type: ${serdeType(value)}, expected a string`
+    }
+  }
+  return null
+}
+
+/** The 422 for a body that does not fit `shape`; null when it fits. */
+function checkShape(body: Record<string, unknown>, shape: BodyShape): Response | null {
+  const reason = shapeReason(body, shape)
+  return reason === null ? null : shapeError(reason)
+}
+
+/** One element of SendMessageRequest.images (types.rs ImageData: both fields required strings). */
+interface WireImage {
+  media_type: string
+  data: string
+}
+
+/** `#[serde(default)] images: Vec<ImageData>`: absent is empty; null or anything but an array of ImageData is a 422. */
+function checkImagesShape(images: unknown): WireImage[] | Response {
+  if (images === undefined) return []
+  if (!Array.isArray(images)) return shapeError(`images: invalid type: ${serdeType(images)}, expected a sequence`)
+  for (const [i, image] of images.entries()) {
+    if (!isRecord(image)) return shapeError(`images[${i}]: invalid type: ${serdeType(image)}, expected struct ImageData`)
+    // serde_path_to_error paths: "images[0]: missing field `data`", "images[0].data: invalid type: ...".
+    const reason = shapeReason(image, { required: ["media_type", "data"] })
+    if (reason !== null) return shapeError(`images[${i}]${reason.startsWith("missing field") ? ": " : "."}${reason}`)
+  }
+  return images as WireImage[]
 }
 
 /** Default reply script: an echo, plus the daemon's control acks and two smoke-run magic words. */
@@ -245,6 +335,8 @@ export function echoReply(ctx: MockSendContext): MockEvent[] {
 
 export class MockGateway {
   readonly requests: RecordedRequest[] = []
+  /** Every emit() payload (correlation merged), in emit order. */
+  readonly emitted: MockEvent[] = []
   readonly threads = new Map<string, MockThread>()
   readonly approvals = new Map<string, MockApproval>()
   readonly authGates = new Map<string, MockAuthGate>()
@@ -260,7 +352,11 @@ export class MockGateway {
   transcribeReply: (() => Response) | null = null
   /** Next auth-token answer body (default {success: true}). */
   authTokenResult: { success: boolean; message: string } = { success: true, message: "Token saved" }
+  /** GET /api/gateway/status uptime_secs; default: whole seconds on `now` since the start or the last restart(). */
+  uptimeSecs: () => number
 
+  private readonly now: () => number
+  private bootedAt: number
   private readonly server: ReturnType<typeof Bun.serve>
   private readonly streams = new Set<ReadableStreamDefaultController<Uint8Array>>()
   private readonly overrides = new Map<string, { handler: MockRouteHandler; times: number }>()
@@ -287,6 +383,9 @@ export class MockGateway {
     this.maxStreams = opts.maxStreams ?? 100
     this.stepDelayMs = opts.stepDelayMs ?? 0
     this.assistantThreadId = opts.assistantThread === false ? null : crypto.randomUUID()
+    this.now = opts.now ?? (() => performance.now())
+    this.bootedAt = this.now()
+    this.uptimeSecs = () => Math.max(0, Math.floor((this.now() - this.bootedAt) / 1000))
     this.server = Bun.serve({
       hostname: "127.0.0.1",
       port: opts.port ?? 0,
@@ -339,6 +438,7 @@ export class MockGateway {
   /** Sends one event to every open stream; `corr` is merged at the top level (current-mode correlation). */
   emit(event: MockEvent, corr: MockCorr = {}): void {
     const payload = { ...event, ...corr }
+    this.emitted.push(payload)
     this.emitRaw(`event: ${event.type}\ndata: ${JSON.stringify(payload)}\n\n`)
   }
 
@@ -368,6 +468,23 @@ export class MockGateway {
       }
     }
     this.streams.clear()
+  }
+
+  /**
+   * A daemon restart (upgrade-tenant, crash, OOM): every stream drops, uptime_secs starts again from 0, turns still
+   * Processing become Failed without a reply (what durable history shows for a turn the restart killed), and the
+   * pending approvals and authentication gates are gone unless `keepGates` (Engine V2 restores persisted gates).
+   */
+  restart(opts: { keepGates?: boolean } = {}): void {
+    this.dropStreams()
+    this.bootedAt = this.now()
+    for (const thread of this.threads.values()) {
+      for (const turn of thread.turns) if (turn.state === "Processing") turn.state = "Failed"
+    }
+    if (opts.keepGates !== true) {
+      this.approvals.clear()
+      this.authGates.clear()
+    }
   }
 
   addThread(turns: MockTurn[] = [], id: string = crypto.randomUUID()): MockThread {
@@ -511,6 +628,7 @@ export class MockGateway {
     "GET /api/chat/capabilities": () => this.capabilities(),
     "POST /api/chat/auth-token": (rec) => this.authToken(rec),
     "POST /api/chat/auth-cancel": (rec) => this.authCancel(rec),
+    "GET /api/gateway/status": () => this.gatewayStatus(),
     "GET /api/voice/status": () => this.voiceStatus(),
     "POST /api/voice/transcribe": (rec) => this.transcribe(rec),
   }
@@ -549,11 +667,20 @@ export class MockGateway {
     return rec.body
   }
 
-  /** Legacy daemons ignore the field (serde skips unknown fields); M2a validates it (8.3.1). */
+  /** `client_turn_id` is an `Option<String>` of the request types in current mode; legacy daemons do not know it. */
+  private optionalIds(...fields: string[]): string[] {
+    return this.mode === "current" ? [...fields, "client_turn_id"] : fields
+  }
+
+  /**
+   * Legacy daemons ignore the field (serde skips unknown fields). M2a: a non-string is the extractor's 422 (the
+   * shape check normally reports it first), an invalid string 400 "invalid client_turn_id" (8.3.1).
+   */
   private clientTurnId(body: Record<string, unknown>): string | undefined | Response {
     const id = body.client_turn_id
     if (this.mode !== "current" || id === undefined || id === null) return undefined
-    return typeof id === "string" && CLIENT_ID.test(id) ? id : text(400, "invalid client_turn_id")
+    if (typeof id !== "string") return shapeError(`client_turn_id: invalid type: ${serdeType(id)}, expected a string`)
+    return CLIENT_ID.test(id) ? id : text(400, "invalid client_turn_id")
   }
 
   private corrFor(messageId: string, clientTurnId: string | undefined): MockCorr {
@@ -561,26 +688,29 @@ export class MockGateway {
     return clientTurnId ? { message_id: messageId, client_turn_id: clientTurnId } : { message_id: messageId }
   }
 
+  /** server.rs chat_send_handler: the extractor's shape checks, thread_id, client_turn_id, then the images (G5). */
   private send(rec: RecordedRequest): Response {
     const body = this.jsonBody(rec)
     if (body instanceof Response) return body
-    if (typeof body.content !== "string") {
-      return text(422, "Failed to deserialize the JSON body into the target type: missing field `content`")
-    }
+    const shape = checkShape(body, { required: ["content"], optional: this.optionalIds("thread_id", "timezone") })
+    if (shape) return shape
+    const images = checkImagesShape(body.images)
+    if (images instanceof Response) return images
+    const content = body.content as string
     const threadId = typeof body.thread_id === "string" ? body.thread_id.trim() : ""
     if (threadId === "") return text(400, "thread_id is required for /api/chat/send")
     const clientTurnId = this.clientTurnId(body)
     if (clientTurnId instanceof Response) return clientTurnId
-    const rejected = this.checkImages(body.images)
+    const rejected = this.checkImages(images)
     if (rejected) return rejected
     const messageId = crypto.randomUUID()
     const thread = this.threads.get(threadId) ?? this.addThread([], threadId)
-    const turn: MockTurn = { user_input: body.content, response: null, state: "Processing", started_at: nowIso(), completed_at: null }
+    const turn: MockTurn = { user_input: content, response: null, state: "Processing", started_at: nowIso(), completed_at: null }
     thread.turns.push(turn)
     const ctx: MockSendContext = {
       gateway: this,
       mode: this.mode,
-      content: body.content,
+      content,
       threadId,
       messageId,
       clientTurnId,
@@ -593,26 +723,35 @@ export class MockGateway {
     return json(202, { message_id: messageId, status: "accepted" })
   }
 
-  /** G5 in current mode (413/422 naming the 1-based image); legacy mode skips nothing it cannot decode silently. */
-  private checkImages(images: unknown): Response | null {
-    if (images === undefined || this.mode === "legacy") return null
-    if (!Array.isArray(images)) return text(422, "Failed to deserialize the JSON body into the target type: images")
-    if (images.length > this.limits.max_attachments) {
-      return text(422, `image ${this.limits.max_attachments + 1} rejected: too many images (at most ${this.limits.max_attachments})`)
-    }
+  /**
+   * G5 in current mode, in the order of ic/src/channels/image_mime.rs decode_images and with the bodies of
+   * server.rs image_rejection_response (413 for the size limits, 422 otherwise, the 1-based image named): the
+   * count, the message's base64 length bound, then per image its base64 length bound (both before anything is
+   * decoded, so an oversize payload of invalid base64 is a 413), the declared `image/` type, strict base64, empty,
+   * the decoded size, the decoded total and the sniffed type. Legacy daemons drop what they cannot decode silently.
+   */
+  private checkImages(images: readonly WireImage[]): Response | null {
+    if (images.length === 0 || this.mode === "legacy") return null
+    const maxCount = this.limits.max_attachments
+    const maxBytes = this.limits.max_attachment_bytes
+    const maxTotal = this.limits.max_total_attachment_bytes
+    if (images.length > maxCount) return text(422, `image ${maxCount + 1} rejected: too many images (${images.length}, at most ${maxCount})`)
+    const totalTooLarge = () => text(413, `images rejected: the images exceed ${maxTotal} bytes in total`)
+    if (images.reduce((sum, image) => sum + image.data.length, 0) > base64Bound(maxTotal)) return totalTooLarge()
+    const tooLarge = (n: number) => text(413, `image ${n} rejected: larger than ${maxBytes} bytes`)
+    const unsupported = (n: number) => text(422, `image ${n} rejected: unsupported image type (allowed: png, jpeg, gif, webp)`)
     let total = 0
     for (const [i, image] of images.entries()) {
       const n = i + 1
-      if (!isRecord(image) || typeof image.data !== "string" || !/^[A-Za-z0-9+/]*={0,2}$/.test(image.data)) {
-        return text(422, `image ${n} rejected: invalid base64`)
-      }
-      const bytes = new Uint8Array(Buffer.from(image.data, "base64"))
-      if (bytes.length > this.limits.max_attachment_bytes) {
-        return text(413, `image ${n} rejected: larger than ${this.limits.max_attachment_bytes} bytes`)
-      }
+      if (image.data.length > base64Bound(maxBytes)) return tooLarge(n)
+      if (!/^image\//i.test(image.media_type)) return unsupported(n)
+      const bytes = strictBase64(image.data)
+      if (bytes === null) return text(422, `image ${n} rejected: invalid base64`)
+      if (bytes.length === 0) return text(422, `image ${n} rejected: no image data`)
+      if (bytes.length > maxBytes) return tooLarge(n)
       total += bytes.length
-      if (total > this.limits.max_total_attachment_bytes) return text(413, `image ${n} rejected: images exceed the total size limit`)
-      if (sniff(bytes) === null) return text(422, `image ${n} rejected: unsupported image type (allowed: png, jpeg, gif, webp)`)
+      if (total > maxTotal) return totalTooLarge()
+      if (sniff(bytes) === null) return unsupported(n)
     }
     return null
   }
@@ -636,19 +775,22 @@ export class MockGateway {
     }
   }
 
+  /** server.rs chat_approval_handler: shape, action, request_id, client_turn_id, then the owning thread and gate. */
   private approval(rec: RecordedRequest): Response {
     const body = this.jsonBody(rec)
     if (body instanceof Response) return body
-    const action = typeof body.action === "string" ? body.action : ""
+    const shape = checkShape(body, { required: ["request_id", "action"], optional: this.optionalIds("thread_id") })
+    if (shape) return shape
+    const action = body.action as string
     if (!["approve", "always", "deny"].includes(action)) return text(400, `Unknown action: ${action}`)
-    const requestId = typeof body.request_id === "string" ? body.request_id : ""
+    const requestId = body.request_id as string
     if (!UUID.test(requestId)) return text(400, "Invalid request_id (expected UUID)")
+    const clientTurnId = this.clientTurnId(body)
+    if (clientTurnId instanceof Response) return clientTurnId
     const requested = typeof body.thread_id === "string" ? body.thread_id.trim() : null
     if (body.thread_id !== undefined && body.thread_id !== null && !requested) {
       return text(400, "thread_id must not be blank when supplied")
     }
-    const clientTurnId = this.clientTurnId(body)
-    if (clientTurnId instanceof Response) return clientTurnId
     const pending = this.approvals.get(requestId)
     if (!pending) return text(404, "No pending approval matches this request_id")
     if (requested && requested !== pending.thread_id) return text(400, "thread_id does not own this approval request")
@@ -659,7 +801,11 @@ export class MockGateway {
     return json(202, { message_id: messageId, status: "accepted" })
   }
 
-  /** After an approval: gate_resolved (V2), then the resumed turn under the owning turn's client_turn_id. */
+  /**
+   * After an approval, the resumed turn under the owning turn's client_turn_id. Its turn_started comes first: the
+   * approval is a message of its own, so the agent loop reports Started before the V2 bridge's resolve_gate
+   * broadcasts the (uncorrelated) gate_resolved (ic/src/agent/agent_loop.rs, ic/src/bridge/router.rs).
+   */
   private continuation(pending: MockApproval, action: string, corr: MockCorr): MockEvent[] {
     const thread_id = pending.thread_id
     const resolution = action === "deny" ? "denied" : action === "always" ? "approved_always" : "approved"
@@ -677,8 +823,8 @@ export class MockGateway {
             { type: "tool_completed", name: pending.tool_name, success: true, thread_id, ...corr },
           ]
     return [
-      ...resolved,
       ...(current ? [{ type: "turn_started", thread_id, ...corr }] : []),
+      ...resolved,
       ...tools,
       { type: "response", content: reply, thread_id, ...corr },
       ...(current ? [{ type: "turn_finished", thread_id, outcome: "replied", ...corr }] : []),
@@ -781,16 +927,28 @@ export class MockGateway {
     })
   }
 
+  /**
+   * AuthTokenRequest / AuthCancelRequest: `request_id` and `thread_id` are `Option<Uuid>`, so anything but null or a
+   * UUID string fails the extractor (422) before any handler check.
+   */
+  private authShape(body: Record<string, unknown>, required: readonly string[]): Response | null {
+    const shape = checkShape(body, { required, optional: this.optionalIds("request_id", "thread_id") })
+    if (shape) return shape
+    for (const field of ["request_id", "thread_id"]) {
+      const value = body[field]
+      if (typeof value === "string" && !UUID.test(value)) return shapeError(`${field}: UUID parsing failed: invalid character`)
+    }
+    return null
+  }
+
+  /** server.rs requested_engine_auth_gate: both ids or neither; a named gate must still be pending (else 409). */
   private gateCheck(body: Record<string, unknown>): Response | MockAuthGate | null {
     const requestId = body.request_id
     const threadId = body.thread_id
     const has = (v: unknown) => v !== undefined && v !== null
     if (has(requestId) !== has(threadId)) return text(400, "request_id and thread_id must be supplied together")
     if (!has(requestId)) return [...this.authGates.values()].find((g) => g.extension_name === body.extension_name) ?? null
-    if (typeof requestId !== "string" || !UUID.test(requestId) || typeof threadId !== "string" || !UUID.test(threadId)) {
-      return text(422, "Failed to deserialize the JSON body into the target type: invalid UUID")
-    }
-    const gate = this.authGates.get(requestId)
+    const gate = this.authGates.get(requestId as string)
     if (!gate || gate.thread_id !== threadId || gate.extension_name !== body.extension_name) {
       return text(409, "Authentication request is stale or no longer available")
     }
@@ -800,9 +958,8 @@ export class MockGateway {
   private authToken(rec: RecordedRequest): Response {
     const body = this.jsonBody(rec)
     if (body instanceof Response) return body
-    if (typeof body.extension_name !== "string" || typeof body.token !== "string") {
-      return text(422, "Failed to deserialize the JSON body into the target type: missing field `token`")
-    }
+    const shape = this.authShape(body, ["extension_name", "token"])
+    if (shape) return shape
     const clientTurnId = this.clientTurnId(body)
     if (clientTurnId instanceof Response) return clientTurnId
     const gate = this.gateCheck(body)
@@ -815,6 +972,10 @@ export class MockGateway {
     return json(200, { success: result.success, message: result.message, activated: result.success })
   }
 
+  /**
+   * V2: the resume message queued by auth-token runs through the agent loop, so its turn_started comes before the
+   * bridge's gate_resolved{credential_provided} (ic/src/bridge/router.rs resolve_gate).
+   */
   private authContinuation(gate: MockAuthGate | null, extension: string, clientTurnId: string | undefined): MockEvent[] {
     if (!gate || this.engine !== "v2") {
       return [{ type: "auth_completed", extension_name: extension, success: true, message: `${extension} is ready` }]
@@ -823,8 +984,8 @@ export class MockGateway {
     const corr = this.corrFor(crypto.randomUUID(), clientTurnId)
     const current = this.mode === "current"
     return [
-      { type: "gate_resolved", request_id: gate.request_id, gate_name: "authentication", tool_name: extension, resolution: "credential_provided", message: "Credential accepted.", thread_id },
       ...(current ? [{ type: "turn_started", thread_id, ...corr }] : []),
+      { type: "gate_resolved", request_id: gate.request_id, gate_name: "authentication", tool_name: extension, resolution: "credential_provided", message: "Credential accepted.", thread_id },
       { type: "response", content: `${extension} is connected.`, thread_id, ...corr },
       ...(current ? [{ type: "turn_finished", thread_id, outcome: "replied", ...corr }] : []),
     ]
@@ -833,9 +994,8 @@ export class MockGateway {
   private authCancel(rec: RecordedRequest): Response {
     const body = this.jsonBody(rec)
     if (body instanceof Response) return body
-    if (typeof body.extension_name !== "string") {
-      return text(422, "Failed to deserialize the JSON body into the target type: missing field `extension_name`")
-    }
+    const shape = this.authShape(body, ["extension_name"])
+    if (shape) return shape
     const clientTurnId = this.clientTurnId(body)
     if (clientTurnId instanceof Response) return clientTurnId
     const gate = this.gateCheck(body)
@@ -848,6 +1008,24 @@ export class MockGateway {
       }
     }
     return json(200, { success: true, message: "Auth cancelled" })
+  }
+
+  /** server.rs gateway_status_handler (the fields a client may read; no costs or channel health). */
+  private gatewayStatus(): Response {
+    return json(200, {
+      version: "2.1.9-mock",
+      sse_connections: this.streams.size,
+      ws_connections: 0,
+      total_connections: this.streams.size,
+      uptime_secs: this.uptimeSecs(),
+      restart_enabled: false,
+      llm_backend: "openai_compatible",
+      llm_model: "mock",
+      enabled_channels: ["gateway"],
+      skills_enabled: false,
+      skills_max_active: 0,
+      skills_max_context_tokens: 0,
+    })
   }
 
   private voiceStatus(): Response {

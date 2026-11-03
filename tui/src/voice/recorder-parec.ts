@@ -8,6 +8,14 @@
  * parec writes raw PCM unbuffered; chunks are converted with an odd-byte carry (voice/levels.ts S16leDecoder) and
  * the first stdout chunk calls onFirstChunk. Stop: SIGINT, wait 1 s, SIGKILL, read the rest. Cancel: SIGKILL.
  * stderr goes to a 4 KiB ring and is only summarized. pw-record is not used (it needs --raw and stdbuf -o0).
+ *
+ * The configured or stored device (`[voice] device`, `/voice device`) is an OpenTUI device name or a substring of
+ * one ("C922"), not a PulseAudio source name, so --device gets it only when it names a source: an exact entry of
+ * `pactl list short sources` (asked only for names that do not look like one), or a name shaped like a source
+ * (`alsa_input.usb-...`, `<sink>.monitor`, `@DEFAULT_SOURCE@`). Otherwise parec records the default source and the
+ * handle reports a device fallback, as the OpenTUI recorder does when no device matches. When parec exits before
+ * the first chunk with --device set, it is started once more without it and reports the fallback through
+ * onDeviceFallback (start() has returned by then).
  */
 import type { Clock } from "@opentui/core"
 import { bunSpawn, type ChildEnv, type ChildProcess, type SpawnFn } from "../config/types.ts"
@@ -18,7 +26,10 @@ import { CaptureSession, readAll, settleWithin, TIMED_OUT, type CaptureHandle, t
 import type { Recorder, WavClip } from "./types.ts"
 
 export const PAREC_STOP_GRACE_MS = 1_000
+/** `pactl list short sources` gets this long before it is killed (an unresponsive sound server). */
+export const PACTL_TIMEOUT_MS = 1_500
 const STDERR_RING_BYTES = 4 * 1024
+const PACTL_MAX_OUTPUT_BYTES = 64 * 1024
 const SUMMARY_CHARS = 160
 
 /** The parec argv of 5.5 (the command can be overridden for tests and odd installs). */
@@ -37,6 +48,30 @@ export function parecArgv(device?: string, command = "parec"): string[] {
   ]
 }
 
+const PULSE_SPECIAL_SOURCES: ReadonlySet<string> = new Set(["@DEFAULT_SOURCE@", "@DEFAULT_MONITOR@"])
+/** One token of dot-separated parts: `alsa_input.usb-046d_C922-02.analog-stereo`, `bluez_input.00:1B:66:AA:BB:CC.0`. */
+const PULSE_SOURCE_NAME = /^[A-Za-z0-9_][A-Za-z0-9_:+-]*(?:\.[A-Za-z0-9_:+-]+)+$/
+
+/**
+ * True for PulseAudio / PipeWire source names: the device-backed sources are `<api>_input.<device>[.<profile>]`,
+ * monitors `<sink>.monitor`, plus the special `@DEFAULT_SOURCE@` and `@DEFAULT_MONITOR@`. An OpenTUI device name
+ * (spaces) or a `[voice] device` substring ("C922", no dot) is not.
+ */
+export function looksLikePulseSource(name: string): boolean {
+  return PULSE_SPECIAL_SOURCES.has(name) || PULSE_SOURCE_NAME.test(name)
+}
+
+/** The names of `pactl list short sources` (index, name, driver, sample spec, state; tab-separated). */
+export function parsePactlSources(text: string): string[] {
+  return text.split("\n").flatMap((line) => {
+    const name = line.split("\t")[1]?.trim()
+    return name === undefined || name === "" ? [] : [name]
+  })
+}
+
+/** PulseAudio source names, for an exact --device match; [] when they cannot be listed. */
+export type PulseSourceLister = (signal: AbortSignal) => Promise<readonly string[]>
+
 export interface ParecRecorderOptions {
   clock: Clock
   /** buildChildEnv() from config/child-env.ts. */
@@ -45,6 +80,8 @@ export interface ParecRecorderOptions {
   /** Executable lookup for available(); default Bun.which with the child PATH. */
   which?: (command: string) => string | null
   command?: string
+  /** Default: `pactl list short sources` through `spawn`, with the same environment. */
+  listSources?: PulseSourceLister
 }
 
 /** Keeps the last `capacity` bytes of a stream. */
@@ -85,27 +122,63 @@ function spawnFailure(error: unknown): VoiceError {
   return new VoiceError("recorder", detail, { source: "recorder" })
 }
 
+/** `pactl list short sources` (argv only, the child environment, killed after PACTL_TIMEOUT_MS); [] on any failure. */
+async function listPulseSources(spawn: SpawnFn, env: ChildEnv, signal: AbortSignal): Promise<string[]> {
+  let child: ChildProcess
+  try {
+    child = spawn(["pactl", "list", "short", "sources"], {
+      env,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "ignore",
+      signal,
+      timeout: PACTL_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    })
+  } catch {
+    return []
+  }
+  const chunks: Uint8Array[] = []
+  let size = 0
+  await drain(child.stdout, (chunk) => {
+    if (size >= PACTL_MAX_OUTPUT_BYTES) return
+    chunks.push(chunk.slice(0, PACTL_MAX_OUTPUT_BYTES - size))
+    size += chunk.length
+  })
+  if ((await child.exited) !== 0) return []
+  return parsePactlSources(new TextDecoder().decode(Buffer.concat(chunks)))
+}
+
+/** Starts parec on a source name, or on the default source (null). */
+type ParecLauncher = (device: string | null) => ChildProcess
+
 class ParecRecording implements CaptureHandle {
   readonly kind = "parec" as const
-  readonly deviceFallback = false
-  readonly deviceName: string | null
+  /** The source parec records from; null: the default source. */
+  deviceName: string | null
+  /** A device was requested, but the default source records. */
+  deviceFallback: boolean
   private readonly session: CaptureSession
   private readonly decoder = new S16leDecoder()
-  private readonly stderr = new ByteRing(STDERR_RING_BYTES)
-  private readonly stdoutDone: Promise<void>
+  private child: ChildProcess
+  private stderr = new ByteRing(STDERR_RING_BYTES)
+  private stdoutDone: Promise<void>
+  private retried = false
   private stopping = false
   private cancelled = false
 
   constructor(
-    private readonly child: ChildProcess,
+    private readonly launch: ParecLauncher,
+    requested: string | null,
+    device: string | null,
     private readonly opts: CaptureStartOptions,
     private readonly clock: Clock,
   ) {
-    this.deviceName = opts.device?.trim() || null
+    this.deviceName = device
+    this.deviceFallback = requested !== null && device === null
     this.session = new CaptureSession({ maxDurationMs: opts.maxDurationMs, clock, onLevel: opts.onLevel, onFirstChunk: opts.onFirstChunk })
-    this.stdoutDone = drain(child.stdout, (chunk) => this.onPcm(chunk))
-    void drain(child.stderr, (chunk) => this.stderr.push(chunk))
-    void child.exited.then((code) => this.onExit(code))
+    this.child = launch(device)
+    this.stdoutDone = this.watch(this.child)
     if (opts.signal.aborted) this.cancel()
     else opts.signal.addEventListener("abort", () => this.cancel(), { once: true })
   }
@@ -131,6 +204,15 @@ class ParecRecording implements CaptureHandle {
     this.session.discard()
   }
 
+  /** Reads one child's stdout and stderr and handles its exit; returns the end of its stdout. */
+  private watch(child: ChildProcess): Promise<void> {
+    const stderr = this.stderr
+    const stdoutDone = drain(child.stdout, (chunk) => this.onPcm(chunk))
+    void drain(child.stderr, (chunk) => stderr.push(chunk))
+    void child.exited.then((code) => this.onExit(child, stdoutDone, code))
+    return stdoutDone
+  }
+
   private onPcm(chunk: Uint8Array): void {
     const samples = this.decoder.push(chunk)
     chunk.fill(0)
@@ -138,13 +220,36 @@ class ParecRecording implements CaptureHandle {
     samples.fill(0)
   }
 
-  private async onExit(code: number): Promise<void> {
-    if (this.stopping || this.cancelled) return
-    await this.stdoutDone
-    if (this.stopping || this.cancelled) return
+  private async onExit(child: ChildProcess, stdoutDone: Promise<void>, code: number): Promise<void> {
+    if (this.stopping || this.cancelled || child !== this.child) return
+    await stdoutDone
+    if (this.stopping || this.cancelled || child !== this.child) return
+    if (!this.session.firstChunkSeen && this.deviceName !== null && !this.retried) {
+      this.retryOnDefaultSource()
+      return
+    }
     const summary = this.stderr.summary()
     const message = `parec exited (code ${code})${summary ? `: ${summary}` : ""}`
     this.opts.onFailure?.(new VoiceError("recorder", message, { source: "recorder" }))
+  }
+
+  /** The named source failed before any audio arrived: once more on the default source, reported as a fallback. */
+  private retryOnDefaultSource(): void {
+    this.retried = true
+    this.decoder.reset()
+    let child: ChildProcess
+    try {
+      child = this.launch(null)
+    } catch (error) {
+      this.opts.onFailure?.(spawnFailure(error))
+      return
+    }
+    this.child = child
+    this.stderr = new ByteRing(STDERR_RING_BYTES)
+    this.stdoutDone = this.watch(child)
+    this.deviceName = null
+    this.deviceFallback = true
+    this.opts.onDeviceFallback?.({ deviceName: null, deviceFallback: true })
   }
 }
 
@@ -165,18 +270,29 @@ class ParecRecorder implements Recorder {
 
   async start(opts: CaptureStartOptions): Promise<CaptureHandle> {
     if (opts.signal.aborted) throw cancelledError("the recording was cancelled", "recorder")
-    let child: ChildProcess
-    try {
-      child = this.spawn(parecArgv(opts.device, this.command), {
+    const requested = opts.device?.trim() || null
+    const device = requested === null ? null : await this.sourceFor(requested, opts.signal)
+    if (opts.signal.aborted) throw cancelledError("the recording was cancelled", "recorder")
+    const launch: ParecLauncher = (name) =>
+      this.spawn(parecArgv(name ?? undefined, this.command), {
         env: this.opts.env,
         stdin: "ignore",
         stdout: "pipe",
         stderr: "pipe",
       })
+    try {
+      return new ParecRecording(launch, requested, device, opts, this.opts.clock)
     } catch (error) {
       throw spawnFailure(error)
     }
-    return new ParecRecording(child, opts, this.opts.clock)
+  }
+
+  /** The source name to pass as --device, or null for the default source. */
+  private async sourceFor(name: string, signal: AbortSignal): Promise<string | null> {
+    if (looksLikePulseSource(name)) return name
+    const list = this.opts.listSources ?? ((abort: AbortSignal) => listPulseSources(this.spawn, this.opts.env, abort))
+    const sources = await list(signal).catch((): readonly string[] => [])
+    return sources.includes(name) ? name : null
   }
 }
 

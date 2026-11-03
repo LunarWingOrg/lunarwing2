@@ -646,9 +646,22 @@ async fn emit_approval_turn(gateway: &GatewayChannel) -> usize {
         parameters,
         allow_always: true,
     };
-    let mut frames = 2 + status(gateway, &paused, approval).await;
+    let frames = 2 + status(gateway, &paused, approval).await;
     gateway
         .message_lifecycle(&paused, MessageLifecycle::Finished(TurnOutcome::Paused))
+        .await;
+    frames + 1 + emit_continuation(gateway).await
+}
+
+/// The resumed turn: the gate decision, credential prompts, engine events, a job, the
+/// reply.
+#[cfg(test)]
+async fn emit_continuation(gateway: &GatewayChannel) -> usize {
+    let msg = chat_message(APPROVAL_MESSAGE, Some(SECOND_TURN));
+    let sse = &gateway.state().sse;
+    // The agent loop starts the approval message before its handler resolves the gate.
+    gateway
+        .message_lifecycle(&msg, MessageLifecycle::Started)
         .await;
     // `resolve_gate` announces the decision without correlation.
     sse.broadcast_for_user(
@@ -662,19 +675,7 @@ async fn emit_approval_turn(gateway: &GatewayChannel) -> usize {
             thread_id: Some(THREAD.into()),
         },
     );
-    frames += 2;
-    frames + emit_continuation(gateway).await
-}
-
-/// The resumed turn: credential prompts, engine events, a job, the reply.
-#[cfg(test)]
-async fn emit_continuation(gateway: &GatewayChannel) -> usize {
-    let msg = chat_message(APPROVAL_MESSAGE, Some(SECOND_TURN));
-    let sse = &gateway.state().sse;
-    gateway
-        .message_lifecycle(&msg, MessageLifecycle::Started)
-        .await;
-    let mut frames = 1;
+    let mut frames = 2;
     let statuses = [
         StatusUpdate::ExternalWaiting {
             gate_name: "deploy-approval".into(),

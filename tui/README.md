@@ -205,7 +205,7 @@ max_duration_s = 120               # hard cap 290
 auto_stop_on_silence = false       # toggle mode only
 silence_stop_ms = 3500
 blur_policy = "hold"               # hold | always | never
-# device = "C922"                  # substring of the capture device name
+# device = "C922"                  # substring of the capture device name (parec: a PulseAudio source name)
 [voice.hex]
 command = ["hex"]                  # argv, no shell
 model = ""                         # empty: the first installed, verified English model
@@ -247,11 +247,17 @@ it applies. Every state carries a text label, so nothing depends on colour.
 
 ## Keys and the composer
 
+Keys marked **(KKP)** need the kitty keyboard protocol (kitty outside tmux). tmux, and terminals
+without the protocol, deliver the legacy encoding instead: there kitty sends Ctrl+Enter as a plain
+Enter (the message is queued instead of interrupting), Ctrl+- as `-` and Ctrl+. as `.`. Every action
+with a (KKP) key has another key on the same line that works everywhere, also inside tmux. F1 marks the
+same keys, and the footer only offers keys that arrive where it is shown.
+
 | Keys | When | Action |
 |---|---|---|
 | Enter | always | send (queued while a turn runs); confirm a guarded send or a typed approval; send the credential |
-| Ctrl+J, Alt+Enter, Shift+Enter | composer | new line (Shift+Enter needs the kitty keyboard protocol) |
-| Ctrl+S, Ctrl+Enter | always | interrupt the running turn, then send; with an empty message, interrupt only |
+| Ctrl+J, Alt+Enter, Shift+Enter (KKP) | composer | new line |
+| Ctrl+S, Ctrl+Enter (KKP) | always | interrupt the running turn, then send; with an empty message, interrupt only; also cancels a message that shows "no reply yet" (legacy daemons) |
 | F9, Ctrl+Space | voice | push-to-talk (tap to start and stop, or hold) |
 | F1 | always | help |
 | Esc | always | close the panel; cancel a confirmation; cancel dictation; dismiss the newest notice |
@@ -259,16 +265,35 @@ it applies. Every state carries a text label, so nothing depends on colour.
 | Ctrl+R / Ctrl+X | images attached | remove the last / every attachment |
 | Alt+Y / Alt+A / Alt+N | approval pending | approve / approve and always allow this tool / deny |
 | Alt+V | approval pending | view the full approval text |
-| Alt+], Alt+J | several approvals | focus the next pending approval; inside tmux use **Alt+J** (tmux sends Alt+] in the legacy encoding as `ESC ]`, which is dropped) |
+| Alt+] (KKP), Alt+J | several approvals | focus the next pending approval; inside tmux use **Alt+J** (tmux sends Alt+] in the legacy encoding as `ESC ]`, which is dropped) |
 | Alt+R | voice clip kept | retry the kept voice clip |
 | Up, Down | first / last line | previous / next sent message or cleared draft |
-| Ctrl+_ (what Ctrl+- sends) / Ctrl+. | composer | undo / redo, also inside tmux |
+| Ctrl+_, Ctrl+/, Ctrl+- (KKP) | composer | undo (Ctrl+_ is Ctrl+Shift+- on most layouts; Ctrl+_ and Ctrl+/ send 0x1F, which tmux forwards) |
+| Ctrl+Y, Ctrl+. (KKP) | composer | redo |
 | PageUp, PageDown | always | scroll the panel or the transcript; scrolling to the end follows new text again |
 | Ctrl+C | always | cancel dictation; else clear the message (Ctrl+_ restores it); else press twice within 2 s to quit |
 
 The composer wraps words and grows from one to six rows. A paste keeps its line breaks. A byte counter
 appears above 80 % of the daemon's message limit. A message typed while a turn runs is queued. On
 legacy daemons each queued message still gets its own reply in order.
+
+On legacy daemons a message that gets no event for 15 s shows "no reply yet: the daemon may be busy
+with another channel; a late reply still lands here (Ctrl+S cancels)". It stays first in line: a daemon
+busy with an XMPP or other non-gateway turn holds the message in its scheduler without a word and
+answers it later, and that late reply must land on this message, not on the next one. The note goes
+with the first event. The message is marked `unanswered` only after 10 minutes, or when you cancel it:
+Ctrl+S (or `/interrupt`) sends an interrupt, and the daemon either drops the queued message
+("Interrupted.", the message reads "interrupted" / "cancelled before it started") or has nothing for it
+("Nothing to interrupt.", the message reads "unanswered"). A message the daemon consumed as an approval
+keyword never gets a reply, so cancel it before you send the next one: until then the next reply is
+matched to it.
+
+When the daemon restarts in the middle of a turn (upgrade-tenant, a crash, an OOM kill), the TUI
+reconnects and sees from the gateway's uptime (`GET /api/gateway/status`) that it talks to a new
+process. A turn the old process had finished is filled in from history; every other turn it was
+handling reads "lost (daemon restarted)" and never takes a later reply ("the daemon restarted: N
+unfinished turns were lost"). A turn paused at an approval the restarted daemon still lists (Engine V2
+keeps its gates) stays answerable. Ask again after a restart; nothing is re-sent automatically.
 
 Approvals:
 
@@ -312,7 +337,7 @@ or when the credential is sent.
 | `/copy [n]` | copy the newest (n-th newest) reply |
 | `/voice [status\|use <id>\|auto\|order <ids>\|device [name]\|test\|privacy\|retry]` | voice sources, devices and the privacy panel |
 | `/transport [status\|reconnect]` | connection details; reconnect now |
-| `/interrupt`, `/stop`, `/steer <note>` | stop the running turn; add a note to it |
+| `/interrupt`, `/stop`, `/steer <note>` | stop the running turn (or cancel a message that shows "no reply yet"); add a note to it |
 | `/approve`, `/always`, `/deny`, `/approval view` | answer or view the focused approval |
 | `/thread [list\|new\|<id prefix>]` | the threads of this gateway; switch threads |
 | `/clear`, `/new` | forwarded to the daemon |
@@ -355,7 +380,8 @@ client degrades instead of failing.
 | Approvals with a panel | yes | yes | REPLv3 only |
 | Threads and history | yes | yes | REPLv3: own thread token |
 | LunarVoice transcription | when configured | when `/api/voice/status` says configured | REPLv3 only |
-| Exact turn end | `turn_finished` events | inferred: the reply, status hints, and a history resync 10 s after a `Done` without a reply; the oldest waiting turn is marked `unanswered` after 15 s without any event | REPLv3 only |
+| Exact turn end | `turn_finished` events | inferred: the reply, status hints, and a history resync 10 s after a `Done` without a reply; the oldest waiting turn shows "no reply yet" after 15 s without any event, stays first in line, and is marked `unanswered` after 10 min or when Ctrl+S cancels it | REPLv3 only |
+| Daemon restart detected | yes (`GET /api/gateway/status` uptime) | yes (same route) | M4 |
 
 Limits (images, message size, transcription size) come from the daemon. Legacy gateways get the
 defaults: 100,000-byte messages, 5 images of at most 5 MiB and 7 MiB in total, PNG, JPEG, GIF and WebP,
@@ -386,7 +412,12 @@ afterwards.
   -50 dBFS is discarded with "no signal from <device> - /voice device". Recordings stop at
   `max_duration_s` (default 120 s, cap 290 s), with a warning 10 s before.
 - **Devices**: the device stored with `/voice device <name>`, then `[voice] device`, then the default
-  source.
+  source. OpenTUI audio matches the name against its capture devices (exactly, then as a substring). The
+  `parec` fallback passes it to `--device` only when it is a PulseAudio source name: listed by
+  `pactl list short sources`, or shaped like one (`alsa_input.usb-...`, `....monitor`, `@DEFAULT_SOURCE@`).
+  Otherwise, or when parec cannot open that source before any audio arrives (it then tries once more
+  without `--device`), parec records from the default source with the notice `capture device "<name>" not
+  found; using the default source - /voice device`.
 - `--no-voice` creates no audio engine and probes no voice source. Dictation is also disabled while a
   credential is being entered.
 
@@ -475,6 +506,9 @@ Limits and validation:
 - Only PNG, JPEG, GIF and WebP, recognised by their magic bytes. File extensions, clipboard types and
   data-URL prefixes are not trusted, and BMP, SVG, TIFF, HEIC, AVIF and ICO are refused. The detected
   type is the one sent.
+- Animated WebP (a `VP8X` header with the animation flag) is refused with "animated WebP is not
+  supported; convert it to PNG or GIF", because OpenTUI 0.8.1 cannot decode it. Still WebP (also with
+  alpha) and animated GIF work.
 - The per-image, count and total limits come from the daemon (legacy gateways: 5 images, 5 MiB each,
   7 MiB together). The whole request must also fit the gateway's body limit after base64 encoding. The
   limits are checked when you attach and again when you send.
@@ -570,9 +604,13 @@ meter at 4 Hz. `[ui] cursor_blink = false` stops the cursor blinking.
 - Tokens never appear on argv, in URLs, in logs, in error messages or on screen. HTTP proxy variables are
   neutralized at start. If one is still set, gateway and Hex requests are refused rather than sent
   through the proxy.
-- Child processes (`parec`, `wl-paste`, `wl-copy`, `grim`, `slurp`, `notify-send`, `xdg-open`, `hex`) are
-  started without a shell, with an argv array and an allowlisted environment. They never get a token,
-  the proxy variables or `TRANSCRIBE_DUMP_DIR`.
+- Child processes (`parec`, `pactl`, `wl-paste`, `wl-copy`, `grim`, `slurp`, `notify-send`, `xdg-open`,
+  `hex`) are started without a shell, with an argv array and an allowlisted environment. They never get a
+  token, the proxy variables or `TRANSCRIBE_DUMP_DIR`. `pactl list short sources` runs only for the parec
+  fallback, when the configured device name does not look like a PulseAudio source.
+- The restart probe `GET /api/gateway/status` is an ordinary authenticated request: the listener-owner
+  check runs before it, the token goes only in its `Authorization` header, and the client reads nothing
+  but `uptime_secs` from the answer.
 - Server text (replies, activity, notices, captions) is stripped of escape sequences, control characters
   and bidi controls before it is shown. Approval text shows them as visible escapes instead.
 
@@ -588,6 +626,8 @@ meter at 4 Hz. `[ui] cursor_blink = false` stops the cursor blinking.
 | `OFFLINE`, "port N is held by uid U, expected X" | another account owns the port. Check the tenant (`mt-admin status <t>`) and the `tenant_uid` in your tenant file |
 | "HTTP_PROXY is set: gateway requests are never sent through a proxy" | unset the proxy variables for the TUI, or set `NO_PROXY='*'` |
 | `reconnecting in N s` | the gateway is down or restarting; the TUI keeps retrying (backoff up to 15 s). `/transport reconnect` retries at once |
+| a turn reads "lost (daemon restarted)" | the daemon restarted while it handled the turn; its work is gone. Ask again (nothing is re-sent automatically) |
+| a turn shows "no reply yet" | legacy daemon: the message waits in the daemon's queue (another channel's turn runs) or was consumed without a reply. Its reply still lands on it; Ctrl+S cancels it |
 | header says `legacy daemon` | expected with today's daemons; see the [capability matrix](#capability-matrix) |
 | `(no mic)` | no source can transcribe: `/voice` lists the reason per source (gateway voice not configured, Hex not running or not installed). The footer and the welcome then offer no push-to-talk key |
 | "voice failed (Alt+R retry, Esc discard): ..." | every source failed; the clip is kept for 10 min |
@@ -603,8 +643,13 @@ meter at 4 Hz. `[ui] cursor_blink = false` stops the cursor blinking.
 ## Known limitations
 
 - Legacy daemons (today's tenants): replies are matched first in, first out; a turn that gets no event
-  for 15 s is marked `unanswered`, and a finished turn without a reply is resolved by a history resync;
-  generated images are not delivered.
+  for 15 s shows "no reply yet" and keeps its place for 10 minutes, so a message the daemon consumed
+  silently (an approval keyword) takes the next reply unless you cancel it with Ctrl+S; a finished turn
+  without a reply is resolved by a history resync; generated images are not delivered.
+- Restart detection needs `GET /api/gateway/status` at connect. When that probe fails or times out
+  (3 s), a turn that died in a restart stays open until history shows it Failed for longer than 610 s. A
+  daemon host that was suspended while this TUI ran on another machine reads as a restart, because the
+  daemon's uptime does not count the suspend.
 - On V1 gateways, after a credential is accepted through `auth-token`, the daemon leaves credential mode
   only on the session's active thread. A TUI thread that is not the active thread may consume its next
   message as a credential (the text is not leaked, but that message is lost).
@@ -612,7 +657,8 @@ meter at 4 Hz. `[ui] cursor_blink = false` stops the cursor blinking.
   credential completed elsewhere (for example in the web UI) without a `gate_resolved` leaves the TUI
   in credential mode until Esc Esc.
 - Copy on select copies any finished drag selection, including one inside the composer.
-- Images above 25 megapixels are refused (OpenTUI 0.8.1 limit, no downscaling).
+- Images above 25 megapixels, and animated WebP, are refused (OpenTUI 0.8.1 limits, no downscaling or
+  conversion).
 - The microphone, clipboard, screenshot, notification and Hex paths are tested with fakes. The
   supervised live tests of design section 16 are still open.
 
@@ -628,10 +674,15 @@ bun test test/integration/gateway-transport.test.ts # one file
 
 - Layout: `src/` (config, state, controller, transport, voice, images, components), `test/` (unit,
   integration and OpenTUI `testRender` UI tests, mocks and fakes). The test preload (`test/setup.ts`)
-  fails the run on unhandled rejections, removes temp directories, refuses to spawn real desktop tools,
-  `hex`, `sudo`, `systemctl` or `rc-service`, and refuses non-loopback fetches. Tests inject clocks
-  (`ManualClock`) and child processes (`test/helpers/fake-spawn.ts`), and every mock listens on
-  `127.0.0.1:0`.
+  fails the run on unhandled rejections, removes temp directories, refuses to spawn real desktop tools
+  (`parec` and `pactl` included), `hex`, `sudo`, `systemctl` or `rc-service`, and refuses non-loopback
+  fetches. Tests inject clocks (`ManualClock`) and child processes (`test/helpers/fake-spawn.ts`), and
+  every mock listens on `127.0.0.1:0`.
+- Contract checks against the daemon: `test/transport/sse-fixture.test.ts` replays the server's golden
+  SSE fixture (`../ic/src/channels/web/tests/fixtures/sse_current.ndjson`, written by
+  `ic/src/channels/web/tests/correlation.rs`) through the client's own SSE parser and event mapper, so it
+  needs the whole repository checkout (CI has it). The mock gateway's `current` mode follows the real
+  server's image checks, request-shape 422s and continuation order (`test/integration/mock-gateway.test.ts`).
 - A mock gateway for manual runs:
   `bun test/mocks/mock-gateway.ts --mode legacy|current [--token-file <0600 file>]` prints
   `LISTENING <port>` and answers every message with `echo: <text>`. Then run

@@ -216,6 +216,49 @@ describe("connect (3.8 steps 1-6)", () => {
     expect(muted.limits.maxTranscribeWavBytes).toBe(0)
   })
 
+  test("GET /api/gateway/status uptime_secs tells when the daemon started, in the Clock domain (both modes)", async () => {
+    for (const mode of ["legacy", "current"] as const) {
+      const r = await rig(mode)
+      r.clock.setTime(5_000_000)
+      r.mock.uptimeSecs = () => 42
+      const info = await connect(r)
+      // ManualClock: the probe was sent and answered at 5_000_000, so the start lies in (5_000_000 - 43 s, - 42 s].
+      expect(info.daemonStart).toEqual({ earliest: 5_000_000 - 43_000, latest: 5_000_000 - 42_000, measuredAt: 5_000_000 })
+      const status = r.mock.requestsTo("GET /api/gateway/status")
+      expect(status).toHaveLength(1)
+      expect(status[0]?.headers.authorization).toBe(`Bearer ${TOKEN}`)
+      expect(status[0]?.url).toBe("/api/gateway/status")
+      expect(routes(r.mock).slice(0, 2)).toEqual(["GET /api/health", "GET /api/chat/events"])
+    }
+  })
+
+  test("a status probe that fails, answers without uptime_secs or hangs gives no daemon start; connect still works", async () => {
+    const r = await rig("current")
+    const cases: (() => Response)[] = [
+      () => new Response(null, { status: 404 }),
+      () => text(403, "Client token not permitted for this route"),
+      () => text(500, "boom"),
+      () => json(200, { version: "2.1.6" }),
+      () => json(200, { uptime_secs: -1 }),
+      () => json(200, { uptime_secs: "42" }),
+      () => text(200, "not json"),
+    ]
+    for (const answer of cases) {
+      r.mock.override("GET /api/gateway/status", answer, 1)
+      const info = await connect(r)
+      expect([info.protocol, info.daemonStart]).toEqual(["gateway-chat", null])
+    }
+    // A status route that never answers (a channel health check hangs) holds the connect for at most 3 s.
+    const slow = new Promise<Response>(() => undefined)
+    r.mock.override("GET /api/gateway/status", () => slow, 1)
+    const connecting = connect(r)
+    await r.mock.waitForRequest("GET /api/chat/pending-gates", false)
+    for (let i = 0; i < 50 && r.mock.requestsTo("GET /api/gateway/status").length < 8; i += 1) await new Promise((resolve) => setTimeout(resolve, 2))
+    r.clock.advance(3_000)
+    const info = await connecting
+    expect(info.daemonStart).toBeNull()
+  })
+
   test("503 'Too many connections' on the event stream is busy, retried after 30 s", async () => {
     const r = await rig("current", { mock: { maxStreams: 0 } })
     const error = await rejection(connect(r))

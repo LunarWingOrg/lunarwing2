@@ -163,6 +163,14 @@ export interface VoiceErrorBody {
   message: string
 }
 
+/**
+ * GET /api/gateway/status (server.rs GatewayStatusResponse), the one field the client reads: whole seconds since
+ * the gateway channel of this daemon process was created (GatewayState.startup_time).
+ */
+export interface GatewayStatusResponse {
+  uptime_secs: number
+}
+
 /** auth-token / auth-cancel answer 200 with ActionResponse (types.rs ActionResponse). */
 export interface ActionResponse {
   success: boolean
@@ -318,6 +326,9 @@ const EVENT_SHAPES: { readonly [K in GatewayEventType]: (o: Obj) => boolean } = 
 function isKnownType(type: string): type is GatewayEventType {
   return Object.hasOwn(EVENT_SHAPES, type)
 }
+
+/** Every event type the client parses (the GatewayEvent union); the golden-fixture test checks it against the server. */
+export const GATEWAY_EVENT_TYPES: readonly GatewayEventType[] = Object.freeze(Object.keys(EVENT_SHAPES) as GatewayEventType[])
 
 /**
  * The type guard of design 3.8 ("JSON.parse → type guard → mapper"): a known event type with the fields the
@@ -766,6 +777,13 @@ export function parseVoiceError(value: unknown): VoiceErrorBody | null {
 
 export function parseActionResponse(value: unknown): ActionResponse | null {
   return isObj(value) && isBool(value.success) ? { success: value.success, message: isStr(value.message) ? value.message : "" } : null
+}
+
+/** `uptime_secs` must be a non-negative integer (a Rust u64); anything else gives no daemon start. */
+export function parseGatewayStatus(value: unknown): GatewayStatusResponse | null {
+  if (!isObj(value)) return null
+  const uptime = value.uptime_secs
+  return typeof uptime === "number" && Number.isSafeInteger(uptime) && uptime >= 0 ? { uptime_secs: uptime } : null
 }
 
 export function parseSendResponse(value: unknown): SendMessageResponse | null {

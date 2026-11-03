@@ -150,11 +150,11 @@ mod tests {
     }
 
     #[test]
-    fn stash_evicts_by_count_bytes_and_ttl() {
+    fn stash_evicts_the_oldest_image_by_count() {
         let thread = ThreadId::new();
         let start = Instant::now();
 
-        // Count: the ninth image evicts the oldest.
+        // The ninth image evicts the oldest.
         let stash = GeneratedImageStash::default();
         for index in 0..=MAX_STASHED_IMAGES {
             stash.put_at(thread, format!("call-{index}"), image(64, 'A'), start);
@@ -167,8 +167,14 @@ mod tests {
                 .take_at(thread, &format!("call-{MAX_STASHED_IMAGES}"), start)
                 .is_some()
         );
+    }
 
-        // Bytes: three images of a third of the budget plus one byte do not fit.
+    #[test]
+    fn stash_evicts_the_oldest_images_by_bytes() {
+        let thread = ThreadId::new();
+        let start = Instant::now();
+
+        // Three images of a third of the budget plus one byte do not fit.
         let stash = GeneratedImageStash::default();
         let third = MAX_STASHED_BYTES / 3 + 1;
         for index in 0..3 {
@@ -188,8 +194,14 @@ mod tests {
             start,
         );
         assert_eq!(stash.len(), 0);
+    }
 
-        // Age: an image is dropped once it is STASH_TTL old, by take and by put.
+    #[test]
+    fn stash_drops_images_once_they_are_ttl_old() {
+        let thread = ThreadId::new();
+        let start = Instant::now();
+
+        // An image is dropped once it is STASH_TTL old, by take and by put.
         let stash = GeneratedImageStash::default();
         let expired = start + STASH_TTL;
         stash.put_at(thread, "old".into(), image(64, 'D'), start);

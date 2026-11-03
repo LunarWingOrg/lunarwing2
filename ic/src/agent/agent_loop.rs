@@ -125,18 +125,6 @@ async fn abort_and_wait<T>(handle: &mut tokio::task::JoinHandle<T>) {
     let _ = handle.await;
 }
 
-/// How a handled message finished, judged from the handler's result alone (TUI design
-/// 8.2.2). Outcome hints recorded with `ChannelManager::note_turn_outcome` by the code
-/// that knows more refine `Replied` and `NoReply` when the outcome is reported.
-fn turn_outcome(result: &Result<Option<String>, Error>) -> TurnOutcome {
-    match result {
-        Ok(Some(text)) if !text.is_empty() => TurnOutcome::Replied,
-        // Includes `Ok(None)` (the shutdown signal) and the empty suppression sentinels.
-        Ok(_) => TurnOutcome::NoReply,
-        Err(_) => TurnOutcome::Failed,
-    }
-}
-
 /// The outcome a V1 submission result implies beyond its reply text (TUI design 8.2.2):
 /// the turn stopped at an approval gate, was interrupted, or ended in an `Error: ...`
 /// reply.
@@ -154,8 +142,8 @@ fn submission_outcome_hint(result: &SubmissionResult) -> Option<TurnOutcome> {
 /// DEC-1 guard (TUI design 8.4): `Ok(None)` stops the loop except on channels whose
 /// clients attach to a running service. There, model output that maps to `Ok(None)`
 /// (a V1 `NO_REPLY` reply, V2 `Completed { response: None }`) must not stop the daemon;
-/// the producers themselves are tracked separately. To revert, map `Ok(None)` straight
-/// to `Shutdown` in `deliver_message_result` again.
+/// the producers themselves are tracked separately. To revert, give `Ok(None)` the
+/// `Shutdown` control in `deliver_message_result` again.
 fn none_result_control(channel: &str) -> MessageLoopControl {
     if crate::agent::commands::quit_refusal(channel).is_some() {
         tracing::warn!(
@@ -1334,7 +1322,8 @@ impl Agent {
     }
 
     /// Runs one dequeued message under the soft timeout and reports its lifecycle: `Started`
-    /// first, then exactly one `Finished` from whichever arm ends it (TUI design 8.2.2).
+    /// first, then exactly one `Finished` with the outcome of whichever arm ends it, after
+    /// that arm's reply or notice (TUI design 8.2.2).
     async fn supervise_message(
         self: Arc<Self>,
         message: IncomingMessage,
@@ -1362,31 +1351,27 @@ impl Agent {
             _ = &mut deadline => ActiveMessageResult::TimedOut,
         };
 
-        match active_result {
+        let (control, outcome) = match active_result {
             ActiveMessageResult::Completed(Ok(result)) => {
-                let outcome = turn_outcome(&result);
-                let control = self.deliver_message_result(&message, result).await;
-                self.report_finished(&message, outcome).await;
-                control
+                self.deliver_message_result(&message, result).await
             }
             ActiveMessageResult::Completed(Err(join_error)) => {
                 self.handle_message_panic(&message, &join_error).await;
-                self.report_finished(&message, TurnOutcome::Failed).await;
-                MessageLoopControl::Continue
+                (MessageLoopControl::Continue, TurnOutcome::Failed)
             }
             ActiveMessageResult::TimedOut => {
                 self.handle_soft_timeout(&message, &suppressed, soft_timeout, abort_handle)
                     .await;
                 abort_guard.disarm();
-                self.report_finished(&message, TurnOutcome::TimedOut).await;
-                MessageLoopControl::Continue
+                (MessageLoopControl::Continue, TurnOutcome::TimedOut)
             }
             ActiveMessageResult::Cancelled => {
                 abort_and_wait(&mut handle).await;
-                self.report_finished(&message, TurnOutcome::Cancelled).await;
-                MessageLoopControl::Continue
+                (MessageLoopControl::Continue, TurnOutcome::Cancelled)
             }
-        }
+        };
+        self.report_finished(&message, outcome).await;
+        control
     }
 
     async fn prepare_message(&self, mut message: IncomingMessage) -> IncomingMessage {
@@ -1449,8 +1434,8 @@ impl Agent {
         }
         self.report_started(interrupt).await;
         let result = Ok(Some(crate::bridge::INTERRUPTED_RESPONSE.to_string()));
-        let _ = self.deliver_message_result(interrupt, result).await;
-        self.report_finished(interrupt, TurnOutcome::Replied).await;
+        let (_, outcome) = self.deliver_message_result(interrupt, result).await;
+        self.report_finished(interrupt, outcome).await;
     }
 
     /// Queues an ordinary message. When the deferred queue is full the message is
@@ -1469,8 +1454,7 @@ impl Agent {
         self.report_started(&message).await;
         let suppressed = AtomicBool::new(false);
         let result = self.handle_message(&message, &suppressed).await;
-        let outcome = turn_outcome(&result);
-        let _ = self.deliver_message_result(&message, result).await;
+        let (_, outcome) = self.deliver_message_result(&message, result).await;
         self.report_finished(&message, outcome).await;
     }
 
@@ -1489,15 +1473,23 @@ impl Agent {
             .await;
     }
 
+    /// Delivers a handler result and rates how the message finished (TUI design 8.2.2).
+    ///
+    /// A non-empty reply is `replied` once it reached `respond()` or the coalescing
+    /// buffer, and `no_reply` when a `BeforeOutbound` hook suppressed it. An empty reply
+    /// (the suppression sentinels: approval prompt, inbound hook rejection, stale
+    /// approval) and `Ok(None)` are `no_reply`; an error is `failed`. Outcome hints
+    /// recorded with `ChannelManager::note_turn_outcome` refine `replied` and `no_reply`
+    /// when the outcome is reported.
     async fn deliver_message_result(
         &self,
         message: &IncomingMessage,
         result: Result<Option<String>, Error>,
-    ) -> MessageLoopControl {
+    ) -> (MessageLoopControl, TurnOutcome) {
         match result {
             Ok(Some(response)) if !response.is_empty() => {
-                self.deliver_outbound_with_hooks(message, response).await;
-                MessageLoopControl::Continue
+                let delivery = self.deliver_outbound_with_hooks(message, response).await;
+                (MessageLoopControl::Continue, delivery.outcome())
             }
             Ok(Some(empty)) => {
                 tracing::debug!(
@@ -1506,10 +1498,10 @@ impl Agent {
                     empty_len = empty.len(),
                     "Suppressed empty response (not sent to channel)"
                 );
-                MessageLoopControl::Continue
+                (MessageLoopControl::Continue, TurnOutcome::NoReply)
             }
-            // DEC-1 (TUI design 8.4): was `Ok(None) => MessageLoopControl::Shutdown`.
-            Ok(None) => none_result_control(&message.channel),
+            // DEC-1 (TUI design 8.4): the control was `MessageLoopControl::Shutdown`.
+            Ok(None) => (none_result_control(&message.channel), TurnOutcome::NoReply),
             Err(error) => {
                 tracing::error!("Error handling message: {error}");
                 if let Err(send_error) = self
@@ -1523,13 +1515,17 @@ impl Agent {
                         "Failed to send error response to channel"
                     );
                 }
-                MessageLoopControl::Continue
+                (MessageLoopControl::Continue, TurnOutcome::Failed)
             }
         }
     }
 
-    async fn deliver_outbound_with_hooks(&self, message: &IncomingMessage, response: String) {
-        self.response_delivery().deliver(message, response).await;
+    async fn deliver_outbound_with_hooks(
+        &self,
+        message: &IncomingMessage,
+        response: String,
+    ) -> super::response_delivery::Delivery {
+        self.response_delivery().deliver(message, response).await
     }
 
     pub(crate) fn response_delivery(&self) -> super::response_delivery::ResponseDelivery {
@@ -2365,7 +2361,6 @@ mod tests {
         MessageLoopControl, abort_and_wait, chat_tool_execution_metadata, coalesced_reply_context,
         coordination_activity_is_denied, none_result_control, resolve_routine_notification_user,
         should_fallback_routine_notification, submission_outcome_hint, truncate_for_preview,
-        turn_outcome,
     };
     use crate::agent::submission::SubmissionResult;
     #[cfg(feature = "libsql")]
@@ -2536,20 +2531,122 @@ mod tests {
         assert!(dropped.load(Ordering::SeqCst));
     }
 
-    #[test]
-    fn turn_outcome_maps_results() {
-        assert_eq!(
-            turn_outcome(&Ok(Some("hello".to_string()))),
-            TurnOutcome::Replied
+    /// Rejects every reply at `BeforeOutbound`.
+    #[cfg(feature = "libsql")]
+    struct RejectOutbound;
+
+    #[cfg(feature = "libsql")]
+    #[async_trait::async_trait]
+    impl crate::hooks::Hook for RejectOutbound {
+        fn name(&self) -> &str {
+            "agent-loop-reject-outbound"
+        }
+
+        fn hook_points(&self) -> &[crate::hooks::HookPoint] {
+            &[crate::hooks::HookPoint::BeforeOutbound]
+        }
+
+        async fn execute(
+            &self,
+            _event: &crate::hooks::HookEvent,
+            _ctx: &crate::hooks::HookContext,
+        ) -> Result<crate::hooks::HookOutcome, crate::hooks::HookError> {
+            Ok(crate::hooks::HookOutcome::reject("blocked by the test"))
+        }
+    }
+
+    /// Replies a `StubChannel` captured.
+    #[cfg(feature = "libsql")]
+    type StubReplies =
+        Arc<std::sync::Mutex<Vec<(IncomingMessage, crate::channels::OutgoingResponse)>>>;
+
+    /// An agent whose channels hold one `StubChannel` named `stub`, its replies, and the
+    /// directory of its database (keep it alive while the agent is used).
+    #[cfg(feature = "libsql")]
+    async fn stub_channel_agent() -> (Agent, StubReplies, tempfile::TempDir) {
+        let (db, db_dir) = crate::testing::test_db().await;
+        let harness = crate::testing::TestHarnessBuilder::new()
+            .with_db(db)
+            .build()
+            .await;
+        let channels = Arc::new(ChannelManager::new());
+        let (stub, _sender) = crate::testing::StubChannel::new("stub");
+        let replies = stub.captured_responses_handle();
+        channels.add(Box::new(stub)).await;
+        let agent = Agent::new(
+            AgentConfig::for_testing(),
+            harness.deps,
+            channels,
+            None,
+            None,
+            None,
+            None,
+            None,
         );
-        // Empty suppression sentinels (approval prompt, hook rejection, stale approval).
-        assert_eq!(turn_outcome(&Ok(Some(String::new()))), TurnOutcome::NoReply);
+        (agent, replies, db_dir)
+    }
+
+    /// Delivers `result` for `message`: whether the loop continues, and the outcome.
+    #[cfg(feature = "libsql")]
+    async fn rate(
+        agent: &Agent,
+        message: &IncomingMessage,
+        result: Result<Option<String>, crate::error::Error>,
+    ) -> (bool, TurnOutcome) {
+        let (control, outcome) = agent.deliver_message_result(message, result).await;
+        (matches!(control, MessageLoopControl::Continue), outcome)
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn deliver_message_result_rates_what_reached_the_channel() {
+        let (agent, replies, _db_dir) = stub_channel_agent().await;
+        let message = IncomingMessage::new("stub", "alice", "hello");
+        let reply_count = || replies.lock().map_or(0, |replies| replies.len());
+
+        let reply = Ok(Some("hi there".to_string()));
+        assert_eq!(
+            rate(&agent, &message, reply).await,
+            (true, TurnOutcome::Replied)
+        );
+        assert_eq!(reply_count(), 1);
+        // Empty suppression sentinels (approval prompt, inbound hook rejection, stale
+        // approval) are no reply.
+        let empty = Ok(Some(String::new()));
+        assert_eq!(
+            rate(&agent, &message, empty).await,
+            (true, TurnOutcome::NoReply)
+        );
         // `Ok(None)` is the shutdown signal (and the silent `NO_REPLY` reply).
-        assert_eq!(turn_outcome(&Ok(None)), TurnOutcome::NoReply);
+        assert_eq!(
+            rate(&agent, &message, Ok(None)).await,
+            (false, TurnOutcome::NoReply)
+        );
         let error = crate::error::Error::from(crate::error::JobError::NotFound {
             id: uuid::Uuid::new_v4(),
         });
-        assert_eq!(turn_outcome(&Err(error)), TurnOutcome::Failed);
+        assert_eq!(
+            rate(&agent, &message, Err(error)).await,
+            (true, TurnOutcome::Failed)
+        );
+        assert_eq!(reply_count(), 2, "the error reply");
+    }
+
+    /// A reply that a `BeforeOutbound` hook suppresses never reached `respond()`: the
+    /// message finishes `no_reply`, not `replied`.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn deliver_message_result_rates_a_hook_suppressed_reply_no_reply() {
+        let (agent, replies, _db_dir) = stub_channel_agent().await;
+        agent.hooks().register(Arc::new(RejectOutbound)).await;
+        let message = IncomingMessage::new("stub", "alice", "hello");
+
+        let reply = Ok(Some("hi there".to_string()));
+        assert_eq!(
+            rate(&agent, &message, reply).await,
+            (true, TurnOutcome::NoReply)
+        );
+        assert_eq!(replies.lock().map_or(0, |replies| replies.len()), 0);
     }
 
     #[test]

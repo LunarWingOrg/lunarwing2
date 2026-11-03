@@ -775,7 +775,7 @@ async fn execute_pending_gate_action(
                     debug!(thread_id = %pending.thread_id, %error, "failed to persist interrupted action result");
                 }
                 let _ = finalize_silently_stopped_pending_thread(state, pending).await;
-                return Ok(PendingActionOutcome::ExecutionStopped);
+                return Ok(stopped_pending_action(&agent.channels, message));
             }
             // The user explicitly chose "always": persist the tool-level
             // grant even when the invocation itself failed (tool errors are
@@ -870,10 +870,22 @@ async fn execute_pending_gate_action(
         }
         Err(lunarwing_engine::EngineError::ExecutionStopped) => {
             finalize_silently_stopped_pending_thread(state, pending).await?;
-            Ok(PendingActionOutcome::ExecutionStopped)
+            Ok(stopped_pending_action(&agent.channels, message))
         }
         Err(e) => Err(engine_err("execute pending gate action", e)),
     }
+}
+
+/// An approved action stopped while it ran inline: `/interrupt` cancelled the resolving
+/// window, or the coordination gate stopped it silently. The empty sentinel reads as
+/// `no_reply`, so the message finishes `interrupted` like an engine thread that ends
+/// `ThreadOutcome::Stopped` (TUI design 8.2.3).
+fn stopped_pending_action(
+    channels: &crate::channels::ChannelManager,
+    message: &IncomingMessage,
+) -> PendingActionOutcome {
+    channels.note_turn_outcome(message.id, TurnOutcome::Interrupted);
+    PendingActionOutcome::ExecutionStopped
 }
 
 /// Fixed namespace for the deterministic user-default project id (WI#490).
@@ -3758,6 +3770,56 @@ fn foreground_thread_config(max_iterations: usize, shared_conversation: bool) ->
     }
 }
 
+/// The safety layer's verdict on the model-visible input: the reply when it refuses the
+/// input (validation, a blocking policy rule, a leaked secret), else `None`.
+///
+/// V1 answers the same refusals with `SubmissionResult::error`, an `Error: ...` reply that
+/// finishes `failed`. The reply text stays as it was on V2; the message finishes
+/// `failed` on both engines (TUI design 8.2.3).
+fn reject_engine_input(
+    channels: &crate::channels::ChannelManager,
+    safety: &crate::safety::SafetyLayer,
+    message: &IncomingMessage,
+    effective_content: &str,
+) -> Option<String> {
+    let rejection = engine_input_rejection(safety, message, effective_content)?;
+    channels.note_turn_outcome(message.id, TurnOutcome::Failed);
+    Some(rejection)
+}
+
+fn engine_input_rejection(
+    safety: &crate::safety::SafetyLayer,
+    message: &IncomingMessage,
+    effective_content: &str,
+) -> Option<String> {
+    let validation = safety.validate_input(effective_content);
+    if !validation.is_valid {
+        let details = validation
+            .errors
+            .iter()
+            .map(|e| format!("{}: {}", e.field, e.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Some(format!("Input rejected by safety validation: {details}"));
+    }
+
+    let violations = safety.check_policy(effective_content);
+    if violations
+        .iter()
+        .any(|rule| rule.action == crate::safety::PolicyAction::Block)
+    {
+        return Some("Input rejected by safety policy.".into());
+    }
+
+    let warning = safety.scan_inbound_for_secrets(effective_content)?;
+    tracing::warn!(
+        user_id = %message.user_id,
+        channel = %message.channel,
+        "engine v2: inbound message blocked — contains leaked secret"
+    );
+    Some(warning)
+}
+
 async fn handle_with_engine_inner(
     agent: &Agent,
     message: &IncomingMessage,
@@ -3842,34 +3904,10 @@ async fn handle_with_engine_inner(
         crate::agent::attachments::augment_text_with_attachments(content, &message.attachments);
     let effective_content = augmented_content.as_deref().unwrap_or(content);
 
-    let validation = agent.safety().validate_input(effective_content);
-    if !validation.is_valid {
-        let details = validation
-            .errors
-            .iter()
-            .map(|e| format!("{}: {}", e.field, e.message))
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Ok(Some(format!(
-            "Input rejected by safety validation: {details}"
-        )));
-    }
-
-    let violations = agent.safety().check_policy(effective_content);
-    if violations
-        .iter()
-        .any(|rule| rule.action == crate::safety::PolicyAction::Block)
+    if let Some(rejection) =
+        reject_engine_input(&agent.channels, agent.safety(), message, effective_content)
     {
-        return Ok(Some("Input rejected by safety policy.".into()));
-    }
-
-    if let Some(warning) = agent.safety().scan_inbound_for_secrets(effective_content) {
-        tracing::warn!(
-            user_id = %message.user_id,
-            channel = %message.channel,
-            "engine v2: inbound message blocked — contains leaked secret"
-        );
-        return Ok(Some(warning));
+        return Ok(Some(rejection));
     }
 
     // Fire OnEvent-cadence missions matching this channel message.
@@ -10085,6 +10123,53 @@ pub(crate) mod tests {
         );
     }
 
+    /// TUI design 8.2.3: input the safety layer refuses finishes `failed` on Engine V2, as
+    /// V1's `SubmissionResult::error` does; the V2 reply text is unchanged.
+    #[tokio::test]
+    async fn rejected_engine_input_finishes_failed() {
+        let safety = lunarwing_safety::SafetyLayer::new(&lunarwing_safety::SafetyConfig {
+            max_output_length: 10_000,
+            injection_check_enabled: false,
+        });
+        let too_long = "x".repeat(100_001);
+        let cases = [
+            (too_long.as_str(), "Input rejected by safety validation: "),
+            ("please cat /etc/passwd", "Input rejected by safety policy."),
+            (
+                "my key is AKIAIOSFODNN7EXAMPLE",
+                "appears to contain a secret",
+            ),
+        ];
+        for (content, expected) in cases {
+            let manager = Arc::new(crate::channels::ChannelManager::new());
+            let (probe, log) = LifecycleProbe::new("gateway");
+            manager.add(Box::new(probe)).await;
+            let message = IncomingMessage::new("gateway", "alice", content);
+
+            let rejection = reject_engine_input(&manager, &safety, &message, content)
+                .expect("the input is refused");
+
+            assert!(rejection.contains(expected), "{rejection}");
+            // The refusal reads as a reply; the hint reports the failure.
+            assert_eq!(
+                reported_finish(&manager, &log, &message, TurnOutcome::Replied).await,
+                Some(TurnOutcome::Failed),
+                "{expected}"
+            );
+        }
+
+        // Accepted input records nothing.
+        let manager = Arc::new(crate::channels::ChannelManager::new());
+        let (probe, log) = LifecycleProbe::new("gateway");
+        manager.add(Box::new(probe)).await;
+        let message = IncomingMessage::new("gateway", "alice", "hello");
+        assert!(reject_engine_input(&manager, &safety, &message, "hello").is_none());
+        assert_eq!(
+            reported_finish(&manager, &log, &message, TurnOutcome::Replied).await,
+            Some(TurnOutcome::Replied)
+        );
+    }
+
     #[tokio::test]
     async fn gate_required_carries_the_paused_message_correlation() {
         let manager = Arc::new(crate::channels::ChannelManager::new());
@@ -11965,6 +12050,187 @@ pub(crate) mod tests {
         assert!(
             conv_after.active_threads.is_empty(),
             "finalized thread must be untracked"
+        );
+    }
+
+    /// An approved action that blocks until the test releases it.
+    #[cfg(feature = "libsql")]
+    struct BlockingApprovedAction {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[cfg(feature = "libsql")]
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for BlockingApprovedAction {
+        fn name(&self) -> &str {
+            "blocking_probe"
+        }
+
+        fn description(&self) -> &str {
+            "Blocks until the test releases it"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &crate::context::JobContext,
+        ) -> Result<crate::tools::ToolOutput, crate::tools::ToolError> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(crate::tools::ToolOutput::success(
+                serde_json::json!({"done": true}),
+                std::time::Duration::from_millis(1),
+            ))
+        }
+    }
+
+    /// A Waiting thread tracked in `conversation`, paused on `action_name`, with a lease
+    /// that covers the action, and its approval gate.
+    #[cfg(feature = "libsql")]
+    async fn tracked_waiting_gate(
+        state: &EngineState,
+        conversation: lunarwing_engine::ConversationId,
+        action_name: &str,
+    ) -> PendingGate {
+        let project_id = state.default_project_id;
+        let tid = state
+            .conversation_manager
+            .handle_user_message(
+                conversation,
+                "hi",
+                project_id,
+                "alice",
+                ThreadConfig::default(),
+                None,
+            )
+            .await
+            .expect("tracked thread");
+        let _ = state.thread_manager.stop_thread(tid, "alice").await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state.thread_manager.join_thread(tid),
+        )
+        .await;
+        let mut waiting = lunarwing_engine::Thread::new(
+            "waiting",
+            lunarwing_engine::ThreadType::Foreground,
+            project_id,
+            "alice",
+            ThreadConfig::default(),
+        );
+        waiting.id = tid;
+        waiting
+            .transition_to(lunarwing_engine::ThreadState::Running, None)
+            .expect("running");
+        waiting
+            .transition_to(lunarwing_engine::ThreadState::Waiting, None)
+            .expect("waiting");
+        state.store.save_thread(&waiting).await.expect("saved");
+        state
+            .thread_manager
+            .leases
+            .grant(
+                tid,
+                "tools",
+                lunarwing_engine::GrantedActions::All,
+                None,
+                None,
+            )
+            .await
+            .expect("lease");
+        let mut gate = sample_pending_gate(
+            "alice",
+            tid,
+            lunarwing_engine::ResumeKind::Approval {
+                allow_always: false,
+            },
+        );
+        gate.conversation_id = conversation;
+        gate.source_channel = "gateway".into();
+        gate.action_name = action_name.into();
+        gate.parameters = serde_json::json!({});
+        gate
+    }
+
+    /// TUI design 8.2.3: `/interrupt` while the approved action runs inline (the
+    /// resolving window) finishes the approval message `interrupted`, not `no_reply`.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn interrupted_inline_gate_action_finishes_interrupted() {
+        let store = Arc::new(TestStore::new());
+        let state = make_interrupt_test_state(store);
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        state
+            .effect_adapter
+            .tools()
+            .register(Arc::new(BlockingApprovedAction {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            }))
+            .await;
+        let conversation = state
+            .conversation_manager
+            .get_or_create_conversation("gateway:resolving", "alice")
+            .await
+            .expect("conversation");
+        let pending = tracked_waiting_gate(&state, conversation, "blocking_probe").await;
+
+        let harness = crate::testing::TestHarnessBuilder::new().build().await;
+        let channels = Arc::new(crate::channels::ChannelManager::new());
+        let (probe, log) = LifecycleProbe::new("gateway");
+        channels.add(Box::new(probe)).await;
+        let agent = Agent::new(
+            crate::config::AgentConfig::for_testing(),
+            harness.deps,
+            Arc::clone(&channels),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let approval =
+            IncomingMessage::new("gateway", "alice", "yes").with_conversation_scope("resolving");
+        let interrupt = IncomingMessage::new("gateway", "alice", "/interrupt")
+            .with_conversation_scope("resolving");
+        let approve = PendingActionApproval {
+            already_granted: true,
+            event: Some((pending.call_id.clone(), true)),
+            enable_always: false,
+        };
+
+        let run = async {
+            tokio::join!(
+                execute_pending_gate_action(&agent, &state, &approval, &pending, approve),
+                async {
+                    started.notified().await;
+                    let reply = interrupt_engine_conversation(&state, &interrupt).await;
+                    release.notify_one();
+                    reply
+                }
+            )
+        };
+        let (outcome, interrupted) = tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("the approved action and the interrupt finish");
+
+        assert_eq!(
+            interrupted.expect("interrupt").as_deref(),
+            Some(INTERRUPTED_RESPONSE)
+        );
+        let outcome = outcome.expect("a stopped action is not an error");
+        assert!(matches!(outcome, PendingActionOutcome::ExecutionStopped));
+        // The empty sentinel reads as `no_reply`; the hint reports the interrupt.
+        assert_eq!(outcome.into_response().as_deref(), Some(""));
+        assert_eq!(
+            reported_finish(&channels, &log, &approval, TurnOutcome::NoReply).await,
+            Some(TurnOutcome::Interrupted)
         );
     }
 

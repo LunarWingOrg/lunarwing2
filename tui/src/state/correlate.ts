@@ -14,10 +14,15 @@
  *    expired; an interrupt, /clear or /new control answered with anything but "Nothing to interrupt."; the
  *    credential flow ending locally (composer/credential_done).
  * 4. Correlated without lifecycle: a correlated final seals.
- * 5. Uncorrelated final (legacy): control acks seal the oldest control of their kind ("Interrupted." also ends
- *    the interrupted turn and arms the V1 stray-ack window); a stray "Interrupted." is swallowed once; otherwise
- *    the oldest inflight turn is sealed done (FIFO), skipping turns paused at an open prompt or credential
- *    request (legacyTarget); with nothing inflight it is a background record.
+ * 5. Uncorrelated final (legacy): control acks seal the oldest control of their kind; a stray "Interrupted." is
+ *    swallowed once; otherwise the oldest inflight turn is sealed done (FIFO), skipping turns paused at an open
+ *    prompt or credential request (legacyTarget); with nothing inflight it is a background record.
+ *    5a. The daemon answers an interrupt from its scheduler (ic/src/agent/agent_loop.rs handle_priority_control,
+ *    dispatch.rs cancel_lane): with a turn of the thread running it stops that one ("Interrupted.") and queued
+ *    follow-ups still run; with only queued messages it drops them all ("Interrupted." once); with nothing it
+ *    says "Nothing to interrupt.". So "Interrupted." ends the oldest running user turn created before the
+ *    interrupt (arming the V1 stray-ack window), or, when none of them saw an event yet, every one still waiting
+ *    ("cancelled before it started"); "Nothing to interrupt." ends the ones still waiting as unanswered (rule 12).
  * 6. Correlated transport, final without id: a background record, never FIFO.
  * 7. Uncorrelated progress (legacy): the oldest inflight turn; with none, deltas and images open a background
  *    record and activity is dropped.
@@ -26,7 +31,17 @@
  *    becomes an error notice.
  * 10. turn.auth_required: credential mode (3.6.4); the secret itself never enters the store.
  * 11. Settle hints are for the session controller (legacy resync grace); the store ignores them.
- * 12. Unanswered (legacy gateway): no event within 15 s after acceptance (tickTurns).
+ * 12. Waiting (legacy gateway, tickTurns): a turn at the head of the queue with no event 15 s after acceptance
+ *    gets the "no reply yet" note and stays first in line, because a daemon busy with another channel's turn
+ *    holds the message in its MessageScheduler without a word, and its reply arrives later (review finding
+ *    client-correctness-4). It is sealed unanswered only after the stale limit of history recovery (610 s), or
+ *    when the user cancels it (rule 5a). The first event removes the note.
+ * 13. Daemon restart (resync): a connect that sees a later daemon start than the one before (ServerInfo
+ *    .daemonStart, GET /api/gateway/status uptime_secs) marks a restart; the next resync of the thread first
+ *    recovers what history shows finished, then seals everything still open from before the new start "lost
+ *    (daemon restarted)", except a turn paused at a gate the restarted daemon still lists (V2 keeps persisted
+ *    gates). Such turns never take another reply (review finding client-correctness-6). Without a usable start
+ *    (the probe failed) nothing changes: a young reply-less Failed turn stays open as before.
  *
  * Every server string is sanitized here (sanitize.ts) before it is stored, whatever the adapter did: replies,
  * activity, notices and captions are stripped (sanitizeText); approval text and credential URLs are escaped
@@ -52,9 +67,11 @@ import {
 } from "./model.ts"
 import type {
   ApprovalResolution,
+  DaemonStart,
   FinishOutcome,
   HistoryTurn,
   ResyncSnapshot,
+  ServerInfo,
   TransportEvent,
   TransportEventOf,
   WireApproval,
@@ -69,10 +86,16 @@ import { appendDelta, applyFinal, isSealedPhase, turnTextOf } from "./turn-text.
 
 /** Rule 5a: after a legacy "Interrupted." ack, V1's second "Interrupted." (the aborted turn) is swallowed. */
 export const STRAY_INTERRUPT_WINDOW_MS = 5_000
-/** Rule 12. */
-export const UNANSWERED_AFTER_MS = 15_000
 /** Resync: durable V2 history shows in-flight turns as Failed; the late watcher may run another 600 s. */
 export const YOUNG_FAILED_TURN_MS = 610_000
+/** Rule 12: the "no reply yet" note. */
+export const NO_REPLY_YET_MS = 15_000
+/** Rule 12: unanswered only after the same stale limit as history recovery. */
+export const UNANSWERED_AFTER_MS = YOUNG_FAILED_TURN_MS
+/** Rule 13: a daemon start later than the known one by more than this (plus drift) is a restart. */
+export const RESTART_SLACK_MS = 2_000
+/** Rule 13: the client's and the daemon host's clocks may drift apart by up to 1 ms per second. */
+export const RESTART_DRIFT_RATIO = 0.001
 /** Resync: a history turn matches a local turn that was sent at most this long after the turn started. */
 export const HISTORY_START_SKEW_MS = 5_000
 /** Prompts that are no longer pending (kept for the transcript) beyond this count are forgotten, oldest first. */
@@ -91,8 +114,14 @@ export const NOTES = {
   late: "reply arrived after the turn finished",
   deltaCut: "streamed text over 1 MiB was cut; the final reply replaces it",
   imageNotDelivered: "image generated, but this daemon does not deliver images to clients (needs the M2a daemon)",
-  unanswered: "no reply within 15 s (consumed as a control input?)",
+  /** Rule 12, while the turn waits; removed by its first event. */
+  noReplyYet: "no reply yet: the daemon may be busy with another channel; a late reply still lands here (Ctrl+S cancels)",
+  unanswered: "no reply within 10 min (consumed as a control input?)",
+  /** Rule 5a: the interrupt found nothing running or queued for the thread, so no reply will come. */
+  nothingToInterrupt: "cancelled: the daemon had nothing running or queued for it",
   lost: "connection lost; this turn cannot be resumed",
+  /** Rule 13; also the status line of such a turn. */
+  daemonRestarted: "lost (daemon restarted)",
   credentialCancelled: "credential cancelled",
   credentialEnded: "credential mode ended; nothing was sent",
   approvalExpired: "approval expired",
@@ -302,8 +331,16 @@ function withNote(record: TurnRecord, note: string): TurnRecord {
   return { ...record, notes: [...record.notes, note].slice(-MAX_NOTES_PER_TURN) }
 }
 
+/** An event arrived for the record; the first one ends rule 12's wait, so its "no reply yet" note goes. */
 function touched(record: TurnRecord, at: number): TurnRecord {
-  return { ...record, firstEventAt: record.firstEventAt ?? at, lastEventAt: at }
+  const waited = record.firstEventAt === undefined && record.notes.includes(NOTES.noReplyYet)
+  const notes = waited ? record.notes.filter((note) => note !== NOTES.noReplyYet) : record.notes
+  return { ...record, notes, firstEventAt: record.firstEventAt ?? at, lastEventAt: at }
+}
+
+/** Accepted by the daemon (sent or queued here) without any event yet: rule 12's waiting turn. */
+function isWaitingSilently(record: TurnRecord): boolean {
+  return record.origin === "user" && record.firstEventAt === undefined && (record.phase === "sent" || record.phase === "queued")
 }
 
 /** A correlated event arrived: waiting turns start running, paused ones resume unless still blocked. */
@@ -780,7 +817,9 @@ function legacyFinal(state: AppState, text: string, at: number): AppState {
   const kind = state.controls.length > 0 ? controlAckKind(text) : null
   const control = kind === null ? undefined : oldestControl(state, kind)
   if (control !== undefined) {
-    const acked = isInterruptedAck(text) ? interruptOldestTurn(state, control, at) : state
+    let acked = state
+    if (isInterruptedAck(text)) acked = interruptOldestTurn(state, control, at)
+    else if (text.trim() === NOTHING_TO_INTERRUPT_ACK) acked = cancelWaitingTurns(state, control, at)
     return ackControl(acked, control, text, at)
   }
   const stray = state.strayInterruptAck
@@ -799,19 +838,56 @@ function oldestControl(state: AppState, kind: ControlKind): TurnRecord | undefin
   return undefined
 }
 
+/** The unsealed user turns created before `control`, oldest first. */
+function userTurnsBefore(state: AppState, control: TurnRecord): TurnRecord[] {
+  return state.inflight.flatMap((id) => {
+    const record = state.turns[id]
+    return record !== undefined && record.origin === "user" && record.seq < control.seq ? [record] : []
+  })
+}
+
 /**
- * Rule 5a, "Interrupted.": the oldest unsealed user turn created before the interrupt ends interrupted (deltas
- * kept). Unless the engine is V2, V1 also answers that turn with "Interrupted.": arm the stray-ack window.
+ * Rule 5a, "Interrupted.": the daemon stopped the turn it was running, the oldest running user turn created before
+ * the interrupt (else the oldest that saw any event), which ends interrupted with its deltas kept; a turn behind
+ * it that is only queued still runs. When none of them saw an event, the daemon was only holding them and dropped
+ * them all: each ends "cancelled before it started". Unless the engine is V2, V1 also answers a stopped turn with
+ * "Interrupted.": arm the stray-ack window. A transport without progress events (legacy socket) cannot tell a
+ * running turn from a waiting one, so there the oldest turn is the one stopped.
  */
 function interruptOldestTurn(state: AppState, control: TurnRecord, at: number): AppState {
-  const target = state.inflight
-    .map((id) => state.turns[id])
-    .find((record) => record !== undefined && record.origin === "user" && record.seq < control.seq)
-  if (target === undefined) return state
-  const wasRunning = !PAUSED_PHASES.has(target.phase)
-  const sealed = seal(state, target, "interrupted", at)
-  const armStray = wasRunning && state.server?.engine !== "v2"
-  return armStray ? { ...sealed, strayInterruptAck: { until: at + STRAY_INTERRUPT_WINDOW_MS } } : sealed
+  const before = userTurnsBefore(state, control)
+  const silent = state.server?.capabilities.activity !== true
+  const target = silent
+    ? before[0]
+    : (before.find((record) => record.phase === "running") ?? before.find((record) => record.firstEventAt !== undefined))
+  let next: AppState
+  let armStray: boolean
+  if (target !== undefined) {
+    armStray = !PAUSED_PHASES.has(target.phase)
+    next = seal(state, target, "interrupted", at)
+  } else {
+    const waiting = before.filter(isWaitingSilently)
+    if (waiting.length === 0) return state
+    armStray = true
+    next = waiting.reduce((acc, record) => seal(acc, withNote(dropNote(record, NOTES.noReplyYet), NOTES.cancelled), "interrupted", at), state)
+  }
+  return armStray && state.server?.engine !== "v2" ? { ...next, strayInterruptAck: { until: at + STRAY_INTERRUPT_WINDOW_MS } } : next
+}
+
+/**
+ * Rule 5a, "Nothing to interrupt." (legacy gateway): the daemon had nothing running or queued for the thread, so
+ * the turns created before the interrupt that never saw an event will get no reply. They end unanswered: this is
+ * how the user cancels a turn that rule 12 keeps waiting. Not on transports without progress events.
+ */
+function cancelWaitingTurns(state: AppState, control: TurnRecord, at: number): AppState {
+  if (state.server?.capabilities.activity !== true) return state
+  return userTurnsBefore(state, control)
+    .filter(isWaitingSilently)
+    .reduce((acc, record) => seal(acc, withNote(dropNote(record, NOTES.noReplyYet), NOTES.nothingToInterrupt), "unanswered", at), state)
+}
+
+function dropNote(record: TurnRecord, note: string): TurnRecord {
+  return record.notes.includes(note) ? { ...record, notes: record.notes.filter((other) => other !== note) } : record
 }
 
 /** A control's reply: it becomes the ack, the control is sealed, and rule 3b may end paused turns. */
@@ -1487,20 +1563,22 @@ export function tickTurns(state: AppState, at: number): AppState {
 }
 
 /**
- * Rule 12, only where silence means something: legacy gateways stream activity, so a turn at the head of the
- * queue with no event 15 s after it was accepted (or after the turn before it ended) was consumed. A legacy
- * socket has no progress events at all; its turns get the 120 s stall notice instead (3.6.2).
+ * Rule 12, only where silence means something: legacy gateways stream activity, so the turn at the head of the
+ * queue with no event 15 s after it was accepted (or after the turn before it ended) is waiting: in the daemon's
+ * scheduler behind another channel's turn, or consumed as a control input. It gets the "no reply yet" note and
+ * stays first in line, so a late reply still lands on it; only after the stale limit is it sealed unanswered. A
+ * legacy socket has no progress events at all; its turns get the 120 s stall notice instead (3.6.2).
  */
 function markUnanswered(state: AppState, at: number): AppState {
   const caps = state.server?.capabilities
   if (caps === undefined || caps.correlation || !caps.activity) return state
   const head = state.inflight[0]
   const record = head === undefined ? undefined : state.turns[head]
-  if (record === undefined || record.firstEventAt !== undefined || record.sentAt === undefined) return state
-  if (record.phase !== "sent" && record.phase !== "queued") return state
-  const since = Math.max(record.sentAt, lastUserTurnEnd(state))
-  if (at - since < UNANSWERED_AFTER_MS) return state
-  return seal(state, withNote(record, NOTES.unanswered), "unanswered", at)
+  if (record === undefined || record.sentAt === undefined || !isWaitingSilently(record)) return state
+  const silent = at - Math.max(record.sentAt, lastUserTurnEnd(state))
+  if (silent >= UNANSWERED_AFTER_MS) return seal(state, withNote(dropNote(record, NOTES.noReplyYet), NOTES.unanswered), "unanswered", at)
+  if (silent >= NO_REPLY_YET_MS && !record.notes.includes(NOTES.noReplyYet)) return putTurn(state, withNote(record, NOTES.noReplyYet))
+  return state
 }
 
 function lastUserTurnEnd(state: AppState): number {
@@ -1563,8 +1641,82 @@ export function applyResync(state: AppState, snapshot: ResyncSnapshot, at: numbe
     return record.origin === "user" || record.origin === "history"
   })
   next = seeded ? matchHistory(next, snapshot.turns, at, clock) : seedHistory(next, snapshot, at, clock)
+  next = sealLostToRestart(next, snapshot, at)
   for (const approval of snapshot.approvals) next = upsertApproval(next, approval, null, snapshot.threadId, at)
   return restoreCredentialMode(next, snapshot, at)
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Daemon restarts (rule 13)
+// ---------------------------------------------------------------------------------------------------------
+
+/**
+ * True when `after` puts the daemon's start later than `before` allows: the daemon restarted in between. Both
+ * starts are bounds in the Clock domain; the slack covers the probes' rounding and round trips, the drift term
+ * the two hosts' clocks over the time between the probes. A missing start (probe failed) says nothing.
+ */
+export function daemonRestarted(before: DaemonStart | null, after: DaemonStart | null | undefined): boolean {
+  if (before === null || after === null || after === undefined) return false
+  const drift = Math.abs(after.measuredAt - before.measuredAt) * RESTART_DRIFT_RATIO
+  return after.earliest > before.latest + RESTART_SLACK_MS + drift
+}
+
+/**
+ * conn/ready: the newest daemon start replaces the known one; a later one marks a restart for the next resync. A
+ * connect that could not tell keeps the known start, so a restart behind it is still seen by a later connect.
+ */
+export function noteDaemonStart(state: AppState, info: ServerInfo): AppState {
+  const start = info.daemonStart ?? null
+  if (start === null) return state
+  if (!daemonRestarted(state.daemonStart, start)) return { ...state, daemonStart: start }
+  return { ...state, daemonStart: start, daemonRestart: { bootedAfter: start.earliest } }
+}
+
+/**
+ * Rule 13, after history was matched: everything still open from before the new process started went down with the
+ * old one (V2 stamps its threads Failed, ic/src/bridge/router.rs; queued messages and V1 state are in memory). It
+ * is sealed "lost (daemon restarted)", so no later reply attaches to it, except a turn paused at a gate the
+ * restarted daemon still lists. Prompts and a credential request the snapshot no longer lists are gone too.
+ */
+function sealLostToRestart(state: AppState, snapshot: ResyncSnapshot, at: number): AppState {
+  const restart = state.daemonRestart
+  if (restart === null) return state
+  const live = new Set([...snapshot.approvals.map((approval) => approval.id), ...(snapshot.authGates ?? []).map((gate) => gate.requestId)])
+  let next: AppState = { ...state, daemonRestart: null, strayInterruptAck: null }
+  const credential = next.composer.credential
+  if (credential !== null && (credential.requestId === undefined || !live.has(credential.requestId))) next = leaveCredentialMode(next, at)
+  let lost = 0
+  for (const id of state.order) {
+    const record = next.turns[id]
+    if (record === undefined || isSealed(record) || record.createdAt >= restart.bootedAfter) continue
+    if (pausedAtLiveGate(next, record, live)) continue
+    next = loseToRestart(next, record, at)
+    if (record.origin === "user") lost += 1
+  }
+  for (const approvalId of next.approvalQueue) {
+    const prompt = next.approvals[approvalId]
+    if (prompt !== undefined && !live.has(prompt.id) && prompt.createdAt < restart.bootedAfter) next = settlePrompt(next, prompt, "expired", at)
+  }
+  const text = lost === 0 ? "the daemon restarted" : `the daemon restarted: ${lost} unfinished turn${lost === 1 ? " was" : "s were"} lost`
+  return pushNotice(next, { level: lost === 0 ? "info" : "warn", source: "transport", text }, at)
+}
+
+/** V2 keeps a thread paused at a gate across a restart: the turn lives on while the daemon still lists the gate. */
+function pausedAtLiveGate(state: AppState, record: TurnRecord, live: ReadonlySet<string>): boolean {
+  if (record.phase !== "awaiting_approval" && record.phase !== "awaiting_input") return false
+  if (record.approvalIds.some((id) => live.has(id))) return true
+  const credential = state.composer.credential
+  return credential !== null && credential.turnId === record.id && credential.requestId !== undefined && live.has(credential.requestId)
+}
+
+function loseToRestart(state: AppState, record: TurnRecord, at: number): AppState {
+  let next = state
+  for (const id of record.approvalIds) {
+    const prompt = next.approvals[id]
+    if (prompt !== undefined && isOpenPrompt(prompt)) next = settlePrompt(next, prompt, "expired", at)
+  }
+  const current = next.turns[record.id] ?? record
+  return seal(next, withNote(dropNote(current, NOTES.noReplyYet), NOTES.daemonRestarted), "lost", at)
 }
 
 /**
@@ -1654,7 +1806,7 @@ function recoverFromHistory(state: AppState, record: TurnRecord, turn: HistoryTu
   const response = turn.response === null ? "" : cleanText(turn.response)
   const phase = historyPhase(turn.state)
   const finalText = record.finalText ?? (response.length > 0 ? response : null)
-  const recovered: TurnRecord = { ...record, recovered: true, finalText }
+  const recovered: TurnRecord = { ...dropNote(record, NOTES.noReplyYet), recovered: true, finalText }
   if (response.length > 0) {
     const patch = phase === "failed" ? { error: record.error ?? { code: "failed", message: response } } : {}
     return seal(state, recovered, phase, at, patch)

@@ -1,6 +1,7 @@
 /**
  * Supervisor and reconnects against the mock gateway (design 3.6.5, 11.3.3, WI#458 item 5, SEC-01): a dropped
- * stream reconnects and resyncs without re-sending; the 45 s watchdog forces a reconnect; 503 "Too many
+ * stream reconnects and resyncs without re-sending; a daemon restart mid-turn (uptime_secs starts again) seals the
+ * dead turn "lost (daemon restarted)" while a plain drop keeps it open; the 45 s watchdog forces a reconnect; 503 "Too many
  * connections" waits 30 s; a 401 on the event stream goes offline without a retry loop; a listener owned by
  * another uid during a reconnect goes offline with the uid message. Every case runs against the mock gateway in
  * both modes: "legacy" (today's tenant daemons, the M1a target) and "current" (the M2a contract). Backoff
@@ -11,7 +12,7 @@ import type { TurnId } from "../../src/state/model.ts"
 import { exponentialBackoff } from "../../src/transport/backoff.ts"
 import type { ProcReader } from "../../src/transport/listener-owner.ts"
 import { startGatewayRuntime, TEST_UID, type GatewayRig } from "../helpers/render.tsx"
-import { fixtureToken, procNetTcpLine } from "../mocks/mock-gateway.ts"
+import { echoReply, fixtureToken, procNetTcpLine, type MockEvent, type MockSendContext } from "../mocks/mock-gateway.ts"
 
 let rig: GatewayRig | null = null
 
@@ -61,6 +62,59 @@ describe.each(["legacy", "current"] as const)("reconnects (%s gateway)", (mode) 
     expect(r.mock.requestsTo("GET /api/chat/history").length).toBeGreaterThan(histories)
     expect(r.mock.requestsTo("POST /api/chat/send")).toHaveLength(1)
     expect(r.store.getState().turns[T1]?.phase).toBe("done")
+  })
+
+  test("a daemon restart mid-turn: the dead turn is lost (daemon restarted) and the next message gets its own reply", async () => {
+    // The first message runs and never finishes: the daemon goes down mid-turn.
+    const replies = (ctx: MockSendContext): MockEvent[] =>
+      ctx.content === "migrate the database"
+        ? [
+            ...(ctx.mode === "current" ? [{ type: "turn_started", thread_id: ctx.threadId }] : []),
+            { type: "thinking", message: "Processing...", thread_id: ctx.threadId },
+            { type: "tool_started", name: "shell", thread_id: ctx.threadId },
+          ]
+        : echoReply(ctx)
+    const r = await start(mode, { mock: { replies } })
+    await r.until(() => r.store.getState().conn.kind === "ready", "ready")
+    await r.run("migrate the database")
+    await r.until(() => r.store.getState().turns[T1]?.phase === "running", "running")
+    await r.advance(30_000, 5_000)
+
+    // upgrade-tenant, OOM or crash: streams drop, the daemon starts again, history shows the turn Failed
+    r.mock.restart()
+    await r.until(() => r.store.getState().conn.kind === "reconnecting", "reconnecting")
+    await r.advance(600)
+    await r.until(() => r.store.getState().conn.kind === "ready" && r.store.getState().turns[T1]?.phase === "lost", "lost after the resync")
+    expect(r.mock.requestsTo("GET /api/gateway/status")).toHaveLength(2)
+    expect(r.store.getState().turns[T1]?.notes).toEqual(["lost (daemon restarted)"])
+    expect(r.store.getState().notices.map((notice) => notice.text)).toContain("the daemon restarted: 1 unfinished turn was lost")
+
+    await r.run("what happened?")
+    await r.until(() => r.store.getState().turns["t-2" as TurnId]?.phase === "done", "the next reply")
+    expect(r.store.getState().turns["t-2" as TurnId]?.finalText).toBe("echo: what happened?")
+    expect(r.store.getState().turns[T1]).toMatchObject({ phase: "lost", finalText: null })
+  })
+
+  test("a dropped stream without a restart keeps the turn open (the daemon is the same process)", async () => {
+    const replies = (ctx: MockSendContext): MockEvent[] =>
+      ctx.content === "run the build"
+        ? [
+            ...(ctx.mode === "current" ? [{ type: "turn_started", thread_id: ctx.threadId }] : []),
+            { type: "thinking", message: "Processing...", thread_id: ctx.threadId },
+          ]
+        : echoReply(ctx)
+    const r = await start(mode, { mock: { replies } })
+    await r.until(() => r.store.getState().conn.kind === "ready", "ready")
+    await r.run("run the build")
+    await r.until(() => r.store.getState().turns[T1]?.phase === "running", "running")
+    await r.advance(30_000, 5_000)
+    r.mock.dropStreams()
+    await r.until(() => r.store.getState().conn.kind === "reconnecting", "reconnecting")
+    await r.advance(600)
+    await r.until(() => r.store.getState().conn.kind === "ready", "ready again")
+    await r.settle()
+    expect(r.store.getState().turns[T1]?.phase).toBe("running")
+    expect(r.store.getState().notices.map((notice) => notice.text).some((text) => text.includes("restarted"))).toBe(false)
   })
 
   test("the watchdog: 45 s without a byte forces a reconnect", async () => {
