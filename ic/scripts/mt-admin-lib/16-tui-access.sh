@@ -450,16 +450,17 @@ _tui_registry_refuse() {  # <file> <status>
 # within the daemon's size limit (the writer adds one newline).
 _tui_registry_plan_upsert() {  # <tenant> <file> <label> <sha256> <now> <expires|"">
   local tenant="$1" file="$2"
+  # jq 1.6 (Debian 12) reserves `label`, so the jq variable is $want_label.
   _tui_registry_eval "$tenant" "$file" '
     reason as $r
     | if $r != "ok" then $r
       else
-        (.tokens |= (map(select(.label != $label))
-          + [{label: $label, sha256: $sha, created_at: $now}
-             + (if $exp == "" then {} else {expires_at: $exp} end)])) as $next
+        (.tokens |= (map(select(.label != $want_label))
+          + [{"label": $want_label, "sha256": $sha, "created_at": $now}
+             + (if $exp == "" then {} else {"expires_at": $exp} end)])) as $next
         | if ($next.tokens | length) > $max then "too-many" else "ok", ($next | tojson) end
       end' \
-    --arg label "$3" --arg sha "$4" --arg now "$5" --arg exp "$6" \
+    --arg want_label "$3" --arg sha "$4" --arg now "$5" --arg exp "$6" \
     --argjson max "$TUI_ACCESS_MAX_CLIENT_TOKENS"
   if [[ "$TUI_REGISTRY_STATUS" == ok ]] \
     && (($(_tui_byte_length "$TUI_REGISTRY_DOC") >= TUI_ACCESS_MAX_REGISTRY_BYTES)); then
@@ -488,10 +489,10 @@ _tui_registry_remove() {  # <tenant> <file> <label>
   _tui_registry_eval "$tenant" "$file" '
     reason as $r
     | if $r != "ok" then $r
-      elif any(.tokens[]; .label == $label)
-      then "ok", ((.tokens |= map(select(.label != $label))) | tojson)
+      elif any(.tokens[]; .label == $want_label)
+      then "ok", ((.tokens |= map(select(.label != $want_label))) | tojson)
       else "absent" end' \
-    --arg label "$label"
+    --arg want_label "$label"
   case "$TUI_REGISTRY_STATUS" in
     absent) return 0 ;;
     ok) [[ -n "$TUI_REGISTRY_DOC" ]] || _tui_registry_refuse "$file" unreadable ;;
