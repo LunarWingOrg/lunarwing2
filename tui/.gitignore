@@ -1,0 +1,8 @@
+node_modules/
+# per-task type-check configs used while several agents build in parallel
+tsconfig.task-*.json
+*.tsbuildinfo
+*.log
+coverage/
+dist/
+.cache/

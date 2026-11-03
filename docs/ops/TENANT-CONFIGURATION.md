@@ -24,6 +24,7 @@ Each tenant's configuration lives under their home directory:
 │   ├── tools/              # Installed WASM tools
 │   ├── channels/           # Installed WASM channels
 │   ├── darkirc/            # DarkIRC state when enabled
+│   ├── gateway-client-tokens.json # tui-access client-token digests (optional, 0600)
 │   └── xmpp/               # OMEMO key store
 ├── logs/                   # OpenRC service log output
 ├── run/                    # Runtime sockets and PID files
@@ -286,6 +287,22 @@ The auth token is generated during tenant creation. To retrieve it:
 grep GATEWAY_AUTH_TOKEN /home/<tenant>/lunarwing/env/lunarwing.env
 ```
 
+That lookup serves the web login. To give a desktop user's terminal UI (`tui/`) access, do not copy the token by hand: run `tui-access` as root. It writes the token into `~<user>/.config/lunarwing-tui/tenants/<tenant>.json` (0600, owned by that user) and never prints it.
+
+```bash
+# Grant a dedicated, revocable client token (refused, nothing written, unless the
+# running daemon lists client_tokens in GET /api/chat/capabilities):
+sudo ic/scripts/lunarwing-mt-admin.sh tui-access <tenant> --for-user <user> --expires-in-days 90
+# Stopgap for daemons that predate client tokens: copy the master token (warned):
+sudo ic/scripts/lunarwing-mt-admin.sh tui-access <tenant> --for-user <user> --use-master-token
+# Revoke:
+sudo ic/scripts/lunarwing-mt-admin.sh tui-access <tenant> --for-user <user> --revoke
+# Invalidate every copy of the master token (restarts a running tenant):
+sudo ic/scripts/lunarwing-mt-admin.sh rotate-gateway-token <tenant>
+```
+
+A client-token grant registers only the token's SHA-256 in `state/gateway-client-tokens.json`, which daemons with client-token support reload every 2 s, so neither the grant nor the revocation needs a restart; the grant refuses to register anything unless the running daemon advertises that support. A master-token grant removes any earlier client-token entry of the same user from that file, and stays valid until `rotate-gateway-token <tenant>` replaces `GATEWAY_AUTH_TOKEN` and restarts the tenant. That rotation is disruptive by design: the web login, every master-token TUI file, the worker token fallback and the DarkIRC and Brave key uploads all hold the old value afterwards and must be refreshed (`tokens <tenant>` shows the new value; re-grant the TUI users who keep access). Flags, exit codes and file details: [MT-ADMIN-QUICKSTART](../guides/MT-ADMIN-QUICKSTART.md#tui-access-for-a-desktop-user).
+
 ## Engine V2 Channel Rollout
 
 As of v2.0.6.0, multi-tenant provisioning writes Engine V2 into every
@@ -387,7 +404,7 @@ WASM_CHANNELS_DIR=/home/<tenant>/lunarwing/state/channels
 
 WASM tools and channels are installed into the tenant's state directory. Disable WASM entirely by setting `WASM_ENABLED=false`.
 
-Set `TOOL_ACTIVITY=true` to route tool-activity status updates (`ToolStarted` / `ToolCompleted` / `ToolResult`) to the WASM channels. Off by default: the host drops those events before they reach a guest, so channels stay quiet. When enabled, the XMPP guest renders them in DMs and the DarkIRC/WeeChat guests emit them as `[status]` lines. Native channels (REPL, Signal) keep their own per-channel `/debug` toggles regardless of this flag.
+Set `TOOL_ACTIVITY=true` to route tool-activity status updates (`ToolStarted` / `ToolCompleted` / `ToolResult`, plus `ImageGenerated`, which replaces the image tool's `ToolResult`) to the WASM channels. Off by default: the host drops those events before they reach a guest, so channels stay quiet. When enabled, the XMPP guest renders them in DMs and the DarkIRC/WeeChat guests emit them as `[status]` lines. Native channels (REPL, Signal) keep their own per-channel `/debug` toggles regardless of this flag.
 
 ## WeeChat Relay Configuration
 

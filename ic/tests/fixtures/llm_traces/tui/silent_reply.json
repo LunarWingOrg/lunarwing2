@@ -1,0 +1,31 @@
+{
+  "model_name": "tui-silent-reply",
+  "turns": [
+    {
+      "user_input": "Nothing to add here, stay quiet.",
+      "steps": [
+        {
+          "response": {
+            "type": "text",
+            "content": "NO_REPLY",
+            "input_tokens": 40,
+            "output_tokens": 2
+          }
+        }
+      ]
+    },
+    {
+      "user_input": "hello",
+      "steps": [
+        {
+          "response": {
+            "type": "text",
+            "content": "Still here after a silent reply.",
+            "input_tokens": 60,
+            "output_tokens": 8
+          }
+        }
+      ]
+    }
+  ]
+}

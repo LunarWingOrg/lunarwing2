@@ -107,16 +107,17 @@ inherited_lock_fd_is_held() {
 # a locked section keeps the tenant lock held after mt-admin dies (a `die`
 # inside the section skips the unlock/close). On OpenRC, rc-service and
 # supervise-daemon are children of mt-admin, so they carry every tracked fd —
-# the lifecycle fd, the upgrade fd (04-tenant-lifecycle.sh) and the DarkIRC
-# writer fd (06-env-generation.sh) — not just the lifecycle one. Per-command
-# redirections close the fds only for that command's child, so mt-admin keeps
-# its own fds and still owns the unlocks, and shell-function stubs in
-# harnesses keep working.
+# the lifecycle fd, the direct and wrapper-inherited upgrade fds
+# (04-tenant-lifecycle.sh) and the DarkIRC writer fd (06-env-generation.sh) —
+# not just the lifecycle one. Per-command redirections close the fds only for
+# that command's child, so mt-admin keeps its own fds and still owns the
+# unlocks, and shell-function stubs in harnesses keep working.
 with_tracked_lock_fds_closed() {
   local -a lw_fds=()
   local lw_fd lw_close_args=""
   for lw_fd in "${LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD:-}" \
     "${LUNARWING_MT_ACTIVE_UPGRADE_LOCK_FD:-}" \
+    "${LUNARWING_MT_INHERITED_UPGRADE_LOCK_FD:-}" \
     "${LUNARWING_MT_UPGRADE_LOCK_FD:-}" \
     "${DARKIRC_WRITER_LOCK_FD:-}"; do
     [[ "$lw_fd" =~ ^[0-9]+$ ]] && lw_fds+=("$lw_fd")

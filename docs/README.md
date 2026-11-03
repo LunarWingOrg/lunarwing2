@@ -33,7 +33,7 @@ System design and technical architecture documents (the authoritative specs).
 |------|-------------|
 | [`ENGINE-V2.md`](architecture/ENGINE-V2.md) | V2 engine: threads, capabilities, CodeAct, gates, learning missions (linked from `CLAUDE.md`) |
 | [`IRC-SENDER-IDENTITY.md`](architecture/IRC-SENDER-IDENTITY.md) | Versioned DarkIRC and WeeChat sender principals, DM scope, pairing compatibility, owner routing, and migration behavior |
-| [`OUTBOUND-DELIVERY-SEMANTICS.md`](architecture/OUTBOUND-DELIVERY-SEMANTICS.md) | What a successful `message`-tool send means (acceptance, not delivery), XMPP enqueue gate/shutdown drain, and mission-spec delivery-receipt discipline (WI#270) |
+| [`OUTBOUND-DELIVERY-SEMANTICS.md`](architecture/OUTBOUND-DELIVERY-SEMANTICS.md) | What a successful `message`-tool send means (acceptance, not delivery), XMPP enqueue gate/shutdown drain, mission-spec delivery-receipt discipline (WI#270), and the message lifecycle contract: `Started`/`Finished` per inbound message, turn outcomes and outcome hints (TUI M2a) |
 | [`SSH_AGENT_HARNESS.md`](architecture/SSH_AGENT_HARNESS.md) | SSH agent harness: per-tenant in-process ssh-agent, encrypted key store, worker socket injection, host-key model |
 | [`SSH_DELIVERY_MECHANISMS.md`](architecture/SSH_DELIVERY_MECHANISMS.md) | The three ways the agent runs SSH: worker mode, the `ssh`/`ssh_git` built-in tools, and the WASM `ssh` tool — when-to-use, security, enablement |
 | [`SEMANTIC-MEMORY-SEARCH.md`](architecture/SEMANTIC-MEMORY-SEARCH.md) | Hybrid FTS + vector memory search, RRF fusion, embeddings (linked from `CLAUDE.md`) |
@@ -74,6 +74,7 @@ How-to guides, build instructions, and setup walkthroughs.
 | [`FEDORA_PACKAGE_LIST.md`](guides/FEDORA_PACKAGE_LIST.md) | Fedora MT host packages and Python tooling dependencies |
 | [`ARCHLINUX_PACKAGE_LIST.md`](guides/ARCHLINUX_PACKAGE_LIST.md) | Arch Linux MT host packages and Python tooling dependencies |
 | [`GENTOO_PACKAGE_LIST.md`](guides/GENTOO_PACKAGE_LIST.md) | Gentoo/OpenRC MT packages and rootless Podman prerequisites |
+| [`GATEWAY_CHAT_API.md`](guides/GATEWAY_CHAT_API.md) | Normative gateway chat contract for machine clients such as the TUI (`api_version` 1): `client_turn_id` correlation, `turn_started`/`turn_finished` and turn outcomes, `GET /api/chat/capabilities`, image validation, Engine V2 generated images, `/quit` refusal |
 | [`GATEWAY_VOICE_API.md`](guides/GATEWAY_VOICE_API.md) | Desktop-facing gateway voice API: authenticated, bounded `/api/voice/{status,transcribe,synthesize}` proxy to the LunarVoice sidecar (WI#131) |
 | [`COORDINATION_KNOWLEDGE_SETUP.md`](guides/COORDINATION_KNOWLEDGE_SETUP.md) | Cross-tenant `KNOW:` knowledge sharing over XMPP MUC: production setup, env vars, live verification |
 | [`EMOTING_MASCOT.md`](guides/EMOTING_MASCOT.md) | Emoting mascot widget (web gateway): sprite animation for roleplay action phrases |

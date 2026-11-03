@@ -153,7 +153,8 @@ metadata. Approval prompts, authentication state, external waits, job starts,
 and routed tool activity are actionable; generic status text, thinking updates,
 and stream chunks are ignored by this guest.
 
-`ToolStarted`, `ToolCompleted`, and `ToolResult` are high-volume and are dropped
+`ToolStarted`, `ToolCompleted`, `ToolResult`, and `ImageGenerated` (which stands
+in for the image tool's `ToolResult`) are high-volume and are dropped
 by the WASM host unless the global `channels.tool_activity` setting is enabled
 (or `TOOL_ACTIVITY=true` overrides it). The flag defaults to false and applies to
 both channels loaded at startup and channels activated later. It is a host-level

@@ -1,9 +1,11 @@
 //! Shared types and utilities for the LunarWing workspace.
 
+pub mod client_caps;
 mod event;
 mod prompt_context;
 mod util;
 
+pub use client_caps::{TurnOutcome, WireLimits};
 pub use event::{AppEvent, PlanStepDto, ToolDecisionDto};
 pub use prompt_context::{
     DEFAULT_PROMPT_CONTEXT_MAX_CHARS_PER_MESSAGE, DEFAULT_PROMPT_CONTEXT_MAX_MESSAGES,

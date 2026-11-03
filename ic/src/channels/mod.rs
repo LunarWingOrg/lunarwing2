@@ -31,6 +31,8 @@ pub mod budget;
 mod channel;
 pub mod coalesce;
 mod http;
+pub(crate) mod image_mime;
+pub mod lifecycle;
 mod manager;
 mod repl;
 mod signal;
@@ -41,11 +43,18 @@ pub mod web;
 mod webhook_server;
 mod xmpp;
 
+/// Channel name of the web gateway ([`GatewayChannel`]).
+pub const GATEWAY_CHANNEL: &str = "gateway";
+/// Channel name of the Unix-socket REPL. Not cfg-gated, so callers can compare
+/// channel names on every platform.
+pub const UNIX_SOCKET_REPL_CHANNEL: &str = "unix_socket_repl";
+
 pub use channel::{
     AttachmentKind, Channel, ChannelSecretUpdater, IncomingAttachment, IncomingMessage,
     MessageStream, OutgoingResponse, StatusUpdate, ToolDecision, routing_target_from_metadata,
 };
 pub use http::{HttpChannel, HttpChannelState};
+pub use lifecycle::{MessageLifecycle, TurnOutcome};
 pub use manager::ChannelManager;
 pub use repl::ReplChannel;
 pub use signal::SignalChannel;

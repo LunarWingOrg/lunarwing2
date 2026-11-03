@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use lunarwing::agent::{Agent, AgentDeps};
 use lunarwing::app::{AppBuilder, AppBuilderFlags};
 use lunarwing::channels::web::log_layer::LogBroadcaster;
-use lunarwing::channels::{OutgoingResponse, StatusUpdate};
+use lunarwing::channels::{MessageLifecycle, OutgoingResponse, StatusUpdate};
 use lunarwing::config::Config;
 use lunarwing::db::Database;
 use lunarwing::hooks::Hook;
@@ -23,7 +23,9 @@ use lunarwing::tools::mcp::config::{McpServerConfig, McpServersFile};
 
 use crate::support::instrumented_llm::InstrumentedLlm;
 use crate::support::metrics::{ToolInvocation, TraceMetrics};
-use crate::support::test_channel::{CapturedDelivery, TestChannel, TestChannelHandle};
+use crate::support::test_channel::{
+    CapturedDelivery, LifecycleRecord, TestChannel, TestChannelHandle,
+};
 use crate::support::trace_llm::{LlmTrace, TraceLlm};
 
 use lunarwing::llm::recording::{HttpExchange, HttpInterceptor, ReplayingHttpInterceptor};
@@ -134,6 +136,25 @@ impl TestRig {
     /// Return status and response deliveries in exact channel call order.
     pub fn captured_deliveries(&self) -> Vec<CapturedDelivery> {
         self.channel.captured_deliveries()
+    }
+
+    /// Return `(message id, event)` for every lifecycle event the agent reported.
+    pub fn captured_lifecycle(&self) -> Vec<(uuid::Uuid, MessageLifecycle)> {
+        self.channel.captured_lifecycle()
+    }
+
+    /// Return every lifecycle event with its position among `captured_deliveries()`.
+    pub fn captured_lifecycle_records(&self) -> Vec<LifecycleRecord> {
+        self.channel.captured_lifecycle_records()
+    }
+
+    /// Wait until at least `n` lifecycle events have been captured, or `timeout` elapses.
+    pub async fn wait_for_lifecycle(
+        &self,
+        n: usize,
+        timeout: Duration,
+    ) -> Vec<(uuid::Uuid, MessageLifecycle)> {
+        self.channel.wait_for_lifecycle(n, timeout).await
     }
 
     /// Clear all captured responses and status events.

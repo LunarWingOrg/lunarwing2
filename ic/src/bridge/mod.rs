@@ -6,6 +6,7 @@
 
 pub mod auth_manager;
 mod effect_adapter;
+mod generated_images;
 mod llm_adapter;
 pub mod router;
 pub mod skill_migration;

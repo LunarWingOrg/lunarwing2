@@ -162,6 +162,31 @@ worker-opencode2-ts:
     - bun scripts/lunarwing_tool_proxy_test.ts
     - bun scripts/lunarwing_tool_plugin_test.ts
 
+# Multimodal TUI (tui/, Bun + OpenTUI; TUI design 11.3.6, milestone M1a): the
+# frozen install, the strict type check and the whole bun test suite on each
+# MR/push. Same shape as worker-opencode-ts (digest-tied bun image, lint
+# runner tag, no extends, no before_script); the tests use only fakes, mocks
+# on 127.0.0.1:0 and temp dirs, so the lane needs no service or secret.
+# Pinned by validate_config.py like the worker TS lanes (WORKER_TS_LANE_SCRIPTS).
+tui-ts:
+  stage: validate
+  needs: []
+  image:
+    name: "$CI_BUN_IMAGE"
+    entrypoint: [""]
+  tags:
+    - "$CI_LINT_RUNNER_TAG"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$/ && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
+  script:
+    - cd tui
+    - bun install --frozen-lockfile
+    - ./node_modules/.bin/tsc --noEmit
+    - bun test
+
 # WI#375 DR-3: pebble's Rust suite previously gated only at the (protected)
 # worker image build (`cargo test --locked` in the Dockerfile). Pinned by
 # validate_config.py (validate_pebble_rust_lane).

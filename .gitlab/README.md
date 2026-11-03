@@ -467,6 +467,24 @@ host's concurrent builds before retrying manually.
   `CI_BUN_IMAGE` tie cross-checks both `opencode4lunarwing/Dockerfile` and
   `opencode2.4lunarwing/Dockerfile` (MR !1669 review IK-2), so a drifted bun
   digest in either worker image fails `ci-config`.
+- `tui-ts`: the multimodal terminal client in `tui/` (Bun + OpenTUI 0.8.1;
+  TUI design 11.3.6, milestone M1a): `cd tui`, `bun install
+  --frozen-lockfile`, `./node_modules/.bin/tsc --noEmit` (strict, over the
+  whole `src/` and `test/` tree) and `bun test` (unit, integration and
+  OpenTUI `testRender` UI suites). Runs on the same digest-pinned
+  `CI_BUN_IMAGE` and lint runner as the worker Bun lanes on every MR/branch
+  push and protected release tag, with no path-only `changes:` filter, and
+  is pinned by the same `WORKER_TS_LANE_SCRIPTS` machinery, so a script edit
+  must update the tuple in the same commit. The suites are hermetic: mock
+  servers listen only on `127.0.0.1:0`, temp directories come from
+  `mkdtemp`, clocks are injected, and child processes are fakes; the
+  `tui/bunfig.toml` test preload (`tui/test/setup.ts`) refuses the real
+  recorders, clipboard, screenshot, notifier, opener and Hex binaries and
+  any non-loopback fetch. The lane therefore needs no service, device or
+  secret. That preload is repo trust surface like the worker lanes'
+  `bunfig.toml` and `package.json` (reviewed in the diff, not pinned). The
+  developer host runs Bun 1.3.14 (`engines: >=1.3.14`) and the lane runs the
+  image's 1.4.4; both must pass.
 - `worker-pebble-rust`: the pebble worker's Rust suite via
   `bash .gitlab/scripts/cargo-ci.sh test -j2 --locked --manifest-path
   ../pebble4lunarwing/Cargo.toml`, resolving under ic's vendored context on

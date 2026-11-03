@@ -6,17 +6,18 @@
 #![allow(dead_code)] // Public API consumed by later test modules (Task 3+).
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::StreamExt;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
+use uuid::Uuid;
 
 use lunarwing::channels::{
-    Channel, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate,
+    Channel, IncomingMessage, MessageLifecycle, MessageStream, OutgoingResponse, StatusUpdate,
 };
 use lunarwing::error::ChannelError;
 
@@ -31,6 +32,18 @@ pub enum CapturedDelivery {
         message: Box<IncomingMessage>,
         response: OutgoingResponse,
     },
+}
+
+/// One `Channel::message_lifecycle` call, in arrival order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LifecycleRecord {
+    /// `IncomingMessage::id` of the message the event belongs to.
+    pub message_id: Uuid,
+    /// The event, with outcome hints already applied by the `ChannelManager`.
+    pub event: MessageLifecycle,
+    /// Number of entries in `captured_deliveries()` when the event arrived, so a test can
+    /// check that a reply was delivered before its `Finished`.
+    pub deliveries_before: usize,
 }
 
 /// A `Channel` implementation for injecting messages and capturing responses
@@ -48,6 +61,9 @@ pub struct TestChannel {
     status_events: Arc<Mutex<Vec<StatusUpdate>>>,
     /// Statuses and responses in the exact order delivered through the channel.
     deliveries: Arc<Mutex<Vec<CapturedDelivery>>>,
+    /// Lifecycle events reported by the agent, in arrival order. A std lock (never held
+    /// across `.await`), so readers never fail on contention.
+    lifecycle: Arc<std::sync::Mutex<Vec<LifecycleRecord>>>,
     /// Tracks when each tool started (by name). Supports nested/overlapping tools
     /// by using a Vec of start times per tool name.
     tool_start_times: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
@@ -80,6 +96,7 @@ impl TestChannel {
             responses: Arc::new(Mutex::new(Vec::new())),
             status_events: Arc::new(Mutex::new(Vec::new())),
             deliveries: Arc::new(Mutex::new(Vec::new())),
+            lifecycle: Arc::new(std::sync::Mutex::new(Vec::new())),
             tool_start_times: Arc::new(Mutex::new(HashMap::new())),
             tool_timings: Arc::new(Mutex::new(Vec::new())),
             user_id: user_id.into(),
@@ -178,6 +195,49 @@ impl TestChannel {
             .clone()
     }
 
+    /// Return `(message id, event)` for every lifecycle event captured so far.
+    pub fn captured_lifecycle(&self) -> Vec<(Uuid, MessageLifecycle)> {
+        self.captured_lifecycle_records()
+            .into_iter()
+            .map(|record| (record.message_id, record.event))
+            .collect()
+    }
+
+    /// Return every lifecycle event captured so far, with its delivery position.
+    pub fn captured_lifecycle_records(&self) -> Vec<LifecycleRecord> {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Wait until at least `n` lifecycle events have been captured, or `timeout` elapses.
+    ///
+    /// The agent reports `Finished` after the reply was handed to `respond()`, so a test
+    /// that waited for a response may still have to wait briefly for the finish.
+    pub async fn wait_for_lifecycle(
+        &self,
+        n: usize,
+        timeout: Duration,
+    ) -> Vec<(Uuid, MessageLifecycle)> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut interval = Duration::from_millis(20);
+        let max_interval = Duration::from_millis(200);
+        loop {
+            let ready = self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len()
+                >= n;
+            if ready || tokio::time::Instant::now() >= deadline {
+                return self.captured_lifecycle();
+            }
+            tokio::time::sleep(interval).await;
+            interval = (interval * 2).min(max_interval);
+        }
+    }
+
     /// Return the names of all `ToolStarted` events captured so far.
     pub fn tool_calls_started(&self) -> Vec<String> {
         self.captured_status_events()
@@ -226,6 +286,10 @@ impl TestChannel {
         self.responses.lock().await.clear();
         self.status_events.lock().await.clear();
         self.deliveries.lock().await.clear();
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
         self.tool_start_times.lock().await.clear();
         self.tool_timings.lock().await.clear();
     }
@@ -288,6 +352,10 @@ impl Channel for TestChannelHandle {
         metadata: &serde_json::Value,
     ) -> Result<(), ChannelError> {
         self.inner.send_status(status, metadata).await
+    }
+
+    async fn message_lifecycle(&self, msg: &IncomingMessage, event: MessageLifecycle) {
+        self.inner.message_lifecycle(msg, event).await;
     }
 
     async fn broadcast(
@@ -387,6 +455,20 @@ impl Channel for TestChannel {
         }
         self.status_events.lock().await.push(status);
         Ok(())
+    }
+
+    async fn message_lifecycle(&self, msg: &IncomingMessage, event: MessageLifecycle) {
+        // Hold the deliveries lock while recording, so the position is exact even if a
+        // delivery for another message races with this event.
+        let deliveries = self.deliveries.lock().await;
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(LifecycleRecord {
+                message_id: msg.id,
+                event,
+                deliveries_before: deliveries.len(),
+            });
     }
 
     async fn broadcast(

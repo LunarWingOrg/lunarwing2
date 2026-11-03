@@ -27,6 +27,7 @@ use crate::agent::agentic_loop::{
     AgenticLoopConfig, LoopDelegate, LoopOutcome, LoopSignal, TextAction,
 };
 use crate::llm::{ChatMessage, Reasoning, ReasoningContext, Role};
+use crate::tools::builtin::image_gen::parse_image_sentinel;
 use crate::tools::redact_params;
 
 /// Result of the agentic loop execution.
@@ -927,45 +928,27 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                         .into())
                     });
 
-                    // Detect image generation sentinel
-                    let is_image_sentinel = if let Ok(ref output) = tool_result
-                        && matches!(tc.name.as_str(), "image_generate" | "image_edit")
-                    {
-                        if let Ok(sentinel) = serde_json::from_str::<serde_json::Value>(output)
-                            && sentinel.get("type").and_then(|v| v.as_str())
-                                == Some("image_generated")
-                        {
-                            let data_url = sentinel
-                                .get("data")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string();
-                            let path = sentinel
-                                .get("path")
-                                .and_then(|v| v.as_str())
-                                .map(String::from);
-                            if data_url.is_empty() {
-                                tracing::warn!(
-                                    "Image generation sentinel has empty data URL, skipping broadcast"
-                                );
-                            } else {
-                                let _ = self
-                                    .agent
-                                    .channels
-                                    .send_status(
-                                        &self.message.channel,
-                                        StatusUpdate::ImageGenerated { data_url, path },
-                                        &self.message.metadata,
-                                    )
-                                    .await;
-                            }
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
+                    // A generated image reaches the channel as an image, not as a
+                    // preview of its base64 sentinel (TUI design 8.3.6).
+                    let generated = tool_result
+                        .as_ref()
+                        .ok()
+                        .and_then(|output| parse_image_sentinel(&tc.name, output));
+                    let is_image_sentinel = generated.is_some();
+                    if let Some(image) = generated {
+                        let _ = self
+                            .agent
+                            .channels
+                            .send_status(
+                                &self.message.channel,
+                                StatusUpdate::ImageGenerated {
+                                    data_url: image.data_url,
+                                    path: image.path,
+                                },
+                                &self.message.metadata,
+                            )
+                            .await;
+                    }
 
                     // Send ToolResult preview
                     if !is_image_sentinel
@@ -1376,6 +1359,7 @@ mod tests {
     };
     use crate::safety::SafetyLayer;
     use crate::tools::ToolRegistry;
+    use crate::tools::builtin::image_gen::parse_image_sentinel;
 
     use super::{check_auth_required, prompt_context_from_chat_messages};
 
@@ -2819,25 +2803,21 @@ mod tests {
 
     #[test]
     fn test_image_sentinel_empty_data_url_should_be_skipped() {
-        // Regression: unwrap_or_default() on missing "data" field produces an empty
-        // string. Broadcasting an empty data_url would send a broken SSE event.
-        let sentinel = serde_json::json!({
+        // Regression: a sentinel without "data" (or with an empty data URL) must
+        // not broadcast an ImageGenerated with an empty data URL.
+        let missing = serde_json::json!({
             "type": "image_generated",
-            "path": "/tmp/image.png"
-            // "data" field is missing
+            "path": "image.png"
         });
-
-        let data_url = sentinel
-            .get("data")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-
-        assert!(
-            data_url.is_empty(),
-            "Missing 'data' field should produce empty string"
+        assert_eq!(
+            parse_image_sentinel("image_generate", &missing.to_string()),
+            None
         );
-        // The fix: empty data_url means we skip broadcasting
+        let empty = serde_json::json!({"type": "image_generated", "data": ""});
+        assert_eq!(
+            parse_image_sentinel("image_generate", &empty.to_string()),
+            None
+        );
     }
 
     #[test]
@@ -2845,19 +2825,13 @@ mod tests {
         let sentinel = serde_json::json!({
             "type": "image_generated",
             "data": "data:image/png;base64,abc123",
-            "path": "/tmp/image.png"
+            "path": "image.png"
         });
 
-        let data_url = sentinel
-            .get("data")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-
-        assert!(
-            !data_url.is_empty(),
-            "Present 'data' field should produce non-empty string"
-        );
+        let image = parse_image_sentinel("image_generate", &sentinel.to_string())
+            .expect("a PNG data URL is an image");
+        assert_eq!(image.data_url, "data:image/png;base64,abc123");
+        assert_eq!(image.path.as_deref(), Some("image.png"));
     }
 
     /// Test the relay channel auto-deny decision logic:

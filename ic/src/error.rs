@@ -576,6 +576,28 @@ impl RoutineError {
     }
 }
 
+impl Error {
+    /// Text that is safe to deliver to a channel user. Internal engine
+    /// join/stop/lookup details stay in logs; actionable errors keep their text.
+    pub fn user_facing_message(&self) -> String {
+        match self {
+            Self::Engine { context, .. } if context == "thread still stopping" => {
+                "The previous turn is still stopping. Please send your message again in a moment."
+                    .to_string()
+            }
+            Self::Engine { context, .. }
+                if matches!(
+                    context.as_str(),
+                    "join error" | "stop late thread" | "late turn timeout" | "thread lookup"
+                ) =>
+            {
+                "The request could not be completed because of an internal engine error. Please try again; if it keeps happening, ask the operator to check the daemon log.".to_string()
+            }
+            other => format!("Error: {other}"),
+        }
+    }
+}
+
 /// Result type alias for the agent.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -819,5 +841,45 @@ mod tests {
             }
             .is_retryable()
         );
+    }
+
+    #[test]
+    fn internal_engine_join_errors_are_sanitized_for_channels() {
+        let error = Error::Engine {
+            context: "join error".into(),
+            reason: "thread not found: 3bfdad4f-78df-52c2-9fe1-4a1c42466559".into(),
+        };
+        let message = error.user_facing_message();
+        assert!(!message.contains("3bfdad4f"), "{message}");
+        assert!(!message.contains("join error"), "{message}");
+        assert!(message.contains("Please try again"), "{message}");
+
+        let other = Error::Config(ConfigError::MissingEnvVar("X".into()));
+        assert_eq!(other.user_facing_message(), format!("Error: {other}"));
+    }
+
+    #[test]
+    fn actionable_engine_errors_keep_their_channel_message() {
+        let error = Error::Engine {
+            context: "stale".into(),
+            reason: "Approval request is stale or already resolved".into(),
+        };
+        assert_eq!(error.user_facing_message(), format!("Error: {error}"));
+    }
+
+    #[test]
+    fn thread_stopping_errors_hide_the_internal_reason() {
+        let error = Error::Engine {
+            context: "thread still stopping".into(),
+            reason: "thread already running: 3bfdad4f-78df-52c2-9fe1-4a1c42466559".into(),
+        };
+        let message = error.user_facing_message();
+        assert!(
+            message.contains("previous turn is still stopping"),
+            "{message}"
+        );
+        assert!(message.contains("again in a moment"), "{message}");
+        assert!(!message.contains("3bfdad4f"), "{message}");
+        assert!(!message.contains("thread already running"), "{message}");
     }
 }
