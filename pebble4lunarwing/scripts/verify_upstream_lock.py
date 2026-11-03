@@ -42,6 +42,8 @@ import tomllib
 # option is enabled and a few kilobytes of crafted Markdown can exhaust the
 # worker's memory. 0.13.5 keeps the same dependency requirements and MSRV;
 # only its version/checksum lines change (same recipe as the rows above).
+# 2026-11-02: 0.13.6 fixes RUSTSEC-2026-0433 (quadratic parsing of nested
+# image wikilinks with ENABLE_WIKILINKS), with the same package-only delta.
 ALLOWED_PACKAGES = {
     "chacha20",
     "clipboard-win",
