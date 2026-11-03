@@ -1847,6 +1847,8 @@ fallback, but is never held across a live await. Terminal unregistration and
 final persistence check the generation; re-adopting an id over another live
 generation is refused. This closes the re-adoption window where a stale join
 could see a new `Created` record without its task and fail that live task.
+Task-level errors enter the same claimable completed slot, and task errors or
+panics unregister their generation even when no joiner remains.
 
 Completed entries expire after 22 minutes and are pruned on insertion and read,
 covering the longest foreground/late-waiter budget without retaining every turn
@@ -1854,7 +1856,9 @@ for the daemon's lifetime. Every joiner can read an outcome, but an atomic
 per-generation completion claim permits only one channel/history/gate
 completion pass. Foreground, late, and expired-gate waiters all use that claim;
 later waiters return the empty sentinel instead of duplicating a reply, history
-entry, or pending gate.
+entry, or pending gate. After retention expires, store recovery creates a fresh
+unclaimed slot: exactly-once completion covers the current waiters inside that
+window, not an arbitrary joiner arriving later.
 
 When neither registry has the requested generation, `store.load_thread` is the
 restart-safe fallback. `Done`/`Completed` reconstructs `Completed` from the last
@@ -1878,6 +1882,8 @@ so later joiners see the same representation; they are not a durable outbox.
 Join/stop/thread-lookup failures delivered by the agent message loop or late
 watcher pass through `Error::user_facing_message`, which keeps engine context
 and thread UUIDs in logs while sending a stable retry message to channel users.
+A live re-adoption collision instead asks the user to resend after the previous
+turn finishes stopping; its raw `AlreadyRunning` reason and UUID remain log-side.
 Actionable gate errors such as stale or expired approvals keep their original
 messages. Terminal failures classified as `Unknown` also use generic text;
 classified model and orchestration messages remain unchanged.
