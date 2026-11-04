@@ -1,11 +1,7 @@
-# LW AI Code Contribution Policy
+# Lunarwing2 AI Code Contribution Policy
 
-**Effective Date:** November 15th, 2026
-**Last Updated:** October 3rd, 2026 *(Added exceptions for documentation and non-generative cybersecurity analysis)*
-
-**Revalidated 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-03 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-14 (v2.1.6.0).** Policy text reviewed; no changes were
-needed. The companion human policy (`CODE-CONTRIBUTION-POLICY.md`) had its
-stale `src/*/CLAUDE.md` references corrected to the `ic/` tree in this pass.
+**Effective Date:** December 15th, 2026
+**Last Updated:** November 3rd, 2026 *(Added exceptions for documentation and non-generative cybersecurity analysis)*
 
 ## 1. Core Rule: Closed-Weight Models Prohibited for Code Generation
 
@@ -13,7 +9,7 @@ Code produced by proprietary, closed-weight models — including but not limited
 
 ## 2. Permitted Models
 
-Code produced by open-weight models — such as Qwen (3.5, 3.6, 3.8), DeepSeek, GLM, GPT-OSS, Moonshot Kimi (2.5, 2.6, and 3), Llama variants, and similar models whose trained parameters are publicly released — will continue to be accepted. Contributions that disclose the model used are appreciated but not required.
+Code produced by open-weight models — such as Qwen (3.5, 3.6, 3.8, 4), DeepSeek, GLM, GPT-OSS, Moonshot Kimi (2.5, 2.6, 3, 3.1 Pro), Llama variants or other Meta models which have their weights published, and similar models whose trained parameters are publicly released — will continue to be accepted. Contributions that disclose the model used are appreciated but not required.
 
 ## 3. Responsibility & Enforcement
 
