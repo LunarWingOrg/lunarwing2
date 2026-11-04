@@ -1,5 +1,5 @@
 /**
- * Thin entry point (design 3.1, 3.2): configuration, renderer, controllers, mount. Started by bin/lunarwing-tui.
+ * Thin entry point (design 3.1, 3.2): configuration, renderer, controllers, mount. Started by bin/wingtip.
  *
  * Order: neutralizeProxyEnv() first, before anything can fetch (3.11.4: Bun's fetch would send even loopback
  * requests through an inherited HTTP_PROXY, and GatewayTransport refuses to run with one set). Then
@@ -163,7 +163,7 @@ async function run(config: ResolvedConfig, clock: Clock, ensureRenderer: () => P
   const target = config.target
   if (target.transport !== "gateway") {
     await config.lock.release()
-    process.stderr.write("lunarwing-tui: the socket transport is not in this build yet (M4); use --tenant or --gateway-url\n")
+    process.stderr.write("wingtip: the socket transport is not in this build yet (M4); use --tenant or --gateway-url\n")
     return 2
   }
   let log: DebugLog
@@ -192,6 +192,6 @@ try {
   process.exit(await main())
 } catch (error) {
   // Never print a token: errors here come from setup code whose messages are built without secrets.
-  process.stderr.write(`lunarwing-tui: ${error instanceof Error ? error.message : "unexpected failure"}\n`)
+  process.stderr.write(`wingtip: ${error instanceof Error ? error.message : "unexpected failure"}\n`)
   process.exit(1)
 }

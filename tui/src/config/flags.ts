@@ -270,7 +270,7 @@ function applyBool(flags: ParsedFlags, name: string): void {
 function consume(cursor: Cursor, flags: ParsedFlags): void {
   const arg = cursor.argv[cursor.index] ?? ""
   if (!arg.startsWith("-") || arg === "-" || arg === "--") {
-    throw new ConfigError("unexpected argument (lunarwing-tui takes options only; see --help)")
+    throw new ConfigError("unexpected argument (wingtip takes options only; see --help)")
   }
   const name = flagName(arg)
   const inline = name.length < arg.length ? arg.slice(name.length + 1) : undefined
@@ -297,7 +297,7 @@ export function parseFlags(argv: readonly string[]): ParsedFlags {
 
 export function usageText(): string {
   return [
-    "Usage: lunarwing-tui [options]",
+    "Usage: wingtip [options]",
     "",
     "Connection:",
     "  --tenant <name>                 tenant gateway from tenants/<name>.json (mt-admin tui-access)",

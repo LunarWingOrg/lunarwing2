@@ -2,7 +2,7 @@
  * Tenant access files (design 3.11.3, 9.5): `<config dir>/tenants/<tenant>.json`, written by
  * `lunarwing-mt-admin.sh tui-access <tenant> --for-user <user>` (ic/scripts/mt-admin-lib/16-tui-access.sh):
  *
- *   {"schema":"lunarwing-tui/tenant-access","version":1,"tenant":"derpy","transport":"gateway",
+ *   {"schema":"wingtip/tenant-access","version":1,"tenant":"derpy","transport":"gateway",
  *    "url":"http://127.0.0.1:10000","tenant_uid":1010,"token":"<64 hex>","token_kind":"client","label":"tui:sun",
  *    "issued_at":"2026-11-03T00:15:00Z","expires_at":"2027-02-01T00:15:00Z"}
  *
@@ -20,7 +20,7 @@ import { Secret } from "./secret.ts"
 import { currentUid, isValidTokenText, readCheckedFile } from "./token-file.ts"
 import type { TokenKind, TokenSource } from "./types.ts"
 
-export const TENANT_ACCESS_SCHEMA = "lunarwing-tui/tenant-access"
+export const TENANT_ACCESS_SCHEMA = "wingtip/tenant-access"
 export const TENANT_ACCESS_VERSION = 1
 export const TENANT_ACCESS_MAX_BYTES = 4096
 
