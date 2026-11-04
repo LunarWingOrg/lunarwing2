@@ -155,7 +155,7 @@ export function authFailureHint(kind: TokenKind, context: AuthHintContext): stri
   const tenant = context.tenant ?? "<tenant>"
   switch (kind) {
     case "client":
-      return `this tenant may predate client tokens: re-run \`${tuiAccessCommand(tenant, context.user, true)}\`, or \`upgrade-tenant ${tenant}\``
+      return `the client token was not accepted (revoked, or the daemon does not support client tokens): ask for a new grant, \`${tuiAccessCommand(tenant, context.user, false)}\` (with \`--use-master-token\` while the tenant predates client tokens)`
     case "master":
       return `the master token changed: re-run \`${tuiAccessCommand(tenant, context.user, true)}\``
     case "file":
