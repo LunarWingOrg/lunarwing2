@@ -277,9 +277,14 @@ Rules (`OutcomeHints`):
 reached it through V1 `NO_REPLY` and Engine V2
 `Completed { response: None }`; WI#550 maps both to the empty-response sentinel
 on every channel, so they finish `no_reply` without stopping the agent or
-writing assistant history. On the two channels whose clients attach to a
-running service, `gateway` and `unix_socket_repl`, DEC-1 remains a backstop for
-any other `Ok(None)`:
+sending anything. V2 writes no assistant compatibility-history row; V1 keeps the
+literal `NO_REPLY` response in its in-memory thread history and database as before,
+since persistence happens before outbound suppression. Legacy command routing
+also uses the empty suppression sentinel for non-replies, including message-less
+success, suppressed, interrupted and approval-pending results; only an explicitly
+accepted `Submission::Quit` requests shutdown. On the two channels whose clients
+attach to a running service, `gateway` and `unix_socket_repl`, DEC-1 remains a
+backstop for any other `Ok(None)`:
 
 - `/quit`, `/exit` and `/shutdown` are refused before they reach the
   shutdown path (`quit_refusal` in `ic/src/agent/commands.rs`): the client gets

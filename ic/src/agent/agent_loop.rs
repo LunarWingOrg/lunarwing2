@@ -2656,6 +2656,72 @@ mod tests {
         assert_eq!(replies.lock().map_or(0, |replies| replies.len()), 1);
     }
 
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn legacy_command_non_replies_keep_xmpp_agent_running() {
+        let (agent, _stub_replies, _db_dir) = stub_channel_agent().await;
+        let (channel, _sender) = crate::testing::StubChannel::new("xmpp");
+        let replies = channel.captured_responses_handle();
+        agent.channels.add(Box::new(channel)).await;
+
+        // Inject latent command outcomes at the adapter boundary: no system command
+        // returns these yet. XMPP has no DEC-1 guard to mask a shutdown sentinel.
+        for result in [
+            SubmissionResult::Suppressed,
+            SubmissionResult::Interrupted,
+            SubmissionResult::Ok { message: None },
+            SubmissionResult::NeedApproval {
+                request_id: uuid::Uuid::new_v4(),
+                tool_name: "shell".into(),
+                description: "Run a command".into(),
+                parameters: serde_json::json!({}),
+                allow_always: false,
+            },
+        ] {
+            let message = IncomingMessage::new("xmpp", "alice", "/command");
+            let response = crate::agent::commands::legacy_command_response(result);
+            assert_eq!(
+                rate(&agent, &message, Ok(Some(response))).await,
+                (true, TurnOutcome::NoReply)
+            );
+            assert!(replies.lock().unwrap().is_empty());
+        }
+
+        // Follow-up commands go through the real legacy router caller, preserving
+        // ordinary responses, success messages and error formatting.
+        for (index, (command, expected)) in [
+            ("ping", "pong!"),
+            ("debug", "Debug toggle is handled by your client."),
+            ("unknown", "Error: Unknown command: unknown. Try /help"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let message = IncomingMessage::new("xmpp", "alice", format!("/{command}"));
+            let result = agent
+                .handle_job_or_command(
+                    crate::agent::MessageIntent::Command {
+                        command: command.into(),
+                        args: Vec::new(),
+                    },
+                    &message,
+                )
+                .await
+                .unwrap();
+            let SubmissionResult::Response { content } = result else {
+                panic!("legacy command returned a non-response: {result:?}");
+            };
+            assert_eq!(content, expected);
+            assert_eq!(
+                rate(&agent, &message, Ok(Some(content))).await,
+                (true, TurnOutcome::Replied)
+            );
+            let replies = replies.lock().unwrap();
+            assert_eq!(replies.len(), index + 1);
+            assert_eq!(replies[index].1.content, expected);
+        }
+    }
+
     /// A reply that a `BeforeOutbound` hook suppresses never reached `respond()`: the
     /// message finishes `no_reply`, not `replied`.
     #[cfg(feature = "libsql")]

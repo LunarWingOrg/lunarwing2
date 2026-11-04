@@ -52,6 +52,19 @@ pub(super) fn quit_refusal(channel: &str) -> Option<&'static str> {
         .then_some(QUIT_REFUSED_MESSAGE)
 }
 
+/// Legacy commands return text or the empty suppression sentinel, never shutdown.
+/// Only an explicitly accepted `Submission::Quit` may stop the agent loop.
+pub(super) fn legacy_command_response(result: SubmissionResult) -> String {
+    match result {
+        SubmissionResult::Response { content } => content,
+        SubmissionResult::Ok { message } => message.unwrap_or_default(),
+        SubmissionResult::Error { message } => format!("Error: {}", message),
+        SubmissionResult::Suppressed
+        | SubmissionResult::Interrupted
+        | SubmissionResult::NeedApproval { .. } => String::new(),
+    }
+}
+
 impl Agent {
     /// Handle job-related intents without turn tracking.
     pub(super) async fn handle_job_or_command(
@@ -93,13 +106,8 @@ impl Agent {
                 self.handle_help_job(&message.user_id, &job_id).await?
             }
             MessageIntent::Command { command, args } => {
-                match self
-                    .handle_command(&command, &args, &message.channel)
+                self.handle_command(&command, &args, &message.channel)
                     .await?
-                {
-                    Some(s) => s,
-                    None => return Ok(SubmissionResult::Ok { message: None }), // Shutdown signal
-                }
             }
             _ => "Unknown intent".to_string(),
         };
@@ -901,15 +909,11 @@ impl Agent {
         command: &str,
         args: &[String],
         channel: &str,
-    ) -> Result<Option<String>, Error> {
+    ) -> Result<String, Error> {
         // System commands are now handled directly via Submission::SystemCommand,
         // but the router may still send us unknown /commands.
-        match self.handle_system_command(command, args, channel).await? {
-            SubmissionResult::Response { content } => Ok(Some(content)),
-            SubmissionResult::Ok { message } => Ok(message),
-            SubmissionResult::Error { message } => Ok(Some(format!("Error: {}", message))),
-            _ => Ok(None),
-        }
+        let result = self.handle_system_command(command, args, channel).await?;
+        Ok(legacy_command_response(result))
     }
 
     /// Persist the selected model to the settings store (DB and/or TOML config).

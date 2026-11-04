@@ -455,8 +455,10 @@ no `message_id` or `client_turn_id`.
   punctuation characters, for example `NO_REPLY.`; or Engine V2
   `Completed{response: None}`) finishes `no_reply` on every channel (WI#550).
   Both producers use the empty-response suppression sentinel, so the daemon
-  keeps running and no assistant history row is written. The DEC-1 guard on
-  the two client channels remains as a backstop for any other `Ok(None)`.
+  keeps running and nothing is sent. V2 writes no assistant compatibility-history
+  row; V1 keeps the literal `NO_REPLY` response in its in-memory thread history and
+  database as before, since persistence precedes outbound suppression. The DEC-1
+  guard on the two client channels remains as a backstop for any other `Ok(None)`.
 - `/restart`: an operator action (`lunarwing-mt-admin.sh restart-tenant`); the
   TUI refuses it locally.
 - Bare approval keywords (for example `yes`, `ok`, `no`, `deny`, `always`;
