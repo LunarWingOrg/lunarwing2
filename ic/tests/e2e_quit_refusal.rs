@@ -3,11 +3,11 @@
 //!
 //! The web gateway (`gateway`) and the Unix-socket REPL (`unix_socket_repl`) are clients
 //! attached to a running service: the agent refuses the three commands from them and
-//! keeps running. With decision DEC-1 a silent `NO_REPLY` model reply (an `Ok(None)`
-//! handler result) does not stop the agent on those channels either. The in-process
-//! REPL (`repl`) still exits. These tests drive the V1 agent loop (`ENGINE_V2` unset,
-//! as in CI); a `ShutdownProbe` channel observes whether the loop shut the channels
-//! down.
+//! keeps running. With decision DEC-1 and WI#550 a silent `NO_REPLY` model reply
+//! does not stop the agent on those channels or non-TUI service channels such as
+//! `xmpp`. The in-process REPL (`repl`) still exits. These tests drive the V1 agent
+//! loop (`ENGINE_V2` unset, as in CI); a `ShutdownProbe` channel observes whether
+//! the loop shut the channels down.
 
 #[cfg(feature = "libsql")]
 mod support;
@@ -206,12 +206,20 @@ mod tests {
         rig.shutdown();
     }
 
-    /// DEC-1: a `NO_REPLY` model reply is suppressed and finishes `no_reply`, and the
-    /// agent keeps answering on `channel`.
+    /// DEC-1/WI#550: a `NO_REPLY` model reply is suppressed and finishes `no_reply`,
+    /// and the agent keeps answering on `channel`.
     async fn assert_silent_reply_keeps_running(channel: &str) {
         let (rig, stopped) = rig_for(channel, fixture("tui/silent_reply.json")).await;
 
-        let silent = send(&rig, channel, "Nothing to add here, stay quiet.").await;
+        let mut silent_message =
+            IncomingMessage::new(channel, USER, "Nothing to add here, stay quiet.");
+        if channel == "xmpp" {
+            silent_message = silent_message.with_metadata(
+                serde_json::json!({"chat_type": "group", "xmpp_type": "groupchat"}),
+            );
+        }
+        let silent = silent_message.id;
+        rig.send_incoming(silent_message).await;
         assert_eq!(
             wait_for_finish(&rig, silent).await,
             [
@@ -253,6 +261,11 @@ mod tests {
     #[tokio::test]
     async fn gateway_silent_reply_does_not_stop_agent() {
         assert_silent_reply_keeps_running(GATEWAY).await;
+    }
+
+    #[tokio::test]
+    async fn xmpp_group_silent_reply_does_not_stop_agent() {
+        assert_silent_reply_keeps_running("xmpp").await;
     }
 
     /// The in-process REPL owns the process: `/quit` still stops the agent loop.
