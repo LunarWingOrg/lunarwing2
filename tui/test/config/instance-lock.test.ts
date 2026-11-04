@@ -14,7 +14,7 @@ import { makeTempDir, writeFileWithMode } from "../helpers/tmp.ts"
 const DEAD_PID = 2_147_483_646
 
 async function stateDir(): Promise<string> {
-  const dir = join(await makeTempDir(), "state", "lunarwing-tui")
+  const dir = join(await makeTempDir(), "state", "wingtip")
   await ensureStateDir(dir)
   return dir
 }

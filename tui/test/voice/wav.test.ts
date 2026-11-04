@@ -204,7 +204,7 @@ describe("parec recorder", () => {
       "--rate=16000",
       "--channels=1",
       "--latency-msec=20",
-      "--client-name=lunarwing-tui",
+      "--client-name=wingtip",
       "--stream-name=dictation",
       "--device=alsa_input.usb-C922",
     ])

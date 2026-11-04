@@ -210,7 +210,7 @@ describe("approval panel", () => {
     await app.emit({ kind: "turn.approval", turnId: turnId("t-0"), approval: approval({ parameters: '{"command":"cat ~/.ssh/id_ed25519"}' }) })
     const calls = fake.callsFor("notify-send")
     expect(calls).toHaveLength(1)
-    expect(calls[0]?.argv).toEqual(["notify-send", "-a", "lunarwing-tui", "--", "LunarWing derpy", "approval needed: shell"])
+    expect(calls[0]?.argv).toEqual(["notify-send", "-a", "wingtip", "--", "LunarWing derpy", "approval needed: shell"])
     expect(JSON.stringify(calls[0]?.argv)).not.toContain("id_ed25519")
     expect(calls[0]?.env).toEqual({ PATH: "/usr/bin", WAYLAND_DISPLAY: "wayland-1" })
   })
