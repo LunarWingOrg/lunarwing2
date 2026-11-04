@@ -152,7 +152,8 @@ cargo bench --all-features --no-run
 - **Secrets**: Use the `secrecy` crate for sensitive values; never log or expose secrets.
 - **Logging**: Use `tracing` macros (`info!`, `warn!`, `error!`) rather than `println!`.
 - **Compile-time directory embeds** (refinery migrations, registry manifests, skills) need a directory-level `cargo:rerun-if-changed` in `ic/build.rs`. Per-file watches miss newly added files, so reused target dirs (tenant upgrades) ship without them while clean CI builds pass.
-- Keep clippy clean with zero warnings.
+- Good resources for fresh agents to get acquainted with policies regarding code generation can view docs/guides/AI-CODE-CONTRIBUTION-POLICY.md and docs/guides/CODE-CONTRIBUTION-POLICY.md
+- Keep clippy clean with zero warnings unless otherwise stated explicitly by the user to do so.
 
 ## Database, Setup, and Config Rules
 
@@ -244,7 +245,7 @@ Exceptions: comments/docs forbidding the pattern; code inside `ic/scripts/lunarw
 - Preserve existing defaults unless the task explicitly changes them.
 - Avoid unrelated file churn and generated-file edits unless required.
 - Respect a dirty worktree and never revert user changes you did not make.
-- *DO NOT USE FULL DEBUG BUILDS DO NOT USE FULL DEBUG BUILDS. WASTEFUL AND TO BE AVOIDED AT ALL COSTS*
+- *DO NOT USE FULL DEBUG BUILDS DO NOT USE FULL DEBUG BUILDS. WASTEFUL AND TO BE AVOIDED AT ALL COSTS. UNLESS THE USER REQUESTS IT OR IT IS ABSOLUTELY NECESSARY*
 
 ## Before Finishing
 
