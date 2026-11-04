@@ -54,10 +54,8 @@ import sys
 with open(sys.argv[-1]) as source:
     print(json.load(source)["containerimage.digest"])
 """)
-        # BUILDCTL_MODE steers failure injection: "ok" always publishes,
-        # "fail_once" fails only the first call with the pipeline-5984
-        # registry-auth 429, "fail_always" always fails with it, and
-        # "fail_compile" always fails with a genuine build error.
+        # BUILDCTL_MODE steers failure injection: registry-auth, snapshot and
+        # genuine build/package failures all stay inside this hermetic shim.
         self.write_shim("buildctl-daemonless.sh", f"""#!{sys.executable}
 import json
 import os
@@ -74,6 +72,21 @@ if mode == "fail_always" or (mode == "fail_once" and count == 1):
     print("#33 [auth] registry.invalid/example/worker/worker-opencode2:pull,push token for registry.invalid", file=sys.stderr)
     print("ERROR: failed to push registry.invalid/example/worker/worker-opencode2:tag: failed to authorize: failed to fetch oauth token: unexpected status from POST request to https://git.lunarwing.invalid/jwt/auth: 429 Too Many Requests: Retry later", file=sys.stderr)
     sys.exit(1)
+if mode in ("snapshot_fail_always", "snapshot_fail_once") and (mode == "snapshot_fail_always" or count == 1):
+    print(os.environ.get("BUILDCTL_SNAPSHOT_SIGNATURE", "W: Tried to start delayed item http://snapshot.debian.org/archive/debian/20261024T011300Z but failed"), file=sys.stderr)
+    if os.environ.get("BUILDCTL_SNAPSHOT_KILL") == "1":
+        print("#34 [runtime 2/17] RUN apt-get update against snapshot.debian.org", file=sys.stderr)
+        print("ERROR: failed to solve: process \\"/bin/sh -c apt-get update\\" did not complete successfully: exit code: 137", file=sys.stderr)
+    else:
+        print("ERROR: failed to solve: process \\"/bin/sh -c apt-get update\\" did not complete successfully: exit code: 1", file=sys.stderr)
+    sys.exit(1)
+if mode in ("fail_package", "fail_version"):
+    print("W: Tried to start delayed item http://snapshot.debian.org/archive/debian/20261024T011300Z but failed", file=sys.stderr)
+    if mode == "fail_package":
+        print("E: Unable to locate package lunarwing-fixture", file=sys.stderr)
+    else:
+        print("E: Version '1.2.3' for 'lunarwing-fixture' was not found", file=sys.stderr)
+    sys.exit(100)
 if mode == "fail_compile":
     print("ERROR: failed to solve: process \\"/bin/sh -c make\\" did not complete successfully: exit code: 2", file=sys.stderr)
     sys.exit(1)
@@ -210,6 +223,62 @@ for index, argument in enumerate(args):
             f"jitter {jitter} from CI_JOB_ID={self.env['CI_JOB_ID']}",
         )
         self.assertLessEqual(sum(expected_bases) + 7 * 29, 8 * 3600)
+
+    def test_transient_snapshot_signature_is_retried(self):
+        self.env["BUILDCTL_MODE"] = "snapshot_fail_once"
+        self.env["BUILDCTL_SNAPSHOT_SIGNATURE"] = (
+            "Failed to fetch http://snapshot.debian.org/archive/debian/20261024T011300Z "
+            "Connection failed"
+        )
+        result = self.run_build()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        # Candidate failure + candidate retry + clean rebuild.
+        self.assertEqual(len(calls), 3)
+        self.assertNotIn("--no-cache", calls[0])
+        self.assertNotIn("--no-cache", calls[1])
+        self.assertIn("--no-cache", calls[2])
+        self.assertIn(
+            "retrying after a transient snapshot.debian.org failure (attempt 1/3)",
+            result.stderr,
+        )
+        self.assertEqual(self.recorded_sleeps(), [122])
+
+    def test_snapshot_run_137_is_retried(self):
+        self.env["BUILDCTL_MODE"] = "snapshot_fail_once"
+        self.env["BUILDCTL_SNAPSHOT_SIGNATURE"] = "W: mirror progress stalled"
+        self.env["BUILDCTL_SNAPSHOT_KILL"] = "1"
+        result = self.run_build()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.log.read_text().splitlines()
+        self.assertEqual(len(calls), 3)
+        self.assertIn("transient snapshot.debian.org failure", result.stderr)
+        self.assertEqual(self.recorded_sleeps(), [122])
+
+    def test_persistent_snapshot_failure_uses_smaller_budget(self):
+        self.env["BUILDCTL_MODE"] = "snapshot_fail_always"
+        self.env["BUILDCTL_SNAPSHOT_SIGNATURE"] = "Some index files failed to download"
+        result = self.run_build()
+        self.assertNotEqual(result.returncode, 0)
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertEqual(len(calls), 3)
+        for args in calls:
+            self.assertNotIn("--no-cache", args)
+        self.assertEqual(self.recorded_sleeps(), [122, 302])
+        self.assertIn("image build attempt 3/3", result.stderr)
+        self.assertIn("not retrying", result.stderr)
+        # Both ladders, including maximum jitter on all nine sleeps, fit easily.
+        self.assertLessEqual(5715 + 420 + 9 * 29, 8 * 3600)
+
+    def test_package_failures_are_not_retried_despite_snapshot_warning(self):
+        for mode in ("fail_package", "fail_version"):
+            with self.subTest(mode=mode):
+                self.env["BUILDCTL_MODE"] = mode
+                result = self.run_build()
+                self.assertEqual(result.returncode, 100)
+                self.assertEqual(len(self.log.read_text().splitlines()), 1)
+                self.assertEqual(self.recorded_sleeps(), [])
+                self.assertIn("not retrying", result.stderr)
 
     def test_non_transient_build_failure_is_not_retried(self):
         self.env["BUILDCTL_MODE"] = "fail_compile"
