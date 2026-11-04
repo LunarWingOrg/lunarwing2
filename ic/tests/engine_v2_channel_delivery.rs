@@ -755,6 +755,79 @@ async fn assert_delivery_case(case: DeliveryCase) {
     lunarwing::bridge::reset_engine_state().await;
 }
 
+async fn assert_silent_completion_case() {
+    lunarwing::bridge::reset_engine_state().await;
+
+    let path = format!(
+        "{}/tests/fixtures/llm_traces/engine_v2/silent_completion.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let trace = support::trace_llm::LlmTrace::from_file(&path)
+        .unwrap_or_else(|error| panic!("failed to load {path}: {error}"));
+    let rig = TestRigBuilder::new()
+        .with_channel_name("xmpp")
+        .with_trace(trace)
+        .build()
+        .await;
+    let first_scope = Uuid::new_v4().to_string();
+    let first = IncomingMessage::new("xmpp", "test-user", "stay silent through v2")
+        .with_conversation_scope(first_scope.clone())
+        .with_metadata(serde_json::json!({
+            "chat_type": "group",
+            "xmpp_target": "room@conference.example.org",
+            "xmpp_type": "groupchat",
+        }));
+    let first_id = first.id;
+    rig.send_incoming(first).await;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let finished = rig.captured_lifecycle().into_iter().any(|(id, event)| {
+                id == first_id
+                    && matches!(
+                        event,
+                        lunarwing::channels::MessageLifecycle::Finished(
+                            lunarwing::channels::TurnOutcome::NoReply
+                        )
+                    )
+            });
+            if finished {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("silent V2 completion should finish without a reply");
+    assert!(rig.captured_responses().is_empty());
+
+    let conversation_id = rig
+        .database()
+        .get_or_create_scoped_conversation("xmpp", "test-user", &first_scope)
+        .await
+        .expect("silent completion conversation should resolve");
+    let history = rig
+        .database()
+        .list_conversation_messages(conversation_id)
+        .await
+        .expect("silent completion history should load");
+    assert!(history.iter().all(|message| message.role != "assistant"));
+
+    let follow_up = IncomingMessage::new("xmpp", "test-user", "after empty v2")
+        .with_conversation_scope(Uuid::new_v4().to_string())
+        .with_metadata(serde_json::json!({"xmpp_target": "room@conference.example.org"}));
+    rig.send_incoming(follow_up).await;
+    let responses = rig.wait_for_responses(1, Duration::from_secs(10)).await;
+    assert_eq!(responses.len(), 1, "agent stopped after a silent V2 turn");
+    assert_eq!(
+        responses[0].content,
+        "Still running after empty V2 completion."
+    );
+
+    rig.shutdown_and_wait().await;
+    lunarwing::bridge::reset_engine_state().await;
+}
+
 async fn assert_legacy_case(channel: &'static str, scope: &str) {
     lunarwing::bridge::reset_engine_state().await;
 
@@ -1757,6 +1830,7 @@ async fn engine_v2_channel_delivery_matrix() {
     for case in cases {
         assert_delivery_case(case).await;
     }
+    assert_silent_completion_case().await;
 
     env.set_channels(None);
     assert_legacy_case("xmpp", &Uuid::new_v4().to_string()).await;
