@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "lunarwing-tui",
+      "name": "wingtip",
       "dependencies": {
         "@opentui/core": "0.8.1",
         "@opentui/react": "0.8.1",
