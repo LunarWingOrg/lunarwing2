@@ -46,7 +46,7 @@ env_dir="$tenant_root/env"
 state_dir="$tenant_root/state"
 registry="$state_dir/gateway-client-tokens.json"
 desk_home="$fixture/home/desk"
-desk_cfg="$desk_home/.config/lunarwing-tui"
+desk_cfg="$desk_home/.config/wingtip"
 desk_file="$desk_cfg/tenants/alpha.json"
 calls="$fixture/calls"
 OUT="$fixture/out"
@@ -411,7 +411,7 @@ assert_1() {
     && [[ "$(desk_json .url)" == "http://127.0.0.1:$FIX_PORT" ]] \
     && [[ "$TOKEN_A" =~ ^[0-9a-f]{64}$ ]] \
     && [[ "$(desk_json '[.schema, .version, .tenant, .transport, .token_kind, .label, .issued_at, .expires_at] | map(tostring) | join(" ")')" \
-      == "lunarwing-tui/tenant-access 1 alpha gateway client tui:desk $FIX_ISSUED $FIX_EXPIRES_90" ]]
+      == "wingtip/tenant-access 1 alpha gateway client tui:desk $FIX_ISSUED $FIX_EXPIRES_90" ]]
 }
 check "1. grant writes 0600 desktop config with http://127.0.0.1:20042 and a 64-hex token" assert_1
 
@@ -775,7 +775,7 @@ revoke_with_unusable_home() {  # <foreign-owned|missing>
     && grep -qF "revoked tenant 'alpha' for user 'desk'" "$OUT" \
     && grep -qF "registry: removed 'tui:desk'" "$OUT" \
     && grep -qF "config:   not checked (home $desk_home" "$OUT" \
-    && grep -qF "remove ~desk/.config/lunarwing-tui/tenants/alpha.json by hand" "$OUT" \
+    && grep -qF "remove ~desk/.config/wingtip/tenants/alpha.json by hand" "$OUT" \
     && grep -qF "its desktop config is not checked" "$ERR" \
     && grep -qF "should a desktop config of 'desk' hold the master token" "$ERR"; } || ok=false
   STAT_HOME_UID=1000

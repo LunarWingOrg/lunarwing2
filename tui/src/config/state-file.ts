@@ -1,5 +1,5 @@
 /**
- * Client state files (design 3.11.5, 3.11.6): `${XDG_STATE_HOME:-~/.local/state}/lunarwing-tui/` (0700) with
+ * Client state files (design 3.11.5, 3.11.6): `${XDG_STATE_HOME:-~/.local/state}/wingtip/` (0700) with
  * `state.json` ({"lastTenant"}) and `<profile>.json` (lastThreadId, lastReplThread, voiceAck, imageAck,
  * voiceDevice), all 0600.
  *

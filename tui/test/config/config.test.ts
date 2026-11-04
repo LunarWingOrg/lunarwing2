@@ -42,7 +42,7 @@ interface Sandbox {
 async function sandbox(): Promise<Sandbox> {
   const root = await makeTempDir()
   const home = join(root, "home")
-  const configDir = join(home, ".config", "lunarwing-tui")
+  const configDir = join(home, ".config", "wingtip")
   await mkdir(join(configDir, "tokens"), { recursive: true, mode: 0o700 })
   await mkdir(join(configDir, "tenants"), { recursive: true, mode: 0o700 })
   const base = { HOME: home, XDG_CONFIG_HOME: join(home, ".config"), XDG_STATE_HOME: join(root, "state") }
@@ -90,7 +90,7 @@ function gateway(config: ResolvedConfig) {
 
 function tenantJson(tenant: string, overrides: Record<string, unknown> = {}): string {
   const record: Record<string, unknown> = {
-    schema: "lunarwing-tui/tenant-access",
+    schema: "wingtip/tenant-access",
     version: 1,
     tenant,
     transport: "gateway",
@@ -192,7 +192,7 @@ describe("flags (3.11.1)", () => {
     expect(help.kind).toBe("exit")
     if (help.kind === "exit") expect(help.output).toContain("--tenant <name>")
     const version = await loadConfig({ argv: ["--version"], env: {}, home: "/nonexistent", user: USER })
-    expect(version).toEqual({ kind: "exit", code: 0, output: "lunarwing-tui 0.1.0" })
+    expect(version).toEqual({ kind: "exit", code: 0, output: "wingtip 0.1.0" })
   })
 })
 
@@ -262,7 +262,7 @@ describe("precedence: flags > environment > profile > globals > defaults (3.11)"
 
     const none = await configError(loadConfig(sb.options(["--profile", "s", "--gateway-url", "http://127.0.0.1:1"])))
     expect(none.message).toContain("no gateway token for profile s")
-    expect(none.message).toContain("~/.config/lunarwing-tui/tokens/s.token")
+    expect(none.message).toContain("~/.config/wingtip/tokens/s.token")
   })
 
   test("transport: --transport > LUNARWING_TUI_TRANSPORT > profile > global", async () => {
@@ -329,7 +329,7 @@ describe("tokens (3.11.3)", () => {
     const sb = await sandbox()
     const path = await sb.writeToken("devgw", SECRET, 0o644)
     const refused = await configError(readTokenFile(path, { home: sb.home }))
-    expect(refused.message).toBe("token file ~/.config/lunarwing-tui/tokens/devgw.token has mode 0644: group and others must have no access (chmod 600)")
+    expect(refused.message).toBe("token file ~/.config/wingtip/tokens/devgw.token has mode 0644: group and others must have no access (chmod 600)")
     expect(refused.message).not.toContain(SECRET)
     const viaConfig = await configError(loadConfig(sb.options(["--profile", "devgw", "--gateway-url", "http://127.0.0.1:8765"])))
     expect(viaConfig.message).toContain("has mode 0644")
@@ -339,7 +339,7 @@ describe("tokens (3.11.3)", () => {
     const config = await ready(sb.options(["--profile", "devgw", "--gateway-url", "http://127.0.0.1:8765"]))
     expect(gateway(config).token.current().expose()).toBe(SECRET)
     expect(gateway(config).token.kind()).toBe("file")
-    expect(gateway(config).token.describe()).toBe("token file ~/.config/lunarwing-tui/tokens/devgw.token")
+    expect(gateway(config).token.describe()).toBe("token file ~/.config/wingtip/tokens/devgw.token")
   })
 
   test("symlinked, foreign, oversized, non-regular and malformed token files are refused by name, never by content", async () => {
@@ -573,7 +573,7 @@ describe("config.toml (3.11.2)", () => {
     await sb.writeToken("default", TOKEN)
     const path = await sb.writeConfig("[ui]\nreduce_motion = true\n", 0o664)
     const error = await configError(loadConfig(sb.options(["--gateway-url", "http://127.0.0.1:8765"])))
-    expect(error.message).toBe("config file ~/.config/lunarwing-tui/config.toml has mode 0664: it must not be writable by group or others (chmod go-w)")
+    expect(error.message).toBe("config file ~/.config/wingtip/config.toml has mode 0664: it must not be writable by group or others (chmod go-w)")
     await writeFileWithMode(path, "[ui]\nreduce_motion = true\n", 0o602)
     expect((await configError(loadConfig(sb.options(["--gateway-url", "http://127.0.0.1:8765"])))).message).toContain("has mode 0602")
     await writeFileWithMode(path, "[ui]\nreduce_motion = true\n", 0o644)
@@ -712,11 +712,11 @@ describe("paths (3.9, 3.11.2, 3.11.6)", () => {
   test("config, state and runtime directories honour LUNARWING_TUI_CONFIG_DIR and the XDG variables", () => {
     const home = "/home/t"
     expect(configDirCandidates({ LUNARWING_TUI_CONFIG_DIR: "~/cfg", XDG_CONFIG_HOME: "/x" }, home)).toEqual(["/home/t/cfg"])
-    expect(configDirCandidates({ XDG_CONFIG_HOME: "/x" }, home)).toEqual(["/x/lunarwing-tui", "/home/t/.config/lunarwing-tui"])
-    expect(configDirCandidates({ XDG_CONFIG_HOME: "relative" }, home)).toEqual(["/home/t/.config/lunarwing-tui"])
-    expect(resolveStateDir({ XDG_STATE_HOME: "/s" }, home)).toBe("/s/lunarwing-tui")
-    expect(resolveStateDir({}, home)).toBe("/home/t/.local/state/lunarwing-tui")
-    expect(resolveRuntimeDir({ XDG_RUNTIME_DIR: "/run/user/1" })).toBe("/run/user/1/lunarwing-tui")
+    expect(configDirCandidates({ XDG_CONFIG_HOME: "/x" }, home)).toEqual(["/x/wingtip", "/home/t/.config/wingtip"])
+    expect(configDirCandidates({ XDG_CONFIG_HOME: "relative" }, home)).toEqual(["/home/t/.config/wingtip"])
+    expect(resolveStateDir({ XDG_STATE_HOME: "/s" }, home)).toBe("/s/wingtip")
+    expect(resolveStateDir({}, home)).toBe("/home/t/.local/state/wingtip")
+    expect(resolveRuntimeDir({ XDG_RUNTIME_DIR: "/run/user/1" })).toBe("/run/user/1/wingtip")
     expect(resolveRuntimeDir({})).toBeNull()
   })
 
@@ -736,13 +736,13 @@ describe("paths (3.9, 3.11.2, 3.11.6)", () => {
     expect(error.message).toContain("cannot be created (EACCES)")
   })
 
-  test("the state directory is created 0700 and the config dir falls back to ~/.config/lunarwing-tui", async () => {
+  test("the state directory is created 0700 and the config dir falls back to ~/.config/wingtip", async () => {
     const sb = await sandbox()
     await sb.writeToken("default", TOKEN)
     const custom = join(sb.root, "xdg-config")
     const config = await ready(sb.options(["--gateway-url", "http://127.0.0.1:8765"], { XDG_CONFIG_HOME: custom }))
     expect(config.dirs.config).toBe(sb.configDir)
-    expect(config.dirs.state).toBe(join(sb.root, "state", "lunarwing-tui"))
+    expect(config.dirs.state).toBe(join(sb.root, "state", "wingtip"))
     expect((await stat(config.dirs.state)).mode & 0o777).toBe(0o700)
   })
 })
@@ -816,7 +816,7 @@ describe("debug log (3.11.6)", () => {
     await sb.writeToken("default", TOKEN)
     const url = ["--gateway-url", "http://127.0.0.1:8765"]
     expect((await ready(sb.options(url))).debugLogPath).toBeNull()
-    expect((await ready(sb.options([...url, "--debug-log"]))).debugLogPath).toBe(join(sb.root, "state", "lunarwing-tui", "debug.log"))
+    expect((await ready(sb.options([...url, "--debug-log"]))).debugLogPath).toBe(join(sb.root, "state", "wingtip", "debug.log"))
     expect((await ready(sb.options([...url, "--debug-log", "logs/x.log"]))).debugLogPath).toBe(join(sb.root, "logs", "x.log"))
     expect((await ready(sb.options(url, { LUNARWING_TUI_DEBUG_LOG: "~/tui.log" }))).debugLogPath).toBe(join(sb.home, "tui.log"))
   })

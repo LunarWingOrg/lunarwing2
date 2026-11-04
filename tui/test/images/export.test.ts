@@ -39,7 +39,7 @@ interface Rig {
 
 async function rig(overrides: Partial<ImageExporterOptions> = {}): Promise<Rig> {
   const dir = await makeTempDir()
-  const runtimeDir = join(dir, "run", "lunarwing-tui")
+  const runtimeDir = join(dir, "run", "wingtip")
   await mkdir(join(dir, "run"), { mode: 0o700 })
   await mkdir(join(dir, "work"))
   const clock = new ManualClock()
@@ -131,7 +131,7 @@ describe("/image open", () => {
     failing.fake.on("xdg-open", { exitCode: 4 })
     const error = await rejection(createImageExporter(failing.options).open(generated(PNG)))
     expect(error.kind).toBe("failed")
-    expect(error.message).toMatch(/^xdg-open failed \(exit 4\); the image is at ~\/run\/lunarwing-tui\/img-.*\.png until you quit$/)
+    expect(error.message).toMatch(/^xdg-open failed \(exit 4\); the image is at ~\/run\/wingtip\/img-.*\.png until you quit$/)
   })
 
   test("a missing xdg-open keeps the file until quit and says where it is", async () => {
@@ -139,7 +139,7 @@ describe("/image open", () => {
     const exporter = createImageExporter(options)
     const error = await rejection(exporter.open(generated(PNG)))
     expect(error.kind).toBe("unavailable")
-    expect(error.message).toContain("xdg-open is not installed; the image is at ~/run/lunarwing-tui/img-")
+    expect(error.message).toContain("xdg-open is not installed; the image is at ~/run/wingtip/img-")
     expect(fake.calls).toHaveLength(1)
     expect(exporter.exported()).toHaveLength(1)
     await exporter.dispose()

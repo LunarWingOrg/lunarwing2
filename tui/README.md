@@ -1,6 +1,6 @@
-# LunarWing TUI
+# Wingtip
 
-A terminal client for LunarWing with text, push-to-talk dictation and images. It runs on Bun with
+Wingtip is LunarWing's terminal client with text, push-to-talk dictation and images. It runs on Bun with
 OpenTUI 0.8.1 and React 19 and talks to a tenant's web gateway (HTTP plus SSE, bearer token). The
 design is `/tmp/lw-tui-research/design/DESIGN.md` (sections 3, 5, 6, 7 and 9); this README covers
 what you need in order to use it.
@@ -89,7 +89,7 @@ sudo ic/scripts/lunarwing-mt-admin.sh tui-access <tenant> --list
 sudo ic/scripts/lunarwing-mt-admin.sh tui-access <tenant> --for-user <user> --revoke
 ```
 
-- A grant writes `~<user>/.config/lunarwing-tui/tenants/<tenant>.json` (mode 0600, owned by `<user>`,
+- A grant writes `~<user>/.config/wingtip/tenants/<tenant>.json` (mode 0600, owned by `<user>`,
   in 0700 directories) with the gateway URL, the tenant's uid and the token. Nothing prints the token.
 - Without `--use-master-token` the grant first asks the running daemon, with the master token, whether
   it authenticates client tokens (`GET /api/chat/capabilities` must list `client_tokens`) and refuses,
@@ -105,17 +105,19 @@ sudo ic/scripts/lunarwing-mt-admin.sh tui-access <tenant> --for-user <user> --re
   The details are in `docs/guides/MT-ADMIN-QUICKSTART.md` ("TUI access for a desktop user").
 - Never copy the output of `mt-admin tokens` into a file for the TUI. That verb is for the web login.
 
-Keep `~/.config/lunarwing-tui/tenants/` out of dotfile sync and backups.
+Keep `~/.config/wingtip/tenants/` out of dotfile sync and backups.
 
 ## Launch
 
+Run `bun link` from `tui/` to put the `wingtip` command on your PATH, then:
+
 ```bash
-tui/bin/lunarwing-tui --tenant <tenant>     # one tenant file from tui-access
-tui/bin/lunarwing-tui                       # one tenant file: used directly; several: a picker
+wingtip --tenant <tenant>     # one tenant file from tui-access
+wingtip                       # one tenant file: used directly; several: a picker
 ```
 
-The launcher can be symlinked (for example into `~/.local/bin`). From inside `tui/`,
-`bun run start -- --tenant <tenant>` does the same.
+Without linking, invoke `tui/bin/wingtip` from the repository root, or symlink that launcher into
+`~/.local/bin`. From inside `tui/`, `bun run start -- --tenant <tenant>` does the same.
 
 How the target is chosen (first match wins):
 
@@ -128,7 +130,7 @@ How the target is chosen (first match wins):
 A gateway that is not a tenant (a dev gateway) needs a URL and a token file:
 
 ```bash
-tui/bin/lunarwing-tui --gateway-url http://127.0.0.1:8765 --token-file ~/.config/lunarwing-tui/tokens/dev.token
+tui/bin/wingtip --gateway-url http://127.0.0.1:8765 --token-file ~/.config/wingtip/tokens/dev.token
 ```
 
 The token is **never** accepted on the command line: `--token`, `--gateway-token` and `--token=...`
@@ -177,13 +179,13 @@ tables, then the defaults.
 ## Configuration files
 
 The config directory is the first one that exists of `$LUNARWING_TUI_CONFIG_DIR`,
-`${XDG_CONFIG_HOME:-~/.config}/lunarwing-tui` and `~/.config/lunarwing-tui` (where `tui-access`
+`${XDG_CONFIG_HOME:-~/.config}/wingtip` and `~/.config/wingtip` (where `tui-access`
 writes). It holds:
 
 | Path | Rules |
 |---|---|
 | `config.toml` (optional) | owned by you and not group- or world-writable (it names commands); may be a symlink (dotfile managers); at most 256 KiB |
-| `tenants/<tenant>.json` | written by `tui-access`; 0600, owned by you, regular file (no symlink), at most 4 KiB; schema `lunarwing-tui/tenant-access` version 1; `tenant` must equal the file name; `tenant_uid` required; an `expires_at` in the past is refused; `tenants/` must be yours and not group- or world-writable |
+| `tenants/<tenant>.json` | written by `tui-access`; 0600, owned by you, regular file (no symlink), at most 4 KiB; schema `wingtip/tenant-access` version 1; `tenant` must equal the file name; `tenant_uid` required; an `expires_at` in the past is refused; `tenants/` must be yours and not group- or world-writable |
 | `tokens/<profile>.token` | token files for non-tenant profiles: 0600, owned by you, regular file, at most 4 KiB, 16-512 printable ASCII characters |
 
 Errors name the file and the failed check, never the content. Unknown keys in `config.toml` produce a
@@ -217,7 +219,7 @@ tenant = "derpy"                   # URL, token and tenant uid come from tenants
 thread = "last"
 [profiles.devgw]
 gateway_url = "http://127.0.0.1:8765"
-token_file = "~/.config/lunarwing-tui/tokens/devgw.token"
+token_file = "~/.config/wingtip/tokens/devgw.token"
 # expected_uid = 1000              # owner of the loopback listener; default: your uid
 # allow_insecure_http = false      # plain http to a non-loopback host (sticky warning)
 [profiles.devgw.ui]                # a profile may override [ui] and [voice]
@@ -231,11 +233,11 @@ Files the TUI writes (all 0600 in 0700 directories, written atomically):
 
 | Path | Content |
 |---|---|
-| `${XDG_STATE_HOME:-~/.local/state}/lunarwing-tui/state.json` | the last picked tenant |
+| `${XDG_STATE_HOME:-~/.local/state}/wingtip/state.json` | the last picked tenant |
 | `.../<profile>.json` | the remembered thread, the first-use acknowledgements for voice sources and image sources, the chosen capture device |
 | `.../<profile>.lock` | pid of the primary instance of the profile |
 | `.../debug.log` | only with `--debug-log`: event types, sizes, durations and status codes; never message text, transcripts, audio, image bytes, headers or tokens |
-| `$XDG_RUNTIME_DIR/lunarwing-tui/` | `/image open` exports, removed on quit |
+| `$XDG_RUNTIME_DIR/wingtip/` | `/image open` exports, removed on quit |
 
 ## The screen
 
@@ -524,7 +526,7 @@ Generated images (exact mode only) are rendered under the reply from validated b
 cells), never from a path or URL the server names. `--image-protocol auto|kitty|sixel|blocks` (or
 `[ui] image_protocol`) selects the renderer. Inside tmux, `auto` uses block characters, and forcing
 `kitty` there misplaces images (a known OpenTUI issue; `/transport` warns). `/image open [n]` writes the
-image to `$XDG_RUNTIME_DIR/lunarwing-tui/` (0600) and opens it with `xdg-open`, and those copies are
+image to `$XDG_RUNTIME_DIR/wingtip/` (0600) and opens it with `xdg-open`, and those copies are
 removed on quit. `/image save [n] [path]` writes a new 0600 file and never overwrites one. Only the
 newest 20 images keep their bytes in memory; older ones become placeholders ("image no longer in
 memory").
@@ -582,7 +584,7 @@ across the whole window.
 ## Desktop notifications
 
 When the terminal does not have focus and an approval arrives, the TUI runs
-`notify-send -a lunarwing-tui -- "LunarWing <tenant>" "approval needed: <tool>"`, at most once per 10 s.
+`notify-send -a wingtip -- "LunarWing <tenant>" "approval needed: <tool>"`, at most once per 10 s.
 Only the tool name is sent, never the description or the parameters. `[ui] notify = "all"` also notifies
 when a turn finishes while unfocused, and `"off"` silences it. Without `notify-send` nothing happens.
 Terminal bells are not used.
@@ -623,7 +625,7 @@ meter at 4 Hz. `[ui] cursor_blink = false` stops the cursor blinking.
 |---|---|
 | exits with "no tenant access is configured for <user>" | no valid `tenants/*.json`: ask for `tui-access` (above). Invalid files are listed with their reason |
 | a tenant file is refused (mode, owner, expired, missing `tenant_uid`) | re-run `tui-access` for your user; do not edit the file by hand |
-| tenant files from `tui-access` are not found | `${XDG_CONFIG_HOME}/lunarwing-tui` exists and is searched first; move the files there, or set `LUNARWING_TUI_CONFIG_DIR=~/.config/lunarwing-tui` |
+| tenant files from `tui-access` are not found | `${XDG_CONFIG_HOME}/wingtip` exists and is searched first; move the files there, or set `LUNARWING_TUI_CONFIG_DIR=~/.config/wingtip` |
 | `OFFLINE` with "the gateway rejected the token (HTTP 401 ...)" | client token on a daemon without client tokens: run `upgrade-tenant <t>` or re-grant with `--use-master-token`; master token changed: re-grant with `--use-master-token`; token file: replace the file |
 | `OFFLINE`, "... was refused (HTTP 403) ...; client tokens reach only chat, voice and status routes" | a client token reached a route outside its scope |
 | `OFFLINE`, "port N is held by uid U, expected X" | another account owns the port. Check the tenant (`mt-admin status <t>`) and the `tenant_uid` in your tenant file |
@@ -689,7 +691,7 @@ bun test test/integration/gateway-transport.test.ts # one file
 - A mock gateway for manual runs:
   `bun test/mocks/mock-gateway.ts --mode legacy|current [--token-file <0600 file>]` prints
   `LISTENING <port>` and answers every message with `echo: <text>`. Then run
-  `bin/lunarwing-tui --gateway-url http://127.0.0.1:<port> --token-file <same file> --no-voice`.
+  `bin/wingtip --gateway-url http://127.0.0.1:<port> --token-file <same file> --no-voice`.
 - CI: the `tui-ts` job in `.gitlab/ci/validate.yml` runs `bun install --frozen-lockfile`,
   `./node_modules/.bin/tsc --noEmit` and `bun test` in `tui/` on Bun 1.4.4. The script is pinned
   line for line by `.gitlab/scripts/validate_config.py` (`WORKER_TS_LANE_SCRIPTS`).

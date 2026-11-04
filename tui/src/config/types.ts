@@ -38,7 +38,7 @@ export interface TokenSource {
 
 export type ImageSourceKind = PendingImage["source"]
 
-/** `${XDG_STATE_HOME:-~/.local/state}/lunarwing-tui/<profile>.json`, 0600. Timestamps are ISO-8601 strings. */
+/** `${XDG_STATE_HOME:-~/.local/state}/wingtip/<profile>.json`, 0600. Timestamps are ISO-8601 strings. */
 export interface ProfileState {
   lastThreadId?: string
   /** "tui-<profile>-<16 hex>"; written only so --thread last or /thread resume can rejoin it (3.9). */
@@ -51,7 +51,7 @@ export interface ProfileState {
   voiceDevice?: string
 }
 
-/** `.../lunarwing-tui/state.json`, 0600. */
+/** `.../wingtip/state.json`, 0600. */
 export interface GlobalState {
   lastTenant?: string
 }

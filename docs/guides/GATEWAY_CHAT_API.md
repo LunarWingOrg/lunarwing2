@@ -1,8 +1,8 @@
 # Gateway Chat API (chat contract, `api_version` 1)
 
 Normative description of the web gateway's chat surface as a machine client
-uses it: the multimodal terminal client (`tui/`) is the reference consumer,
-and the web UI uses a subset. Version 1 of the contract is milestone M2a of
+uses it: Wingtip, the multimodal terminal client (`tui/`), is the reference
+consumer, and the web UI uses a subset. Version 1 of the contract is milestone M2a of
 the TUI design ("gateway contract in the daemon"): message correlation, turn
 lifecycle events, the capabilities document, image validation, Engine V2
 generated images and the `/quit` refusal. Client tokens (M2b) are not part of

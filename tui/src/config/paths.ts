@@ -11,7 +11,7 @@ import { isAbsolute, join, resolve } from "node:path"
 
 export type EnvSource = Readonly<Record<string, string | undefined>>
 
-export const APP_DIR_NAME = "lunarwing-tui"
+export const APP_DIR_NAME = "wingtip"
 
 /** A set, non-empty variable. */
 export function envValue(env: EnvSource, name: string): string | undefined {
@@ -94,7 +94,7 @@ export function resolveSocketPath(options: {
 /**
  * Config directory candidates in search order. An explicit LUNARWING_TUI_CONFIG_DIR is the only candidate (it is
  * used even before it exists, so a test or smoke run never falls through to the real ~/.config); otherwise
- * ${XDG_CONFIG_HOME:-$HOME/.config}/lunarwing-tui, then $HOME/.config/lunarwing-tui (where tui-access writes).
+ * ${XDG_CONFIG_HOME:-$HOME/.config}/wingtip, then $HOME/.config/wingtip (where tui-access writes).
  */
 export function configDirCandidates(env: EnvSource, home: string): string[] {
   const explicit = envValue(env, "LUNARWING_TUI_CONFIG_DIR")
@@ -122,12 +122,12 @@ export async function resolveConfigDir(env: EnvSource, home: string): Promise<st
   return candidates[0] ?? join(home, ".config", APP_DIR_NAME)
 }
 
-/** ${XDG_STATE_HOME:-~/.local/state}/lunarwing-tui (0700). */
+/** ${XDG_STATE_HOME:-~/.local/state}/wingtip (0700). */
 export function resolveStateDir(env: EnvSource, home: string): string {
   return join(xdgDir(env, "XDG_STATE_HOME") ?? join(home, ".local", "state"), APP_DIR_NAME)
 }
 
-/** $XDG_RUNTIME_DIR/lunarwing-tui (0700, /image open exports), or null without a runtime directory. */
+/** $XDG_RUNTIME_DIR/wingtip (0700, /image open exports), or null without a runtime directory. */
 export function resolveRuntimeDir(env: EnvSource): string | null {
   const runtime = xdgDir(env, "XDG_RUNTIME_DIR")
   return runtime === undefined ? null : join(runtime, APP_DIR_NAME)
