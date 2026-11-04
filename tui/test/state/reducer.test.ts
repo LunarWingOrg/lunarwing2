@@ -1374,9 +1374,9 @@ describe("composer, images, notices and bounds", () => {
     const prompt = h.state.approvals["req-1"]
     expect(prompt?.parameters).toBe('{"command": "ls \\u{1b}]0;title; rm -rf ~"}')
     expect(prompt?.toolName).toBe("shell\\u{1b}[2K")
-    // a reply is stripped as usual
+    // a reply is stripped as usual, with a visible marker when the sequence never terminates
     h.evt({ kind: "turn.final", turnId: a, text: "ok \u001b]0;gone" })
-    expect(h.turn(a).finalText).toBe("ok ")
+    expect(h.turn(a).finalText).toBe("ok […escape sequence removed]")
   })
 
   test("reducer never reads Date.now (spy)", () => {
