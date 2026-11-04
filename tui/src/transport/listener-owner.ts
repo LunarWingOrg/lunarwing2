@@ -194,7 +194,7 @@ export function isLoopbackHost(hostname: string): boolean {
 
 type Target = { family: 4 | 6; bytes: Uint8Array }
 
-/** The addresses a connection to `hostname` can reach; null for a DNS name (every row on the port matches). */
+/** Literal addresses a connection to `hostname` can reach; null means ownership cannot be verified locally. */
 function targetsFor(hostname: string): Target[] | null {
   const host = hostname.toLowerCase()
   if (host === "localhost") {
@@ -253,14 +253,30 @@ async function readTables(read: ProcReader): Promise<{ tcp: string; tcp6: string
   return { tcp: tcp.value, tcp6: v6 }
 }
 
-/** Uids owning a LISTEN socket that a connection to `url` can reach (sorted, unique). */
-export async function listenerUids(url: URL, read: ProcReader = readProcNet): Promise<number[]> {
+async function matchingListeners(url: URL, read: ProcReader): Promise<ListenerRow[]> {
+  const targets = targetsFor(url.hostname)
+  if (targets === null) {
+    throw new TransportError(
+      "unsupported",
+      `cannot verify the listener owner for DNS host ${url.hostname}; use localhost or an IP literal`,
+      { fatal: true },
+    )
+  }
   const { tcp, tcp6 } = await readTables(read)
   const port = urlPort(url)
   const rows = [...parseProcNetTcp(tcp, 4), ...parseProcNetTcp(tcp6, 6)].filter((row) => row.port === port)
-  const targets = targetsFor(url.hostname)
-  const matching = targets === null ? rows : rows.filter((row) => targets.some((t) => rowReaches(row, t)))
+  return rows.filter((row) => targets.some((target) => rowReaches(row, target)))
+}
+
+/** Uids owning a LISTEN socket that a connection to `url` can reach (sorted, unique). */
+export async function listenerUids(url: URL, read: ProcReader = readProcNet): Promise<number[]> {
+  const matching = await matchingListeners(url, read)
   return [...new Set(matching.map((row) => row.uid))].sort((a, b) => a - b)
+}
+
+export interface ListenerOwnerOptions {
+  /** Refuse wildcard and non-loopback rows (the embedded Hex child, which must never self-expose). */
+  loopbackOnly?: boolean
 }
 
 /**
@@ -272,12 +288,19 @@ export async function assertListenerOwner(
   url: URL,
   expected: ExpectedListener,
   read: ProcReader = readProcNet,
+  options: ListenerOwnerOptions = {},
 ): Promise<void> {
-  const uids = await listenerUids(url, read)
+  const matching = await matchingListeners(url, read)
   const port = urlPort(url)
-  if (uids.length === 0) {
+  if (matching.length === 0) {
     throw new TransportError("unreachable", `nothing listens on ${url.hostname}:${port}`)
   }
+  if (options.loopbackOnly === true && matching.some((row) => !isLoopbackHost(row.address))) {
+    throw new TransportError("forbidden", `port ${port} has a non-loopback listener (127.0.0.1 or ::1 required)`, {
+      fatal: true,
+    })
+  }
+  const uids = [...new Set(matching.map((row) => row.uid))].sort((a, b) => a - b)
   const foreign = uids.filter((uid) => uid !== expected.uid)
   if (foreign.length > 0) {
     const holder = foreign.length === 1 ? `uid ${foreign[0]}` : `uids ${foreign.join(", ")}`
