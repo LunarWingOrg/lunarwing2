@@ -534,12 +534,12 @@ check "8. re-grant rotates: new token, exactly one tui:desk entry, previous dige
 
 run_tui alpha --for-user desk --revoke
 assert_revoke_drops() {
-  drop_began desk "jq -r " && drop_ran desk "rm -f -- $desk_file" \
+  drop_ran desk "rm -f -- $desk_file" && ! drop_began desk "jq " \
     && drop_began alpha "env -i PATH=/usr/bin:/bin TARGET_PATH=$registry MAX_BYTES=65536 timeout " \
     && drop_began alpha "env -i PATH=/usr/bin:/bin TARGET_PATH=$registry TARGET_MODE=600 PARENT_POLICY=owned-parent " \
     && [[ ! -s "$undropped" ]]
 }
-check "drops: revoke reads and removes the desktop file as desk and rewrites the registry as alpha" assert_revoke_drops
+check "drops: revoke removes the desktop file as desk without reading it and rewrites the registry as alpha" assert_revoke_drops
 assert_9() {
   local first_rc="$RC" first_out sum_after
   first_out="$(cat "$OUT")"
@@ -894,6 +894,30 @@ assert_fifo_master_and_revoke() {
 }
 check "with a FIFO registry a master grant only warns, and revoke removes the desktop file then exits 1" \
   assert_fifo_master_and_revoke
+
+assert_revoke_without_desktop_read() {  # <fifo|oversized>
+  local how="$1" ok=true
+  clean_grant_state
+  gateway_answers 200 200
+  run_tui alpha --for-user desk --no-verify
+  ((RC == 0)) && [[ -f "$desk_file" ]] || return 1
+  rm -f -- "$desk_file"
+  case "$how" in
+    fifo) mkfifo -m 600 "$desk_file" ;;
+    oversized) truncate -s 2G "$desk_file" ;;
+  esac
+  run_tui_bounded 8 alpha --for-user desk --revoke
+  ((RC == 0)) && [[ ! -e "$desk_file" ]] \
+    && grep -qF 'token_kind unknown; not read' "$OUT" \
+    && grep -qF 'may have held the master token' "$ERR" \
+    && ! drop_began desk "jq " || ok=false
+  rm -f -- "$desk_file"
+  [[ "$ok" == true ]]
+}
+check "UZ-6: revoke removes a desktop FIFO without opening it and reports unknown token kind" \
+  assert_revoke_without_desktop_read fifo
+check "UZ-6: revoke removes a multi-GB desktop file without reading it" \
+  assert_revoke_without_desktop_read oversized
 
 # ── Scenario L: listener owned by another uid ────────────────────────────────
 
