@@ -1157,11 +1157,11 @@ const TCP_HEADER = "  sl  local_address rem_address   st tx_queue rx_queue tr tm
 const TCP6_HEADER =
   "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
 
-/** A ProcReader whose tables show one 0.0.0.0 LISTEN socket on `port` owned by `uid` (and no IPv6 sockets). */
-export function procReaderFor(port: number, uid: number): ProcReader & { reads: number } {
+/** A ProcReader whose tables show one LISTEN socket on `port` owned by `uid` (and no IPv6 sockets). */
+export function procReaderFor(port: number, uid: number, addressHex = "00000000"): ProcReader & { reads: number } {
   const reader = async (path: "/proc/net/tcp" | "/proc/net/tcp6"): Promise<string> => {
     reader.reads += 1
-    return path === "/proc/net/tcp" ? `${TCP_HEADER}\n${procNetTcpLine(0, "00000000", port, uid)}\n` : `${TCP6_HEADER}\n`
+    return path === "/proc/net/tcp" ? `${TCP_HEADER}\n${procNetTcpLine(0, addressHex, port, uid)}\n` : `${TCP6_HEADER}\n`
   }
   reader.reads = 0
   return reader

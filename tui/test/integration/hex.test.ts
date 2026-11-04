@@ -370,8 +370,8 @@ interface EmbeddedRig {
 interface EmbeddedRigOptions {
   /** Overrides of the embedded child's script (default: the mock's ready line, alive until stdin ends). */
   child?: Partial<FakeProcessScript> | ((mock: MockHex) => Partial<FakeProcessScript>)
-  /** The LISTEN row /proc/net/tcp shows: default the mock's port, owned by this uid. */
-  listener?: { port?: number; uid?: number }
+  /** The LISTEN row /proc/net/tcp shows: default 127.0.0.1 on the mock's port, owned by this uid. */
+  listener?: { port?: number; uid?: number; addressHex?: string }
   /** A Hex app (MockHex in app mode) whose support dir the locator reads. */
   app?: MockHex
 }
@@ -412,7 +412,11 @@ async function embeddedRig(opts: EmbeddedRigOptions = {}): Promise<EmbeddedRig> 
       uid,
       spawn,
       which: (cmd) => (cmd === "hex" ? "/usr/bin/hex" : null),
-      readProc: procReaderFor(opts.listener?.port ?? opts.app?.port ?? mock.port, opts.listener?.uid ?? uid),
+      readProc: procReaderFor(
+        opts.listener?.port ?? opts.app?.port ?? mock.port,
+        opts.listener?.uid ?? uid,
+        opts.listener?.addressHex ?? "0100007F",
+      ),
     },
   })
   cleanups.push(async () => {
@@ -498,6 +502,17 @@ describe("hex-embedded", () => {
     const child = await rig.spawned()
     expect(child.kills).toContain("SIGKILL")
     expect(child.stdinEnded).toBe(true)
+    expect(rig.mock.requests).toHaveLength(0)
+  })
+
+  test("a wildcard listener is refused even when its owner matches", async () => {
+    const rig = await embeddedRig({ listener: { addressHex: "00000000" } })
+    const error = await rejection(rig.source.transcribe(clip(), never))
+    expect([error.kind, error.message]).toEqual([
+      "unavailable",
+      `port ${rig.mock.port} has a non-loopback listener (127.0.0.1 or ::1 required)`,
+    ])
+    expect((await rig.spawned()).kills).toContain("SIGKILL")
     expect(rig.mock.requests).toHaveLength(0)
   })
 

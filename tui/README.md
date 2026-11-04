@@ -465,7 +465,8 @@ own dictation (`/dictations`) and the Hex CLI are not used in this release.
   binary is `[voice.hex] command` or `LUNARWING_TUI_HEX_BIN`. The child gets an allowlisted environment
   without `TRANSCRIBE_DUMP_DIR`. It must print one ready line within 15 s
   (`{"type":"ready","url":"http://127.0.0.1:<port>","token":"hex_...","apiVersion":"2","pid":<pid>}`;
-  the pid must be the child's own), and the TUI checks the port's owner again. The child lives only
+  the pid must be the child's own), and the TUI checks the port's owner again. Every matching listener
+  must be loopback-only: a `0.0.0.0` or `::` wildcard bind is refused even when its uid matches. The child lives only
   while its stdin stays open, and the TUI never writes to it. If the TUI quits or crashes, even by
   SIGKILL, the child exits within about 5 s. It stays up 10 minutes after the last transcription. On
   quit the TUI closes stdin, sends SIGTERM after 6 s and SIGKILL after 10 s. Embedded mode writes no

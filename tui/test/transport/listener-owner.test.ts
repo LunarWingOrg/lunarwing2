@@ -127,8 +127,22 @@ describe("listenerUids and assertListenerOwner (3.8.1)", () => {
     expect(await listenerUids(url("http://localhost:10000"), tenants())).toEqual([1010])
   })
 
-  test("a DNS name matches every listener on the port", async () => {
-    expect(await listenerUids(url("http://gateway.example:10000"), tenants())).toEqual([1010])
+  test("a DNS name cannot borrow the owner of an unrelated local listener", async () => {
+    const error = await refusal(listenerUids(url("http://gateway.example:10000"), tenants()))
+    expect(error.code).toBe("unsupported")
+    expect(error.fatal).toBe(true)
+    expect(error.message).toBe("cannot verify the listener owner for DNS host gateway.example; use localhost or an IP literal")
+  })
+
+  test("loopback-only mode refuses a wildcard listener", async () => {
+    const error = await refusal(
+      assertListenerOwner(url("http://127.0.0.1:10000"), { uid: 1010, label: "this user" }, tenants(), {
+        loopbackOnly: true,
+      }),
+    )
+    expect(error.code).toBe("forbidden")
+    expect(error.fatal).toBe(true)
+    expect(error.message).toBe("port 10000 has a non-loopback listener (127.0.0.1 or ::1 required)")
   })
 
   test("a foreign uid on the port is refused, fatal, with the uid message", async () => {
