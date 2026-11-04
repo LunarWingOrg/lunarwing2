@@ -2631,6 +2631,31 @@ mod tests {
         assert_eq!(reply_count(), 2, "the error reply");
     }
 
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn completed_without_response_keeps_xmpp_agent_running() {
+        let (agent, _stub_replies, _db_dir) = stub_channel_agent().await;
+        let (channel, _sender) = crate::testing::StubChannel::new("xmpp");
+        let replies = channel.captured_responses_handle();
+        agent.channels.add(Box::new(channel)).await;
+        let message = IncomingMessage::new("xmpp", "alice", "stay silent");
+
+        let outcome = lunarwing_engine::ThreadOutcome::Completed { response: None };
+        let result = Ok(crate::bridge::router::thread_outcome_response(&outcome));
+        assert_eq!(
+            rate(&agent, &message, result).await,
+            (true, TurnOutcome::NoReply)
+        );
+        assert!(replies.lock().map_or(true, |replies| replies.is_empty()));
+
+        let follow_up = Ok(Some("Still running.".to_string()));
+        assert_eq!(
+            rate(&agent, &message, follow_up).await,
+            (true, TurnOutcome::Replied)
+        );
+        assert_eq!(replies.lock().map_or(0, |replies| replies.len()), 1);
+    }
+
     /// A reply that a `BeforeOutbound` hook suppresses never reached `respond()`: the
     /// message finishes `no_reply`, not `replied`.
     #[cfg(feature = "libsql")]
