@@ -1,11 +1,11 @@
 {
-  "name": "lunarwing-tui",
+  "name": "wingtip",
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "LunarWing multimodal terminal client (voice and images) on Bun and OpenTUI",
+  "description": "Wingtip: LunarWing's multimodal terminal client (voice and images) on Bun and OpenTUI",
   "bin": {
-    "lunarwing-tui": "./bin/lunarwing-tui"
+    "wingtip": "./bin/wingtip"
   },
   "engines": {
     "bun": ">=1.3.14"

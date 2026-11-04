@@ -2,7 +2,7 @@
  * Desktop notifications (design 3.6.2, UX-12). When the terminal is blurred (useBlur / useFocus feed ui/blur and
  * ui/focus) and a new approval prompt arrives, notify-send is spawned through the injected SpawnFn:
  *
- *   ["notify-send", "-a", "lunarwing-tui", "--", "LunarWing <tenant>", "approval needed: <tool>"]
+ *   ["notify-send", "-a", "wingtip", "--", "LunarWing <tenant>", "approval needed: <tool>"]
  *
  * argv only, with the allowlisted child environment; the tool name is sanitized and cut to 64 characters, and the
  * description and parameters are never included. At most one notification per 10 s. [ui] notify = "approvals"
@@ -41,7 +41,7 @@ export function createNotifier(deps: NotifierDeps): Notifier {
 
 /** The argv for one notification; exported for tests. */
 export function notifyArgv(name: string, body: string): string[] {
-  return ["notify-send", "-a", "lunarwing-tui", "--", `LunarWing ${sanitizeLine(name).trim()}`, body]
+  return ["notify-send", "-a", "wingtip", "--", `LunarWing ${sanitizeLine(name).trim()}`, body]
 }
 
 /** "approval needed: <tool>", the tool name sanitized and cut. */

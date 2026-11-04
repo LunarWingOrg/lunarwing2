@@ -30,7 +30,7 @@ export function isValidTokenText(text: string): boolean {
 /** The current uid; the client is POSIX-only. */
 export function currentUid(): number {
   const uid = process.getuid?.()
-  if (uid === undefined) throw new ConfigError("lunarwing-tui needs a POSIX system (no process.getuid)")
+  if (uid === undefined) throw new ConfigError("wingtip needs a POSIX system (no process.getuid)")
   return uid
 }
 
@@ -42,7 +42,7 @@ export interface FileCheck {
   /** Required owner (process.getuid()). */
   uid: number
   maxBytes: number
-  /** How the file is named in messages, e.g. "token file ~/.config/lunarwing-tui/tokens/devgw.token". */
+  /** How the file is named in messages, e.g. "token file ~/.config/wingtip/tokens/devgw.token". */
   label: string
   /** 0o077 for secrets (no group/other access at all), 0o022 for config.toml (not writable by others). */
   forbiddenModeBits: number

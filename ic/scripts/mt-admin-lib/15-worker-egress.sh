@@ -333,22 +333,27 @@ worker_egress_pebble_backend() {
 # source of the allowlist, so a backend it cannot resolve is silently dropped
 # from the rendered ruleset and static host mappings — and then every
 # dispatched job dies seconds later with an opaque connect error that reads
-# like a worker crash.
+# like a worker crash. Status 4 marks these lane-local configuration refusals;
+# unsafe paths and other shared failures remain fatal to the whole worker pass.
 worker_egress_require_pebble_backend() {
   local name="$1" backend split host port subnet gateway resolved
   worker_egress_enabled "$name" || return 0
   backend="$(worker_egress_pebble_backend "$name")" || return 1
   if [[ -z "$backend" ]]; then
-    die "pebble worker for '$name' has no declared model backend, so the worker egress filter would block every job; pin it with 'configure-pebble $name --nanogpt-api-key <key> --base-url <url>' (default $PEBBLE_DEFAULT_BASE_URL), or allow the backend host yourself with 'configure-worker-egress $name --allow <host>:443'"
+    warn_err "pebble worker for '$name' has no declared model backend, so the worker egress filter would block every job; pin it with 'configure-pebble $name --nanogpt-api-key <key> --base-url <url>' (default $PEBBLE_DEFAULT_BASE_URL), or allow the backend host yourself with 'configure-worker-egress $name --allow <host>:443'"
+    return 4
   fi
-  split="$(_worker_egress_split_target "$backend" true)" \
-    || die "invalid pebble model backend '$(sanitize_display_value "$backend")' for tenant '$name'"
+  split="$(_worker_egress_split_target "$backend" true)" || {
+    warn_err "invalid pebble model backend '$(sanitize_display_value "$backend")' for tenant '$name'"
+    return 4
+  }
   read -r host port <<<"$split"
   subnet="$(worker_egress_state_get "$name" SUBNET)"
   gateway="$(_worker_egress_gateway "$subnet")"
   resolved="$(_worker_egress_resolve_target "$backend" "$gateway" false)" || return 1
   if [[ -z "$resolved" ]]; then
-    die "pebble worker for '$name' cannot resolve its model backend '$host:$port' to IPv4 from this host, so the worker egress filter would omit it and every job would fail; fix DNS for '$host' here or point 'configure-pebble $name --base-url' at a resolvable endpoint (a literal address still has to be allowed with 'configure-worker-egress $name --allow <address>:$port')"
+    warn_err "pebble worker for '$name' cannot resolve its model backend '$host:$port' to IPv4 from this host, so the worker egress filter would omit it and every job would fail; fix DNS for '$host' here or point 'configure-pebble $name --base-url' at a resolvable endpoint (a literal address still has to be allowed with 'configure-worker-egress $name --allow <address>:$port')"
+    return 4
   fi
   say "pebble model backend $host:$port is derived into $name's worker egress allowlist"
   return 0
@@ -873,10 +878,12 @@ prepare_worker_egress() {
   local name="$1" worker="$2" launch_text
   require_cmd nft
   worker_egress_ensure "$name" >/dev/null
-  # WI#506: refuse a pebble lane whose backend the filter would block before
-  # any container exists, rather than letting every dispatched job fail with
-  # an opaque connect error minutes later.
-  [[ "$worker" != pebble ]] || worker_egress_require_pebble_backend "$name"
+  # WI#506/#552: refuse a pebble lane whose backend the filter would block
+  # before any container exists, and preserve status 4 even when a caller is
+  # probing this function from an ignored-errexit context.
+  if [[ "$worker" == pebble ]]; then
+    worker_egress_require_pebble_backend "$name" || return "$?"
+  fi
   worker_egress_apply "$name" >/dev/null
   launch_text="$(worker_egress_launch_args "$name")" \
     || die "cannot render worker egress launch arguments for '$name'"

@@ -3,7 +3,7 @@
  * which are block thumbnails of at most 56x12 cells inside tmux.
  *
  * - open writes the validated bytes of the newest (or n-th newest) generated image to
- *   $XDG_RUNTIME_DIR/lunarwing-tui/img-<uuid>.<ext>. The directory is created 0700 and checked with lstat (a real
+ *   $XDG_RUNTIME_DIR/wingtip/img-<uuid>.<ext>. The directory is created 0700 and checked with lstat (a real
  *   directory, owned by this uid, no group or other bits); the file is opened O_CREAT | O_EXCL | O_NOFOLLOW |
  *   O_WRONLY with mode 0600. Then ["xdg-open", file] is spawned (argv only, the child environment). Exported files
  *   are removed by dispose() on quit.
@@ -178,7 +178,7 @@ function validatedBytes(image: ExportableImage): { bytes: Uint8Array; mime: Imag
 // ---------------------------------------------------------------------------------------------------------
 
 export interface ImageExporterOptions {
-  /** config/paths.ts resolveRuntimeDir(env): $XDG_RUNTIME_DIR/lunarwing-tui, or null without one. */
+  /** config/paths.ts resolveRuntimeDir(env): $XDG_RUNTIME_DIR/wingtip, or null without one. */
   runtimeDir: string | null
   /** config/child-env.ts buildChildEnv(), for xdg-open. */
   env: ChildEnv

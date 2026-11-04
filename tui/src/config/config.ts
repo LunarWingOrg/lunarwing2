@@ -604,9 +604,9 @@ async function versionText(): Promise<string> {
   try {
     const pkg: unknown = await Bun.file(new URL("../../package.json", import.meta.url)).json()
     const version = isTable(pkg) && typeof pkg.version === "string" ? pkg.version : "unknown"
-    return `lunarwing-tui ${version}`
+    return `wingtip ${version}`
   } catch {
-    return "lunarwing-tui (version unknown)"
+    return "wingtip (version unknown)"
   }
 }
 

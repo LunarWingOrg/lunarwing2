@@ -467,7 +467,7 @@ host's concurrent builds before retrying manually.
   `CI_BUN_IMAGE` tie cross-checks both `opencode4lunarwing/Dockerfile` and
   `opencode2.4lunarwing/Dockerfile` (MR !1669 review IK-2), so a drifted bun
   digest in either worker image fails `ci-config`.
-- `tui-ts`: the multimodal terminal client in `tui/` (Bun + OpenTUI 0.8.1;
+- `tui-ts`: Wingtip, the multimodal terminal client in `tui/` (Bun + OpenTUI 0.8.1;
   TUI design 11.3.6, milestone M1a): `cd tui`, `bun install
   --frozen-lockfile`, `./node_modules/.bin/tsc --noEmit` (strict, over the
   whole `src/` and `test/` tree) and `bun test` (unit, integration and

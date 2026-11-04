@@ -33,7 +33,7 @@ function notices(harness: AppHarness): string[] {
 class RecordingExporter implements ImageExporter {
   readonly saves: { image: ExportableImage; request: SaveRequest }[] = []
   async open(): Promise<string> {
-    return "/run/user/1000/lunarwing-tui/img-1.png"
+    return "/run/user/1000/wingtip/img-1.png"
   }
   async save(image: ExportableImage, request: SaveRequest): Promise<string> {
     this.saves.push({ image, request })

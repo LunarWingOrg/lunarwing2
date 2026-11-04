@@ -251,11 +251,13 @@ sudo ic/scripts/lunarwing-mt-admin.sh worker-egress <name>    # shows the derive
 
 The allowlist is never widened automatically: the backend is derived only from
 what `configure-pebble` (or an operator) declared. If a tenant has no declared
-backend, or the host does not resolve to IPv4 on the tenant host, the pebble
-lane refuses to start and names the exact remediation — it does not start and
-then fail every dispatched job with an opaque connect error. A worker that was
-provisioned before this change carries no backend key; re-run `configure-pebble`
-(or allow the host yourself with
+backend, the backend is malformed, or the host does not resolve to IPv4 on the
+tenant host, the pebble lane refuses to start and names the exact remediation —
+it does not start and then fail every dispatched job with an opaque connect
+error. This status-4 refusal is lane-local (WI#552): `start-tenant` and
+`restart-tenant` still attempt the other selected workers, then report pebble
+as failed. A worker that was provisioned before this change carries no backend
+key; re-run `configure-pebble` (or allow the host yourself with
 `configure-worker-egress <name> --allow nano-gpt.com:443`) before the next
 pebble start.
 

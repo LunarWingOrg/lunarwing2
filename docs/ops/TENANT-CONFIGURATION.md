@@ -287,7 +287,7 @@ The auth token is generated during tenant creation. To retrieve it:
 grep GATEWAY_AUTH_TOKEN /home/<tenant>/lunarwing/env/lunarwing.env
 ```
 
-That lookup serves the web login. To give a desktop user's terminal UI (`tui/`) access, do not copy the token by hand: run `tui-access` as root. It writes the token into `~<user>/.config/lunarwing-tui/tenants/<tenant>.json` (0600, owned by that user) and never prints it.
+That lookup serves the web login. To give a desktop user's Wingtip terminal UI (`tui/`) access, do not copy the token by hand: run `tui-access` as root. It writes the token into `~<user>/.config/wingtip/tenants/<tenant>.json` (0600, owned by that user) and never prints it.
 
 ```bash
 # Grant a dedicated, revocable client token (refused, nothing written, unless the

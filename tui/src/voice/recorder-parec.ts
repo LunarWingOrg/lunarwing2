@@ -2,7 +2,7 @@
  * The parec fallback recorder (design 5.5), used when OpenTUI Audio is unavailable. One async child per
  * recording, argv only (never a shell), the allowlisted child environment (config/child-env.ts):
  *
- *   parec --raw --format=s16le --rate=16000 --channels=1 --latency-msec=20 --client-name=lunarwing-tui
+ *   parec --raw --format=s16le --rate=16000 --channels=1 --latency-msec=20 --client-name=wingtip
  *         --stream-name=dictation [--device=<name>]
  *
  * parec writes raw PCM unbuffered; chunks are converted with an odd-byte carry (voice/levels.ts S16leDecoder) and
@@ -42,7 +42,7 @@ export function parecArgv(device?: string, command = "parec"): string[] {
     "--rate=16000",
     "--channels=1",
     "--latency-msec=20",
-    "--client-name=lunarwing-tui",
+    "--client-name=wingtip",
     "--stream-name=dictation",
     ...deviceArg,
   ]

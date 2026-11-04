@@ -21,7 +21,7 @@ function fakeToken(tenant: string): string {
 
 function tenantJson(tenant: string, overrides: Record<string, unknown> = {}): string {
   const record: Record<string, unknown> = {
-    schema: "lunarwing-tui/tenant-access",
+    schema: "wingtip/tenant-access",
     version: 1,
     tenant,
     transport: "gateway",
@@ -51,14 +51,14 @@ interface Sandbox {
 async function sandbox(): Promise<Sandbox> {
   const root = await makeTempDir()
   const home = join(root, "home")
-  const configDir = join(home, ".config", "lunarwing-tui")
+  const configDir = join(home, ".config", "wingtip")
   await mkdir(join(configDir, "tenants"), { recursive: true, mode: 0o700 })
   const env = { HOME: home, XDG_CONFIG_HOME: join(home, ".config"), XDG_STATE_HOME: join(root, "state") }
   return {
     root,
     home,
     configDir,
-    stateDir: join(root, "state", "lunarwing-tui"),
+    stateDir: join(root, "state", "wingtip"),
     options: (argv, extra = {}) => ({ argv, env: { ...env }, home, user: USER, cwd: root, now: () => NOW, ...extra }),
     writeTenant: (tenant, overrides = {}, mode = 0o600) =>
       writeFileWithMode(join(configDir, "tenants", `${tenant}.json`), tenantJson(tenant, overrides), mode),
@@ -171,7 +171,7 @@ describe("tenant selection (3.11.5)", () => {
     await sb.writeTenant("derpy")
     await sb.writeTenant("old", { tenant_uid: undefined })
     await sb.writeTenant("loose", {}, 0o644)
-    await writeFileWithMode(join(sb.configDir, "tenants", "broken.json"), `{"schema":"lunarwing-tui/tenant-access","token":"${fakeToken("broken")}`, 0o600)
+    await writeFileWithMode(join(sb.configDir, "tenants", "broken.json"), `{"schema":"wingtip/tenant-access","token":"${fakeToken("broken")}`, 0o600)
     await writeFileWithMode(join(sb.configDir, "tenants", "notes.txt"), "not a tenant file", 0o600)
 
     const listing = await listTenantFiles(sb.configDir, { uid: process.getuid?.() ?? -1, now: () => NOW, home: sb.home, user: USER })
@@ -220,7 +220,7 @@ describe("tenant selection (3.11.5)", () => {
     await alpha.lock.release()
 
     const missing = await configError(loadConfig(sb.options(["--tenant", "zulu"])))
-    expect(missing.message).toContain("no tenant access file for zulu (~/.config/lunarwing-tui/tenants/zulu.json)")
+    expect(missing.message).toContain("no tenant access file for zulu (~/.config/wingtip/tenants/zulu.json)")
     expect(missing.message).toContain("sudo ic/scripts/lunarwing-mt-admin.sh tui-access zulu --for-user tester --use-master-token")
   })
 

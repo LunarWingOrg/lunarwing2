@@ -623,7 +623,7 @@ Commands:
   tui-access <name> --for-user <user> [--url-host <host>]
              [--expires-in-days <n>] [--use-master-token] [--no-verify]
                                    Give a desktop user TUI access to the tenant
-                                   gateway: writes ~<user>/.config/lunarwing-tui/
+                                   gateway: writes ~<user>/.config/wingtip/
                                    tenants/<name>.json (0600, owned by <user>)
                                    with a new client token whose SHA-256 is
                                    registered in the tenant's state dir. Refused

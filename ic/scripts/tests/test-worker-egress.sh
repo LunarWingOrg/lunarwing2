@@ -1045,6 +1045,8 @@ rm -f "$pebble_env"
 if output="$(prepare_worker_egress alpha pebble 2>&1)"; then
   fail "pebble lane started with no declared model backend"
 else
+  pebble_rc=$?
+  assert_eq "$pebble_rc" 4 "undeclared pebble backend is a lane-local configuration refusal"
   assert_contains "$output" 'configure-pebble alpha' "undeclared pebble backend names configure-pebble"
   assert_contains "$output" 'configure-worker-egress alpha --allow' "undeclared pebble backend names the egress remediation"
   assert_eq "$(cat "$apply_log")" "" "an undeclared pebble backend never renders an allowlist"
@@ -1059,17 +1061,25 @@ fi
 assert_contains "$(worker_egress_target_records alpha)" 'nano-gpt.com 198.51.100.7 443' \
   "pebble backend is derived into the tenant's own allowlist"
 printf 'PEBBLE_BASE_URL=https://missing.invalid/api\n' >"$pebble_env"
+: >"$apply_log"
 if output="$(prepare_worker_egress alpha pebble 2>&1)"; then
   fail "unresolvable pebble backend was accepted"
 else
+  pebble_rc=$?
+  assert_eq "$pebble_rc" 4 "unresolvable pebble backend is a lane-local configuration refusal"
   assert_contains "$output" 'cannot resolve its model backend' "unresolvable pebble backend is a start-time refusal"
   assert_contains "$output" 'missing.invalid:443' "unresolvable refusal names the backend host"
+  assert_eq "$(cat "$apply_log")" "" "an unresolvable pebble backend never renders an allowlist"
 fi
 printf 'PEBBLE_BASE_URL=not-a-url\n' >"$pebble_env"
+: >"$apply_log"
 if output="$(prepare_worker_egress alpha pebble 2>&1)"; then
   fail "malformed pebble backend was accepted"
 else
+  pebble_rc=$?
+  assert_eq "$pebble_rc" 4 "malformed pebble backend is a lane-local configuration refusal"
   assert_contains "$output" "invalid pebble model backend 'not-a-url'" "malformed pebble backend is refused"
+  assert_eq "$(cat "$apply_log")" "" "a malformed pebble backend never renders an allowlist"
 fi
 printf 'PEBBLE_BASE_URL=https://198.51.100.9:8443/api\n' >"$pebble_env"
 if prepare_worker_egress alpha pebble >/dev/null 2>&1; then

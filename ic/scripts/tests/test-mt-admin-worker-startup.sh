@@ -60,7 +60,10 @@ ports_get() {
 }
 _ensure_tenant_image() { [[ "$2" != "lunarwing-worker-${missing_image}:latest" ]]; }
 _worker_launch_contract() { printf fixture-contract; }
-prepare_worker_egress() { WORKER_EGRESS_LAUNCH_ARGS=(); }
+prepare_worker_egress() {
+  if [[ "$failure_mode" == pebble-config && "$2" == pebble ]]; then return 4; fi
+  WORKER_EGRESS_LAUNCH_ARGS=()
+}
 worker_egress_reconcile_container() { :; }
 worker_egress_verify_after_start() { :; }
 worker_egress_network_name() { printf fixture-egress; }
@@ -186,12 +189,26 @@ for INIT_SYSTEM in systemd openrc; do
     missing_image=''
   done
 
+  failure_mode=pebble-config
+  for verb in start_tenant restart_tenant; do
+    run_start "$verb"
+    expect test "$rc" = 1
+    expect grep -q 'pebble worker configuration refused' "$output"
+    expect grep -q 'failed worker lanes: pebble' "$output"
+    expect grep -q probe:opencode "$events"
+    expect grep -q probe:kimi "$events"
+    expect grep -q probe:opencode2 "$events"
+    expect test "$(grep -c 'not attempted:' "$output" || true)" = 0
+  done
+  failure_mode=none
+
   for failure_mode in runtime auth; do
     run_start start_tenant
     if [[ "$failure_mode" == runtime ]]; then expect test "$rc" = 125;
     else expect test "$rc" = 1; fi
     expect test "$(grep -Ec 'hash:lunarwing-kimi-alice$|unit:kimi|probe:opencode2' "$events" || true)" = 0
     expect test "$(grep -c 'kimi worker ready' "$output" || true)" = 0
+    expect grep -q 'failed worker lanes: kimi; not attempted: opencode2' "$output"
     if [[ "$failure_mode" == auth ]]; then
       expect test "$(grep -c run:kimi "$events" || true)" = 0
     fi
