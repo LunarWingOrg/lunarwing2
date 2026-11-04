@@ -1,0 +1,31 @@
+{
+  "model_name": "wi550-silent-completion",
+  "turns": [
+    {
+      "user_input": "stay silent through v2",
+      "steps": [
+        {
+          "response": {
+            "type": "text",
+            "content": "```repl\nFINAL(None)\n```",
+            "input_tokens": 40,
+            "output_tokens": 3
+          }
+        }
+      ]
+    },
+    {
+      "user_input": "after empty v2",
+      "steps": [
+        {
+          "response": {
+            "type": "text",
+            "content": "```repl\nFINAL('Still running after empty V2 completion.')\n```",
+            "input_tokens": 60,
+            "output_tokens": 10
+          }
+        }
+      ]
+    }
+  ]
+}
