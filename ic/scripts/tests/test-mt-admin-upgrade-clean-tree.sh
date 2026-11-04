@@ -370,11 +370,12 @@ darkirc_writer_lock() {
   flock -x "$writer_fd"
 }
 darkirc_writer_unlock() { flock -u "$writer_fd"; exec {writer_fd}>&-; }
-# Keep the real helper and Kimi starter: a stale Kimi image must stay lane-local
-# through upgrades, whereas the real _ctr-run/credential-assignment failures
-# must not record a hash, report ready or attempt opencode2.
+# Keep the real helper and Kimi starter: Pebble's status-4 config refusal and
+# a stale Kimi image's status 3 must stay lane-local through upgrades, whereas
+# real _ctr-run/credential-assignment failures must not record a hash, report
+# ready or attempt opencode2.
 start_tenant() { _start_tenant_workers "$1"; }
-start_tenant_pebble() { [[ "$startup_mode" != degraded ]] || return 3; }
+start_tenant_pebble() { [[ "$startup_mode" != degraded ]] || return 4; }
 start_tenant_opencode() { :; }
 start_tenant_opencode2() { printf 'later-lane\n' >>"$events"; }
 tenant_worker_desired_running() { return 0; }
@@ -457,9 +458,11 @@ for INIT_SYSTEM in systemd openrc; do
           pass "$label attempts later selected lanes after two lane refusals"
         else fail "$label aborted the worker pass early: $output"; fi
       elif [[ "$startup_mode" != clean ]]; then
-        if ! grep -Eq 'hash|unit|later-lane' "$events" && [[ "$output" != *'kimi worker ready'* ]]; then
-          pass "$label keeps inner runtime/auth failures fatal"
-        else fail "$label continued after a fatal worker failure: $output"; fi
+        if ! grep -Eq 'hash|unit|later-lane' "$events" \
+            && [[ "$output" != *'kimi worker ready'* \
+            && "$output" == *'failed worker lanes: kimi; not attempted: opencode2'* ]]; then
+          pass "$label keeps inner runtime/auth failures fatal and names skipped lanes"
+        else fail "$label continued after a fatal worker failure or hid skipped lanes: $output"; fi
       fi
     done
   done
