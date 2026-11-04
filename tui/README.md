@@ -1,6 +1,6 @@
-# LunarWing TUI
+# Wingtip
 
-A terminal client for LunarWing with text, push-to-talk dictation and images. It runs on Bun with
+Wingtip is LunarWing's terminal client with text, push-to-talk dictation and images. It runs on Bun with
 OpenTUI 0.8.1 and React 19 and talks to a tenant's web gateway (HTTP plus SSE, bearer token). The
 design is `/tmp/lw-tui-research/design/DESIGN.md` (sections 3, 5, 6, 7 and 9); this README covers
 what you need in order to use it.
@@ -109,13 +109,15 @@ Keep `~/.config/wingtip/tenants/` out of dotfile sync and backups.
 
 ## Launch
 
+Run `bun link` from `tui/` to put the `wingtip` command on your PATH, then:
+
 ```bash
-tui/bin/wingtip --tenant <tenant>     # one tenant file from tui-access
-tui/bin/wingtip                       # one tenant file: used directly; several: a picker
+wingtip --tenant <tenant>     # one tenant file from tui-access
+wingtip                       # one tenant file: used directly; several: a picker
 ```
 
-The launcher can be symlinked (for example into `~/.local/bin`). From inside `tui/`,
-`bun run start -- --tenant <tenant>` does the same.
+Without linking, invoke `tui/bin/wingtip` from the repository root, or symlink that launcher into
+`~/.local/bin`. From inside `tui/`, `bun run start -- --tenant <tenant>` does the same.
 
 How the target is chosen (first match wins):
 

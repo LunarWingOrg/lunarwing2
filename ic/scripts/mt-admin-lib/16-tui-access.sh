@@ -5,8 +5,8 @@
 #
 # 16-tui-access.sh — part of the lunarwing-mt-admin library.
 #
-# `tui-access`: gives a desktop user access to one tenant gateway for the
-# multimodal TUI (tui/) without that user ever reading tenant files. Root
+# `tui-access`: gives a desktop user access to one tenant gateway for Wingtip,
+# the multimodal TUI (tui/), without that user ever reading tenant files. Root
 # writes, AS the desktop user,
 #   ~<user>/.config/wingtip/tenants/<tenant>.json   (0600, 0700 dirs)
 # with the gateway URL, the tenant uid and the bearer token. The default

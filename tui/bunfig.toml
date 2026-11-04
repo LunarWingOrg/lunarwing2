@@ -1,4 +1,4 @@
-# LunarWing TUI (design 3.1, 11.3.1).
+# Wingtip (design 3.1, 11.3.1).
 
 [install]
 # `bun add` writes exact versions; the pins in package.json are never ranges (3.1).

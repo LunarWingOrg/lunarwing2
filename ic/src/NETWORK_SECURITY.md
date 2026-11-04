@@ -13,7 +13,7 @@ LunarWing operates across four trust boundaries:
 | Boundary | Trust Level | Examples |
 |----------|------------|---------|
 | **Local user** | Fully trusted | In-process REPL, CLI commands, Unix-socket REPL clients (`lunarwing repl`) |
-| **Gateway client** | Authenticated (bearer token) | Web UI in a browser and the terminal client (`tui/`) over HTTP + SSE; the gateway is loopback-bound by default, but multi-tenant gateways can listen on every interface (below). Browsers are additionally subject to CORS, Origin validation, CSRF protections |
+| **Gateway client** | Authenticated (bearer token) | Web UI in a browser and Wingtip, the terminal client (`tui/`), over HTTP + SSE; the gateway is loopback-bound by default, but multi-tenant gateways can listen on every interface (below). Browsers are additionally subject to CORS, Origin validation, CSRF protections |
 | **Docker containers** | Untrusted (sandboxed) | Worker containers executing user jobs; isolated via per-job tokens, allowlisted egress, dropped capabilities |
 | **External services** | Untrusted | Webhook senders (XMPP bridge); authenticated via shared secret |
 

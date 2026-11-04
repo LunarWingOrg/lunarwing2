@@ -209,7 +209,7 @@ Do not capture that output in shared logs. The gateway binds to the tenant's reg
 
 ### TUI access for a desktop user
 
-The terminal UI (`tui/`) runs as a desktop user, who owns the microphone, clipboard and Hex session but cannot read tenant env files, sockets or tokens. Give that user access to one tenant gateway with `tui-access`; `tokens` stays the web-login path.
+Wingtip (`tui/`) runs as a desktop user, who owns the microphone, clipboard and Hex session but cannot read tenant env files, sockets or tokens. Give that user access to one tenant gateway with `tui-access`; `tokens` stays the web-login path.
 
 ```bash
 # Dedicated, revocable client token; refused (nothing written) unless the running

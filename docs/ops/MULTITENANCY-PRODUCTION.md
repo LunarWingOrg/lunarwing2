@@ -192,9 +192,9 @@ ssh -L 10000:127.0.0.1:10000 -L 10010:127.0.0.1:10010 \
 
 Then access `http://localhost:10000`, `http://localhost:10010`, etc.
 
-#### Terminal UI access (`tui-access`)
+#### Wingtip terminal UI access (`tui-access`)
 
-The multimodal TUI runs as a desktop user (for example `sun`), who cannot read tenant env files, sockets or tokens. Grant access per user and tenant instead of handing out `tokens` output:
+Wingtip, the multimodal TUI, runs as a desktop user (for example `sun`), who cannot read tenant env files, sockets or tokens. Grant access per user and tenant instead of handing out `tokens` output:
 
 ```bash
 # Dedicated, revocable client token. Refused (nothing written) unless the running
