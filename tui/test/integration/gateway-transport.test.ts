@@ -354,6 +354,51 @@ describe("connect (3.8 steps 1-6)", () => {
     expect(await next(it)).toMatchObject({ kind: "turn.delta", text: "another thread" })
     expect(await next(it)).toMatchObject({ kind: "turn.activity", threadId: thread.id, activity: { kind: "thinking", text: "next turn" } })
   })
+
+  test("buffered image bytes are capped before connect finishes", async () => {
+    const mock = await MockGateway.start({ mode: "legacy", token: TOKEN })
+    cleanups.push(() => mock.stop())
+    const thread = mock.addThread([])
+    const encoder = new TextEncoder()
+    let stream: ReadableStreamDefaultController<Uint8Array> | null = null
+    const sse = (event: Record<string, unknown>) =>
+      stream?.enqueue(encoder.encode(`event: ${String(event.type)}\ndata: ${JSON.stringify(event)}\n\n`))
+    const image = () => ({ type: "image_generated", data_url: `data:image/png;base64,${"A".repeat(1200)}`, thread_id: thread.id })
+    const fetchImpl: FetchLike = async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input))
+      if (url.pathname === "/api/chat/events") {
+        const body = new ReadableStream<Uint8Array>({ start: (c) => void (stream = c) })
+        init?.signal?.addEventListener("abort", () => stream?.error(init.signal?.reason))
+        return new Response(body, { headers: { "content-type": "text/event-stream" } })
+      }
+      if (url.pathname === "/api/chat/capabilities") {
+        sse(image())
+        sse({ type: "thinking", message: "keep", thread_id: thread.id })
+        sse(image())
+      }
+      return fetch(input, init)
+    }
+    const transport = new GatewayTransport({
+      baseUrl: mock.url,
+      token: new MemoryTokenSource(TOKEN),
+      thread: { kind: "id", id: thread.id },
+      clock: new ManualClock(),
+      timezone: "",
+      stateFile: new MemoryStateFile(),
+      fetchImpl,
+      expectedListener: { uid: UID, label: "test" },
+      readProc: procReaderFor(mock.port, UID),
+      env: {},
+      eventMaxBytes: 4096,
+      decodeImage: () => ({ mime: "image/png", bytes: TINY_PNG }),
+    })
+    cleanups.push(() => transport.close())
+    await transport.connect(new AbortController().signal)
+    const it = transport.events()[Symbol.asyncIterator]()
+    expect(await next(it)).toMatchObject({ kind: "turn.activity", activity: { kind: "thinking", text: "keep" } })
+    expect(await next(it)).toMatchObject({ kind: "turn.image", image: { bytes: TINY_PNG } })
+    expect(await next(it)).toEqual({ kind: "resync.required", reason: "overflow" })
+  })
 })
 
 describe("events", () => {

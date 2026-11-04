@@ -22,7 +22,8 @@ import { sanitizeLine } from "../sanitize.ts"
 import type { ThreadId, TurnId } from "../state/model.ts"
 import { asTurnId, isValidClientId } from "../state/ids.ts"
 import { TransportError, codeForHttpStatus, isTransportError } from "./errors.ts"
-import { EVENT_CHANNEL_CAPACITY, EventChannel } from "./event-channel.ts"
+import { EVENT_CHANNEL_CAPACITY, EVENT_CHANNEL_MAX_BYTES, EventChannel } from "./event-channel.ts"
+import { eventMemoryBytes } from "./event-memory.ts"
 import { isFrameTooLargeError } from "./framing.ts"
 import * as wire from "./gateway-wire.ts"
 import { assertSendableContent } from "./guards.ts"
@@ -130,6 +131,8 @@ export interface GatewayTransportOptions {
   env?: Readonly<Record<string, string | undefined>>
   /** image_generated validation; default gateway-wire decodeGeneratedImage. */
   decodeImage?: wire.ImageDecoder
+  /** Aggregate queued-event memory; tests inject a small bound. */
+  eventMaxBytes?: number
   /** Extra sticky warnings from the configuration, reported in ServerInfo.warnings. */
   warnings?: readonly string[]
 }
@@ -331,6 +334,7 @@ interface Connection {
   readonly abort: AbortController
   /** Raw events received before connect() finished (released at step 6). */
   buffered: wire.GatewayEvent[] | null
+  bufferedBytes: number
   bufferOverflow: boolean
   wire: wire.GatewayWireContext
   watchdog: TimerHandle | null
@@ -605,9 +609,14 @@ export class GatewayTransport implements Transport {
 
   private newConnection(): Connection {
     const conn: Connection = {
-      channel: new EventChannel({ capacity: EVENT_CHANNEL_CAPACITY, onReturn: () => this.endConnection(conn, "closed") }),
+      channel: new EventChannel({
+        capacity: EVENT_CHANNEL_CAPACITY,
+        ...(this.opts.eventMaxBytes !== undefined ? { maxBytes: this.opts.eventMaxBytes } : {}),
+        onReturn: () => this.endConnection(conn, "closed"),
+      }),
       abort: new AbortController(),
       buffered: [],
+      bufferedBytes: 0,
       bufferOverflow: false,
       wire: {
         correlated: false,
@@ -891,6 +900,7 @@ export class GatewayTransport implements Transport {
     conn.wire = { ...conn.wire, correlated }
     const buffered = conn.buffered ?? []
     conn.buffered = null
+    conn.bufferedBytes = 0
     const newest = seed.turns.at(-1)?.response ?? null
     const duplicateAt =
       newest === null
@@ -953,17 +963,28 @@ export class GatewayTransport implements Transport {
     this.deliver(conn, event)
   }
 
-  /** Same policy as EventChannel: on overflow drop the deltas, then the oldest event, and resync afterwards. */
+  /** Images go first on byte overflow, then deltas and the oldest events; release emits one resync marker. */
   private buffer(conn: Connection, event: wire.GatewayEvent): void {
     let buffered = conn.buffered
     if (!buffered) return
-    if (buffered.length >= EVENT_CHANNEL_CAPACITY) {
+    const eventBytes = eventMemoryBytes(event)
+    const maxBytes = this.opts.eventMaxBytes ?? EVENT_CHANNEL_MAX_BYTES
+    const byteOverflow = conn.bufferedBytes + eventBytes > maxBytes
+    if (buffered.length >= EVENT_CHANNEL_CAPACITY || byteOverflow) {
       conn.bufferOverflow = true
+      if (byteOverflow) buffered = buffered.filter((e) => e.type !== "image_generated")
       buffered = buffered.filter((e) => e.type !== "stream_chunk")
-      if (buffered.length >= EVENT_CHANNEL_CAPACITY) buffered.shift()
+      let bytes = buffered.reduce<number>((total, item) => total + eventMemoryBytes(item), 0)
+      while (buffered.length > 0 && (buffered.length >= EVENT_CHANNEL_CAPACITY || bytes + eventBytes > maxBytes)) {
+        buffered.shift()
+        bytes = buffered.reduce<number>((total, item) => total + eventMemoryBytes(item), 0)
+      }
       conn.buffered = buffered
+      conn.bufferedBytes = bytes
     }
+    if (buffered.length >= EVENT_CHANNEL_CAPACITY || conn.bufferedBytes + eventBytes > maxBytes) return
     buffered.push(event)
+    conn.bufferedBytes += eventBytes
   }
 
   private deliver(conn: Connection, event: wire.GatewayEvent): void {
@@ -1025,6 +1046,7 @@ export class GatewayTransport implements Transport {
       conn.watchdog = null
     }
     conn.buffered = null
+    conn.bufferedBytes = 0
     conn.seed = null
     if (outcome === "closed" || outcome === "replaced") {
       const why = outcome === "closed" ? "the gateway transport was closed" : "replaced by a new connection"
