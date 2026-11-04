@@ -945,7 +945,7 @@ describe("tokens (3.8, UX-10)", () => {
   })
 
   const hints: [TokenKind, string, string][] = [
-    ["client", "tenants/derpy.json (client token tui:sun)", "tui-access derpy --for-user $USER --use-master-token"],
+    ["client", "tenants/derpy.json (client token tui:sun)", "ask for a new grant, `sudo ic/scripts/lunarwing-mt-admin.sh tui-access derpy --for-user $USER` (with `--use-master-token`"],
     ["master", "tenants/derpy.json (master token)", "the master token changed: re-run `tui-access derpy --for-user $USER --use-master-token`"],
     ["file", "tokens/devgw.token", "the token in tokens/devgw.token was rejected"],
   ]

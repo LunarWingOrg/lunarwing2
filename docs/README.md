@@ -53,6 +53,7 @@ How-to guides, build instructions, and setup walkthroughs.
 |------|-------------|
 | [`CONTRIBUTOR-ONBOARDING.md`](guides/CONTRIBUTOR-ONBOARDING.md) | Contributor onboarding: shortest path from clone to merged MR, current freeze status, contribution tiers, review expectations, AI-policy compliance |
 | [`MT-ADMIN-QUICKSTART.md`](guides/MT-ADMIN-QUICKSTART.md) | Init-agnostic multi-tenant provisioning and lifecycle quickstart |
+| [`WINGTIP_GUIDE.md`](guides/WINGTIP_GUIDE.md) | Wingtip terminal client: tenant upgrade, `tui-access` grant, install, first session, rotate and revoke, troubleshooting |
 | [`TENANT-SYSTEM-PROMPTS.md`](guides/TENANT-SYSTEM-PROMPTS.md) | Per-tenant system prompt management: gateway Settings panel, `/api/prompts` routes, Engine V2 initialization snapshot and restart activation (WI#220) |
 | [`CREATE_TENANT_NEW_SCRIPT.md`](guides/CREATE_TENANT_NEW_SCRIPT.md) | Full-featured tenant convenience wrapper |
 | [`TENANT_KNOWLEDGE_SEED.md`](guides/TENANT_KNOWLEDGE_SEED.md) | Seeding a new tenant's knowledge store with the full lw2studymcp study-notes base (`--with-study-mcp` one-shot import) |
@@ -275,6 +276,7 @@ here while they are still present in `proposals/`.
 | [`WEECHAT_CLIENT_RELAY_API_AUTOMATION.md`](proposals/WEECHAT_CLIENT_RELAY_API_AUTOMATION.md) | Partial | Relay bootstrap shipped; full client provisioning remains open |
 | [`WEECHAT_WS_ADAPTER_MISSING_DEPENDENCY_AND_AUTOMATION.md`](proposals/WEECHAT_WS_ADAPTER_MISSING_DEPENDENCY_AND_AUTOMATION.md) | Partial | Service and port automation landed; dependency install remains warn-only |
 | [`WEECHAT_WS_ADAPTER_SYNC_PROTOCOL.md`](proposals/WEECHAT_WS_ADAPTER_SYNC_PROTOCOL.md) | Superseded | `ironclaw-sync` was renamed to `lunarwing-sync` |
+| [`WINGTIP_DESIGN.md`](proposals/WINGTIP_DESIGN.md) | Partial / in progress | Wingtip, the multimodal terminal client (`tui/`): M1 and M2a shipped in !2173; M2b client tokens, M3 socket hardening (WI#458) and M4 REPLv3 open |
 | [`WORK_ON_LUNAR_SPRITE.md`](proposals/WORK_ON_LUNAR_SPRITE.md) | Open stub | Placeholder without a proposal or implementation |
 | [`XMPP_INCOMING_ATTACHMENT.md`](proposals/XMPP_INCOMING_ATTACHMENT.md) | Superseded | Obsolete compiler-warning capture; inbound OOB/aesgcm handling now uses the source-verified download pipeline |
 | [`XMPP_LUNARVISION_INTEGRATION.md`](proposals/XMPP_LUNARVISION_INTEGRATION.md) | Implemented | Automatic OCR/VL enrichment uses host-side auth when configured and preserves multimodal fallback |

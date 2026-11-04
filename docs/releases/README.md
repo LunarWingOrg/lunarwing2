@@ -1,6 +1,6 @@
 # Release Notes
 
-The current release notes are [v2.1.7.0 — Shiranui (不知火)](../../RELEASE-v2.1.7.0.md)
+The current release-notes draft is [v2.1.8.0 — Umioto (海音)](../../RELEASE-v2.1.8.0.md)
 at the repository root.
 
 ## Released versions
@@ -12,6 +12,7 @@ are historical snapshots, not the current backlog.
 
 | Release | Codename | Date | Notes |
 |---------|----------|------|-------|
+| [v2.1.7.0](RELEASE-v2.1.7.0.md) | Shiranui (不知火) | 2026-10-30 | External-worker isolation, Engine V2 ownership, tenant lifecycle hardening, dependency security refresh |
 | [v2.1.6.0](RELEASE-v2.1.6.0.md) | Tsuno (角) | 2026-10-24 | External-worker tool proxy and cron missions, credential boundaries, OpenRC proxy migration, dependency security refresh |
 | [v2.1.5.0](RELEASE-v2.1.5.0.md) | Bungei Fukkō (文芸復興) | 2026-10-10 | Engine recovery, honest failure reporting, memory tooling, dependency and security re-audit |
 | [v2.1.4.0](RELEASE-v2.1.4.0.md) | Kabuto (兜) | 2026-10-03 | Engine/mission recovery hardening, dependency re-audit, tenant system-prompt editor, tool runtime estimates, XMPP outbound spool |

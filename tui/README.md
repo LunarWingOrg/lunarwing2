@@ -2,14 +2,16 @@
 
 Wingtip is LunarWing's terminal client with text, push-to-talk dictation and images. It runs on Bun with
 OpenTUI 0.8.1 and React 19 and talks to a tenant's web gateway (HTTP plus SSE, bearer token). The
-design is `/tmp/lw-tui-research/design/DESIGN.md` (sections 3, 5, 6, 7 and 9); this README covers
-what you need in order to use it.
+design is [`docs/proposals/WINGTIP_DESIGN.md`](../docs/proposals/WINGTIP_DESIGN.md) (sections 3, 5, 6, 7 and 9); this README covers
+what you need in order to use it. For a step-by-step setup (tenant upgrade, `tui-access` grant, install,
+first session), start with [`docs/guides/WINGTIP_GUIDE.md`](../docs/guides/WINGTIP_GUIDE.md).
 
-Status: milestones M1a (gateway client, LunarVoice, images, `tui-access`) and M1b (Hex voice sources).
-Today's tenant daemons are served in **legacy mode** (header `legacy daemon`): everything works, but
-replies are matched first in, first out, and generated images are not delivered. Daemons with the M2a
-gateway contract are served in **exact mode** (header `exact`). The Unix-socket transport
-(`--socket`, REPLv3) arrives with M4. Until then the client refuses it with a message.
+Status: milestones M1a (gateway client, LunarVoice, images, `tui-access`), M1b (Hex voice sources) and
+M2a (the daemon's gateway contract), merged in MR !2173. Daemons built from master since then serve
+Wingtip in **exact mode** (header `exact`). Older daemons are served in **legacy mode** (header
+`legacy daemon`): everything works, but replies are matched first in, first out, and generated images
+are not delivered. Client tokens arrive with M2b. The Unix-socket transport (`--socket`, REPLv3)
+arrives with M4. Until then the client refuses it with a message.
 
 ## Contents
 
@@ -349,8 +351,8 @@ or when the credential is sent.
 | `//<text>` | send `/<text>` to the daemon |
 | `/quit`, `/exit` | quit the TUI |
 
-`/quit`, `/exit` and `/shutdown` are never sent to the daemon, on any transport, because on today's
-daemons they would stop it. `/shutdown` and `/restart` are refused. To ask the daemon itself, write
+`/quit`, `/exit` and `/shutdown` are never sent to the daemon, on any transport, because daemons built
+before M2a stop on them (M2a daemons refuse them on the gateway and the socket). `/shutdown` and `/restart` are refused. To ask the daemon itself, write
 `//restart`, which also needs a second Enter. Other unknown `/commands` are forwarded unchanged.
 
 ## The info panel
@@ -375,7 +377,7 @@ else.
 The client asks the gateway for `GET /api/chat/capabilities`. A 404 means a legacy daemon, and the
 client degrades instead of failing.
 
-| Capability | Exact mode (M2a daemons) | Legacy mode (today's daemons) | Socket (M4) |
+| Capability | Exact mode (M2a daemons) | Legacy mode (daemons before M2a) | Socket (M4) |
 |---|---|---|---|
 | Text turns, queueing, interrupt, steer | yes, matched by id | yes, matched first in, first out | M4 |
 | Token streaming | when the engine streams | when the engine streams (detected from the first chunk) | no (V1 on the socket) |
@@ -541,9 +543,9 @@ agent and tools. The first image from each source shows the notice "images you s
 <tenant>'s workspace (no expiry) and are readable from every channel", and the attachment bar's caption
 ends with "stored in <tenant>'s workspace".
 
-Whether TUI image turns should skip this storage is decision **DEC-3**, which is still open. Storing and
-disclosing is the current default, because on V1 engines an image is visible to the model only in its
-own turn, and the stored copy is how later turns refer back to it.
+Whether TUI image turns should skip this storage was decision **DEC-3**, and they do not: storing and
+disclosing was kept, because on V1 engines an image is visible to the model only in its own turn, and
+the stored copy is how later turns refer back to it.
 
 ### Vision caveat
 
@@ -626,14 +628,14 @@ meter at 4 Hz. `[ui] cursor_blink = false` stops the cursor blinking.
 | exits with "no tenant access is configured for <user>" | no valid `tenants/*.json`: ask for `tui-access` (above). Invalid files are listed with their reason |
 | a tenant file is refused (mode, owner, expired, missing `tenant_uid`) | re-run `tui-access` for your user; do not edit the file by hand |
 | tenant files from `tui-access` are not found | `${XDG_CONFIG_HOME}/wingtip` exists and is searched first; move the files there, or set `LUNARWING_TUI_CONFIG_DIR=~/.config/wingtip` |
-| `OFFLINE` with "the gateway rejected the token (HTTP 401 ...)" | client token on a daemon without client tokens: run `upgrade-tenant <t>` or re-grant with `--use-master-token`; master token changed: re-grant with `--use-master-token`; token file: replace the file |
+| `OFFLINE` with "the gateway rejected the token (HTTP 401 ...)" | client token: it was revoked, or the daemon does not accept client tokens (none does before M2b): ask for a new grant, with `--use-master-token` while the tenant predates client tokens; master token changed (`rotate-gateway-token`): re-grant with `--use-master-token`; token file: replace the file. Then `/transport reconnect` |
 | `OFFLINE`, "... was refused (HTTP 403) ...; client tokens reach only chat, voice and status routes" | a client token reached a route outside its scope |
 | `OFFLINE`, "port N is held by uid U, expected X" | another account owns the port. Check the tenant (`mt-admin status <t>`) and the `tenant_uid` in your tenant file |
 | "HTTP_PROXY is set: gateway requests are never sent through a proxy" | unset the proxy variables for the TUI, or set `NO_PROXY='*'` |
 | `reconnecting in N s` | the gateway is down or restarting; the TUI keeps retrying (backoff up to 15 s). `/transport reconnect` retries at once |
 | a turn reads "lost (daemon restarted)" | the daemon restarted while it handled the turn; its work is gone. Ask again (nothing is re-sent automatically) |
 | a turn shows "no reply yet" | legacy daemon: the message waits in the daemon's queue (another channel's turn runs) or was consumed without a reply. Its reply still lands on it; Ctrl+S cancels it |
-| header says `legacy daemon` | expected with today's daemons; see the [capability matrix](#capability-matrix) |
+| header says `legacy daemon` | the tenant runs a build from before M2a (MR !2173): upgrade it (`upgrade-tenant <t> --target master`); see the [capability matrix](#capability-matrix) |
 | `(no mic)` | no source can transcribe: `/voice` lists the reason per source (gateway voice not configured, Hex not running or not installed). The footer and the welcome then offer no push-to-talk key |
 | "voice failed (Alt+R retry, Esc discard): ..." | every source failed; the clip is kept for 10 min |
 | "no signal from <device> - /voice device" | the capture device is muted or wrong; pick another with `/voice device` |
@@ -647,7 +649,7 @@ meter at 4 Hz. `[ui] cursor_blink = false` stops the cursor blinking.
 
 ## Known limitations
 
-- Legacy daemons (today's tenants): replies are matched first in, first out; a turn that gets no event
+- Legacy daemons (builds before M2a): replies are matched first in, first out; a turn that gets no event
   for 15 s shows "no reply yet" and keeps its place for 10 minutes, so a message the daemon consumed
   silently (an approval keyword) takes the next reply unless you cancel it with Ctrl+S; a finished turn
   without a reply is resolved by a history resync; generated images are not delivered.

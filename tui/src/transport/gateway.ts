@@ -144,9 +144,9 @@ export function authFailureHint(kind: TokenKind, opts: { tenant: string | null; 
   switch (kind) {
     case "client":
       return (
-        "this tenant may predate client tokens: re-run " +
-        `\`sudo ic/scripts/lunarwing-mt-admin.sh tui-access ${tenant} --for-user $USER --use-master-token\`, ` +
-        `or \`upgrade-tenant ${tenant}\``
+        "the client token was not accepted (revoked, or the daemon does not support client tokens): " +
+        `ask for a new grant, \`sudo ic/scripts/lunarwing-mt-admin.sh tui-access ${tenant} --for-user $USER\` ` +
+        "(with `--use-master-token` while the tenant predates client tokens)"
       )
     case "master":
       return `the master token changed: re-run \`tui-access ${tenant} --for-user $USER --use-master-token\``
