@@ -621,7 +621,8 @@ meter at 4 Hz. `[ui] cursor_blink = false` stops the cursor blinking.
   check runs before it, the token goes only in its `Authorization` header, and the client reads nothing
   but `uptime_secs` from the answer.
 - Server text (replies, activity, notices, captions) is stripped of escape sequences, control characters
-  and bidi controls before it is shown. Approval text shows them as visible escapes instead.
+  and bidi controls before it is shown. If an unterminated escape string consumes the rest of a reply, a
+  visible `[…escape sequence removed]` marker records the truncation. Approval text shows controls as visible escapes instead.
 
 ## Troubleshooting
 
