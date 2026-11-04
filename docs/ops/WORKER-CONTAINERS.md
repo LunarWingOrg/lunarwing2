@@ -687,12 +687,13 @@ Enforced controls (opencode2 lane unless noted):
    `PEBBLE_BASE_URL` from `lunarwing.env`, plus the pebble lane's own
    `PEBBLE_BASE_URL`/`NANOGPT_BASE_URL` from `pebble.env` (WI#506). A target
    the host cannot resolve is silently omitted from the ruleset, so the
-   pebble lane refuses to start when its model backend is undeclared or
-   unresolvable (`worker_egress_require_pebble_backend`) and names the exact
+   pebble lane refuses to start when its model backend is undeclared, malformed
+   or unresolvable (`worker_egress_require_pebble_backend`) and names the exact
    remediation instead of letting every dispatched job fail with an opaque
-   connect error. `worker-egress <tenant>` prints the derived targets under
-   `allowlist targets:`; see `docs/ops/PEBBLE-WORKER.md` for the pebble
-   backend pin.
+   connect error. This is a status-4 lane-local refusal (WI#552), so other
+   selected workers still start; see “Shared startup isolation” below.
+   `worker-egress <tenant>` prints the derived targets under `allowlist targets:`;
+   see `docs/ops/PEBBLE-WORKER.md` for the pebble backend pin.
 
    **Rootless Podman first-start keeper (WI#504):** when no worker container is
    running, mt-admin creates `lw-egress-keeper-<tenant>` on that tenant's
@@ -2037,31 +2038,36 @@ selection in `/etc/lunarwing/ports.json`. `build-tenant --with-<worker>` and the
 standalone build commands build shared images but do not select a worker for a
 tenant.
 
-### Shared startup isolation (WI#469 / goal 113)
+### Shared startup isolation (WI#469 / goal 113; WI#552)
 
 `start-tenant` and `restart-tenant` attempt selected workers in the existing
 `pebble opencode kimi opencode2` order, after starting the daemon. A stale
-image's user-contract refusal no longer exits the whole mt-admin process:
-each starter emits a bounded, escaped diagnostic and returns **3**. The worker
-pass warns, continues to later selected lanes, then names all refused lanes
-and returns **1** if any were refused. `start-worker` exposes the starter's
-status 3 directly. The image-user checks themselves remain fail-closed: no
-refused image is launched, rendered or recorded as ready.
+image's user-contract refusal returns **3**; a refusal that depends only on one
+lane's configuration returns **4** (currently an undeclared, malformed or
+unresolvable pebble model backend). The worker pass warns for either status,
+continues to later selected lanes, then names all refused lanes and returns
+**1** if any were refused. `start-worker` exposes the starter's status 3 or 4
+directly. Both refusals remain fail-closed for their own lane: no refused
+worker is launched, rendered or recorded as ready.
 
 Other outcomes stay distinct:
 
 - Deselected workers, OpenRC intentionally stopped workers, unallocated ports
   and unavailable images retain their existing soft-skip behavior.
-- Runtime, credential, workspace or egress failures are **not** stale-image
-  skips: any nonzero status other than 3 aborts the pass unchanged. Each
-  starter runs in its own `set -e` subshell so an inner failure cannot fall
+- Shared runtime, credential, workspace or egress-apply failures are **not**
+  lane-local refusals: any nonzero status other than 3 or 4 aborts the pass.
+  Each starter runs in its own `set -e` subshell so an inner failure cannot fall
   through to hash storage, unit registration or a false `worker ready` line.
+  The degraded summary names the failed lanes and every selected,
+  desired-running lane never attempted, for example `failed worker lanes:
+  pebble; not attempted: opencode kimi opencode2`.
 - `upgrade-tenant` preserves startup failure through both upgrade layers and
   the lifecycle/DarkIRC locks. It still refreshes an installed host health
-  pipeline, but reports **upgrade incomplete**, the startup status and failed
-  lanes, not `tenant upgraded`. This is **not an atomic rollback**: the new
-  checkout/binary is already installed, the daemon and successful lanes may
-  be running. Repair the failed lanes and retry `start-tenant`.
+  pipeline, but reports **upgrade incomplete**, the startup status, failed
+  lanes and any lanes not attempted, not `tenant upgraded`. This is **not an
+  atomic rollback**: the new checkout/binary is already installed, the daemon
+  and successful lanes may be running. Repair the failed lanes and retry
+  `start-tenant`.
 
 Maintainers: capture lifecycle callbacks and startup results with errexit
 temporarily disabled, outside `if`/`||`. Putting the function on the left of
