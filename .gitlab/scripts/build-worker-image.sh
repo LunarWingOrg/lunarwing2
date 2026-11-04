@@ -262,12 +262,12 @@ metadata_digest() {
 # GitLab's 429 rate limit at the very last step — pipeline 5984 lost the
 # opencode, opencode2 and kimi candidates (and, by cascade, their scans) to
 # one such burst, and pipeline 6212 lost the kimi candidate to a sustained
-# 429 burst that outlasted the original 4-attempt/3-minute window. The build is
-# deterministic and the retry reuses the layer cache, so only the narrow
-# observed transient signature is retried; a genuine build failure exits on
-# the first attempt. The publication jobs keep their pinned `retry: 0` (no
-# blind whole-job re-run) — this retry fires only inside the job and only on
-# the rate-limit signature.
+# 429 burst that outlasted the original 4-attempt/3-minute window. Package
+# versions are pinned, but snapshot.debian.org transport is not deterministic,
+# so its narrow transient signatures have their own retry ladder. A genuine
+# build or package failure still exits on the first attempt. The publication
+# jobs keep their pinned `retry: 0` (no blind whole-job re-run) — these retries
+# fire only inside the job and only on the classified transient signatures.
 #
 # Exponential backoff with jitter desynchronizes concurrent worker pushes:
 # when kimi/opencode/opencode2 all hit the 429 at once, identical delays
@@ -282,17 +282,30 @@ metadata_digest() {
 # 6-attempt/~15-minute window (opencode and pebble each burned all six, and
 # their scans then stopped at the "worker-image.env is missing" guard). Eight
 # attempts from a 45 s base give 45+90+180+360+720+1440+2880 = 5715 s
-# (~95.25 minutes) of sleeping, which still sits well inside the candidate
-# job's 8 h timeout. The 8th attempt is the final one, so the 2880 s rung
-# is never doubled past — adding attempts without re-checking this curve
-# would outgrow the timeout.
+# (~95.25 minutes) of sleeping. Snapshot failures get three attempts with
+# 120+300 = 420 s of base delays. Both ladders together sleep at most 6396 s
+# (~106.6 minutes) including maximum jitter, well inside the candidate job's
+# 8 h timeout. Adding attempts without re-checking these curves would outgrow
+# the timeout.
 _bwr_max_attempts=8
 _bwr_base_delay=45
+_bwr_snapshot_max_attempts=3
 push_attempt_log="$CI_PROJECT_DIR/.worker-push-attempt.log"
 push_attempt_rc="$CI_PROJECT_DIR/.worker-push-attempt.rc"
 
 transient_push_failure() {
     grep -qE 'failed to fetch oauth token|429 Too Many Requests' "$push_attempt_log"
+}
+
+transient_snapshot_failure() {
+    if grep -qE 'E: Unable to locate package|E: Version .* was not found' "$push_attempt_log"; then
+        return 1
+    fi
+    if grep -qE "Tried to start delayed item http://snapshot\\.debian\\.org|Failed to fetch http://snapshot\\.debian\\.org|Some index files failed to download|Unable to fetch some archives|Temporary failure resolving 'snapshot\\.debian\\.org'|Could not connect to snapshot\\.debian\\.org" "$push_attempt_log"; then
+        return 0
+    fi
+    grep -q 'snapshot\.debian\.org' "$push_attempt_log" &&
+        { grep -qE 'process .*exit code: 137' "$push_attempt_log" || [ "${1:-}" = 137 ]; }
 }
 
 build_image_with_retry() {
@@ -312,18 +325,34 @@ build_image_with_retry() {
             return 0
         fi
         IFS= read -r _bwr_status < "$push_attempt_rc"
-        if [ "$_bwr_attempt" -lt "$_bwr_max_attempts" ] && transient_push_failure; then
+        _bwr_attempt_budget=$_bwr_max_attempts
+        if transient_snapshot_failure "$_bwr_status"; then
+            _bwr_attempt_budget=$_bwr_snapshot_max_attempts
+            if [ "$_bwr_attempt" -lt "$_bwr_snapshot_max_attempts" ]; then
+                if [ "$_bwr_attempt" -eq 1 ]; then
+                    _bwr_base=120
+                else
+                    _bwr_base=300
+                fi
+                _bwr_jitter=$(( CI_JOB_ID % 30 ))
+                _bwr_delay=$((_bwr_base + _bwr_jitter))
+                echo "retrying after a transient snapshot.debian.org failure (attempt $_bwr_attempt/$_bwr_snapshot_max_attempts); sleeping ${_bwr_delay}s" >&2
+                sleep "$_bwr_delay"
+                _bwr_attempt=$((_bwr_attempt + 1))
+                continue
+            fi
+        elif [ "$_bwr_attempt" -lt "$_bwr_max_attempts" ] && transient_push_failure; then
             _bwr_base=$((_bwr_base_delay * (1 << (_bwr_attempt - 1))))
             _bwr_jitter=$(( CI_JOB_ID % 30 ))
             _bwr_delay=$((_bwr_base + _bwr_jitter))
             echo "registry push attempt $_bwr_attempt/$_bwr_max_attempts hit a transient registry-auth error; retrying in ${_bwr_delay}s" >&2
             sleep "$_bwr_delay"
             _bwr_attempt=$((_bwr_attempt + 1))
-        else
-            echo "image build attempt $_bwr_attempt/$_bwr_max_attempts failed (exit $_bwr_status); not retrying" >&2
-            rm -f "$push_attempt_log" "$push_attempt_rc"
-            return "$_bwr_status"
+            continue
         fi
+        echo "image build attempt $_bwr_attempt/$_bwr_attempt_budget failed (exit $_bwr_status); not retrying" >&2
+        rm -f "$push_attempt_log" "$push_attempt_rc"
+        return "$_bwr_status"
     done
 }
 
