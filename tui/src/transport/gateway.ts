@@ -126,7 +126,7 @@ export interface GatewayTransportOptions {
   tenant?: string | null
   /** [profile] allow_insecure_http: plain http to a non-loopback host (sticky warning). */
   allowInsecureHttp?: boolean
-  /** Environment checked for proxy variables before every request; default process.env. */
+  /** Environment checked for proxy and unsafe TLS variables before every request; default process.env. */
   env?: Readonly<Record<string, string | undefined>>
   /** image_generated validation; default gateway-wire decodeGeneratedImage. */
   decodeImage?: wire.ImageDecoder
@@ -1162,6 +1162,13 @@ export class GatewayTransport implements Transport {
       throw new TransportError("unsupported", `${name} is set: gateway requests are never sent through a proxy (3.11.4)`, {
         fatal: true,
       })
+    }
+    if (this.opts.baseUrl.protocol === "https:" && this.env.NODE_TLS_REJECT_UNAUTHORIZED === "0") {
+      throw new TransportError(
+        "unsupported",
+        "NODE_TLS_REJECT_UNAUTHORIZED=0 disables certificate verification: refusing the HTTPS gateway request",
+        { fatal: true },
+      )
     }
   }
 
