@@ -620,6 +620,8 @@ meter at 4 Hz. `[ui] cursor_blink = false` stops the cursor blinking.
 - The restart probe `GET /api/gateway/status` is an ordinary authenticated request: the listener-owner
   check runs before it, the token goes only in its `Authorization` header, and the client reads nothing
   but `uptime_secs` from the answer.
+- Inbound event queues retain at most 64 MiB in aggregate (in addition to per-event limits). On byte pressure,
+  queued images are dropped first and a `resync.required` notice requests canonical history instead.
 - Server text (replies, activity, notices, captions) is stripped of escape sequences, control characters
   and bidi controls before it is shown. If an unterminated escape string consumes the rest of a reply, a
   visible `[…escape sequence removed]` marker records the truncation. Approval text shows controls as visible escapes instead.
