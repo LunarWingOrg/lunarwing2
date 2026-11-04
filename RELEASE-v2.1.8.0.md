@@ -53,7 +53,7 @@ Registry bumps require rebuilt WASM artifacts; they do not by themselves change 
 
 - **The OpenCode v1.19.5 bump is not a proven fix for WI#333.** The model-metadata and silent-stream failure paths observed on v1.18.x are not verified fixed, and the relevant prompt-assembly code remains unchanged. Keep the live-dispatch validation above in the rollout plan.
 - **Silent replies remain a daemon-stop risk outside the protected channels (WI#550).** V1 `NO_REPLY` and V2 completions without a response still map to shutdown on channels other than `gateway` and `unix_socket_repl`; the remaining channels are tracked for v2.1.9.0.
-- **Wingtip is gateway-only in this draft.** Its unix-socket transport is not yet available; legacy daemons use first-in-first-out reply matching and do not deliver generated images.
+- **Wingtip currently uses gateway transport only.** Its unix-socket transport is not yet available; legacy daemons use first-in-first-out reply matching and do not deliver generated images.
 - **Worker isolation keeps its documented boundary.** The bridge/task split protects hub credentials, but jobs inside one task container remain one authority domain. Tool grants stay empty by default, and worker egress remains allowlist-based. The [v2.1.7.0 deployment boundaries](docs/releases/RELEASE-v2.1.7.0.md#known-limitations) apply where not superseded here.
 
 ---
