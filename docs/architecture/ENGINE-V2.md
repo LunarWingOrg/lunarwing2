@@ -1813,6 +1813,14 @@ agent's outbound handler then uses the shared `ResponseDelivery` path:
 `BeforeOutbound`, suppress-empty, optional coordination coalescing, and
 `ChannelManager::respond()` with the original incoming metadata.
 
+**Silent replies are not shutdowns (WI#550).** V1 `NO_REPLY` responses and V2
+`Completed { response: None }` outcomes both return the same empty-string
+suppression sentinel as `Stopped`. The agent loop therefore continues, reports
+`NoReply`, sends nothing, and writes no assistant compatibility-history row.
+Model-driven paths no longer reuse `Ok(None)`, which remains the explicit
+shutdown signal except for the DEC-1 client-channel backstop. The separate
+`GatePaused` mapping is unchanged because its gate handler owns status delivery.
+
 At the initial 610-second outcome deadline, delivery transfers to an owned late
 watcher, retaining the engine event receiver and original reply route. The caller
 returns an empty sentinel and emits a waiting status, not a terminal reply. The
