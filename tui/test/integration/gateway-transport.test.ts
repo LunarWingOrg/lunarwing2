@@ -1105,6 +1105,19 @@ describe("security", () => {
     expect((await connect(direct)).protocol).toBe("gateway-chat")
   })
 
+  test("NODE_TLS_REJECT_UNAUTHORIZED=0 fails an HTTPS request closed before anything is sent", async () => {
+    const r = await rig("current", {
+      transport: {
+        baseUrl: new URL("https://127.0.0.1:1"),
+        env: { NODE_TLS_REJECT_UNAUTHORIZED: "0" },
+      },
+    })
+    const error = await rejection(connect(r))
+    expect([error.code, error.fatal]).toEqual(["unsupported", true])
+    expect(error.message).toContain("NODE_TLS_REJECT_UNAUTHORIZED=0")
+    expect(r.mock.requests).toHaveLength(0)
+  })
+
   test("plain http is accepted only to loopback unless allowed; credentials, queries and fragments are refused", () => {
     const base = {
       token: new MemoryTokenSource(TOKEN),

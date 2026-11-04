@@ -605,13 +605,14 @@ meter at 4 Hz. `[ui] cursor_blink = false` stops the cursor blinking.
 - Before any token leaves the client for a loopback port (the gateway, or Hex), the TUI checks in
   `/proc/net/tcp` and `/proc/net/tcp6` that the listening socket belongs to the expected uid: the
   tenant's uid from the tenant file, `expected_uid`, or your own. A mismatch goes offline with "port N
-  is held by uid U, expected X" before any authenticated request.
+  is held by uid U, expected X" before any authenticated request. Only `localhost` and IP literals are
+  matched; another DNS name fails closed rather than borrowing the owner of an unrelated local port.
 - Plain `http` is accepted only to loopback (127.0.0.0/8, `::1`, `localhost`), unless
   `allow_insecure_http = true` (sticky warning). URLs with credentials, a query or a fragment are refused,
   and so are redirects.
-- Tokens never appear on argv, in URLs, in logs, in error messages or on screen. HTTP proxy variables are
-  neutralized at start. If one is still set, gateway and Hex requests are refused rather than sent
-  through the proxy.
+- Tokens never appear on argv, in URLs, in logs, in error messages or on screen. HTTP proxy variables and
+  `NODE_TLS_REJECT_UNAUTHORIZED` are neutralized at start. If a proxy is still set, gateway and Hex requests
+  are refused rather than sent through it; an HTTPS request is also refused if the TLS-disable variable is `0`.
 - Child processes (`parec`, `pactl`, `wl-paste`, `wl-copy`, `grim`, `slurp`, `notify-send`, `xdg-open`,
   `hex`) are started without a shell, with an argv array and an allowlisted environment. They never get a
   token, the proxy variables or `TRANSCRIBE_DUMP_DIR`. `pactl list short sources` runs only for the parec
