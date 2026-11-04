@@ -88,7 +88,8 @@
 
 ## Phase 3 — Carried Known-Issues from RELEASE-v2.1.3.0.md (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
 
-4. [ ] Fix any issues in CI/CD (if any) - See Pipeline for LATEST MASTER pipeline (you can use gitlab mcp) and see if anything is not GREEN. If there are problems, fix them - always check last dozen or so Work Items for TIPS as to why master pipelines are actually red. Kageho is watching and posting WIs with explanations now usually (fairly frequently)
+4. [x] Fix any issues in CI/CD (if any) - See Pipeline for LATEST MASTER pipeline (you can use gitlab mcp) and see if anything is not GREEN. If there are problems, fix them - always check last dozen or so Work Items for TIPS as to why master pipelines are actually red. Kageho is watching and posting WIs with explanations now usually (fairly frequently)
+    - **DONE 2026-11-04 (Rarity, item-4, branch `rarity/kimi-4-20261104-0600`):** audited the latest `master` pipeline [7154](https://git.lunarwing.org/lunarwing/lunarwing2/-/pipelines/7154) at `ffdfccc850` — **45/45 jobs succeeded**, including all optional worker lanes and the `cargo-deny`, `satellite-advisory-sweep`, and `panic-policy` gates. Reviewed the 15 newest work items; the recent CI report was closed WI#547 (yanked `async-executor` 1.14.0), whose prescribed lockfile/vendor fix is already present. The previous red `master` pipeline 7100 had exactly those two advisory-gate failures plus `panic-policy`; all three are green on 7154, and the two intervening `master` pipelines 7116 and 7139 also succeeded. No current CI/CD failure remains to fix, so this is an evidence-only checkoff with no source or CI configuration change.
 5. [x] (S) (H MR) release alpha of droid and desk repo projs LATER near end of dev cycle
 6. [x] (S) (H MR) prob rm opencode v1 in .1.7.0 and add lunardepth in .1.8.0
 
