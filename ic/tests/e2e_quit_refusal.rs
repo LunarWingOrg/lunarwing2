@@ -214,9 +214,8 @@ mod tests {
         let mut silent_message =
             IncomingMessage::new(channel, USER, "Nothing to add here, stay quiet.");
         if channel == "xmpp" {
-            silent_message = silent_message.with_metadata(
-                serde_json::json!({"chat_type": "group", "xmpp_type": "groupchat"}),
-            );
+            silent_message = silent_message
+                .with_metadata(serde_json::json!({"chat_type": "group", "xmpp_type": "groupchat"}));
         }
         let silent = silent_message.id;
         rig.send_incoming(silent_message).await;
