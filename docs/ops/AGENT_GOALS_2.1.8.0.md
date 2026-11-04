@@ -326,13 +326,13 @@
 33. [x] wingtip - change the binary name to `wingtip` from the generic tui name - see https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/554
     - **DONE 2026-11-04 (SweetieBot, item-33, branch `sweetiebot/kimi-33-20261104-0005`):** WI#554 is implemented. The launcher is now `tui/bin/wingtip`, the package exposes the `wingtip` command, help/version/errors use the new name, and the README documents `bun link` followed by `wingtip`. The package/lockfile name, PulseAudio client and desktop notification name are Wingtip too.
     - Config, state and runtime directories now use `wingtip`; tenant grants use schema `wingtip/tenant-access`, with mt-admin's writer, revocation guidance, tests and operator docs aligned. The `tui-access` operator verb, `tui:<user>` token labels, `tui-<profile>-...` thread IDs and `LUNARWING_TUI_*` environment surface remain unchanged. A repository-wide search finds no retired client-name references.
-    - **Verification:** Bun 1.4.4 `bun install --frozen-lockfile` passed with no changes; `tsc --noEmit` passed; the full Bun suite passed **807/807 tests across 60 files**; real launcher smoke printed `wingtip 0.1.0` and `Usage: wingtip [options]`. `test-mt-admin-tui-access.sh` passed in full; targeted shellcheck and `bash -n` passed; `validate_config.py` validated 8 YAML files; `shell-syntax.sh` validated 281 scripts + 3 hooks; `git diff --check` passed. The host's unsupported Bun 1.3.1 was not used for the final suite or launcher smoke; an isolated Bun 1.4.4 runtime was used and removed afterward.
+    - **Verification:** Bun 1.4.4 `bun install --frozen-lockfile` passed with no changes; `tsc --noEmit` passed; the full Bun suite passed **807/807 tests across 60 files**; real launcher smoke printed `wingtip 0.1.0` and `Usage: wingtip [options]`. `test-mt-admin-tui-access.sh` passed in full; targeted shellcheck and `bash -n` passed; `validate_config.py` validated 8 YAML files; `shell-syntax.sh` validated 281 scripts + 3 hooks; `git diff --check` passed. The host's unsupported Bun 1.3.1 was not used for the final suite or launcher smoke; an isolated Bun 1.4.4 runtime was used and removed afterward
+34. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/557
+35. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/556
+36. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/550 - test with a fresh tenant you will create to test properly on your machine - do not delete the tenant when you are done testing
 
 ## Phase 7 - Advanced Operator Notes
 
-34. [x] (S) Reserved
-35. [x] (S) Reserved
-36. [x] (S) Reserved
 37. [x] (S) NOTE TO RECHECK ALL WIS WITH TAG FOR 2.1.6.0
 38. [x] (H) Revamped LunarWing TUI REPLv3 utilizing OpenTUI, Multimodal input/output, and more
 39. [x] (H) Remaining polish items from massive changes introduced in Tsuno
