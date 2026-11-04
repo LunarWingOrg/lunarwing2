@@ -634,8 +634,10 @@ Commands:
                                    copies GATEWAY_AUTH_TOKEN instead: a stopgap
                                    (full API access, revocable only by
                                    rotate-gateway-token). Prints no token.
-                                   Exit 2: files written but the daemon
-                                   rejected the token
+                                   --expires-in-days is client-enforced before
+                                   M2b; M2b must reject expired tokens and end
+                                   their streams at expiry. Exit 2: files written
+                                   but the daemon rejected the token
   tui-access <name> --for-user <user> --revoke
                                    Remove the user's client token tenant-side
                                    (effective within ~2 s on a daemon with
