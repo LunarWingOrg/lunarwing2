@@ -140,10 +140,9 @@ fn submission_outcome_hint(result: &SubmissionResult) -> Option<TurnOutcome> {
 }
 
 /// DEC-1 guard (TUI design 8.4): `Ok(None)` stops the loop except on channels whose
-/// clients attach to a running service. There, model output that maps to `Ok(None)`
-/// (a V1 `NO_REPLY` reply, V2 `Completed { response: None }`) must not stop the daemon;
-/// the producers themselves are tracked separately. To revert, give `Ok(None)` the
-/// `Shutdown` control in `deliver_message_result` again.
+/// clients attach to a running service. WI#550 maps both model-driven silent outcomes
+/// to the empty-string sentinel instead; this remains a backstop for client channels.
+/// To revert, give `Ok(None)` the `Shutdown` control in `deliver_message_result` again.
 fn none_result_control(channel: &str) -> MessageLoopControl {
     if crate::agent::commands::quit_refusal(channel).is_some() {
         tracing::warn!(
@@ -2302,7 +2301,7 @@ impl Agent {
                 // Suppress silent replies (e.g. from group chat "nothing to say" responses)
                 if crate::llm::is_silent_reply(&content) {
                     tracing::debug!("Suppressing silent reply token");
-                    Ok(None)
+                    Ok(Some(String::new()))
                 } else {
                     Ok(Some(content))
                 }
@@ -2617,7 +2616,7 @@ mod tests {
             rate(&agent, &message, empty).await,
             (true, TurnOutcome::NoReply)
         );
-        // `Ok(None)` is the shutdown signal (and the silent `NO_REPLY` reply).
+        // `Ok(None)` remains the explicit shutdown signal; silent replies use `Some("")`.
         assert_eq!(
             rate(&agent, &message, Ok(None)).await,
             (false, TurnOutcome::NoReply)
