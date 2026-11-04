@@ -53,6 +53,7 @@ How-to guides, build instructions, and setup walkthroughs.
 |------|-------------|
 | [`CONTRIBUTOR-ONBOARDING.md`](guides/CONTRIBUTOR-ONBOARDING.md) | Contributor onboarding: shortest path from clone to merged MR, current freeze status, contribution tiers, review expectations, AI-policy compliance |
 | [`MT-ADMIN-QUICKSTART.md`](guides/MT-ADMIN-QUICKSTART.md) | Init-agnostic multi-tenant provisioning and lifecycle quickstart |
+| [`WINGTIP_GUIDE.md`](guides/WINGTIP_GUIDE.md) | Wingtip terminal client: tenant upgrade, `tui-access` grant, install, first session, rotate and revoke, troubleshooting |
 | [`TENANT-SYSTEM-PROMPTS.md`](guides/TENANT-SYSTEM-PROMPTS.md) | Per-tenant system prompt management: gateway Settings panel, `/api/prompts` routes, Engine V2 initialization snapshot and restart activation (WI#220) |
 | [`CREATE_TENANT_NEW_SCRIPT.md`](guides/CREATE_TENANT_NEW_SCRIPT.md) | Full-featured tenant convenience wrapper |
 | [`TENANT_KNOWLEDGE_SEED.md`](guides/TENANT_KNOWLEDGE_SEED.md) | Seeding a new tenant's knowledge store with the full lw2studymcp study-notes base (`--with-study-mcp` one-shot import) |
