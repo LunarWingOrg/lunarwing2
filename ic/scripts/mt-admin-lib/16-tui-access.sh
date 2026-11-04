@@ -8,7 +8,7 @@
 # `tui-access`: gives a desktop user access to one tenant gateway for the
 # multimodal TUI (tui/) without that user ever reading tenant files. Root
 # writes, AS the desktop user,
-#   ~<user>/.config/lunarwing-tui/tenants/<tenant>.json   (0600, 0700 dirs)
+#   ~<user>/.config/wingtip/tenants/<tenant>.json   (0600, 0700 dirs)
 # with the gateway URL, the tenant uid and the bearer token. The default
 # client-token mode also registers, AS the tenant, only the SHA-256 of a fresh
 # 256-bit token in <state>/gateway-client-tokens.json (0600), which daemons
@@ -600,7 +600,7 @@ _tui_registry_list() {  # <tenant>
 # TUI_DESKTOP_FILE.
 _tui_desktop_config_write() {  # <user> <home> <tenant> <json>
   local user="$1" home="$2" tenant="$3" json="$4" base dir rc=0
-  base="$home/.config/lunarwing-tui"
+  base="$home/.config/wingtip"
   dir="$base/tenants"
   TUI_DESKTOP_FILE="$dir/$tenant.json"
   tenant_mkdir_p "$user" "$dir" || die "could not create $dir as user '$user'"
@@ -615,7 +615,7 @@ _tui_desktop_config_write() {  # <user> <home> <tenant> <json>
 # TUI_DESKTOP_KIND (client|master|unknown, empty when absent).
 _tui_desktop_config_remove() {  # <user> <home> <tenant>
   local user="$1" home="$2" tenant="$3" dir kind
-  dir="$home/.config/lunarwing-tui/tenants"
+  dir="$home/.config/wingtip/tenants"
   TUI_DESKTOP_FILE="$dir/$tenant.json"
   TUI_DESKTOP_RESULT=absent TUI_DESKTOP_KIND=""
   darkirc_path_components_safe "$dir" \
@@ -989,7 +989,7 @@ _tui_access_grant() {  # <tenant> <user> <url_host> <expires_days> <use_master> 
   fi
   # printf -v is a builtin: the token never reaches argv. Every interpolated
   # value was validated as JSON-safe above.
-  printf -v json '{"schema":"lunarwing-tui/tenant-access","version":1,"tenant":"%s","transport":"gateway","url":"%s","tenant_uid":%s,"token":"%s","token_kind":"%s","label":"%s","issued_at":"%s"%s}' \
+  printf -v json '{"schema":"wingtip/tenant-access","version":1,"tenant":"%s","transport":"gateway","url":"%s","tenant_uid":%s,"token":"%s","token_kind":"%s","label":"%s","issued_at":"%s"%s}' \
     "$tenant" "$TUI_GATEWAY_URL" "$tenant_uid" "$token" "$kind" "$label" "$TUI_ISSUED_AT" "$expires_json"
   # The desktop file goes first: on rotation the new token is in place before
   # the old digest disappears, and a refused desktop path leaves the registry
@@ -1057,7 +1057,7 @@ _tui_revoke_report() {  # <tenant> <user> <label> <desktop: checked|no-account|u
       fi
       ;;
     no-account) say "  config:   not checked (no passwd entry for '$user')" ;;
-    *) say "  config:   not checked ($TUI_USER_HOME_ERROR); remove ~$user/.config/lunarwing-tui/tenants/$tenant.json by hand if it still exists" ;;
+    *) say "  config:   not checked ($TUI_USER_HOME_ERROR); remove ~$user/.config/wingtip/tenants/$tenant.json by hand if it still exists" ;;
   esac
   if [[ "$TUI_DESKTOP_KIND" == master ]]; then
     say "WARNING: that desktop config held the master token of tenant '$tenant'; $master_note" >&2
