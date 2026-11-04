@@ -136,7 +136,7 @@ describe("current gateway", () => {
     await r.until(() => r.store.getState().conn.kind === "offline", "offline")
     const conn = r.store.getState().conn
     expect(conn.kind === "offline" && conn.fatal).toBe(true)
-    expect(conn.kind === "offline" ? conn.reason : "").toContain("tui-access derpy --for-user $USER --use-master-token")
+    expect(conn.kind === "offline" ? conn.reason : "").toContain("ask for a new grant, `sudo ic/scripts/lunarwing-mt-admin.sh tui-access derpy --for-user $USER` (with `--use-master-token`")
     expect(r.token.reloads).toBe(1)
   })
 

@@ -148,11 +148,13 @@ describe("tenant selection (3.11.5)", () => {
     expect(noTenantAccessMessage(USER)).toBe(error.message)
   })
 
-  test("the 401 hint for a client token mentions --use-master-token", async () => {
+  test("the 401 hint for a client token asks for a new grant and mentions --use-master-token", async () => {
     const client = authFailureHint("client", { tenant: "derpy", user: USER })
-    expect(client).toContain("this tenant may predate client tokens")
-    expect(client).toContain("sudo ic/scripts/lunarwing-mt-admin.sh tui-access derpy --for-user tester --use-master-token")
-    expect(client).toContain("upgrade-tenant derpy")
+    expect(client).toContain("the client token was not accepted")
+    expect(client).toContain("sudo ic/scripts/lunarwing-mt-admin.sh tui-access derpy --for-user tester")
+    expect(client).toContain("--use-master-token")
+    // Upgrading does not help until a daemon with client-token support exists (M2b).
+    expect(client).not.toContain("upgrade-tenant")
     const master = authFailureHint("master", { tenant: "derpy", user: USER })
     expect(master).toContain("the master token changed")
     expect(master).toContain("--use-master-token")
