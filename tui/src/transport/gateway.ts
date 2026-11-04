@@ -975,10 +975,15 @@ export class GatewayTransport implements Transport {
       if (byteOverflow) buffered = buffered.filter((e) => e.type !== "image_generated")
       buffered = buffered.filter((e) => e.type !== "stream_chunk")
       let bytes = buffered.reduce<number>((total, item) => total + eventMemoryBytes(item), 0)
-      while (buffered.length > 0 && (buffered.length >= EVENT_CHANNEL_CAPACITY || bytes + eventBytes > maxBytes)) {
-        buffered.shift()
-        bytes = buffered.reduce<number>((total, item) => total + eventMemoryBytes(item), 0)
+      let dropCount = 0
+      while (
+        dropCount < buffered.length &&
+        (buffered.length - dropCount >= EVENT_CHANNEL_CAPACITY || bytes + eventBytes > maxBytes)
+      ) {
+        bytes -= eventMemoryBytes(buffered[dropCount])
+        dropCount += 1
       }
+      buffered = buffered.slice(dropCount)
       conn.buffered = buffered
       conn.bufferedBytes = bytes
     }
