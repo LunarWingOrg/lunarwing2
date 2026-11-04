@@ -2,7 +2,7 @@
 
 Wingtip is LunarWing's terminal client with text, push-to-talk dictation and images. It runs on Bun with
 OpenTUI 0.8.1 and React 19 and talks to a tenant's web gateway (HTTP plus SSE, bearer token). The
-design is `/tmp/lw-tui-research/design/DESIGN.md` (sections 3, 5, 6, 7 and 9); this README covers
+design is [`docs/proposals/WINGTIP_DESIGN.md`](../docs/proposals/WINGTIP_DESIGN.md) (sections 3, 5, 6, 7 and 9); this README covers
 what you need in order to use it.
 
 Status: milestones M1a (gateway client, LunarVoice, images, `tui-access`) and M1b (Hex voice sources).
