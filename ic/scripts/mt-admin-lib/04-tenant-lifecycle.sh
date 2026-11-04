@@ -956,6 +956,7 @@ _restart_tenant_daemon() {
 start_tenant() {
   local name="$1"
   TENANT_START_FAILED_WORKERS=()
+  TENANT_START_NOT_ATTEMPTED_WORKERS=()
   name="$(sanitize_name "$name")"
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
 
@@ -1092,12 +1093,36 @@ start_tenant() {
   return "$worker_rc"
 }
 
-# Called with errexit off, outside an ignored-errexit context. Only the explicit
-# image-contract refusal (3) is lane-local; runtime/auth/config failures abort.
+_record_not_attempted_workers() {
+  local name="$1" failed="$2" _w after_failed=false
+  TENANT_START_NOT_ATTEMPTED_WORKERS=()
+  for _w in pebble opencode kimi opencode2; do
+    if [[ "$after_failed" == false ]]; then
+      [[ "$_w" != "$failed" ]] || after_failed=true
+      continue
+    fi
+    if tenant_worker_enabled "$name" "$_w" \
+        && { [[ "$INIT_SYSTEM" != "openrc" ]] || tenant_worker_desired_running "$name" "$_w"; }; then
+      TENANT_START_NOT_ATTEMPTED_WORKERS+=("$_w")
+    fi
+  done
+}
+
+_tenant_worker_start_failure_summary() {
+  printf 'failed worker lanes: %s' "${TENANT_START_FAILED_WORKERS[*]:-unknown}"
+  if [[ "${#TENANT_START_NOT_ATTEMPTED_WORKERS[@]}" -ne 0 ]]; then
+    printf '; not attempted: %s' "${TENANT_START_NOT_ATTEMPTED_WORKERS[*]}"
+  fi
+}
+
+# Called with errexit off, outside an ignored-errexit context. Image-contract
+# refusals (3) and lane-local configuration refusals (4) continue; shared
+# runtime/auth/config failures abort and name the selected lanes not attempted.
 _start_tenant_workers() {
   local name="$1" _w worker_rc
   # Shared with upgrade_tenant_locked's degraded summary; reset on every pass.
   TENANT_START_FAILED_WORKERS=()
+  TENANT_START_NOT_ATTEMPTED_WORKERS=()
 
   # Gate each worker on the tenant's persisted selection (add-tenant --with-*).
   # Without this, start_tenant_<worker> would start every worker whose SHARED
@@ -1111,11 +1136,17 @@ _start_tenant_workers() {
       worker_rc=$?
       if [[ "$worker_rc" -ne 0 ]]; then
         TENANT_START_FAILED_WORKERS+=("$_w")
-        if [[ "$worker_rc" -ne 3 ]]; then
+        if [[ "$worker_rc" -ne 3 && "$worker_rc" -ne 4 ]]; then
+          _record_not_attempted_workers "$name" "$_w"
           warn_err "$_w worker startup failed for $name (status $worker_rc); aborting worker pass"
+          say "WARNING: tenant '$name' startup degraded; $(_tenant_worker_start_failure_summary)" >&2
           return "$worker_rc"
         fi
-        say "WARNING: $_w worker image refused for $name; continuing with later selected lanes" >&2
+        if [[ "$worker_rc" -eq 3 ]]; then
+          say "WARNING: $_w worker image refused for $name; continuing with later selected lanes" >&2
+        else
+          say "WARNING: $_w worker configuration refused for $name; continuing with later selected lanes" >&2
+        fi
       fi
     elif [[ "$INIT_SYSTEM" == "openrc" ]] && tenant_worker_enabled "$name" "$_w"; then
       say "$_w worker intentionally stopped for $name (skipping; use 'start-worker $name $_w')"
@@ -1124,7 +1155,7 @@ _start_tenant_workers() {
     fi
   done
   if [[ "${#TENANT_START_FAILED_WORKERS[@]}" -ne 0 ]]; then
-    say "WARNING: tenant '$name' startup degraded; failed worker lanes: ${TENANT_START_FAILED_WORKERS[*]}" >&2
+    say "WARNING: tenant '$name' startup degraded; $(_tenant_worker_start_failure_summary)" >&2
     return 1
   fi
   return 0
@@ -1901,6 +1932,7 @@ upgrade_tenant_locked() {
 
   local startup_rc=0
   TENANT_START_FAILED_WORKERS=()
+  TENANT_START_NOT_ATTEMPTED_WORKERS=()
   set +e
   start_tenant "$name"
   startup_rc=$?
@@ -1920,7 +1952,7 @@ upgrade_tenant_locked() {
 
   say ""
   if [[ "$startup_rc" -ne 0 ]]; then
-    warn_err "tenant '$name' upgrade incomplete: $before -> $("${tgit[@]}" describe --tags --always 2>/dev/null); startup failed (status $startup_rc); failed worker lanes: ${TENANT_START_FAILED_WORKERS[*]:-unknown}"
+    warn_err "tenant '$name' upgrade incomplete: $before -> $("${tgit[@]}" describe --tags --always 2>/dev/null); startup failed (status $startup_rc); $(_tenant_worker_start_failure_summary)"
     say "target is installed; repair the failed lanes and re-run start-tenant $name; verify with: $0 status $name"
     return "$startup_rc"
   fi
