@@ -299,16 +299,16 @@ transient_push_failure() {
 }
 
 transient_snapshot_failure() {
-    _tsf_status=$1
-    if grep -qE 'Tried to start delayed item http://snapshot\.debian\.org|Failed to fetch http://snapshot\.debian\.org|Some index files failed to download|Unable to fetch some archives' "$push_attempt_log"; then
+    if grep -qE 'Failed to fetch http://snapshot\.debian\.org|Some index files failed to download|Unable to fetch some archives' "$push_attempt_log"; then
         return 0
     fi
     if grep -qE "Temporary failure resolving 'snapshot\.debian\.org'|Could not connect to snapshot\.debian\.org" "$push_attempt_log"; then
         return 0
     fi
-    [ "$_tsf_status" -eq 137 ] &&
-        grep -q 'snapshot\.debian\.org' "$push_attempt_log" &&
-        grep -qE '(^|[[:space:]])RUN([[:space:]]|$)' "$push_attempt_log"
+    # buildctl exits 1 when BuildKit kills a RUN step, while the step's own
+    # trace says "exit code: 137"; match the trace text, not the exit status.
+    grep -q 'did not complete successfully: exit code: 137' "$push_attempt_log" &&
+        grep -q 'snapshot\.debian\.org' "$push_attempt_log"
 }
 
 build_image_with_retry() {
@@ -338,7 +338,7 @@ build_image_with_retry() {
             _bwr_attempt=$((_bwr_attempt + 1))
         elif [ "$_bwr_attempt" -lt "$_bwr_max_attempts" ] &&
             [ "$_bwr_snapshot_attempt" -lt "$_bwr_snapshot_max_attempts" ] &&
-            transient_snapshot_failure "$_bwr_status"; then
+            transient_snapshot_failure; then
             case "$_bwr_snapshot_attempt" in
                 1) _bwr_base=120 ;;
                 *) _bwr_base=300 ;;

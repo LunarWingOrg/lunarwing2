@@ -82,7 +82,12 @@ if mode == "fail_snapshot_killed_once" and count == 1:
     print("#12 [runtime 2/17] RUN apt-get update using snapshot.debian.org", file=sys.stderr)
     print("Killed", file=sys.stderr)
     print("ERROR: failed to solve: process did not complete successfully: exit code: 137", file=sys.stderr)
-    sys.exit(137)
+    sys.exit(1)
+if mode == "fail_compile_after_snapshot_delay_warning":
+    print("#12 [builder 3/13] RUN apt-get update", file=sys.stderr)
+    print("W: Tried to start delayed item http://snapshot.debian.org/archive/debian/20261024T011300Z but failed", file=sys.stderr)
+    print('ERROR: failed to solve: process "/bin/sh -c make" did not complete successfully: exit code: 2', file=sys.stderr)
+    sys.exit(1)
 if mode == "fail_compile":
     print("ERROR: failed to solve: process \\"/bin/sh -c make\\" did not complete successfully: exit code: 2", file=sys.stderr)
     sys.exit(1)
@@ -243,14 +248,27 @@ for index, argument in enumerate(args):
         self.assertEqual(self.recorded_sleeps(), [122])
 
     def test_snapshot_sigkill_during_apt_run_is_retried(self):
-        # Pipeline 7174's 137 trace names the snapshot RUN step but need not
-        # contain apt's delayed-item warning, so this pins the 137 classifier.
+        # Pipeline 7174's trace names the snapshot RUN step with "exit code:
+        # 137" but buildctl itself exits 1, so the stub exits 1 and the
+        # classifier must match the trace text, not the exit status.
         self.env["BUILDCTL_MODE"] = "fail_snapshot_killed_once"
         result = self.run_build()
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.log.read_text().splitlines()
         self.assertEqual(len(calls), 3)
         self.assertIn("transient snapshot.debian.org failure (attempt 1/3)", result.stderr)
+
+    def test_snapshot_delay_warning_alone_is_not_retried(self):
+        # apt prints "W: Tried to start delayed item … snapshot.debian.org"
+        # while merely slow, even on a step that later succeeds; that warning
+        # must not turn a later genuine failure into a snapshot retry.
+        self.env["BUILDCTL_MODE"] = "fail_compile_after_snapshot_delay_warning"
+        result = self.run_build()
+        self.assertNotEqual(result.returncode, 0)
+        calls = self.log.read_text().splitlines()
+        self.assertEqual(len(calls), 1)
+        self.assertIn("not retrying", result.stderr)
+        self.assertNotIn("transient snapshot.debian.org", result.stderr)
 
     def test_persistent_snapshot_failure_exhausts_own_budget(self):
         self.env["BUILDCTL_MODE"] = "fail_snapshot_always"
