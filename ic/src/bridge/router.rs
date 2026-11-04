@@ -151,7 +151,7 @@ fn engine_conversation_key(message: &IncomingMessage) -> String {
 /// sentinel, which the outbound handler suppresses and which is never written to
 /// v1 compatibility history. `GatePaused` returns `None` because the caller drives
 /// its channel status side effects separately.
-fn thread_outcome_response(outcome: &ThreadOutcome) -> Option<String> {
+pub(crate) fn thread_outcome_response(outcome: &ThreadOutcome) -> Option<String> {
     match outcome {
         ThreadOutcome::Completed { response } => Some(response.clone().unwrap_or_default()),
         ThreadOutcome::Stopped => Some(String::new()),
