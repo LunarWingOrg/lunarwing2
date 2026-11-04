@@ -1,20 +1,25 @@
 /**
  * Bounded single-consumer event queue between a transport's reader and the supervisor (design 3.7).
  *
- * - At most `capacity` (10 000) queued events. On overflow the queued `turn.delta` items are dropped (the final
- *   text is canonical and history can be resynced) and one `resync.required{overflow}` is queued; if the queue is
- *   still full of other events the oldest one makes room for that marker and the newest event is dropped.
+ * - At most `capacity` (10 000) queued events and `maxBytes` (64 MiB by default) of retained event data. On count
+ *   overflow the queued `turn.delta` items are dropped; on byte overflow queued images are dropped first. One
+ *   `resync.required{overflow}` is queued; if necessary the oldest non-marker makes room for that marker, and the
+ *   newest event is dropped when it still does not fit.
  * - `fail(error)`: the consumer still receives every queued event, then its next() throws `error` (the supervisor
  *   treats that as a connection loss). `close()`: the consumer drains and then ends normally.
  * - A consumer that stops iterating (break/return) ends the channel and runs `onReturn` (the transport aborts its
  *   reader).
  */
+import { eventMemoryBytes } from "./event-memory.ts"
 import type { TransportEvent } from "./types.ts"
 
 export const EVENT_CHANNEL_CAPACITY = 10_000
+export const EVENT_CHANNEL_MAX_BYTES = 64 * 1024 * 1024
 
 export interface EventChannelOptions {
   capacity?: number
+  /** Aggregate estimated bytes retained by queued events (images included). */
+  maxBytes?: number
   /** Called once when the consumer stops iterating early. */
   onReturn?: () => void
 }
@@ -26,9 +31,11 @@ type Waiter = {
 
 export class EventChannel implements AsyncIterable<TransportEvent> {
   private readonly capacity: number
+  private readonly maxBytes: number
   private readonly onReturn: (() => void) | undefined
   private queue: TransportEvent[] = []
   private head = 0
+  private queuedBytes = 0
   private waiter: Waiter | null = null
   private state: "open" | "closed" | "failed" | "done" = "open"
   private failure: unknown = null
@@ -39,6 +46,7 @@ export class EventChannel implements AsyncIterable<TransportEvent> {
 
   constructor(opts: EventChannelOptions = {}) {
     this.capacity = Math.max(1, opts.capacity ?? EVENT_CHANNEL_CAPACITY)
+    this.maxBytes = Math.max(1, opts.maxBytes ?? EVENT_CHANNEL_MAX_BYTES)
     this.onReturn = opts.onReturn
   }
 
@@ -52,11 +60,14 @@ export class EventChannel implements AsyncIterable<TransportEvent> {
       waiter.resolve({ value: event, done: false })
       return true
     }
-    if (this.size >= this.capacity && !this.makeRoom()) {
+    const bytes = eventMemoryBytes(event)
+    const overflow = this.size >= this.capacity || this.queuedBytes + bytes > this.maxBytes
+    if (overflow && !this.makeRoom(bytes)) {
       this.droppedCount += 1
       return false
     }
     this.queue.push(event)
+    this.queuedBytes += bytes
     return true
   }
 
@@ -81,6 +92,8 @@ export class EventChannel implements AsyncIterable<TransportEvent> {
       const event = this.queue[i]
       if (event !== undefined && predicate(event)) {
         this.queue.splice(i, 1)
+        this.queuedBytes -= eventMemoryBytes(event)
+        if (event === this.overflowMarker) this.overflowMarker = null
         return event
       }
     }
@@ -92,12 +105,17 @@ export class EventChannel implements AsyncIterable<TransportEvent> {
     return this.queue.length - this.head
   }
 
+  /** Estimated bytes retained by queued, undelivered events. */
+  get bytes(): number {
+    return this.queuedBytes
+  }
+
   /** Events handed to the consumer so far. */
   get delivered(): number {
     return this.deliveredCount
   }
 
-  /** Events dropped because the queue was full (deltas dropped on overflow included). */
+  /** Events dropped because the count or byte budget was exceeded. */
   get dropped(): number {
     return this.droppedCount
   }
@@ -145,26 +163,54 @@ export class EventChannel implements AsyncIterable<TransportEvent> {
       this.head = 0
     }
     if (event === this.overflowMarker) this.overflowMarker = null
-    if (event !== undefined) this.deliveredCount += 1
+    if (event !== undefined) {
+      this.queuedBytes -= eventMemoryBytes(event)
+      this.deliveredCount += 1
+    }
     return event
   }
 
-  /** Overflow policy; true when the incoming event now fits. */
-  private makeRoom(): boolean {
-    const before = this.size
-    this.queue = this.queue.slice(this.head).filter((event) => event.kind !== "turn.delta")
+  private recountBytes(): void {
+    this.queuedBytes = this.queue.slice(this.head).reduce<number>((total, event) => total + eventMemoryBytes(event), 0)
+  }
+
+  private dropEvents(predicate: (event: TransportEvent) => boolean): void {
+    const queued = this.queue.slice(this.head)
+    const kept = queued.filter((event) => !predicate(event))
+    this.droppedCount += queued.length - kept.length
+    this.queue = kept
     this.head = 0
-    this.droppedCount += before - this.queue.length
-    if (this.overflowMarker === null) {
-      if (this.size >= this.capacity) {
-        this.queue.shift()
-        this.droppedCount += 1
-      }
-      const marker: TransportEvent = { kind: "resync.required", reason: "overflow" }
-      this.overflowMarker = marker
-      this.queue.push(marker)
+    this.recountBytes()
+  }
+
+  private dropOldest(): boolean {
+    const index = this.queue.findIndex((event, i) => i >= this.head && event !== this.overflowMarker)
+    if (index < 0) return false
+    this.queue.splice(index, 1)
+    this.droppedCount += 1
+    this.recountBytes()
+    return true
+  }
+
+  /** Overflow policy; true when the incoming event now fits. */
+  private makeRoom(incomingBytes: number): boolean {
+    if (this.queuedBytes + incomingBytes > this.maxBytes) {
+      this.dropEvents((event) => event.kind === "turn.image")
     }
-    return this.size < this.capacity
+    this.dropEvents((event) => event.kind === "turn.delta")
+    if (this.overflowMarker === null) {
+      const marker: TransportEvent = { kind: "resync.required", reason: "overflow" }
+      const markerBytes = eventMemoryBytes(marker)
+      while (this.size >= this.capacity || this.queuedBytes + markerBytes > this.maxBytes) {
+        if (!this.dropOldest()) break
+      }
+      if (this.size < this.capacity && this.queuedBytes + markerBytes <= this.maxBytes) {
+        this.overflowMarker = marker
+        this.queue.push(marker)
+        this.queuedBytes += markerBytes
+      }
+    }
+    return this.size < this.capacity && this.queuedBytes + incomingBytes <= this.maxBytes
   }
 
   private settleWaiter(): void {
@@ -185,6 +231,7 @@ export class EventChannel implements AsyncIterable<TransportEvent> {
     this.state = "done"
     this.queue = []
     this.head = 0
+    this.queuedBytes = 0
     const waiter = this.waiter
     this.waiter = null
     waiter?.resolve({ value: undefined, done: true })

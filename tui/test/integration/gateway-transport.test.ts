@@ -586,6 +586,23 @@ describe("events() bounds (EventChannel, 3.7)", () => {
     expect(await drain(channel)).toEqual([activity("b"), activity("c"), { kind: "resync.required", reason: "overflow" }])
   })
 
+  test("byte overflow drops queued images first, stays under budget and emits a resync", async () => {
+    const image = (size: number): TransportEvent => ({
+      kind: "turn.image",
+      turnId: TURN,
+      image: { mime: "image/png", bytes: new Uint8Array(size) },
+    })
+    const channel = new EventChannel({ capacity: 100, maxBytes: 4096 })
+    expect(channel.push(image(2000))).toBe(true)
+    expect(channel.push(activity("keep"))).toBe(true)
+    expect(channel.push(image(2000))).toBe(true)
+    expect(channel.dropped).toBe(1)
+    expect(channel.bytes).toBeLessThanOrEqual(4096)
+    channel.close()
+    expect(await drain(channel)).toEqual([activity("keep"), { kind: "resync.required", reason: "overflow" }, image(2000)])
+    expect(channel.bytes).toBe(0)
+  })
+
   test("a waiting consumer receives events directly; there is a single consumer; an early return runs onReturn", async () => {
     let returned = 0
     const channel = new EventChannel({ onReturn: () => (returned += 1) })
