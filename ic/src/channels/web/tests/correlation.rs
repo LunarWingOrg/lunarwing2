@@ -439,7 +439,7 @@ fn status_sse_event_matches_previous_inline_mapping() {
             "{variant}"
         );
     }
-    assert_eq!(covered.len(), 16, "one case per StatusUpdate variant");
+    assert_eq!(covered.len(), 17, "one case per StatusUpdate variant");
 
     // Without a thread id, thread-scoped events simply omit the field.
     let event = status_sse_event(StatusUpdate::Thinking("x".into()), None);
