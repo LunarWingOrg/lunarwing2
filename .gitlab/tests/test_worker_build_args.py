@@ -75,8 +75,7 @@ if mode == "fail_always" or (mode == "fail_once" and count == 1):
     sys.exit(1)
 if mode == "fail_snapshot_always" or (mode == "fail_snapshot_once" and count == 1):
     print("#12 [builder 3/13] RUN apt-get update && apt-get install", file=sys.stderr)
-    print("W: Tried to start delayed item http://snapshot.debian.org/archive/debian/20261024T011300Z but failed", file=sys.stderr)
-    print("E: Unable to fetch some archives, maybe run apt-get update or try with --fix-missing?", file=sys.stderr)
+    print("E: Failed to fetch https://snapshot.debian.org/archive/debian/20261024T011300Z/pool/example.deb  504  Gateway Timeout", file=sys.stderr)
     sys.exit(1)
 if mode == "fail_snapshot_killed_once" and count == 1:
     print("#12 [runtime 2/17] RUN apt-get update", file=sys.stderr)
@@ -344,6 +343,8 @@ for index, argument in enumerate(args):
                 ]
                 self.assertEqual(len(apt_lines), 6)
                 for line in apt_lines:
+                    self.assertIn("Acquire::Retries=0", line)
+                    self.assertIn("Acquire::https::Timeout=60", line)
                     if " update" in line:
                         self.assertIn("timeout -k 30 240 apt-get -o ", line)
                     elif " install" in line:
