@@ -1102,7 +1102,7 @@ class BunImageTieTests(unittest.TestCase):
         }
         self.merged = {
             ".worker-candidate": {"image": "docker.io/moby/buildkit:v0.34.1-rootless@sha256:f68752a5a94acfcdad2d07867b7075601a421638e17fc5f28efc1c814d0c4f89"},
-            ".worker-scan": {"image": "docker.io/aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969"},
+            ".worker-scan": {"image": "docker.io/aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c"},
             ".worker-promotion": {"image": "docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"},
             "rust-test-postgres-integration": {
                 "services": [{"name": f"docker.io/pgvector/pgvector:pg16@sha256:{self.OTHER_DIGEST}"}],
@@ -1233,7 +1233,7 @@ class NodeImageTieTests(unittest.TestCase):
         }
         self.merged = {
             ".worker-candidate": {"image": "docker.io/moby/buildkit:v0.34.1-rootless@sha256:f68752a5a94acfcdad2d07867b7075601a421638e17fc5f28efc1c814d0c4f89"},
-            ".worker-scan": {"image": "docker.io/aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969"},
+            ".worker-scan": {"image": "docker.io/aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c"},
             ".worker-promotion": {"image": "docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"},
             "rust-test-postgres-integration": {
                 "services": [{"name": f"docker.io/pgvector/pgvector:pg16@sha256:{self.OTHER_DIGEST}"}],
@@ -1378,7 +1378,7 @@ class DebianSnapshotTieTests(unittest.TestCase):
         }
         self.merged = {
             ".worker-candidate": {"image": "docker.io/moby/buildkit:v0.34.1-rootless@sha256:f68752a5a94acfcdad2d07867b7075601a421638e17fc5f28efc1c814d0c4f89"},
-            ".worker-scan": {"image": "docker.io/aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969"},
+            ".worker-scan": {"image": "docker.io/aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c"},
             ".worker-promotion": {"image": "docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"},
             "rust-test-postgres-integration": {
                 "services": [{"name": f"docker.io/pgvector/pgvector:pg16@sha256:{self.OTHER_DIGEST}"}],
@@ -3517,7 +3517,7 @@ class TrivyGateInputTests(unittest.TestCase):
             "after_script": ["cp clean.json worker-vulnerabilities.json"],
             "allow_failure": True,
             "variables": {"PATH": "$CI_PROJECT_DIR/fakebin:/usr/bin:/bin"},
-            "image": {"name": "docker.io/aquasec/trivy:0.74.0@sha256:" + "0" * 64, "entrypoint": [""]},
+            "image": {"name": "docker.io/aquasec/trivy:0.76.1@sha256:" + "0" * 64, "entrypoint": [""]},
             "timeout": "1h",
         }
         for key, value in overrides.items():
@@ -3531,7 +3531,7 @@ class TrivyGateInputTests(unittest.TestCase):
 
     def test_scan_job_image_override_is_caught_by_value(self):
         merged = copy.deepcopy(self.merged)
-        merged["worker-kimi-scan"]["image"] = {"name": "docker.io/aquasec/trivy:0.74.0@sha256:" + "0" * 64, "entrypoint": [""]}
+        merged["worker-kimi-scan"]["image"] = {"name": "docker.io/aquasec/trivy:0.76.1@sha256:" + "0" * 64, "entrypoint": [""]}
         self.assertTrue(any("worker-kimi-scan image must be exactly" in error for error in self.errors(merged)))
 
     def test_scan_retry_pin_is_enforced(self):
