@@ -470,9 +470,7 @@ fn log_output_budget_retry(
 fn add_usage(base: &mut TokenUsage, extra: TokenUsage) {
     base.input_tokens = base.input_tokens.saturating_add(extra.input_tokens);
     base.output_tokens = base.output_tokens.saturating_add(extra.output_tokens);
-    base.reasoning_tokens = base
-        .reasoning_tokens
-        .saturating_add(extra.reasoning_tokens);
+    base.reasoning_tokens = base.reasoning_tokens.saturating_add(extra.reasoning_tokens);
     base.cache_read_tokens = base
         .cache_read_tokens
         .saturating_add(extra.cache_read_tokens);
@@ -789,7 +787,7 @@ mod tests {
                     discarded_usage: Some(TokenUsage {
                         input_tokens: 2000,
                         output_tokens: 0,
-                    reasoning_tokens: 0,
+                        reasoning_tokens: 0,
                         cache_read_tokens: 300,
                         cache_write_tokens: 50,
                         cost_usd: 0.0,
