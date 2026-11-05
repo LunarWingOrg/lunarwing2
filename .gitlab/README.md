@@ -299,25 +299,27 @@ not a dropped fetch).
 
 Root cause: the worker images install every Debian package from the pinned
 `snapshot.debian.org` archive — the same best-effort, throttled service the
-`worker-kimi-ts` lane provisions from — but the Dockerfile `apt-get` calls
-carried no retry options, so a single dropped fetch failed a multi-hour
-candidate. Since 2026-10-19 every `apt-get update`/`apt-get install` in all
-four worker Dockerfiles (kimi, opencode, opencode2, pebble) runs with
-`Acquire::Retries=5`/`Acquire::http::Timeout=60`, the same options the lane
-has used since the HE-4/HN-8 hardening. Since 2026-11-05, `timeout -k 30 240`
-bounds each update and `timeout -k 30 600` bounds each install (the
-`WITH_TOOLCHAINS` install gets 1800 s — its package set is far larger), so a
-hung apt run exits 124 — or is KILLed 30 s after it ignores TERM — instead of
-waiting for the runner to kill the job. The image-build wrapper gives
-classified snapshot failures and these timeouts a separate three-attempt
-ladder with 120/300-second delays plus job-id-based jitter. A 137 or 124 kill
-is in this class only when the quoted process command itself names the
-snapshot host (BuildKit escapes the command's inner double quotes as `\"`, and
-the matcher handles them); an unrelated compile-step 137 is not retried
-(WI#559). Package-resolution and other genuine build failures still exit on
-the first attempt. Publication jobs keep `retry: 0`. A full snapshot outage
-still fails after the third attempt or the applicable time limit until the
-service recovers (retry the job).
+`worker-kimi-ts` lane provisions from. The Dockerfile `apt-get` calls
+originally carried no retry options, so a single dropped fetch failed a
+multi-hour candidate; the later `Acquire::Retries=5` mitigation made transient
+recovery better but matched CVE-2026-109518's required non-zero retry
+condition. WI#561 moved every source to HTTPS and set `Acquire::Retries=0`
+with `Acquire::https::Timeout=60`, retiring APT's automatic per-fetch retries.
+The bounded outer ladders remain: `timeout -k 30 240` bounds each update and
+`timeout -k 30 600` bounds each install (the `WITH_TOOLCHAINS` install gets
+1800 s — its package set is far larger), so a hung apt run exits 124 — or is
+KILLed 30 s after it ignores TERM — instead of waiting for the runner to kill
+the job. The image-build wrapper gives classified HTTP or HTTPS snapshot
+failures and these timeouts a separate three-attempt ladder with
+120/300-second delays plus job-id-based jitter. A 137 or 124 kill is in this
+class only when the quoted process command itself names the snapshot host
+(BuildKit escapes the command's inner double quotes as `\"`, and the matcher
+handles them); an unrelated compile-step 137 is not retried (WI#559).
+Package-resolution and other genuine build failures still exit on the first
+attempt. Publication jobs keep `retry: 0`. A full snapshot outage still fails
+after the third attempt or the applicable time limit until the service
+recovers (retry the job). Direct mt-admin builds have no outer ladder and fail
+fast on the first transient fetch; rerun the build when the archive recovers.
 
 ## worker scan transient kills (exit 137)
 
@@ -365,18 +367,20 @@ host's concurrent builds before retrying manually.
   lacks python3 and the entrypoint config tests bash-run `entrypoint.sh`,
   whose config section embeds python3 heredocs — from the pinned
   `CI_DEBIAN_SNAPSHOT` archive (tied to the Dockerfile `ARG DEBIAN_SNAPSHOT`
-  by `validate_config.py`), not the live deb.debian.org mirror. That archive
-  is a best-effort, throttled service, so the lane's `apt-get update` and
-  `apt-get install` both run with
-  `Acquire::Retries=5`/`Acquire::http::Timeout=60`. Since 2026-11-05,
+  by `validate_config.py`), not the live deb.debian.org mirror. WI#561 moved
+  the source to HTTPS and the lane installs `apt` as well as `python3`, so the
+  fixed client from the pinned snapshot replaces the base image's client.
+  Both APT calls use `Acquire::Retries=0`/`Acquire::https::Timeout=60`;
+  automatic per-fetch retries stay off (CVE-2026-109518).
   `ci-apt-with-retry.sh` bounds them at 240/600 seconds respectively
   (`timeout -k 30`, so a stalled apt is KILLed 30 s after it ignores TERM)
-  and gives classified snapshot failures and timeout exit 124 three attempts
-  with 120/300-second delays plus job-id-based jitter (pipeline 7193,
-  job 157425). The conservative timeout-plus-backoff total is 2998 seconds,
-  below the 1 h runner cap. Permanent package failures still exit on the
-  first attempt; a full snapshot outage fails after the third attempt or the
-  applicable time limit until the service recovers (retry the job).
+  and gives classified HTTP or HTTPS snapshot failures and timeout exit 124
+  three attempts with 120/300-second delays plus job-id-based jitter
+  (pipeline 7193, job 157425). The conservative timeout-plus-backoff total is
+  2998 seconds, below the 1 h runner cap. Permanent package failures still
+  exit on the first attempt; a full snapshot outage fails after the third
+  attempt or the applicable time limit until the service recovers (retry the
+  job).
   Runs on every MR/branch
   push and protected release tag on the digest-pinned `CI_NODE_IMAGE`, which
   `validate_config.py` ties to the node FROM digest(s) in
