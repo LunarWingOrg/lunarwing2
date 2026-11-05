@@ -85,6 +85,18 @@ These are upstream/network/keyless-discovery results only. They are not treated
 as proof that LunarWing can activate the servers or that the tenant agent can
 execute the tools.
 
+Narrow direct calls then established these upstream baselines:
+
+- Exa `web_search_exa` returned a result from
+  `https://modelcontextprotocol.io/llms.txt` for a one-result search.
+- Context7 `resolve-library-id` resolved Next.js to `/vercel/next.js` with
+  source metadata and available versions.
+- CoinGecko `execute` ran the documented `client.simple.price.get` request for
+  Bitcoin in USD but returned `isError: true` with `Error: 429 Throttled`.
+  Discovery therefore works, while the keyless shared execution quota was
+  exhausted at this attempt. A later agent attempt is still required; this is
+  not classified as a LunarWing transport failure.
+
 ### Brave Search — direct package preflight
 
 The pinned package was installed under the tenant account with npm lifecycle
