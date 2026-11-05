@@ -2270,6 +2270,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocking_completion_preserves_reasoning_and_token_usage() {
+        let mut response = blocking_response_with_wire_finish(Some("stop"));
+        response.choice = OneOrMany::many(vec![
+            AssistantContent::Reasoning(rig_core::message::Reasoning::new("considering")),
+            AssistantContent::text("hello"),
+        ])
+        .expect("blocking reasoning fixture should be non-empty");
+        response.usage.reasoning_tokens = 2;
+        let model = ScriptedCompletionModel::with_blocking_response(response);
+        let adapter = RigAdapter::new(model, "test-model");
+
+        let output = adapter
+            .complete(CompletionRequest::new(vec![ChatMessage::user("hi")]))
+            .await
+            .expect("blocking completion should succeed");
+
+        assert_eq!(output.content, "hello");
+        assert_eq!(output.reasoning.as_deref(), Some("considering"));
+        assert_eq!(output.reasoning_tokens, 2);
+    }
+
+    #[tokio::test]
     async fn blocking_tool_completion_carries_provider_finish_reason() {
         let model = ScriptedCompletionModel::with_blocking_response(
             blocking_response_with_wire_finish(Some("length")),
