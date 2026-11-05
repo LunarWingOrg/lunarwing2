@@ -56,7 +56,7 @@ describe("sanitizeText (3.12.5)", () => {
   test("OSC and DCS terminator handling matches OpenTUI", () => {
     expect(sanitizeText(`${ESC}]0;title${ESC}\\after`)).toBe("after")
     expect(sanitizeText(`${ESC}]0;title\u009cafter`)).toBe("after")
-    expect(sanitizeText(`before ${ESC}Ppayload${BEL}after`)).toBe("before […escape sequence removed]")
+    expect(sanitizeText(`before ${ESC}Ppayload${BEL}after`)).toBe("before after")
   })
 
   test("bidi embedding, override and isolate controls are removed", () => {

@@ -27,10 +27,10 @@ const BEL = 0x07
 const ST = 0x9c
 const REMOVED_TO_END = "[…escape sequence removed]"
 
-function stringSequenceEnd(text: string, start: number, osc: boolean): number {
+function stringSequenceEnd(text: string, start: number): number {
   for (let i = start; i < text.length; i += 1) {
     const code = text.charCodeAt(i)
-    if ((osc && code === BEL) || code === ST) return i + 1
+    if (code === BEL || code === ST) return i + 1
     if (code === ESC && text.charCodeAt(i + 1) === 0x5c) return i + 2
   }
   return -1
@@ -45,8 +45,7 @@ function hasUnterminatedStringSequence(text: string): boolean {
     const escaped =
       first === ESC && (second === 0x50 || second === 0x58 || second === 0x5d || second === 0x5e || second === 0x5f)
     if (!c1 && !escaped) continue
-    const osc = first === 0x9d || (first === ESC && second === 0x5d)
-    const end = stringSequenceEnd(text, i + (escaped ? 2 : 1), osc)
+    const end = stringSequenceEnd(text, i + (escaped ? 2 : 1))
     if (end < 0) return true
     i = end - 1
   }
