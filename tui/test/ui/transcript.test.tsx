@@ -80,6 +80,35 @@ describe("turn labels", () => {
 })
 
 describe("speaker gutter", () => {
+  test("live reasoning is one updating multiline block, separate from the answer and hidden after completion", async () => {
+    app = await renderApp({ width: 100, height: 30 })
+    await app.type("think carefully")
+    await app.enter()
+    const id = turnId("t-1")
+    await app.emit({ kind: "turn.reasoning", turnId: id, text: "previous snapshot" })
+    expect(await app.render()).toContain("reasoning: previous snapshot")
+    await app.emit(
+      { kind: "turn.activity", turnId: id, activity: { kind: "tool_started", text: "http" } },
+      { kind: "turn.reasoning", turnId: id, text: "updated snapshot\nlatest tail" },
+    )
+    const frame = await app.render()
+    expect(frame).not.toContain("previous snapshot")
+    expect(frame.match(/reasoning:/g)).toHaveLength(1)
+    expect(frame).toContain("reasoning: updated snapshot")
+    expect(frame).toMatch(/\n +latest tail/)
+    expect(frame).toContain(": http")
+    expect(frame).not.toContain("lunarwing ▏")
+    await app.emit(
+      { kind: "turn.final", turnId: id, text: "final answer" },
+      { kind: "turn.finished", turnId: id, outcome: "replied" },
+      { kind: "turn.reasoning", turnId: id, text: "late snapshot" },
+    )
+    const done = await app.render()
+    expect(done).toContain("lunarwing ▏ final answer")
+    expect(done).not.toContain("reasoning:")
+    expect(done).not.toContain("late snapshot")
+  })
+
   test("continuation lines of a multi-line or wrapped message start under the text, not at column 0", async () => {
     const transport = new FakeTransport()
     app = await renderApp({ transport, width: 60, height: 30 })

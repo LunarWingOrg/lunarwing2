@@ -7,12 +7,14 @@ use crate::llm::config::CacheRetention;
 use async_trait::async_trait;
 use futures::StreamExt;
 use rig_core::OneOrMany;
+#[cfg(test)]
+use rig_core::completion::Usage as RigUsage;
 use rig_core::completion::{
     AssistantContent, CompletionModel, CompletionRequest as RigRequest, GetTokenUsage,
-    ToolDefinition as RigToolDefinition, Usage as RigUsage,
+    ToolDefinition as RigToolDefinition,
 };
 use rig_core::message::{
-    DocumentSourceKind, Image, ImageMediaType, Message as RigMessage, MimeType,
+    DocumentSourceKind, Image, ImageMediaType, Message as RigMessage, MimeType, ReasoningContent,
     ToolChoice as RigToolChoice, ToolFunction, ToolResult as RigToolResult, ToolResultContent,
     UserContent,
 };
@@ -410,54 +412,77 @@ fn extract_finish_reason<T: Serialize>(raw: &T) -> Option<FinishReason> {
         .map(FinishReason::from_stream_reason)
 }
 
-/// Extract text and tool calls from a rig-core completion response.
-///
-/// `raw_finish` is the provider-reported finish reason from
-/// [`extract_finish_reason`]. Tool calls present in the content are ground
-/// truth and always yield [`FinishReason::ToolUse`]; otherwise the provider's
-/// value is carried verbatim, or [`FinishReason::Unknown`] when the provider
-/// said nothing (WI#292 — finish is no longer synthesized from content shape).
+fn displayable_reasoning(reasoning: &rig_core::message::Reasoning) -> String {
+    reasoning
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            ReasoningContent::Text { text, .. } => Some(text.as_str()),
+            ReasoningContent::Summary(summary) => Some(summary.as_str()),
+            ReasoningContent::Encrypted(_) | ReasoningContent::Redacted { .. } => None,
+            _ => None,
+        })
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+struct ExtractedResponse {
+    text: Option<String>,
+    reasoning: Option<String>,
+    tool_calls: Vec<IronToolCall>,
+    finish: FinishReason,
+}
+
+/// Extract text, displayable reasoning and tool calls from a rig-core response.
+/// Encrypted and redacted reasoning payloads remain opaque and are not displayed.
 fn extract_response(
     choice: &OneOrMany<AssistantContent>,
-    _usage: &RigUsage,
     raw_finish: Option<FinishReason>,
-) -> (Option<String>, Vec<IronToolCall>, FinishReason) {
-    let mut text_parts: Vec<String> = Vec::new();
-    let mut tool_calls: Vec<IronToolCall> = Vec::new();
+) -> ExtractedResponse {
+    let mut text_parts = Vec::new();
+    let mut reasoning_parts = Vec::new();
+    let mut tool_calls = Vec::new();
 
     for content in choice.iter() {
         match content {
-            AssistantContent::Text(t) => {
-                if !t.text.is_empty() {
-                    text_parts.push(t.text.clone());
+            AssistantContent::Text(text) if !text.text.is_empty() => {
+                text_parts.push(text.text.clone());
+            }
+            AssistantContent::Reasoning(reasoning) => {
+                let text = displayable_reasoning(reasoning);
+                if !text.is_empty() {
+                    reasoning_parts.push(text);
                 }
             }
-            AssistantContent::ToolCall(tc) => {
+            AssistantContent::ToolCall(call) => {
                 tool_calls.push(IronToolCall {
-                    id: tc.id.clone(),
-                    name: tc.function.name.clone(),
-                    arguments: tc.function.arguments.clone(),
+                    id: call.id.clone(),
+                    name: call.function.name.clone(),
+                    arguments: call.function.arguments.clone(),
                     reasoning: None,
                 });
             }
-            // Reasoning and Image variants are not mapped to LunarWing types
             _ => {}
         }
     }
 
-    let text = if text_parts.is_empty() {
-        None
-    } else {
-        Some(text_parts.join(""))
-    };
-
+    let reasoning = (!reasoning_parts.is_empty()).then(|| reasoning_parts.join("\n"));
+    for call in &mut tool_calls {
+        call.reasoning = reasoning.clone();
+    }
     let finish = if !tool_calls.is_empty() {
         FinishReason::ToolUse
     } else {
         raw_finish.unwrap_or(FinishReason::Unknown)
     };
 
-    (text, tool_calls, finish)
+    ExtractedResponse {
+        text: (!text_parts.is_empty()).then(|| text_parts.join("")),
+        reasoning,
+        tool_calls,
+        finish,
+    }
 }
 
 /// Saturate u64 to u32 for token counts.
@@ -640,6 +665,7 @@ where
         let usage = raw_usage.has_values().then(|| TokenUsage {
             input_tokens: saturate_u32(raw_usage.input_tokens),
             output_tokens: saturate_u32(raw_usage.output_tokens),
+            reasoning_tokens: saturate_u32(raw_usage.reasoning_tokens),
             cache_read_input_tokens: saturate_u32(raw_usage.cached_input_tokens),
             cache_creation_input_tokens: saturate_u32(raw_usage.cache_creation_input_tokens),
         });
@@ -675,8 +701,19 @@ where
             Some(Ok(StreamedAssistantContent::Text(text))) if !text.text.is_empty() => {
                 Ok(LlmStreamChunk::TextDelta(text.text))
             }
+            Some(Ok(StreamedAssistantContent::Reasoning(reasoning))) => {
+                let text = displayable_reasoning(&reasoning);
+                if text.is_empty() {
+                    continue;
+                }
+                Ok(LlmStreamChunk::ReasoningDelta(text))
+            }
+            Some(Ok(StreamedAssistantContent::ReasoningDelta { reasoning, .. }))
+                if !reasoning.is_empty() =>
+            {
+                Ok(LlmStreamChunk::ReasoningDelta(reasoning))
+            }
             Some(Ok(StreamedAssistantContent::Text(_)))
-            | Some(Ok(StreamedAssistantContent::Reasoning(_)))
             | Some(Ok(StreamedAssistantContent::ReasoningDelta { .. }))
             | Some(Ok(StreamedAssistantContent::Unknown(_))) => continue,
             Some(Ok(StreamedAssistantContent::ToolCallDelta {
@@ -765,17 +802,18 @@ where
                     reason: e.to_string(),
                 })?;
 
-        let (text, _tool_calls, finish) = extract_response(
+        let extracted = extract_response(
             &response.choice,
-            &response.usage,
             extract_finish_reason(&response.raw_response),
         );
 
         let resp = CompletionResponse {
-            content: text.unwrap_or_default(),
+            content: extracted.text.unwrap_or_default(),
+            reasoning: extracted.reasoning,
             input_tokens: saturate_u32(response.usage.input_tokens),
             output_tokens: saturate_u32(response.usage.output_tokens),
-            finish_reason: finish,
+            reasoning_tokens: saturate_u32(response.usage.reasoning_tokens),
+            finish_reason: extracted.finish,
             cache_read_input_tokens: saturate_u32(response.usage.cached_input_tokens),
             cache_creation_input_tokens: extract_cache_creation(&response.raw_response),
         };
@@ -821,9 +859,13 @@ where
                     reason: e.to_string(),
                 })?;
 
-        let (text, mut tool_calls, finish) = extract_response(
+        let ExtractedResponse {
+            text,
+            reasoning,
+            mut tool_calls,
+            finish,
+        } = extract_response(
             &response.choice,
-            &response.usage,
             extract_finish_reason(&response.raw_response),
         );
 
@@ -843,8 +885,10 @@ where
         let resp = ToolCompletionResponse {
             content: text,
             tool_calls,
+            reasoning,
             input_tokens: saturate_u32(response.usage.input_tokens),
             output_tokens: saturate_u32(response.usage.output_tokens),
+            reasoning_tokens: saturate_u32(response.usage.reasoning_tokens),
             finish_reason: finish,
             cache_read_input_tokens: saturate_u32(response.usage.cached_input_tokens),
             cache_creation_input_tokens: extract_cache_creation(&response.raw_response),
@@ -1169,12 +1213,66 @@ mod tests {
                 usage: Some(crate::llm::TokenUsage {
                     input_tokens: 7,
                     output_tokens: 3,
+                    reasoning_tokens: 0,
                     cache_read_input_tokens: 2,
                     cache_creation_input_tokens: 0,
                 }),
                 finish_reason,
             })) if finish_reason == "unknown"
         ));
+    }
+
+    #[tokio::test]
+    async fn complete_stream_emits_reasoning_and_its_token_usage() {
+        let mut final_response = TestStreamingResponse::new(7, 5, 0);
+        final_response.usage.reasoning_tokens = 3;
+        let model = ScriptedCompletionModel::new(vec![
+            Ok(RawStreamingChoice::ReasoningDelta {
+                id: None,
+                reasoning: "think ".to_string(),
+            }),
+            Ok(RawStreamingChoice::Reasoning {
+                id: None,
+                content: ReasoningContent::Summary("summary".to_string()),
+            }),
+            Ok(RawStreamingChoice::Reasoning {
+                id: None,
+                content: ReasoningContent::Redacted {
+                    data: "opaque".to_string(),
+                },
+            }),
+            Ok(RawStreamingChoice::Message("answer".to_string())),
+            Ok(RawStreamingChoice::FinalResponse(final_response)),
+        ]);
+        let adapter = RigAdapter::new(model, "test-model");
+
+        let chunks = adapter
+            .complete_stream(CompletionRequest::new(vec![ChatMessage::user("hi")]))
+            .await
+            .expect("stream should open")
+            .collect::<Vec<_>>()
+            .await;
+
+        let reasoning = chunks
+            .iter()
+            .filter_map(|item| match item {
+                Ok(LlmStreamChunk::ReasoningDelta(text)) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reasoning, ["think ", "summary"]);
+        assert!(
+            chunks.iter().any(
+                |item| matches!(item, Ok(LlmStreamChunk::TextDelta(text)) if text == "answer")
+            )
+        );
+        let reasoning_tokens = chunks.iter().find_map(|item| match item {
+            Ok(LlmStreamChunk::Done {
+                usage: Some(usage), ..
+            }) => Some(usage.reasoning_tokens),
+            _ => None,
+        });
+        assert_eq!(reasoning_tokens, Some(3));
     }
 
     #[tokio::test]
@@ -1969,23 +2067,43 @@ mod tests {
     #[test]
     fn test_extract_response_text_only() {
         let content = OneOrMany::one(AssistantContent::text("Hello world"));
-        let usage = RigUsage::new();
-        let (text, calls, finish) = extract_response(&content, &usage, Some(FinishReason::Stop));
-        assert_eq!(text, Some("Hello world".to_string()));
-        assert!(calls.is_empty());
-        assert_eq!(finish, FinishReason::Stop);
+        let extracted = extract_response(&content, Some(FinishReason::Stop));
+        assert_eq!(extracted.text, Some("Hello world".to_string()));
+        assert_eq!(extracted.reasoning, None);
+        assert!(extracted.tool_calls.is_empty());
+        assert_eq!(extracted.finish, FinishReason::Stop);
     }
 
     #[test]
     fn test_extract_response_tool_call() {
         let tc = AssistantContent::tool_call("call_1", "search", serde_json::json!({"q": "test"}));
         let content = OneOrMany::one(tc);
-        let usage = RigUsage::new();
-        let (text, calls, finish) = extract_response(&content, &usage, None);
-        assert!(text.is_none());
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "search");
-        assert_eq!(finish, FinishReason::ToolUse);
+        let extracted = extract_response(&content, None);
+        assert!(extracted.text.is_none());
+        assert_eq!(extracted.tool_calls.len(), 1);
+        assert_eq!(extracted.tool_calls[0].name, "search");
+        assert_eq!(extracted.finish, FinishReason::ToolUse);
+    }
+
+    #[test]
+    fn test_extract_response_preserves_displayable_reasoning_for_tool_calls() {
+        let content = OneOrMany::many(vec![
+            AssistantContent::Reasoning(rig_core::message::Reasoning::multi(vec![
+                "Compare choices".to_string(),
+                "Choose search".to_string(),
+            ])),
+            AssistantContent::Reasoning(rig_core::message::Reasoning::summaries(vec![
+                "Search is needed".to_string(),
+            ])),
+            AssistantContent::Reasoning(rig_core::message::Reasoning::encrypted("opaque")),
+            AssistantContent::Reasoning(rig_core::message::Reasoning::redacted("opaque")),
+            AssistantContent::tool_call("call_1", "search", serde_json::json!({"q": "test"})),
+        ])
+        .expect("reasoning fixture should be non-empty");
+        let extracted = extract_response(&content, None);
+        let expected = Some("Compare choices\nChoose search\nSearch is needed".to_string());
+        assert_eq!(extracted.reasoning, expected);
+        assert_eq!(extracted.tool_calls[0].reasoning, expected);
     }
 
     // -- WI#292: finish_reason is carried, not synthesized --
@@ -1993,14 +2111,16 @@ mod tests {
     #[test]
     fn test_extract_response_carries_provider_finish_reason() {
         let content = OneOrMany::one(AssistantContent::text("truncated..."));
-        let usage = RigUsage::new();
         for (raw, expected) in [
             (FinishReason::Stop, FinishReason::Stop),
             (FinishReason::Length, FinishReason::Length),
             (FinishReason::ContentFilter, FinishReason::ContentFilter),
         ] {
-            let (_, _, finish) = extract_response(&content, &usage, Some(raw));
-            assert_eq!(finish, expected, "provider-reported {raw:?} must survive");
+            let extracted = extract_response(&content, Some(raw));
+            assert_eq!(
+                extracted.finish, expected,
+                "provider-reported {raw:?} must survive"
+            );
         }
     }
 
@@ -2008,9 +2128,8 @@ mod tests {
     fn test_extract_response_without_provider_reason_is_unknown_not_stop() {
         // WI#292: a silent provider must surface Unknown, not a fabricated Stop.
         let content = OneOrMany::one(AssistantContent::text("hi"));
-        let usage = RigUsage::new();
-        let (_, _, finish) = extract_response(&content, &usage, None);
-        assert_eq!(finish, FinishReason::Unknown);
+        let extracted = extract_response(&content, None);
+        assert_eq!(extracted.finish, FinishReason::Unknown);
     }
 
     #[test]
@@ -2019,10 +2138,9 @@ mod tests {
         // finish reason (e.g. a proxy that defaults it to "stop").
         let tc = AssistantContent::tool_call("call_1", "search", serde_json::json!({"q": "x"}));
         let content = OneOrMany::one(tc);
-        let usage = RigUsage::new();
-        let (_, calls, finish) = extract_response(&content, &usage, Some(FinishReason::Stop));
-        assert_eq!(calls.len(), 1);
-        assert_eq!(finish, FinishReason::ToolUse);
+        let extracted = extract_response(&content, Some(FinishReason::Stop));
+        assert_eq!(extracted.tool_calls.len(), 1);
+        assert_eq!(extracted.finish, FinishReason::ToolUse);
     }
 
     #[test]
@@ -2149,6 +2267,28 @@ mod tests {
         );
         // Provider stayed silent: unknown, not a fabricated stop.
         assert_eq!(complete_finish_reason(None).await, FinishReason::Unknown);
+    }
+
+    #[tokio::test]
+    async fn blocking_completion_preserves_reasoning_and_token_usage() {
+        let mut response = blocking_response_with_wire_finish(Some("stop"));
+        response.choice = OneOrMany::many(vec![
+            AssistantContent::Reasoning(rig_core::message::Reasoning::new("considering")),
+            AssistantContent::text("hello"),
+        ])
+        .expect("blocking reasoning fixture should be non-empty");
+        response.usage.reasoning_tokens = 2;
+        let model = ScriptedCompletionModel::with_blocking_response(response);
+        let adapter = RigAdapter::new(model, "test-model");
+
+        let output = adapter
+            .complete(CompletionRequest::new(vec![ChatMessage::user("hi")]))
+            .await
+            .expect("blocking completion should succeed");
+
+        assert_eq!(output.content, "hello");
+        assert_eq!(output.reasoning.as_deref(), Some("considering"));
+        assert_eq!(output.reasoning_tokens, 2);
     }
 
     #[tokio::test]

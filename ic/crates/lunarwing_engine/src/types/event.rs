@@ -381,6 +381,12 @@ pub enum EventKind {
     ResponseDelta {
         content: String,
     },
+    /// A coalesced, trailing-16-KiB provider-reasoning snapshot for opt-in live
+    /// delivery. Like [`EventKind::ResponseDelta`], this is not persisted in
+    /// durable thread history.
+    ReasoningDelta {
+        content: String,
+    },
 
     // ── Thread tree ─────────────────────────────────────────
     ChildSpawned {
@@ -872,6 +878,26 @@ mod tests {
         assert!(matches!(
             decoded.kind,
             EventKind::ResponseDelta { content } if content == "partial response"
+        ));
+    }
+
+    #[test]
+    fn reasoning_delta_round_trips_through_serde() {
+        let event = ThreadEvent::new(
+            ThreadId::new(),
+            EventKind::ReasoningDelta {
+                content: "cumulative reasoning".to_string(),
+            },
+        );
+
+        let json = serde_json::to_value(&event).expect("reasoning delta should serialize");
+        let decoded: ThreadEvent =
+            serde_json::from_value(json).expect("reasoning delta should deserialize");
+
+        assert_eq!(decoded.thread_id, event.thread_id);
+        assert!(matches!(
+            decoded.kind,
+            EventKind::ReasoningDelta { content } if content == "cumulative reasoning"
         ));
     }
 

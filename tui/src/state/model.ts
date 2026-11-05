@@ -91,6 +91,8 @@ export interface TurnRecord {
   deltas: string
   /** Canonical text; several finals are joined with a blank line. */
   finalText: string | null
+  /** Latest sanitized live reasoning tail (at most 16 KiB UTF-8); hidden on sealed turns. */
+  reasoning?: string
   /** Ring buffer, last 50. */
   activity: Activity[]
   /** Generated images. */
@@ -267,6 +269,7 @@ export const STATE_BOUNDS = {
   maxImagePayloads: 20,
   maxActivityPerTurn: 50,
   maxDeltaBytesPerTurn: 1024 * 1024,
+  maxReasoningBytesPerTurn: 16 * 1024,
   maxNotices: 20,
   visibleNotices: 2,
   noticeInfoMs: 6_000,

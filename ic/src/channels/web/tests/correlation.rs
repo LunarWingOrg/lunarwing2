@@ -273,6 +273,7 @@ fn status_variant(status: &StatusUpdate) -> &'static str {
         StatusUpdate::Suggestions { .. } => "Suggestions",
         StatusUpdate::SkillActivated { .. } => "SkillActivated",
         StatusUpdate::ReasoningUpdate { .. } => "ReasoningUpdate",
+        StatusUpdate::ReasoningStream(_) => "ReasoningStream",
         StatusUpdate::TurnCost { .. } => "TurnCost",
     }
 }
@@ -409,6 +410,11 @@ fn prompt_and_summary_status_cases() -> Vec<(StatusUpdate, serde_json::Value)> {
                    "decisions": [{"tool_name": "http", "rationale": "Fetch the page."}], "thread_id": "t"}),
         ),
         (
+            StatusUpdate::ReasoningStream("bounded live reasoning".into()),
+            json!({"type": "reasoning_update", "narrative": "bounded live reasoning",
+                   "decisions": [], "thread_id": "t"}),
+        ),
+        (
             StatusUpdate::TurnCost {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -433,7 +439,7 @@ fn status_sse_event_matches_previous_inline_mapping() {
             "{variant}"
         );
     }
-    assert_eq!(covered.len(), 16, "one case per StatusUpdate variant");
+    assert_eq!(covered.len(), 17, "one case per StatusUpdate variant");
 
     // Without a thread id, thread-scoped events simply omit the field.
     let event = status_sse_event(StatusUpdate::Thinking("x".into()), None);

@@ -252,6 +252,14 @@ The header names the tenant or profile, the connection state (`connecting`, `rea
 N s`, `OFFLINE`), the engine, `exact` or `legacy daemon`, the image protocol, and `second window` when
 it applies. Every state carries a text label, so nothing depends on colour.
 
+With the daemon's opt-in `ENGINE_V2_STREAM_REASONING=true`, a running turn shows
+one updating `reasoning:` block. Each live snapshot replaces the previous one,
+retaining its latest 16 KiB UTF-8 tail and newlines; it does not append activity
+lines or become assistant answer text. The block disappears when the turn is
+sealed and is not recovered from history. Tool-selection summaries remain in
+the activity log. See [tenant configuration](../docs/ops/TENANT-CONFIGURATION.md#live-provider-reasoning-wi546)
+for operator setup and the shared-gateway restriction.
+
 ## Keys and the composer
 
 Keys marked **(KKP)** need the kitty keyboard protocol (kitty outside tmux). tmux, and terminals

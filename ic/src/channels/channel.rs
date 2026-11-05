@@ -404,13 +404,15 @@ pub enum StatusUpdate {
     Suggestions { suggestions: Vec<String> },
     /// Skills activated for this conversation turn.
     SkillActivated { skill_names: Vec<String> },
-    /// Safe reasoning summary for selected tools.
+    /// Tool-selection reasoning summary.
     ReasoningUpdate {
-        /// Human-readable summary of the agent's decision.
+        /// Human-readable summary of the selected tools.
         narrative: String,
         /// Per-tool decisions.
         decisions: Vec<ToolDecision>,
     },
+    /// Opt-in live provider reasoning for gateway clients, including the TUI.
+    ReasoningStream(String),
     /// Per-turn token usage and cost summary (shown as subtle metadata).
     TurnCost {
         input_tokens: u64,

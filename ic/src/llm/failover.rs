@@ -591,8 +591,10 @@ mod tests {
                 output_cost: Decimal::ZERO,
                 complete_result: Mutex::new(Some(Ok(CompletionResponse {
                     content: content.to_string(),
+                    reasoning: None,
                     input_tokens: 10,
                     output_tokens: 5,
+                    reasoning_tokens: 0,
                     finish_reason: FinishReason::Stop,
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
@@ -600,8 +602,10 @@ mod tests {
                 tool_complete_result: Mutex::new(Some(Ok(ToolCompletionResponse {
                     content: Some(content.to_string()),
                     tool_calls: vec![],
+                    reasoning: None,
                     input_tokens: 10,
                     output_tokens: 5,
+                    reasoning_tokens: 0,
                     finish_reason: FinishReason::Stop,
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
@@ -927,6 +931,7 @@ mod tests {
                 usage: Some(TokenUsage {
                     input_tokens: 1500,
                     output_tokens: 0,
+                    reasoning_tokens: 0,
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
                 }),
@@ -960,6 +965,7 @@ mod tests {
                     discarded_usage: Some(TokenUsage {
                         input_tokens: 1500,
                         output_tokens: 0,
+                        reasoning_tokens: 0,
                         cache_read_input_tokens: 0,
                         cache_creation_input_tokens: 0,
                     }),
@@ -983,6 +989,7 @@ mod tests {
                 usage: Some(TokenUsage {
                     input_tokens: 700,
                     output_tokens: 0,
+                    reasoning_tokens: 0,
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
                 }),
@@ -1009,7 +1016,7 @@ mod tests {
                 provider,
                 usage: Some(TokenUsage {
                     input_tokens: 1400,
-                    output_tokens: 0,
+                    output_tokens: 0, reasoning_tokens: 0,
                     ..
                 }),
                 ..
@@ -1670,8 +1677,10 @@ mod tests {
             }
             Ok(CompletionResponse {
                 content: format!("{} ok", self.name),
+                reasoning: None,
                 input_tokens: 10,
                 output_tokens: 5,
+                reasoning_tokens: 0,
                 finish_reason: FinishReason::Stop,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
@@ -1697,8 +1706,10 @@ mod tests {
             Ok(ToolCompletionResponse {
                 content: Some(format!("{} ok", self.name)),
                 tool_calls: vec![],
+                reasoning: None,
                 input_tokens: 10,
                 output_tokens: 5,
+                reasoning_tokens: 0,
                 finish_reason: FinishReason::Stop,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,

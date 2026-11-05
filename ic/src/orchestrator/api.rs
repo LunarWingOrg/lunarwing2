@@ -177,8 +177,10 @@ async fn llm_complete(
 
     Ok(Json(ProxyCompletionResponse {
         content: resp.content,
+        reasoning: resp.reasoning,
         input_tokens: resp.input_tokens,
         output_tokens: resp.output_tokens,
+        reasoning_tokens: resp.reasoning_tokens,
         finish_reason: format_finish_reason(resp.finish_reason),
         cache_read_input_tokens: resp.cache_read_input_tokens,
         cache_creation_input_tokens: resp.cache_creation_input_tokens,
@@ -208,9 +210,11 @@ async fn llm_complete_with_tools(
 
     Ok(Json(ProxyToolCompletionResponse {
         content: resp.content,
+        reasoning: resp.reasoning,
         tool_calls: resp.tool_calls,
         input_tokens: resp.input_tokens,
         output_tokens: resp.output_tokens,
+        reasoning_tokens: resp.reasoning_tokens,
         finish_reason: format_finish_reason(resp.finish_reason),
         cache_read_input_tokens: resp.cache_read_input_tokens,
         cache_creation_input_tokens: resp.cache_creation_input_tokens,

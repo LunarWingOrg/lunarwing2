@@ -702,11 +702,13 @@ async fn buffer_completion_stream(
 ) -> Result<BufferedCompletion, LlmError> {
     let mut chunks = Vec::new();
     let mut content = String::new();
+    let mut reasoning = String::new();
 
     while let Some(item) = stream.next().await {
         let chunk = item?;
         match &chunk {
             LlmStreamChunk::TextDelta(delta) => content.push_str(delta),
+            LlmStreamChunk::ReasoningDelta(delta) => reasoning.push_str(delta),
             LlmStreamChunk::ToolCallDelta { .. } => {
                 return Err(LlmError::InvalidResponse {
                     provider: provider_name.to_string(),
@@ -721,8 +723,10 @@ async fn buffer_completion_stream(
                 let usage = usage.unwrap_or_default();
                 let response = CompletionResponse {
                     content,
+                    reasoning: (!reasoning.is_empty()).then_some(reasoning),
                     input_tokens: usage.input_tokens,
                     output_tokens: usage.output_tokens,
+                    reasoning_tokens: usage.reasoning_tokens,
                     finish_reason: FinishReason::from_stream_reason(finish_reason),
                     cache_read_input_tokens: usage.cache_read_input_tokens,
                     cache_creation_input_tokens: usage.cache_creation_input_tokens,
@@ -1176,12 +1180,42 @@ mod tests {
     use futures::StreamExt;
 
     use crate::llm::ChatMessage;
-    use crate::llm::provider::LlmStreamChunk;
+    use crate::llm::provider::{LlmStreamChunk, TokenUsage};
     use crate::llm::streaming_test_support::{ScriptedStreamingProvider, StreamScript};
     use crate::testing::StubLlm;
 
     fn default_config() -> SmartRoutingConfig {
         SmartRoutingConfig::default()
+    }
+
+    #[tokio::test]
+    async fn buffered_completion_preserves_reasoning_and_usage() {
+        let stream = futures::stream::iter([
+            Ok(LlmStreamChunk::ReasoningDelta("think".to_string())),
+            Ok(LlmStreamChunk::ReasoningDelta("ing".to_string())),
+            Ok(LlmStreamChunk::TextDelta("answer".to_string())),
+            Ok(LlmStreamChunk::Done {
+                usage: Some(TokenUsage {
+                    output_tokens: 5,
+                    reasoning_tokens: 3,
+                    ..TokenUsage::default()
+                }),
+                finish_reason: "stop".to_string(),
+            }),
+        ])
+        .boxed();
+
+        let buffered = buffer_completion_stream("primary", stream)
+            .await
+            .expect("reasoning stream should buffer");
+        assert_eq!(buffered.response.reasoning.as_deref(), Some("thinking"));
+        assert_eq!(buffered.response.content, "answer");
+        assert_eq!(buffered.response.reasoning_tokens, 3);
+        assert!(
+            buffered.chunks.iter().any(
+                |chunk| matches!(chunk, LlmStreamChunk::ReasoningDelta(text) if text == "think")
+            )
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1691,8 +1725,10 @@ mod tests {
     fn detects_uncertain_short_response() {
         let response = CompletionResponse {
             content: "I'm not sure.".to_string(),
+            reasoning: None,
             input_tokens: 10,
             output_tokens: 5,
+            reasoning_tokens: 0,
             finish_reason: crate::llm::FinishReason::Stop,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
@@ -1704,8 +1740,10 @@ mod tests {
     fn detects_empty_response_as_uncertain() {
         let response = CompletionResponse {
             content: "".to_string(),
+            reasoning: None,
             input_tokens: 10,
             output_tokens: 0,
+            reasoning_tokens: 0,
             finish_reason: crate::llm::FinishReason::Stop,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
@@ -1717,8 +1755,10 @@ mod tests {
     fn short_confident_response_is_not_uncertain() {
         let response = CompletionResponse {
             content: "Yes.".to_string(),
+            reasoning: None,
             input_tokens: 10,
             output_tokens: 1,
+            reasoning_tokens: 0,
             finish_reason: crate::llm::FinishReason::Stop,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
@@ -1731,8 +1771,10 @@ mod tests {
         let response = CompletionResponse {
             content: "The answer is 42. This is a well-known constant from the Hitchhiker's Guide."
                 .to_string(),
+            reasoning: None,
             input_tokens: 10,
             output_tokens: 20,
+            reasoning_tokens: 0,
             finish_reason: crate::llm::FinishReason::Stop,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
@@ -2138,6 +2180,7 @@ mod tests {
                 usage: Some(crate::llm::TokenUsage {
                     input_tokens: 1500,
                     output_tokens: 0,
+                    reasoning_tokens: 0,
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
                 }),

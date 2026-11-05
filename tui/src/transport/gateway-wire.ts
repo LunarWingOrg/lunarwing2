@@ -574,6 +574,9 @@ function mapImage(event: GatewayEventOf<"image_generated">, scope: MapScope): Tr
 }
 
 function mapReasoning(event: GatewayEventOf<"reasoning_update">, scope: MapScope): TransportEvent[] {
+  if (event.decisions.length === 0) {
+    return event.narrative.trim() === "" ? NONE : [withThread({ kind: "turn.reasoning", turnId: scope.turnId, text: event.narrative }, scope)]
+  }
   const first = event.decisions[0]
   const text = event.narrative.trim() !== "" ? event.narrative : first ? `${first.tool_name}: ${first.rationale}` : ""
   return text === "" ? NONE : activity(scope, "reasoning", text)

@@ -156,6 +156,11 @@ allowlist; mt-admin flags and stored tenant settings take precedence.
 See [approval behavior](../../../docs/guides/ENABLING_DEV_TOOLS.md#3-keep-or-change-approval-behavior)
 for the restrictions that global auto-approval does not bypass.
 
+mt-admin also renders `ENGINE_V2_STREAM_REASONING=false` for new tenants and
+preserves an existing opt-in on env re-render. This gateway-only live reasoning
+setting is documented in [tenant configuration](../../../docs/ops/TENANT-CONFIGURATION.md#live-provider-reasoning-wi546),
+including the restriction on shared gateways with unscoped routine turns.
+
 **Seed source locations in the repo:**
 - Runtime config template: `deploy/config.toml`
 - Workspace seed templates: `deploy/workspace-template/*.md`

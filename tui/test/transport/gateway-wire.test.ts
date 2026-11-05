@@ -95,6 +95,17 @@ describe("gateway SSE → TransportEvent (3.4 table)", () => {
     ])
   })
 
+  test("live reasoning snapshots keep correlation and multiline text, distinct from tool summaries", () => {
+    const narrative = "old head\n" + "x".repeat(1_100) + "\nlatest tail"
+    expect(map({ type: "reasoning_update", narrative, decisions: [], thread_id: T, ...corr })).toEqual([
+      { kind: "turn.reasoning", turnId: C as never, threadId: T, text: narrative },
+    ])
+    expect(map({ type: "reasoning_update", narrative: "  \n", decisions: [], thread_id: T, ...corr })).toEqual([])
+    expect(map({ type: "reasoning_update", narrative: "Selected tools", decisions: [{ tool_name: "http", rationale: "fetch" }], ...corr })).toEqual([
+      { kind: "turn.activity", turnId: C as never, activity: { kind: "reasoning", text: "Selected tools" } },
+    ])
+  })
+
   test("tool_started / tool_completed / tool_result → turn.activity", () => {
     expect(map({ type: "tool_started", name: "http", thread_id: T })).toEqual([
       { kind: "turn.activity", turnId: null, threadId: T, activity: { kind: "tool_started", text: "http" } },
@@ -208,7 +219,7 @@ describe("gateway SSE → TransportEvent (3.4 table)", () => {
       { kind: "turn.cost", turnId: null, threadId: T, inputTokens: 10, outputTokens: 5, costUsd: "0.001" },
     ])
     expect(map({ type: "reasoning_update", narrative: "Checking the registry", decisions: [], thread_id: T })).toEqual([
-      { kind: "turn.activity", turnId: null, threadId: T, activity: { kind: "reasoning", text: "Checking the registry" } },
+      { kind: "turn.reasoning", turnId: null, threadId: T, text: "Checking the registry" },
     ])
     expect(map({ type: "reasoning_update", narrative: "", decisions: [{ tool_name: "http", rationale: "fetch" }] })).toEqual([
       { kind: "turn.activity", turnId: null, activity: { kind: "reasoning", text: "http: fetch" } },

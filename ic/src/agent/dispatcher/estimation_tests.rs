@@ -100,8 +100,10 @@ impl LlmProvider for ToolLlm {
             },
             content: calls.is_empty().then(|| "Finished.".into()),
             tool_calls: calls,
+            reasoning: None,
             input_tokens: 0,
             output_tokens: 0,
+            reasoning_tokens: 0,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })

@@ -328,6 +328,10 @@ async fn handle_stream_chunk<'a>(
             append_detection_text(&mut state.detection_text, delta);
             Some((Ok(chunk), state))
         }
+        LlmStreamChunk::ReasoningDelta(_) => {
+            record_first_chunk(&mut state);
+            Some((Ok(chunk), state))
+        }
         LlmStreamChunk::ToolCallDelta {
             index,
             name,
@@ -626,8 +630,10 @@ mod tests {
             Ok(ToolCompletionResponse {
                 content: self.response.content.clone(),
                 tool_calls: self.response.tool_calls.clone(),
+                reasoning: self.response.reasoning.clone(),
                 input_tokens: self.response.input_tokens,
                 output_tokens: self.response.output_tokens,
+                reasoning_tokens: self.response.reasoning_tokens,
                 finish_reason: self.response.finish_reason,
                 cache_read_input_tokens: self.response.cache_read_input_tokens,
                 cache_creation_input_tokens: self.response.cache_creation_input_tokens,
@@ -917,8 +923,10 @@ mod tests {
                         arguments: serde_json::Value::Null,
                         reasoning: None,
                     }],
+                    reasoning: None,
                     input_tokens: 0,
                     output_tokens: 0,
+                    reasoning_tokens: 0,
                     finish_reason: FinishReason::ToolUse,
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
@@ -966,8 +974,10 @@ mod tests {
                     arguments: serde_json::json!({"path": "pwned.md"}),
                     reasoning: None,
                 }],
+                reasoning: None,
                 input_tokens: 10,
                 output_tokens: 5,
+                reasoning_tokens: 0,
                 finish_reason: FinishReason::Stop,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,

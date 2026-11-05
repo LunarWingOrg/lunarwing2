@@ -1432,6 +1432,7 @@ write_tenant_lunarwing_env() {
   local llm_turn_budget llm_request_timeout allow_local_tools auto_approve_tools agent_max_tool_iterations
   local sandbox_policy sandbox_allow_full_access
   local engine_v2_model_recovery_attempts engine_v2_model_recovery_total_attempts engine_v2_tool_async_timeout_secs
+  local engine_v2_stream_reasoning
   local skill_self_improvement skill_prune_quarantine_days reflex_compiler_enabled
   llm_turn_budget="$(_env_existing "$env_snapshot" LLM_TURN_BUDGET_SECS)";                llm_turn_budget="${llm_turn_budget:-599}"
   llm_request_timeout="$(_env_existing "$env_snapshot" LLM_REQUEST_TIMEOUT_SECS)";        llm_request_timeout="${llm_request_timeout:-2599}"
@@ -1454,6 +1455,8 @@ write_tenant_lunarwing_env() {
   engine_v2_max_output_tokens="${engine_v2_max_output_tokens:-8192}"
   engine_v2_tool_async_timeout_secs="$(_env_existing "$env_snapshot" ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS)"
   engine_v2_tool_async_timeout_secs="${engine_v2_tool_async_timeout_secs:-7999}"
+  engine_v2_stream_reasoning="$(_env_existing "$env_snapshot" ENGINE_V2_STREAM_REASONING)"
+  engine_v2_stream_reasoning="${engine_v2_stream_reasoning:-false}"
   skill_self_improvement="$(_env_existing "$env_snapshot" SKILL_SELF_IMPROVEMENT)";       skill_self_improvement="${skill_self_improvement:-true}"
   skill_prune_quarantine_days="$(_env_existing "$env_snapshot" SKILL_PRUNE_QUARANTINE_DAYS)"
   skill_prune_quarantine_days="${skill_prune_quarantine_days:-15}"
@@ -1606,6 +1609,9 @@ ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=$engine_v2_tool_async_timeout_secs
 # "used its entire output budget before producing visible text". Preserved on
 # re-render.
 ENGINE_V2_MAX_OUTPUT_TOKENS=$engine_v2_max_output_tokens
+# Live provider reasoning to gateway clients only (WI#546); opt-in, preserved
+# on re-render. Keep disabled on shared gateways with unscoped routine turns.
+ENGINE_V2_STREAM_REASONING=$engine_v2_stream_reasoning
 
 # Generic sandbox egress (WI#154): none by default on multi-tenant hosts —
 # the advisory proxy mode would let a sandboxed process reach host-loopback

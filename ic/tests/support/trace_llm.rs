@@ -513,8 +513,10 @@ impl LlmProvider for TraceLlm {
                 } => {
                     return Ok(CompletionResponse {
                         content,
+                        reasoning: None,
                         input_tokens,
                         output_tokens,
+                        reasoning_tokens: 0,
                         finish_reason: FinishReason::Stop,
                         cache_read_input_tokens: 0,
                         cache_creation_input_tokens: 0,
@@ -550,8 +552,10 @@ impl LlmProvider for TraceLlm {
             } => Ok(ToolCompletionResponse {
                 content: Some(content),
                 tool_calls: Vec::new(),
+                reasoning: None,
                 input_tokens,
                 output_tokens,
+                reasoning_tokens: 0,
                 finish_reason: FinishReason::Stop,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
@@ -573,8 +577,10 @@ impl LlmProvider for TraceLlm {
                 Ok(ToolCompletionResponse {
                     content: None,
                     tool_calls: calls,
+                    reasoning: None,
                     input_tokens,
                     output_tokens,
+                    reasoning_tokens: 0,
                     finish_reason: FinishReason::ToolUse,
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,

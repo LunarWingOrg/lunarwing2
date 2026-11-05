@@ -123,3 +123,11 @@ export function cutToUtf8Bytes(text: string, maxBytes: number): string {
   }
   return text.slice(0, end)
 }
+
+/** The latest suffix that fits in `maxBytes` UTF-8 bytes, without a partial leading code point. */
+export function tailToUtf8Bytes(text: string, maxBytes: number): string {
+  const bytes = Buffer.from(text, "utf8")
+  let start = Math.max(0, bytes.length - maxBytes)
+  while (start < bytes.length && ((bytes[start] ?? 0) & 0xc0) === 0x80) start += 1
+  return bytes.subarray(start).toString("utf8")
+}
