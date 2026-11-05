@@ -101,9 +101,9 @@ sudo ic/scripts/lunarwing-mt-admin.sh tui-access <tenant> --for-user <user> --re
   the sticky warning "this TUI uses the tenant master token" while it uses one.
 - Running the grant again rotates the token. `--revoke` removes the tenant-side entry and the desktop
   file. A connected TUI then goes offline with a hint that names `tui-access`.
-- Other options: `--url-host <host>` overrides the URL host, and `--no-verify` skips the capability
-  check and the post-grant probes. Exit status: 0 done, 1 refused (including a client grant the daemon
-  cannot authenticate), 2 files written but the running daemon rejected the token.
+- Other options: `--url-host <ip>` overrides the URL host (only `localhost` or an IP literal; DNS names
+  are refused), and `--no-verify` skips the capability check and the post-grant probes. Exit status: 0 done,
+  1 refused (including a client grant the daemon cannot authenticate), 2 files written but the running daemon rejected the token.
   The details are in `docs/guides/MT-ADMIN-QUICKSTART.md` ("TUI access for a desktop user").
 - Never copy the output of `mt-admin tokens` into a file for the TUI. That verb is for the web login.
 
@@ -611,8 +611,10 @@ meter at 4 Hz. `[ui] cursor_blink = false` stops the cursor blinking.
   `allow_insecure_http = true` (sticky warning). URLs with credentials, a query or a fragment are refused,
   and so are redirects.
 - Tokens never appear on argv, in URLs, in logs, in error messages or on screen. HTTP proxy variables and
-  `NODE_TLS_REJECT_UNAUTHORIZED` are neutralized at start. If a proxy is still set, gateway and Hex requests
-  are refused rather than sent through it; an HTTPS request is also refused if the TLS-disable variable is `0`.
+  `NODE_TLS_REJECT_UNAUTHORIZED` are neutralized at start. Every gateway fetch also sets Bun's
+  `tls.rejectUnauthorized: true`, which overrides that environment variable even if Bun cached it. If a proxy is
+  still set, gateway and Hex requests are refused rather than sent through it; an HTTPS request is also refused
+  if the TLS-disable variable is `0`.
 - Child processes (`parec`, `pactl`, `wl-paste`, `wl-copy`, `grim`, `slurp`, `notify-send`, `xdg-open`,
   `hex`) are started without a shell, with an argv array and an allowlisted environment. They never get a
   token, the proxy variables or `TRANSCRIBE_DUMP_DIR`. `pactl list short sources` runs only for the parec
