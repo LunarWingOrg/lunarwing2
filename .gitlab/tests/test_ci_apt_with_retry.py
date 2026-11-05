@@ -76,7 +76,7 @@ if install and mode == "fail_package":
     def run_apt(self, mode="ok"):
         self.env["APT_MODE"] = mode
         return subprocess.run(
-            ["sh", str(SCRIPT), "python3"],
+            ["sh", str(SCRIPT), "apt", "python3"],
             cwd=self.root,
             env=self.env,
             capture_output=True,
@@ -104,7 +104,7 @@ if install and mode == "fail_package":
         self.assertIn("update", calls[0])
         self.assertIn("Acquire::Check-Valid-Until=false", calls[0])
         self.assertIn("install", calls[1])
-        self.assertEqual(calls[1][-2:], ["--no-install-recommends", "python3"])
+        self.assertEqual(calls[1][-3:], ["--no-install-recommends", "apt", "python3"])
         for call in calls:
             self.assertIn("Acquire::Retries=0", call)
             self.assertIn("Acquire::https::Timeout=60", call)
