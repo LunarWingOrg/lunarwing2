@@ -134,6 +134,9 @@ class WorkerReproducibilityTests(unittest.TestCase):
                 self.assertEqual(text.count("Acquire::https::Timeout=60"), apt_calls)
                 self.assertNotRegex(text, r"Acquire::Retries=[1-9]")
                 self.assertEqual(text.count("--no-install-recommends apt"), 3)
+                expected = "3.0.4" if lane.startswith("opencode") else "2.6.2"
+                assertion = f'test "$(dpkg-query -W -f=\'${{Version}}\' apt)" = "{expected}";'
+                self.assertEqual(text.count(assertion), 2)
 
 
 if __name__ == "__main__":
