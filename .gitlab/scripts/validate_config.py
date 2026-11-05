@@ -2696,7 +2696,7 @@ def validate_worker_snapshots(variables: dict[str, str], errors: list[str]) -> N
         return
     minimum_snapshot = "20261105T082236Z"
     if snapshot < minimum_snapshot:
-        errors.append("CI_DEBIAN_SNAPSHOT predates the CVE-2026-111497 Brotli fixes")
+        errors.append("CI_DEBIAN_SNAPSHOT predates the CVE-2026-109518 APT fixes")
     for dockerfile in (
         KIMI_DOCKERFILE, PEBBLE_DOCKERFILE, OPENCODE_DOCKERFILE, OPENCODE2_DOCKERFILE,
     ):
@@ -2717,7 +2717,7 @@ def validate_worker_snapshots(variables: dict[str, str], errors: list[str]) -> N
             for value in normalized
         ):
             errors.append(
-                f"{dockerfile} ARG DEBIAN_SNAPSHOT predates the CVE-2026-111497 Brotli fixes"
+                f"{dockerfile} ARG DEBIAN_SNAPSHOT predates the CVE-2026-109518 APT fixes"
             )
 
 
