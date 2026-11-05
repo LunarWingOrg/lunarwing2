@@ -28,6 +28,8 @@ ARG SOURCE_REVISION=unknown
 # ──────────────────────
 # The bun digest below must stay equal to CI_BUN_IMAGE in
 # .gitlab/ci/defaults.yml (enforced by validate_config.py).
+FROM docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b AS certificates
+
 FROM docker.io/oven/bun:1.4.4-debian@sha256:93d5032fe06d163427822dc1598f420363759bb18155c9cc90eb1be05a64a19e AS builder
 
 ARG OPENCODE_VERSION
@@ -36,7 +38,10 @@ ARG DEBIAN_SNAPSHOT
 ARG MODELS_DEV_SNAPSHOT_SHA256
 WORKDIR /build
 
+COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
 RUN set -eu; \
+    test -s /etc/ssl/certs/ca-certificates.crt; \
     rm -f /etc/apt/sources.list.d/debian.sources; \
     printf '%s\n' \
       "deb https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie main" \
@@ -143,7 +148,10 @@ LABEL org.opencontainers.image.title="LunarWing OpenCode Worker" \
       org.opencontainers.image.revision="${SOURCE_REVISION}" \
       org.opencontainers.image.toolchain-profile="${WITH_TOOLCHAINS}"
 
+COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
 RUN set -eu; \
+    test -s /etc/ssl/certs/ca-certificates.crt; \
     rm -f /etc/apt/sources.list.d/debian.sources; \
     printf '%s\n' \
       "deb https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie main" \
