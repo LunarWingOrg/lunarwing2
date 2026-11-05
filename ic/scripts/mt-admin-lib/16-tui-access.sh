@@ -255,6 +255,7 @@ _tui_desktop_user_resolve() {  # <user> [grant|revoke]
 # ── Tenant gateway and env ───────────────────────────────────────────────────
 
 # Maps a GATEWAY_HOST (or --url-host) value to the host part of the URL.
+# Tenant listener-owner checks require localhost or an IP literal, never DNS.
 _tui_url_host() {  # <host>
   local host="${1,,}" bare
   case "$host" in
@@ -277,7 +278,8 @@ _tui_url_host() {  # <host>
     printf '[%s]' "$bare"
     return 0
   fi
-  [[ "$host" =~ ^[a-z0-9.-]{1,253}$ ]] || return 1
+  # Preserve the existing IPv4-spelling handling, but never emit a DNS name.
+  [[ "$host" =~ ^[0-9.]{1,15}$ ]] || return 1
   printf '%s' "$host"
 }
 
@@ -308,7 +310,7 @@ _tui_gateway_url() {  # <tenant> <env_path> <override_host>
       || die "could not read GATEWAY_HOST for tenant '$tenant' (tenant-side read of $env_path refused)"
   fi
   host="$(_tui_url_host "$raw")" \
-    || die "unsupported gateway host '$(sanitize_display_value "$raw")' for tenant '$tenant' (want IPv4, an IPv6 literal or a [A-Za-z0-9.-] hostname; --url-host overrides)"
+    || die "unsupported gateway host '$(sanitize_display_value "$raw")' for tenant '$tenant' (use localhost or an IP literal; --url-host <ip> overrides)"
   url_re='^http://[]a-z0-9.:[-]+:[0-9]{1,5}$'
   [[ "http://$host:$port" =~ $url_re ]] || die "internal error: unexpected gateway URL shape for tenant '$tenant'"
   TUI_GATEWAY_URL="http://$host:$port"
@@ -612,27 +614,21 @@ _tui_desktop_config_write() {  # <user> <home> <tenant> <json>
 }
 
 # Sets TUI_DESKTOP_FILE, TUI_DESKTOP_RESULT (removed|absent) and
-# TUI_DESKTOP_KIND (client|master|unknown, empty when absent).
+# TUI_DESKTOP_KIND (unknown when present, empty when absent). The user's file is
+# never opened: its kind only selects warning wording, and reading it could
+# block revoke on a FIFO or oversized file while the lifecycle lock is held.
 _tui_desktop_config_remove() {  # <user> <home> <tenant>
-  local user="$1" home="$2" tenant="$3" dir kind
+  local user="$1" home="$2" tenant="$3" dir
   dir="$home/.config/wingtip/tenants"
   TUI_DESKTOP_FILE="$dir/$tenant.json"
   TUI_DESKTOP_RESULT=absent TUI_DESKTOP_KIND=""
   darkirc_path_components_safe "$dir" \
     || die "unsafe desktop config path $dir (a symlinked component); remove $TUI_DESKTOP_FILE by hand"
   [[ -e "$TUI_DESKTOP_FILE" || -L "$TUI_DESKTOP_FILE" ]] || return 0
-  kind=unknown
-  if [[ -f "$TUI_DESKTOP_FILE" && ! -L "$TUI_DESKTOP_FILE" ]]; then
-    # Read as the user; only the token_kind word leaves jq.
-    kind="$(tenant_jq "$user" -r \
-      'if type == "object" and (.token_kind == "client" or .token_kind == "master") then .token_kind else "unknown" end' \
-      "$TUI_DESKTOP_FILE" 2>/dev/null)" || kind=unknown
-    [[ "$kind" == client || "$kind" == master ]] || kind=unknown
-  fi
   _tui_as_user "$user" rm -f -- "$TUI_DESKTOP_FILE" \
     || die "could not remove $TUI_DESKTOP_FILE as user '$user'"
   TUI_DESKTOP_RESULT=removed
-  TUI_DESKTOP_KIND="$kind"
+  TUI_DESKTOP_KIND=unknown
 }
 
 # ── Listener owner and probe ─────────────────────────────────────────────────
@@ -1051,7 +1047,7 @@ _tui_revoke_report() {  # <tenant> <user> <label> <desktop: checked|no-account|u
   case "$desktop" in
     checked)
       if [[ "$TUI_DESKTOP_RESULT" == removed ]]; then
-        say "  config:   removed $TUI_DESKTOP_FILE"
+        say "  config:   removed $TUI_DESKTOP_FILE (token_kind unknown; not read)"
       else
         say "  config:   no desktop config"
       fi
@@ -1059,8 +1055,8 @@ _tui_revoke_report() {  # <tenant> <user> <label> <desktop: checked|no-account|u
     no-account) say "  config:   not checked (no passwd entry for '$user')" ;;
     *) say "  config:   not checked ($TUI_USER_HOME_ERROR); remove ~$user/.config/wingtip/tenants/$tenant.json by hand if it still exists" ;;
   esac
-  if [[ "$TUI_DESKTOP_KIND" == master ]]; then
-    say "WARNING: that desktop config held the master token of tenant '$tenant'; $master_note" >&2
+  if [[ "$TUI_DESKTOP_KIND" == unknown && "$TUI_REGISTRY_RESULT" != removed ]]; then
+    say "WARNING: that desktop config may have held the master token of tenant '$tenant'; $master_note" >&2
   elif [[ "$desktop" != checked ]]; then
     say "WARNING: should a desktop config of '$user' hold the master token of tenant '$tenant' (token_kind master), $master_note" >&2
   fi

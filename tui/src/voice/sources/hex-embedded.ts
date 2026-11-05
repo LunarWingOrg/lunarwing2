@@ -382,7 +382,9 @@ export class HexEmbeddedChild {
     }
     const baseUrl = hexBaseUrl(parsed.port)
     try {
-      await assertListenerOwner(new URL(baseUrl), { uid: this.opts.uid, label: "this user" }, this.opts.readProc ?? readProcNet)
+      await assertListenerOwner(new URL(baseUrl), { uid: this.opts.uid, label: "this user" }, this.opts.readProc ?? readProcNet, {
+        loopbackOnly: true,
+      })
     } catch (error) {
       parsed.token.dispose()
       throw new VoiceError("unavailable", isTransportError(error) ? error.message : "cannot verify the owner of the embedded Hex port")

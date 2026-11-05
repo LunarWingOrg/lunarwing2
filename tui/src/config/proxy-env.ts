@@ -3,7 +3,8 @@
  *
  * Bun's fetch sends requests through HTTP_PROXY, HTTPS_PROXY or ALL_PROXY whenever the `proxy` option is unset,
  * loopback requests included, and bypasses only hosts listed in NO_PROXY. Every peer of the TUI is local or
- * explicitly configured, so the process disables proxying before its first fetch.
+ * explicitly configured, so the process disables proxying before its first fetch. It also blanks
+ * NODE_TLS_REJECT_UNAUTHORIZED: Bun honours a value of 0 by skipping HTTPS certificate verification.
  *
  * Measured on Bun 1.3.14 (and pinned by test/config/proxy-env.test.ts through test/fixtures/proxy-child.ts):
  * `delete process.env.HTTP_PROXY` does NOT stop the proxying, because Bun keeps its own copy of the
@@ -22,6 +23,7 @@ export function neutralizeProxyEnv(env: MutableEnv = process.env): void {
   for (const name of PROXY_ENV_NAMES) env[name] = ""
   env.NO_PROXY = "*"
   env.no_proxy = "*"
+  env.NODE_TLS_REJECT_UNAUTHORIZED = ""
 }
 
 /** Blanks variables the client has consumed (e.g. LUNARWING_GATEWAY_TOKEN), for the same reason: "" not delete. */

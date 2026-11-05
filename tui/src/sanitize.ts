@@ -22,10 +22,42 @@ export interface SanitizeOptions {
 // C0 except TAB and LF, DEL and C1, then the bidi controls.
 const CONTROL_CHARACTERS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g
 const LINE_FEEDS = /\n+/g
+const ESC = 0x1b
+const BEL = 0x07
+const ST = 0x9c
+const REMOVED_TO_END = "[…escape sequence removed]"
+
+function stringSequenceEnd(text: string, start: number): number {
+  for (let i = start; i < text.length; i += 1) {
+    const code = text.charCodeAt(i)
+    if (code === BEL || code === ST) return i + 1
+    if (code === ESC && text.charCodeAt(i + 1) === 0x5c) return i + 2
+  }
+  return -1
+}
+
+/** True when OSC, DCS, SOS, PM or APC consumes everything after its introducer. */
+function hasUnterminatedStringSequence(text: string): boolean {
+  for (let i = 0; i < text.length; i += 1) {
+    const first = text.charCodeAt(i)
+    const second = text.charCodeAt(i + 1)
+    const c1 = first === 0x90 || first === 0x98 || (first >= 0x9d && first <= 0x9f)
+    const escaped =
+      first === ESC && (second === 0x50 || second === 0x58 || second === 0x5d || second === 0x5e || second === 0x5f)
+    if (!c1 && !escaped) continue
+    const end = stringSequenceEnd(text, i + (escaped ? 2 : 1))
+    if (end < 0) return true
+    i = end - 1
+  }
+  return false
+}
 
 export function sanitizeText(text: string, options: SanitizeOptions = {}): string {
   const stripped = stripAnsiSequences(text).replace(CONTROL_CHARACTERS, "")
-  return options.multiline === true ? stripped : stripped.replace(LINE_FEEDS, " ")
+  const visible = options.multiline === true ? stripped : stripped.replace(LINE_FEEDS, " ")
+  if (!hasUnterminatedStringSequence(text) || visible === text) return visible
+  const separator = visible === "" || /\s$/.test(visible) ? "" : " "
+  return `${visible}${separator}${REMOVED_TO_END}`
 }
 
 /** sanitizeText(text) in single-line mode. */
@@ -39,8 +71,8 @@ const VISIBLE_ESCAPES = /[\u0000-\u0008\u000a-\u001f\u007f-\u009f\u202a-\u202e\u
 /**
  * Terminal-safe like sanitizeText, but hides nothing: every control and bidi character becomes a visible
  * "\u{1b}"-style escape instead of being removed. Stripping removes an escape sequence together with its
- * payload (an OSC title, a DCS string, and an unterminated one swallows the rest of the text, as a terminal
- * would), which is a place to hide text. Use this where the user must see everything: approval tool names,
+ * payload (an OSC title or DCS string). sanitizeText appends a visible marker when an unterminated sequence
+ * consumes the rest of the text, but sanitizeVisible keeps the payload itself visible. Use this where the user must see everything: approval tool names,
  * descriptions and parameters (3.6.2, SEC-04).
  */
 export function sanitizeVisible(text: string, options: SanitizeOptions = {}): string {

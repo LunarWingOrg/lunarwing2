@@ -354,6 +354,51 @@ describe("connect (3.8 steps 1-6)", () => {
     expect(await next(it)).toMatchObject({ kind: "turn.delta", text: "another thread" })
     expect(await next(it)).toMatchObject({ kind: "turn.activity", threadId: thread.id, activity: { kind: "thinking", text: "next turn" } })
   })
+
+  test("buffered image bytes are capped before connect finishes", async () => {
+    const mock = await MockGateway.start({ mode: "legacy", token: TOKEN })
+    cleanups.push(() => mock.stop())
+    const thread = mock.addThread([])
+    const encoder = new TextEncoder()
+    let stream: ReadableStreamDefaultController<Uint8Array> | null = null
+    const sse = (event: Record<string, unknown>) =>
+      stream?.enqueue(encoder.encode(`event: ${String(event.type)}\ndata: ${JSON.stringify(event)}\n\n`))
+    const image = () => ({ type: "image_generated", data_url: `data:image/png;base64,${"A".repeat(1200)}`, thread_id: thread.id })
+    const fetchImpl: FetchLike = async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input))
+      if (url.pathname === "/api/chat/events") {
+        const body = new ReadableStream<Uint8Array>({ start: (c) => void (stream = c) })
+        init?.signal?.addEventListener("abort", () => stream?.error(init.signal?.reason))
+        return new Response(body, { headers: { "content-type": "text/event-stream" } })
+      }
+      if (url.pathname === "/api/chat/capabilities") {
+        sse(image())
+        sse({ type: "thinking", message: "keep", thread_id: thread.id })
+        sse(image())
+      }
+      return fetch(input, init)
+    }
+    const transport = new GatewayTransport({
+      baseUrl: mock.url,
+      token: new MemoryTokenSource(TOKEN),
+      thread: { kind: "id", id: thread.id },
+      clock: new ManualClock(),
+      timezone: "",
+      stateFile: new MemoryStateFile(),
+      fetchImpl,
+      expectedListener: { uid: UID, label: "test" },
+      readProc: procReaderFor(mock.port, UID),
+      env: {},
+      eventMaxBytes: 4096,
+      decodeImage: () => ({ mime: "image/png", bytes: TINY_PNG }),
+    })
+    cleanups.push(() => transport.close())
+    await transport.connect(new AbortController().signal)
+    const it = transport.events()[Symbol.asyncIterator]()
+    expect(await next(it)).toMatchObject({ kind: "turn.activity", activity: { kind: "thinking", text: "keep" } })
+    expect(await next(it)).toMatchObject({ kind: "turn.image", image: { bytes: TINY_PNG } })
+    expect(await next(it)).toEqual({ kind: "resync.required", reason: "overflow" })
+  })
 })
 
 describe("events", () => {
@@ -584,6 +629,23 @@ describe("events() bounds (EventChannel, 3.7)", () => {
     expect(channel.push(activity("e"))).toBe(false)
     channel.close()
     expect(await drain(channel)).toEqual([activity("b"), activity("c"), { kind: "resync.required", reason: "overflow" }])
+  })
+
+  test("byte overflow drops queued images first, stays under budget and emits a resync", async () => {
+    const image = (size: number): TransportEvent => ({
+      kind: "turn.image",
+      turnId: TURN,
+      image: { mime: "image/png", bytes: new Uint8Array(size) },
+    })
+    const channel = new EventChannel({ capacity: 100, maxBytes: 4096 })
+    expect(channel.push(image(2000))).toBe(true)
+    expect(channel.push(activity("keep"))).toBe(true)
+    expect(channel.push(image(2000))).toBe(true)
+    expect(channel.dropped).toBe(1)
+    expect(channel.bytes).toBeLessThanOrEqual(4096)
+    channel.close()
+    expect(await drain(channel)).toEqual([activity("keep"), { kind: "resync.required", reason: "overflow" }, image(2000)])
+    expect(channel.bytes).toBe(0)
   })
 
   test("a waiting consumer receives events directly; there is a single consumer; an early return runs onReturn", async () => {
@@ -1103,6 +1165,38 @@ describe("security", () => {
 
     const direct = await rig("current", { transport: { env: { HTTP_PROXY: "http://127.0.0.1:9", NO_PROXY: "*" } } })
     expect((await connect(direct)).protocol).toBe("gateway-chat")
+  })
+
+  test("HTTPS requests explicitly require certificate verification independently of Bun's environment", async () => {
+    const inits: Parameters<FetchLike>[1][] = []
+    let port = 0
+    const fetchImpl: FetchLike = async (input, init) => {
+      inits.push(init)
+      const url = new URL(input instanceof Request ? input.url : String(input))
+      url.protocol = "http:"
+      url.port = String(port)
+      return fetch(url, init)
+    }
+    const r = await rig("current", {
+      transport: { baseUrl: new URL("https://127.0.0.1"), expectedListener: null, fetchImpl },
+    })
+    port = r.mock.port
+    expect((await connect(r)).protocol).toBe("gateway-chat")
+    expect(inits.length).toBeGreaterThan(0)
+    for (const init of inits) expect(init?.tls).toEqual({ rejectUnauthorized: true })
+  })
+
+  test("NODE_TLS_REJECT_UNAUTHORIZED=0 fails an HTTPS request closed before anything is sent", async () => {
+    const r = await rig("current", {
+      transport: {
+        baseUrl: new URL("https://127.0.0.1:1"),
+        env: { NODE_TLS_REJECT_UNAUTHORIZED: "0" },
+      },
+    })
+    const error = await rejection(connect(r))
+    expect([error.code, error.fatal]).toEqual(["unsupported", true])
+    expect(error.message).toContain("NODE_TLS_REJECT_UNAUTHORIZED=0")
+    expect(r.mock.requests).toHaveLength(0)
   })
 
   test("plain http is accepted only to loopback unless allowed; credentials, queries and fragments are refused", () => {

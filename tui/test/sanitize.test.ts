@@ -37,10 +37,26 @@ describe("sanitizeText (3.12.5)", () => {
     const introducers = new Set([0x90, 0x98, 0x9b, 0x9d, 0x9e, 0x9f])
     for (let code = 0x7f; code <= 0x9f; code += 1) {
       const out = sanitizeText(`a${String.fromCharCode(code)}b`)
-      expect(out).toBe(introducers.has(code) ? "a" : "ab")
+      const expected = introducers.has(code) && code !== 0x9b ? "a […escape sequence removed]" : introducers.has(code) ? "a" : "ab"
+      expect(out).toBe(expected)
     }
     expect(sanitizeText("next\u0085line")).toBe("nextline")
     expect(sanitizeText("osc \u009d0;title\u009cafter")).toBe("osc after")
+  })
+
+  test("an unterminated escape string leaves a visible removal marker", () => {
+    const input = `before ${ESC}]0;title never-terminated after`
+    const output = sanitizeText(input)
+    expect(output).toBe("before […escape sequence removed]")
+    expect(output).toContain("before")
+    expect(output).toContain("escape sequence removed")
+    expect(sanitizeText(`${ESC}]0;complete${BEL}after`)).toBe("after")
+  })
+
+  test("OSC and DCS terminator handling matches OpenTUI", () => {
+    expect(sanitizeText(`${ESC}]0;title${ESC}\\after`)).toBe("after")
+    expect(sanitizeText(`${ESC}]0;title\u009cafter`)).toBe("after")
+    expect(sanitizeText(`before ${ESC}Ppayload${BEL}after`)).toBe("before after")
   })
 
   test("bidi embedding, override and isolate controls are removed", () => {

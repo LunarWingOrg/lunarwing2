@@ -136,7 +136,12 @@ describe("proxy environment (3.11.4)", () => {
   )
 
   test("neutralizeProxyEnv() assigns empty values instead of deleting, and sets NO_PROXY and no_proxy to *", () => {
-    const env: Record<string, string | undefined> = { HTTP_PROXY: "http://proxy.invalid:3128", all_proxy: "socks5://x", PATH: "/bin" }
+    const env: Record<string, string | undefined> = {
+      HTTP_PROXY: "http://proxy.invalid:3128",
+      all_proxy: "socks5://x",
+      NODE_TLS_REJECT_UNAUTHORIZED: "0",
+      PATH: "/bin",
+    }
     neutralizeProxyEnv(env)
     for (const name of PROXY_ENV_NAMES) {
       expect(Object.hasOwn(env, name)).toBe(true)
@@ -144,6 +149,7 @@ describe("proxy environment (3.11.4)", () => {
     }
     expect(env.NO_PROXY).toBe("*")
     expect(env.no_proxy).toBe("*")
+    expect(env.NODE_TLS_REJECT_UNAUTHORIZED).toBe("")
     expect(env.PATH).toBe("/bin")
   })
 })
