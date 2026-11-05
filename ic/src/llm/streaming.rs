@@ -153,14 +153,10 @@ pub(crate) async fn open_stream<'a>(
             }
             Some(Ok(first)) => {
                 let first_reasoning = reasoning.remove(0);
-                let rest = stream::iter(
-                    reasoning
-                        .into_iter()
-                        .chain(std::iter::once(first))
-                        .map(Ok),
-                )
-                .chain(stream)
-                .boxed();
+                let rest =
+                    stream::iter(reasoning.into_iter().chain(std::iter::once(first)).map(Ok))
+                        .chain(stream)
+                        .boxed();
                 return StreamOpening::Content {
                     first: first_reasoning,
                     rest,
