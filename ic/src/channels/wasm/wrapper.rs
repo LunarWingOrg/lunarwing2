@@ -5643,6 +5643,8 @@ mod tests {
 
     #[test]
     fn live_reasoning_never_reaches_wasm_on_status() {
+        use crate::channels::StatusUpdate;
+
         let live = StatusUpdate::ReasoningStream("provider reasoning".to_string());
         assert!(status_to_wit(&live, &serde_json::json!({})).is_none());
 
