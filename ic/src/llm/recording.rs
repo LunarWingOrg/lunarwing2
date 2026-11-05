@@ -504,7 +504,9 @@ impl StreamTraceAccumulator {
                 }
                 tool_call.arguments.push_str(args_delta);
             }
-            LlmStreamChunk::Observation(_) | LlmStreamChunk::Done { .. } => {}
+            LlmStreamChunk::ReasoningDelta(_)
+            | LlmStreamChunk::Observation(_)
+            | LlmStreamChunk::Done { .. } => {}
         }
     }
 
@@ -950,6 +952,7 @@ mod tests {
                     usage: Some(TokenUsage {
                         input_tokens: 7,
                         output_tokens: 3,
+                        reasoning_tokens: 0,
                         cache_read_input_tokens: 0,
                         cache_creation_input_tokens: 0,
                     }),
@@ -1012,6 +1015,7 @@ mod tests {
                     usage: Some(TokenUsage {
                         input_tokens: 8,
                         output_tokens: 4,
+                        reasoning_tokens: 0,
                         cache_read_input_tokens: 0,
                         cache_creation_input_tokens: 0,
                     }),
@@ -1118,6 +1122,7 @@ mod tests {
                     usage: Some(TokenUsage {
                         input_tokens: 1,
                         output_tokens: 1,
+                        reasoning_tokens: 0,
                         cache_read_input_tokens: 0,
                         cache_creation_input_tokens: 0,
                     }),
