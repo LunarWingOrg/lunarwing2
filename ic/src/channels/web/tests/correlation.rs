@@ -273,6 +273,7 @@ fn status_variant(status: &StatusUpdate) -> &'static str {
         StatusUpdate::Suggestions { .. } => "Suggestions",
         StatusUpdate::SkillActivated { .. } => "SkillActivated",
         StatusUpdate::ReasoningUpdate { .. } => "ReasoningUpdate",
+        StatusUpdate::ReasoningStream(_) => "ReasoningStream",
         StatusUpdate::TurnCost { .. } => "TurnCost",
     }
 }
@@ -407,6 +408,11 @@ fn prompt_and_summary_status_cases() -> Vec<(StatusUpdate, serde_json::Value)> {
             },
             json!({"type": "reasoning_update", "narrative": "Selected 1 tool.",
                    "decisions": [{"tool_name": "http", "rationale": "Fetch the page."}], "thread_id": "t"}),
+        ),
+        (
+            StatusUpdate::ReasoningStream("bounded live reasoning".into()),
+            json!({"type": "reasoning_update", "narrative": "bounded live reasoning",
+                   "decisions": [], "thread_id": "t"}),
         ),
         (
             StatusUpdate::TurnCost {

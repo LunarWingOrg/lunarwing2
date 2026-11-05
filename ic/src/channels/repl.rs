@@ -884,6 +884,9 @@ impl Channel for ReplChannel {
                     eprintln!("    \x1b[90m\u{2192} {}: {display}\x1b[0m", d.tool_name);
                 }
             }
+            StatusUpdate::ReasoningStream(_) => {
+                // Raw provider reasoning is available only through the opt-in gateway stream.
+            }
             StatusUpdate::TurnCost { .. } => {
                 // Cost display is handled by the TUI channel
             }

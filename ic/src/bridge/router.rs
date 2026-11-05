@@ -4512,6 +4512,30 @@ async fn handle_mission_notification(
     }
 }
 
+fn engine_reasoning_stream_enabled() -> bool {
+    crate::config::env_or_override("ENGINE_V2_STREAM_REASONING")
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+async fn forward_reasoning_delta_to_channel(
+    content: &str,
+    channels: &std::sync::Arc<crate::channels::ChannelManager>,
+    channel_name: &str,
+    metadata: &serde_json::Value,
+    enabled: bool,
+) {
+    if !enabled || !channel_name.eq_ignore_ascii_case("gateway") {
+        return;
+    }
+    let _ = channels
+        .send_status(
+            channel_name,
+            StatusUpdate::ReasoningStream(content.to_string()),
+            metadata,
+        )
+        .await;
+}
+
 /// Forward an engine ThreadEvent to the channel as a StatusUpdate.
 ///
 /// `generated` is the image an image-tool `ActionExecuted` event produced; it is sent
@@ -4670,16 +4694,14 @@ async fn forward_event_to_channel(
                 .await;
         }
         EventKind::ReasoningDelta { content } => {
-            let _ = channels
-                .send_status(
-                    channel_name,
-                    StatusUpdate::ReasoningUpdate {
-                        narrative: content.clone(),
-                        decisions: Vec::new(),
-                    },
-                    metadata,
-                )
-                .await;
+            forward_reasoning_delta_to_channel(
+                content,
+                channels,
+                channel_name,
+                metadata,
+                engine_reasoning_stream_enabled(),
+            )
+            .await;
         }
         // Deltas are delivered channel-neutrally to every channel, including the
         // gateway (whose `send_status` maps `StreamChunk` to the SSE
@@ -9884,7 +9906,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn reasoning_delta_reaches_gateway_as_reasoning_update() {
+    async fn reasoning_delta_reaches_gateway_as_reasoning_stream_when_enabled() {
         use crate::testing::StubChannel;
 
         let manager = std::sync::Arc::new(crate::channels::ChannelManager::new());
@@ -9892,23 +9914,41 @@ pub(crate) mod tests {
         let gateway_statuses = gateway_stub.captured_statuses_handle();
         manager.add(Box::new(gateway_stub)).await;
 
-        let event = lunarwing_engine::ThreadEvent::new(
-            lunarwing_engine::ThreadId::new(),
-            lunarwing_engine::EventKind::ReasoningDelta {
-                content: "cumulative reasoning".to_string(),
-            },
-        );
-        forward_event_to_channel(&event, &manager, "gateway", &serde_json::json!({}), None).await;
+        forward_reasoning_delta_to_channel(
+            "bounded reasoning",
+            &manager,
+            "gateway",
+            &serde_json::json!({}),
+            true,
+        )
+        .await;
 
         let captured = gateway_statuses.lock().expect("poisoned");
         assert_eq!(captured.len(), 1);
         assert!(matches!(
             &captured[0],
-            StatusUpdate::ReasoningUpdate {
-                narrative,
-                decisions,
-            } if narrative == "cumulative reasoning" && decisions.is_empty()
+            StatusUpdate::ReasoningStream(narrative) if narrative == "bounded reasoning"
         ));
+    }
+
+    #[tokio::test]
+    async fn reasoning_delta_is_suppressed_when_disabled_or_on_xmpp() {
+        use crate::testing::StubChannel;
+
+        let manager = std::sync::Arc::new(crate::channels::ChannelManager::new());
+        let (gateway_stub, _gateway_tx) = StubChannel::new("gateway");
+        let gateway_statuses = gateway_stub.captured_statuses_handle();
+        manager.add(Box::new(gateway_stub)).await;
+        let (xmpp_stub, _xmpp_tx) = StubChannel::new("xmpp");
+        let xmpp_statuses = xmpp_stub.captured_statuses_handle();
+        manager.add(Box::new(xmpp_stub)).await;
+
+        let metadata = serde_json::json!({});
+        forward_reasoning_delta_to_channel("secret", &manager, "gateway", &metadata, false).await;
+        forward_reasoning_delta_to_channel("secret", &manager, "xmpp", &metadata, true).await;
+
+        assert!(gateway_statuses.lock().expect("poisoned").is_empty());
+        assert!(xmpp_statuses.lock().expect("poisoned").is_empty());
     }
 
     #[tokio::test]
