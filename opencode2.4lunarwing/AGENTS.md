@@ -92,7 +92,7 @@ Keep `ARG SOURCE_DATE_EPOCH=0` in the runtime stage before `useradd` and keep
 the same-layer shadow-day assertion. Shadow-utils records the epoch day in
 `/etc/shadow`; without the ARG a candidate and rebuild spanning UTC midnight
 have different file contents, which BuildKit's timestamp rewrite cannot fix
-(WI#510). All four workers and `CI_DEBIAN_SNAPSHOT` use `20261024T011300Z`,
+(WI#510). All four workers and `CI_DEBIAN_SNAPSHOT` use `20261105T082236Z`,
 which includes the Bookworm/Trixie Brotli security fixes; bump them together.
 Snapshot sources stay HTTPS, with `Acquire::Retries=0` and
 `Acquire::https::Timeout=60` on every `apt-get` call (WI#561); transient recovery
