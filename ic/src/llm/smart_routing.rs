@@ -1180,7 +1180,7 @@ mod tests {
     use futures::StreamExt;
 
     use crate::llm::ChatMessage;
-    use crate::llm::provider::LlmStreamChunk;
+    use crate::llm::provider::{LlmStreamChunk, TokenUsage};
     use crate::llm::streaming_test_support::{ScriptedStreamingProvider, StreamScript};
     use crate::testing::StubLlm;
 
