@@ -47,7 +47,7 @@ use crate::types::shared_owner_id;
 use crate::types::step::{ActionCall, LlmResponse, StepId, TokenUsage};
 use crate::types::thread::{Thread, ThreadState};
 
-use super::llm_stream::collect_llm_stream;
+use super::llm_stream::{LlmStreamDelta, collect_llm_stream};
 use super::scripting::{
     execute_code_with_action_limit, json_to_monty, monty_to_json, monty_to_string,
 };
@@ -783,18 +783,25 @@ async fn handle_llm_complete(
                 Err(error) => return (Err(error), Vec::new(), false),
             };
             let mut emitted_text = false;
-            let collection = collect_llm_stream(stream, |content| {
-                emitted_text = true;
+            let collection = collect_llm_stream(stream, |delta| {
                 let Some(tx) = event_tx else {
+                    if matches!(delta, LlmStreamDelta::Text(_)) {
+                        emitted_text = true;
+                    }
                     return;
                 };
-                let event = ThreadEvent::new(
-                    thread_id,
-                    EventKind::ResponseDelta {
+                let kind = match delta {
+                    LlmStreamDelta::Text(content) => {
+                        emitted_text = true;
+                        EventKind::ResponseDelta {
+                            content: content.to_string(),
+                        }
+                    }
+                    LlmStreamDelta::Reasoning(content) => EventKind::ReasoningDelta {
                         content: content.to_string(),
                     },
-                );
-                let _ = tx.send(event);
+                };
+                let _ = tx.send(ThreadEvent::new(thread_id, kind));
             })
             .await;
             (collection.result, collection.observations, emitted_text)
