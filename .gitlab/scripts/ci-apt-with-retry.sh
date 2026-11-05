@@ -19,7 +19,7 @@ while [ "$attempt" -le "$max_attempts" ]; do
     : > "$attempt_rc"
     { apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update &&
         apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install -y --no-install-recommends "$@" ||
-        printf '%s\n' "$?" > "$attempt_rc"; } | tee "$attempt_log"
+        printf '%s\n' "$?" > "$attempt_rc"; } 2>&1 | tee "$attempt_log"
     if [ ! -s "$attempt_rc" ]; then
         cleanup_attempt_files
         exit 0
