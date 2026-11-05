@@ -217,6 +217,20 @@ streamed. A name-only delta does not discard the final call's arguments; a
 final call can also supply an otherwise-missing name without duplicating
 already-streamed arguments.
 
+Provider reasoning follows a separate live path (WI#546): textual and summary
+reasoning blocks become `LlmStreamChunk::ReasoningDelta`, cross the host/engine
+bridge unchanged, and accumulate into live `EventKind::ReasoningDelta`
+snapshots. The router maps each cumulative snapshot to the existing
+`reasoning_update` status/SSE event with an empty tool-decision list, so the
+browser replaces the narrative without losing earlier fragments. Encrypted and
+redacted provider payloads stay opaque and are not rendered. Leading reasoning
+is replayed before final text by stream opening, but does not suppress the
+existing empty-response or output-budget retry when no final content arrives.
+Blocking Rig responses preserve displayable reasoning separately and attach it
+to their tool calls; worker proxy responses carry the same optional field.
+`reasoning_tokens` is retained through host and engine usage accounting as a
+subset of `output_tokens`, never as an additional term in token totals or cost.
+
 `repl_argument_corruption_total` counts rejected responses per provider in
 `runtime/llm-stream-metrics.json` (streaming and blocking paths). The existing
 registry-aware healthpoint aggregates it by tenant and exports
