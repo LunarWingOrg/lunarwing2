@@ -662,7 +662,7 @@ mod tests {
     fn reasoning_emission_respects_coalescing_interval() {
         let mut accumulator = StreamAccumulator::default();
         let mut emitted = Vec::new();
-        let mut on_delta = |delta| emitted.push(delta.to_string());
+        let mut on_delta = |delta: LlmStreamDelta<'_>| emitted.push(delta.to_string());
 
         accumulator
             .push(
