@@ -7,12 +7,12 @@ use crate::llm::config::CacheRetention;
 use async_trait::async_trait;
 use futures::StreamExt;
 use rig_core::OneOrMany;
+#[cfg(test)]
+use rig_core::completion::Usage as RigUsage;
 use rig_core::completion::{
     AssistantContent, CompletionModel, CompletionRequest as RigRequest, GetTokenUsage,
     ToolDefinition as RigToolDefinition,
 };
-#[cfg(test)]
-use rig_core::completion::Usage as RigUsage;
 use rig_core::message::{
     DocumentSourceKind, Image, ImageMediaType, Message as RigMessage, MimeType, ReasoningContent,
     ToolChoice as RigToolChoice, ToolFunction, ToolResult as RigToolResult, ToolResultContent,
@@ -1261,13 +1261,14 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(reasoning, ["think ", "summary"]);
-        assert!(chunks.iter().any(
-            |item| matches!(item, Ok(LlmStreamChunk::TextDelta(text)) if text == "answer")
-        ));
+        assert!(
+            chunks.iter().any(
+                |item| matches!(item, Ok(LlmStreamChunk::TextDelta(text)) if text == "answer")
+            )
+        );
         let reasoning_tokens = chunks.iter().find_map(|item| match item {
             Ok(LlmStreamChunk::Done {
-                usage: Some(usage),
-                ..
+                usage: Some(usage), ..
             }) => Some(usage.reasoning_tokens),
             _ => None,
         });
