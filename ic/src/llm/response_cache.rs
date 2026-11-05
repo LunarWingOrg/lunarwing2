@@ -624,21 +624,36 @@ mod tests {
         ));
         let cached = CachedProvider::new(provider.clone(), ResponseCacheConfig::default());
 
-        for _ in 0..2 {
+        for attempt in 0..2 {
             let chunks = cached
                 .complete_stream(simple_request())
                 .await
                 .expect("stream should open")
                 .collect::<Vec<_>>()
                 .await;
-            assert!(matches!(
-                chunks.first(),
-                Some(Ok(LlmStreamChunk::ReasoningDelta(text))) if text == "thinking"
-            ));
-            assert!(matches!(
-                chunks.get(1),
-                Some(Ok(LlmStreamChunk::TextDelta(text))) if text == "answer"
-            ));
+            if attempt == 0 {
+                assert!(matches!(
+                    chunks.first(),
+                    Some(Ok(LlmStreamChunk::ReasoningDelta(text))) if text == "think"
+                ));
+                assert!(matches!(
+                    chunks.get(1),
+                    Some(Ok(LlmStreamChunk::ReasoningDelta(text))) if text == "ing"
+                ));
+                assert!(matches!(
+                    chunks.get(2),
+                    Some(Ok(LlmStreamChunk::TextDelta(text))) if text == "answer"
+                ));
+            } else {
+                assert!(matches!(
+                    chunks.first(),
+                    Some(Ok(LlmStreamChunk::ReasoningDelta(text))) if text == "thinking"
+                ));
+                assert!(matches!(
+                    chunks.get(1),
+                    Some(Ok(LlmStreamChunk::TextDelta(text))) if text == "answer"
+                ));
+            }
         }
         assert_eq!(provider.plain_calls(), 1);
     }
