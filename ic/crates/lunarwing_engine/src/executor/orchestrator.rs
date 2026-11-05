@@ -826,11 +826,13 @@ fn llm_output_result(
 ) -> ExtFunctionResult {
     total_tokens.input_tokens += output.usage.input_tokens;
     total_tokens.output_tokens += output.usage.output_tokens;
+    total_tokens.reasoning_tokens += output.usage.reasoning_tokens;
     total_tokens.cost_usd += output.usage.cost_usd;
 
     let usage = serde_json::json!({
         "input_tokens": output.usage.input_tokens,
         "output_tokens": output.usage.output_tokens,
+        "reasoning_tokens": output.usage.reasoning_tokens,
         "cost_usd": output.usage.cost_usd,
     });
     let provider_observation = observation_context(observations);
