@@ -296,7 +296,7 @@ stamped message caused it.
 | `stream_chunk` | `content`, `thread_id?` | V2 only; the final `response.content` is canonical | yes |
 | `tool_started` / `tool_result` / `tool_completed` | `name` / `name, preview` / `name, success, error?, parameters?` | V1 and V2 (V2 previews at most 1000 bytes; on V2 `parameters` is the duration, for example `"8123ms"`) | yes |
 | `image_generated` | `data_url`, `path?`, `thread_id?` | V1 and V2 image tools; replaces the tool's `tool_result` | yes |
-| `reasoning_update` | `narrative`, `decisions[{tool_name, rationale}]`, `thread_id?` | V1/V2 tool summaries; V2 also cumulative live provider reasoning with `decisions: []` | yes |
+| `reasoning_update` | `narrative`, `decisions[{tool_name, rationale}]`, `thread_id?` | V1/V2 tool summaries; opted-in V2 live provider snapshots with `decisions: []` | yes |
 | `status` | `message`, `thread_id?` | progress and misc (skills, external waits); an empty `message` must be ignored | yes |
 | `approval_needed` | `request_id`, `tool_name`, `description`, `parameters` (redacted, pretty JSON), `thread_id?`, `allow_always` | V1, V2 | yes |
 | `gate_required` | `request_id`, `gate_name`, `tool_name`, `description`, `parameters`, `resume_kind`, `thread_id?` | V2; deduplicate with `approval_needed` by `request_id` | yes |
@@ -307,6 +307,17 @@ stamped message caused it.
 | `job_started` | `job_id`, `title`, `browse_url` | a job created during a turn | yes |
 | `job_message`, `job_tool_use`, `job_tool_result`, `job_status`, `job_result` | as named | the job event bus | no |
 | `extension_status`, `skill_activated`, `error`, `heartbeat`, `stream_gap` | as named | extensions, unused, unused, global, lag | no |
+
+Live provider reasoning is off by default. Set `ENGINE_V2_STREAM_REASONING=true`
+(or `1`) to emit it on the gateway only; browser and TUI clients then receive
+an immediate snapshot followed by at most one snapshot every 300 ms per LLM
+stream, with pending reasoning flushed before answer text and at stream end.
+Each `narrative` is the trailing **16 KiB** of cumulative reasoning, cut at a
+UTF-8 boundary, so clients replace rather than append it and may no longer show
+the earlier prefix. These events are live-only, never enter durable thread
+history, and are not forwarded to WASM channels, XMPP, or the local REPL.
+Tool-selection summaries keep the same event shape and are not affected by the
+opt-in flag.
 
 Typical Engine V2 turn with one image tool call:
 

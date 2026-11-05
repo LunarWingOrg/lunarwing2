@@ -381,8 +381,9 @@ pub enum EventKind {
     ResponseDelta {
         content: String,
     },
-    /// A cumulative provider-reasoning snapshot for live delivery. Like
-    /// [`EventKind::ResponseDelta`], this is not part of durable thread history.
+    /// A coalesced, trailing-16-KiB provider-reasoning snapshot for opt-in live
+    /// delivery. Like [`EventKind::ResponseDelta`], this is not persisted in
+    /// durable thread history.
     ReasoningDelta {
         content: String,
     },

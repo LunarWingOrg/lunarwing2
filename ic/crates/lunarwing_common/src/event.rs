@@ -234,7 +234,7 @@ pub enum AppEvent {
         message: Option<String>,
     },
 
-    /// Tool-selection reasoning or cumulative live provider reasoning.
+    /// Tool-selection reasoning or an opt-in bounded live provider snapshot.
     #[serde(rename = "reasoning_update")]
     ReasoningUpdate {
         narrative: String,

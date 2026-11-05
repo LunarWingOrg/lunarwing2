@@ -217,15 +217,23 @@ streamed. A name-only delta does not discard the final call's arguments; a
 final call can also supply an otherwise-missing name without duplicating
 already-streamed arguments.
 
-Provider reasoning follows a separate live path (WI#546): textual and summary
-reasoning blocks become `LlmStreamChunk::ReasoningDelta`, cross the host/engine
-bridge unchanged, and accumulate into live `EventKind::ReasoningDelta`
-snapshots. The router maps each cumulative snapshot to the existing
-`reasoning_update` status/SSE event with an empty tool-decision list, so the
-browser replaces the narrative without losing earlier fragments. Encrypted and
-redacted provider payloads stay opaque and are not rendered. Leading reasoning
-is replayed before final text by stream opening, but does not suppress the
-existing empty-response or output-budget retry when no final content arrives.
+Provider reasoning follows a separate opt-in live path (WI#546): textual and
+summary reasoning blocks become `LlmStreamChunk::ReasoningDelta`, cross the
+host/engine bridge unchanged, and accumulate into live
+`EventKind::ReasoningDelta` snapshots. After an immediate first snapshot, each
+LLM stream emits at most one every 300 ms; pending reasoning flushes before
+answer text, at `Done`, and on stream termination. Every snapshot is only the
+trailing 16 KiB of the cumulative reasoning, cut at a UTF-8 boundary. The
+router forwards these snapshots only for the gateway when
+`ENGINE_V2_STREAM_REASONING=true` (or `1`); the default is off. The gateway
+maps them to the existing `reasoning_update` SSE event with `decisions: []` for
+both browser and TUI clients, which replace the narrative with the latest
+bounded tail. WASM channels (including XMPP) and the local REPL discard the
+distinct internal `ReasoningStream` status, while `ReasoningUpdate` remains the
+tool-selection summary. Encrypted and redacted provider payloads stay opaque
+and are not rendered. Leading reasoning is replayed before final text by
+stream opening, but does not suppress the existing empty-response or
+output-budget retry when no final content arrives.
 Blocking Rig responses preserve displayable reasoning separately and attach it
 to their tool calls; worker proxy responses carry the same optional field.
 `reasoning_tokens` is retained through host and engine usage accounting as a
