@@ -362,8 +362,12 @@ host's concurrent builds before retrying manually.
   by `validate_config.py`), not the live deb.debian.org mirror. That archive
   is a best-effort, throttled service, so the lane's `apt-get update` and
   `apt-get install` both run with
-  `Acquire::Retries=5`/`Acquire::http::Timeout=60`; a snapshot outage
-  still fails this required lane until the service recovers (retry the job).
+  `Acquire::Retries=5`/`Acquire::http::Timeout=60`. Since 2026-11-05,
+  `ci-apt-with-retry.sh` also gives classified snapshot fetch failures three
+  attempts with 120/300-second delays plus job-id-based jitter (pipeline 7193,
+  job 157425). Permanent package failures still exit on the first attempt; a
+  full snapshot outage fails after the third attempt until the service
+  recovers (retry the job).
   Runs on every MR/branch
   push and protected release tag on the digest-pinned `CI_NODE_IMAGE`, which
   `validate_config.py` ties to the node FROM digest(s) in

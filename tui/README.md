@@ -101,9 +101,9 @@ sudo ic/scripts/lunarwing-mt-admin.sh tui-access <tenant> --for-user <user> --re
   the sticky warning "this TUI uses the tenant master token" while it uses one.
 - Running the grant again rotates the token. `--revoke` removes the tenant-side entry and the desktop
   file. A connected TUI then goes offline with a hint that names `tui-access`.
-- Other options: `--url-host <host>` overrides the URL host, and `--no-verify` skips the capability
-  check and the post-grant probes. Exit status: 0 done, 1 refused (including a client grant the daemon
-  cannot authenticate), 2 files written but the running daemon rejected the token.
+- Other options: `--url-host <ip>` overrides the URL host (only `localhost` or an IP literal; DNS names
+  are refused), and `--no-verify` skips the capability check and the post-grant probes. Exit status: 0 done,
+  1 refused (including a client grant the daemon cannot authenticate), 2 files written but the running daemon rejected the token.
   The details are in `docs/guides/MT-ADMIN-QUICKSTART.md` ("TUI access for a desktop user").
 - Never copy the output of `mt-admin tokens` into a file for the TUI. That verb is for the web login.
 
@@ -465,7 +465,8 @@ own dictation (`/dictations`) and the Hex CLI are not used in this release.
   binary is `[voice.hex] command` or `LUNARWING_TUI_HEX_BIN`. The child gets an allowlisted environment
   without `TRANSCRIBE_DUMP_DIR`. It must print one ready line within 15 s
   (`{"type":"ready","url":"http://127.0.0.1:<port>","token":"hex_...","apiVersion":"2","pid":<pid>}`;
-  the pid must be the child's own), and the TUI checks the port's owner again. The child lives only
+  the pid must be the child's own), and the TUI checks the port's owner again. Every matching listener
+  must be loopback-only: a `0.0.0.0` or `::` wildcard bind is refused even when its uid matches. The child lives only
   while its stdin stays open, and the TUI never writes to it. If the TUI quits or crashes, even by
   SIGKILL, the child exits within about 5 s. It stays up 10 minutes after the last transcription. On
   quit the TUI closes stdin, sends SIGTERM after 6 s and SIGKILL after 10 s. Embedded mode writes no
@@ -604,13 +605,16 @@ meter at 4 Hz. `[ui] cursor_blink = false` stops the cursor blinking.
 - Before any token leaves the client for a loopback port (the gateway, or Hex), the TUI checks in
   `/proc/net/tcp` and `/proc/net/tcp6` that the listening socket belongs to the expected uid: the
   tenant's uid from the tenant file, `expected_uid`, or your own. A mismatch goes offline with "port N
-  is held by uid U, expected X" before any authenticated request.
+  is held by uid U, expected X" before any authenticated request. Only `localhost` and IP literals are
+  matched; another DNS name fails closed rather than borrowing the owner of an unrelated local port.
 - Plain `http` is accepted only to loopback (127.0.0.0/8, `::1`, `localhost`), unless
   `allow_insecure_http = true` (sticky warning). URLs with credentials, a query or a fragment are refused,
   and so are redirects.
-- Tokens never appear on argv, in URLs, in logs, in error messages or on screen. HTTP proxy variables are
-  neutralized at start. If one is still set, gateway and Hex requests are refused rather than sent
-  through the proxy.
+- Tokens never appear on argv, in URLs, in logs, in error messages or on screen. HTTP proxy variables and
+  `NODE_TLS_REJECT_UNAUTHORIZED` are neutralized at start. Every gateway fetch also sets Bun's
+  `tls.rejectUnauthorized: true`, which overrides that environment variable even if Bun cached it. If a proxy is
+  still set, gateway and Hex requests are refused rather than sent through it; an HTTPS request is also refused
+  if the TLS-disable variable is `0`.
 - Child processes (`parec`, `pactl`, `wl-paste`, `wl-copy`, `grim`, `slurp`, `notify-send`, `xdg-open`,
   `hex`) are started without a shell, with an argv array and an allowlisted environment. They never get a
   token, the proxy variables or `TRANSCRIBE_DUMP_DIR`. `pactl list short sources` runs only for the parec
@@ -618,8 +622,11 @@ meter at 4 Hz. `[ui] cursor_blink = false` stops the cursor blinking.
 - The restart probe `GET /api/gateway/status` is an ordinary authenticated request: the listener-owner
   check runs before it, the token goes only in its `Authorization` header, and the client reads nothing
   but `uptime_secs` from the answer.
+- Inbound event queues retain at most 64 MiB in aggregate (in addition to per-event limits). On byte pressure,
+  queued images are dropped first and a `resync.required` notice requests canonical history instead.
 - Server text (replies, activity, notices, captions) is stripped of escape sequences, control characters
-  and bidi controls before it is shown. Approval text shows them as visible escapes instead.
+  and bidi controls before it is shown. If an unterminated escape string consumes the rest of a reply, a
+  visible `[…escape sequence removed]` marker records the truncation. Approval text shows controls as visible escapes instead.
 
 ## Troubleshooting
 
