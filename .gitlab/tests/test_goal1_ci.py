@@ -71,9 +71,9 @@ class WorkerSnapshotSecurityTests(unittest.TestCase):
         self.assertEqual(
             self.errors(stale),
             [
-                "CI_DEBIAN_SNAPSHOT predates the CVE-2026-111497 Brotli fixes",
+                "CI_DEBIAN_SNAPSHOT predates the CVE-2026-109518 APT fixes",
                 *(
-                    f"{path} ARG DEBIAN_SNAPSHOT predates the CVE-2026-111497 Brotli fixes"
+                    f"{path} ARG DEBIAN_SNAPSHOT predates the CVE-2026-109518 APT fixes"
                     for path in self.dockerfiles.values()
                 ),
             ],
