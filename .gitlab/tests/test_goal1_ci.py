@@ -2627,25 +2627,26 @@ class WorkerTsLaneTests(unittest.TestCase):
             merged.update(config.load_yaml(ROOT / include.lstrip("/")))
         self.assertEqual(self.errors(merged), [])
 
-    def test_missing_apt_retries_are_caught(self):
-        # HE-4/HN-8: reverting the snapshot fetches to retry-less apt-get
-        # drops the pinned provisioning fragment — on update and install
-        # together, or on the install half alone.
-        merged = self.merged()
-        merged["worker-kimi-ts"]["script"] = [
-            command.replace(" -o Acquire::Retries=5 -o Acquire::http::Timeout=60", "")
-            for command in merged["worker-kimi-ts"]["script"]
-        ]
-        self.assertTrue(any("Acquire::Retries" in error for error in self.errors(merged)))
-        merged = self.merged()
-        merged["worker-kimi-ts"]["script"] = [
-            command.replace(
-                "apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install",
-                "apt-get install",
-            )
-            for command in merged["worker-kimi-ts"]["script"]
-        ]
-        self.assertTrue(any("Acquire::Retries" in error for error in self.errors(merged)))
+    def test_retry_less_apt_provisioning_is_caught(self):
+        # HE-4/HN-8: the lane cannot bypass the retry helper with retry-less
+        # inline apt-get, whether both halves or only install lose the options.
+        provisioning = next(
+            i
+            for i, command in enumerate(self.merged()["worker-kimi-ts"]["script"])
+            if "ci-apt-with-retry.sh" in command
+        )
+        variants = (
+            "apt-get update && apt-get install -y --no-install-recommends python3",
+            "apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update && "
+            "apt-get install -y --no-install-recommends python3",
+        )
+        for command in variants:
+            with self.subTest(command=command):
+                merged = self.merged()
+                merged["worker-kimi-ts"]["script"][provisioning] = command
+                self.assertTrue(
+                    any("exactly the pinned commands" in error for error in self.errors(merged))
+                )
 
     def test_main_runs_the_lane_validator(self):
         # MR !1618 review GV-2: every unit test above calls the validator

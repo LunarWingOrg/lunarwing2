@@ -124,12 +124,13 @@ worker-kimi-ts:
     # Install it from the pinned CI_DEBIAN_SNAPSHOT archive (tied to the
     # Dockerfile ARG DEBIAN_SNAPSHOT), mirroring the builder stage's apt
     # source setup — not from the live deb.debian.org mirror (GV-4).
-    # snapshot.debian.org is a best-effort, throttled service, so both the
-    # update and the install fetches retry; an outage still fails the lane
-    # until the service recovers (MR !1627 review HE-4, MR !1644 review HN-8).
+    # snapshot.debian.org is a best-effort, throttled service, so apt retries
+    # individual fetches and the helper gives classified snapshot failures a
+    # separate three-attempt ladder (120/300-second delays plus job-id jitter).
+    # Permanent package failures still exit on the first attempt.
     - rm -f /etc/apt/sources.list.d/debian.sources
     - printf '%s\n' "deb http://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm main" "deb http://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm-updates main" "deb http://snapshot.debian.org/archive/debian-security/${CI_DEBIAN_SNAPSHOT}/ bookworm-security main" > /etc/apt/sources.list
-    - apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install -y --no-install-recommends python3
+    - sh .gitlab/scripts/ci-apt-with-retry.sh python3
     - cd kimicode4lunarwing/scripts
     - npm ci --ignore-scripts
     - npx tsc -p tsconfig.json
