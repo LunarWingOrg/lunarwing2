@@ -1211,9 +1211,11 @@ mod tests {
         assert_eq!(buffered.response.reasoning.as_deref(), Some("thinking"));
         assert_eq!(buffered.response.content, "answer");
         assert_eq!(buffered.response.reasoning_tokens, 3);
-        assert!(buffered.chunks.iter().any(
-            |chunk| matches!(chunk, LlmStreamChunk::ReasoningDelta(text) if text == "think")
-        ));
+        assert!(
+            buffered.chunks.iter().any(
+                |chunk| matches!(chunk, LlmStreamChunk::ReasoningDelta(text) if text == "think")
+            )
+        );
     }
 
     // -----------------------------------------------------------------------
