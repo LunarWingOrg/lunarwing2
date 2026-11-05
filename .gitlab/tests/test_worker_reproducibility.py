@@ -133,6 +133,7 @@ class WorkerReproducibilityTests(unittest.TestCase):
                 self.assertEqual(text.count("Acquire::Retries=0"), apt_calls)
                 self.assertEqual(text.count("Acquire::https::Timeout=60"), apt_calls)
                 self.assertNotRegex(text, r"Acquire::Retries=[1-9]")
+                self.assertEqual(text.count("--no-install-recommends apt"), 3)
 
 
 if __name__ == "__main__":
