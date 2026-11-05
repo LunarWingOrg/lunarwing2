@@ -109,7 +109,8 @@ export const GATEWAY_PROXY_ENV_NAMES = ["http_proxy", "HTTP_PROXY", "https_proxy
 // Options
 // ---------------------------------------------------------------------------------------------------------
 
-export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>
+export type FetchRequestInit = RequestInit & { tls?: { rejectUnauthorized: boolean } }
+export type FetchLike = (input: string | URL | Request, init?: FetchRequestInit) => Promise<Response>
 
 export interface GatewayTransportOptions {
   baseUrl: URL
@@ -1151,7 +1152,14 @@ export class GatewayTransport implements Transport {
       headers.set("Content-Type", "application/json")
       body = JSON.stringify(spec.body())
     }
-    return this.fetchImpl(this.url(spec.path, spec.query), { method: spec.method, headers, body, redirect: "error", signal })
+    return this.fetchImpl(this.url(spec.path, spec.query), {
+      method: spec.method,
+      headers,
+      body,
+      redirect: "error",
+      signal,
+      tls: { rejectUnauthorized: true },
+    })
   }
 
   private refuseRedirect(res: Response, spec: CallSpec): Response {

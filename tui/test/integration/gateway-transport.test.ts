@@ -1167,6 +1167,25 @@ describe("security", () => {
     expect((await connect(direct)).protocol).toBe("gateway-chat")
   })
 
+  test("HTTPS requests explicitly require certificate verification independently of Bun's environment", async () => {
+    const inits: Parameters<FetchLike>[1][] = []
+    let port = 0
+    const fetchImpl: FetchLike = async (input, init) => {
+      inits.push(init)
+      const url = new URL(input instanceof Request ? input.url : String(input))
+      url.protocol = "http:"
+      url.port = String(port)
+      return fetch(url, init)
+    }
+    const r = await rig("current", {
+      transport: { baseUrl: new URL("https://127.0.0.1"), expectedListener: null, fetchImpl },
+    })
+    port = r.mock.port
+    expect((await connect(r)).protocol).toBe("gateway-chat")
+    expect(inits.length).toBeGreaterThan(0)
+    for (const init of inits) expect(init?.tls).toEqual({ rejectUnauthorized: true })
+  })
+
   test("NODE_TLS_REJECT_UNAUTHORIZED=0 fails an HTTPS request closed before anything is sent", async () => {
     const r = await rig("current", {
       transport: {
