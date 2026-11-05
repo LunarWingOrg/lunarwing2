@@ -110,7 +110,7 @@ class WorkerReproducibilityTests(unittest.TestCase):
         defaults = yaml.safe_load((ROOT / ".gitlab/ci/defaults.yml").read_text())
         snapshot = defaults["variables"]["CI_DEBIAN_SNAPSHOT"]
         self.assertRegex(snapshot, r"^\d{8}T\d{6}Z$")
-        self.assertGreaterEqual(snapshot, "20261024T011300Z")
+        self.assertGreaterEqual(snapshot, "20261105T082236Z")
         for lane in WORKERS:
             with self.subTest(lane=lane):
                 pins = re.findall(
