@@ -586,7 +586,7 @@ mod tests {
                     usage: Some(TokenUsage {
                         input_tokens: 3,
                         output_tokens: 2,
-                    reasoning_tokens: 0,
+                        reasoning_tokens: 0,
                         cache_read_input_tokens: 1,
                         cache_creation_input_tokens: 0,
                     }),
@@ -679,7 +679,7 @@ mod tests {
                     usage: Some(TokenUsage {
                         input_tokens: 3,
                         output_tokens: 2,
-                    reasoning_tokens: 0,
+                        reasoning_tokens: 0,
                         cache_read_input_tokens: 1,
                         cache_creation_input_tokens: 0,
                     }),
