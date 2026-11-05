@@ -96,7 +96,9 @@ have different file contents, which BuildKit's timestamp rewrite cannot fix
 which includes the Bookworm/Trixie Brotli security fixes; bump them together.
 Snapshot sources stay HTTPS, with `Acquire::Retries=0` and
 `Acquire::https::Timeout=60` on every `apt-get` call (WI#561); transient recovery
-belongs to bounded outer retries, not APT's automatic download retries.
+belongs to bounded outer retries, not APT's automatic download retries. Keep both
+direct CA-bundle copies from the digest-pinned Python image before APT and the
+exact `3.0.4` installed-version assertions; slim bases may have no trust store.
 
 The Bun 1.4.4 photon-node hunk-10 repair that this lane used to apply at the
 v2.1.2 pin is retired: v2.2.5 carries the `61845b0` whitespace repair as a
