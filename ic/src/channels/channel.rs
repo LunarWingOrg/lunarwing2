@@ -404,11 +404,12 @@ pub enum StatusUpdate {
     Suggestions { suggestions: Vec<String> },
     /// Skills activated for this conversation turn.
     SkillActivated { skill_names: Vec<String> },
-    /// Safe reasoning summary for selected tools.
+    /// Tool-selection reasoning or cumulative live provider reasoning.
     ReasoningUpdate {
-        /// Human-readable summary of the agent's decision.
+        /// Human-readable reasoning narrative. Provider deltas are accumulated
+        /// by the engine so replacing this narrative never drops earlier text.
         narrative: String,
-        /// Per-tool decisions.
+        /// Per-tool decisions; empty for live provider reasoning.
         decisions: Vec<ToolDecision>,
     },
     /// Per-turn token usage and cost summary (shown as subtle metadata).

@@ -175,6 +175,7 @@ fn map_usage(usage: crate::llm::TokenUsage) -> TokenUsage {
     map_usage_fields(
         usage.input_tokens,
         usage.output_tokens,
+        usage.reasoning_tokens,
         usage.cache_read_input_tokens,
         usage.cache_creation_input_tokens,
     )
@@ -183,12 +184,14 @@ fn map_usage(usage: crate::llm::TokenUsage) -> TokenUsage {
 fn map_usage_fields(
     input_tokens: u32,
     output_tokens: u32,
+    reasoning_tokens: u32,
     cache_read_tokens: u32,
     cache_write_tokens: u32,
 ) -> TokenUsage {
     TokenUsage {
         input_tokens: u64::from(input_tokens),
         output_tokens: u64::from(output_tokens),
+        reasoning_tokens: u64::from(reasoning_tokens),
         cache_read_tokens: u64::from(cache_read_tokens),
         cache_write_tokens: u64::from(cache_write_tokens),
         cost_usd: 0.0,
@@ -199,6 +202,9 @@ fn map_stream_chunk(chunk: crate::llm::LlmStreamChunk) -> lunarwing_engine::LlmS
     match chunk {
         crate::llm::LlmStreamChunk::TextDelta(text) => {
             lunarwing_engine::LlmStreamChunk::TextDelta(text)
+        }
+        crate::llm::LlmStreamChunk::ReasoningDelta(text) => {
+            lunarwing_engine::LlmStreamChunk::ReasoningDelta(text)
         }
         crate::llm::LlmStreamChunk::ToolCallDelta {
             index,
@@ -244,6 +250,7 @@ fn map_completion_response(response: CompletionResponse) -> Result<LlmOutput, En
         usage: map_usage_fields(
             response.input_tokens,
             response.output_tokens,
+            response.reasoning_tokens,
             response.cache_read_input_tokens,
             response.cache_creation_input_tokens,
         ),
@@ -255,6 +262,7 @@ fn map_tool_response(response: ToolCompletionResponse) -> Result<LlmOutput, Engi
     let usage = map_usage_fields(
         response.input_tokens,
         response.output_tokens,
+        response.reasoning_tokens,
         response.cache_read_input_tokens,
         response.cache_creation_input_tokens,
     );
@@ -462,6 +470,7 @@ fn log_output_budget_retry(
 fn add_usage(base: &mut TokenUsage, extra: TokenUsage) {
     base.input_tokens = base.input_tokens.saturating_add(extra.input_tokens);
     base.output_tokens = base.output_tokens.saturating_add(extra.output_tokens);
+    base.reasoning_tokens = base.reasoning_tokens.saturating_add(extra.reasoning_tokens);
     base.cache_read_tokens = base
         .cache_read_tokens
         .saturating_add(extra.cache_read_tokens);
@@ -764,6 +773,7 @@ mod tests {
                 discarded_usage: Some(HostUsage {
                     input_tokens: 2000,
                     output_tokens: 0,
+                    reasoning_tokens: 0,
                     cache_read_input_tokens: 300,
                     cache_creation_input_tokens: 50,
                 }),
@@ -777,6 +787,7 @@ mod tests {
                     discarded_usage: Some(TokenUsage {
                         input_tokens: 2000,
                         output_tokens: 0,
+                        reasoning_tokens: 0,
                         cache_read_tokens: 300,
                         cache_write_tokens: 50,
                         cost_usd: 0.0,
@@ -791,12 +802,14 @@ mod tests {
         let provider = Arc::new(ScriptedStreamingProvider::new(
             "primary",
             vec![StreamScript::Items(vec![
+                Ok(HostChunk::ReasoningDelta("thinking".into())),
                 Ok(HostChunk::TextDelta("hel".into())),
                 Ok(HostChunk::TextDelta("lo".into())),
                 Ok(HostChunk::Done {
                     usage: Some(HostUsage {
                         input_tokens: 8,
                         output_tokens: 3,
+                        reasoning_tokens: 2,
                         cache_read_input_tokens: 2,
                         cache_creation_input_tokens: 1,
                     }),
@@ -815,15 +828,17 @@ mod tests {
             .await;
 
         assert_eq!(provider.plain_calls(), 1);
-        assert!(matches!(&chunks[0], Ok(EngineChunk::TextDelta(text)) if text == "hel"));
-        assert!(matches!(&chunks[1], Ok(EngineChunk::TextDelta(text)) if text == "lo"));
-        match &chunks[2] {
+        assert!(matches!(&chunks[0], Ok(EngineChunk::ReasoningDelta(text)) if text == "thinking"));
+        assert!(matches!(&chunks[1], Ok(EngineChunk::TextDelta(text)) if text == "hel"));
+        assert!(matches!(&chunks[2], Ok(EngineChunk::TextDelta(text)) if text == "lo"));
+        match &chunks[3] {
             Ok(EngineChunk::Done {
                 usage: Some(usage),
                 finish_reason,
             }) => {
                 assert_eq!(usage.input_tokens, 8);
                 assert_eq!(usage.output_tokens, 3);
+                assert_eq!(usage.reasoning_tokens, 2);
                 assert_eq!(usage.cache_read_tokens, 2);
                 assert_eq!(usage.cache_write_tokens, 1);
                 assert_eq!(usage.cost_usd, 0.0);
@@ -1091,8 +1106,10 @@ mod tests {
                 .push(request);
             Ok(CompletionResponse {
                 content: "plain".to_string(),
+                reasoning: None,
                 input_tokens: 1,
                 output_tokens: 1,
+                reasoning_tokens: 0,
                 finish_reason: FinishReason::Stop,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
@@ -1110,8 +1127,10 @@ mod tests {
             Ok(ToolCompletionResponse {
                 content: Some("tools".to_string()),
                 tool_calls: Vec::new(),
+                reasoning: None,
                 input_tokens: 1,
                 output_tokens: 1,
+                reasoning_tokens: 0,
                 finish_reason: FinishReason::Stop,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
@@ -1214,8 +1233,10 @@ mod tests {
         ) -> Result<CompletionResponse, LlmError> {
             Ok(CompletionResponse {
                 content: "truncated".to_string(),
+                reasoning: None,
                 input_tokens: 1,
                 output_tokens: 1,
+                reasoning_tokens: 0,
                 finish_reason: self.plain_reason,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
@@ -1234,8 +1255,10 @@ mod tests {
                     arguments: serde_json::json!({}),
                     reasoning: None,
                 }],
+                reasoning: None,
                 input_tokens: 1,
                 output_tokens: 1,
+                reasoning_tokens: 0,
                 finish_reason: self.tool_reason,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
@@ -1375,6 +1398,7 @@ mod tests {
         HostUsage {
             input_tokens,
             output_tokens,
+            reasoning_tokens: 0,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         }
@@ -1383,8 +1407,10 @@ mod tests {
     fn plain_response(content: &str, input_tokens: u32, output_tokens: u32) -> CompletionResponse {
         CompletionResponse {
             content: content.to_string(),
+            reasoning: None,
             input_tokens,
             output_tokens,
+            reasoning_tokens: 0,
             finish_reason: FinishReason::Stop,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
@@ -1434,8 +1460,10 @@ mod tests {
             self.next_blocking().map(|response| ToolCompletionResponse {
                 content: Some(response.content),
                 tool_calls: Vec::new(),
+                reasoning: response.reasoning,
                 input_tokens: response.input_tokens,
                 output_tokens: response.output_tokens,
+                reasoning_tokens: response.reasoning_tokens,
                 finish_reason: response.finish_reason,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,

@@ -61,8 +61,12 @@ pub struct ProxyCompletionRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ProxyCompletionResponse {
     pub content: String,
+    #[serde(default)]
+    pub reasoning: Option<String>,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    #[serde(default)]
+    pub reasoning_tokens: u32,
     pub finish_reason: String,
     #[serde(default)]
     pub cache_read_input_tokens: u32,
@@ -85,8 +89,12 @@ pub struct ProxyToolCompletionRequest {
 pub struct ProxyToolCompletionResponse {
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
+    #[serde(default)]
+    pub reasoning: Option<String>,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    #[serde(default)]
+    pub reasoning_tokens: u32,
     pub finish_reason: String,
     #[serde(default)]
     pub cache_read_input_tokens: u32,
@@ -286,8 +294,10 @@ impl WorkerHttpClient {
 
         Ok(CompletionResponse {
             content: proxy_resp.content,
+            reasoning: proxy_resp.reasoning,
             input_tokens: proxy_resp.input_tokens,
             output_tokens: proxy_resp.output_tokens,
+            reasoning_tokens: proxy_resp.reasoning_tokens,
             finish_reason: parse_finish_reason(&proxy_resp.finish_reason),
             cache_read_input_tokens: proxy_resp.cache_read_input_tokens,
             cache_creation_input_tokens: proxy_resp.cache_creation_input_tokens,
@@ -315,9 +325,11 @@ impl WorkerHttpClient {
 
         Ok(ToolCompletionResponse {
             content: proxy_resp.content,
+            reasoning: proxy_resp.reasoning,
             tool_calls: proxy_resp.tool_calls,
             input_tokens: proxy_resp.input_tokens,
             output_tokens: proxy_resp.output_tokens,
+            reasoning_tokens: proxy_resp.reasoning_tokens,
             finish_reason: parse_finish_reason(&proxy_resp.finish_reason),
             cache_read_input_tokens: proxy_resp.cache_read_input_tokens,
             cache_creation_input_tokens: proxy_resp.cache_creation_input_tokens,

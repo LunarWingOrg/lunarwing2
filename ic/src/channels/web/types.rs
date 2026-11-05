@@ -402,7 +402,7 @@ pub enum SseEvent {
         message: Option<String>,
     },
 
-    /// Safe reasoning summary for selected tools.
+    /// Tool-selection reasoning or cumulative live provider reasoning.
     #[serde(rename = "reasoning_update")]
     ReasoningUpdate {
         narrative: String,
