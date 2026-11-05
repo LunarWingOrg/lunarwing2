@@ -86,7 +86,10 @@ ARG WITH_TOOLCHAINS=false
 LABEL org.opencontainers.image.revision="${SOURCE_REVISION}" \
       org.opencontainers.image.toolchain-profile="${WITH_TOOLCHAINS}"
 
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
 RUN set -eu; \
+    test -s /etc/ssl/certs/ca-certificates.crt; \
     rm -f /etc/apt/sources.list.d/debian.sources; \
     printf '%s\n' \
       "deb https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm main" \
