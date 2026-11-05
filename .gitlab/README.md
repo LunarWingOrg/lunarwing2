@@ -53,8 +53,8 @@ Pinned images:
   `sha256:9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f`
 - BuildKit 0.34.1 rootless OCI index:
   `sha256:f68752a5a94acfcdad2d07867b7075601a421638e17fc5f28efc1c814d0c4f89`
-- Trivy 0.74.0 OCI index:
-  `sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969`
+- Trivy 0.76.1 OCI index:
+  `sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c`
 - pgvector PostgreSQL 16 OCI index:
   `sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b`
 
