@@ -79,9 +79,11 @@ if mode == "fail_snapshot_always" or (mode == "fail_snapshot_once" and count == 
     print("E: Unable to fetch some archives, maybe run apt-get update or try with --fix-missing?", file=sys.stderr)
     sys.exit(1)
 if mode == "fail_snapshot_killed_once" and count == 1:
-    print("#12 [runtime 2/17] RUN apt-get update using snapshot.debian.org", file=sys.stderr)
+    print("#12 [runtime 2/17] RUN apt-get update", file=sys.stderr)
     print("Killed", file=sys.stderr)
-    print('ERROR: failed to solve: process "/bin/sh -c timeout 240 apt-get update against snapshot.debian.org" did not complete successfully: exit code: 137', file=sys.stderr)
+    # Real-trace shape from pipeline 7174, job 156769: BuildKit prints the
+    # whole RUN command and escapes its inner double quotes as \".
+    print('error: failed to solve: process "/bin/sh -c set -eu;     rm -f /etc/apt/sources.list.d/debian.sources;     printf \\'%s\\\\n\\'       \\\\"deb http://snapshot.debian.org/archive/debian/${{DEBIAN_SNAPSHOT}}/ trixie main\\\\"       > /etc/apt/sources.list;     timeout 240 apt-get update" did not complete successfully: exit code: 137', file=sys.stderr)
     sys.exit(1)
 if mode == "fail_snapshot_timeout_once" and count == 1:
     print('ERROR: failed to solve: process "/bin/sh -c timeout 600 apt-get install from snapshot.debian.org" did not complete successfully: exit code: 124', file=sys.stderr)
@@ -256,8 +258,10 @@ for index, argument in enumerate(args):
 
     def test_snapshot_sigkill_during_apt_run_is_retried(self):
         # Pipeline 7174's trace names the snapshot RUN step with "exit code:
-        # 137" but buildctl itself exits 1, so the stub exits 1 and the
-        # classifier must match the trace text, not the exit status.
+        # 137" but buildctl itself exits 1, and BuildKit escapes the inner
+        # double quotes of the printed RUN command as \". The stub prints that
+        # real shape, so the classifier must match the escaped trace text,
+        # not the exit status and not a bare-quote scan.
         self.env["BUILDCTL_MODE"] = "fail_snapshot_killed_once"
         result = self.run_build()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -334,16 +338,22 @@ for index, argument in enumerate(args):
             with self.subTest(lane=lane):
                 lines = (ROOT / lane / "Dockerfile").read_text().splitlines()
                 apt_lines = [
-                    line.strip()
+                    line
                     for line in lines
                     if "apt-get" in line and not line.lstrip().startswith("#")
                 ]
                 self.assertEqual(len(apt_lines), 6)
                 for line in apt_lines:
                     if " update" in line:
-                        self.assertIn("timeout 240 apt-get -o ", line)
+                        self.assertIn("timeout -k 30 240 apt-get -o ", line)
                     elif " install" in line:
-                        self.assertIn("timeout 600 apt-get -o ", line)
+                        # Base and runtime installs keep the 600 s limit; the
+                        # WITH_TOOLCHAINS install (six-space continuation) gets
+                        # 1800 s because build-essential/clang are far larger.
+                        if line.startswith("      "):
+                            self.assertIn("timeout -k 30 1800 apt-get -o ", line)
+                        else:
+                            self.assertIn("timeout -k 30 600 apt-get -o ", line)
                     else:
                         self.fail(f"unrecognized apt command in {lane}: {line}")
 

@@ -311,7 +311,10 @@ transient_snapshot_failure() {
     # trace says "exit code: 137" or "exit code: 124". Match the quoted
     # process command itself so an unrelated compile kill is never retried
     # merely because an earlier Dockerfile step named the snapshot host.
-    grep -qE 'process "[^"]*snapshot\.debian\.org[^"]*" did not complete successfully: exit code: (137|124)' "$push_attempt_log"
+    # BuildKit escapes inner double quotes as \" in that trace (pipeline 7174,
+    # job 156769), so a bare [^"]* stops before the snapshot URL; allow
+    # backslash-escaped characters inside the quoted command.
+    grep -qE 'process "([^"\\]|\\.)*snapshot\.debian\.org([^"\\]|\\.)*" did not complete successfully: exit code: (137|124)' "$push_attempt_log"
 }
 
 build_image_with_retry() {
