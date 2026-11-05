@@ -228,7 +228,10 @@ router forwards these snapshots only for the gateway when
 `ENGINE_V2_STREAM_REASONING=true` (or `1`); the default is off. The gateway
 maps them to the existing `reasoning_update` SSE event with `decisions: []` for
 both browser and TUI clients, which replace the narrative with the latest
-bounded tail. WASM channels (including XMPP) and the local REPL discard the
+bounded tail. Wingtip maps empty-decision snapshots to `turn.reasoning` and
+replaces a sanitized multiline field on the matching turn, independent of the
+tool-summary activity ring; one updating block is shown until the turn is
+sealed. WASM channels (including XMPP) and the local REPL discard the
 distinct internal `ReasoningStream` status, while `ReasoningUpdate` remains the
 tool-selection summary. Encrypted and redacted provider payloads stay opaque
 and are not rendered. Leading reasoning is replayed before final text by

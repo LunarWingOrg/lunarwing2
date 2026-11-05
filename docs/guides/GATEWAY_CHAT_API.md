@@ -319,6 +319,12 @@ history, and are not forwarded to WASM channels, XMPP, or the local REPL.
 Tool-selection summaries keep the same event shape and are not affected by the
 opt-in flag.
 
+Wingtip maps `decisions: []` to a replacement `turn.reasoning` snapshot, keeps
+the latest sanitized multiline tail on the correlated turn, and hides that
+block when the turn is sealed. Non-empty tool decisions still produce activity
+entries. Operator setup and the unscoped-routine restriction are in
+[tenant configuration](../ops/TENANT-CONFIGURATION.md#live-provider-reasoning-wi546).
+
 Typical Engine V2 turn with one image tool call:
 
 ```text

@@ -7,6 +7,7 @@ Status: final design, 2026-11-03. Revised from the integration draft (`design/DE
 > - **Names.** The client was renamed Wingtip after this design was written (WI#554). Paths and identifiers below use the new names: the launcher `tui/bin/wingtip`, the package `wingtip`, `~/.config/wingtip/`, `~/.local/state/wingtip/`, `$XDG_RUNTIME_DIR/wingtip/` and the access-file schema `wingtip/tenant-access`. Environment variables keep their `LUNARWING_TUI_` prefix, as in the code.
 > - **Research citations.** `<research>/` stands for the research workspace the design was written from: the brief, the area designs, the cross-check reports, the unpacked package sources and the probe scripts. It is not part of the repository. Where a fact from it matters, it is quoted here.
 > - **Paths.** The `cd ic` and `cd tui` commands run from the repository root. `ic/...:N` line citations refer to commit `724ea0a05` and drift on later commits.
+> - **Live reasoning (WI#546, 2026-11-05).** The turn model and gateway mapping below include a separate replacement snapshot for provider reasoning; tool-selection summaries remain activity entries.
 >
 > **Status on master (2026-11-03):**
 > - **Merged** (!2173): M1a, M1b and M2a.
@@ -352,6 +353,7 @@ export interface TurnRecord {
   phase: TurnPhase
   deltas: string                 // streamed text (turn-text.ts), capped at 1 MiB
   finalText: string | null       // canonical text; several finals are joined with a blank line
+  reasoning?: string            // sanitized live snapshot; latest 16 KiB UTF-8, hidden when sealed
   activity: Activity[]           // ring buffer, last 50
   images: TranscriptImage[]      // generated images
   approvalIds: ApprovalId[]
@@ -444,6 +446,7 @@ export type TransportEvent =
   | { kind: "turn.accepted"; turnId: TurnId }                                // REPLv3 Ack
   | { kind: "turn.started"; turnId: TurnId | null; threadId?: ThreadId }     // gateway turn_started, REPLv3 TurnStarted
   | { kind: "turn.delta"; turnId: TurnId | null; threadId?: ThreadId; text: string }
+  | { kind: "turn.reasoning"; turnId: TurnId | null; threadId?: ThreadId; text: string }
   | { kind: "turn.activity"; turnId: TurnId | null; threadId?: ThreadId; activity: Omit<Activity, "at"> }
   | { kind: "turn.image"; turnId: TurnId | null; threadId?: ThreadId; image: { mime: ImageMime; bytes: Uint8Array; caption?: string } }
   | { kind: "turn.approval"; turnId: TurnId | null; threadId?: ThreadId; approval: WireApproval }
@@ -479,7 +482,9 @@ export type TransportEvent =
 | `auth_required {extension_name, instructions?, auth_url?, setup_url?}` | `turn.auth_required` |
 | `auth_completed` | `notice{source:"auth"}` |
 | `image_generated {data_url, path?}` | `turn.image` after `images/data-url.ts` validation |
-| `suggestions`, `turn_cost`, `reasoning_update`, `skill_activated` | `turn.suggestions`, `turn.cost`, `turn.activity{reasoning}`, `turn.activity{skill}` |
+| `reasoning_update {narrative, decisions: []}` | `turn.reasoning`: replace the turn's sanitized multiline snapshot with the latest 16 KiB UTF-8 tail, never append activity or answer text; use progress correlation and ignore sealed turns |
+| `reasoning_update` with non-empty `decisions` | `turn.activity{reasoning}` (tool-selection summary) |
+| `suggestions`, `turn_cost`, `skill_activated` | `turn.suggestions`, `turn.cost`, `turn.activity{skill}` |
 | `turn_recovery {recovery_state}` | `failed` → `turn.error{code:"recovery_failed"}`, else `turn.activity{recovery}` |
 | `job_started`, `job_result`, `job_status` | `notice{source:"job"}` (URLs shown as text, never opened) |
 | `stream_gap {missed_events}` | `resync.required{gap}` |

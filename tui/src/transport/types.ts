@@ -113,6 +113,8 @@ export type TransportEvent =
   /** gateway turn_started, REPLv3 TurnStarted (again after an approval or credential continuation). */
   | { kind: "turn.started"; turnId: TurnId | null; threadId?: ThreadId }
   | { kind: "turn.delta"; turnId: TurnId | null; threadId?: ThreadId; text: string }
+  /** Live provider reasoning: a replacement snapshot, never assistant text or an activity entry. */
+  | { kind: "turn.reasoning"; turnId: TurnId | null; threadId?: ThreadId; text: string }
   | { kind: "turn.activity"; turnId: TurnId | null; threadId?: ThreadId; activity: Omit<Activity, "at"> }
   /** Bytes already validated by images/data-url.ts and images/sniff.ts; a server path is only ever a caption. */
   | {

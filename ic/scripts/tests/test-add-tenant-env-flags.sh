@@ -186,6 +186,7 @@ assert_eq "coordination admin token generated" \
 assert_eq "coordination admin port allocated" "$(envval COORD_ADMIN_PORT)" "20009"
 assert_eq "default ENGINE_V2" "$(envval ENGINE_V2)" "true"
 assert_eq "default ENGINE_V2_CHANNELS" "$(envval ENGINE_V2_CHANNELS)" "xmpp,weechat,darkirc"
+assert_eq "default ENGINE_V2_STREAM_REASONING" "$(envval ENGINE_V2_STREAM_REASONING)" "false"
 assert_eq "default ORCHESTRATOR_SELF_MODIFY" \
   "$(envval ORCHESTRATOR_SELF_MODIFY)" "true"
 # WI#291: new tenants get a lightweight-routine tool-round cap above the
@@ -242,6 +243,7 @@ sed -i \
   -e 's/^MASCOT_ENABLED=.*/MASCOT_ENABLED=true/' \
   -e 's/^ENGINE_V2=.*/ENGINE_V2=false/' \
   -e 's/^ENGINE_V2_CHANNELS=.*/ENGINE_V2_CHANNELS=xmpp/' \
+  -e 's/^ENGINE_V2_STREAM_REASONING=.*/ENGINE_V2_STREAM_REASONING=true/' \
   -e 's/^ORCHESTRATOR_SELF_MODIFY=.*/ORCHESTRATOR_SELF_MODIFY=false/' \
   -e 's/^ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS=.*/ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS=4/' \
   -e 's/^SANDBOX_NETWORK=.*/SANDBOX_NETWORK=proxy/' \
@@ -289,6 +291,7 @@ assert_eq "rerun preserves LW2STUDYMCP_ALLOW_WRITE" \
   "$(envval LW2STUDYMCP_ALLOW_WRITE)" "1"
 assert_eq "rerun preserves ENGINE_V2" "$(envval ENGINE_V2)" "false"
 assert_eq "rerun preserves ENGINE_V2_CHANNELS" "$(envval ENGINE_V2_CHANNELS)" "xmpp"
+assert_eq "rerun preserves ENGINE_V2_STREAM_REASONING" "$(envval ENGINE_V2_STREAM_REASONING)" "true"
 assert_eq "rerun preserves ORCHESTRATOR_SELF_MODIFY" \
   "$(envval ORCHESTRATOR_SELF_MODIFY)" "false"
 assert_eq "rerun preserves ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS" \
@@ -298,6 +301,17 @@ assert_eq "rerun preserves SANDBOX_RUNTIME" "$(envval SANDBOX_RUNTIME)" "docker"
 assert_eq "rerun preserves SANDBOX_IMAGE" "$(envval SANDBOX_IMAGE)" "custom-sandbox:v2"
 assert_eq "rerun preserves SANDBOX_AUTO_PULL" "$(envval SANDBOX_AUTO_PULL)" "true"
 assert_eq "rerun preserves SANDBOX_TENANT_LOGS" "$(envval SANDBOX_TENANT_LOGS)" "off"
+
+echo "=== live reasoning opt-in preservation tests ==="
+for reasoning_setting in 1 false 0; do
+  sed -i "s/^ENGINE_V2_STREAM_REASONING=.*/ENGINE_V2_STREAM_REASONING=$reasoning_setting/" \
+    "$MT_FIXTURE/env/lunarwing.env"
+  write_tenant_lunarwing_env fixture-tenant
+  assert_eq "rerun preserves reasoning $reasoning_setting" "$(envval ENGINE_V2_STREAM_REASONING)" "$reasoning_setting"
+done
+sed -i '/^ENGINE_V2_STREAM_REASONING=/d' "$MT_FIXTURE/env/lunarwing.env"
+write_tenant_lunarwing_env fixture-tenant
+assert_eq "older tenant defaults reasoning to false" "$(envval ENGINE_V2_STREAM_REASONING)" "false"
 
 echo "=== approval setting migration tests ==="
 # Canonical key must win even when a conflicting legacy value is present.
