@@ -12,7 +12,7 @@
 # gone.
 ARG OPENCODE_VERSION=v1.19.5
 ARG OPENCODE_REF=810c0eba1a7348036f8bdf61e6632d0c36c6876c
-ARG DEBIAN_SNAPSHOT=20261024T011300Z
+ARG DEBIAN_SNAPSHOT=20261105T082236Z
 # WI#467: sha256 of the committed models.dev snapshot (models-dev/api.json)
 # the upstream build compiles into the binary instead of fetching live.
 # Refresh the file and this pin together in one deliberate commit (see the
