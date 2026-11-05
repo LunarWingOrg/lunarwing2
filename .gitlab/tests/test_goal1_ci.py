@@ -86,7 +86,7 @@ class WorkerSnapshotSecurityTests(unittest.TestCase):
             path.write_text(f"ARG DEBIAN_SNAPSHOT={stale}\n", encoding="utf-8")
             with self.subTest(worker=name):
                 self.assertTrue(
-                    any(str(path) in error and "Brotli fixes" in error for error in self.errors()),
+                    any(str(path) in error and "APT fixes" in error for error in self.errors()),
                     self.errors(),
                 )
             path.write_text(original, encoding="utf-8")
