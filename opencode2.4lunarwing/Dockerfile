@@ -12,8 +12,6 @@ ARG SOURCE_REVISION=unknown
 # ──────────────────────
 # Stage 1: build opencode from source
 # ──────────────────────
-FROM docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b AS certificates
-
 FROM docker.io/oven/bun:1.4.4-debian@sha256:93d5032fe06d163427822dc1598f420363759bb18155c9cc90eb1be05a64a19e AS builder
 
 ARG OPENCODE_VERSION
@@ -21,7 +19,7 @@ ARG OPENCODE_REF
 ARG DEBIAN_SNAPSHOT
 WORKDIR /build
 
-COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 RUN set -eu; \
     test -s /etc/ssl/certs/ca-certificates.crt; \
@@ -158,7 +156,7 @@ LABEL org.opencontainers.image.title="LunarWing OpenCode 2 Worker" \
       org.opencontainers.image.revision="${SOURCE_REVISION}" \
       org.opencontainers.image.toolchain-profile="${WITH_TOOLCHAINS}"
 
-COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 RUN set -eu; \
     test -s /etc/ssl/certs/ca-certificates.crt; \
