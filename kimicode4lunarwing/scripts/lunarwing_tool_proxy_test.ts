@@ -11,7 +11,7 @@ import { chownSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symli
 import { connect, type Socket } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { after, before, test } from "node:test"
+import { after, afterEach, before, test } from "node:test"
 
 import { createEnvelope } from "./lunarwing_runtime.js"
 import {
@@ -54,12 +54,34 @@ function ipcRequest(socketPath: string, request: Record<string, unknown>): Promi
 
 let workDir = ""
 let relay: ToolProxyRelay
+const startedTaskIds = new Set<string>()
+
+async function startTask(taskId: string, hub: FakeHubSocket) {
+  const handle = await relay.startTask(taskId, hub)
+  if (handle) startedTaskIds.add(taskId)
+  return handle
+}
+
+async function waitForFrames(hub: FakeHubSocket, count: number): Promise<void> {
+  const deadline = Date.now() + 5_000
+  while (hub.sent.length < count) {
+    if (Date.now() > deadline) {
+      throw new Error(`relay emitted ${hub.sent.length} hub frames, expected ${count}`)
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+}
 
 before(() => {
   workDir = mkdtempSync(join(tmpdir(), "tool-proxy-test-"))
   process.env.LUNARWING_TOOL_PROXY_DIR = workDir
   process.env.LUNARWING_TOOL_PROXY_TIMEOUT_MS = "2000"
   relay = new ToolProxyRelay()
+})
+
+afterEach(() => {
+  for (const taskId of startedTaskIds) relay.closeTask(taskId)
+  startedTaskIds.clear()
 })
 
 after(() => {
@@ -70,7 +92,7 @@ after(() => {
 
 test("call emits a hub-bound tool_call frame and routes the reply by call_id", async () => {
   const hub = new FakeHubSocket()
-  const handle = await relay.startTask("task-1", hub)
+  const handle = await startTask("task-1", hub)
   assert.ok(handle, "task proxy should start")
 
   const responsePromise = ipcRequest(handle.socketPath, {
@@ -80,7 +102,7 @@ test("call emits a hub-bound tool_call frame and routes the reply by call_id", a
     arguments: { path: "notes/x.md" },
   })
   // Let the relay process the request, then inspect the WS frame it sent.
-  await new Promise((resolve) => setTimeout(resolve, 100))
+  await waitForFrames(hub, 1)
   assert.equal(hub.sent.length, 1)
   const frame = JSON.parse(hub.sent[0]) as { type: string; payload: Record<string, unknown> }
   assert.equal(frame.type, "tool_call")
@@ -116,11 +138,11 @@ test("call emits a hub-bound tool_call frame and routes the reply by call_id", a
 
 test("list sends tool_list and resolves on tool_catalog", async () => {
   const hub = new FakeHubSocket()
-  const handle = await relay.startTask("task-2", hub)
+  const handle = await startTask("task-2", hub)
   assert.ok(handle)
 
   const responsePromise = ipcRequest(handle.socketPath, { op: "list" })
-  await new Promise((resolve) => setTimeout(resolve, 100))
+  await waitForFrames(hub, 1)
   assert.equal(hub.sent.length, 1)
   const frame = JSON.parse(hub.sent[0]) as { type: string; payload: Record<string, unknown> }
   assert.equal(frame.type, "tool_list")
@@ -142,7 +164,7 @@ test("list sends tool_list and resolves on tool_catalog", async () => {
 
 test("invalid identifiers and oversized frames are rejected locally", async () => {
   const hub = new FakeHubSocket()
-  const handle = await relay.startTask("task-3", hub)
+  const handle = await startTask("task-3", hub)
   assert.ok(handle)
   try {
     const badName = await ipcRequest(handle.socketPath, {
@@ -208,7 +230,7 @@ test("invalid identifiers and oversized frames are rejected locally", async () =
 test("hub-frame routing is scoped to the owning socket", async () => {
   const hubA = new FakeHubSocket()
   const hubB = new FakeHubSocket()
-  const handle = await relay.startTask("task-4", hubA)
+  const handle = await startTask("task-4", hubA)
   assert.ok(handle)
 
   const responsePromise = ipcRequest(handle.socketPath, {
@@ -217,7 +239,7 @@ test("hub-frame routing is scoped to the owning socket", async () => {
     name: "memory_read",
     arguments: {},
   })
-  await new Promise((resolve) => setTimeout(resolve, 100))
+  await waitForFrames(hubA, 1)
   assert.equal(hubA.sent.length, 1)
 
   // A reply arriving on the WRONG hub socket must not resolve the call.
@@ -237,7 +259,7 @@ test("hub-frame routing is scoped to the owning socket", async () => {
 
 test("closing a task fails its in-flight calls", async () => {
   const hub = new FakeHubSocket()
-  const handle = await relay.startTask("task-5", hub)
+  const handle = await startTask("task-5", hub)
   assert.ok(handle)
 
   const responsePromise = ipcRequest(handle.socketPath, {
@@ -246,7 +268,7 @@ test("closing a task fails its in-flight calls", async () => {
     name: "memory_read",
     arguments: {},
   })
-  await new Promise((resolve) => setTimeout(resolve, 100))
+  await waitForFrames(hub, 1)
   assert.equal(hub.sent.length, 1)
   handle.close()
   const response = await responsePromise
@@ -325,7 +347,7 @@ test("startTask returns null instead of throwing when the proxy dir is unusable 
   process.env.LUNARWING_TOOL_PROXY_DIR = filePath
   try {
     const hub = new FakeHubSocket()
-    const handle = await relay.startTask("task-sabotaged", hub)
+    const handle = await startTask("task-sabotaged", hub)
     assert.equal(handle, null)
     assert.equal(relay.activeTaskCount, 0)
     assert.equal(hub.sent.length, 0)
@@ -338,7 +360,7 @@ test("closeTask never throws even when the socket path cannot be removed (EF-2)"
   const sub = mkdtempSync(join(workDir, "close-sabotage-"))
   process.env.LUNARWING_TOOL_PROXY_DIR = sub
   const hub = new FakeHubSocket()
-  const handle = await relay.startTask("task-close-sabotage", hub)
+  const handle = await startTask("task-close-sabotage", hub)
   assert.ok(handle)
   // Replace the proxy dir with a plain file: rmSync(socketPath) then fails
   // with ENOTDIR, which closeTask must swallow (teardown continues).
@@ -355,7 +377,7 @@ test("closeTask never throws even when the socket path cannot be removed (EF-2)"
 
 test("dropHubSocket fails pending waiters and frees the socket's pending map (EF-9)", async () => {
   const hub = new FakeHubSocket()
-  const handle = await relay.startTask("task-drop", hub)
+  const handle = await startTask("task-drop", hub)
   assert.ok(handle)
 
   try {
@@ -365,7 +387,7 @@ test("dropHubSocket fails pending waiters and frees the socket's pending map (EF
       name: "memory_read",
       arguments: {},
     })
-    await new Promise((resolve) => setTimeout(resolve, 100))
+    await waitForFrames(hub, 1)
     assert.equal(hub.sent.length, 1)
     relay.dropHubSocket(hub)
     const response = await responsePromise
@@ -383,7 +405,7 @@ test("a request after dropHubSocket fails at once and re-creates no pending stat
   // after dropHubSocket re-created the socket's pending map and sent into
   // the closed socket, then waited out the full relay timeout (2 s here).
   const hub = new FakeHubSocket()
-  const handle = await relay.startTask("task-drop-final", hub)
+  const handle = await startTask("task-drop-final", hub)
   assert.ok(handle)
   try {
     relay.dropHubSocket(hub)
@@ -424,7 +446,7 @@ test("the proxy dir is created bridge-owned 0711 (KW-6)", async () => {
   process.env.LUNARWING_TOOL_PROXY_DIR = sub
   try {
     const hub = new FakeHubSocket()
-    const handle = await relay.startTask("task-kw6", hub)
+    const handle = await startTask("task-kw6", hub)
     assert.ok(handle, "task proxy should start")
     assert.equal(statSync(sub).mode & 0o777, 0o711)
     handle!.close()
@@ -439,7 +461,7 @@ test("shared split sockets are group-writable and the directory stays non-writab
   process.env.LUNARWING_TASK_RUNNER_REMOTE = "1"
   const hub = new FakeHubSocket()
   try {
-    const handle = await relay.startTask("task-shared-split", hub)
+    const handle = await startTask("task-shared-split", hub)
     assert.ok(handle, "shared task proxy should start")
     assert.equal(statSync(handle.socketPath).mode & 0o777, 0o660)
     assert.equal(statSync(workDir).mode & 0o777, 0o711)
