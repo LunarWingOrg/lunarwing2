@@ -100,7 +100,13 @@ model's answer.
   `https://modelcontextprotocol.io/llms.txt`. The turn completed and the agent
   reported the same URL. An `echo` entry is the Engine V2 response artifact,
   not a substitute search tool.
-- **Context7, CoinGecko, and Brave Search:** agent attempts are pending.
+- **Context7 — keyless agent calls passed.** The agent called
+  `context7_resolve_library_id` and then `context7_query_docs`. History records
+  `has_result: true` and `has_error: false` for both. Resolution selected
+  `/vercel/next.js`; the documentation preview contains Next.js Route Handler
+  guidance and its `route.js|ts` convention. The turn completed with no retry
+  or fallback server.
+- **CoinGecko and Brave Search:** agent attempts are pending.
 
 ### Hosted upstream discovery preflight
 
