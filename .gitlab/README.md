@@ -370,6 +370,9 @@ host's concurrent builds before retrying manually.
   by `validate_config.py`), not the live deb.debian.org mirror. WI#561 moved
   the source to HTTPS and the lane installs `apt` as well as `python3`, so the
   fixed client from the pinned snapshot replaces the base image's client.
+  Before APT starts, Node writes its built-in `tls.rootCertificates` to the
+  system CA bundle because the slim image may not ship one. The helper asserts
+  APT `2.6.2` after installation so failed indexes cannot produce a false pass.
   Both APT calls use `Acquire::Retries=0`/`Acquire::https::Timeout=60`;
   automatic per-fetch retries stay off (CVE-2026-109518).
   `ci-apt-with-retry.sh` bounds them at 240/600 seconds respectively
