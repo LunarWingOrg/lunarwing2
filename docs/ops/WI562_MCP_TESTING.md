@@ -65,6 +65,21 @@ Upstream references:
 
 ## Results
 
-Testing is in progress. This section will be replaced with observed activation,
-discovery, and agent-call results; no result is inferred from the upstream
-authentication contracts above.
+The tenant release build and LunarWing activation/agent tests are still in
+progress. No hosted-server result is inferred from the upstream authentication
+contracts above.
+
+### Brave Search — direct package preflight
+
+The pinned package was installed under the tenant account with npm lifecycle
+scripts disabled. Running its real stdio entrypoint with both `BRAVE_API_KEY`
+and `BRAVE_API_KEY_FILE` removed exited with status 1 before MCP startup:
+
+```text
+Error: A Brave API key is required via --brave-api-key, BRAVE_API_KEY, --brave-api-key-file, or BRAVE_API_KEY_FILE. You can get one at https://brave.com/search/api/.
+Invalid configuration
+```
+
+This confirms that the official Brave server cannot perform a keyless search.
+The LunarWing installation, activation, and agent-attempt results are recorded
+separately below once the tenant is running.
