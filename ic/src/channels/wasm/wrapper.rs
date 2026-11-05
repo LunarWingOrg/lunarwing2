@@ -3698,10 +3698,11 @@ fn status_to_wit(
             },
             metadata_json,
         },
-        // Suggestions, turn cost, and skill activations are web-gateway-only; skip for WASM channels
+        // Live provider reasoning and these activity summaries are gateway-only.
         StatusUpdate::Suggestions { .. }
         | StatusUpdate::TurnCost { .. }
-        | StatusUpdate::SkillActivated { .. } => return None,
+        | StatusUpdate::SkillActivated { .. }
+        | StatusUpdate::ReasoningStream(_) => return None,
         StatusUpdate::ReasoningUpdate {
             narrative,
             decisions,
@@ -5638,6 +5639,18 @@ mod tests {
         assert!(!is_tool_activity_status(&StatusUpdate::StreamChunk(
             "chunk".to_string()
         )));
+    }
+
+    #[test]
+    fn live_reasoning_never_reaches_wasm_on_status() {
+        use crate::channels::StatusUpdate;
+
+        let live = StatusUpdate::ReasoningStream("provider reasoning".to_string());
+        assert!(status_to_wit(&live, &serde_json::json!({})).is_none());
+
+        let summary =
+            StatusUpdate::reasoning_for_tools(&["shell".to_string()]).expect("tool summary");
+        assert!(status_to_wit(&summary, &serde_json::json!({})).is_some());
     }
 
     #[test]

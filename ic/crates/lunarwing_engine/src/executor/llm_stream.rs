@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 
@@ -9,14 +10,35 @@ use crate::types::repl::{
 };
 use crate::types::step::{ActionCall, LlmResponse, TokenUsage};
 
+const REASONING_EMIT_INTERVAL: Duration = Duration::from_millis(300);
+const REASONING_SNAPSHOT_MAX_BYTES: usize = 16 * 1024;
+
 pub(super) struct LlmStreamCollection {
     pub(super) result: Result<LlmOutput, EngineError>,
     pub(super) observations: Vec<ProviderStreamObservation>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum LlmStreamDelta<'a> {
+    Text(&'a str),
+    Reasoning(&'a str),
+}
+
+impl std::fmt::Display for LlmStreamDelta<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let content = match self {
+            Self::Text(content) | Self::Reasoning(content) => content,
+        };
+        formatter.write_str(content)
+    }
+}
+
 #[derive(Default)]
 struct StreamAccumulator {
     text: String,
+    reasoning: String,
+    reasoning_dirty: bool,
+    last_reasoning_emit: Option<Instant>,
     tool_calls: BTreeMap<usize, ToolCallAccumulator>,
     observations: Vec<ProviderStreamObservation>,
     usage: TokenUsage,
@@ -37,18 +59,20 @@ struct ToolCallAccumulator {
 
 pub(super) async fn collect_llm_stream(
     mut stream: LlmStream<'_>,
-    mut on_text_delta: impl FnMut(&str),
+    mut on_delta: impl FnMut(LlmStreamDelta<'_>),
 ) -> LlmStreamCollection {
     let mut accumulator = StreamAccumulator::default();
     while let Some(item) = stream.next().await {
         let result = match item {
-            Ok(chunk) => accumulator.push(chunk, &mut on_text_delta),
+            Ok(chunk) => accumulator.push(chunk, &mut on_delta),
             Err(error) => Err(error),
         };
         if let Err(error) = result {
+            accumulator.emit_pending_reasoning(&mut on_delta);
             return accumulator.with_error(error);
         }
     }
+    accumulator.emit_pending_reasoning(&mut on_delta);
     accumulator.finish()
 }
 
@@ -56,7 +80,7 @@ impl StreamAccumulator {
     fn push(
         &mut self,
         chunk: LlmStreamChunk,
-        on_text_delta: &mut impl FnMut(&str),
+        on_delta: &mut impl FnMut(LlmStreamDelta<'_>),
     ) -> Result<(), EngineError> {
         if self.saw_done {
             return Err(llm_error("LLM stream emitted a chunk after Done"));
@@ -65,9 +89,22 @@ impl StreamAccumulator {
         match chunk {
             LlmStreamChunk::TextDelta(delta) => {
                 if !delta.is_empty() {
-                    on_text_delta(&delta);
+                    self.emit_pending_reasoning(on_delta);
+                    on_delta(LlmStreamDelta::Text(&delta));
                 }
                 self.text.push_str(&delta);
+            }
+            LlmStreamChunk::ReasoningDelta(delta) => {
+                if !delta.is_empty() {
+                    self.reasoning.push_str(&delta);
+                    self.reasoning_dirty = true;
+                    let due = self
+                        .last_reasoning_emit
+                        .is_none_or(|last| last.elapsed() >= REASONING_EMIT_INTERVAL);
+                    if due {
+                        self.emit_pending_reasoning(on_delta);
+                    }
+                }
             }
             LlmStreamChunk::ToolCallDelta {
                 index,
@@ -95,6 +132,7 @@ impl StreamAccumulator {
                 usage,
                 finish_reason,
             } => {
+                self.emit_pending_reasoning(on_delta);
                 self.usage = usage
                     .unwrap_or_default()
                     .saturating_add(self.discarded_usage);
@@ -103,6 +141,17 @@ impl StreamAccumulator {
             }
         }
         Ok(())
+    }
+
+    fn emit_pending_reasoning(&mut self, on_delta: &mut impl FnMut(LlmStreamDelta<'_>)) {
+        if !self.reasoning_dirty {
+            return;
+        }
+        on_delta(LlmStreamDelta::Reasoning(reasoning_snapshot(
+            &self.reasoning,
+        )));
+        self.reasoning_dirty = false;
+        self.last_reasoning_emit = Some(Instant::now());
     }
 
     fn finish(mut self) -> LlmStreamCollection {
@@ -148,6 +197,16 @@ impl StreamAccumulator {
             finish_reason: self.finish_reason,
         })
     }
+}
+
+fn reasoning_snapshot(reasoning: &str) -> &str {
+    let Some(mut start) = reasoning.len().checked_sub(REASONING_SNAPSHOT_MAX_BYTES) else {
+        return reasoning;
+    };
+    while !reasoning.is_char_boundary(start) {
+        start += 1;
+    }
+    &reasoning[start..]
 }
 
 impl ToolCallAccumulator {
@@ -285,6 +344,7 @@ mod tests {
                     discarded_usage: Some(TokenUsage {
                         input_tokens: 900,
                         output_tokens: 0,
+                        reasoning_tokens: 0,
                         cache_read_tokens: 100,
                         cache_write_tokens: 0,
                         cost_usd: 0.0,
@@ -296,6 +356,7 @@ mod tests {
                     discarded_usage: Some(TokenUsage {
                         input_tokens: 1100,
                         output_tokens: 0,
+                        reasoning_tokens: 0,
                         cache_read_tokens: 0,
                         cache_write_tokens: 0,
                         cost_usd: 0.0,
@@ -547,6 +608,96 @@ mod tests {
             let (result, _) = collect(items).await;
             assert!(matches!(result, Err(EngineError::Llm { .. })));
         }
+    }
+
+    #[tokio::test]
+    async fn coalesces_reasoning_and_flushes_before_text() {
+        let stream = stream::iter(vec![
+            Ok(LlmStreamChunk::ReasoningDelta("think".to_string())),
+            Ok(LlmStreamChunk::ReasoningDelta("ing".to_string())),
+            Ok(LlmStreamChunk::ReasoningDelta("!".to_string())),
+            Ok(LlmStreamChunk::TextDelta("answer".to_string())),
+            done(Some(TokenUsage {
+                input_tokens: 7,
+                output_tokens: 5,
+                reasoning_tokens: 3,
+                ..TokenUsage::default()
+            })),
+        ])
+        .boxed();
+        let mut deltas = Vec::new();
+        let output = collect_llm_stream(stream, |delta| {
+            let kind = match delta {
+                LlmStreamDelta::Text(_) => "text",
+                LlmStreamDelta::Reasoning(_) => "reasoning",
+            };
+            deltas.push(format!("{kind}:{delta}"));
+        })
+        .await
+        .result
+        .expect("reasoning stream should collect");
+
+        assert_eq!(
+            deltas,
+            ["reasoning:think", "reasoning:thinking!", "text:answer"]
+        );
+        assert_eq!(output.usage.reasoning_tokens, 3);
+        assert_eq!(output.usage.total(), 12);
+    }
+
+    #[tokio::test]
+    async fn flushes_pending_reasoning_on_done() {
+        let (result, deltas) = collect(vec![
+            Ok(LlmStreamChunk::ReasoningDelta("think".to_string())),
+            Ok(LlmStreamChunk::ReasoningDelta("ing".to_string())),
+            done(None),
+        ])
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(deltas, ["think", "thinking"]);
+    }
+
+    #[test]
+    fn reasoning_emission_respects_coalescing_interval() {
+        let mut accumulator = StreamAccumulator::default();
+        let mut emitted = Vec::new();
+        let mut on_delta = |delta: LlmStreamDelta<'_>| emitted.push(delta.to_string());
+
+        accumulator
+            .push(
+                LlmStreamChunk::ReasoningDelta("think".to_string()),
+                &mut on_delta,
+            )
+            .expect("first delta");
+        accumulator
+            .push(
+                LlmStreamChunk::ReasoningDelta("ing".to_string()),
+                &mut on_delta,
+            )
+            .expect("coalesced delta");
+        accumulator.last_reasoning_emit = Some(Instant::now() - REASONING_EMIT_INTERVAL);
+        accumulator
+            .push(
+                LlmStreamChunk::ReasoningDelta("!".to_string()),
+                &mut on_delta,
+            )
+            .expect("due delta");
+
+        assert_eq!(emitted, ["think", "thinking!"]);
+    }
+
+    #[test]
+    fn reasoning_snapshot_is_bounded_at_a_utf8_boundary() {
+        let input = format!(
+            "{}é{}",
+            "x".repeat(REASONING_SNAPSHOT_MAX_BYTES - 1),
+            "y".repeat(REASONING_SNAPSHOT_MAX_BYTES - 1)
+        );
+        let snapshot = reasoning_snapshot(&input);
+
+        assert!(snapshot.len() <= REASONING_SNAPSHOT_MAX_BYTES);
+        assert_eq!(snapshot, "y".repeat(REASONING_SNAPSHOT_MAX_BYTES - 1));
     }
 
     struct CompleteOnlyBackend;

@@ -94,6 +94,7 @@ fn is_transient_progress(status: &StatusUpdate) -> bool {
             | StatusUpdate::ToolResult { .. }
             | StatusUpdate::StreamChunk(_)
             | StatusUpdate::ReasoningUpdate { .. }
+            | StatusUpdate::ReasoningStream(_)
     )
 }
 

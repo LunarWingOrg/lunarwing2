@@ -428,8 +428,10 @@ mod tests {
         ) -> Result<CompletionResponse, LlmError> {
             Ok(CompletionResponse {
                 content: self.next_content().await,
+                reasoning: None,
                 input_tokens: 1,
                 output_tokens: 1,
+                reasoning_tokens: 0,
                 finish_reason: FinishReason::Stop,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
@@ -443,8 +445,10 @@ mod tests {
             Ok(ToolCompletionResponse {
                 content: Some(self.next_content().await),
                 tool_calls: Vec::new(),
+                reasoning: None,
                 input_tokens: 1,
                 output_tokens: 1,
+                reasoning_tokens: 0,
                 finish_reason: FinishReason::Stop,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,

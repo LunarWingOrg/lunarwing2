@@ -102,8 +102,10 @@ impl LlmProvider for ScriptedStreamingProvider {
     async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         Ok(CompletionResponse {
             content: "blocking response".to_string(),
+            reasoning: None,
             input_tokens: 10,
             output_tokens: 5,
+            reasoning_tokens: 0,
             finish_reason: FinishReason::Stop,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
@@ -126,8 +128,10 @@ impl LlmProvider for ScriptedStreamingProvider {
         Ok(ToolCompletionResponse {
             content: Some("blocking tool response".to_string()),
             tool_calls: Vec::new(),
+            reasoning: None,
             input_tokens: 10,
             output_tokens: 5,
+            reasoning_tokens: 0,
             finish_reason: FinishReason::Stop,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,

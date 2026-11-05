@@ -201,6 +201,62 @@ function historyTurn(userInput: string, response: string | null, state: string, 
 // Correlation and sealing (3.5)
 // ---------------------------------------------------------------------------------------------------------
 
+describe("live reasoning snapshots (WI#546)", () => {
+  for (const mode of ["current", "legacy"] as const) {
+    test(`${mode}: snapshots replace without evicting tool activity or becoming answer text`, () => {
+      const h = new Harness(mode)
+      const id = h.send("think through this")
+      h.evt({ kind: "turn.activity", turnId: id, activity: { kind: "tool_started", text: "http" } })
+      const snapshot = (text: string, threadId = THREAD) => {
+        for (const event of decodeGatewayEvent({
+          type: "reasoning_update", narrative: text, decisions: [], thread_id: threadId,
+          ...(mode === "current" ? { client_turn_id: id } : {}),
+        }, { correlated: mode === "current" })) h.evt(event)
+      }
+      const prefix = "old head " + "x".repeat(1_100)
+      for (let index = 0; index < 60; index += 1) snapshot(`${prefix}\nlatest-${index}`)
+      expect(h.turn(id).reasoning).toBe(`${prefix}\nlatest-59`)
+      expect(h.turn(id).activity.map((entry) => entry.text)).toEqual(["http"])
+      expect(h.turn(id)).toMatchObject({ phase: "running", deltas: "", finalText: null })
+      // Tool-selection summaries remain normal activity, not a replacement for the live tail.
+      h.evt({ kind: "turn.activity", turnId: id, activity: { kind: "reasoning", text: "Selected 1 tool" } })
+      snapshot("next step")
+      expect(h.turn(id).activity.map((entry) => entry.text)).toEqual(["http", "Selected 1 tool"])
+      expect(h.turn(id).reasoning).toBe("next step")
+      snapshot("another thread", "00000000-0000-4000-8000-0000000000aa")
+      expect(h.turn(id).reasoning).toBe("next step")
+      // Progress from another thread is silently dropped, just like activity/deltas.
+      expect(h.state.otherThreadsUnread).toBe(0)
+      h.evt({ kind: "turn.delta", turnId: id, text: "answer" })
+      h.evt({ kind: "turn.final", turnId: id, text: "final answer" })
+      if (mode === "current") h.evt({ kind: "turn.finished", turnId: id, outcome: "replied" })
+      snapshot("late snapshot")
+      expect(h.turn(id)).toMatchObject({ phase: "done", reasoning: "next step", deltas: "answer", finalText: "final answer" })
+    })
+  }
+
+  test("sanitizes and retains the latest UTF-8 tail, including newlines, without splitting a code point", () => {
+    const h = new Harness("current")
+    const id = h.send("think")
+    h.evt({ kind: "turn.reasoning", turnId: id, text: `discard\x1b[31m${"😀".repeat(5_000)}\nEND!\x1b[0m` })
+    const reasoning = h.turn(id).reasoning ?? ""
+    expect(reasoning).toBe("😀".repeat(4_094) + "\nEND!")
+    expect(Buffer.byteLength(reasoning)).toBeLessThanOrEqual(STATE_BOUNDS.maxReasoningBytesPerTurn)
+    h.evt({ kind: "turn.reasoning", turnId: id, text: "\x1b[31m\x1b[0m" })
+    expect(h.turn(id).reasoning).toBe(reasoning)
+  })
+
+  test("uncorrelated snapshots on an exact gateway and unknown turn ids do not create or attach records", () => {
+    const h = new Harness("current")
+    const id = h.send("think")
+    h.evt({ kind: "turn.reasoning", turnId: null, text: "unscoped" })
+    h.evt({ kind: "turn.reasoning", turnId: "unknown" as TurnId, text: "another client" })
+    expect(h.turn(id).reasoning).toBeUndefined()
+    expect(h.records()).toHaveLength(1)
+    expect(h.turn(id).phase).toBe("sent")
+  })
+})
+
 describe("correlated transports (current gateway, REPLv3)", () => {
   test("queued turn receives its own final", () => {
     const h = new Harness("current")

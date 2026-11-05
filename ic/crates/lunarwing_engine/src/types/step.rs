@@ -267,6 +267,10 @@ pub struct ActionResult {
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Provider-reported reasoning tokens; a subset of `output_tokens`, not an
+    /// additional term in [`TokenUsage::total`].
+    #[serde(default)]
+    pub reasoning_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     /// USD cost for this call (populated by LlmBackend if cost data is available).
@@ -285,6 +289,7 @@ impl TokenUsage {
         Self {
             input_tokens: self.input_tokens.saturating_add(rhs.input_tokens),
             output_tokens: self.output_tokens.saturating_add(rhs.output_tokens),
+            reasoning_tokens: self.reasoning_tokens.saturating_add(rhs.reasoning_tokens),
             cache_read_tokens: self.cache_read_tokens.saturating_add(rhs.cache_read_tokens),
             cache_write_tokens: self
                 .cache_write_tokens

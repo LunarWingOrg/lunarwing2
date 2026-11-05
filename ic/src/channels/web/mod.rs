@@ -617,6 +617,11 @@ pub(crate) fn status_sse_event(status: StatusUpdate, thread_id: Option<String>) 
             decisions: decisions.into_iter().map(ToolDecisionDto::from).collect(),
             thread_id,
         },
+        StatusUpdate::ReasoningStream(narrative) => SseEvent::ReasoningUpdate {
+            narrative,
+            decisions: Vec::new(),
+            thread_id,
+        },
         StatusUpdate::TurnCost {
             input_tokens,
             output_tokens,

@@ -181,6 +181,7 @@ function ReplyParts(props: TurnViewProps): ReactNode {
       {activity.map((entry, index) => (
         <Dim key={`a${index}`} theme={theme} text={`  : ${entry.text}${entry.ok === false ? " (failed)" : ""}`} />
       ))}
+      {!isSealedPhase(record.phase) && record.reasoning && <Dim theme={theme} text={`  reasoning: ${record.reasoning}`} />}
       {record.images.map((image) => (
         <ImageBlock key={image.id} image={image} columns={props.imageColumns} rows={GENERATED_IMAGE_ROWS} protocol={props.protocol} theme={theme} />
       ))}

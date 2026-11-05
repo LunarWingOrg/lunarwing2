@@ -78,7 +78,7 @@ import type {
 } from "../transport/types.ts"
 import { NOTHING_TO_INTERRUPT_ACK, controlAckKind, isInterruptedAck } from "../transport/control-acks.ts"
 import { sanitizeText, sanitizeVisible } from "../sanitize.ts"
-import { appendDelta, applyFinal, isSealedPhase, turnTextOf } from "./turn-text.ts"
+import { appendDelta, applyFinal, isSealedPhase, tailToUtf8Bytes, turnTextOf } from "./turn-text.ts"
 
 // ---------------------------------------------------------------------------------------------------------
 // Constants
@@ -500,6 +500,8 @@ export function applyEvent(state: AppState, event: TransportEvent, at: number): 
       return onStarted(state, event, at)
     case "turn.delta":
       return onDelta(state, event, at)
+    case "turn.reasoning":
+      return onReasoning(state, event, at)
     case "turn.activity":
       return onActivity(state, event, at)
     case "turn.image":
@@ -694,6 +696,15 @@ function onDelta(state: AppState, event: TransportEventOf<"turn.delta">, at: num
   let record: TurnRecord = { ...target.record, deltas: result.text.deltas }
   if (result.status === "cut") record = withNote(record, NOTES.deltaCut)
   return putTurn(target.state, progressed(target.state, record, at))
+}
+
+function onReasoning(state: AppState, event: TransportEventOf<"turn.reasoning">, at: number): AppState {
+  const record = progressTarget(state, event.turnId)
+  if (record === undefined || isSealed(record)) return state
+  // Sanitize before cutting: a control sequence must not be split into visible fragments by the byte cap.
+  const reasoning = tailToUtf8Bytes(cleanText(event.text), STATE_BOUNDS.maxReasoningBytesPerTurn)
+  if (reasoning.trim().length === 0) return state
+  return putTurn(state, progressed(state, { ...record, reasoning }, at))
 }
 
 function onActivity(state: AppState, event: TransportEventOf<"turn.activity">, at: number): AppState {

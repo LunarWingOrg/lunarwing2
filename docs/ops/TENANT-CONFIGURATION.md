@@ -393,6 +393,22 @@ aggressively; note that supervised approval prompts are separately bounded by
 the fixed 300s `supervised_timeout_secs` fail-closed auto-deny, which has no
 env override.
 
+### Live provider reasoning (WI#546)
+
+`ENGINE_V2_STREAM_REASONING=false` is the default. Set it to `true` (or `1`)
+in the tenant's `lunarwing.env` and restart the tenant to show live provider
+reasoning in browser and Wingtip gateway clients. mt-admin writes `false` for
+new tenants and preserves an existing value on env re-render. Snapshots carry
+only the latest 16 KiB UTF-8 tail, with updates coalesced at 300 ms per LLM
+stream; they are not stored in durable history or sent to XMPP/WASM/REPL.
+Wingtip replaces one multiline reasoning block without filling the activity
+log and hides it when the turn is sealed.
+
+Keep this flag off on shared gateways until routine-originated Engine V2 turns
+carry a `user_id`: statuses without that metadata use the existing broadcast
+path to all subscribers, including live reasoning when enabled (MR !2212 VV-5).
+This flag does not change tool-selection summaries.
+
 ## WASM Extensions
 
 ```bash

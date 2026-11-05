@@ -515,9 +515,11 @@ impl LlmProvider for LunarWingCloudChatProvider {
 
         Ok(CompletionResponse {
             content,
+            reasoning: None,
             finish_reason,
             input_tokens,
             output_tokens,
+            reasoning_tokens: 0,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
@@ -624,9 +626,11 @@ impl LlmProvider for LunarWingCloudChatProvider {
         Ok(ToolCompletionResponse {
             content,
             tool_calls,
+            reasoning: None,
             finish_reason,
             input_tokens,
             output_tokens,
+            reasoning_tokens: 0,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
