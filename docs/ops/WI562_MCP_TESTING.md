@@ -88,6 +88,20 @@ keyless configurations are the ones under test. Brave's generic connection
 error is the daemon-facing form of the direct missing-key exit documented
 below, not evidence that Brave offers anonymous search.
 
+### Agent-driven results
+
+The prompts below went through the real Engine V2 gateway chat path. Evidence
+comes from the persisted `tool_calls` in `/api/chat/history`, not only from the
+model's answer.
+
+- **Exa — keyless agent call passed.** The agent called
+  `exa_web_search_exa` once with one requested result. History records
+  `has_result: true`, `has_error: false`, and a result preview whose top URL is
+  `https://modelcontextprotocol.io/llms.txt`. The turn completed and the agent
+  reported the same URL. An `echo` entry is the Engine V2 response artifact,
+  not a substitute search tool.
+- **Context7, CoinGecko, and Brave Search:** agent attempts are pending.
+
 ### Hosted upstream discovery preflight
 
 Before LunarWing activation, the tenant account used the official MCP
