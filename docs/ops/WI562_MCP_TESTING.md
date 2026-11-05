@@ -65,9 +65,17 @@ Upstream references:
 
 ## Results
 
-The daemon and XMPP bridge release builds completed, and the tenant service
-graph is running. Agent-driven tests are still in progress; no result is
-inferred from the upstream authentication contracts above.
+All requested tests completed. CoinGecko, Exa, and Context7 work end-to-end
+through the tenant agent without credentials. Brave Search installs but cannot
+start without its required API key. No LunarWing source defect was exposed by
+these tests, so this pass makes no runtime code change.
+
+| Server | Activation | Keyless agent result |
+| --- | --- | --- |
+| CoinGecko | Active | Passed; real Bitcoin/USD price returned |
+| Exa | Active | Passed; real web-search result returned |
+| Context7 | Active | Passed; library resolution and documentation returned |
+| Brave Search | Failed before MCP initialize | Activation attempted by the agent and failed; API key required |
 
 ### LunarWing installation and activation
 
@@ -94,25 +102,35 @@ The prompts below went through the real Engine V2 gateway chat path. Evidence
 comes from the persisted `tool_calls` in `/api/chat/history`, not only from the
 model's answer.
 
-- **Exa — keyless agent call passed.** The agent called
+- **Exa — keyless agent call passed** (thread
+  `ea0fbe14-db41-42a9-91c2-0fb7d166a74c`). The agent called
   `exa_web_search_exa` once with one requested result. History records
   `has_result: true`, `has_error: false`, and a result preview whose top URL is
   `https://modelcontextprotocol.io/llms.txt`. The turn completed and the agent
   reported the same URL. An `echo` entry is the Engine V2 response artifact,
   not a substitute search tool.
-- **Context7 — keyless agent calls passed.** The agent called
+- **Context7 — keyless agent calls passed** (thread
+  `bfa77463-6d1b-44a6-a2ac-5d3986c1b25b`). The agent called
   `context7_resolve_library_id` and then `context7_query_docs`. History records
   `has_result: true` and `has_error: false` for both. Resolution selected
   `/vercel/next.js`; the documentation preview contains Next.js Route Handler
   guidance and its `route.js|ts` convention. The turn completed with no retry
   or fallback server.
-- **CoinGecko — keyless agent call passed.** After one approval, the agent
+- **CoinGecko — keyless agent call passed** (thread
+  `46725546-06a4-43cf-9c6e-b1eb7455b99c`). After one approval, the agent
   called `coingecko_execute` exactly once with the documented
   `client.simple.price.get` code. History records `has_result: true`,
   `has_error: false`, and `{"result":{"bitcoin":{"usd":75753}}}`. The turn
   completed and reported Bitcoin at 75,753 USD. An `echo` entry is again the
   Engine V2 response artifact.
-- **Brave Search:** agent activation attempt is pending.
+- **Brave Search — keyless activation failed as expected** (thread
+  `816a45b4-a38e-4d9d-85d8-565875dcaea2`). The agent called `tool_activate`
+  exactly once for `brave-search`. The result payload contains
+  `Activation failed: External service error: [brave-search] MCP server closed connection before responding to request Some(1)`.
+  No Brave search call or substitute server followed. History's outer
+  `has_result: true` / `has_error: false` flags describe the completed
+  `tool_activate` wrapper, not successful Brave activation; its embedded error
+  payload is the authoritative result.
 
 ### Hosted upstream discovery preflight
 
@@ -126,33 +144,50 @@ parameter. Initialize and `tools/list` succeeded on all three endpoints:
 | Exa | `web_search_exa`, `web_fetch_exa` |
 | Context7 | `resolve-library-id`, `query-docs` |
 
-These are upstream/network/keyless-discovery results only. They are not treated
-as proof that LunarWing can activate the servers or that the tenant agent can
-execute the tools.
+These were upstream/network/keyless-discovery checks, separate from the
+LunarWing activation and agent evidence above.
 
-Narrow direct calls then established these upstream baselines:
+Narrow direct calls established these upstream baselines:
 
 - Exa `web_search_exa` returned a result from
   `https://modelcontextprotocol.io/llms.txt` for a one-result search.
 - Context7 `resolve-library-id` resolved Next.js to `/vercel/next.js` with
   source metadata and available versions.
-- CoinGecko `execute` ran the documented `client.simple.price.get` request for
-  Bitcoin in USD but returned `isError: true` with `Error: 429 Throttled`.
-  Discovery therefore works, while the keyless shared execution quota was
-  exhausted at this attempt. A later agent attempt is still required; this is
-  not classified as a LunarWing transport failure.
+- CoinGecko `execute` initially returned `isError: true` with
+  `Error: 429 Throttled` for the documented Bitcoin/USD request. The later
+  agent call above succeeded, so this was transient shared-keyless throttling,
+  not a persistent authentication or LunarWing transport failure.
 
 ### Brave Search — direct package preflight
 
-The pinned package was installed under the tenant account with npm lifecycle
-scripts disabled. Running its real stdio entrypoint with both `BRAVE_API_KEY`
-and `BRAVE_API_KEY_FILE` removed exited with status 1 before MCP startup:
+The pinned package was installed under `/home/mcpvalidation/.local/share/`
+(outside the tenant source checkout) with npm lifecycle scripts disabled.
+Running its real stdio entrypoint with both `BRAVE_API_KEY` and
+`BRAVE_API_KEY_FILE` removed exited with status 1 before MCP startup:
 
 ```text
 Error: A Brave API key is required via --brave-api-key, BRAVE_API_KEY, --brave-api-key-file, or BRAVE_API_KEY_FILE. You can get one at https://brave.com/search/api/.
 Invalid configuration
 ```
 
-This confirms that the official Brave server cannot perform a keyless search.
-The LunarWing installation, activation, and agent-attempt results are recorded
-separately below once the tenant is running.
+This independently explains the LunarWing activation failure. The official
+Brave server cannot perform a keyless search in the tested configuration.
+
+## Final status and authenticated follow-up
+
+- `mt-admin status mcpvalidation` reports PostgreSQL running, LunarVision
+  healthy, and the daemon, XMPP bridge, WeeChat, adapter, and supervisor units
+  started. `GET /api/health` on gateway `10030` returns
+  `{"status":"healthy","channel":"gateway"}`.
+- CoinGecko, Exa, and Context7 remain active with the tools listed above.
+  Brave remains installed but disabled with no tools registered. All four
+  configurations were left in place for the later authenticated pass.
+- The daemon and XMPP bridge release builds completed in 8m40s and 7m28s
+  respectively under the 18-thread build bound.
+- **`mcpvalidation` remains running and boot-persistent. No remove, purge, or
+  teardown operation was run.**
+- For the authenticated follow-up, add credentials through the normal
+  owner-scoped extension secret configuration, reactivate Brave, and repeat
+  the same narrow prompts. Exa/Context7 can use their offered OAuth flow to
+  raise limits; CoinGecko can move to its authenticated Pro endpoint if the
+  free shared quota is throttled. Do not place token values in this report.
