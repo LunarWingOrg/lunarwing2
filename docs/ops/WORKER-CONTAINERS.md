@@ -9,7 +9,7 @@ See [`NANOCODE-REMOVAL.md`](NANOCODE-REMOVAL.md) for upgrade behavior.
 
 Master pipeline 6719's four worker scans each found CVE-2026-111497 in
 `libbrotli1`. All four Dockerfiles and `CI_DEBIAN_SNAPSHOT` now use
-`20261024T011300Z`: bookworm selects `1.0.9-2+deb12u1`, trixie
+`20261105T082236Z`: bookworm selects `1.0.9-2+deb12u1`, trixie
 `1.1.0-2+deb13u1`. The validator binds every worker's snapshot to CI and
 rejects older snapshots. The three existing scan suppressions were re-checked
 against these indexes and Debian's tracker; Brotli is not suppressed.
@@ -60,6 +60,41 @@ make an unrelated compile kill transient. Package pins and snapshot contents
 are unchanged, but the Dockerfile command edits re-key their layers.
 Protected candidate-versus-clean-rebuild digests, all four scans, and the
 opencode2 exposure verifier remain the image acceptance gates.
+
+## APT transport, retry, and client hardening (WI#561, 2026-11-05)
+
+[CVE-2026-109518](https://ubuntu.com/security/CVE-2026-109518) requires an
+on-path attacker, redirect handling, and non-zero `Acquire::Retries`; APT's
+retry hard-link reuse can otherwise replace an already verified package. All
+24 worker `deb` source lines and the three `worker-kimi-ts` lines now use
+`https://snapshot.debian.org` with normal certificate verification. There is
+no `Verify-Peer=false` or plain-HTTP fallback. Both snapshot hosts were
+checked over HTTPS on 2026-11-05: each returned its pinned content after an
+HTTPS 302 redirect, with HSTS present.
+
+Every worker APT call and both helper calls set `Acquire::Retries=0` and
+`Acquire::https::Timeout=60`. The WI#559 process timeouts are unchanged.
+Protected candidate builds and the CI helper retain their three-attempt outer
+ladders and recognize HTTP and HTTPS traces, so resilience does not depend on
+APT's vulnerable automatic retry path. Direct mt-admin builds have no outer
+retry ladder: a transient fetch now fails fast and the operator reruns the
+build after the archive recovers.
+
+The four Dockerfiles and `CI_DEBIAN_SNAPSHOT` use `20261105T082236Z`. Its
+Bookworm security archive serves `apt_2.6.2_amd64.deb`; its Trixie security
+`InRelease` is byte-identical to the index whose package list was checked for
+APT `3.0.4`. Every Dockerfile install explicitly includes `apt`, as does the
+CI provisioning helper, replacing the vulnerable client inherited from the
+base images instead of merely making a fixed version available. The snapshot
+floor and package-install shape have regression coverage.
+
+The inventory is limited to the four worker Dockerfiles plus
+`.gitlab/ci/validate.yml`; mt-admin renders those same lane Dockerfiles and
+has no independent mirror recipe. Independent second-host SHA-256 verification
+(WI#561 lane C) is not implemented. Rebuild every worker image and recreate
+its containers to deploy this fix. Protected candidate/rebuild digests, all
+four scans, and the opencode2 exposure verifier remain mandatory acceptance;
+local package-index probes and hermetic tests do not replace them.
 
 ## Hub-handshake credential boundary (WI#373)
 
@@ -1374,7 +1409,7 @@ and ties every snapshot to CI. Protected whole-image candidate/rebuild,
 scan and exposure verification on the changed tree remain required.
 
 The four `DEBIAN_SNAPSHOT` defaults and `CI_DEBIAN_SNAPSHOT` now use
-`20261024T011300Z`: its security indexes supply patched `libbrotli1`
+`20261105T082236Z`: its security indexes supply patched `libbrotli1`
 `1.0.9-2+deb12u1` (Bookworm) and `1.1.0-2+deb13u1` (Trixie), fixing
 CVE-2026-111497 without a new Trivy ignore. The three existing dated ignores
 were re-verified against these package indexes and the Debian tracker; their
