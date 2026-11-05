@@ -360,7 +360,7 @@
 41. [x] update the draft of the release notes at the root of the repo. much has changed and has been fixed. you can check open work items as well to help with this task
     - **DONE 2026-11-05 (Rarity, item-41, branch `aj/kimi-41-20261105-1200`):** refreshed the root `RELEASE-v2.1.8.0.md` draft with WI#556 Wingtip listener/TLS/revocation/event-memory hardening, WI#550's legacy silent-outcome guard, and WI#557's bounded Debian snapshot retries plus `tui-ts` validation. Upgrade guidance now calls out literal-IP gateway hosts, strict TLS, and wildcard Hex refusal. Known limitations record Wingtip M2b token-lifecycle work, WI#546 reasoning visibility/accounting, and the open WI#558/WI#559/WI#560 release-tooling follow-ups; current open-item descriptions and discussions were checked rather than presenting them as fixed.
     - **Verification:** `verify_release_version.py --self-test` **6/6 OK**; all **6** relative Markdown links and anchors resolve; the updated draft is **69 lines**, has balanced code fences, and passes `git diff --check`. Documentation-only change, so no cargo lane applies. The release draft was committed separately as `0ef4c56ee` before this checkoff.
-42. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/546
+42. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/546 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2207 but has some issues - please go through the review comments on the closed MR and re-attempt according to the review
 
 ## Phase 7 - Advanced Operator Notes
 
