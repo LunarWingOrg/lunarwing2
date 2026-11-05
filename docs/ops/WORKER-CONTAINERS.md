@@ -88,6 +88,16 @@ CI provisioning helper, replacing the vulnerable client inherited from the
 base images instead of merely making a fixed version available. The snapshot
 floor and package-install shape have regression coverage.
 
+The slim Node and Debian bases can have no system CA bundle at all. Each
+builder and runtime therefore copies `/etc/ssl/certs/ca-certificates.crt`
+directly from the already-reviewed, digest-pinned Python `3.12-slim-bookworm`
+image before its first APT call; no extra Dockerfile stage changes the builder
+manifest layout. `worker-kimi-ts` instead writes the bundle from the pinned
+Node runtime's built-in `tls.rootCertificates`. Both sources are local trusted
+inputs, not insecure network fallbacks. Each builder/runtime and the CI helper
+also assert the exact installed APT version (`2.6.2` or `3.0.4`), closing the
+APT behavior where failed index downloads can still return success.
+
 The inventory is limited to the four worker Dockerfiles plus
 `.gitlab/ci/validate.yml`; mt-admin renders those same lane Dockerfiles and
 has no independent mirror recipe. Independent second-host SHA-256 verification
