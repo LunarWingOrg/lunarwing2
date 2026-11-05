@@ -21,7 +21,8 @@ transient_snapshot_failure() {
 while [ "$attempt" -le "$max_attempts" ]; do
     : > "$attempt_rc"
     { timeout -k 30 "$update_timeout" apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=0 -o Acquire::https::Timeout=60 update &&
-        timeout -k 30 "$install_timeout" apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=60 install -y --no-install-recommends "$@" ||
+        timeout -k 30 "$install_timeout" apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=60 install -y --no-install-recommends "$@" &&
+        test "$(dpkg-query -W -f='${Version}' apt)" = "2.6.2" ||
         printf '%s\n' "$?" > "$attempt_rc"; } 2>&1 | tee "$attempt_log"
     if [ ! -s "$attempt_rc" ]; then
         cleanup_attempt_files
