@@ -273,11 +273,18 @@ Rules (`OutcomeHints`):
 ### The DEC-1 guard: `Ok(None)` on client channels
 
 `Ok(None)` from the message handler is the agent loop's shutdown signal
-(`/quit`, `/exit`, `/shutdown` on the in-process REPL). Model output reaches it
-too: a V1 reply that is `NO_REPLY` (`is_silent_reply` allows up to four
-trailing spaces or punctuation characters) and Engine V2
-`Completed { response: None }`. On the two channels whose clients attach to a
-running service, `gateway` and `unix_socket_repl`:
+(`/quit`, `/exit`, `/shutdown` on the in-process REPL). Model output formerly
+reached it through V1 `NO_REPLY` and Engine V2
+`Completed { response: None }`; WI#550 maps both to the empty-response sentinel
+on every channel, so they finish `no_reply` without stopping the agent or
+sending anything. V2 writes no assistant compatibility-history row; V1 keeps the
+literal `NO_REPLY` response in its in-memory thread history and database as before,
+since persistence happens before outbound suppression. Legacy command routing
+also uses the empty suppression sentinel for non-replies, including message-less
+success, suppressed, interrupted and approval-pending results; only an explicitly
+accepted `Submission::Quit` requests shutdown. On the two channels whose clients
+attach to a running service, `gateway` and `unix_socket_repl`, DEC-1 remains a
+backstop for any other `Ok(None)`:
 
 - `/quit`, `/exit` and `/shutdown` are refused before they reach the
   shutdown path (`quit_refusal` in `ic/src/agent/commands.rs`): the client gets
@@ -286,15 +293,12 @@ running service, `gateway` and `unix_socket_repl`:
   (`none_result_control`, with a warning), and the message finishes
   `no_reply`.
 
-Every other channel, including the in-process REPL, keeps the shutdown. The
-producers themselves stay tracked as separate bugs. To revert the guard, give
-`Ok(None)` the `MessageLoopControl::Shutdown` control in
-`deliver_message_result` again (a comment there names it), delete
-`none_result_control` and its unit test, and delete the two
-`*_silent_reply_does_not_stop_agent` tests in
-`ic/tests/e2e_quit_refusal.rs` with their trace
-`ic/tests/fixtures/llm_traces/tui/silent_reply.json`. The `/quit` refusal is
-independent of the guard.
+Every other channel, including the in-process REPL, keeps the shutdown for an
+actual `Ok(None)`. To revert only the DEC-1 guard, give `Ok(None)` the
+`MessageLoopControl::Shutdown` control in `deliver_message_result` again (a
+comment there names it) and delete `none_result_control` and its unit test.
+Keep the WI#550 producer fixes and their independent silent-reply tests. The
+`/quit` refusal is independent of the guard.
 
 ### Known gaps
 

@@ -147,13 +147,13 @@ fn engine_conversation_key(message: &IncomingMessage) -> String {
 
 /// Map a thread outcome to the terminal channel response.
 ///
-/// `Stopped` (and any future no-reply outcome) uses the empty-string sentinel,
-/// which the outbound handler suppresses and which is never written to v1
-/// compatibility history. `GatePaused` returns `None` because the caller drives
+/// `Stopped` and a completed turn without response text use the empty-string
+/// sentinel, which the outbound handler suppresses and which is never written to
+/// v1 compatibility history. `GatePaused` returns `None` because the caller drives
 /// its channel status side effects separately.
-fn thread_outcome_response(outcome: &ThreadOutcome) -> Option<String> {
+pub(crate) fn thread_outcome_response(outcome: &ThreadOutcome) -> Option<String> {
     match outcome {
-        ThreadOutcome::Completed { response } => response.clone(),
+        ThreadOutcome::Completed { response } => Some(response.clone().unwrap_or_default()),
         ThreadOutcome::Stopped => Some(String::new()),
         ThreadOutcome::MaxIterations => Some(
             "Reached maximum iterations after a final recovery attempt. Retry with narrower scope or a higher iteration limit."
@@ -11507,6 +11507,14 @@ pub(crate) mod tests {
                 response: Some("final".into()),
             }),
             Some("final".into())
+        );
+    }
+
+    #[test]
+    fn completed_outcome_without_text_uses_empty_response_sentinel() {
+        assert_eq!(
+            thread_outcome_response(&ThreadOutcome::Completed { response: None }),
+            Some(String::new())
         );
     }
 

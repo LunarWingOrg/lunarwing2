@@ -54,10 +54,9 @@ import sys
 with open(sys.argv[-1]) as source:
     print(json.load(source)["containerimage.digest"])
 """)
-        # BUILDCTL_MODE steers failure injection: "ok" always publishes,
-        # "fail_once" fails only the first call with the pipeline-5984
-        # registry-auth 429, "fail_always" always fails with it, and
-        # "fail_compile" always fails with a genuine build error.
+        # BUILDCTL_MODE steers failure injection without contacting a builder
+        # or registry. Each failure mode emits the job-trace signature that the
+        # production retry classifier must accept or reject.
         self.write_shim("buildctl-daemonless.sh", f"""#!{sys.executable}
 import json
 import os
@@ -74,9 +73,27 @@ if mode == "fail_always" or (mode == "fail_once" and count == 1):
     print("#33 [auth] registry.invalid/example/worker/worker-opencode2:pull,push token for registry.invalid", file=sys.stderr)
     print("ERROR: failed to push registry.invalid/example/worker/worker-opencode2:tag: failed to authorize: failed to fetch oauth token: unexpected status from POST request to https://git.lunarwing.invalid/jwt/auth: 429 Too Many Requests: Retry later", file=sys.stderr)
     sys.exit(1)
+if mode == "fail_snapshot_always" or (mode == "fail_snapshot_once" and count == 1):
+    print("#12 [builder 3/13] RUN apt-get update && apt-get install", file=sys.stderr)
+    print("W: Tried to start delayed item http://snapshot.debian.org/archive/debian/20261024T011300Z but failed", file=sys.stderr)
+    print("E: Unable to fetch some archives, maybe run apt-get update or try with --fix-missing?", file=sys.stderr)
+    sys.exit(1)
+if mode == "fail_snapshot_killed_once" and count == 1:
+    print("#12 [runtime 2/17] RUN apt-get update using snapshot.debian.org", file=sys.stderr)
+    print("Killed", file=sys.stderr)
+    print("ERROR: failed to solve: process did not complete successfully: exit code: 137", file=sys.stderr)
+    sys.exit(1)
+if mode == "fail_compile_after_snapshot_delay_warning":
+    print("#12 [builder 3/13] RUN apt-get update", file=sys.stderr)
+    print("W: Tried to start delayed item http://snapshot.debian.org/archive/debian/20261024T011300Z but failed", file=sys.stderr)
+    print('ERROR: failed to solve: process "/bin/sh -c make" did not complete successfully: exit code: 2', file=sys.stderr)
+    sys.exit(1)
 if mode == "fail_compile":
     print("ERROR: failed to solve: process \\"/bin/sh -c make\\" did not complete successfully: exit code: 2", file=sys.stderr)
     sys.exit(1)
+if mode == "fail_package":
+    print("E: Unable to locate package definitely-not-a-real-package", file=sys.stderr)
+    sys.exit(100)
 metadata = pathlib.Path(args[args.index("--metadata-file") + 1])
 metadata.write_text(json.dumps({{"containerimage.digest": "sha256:" + "0" * 64}}))
 for index, argument in enumerate(args):
@@ -218,6 +235,65 @@ for index, argument in enumerate(args):
         calls = self.log.read_text().splitlines()
         self.assertEqual(len(calls), 1)
         self.assertIn("not retrying", result.stderr)
+
+    def test_transient_snapshot_failure_is_retried(self):
+        self.env["BUILDCTL_MODE"] = "fail_snapshot_once"
+        result = self.run_build()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertEqual(len(calls), 3)
+        self.assertNotIn("--no-cache", calls[1])
+        self.assertIn("--no-cache", calls[2])
+        self.assertIn("transient snapshot.debian.org failure (attempt 1/3)", result.stderr)
+        self.assertEqual(self.recorded_sleeps(), [122])
+
+    def test_snapshot_sigkill_during_apt_run_is_retried(self):
+        # Pipeline 7174's trace names the snapshot RUN step with "exit code:
+        # 137" but buildctl itself exits 1, so the stub exits 1 and the
+        # classifier must match the trace text, not the exit status.
+        self.env["BUILDCTL_MODE"] = "fail_snapshot_killed_once"
+        result = self.run_build()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.log.read_text().splitlines()
+        self.assertEqual(len(calls), 3)
+        self.assertIn("transient snapshot.debian.org failure (attempt 1/3)", result.stderr)
+
+    def test_snapshot_delay_warning_alone_is_not_retried(self):
+        # apt prints "W: Tried to start delayed item … snapshot.debian.org"
+        # while merely slow, even on a step that later succeeds; that warning
+        # must not turn a later genuine failure into a snapshot retry.
+        self.env["BUILDCTL_MODE"] = "fail_compile_after_snapshot_delay_warning"
+        result = self.run_build()
+        self.assertNotEqual(result.returncode, 0)
+        calls = self.log.read_text().splitlines()
+        self.assertEqual(len(calls), 1)
+        self.assertIn("not retrying", result.stderr)
+        self.assertNotIn("transient snapshot.debian.org", result.stderr)
+
+    def test_persistent_snapshot_failure_exhausts_own_budget(self):
+        self.env["BUILDCTL_MODE"] = "fail_snapshot_always"
+        result = self.run_build()
+        self.assertNotEqual(result.returncode, 0)
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertEqual(len(calls), 3)
+        for args in calls:
+            self.assertNotIn("--no-cache", args)
+        self.assertEqual(self.recorded_sleeps(), [122, 302])
+        self.assertIn("failure (attempt 1/3)", result.stderr)
+        self.assertIn("failure (attempt 2/3)", result.stderr)
+        self.assertIn("not retrying", result.stderr)
+        # Conservatively add both full ladders and nine maximum jitter values;
+        # even that unreachable combination remains below the 8 h job timeout.
+        self.assertLessEqual(5715 + 420 + 9 * 29, 8 * 3600)
+
+    def test_package_resolution_failure_is_not_retried(self):
+        self.env["BUILDCTL_MODE"] = "fail_package"
+        result = self.run_build()
+        self.assertNotEqual(result.returncode, 0)
+        calls = self.log.read_text().splitlines()
+        self.assertEqual(len(calls), 1)
+        self.assertIn("not retrying", result.stderr)
+        self.assertNotIn("transient snapshot.debian.org", result.stderr)
 
 
 if __name__ == "__main__":

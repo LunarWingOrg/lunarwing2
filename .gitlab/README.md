@@ -304,8 +304,14 @@ carried no retry options, so a single dropped fetch failed a multi-hour
 candidate. Since 2026-10-19 every `apt-get update`/`apt-get install` in all
 four worker Dockerfiles (kimi, opencode, opencode2, pebble) runs with
 `Acquire::Retries=5`/`Acquire::http::Timeout=60`, the same options the lane
-has used since the HE-4/HN-8 hardening. A full snapshot outage still fails
-the build until the service recovers (retry the job).
+has used since the HE-4/HN-8 hardening. Since 2026-11-04 the image-build
+wrapper also gives classified snapshot failures a separate three-attempt
+ladder with 120/300-second delays plus job-id-based jitter. This covers apt's
+snapshot fetch/download signatures and a 137 kill on a `RUN` step whose trace
+names the snapshot host (pipeline 7174); package-resolution and other genuine
+build failures still exit on the first attempt. Publication jobs keep
+`retry: 0`. A full snapshot outage still fails after the third attempt until
+the service recovers (retry the job).
 
 ## worker scan transient kills (exit 137)
 

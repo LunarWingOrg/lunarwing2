@@ -140,10 +140,9 @@ fn submission_outcome_hint(result: &SubmissionResult) -> Option<TurnOutcome> {
 }
 
 /// DEC-1 guard (TUI design 8.4): `Ok(None)` stops the loop except on channels whose
-/// clients attach to a running service. There, model output that maps to `Ok(None)`
-/// (a V1 `NO_REPLY` reply, V2 `Completed { response: None }`) must not stop the daemon;
-/// the producers themselves are tracked separately. To revert, give `Ok(None)` the
-/// `Shutdown` control in `deliver_message_result` again.
+/// clients attach to a running service. WI#550 maps both model-driven silent outcomes
+/// to the empty-string sentinel instead; this remains a backstop for client channels.
+/// To revert, give `Ok(None)` the `Shutdown` control in `deliver_message_result` again.
 fn none_result_control(channel: &str) -> MessageLoopControl {
     if crate::agent::commands::quit_refusal(channel).is_some() {
         tracing::warn!(
@@ -2302,7 +2301,7 @@ impl Agent {
                 // Suppress silent replies (e.g. from group chat "nothing to say" responses)
                 if crate::llm::is_silent_reply(&content) {
                     tracing::debug!("Suppressing silent reply token");
-                    Ok(None)
+                    Ok(Some(String::new()))
                 } else {
                     Ok(Some(content))
                 }
@@ -2617,7 +2616,7 @@ mod tests {
             rate(&agent, &message, empty).await,
             (true, TurnOutcome::NoReply)
         );
-        // `Ok(None)` is the shutdown signal (and the silent `NO_REPLY` reply).
+        // `Ok(None)` remains the explicit shutdown signal; silent replies use `Some("")`.
         assert_eq!(
             rate(&agent, &message, Ok(None)).await,
             (false, TurnOutcome::NoReply)
@@ -2630,6 +2629,97 @@ mod tests {
             (true, TurnOutcome::Failed)
         );
         assert_eq!(reply_count(), 2, "the error reply");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn completed_without_response_keeps_xmpp_agent_running() {
+        let (agent, _stub_replies, _db_dir) = stub_channel_agent().await;
+        let (channel, _sender) = crate::testing::StubChannel::new("xmpp");
+        let replies = channel.captured_responses_handle();
+        agent.channels.add(Box::new(channel)).await;
+        let message = IncomingMessage::new("xmpp", "alice", "stay silent");
+
+        let outcome = lunarwing_engine::ThreadOutcome::Completed { response: None };
+        let result = Ok(crate::bridge::router::thread_outcome_response(&outcome));
+        assert_eq!(
+            rate(&agent, &message, result).await,
+            (true, TurnOutcome::NoReply)
+        );
+        assert!(replies.lock().map_or(true, |replies| replies.is_empty()));
+
+        let follow_up = Ok(Some("Still running.".to_string()));
+        assert_eq!(
+            rate(&agent, &message, follow_up).await,
+            (true, TurnOutcome::Replied)
+        );
+        assert_eq!(replies.lock().map_or(0, |replies| replies.len()), 1);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn legacy_command_non_replies_keep_xmpp_agent_running() {
+        let (agent, _stub_replies, _db_dir) = stub_channel_agent().await;
+        let (channel, _sender) = crate::testing::StubChannel::new("xmpp");
+        let replies = channel.captured_responses_handle();
+        agent.channels.add(Box::new(channel)).await;
+
+        // Inject latent command outcomes at the adapter boundary: no system command
+        // returns these yet. XMPP has no DEC-1 guard to mask a shutdown sentinel.
+        for result in [
+            SubmissionResult::Suppressed,
+            SubmissionResult::Interrupted,
+            SubmissionResult::Ok { message: None },
+            SubmissionResult::NeedApproval {
+                request_id: uuid::Uuid::new_v4(),
+                tool_name: "shell".into(),
+                description: "Run a command".into(),
+                parameters: serde_json::json!({}),
+                allow_always: false,
+            },
+        ] {
+            let message = IncomingMessage::new("xmpp", "alice", "/command");
+            let response = crate::agent::commands::legacy_command_response(result);
+            assert_eq!(
+                rate(&agent, &message, Ok(Some(response))).await,
+                (true, TurnOutcome::NoReply)
+            );
+            assert!(replies.lock().unwrap().is_empty());
+        }
+
+        // Follow-up commands go through the real legacy router caller, preserving
+        // ordinary responses, success messages and error formatting.
+        for (index, (command, expected)) in [
+            ("ping", "pong!"),
+            ("debug", "Debug toggle is handled by your client."),
+            ("unknown", "Error: Unknown command: unknown. Try /help"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let message = IncomingMessage::new("xmpp", "alice", format!("/{command}"));
+            let result = agent
+                .handle_job_or_command(
+                    crate::agent::MessageIntent::Command {
+                        command: command.into(),
+                        args: Vec::new(),
+                    },
+                    &message,
+                )
+                .await
+                .unwrap();
+            let SubmissionResult::Response { content } = result else {
+                panic!("legacy command returned a non-response: {result:?}");
+            };
+            assert_eq!(content, expected);
+            assert_eq!(
+                rate(&agent, &message, Ok(Some(content))).await,
+                (true, TurnOutcome::Replied)
+            );
+            let replies = replies.lock().unwrap();
+            assert_eq!(replies.len(), index + 1);
+            assert_eq!(replies[index].1.content, expected);
+        }
     }
 
     /// A reply that a `BeforeOutbound` hook suppresses never reached `respond()`: the

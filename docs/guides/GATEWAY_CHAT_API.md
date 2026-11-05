@@ -450,12 +450,15 @@ no `message_id` or `client_turn_id`.
   (lunarwing-mt-admin.sh stop-tenant)." and `turn_finished{failed}`; the
   daemon keeps running. Legacy daemons stop on these commands, so clients
   intercept them locally on every daemon.
-- A reply that the agent maps to "stop" (a V1 reply that `is_silent_reply`
-  reads as silent: `NO_REPLY`, optionally followed by up to four whitespace
-  or ASCII punctuation characters, for example `NO_REPLY.`; or Engine V2
-  `Completed{response: None}`) does not stop the daemon from these two
-  channels either (DEC-1 guard); it finishes `no_reply`. Other channels keep
-  the old behaviour, and the two producers are tracked as separate bugs.
+- A silent reply (a V1 reply that `is_silent_reply` reads as silent:
+  `NO_REPLY`, optionally followed by up to four whitespace or ASCII
+  punctuation characters, for example `NO_REPLY.`; or Engine V2
+  `Completed{response: None}`) finishes `no_reply` on every channel (WI#550).
+  Both producers use the empty-response suppression sentinel, so the daemon
+  keeps running and nothing is sent. V2 writes no assistant compatibility-history
+  row; V1 keeps the literal `NO_REPLY` response in its in-memory thread history and
+  database as before, since persistence precedes outbound suppression. The DEC-1
+  guard on the two client channels remains as a backstop for any other `Ok(None)`.
 - `/restart`: an operator action (`lunarwing-mt-admin.sh restart-tenant`); the
   TUI refuses it locally.
 - Bare approval keywords (for example `yes`, `ok`, `no`, `deny`, `always`;
