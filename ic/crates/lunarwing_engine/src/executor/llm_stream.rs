@@ -307,6 +307,7 @@ mod tests {
                     discarded_usage: Some(TokenUsage {
                         input_tokens: 900,
                         output_tokens: 0,
+                        reasoning_tokens: 0,
                         cache_read_tokens: 100,
                         cache_write_tokens: 0,
                         cost_usd: 0.0,
@@ -318,6 +319,7 @@ mod tests {
                     discarded_usage: Some(TokenUsage {
                         input_tokens: 1100,
                         output_tokens: 0,
+                        reasoning_tokens: 0,
                         cache_read_tokens: 0,
                         cache_write_tokens: 0,
                         cost_usd: 0.0,
@@ -583,7 +585,8 @@ mod tests {
                 reasoning_tokens: 3,
                 ..TokenUsage::default()
             })),
-        ]);
+        ])
+        .boxed();
         let mut deltas = Vec::new();
         let output = collect_llm_stream(stream, |delta| {
             let kind = match delta {
