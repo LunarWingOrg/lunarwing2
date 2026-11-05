@@ -128,7 +128,10 @@ def record_note(state_path, iid, note_id, created_at, head_sha=None):
     if not entry.get("posted_note_id"):
         entry["posted_note_id"] = note_id
     entry["posted_at"] = created_at
-    if head_sha and not entry.get("head_sha"):
+    if head_sha:
+        # The head that was reviewed. Only `post --head` and `note-id --head`
+        # pass one; a CI addendum (`--any-head`) leaves the recorded head alone,
+        # so a push after the review still shows as CHANGED in `status`.
         entry["head_sha"] = head_sha
     save_state(state_path, state)
     print(f"state: !{iid} posted_note_ids={ids} posted_at={created_at}")
@@ -251,7 +254,8 @@ def cmd_post(args):
     note = disc["notes"][0]
     print(f"posted note {note['id']} at {note['created_at']}")
     if args.record:
-        record_note(args.state, args.iid, int(note["id"]), note["created_at"], mr["sha"])
+        reviewed = mr["sha"] if args.head else None
+        record_note(args.state, args.iid, int(note["id"]), note["created_at"], reviewed)
 
 
 def cmd_note_id(args):
@@ -342,7 +346,8 @@ def main():
     p.add_argument("file")
     p.add_argument("--head", help="head sha (prefix ok) the note was written for; refused if the MR moved")
     p.add_argument("--any-head", action="store_true", help="skip the head check")
-    p.add_argument("--record", action="store_true", help="record the note id in the state file")
+    p.add_argument("--record", action="store_true",
+                   help="record the note id in the state file (with --head, also the reviewed head)")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_post)
 
