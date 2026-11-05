@@ -2,13 +2,11 @@ ARG PEBBLE_REF=2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b
 ARG DEBIAN_SNAPSHOT=20261105T082236Z
 ARG SOURCE_REVISION=unknown
 
-FROM docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b AS certificates
-
 FROM docker.io/library/rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS builder
 
 ARG PEBBLE_REF
 ARG DEBIAN_SNAPSHOT
-COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 RUN set -eu; \
     test -s /etc/ssl/certs/ca-certificates.crt; \
@@ -91,7 +89,7 @@ ARG WITH_TOOLCHAINS=false
 LABEL org.opencontainers.image.revision="${SOURCE_REVISION}" \
       org.opencontainers.image.toolchain-profile="${WITH_TOOLCHAINS}"
 
-COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 RUN set -eu; \
     test -s /etc/ssl/certs/ca-certificates.crt; \
