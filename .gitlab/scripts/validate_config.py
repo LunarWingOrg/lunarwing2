@@ -2771,9 +2771,9 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
     # the token inside a snapshot URL (an ENV after the ARG wins over it, a
     # RUN-level shell assignment re-points the RUN's URLs, a multi-name ARG
     # hides from the valued-ARG match, and shell substitution is not a
-    # literal reference), and every apt `deb` source line must point at
-    # snapshot.debian.org, so a builder moved back to the live mirror is
-    # caught too. The host match is case-insensitive in both rules.
+    # literal reference), and every apt `deb` source line must use HTTPS at
+    # snapshot.debian.org, so a builder moved back to the live mirror or plain
+    # HTTP is caught too. The host match is case-insensitive in both rules.
     snapshot = variables.get("CI_DEBIAN_SNAPSHOT", "")
     if not re.fullmatch(r"\d{8}T\d{6}Z", snapshot):
         errors.append(
