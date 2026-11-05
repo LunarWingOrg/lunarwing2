@@ -344,15 +344,16 @@
 39. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/559
 40. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/558
 41. [ ] update the draft of the release notes at the root of the repo. much has changed and has been fixed. you can check open work items as well to help with this task
+42. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/546
 
 ## Phase 7 - Advanced Operator Notes
 
-42. [x] (H) Deploy the stoplight system
-43. [x] (H) Dive back in to LunarDepth and open worker lanes across the fleet for it get it running and up again patches too
-44. [x] (H) follow up on some earlier endeavors
-45. [x] (H) check older goals for others that may be not done yet
-46. [x] (H) update rel notes
-47. [x] (S) Reserved
+43. [x] (H) Deploy the stoplight system
+44. [x] (H) Dive back in to LunarDepth and open worker lanes across the fleet for it get it running and up again patches too
+45. [x] (H) follow up on some earlier endeavors
+46. [x] (H) check older goals for others that may be not done yet
+47. [x] (H) update rel notes
 48. [x] (S) Reserved
+49. [x] (S) Reserved
 
 ---
