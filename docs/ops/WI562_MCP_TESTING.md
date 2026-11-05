@@ -65,9 +65,28 @@ Upstream references:
 
 ## Results
 
-The tenant release build and LunarWing activation/agent tests are still in
-progress. No hosted-server result is inferred from the upstream authentication
-contracts above.
+The daemon and XMPP bridge release builds completed, and the tenant service
+graph is running. Agent-driven tests are still in progress; no result is
+inferred from the upstream authentication contracts above.
+
+### LunarWing installation and activation
+
+All four configurations installed successfully through the authenticated
+`POST /api/extensions/install` route. Activation through
+`POST /api/extensions/{name}/activate` produced these observed states:
+
+| Server | LunarWing result | Registered tools / failure |
+| --- | --- | --- |
+| CoinGecko | Active, enabled | `coingecko_execute`, `coingecko_search_docs` |
+| Exa | Active, enabled | `exa_web_search_exa`, `exa_web_fetch_exa` |
+| Context7 | Active, enabled | `context7_resolve-library-id`, `context7_query-docs` |
+| Brave Search | Inactive, disabled after failed activation | `Activation failed: External service error: [brave-search] MCP server closed connection before responding to request Some(1)` |
+
+Exa and Context7 also returned optional OAuth authorization URLs after their
+successful activation. No OAuth callback or credential was used; the active
+keyless configurations are the ones under test. Brave's generic connection
+error is the daemon-facing form of the direct missing-key exit documented
+below, not evidence that Brave offers anonymous search.
 
 ### Hosted upstream discovery preflight
 
