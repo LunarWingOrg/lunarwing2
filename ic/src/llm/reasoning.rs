@@ -483,6 +483,7 @@ impl Reasoning {
         let usage = TokenUsage {
             input_tokens: response.input_tokens,
             output_tokens: response.output_tokens,
+            reasoning_tokens: response.reasoning_tokens,
             cache_read_input_tokens: response.cache_read_input_tokens,
             cache_creation_input_tokens: response.cache_creation_input_tokens,
         };
@@ -554,7 +555,11 @@ impl Reasoning {
 
         let response = self.llm.complete_with_tools(request).await?;
 
-        let reasoning = response.content.unwrap_or_default();
+        let shared_reasoning = response
+            .reasoning
+            .clone()
+            .or(response.content.clone())
+            .unwrap_or_default();
 
         let selections: Vec<ToolSelection> = response
             .tool_calls
@@ -562,7 +567,9 @@ impl Reasoning {
             .map(|tool_call| ToolSelection {
                 tool_name: tool_call.name,
                 parameters: tool_call.arguments,
-                reasoning: reasoning.clone(),
+                reasoning: tool_call
+                    .reasoning
+                    .unwrap_or_else(|| shared_reasoning.clone()),
                 alternatives: vec![],
                 tool_call_id: tool_call.id,
             })
