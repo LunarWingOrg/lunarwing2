@@ -188,6 +188,7 @@ impl LlmProvider for InstrumentedLlm {
                             .await;
                         }
                         Ok(LlmStreamChunk::TextDelta(_))
+                        | Ok(LlmStreamChunk::ReasoningDelta(_))
                         | Ok(LlmStreamChunk::Observation(_))
                         | Err(_) => {}
                     }
