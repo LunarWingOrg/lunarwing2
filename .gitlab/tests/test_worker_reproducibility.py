@@ -120,6 +120,20 @@ class WorkerReproducibilityTests(unittest.TestCase):
                 )
                 self.assertEqual(pins, [snapshot])
 
+    def test_worker_apt_uses_https_without_internal_retries(self):
+        for lane in WORKERS:
+            with self.subTest(lane=lane):
+                text = (ROOT / lane / "Dockerfile").read_text()
+                sources = re.findall(r'"deb (https?)://snapshot\.debian\.org/', text)
+                self.assertEqual(len(sources), 6)
+                self.assertEqual(set(sources), {"https"})
+                self.assertNotIn('"deb http://', text)
+                apt_calls = len(re.findall(r"\bapt-get\b", text))
+                self.assertEqual(apt_calls, 6)
+                self.assertEqual(text.count("Acquire::Retries=0"), apt_calls)
+                self.assertEqual(text.count("Acquire::https::Timeout=60"), apt_calls)
+                self.assertNotRegex(text, r"Acquire::Retries=[1-9]")
+
 
 if __name__ == "__main__":
     unittest.main()
