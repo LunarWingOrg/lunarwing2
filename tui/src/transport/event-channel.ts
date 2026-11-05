@@ -170,25 +170,28 @@ export class EventChannel implements AsyncIterable<TransportEvent> {
     return event
   }
 
-  private recountBytes(): void {
-    this.queuedBytes = this.queue.slice(this.head).reduce<number>((total, event) => total + eventMemoryBytes(event), 0)
-  }
-
   private dropEvents(predicate: (event: TransportEvent) => boolean): void {
-    const queued = this.queue.slice(this.head)
-    const kept = queued.filter((event) => !predicate(event))
-    this.droppedCount += queued.length - kept.length
+    const kept: TransportEvent[] = []
+    for (let i = this.head; i < this.queue.length; i += 1) {
+      const event = this.queue[i]
+      if (event === undefined) continue
+      if (predicate(event)) {
+        this.queuedBytes -= eventMemoryBytes(event)
+        this.droppedCount += 1
+      } else {
+        kept.push(event)
+      }
+    }
     this.queue = kept
     this.head = 0
-    this.recountBytes()
   }
 
   private dropOldest(): boolean {
     const index = this.queue.findIndex((event, i) => i >= this.head && event !== this.overflowMarker)
     if (index < 0) return false
-    this.queue.splice(index, 1)
+    const [event] = this.queue.splice(index, 1)
+    if (event !== undefined) this.queuedBytes -= eventMemoryBytes(event)
     this.droppedCount += 1
-    this.recountBytes()
     return true
   }
 
