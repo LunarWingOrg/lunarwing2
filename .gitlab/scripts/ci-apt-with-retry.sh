@@ -14,14 +14,14 @@ cleanup_attempt_files() {
 
 transient_snapshot_failure() {
     [ "$1" = 124 ] && return 0
-    grep -qE 'Failed to fetch http://snapshot\.debian\.org|Some index files failed to download|Unable to fetch some archives' "$attempt_log" ||
+    grep -qE 'Failed to fetch https?://snapshot\.debian\.org|Some index files failed to download|Unable to fetch some archives' "$attempt_log" ||
         grep -qE "Temporary failure resolving 'snapshot\.debian\.org'|Could not connect to snapshot\.debian\.org" "$attempt_log"
 }
 
 while [ "$attempt" -le "$max_attempts" ]; do
     : > "$attempt_rc"
-    { timeout -k 30 "$update_timeout" apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update &&
-        timeout -k 30 "$install_timeout" apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install -y --no-install-recommends "$@" ||
+    { timeout -k 30 "$update_timeout" apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=0 -o Acquire::https::Timeout=60 update &&
+        timeout -k 30 "$install_timeout" apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=60 install -y --no-install-recommends "$@" ||
         printf '%s\n' "$?" > "$attempt_rc"; } 2>&1 | tee "$attempt_log"
     if [ ! -s "$attempt_rc" ]; then
         cleanup_attempt_files
