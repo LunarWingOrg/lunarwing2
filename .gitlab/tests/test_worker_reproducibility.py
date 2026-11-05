@@ -106,7 +106,7 @@ class WorkerReproducibilityTests(unittest.TestCase):
                     self.assertEqual(result.stdout, "")
             self.assertNotEqual(self.shadow_check(lane, account, 0, None).returncode, 0)
 
-    def test_all_worker_snapshots_match_ci_and_include_the_brotli_fix(self):
+    def test_all_worker_snapshots_match_ci_and_include_security_fixes(self):
         defaults = yaml.safe_load((ROOT / ".gitlab/ci/defaults.yml").read_text())
         snapshot = defaults["variables"]["CI_DEBIAN_SNAPSHOT"]
         self.assertRegex(snapshot, r"^\d{8}T\d{6}Z$")
