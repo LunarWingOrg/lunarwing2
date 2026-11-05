@@ -53,8 +53,7 @@ if mode == "hang_update_once" and count == 1:
 if mode == "hang_install_once" and count == 2:
     time.sleep(2)
 if install and (mode == "fail_snapshot_always" or (mode == "fail_snapshot_once" and count == 2)):
-    print("E: Failed to fetch http://snapshot.debian.org/archive/debian/pool/python3.deb  504  Gateway Timeout", file=sys.stderr)
-    print("E: Unable to fetch some archives, maybe run apt-get update or try with --fix-missing?", file=sys.stderr)
+    print("E: Failed to fetch https://snapshot.debian.org/archive/debian/pool/python3.deb  504  Gateway Timeout", file=sys.stderr)
     sys.exit(100)
 if install and mode == "fail_package":
     print("E: Unable to locate package python3", file=sys.stderr)
@@ -97,7 +96,7 @@ if install and mode == "fail_package":
         self.assertFalse((self.root / ".ci-apt-attempt.log").exists())
         self.assertFalse((self.root / ".ci-apt-attempt.rc").exists())
 
-    def test_success_uses_pinned_retry_options_without_sleeping(self):
+    def test_success_disables_internal_retries_without_sleeping(self):
         result = self.run_apt()
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.apt_calls()
@@ -107,8 +106,8 @@ if install and mode == "fail_package":
         self.assertIn("install", calls[1])
         self.assertEqual(calls[1][-2:], ["--no-install-recommends", "python3"])
         for call in calls:
-            self.assertIn("Acquire::Retries=5", call)
-            self.assertIn("Acquire::http::Timeout=60", call)
+            self.assertIn("Acquire::Retries=0", call)
+            self.assertIn("Acquire::https::Timeout=60", call)
         self.assertEqual(self.recorded_sleeps(), [])
         self.assert_attempt_files_removed()
 
