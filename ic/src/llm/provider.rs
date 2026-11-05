@@ -203,8 +203,12 @@ impl CompletionRequest {
 #[derive(Debug, Clone)]
 pub struct CompletionResponse {
     pub content: String,
+    /// Provider reasoning kept separate from the final assistant response.
+    pub reasoning: Option<String>,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Reasoning tokens reported by the provider; included in `output_tokens`.
+    pub reasoning_tokens: u32,
     pub finish_reason: FinishReason,
     /// Tokens read from the provider's server-side prompt cache (Anthropic).
     /// Zero when caching is not supported or on a cache miss.
@@ -265,6 +269,8 @@ pub enum LlmStreamObservation {
 pub enum LlmStreamChunk {
     /// Incremental assistant text.
     TextDelta(String),
+    /// Incremental provider reasoning, kept separate from final assistant text.
+    ReasoningDelta(String),
     /// Incremental tool/action call data.
     ToolCallDelta {
         index: usize,
@@ -450,8 +456,12 @@ pub struct ToolCompletionResponse {
     pub content: Option<String>,
     /// Tool calls requested by the model.
     pub tool_calls: Vec<ToolCall>,
+    /// Shared provider reasoning associated with this response and its calls.
+    pub reasoning: Option<String>,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Reasoning tokens reported by the provider; included in `output_tokens`.
+    pub reasoning_tokens: u32,
     pub finish_reason: FinishReason,
     /// Tokens read from the provider's server-side prompt cache (Anthropic).
     pub cache_read_input_tokens: u32,
@@ -472,6 +482,9 @@ pub struct ModelMetadata {
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Provider-reported reasoning tokens; a subset of `output_tokens`, not an
+    /// additional term in [`TokenUsage::total`].
+    pub reasoning_tokens: u32,
     /// Tokens served from the provider's server-side prompt cache (Anthropic).
     pub cache_read_input_tokens: u32,
     /// Tokens written to the provider's prompt cache (Anthropic).
@@ -489,6 +502,7 @@ impl TokenUsage {
         Self {
             input_tokens: self.input_tokens.saturating_add(rhs.input_tokens),
             output_tokens: self.output_tokens.saturating_add(rhs.output_tokens),
+            reasoning_tokens: self.reasoning_tokens.saturating_add(rhs.reasoning_tokens),
             cache_read_input_tokens: self
                 .cache_read_input_tokens
                 .saturating_add(rhs.cache_read_input_tokens),
@@ -514,20 +528,24 @@ pub trait LlmProvider: Send + Sync {
     /// Complete a chat conversation as an incremental stream.
     ///
     /// Providers that do not support native streaming inherit a safe fallback
-    /// that performs the existing blocking completion and emits one text delta
-    /// followed by terminal metadata. An empty completion emits no text delta
-    /// at all (matching `complete_with_tools_stream`), so the WI#297
-    /// empty-stream detection in the retry/failover layers sees the
-    /// `Done`-first shape regardless of provider.
+    /// that performs the existing blocking completion and emits optional
+    /// reasoning, one text delta, then terminal metadata. A completion with
+    /// neither reasoning nor text emits no content delta (matching
+    /// `complete_with_tools_stream`), so the WI#297 empty-stream detection in
+    /// the retry/failover layers sees the `Done`-first shape regardless of provider.
     async fn complete_stream(&self, request: CompletionRequest) -> Result<LlmStream<'_>, LlmError> {
         let response = self.complete(request).await?;
         let usage = TokenUsage {
             input_tokens: response.input_tokens,
             output_tokens: response.output_tokens,
+            reasoning_tokens: response.reasoning_tokens,
             cache_read_input_tokens: response.cache_read_input_tokens,
             cache_creation_input_tokens: response.cache_creation_input_tokens,
         };
         let mut chunks = Vec::new();
+        if let Some(reasoning) = response.reasoning.filter(|reasoning| !reasoning.is_empty()) {
+            chunks.push(Ok(LlmStreamChunk::ReasoningDelta(reasoning)));
+        }
         if !response.content.is_empty() {
             chunks.push(Ok(LlmStreamChunk::TextDelta(response.content)));
         }
@@ -548,7 +566,7 @@ pub trait LlmProvider: Send + Sync {
     ///
     /// Providers that do not support native tool streaming inherit a safe
     /// fallback that performs the existing blocking completion and emits the
-    /// complete text/tool calls followed by terminal metadata.
+    /// complete reasoning, text/tool calls followed by terminal metadata.
     async fn complete_with_tools_stream(
         &self,
         request: ToolCompletionRequest,
@@ -557,10 +575,14 @@ pub trait LlmProvider: Send + Sync {
         let usage = TokenUsage {
             input_tokens: response.input_tokens,
             output_tokens: response.output_tokens,
+            reasoning_tokens: response.reasoning_tokens,
             cache_read_input_tokens: response.cache_read_input_tokens,
             cache_creation_input_tokens: response.cache_creation_input_tokens,
         };
         let mut chunks = Vec::new();
+        if let Some(reasoning) = response.reasoning.filter(|reasoning| !reasoning.is_empty()) {
+            chunks.push(Ok(LlmStreamChunk::ReasoningDelta(reasoning)));
+        }
         if let Some(content) = response.content.filter(|content| !content.is_empty()) {
             chunks.push(Ok(LlmStreamChunk::TextDelta(content)));
         }
@@ -795,8 +817,10 @@ mod tests {
         ) -> Result<CompletionResponse, LlmError> {
             Ok(CompletionResponse {
                 content: "plain".to_string(),
+                reasoning: None,
                 input_tokens: 1,
                 output_tokens: 1,
+                reasoning_tokens: 0,
                 finish_reason: FinishReason::Stop,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
@@ -815,8 +839,10 @@ mod tests {
                     arguments: serde_json::json!({"q": "rust"}),
                     reasoning: None,
                 }],
+                reasoning: None,
                 input_tokens: 8,
                 output_tokens: 4,
+                reasoning_tokens: 0,
                 finish_reason: FinishReason::ToolUse,
                 cache_read_input_tokens: 2,
                 cache_creation_input_tokens: 1,
@@ -890,6 +916,7 @@ mod tests {
                 usage: Some(TokenUsage {
                     input_tokens: 8,
                     output_tokens: 4,
+                    reasoning_tokens: 0,
                     cache_read_input_tokens: 2,
                     cache_creation_input_tokens: 1,
                 }),
