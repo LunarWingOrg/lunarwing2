@@ -1314,7 +1314,7 @@ WORKER_TS_LANE_SCRIPTS = {
         "$CI_NODE_IMAGE",
         (
             "rm -f /etc/apt/sources.list.d/debian.sources",
-            "printf '%s\\n' \"deb http://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm main\" \"deb http://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm-updates main\" \"deb http://snapshot.debian.org/archive/debian-security/${CI_DEBIAN_SNAPSHOT}/ bookworm-security main\" > /etc/apt/sources.list",
+            "printf '%s\\n' \"deb https://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm main\" \"deb https://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm-updates main\" \"deb https://snapshot.debian.org/archive/debian-security/${CI_DEBIAN_SNAPSHOT}/ bookworm-security main\" > /etc/apt/sources.list",
             "sh .gitlab/scripts/ci-apt-with-retry.sh python3",
             "cd kimicode4lunarwing/scripts",
             "npm ci --ignore-scripts",
@@ -2855,7 +2855,7 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
         )
         deb822_uris = re.compile(f"{boundary}URIs:([^{quotes}]*)", re.IGNORECASE)
         snapshot_uri = re.compile(
-            f"https?://snapshot{bs}.debian{bs}.org/archive/", re.IGNORECASE
+            f"https://snapshot{bs}.debian{bs}.org/archive/", re.IGNORECASE
         )
 
         def live_sources(line: str) -> list[str]:
@@ -2870,7 +2870,7 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
         ]
         if non_snapshot_sources:
             errors.append(
-                "kimicode4lunarwing/Dockerfile apt deb sources must use "
+                "kimicode4lunarwing/Dockerfile apt deb sources must use HTTPS "
                 f"snapshot.debian.org: {non_snapshot_sources}"
             )
 
