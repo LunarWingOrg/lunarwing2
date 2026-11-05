@@ -196,8 +196,8 @@ impl CachedProvider {
         request_number: u64,
     ) -> LlmStream<'a> {
         futures::stream::unfold(
-            (inner, key, String::new(), false),
-            move |(mut inner, key, mut content, finished)| async move {
+            (inner, key, String::new(), String::new(), false),
+            move |(mut inner, key, mut content, mut reasoning, finished)| async move {
                 if finished {
                     return None;
                 }
@@ -209,6 +209,7 @@ impl CachedProvider {
 
                 match &item {
                     Ok(LlmStreamChunk::TextDelta(delta)) => content.push_str(delta),
+                    Ok(LlmStreamChunk::ReasoningDelta(delta)) => reasoning.push_str(delta),
                     Ok(LlmStreamChunk::Done {
                         usage,
                         finish_reason,
@@ -218,8 +219,10 @@ impl CachedProvider {
                             key.clone(),
                             CompletionResponse {
                                 content: content.clone(),
+                                reasoning: (!reasoning.is_empty()).then(|| reasoning.clone()),
                                 input_tokens: usage.input_tokens,
                                 output_tokens: usage.output_tokens,
+                                reasoning_tokens: usage.reasoning_tokens,
                                 finish_reason: FinishReason::from_stream_reason(finish_reason),
                                 cache_read_input_tokens: usage.cache_read_input_tokens,
                                 cache_creation_input_tokens: usage.cache_creation_input_tokens,
@@ -234,7 +237,7 @@ impl CachedProvider {
                 }
 
                 let finished = matches!(&item, Ok(LlmStreamChunk::Done { .. }) | Err(_));
-                Some((item, (inner, key, content, finished)))
+                Some((item, (inner, key, content, reasoning, finished)))
             },
         )
         .boxed()
@@ -245,17 +248,20 @@ fn cached_stream(response: CompletionResponse) -> LlmStream<'static> {
     let usage = TokenUsage {
         input_tokens: response.input_tokens,
         output_tokens: response.output_tokens,
+        reasoning_tokens: response.reasoning_tokens,
         cache_read_input_tokens: response.cache_read_input_tokens,
         cache_creation_input_tokens: response.cache_creation_input_tokens,
     };
-    futures::stream::iter([
-        Ok(LlmStreamChunk::TextDelta(response.content)),
-        Ok(LlmStreamChunk::Done {
-            usage: Some(usage),
-            finish_reason: response.finish_reason.as_str().to_string(),
-        }),
-    ])
-    .boxed()
+    let mut chunks = Vec::new();
+    if let Some(reasoning) = response.reasoning.filter(|reasoning| !reasoning.is_empty()) {
+        chunks.push(Ok(LlmStreamChunk::ReasoningDelta(reasoning)));
+    }
+    chunks.push(Ok(LlmStreamChunk::TextDelta(response.content)));
+    chunks.push(Ok(LlmStreamChunk::Done {
+        usage: Some(usage),
+        finish_reason: response.finish_reason.as_str().to_string(),
+    }));
+    futures::stream::iter(chunks).boxed()
 }
 
 /// Build a deterministic cache key from a completion request.
@@ -457,8 +463,10 @@ mod tests {
             self.call_count.fetch_add(1, Ordering::Relaxed);
             Ok(CompletionResponse {
                 content: "ok".into(),
+                reasoning: None,
                 input_tokens: 1,
                 output_tokens: 1,
+                reasoning_tokens: 0,
                 finish_reason: FinishReason::Stop,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
@@ -472,8 +480,10 @@ mod tests {
             Ok(ToolCompletionResponse {
                 content: Some("ok".into()),
                 tool_calls: vec![],
+                reasoning: None,
                 input_tokens: 1,
                 output_tokens: 1,
+                reasoning_tokens: 0,
                 finish_reason: FinishReason::Stop,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
@@ -511,6 +521,7 @@ mod tests {
                 usage: Some(TokenUsage {
                     input_tokens: 3,
                     output_tokens: 2,
+                    reasoning_tokens: 0,
                     cache_read_input_tokens: 1,
                     cache_creation_input_tokens: 0,
                 }),
@@ -575,6 +586,7 @@ mod tests {
                     usage: Some(TokenUsage {
                         input_tokens: 3,
                         output_tokens: 2,
+                    reasoning_tokens: 0,
                         cache_read_input_tokens: 1,
                         cache_creation_input_tokens: 0,
                     }),
@@ -589,6 +601,46 @@ mod tests {
         assert_eq!(blocking_hit.content, "hello");
         assert_eq!(blocking_hit.input_tokens, 3);
         assert_eq!(blocking_hit.output_tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn stream_hit_replays_cached_reasoning_before_text() {
+        let provider = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![StreamScript::Items(vec![
+                Ok(LlmStreamChunk::ReasoningDelta("think".to_string())),
+                Ok(LlmStreamChunk::ReasoningDelta("ing".to_string())),
+                Ok(LlmStreamChunk::TextDelta("answer".to_string())),
+                Ok(LlmStreamChunk::Done {
+                    usage: Some(TokenUsage {
+                        output_tokens: 5,
+                        reasoning_tokens: 3,
+                        ..TokenUsage::default()
+                    }),
+                    finish_reason: "stop".to_string(),
+                }),
+            ])],
+            vec![],
+        ));
+        let cached = CachedProvider::new(provider.clone(), ResponseCacheConfig::default());
+
+        for _ in 0..2 {
+            let chunks = cached
+                .complete_stream(simple_request())
+                .await
+                .expect("stream should open")
+                .collect::<Vec<_>>()
+                .await;
+            assert!(matches!(
+                chunks.first(),
+                Some(Ok(LlmStreamChunk::ReasoningDelta(text))) if text == "thinking"
+            ));
+            assert!(matches!(
+                chunks.get(1),
+                Some(Ok(LlmStreamChunk::TextDelta(text))) if text == "answer"
+            ));
+        }
+        assert_eq!(provider.plain_calls(), 1);
     }
 
     #[tokio::test]
@@ -627,6 +679,7 @@ mod tests {
                     usage: Some(TokenUsage {
                         input_tokens: 3,
                         output_tokens: 2,
+                    reasoning_tokens: 0,
                         cache_read_input_tokens: 1,
                         cache_creation_input_tokens: 0,
                     }),
@@ -705,6 +758,7 @@ mod tests {
                     usage: Some(TokenUsage {
                         input_tokens: 1,
                         output_tokens: 1,
+                        reasoning_tokens: 0,
                         cache_read_input_tokens: 0,
                         cache_creation_input_tokens: 0,
                     }),
