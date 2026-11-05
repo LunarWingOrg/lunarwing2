@@ -69,6 +69,22 @@ The tenant release build and LunarWing activation/agent tests are still in
 progress. No hosted-server result is inferred from the upstream authentication
 contracts above.
 
+### Hosted upstream discovery preflight
+
+Before LunarWing activation, the tenant account used the official MCP
+TypeScript SDK against each hosted URL with no Authorization header or API-key
+parameter. Initialize and `tools/list` succeeded on all three endpoints:
+
+| Server | Discovered tools |
+| --- | --- |
+| CoinGecko | `execute`, `search_docs` |
+| Exa | `web_search_exa`, `web_fetch_exa` |
+| Context7 | `resolve-library-id`, `query-docs` |
+
+These are upstream/network/keyless-discovery results only. They are not treated
+as proof that LunarWing can activate the servers or that the tenant agent can
+execute the tools.
+
 ### Brave Search — direct package preflight
 
 The pinned package was installed under the tenant account with npm lifecycle
