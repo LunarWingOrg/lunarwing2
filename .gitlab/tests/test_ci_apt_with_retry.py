@@ -33,6 +33,10 @@ class CiAptWithRetryTests(unittest.TestCase):
             "sleep",
             f"#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{self.sleeps}'\n",
         )
+        self.write_shim(
+            "dpkg-query",
+            "#!/bin/sh\nprintf '%s\\n' \"${APT_DPKG_VERSION:-2.6.2}\"\n",
+        )
         self.write_shim("apt-get", f"""#!{sys.executable}
 import json
 import os
@@ -160,6 +164,15 @@ if install and mode == "fail_package":
         self.assertEqual(self.recorded_sleeps(), [])
         self.assertIn("attempt 1/3 failed (exit 100); not retrying", result.stderr)
         self.assertNotIn("retrying after a transient", result.stderr)
+        self.assert_attempt_files_removed()
+
+    def test_unfixed_installed_apt_fails_closed(self):
+        self.env["APT_DPKG_VERSION"] = "2.6.1"
+        result = self.run_apt()
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(len(self.apt_calls()), 2)
+        self.assertEqual(self.recorded_sleeps(), [])
+        self.assertIn("attempt 1/3 failed (exit 1); not retrying", result.stderr)
         self.assert_attempt_files_removed()
 
 
