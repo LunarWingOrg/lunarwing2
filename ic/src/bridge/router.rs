@@ -9898,14 +9898,7 @@ pub(crate) mod tests {
                 content: "cumulative reasoning".to_string(),
             },
         );
-        forward_event_to_channel(
-            &event,
-            &manager,
-            "gateway",
-            &serde_json::json!({}),
-            None,
-        )
-        .await;
+        forward_event_to_channel(&event, &manager, "gateway", &serde_json::json!({}), None).await;
 
         let captured = gateway_statuses.lock().expect("poisoned");
         assert_eq!(captured.len(), 1);
