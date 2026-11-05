@@ -2694,7 +2694,7 @@ def validate_worker_snapshots(variables: dict[str, str], errors: list[str]) -> N
     if not re.fullmatch(r"\d{8}T\d{6}Z", snapshot):
         errors.append("CI_DEBIAN_SNAPSHOT must be a snapshot timestamp")
         return
-    minimum_snapshot = "20261024T011300Z"
+    minimum_snapshot = "20261105T082236Z"
     if snapshot < minimum_snapshot:
         errors.append("CI_DEBIAN_SNAPSHOT predates the CVE-2026-111497 Brotli fixes")
     for dockerfile in (
