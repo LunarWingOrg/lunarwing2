@@ -305,8 +305,10 @@ impl LlmProvider for StubLlm {
         }
         Ok(CompletionResponse {
             content: self.response(),
+            reasoning: None,
             input_tokens: 10,
             output_tokens: 5,
+            reasoning_tokens: 0,
             finish_reason: FinishReason::Stop,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
@@ -324,8 +326,10 @@ impl LlmProvider for StubLlm {
         Ok(ToolCompletionResponse {
             content: Some(self.response()),
             tool_calls: Vec::new(),
+            reasoning: None,
             input_tokens: 10,
             output_tokens: 5,
+            reasoning_tokens: 0,
             finish_reason: FinishReason::Stop,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
