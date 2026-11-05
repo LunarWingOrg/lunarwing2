@@ -81,7 +81,14 @@ if mode == "fail_snapshot_always" or (mode == "fail_snapshot_once" and count == 
 if mode == "fail_snapshot_killed_once" and count == 1:
     print("#12 [runtime 2/17] RUN apt-get update using snapshot.debian.org", file=sys.stderr)
     print("Killed", file=sys.stderr)
-    print("ERROR: failed to solve: process did not complete successfully: exit code: 137", file=sys.stderr)
+    print('ERROR: failed to solve: process "/bin/sh -c timeout 240 apt-get update against snapshot.debian.org" did not complete successfully: exit code: 137', file=sys.stderr)
+    sys.exit(1)
+if mode == "fail_snapshot_timeout_once" and count == 1:
+    print('ERROR: failed to solve: process "/bin/sh -c timeout 600 apt-get install from snapshot.debian.org" did not complete successfully: exit code: 124', file=sys.stderr)
+    sys.exit(1)
+if mode == "fail_compile_killed_after_snapshot_header":
+    print('#7 [runtime 2/18] RUN set -eu; printf "deb http://snapshot.debian.org/archive/debian/..."', file=sys.stderr)
+    print('ERROR: failed to solve: process "/bin/sh -c bun build --compile ..." did not complete successfully: exit code: 137', file=sys.stderr)
     sys.exit(1)
 if mode == "fail_compile_after_snapshot_delay_warning":
     print("#12 [builder 3/13] RUN apt-get update", file=sys.stderr)
@@ -257,6 +264,27 @@ for index, argument in enumerate(args):
         calls = self.log.read_text().splitlines()
         self.assertEqual(len(calls), 3)
         self.assertIn("transient snapshot.debian.org failure (attempt 1/3)", result.stderr)
+
+    def test_snapshot_timeout_during_apt_run_is_retried(self):
+        self.env["BUILDCTL_MODE"] = "fail_snapshot_timeout_once"
+        result = self.run_build()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.log.read_text().splitlines()
+        self.assertEqual(len(calls), 3)
+        self.assertIn("transient snapshot.debian.org failure (attempt 1/3)", result.stderr)
+        self.assertEqual(self.recorded_sleeps(), [122])
+
+    def test_compile_sigkill_with_snapshot_step_header_is_not_retried(self):
+        # VK-1: BuildKit prints every Dockerfile step header, including the
+        # snapshot source setup. That unrelated text must not classify a bun
+        # compile killed with 137 as an apt/snapshot failure.
+        self.env["BUILDCTL_MODE"] = "fail_compile_killed_after_snapshot_header"
+        result = self.run_build()
+        self.assertNotEqual(result.returncode, 0)
+        calls = self.log.read_text().splitlines()
+        self.assertEqual(len(calls), 1)
+        self.assertIn("not retrying", result.stderr)
+        self.assertNotIn("transient snapshot.debian.org", result.stderr)
 
     def test_snapshot_delay_warning_alone_is_not_retried(self):
         # apt prints "W: Tried to start delayed item … snapshot.debian.org"
