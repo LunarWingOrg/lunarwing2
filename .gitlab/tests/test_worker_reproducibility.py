@@ -137,6 +137,8 @@ class WorkerReproducibilityTests(unittest.TestCase):
                 expected = "3.0.4" if lane.startswith("opencode") else "2.6.2"
                 assertion = f'test "$(dpkg-query -W -f=\'${{Version}}\' apt)" = "{expected}";'
                 self.assertEqual(text.count(assertion), 2)
+                self.assertEqual(text.count("AS certificates"), 1)
+                self.assertEqual(text.count("COPY --from=certificates /etc/ssl/certs/ca-certificates.crt"), 2)
 
 
 if __name__ == "__main__":
