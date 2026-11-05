@@ -311,8 +311,9 @@ for index, argument in enumerate(args):
         self.assertIn("failure (attempt 2/3)", result.stderr)
         self.assertIn("not retrying", result.stderr)
         # Conservatively add both full ladders and nine maximum jitter values;
-        # even that unreachable combination remains below the 8 h job timeout.
-        self.assertLessEqual(5715 + 420 + 9 * 29, 8 * 3600)
+        # even that unreachable combination stays below runner cccccc's
+        # observed ~10000 s cap, although the YAML permits 8 h.
+        self.assertLessEqual(5715 + 420 + 9 * 29, 10000)
 
     def test_package_resolution_failure_is_not_retried(self):
         self.env["BUILDCTL_MODE"] = "fail_package"
@@ -322,6 +323,29 @@ for index, argument in enumerate(args):
         self.assertEqual(len(calls), 1)
         self.assertIn("not retrying", result.stderr)
         self.assertNotIn("transient snapshot.debian.org", result.stderr)
+
+    def test_every_worker_dockerfile_apt_call_has_a_time_limit(self):
+        for lane in (
+            "kimicode4lunarwing",
+            "opencode4lunarwing",
+            "opencode2.4lunarwing",
+            "pebble4lunarwing",
+        ):
+            with self.subTest(lane=lane):
+                lines = (ROOT / lane / "Dockerfile").read_text().splitlines()
+                apt_lines = [
+                    line.strip()
+                    for line in lines
+                    if "apt-get" in line and not line.lstrip().startswith("#")
+                ]
+                self.assertEqual(len(apt_lines), 6)
+                for line in apt_lines:
+                    if " update" in line:
+                        self.assertIn("timeout 240 apt-get -o ", line)
+                    elif " install" in line:
+                        self.assertIn("timeout 600 apt-get -o ", line)
+                    else:
+                        self.fail(f"unrecognized apt command in {lane}: {line}")
 
 
 if __name__ == "__main__":
