@@ -39,9 +39,9 @@ WORKDIR /build
 RUN set -eu; \
     rm -f /etc/apt/sources.list.d/debian.sources; \
     printf '%s\n' \
-      "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie main" \
-      "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie-updates main" \
-      "deb http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ trixie-security main" \
+      "deb https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie main" \
+      "deb https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie-updates main" \
+      "deb https://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ trixie-security main" \
       > /etc/apt/sources.list; \
     timeout -k 30 240 apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update; \
     timeout -k 30 600 apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install -y --no-install-recommends \
@@ -145,9 +145,9 @@ LABEL org.opencontainers.image.title="LunarWing OpenCode Worker" \
 RUN set -eu; \
     rm -f /etc/apt/sources.list.d/debian.sources; \
     printf '%s\n' \
-      "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie main" \
-      "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie-updates main" \
-      "deb http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ trixie-security main" \
+      "deb https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie main" \
+      "deb https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie-updates main" \
+      "deb https://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ trixie-security main" \
       > /etc/apt/sources.list; \
     timeout -k 30 240 apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update; \
     timeout -k 30 600 apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install -y --no-install-recommends \
