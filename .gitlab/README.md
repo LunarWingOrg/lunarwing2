@@ -304,14 +304,20 @@ carried no retry options, so a single dropped fetch failed a multi-hour
 candidate. Since 2026-10-19 every `apt-get update`/`apt-get install` in all
 four worker Dockerfiles (kimi, opencode, opencode2, pebble) runs with
 `Acquire::Retries=5`/`Acquire::http::Timeout=60`, the same options the lane
-has used since the HE-4/HN-8 hardening. Since 2026-11-04 the image-build
-wrapper also gives classified snapshot failures a separate three-attempt
-ladder with 120/300-second delays plus job-id-based jitter. This covers apt's
-snapshot fetch/download signatures and a 137 kill on a `RUN` step whose trace
-names the snapshot host (pipeline 7174); package-resolution and other genuine
-build failures still exit on the first attempt. Publication jobs keep
-`retry: 0`. A full snapshot outage still fails after the third attempt until
-the service recovers (retry the job).
+has used since the HE-4/HN-8 hardening. Since 2026-11-05, `timeout -k 30 240`
+bounds each update and `timeout -k 30 600` bounds each install (the
+`WITH_TOOLCHAINS` install gets 1800 s — its package set is far larger), so a
+hung apt run exits 124 — or is KILLed 30 s after it ignores TERM — instead of
+waiting for the runner to kill the job. The image-build wrapper gives
+classified snapshot failures and these timeouts a separate three-attempt
+ladder with 120/300-second delays plus job-id-based jitter. A 137 or 124 kill
+is in this class only when the quoted process command itself names the
+snapshot host (BuildKit escapes the command's inner double quotes as `\"`, and
+the matcher handles them); an unrelated compile-step 137 is not retried
+(WI#559). Package-resolution and other genuine build failures still exit on
+the first attempt. Publication jobs keep `retry: 0`. A full snapshot outage
+still fails after the third attempt or the applicable time limit until the
+service recovers (retry the job).
 
 ## worker scan transient kills (exit 137)
 
@@ -363,11 +369,14 @@ host's concurrent builds before retrying manually.
   is a best-effort, throttled service, so the lane's `apt-get update` and
   `apt-get install` both run with
   `Acquire::Retries=5`/`Acquire::http::Timeout=60`. Since 2026-11-05,
-  `ci-apt-with-retry.sh` also gives classified snapshot fetch failures three
-  attempts with 120/300-second delays plus job-id-based jitter (pipeline 7193,
-  job 157425). Permanent package failures still exit on the first attempt; a
-  full snapshot outage fails after the third attempt until the service
-  recovers (retry the job).
+  `ci-apt-with-retry.sh` bounds them at 240/600 seconds respectively
+  (`timeout -k 30`, so a stalled apt is KILLed 30 s after it ignores TERM)
+  and gives classified snapshot failures and timeout exit 124 three attempts
+  with 120/300-second delays plus job-id-based jitter (pipeline 7193,
+  job 157425). The conservative timeout-plus-backoff total is 2998 seconds,
+  below the 1 h runner cap. Permanent package failures still exit on the
+  first attempt; a full snapshot outage fails after the third attempt or the
+  applicable time limit until the service recovers (retry the job).
   Runs on every MR/branch
   push and protected release tag on the digest-pinned `CI_NODE_IMAGE`, which
   `validate_config.py` ties to the node FROM digest(s) in

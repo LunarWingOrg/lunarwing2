@@ -285,9 +285,11 @@ metadata_digest() {
 # attempts from a 45 s base give 45+90+180+360+720+1440+2880 = 5715 s
 # (~95.25 minutes) of sleeping. The separate three-attempt snapshot ladder
 # adds at most 120+300 = 420 s plus two jitter values; even conservatively
-# adding both complete ladders and nine maximum jitter values gives 6396 s,
-# well inside the candidate job's 8 h timeout. The final attempt on either
-# ladder is never followed by another delay on that ladder.
+# adding both complete ladders and nine maximum jitter values gives 6396 s
+# of sleeping, below the roughly 10000 s cap observed on runner cccccc (the
+# YAML permits 8 h). Dockerfile apt calls have their own 240/600 s limits,
+# so a stalled fetch becomes a retryable exit 124 instead of burning that cap.
+# The final attempt on either ladder is never followed by another delay.
 _bwr_max_attempts=8
 _bwr_base_delay=45
 _bwr_snapshot_max_attempts=3
@@ -306,9 +308,13 @@ transient_snapshot_failure() {
         return 0
     fi
     # buildctl exits 1 when BuildKit kills a RUN step, while the step's own
-    # trace says "exit code: 137"; match the trace text, not the exit status.
-    grep -q 'did not complete successfully: exit code: 137' "$push_attempt_log" &&
-        grep -q 'snapshot\.debian\.org' "$push_attempt_log"
+    # trace says "exit code: 137" or "exit code: 124". Match the quoted
+    # process command itself so an unrelated compile kill is never retried
+    # merely because an earlier Dockerfile step named the snapshot host.
+    # BuildKit escapes inner double quotes as \" in that trace (pipeline 7174,
+    # job 156769), so a bare [^"]* stops before the snapshot URL; allow
+    # backslash-escaped characters inside the quoted command.
+    grep -qE 'process "([^"\\]|\\.)*snapshot\.debian\.org([^"\\]|\\.)*" did not complete successfully: exit code: (137|124)' "$push_attempt_log"
 }
 
 build_image_with_retry() {

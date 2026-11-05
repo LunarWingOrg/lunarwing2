@@ -22,7 +22,7 @@ class CiAptWithRetryTests(unittest.TestCase):
         self.root = pathlib.Path(temporary.name)
         self.bin = self.root / "bin"
         self.bin.mkdir()
-        for name in ("sh", "grep", "tee", "rm"):
+        for name in ("sh", "grep", "tee", "rm", "timeout"):
             tool = shutil.which(name)
             self.assertIsNotNone(tool, f"required tool {name!r} not found")
             (self.bin / name).symlink_to(tool)
@@ -38,6 +38,7 @@ import json
 import os
 import pathlib
 import sys
+import time
 
 args = sys.argv[1:]
 with open(os.environ["APT_CALLS"], "a") as log:
@@ -47,6 +48,10 @@ count = int(state.read_text().strip()) + 1 if state.exists() else 1
 state.write_text(str(count))
 mode = os.environ.get("APT_MODE", "ok")
 install = "install" in args
+if mode == "hang_update_once" and count == 1:
+    time.sleep(2)
+if mode == "hang_install_once" and count == 2:
+    time.sleep(2)
 if install and (mode == "fail_snapshot_always" or (mode == "fail_snapshot_once" and count == 2)):
     print("E: Failed to fetch http://snapshot.debian.org/archive/debian/pool/python3.deb  504  Gateway Timeout", file=sys.stderr)
     print("E: Unable to fetch some archives, maybe run apt-get update or try with --fix-missing?", file=sys.stderr)
@@ -114,6 +119,30 @@ if install and mode == "fail_package":
         self.assertEqual(self.recorded_sleeps(), [122])
         self.assertIn("transient snapshot.debian.org failure (attempt 1/3)", result.stderr)
         self.assert_attempt_files_removed()
+
+    def test_hung_update_times_out_and_is_retried(self):
+        self.env["CI_APT_UPDATE_TIMEOUT"] = "1"
+        result = self.run_apt("hang_update_once")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.apt_calls()), 3)
+        self.assertEqual(self.recorded_sleeps(), [122])
+        self.assertIn("transient snapshot.debian.org failure (attempt 1/3)", result.stderr)
+        self.assert_attempt_files_removed()
+
+    def test_hung_install_times_out_and_is_retried(self):
+        self.env["CI_APT_INSTALL_TIMEOUT"] = "1"
+        result = self.run_apt("hang_install_once")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.apt_calls()), 4)
+        self.assertEqual(self.recorded_sleeps(), [122])
+        self.assertIn("transient snapshot.debian.org failure (attempt 1/3)", result.stderr)
+        self.assert_attempt_files_removed()
+
+    def test_timeout_ladder_fits_inside_lint_runner_hour(self):
+        # Three attempts at 240 s update + 600 s install, plus both maximum
+        # backoffs and jitter, leave 602 s for the rest of worker-kimi-ts.
+        self.assertEqual(3 * (240 + 600) + 120 + 300 + 2 * 29, 2998)
+        self.assertLess(3 * (240 + 600) + 120 + 300 + 2 * 29, 3600)
 
     def test_persistent_snapshot_failure_exhausts_three_attempts(self):
         result = self.run_apt("fail_snapshot_always")
