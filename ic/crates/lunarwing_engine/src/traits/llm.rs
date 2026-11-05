@@ -79,6 +79,8 @@ impl ProviderStreamObservation {
 pub enum LlmStreamChunk {
     /// Incremental assistant text.
     TextDelta(String),
+    /// Incremental provider reasoning, kept separate from final assistant text.
+    ReasoningDelta(String),
     /// Incremental action call data.
     ToolCallDelta {
         index: usize,
