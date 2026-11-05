@@ -255,6 +255,7 @@ _tui_desktop_user_resolve() {  # <user> [grant|revoke]
 # ── Tenant gateway and env ───────────────────────────────────────────────────
 
 # Maps a GATEWAY_HOST (or --url-host) value to the host part of the URL.
+# Tenant listener-owner checks require localhost or an IP literal, never DNS.
 _tui_url_host() {  # <host>
   local host="${1,,}" bare
   case "$host" in
@@ -277,7 +278,8 @@ _tui_url_host() {  # <host>
     printf '[%s]' "$bare"
     return 0
   fi
-  [[ "$host" =~ ^[a-z0-9.-]{1,253}$ ]] || return 1
+  # Preserve the existing IPv4-spelling handling, but never emit a DNS name.
+  [[ "$host" =~ ^[0-9.]{1,15}$ ]] || return 1
   printf '%s' "$host"
 }
 
@@ -308,7 +310,7 @@ _tui_gateway_url() {  # <tenant> <env_path> <override_host>
       || die "could not read GATEWAY_HOST for tenant '$tenant' (tenant-side read of $env_path refused)"
   fi
   host="$(_tui_url_host "$raw")" \
-    || die "unsupported gateway host '$(sanitize_display_value "$raw")' for tenant '$tenant' (want IPv4, an IPv6 literal or a [A-Za-z0-9.-] hostname; --url-host overrides)"
+    || die "unsupported gateway host '$(sanitize_display_value "$raw")' for tenant '$tenant' (use localhost or an IP literal; --url-host <ip> overrides)"
   url_re='^http://[]a-z0-9.:[-]+:[0-9]{1,5}$'
   [[ "http://$host:$port" =~ $url_re ]] || die "internal error: unexpected gateway URL shape for tenant '$tenant'"
   TUI_GATEWAY_URL="http://$host:$port"

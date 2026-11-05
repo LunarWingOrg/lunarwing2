@@ -508,6 +508,20 @@ assert_7() {
     && [[ ! -s "$calls/curl.argv" ]] && grep -q 'verify:  skipped (--no-verify)' "$OUT"
 }
 check "7. GATEWAY_HOST=0.0.0.0 -> 127.0.0.1; 100.88.107.159 kept; ::1 -> [::1]; --url-host overrides" assert_7
+
+assert_dns_hosts_refused() {
+  local before_desk before_registry
+  before_desk="$(file_sum "$desk_file")"
+  before_registry="$(file_sum "$registry")"
+  write_env "GATEWAY_HOST=gw.example"
+  run_tui alpha --for-user desk --no-verify
+  refused_with "use localhost or an IP literal; --url-host <ip>" || return 1
+  write_env
+  run_tui alpha --for-user desk --no-verify --url-host gw.example
+  refused_with "use localhost or an IP literal; --url-host <ip>" || return 1
+  [[ "$(file_sum "$desk_file")" == "$before_desk" && "$(file_sum "$registry")" == "$before_registry" ]]
+}
+check "VM-1: DNS names from GATEWAY_HOST and --url-host are refused without writing a grant" assert_dns_hosts_refused
 write_env
 
 # ── Scenario D: rotation ─────────────────────────────────────────────────────
