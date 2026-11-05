@@ -23,7 +23,7 @@ spec.loader.exec_module(config)
 
 
 class WorkerSnapshotSecurityTests(unittest.TestCase):
-    SNAPSHOT = "20261024T011300Z"
+    SNAPSHOT = "20261105T082236Z"
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
