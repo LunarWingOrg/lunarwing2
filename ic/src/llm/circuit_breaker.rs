@@ -222,6 +222,7 @@ impl CircuitBreakerProvider {
                     Ok(LlmStreamChunk::Done { .. }) => self.record_success().await,
                     Err(error) => self.record_failure(error).await,
                     Ok(LlmStreamChunk::TextDelta(_))
+                    | Ok(LlmStreamChunk::ReasoningDelta(_))
                     | Ok(LlmStreamChunk::ToolCallDelta { .. })
                     | Ok(LlmStreamChunk::Observation(_)) => {}
                 }
