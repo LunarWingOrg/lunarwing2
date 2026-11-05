@@ -68,8 +68,10 @@ impl LlmProvider for MockLlmProvider {
 
         Ok(CompletionResponse {
             content: format!("Mock response to: {}", user_msg),
+            reasoning: None,
             input_tokens: 10,
             output_tokens: 5,
+            reasoning_tokens: 0,
             finish_reason: FinishReason::Stop,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
@@ -96,9 +98,11 @@ impl LlmProvider for MockLlmProvider {
                     arguments: serde_json::json!({"test": true}),
                     reasoning: None,
                 }],
-                input_tokens: 15,
+                reasoning: None,
+            input_tokens: 15,
                 output_tokens: 8,
-                finish_reason: FinishReason::ToolUse,
+                reasoning_tokens: 0,
+            finish_reason: FinishReason::ToolUse,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             })
@@ -106,9 +110,11 @@ impl LlmProvider for MockLlmProvider {
             Ok(ToolCompletionResponse {
                 content: Some("No tools available".to_string()),
                 tool_calls: vec![],
-                input_tokens: 10,
+                reasoning: None,
+            input_tokens: 10,
                 output_tokens: 4,
-                finish_reason: FinishReason::Stop,
+                reasoning_tokens: 0,
+            finish_reason: FinishReason::Stop,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             })
@@ -146,8 +152,10 @@ impl LlmProvider for FixedModelProvider {
     async fn complete(&self, _req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         Ok(CompletionResponse {
             content: "fixed response".to_string(),
+            reasoning: None,
             input_tokens: 10,
             output_tokens: 5,
+            reasoning_tokens: 0,
             finish_reason: FinishReason::Stop,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
@@ -161,8 +169,10 @@ impl LlmProvider for FixedModelProvider {
         Ok(ToolCompletionResponse {
             content: Some("fixed response".to_string()),
             tool_calls: vec![],
+            reasoning: None,
             input_tokens: 10,
             output_tokens: 5,
+            reasoning_tokens: 0,
             finish_reason: FinishReason::Stop,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
