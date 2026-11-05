@@ -106,7 +106,13 @@ model's answer.
   `/vercel/next.js`; the documentation preview contains Next.js Route Handler
   guidance and its `route.js|ts` convention. The turn completed with no retry
   or fallback server.
-- **CoinGecko and Brave Search:** agent attempts are pending.
+- **CoinGecko — keyless agent call passed.** After one approval, the agent
+  called `coingecko_execute` exactly once with the documented
+  `client.simple.price.get` code. History records `has_result: true`,
+  `has_error: false`, and `{"result":{"bitcoin":{"usd":75753}}}`. The turn
+  completed and reported Bitcoin at 75,753 USD. An `echo` entry is again the
+  Engine V2 response artifact.
+- **Brave Search:** agent activation attempt is pending.
 
 ### Hosted upstream discovery preflight
 
