@@ -29,6 +29,7 @@ RUN set -eu; \
     timeout -k 30 240 apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=0 -o Acquire::https::Timeout=60 update; \
     timeout -k 30 600 apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=60 install -y --no-install-recommends apt \
       git python3 make g++ ca-certificates; \
+    test "$(dpkg-query -W -f='${Version}' apt)" = "3.0.4"; \
     rm -rf /var/lib/apt/lists/* \
       /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache
 
@@ -173,6 +174,7 @@ RUN set -eu; \
       openssh-client \
       jq \
       neovim; \
+    test "$(dpkg-query -W -f='${Version}' apt)" = "3.0.4"; \
     rm -rf /var/lib/apt/lists/* \
       /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache
 
