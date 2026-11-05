@@ -115,8 +115,9 @@ pub(crate) fn is_transient_empty_stream(error: &LlmError) -> bool {
     )
 }
 
-/// Consume `stream` past leading content-free `TextDelta("")` chunks and
-/// classify the first meaningful item.
+/// Consume `stream` past leading content-free deltas and classify the first
+/// final-content item. Leading reasoning is buffered and replayed in order,
+/// but does not by itself make a truncated or otherwise empty answer successful.
 ///
 /// Some providers (notably the blocking `complete_stream` fallback before
 /// WI#297, and chat gateways) emit an empty text delta ahead of `Done` for an
@@ -126,11 +127,14 @@ pub(crate) async fn open_stream<'a>(
     mut stream: LlmStream<'a>,
     provider: &str,
 ) -> StreamOpening<'a> {
+    let mut reasoning = Vec::new();
     loop {
         match stream.next().await {
             None => return StreamOpening::Error(empty_stream_error(provider, None, None)),
             Some(Err(error)) => return StreamOpening::Error(error),
             Some(Ok(LlmStreamChunk::TextDelta(text))) if text.is_empty() => continue,
+            Some(Ok(LlmStreamChunk::ReasoningDelta(text))) if text.is_empty() => continue,
+            Some(Ok(chunk @ LlmStreamChunk::ReasoningDelta(_))) => reasoning.push(chunk),
             Some(Ok(LlmStreamChunk::Done {
                 finish_reason,
                 usage,
@@ -141,10 +145,25 @@ pub(crate) async fn open_stream<'a>(
                     usage,
                 ));
             }
-            Some(Ok(first)) => {
+            Some(Ok(first)) if reasoning.is_empty() => {
                 return StreamOpening::Content {
                     first,
                     rest: stream,
+                };
+            }
+            Some(Ok(first)) => {
+                let first_reasoning = reasoning.remove(0);
+                let rest = stream::iter(
+                    reasoning
+                        .into_iter()
+                        .chain(std::iter::once(first))
+                        .map(Ok),
+                )
+                .chain(stream)
+                .boxed();
+                return StreamOpening::Content {
+                    first: first_reasoning,
+                    rest,
                 };
             }
         }
@@ -335,6 +354,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_stream_replays_reasoning_before_final_content() {
+        let stream = futures::stream::iter([
+            Ok(LlmStreamChunk::ReasoningDelta("think".to_string())),
+            Ok(LlmStreamChunk::ReasoningDelta("ing".to_string())),
+            Ok(LlmStreamChunk::TextDelta("answer".to_string())),
+            Ok(done_chunk("stop")),
+        ])
+        .boxed();
+
+        let StreamOpening::Content { first, rest } = open_stream(stream, "primary").await else {
+            panic!("reasoning plus final text should be a content stream");
+        };
+        assert!(matches!(first, LlmStreamChunk::ReasoningDelta(text) if text == "think"));
+        let remainder = rest.collect::<Vec<_>>().await;
+        assert!(matches!(
+            remainder.first(),
+            Some(Ok(LlmStreamChunk::ReasoningDelta(text))) if text == "ing"
+        ));
+        assert!(matches!(
+            remainder.get(1),
+            Some(Ok(LlmStreamChunk::TextDelta(text))) if text == "answer"
+        ));
+    }
+
+    #[tokio::test]
+    async fn open_stream_does_not_treat_reasoning_as_final_content() {
+        let stream = futures::stream::iter([
+            Ok(LlmStreamChunk::ReasoningDelta("thinking".to_string())),
+            Ok(done_chunk("length")),
+        ])
+        .boxed();
+
+        assert!(matches!(
+            open_stream(stream, "primary").await,
+            StreamOpening::Error(LlmError::EmptyStream {
+                finish: FinishReason::Length,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn open_stream_treats_tool_call_chunks_as_content() {
         let stream = futures::stream::iter([
             Ok(LlmStreamChunk::ToolCallDelta {
@@ -409,6 +470,7 @@ mod tests {
             usage: Some(TokenUsage {
                 input_tokens: 1200,
                 output_tokens: 0,
+                reasoning_tokens: 0,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             }),
