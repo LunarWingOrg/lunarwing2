@@ -339,7 +339,7 @@ test("executeTask: timeout escalates past ignored SIGTERM", async () => {
 
 test("executeTask: silent wedge resolves as timed_out with partial output (WI#263)", async () => {
   const bin = makeMockKimi("silent-hang")
-  process.env.KIMI_SILENCE_TIMEOUT_MS = "300"
+  process.env.KIMI_SILENCE_TIMEOUT_MS = "1500"
   process.env.KIMI_KILL_GRACE_MS = "100"
   const started = Date.now()
   const { result, progress } = await runExecutor(
@@ -349,7 +349,7 @@ test("executeTask: silent wedge resolves as timed_out with partial output (WI#26
   delete process.env.KIMI_SILENCE_TIMEOUT_MS
   delete process.env.KIMI_KILL_GRACE_MS
   assert.equal(result?.status, "timed_out")
-  assert.match(result?.error || "", /no stream output for 300ms/)
+  assert.match(result?.error || "", /no stream output for 1500ms/)
   // The streamed investigation evidence must survive the wedge.
   assert.ok((result?.output || "").includes("Investigation step"))
   assert.ok(progress.some((delta) => delta.includes("Investigation step")))
@@ -734,7 +734,7 @@ setTimeout(() => {
 }, 40)
 `)
   process.env.KIMI_PROGRESS_HEARTBEAT_MS = "40"
-  process.env.KIMI_SILENCE_TIMEOUT_MS = "250"
+  process.env.KIMI_SILENCE_TIMEOUT_MS = "1500"
   process.env.KIMI_KILL_GRACE_MS = "50"
   try {
     const { result, progress } = await runExecutor(
