@@ -44,6 +44,19 @@ Protected candidate reproducibility and all four scan jobs must pass before
 promotion; local runtime/package checks do not replace those gates. WI#514
 stays open until that protected pipeline acceptance is recorded.
 
+## Snapshot apt time bounds (WI#559, 2026-11-05)
+
+All four worker Dockerfiles bound `apt-get update` with `timeout 240` and
+`apt-get install` with `timeout 600`. The `worker-kimi-ts` provisioning helper
+uses the same limits. A stall therefore exits 124 and enters the existing
+three-attempt snapshot retry ladder instead of running until the runner kills
+the job. Build-wrapper trace matching accepts 137 or 124 only when the quoted
+process command itself names `snapshot.debian.org`; an earlier snapshot step
+header does not make an unrelated compile kill transient. Package pins and
+snapshot contents are unchanged, but the Dockerfile command edits re-key their
+layers. Protected candidate-versus-clean-rebuild digests, all four scans, and
+the opencode2 exposure verifier remain the image acceptance gates.
+
 ## Hub-handshake credential boundary (WI#373)
 
 Only the bridge container receives `AGENT_AUTH_TOKEN`, the tenant-scoped
