@@ -7,14 +7,12 @@ ARG SOURCE_REVISION=unknown
 # ──────────────────────────────
 # Stage 1: build the bridge + tests
 # ──────────────────────────────
-FROM docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b AS certificates
-
 FROM docker.io/library/node:22.23.4-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS builder
 
 ARG DEBIAN_SNAPSHOT
 WORKDIR /build
 
-COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 RUN set -eu; \
     test -s /etc/ssl/certs/ca-certificates.crt; \
@@ -89,7 +87,7 @@ LABEL org.opencontainers.image.title="LunarWing Kimi Code Worker" \
       org.opencontainers.image.revision="${SOURCE_REVISION}" \
       org.opencontainers.image.toolchain-profile="${WITH_TOOLCHAINS}"
 
-COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 RUN set -eu; \
     test -s /etc/ssl/certs/ca-certificates.crt; \
