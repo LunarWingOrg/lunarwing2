@@ -4669,6 +4669,18 @@ async fn forward_event_to_channel(
                 )
                 .await;
         }
+        EventKind::ReasoningDelta { content } => {
+            let _ = channels
+                .send_status(
+                    channel_name,
+                    StatusUpdate::ReasoningUpdate {
+                        narrative: content.clone(),
+                        decisions: Vec::new(),
+                    },
+                    metadata,
+                )
+                .await;
+        }
         // Deltas are delivered channel-neutrally to every channel, including the
         // gateway (whose `send_status` maps `StreamChunk` to the SSE
         // `stream_chunk` event using the thread id in the status metadata). WASM
@@ -9869,6 +9881,41 @@ pub(crate) mod tests {
                 captured[0]
             );
         }
+    }
+
+    #[tokio::test]
+    async fn reasoning_delta_reaches_gateway_as_reasoning_update() {
+        use crate::testing::StubChannel;
+
+        let manager = std::sync::Arc::new(crate::channels::ChannelManager::new());
+        let (gateway_stub, _gateway_tx) = StubChannel::new("gateway");
+        let gateway_statuses = gateway_stub.captured_statuses_handle();
+        manager.add(Box::new(gateway_stub)).await;
+
+        let event = lunarwing_engine::ThreadEvent::new(
+            lunarwing_engine::ThreadId::new(),
+            lunarwing_engine::EventKind::ReasoningDelta {
+                content: "cumulative reasoning".to_string(),
+            },
+        );
+        forward_event_to_channel(
+            &event,
+            &manager,
+            "gateway",
+            &serde_json::json!({}),
+            None,
+        )
+        .await;
+
+        let captured = gateway_statuses.lock().expect("poisoned");
+        assert_eq!(captured.len(), 1);
+        assert!(matches!(
+            &captured[0],
+            StatusUpdate::ReasoningUpdate {
+                narrative,
+                decisions,
+            } if narrative == "cumulative reasoning" && decisions.is_empty()
+        ));
     }
 
     #[tokio::test]
