@@ -923,7 +923,7 @@ assert_revoke_without_desktop_read() {  # <fifo|oversized>
   run_tui_bounded 8 alpha --for-user desk --revoke
   ((RC == 0)) && [[ ! -e "$desk_file" ]] \
     && grep -qF 'token_kind unknown; not read' "$OUT" \
-    && grep -qF 'may have held the master token' "$ERR" \
+    && ! grep -qF 'may have held the master token' "$ERR" \
     && ! drop_began desk "jq " || ok=false
   rm -f -- "$desk_file"
   [[ "$ok" == true ]]

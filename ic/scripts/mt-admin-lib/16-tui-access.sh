@@ -1055,7 +1055,7 @@ _tui_revoke_report() {  # <tenant> <user> <label> <desktop: checked|no-account|u
     no-account) say "  config:   not checked (no passwd entry for '$user')" ;;
     *) say "  config:   not checked ($TUI_USER_HOME_ERROR); remove ~$user/.config/wingtip/tenants/$tenant.json by hand if it still exists" ;;
   esac
-  if [[ "$TUI_DESKTOP_KIND" == unknown ]]; then
+  if [[ "$TUI_DESKTOP_KIND" == unknown && "$TUI_REGISTRY_RESULT" != removed ]]; then
     say "WARNING: that desktop config may have held the master token of tenant '$tenant'; $master_note" >&2
   elif [[ "$desktop" != checked ]]; then
     say "WARNING: should a desktop config of '$user' hold the master token of tenant '$tenant' (token_kind master), $master_note" >&2
