@@ -36,7 +36,7 @@ TRIVY_IGNORE = ROOT / ".gitlab" / "trivy-ignore"
 TRIVY_IGNORE_ENTRY = re.compile(r"^CVE-\d{4}-\d{4,} exp:\d{4}-\d{2}-\d{2}$")
 TRIVY_IGNORE_MAX_EXPIRY_MONTHS = 6
 TRIVY_GATE_COMMAND = (
-    'trivy image --config /dev/null --ignorefile "$CI_PROJECT_DIR/.gitlab/trivy-ignore" '
+    'trivy image --config /dev/null --skip-version-check --ignorefile "$CI_PROJECT_DIR/.gitlab/trivy-ignore" '
     "--exit-code 1 --severity CRITICAL "
 )
 TRIVY_SCAN_VARIABLES = {"TRIVY_CACHE_DIR", "TRIVY_NO_PROGRESS", "TRIVY_PASSWORD", "TRIVY_USERNAME"}
@@ -110,17 +110,17 @@ fi
 }
 """,
     'rm -rf "$TRIVY_CACHE_DIR"',
-    'trivy_with_retry trivy image --config /dev/null --format template --template "@/contrib/gitlab.tpl" '
+    'trivy_with_retry trivy image --config /dev/null --skip-version-check --format template --template "@/contrib/gitlab.tpl" '
     '--output gl-container-scanning-report.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"',
     'trivy_with_retry '
     + TRIVY_GATE_COMMAND
     + '--format json --output worker-vulnerabilities.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"',
-    'trivy_with_retry trivy image --config /dev/null --format cyclonedx --output worker-sbom.cdx.json '
+    'trivy_with_retry trivy image --config /dev/null --skip-version-check --format cyclonedx --output worker-sbom.cdx.json '
     '"$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"',
 ]
 WORKER_SCAN_PINNED_VALUES = {
     "image": {
-        "name": "docker.io/aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969",
+        "name": "docker.io/aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c",
         "entrypoint": [""],
     },
     "tags": ["container-build"],
@@ -2876,7 +2876,7 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
 
     literal_images = {
         ".worker-candidate": "docker.io/moby/buildkit:v0.34.1-rootless@sha256:f68752a5a94acfcdad2d07867b7075601a421638e17fc5f28efc1c814d0c4f89",
-        ".worker-scan": "docker.io/aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969",
+        ".worker-scan": "docker.io/aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c",
         ".worker-promotion": "docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b",
     }
     for template_name, expected in literal_images.items():

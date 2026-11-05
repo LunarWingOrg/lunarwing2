@@ -79,9 +79,18 @@ if mode == "fail_snapshot_always" or (mode == "fail_snapshot_once" and count == 
     print("E: Unable to fetch some archives, maybe run apt-get update or try with --fix-missing?", file=sys.stderr)
     sys.exit(1)
 if mode == "fail_snapshot_killed_once" and count == 1:
-    print("#12 [runtime 2/17] RUN apt-get update using snapshot.debian.org", file=sys.stderr)
+    print("#12 [runtime 2/17] RUN apt-get update", file=sys.stderr)
     print("Killed", file=sys.stderr)
-    print("ERROR: failed to solve: process did not complete successfully: exit code: 137", file=sys.stderr)
+    # Real-trace shape from pipeline 7174, job 156769: BuildKit prints the
+    # whole RUN command and escapes its inner double quotes as \".
+    print('error: failed to solve: process "/bin/sh -c set -eu;     rm -f /etc/apt/sources.list.d/debian.sources;     printf \\'%s\\\\n\\'       \\\\"deb http://snapshot.debian.org/archive/debian/${{DEBIAN_SNAPSHOT}}/ trixie main\\\\"       > /etc/apt/sources.list;     timeout 240 apt-get update" did not complete successfully: exit code: 137', file=sys.stderr)
+    sys.exit(1)
+if mode == "fail_snapshot_timeout_once" and count == 1:
+    print('ERROR: failed to solve: process "/bin/sh -c timeout 600 apt-get install from snapshot.debian.org" did not complete successfully: exit code: 124', file=sys.stderr)
+    sys.exit(1)
+if mode == "fail_compile_killed_after_snapshot_header":
+    print('#7 [runtime 2/18] RUN set -eu; printf "deb http://snapshot.debian.org/archive/debian/..."', file=sys.stderr)
+    print('ERROR: failed to solve: process "/bin/sh -c bun build --compile ..." did not complete successfully: exit code: 137', file=sys.stderr)
     sys.exit(1)
 if mode == "fail_compile_after_snapshot_delay_warning":
     print("#12 [builder 3/13] RUN apt-get update", file=sys.stderr)
@@ -249,14 +258,37 @@ for index, argument in enumerate(args):
 
     def test_snapshot_sigkill_during_apt_run_is_retried(self):
         # Pipeline 7174's trace names the snapshot RUN step with "exit code:
-        # 137" but buildctl itself exits 1, so the stub exits 1 and the
-        # classifier must match the trace text, not the exit status.
+        # 137" but buildctl itself exits 1, and BuildKit escapes the inner
+        # double quotes of the printed RUN command as \". The stub prints that
+        # real shape, so the classifier must match the escaped trace text,
+        # not the exit status and not a bare-quote scan.
         self.env["BUILDCTL_MODE"] = "fail_snapshot_killed_once"
         result = self.run_build()
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.log.read_text().splitlines()
         self.assertEqual(len(calls), 3)
         self.assertIn("transient snapshot.debian.org failure (attempt 1/3)", result.stderr)
+
+    def test_snapshot_timeout_during_apt_run_is_retried(self):
+        self.env["BUILDCTL_MODE"] = "fail_snapshot_timeout_once"
+        result = self.run_build()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.log.read_text().splitlines()
+        self.assertEqual(len(calls), 3)
+        self.assertIn("transient snapshot.debian.org failure (attempt 1/3)", result.stderr)
+        self.assertEqual(self.recorded_sleeps(), [122])
+
+    def test_compile_sigkill_with_snapshot_step_header_is_not_retried(self):
+        # VK-1: BuildKit prints every Dockerfile step header, including the
+        # snapshot source setup. That unrelated text must not classify a bun
+        # compile killed with 137 as an apt/snapshot failure.
+        self.env["BUILDCTL_MODE"] = "fail_compile_killed_after_snapshot_header"
+        result = self.run_build()
+        self.assertNotEqual(result.returncode, 0)
+        calls = self.log.read_text().splitlines()
+        self.assertEqual(len(calls), 1)
+        self.assertIn("not retrying", result.stderr)
+        self.assertNotIn("transient snapshot.debian.org", result.stderr)
 
     def test_snapshot_delay_warning_alone_is_not_retried(self):
         # apt prints "W: Tried to start delayed item … snapshot.debian.org"
@@ -283,8 +315,9 @@ for index, argument in enumerate(args):
         self.assertIn("failure (attempt 2/3)", result.stderr)
         self.assertIn("not retrying", result.stderr)
         # Conservatively add both full ladders and nine maximum jitter values;
-        # even that unreachable combination remains below the 8 h job timeout.
-        self.assertLessEqual(5715 + 420 + 9 * 29, 8 * 3600)
+        # even that unreachable combination stays below runner cccccc's
+        # observed ~10000 s cap, although the YAML permits 8 h.
+        self.assertLessEqual(5715 + 420 + 9 * 29, 10000)
 
     def test_package_resolution_failure_is_not_retried(self):
         self.env["BUILDCTL_MODE"] = "fail_package"
@@ -294,6 +327,35 @@ for index, argument in enumerate(args):
         self.assertEqual(len(calls), 1)
         self.assertIn("not retrying", result.stderr)
         self.assertNotIn("transient snapshot.debian.org", result.stderr)
+
+    def test_every_worker_dockerfile_apt_call_has_a_time_limit(self):
+        for lane in (
+            "kimicode4lunarwing",
+            "opencode4lunarwing",
+            "opencode2.4lunarwing",
+            "pebble4lunarwing",
+        ):
+            with self.subTest(lane=lane):
+                lines = (ROOT / lane / "Dockerfile").read_text().splitlines()
+                apt_lines = [
+                    line
+                    for line in lines
+                    if "apt-get" in line and not line.lstrip().startswith("#")
+                ]
+                self.assertEqual(len(apt_lines), 6)
+                for line in apt_lines:
+                    if " update" in line:
+                        self.assertIn("timeout -k 30 240 apt-get -o ", line)
+                    elif " install" in line:
+                        # Base and runtime installs keep the 600 s limit; the
+                        # WITH_TOOLCHAINS install (six-space continuation) gets
+                        # 1800 s because build-essential/clang are far larger.
+                        if line.startswith("      "):
+                            self.assertIn("timeout -k 30 1800 apt-get -o ", line)
+                        else:
+                            self.assertIn("timeout -k 30 600 apt-get -o ", line)
+                    else:
+                        self.fail(f"unrecognized apt command in {lane}: {line}")
 
 
 if __name__ == "__main__":
