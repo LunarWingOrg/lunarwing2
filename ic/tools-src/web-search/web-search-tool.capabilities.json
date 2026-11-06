@@ -1,5 +1,5 @@
 {
-  "version": "0.2.0",
+  "version": "0.2.9",
   "wit_version": "0.3.0",
   "description": "Search the web using Brave Search. Returns titles, URLs, descriptions, and publication dates for matching web pages. Supports filtering by country, language, and freshness. Authentication is handled via the 'brave_api_key' secret injected by the host.",
   "capabilities": {
