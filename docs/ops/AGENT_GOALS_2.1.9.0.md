@@ -29,16 +29,32 @@
     - **Spec: commit hygiene.** One concern per commit: version bumps, external crate updates, vendor refresh, CI tool bumps, docs and trail. Stage no cargo-home gitlinks or other stray paths, and cherry-pick nothing from older sweep branches.
     - **Reference.** The v2.1.8.0 sweep is the worked example: branch `rarity/kimi-1-20261031-0000`, merged as `7ba88e9c1` via !2100, with its full trail under item 1 of the v2.1.8.0 goals file (`docs/ops/history/AGENT_GOALS_2.1.8.0.md`, or `git show v2.1.8.0:docs/ops/AGENT_GOALS_2.1.8.0.md`). Its run-288 review needed a follow-up for the gitlab tool's pins (SY-1) and a mis-stated `ic/Cargo.lock` delta (SY-2); the v2.1.7.0 predecessor !1906 was closed for building on a stale base, carrying an unneeded `ic/deny.toml` edit and mixing in the sccache bump
 
-## Phase 2 — Features & Polish (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
+## Phase 2 — Features/Polish/BaselineAdditions (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
 
-## Phase 3 — Carried Known-Issues from RELEASE-v2.1.3.0.md (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
+2. [ ] audit all crates for security and write report to docs/ops
+3. [x] (S) Reserved
+
+## Phase 3 — Carried Known-Issues from RELEASE-v2.1.8.0.md (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
+
+4. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/545
 
 ## Phase 4 - Documentation and Misc goal items (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
 
+5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/543
+
 ## Phase 5 - Misc Operations (ALWAYS READ ALL COMMENTS FOR EACH WORK ITEM WHEN A WORK ITEM IS REFERENCED - ALSO ALWAYS READ LINKED WORK ITEMS FOR EACH WORK ITEM REFERENCED)
+
+6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/540
 
 ## Phase 6 - Gauntlets (for goals which reference any work items, see comments on those work items in addition to reading full descriptions)
 
+7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/539
+8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/383
+9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/314
+10. [ ] create draft for release notes at base of root
+
 ## Phase 7 - Advanced Operator Notes
+
+11. [x] (S) Reserved
 
 ---
