@@ -373,10 +373,10 @@
     - **DONE 2026-11-05 (Rarity, item-43, branch `rarity/kimi-43-20261105-2131`):** created the persistent, non-animal-named tenant `mcpvalidation` on OpenRC/rootless Podman (ports 10030-10039), built the daemon and XMPP bridge in release mode, installed CoinGecko, Exa, Brave Search, and Context7 without credentials, and exercised them through real Engine V2 gateway prompts. Full findings are in `docs/ops/WI562_MCP_TESTING.md`.
     - **Evidence:** CoinGecko `coingecko_execute` returned Bitcoin at 75,753 USD; Exa `exa_web_search_exa` returned the official MCP documentation index; Context7 resolved `/vercel/next.js` and returned App Router documentation. All three remain active with successful `has_result`/`has_error` history evidence. Brave's official stdio server 2.1.4 requires `BRAVE_API_KEY` and exits before initialize; both direct activation and the agent's single `tool_activate` attempt failed accordingly, with no substitute search used. An earlier direct CoinGecko 429 was transient and the agent retry succeeded. Final `mt-admin status`, gateway health, report consistency, MCP persistence, and `git diff --check` pass. The tenant remains running and boot-persistent for the later authenticated pass; no teardown was run and no LunarWing runtime code change was needed.
 44. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/561 - unfortunately, the last attempt had SALVAGED attempt. looks mostly good, but the reviewer did leave several comments on the closed MR that block this from merging. it will need a re-attempt - CLosed MR:  https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2215
+45. [ ] the release notes draft at the base of the repo needs to be updated. please do so.
 
 ## Phase 7 - Advanced Operator Notes
 
-45. [x] (H) follow up on some earlier endeavors
 46. [x] (H) check older goals for others that may be not done yet
 47. [x] (H) update rel notes
 48. [x] (S) Deploy the stoplight system
