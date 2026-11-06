@@ -22,10 +22,12 @@ RUN set -eu; \
       "deb https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm-updates main" \
       "deb https://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ bookworm-security main" \
       > /etc/apt/sources.list; \
-    timeout -k 30 240 apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=0 -o Acquire::https::Timeout=60 update; \
-    timeout -k 30 600 apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=60 install -y --no-install-recommends apt \
+    timeout -k 30 240 apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=0 -o Acquire::https::Timeout=60 --error-on=any update; \
+    timeout -k 30 600 apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=60 install -y --no-install-recommends apt; \
+    dpkg --compare-versions "$(dpkg-query -W -f='${Version}' apt)" ge 2.6.2; \
+    timeout -k 30 600 apt-get -o Acquire::Retries=3 -o Acquire::https::Timeout=60 install -y --no-install-recommends \
       python3 make g++ ca-certificates; \
-    test "$(dpkg-query -W -f='${Version}' apt)" = "2.6.2"; \
+    update-ca-certificates; \
     rm -rf /var/lib/apt/lists/* \
       /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache
 
@@ -97,8 +99,10 @@ RUN set -eu; \
       "deb https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm-updates main" \
       "deb https://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ bookworm-security main" \
       > /etc/apt/sources.list; \
-    timeout -k 30 240 apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=0 -o Acquire::https::Timeout=60 update; \
-    timeout -k 30 600 apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=60 install -y --no-install-recommends apt \
+    timeout -k 30 240 apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=0 -o Acquire::https::Timeout=60 --error-on=any update; \
+    timeout -k 30 600 apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=60 install -y --no-install-recommends apt; \
+    dpkg --compare-versions "$(dpkg-query -W -f='${Version}' apt)" ge 2.6.2; \
+    timeout -k 30 600 apt-get -o Acquire::Retries=3 -o Acquire::https::Timeout=60 install -y --no-install-recommends \
       tini \
       python3 \
       python3-pip \
@@ -111,15 +115,15 @@ RUN set -eu; \
       openssh-client \
       jq \
       neovim; \
-    test "$(dpkg-query -W -f='${Version}' apt)" = "2.6.2"; \
+    update-ca-certificates; \
     rm -rf /var/lib/apt/lists/* \
       /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache
 
 # Toolchain packages: only when WITH_TOOLCHAINS=true.
 RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
       set -eu; \
-      timeout -k 30 240 apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=0 -o Acquire::https::Timeout=60 update; \
-      timeout -k 30 1800 apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=60 install -y --no-install-recommends apt \
+      timeout -k 30 240 apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=3 -o Acquire::https::Timeout=60 --error-on=any update; \
+      timeout -k 30 1800 apt-get -o Acquire::Retries=3 -o Acquire::https::Timeout=60 install -y --no-install-recommends \
         python3-dev \
         build-essential \
         gcc \

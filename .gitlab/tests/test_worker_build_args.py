@@ -341,12 +341,14 @@ for index, argument in enumerate(args):
                     for line in lines
                     if "apt-get" in line and not line.lstrip().startswith("#")
                 ]
-                self.assertEqual(len(apt_lines), 6)
+                self.assertEqual(len(apt_lines), 8)
                 for line in apt_lines:
-                    self.assertIn("Acquire::Retries=0", line)
                     self.assertIn("Acquire::https::Timeout=60", line)
                     if " update" in line:
                         self.assertIn("timeout -k 30 240 apt-get -o ", line)
+                        self.assertIn("--error-on=any", line)
+                        expected_retries = 3 if line.startswith("      ") else 0
+                        self.assertIn(f"Acquire::Retries={expected_retries}", line)
                     elif " install" in line:
                         # Base and runtime installs keep the 600 s limit; the
                         # WITH_TOOLCHAINS install (six-space continuation) gets
@@ -355,6 +357,10 @@ for index, argument in enumerate(args):
                             self.assertIn("timeout -k 30 1800 apt-get -o ", line)
                         else:
                             self.assertIn("timeout -k 30 600 apt-get -o ", line)
+                        if "Acquire::Retries=0" in line:
+                            self.assertIn("--no-install-recommends apt;", line)
+                        else:
+                            self.assertIn("Acquire::Retries=3", line)
                     else:
                         self.fail(f"unrecognized apt command in {lane}: {line}")
 

@@ -120,7 +120,7 @@ class WorkerReproducibilityTests(unittest.TestCase):
                 )
                 self.assertEqual(pins, [snapshot])
 
-    def test_worker_apt_uses_https_without_internal_retries(self):
+    def test_worker_apt_bootstraps_fixed_client_before_retrying(self):
         for lane in WORKERS:
             with self.subTest(lane=lane):
                 text = (ROOT / lane / "Dockerfile").read_text()
@@ -128,15 +128,35 @@ class WorkerReproducibilityTests(unittest.TestCase):
                 self.assertEqual(len(sources), 6)
                 self.assertEqual(set(sources), {"https"})
                 self.assertNotIn('"deb http://', text)
-                apt_calls = len(re.findall(r"\bapt-get\b", text))
-                self.assertEqual(apt_calls, 6)
-                self.assertEqual(text.count("Acquire::Retries=0"), apt_calls)
-                self.assertEqual(text.count("Acquire::https::Timeout=60"), apt_calls)
-                self.assertNotRegex(text, r"Acquire::Retries=[1-9]")
-                self.assertEqual(text.count("--no-install-recommends apt"), 3)
+                apt_lines = [
+                    line for line in text.splitlines()
+                    if "apt-get" in line and not line.lstrip().startswith("#")
+                ]
+                self.assertEqual(len(apt_lines), 8)
+                for line in apt_lines:
+                    self.assertIn("Acquire::https::Timeout=60", line)
+                retries = re.findall(r"Acquire::Retries=(\d+)", text)
+                self.assertEqual(retries.count("0"), 4)
+                self.assertEqual(retries.count("3"), 4)
+                self.assertEqual(len(retries), 8)
+                updates = [line for line in apt_lines if " update" in line]
+                self.assertEqual(len(updates), 3)
+                for line in updates:
+                    self.assertIn("--error-on=any", line)
+                bootstrap = [
+                    line for line in apt_lines
+                    if " install" in line and "Acquire::Retries=0" in line
+                ]
+                self.assertEqual(len(bootstrap), 2)
+                for line in bootstrap:
+                    self.assertIn("--no-install-recommends apt;", line)
                 expected = "3.0.4" if lane.startswith("opencode") else "2.6.2"
-                assertion = f'test "$(dpkg-query -W -f=\'${{Version}}\' apt)" = "{expected}";'
+                assertion = (
+                    'dpkg --compare-versions "$(dpkg-query -W -f=\'${Version}\' apt)" '
+                    f"ge {expected};"
+                )
                 self.assertEqual(text.count(assertion), 2)
+                self.assertEqual(text.count("update-ca-certificates;"), 2)
                 self.assertNotIn("AS certificates", text)
                 certificate_copy = "COPY --from=docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"
                 self.assertEqual(text.count(certificate_copy), 2)
