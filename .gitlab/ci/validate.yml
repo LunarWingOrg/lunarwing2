@@ -129,6 +129,7 @@ worker-kimi-ts:
     # seconds and gives classified failures and timeout exit 124 a three-attempt
     # ladder (120/300-second delays plus job-id jitter), below the 1 h runner cap.
     # Permanent package failures still exit on the first attempt.
+    - mkdir -p /etc/ssl/certs
     - node -e 'require("fs").writeFileSync("/etc/ssl/certs/ca-certificates.crt", require("tls").rootCertificates.join("\n") + "\n")'
     - rm -f /etc/apt/sources.list.d/debian.sources
     - printf '%s\n' "deb https://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm main" "deb https://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm-updates main" "deb https://snapshot.debian.org/archive/debian-security/${CI_DEBIAN_SNAPSHOT}/ bookworm-security main" > /etc/apt/sources.list

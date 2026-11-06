@@ -2271,6 +2271,12 @@ class WorkerTsLaneTests(unittest.TestCase):
                 merged[job_name] = {"extends": ".worker-template"}
                 self.assertEqual(self.errors(merged), [])
 
+    def test_kimi_certificate_directory_precedes_node_bootstrap(self):
+        script = config.load_yaml(ROOT / ".gitlab/ci/validate.yml")["worker-kimi-ts"]["script"]
+        self.assertEqual(script[0], "mkdir -p /etc/ssl/certs")
+        self.assertIn('writeFileSync("/etc/ssl/certs/ca-certificates.crt"', script[1])
+        self.assertEqual(script[:2], list(config.WORKER_TS_LANE_SCRIPTS["worker-kimi-ts"][1][:2]))
+
     def test_main_rejects_job_level_execution_override(self):
         original_load_yaml = config.load_yaml
         for job_name in self.LANES:
