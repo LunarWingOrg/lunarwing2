@@ -3,7 +3,7 @@ wit_bindgen::generate!({
     path: "../../wit/channel.wit",
 });
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use exports::lunarwing::agent::channel::{
     AgentResponse, ChannelConfig, Guest, IncomingHttpRequest, OutgoingHttpResponse, PollConfig,
@@ -21,7 +21,9 @@ const DEFAULT_POLL_INTERVAL_MS: u32 = 30_000;
 struct RuntimeConfig {
     #[serde(default = "default_display_name")]
     display_name: String,
+    #[serde(deserialize_with = "deserialize_multica_url")]
     multica_url: String,
+    #[serde(deserialize_with = "deserialize_workspace_id")]
     workspace_id: String,
     runtime_id: Option<String>,
     #[serde(default = "default_daemon_id")]
@@ -32,6 +34,32 @@ struct RuntimeConfig {
     polling_enabled: bool,
     #[serde(default = "default_poll_interval")]
     poll_interval_ms: u32,
+}
+
+fn deserialize_multica_url<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_required_string(deserializer, "multica_url")
+}
+
+fn deserialize_workspace_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_required_string(deserializer, "workspace_id")
+}
+
+fn deserialize_required_string<'de, D>(deserializer: D, field: &str) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<String>::deserialize(deserializer)? {
+        Some(value) if !value.trim().is_empty() => Ok(value),
+        _ => Err(serde::de::Error::custom(format!(
+            "{field} is not configured"
+        ))),
+    }
 }
 
 fn default_display_name() -> String {
@@ -607,4 +635,65 @@ fn emit_task_message(task: &ClaimedTask) {
         channel_host::LogLevel::Info,
         &format!("claimed task {task_id}: {identifier} — {issue_title}"),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_required_fields(
+        multica_url: serde_json::Value,
+        workspace_id: serde_json::Value,
+    ) -> String {
+        serde_json::json!({
+            "multica_url": multica_url,
+            "workspace_id": workspace_id,
+        })
+        .to_string()
+    }
+
+    fn assert_required_field_error(config: &str, field: &str) {
+        let error = parse_config(config).expect_err("configuration should be rejected");
+        assert!(
+            error.contains(&format!("{field} is not configured")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn null_required_fields_name_the_missing_setting() {
+        let null_url = config_with_required_fields(serde_json::Value::Null, "workspace".into());
+        assert_required_field_error(&null_url, "multica_url");
+
+        let null_workspace =
+            config_with_required_fields("https://multica.example".into(), serde_json::Value::Null);
+        assert_required_field_error(&null_workspace, "workspace_id");
+    }
+
+    #[test]
+    fn blank_required_fields_name_the_missing_setting() {
+        let blank_url = config_with_required_fields("  ".into(), "workspace".into());
+        assert_required_field_error(&blank_url, "multica_url");
+
+        let blank_workspace =
+            config_with_required_fields("https://multica.example".into(), "".into());
+        assert_required_field_error(&blank_workspace, "workspace_id");
+    }
+
+    #[test]
+    fn complete_config_preserves_values_and_defaults() {
+        let config = parse_config(&config_with_required_fields(
+            "https://multica.example".into(),
+            "workspace".into(),
+        ))
+        .expect("complete configuration should parse");
+
+        assert_eq!(config.multica_url, "https://multica.example");
+        assert_eq!(config.workspace_id, "workspace");
+        assert_eq!(config.display_name, "Multica");
+        assert_eq!(config.daemon_id, "lunarwing");
+        assert_eq!(config.runtime_type, "lunarwing");
+        assert!(config.polling_enabled);
+        assert_eq!(config.poll_interval_ms, DEFAULT_POLL_INTERVAL_MS);
+    }
 }
