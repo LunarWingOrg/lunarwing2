@@ -44,7 +44,9 @@
 
 ## Phase 5 - Misc Operations (ALWAYS READ ALL COMMENTS FOR EACH WORK ITEM WHEN A WORK ITEM IS REFERENCED - ALSO ALWAYS READ LINKED WORK ITEMS FOR EACH WORK ITEM REFERENCED)
 
-6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/540
+6. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/540
+   - DONE (SweetieBot (autonomous), 2026-11-06): `_worker_source_git` now checks checkout ownership before invoking git; foreign-owned roots run only as their owner with an explicit `safe.directory`, while caller-owned roots retain the direct path. Added static and behavioral regression coverage in `test-mt-admin-pebble-build-inputs.sh`.
+   - Verification: `test-mt-admin-pebble-build-inputs.sh` and `test-mt-admin-upgrade-build-failure.sh` passed; `check-mt-admin.sh` and shellcheck on the modified test passed with zero warnings.
 
 ## Phase 6 - Gauntlets (for goals which reference any work items, see comments on those work items in addition to reading full descriptions)
 
