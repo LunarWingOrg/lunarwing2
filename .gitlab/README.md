@@ -303,8 +303,11 @@ Root cause: the worker images install every Debian package from the pinned
 originally carried no retry options, so a single dropped fetch failed a
 multi-hour candidate; the later `Acquire::Retries=5` mitigation made transient
 recovery better but matched CVE-2026-109518's required non-zero retry
-condition. WI#561 moved every source to HTTPS and set `Acquire::Retries=0`
-with `Acquire::https::Timeout=60`, retiring APT's automatic per-fetch retries.
+condition. WI#561 moved every source to HTTPS. The old base client uses
+`Acquire::Retries=0` only for its update and apt-only bootstrap install; once
+the fixed-version floor passes, the fixed client installs all remaining
+packages with `Acquire::Retries=3`, including the toolchain layer. Every call
+sets `Acquire::https::Timeout=60`, and every update uses `--error-on=any`.
 The bounded outer ladders remain: `timeout -k 30 240` bounds each update and
 `timeout -k 30 600` bounds each install (the `WITH_TOOLCHAINS` install gets
 1800 s — its package set is far larger), so a hung apt run exits 124 — or is
@@ -318,8 +321,9 @@ handles them); an unrelated compile-step 137 is not retried (WI#559).
 Package-resolution and other genuine build failures still exit on the first
 attempt. Publication jobs keep `retry: 0`. A full snapshot outage still fails
 after the third attempt or the applicable time limit until the service
-recovers (retry the job). Direct mt-admin builds have no outer ladder and fail
-fast on the first transient fetch; rerun the build when the archive recovers.
+recovers (retry the job). Direct mt-admin builds have no outer ladder: the
+small bootstrap fails fast, while the fixed client retries subsequent transient
+package fetches three times; rerun the build if the archive remains unavailable.
 
 ## worker scan transient kills (exit 137)
 
@@ -368,14 +372,15 @@ host's concurrent builds before retrying manually.
   whose config section embeds python3 heredocs — from the pinned
   `CI_DEBIAN_SNAPSHOT` archive (tied to the Dockerfile `ARG DEBIAN_SNAPSHOT`
   by `validate_config.py`), not the live deb.debian.org mirror. WI#561 moved
-  the source to HTTPS and the lane installs `apt` as well as `python3`, so the
-  fixed client from the pinned snapshot replaces the base image's client.
-  Before APT starts, Node writes its built-in `tls.rootCertificates` to the
-  system CA bundle because the slim image may not ship one. The helper asserts
-  APT `2.6.2` after installation so failed indexes cannot produce a false pass.
-  Both APT calls use `Acquire::Retries=0`/`Acquire::https::Timeout=60`;
-  automatic per-fetch retries stay off (CVE-2026-109518).
-  `ci-apt-with-retry.sh` bounds them at 240/600 seconds respectively
+  the source to HTTPS. The helper installs `apt` alone with the old client and
+  `Acquire::Retries=0`, requires APT `2.6.2` or newer, then installs
+  `ca-certificates` and `python3` with the fixed client and `Acquire::Retries=3`.
+  Before APT starts, the lane creates `/etc/ssl/certs` and Node writes its
+  built-in `tls.rootCertificates` to the system bundle because the slim image
+  may not ship one. Every call sets `Acquire::https::Timeout=60`, every update
+  uses `--error-on=any`, and CA installation is followed by
+  `update-ca-certificates`. `ci-apt-with-retry.sh` bounds the update at 240
+  seconds and both installs together at 600 seconds
   (`timeout -k 30`, so a stalled apt is KILLed 30 s after it ignores TERM)
   and gives classified HTTP or HTTPS snapshot failures and timeout exit 124
   three attempts with 120/300-second delays plus job-id-based jitter

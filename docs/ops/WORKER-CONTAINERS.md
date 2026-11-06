@@ -72,31 +72,43 @@ no `Verify-Peer=false` or plain-HTTP fallback. Both snapshot hosts were
 checked over HTTPS on 2026-11-05: each returned its pinned content after an
 HTTPS 302 redirect, with HSTS present.
 
-Every worker APT call and both helper calls set `Acquire::Retries=0` and
-`Acquire::https::Timeout=60`. The WI#559 process timeouts are unchanged.
-Protected candidate builds and the CI helper retain their three-attempt outer
-ladders and recognize HTTP and HTTPS traces, so resilience does not depend on
-APT's vulnerable automatic retry path. Direct mt-admin builds have no outer
-retry ladder: a transient fetch now fails fast and the operator reruns the
-build after the archive recovers.
+Every worker APT call sets `Acquire::https::Timeout=60`. In each builder and
+runtime, the old base client's update and apt-only bootstrap install use
+`Acquire::Retries=0`. A `dpkg --compare-versions` floor (`2.6.2` on Bookworm,
+`3.0.4` on Trixie) must pass before the fixed client installs every remaining
+package with `Acquire::Retries=3`; toolchain updates and installs likewise use
+the fixed client with three retries. Every update uses `--error-on=any`, so a
+failed security index cannot pass silently. The WI#559 process timeouts are
+unchanged. Protected candidate builds and the CI helper retain their
+three-attempt outer ladders and recognize HTTP and HTTPS traces. Direct
+mt-admin builds have no outer ladder: the small bootstrap still fails fast,
+but transient fetches for all remaining packages get the fixed client's three
+bounded attempts instead of making the whole build fragile to one response.
 
 The four Dockerfiles and `CI_DEBIAN_SNAPSHOT` use `20261105T082236Z`. Its
 Bookworm security archive serves `apt_2.6.2_amd64.deb`; its Trixie security
 `InRelease` is byte-identical to the index whose package list was checked for
-APT `3.0.4`. Every Dockerfile install explicitly includes `apt`, as does the
-CI provisioning helper, replacing the vulnerable client inherited from the
-base images instead of merely making a fixed version available. The snapshot
-floor and package-install shape have regression coverage.
+APT `3.0.4`. Every builder/runtime installs `apt` alone before its other
+packages, as does the CI provisioning helper, replacing the vulnerable client
+inherited from the base images instead of merely making a fixed version
+available. The snapshot floor and package-install shape have regression
+coverage; later fixed point releases satisfy the floor without another
+Dockerfile edit.
 
 The slim Node and Debian bases can have no system CA bundle at all. Each
 builder and runtime therefore copies `/etc/ssl/certs/ca-certificates.crt`
 directly from the already-reviewed, digest-pinned Python `3.12-slim-bookworm`
 image before its first APT call; no extra Dockerfile stage changes the builder
-manifest layout. `worker-kimi-ts` instead writes the bundle from the pinned
-Node runtime's built-in `tls.rootCertificates`. Both sources are local trusted
-inputs, not insecure network fallbacks. Each builder/runtime and the CI helper
-also assert the exact installed APT version (`2.6.2` or `3.0.4`), closing the
-APT behavior where failed index downloads can still return success.
+manifest layout. `worker-kimi-ts` creates `/etc/ssl/certs` and then writes the
+bundle from the pinned Node runtime's built-in `tls.rootCertificates`. Both
+sources are local trusted inputs, not insecure network fallbacks. After CA
+package installation, `update-ca-certificates` regenerates the bundle and
+hashed links as one consistent store. The version floors and strict update
+errors close the APT behavior where failed index downloads can otherwise
+return success. The validator ties every worker snapshot ARG to CI and applies
+its robust HTTPS source parser to Kimi; `test_worker_reproducibility` enforces
+HTTPS, bootstrap-only retry suppression, version floors, and strict updates on
+all four lanes.
 
 The inventory is limited to the four worker Dockerfiles plus
 `.gitlab/ci/validate.yml`; mt-admin renders those same lane Dockerfiles and
