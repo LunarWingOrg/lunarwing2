@@ -305,14 +305,14 @@ impl Guest for MulticaChannel {
                 });
                 let url = api_url(&config.multica_url, &format!("/api/issues/{iid}/comments"));
                 let (status, resp_body) = http_post(&url, body.to_string().as_bytes())?;
-                if status < 200 || status >= 300 {
+                if !(200..300).contains(&status) {
                     return Err(format!(
                         "post_comment failed (HTTP {status}): {}",
                         String::from_utf8_lossy(&resp_body)
                     ));
                 }
             }
-            "complete" | _ => {
+            _ => {
                 if let Some(tid) = task_id {
                     let body = serde_json::json!({ "output": response.content });
                     let url = api_url(
@@ -320,7 +320,7 @@ impl Guest for MulticaChannel {
                         &format!("/api/daemon/tasks/{tid}/complete"),
                     );
                     let (status, resp_body) = http_post(&url, body.to_string().as_bytes())?;
-                    if status < 200 || status >= 300 {
+                    if !(200..300).contains(&status) {
                         return Err(format!(
                             "complete_task failed (HTTP {status}): {}",
                             String::from_utf8_lossy(&resp_body)
@@ -400,7 +400,7 @@ fn do_register(config: &RuntimeConfig) -> Result<String, String> {
     });
     let url = api_url(&config.multica_url, "/api/daemon/register");
     let (status, resp_bytes) = http_post(&url, body.to_string().as_bytes())?;
-    if status < 200 || status >= 300 {
+    if !(200..300).contains(&status) {
         return Err(format!(
             "register HTTP {status}: {}",
             String::from_utf8_lossy(&resp_bytes)
@@ -418,7 +418,7 @@ fn send_heartbeat(config: &RuntimeConfig, runtime_id: &str) -> Result<HeartbeatR
     let body = serde_json::json!({ "runtime_id": runtime_id });
     let url = api_url(&config.multica_url, "/api/daemon/heartbeat");
     let (status, resp_bytes) = http_post(&url, body.to_string().as_bytes())?;
-    if status < 200 || status >= 300 {
+    if !(200..300).contains(&status) {
         return Err(format!(
             "heartbeat HTTP {status}: {}",
             String::from_utf8_lossy(&resp_bytes)
@@ -449,7 +449,7 @@ fn report_local_skills(config: &RuntimeConfig, runtime_id: &str, request_id: &st
         &format!("/api/daemon/runtimes/{runtime_id}/local-skills/{request_id}/result"),
     );
     match http_post(&url, body.to_string().as_bytes()) {
-        Ok((status, _)) if status >= 200 && status < 300 => {
+        Ok((status, _)) if (200..300).contains(&status) => {
             channel_host::log(
                 channel_host::LogLevel::Info,
                 &format!("reported {} local skills", skills.len()),
@@ -538,7 +538,7 @@ fn claim_task(config: &RuntimeConfig, runtime_id: &str) -> Result<Option<Claimed
     if body_str.trim().is_empty() || body_str.trim() == "null" {
         return Ok(None);
     }
-    if status < 200 || status >= 300 {
+    if !(200..300).contains(&status) {
         return Err(format!("claim_task HTTP {status}: {body_str}"));
     }
     let task: ClaimedTask =
