@@ -33,6 +33,10 @@ class CiAptWithRetryTests(unittest.TestCase):
             "sleep",
             f"#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{self.sleeps}'\n",
         )
+        self.write_shim(
+            "dpkg-query",
+            "#!/bin/sh\nprintf '%s\\n' \"${APT_DPKG_VERSION:-2.6.2}\"\n",
+        )
         self.write_shim("apt-get", f"""#!{sys.executable}
 import json
 import os
@@ -53,8 +57,7 @@ if mode == "hang_update_once" and count == 1:
 if mode == "hang_install_once" and count == 2:
     time.sleep(2)
 if install and (mode == "fail_snapshot_always" or (mode == "fail_snapshot_once" and count == 2)):
-    print("E: Failed to fetch http://snapshot.debian.org/archive/debian/pool/python3.deb  504  Gateway Timeout", file=sys.stderr)
-    print("E: Unable to fetch some archives, maybe run apt-get update or try with --fix-missing?", file=sys.stderr)
+    print("E: Failed to fetch https://snapshot.debian.org/archive/debian/pool/python3.deb  504  Gateway Timeout", file=sys.stderr)
     sys.exit(100)
 if install and mode == "fail_package":
     print("E: Unable to locate package python3", file=sys.stderr)
@@ -77,7 +80,7 @@ if install and mode == "fail_package":
     def run_apt(self, mode="ok"):
         self.env["APT_MODE"] = mode
         return subprocess.run(
-            ["sh", str(SCRIPT), "python3"],
+            ["sh", str(SCRIPT), "apt", "python3"],
             cwd=self.root,
             env=self.env,
             capture_output=True,
@@ -97,7 +100,7 @@ if install and mode == "fail_package":
         self.assertFalse((self.root / ".ci-apt-attempt.log").exists())
         self.assertFalse((self.root / ".ci-apt-attempt.rc").exists())
 
-    def test_success_uses_pinned_retry_options_without_sleeping(self):
+    def test_success_disables_internal_retries_without_sleeping(self):
         result = self.run_apt()
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.apt_calls()
@@ -105,10 +108,10 @@ if install and mode == "fail_package":
         self.assertIn("update", calls[0])
         self.assertIn("Acquire::Check-Valid-Until=false", calls[0])
         self.assertIn("install", calls[1])
-        self.assertEqual(calls[1][-2:], ["--no-install-recommends", "python3"])
+        self.assertEqual(calls[1][-3:], ["--no-install-recommends", "apt", "python3"])
         for call in calls:
-            self.assertIn("Acquire::Retries=5", call)
-            self.assertIn("Acquire::http::Timeout=60", call)
+            self.assertIn("Acquire::Retries=0", call)
+            self.assertIn("Acquire::https::Timeout=60", call)
         self.assertEqual(self.recorded_sleeps(), [])
         self.assert_attempt_files_removed()
 
@@ -161,6 +164,15 @@ if install and mode == "fail_package":
         self.assertEqual(self.recorded_sleeps(), [])
         self.assertIn("attempt 1/3 failed (exit 100); not retrying", result.stderr)
         self.assertNotIn("retrying after a transient", result.stderr)
+        self.assert_attempt_files_removed()
+
+    def test_unfixed_installed_apt_fails_closed(self):
+        self.env["APT_DPKG_VERSION"] = "2.6.1"
+        result = self.run_apt()
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(len(self.apt_calls()), 2)
+        self.assertEqual(self.recorded_sleeps(), [])
+        self.assertIn("attempt 1/3 failed (exit 1); not retrying", result.stderr)
         self.assert_attempt_files_removed()
 
 

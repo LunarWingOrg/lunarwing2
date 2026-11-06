@@ -23,7 +23,7 @@ spec.loader.exec_module(config)
 
 
 class WorkerSnapshotSecurityTests(unittest.TestCase):
-    SNAPSHOT = "20261024T011300Z"
+    SNAPSHOT = "20261105T082236Z"
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -71,9 +71,9 @@ class WorkerSnapshotSecurityTests(unittest.TestCase):
         self.assertEqual(
             self.errors(stale),
             [
-                "CI_DEBIAN_SNAPSHOT predates the CVE-2026-111497 Brotli fixes",
+                "CI_DEBIAN_SNAPSHOT predates the CVE-2026-109518 APT fixes",
                 *(
-                    f"{path} ARG DEBIAN_SNAPSHOT predates the CVE-2026-111497 Brotli fixes"
+                    f"{path} ARG DEBIAN_SNAPSHOT predates the CVE-2026-109518 APT fixes"
                     for path in self.dockerfiles.values()
                 ),
             ],
@@ -86,7 +86,7 @@ class WorkerSnapshotSecurityTests(unittest.TestCase):
             path.write_text(f"ARG DEBIAN_SNAPSHOT={stale}\n", encoding="utf-8")
             with self.subTest(worker=name):
                 self.assertTrue(
-                    any(str(path) in error and "Brotli fixes" in error for error in self.errors()),
+                    any(str(path) in error and "APT fixes" in error for error in self.errors()),
                     self.errors(),
                 )
             path.write_text(original, encoding="utf-8")
@@ -1410,8 +1410,8 @@ class DebianSnapshotTieTests(unittest.TestCase):
             + self.node_from()
             + "ARG DEBIAN_SNAPSHOT\n"
             + "RUN printf '%s\\n' \\\n"
-            + '      "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT} bookworm main" \\\n'
-            + '      "deb http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT} bookworm-security main" \\\n'
+            + '      "deb https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT} bookworm main" \\\n'
+            + '      "deb https://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT} bookworm-security main" \\\n'
             + "      > /etc/apt/sources.list\n"
         )
         self.assertEqual(self.errors(), [])
@@ -1482,7 +1482,7 @@ class DebianSnapshotTieTests(unittest.TestCase):
             f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
             + self.node_from()
             + "RUN printf '%s\\n' "
-            + f'"deb http://snapshot.debian.org/archive/debian/{self.SNAPSHOT}/ bookworm main" '
+            + f'"deb https://snapshot.debian.org/archive/debian/{self.SNAPSHOT}/ bookworm main" '
             + "> /etc/apt/sources.list\n"
         )
         self.assertTrue(
@@ -1495,7 +1495,7 @@ class DebianSnapshotTieTests(unittest.TestCase):
             f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
             + self.node_from()
             + "RUN printf '%s\\n' "
-            + '"deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOTS}/ bookworm main" '
+            + '"deb https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOTS}/ bookworm main" '
             + "> /etc/apt/sources.list\n"
         )
         self.assertTrue(
@@ -1544,7 +1544,7 @@ class DebianSnapshotTieTests(unittest.TestCase):
             f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
             + self.node_from()
             + "RUN printf '%s\\n' "
-            + '"deb http://snapshot.debian.org/archive/debian/$(echo ${DEBIAN_SNAPSHOT})/ bookworm main" '
+            + '"deb https://snapshot.debian.org/archive/debian/$(echo ${DEBIAN_SNAPSHOT})/ bookworm main" '
             + "> /etc/apt/sources.list\n"
         )
         self.assertTrue(
@@ -1628,13 +1628,23 @@ class DebianSnapshotTieTests(unittest.TestCase):
             f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
             + self.node_from()
             + "RUN printf '%s\\n' "
-            + '"deb [arch=amd64] http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm main" '
+            + '"deb [arch=amd64] https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm main" '
             + "> /etc/apt/sources.list\n"
             + "RUN printf '%s\\n' 'Types: deb deb-src' "
-            + "'URIs: http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/' "
+            + "'URIs: https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/' "
             + "'Suites: bookworm' > /etc/apt/sources.list.d/debian.sources\n"
         )
         self.assertEqual(self.errors(), [])
+
+    def test_plain_http_snapshot_source_is_caught(self):
+        self.write_dockerfile(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            + self.node_from()
+            + "RUN echo 'deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm main' > /a.list\n"
+        )
+        self.assertTrue(
+            any("must use HTTPS" in error for error in self.errors())
+        )
 
     def test_live_mirror_beside_a_snapshot_source_is_caught(self):
         # MR !1680 review IP-2 (A9): the per-line check excused the whole
@@ -1643,7 +1653,7 @@ class DebianSnapshotTieTests(unittest.TestCase):
         self.write_dockerfile(
             f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
             + self.node_from()
-            + "RUN echo 'deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm main' > /a.list "
+            + "RUN echo 'deb https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm main' > /a.list "
             + "&& echo 'deb http://deb.debian.org/debian bookworm main' >> /a.list\n"
         )
         self.assertTrue(
@@ -1668,7 +1678,7 @@ class DebianSnapshotTieTests(unittest.TestCase):
                 + newline + "Suites: bookworm' > /a.sources\n"
             ),
             "deb822 snapshot plus live": (
-                "RUN echo 'URIs: http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/"
+                "RUN echo 'URIs: https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/"
                 " http://deb.debian.org/debian' >> /a.sources\n"
             ),
         }

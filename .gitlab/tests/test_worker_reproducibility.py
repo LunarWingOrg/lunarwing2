@@ -106,11 +106,11 @@ class WorkerReproducibilityTests(unittest.TestCase):
                     self.assertEqual(result.stdout, "")
             self.assertNotEqual(self.shadow_check(lane, account, 0, None).returncode, 0)
 
-    def test_all_worker_snapshots_match_ci_and_include_the_brotli_fix(self):
+    def test_all_worker_snapshots_match_ci_and_include_security_fixes(self):
         defaults = yaml.safe_load((ROOT / ".gitlab/ci/defaults.yml").read_text())
         snapshot = defaults["variables"]["CI_DEBIAN_SNAPSHOT"]
         self.assertRegex(snapshot, r"^\d{8}T\d{6}Z$")
-        self.assertGreaterEqual(snapshot, "20261024T011300Z")
+        self.assertGreaterEqual(snapshot, "20261105T082236Z")
         for lane in WORKERS:
             with self.subTest(lane=lane):
                 pins = re.findall(
@@ -119,6 +119,27 @@ class WorkerReproducibilityTests(unittest.TestCase):
                     flags=re.MULTILINE,
                 )
                 self.assertEqual(pins, [snapshot])
+
+    def test_worker_apt_uses_https_without_internal_retries(self):
+        for lane in WORKERS:
+            with self.subTest(lane=lane):
+                text = (ROOT / lane / "Dockerfile").read_text()
+                sources = re.findall(r'"deb (https?)://snapshot\.debian\.org/', text)
+                self.assertEqual(len(sources), 6)
+                self.assertEqual(set(sources), {"https"})
+                self.assertNotIn('"deb http://', text)
+                apt_calls = len(re.findall(r"\bapt-get\b", text))
+                self.assertEqual(apt_calls, 6)
+                self.assertEqual(text.count("Acquire::Retries=0"), apt_calls)
+                self.assertEqual(text.count("Acquire::https::Timeout=60"), apt_calls)
+                self.assertNotRegex(text, r"Acquire::Retries=[1-9]")
+                self.assertEqual(text.count("--no-install-recommends apt"), 3)
+                expected = "3.0.4" if lane.startswith("opencode") else "2.6.2"
+                assertion = f'test "$(dpkg-query -W -f=\'${{Version}}\' apt)" = "{expected}";'
+                self.assertEqual(text.count(assertion), 2)
+                self.assertNotIn("AS certificates", text)
+                certificate_copy = "COPY --from=docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"
+                self.assertEqual(text.count(certificate_copy), 2)
 
 
 if __name__ == "__main__":

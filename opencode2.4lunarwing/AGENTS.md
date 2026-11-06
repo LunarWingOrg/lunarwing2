@@ -92,8 +92,13 @@ Keep `ARG SOURCE_DATE_EPOCH=0` in the runtime stage before `useradd` and keep
 the same-layer shadow-day assertion. Shadow-utils records the epoch day in
 `/etc/shadow`; without the ARG a candidate and rebuild spanning UTC midnight
 have different file contents, which BuildKit's timestamp rewrite cannot fix
-(WI#510). All four workers and `CI_DEBIAN_SNAPSHOT` use `20261024T011300Z`,
+(WI#510). All four workers and `CI_DEBIAN_SNAPSHOT` use `20261105T082236Z`,
 which includes the Bookworm/Trixie Brotli security fixes; bump them together.
+Snapshot sources stay HTTPS, with `Acquire::Retries=0` and
+`Acquire::https::Timeout=60` on every `apt-get` call (WI#561); transient recovery
+belongs to bounded outer retries, not APT's automatic download retries. Keep both
+direct CA-bundle copies from the digest-pinned Python image before APT and the
+exact `3.0.4` installed-version assertions; slim bases may have no trust store.
 
 The Bun 1.4.4 photon-node hunk-10 repair that this lane used to apply at the
 v2.1.2 pin is retired: v2.2.5 carries the `61845b0` whitespace repair as a
