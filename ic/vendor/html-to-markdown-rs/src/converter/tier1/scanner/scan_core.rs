@@ -7,7 +7,12 @@ pub fn scan(
     scan_with_policy(html, options, effective_base, Default::default())
 }
 
-pub(crate) fn scan_with_policy(
+/// ~keep Scan with explicit per-call accessible-name handling.
+///
+/// # Errors
+///
+/// Returns a bail reason when the scanner cannot handle the input.
+pub fn scan_with_policy(
     html: &str,
     options: &ConversionOptions,
     effective_base: Option<std::rc::Rc<url::Url>>,
@@ -864,10 +869,7 @@ fn finish_scan(
 fn find_close_tag_range(bytes: &[u8], open_end: usize, tag_name: &[u8]) -> Option<(usize, usize)> {
     let mut idx = open_end;
     while idx < bytes.len() {
-        match memchr3(b'<', b'<', b'<', &bytes[idx..]) {
-            Some(off) => idx += off,
-            None => return None,
-        }
+        idx += memchr3(b'<', b'<', b'<', &bytes[idx..])?;
         let is_close = bytes.get(idx + 1) == Some(&b'/');
         let name_start = idx + usize::from(is_close) + 1;
         if is_close && let Some(after) = matching_tag_after(bytes, name_start, tag_name) {
@@ -897,10 +899,7 @@ fn find_balanced_close(bytes: &[u8], open_end: usize, tag_name: &[u8]) -> Option
     let mut idx = open_end;
     let mut depth = 1usize;
     while idx < bytes.len() {
-        match memchr::memchr(b'<', &bytes[idx..]) {
-            Some(off) => idx += off,
-            None => return None,
-        }
+        idx += memchr::memchr(b'<', &bytes[idx..])?;
         let is_close = bytes.get(idx + 1) == Some(&b'/');
         let name_start = idx + usize::from(is_close) + 1;
         let Some(after) = matching_tag_after(bytes, name_start, tag_name) else {

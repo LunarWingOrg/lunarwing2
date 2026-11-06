@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.89"
 name = "aes"
-version = "0.9.3"
+version = "0.9.4"
 authors = ["RustCrypto Developers"]
 build = false
 autolib = false
@@ -25,7 +25,6 @@ description = "Pure Rust implementation of the Advanced Encryption Standard (a.k
 documentation = "https://docs.rs/aes"
 readme = "README.md"
 keywords = [
-    "crypto",
     "aes",
     "rijndael",
     "block-cipher",

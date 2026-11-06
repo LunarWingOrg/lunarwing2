@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.9.4 (2026-11-02)
+### Changed
+- Reduce size of `Aes128/192/256` structs by using compact round key representation
+  for software backend ([#594])
+
+### Fixed
+- Performance regression by using `#[inline]` attributes ([#598])
+
+[#594]: https://github.com/RustCrypto/block-ciphers/pull/594
+[#598]: https://github.com/RustCrypto/block-ciphers/pull/598
+
 ## 0.9.3 (2026-08-28)
 ### Changed
 - MSRV bumped to 1.89 ([#580])

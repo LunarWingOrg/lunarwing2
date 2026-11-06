@@ -2,12 +2,14 @@
 
 use crate::compression::CompressionMethod;
 use crate::format::MagicPositionCache;
-use crate::format::blocks::{FixedSizeBlock, Zip32CentralDirectoryEnd, ZipCentralEntryBlock};
+use crate::format::blocks::{
+    FixedSizeBlock, Zip32CentralDirectoryEnd, ZipCentralEntryBlock, ZipLocalEntryBlock,
+};
 use crate::format::find_central_directory_end;
 use crate::format::magic::Magic;
 use crate::read::config::Config;
 use crate::read::extract::RootDirFilter;
-use crate::read::magic_finder::MagicFinder;
+use crate::read::magic_finder::{Forward, MagicFinder};
 use crate::read::readers::{ZipFileReader, ZipFileSeekReader};
 use crate::read::zipfile::{ZipFileEntry, ZipFileEntryWithDataDescriptor};
 use crate::read::{
@@ -15,20 +17,20 @@ use crate::read::{
     central_header_to_zip_file_inner,
 };
 use crate::result::{ZipError, ZipResult};
-use crate::types::ZipFileData;
+use crate::types::{FilesByNameMap, ZipFileData};
 use crate::unstable::path_to_string;
+use core::mem;
 use core::ops::Range;
 use indexmap::IndexMap;
 use std::borrow::Cow;
 use std::io::{Read, Seek, SeekFrom};
-use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Immutable metadata about a `ZipArchive`.
 #[derive(Debug)]
 pub struct ZipArchiveMetadata {
-    pub(crate) files: IndexMap<Box<[u8]>, ZipFileData>,
+    pub(crate) files: FilesByNameMap,
     /// The raw file count (before inserting in the IndexMap) - used to detect duplicates
     pub(crate) raw_file_count: usize,
     pub(crate) offset: u64,
@@ -71,7 +73,7 @@ impl ZipArchiveMetadata {
 
 #[derive(Debug)]
 pub(crate) struct SharedBuilder {
-    pub(crate) files: IndexMap<Box<[u8]>, ZipFileData>,
+    pub(crate) files: FilesByNameMap,
     pub(crate) raw_file_count: usize,
     pub(super) offset: u64,
     pub(super) dir_start: u64,
@@ -95,6 +97,20 @@ impl SharedBuilder {
             comment,
             zip64_extensible_data_sector,
         }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ArchiveMetadataBuilder {
+    pub(crate) shared: SharedBuilder,
+    pub(crate) comment: Box<[u8]>,
+    pub(crate) zip64_extensible_data_sector: Option<Box<[u8]>>,
+}
+
+impl ArchiveMetadataBuilder {
+    pub(crate) fn build(self) -> ZipArchiveMetadata {
+        self.shared
+            .build(self.comment, self.zip64_extensible_data_sector)
     }
 }
 
@@ -127,12 +143,19 @@ pub struct ZipArchive<R> {
 
 impl<R> ZipArchive<R> {
     pub(crate) fn from_finalized_writer(
-        files: IndexMap<Box<[u8]>, ZipFileData>,
+        mut files: FilesByNameMap,
         comment: Box<[u8]>,
         zip64_extensible_data_sector: Option<Box<[u8]>>,
         reader: R,
         central_start: u64,
     ) -> Self {
+        for (name, file) in &mut files {
+            file.overridden_header_name = None;
+            file.header_language_encoding = crate::format::flags::ZipFlags::matching(
+                file.flags(name),
+                crate::format::flags::ZipFlags::LanguageEncoding,
+            );
+        }
         let initial_offset = match files.first() {
             Some((_, file)) => file.header_start,
             None => central_start,
@@ -198,7 +221,10 @@ impl CentralDirectoryChains {
 impl<R: Read + Seek> ZipArchive<R> {
     /// Get the directory start offset and number of files. This is done in a
     /// separate function to ease the control flow design.
-    pub(crate) fn get_metadata(config: Config, reader: &mut R) -> ZipResult<ZipArchiveMetadata> {
+    pub(crate) fn get_metadata(
+        config: Config,
+        reader: &mut R,
+    ) -> ZipResult<ArchiveMetadataBuilder> {
         // End of the probed region, initially set to the end of the file
         let file_len = reader.seek(SeekFrom::End(0))?;
         let mut last_err = None;
@@ -246,9 +272,11 @@ impl<R: Read + Seek> ZipArchive<R> {
                     } else {
                         None
                     };
-                    return Ok(
-                        shared.build(cde.eocd.data.zip_file_comment, zip64_extensible_data_sector)
-                    );
+                    return Ok(ArchiveMetadataBuilder {
+                        shared,
+                        comment: cde.eocd.data.zip_file_comment,
+                        zip64_extensible_data_sector,
+                    });
                 }
                 Err(e) => {
                     // Other readers use a record whose CD ends at it, so don't fall back past it.
@@ -460,7 +488,7 @@ impl<R: Read + Seek> ZipArchive<R> {
     ///
     /// This uses the central directory record of the ZIP file, and ignores local file headers.
     pub fn with_config(config: Config, mut reader: R) -> ZipResult<ZipArchive<R>> {
-        let shared = Self::get_metadata(config, &mut reader)?;
+        let shared = Self::get_metadata(config, &mut reader)?.build();
 
         Ok(ZipArchive {
             reader,
@@ -551,6 +579,11 @@ impl<R: Read + Seek> ZipArchive<R> {
     }
 
     fn has_overlap(&mut self, include_header: bool) -> ZipResult<bool> {
+        let ranges = self.entry_byte_ranges(include_header)?;
+        Ok(Self::ranges_overlap(&ranges, self.shared.dir_start))
+    }
+
+    fn entry_byte_ranges(&mut self, include_header: bool) -> ZipResult<Vec<Range<u64>>> {
         let mut ranges = Vec::<Range<u64>>::with_capacity(self.shared.files.len());
         for file in self.shared.files.values() {
             if !include_header && file.compressed_size == 0 {
@@ -571,8 +604,71 @@ impl<R: Read + Seek> ZipArchive<R> {
             ranges.push(start..end);
         }
         ranges.sort_unstable_by_key(|r| (r.start, r.end));
-        let overlaps_central_directory = ranges.iter().any(|r| r.end > self.shared.dir_start);
-        Ok(overlaps_central_directory || ranges.windows(2).any(|w| w[0].end > w[1].start))
+        Ok(ranges)
+    }
+
+    fn ranges_overlap(ranges: &[Range<u64>], dir_start: u64) -> bool {
+        ranges.iter().any(|r| r.end > dir_start) || ranges.windows(2).any(|w| w[0].end > w[1].start)
+    }
+
+    fn unoccupied_ranges(ranges: &[Range<u64>], end: u64) -> Vec<Range<u64>> {
+        let mut unoccupied = Vec::new();
+        let mut cursor = 0;
+        for range in ranges {
+            let gap_end = range.start.min(end);
+            if cursor < gap_end {
+                unoccupied.push(cursor..gap_end);
+            }
+            cursor = cursor.max(range.end.min(end));
+            if cursor == end {
+                break;
+            }
+        }
+        if cursor < end {
+            unoccupied.push(cursor..end);
+        }
+        unoccupied
+    }
+
+    fn scan_for_unlisted_local_headers(&mut self, gaps: &[Range<u64>]) -> ZipResult<bool> {
+        const LOCAL_FILE_HEADER_SIGNATURE: [u8; size_of::<Magic>()] =
+            Magic::LOCAL_FILE_HEADER_SIGNATURE.to_le_bytes();
+
+        for gap in gaps {
+            let mut finder =
+                MagicFinder::<Forward<'_>>::new(&LOCAL_FILE_HEADER_SIGNATURE, gap.start, gap.end);
+            while let Some(offset) = finder.next(&mut self.reader)? {
+                if Self::is_valid_local_header_at(&mut self.reader, offset, gap.end)? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn is_valid_local_header_at<T: Read + Seek + ?Sized>(
+        reader: &mut T,
+        offset: u64,
+        range_end: u64,
+    ) -> ZipResult<bool> {
+        let fixed_header_end =
+            offset.checked_add((size_of::<Magic>() + size_of::<ZipLocalEntryBlock>()) as u64);
+        if fixed_header_end.is_none_or(|end| end > range_end) {
+            return Ok(false);
+        }
+        reader.seek(SeekFrom::Start(offset))?;
+        let block = match ZipLocalEntryBlock::parse(reader) {
+            Ok(block) => block,
+            Err(ZipError::Io(error)) if error.kind() != std::io::ErrorKind::UnexpectedEof => {
+                return Err(ZipError::Io(error));
+            }
+            Err(_) => return Ok(false),
+        };
+        let variable_fields_len =
+            u64::from(block.file_name_length) + u64::from(block.extra_field_length);
+        Ok(!fixed_header_end
+            .and_then(|end| end.checked_add(variable_fields_len))
+            .is_none_or(|end| end > range_end))
     }
 
     /// Search for a file entry by name, decrypt with given password
@@ -600,10 +696,22 @@ impl<R: Read + Seek> ZipArchive<R> {
         self.by_name_with_optional_password(name, None)
     }
 
+    /// Search for a file entry by its raw name bytes, without decoding the name.
+    /// The running time of this operation doesn't scale with the number of files in the archive,
+    /// only with the length of the name being looked up (since it is hashed).
+    pub fn by_name_raw(&mut self, name: &[u8]) -> ZipResult<ZipFile<'_, R>> {
+        let index = self
+            .index_for_name_raw(name)
+            .ok_or(ZipError::FileNotFound)?;
+        self.by_index_raw(index)
+    }
+
     /// Get the index of a file entry by name, if it's present.
     /// First try to get the index by the name as a binary representation of the name. If not found,
     /// try to find the name with the decoded version of the name. This is a fallback for name
     /// encoded with CP437.
+    /// If you don't need to use the fallback, consider using [`Self::index_for_name_raw`] which doesn't
+    /// have the fallback.
     #[inline]
     pub fn index_for_name(&self, name: &str) -> Option<usize> {
         self.shared.files.get_index_of(name.as_bytes()).or_else(|| {
@@ -612,6 +720,14 @@ impl<R: Read + Seek> ZipArchive<R> {
                 .iter()
                 .position(|(raw, data)| data.name(raw).is_ok_and(|decoded| decoded == name))
         })
+    }
+
+    /// Get the index of a file entry by the raw name, if it's present. The running time of this
+    /// operation doesn't scale with the number of files in the archive, only with the length of the
+    /// name being looked up (since it is hashed).
+    #[inline]
+    pub fn index_for_name_raw(&self, name: &[u8]) -> Option<usize> {
+        self.shared.files.get_index_of(name)
     }
 
     /// Get data and the data descriptor of the file
@@ -812,7 +928,8 @@ impl<R: Read + Seek> ZipArchive<R> {
         })
     }
 
-    /// Validates that all local file headers in the archive match their corresponding central directory headers.
+    /// Validates that local file headers match their corresponding central directory headers and
+    /// that no local file headers are missing from the central directory.
     pub fn validate_header_consistency(&mut self) -> ZipResult<()> {
         if self.shared.has_duplicate_names() {
             return Err(invalid!(
@@ -822,9 +939,16 @@ impl<R: Read + Seek> ZipArchive<R> {
         for (file_name_raw, data) in &self.shared.files {
             data.validate_header_consistency(&mut self.reader, file_name_raw)?;
         }
-        if self.has_overlapping_entries()? {
+        let ranges = self.entry_byte_ranges(true)?;
+        if Self::ranges_overlap(&ranges, self.shared.dir_start) {
             return Err(invalid!(
                 "header inconsistency detected: archive contains overlapping entries"
+            ));
+        }
+        let gaps = Self::unoccupied_ranges(&ranges, self.shared.dir_start);
+        if self.scan_for_unlisted_local_headers(&gaps)? {
+            return Err(invalid!(
+                "header inconsistency detected: local file header missing from central directory"
             ));
         }
         Ok(())
@@ -919,7 +1043,29 @@ mod tests {
     use crate::format::{MagicPositionCache, find_central_directory_end};
     use crate::read::ArchiveOffset;
     use crate::read::magic_finder::{Backwards, MagicFinder};
+    use crate::write::SimpleFileOptions;
+    use crate::{ZipArchive, ZipWriter};
     use std::io::{Cursor, Write};
+
+    #[test]
+    fn unlisted_local_header_with_malformed_extra_field_is_detected() {
+        let mut bytes = Magic::LOCAL_FILE_HEADER_SIGNATURE.to_le_bytes().to_vec();
+        let mut fixed_header = [0; 26];
+        fixed_header[22..24].copy_from_slice(&1u16.to_le_bytes());
+        fixed_header[24..26].copy_from_slice(&4u16.to_le_bytes());
+        bytes.extend_from_slice(&fixed_header);
+        bytes.extend_from_slice(b"x");
+        bytes.extend_from_slice(&[1, 0, 5, 0]);
+
+        assert!(
+            super::ZipArchive::<Cursor<Vec<u8>>>::is_valid_local_header_at(
+                &mut Cursor::new(bytes.clone()),
+                0,
+                bytes.len() as u64,
+            )
+            .unwrap()
+        );
+    }
 
     #[test]
     fn invalid_offset() {
@@ -1299,5 +1445,121 @@ mod tests {
         let info = result.unwrap();
         assert_eq!(info.archive_offset, archive_start);
         assert!(info.eocd64.is_none());
+    }
+
+    #[test]
+    fn test_unicode_path_components_and_ascii_extension_are_consistent() {
+        fn assert_unicode_path_consistency(main_name: &str, unicode_path: &str, expected: bool) {
+            let mut unicode_path_data = Vec::with_capacity(5 + unicode_path.len());
+            unicode_path_data.push(1u8);
+            unicode_path_data
+                .extend_from_slice(&crc32fast::hash(main_name.as_bytes()).to_le_bytes());
+            unicode_path_data.extend_from_slice(unicode_path.as_bytes());
+
+            let mut payload = Cursor::new(Vec::new());
+            let mut writer = ZipWriter::new(&mut payload);
+            let mut options = SimpleFileOptions::default().into_full_options();
+            options
+                .add_extra_field(0x7075, unicode_path_data, false)
+                .unwrap();
+            #[cfg(all(feature = "deflate-zopfli", not(feature = "deflate-flate2")))]
+            {
+                options = options.compression_method(crate::CompressionMethod::Stored);
+            }
+            writer.start_file(main_name, options).unwrap();
+            writer.write_all(b"payload").unwrap();
+            writer.finish().unwrap();
+            let archive_bytes = payload.into_inner();
+
+            let mut archive = ZipArchive::new(Cursor::new(&archive_bytes)).unwrap();
+            assert_eq!(
+                archive.validate_header_consistency().is_ok(),
+                expected,
+                "ZipArchive result for {main_name:?} -> {unicode_path:?}"
+            );
+
+            #[cfg(not(miri))]
+            {
+                use crate::read::stream::ZipStreamReader;
+                use tempfile::tempdir;
+                let destination = tempdir().unwrap();
+                let stream = ZipStreamReader::new(Cursor::new(&archive_bytes))
+                    .enforce_header_consistency(true);
+                let result = stream.extract(destination.path());
+                assert_eq!(
+                    result.is_ok(),
+                    expected,
+                    "ZipStreamReader result for {main_name:?} -> {unicode_path:?}: {result:?}"
+                );
+            }
+        }
+        assert_unicode_path_consistency("fallback.txt", "other.txt", false);
+        assert_unicode_path_consistency("a/../b.txt", "a/b.txt", false);
+        assert_unicode_path_consistency("café.bin", "café.txt", false);
+        assert_unicode_path_consistency("café.txt", "café", false);
+        assert_unicode_path_consistency("café.zip.gz", "café.tar.gz", false);
+        assert_unicode_path_consistency("cafe.zip.gz", "cafe.tar.gz", false);
+
+        // Non-ASCII names remain valid overrides when path structure and ASCII extension agree.
+        assert_unicode_path_consistency("cafe.txt", "café.txt", true);
+        assert_unicode_path_consistency("cafe.tar.gz", "café.tar.gz", true);
+        assert_unicode_path_consistency("cafe", "café", true);
+        assert_unicode_path_consistency("café.txt", "café.txt", true);
+        // A filename encoded as UTF-8 by EFS cannot be overridden by a different path.
+        assert_unicode_path_consistency("é/foo.txt", "e/foo.txt", false);
+
+        // Positive examples (German ß / ss transliteration and case insensitivity)
+        assert_unicode_path_consistency("strasse.txt", "straße.txt", true);
+        assert_unicode_path_consistency("STRASSE.TXT", "straße.txt", true);
+        assert_unicode_path_consistency("README.TXT", "readme.txt", true);
+
+        // Turkish I / İ / ı case conversions and Turkish diacritics
+        assert_unicode_path_consistency("ISTANBUL.TXT", "İstanbul.txt", true);
+        assert_unicode_path_consistency("istanbul.txt", "İstanbul.txt", true);
+        assert_unicode_path_consistency("DIYARBAKIR.TXT", "Diyarbakır.txt", true);
+        assert_unicode_path_consistency("ATATURK.TXT", "Atatürk.txt", true);
+        assert_unicode_path_consistency("ataturk.txt", "Atatürk.txt", true);
+        assert_unicode_path_consistency("TURKIYE.TXT", "Türkiye.txt", true);
+        assert_unicode_path_consistency("CANAKKALE.TXT", "Çanakkale.txt", true);
+
+        // DOS 8.3 aliases with tilde (LFN compatibility for 1990s tools)
+        assert_unicode_path_consistency("LONGFI~1.TXT", "LongFileName.txt", true);
+        assert_unicode_path_consistency("DOCUME~2.PDF", "DocumentSpecialReport.pdf", true);
+        assert_unicode_path_consistency("ISTANB~1.DOC", "İstanbulReport.doc", true);
+        assert_unicode_path_consistency("LONGFI~1.TXT", "malware.txt", false);
+        assert_unicode_path_consistency("LONGFI~1.EXE", "LongFileName.pdf", false);
+
+        // Non-ASCII extension with ASCII fallback
+        assert_unicode_path_consistency("document.doc", "document.дос", true);
+        assert_unicode_path_consistency("report.pdf", "report.рdf", true);
+
+        // Latin and Non-Latin alphabets
+        assert_unicode_path_consistency("arxeio.txt", "αρχείο.txt", true);
+        assert_unicode_path_consistency("document.txt", "документ.txt", true);
+
+        // Adversarial Cloaking Bypasses (Must be blocked):
+        assert_unicode_path_consistency("readme.txt", "malwaré.txt", false);
+        assert_unicode_path_consistency("readme.txt", "malware.ехе", false);
+        assert_unicode_path_consistency("cache/file.txt", "startup_é/file.txt", false);
+        assert_unicode_path_consistency("updater.exe", "trojan_é.exe", false);
+
+        // Valid multi-dot versioned archive:
+        assert_unicode_path_consistency(
+            "my.package.version.tar.gz",
+            "my.päckage.version.tar.gz",
+            true,
+        );
+
+        // Edge case bypasses:
+        // 1. Right-to-Left Override (RLO) spoofing:
+        assert_unicode_path_consistency("file.txt", "file\u{202E}txt.exe", false);
+        // 2. Fullwidth dot homoglyph:
+        assert_unicode_path_consistency("malware", "malware\u{FF0E}exe", false);
+        // 3. Trailing dot / space divergence (Windows Win32 stripping evasion):
+        assert_unicode_path_consistency("file.txt", "file.txt.", false);
+        assert_unicode_path_consistency("file.txt", "file.txt ", false);
+        // 4. Directory trailing slash mismatch:
+        assert_unicode_path_consistency("folder/", "folder", false);
+        assert_unicode_path_consistency("folder", "folder/", false);
     }
 }
