@@ -301,7 +301,7 @@ transient_push_failure() {
 }
 
 transient_snapshot_failure() {
-    if grep -qE 'Failed to fetch http://snapshot\.debian\.org|Some index files failed to download|Unable to fetch some archives' "$push_attempt_log"; then
+    if grep -qE 'Failed to fetch https?://snapshot\.debian\.org|Some index files failed to download|Unable to fetch some archives' "$push_attempt_log"; then
         return 0
     fi
     if grep -qE "Temporary failure resolving 'snapshot\.debian\.org'|Could not connect to snapshot\.debian\.org" "$push_attempt_log"; then
