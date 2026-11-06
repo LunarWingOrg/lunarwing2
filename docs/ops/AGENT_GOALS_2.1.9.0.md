@@ -50,7 +50,11 @@
 
 7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/539
 8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/383
-9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/314
+9. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/314
+   - DONE (SweetieBot): `ic/channels-src/multica/src/lib.rs` now deserializes `multica_url` and `workspace_id` through field-specific required-string validators. Manifest `null` placeholders and blank strings fail with `invalid multica config: <field> is not configured` instead of an anonymous JSON type/position error; complete configurations retain their values and defaults.
+   - Added three regression tests covering null required fields, blank required fields, and a complete valid configuration. Against the unfixed parser, the null test reproduced `invalid multica config: invalid type: null, expected a string at line 1 column 19`; after the fix, `taskset -c 0-17 cargo test --locked --manifest-path channels-src/multica/Cargo.toml -j18` passed 3/3. `taskset -c 0-17 cargo clippy --locked --manifest-path channels-src/multica/Cargo.toml -j18 --all-targets -- -D warnings` passed after mechanical cleanup of the touched file's seven pre-existing lint warnings.
+   - Updated `docs/guides/MULTICA_DEPLOYMENT.md` with the startup validation contract and named-field troubleshooting. Implementation, lint cleanup, and docs commits: `3aa51dd92`, `06500c0bf`, and `074090bce`.
+   - Verification limitation: the `wasm32-wasip2` compile check could not run because that target is absent and this host has no `rustup` executable on PATH. Native targeted tests, formatting, and zero-warning clippy passed; no live Multica runtime test was attempted.
 10. [ ] create draft for release notes at base of root
 
 ## Phase 7 - Advanced Operator Notes
