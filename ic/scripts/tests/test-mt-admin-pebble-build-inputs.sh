@@ -167,4 +167,62 @@ grep -Fq 'worker_paths+=(pebble4lunarwing)' "$BUILD_LIB" \
 grep -Fq 'local smoke_script="${LUNARWING_PEBBLE_TOOLCHAIN_SMOKE:-$LUNARWING_ROOT/pebble4lunarwing/scripts/smoke-task-shell-toolchain.sh}"' "$BUILD_LIB" \
   || fail 'tenant fat builds can execute the smoke helper from the tenant checkout'
 
-printf 'PASS: Pebble builds use the reviewed lock pin, clean tenant sources, and the operator smoke helper (WI#507)\n'
+# WI#540: select the source owner before any git invocation. A permissive root
+# safe.directory must never turn the revision probe into root execution of
+# tenant repository configuration.
+worker_source_git_def="$(awk '/^_worker_source_git\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' "$BUILD_LIB")"
+[[ "$worker_source_git_def" == *'owner="$(stat -c %U "$root" 2>/dev/null)" || return 1'* ]] \
+  || fail 'worker source git does not resolve the source owner'
+[[ "$worker_source_git_def" == *'caller="$(id -un)" || return 1'* ]] \
+  || fail 'worker source git does not resolve the caller'
+[[ "$worker_source_git_def" == *'if [[ "$owner" != "$caller" ]]; then'* ]] \
+  || fail 'worker source git does not compare ownership'
+[[ "$worker_source_git_def" == *'sudo -u "$owner" git -c safe.directory="$root" -C "$root" "$@"'* ]] \
+  || fail 'worker source git owner path lacks its explicit safe.directory'
+(
+  caller_git_marker="$fixture_dir/caller-git-invoked"
+  rm -f "$caller_git_marker"
+  # Function mocks work on noexec temporary filesystems; mock exec as well so
+  # the helper's production `exec sudo` shape reaches the sudo function.
+  exec() { "$@"; }
+  stat() { printf 'tenant\n'; }
+  id() {
+    [[ "${1:-}" == '-un' ]] || return 64
+    printf 'root\n'
+  }
+  git() {
+    : >"$caller_git_marker"
+    return 64
+  }
+  sudo() {
+    [[ "${1:-}" == '-u' && "${2:-}" == 'tenant' ]] || return 64
+    shift 2
+    [[ "${1:-}" == 'git' && "${2:-}" == '-c' && "${3:-}" == "safe.directory=$tenant_root" ]] \
+      || return 64
+    [[ "${4:-}" == '-C' && "${5:-}" == "$tenant_root" ]] || return 64
+    [[ "${6:-}" == 'rev-parse' && "${7:-}" == '--verify' && "${8:-}" == 'HEAD' && $# -eq 8 ]] \
+      || return 64
+    command "$@"
+  }
+  foreign_head="$(_worker_source_git "$tenant_root" rev-parse --verify HEAD)" \
+    || fail 'worker source git failed for a foreign-owned checkout'
+  [[ ! -e "$caller_git_marker" ]] \
+    || fail 'worker source git invoked git as the caller before checking ownership'
+  [[ "$foreign_head" == "$tenant_head" ]] \
+    || fail 'worker source git returned the wrong foreign-owned revision'
+)
+(
+  stat() { printf 'caller\n'; }
+  id() {
+    [[ "${1:-}" == '-un' ]] || return 64
+    printf 'caller\n'
+  }
+  sudo() { return 64; }
+  operator_head="$(command git -C "$operator_root" rev-parse --verify HEAD)"
+  direct_head="$(_worker_source_git "$operator_root" rev-parse --verify HEAD)" \
+    || fail 'worker source git failed for a caller-owned checkout'
+  [[ "$direct_head" == "$operator_head" ]] \
+    || fail 'worker source git changed the caller-owned revision result'
+)
+
+printf 'PASS: Pebble build inputs and owner-safe worker source git (WI#507, WI#540)\n'
