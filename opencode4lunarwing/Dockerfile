@@ -12,7 +12,7 @@
 # gone.
 ARG OPENCODE_VERSION=v1.19.5
 ARG OPENCODE_REF=810c0eba1a7348036f8bdf61e6632d0c36c6876c
-ARG DEBIAN_SNAPSHOT=20261024T011300Z
+ARG DEBIAN_SNAPSHOT=20261105T082236Z
 # WI#467: sha256 of the committed models.dev snapshot (models-dev/api.json)
 # the upstream build compiles into the binary instead of fetching live.
 # Refresh the file and this pin together in one deliberate commit (see the
@@ -36,16 +36,22 @@ ARG DEBIAN_SNAPSHOT
 ARG MODELS_DEV_SNAPSHOT_SHA256
 WORKDIR /build
 
+COPY --from=docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
 RUN set -eu; \
+    test -s /etc/ssl/certs/ca-certificates.crt; \
     rm -f /etc/apt/sources.list.d/debian.sources; \
     printf '%s\n' \
-      "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie main" \
-      "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie-updates main" \
-      "deb http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ trixie-security main" \
+      "deb https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie main" \
+      "deb https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie-updates main" \
+      "deb https://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ trixie-security main" \
       > /etc/apt/sources.list; \
-    timeout -k 30 240 apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update; \
-    timeout -k 30 600 apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install -y --no-install-recommends \
+    timeout -k 30 240 apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=0 -o Acquire::https::Timeout=60 --error-on=any update; \
+    timeout -k 30 600 apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=60 install -y --no-install-recommends apt; \
+    dpkg --compare-versions "$(dpkg-query -W -f='${Version}' apt)" ge 3.0.4; \
+    timeout -k 30 600 apt-get -o Acquire::Retries=3 -o Acquire::https::Timeout=60 install -y --no-install-recommends \
       git python3 make g++ ca-certificates; \
+    update-ca-certificates; \
     rm -rf /var/lib/apt/lists/* \
       /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache
 
@@ -142,15 +148,20 @@ LABEL org.opencontainers.image.title="LunarWing OpenCode Worker" \
       org.opencontainers.image.revision="${SOURCE_REVISION}" \
       org.opencontainers.image.toolchain-profile="${WITH_TOOLCHAINS}"
 
+COPY --from=docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
 RUN set -eu; \
+    test -s /etc/ssl/certs/ca-certificates.crt; \
     rm -f /etc/apt/sources.list.d/debian.sources; \
     printf '%s\n' \
-      "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie main" \
-      "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie-updates main" \
-      "deb http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ trixie-security main" \
+      "deb https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie main" \
+      "deb https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie-updates main" \
+      "deb https://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ trixie-security main" \
       > /etc/apt/sources.list; \
-    timeout -k 30 240 apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update; \
-    timeout -k 30 600 apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install -y --no-install-recommends \
+    timeout -k 30 240 apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=0 -o Acquire::https::Timeout=60 --error-on=any update; \
+    timeout -k 30 600 apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=60 install -y --no-install-recommends apt; \
+    dpkg --compare-versions "$(dpkg-query -W -f='${Version}' apt)" ge 3.0.4; \
+    timeout -k 30 600 apt-get -o Acquire::Retries=3 -o Acquire::https::Timeout=60 install -y --no-install-recommends \
       tini \
       python3 \
       python3-pip \
@@ -163,14 +174,15 @@ RUN set -eu; \
       openssh-client \
       jq \
       neovim; \
+    update-ca-certificates; \
     rm -rf /var/lib/apt/lists/* \
       /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache
 
 # Toolchain packages: only when WITH_TOOLCHAINS=true.
 RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
       set -eu; \
-      timeout -k 30 240 apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update; \
-      timeout -k 30 1800 apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install -y --no-install-recommends \
+      timeout -k 30 240 apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=3 -o Acquire::https::Timeout=60 --error-on=any update; \
+      timeout -k 30 1800 apt-get -o Acquire::Retries=3 -o Acquire::https::Timeout=60 install -y --no-install-recommends \
         python3-dev \
         build-essential \
         gcc \

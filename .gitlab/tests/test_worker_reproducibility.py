@@ -106,11 +106,11 @@ class WorkerReproducibilityTests(unittest.TestCase):
                     self.assertEqual(result.stdout, "")
             self.assertNotEqual(self.shadow_check(lane, account, 0, None).returncode, 0)
 
-    def test_all_worker_snapshots_match_ci_and_include_the_brotli_fix(self):
+    def test_all_worker_snapshots_match_ci_and_include_security_fixes(self):
         defaults = yaml.safe_load((ROOT / ".gitlab/ci/defaults.yml").read_text())
         snapshot = defaults["variables"]["CI_DEBIAN_SNAPSHOT"]
         self.assertRegex(snapshot, r"^\d{8}T\d{6}Z$")
-        self.assertGreaterEqual(snapshot, "20261024T011300Z")
+        self.assertGreaterEqual(snapshot, "20261105T082236Z")
         for lane in WORKERS:
             with self.subTest(lane=lane):
                 pins = re.findall(
@@ -119,6 +119,47 @@ class WorkerReproducibilityTests(unittest.TestCase):
                     flags=re.MULTILINE,
                 )
                 self.assertEqual(pins, [snapshot])
+
+    def test_worker_apt_bootstraps_fixed_client_before_retrying(self):
+        for lane in WORKERS:
+            with self.subTest(lane=lane):
+                text = (ROOT / lane / "Dockerfile").read_text()
+                sources = re.findall(r'"deb (https?)://snapshot\.debian\.org/', text)
+                self.assertEqual(len(sources), 6)
+                self.assertEqual(set(sources), {"https"})
+                self.assertNotIn('"deb http://', text)
+                apt_lines = [
+                    line for line in text.splitlines()
+                    if "apt-get" in line and not line.lstrip().startswith("#")
+                ]
+                self.assertEqual(len(apt_lines), 8)
+                for line in apt_lines:
+                    self.assertIn("Acquire::https::Timeout=60", line)
+                retries = re.findall(r"Acquire::Retries=(\d+)", text)
+                self.assertEqual(retries.count("0"), 4)
+                self.assertEqual(retries.count("3"), 4)
+                self.assertEqual(len(retries), 8)
+                updates = [line for line in apt_lines if " update" in line]
+                self.assertEqual(len(updates), 3)
+                for line in updates:
+                    self.assertIn("--error-on=any", line)
+                bootstrap = [
+                    line for line in apt_lines
+                    if " install" in line and "Acquire::Retries=0" in line
+                ]
+                self.assertEqual(len(bootstrap), 2)
+                for line in bootstrap:
+                    self.assertIn("--no-install-recommends apt;", line)
+                expected = "3.0.4" if lane.startswith("opencode") else "2.6.2"
+                assertion = (
+                    'dpkg --compare-versions "$(dpkg-query -W -f=\'${Version}\' apt)" '
+                    f"ge {expected};"
+                )
+                self.assertEqual(text.count(assertion), 2)
+                self.assertEqual(text.count("update-ca-certificates;"), 2)
+                self.assertNotIn("AS certificates", text)
+                certificate_copy = "COPY --from=docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"
+                self.assertEqual(text.count(certificate_copy), 2)
 
 
 if __name__ == "__main__":

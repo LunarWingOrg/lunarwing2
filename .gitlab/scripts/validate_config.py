@@ -1313,9 +1313,11 @@ WORKER_TS_LANE_SCRIPTS = {
     "worker-kimi-ts": (
         "$CI_NODE_IMAGE",
         (
+            "mkdir -p /etc/ssl/certs",
+            "node -e 'require(\"fs\").writeFileSync(\"/etc/ssl/certs/ca-certificates.crt\", require(\"tls\").rootCertificates.join(\"\\n\") + \"\\n\")'",
             "rm -f /etc/apt/sources.list.d/debian.sources",
-            "printf '%s\\n' \"deb http://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm main\" \"deb http://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm-updates main\" \"deb http://snapshot.debian.org/archive/debian-security/${CI_DEBIAN_SNAPSHOT}/ bookworm-security main\" > /etc/apt/sources.list",
-            "sh .gitlab/scripts/ci-apt-with-retry.sh python3",
+            "printf '%s\\n' \"deb https://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm main\" \"deb https://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm-updates main\" \"deb https://snapshot.debian.org/archive/debian-security/${CI_DEBIAN_SNAPSHOT}/ bookworm-security main\" > /etc/apt/sources.list",
+            "sh .gitlab/scripts/ci-apt-with-retry.sh ca-certificates python3",
             "cd kimicode4lunarwing/scripts",
             "npm ci --ignore-scripts",
             "npx tsc -p tsconfig.json",
@@ -2694,9 +2696,9 @@ def validate_worker_snapshots(variables: dict[str, str], errors: list[str]) -> N
     if not re.fullmatch(r"\d{8}T\d{6}Z", snapshot):
         errors.append("CI_DEBIAN_SNAPSHOT must be a snapshot timestamp")
         return
-    minimum_snapshot = "20261024T011300Z"
+    minimum_snapshot = "20261105T082236Z"
     if snapshot < minimum_snapshot:
-        errors.append("CI_DEBIAN_SNAPSHOT predates the CVE-2026-111497 Brotli fixes")
+        errors.append("CI_DEBIAN_SNAPSHOT predates the CVE-2026-109518 APT fixes")
     for dockerfile in (
         KIMI_DOCKERFILE, PEBBLE_DOCKERFILE, OPENCODE_DOCKERFILE, OPENCODE2_DOCKERFILE,
     ):
@@ -2717,7 +2719,7 @@ def validate_worker_snapshots(variables: dict[str, str], errors: list[str]) -> N
             for value in normalized
         ):
             errors.append(
-                f"{dockerfile} ARG DEBIAN_SNAPSHOT predates the CVE-2026-111497 Brotli fixes"
+                f"{dockerfile} ARG DEBIAN_SNAPSHOT predates the CVE-2026-109518 APT fixes"
             )
 
 
@@ -2771,9 +2773,9 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
     # the token inside a snapshot URL (an ENV after the ARG wins over it, a
     # RUN-level shell assignment re-points the RUN's URLs, a multi-name ARG
     # hides from the valued-ARG match, and shell substitution is not a
-    # literal reference), and every apt `deb` source line must point at
-    # snapshot.debian.org, so a builder moved back to the live mirror is
-    # caught too. The host match is case-insensitive in both rules.
+    # literal reference), and every apt `deb` source line must use HTTPS at
+    # snapshot.debian.org, so a builder moved back to the live mirror or plain
+    # HTTP is caught too. The host match is case-insensitive in both rules.
     snapshot = variables.get("CI_DEBIAN_SNAPSHOT", "")
     if not re.fullmatch(r"\d{8}T\d{6}Z", snapshot):
         errors.append(
@@ -2855,7 +2857,7 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
         )
         deb822_uris = re.compile(f"{boundary}URIs:([^{quotes}]*)", re.IGNORECASE)
         snapshot_uri = re.compile(
-            f"https?://snapshot{bs}.debian{bs}.org/archive/", re.IGNORECASE
+            f"https://snapshot{bs}.debian{bs}.org/archive/", re.IGNORECASE
         )
 
         def live_sources(line: str) -> list[str]:
@@ -2870,7 +2872,7 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
         ]
         if non_snapshot_sources:
             errors.append(
-                "kimicode4lunarwing/Dockerfile apt deb sources must use "
+                "kimicode4lunarwing/Dockerfile apt deb sources must use HTTPS "
                 f"snapshot.debian.org: {non_snapshot_sources}"
             )
 

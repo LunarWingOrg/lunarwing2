@@ -75,8 +75,7 @@ if mode == "fail_always" or (mode == "fail_once" and count == 1):
     sys.exit(1)
 if mode == "fail_snapshot_always" or (mode == "fail_snapshot_once" and count == 1):
     print("#12 [builder 3/13] RUN apt-get update && apt-get install", file=sys.stderr)
-    print("W: Tried to start delayed item http://snapshot.debian.org/archive/debian/20261024T011300Z but failed", file=sys.stderr)
-    print("E: Unable to fetch some archives, maybe run apt-get update or try with --fix-missing?", file=sys.stderr)
+    print("E: Failed to fetch https://snapshot.debian.org/archive/debian/20261024T011300Z/pool/example.deb  504  Gateway Timeout", file=sys.stderr)
     sys.exit(1)
 if mode == "fail_snapshot_killed_once" and count == 1:
     print("#12 [runtime 2/17] RUN apt-get update", file=sys.stderr)
@@ -342,10 +341,14 @@ for index, argument in enumerate(args):
                     for line in lines
                     if "apt-get" in line and not line.lstrip().startswith("#")
                 ]
-                self.assertEqual(len(apt_lines), 6)
+                self.assertEqual(len(apt_lines), 8)
                 for line in apt_lines:
+                    self.assertIn("Acquire::https::Timeout=60", line)
                     if " update" in line:
                         self.assertIn("timeout -k 30 240 apt-get -o ", line)
+                        self.assertIn("--error-on=any", line)
+                        expected_retries = 3 if line.startswith("      ") else 0
+                        self.assertIn(f"Acquire::Retries={expected_retries}", line)
                     elif " install" in line:
                         # Base and runtime installs keep the 600 s limit; the
                         # WITH_TOOLCHAINS install (six-space continuation) gets
@@ -354,6 +357,10 @@ for index, argument in enumerate(args):
                             self.assertIn("timeout -k 30 1800 apt-get -o ", line)
                         else:
                             self.assertIn("timeout -k 30 600 apt-get -o ", line)
+                        if "Acquire::Retries=0" in line:
+                            self.assertIn("--no-install-recommends apt;", line)
+                        else:
+                            self.assertIn("Acquire::Retries=3", line)
                     else:
                         self.fail(f"unrecognized apt command in {lane}: {line}")
 
