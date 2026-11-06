@@ -89,7 +89,6 @@
 ## Phase 3 — Carried Known-Issues from RELEASE-v2.1.3.0.md (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
 
 4. [ ] Fix any issues in CI/CD (if any) - See Pipeline for LATEST MASTER pipeline (you can use gitlab mcp) and see if anything is not GREEN. If there are problems, fix them - always check last dozen or so Work Items for TIPS as to why master pipelines are actually red. Kageho is watching and posting WIs with explanations now usually (fairly frequently)
-    - **TRIAGE 2026-11-05 (Rarity, item-4, branch `rarity/kimi-4-20261105-2031`):** latest master pipeline **7240** (`881fdfbe9`) is running. Blocking `wasm-channel-test-artifacts` job 159085 failed with `No space left on device`; unchanged retry 159218 passed on the same runner after its available space recovered. `worker-opencode2-candidate` job 159106 likewise failed with `ENOSPC` on the same runner system, and scan 159107 was only the documented missing-`worker-image.env` knock-on. Retry 159220 cleared the install/build failure and is using the existing bounded registry-429 retry ladder. Recent WI#557–WI#560 fixes are present and their lanes are green; WI#561 is an open security-hardening stub, not an acceptance spec for this pipeline repair. No source defect has been identified; awaiting the remaining jobs before checkoff.
 5. [x] (S) (H MR) release alpha of droid and desk repo projs LATER near end of dev cycle
 6. [x] (S) (H MR) prob rm opencode v1 in .1.7.0 and add lunardepth in .1.8.0
 
