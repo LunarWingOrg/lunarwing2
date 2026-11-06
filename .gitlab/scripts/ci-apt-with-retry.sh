@@ -18,11 +18,20 @@ transient_snapshot_failure() {
         grep -qE "Temporary failure resolving 'snapshot\.debian\.org'|Could not connect to snapshot\.debian\.org" "$attempt_log"
 }
 
+# The base image's apt fetches only apt itself with automatic retries disabled.
+# Both installs share install_timeout, preserving the existing ladder budget.
+# Once the fixed client is verified, it installs the requested packages with
+# bounded retries; an unreachable index fails the attempt instead of passing
+# silently with stale or missing security metadata.
 while [ "$attempt" -le "$max_attempts" ]; do
     : > "$attempt_rc"
-    { timeout -k 30 "$update_timeout" apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=0 -o Acquire::https::Timeout=60 update &&
-        timeout -k 30 "$install_timeout" apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=60 install -y --no-install-recommends "$@" &&
-        test "$(dpkg-query -W -f='${Version}' apt)" = "2.6.2" ||
+    { timeout -k 30 "$update_timeout" apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=0 -o Acquire::https::Timeout=60 --error-on=any update &&
+        timeout -k 30 "$install_timeout" sh -u -c '
+            apt-get -o Acquire::Retries=0 -o Acquire::https::Timeout=60 install -y --no-install-recommends apt &&
+            dpkg --compare-versions "$(dpkg-query -W -f="\${Version}" apt)" ge 2.6.2 &&
+            apt-get -o Acquire::Retries=3 -o Acquire::https::Timeout=60 install -y --no-install-recommends "$@" &&
+            update-ca-certificates
+        ' sh "$@" ||
         printf '%s\n' "$?" > "$attempt_rc"; } 2>&1 | tee "$attempt_log"
     if [ ! -s "$attempt_rc" ]; then
         cleanup_attempt_files

@@ -1317,7 +1317,7 @@ WORKER_TS_LANE_SCRIPTS = {
             "node -e 'require(\"fs\").writeFileSync(\"/etc/ssl/certs/ca-certificates.crt\", require(\"tls\").rootCertificates.join(\"\\n\") + \"\\n\")'",
             "rm -f /etc/apt/sources.list.d/debian.sources",
             "printf '%s\\n' \"deb https://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm main\" \"deb https://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm-updates main\" \"deb https://snapshot.debian.org/archive/debian-security/${CI_DEBIAN_SNAPSHOT}/ bookworm-security main\" > /etc/apt/sources.list",
-            "sh .gitlab/scripts/ci-apt-with-retry.sh apt python3",
+            "sh .gitlab/scripts/ci-apt-with-retry.sh ca-certificates python3",
             "cd kimicode4lunarwing/scripts",
             "npm ci --ignore-scripts",
             "npx tsc -p tsconfig.json",

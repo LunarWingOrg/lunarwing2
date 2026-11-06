@@ -124,16 +124,17 @@ worker-kimi-ts:
     # Install it from the pinned CI_DEBIAN_SNAPSHOT archive (tied to the
     # Dockerfile ARG DEBIAN_SNAPSHOT), mirroring the builder stage's apt
     # source setup — not from the live deb.debian.org mirror (GV-4).
-    # HTTPS protects the archive transport. Internal apt retries are disabled
-    # (CVE-2026-109518); the helper instead bounds update/install at 240/600
-    # seconds and gives classified failures and timeout exit 124 a three-attempt
-    # ladder (120/300-second delays plus job-id jitter), below the 1 h runner cap.
-    # Permanent package failures still exit on the first attempt.
+    # HTTPS protects the archive transport. The old client installs only apt
+    # with retries disabled (CVE-2026-109518); the verified fixed client installs
+    # the remaining packages with bounded retries. The helper bounds update and
+    # both installs at 240/600 seconds and gives classified failures and timeout
+    # exit 124 a three-attempt ladder (120/300-second delays plus job-id jitter),
+    # below the 1 h runner cap. Permanent package failures exit on the first attempt.
     - mkdir -p /etc/ssl/certs
     - node -e 'require("fs").writeFileSync("/etc/ssl/certs/ca-certificates.crt", require("tls").rootCertificates.join("\n") + "\n")'
     - rm -f /etc/apt/sources.list.d/debian.sources
     - printf '%s\n' "deb https://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm main" "deb https://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm-updates main" "deb https://snapshot.debian.org/archive/debian-security/${CI_DEBIAN_SNAPSHOT}/ bookworm-security main" > /etc/apt/sources.list
-    - sh .gitlab/scripts/ci-apt-with-retry.sh apt python3
+    - sh .gitlab/scripts/ci-apt-with-retry.sh ca-certificates python3
     - cd kimicode4lunarwing/scripts
     - npm ci --ignore-scripts
     - npx tsc -p tsconfig.json
