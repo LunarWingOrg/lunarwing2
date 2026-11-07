@@ -50,6 +50,12 @@ pub struct ReplCommand {
     pub socket: Option<PathBuf>,
 }
 
+fn socket_owner_ok(metadata: &std::fs::Metadata, expected_uid: u32) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    metadata.file_type().is_socket() && metadata.uid() == expected_uid
+}
+
 impl ReplCommand {
     pub async fn run(&self) -> anyhow::Result<()> {
         let socket_path = self.socket.clone().unwrap_or_else(|| {
@@ -63,6 +69,20 @@ impl ReplCommand {
                 crate::bootstrap::lunarwing_base_dir().join("lunarwing.sock")
             }
         });
+
+        let expected_uid = nix::unistd::geteuid().as_raw();
+        let metadata = std::fs::symlink_metadata(&socket_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to inspect LunarWing REPL socket {}: {e}",
+                socket_path.display()
+            )
+        })?;
+        if !socket_owner_ok(&metadata, expected_uid) {
+            anyhow::bail!(
+                "Refusing LunarWing REPL socket {}: expected a non-symlink socket owned by uid {expected_uid}",
+                socket_path.display()
+            );
+        }
 
         let stream = UnixStream::connect(&socket_path).await.map_err(|e| {
             anyhow::anyhow!(
@@ -175,4 +195,41 @@ async fn read_message(
     }
     let msg = serde_json::from_str(&buf)?;
     Ok(msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v1_encodings_match_golden_fixtures() {
+        const FRAMES: &str =
+            include_str!("../../crates/lunarwing_common/tests/fixtures/replv3/v1_frames.ndjson");
+
+        for line in FRAMES.lines() {
+            let frame: ReplMessage = serde_json::from_str(line).expect("golden v1 frame");
+            assert_eq!(serde_json::to_string(&frame).expect("v1 encoding"), line);
+        }
+    }
+
+    #[test]
+    fn socket_owner_check_refuses_foreign_uid_and_symlink() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket = temp.path().join("repl.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("socket");
+        let expected_uid = nix::unistd::geteuid().as_raw();
+        let metadata = std::fs::symlink_metadata(&socket).expect("socket metadata");
+        assert!(socket_owner_ok(&metadata, expected_uid));
+        assert!(!socket_owner_ok(&metadata, expected_uid.wrapping_add(1)));
+
+        let link = temp.path().join("repl-link.sock");
+        std::os::unix::fs::symlink(&socket, &link).expect("socket symlink");
+        let metadata = std::fs::symlink_metadata(&link).expect("symlink metadata");
+        assert!(!socket_owner_ok(&metadata, expected_uid));
+
+        let regular = temp.path().join("regular.sock");
+        std::fs::write(&regular, b"not a socket").expect("regular file");
+        let metadata = std::fs::symlink_metadata(&regular).expect("regular metadata");
+        assert!(!socket_owner_ok(&metadata, expected_uid));
+    }
 }
