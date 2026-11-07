@@ -692,7 +692,7 @@ mod tests {
         assert_eq!(cheap.plain_calls(), 1);
         assert_eq!(primary.plain_calls(), 0);
         assert_eq!(fallback.plain_calls(), 0);
-        assert_eq!(cache.len(), 1);
+        assert!(cache.is_empty());
     }
 
     #[tokio::test]
