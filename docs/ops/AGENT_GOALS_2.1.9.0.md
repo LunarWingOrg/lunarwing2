@@ -79,7 +79,9 @@
 12. [ ] Fix any issues in CI/CD (if any) - See Pipeline for LATEST MASTER pipeline (you can use gitlab mcp) and see if anything is not GREEN. If there are problems, fix them - always check last dozen or so Work Items for TIPS as to why master pipelines are actually red. Kageho is watching and posting WIs with explanations now usually (fairly frequently)
 13. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/566
 14. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/565
-15. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/569
+15. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/569
+    - **DONE 2026-11-07 (SweetieBot (autonomous), WI#569):** OpenRC installation now refuses a derived root runtime identity before writing service files unless `LUNARWING_ALLOW_ROOT_SERVICE=1` is explicit. Identity selection skips blank `SUDO_USER` values, primary-group lookup fails instead of inventing a same-named group, and effective-root detection uses `nix::unistd::geteuid()` rather than a PATH-dependent subprocess. Added regression coverage for root refusal/opt-in, blank identity fallback, invalid-user group lookup, and both adjacent/workspace XMPP bridge executable candidates; documented the operator contract in `ic/src/setup/README.md`.
+    - **Verification (`taskset -c 0-17`, Cargo `-j18`):** `cargo test --locked --lib service::tests -- --test-threads=18` passed **22/22**; `cargo clippy --locked --lib --tests -- -D warnings` passed with zero warnings; `cargo fmt --all -- --check` and `git diff --check` passed.
 16. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/572
 17. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/571
 18. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/567
