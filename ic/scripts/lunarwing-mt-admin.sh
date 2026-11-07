@@ -392,6 +392,7 @@ Commands:
                                    candidate tags without stopping the tenant
     --enabled                      Build every lane the tenant has enabled
     --with-pebble --with-opencode --with-kimi --with-opencode2
+    --target <ref>                 Operator release ref for source provenance
 
   last-build-stage <name>          Print the last completed build stage
                                    (daemon|bridge|wasm|none, or unknown when the
