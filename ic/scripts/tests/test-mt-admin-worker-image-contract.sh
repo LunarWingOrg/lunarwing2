@@ -594,12 +594,12 @@ mkdir -p "$fixture/nogit/kimicode4lunarwing"
 assert_eq "$(GIT_CEILING_DIRECTORIES="$fixture" _worker_source_revision "$fixture/nogit" kimicode4lunarwing)" \
   "unknown" 'non-git root reports unknown'
 
-# The retry-as-owner path needs root and another account; pin its presence.
+# The foreign-owner path needs root and another account; pin its presence.
 # shellcheck disable=SC2016  # literal source text, not an expansion
-if [[ "$(declare -f _worker_source_git)" == *'sudo -u "$owner" git -C "$root"'* ]]; then
-  pass 'source lookup retries as the checkout owner when root is refused'
+if [[ "$(declare -f _worker_source_git)" == *'sudo -u "$owner" git -c safe.directory="$root" -C "$root"'* ]]; then
+  pass 'source lookup runs as the checkout owner when the caller does not own it'
 else
-  fail 'source lookup retries as the checkout owner when root is refused'
+  fail 'source lookup runs as the checkout owner when the caller does not own it'
 fi
 
 fake_worker_runtime() {

@@ -1,8 +1,9 @@
 //! In-memory LLM response cache with TTL and LRU eviction.
 //!
 //! Wraps any [`LlmProvider`] and caches [`complete()`] responses keyed
-//! by a SHA-256 hash of the messages and model name. Tool-calling
-//! requests are never cached since they can trigger side effects.
+//! by a SHA-256 hash of the messages and model name. Tool-calling requests
+//! and providers that select a model during dispatch are never cached: tool
+//! calls can have side effects, and dynamic routing has no safe pre-dispatch key.
 //!
 //! ```text
 //! ┌──────────────────────────────────────────────────┐
@@ -29,7 +30,7 @@ use sha2::{Digest, Sha256};
 use crate::llm::error::LlmError;
 use crate::llm::provider::{
     CompletionRequest, CompletionResponse, FinishReason, LlmProvider, LlmStream, LlmStreamChunk,
-    ModelMetadata, TokenUsage, ToolCompletionRequest, ToolCompletionResponse,
+    LlmStreamObservation, ModelMetadata, TokenUsage, ToolCompletionRequest, ToolCompletionResponse,
 };
 
 /// How often (in requests) to emit a cache statistics log line.
@@ -53,8 +54,20 @@ impl Default for ResponseCacheConfig {
     }
 }
 
+#[derive(Clone)]
+struct StreamCacheMetadata {
+    finish_reason: String,
+    observations: Vec<LlmStreamObservation>,
+}
+
+struct CacheHit {
+    response: CompletionResponse,
+    stream_metadata: Option<StreamCacheMetadata>,
+}
+
 struct CacheEntry {
     response: CompletionResponse,
+    stream_metadata: Option<StreamCacheMetadata>,
     created_at: Instant,
     last_accessed: Instant,
     hit_count: u64,
@@ -134,26 +147,36 @@ impl CachedProvider {
         }
     }
 
-    fn lookup(&self, key: &str, now: Instant, request_number: u64) -> Option<CompletionResponse> {
+    fn lookup(&self, key: &str, now: Instant, request_number: u64) -> Option<CacheHit> {
         let mut guard = self.cache.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(entry) = guard.get_mut(key) {
             if now.duration_since(entry.created_at) < self.config.ttl {
                 entry.last_accessed = now;
                 entry.hit_count += 1;
                 let hit_count = entry.hit_count;
-                let response = entry.response.clone();
+                let hit = CacheHit {
+                    response: entry.response.clone(),
+                    stream_metadata: entry.stream_metadata.clone(),
+                };
                 tracing::trace!(hits = hit_count, "response cache hit");
                 let _ = entry;
                 let total_hits = self.total_hit_count.fetch_add(1, Ordering::Relaxed) + 1;
                 Self::maybe_log_stats(&guard, request_number, total_hits);
-                return Some(response);
+                return Some(hit);
             }
             guard.remove(key);
         }
         None
     }
 
-    fn insert(&self, key: String, response: CompletionResponse, now: Instant, request_number: u64) {
+    fn insert(
+        &self,
+        key: String,
+        response: CompletionResponse,
+        stream_metadata: Option<StreamCacheMetadata>,
+        now: Instant,
+        request_number: u64,
+    ) {
         let mut guard = self.cache.lock().unwrap_or_else(|error| error.into_inner());
         guard.retain(|_, entry| now.duration_since(entry.created_at) < self.config.ttl);
 
@@ -172,6 +195,7 @@ impl CachedProvider {
             key,
             CacheEntry {
                 response,
+                stream_metadata,
                 created_at: now,
                 last_accessed: now,
                 hit_count: 0,
@@ -191,60 +215,97 @@ impl CachedProvider {
     fn cache_miss_stream<'a>(
         &'a self,
         inner: LlmStream<'a>,
-        key: String,
+        key: Option<String>,
         now: Instant,
         request_number: u64,
     ) -> LlmStream<'a> {
-        futures::stream::unfold(
-            (inner, key, String::new(), String::new(), false),
-            move |(mut inner, key, mut content, mut reasoning, finished)| async move {
-                if finished {
-                    return None;
-                }
+        struct StreamState<'a> {
+            inner: LlmStream<'a>,
+            key: Option<String>,
+            content: String,
+            reasoning: String,
+            observations: Vec<LlmStreamObservation>,
+            has_tool_calls: bool,
+            finished: bool,
+        }
 
-                let Some(item) = inner.next().await else {
-                    self.log_miss_without_insert(request_number);
-                    return None;
-                };
+        let state = StreamState {
+            inner,
+            key,
+            content: String::new(),
+            reasoning: String::new(),
+            observations: Vec::new(),
+            has_tool_calls: false,
+            finished: false,
+        };
+        futures::stream::unfold(state, move |mut state| async move {
+            if state.finished {
+                return None;
+            }
 
-                match &item {
-                    Ok(LlmStreamChunk::TextDelta(delta)) => content.push_str(delta),
-                    Ok(LlmStreamChunk::ReasoningDelta(delta)) => reasoning.push_str(delta),
-                    Ok(LlmStreamChunk::Done {
-                        usage,
-                        finish_reason,
-                    }) => {
-                        let usage = usage.unwrap_or_default();
-                        self.insert(
-                            key.clone(),
-                            CompletionResponse {
-                                content: content.clone(),
-                                reasoning: (!reasoning.is_empty()).then(|| reasoning.clone()),
-                                input_tokens: usage.input_tokens,
-                                output_tokens: usage.output_tokens,
-                                reasoning_tokens: usage.reasoning_tokens,
-                                finish_reason: FinishReason::from_stream_reason(finish_reason),
-                                cache_read_input_tokens: usage.cache_read_input_tokens,
-                                cache_creation_input_tokens: usage.cache_creation_input_tokens,
-                            },
-                            now,
-                            request_number,
-                        );
+            let Some(item) = state.inner.next().await else {
+                self.log_miss_without_insert(request_number);
+                return None;
+            };
+
+            match &item {
+                Ok(LlmStreamChunk::TextDelta(delta)) => state.content.push_str(delta),
+                Ok(LlmStreamChunk::ReasoningDelta(delta)) => state.reasoning.push_str(delta),
+                Ok(LlmStreamChunk::Done {
+                    usage,
+                    finish_reason,
+                }) => {
+                    let usage = usage.unwrap_or_default();
+                    let response = CompletionResponse {
+                        content: state.content.clone(),
+                        reasoning: (!state.reasoning.is_empty()).then(|| state.reasoning.clone()),
+                        input_tokens: usage.input_tokens,
+                        output_tokens: usage.output_tokens,
+                        reasoning_tokens: usage.reasoning_tokens,
+                        finish_reason: FinishReason::from_stream_reason(finish_reason),
+                        cache_read_input_tokens: usage.cache_read_input_tokens,
+                        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                    };
+                    match state.key.clone() {
+                        Some(key) if is_cacheable(&response.content, state.has_tool_calls) => {
+                            let metadata = StreamCacheMetadata {
+                                finish_reason: finish_reason.clone(),
+                                observations: state.observations.clone(),
+                            };
+                            self.insert(key, response, Some(metadata), now, request_number);
+                        }
+                        _ => self.log_miss_without_insert(request_number),
                     }
-                    Err(_) => self.log_miss_without_insert(request_number),
-                    Ok(LlmStreamChunk::ToolCallDelta { .. })
-                    | Ok(LlmStreamChunk::Observation(_)) => {}
                 }
+                Err(_) => self.log_miss_without_insert(request_number),
+                Ok(LlmStreamChunk::ToolCallDelta { .. }) => state.has_tool_calls = true,
+                Ok(LlmStreamChunk::Observation(observation)) => {
+                    if !matches!(observation, LlmStreamObservation::Retried { .. }) {
+                        state.observations.push(observation.clone());
+                    }
+                }
+            }
 
-                let finished = matches!(&item, Ok(LlmStreamChunk::Done { .. }) | Err(_));
-                Some((item, (inner, key, content, reasoning, finished)))
-            },
-        )
+            state.finished = matches!(&item, Ok(LlmStreamChunk::Done { .. }) | Err(_));
+            Some((item, state))
+        })
         .boxed()
     }
 }
 
-fn cached_stream(response: CompletionResponse) -> LlmStream<'static> {
+fn is_cacheable(content: &str, has_tool_calls: bool) -> bool {
+    !has_tool_calls && crate::llm::reasoning::has_visible_response_content(content)
+}
+
+fn cached_stream(hit: CacheHit) -> LlmStream<'static> {
+    let CacheHit {
+        response,
+        stream_metadata,
+    } = hit;
+    let finish_reason = stream_metadata.as_ref().map_or_else(
+        || response.finish_reason.as_str().to_string(),
+        |metadata| metadata.finish_reason.clone(),
+    );
     let usage = TokenUsage {
         input_tokens: response.input_tokens,
         output_tokens: response.output_tokens,
@@ -257,28 +318,39 @@ fn cached_stream(response: CompletionResponse) -> LlmStream<'static> {
         chunks.push(Ok(LlmStreamChunk::ReasoningDelta(reasoning)));
     }
     chunks.push(Ok(LlmStreamChunk::TextDelta(response.content)));
+    if let Some(metadata) = stream_metadata {
+        chunks.extend(
+            metadata
+                .observations
+                .into_iter()
+                .map(|observation| Ok(LlmStreamChunk::Observation(observation))),
+        );
+    }
     chunks.push(Ok(LlmStreamChunk::Done {
         usage: Some(usage),
-        finish_reason: response.finish_reason.as_str().to_string(),
+        finish_reason,
     }));
     futures::stream::iter(chunks).boxed()
 }
 
 /// Build a deterministic cache key from a completion request.
 ///
-/// Hashes the model name, messages, and response-affecting parameters
-/// (max_tokens, temperature, stop_sequences) via SHA-256. Two requests
-/// with identical content and parameters produce the same key.
-fn cache_key(model: &str, request: &CompletionRequest) -> String {
+/// Hashes the model name, messages, metadata, and response-affecting parameters
+/// (max_tokens, temperature, stop_sequences) via SHA-256. Serialization failure
+/// returns `None` so the request bypasses the cache instead of sharing a key.
+fn cache_key(model: &str, request: &CompletionRequest) -> Option<String> {
     let mut hasher = Sha256::new();
     hasher.update(model.as_bytes());
     hasher.update(b"|");
 
-    // Messages are Serialize, so we can deterministically hash them.
-    // serde_json produces stable output for the same input structure.
-    if let Ok(json) = serde_json::to_string(&request.messages) {
-        hasher.update(json.as_bytes());
-    }
+    let messages = match serde_json::to_string(&request.messages) {
+        Ok(json) => json,
+        Err(error) => {
+            tracing::warn!(%error, "response cache key serialization failed; bypassing cache");
+            return None;
+        }
+    };
+    hasher.update(messages.as_bytes());
 
     // Include response-affecting parameters so different temperatures,
     // max_tokens, or stop sequences produce distinct cache keys.
@@ -298,7 +370,17 @@ fn cache_key(model: &str, request: &CompletionRequest) -> String {
         }
     }
 
-    format!("{:x}", hasher.finalize())
+    hasher.update(b"|metadata|");
+    let mut metadata: Vec<_> = request.metadata.iter().collect();
+    metadata.sort_unstable_by_key(|(left, _)| *left);
+    for (key, value) in metadata {
+        hasher.update((key.len() as u64).to_le_bytes());
+        hasher.update(key.as_bytes());
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+
+    Some(format!("{:x}", hasher.finalize()))
 }
 
 #[async_trait]
@@ -320,18 +402,25 @@ impl LlmProvider for CachedProvider {
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
-        let effective_model = self.inner.effective_model_name(request.model.as_deref());
-        let key = cache_key(&effective_model, &request);
+        let key = self
+            .inner
+            .cache_key_model_name(request.model.as_deref())
+            .and_then(|model| cache_key(&model, &request));
         let now = Instant::now();
         let req_no = self.request_count.fetch_add(1, Ordering::Relaxed) + 1;
 
-        if let Some(response) = self.lookup(&key, now, req_no) {
-            return Ok(response);
+        if let Some(hit) = key.as_deref().and_then(|key| self.lookup(key, now, req_no)) {
+            return Ok(hit.response);
         }
 
         match self.inner.complete(request).await {
             Ok(response) => {
-                self.insert(key, response.clone(), now, req_no);
+                match key {
+                    Some(key) if is_cacheable(&response.content, false) => {
+                        self.insert(key, response.clone(), None, now, req_no);
+                    }
+                    _ => self.log_miss_without_insert(req_no),
+                }
                 Ok(response)
             }
             Err(error) => {
@@ -342,13 +431,18 @@ impl LlmProvider for CachedProvider {
     }
 
     async fn complete_stream(&self, request: CompletionRequest) -> Result<LlmStream<'_>, LlmError> {
-        let effective_model = self.inner.effective_model_name(request.model.as_deref());
-        let key = cache_key(&effective_model, &request);
+        let key = self
+            .inner
+            .cache_key_model_name(request.model.as_deref())
+            .and_then(|model| cache_key(&model, &request));
         let now = Instant::now();
         let request_number = self.request_count.fetch_add(1, Ordering::Relaxed) + 1;
 
-        if let Some(response) = self.lookup(&key, now, request_number) {
-            return Ok(cached_stream(response));
+        if let Some(hit) = key
+            .as_deref()
+            .and_then(|key| self.lookup(key, now, request_number))
+        {
+            return Ok(cached_stream(hit));
         }
 
         match self.inner.complete_stream(request).await {
@@ -387,13 +481,17 @@ impl LlmProvider for CachedProvider {
         self.inner.effective_model_name(requested_model)
     }
 
+    fn cache_key_model_name(&self, requested_model: Option<&str>) -> Option<String> {
+        self.inner.cache_key_model_name(requested_model)
+    }
+
     fn active_model_name(&self) -> String {
         self.inner.active_model_name()
     }
 
     fn set_model(&self, model: &str) -> Result<(), LlmError> {
-        // Cache keys embed the active model name via `effective_model_name()`, so
-        // requests to the new model automatically land in a separate cache slot.
+        // Cacheable providers embed the active model name in each key, so requests
+        // to the new model automatically land in a separate cache slot.
         // Entries for the old model remain valid: if we switch back, they will be
         // hit again rather than wasted. Natural TTL / LRU eviction cleans them up.
         self.inner.set_model(model)
@@ -413,11 +511,13 @@ mod tests {
     use tracing_test::traced_test;
 
     use crate::llm::error::LlmError;
+    use crate::llm::failover::FailoverProvider;
     use crate::llm::provider::{
-        ChatMessage, CompletionResponse, FinishReason, LlmStreamChunk, TokenUsage,
-        ToolCompletionRequest, ToolCompletionResponse,
+        ChatMessage, CompletionResponse, FinishReason, LlmStreamChunk, LlmStreamObservation,
+        StreamFailureReason, TokenUsage, ToolCompletionRequest, ToolCompletionResponse,
     };
     use crate::llm::response_cache::*;
+    use crate::llm::smart_routing::{SmartRoutingConfig, SmartRoutingProvider};
     use crate::llm::streaming_test_support::{ScriptedStreamingProvider, StreamScript};
     use crate::testing::StubLlm;
 
@@ -659,6 +759,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_hit_preserves_finish_reason_without_replaying_retries() {
+        let observation = LlmStreamObservation::Retried {
+            provider: "previous-model".to_string(),
+            attempts: 1,
+            reason: StreamFailureReason::Empty,
+            discarded_usage: Some(TokenUsage {
+                input_tokens: 2,
+                output_tokens: 1,
+                ..TokenUsage::default()
+            }),
+        };
+        let provider = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![StreamScript::Items(vec![
+                Ok(LlmStreamChunk::ReasoningDelta("thinking".to_string())),
+                Ok(LlmStreamChunk::TextDelta("answer".to_string())),
+                Ok(LlmStreamChunk::Observation(observation)),
+                Ok(LlmStreamChunk::Done {
+                    usage: Some(TokenUsage::default()),
+                    finish_reason: "provider_specific_stop".to_string(),
+                }),
+            ])],
+            vec![],
+        ));
+        let cached = CachedProvider::new(provider.clone(), ResponseCacheConfig::default());
+
+        let miss_chunks = cached
+            .complete_stream(simple_request())
+            .await
+            .expect("stream should open")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("stream should complete");
+        assert!(miss_chunks.iter().any(|chunk| matches!(
+            chunk,
+            LlmStreamChunk::Observation(LlmStreamObservation::Retried { .. })
+        )));
+
+        let chunks = cached
+            .complete_stream(simple_request())
+            .await
+            .expect("cached stream should open")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("cached stream should complete");
+
+        assert_eq!(
+            chunks,
+            vec![
+                LlmStreamChunk::ReasoningDelta("thinking".to_string()),
+                LlmStreamChunk::TextDelta("answer".to_string()),
+                LlmStreamChunk::Done {
+                    usage: Some(TokenUsage::default()),
+                    finish_reason: "provider_specific_stop".to_string(),
+                },
+            ]
+        );
+        assert_eq!(provider.plain_calls(), 1);
+        assert_eq!(cached.total_hits(), 1);
+    }
+
+    #[tokio::test]
     async fn stream_hit_emits_cached_text_and_done() {
         let provider = Arc::new(ScriptedStreamingProvider::new(
             "scripted",
@@ -704,6 +870,202 @@ mod tests {
         );
         assert_eq!(provider.plain_calls(), 1);
         assert_eq!(cached.total_hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_stream_is_not_cached() {
+        let empty_stream = || {
+            StreamScript::Items(vec![
+                Ok(LlmStreamChunk::TextDelta(String::new())),
+                Ok(LlmStreamChunk::Done {
+                    usage: None,
+                    finish_reason: "stop".to_string(),
+                }),
+            ])
+        };
+        let provider = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![empty_stream(), empty_stream()],
+            vec![],
+        ));
+        let cached = CachedProvider::new(provider.clone(), ResponseCacheConfig::default());
+
+        for _ in 0..2 {
+            let chunks = cached
+                .complete_stream(simple_request())
+                .await
+                .expect("stream should open")
+                .collect::<Vec<_>>()
+                .await;
+            assert!(matches!(
+                chunks.as_slice(),
+                [Ok(LlmStreamChunk::TextDelta(text)), Ok(LlmStreamChunk::Done { .. })]
+                    if text.is_empty()
+            ));
+        }
+
+        assert_eq!(provider.plain_calls(), 2);
+        assert!(cached.is_empty());
+        assert_eq!(cached.total_hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_blocking_response_is_not_cached() {
+        let stub = Arc::new(StubLlm::new(""));
+        let cached = CachedProvider::new(stub.clone(), ResponseCacheConfig::default());
+
+        for _ in 0..2 {
+            let response = cached.complete(simple_request()).await.unwrap();
+            assert!(response.content.is_empty());
+        }
+
+        assert_eq!(stub.calls(), 2);
+        assert!(cached.is_empty());
+        assert_eq!(cached.total_hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn whitespace_and_think_only_streams_are_not_cached() {
+        for content in ["  \n", "<think>pondering</think>"] {
+            let stream = || {
+                StreamScript::Items(vec![
+                    Ok(LlmStreamChunk::TextDelta(content.to_string())),
+                    Ok(LlmStreamChunk::Done {
+                        usage: None,
+                        finish_reason: "stop".to_string(),
+                    }),
+                ])
+            };
+            let provider = Arc::new(ScriptedStreamingProvider::new(
+                "scripted",
+                vec![stream(), stream()],
+                vec![],
+            ));
+            let cached = CachedProvider::new(provider.clone(), ResponseCacheConfig::default());
+
+            for _ in 0..2 {
+                let chunks = cached
+                    .complete_stream(simple_request())
+                    .await
+                    .expect("stream should open")
+                    .collect::<Vec<_>>()
+                    .await;
+                assert!(matches!(
+                    chunks.as_slice(),
+                    [Ok(LlmStreamChunk::TextDelta(text)), Ok(LlmStreamChunk::Done { .. })]
+                        if text.as_str() == content
+                ));
+            }
+
+            assert_eq!(provider.plain_calls(), 2);
+            assert!(cached.is_empty());
+            assert_eq!(cached.total_hits(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn whitespace_and_think_only_blocking_responses_are_not_cached() {
+        for content in ["  \n", "<think>pondering</think>"] {
+            let stub = Arc::new(StubLlm::new(content));
+            let cached = CachedProvider::new(stub.clone(), ResponseCacheConfig::default());
+
+            for _ in 0..2 {
+                let response = cached.complete(simple_request()).await.unwrap();
+                assert_eq!(response.content, content);
+            }
+
+            assert_eq!(stub.calls(), 2);
+            assert!(cached.is_empty());
+            assert_eq!(cached.total_hits(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_call_only_plain_stream_is_not_cached() {
+        let provider = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![native_tool_stream(), native_tool_stream()],
+            vec![],
+        ));
+        let cached = CachedProvider::new(provider.clone(), ResponseCacheConfig::default());
+
+        for _ in 0..2 {
+            let chunks = cached
+                .complete_stream(simple_request())
+                .await
+                .expect("stream should open")
+                .collect::<Vec<_>>()
+                .await;
+            assert!(matches!(
+                chunks.as_slice(),
+                [
+                    Ok(LlmStreamChunk::ToolCallDelta { .. }),
+                    Ok(LlmStreamChunk::Done { .. })
+                ]
+            ));
+        }
+
+        assert_eq!(provider.plain_calls(), 2);
+        assert!(cached.is_empty());
+        assert_eq!(cached.total_hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn failover_blocking_responses_are_not_cached() {
+        let primary = Arc::new(StubLlm::failing("primary-model"));
+        let fallback =
+            Arc::new(StubLlm::new("fallback response").with_model_name("fallback-model"));
+        let failover =
+            Arc::new(FailoverProvider::new(vec![primary.clone(), fallback.clone()]).unwrap());
+        let cached = CachedProvider::new(failover, ResponseCacheConfig::default());
+
+        for _ in 0..2 {
+            let response = cached.complete(simple_request()).await.unwrap();
+            assert_eq!(response.content, "fallback response");
+            assert_eq!(cached.effective_model_name(None), "fallback-model");
+        }
+
+        assert_eq!(primary.calls(), 2);
+        assert_eq!(fallback.calls(), 2);
+        assert!(cached.is_empty());
+        assert_eq!(cached.total_hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn smart_routed_streams_are_not_cached() {
+        let primary = Arc::new(StubLlm::new("primary response").with_model_name("primary-model"));
+        let cheap = Arc::new(StubLlm::new("cheap response").with_model_name("cheap-model"));
+        let routed = Arc::new(SmartRoutingProvider::new(
+            primary.clone(),
+            cheap.clone(),
+            SmartRoutingConfig {
+                cascade_enabled: false,
+                ..SmartRoutingConfig::default()
+            },
+        ));
+        let cached = CachedProvider::new(routed, ResponseCacheConfig::default());
+
+        for _ in 0..2 {
+            let chunks = cached
+                .complete_stream(simple_request())
+                .await
+                .expect("stream should open")
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("stream should complete");
+            assert!(matches!(
+                chunks.as_slice(),
+                [LlmStreamChunk::TextDelta(text), LlmStreamChunk::Done { .. }]
+                    if text == "cheap response"
+            ));
+        }
+
+        assert_eq!(cheap.calls(), 2);
+        assert_eq!(primary.calls(), 0);
+        assert!(cached.is_empty());
+        assert_eq!(cached.total_hits(), 0);
     }
 
     #[tokio::test]
@@ -864,7 +1226,21 @@ mod tests {
         let k1 = cache_key("model-a", &req);
         let k2 = cache_key("model-a", &req);
         assert_eq!(k1, k2);
-        assert_eq!(k1.len(), 64); // SHA-256 hex
+        assert_eq!(k1.as_deref().map(str::len), Some(64)); // SHA-256 hex
+    }
+
+    #[test]
+    fn cache_key_canonicalizes_and_varies_by_metadata() {
+        let mut req_a = simple_request();
+        req_a.metadata.insert("thread".into(), "thread-1".into());
+        req_a.metadata.insert("region".into(), "local".into());
+        let mut req_b = simple_request();
+        req_b.metadata.insert("region".into(), "local".into());
+        req_b.metadata.insert("thread".into(), "thread-1".into());
+        assert_eq!(cache_key("m", &req_a), cache_key("m", &req_b));
+
+        req_b.metadata.insert("thread".into(), "thread-2".into());
+        assert_ne!(cache_key("m", &req_a), cache_key("m", &req_b));
     }
 
     #[test]

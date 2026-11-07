@@ -103,6 +103,22 @@ LLM_API_KEY=your-key
 LLM_MODEL=your-model-name
 ```
 
+### Optional response cache
+
+Response caching is disabled by default. Enable it in `lunarwing.env` with
+`LLM_RESPONSE_CACHE_ENABLED=true`; the TTL and entry limit are controlled by
+`LLM_RESPONSE_CACHE_TTL_SECS` and `LLM_RESPONSE_CACHE_MAX_ENTRIES`.
+
+The cache only stores responses with user-visible content and never stores
+streams containing tool calls. Smart routing and failover select a backend during
+dispatch, so configuring either one makes the response cache bypass every request
+rather than risk replaying a response from the wrong model. Startup logs call out
+this bypass when caching is enabled.
+
+Cache keys include request metadata. Because the agent supplies a thread ID in
+that metadata, entries are normally isolated to one conversation thread instead
+of being shared across threads; this improves isolation but reduces hit rates.
+
 ### TensorZero proxy configuration
 
 The proxy is disabled by default. Provision it with
