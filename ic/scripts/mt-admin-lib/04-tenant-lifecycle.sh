@@ -1670,13 +1670,13 @@ with_tenant_upgrade_lock() {  # <name> <cmd> [args...]
 # Build every selected worker image to a candidate tag while the tenant runs.
 # On failure, discard the candidates and return the clone to <previous_commit>,
 # so the running tenant is exactly as it was. Never dies.
-upgrade_build_candidates_prestop() {  # <name> <lw_root> <previous_commit> <pebble> <oc> <kimi> <oc2>
+upgrade_build_candidates_prestop() {  # <name> <lw_root> <previous_commit> <pebble> <oc> <kimi> <oc2> <release_ref>
   local name="$1" lw_root="$2" previous_commit="$3"
-  local pebble="$4" oc="$5" kimi="$6" oc2="$7"
+  local pebble="$4" oc="$5" kimi="$6" oc2="$7" release_ref="$8"
   local rc=0 caller_errexit=false
   [[ $- != *e* ]] || caller_errexit=true
   set +e
-  ( set -e; build_candidate_workers "$name" "$oc" "$kimi" "$oc2" "$pebble" "false" )
+  ( set -e; build_candidate_workers "$name" "$oc" "$kimi" "$oc2" "$pebble" "false" "$release_ref" )
   rc=$?
   if [[ "$caller_errexit" == true ]]; then set -e; else set +e; fi
   [[ "$rc" -eq 0 ]] && return 0
@@ -1869,7 +1869,7 @@ upgrade_tenant_locked() {
   say "  now at: $("${tgit[@]}" describe --tags --always 2>/dev/null)"
 
   upgrade_build_candidates_prestop "$name" "$lw_root" "$previous_commit" \
-    "$with_pebble" "$with_opencode" "$with_kimi" "$with_opencode2" \
+    "$with_pebble" "$with_opencode" "$with_kimi" "$with_opencode2" "$checkout_ref" \
     || die "worker image candidate build failed; tenant '$name' was not stopped and is unchanged"
 
   # The candidate builds only read the checkout; the build lock guards the

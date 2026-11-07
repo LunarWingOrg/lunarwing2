@@ -19,6 +19,10 @@ built_tag=""
 tag_calls=()
 rmi_calls=()
 expected_root="$LUNARWING_ROOT"
+expected_archive=false
+archived_dockerfile=""
+build_log=""
+build_should_fail=false
 capture_container_cmd() {
   case "$1" in
     build)
@@ -43,9 +47,18 @@ capture_container_cmd() {
           *) shift ;;
         esac
       done
-      [[ "$used_dockerfile" == "$expected_root/pebble4lunarwing/Dockerfile" && "$1" == "$expected_root" ]] \
-        || fail "wrong Dockerfile or context for source root $expected_root"
+      if [[ "$expected_archive" == true ]]; then
+        [[ "$used_dockerfile" == "$1/pebble4lunarwing/Dockerfile" \
+          && "$1" != "$tenant_root" && "$1" == "$archive_parent"/lw-worker-source.* ]] \
+          || fail "tenant build did not use a private archived context: $1"
+        archived_dockerfile="$(<"$used_dockerfile")"
+      else
+        [[ "$used_dockerfile" == "$expected_root/pebble4lunarwing/Dockerfile" && "$1" == "$expected_root" ]] \
+          || fail "wrong Dockerfile or context for source root $expected_root"
+      fi
       build_context="$1"
+      [[ -z "$build_log" ]] || printf '%s\n' "$build_context" >>"$build_log"
+      [[ "$build_should_fail" != true ]] || return 1
       ;;
     tag) tag_calls+=("$2 $3") ;;
     rmi) rmi_calls+=("$2") ;;
@@ -121,51 +134,117 @@ fi
   || fail 'failing smoke still re-tagged :latest'
 smoke_should_fail=false
 
-# WI#507: tenant builds use the tenant checkout, not the operator's dirty tree.
+# WI#539: tenant revisions select the image, but only operator-archived bytes build.
 fixture_dir="$(mktemp -d)"
 trap 'rm -rf "$fixture_dir"' EXIT
 git_fixture() { git -C "$1" -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false "${@:2}"; }
+reviewed_root="$LUNARWING_ROOT"
 make_pebble_checkout() {
   mkdir -p "$1/pebble4lunarwing/upstream"
   printf 'FROM scratch\n' >"$1/pebble4lunarwing/Dockerfile"
-  cp "$LUNARWING_ROOT/pebble4lunarwing/upstream/Cargo.lock" "$1/pebble4lunarwing/upstream/Cargo.lock"
+  cp "$reviewed_root/pebble4lunarwing/upstream/Cargo.lock" "$1/pebble4lunarwing/upstream/Cargo.lock"
   git_fixture "$1" init -q
   git_fixture "$1" add -A
   git_fixture "$1" commit -qm fixture
 }
 operator_root="$fixture_dir/operator"
 tenant_root="$fixture_dir/tenant"
+archive_parent="$fixture_dir/archives"
+build_log="$fixture_dir/build-contexts"
+mkdir -p "$archive_parent"
+: >"$build_log"
 make_pebble_checkout "$operator_root"
-make_pebble_checkout "$tenant_root"
+git -C "$operator_root" branch -M main
+git clone -q "$operator_root" "$tenant_root"
+git -C "$tenant_root" checkout -q -B release
 printf 'operator edit\n' >>"$operator_root/pebble4lunarwing/Dockerfile"
 printf 'tenant commit\n' >>"$tenant_root/pebble4lunarwing/Dockerfile"
 git_fixture "$tenant_root" commit -qam tenant
 tenant_head="$(git -C "$tenant_root" rev-parse HEAD)"
+git -C "$operator_root" fetch -q "$tenant_root" HEAD:refs/heads/release
 
-expected_root="$tenant_root"
-LUNARWING_ROOT="$operator_root" build_pebble_worker false false "$tenant_root"
+build_count() { wc -l <"$build_log"; }
+assert_build_refusal() {  # <label> <required diagnostic>
+  local label="$1" diagnostic="$2" before
+  before="$(build_count)"
+  if (build_pebble_worker false false "$tenant_root") >"$fixture_dir/$label.log" 2>&1; then
+    fail "$label was accepted"
+  fi
+  grep -Fq -- "$diagnostic" "$fixture_dir/$label.log" \
+    || fail "$label did not report '$diagnostic': $(cat "$fixture_dir/$label.log")"
+  [[ "$(build_count)" == "$before" ]] || fail "$label reached the container builder"
+}
+
+export LUNARWING_WORKER_BUILD_TMPDIR="$archive_parent"
+LUNARWING_ROOT="$operator_root"
+expected_archive=true
+build_pebble_worker false false "$tenant_root"
 [[ "$effective_revision" == "$tenant_head" ]] \
   || fail "tenant build stamp '$effective_revision' is not the tenant clone HEAD $tenant_head"
-[[ "$build_context" == "$tenant_root" ]] \
-  || fail "tenant build context '$build_context' is not the tenant clone"
-expected_root="$LUNARWING_ROOT"
+expected_dockerfile="$(git -C "$tenant_root" show HEAD:pebble4lunarwing/Dockerfile)"
+[[ "$archived_dockerfile" == "$expected_dockerfile" ]] \
+  || fail 'builder received working-tree bytes instead of the committed Dockerfile'
+[[ ! -e "$build_context" ]] || fail "archived build context was not removed: $build_context"
+
+build_pebble_worker false false "$tenant_root" origin/release
+[[ "$effective_revision" == "$tenant_head" && "$archived_dockerfile" == "$expected_dockerfile" ]] \
+  || fail 'upgrade-style origin/ref did not build the validated local release archive'
+build_should_fail=true
+if (trap - EXIT; build_pebble_worker false false "$tenant_root") >"$fixture_dir/build-failure.log" 2>&1; then
+  fail 'forced container build failure was accepted'
+fi
+build_should_fail=false
+failed_context="$(tail -n1 "$build_log")"
+[[ "$failed_context" == "$archive_parent"/lw-worker-source.* && ! -e "$failed_context" ]] \
+  || fail "failed build did not remove archived context: $failed_context"
+grep -Fq 'pebble worker image build failed' "$fixture_dir/build-failure.log" \
+  || fail 'forced build failure did not preserve the builder diagnostic'
 
 printf 'dirty tenant edit\n' >>"$tenant_root/pebble4lunarwing/Dockerfile"
-if (build_pebble_worker false false "$tenant_root" >/dev/null 2>&1); then
-  fail 'tenant build accepted a dirty pebble source tree'
-fi
+[[ "$archived_dockerfile" == "$expected_dockerfile" ]] \
+  || fail 'a later working-tree edit changed the archived Dockerfile captured by the builder'
+assert_build_refusal dirty-source 'dirty tenant checkout'
+git_fixture "$tenant_root" checkout -q -- pebble4lunarwing/Dockerfile
 
+printf 'unknown tenant commit\n' >>"$tenant_root/pebble4lunarwing/Dockerfile"
+git_fixture "$tenant_root" commit -qam unknown
+unknown_head="$(git -C "$tenant_root" rev-parse HEAD)"
+assert_build_refusal unknown-head "$unknown_head"
+grep -Fq 'unknown to operator checkout' "$fixture_dir/unknown-head.log" \
+  || fail 'unknown tenant HEAD refusal is not explicit'
+
+git_fixture "$operator_root" commit -qam main-only
+off_ref_head="$(git -C "$operator_root" rev-parse HEAD)"
+git -C "$tenant_root" fetch -q "$operator_root" main
+git_fixture "$tenant_root" reset -q --hard "$off_ref_head"
+assert_build_refusal off-release 'not on operator release ref refs/heads/release'
+
+expected_archive=false
+LUNARWING_ROOT="$reviewed_root"
+unset LUNARWING_WORKER_BUILD_TMPDIR
 BUILD_LIB="$(dirname "$MT_ADMIN")/mt-admin-lib/05-tenant-build.sh"
 grep -Fq 'build_pebble_worker "false" "$with_toolchains" "$(tenant_lw_root "$name")"' "$BUILD_LIB" \
-  || fail 'build-tenant does not pass the tenant checkout to the pebble builder'
+  || fail 'build-tenant does not pass the tenant revision source to the pebble builder'
 grep -Fq 'build_pebble_worker "false" "$with_toolchains" "$worker_source_root"' "$BUILD_LIB" \
   || fail 'build-all does not pass the verified shared worker root to the pebble builder'
-grep -Fq 'pebble)    LUNARWING_WORKER_IMAGE_TAG="$tag" build_pebble_worker "false" "$with_toolchains" "$lw_root" || rc=$? ;;' "$BUILD_LIB" \
-  || fail 'upgrade candidate builds do not pass the tenant checkout to the pebble builder'
+for lane in pebble4lunarwing opencode4lunarwing opencode2.4lunarwing kimicode4lunarwing; do
+  grep -Fq "_prepare_worker_build_source \"\$source_root\" $lane" "$BUILD_LIB" \
+    || fail "$lane does not use the shared operator-archive helper"
+done
+grep -Fq 'pebble)    LUNARWING_WORKER_IMAGE_TAG="$tag" build_pebble_worker "false" "$with_toolchains" "$lw_root" "$release_ref" || rc=$? ;;' "$BUILD_LIB" \
+  || fail 'upgrade candidate builds do not forward the release ref and tenant revision source'
 grep -Fq 'worker_paths+=(pebble4lunarwing)' "$BUILD_LIB" \
   || fail 'build-all dirty-source guard does not cover pebble4lunarwing'
+grep -Fq 'git -C "$LUNARWING_ROOT" cat-file -e "${revision}^{commit}"' "$BUILD_LIB" \
+  || fail 'tenant HEAD is not checked against operator objects'
+grep -Fq 'git -C "$LUNARWING_ROOT" merge-base --is-ancestor "$revision" "$release_ref"' "$BUILD_LIB" \
+  || fail 'tenant HEAD is not checked against the operator release ref'
+grep -Fq 'git -C "$LUNARWING_ROOT" archive --format=tar --output="$archive"' "$BUILD_LIB" \
+  || fail 'worker contexts are not archived from the operator checkout'
 grep -Fq 'local smoke_script="${LUNARWING_PEBBLE_TOOLCHAIN_SMOKE:-$LUNARWING_ROOT/pebble4lunarwing/scripts/smoke-task-shell-toolchain.sh}"' "$BUILD_LIB" \
   || fail 'tenant fat builds can execute the smoke helper from the tenant checkout'
+
+tenant_head="$(git -C "$tenant_root" rev-parse HEAD)"
 
 # WI#540: select the source owner before any git invocation. A permissive root
 # safe.directory must never turn the revision probe into root execution of
@@ -240,4 +319,4 @@ worker_source_git_def="$(awk '/^_worker_source_git\(\) \{/{f=1} f{print} f&&/^\}
     || fail 'worker source git caller path used the wrong checkout'
 )
 
-printf 'PASS: Pebble build inputs and owner-safe worker source git (WI#507, WI#540)\n'
+printf 'PASS: worker build provenance, archived contexts, and owner-safe source git (WI#507/WI#539/WI#540)\n'
