@@ -86,6 +86,11 @@ RigAdapter
   -> RecordingLlm
 ```
 
+`CachedProvider` requires a model identity that is known before dispatch.
+Responses selected through smart routing or failover therefore bypass the outer
+cache rather than risking a hit from a different backend. Content-free terminal
+responses are never inserted on either the blocking or streaming path.
+
 It does not change engine execution or channel behavior. Engine V2 remains
 gateway-only by default. Any future WASM channel opt-in must follow the
 channel-neutral delivery design in
