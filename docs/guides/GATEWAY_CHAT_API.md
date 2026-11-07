@@ -138,7 +138,7 @@ Protected, not rate-limited.
 ```json
 {
   "api_version": 1,
-  "server_version": "2.1.8",
+  "server_version": "2.1.9",
   "engine": "v2",
   "features": ["status", "attachments", "transcribe", "stream"],
   "limits": {

@@ -1576,7 +1576,7 @@ Ids: `msg_id` and `req_id` pass `is_valid_client_id`; invalid → `Error{bad_fra
 
 ```json
 {"Connect":{"version":"wingtip/0.2.0","client_info":"opentui/0.8.1 bun/1.3.14","protocol":3,"features":["status","attachments","transcribe"],"thread":"tui-derpy-7f3c2a9e41d0b6c5"}}
-{"Connect":{"version":"2.1.8","client_info":null}}
+{"Connect":{"version":"2.1.9","client_info":null}}
 {"Message":{"content":"What is in this screenshot?","session_id":null,"msg_id":"c-0007","attachments":[{"mime_type":"image/png","filename":"shot.png","data_base64":"iVBORw0KGgo="}]}}
 {"Message":{"content":"hello","session_id":null}}
 {"Interrupt":{"msg_id":"c-0008"}}
