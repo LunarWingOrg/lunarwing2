@@ -180,7 +180,7 @@ fn runtime_socket_dirs() -> Vec<PathBuf> {
             }
         }
     }
-    dirs.push(PathBuf::from("/tmp/.X11-unix"));
+    dirs.push(PathBuf::from("/tmp/.X11-unix")); // safety: fixed OS X11 socket directory, not a test temp path.
     let tmux_base = std::env::var("TMUX_TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
     let tmux_base = PathBuf::from(tmux_base);
     if tmux_base.is_absolute() {

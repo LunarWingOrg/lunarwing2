@@ -332,11 +332,15 @@ def is_fuzz_target_path(path: pathlib.Path) -> bool:
     )
 
 
+def is_test_only_path(path: pathlib.Path) -> bool:
+    return is_fuzz_target_path(path) or path.name == "tests.rs"
+
+
 def collect_violations(base: str, head: str) -> list[tuple[str, int, str]]:
     violations: list[tuple[str, int, str]] = []
 
     for path in changed_rust_files(base, head):
-        if is_fuzz_target_path(path):
+        if is_test_only_path(path):
             continue
         source_path = PROJECT_ROOT / path
         if not source_path.exists():
@@ -741,6 +745,14 @@ class CheckNoPanicsTests(unittest.TestCase):
                 violations = collect_violations("base", "head")
 
         self.assertEqual(violations, [])
+
+    def test_tests_rs_files_are_test_only(self) -> None:
+        self.assertTrue(
+            is_test_only_path(pathlib.Path("src/channels/unix_socket_repl/tests.rs"))
+        )
+        self.assertFalse(
+            is_test_only_path(pathlib.Path("src/channels/unix_socket_repl/mod.rs"))
+        )
 
 
 if __name__ == "__main__":
