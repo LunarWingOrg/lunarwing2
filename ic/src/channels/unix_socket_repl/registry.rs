@@ -34,7 +34,11 @@ impl Registry {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub(super) fn try_reserve(self: &Arc<Self>, max_connections: usize, session_id: String) -> Option<SlotGuard> {
+    pub(super) fn try_reserve(
+        self: &Arc<Self>,
+        max_connections: usize,
+        session_id: String,
+    ) -> Option<SlotGuard> {
         let mut state = self.state();
         if state.reservations >= max_connections {
             return None;

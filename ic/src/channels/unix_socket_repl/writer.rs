@@ -62,11 +62,7 @@ impl Outbound {
         )
     }
 
-    pub(super) fn spawn_writer(
-        &self,
-        write: OwnedWriteHalf,
-        rx: mpsc::Receiver<QueuedFrame>,
-    ) {
+    pub(super) fn spawn_writer(&self, write: OwnedWriteHalf, rx: mpsc::Receiver<QueuedFrame>) {
         tokio::spawn(writer_task(
             write,
             rx,
@@ -86,11 +82,7 @@ impl Outbound {
         self.offer_bytes(bytes, class)
     }
 
-    fn offer_bytes(
-        &self,
-        bytes: Vec<u8>,
-        class: FrameClass,
-    ) -> Result<Delivery, OfferError> {
+    fn offer_bytes(&self, bytes: Vec<u8>, class: FrameClass) -> Result<Delivery, OfferError> {
         if self.kill.is_cancelled() {
             return Err(OfferError::SlowConsumer);
         }
@@ -103,21 +95,19 @@ impl Outbound {
         }
 
         let len = bytes.len();
-        let reserved = self.queued_bytes.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |current| {
-                current
-                    .checked_add(len)
-                    .filter(|total| *total <= self.limits.outbound_queue_bytes)
-            },
-        );
+        let reserved =
+            self.queued_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current
+                        .checked_add(len)
+                        .filter(|total| *total <= self.limits.outbound_queue_bytes)
+                });
         if reserved.is_err() {
             return self.overflow(class);
         }
 
         let queued = QueuedFrame { bytes, class };
-        if let Err(error) = self.tx.try_send(queued) {
+        if self.tx.try_send(queued).is_err() {
             self.queued_bytes.fetch_sub(len, Ordering::AcqRel);
             return self.overflow(class);
         }
