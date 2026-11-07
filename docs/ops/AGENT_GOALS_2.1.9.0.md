@@ -100,18 +100,18 @@
     - **Verification (`taskset -c 0-17`, Cargo `-j18`):** `cargo test --locked --lib service::tests -- --test-threads=18` passed **22/22**; `cargo clippy --locked --lib --tests -- -D warnings` passed with zero warnings; `cargo fmt --all -- --check` and `git diff --check` passed.
 16. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/572
     - **DONE 2026-11-07 (`rarity/kimi-16-20261107-2101`, WI#572):** `CachedProvider` now requires output to pass the existing stream-integrity corruption detector before insertion. Repeated-phrase and role-delimiter responses are never stored on either the blocking or streaming path, so identical requests regenerate instead of replaying flagged output for the TTL. Added both-path regressions and a visible-answer cacheability control; cache keys, TTL, provider layering, and eviction semantics are unchanged.
-    - **Verification (`taskset -c 0-17`, Cargo `-j18`):** `cargo test --locked --lib llm:: -- --test-threads=18` **670/670 PASS**; `cargo clippy --locked --lib --tests -- -D warnings` **PASS**; `cargo fmt --all -- --check` and `git diff --check` **PASS**. No push or MR was requested, so remote CI on the committed head remains a maintainer/CI step.
+    - **Verification (`taskset -c 0-17`, Cargo `-j18`):** `cargo test --locked --lib llm:: -- --test-threads=18` **670/670 PASS**; `cargo clippy --locked --lib --tests -- -D warnings` **PASS**; `cargo fmt --all -- --check` and `git diff --check` **PASS**. No push or MR was requested, so remote CI on the committed head remains a maintainer/CI step
 17. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/571
 18. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/567
     - **DONE 2026-11-07 (SweetieBot (autonomous), WI#567):** generated systemd-user units now load `<base_dir>/env/lunarwing.env` through an existence-tolerant `EnvironmentFile=-…` directive, matching the bootstrap contract while allowing fresh installs without the file. Added rendering regression coverage. The linked `--no-onboard` finding remains separately tracked as goal #19 / WI#568
     - **Verification:** `taskset -c 0-17 cargo test -j18 --locked --lib service::tests -- --test-threads=18` **19/19 PASS**; `taskset -c 0-17 cargo clippy -j18 --locked --lib --tests -- -D warnings` **PASS**; `cargo fmt --all -- --check` and `git diff --check` **PASS**. `systemd-analyze` is unavailable on this OpenRC host, so no live systemd-user parser/install check was performed
 19. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/568
-    - **DONE 2026-11-07 (`rarity/kimi-19-20261107-2130`, WI#568):** generated systemd-user units now invoke `lunarwing --no-onboard run`, matching OpenRC, the committed production template, and mt-admin units. Updated the renderer regression assertion and setup specification; WI#567's optional `EnvironmentFile` remains intact.
+    - **DONE 2026-11-07 (`rarity/kimi-19-20261107-2130`, WI#568):** generated systemd-user units now invoke `lunarwing --no-onboard run`, matching OpenRC, the committed production template, and mt-admin units. Updated the renderer regression assertion and setup specification; WI#567's optional `EnvironmentFile` remains intact
     - **Verification (`taskset -c 0-17`, Cargo `-j18`):** `cargo test --locked --lib service::tests -- --test-threads=18` **23/23 PASS**; `cargo clippy --locked --lib --tests -- -D warnings` **PASS**; `cargo fmt --all -- --check` and `git diff --check` **PASS**.
+20. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/580
 
 ## Phase 7 - Advanced Operator Notes
 
-20. [x] (S) Reserved
 21. [x] (H) check older goals for others that may be not done yet
 22. [x] (H) update rel notes
 23. [x] (S) Deploy the stoplight system
