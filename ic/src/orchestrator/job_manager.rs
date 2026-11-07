@@ -1751,7 +1751,11 @@ async fn run_promotion_with_timeout(
     policy: &harness::WriteBackPolicy,
     timeout: std::time::Duration,
 ) -> harness::PromotionSummary {
-    match tokio::time::timeout(timeout, run_promotion(deps, job_id, owner_id, staging, policy)).await
+    match tokio::time::timeout(
+        timeout,
+        run_promotion(deps, job_id, owner_id, staging, policy),
+    )
+    .await
     {
         Ok(summary) => summary,
         Err(_) => {

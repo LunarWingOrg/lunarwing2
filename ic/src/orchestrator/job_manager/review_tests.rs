@@ -217,7 +217,10 @@ async fn promotion_deadline_stops_finalizing_and_releases_harness_state() {
     assert_eq!(handle.state, ContainerState::Stopped);
     let summary = handle.harness.unwrap().promotion.unwrap();
     assert!(summary.skipped);
-    assert_eq!(summary.skip_reason.as_deref(), Some("promotion deadline exceeded"));
+    assert_eq!(
+        summary.skip_reason.as_deref(),
+        Some("promotion deadline exceeded")
+    );
     assert!(token_store.harness_secrets(job_id).await.is_none());
     assert!(!job_dir.exists());
 }

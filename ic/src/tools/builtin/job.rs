@@ -237,7 +237,9 @@ struct HarnessJobDirGuard {
 
 impl HarnessJobDirGuard {
     fn new(job_id: Uuid) -> Self {
-        Self { job_id: Some(job_id) }
+        Self {
+            job_id: Some(job_id),
+        }
     }
 
     fn dispatch_succeeded(mut self) {
@@ -1180,8 +1182,7 @@ impl CreateJobTool {
         loop {
             if tokio::time::Instant::now() > deadline {
                 if jm.get_handle(job_id).await.is_some_and(|handle| {
-                    handle.state
-                        == crate::orchestrator::job_manager::ContainerState::Finalizing
+                    handle.state == crate::orchestrator::job_manager::ContainerState::Finalizing
                 }) {
                     tokio::time::sleep(poll_interval).await;
                     continue;
