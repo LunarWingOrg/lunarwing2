@@ -62,6 +62,21 @@ impl Outbound {
         )
     }
 
+    pub(super) fn spawn_writer(
+        &self,
+        write: OwnedWriteHalf,
+        rx: mpsc::Receiver<QueuedFrame>,
+    ) {
+        tokio::spawn(writer_task(
+            write,
+            rx,
+            Arc::clone(&self.queued_bytes),
+            Arc::clone(&self.dropped_status),
+            self.limits,
+            self.kill.clone(),
+        ));
+    }
+
     pub(super) fn offer(
         &self,
         frame: &ServerFrame,
@@ -128,11 +143,7 @@ pub(super) async fn writer_task(
     kill: CancellationToken,
 ) {
     loop {
-        let queued = tokio::select! {
-            () = kill.cancelled() => break,
-            queued = rx.recv() => queued,
-        };
-        let Some(queued) = queued else {
+        let Some(queued) = rx.recv().await else {
             break;
         };
         queued_bytes.fetch_sub(queued.bytes.len(), Ordering::AcqRel);
