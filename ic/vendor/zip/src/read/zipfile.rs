@@ -6,7 +6,6 @@ use crate::HasZipMetadata;
 use crate::ZIP64_BYTES_THR;
 use crate::ZipReadOptions;
 use crate::format::data_descriptor::ZipDataDescriptor;
-use crate::format::ffi;
 use crate::format::flags::ZipFileFlags;
 use crate::format::system::System;
 use crate::read::ExtraField;
@@ -52,6 +51,21 @@ pub struct ZipFileEntry<'a> {
     pub(crate) data: Cow<'a, ZipFileData>,
 }
 
+/// Owned version of `ZipFileEntry`
+#[derive(Debug)]
+pub struct OwnedZipFileEntry {
+    pub(crate) file_name_raw: Box<[u8]>,
+    pub(crate) data: ZipFileData,
+}
+
+impl<'a> From<ZipFileEntry<'a>> for OwnedZipFileEntry {
+    fn from(entry: ZipFileEntry<'a>) -> Self {
+        Self {
+            file_name_raw: entry.file_name_raw.into_owned().into_boxed_slice(),
+            data: entry.data.into_owned(),
+        }
+    }
+}
 /// A struct for reading and seeking a zip file
 pub struct ZipFileSeek<'a, R> {
     pub(crate) file_name_raw: Cow<'a, [u8]>,
@@ -189,8 +203,7 @@ macro_rules! zip_file_methods {
 
         /// Returns whether the file is actually a symbolic link
         pub fn is_symlink(&self) -> bool {
-            self.unix_mode()
-                .is_some_and(|mode| mode & ffi::S_IFLNK == ffi::S_IFLNK)
+            self.get_metadata().is_symlink()
         }
 
         /// Returns whether the file is a normal file (i.e. not a directory or symlink)
@@ -230,6 +243,24 @@ impl HasZipMetadata for ZipFileEntryWithDataDescriptor<'_> {
     }
 }
 
+impl HasZipMetadata for OwnedZipFileEntry {
+    fn get_metadata(&self) -> &ZipFileData {
+        &self.data
+    }
+}
+
+impl OwnedZipFileEntry {
+    zip_file_methods!();
+
+    /// Convert the owned type to a `ZipFileEntry`
+    pub fn as_ref(&self) -> ZipFileEntry<'_> {
+        ZipFileEntry {
+            file_name_raw: Cow::Borrowed(&self.file_name_raw),
+            data: Cow::Borrowed(&self.data),
+        }
+    }
+}
+
 impl<'a> ZipFileEntry<'a> {
     zip_file_methods!();
 
@@ -260,6 +291,14 @@ impl HasZipMetadata for ZipFileEntry<'_> {
 impl<'a, R: Read + ?Sized> ZipFile<'a, R> {
     zip_file_methods!();
 
+    /// get the corresponding entry
+    pub fn entry(&self) -> ZipFileEntry<'_> {
+        ZipFileEntry {
+            file_name_raw: Cow::Borrowed(self.file_name_raw.as_ref()),
+            data: Cow::Borrowed(self.data.as_ref()),
+        }
+    }
+
     pub(crate) fn take_raw_reader(&mut self) -> io::Result<io::Take<&'a mut R>> {
         replace(&mut self.reader, ZipFileReader::NoReader).into_inner()
     }
@@ -270,51 +309,9 @@ impl<'a, R: Read + ?Sized> ZipFile<'a, R> {
     pub(crate) fn safe_prepare_path(
         &self,
         base_path: &Path,
-        outpath: &mut PathBuf,
         root_dir: Option<&(Vec<&OsStr>, impl RootDirFilter)>,
-    ) -> ZipResult<()> {
-        let file_name = self.name()?;
-        let components = self
-            .data
-            .simplified_components(&file_name)
-            .ok_or(invalid!("Invalid file path"))?;
-
-        let components = match root_dir {
-            Some((root_dir, filter)) => match components.strip_prefix(&**root_dir) {
-                Some(components) => components,
-
-                // In this case, we expect that the file was not in the root
-                // directory, but was filtered out when searching for the
-                // root directory.
-                None => {
-                    // We could technically find ourselves at this code
-                    // path if the user provides an unstable or
-                    // non-deterministic `filter` function.
-                    //
-                    // If debug assertions are on, we should panic here.
-                    // Otherwise, the safest thing to do here is to just
-                    // extract as-is.
-                    debug_assert!(
-                        !filter(&PathBuf::from_iter(components.iter())),
-                        "Root directory filter should not match at this point"
-                    );
-
-                    // Extract as-is.
-                    &components[..]
-                }
-            },
-
-            None => &components[..],
-        };
-
-        *outpath = crate::path::resolve_enclosed(
-            base_path,
-            base_path,
-            components.iter().map(|c| c.to_os_string()),
-            true, // create intermediate directories
-        )?;
-
-        Ok(())
+    ) -> ZipResult<PathBuf> {
+        safe_prepare_path_from_metadata(&self.file_name_raw, &self.data, base_path, root_dir)
     }
 
     /// Get the extra data of the zip header for this file
@@ -438,4 +435,32 @@ impl<R: Read + ?Sized> Drop for ZipFile<'_, R> {
             }
         }
     }
+}
+
+pub(crate) fn safe_prepare_path_from_metadata<Filter: RootDirFilter>(
+    file_name_raw: &[u8],
+    data: &ZipFileData,
+    base_path: &Path,
+    root_dir: Option<&(Vec<&OsStr>, Filter)>,
+) -> ZipResult<PathBuf> {
+    let file_name = data.name(file_name_raw)?;
+    let components = data
+        .simplified_components(&file_name)
+        .ok_or(invalid!("Invalid file path"))?;
+
+    let components = match root_dir {
+        Some((root_dir, filter)) => match components.strip_prefix(&**root_dir) {
+            Some(components) => components,
+            None => {
+                debug_assert!(
+                    !filter(&PathBuf::from_iter(components.iter())),
+                    "Root directory filter should not match at this point"
+                );
+                &components[..]
+            }
+        },
+        None => &components[..],
+    };
+
+    crate::path::resolve_enclosed(base_path, base_path, components.iter().copied(), true)
 }

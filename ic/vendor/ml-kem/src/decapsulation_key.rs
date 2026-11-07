@@ -8,13 +8,14 @@ use array::{
     Array, ArraySize,
     sizes::{U32, U64},
 };
+use core::fmt;
 use kem::{
     Ciphertext, Decapsulate, Decapsulator, Generate, InvalidKey, Kem, KeyExport, KeyInit,
     KeySizeUser,
 };
 use module_lattice::{
     MaybeBox,
-    ctutils::{CtEq, CtSelect},
+    ctutils::{Choice, CtEq, CtSelect},
 };
 use rand_core::{TryCryptoRng, TryRng};
 
@@ -23,7 +24,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// A `DecapsulationKey` provides the ability to generate a new key pair, and decapsulate an
 /// encapsulated shared key.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DecapsulationKey<P>
 where
     P: KemParams,
@@ -63,13 +64,14 @@ where
     #[deprecated(since = "0.3.0", note = "use `DecapsulationKey::from_seed` instead")]
     pub fn from_expanded(enc: &ExpandedDecapsulationKey<P>) -> Result<Self, InvalidKey> {
         let (dk_pke, ek_pke, h, z) = P::split_dk(enc);
-        let dk_pke = MaybeBox::new(DecryptionKey::from_bytes(dk_pke));
         let ek_pke = EncryptionKey::from_bytes(ek_pke)?;
 
         let ek = EncapsulationKey::from_encryption_key(ek_pke);
         if ek.h() != *h {
             return Err(InvalidKey);
         }
+
+        let dk_pke = MaybeBox::new(DecryptionKey::from_bytes(dk_pke));
 
         Ok(Self {
             dk_pke,
@@ -128,6 +130,18 @@ where
     }
 }
 
+// Only show the public encapsulation key so secrets don't end up in logs
+impl<P> fmt::Debug for DecapsulationKey<P>
+where
+    P: KemParams,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DecapsulationKey")
+            .field("ek", &self.ek)
+            .finish_non_exhaustive()
+    }
+}
+
 // Handwritten to omit `d` in the comparisons, so keys initialized from seeds compare equally to
 // keys initialized from the expanded form
 impl<P> PartialEq for DecapsulationKey<P>
@@ -135,7 +149,9 @@ where
     P: KemParams,
 {
     fn eq(&self, other: &Self) -> bool {
-        self.dk_pke.ct_eq(&other.dk_pke).into() && self.ek.eq(&other.ek) && self.z.eq(&other.z)
+        // Only the public encapsulation key may be compared in variable time.
+        let ek_eq = Choice::from_u8_lsb(u8::from(self.ek.eq(&other.ek)));
+        (self.dk_pke.ct_eq(&other.dk_pke) & ek_eq & self.z.ct_eq(&other.z)).into()
     }
 }
 
@@ -277,5 +293,43 @@ where
         let dk_pke = self.dk_pke.to_bytes();
         let ek = self.ek.to_bytes();
         P::concat_dk(dk_pke, ek, self.ek.h(), *self.z)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{MlKem512, MlKem768, MlKem1024};
+
+    fn key_equality<P: KemParams>() {
+        let key = DecapsulationKey::<P>::from_seed([0; 64].into());
+        let other = DecapsulationKey::<P>::from_seed([1; 64].into());
+
+        // Changing any one compared component must make the keys unequal.
+        let mut changed = key.clone();
+        changed.dk_pke = other.dk_pke.clone();
+        assert_ne!(key, changed);
+
+        let mut changed = key.clone();
+        changed.ek = other.ek.clone();
+        assert_ne!(key, changed);
+
+        for i in [0, 31] {
+            let mut changed = key.clone();
+            changed.z[i] ^= 1;
+            assert_ne!(key, changed);
+        }
+
+        // Seed provenance is deliberately omitted from equality.
+        let mut imported = key.clone();
+        imported.d = None;
+        assert_eq!(key, imported);
+    }
+
+    #[test]
+    fn equality_compares_all_key_components() {
+        key_equality::<MlKem512>();
+        key_equality::<MlKem768>();
+        key_equality::<MlKem1024>();
     }
 }

@@ -1,13 +1,32 @@
 # Security Policy
 
-## Supported Versions
+## Supported versions
 
 Only the latest released version (and, when a prerelease is newer than the latest stable release, that prerelease to a 
-limited extent) are supported.
+limited extent) are supported. Backports of security fixes or backward-compatibility shims for older major versions may
+be developed, but this is strictly best-effort; all users should update to the latest version as soon as possible.
 
-## Reporting a Vulnerability
+## Some "vulnerabilities" are necessary for backward-compatibility
 
-To report a vulnerability in a release or prerelease on crates.io, please go to 
+* In 9.x versions, `enforce_header_consistency` defaults to false in `ZipStreamReader`, `ZipReadOptions` and
+  `ExtractOptions`. This is necessary for backward compatibility with version 9.0.0, because the inconsistencies they
+  detect between local file headers and central directories also serve legitimate purposes. For example, they make it
+  possible to rename or suppress files in an archive given append-only access to it, and they can be used to save space
+  when an archive contains multiple copies of a file (as occurs when `ZipWriter::shallow_copy_file` is called). In 10.0.0,
+  `enforce_header_consistency` will become true by default, but this will require a major-version increment because it's a
+  breaking change.
+* `ExtractOptions` will never have a size limit by default, which leaves users vulnerable to "ZIP bombs", because
+  surprisingly large file sizes and compression ratios have legitimate uses, and users who rely on a disk quota at the
+  operating-system or container level will expect larger extractions to succeed when they increase that quota.
+
+## Reporting a vulnerability
+
+To report a vulnerability in a prerelease version or at the tip of the master branch, if no release versions are affected,
+please open an issue at https://github.com/zip-rs/zip2/issues. Prerelease versions and tip-of-master builds aren't expected
+to be secure, so full disclosure of vulnerabilities that are caught at that stage doesn't cost us trust, and it makes it
+easier to develop a fix collaboratively.
+
+To report a vulnerability in a release that's published on crates.io, please go to 
 https://github.com/zip-rs/zip2/security/advisories/new. We'll attempt to:
 
 * Close the report within 7 days without publishing it if:
@@ -37,11 +56,6 @@ the delay before full public disclosure will be determined as follows:
 * If a potential victim at credible risk requests more time to deploy a fix, then the withholding of details can
   be extended up to 30 days. This may be extended to 90 days for high-value government and nonprofit targets, when
   truly extraordinary circumstances are delaying the deployment.
-
-## Backporting
-
-Backports of security fixes to older major versions are strictly best-effort; all users should update to the latest 
-version as soon as possible.
 
 ## No yanked versions
 

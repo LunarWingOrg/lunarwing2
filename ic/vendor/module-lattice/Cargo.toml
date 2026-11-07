@@ -11,9 +11,9 @@
 
 [package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 name = "module-lattice"
-version = "0.2.3"
+version = "0.2.4"
 build = false
 autolib = false
 autobins = false
@@ -46,10 +46,7 @@ all-features = true
 
 [features]
 alloc = []
-ctutils = [
-    "dep:ctutils",
-    "array/ctutils",
-]
+ctutils = []
 zeroize = [
     "array/zeroize",
     "dep:zeroize",
@@ -69,12 +66,14 @@ path = "tests/encode.rs"
 
 [dependencies.array]
 version = "0.4.8"
-features = ["extra-sizes"]
+features = [
+    "ctutils",
+    "extra-sizes",
+]
 package = "hybrid-array"
 
 [dependencies.ctutils]
-version = "0.4"
-optional = true
+version = "0.4.7"
 
 [dependencies.num-traits]
 version = "0.2"

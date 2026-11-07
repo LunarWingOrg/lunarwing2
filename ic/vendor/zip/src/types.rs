@@ -1,7 +1,7 @@
 //! Types that specify what is contained in a ZIP.
 
 use crate::datetime::DateTime;
-use crate::extra_fields::ExtraFields;
+use crate::extra_fields::{ExtraField, ExtraFields};
 use crate::format::aes::{AesMode, AesVendorVersion};
 use crate::format::blocks::{FixedSizeBlock, ZipLocalEntryBlock};
 use crate::format::data_descriptor::{
@@ -22,8 +22,9 @@ use crate::read::{HeaderConsistencyMetadata, HeaderDataDescriptorMetadata};
 use crate::result::{ZipError, ZipResult, invalid};
 use crate::write::FileOptionExtension;
 use crate::write::FileOptions;
-use crate::{CompressionMethod, ExtraField, ZipReadOptions};
+use crate::{CompressionMethod, ZipReadOptions};
 
+use indexmap::IndexMap;
 use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::io::{Read, Seek, SeekFrom, Take};
@@ -78,6 +79,9 @@ pub struct ZipFileData {
     pub large_file: bool,
     /// extra fields, see <https://libzip.org/specifications/extrafld.txt>
     pub extra_fields: ExtraFields,
+    /// The file name as stored in the header, before applying a Unicode Path extra field.
+    pub(crate) overridden_header_name: Option<Box<[u8]>>,
+    pub(crate) header_language_encoding: bool,
 }
 
 impl ZipFileData {
@@ -140,7 +144,7 @@ impl ZipFileData {
         #[cfg(feature = "aes-crypto")]
         {
             use crate::ExtraField;
-            for one_extra in &self.extra_fields.inner {
+            for one_extra in self.extra_fields.inner.as_ref() {
                 if let ExtraField::AeXEncryption(aes) = one_extra {
                     return Some((aes.aes_mode, aes.aes_vendor_version));
                 }
@@ -252,6 +256,9 @@ impl ZipFileData {
         };
         HeaderConsistencyMetadata {
             name,
+            overridden_header_name: self.overridden_header_name.as_deref(),
+            is_directory: self.is_dir(name),
+            has_language_encoding: self.header_language_encoding,
             upath,
             upath_crc32,
             compression_method: self.compression_method.serialize_to_u16(),
@@ -266,10 +273,16 @@ impl ZipFileData {
                 is_pending_data_descriptor: is_local && is_using_data_descriptor,
             },
             #[cfg(feature = "aes-crypto")]
-            aes: self.extra_fields.inner.iter().rev().find_map(|f| match f {
-                ExtraField::AeXEncryption(aes) => Some(*aes),
-                _ => None,
-            }),
+            aes: self
+                .extra_fields
+                .inner
+                .as_ref()
+                .iter()
+                .rev()
+                .find_map(|f| match f {
+                    ExtraField::AeXEncryption(aes) => Some(*aes),
+                    _ => None,
+                }),
         }
     }
 
@@ -329,6 +342,17 @@ impl ZipFileData {
     /// Check if the file is a directory based on the file name.
     pub(crate) fn is_dir(&self, file_name: &[u8]) -> bool {
         is_dir(file_name)
+    }
+
+    pub(crate) fn is_non_dir_based_on_unix_mode(&self) -> bool {
+        self.unix_mode()
+            .is_some_and(|p| p & ffi::S_IFDIR != ffi::S_IFDIR)
+    }
+
+    /// Check if the file is a symbolic link.
+    pub(crate) fn is_symlink(&self) -> bool {
+        self.unix_mode()
+            .is_some_and(|mode| mode & crate::format::ffi::S_IFLNK == crate::format::ffi::S_IFLNK)
     }
 
     pub(crate) fn file_name_sanitized(&self, file_name: &str) -> PathBuf {
@@ -395,8 +419,10 @@ impl ZipFileData {
         options: &FileOptions<'_, '_, T>,
         raw_values: &ZipRawValues,
         header_start: u64,
-        #[cfg_attr(not(feature = "aes-crypto"), allow(unused_mut))] mut extra_fields: ExtraFields,
-    ) -> Self {
+        #[cfg_attr(not(feature = "aes-crypto"), allow(unused_mut))] mut extra_fields: Vec<
+            ExtraField,
+        >,
+    ) -> ZipFileData {
         // Figure out the underlying compression_method and aes mode when using
         // AES encryption.
         // Preserve AES method for raw copies without needing a password
@@ -411,11 +437,11 @@ impl ZipFileData {
                 use crate::extra_fields::AexEncryption;
                 // Write AES encryption extra data.
                 // For raw copies of AES entries, write the correct AES extra data immediately
-                extra_fields
-                    .inner
-                    .push(crate::extra_fields::ExtraField::AeXEncryption(
-                        AexEncryption::new(vendor_version, mode, compression_method),
-                    ));
+                extra_fields.push(ExtraField::AeXEncryption(AexEncryption::new(
+                    vendor_version,
+                    mode,
+                    compression_method,
+                )));
             }
             _ => {}
         }
@@ -476,7 +502,11 @@ impl ZipFileData {
             central_header_start: 0,
             external_attributes,
             large_file: options.large_file,
-            extra_fields,
+            extra_fields: ExtraFields {
+                inner: extra_fields.into_boxed_slice(),
+            },
+            overridden_header_name: None,
+            header_language_encoding: flags.matching(ZipFlags::LanguageEncoding),
         };
         local_block.version_made_by = local_block.version_needed() as u8;
         local_block
@@ -485,7 +515,7 @@ impl ZipFileData {
     pub(crate) fn from_local_block(
         block: ZipLocalEntryBlock,
         extra_fields: ExtraFields,
-    ) -> ZipResult<Self> {
+    ) -> ZipResult<ZipFileData> {
         let ZipLocalEntryBlock {
             version_made_by,
             flags,
@@ -521,6 +551,8 @@ impl ZipFileData {
             external_attributes: 0,
             large_file: false,
             extra_fields,
+            overridden_header_name: None,
+            header_language_encoding: ZipFlags::matching(flags, ZipFlags::LanguageEncoding),
         };
         Ok(data)
     }
@@ -545,7 +577,8 @@ impl ZipFileData {
     pub(crate) fn drop_unicode_path_renaming(&mut self, file_name_raw: &[u8]) {
         const UNICODE_PATH: u16 = crate::format::extra_fields::ExtraFieldId::UnicodePath.as_u16();
         let crc = crc32fast::hash(file_name_raw);
-        self.extra_fields.inner.retain(|field| match field {
+        let mut inner = std::mem::take(&mut self.extra_fields.inner).into_vec();
+        inner.retain(|field| match field {
             ExtraField::UnicodePath(unicode) => {
                 unicode.crc32 != crc || *unicode.content == *file_name_raw
             }
@@ -556,6 +589,7 @@ impl ZipFileData {
             }
             _ => true,
         });
+        self.extra_fields.inner = inner.into_boxed_slice();
     }
 
     /// Sets the language encoding flag for this entry written under a new name.
@@ -672,6 +706,8 @@ impl ZipFileData {
         }
     }
 }
+
+pub(crate) type FilesByNameMap = IndexMap<Box<[u8]>, ZipFileData>;
 
 #[cfg(test)]
 mod tests {

@@ -11,9 +11,9 @@
 
 [package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 name = "ml-kem"
-version = "0.3.3"
+version = "0.3.4"
 build = false
 exclude = [
     "tests/key-gen.rs",
@@ -72,6 +72,10 @@ name = "ml_kem"
 path = "src/lib.rs"
 
 [[test]]
+name = "debug"
+path = "tests/debug.rs"
+
+[[test]]
 name = "pkcs8"
 path = "tests/pkcs8.rs"
 
@@ -102,7 +106,7 @@ default-features = false
 version = "0.3"
 
 [dependencies.module-lattice]
-version = "0.2.3"
+version = "0.2.4"
 features = ["ctutils"]
 
 [dependencies.pkcs8]

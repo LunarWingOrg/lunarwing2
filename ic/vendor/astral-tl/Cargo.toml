@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "astral-tl"
-version = "0.8.0"
+version = "0.8.1"
 build = false
 exclude = [".github/*"]
 autolib = false
@@ -34,6 +34,9 @@ categories = [
 ]
 license = "MIT"
 repository = "https://github.com/astral-sh/astral-tl"
+
+[badges.maintenance]
+status = "deprecated"
 
 [features]
 __INTERNALS_DO_NOT_USE = []

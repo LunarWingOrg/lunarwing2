@@ -13,7 +13,7 @@
 edition = "2018"
 rust-version = "1.83"
 name = "async-compression"
-version = "0.4.51"
+version = "0.4.52"
 authors = [
     "Wim Looman <wim@nemo157.com>",
     "Allen Bui <fairingrey@gmail.com>",
@@ -217,7 +217,7 @@ required-features = [
 ]
 
 [dependencies.compression-codecs]
-version = "0.4.46"
+version = "0.4.47"
 
 [dependencies.compression-core]
 version = "0.4.34"
