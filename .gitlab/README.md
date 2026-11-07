@@ -715,7 +715,7 @@ These run with `allow_failure: true`:
 - `rust-msrv-check`: becomes blocking once the declared MSRV (1.96.1) is confirmed
   green, closing the plan §15.5 reconciliation.
 - `secret-history`: runs on schedules and protected release-tag pipelines;
-  becomes blocking after historical findings are reviewed.
+  becomes blocking after the historical findings tracked in WI#575 are reviewed.
 
 Formerly observational, now blocking (goals 2.1.1.0 item 23): `rust-clippy-all`
 (clean all-features baseline landed) and `architecture-boundaries` (changed-line
