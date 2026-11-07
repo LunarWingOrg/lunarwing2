@@ -2535,8 +2535,20 @@ builds resolve the tenant checkout's HEAD as its owner and require the selected
 worker directory to be clean. That SHA is the image's `SOURCE_REVISION`, but it
 is a provenance identifier, not a trust boundary. The commit must already be an
 object in the operator checkout and an ancestor of the release ref being
-deployed: the `upgrade-tenant --target` ref, or the tenant's configured branch.
-Unknown and off-ref commits are refused before any image build.
+deployed. `build-tenant` and `build-all` use the operator checkout's current
+local branch (`refs/heads/*`), or its exact HEAD commit when detached; the
+tenant's branch name and detached state are never consulted. Upgrade candidates
+use the explicit `upgrade-tenant --target` ref, which may name a local branch,
+tag, remote-tracking ref, or commit. Any ancestor of the selected ref is
+accepted, not only its tip. Unknown and off-ref commits are refused before any
+image build.
+
+Fetch and fast-forward the operator checkout's current local branch before a
+default tenant build. Fetching only `origin/*` does not update that default, so
+a tenant at the newer remote tip is refused until the local branch advances.
+`--source-repo` / `LUNARWING_MT_SOURCE_REPO` selects the repository used to
+clone or update the tenant checkout; it does not replace the operator-checkout
+object and ancestry checks above.
 
 The Dockerfile and context are extracted from `git archive` of that commit in
 the operator checkout into a root-owned mode-0700 temporary directory. Links and
