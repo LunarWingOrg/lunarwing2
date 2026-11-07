@@ -370,7 +370,7 @@ fn cache_key(model: &str, request: &CompletionRequest) -> Option<String> {
 
     hasher.update(b"|metadata|");
     let mut metadata: Vec<_> = request.metadata.iter().collect();
-    metadata.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    metadata.sort_unstable_by_key(|(left, _)| *left);
     for (key, value) in metadata {
         hasher.update((key.len() as u64).to_le_bytes());
         hasher.update(key.as_bytes());
