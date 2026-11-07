@@ -1440,22 +1440,24 @@ build_all() {
   done <<< "$names"
 }
 
-# Run git against a worker build's source root, retrying as the directory's
-# owner when the invoking account (root) is refused by git's dubious-ownership
-# check — the shape shared_worker_source_root already uses for tenant checkouts.
+# Run git against a worker build's source root as its owner. Check ownership
+# before invoking git so a permissive caller safe.directory cannot make git read
+# a tenant-owned repository's configuration as root (WI#540).
 # Usage: _worker_source_git <source-root> <git args...>
 _worker_source_git() {
   local root="$1"; shift
-  local out owner
-  if out="$(git -C "$root" "$@" 2>/dev/null)"; then
-    printf '%s' "$out"
-    return 0
-  fi
+  local owner caller
   owner="$(stat -c %U "$root" 2>/dev/null)" || return 1
-  [[ -n "$owner" && "$owner" != "$(id -un)" ]] || return 1
-  # `cd /`: sudo keeps the caller's cwd, which the owner may not be able to
-  # enter (see _ctr).
-  ( cd / && exec sudo -u "$owner" git -C "$root" "$@" 2>/dev/null )
+  [[ -n "$owner" ]] || return 1
+  caller="$(id -un)" || return 1
+  if [[ "$owner" != "$caller" ]]; then
+    # `cd /`: sudo keeps the caller's cwd, which the owner may not be able to
+    # enter (see _ctr).
+    ( cd / && exec sudo -u "$owner" git -c safe.directory="$root" -C "$root" "$@" 2>/dev/null )
+  else
+    # Ignore caller safe.directory entries if discovery walks above this root.
+    git -c safe.directory= -C "$root" "$@" 2>/dev/null
+  fi
 }
 
 # Source revision for a worker image's org.opencontainers.image.revision label.
