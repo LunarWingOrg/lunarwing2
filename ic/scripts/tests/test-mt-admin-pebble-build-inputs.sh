@@ -22,6 +22,7 @@ expected_root="$LUNARWING_ROOT"
 expected_archive=false
 archived_dockerfile=""
 build_log=""
+build_should_fail=false
 capture_container_cmd() {
   case "$1" in
     build)
@@ -57,6 +58,7 @@ capture_container_cmd() {
       fi
       build_context="$1"
       [[ -z "$build_log" ]] || printf '%s\n' "$build_context" >>"$build_log"
+      [[ "$build_should_fail" != true ]] || return 1
       ;;
     tag) tag_calls+=("$2 $3") ;;
     rmi) rmi_calls+=("$2") ;;
@@ -183,6 +185,20 @@ expected_dockerfile="$(git -C "$tenant_root" show HEAD:pebble4lunarwing/Dockerfi
 [[ "$archived_dockerfile" == "$expected_dockerfile" ]] \
   || fail 'builder received working-tree bytes instead of the committed Dockerfile'
 [[ ! -e "$build_context" ]] || fail "archived build context was not removed: $build_context"
+
+build_pebble_worker false false "$tenant_root" origin/release
+[[ "$effective_revision" == "$tenant_head" && "$archived_dockerfile" == "$expected_dockerfile" ]] \
+  || fail 'upgrade-style origin/ref did not build the validated local release archive'
+build_should_fail=true
+if (trap - EXIT; build_pebble_worker false false "$tenant_root") >"$fixture_dir/build-failure.log" 2>&1; then
+  fail 'forced container build failure was accepted'
+fi
+build_should_fail=false
+failed_context="$(tail -n1 "$build_log")"
+[[ "$failed_context" == "$archive_parent"/lw-worker-source.* && ! -e "$failed_context" ]] \
+  || fail "failed build did not remove archived context: $failed_context"
+grep -Fq 'pebble worker image build failed' "$fixture_dir/build-failure.log" \
+  || fail 'forced build failure did not preserve the builder diagnostic'
 
 printf 'dirty tenant edit\n' >>"$tenant_root/pebble4lunarwing/Dockerfile"
 [[ "$archived_dockerfile" == "$expected_dockerfile" ]] \
