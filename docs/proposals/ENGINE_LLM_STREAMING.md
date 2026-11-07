@@ -89,7 +89,10 @@ RigAdapter
 `CachedProvider` requires a model identity that is known before dispatch.
 Responses selected through smart routing or failover therefore bypass the outer
 cache rather than risking a hit from a different backend. Content-free terminal
-responses are never inserted on either the blocking or streaming path.
+responses are never inserted on either the blocking or streaming path. Cache keys
+include canonical request metadata and serialization failures bypass insertion.
+Stream hits preserve the provider's original finish reason and retry/failover
+observations, including discarded token-usage accounting.
 
 It does not change engine execution or channel behavior. Engine V2 remains
 gateway-only by default. Any future WASM channel opt-in must follow the
