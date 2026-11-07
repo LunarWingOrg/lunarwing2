@@ -1386,6 +1386,11 @@ impl SecretValueRedactor {
         start: usize,
         end: usize,
     ) -> Vec<(usize, usize)> {
+        let start = crate::util::floor_char_boundary(haystack, start);
+        let mut end = end.min(haystack.len());
+        while end < haystack.len() && !haystack.is_char_boundary(end) {
+            end += 1;
+        }
         let slice = &haystack[start..end];
         if let Some(matcher) = &self.folded_matcher {
             return collect_automaton_ranges(
@@ -3058,6 +3063,18 @@ mod tests {
             assert!(scrubbed.contains("prefix"));
             assert!(scrubbed.contains("suffix"));
         }
+    }
+
+    #[test]
+    fn redactor_long_multibyte_raw_value_snaps_search_window_boundaries() {
+        // WU-1: the short-variant search windows around a long raw match must
+        // not slice through a multi-byte character at either computed margin.
+        let value = "€".repeat(1734);
+        assert!(value.len() > WRAP_LINE_VARIANT_CHAR_CAP);
+        let redactor = SecretValueRedactor::new([SecretString::from(value.clone())].as_slice());
+        let text = format!("prefix\n{value}\nsuffix");
+        let scrubbed = redactor.scrub(&text);
+        assert_eq!(scrubbed, "prefix\n[redacted-secret]\nsuffix");
     }
 
     #[test]
