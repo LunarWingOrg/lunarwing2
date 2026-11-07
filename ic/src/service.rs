@@ -223,7 +223,8 @@ fn install_linux_systemd_user() -> Result<()> {
 
     let exe = std::env::current_exe().context("failed to resolve current executable")?;
     let bridge_exe = linux_bridge_executable_path(&exe);
-    let unit = linux_unit_content(&exe, bridge_exe.is_some());
+    let env_file = lunarwing_base_dir().join("env/lunarwing.env");
+    let unit = linux_unit_content(&exe, &env_file, bridge_exe.is_some());
 
     std::fs::write(&file, unit)?;
     if let Some(bridge_exe) = bridge_exe {
@@ -579,7 +580,7 @@ fn disable_legacy_macos_service() -> Result<()> {
     Ok(())
 }
 
-fn linux_unit_content(exe: &Path, include_xmpp_bridge: bool) -> String {
+fn linux_unit_content(exe: &Path, env_file: &Path, include_xmpp_bridge: bool) -> String {
     let bridge_unit_lines = if include_xmpp_bridge {
         format!(
             "Wants={bridge}\n\
@@ -602,6 +603,7 @@ fn linux_unit_content(exe: &Path, include_xmpp_bridge: bool) -> String {
          Environment=\"AGENT_NAME=lunarwing\"\n\
          Environment=\"ALLOW_PRIVATE_IPS=1\"\n\
          Environment=\"PGSSLMODE=disable\"\n\
+         EnvironmentFile=-{env_file}\n\
          ExecStart=\"{exe}\" run\n\
          Restart=always\n\
          RestartSec=3\n\
@@ -609,6 +611,7 @@ fn linux_unit_content(exe: &Path, include_xmpp_bridge: bool) -> String {
          [Install]\n\
          WantedBy=default.target\n",
         exe = exe.display(),
+        env_file = env_file.display(),
         bridge_unit_lines = bridge_unit_lines,
     )
 }
@@ -1191,10 +1194,24 @@ mod tests {
 
     #[test]
     fn linux_unit_content_adds_bridge_dependency_when_enabled() {
-        let unit = linux_unit_content(Path::new("/tmp/lunarwing"), true);
+        let unit = linux_unit_content(
+            Path::new("/tmp/lunarwing"),
+            Path::new("/srv/lunarwing/env/lunarwing.env"),
+            true,
+        );
         assert!(unit.contains("Wants=xmpp-bridge.service"));
         assert!(unit.contains("After=network.target xmpp-bridge.service"));
         assert!(unit.contains("ExecStart=\"/tmp/lunarwing\" run"));
+    }
+
+    #[test]
+    fn linux_unit_content_loads_optional_env_file() {
+        let unit = linux_unit_content(
+            Path::new("/tmp/lunarwing"),
+            Path::new("/srv/lunarwing/env/lunarwing.env"),
+            false,
+        );
+        assert!(unit.contains("EnvironmentFile=-/srv/lunarwing/env/lunarwing.env\n"));
     }
 
     #[test]
