@@ -100,6 +100,7 @@ assert_eq "timer cadence scales with long interval" "OnCalendar=*:0/45" \
   "$(grep '^OnCalendar=' "$SD_DIR/lunarwing-mt-health.timer")"
 
 printf 'LUNARWING_MT_HEALTH_INTERVAL_MIN=23\n' >"$HEALTH_ENV_FILE"
+# shellcheck disable=SC2034
 INIT_SYSTEM="openrc"
 HEALTH_INTERVAL_MIN=""
 ensure_init_system
