@@ -1475,8 +1475,8 @@ pub struct PromotionSummary {
     pub records: Vec<PromotionRecord>,
     pub rejections: Vec<PromotionRejection>,
     pub dropped_rejections: usize,
-    /// True when promotion never ran (failed job, container teardown failure,
-    /// missing resolver); `reason` says why.
+    /// True when promotion did not run or stopped before every accepted write
+    /// completed; `reason` says why. Records completed before a deadline remain.
     pub skipped: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skip_reason: Option<String>,

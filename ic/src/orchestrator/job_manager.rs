@@ -1751,22 +1751,18 @@ async fn run_promotion_with_timeout(
     policy: &harness::WriteBackPolicy,
     timeout: std::time::Duration,
 ) -> harness::PromotionSummary {
-    match tokio::time::timeout(
+    let mut summary = harness::PromotionSummary::default();
+    let result = tokio::time::timeout(
         timeout,
-        run_promotion(deps, job_id, owner_id, staging, policy),
+        run_promotion_into(deps, job_id, owner_id, staging, policy, &mut summary),
     )
-    .await
-    {
-        Ok(summary) => summary,
-        Err(_) => {
-            tracing::warn!(job_id = %job_id, "Harness write-back promotion deadline exceeded");
-            harness::PromotionSummary {
-                skipped: true,
-                skip_reason: Some("promotion deadline exceeded".to_string()),
-                ..Default::default()
-            }
-        }
+    .await;
+    if result.is_err() {
+        tracing::warn!(job_id = %job_id, "Harness write-back promotion deadline exceeded");
+        summary.skipped = true;
+        summary.skip_reason = Some("promotion deadline exceeded".to_string());
     }
+    summary
 }
 
 /// Run the write-back promotion pipeline: screen staged files, snapshot the
@@ -1782,11 +1778,19 @@ async fn run_promotion(
     policy: &harness::WriteBackPolicy,
 ) -> harness::PromotionSummary {
     let mut summary = harness::PromotionSummary::default();
-    // CW-10: scan staged content for the job's own mounted secret values in
-    // addition to the pattern-based leak scan.
+    run_promotion_into(deps, job_id, owner_id, staging, policy, &mut summary).await;
+    summary
+}
+
+async fn run_promotion_into(
+    deps: &PromotionDeps,
+    job_id: Uuid,
+    owner_id: &str,
+    staging: &std::path::Path,
+    policy: &harness::WriteBackPolicy,
+    summary: &mut harness::PromotionSummary,
+) {
     let redactor = deps.token_store.harness_secret_redactor(job_id).await;
-    // DH-10: the staging walk is blocking filesystem IO — keep it off the
-    // async executor.
     let staging_buf = staging.to_path_buf();
     let policy_owned = policy.clone();
     let planned = tokio::task::spawn_blocking(move || {
@@ -1798,24 +1802,24 @@ async fn run_promotion(
         Ok(Err(e)) => {
             summary.skipped = true;
             summary.skip_reason = Some(format!("staging scan failed: {e}"));
-            return summary;
+            return;
         }
         Err(e) => {
             summary.skipped = true;
             summary.skip_reason = Some(format!("staging scan task failed: {e}"));
-            return summary;
+            return;
         }
     };
     summary.rejections = plan.rejections;
     summary.dropped_rejections = plan.dropped_rejections;
     if plan.accepted.is_empty() {
-        return summary;
+        return;
     }
 
     let Some(resolver) = &deps.workspace else {
         summary.skipped = true;
         summary.skip_reason = Some("no workspace available for write-back promotion".to_string());
-        return summary;
+        return;
     };
     let workspace = resolver.resolve(owner_id).await;
     for write in plan.accepted {
@@ -1827,7 +1831,6 @@ async fn run_promotion(
             }),
         }
     }
-    summary
 }
 
 /// Preserve the actual write scope's prior content before an overwrite. Only
