@@ -1160,6 +1160,10 @@ impl LlmProvider for SmartRoutingProvider {
         self.primary.effective_model_name(requested_model)
     }
 
+    fn cache_key_model_name(&self, _requested_model: Option<&str>) -> Option<String> {
+        None
+    }
+
     fn active_model_name(&self) -> String {
         self.primary.active_model_name()
     }
