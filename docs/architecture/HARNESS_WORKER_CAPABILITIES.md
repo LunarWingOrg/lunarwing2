@@ -24,10 +24,12 @@ redaction.
 
 The v2.1.9.0 WI#383 changes close four more residual gaps:
 
-- Direct and folded secret variants are searched through per-job Aho-Corasick
-  automatons instead of one search per variant per event. Encoded values also
-  arm aligned 48-character base64 and 32-character hex chunks, so large and
-  non-canonically wrapped partial output is scrubbed in aligned units.
+- Bounded direct and folded secret variants are searched through per-job
+  Aho-Corasick automatons instead of one search per variant per event; long raw
+  values and whole encodings use sequential scans and suppress redundant chunk
+  searches in their spans. Encoded values also arm aligned 48-character base64
+  and 32-character hex chunks, so large and non-canonically wrapped partial
+  output is scrubbed in aligned units.
 - Per-line JSON-escaped variants prevent a raw line ending in a backslash from
   splitting a JSON escape during replacement.
 - A dispatch drop guard removes partial harness directories on every return
@@ -121,11 +123,15 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
   JSON (EE-11).
   Variants are sorted longest-first across all mounted values. JSON object
   keys are also scrubbed. Direct and folded lists each have one per-job
-  Aho-Corasick automaton, built once and cached next to the held secrets rather
-  than searched variant-by-variant for every event (EE-1). The daemon re-scrubs
-  event ingest and `/complete` before persistence and broadcast; the redactor
-  is cleared on the same terminal paths, and cache insertion is skipped when a
-  terminal clear raced the build (EE-4).
+  Aho-Corasick automaton for variants up to 4096 bytes, built once and cached
+  next to the held secrets. Longer raw values and whole encodings use direct
+  sequential scans; their folded matches suppress redundant chunk searches in
+  the covered spans, with a bounded overlap margin around remaining gaps. This
+  avoids pathological automaton construction and overlapping-match volume on
+  repetitive maximum-size values (EE-1). The daemon re-scrubs event ingest and
+  `/complete` before persistence and broadcast; the redactor is cleared on the
+  same terminal paths, and cache insertion is skipped when a terminal clear
+  raced the build (EE-4).
   - NOT covered (documented gaps): offset/grouped dump formats — plain
     `xxd`, `od`, `hexdump -C` — which interleave offsets and ASCII columns
     and never contain a contiguous encoded span; base32 and other alphabets;

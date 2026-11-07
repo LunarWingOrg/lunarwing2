@@ -2619,6 +2619,8 @@ mod tests {
         let values = vec![SecretString::from(value.to_string())];
         let redactor = SecretValueRedactor::new(&values);
         assert!(redactor.is_armed());
+        assert!(redactor.direct_matcher.is_some());
+        assert!(redactor.folded_matcher.is_some());
 
         let b64 = base64::engine::general_purpose::STANDARD.encode(value);
         let url = urlencoding::encode(value).into_owned();
@@ -2795,7 +2797,6 @@ mod tests {
         use base64::Engine;
         let value = "V".repeat(MAX_SECRET_BYTES);
         let redactor = SecretValueRedactor::new([SecretString::from(value.clone())].as_slice());
-        assert!(redactor.direct_matcher.is_some());
         assert!(redactor.folded_matcher.is_some());
         let b64 = base64::engine::general_purpose::STANDARD.encode(&value);
         for width in [64usize, 76] {
