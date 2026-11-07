@@ -20,6 +20,7 @@ tag_calls=()
 rmi_calls=()
 expected_root="$LUNARWING_ROOT"
 expected_archive=false
+expected_lane=pebble4lunarwing
 archived_dockerfile=""
 build_log=""
 build_should_fail=false
@@ -47,7 +48,11 @@ capture_container_cmd() {
           *) shift ;;
         esac
       done
-      if [[ "$expected_archive" == true ]]; then
+      if [[ "$expected_archive" == true && "$expected_lane" == kimicode4lunarwing ]]; then
+        [[ -z "$used_dockerfile" && "$1" == "$archive_parent"/lw-worker-source.*/kimicode4lunarwing ]] \
+          || fail "tenant Kimi build did not use a private archived lane context: $1"
+        archived_dockerfile="$(<"$1/Dockerfile")"
+      elif [[ "$expected_archive" == true ]]; then
         [[ "$used_dockerfile" == "$1/pebble4lunarwing/Dockerfile" \
           && "$1" != "$tenant_root" && "$1" == "$archive_parent"/lw-worker-source.* ]] \
           || fail "tenant build did not use a private archived context: $1"
@@ -139,9 +144,10 @@ fixture_dir="$(mktemp -d)"
 trap 'rm -rf "$fixture_dir"' EXIT
 git_fixture() { git -C "$1" -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false "${@:2}"; }
 reviewed_root="$LUNARWING_ROOT"
-make_pebble_checkout() {
-  mkdir -p "$1/pebble4lunarwing/upstream"
+make_worker_checkout() {
+  mkdir -p "$1/pebble4lunarwing/upstream" "$1/kimicode4lunarwing"
   printf 'FROM scratch\n' >"$1/pebble4lunarwing/Dockerfile"
+  printf 'FROM scratch\nLABEL lane=kimi\n' >"$1/kimicode4lunarwing/Dockerfile"
   cp "$reviewed_root/pebble4lunarwing/upstream/Cargo.lock" "$1/pebble4lunarwing/upstream/Cargo.lock"
   git_fixture "$1" init -q
   git_fixture "$1" add -A
@@ -153,21 +159,24 @@ archive_parent="$fixture_dir/archives"
 build_log="$fixture_dir/build-contexts"
 mkdir -p "$archive_parent"
 : >"$build_log"
-make_pebble_checkout "$operator_root"
+make_worker_checkout "$operator_root"
 git -C "$operator_root" branch -M main
+base_head="$(git -C "$operator_root" rev-parse HEAD)"
 git clone -q "$operator_root" "$tenant_root"
 git -C "$tenant_root" checkout -q -B release
-printf 'operator edit\n' >>"$operator_root/pebble4lunarwing/Dockerfile"
 printf 'tenant commit\n' >>"$tenant_root/pebble4lunarwing/Dockerfile"
 git_fixture "$tenant_root" commit -qam tenant
 tenant_head="$(git -C "$tenant_root" rev-parse HEAD)"
-git -C "$operator_root" fetch -q "$tenant_root" HEAD:refs/heads/release
+git -C "$operator_root" fetch -q "$tenant_root" HEAD
+git -C "$operator_root" merge -q --ff-only "$tenant_head"
+git -C "$operator_root" update-ref refs/remotes/origin/release "$tenant_head"
+printf 'operator edit\n' >>"$operator_root/pebble4lunarwing/Dockerfile"
 
 build_count() { wc -l <"$build_log"; }
-assert_build_refusal() {  # <label> <required diagnostic>
-  local label="$1" diagnostic="$2" before
+assert_build_refusal() {  # <label> <required diagnostic> [explicit release ref]
+  local label="$1" diagnostic="$2" release_ref="${3:-}" before
   before="$(build_count)"
-  if (build_pebble_worker false false "$tenant_root") >"$fixture_dir/$label.log" 2>&1; then
+  if (build_pebble_worker false false "$tenant_root" "$release_ref") >"$fixture_dir/$label.log" 2>&1; then
     fail "$label was accepted"
   fi
   grep -Fq -- "$diagnostic" "$fixture_dir/$label.log" \
@@ -186,11 +195,32 @@ expected_dockerfile="$(git -C "$tenant_root" show HEAD:pebble4lunarwing/Dockerfi
   || fail 'builder received working-tree bytes instead of the committed Dockerfile'
 [[ ! -e "$build_context" ]] || fail "archived build context was not removed: $build_context"
 
+# Default provenance comes only from the operator, including detached HEADs.
+git -C "$operator_root" checkout -q --detach main
+git -C "$tenant_root" checkout -q --detach "$tenant_head"
+build_pebble_worker false false "$tenant_root"
+[[ "$effective_revision" == "$tenant_head" ]] \
+  || fail 'detached operator/tenant HEADs did not use the exact operator commit'
+git -C "$operator_root" checkout -q main
+
+git -C "$tenant_root" checkout -q --detach "$base_head"
+build_pebble_worker false false "$tenant_root"
+[[ "$effective_revision" == "$base_head" ]] \
+  || fail 'an ancestor on the operator release branch was not accepted'
+git -C "$tenant_root" checkout -q --detach "$tenant_head"
+
+expected_lane=kimicode4lunarwing
+build_kimi_worker false false "" "$tenant_root"
+expected_lane=pebble4lunarwing
+expected_kimi_dockerfile="$(git -C "$tenant_root" show HEAD:kimicode4lunarwing/Dockerfile)"
+[[ "$effective_revision" == "$tenant_head" && "$archived_dockerfile" == "$expected_kimi_dockerfile" ]] \
+  || fail 'Kimi did not build from the validated operator archive'
+
 build_pebble_worker false false "$tenant_root" origin/release
 [[ "$effective_revision" == "$tenant_head" && "$archived_dockerfile" == "$expected_dockerfile" ]] \
   || fail 'upgrade-style origin/ref did not build the validated local release archive'
 build_should_fail=true
-if (trap - EXIT; build_pebble_worker false false "$tenant_root") >"$fixture_dir/build-failure.log" 2>&1; then
+if (build_pebble_worker false false "$tenant_root") >"$fixture_dir/build-failure.log" 2>&1; then
   fail 'forced container build failure was accepted'
 fi
 build_should_fail=false
@@ -213,11 +243,32 @@ assert_build_refusal unknown-head "$unknown_head"
 grep -Fq 'unknown to operator checkout' "$fixture_dir/unknown-head.log" \
   || fail 'unknown tenant HEAD refusal is not explicit'
 
+# A tenant branch named for an operator remote branch or tag must not select it.
+git -C "$operator_root" fetch -q "$tenant_root" HEAD:refs/remotes/origin/wip
+git -C "$operator_root" tag old-release "$unknown_head"
+git -C "$tenant_root" checkout -q -B wip
+assert_build_refusal tenant-remote-ref 'not on operator release ref refs/heads/main'
+git -C "$tenant_root" checkout -q -B old-release
+assert_build_refusal tenant-tag-ref 'not on operator release ref refs/heads/main'
+build_pebble_worker false false "$tenant_root" origin/wip
+[[ "$effective_revision" == "$unknown_head" ]] \
+  || fail 'an explicit operator remote ref was not honored'
+
+# Committed links fail closed after provenance succeeds but before any build.
+git -C "$tenant_root" checkout -q -B linked "$tenant_head"
+ln -s Dockerfile "$tenant_root/pebble4lunarwing/archived-link"
+git_fixture "$tenant_root" add -A
+git_fixture "$tenant_root" commit -qm linked
+git -C "$operator_root" fetch -q "$tenant_root" HEAD:refs/heads/link-check
+assert_build_refusal linked-source 'contains a link or special file' refs/heads/link-check
+[[ -z "$(find "$archive_parent" -mindepth 1 -maxdepth 1 -print -quit)" ]] \
+  || fail 'link refusal left an archived context behind'
+
 git_fixture "$operator_root" commit -qam main-only
 off_ref_head="$(git -C "$operator_root" rev-parse HEAD)"
 git -C "$tenant_root" fetch -q "$operator_root" main
 git_fixture "$tenant_root" reset -q --hard "$off_ref_head"
-assert_build_refusal off-release 'not on operator release ref refs/heads/release'
+assert_build_refusal off-release 'not on operator release ref refs/remotes/origin/release' origin/release
 
 expected_archive=false
 LUNARWING_ROOT="$reviewed_root"
