@@ -395,6 +395,14 @@ def validate_release_gates(merged: dict, defaults: dict, errors: list[str]) -> N
         if not release or RELEASE_TAG_PREDICATE not in release[0]:
             errors.append(f"{job_name} must run for protected release tags")
 
+    expected_history_rules = [
+        {"if": FULL_VALIDATION_RULES[1]},
+        {"if": FULL_VALIDATION_RULES[-1]},
+        {"when": "never"},
+    ]
+    if merged.get("secret-history", {}).get("rules") != expected_history_rules:
+        errors.append("secret-history must run only for schedules and protected release tags")
+
 
 def validate_opencode2_exposure_verify(merged: dict, errors: list[str]) -> None:
     job = merged.get("worker-opencode2-exposure-verify")
