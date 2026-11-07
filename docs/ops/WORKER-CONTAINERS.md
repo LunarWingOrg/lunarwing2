@@ -2524,22 +2524,47 @@ sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant <tenant>  # logs "config ch
 
 Rollout note: the first `start-tenant` after upgrading mt-admin to this version recreates every worker container once, because the stored contract hash gains the image segment. The replaced image stays in the tenant store until the next rebuild's prune. `ic/scripts/tests/test-mt-admin-worker-image-contract.sh` pins the behaviour for all four lanes on both paths.
 
-mt-admin builds also stamp `org.opencontainers.image.revision` with the source checkout's commit (the `SOURCE_REVISION` build-arg every worker Dockerfile declares and CI already passed; mt-admin builds left it `unknown`). `-dirty` is appended when the worker directory has uncommitted or untracked changes and `unknown` is kept outside a git checkout, so a deployed image can be traced to a target commit:
+mt-admin builds also stamp `org.opencontainers.image.revision` with the source checkout's commit (the `SOURCE_REVISION` build-arg every worker Dockerfile declares and CI already passed; mt-admin builds left it `unknown`). Standalone per-lane builds retain the live operator-checkout behavior: `-dirty` is appended when the worker directory has uncommitted or untracked changes and `unknown` is kept outside a git checkout, so a deployed image can be traced to a target commit:
 
 ```bash
 podman image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' lunarwing-worker-kimi:latest
 ```
 
-For Pebble, `build-tenant`, `build-all`, and pre-stop upgrade candidate builds
-pass the tenant checkout to `build_pebble_worker`; only the standalone
-`build-pebble-worker` command uses the operator checkout. Tenant Pebble sources
-must resolve to a clean commit, so the shared image cannot silently include a
-dirty tenant tree or the operator's uncommitted `pebble4lunarwing/` edits.
-`build-all` also includes Pebble in its dirty-source and mixed-revision checks.
-The fat-build smoke script is host-executed by root and therefore always comes
-from the operator checkout, even when the image context comes from a tenant
-(WI#507). `test-mt-admin-pebble-build-inputs.sh` pins these boundaries and the
-upgrade harness exercises the candidate call site.
+For all four lanes, `build-tenant`, `build-all`, and pre-stop upgrade candidate
+builds resolve the tenant checkout's HEAD as its owner and require the selected
+worker directory to be clean. That SHA is the image's `SOURCE_REVISION`, but it
+is a provenance identifier, not a trust boundary. The commit must already be an
+object in the operator checkout and an ancestor of the release ref being
+deployed. `build-tenant` and `build-all` use the operator checkout's current
+local branch (`refs/heads/*`), or its exact HEAD commit when detached; the
+tenant's branch name and detached state are never consulted. Upgrade candidates
+use the explicit `upgrade-tenant --target` ref, which may name a local branch,
+tag, remote-tracking ref, or commit. Any ancestor of the selected ref is
+accepted, not only its tip. Unknown and off-ref commits are refused before any
+image build.
+
+Fetch and fast-forward the operator checkout's current local branch before a
+default tenant build. Fetching only `origin/*` does not update that default, so
+a tenant at the newer remote tip is refused until the local branch advances.
+`--source-repo` / `LUNARWING_MT_SOURCE_REPO` selects the repository used to
+clone or update the tenant checkout; it does not replace the operator-checkout
+object and ancestry checks above.
+
+The Dockerfile and context are extracted from `git archive` of that commit in
+the operator checkout into a root-owned mode-0700 temporary directory. Links and
+special files are refused, and the directory is removed on exit. Tenant-authored
+working-tree bytes therefore never reach the rootful builder, and uncommitted
+operator edits are excluded too. Standalone `build-<lane>-worker` commands keep
+using the operator checkout directly. `build-all` retains its clean-source and
+mixed-revision checks across tenants.
+
+Podman builds retain `--network=host` because the affected hosts' default build
+network cannot reach upstreams; this is an operator networking choice, and the
+context is now the validated operator archive rather than a tenant directory.
+It does not change the runtime per-tenant egress allowlist. Pebble's fat-build
+smoke script is host-executed by root and likewise always comes from the
+operator checkout (WI#507/WI#539). `test-mt-admin-pebble-build-inputs.sh` pins
+these boundaries and the upgrade harness exercises the candidate call site.
 
 ### Upgrade ordering
 

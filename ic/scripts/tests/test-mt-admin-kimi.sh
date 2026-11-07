@@ -976,7 +976,7 @@ docker() { BUILD_CALL="$*"; }
 BUILD_CALL=''
 # Function comes from sourced mt-admin later in ShellCheck's composed parse.
 # shellcheck disable=SC2218
-build_kimi_worker false true 9.9.9 "$fixture/target" >/dev/null
+LUNARWING_ROOT="$fixture/target" build_kimi_worker false true 9.9.9 "$fixture/target" >/dev/null
 if [[ "$BUILD_CALL" == *'--build-arg WITH_TOOLCHAINS=true'* \
   && "$BUILD_CALL" == *'--build-arg KIMI_CODE_VERSION=9.9.9'* \
   && "$BUILD_CALL" == *"$fixture/target/kimicode4lunarwing" ]]; then

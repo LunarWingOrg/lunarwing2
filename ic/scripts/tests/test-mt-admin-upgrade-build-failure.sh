@@ -470,18 +470,22 @@ fi
 pebble_root_file="$fixture/pebble-source-root"
 pebble_tag_file="$fixture/pebble-built-tag"
 pebble_ref_file="$fixture/pebble-built-ref"
+pebble_release_file="$fixture/pebble-release-ref"
 build_pebble_worker() {
   printf '%s\n' "${3:-}" >"$pebble_root_file"
+  printf '%s\n' "${4:-}" >"$pebble_release_file"
   printf '%s\n' "${LUNARWING_WORKER_IMAGE_TAG:-}" >"$pebble_tag_file"
   worker_image_ref pebble >"$pebble_ref_file"
   return 0
 }
 : >"$lane_file"
-capture build_candidate_workers fixture false false false true false
+capture build_candidate_workers fixture false false false true false refs/heads/moving
 if [[ "$rc" -ne 0 ]]; then
   fail "real pebble candidate builder failed (rc=$rc): $output"
 elif [[ "$(cat "$pebble_root_file" 2>/dev/null)" != "$fixture_repo" ]]; then
   fail "pebble candidate used source root '$(cat "$pebble_root_file" 2>/dev/null)' instead of the tenant checkout"
+elif [[ "$(cat "$pebble_release_file" 2>/dev/null)" != refs/heads/moving ]]; then
+  fail "pebble candidate lost the operator release ref: '$(cat "$pebble_release_file" 2>/dev/null)'"
 elif [[ "$(cat "$pebble_tag_file" 2>/dev/null)" != wi527-fixture ]]; then
   fail "pebble candidate passed a wrong image tag: '$(cat "$pebble_tag_file" 2>/dev/null)'"
 elif [[ "$(cat "$pebble_ref_file" 2>/dev/null)" != "$(upgrade_candidate_image_ref fixture pebble)" ]]; then
@@ -489,7 +493,7 @@ elif [[ "$(cat "$pebble_ref_file" 2>/dev/null)" != "$(upgrade_candidate_image_re
 elif ! grep -qx pebble "$lane_file"; then
   fail "pebble candidate builder did not record the lane: $(cat "$lane_file")"
 else
-  pass 'real pebble candidate builder uses the tenant source root and per-tenant tag'
+  pass 'real pebble candidate builder forwards the tenant root, release ref, and per-tenant tag'
 fi
 printf 'kimi\n' >"$lane_file"
 

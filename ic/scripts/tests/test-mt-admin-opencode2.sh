@@ -446,6 +446,7 @@ docker() { fake_container_runtime docker "$@"; }
 podman() { fake_container_runtime podman "$@"; }
 : > "$fixture/tag-calls"
 BUILD_CALL=''
+export LUNARWING_ROOT="$fixture/target"
 build_opencode2_worker false true "$fixture/target" >/dev/null
 if [[ "$BUILD_CALL" == *'--build-arg WITH_TOOLCHAINS=true'* \
   && "$BUILD_CALL" == *'-t lunarwing-worker-opencode2:candidate'* \

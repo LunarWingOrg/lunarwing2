@@ -414,7 +414,7 @@ else
   # as an explicit opt-in for a pebble lane the registry does not list.
   # TD-6/TD-11: on candidate build failure revert the checkout and pop the stash
   # so the running tenant's clone is exactly as it was.
-  cand_args=(build-worker-candidates "$TENANT" --enabled)
+  cand_args=(build-worker-candidates "$TENANT" --enabled --target "$TARGET_REF")
   $WITH_PEBBLE && cand_args+=(--with-pebble)
   cand_rc=0
   set +e

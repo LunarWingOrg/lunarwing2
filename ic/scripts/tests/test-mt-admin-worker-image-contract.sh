@@ -704,9 +704,9 @@ build_arg_seen() {  # <image tag> <SOURCE_REVISION value>
 # production keeps that ownership transition mandatory.
 chown() { :; }
 CALLS=()
-build_kimi_worker false false "" "$repo"
-build_opencode_worker false false "$repo"
-build_opencode2_worker false false "$repo"
+LUNARWING_ROOT="$repo" build_kimi_worker false false "" "$repo"
+LUNARWING_ROOT="$repo" build_opencode_worker false false "$repo"
+LUNARWING_ROOT="$repo" build_opencode2_worker false false "$repo"
 LUNARWING_ROOT="$repo" build_pebble_worker false false
 for worker in kimi opencode opencode2 pebble; do
   build_tag="lunarwing-worker-${worker}:latest"
@@ -722,7 +722,7 @@ assert_call "podman:tag $expected_image_id lunarwing-worker-opencode2:latest" \
   'opencode2 promotion tags the verified immutable ID'
 printf 'FROM scratch\nLABEL fixture=2\n' >"$repo/kimicode4lunarwing/Dockerfile"
 CALLS=()
-build_kimi_worker false false "" "$repo"
+LUNARWING_ROOT="$repo" build_kimi_worker false false "" "$repo"
 if build_arg_seen lunarwing-worker-kimi:latest "${head}-dirty"; then
   pass 'dirty worker dir stamps SOURCE_REVISION=HEAD-dirty'
 else
