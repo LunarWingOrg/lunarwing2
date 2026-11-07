@@ -43,6 +43,38 @@ detect_init_system() {
   die "could not detect a supported service manager; set LUNARWING_SERVICE_MANAGER=systemd or openrc"
 }
 
+_persisted_health_interval() {
+  [[ -r "$HEALTH_ENV_FILE" ]] || return 0
+  awk -F= '
+    $1 == "LUNARWING_MT_HEALTH_INTERVAL_MIN" {
+      sub(/^[^=]*=/, "")
+      value = $0
+    }
+    END { if (value != "") print value }
+  ' "$HEALTH_ENV_FILE" 2>/dev/null || true
+}
+
+HEALTH_INTERVAL_SOURCE=""
+_resolve_health_interval() {
+  local persisted=""
+  if [[ -n "${LUNARWING_MT_HEALTH_INTERVAL_MIN:-}" ]]; then
+    HEALTH_INTERVAL_MIN="$LUNARWING_MT_HEALTH_INTERVAL_MIN"
+    HEALTH_INTERVAL_SOURCE="environment (LUNARWING_MT_HEALTH_INTERVAL_MIN)"
+  else
+    persisted="$(_persisted_health_interval)"
+    if [[ -n "$persisted" ]]; then
+      HEALTH_INTERVAL_MIN="$persisted"
+      HEALTH_INTERVAL_SOURCE="$HEALTH_ENV_FILE"
+    else
+      HEALTH_INTERVAL_MIN=15
+      HEALTH_INTERVAL_SOURCE="default"
+    fi
+  fi
+  if [[ ! "$HEALTH_INTERVAL_MIN" =~ ^([1-9]|[1-5][0-9])$ ]]; then
+    die "invalid LUNARWING_MT_HEALTH_INTERVAL_MIN from $HEALTH_INTERVAL_SOURCE: '$HEALTH_INTERVAL_MIN' (expected an integer from 1 to 59)"
+  fi
+}
+
 INIT_SYSTEM=""
 ensure_init_system() {
   # Propagate detection failure: detect_init_system die()s inside the command
@@ -53,13 +85,7 @@ ensure_init_system() {
     INIT_SYSTEM="$(detect_init_system)" || return 1
     [[ -n "$INIT_SYSTEM" ]] || return 1
   fi
-  if [[ -z "$HEALTH_INTERVAL_MIN" ]]; then
-    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
-      HEALTH_INTERVAL_MIN=5
-    else
-      HEALTH_INTERVAL_MIN=15
-    fi
-  fi
+  _resolve_health_interval
 }
 
 # Machine-wide persisted runtime choice (see _save_container_runtime). One
