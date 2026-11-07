@@ -1770,6 +1770,7 @@ async fn run_promotion_with_timeout(
 /// (DH-5 rollback), then write accepted ones into the tenant workspace. Every
 /// run — accepted, rejection-only, or skipped — is audited by the caller
 /// (CW-9).
+#[cfg(test)]
 async fn run_promotion(
     deps: &PromotionDeps,
     job_id: Uuid,
