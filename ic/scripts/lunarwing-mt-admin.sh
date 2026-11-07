@@ -1060,7 +1060,7 @@ main() {
       # calls this before its stop so a lane build failure cannot strand it.
       require_root
       local cand_name="" cand_pebble="false" cand_oc="false" cand_kimi="false" cand_oc2="false"
-      local cand_all_enabled="false"
+      local cand_all_enabled="false" cand_target=""
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --enabled)        cand_all_enabled="true"; shift ;;
@@ -1068,6 +1068,8 @@ main() {
           --with-opencode)  cand_oc="true"; shift ;;
           --with-kimi)      cand_kimi="true"; shift ;;
           --with-opencode2) cand_oc2="true"; shift ;;
+          --target)         cand_target="$2"; shift 2 ;;
+          --target=*)       cand_target="${1#*=}"; shift ;;
           -*)               die "unknown flag: $1" ;;
           *)
             if [[ -z "$cand_name" ]]; then cand_name="$1"; shift
@@ -1076,7 +1078,7 @@ main() {
             ;;
         esac
       done
-      [[ -n "$cand_name" ]] || die "usage: build-worker-candidates <name> [--enabled] [--with-pebble] [--with-opencode] [--with-kimi] [--with-opencode2]"
+      [[ -n "$cand_name" ]] || die "usage: build-worker-candidates <name> [--enabled] [--with-pebble] [--with-opencode] [--with-kimi] [--with-opencode2] [--target <ref>]"
       cand_name="$(sanitize_name "$cand_name")"
       ports_registry_init
       tenant_exists_in_registry "$cand_name" || die "tenant '$cand_name' not found in registry"
@@ -1094,7 +1096,7 @@ main() {
       # same tenant (they share the candidate tag). run-300 TO-1: inside the
       # upgrade wrapper that run's inherited lock is used, not re-acquired.
       with_tenant_upgrade_lock "$cand_name" \
-        build_candidate_workers "$cand_name" "$cand_oc" "$cand_kimi" "$cand_oc2" "$cand_pebble" "false"
+        build_candidate_workers "$cand_name" "$cand_oc" "$cand_kimi" "$cand_oc2" "$cand_pebble" "false" "$cand_target"
       ;;
 
     last-build-stage)
