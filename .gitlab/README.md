@@ -686,7 +686,14 @@ host's concurrent builds before retrying manually.
   per-worker resource groups to serialize registry publication.
 
 Known false-positive Gitleaks findings are listed by exact fingerprint in
-`/.gitleaksignore`. Broad path or rule exclusions are forbidden. Worker-image
+`/.gitleaksignore`. Broad path or rule exclusions are forbidden. The
+`secret-detection` job first scans the non-vendor tree with the default rules,
+then scans `ic/vendor/` with `.gitlab/gitleaks-vendor.toml`. That second pass
+disables only `generic-api-key`, `pkcs12-file`, and `private-key`, whose pinned
+third-party fixtures otherwise produce thousands of findings; every other
+default rule remains enabled. Residual vendor fixtures use exact fingerprints,
+not path allowlists. Review a fresh scan with the pinned Gitleaks image before
+changing the disabled-rule set. Worker-image
 CRITICAL findings that Debian has not fixed for the pinned toolchain
 dependencies are listed by exact CVE with a rationale comment and an expiry
 date in Trivy's own syntax (`CVE-… exp:YYYY-MM-DD`, one entry per line) in
