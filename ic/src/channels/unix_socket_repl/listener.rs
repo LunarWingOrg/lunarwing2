@@ -159,7 +159,7 @@ async fn bind_socket_with_uid(
 }
 
 fn prepare_parent_dir(path: &Path, expected_uid: u32) -> Result<(), ReplSocketError> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::fs::DirBuilderExt;
 
     let parent = path
         .parent()
@@ -173,9 +173,6 @@ fn prepare_parent_dir(path: &Path, expected_uid: u32) -> Result<(), ReplSocketEr
             builder.create(parent).map_err(|error| {
                 ReplSocketError::io("failed to create REPL socket parent", parent, error)
             })?;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
-                |error| ReplSocketError::io("failed to chmod REPL socket parent", parent, error),
-            )?;
             let metadata = std::fs::symlink_metadata(parent).map_err(|error| {
                 ReplSocketError::io("failed to inspect REPL socket parent", parent, error)
             })?;
