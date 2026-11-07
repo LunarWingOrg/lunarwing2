@@ -86,7 +86,9 @@
     - **Honest gap:** the GitLab MCP advertised its pipeline methods but did not expose them as callable tools in this session, and anonymous pipeline APIs are private. No claim of a green latest remote pipeline is made; the exact-head remote pipeline remains a maintainer/CI check.
 13. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/566
 14. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/565
-15. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/569
+15. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/569
+    - **DONE 2026-11-07 (SweetieBot (autonomous), WI#569):** OpenRC installation now refuses a derived root runtime identity before writing service files unless `LUNARWING_ALLOW_ROOT_SERVICE=1` is explicit. Identity selection skips blank `SUDO_USER` values, primary-group lookup fails instead of inventing a same-named group, and effective-root detection uses `nix::unistd::geteuid()` rather than a PATH-dependent subprocess. Added regression coverage for root refusal/opt-in, blank identity fallback, invalid-user group lookup, and both adjacent/workspace XMPP bridge executable candidates; documented the operator contract in `ic/src/setup/README.md`.
+    - **Verification (`taskset -c 0-17`, Cargo `-j18`):** `cargo test --locked --lib service::tests -- --test-threads=18` passed **22/22**; `cargo clippy --locked --lib --tests -- -D warnings` passed with zero warnings; `cargo fmt --all -- --check` and `git diff --check` passed.
 16. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/572
 17. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/571
 18. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/567

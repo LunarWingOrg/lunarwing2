@@ -185,6 +185,15 @@ background-service installation:
 - Linux with OpenRC: system service under `/etc/init.d/` (requires root; the
   wizard prints the exact `sudo` command when needed)
 
+OpenRC installation derives the daemon's runtime user from `SUDO_USER`, then
+`USER`, and resolves that account's actual primary group. It refuses a root
+runtime identity before writing service files. Run the installer through `sudo`
+from the intended non-root service account; a direct-root or provisioning
+environment that deliberately requires a root daemon must opt in explicitly
+with `LUNARWING_ALLOW_ROOT_SERVICE=1`. An unknown service user or unresolvable
+primary group also aborts installation rather than generating an invalid
+service configuration.
+
 The watchdog installer follows the same service-manager split:
 
 ```bash
