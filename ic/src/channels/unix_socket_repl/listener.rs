@@ -23,7 +23,7 @@ pub(super) enum ReplSocketError {
         source: std::io::Error,
     },
     #[error(
-        "insecure REPL socket parent {path}: owner uid {owner}, mode {mode:04o}; expected a directory owned by the daemon uid with no group/other write bits"
+        "insecure REPL socket parent {path}: owner uid {owner}, mode {mode:04o}; expected a directory owned by the daemon uid with no group/other write bits; fix with `chmod go-w {path}` or choose a dedicated owner-only directory"
     )]
     InsecureParent {
         path: PathBuf,
