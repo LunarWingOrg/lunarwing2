@@ -205,6 +205,31 @@ class FullValidationTests(unittest.TestCase):
         config.validate_release_gates(self.merged, defaults, errors)
         self.assertTrue(any("canonical predicate" in error for error in errors))
 
+    def test_secret_history_schedule_and_release_rules_cannot_be_weakened(self):
+        mutations = []
+        for index in (0, 1):
+            rules = copy.deepcopy(self.merged["secret-history"]["rules"])
+            del rules[index]
+            mutations.append((f"missing rule {index}", rules))
+        for name, old, new in (
+            ("unprotected tag", ' && $CI_COMMIT_REF_PROTECTED == "true"', ""),
+            ("non-push tag", '$CI_PIPELINE_SOURCE == "push"', '$CI_PIPELINE_SOURCE == "web"'),
+        ):
+            rules = copy.deepcopy(self.merged["secret-history"]["rules"])
+            rules[1]["if"] = rules[1]["if"].replace(old, new)
+            mutations.append((name, rules))
+        rules = copy.deepcopy(self.merged["secret-history"]["rules"])
+        rules.insert(-1, {"if": '$CI_PIPELINE_SOURCE == "merge_request_event"'})
+        mutations.append(("merge request trigger", rules))
+
+        for name, rules in mutations:
+            with self.subTest(name=name):
+                merged = copy.deepcopy(self.merged)
+                merged["secret-history"]["rules"] = rules
+                errors = []
+                config.validate_release_gates(merged, self.defaults, errors)
+                self.assertIn("secret-history must run only for schedules and protected release tags", errors)
+
     def test_unlocked_cavepony_build_is_rejected(self):
         self.merged["cavepony-wasm"]["script"] = [command.replace(" --locked", "") for command in self.merged["cavepony-wasm"]["script"]]
         errors = []

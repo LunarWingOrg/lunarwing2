@@ -231,6 +231,30 @@ struct SandboxExecutionOptions {
     harness: Option<HarnessJobOptions>,
 }
 
+struct HarnessJobDirGuard {
+    job_id: Option<Uuid>,
+}
+
+impl HarnessJobDirGuard {
+    fn new(job_id: Uuid) -> Self {
+        Self {
+            job_id: Some(job_id),
+        }
+    }
+
+    fn dispatch_succeeded(mut self) {
+        self.job_id = None;
+    }
+}
+
+impl Drop for HarnessJobDirGuard {
+    fn drop(&mut self) {
+        if let Some(job_id) = self.job_id {
+            harness::cleanup_harness_job_dir(job_id);
+        }
+    }
+}
+
 /// Parse `worker_secrets` (map of secret name -> mounted file name).
 fn harness_secret_mounts(params: &serde_json::Value) -> Result<Vec<SecretFileMount>, ToolError> {
     let Some(obj) = params.get("worker_secrets") else {
@@ -980,7 +1004,9 @@ impl CreateJobTool {
         let (project_dir, browse_id) = resolve_project_dir(explicit_dir, job_id)?;
         let project_dir_str = project_dir.display().to_string();
 
-        // WI#326: prepare harness mounts before any container exists.
+        // WI#326: prepare harness mounts before any container exists. Every
+        // return before successful dispatch removes partial injection/staging.
+        let harness_dir_guard = HarnessJobDirGuard::new(job_id);
         let harness_request = match harness_options {
             Some(options) => Some(
                 self.prepare_harness_request(job_id, &ctx.user_id, options)
@@ -1104,6 +1130,7 @@ impl CreateJobTool {
                 self.update_context_state(job_id, JobState::Failed, Some(e.to_string()));
                 ToolError::ExecutionFailed(format!("failed to create container: {}", e))
             })?;
+        harness_dir_guard.dispatch_succeeded();
 
         // The mode was persisted in the initial insert above (CV-9), so
         // job_prompt and restarts can already tell harness jobs apart from
@@ -1154,6 +1181,12 @@ impl CreateJobTool {
 
         loop {
             if tokio::time::Instant::now() > deadline {
+                if jm.get_handle(job_id).await.is_some_and(|handle| {
+                    handle.state == crate::orchestrator::job_manager::ContainerState::Finalizing
+                }) {
+                    tokio::time::sleep(poll_interval).await;
+                    continue;
+                }
                 let _ = jm.stop_job(job_id).await;
                 jm.cleanup_job(job_id).await;
                 self.update_status(
@@ -3258,6 +3291,20 @@ impl Tool for JobPromptTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn harness_dir_guard_cleans_until_dispatch_succeeds() {
+        let job_id = Uuid::new_v4();
+        let dir = harness::harness_job_dir(job_id);
+        std::fs::create_dir_all(&dir).unwrap(); // safety: test
+        drop(HarnessJobDirGuard::new(job_id));
+        assert!(!dir.exists());
+
+        std::fs::create_dir_all(&dir).unwrap(); // safety: test
+        HarnessJobDirGuard::new(job_id).dispatch_succeeded();
+        assert!(dir.exists());
+        harness::cleanup_harness_job_dir(job_id);
+    }
 
     #[tokio::test]
     async fn test_create_job_tool_local() {

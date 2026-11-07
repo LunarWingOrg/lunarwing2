@@ -112,6 +112,7 @@ lunarwing_skills = { path = "crates/lunarwing_skills", version = "2.1.9" }
 
 # Safety/sanitization
 lunarwing_safety = { path = "crates/lunarwing_safety", version = "2.1.9" }
+aho-corasick = "1"
 regex = "1"
 unicode-normalization = "0.1"
 
