@@ -73,16 +73,16 @@
     - **SweetieBot re-attempt (2026-11-07):** the Multica channel now rejects null, blank, and absent `multica_url` / `workspace_id` values with field-specific `is not configured` errors that do not echo configuration values. Four unit tests cover null, blank, absent, and valid/defaulted configurations; the deployment guide documents the startup contract and troubleshooting. Behavior-identical clippy cleanups keep the touched channel zero-warning.
     - **!2228 WF-1 resolved:** `ic/registry/channels/multica.json` is bumped from the post-!2227 release **0.1.18 to 0.1.19**, giving this source change its own registry version. `version-policy.sh` against base `e773c59ff` passes.
     - **Verification:** native Multica `cargo test --locked` passed **4/4**, `cargo clippy --locked --all-targets -- -D warnings` passed, rustfmt passed, and all **14 registry JSON files** validated. Commands used `taskset -c 0-17` and Cargo `-j18`. A `cargo check --target wasm32-wasip2` was attempted but the installed toolchain has only the host standard library and no `rustup`; the WASM build and full pipeline on the committed head remain CI requirements.
-    - **!2228 WF-2 scope:** WI#314 stays open for the separate host-side half — pre-start required-field validation and making external channel status reflect `ChannelManager::start_failures`. This goal completes the reviewed channel-diagnostic re-attempt; it does not claim those host-side changes are fixed.
+    - **!2228 WF-2 scope:** WI#314 stays open for the separate host-side half — pre-start required-field validation and making external channel status reflect `ChannelManager::start_failures`. This goal completes the reviewed channel-diagnostic re-attempt; it does not claim those host-side changes are fixed
 10. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/458 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2242 and please review the comments on the closed MR and re-attempt with the guidance
 11. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/563
 12. [ ] Fix any issues in CI/CD (if any) - See Pipeline for LATEST MASTER pipeline (you can use gitlab mcp) and see if anything is not GREEN. If there are problems, fix them - always check last dozen or so Work Items for TIPS as to why master pipelines are actually red. Kageho is watching and posting WIs with explanations now usually (fairly frequently)
-13. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/564
+13. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/566
 14. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/565
 15. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/569
 16. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/572
 17. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/571
-18. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/570
+18. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/567
 19. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/568
 
 ## Phase 7 - Advanced Operator Notes
