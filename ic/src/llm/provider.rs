@@ -626,6 +626,14 @@ pub trait LlmProvider: Send + Sync {
             .unwrap_or_else(|| self.active_model_name())
     }
 
+    /// Resolve a model identity that an outer response cache can use before dispatch.
+    ///
+    /// Providers that select a backend while dispatching return `None`: caching their
+    /// responses behind a pre-dispatch key could replay another model's response.
+    fn cache_key_model_name(&self, requested_model: Option<&str>) -> Option<String> {
+        Some(self.effective_model_name(requested_model))
+    }
+
     /// Get the currently active model name.
     ///
     /// May differ from `model_name()` if the model was switched at runtime
