@@ -179,6 +179,23 @@ dotfile sync), rotate the token as above.
 `--revoke` cuts one user off within about 2 s, without a restart. After moving every user to a client
 token, run `rotate-gateway-token` once so that no master-token copy stays valid.
 
+## Protocol-1 Unix socket
+
+The M3 hardening applies to the existing `lunarwing repl` socket; Wingtip's own socket transport
+arrives with M4. The socket is mode 0600 and both server and built-in client require the peer to
+have the daemon user's UID. Its parent directory must be owned by that UID and must not be
+group- or other-writable. If startup reports `insecure REPL socket parent`, run
+`chmod go-w <parent>` after checking the directory's ownership and contents, or configure a
+dedicated owner-only directory. A missing parent is created with permissions no broader than 0700;
+existing parents are never chmodded.
+
+Keep a custom `LUNARWING_SOCKET` in a dedicated directory rather than directly under `$HOME` or
+`/tmp`. Sandbox protection covers the socket's entire parent directory: putting it under `$HOME`
+also prevents workspaces below `$HOME` from being sandbox mount roots. If the socket disappears or
+is replaced, the daemon logs the degraded listener without marking the whole daemon unhealthy;
+this deliberately avoids the restart cycle tracked by WI#385. Investigate that log before
+restarting through the normal single-node or mt-admin service path.
+
 ## Troubleshooting
 
 | You see | What to do |
