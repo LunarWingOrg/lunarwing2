@@ -1702,7 +1702,26 @@ pub enum ExternalTaskStatus {
     Cancelled,
     #[serde(rename = "timed_out")]
     TimedOut,
-    Partial(String),
+}
+
+impl ExternalTaskStatus {
+    fn from_worker_status(status: &str, job_id: Uuid, worker_name: &str) -> Self {
+        match status {
+            "success" => Self::Success,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            "timed_out" => Self::TimedOut,
+            _ => {
+                tracing::warn!(
+                    %job_id,
+                    worker = worker_name,
+                    raw_status = %log_safe(status, 128),
+                    "Unrecognized external worker task status; treating result as failed"
+                );
+                Self::Failed
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for ExternalTaskStatus {
@@ -1712,7 +1731,6 @@ impl std::fmt::Display for ExternalTaskStatus {
             Self::Failed => write!(f, "failed"),
             Self::Cancelled => write!(f, "cancelled"),
             Self::TimedOut => write!(f, "timed_out"),
-            Self::Partial(msg) => write!(f, "partial: {}", msg),
         }
     }
 }
@@ -2802,12 +2820,11 @@ async fn run_external_task(
                                     }
                                 })?;
 
-                            let status = match result.status.as_str() {
-                                "success" => ExternalTaskStatus::Success,
-                                "cancelled" => ExternalTaskStatus::Cancelled,
-                                "timed_out" => ExternalTaskStatus::TimedOut,
-                                _ => ExternalTaskStatus::Failed,
-                            };
+                            let status = ExternalTaskStatus::from_worker_status(
+                                &result.status,
+                                job_id,
+                                worker_name,
+                            );
 
                             // WI#267: a worker-reported *timeout* can carry
                             // synthetic heartbeats (an executor older than the
@@ -3210,7 +3227,7 @@ async fn run_external_task(
                 timed_out_result_message(task_result.error.as_deref(), &task_result.output),
             )
         }
-        ExternalTaskStatus::Failed | ExternalTaskStatus::Partial(_) => (
+        ExternalTaskStatus::Failed => (
             false,
             JobState::Failed,
             "failed",
@@ -3568,12 +3585,8 @@ async fn wait_for_cancel_ack(
             if payload.task_id != job_id.to_string() {
                 continue;
             }
-            let status = match payload.status.as_str() {
-                "success" => ExternalTaskStatus::Success,
-                "cancelled" => ExternalTaskStatus::Cancelled,
-                "timed_out" => ExternalTaskStatus::TimedOut,
-                _ => ExternalTaskStatus::Failed,
-            };
+            let status =
+                ExternalTaskStatus::from_worker_status(&payload.status, job_id, worker_name);
             return Some(ExternalTaskResult {
                 status,
                 output: payload.output,
@@ -6432,10 +6445,6 @@ mod tests {
             serde_json::to_string(&ExternalTaskStatus::TimedOut).unwrap(),
             "\"timed_out\""
         );
-        let partial_json =
-            serde_json::to_string(&ExternalTaskStatus::Partial("wip".to_string())).unwrap();
-        assert!(partial_json.contains("partial"));
-        assert!(partial_json.contains("wip"));
 
         let success: ExternalTaskStatus = serde_json::from_str("\"success\"").unwrap();
         assert_eq!(success, ExternalTaskStatus::Success);
@@ -6457,6 +6466,29 @@ mod tests {
         assert!(matches!(success, ExternalTaskStatus::Success));
         assert!(!matches!(failed, ExternalTaskStatus::Success));
         assert!(!matches!(cancelled, ExternalTaskStatus::Success));
+    }
+
+    #[test]
+    fn worker_task_status_parsing_fails_closed_on_unknown_values() {
+        let job_id = Uuid::nil();
+        for (raw, expected) in [
+            ("success", ExternalTaskStatus::Success),
+            ("failed", ExternalTaskStatus::Failed),
+            ("cancelled", ExternalTaskStatus::Cancelled),
+            ("timed_out", ExternalTaskStatus::TimedOut),
+        ] {
+            assert_eq!(
+                ExternalTaskStatus::from_worker_status(raw, job_id, "test-worker"),
+                expected
+            );
+        }
+
+        for raw in ["partial", "success\nforged", ""] {
+            assert_eq!(
+                ExternalTaskStatus::from_worker_status(raw, job_id, "test-worker"),
+                ExternalTaskStatus::Failed
+            );
+        }
     }
 
     #[test]
