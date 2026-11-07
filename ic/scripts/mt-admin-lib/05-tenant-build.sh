@@ -753,9 +753,9 @@ _upgrade_validate_lane() {  # <lane>
 }
 
 # Build <lane>'s image to this run's candidate tag and record it.
-# Usage: build_candidate_worker <tenant> <lane> <with_toolchains>
+# Usage: build_candidate_worker <tenant> <lane> <with_toolchains> [release_ref]
 build_candidate_worker() {
-  local name="$1" lane="$2" with_toolchains="${3:-false}"
+  local name="$1" lane="$2" with_toolchains="${3:-false}" release_ref="${4:-}"
   local lw_root tag rc=0 profile
   _upgrade_validate_lane "$lane" || die "unknown worker lane '$lane'"
   ensure_container_runtime
@@ -775,10 +775,10 @@ build_candidate_worker() {
     with_toolchains="$profile"
   fi
   case "$lane" in
-    pebble)    LUNARWING_WORKER_IMAGE_TAG="$tag" build_pebble_worker "false" "$with_toolchains" "$lw_root" || rc=$? ;;
-    opencode)  LUNARWING_WORKER_IMAGE_TAG="$tag" build_opencode_worker "false" "$with_toolchains" "$lw_root" || rc=$? ;;
-    kimi)      LUNARWING_WORKER_IMAGE_TAG="$tag" build_kimi_worker "false" "$with_toolchains" "" "$lw_root" || rc=$? ;;
-    opencode2) LUNARWING_WORKER_IMAGE_TAG="$tag" build_opencode2_worker "false" "$with_toolchains" "$lw_root" || rc=$? ;;
+    pebble)    LUNARWING_WORKER_IMAGE_TAG="$tag" build_pebble_worker "false" "$with_toolchains" "$lw_root" "$release_ref" || rc=$? ;;
+    opencode)  LUNARWING_WORKER_IMAGE_TAG="$tag" build_opencode_worker "false" "$with_toolchains" "$lw_root" "$release_ref" || rc=$? ;;
+    kimi)      LUNARWING_WORKER_IMAGE_TAG="$tag" build_kimi_worker "false" "$with_toolchains" "" "$lw_root" "$release_ref" || rc=$? ;;
+    opencode2) LUNARWING_WORKER_IMAGE_TAG="$tag" build_opencode2_worker "false" "$with_toolchains" "$lw_root" "$release_ref" || rc=$? ;;
   esac
   [[ "$rc" -eq 0 ]] || return "$rc"
   _ensure_marker_dir
@@ -804,10 +804,10 @@ _worker_toolchain_profile() {  # <lane>
 
 # Build every selected lane's candidate image, recording each success. Fails at
 # the first failing lane with that lane named, leaving the tenant untouched.
-# Usage: build_candidate_workers <tenant> <with_opencode> <with_kimi> <with_opencode2> [with_pebble] [with_toolchains]
+# Usage: build_candidate_workers <tenant> <with_opencode> <with_kimi> <with_opencode2> [with_pebble] [with_toolchains] [release_ref]
 build_candidate_workers() {
   local name="$1" with_opencode="$2" with_kimi="$3" with_opencode2="$4"
-  local with_pebble="${5:-false}" with_toolchains="${6:-false}"
+  local with_pebble="${5:-false}" with_toolchains="${6:-false}" release_ref="${7:-}"
   _ensure_marker_dir
   : >"$(tenant_candidate_lanes_file "$name")"
   # run-300 TO-3: a new run must not inherit a prior run's pre-promotion ids, or
@@ -823,7 +823,7 @@ build_candidate_workers() {
     esac
     say ""
     say "=== Building $lane worker candidate image (tenant still running) ==="
-    build_candidate_worker "$name" "$lane" "$with_toolchains" \
+    build_candidate_worker "$name" "$lane" "$with_toolchains" "$release_ref" \
       || die "$lane worker image candidate build failed; tenant '$name' has not been stopped"
   done
 }
@@ -1482,6 +1482,158 @@ _worker_source_revision() {
   printf '%s' "$revision"
 }
 
+WORKER_BUILD_SOURCE_ROOT=""
+WORKER_BUILD_SOURCE_REVISION=""
+WORKER_BUILD_ARCHIVE_ROOT=""
+WORKER_BUILD_PRIOR_EXIT_TRAP=""
+WORKER_BUILD_PRIOR_EXIT_ACTION=""
+
+_operator_worker_release_ref() {  # <branch, tag, remote ref, or commit>
+  local requested="$1" candidate
+  if [[ "$requested" =~ ^[0-9a-f]{40}$ ]]; then
+    printf '%s\n' "$requested"
+    return 0
+  fi
+  local -a candidates=()
+  case "$requested" in
+    refs/*)   candidates=("$requested") ;;
+    origin/*) candidates=("refs/remotes/$requested" "refs/heads/${requested#origin/}" "refs/tags/${requested#origin/}") ;;
+    *)        candidates=("refs/heads/$requested" "refs/remotes/origin/$requested" "refs/tags/$requested") ;;
+  esac
+  for candidate in "${candidates[@]}"; do
+    git check-ref-format "$candidate" >/dev/null 2>&1 || continue
+    if git -C "$LUNARWING_ROOT" rev-parse --verify --quiet "${candidate}^{commit}" >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+_default_operator_worker_release_ref() {
+  local release_ref
+  release_ref="$(git -C "$LUNARWING_ROOT" symbolic-ref --quiet HEAD 2>/dev/null)" || release_ref=""
+  if [[ -z "$release_ref" ]]; then
+    release_ref="$(git -C "$LUNARWING_ROOT" rev-parse --verify HEAD 2>/dev/null)" || release_ref=""
+  fi
+  [[ "$release_ref" =~ ^refs/heads/.+$ || "$release_ref" =~ ^[0-9a-f]{40}$ ]] || return 1
+  printf '%s\n' "$release_ref"
+}
+
+_worker_source_provenance() {  # <tenant source root> <lane> [release ref]
+  local source_root="$1" lane="$2" requested="${3:-}"
+  local revision dirty owner release_ref
+  revision="$(_worker_source_git "$source_root" rev-parse --verify HEAD)" || revision=""
+  [[ "$revision" =~ ^[0-9a-f]{40}$ ]] \
+    || die "cannot verify tenant worker checkout HEAD: $source_root"
+  dirty="$(_worker_source_git "$source_root" status --porcelain --untracked-files=all -- "$lane")" \
+    || die "cannot inspect tenant worker source: $source_root"
+  [[ -z "$dirty" ]] \
+    || die "refusing to build a shared worker image from a dirty tenant checkout: $source_root ($lane)"
+  owner="$(stat -c %U "$source_root" 2>/dev/null)" || owner="unknown"
+  git -C "$LUNARWING_ROOT" cat-file -e "${revision}^{commit}" 2>/dev/null \
+    || die "tenant '$owner' HEAD $revision is unknown to operator checkout $LUNARWING_ROOT"
+  if [[ -z "$requested" ]]; then
+    requested="$(_default_operator_worker_release_ref)" \
+      || die "cannot determine operator release ref for tenant '$owner' HEAD $revision"
+  fi
+  release_ref="$(_operator_worker_release_ref "$requested")" || release_ref=""
+  [[ -n "$release_ref" ]] \
+    || die "tenant '$owner' HEAD $revision has no operator release ref matching '$requested'"
+  git -C "$LUNARWING_ROOT" merge-base --is-ancestor "$revision" "$release_ref" \
+    || die "tenant '$owner' HEAD $revision is not on operator release ref $release_ref"
+  WORKER_BUILD_SOURCE_REVISION="$revision"
+}
+
+_archive_worker_source() {  # <tenant source root> <lane>
+  local source_root="$1" lane="$2" tmp_parent tmp archive links
+  local -a paths=("$lane")
+  [[ "$lane" != opencode2.4lunarwing ]] \
+    || paths+=(.gitlab/scripts/verify-opencode2-exposure-out-of-band.py)
+  require_cmd tar
+  tmp_parent="${LUNARWING_WORKER_BUILD_TMPDIR:-/var/tmp}"
+  [[ -d "$tmp_parent" && ! -L "$tmp_parent" ]] \
+    || die "worker archive parent is not a real directory: $tmp_parent"
+  tmp="$(mktemp -d "$tmp_parent/lw-worker-source.XXXXXX")" \
+    || die "cannot create private worker source archive under $tmp_parent"
+  chmod 0700 "$tmp" || { rm -rf -- "$tmp"; die "cannot protect worker source archive $tmp"; }
+  archive="$tmp/source.tar"
+  if ! git -C "$LUNARWING_ROOT" archive --format=tar --output="$archive" \
+      "$WORKER_BUILD_SOURCE_REVISION" -- "${paths[@]}" \
+    || ! tar -x -f "$archive" -C "$tmp"; then
+    rm -rf -- "$tmp"
+    die "cannot archive tenant revision $WORKER_BUILD_SOURCE_REVISION from operator checkout"
+  fi
+  rm -f -- "$archive" || { rm -rf -- "$tmp"; die "cannot remove worker source archive stream"; }
+  links="$(find "$tmp" ! -type f ! -type d -print -quit)" \
+    || { rm -rf -- "$tmp"; die "cannot validate worker source archive $tmp"; }
+  [[ -z "$links" ]] || { rm -rf -- "$tmp"; die "worker source archive contains a link or special file"; }
+  links="$(find "$tmp" -type f -links +1 -print -quit)" \
+    || { rm -rf -- "$tmp"; die "cannot validate worker source archive links"; }
+  [[ -z "$links" ]] || { rm -rf -- "$tmp"; die "worker source archive contains a hard link"; }
+  [[ -f "$tmp/$lane/Dockerfile" && ! -L "$tmp/$lane/Dockerfile" ]] \
+    || { rm -rf -- "$tmp"; die "archived worker source has no regular $lane/Dockerfile"; }
+  WORKER_BUILD_SOURCE_ROOT="$tmp"
+  WORKER_BUILD_ARCHIVE_ROOT="$tmp"
+}
+
+_prepare_worker_build_source() {  # <source root> <lane> [release ref]
+  local source_root="$1" lane="$2" release_ref="${3:-}"
+  WORKER_BUILD_SOURCE_ROOT="$source_root"
+  WORKER_BUILD_ARCHIVE_ROOT=""
+  if [[ "$source_root" == "$LUNARWING_ROOT" ]]; then
+    WORKER_BUILD_SOURCE_REVISION="$(_worker_source_revision "$source_root" "$lane")"
+    return 0
+  fi
+  _worker_source_provenance "$source_root" "$lane" "$release_ref"
+  _archive_worker_source "$source_root" "$lane"
+}
+
+_cleanup_worker_build_context() {  # <archive root>
+  local root="$1"
+  [[ -n "$root" && -d "$root" && ! -L "$root" ]] || return 0
+  rm -rf -- "$root"
+}
+
+_worker_build_context_begin() {
+  WORKER_BUILD_PRIOR_EXIT_TRAP=""
+  WORKER_BUILD_PRIOR_EXIT_ACTION=""
+  # Bash reports the parent's EXIT trap inside a subshell; never re-arm it there.
+  if [[ "$BASHPID" == "$$" ]]; then
+    WORKER_BUILD_PRIOR_EXIT_TRAP="$(trap -p EXIT)"
+    if [[ -n "$WORKER_BUILD_PRIOR_EXIT_TRAP" ]]; then
+      local -a trap_parts=()
+      eval "trap_parts=($WORKER_BUILD_PRIOR_EXIT_TRAP)"
+      WORKER_BUILD_PRIOR_EXIT_ACTION="${trap_parts[2]:-}"
+    fi
+  fi
+  trap '_worker_build_context_exit $?' EXIT
+}
+
+_worker_build_context_exit() {  # <status>
+  local status="$1"
+  trap - EXIT
+  _cleanup_worker_build_context "$WORKER_BUILD_ARCHIVE_ROOT" || true
+  if [[ "$BASHPID" == "$$" && -n "$WORKER_BUILD_PRIOR_EXIT_ACTION" ]]; then
+    eval "$WORKER_BUILD_PRIOR_EXIT_ACTION"
+  fi
+  exit "$status"
+}
+
+_worker_build_context_finish() {
+  [[ -n "$WORKER_BUILD_ARCHIVE_ROOT" ]] || return 0
+  _cleanup_worker_build_context "$WORKER_BUILD_ARCHIVE_ROOT" \
+    || die "cannot remove worker source archive $WORKER_BUILD_ARCHIVE_ROOT"
+  WORKER_BUILD_ARCHIVE_ROOT=""
+  if [[ "$BASHPID" == "$$" && -n "$WORKER_BUILD_PRIOR_EXIT_TRAP" ]]; then
+    eval "$WORKER_BUILD_PRIOR_EXIT_TRAP"
+  else
+    trap - EXIT
+  fi
+  WORKER_BUILD_PRIOR_EXIT_TRAP=""
+  WORKER_BUILD_PRIOR_EXIT_ACTION=""
+}
+
 # WI#527: the image tag a worker build writes. Defaults to :latest so every
 # existing caller (build-tenant, build-all, per-lane verbs) is unchanged; the
 # upgrade path sets LUNARWING_WORKER_IMAGE_TAG to a candidate tag so the images
@@ -1499,7 +1651,12 @@ build_pebble_worker() {
   local no_cache="${1:-false}"
   local with_toolchains="${2:-false}"
   local source_root="${3:-$LUNARWING_ROOT}"
+  local release_ref="${4:-}"
+  _prepare_worker_build_source "$source_root" pebble4lunarwing "$release_ref"
+  source_root="$WORKER_BUILD_SOURCE_ROOT"
   local pebble_dir="${source_root}/pebble4lunarwing"
+  local source_revision="$WORKER_BUILD_SOURCE_REVISION"
+  [[ -z "$WORKER_BUILD_ARCHIVE_ROOT" ]] || _worker_build_context_begin
 
   [[ -d "$pebble_dir" ]] || die "pebble worker dir not found at $pebble_dir"
 
@@ -1507,11 +1664,6 @@ build_pebble_worker() {
 
   local toolchain_desc="slim (no toolchains)"
   [[ "$with_toolchains" == "true" ]] && toolchain_desc="fat (with Rust/Go/C++ toolchains)"
-  local source_revision
-  source_revision="$(_worker_source_revision "$source_root" pebble4lunarwing)"
-  if [[ "$source_root" != "$LUNARWING_ROOT" && ! "$source_revision" =~ ^[0-9a-f]{40}$ ]]; then
-    die "refusing to build a shared pebble worker image from a dirty or unverifiable tenant checkout: $source_root"
-  fi
   local -a revision_args=(--build-arg "SOURCE_REVISION=$source_revision")
   say "building pebble worker Docker image [$toolchain_desc] (source revision: $source_revision) ..."
   local cache_flag=""
@@ -1567,13 +1719,19 @@ build_pebble_worker() {
   fi
 
   say "pebble worker image built: $output_tag [$toolchain_desc] (revision $source_revision)"
+  _worker_build_context_finish
 }
 
 build_opencode_worker() {
   local no_cache="${1:-false}"
   local with_toolchains="${2:-false}"
   local source_root="${3:-$LUNARWING_ROOT}"
+  local release_ref="${4:-}"
+  _prepare_worker_build_source "$source_root" opencode4lunarwing "$release_ref"
+  source_root="$WORKER_BUILD_SOURCE_ROOT"
   local opencode_dir="${source_root}/opencode4lunarwing"
+  local source_revision="$WORKER_BUILD_SOURCE_REVISION"
+  [[ -z "$WORKER_BUILD_ARCHIVE_ROOT" ]] || _worker_build_context_begin
 
   [[ -d "$opencode_dir" ]] || die "opencode worker dir not found at $opencode_dir"
 
@@ -1581,8 +1739,6 @@ build_opencode_worker() {
 
   local toolchain_desc="slim (no toolchains)"
   [[ "$with_toolchains" == "true" ]] && toolchain_desc="fat (with Rust/Go/C++ toolchains)"
-  local source_revision
-  source_revision="$(_worker_source_revision "$source_root" opencode4lunarwing)"
   local -a revision_args=(--build-arg "SOURCE_REVISION=$source_revision")
   say "building opencode worker Docker image [$toolchain_desc] (source revision: $source_revision) ..."
 
@@ -1615,6 +1771,7 @@ build_opencode_worker() {
   fi
 
   say "opencode worker image built: $output_tag [$toolchain_desc] (revision $source_revision)"
+  _worker_build_context_finish
 }
 
 _opencode2_snapshot_source() {
@@ -1766,7 +1923,12 @@ build_opencode2_worker() {
   local no_cache="${1:-false}"
   local with_toolchains="${2:-false}"
   local source_root="${3:-$LUNARWING_ROOT}"
+  local release_ref="${4:-}"
+  _prepare_worker_build_source "$source_root" opencode2.4lunarwing "$release_ref"
+  source_root="$WORKER_BUILD_SOURCE_ROOT"
   local opencode2_dir="${source_root}/opencode2.4lunarwing"
+  local source_revision="$WORKER_BUILD_SOURCE_REVISION"
+  [[ -z "$WORKER_BUILD_ARCHIVE_ROOT" ]] || _worker_build_context_begin
 
   [[ -d "$opencode2_dir" ]] || die "opencode2 worker dir not found at $opencode2_dir"
 
@@ -1775,8 +1937,6 @@ build_opencode2_worker() {
 
   local toolchain_desc="slim (no toolchains)"
   [[ "$with_toolchains" == "true" ]] && toolchain_desc="fat (with Rust/Go/C++ toolchains)"
-  local source_revision
-  source_revision="$(_worker_source_revision "$source_root" opencode2.4lunarwing)"
   local -a revision_args=(--build-arg "SOURCE_REVISION=$source_revision")
   say "building opencode2 worker Docker image [$toolchain_desc] (source revision: $source_revision) ..."
 
@@ -1842,6 +2002,7 @@ build_opencode2_worker() {
   "$CONTAINER_RT" rmi "$candidate_tag" >/dev/null 2>&1 || true
 
   say "opencode2 worker image built: $output_tag [$toolchain_desc] (revision $source_revision)"
+  _worker_build_context_finish
 }
 
 build_kimi_worker() {
@@ -1849,7 +2010,12 @@ build_kimi_worker() {
   local with_toolchains="${2:-false}"
   local kimi_code_version="${3:-}"
   local source_root="${4:-$LUNARWING_ROOT}"
+  local release_ref="${5:-}"
+  _prepare_worker_build_source "$source_root" kimicode4lunarwing "$release_ref"
+  source_root="$WORKER_BUILD_SOURCE_ROOT"
   local kimi_dir="${source_root}/kimicode4lunarwing"
+  local source_revision="$WORKER_BUILD_SOURCE_REVISION"
+  [[ -z "$WORKER_BUILD_ARCHIVE_ROOT" ]] || _worker_build_context_begin
 
   [[ -d "$kimi_dir" ]] || die "kimi worker dir not found at $kimi_dir"
 
@@ -1859,8 +2025,6 @@ build_kimi_worker() {
   [[ "$with_toolchains" == "true" ]] && toolchain_desc="fat (with Rust/Go/C++ toolchains)"
   local version_desc="Dockerfile default"
   [[ -z "$kimi_code_version" ]] || version_desc="$kimi_code_version"
-  local source_revision
-  source_revision="$(_worker_source_revision "$source_root" kimicode4lunarwing)"
   local -a revision_args=(--build-arg "SOURCE_REVISION=$source_revision")
   say "building kimi worker Docker image [$toolchain_desc] (kimi-code version: ${version_desc}, source revision: $source_revision) ..."
 
@@ -1892,6 +2056,7 @@ build_kimi_worker() {
   fi
 
   say "kimi worker image built: $output_tag [$toolchain_desc] (revision $source_revision)"
+  _worker_build_context_finish
 }
 
 # ── WASM install ─────────────────────────────────────────────────────────────

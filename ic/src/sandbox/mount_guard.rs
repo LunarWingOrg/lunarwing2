@@ -25,6 +25,14 @@
 //!    ordinary `git` work at the repository root; masking keeps the workflow
 //!    and removes the secret.
 //!
+//! Unix sockets are IPC paths out of the sandbox even through read-only bind
+//! mounts. Runtime socket directories join the protected set and `/`, `/run`
+//! and `/var/run` are denied as roots. The bounded mask walk also shadows every
+//! socket inode it reaches. At five levels or 10 000 entries it warns instead
+//! of failing the mount; sockets in known runtime directories remain covered
+//! structurally, while a socket deeper in another large tree is a documented
+//! residual risk.
+//!
 //! Everything is validated against canonicalized paths, so `..`, symlinks and
 //! prefix confusion (`/home/u/envs` vs `/home/u/env`) resolve to their real
 //! location before any check runs.
@@ -46,8 +54,12 @@
 //! script that exported `SANDBOX_PROTECTED_PATHS` itself would silently shadow
 //! the operator's value.
 
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+const DENIED_MOUNT_ROOTS: [&str; 3] = ["/", "/run", "/var/run"];
 
 use crate::sandbox::error::SandboxError;
 
@@ -95,7 +107,7 @@ fn resolve_protected_paths_signalled(degrade_logged: &AtomicBool) -> Vec<PathBuf
         &base,
         mt_base_name_is_nonstandard(&base),
     );
-    resolve_protected_paths_from(explicit.as_deref(), &base)
+    resolve_protected_paths_from(explicit.as_deref(), &base, &runtime_socket_dirs())
 }
 
 /// Emit the WI#441 degrade signal at most once per process, and report whether
@@ -149,6 +161,34 @@ fn explicit_protected_entries(
     (!entries.is_empty()).then(|| entries.join(":"))
 }
 
+fn runtime_socket_dirs() -> Vec<PathBuf> {
+    let uid = nix::unistd::geteuid().as_raw();
+    let mut dirs = vec![PathBuf::from(format!("/run/user/{uid}"))];
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+        let dir = PathBuf::from(dir);
+        if dir.is_absolute() {
+            dirs.push(dir);
+        }
+    }
+    for variable in ["LUNARWING_SOCKET", "IRONCLAW_SOCKET"] {
+        if let Ok(socket) = std::env::var(variable) {
+            let socket = PathBuf::from(socket);
+            if socket.is_absolute()
+                && let Some(parent) = socket.parent()
+            {
+                dirs.push(parent.to_path_buf());
+            }
+        }
+    }
+    dirs.push(PathBuf::from("/tmp/.X11-unix")); // safety: fixed OS X11 socket directory, not a test temp path.
+    let tmux_base = std::env::var("TMUX_TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
+    let tmux_base = PathBuf::from(tmux_base);
+    if tmux_base.is_absolute() {
+        dirs.push(tmux_base.join(format!("tmux-{uid}")));
+    }
+    dirs
+}
+
 /// Protected set for an explicit env override and base dir.
 ///
 /// Split out of [`resolve_protected_paths`] so the derivation can be tested
@@ -164,7 +204,11 @@ fn explicit_protected_entries(
 /// root. The
 /// added paths are inert subdirectories of already-protected single-node
 /// bases, so default protection behaviour is unchanged.
-fn resolve_protected_paths_from(env_raw: Option<&str>, base: &Path) -> Vec<PathBuf> {
+fn resolve_protected_paths_from(
+    env_raw: Option<&str>,
+    base: &Path,
+    runtime_dirs: &[PathBuf],
+) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = env_raw
         .map(|raw| {
             raw.split(':')
@@ -175,6 +219,7 @@ fn resolve_protected_paths_from(env_raw: Option<&str>, base: &Path) -> Vec<PathB
         })
         .unwrap_or_default();
 
+    paths.extend(runtime_dirs.iter().cloned());
     paths.push(base.join("env"));
     paths.push(base.join("state"));
     paths.push(base.join("run"));
@@ -295,7 +340,7 @@ fn tenant_logs_mount_source_from(
     }
     if let Some(file) = masked_files_for_mount(&canonical, &[]).first() {
         return Err(format!(
-            "it contains the credential-bearing file {}",
+            "it contains the credential-bearing file or Unix socket {}",
             file.display()
         ));
     }
@@ -329,6 +374,16 @@ pub fn validate_mount_dir(dir: &Path, protected: &[PathBuf]) -> Result<PathBuf, 
             path: dir.display().to_string(),
             reason: format!("working directory cannot be resolved: {e}"),
         })?;
+
+    if DENIED_MOUNT_ROOTS
+        .iter()
+        .any(|root| canonical == Path::new(root))
+    {
+        return Err(SandboxError::MountPathDenied {
+            path: canonical.display().to_string(),
+            reason: "working directory exposes system and runtime sockets".to_string(),
+        });
+    }
 
     // At or inside a protected directory → refuse. Mounting an *ancestor* of a
     // protected directory stays legal (agents run `git` at repo roots); those
@@ -437,28 +492,61 @@ const MASK_SCAN_MAX_DEPTH: usize = 5;
 /// Total entries visited before the walk stops expanding.
 const MASK_SCAN_MAX_ENTRIES: usize = 10_000;
 
-/// Credential-bearing files discovered by a bounded walk of the mount tree
-/// (WI#211). Directory masking covers the enumerated protected dirs; this
-/// covers credential files *outside* them — a copied `lunarwing.env` in a
-/// workspace, a backup, a snapshot. Returns canonical file paths the caller
-/// shadows with an empty read-only file bind.
+#[derive(Default, Debug)]
+pub struct MaskScan {
+    pub files: Vec<PathBuf>,
+    pub sockets: Vec<PathBuf>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScanCaps {
+    max_depth: usize,
+    max_entries: usize,
+}
+
+impl Default for ScanCaps {
+    fn default() -> Self {
+        Self {
+            max_depth: MASK_SCAN_MAX_DEPTH,
+            max_entries: MASK_SCAN_MAX_ENTRIES,
+        }
+    }
+}
+
+/// Credential-bearing files and Unix sockets discovered by a bounded walk of
+/// the mount tree. Directory masking covers the enumerated protected dirs;
+/// this covers files and IPC inodes outside them. Each returned path is
+/// shadowed with an empty read-only file bind.
 ///
-/// The walk is plan-time only (like directory masking): files created during
-/// execution are not retroactively masked, but the mount is read-only for the
-/// sandboxed policy and writable workspaces are agent-owned task data, not a
-/// security boundary. Protected directories passed in `skip` are not descended
-/// into (they are shadowed whole).
+/// The walk is plan-time only and stops at five levels or 10 000 entries. A
+/// truncated walk warns once per root but does not refuse the mount: known
+/// runtime socket directories are protected independently of this walk.
 pub fn masked_files_for_mount(mount_root: &Path, skip: &[PathBuf]) -> Vec<PathBuf> {
+    let scan = scan_mount(mount_root, skip, ScanCaps::default());
+    if scan.truncated
+        && let Ok(root) = mount_root.canonicalize()
+    {
+        warn_scan_truncated(&root);
+    }
+    let mut found = scan.files;
+    found.extend(scan.sockets);
+    found.sort();
+    found.dedup();
+    found
+}
+
+fn scan_mount(mount_root: &Path, skip: &[PathBuf], caps: ScanCaps) -> MaskScan {
     let Ok(root) = mount_root.canonicalize() else {
-        return Vec::new();
+        return MaskScan::default();
     };
     let skipped: Vec<PathBuf> = skip.iter().filter_map(|p| p.canonicalize().ok()).collect();
-    let mut found = Vec::new();
+    let mut scan = MaskScan::default();
     let mut entries = 0usize;
-    // Stack of (dir, depth).
-    let mut stack = vec![(root.clone(), 0usize)];
-    while let Some((dir, depth)) = stack.pop() {
-        if entries >= MASK_SCAN_MAX_ENTRIES {
+    let mut stack = vec![(root, 0usize)];
+    'walk: while let Some((dir, depth)) = stack.pop() {
+        if entries >= caps.max_entries {
+            scan.truncated = true;
             break;
         }
         let Ok(children) = std::fs::read_dir(&dir) else {
@@ -466,34 +554,67 @@ pub fn masked_files_for_mount(mount_root: &Path, skip: &[PathBuf]) -> Vec<PathBu
         };
         for entry in children.flatten() {
             entries += 1;
-            if entries > MASK_SCAN_MAX_ENTRIES {
-                break;
+            if entries > caps.max_entries {
+                scan.truncated = true;
+                break 'walk;
             }
             let path = entry.path();
-            let file_type = entry.file_type();
-            let Ok(ft) = file_type else { continue };
-            if ft.is_symlink() {
-                // Do not follow links during the walk: a link could point at a
-                // file outside the mount (masking it would fail the whole run)
-                // or re-enter a protected dir. The bind-mount surface is the
-                // real file tree only.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
                 continue;
             }
-            if ft.is_file() {
+            if file_type.is_file() {
                 if is_protected_file_name(&path) {
-                    found.push(path);
+                    scan.files.push(path);
                 }
-            } else if ft.is_dir() && depth + 1 < MASK_SCAN_MAX_DEPTH {
+            } else if is_unix_socket(&file_type) {
+                scan.sockets.push(path);
+            } else if file_type.is_dir() {
                 if skipped.iter().any(|s| path.starts_with(s)) {
+                    continue;
+                }
+                if depth + 1 >= caps.max_depth {
+                    scan.truncated = true;
                     continue;
                 }
                 stack.push((path, depth + 1));
             }
         }
     }
-    found.sort();
-    found.dedup();
-    found
+    scan.files.sort();
+    scan.files.dedup();
+    scan.sockets.sort();
+    scan.sockets.dedup();
+    scan
+}
+
+fn warn_scan_truncated(root: &Path) {
+    static WARNED_ROOTS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+    let warned = WARNED_ROOTS.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut warned = warned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if warned.insert(root.to_path_buf()) {
+        tracing::warn!(
+            mount = %root.display(),
+            "sandbox mask scan truncated; Unix sockets deeper than 5 levels or after 10 000 entries are not masked"
+        );
+    }
+}
+
+#[cfg(unix)]
+fn is_unix_socket(file_type: &std::fs::FileType) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+
+    file_type.is_socket()
+}
+
+#[cfg(not(unix))]
+fn is_unix_socket(_file_type: &std::fs::FileType) -> bool {
+    false
 }
 
 /// Reject mount roots whose own path contains a lexical traversal component.
@@ -799,7 +920,7 @@ mod tests {
     #[test]
     fn mt_layout_base_dir_derives_env_and_run_siblings() {
         let base = Path::new("/home/tenant/lunarwing/state");
-        let paths = resolve_protected_paths_from(None, base);
+        let paths = resolve_protected_paths_from(None, base, &[]);
         let norm =
             |p: String| std::fs::canonicalize(&p).map_or(p, |c| c.to_string_lossy().into_owned());
         let rendered: Vec<String> = paths
@@ -830,7 +951,7 @@ mod tests {
     /// unchanged.
     #[test]
     fn non_mt_base_dir_gains_no_siblings() {
-        let paths = resolve_protected_paths_from(None, Path::new("/home/u/.ironclaw"));
+        let paths = resolve_protected_paths_from(None, Path::new("/home/u/.ironclaw"), &[]);
         assert!(
             !paths.iter().any(|p| p.ends_with(Path::new("u/env"))),
             "no sibling env/ derived for a non-MT base: {paths:?}"
@@ -852,7 +973,7 @@ mod tests {
             // `<root>/lunarwing/var` instead of `<root>/lunarwing/state`.
             let alt_base = tenant_root.join("var");
             std::fs::create_dir_all(&alt_base).expect("alt base");
-            let paths = resolve_protected_paths_from(None, &alt_base);
+            let paths = resolve_protected_paths_from(None, &alt_base, &[]);
             for want in [
                 tenant_root.join("env"),
                 tenant_root.join("run"),
@@ -887,7 +1008,7 @@ mod tests {
 
             assert!(!looks_like_mt_tenant_root(&home));
             assert!(!mt_base_name_is_nonstandard(&base));
-            let paths = resolve_protected_paths_from(None, &base);
+            let paths = resolve_protected_paths_from(None, &base, &[]);
             let mount_root = validate_mount_dir(&home, &paths).expect("home remains mountable");
             let masked = masked_dirs_for_mount(&mount_root, &paths).expect("mask planning");
             assert!(masked.contains(&base.canonicalize().expect("base exists")));
@@ -917,7 +1038,7 @@ mod tests {
         // both, so drop them to make the marker genuinely absent.
         std::fs::remove_dir_all(fixture.root.join("lunarwing/run")).expect("remove run");
         std::fs::remove_dir_all(fixture.root.join("lunarwing/logs")).expect("remove logs");
-        let paths = resolve_protected_paths_from(None, &ordinary);
+        let paths = resolve_protected_paths_from(None, &ordinary, &[]);
         assert!(
             !paths.contains(&fixture.root.join("lunarwing/env")),
             "no siblings without the layout marker: {paths:?}"
@@ -971,6 +1092,7 @@ mod tests {
         let paths = resolve_protected_paths_from(
             Some("/t/lunarwing/env: /t/lunarwing/state ::/t/lunarwing/run "),
             Path::new("/home/u/.ironclaw"),
+            &[],
         );
         for want in [
             Path::new("/t/lunarwing/env"),
@@ -1001,13 +1123,13 @@ mod tests {
         );
 
         let base = fixture.root.join("lunarwing/state");
-        let without = resolve_protected_paths_from(Some("/srv/extra"), &base);
+        let without = resolve_protected_paths_from(Some("/srv/extra"), &base, &[]);
         assert!(
             validate_mount_dir(&raw_logs, &without).is_ok(),
             "outside every default, so mountable without the init's list"
         );
         let joined = explicit_protected_entries(Some("/srv/extra"), Some(&raw));
-        let with = resolve_protected_paths_from(joined.as_deref(), &base);
+        let with = resolve_protected_paths_from(joined.as_deref(), &base, &[]);
         assert!(with.contains(&PathBuf::from("/srv/extra")), "{with:?}");
         match validate_mount_dir(&raw_logs, &with) {
             Err(SandboxError::MountPathDenied { reason, .. }) => {
@@ -1079,6 +1201,136 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("dir");
         std::fs::write(dir.join("copied.env"), "TOKEN=x\n").expect("env copy");
         assert!(tenant_logs_mount_source_from(&dir, &fixture.protected()).is_err());
+    }
+
+    #[test]
+    fn masked_files_include_unix_sockets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let nested = temp.path().join("ws/a/b");
+        std::fs::create_dir_all(&nested).expect("nested dirs");
+        let socket = nested.join("agent.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("socket");
+        let masked = masked_files_for_mount(&temp.path().join("ws"), &[]);
+        assert!(
+            masked.contains(&socket.canonicalize().expect("socket path")),
+            "{masked:?}"
+        );
+    }
+
+    #[test]
+    fn masked_files_skip_sockets_inside_skipped_dirs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let skipped = temp.path().join("skipped");
+        std::fs::create_dir_all(&skipped).expect("skipped dir");
+        let socket = skipped.join("agent.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("socket");
+        let masked = masked_files_for_mount(temp.path(), &[skipped]);
+        assert!(
+            !masked.contains(&socket.canonicalize().expect("socket path")),
+            "{masked:?}"
+        );
+    }
+
+    #[test]
+    fn tenant_logs_source_with_unix_socket_is_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let logs = temp.path().join("logs");
+        std::fs::create_dir_all(&logs).expect("logs dir");
+        let _listener =
+            std::os::unix::net::UnixListener::bind(logs.join("agent.sock")).expect("socket");
+        let error = tenant_logs_mount_source_from(&logs, &[]).expect_err("socket refused");
+        assert!(error.contains("Unix socket"), "{error}");
+    }
+
+    #[test]
+    fn root_mount_masks_xdg_runtime_dir() {
+        let fixture = Fixture::new();
+        let runtime = fixture.root.join("run/user/1000");
+        std::fs::create_dir_all(&runtime).expect("runtime dir");
+        let protected = resolve_protected_paths_from(
+            None,
+            &fixture.root.join("lunarwing/state"),
+            std::slice::from_ref(&runtime),
+        );
+        let masked = masked_dirs_for_mount(&fixture.root, &protected).expect("mask planning");
+        assert!(
+            masked.contains(&runtime.canonicalize().expect("canonical runtime")),
+            "{masked:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_dir_is_refused_as_mount_root() {
+        let fixture = Fixture::new();
+        let runtime = fixture.root.join("runtime");
+        std::fs::create_dir_all(&runtime).expect("runtime dir");
+        let protected = resolve_protected_paths_from(
+            None,
+            &fixture.root.join("lunarwing/state"),
+            std::slice::from_ref(&runtime),
+        );
+        assert!(validate_mount_dir(&runtime, &protected).is_err());
+    }
+
+    #[test]
+    fn repl_socket_parent_is_protected() {
+        let fixture = Fixture::new();
+        let parent = fixture.root.join("repl");
+        std::fs::create_dir_all(&parent).expect("REPL dir");
+        let socket = parent.join("lunarwing.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("socket");
+        let protected = resolve_protected_paths_from(
+            None,
+            &fixture.root.join("lunarwing/state"),
+            std::slice::from_ref(&parent),
+        );
+        assert!(protected.contains(&parent.canonicalize().expect("canonical parent")));
+        assert!(validate_mount_dir(&socket, &protected).is_err());
+    }
+
+    #[test]
+    fn root_run_and_var_run_mount_roots_are_refused() {
+        for root in ["/", "/run", "/var/run"] {
+            assert!(
+                validate_mount_dir(Path::new(root), &[]).is_err(),
+                "{root} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn socket_beyond_depth_cap_is_reported_truncated() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let deep = temp.path().join("a/b/c/d/e");
+        std::fs::create_dir_all(&deep).expect("deep dirs");
+        let socket = deep.join("s.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("socket");
+        let scan = scan_mount(temp.path(), &[], ScanCaps::default());
+        assert!(scan.truncated);
+        assert!(
+            !scan
+                .sockets
+                .contains(&socket.canonicalize().expect("socket path"))
+        );
+    }
+
+    #[test]
+    fn socket_after_entry_cap_is_reported_truncated() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for index in 0..9 {
+            std::fs::write(temp.path().join(format!("file-{index}")), b"x").expect("file");
+        }
+        let _listener =
+            std::os::unix::net::UnixListener::bind(temp.path().join("s.sock")).expect("socket");
+        let scan = scan_mount(
+            temp.path(),
+            &[],
+            ScanCaps {
+                max_depth: 5,
+                max_entries: 8,
+            },
+        );
+        assert!(scan.truncated);
     }
 
     #[test]

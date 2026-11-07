@@ -12,6 +12,7 @@ fixture="$(mktemp -d)"
 trap 'command rm -rf "$fixture"' EXIT
 mkdir -p "$fixture/source/opencode2.4lunarwing/scripts"
 printf 'fixture wrapper\n' >"$fixture/source/opencode2.4lunarwing/scripts/opencode-exposure-guard.sh"
+export LUNARWING_ROOT="$fixture/source"
 calls="$fixture/calls"
 failures=0
 pass() { printf 'PASS: %s\n' "$1"; }

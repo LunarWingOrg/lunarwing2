@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! `lunarwing repl` — connect to a running LunarWing daemon via Unix socket.
 //!
 //! The daemon must already be running (e.g. via `systemctl start lunarwing`)
@@ -9,8 +11,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
+use tokio::net::UnixStream;
 
 /// Protocol messages — must stay in sync with the server's
 /// `unix_socket_repl::ReplMessage`.
@@ -185,4 +187,20 @@ async fn read_message(
     }
     let msg = serde_json::from_str(&buf)?;
     Ok(msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v1_encodings_match_golden_fixtures() {
+        const FRAMES: &str =
+            include_str!("../../crates/lunarwing_common/tests/fixtures/replv3/v1_frames.ndjson");
+
+        for line in FRAMES.lines() {
+            let frame: ReplMessage = serde_json::from_str(line).expect("golden v1 frame");
+            assert_eq!(serde_json::to_string(&frame).expect("v1 encoding"), line);
+        }
+    }
 }

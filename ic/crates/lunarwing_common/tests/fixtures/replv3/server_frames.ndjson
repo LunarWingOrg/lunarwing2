@@ -1,0 +1,14 @@
+{"Welcome":{"protocol":3,"server_version":"2.1.9","agent_name":"LunarWing","engine":"v1","session_id":"0b6c1c2d3e4f4a5b8c9d0e1f2a3b4c5d","thread":"tui-derpy-7f3c2a9e41d0b6c5","features":["status","attachments","transcribe"],"limits":{"max_content_bytes":100000,"max_attachments":5,"max_attachment_bytes":5242880,"max_total_attachment_bytes":10485760,"attachment_mime_types":["image/png","image/jpeg","image/gif","image/webp"],"max_transcribe_b64_bytes":16777216,"transcribe_formats":["wav","ogg","opus","mp3","mp4","webm","flac","m4a","aac"],"messages_per_minute":60,"transcribes_per_minute":10,"max_frame_bytes":16842752,"max_in_flight":8,"idle_timeout_secs":180}}}
+{"Ack":{"msg_id":"c-0007"}}
+{"TurnStarted":{"msg_id":"c-0007"}}
+{"TurnFinished":{"msg_id":"c-0007","outcome":"replied","dropped_status":0}}
+{"Status":{"msg_id":"c-0007","event":{"type":"thinking","message":"Processing..."}}}
+{"Response":{"content":"It is a terminal screenshot showing a failing test run.","session_id":"0b6c1c2d3e4f4a5b8c9d0e1f2a3b4c5d","is_complete":true,"msg_id":"c-0007"}}
+{"ApprovalRequest":{"msg_id":"c-0011","request_id":"5f0c1d9e-2b7a-4c7e-9a51-0d3f8e6b1a22","tool_name":"shell","description":"Run shell command: rm -rf build/","parameters":"{\n  \"command\": \"rm -rf build/\"\n}","allow_always":false,"parameters_truncated":false,"parameters_bytes":32}}
+{"ApprovalResolved":{"request_id":"5f0c1d9e-2b7a-4c7e-9a51-0d3f8e6b1a22","resolution":"approve"}}
+{"AuthRequired":{"msg_id":"c-0012","extension_name":"github","instructions":"Paste a GitHub personal access token as your next message.","setup_url":"https://github.com/settings/tokens"}}
+{"Error":{"msg_id":"c-0013","code":"unsupported_media","message":"image 0: unsupported image type (allowed: png, jpeg, gif, webp)","retryable":false,"fatal":false}}
+{"TranscribeResult":{"req_id":"t-0003","text":"remind me to rotate the backup keys tomorrow","elapsed_ms":1840,"language":"en","model":"parakeet-tdt-0.6b-v2-int8"}}
+{"Notice":{"kind":"background","level":"info","text":"[Job 6e63414c] Container finished (status: completed)"}}
+"Ping"
+"Pong"

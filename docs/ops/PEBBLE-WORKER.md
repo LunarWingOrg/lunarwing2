@@ -172,12 +172,20 @@ sudo ic/scripts/lunarwing-mt-admin.sh build-pebble-worker
 
 That standalone command builds from the operator checkout. Tenant builds
 (`build-tenant <name> --with-pebble`, `build-all --with-pebble`, and worker
-candidate builds during `upgrade-tenant`) instead use the tenant clone for the
-Dockerfile, build context, and `SOURCE_REVISION` stamp. Tenant builds refuse a
-dirty or unverifiable `pebble4lunarwing/` source tree, so uncommitted operator
-edits cannot enter a tenant image and a shared image always names a clean
-tenant commit. The fat-build toolchain smoke helper still executes from the
-operator checkout, never from the tenant-writable clone (WI#507).
+candidate builds during `upgrade-tenant`) resolve the tenant clone's clean HEAD
+for the `SOURCE_REVISION` stamp, but do not build from that tenant-writable
+directory. The commit must already exist in the operator checkout and be an
+ancestor of the release ref being deployed. Default builds use the operator's
+current local branch, or its exact HEAD when detached; upgrades use the explicit
+target ref. Tenant branch names are ignored, and ancestors behind the ref tip
+are accepted. Fast-forward the operator's local branch before default builds:
+`--source-repo` / `LUNARWING_MT_SOURCE_REPO` updates the tenant clone's source,
+not the operator archive's provenance anchor. The Dockerfile and build context
+come from a private, root-owned `git archive` of that commit in the operator
+checkout; links are refused and the archive is removed on exit. Thus tenant and
+operator working-tree edits cannot enter the image, while the image still names
+the tenant's commit. The fat-build toolchain smoke helper also executes from the
+operator checkout, never from the tenant-writable clone (WI#507/WI#539).
 
 ### Port Allocation
 

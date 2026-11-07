@@ -223,7 +223,8 @@ fn install_linux_systemd_user() -> Result<()> {
 
     let exe = std::env::current_exe().context("failed to resolve current executable")?;
     let bridge_exe = linux_bridge_executable_path(&exe);
-    let unit = linux_unit_content(&exe, bridge_exe.is_some());
+    let env_file = lunarwing_base_dir().join("env/lunarwing.env");
+    let unit = linux_unit_content(&exe, &env_file, bridge_exe.is_some());
 
     std::fs::write(&file, unit)?;
     if let Some(bridge_exe) = bridge_exe {
@@ -260,7 +261,7 @@ fn install_linux_openrc() -> Result<()> {
     let base_dir = lunarwing_base_dir();
     let logs_dir = base_dir.join("logs");
     let bridge_exe = linux_bridge_executable_path(&exe);
-    let (service_user, service_group) = current_service_identity();
+    let (service_user, service_group) = current_service_identity()?;
 
     write_text_file_with_mode(
         &linux_openrc_init_path(OPENRC_UNIT),
@@ -579,7 +580,7 @@ fn disable_legacy_macos_service() -> Result<()> {
     Ok(())
 }
 
-fn linux_unit_content(exe: &Path, include_xmpp_bridge: bool) -> String {
+fn linux_unit_content(exe: &Path, env_file: &Path, include_xmpp_bridge: bool) -> String {
     let bridge_unit_lines = if include_xmpp_bridge {
         format!(
             "Wants={bridge}\n\
@@ -602,6 +603,7 @@ fn linux_unit_content(exe: &Path, include_xmpp_bridge: bool) -> String {
          Environment=\"AGENT_NAME=lunarwing\"\n\
          Environment=\"ALLOW_PRIVATE_IPS=1\"\n\
          Environment=\"PGSSLMODE=disable\"\n\
+         EnvironmentFile=-{env_file}\n\
          ExecStart=\"{exe}\" run\n\
          Restart=always\n\
          RestartSec=3\n\
@@ -609,6 +611,7 @@ fn linux_unit_content(exe: &Path, include_xmpp_bridge: bool) -> String {
          [Install]\n\
          WantedBy=default.target\n",
         exe = exe.display(),
+        env_file = env_file.display(),
         bridge_unit_lines = bridge_unit_lines,
     )
 }
@@ -641,6 +644,12 @@ fn linux_bridge_executable_path(lunarwing_exe: &Path) -> Option<PathBuf> {
         }
     }
 
+    linux_bridge_executable_candidates(lunarwing_exe)
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+fn linux_bridge_executable_candidates(lunarwing_exe: &Path) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
     if let Some(exe_dir) = lunarwing_exe.parent() {
@@ -660,7 +669,7 @@ fn linux_bridge_executable_path(lunarwing_exe: &Path) -> Option<PathBuf> {
         }
     }
 
-    candidates.into_iter().find(|path| path.is_file())
+    candidates
 }
 
 fn linux_openrc_confd_content(
@@ -935,27 +944,66 @@ fn ensure_openrc_root(action: &str) -> Result<()> {
 }
 
 fn is_effective_root() -> bool {
-    match run_capture(Command::new("id").arg("-u")) {
-        Ok(output) => output.trim() == "0",
-        Err(_) => false,
+    #[cfg(unix)]
+    {
+        nix::unistd::geteuid().is_root()
+    }
+    #[cfg(not(unix))]
+    {
+        false
     }
 }
 
-fn current_service_identity() -> (String, String) {
-    let user = std::env::var("SUDO_USER")
-        .ok()
-        .or_else(|| std::env::var("USER").ok())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "root".to_string());
-    let group = current_primary_group(&user).unwrap_or_else(|| user.clone());
-    (user, group)
+fn current_service_identity() -> Result<(String, String)> {
+    let user = select_service_user(
+        std::env::var("SUDO_USER").ok().as_deref(),
+        std::env::var("USER").ok().as_deref(),
+    );
+    ensure_openrc_service_identity(&user, root_service_allowed())?;
+    let group = current_primary_group(&user)?;
+    Ok((user, group))
 }
 
-fn current_primary_group(user: &str) -> Option<String> {
-    run_capture(Command::new("id").args(["-gn", user]))
-        .ok()
-        .map(|output| output.trim().to_string())
-        .filter(|value| !value.is_empty())
+fn select_service_user(sudo_user: Option<&str>, user: Option<&str>) -> String {
+    sudo_user
+        .into_iter()
+        .chain(user)
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .unwrap_or("root")
+        .to_string()
+}
+
+fn root_service_allowed() -> bool {
+    std::env::var("LUNARWING_ALLOW_ROOT_SERVICE").is_ok_and(|value| value.trim() == "1")
+}
+
+fn ensure_openrc_service_identity(user: &str, allow_root: bool) -> Result<()> {
+    if user.trim() != "root" || allow_root {
+        return Ok(());
+    }
+
+    bail!(
+        "Refusing to configure the OpenRC service to run as root. \
+         Run the installer through sudo from a non-root service account, or set \
+         LUNARWING_ALLOW_ROOT_SERVICE=1 to explicitly allow a root daemon."
+    )
+}
+
+#[cfg(unix)]
+fn current_primary_group(user: &str) -> Result<String> {
+    let account = nix::unistd::User::from_name(user)
+        .with_context(|| format!("failed to look up service user '{user}'"))?
+        .with_context(|| format!("service user '{user}' does not exist"))?;
+    let group = nix::unistd::Group::from_gid(account.gid)
+        .with_context(|| format!("failed to look up primary group for service user '{user}'"))?
+        .with_context(|| format!("primary group for service user '{user}' does not exist"))?;
+    Ok(group.name)
+}
+
+#[cfg(not(unix))]
+fn current_primary_group(user: &str) -> Result<String> {
+    bail!("OpenRC service identity lookup is not supported on this platform for '{user}'")
 }
 
 fn shell_quote(raw: &str) -> String {
@@ -1146,10 +1194,24 @@ mod tests {
 
     #[test]
     fn linux_unit_content_adds_bridge_dependency_when_enabled() {
-        let unit = linux_unit_content(Path::new("/tmp/lunarwing"), true);
+        let unit = linux_unit_content(
+            Path::new("/tmp/lunarwing"),
+            Path::new("/srv/lunarwing/env/lunarwing.env"),
+            true,
+        );
         assert!(unit.contains("Wants=xmpp-bridge.service"));
         assert!(unit.contains("After=network.target xmpp-bridge.service"));
         assert!(unit.contains("ExecStart=\"/tmp/lunarwing\" run"));
+    }
+
+    #[test]
+    fn linux_unit_content_loads_optional_env_file() {
+        let unit = linux_unit_content(
+            Path::new("/tmp/lunarwing"),
+            Path::new("/srv/lunarwing/env/lunarwing.env"),
+            false,
+        );
+        assert!(unit.contains("EnvironmentFile=-/srv/lunarwing/env/lunarwing.env\n"));
     }
 
     #[test]
@@ -1158,6 +1220,44 @@ mod tests {
         assert!(unit.contains("Description=LunarWing XMPP bridge"));
         assert!(unit.contains("PartOf=lunarwing.service"));
         assert!(unit.contains("ExecStart=\"/tmp/xmpp-bridge\""));
+    }
+
+    #[test]
+    fn linux_bridge_candidates_cover_adjacent_and_workspace_builds() {
+        assert_eq!(
+            linux_bridge_executable_candidates(Path::new("/repo/target/release/lunarwing")),
+            vec![
+                PathBuf::from("/repo/target/release/xmpp-bridge"),
+                PathBuf::from("/repo/bridges/xmpp-bridge/target/release/xmpp-bridge"),
+            ]
+        );
+    }
+
+    #[test]
+    fn service_user_selection_skips_blank_sudo_user() {
+        assert_eq!(
+            select_service_user(Some("  "), Some(" lunarwing ")),
+            "lunarwing"
+        );
+        assert_eq!(select_service_user(None, None), "root");
+    }
+
+    #[test]
+    fn openrc_root_service_requires_explicit_opt_in() {
+        let err = ensure_openrc_service_identity(" root ", false)
+            .expect_err("root service identity should be refused");
+        assert!(err.to_string().contains("run as root"));
+        assert!(err.to_string().contains("LUNARWING_ALLOW_ROOT_SERVICE=1"));
+        assert!(ensure_openrc_service_identity("root", true).is_ok());
+        assert!(ensure_openrc_service_identity("lunarwing", false).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn primary_group_lookup_rejects_unknown_user() {
+        let err = current_primary_group("lunarwing\0invalid")
+            .expect_err("an invalid service user should not get a same-named group fallback");
+        assert!(err.to_string().contains("does not exist"));
     }
 
     #[test]

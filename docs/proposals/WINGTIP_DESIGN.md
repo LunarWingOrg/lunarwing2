@@ -12,7 +12,8 @@ Status: final design, 2026-11-03. Revised from the integration draft (`design/DE
 > **Status on master (2026-11-03):**
 > - **Merged** (!2173): M1a, M1b and M2a.
 > - **Since then:** a default `tui-access` grant refuses unless the running daemon lists the `client_tokens` capability feature, and `rotate-gateway-token` rotates `GATEWAY_AUTH_TOKEN` (3e495eb61).
-> - **Not built yet:** M2b (client tokens, 8.3.5), M3 (socket hardening, WI#458) and M4 (REPLv3 and the client socket transport). Their sections describe planned work.
+> - **Implemented since then:** M3 (protocol-1 socket hardening, WI#458).
+> - **Not built yet:** M2b (client tokens, 8.3.5) and M4 (REPLv3 and the client socket transport). Their sections describe planned work.
 > - **Open review findings:** WI#556 (UZ-3 to UZ-9) and WI#550 (silent replies still stop the daemon on channels other than the gateway and the socket).
 > - **Appendix A decisions:**
 >   - DEC-1: adopted, implemented in M2a.
@@ -762,7 +763,7 @@ export async function assertListenerOwner(url: URL, expected: { uid: number; lab
 
 ### 3.9 SocketTransport (`tui/src/transport/socket.ts`, M4)
 
-- Path order: `--socket`, `LUNARWING_SOCKET`, `IRONCLAW_SOCKET`, `$XDG_RUNTIME_DIR/lunarwing.sock`, `$LUNARWING_BASE_DIR` (or `$IRONCLAW_BASE_DIR`)`/lunarwing.sock`, `~/.ironclaw/lunarwing.sock` (mirrors `ic/src/main.rs:490-500`). Before connecting: `lstat` must show a socket (not a symlink) owned by `process.getuid()`, else `forbidden` (fatal). `ENOENT`/`ECONNREFUSED` → `unreachable` (retry). `EACCES` → `permission_denied` (fatal) with the hint "tenant sockets are owner-only; use `--tenant <t>` after `tui-access`".
+- Path order: `--socket`, `LUNARWING_SOCKET`, `IRONCLAW_SOCKET`, `$XDG_RUNTIME_DIR/lunarwing.sock`, `$LUNARWING_BASE_DIR` (or `$IRONCLAW_BASE_DIR`)`/lunarwing.sock`, `~/.ironclaw/lunarwing.sock` (mirrors `ic/src/main.rs:490-500`). Before connecting: `lstat` must show a socket (not a symlink) owned by `process.getuid()`, else `forbidden` (fatal). After connecting, check the listener's race-free peer credentials as well; the Rust protocol-1 client already does this with `UnixStream::peer_cred()` before its handshake. `ENOENT`/`ECONNREFUSED` → `unreachable` (retry). `EACCES` → `permission_denied` (fatal) with the hint "tenant sockets are owner-only; use `--tenant <t>` after `tui-access`".
 - Framing (`transport/framing.ts`, shared with SSE): split on byte `0x0A` and decode each line with `TextDecoder("utf-8").decode(seg, {stream:true})`, flushing at line end (fixes C4); linear in input (fixes C6); bounded at 32 MiB until `Welcome` sets `max_frame_bytes`; an oversize line throws `FrameTooLargeError`, destroys the socket and reconnects.
 
 ```ts
@@ -2490,15 +2491,15 @@ Errors: `ReplSocketError` (startup, thiserror), converted into `ChannelError::St
 
 ```rust
 // listener.rs
-fn prepare_parent_dir(path: &Path) -> Result<(), ReplSocketError>;   // missing: create 0700 (DirBuilder.mode + set_permissions, umask-proof)
+fn prepare_parent_dir(path: &Path) -> Result<(), ReplSocketError>;   // missing: DirBuilder.mode(0700), then lstat + validate; never chmod
 fn validate_parent(parent: &Path, meta: &std::fs::Metadata) -> Result<(), ReplSocketError>;
 // existing parent: must be a directory owned by geteuid with mode & 0o022 == 0, else InsecureParent (SEC-11); never chmod
 fn set_mode_0600(path: &Path) -> Result<(), ReplSocketError>;        // after bind
 ```
 
-Existing directories are never chmodded because they are shared: `$XDG_RUNTIME_DIR` (0700) and the multi-tenant `run/` (0750 on OpenRC via `checkpath`, `ic/scripts/mt-admin-lib/08-units-openrc.sh:1122`, also holding `ssh-agent/`). The bind-to-chmod window is harmless because every connection passes the uid gate and MT units run with `UMask=0077` (`07-units-systemd.sh:1054`, `08-units-openrc.sh:916`). The SSH-agent socket precedent (`ic/src/bridge/ssh_agent.rs:105-153`, 0755/0666) is deliberately not copied: that socket must be reachable by worker uids; this one must not.
+Directories are never chmodded after a path-based create or inspection. A missing parent is created with `DirBuilder.mode(0o700)`, which the umask can only make more restrictive, and then re-inspected with `symlink_metadata` and validated. Omitting a follow-up chmod avoids chmodding a symlink target if another process swaps the path during creation. Existing directories are left untouched because they are shared: `$XDG_RUNTIME_DIR` (0700) and the multi-tenant `run/` (0750 on OpenRC via `checkpath`, `ic/scripts/mt-admin-lib/08-units-openrc.sh:1122`, also holding `ssh-agent/`). The bind-to-chmod window is harmless because every connection passes the uid gate and MT units run with `UMask=0077` (`07-units-systemd.sh:1054`, `08-units-openrc.sh:916`). The SSH-agent socket precedent (`ic/src/bridge/ssh_agent.rs:105-153`, 0755/0666) is deliberately not copied: that socket must be reachable by worker uids; this one must not.
 
-The strict owner and mode rule (SEC-11) holds for every layout in use: `$XDG_RUNTIME_DIR` is 0700 and user-owned; the OpenRC tenant `run/` is 0750 and tenant-owned (`08-units-openrc.sh:1122`); a daemon-created `run/` is 0700 under `UMask=0077`; a dev harness `run/` is 0755 at worst. In a group- or world-writable parent another uid could pre-bind or replace the path, and the legacy clients would talk to it. A socket configured in a shared directory such as `/tmp` is therefore refused at start (today it works); the error names the directory and its mode.
+The strict owner and mode rule (SEC-11) holds for every layout in use: `$XDG_RUNTIME_DIR` is 0700 and user-owned; the OpenRC tenant `run/` is 0750 and tenant-owned (`08-units-openrc.sh:1122`); a daemon-created `run/` is 0700 under `UMask=0077`; a dev harness `run/` is 0755 at worst. In a group- or world-writable parent another uid could pre-bind or replace the path, and the legacy clients would talk to it. A socket configured in a shared directory such as `/tmp` is therefore refused at start (today it works); this also refuses a fresh group-writable home or base directory created under umask 002. The error names the directory and its mode and tells the operator to run `chmod go-w <parent>` or choose a dedicated owner-only directory.
 
 #### 8.5.3 WI#458 item 2: same-uid `SO_PEERCRED` gate
 
@@ -2562,7 +2563,7 @@ Any Unix socket inside a mounted tree is an IPC path out of the sandbox: `connec
 
 1. **Structural protection of the socket directories**, independent of any walk. `resolve_protected_paths_from(env_raw, base, runtime_dirs: &[PathBuf])` (`:167`) gains the last parameter so tests stay environment-free; `resolve_protected_paths_signalled` (`:86`) fills it from NEW `fn runtime_socket_dirs() -> Vec<PathBuf>`:
    - `$XDG_RUNTIME_DIR` when absolute, and `/run/user/<geteuid>`: the default REPL socket (`ic/src/main.rs:490-499`), the D-Bus session bus, `systemd/private`, `podman/podman.sock`, Wayland, PipeWire, and agent sockets kept there;
-   - the parent of `LUNARWING_SOCKET` / `IRONCLAW_SOCKET` when set (the base-dir fallback is already protected);
+   - the parent of `LUNARWING_SOCKET` / `IRONCLAW_SOCKET` when set (the base-dir fallback is already protected). The whole parent is protected, so a custom socket directly under `$HOME` makes every workspace below `$HOME` ineligible as a sandbox mount root; choose a dedicated owner-only socket directory instead;
    - `/tmp/.X11-unix` and `${TMUX_TMPDIR:-/tmp}/tmux-<geteuid>` (an X11 client can read every keystroke; a tmux client can type into the user's terminals).
    They join the protected set, so `validate_mount_dir` refuses them as roots (at or inside) and `masked_dirs_for_mount` (`:378-392`) shadows each of them whole with an empty directory under any mounted ancestor, whether or not it exists yet (WI#209). The proxy relay socket and the mask artifacts also live under `$XDG_RUNTIME_DIR` (`ic/src/sandbox/proxy/relay.rs:103-117`) but are mounted directly as sources (`cli_runner.rs:419-471`), so the shadowing does not touch them.
    `validate_mount_dir` also refuses the canonical roots `/`, `/run` and `/var/run` (NEW `const DENIED_MOUNT_ROOTS: [&str; 3]`): they expose system sockets such as `/run/dbus/system_bus_socket` that no bounded walk can be trusted to reach.
