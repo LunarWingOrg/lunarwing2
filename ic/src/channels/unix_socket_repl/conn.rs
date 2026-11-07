@@ -143,22 +143,22 @@ where
             buffer.clear();
         }
         let read = (&mut *reader)
-            .take(max.saturating_add(1) as u64)
+            .take(max.saturating_add(2) as u64)
             .read_until(b'\n', buffer)
             .await?;
         if read == 0 {
             return Ok(FrameRead::Eof);
-        }
-        if buffer.len() > max {
-            buffer.clear();
-            buffer.shrink_to(BUFFER_SHRINK_THRESHOLD);
-            return Ok(FrameRead::TooLong);
         }
         if buffer.last() == Some(&b'\n') {
             buffer.pop();
         }
         if buffer.last() == Some(&b'\r') {
             buffer.pop();
+        }
+        if buffer.len() > max {
+            buffer.clear();
+            buffer.shrink_to(BUFFER_SHRINK_THRESHOLD);
+            return Ok(FrameRead::TooLong);
         }
         if buffer.is_empty() {
             continue;
