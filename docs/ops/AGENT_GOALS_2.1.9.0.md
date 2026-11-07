@@ -63,7 +63,7 @@
 7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/539
 8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/383
 9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/314 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2228 but had some problems - please see review comments on the closed MR and re-attempt
-10. [ ] create draft for release notes at base of root
+10. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/458
 
 ## Phase 7 - Advanced Operator Notes
 
