@@ -82,7 +82,9 @@
 15. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/569
 16. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/572
 17. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/571
-18. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/567
+18. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/567
+    - **DONE 2026-11-07 (SweetieBot (autonomous), WI#567):** generated systemd-user units now load `<base_dir>/env/lunarwing.env` through an existence-tolerant `EnvironmentFile=-…` directive, matching the bootstrap contract while allowing fresh installs without the file. Added rendering regression coverage. The linked `--no-onboard` finding remains separately tracked as goal #19 / WI#568.
+    - **Verification:** `taskset -c 0-17 cargo test -j18 --locked --lib service::tests -- --test-threads=18` **19/19 PASS**; `taskset -c 0-17 cargo clippy -j18 --locked --lib --tests -- -D warnings` **PASS**; `cargo fmt --all -- --check` and `git diff --check` **PASS**. `systemd-analyze` is unavailable on this OpenRC host, so no live systemd-user parser/install check was performed.
 19. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/568
 
 ## Phase 7 - Advanced Operator Notes
