@@ -36,7 +36,12 @@
 
 ## Phase 3 — Carried Known-Issues from RELEASE-v2.1.8.0.md (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
 
-4. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/545
+4. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/545
+    - **DONE 2026-11-07 (Rarity, item-4, branch `rarity/kimi-4-20261107-0002`):** fixed the original cache-poisoning defect on both completion paths. Empty, tool-free terminal responses still reach the caller but are never inserted, including reasoning-only and deterministic `length`/`content_filter` outcomes; regressions prove repeated empty blocking and streaming calls remain misses.
+    - **Backend identity (comment finding D):** added `cache_key_model_name` with forwarding through retry, circuit-breaker, timeout, recording, stream-integrity and cache decorators. Smart routing and failover return no pre-dispatch identity, so their responses bypass the outer cache instead of being replayed from another model. This deliberately avoids the suggested post-dispatch-only rekey: it cannot make the earlier lookup safe and would consume failover's request-scoped model binding before the caller reads it. Stable single-backend caching is unchanged.
+    - **Comment findings A–C:** cache keys now include sorted, length-framed request metadata and fail closed to a cache bypass on message serialization errors. Stream entries preserve the exact provider finish reason and retry/failover observations (including discarded usage), replaying them before terminal `Done`; an exact-chunk regression covers both. `docs/proposals/ENGINE_LLM_STREAMING.md` records the resulting contracts.
+    - **Verification (`taskset -c 0-17`, `-j18`):** `cargo test --lib llm:: -- --nocapture` **663/663 PASS**, including all six new regressions; the post-Clippy metadata regression **1/1 PASS** on the exact final source. `cargo clippy --locked --all --benches --tests --examples -- -D warnings` PASS, `cargo fmt --all -- --check` PASS, and `git diff --check` PASS.
+    - **Honest gap:** no live external-provider/tenant smoke or MR pipeline was run. The tests exercise the actual cache, routing/failover decorators and full composed chain with deterministic providers; item is checked on the code-fix bar.
 
 ## Phase 4 - Documentation and Misc goal items (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
 
