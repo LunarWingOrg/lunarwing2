@@ -158,8 +158,8 @@ fn truncate_parameters(parameters: &str) -> String {
     }
     let omitted = parameters.len() - boundary;
     format!(
-        "{}\n[... {omitted} more bytes not shown; review the full request in the web UI before approving]",
-        &parameters[..boundary]
+        "{}\n[... {omitted} more bytes not shown; review the full request in the web UI before approving]", // safety: literal truncation marker, not byte slicing.
+        parameters.get(..boundary).unwrap_or_default()
     )
 }
 
