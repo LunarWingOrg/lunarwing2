@@ -139,6 +139,22 @@ async fn socket_file_mode_is_0600() {
 }
 
 #[tokio::test]
+async fn shutdown_unlinks_socket_and_channel_can_restart() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("repl.sock");
+    let channel = test_channel(&path, 2);
+    let stream = start(&channel).await;
+    drop(stream);
+    channel.shutdown().await.expect("first shutdown");
+    assert!(!path.exists());
+
+    let _stream = start(&channel).await;
+    let (_client, _session) = TestClient::handshake(&path).await;
+    channel.shutdown().await.expect("second shutdown");
+    assert!(!path.exists());
+}
+
+#[tokio::test]
 async fn missing_parent_dir_is_created_0700() {
     let temp = tempfile::tempdir().expect("tempdir");
     let parent = temp.path().join("nested/run");
@@ -491,7 +507,15 @@ async fn oversize_handshake_line_closes_connection() {
     let channel = test_channel(&path, 2).with_limits(limits);
     let _stream = start(&channel).await;
     let mut client = TestClient::connect(&path).await;
-    client.send_raw(&[b'x'; 100]).await;
+    client
+        .send(&ClientFrame::Connect(ConnectFrame {
+            version: "x".repeat(100),
+            client_info: None,
+            protocol: None,
+            features: Vec::new(),
+            thread: None,
+        }))
+        .await;
     assert!(client.read_optional().await.is_none());
     channel.shutdown().await.expect("shutdown");
 }
@@ -506,6 +530,22 @@ async fn crlf_terminated_frames_are_accepted() {
     client.send_raw(b"\"Ping\"\r\n").await;
     assert!(matches!(client.read().await, ServerFrame::Pong));
     channel.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn frame_limit_excludes_lf_and_crlf_endings() {
+    for ending in ["\n", "\r\n"] {
+        let line = format!("\"Ping\"{ending}");
+        let mut reader = BufReader::new(line.as_bytes());
+        let mut buffer = Vec::new();
+        assert_eq!(
+            super::conn::read_frame_line(&mut reader, &mut buffer, 6)
+                .await
+                .expect("frame read"),
+            super::conn::FrameRead::Line
+        );
+        assert_eq!(buffer, b"\"Ping\"");
+    }
 }
 
 #[tokio::test]
