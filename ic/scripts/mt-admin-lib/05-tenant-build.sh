@@ -1495,7 +1495,7 @@ _operator_worker_release_ref() {  # <branch, tag, remote ref, or commit>
   local -a candidates=()
   case "$requested" in
     refs/*)   candidates=("$requested") ;;
-    origin/*) candidates=("refs/remotes/$requested") ;;
+    origin/*) candidates=("refs/remotes/$requested" "refs/heads/${requested#origin/}" "refs/tags/${requested#origin/}") ;;
     *)        candidates=("refs/heads/$requested" "refs/remotes/origin/$requested" "refs/tags/$requested") ;;
   esac
   for candidate in "${candidates[@]}"; do
