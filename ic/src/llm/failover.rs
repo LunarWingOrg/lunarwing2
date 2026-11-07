@@ -556,6 +556,10 @@ impl LlmProvider for FailoverProvider {
 
         self.providers[self.last_used.load(Ordering::Relaxed)].effective_model_name(requested_model)
     }
+
+    fn cache_key_model_name(&self, _requested_model: Option<&str>) -> Option<String> {
+        None
+    }
 }
 
 #[cfg(test)]
