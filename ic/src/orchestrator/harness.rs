@@ -839,7 +839,6 @@ pub struct SecretValueRedactor {
     folded_variants: Vec<SecretString>,
     direct_matcher: Option<aho_corasick::AhoCorasick>,
     folded_matcher: Option<aho_corasick::AhoCorasick>,
-    folded_long_matcher: Option<aho_corasick::AhoCorasick>,
     /// Longest variant length in bytes; bounds the truncation-cut scan.
     max_variant_bytes: usize,
 }
@@ -1144,45 +1143,20 @@ fn replace_ranges(text: &str, mut ranges: Vec<(usize, usize)>) -> String {
 
 fn build_variant_matcher(variants: &[SecretString]) -> Option<aho_corasick::AhoCorasick> {
     use secrecy::ExposeSecret;
-    if variants.is_empty() {
-        return None;
-    }
-    match aho_corasick::AhoCorasick::new(
-        variants
-            .iter()
-            .map(|variant| variant.expose_secret().as_bytes()),
-    ) {
-        Ok(matcher) => Some(matcher),
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                variants = variants.len(),
-                "Failed to build harness secret matcher; using sequential fallback"
-            );
-            None
-        }
-    }
-}
-
-fn build_folded_long_matcher(variants: &[SecretString]) -> Option<aho_corasick::AhoCorasick> {
-    use secrecy::ExposeSecret;
-    let long: Vec<&[u8]> = variants
+    let short: Vec<&[u8]> = variants
         .iter()
-        .filter(|variant| variant.expose_secret().len() > WRAP_LINE_VARIANT_CHAR_CAP)
+        .filter(|variant| variant.expose_secret().len() <= WRAP_LINE_VARIANT_CHAR_CAP)
         .map(|variant| variant.expose_secret().as_bytes())
         .collect();
-    if long.is_empty() {
+    if short.is_empty() {
         return None;
     }
-    match aho_corasick::AhoCorasick::builder()
-        .match_kind(aho_corasick::MatchKind::LeftmostLongest)
-        .build(long)
-    {
+    match aho_corasick::AhoCorasick::new(short) {
         Ok(matcher) => Some(matcher),
         Err(error) => {
             tracing::warn!(
                 %error,
-                "Failed to build long harness secret matcher; using full overlapping search"
+                "Failed to build harness secret matcher; using sequential fallback"
             );
             None
         }
@@ -1210,7 +1184,10 @@ fn collect_automaton_ranges(
     ranges
 }
 
-fn sequential_match_ranges(variants: &[SecretString], text: &str) -> Vec<(usize, usize)> {
+fn sequential_match_ranges<'a>(
+    variants: impl IntoIterator<Item = &'a SecretString>,
+    text: &str,
+) -> Vec<(usize, usize)> {
     use secrecy::ExposeSecret;
     let mut ranges = Vec::new();
     for variant in variants {
@@ -1228,10 +1205,28 @@ fn sequential_match_ranges(variants: &[SecretString], text: &str) -> Vec<(usize,
     ranges
 }
 
+fn long_sequential_match_ranges(variants: &[SecretString], text: &str) -> Vec<(usize, usize)> {
+    use secrecy::ExposeSecret;
+    sequential_match_ranges(
+        variants
+            .iter()
+            .filter(|variant| variant.expose_secret().len() > WRAP_LINE_VARIANT_CHAR_CAP),
+        text,
+    )
+}
+
 fn variants_contain(variants: &[SecretString], text: &str) -> bool {
     use secrecy::ExposeSecret;
     variants
         .iter()
+        .any(|variant| text.contains(variant.expose_secret()))
+}
+
+fn long_variants_contain(variants: &[SecretString], text: &str) -> bool {
+    use secrecy::ExposeSecret;
+    variants
+        .iter()
+        .filter(|variant| variant.expose_secret().len() > WRAP_LINE_VARIANT_CHAR_CAP)
         .any(|variant| text.contains(variant.expose_secret()))
 }
 
@@ -1277,7 +1272,6 @@ impl SecretValueRedactor {
     fn rebuild_matchers(&mut self) {
         self.direct_matcher = build_variant_matcher(&self.direct_variants);
         self.folded_matcher = build_variant_matcher(&self.folded_variants);
-        self.folded_long_matcher = build_folded_long_matcher(&self.folded_variants);
     }
 
     pub fn is_armed(&self) -> bool {
@@ -1288,7 +1282,7 @@ impl SecretValueRedactor {
     pub fn contains_secret(&self, text: &str) -> bool {
         let direct_hit = self.direct_matcher.as_ref().map_or_else(
             || variants_contain(&self.direct_variants, text),
-            |matcher| matcher.is_match(text),
+            |matcher| matcher.is_match(text) || long_variants_contain(&self.direct_variants, text),
         );
         if direct_hit || self.folded_variants.is_empty() {
             return direct_hit;
@@ -1300,7 +1294,9 @@ impl SecretValueRedactor {
         let haystack = folded.as_ref().map_or(text, |f| f.text.as_str());
         self.folded_matcher.as_ref().map_or_else(
             || variants_contain(&self.folded_variants, haystack),
-            |matcher| matcher.is_match(haystack),
+            |matcher| {
+                matcher.is_match(haystack) || long_variants_contain(&self.folded_variants, haystack)
+            },
         )
     }
 
@@ -1324,8 +1320,9 @@ impl SecretValueRedactor {
                     .find_overlapping_iter(text)
                     .map(|found| (found.start(), found.end())),
             ));
+            ranges.extend(long_sequential_match_ranges(&self.direct_variants, text));
         } else {
-            ranges.extend(sequential_match_ranges(&self.direct_variants, text));
+            ranges.extend(sequential_match_ranges(self.direct_variants.iter(), text));
         }
         ranges
     }
@@ -1342,15 +1339,9 @@ impl SecretValueRedactor {
             .any(|b| matches!(b, b'\n' | b'\r' | b'\\'))
             .then(|| fold_line_breaks(text));
         let haystack = folded.as_ref().map_or(text, |f| f.text.as_str());
-        let long_matches = self
-            .folded_long_matcher
-            .as_ref()
-            .map_or_else(Vec::new, |matcher| {
-                matcher
-                    .find_iter(haystack)
-                    .map(|found| (found.start(), found.end()))
-                    .collect::<Vec<_>>()
-            });
+        let mut long_matches = long_sequential_match_ranges(&self.folded_variants, haystack);
+        long_matches.sort_unstable_by_key(|&(start, end)| (end, start));
+        let long_matches = collect_automaton_ranges(long_matches);
         if long_matches.is_empty() {
             return self.overlapping_folded_match_ranges(
                 &folded,
@@ -1406,12 +1397,18 @@ impl SecretValueRedactor {
             .map(|(start, end)| Self::original_range(folded, text, start, end))
             .collect();
         }
-        sequential_match_ranges(&self.folded_variants, slice)
-            .into_iter()
-            .map(|(found_start, found_end)| {
-                Self::original_range(folded, text, start + found_start, start + found_end)
-            })
-            .collect()
+        use secrecy::ExposeSecret;
+        sequential_match_ranges(
+            self.folded_variants
+                .iter()
+                .filter(|variant| variant.expose_secret().len() <= WRAP_LINE_VARIANT_CHAR_CAP),
+            slice,
+        )
+        .into_iter()
+        .map(|(found_start, found_end)| {
+            Self::original_range(folded, text, start + found_start, start + found_end)
+        })
+        .collect()
     }
 
     fn original_range(
