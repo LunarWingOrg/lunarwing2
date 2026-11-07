@@ -41,7 +41,10 @@
 
 ## Phase 2 — Features/Polish/BaselineAdditions (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
 
-2. [ ] audit all crates for security and write report to docs/ops
+2. [x] audit all crates for security and write report to docs/ops
+    - **DONE 2026-11-07 (item-2, branch `aj/kimi-2-20261107-0600`):** post-sweep audit of all **27 tracked non-vendor lockfiles** against RustSec advisory-db `309392b18f6b17022f82c701f300433126901068` (2026-11-06, confirmed upstream HEAD). Full report: `docs/ops/v2.1.9.0_CARGO_DENY_AUDIT.md`. All four advisory gates green: main cargo-deny advisories/bans/licenses/sources ok with zero warnings/index failures; satellite sweep **26 roots ok + one manifest-less skip**; default-graph and lockfile-only guards both ok. Independent cargo-audit completed 27/27 locks: 25 roots at zero vulnerabilities; only the documented acceptances and guarded uncompiled `pyo3` IDs remain in `ic`/xmpp-bridge raw-lock output.
+    - **Findings and scope:** all **13 existing acceptances re-verified**, with no ignore added, removed, or widened; only the RSA rationale moved to current upstream evidence (russh 0.65.1 still pins rsa 0.10.0-rc.18; RSA rc.22 is not RustSec-marked patched). New informational `astral-tl 0.8.1` unmaintained notice RUSTSEC-2026-0444 is not a vulnerability; its clearing parent releases require Rust 1.99, above MSRV 1.96.1. Direct sparse-index verification covered **4,135 registry pins** with zero yanked, missing, checksum mismatches, or fetch errors. Pebble's exact pinned-upstream override delta and SHA-256 passed. Six lockless dev/test/stray manifests and non-Rust/container surfaces are explicitly disclosed in the report.
+    - **Verification:** guard suites `test_deny_toml_guards.py` **23/23**, `test_cargo_deny_gate.py` **15/15**, `test_lockfile_only_advisory_guard.py` **5/5**, `test_default_graph_guard.py` **12/12**, and `test_pebble_build_inputs.py` **41 OK, four skipped**. No dependency, manifest, lockfile, vendor source, or CI gate changed. The exact-head MR pipeline remains the maintainer/CI step; no push or MR was requested.
 3. [x] (S) add new WI here later
 
 ## Phase 3 — Carried Known-Issues from RELEASE-v2.1.8.0.md (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
