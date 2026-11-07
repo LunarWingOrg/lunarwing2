@@ -161,6 +161,68 @@ async fn finalizing_blocks_stop_cleanup_and_exit_watcher() {
 }
 
 #[tokio::test]
+async fn promotion_deadline_stops_finalizing_and_releases_harness_state() {
+    struct StalledResolver;
+
+    #[async_trait::async_trait]
+    impl crate::tools::builtin::memory::WorkspaceResolver for StalledResolver {
+        async fn resolve(&self, _user_id: &str) -> Arc<crate::workspace::Workspace> {
+            std::future::pending().await
+        }
+    }
+
+    let job_id = Uuid::new_v4();
+    let tmp = tempfile::tempdir().unwrap(); // safety: test
+    let staging = tmp.path().join("staging");
+    std::fs::create_dir_all(staging.join("projects")).unwrap(); // safety: test
+    std::fs::write(staging.join("projects/out.md"), "result").unwrap(); // safety: test
+    let mut handle = running_handle(job_id);
+    if let Some(harness) = &mut handle.harness {
+        harness.staging_dir = Some(staging);
+    }
+    let containers = Arc::new(RwLock::new(HashMap::from([(job_id, handle)])));
+    let token_store = TokenStore::new();
+    token_store
+        .store_harness_secrets(
+            job_id,
+            vec![(
+                "FIXTURE".to_string(),
+                secrecy::SecretString::from("harness-review-fixture".to_string()),
+            )],
+        )
+        .await;
+    let deps = PromotionDeps {
+        containers: Arc::clone(&containers),
+        token_store: token_store.clone(),
+        workspace: Some(Arc::new(StalledResolver)),
+        store: None,
+    };
+    let job_dir = harness::harness_job_dir(job_id);
+    std::fs::create_dir_all(&job_dir).unwrap(); // safety: test
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        finalize_harness_job_with_timeout(
+            deps,
+            job_id,
+            true,
+            true,
+            std::time::Duration::from_millis(20),
+        ),
+    )
+    .await
+    .expect("stalled promotion must reach its deadline"); // safety: test
+
+    let handle = containers.read().await.get(&job_id).unwrap().clone();
+    assert_eq!(handle.state, ContainerState::Stopped);
+    let summary = handle.harness.unwrap().promotion.unwrap();
+    assert!(summary.skipped);
+    assert_eq!(summary.skip_reason.as_deref(), Some("promotion deadline exceeded"));
+    assert!(token_store.harness_secrets(job_id).await.is_none());
+    assert!(!job_dir.exists());
+}
+
+#[tokio::test]
 async fn watcher_claim_prevents_late_completion_and_cleanup_removes_handle() {
     let mgr = ContainerJobManager::new(ContainerJobConfig::default(), TokenStore::new());
     let job_id = Uuid::new_v4();

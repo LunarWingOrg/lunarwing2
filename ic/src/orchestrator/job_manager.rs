@@ -33,6 +33,7 @@ use crate::tools::mcp::config::{McpServerConfig, McpServersFile, McpTransportCon
 pub const MAX_WORKER_MCP_SERVERS: usize = 8;
 const MAX_WORKER_MCP_CREDENTIALS: usize = 32;
 const MCP_SECRET_MARKER: &str = "worker-grant";
+const HARNESS_PROMOTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Which mode a sandbox container runs in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1626,6 +1627,23 @@ async fn finalize_harness_job(
     job_succeeded: bool,
     teardown_confirmed: bool,
 ) {
+    finalize_harness_job_with_timeout(
+        deps,
+        job_id,
+        job_succeeded,
+        teardown_confirmed,
+        HARNESS_PROMOTION_TIMEOUT,
+    )
+    .await;
+}
+
+async fn finalize_harness_job_with_timeout(
+    deps: PromotionDeps,
+    job_id: Uuid,
+    job_succeeded: bool,
+    teardown_confirmed: bool,
+    promotion_timeout: std::time::Duration,
+) {
     // Read guard scoped to this block — never held across a write (CV-1).
     let state = {
         let containers = deps.containers.read().await;
@@ -1661,7 +1679,15 @@ async fn finalize_harness_job(
         summary.skip_reason =
             Some("container teardown could not be confirmed; write-back refused".to_string());
     } else {
-        summary = run_promotion(&deps, job_id, &owner_id, &staging, &policy).await;
+        summary = run_promotion_with_timeout(
+            &deps,
+            job_id,
+            &owner_id,
+            &staging,
+            &policy,
+            promotion_timeout,
+        )
+        .await;
     }
 
     // DZ-6: the `harness_write_back` audit event is written via a direct
@@ -1715,6 +1741,28 @@ async fn finalize_harness_job(
     // snapshot + staging) — DH-2: nothing is left for the boot-time sweep.
     deps.token_store.clear_harness_secrets(job_id).await;
     harness::cleanup_harness_job_dir(job_id);
+}
+
+async fn run_promotion_with_timeout(
+    deps: &PromotionDeps,
+    job_id: Uuid,
+    owner_id: &str,
+    staging: &std::path::Path,
+    policy: &harness::WriteBackPolicy,
+    timeout: std::time::Duration,
+) -> harness::PromotionSummary {
+    match tokio::time::timeout(timeout, run_promotion(deps, job_id, owner_id, staging, policy)).await
+    {
+        Ok(summary) => summary,
+        Err(_) => {
+            tracing::warn!(job_id = %job_id, "Harness write-back promotion deadline exceeded");
+            harness::PromotionSummary {
+                skipped: true,
+                skip_reason: Some("promotion deadline exceeded".to_string()),
+                ..Default::default()
+            }
+        }
+    }
 }
 
 /// Run the write-back promotion pipeline: screen staged files, snapshot the
