@@ -1,13 +1,16 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use futures::StreamExt;
+use lunarwing_common::TurnOutcome;
 use lunarwing_common::repl_wire::{
-    ClientFrame, ConnectFrame, ResponseFrame, ServerFrame, encode_client_line,
+    ClientFrame, ConnectFrame, MessageFrame, ResponseFrame, ServerFrame, WireAttachment,
+    encode_client_line,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 use super::listener::{Existing, ReplSocketError, bind_socket, classify_existing, peer_allowed};
 use super::*;
@@ -351,4 +354,391 @@ async fn replaced_socket_inode_is_logged_and_reported_healthy() {
     assert!(path.exists());
     drop(replacement);
     std::fs::remove_file(&path).expect("replacement cleanup");
+}
+
+#[tokio::test]
+async fn v1_client_gets_legacy_welcome_response() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("repl.sock");
+    let channel = test_channel(&path, 2);
+    let _stream = start(&channel).await;
+    let (_client, session) = TestClient::handshake(&path).await;
+    assert_eq!(session.len(), 32);
+    channel.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn vibetui4_connect_without_protocol_is_v1() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("repl.sock");
+    let channel = test_channel(&path, 2);
+    let _stream = start(&channel).await;
+    let mut client = TestClient::connect(&path).await;
+    client
+        .send(&ClientFrame::Connect(ConnectFrame {
+            version: "vibetui4".to_string(),
+            client_info: Some("opentui".to_string()),
+            protocol: None,
+            features: vec!["status".to_string()],
+            thread: None,
+        }))
+        .await;
+    assert!(response_text(&client.read().await).contains("Connected to test-agent"));
+    channel.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn handshake_times_out_without_connect() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("repl.sock");
+    let channel = test_channel(&path, 2).with_limits(fast_limits());
+    let _stream = start(&channel).await;
+    let mut client = TestClient::connect(&path).await;
+    assert!(client.read_optional().await.is_none());
+    channel.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn non_connect_first_frame_closes_without_logging_payload() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("repl.sock");
+    let channel = test_channel(&path, 2);
+    let _stream = start(&channel).await;
+    let mut client = TestClient::connect(&path).await;
+    let secret = "handshake-payload-must-not-be-logged";
+    client
+        .send(&ClientFrame::Message(MessageFrame {
+            content: secret.to_string(),
+            session_id: None,
+            msg_id: None,
+            attachments: Vec::new(),
+        }))
+        .await;
+    assert!(client.read_optional().await.is_none());
+    assert!(!logs_contain(secret));
+    channel.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn pending_handshakes_are_capped() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("repl.sock");
+    let limits = ReplLimits {
+        pending_handshakes: 2,
+        handshake_timeout: Duration::from_millis(300),
+        ..fast_limits()
+    };
+    let channel = test_channel(&path, 4).with_limits(limits);
+    let _stream = start(&channel).await;
+    let mut first = TestClient::connect(&path).await;
+    let mut second = TestClient::connect(&path).await;
+    let mut excess = TestClient::connect(&path).await;
+    assert!(excess.read_optional().await.is_none());
+    first.send(&legacy_connect()).await;
+    second.send(&legacy_connect()).await;
+    assert!(matches!(first.read().await, ServerFrame::Response(_)));
+    assert!(matches!(second.read().await, ServerFrame::Response(_)));
+    channel.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn v1_server_busy_response_when_full() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("repl.sock");
+    let channel = test_channel(&path, 1);
+    let _stream = start(&channel).await;
+    let (_first, _session) = TestClient::handshake(&path).await;
+    let mut second = TestClient::connect(&path).await;
+    second.send(&legacy_connect()).await;
+    assert!(response_text(&second.read().await).contains("Server busy: maximum connections (1)"));
+    assert_eq!(channel.registry.len(), 1);
+    channel.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn oversize_line_is_rejected_and_connection_closed() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("repl.sock");
+    let limits = ReplLimits {
+        max_frame_bytes: 64,
+        ..fast_limits()
+    };
+    let channel = test_channel(&path, 2).with_limits(limits);
+    let _stream = start(&channel).await;
+    let (mut client, _session) = TestClient::handshake(&path).await;
+    client
+        .send(&ClientFrame::Message(MessageFrame {
+            content: "x".repeat(100),
+            session_id: None,
+            msg_id: None,
+            attachments: Vec::new(),
+        }))
+        .await;
+    assert!(response_text(&client.read().await).contains("frame exceeds 64 bytes"));
+    assert!(client.read_optional().await.is_none());
+    channel.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn oversize_handshake_line_closes_connection() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("repl.sock");
+    let limits = ReplLimits {
+        max_handshake_bytes: 32,
+        ..fast_limits()
+    };
+    let channel = test_channel(&path, 2).with_limits(limits);
+    let _stream = start(&channel).await;
+    let mut client = TestClient::connect(&path).await;
+    client.send_raw(&vec![b'x'; 100]).await;
+    assert!(client.read_optional().await.is_none());
+    channel.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn crlf_terminated_frames_are_accepted() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("repl.sock");
+    let channel = test_channel(&path, 2);
+    let _stream = start(&channel).await;
+    let (mut client, _session) = TestClient::handshake(&path).await;
+    client.send_raw(b"\"Ping\"\r\n").await;
+    assert!(matches!(client.read().await, ServerFrame::Pong));
+    channel.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn v1_session_has_no_idle_timeout() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("repl.sock");
+    let channel = test_channel(&path, 2).with_limits(fast_limits());
+    let _stream = start(&channel).await;
+    let (mut client, _session) = TestClient::handshake(&path).await;
+    sleep(Duration::from_millis(120)).await;
+    client.send(&ClientFrame::Ping).await;
+    assert!(matches!(client.read().await, ServerFrame::Pong));
+    channel.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn respond_to_stalled_reader_returns_immediately() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("repl.sock");
+    let limits = ReplLimits {
+        outbound_queue_frames: 2,
+        outbound_queue_bytes: 1024,
+        ..fast_limits()
+    };
+    let channel = test_channel(&path, 2).with_limits(limits);
+    let _stream = start(&channel).await;
+    let (_client, session) = TestClient::handshake(&path).await;
+    for _ in 0..8 {
+        let started = Instant::now();
+        let _ = channel
+            .respond(
+                &incoming(&session, "hello"),
+                OutgoingResponse::text("x".repeat(4096)),
+            )
+            .await;
+        assert!(started.elapsed() < Duration::from_millis(50));
+    }
+    channel.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn slow_reader_is_disconnected_and_other_sessions_unaffected() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("repl.sock");
+    let limits = ReplLimits {
+        outbound_queue_frames: 2,
+        outbound_queue_bytes: 64 * 1024,
+        ..fast_limits()
+    };
+    let channel = test_channel(&path, 2).with_limits(limits);
+    let _stream = start(&channel).await;
+    let (_slow, slow_session) = TestClient::handshake(&path).await;
+    let (mut other, _other_session) = TestClient::handshake(&path).await;
+    let mut disconnected = false;
+    for index in 0..100 {
+        if channel
+            .respond(
+                &incoming(&slow_session, "hello"),
+                OutgoingResponse::text("x".repeat(32 * 1024)),
+            )
+            .await
+            .is_err()
+        {
+            disconnected = true;
+            break;
+        }
+        if index % 10 == 0 {
+            other.send(&ClientFrame::Ping).await;
+            assert!(matches!(other.read().await, ServerFrame::Pong));
+        }
+    }
+    assert!(disconnected, "slow consumer must be disconnected");
+    other.send(&ClientFrame::Ping).await;
+    assert!(matches!(other.read().await, ServerFrame::Pong));
+    channel.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn graceful_fatal_error_is_flushed_before_close() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("repl.sock");
+    let limits = ReplLimits {
+        max_frame_bytes: 64,
+        ..fast_limits()
+    };
+    let channel = test_channel(&path, 2).with_limits(limits);
+    let _stream = start(&channel).await;
+    let (mut client, _session) = TestClient::handshake(&path).await;
+    client.send_raw(&vec![b'x'; 100]).await;
+    assert!(response_text(&client.read().await).contains("frame exceeds"));
+    assert!(client.read_optional().await.is_none());
+    channel.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn v1_approval_prompt_is_a_response() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("repl.sock");
+    let channel = test_channel(&path, 2);
+    let _stream = start(&channel).await;
+    let (mut client, session) = TestClient::handshake(&path).await;
+    channel
+        .send_status(
+            StatusUpdate::ApprovalNeeded {
+                request_id: "request-1".to_string(),
+                tool_name: "shell".to_string(),
+                description: "run command".to_string(),
+                parameters: serde_json::json!({"command": "rm -rf build"}),
+                allow_always: false,
+            },
+            &serde_json::json!({"unix_session_id": session}),
+        )
+        .await
+        .expect("approval status");
+    let text = response_text(&client.read().await);
+    assert!(text.contains("Approval required for `shell`"), "{text}");
+    assert!(text.contains("request-1"), "{text}");
+    channel.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn v1_approval_prompt_marks_truncated_parameters() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("repl.sock");
+    let channel = test_channel(&path, 2);
+    let _stream = start(&channel).await;
+    let (mut client, session) = TestClient::handshake(&path).await;
+    channel
+        .send_status(
+            StatusUpdate::ApprovalNeeded {
+                request_id: "request-2".to_string(),
+                tool_name: "shell".to_string(),
+                description: "run command".to_string(),
+                parameters: serde_json::json!({"command": "x".repeat(9000)}),
+                allow_always: false,
+            },
+            &serde_json::json!({"unix_session_id": session}),
+        )
+        .await
+        .expect("approval status");
+    let text = response_text(&client.read().await);
+    assert!(
+        text.contains("more bytes not shown; review the full request"),
+        "{text}"
+    );
+    assert!(!text.contains(&"x".repeat(9000)));
+    channel.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn v1_keyword_without_pending_gets_notice_response() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("repl.sock");
+    let channel = test_channel(&path, 2);
+    let _stream = start(&channel).await;
+    let (mut client, session) = TestClient::handshake(&path).await;
+    channel
+        .message_lifecycle(
+            &incoming(&session, "ok"),
+            MessageLifecycle::Finished(TurnOutcome::NoReply),
+        )
+        .await;
+    assert_eq!(
+        response_text(&client.read().await),
+        "Nothing is waiting for approval."
+    );
+    channel.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn v1_silent_turn_gets_no_reply_response() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("repl.sock");
+    let channel = test_channel(&path, 2);
+    let _stream = start(&channel).await;
+    let (mut client, session) = TestClient::handshake(&path).await;
+    channel
+        .message_lifecycle(
+            &incoming(&session, "hello"),
+            MessageLifecycle::Finished(TurnOutcome::NoReply),
+        )
+        .await;
+    assert_eq!(response_text(&client.read().await), "(no reply)");
+    channel.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn v1_attachments_get_legacy_error_response() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("repl.sock");
+    let channel = test_channel(&path, 2);
+    let mut stream = start(&channel).await;
+    let (mut client, _session) = TestClient::handshake(&path).await;
+    client
+        .send(&ClientFrame::Message(MessageFrame {
+            content: "image".to_string(),
+            session_id: None,
+            msg_id: None,
+            attachments: vec![WireAttachment {
+                mime_type: "image/png".to_string(),
+                filename: None,
+                data_base64: "aGVsbG8=".to_string(),
+            }],
+        }))
+        .await;
+    assert!(response_text(&client.read().await).contains("attachments require REPLv3"));
+    assert!(
+        timeout(Duration::from_millis(50), stream.next())
+            .await
+            .is_err()
+    );
+    channel.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn v1_quit_is_forwarded_to_the_agent() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("repl.sock");
+    let channel = test_channel(&path, 2);
+    let mut stream = start(&channel).await;
+    let (mut client, _session) = TestClient::handshake(&path).await;
+    client
+        .send(&ClientFrame::Message(MessageFrame {
+            content: "/quit".to_string(),
+            session_id: None,
+            msg_id: None,
+            attachments: Vec::new(),
+        }))
+        .await;
+    let message = timeout(Duration::from_secs(1), stream.next())
+        .await
+        .expect("forwarded message")
+        .expect("message stream");
+    assert_eq!(message.content, "/quit");
+    channel.shutdown().await.expect("shutdown");
 }
