@@ -7,6 +7,12 @@ unset LUNARWING_MT_HEALTH_INTERVAL_MIN
 # shellcheck source=../lunarwing-mt-admin.sh
 source "$MT_ADMIN"
 
+TEST_ROOT="$(mktemp -d)"
+trap 'rm -rf "$TEST_ROOT"' EXIT
+HEALTH_ENV_FILE="$TEST_ROOT/health.env"
+SD_DIR="$TEST_ROOT/systemd"
+mkdir -p "$SD_DIR"
+
 failures=0
 
 assert_eq() {
@@ -19,10 +25,46 @@ assert_eq() {
   fi
 }
 
+assert_invalid_interval() {
+  local label="$1" value="$2" origin="$3"
+  local output="" expected_source="$HEALTH_ENV_FILE"
+  local status=0
+  local -a resolver=(
+    bash -c '
+      source "$1"
+      HEALTH_ENV_FILE="$2"
+      INIT_SYSTEM="openrc"
+      ensure_init_system
+    ' _ "$MT_ADMIN" "$HEALTH_ENV_FILE"
+  )
+
+  if [[ "$origin" == "environment" ]]; then
+    expected_source="environment (LUNARWING_MT_HEALTH_INTERVAL_MIN)"
+    if output="$(LUNARWING_MT_HEALTH_INTERVAL_MIN="$value" "${resolver[@]}" 2>&1)"; then
+      status=0
+    else
+      status=$?
+    fi
+  else
+    printf 'LUNARWING_MT_HEALTH_INTERVAL_MIN=%s\n' "$value" >"$HEALTH_ENV_FILE"
+    if output="$("${resolver[@]}" 2>&1)"; then
+      status=0
+    else
+      status=$?
+    fi
+  fi
+
+  assert_eq "$label exits nonzero" "1" "$status"
+  assert_eq "$label names its source" \
+    "error: invalid LUNARWING_MT_HEALTH_INTERVAL_MIN from $expected_source: '$value' (expected an integer from 1 to 59)" \
+    "$output"
+}
+
 INIT_SYSTEM="openrc"
 HEALTH_INTERVAL_MIN=""
 ensure_init_system
-assert_eq "OpenRC default interval" "5" "$HEALTH_INTERVAL_MIN"
+assert_eq "OpenRC default interval" "15" "$HEALTH_INTERVAL_MIN"
+assert_eq "OpenRC default interval source" "default" "$HEALTH_INTERVAL_SOURCE"
 
 FCRON_TAB=""
 fcrontab() {
@@ -38,10 +80,10 @@ _ensure_cron_runlevel() { :; }
 # shellcheck disable=SC2034
 HEALTH_LAUNCHER="/usr/local/sbin/lunarwing-mt-health"
 _install_health_cron >/dev/null
-if grep -qF '*/5 * * * * /usr/local/sbin/lunarwing-mt-health' <<<"$FCRON_TAB"; then
-  printf 'PASS: OpenRC fcrontab uses */5\n'
+if grep -qF '*/15 * * * * /usr/local/sbin/lunarwing-mt-health' <<<"$FCRON_TAB"; then
+  printf 'PASS: OpenRC fcrontab uses */15\n'
 else
-  printf 'FAIL: OpenRC fcrontab does not use */5\n'
+  printf 'FAIL: OpenRC fcrontab does not use */15\n'
   failures=$((failures + 1))
 fi
 
@@ -55,18 +97,17 @@ assert_eq "systemd default interval remains unchanged" "15" "$HEALTH_INTERVAL_MI
 override_interval="$(
   LUNARWING_MT_HEALTH_INTERVAL_MIN=7 bash -c '
     source "$1"
+    HEALTH_ENV_FILE="$2"
     INIT_SYSTEM="openrc"
     ensure_init_system
     printf "%s" "$HEALTH_INTERVAL_MIN"
-  ' _ "$MT_ADMIN"
+  ' _ "$MT_ADMIN" "$HEALTH_ENV_FILE"
 )"
 assert_eq "explicit interval overrides OpenRC default" "7" "$override_interval"
 
 # ── systemd timer rendering ───────────────────────────────────────────────────
 # Mock systemctl (enable/daemon-reload no-ops) and redirect the unit dir into a
 # scratch dir via LUNARWING_MT_SYSTEMD_UNIT_DIR so nothing touches the host.
-SD_DIR="$(mktemp -d)"
-trap 'rm -rf "$SD_DIR"' EXIT
 systemctl() { :; }
 
 # shellcheck disable=SC2034
@@ -93,6 +134,38 @@ assert_eq "oneshot bound scales with long interval" "TimeoutStartSec=2700" \
   "$(grep '^TimeoutStartSec=' "$SD_DIR/lunarwing-mt-health.service")"
 assert_eq "timer cadence scales with long interval" "OnCalendar=*:0/45" \
   "$(grep '^OnCalendar=' "$SD_DIR/lunarwing-mt-health.timer")"
+
+printf 'LUNARWING_MT_HEALTH_INTERVAL_MIN=23\n' >"$HEALTH_ENV_FILE"
+# shellcheck disable=SC2034
+INIT_SYSTEM="openrc"
+HEALTH_INTERVAL_MIN=""
+HEALTH_INTERVAL_SOURCE=""
+ensure_init_system
+assert_eq "persisted interval overrides default" "23" "$HEALTH_INTERVAL_MIN"
+assert_eq "persisted interval names its source" "$HEALTH_ENV_FILE" "$HEALTH_INTERVAL_SOURCE"
+
+HEALTH_INTERVAL_MIN=""
+HEALTH_INTERVAL_SOURCE=""
+ensure_init_system
+assert_eq "persisted interval survives re-install resolution" "23" "$HEALTH_INTERVAL_MIN"
+
+override_result="$(
+  LUNARWING_MT_HEALTH_INTERVAL_MIN=7 bash -c '
+    source "$1"
+    HEALTH_ENV_FILE="$2"
+    INIT_SYSTEM="openrc"
+    ensure_init_system
+    printf "%s|%s" "$HEALTH_INTERVAL_MIN" "$HEALTH_INTERVAL_SOURCE"
+  ' _ "$MT_ADMIN" "$HEALTH_ENV_FILE"
+)"
+assert_eq "environment overrides persisted interval and names its source" \
+  "7|environment (LUNARWING_MT_HEALTH_INTERVAL_MIN)" "$override_result"
+assert_eq "environment override does not rewrite persisted interval" "23" "$(_persisted_health_interval)"
+
+assert_invalid_interval "quoted persisted interval" '"15"' "file"
+assert_invalid_interval "zero persisted interval" "0" "file"
+assert_invalid_interval "non-numeric environment interval" "often" "environment"
+assert_invalid_interval "above-range environment interval" "60" "environment"
 
 if [[ "$failures" -ne 0 ]]; then
   printf 'RESULT: %d failure(s)\n' "$failures"
