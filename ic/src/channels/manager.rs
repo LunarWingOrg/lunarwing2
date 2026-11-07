@@ -171,12 +171,9 @@ impl ChannelManager {
 
         // Shut down any existing channel with the same name to avoid parallel consumers.
         // The old forwarding task will stop when the channel's stream ends after shutdown.
-        {
-            let channels = self.channels.read().await;
-            if let Some(existing) = channels.get(&name) {
-                tracing::debug!(channel = %name, "Shutting down existing channel before hot-add replacement");
-                let _ = existing.shutdown().await;
-            }
+        if let Some(existing) = self.get_channel(&name).await {
+            tracing::debug!(channel = %name, "Shutting down existing channel before hot-add replacement");
+            let _ = existing.shutdown().await;
         }
 
         let stream = match channel.start().await {
@@ -218,7 +215,13 @@ impl ChannelManager {
     /// Also merges the injection channel so background tasks can push messages
     /// into the same stream.
     pub async fn start_all(&self) -> Result<MessageStream, ChannelError> {
-        let channels = self.channels.read().await;
+        let channels: Vec<(String, Arc<dyn Channel>)> = self
+            .channels
+            .read()
+            .await
+            .iter()
+            .map(|(name, channel)| (name.clone(), Arc::clone(channel)))
+            .collect();
         let mut streams: Vec<MessageStream> = Vec::new();
 
         for (name, channel) in channels.iter() {
@@ -268,8 +271,7 @@ impl ChannelManager {
         {
             return Err(knowledge_publish_blocked(&msg.channel));
         }
-        let channels = self.channels.read().await;
-        if let Some(channel) = channels.get(&msg.channel) {
+        if let Some(channel) = self.get_channel(&msg.channel).await {
             channel.respond(msg, response).await
         } else {
             Err(ChannelError::SendFailed {
@@ -301,8 +303,7 @@ impl ChannelManager {
             return Ok(());
         }
 
-        let channels = self.channels.read().await;
-        if let Some(channel) = channels.get(channel_name) {
+        if let Some(channel) = self.get_channel(channel_name).await {
             channel.send_status(status, metadata).await
         } else {
             // Silently ignore if channel not found (status is best-effort)
@@ -361,8 +362,7 @@ impl ChannelManager {
         {
             return Err(knowledge_publish_blocked(channel_name));
         }
-        let channels = self.channels.read().await;
-        if let Some(channel) = channels.get(channel_name) {
+        if let Some(channel) = self.get_channel(channel_name).await {
             channel.broadcast(user_id, response).await
         } else {
             Err(ChannelError::SendFailed {
@@ -380,7 +380,13 @@ impl ChannelManager {
         user_id: &str,
         response: OutgoingResponse,
     ) -> Vec<(String, Result<(), ChannelError>)> {
-        let channels = self.channels.read().await;
+        let channels: Vec<(String, Arc<dyn Channel>)> = self
+            .channels
+            .read()
+            .await
+            .iter()
+            .map(|(name, channel)| (name.clone(), Arc::clone(channel)))
+            .collect();
         let mut results = Vec::new();
 
         for (name, channel) in channels.iter() {
@@ -400,7 +406,13 @@ impl ChannelManager {
 
     /// Check health of all channels.
     pub async fn health_check_all(&self) -> HashMap<String, Result<(), ChannelError>> {
-        let channels = self.channels.read().await;
+        let channels: Vec<(String, Arc<dyn Channel>)> = self
+            .channels
+            .read()
+            .await
+            .iter()
+            .map(|(name, channel)| (name.clone(), Arc::clone(channel)))
+            .collect();
         let start_failures = self.start_failures.read().await.clone();
         let mut results = HashMap::new();
 
@@ -421,7 +433,13 @@ impl ChannelManager {
 
     /// Shutdown all channels.
     pub async fn shutdown_all(&self) -> Result<(), ChannelError> {
-        let channels = self.channels.read().await;
+        let channels: Vec<(String, Arc<dyn Channel>)> = self
+            .channels
+            .read()
+            .await
+            .iter()
+            .map(|(name, channel)| (name.clone(), Arc::clone(channel)))
+            .collect();
         for (name, channel) in channels.iter() {
             if let Err(e) = channel.shutdown().await {
                 tracing::error!("Error shutting down channel {}: {}", name, e);
@@ -959,5 +977,113 @@ mod tests {
         gate.notify_one();
         task.await.expect("lifecycle task");
         assert_eq!(recorded(&events), vec![(msg_id, MessageLifecycle::Started)]);
+    }
+
+    struct GatedChannel {
+        name: &'static str,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for GatedChannel {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        async fn start(&self) -> Result<MessageStream, ChannelError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+
+        async fn respond(
+            &self,
+            _msg: &IncomingMessage,
+            _response: OutgoingResponse,
+        ) -> Result<(), ChannelError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+
+        async fn send_status(
+            &self,
+            _status: StatusUpdate,
+            _metadata: &serde_json::Value,
+        ) -> Result<(), ChannelError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+
+        async fn health_check(&self) -> Result<(), ChannelError> {
+            Ok(())
+        }
+    }
+
+    fn gated_channel() -> (
+        GatedChannel,
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        (
+            GatedChannel {
+                name: "blocked",
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            },
+            entered,
+            release,
+        )
+    }
+
+    #[tokio::test]
+    async fn respond_does_not_hold_registry_lock_while_channel_blocks() {
+        let manager = Arc::new(ChannelManager::new());
+        let (channel, entered, release) = gated_channel();
+        manager.add(Box::new(channel)).await;
+        let task = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                manager
+                    .respond(
+                        &IncomingMessage::new("blocked", "owner", "hello"),
+                        OutgoingResponse::text("reply"),
+                    )
+                    .await
+            }
+        });
+        entered.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), manager.remove("other"))
+            .await
+            .expect("respond must not hold the registry lock");
+        release.notify_one();
+        task.await.expect("respond task").expect("respond result");
+    }
+
+    #[tokio::test]
+    async fn send_status_does_not_hold_registry_lock_while_channel_blocks() {
+        let manager = Arc::new(ChannelManager::new());
+        let (channel, entered, release) = gated_channel();
+        manager.add(Box::new(channel)).await;
+        let task = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                manager
+                    .send_status(
+                        "blocked",
+                        StatusUpdate::Thinking("working".to_string()),
+                        &serde_json::Value::Null,
+                    )
+                    .await
+            }
+        });
+        entered.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), manager.remove("other"))
+            .await
+            .expect("send_status must not hold the registry lock");
+        release.notify_one();
+        task.await.expect("status task").expect("status result");
     }
 }
