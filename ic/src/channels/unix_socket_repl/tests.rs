@@ -742,3 +742,35 @@ async fn v1_quit_is_forwarded_to_the_agent() {
     assert_eq!(message.content, "/quit");
     channel.shutdown().await.expect("shutdown");
 }
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn malformed_handshake_error_omits_payload_from_logs() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("repl.sock");
+    let channel = test_channel(&path, 2);
+    let _stream = start(&channel).await;
+    let mut client = TestClient::connect(&path).await;
+    let secret = "unknown-variant-payload-must-not-be-logged";
+    client
+        .send_raw(format!("{{\"{secret}\":{{}}}}\n").as_bytes())
+        .await;
+    assert!(client.read_optional().await.is_none());
+    assert!(!logs_contain(secret));
+    channel.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn duplicate_start_preserves_live_listener_lock() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("repl.sock");
+    let first = test_channel(&path, 2);
+    let _first_stream = start(&first).await;
+    let _duplicate_stream = start(&first).await;
+    let second = test_channel(&path, 2);
+    let _second_stream = start(&second).await;
+    assert!(matches!(&*second.state(), ListenerState::NotServing { .. }));
+    let (_client, _session) = TestClient::handshake(&path).await;
+    second.shutdown().await.expect("second shutdown");
+    first.shutdown().await.expect("first shutdown");
+}

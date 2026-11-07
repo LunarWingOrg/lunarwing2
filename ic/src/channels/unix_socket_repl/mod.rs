@@ -157,6 +157,10 @@ impl Channel for UnixSocketReplChannel {
     }
 
     async fn start(&self) -> Result<MessageStream, ChannelError> {
+        if matches!(&*self.state(), ListenerState::Serving { .. }) {
+            warn!(path = ?self.socket_path, "unix socket REPL start requested while already serving");
+            return Ok(Box::pin(futures::stream::pending()));
+        }
         let bound = match bind_socket(&self.socket_path).await {
             Ok(bound) => bound,
             Err(error) if error.is_not_serving() => {

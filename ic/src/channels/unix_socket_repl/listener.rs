@@ -216,7 +216,9 @@ fn set_mode_0600(path: &Path) -> Result<(), ReplSocketError> {
 fn acquire_path_lock(path: &Path) -> Result<std::fs::File, ReplSocketError> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-    let lock_path = PathBuf::from(format!("{}.lock", path.display()));
+    let mut lock_name = path.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    let lock_path = PathBuf::from(lock_name);
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
