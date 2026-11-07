@@ -1,8 +1,9 @@
 //! In-memory LLM response cache with TTL and LRU eviction.
 //!
 //! Wraps any [`LlmProvider`] and caches [`complete()`] responses keyed
-//! by a SHA-256 hash of the messages and model name. Tool-calling
-//! requests are never cached since they can trigger side effects.
+//! by a SHA-256 hash of the messages and model name. Tool-calling requests
+//! and providers that select a model during dispatch are never cached: tool
+//! calls can have side effects, and dynamic routing has no safe pre-dispatch key.
 //!
 //! ```text
 //! ┌──────────────────────────────────────────────────┐
@@ -191,7 +192,7 @@ impl CachedProvider {
     fn cache_miss_stream<'a>(
         &'a self,
         inner: LlmStream<'a>,
-        key: String,
+        key: Option<String>,
         now: Instant,
         request_number: u64,
     ) -> LlmStream<'a> {
@@ -225,10 +226,11 @@ impl CachedProvider {
                             cache_read_input_tokens: usage.cache_read_input_tokens,
                             cache_creation_input_tokens: usage.cache_creation_input_tokens,
                         };
-                        if is_cacheable(&response.content, has_tool_calls) {
-                            self.insert(key.clone(), response, now, request_number);
-                        } else {
-                            self.log_miss_without_insert(request_number);
+                        match key.clone() {
+                            Some(key) if is_cacheable(&response.content, has_tool_calls) => {
+                                self.insert(key, response, now, request_number);
+                            }
+                            _ => self.log_miss_without_insert(request_number),
                         }
                     }
                     Err(_) => self.log_miss_without_insert(request_number),
@@ -327,21 +329,24 @@ impl LlmProvider for CachedProvider {
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
-        let effective_model = self.inner.effective_model_name(request.model.as_deref());
-        let key = cache_key(&effective_model, &request);
+        let key = self
+            .inner
+            .cache_key_model_name(request.model.as_deref())
+            .map(|model| cache_key(&model, &request));
         let now = Instant::now();
         let req_no = self.request_count.fetch_add(1, Ordering::Relaxed) + 1;
 
-        if let Some(response) = self.lookup(&key, now, req_no) {
+        if let Some(response) = key.as_deref().and_then(|key| self.lookup(key, now, req_no)) {
             return Ok(response);
         }
 
         match self.inner.complete(request).await {
             Ok(response) => {
-                if is_cacheable(&response.content, false) {
-                    self.insert(key, response.clone(), now, req_no);
-                } else {
-                    self.log_miss_without_insert(req_no);
+                match key {
+                    Some(key) if is_cacheable(&response.content, false) => {
+                        self.insert(key, response.clone(), now, req_no);
+                    }
+                    _ => self.log_miss_without_insert(req_no),
                 }
                 Ok(response)
             }
@@ -353,12 +358,17 @@ impl LlmProvider for CachedProvider {
     }
 
     async fn complete_stream(&self, request: CompletionRequest) -> Result<LlmStream<'_>, LlmError> {
-        let effective_model = self.inner.effective_model_name(request.model.as_deref());
-        let key = cache_key(&effective_model, &request);
+        let key = self
+            .inner
+            .cache_key_model_name(request.model.as_deref())
+            .map(|model| cache_key(&model, &request));
         let now = Instant::now();
         let request_number = self.request_count.fetch_add(1, Ordering::Relaxed) + 1;
 
-        if let Some(response) = self.lookup(&key, now, request_number) {
+        if let Some(response) = key
+            .as_deref()
+            .and_then(|key| self.lookup(key, now, request_number))
+        {
             return Ok(cached_stream(response));
         }
 
@@ -398,13 +408,17 @@ impl LlmProvider for CachedProvider {
         self.inner.effective_model_name(requested_model)
     }
 
+    fn cache_key_model_name(&self, requested_model: Option<&str>) -> Option<String> {
+        self.inner.cache_key_model_name(requested_model)
+    }
+
     fn active_model_name(&self) -> String {
         self.inner.active_model_name()
     }
 
     fn set_model(&self, model: &str) -> Result<(), LlmError> {
-        // Cache keys embed the active model name via `effective_model_name()`, so
-        // requests to the new model automatically land in a separate cache slot.
+        // Cacheable providers embed the active model name in each key, so requests
+        // to the new model automatically land in a separate cache slot.
         // Entries for the old model remain valid: if we switch back, they will be
         // hit again rather than wasted. Natural TTL / LRU eviction cleans them up.
         self.inner.set_model(model)
@@ -424,11 +438,13 @@ mod tests {
     use tracing_test::traced_test;
 
     use crate::llm::error::LlmError;
+    use crate::llm::failover::FailoverProvider;
     use crate::llm::provider::{
         ChatMessage, CompletionResponse, FinishReason, LlmStreamChunk, TokenUsage,
         ToolCompletionRequest, ToolCompletionResponse,
     };
     use crate::llm::response_cache::*;
+    use crate::llm::smart_routing::{SmartRoutingConfig, SmartRoutingProvider};
     use crate::llm::streaming_test_support::{ScriptedStreamingProvider, StreamScript};
     use crate::testing::StubLlm;
 
@@ -765,6 +781,64 @@ mod tests {
         }
 
         assert_eq!(stub.calls(), 2);
+        assert!(cached.is_empty());
+        assert_eq!(cached.total_hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn failover_blocking_responses_are_not_cached() {
+        let primary = Arc::new(StubLlm::failing("primary-model"));
+        let fallback =
+            Arc::new(StubLlm::new("fallback response").with_model_name("fallback-model"));
+        let failover =
+            Arc::new(FailoverProvider::new(vec![primary.clone(), fallback.clone()]).unwrap());
+        let cached = CachedProvider::new(failover, ResponseCacheConfig::default());
+
+        for _ in 0..2 {
+            let response = cached.complete(simple_request()).await.unwrap();
+            assert_eq!(response.content, "fallback response");
+            assert_eq!(cached.effective_model_name(None), "fallback-model");
+        }
+
+        assert_eq!(primary.calls(), 2);
+        assert_eq!(fallback.calls(), 2);
+        assert!(cached.is_empty());
+        assert_eq!(cached.total_hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn smart_routed_streams_are_not_cached() {
+        let primary = Arc::new(StubLlm::new("primary response").with_model_name("primary-model"));
+        let cheap = Arc::new(StubLlm::new("cheap response").with_model_name("cheap-model"));
+        let routed = Arc::new(SmartRoutingProvider::new(
+            primary.clone(),
+            cheap.clone(),
+            SmartRoutingConfig {
+                cascade_enabled: false,
+                ..SmartRoutingConfig::default()
+            },
+        ));
+        let cached = CachedProvider::new(routed, ResponseCacheConfig::default());
+
+        for _ in 0..2 {
+            let chunks = cached
+                .complete_stream(simple_request())
+                .await
+                .expect("stream should open")
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("stream should complete");
+            assert!(matches!(
+                chunks.as_slice(),
+                [LlmStreamChunk::TextDelta(text), LlmStreamChunk::Done { .. }]
+                    if text == "cheap response"
+            ));
+        }
+
+        assert_eq!(cheap.calls(), 2);
+        assert_eq!(primary.calls(), 0);
         assert!(cached.is_empty());
         assert_eq!(cached.total_hits(), 0);
     }
