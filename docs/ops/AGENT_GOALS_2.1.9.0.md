@@ -46,7 +46,9 @@
 
 ## Phase 3 — Carried Known-Issues from RELEASE-v2.1.8.0.md (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
 
-4. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/545 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2230 but had some problems - please see review comments on the closed MR and re-attempt
+4. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/545 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2230 but had some problems - please see review comments on the closed MR and re-attempt
+    - **DONE 2026-11-07 (`rarity/kimi-4-20261107-0601`):** restored !2230's reviewed cache-key/model-identity work and resolved WH-1 through WH-5. Blocking and streaming inserts now require cleaned user-visible content and reject tool-call streams; hits retain the original finish reason without replaying `Retried` observations or discarded usage. Added whitespace/think-only regressions on both paths, a tool-only stream regression, a real `build_provider_chain` failover test, a startup bypass notice, and operator documentation for dynamic-routing bypass and per-thread keys.
+    - **Verification (`taskset -c 0-17`, Cargo `-j18`):** `cargo test --locked --lib llm:: -- --test-threads=18` **667/667 PASS**; `cargo clippy --locked --lib --tests -- -D warnings` **PASS**; `cargo fmt --all -- --check` and `git diff --check` **PASS**. No push or MR was requested, so remote CI on this local head remains a maintainer/CI step.
 
 ## Phase 4 - Documentation and Misc goal items (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
 

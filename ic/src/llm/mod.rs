@@ -465,6 +465,9 @@ pub async fn build_provider_chain(
             max_entries = config.response_cache_max_entries,
             "LLM response cache enabled"
         );
+        if llm.cache_key_model_name(None).is_none() {
+            tracing::info!("LLM response cache will be bypassed for dispatch-time model selection");
+        }
         Arc::new(CachedProvider::new(llm, rc_config))
     } else {
         llm
@@ -692,7 +695,7 @@ mod tests {
         assert_eq!(cheap.plain_calls(), 1);
         assert_eq!(primary.plain_calls(), 0);
         assert_eq!(fallback.plain_calls(), 0);
-        assert_eq!(cache.len(), 1);
+        assert!(cache.is_empty());
     }
 
     #[tokio::test]
@@ -753,6 +756,20 @@ mod tests {
         assert_eq!(cheap.tool_calls(), 0);
         assert_eq!(fallback.tool_calls(), 0);
         assert!(cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn built_failover_chain_disables_response_cache_keys() {
+        let mut config = test_llm_config();
+        config.response_cache_enabled = true;
+        config.lunarwing_cloud.fallback_model = Some("fallback-test-model".to_string());
+        let session = Arc::new(SessionManager::new(SessionConfig::default()));
+
+        let (provider, _, _) = build_provider_chain(&config, session)
+            .await
+            .expect("provider chain should build");
+
+        assert!(provider.cache_key_model_name(None).is_none());
     }
 
     #[test]

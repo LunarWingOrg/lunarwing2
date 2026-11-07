@@ -86,6 +86,16 @@ RigAdapter
   -> RecordingLlm
 ```
 
+`CachedProvider` requires a model identity that is known before dispatch.
+Responses selected through smart routing or failover therefore bypass the outer
+cache rather than risking a hit from a different backend. Responses without
+user-visible content after normal response cleaning are never inserted on either
+the blocking or streaming path, and streams containing tool calls are not cached.
+Cache keys include canonical request metadata and serialization failures bypass
+caching. Stream hits preserve the provider's original finish reason and non-retry
+observations. Retry observations and their discarded token-usage accounting are
+forwarded on cache misses but are not replayed on cache hits.
+
 It does not change engine execution or channel behavior. Engine V2 remains
 gateway-only by default. Any future WASM channel opt-in must follow the
 channel-neutral delivery design in

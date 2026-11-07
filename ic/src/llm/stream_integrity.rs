@@ -217,6 +217,10 @@ impl LlmProvider for StreamIntegrityProvider {
         self.inner.effective_model_name(requested_model)
     }
 
+    fn cache_key_model_name(&self, requested_model: Option<&str>) -> Option<String> {
+        self.inner.cache_key_model_name(requested_model)
+    }
+
     fn active_model_name(&self) -> String {
         self.inner.active_model_name()
     }
