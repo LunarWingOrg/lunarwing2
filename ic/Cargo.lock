@@ -4473,6 +4473,7 @@ version = "2.1.9"
 dependencies = [
  "aes-gcm 0.10.3",
  "agent-client-protocol",
+ "aho-corasick",
  "anyhow",
  "async-trait",
  "axum 0.8.9",
