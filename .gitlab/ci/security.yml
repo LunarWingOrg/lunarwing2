@@ -103,6 +103,7 @@ secret-history:
   needs: []
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$/ && $CI_COMMIT_REF_PROTECTED == "true"'
     - when: never
   script:
     - gitleaks git --redact=100 --no-banner --no-color --log-opts="--all" .
