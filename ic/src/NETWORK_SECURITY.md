@@ -2,7 +2,7 @@
 
 This document catalogs every network-facing surface in LunarWing, its authentication mechanism, bind address, security controls, and known findings. Use this as the authoritative reference during code reviews that touch network-facing code.
 
-**Last updated:** 2026-11-03 (web gateway: trust table, chat client contract, rate and body limits)
+**Last updated:** 2026-11-07 (Unix-socket REPL and sandbox socket hardening)
 
 ---
 
@@ -173,6 +173,21 @@ The gateway sets the following security headers on all responses (via `SetRespon
 Shutdown is triggered via a `oneshot::Sender` stored in `GatewayState::shutdown_tx`. The server uses `axum::serve(...).with_graceful_shutdown(...)` to drain in-flight requests before closing the listener.
 
 **Reference:** `src/channels/web/server.rs` — `shutdown_tx` / `shutdown_rx` setup
+
+---
+
+## Unix-socket REPL (protocol 1, M3)
+
+**Source:** `src/channels/unix_socket_repl/`, `src/cli/repl.rs`, `src/sandbox/mount_guard.rs`
+
+The daemon's Unix-socket REPL is a same-uid local control interface, not a cross-tenant access path. Protocol 1's newline-delimited JSON and legacy response bytes remain unchanged; REPLv3 is a separate M4 transport.
+
+- **Path ownership and permissions.** A missing parent is created mode 0700. An existing parent must be a directory owned by the daemon's effective uid with no group/other write bits and is never chmodded. The listener socket is chmodded 0600 immediately after bind. `lunarwing repl` uses `symlink_metadata` before connecting and refuses symlinks, non-sockets and sockets owned by another uid. The standalone `ic/unix-socket-client` does not perform this owner check; its README states that limitation.
+- **Peer identity.** Every accepted stream passes `SO_PEERCRED` through Tokio's `UnixStream::peer_cred()` before any byte is read. A uid other than the daemon's effective uid is closed and logged with peer uid/pid only. Credentials are mapped into the daemon's user namespace, so a rootless keep-id container can appear as the daemon uid; sandbox path isolation below is therefore still required.
+- **Bind and shutdown lifecycle.** A lock file beside the socket is held for the listener's lifetime. Bind happens before any unlink. On `EADDRINUSE`, only a same-uid socket inode is probed, with a 500 ms connect budget; a live listener is never stolen, a symlink/non-socket or foreign-owned path is never removed, and only a stale socket is unlinked and rebound. Shutdown cancels acceptance and removes the path only when its device/inode still matches the one this instance bound. Another serving daemon, an insecure parent, a foreign/non-socket path, or a replaced/missing inode is logged and reported healthy but not serving so the single-node watchdog cannot create a restart loop. Other I/O failures still fail startup.
+- **Bounded I/O.** The first frame must be `Connect`; logging is limited to its kind and sanitized, truncated version/client-info fields. No message, attachment, audio, response or credential payload is logged. Handshakes are capped at 16 KiB and 10 s with at most 8 pending; accept errors back off from 10 ms to 1 s. Subsequent frames are capped at 16 MiB + 64 KiB and close on overflow. Protocol 1 has no idle timeout. Each connection has a 1024-frame/32 MiB outbound queue, status shedding above 2 MiB, and a 15 s write deadline. Control overflow disconnects only the slow consumer; `respond`, status and lifecycle delivery enqueue synchronously and never hold the channel registry lock across a socket write.
+- **Legacy compatibility.** Approval and authentication prompts arrive as ordinary `Response` frames so lockstep clients do not hang. Approval parameter text over 8 KiB ends with an explicit omitted-byte marker directing the user to review the full request in the web UI. Silent turns yield `(no reply)` or `Nothing is waiting for approval.` as appropriate. Attachments and v3-only frames receive legacy error responses. Both Rust clients are pinned to golden protocol-1 fixtures.
+- **Sandbox isolation.** `$XDG_RUNTIME_DIR`, `/run/user/<uid>`, the configured REPL socket's parent, `/tmp/.X11-unix`, and the tmux socket directory join the protected mount paths; tenant `run/` was already protected. `/`, `/run` and `/var/run` are refused as mount roots, and protected socket directories are shadowed beneath any mounted ancestor. The plan-time mask walk also shadows every reachable Unix socket, including through read-only mounts. It stops at depth 5 or 10 000 entries and warns once per root rather than rejecting large source trees. Thus no socket in a known socket directory is intended to be reachable from the sandbox; a socket deeper inside another large tree can remain a residual risk. The tenant-log source is refused if this walk finds a credential file or socket.
 
 ---
 
