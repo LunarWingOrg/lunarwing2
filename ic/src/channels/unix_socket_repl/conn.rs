@@ -28,8 +28,8 @@ enum HandshakeError {
     Read(std::io::Error),
     #[error("handshake exceeds {0} bytes")]
     TooLong(usize),
-    #[error("handshake JSON parse failed: {0}")]
-    Parse(serde_json::Error),
+    #[error("handshake JSON parse failed")]
+    Parse,
     #[error("expected Connect, got {0}")]
     NotConnect(&'static str),
     #[error("client disconnected before handshake")]
@@ -119,7 +119,7 @@ async fn read_handshake(
         FrameRead::TooLong => Err(HandshakeError::TooLong(limits.max_handshake_bytes)),
         FrameRead::Line => {
             let frame =
-                serde_json::from_slice::<ClientFrame>(buffer).map_err(HandshakeError::Parse)?;
+                serde_json::from_slice::<ClientFrame>(buffer).map_err(|_| HandshakeError::Parse)?;
             match frame {
                 ClientFrame::Connect(connect) => Ok(connect),
                 other => Err(HandshakeError::NotConnect(other.kind())),
@@ -137,7 +137,11 @@ where
     R: AsyncBufRead + Unpin + ?Sized,
 {
     loop {
-        buffer.clear();
+        if buffer.capacity() > BUFFER_SHRINK_THRESHOLD {
+            *buffer = Vec::with_capacity(4096);
+        } else {
+            buffer.clear();
+        }
         let read = (&mut *reader)
             .take(max.saturating_add(1) as u64)
             .read_until(b'\n', buffer)
@@ -198,8 +202,8 @@ async fn read_loop(
                         break;
                     }
                 }
-                Err(error) => {
-                    warn!(%error, %session_id, "unix socket REPL: message parse error");
+                Err(_) => {
+                    warn!(%session_id, "unix socket REPL: message parse error");
                 }
             },
             Err(error) => {
