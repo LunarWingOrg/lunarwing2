@@ -839,6 +839,7 @@ pub struct SecretValueRedactor {
     folded_variants: Vec<SecretString>,
     direct_matcher: Option<aho_corasick::AhoCorasick>,
     folded_matcher: Option<aho_corasick::AhoCorasick>,
+    folded_long_matcher: Option<aho_corasick::AhoCorasick>,
     /// Longest variant length in bytes; bounds the truncation-cut scan.
     max_variant_bytes: usize,
 }
@@ -1163,6 +1164,31 @@ fn build_variant_matcher(variants: &[SecretString]) -> Option<aho_corasick::AhoC
     }
 }
 
+fn build_folded_long_matcher(variants: &[SecretString]) -> Option<aho_corasick::AhoCorasick> {
+    use secrecy::ExposeSecret;
+    let long: Vec<&[u8]> = variants
+        .iter()
+        .filter(|variant| variant.expose_secret().len() > WRAP_LINE_VARIANT_CHAR_CAP)
+        .map(|variant| variant.expose_secret().as_bytes())
+        .collect();
+    if long.is_empty() {
+        return None;
+    }
+    match aho_corasick::AhoCorasick::builder()
+        .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+        .build(long)
+    {
+        Ok(matcher) => Some(matcher),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "Failed to build long harness secret matcher; using full overlapping search"
+            );
+            None
+        }
+    }
+}
+
 /// Compact overlapping automaton matches while their end offsets are ordered.
 /// A later long match may swallow several earlier ranges, so merge backwards
 /// instead of storing every occurrence for the final sort.
@@ -1251,6 +1277,7 @@ impl SecretValueRedactor {
     fn rebuild_matchers(&mut self) {
         self.direct_matcher = build_variant_matcher(&self.direct_variants);
         self.folded_matcher = build_variant_matcher(&self.folded_variants);
+        self.folded_long_matcher = build_folded_long_matcher(&self.folded_variants);
     }
 
     pub fn is_armed(&self) -> bool {
@@ -1315,24 +1342,88 @@ impl SecretValueRedactor {
             .any(|b| matches!(b, b'\n' | b'\r' | b'\\'))
             .then(|| fold_line_breaks(text));
         let haystack = folded.as_ref().map_or(text, |f| f.text.as_str());
+        let long_matches = self
+            .folded_long_matcher
+            .as_ref()
+            .map_or_else(Vec::new, |matcher| {
+                matcher
+                    .find_iter(haystack)
+                    .map(|found| (found.start(), found.end()))
+                    .collect::<Vec<_>>()
+            });
+        if long_matches.is_empty() {
+            return self.overlapping_folded_match_ranges(
+                &folded,
+                text,
+                haystack,
+                0,
+                haystack.len(),
+            );
+        }
+
+        let mut ranges = Vec::new();
+        let mut cursor = 0usize;
+        for (start, end) in long_matches {
+            if cursor < start {
+                let from = cursor.saturating_sub(WRAP_LINE_VARIANT_CHAR_CAP);
+                let to = (start + WRAP_LINE_VARIANT_CHAR_CAP).min(haystack.len());
+                ranges.extend(
+                    self.overlapping_folded_match_ranges(&folded, text, haystack, from, to),
+                );
+            }
+            ranges.push(Self::original_range(&folded, text, start, end));
+            cursor = end;
+        }
+        if cursor < haystack.len() {
+            let from = cursor.saturating_sub(WRAP_LINE_VARIANT_CHAR_CAP);
+            ranges.extend(self.overlapping_folded_match_ranges(
+                &folded,
+                text,
+                haystack,
+                from,
+                haystack.len(),
+            ));
+        }
+        ranges
+    }
+
+    fn overlapping_folded_match_ranges(
+        &self,
+        folded: &Option<FoldedText>,
+        text: &str,
+        haystack: &str,
+        start: usize,
+        end: usize,
+    ) -> Vec<(usize, usize)> {
+        let slice = &haystack[start..end];
         if let Some(matcher) = &self.folded_matcher {
             return collect_automaton_ranges(
                 matcher
-                    .find_overlapping_iter(haystack)
-                    .map(|found| (found.start(), found.end()))
-                    .map(|(start, end)| match &folded {
-                        Some(f) => (f.map[start], char_end_at(text, f.map[end - 1])),
-                        None => (start, end),
-                    }),
-            );
-        }
-        sequential_match_ranges(&self.folded_variants, haystack)
+                    .find_overlapping_iter(slice)
+                    .map(|found| (start + found.start(), start + found.end())),
+            )
             .into_iter()
-            .map(|(start, end)| match &folded {
-                Some(f) => (f.map[start], char_end_at(text, f.map[end - 1])),
-                None => (start, end),
+            .map(|(start, end)| Self::original_range(folded, text, start, end))
+            .collect();
+        }
+        sequential_match_ranges(&self.folded_variants, slice)
+            .into_iter()
+            .map(|(found_start, found_end)| {
+                Self::original_range(folded, text, start + found_start, start + found_end)
             })
             .collect()
+    }
+
+    fn original_range(
+        folded: &Option<FoldedText>,
+        text: &str,
+        start: usize,
+        end: usize,
+    ) -> (usize, usize) {
+        match folded {
+            Some(f) => (f.map[start], char_end_at(text, f.map[end - 1])),
+            None => (start, end),
+        }
     }
 
     /// Scrub before this helper's truncation (DG-2). A variant prefix (≥
