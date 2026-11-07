@@ -224,8 +224,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn connected_peer_check_uses_race_free_credentials() {
+    #[tokio::test]
+    async fn connected_peer_check_uses_race_free_credentials() {
         let (stream, _peer) = UnixStream::pair().expect("socket pair");
         let expected_uid = nix::unistd::geteuid().as_raw();
         assert!(connected_peer_ok(&stream, expected_uid).expect("peer credentials"));
