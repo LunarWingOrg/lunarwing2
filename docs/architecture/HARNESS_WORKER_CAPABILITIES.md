@@ -22,6 +22,21 @@ Regression anchors are `promotion_rejects_staged_paths_embedding_mounted_secrets
 limitations below describe source behavior, not a promise of exhaustive secret
 redaction.
 
+The v2.1.9.0 WI#383 changes close four more residual gaps:
+
+- Direct and folded secret variants are searched through per-job Aho-Corasick
+  automatons instead of one search per variant per event. Encoded values also
+  arm aligned 48-character base64 and 32-character hex chunks, so large and
+  non-canonically wrapped partial output is scrubbed in aligned units.
+- Per-line JSON-escaped variants prevent a raw line ending in a backslash from
+  splitting a JSON escape during replacement.
+- A dispatch drop guard removes partial harness directories on every return
+  before successful container creation, including preparation and MCP-validation
+  failures.
+- Write-back promotion has a five-minute deadline. `wait=true` treats
+  `Finalizing` separately from worker execution and waits for that bounded
+  outcome instead of reporting a false timeout and abandoning the handle.
+
 The conventional LunarWing Docker worker can run in **harness mode**
 (`create_job` with `mode: "harness"`), adding three optional capability
 layers on top of the plain `worker` mode. Harness jobs require the Docker
@@ -92,33 +107,25 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
   replacement and merged in one sweep (EE-9), so a second value sharing a
   substring cannot leave its non-overlapping tail behind. For secrets whose
   encoded form is at most 4096 chars, individual wrap lines at the canonical
-  widths are armed as well (a tool returning one line at a time); larger
-  secrets rely on whole-blob fold matching so the variant count stays
-  bounded. Per-line variants skip RFC 7468 armor delimiters and lines with no
-  alphanumeric byte (DZ-5): a punctuation-only line of a multi-line value is
-  therefore not armed on its own, though its whole value and its other lines
-  still are.
-  - Size limit, stated plainly (EE-2): partial coverage of a truncated
-    print exists ONLY at the canonical wrap widths — 76-column base64 and
-    60-column hex, whose individual lines are the ones armed — and only up
-    to the 4096-char encoding cap (base64 of raw values over ~3 KiB, hex
-    over ~2 KiB; a 4096-byte RSA PEM's base64 is already past it). At any
-    other width (`base64 -w64`, `openssl base64`, hex at 48) even a
-    below-cap `| head -5` leaks everything printed (measured: 320 of 320
-    chars for raw 500-3072 B). Above the cap only the whole contiguous
-    encoding is matched at all, so a partial or truncated print of such an
-    encoding (`base64 secret | head -5`, or the 64 KiB shell-capture cut
-    on a ≥48 KiB secret) leaks almost everything printed; measured with
-    real CLI output: 285 bytes for a 5-line head of a >3 KiB secret,
-    48,513 bytes for base64 of a 48-64 KiB secret, 32,231 bytes for
-    `xxd -p` of a ≥32 KiB secret. Restoring partial coverage for large
-    encodings needs aligned-chunk variants in a per-job automaton —
-    tracked in WI#383.
+  widths are armed as direct variants as well (a tool returning one line at a
+  time). Independently of that cap, encoded forms arm aligned 48-character
+  base64 and 32-character hex chunks in the folded list. A partial or truncated
+  print is therefore scrubbed in those aligned units at any wrap width,
+  including above the old cap and at non-canonical widths. A trailing fragment
+  shorter than the applicable chunk can still survive; this is not arbitrary
+  slice detection. Per-line variants skip RFC 7468 armor delimiters and lines
+  with no alphanumeric byte (DZ-5): a punctuation-only line of a multi-line
+  value is therefore not armed on its own, though its whole value and its other
+  lines still are. Per-line JSON-escaped forms are armed alongside the raw
+  lines, so replacing a line that ends in a backslash cannot leave malformed
+  JSON (EE-11).
   Variants are sorted longest-first across all mounted values. JSON object
-  keys are also scrubbed. The daemon re-scrubs event ingest and `/complete` before
-  persistence and broadcast, using a redactor built **once per job and
-  cached** next to the held secrets (cleared on the same terminal paths; the
-  cache insert is skipped when a terminal clear raced the build — EE-4).
+  keys are also scrubbed. Direct and folded lists each have one per-job
+  Aho-Corasick automaton, built once and cached next to the held secrets rather
+  than searched variant-by-variant for every event (EE-1). The daemon re-scrubs
+  event ingest and `/complete` before persistence and broadcast; the redactor
+  is cleared on the same terminal paths, and cache insertion is skipped when a
+  terminal clear raced the build (EE-4).
   - NOT covered (documented gaps): offset/grouped dump formats — plain
     `xxd`, `od`, `hexdump -C` — which interleave offsets and ASCII columns
     and never contain a contiguous encoded span; base32 and other alphabets;
@@ -249,15 +256,18 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
 Harness dirs (injection snapshot + staging) and the held secret values are
 released on the handled terminal paths: normal completion — both the promotion
 (`finalize_harness_job`) and non-promotion branches of `complete_job` —
-stop/cancel, the container-exit watcher (crash/OOM), `create_job` failure,
-and several early-return paths between harness preparation and container
-creation. Failures during partial harness preparation or before the manager's
-MCP validation completes can still leave directories, and filesystem cleanup
-can fail (EA-2). While a job is `Finalizing`, stop/cancel are refused and
-`cleanup_job` defers, so promotion is never torn down mid-walk (DH-4). At
-daemon startup a sweep removes harness dirs with no live labeled container
-(1-hour grace for in-flight dispatch; skipped entirely when the runtime
-cannot be listed).
+stop/cancel, the container-exit watcher (crash/OOM), and `create_job` failure.
+A dispatch drop guard also removes the per-job directory on every return before
+successful container creation, including partial preparation and manager-side
+MCP-validation failures; filesystem cleanup itself can still fail (EA-2). While
+a job is `Finalizing`, stop/cancel are refused and `cleanup_job` defers, so
+promotion is never torn down mid-walk (DH-4). Promotion has a five-minute
+deadline, after which the finalizer records a skipped outcome, persists the
+audit event, flips to `Stopped`, and releases harness state. A `wait=true`
+poller does not apply its worker-execution timeout while this bounded promotion
+is running. At daemon startup a sweep removes harness dirs with no live labeled
+container (1-hour grace for in-flight dispatch; skipped entirely when the
+runtime cannot be listed).
 
 ## Files
 
@@ -285,33 +295,18 @@ cannot be listed).
   low-entropy line over-redaction beyond the landed filter (armor delimiters
   and lines with no alphanumeric byte are skipped, but short structural lines
   such as `apiVersion: v1` and `kind: Config` are still armed), temporary
-  plaintext copies,
-  preparation/cleanup orphans, no promotion deadline, remaining synchronous
-  filesystem cleanup on async tasks, and stronger delivery, sparse-file and
-  persisted-insert tests. Staged-path/audit scrubbing (DZ-6) and duplicate
-  `/complete` side effects (DZ-7/EA-7/EE-6) are fixed as described above.
-- !1548 run-78 residuals (WI#383): per-event scrubbing runs synchronously
-  inside the async `/event` handler — beyond the landed needle-length guard
-  the proper shape is one per-job `aho-corasick` automaton over the folded
-  text that must also cover the DIRECT list (raw values, raw multi-line
-  lines, per-line wrap pieces; a per-event leaf cap alone does not bound
-  the cost) (the widened EE-1 betterment); partial/truncated prints leak
-  near-wholly above the 4096-char arming cap and, at non-canonical widths,
-  below it too (EE-2 — needs that automaton with
-  aligned chunks); line-prefixed views (`read_file`, `cat -n`) defeat
-  folding (EE-7); partial/truncated prints leak
-  near-wholly above the 4096-char arming cap and, at non-canonical widths,
-  below it too (EE-2 — needs that automaton with
-  aligned chunks);
-  an event body uploaded slowly past a token revoke is persisted
-  daemon-side without the value scrub (EE-10); a per-line variant can split
-  a JSON escape and leave malformed scrubbed text for the model (EE-11); a
-  `wait=true` timeout during `Finalizing` reports `failed` while promotion
-  continues and leaks the handle (EE-12, under EA-5); and EA-1 detection
-  uses LunarWing's own effective uid rather than the runtime owner's, with
-  a `tcp://` `DOCKER_HOST` resolving bind paths on the remote host — every
-  such case fails closed, never a leak (EE-14, added by the run-84 ET-5
-  reconciliation).
+  plaintext copies, remaining synchronous filesystem cleanup on async tasks,
+  and stronger delivery, sparse-file and persisted-insert tests.
+  Staged-path/audit scrubbing (DZ-6) and duplicate `/complete` side effects
+  (DZ-7/EA-7/EE-6) are fixed as described above.
+- Remaining !1548/run-84 residuals (WI#383): line-prefixed views (`read_file`,
+  `cat -n`) defeat folding (EE-7); upstream tool cuts and trailing fragments
+  shorter than an aligned chunk can still survive (DG-2/DZ-3/EE-2); an event
+  body uploaded slowly past a token revoke can be persisted daemon-side without
+  the value scrub (EE-10); and EA-1 detection uses LunarWing's own effective
+  uid rather than the runtime owner's, with a `tcp://` `DOCKER_HOST` resolving
+  bind paths on the remote host — every such case fails closed, never a leak
+  (EE-14, added by the run-84 ET-5 reconciliation).
 - External-worker (opencode/pebble) secrets mounting — this WI covers the
   conventional harness only.
 - Concurrent-edit conflict policy: promotion snapshots the replaced content
