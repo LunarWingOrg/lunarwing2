@@ -39,7 +39,7 @@
     - **Worker/CI audit (recorded, not upgraded):** kimi-code **2.4.1** (Dockerfile ARG = `kimi-cli/package.json` = package-lock); opencode v1 **v1.19.5** + `810c0eba1a7348036f8bdf61e6632d0c36c6876c`; opencode2 **v2.2.5** + `9bbb8ce18c80f099e0e448775f59d965ead40a21`; Pebble ref `2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b`, with upstream lock SHA-256 recomputed as **`47ab4b8dd909778c6dd6b5f15e2e0c6289240ecc7ecf5c116ef7395209d93ce4`** and matching the Dockerfile. All four worker `DEBIAN_SNAPSHOT` defaults and `CI_DEBIAN_SNAPSHOT` are **20261105T082236Z** (WI#561 validator green). Node **22.23.4-bookworm-slim**, Bun **1.4.4-debian**, and Rust **1.96.1-bookworm** remain digest-pinned; cargo-deny **0.20.2**, shellcheck **0.11.0**, and sccache **0.17.0** remain unchanged. No worker or CI tool upgrade was mixed into this sweep.
     - **Tracked audit and docs:** no `"2.1.8"` remains in any tracked TOML or lockfile, including owned path requirements. The only remaining quoted token is the checklist/historical prose in the current and v2.1.8.0 goals files. Contributor onboarding, Multica deployment history, gateway/Wingtip version examples, and the onboard-web fake compile string now name 2.1.9/2.1.9.0; release notes remain the separate item #10.
     - **Verification on this tree (`taskset -c 0-17`, Cargo `-j18`):** all four `cargo check --locked` shapes passed (default `--all-targets`, postgres-only `--tests`, libsql-only `--tests`, all-features); default and all-features clippy with `-D warnings` passed; rustfmt passed. Postgres emitted six warnings from unchanged feature-gated test helpers, but both required clippy lanes are zero-warning. All **13 WASM extensions (nine tools + four channels)** built with `--strict`; `version-policy.sh` and direct `check-version-bumps.sh` against base `e9815abc5` passed; release-version self-test **6/6**; config validation **8 YAML**; registry validation **14 JSON**; standalone deliverables **11 units**; shell syntax **283 scripts + three hooks**. Focused suites: `test_goal1_ci.py` **282/282**, `test_deny_toml_guards.py` **23/23**, `test_cargo_deny_gate.py` **15/15**, `test_lockfile_only_advisory_guard.py` **5/5**, and `test_pebble_build_inputs.py` **41 OK, four skipped**. Non-vendor `git diff --check` is clean.
-    - **Honest gap:** the fully green MR pipeline on the exact head is CI-only and cannot be run from this checkout; no push or MR was requested in this task. All local gates are green, and the remote pipeline on the committed head remains the maintainer/CI step before merge.
+    - **Honest gap:** the fully green MR pipeline on the exact head is CI-only and cannot be run from this checkout; no push or MR was requested in this task. All local gates are green, and the remote pipeline on the committed head remains the maintainer/CI step before merge
 
 ## Phase 2 — Features/Polish/BaselineAdditions (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
 
@@ -48,7 +48,7 @@
 
 ## Phase 3 — Carried Known-Issues from RELEASE-v2.1.8.0.md (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
 
-4. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/545
+4. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/545 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2230 but had some problems - please see review comments on the closed MR and re-attempt
 
 ## Phase 4 - Documentation and Misc goal items (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
 
@@ -56,13 +56,13 @@
 
 ## Phase 5 - Misc Operations (ALWAYS READ ALL COMMENTS FOR EACH WORK ITEM WHEN A WORK ITEM IS REFERENCED - ALSO ALWAYS READ LINKED WORK ITEMS FOR EACH WORK ITEM REFERENCED)
 
-6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/540
+6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/540 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2226 but had some problems - please see review comments on the closed MR and re-attempt
 
 ## Phase 6 - Gauntlets (for goals which reference any work items, see comments on those work items in addition to reading full descriptions)
 
 7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/539
 8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/383
-9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/314
+9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/314 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2228 but had some problems - please see review comments on the closed MR and re-attempt
 10. [ ] create draft for release notes at base of root
 
 ## Phase 7 - Advanced Operator Notes
