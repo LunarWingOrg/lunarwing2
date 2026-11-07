@@ -29,6 +29,7 @@ assert_invalid_interval() {
   local label="$1" value="$2" origin="$3"
   local output="" expected_source="$HEALTH_ENV_FILE"
   local status=0
+  # shellcheck disable=SC2016  # literal script receives its expansions as bash -c arguments
   local -a resolver=(
     bash -c '
       source "$1"
