@@ -998,7 +998,10 @@ mod tests {
                 .await;
             assert!(matches!(
                 chunks.as_slice(),
-                [Ok(LlmStreamChunk::ToolCallDelta { .. }), Ok(LlmStreamChunk::Done { .. })]
+                [
+                    Ok(LlmStreamChunk::ToolCallDelta { .. }),
+                    Ok(LlmStreamChunk::Done { .. })
+                ]
             ));
         }
 

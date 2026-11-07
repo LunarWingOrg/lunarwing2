@@ -466,9 +466,7 @@ pub async fn build_provider_chain(
             "LLM response cache enabled"
         );
         if llm.cache_key_model_name(None).is_none() {
-            tracing::info!(
-                "LLM response cache will be bypassed for dispatch-time model selection"
-            );
+            tracing::info!("LLM response cache will be bypassed for dispatch-time model selection");
         }
         Arc::new(CachedProvider::new(llm, rc_config))
     } else {
