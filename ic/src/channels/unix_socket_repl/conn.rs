@@ -1,6 +1,3 @@
-#[cfg(test)]
-use std::time::Duration;
-
 use lunarwing_common::repl_wire::{
     ClientFrame, ConnectFrame, ResponseFrame, ServerFrame, encode_line,
 };
@@ -296,9 +293,4 @@ fn sanitize_handshake_field(value: &str) -> String {
         .filter(|character| !character.is_control())
         .take(64)
         .collect()
-}
-
-#[cfg(test)]
-pub(super) fn handshake_timeout(limits: &ReplLimits) -> Duration {
-    limits.handshake_timeout
 }
