@@ -1,0 +1,7 @@
+{"Connect":{"version":"2.1.9","client_info":null}}
+{"Message":{"content":"hello","session_id":null}}
+{"Disconnect":{"session_id":null,"reason":"client requested disconnect"}}
+"Ping"
+"Pong"
+{"Response":{"content":"Connected to LunarWing REPL. Session: 0b6c1c2d3e4f4a5b8c9d0e1f2a3b4c5d","session_id":"0b6c1c2d3e4f4a5b8c9d0e1f2a3b4c5d","is_complete":true}}
+{"Response":{"content":"Server busy: maximum connections (10) reached.","session_id":"0b6c1c2d3e4f4a5b8c9d0e1f2a3b4c5d","is_complete":true}}
