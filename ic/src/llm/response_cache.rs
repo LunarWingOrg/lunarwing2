@@ -275,19 +275,22 @@ fn cached_stream(response: CompletionResponse) -> LlmStream<'static> {
 
 /// Build a deterministic cache key from a completion request.
 ///
-/// Hashes the model name, messages, and response-affecting parameters
-/// (max_tokens, temperature, stop_sequences) via SHA-256. Two requests
-/// with identical content and parameters produce the same key.
-fn cache_key(model: &str, request: &CompletionRequest) -> String {
+/// Hashes the model name, messages, metadata, and response-affecting parameters
+/// (max_tokens, temperature, stop_sequences) via SHA-256. Serialization failure
+/// returns `None` so the request bypasses the cache instead of sharing a key.
+fn cache_key(model: &str, request: &CompletionRequest) -> Option<String> {
     let mut hasher = Sha256::new();
     hasher.update(model.as_bytes());
     hasher.update(b"|");
 
-    // Messages are Serialize, so we can deterministically hash them.
-    // serde_json produces stable output for the same input structure.
-    if let Ok(json) = serde_json::to_string(&request.messages) {
-        hasher.update(json.as_bytes());
-    }
+    let messages = match serde_json::to_string(&request.messages) {
+        Ok(json) => json,
+        Err(error) => {
+            tracing::warn!(%error, "response cache key serialization failed; bypassing cache");
+            return None;
+        }
+    };
+    hasher.update(messages.as_bytes());
 
     // Include response-affecting parameters so different temperatures,
     // max_tokens, or stop sequences produce distinct cache keys.
@@ -307,7 +310,17 @@ fn cache_key(model: &str, request: &CompletionRequest) -> String {
         }
     }
 
-    format!("{:x}", hasher.finalize())
+    hasher.update(b"|metadata|");
+    let mut metadata: Vec<_> = request.metadata.iter().collect();
+    metadata.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    for (key, value) in metadata {
+        hasher.update((key.len() as u64).to_le_bytes());
+        hasher.update(key.as_bytes());
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+
+    Some(format!("{:x}", hasher.finalize()))
 }
 
 #[async_trait]
@@ -332,7 +345,7 @@ impl LlmProvider for CachedProvider {
         let key = self
             .inner
             .cache_key_model_name(request.model.as_deref())
-            .map(|model| cache_key(&model, &request));
+            .and_then(|model| cache_key(&model, &request));
         let now = Instant::now();
         let req_no = self.request_count.fetch_add(1, Ordering::Relaxed) + 1;
 
@@ -361,7 +374,7 @@ impl LlmProvider for CachedProvider {
         let key = self
             .inner
             .cache_key_model_name(request.model.as_deref())
-            .map(|model| cache_key(&model, &request));
+            .and_then(|model| cache_key(&model, &request));
         let now = Instant::now();
         let request_number = self.request_count.fetch_add(1, Ordering::Relaxed) + 1;
 
@@ -1001,7 +1014,21 @@ mod tests {
         let k1 = cache_key("model-a", &req);
         let k2 = cache_key("model-a", &req);
         assert_eq!(k1, k2);
-        assert_eq!(k1.len(), 64); // SHA-256 hex
+        assert_eq!(k1.as_deref().map(str::len), Some(64)); // SHA-256 hex
+    }
+
+    #[test]
+    fn cache_key_canonicalizes_and_varies_by_metadata() {
+        let mut req_a = simple_request();
+        req_a.metadata.insert("thread".into(), "thread-1".into());
+        req_a.metadata.insert("region".into(), "local".into());
+        let mut req_b = simple_request();
+        req_b.metadata.insert("region".into(), "local".into());
+        req_b.metadata.insert("thread".into(), "thread-1".into());
+        assert_eq!(cache_key("m", &req_a), cache_key("m", &req_b));
+
+        req_b.metadata.insert("thread".into(), "thread-2".into());
+        assert_ne!(cache_key("m", &req_a), cache_key("m", &req_b));
     }
 
     #[test]
