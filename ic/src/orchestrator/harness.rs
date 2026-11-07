@@ -1163,6 +1163,27 @@ fn build_variant_matcher(variants: &[SecretString]) -> Option<aho_corasick::AhoC
     }
 }
 
+/// Compact overlapping automaton matches while their end offsets are ordered.
+/// A later long match may swallow several earlier ranges, so merge backwards
+/// instead of storing every occurrence for the final sort.
+fn collect_automaton_ranges(
+    matches: impl IntoIterator<Item = (usize, usize)>,
+) -> Vec<(usize, usize)> {
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for (mut start, mut end) in matches {
+        while let Some(last) = ranges.last() {
+            if start > last.end {
+                break;
+            }
+            start = start.min(last.start);
+            end = end.max(last.end);
+            ranges.pop();
+        }
+        ranges.push((start, end));
+    }
+    ranges
+}
+
 fn sequential_match_ranges(variants: &[SecretString], text: &str) -> Vec<(usize, usize)> {
     use secrecy::ExposeSecret;
     let mut ranges = Vec::new();
@@ -1271,11 +1292,11 @@ impl SecretValueRedactor {
     fn match_ranges(&self, text: &str) -> Vec<(usize, usize)> {
         let mut ranges = self.folded_match_ranges(text);
         if let Some(matcher) = &self.direct_matcher {
-            ranges.extend(
+            ranges.extend(collect_automaton_ranges(
                 matcher
                     .find_overlapping_iter(text)
                     .map(|found| (found.start(), found.end())),
-            );
+            ));
         } else {
             ranges.extend(sequential_match_ranges(&self.direct_variants, text));
         }
@@ -1294,16 +1315,18 @@ impl SecretValueRedactor {
             .any(|b| matches!(b, b'\n' | b'\r' | b'\\'))
             .then(|| fold_line_breaks(text));
         let haystack = folded.as_ref().map_or(text, |f| f.text.as_str());
-        let matches = self.folded_matcher.as_ref().map_or_else(
-            || sequential_match_ranges(&self.folded_variants, haystack),
-            |matcher| {
+        if let Some(matcher) = &self.folded_matcher {
+            return collect_automaton_ranges(
                 matcher
                     .find_overlapping_iter(haystack)
                     .map(|found| (found.start(), found.end()))
-                    .collect()
-            },
-        );
-        matches
+                    .map(|(start, end)| match &folded {
+                        Some(f) => (f.map[start], char_end_at(text, f.map[end - 1])),
+                        None => (start, end),
+                    }),
+            );
+        }
+        sequential_match_ranges(&self.folded_variants, haystack)
             .into_iter()
             .map(|(start, end)| match &folded {
                 Some(f) => (f.map[start], char_end_at(text, f.map[end - 1])),
