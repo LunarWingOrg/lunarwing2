@@ -61,7 +61,11 @@
 7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/539
 8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/383
 9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/314 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2228 but had some problems - please see review comments on the closed MR and re-attempt
-10. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/458
+10. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/458
+    - **Completed Wingtip M3 on protocol 1:** shared redacting v1/v3 wire types and golden fixtures; 0600 socket and strict parent modes; same-uid peer gate; locked bind/probe/stale recovery and inode-safe shutdown; bounded reads, handshakes and per-connection writers; manager lock release; sandbox runtime-directory protection and socket masking; legacy approval/auth and no-reply responses; CLI owner checks and CI coverage.
+    - **Scope:** WI#458 items 1-4 and the M3 D1/D2/D3-v1/D5/D8/D9 work are implemented. Item 5's REPLv3 reconnect suite remains with M4 as the design specifies; the standalone prototype/REPLv3 transport was not pulled into this milestone. Item 6 was already implemented and was reverified.
+    - **Rust verification:** 38 REPL, 19 manager, 38 mount-guard, 30 common, two CLI, one standalone-client and seven libsql quit-refusal tests pass. All four Cargo check shapes pass (default all-targets, postgres-only tests, libsql-only tests, all-features); default and all-features clippy with `-D warnings` pass; standalone clippy and common clippy pass.
+    - **Other gates:** rustfmt, pre-commit safety, panic-policy self-tests (17/17) and repository scan, and CI YAML validation (eight files) pass. Wingtip typecheck and all 821 tests pass, including the item-6 layout/resize cases. Real loopback Unix-socket tests cover live/stale/concurrent/replaced listeners, peer rejection, framing, backpressure and legacy responses; no supervised tenant or live-podman smoke was run.
 11. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/563
 
 ## Phase 7 - Advanced Operator Notes
