@@ -604,7 +604,7 @@ fn linux_unit_content(exe: &Path, env_file: &Path, include_xmpp_bridge: bool) ->
          Environment=\"ALLOW_PRIVATE_IPS=1\"\n\
          Environment=\"PGSSLMODE=disable\"\n\
          EnvironmentFile=-{env_file}\n\
-         ExecStart=\"{exe}\" run\n\
+         ExecStart=\"{exe}\" --no-onboard run\n\
          Restart=always\n\
          RestartSec=3\n\
          \n\
@@ -1201,7 +1201,7 @@ mod tests {
         );
         assert!(unit.contains("Wants=xmpp-bridge.service"));
         assert!(unit.contains("After=network.target xmpp-bridge.service"));
-        assert!(unit.contains("ExecStart=\"/tmp/lunarwing\" run"));
+        assert!(unit.contains("ExecStart=\"/tmp/lunarwing\" --no-onboard run\n"));
     }
 
     #[test]
