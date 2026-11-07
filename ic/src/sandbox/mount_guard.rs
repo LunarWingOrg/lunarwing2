@@ -173,10 +173,10 @@ fn runtime_socket_dirs() -> Vec<PathBuf> {
     for variable in ["LUNARWING_SOCKET", "IRONCLAW_SOCKET"] {
         if let Ok(socket) = std::env::var(variable) {
             let socket = PathBuf::from(socket);
-            if socket.is_absolute() {
-                if let Some(parent) = socket.parent() {
-                    dirs.push(parent.to_path_buf());
-                }
+            if socket.is_absolute()
+                && let Some(parent) = socket.parent()
+            {
+                dirs.push(parent.to_path_buf());
             }
         }
     }
@@ -524,10 +524,10 @@ impl Default for ScanCaps {
 /// runtime socket directories are protected independently of this walk.
 pub fn masked_files_for_mount(mount_root: &Path, skip: &[PathBuf]) -> Vec<PathBuf> {
     let scan = scan_mount(mount_root, skip, ScanCaps::default());
-    if scan.truncated {
-        if let Ok(root) = mount_root.canonicalize() {
-            warn_scan_truncated(&root);
-        }
+    if scan.truncated
+        && let Ok(root) = mount_root.canonicalize()
+    {
+        warn_scan_truncated(&root);
     }
     let mut found = scan.files;
     found.extend(scan.sockets);
@@ -1250,7 +1250,7 @@ mod tests {
         let protected = resolve_protected_paths_from(
             None,
             &fixture.root.join("lunarwing/state"),
-            &[runtime.clone()],
+            std::slice::from_ref(&runtime),
         );
         let masked = masked_dirs_for_mount(&fixture.root, &protected).expect("mask planning");
         assert!(

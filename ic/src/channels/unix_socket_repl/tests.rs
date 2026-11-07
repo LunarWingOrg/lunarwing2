@@ -491,7 +491,7 @@ async fn oversize_handshake_line_closes_connection() {
     let channel = test_channel(&path, 2).with_limits(limits);
     let _stream = start(&channel).await;
     let mut client = TestClient::connect(&path).await;
-    client.send_raw(&vec![b'x'; 100]).await;
+    client.send_raw(&[b'x'; 100]).await;
     assert!(client.read_optional().await.is_none());
     channel.shutdown().await.expect("shutdown");
 }
@@ -594,7 +594,7 @@ async fn graceful_fatal_error_is_flushed_before_close() {
     let channel = test_channel(&path, 2).with_limits(limits);
     let _stream = start(&channel).await;
     let (mut client, _session) = TestClient::handshake(&path).await;
-    client.send_raw(&vec![b'x'; 100]).await;
+    client.send_raw(&[b'x'; 100]).await;
     assert!(response_text(&client.read().await).contains("frame exceeds"));
     assert!(client.read_optional().await.is_none());
     channel.shutdown().await.expect("shutdown");
