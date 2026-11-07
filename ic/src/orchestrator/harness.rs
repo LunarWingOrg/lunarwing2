@@ -2824,15 +2824,14 @@ mod tests {
         let first_line = std::str::from_utf8(&b64.as_bytes()[..76]).unwrap(); // safety: test
         assert!(redactor.contains_secret(first_line));
 
-        let partial = b64[..320]
-            .as_bytes()
+        let partial = b64.as_bytes()[..320]
             .chunks(64)
             .map(|c| std::str::from_utf8(c).unwrap()) // safety: test
             .collect::<Vec<_>>()
             .join("\n");
         let scrubbed = redactor.scrub(&partial);
         let folded_scrubbed = fold_line_breaks(&scrubbed).text;
-        for chunk in b64[..288].as_bytes().chunks(BASE64_ALIGNED_CHUNK_CHARS) {
+        for chunk in b64.as_bytes()[..288].chunks(BASE64_ALIGNED_CHUNK_CHARS) {
             let chunk = std::str::from_utf8(chunk).unwrap(); // safety: test
             assert!(!folded_scrubbed.contains(chunk), "aligned chunk leaked");
         }
@@ -3203,15 +3202,14 @@ mod tests {
             .collect(); // safety: test
         let redactor = SecretValueRedactor::new([SecretString::from(value.clone())].as_slice());
         let hex: String = value.bytes().map(|byte| format!("{byte:02x}")).collect();
-        let partial = hex[..160]
-            .as_bytes()
+        let partial = hex.as_bytes()[..160]
             .chunks(48)
             .map(|c| std::str::from_utf8(c).unwrap()) // safety: test
             .collect::<Vec<_>>()
             .join("\n");
         let scrubbed = redactor.scrub(&partial);
         let folded_scrubbed = fold_line_breaks(&scrubbed).text;
-        for chunk in hex[..128].as_bytes().chunks(HEX_ALIGNED_CHUNK_CHARS) {
+        for chunk in hex.as_bytes()[..128].chunks(HEX_ALIGNED_CHUNK_CHARS) {
             let chunk = std::str::from_utf8(chunk).unwrap(); // safety: test
             assert!(!folded_scrubbed.contains(chunk), "aligned hex chunk leaked");
         }
