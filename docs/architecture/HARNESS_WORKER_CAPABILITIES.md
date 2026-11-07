@@ -270,7 +270,10 @@ MCP-validation failures; filesystem cleanup itself can still fail (EA-2). While
 a job is `Finalizing`, stop/cancel are refused and `cleanup_job` defers, so
 promotion is never torn down mid-walk (DH-4). Promotion has a five-minute
 deadline, after which the finalizer records a skipped outcome, persists the
-audit event, flips to `Stopped`, and releases harness state. A `wait=true`
+audit event, flips to `Stopped`, and releases harness state. The deadline can
+cancel promotion between a rollback snapshot and its write, leaving an extra
+backup; cancellation during `Workspace::write` inherits that backend's
+atomicity, and the retained snapshots provide recovery evidence. A `wait=true`
 poller does not apply its worker-execution timeout while this bounded promotion
 is running. At daemon startup a sweep removes harness dirs with no live labeled
 container (1-hour grace for in-flight dispatch; skipped entirely when the
