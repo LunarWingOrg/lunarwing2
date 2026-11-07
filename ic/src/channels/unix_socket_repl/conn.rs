@@ -47,18 +47,27 @@ pub(super) async fn serve_connection(
     write: OwnedWriteHalf,
     ctx: ConnCtx,
     permit: OwnedSemaphorePermit,
+    cancel: CancellationToken,
 ) {
     let session_id = uuid::Uuid::new_v4().simple().to_string();
     let mut reader = BufReader::new(read);
     let mut buffer = Vec::with_capacity(4096);
-    let connect = match read_handshake(&mut reader, &mut buffer, &ctx.limits).await {
-        Ok(connect) => connect,
-        Err(HandshakeError::Eof) => return,
-        Err(error) => {
-            warn!(%error, "unix socket REPL: handshake rejected");
-            return;
+    let connect = tokio::select! {
+        () = cancel.cancelled() => return,
+        connect = read_handshake(&mut reader, &mut buffer, &ctx.limits) => {
+            match connect {
+                Ok(connect) => connect,
+                Err(HandshakeError::Eof) => return,
+                Err(error) => {
+                    warn!(%error, "unix socket REPL: handshake rejected");
+                    return;
+                }
+            }
         }
     };
+    if cancel.is_cancelled() {
+        return;
+    }
     info!(
         version = %sanitize_handshake_field(&connect.version),
         client_info = %connect.client_info.as_deref().map(sanitize_handshake_field).unwrap_or_default(),

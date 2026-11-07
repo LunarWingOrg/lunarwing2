@@ -386,13 +386,18 @@ pub(super) async fn accept_loop(
             drop(stream);
             continue;
         };
-        spawn_connection(stream, permit, ctx.clone());
+        spawn_connection(stream, permit, ctx.clone(), cancel.clone());
     }
 }
 
-fn spawn_connection(stream: UnixStream, permit: OwnedSemaphorePermit, ctx: ConnCtx) {
+fn spawn_connection(
+    stream: UnixStream,
+    permit: OwnedSemaphorePermit,
+    ctx: ConnCtx,
+    cancel: CancellationToken,
+) {
     let (read, write) = stream.into_split();
     tokio::spawn(async move {
-        serve_connection(read, write, ctx, permit).await;
+        serve_connection(read, write, ctx, permit, cancel).await;
     });
 }
