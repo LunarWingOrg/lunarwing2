@@ -1172,11 +1172,11 @@ fn collect_automaton_ranges(
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     for (mut start, mut end) in matches {
         while let Some(last) = ranges.last() {
-            if start > last.end {
+            if start > last.1 {
                 break;
             }
-            start = start.min(last.start);
-            end = end.max(last.end);
+            start = start.min(last.0);
+            end = end.max(last.1);
             ranges.pop();
         }
         ranges.push((start, end));
