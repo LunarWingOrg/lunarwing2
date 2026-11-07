@@ -809,8 +809,8 @@ fn sweep_harness_dirs_in(
 /// and lines with no alphanumeric byte (DZ-5). For secrets whose encoded form
 /// is at most [`WRAP_LINE_VARIANT_CHAR_CAP`] chars, individual wrap lines at
 /// the canonical widths are armed as well (a tool returning one line at a
-/// time); larger secrets rely on whole-blob fold matching to keep the variant
-/// count bounded (EB-4).
+/// time); larger and truncated encodings use aligned chunks in the same
+/// per-job folded automaton (EB-4/EE-2).
 ///
 /// NOT covered (documented gaps): offset/grouped dump formats such as plain
 /// `xxd`, `od`, or `hexdump -C`, which interleave offsets and ASCII columns
@@ -824,8 +824,8 @@ fn sweep_harness_dirs_in(
 /// redaction limits accidental exposure of whole values.
 ///
 /// Retained variants are held as [`SecretString`] and zeroize on drop (CV-10);
-/// temporary strings and serialized copies do not all zeroize. `Debug`
-/// deliberately prints no variant material.
+/// automaton tables, temporary strings, and serialized copies do not all
+/// zeroize. `Debug` deliberately prints no variant material.
 #[derive(Clone, Default)]
 pub struct SecretValueRedactor {
     /// Variants matched directly against the text: the raw value, per-line
@@ -834,9 +834,11 @@ pub struct SecretValueRedactor {
     direct_variants: Vec<SecretString>,
     /// Variants matched against the text with line breaks folded out:
     /// contiguous ASCII encodings (hex lower/upper, base64 standard and
-    /// URL-safe plus offset cores) and the raw value itself (EE-8), covering
-    /// every wrap width with O(1) variants (EB-3/EB-4).
+    /// URL-safe plus offset cores), aligned partial chunks, and the raw value
+    /// itself (EE-8).
     folded_variants: Vec<SecretString>,
+    direct_matcher: Option<aho_corasick::AhoCorasick>,
+    folded_matcher: Option<aho_corasick::AhoCorasick>,
     /// Longest variant length in bytes; bounds the truncation-cut scan.
     max_variant_bytes: usize,
 }
@@ -858,11 +860,14 @@ const BASE64_CLI_WRAP_COLS: usize = 76;
 /// Column width of plain hex output from `xxd -p` (30 input bytes).
 const HEX_CLI_WRAP_COLS: usize = 60;
 
+/// Stable base64 quantum-aligned chunk used to catch partial encoded output.
+const BASE64_ALIGNED_CHUNK_CHARS: usize = 48;
+/// Stable byte-aligned chunk used to catch partial hexadecimal output.
+const HEX_ALIGNED_CHUNK_CHARS: usize = 32;
+
 /// Cap on the encoded length for which individual wrap lines are armed as
-/// direct variants (EB-4). Whole-blob coverage for larger encodings comes
-/// from fold matching, which is wrap-width independent. 4096 chars covers
-/// single-line tokens and PEM-sized secrets (~3 KiB raw) while capping the
-/// per-secret variant count at a few hundred instead of thousands.
+/// direct variants (EB-4). Larger and truncated encodings are covered by
+/// aligned chunks in the width-independent fold pass.
 const WRAP_LINE_VARIANT_CHAR_CAP: usize = 4096;
 
 /// Insert a variant when it is long enough and not already present. Dedup
@@ -883,10 +888,23 @@ fn push_variant(
     }
 }
 
+fn push_json_string_variant(
+    variants: &mut Vec<SecretString>,
+    seen: &mut std::collections::HashSet<u64>,
+    raw: &str,
+) {
+    if let Ok(json_quoted) = serde_json::to_string(raw) {
+        let escaped = json_quoted
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .unwrap_or(json_quoted.as_str())
+            .to_string();
+        push_variant(variants, seen, escaped);
+    }
+}
+
 /// Arm individual wrap lines at one canonical width as direct variants, so a
-/// tool returning a single wrapped line at a time is still caught. Bounded by
-/// [`WRAP_LINE_VARIANT_CHAR_CAP`] — larger encodings are covered whole by the
-/// width-independent fold pass (EB-4).
+/// tool returning a single wrapped line at a time is still caught.
 fn push_wrap_line_variants(
     variants: &mut Vec<SecretString>,
     seen: &mut std::collections::HashSet<u64>,
@@ -904,11 +922,24 @@ fn push_wrap_line_variants(
     }
 }
 
+/// Arm fixed aligned chunks so truncated prints and non-canonical wrap widths
+/// still match without a per-line/per-chunk search loop (EE-2).
+fn push_aligned_chunk_variants(
+    variants: &mut Vec<SecretString>,
+    seen: &mut std::collections::HashSet<u64>,
+    encoded: &str,
+    width: usize,
+) {
+    for chunk in encoded.as_bytes().chunks(width) {
+        if let Ok(chunk) = std::str::from_utf8(chunk) {
+            push_variant(variants, seen, chunk.to_string());
+        }
+    }
+}
+
 /// Insert a base64 encoding in padded and unpadded form, plus the
 /// stream-stable core with the final quantum dropped (the last 4 chars can
 /// mix with suffix bytes when the value sits inside a larger encoded blob).
-/// The full contiguous form is matched by the fold pass, so any CLI wrap
-/// width is covered; per-line pieces are armed via `push_wrap_line_variants`.
 /// Dedup is per-list (EE-3): an exactly-80-char encoding has a core equal to
 /// its 76-column line piece, and sharing one set would drop the core from
 /// the fold list — unwrapping the leak the line piece exists to stop.
@@ -920,6 +951,7 @@ fn push_base64_variants(
     encoded: String,
 ) {
     push_wrap_line_variants(direct, seen_direct, &encoded, BASE64_CLI_WRAP_COLS);
+    push_aligned_chunk_variants(folded, seen_folded, &encoded, BASE64_ALIGNED_CHUNK_CHARS);
     if encoded.len() >= MIN_REDACTED_SECRET_BYTES + 4 {
         let core = encoded[..encoded.len() - 4].to_string();
         push_variant(folded, seen_folded, core);
@@ -971,20 +1003,14 @@ fn secret_variants(raw: &str) -> (Vec<SecretString>, Vec<SecretString>) {
             continue;
         }
         push_variant(&mut direct, &mut seen_direct, line.to_string());
+        push_json_string_variant(&mut direct, &mut seen_direct, line);
         let trimmed = line.trim();
         if trimmed != line {
             push_variant(&mut direct, &mut seen_direct, trimmed.to_string());
+            push_json_string_variant(&mut direct, &mut seen_direct, trimmed);
         }
     }
-    // The form the value takes inside a JSON string literal.
-    if let Ok(json_quoted) = serde_json::to_string(raw) {
-        let escaped = json_quoted
-            .strip_prefix('"')
-            .and_then(|s| s.strip_suffix('"'))
-            .unwrap_or(json_quoted.as_str())
-            .to_string();
-        push_variant(&mut direct, &mut seen_direct, escaped);
-    }
+    push_json_string_variant(&mut direct, &mut seen_direct, raw);
     push_variant(
         &mut direct,
         &mut seen_direct,
@@ -997,6 +1023,12 @@ fn secret_variants(raw: &str) -> (Vec<SecretString>, Vec<SecretString>) {
     }
     for encoded in [hex.to_ascii_uppercase(), hex] {
         push_wrap_line_variants(&mut direct, &mut seen_direct, &encoded, HEX_CLI_WRAP_COLS);
+        push_aligned_chunk_variants(
+            &mut folded,
+            &mut seen_folded,
+            &encoded,
+            HEX_ALIGNED_CHUNK_CHARS,
+        );
         push_variant(&mut folded, &mut seen_folded, encoded);
     }
 
@@ -1109,14 +1141,93 @@ fn replace_ranges(text: &str, mut ranges: Vec<(usize, usize)>) -> String {
     out
 }
 
-// Test-only probe for the EE-1 needle-length guard in
-// `SecretValueRedactor::folded_match_ranges`: bumped immediately before every
-// `find` call so a test can prove the guard skipped the searcher setup
-// entirely (a behavioral assertion on the output cannot — the guarded and
-// unguarded paths produce identical text).
-#[cfg(test)]
-thread_local! {
-    static FOLDED_FIND_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+fn build_variant_matcher(variants: &[SecretString]) -> Option<aho_corasick::AhoCorasick> {
+    use secrecy::ExposeSecret;
+    let short: Vec<&[u8]> = variants
+        .iter()
+        .filter(|variant| variant.expose_secret().len() <= WRAP_LINE_VARIANT_CHAR_CAP)
+        .map(|variant| variant.expose_secret().as_bytes())
+        .collect();
+    if short.is_empty() {
+        return None;
+    }
+    match aho_corasick::AhoCorasick::new(short) {
+        Ok(matcher) => Some(matcher),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "Failed to build harness secret matcher; using sequential fallback"
+            );
+            None
+        }
+    }
+}
+
+/// Compact overlapping automaton matches while their end offsets are ordered.
+/// A later long match may swallow several earlier ranges, so merge backwards
+/// instead of storing every occurrence for the final sort.
+fn collect_automaton_ranges(
+    matches: impl IntoIterator<Item = (usize, usize)>,
+) -> Vec<(usize, usize)> {
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for (mut start, mut end) in matches {
+        while let Some(last) = ranges.last() {
+            if start > last.1 {
+                break;
+            }
+            start = start.min(last.0);
+            end = end.max(last.1);
+            ranges.pop();
+        }
+        ranges.push((start, end));
+    }
+    ranges
+}
+
+fn sequential_match_ranges<'a>(
+    variants: impl IntoIterator<Item = &'a SecretString>,
+    text: &str,
+) -> Vec<(usize, usize)> {
+    use secrecy::ExposeSecret;
+    let mut ranges = Vec::new();
+    for variant in variants {
+        let needle = variant.expose_secret();
+        let mut from = 0usize;
+        while needle.len() <= text.len().saturating_sub(from) {
+            let Some(pos) = text[from..].find(needle) else {
+                break;
+            };
+            let start = from + pos;
+            ranges.push((start, start + needle.len()));
+            from = start + needle.len();
+        }
+    }
+    ranges
+}
+
+fn long_sequential_match_ranges(variants: &[SecretString], text: &str) -> Vec<(usize, usize)> {
+    use secrecy::ExposeSecret;
+    sequential_match_ranges(
+        variants
+            .iter()
+            .filter(|variant| variant.expose_secret().len() > WRAP_LINE_VARIANT_CHAR_CAP),
+        text,
+    )
+}
+
+fn variants_contain(variants: &[SecretString], text: &str) -> bool {
+    use secrecy::ExposeSecret;
+    variants
+        .iter()
+        .any(|variant| text.contains(variant.expose_secret()))
+}
+
+fn long_variants_contain(variants: &[SecretString], text: &str) -> bool {
+    use secrecy::ExposeSecret;
+    variants
+        .iter()
+        .filter(|variant| variant.expose_secret().len() > WRAP_LINE_VARIANT_CHAR_CAP)
+        .any(|variant| text.contains(variant.expose_secret()))
 }
 
 impl SecretValueRedactor {
@@ -1126,6 +1237,7 @@ impl SecretValueRedactor {
         for value in values {
             redactor.add_raw(value.expose_secret());
         }
+        redactor.rebuild_matchers();
         redactor
     }
 
@@ -1133,6 +1245,7 @@ impl SecretValueRedactor {
     /// token, as defense in depth against accidental output — DG-7).
     pub fn add_value(&mut self, value: &str) {
         self.add_raw(value);
+        self.rebuild_matchers();
     }
 
     fn add_raw(&mut self, raw: &str) {
@@ -1143,7 +1256,6 @@ impl SecretValueRedactor {
         let (direct, folded) = secret_variants(raw);
         self.direct_variants.extend(direct);
         self.folded_variants.extend(folded);
-        // Values can overlap across separate secrets (e.g. password + URL).
         self.direct_variants
             .sort_by_key(|v| std::cmp::Reverse(v.expose_secret().len()));
         self.folded_variants
@@ -1157,33 +1269,35 @@ impl SecretValueRedactor {
             .unwrap_or(0);
     }
 
+    fn rebuild_matchers(&mut self) {
+        self.direct_matcher = build_variant_matcher(&self.direct_variants);
+        self.folded_matcher = build_variant_matcher(&self.folded_variants);
+    }
+
     pub fn is_armed(&self) -> bool {
         !self.direct_variants.is_empty() || !self.folded_variants.is_empty()
     }
 
     /// True when `text` contains any mounted secret value in a known encoding.
     pub fn contains_secret(&self, text: &str) -> bool {
-        use secrecy::ExposeSecret;
-        if self
-            .direct_variants
-            .iter()
-            .any(|v| text.contains(v.expose_secret()))
-        {
-            return true;
+        let direct_hit = self.direct_matcher.as_ref().map_or_else(
+            || variants_contain(&self.direct_variants, text),
+            |matcher| matcher.is_match(text) || long_variants_contain(&self.direct_variants, text),
+        );
+        if direct_hit || self.folded_variants.is_empty() {
+            return direct_hit;
         }
-        if self.folded_variants.is_empty() {
-            return false;
-        }
-        if !text.bytes().any(|b| matches!(b, b'\n' | b'\r' | b'\\')) {
-            return self
-                .folded_variants
-                .iter()
-                .any(|v| text.contains(v.expose_secret()));
-        }
-        let folded = fold_line_breaks(text);
-        self.folded_variants
-            .iter()
-            .any(|v| folded.text.contains(v.expose_secret()))
+        let folded = text
+            .bytes()
+            .any(|b| matches!(b, b'\n' | b'\r' | b'\\'))
+            .then(|| fold_line_breaks(text));
+        let haystack = folded.as_ref().map_or(text, |f| f.text.as_str());
+        self.folded_matcher.as_ref().map_or_else(
+            || variants_contain(&self.folded_variants, haystack),
+            |matcher| {
+                matcher.is_match(haystack) || long_variants_contain(&self.folded_variants, haystack)
+            },
+        )
     }
 
     pub fn scrub(&self, text: &str) -> String {
@@ -1199,19 +1313,16 @@ impl SecretValueRedactor {
     /// starts inside another match merges with it instead of being evaluated
     /// against already-replaced text — in either direction (EE-9).
     fn match_ranges(&self, text: &str) -> Vec<(usize, usize)> {
-        use secrecy::ExposeSecret;
         let mut ranges = self.folded_match_ranges(text);
-        for variant in &self.direct_variants {
-            let needle = variant.expose_secret();
-            let mut from = 0usize;
-            while needle.len() <= text.len().saturating_sub(from) {
-                let Some(pos) = text[from..].find(needle) else {
-                    break;
-                };
-                let start = from + pos;
-                ranges.push((start, start + needle.len()));
-                from = start + needle.len();
-            }
+        if let Some(matcher) = &self.direct_matcher {
+            ranges.extend(collect_automaton_ranges(
+                matcher
+                    .find_overlapping_iter(text)
+                    .map(|found| (found.start(), found.end())),
+            ));
+            ranges.extend(long_sequential_match_ranges(&self.direct_variants, text));
+        } else {
+            ranges.extend(sequential_match_ranges(self.direct_variants.iter(), text));
         }
         ranges
     }
@@ -1220,44 +1331,96 @@ impl SecretValueRedactor {
     /// Line breaks are folded out for matching (EB-3/EB-4); when the text has
     /// none to fold, the text is searched as-is with an identity mapping.
     fn folded_match_ranges(&self, text: &str) -> Vec<(usize, usize)> {
-        use secrecy::ExposeSecret;
-        let mut ranges = Vec::new();
         if self.folded_variants.is_empty() {
-            return ranges;
+            return Vec::new();
         }
-        let folds = text.bytes().any(|b| matches!(b, b'\n' | b'\r' | b'\\'));
-        let folded = folds.then(|| fold_line_breaks(text));
+        let folded = text
+            .bytes()
+            .any(|b| matches!(b, b'\n' | b'\r' | b'\\'))
+            .then(|| fold_line_breaks(text));
         let haystack = folded.as_ref().map_or(text, |f| f.text.as_str());
-        for variant in &self.folded_variants {
-            let needle = variant.expose_secret();
-            let mut from = 0usize;
-            loop {
-                // A needle longer than the remaining text can never match;
-                // skip the Two-Way searcher setup, whose cost grows with the
-                // needle length (EE-1 — without this guard every folded
-                // variant costs its own length per JSON leaf, even when the
-                // leaf is far smaller than the variant).
-                if needle.len() > haystack.len().saturating_sub(from) {
-                    break;
-                }
-                #[cfg(test)]
-                FOLDED_FIND_CALLS.with(|c| c.set(c.get() + 1));
-                let Some(pos) = haystack[from..].find(needle) else {
-                    break;
-                };
-                let start = from + pos;
-                let end = start + needle.len();
-                let (os, oe) = match &folded {
-                    // The match ends on a char boundary of the folded text,
-                    // but that char may be multi-byte in the original.
-                    Some(f) => (f.map[start], char_end_at(text, f.map[end - 1])),
-                    None => (start, end),
-                };
-                ranges.push((os, oe));
-                from = end;
+        let mut long_matches = long_sequential_match_ranges(&self.folded_variants, haystack);
+        long_matches.sort_unstable_by_key(|&(start, end)| (end, start));
+        let long_matches = collect_automaton_ranges(long_matches);
+        if long_matches.is_empty() {
+            return self.overlapping_folded_match_ranges(
+                &folded,
+                text,
+                haystack,
+                0,
+                haystack.len(),
+            );
+        }
+
+        let mut ranges = Vec::new();
+        let mut cursor = 0usize;
+        for (start, end) in long_matches {
+            if cursor < start {
+                let from = cursor.saturating_sub(WRAP_LINE_VARIANT_CHAR_CAP);
+                let to = (start + WRAP_LINE_VARIANT_CHAR_CAP).min(haystack.len());
+                ranges.extend(
+                    self.overlapping_folded_match_ranges(&folded, text, haystack, from, to),
+                );
             }
+            ranges.push(Self::original_range(&folded, text, start, end));
+            cursor = end;
+        }
+        if cursor < haystack.len() {
+            let from = cursor.saturating_sub(WRAP_LINE_VARIANT_CHAR_CAP);
+            ranges.extend(self.overlapping_folded_match_ranges(
+                &folded,
+                text,
+                haystack,
+                from,
+                haystack.len(),
+            ));
         }
         ranges
+    }
+
+    fn overlapping_folded_match_ranges(
+        &self,
+        folded: &Option<FoldedText>,
+        text: &str,
+        haystack: &str,
+        start: usize,
+        end: usize,
+    ) -> Vec<(usize, usize)> {
+        let slice = &haystack[start..end];
+        if let Some(matcher) = &self.folded_matcher {
+            return collect_automaton_ranges(
+                matcher
+                    .find_overlapping_iter(slice)
+                    .map(|found| (start + found.start(), start + found.end())),
+            )
+            .into_iter()
+            .map(|(start, end)| Self::original_range(folded, text, start, end))
+            .collect();
+        }
+        use secrecy::ExposeSecret;
+        sequential_match_ranges(
+            self.folded_variants
+                .iter()
+                .filter(|variant| variant.expose_secret().len() <= WRAP_LINE_VARIANT_CHAR_CAP),
+            slice,
+        )
+        .into_iter()
+        .map(|(found_start, found_end)| {
+            Self::original_range(folded, text, start + found_start, start + found_end)
+        })
+        .collect()
+    }
+
+    fn original_range(
+        folded: &Option<FoldedText>,
+        text: &str,
+        start: usize,
+        end: usize,
+    ) -> (usize, usize) {
+        match folded {
+            Some(f) => (f.map[start], char_end_at(text, f.map[end - 1])),
+            None => (start, end),
+        }
     }
 
     /// Scrub before this helper's truncation (DG-2). A variant prefix (≥
@@ -1400,8 +1563,8 @@ pub struct PromotionSummary {
     pub records: Vec<PromotionRecord>,
     pub rejections: Vec<PromotionRejection>,
     pub dropped_rejections: usize,
-    /// True when promotion never ran (failed job, container teardown failure,
-    /// missing resolver); `reason` says why.
+    /// True when promotion did not run or stopped before every accepted write
+    /// completed; `reason` says why. Records completed before a deadline remain.
     pub skipped: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skip_reason: Option<String>,
@@ -2456,6 +2619,8 @@ mod tests {
         let values = vec![SecretString::from(value.to_string())];
         let redactor = SecretValueRedactor::new(&values);
         assert!(redactor.is_armed());
+        assert!(redactor.direct_matcher.is_some());
+        assert!(redactor.folded_matcher.is_some());
 
         let b64 = base64::engine::general_purpose::STANDARD.encode(value);
         let url = urlencoding::encode(value).into_owned();
@@ -2628,18 +2793,11 @@ mod tests {
     }
 
     #[test]
-    fn redactor_fold_matching_scrubs_large_secrets_without_line_variants() {
-        // EB-3/EB-4: a secret whose encodings exceed the per-line cap is still
-        // scrubbed whole at any wrap width, and the variant count stays
-        // bounded (no per-line explosion for MAX_SECRET_BYTES-sized values).
+    fn redactor_fold_matching_scrubs_large_secrets_with_aligned_chunks() {
         use base64::Engine;
         let value = "V".repeat(MAX_SECRET_BYTES);
         let redactor = SecretValueRedactor::new([SecretString::from(value.clone())].as_slice());
-        let total = redactor.direct_variants.len() + redactor.folded_variants.len();
-        assert!(
-            total < 256,
-            "variant count must stay bounded for large secrets, got {total}"
-        );
+        assert!(redactor.folded_matcher.is_some());
         let b64 = base64::engine::general_purpose::STANDARD.encode(&value);
         for width in [64usize, 76] {
             let wrapped = b64
@@ -2654,19 +2812,29 @@ mod tests {
                 "{width}-col wrap of a large secret must fold-scrub"
             );
         }
-        // A value of all-same bytes compresses to identical wrap lines; use a
-        // varying value to prove per-line pieces are NOT armed above the cap.
+
         let varying: String = (0..5000u32)
             .map(|i| char::from_digit(i % 10, 10).unwrap())
             .collect(); // safety: test
         let redactor = SecretValueRedactor::new([SecretString::from(varying.clone())].as_slice());
+        assert!(redactor.direct_variants.len() < 256);
+        assert!(redactor.folded_variants.len() < 20_000);
         let b64 = base64::engine::general_purpose::STANDARD.encode(&varying);
         assert!(b64.len() > WRAP_LINE_VARIANT_CHAR_CAP);
         let first_line = std::str::from_utf8(&b64.as_bytes()[..76]).unwrap(); // safety: test
-        assert!(
-            !redactor.contains_secret(first_line),
-            "single wrap lines above the cap are intentionally not armed"
-        );
+        assert!(redactor.contains_secret(first_line));
+
+        let partial = b64.as_bytes()[..320]
+            .chunks(64)
+            .map(|c| std::str::from_utf8(c).unwrap()) // safety: test
+            .collect::<Vec<_>>()
+            .join("\n");
+        let scrubbed = redactor.scrub(&partial);
+        let folded_scrubbed = fold_line_breaks(&scrubbed).text;
+        for chunk in b64.as_bytes()[..288].chunks(BASE64_ALIGNED_CHUNK_CHARS) {
+            let chunk = std::str::from_utf8(chunk).unwrap(); // safety: test
+            assert!(!folded_scrubbed.contains(chunk), "aligned chunk leaked");
+        }
     }
 
     #[test]
@@ -2925,35 +3093,6 @@ mod tests {
     }
 
     #[test]
-    fn redactor_folded_path_skips_oversized_needles() {
-        // EE-1: a folded variant longer than the text can never match; the
-        // length guard must leave such text untouched while skipping the
-        // searcher setup whose cost grows with the variant length. The
-        // FOLDED_FIND_CALLS probe pins the skip itself: with the guard
-        // removed the output is unchanged, so only the counter can fail.
-        FOLDED_FIND_CALLS.with(|c| c.set(0));
-        let value = "V".repeat(MAX_SECRET_BYTES);
-        let redactor = SecretValueRedactor::new([SecretString::from(value)].as_slice());
-        let text = "tiny leaf with a newline\nand a backslash \\ inside";
-        assert_eq!(redactor.scrub(text), text);
-        assert!(!redactor.contains_secret(text));
-        FOLDED_FIND_CALLS.with(|c| {
-            assert_eq!(
-                c.get(),
-                0,
-                "every folded variant is longer than the text, so find must never run"
-            )
-        });
-        // Positive control, so the probe itself cannot pass vacuously: a
-        // folded variant shorter than the text DOES reach the find.
-        let redactor = SecretValueRedactor::new(
-            [SecretString::from("control-value-long-enough".to_string())].as_slice(),
-        );
-        let _ = redactor.scrub("newline\nto force the folded path");
-        FOLDED_FIND_CALLS.with(|c| assert!(c.get() > 0, "probe must count real finds"));
-    }
-
-    #[test]
     fn redactor_compact_json_with_escaped_breaks_still_folds() {
         // Compact JSON carries line breaks ONLY as two-character `\n`/`\r`
         // escapes. The folded path must trigger on the backslash byte and
@@ -3041,6 +3180,38 @@ mod tests {
         for line in ["line-one-fixture-material", "line-two-fixture-material"] {
             let scrubbed = redactor.scrub(&format!("leaked {line} here"));
             assert!(!scrubbed.contains(line), "line must be scrubbed");
+        }
+    }
+
+    #[test]
+    fn redactor_preserves_json_when_a_secret_line_ends_in_backslash() {
+        let line = "json-line-with-terminal-backslash\\";
+        let value = format!("prefix-line-material\n{line}\nsuffix-line-material");
+        let redactor = SecretValueRedactor::new([SecretString::from(value)].as_slice());
+        let serialized = serde_json::to_string(&serde_json::json!({ "output": line })).unwrap(); // safety: test
+        let scrubbed = redactor.scrub(&serialized);
+        let cleaned: serde_json::Value = serde_json::from_str(&scrubbed).unwrap(); // safety: test
+        assert_eq!(cleaned["output"], "[redacted-secret]");
+        assert_eq!(redactor.scrub(line), "[redacted-secret]");
+    }
+
+    #[test]
+    fn redactor_aligned_hex_chunks_cover_truncated_noncanonical_output() {
+        let value: String = (0..5000u32)
+            .map(|i| char::from_digit(i % 10, 10).unwrap())
+            .collect(); // safety: test
+        let redactor = SecretValueRedactor::new([SecretString::from(value.clone())].as_slice());
+        let hex: String = value.bytes().map(|byte| format!("{byte:02x}")).collect();
+        let partial = hex.as_bytes()[..160]
+            .chunks(48)
+            .map(|c| std::str::from_utf8(c).unwrap()) // safety: test
+            .collect::<Vec<_>>()
+            .join("\n");
+        let scrubbed = redactor.scrub(&partial);
+        let folded_scrubbed = fold_line_breaks(&scrubbed).text;
+        for chunk in hex.as_bytes()[..128].chunks(HEX_ALIGNED_CHUNK_CHARS) {
+            let chunk = std::str::from_utf8(chunk).unwrap(); // safety: test
+            assert!(!folded_scrubbed.contains(chunk), "aligned hex chunk leaked");
         }
     }
 
