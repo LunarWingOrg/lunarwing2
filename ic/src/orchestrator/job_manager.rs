@@ -33,6 +33,7 @@ use crate::tools::mcp::config::{McpServerConfig, McpServersFile, McpTransportCon
 pub const MAX_WORKER_MCP_SERVERS: usize = 8;
 const MAX_WORKER_MCP_CREDENTIALS: usize = 32;
 const MCP_SECRET_MARKER: &str = "worker-grant";
+const HARNESS_PROMOTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Which mode a sandbox container runs in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1626,6 +1627,23 @@ async fn finalize_harness_job(
     job_succeeded: bool,
     teardown_confirmed: bool,
 ) {
+    finalize_harness_job_with_timeout(
+        deps,
+        job_id,
+        job_succeeded,
+        teardown_confirmed,
+        HARNESS_PROMOTION_TIMEOUT,
+    )
+    .await;
+}
+
+async fn finalize_harness_job_with_timeout(
+    deps: PromotionDeps,
+    job_id: Uuid,
+    job_succeeded: bool,
+    teardown_confirmed: bool,
+    promotion_timeout: std::time::Duration,
+) {
     // Read guard scoped to this block — never held across a write (CV-1).
     let state = {
         let containers = deps.containers.read().await;
@@ -1661,7 +1679,15 @@ async fn finalize_harness_job(
         summary.skip_reason =
             Some("container teardown could not be confirmed; write-back refused".to_string());
     } else {
-        summary = run_promotion(&deps, job_id, &owner_id, &staging, &policy).await;
+        summary = run_promotion_with_timeout(
+            &deps,
+            job_id,
+            &owner_id,
+            &staging,
+            &policy,
+            promotion_timeout,
+        )
+        .await;
     }
 
     // DZ-6: the `harness_write_back` audit event is written via a direct
@@ -1717,11 +1743,34 @@ async fn finalize_harness_job(
     harness::cleanup_harness_job_dir(job_id);
 }
 
+async fn run_promotion_with_timeout(
+    deps: &PromotionDeps,
+    job_id: Uuid,
+    owner_id: &str,
+    staging: &std::path::Path,
+    policy: &harness::WriteBackPolicy,
+    timeout: std::time::Duration,
+) -> harness::PromotionSummary {
+    let mut summary = harness::PromotionSummary::default();
+    let result = tokio::time::timeout(
+        timeout,
+        run_promotion_into(deps, job_id, owner_id, staging, policy, &mut summary),
+    )
+    .await;
+    if result.is_err() {
+        tracing::warn!(job_id = %job_id, "Harness write-back promotion deadline exceeded");
+        summary.skipped = true;
+        summary.skip_reason = Some("promotion deadline exceeded".to_string());
+    }
+    summary
+}
+
 /// Run the write-back promotion pipeline: screen staged files, snapshot the
 /// prior content of each replaced file under `backups/harness/<job_id>/`
 /// (DH-5 rollback), then write accepted ones into the tenant workspace. Every
 /// run — accepted, rejection-only, or skipped — is audited by the caller
 /// (CW-9).
+#[cfg(test)]
 async fn run_promotion(
     deps: &PromotionDeps,
     job_id: Uuid,
@@ -1730,11 +1779,19 @@ async fn run_promotion(
     policy: &harness::WriteBackPolicy,
 ) -> harness::PromotionSummary {
     let mut summary = harness::PromotionSummary::default();
-    // CW-10: scan staged content for the job's own mounted secret values in
-    // addition to the pattern-based leak scan.
+    run_promotion_into(deps, job_id, owner_id, staging, policy, &mut summary).await;
+    summary
+}
+
+async fn run_promotion_into(
+    deps: &PromotionDeps,
+    job_id: Uuid,
+    owner_id: &str,
+    staging: &std::path::Path,
+    policy: &harness::WriteBackPolicy,
+    summary: &mut harness::PromotionSummary,
+) {
     let redactor = deps.token_store.harness_secret_redactor(job_id).await;
-    // DH-10: the staging walk is blocking filesystem IO — keep it off the
-    // async executor.
     let staging_buf = staging.to_path_buf();
     let policy_owned = policy.clone();
     let planned = tokio::task::spawn_blocking(move || {
@@ -1746,24 +1803,24 @@ async fn run_promotion(
         Ok(Err(e)) => {
             summary.skipped = true;
             summary.skip_reason = Some(format!("staging scan failed: {e}"));
-            return summary;
+            return;
         }
         Err(e) => {
             summary.skipped = true;
             summary.skip_reason = Some(format!("staging scan task failed: {e}"));
-            return summary;
+            return;
         }
     };
     summary.rejections = plan.rejections;
     summary.dropped_rejections = plan.dropped_rejections;
     if plan.accepted.is_empty() {
-        return summary;
+        return;
     }
 
     let Some(resolver) = &deps.workspace else {
         summary.skipped = true;
         summary.skip_reason = Some("no workspace available for write-back promotion".to_string());
-        return summary;
+        return;
     };
     let workspace = resolver.resolve(owner_id).await;
     for write in plan.accepted {
@@ -1775,7 +1832,6 @@ async fn run_promotion(
             }),
         }
     }
-    summary
 }
 
 /// Preserve the actual write scope's prior content before an overwrite. Only
