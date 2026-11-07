@@ -54,7 +54,9 @@
 
 ## Phase 5 - Misc Operations (ALWAYS READ ALL COMMENTS FOR EACH WORK ITEM WHEN A WORK ITEM IS REFERENCED - ALSO ALWAYS READ LINKED WORK ITEMS FOR EACH WORK ITEM REFERENCED)
 
-6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/540 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2226 but had some problems - please see review comments on the closed MR and re-attempt
+6. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/540 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2226 but had some problems - please see review comments on the closed MR and re-attempt
+   - DONE (SweetieBot (autonomous), 2026-11-07): `_worker_source_git` now resolves checkout ownership before any git invocation. Foreign-owned roots run only as their owner with an explicit `safe.directory`; caller-owned roots reset inherited `safe.directory` entries so repository discovery cannot walk into a foreign parent. Added static and behavioral regression coverage, and updated the worker-image contract pin whose stale text broke MR !2226.
+   - Verification: `test-mt-admin-pebble-build-inputs.sh`, `test-mt-admin-upgrade-build-failure.sh`, and `test-mt-admin-worker-image-contract.sh` passed; `check-mt-admin.sh` and shellcheck on the modified harnesses passed with the pinned shellcheck 0.11.0. A live Git fixture also confirmed that the helper refuses a foreign parent repository despite global `safe.directory=*`.
 
 ## Phase 6 - Gauntlets (for goals which reference any work items, see comments on those work items in addition to reading full descriptions)
 
