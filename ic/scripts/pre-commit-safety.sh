@@ -141,8 +141,22 @@ PROD_DIFF=$(echo "$PROD_DIFF" | grep -v '^+++ b/tests/' || true)
 # Only match `mod tests` (the conventional #[cfg(test)] module) — do NOT
 # match `fn test_*` because production code can have functions named test_*.
 PROD_DIFF=$(echo "$PROD_DIFF" | awk '
+    /^diff --git / {
+        in_test_file = ($0 ~ /\/tests\.rs$/)
+        in_rust_test = 0
+        pending_test_cfg = 0
+    }
     /^@@ / { in_test = ($0 ~ /mod tests/) }
-    !in_test { print }
+    /^\+[[:space:]]*#\[cfg\(test\)\]/ { pending_test_cfg = 1 }
+    pending_test_cfg && /^\+[[:space:]]*mod tests[[:space:]]*\{/ {
+        in_rust_test = 1
+        pending_test_cfg = 0
+    }
+    in_rust_test && /^\+}/ {
+        in_rust_test = 0
+        next
+    }
+    !in_test && !in_test_file && !in_rust_test { print }
 ' || true)
 if echo "$PROD_DIFF" | grep -nE '^\+' \
     | grep -E '\.(unwrap|expect)\(|[^_]assert(_eq|_ne)?!' \

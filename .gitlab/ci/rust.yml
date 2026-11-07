@@ -143,6 +143,7 @@ rust-test-lib:
     LUNARWING_CLOUD_BASE_URL: "http://127.0.0.1"
   script:
     - bash .gitlab/scripts/cargo-ci.sh test -j2 --locked --workspace --lib -- --test-threads=1
+    - bash .gitlab/scripts/cargo-ci.sh test -j2 --locked --manifest-path unix-socket-client/Cargo.toml -- --test-threads=1
 
 rust-test-libsql:
   extends:

@@ -3,6 +3,7 @@
 pub mod client_caps;
 mod event;
 mod prompt_context;
+pub mod repl_wire;
 mod util;
 
 pub use client_caps::{TurnOutcome, WireLimits};

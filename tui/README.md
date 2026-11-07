@@ -10,8 +10,9 @@ Status: milestones M1a (gateway client, LunarVoice, images, `tui-access`), M1b (
 M2a (the daemon's gateway contract), merged in MR !2173. Daemons built from master since then serve
 Wingtip in **exact mode** (header `exact`). Older daemons are served in **legacy mode** (header
 `legacy daemon`): everything works, but replies are matched first in, first out, and generated images
-are not delivered. Client tokens arrive with M2b. The Unix-socket transport (`--socket`, REPLv3)
-arrives with M4. Until then the client refuses it with a message.
+are not delivered. Client tokens arrive with M2b. Protocol-1 Unix-socket server hardening (M3) is
+implemented, but the Unix-socket client transport (`--socket`, REPLv3) arrives with M4. Until then
+the client refuses it with a message.
 
 ## Contents
 
