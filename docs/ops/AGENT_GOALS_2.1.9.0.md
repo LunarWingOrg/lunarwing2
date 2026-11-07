@@ -55,7 +55,9 @@
 
 ## Phase 4 - Documentation and Misc goal items (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
 
-5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/543
+5. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/543
+    - Implemented a shared worker-status parser for both the main stream and cancel-handoff result paths. It recognizes `failed` explicitly and warns with job/worker context plus a bounded, log-safe raw status before mapping unknown values to `Failed`; removed the production-dead `Partial` variant as recommended in the WI discussion. Implementation commit: `85d86d919`.
+    - Verification passed: `taskset -c 0-17 cargo test -j18 --locked --lib task_status -- --nocapture` (3 passed, 0 failed), `taskset -c 0-17 cargo clippy -j18 --locked --lib --tests -- -D warnings`, direct rustfmt check on `external_worker.rs`, and `git diff --check`.
 
 ## Phase 5 - Misc Operations (ALWAYS READ ALL COMMENTS FOR EACH WORK ITEM WHEN A WORK ITEM IS REFERENCED - ALSO ALWAYS READ LINKED WORK ITEMS FOR EACH WORK ITEM REFERENCED)
 
