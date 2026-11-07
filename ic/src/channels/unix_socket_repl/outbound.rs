@@ -89,7 +89,11 @@ pub(super) fn send_status(
     Ok(())
 }
 
-pub(super) fn message_lifecycle(registry: &Registry, msg: &IncomingMessage, event: MessageLifecycle) {
+pub(super) fn message_lifecycle(
+    registry: &Registry,
+    msg: &IncomingMessage,
+    event: MessageLifecycle,
+) {
     let MessageLifecycle::Finished(outcome) = event else {
         return;
     };
@@ -129,8 +133,8 @@ fn approval_prompt(
     parameters: &serde_json::Value,
     allow_always: bool,
 ) -> String {
-    let parameters = serde_json::to_string_pretty(parameters)
-        .unwrap_or_else(|_| parameters.to_string());
+    let parameters =
+        serde_json::to_string_pretty(parameters).unwrap_or_else(|_| parameters.to_string());
     let parameters = truncate_parameters(&parameters);
     let always_line = if allow_always {
         format!(

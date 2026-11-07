@@ -4,7 +4,7 @@ use std::time::Duration;
 use lunarwing_common::repl_wire::{
     ClientFrame, ConnectFrame, ResponseFrame, ServerFrame, encode_line,
 };
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::sync::CancellationToken;
@@ -73,7 +73,10 @@ pub(super) async fn serve_connection(
         .registry
         .try_reserve(ctx.max_connections, session_id.clone())
     else {
-        warn!(max_connections = ctx.max_connections, "unix socket REPL: max connections reached");
+        warn!(
+            max_connections = ctx.max_connections,
+            "unix socket REPL: max connections reached"
+        );
         write_busy(write, &session_id, ctx.max_connections, ctx.limits).await;
         return;
     };
@@ -86,7 +89,10 @@ pub(super) async fn serve_connection(
     if let Err(error) = offer_legacy(
         &session,
         &session_id,
-        format!("Connected to {} REPL. Session: {session_id}", ctx.agent_name),
+        format!(
+            "Connected to {} REPL. Session: {session_id}",
+            ctx.agent_name
+        ),
     ) {
         debug!(%error, %session_id, "unix socket REPL: failed to queue welcome");
         ctx.registry.remove(&session_id);
@@ -115,7 +121,8 @@ async fn read_handshake(
         FrameRead::Eof => Err(HandshakeError::Eof),
         FrameRead::TooLong => Err(HandshakeError::TooLong(limits.max_handshake_bytes)),
         FrameRead::Line => {
-            let frame = serde_json::from_slice::<ClientFrame>(buffer).map_err(HandshakeError::Parse)?;
+            let frame =
+                serde_json::from_slice::<ClientFrame>(buffer).map_err(HandshakeError::Parse)?;
             match frame {
                 ClientFrame::Connect(connect) => Ok(connect),
                 other => Err(HandshakeError::NotConnect(other.kind())),
@@ -231,7 +238,9 @@ async fn dispatch(frame: ClientFrame, session_id: &str, ctx: &ConnCtx, session: 
             }
         }
         ClientFrame::Ping => {
-            let _ = session.outbound.offer(&ServerFrame::Pong, FrameClass::Control);
+            let _ = session
+                .outbound
+                .offer(&ServerFrame::Pong, FrameClass::Control);
             Flow::Continue
         }
         ClientFrame::Pong => Flow::Continue,
@@ -251,11 +260,7 @@ async fn dispatch(frame: ClientFrame, session_id: &str, ctx: &ConnCtx, session: 
     }
 }
 
-fn offer_legacy(
-    session: &Session,
-    session_id: &str,
-    content: String,
-) -> Result<(), OfferError> {
+fn offer_legacy(session: &Session, session_id: &str, content: String) -> Result<(), OfferError> {
     session.outbound.offer(
         &ServerFrame::Response(ResponseFrame {
             content,

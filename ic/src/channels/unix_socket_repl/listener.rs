@@ -7,8 +7,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 
-use super::conn::serve_connection;
 use super::ConnCtx;
+use super::conn::serve_connection;
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
@@ -22,7 +22,9 @@ pub(super) enum ReplSocketError {
         #[source]
         source: std::io::Error,
     },
-    #[error("insecure REPL socket parent {path}: owner uid {owner}, mode {mode:04o}; expected a directory owned by the daemon uid with no group/other write bits")]
+    #[error(
+        "insecure REPL socket parent {path}: owner uid {owner}, mode {mode:04o}; expected a directory owned by the daemon uid with no group/other write bits"
+    )]
     InsecureParent {
         path: PathBuf,
         owner: u32,
@@ -63,7 +65,7 @@ pub(super) struct SocketIdentity {
 }
 
 impl SocketIdentity {
-    fn of(path: &Path) -> Result<Self, ReplSocketError> {
+    pub(super) fn of(path: &Path) -> Result<Self, ReplSocketError> {
         use std::os::unix::fs::MetadataExt;
 
         let metadata = std::fs::symlink_metadata(path)
@@ -104,7 +106,10 @@ pub(super) async fn bind_socket(path: &Path) -> Result<BoundSocket, ReplSocketEr
     bind_socket_with_uid(path, nix::unistd::geteuid().as_raw()).await
 }
 
-async fn bind_socket_with_uid(path: &Path, expected_uid: u32) -> Result<BoundSocket, ReplSocketError> {
+async fn bind_socket_with_uid(
+    path: &Path,
+    expected_uid: u32,
+) -> Result<BoundSocket, ReplSocketError> {
     prepare_parent_dir(path, expected_uid)?;
     let lock = acquire_path_lock(path)?;
     let listener = match UnixListener::bind(path) {
@@ -123,8 +128,9 @@ async fn bind_socket_with_uid(path: &Path, expected_uid: u32) -> Result<BoundSoc
                 }
                 Existing::Stale => {
                     remove_stale(path)?;
-                    UnixListener::bind(path)
-                        .map_err(|error| ReplSocketError::io("failed to rebind REPL socket", path, error))?
+                    UnixListener::bind(path).map_err(|error| {
+                        ReplSocketError::io("failed to rebind REPL socket", path, error)
+                    })?
                 }
                 Existing::OwnedSocket => {
                     return Err(ReplSocketError::io(
@@ -135,7 +141,13 @@ async fn bind_socket_with_uid(path: &Path, expected_uid: u32) -> Result<BoundSoc
                 }
             }
         }
-        Err(error) => return Err(ReplSocketError::io("failed to bind REPL socket", path, error)),
+        Err(error) => {
+            return Err(ReplSocketError::io(
+                "failed to bind REPL socket",
+                path,
+                error,
+            ));
+        }
     };
     set_mode_0600(path)?;
     let identity = SocketIdentity::of(path)?;
@@ -147,7 +159,7 @@ async fn bind_socket_with_uid(path: &Path, expected_uid: u32) -> Result<BoundSoc
 }
 
 fn prepare_parent_dir(path: &Path, expected_uid: u32) -> Result<(), ReplSocketError> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
     let parent = path
         .parent()
@@ -158,13 +170,15 @@ fn prepare_parent_dir(path: &Path, expected_uid: u32) -> Result<(), ReplSocketEr
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let mut builder = std::fs::DirBuilder::new();
             builder.recursive(true).mode(0o700);
-            builder
-                .create(parent)
-                .map_err(|error| ReplSocketError::io("failed to create REPL socket parent", parent, error))?;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-                .map_err(|error| ReplSocketError::io("failed to chmod REPL socket parent", parent, error))?;
-            let metadata = std::fs::symlink_metadata(parent)
-                .map_err(|error| ReplSocketError::io("failed to inspect REPL socket parent", parent, error))?;
+            builder.create(parent).map_err(|error| {
+                ReplSocketError::io("failed to create REPL socket parent", parent, error)
+            })?;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                |error| ReplSocketError::io("failed to chmod REPL socket parent", parent, error),
+            )?;
+            let metadata = std::fs::symlink_metadata(parent).map_err(|error| {
+                ReplSocketError::io("failed to inspect REPL socket parent", parent, error)
+            })?;
             validate_parent(parent, &metadata, expected_uid)
         }
         Err(error) => Err(ReplSocketError::io(
@@ -210,9 +224,13 @@ fn acquire_path_lock(path: &Path) -> Result<std::fs::File, ReplSocketError> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&lock_path)
-        .map_err(|error| ReplSocketError::io("failed to open REPL socket lock", &lock_path, error))?;
+        .map_err(|error| {
+            ReplSocketError::io("failed to open REPL socket lock", &lock_path, error)
+        })?;
     lock.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|error| ReplSocketError::io("failed to chmod REPL socket lock", &lock_path, error))?;
+        .map_err(|error| {
+            ReplSocketError::io("failed to chmod REPL socket lock", &lock_path, error)
+        })?;
     match lock.try_lock() {
         Ok(()) => Ok(lock),
         Err(std::fs::TryLockError::WouldBlock) => {
@@ -253,22 +271,25 @@ async fn probe_existing(path: &Path, expected_uid: u32) -> Result<Existing, Repl
         }
     };
     match classify_existing(&metadata, expected_uid) {
-        Existing::OwnedSocket => match tokio::time::timeout(PROBE_TIMEOUT, UnixStream::connect(path)).await {
-            Ok(Ok(_stream)) | Err(_) => Ok(Existing::Live),
-            Ok(Err(error))
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-                ) =>
-            {
-                Ok(Existing::Stale)
+        Existing::OwnedSocket => {
+            match tokio::time::timeout(PROBE_TIMEOUT, UnixStream::connect(path)).await {
+                Ok(Ok(_stream)) => Ok(Existing::Live),
+                Err(_) => Ok(Existing::Live),
+                Ok(Err(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    Ok(Existing::Stale)
+                }
+                Ok(Err(error)) => Err(ReplSocketError::io(
+                    "failed to probe existing REPL socket",
+                    path,
+                    error,
+                )),
             }
-            Ok(Err(error)) => Err(ReplSocketError::io(
-                "failed to probe existing REPL socket",
-                path,
-                error,
-            )),
-        },
+        }
         Existing::Foreign { uid } => Ok(Existing::Foreign { uid }),
         Existing::NotSocket => Ok(Existing::NotSocket),
         Existing::Live | Existing::Stale => Err(ReplSocketError::io(
