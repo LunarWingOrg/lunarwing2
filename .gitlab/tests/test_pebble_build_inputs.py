@@ -253,9 +253,9 @@ class TaskShellToolchainPathTests(unittest.TestCase):
         # re-tagged after the probe passes (WI#334). WI#527/TD-14: the output
         # tag honours LUNARWING_WORKER_IMAGE_TAG via worker_image_ref. WI#527
         # TO-6: the fat staging tag is derived from that output tag, so two
-        # concurrent builds (another tenant's upgrade) cannot share it. WI#507:
-        # the host-executed helper stays in the operator checkout even when the
-        # image build context is a tenant-writable checkout.
+        # concurrent builds (another tenant's upgrade) cannot share it. WI#539:
+        # the host-executed helper stays in the operator checkout; tenant image
+        # contexts are operator-owned archives of the validated tenant commit.
         build_lib = (ROOT / "ic/scripts/mt-admin-lib/05-tenant-build.sh").read_text(encoding="utf-8")
         self.assertIn('fat_candidate="${output_tag}-candidate"', build_lib)
         self.assertIn('CONTAINER_RT="$CONTAINER_RT" "$smoke_script" image "$fat_candidate"', build_lib)
@@ -279,6 +279,30 @@ class TaskShellToolchainPathTests(unittest.TestCase):
         dockerfile = (ROOT / "pebble4lunarwing/Dockerfile").read_text(encoding="utf-8")
         self.assertIn("COPY --from=builder /build/pebble/target/release/pebble /usr/local/lib/pebble/pebble", dockerfile)
         self.assertIn("COPY pebble4lunarwing/scripts/pebble-self-update-guard.sh /usr/local/bin/pebble", dockerfile)
+
+
+class WorkerSourceProvenanceTests(unittest.TestCase):
+    def test_every_tenant_lane_uses_the_operator_archive(self):
+        build_lib = (ROOT / "ic/scripts/mt-admin-lib/05-tenant-build.sh").read_text(encoding="utf-8")
+        for lane in ("pebble4lunarwing", "opencode4lunarwing", "opencode2.4lunarwing", "kimicode4lunarwing"):
+            with self.subTest(lane=lane):
+                self.assertIn(f'_prepare_worker_build_source "$source_root" {lane} "$release_ref"', build_lib)
+        for needle in (
+            'git -C "$LUNARWING_ROOT" cat-file -e "${revision}^{commit}"',
+            'git -C "$LUNARWING_ROOT" merge-base --is-ancestor "$revision" "$release_ref"',
+            'git -C "$LUNARWING_ROOT" archive --format=tar --output="$archive"',
+            'worker source archive contains a link or special file',
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, build_lib)
+
+    def test_upgrade_paths_forward_the_release_ref(self):
+        lifecycle = (ROOT / "ic/scripts/mt-admin-lib/04-tenant-lifecycle.sh").read_text(encoding="utf-8")
+        wrapper = (ROOT / "ic/scripts/upgrade-tenant.sh").read_text(encoding="utf-8")
+        dispatcher = (ROOT / "ic/scripts/lunarwing-mt-admin.sh").read_text(encoding="utf-8")
+        self.assertIn('"$with_opencode2" "$checkout_ref"', lifecycle)
+        self.assertIn('cand_args=(build-worker-candidates "$TENANT" --enabled --target "$TARGET_REF")', wrapper)
+        self.assertIn('"$cand_pebble" "false" "$cand_target"', dispatcher)
 
 
 class ToolchainProfileBehaviourTests(unittest.TestCase):
