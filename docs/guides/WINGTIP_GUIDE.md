@@ -204,4 +204,5 @@ default).
   option and exit status.
 - [`GATEWAY_CHAT_API.md`](GATEWAY_CHAT_API.md): the gateway chat contract Wingtip uses.
 - [`docs/proposals/WINGTIP_DESIGN.md`](../proposals/WINGTIP_DESIGN.md): the design, including the
-  planned client tokens (M2b), socket hardening (M3, WI#458) and the socket transport (M4).
+  implemented protocol-1 socket hardening (M3, WI#458), planned client tokens (M2b), and the
+  planned socket transport (M4).

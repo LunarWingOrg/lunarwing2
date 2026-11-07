@@ -12,7 +12,8 @@ Status: final design, 2026-11-03. Revised from the integration draft (`design/DE
 > **Status on master (2026-11-03):**
 > - **Merged** (!2173): M1a, M1b and M2a.
 > - **Since then:** a default `tui-access` grant refuses unless the running daemon lists the `client_tokens` capability feature, and `rotate-gateway-token` rotates `GATEWAY_AUTH_TOKEN` (3e495eb61).
-> - **Not built yet:** M2b (client tokens, 8.3.5), M3 (socket hardening, WI#458) and M4 (REPLv3 and the client socket transport). Their sections describe planned work.
+> - **Implemented since then:** M3 (protocol-1 socket hardening, WI#458).
+> - **Not built yet:** M2b (client tokens, 8.3.5) and M4 (REPLv3 and the client socket transport). Their sections describe planned work.
 > - **Open review findings:** WI#556 (UZ-3 to UZ-9) and WI#550 (silent replies still stop the daemon on channels other than the gateway and the socket).
 > - **Appendix A decisions:**
 >   - DEC-1: adopted, implemented in M2a.
