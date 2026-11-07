@@ -32,7 +32,11 @@ Auto-triggered onboarding uses **quick mode** by default.
 **not** by itself suppress first-run onboarding. Fresh instances still need the
 bootstrap `.env` / database setup that the wizard creates.
 
-The `--no-onboard` CLI flag suppresses auto-detection.
+The `--no-onboard` CLI flag suppresses auto-detection. Generated Linux
+systemd-user and OpenRC services pass `--no-onboard` before `run`, matching the
+committed production templates and mt-admin units. These daemon paths never
+start the interactive first-run wizard; run `lunarwing onboard` explicitly when
+interactive setup is required.
 
 ## Multi-tenant provisioning (separate from the wizard)
 
