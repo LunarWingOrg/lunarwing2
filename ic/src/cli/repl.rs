@@ -56,6 +56,10 @@ fn socket_owner_ok(metadata: &std::fs::Metadata, expected_uid: u32) -> bool {
     metadata.file_type().is_socket() && metadata.uid() == expected_uid
 }
 
+fn connected_peer_ok(stream: &UnixStream, expected_uid: u32) -> std::io::Result<bool> {
+    Ok(stream.peer_cred()?.uid() == expected_uid)
+}
+
 impl ReplCommand {
     pub async fn run(&self) -> anyhow::Result<()> {
         let socket_path = self.socket.clone().unwrap_or_else(|| {
@@ -92,6 +96,14 @@ impl ReplCommand {
                 e
             )
         })?;
+        if !connected_peer_ok(&stream, expected_uid)
+            .map_err(|e| anyhow::anyhow!("Failed to verify LunarWing REPL peer credentials: {e}"))?
+        {
+            anyhow::bail!(
+                "Refusing LunarWing REPL socket {}: connected peer is not owned by uid {expected_uid}",
+                socket_path.display()
+            );
+        }
 
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
@@ -210,6 +222,16 @@ mod tests {
             let frame: ReplMessage = serde_json::from_str(line).expect("golden v1 frame");
             assert_eq!(serde_json::to_string(&frame).expect("v1 encoding"), line);
         }
+    }
+
+    #[test]
+    fn connected_peer_check_uses_race_free_credentials() {
+        let (stream, _peer) = UnixStream::pair().expect("socket pair");
+        let expected_uid = nix::unistd::geteuid().as_raw();
+        assert!(connected_peer_ok(&stream, expected_uid).expect("peer credentials"));
+        assert!(
+            !connected_peer_ok(&stream, expected_uid.wrapping_add(1)).expect("peer credentials")
+        );
     }
 
     #[test]
