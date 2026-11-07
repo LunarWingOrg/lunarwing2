@@ -1510,9 +1510,19 @@ _operator_worker_release_ref() {  # <branch, tag, remote ref, or commit>
   return 1
 }
 
+_default_operator_worker_release_ref() {
+  local release_ref
+  release_ref="$(git -C "$LUNARWING_ROOT" symbolic-ref --quiet HEAD 2>/dev/null)" || release_ref=""
+  if [[ -z "$release_ref" ]]; then
+    release_ref="$(git -C "$LUNARWING_ROOT" rev-parse --verify HEAD 2>/dev/null)" || release_ref=""
+  fi
+  [[ "$release_ref" =~ ^refs/heads/.+$ || "$release_ref" =~ ^[0-9a-f]{40}$ ]] || return 1
+  printf '%s\n' "$release_ref"
+}
+
 _worker_source_provenance() {  # <tenant source root> <lane> [release ref]
   local source_root="$1" lane="$2" requested="${3:-}"
-  local revision dirty owner branch release_ref
+  local revision dirty owner release_ref
   revision="$(_worker_source_git "$source_root" rev-parse --verify HEAD)" || revision=""
   [[ "$revision" =~ ^[0-9a-f]{40}$ ]] \
     || die "cannot verify tenant worker checkout HEAD: $source_root"
@@ -1524,10 +1534,8 @@ _worker_source_provenance() {  # <tenant source root> <lane> [release ref]
   git -C "$LUNARWING_ROOT" cat-file -e "${revision}^{commit}" 2>/dev/null \
     || die "tenant '$owner' HEAD $revision is unknown to operator checkout $LUNARWING_ROOT"
   if [[ -z "$requested" ]]; then
-    branch="$(_worker_source_git "$source_root" symbolic-ref --quiet --short HEAD)" || branch=""
-    [[ -n "$branch" ]] \
-      || die "tenant '$owner' HEAD $revision is detached; an explicit release ref is required"
-    requested="$branch"
+    requested="$(_default_operator_worker_release_ref)" \
+      || die "cannot determine operator release ref for tenant '$owner' HEAD $revision"
   fi
   release_ref="$(_operator_worker_release_ref "$requested")" || release_ref=""
   [[ -n "$release_ref" ]] \
@@ -1588,12 +1596,16 @@ _cleanup_worker_build_context() {  # <archive root>
 }
 
 _worker_build_context_begin() {
-  WORKER_BUILD_PRIOR_EXIT_TRAP="$(trap -p EXIT)"
+  WORKER_BUILD_PRIOR_EXIT_TRAP=""
   WORKER_BUILD_PRIOR_EXIT_ACTION=""
-  if [[ -n "$WORKER_BUILD_PRIOR_EXIT_TRAP" ]]; then
-    local -a trap_parts=()
-    eval "trap_parts=($WORKER_BUILD_PRIOR_EXIT_TRAP)"
-    WORKER_BUILD_PRIOR_EXIT_ACTION="${trap_parts[2]:-}"
+  # Bash reports the parent's EXIT trap inside a subshell; never re-arm it there.
+  if [[ "$BASHPID" == "$$" ]]; then
+    WORKER_BUILD_PRIOR_EXIT_TRAP="$(trap -p EXIT)"
+    if [[ -n "$WORKER_BUILD_PRIOR_EXIT_TRAP" ]]; then
+      local -a trap_parts=()
+      eval "trap_parts=($WORKER_BUILD_PRIOR_EXIT_TRAP)"
+      WORKER_BUILD_PRIOR_EXIT_ACTION="${trap_parts[2]:-}"
+    fi
   fi
   trap '_worker_build_context_exit $?' EXIT
 }
@@ -1602,7 +1614,9 @@ _worker_build_context_exit() {  # <status>
   local status="$1"
   trap - EXIT
   _cleanup_worker_build_context "$WORKER_BUILD_ARCHIVE_ROOT" || true
-  [[ -z "$WORKER_BUILD_PRIOR_EXIT_ACTION" ]] || eval "$WORKER_BUILD_PRIOR_EXIT_ACTION"
+  if [[ "$BASHPID" == "$$" && -n "$WORKER_BUILD_PRIOR_EXIT_ACTION" ]]; then
+    eval "$WORKER_BUILD_PRIOR_EXIT_ACTION"
+  fi
   exit "$status"
 }
 
@@ -1611,7 +1625,7 @@ _worker_build_context_finish() {
   _cleanup_worker_build_context "$WORKER_BUILD_ARCHIVE_ROOT" \
     || die "cannot remove worker source archive $WORKER_BUILD_ARCHIVE_ROOT"
   WORKER_BUILD_ARCHIVE_ROOT=""
-  if [[ -n "$WORKER_BUILD_PRIOR_EXIT_TRAP" ]]; then
+  if [[ "$BASHPID" == "$$" && -n "$WORKER_BUILD_PRIOR_EXIT_TRAP" ]]; then
     eval "$WORKER_BUILD_PRIOR_EXIT_TRAP"
   else
     trap - EXIT
