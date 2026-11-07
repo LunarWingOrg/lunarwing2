@@ -280,7 +280,9 @@ impl CachedProvider {
                 Err(_) => self.log_miss_without_insert(request_number),
                 Ok(LlmStreamChunk::ToolCallDelta { .. }) => state.has_tool_calls = true,
                 Ok(LlmStreamChunk::Observation(observation)) => {
-                    state.observations.push(observation.clone());
+                    if !matches!(observation, LlmStreamObservation::Retried { .. }) {
+                        state.observations.push(observation.clone());
+                    }
                 }
             }
 
@@ -292,7 +294,7 @@ impl CachedProvider {
 }
 
 fn is_cacheable(content: &str, has_tool_calls: bool) -> bool {
-    has_tool_calls || !content.is_empty()
+    !has_tool_calls && crate::llm::reasoning::has_visible_response_content(content)
 }
 
 fn cached_stream(hit: CacheHit) -> LlmStream<'static> {
@@ -757,7 +759,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_hit_preserves_finish_reason_and_observations() {
+    async fn stream_hit_preserves_finish_reason_without_replaying_retries() {
         let observation = LlmStreamObservation::Retried {
             provider: "previous-model".to_string(),
             attempts: 1,
@@ -773,7 +775,7 @@ mod tests {
             vec![StreamScript::Items(vec![
                 Ok(LlmStreamChunk::ReasoningDelta("thinking".to_string())),
                 Ok(LlmStreamChunk::TextDelta("answer".to_string())),
-                Ok(LlmStreamChunk::Observation(observation.clone())),
+                Ok(LlmStreamChunk::Observation(observation)),
                 Ok(LlmStreamChunk::Done {
                     usage: Some(TokenUsage::default()),
                     finish_reason: "provider_specific_stop".to_string(),
@@ -783,7 +785,7 @@ mod tests {
         ));
         let cached = CachedProvider::new(provider.clone(), ResponseCacheConfig::default());
 
-        cached
+        let miss_chunks = cached
             .complete_stream(simple_request())
             .await
             .expect("stream should open")
@@ -792,6 +794,11 @@ mod tests {
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
             .expect("stream should complete");
+        assert!(miss_chunks.iter().any(|chunk| matches!(
+            chunk,
+            LlmStreamChunk::Observation(LlmStreamObservation::Retried { .. })
+        )));
+
         let chunks = cached
             .complete_stream(simple_request())
             .await
@@ -807,7 +814,6 @@ mod tests {
             vec![
                 LlmStreamChunk::ReasoningDelta("thinking".to_string()),
                 LlmStreamChunk::TextDelta("answer".to_string()),
-                LlmStreamChunk::Observation(observation),
                 LlmStreamChunk::Done {
                     usage: Some(TokenUsage::default()),
                     finish_reason: "provider_specific_stop".to_string(),
@@ -914,6 +920,89 @@ mod tests {
         }
 
         assert_eq!(stub.calls(), 2);
+        assert!(cached.is_empty());
+        assert_eq!(cached.total_hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn whitespace_and_think_only_streams_are_not_cached() {
+        for content in ["  \n", "<think>pondering</think>"] {
+            let stream = || {
+                StreamScript::Items(vec![
+                    Ok(LlmStreamChunk::TextDelta(content.to_string())),
+                    Ok(LlmStreamChunk::Done {
+                        usage: None,
+                        finish_reason: "stop".to_string(),
+                    }),
+                ])
+            };
+            let provider = Arc::new(ScriptedStreamingProvider::new(
+                "scripted",
+                vec![stream(), stream()],
+                vec![],
+            ));
+            let cached = CachedProvider::new(provider.clone(), ResponseCacheConfig::default());
+
+            for _ in 0..2 {
+                let chunks = cached
+                    .complete_stream(simple_request())
+                    .await
+                    .expect("stream should open")
+                    .collect::<Vec<_>>()
+                    .await;
+                assert!(matches!(
+                    chunks.as_slice(),
+                    [Ok(LlmStreamChunk::TextDelta(text)), Ok(LlmStreamChunk::Done { .. })]
+                        if text.as_str() == content
+                ));
+            }
+
+            assert_eq!(provider.plain_calls(), 2);
+            assert!(cached.is_empty());
+            assert_eq!(cached.total_hits(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn whitespace_and_think_only_blocking_responses_are_not_cached() {
+        for content in ["  \n", "<think>pondering</think>"] {
+            let stub = Arc::new(StubLlm::new(content));
+            let cached = CachedProvider::new(stub.clone(), ResponseCacheConfig::default());
+
+            for _ in 0..2 {
+                let response = cached.complete(simple_request()).await.unwrap();
+                assert_eq!(response.content, content);
+            }
+
+            assert_eq!(stub.calls(), 2);
+            assert!(cached.is_empty());
+            assert_eq!(cached.total_hits(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_call_only_plain_stream_is_not_cached() {
+        let provider = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![native_tool_stream(), native_tool_stream()],
+            vec![],
+        ));
+        let cached = CachedProvider::new(provider.clone(), ResponseCacheConfig::default());
+
+        for _ in 0..2 {
+            let chunks = cached
+                .complete_stream(simple_request())
+                .await
+                .expect("stream should open")
+                .collect::<Vec<_>>()
+                .await;
+            assert!(matches!(
+                chunks.as_slice(),
+                [Ok(LlmStreamChunk::ToolCallDelta { .. }), Ok(LlmStreamChunk::Done { .. })]
+            ));
+        }
+
+        assert_eq!(provider.plain_calls(), 2);
         assert!(cached.is_empty());
         assert_eq!(cached.total_hits(), 0);
     }
