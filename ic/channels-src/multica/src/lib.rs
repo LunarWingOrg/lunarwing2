@@ -3,7 +3,7 @@ wit_bindgen::generate!({
     path: "../../wit/channel.wit",
 });
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use exports::lunarwing::agent::channel::{
     AgentResponse, ChannelConfig, Guest, IncomingHttpRequest, OutgoingHttpResponse, PollConfig,
@@ -21,7 +21,9 @@ const DEFAULT_POLL_INTERVAL_MS: u32 = 30_000;
 struct RuntimeConfig {
     #[serde(default = "default_display_name")]
     display_name: String,
+    #[serde(default, deserialize_with = "deserialize_multica_url")]
     multica_url: String,
+    #[serde(default, deserialize_with = "deserialize_workspace_id")]
     workspace_id: String,
     runtime_id: Option<String>,
     #[serde(default = "default_daemon_id")]
@@ -32,6 +34,32 @@ struct RuntimeConfig {
     polling_enabled: bool,
     #[serde(default = "default_poll_interval")]
     poll_interval_ms: u32,
+}
+
+fn deserialize_multica_url<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_required_string(deserializer, "multica_url")
+}
+
+fn deserialize_workspace_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_required_string(deserializer, "workspace_id")
+}
+
+fn deserialize_required_string<'de, D>(deserializer: D, field: &str) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<String>::deserialize(deserializer)? {
+        Some(value) if !value.trim().is_empty() => Ok(value),
+        _ => Err(serde::de::Error::custom(format!(
+            "{field} is not configured"
+        ))),
+    }
 }
 
 fn default_display_name() -> String {
@@ -277,14 +305,14 @@ impl Guest for MulticaChannel {
                 });
                 let url = api_url(&config.multica_url, &format!("/api/issues/{iid}/comments"));
                 let (status, resp_body) = http_post(&url, body.to_string().as_bytes())?;
-                if status < 200 || status >= 300 {
+                if !(200..300).contains(&status) {
                     return Err(format!(
                         "post_comment failed (HTTP {status}): {}",
                         String::from_utf8_lossy(&resp_body)
                     ));
                 }
             }
-            "complete" | _ => {
+            _ => {
                 if let Some(tid) = task_id {
                     let body = serde_json::json!({ "output": response.content });
                     let url = api_url(
@@ -292,7 +320,7 @@ impl Guest for MulticaChannel {
                         &format!("/api/daemon/tasks/{tid}/complete"),
                     );
                     let (status, resp_body) = http_post(&url, body.to_string().as_bytes())?;
-                    if status < 200 || status >= 300 {
+                    if !(200..300).contains(&status) {
                         return Err(format!(
                             "complete_task failed (HTTP {status}): {}",
                             String::from_utf8_lossy(&resp_body)
@@ -322,7 +350,17 @@ fn load_config() -> Result<RuntimeConfig, String> {
 }
 
 fn parse_config(json: &str) -> Result<RuntimeConfig, String> {
-    serde_json::from_str(json).map_err(|e| format!("invalid multica config: {e}"))
+    let config: RuntimeConfig =
+        serde_json::from_str(json).map_err(|e| format!("invalid multica config: {e}"))?;
+    for (field, value) in [
+        ("multica_url", config.multica_url.as_str()),
+        ("workspace_id", config.workspace_id.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(format!("invalid multica config: {field} is not configured"));
+        }
+    }
+    Ok(config)
 }
 
 fn resolve_runtime_id(config: &RuntimeConfig, state: &mut ChannelState) -> Option<String> {
@@ -372,7 +410,7 @@ fn do_register(config: &RuntimeConfig) -> Result<String, String> {
     });
     let url = api_url(&config.multica_url, "/api/daemon/register");
     let (status, resp_bytes) = http_post(&url, body.to_string().as_bytes())?;
-    if status < 200 || status >= 300 {
+    if !(200..300).contains(&status) {
         return Err(format!(
             "register HTTP {status}: {}",
             String::from_utf8_lossy(&resp_bytes)
@@ -390,7 +428,7 @@ fn send_heartbeat(config: &RuntimeConfig, runtime_id: &str) -> Result<HeartbeatR
     let body = serde_json::json!({ "runtime_id": runtime_id });
     let url = api_url(&config.multica_url, "/api/daemon/heartbeat");
     let (status, resp_bytes) = http_post(&url, body.to_string().as_bytes())?;
-    if status < 200 || status >= 300 {
+    if !(200..300).contains(&status) {
         return Err(format!(
             "heartbeat HTTP {status}: {}",
             String::from_utf8_lossy(&resp_bytes)
@@ -421,7 +459,7 @@ fn report_local_skills(config: &RuntimeConfig, runtime_id: &str, request_id: &st
         &format!("/api/daemon/runtimes/{runtime_id}/local-skills/{request_id}/result"),
     );
     match http_post(&url, body.to_string().as_bytes()) {
-        Ok((status, _)) if status >= 200 && status < 300 => {
+        Ok((status, _)) if (200..300).contains(&status) => {
             channel_host::log(
                 channel_host::LogLevel::Info,
                 &format!("reported {} local skills", skills.len()),
@@ -510,7 +548,7 @@ fn claim_task(config: &RuntimeConfig, runtime_id: &str) -> Result<Option<Claimed
     if body_str.trim().is_empty() || body_str.trim() == "null" {
         return Ok(None);
     }
-    if status < 200 || status >= 300 {
+    if !(200..300).contains(&status) {
         return Err(format!("claim_task HTTP {status}: {body_str}"));
     }
     let task: ClaimedTask =
@@ -607,4 +645,74 @@ fn emit_task_message(task: &ClaimedTask) {
         channel_host::LogLevel::Info,
         &format!("claimed task {task_id}: {identifier} — {issue_title}"),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_required_fields(
+        multica_url: serde_json::Value,
+        workspace_id: serde_json::Value,
+    ) -> String {
+        serde_json::json!({
+            "multica_url": multica_url,
+            "workspace_id": workspace_id,
+        })
+        .to_string()
+    }
+
+    fn assert_required_field_error(config: &str, field: &str) {
+        let error = parse_config(config).expect_err("configuration should be rejected");
+        assert!(
+            error.contains(&format!("{field} is not configured")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn null_required_fields_name_the_missing_setting() {
+        let null_url = config_with_required_fields(serde_json::Value::Null, "workspace".into());
+        assert_required_field_error(&null_url, "multica_url");
+
+        let null_workspace =
+            config_with_required_fields("https://multica.example".into(), serde_json::Value::Null);
+        assert_required_field_error(&null_workspace, "workspace_id");
+    }
+
+    #[test]
+    fn blank_required_fields_name_the_missing_setting() {
+        let blank_url = config_with_required_fields("  ".into(), "workspace".into());
+        assert_required_field_error(&blank_url, "multica_url");
+
+        let blank_workspace =
+            config_with_required_fields("https://multica.example".into(), "".into());
+        assert_required_field_error(&blank_workspace, "workspace_id");
+    }
+
+    #[test]
+    fn absent_required_fields_name_the_missing_setting() {
+        assert_required_field_error(r#"{"workspace_id":"workspace"}"#, "multica_url");
+        assert_required_field_error(
+            r#"{"multica_url":"https://multica.example"}"#,
+            "workspace_id",
+        );
+    }
+
+    #[test]
+    fn complete_config_preserves_values_and_defaults() {
+        let config = parse_config(&config_with_required_fields(
+            "https://multica.example".into(),
+            "workspace".into(),
+        ))
+        .expect("complete configuration should parse");
+
+        assert_eq!(config.multica_url, "https://multica.example");
+        assert_eq!(config.workspace_id, "workspace");
+        assert_eq!(config.display_name, "Multica");
+        assert_eq!(config.daemon_id, "lunarwing");
+        assert_eq!(config.runtime_type, "lunarwing");
+        assert!(config.polling_enabled);
+        assert_eq!(config.poll_interval_ms, DEFAULT_POLL_INTERVAL_MS);
+    }
 }
