@@ -79,6 +79,19 @@ impl TestClient {
         Some(serde_json::from_str(&line).expect("server frame"))
     }
 
+    async fn is_closed(&mut self) -> bool {
+        let mut line = String::new();
+        let read = timeout(Duration::from_secs(2), self.reader.read_line(&mut line))
+            .await
+            .expect("server read timeout");
+        match read {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => true,
+            Err(error) => panic!("server read: {error}"),
+        }
+    }
+
     async fn read(&mut self) -> ServerFrame {
         self.read_optional()
             .await
@@ -430,7 +443,7 @@ async fn shutdown_cancels_pending_handshake() {
 
     let connect = encode_client_line(&legacy_connect()).expect("connect encoding");
     let _ = client.reader.get_mut().write_all(&connect).await;
-    assert!(client.read_optional().await.is_none());
+    assert!(client.is_closed().await);
     assert_eq!(channel.registry.len(), 0);
 }
 
