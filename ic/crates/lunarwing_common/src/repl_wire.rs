@@ -163,7 +163,10 @@ impl fmt::Debug for WireAttachment {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WireAttachment")
             .field("mime_type", &self.mime_type)
-            .field("filename", &self.filename)
+            .field(
+                "filename",
+                &self.filename.as_ref().map(|value| Redacted(value.len())),
+            )
             .field("data_base64", &Redacted(self.data_base64.len()))
             .finish()
     }
@@ -229,10 +232,22 @@ fn default_audio_format() -> String {
     "wav".to_string()
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct DisconnectFrame {
     pub session_id: Option<String>,
     pub reason: Option<String>,
+}
+
+impl fmt::Debug for DisconnectFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DisconnectFrame")
+            .field("session_id", &self.session_id)
+            .field(
+                "reason",
+                &self.reason.as_ref().map(|value| Redacted(value.len())),
+            )
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -322,7 +337,7 @@ impl fmt::Debug for ApprovalRequestFrame {
             .field("msg_id", &self.msg_id)
             .field("request_id", &self.request_id)
             .field("tool_name", &self.tool_name)
-            .field("description", &self.description)
+            .field("description", &Redacted(self.description.len()))
             .field("parameters", &Redacted(self.parameters.len()))
             .field("allow_always", &self.allow_always)
             .field("parameters_truncated", &self.parameters_truncated)
@@ -348,7 +363,7 @@ pub enum ApprovalResolution {
     Unknown,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct AuthRequiredFrame {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub msg_id: Option<String>,
@@ -361,7 +376,31 @@ pub struct AuthRequiredFrame {
     pub setup_url: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+impl fmt::Debug for AuthRequiredFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthRequiredFrame")
+            .field("msg_id", &self.msg_id)
+            .field("extension_name", &self.extension_name)
+            .field(
+                "instructions",
+                &self
+                    .instructions
+                    .as_ref()
+                    .map(|value| Redacted(value.len())),
+            )
+            .field(
+                "auth_url",
+                &self.auth_url.as_ref().map(|value| Redacted(value.len())),
+            )
+            .field(
+                "setup_url",
+                &self.setup_url.as_ref().map(|value| Redacted(value.len())),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct ErrorFrame {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub msg_id: Option<String>,
@@ -371,6 +410,19 @@ pub struct ErrorFrame {
     pub message: String,
     pub retryable: bool,
     pub fatal: bool,
+}
+
+impl fmt::Debug for ErrorFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ErrorFrame")
+            .field("msg_id", &self.msg_id)
+            .field("req_id", &self.req_id)
+            .field("code", &self.code)
+            .field("message", &Redacted(self.message.len()))
+            .field("retryable", &self.retryable)
+            .field("fatal", &self.fatal)
+            .finish()
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
@@ -557,7 +609,7 @@ mod tests {
             msg_id: None,
             attachments: vec![WireAttachment {
                 mime_type: "image/png".to_string(),
-                filename: None,
+                filename: Some(secret.to_string()),
                 data_base64: secret.to_string(),
             }],
         };
@@ -573,8 +625,38 @@ mod tests {
             text: secret.to_string(),
             msg_id: None,
         };
+        let disconnect = DisconnectFrame {
+            session_id: None,
+            reason: Some(secret.to_string()),
+        };
+        let approval = ApprovalRequestFrame {
+            msg_id: None,
+            request_id: "request".to_string(),
+            tool_name: "shell".to_string(),
+            description: secret.to_string(),
+            parameters: secret.to_string(),
+            allow_always: false,
+            parameters_truncated: false,
+            parameters_bytes: secret.len() as u64,
+        };
+        let auth = AuthRequiredFrame {
+            msg_id: None,
+            extension_name: "extension".to_string(),
+            instructions: Some(secret.to_string()),
+            auth_url: Some(secret.to_string()),
+            setup_url: Some(secret.to_string()),
+        };
+        let error = ErrorFrame {
+            msg_id: None,
+            req_id: None,
+            code: ErrorCode::BadFrame,
+            message: secret.to_string(),
+            retryable: false,
+            fatal: false,
+        };
         let output = format!(
-            "{message:?} {response:?} {notice:?} {:?} {:?}",
+            "{message:?} {response:?} {notice:?} {disconnect:?} {approval:?} {auth:?} {error:?} {:?} {:?} {:?}",
+            message.attachments[0],
             ClientFrame::Message(message.clone()),
             ServerFrame::Response(response.clone())
         );
