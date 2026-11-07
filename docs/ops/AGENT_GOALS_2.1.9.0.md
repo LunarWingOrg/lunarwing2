@@ -77,10 +77,20 @@
 10. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/458 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2242 and please review the comments on the closed MR and re-attempt with the guidance
 11. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/563
 12. [ ] Fix any issues in CI/CD (if any) - See Pipeline for LATEST MASTER pipeline (you can use gitlab mcp) and see if anything is not GREEN. If there are problems, fix them - always check last dozen or so Work Items for TIPS as to why master pipelines are actually red. Kageho is watching and posting WIs with explanations now usually (fairly frequently)
-13. [ ] 
+13. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/564
+14. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/565
+15. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/569
+16. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/572
+17. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/571
+18. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/570
+19. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/568
 
 ## Phase 7 - Advanced Operator Notes
 
-14. [x] (S) Reserved
+20. [x] (S) Reserved
+21. [x] (H) check older goals for others that may be not done yet
+22. [x] (H) update rel notes
+23. [x] (S) Deploy the stoplight system
+24. [x] (S) Dive back in to LunarDepth and open worker lanes across the fleet for it get it running and up again patches too
 
 ---
