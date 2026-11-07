@@ -148,9 +148,10 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
     the ACP bridge does not. The worker's `PR_SET_DUMPABLE=0` is intended to
     prevent child access to `/proc/1/environ`; token redaction is not proof
     that such access is possible or that every output path is covered.
-  - Retained variants use `SecretString` and zeroize on drop. Temporary
-    encoding strings, pulled strings, and serialized copies do not all
-    zeroize (DZ-8).
+  - Retained variants use `SecretString` and zeroize on drop. Automaton
+    transition tables, temporary encoding strings, pulled strings, and
+    serialized copies do not all zeroize; automatons are dropped with the
+    redactor on the same terminal cleanup paths (DZ-8).
   - Redaction is **best-effort, not a boundary**: a job that deliberately
     slices a value (e.g. `cut -c1-32` over several calls) or encodes it in a
     form not covered above can smuggle partials out. Extracted/decoded fields

@@ -809,8 +809,8 @@ fn sweep_harness_dirs_in(
 /// and lines with no alphanumeric byte (DZ-5). For secrets whose encoded form
 /// is at most [`WRAP_LINE_VARIANT_CHAR_CAP`] chars, individual wrap lines at
 /// the canonical widths are armed as well (a tool returning one line at a
-/// time); larger secrets rely on whole-blob fold matching to keep the variant
-/// count bounded (EB-4).
+/// time); larger and truncated encodings use aligned chunks in the same
+/// per-job folded automaton (EB-4/EE-2).
 ///
 /// NOT covered (documented gaps): offset/grouped dump formats such as plain
 /// `xxd`, `od`, or `hexdump -C`, which interleave offsets and ASCII columns
@@ -824,8 +824,8 @@ fn sweep_harness_dirs_in(
 /// redaction limits accidental exposure of whole values.
 ///
 /// Retained variants are held as [`SecretString`] and zeroize on drop (CV-10);
-/// temporary strings and serialized copies do not all zeroize. `Debug`
-/// deliberately prints no variant material.
+/// automaton tables, temporary strings, and serialized copies do not all
+/// zeroize. `Debug` deliberately prints no variant material.
 #[derive(Clone, Default)]
 pub struct SecretValueRedactor {
     /// Variants matched directly against the text: the raw value, per-line
