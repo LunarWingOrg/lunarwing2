@@ -31,7 +31,10 @@
 
 ## Phase 2 — Features/Polish/BaselineAdditions (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
 
-2. [ ] audit all crates for security and write report to docs/ops
+2. [x] audit all crates for security and write report to docs/ops
+   - Completed 2026-11-07 for audited base `e9815abc5`; report: `docs/ops/v2.1.9.0_CARGO_DENY_AUDIT.md` (report commit `5fd5f4a1a`). All 27 tracked non-vendor lock roots were scanned: no new unaccepted vulnerability, no yanked warning, and no change to the 13 existing advisory acceptances.
+   - Evidence: main cargo-deny gate green; satellite sweep 26 roots OK plus the manifest-less Pebble override independently scanned and verified; default-graph and lockfile-only guards green; targeted suites 23/23, 15/15, 5/5, and 41 OK (4 skipped). The new informational `astral-tl` notice and the `html-to-markdown-rs 3.21.1` cleanup path are documented in the report.
+   - Scope note: item 1 was still open and the daemon was 2.1.8 at the audited base. Re-run the advisory gates and lockfile scan after item 1's dependency sweep and before release.
 3. [x] (S) Reserved
 
 ## Phase 3 — Carried Known-Issues from RELEASE-v2.1.8.0.md (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
