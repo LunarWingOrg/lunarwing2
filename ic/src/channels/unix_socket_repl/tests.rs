@@ -415,6 +415,26 @@ async fn handshake_times_out_without_connect() {
 }
 
 #[tokio::test]
+async fn shutdown_cancels_pending_handshake() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("repl.sock");
+    let limits = ReplLimits {
+        handshake_timeout: Duration::from_secs(2),
+        ..fast_limits()
+    };
+    let channel = test_channel(&path, 2).with_limits(limits);
+    let _stream = start(&channel).await;
+    let mut client = TestClient::connect(&path).await;
+    sleep(Duration::from_millis(20)).await;
+    channel.shutdown().await.expect("shutdown");
+
+    let connect = encode_client_line(&legacy_connect()).expect("connect encoding");
+    let _ = client.reader.get_mut().write_all(&connect).await;
+    assert!(client.read_optional().await.is_none());
+    assert_eq!(channel.registry.len(), 0);
+}
+
+#[tokio::test]
 #[tracing_test::traced_test]
 async fn non_connect_first_frame_closes_without_logging_payload() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -567,12 +587,21 @@ async fn respond_to_stalled_reader_returns_immediately() {
     let path = temp.path().join("repl.sock");
     let limits = ReplLimits {
         outbound_queue_frames: 2,
-        outbound_queue_bytes: 1024,
+        outbound_queue_bytes: 64 * 1024,
         ..fast_limits()
     };
     let channel = test_channel(&path, 2).with_limits(limits);
     let _stream = start(&channel).await;
     let (_client, session) = TestClient::handshake(&path).await;
+    let started = Instant::now();
+    channel
+        .respond(
+            &incoming(&session, "hello"),
+            OutgoingResponse::text("x".repeat(4096)),
+        )
+        .await
+        .expect("first response should enter the bounded queue");
+    assert!(started.elapsed() < Duration::from_millis(50));
     for _ in 0..8 {
         let started = Instant::now();
         let _ = channel
