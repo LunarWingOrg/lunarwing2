@@ -296,6 +296,14 @@ class WorkerSourceProvenanceTests(unittest.TestCase):
             with self.subTest(needle=needle):
                 self.assertIn(needle, build_lib)
 
+    def test_default_release_ref_is_operator_controlled(self):
+        build_lib = (ROOT / "ic/scripts/mt-admin-lib/05-tenant-build.sh").read_text(encoding="utf-8")
+        self.assertIn('requested="$(_default_operator_worker_release_ref)"', build_lib)
+        self.assertIn('git -C "$LUNARWING_ROOT" symbolic-ref --quiet HEAD', build_lib)
+        self.assertIn('git -C "$LUNARWING_ROOT" rev-parse --verify HEAD', build_lib)
+        self.assertNotIn('_worker_source_git "$source_root" symbolic-ref', build_lib)
+        self.assertGreaterEqual(build_lib.count('[[ "$BASHPID" == "$$"'), 3)
+
     def test_upgrade_paths_forward_the_release_ref(self):
         lifecycle = (ROOT / "ic/scripts/mt-admin-lib/04-tenant-lifecycle.sh").read_text(encoding="utf-8")
         wrapper = (ROOT / "ic/scripts/upgrade-tenant.sh").read_text(encoding="utf-8")
