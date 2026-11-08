@@ -2,9 +2,7 @@
 
 ## Codename: Kaitei (海底, かいてい) — The Seabed
 
-**Status:** First draft — 2026-11-08
-
-**Release Date:** TBD
+**Release Date:** 2026-11-08
 
 > Below the last wave,<br>
 > old currents settle in sand;<br>
@@ -12,7 +10,7 @@
 
 *The surface moves. The seabed carries it.*
 
-Umioto listened to the sea. **Kaitei strengthens the ground beneath it.** This release concentrates on reliable model responses, trusted worker builds, deeper credential redaction, and quieter, more useful host monitoring. The daemon's local REPL gains a versioned socket foundation while service installation and dependency maintenance reinforce the layers below.
+Umioto listened to the sea. **Kaitei strengthens the water beneath it.** This release concentrates on reliable model responses, trusted worker builds, deeper credential redaction, and quieter, more useful host monitoring. The daemon's local REPL gains a versioned socket foundation while service installation and dependency maintenance reinforce the layers below.
 
 ## Highlights
 
@@ -59,7 +57,6 @@ Registry bumps require rebuilt WASM artifacts. The [November 7 cargo-deny audit]
 
 - **Harness redaction remains bounded, best-effort handling.** Offset/grouped dumps, other encodings, arbitrary fragments and unmarked cuts are not comprehensively covered. The required runtime-equipped lane for combined secrets/write-back coverage remains outstanding; see the [capability boundaries](docs/architecture/HARNESS_WORKER_CAPABILITIES.md#explicitly-out-of-scope-follow-ups). External-worker isolation retains its existing per-task-container authority boundary.
 - **Socket and channel follow-ups remain.** Wingtip's socket transport/reconnect suite belongs to M4. A missing or replaced daemon socket is logged without automatic rebind. Multica's host-side pre-start validation and accurate external startup-status reporting remain separate WI#314 work.
-- **Engine V2 steer provenance is still pending (WI#583).** Steer instructions reach the running conversation but are not yet included as user input in conversation-insight capture.
 - **Secret-scan coverage is explicit (WI#575).** The vendor pass disables the generic API-key, PKCS#12 and private-key rules and pins remaining known fixtures by exact fingerprint. Historical scanning remains observational while findings are triaged and credentials remediated; a green current-tree scan is not a clean-history claim. See the [CI scanning policy](.gitlab/README.md).
 
 ---
