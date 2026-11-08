@@ -260,7 +260,7 @@ while True:
 
     def test_cli_background_wait_is_bounded_and_cancelled(self) -> None:
         started = time.monotonic()
-        result = self.run_cli("25")
+        result = self.run_cli("2000")
         self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
         self.assertLess(time.monotonic() - started, 10)
         events = [

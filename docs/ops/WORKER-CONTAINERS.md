@@ -1805,7 +1805,7 @@ case block moved together. Bun 1.4.4, Node 22.23.4, and
   `opencode run`. The optional `--mode cli` entrypoint does, so it now applies
   `OPENCODE_RUN_TIMEOUT_MS` (default 3600000) through GNU `timeout
   --preserve-status -k 5s`. A real-entrypoint regression emits the upstream
-  NDJSON shape and proves a 25 ms deadline reaches the CLI's SIGTERM handler
+  NDJSON shape and proves a 2000 ms deadline reaches the CLI's SIGTERM handler
   with exit 143 instead of waiting forever; zero, negative, fractional, and
   non-numeric deadlines are refused. The hub credential remains stripped.
 - upstream tests under pinned Bun 1.4.4: noninteractive **22/22** (including
