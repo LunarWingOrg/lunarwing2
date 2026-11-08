@@ -124,6 +124,23 @@ of tenant provisioning (unless `--no-health` is passed). This function:
    be integers from 1 to 59; invalid values abort installation and name their
    source.
 
+   **Container healthchecks are separate.** On systemd hosts, Podman runs each
+   tenant container's `HealthCmd` from its own systemd timer, and every run is
+   a full `podman healthcheck run` process. Postgres, LunarVision, LunarVoice,
+   and the worker bridge and task containers all use one cadence, 60 seconds by
+   default (10 seconds for Postgres and 15 for the others before 2026-11-08;
+   dozens of containers on that cadence caused host-wide CPU bursts). Set
+   `LUNARWING_MT_CONTAINER_HEALTH_INTERVAL_SEC=N` in the same file, as a plain
+   `NAME=value` line, to change it. The same-named environment variable takes
+   precedence for one run. Values must be integers from 10 to 3600; invalid
+   values stop mt-admin before any unit is written. The health pipeline only
+   escalates `unhealthy`, so a longer cadence delays detection by roughly
+   three intervals (three retries) and nothing else. Containers whose Quadlet
+   is hashed (LunarVision, LunarVoice, workers) are recreated with the new
+   cadence on the next `start-tenant` or `upgrade-tenant`; Postgres picks it up
+   on its next restart. OpenRC hosts disable Podman's timer healthchecks
+   entirely, so the setting does not apply there.
+
 Because the pipeline is host-global and auto-discovers tenants, scheduling is
 idempotent. Subsequent `add-tenant` calls re-run `ensure_health_pipeline()`.
 `enable-health-fleet.sh` is the explicit fleet installation path.

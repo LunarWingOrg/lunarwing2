@@ -206,6 +206,12 @@ OPENRC_INITD_DIR="$ROOT/init.d"
 CONTAINER_RT=true
 mkdir -p "$OPENRC_INITD_DIR"
 ports_set_voice alpha true
+# Resolve the container health cadence from a scratch health.env, never the host's.
+# shellcheck disable=SC2034  # Consumed by sourced mt-admin functions.
+HEALTH_ENV_FILE="$ROOT/health.env"
+unset LUNARWING_MT_CONTAINER_HEALTH_INTERVAL_SEC
+# shellcheck disable=SC2034  # Consumed by sourced mt-admin functions.
+CONTAINER_HEALTH_INTERVAL_SEC=""
 # Imported above, then replaced with a call-recording mock later in this test.
 # shellcheck disable=SC2218
 render_voice_quadlet alpha
@@ -256,6 +262,7 @@ fi
 quadlet="$ROOT/quadlets/lunarwing-voice-alpha.container"
 assert_eq "$(grep -c '^HealthCmd=curl -sf http://127.0.0.1:8091/health && curl -sf http://127.0.0.1:8091/ready || exit 1$' "$quadlet")" 1 "quadlet health-checks liveness and readiness"
 assert_eq "$(grep -c '^PodmanArgs=--security-opt=no-new-privileges$' "$quadlet")" 1 "quadlet sets no-new-privileges"
+assert_eq "$(grep -c '^HealthInterval=60s$' "$quadlet")" 1 "quadlet uses the 60s default container health cadence"
 assert_eq "$(grep -c '^PublishPort=127.0.0.1:40000:8090$' "$quadlet")" 1 "quadlet publishes API port on loopback"
 assert_eq "$(grep -c '^PublishPort=127.0.0.1:40001:8091$' "$quadlet")" 1 "quadlet publishes health port on loopback"
 assert_eq "$(grep -c "^Volume=${VOICE_MODELS_DIR}:/models:ro\$" "$quadlet")" 1 "quadlet mounts model store read-only"

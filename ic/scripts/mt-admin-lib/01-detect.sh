@@ -43,15 +43,53 @@ detect_init_system() {
   die "could not detect a supported service manager; set LUNARWING_SERVICE_MANAGER=systemd or openrc"
 }
 
-_persisted_health_interval() {
+_persisted_health_setting() {  # <key> -> last KEY=value in health.env, or nothing
+  local key="$1"
   [[ -r "$HEALTH_ENV_FILE" ]] || return 0
-  awk -F= '
-    $1 == "LUNARWING_MT_HEALTH_INTERVAL_MIN" {
+  awk -F= -v key="$key" '
+    $1 == key {
       sub(/^[^=]*=/, "")
       value = $0
     }
     END { if (value != "") print value }
   ' "$HEALTH_ENV_FILE" 2>/dev/null || true
+}
+
+_persisted_health_interval() {
+  _persisted_health_setting LUNARWING_MT_HEALTH_INTERVAL_MIN
+}
+
+# Podman runs every container healthcheck from its own systemd timer, and each
+# run is a full `podman healthcheck run` process. Dozens of tenant containers on
+# a 10-15 s cadence caused host-wide CPU bursts, so the default is 60 s. Same
+# precedence as the pipeline cadence: environment, then health.env, then default.
+CONTAINER_HEALTH_INTERVAL_SEC=""
+CONTAINER_HEALTH_INTERVAL_SOURCE=""
+_resolve_container_health_interval() {
+  local value origin
+  if [[ -n "${LUNARWING_MT_CONTAINER_HEALTH_INTERVAL_SEC:-}" ]]; then
+    value="$LUNARWING_MT_CONTAINER_HEALTH_INTERVAL_SEC"
+    origin="environment (LUNARWING_MT_CONTAINER_HEALTH_INTERVAL_SEC)"
+  else
+    value="$(_persisted_health_setting LUNARWING_MT_CONTAINER_HEALTH_INTERVAL_SEC)"
+    if [[ -n "$value" ]]; then
+      origin="$HEALTH_ENV_FILE"
+    else
+      value=60
+      origin="default"
+    fi
+  fi
+  if [[ ! "$value" =~ ^[1-9][0-9]{0,3}$ ]] || (( value < 10 || value > 3600 )); then
+    die "invalid LUNARWING_MT_CONTAINER_HEALTH_INTERVAL_SEC from $origin: '$value' (expected an integer from 10 to 3600)"
+  fi
+  CONTAINER_HEALTH_INTERVAL_SEC="$value"
+  CONTAINER_HEALTH_INTERVAL_SOURCE="$origin"
+}
+
+# Renderers call this directly (never inside a command substitution) so an
+# invalid value stops mt-admin before any unit is written.
+_ensure_container_health_interval() {
+  [[ -n "$CONTAINER_HEALTH_INTERVAL_SEC" ]] || _resolve_container_health_interval
 }
 
 HEALTH_INTERVAL_SOURCE=""
@@ -86,6 +124,7 @@ ensure_init_system() {
     [[ -n "$INIT_SYSTEM" ]] || return 1
   fi
   _resolve_health_interval
+  _resolve_container_health_interval
 }
 
 # Machine-wide persisted runtime choice (see _save_container_runtime). One

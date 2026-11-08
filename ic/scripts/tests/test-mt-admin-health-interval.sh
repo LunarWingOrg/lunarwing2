@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MT_ADMIN="$SCRIPT_DIR/../lunarwing-mt-admin.sh"
-unset LUNARWING_MT_HEALTH_INTERVAL_MIN
+unset LUNARWING_MT_HEALTH_INTERVAL_MIN LUNARWING_MT_CONTAINER_HEALTH_INTERVAL_SEC
 # shellcheck source=../lunarwing-mt-admin.sh
 source "$MT_ADMIN"
 
@@ -167,6 +167,53 @@ assert_invalid_interval "quoted persisted interval" '"15"' "file"
 assert_invalid_interval "zero persisted interval" "0" "file"
 assert_invalid_interval "non-numeric environment interval" "often" "environment"
 assert_invalid_interval "above-range environment interval" "60" "environment"
+
+# ── Podman container healthcheck cadence ──────────────────────────────────────
+# Podman runs each container healthcheck from its own systemd timer as a full
+# `podman healthcheck run` process, so the default is 60 s (it was 10-15 s).
+container_interval() {  # [env value] -> "<sec>|<source>|rc=<status>" or the error
+  local env_value="${1:-}" output="" status=0
+  # shellcheck disable=SC2016  # literal script receives its expansions as bash -c arguments
+  output="$(LUNARWING_MT_CONTAINER_HEALTH_INTERVAL_SEC="$env_value" bash -c '
+    source "$1"
+    HEALTH_ENV_FILE="$2"
+    INIT_SYSTEM="systemd"
+    ensure_init_system
+    printf "%s|%s" "$CONTAINER_HEALTH_INTERVAL_SEC" "$CONTAINER_HEALTH_INTERVAL_SOURCE"
+  ' _ "$MT_ADMIN" "$HEALTH_ENV_FILE" 2>&1)" || status=$?
+  printf '%s|rc=%s' "$output" "$status"
+}
+
+container_error() {  # <value> <source> -> the expected die message
+  printf "error: invalid LUNARWING_MT_CONTAINER_HEALTH_INTERVAL_SEC from %s: '%s' (expected an integer from 10 to 3600)|rc=1" "$2" "$1"
+}
+
+env_source="environment (LUNARWING_MT_CONTAINER_HEALTH_INTERVAL_SEC)"
+printf 'LUNARWING_MT_HEALTH_INTERVAL_MIN=15\n' >"$HEALTH_ENV_FILE"
+assert_eq "container interval defaults to 60s" "60|default|rc=0" "$(container_interval)"
+
+printf 'LUNARWING_MT_HEALTH_INTERVAL_MIN=15\n#LUNARWING_MT_CONTAINER_HEALTH_INTERVAL_SEC=30\n' >"$HEALTH_ENV_FILE"
+assert_eq "commented container interval is ignored" "60|default|rc=0" "$(container_interval)"
+
+printf 'LUNARWING_MT_HEALTH_INTERVAL_MIN=15\nLUNARWING_MT_CONTAINER_HEALTH_INTERVAL_SEC=120\n' >"$HEALTH_ENV_FILE"
+assert_eq "persisted container interval names its source" "120|$HEALTH_ENV_FILE|rc=0" "$(container_interval)"
+assert_eq "environment overrides persisted container interval" "45|$env_source|rc=0" "$(container_interval 45)"
+assert_eq "environment override does not rewrite health.env" "120" \
+  "$(_persisted_health_setting LUNARWING_MT_CONTAINER_HEALTH_INTERVAL_SEC)"
+assert_eq "previous 15s cadence stays selectable" "15|$env_source|rc=0" "$(container_interval 15)"
+assert_eq "container interval upper bound accepted" "3600|$env_source|rc=0" "$(container_interval 3600)"
+
+assert_eq "container interval below 10s refused" "$(container_error 9 "$env_source")" "$(container_interval 9)"
+assert_eq "container interval above 3600s refused" "$(container_error 3601 "$env_source")" "$(container_interval 3601)"
+assert_eq "container interval with a unit suffix refused" "$(container_error 60s "$env_source")" "$(container_interval 60s)"
+assert_eq "container interval with a leading zero refused" "$(container_error 0060 "$env_source")" "$(container_interval 0060)"
+printf 'LUNARWING_MT_HEALTH_INTERVAL_MIN=15\nLUNARWING_MT_CONTAINER_HEALTH_INTERVAL_SEC="60"\n' >"$HEALTH_ENV_FILE"
+assert_eq "quoted persisted container interval refused" "$(container_error '"60"' "$HEALTH_ENV_FILE")" "$(container_interval)"
+
+# The health.env template documents the knob without pinning it.
+template_text="$(declare -f ensure_health_pipeline)"
+assert_eq "health.env template documents the container interval" "1" \
+  "$(grep -cF '#LUNARWING_MT_CONTAINER_HEALTH_INTERVAL_SEC=60' <<<"$template_text")"
 
 if [[ "$failures" -ne 0 ]]; then
   printf 'RESULT: %d failure(s)\n' "$failures"

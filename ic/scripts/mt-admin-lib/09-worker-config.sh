@@ -173,7 +173,8 @@ start_worker_task_container() {
   task_uid="$(worker_task_uid "$worker")"
   task_gid="$task_uid"
   health_command="$(worker_task_health_command "$worker" "$name")" || return 1
-  health_args=(--health-cmd "$health_command" --health-interval 15s --health-timeout 3s --health-retries 3)
+  _ensure_container_health_interval || return 1
+  health_args=(--health-cmd "$health_command" --health-interval "${CONTAINER_HEALTH_INTERVAL_SEC}s" --health-timeout 3s --health-retries 3)
   if _openrc_podman_uses_init_health; then
     health_args=(--no-healthcheck)
   fi
