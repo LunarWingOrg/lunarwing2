@@ -1,0 +1,13 @@
+title = "LunarWing vendor high-confidence secret scan"
+
+# Keep the default rules except for three fixture-heavy matchers that produced
+# 2,437 findings in pinned third-party test keys, certificates, and examples.
+# All remaining findings require review; known fixtures use exact fingerprints
+# in /.gitleaksignore rather than path allowlists.
+[extend]
+useDefault = true
+disabledRules = [
+  "generic-api-key",
+  "pkcs12-file",
+  "private-key",
+]
