@@ -122,7 +122,7 @@
 
 ## Phase 7 - Advanced Operator Notes
 
-22. [x] (H) update rel notes
+22. [x] (H) update rel notes write actual prompt for this later
 23. [x] (S) Deploy the stoplight system
 24. [x] (S) Dive back in to LunarDepth and open worker lanes across the fleet for it get it running and up again patches too
 
