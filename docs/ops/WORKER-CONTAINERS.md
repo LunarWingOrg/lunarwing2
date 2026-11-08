@@ -29,8 +29,9 @@ At the OpenCode v1.18.25 / v2.1.2 pins, Bun 1.4.4 rejected the upstream
 photon-node patch's hunk-10 context whitespace, and each builder ran
 `python3 /build/fix_photon_patch_context.py /build/opencode` immediately after
 checkout and before `bun install --frozen-lockfile`, backporting upstream
-`61845b0`'s three-space repair. **That repair is retired as of the v1.19.5 /
-v2.2.5 pins (WI#531):** both trees carry the repair in content (a
+`61845b0`'s three-space repair. **That repair has been retired since the
+v1.19.5 / v2.2.5 pins (WI#531), including the current v2.2.6 pin (WI#582):**
+both trees carry the repair in content (a
 content-equivalent backport — neither tag contains the commit itself, so do
 not test it with `merge-base --is-ancestor`), so the fixer's exact-match
 guard reports the repair as redundant. The fixer files, their
@@ -732,8 +733,8 @@ plus `opencode service set remote true` and `opencode pair` surfaces. !1490
 completed analysis and approval to cross that boundary at v2.0.32**, through
 the existing compile-out, wrapper, config and image assertions. See the
 v2.0.32 bump entry below for the source review and verification status; the
-lane has since advanced to **v2.2.5** (2026-11-02, WI#531) with every gate
-re-verified against a fresh clone — see the v2.2.5 bump entry.
+lane has since advanced to **v2.2.6** (2026-11-08, WI#582) with every gate
+re-verified against a fresh clone — see the v2.2.6 bump entry.
 
 **Gate record for !1490 (run-79 EI-2):** the in-image layers below (ruleset,
 wrapper, config pins, compile-out) are **naive-use guards, not a boundary**
@@ -1003,14 +1004,15 @@ Enforced controls (opencode2 lane unless noted):
    nondeterminism. Items 28 and 95 stay unchecked until that evidence exists.
    **WI#369 typecheck compiler:** the gate runs whatever `@typescript/native`
    the upstream lock pins. Check its version on every bump: v2.2.5 moved it
-   from `npm:typescript@7.0.2` to a `7.1.0-beta`; a beta compiler in a build
-   gate is acceptable only while it is upstream's own pinned devDependency,
-   resolved through the committed lock, and still exposes `tsc` at `bin/tsc`.
+   from `npm:typescript@7.0.2` to a `7.1.0-beta`, and v2.2.6 retains that
+   version; a beta compiler in a build gate is acceptable only while it is
+   upstream's own pinned devDependency, resolved through the committed lock,
+   and still exposes `tsc` at `bin/tsc`.
    Record the version and the binary path in the bump entry.
 8. **Compile the tunnel out.** `scripts/compile_out_remote_tunnel.py` runs
    in the builder stage: the historical v2.0.24 path verifies there is no
-   tunnel surface; at the current v2.2.5 pin it replaces `remote-tunnel.ts`
-   with a fail-closed stub (re-verified against the real v2.2.5 tree:
+   tunnel surface; at the current v2.2.6 pin it replaces `remote-tunnel.ts`
+   with a fail-closed stub (re-verified against the real v2.2.6 tree:
    importers still use exactly
    `run`/`ensure`/`hostname`). Drift detection scans
    `packages/{cli,server,schema,core}/src` (`*.ts` and `*.tsx`), matches
@@ -1239,8 +1241,8 @@ stack settles. Do not configure both lanes on the same
 tenant during the transition (agent routing confusion — plan §5).
 
 **Dockerfile:** `opencode2.4lunarwing/Dockerfile` — pinned to
-**v2.2.5** at reviewed full commit
-`9bbb8ce18c80f099e0e448775f59d965ead40a21` (WI#531; WI#427 boundary crossing
+**v2.2.6** at reviewed full commit
+`dc2ffcf8bf26f9e669b6aa22b95f50e12be15e06` (WI#582; WI#427 boundary crossing
 first crossed at v2.0.32/`843a6c514e606b436a7fe713422ace0a93ad3d61`); the v2 bridge uses
 `@opencode/client` (promise API) instead of `@opencode-ai/sdk`, and the
 v2 config file is `config/opencode2.json` (`providers` map,
@@ -1759,6 +1761,109 @@ CLI credential records from OAuth tokens to external credentials. An image
 downgrade alone is not a verified database rollback; restore the matching
 pre-upgrade state with the prior image if rollback is needed.
 
+### v2.2.6 bump — WI#582, goal 24 re-attempt (2026-11-08)
+
+**Review reconciliation and pins:** this re-attempt combines approved !2277
+with !2274's unique CLI-mode bound, resolving the XN-2 overlap without dropping
+either regression path. XN-1 stays fixed by the reviewed 2000 ms CLI test
+budget. The WI#427 OpenTunnel boundary controls were re-run against fresh
+upstream artifacts. `npm view @moonshot-ai/kimi-code dist-tags` still names
+**2.5.2** as `latest` (the 2.6.0 canary is not stable), and `git ls-remote`
+resolves lightweight v2.2.6 directly to
+`dc2ffcf8bf26f9e669b6aa22b95f50e12be15e06`. The fresh clone's HEAD matches.
+Dockerfile defaults, CI case blocks, the Kimi manifest and its lock moved
+together. Regenerating the lock with
+`npm install --package-lock-only --save-exact --ignore-scripts` produced no
+drift from the reviewed pin: the tarball is
+`https://registry.npmjs.org/@moonshot-ai/kimi-code/-/kimi-code-2.5.2.tgz` with
+integrity `sha512-a7UuugqQuPBHB2ZMiu8ezAFIwJ0dn6xanuRnTqa2pXXu12ng7kvigAlXy47TxNKpnyj8vgaNStedTv4kbqSCuA==`.
+Node/Bun base digests and `DEBIAN_SNAPSHOT=20261105T082236Z` are unchanged.
+
+**Kimi 2.5.2 verification:**
+
+- The removed server APIs are outside this subprocess lane: it uses print mode,
+  not WebSocket subscription/replay, snapshots, REST task/status endpoints, or
+  transcript `meta`/`todos`. The four real 2.5.2 contract cases pass in the
+  pinned Node 22 environment: headless `-p --output-format stream-json`,
+  `--yolo` rejection, baked PreToolUse hook acceptance, and MCP NDJSON
+  initialize/tools-list with parent-env pass-through. Print-mode meta events
+  retain `system.version` and `turn.step.retrying`.
+- Creation-time SSH/Docker/custom-command environments stay unselected: the
+  WI#582 argv regression pins exactly `-p <prompt> --output-format stream-json`
+  with no `--environment`/`--environment-cwd`. The generated config does not
+  set `[workspace] require_trust = false`, and the existing trust-env scrub
+  remains. The lane neither enables nor relies on the default-off global
+  full-text index. `chokidar`, `qrcode`, `ws`, and `engines.node >=22.19.0`
+  remain unchanged.
+- This re-attempt built local image `b5c9ca168e9a…` with the locked CLI. Its
+  full in-image suite finished **183 pass / 3 expected root-only skips / 0
+  fail**. The image reports `kimi --version` = **2.5.2**, `/health` carries
+  `"kimi_code_version": "2.5.2"` through `KIMI_CODE_IMAGE_VERSION`, and the
+  started bridge reaches `/ready` = true. This is a local candidate, not the
+  protected CI candidate/rebuild pair.
+
+**Gate re-verification on the fresh v2.2.6 clone and binary:**
+
+- compile-out: `packages/cli/src/services/remote-tunnel.ts` keeps its path and
+  exact `run`/`ensure`/`hostname` importer surface. After stubbing, no scanned
+  source under `packages/{cli,server,schema,core}/src` retains an
+  `@opentunnel` specifier; `@opentunnel/client` remains declared but
+  unimported. This re-attempt built the patched binary, verified `opencode
+  --version` = **opencode v2.2.6**, and passed the real no-OpenTunnel marker
+  scan and lane exposure assertions. The every-token wrapper forwards
+  `--version` and refuses `service set remote true`, remote pairing, and
+  non-loopback serving with exit 77. The earlier !2277 local image
+  (`fc8839ef053d…`) also passed the started-entrypoint runtime smoke **5/5**;
+  this re-attempt did not repeat a full OpenCode2 image build.
+- reproducible build: `packages/cli/script/build.ts` retains `--single` and
+  exactly one `bytecode: true` and `splitting: true` anchor;
+  `prepare_reproducible_build.py` exits 0 and the patched build succeeds. Bun
+  1.4.4 and the content-equivalent photon whitespace repair remain unchanged,
+  so the retired fixer stays removed.
+- SDK surface: the real client has all 6 bridge methods
+  (`session.create/prompt/interrupt`, `permission.reply`, `event.subscribe`,
+  top-level `message.list`), both known-stale paths remain absent, and all 8
+  bridge event names are in the generated `V2Event` union. The union has 97
+  literal members plus the `V2EventRpc` dynamic family. The builder-shaped
+  `@typescript/native` (`npm:typescript@7.1.0-beta`, binary `bin/tsc`)
+  typecheck and the real-client assertion both exit 0.
+- background waits: upstream's `background_wait` is CLI JSON stdout NDJSON,
+  not a serve `V2Event`, so it is deliberately absent from
+  `BRIDGE_SDK_EVENTS`. The serve regression injects its shape behind a pending
+  prompt and proves `timed_out` after 10 ms with one `session.interrupt`. The
+  optional CLI `run` path now uses `OPENCODE_RUN_TIMEOUT_MS` (default 3600000)
+  through GNU `timeout --preserve-status -k 5s`, preserving the WI#373
+  credential scrub. Its real-entrypoint regression emits the upstream NDJSON
+  shape and proves the 2000 ms deadline reaches SIGTERM with exit 143; zero,
+  negative, fractional, and non-numeric deadlines are refused.
+- new opt-ins stay off: `OPENCODE_FLAGS` is unset; no MCP `pool: true`,
+  `experimental.all_flags`, `experimental.codemode_vm`, or `websearch.use`
+  entry is present. Download-oriented file/media responses do not intersect
+  the bridge's six-method SDK surface. `session_move` now authorizes external
+  destinations; `session_rename` remains unguarded, so both explicit deny rules
+  stay. No new share, relay, pairing, or public-listener surface was found.
+- upstream suites under pinned Bun 1.4.4: noninteractive **22/22** (including
+  background-job cancellation), file/media downloads **7/7**, and CLI/core flag
+  suites **26/26** pass. Lane executor, SDK, result, path, proxy, plugin,
+  bridge, and task-runner suites pass. Python suites pass: compile-out
+  **10/10**, reproducible-build **3/3**, exposure policy **68/68**, image
+  config **11/11**, entrypoint config **11/11**, runtime smoke **50/50**, and
+  study-notes config **8/8**. `check-worker-exposure-policy.sh` passes both
+  OpenCode lanes.
+- repository gates: `.gitlab/tests/test_goal1_ci.py` **283/283**,
+  `test_worker_build_args.py` **16/16**, both Kimi and OpenCode2 mt-admin
+  harnesses, CI validation **8 YAML**, Python syntax **148 files**, shell
+  syntax **283 scripts + three hooks**, repository ShellCheck, and
+  `git diff --check` pass. Executable fixtures used short executable temp
+  directories because this host mounts `/tmp` `noexec` and Unix socket paths
+  are length-bounded.
+
+**Protected and rollout gates not performed locally:** protected
+`worker-{kimi,opencode2}-candidate` and scan jobs, OpenCode2 exposure verify,
+the candidate-vs-uncached-clean-rebuild digest comparisons, and a green
+post-merge master pipeline remain CI requirements. No tenant rollout or
+live-model daemon-dispatched job was performed.
+
 ### v2.2.5 bump — WI#531, item 30 (2026-11-02)
 
 **Authorization:** the WI#427 boundary crossing (OpenTunnel compile-out,
@@ -2078,29 +2183,16 @@ optional for OAuth-backed setups. mt-admin keeps both credentials out of process
 arguments by materializing private `kimi-runtime.env`; API key input uses file
 path rather than plaintext argv. The Kimi Code CLI and bridge are installed
 with `npm ci` from committed integrity locks. `KIMI_CODE_VERSION` defaults to
-`2.3.0` and must match `kimi-cli/package-lock.json` (the pin moved `0.42.0` →
-`0.43.0` → `0.43.1` → `2.0.2` earlier in the v2.1.2.0/v2.1.3.0 cycle, then
-`2.0.2` → `2.1.1` on 2026-09-26 for checklist item #2, adopting npm `latest`
-again, `2.1.1` → `2.2.0` on 2026-10-15 for the v2.1.6.0 checklist item #4,
-and `2.2.0` → `2.3.0` on 2026-10-21 for the v2.1.6.0 checklist item #83,
-again npm `latest`; engine requirement unchanged at `node >=22.19.0`, satisfied by the
-pinned node 22 base; the 2.x behavior changes the worker cares about are the
-headless permission-contract findings below, verified on 2.0.x — the 2.3.0
-live CLI contract gate (`kimi_cli_contract_test.ts`) runs during the worker
-Dockerfile build; the 2.3.0 real-binary lane was additionally run on the
-host (4/4: headless `-p --output-format stream-json` accepted, `--yolo`
-rejected alongside `-p`, the baked `[[hooks]]` PreToolUse guard table
-valid, and the `mcp.json` spawn + `initialize` → `tools/list` MCP
-handshake), so the in-image gate is a re-confirmation of verified
-behavior. 2.3.0's new env surface is
-`KIMI_CODE_MODEL_MIGRATION_STATE_FILE_NAME` and
-`KIMI_CODE_SESSION_RATING_PREVIEW` (survey state renamed); neither is
-exported by the worker). **Blocked at the pin's landing (the !1831
-review's MG-1):** the protected `worker-kimi-candidate` build is blocked by
-the instance's `throttle_unauthenticated_web` rate limit (the !1828
-review's MD-1), so no image has been built from the 2.3.0 pin yet —
-tenants keep their current 2.2.0 images until the limit is lifted and
-the candidate build runs.
+`2.5.2` and must match `kimi-cli/package-lock.json`. WI#582 moved the pin from
+2.4.1 on 2026-11-08; the engine requirement remains `node >=22.19.0`, satisfied
+by the pinned Node 22 base. The worker uses only headless
+`kimi -p --output-format stream-json`, not the server APIs removed in 2.5.0.
+The real-CLI contract gate (`kimi_cli_contract_test.ts`) runs during the image
+build and covers headless invocation, `--yolo` rejection, PreToolUse guard
+configuration, and the MCP handshake. The new creation-time environment flags
+and workspace trust bypass stay off, and the lane does not use the optional
+global-search index; see the WI#582 bump entry for the source audit and
+verification trail.
 An override without a matching reviewed lock fails closed. The pinned version is baked
 into `KIMI_CODE_IMAGE_VERSION` and reported as `kimi_code_version`, and
 `ic/scripts/tests/test-mt-admin-kimi.sh` cross-checks Dockerfile default, CI

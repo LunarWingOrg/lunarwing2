@@ -261,11 +261,19 @@ trap cleanup EXIT INT TERM
 case "$MODE" in
 
   cli)
-    log "Mode: CLI — running opencode with args: $*"
+    run_timeout_ms="${OPENCODE_RUN_TIMEOUT_MS:-3600000}"
+    [[ "$run_timeout_ms" =~ ^[1-9][0-9]*$ ]] \
+      || die "OPENCODE_RUN_TIMEOUT_MS must be a positive integer (milliseconds)"
+    printf -v run_timeout_seconds '%d.%03d' \
+      "$((run_timeout_ms / 1000))" "$((run_timeout_ms % 1000))"
+    log "Mode: CLI — running opencode with args: $* (timeout ${run_timeout_ms}ms)"
     cd "$WORKSPACE_ROOT"
     # WI#373: the prompt runs untrusted agent code — never inherit the
-    # bridge's hub-handshake credential.
-    exec env -u AGENT_AUTH_TOKEN "$OPENCODE_BIN" run "$@"
+    # bridge's hub-handshake credential. WI#582: upstream `run` can wait for
+    # background jobs forever; bound it while preserving SIGTERM cancellation
+    # (and upstream's exit 143) so the jobs are interrupted, not orphaned.
+    exec env -u AGENT_AUTH_TOKEN timeout --preserve-status -k 5s \
+      "$run_timeout_seconds" "$OPENCODE_BIN" run "$@"
     ;;
 
   acp)

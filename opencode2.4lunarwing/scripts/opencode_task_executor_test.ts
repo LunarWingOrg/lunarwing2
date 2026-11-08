@@ -718,6 +718,32 @@ const promptHangResult = await runTask(promptHang.sdk, {
 assert.equal(promptHangResult.status, "timed_out")
 assert.equal(promptHang.interruptCount(), 1)
 
+// WI#582: v2.2.6's noninteractive run can wait forever for background jobs.
+// The serve bridge does not subscribe to this CLI-only event as a V2Event,
+// but an unknown event with the same shape must not settle or wedge the task:
+// the task deadline still fires and session interruption remains bounded.
+const backgroundWait = makeSdk({
+  events: [
+    {
+      type: "background_wait",
+      data: {
+        sessionID: "session-1",
+        jobs: [{ id: "job-1", kind: "shell", title: "dev server" }],
+      },
+    },
+  ],
+  pendingAfterEvents: true,
+  pendingPrompt: true,
+})
+const backgroundWaitResult = await runTask(backgroundWait.sdk, {
+  task_id: "task-background-wait",
+  prompt: "test",
+  timeout_ms: 10,
+})
+assert.equal(backgroundWaitResult.status, "timed_out")
+assert.equal(backgroundWaitResult.error, "Task timed out after 10ms")
+assert.equal(backgroundWait.interruptCount(), 1)
+
 const permissionHang = makeSdk({
   pendingPermissionReply: true,
   events: [
@@ -901,11 +927,10 @@ assert.ok(contextPromptArgs[1].signal instanceof AbortSignal)
 }
 
 // !1746 review KL-1/KL-2: v2.0.32's built-in Code Mode session_move and
-// session_rename carry no permission check of their own
-// (packages/core/src/tool/plugin/opencode.ts). session_rename rewrites any
-// session title — the WI#324 task binding — and session_move re-roots the
-// session so the KG-2 external_directory confinement never fires. Both must
-// be wholly denied so they are dropped from the tool snapshot.
+// session_rename carried no permission check of their own. v2.2.6 adds an
+// external_directory check to session_move, but the lane keeps the stronger
+// explicit deny for both: move re-roots the session and rename rewrites the
+// WI#324 task-binding title. Both must be dropped from the tool snapshot.
 {
   const rulesetSdk = makeSdk({})
   await runTask(rulesetSdk.sdk)

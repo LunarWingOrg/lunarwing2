@@ -125,6 +125,7 @@ services:
     environment:
       <<: *worker-env
       OPENCODE_MODE: cli
+      OPENCODE_RUN_TIMEOUT_MS: ${OPENCODE_RUN_TIMEOUT_MS:-3600000}
     stdin_open: true
     tty: true
     restart: "no"

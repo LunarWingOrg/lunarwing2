@@ -135,6 +135,7 @@ run_check "health-netbird.sh" "netbird" > "$WORKDIR/check-netbird.tmp" 2> "$WORK
 run_check "health-runtime.sh" "runtime" > "$WORKDIR/check-runtime.tmp" 2> "$WORKDIR/log-runtime.tmp" &
 run_check "health-knowledge.sh" "knowledge" > "$WORKDIR/check-knowledge.tmp" 2> "$WORKDIR/log-knowledge.tmp" &
 run_check "health-worker-egress.sh" "worker_egress" > "$WORKDIR/check-worker-egress.tmp" 2> "$WORKDIR/log-worker-egress.tmp" &
+run_check "health-disk.sh" "disk" > "$WORKDIR/check-disk.tmp" 2> "$WORKDIR/log-disk.tmp" &
 case "$SERVICE_MANAGER" in
   systemd) run_check "health-systemd.sh" "systemd" > "$WORKDIR/check-svcmgr.tmp" 2> "$WORKDIR/log-svcmgr.tmp" & ;;
   openrc)  run_check "health-openrc.sh"  "openrc"  > "$WORKDIR/check-svcmgr.tmp" 2> "$WORKDIR/log-svcmgr.tmp" & ;;
@@ -146,7 +147,7 @@ esac
 wait || true
 
 # Append logs to main log file
-for comp in gateway xmpp omemo ratelimit clickhouse tensorzero models llm-streams lunarvision lunarvoice netbird runtime knowledge worker_egress svcmgr; do
+for comp in gateway xmpp omemo ratelimit clickhouse tensorzero models llm-streams lunarvision lunarvoice netbird runtime knowledge worker_egress disk svcmgr; do
     [ -f "$WORKDIR/log-${comp}.tmp" ] && cat "$WORKDIR/log-${comp}.tmp" >> "$LOG_FILE" && rm -f "$WORKDIR/log-${comp}.tmp"
 done
 
@@ -165,6 +166,7 @@ check_netbird=$(cat "$WORKDIR/check-netbird.tmp" 2>/dev/null || echo)
 check_runtime=$(cat "$WORKDIR/check-runtime.tmp" 2>/dev/null || echo)
 check_knowledge=$(cat "$WORKDIR/check-knowledge.tmp" 2>/dev/null || echo)
 check_worker_egress=$(cat "$WORKDIR/check-worker-egress.tmp" 2>/dev/null || echo)
+check_disk=$(cat "$WORKDIR/check-disk.tmp" 2>/dev/null || echo)
 check_svcmgr=$(cat "$WORKDIR/check-svcmgr.tmp" 2>/dev/null || echo)
 
 # Cleanup temp files (the WORKDIR itself is removed by the EXIT trap)
@@ -185,6 +187,7 @@ components=(
     "$check_runtime"
     "$check_knowledge"
     "${check_worker_egress:-}"
+    "${check_disk:-}"
     "${check_svcmgr:-}"
 )
 
@@ -226,7 +229,7 @@ for comp in "$check_gateway" "$check_xmpp" \
     "$check_clickhouse" "$check_tensorzero" \
     "$check_models" "$check_llm_streams" \
     "$check_lunarvision" "$check_lunarvoice" "$check_netbird" "$check_runtime" "$check_knowledge" \
-    "${check_worker_egress:-}" "${check_svcmgr:-}"; do
+    "${check_worker_egress:-}" "${check_disk:-}" "${check_svcmgr:-}"; do
     if [ -n "$comp" ] && echo "$comp" | jq . >/dev/null 2>&1; then
         if [ -n "$components_json" ]; then
             components_json="$components_json,$comp"

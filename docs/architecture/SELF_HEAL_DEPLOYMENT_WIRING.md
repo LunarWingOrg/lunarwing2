@@ -1,16 +1,18 @@
 # Infrastructure Self-Healing — Deployment & Provisioning Wiring
 
-**Created:** 2026-06-13. **Source revalidated:** 2026-11-01, v2.1.8.0.
+**Created:** 2026-06-13. **Source revalidated:** 2026-11-08, v2.1.9.0.
 **Status:** Reference — documents current behavior, not a proposal.
 **Related:** [health pipeline README](../../ic-infrastructure-health-check/README.md),
 [multi-tenant operations](../ops/MULTITENANCY-PRODUCTION.md),
+[disk health runbook](../ops/DISK_HEALTH_RUNBOOK.md),
 [historical chaos plan](../internal/history/proposals/CHAOS_ENGINEERING_TEST_PLAN.md).
 
 Current ownership: `ensure_health_pipeline`, `health_env_reconcile_line`, and
 `refresh_deployed_health_pipeline` in `ic/scripts/mt-admin-lib/12-health-pipeline.sh`;
 tenant provisioning/upgrade in `04-tenant-lifecycle.sh`; runtime egress policy in
 `15-worker-egress.sh`. WI#424 adds a monitor-only worker-egress healthpoint and
-refreshes already-installed host health assets during tenant upgrades. Init
+refreshes already-installed host health assets during tenant upgrades. WI#586
+adds monitor-only block/inode capacity healthpoints per filesystem. Init
 operations remain inside mt-admin and the dedicated health tooling; tenant
 systemd units use the tenant user manager, while the host health timer uses the
 system manager.
@@ -153,6 +155,17 @@ including when `SELF_HEAL_REMEDY_LOGICAL=false`. The pipeline does not repair
 firewall policy. Network creation, fail-closed launch checks, and policy repair
 belong to mt-admin's worker-egress module. See
 [worker operations](../ops/WORKER-CONTAINERS.md) for the audit and repair surface.
+
+Disk-capacity failures use monitor-only `disk@<mount>` escalation with the same
+MT behavior. `health-disk.sh` deduplicates watched paths by filesystem, checks
+both block and inode consumption, discovers tenant rootless stores from the
+registry's user/home mapping, and bounds every `df`/`stat` probe. It reports
+unreadable paths and probe timeouts as degraded rather than hiding them. The
+pipeline exports per-mount capacity gauges and **never deletes anything**;
+manual Podman/Docker pruning, stale Cargo target cleanup, and Buildah leftover
+triage are in the [disk health runbook](../ops/DISK_HEALTH_RUNBOOK.md). Default
+thresholds and `HEALTH_DISK_EXTRA_PATHS` are documented in the generated
+`health.env` template.
 
 ### Path 2: `install-lunarwing-watchdog.sh` (manual, complementary)
 

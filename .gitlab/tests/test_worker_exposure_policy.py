@@ -143,8 +143,12 @@ class WorkerExposurePolicyGuardTests(unittest.TestCase):
             # readlink: the lane entrypoints resolve their config alias with
             # `readlink -f` (WI#529 consumer (a)); the image has coreutils, so
             # the guard lane must model that, not a PATH without it (UL-5).
+            # sleep/env/timeout: the opencode2 CLI-mode entrypoint cases exec the
+            # full entrypoint (health-server settle, credential scrub, run
+            # deadline; WI#582), and all three are coreutils in the image too.
             for tool in ("bash", "sh", "python3", "grep", "dirname", "cp", "mkdir",
-                         "chmod", "rm", "ln", "date", "readlink"):
+                         "chmod", "rm", "ln", "date", "readlink", "sleep", "env",
+                         "timeout"):
                 target = shutil.which(tool)
                 if target is None:
                     raise AssertionError(f"required tool {tool!r} not found")

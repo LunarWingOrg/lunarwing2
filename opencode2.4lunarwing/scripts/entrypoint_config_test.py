@@ -14,6 +14,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import time
 import unittest
 
 
@@ -202,6 +203,83 @@ class EntrypointConfigTests(unittest.TestCase):
         self.assertEqual(config["share"], "disabled")
         self.assertNotIn("--allow-write", config["mcp"]["study_notes"]["command"])
         self.assertIn(str(study / "skills"), config["skills"]["paths"])
+
+    def prepare_cli(self, timeout_ms: str) -> tuple[Path, dict[str, str]]:
+        """Build the full entrypoint around a CLI stuck in background_wait."""
+        # The real health server is irrelevant here; exiting immediately keeps
+        # the one-shot CLI process as the only child this test must reap.
+        (self.app / "health_server.py").write_text("")
+        fake_cli = self.root / "fake-opencode.py"
+        fake_cli.write_text("""#!/usr/bin/env python3
+import json
+import os
+import signal
+import sys
+import time
+
+job = {"id": "sh_train", "kind": "shell", "title": "python train.py"}
+def emit(event_type, timestamp):
+    print(json.dumps({
+        "type": event_type,
+        "timestamp": timestamp,
+        "sessionID": "ses_1",
+        "jobs": [job],
+        "credential_present": "AGENT_AUTH_TOKEN" in os.environ,
+    }), flush=True)
+
+def cancelled(signum, frame):
+    emit("test_cancelled", 2)
+    sys.exit(143)
+
+signal.signal(signal.SIGTERM, cancelled)
+emit("background_wait", 1)
+while True:
+    time.sleep(60)
+""")
+        fake_cli.chmod(0o755)
+        entrypoint = (LANE / "entrypoint.sh").read_text()
+        entrypoint = entrypoint.replace("/app/", str(self.app) + "/")
+        entrypoint = entrypoint.replace("/home/opencode2/", str(self.home) + "/")
+        script = self.root / "entrypoint-under-test.sh"
+        script.write_text('test "$EUID" -ne 0 || exit 99\n' + entrypoint)
+        env = {
+            **self.env,
+            "AGENT_AUTH_TOKEN": "fixture-hub-credential",
+            "OPENCODE_MODE": "cli",
+            "OPENCODE_BIN": str(fake_cli),
+            "OPENCODE_RUN_TIMEOUT_MS": timeout_ms,
+        }
+        return script, env
+
+    def run_cli(self, timeout_ms: str) -> subprocess.CompletedProcess:
+        script, env = self.prepare_cli(timeout_ms)
+        return subprocess.run(
+            ["bash", str(script)], text=True, capture_output=True, timeout=15,
+            env=env, cwd=self.root, **self.identity,
+        )
+
+    def test_cli_background_wait_is_bounded_and_cancelled(self) -> None:
+        started = time.monotonic()
+        result = self.run_cli("2000")
+        self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
+        self.assertLess(time.monotonic() - started, 10)
+        events = [
+            json.loads(line) for line in result.stdout.splitlines()
+            if line.startswith("{")
+        ]
+        self.assertEqual(events[0]["type"], "background_wait")
+        self.assertEqual(events[0]["sessionID"], "ses_1")
+        self.assertEqual(events[0]["jobs"][0]["id"], "sh_train")
+        self.assertFalse(events[0]["credential_present"])
+        self.assertEqual(events[-1]["type"], "test_cancelled")
+
+    def test_cli_rejects_an_unbounded_or_invalid_timeout(self) -> None:
+        for value in ("0", "-1", "1.5", "unbounded"):
+            with self.subTest(value=value):
+                result = self.run_cli(value)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("OPENCODE_RUN_TIMEOUT_MS must be a positive integer", result.stderr)
+                self.assertNotIn("background_wait", result.stdout)
 
 
 if __name__ == "__main__":

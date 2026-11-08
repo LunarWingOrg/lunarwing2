@@ -46,7 +46,15 @@ The agent logs `External workers configured: opencode2` on startup.
 Every OpenCode SDK request receives the task abort signal. On timeout or
 cancellation, the worker stops waiting immediately and gives session cleanup
 a bounded grace (`OPENCODE_SESSION_ABORT_TIMEOUT_MS`, applied to
-`session.interrupt`) instead of leaving work orphaned.
+`session.interrupt`) instead of leaving work orphaned. OpenCode v2.2.6's
+noninteractive `opencode run` can wait indefinitely for background jobs. The
+WebSocket bridge uses the serve SDK rather than `run`, and its task deadline
+still interrupts a session whose events never settle; the executor regression
+covers the new run-style `background_wait` shape without treating it as
+completion. The optional `--mode cli` path does invoke `run`, so entrypoint.sh
+bounds it with `OPENCODE_RUN_TIMEOUT_MS` (default `3600000`, one hour) and GNU
+`timeout --preserve-status -k 5s`; the deadline sends SIGTERM through upstream's
+normal background-job cancellation path instead of bypassing it.
 Transient provider streaming timeouts and temporary routing exhaustion are
 retried twice in the same OpenCode session by default, preserving completed
 workspace work.
@@ -55,7 +63,7 @@ workspace work.
 
 | Area | v1 (`opencode4lunarwing`) | v2 (this worker) |
 |---|---|---|
-| Pin | v1.19.5 (proven) | v2.2.5 (beta in practice) |
+| Pin | v1.19.5 (proven) | v2.2.6 (beta in practice) |
 | Client SDK | `@opencode-ai/sdk/v2/client` | `@opencode/client/promise` |
 | Config file | `config/opencode.json` | `config/opencode2.json` |
 | Config shape | `provider.<id>.{npm,options.baseURL}` | `providers.<id>.{package,settings.baseURL}` |
@@ -67,8 +75,8 @@ workspace work.
 | Worker env overrides | `OPENCODE_MODEL` / `OPENCODE_BASE_URL` | `OPENCODE2_MODEL` / `OPENCODE2_BASE_URL` |
 
 WI#427 approved crossing the OpenTunnel boundary at
-`843a6c514e606b436a7fe713422ace0a93ad3d61` (v2.0.32); the current v2.2.5 pin
-is `9bbb8ce18c80f099e0e448775f59d965ead40a21` (tag resolved via git
+`843a6c514e606b436a7fe713422ace0a93ad3d61` (v2.0.32); the current v2.2.6 pin
+is `dc2ffcf8bf26f9e669b6aa22b95f50e12be15e06` (tag resolved via git
 ls-remote, every gate re-verified on the fresh clone).
 The build compiles OpenTunnel out; the wrapper refuses service/pairing,
 self-upgrade (`upgrade`/`update`), and non-loopback serving, and sharing
