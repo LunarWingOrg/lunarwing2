@@ -290,7 +290,7 @@ impl ConversationManager {
         for (index, note) in notes.iter().enumerate() {
             if let Err(error) = self
                 .thread_manager
-                .inject_message(thread_id, user_id, ThreadMessage::generated_goal(note))
+                .inject_message(thread_id, user_id, ThreadMessage::steered(note))
                 .await
             {
                 restore_steer_notes(conv, notes.into_iter().skip(index));
@@ -338,7 +338,7 @@ impl ConversationManager {
             });
         }
         for note in notes {
-            let message = ThreadMessage::generated_goal(note.clone());
+            let message = ThreadMessage::steered(note.clone());
             if !thread.internal_messages.is_empty() {
                 thread.add_internal_message(message.clone());
             }
@@ -468,7 +468,7 @@ impl ConversationManager {
                 history.extend(
                     conv.pending_steer_notes
                         .iter()
-                        .map(ThreadMessage::generated_goal),
+                        .map(ThreadMessage::steered),
                 );
 
                 // Spawn new foreground thread with conversation history

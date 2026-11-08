@@ -464,7 +464,11 @@ impl Thread {
             && !self.config.mission_child
             && !self.config.mission_context.is_conversation_insights()
             && message.role == crate::types::message::MessageRole::User
-            && message.provenance == crate::types::provenance::Provenance::User
+            && matches!(
+                message.provenance,
+                crate::types::provenance::Provenance::User
+                    | crate::types::provenance::Provenance::Steered
+            )
             && !message.content.trim().is_empty()
         {
             self.insight_inputs
