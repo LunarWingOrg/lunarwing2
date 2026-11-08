@@ -1230,6 +1230,45 @@ fn long_variants_contain(variants: &[SecretString], text: &str) -> bool {
         .any(|variant| text.contains(variant.expose_secret()))
 }
 
+const MAX_STRUCTURED_JSON_DEPTH: usize = 4;
+const MAX_STRUCTURED_JSON_FIELDS: usize = 256;
+
+fn collect_structured_json_fields(
+    raw: &str,
+    depth: usize,
+    seen: &mut std::collections::HashSet<u64>,
+    fields: &mut Vec<String>,
+) {
+    use std::hash::{Hash, Hasher};
+    if depth >= MAX_STRUCTURED_JSON_DEPTH || fields.len() >= MAX_STRUCTURED_JSON_FIELDS {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return;
+    };
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        if fields.len() >= MAX_STRUCTURED_JSON_FIELDS {
+            return;
+        }
+        match value {
+            serde_json::Value::String(field) => {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                field.hash(&mut hasher);
+                if seen.insert(hasher.finish()) {
+                    collect_structured_json_fields(&field, depth + 1, seen, fields);
+                    if fields.len() < MAX_STRUCTURED_JSON_FIELDS {
+                        fields.push(field);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => pending.extend(items),
+            serde_json::Value::Object(map) => pending.extend(map.into_values()),
+            _ => {}
+        }
+    }
+}
+
 impl SecretValueRedactor {
     pub fn new(values: &[SecretString]) -> Self {
         use secrecy::ExposeSecret;
@@ -1248,14 +1287,25 @@ impl SecretValueRedactor {
         self.rebuild_matchers();
     }
 
-    fn add_raw(&mut self, raw: &str) {
-        use secrecy::ExposeSecret;
+    fn extend_variants(&mut self, raw: &str) {
         if raw.len() < MIN_REDACTED_SECRET_BYTES {
             return;
         }
         let (direct, folded) = secret_variants(raw);
         self.direct_variants.extend(direct);
         self.folded_variants.extend(folded);
+    }
+
+    fn add_raw(&mut self, raw: &str) {
+        use secrecy::ExposeSecret;
+        self.extend_variants(raw);
+        let mut fields = Vec::new();
+        collect_structured_json_fields(raw, 0, &mut std::collections::HashSet::new(), &mut fields);
+        for field in fields {
+            if field != raw {
+                self.extend_variants(&field);
+            }
+        }
         self.direct_variants
             .sort_by_key(|v| std::cmp::Reverse(v.expose_secret().len()));
         self.folded_variants
@@ -2662,6 +2712,34 @@ mod tests {
         let text = event.to_string();
         assert!(!text.contains("tok_1234567890abcdef"));
         assert_eq!(event["count"], 3);
+    }
+
+    #[test]
+    fn redactor_scrubs_decoded_structured_json_fields() {
+        let private_key = "-----BEGIN PRIVATE KEY-----\nfixture-extracted-private-key-material-0123456789\n-----END PRIVATE KEY-----";
+        let nested = serde_json::to_string(&serde_json::json!({
+            "api_token": "nested-extracted-token-0123456789"
+        }))
+        .unwrap(); // safety: test
+        let mounted = serde_json::to_string(&serde_json::json!({
+            "private_key": private_key,
+            "nested": nested,
+        }))
+        .unwrap(); // safety: test
+        let redactor = SecretValueRedactor::new(&[SecretString::from(mounted)]);
+
+        for decoded in [
+            private_key,
+            "fixture-extracted-private-key-material-0123456789",
+            "nested-extracted-token-0123456789",
+        ] {
+            let scrubbed = redactor.scrub(&format!("jq output:\n{decoded}"));
+            assert!(
+                !scrubbed.contains(decoded),
+                "decoded structured field leaked: {decoded}"
+            );
+            assert!(scrubbed.contains("[redacted-secret]"));
+        }
     }
 
     #[test]
