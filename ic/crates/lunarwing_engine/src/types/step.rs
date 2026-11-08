@@ -170,10 +170,14 @@ impl LlmResponse {
 /// Detect a CodeAct final-answer pseudo-action surfaced as a tool call name.
 fn is_final_pseudo_action(name: &str) -> bool {
     let lower = name.trim().to_lowercase();
+    let malformed_xml_final = lower
+        .strip_suffix("</arg_value>")
+        .is_some_and(|prefix| prefix.starts_with("final"));
     lower == "final"
         || lower.starts_with("final(")
         || lower == "final_var"
         || lower.starts_with("final_var(")
+        || malformed_xml_final
 }
 
 /// Best-effort extraction of the intended final answer from a bogus call.
@@ -386,6 +390,24 @@ mod tests {
         assert_eq!(
             extract_final_answer(&text).as_deref(),
             Some("All four steps completed")
+        );
+    }
+
+    #[test]
+    fn from_action_calls_consumes_final_broker_xml_junk() {
+        let response = LlmResponse::from_action_calls(
+            vec![call(
+                "FINALBroker</arg_value>",
+                serde_json::json!({"answer": "hold-thirty-two complete"}),
+            )],
+            None,
+        );
+        let LlmResponse::Text(text) = response else {
+            panic!("FINALBroker junk call must become text");
+        };
+        assert_eq!(
+            extract_final_answer(&text).as_deref(),
+            Some("hold-thirty-two complete")
         );
     }
 
