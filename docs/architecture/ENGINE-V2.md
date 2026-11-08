@@ -1524,9 +1524,11 @@ static kinds/classes, counts and timestamps are logged.
   project, or the durable source scan on tick
 - **Evidence**: each top-level Foreground thread captures its ingested User-role
   statements at ingestion time as complete, untruncated `InsightSource` records
-  (message/thread/conversation identity + timestamp). Generated goals, steer
-  notes, system injections, research/mission threads, failed threads, other
-  users' or projects' threads, legacy pre-upgrade threads, and truncated
+  (message/thread/conversation identity + timestamp). Statements ingested
+  through `/steer` carry `Steered` provenance and are captured as fresh user
+  evidence on the same terms as direct `User` input. Generated goals, system
+  injections, research/mission threads, failed threads, other users' or
+  projects' threads, legacy pre-upgrade threads, and truncated
   statements are never sources; a single oversized statement (over the
   per-statement or per-thread bound) disqualifies its entire conversation —
   fail-closed, so partial evidence is never extracted. The host selects the
