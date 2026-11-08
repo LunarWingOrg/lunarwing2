@@ -1140,12 +1140,7 @@ mod tests {
         let _ = tm.join_thread(thread_id).await.unwrap();
 
         let thread = cm.store.load_thread(thread_id).await.unwrap().unwrap();
-        let user_messages: Vec<&str> = thread
-            .messages
-            .iter()
-            .filter(|message| message.role == crate::types::message::MessageRole::User)
-            .map(|message| message.content.as_str())
-            .collect();
+        let user_messages = user_message_contents(&thread);
         assert_eq!(user_messages, vec!["wrapped steer", "next request"]);
         assert!(
             cm.store
@@ -1159,12 +1154,27 @@ mod tests {
     }
 
     fn user_message_contents(thread: &crate::types::thread::Thread) -> Vec<&str> {
-        thread
+        let contents: Vec<&str> = thread
             .messages
             .iter()
             .filter(|message| message.role == crate::types::message::MessageRole::User)
             .map(|message| message.content.as_str())
-            .collect()
+            .collect();
+        let insight_contents: Vec<&str> = thread
+            .insight_inputs
+            .iter()
+            .map(|source| source.text.as_str())
+            .collect();
+        assert_eq!(insight_contents, contents);
+        for message in &thread.messages {
+            if message.content == "wrapped steer" {
+                assert_eq!(
+                    message.provenance,
+                    crate::types::provenance::Provenance::Steered
+                );
+            }
+        }
+        contents
     }
 
     #[tokio::test]
