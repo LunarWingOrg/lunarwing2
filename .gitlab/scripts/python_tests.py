@@ -68,9 +68,7 @@ def run_loaded_suite(label: str, suite, records: list[dict]) -> tuple[bool, int,
 
 
 def load_file_suite(path: pathlib.Path):
-    """WI#363: .gitlab/tests modules are not package-importable (the hidden
-    directory name), so the deny.toml guard suite is loaded by path — the
-    same importlib pattern the module itself uses for the scripts."""
+    """Load a .gitlab/tests module by path; its hidden parent is not importable."""
     spec = importlib.util.spec_from_file_location(path.stem, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -90,22 +88,26 @@ def main() -> int:
             records,
         )
 
-    # WI#363: the deny.toml advisory-guard suite is also discovered by the
-    # ci-config lane's unittest discover; registering it here keeps it running
-    # in python-unit too (the WI's explicit registration requirement).
+    # These suites also run in ci-config's unittest discovery. Register them
+    # here so the Git-enabled python-unit lane exercises their end-to-end cases.
     guard_ok, guard_total, guard_skipped = run_loaded_suite(
         "deny.toml advisory guards",
         load_file_suite(ROOT / ".gitlab" / "tests" / "test_deny_toml_guards.py"),
         records,
     )
+    scan_ok, scan_total, scan_skipped = run_loaded_suite(
+        "two-pass secret scanning",
+        load_file_suite(ROOT / ".gitlab" / "tests" / "test_scan_secrets.py"),
+        records,
+    )
 
     junit.write(REPORT_PATH, records)
-    total += adapter_total + guard_total
-    skipped += adapter_skipped + guard_skipped
+    total += adapter_total + guard_total + scan_total
+    skipped += adapter_skipped + guard_skipped + scan_skipped
     if skipped:
         print(f"ERROR: {skipped} Python test(s) skipped; CI prerequisites are incomplete", file=sys.stderr)
         return 1
-    if not ok or not adapter_ok or not guard_ok:
+    if not ok or not adapter_ok or not guard_ok or not scan_ok:
         return 1
 
     print(f"Python test suites passed: {total} tests, no skips.")

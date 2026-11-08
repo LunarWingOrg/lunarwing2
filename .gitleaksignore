@@ -32,3 +32,17 @@ ic/tests/test-pages/cnn/source.html:generic-api-key:2468
 docs/proposals/MULTIAGENTTEAMORCHESTRATION/coordination-phase1-plan.md:generic-api-key:176
 ic/scripts/tests/test_darkirc_h3_analyzer.py:generic-api-key:31
 ic/scripts/tests/test_darkirc_h3_analyzer.py:generic-api-key:32
+ic/vendor/aws-lc-sys/aws-lc/crypto/evp_extra/p_pqdsa_test.cc:square-access-token:1295
+ic/vendor/aws-lc-sys-0.43.0/aws-lc/crypto/evp_extra/p_pqdsa_test.cc:square-access-token:1295
+ic/vendor/aws-lc-sys-0.44.0/aws-lc/crypto/evp_extra/p_pqdsa_test.cc:square-access-token:1295
+ic/vendor/readabilityrs/tests/test-pages/buzzfeed-1/source.html:gcp-api-key:751
+ic/vendor/readabilityrs/tests/test-pages/herald-sun-1/source.html:jwt:684
+ic/vendor/readabilityrs/tests/test-pages/la-nacion/source.html:jwt:610
+ic/vendor/readabilityrs/tests/test-pages/liberation-1/source.html:jwt:1623
+ic/vendor/readabilityrs/tests/test-pages/salon-1/source.html:jwt:2001
+ic/vendor/readabilityrs-0.1.3/tests/test-pages/buzzfeed-1/source.html:gcp-api-key:751
+ic/vendor/readabilityrs-0.1.3/tests/test-pages/herald-sun-1/source.html:jwt:684
+ic/vendor/readabilityrs-0.1.3/tests/test-pages/la-nacion/source.html:jwt:610
+ic/vendor/readabilityrs-0.1.3/tests/test-pages/liberation-1/source.html:jwt:1623
+ic/vendor/readabilityrs-0.1.3/tests/test-pages/salon-1/source.html:jwt:2001
+ic/vendor/rig-core/.cargo-checksum.json:discord-api-token:49
