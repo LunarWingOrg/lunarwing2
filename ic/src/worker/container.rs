@@ -750,10 +750,10 @@ impl LoopDelegate for ContainerDelegate {
 
             // DG-1/DG-2: scrub at the tool-result boundary before worker event
             // truncation and reuse that text for last_output and LLM context.
-            // Tools may already have truncated output internally; fragments at
-            // those earlier cuts are not guaranteed to match whole variants.
+            // Explicitly truncated results also redact partial encoded chunks
+            // at the tool's own capture and head/tail cut boundaries.
             let result = match result {
-                Ok(output) => Ok(self.secret_redactor.scrub(&output)),
+                Ok(output) => Ok(self.secret_redactor.scrub_tool_result(&output)),
                 Err(error) => Err(self.secret_redactor.scrub(&error)),
             };
 
