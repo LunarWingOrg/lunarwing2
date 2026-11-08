@@ -224,15 +224,19 @@ FI_FREE=4294967296 FI_DEGRADED_FREE=1 FI_CRITICAL_FREE=2 run_check
 assert_eq "$RC" "1" "reversed free-space floors fall back to defaults"
 assert_contains "$(cat "$FIXTURE/stderr.log")" 'using 5 and 2' "reversed free-space warning is diagnostic"
 
-FI_DF_HANG=1 FI_TIMEOUT=1 SECONDS=0 run_check
+probe_start=$SECONDS
+FI_DF_HANG=1 FI_TIMEOUT=1 run_check
+probe_elapsed=$((SECONDS - probe_start))
 assert_eq "$RC" "1" "a hung df is cut off and degraded"
 assert_contains "$OUTPUT" 'block df failed or timed out' "hung df produces a bounded-probe issue"
-if ((SECONDS < 6)); then pass "hung df returns within the per-probe budget"; else fail "hung df exceeded the per-probe budget ($SECONDS seconds)"; fi
+if ((probe_elapsed < 6)); then pass "hung df returns within the per-probe budget"; else fail "hung df exceeded the per-probe budget ($probe_elapsed seconds)"; fi
 
-FI_DF_HANG=1 FI_TIMEOUT=3 FI_SWEEP=1 SECONDS=0 run_check
+probe_start=$SECONDS
+FI_DF_HANG=1 FI_TIMEOUT=3 FI_SWEEP=1 run_check
+probe_elapsed=$((SECONDS - probe_start))
 assert_eq "$RC" "1" "an exhausted sweep deadline returns a degraded partial report"
 assert_contains "$OUTPUT" 'disk sweep incomplete' "sweep deadline coverage loss is explicit"
-if ((SECONDS < 6)); then pass "overall deadline lands before the outer component timeout"; else fail "overall deadline exceeded its budget ($SECONDS seconds)"; fi
+if ((probe_elapsed < 6)); then pass "overall deadline lands before the outer component timeout"; else fail "overall deadline exceeded its budget ($probe_elapsed seconds)"; fi
 
 self_heal="$ROOT/lunarwing-self-heal.sh"
 assert_contains "$(cat "$self_heal")" 'MONITOR_ONLY[disk]=1' "disk is pinned monitor-only"
