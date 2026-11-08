@@ -125,7 +125,7 @@ Every check writes a single JSON object to stdout (logs go to stderr) and exits
 | runtime | health-runtime.sh | Per-tenant gateway `/api/gateway/status` + `/api/chat/pending-gates` and bridge `/v1/status` (ports-registry discovery, bearer tokens from tenant env files) | `gateway_reachable`, `gateway_uptime_secs`, `gateway_connections`, `channels_unhealthy` (unhealthy channels degrade the tenant), `pending_gates` (metric only — approval/auth waits are not stalled execution; an unobservable pending-gates endpoint degrades as an observability gap), `bridge_running`, `bridge_queued_messages`, `bridge_outbound_last_hour`, `bridge_omemo_enabled`, `bridge_prekeys_available` |
 | knowledge | health-knowledge.sh | Per-tenant `knowledge_sync_state.json` + `knowledge_sweep_state.json` **and the tenant's actual feature enablement** (`KNOWLEDGE_SYNC_ENABLED` default false, `KNOWLEDGE_SWEEP_ENABLED` default true, plus cadences, from the tenant env file) | `sync_enabled`, `sweep_enabled`, `sync_cadence_hours`, `sweep_cadence_hours`, `sync_consecutive_failures`, `sync_last_error_class`, `sync_deferred_notes`, `sync_last_success_age_seconds`, `sweep_last_run_age_seconds`; monitor-only — disabled features ignore their (possibly stale) state; enabled-but-never-observed degrades only past the startup grace period; overdue derives from the configured cadence |
 | worker_egress | health-worker-egress.sh | Root-owned egress state, live tenant network policy, and worker attachments | per-tenant `instances[]`; monitor-only, no firewall repair |
-| disk | health-disk.sh | Host, container-store, tenant, and operator-extra filesystems, deduplicated by device; block and inode use with bounded `df`/`stat` | per-mount `filesystems[]`: `size_bytes`, `free_bytes`, `used_pct`, `inodes_used_pct`, `status`, `available`; monitor-only, never cleans up |
+| disk | health-disk.sh | Host, container-store, tenant, and operator-extra filesystems, deduplicated by followed device; block and inode use with bounded `df`/`stat` and an overall sweep deadline | per-mount `filesystems[]`: `size_bytes`, `free_bytes`, `used_pct`, `inodes_used_pct` (`null` when untracked), `status`, `available`, `present` (absent discovered paths stay healthy); monitor-only, never cleans up |
 | systemd / openrc / launchd | health-{systemd,openrc,launchd}.sh | Service-manager unit state (incl. per-tenant) | `metrics.units` / `.services` / `.agents` |
 
 A check that cannot reach its target generally reports `critical`; several
@@ -210,10 +210,11 @@ workloads.
 | `HEALTH_RATELIMIT_QUEUE_DEGRADED` | health-ratelimit.sh | `100` | Queued messages before degraded |
 | `HEALTH_CLICKHOUSE_{DISK,MEMORY}_{DEGRADED,CRITICAL}` | health-clickhouse.sh | `70`/`85`, `80`/`95` | Disk and memory utilization thresholds (percent) |
 | `HEALTH_CLICKHOUSE_QUERY_{DEGRADED,CRITICAL}_MS` | health-clickhouse.sh | `1000` / `5000` | Query latency thresholds |
-| `HEALTH_DISK_{DEGRADED,CRITICAL}_USED_PCT` | health-disk.sh | `80` / `90` | Used-block and used-inode thresholds; invalid integers use these defaults |
-| `HEALTH_DISK_{DEGRADED,CRITICAL}_FREE_GIB` | health-disk.sh | `5` / `2` | Strict free-space floors in GiB |
-| `HEALTH_DISK_EXTRA_PATHS` | health-disk.sh | _(empty)_ | Additional space-separated paths, such as a colocated GitLab runner store |
-| `HEALTH_DISK_TIMEOUT` | health-disk.sh | `3` | Per-`df`/`stat` timeout in seconds; `0`/invalid values use the default |
+| `HEALTH_DISK_{DEGRADED,CRITICAL}_USED_PCT` | health-disk.sh | `80` / `90` | Used-block and used-inode thresholds; invalid base-10 integers or reversed pairs use these defaults |
+| `HEALTH_DISK_{DEGRADED,CRITICAL}_FREE_GIB` | health-disk.sh | `5` / `2` | Strict free-space floors in GiB; reversed pairs use these defaults |
+| `HEALTH_DISK_EXTRA_PATHS` | health-disk.sh | _(empty)_ | Additional whitespace-separated paths, such as a colocated GitLab runner store; paths containing spaces are unsupported and explicit paths must exist |
+| `HEALTH_DISK_TIMEOUT` | health-disk.sh | `3` | Per-`df`/`stat`/`getent` timeout in seconds; `0`/invalid values use the default |
+| `HEALTH_DISK_SWEEP_DEADLINE_SECS` | health-disk.sh | `19` | Whole-sweep deadline; remaining paths are skipped and the partial report degrades (`0` disables) |
 | `HEALTH_DISK_{PODMAN,DOCKER}_ROOT` | health-disk.sh | `/var/lib/containers/storage`, `/var/lib/docker` | Root container-store paths; override a non-default data root |
 | `HEALTH_TENSORZERO_P95_{DEGRADED,CRITICAL}_MS` | health-tensorzero.sh | `5000` / `15000` | Inference p95 latency thresholds |
 | `HEALTH_TENSORZERO_ERROR_{DEGRADED,CRITICAL}_PCT` | health-tensorzero.sh | `1` / `5` | Error-rate thresholds (percent; floats allowed) |
