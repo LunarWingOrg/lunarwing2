@@ -47,10 +47,14 @@ Every OpenCode SDK request receives the task abort signal. On timeout or
 cancellation, the worker stops waiting immediately and gives session cleanup
 a bounded grace (`OPENCODE_SESSION_ABORT_TIMEOUT_MS`, applied to
 `session.interrupt`) instead of leaving work orphaned. OpenCode v2.2.6's
-noninteractive `opencode run` can wait indefinitely for background jobs; this
-bridge uses the serve SDK rather than `run`, and its task deadline still
-interrupts a session whose events never settle. The executor regression covers
-the new run-style `background_wait` shape without treating it as completion.
+noninteractive `opencode run` can wait indefinitely for background jobs. The
+WebSocket bridge uses the serve SDK rather than `run`, and its task deadline
+still interrupts a session whose events never settle; the executor regression
+covers the new run-style `background_wait` shape without treating it as
+completion. The optional `--mode cli` path does invoke `run`, so entrypoint.sh
+bounds it with `OPENCODE_RUN_TIMEOUT_MS` (default `3600000`, one hour) and GNU
+`timeout --preserve-status -k 5s`; the deadline sends SIGTERM through upstream's
+normal background-job cancellation path instead of bypassing it.
 Transient provider streaming timeouts and temporary routing exhaustion are
 retried twice in the same OpenCode session by default, preserving completed
 workspace work.
