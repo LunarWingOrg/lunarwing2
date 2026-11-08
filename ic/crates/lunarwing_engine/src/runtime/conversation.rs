@@ -465,11 +465,7 @@ impl ConversationManager {
                 // Build conversation history from prior entries, followed by any
                 // steer notes that arrived while no foreground thread was running.
                 let mut history = build_history_from_entries(&conv.entries);
-                history.extend(
-                    conv.pending_steer_notes
-                        .iter()
-                        .map(ThreadMessage::steered),
-                );
+                history.extend(conv.pending_steer_notes.iter().map(ThreadMessage::steered));
 
                 // Spawn new foreground thread with conversation history
                 let thread_id = self
