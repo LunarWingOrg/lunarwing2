@@ -36,6 +36,10 @@ STUB
 cat >"$BIN/df" <<'STUB'
 #!/usr/bin/env bash
 [[ "${FI_DF_HANG:-}" == "1" ]] && sleep 30
+if [[ " $* " == *" --output="* ]] && [[ " $* " == *" -P "* || " $* " == *" -i "* ]]; then
+  printf 'df: options -P/-i and --output are mutually exclusive\n' >&2
+  exit 1
+fi
 path="${!#}"
 mount="${FI_MOUNT:-/}"
 used="${FI_USED:-10}"
