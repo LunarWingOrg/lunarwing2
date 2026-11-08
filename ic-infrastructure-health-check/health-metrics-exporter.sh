@@ -89,7 +89,7 @@ def norm: if (type == "string") and test("^-?[0-9]+(\\.[0-9]+)?$") then tonumber
 # elsewhere are skipped; non-numeric/non-boolean leaves are dropped.
 def toseries($prefix):
   to_entries[]
-  | select(.key as $k | (["instances","providers","units","services","agents","enabled"] | index($k)) | not)
+  | select(.key as $k | (["instances","filesystems","providers","units","services","agents","enabled"] | index($k)) | not)
   | (.key | esc) as $key
   | (.value | norm) as $v
   | if ($v | type) == "object" then ($v | toseries($prefix + $key + "_"))
@@ -115,6 +115,24 @@ def instances($comp):
           elif ($v | type) == "boolean" then $head + (if $v then "1" else "0" end)
           elif $v == "true" then $head + "1"
           elif $v == "false" then $head + "0"
+          else empty end ) );
+
+# Per-filesystem disk gauges. Mount is the bounded escalation identity; paths
+# remain JSON-only so a long path list cannot become a high-cardinality label.
+def filesystems($comp):
+  (.metrics.filesystems // [])[] | select(type == "object")
+  | ((.mount // "unknown") | tostring) as $mount
+  | ("lunarwing_health_" + $comp) as $base
+  | ( . as $fs
+    | ( $base + "_filesystem_status{mount=\"" + ($mount | lv) + "\"} "
+        + (($fs.status // "unknown") | status_code | tostring) ),
+      ( $fs | to_entries[]
+        | select(.key as $k | (["mount","paths","status","issues"] | index($k)) | not)
+        | (.key | esc) as $key
+        | (.value | norm) as $v
+        | ($base + "_" + $key + "{mount=\"" + ($mount | lv) + "\"} ") as $head
+        | if ($v | type) == "number" then $head + ($v | tostring)
+          elif ($v | type) == "boolean" then $head + (if $v then "1" else "0" end)
           else empty end ) );
 
 # Per-provider stream telemetry. Provider and tenant stay bounded labels rather
@@ -184,6 +202,7 @@ def units($init):
             else [] end )
         + ($m | [toseries("lunarwing_health_" + $comp + "_")])
         + ($c | [instances($comp)])
+        + ($c | [filesystems($comp)])
         + ($c | [providers($comp)])
         + ($c | [units((($c.component // "unknown") | tostring))])
       end ]
@@ -250,6 +269,12 @@ assembled="$WORKDIR/full.prom"
         lunarwing_health_component_enabled \
         lunarwing_health_status \
         lunarwing_health_check_duration_seconds \
+        lunarwing_health_disk_filesystem_status \
+        lunarwing_health_disk_size_bytes \
+        lunarwing_health_disk_free_bytes \
+        lunarwing_health_disk_used_pct \
+        lunarwing_health_disk_inodes_used_pct \
+        lunarwing_health_disk_available \
         lunarwing_health_unit_status \
         lunarwing_health_unit_up \
         lunarwing_health_unit_restarts_total \
