@@ -16,7 +16,7 @@
  * (../lunarwing_tool_proxy.ts).
  *
  * v2 registration notes (verified against the pinned v2.1.2 source
- * anomalyco/opencode a517687f, re-verified at v2.2.5 9bbb8ce1):
+ * anomalyco/opencode a517687f, re-verified at v2.2.6 dc2ffcf8):
  * - Configured plugin paths must be DIRECTORIES: a file path in the config's
  *   `plugins` array is dropped with "configured plugin path must be a
  *   directory" (packages/core/src/config/plugin/source.ts). This directory is

@@ -147,11 +147,10 @@ function sessionPermissions(): Array<{ action: string; resource: string; effect:
     { action: "shell", resource: "*opencode service *", effect: "deny" },
     { action: "shell", resource: "*opencode pair *", effect: "deny" },
     { action: "shell", resource: "*opencode serve *", effect: "deny" },
-    // v2.0.32 Code Mode session_move / session_rename have no permission
-    // check of their own (packages/core/src/tool/plugin/opencode.ts; still
-    // unguarded at the v2.2.5 pin).
-    // session_rename rewrites any session title (the WI#324 task binding);
-    // session_move re-roots the session so external_directory never fires.
+    // v2.0.32 Code Mode session_move / session_rename had no permission
+    // check of their own. v2.2.6 adds an external_directory check to
+    // session_move, but keep both wholly denied: move still re-roots the
+    // session, and rename still rewrites the WI#324 task-binding title.
     { action: "opencode_session_move", resource: "*", effect: "deny" },
     { action: "opencode_session_rename", resource: "*", effect: "deny" },
   ]

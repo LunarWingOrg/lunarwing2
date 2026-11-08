@@ -112,7 +112,7 @@ opencode2.4lunarwing/scripts/compile_out_remote_tunnel_test.py
 opencode2.4lunarwing/scripts/runtime_smoke.py
 opencode2.4lunarwing/scripts/runtime_smoke_test.py
 opencode2.4lunarwing/scripts/runtime_smoke_entrypoint.sh'
-        source_ref=9bbb8ce18c80f099e0e448775f59d965ead40a21
+        source_ref=dc2ffcf8bf26f9e669b6aa22b95f50e12be15e06
         # WI#357 run-106 GJ-3(a): the checkout's wrapper digest, compared by
         # the in-image --image-filesystem assert against the installed wrapper.
         # Detects accidental drift; an adversarial Dockerfile can still defeat
@@ -129,8 +129,8 @@ opencode2.4lunarwing/scripts/runtime_smoke_entrypoint.sh'
         [ "${#wrapper_anchor}" -eq 64 ] || {
             echo "invalid wrapper sha256 for $wrapper_file" >&2; exit 1;
         }
-        build_args="OPENCODE_VERSION=v2.2.5
-OPENCODE_REF=9bbb8ce18c80f099e0e448775f59d965ead40a21
+        build_args="OPENCODE_VERSION=v2.2.6
+OPENCODE_REF=dc2ffcf8bf26f9e669b6aa22b95f50e12be15e06
 WITH_TOOLCHAINS=false
 LUNARWING_WRAPPER_SHA256=$wrapper_anchor
 SOURCE_REVISION=$CI_COMMIT_SHA"
@@ -189,8 +189,8 @@ kimicode4lunarwing/scripts/task_runner_client.ts
 kimicode4lunarwing/scripts/task_runner_client_test.ts
 kimicode4lunarwing/scripts/task_prompt_test.ts
 kimicode4lunarwing/scripts/workspace_path.ts'
-        source_ref=2.4.1
-        build_args="KIMI_CODE_VERSION=2.4.1
+        source_ref=2.5.2
+        build_args="KIMI_CODE_VERSION=2.5.2
 WITH_TOOLCHAINS=false
 SOURCE_REVISION=$CI_COMMIT_SHA"
         ;;

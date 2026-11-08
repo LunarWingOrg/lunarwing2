@@ -121,7 +121,10 @@
 21. [x] (S) Release notes update rel notes write actual prompt for this later
 22. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/586
 23. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/585
-24. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/582
+24. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/582
+    - **DONE 2026-11-08 (`cmc/goal24`, WI#582):** Kimi Code moves 2.4.1→2.5.2 with a regenerated exact-integrity lock; OpenCode2 moves to v2.2.6 at `dc2ffcf8bf26f9e669b6aa22b95f50e12be15e06`. Base images and the Debian snapshot are unchanged. Fresh-source audits re-verified the tunnel compile-out, build anchors, six-method/eight-event SDK surface, and new opt-in defaults. `background_wait` is CLI NDJSON, not SSE; the optional CLI path now enforces `OPENCODE_RUN_TIMEOUT_MS` (default one hour) with SIGTERM cancellation preserved.
+    - **Verification:** Kimi host **184 pass/two skips**, real CLI **4/4**, local image **183 pass/three skips**, and health/version checks pass. OpenCode local candidate and runtime smoke pass, including **11/11** entrypoint tests, exposure assertions, and the checkout-owned out-of-band verifier. Upstream tests pass **22/22** noninteractive, **5/5** file downloads, and **10/10** targeted tool/flag cases. Full GitLab suite **546 OK/13 skips** plus final targeted **283 + 16** tests, both mt-admin harnesses, BuildKit parser, ShellCheck with the two pre-existing SC2016 infos excluded, and `git diff --check` pass. Detailed evidence: `docs/ops/WORKER-CONTAINERS.md` v2.2.6 and kimi-code 2.5.2 bump entries.
+    - **CI acceptance:** protected candidate/scan/exposure jobs, BuildKit `rewrite-timestamp` clean-rebuild comparisons, and the green master pipeline after merge remain CI/maintainer gates; local Podman image-ID comparisons without that timestamp rewrite are not claimed as reproducibility evidence. No tenant rollout or live model-backed job was performed.
 
 ## Phase 7 - Advanced Operator Notes
 
