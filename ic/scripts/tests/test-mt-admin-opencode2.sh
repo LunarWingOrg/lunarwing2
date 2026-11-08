@@ -138,6 +138,12 @@ fi
 
 # ── systemd quadlet ──────────────────────────────────────────────────────────
 MT_ROOTLESS=true
+# Resolve the container health cadence from a scratch health.env, never the host's.
+# shellcheck disable=SC2034  # Consumed by sourced mt-admin functions.
+HEALTH_ENV_FILE="$fixture/health.env"
+unset LUNARWING_MT_CONTAINER_HEALTH_INTERVAL_SEC
+# shellcheck disable=SC2034  # Consumed by sourced mt-admin functions.
+CONTAINER_HEALTH_INTERVAL_SEC=""
 render_worker_quadlet root opencode2 8443
 quadlet="$fixture/quadlets/lunarwing-opencode2-root.container"
 assert_contains "$quadlet" 'ContainerName=lunarwing-opencode2-root' 'quadlet names the opencode2 container'
@@ -152,6 +158,7 @@ assert_contains "$quadlet" "Environment=AGENT_AUTH_TOKEN=${minted//%/%%}" 'quadl
 assert_not_contains "$quadlet" 'Environment=AGENT_AUTH_TOKEN=gate%%token' 'quadlet never inlines the gateway bearer'
 assert_contains "$quadlet" 'Exec=--mode websocket' 'quadlet selects websocket mode'
 assert_contains "$quadlet" 'HealthCmd=curl -sf http://127.0.0.1:8443/health' 'quadlet probes the health endpoint'
+assert_contains "$quadlet" 'HealthInterval=60s' 'quadlet uses the 60s default container health cadence'
 assert_contains "$quadlet" 'Network=lw-egress-root' 'quadlet joins only the tenant egress network'
 assert_contains "$quadlet" 'DNS=127.0.0.1' 'quadlet pins an unserved loopback resolver'
 assert_contains "$quadlet" 'AddHost=git.example.org:203.0.113.40' 'quadlet installs static hosts from the resolved allowlist'

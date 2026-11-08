@@ -113,6 +113,7 @@ _register_vision_systemd_fallback() {
 
 render_vision_quadlet() {
   local name="$1" qdir vision_port vision_health_port env_path path
+  _ensure_container_health_interval || return 1
   qdir="$(tenant_quadlet_dir "$name")"
   vision_port="$(ports_get "$name" vision_service)" || return 1
   vision_health_port="$(ports_get "$name" vision_health)" || return 1
@@ -145,7 +146,7 @@ PublishPort=127.0.0.1:${vision_port}:${VISION_SIDECAR_INTERNAL_PORT}
 PublishPort=127.0.0.1:${vision_health_port}:${VISION_SIDECAR_HEALTH_PORT}
 EnvironmentFile=${env_path}
 HealthCmd=curl -sf http://127.0.0.1:${VISION_SIDECAR_HEALTH_PORT}/health || exit 1
-HealthInterval=15s
+HealthInterval=${CONTAINER_HEALTH_INTERVAL_SEC}s
 HealthTimeout=5s
 HealthRetries=3
 HealthStartPeriod=30s
@@ -275,6 +276,7 @@ _register_voice_systemd_fallback() {
 
 render_voice_quadlet() {
   local name="$1" qdir voice_port voice_health_port env_path path
+  _ensure_container_health_interval || return 1
   qdir="$(tenant_quadlet_dir "$name")"
   voice_port="$(ports_get "$name" voice_service)" || return 1
   voice_health_port="$(ports_get "$name" voice_health)" || return 1
@@ -308,7 +310,7 @@ PublishPort=127.0.0.1:${voice_health_port}:${VOICE_SIDECAR_HEALTH_PORT}
 EnvironmentFile=${env_path}
 Volume=${VOICE_MODELS_DIR}:/models:ro
 HealthCmd=curl -sf http://127.0.0.1:${VOICE_SIDECAR_HEALTH_PORT}/health && curl -sf http://127.0.0.1:${VOICE_SIDECAR_HEALTH_PORT}/ready || exit 1
-HealthInterval=15s
+HealthInterval=${CONTAINER_HEALTH_INTERVAL_SEC}s
 HealthTimeout=5s
 HealthRetries=3
 HealthStartPeriod=60s
@@ -388,6 +390,7 @@ _write_systemd_unit() {  # <tenant> <path> <mode> — unit body on stdin
 render_pg_quadlet() {
   local name="$1"
   local qdir pg_port pg_password
+  _ensure_container_health_interval || return 1
   qdir="$(tenant_quadlet_dir "$name")"
   pg_port="$(ports_get "$name" postgres)"
   # Run-166 LF-3: a resolver refusal is fatal — an empty password inlined
@@ -419,7 +422,7 @@ Environment=POSTGRES_USER=lunarwing
 Environment=POSTGRES_PASSWORD=${pg_password}
 Environment=POSTGRES_DB=lunarwing
 HealthCmd=pg_isready -U lunarwing -q
-HealthInterval=10s
+HealthInterval=${CONTAINER_HEALTH_INTERVAL_SEC}s
 HealthTimeout=3s
 HealthRetries=5
 HealthStartPeriod=30s
@@ -448,6 +451,7 @@ render_worker_quadlet() {
   esac
   local qdir wss_port workspace_dir env_dir tenant_env_path worker_env_path host_health_port
   local runtime_env_path="" runtime_env_hash="" health_path="health"
+  _ensure_container_health_interval || return 1
   qdir="$(tenant_quadlet_dir "$name")"
   wss_port="$(ports_get "$name" "${worker}_wss")"
   host_health_port="$(ports_get "$name" "${worker}_health")"
@@ -643,7 +647,7 @@ EOF
     [[ "$worker" == "opencode" || "$worker" == "kimi" || "$worker" == "opencode2" ]] && printf 'Exec=--mode websocket\n'
     cat <<EOF
 HealthCmd=curl -sf http://127.0.0.1:${health_port}/${health_path} || exit 1
-HealthInterval=15s
+HealthInterval=${CONTAINER_HEALTH_INTERVAL_SEC}s
 HealthTimeout=5s
 HealthRetries=3
 HealthStartPeriod=30s
@@ -671,6 +675,7 @@ EOF
 render_worker_task_quadlet() {
   local name="$1" worker="$2" workspace_dir="$3"
   local qdir task_container ipc_volume task_uid egress_network egress_ruleset egress_guard egress_chain egress_subnet egress_mappings health_command
+  _ensure_container_health_interval || return 1
   qdir="$(tenant_quadlet_dir "$name")"
   task_container="$(worker_task_container_name "$worker" "$name")"
   ipc_volume="$(worker_ipc_volume_name "$worker" "$name")"
@@ -750,7 +755,7 @@ EOF
     done
     cat <<EOF
 HealthCmd=${health_command}
-HealthInterval=15s
+HealthInterval=${CONTAINER_HEALTH_INTERVAL_SEC}s
 HealthTimeout=5s
 HealthRetries=3
 HealthStartPeriod=30s

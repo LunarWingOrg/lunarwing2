@@ -178,6 +178,11 @@ ensure_health_pipeline() {
 
   say "--- Ensuring host-global health/self-heal pipeline ---"
   say "health interval: every ${HEALTH_INTERVAL_MIN} min (source: ${HEALTH_INTERVAL_SOURCE:-unset})"
+  # OpenRC disables Podman's timer healthchecks, so the cadence only applies
+  # here. ensure_init_system above resolved it.
+  if [[ "$INIT_SYSTEM" == "systemd" && -n "${CONTAINER_HEALTH_INTERVAL_SEC:-}" ]]; then
+    say "container healthcheck interval: every ${CONTAINER_HEALTH_INTERVAL_SEC}s (source: ${CONTAINER_HEALTH_INTERVAL_SOURCE:-unset})"
+  fi
 
   # 1) Stable copy of the pipeline scripts (survives repo/worktree moves).
   mkdir -p "$HEALTH_LIB_DIR"
@@ -210,6 +215,10 @@ LUNARWING_SERVICE_MANAGER=$INIT_SYSTEM
 # inline comment. The same-named environment variable overrides this line for
 # one-off mt-admin runs and is not written back to this file.
 LUNARWING_MT_HEALTH_INTERVAL_MIN=15
+# Podman healthcheck cadence for tenant containers, in seconds (10-3600; the
+# default is 60). Uncomment to change it, using the same plain NAME=value form;
+# containers pick it up when mt-admin next recreates them.
+#LUNARWING_MT_CONTAINER_HEALTH_INTERVAL_SEC=60
 SELF_HEAL_TENANTS_FILE=$PORTS_REGISTRY
 # WI#424 worker egress audit: the health lib performs its own read-only
 # root-owned audit (health-worker-egress.sh). Root cron must never execute or

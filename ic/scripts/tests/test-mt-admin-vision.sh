@@ -131,6 +131,12 @@ CONTAINER_RT=podman
 # shellcheck disable=SC2034  # Consumed by sourced mt-admin functions.
 MT_ROOTLESS=true
 
+# Resolve the container health cadence from a scratch health.env, never the host's.
+# shellcheck disable=SC2034  # Consumed by sourced mt-admin functions.
+HEALTH_ENV_FILE="$ROOT/health.env"
+unset LUNARWING_MT_CONTAINER_HEALTH_INTERVAL_SEC
+# shellcheck disable=SC2034  # Consumed by sourced mt-admin functions.
+CONTAINER_HEALTH_INTERVAL_SEC=""
 # Imported above, then replaced with a call-recording mock later in this test.
 # shellcheck disable=SC2218
 render_vision_quadlet alpha
@@ -139,6 +145,16 @@ quadlet_text="$(<"$quadlet")"
 assert_contains "$quadlet_text" 'PublishPort=127.0.0.1:20005:8088' "Quadlet publishes API port"
 assert_contains "$quadlet_text" 'PublishPort=127.0.0.1:20006:8089' "Quadlet publishes health port"
 assert_contains "$quadlet_text" 'HealthCmd=curl -sf http://127.0.0.1:8089/health || exit 1' "Quadlet checks dedicated listener"
+assert_contains "$quadlet_text" 'HealthInterval=60s' "Quadlet uses the 60s default container health cadence"
+# shellcheck disable=SC2034  # Consumed by sourced mt-admin functions.
+CONTAINER_HEALTH_INTERVAL_SEC=""
+# shellcheck disable=SC2218
+LUNARWING_MT_CONTAINER_HEALTH_INTERVAL_SEC=90 render_vision_quadlet alpha
+assert_contains "$(<"$quadlet")" 'HealthInterval=90s' "Quadlet follows the container health cadence override"
+# shellcheck disable=SC2034  # Consumed by sourced mt-admin functions.
+CONTAINER_HEALTH_INTERVAL_SEC=""
+# shellcheck disable=SC2218
+render_vision_quadlet alpha
 assert_contains "$quadlet_text" 'PodmanArgs=--security-opt=no-new-privileges' "Quadlet sets no-new-privileges"
 assert_contains "$quadlet_text" "EnvironmentFile=$(tenant_env_dir alpha)/vision.env" "Quadlet uses secret env file"
 if grep -qF 'test-only-token' "$quadlet"; then fail "Quadlet embedded auth token"; else pass "Quadlet does not embed auth token"; fi
