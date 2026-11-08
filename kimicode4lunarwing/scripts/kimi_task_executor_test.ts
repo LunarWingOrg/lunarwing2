@@ -499,6 +499,13 @@ process.exit(r.status ?? 1)
     ]
     assert.deepEqual(recorded.slice(0, prefix.length), prefix)
     assert.equal(recorded[prefix.length], bin, "the CLI path follows the pinned setpriv prefix")
+    // WI#582: the 2.5.x creation-time environment flags must stay unused.
+    assert.deepEqual(recorded.slice(prefix.length + 1), [
+      "-p",
+      "hello world",
+      "--output-format",
+      "stream-json",
+    ])
   } finally {
     process.env.PATH = savedPath
     delete process.env.KIMI_TASK_UID
