@@ -135,7 +135,7 @@ observe_path() {
     return 0
   fi
 
-  if ! output="$(bounded df -P -B1 --output=size,avail,pcent,target -- "$path" 2>/dev/null)"; then
+  if ! output="$(bounded df -B1 --output=size,avail,pcent,target -- "$path" 2>/dev/null)"; then
     mark_unavailable "$key" "$path" "block df failed or timed out"
     return 0
   fi
@@ -152,7 +152,7 @@ observe_path() {
   FS_FREE[$key]="$free"
   FS_USED[$key]="$used"
   FS_AVAILABLE[$key]=true
-  if ! inode_output="$(bounded df -P -i --output=itotal,iavail,ipcent,target -- "$path" 2>/dev/null)"; then
+  if ! inode_output="$(bounded df --output=itotal,iavail,ipcent,target -- "$path" 2>/dev/null)"; then
     FS_INODES[$key]=0
     FS_STATUS[$key]=degraded
     FS_AVAILABLE[$key]=false
