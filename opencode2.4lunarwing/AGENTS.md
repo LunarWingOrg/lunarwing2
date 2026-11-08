@@ -3,7 +3,7 @@
 ## What This Is
 
 Persistent container worker for upstream OpenCode **2** (the `v2` line, pinned
-v2.2.5). This is a separate worker lane from `opencode4lunarwing/` (the proven
+v2.2.6). This is a separate worker lane from `opencode4lunarwing/` (the proven
 v1 worker, pinned v1.19.5) per
 `docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md`. Tenants opt in explicitly; v1
 stays the default until v2 earns trust. The WebSocket bridge is
@@ -17,7 +17,7 @@ internal opencode headless server.
 - `scripts/lunarwing_tool_plugin/index.ts` — WI#324 v2 serve-process plugin (directory plugin registered by absolute path in `config/opencode2.json`'s `plugins` array; v2 drops configured plugin *file* paths). Statically registers the phase-1 `lunarwing_*` tools via the v2 promise API (`{id, setup}` default export, `ctx.tool.transform`, `codemode: false`, plain JSON Schema inputs) and relays each call over the session's task socket. Dependency-free on purpose — the runtime image ships no `@opencode/plugin`/`effect` for it to import.
 - `scripts/opencode_task_executor.ts` — Task execution via the v2 client SDK. Controls session creation, permissions, event streaming.
 - `scripts/sdk_surface.ts` — Canonical list of the `@opencode/client` method paths the bridge calls and the event `type` literals it matches (WI#329). It drives the image-build gate (`scripts/sdk_surface_assert.ts`, run from the Dockerfile — asserts the method paths against the real pinned client and the event names against the pinned generated V2Event union, WI#369) and the executor self-test, which binds it to the injected mock, to the call sites/event literals extracted from every non-test `scripts/*.ts` source, and — via a recording Proxy over the mock — to every client leaf path the suite actually touches. ADD to this list whenever the bridge calls a new client method or matches a new event; never shrink it to force an assertion to pass.
-- `scripts/tsconfig.sdk-surface.json` — WI#369 compile-time gate: the Dockerfile builder stage runs `tsc --noEmit` (via the monorepo's pinned `@typescript/native` devDependency, `npm:typescript@7.1.0-beta` at the v2.2.5 pin — 7.0.2 at v2.1.2; v2.0.32's `@typescript/native-preview` shipped it as `tsgo`) over the SDK-facing scripts against the pinned generated client types, covering call argument and event payload shapes. The version comes from upstream's committed lock, never a separate fetch, and the binary path (`bin/tsc`) is what the Dockerfile invokes — re-check both on every bump (checklist item 7). Keep its `include` list covering every non-test script that imports `@opencode/client`. `scripts/gate-env.d.ts` carries the minimal runtime declarations the gate needs (the monorepo's bun install does not expose @types at a stable path); extend it when a gated script uses a new runtime API.
+- `scripts/tsconfig.sdk-surface.json` — WI#369 compile-time gate: the Dockerfile builder stage runs `tsc --noEmit` (via the monorepo's pinned `@typescript/native` devDependency, `npm:typescript@7.1.0-beta` at the v2.2.6 pin — 7.0.2 at v2.1.2; v2.0.32's `@typescript/native-preview` shipped it as `tsgo`) over the SDK-facing scripts against the pinned generated client types, covering call argument and event payload shapes. The version comes from upstream's committed lock, never a separate fetch, and the binary path (`bin/tsc`) is what the Dockerfile invokes — re-check both on every bump (checklist item 7). Keep its `include` list covering every non-test script that imports `@opencode/client`. `scripts/gate-env.d.ts` carries the minimal runtime declarations the gate needs (the monorepo's bun install does not expose @types at a stable path); extend it when a gated script uses a new runtime API.
 - `scripts/lunarwing_runtime.ts` — Shared types and envelope helpers. Keep in sync with `agent_comm_protocol.json`.
 - `entrypoint-split.sh` — WI#454 bridge uid 10103:10003, private token home `/home/opencode2-bridge`; task role stays in `entrypoint.sh` as uid 10003:10003 and owns loopback serve. Both use no-new-privileges and no capabilities, with role-owned sticky `-ipc-v2` IPC. Rootful starts pin the workspace device/inode before setup.
 - `scripts/task_runner.ts` / `scripts/task_runner_client.ts` — Bounded Unix task dispatch, cancellation and ping health. The task runner creates cron directories. Reject grants before delegation; jobs sharing this task container share authority. Keep the parser, image config and exported-source fixtures in sync with split identity ENV and boot files.
@@ -103,7 +103,7 @@ direct CA-bundle copies from the digest-pinned Python image before APT and run
 `update-ca-certificates` after package installation; slim bases may have no trust store.
 
 The Bun 1.4.4 photon-node hunk-10 repair that this lane used to apply at the
-v2.1.2 pin is retired: v2.2.5 carries the `61845b0` whitespace repair as a
+v2.1.2 pin is retired: v2.2.6 carries the `61845b0` whitespace repair as a
 content-equivalent backport (the tag does not contain that commit), so
 `fix_photon_patch_context.py` would fail as redundant. The two fixer files,
 their Dockerfile `COPY`/`RUN` and self-test invocation, and this lane's two
@@ -119,6 +119,11 @@ See checklist item 7 in `docs/ops/WORKER-CONTAINERS.md`.
 - Remove the health server — orchestration depends on it
 - Configure opencode and opencode2 on the same tenant during the transition
   (agent routing confusion; see plan §5)
+- Enable v2.2.6's new opt-in surfaces in the worker: no MCP `pool: true`,
+  `OPENCODE_FLAGS=all`, `experimental.all_flags`, `experimental.codemode_vm`,
+  or `websearch.use` policy entries. `background_wait` is a noninteractive-run
+  JSON event, not a serve `V2Event`; never treat it as task completion, and
+  keep the executor deadline/interrupt regression for a wait that never ends.
 - Let the worker self-expose (WI#357): never start service mode
   (`opencode service …`, `serve --service`), pairing (`opencode pair …`),
   or a non-loopback `serve`; never enable session sharing (`share` stays
@@ -147,11 +152,11 @@ See checklist item 7 in `docs/ops/WORKER-CONTAINERS.md`.
 Workers must never self-expose; LunarWing owns every public path through the
 daemon's tunnel. See `docs/ops/WORKER-CONTAINERS.md` → "Worker exposure
 policy" for the full control set, the !1490 gate record, and the bump
-checklist. This lane pins v2.2.5 (the v2.0.26 boundary was crossed at
+checklist. This lane pins v2.2.6 (the v2.0.26 boundary was crossed at
 v2.0.32 under the maintainer-approved WI#427):
 v2.0.26 introduced OpenTunnel remote access (hosted relay, no self-host
 option). The compile-out guard stubs `remote-tunnel.ts` at build time,
-re-verified against v2.2.5, and CI + the build assertions fail if the tunnel
+re-verified against v2.2.6, and CI + the build assertions fail if the tunnel
 survives. Future bumps remain deliberate-only. WI#369's SDK-gate blind spots remain
 open; WI#424's egress allowlist is implemented (mt-admin `worker-egress`) and
 `scripts/runtime_smoke_entrypoint.sh` starts the real entrypoint for the
