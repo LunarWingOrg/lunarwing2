@@ -169,10 +169,9 @@ impl LlmResponse {
 
 /// Detect a CodeAct final-answer pseudo-action surfaced as a tool call name.
 fn is_final_pseudo_action(name: &str) -> bool {
-    let lower = name.trim().to_lowercase();
-    let malformed_xml_final = lower
-        .strip_suffix("</arg_value>")
-        .is_some_and(|prefix| prefix.starts_with("final"));
+    let trimmed = name.trim();
+    let lower = trimmed.to_lowercase();
+    let malformed_xml_final = trimmed.starts_with("FINAL") && lower.ends_with("</arg_value>");
     lower == "final"
         || lower.starts_with("final(")
         || lower == "final_var"
@@ -408,6 +407,26 @@ mod tests {
         assert_eq!(
             extract_final_answer(&text).as_deref(),
             Some("hold-thirty-two complete")
+        );
+    }
+
+    #[test]
+    fn from_action_calls_preserves_lowercase_finalize_xml_tool_call() {
+        let response = LlmResponse::from_action_calls(
+            vec![call(
+                "finalize_order</arg_value>",
+                serde_json::json!({"message": "order 42"}),
+            )],
+            None,
+        );
+        let LlmResponse::ActionCalls { calls, .. } = response else {
+            panic!("lowercase finalize tool call must stay structured");
+        };
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].action_name, "finalize_order</arg_value>");
+        assert_eq!(
+            calls[0].parameters,
+            serde_json::json!({"message": "order 42"})
         );
     }
 

@@ -827,6 +827,12 @@ fn sweep_harness_dirs_in(
 /// automaton tables, temporary strings, and serialized copies do not all
 /// zeroize. `Debug` deliberately prints no variant material.
 #[derive(Clone, Default)]
+struct PartialCutMatcher {
+    prefixes: Vec<SecretString>,
+    reversed: Vec<SecretString>,
+}
+
+#[derive(Clone, Default)]
 pub struct SecretValueRedactor {
     /// Variants matched directly against the text: the raw value, per-line
     /// splits of multi-line values, JSON-escaped and URL-encoded forms, and
@@ -839,6 +845,7 @@ pub struct SecretValueRedactor {
     folded_variants: Vec<SecretString>,
     direct_matcher: Option<aho_corasick::AhoCorasick>,
     folded_matcher: Option<aho_corasick::AhoCorasick>,
+    cut_matcher: PartialCutMatcher,
     /// Longest variant length in bytes; bounds the truncation-cut scan.
     max_variant_bytes: usize,
 }
@@ -1067,31 +1074,64 @@ fn secret_variants(raw: &str) -> (Vec<SecretString>, Vec<SecretString>) {
     (direct, folded)
 }
 
-/// Text with every line break removed so wrapped encodings match however the
-/// CLI wrapped them (EB-3). Both real newlines and the JSON-escaped `\n`/`\r`
-/// two-character forms are folded; `map` translates folded byte offsets back
-/// to the original byte offset of each folded char.
+/// Text with every line break and recognized line-number gutter removed so
+/// wrapped encodings match however the CLI wrapped them (EB-3/EE-7). Both real
+/// newlines and the JSON-escaped `\n`/`\r` forms are folded; `map` translates
+/// folded byte offsets back to the original byte offset of each folded char.
 struct FoldedText {
     text: String,
     map: Vec<usize>,
 }
 
+fn line_number_prefix_len(text: &str) -> usize {
+    let Some(number) = text.as_bytes().get(..6) else {
+        return 0;
+    };
+    if !number.iter().all(|b| matches!(b, b' ' | b'0'..=b'9'))
+        || !number.iter().any(u8::is_ascii_digit)
+    {
+        return 0;
+    }
+    let rest = &text[6..];
+    if rest.starts_with("│ ") {
+        6 + "│ ".len()
+    } else if rest.starts_with('\t') {
+        7
+    } else {
+        0
+    }
+}
+
 fn fold_line_breaks(text: &str) -> FoldedText {
     let mut folded = String::with_capacity(text.len());
     let mut map = Vec::with_capacity(text.len());
-    let mut chars = text.char_indices().peekable();
-    while let Some((idx, ch)) = chars.next() {
+    let mut idx = 0usize;
+    let mut line_start = true;
+    while idx < text.len() {
+        if line_start {
+            idx += line_number_prefix_len(&text[idx..]);
+            line_start = false;
+            if idx >= text.len() {
+                break;
+            }
+        }
+        let Some(ch) = text[idx..].chars().next() else {
+            break;
+        };
         match ch {
-            '\n' | '\r' => {}
+            '\n' | '\r' => line_start = true,
             '\\' => {
-                if matches!(chars.peek(), Some(&(_, 'n' | 'r'))) {
-                    chars.next();
-                } else {
-                    push_mapped(&mut folded, &mut map, idx, ch);
+                let next = idx + 1;
+                if matches!(text[next..].chars().next(), Some('n' | 'r')) {
+                    idx = next + 1;
+                    line_start = true;
+                    continue;
                 }
+                push_mapped(&mut folded, &mut map, idx, ch);
             }
             _ => push_mapped(&mut folded, &mut map, idx, ch),
         }
+        idx += ch.len_utf8();
     }
     FoldedText { text: folded, map }
 }
@@ -1163,6 +1203,110 @@ fn build_variant_matcher(variants: &[SecretString]) -> Option<aho_corasick::AhoC
     }
 }
 
+const MAX_PARTIAL_CUT_MARKERS: usize = 16;
+
+fn build_cut_matcher(variants: &[SecretString]) -> PartialCutMatcher {
+    use secrecy::ExposeSecret;
+    let mut prefixes: Vec<SecretString> = variants
+        .iter()
+        .filter(|variant| {
+            let value = variant.expose_secret();
+            value.len() > MIN_REDACTED_SECRET_BYTES
+                && value.len() <= BASE64_ALIGNED_CHUNK_CHARS
+                && value.is_ascii()
+        })
+        .cloned()
+        .collect();
+    prefixes.sort_by(|left, right| left.expose_secret().cmp(right.expose_secret()));
+    prefixes.dedup_by(|left, right| left.expose_secret() == right.expose_secret());
+    let mut reversed: Vec<SecretString> = prefixes
+        .iter()
+        .map(|variant| {
+            SecretString::from(
+                variant
+                    .expose_secret()
+                    .bytes()
+                    .rev()
+                    .map(char::from)
+                    .collect::<String>(),
+            )
+        })
+        .collect();
+    reversed.sort_by(|left, right| left.expose_secret().cmp(right.expose_secret()));
+    PartialCutMatcher { prefixes, reversed }
+}
+
+fn has_longer_prefixed_variant(variants: &[SecretString], fragment: &str) -> bool {
+    use secrecy::ExposeSecret;
+    let index = variants.partition_point(|variant| variant.expose_secret() <= fragment);
+    variants.get(index).is_some_and(|variant| {
+        let value = variant.expose_secret();
+        value.len() > fragment.len() && value.starts_with(fragment)
+    })
+}
+
+impl PartialCutMatcher {
+    fn tail_range(&self, text: &str, end: usize) -> Option<(usize, usize)> {
+        let mut start = end;
+        while start > 0
+            && end - start < BASE64_ALIGNED_CHUNK_CHARS
+            && text.as_bytes()[start - 1].is_ascii()
+        {
+            start -= 1;
+        }
+        let window = &text[start..end];
+        for len in (MIN_REDACTED_SECRET_BYTES..=window.len()).rev() {
+            let fragment = &window[window.len() - len..];
+            if has_longer_prefixed_variant(&self.prefixes, fragment) {
+                return Some((end - len, end));
+            }
+        }
+        None
+    }
+
+    fn head_range(&self, text: &str, start: usize) -> Option<(usize, usize)> {
+        let mut end = start;
+        while end < text.len()
+            && end - start < BASE64_ALIGNED_CHUNK_CHARS
+            && text.as_bytes()[end].is_ascii()
+        {
+            end += 1;
+        }
+        let reversed = text[start..end]
+            .bytes()
+            .rev()
+            .map(char::from)
+            .collect::<String>();
+        for len in (MIN_REDACTED_SECRET_BYTES..=reversed.len()).rev() {
+            if has_longer_prefixed_variant(&self.reversed, &reversed[..len]) {
+                return Some((start, start + len));
+            }
+        }
+        None
+    }
+
+    fn ranges_for_text(&self, text: &str) -> Vec<(usize, usize)> {
+        let mut ranges = Vec::new();
+        ranges.extend(self.head_range(text, 0));
+        let mut from = 0usize;
+        for _ in 0..MAX_PARTIAL_CUT_MARKERS {
+            let Some(relative) = text[from..].find("... [truncated ") else {
+                break;
+            };
+            let marker_start = from + relative;
+            ranges.extend(self.tail_range(text, marker_start));
+            let Some(relative_end) = text[marker_start..].find("] ...") else {
+                break;
+            };
+            let marker_end = marker_start + relative_end + "] ...".len();
+            ranges.extend(self.head_range(text, marker_end));
+            from = marker_end;
+        }
+        ranges.extend(self.tail_range(text, text.len()));
+        ranges
+    }
+}
+
 /// Compact overlapping automaton matches while their end offsets are ordered.
 /// A later long match may swallow several earlier ranges, so merge backwards
 /// instead of storing every occurrence for the final sort.
@@ -1230,6 +1374,112 @@ fn long_variants_contain(variants: &[SecretString], text: &str) -> bool {
         .any(|variant| text.contains(variant.expose_secret()))
 }
 
+const MAX_STRUCTURED_JSON_DEPTH: usize = 4;
+const MAX_STRUCTURED_JSON_FIELDS: usize = 256;
+
+fn structured_key_is_secret(key: &str) -> bool {
+    let key: String = key
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect();
+    if [
+        "uri",
+        "url",
+        "endpoint",
+        "method",
+        "type",
+        "publickey",
+        "publickeydata",
+    ]
+    .iter()
+    .any(|suffix| key.ends_with(suffix))
+    {
+        return false;
+    }
+    matches!(key.as_str(), "auth" | "pwd" | "pass" | "dsn")
+        || key.ends_with("key")
+        || key.ends_with("keydata")
+        || [
+            "token",
+            "secret",
+            "password",
+            "passwd",
+            "passphrase",
+            "credential",
+        ]
+        .iter()
+        .any(|part| key.contains(part))
+}
+
+fn collect_structured_field_secret(field: String, secret_field: bool, fields: &mut Vec<String>) {
+    if fields.len() >= MAX_STRUCTURED_JSON_FIELDS {
+        return;
+    }
+    // URL userinfo can carry a password under any key, including public-looking
+    // names such as database_url. Do not arm the URL's public host/path instead.
+    if field.contains("://")
+        && let Ok(url) = url::Url::parse(&field)
+        && url.has_authority()
+    {
+        if let Some(password) = url.password() {
+            fields.push(password.to_string());
+            // Url::password preserves percent escapes; arm the decoded password
+            // too, while retaining literal '+' characters (not form decoding).
+            if fields.len() < MAX_STRUCTURED_JSON_FIELDS
+                && let Ok(decoded) = urlencoding::decode(password)
+                && decoded != password
+            {
+                fields.push(decoded.into_owned());
+            }
+        }
+    } else if secret_field {
+        fields.push(field);
+    }
+}
+
+fn collect_structured_json_fields(
+    raw: &str,
+    depth: usize,
+    seen: &mut std::collections::HashSet<u64>,
+    fields: &mut Vec<String>,
+) {
+    use std::hash::{Hash, Hasher};
+    if depth >= MAX_STRUCTURED_JSON_DEPTH || fields.len() >= MAX_STRUCTURED_JSON_FIELDS {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return;
+    };
+    let mut pending = vec![(None, value)];
+    while let Some((key, value)) = pending.pop() {
+        if fields.len() >= MAX_STRUCTURED_JSON_FIELDS {
+            return;
+        }
+        match value {
+            serde_json::Value::String(field) => {
+                let secret_field = key.as_deref().is_some_and(structured_key_is_secret);
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                (&field, secret_field).hash(&mut hasher);
+                if seen.insert(hasher.finish()) {
+                    collect_structured_json_fields(&field, depth + 1, seen, fields);
+                    collect_structured_field_secret(field, secret_field, fields);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                pending.extend(items.into_iter().map(|item| (key.clone(), item)));
+            }
+            serde_json::Value::Object(map) => {
+                pending.extend(
+                    map.into_iter()
+                        .map(|(field_key, field)| (Some(field_key), field)),
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
 impl SecretValueRedactor {
     pub fn new(values: &[SecretString]) -> Self {
         use secrecy::ExposeSecret;
@@ -1248,14 +1498,25 @@ impl SecretValueRedactor {
         self.rebuild_matchers();
     }
 
-    fn add_raw(&mut self, raw: &str) {
-        use secrecy::ExposeSecret;
+    fn extend_variants(&mut self, raw: &str) {
         if raw.len() < MIN_REDACTED_SECRET_BYTES {
             return;
         }
         let (direct, folded) = secret_variants(raw);
         self.direct_variants.extend(direct);
         self.folded_variants.extend(folded);
+    }
+
+    fn add_raw(&mut self, raw: &str) {
+        use secrecy::ExposeSecret;
+        self.extend_variants(raw);
+        let mut fields = Vec::new();
+        collect_structured_json_fields(raw, 0, &mut std::collections::HashSet::new(), &mut fields);
+        for field in fields {
+            if field != raw {
+                self.extend_variants(&field);
+            }
+        }
         self.direct_variants
             .sort_by_key(|v| std::cmp::Reverse(v.expose_secret().len()));
         self.folded_variants
@@ -1272,6 +1533,7 @@ impl SecretValueRedactor {
     fn rebuild_matchers(&mut self) {
         self.direct_matcher = build_variant_matcher(&self.direct_variants);
         self.folded_matcher = build_variant_matcher(&self.folded_variants);
+        self.cut_matcher = build_cut_matcher(&self.folded_variants);
     }
 
     pub fn is_armed(&self) -> bool {
@@ -1473,6 +1735,40 @@ impl SecretValueRedactor {
             text.truncate(keep);
             text.push_str("[redacted-secret]");
         }
+    }
+
+    /// Scrub a serialized tool result, including partial encoded chunks at the
+    /// boundaries of output the tool explicitly reports as truncated.
+    pub fn scrub_tool_result(&self, text: &str) -> String {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(text) else {
+            return self.scrub(text);
+        };
+        self.scrub_json(&mut value);
+        let truncated = value
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if truncated && let Some(serde_json::Value::String(output)) = value.get_mut("output") {
+            *output = self.redact_external_cuts(output);
+        }
+        match serde_json::to_string_pretty(&value) {
+            Ok(serialized) => serialized,
+            Err(_) => self.scrub(text),
+        }
+    }
+
+    fn redact_external_cuts(&self, text: &str) -> String {
+        let folded = fold_line_breaks(text);
+        let ranges: Vec<(usize, usize)> = self
+            .cut_matcher
+            .ranges_for_text(&folded.text)
+            .into_iter()
+            .map(|(start, end)| (folded.map[start], char_end_at(text, folded.map[end - 1])))
+            .collect();
+        if ranges.is_empty() {
+            return text.to_string();
+        }
+        replace_ranges(text, ranges)
     }
 
     /// Recursively scrub every string in a JSON value in place, including
@@ -2665,6 +2961,250 @@ mod tests {
     }
 
     #[test]
+    fn redactor_scrubs_decoded_structured_json_fields() {
+        let private_key = format!(
+            "-----BEGIN {0}-----\nfixture-extracted-private-key-material-0123456789\n-----END {0}-----",
+            "PRIVATE KEY"
+        );
+        let nested = serde_json::to_string(&serde_json::json!({
+            "api_token": "nested-extracted-token-0123456789"
+        }))
+        .unwrap(); // safety: test
+        let mounted = serde_json::to_string(&serde_json::json!({
+            "type": "service_account",
+            "project_id": "lunarwing-fixture-project",
+            "client_email": "fixture@lunarwing.invalid",
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "universe_domain": "googleapis.com",
+            "private_key": private_key.clone(),
+            "nested": nested,
+        }))
+        .unwrap(); // safety: test
+        let redactor = SecretValueRedactor::new(&[SecretString::from(mounted)]);
+
+        for decoded in [
+            private_key.as_str(),
+            "fixture-extracted-private-key-material-0123456789",
+            "nested-extracted-token-0123456789",
+        ] {
+            let scrubbed = redactor.scrub(&format!("jq output:\n{decoded}"));
+            assert!(
+                !scrubbed.contains(decoded),
+                "decoded structured field leaked: {decoded}"
+            );
+            assert!(scrubbed.contains("[redacted-secret]"));
+        }
+
+        let public_metadata = concat!(
+            "kind: service_account\n",
+            "token_endpoint = https://oauth2.googleapis.com/token\n",
+            "auth_endpoint = https://accounts.google.com/o/oauth2/auth\n",
+            "api_endpoint = https://storage.googleapis.com/bucket\n",
+            "project_id = lunarwing-fixture-project\n",
+            "client_email = fixture@lunarwing.invalid\n",
+            "universe_domain = googleapis.com\n",
+        );
+        assert_eq!(redactor.scrub(public_metadata), public_metadata);
+        assert!(!redactor.contains_secret(public_metadata));
+
+        let tmp = staging_with(&[("projects/gcp.md", public_metadata)]);
+        let plan =
+            plan_promotion(tmp.path(), &WriteBackPolicy::default(), Some(&redactor)).unwrap(); // safety: test
+        assert_eq!(plan.accepted.len(), 1, "public metadata: {plan:?}");
+        assert!(plan.rejections.is_empty(), "public metadata: {plan:?}");
+    }
+
+    fn assert_extracted_secret_is_redacted(redactor: &SecretValueRedactor, decoded: &str) {
+        use base64::Engine;
+
+        for printed in [
+            decoded.to_string(),
+            base64::engine::general_purpose::STANDARD.encode(decoded),
+            urlencoding::encode(decoded).into_owned(),
+        ] {
+            assert!(redactor.contains_secret(&printed), "missed extracted value");
+            assert_eq!(
+                redactor.scrub(&format!("before {printed} after")),
+                "before [redacted-secret] after"
+            );
+            let tool_result = serde_json::json!({"stdout": printed, "exit_code": 0});
+            let scrubbed = redactor.scrub_tool_result(&tool_result.to_string());
+            let scrubbed: serde_json::Value = serde_json::from_str(&scrubbed).unwrap(); // safety: test
+            assert_eq!(scrubbed["stdout"], "[redacted-secret]");
+            assert_eq!(scrubbed["exit_code"], 0);
+        }
+        let tmp = staging_with(&[("projects/extracted.md", decoded)]);
+        let plan = plan_promotion(tmp.path(), &WriteBackPolicy::default(), Some(redactor)).unwrap(); // safety: test
+        assert!(plan.accepted.is_empty(), "extracted secret: {plan:?}");
+        assert_eq!(plan.rejections.len(), 1);
+    }
+
+    #[test]
+    fn redactor_scrubs_common_structured_credential_layouts() {
+        use base64::Engine;
+
+        // Keep PEM armor assembled at runtime: scanner-safe, like the GCP fixture.
+        let pem = format!(
+            "-----BEGIN {0}-----\nlayout-private-fixture-material-0123456789\n-----END {0}-----",
+            "PRIVATE KEY"
+        );
+        let key_data = base64::engine::general_purpose::STANDARD.encode(&pem);
+        let auth = base64::engine::general_purpose::STANDARD
+            .encode("fixture-user:docker-layout-fixture-value");
+        let value = "layout-credential-\"fixture\"-0123456789";
+        let opaque = "fixture:opaque://credential-value";
+        let layouts = [
+            (serde_json::json!({"private_key": pem}), pem.as_str()),
+            (serde_json::json!({"privateKey": pem}), pem.as_str()),
+            (serde_json::json!({"apiKey": value}), value),
+            (serde_json::json!({"key": value}), value),
+            (
+                serde_json::json!({"users": [{"user": {"client-key-data": key_data}}]}),
+                key_data.as_str(),
+            ),
+            (
+                serde_json::json!({"auths": {"registry.invalid": {"auth": auth}}}),
+                auth.as_str(),
+            ),
+            (serde_json::json!({"pwd": value}), value),
+            (serde_json::json!({"SecretAccessKey": value}), value),
+            (serde_json::json!({"SessionToken": value}), value),
+            (serde_json::json!({"api_tokens": [value]}), value),
+            (serde_json::json!({"pass": value}), value),
+            (serde_json::json!({"databasePassword": value}), value),
+            (serde_json::json!({"db-passwd": value}), value),
+            (serde_json::json!({"keyPassphrase": value}), value),
+            (serde_json::json!({"service.credentials": [value]}), value),
+            // An opaque value containing :// is not a scheme://authority URL.
+            (serde_json::json!({"password": opaque}), opaque),
+            (
+                serde_json::json!({"nested": serde_json::json!({"apiKey": value}).to_string()}),
+                value,
+            ),
+            // The public occurrence is visited first; it must not suppress auth.
+            (serde_json::json!({"auth": value, "z_public": value}), value),
+        ];
+        for (mounted, decoded) in layouts {
+            let redactor = SecretValueRedactor::new(&[SecretString::from(mounted.to_string())]);
+            assert_extracted_secret_is_redacted(&redactor, decoded);
+        }
+    }
+
+    #[test]
+    fn redactor_extracts_structured_url_passwords_under_any_key() {
+        let plain = "database-layout-fixture-0123456789";
+        let encoded = "credential%2furl%40fixture+pw%3a%c3%a9";
+        let decoded = "credential/url@fixture+pw:é";
+        for (mounted, url, password, decoded_password) in [
+            (
+                serde_json::json!({"database_url": format!("postgres://lw:{plain}@db/lw")}),
+                format!("postgres://lw:{plain}@db/lw"),
+                plain,
+                plain,
+            ),
+            (
+                serde_json::json!({"dsn": format!("mysql://fixture-user:{encoded}@db.invalid/lw")}),
+                format!("mysql://fixture-user:{encoded}@db.invalid/lw"),
+                encoded,
+                decoded,
+            ),
+            (
+                serde_json::json!({"connections": [format!("https://fixture-user:{encoded}@db.invalid/lw")]}),
+                format!("https://fixture-user:{encoded}@db.invalid/lw"),
+                encoded,
+                decoded,
+            ),
+        ] {
+            let redactor = SecretValueRedactor::new(&[SecretString::from(mounted.to_string())]);
+            assert_extracted_secret_is_redacted(&redactor, password);
+            assert_extracted_secret_is_redacted(&redactor, decoded_password);
+            assert_eq!(
+                redactor.scrub(&url),
+                url.replace(password, "[redacted-secret]")
+            );
+            let public_url = url.replace(&format!(":{password}"), "");
+            assert_eq!(redactor.scrub(&public_url), public_url);
+            assert!(!redactor.contains_secret(&public_url));
+            let tmp = staging_with(&[("projects/connection.md", &public_url)]);
+            let plan =
+                plan_promotion(tmp.path(), &WriteBackPolicy::default(), Some(&redactor)).unwrap(); // safety: test
+            assert_eq!(plan.accepted.len(), 1, "public URL: {plan:?}");
+            assert!(plan.rejections.is_empty());
+        }
+    }
+
+    #[test]
+    fn redactor_allows_public_structured_metadata_promotion() {
+        let token_url = "https://oauth2.googleapis.com/token";
+        let refresh_url = "https://auth.example.com/oauth/refresh";
+        let public_key = "ssh-ed25519 AAAA-public-fixture-material probe@host";
+        for (mounted, public) in [
+            (serde_json::json!({"token_uri": token_url}), token_url),
+            (serde_json::json!({"tokenUri": token_url}), token_url),
+            (
+                serde_json::json!({"token_endpoint_auth_method": "client_secret_basic"}),
+                "client_secret_basic",
+            ),
+            (
+                serde_json::json!({"refresh_token_url": refresh_url}),
+                refresh_url,
+            ),
+            (serde_json::json!({"tokenEndpoint": token_url}), token_url),
+            (
+                serde_json::json!({"tokenType": "fixture_bearer"}),
+                "fixture_bearer",
+            ),
+            (serde_json::json!({"public_key": public_key}), public_key),
+            (serde_json::json!({"publicKeyData": public_key}), public_key),
+            // URL shape takes precedence even under an otherwise secret-like key.
+            (serde_json::json!({"auth": token_url}), token_url),
+            (
+                serde_json::json!({"dsn": "postgres://fixture-user@db.invalid/lw"}),
+                "postgres://fixture-user@db.invalid/lw",
+            ),
+        ] {
+            let redactor = SecretValueRedactor::new(&[SecretString::from(mounted.to_string())]);
+            assert_eq!(redactor.scrub(public), public);
+            assert!(!redactor.contains_secret(public));
+            let tmp = staging_with(&[("projects/public.md", public)]);
+            let plan =
+                plan_promotion(tmp.path(), &WriteBackPolicy::default(), Some(&redactor)).unwrap(); // safety: test
+            assert_eq!(plan.accepted.len(), 1, "public metadata: {plan:?}");
+            assert!(plan.rejections.is_empty(), "public metadata: {plan:?}");
+        }
+    }
+
+    #[test]
+    fn structured_json_collection_preserves_bounds() {
+        let urls: Vec<_> = (0..MAX_STRUCTURED_JSON_FIELDS)
+            .map(|n| format!("postgres://lw:fixture%2Fpassword-{n}@db/lw"))
+            .collect();
+        // Leave an odd number of slots: the final URL must not add both forms.
+        let mut fields = vec!["already-collected-fixture".to_string()];
+        collect_structured_json_fields(
+            &serde_json::json!({"database_url": urls}).to_string(),
+            0,
+            &mut std::collections::HashSet::new(),
+            &mut fields,
+        );
+        assert_eq!(fields.len(), MAX_STRUCTURED_JSON_FIELDS);
+
+        let mut nested = serde_json::json!({"apiKey": "nested-layout-fixture-value"}).to_string();
+        for depth in 0..=MAX_STRUCTURED_JSON_DEPTH {
+            let mut fields = Vec::new();
+            collect_structured_json_fields(
+                &nested,
+                0,
+                &mut std::collections::HashSet::new(),
+                &mut fields,
+            );
+            assert_eq!(fields.is_empty(), depth >= MAX_STRUCTURED_JSON_DEPTH);
+            nested = serde_json::json!({"nested": nested}).to_string();
+        }
+    }
+
+    #[test]
     fn redactor_scrubs_json_object_keys() {
         // DG-2: a secret used as a JSON KEY must not survive scrubbing.
         let values = vec![SecretString::from("tok_1234567890abcdef".to_string())];
@@ -2794,6 +3334,51 @@ mod tests {
             let scrubbed = redactor.scrub(&serialized);
             let cleaned: serde_json::Value = serde_json::from_str(&scrubbed).unwrap(); // safety: test
             assert_eq!(cleaned["output"], "[redacted-secret]");
+        }
+    }
+
+    #[test]
+    fn redactor_fold_matching_strips_line_number_gutters() {
+        use base64::Engine;
+        let value: String = (0..5040u32)
+            .map(|i| char::from_digit(i % 10, 10).unwrap()) // safety: test
+            .collect();
+        let redactor = SecretValueRedactor::new([SecretString::from(value)].as_slice());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(
+            (0..5040u32)
+                .map(|i| char::from_digit(i % 10, 10).unwrap()) // safety: test
+                .collect::<String>(),
+        );
+        assert_eq!(encoded.len() % BASE64_ALIGNED_CHUNK_CHARS, 0);
+        let lines: Vec<&str> = encoded
+            .as_bytes()
+            .chunks(64)
+            .map(|line| std::str::from_utf8(line).unwrap()) // safety: test
+            .collect();
+        let read_file = lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| format!("{:>6}│ {}", i + 1, line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cat_n = lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| format!("{:>6}\t{}", i + 1, line))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for view in [read_file, cat_n] {
+            for text in [
+                view.clone(),
+                serde_json::to_string_pretty(&serde_json::json!({ "content": view })).unwrap(), // safety: test
+            ] {
+                let scrubbed = redactor.scrub(&text);
+                for chunk in encoded.as_bytes().chunks(BASE64_ALIGNED_CHUNK_CHARS) {
+                    let chunk = std::str::from_utf8(chunk).unwrap(); // safety: test
+                    assert!(!scrubbed.contains(chunk), "guttered chunk leaked");
+                }
+            }
         }
     }
 
@@ -3230,6 +3815,71 @@ mod tests {
             let chunk = std::str::from_utf8(chunk).unwrap(); // safety: test
             assert!(!folded_scrubbed.contains(chunk), "aligned hex chunk leaked");
         }
+    }
+
+    #[test]
+    fn scrub_tool_result_redacts_encoded_fragments_at_upstream_cuts() {
+        use base64::Engine;
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let value: String = (0..8000u32)
+            .map(|i| {
+                let mixed = i.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                char::from(ALPHABET[mixed as usize % ALPHABET.len()])
+            })
+            .collect();
+        let redactor = SecretValueRedactor::new([SecretString::from(value.clone())].as_slice());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(value);
+        let capture_fragment = &encoded[288..319];
+        let head_fragment = &encoded[288..301];
+        let tail_suffix = &encoded[5001..5040];
+        let tail_prefix = &encoded[5040..5059];
+        let output = format!(
+            "{}\n\n... [truncated 4700 bytes] ...\n\n{}",
+            &encoded[..301],
+            &encoded[5001..5059]
+        );
+        let result = serde_json::json!({
+            "output": output,
+            "exit_code": 0,
+            "sandboxed": false,
+            "truncated": true,
+            "success": true,
+            "warning": "[output truncated]",
+        });
+        let serialized = serde_json::to_string_pretty(&result).unwrap(); // safety: test
+        let full_only = redactor.scrub(&serialized);
+        for fragment in [head_fragment, tail_suffix, tail_prefix] {
+            assert!(
+                full_only.contains(fragment),
+                "probe must distinguish full matching from cut matching"
+            );
+        }
+        let scrubbed = redactor.scrub_tool_result(&serialized);
+        let cleaned: serde_json::Value = serde_json::from_str(&scrubbed).unwrap(); // safety: test
+        let cleaned_output = cleaned["output"].as_str().unwrap(); // safety: test
+        for fragment in [head_fragment, tail_suffix, tail_prefix] {
+            assert!(
+                !cleaned_output.contains(fragment),
+                "upstream cut fragment leaked: {fragment}"
+            );
+        }
+
+        let capture = serde_json::to_string_pretty(&serde_json::json!({
+            "output": &encoded[..319],
+            "truncated": true,
+        }))
+        .unwrap(); // safety: test
+        assert!(redactor.scrub(&capture).contains(capture_fragment));
+        let scrubbed = redactor.scrub_tool_result(&capture);
+        assert!(!scrubbed.contains(capture_fragment));
+
+        let complete = serde_json::to_string_pretty(&serde_json::json!({
+            "output": &encoded[..319],
+            "truncated": false,
+        }))
+        .unwrap(); // safety: test
+        let scrubbed = redactor.scrub_tool_result(&complete);
+        assert!(scrubbed.contains(capture_fragment));
     }
 
     #[test]
