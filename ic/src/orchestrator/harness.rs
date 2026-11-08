@@ -827,6 +827,12 @@ fn sweep_harness_dirs_in(
 /// automaton tables, temporary strings, and serialized copies do not all
 /// zeroize. `Debug` deliberately prints no variant material.
 #[derive(Clone, Default)]
+struct PartialCutMatcher {
+    prefixes: Vec<SecretString>,
+    reversed: Vec<SecretString>,
+}
+
+#[derive(Clone, Default)]
 pub struct SecretValueRedactor {
     /// Variants matched directly against the text: the raw value, per-line
     /// splits of multi-line values, JSON-escaped and URL-encoded forms, and
@@ -839,6 +845,7 @@ pub struct SecretValueRedactor {
     folded_variants: Vec<SecretString>,
     direct_matcher: Option<aho_corasick::AhoCorasick>,
     folded_matcher: Option<aho_corasick::AhoCorasick>,
+    cut_matcher: PartialCutMatcher,
     /// Longest variant length in bytes; bounds the truncation-cut scan.
     max_variant_bytes: usize,
 }
@@ -1067,31 +1074,64 @@ fn secret_variants(raw: &str) -> (Vec<SecretString>, Vec<SecretString>) {
     (direct, folded)
 }
 
-/// Text with every line break removed so wrapped encodings match however the
-/// CLI wrapped them (EB-3). Both real newlines and the JSON-escaped `\n`/`\r`
-/// two-character forms are folded; `map` translates folded byte offsets back
-/// to the original byte offset of each folded char.
+/// Text with every line break and recognized line-number gutter removed so
+/// wrapped encodings match however the CLI wrapped them (EB-3/EE-7). Both real
+/// newlines and the JSON-escaped `\n`/`\r` forms are folded; `map` translates
+/// folded byte offsets back to the original byte offset of each folded char.
 struct FoldedText {
     text: String,
     map: Vec<usize>,
 }
 
+fn line_number_prefix_len(text: &str) -> usize {
+    let Some(number) = text.as_bytes().get(..6) else {
+        return 0;
+    };
+    if !number.iter().all(|b| matches!(b, b' ' | b'0'..=b'9'))
+        || !number.iter().any(u8::is_ascii_digit)
+    {
+        return 0;
+    }
+    let rest = &text[6..];
+    if rest.starts_with("│ ") {
+        6 + "│ ".len()
+    } else if rest.starts_with('\t') {
+        7
+    } else {
+        0
+    }
+}
+
 fn fold_line_breaks(text: &str) -> FoldedText {
     let mut folded = String::with_capacity(text.len());
     let mut map = Vec::with_capacity(text.len());
-    let mut chars = text.char_indices().peekable();
-    while let Some((idx, ch)) = chars.next() {
+    let mut idx = 0usize;
+    let mut line_start = true;
+    while idx < text.len() {
+        if line_start {
+            idx += line_number_prefix_len(&text[idx..]);
+            line_start = false;
+            if idx >= text.len() {
+                break;
+            }
+        }
+        let Some(ch) = text[idx..].chars().next() else {
+            break;
+        };
         match ch {
-            '\n' | '\r' => {}
+            '\n' | '\r' => line_start = true,
             '\\' => {
-                if matches!(chars.peek(), Some(&(_, 'n' | 'r'))) {
-                    chars.next();
-                } else {
-                    push_mapped(&mut folded, &mut map, idx, ch);
+                let next = idx + 1;
+                if matches!(text[next..].chars().next(), Some('n' | 'r')) {
+                    idx = next + 1;
+                    line_start = true;
+                    continue;
                 }
+                push_mapped(&mut folded, &mut map, idx, ch);
             }
             _ => push_mapped(&mut folded, &mut map, idx, ch),
         }
+        idx += ch.len_utf8();
     }
     FoldedText { text: folded, map }
 }
@@ -1163,6 +1203,110 @@ fn build_variant_matcher(variants: &[SecretString]) -> Option<aho_corasick::AhoC
     }
 }
 
+const MAX_PARTIAL_CUT_MARKERS: usize = 16;
+
+fn build_cut_matcher(variants: &[SecretString]) -> PartialCutMatcher {
+    use secrecy::ExposeSecret;
+    let mut prefixes: Vec<SecretString> = variants
+        .iter()
+        .filter(|variant| {
+            let value = variant.expose_secret();
+            value.len() > MIN_REDACTED_SECRET_BYTES
+                && value.len() <= BASE64_ALIGNED_CHUNK_CHARS
+                && value.is_ascii()
+        })
+        .cloned()
+        .collect();
+    prefixes.sort_by(|left, right| left.expose_secret().cmp(right.expose_secret()));
+    prefixes.dedup_by(|left, right| left.expose_secret() == right.expose_secret());
+    let mut reversed: Vec<SecretString> = prefixes
+        .iter()
+        .map(|variant| {
+            SecretString::from(
+                variant
+                    .expose_secret()
+                    .bytes()
+                    .rev()
+                    .map(char::from)
+                    .collect::<String>(),
+            )
+        })
+        .collect();
+    reversed.sort_by(|left, right| left.expose_secret().cmp(right.expose_secret()));
+    PartialCutMatcher { prefixes, reversed }
+}
+
+fn has_longer_prefixed_variant(variants: &[SecretString], fragment: &str) -> bool {
+    use secrecy::ExposeSecret;
+    let index = variants.partition_point(|variant| variant.expose_secret() <= fragment);
+    variants.get(index).is_some_and(|variant| {
+        let value = variant.expose_secret();
+        value.len() > fragment.len() && value.starts_with(fragment)
+    })
+}
+
+impl PartialCutMatcher {
+    fn tail_range(&self, text: &str, end: usize) -> Option<(usize, usize)> {
+        let mut start = end;
+        while start > 0
+            && end - start < BASE64_ALIGNED_CHUNK_CHARS
+            && text.as_bytes()[start - 1].is_ascii()
+        {
+            start -= 1;
+        }
+        let window = &text[start..end];
+        for len in (MIN_REDACTED_SECRET_BYTES..=window.len()).rev() {
+            let fragment = &window[window.len() - len..];
+            if has_longer_prefixed_variant(&self.prefixes, fragment) {
+                return Some((end - len, end));
+            }
+        }
+        None
+    }
+
+    fn head_range(&self, text: &str, start: usize) -> Option<(usize, usize)> {
+        let mut end = start;
+        while end < text.len()
+            && end - start < BASE64_ALIGNED_CHUNK_CHARS
+            && text.as_bytes()[end].is_ascii()
+        {
+            end += 1;
+        }
+        let reversed = text[start..end]
+            .bytes()
+            .rev()
+            .map(char::from)
+            .collect::<String>();
+        for len in (MIN_REDACTED_SECRET_BYTES..=reversed.len()).rev() {
+            if has_longer_prefixed_variant(&self.reversed, &reversed[..len]) {
+                return Some((start, start + len));
+            }
+        }
+        None
+    }
+
+    fn ranges_for_text(&self, text: &str) -> Vec<(usize, usize)> {
+        let mut ranges = Vec::new();
+        ranges.extend(self.head_range(text, 0));
+        let mut from = 0usize;
+        for _ in 0..MAX_PARTIAL_CUT_MARKERS {
+            let Some(relative) = text[from..].find("... [truncated ") else {
+                break;
+            };
+            let marker_start = from + relative;
+            ranges.extend(self.tail_range(text, marker_start));
+            let Some(relative_end) = text[marker_start..].find("] ...") else {
+                break;
+            };
+            let marker_end = marker_start + relative_end + "] ...".len();
+            ranges.extend(self.head_range(text, marker_end));
+            from = marker_end;
+        }
+        ranges.extend(self.tail_range(text, text.len()));
+        ranges
+    }
+}
+
 /// Compact overlapping automaton matches while their end offsets are ordered.
 /// A later long match may swallow several earlier ranges, so merge backwards
 /// instead of storing every occurrence for the final sort.
@@ -1230,6 +1374,65 @@ fn long_variants_contain(variants: &[SecretString], text: &str) -> bool {
         .any(|variant| text.contains(variant.expose_secret()))
 }
 
+const MAX_STRUCTURED_JSON_DEPTH: usize = 4;
+const MAX_STRUCTURED_JSON_FIELDS: usize = 256;
+
+fn structured_key_is_secret(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    if matches!(key.as_str(), "token_uri" | "token_url" | "token_endpoint") {
+        return false;
+    }
+    matches!(key.as_str(), "password" | "passphrase")
+        || key.ends_with("_key")
+        || key.contains("token")
+        || key.contains("secret")
+        || key.starts_with("credential")
+}
+
+fn collect_structured_json_fields(
+    raw: &str,
+    depth: usize,
+    seen: &mut std::collections::HashSet<u64>,
+    fields: &mut Vec<String>,
+) {
+    use std::hash::{Hash, Hasher};
+    if depth >= MAX_STRUCTURED_JSON_DEPTH || fields.len() >= MAX_STRUCTURED_JSON_FIELDS {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return;
+    };
+    let mut pending = vec![(None, value)];
+    while let Some((key, value)) = pending.pop() {
+        if fields.len() >= MAX_STRUCTURED_JSON_FIELDS {
+            return;
+        }
+        match value {
+            serde_json::Value::String(field) => {
+                let secret_field = key.as_deref().is_some_and(structured_key_is_secret);
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                (&field, secret_field).hash(&mut hasher);
+                if seen.insert(hasher.finish()) {
+                    collect_structured_json_fields(&field, depth + 1, seen, fields);
+                    if secret_field && fields.len() < MAX_STRUCTURED_JSON_FIELDS {
+                        fields.push(field);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                pending.extend(items.into_iter().map(|item| (key.clone(), item)));
+            }
+            serde_json::Value::Object(map) => {
+                pending.extend(
+                    map.into_iter()
+                        .map(|(field_key, field)| (Some(field_key), field)),
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
 impl SecretValueRedactor {
     pub fn new(values: &[SecretString]) -> Self {
         use secrecy::ExposeSecret;
@@ -1248,14 +1451,25 @@ impl SecretValueRedactor {
         self.rebuild_matchers();
     }
 
-    fn add_raw(&mut self, raw: &str) {
-        use secrecy::ExposeSecret;
+    fn extend_variants(&mut self, raw: &str) {
         if raw.len() < MIN_REDACTED_SECRET_BYTES {
             return;
         }
         let (direct, folded) = secret_variants(raw);
         self.direct_variants.extend(direct);
         self.folded_variants.extend(folded);
+    }
+
+    fn add_raw(&mut self, raw: &str) {
+        use secrecy::ExposeSecret;
+        self.extend_variants(raw);
+        let mut fields = Vec::new();
+        collect_structured_json_fields(raw, 0, &mut std::collections::HashSet::new(), &mut fields);
+        for field in fields {
+            if field != raw {
+                self.extend_variants(&field);
+            }
+        }
         self.direct_variants
             .sort_by_key(|v| std::cmp::Reverse(v.expose_secret().len()));
         self.folded_variants
@@ -1272,6 +1486,7 @@ impl SecretValueRedactor {
     fn rebuild_matchers(&mut self) {
         self.direct_matcher = build_variant_matcher(&self.direct_variants);
         self.folded_matcher = build_variant_matcher(&self.folded_variants);
+        self.cut_matcher = build_cut_matcher(&self.folded_variants);
     }
 
     pub fn is_armed(&self) -> bool {
@@ -1473,6 +1688,40 @@ impl SecretValueRedactor {
             text.truncate(keep);
             text.push_str("[redacted-secret]");
         }
+    }
+
+    /// Scrub a serialized tool result, including partial encoded chunks at the
+    /// boundaries of output the tool explicitly reports as truncated.
+    pub fn scrub_tool_result(&self, text: &str) -> String {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(text) else {
+            return self.scrub(text);
+        };
+        self.scrub_json(&mut value);
+        let truncated = value
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if truncated && let Some(serde_json::Value::String(output)) = value.get_mut("output") {
+            *output = self.redact_external_cuts(output);
+        }
+        match serde_json::to_string_pretty(&value) {
+            Ok(serialized) => serialized,
+            Err(_) => self.scrub(text),
+        }
+    }
+
+    fn redact_external_cuts(&self, text: &str) -> String {
+        let folded = fold_line_breaks(text);
+        let ranges: Vec<(usize, usize)> = self
+            .cut_matcher
+            .ranges_for_text(&folded.text)
+            .into_iter()
+            .map(|(start, end)| (folded.map[start], char_end_at(text, folded.map[end - 1])))
+            .collect();
+        if ranges.is_empty() {
+            return text.to_string();
+        }
+        replace_ranges(text, ranges)
     }
 
     /// Recursively scrub every string in a JSON value in place, including
@@ -2665,6 +2914,61 @@ mod tests {
     }
 
     #[test]
+    fn redactor_scrubs_decoded_structured_json_fields() {
+        let private_key = format!(
+            "-----BEGIN {0}-----\nfixture-extracted-private-key-material-0123456789\n-----END {0}-----",
+            "PRIVATE KEY"
+        );
+        let nested = serde_json::to_string(&serde_json::json!({
+            "api_token": "nested-extracted-token-0123456789"
+        }))
+        .unwrap(); // safety: test
+        let mounted = serde_json::to_string(&serde_json::json!({
+            "type": "service_account",
+            "project_id": "lunarwing-fixture-project",
+            "client_email": "fixture@lunarwing.invalid",
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "universe_domain": "googleapis.com",
+            "private_key": private_key.clone(),
+            "nested": nested,
+        }))
+        .unwrap(); // safety: test
+        let redactor = SecretValueRedactor::new(&[SecretString::from(mounted)]);
+
+        for decoded in [
+            private_key.as_str(),
+            "fixture-extracted-private-key-material-0123456789",
+            "nested-extracted-token-0123456789",
+        ] {
+            let scrubbed = redactor.scrub(&format!("jq output:\n{decoded}"));
+            assert!(
+                !scrubbed.contains(decoded),
+                "decoded structured field leaked: {decoded}"
+            );
+            assert!(scrubbed.contains("[redacted-secret]"));
+        }
+
+        let public_metadata = concat!(
+            "kind: service_account\n",
+            "token_endpoint = https://oauth2.googleapis.com/token\n",
+            "auth_endpoint = https://accounts.google.com/o/oauth2/auth\n",
+            "api_endpoint = https://storage.googleapis.com/bucket\n",
+            "project_id = lunarwing-fixture-project\n",
+            "client_email = fixture@lunarwing.invalid\n",
+            "universe_domain = googleapis.com\n",
+        );
+        assert_eq!(redactor.scrub(public_metadata), public_metadata);
+        assert!(!redactor.contains_secret(public_metadata));
+
+        let tmp = staging_with(&[("projects/gcp.md", public_metadata)]);
+        let plan =
+            plan_promotion(tmp.path(), &WriteBackPolicy::default(), Some(&redactor)).unwrap(); // safety: test
+        assert_eq!(plan.accepted.len(), 1, "public metadata: {plan:?}");
+        assert!(plan.rejections.is_empty(), "public metadata: {plan:?}");
+    }
+
+    #[test]
     fn redactor_scrubs_json_object_keys() {
         // DG-2: a secret used as a JSON KEY must not survive scrubbing.
         let values = vec![SecretString::from("tok_1234567890abcdef".to_string())];
@@ -2794,6 +3098,51 @@ mod tests {
             let scrubbed = redactor.scrub(&serialized);
             let cleaned: serde_json::Value = serde_json::from_str(&scrubbed).unwrap(); // safety: test
             assert_eq!(cleaned["output"], "[redacted-secret]");
+        }
+    }
+
+    #[test]
+    fn redactor_fold_matching_strips_line_number_gutters() {
+        use base64::Engine;
+        let value: String = (0..5040u32)
+            .map(|i| char::from_digit(i % 10, 10).unwrap()) // safety: test
+            .collect();
+        let redactor = SecretValueRedactor::new([SecretString::from(value)].as_slice());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(
+            (0..5040u32)
+                .map(|i| char::from_digit(i % 10, 10).unwrap()) // safety: test
+                .collect::<String>(),
+        );
+        assert_eq!(encoded.len() % BASE64_ALIGNED_CHUNK_CHARS, 0);
+        let lines: Vec<&str> = encoded
+            .as_bytes()
+            .chunks(64)
+            .map(|line| std::str::from_utf8(line).unwrap()) // safety: test
+            .collect();
+        let read_file = lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| format!("{:>6}│ {}", i + 1, line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cat_n = lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| format!("{:>6}\t{}", i + 1, line))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for view in [read_file, cat_n] {
+            for text in [
+                view.clone(),
+                serde_json::to_string_pretty(&serde_json::json!({ "content": view })).unwrap(), // safety: test
+            ] {
+                let scrubbed = redactor.scrub(&text);
+                for chunk in encoded.as_bytes().chunks(BASE64_ALIGNED_CHUNK_CHARS) {
+                    let chunk = std::str::from_utf8(chunk).unwrap(); // safety: test
+                    assert!(!scrubbed.contains(chunk), "guttered chunk leaked");
+                }
+            }
         }
     }
 
@@ -3230,6 +3579,71 @@ mod tests {
             let chunk = std::str::from_utf8(chunk).unwrap(); // safety: test
             assert!(!folded_scrubbed.contains(chunk), "aligned hex chunk leaked");
         }
+    }
+
+    #[test]
+    fn scrub_tool_result_redacts_encoded_fragments_at_upstream_cuts() {
+        use base64::Engine;
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let value: String = (0..8000u32)
+            .map(|i| {
+                let mixed = i.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                char::from(ALPHABET[mixed as usize % ALPHABET.len()])
+            })
+            .collect();
+        let redactor = SecretValueRedactor::new([SecretString::from(value.clone())].as_slice());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(value);
+        let capture_fragment = &encoded[288..319];
+        let head_fragment = &encoded[288..301];
+        let tail_suffix = &encoded[5001..5040];
+        let tail_prefix = &encoded[5040..5059];
+        let output = format!(
+            "{}\n\n... [truncated 4700 bytes] ...\n\n{}",
+            &encoded[..301],
+            &encoded[5001..5059]
+        );
+        let result = serde_json::json!({
+            "output": output,
+            "exit_code": 0,
+            "sandboxed": false,
+            "truncated": true,
+            "success": true,
+            "warning": "[output truncated]",
+        });
+        let serialized = serde_json::to_string_pretty(&result).unwrap(); // safety: test
+        let full_only = redactor.scrub(&serialized);
+        for fragment in [head_fragment, tail_suffix, tail_prefix] {
+            assert!(
+                full_only.contains(fragment),
+                "probe must distinguish full matching from cut matching"
+            );
+        }
+        let scrubbed = redactor.scrub_tool_result(&serialized);
+        let cleaned: serde_json::Value = serde_json::from_str(&scrubbed).unwrap(); // safety: test
+        let cleaned_output = cleaned["output"].as_str().unwrap(); // safety: test
+        for fragment in [head_fragment, tail_suffix, tail_prefix] {
+            assert!(
+                !cleaned_output.contains(fragment),
+                "upstream cut fragment leaked: {fragment}"
+            );
+        }
+
+        let capture = serde_json::to_string_pretty(&serde_json::json!({
+            "output": &encoded[..319],
+            "truncated": true,
+        }))
+        .unwrap(); // safety: test
+        assert!(redactor.scrub(&capture).contains(capture_fragment));
+        let scrubbed = redactor.scrub_tool_result(&capture);
+        assert!(!scrubbed.contains(capture_fragment));
+
+        let complete = serde_json::to_string_pretty(&serde_json::json!({
+            "output": &encoded[..319],
+            "truncated": false,
+        }))
+        .unwrap(); // safety: test
+        let scrubbed = redactor.scrub_tool_result(&complete);
+        assert!(scrubbed.contains(capture_fragment));
     }
 
     #[test]
