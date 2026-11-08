@@ -45,7 +45,7 @@ When in doubt about where a change belongs, read [`AGENTS.md`](../../AGENTS.md) 
   (`docs/ops/AGENT_GOALS_2.1.9.0.md`). The crate/pin state already moved
   (all LunarWing crates at 2.1.9 per checklist item #1, along with the
   XMPP bridge, the four WASM channels, and their registry packages;
-  kimi worker 2.4.1, opencode v1 at v1.19.5, and opencode2 at v2.2.5;
+  kimi worker 2.5.2, opencode v1 at v1.19.5, and opencode2 at v2.2.6;
   external worker upgrades remain separate from the crate sweep — the v2.0.26
   OpenTunnel boundary was first crossed at v2.0.32 under the maintainer-approved
   WI#427, with WI#357's tunnel compile-out and exposure guards retained;
