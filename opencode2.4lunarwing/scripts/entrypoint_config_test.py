@@ -24,7 +24,8 @@ ENDPOINT = "https://gateway.example.test/openai/v1/"
 
 class EntrypointConfigTests(unittest.TestCase):
     def setUp(self) -> None:
-        temporary = tempfile.TemporaryDirectory(prefix="opencode2-boot-")
+        # The CLI regression executes a fake binary; /tmp is noexec on some hosts.
+        temporary = tempfile.TemporaryDirectory(prefix="opencode2-boot-", dir=LANE)
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.root.chmod(0o755)

@@ -3673,7 +3673,8 @@ class TrivyRetryWrapperBehaviorTests(unittest.TestCase):
         raise AssertionError("trivy_with_retry definition not found in WORKER_SCAN_SCRIPT")
 
     def _run(self, script):
-        with tempfile.TemporaryDirectory() as tmp:
+        # The sleep stub must be executable; /tmp is noexec on some dev hosts.
+        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
             stub_dir = os.path.join(tmp, "stub")
             os.mkdir(stub_dir)
             sleep_stub = os.path.join(stub_dir, "sleep")

@@ -95,6 +95,13 @@ impl ThreadMessage {
         message
     }
 
+    /// Create a user message delivered through the steering surface.
+    pub fn steered(content: impl Into<String>) -> Self {
+        let mut message = Self::user(content);
+        message.provenance = Provenance::Steered;
+        message
+    }
+
     /// Create a system message.
     pub fn system(content: impl Into<String>) -> Self {
         Self {
