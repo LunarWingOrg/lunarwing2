@@ -120,7 +120,9 @@
 20. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/580 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2268 but had some problems - please see review comments on the closed MR and re-attempt
 21. [x] (S) Release notes update rel notes write actual prompt for this later
 22. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/586
-23. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/585
+23. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/585
+    - **DONE 2026-11-08 (`aj/kimi-23-20261108-0600`, WI#585 / XG-1):** malformed-XML pseudo-actions now require uppercase `FINAL` in the original trimmed name. The observed `FINALBroker</arg_value>` recovery remains intact, while `finalize_order</arg_value>` stays a structured action call with its parameters; the existing case-insensitive exact `final` / `final_var` forms are unchanged. Implementation commit: `284f053a3`.
+    - **Verification (`taskset -c 0-17`, Cargo `-j18`):** focused `from_action_calls` tests **12/12 PASS**; `cargo test --locked -p lunarwing_engine --lib` **819/819 PASS**; `cargo clippy --locked -p lunarwing_engine --lib --tests -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` **PASS**. No push or MR was requested; remote CI on the committed local head remains a maintainer/CI step.
 24. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/582
 
 ## Phase 7 - Advanced Operator Notes
