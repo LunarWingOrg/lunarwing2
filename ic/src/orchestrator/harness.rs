@@ -1067,31 +1067,64 @@ fn secret_variants(raw: &str) -> (Vec<SecretString>, Vec<SecretString>) {
     (direct, folded)
 }
 
-/// Text with every line break removed so wrapped encodings match however the
-/// CLI wrapped them (EB-3). Both real newlines and the JSON-escaped `\n`/`\r`
-/// two-character forms are folded; `map` translates folded byte offsets back
-/// to the original byte offset of each folded char.
+/// Text with every line break and recognized line-number gutter removed so
+/// wrapped encodings match however the CLI wrapped them (EB-3/EE-7). Both real
+/// newlines and the JSON-escaped `\n`/`\r` forms are folded; `map` translates
+/// folded byte offsets back to the original byte offset of each folded char.
 struct FoldedText {
     text: String,
     map: Vec<usize>,
 }
 
+fn line_number_prefix_len(text: &str) -> usize {
+    let Some(number) = text.as_bytes().get(..6) else {
+        return 0;
+    };
+    if !number.iter().all(|b| matches!(b, b' ' | b'0'..=b'9'))
+        || !number.iter().any(u8::is_ascii_digit)
+    {
+        return 0;
+    }
+    let rest = &text[6..];
+    if rest.starts_with("│ ") {
+        6 + "│ ".len()
+    } else if rest.starts_with('\t') {
+        7
+    } else {
+        0
+    }
+}
+
 fn fold_line_breaks(text: &str) -> FoldedText {
     let mut folded = String::with_capacity(text.len());
     let mut map = Vec::with_capacity(text.len());
-    let mut chars = text.char_indices().peekable();
-    while let Some((idx, ch)) = chars.next() {
+    let mut idx = 0usize;
+    let mut line_start = true;
+    while idx < text.len() {
+        if line_start {
+            idx += line_number_prefix_len(&text[idx..]);
+            line_start = false;
+            if idx >= text.len() {
+                break;
+            }
+        }
+        let Some(ch) = text[idx..].chars().next() else {
+            break;
+        };
         match ch {
-            '\n' | '\r' => {}
+            '\n' | '\r' => line_start = true,
             '\\' => {
-                if matches!(chars.peek(), Some(&(_, 'n' | 'r'))) {
-                    chars.next();
-                } else {
-                    push_mapped(&mut folded, &mut map, idx, ch);
+                let next = idx + 1;
+                if matches!(text[next..].chars().next(), Some('n' | 'r')) {
+                    idx = next + 1;
+                    line_start = true;
+                    continue;
                 }
+                push_mapped(&mut folded, &mut map, idx, ch);
             }
             _ => push_mapped(&mut folded, &mut map, idx, ch),
         }
+        idx += ch.len_utf8();
     }
     FoldedText { text: folded, map }
 }
@@ -2872,6 +2905,51 @@ mod tests {
             let scrubbed = redactor.scrub(&serialized);
             let cleaned: serde_json::Value = serde_json::from_str(&scrubbed).unwrap(); // safety: test
             assert_eq!(cleaned["output"], "[redacted-secret]");
+        }
+    }
+
+    #[test]
+    fn redactor_fold_matching_strips_line_number_gutters() {
+        use base64::Engine;
+        let value: String = (0..5040u32)
+            .map(|i| char::from_digit(i % 10, 10).unwrap()) // safety: test
+            .collect();
+        let redactor = SecretValueRedactor::new([SecretString::from(value)].as_slice());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(
+            (0..5040u32)
+                .map(|i| char::from_digit(i % 10, 10).unwrap()) // safety: test
+                .collect::<String>(),
+        );
+        assert_eq!(encoded.len() % BASE64_ALIGNED_CHUNK_CHARS, 0);
+        let lines: Vec<&str> = encoded
+            .as_bytes()
+            .chunks(64)
+            .map(|line| std::str::from_utf8(line).unwrap()) // safety: test
+            .collect();
+        let read_file = lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| format!("{:>6}│ {}", i + 1, line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cat_n = lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| format!("{:>6}\t{}", i + 1, line))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for view in [read_file, cat_n] {
+            for text in [
+                view.clone(),
+                serde_json::to_string_pretty(&serde_json::json!({ "content": view })).unwrap(), // safety: test
+            ] {
+                let scrubbed = redactor.scrub(&text);
+                for chunk in encoded.as_bytes().chunks(BASE64_ALIGNED_CHUNK_CHARS) {
+                    let chunk = std::str::from_utf8(chunk).unwrap(); // safety: test
+                    assert!(!scrubbed.contains(chunk), "guttered chunk leaked");
+                }
+            }
         }
     }
 
