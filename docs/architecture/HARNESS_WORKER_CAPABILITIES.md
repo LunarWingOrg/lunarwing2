@@ -43,8 +43,12 @@ The v2.1.9.0 WI#580 follow-up closes three more residuals:
 
 - JSON-mounted secrets arm decoded values of secret-like fields recursively
   (including PEM bodies and JSON documents nested in strings) without arming
-  public credential metadata. Traversal is bounded to four parsing levels and
-  256 unique secret fields per mounted value.
+  public credential metadata. Credential keys are normalized across case and
+  separators, and URL-valued fields contribute their userinfo passwords.
+  Nested JSON-string parsing is bounded to four levels; collection stops at
+  256 secret strings per mounted value (a URL's original percent-encoded and
+  decoded passwords each consume a slot when different). Object/array traversal
+  is bounded by the mounted value's size and runs only when building the redactor.
 - Fold matching recognizes and removes `read_file`'s six-column `NNNNNN│ `
   gutters and `cat -n`'s six-column tab-separated prefixes, so non-canonical
   wrap widths and large encodings remain covered in those presentations.
@@ -135,14 +139,23 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
   own, though its whole value and its other lines still are. Per-line
   JSON-escaped forms are armed alongside the raw lines, so replacing a line
   that ends in a backslash cannot leave malformed JSON (EE-11). Decoded values
-  of JSON-mounted fields receive the same variant treatment only when their key
-  is secret-like: case-insensitive `*_key`, a key containing `token` or
-  `secret`, exact `password` / `passphrase`, or a key beginning `credential`.
-  OAuth `token_uri`, `token_url`, and `token_endpoint` fields are endpoints,
-  not token values; other public metadata such as `type`, `project_id`,
-  `client_email`, and URLs is not armed separately either. The complete mounted
-  value remains armed, and nested traversal retains the depth and field caps
-  listed above (DZ-2).
+  of JSON-mounted fields receive the same variant treatment when their key
+  is secret-like (XI-1): lowercase the ASCII alphanumerics and discard separators,
+  then match suffixes `key` / `keydata`, substrings `token`, `secret`, `password`,
+  `passwd`, `passphrase`, `credential`, or exact `auth`, `pwd`, `pass`, `dsn`.
+  This covers camelCase keys, kubeconfig `client-key-data`, Docker registry
+  `auth`, AWS credentials, and secret arrays that inherit their field's key.
+  Keys ending in normalized `uri`, `url`, `endpoint`, `method`, `type`,
+  `publickey`, or `publickeydata` are excluded (XI-2); public metadata such as
+  `tokenUri`, `refresh_token_url`, `token_endpoint_auth_method`, `public_key`,
+  `type`, `project_id`, and `client_email` is not armed separately.
+  For parseable `scheme://` URL values under **any** key, only the userinfo
+  password is extracted, in its original percent-encoded and decoded UTF-8
+  forms (literal `+` is preserved). A URL without a password contributes
+  nothing, even under a secret-like key; its username, host, path, query, and
+  fragment are not independently armed. Invalid UTF-8 percent escapes retain
+  only the encoded password. The complete mounted value remains armed, and
+  collection retains the depth/count caps listed above (DZ-2).
   Fold matching also strips the exact six-column `read_file` and `cat -n`
   prefixes before matching, preserving a map back to original offsets (EE-7).
   Variants are sorted longest-first across all mounted values. JSON object

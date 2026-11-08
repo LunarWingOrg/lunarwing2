@@ -1378,15 +1378,64 @@ const MAX_STRUCTURED_JSON_DEPTH: usize = 4;
 const MAX_STRUCTURED_JSON_FIELDS: usize = 256;
 
 fn structured_key_is_secret(key: &str) -> bool {
-    let key = key.to_ascii_lowercase();
-    if matches!(key.as_str(), "token_uri" | "token_url" | "token_endpoint") {
+    let key: String = key
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect();
+    if [
+        "uri",
+        "url",
+        "endpoint",
+        "method",
+        "type",
+        "publickey",
+        "publickeydata",
+    ]
+    .iter()
+    .any(|suffix| key.ends_with(suffix))
+    {
         return false;
     }
-    matches!(key.as_str(), "password" | "passphrase")
-        || key.ends_with("_key")
-        || key.contains("token")
-        || key.contains("secret")
-        || key.starts_with("credential")
+    matches!(key.as_str(), "auth" | "pwd" | "pass" | "dsn")
+        || key.ends_with("key")
+        || key.ends_with("keydata")
+        || [
+            "token",
+            "secret",
+            "password",
+            "passwd",
+            "passphrase",
+            "credential",
+        ]
+        .iter()
+        .any(|part| key.contains(part))
+}
+
+fn collect_structured_field_secret(field: String, secret_field: bool, fields: &mut Vec<String>) {
+    if fields.len() >= MAX_STRUCTURED_JSON_FIELDS {
+        return;
+    }
+    // URL userinfo can carry a password under any key, including public-looking
+    // names such as database_url. Do not arm the URL's public host/path instead.
+    if field.contains("://")
+        && let Ok(url) = url::Url::parse(&field)
+        && url.has_authority()
+    {
+        if let Some(password) = url.password() {
+            fields.push(password.to_string());
+            // Url::password preserves percent escapes; arm the decoded password
+            // too, while retaining literal '+' characters (not form decoding).
+            if fields.len() < MAX_STRUCTURED_JSON_FIELDS
+                && let Ok(decoded) = urlencoding::decode(password)
+                && decoded != password
+            {
+                fields.push(decoded.into_owned());
+            }
+        }
+    } else if secret_field {
+        fields.push(field);
+    }
 }
 
 fn collect_structured_json_fields(
@@ -1414,9 +1463,7 @@ fn collect_structured_json_fields(
                 (&field, secret_field).hash(&mut hasher);
                 if seen.insert(hasher.finish()) {
                     collect_structured_json_fields(&field, depth + 1, seen, fields);
-                    if secret_field && fields.len() < MAX_STRUCTURED_JSON_FIELDS {
-                        fields.push(field);
-                    }
+                    collect_structured_field_secret(field, secret_field, fields);
                 }
             }
             serde_json::Value::Array(items) => {
@@ -2966,6 +3013,195 @@ mod tests {
             plan_promotion(tmp.path(), &WriteBackPolicy::default(), Some(&redactor)).unwrap(); // safety: test
         assert_eq!(plan.accepted.len(), 1, "public metadata: {plan:?}");
         assert!(plan.rejections.is_empty(), "public metadata: {plan:?}");
+    }
+
+    fn assert_extracted_secret_is_redacted(redactor: &SecretValueRedactor, decoded: &str) {
+        use base64::Engine;
+
+        for printed in [
+            decoded.to_string(),
+            base64::engine::general_purpose::STANDARD.encode(decoded),
+            urlencoding::encode(decoded).into_owned(),
+        ] {
+            assert!(redactor.contains_secret(&printed), "missed extracted value");
+            assert_eq!(
+                redactor.scrub(&format!("before {printed} after")),
+                "before [redacted-secret] after"
+            );
+            let tool_result = serde_json::json!({"stdout": printed, "exit_code": 0});
+            let scrubbed = redactor.scrub_tool_result(&tool_result.to_string());
+            let scrubbed: serde_json::Value = serde_json::from_str(&scrubbed).unwrap(); // safety: test
+            assert_eq!(scrubbed["stdout"], "[redacted-secret]");
+            assert_eq!(scrubbed["exit_code"], 0);
+        }
+        let tmp = staging_with(&[("projects/extracted.md", decoded)]);
+        let plan = plan_promotion(tmp.path(), &WriteBackPolicy::default(), Some(redactor)).unwrap(); // safety: test
+        assert!(plan.accepted.is_empty(), "extracted secret: {plan:?}");
+        assert_eq!(plan.rejections.len(), 1);
+    }
+
+    #[test]
+    fn redactor_scrubs_common_structured_credential_layouts() {
+        use base64::Engine;
+
+        // Keep PEM armor assembled at runtime: scanner-safe, like the GCP fixture.
+        let pem = format!(
+            "-----BEGIN {0}-----\nlayout-private-fixture-material-0123456789\n-----END {0}-----",
+            "PRIVATE KEY"
+        );
+        let key_data = base64::engine::general_purpose::STANDARD.encode(&pem);
+        let auth = base64::engine::general_purpose::STANDARD
+            .encode("fixture-user:docker-layout-fixture-value");
+        let value = "layout-credential-\"fixture\"-0123456789";
+        let opaque = "fixture:opaque://credential-value";
+        let layouts = [
+            (serde_json::json!({"private_key": pem}), pem.as_str()),
+            (serde_json::json!({"privateKey": pem}), pem.as_str()),
+            (serde_json::json!({"apiKey": value}), value),
+            (serde_json::json!({"key": value}), value),
+            (
+                serde_json::json!({"users": [{"user": {"client-key-data": key_data}}]}),
+                key_data.as_str(),
+            ),
+            (
+                serde_json::json!({"auths": {"registry.invalid": {"auth": auth}}}),
+                auth.as_str(),
+            ),
+            (serde_json::json!({"pwd": value}), value),
+            (serde_json::json!({"SecretAccessKey": value}), value),
+            (serde_json::json!({"SessionToken": value}), value),
+            (serde_json::json!({"api_tokens": [value]}), value),
+            (serde_json::json!({"pass": value}), value),
+            (serde_json::json!({"databasePassword": value}), value),
+            (serde_json::json!({"db-passwd": value}), value),
+            (serde_json::json!({"keyPassphrase": value}), value),
+            (serde_json::json!({"service.credentials": [value]}), value),
+            // An opaque value containing :// is not a scheme://authority URL.
+            (serde_json::json!({"password": opaque}), opaque),
+            (
+                serde_json::json!({"nested": serde_json::json!({"apiKey": value}).to_string()}),
+                value,
+            ),
+            // The public occurrence is visited first; it must not suppress auth.
+            (serde_json::json!({"auth": value, "z_public": value}), value),
+        ];
+        for (mounted, decoded) in layouts {
+            let redactor = SecretValueRedactor::new(&[SecretString::from(mounted.to_string())]);
+            assert_extracted_secret_is_redacted(&redactor, decoded);
+        }
+    }
+
+    #[test]
+    fn redactor_extracts_structured_url_passwords_under_any_key() {
+        let plain = "database-layout-fixture-0123456789";
+        let encoded = "credential%2furl%40fixture+pw%3a%c3%a9";
+        let decoded = "credential/url@fixture+pw:é";
+        for (mounted, url, password, decoded_password) in [
+            (
+                serde_json::json!({"database_url": format!("postgres://lw:{plain}@db/lw")}),
+                format!("postgres://lw:{plain}@db/lw"),
+                plain,
+                plain,
+            ),
+            (
+                serde_json::json!({"dsn": format!("mysql://fixture-user:{encoded}@db.invalid/lw")}),
+                format!("mysql://fixture-user:{encoded}@db.invalid/lw"),
+                encoded,
+                decoded,
+            ),
+            (
+                serde_json::json!({"connections": [format!("https://fixture-user:{encoded}@db.invalid/lw")]}),
+                format!("https://fixture-user:{encoded}@db.invalid/lw"),
+                encoded,
+                decoded,
+            ),
+        ] {
+            let redactor = SecretValueRedactor::new(&[SecretString::from(mounted.to_string())]);
+            assert_extracted_secret_is_redacted(&redactor, password);
+            assert_extracted_secret_is_redacted(&redactor, decoded_password);
+            assert_eq!(
+                redactor.scrub(&url),
+                url.replace(password, "[redacted-secret]")
+            );
+            let public_url = url.replace(&format!(":{password}"), "");
+            assert_eq!(redactor.scrub(&public_url), public_url);
+            assert!(!redactor.contains_secret(&public_url));
+            let tmp = staging_with(&[("projects/connection.md", &public_url)]);
+            let plan =
+                plan_promotion(tmp.path(), &WriteBackPolicy::default(), Some(&redactor)).unwrap(); // safety: test
+            assert_eq!(plan.accepted.len(), 1, "public URL: {plan:?}");
+            assert!(plan.rejections.is_empty());
+        }
+    }
+
+    #[test]
+    fn redactor_allows_public_structured_metadata_promotion() {
+        let token_url = "https://oauth2.googleapis.com/token";
+        let refresh_url = "https://auth.example.com/oauth/refresh";
+        let public_key = "ssh-ed25519 AAAA-public-fixture-material probe@host";
+        for (mounted, public) in [
+            (serde_json::json!({"token_uri": token_url}), token_url),
+            (serde_json::json!({"tokenUri": token_url}), token_url),
+            (
+                serde_json::json!({"token_endpoint_auth_method": "client_secret_basic"}),
+                "client_secret_basic",
+            ),
+            (
+                serde_json::json!({"refresh_token_url": refresh_url}),
+                refresh_url,
+            ),
+            (serde_json::json!({"tokenEndpoint": token_url}), token_url),
+            (
+                serde_json::json!({"tokenType": "fixture_bearer"}),
+                "fixture_bearer",
+            ),
+            (serde_json::json!({"public_key": public_key}), public_key),
+            (serde_json::json!({"publicKeyData": public_key}), public_key),
+            // URL shape takes precedence even under an otherwise secret-like key.
+            (serde_json::json!({"auth": token_url}), token_url),
+            (
+                serde_json::json!({"dsn": "postgres://fixture-user@db.invalid/lw"}),
+                "postgres://fixture-user@db.invalid/lw",
+            ),
+        ] {
+            let redactor = SecretValueRedactor::new(&[SecretString::from(mounted.to_string())]);
+            assert_eq!(redactor.scrub(public), public);
+            assert!(!redactor.contains_secret(public));
+            let tmp = staging_with(&[("projects/public.md", public)]);
+            let plan =
+                plan_promotion(tmp.path(), &WriteBackPolicy::default(), Some(&redactor)).unwrap(); // safety: test
+            assert_eq!(plan.accepted.len(), 1, "public metadata: {plan:?}");
+            assert!(plan.rejections.is_empty(), "public metadata: {plan:?}");
+        }
+    }
+
+    #[test]
+    fn structured_json_collection_preserves_bounds() {
+        let urls: Vec<_> = (0..MAX_STRUCTURED_JSON_FIELDS)
+            .map(|n| format!("postgres://lw:fixture%2Fpassword-{n}@db/lw"))
+            .collect();
+        // Leave an odd number of slots: the final URL must not add both forms.
+        let mut fields = vec!["already-collected-fixture".to_string()];
+        collect_structured_json_fields(
+            &serde_json::json!({"database_url": urls}).to_string(),
+            0,
+            &mut std::collections::HashSet::new(),
+            &mut fields,
+        );
+        assert_eq!(fields.len(), MAX_STRUCTURED_JSON_FIELDS);
+
+        let mut nested = serde_json::json!({"apiKey": "nested-layout-fixture-value"}).to_string();
+        for depth in 0..=MAX_STRUCTURED_JSON_DEPTH {
+            let mut fields = Vec::new();
+            collect_structured_json_fields(
+                &nested,
+                0,
+                &mut std::collections::HashSet::new(),
+                &mut fields,
+            );
+            assert_eq!(fields.is_empty(), depth >= MAX_STRUCTURED_JSON_DEPTH);
+            nested = serde_json::json!({"nested": nested}).to_string();
+        }
     }
 
     #[test]
