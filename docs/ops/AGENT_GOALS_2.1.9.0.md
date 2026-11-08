@@ -118,12 +118,16 @@
     - **DONE 2026-11-07 (`rarity/kimi-19-20261107-2130`, WI#568):** generated systemd-user units now invoke `lunarwing --no-onboard run`, matching OpenRC, the committed production template, and mt-admin units. Updated the renderer regression assertion and setup specification; WI#567's optional `EnvironmentFile` remains intact
     - **Verification (`taskset -c 0-17`, Cargo `-j18`):** `cargo test --locked --lib service::tests -- --test-threads=18` **23/23 PASS**; `cargo clippy --locked --lib --tests -- -D warnings` **PASS**; `cargo fmt --all -- --check` and `git diff --check` **PASS**.
 20. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/580 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2268 but had some problems - please see review comments on the closed MR and re-attempt
-21. [x] (S) Release notes
+21. [x] (S) Release notes update rel notes write actual prompt for this later
+22. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/586
+23. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/585
+24. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/582
 
 ## Phase 7 - Advanced Operator Notes
 
-22. [x] (H) update rel notes write actual prompt for this later
-23. [x] (S) Deploy the stoplight system
-24. [x] (S) Dive back in to LunarDepth and open worker lanes across the fleet for it get it running and up again patches too
+25. [x] (H) update rel notes write actual prompt for this later
+26. [x] (S) Deploy the stoplight system
+27. [x] (S) Dive back in to LunarDepth and open worker lanes across the fleet for it get it running and up again patches too
+28. [x] (H) RESERVED HUMAN NOTE
 
 ---
