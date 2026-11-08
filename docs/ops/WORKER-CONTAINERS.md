@@ -29,8 +29,9 @@ At the OpenCode v1.18.25 / v2.1.2 pins, Bun 1.4.4 rejected the upstream
 photon-node patch's hunk-10 context whitespace, and each builder ran
 `python3 /build/fix_photon_patch_context.py /build/opencode` immediately after
 checkout and before `bun install --frozen-lockfile`, backporting upstream
-`61845b0`'s three-space repair. **That repair is retired as of the v1.19.5 /
-v2.2.5 pins (WI#531):** both trees carry the repair in content (a
+`61845b0`'s three-space repair. **That repair has been retired since the
+v1.19.5 / v2.2.5 pins (WI#531), including the current v2.2.6 pin (WI#582):**
+both trees carry the repair in content (a
 content-equivalent backport — neither tag contains the commit itself, so do
 not test it with `merge-base --is-ancestor`), so the fixer's exact-match
 guard reports the repair as redundant. The fixer files, their
@@ -732,8 +733,8 @@ plus `opencode service set remote true` and `opencode pair` surfaces. !1490
 completed analysis and approval to cross that boundary at v2.0.32**, through
 the existing compile-out, wrapper, config and image assertions. See the
 v2.0.32 bump entry below for the source review and verification status; the
-lane has since advanced to **v2.2.5** (2026-11-02, WI#531) with every gate
-re-verified against a fresh clone — see the v2.2.5 bump entry.
+lane has since advanced to **v2.2.6** (2026-11-08, WI#582) with every gate
+re-verified against a fresh clone — see the v2.2.6 bump entry.
 
 **Gate record for !1490 (run-79 EI-2):** the in-image layers below (ruleset,
 wrapper, config pins, compile-out) are **naive-use guards, not a boundary**
@@ -1003,14 +1004,15 @@ Enforced controls (opencode2 lane unless noted):
    nondeterminism. Items 28 and 95 stay unchecked until that evidence exists.
    **WI#369 typecheck compiler:** the gate runs whatever `@typescript/native`
    the upstream lock pins. Check its version on every bump: v2.2.5 moved it
-   from `npm:typescript@7.0.2` to a `7.1.0-beta`; a beta compiler in a build
-   gate is acceptable only while it is upstream's own pinned devDependency,
-   resolved through the committed lock, and still exposes `tsc` at `bin/tsc`.
+   from `npm:typescript@7.0.2` to a `7.1.0-beta`, and v2.2.6 retains that
+   version; a beta compiler in a build gate is acceptable only while it is
+   upstream's own pinned devDependency, resolved through the committed lock,
+   and still exposes `tsc` at `bin/tsc`.
    Record the version and the binary path in the bump entry.
 8. **Compile the tunnel out.** `scripts/compile_out_remote_tunnel.py` runs
    in the builder stage: the historical v2.0.24 path verifies there is no
-   tunnel surface; at the current v2.2.5 pin it replaces `remote-tunnel.ts`
-   with a fail-closed stub (re-verified against the real v2.2.5 tree:
+   tunnel surface; at the current v2.2.6 pin it replaces `remote-tunnel.ts`
+   with a fail-closed stub (re-verified against the real v2.2.6 tree:
    importers still use exactly
    `run`/`ensure`/`hostname`). Drift detection scans
    `packages/{cli,server,schema,core}/src` (`*.ts` and `*.tsx`), matches
@@ -1239,8 +1241,8 @@ stack settles. Do not configure both lanes on the same
 tenant during the transition (agent routing confusion — plan §5).
 
 **Dockerfile:** `opencode2.4lunarwing/Dockerfile` — pinned to
-**v2.2.5** at reviewed full commit
-`9bbb8ce18c80f099e0e448775f59d965ead40a21` (WI#531; WI#427 boundary crossing
+**v2.2.6** at reviewed full commit
+`dc2ffcf8bf26f9e669b6aa22b95f50e12be15e06` (WI#582; WI#427 boundary crossing
 first crossed at v2.0.32/`843a6c514e606b436a7fe713422ace0a93ad3d61`); the v2 bridge uses
 `@opencode/client` (promise API) instead of `@opencode-ai/sdk`, and the
 v2 config file is `config/opencode2.json` (`providers` map,
