@@ -1,6 +1,6 @@
 # PRE-RELEASE CHECKLIST for LunarWing v2.1.9.0
 
-## Codename: UNKNOWN
+## Codename: Kaitei 海底 (かいてい) — "The Seabed"
 
 **Open TODOs (v2.1.9.0) — To be done before release**
 
