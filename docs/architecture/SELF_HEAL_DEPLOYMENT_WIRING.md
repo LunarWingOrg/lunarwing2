@@ -111,10 +111,18 @@ of tenant provisioning (unless `--no-health` is passed). This function:
      a failed/killed oneshot immediately. The next scheduled run observes health
      again. Per-tenant user-bus calls are individually bounded too
      (`SELF_HEAL_SYSTEMD_PROBE_TIMEOUT`, default 15s).
-   - **OpenRC**: installs a managed `fcron`/`crontab` entry every 5 min
+   - **OpenRC**: installs a managed `fcron`/`crontab` entry every 15 min
      (managed block).
 
-   Set `LUNARWING_MT_HEALTH_INTERVAL_MIN` to override either default.
+   Both init systems default to 15 min. Set
+   `LUNARWING_MT_HEALTH_INTERVAL_MIN=N` in `/etc/lunarwing/health.env` to
+   persist a different cadence across tenant additions, upgrades, and
+   `enable-health-fleet.sh` runs. Use a plain, unquoted `NAME=value` line
+   without an inline comment. The same-named environment variable takes
+   precedence for a one-off installation and is not written back to the file.
+   Every installation logs the effective interval and its source. Values must
+   be integers from 1 to 59; invalid values abort installation and name their
+   source.
 
 Because the pipeline is host-global and auto-discovers tenants, scheduling is
 idempotent. Subsequent `add-tenant` calls re-run `ensure_health_pipeline()`.
