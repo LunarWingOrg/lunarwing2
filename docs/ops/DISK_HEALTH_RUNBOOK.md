@@ -21,14 +21,23 @@ The defaults are:
 
 Override them with `HEALTH_DISK_DEGRADED_USED_PCT`,
 `HEALTH_DISK_CRITICAL_USED_PCT`, `HEALTH_DISK_DEGRADED_FREE_GIB`, and
-`HEALTH_DISK_CRITICAL_FREE_GIB` in `/etc/lunarwing/health.env`. Each `df` and
-`stat` probe is bounded by `HEALTH_DISK_TIMEOUT` (3 seconds by default). An
-unreadable path, a malformed probe result, or a timeout is degraded rather than
-silently healthy.
+`HEALTH_DISK_CRITICAL_FREE_GIB` in `/etc/lunarwing/health.env`. Thresholds are
+base-10 integers; reversed degraded/critical pairs fall back to the defaults.
+Each `df`, `stat`, and `getent` probe is bounded by `HEALTH_DISK_TIMEOUT` (3
+seconds by default). `HEALTH_DISK_SWEEP_DEADLINE_SECS` (19 by default, `0` to
+disable) returns a degraded partial report instead of letting a fleet sweep hit
+the outer component timeout. An unreadable path, a malformed probe result, or
+a timeout is degraded rather than silently healthy.
+
+A discovered tenant/runtime store or default base directory that does not exist
+is listed with `present:false` and stays healthy. Explicit base and extra paths
+remain strict. Filesystems such as btrfs and vfat that do not account for
+inodes report `inodes_used_pct:null`; their block thresholds still apply.
 
 For a colocated GitLab runner, add its rootless store to
 `HEALTH_DISK_EXTRA_PATHS`, for example
 `HEALTH_DISK_EXTRA_PATHS=/home/gitlab-runner/.local/share/containers/storage`.
+Entries are separated by whitespace; paths containing spaces are not supported.
 Use `HEALTH_DISK_DOCKER_ROOT` when Docker's data root is not `/var/lib/docker`.
 
 ## Triage
@@ -62,18 +71,21 @@ These are operator actions, not steps for the health pipeline to automate.
 Inspect usage first with `podman system df` and `podman images` as the affected
 user. For a rootless tenant, run commands through `sudo -u <tenant-user>` with
 that user's normal rootless environment. After identifying unused containers,
-images, and build cache, consider:
+images, and build cache, consider the narrow operations:
 
 ```bash
-sudo -u <tenant-user> podman system prune
+sudo -u <tenant-user> podman container prune
 sudo -u <tenant-user> podman image prune
+sudo -u <tenant-user> podman builder prune
 ```
 
 Review the prompts. Do not add `--all`, `--volumes`, or `--force` unless the
 operator has separately confirmed that the additional deletion is acceptable.
-For rootful Podman, use the host's normal root administration path instead of a
-tenant account. Docker hosts require the equivalent Docker cleanup as the
-Docker-owning account.
+Avoid `podman system prune` for tenant accounts: it also removes unused
+networks, including a stopped tenant's `lw-egress-<tenant>` network and its
+bound egress allowlist until mt-admin re-creates them. For rootful Podman, use
+the host's normal root administration path instead of a tenant account. Docker
+hosts require the equivalent Docker cleanup as the Docker-owning account.
 
 A GitLab runner is not managed by this repository. If it shares the host, its
 operator can schedule a separate pruning policy, such as a daily
