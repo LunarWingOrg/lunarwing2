@@ -119,7 +119,9 @@
     - **Verification (`taskset -c 0-17`, Cargo `-j18`):** `cargo test --locked --lib service::tests -- --test-threads=18` **23/23 PASS**; `cargo clippy --locked --lib --tests -- -D warnings` **PASS**; `cargo fmt --all -- --check` and `git diff --check` **PASS**.
 20. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/580 - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2268 but had some problems - please see review comments on the closed MR and re-attempt
 21. [x] (S) Release notes update rel notes write actual prompt for this later
-22. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/586
+22. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/586
+    - **DONE 2026-11-08 (`rarity/kimi-22-20261108-0601`, WI#586):** added the read-only `disk` health component with filesystem deduplication, host/container/tenant/extra-path discovery, bounded `df`/`stat` probes, block/inode thresholds, absolute free-space floors, and fail-closed unavailable-path reporting. Wired aggregated reports, per-mount Prometheus gauges, health.env knobs, and monitor-only `disk@<mount>` escalation; no automatic restart or cleanup is possible. Added the 45-assertion fixture suite, GNU `df` compatibility coverage, deployment documentation, and a manual cleanup runbook.
+    - **Verification (`taskset -c 0-17`):** all **21 health suites / 1,077 assertions PASS**, including disk **45/45**; `check-mt-admin.sh`, `test-mt-admin-health-interval.sh`, repository ShellCheck, and Bash syntax for **285 scripts + three hooks** passed. Real GNU `df`/`stat` probes emitted valid healthy JSON in both runtime-none and automatic-discovery runs; `git diff --check` is clean. No Rust source changed, so no cargo lane applies. No push, MR, or remote pipeline was requested; CI on the committed head remains a maintainer/CI step.
 23. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/585
 24. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/582
 
