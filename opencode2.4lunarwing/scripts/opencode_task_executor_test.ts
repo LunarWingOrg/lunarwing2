@@ -927,11 +927,10 @@ assert.ok(contextPromptArgs[1].signal instanceof AbortSignal)
 }
 
 // !1746 review KL-1/KL-2: v2.0.32's built-in Code Mode session_move and
-// session_rename carry no permission check of their own
-// (packages/core/src/tool/plugin/opencode.ts). session_rename rewrites any
-// session title — the WI#324 task binding — and session_move re-roots the
-// session so the KG-2 external_directory confinement never fires. Both must
-// be wholly denied so they are dropped from the tool snapshot.
+// session_rename carried no permission check of their own. v2.2.6 adds an
+// external_directory check to session_move, but the lane keeps the stronger
+// explicit deny for both: move re-roots the session and rename rewrites the
+// WI#324 task-binding title. Both must be dropped from the tool snapshot.
 {
   const rulesetSdk = makeSdk({})
   await runTask(rulesetSdk.sdk)
