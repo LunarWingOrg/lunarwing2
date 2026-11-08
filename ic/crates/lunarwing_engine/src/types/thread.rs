@@ -733,6 +733,20 @@ mod tests {
     }
 
     #[test]
+    fn steered_message_is_captured_as_fresh_user_input() {
+        let mut thread = make_thread();
+        thread.add_message(ThreadMessage::generated_goal("model-generated goal"));
+        thread.add_message(ThreadMessage::steered("operator course correction"));
+
+        assert_eq!(thread.insight_inputs.len(), 1);
+        assert_eq!(thread.insight_inputs[0].text, "operator course correction");
+        assert_eq!(
+            thread.messages[1].provenance,
+            crate::types::provenance::Provenance::Steered
+        );
+    }
+
+    #[test]
     fn child_thread_has_parent() {
         let parent = make_thread();
         let child = Thread::new(
