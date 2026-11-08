@@ -233,6 +233,19 @@ SELF_HEAL_TENANTS_FILE=$PORTS_REGISTRY
 HEALTH_WORKER_EGRESS_RUNTIME=${egress_runtime}
 HEALTH_WORKER_EGRESS_ROOTLESS=${egress_rootless}
 
+# Disk capacity monitoring covers blocks and inodes. Percent thresholds apply
+# to both; free-space floors are GiB. Invalid integers fall back to these
+# defaults. Monitoring is read-only and self-heal only escalates it.
+#HEALTH_DISK_DEGRADED_USED_PCT=80
+#HEALTH_DISK_CRITICAL_USED_PCT=90
+#HEALTH_DISK_DEGRADED_FREE_GIB=5
+#HEALTH_DISK_CRITICAL_FREE_GIB=2
+# Add space-separated operator paths (for example, a colocated GitLab runner's
+# rootless container store). Runtime store locations are discovered by path;
+# HEALTH_DISK_DOCKER_ROOT may override a non-default Docker data root.
+#HEALTH_DISK_EXTRA_PATHS=
+#HEALTH_DISK_DOCKER_ROOT=/var/lib/docker
+
 # MT hardening: remediate only auto-discovered per-tenant init units; disable
 # checks that are N/A host-globally; page only on self-heal escalation (not on
 # every non-healthy run); ignore stale reports.
