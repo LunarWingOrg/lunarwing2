@@ -2172,29 +2172,16 @@ optional for OAuth-backed setups. mt-admin keeps both credentials out of process
 arguments by materializing private `kimi-runtime.env`; API key input uses file
 path rather than plaintext argv. The Kimi Code CLI and bridge are installed
 with `npm ci` from committed integrity locks. `KIMI_CODE_VERSION` defaults to
-`2.3.0` and must match `kimi-cli/package-lock.json` (the pin moved `0.42.0` →
-`0.43.0` → `0.43.1` → `2.0.2` earlier in the v2.1.2.0/v2.1.3.0 cycle, then
-`2.0.2` → `2.1.1` on 2026-09-26 for checklist item #2, adopting npm `latest`
-again, `2.1.1` → `2.2.0` on 2026-10-15 for the v2.1.6.0 checklist item #4,
-and `2.2.0` → `2.3.0` on 2026-10-21 for the v2.1.6.0 checklist item #83,
-again npm `latest`; engine requirement unchanged at `node >=22.19.0`, satisfied by the
-pinned node 22 base; the 2.x behavior changes the worker cares about are the
-headless permission-contract findings below, verified on 2.0.x — the 2.3.0
-live CLI contract gate (`kimi_cli_contract_test.ts`) runs during the worker
-Dockerfile build; the 2.3.0 real-binary lane was additionally run on the
-host (4/4: headless `-p --output-format stream-json` accepted, `--yolo`
-rejected alongside `-p`, the baked `[[hooks]]` PreToolUse guard table
-valid, and the `mcp.json` spawn + `initialize` → `tools/list` MCP
-handshake), so the in-image gate is a re-confirmation of verified
-behavior. 2.3.0's new env surface is
-`KIMI_CODE_MODEL_MIGRATION_STATE_FILE_NAME` and
-`KIMI_CODE_SESSION_RATING_PREVIEW` (survey state renamed); neither is
-exported by the worker). **Blocked at the pin's landing (the !1831
-review's MG-1):** the protected `worker-kimi-candidate` build is blocked by
-the instance's `throttle_unauthenticated_web` rate limit (the !1828
-review's MD-1), so no image has been built from the 2.3.0 pin yet —
-tenants keep their current 2.2.0 images until the limit is lifted and
-the candidate build runs.
+`2.5.2` and must match `kimi-cli/package-lock.json`. WI#582 moved the pin from
+2.4.1 on 2026-11-08; the engine requirement remains `node >=22.19.0`, satisfied
+by the pinned Node 22 base. The worker uses only headless
+`kimi -p --output-format stream-json`, not the server APIs removed in 2.5.0.
+The real-CLI contract gate (`kimi_cli_contract_test.ts`) runs during the image
+build and covers headless invocation, `--yolo` rejection, PreToolUse guard
+configuration, and the MCP handshake. The new creation-time environment flags
+and workspace trust bypass stay off, and the lane does not use the optional
+global-search index; see the WI#582 bump entry for the source audit and
+verification trail.
 An override without a matching reviewed lock fails closed. The pinned version is baked
 into `KIMI_CODE_IMAGE_VERSION` and reported as `kimi_code_version`, and
 `ic/scripts/tests/test-mt-admin-kimi.sh` cross-checks Dockerfile default, CI
