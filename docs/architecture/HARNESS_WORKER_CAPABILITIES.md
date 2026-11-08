@@ -39,6 +39,21 @@ The v2.1.9.0 WI#383 changes close four more residual gaps:
   `Finalizing` separately from worker execution and waits for that bounded
   outcome instead of reporting a false timeout and abandoning the handle.
 
+The v2.1.9.0 WI#580 follow-up closes three more residuals:
+
+- JSON-mounted secrets arm decoded values of secret-like fields recursively
+  (including PEM bodies and JSON documents nested in strings) without arming
+  public credential metadata. Traversal is bounded to four parsing levels and
+  256 unique secret fields per mounted value.
+- Fold matching recognizes and removes `read_file`'s six-column `NNNNNN│ `
+  gutters and `cat -n`'s six-column tab-separated prefixes, so non-canonical
+  wrap widths and large encodings remain covered in those presentations.
+- The worker parses serialized tool results before scrubbing them. For results
+  explicitly marked `truncated: true`, partial base64/hex chunks are redacted
+  at the output boundaries and at up to 16 shell head/tail cut markers.
+  Precomputed, sorted variant indexes keep each boundary check logarithmic in
+  the variant count; ordinary untruncated output does not pay this extra work.
+
 The conventional LunarWing Docker worker can run in **harness mode**
 (`create_job` with `mode: "harness"`), adding three optional capability
 layers on top of the plain `worker` mode. Harness jobs require the Docker
@@ -111,16 +126,25 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
   encoded form is at most 4096 chars, individual wrap lines at the canonical
   widths are armed as direct variants as well (a tool returning one line at a
   time). Independently of that cap, encoded forms arm aligned 48-character
-  base64 and 32-character hex chunks in the folded list. A partial or truncated
-  print is therefore scrubbed in those aligned units at any wrap width,
-  including above the old cap and at non-canonical widths. A trailing fragment
-  shorter than the applicable chunk can still survive; this is not arbitrary
-  slice detection. Per-line variants skip RFC 7468 armor delimiters and lines
-  with no alphanumeric byte (DZ-5): a punctuation-only line of a multi-line
-  value is therefore not armed on its own, though its whole value and its other
-  lines still are. Per-line JSON-escaped forms are armed alongside the raw
-  lines, so replacing a line that ends in a backslash cannot leave malformed
-  JSON (EE-11).
+  base64 and 32-character hex chunks in the folded list, including a final
+  short chunk of at least eight characters. A partial or truncated print is
+  therefore scrubbed in those aligned units at any wrap width, including above
+  the old cap and at non-canonical widths. Per-line variants skip RFC 7468
+  armor delimiters and lines with no alphanumeric byte (DZ-5): a
+  punctuation-only line of a multi-line value is therefore not armed on its
+  own, though its whole value and its other lines still are. Per-line
+  JSON-escaped forms are armed alongside the raw lines, so replacing a line
+  that ends in a backslash cannot leave malformed JSON (EE-11). Decoded values
+  of JSON-mounted fields receive the same variant treatment only when their key
+  is secret-like: case-insensitive `*_key`, a key containing `token` or
+  `secret`, exact `password` / `passphrase`, or a key beginning `credential`.
+  OAuth `token_uri`, `token_url`, and `token_endpoint` fields are endpoints,
+  not token values; other public metadata such as `type`, `project_id`,
+  `client_email`, and URLs is not armed separately either. The complete mounted
+  value remains armed, and nested traversal retains the depth and field caps
+  listed above (DZ-2).
+  Fold matching also strips the exact six-column `read_file` and `cat -n`
+  prefixes before matching, preserving a map back to original offsets (EE-7).
   Variants are sorted longest-first across all mounted values. JSON object
   keys are also scrubbed. Direct and folded lists each have one per-job
   Aho-Corasick automaton for variants up to 4096 bytes, built once and cached
@@ -137,19 +161,15 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
     and never contain a contiguous encoded span; base32 and other alphabets;
     `rev`-style reorderings. Fold matching can over-redact when unrelated
     base64/hex-looking text spans a folded line break (safe direction).
-    Line-prefixed views defeat folding (EE-7): `read_file`'s `NNNNNN│ `
-    gutters and `cat -n` break the folded stream at every line, so a
-    wrapped encoding in that presentation can only be caught by the armed
-    per-line pieces — which exist solely at the canonical widths and only
-    up to the 4096-char cap. At the canonical 76-column base64 / 60-column
-    hex that covers secrets up to 3072 / 2048 raw bytes and leaks above;
-    at any other width (`openssl base64` at 64, `base64 -w 32`) the whole
-    encoding leaks for every secret from about 56 bytes up, with no upper
-    bound.
+    Line-prefix formats other than the exact recognized `read_file` / `cat -n`
+    gutters can still defeat folding.
   - Tools can truncate **before** this boundary: shell capture is capped at
-    64 KiB and then reduced to a 32 KiB head/tail result. Fragments at those
-    internal cuts may survive. The partial-prefix check only protects the
-    trailing cut made by `scrub_and_truncate`, not arbitrary upstream cuts.
+    64 KiB per stream and combined output can be reduced to a 32 KiB head/tail
+    result. When the result says `truncated: true`, the worker's parsed-result
+    scrub redacts partial ASCII base64/hex chunks at the final capture cut and
+    on both sides of up to 16 `... [truncated N bytes] ...` markers
+    (DG-2/DZ-3/EE-2). Arbitrary offset slices, unmarked cuts, non-ASCII
+    partials, and markers beyond that cap are not guaranteed coverage.
   - The conventional worker also arms its bearer token as defense in depth;
     the ACP bridge does not. The worker's `PR_SET_DUMPABLE=0` is intended to
     prevent child access to `/proc/1/environ`; token redaction is not proof
@@ -160,11 +180,12 @@ never be persisted as `worker` and restart under the wrong mode (CV-9).
     redactor on the same terminal cleanup paths (DZ-8).
   - Redaction is **best-effort, not a boundary**: a job that deliberately
     slices a value (e.g. `cut -c1-32` over several calls) or encodes it in a
-    form not covered above can smuggle partials out. Extracted/decoded fields
-    of structured secrets (e.g. a JSON private-key field) are not guaranteed
-    coverage. Unmatched text can reach events, completion reports, parent
-    context and provider logs. The real control is the `Always` approval tier
-    on secret mounts.
+    form not covered above can smuggle partials out. Structured fields beyond
+    the documented depth/count caps and decoded content inside those fields
+    (for example, a base64 field decoded to another payload) are not
+    recursively transformed beyond the armed variants. Unmatched text can
+    reach events, completion reports, parent context and provider logs. The
+    real control is the `Always` approval tier on secret mounts.
   - Values shorter than 8 bytes are not value-redacted (scrubbing would
     mangle legitimate output). They are not exported to child env, but a
     tool can still print them.
@@ -300,23 +321,35 @@ runtime cannot be listed).
 
 ## Explicitly out of scope (follow-ups)
 
-- Remaining !1542 Low/Info findings: structured-field extraction redaction
-  gaps (`jq -r .field` output is decoded text, not an armed encoding),
-  low-entropy line over-redaction beyond the landed filter (armor delimiters
-  and lines with no alphanumeric byte are skipped, but short structural lines
-  such as `apiVersion: v1` and `kind: Config` are still armed), temporary
-  plaintext copies, remaining synchronous filesystem cleanup on async tasks,
-  and stronger delivery, sparse-file and persisted-insert tests.
-  Staged-path/audit scrubbing (DZ-6) and duplicate `/complete` side effects
+- Offset/grouped dump formats (`xxd`, `od`, `hexdump -C`), base32 and other
+  alphabets, and `rev`-style reorderings remain deliberately uncovered
+  (EB-3/DZ-10). Supporting each would require another adversarial normalizer
+  and variant family in a best-effort scrubber, not a security boundary; the
+  `Always` approval tier remains the control. Arbitrary offset slices are
+  likewise not claimed to be detected.
+- Remaining !1542 Low/Info findings: low-entropy line over-redaction beyond
+  the landed filter (armor delimiters and lines with no alphanumeric byte are
+  skipped, but short structural lines such as `apiVersion: v1` and
+  `kind: Config` are still armed), temporary plaintext copies, remaining
+  synchronous filesystem cleanup on async tasks, and stronger delivery,
+  sparse-file and persisted-insert tests. Structured-field extraction (DZ-2),
+  staged-path/audit scrubbing (DZ-6), and duplicate `/complete` side effects
   (DZ-7/EA-7/EE-6) are fixed as described above.
-- Remaining !1548/run-84 residuals (WI#383): line-prefixed views (`read_file`,
-  `cat -n`) defeat folding (EE-7); upstream tool cuts and trailing fragments
-  shorter than an aligned chunk can still survive (DG-2/DZ-3/EE-2); an event
-  body uploaded slowly past a token revoke can be persisted daemon-side without
-  the value scrub (EE-10); and EA-1 detection uses LunarWing's own effective
-  uid rather than the runtime owner's, with a `tcp://` `DOCKER_HOST` resolving
-  bind paths on the remote host — every such case fails closed, never a leak
-  (EE-14, added by the run-84 ET-5 reconciliation).
+- Remaining !1548/run-84 residuals (WI#383): an event body uploaded slowly
+  past a token revoke can be persisted daemon-side without the value scrub
+  (EE-10), an accepted race in terminal-path cleanup; and EA-1 detection uses
+  LunarWing's own effective uid rather than the runtime owner's, with a
+  `tcp://` `DOCKER_HOST` resolving bind paths on the remote host — every such
+  case fails closed, never a leak (EE-14). Line-prefixed views (EE-7) and the
+  explicitly marked shell capture/head-tail cuts (DG-2/DZ-3/EE-2) are fixed
+  within the limits documented above.
+- Runtime-gated coverage (DG-6): the keep-id + podman tmpfs `U`-flag
+  combination and runtime-gated write-back tests still self-skip without a
+  container runtime and `lunarwing-worker:latest`. The required Rust lanes do
+  not provide both, and the protected external-worker candidate jobs do not
+  publish that conventional-worker image. A runtime-equipped required master
+  lane is still needed to exercise write-back plus secrets together on every
+  pipeline; no such live coverage is claimed here.
 - External-worker (opencode/pebble) secrets mounting — this WI covers the
   conventional harness only.
 - Concurrent-edit conflict policy: promotion snapshots the replaced content
