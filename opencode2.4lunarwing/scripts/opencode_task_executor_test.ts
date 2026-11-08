@@ -718,6 +718,32 @@ const promptHangResult = await runTask(promptHang.sdk, {
 assert.equal(promptHangResult.status, "timed_out")
 assert.equal(promptHang.interruptCount(), 1)
 
+// WI#582: v2.2.6's noninteractive run can wait forever for background jobs.
+// The serve bridge does not subscribe to this CLI-only event as a V2Event,
+// but an unknown event with the same shape must not settle or wedge the task:
+// the task deadline still fires and session interruption remains bounded.
+const backgroundWait = makeSdk({
+  events: [
+    {
+      type: "background_wait",
+      data: {
+        sessionID: "session-1",
+        jobs: [{ id: "job-1", kind: "shell", title: "dev server" }],
+      },
+    },
+  ],
+  pendingAfterEvents: true,
+  pendingPrompt: true,
+})
+const backgroundWaitResult = await runTask(backgroundWait.sdk, {
+  task_id: "task-background-wait",
+  prompt: "test",
+  timeout_ms: 10,
+})
+assert.equal(backgroundWaitResult.status, "timed_out")
+assert.equal(backgroundWaitResult.error, "Task timed out after 10ms")
+assert.equal(backgroundWait.interruptCount(), 1)
+
 const permissionHang = makeSdk({
   pendingPermissionReply: true,
   events: [
