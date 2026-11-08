@@ -504,21 +504,24 @@ MONITOR_ONLY[lunarvoice]=1
 MONITOR_ONLY[runtime]=1
 MONITOR_ONLY[knowledge]=1
 MONITOR_ONLY[worker_egress]=1
+MONITOR_ONLY[disk]=1
 if [[ "$NETBIRD_REMEDIATE" != true ]]; then
     MONITOR_ONLY[netbird]=1
 fi
 
 # Monitor-only diagnostic components that own NO service at all (MR !1041
-# review finding 2): runtime, knowledge, and worker egress report per-tenant instance
-# diagnostics, so their failures enter the monitor-only escalation path with
-# tenant attribution (synthetic "<comp>@<tenant>" identities built in main),
-# never a SERVICE_MAP restart. Without this registration, standard MT
-# configuration (SELF_HEAL_REMEDY_LOGICAL=false) silently skipped their
-# critical results because there was no service to map.
+# review finding 2): runtime, knowledge, and worker egress report per-tenant
+# instances; disk reports per-filesystem instances. Failures enter the
+# monitor-only escalation path with synthetic "<comp>@<tenant-or-mount>"
+# identities built in main, never a SERVICE_MAP restart or an automatic cleanup.
+# Without this registration, standard MT configuration
+# (SELF_HEAL_REMEDY_LOGICAL=false) silently skipped their critical results
+# because there was no service to map.
 declare -A DIAGNOSTIC_COMPONENTS=(
     [runtime]=1
     [knowledge]=1
     [worker_egress]=1
+    [disk]=1
 )
 
 # Service identities that inherit monitor-only treatment regardless of which
@@ -1099,24 +1102,22 @@ main() {
         done
     done < <(jq -r '.components[] | "\(.component)\t\(.status)"' "$report" 2>/dev/null || true)
 
-    # 1b) Monitor-only diagnostic components (runtime, knowledge, worker_egress — MR !1041
-    # review finding 2): per-instance failures become synthetic monitor-only
-    # targets ("<comp>@<tenant>", or bare "<comp>" for unattributed/legacy
-    # single-node results) so they grace-track and escalate with tenant
-    # attribution even when MT logical remediation is disabled. Healthy
-    # instances clear state through the report-as-truth path; unprobed/unknown
-    # instances are left to the component-level verdict (coverage notes must
-    # not page per tenant).
-    local diag_comp inst_tenant inst_status diag_id diag_cstatus
+    # 1b) Monitor-only diagnostic components: per-instance failures become
+    # synthetic targets ("<comp>@<tenant>", "disk@<mount>", or bare "<comp>"
+    # for unattributed/legacy results) so they grace-track and escalate even
+    # when MT logical remediation is disabled. Healthy instances clear state
+    # through report-as-truth; unprobed/unknown instances are left to the
+    # component-level verdict (coverage notes must not page per instance).
+    local diag_comp inst_name inst_status diag_id diag_cstatus
     local -a diag_bad=()
-    for diag_comp in runtime knowledge worker_egress; do
+    for diag_comp in runtime knowledge worker_egress disk; do
         diag_bad=()
-        while IFS=$'\t' read -r inst_tenant inst_status; do
-            [[ -n "$inst_tenant" ]] || continue
-            if [[ "$inst_tenant" == "default" ]]; then
+        while IFS=$'\t' read -r inst_name inst_status; do
+            [[ -n "$inst_name" ]] || continue
+            if [[ "$inst_name" == "default" ]]; then
                 diag_id="$diag_comp"
             else
-                diag_id="${diag_comp}@${inst_tenant}"
+                diag_id="${diag_comp}@${inst_name}"
             fi
             case "$inst_status" in
                 healthy) healthy[$diag_id]=1 ;;
@@ -1130,8 +1131,13 @@ main() {
             esac
         done < <(jq -r --arg comp "$diag_comp" '
             .components[] | select(.component == $comp)
-            | (.metrics.instances // [])[]
-            | "\(.tenant // "default")\t\(.status // "unknown")"
+            | if $comp == "disk" then
+                (.metrics.filesystems // [])[]
+                | "\(.mount // "default")\t\(.status // "unknown")"
+              else
+                (.metrics.instances // [])[]
+                | "\(.tenant // "default")\t\(.status // "unknown")"
+              end
         ' "$report" 2>/dev/null || true)
         # Component-level failure with no failing instance (invalid registry,
         # incomplete sweep, unknown check outcome): attribute the component
