@@ -549,9 +549,14 @@ impl ThreadManager {
             return Err(error);
         }
 
-        // Add conversation history from prior threads (for context continuity)
+        // Add conversation history from prior threads (for context continuity).
+        // Queued steer notes are fresh user evidence rather than inherited history.
         for msg in initial_messages {
-            thread.messages.push(msg);
+            if msg.provenance == crate::types::provenance::Provenance::Steered {
+                thread.add_message(msg);
+            } else {
+                thread.messages.push(msg);
+            }
         }
 
         // Add the goal as the current user message so the LLM has context.

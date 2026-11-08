@@ -159,8 +159,8 @@ impl PolicyEngine {
                     );
                 }
             }
-            // User and System provenance are trusted
-            Provenance::User | Provenance::System => {}
+            // User, steered user, and System provenance are trusted
+            Provenance::User | Provenance::Steered | Provenance::System => {}
             // MemoryRetrieval is internal, treat as trusted
             Provenance::MemoryRetrieval { .. } => {}
         }

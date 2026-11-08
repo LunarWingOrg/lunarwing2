@@ -290,7 +290,7 @@ impl ConversationManager {
         for (index, note) in notes.iter().enumerate() {
             if let Err(error) = self
                 .thread_manager
-                .inject_message(thread_id, user_id, ThreadMessage::generated_goal(note))
+                .inject_message(thread_id, user_id, ThreadMessage::steered(note))
                 .await
             {
                 restore_steer_notes(conv, notes.into_iter().skip(index));
@@ -338,7 +338,7 @@ impl ConversationManager {
             });
         }
         for note in notes {
-            let message = ThreadMessage::generated_goal(note.clone());
+            let message = ThreadMessage::steered(note.clone());
             if !thread.internal_messages.is_empty() {
                 thread.add_internal_message(message.clone());
             }
@@ -465,11 +465,7 @@ impl ConversationManager {
                 // Build conversation history from prior entries, followed by any
                 // steer notes that arrived while no foreground thread was running.
                 let mut history = build_history_from_entries(&conv.entries);
-                history.extend(
-                    conv.pending_steer_notes
-                        .iter()
-                        .map(ThreadMessage::generated_goal),
-                );
+                history.extend(conv.pending_steer_notes.iter().map(ThreadMessage::steered));
 
                 // Spawn new foreground thread with conversation history
                 let thread_id = self
@@ -1140,12 +1136,7 @@ mod tests {
         let _ = tm.join_thread(thread_id).await.unwrap();
 
         let thread = cm.store.load_thread(thread_id).await.unwrap().unwrap();
-        let user_messages: Vec<&str> = thread
-            .messages
-            .iter()
-            .filter(|message| message.role == crate::types::message::MessageRole::User)
-            .map(|message| message.content.as_str())
-            .collect();
+        let user_messages = user_message_contents(&thread);
         assert_eq!(user_messages, vec!["wrapped steer", "next request"]);
         assert!(
             cm.store
@@ -1159,12 +1150,27 @@ mod tests {
     }
 
     fn user_message_contents(thread: &crate::types::thread::Thread) -> Vec<&str> {
-        thread
+        let contents: Vec<&str> = thread
             .messages
             .iter()
             .filter(|message| message.role == crate::types::message::MessageRole::User)
             .map(|message| message.content.as_str())
-            .collect()
+            .collect();
+        let insight_contents: Vec<&str> = thread
+            .insight_inputs
+            .iter()
+            .map(|source| source.text.as_str())
+            .collect();
+        assert_eq!(insight_contents, contents);
+        for message in &thread.messages {
+            if message.content == "wrapped steer" {
+                assert_eq!(
+                    message.provenance,
+                    crate::types::provenance::Provenance::Steered
+                );
+            }
+        }
+        contents
     }
 
     #[tokio::test]
