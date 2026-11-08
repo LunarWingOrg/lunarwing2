@@ -827,6 +827,12 @@ fn sweep_harness_dirs_in(
 /// automaton tables, temporary strings, and serialized copies do not all
 /// zeroize. `Debug` deliberately prints no variant material.
 #[derive(Clone, Default)]
+struct PartialCutMatcher {
+    prefixes: Vec<SecretString>,
+    reversed: Vec<SecretString>,
+}
+
+#[derive(Clone, Default)]
 pub struct SecretValueRedactor {
     /// Variants matched directly against the text: the raw value, per-line
     /// splits of multi-line values, JSON-escaped and URL-encoded forms, and
@@ -839,6 +845,7 @@ pub struct SecretValueRedactor {
     folded_variants: Vec<SecretString>,
     direct_matcher: Option<aho_corasick::AhoCorasick>,
     folded_matcher: Option<aho_corasick::AhoCorasick>,
+    cut_matcher: PartialCutMatcher,
     /// Longest variant length in bytes; bounds the truncation-cut scan.
     max_variant_bytes: usize,
 }
@@ -1196,6 +1203,110 @@ fn build_variant_matcher(variants: &[SecretString]) -> Option<aho_corasick::AhoC
     }
 }
 
+const MAX_PARTIAL_CUT_MARKERS: usize = 16;
+
+fn build_cut_matcher(variants: &[SecretString]) -> PartialCutMatcher {
+    use secrecy::ExposeSecret;
+    let mut prefixes: Vec<SecretString> = variants
+        .iter()
+        .filter(|variant| {
+            let value = variant.expose_secret();
+            value.len() > MIN_REDACTED_SECRET_BYTES
+                && value.len() <= BASE64_ALIGNED_CHUNK_CHARS
+                && value.is_ascii()
+        })
+        .cloned()
+        .collect();
+    prefixes.sort_by(|left, right| left.expose_secret().cmp(right.expose_secret()));
+    prefixes.dedup_by(|left, right| left.expose_secret() == right.expose_secret());
+    let mut reversed: Vec<SecretString> = prefixes
+        .iter()
+        .map(|variant| {
+            SecretString::from(
+                variant
+                    .expose_secret()
+                    .bytes()
+                    .rev()
+                    .map(char::from)
+                    .collect::<String>(),
+            )
+        })
+        .collect();
+    reversed.sort_by(|left, right| left.expose_secret().cmp(right.expose_secret()));
+    PartialCutMatcher { prefixes, reversed }
+}
+
+fn has_longer_prefixed_variant(variants: &[SecretString], fragment: &str) -> bool {
+    use secrecy::ExposeSecret;
+    let index = variants.partition_point(|variant| variant.expose_secret() <= fragment);
+    variants.get(index).is_some_and(|variant| {
+        let value = variant.expose_secret();
+        value.len() > fragment.len() && value.starts_with(fragment)
+    })
+}
+
+impl PartialCutMatcher {
+    fn tail_range(&self, text: &str, end: usize) -> Option<(usize, usize)> {
+        let mut start = end;
+        while start > 0
+            && end - start < BASE64_ALIGNED_CHUNK_CHARS
+            && text.as_bytes()[start - 1].is_ascii()
+        {
+            start -= 1;
+        }
+        let window = &text[start..end];
+        for len in (MIN_REDACTED_SECRET_BYTES..=window.len()).rev() {
+            let fragment = &window[window.len() - len..];
+            if has_longer_prefixed_variant(&self.prefixes, fragment) {
+                return Some((end - len, end));
+            }
+        }
+        None
+    }
+
+    fn head_range(&self, text: &str, start: usize) -> Option<(usize, usize)> {
+        let mut end = start;
+        while end < text.len()
+            && end - start < BASE64_ALIGNED_CHUNK_CHARS
+            && text.as_bytes()[end].is_ascii()
+        {
+            end += 1;
+        }
+        let reversed = text[start..end]
+            .bytes()
+            .rev()
+            .map(char::from)
+            .collect::<String>();
+        for len in (MIN_REDACTED_SECRET_BYTES..=reversed.len()).rev() {
+            if has_longer_prefixed_variant(&self.reversed, &reversed[..len]) {
+                return Some((start, start + len));
+            }
+        }
+        None
+    }
+
+    fn ranges_for_text(&self, text: &str) -> Vec<(usize, usize)> {
+        let mut ranges = Vec::new();
+        ranges.extend(self.head_range(text, 0));
+        let mut from = 0usize;
+        for _ in 0..MAX_PARTIAL_CUT_MARKERS {
+            let Some(relative) = text[from..].find("... [truncated ") else {
+                break;
+            };
+            let marker_start = from + relative;
+            ranges.extend(self.tail_range(text, marker_start));
+            let Some(relative_end) = text[marker_start..].find("] ...") else {
+                break;
+            };
+            let marker_end = marker_start + relative_end + "] ...".len();
+            ranges.extend(self.head_range(text, marker_end));
+            from = marker_end;
+        }
+        ranges.extend(self.tail_range(text, text.len()));
+        ranges
+    }
+}
+
 /// Compact overlapping automaton matches while their end offsets are ordered.
 /// A later long match may swallow several earlier ranges, so merge backwards
 /// instead of storing every occurrence for the final sort.
@@ -1355,6 +1466,7 @@ impl SecretValueRedactor {
     fn rebuild_matchers(&mut self) {
         self.direct_matcher = build_variant_matcher(&self.direct_variants);
         self.folded_matcher = build_variant_matcher(&self.folded_variants);
+        self.cut_matcher = build_cut_matcher(&self.folded_variants);
     }
 
     pub fn is_armed(&self) -> bool {
@@ -1556,6 +1668,40 @@ impl SecretValueRedactor {
             text.truncate(keep);
             text.push_str("[redacted-secret]");
         }
+    }
+
+    /// Scrub a serialized tool result, including partial encoded chunks at the
+    /// boundaries of output the tool explicitly reports as truncated.
+    pub fn scrub_tool_result(&self, text: &str) -> String {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(text) else {
+            return self.scrub(text);
+        };
+        self.scrub_json(&mut value);
+        let truncated = value
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if truncated && let Some(serde_json::Value::String(output)) = value.get_mut("output") {
+            *output = self.redact_external_cuts(output);
+        }
+        match serde_json::to_string_pretty(&value) {
+            Ok(serialized) => serialized,
+            Err(_) => self.scrub(text),
+        }
+    }
+
+    fn redact_external_cuts(&self, text: &str) -> String {
+        let folded = fold_line_breaks(text);
+        let ranges: Vec<(usize, usize)> = self
+            .cut_matcher
+            .ranges_for_text(&folded.text)
+            .into_iter()
+            .map(|(start, end)| (folded.map[start], char_end_at(text, folded.map[end - 1])))
+            .collect();
+        if ranges.is_empty() {
+            return text.to_string();
+        }
+        replace_ranges(text, ranges)
     }
 
     /// Recursively scrub every string in a JSON value in place, including
@@ -3386,6 +3532,71 @@ mod tests {
             let chunk = std::str::from_utf8(chunk).unwrap(); // safety: test
             assert!(!folded_scrubbed.contains(chunk), "aligned hex chunk leaked");
         }
+    }
+
+    #[test]
+    fn scrub_tool_result_redacts_encoded_fragments_at_upstream_cuts() {
+        use base64::Engine;
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let value: String = (0..8000u32)
+            .map(|i| {
+                let mixed = i.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                char::from(ALPHABET[mixed as usize % ALPHABET.len()])
+            })
+            .collect();
+        let redactor = SecretValueRedactor::new([SecretString::from(value.clone())].as_slice());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(value);
+        let capture_fragment = &encoded[288..319];
+        let head_fragment = &encoded[288..301];
+        let tail_suffix = &encoded[5001..5040];
+        let tail_prefix = &encoded[5040..5059];
+        let output = format!(
+            "{}\n\n... [truncated 4700 bytes] ...\n\n{}",
+            &encoded[..301],
+            &encoded[5001..5059]
+        );
+        let result = serde_json::json!({
+            "output": output,
+            "exit_code": 0,
+            "sandboxed": false,
+            "truncated": true,
+            "success": true,
+            "warning": "[output truncated]",
+        });
+        let serialized = serde_json::to_string_pretty(&result).unwrap(); // safety: test
+        let full_only = redactor.scrub(&serialized);
+        for fragment in [head_fragment, tail_suffix, tail_prefix] {
+            assert!(
+                full_only.contains(fragment),
+                "probe must distinguish full matching from cut matching"
+            );
+        }
+        let scrubbed = redactor.scrub_tool_result(&serialized);
+        let cleaned: serde_json::Value = serde_json::from_str(&scrubbed).unwrap(); // safety: test
+        let cleaned_output = cleaned["output"].as_str().unwrap(); // safety: test
+        for fragment in [head_fragment, tail_suffix, tail_prefix] {
+            assert!(
+                !cleaned_output.contains(fragment),
+                "upstream cut fragment leaked: {fragment}"
+            );
+        }
+
+        let capture = serde_json::to_string_pretty(&serde_json::json!({
+            "output": &encoded[..319],
+            "truncated": true,
+        }))
+        .unwrap(); // safety: test
+        assert!(redactor.scrub(&capture).contains(capture_fragment));
+        let scrubbed = redactor.scrub_tool_result(&capture);
+        assert!(!scrubbed.contains(capture_fragment));
+
+        let complete = serde_json::to_string_pretty(&serde_json::json!({
+            "output": &encoded[..319],
+            "truncated": false,
+        }))
+        .unwrap(); // safety: test
+        let scrubbed = redactor.scrub_tool_result(&complete);
+        assert!(scrubbed.contains(capture_fragment));
     }
 
     #[test]
