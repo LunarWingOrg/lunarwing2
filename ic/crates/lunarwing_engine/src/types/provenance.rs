@@ -13,6 +13,8 @@ use crate::types::memory::DocId;
 pub enum Provenance {
     /// Direct user input.
     User,
+    /// Direct user input delivered through the steering surface.
+    Steered,
     /// System prompt, configuration.
     #[default]
     System,
