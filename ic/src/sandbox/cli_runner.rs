@@ -1821,24 +1821,58 @@ mod tests {
     // ── run failure classification ─────────────────────────────────────
 
     #[test]
-    fn image_failures_classified() {
+    fn image_failures_classified_only_for_runtime_errors() {
         let cases = [
             "Error: lunarwing-worker:latest: image not known",
-            "Unable to find image 'lunarwing-worker:latest' locally",
-            "docker: No such image: lunarwing-worker:latest.",
-            "pull access denied for lunarwing-worker, repository does not exist",
+            "Error: Unable to find image 'lunarwing-worker:latest' locally",
+            "docker: Error response from daemon: No such image: lunarwing-worker:latest.",
+            "Error: pull access denied for lunarwing-worker, repository does not exist",
         ];
         for stderr in cases {
+            let classified = classify_run_failure(stderr, "lunarwing-worker:latest", 125);
+            assert_eq!(
+                classified.as_ref().map(SandboxError::kind),
+                Some("image_unavailable"),
+                "should classify runtime error: {stderr}"
+            );
             assert!(
-                classify_run_failure(stderr, "lunarwing-worker:latest", 125).is_some(),
-                "should classify: {stderr}"
+                classify_run_failure(stderr, "lunarwing-worker:latest", 1).is_none(),
+                "ordinary command output must not be classified: {stderr}"
             );
         }
         assert!(classify_run_failure("sh: foo: command not found", "img", 127).is_none());
         assert!(
             classify_run_failure("Error: command rejected input", "img", 1).is_none(),
-            "exit 125 marker in unrelated contexts must not mask ordinary errors"
+            "runtime prefix without exit 125 must not mask ordinary errors"
         );
+    }
+
+    #[test]
+    fn command_enospc_stderr_is_not_host_storage_failure() {
+        let cases = [
+            (
+                "cp: error writing '/tmp/wheel.tar': No space left on device",
+                1,
+            ),
+            (
+                "pip install failed: [Errno 28] No space left on device: \
+                 '/tmp/pip-unpack-x/torch.whl'",
+                1,
+            ),
+            (
+                "fatal: /home/tenant/.local/share/containers/storage/overlay/x: \
+                 no space left on device",
+                1,
+            ),
+            ("Error: command-provided text: no space left on device", 1),
+            ("cp: /tmp/full: no space left on device", 125),
+        ];
+        for (stderr, exit_code) in cases {
+            assert!(
+                classify_run_failure(stderr, "lunarwing-worker:latest", exit_code).is_none(),
+                "command stderr must remain ordinary ContainerOutput: exit={exit_code}, {stderr}"
+            );
+        }
     }
 
     #[test]
