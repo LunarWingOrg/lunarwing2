@@ -47,6 +47,7 @@ pub enum SandboxNetworkMode {
     /// proxy rejects non-public destinations and pins DNS in this mode.
     /// Requires a local Linux runtime and Python 3 in the image; relay setup
     /// failures fail closed — they never degrade to direct egress.
+    #[default]
     ProxyEnforced,
     /// Egress through a health-gated NetBird/WireGuard sidecar (WI#248). Runs
     /// join its network namespace but retain every sandbox hardening flag.
@@ -58,7 +59,6 @@ pub enum SandboxNetworkMode {
     Tunnel,
     /// Hard network isolation: containers run with `--network none`. No
     /// egress at all, kernel-enforced; the proxy is not started.
-    #[default]
     None,
 }
 
@@ -146,7 +146,7 @@ pub struct SandboxConfig {
     pub proxy_port: u16,
     /// Container runtime to drive (default: auto — podman preferred).
     pub runtime: SandboxRuntime,
-    /// Network egress mode for sandboxed policies (default: none).
+    /// Network egress mode for sandboxed policies (default: proxy-enforced).
     pub network: SandboxNetworkMode,
     /// Tunnel sidecar settings, consulted only in `Tunnel` mode.
     pub tunnel: Option<crate::sandbox::tunnel_sidecar::TunnelSidecarConfig>,
@@ -178,7 +178,7 @@ impl Default for SandboxConfig {
             auto_pull_image: true,
             proxy_port: 0,
             runtime: SandboxRuntime::Auto,
-            network: SandboxNetworkMode::None,
+            network: SandboxNetworkMode::ProxyEnforced,
             tunnel: None,
             protected_paths: crate::sandbox::mount_guard::resolve_protected_paths(),
             tenant_logs: TenantLogsMode::Info,
@@ -201,9 +201,9 @@ impl Default for SandboxConfig {
 /// ```
 ///
 /// For sandboxed policies the egress mode comes from
-/// [`SandboxNetworkMode`]: `None` (default), `ProxyEnforced` (isolated
-/// allowlist web access), `Tunnel` (sidecar overlay egress), or the legacy
-/// advisory `Proxy` mode.
+/// [`SandboxNetworkMode`]: `ProxyEnforced` (default; isolated allowlist web
+/// access), `None` (no egress), `Tunnel` (sidecar overlay egress), or the
+/// legacy advisory `Proxy` mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SandboxPolicy {
     /// Read-only access to workspace, proxied network.
@@ -439,7 +439,8 @@ mod tests {
     fn test_config_defaults_tiered_network() {
         let config = SandboxConfig::default();
         assert_eq!(config.runtime, SandboxRuntime::Auto);
-        assert_eq!(config.network, SandboxNetworkMode::None);
+        assert_eq!(config.network, SandboxNetworkMode::ProxyEnforced);
+        assert_eq!(SandboxNetworkMode::default(), config.network);
         assert_eq!(config.tenant_logs, TenantLogsMode::Info);
     }
 
