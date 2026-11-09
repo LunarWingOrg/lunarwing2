@@ -49,6 +49,11 @@ impl BoxedUint {
         };
 
         {
+            // LLVM can turn the carry mask into a secret-dependent branch on Thumb.
+            // Use a hardened selection on 32-bit ARM.
+            #[cfg(target_arch = "arm")]
+            let rhs = Limb::select(c, Limb::ZERO, carry.is_nonzero());
+            #[cfg(not(target_arch = "arm"))]
             let rhs = carry.wrapping_sub(Limb::ONE) & c;
             lo.borrowing_sub_assign(rhs, Limb::ZERO);
         }

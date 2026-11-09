@@ -48,6 +48,14 @@ pub enum SandboxNetworkMode {
     /// Requires a local Linux runtime and Python 3 in the image; relay setup
     /// failures fail closed — they never degrade to direct egress.
     ProxyEnforced,
+    /// Egress through a health-gated NetBird/WireGuard sidecar (WI#248). Runs
+    /// join its network namespace but retain every sandbox hardening flag.
+    /// The sidecar's nftables policy drops new inbound flows and every
+    /// outbound flow that does not leave through the tunnel interface, so a
+    /// joined command reaches exactly what the tunnel routes: the overlay
+    /// CIDRs of a split tunnel, or everything through a full-route tunnel.
+    /// The uplink, host loopback, LAN and cloud metadata are unreachable.
+    Tunnel,
     /// Hard network isolation: containers run with `--network none`. No
     /// egress at all, kernel-enforced; the proxy is not started.
     #[default]
@@ -61,9 +69,10 @@ impl std::str::FromStr for SandboxNetworkMode {
         match s.to_lowercase().as_str() {
             "proxy" | "allowlist" => Ok(SandboxNetworkMode::Proxy),
             "proxy-enforced" | "proxy_enforced" => Ok(SandboxNetworkMode::ProxyEnforced),
+            "tunnel" => Ok(SandboxNetworkMode::Tunnel),
             "none" | "off" => Ok(SandboxNetworkMode::None),
             _ => Err(format!(
-                "invalid sandbox network mode '{s}', expected 'proxy', 'proxy-enforced', or 'none'"
+                "invalid sandbox network mode '{s}', expected 'proxy', 'proxy-enforced', 'tunnel', or 'none'"
             )),
         }
     }
@@ -139,6 +148,8 @@ pub struct SandboxConfig {
     pub runtime: SandboxRuntime,
     /// Network egress mode for sandboxed policies (default: none).
     pub network: SandboxNetworkMode,
+    /// Tunnel sidecar settings, consulted only in `Tunnel` mode.
+    pub tunnel: Option<crate::sandbox::tunnel_sidecar::TunnelSidecarConfig>,
     /// Directories the sandbox must never expose (WI#205).
     ///
     /// A mount at or inside one of these is refused; one *containing* one of
@@ -168,6 +179,7 @@ impl Default for SandboxConfig {
             proxy_port: 0,
             runtime: SandboxRuntime::Auto,
             network: SandboxNetworkMode::None,
+            tunnel: None,
             protected_paths: crate::sandbox::mount_guard::resolve_protected_paths(),
             tenant_logs: TenantLogsMode::Info,
         }
@@ -182,15 +194,16 @@ impl Default for SandboxConfig {
 /// ├─────────────────┬──────────────────┬────────────────────────────────┤
 /// │ Policy          │ Filesystem       │ Network                        │
 /// ├─────────────────┼──────────────────┼────────────────────────────────┤
-/// │ ReadOnly        │ /workspace (ro)  │ Proxy allowlist or none        │
-/// │ WorkspaceWrite  │ /workspace (rw)  │ Proxy allowlist or none        │
+/// │ ReadOnly        │ /workspace (ro)  │ Selected egress tier           │
+/// │ WorkspaceWrite  │ /workspace (rw)  │ Selected egress tier           │
 /// │ FullAccess      │ Full host        │ Full network (DANGER)          │
 /// └─────────────────┴──────────────────┴────────────────────────────────┘
 /// ```
 ///
 /// For sandboxed policies the egress mode comes from
 /// [`SandboxNetworkMode`]: `None` (default), `ProxyEnforced` (isolated
-/// allowlist web access), or the legacy advisory `Proxy` mode.
+/// allowlist web access), `Tunnel` (sidecar overlay egress), or the legacy
+/// advisory `Proxy` mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SandboxPolicy {
     /// Read-only access to workspace, proxied network.
@@ -414,6 +427,11 @@ mod tests {
             "proxy_enforced".parse::<SandboxNetworkMode>().unwrap(),
             SandboxNetworkMode::ProxyEnforced
         );
+        assert_eq!(
+            "tunnel".parse::<SandboxNetworkMode>().unwrap(),
+            SandboxNetworkMode::Tunnel
+        );
+        assert!("tunnel:netbird".parse::<SandboxNetworkMode>().is_err());
         assert!("everything".parse::<SandboxNetworkMode>().is_err());
     }
 

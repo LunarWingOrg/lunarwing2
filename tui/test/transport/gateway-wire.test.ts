@@ -329,7 +329,7 @@ describe("generated image validation (6.4)", () => {
 describe("capabilities and limits (3.7 folding table)", () => {
   const caps: ChatCapabilities = {
     api_version: 1,
-    server_version: "2.1.9",
+    server_version: "2.2.0",
     engine: "v2",
     features: ["status", "attachments", "transcribe", "stream"],
     limits: {

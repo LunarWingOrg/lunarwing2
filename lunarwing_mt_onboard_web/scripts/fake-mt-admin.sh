@@ -45,7 +45,7 @@ case "$cmd" in
     echo "=== Building tenant: $name ==="
     echo "--- Building lunarwing binary (cargo) ---"
     for c in lunarwing-agent lunarwing-core tensorzero-client secrets-store gateway xmpp-bridge; do
-      echo "   Compiling $c v2.1.9"
+      echo "   Compiling $c v2.2.0"
       nap
     done
     if [[ "$name" == *fail* ]]; then

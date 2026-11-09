@@ -256,6 +256,12 @@ cat >>"$MT_FIXTURE/env/lunarwing.env" <<'EOF'
 LW2STUDYMCP_HOME=/srv/lunarwing/lw2studymcp
 LW2STUDYMCP_STATE_HOME=/srv/lunarwing/study-state
 LW2STUDYMCP_ALLOW_WRITE=1
+SANDBOX_TUNNEL_PROVIDER=wireguard
+SANDBOX_TUNNEL_IMAGE=localhost/lunarwing-tunnel-wireguard:v3
+SANDBOX_TUNNEL_NETBIRD_MANAGEMENT_URL=https://nb.example.test
+SANDBOX_TUNNEL_NETBIRD_SETUP_KEY=fixture-setup-key-not-real
+SANDBOX_TUNNEL_WIREGUARD_CONFIG=/etc/lunarwing/tenants/fixture-tenant/wg0.conf
+SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS=45
 EOF
 # Now re-run WITHOUT the new flags (pass empty for slots 9-11) — file exists.
 write_tenant_lunarwing_env fixture-tenant \
@@ -301,6 +307,20 @@ assert_eq "rerun preserves SANDBOX_RUNTIME" "$(envval SANDBOX_RUNTIME)" "docker"
 assert_eq "rerun preserves SANDBOX_IMAGE" "$(envval SANDBOX_IMAGE)" "custom-sandbox:v2"
 assert_eq "rerun preserves SANDBOX_AUTO_PULL" "$(envval SANDBOX_AUTO_PULL)" "true"
 assert_eq "rerun preserves SANDBOX_TENANT_LOGS" "$(envval SANDBOX_TENANT_LOGS)" "off"
+# WI#248: a tunnel-mode tenant keeps every sidecar knob (T17 of the sandboxtunmode review).
+assert_eq "rerun preserves SANDBOX_TUNNEL_PROVIDER" "$(envval SANDBOX_TUNNEL_PROVIDER)" "wireguard"
+assert_eq "rerun preserves SANDBOX_TUNNEL_IMAGE" \
+  "$(envval SANDBOX_TUNNEL_IMAGE)" "localhost/lunarwing-tunnel-wireguard:v3"
+assert_eq "rerun preserves SANDBOX_TUNNEL_NETBIRD_MANAGEMENT_URL" \
+  "$(envval SANDBOX_TUNNEL_NETBIRD_MANAGEMENT_URL)" "https://nb.example.test"
+assert_eq "rerun preserves SANDBOX_TUNNEL_NETBIRD_SETUP_KEY" \
+  "$(envval SANDBOX_TUNNEL_NETBIRD_SETUP_KEY)" "fixture-setup-key-not-real"
+assert_eq "rerun preserves SANDBOX_TUNNEL_WIREGUARD_CONFIG" \
+  "$(envval SANDBOX_TUNNEL_WIREGUARD_CONFIG)" "/etc/lunarwing/tenants/fixture-tenant/wg0.conf"
+assert_eq "rerun preserves SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS" \
+  "$(envval SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS)" "45"
+assert_eq "tunnel knobs are rendered once each" \
+  "$(grep -c '^SANDBOX_TUNNEL_' "$MT_FIXTURE/env/lunarwing.env")" "6"
 
 echo "=== live reasoning opt-in preservation tests ==="
 for reasoning_setting in 1 false 0; do
@@ -353,9 +373,12 @@ sed -i \
   -e '/^SANDBOX_IMAGE=/d' \
   -e '/^SANDBOX_AUTO_PULL=/d' \
   -e '/^SANDBOX_TENANT_LOGS=/d' \
+  -e '/^SANDBOX_TUNNEL_/d' \
   "$MT_FIXTURE/env/lunarwing.env"
 write_tenant_lunarwing_env fixture-tenant
 assert_eq "re-run adds MASCOT_ENABLED default" "$(envval MASCOT_ENABLED)" "false"
+assert_eq "no SANDBOX_TUNNEL_* line is rendered without an opt-in" \
+  "$(grep -c '^SANDBOX_TUNNEL_' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
 assert_eq "re-run adds ENGINE_V2 default" "$(envval ENGINE_V2)" "true"
 assert_eq "re-run adds ENGINE_V2_CHANNELS default" \
   "$(envval ENGINE_V2_CHANNELS)" "xmpp,weechat,darkirc"
