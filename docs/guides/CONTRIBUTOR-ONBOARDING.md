@@ -28,7 +28,7 @@ When in doubt about where a change belongs, read [`AGENTS.md`](../../AGENTS.md) 
 
 ## 2. What's hot lava right now (freeze status)
 
-**Current state (updated 2026-11-06, target release 2.1.9.0):**
+**Current state (updated 2026-11-09, target release 2.2.0.0):**
 
 - v2.1.5.0 (Bungei Fukkō) shipped 2026-10-10: recovery paths and honest
   failure messages, the workspace daily-log backup gate, the routine/mission
@@ -156,4 +156,4 @@ have you find out after 6 hours of work.
 
 ---
 
-*Last updated: 2026-11-06 (v2.1.9.0 freeze status). Update §2 whenever freeze status changes.*
+*Last updated: 2026-11-09 (v2.2.0.0 freeze status). Update §2 whenever freeze status changes.*
