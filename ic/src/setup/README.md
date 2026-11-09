@@ -532,8 +532,12 @@ key first, then falls back to the standard env var.
 - Returns `restart_required` if any configured field declares it
 - Before startup or hot activation, the host also validates the resolved config
   against every non-optional field. Null, blank, and absent values are rejected
-  before `start()`; the named failure appears in extension status and gateway
-  channel health instead of leaving the channel apparently active.
+  before `start()`; the named failure appears in extension status and the
+  gateway's separate `channel_config_errors` map instead of leaving the channel
+  apparently active. Config errors do not mark runtime `channel_health`
+  unhealthy or trigger watchdog restarts. Runtime/guest startup details remain
+  in daemon logs; health and listings show only `channel failed to start; see
+  daemon logs` for those failures.
 
 **Bridge-backed WASM channels**:
 - A WASM channel can act as a local adapter instead of owning the protocol
@@ -542,6 +546,10 @@ key first, then falls back to the standard env var.
   it talks to a user-run local `xmpp-bridge` process over loopback HTTP
 - Channel setup fields are used for non-secret bridge/runtime config such as
   `bridge_url`, `xmpp_jid`, policy flags, and persistence directories
+- A no-database install cannot persist the native-XMPP migration's `XMPP_JID`
+  value as `extensions.xmpp.setup_fields`. Such an install must provide a
+  settings store; otherwise installable-XMPP validation rejects startup and
+  names `xmpp_jid` instead of silently starting with incomplete config.
 
 **XMPP special case** (`setup_xmpp`):
 - Validates bot token via XMPP `getMe` API
