@@ -681,14 +681,16 @@ call is recorded in the `job_events` — and counted against the
 100-frame budget — of the job whose relay socket was used, not of the
 job that issued it.
 
-## Generic shell sandbox network policy (WI#154/155)
+## Generic shell sandbox network policy (WI#154/155/537)
 
 The generic shell sandbox (`ic/src/sandbox/`) defaults to
-`SANDBOX_NETWORK=none`, in code and in mt-admin-rendered multi-tenant envs.
-`proxy-enforced` keeps `--network none` and exposes only a per-execution Unix
-relay to the public-only allowlist proxy — local Linux runtime and a
+`SANDBOX_NETWORK=proxy-enforced`, in code and in new mt-admin-rendered
+multi-tenant envs. It keeps `--network none` and exposes only a per-execution
+Unix relay to the public-only allowlist proxy — local Linux runtime and a
 Python-3-equipped image are required (the bundled `docker/sandbox.Dockerfile`
-image already includes Python 3). `proxy` remains as the legacy advisory mode.
+image includes the full Python development suite). `none` disables egress,
+`tunnel` selects the item-3 overlay sidecar, and `proxy` remains the legacy
+advisory mode. mt-admin preserves every operator-set value on re-render.
 
 Rootless podman uses keep-id; rootless docker maps container root onto the
 host user; rootful docker maps numeric UIDs and refuses writable workspaces
@@ -1102,26 +1104,33 @@ docker build -f Dockerfile.worker -t lunarwing-worker:latest .
 
 Runs as non-root user `sandbox` (UID 1000) in `/workspace`. Entrypoint is the `lunarwing` binary — the orchestrator passes the full command via Docker cmd.
 
-### Generic sandbox egress default (WI#154)
+### Generic sandbox egress default (WI#537)
 
 The generic podman sandbox (`shell` tool, `ic/src/sandbox/`) defaults to
-**`SANDBOX_NETWORK=none`** on multi-tenant hosts: mt-admin renders
-`SANDBOX_NETWORK=none` into every tenant's `lunarwing.env` (an operator-set
-`proxy` value is preserved on re-render). The advisory `proxy` mode lets a
-sandboxed process that ignores proxy env vars reach host-loopback services —
-worker WSS/health ports, tenant PostgreSQL, and cross-tenant loopback — so it
-is an explicit opt-in (`SANDBOX_NETWORK=proxy`) for tenants that genuinely
-need allowlisted web access. The enforced-proxy middle ground is tracked in
-WI#155. See `ic/src/NETWORK_SECURITY.md` §5 for the tier table.
+**`SANDBOX_NETWORK=proxy-enforced`** in code and in new multi-tenant envs.
+mt-admin fills only an unset value and preserves an operator's `none`,
+`proxy-enforced`, `tunnel`, or `proxy` on re-render. The default retains
+`--network none` and provides standard web egress only through the WI#155 Unix
+relay and its public-only, DNS-pinned allowlist proxy. Advisory `proxy` remains
+an explicit legacy choice: a process that ignores its env vars could reach
+worker WSS/health ports, tenant PostgreSQL, and other tenants' loopback
+services, so it must never become the default. See
+`ic/src/NETWORK_SECURITY.md` §5 for the tier table and exact default allowlist.
 
-### Generic sandbox image + tenant defaults (WI#223)
+### Generic sandbox image + tenant defaults (WI#223/537)
 
-For new multi-tenant tenants, the generic sandbox's image is the lean
+For new multi-tenant tenants, the generic sandbox's image is
 **`lunarwing-sandbox:latest`**, built from `ic/docker/sandbox.Dockerfile`
-(common build tooling only — no lunarwing binary, much smaller than
-`lunarwing-worker:latest`). mt-admin renders these defaults into every
-tenant's `lunarwing.env` during `add-tenant` (existing values are preserved
-if that command is explicitly re-run):
+without the lunarwing binary. Alongside the existing build tools it includes
+Python headers, venv/pip, setuptools/wheel/build, pytest/pytest-cov/coverage,
+mypy, black, isort, flake8, pylint, IPython, debugpy, tox, Twine, pipx, and
+Poetry. Every top-level Python package has an explicit version pin. The base
+image is digest-pinned and apt uses the fixed Debian snapshot over HTTPS, a
+fixed-client-first bootstrap, bounded timeouts, and bounded retries
+(WI#559/561). The Podman 5.8.2 verification build grew from 689,767,025 to
+922,631,733 bytes (**+232,864,708 bytes**, about 222.1 MiB). mt-admin renders
+these defaults into every tenant's `lunarwing.env` during `add-tenant`
+(existing values are preserved if that command is explicitly re-run):
 
 ```bash
 SANDBOX_RUNTIME=podman
@@ -1163,8 +1172,9 @@ tenant, set the three variables in its `lunarwing.env`, build the image, then
 `restart-tenant <name>` so both its daemon configuration and image store update.
 
 The build context is `ic/docker/`, not `ic/`: the Dockerfile has no
-COPY/ADD, and `ic/` carries the vendored crate tree that must stay
-in-context for `Dockerfile.worker`'s offline build.
+build-context COPY/ADD (its CA-bundle COPY comes from a digest-pinned image),
+and `ic/` carries the vendored crate tree that must stay in-context for
+`Dockerfile.worker`'s offline build.
 
 ## Pebble Worker
 
