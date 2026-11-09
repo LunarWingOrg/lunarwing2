@@ -1,9 +1,10 @@
-//! Main sandbox manager coordinating the network proxy and container runner.
+//! Main sandbox manager coordinating the container runner and selected egress.
 //!
 //! The `SandboxManager` is the primary entry point for sandboxed execution.
 //! It coordinates:
 //! - Container lifecycle via the podman/docker CLI runner (no daemon socket)
-//! - HTTP proxy for network access control (proxy network mode)
+//! - HTTP proxy for network access control (proxy network modes)
+//! - Health-gated tunnel sidecar lifecycle (tunnel network mode)
 //! - Credential injection for API calls
 //! - Resource limits and timeouts
 //!
