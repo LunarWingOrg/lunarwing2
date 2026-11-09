@@ -202,11 +202,23 @@ async fn print_failed_channels() {
     let Ok(config) = crate::config::Config::from_env_with_toml(None).await else {
         return;
     };
-    let Some(errors) = crate::cli::channels::gateway_channel_errors(&config.channels).await else {
+    let state = crate::cli::channels::gateway_channel_errors(&config.channels).await;
+    if state.is_unavailable() {
+        println!(
+            "{}",
+            fmt::kv_line(
+                "Channel status",
+                "gateway not reachable; runtime state unknown",
+                12
+            )
+        );
+        return;
+    }
+    let Some(errors) = state.errors() else {
         return;
     };
-    let mut errors: Vec<_> = errors.into_iter().collect();
-    errors.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut errors: Vec<_> = errors.iter().collect();
+    errors.sort_by(|left, right| left.0.cmp(right.0));
     for (name, error) in errors {
         println!(
             "{}",
