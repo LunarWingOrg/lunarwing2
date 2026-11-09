@@ -163,6 +163,7 @@ pub async fn run_status_command() -> anyhow::Result<()> {
         }
     }
     println!("{}", fmt::kv_line("Channels", &channel_info.join(", "), 12));
+    print_failed_channels().await;
 
     // Heartbeat
     let hb_enabled = settings.heartbeat.enabled
@@ -195,6 +196,35 @@ pub async fn run_status_command() -> anyhow::Result<()> {
     );
 
     Ok(())
+}
+
+async fn print_failed_channels() {
+    let Ok(config) = crate::config::Config::from_env_with_toml(None).await else {
+        return;
+    };
+    let state = crate::cli::channels::gateway_channel_errors(&config.channels).await;
+    if state.is_unavailable() {
+        println!(
+            "{}",
+            fmt::kv_line(
+                "Channel status",
+                "gateway not reachable; runtime state unknown",
+                12
+            )
+        );
+        return;
+    }
+    let Some(errors) = state.errors() else {
+        return;
+    };
+    let mut errors: Vec<_> = errors.iter().collect();
+    errors.sort_by(|left, right| left.0.cmp(right.0));
+    for (name, error) in errors {
+        println!(
+            "{}",
+            fmt::kv_line("Failed channel", &format!("{name}: {error}"), 12)
+        );
+    }
 }
 
 fn summarize_mcp_servers(servers: &crate::tools::mcp::config::McpServersFile) -> String {

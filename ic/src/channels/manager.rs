@@ -106,14 +106,23 @@ fn knowledge_publish_blocked(channel_name: &str) -> ChannelError {
     }
 }
 
+fn startup_failure(name: &str) -> ChannelError {
+    ChannelError::StartupFailed {
+        name: name.to_string(),
+        reason: "channel failed to start; see daemon logs".to_string(),
+    }
+}
+
 /// Manages multiple input channels and merges their message streams.
 ///
 /// Includes an injection channel so background tasks (e.g., job monitors) can
 /// push messages into the agent loop without being a full `Channel` impl.
 pub struct ChannelManager {
     channels: Arc<RwLock<HashMap<String, Arc<dyn Channel>>>>,
-    /// Channels whose latest startup attempt failed while they remain registered.
+    /// Runtime startup failures retain no guest-controlled error text.
     start_failures: RwLock<HashSet<String>>,
+    /// Host-generated validation errors are safe to show to operators.
+    config_errors: RwLock<HashMap<String, String>>,
     inject_tx: mpsc::Sender<IncomingMessage>,
     /// Taken once in `start_all()` and merged into the stream.
     inject_rx: tokio::sync::Mutex<Option<mpsc::Receiver<IncomingMessage>>>,
@@ -135,6 +144,7 @@ impl ChannelManager {
         Self {
             channels: Arc::new(RwLock::new(HashMap::new())),
             start_failures: RwLock::new(HashSet::new()),
+            config_errors: RwLock::new(HashMap::new()),
             inject_tx,
             inject_rx: tokio::sync::Mutex::new(Some(inject_rx)),
             coordination_status_policy,
@@ -150,10 +160,38 @@ impl ChannelManager {
         self.inject_tx.clone()
     }
 
+    /// Return channels whose latest runtime startup attempt failed.
+    pub async fn start_failures(&self) -> HashSet<String> {
+        self.start_failures.read().await.clone()
+    }
+
+    /// Return host-generated configuration errors by channel name.
+    pub async fn config_errors(&self) -> HashMap<String, String> {
+        self.config_errors.read().await.clone()
+    }
+
+    /// Record a runtime startup failure without retaining guest-controlled text.
+    pub async fn record_start_failure(&self, name: String) {
+        self.config_errors.write().await.remove(&name);
+        self.start_failures.write().await.insert(name);
+    }
+
+    /// Record a host-generated validation failure separately from runtime health.
+    pub async fn record_config_error(&self, name: String, reason: String) {
+        self.start_failures.write().await.remove(&name);
+        self.config_errors.write().await.insert(name, reason);
+    }
+
+    /// Clear startup and configuration failures after success or removal.
+    pub async fn clear_start_failure(&self, name: &str) {
+        self.start_failures.write().await.remove(name);
+        self.config_errors.write().await.remove(name);
+    }
+
     /// Add a channel to the manager.
     pub async fn add(&self, channel: Box<dyn Channel>) {
         let name = channel.name().to_string();
-        self.start_failures.write().await.remove(&name);
+        self.clear_start_failure(&name).await;
         self.channels
             .write()
             .await
@@ -178,11 +216,11 @@ impl ChannelManager {
 
         let stream = match channel.start().await {
             Ok(stream) => {
-                self.start_failures.write().await.remove(&name);
+                self.clear_start_failure(&name).await;
                 stream
             }
             Err(error) => {
-                self.start_failures.write().await.insert(name);
+                self.record_start_failure(name).await;
                 return Err(error);
             }
         };
@@ -227,12 +265,12 @@ impl ChannelManager {
         for (name, channel) in channels.iter() {
             match channel.start().await {
                 Ok(stream) => {
-                    self.start_failures.write().await.remove(name);
+                    self.clear_start_failure(name).await;
                     tracing::debug!("Started channel: {}", name);
                     streams.push(stream);
                 }
                 Err(error) => {
-                    self.start_failures.write().await.insert(name.clone());
+                    self.record_start_failure(name.clone()).await;
                     tracing::error!("Failed to start channel {}: {}", name, error);
                     // Continue with other channels, don't fail completely
                 }
@@ -418,14 +456,16 @@ impl ChannelManager {
 
         for (name, channel) in channels.iter() {
             let result = if start_failures.contains(name) {
-                Err(ChannelError::HealthCheckFailed {
-                    name: name.clone(),
-                    reason: "channel failed to start; see daemon logs".to_string(),
-                })
+                Err(startup_failure(name))
             } else {
                 channel.health_check().await
             };
             results.insert(name.clone(), result);
+        }
+        for name in start_failures {
+            if !results.contains_key(&name) {
+                results.insert(name.clone(), Err(startup_failure(&name)));
+            }
         }
 
         results
@@ -656,6 +696,52 @@ mod tests {
         assert!(results["sick"].is_err());
     }
 
+    struct SecretStartFailure;
+
+    #[async_trait::async_trait]
+    impl Channel for SecretStartFailure {
+        fn name(&self) -> &str {
+            "multica"
+        }
+
+        async fn start(&self) -> Result<MessageStream, ChannelError> {
+            Err(ChannelError::StartupFailed {
+                name: "multica".to_string(),
+                reason: "guest failed with planted-secret".to_string(),
+            })
+        }
+
+        async fn respond(
+            &self,
+            _msg: &IncomingMessage,
+            _response: OutgoingResponse,
+        ) -> Result<(), ChannelError> {
+            Ok(())
+        }
+
+        async fn health_check(&self) -> Result<(), ChannelError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_failure_health_never_exposes_guest_secret() {
+        let manager = ChannelManager::new();
+        let startup_error = match manager.hot_add(Box::new(SecretStartFailure)).await {
+            Ok(()) => panic!("guest startup must fail"),
+            Err(error) => error,
+        };
+        assert!(startup_error.to_string().contains("planted-secret"));
+
+        let health = manager.health_check_all().await;
+        let health_error = health["multica"]
+            .as_ref()
+            .expect_err("failed hot activation must be unhealthy")
+            .to_string();
+        assert!(health_error.contains("see daemon logs"), "{health_error}");
+        assert!(!health_error.contains("planted-secret"), "{health_error}");
+    }
+
     #[tokio::test]
     async fn startup_failure_overrides_optimistic_channel_health_until_replaced() {
         let manager = ChannelManager::new();
@@ -671,12 +757,36 @@ mod tests {
             .as_ref()
             .expect_err("failed startup must make channel unhealthy")
             .to_string();
-        assert!(error.contains("channel failed to start"), "{error}");
-        assert!(!error.contains("already called"), "{error}");
+        assert!(error.contains("failed to start"), "{error}");
+        assert!(!error.contains("start() already called"), "{error}");
+        assert!(manager.start_failures().await.contains("optional"));
 
         let (replacement, _) = StubChannel::new("optional");
         manager.add(Box::new(replacement)).await;
         assert!(manager.health_check_all().await["optional"].is_ok());
+        assert!(manager.start_failures().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pre_registration_config_error_is_separate_from_runtime_health() {
+        let manager = ChannelManager::new();
+        manager.record_start_failure("multica".to_string()).await;
+        manager
+            .record_config_error(
+                "multica".to_string(),
+                "required field 'multica_url' is not configured".to_string(),
+            )
+            .await;
+
+        assert!(manager.start_failures().await.is_empty());
+        assert_eq!(
+            manager.config_errors().await.get("multica"),
+            Some(&"required field 'multica_url' is not configured".to_string())
+        );
+        assert!(manager.health_check_all().await.is_empty());
+
+        manager.clear_start_failure("multica").await;
+        assert!(manager.config_errors().await.is_empty());
     }
 
     #[tokio::test]
