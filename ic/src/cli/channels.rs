@@ -13,8 +13,9 @@
 //! Until `resolve()` falls back to settings (or the CLI writes `.env`),
 //! an `enable`/`disable` command would silently fail to take effect.
 //!
-//! `status` (runtime health) requires connecting to a running LunarWing instance
-//! via IPC or HTTP, which does not exist yet as a CLI control plane.
+//! When the configured gateway is reachable and has an auth token, `list`
+//! overlays failed runtime starts from its authenticated health endpoint.
+//! Without that connection it retains the static configured-state view.
 
 use std::path::Path;
 
@@ -55,6 +56,59 @@ struct ChannelInfo {
     kind: &'static str,
     enabled: bool,
     details: Vec<(&'static str, String)>,
+}
+
+#[derive(serde::Deserialize)]
+struct GatewayStatusResponse {
+    channel_health: Option<std::collections::HashMap<String, ChannelHealthEntry>>,
+}
+
+#[derive(serde::Deserialize)]
+struct ChannelHealthEntry {
+    healthy: bool,
+    error: Option<String>,
+}
+
+/// Fetch failed runtime channels when the local gateway is configured and reachable.
+pub(crate) async fn gateway_channel_errors(
+    config: &crate::config::ChannelsConfig,
+) -> Option<std::collections::HashMap<String, String>> {
+    let gateway = config.gateway.as_ref()?;
+    let token = gateway
+        .auth_token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| std::env::var("GATEWAY_AUTH_TOKEN").ok())?;
+    let endpoint = format!(
+        "http://{}:{}/api/gateway/status",
+        gateway.host, gateway.port
+    );
+    let response = reqwest::Client::new()
+        .get(endpoint)
+        .bearer_auth(token.trim())
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let status = response.json::<GatewayStatusResponse>().await.ok()?;
+    Some(
+        status
+            .channel_health
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, entry)| !entry.healthy)
+            .map(|(name, entry)| {
+                let error = entry
+                    .error
+                    .unwrap_or_else(|| "channel failed to start; see daemon logs".to_string());
+                (name, error)
+            })
+            .collect(),
+    )
 }
 
 fn builtin_channels(config: &crate::config::ChannelsConfig) -> Vec<ChannelInfo> {
@@ -153,64 +207,76 @@ async fn cmd_list(
         }
     }
 
+    let runtime_errors = gateway_channel_errors(config).await;
+
     if json {
         let entries: Vec<serde_json::Value> = channels
             .iter()
-            .map(|ch| {
-                let mut v = serde_json::json!({
-                    "name": ch.name,
-                    "kind": ch.kind,
-                    "enabled": ch.enabled,
-                });
-                if verbose {
-                    let details: serde_json::Map<String, serde_json::Value> = ch
-                        .details
-                        .iter()
-                        .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.clone())))
-                        .collect();
-                    v["details"] = serde_json::Value::Object(details);
-                }
-                v
+            .map(|channel| {
+                let error = runtime_errors
+                    .as_ref()
+                    .and_then(|errors| errors.get(&channel.name));
+                channel_to_json(channel, verbose, error)
             })
             .collect();
         println!(
             "{}",
             serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string())
         );
-        return Ok(());
+    } else {
+        print_channels_text(&channels, verbose, runtime_errors.as_ref());
     }
 
-    let enabled_count = channels.iter().filter(|c| c.enabled).count();
+    Ok(())
+}
+
+fn channel_to_json(
+    channel: &ChannelInfo,
+    verbose: bool,
+    runtime_error: Option<&String>,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "name": channel.name,
+        "kind": channel.kind,
+        "enabled": channel.enabled,
+    });
+    if let Some(error) = runtime_error {
+        value["active"] = serde_json::Value::Bool(false);
+        value["activation_error"] = serde_json::Value::String(error.clone());
+    }
+    if verbose {
+        let details: serde_json::Map<String, serde_json::Value> = channel
+            .details
+            .iter()
+            .map(|(key, value)| (key.to_string(), serde_json::Value::String(value.clone())))
+            .collect();
+        value["details"] = serde_json::Value::Object(details);
+    }
+    value
+}
+
+fn print_channels_text(
+    channels: &[ChannelInfo],
+    verbose: bool,
+    runtime_errors: Option<&std::collections::HashMap<String, String>>,
+) {
+    let enabled_count = channels.iter().filter(|channel| channel.enabled).count();
     println!(
         "Configured channels ({} enabled, {} total):\n",
         enabled_count,
         channels.len()
     );
 
-    for ch in &channels {
-        let status = if ch.enabled { "enabled" } else { "disabled" };
-        if verbose {
-            println!("  {} [{}] ({})", ch.name, status, ch.kind);
-            for (key, val) in &ch.details {
-                println!("    {}: {}", key, val);
-            }
-            if ch.details.is_empty() && ch.enabled {
-                println!("    (default config)");
-            }
-            println!();
+    for channel in channels {
+        let runtime_error = runtime_errors.and_then(|errors| errors.get(&channel.name));
+        let status = if runtime_error.is_some() {
+            "failed"
+        } else if channel.enabled {
+            "enabled"
         } else {
-            let detail_str = if ch.enabled && !ch.details.is_empty() {
-                let parts: Vec<String> =
-                    ch.details.iter().map(|(k, v)| format!("{k}={v}")).collect();
-                format!("  ({})", parts.join(", "))
-            } else {
-                String::new()
-            };
-            println!(
-                "  {:<16} {:<10} {:<10}{}",
-                ch.name, status, ch.kind, detail_str
-            );
-        }
+            "disabled"
+        };
+        print_channel_text(channel, status, verbose, runtime_error);
     }
 
     if !verbose {
@@ -221,8 +287,44 @@ async fn cmd_list(
         println!("Built-in channels are managed via environment variables and installable");
         println!("channels are configured through the extensions lifecycle.");
     }
+}
 
-    Ok(())
+fn print_channel_text(
+    channel: &ChannelInfo,
+    status: &str,
+    verbose: bool,
+    runtime_error: Option<&String>,
+) {
+    if verbose {
+        println!("  {} [{}] ({})", channel.name, status, channel.kind);
+        for (key, value) in &channel.details {
+            println!("    {}: {}", key, value);
+        }
+        if let Some(error) = runtime_error {
+            println!("    {error}");
+        } else if channel.details.is_empty() && channel.enabled {
+            println!("    (default config)");
+        }
+        println!();
+        return;
+    }
+
+    let details = if let Some(error) = runtime_error {
+        format!("  ({error})")
+    } else if channel.enabled && !channel.details.is_empty() {
+        let parts: Vec<String> = channel
+            .details
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        format!("  ({})", parts.join(", "))
+    } else {
+        String::new()
+    };
+    println!(
+        "  {:<16} {:<10} {:<10}{}",
+        channel.name, status, channel.kind, details
+    );
 }
 
 /// Discover WASM channel names by scanning the channels directory for `*.wasm` files.
@@ -288,6 +390,24 @@ mod tests {
         assert!(info.enabled);
         assert_eq!(info.kind, "built-in");
         assert_eq!(info.details.len(), 1);
+    }
+
+    #[test]
+    fn channel_json_surfaces_failed_runtime_start() {
+        let channel = ChannelInfo {
+            name: "multica".to_string(),
+            kind: "wasm",
+            enabled: true,
+            details: vec![],
+        };
+        let reason =
+            "Channel multica failed to start: required field 'multica_url' is not configured"
+                .to_string();
+
+        let value = channel_to_json(&channel, false, Some(&reason));
+        assert_eq!(value["active"], false);
+        assert_eq!(value["activation_error"], reason);
+        assert_eq!(value["enabled"], true);
     }
 
     #[test]
