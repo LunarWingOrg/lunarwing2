@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use crate::config::helpers::{optional_env, parse_bool_env, parse_optional_env, parse_string_env};
 use crate::error::ConfigError;
 pub use lunarwing_common::PromptContextLimits;
@@ -49,6 +51,61 @@ pub struct SandboxModeConfig {
     /// only (read before the database is up, by tracing init), strictly
     /// parsed.
     pub tenant_logs: crate::sandbox::TenantLogsMode,
+    /// Env-only tunnel sidecar settings, validated when `network = tunnel`.
+    pub tunnel: SandboxTunnelModeConfig,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SandboxTunnelModeConfig {
+    pub provider: Option<String>,
+    pub image: Option<String>,
+    pub netbird_management_url: Option<String>,
+    pub netbird_setup_key: Option<SecretString>,
+    pub wireguard_config: Option<PathBuf>,
+    pub startup_timeout_secs: Option<u64>,
+}
+
+impl SandboxTunnelModeConfig {
+    fn resolve_env() -> Result<Self, ConfigError> {
+        Ok(Self {
+            provider: optional_env("SANDBOX_TUNNEL_PROVIDER")?,
+            image: optional_env("SANDBOX_TUNNEL_IMAGE")?,
+            netbird_management_url: optional_env("SANDBOX_TUNNEL_NETBIRD_MANAGEMENT_URL")?,
+            netbird_setup_key: optional_env("SANDBOX_TUNNEL_NETBIRD_SETUP_KEY")?
+                .map(SecretString::from),
+            wireguard_config: optional_env("SANDBOX_TUNNEL_WIREGUARD_CONFIG")?.map(PathBuf::from),
+            startup_timeout_secs: optional_env("SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS")?
+                .map(|value| {
+                    value.parse::<u64>().map_err(|_| ConfigError::InvalidValue {
+                        key: "SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS".to_string(),
+                        message: "must be a positive number of seconds".to_string(),
+                    })
+                })
+                .transpose()?,
+        })
+    }
+
+    fn to_tunnel_sidecar_config(&self) -> Result<crate::sandbox::TunnelSidecarConfig, ConfigError> {
+        let provider = self
+            .provider
+            .as_deref()
+            .unwrap_or("netbird")
+            .parse::<crate::sandbox::TunnelProvider>()
+            .map_err(|error| ConfigError::InvalidValue {
+                key: "SANDBOX_TUNNEL_PROVIDER".to_string(),
+                message: error,
+            })?;
+        Ok(crate::sandbox::TunnelSidecarConfig {
+            provider,
+            image: self.image.clone(),
+            netbird_management_url: self.netbird_management_url.clone(),
+            netbird_setup_key: self.netbird_setup_key.clone(),
+            wireguard_config: self.wireguard_config.clone(),
+            startup_timeout: std::time::Duration::from_secs(
+                self.startup_timeout_secs.unwrap_or(90),
+            ),
+        })
+    }
 }
 
 impl Default for SandboxModeConfig {
@@ -69,6 +126,7 @@ impl Default for SandboxModeConfig {
             reaper_interval_secs: 300,
             orphan_threshold_secs: 600,
             tenant_logs: crate::sandbox::TenantLogsMode::Info,
+            tunnel: SandboxTunnelModeConfig::default(),
         }
     }
 }
@@ -106,11 +164,25 @@ impl SandboxModeConfig {
             });
         }
 
+        let network = parse_string_env("SANDBOX_NETWORK", ss.network.clone())?;
+        let tunnel = SandboxTunnelModeConfig::resolve_env()?;
+        if network.parse::<crate::sandbox::SandboxNetworkMode>()
+            == Ok(crate::sandbox::SandboxNetworkMode::Tunnel)
+        {
+            tunnel
+                .to_tunnel_sidecar_config()?
+                .validate()
+                .map_err(|message| ConfigError::InvalidValue {
+                    key: "SANDBOX_TUNNEL_*".to_string(),
+                    message,
+                })?;
+        }
+
         Ok(Self {
             enabled: parse_bool_env("SANDBOX_ENABLED", ss.enabled)?,
             policy: parse_string_env("SANDBOX_POLICY", ss.policy.clone())?,
             runtime: parse_string_env("SANDBOX_RUNTIME", ss.runtime.clone())?,
-            network: parse_string_env("SANDBOX_NETWORK", ss.network.clone())?,
+            network,
             // enforce: env > settings, default false.
             enforce: parse_bool_env("SANDBOX_ENFORCE", ss.enforce)?,
             // allow_full_access has no Settings counterpart — env > default only.
@@ -128,6 +200,7 @@ impl SandboxModeConfig {
                 "SANDBOX_TENANT_LOGS",
                 crate::sandbox::TenantLogsMode::Info,
             )?,
+            tunnel,
         })
     }
 
@@ -169,6 +242,17 @@ impl SandboxModeConfig {
             );
             crate::sandbox::SandboxNetworkMode::None
         });
+        let tunnel = if network == crate::sandbox::SandboxNetworkMode::Tunnel {
+            match self.tunnel.to_tunnel_sidecar_config() {
+                Ok(config) => Some(config),
+                Err(error) => {
+                    tracing::error!(error = %error, "Invalid tunnel sidecar configuration");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let mut allowlist = crate::sandbox::default_allowlist();
         allowlist.extend(self.extra_allowed_domains.clone());
@@ -186,6 +270,7 @@ impl SandboxModeConfig {
             proxy_port: 0, // Auto-assign
             runtime,
             network,
+            tunnel,
             protected_paths: crate::sandbox::mount_guard::resolve_protected_paths(),
             tenant_logs: self.tenant_logs,
         }
@@ -880,6 +965,7 @@ mod tests {
             orphan_threshold_secs: 600,
             allow_full_access: false,
             tenant_logs: crate::sandbox::TenantLogsMode::Info,
+            tunnel: SandboxTunnelModeConfig::default(),
         };
         assert!(!cfg.enabled);
         assert_eq!(cfg.policy, "full_access");
@@ -912,6 +998,7 @@ mod tests {
             allow_full_access: false,
             enforce: false,
             tenant_logs: crate::sandbox::TenantLogsMode::Off,
+            tunnel: SandboxTunnelModeConfig::default(),
         };
         let sc = mode.to_sandbox_config();
         assert!(sc.enabled);
@@ -969,6 +1056,98 @@ mod tests {
             legacy.to_sandbox_config().network,
             crate::sandbox::SandboxNetworkMode::Proxy
         );
+    }
+
+    fn clear_tunnel_env() {
+        // SAFETY: callers hold ENV_MUTEX and restore the full environment on drop.
+        unsafe {
+            for key in [
+                "SANDBOX_NETWORK",
+                "SANDBOX_TUNNEL_PROVIDER",
+                "SANDBOX_TUNNEL_IMAGE",
+                "SANDBOX_TUNNEL_NETBIRD_MANAGEMENT_URL",
+                "SANDBOX_TUNNEL_NETBIRD_SETUP_KEY",
+                "SANDBOX_TUNNEL_WIREGUARD_CONFIG",
+                "SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS",
+            ] {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
+    #[test]
+    fn tunnel_netbird_env_resolves_and_converts() {
+        let _guard = crate::config::helpers::lock_env();
+        clear_tunnel_env();
+        // SAFETY: Under ENV_MUTEX, no concurrent env access.
+        unsafe {
+            std::env::set_var("SANDBOX_NETWORK", "tunnel");
+            std::env::set_var(
+                "SANDBOX_TUNNEL_NETBIRD_MANAGEMENT_URL",
+                "https://nb.example.com",
+            );
+            std::env::set_var("SANDBOX_TUNNEL_NETBIRD_SETUP_KEY", "key-1");
+        }
+        let config = SandboxModeConfig::resolve(&crate::settings::Settings::default())
+            .expect("valid tunnel config")
+            .to_sandbox_config();
+        assert_eq!(config.network, crate::sandbox::SandboxNetworkMode::Tunnel);
+        let tunnel = config.tunnel.expect("tunnel settings");
+        assert_eq!(tunnel.provider, crate::sandbox::TunnelProvider::Netbird);
+        assert_eq!(tunnel.image(), "docker.io/netbirdio/netbird:latest");
+    }
+
+    #[test]
+    fn tunnel_missing_or_invalid_settings_fail_resolve() {
+        let _guard = crate::config::helpers::lock_env();
+        clear_tunnel_env();
+        // SAFETY: Under ENV_MUTEX, no concurrent env access.
+        unsafe { std::env::set_var("SANDBOX_NETWORK", "tunnel") };
+        let error = SandboxModeConfig::resolve(&crate::settings::Settings::default())
+            .expect_err("missing provider settings must fail");
+        assert!(error.to_string().contains("MANAGEMENT_URL"));
+
+        // SAFETY: Under ENV_MUTEX, no concurrent env access.
+        unsafe { std::env::set_var("SANDBOX_TUNNEL_PROVIDER", "openvpn") };
+        let error = SandboxModeConfig::resolve(&crate::settings::Settings::default())
+            .expect_err("unknown provider must fail");
+        assert!(error.to_string().contains("SANDBOX_TUNNEL_PROVIDER"));
+    }
+
+    #[test]
+    fn tunnel_zero_timeout_fails_resolve() {
+        let _guard = crate::config::helpers::lock_env();
+        clear_tunnel_env();
+        // SAFETY: Under ENV_MUTEX, no concurrent env access.
+        unsafe {
+            std::env::set_var("SANDBOX_NETWORK", "tunnel");
+            std::env::set_var(
+                "SANDBOX_TUNNEL_NETBIRD_MANAGEMENT_URL",
+                "https://nb.example.com",
+            );
+            std::env::set_var("SANDBOX_TUNNEL_NETBIRD_SETUP_KEY", "key-1");
+            std::env::set_var("SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS", "0");
+        }
+        let error = SandboxModeConfig::resolve(&crate::settings::Settings::default())
+            .expect_err("zero timeout must fail");
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn non_tunnel_mode_does_not_retain_tunnel_secrets() {
+        let _guard = crate::config::helpers::lock_env();
+        clear_tunnel_env();
+        // SAFETY: Under ENV_MUTEX, no concurrent env access.
+        unsafe {
+            std::env::set_var("SANDBOX_NETWORK", "none");
+            std::env::set_var("SANDBOX_TUNNEL_PROVIDER", "openvpn");
+            std::env::set_var("SANDBOX_TUNNEL_NETBIRD_SETUP_KEY", "unused-key");
+        }
+        let config = SandboxModeConfig::resolve(&crate::settings::Settings::default())
+            .expect("unused tunnel provider is ignored")
+            .to_sandbox_config();
+        assert_eq!(config.network, crate::sandbox::SandboxNetworkMode::None);
+        assert!(config.tunnel.is_none());
     }
 
     #[test]
