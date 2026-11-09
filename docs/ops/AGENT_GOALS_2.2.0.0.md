@@ -77,7 +77,9 @@ Items 3–4 cover the sandbox theme; items 5–6 cover LunarDepth.
 
 ## Phase 4 - Documentation and Misc goal items (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
 
-8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/579
+8. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/579
+   - **DONE — Rarity (autonomous), 2026-11-09:** the daemon now emits `Starting LunarWing v2.2.0` at INFO immediately after tracing initialization, using `CARGO_PKG_VERSION` so the banner tracks the built package. Added regression coverage for the emitted message and level.
+   - **Verified:** `taskset -c 0-17 cargo check -j18 --locked --bin lunarwing`; `taskset -c 0-17 cargo clippy -j18 --locked --bin lunarwing --tests -- -D warnings`; `taskset -c 0-17 cargo test -j18 --locked --bin lunarwing tests::startup_banner_logs_version_at_info -- --exact --nocapture` (1 passed); `cargo fmt --all -- --check`.
 
 ## Phase 5 - Misc Operations (ALWAYS READ ALL COMMENTS FOR EACH WORK ITEM WHEN A WORK ITEM IS REFERENCED - ALSO ALWAYS READ LINKED WORK ITEMS FOR EACH WORK ITEM REFERENCED)
 
