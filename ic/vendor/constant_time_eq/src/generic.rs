@@ -50,20 +50,7 @@ pub(crate) type Word = usize;
 pub(crate) type Word = u8;
 
 /// Hides a value from the optimizer.
-#[cfg(all(
-    not(miri),
-    any(
-        target_arch = "x86",
-        target_arch = "x86_64",
-        target_arch = "arm",
-        target_arch = "aarch64",
-        target_arch = "arm64ec",
-        target_arch = "riscv32",
-        target_arch = "riscv64",
-        target_arch = "loongarch64",
-        target_arch = "s390x",
-    )
-))]
+#[cfg(all(inline_asm_is_stable, not(miri)))]
 #[must_use]
 #[inline(always)]
 fn optimizer_hide(mut value: Word) -> Word {
@@ -75,20 +62,7 @@ fn optimizer_hide(mut value: Word) -> Word {
 }
 
 /// Attempts to hide a value from the optimizer.
-#[cfg(any(
-    miri,
-    not(any(
-        target_arch = "x86",
-        target_arch = "x86_64",
-        target_arch = "arm",
-        target_arch = "aarch64",
-        target_arch = "arm64ec",
-        target_arch = "riscv32",
-        target_arch = "riscv64",
-        target_arch = "loongarch64",
-        target_arch = "s390x",
-    ))
-))]
+#[cfg(any(not(inline_asm_is_stable), miri))]
 #[must_use]
 #[inline(never)]
 fn optimizer_hide(value: Word) -> Word {
@@ -238,10 +212,10 @@ pub fn constant_time_eq_n<const N: usize>(a: &[u8; N], b: &[u8; N]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "count_instructions_test")]
+    #[cfg(count_instructions_test)]
     extern crate std;
 
-    #[cfg(feature = "count_instructions_test")]
+    #[cfg(count_instructions_test)]
     #[test]
     fn count_optimizer_hide_instructions() -> std::io::Result<()> {
         use super::{Word, optimizer_hide};

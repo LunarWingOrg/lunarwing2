@@ -1,3 +1,35 @@
+# 0.6.1
+
+* Fixed minimal version of rustversion dependency.
+
+# 0.6.0
+
+* The official repository for this project is now on Codeberg. The git
+  repository on GitHub is still in use; issues and pull requests are
+  accepted on either repository.
+* The availability of stable inline assembly for the target architecture
+  is now auto-detected based on the rustc version through a build script,
+  which allowed lowering the MSRV again.
+* The development-only count_instructions_test feature has been removed,
+  and replaced with an environment variable. To run these tests (currently
+  Linux-only), set COUNT_INSTRUCTIONS_TEST=1 when calling cargo test.
+
+# 0.5.0
+
+* Unfortunately, the Rust-version aware resolver only has an effect if
+  the main crate being compiled is using edition 2024 or opts in, it's
+  not enough to have edition 2024 in a dependency. Yanked 0.4.3 and
+  released 0.5.0; no changes other than the version number. Being able
+  to add new inline assembly architectures without requiring a manual
+  version update in all dependent crates will have to wait until most
+  of the ecosystem is using edition 2024.
+
+# 0.4.3 (yanked)
+
+* Rust 1.95.0 stabilized inline assembly for PowerPC. Increase the Rust
+  minimum version to allow its use. Cargo's version-aware dependency
+  resolution should prevent this from being a breaking change.
+
 # 0.4.2
 
 * Refactor detection of the DIT feature on ARM. For builds without the

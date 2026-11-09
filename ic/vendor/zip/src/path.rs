@@ -57,30 +57,32 @@ fn split_drive_prefix(component: &str) -> [Option<Utf8WindowsComponent<'_>>; 2] 
 /// (e.g. `CON.txt`, `aux.json`, `nul.dat` map to console, null, or hardware ports).
 #[cfg(windows)]
 pub(crate) fn is_windows_reserved_device_name(name: &str) -> bool {
-    let stem = name
-        .split(['.', ':'])
-        .next()
-        .unwrap_or(name)
-        .trim_end_matches([' ', '.']);
+    let Some(stem) = name.split(['.', ':']).next() else {
+        return false;
+    };
+    if stem.len() < 3 {
+        return false;
+    }
+    let stem = stem.trim_end_matches([' ', '.']);
+    if stem.len() < 3 || stem.len() > 7 {
+        return false;
+    }
+    let stem = stem.to_ascii_uppercase();
 
-    if stem.eq_ignore_ascii_case("CON")
-        || stem.eq_ignore_ascii_case("PRN")
-        || stem.eq_ignore_ascii_case("AUX")
-        || stem.eq_ignore_ascii_case("NUL")
-        || stem.eq_ignore_ascii_case("CONIN$")
-        || stem.eq_ignore_ascii_case("CONOUT$")
-        || stem.eq_ignore_ascii_case("CLOCK$")
-    {
+    if matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$" | "CONFIG$"
+    ) {
         return true;
     }
 
     if stem.len() >= 4 && stem.is_char_boundary(3) {
         let (prefix, rest) = stem.split_at(3);
-        if prefix.eq_ignore_ascii_case("COM") || prefix.eq_ignore_ascii_case("LPT") {
+        if matches!(prefix, "COM" | "LPT") {
             let mut chars = rest.chars();
             if let Some(c) = chars.next()
                 && chars.next().is_none()
-                && ((b'1'..=b'9').contains(&(c as u8)) || matches!(c, '¹' | '²' | '³'))
+                && matches!(c, '1'..='9' | '¹' | '²' | '³' | '⁴'..='⁹')
             {
                 return true;
             }
@@ -830,7 +832,7 @@ mod tests {
         for name in [
             "CON", "con", "Con", "PRN", "prn", "AUX", "aux", "NUL", "nul", "CONIN$", "conin$",
             "CONOUT$", "conout$", "CLOCK$", "clock$", "COM1", "com1", "COM9", "com9", "LPT1",
-            "lpt1", "LPT9", "lpt9", "COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³",
+            "lpt1", "LPT9", "lpt9", "COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³", "Lpt⁴", "COM⁹",
         ] {
             assert!(
                 is_windows_reserved_device_name(name),

@@ -1,6 +1,6 @@
 [package]
 name = "crypto-bigint"
-version = "0.7.10"
+version = "0.7.11"
 description = """
 Pure Rust implementation of a big integer library which has been designed from the ground-up for use
 in cryptographic applications. Provides constant-time, `no_std`/`no_alloc`-friendly implementations
@@ -12,21 +12,28 @@ repository = "https://github.com/RustCrypto/crypto-bigint"
 categories = ["algorithms", "cryptography", "data-structures", "mathematics", "no-std"]
 keywords = ["arbitrary", "crypto", "bignum", "integer", "precision"]
 readme = "README.md"
-resolver = "3"
 edition = "2024"
 rust-version = "1.87"
 exclude = [".clippy.toml", ".codecov.yml", ".github", ".gitignore"]
 
+[workspace]
+members = ["checkct", "checkct/checkct_macros", "checkct/driver-opt0"]
+default-members = ["."]
+resolver = "3"
+
+[workspace.dependencies]
+rand_core = { version = "0.10", default-features = false }
+
 [dependencies]
 cpubits = "0.1"
-ctutils = "0.4.6"
+ctutils = "0.4.8"
 num-traits = { version = "0.2.19", default-features = false }
 
 # optional dependencies
 der = { version = "0.8", optional = true, default-features = false }
 hybrid-array = { version = "0.4.12", optional = true }
 getrandom = { version = "0.4", optional = true, features = ["sys_rng"] }
-rand_core = { version = "0.10", optional = true, default-features = false }
+rand_core = { workspace = true, optional = true }
 rlp = { version = "0.6", optional = true, default-features = false }
 serdect = { version = "0.4", optional = true, default-features = false }
 subtle = { version = "2.6", optional = true, default-features = false }
@@ -38,7 +45,7 @@ hex-literal = "1"
 num-bigint = "0.5"
 num-integer = "0.1"
 num-modular = { version = "0.7", features = ["num-bigint", "num-traits"] }
-rand_core = "0.10"
+rand_core = { workspace = true, default-features = true }
 
 [target.'cfg(any(unix, windows))'.dev-dependencies]
 criterion = { version = "0.7", features = ["html_reports"] }

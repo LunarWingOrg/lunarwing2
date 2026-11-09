@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.88"
 name = "zip"
-version = "9.4.1"
+version = "9.5.0"
 authors = [
     "Mathijs van de Nes <git@mathijs.vd-nes.nl>",
     "Marli Frost <marli@frost.red>",
@@ -78,12 +78,10 @@ _miri_compatible_features = [
 ]
 aes-crypto = [
     "dep:aes",
-    "dep:constant_time_eq",
     "getrandom/std",
     "dep:hmac",
     "dep:pbkdf2",
     "dep:sha1",
-    "dep:zeroize",
 ]
 bzip2 = [
     "dep:bzip2",
@@ -96,6 +94,7 @@ bzip2-rs = [
     "_bzip2_any",
 ]
 chrono = ["dep:chrono"]
+constant_time_eq = []
 default = [
     "aes-crypto",
     "bzip2",
@@ -145,6 +144,7 @@ rayon = ["dep:rayon"]
 time = ["dep:time"]
 unreserved = []
 xz = ["dep:lzma-rust2"]
+zeroize = []
 zstd = ["dep:zstd"]
 
 [lib]
@@ -178,7 +178,6 @@ default-features = false
 
 [dependencies.constant_time_eq]
 version = "^0.6.1"
-optional = true
 
 [dependencies.crc32fast]
 version = "1.5"
@@ -245,7 +244,7 @@ default-features = false
 
 [dependencies.zeroize]
 version = "1.9"
-optional = true
+features = ["derive"]
 
 [dependencies.zopfli]
 version = "^0.8.3"
