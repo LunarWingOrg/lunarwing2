@@ -171,6 +171,16 @@ exit 2
         self.assertFalse(self.cached.exists())
         self.assertFalse((self.root / "downloaded").exists())
 
+    def test_rust_templates_keep_bootstrap_and_source_the_outage_fallback(self):
+        defaults = yaml.safe_load((ROOT / ".gitlab/ci/defaults.yml").read_text())
+        command = (
+            "bash .gitlab/scripts/bootstrap-sccache.sh || "
+            "source .gitlab/scripts/disable-sccache.sh"
+        )
+        for template in (".rust-job", ".rust-msrv-job"):
+            with self.subTest(template=template):
+                self.assertIn(command, defaults[template]["before_script"])
+
     def test_after_script_cannot_run_payload_when_earlier_bootstrap_fails(self):
         defaults = yaml.safe_load((ROOT / ".gitlab/ci/defaults.yml").read_text())
         for template in (".rust-job", ".rust-msrv-job"):
