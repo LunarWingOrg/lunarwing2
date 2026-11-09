@@ -119,6 +119,10 @@ fn format_top_level_error(err: &anyhow::Error) {
     eprintln!();
 }
 
+fn log_startup_banner() {
+    tracing::info!("Starting LunarWing v{}", env!("CARGO_PKG_VERSION"));
+}
+
 async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -377,7 +381,7 @@ async fn async_main() -> anyhow::Result<()> {
         config.sandbox.tenant_logs,
     );
 
-    tracing::debug!("Starting LunarWing...");
+    log_startup_banner();
     tracing::debug!("Loaded configuration for agent: {}", config.agent.name);
     tracing::debug!("LLM backend: {}", config.llm.backend);
 
@@ -1633,4 +1637,19 @@ async fn migrate_native_xmpp_to_installable(
         jid = %xmpp.jid,
         "Migrated legacy native XMPP configuration into the installable xmpp channel"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    #[tracing_test::traced_test]
+    #[test]
+    fn startup_banner_logs_version_at_info() {
+        super::log_startup_banner();
+
+        assert!(logs_contain("INFO"));
+        assert!(logs_contain(&format!(
+            "Starting LunarWing v{}",
+            env!("CARGO_PKG_VERSION")
+        )));
+    }
 }

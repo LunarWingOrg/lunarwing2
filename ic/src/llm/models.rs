@@ -118,6 +118,8 @@ pub(crate) fn build_lunarwing_cloud_model_fetch_config() -> crate::config::LlmCo
             session_path: crate::config::llm::default_session_path(),
         },
         max_retries: lunarwing_cloud.max_retries,
+        empty_stream_retry_input_token_budget:
+            crate::llm::retry::DEFAULT_EMPTY_STREAM_RETRY_INPUT_TOKEN_BUDGET,
         circuit_breaker_threshold: lunarwing_cloud.circuit_breaker_threshold,
         circuit_breaker_recovery_secs: lunarwing_cloud.circuit_breaker_recovery_secs,
         response_cache_enabled: lunarwing_cloud.response_cache_enabled,

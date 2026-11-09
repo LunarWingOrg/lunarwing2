@@ -72,9 +72,14 @@ The following are written to `lunarwing.env` by the MT admin script:
 > **Per-tenant ports & the in-process WASM channel.** The LunarWing daemon
 > (which hosts the WeeChat WASM channel in-process) sources `relay_url`,
 > `ws_adapter_url`, and `relay_password` from `RELAY_URL`, `WS_ADAPTER_URL`, and
-> `RELAY_PASSWORD` at startup. Without these the channel falls back to the
-> hardcoded `:9001`/`:6681` defaults and silently fails for every tenant whose
-> ports differ. See the archived `WEECHAT-MULTITENANT-PORT-BUG.md` in `docs/internal/history/archive/ops/`.
+> `RELAY_PASSWORD` at startup. A non-empty managed `RELAY_PASSWORD` takes
+> precedence over `weechat_relay_password` in the per-owner secrets store, so
+> `rotate-relay-password` cannot leave the WASM channel using the previous
+> password after WeeChat and the adapter restart. The store remains the fallback
+> for deployments without the managed environment variable. Without the URL
+> variables the channel falls back to the hardcoded `:9001`/`:6681` defaults and
+> silently fails for every tenant whose ports differ. See the archived
+> `WEECHAT-MULTITENANT-PORT-BUG.md` in `docs/internal/history/archive/ops/`.
 > Existing tenants need `WS_ADAPTER_URL` backfilled — run `mt-admin patch-env <name>`.
 
 ## Generated Service Units

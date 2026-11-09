@@ -102,14 +102,15 @@ ignore = [
     { id = "RUSTSEC-2020-0036", reason = "failure crate officially unmaintained; same vendored libsignal-protocol chain and exposure as RUSTSEC-2019-0036; clearing owner WI#367, decision record WI#331 (re-verified 2026-10-10)" },
 
     # rsa Marvin timing side channel via russh -> rsa 0.10.0-rc.18.
-    # Re-verified 2026-11-07: the advisory still declares patched = [];
-    # rsa 0.10.0-rc.22 is published but not marked patched, and russh
-    # 0.65.1 (newest) still requests rsa =0.10.0-rc.18 as an optional dep,
-    # so a russh bump does not clear the advisory. The tree pins russh
-    # 0.62.7. Clearing requires an upstream constant-time rsa release or
-    # a LunarWing policy change (reject RSA key material by parsed
-    # algorithm, drop the russh/rsa feature — only russh and ssh-key
-    # pull rsa in).
+    # Re-verified 2026-11-09: the advisory now declares patched = [">= 0.10.0"];
+    # rsa 0.10.0 stable is published and not yanked, but the locked rc.18
+    # prerelease remains affected. Newest russh 0.65.1 still requests
+    # rsa =0.10.0-rc.18 as an optional dep, so a russh bump does not clear
+    # the advisory. The tree pins russh 0.62.7 with the same exact RSA pin.
+    # Clearing requires an upstream russh release that adopts patched RSA,
+    # a reviewed vendored backport, or a LunarWing policy change (reject RSA
+    # key material by parsed algorithm, drop the russh/rsa feature — only
+    # russh and ssh-key pull rsa in).
     # EXPOSURE (corrected per MR !1505 review CP-3): compiled into every
     # feature set because LunarWing itself enables the russh "rsa" feature
     # (ic/Cargo.toml). The built-in ssh tool refuses RSA by declared
@@ -122,7 +123,7 @@ ignore = [
     # (rng = None) — unlimited chosen-message RSA signatures with local
     # timing for any tenant that configures an RSA host key.
     # Clearing owner: WI#368 (split out of WI#331).
-    { id = "RUSTSEC-2023-0071", reason = "rsa 0.10.0-rc.18 Marvin timing attack; patched = [] (re-verified 2026-11-07); rc.22 published but not marked patched; russh 0.62.7 in tree; newest 0.65.1 still pins rsa =0.10.0-rc.18; exposure: tenant SSH agent (auto-confirm, 0o666) mounted into untrusted worker containers signs with RSA host keys; LunarWing-enabled russh/rsa feature, every feature set; clearing owner WI#368, decision record WI#331" },
+    { id = "RUSTSEC-2023-0071", reason = "rsa 0.10.0-rc.18 Marvin timing attack; patched >=0.10.0 (re-verified 2026-11-09), stable 0.10.0 published and not yanked; locked rc.18 remains affected; russh 0.62.7 in tree; newest 0.65.1 still pins rsa =0.10.0-rc.18; exposure: tenant SSH agent (auto-confirm, 0o666) mounted into untrusted worker containers signs with RSA host keys; LunarWing-enabled russh/rsa feature, every feature set; clearing owner WI#368, decision record WI#331" },
 
     # h2 empty DATA frames — low severity. The patched 0.4.20 is locked; the
     # remaining 0.3.27 copy is unpatchable upstream (0.3 line ended at 0.3.27)

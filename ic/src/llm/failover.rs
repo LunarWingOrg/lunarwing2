@@ -1282,7 +1282,10 @@ mod tests {
             vec![successful_stream("fallback delta")],
             vec![],
         ));
-        let retry_config = RetryConfig { max_retries: 3 };
+        let retry_config = RetryConfig {
+            max_retries: 3,
+            ..RetryConfig::default()
+        };
         let primary: Arc<dyn LlmProvider> = Arc::new(RetryProvider::new(
             primary_inner.clone(),
             retry_config.clone(),

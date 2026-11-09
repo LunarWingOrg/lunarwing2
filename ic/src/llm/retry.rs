@@ -157,17 +157,25 @@ pub(crate) fn parse_retry_after(header: Option<&reqwest::header::HeaderValue>) -
 
 const DEFAULT_RETRY_AFTER_SECS: u64 = 60;
 
+pub const DEFAULT_EMPTY_STREAM_RETRY_INPUT_TOKEN_BUDGET: u32 = 100_000;
+
 /// Configuration for the retry decorator.
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
     /// Maximum number of retry attempts (not counting the initial attempt).
     /// Default: 3.
     pub max_retries: u32,
+    /// Stop retrying billed-but-empty streams once their cumulative reported
+    /// input tokens reach this budget. Zero disables the budget.
+    pub empty_stream_retry_input_token_budget: u32,
 }
 
 impl Default for RetryConfig {
     fn default() -> Self {
-        Self { max_retries: 3 }
+        Self {
+            max_retries: 3,
+            empty_stream_retry_input_token_budget: DEFAULT_EMPTY_STREAM_RETRY_INPUT_TOKEN_BUDGET,
+        }
     }
 }
 
@@ -207,6 +215,19 @@ impl RetryProvider {
                 .await;
         }
         reason
+    }
+
+    fn empty_retry_budget_exhausted(
+        &self,
+        discarded: Option<TokenUsage>,
+        error: &LlmError,
+    ) -> Option<u32> {
+        let budget = self.config.empty_stream_retry_input_token_budget;
+        let usage = empty_stream_usage(error)?;
+        let total = discarded
+            .map_or(0, |usage| usage.input_tokens)
+            .saturating_add(usage.input_tokens);
+        (budget > 0 && total >= budget).then_some(total)
     }
 
     async fn retry_loop<T, F, Fut>(&self, mut op: F, label: &str) -> Result<T, LlmError>
@@ -289,6 +310,18 @@ impl RetryProvider {
                 }
                 StreamOpening::Error(error) => {
                     if !is_retryable(&error) || attempt == self.config.max_retries {
+                        return Err(fold_discarded_usage(error, discarded_usage));
+                    }
+                    if let Some(billed_input_tokens) =
+                        self.empty_retry_budget_exhausted(discarded_usage, &error)
+                    {
+                        tracing::warn!(
+                            provider = %self.inner.model_name(),
+                            attempt = attempt + 1,
+                            billed_empty_input_tokens = billed_input_tokens,
+                            input_token_budget = self.config.empty_stream_retry_input_token_budget,
+                            "Stopping billed-but-empty stream retries: input token budget exhausted"
+                        );
                         return Err(fold_discarded_usage(error, discarded_usage));
                     }
                     let delay = retry_delay(&error, attempt);
@@ -438,7 +471,10 @@ mod tests {
     }
 
     fn fast_config(max_retries: u32) -> RetryConfig {
-        RetryConfig { max_retries }
+        RetryConfig {
+            max_retries,
+            ..RetryConfig::default()
+        }
     }
 
     fn retryable_stream_error() -> LlmError {
@@ -976,17 +1012,25 @@ mod tests {
         assert_eq!(inner.plain_calls(), 2);
     }
 
-    fn billed_empty_stream(finish_reason: &str, input_tokens: u32) -> StreamScript {
+    fn billed_empty_stream_with_usage(
+        finish_reason: &str,
+        input_tokens: u32,
+        output_tokens: u32,
+    ) -> StreamScript {
         StreamScript::Items(vec![Ok(LlmStreamChunk::Done {
             usage: Some(TokenUsage {
                 input_tokens,
-                output_tokens: 0,
+                output_tokens,
                 reasoning_tokens: 0,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             }),
             finish_reason: finish_reason.to_string(),
         })])
+    }
+
+    fn billed_empty_stream(finish_reason: &str, input_tokens: u32) -> StreamScript {
+        billed_empty_stream_with_usage(finish_reason, input_tokens, 0)
     }
 
     // MR !1395 F-2: the usage of billed-but-empty attempts discarded before a
@@ -1055,6 +1099,69 @@ mod tests {
                 }),
                 ..
             }) if provider == "scripted"
+        ));
+        assert_eq!(inner.plain_calls(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn billed_empty_retry_budget_stops_the_wi578_token_storm() {
+        let inner = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![
+                billed_empty_stream_with_usage("unknown", 97_530, 2_022),
+                billed_empty_stream_with_usage("unknown", 105_821, 1_440),
+                billed_empty_stream_with_usage("unknown", 141_655, 2_246),
+                billed_empty_stream_with_usage("unknown", 46_766, 1_626),
+            ],
+            vec![],
+        ));
+        let retry = RetryProvider::new(inner.clone(), fast_config(3));
+
+        let result = retry.complete_stream(make_request()).await;
+
+        assert!(matches!(
+            result,
+            Err(LlmError::EmptyStream {
+                usage: Some(TokenUsage {
+                    input_tokens: 203_351,
+                    output_tokens: 3_462,
+                    ..
+                }),
+                ..
+            })
+        ));
+        assert_eq!(inner.plain_calls(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_billed_empty_retry_budget_preserves_retry_behavior() {
+        let inner = Arc::new(ScriptedStreamingProvider::new(
+            "scripted",
+            vec![
+                billed_empty_stream("stop", 900),
+                billed_empty_stream("stop", 1100),
+            ],
+            vec![],
+        ));
+        let retry = RetryProvider::new(
+            inner.clone(),
+            RetryConfig {
+                max_retries: 1,
+                empty_stream_retry_input_token_budget: 0,
+            },
+        );
+
+        let result = retry.complete_stream(make_request()).await;
+
+        assert!(matches!(
+            result,
+            Err(LlmError::EmptyStream {
+                usage: Some(TokenUsage {
+                    input_tokens: 2000,
+                    ..
+                }),
+                ..
+            })
         ));
         assert_eq!(inner.plain_calls(), 2);
     }
