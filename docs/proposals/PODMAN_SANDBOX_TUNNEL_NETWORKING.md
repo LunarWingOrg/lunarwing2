@@ -1,8 +1,9 @@
 # Podman Sandbox Tunnel Networking (NetBird + WireGuard)
 
 **Status:** IMPLEMENTED on `sweetiebot/kimi-3-20261109-0012` (WI#248)
-**Lineage:** fresh port of the unreviewed `sandboxtunmode` experiment (`2ed3d0395`),
-plus the egress-only and lifecycle hardening described below. Related design
+**Lineage:** port of the maintainer's `sandboxtunmode` branch (`2ed3d0395`, !1336,
+reviewed in note 5824) onto the v2.2.0.0 head, plus the egress-only and
+lifecycle hardening described below. Related design
 history: WI#144 and the overlay-as-transport discussion on WI#153.
 **Operator guide:** `docs/guides/SANDBOX_TUNNEL_NETWORKING.md`
 
@@ -37,41 +38,77 @@ The generic sandbox boundary remains unchanged. This code is under
 `src/sandbox/`; it is not connected to orchestrator workers, worker exposure, or
 `src/tunnel/` (which publishes the gateway inbound).
 
-### Egress only, not overlay exposure
+### Egress only, in both directions
 
-Sharing a network namespace without a firewall would let a sandboxed process
-bind a port reachable through the tunnel or the sidecar uplink. The original
-experiment left that gap open. This implementation requires `nftables` in every
-sidecar image and installs an `inet lunarwing_sandbox_egress` input chain:
+Sharing a network namespace without a firewall has two gaps: a sandboxed
+process could bind a port reachable through the tunnel or the sidecar uplink,
+and it could use the sidecar's uplink to reach the public internet, the LAN,
+host loopback services (`host.containers.internal`) and the cloud metadata
+service, which is the WI#154 scenario that made `none` the default. The
+original `sandboxtunmode` branch documented the second gap as "advisory unless
+the default route rides the tunnel"; the review of !1336 (note 5824, T1)
+reproduced it. This implementation requires `nftables` in every sidecar image
+and installs an `inet lunarwing_sandbox_egress` table with two base chains:
 
-- default policy `drop` for IPv4 and IPv6;
-- loopback traffic accepted for in-namespace operation;
-- `established,related` return traffic accepted for outbound connections;
-- no other input accept rules permitted.
+- `input`, policy `drop`: loopback and `established,related` return traffic
+  only, so nothing inside the namespace can accept a new inbound flow.
+- `output`, policy `drop`: loopback; the tunnel interfaces `wg0` and `wt0`;
+  IPv6 neighbour discovery; DNS (`udp`/`tcp` 53) to the resolvers in the
+  sidecar's `/etc/resolv.conf`; an explicit drop of `169.254.0.0/16`; and,
+  last, packets carrying the provider's socket mark. Everything else is
+  dropped.
 
-Joiner containers have no `NET_ADMIN`, so their processes cannot alter the
+The mark is how the tunnel's own control plane keeps using the uplink without
+an address allowlist that would have to track management, signal, relay and
+STUN hosts: the NetBird client sets `0x1bd00` on every socket it opens
+(advanced routing, the Linux default with `NET_ADMIN`), and a WireGuard
+device stamps its encapsulated packets with its fwmark (the sidecar sets
+`0x4c57` on a device whose config left it off and keeps wg-quick's full-route
+mark otherwise). Setting a socket mark needs `NET_ADMIN`, which joiners do not
+have, so a joined command can only leave through the tunnel interface: a split
+tunnel reaches its overlay CIDRs and nothing else, a full-route tunnel reaches
+everything through the overlay. UID- and cgroup-based allowances were
+rejected: under rootless podman the sidecar's root and the keep-id sandbox
+user map to the same host uid, and cgroup paths differ between cgroup
+managers and runtimes.
+
+Joiner containers have no `NET_ADMIN`, so their processes cannot alter either
 chain. There are no `-p`/`--publish` arguments, no host-network join, no port
-forward, and no LunarWing listener. The firewall is installed before the first
-joiner and verified before every execution. Missing `nft`, an altered chain, or
-an extra inbound accept fails closed. NetBird ACLs and WireGuard peer policy
-remain separate defense-in-depth; overlay membership is not application auth.
+forward, and no LunarWing listener. The provider is brought up first (it
+resolves and reaches its endpoints through the still-open uplink while no
+joiner exists), then the table is installed and verified; before every run the
+listing is parsed and compared rule by rule with the expected policy. Missing
+`nft`, an altered or missing chain, an extra accept (with or without a
+comment) or a changed policy fails closed. Residuals: DNS to the runtime
+resolvers is reachable from the sandbox, and all concurrent commands of a
+tenant share one loopback. NetBird ACLs and WireGuard peer policy remain
+separate defense-in-depth; overlay membership is not application auth.
 
 ### Lifecycle and failure posture
 
 - Startup validates provider settings, reuses only a running sidecar with the
-  current SHA-256 configuration label, and otherwise recreates it.
+  current configuration label that also passes the provider probe and the
+  firewall check, and otherwise removes and recreates it. With
+  `SANDBOX_AUTO_PULL=false` the image must already be present locally.
 - NetBird readiness is `netbird status --check startup`; WireGuard readiness is
-  the presence of `wg0`. Probes and cleanup are bounded.
+  the presence of `wg0`. The firewall is installed after readiness. Probes,
+  start and cleanup are bounded.
 - `SandboxManager` health-gates initialization and calls `ensure_healthy()`
   before every container run. Provider failure, a dead sidecar, hash drift, or
   firewall drift returns `SandboxError::TunnelUnavailable`, mapped to the stable
-  `[sandbox:sandbox_unavailable]` envelope. There is no fallback to `proxy`,
-  `proxy-enforced`, direct egress, or host execution.
-- Configuration hashes cover provider, image, management URL, setup key,
-  WireGuard path and file contents. Credential/content rotation therefore
-  recreates the sidecar. Only the digest enters a label, never key material.
-- `shutdown()` removes the sidecar. Its label namespace is separate from the
-  one-shot `lunarwing.sandbox` reaper label.
+  `[sandbox:sandbox_unavailable]` envelope, after one bounded attempt to
+  recreate the sidecar. There is no fallback to `proxy`, `proxy-enforced`,
+  direct egress, or host execution.
+- The configuration label is a salted SHA-256 over provider, image, management
+  URL, setup key, WireGuard path and file contents; the salt is a random 0600
+  file in the private runtime directory, so the label is not a plain digest of
+  key material. Credential/content rotation recreates the sidecar.
+- NetBird's peer identity and config live in a named volume keyed by the label
+  hash, so a restart reuses the enrolled peer instead of spending another
+  setup key; a rotation enrols a fresh peer and prunes the previous volume.
+- `shutdown()` removes the sidecar (podman `rm -f -t`, Docker `stop` then
+  `rm -f`). Its label namespace is separate from the one-shot
+  `lunarwing.sandbox` reaper label.
 
 ### Credential handling
 
@@ -93,14 +130,16 @@ receive the setup key or private key.
 |------|---------|-------------|
 | `none` (unchanged default) | no egress | kernel `--network none` |
 | `proxy-enforced` | public web through domain allowlist | network-none + Unix relay + public-only proxy |
-| `tunnel` | private overlay and optionally full-route egress | sidecar input firewall + tunnel routes/ACLs |
+| `tunnel` | private overlay and optionally full-route egress | kernel-enforced sidecar input + output chains; reachability = the tunnel's routes/ACLs |
 | `proxy` (legacy) | public web through env-var proxy | advisory only |
 
 A full-route WireGuard config (`AllowedIPs = 0.0.0.0/0`, plus IPv6 where used) or
-NetBird default route sends outbound traffic through the overlay. A split tunnel
-leaves the sidecar's ordinary pasta/slirp uplink available for other outbound
-destinations; this is intentional and documented, not equivalent to the
-public-only proxy allowlist. The inbound-drop firewall applies in both cases.
+NetBird default route sends all outbound traffic through the overlay. A split
+tunnel reaches only its overlay CIDRs: the sidecar's pasta/slirp uplink is
+closed to joined commands by the output chain in both cases, except for DNS to
+the runtime resolvers. Neither shape is equivalent to the public-only proxy
+allowlist; what is reachable is decided by the tunnel's routes and the overlay's
+ACLs, never by the host's network position.
 
 Item 4 (WI#537) owns any change to the default network mode and the sandbox
 image's Python suite. This item preserves `none` and does not edit that image.

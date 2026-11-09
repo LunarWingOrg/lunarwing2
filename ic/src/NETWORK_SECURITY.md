@@ -401,7 +401,7 @@ Sandboxed policies (`readonly`, `workspace_write`) select an egress mode via
 |------|-----------|-------------|
 | `none` (default) | `--network none` on the container | **Kernel-enforced** — no egress at all; the proxy is not started |
 | `proxy-enforced` (WI#155) | Container keeps `--network none`; egress only through a per-execution **Unix-socket relay** to the allowlist proxy | **Enforced** — no direct egress path exists anywhere (loopback included); the proxy rejects non-public destinations and pins DNS |
-| `tunnel` (WI#248) | Commands join a NetBird/WireGuard sidecar netns; sidecar `nft` input policy drops all non-loopback new inbound flows | **Egress-only** — return traffic and tunnel routes/ACLs only; full-route tunnel confines outbound to the overlay, split tunnel retains direct uplink |
+| `tunnel` (WI#248) | Commands join a NetBird/WireGuard sidecar netns; the sidecar carries an `nft` `input` chain (policy drop) and an `output` chain (policy drop: only `lo`, the tunnel interface, the provider's marked control traffic and DNS to the runtime's resolvers pass; link-local IPv4 dropped) | **Kernel-enforced egress-only** — joined commands reach exactly what the tunnel routes (overlay CIDRs of a split tunnel, everything through a full-route tunnel); the uplink, host loopback, LAN and cloud metadata are unreachable; new inbound is dropped |
 | `proxy` | HTTP proxy + `http_proxy`/`https_proxy` env vars in the container | **Advisory (legacy)** — a process that ignores proxy env vars can still egress directly |
 
 **Default policy (WI#154/155, v2.1.2.0):** the in-code default and mt-admin
@@ -430,22 +430,38 @@ The opt-in `tunnel` mode (WI#248) is separate from both the gateway's inbound
 `src/tunnel/` abstraction and external-worker exposure. One daemon-owned
 sidecar establishes NetBird or kernel WireGuard; one-shot commands join only
 its network namespace and retain every existing hardening flag. There are no
-published ports or host-network joins. A required sidecar `nftables` input
-chain has policy `drop`, accepts loopback and `established,related` return
-traffic, and is verified to contain no other accept rules before every run.
-Joiners have no `NET_ADMIN` and cannot change it. Thus a sandbox process cannot
-bind an inbound service to the LAN or overlay (WI#357).
+published ports or host-network joins. The sidecar carries a required
+`nftables` table with two base chains, installed after the provider is up and
+verified rule by rule before every run:
+
+- `input`, policy `drop`: accepts loopback and `established,related` return
+  traffic only. A sandbox process cannot bind an inbound service reachable
+  from the host, the LAN or the overlay (WI#357).
+- `output`, policy `drop`: accepts loopback, the tunnel interfaces (`wg0`,
+  `wt0`), IPv6 neighbour discovery, DNS (`udp`/`tcp` 53) to the resolvers
+  listed in the sidecar's `/etc/resolv.conf`, and packets carrying the
+  provider's socket mark (NetBird's control-plane mark `0x1bd00`, or the
+  WireGuard device fwmark; the sidecar sets `0x4c57` on a device whose config
+  left it off). `169.254.0.0/16` (cloud metadata, podman's host alias) is
+  dropped before the mark accept. Joiners have no `NET_ADMIN`, so they cannot
+  set a socket mark or alter either chain: what they reach is exactly what
+  the tunnel routes, and the uplink, host loopback, LAN and metadata service
+  are unreachable. The DNS allowance to the runtime resolvers is the one
+  residual uplink channel, and all concurrent commands of a tenant share the
+  namespace's loopback.
 
 The manager health-gates sidecar startup and rechecks provider health,
-configuration hash, and that firewall before each execution. Missing `nft`, an
+configuration hash and both chains before each execution. Missing `nft`, an
 unhealthy provider, or an altered/missing chain returns
-`[sandbox:sandbox_unavailable]` without degrading to another tier. NetBird
-management URL/setup key travel through an atomically created mode-0600
-`--env-file`; WireGuard uses a regular non-symlink mode-0600 config mounted
-read-only. Key material never enters argv, joiner filesystems/environments, or
-LunarWing log/error text. Full-route WireGuard `AllowedIPs` or NetBird default
-routes confine outbound traffic to the overlay; split tunnels intentionally
-retain the ordinary uplink for other outbound destinations. See
+`[sandbox:sandbox_unavailable]` without degrading to another tier; a dead or
+drifted sidecar is removed and recreated once before the run is refused.
+NetBird management URL/setup key travel through an atomically created
+mode-0600 `--env-file` under the private runtime directory (no `/tmp`
+fallback); WireGuard uses a regular non-symlink mode-0600 config mounted
+read-only with a private SELinux label. Key material never enters argv, joiner
+filesystems/environments, or LunarWing log/error text; the configuration label
+on the container is a salted digest. NetBird's peer identity lives in a named
+volume keyed by that digest, so restarts do not spend setup keys. See
 `docs/guides/SANDBOX_TUNNEL_NETWORKING.md` and
 `docs/proposals/PODMAN_SANDBOX_TUNNEL_NETWORKING.md`.
 
@@ -948,7 +964,7 @@ This is by design: MCP server URLs come from **operator-controlled configuration
 
 ### Sandbox Domain Allowlists
 
-In `proxy` and `proxy-enforced` modes, HTTP traffic uses the proxy's domain allowlist. `none` has no egress; `tunnel` bypasses this HTTP allowlist and uses tunnel routes/ACLs instead. The proxy allowlist is built from:
+In `proxy` and `proxy-enforced` modes, HTTP traffic uses the proxy's domain allowlist. `none` has no egress; `tunnel` bypasses this HTTP allowlist — its reachability is the tunnel's routes/ACLs behind the sidecar's output chain. The proxy allowlist is built from:
 
 1. A default set of domains (`src/sandbox/config.rs` — `default_allowlist()`)
 2. Additional domains from `SANDBOX_EXTRA_DOMAINS` env var (comma-separated)
