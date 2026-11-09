@@ -38,9 +38,8 @@ runtime or image is unavailable, commands error with a structured
 
 ## Network Egress Tiers
 
-- `none` (default): `--network none` — kernel-enforced isolation, no egress,
-  no proxy started.
-- `proxy-enforced` (WI#155): container keeps `--network none`; the only egress
+- `none`: `--network none` — kernel-enforced isolation, no egress, no proxy.
+- `proxy-enforced` (default; WI#155/537): container keeps `--network none`; the only egress
   path is a per-execution Unix-socket relay to the validating proxy (public-only,
   DNS-pinned, redirect rechecked). Requires a local Linux runtime and Python 3
   in the image; relay setup failures fail closed (`[sandbox:proxy_error]`),
@@ -59,13 +58,13 @@ runtime or image is unavailable, commands error with a structured
 - `proxy`: legacy allowlist HTTP proxy + credential injection. **Advisory** —
   enforced via env vars, which a process may ignore.
 
-**Default (WI#154/155):** the in-code default and every mt-admin-rendered
-tenant is `none` (mt-admin preserves an operator-set `proxy` on re-render;
-upgrades preserve an explicit `proxy`). `proxy` is advisory; use
-`proxy-enforced` when sandboxed processes need allowlisted web access — it is
-network-isolated everywhere except a Unix relay to the public-only proxy. The
-relay socket lives under `$XDG_RUNTIME_DIR` when available so it stays visible
-to both a `PrivateTmp` daemon and manager-forked workload namespaces.
+**Default (WI#537):** the in-code default and new mt-admin-rendered tenants use
+`proxy-enforced`. mt-admin preserves every operator-set value on re-render:
+`none`, `proxy-enforced`, `tunnel`, or legacy advisory `proxy`. Never make
+advisory `proxy` or a bridged network the default. The enforced relay is the
+only egress path to the public-only proxy; its socket lives under
+`$XDG_RUNTIME_DIR` when available so it stays visible to both a `PrivateTmp`
+daemon and manager-forked workload namespaces.
 
 **Hardening highlights:** explicit `--pids-limit 256`, `--stop-timeout 10`,
 `--entrypoint sh`, `--workdir /workspace`, explicit `--user` resolved per
