@@ -124,4 +124,5 @@ pub(crate) fn managed_channel_secret_env(
 }
 
 #[cfg(test)]
-pub(crate) static WEECHAT_MANAGED_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static WEECHAT_MANAGED_ENV_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());

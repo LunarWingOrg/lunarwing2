@@ -727,9 +727,7 @@ mod tests {
         // mt-admin rotates RELAY_PASSWORD and restarts WeeChat, the adapter,
         // and the daemon together. A stale store entry must not override the
         // rotated value and leave /api/wait returning 401 after every restart.
-        let _env_guard = crate::channels::wasm::WEECHAT_MANAGED_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_guard = crate::channels::wasm::WEECHAT_MANAGED_ENV_LOCK.lock().await;
         unsafe {
             std::env::set_var("RELAY_PASSWORD", "rotated-tenant-secret-pw");
         }

@@ -7185,9 +7185,7 @@ mod tests {
     async fn weechat_host_credential_uses_managed_env_before_stale_store() {
         use crate::secrets::{CreateSecretParams, SecretsStore};
 
-        let _env_guard = crate::channels::wasm::WEECHAT_MANAGED_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_guard = crate::channels::wasm::WEECHAT_MANAGED_ENV_LOCK.lock().await;
         unsafe {
             std::env::set_var("RELAY_PASSWORD", "rotated-tenant-secret-pw");
         }
