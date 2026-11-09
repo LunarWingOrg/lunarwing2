@@ -144,7 +144,7 @@ Use a digest-pinned multi-stage build:
 3. **Runtime stage** — the same pinned Node runtime and Debian snapshot, with only the materialized production closure, root-owned lane scripts/configuration, and task utilities. The application launches the built launcher, equivalent to `node .../@lunardepth/dsh/lib/bin.js --profile lunarwing-worker`, not `tsx`, a source checkout, or a development watcher.
 4. **Assertion stage/final assertions** — run the real entrypoint smoke in `RUN --network=none`, verify effective identities and modes, verify the internal-only harness bind and authenticated protocol, and assert no unwanted residue before the final `USER 10005:10005`.
 
-The final image must not contain the pnpm store, npm cache, LunarDepth `.git`, build-only compilers, or development dependencies unless a separately reviewed toolchain profile explicitly requires them. `WITH_TOOLCHAIN` behavior is not allowed to change Node or pnpm from their required pins.
+The final image must not contain the pnpm store, npm cache, LunarDepth `.git`, build-only compilers, or development dependencies unless a separately reviewed toolchain profile explicitly requires them. `WITH_TOOLCHAINS` behavior is not allowed to change Node or pnpm from their required pins.
 
 ### 5.3 Debian, Node, and determinism
 
@@ -329,6 +329,8 @@ mt-admin start-worker <tenant> lunardepth
 
 `--with-lunardepth` participates in `build-all`, pre-stop `build-worker-candidates --enabled`, `promote-worker-images`, rollback records, import/export, and `upgrade-tenant`. Standalone builds and candidate builds use the same clean-source, `git archive`, provenance, and immutable-image rules as existing lanes. A failed pre-stop candidate leaves the running tenant untouched.
 
+The inline `RUN --network=none` smoke requires Podman 4.5 or newer, or Docker with BuildKit/buildx. Generalize the existing builder probe rather than duplicating it, and run its LunarDepth preflight before `upgrade-tenant` or `stop-tenant-for-upgrade` stops anything. Older hosts may keep an already-built image but cannot rebuild it.
+
 Start/restart follows the existing selected-worker order with LunarDepth appended after opencode2. It preserves lane-local status 3/4 behavior and does not hide failures in other selected lanes. Image ID and split launch-contract changes recreate both roles. Operator-set base URL, model, credential files, and insecure-HTTP exception survive re-render; inherited endpoint markers are re-derived and omitted from export like the other lanes.
 
 Upgrade requires matching lane scripts, image, mt-admin modules, unit definitions, and IPC contract. Rollback restores the recorded prior image ID and matching configuration; it does not rename or adopt an older writable IPC volume. Preserve the workspace and never print the rollback token or LLM key.
@@ -352,12 +354,12 @@ Add the standard protected jobs:
 
 | Job | Required behavior |
 | --- | --- |
-| `worker-lunardepth-candidate` | Build and push an immutable candidate, export `lunardepth-rootfs.tar`, build again with no cache, and require equal whole-image digests. |
-| `worker-lunardepth-exposure-verify` | With checkout-owned tooling, validate tar ownership/modes and complete image config, compare checkout-owned files, and run the real split-role runtime smoke. |
+| `worker-lunardepth-candidate` | Build and push an immutable candidate, run the real split-role runtime smoke, export `lunardepth-rootfs.tar`, build again with no cache, and require equal whole-image digests. Publish the tar as a candidate artifact explicitly. |
+| `worker-lunardepth-exposure-verify` | With checkout-owned tooling, validate tar ownership/modes and complete image config and compare checkout-owned files out of band. This job verifies the candidate; it does not claim to rerun its runtime smoke. |
 | `worker-lunardepth-scan` | Scan the exact candidate digest with the existing CRITICAL gate and produce the CycloneDX SBOM. |
 | `worker-lunardepth-promote` | Manually publish `$CI_COMMIT_TAG-lunardepth` from the verified digest; never rebuild and never publish `:latest`. |
 
-Promotion hard-needs candidate, exposure verification, scan, and the BuildKit parser guard. Use `worker-lunardepth-promotion` as the resource group. No new Trivy suppression is assumed; any finding requires remediation or a separately reviewed, dated exception under the existing policy.
+Promotion hard-needs candidate, exposure verification, scan, `worker-exposure-policy-guard`, and the BuildKit parser guard. Use `worker-lunardepth-promotion` as the resource group. No new Trivy suppression is assumed; any finding requires remediation or a separately reviewed, dated exception under the existing policy.
 
 The existing protected-ref rules stay intact. An MR pipeline proves source/configuration policy, but does not receive publication credentials or substitute for the protected candidate/scan/exposure gates. Publication evidence must name the exact source and image digests.
 
