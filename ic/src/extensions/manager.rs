@@ -5004,15 +5004,6 @@ impl ExtensionManager {
             return self.refresh_active_channel(name, user_id).await;
         }
 
-        // Check auth status first
-        let auth_state = self.check_channel_auth_status(name, user_id).await;
-        if auth_state != ToolAuthState::Ready && auth_state != ToolAuthState::NoAuth {
-            return Err(ExtensionError::ActivationFailed(format!(
-                "Channel '{}' requires configuration. Use the setup form to provide credentials.",
-                name
-            )));
-        }
-
         // Load the channel from files
         let wasm_path = self.wasm_channels_dir.join(format!("{}.wasm", name));
         let cap_path = self
@@ -5121,6 +5112,15 @@ impl ExtensionManager {
                     "Injected runtime config into hot-activated channel"
                 );
             }
+        }
+
+        let auth_state = self
+            .check_channel_auth_status(requested_name, &self.user_id)
+            .await;
+        if auth_state != ToolAuthState::Ready && auth_state != ToolAuthState::NoAuth {
+            return Err(ExtensionError::ActivationFailed(format!(
+                "Channel '{requested_name}' requires configuration. Use the setup form to provide credentials."
+            )));
         }
 
         // Register with webhook router
