@@ -90,7 +90,7 @@ pub async fn setup_wasm_channels(
             }
             Err(reason) => {
                 tracing::error!("Failed to start channel {}: {}", name, reason);
-                channel_manager.record_start_failure(name, reason).await;
+                channel_manager.record_config_error(name, reason).await;
             }
         }
     }
