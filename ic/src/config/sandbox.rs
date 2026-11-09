@@ -16,8 +16,8 @@ pub struct SandboxModeConfig {
     pub policy: String,
     /// Container runtime CLI: "auto" (podman preferred), "podman", or "docker".
     pub runtime: String,
-    /// Network egress mode for sandboxed policies: "none" (default),
-    /// "proxy-enforced" (isolated allowlist web access), "tunnel"
+    /// Network egress mode for sandboxed policies: "proxy-enforced"
+    /// (default; isolated allowlist web access), "none" (no egress), "tunnel"
     /// (egress-only NetBird/WireGuard sidecar), or legacy advisory "proxy".
     pub network: String,
     /// Force sandboxed shell execution even in dev mode (ALLOW_LOCAL_TOOLS).
@@ -118,7 +118,7 @@ impl Default for SandboxModeConfig {
             enabled: true,
             policy: "readonly".to_string(),
             runtime: "auto".to_string(),
-            network: "none".to_string(),
+            network: "proxy-enforced".to_string(),
             enforce: false,
             allow_full_access: false,
             timeout_secs: 120,
@@ -943,6 +943,7 @@ mod tests {
         let cfg = SandboxModeConfig::default();
         assert!(cfg.enabled);
         assert_eq!(cfg.policy, "readonly");
+        assert_eq!(cfg.network, "proxy-enforced");
         assert_eq!(cfg.timeout_secs, 120);
         assert_eq!(cfg.memory_limit_mb, 2048);
         assert_eq!(cfg.cpu_shares, 1024);
@@ -1036,20 +1037,20 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_network_default_and_enforced_mode_survive_resolution() {
+    fn sandbox_network_default_and_explicit_modes_survive_resolution() {
         let default_cfg = SandboxModeConfig::default().to_sandbox_config();
         assert_eq!(
             default_cfg.network,
-            crate::sandbox::SandboxNetworkMode::None
+            crate::sandbox::SandboxNetworkMode::ProxyEnforced
         );
 
-        let enforced = SandboxModeConfig {
-            network: "proxy-enforced".to_string(),
+        let no_egress = SandboxModeConfig {
+            network: "none".to_string(),
             ..SandboxModeConfig::default()
         };
         assert_eq!(
-            enforced.to_sandbox_config().network,
-            crate::sandbox::SandboxNetworkMode::ProxyEnforced
+            no_egress.to_sandbox_config().network,
+            crate::sandbox::SandboxNetworkMode::None
         );
 
         let legacy = SandboxModeConfig {
