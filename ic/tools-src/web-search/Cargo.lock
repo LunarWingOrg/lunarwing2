@@ -633,7 +633,7 @@ dependencies = [
 
 [[package]]
 name = "web-search-tool"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "serde",
  "serde_json",
