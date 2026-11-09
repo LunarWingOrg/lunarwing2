@@ -567,6 +567,7 @@ fn sandbox_error_envelope(err: &crate::sandbox::SandboxError) -> ToolError {
     let class = match kind {
         "sandbox_unavailable" => "sandbox unavailable (container runtime missing or unusable)",
         "image_unavailable" => "sandbox image unavailable",
+        "storage_unavailable" => "sandbox storage failure",
         "network_blocked" => "network egress denied by the sandbox proxy",
         "proxy_error" => "sandbox network proxy failure",
         "timeout" => "sandboxed command timed out",
@@ -1768,5 +1769,32 @@ mod tests {
         });
         assert!(exec.starts_with("[sandbox:execution_failed]"), "{exec}");
         assert!(exec.contains("did NOT run on the host"), "{exec}");
+    }
+
+    #[test]
+    fn sandbox_envelope_leads_storage_failures_with_disk_space() {
+        let storage = envelope_message(&crate::sandbox::SandboxError::StorageUnavailable {
+            path: "/home/tenant/.local/share/containers/storage".to_string(),
+            reason: "Error: configure storage: kernel does not support overlay fs: \
+                     no space left on device: driver not supported"
+                .to_string(),
+        });
+
+        assert!(
+            storage.starts_with(
+                "[sandbox:storage_unavailable] sandbox storage failure: Storage volume full: \
+                 /home/tenant/.local/share/containers/storage"
+            ),
+            "{storage}"
+        );
+        assert!(
+            storage.contains("Underlying container runtime error:"),
+            "{storage}"
+        );
+        assert!(
+            storage.contains("kernel does not support overlay fs"),
+            "{storage}"
+        );
+        assert!(storage.contains("Hint:"), "{storage}");
     }
 }
