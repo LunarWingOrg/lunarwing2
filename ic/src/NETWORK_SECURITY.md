@@ -399,18 +399,21 @@ Sandboxed policies (`readonly`, `workspace_write`) select an egress mode via
 
 | Mode | Mechanism | Enforcement |
 |------|-----------|-------------|
-| `none` | `--network none` on the container | **Kernel-enforced** — no egress at all; the proxy is not started |
-| `proxy-enforced` (default; WI#155/537) | Container keeps `--network none`; egress only through a per-execution **Unix-socket relay** to the allowlist proxy | **Enforced** — no direct egress path exists anywhere (loopback included); the proxy rejects non-public destinations and pins DNS |
+| `none` (default off Linux) | `--network none` on the container | **Kernel-enforced** — no egress at all; the proxy is not started |
+| `proxy-enforced` (Linux default; WI#155/537) | Container keeps `--network none`; egress only through a per-execution **Unix-socket relay** to the allowlist proxy | **Enforced** — no direct egress path exists anywhere (loopback included); the proxy rejects non-public destinations and pins DNS |
 | `tunnel` (WI#248) | Commands join a NetBird/WireGuard sidecar netns; the sidecar carries an `nft` `input` chain (policy drop) and an `output` chain (policy drop: only `lo`, the tunnel interface, the provider's marked control traffic and DNS to the runtime's resolvers pass; link-local IPv4 dropped) | **Kernel-enforced egress-only** — joined commands reach exactly what the tunnel routes (overlay CIDRs of a split tunnel, everything through a full-route tunnel); the uplink, host loopback, LAN and cloud metadata are unreachable; new inbound is dropped |
 | `proxy` | HTTP proxy + `http_proxy`/`https_proxy` env vars in the container | **Advisory (legacy)** — a process that ignores proxy env vars can still egress directly |
 
-**Default policy (WI#537, v2.2.0.0):** the in-code default and new mt-admin
-tenant envs use `SANDBOX_NETWORK=proxy-enforced`. mt-admin preserves every
-operator-set value on re-render: `none`, `proxy-enforced`, `tunnel`, or legacy
-`proxy`. Select `none` to disable egress completely. Never use advisory `proxy`
-or a bridged network as the default: those reopen the WI#154 host-loopback and
-cross-tenant exposure. `proxy-enforced` is kernel-isolated everywhere except
-one per-execution Unix socket relay to the public-only validating proxy:
+**Default policy (WI#537, v2.2.0.0):** on Linux the in-code default and new
+mt-admin tenant envs use `SANDBOX_NETWORK=proxy-enforced`. Other platforms
+default to `none` because the local Unix relay is unsupported; explicitly
+selecting `proxy-enforced` there fails closed rather than degrading. mt-admin
+preserves every operator-set value on re-render: `none`, `proxy-enforced`,
+`tunnel`, or legacy `proxy`. Select `none` to disable egress completely. Never
+use advisory `proxy` or a bridged network as the default: those reopen the
+WI#154 host-loopback and cross-tenant exposure. `proxy-enforced` is
+kernel-isolated everywhere except one per-execution Unix socket relay to the
+public-only validating proxy:
 
 - relay placement: `$XDG_RUNTIME_DIR` when it exists and belongs to our euid
   (fallback: process temp dir). This keeps the socket resolvable across mount
@@ -559,17 +562,21 @@ All requests are validated against a domain allowlist before being forwarded:
 
 **Reference:** `src/sandbox/proxy/http.rs` — `handle_connect()` function
 
-### Credential Injection (HTTP only)
+### Credential Injection (legacy proxy, HTTP only)
 
-For plain HTTP requests to allowed hosts, the proxy can inject credentials:
+`proxy-enforced` is built with **zero credential mappings**: untrusted sandbox
+code cannot make it resolve or inject the daemon's OpenAI, Anthropic, or
+LunarWing Cloud keys. Only the explicitly selected legacy `proxy` mode installs
+those default mappings. Its resolver reads the daemon environment at request
+time and supports bearer tokens, custom headers such as `X-API-Key`, and query
+parameters. Injection works only on plain-HTTP forward requests; CONNECT is
+opaque. Consequently a legacy-mode injected secret is sent on the cleartext
+network path, even though it never enters the container environment or
+filesystem. Operators who do not explicitly accept that risk must use
+`proxy-enforced` or `none`.
 
-- Bearer tokens in `Authorization` header
-- Custom headers (e.g., `X-API-Key`)
-- Query parameters
-- Credentials are resolved at request time from the encrypted secrets store
-- Credentials never enter the container's environment or filesystem
-
-**Reference:** `src/sandbox/proxy/http.rs` — credential injection block in `forward_request()`
+**References:** `src/sandbox/proxy/mod.rs` — mode-specific credential mappings;
+`src/sandbox/proxy/http.rs` — injection block in `forward_request()`
 
 ### Hop-by-Hop Header Filtering
 
@@ -894,8 +901,8 @@ follows the runtime level up to DEBUG, where the per-tool-call lines are, and
 never TRACE; `off` writes no copy and mounts nothing (for a single-node daemon
 shared by several users, whose agents would otherwise all read one copy). The
 mount stays for `--network none` runs, including both the explicit `none`
-tier and the default `proxy-enforced` tier; no direct container network exists
-in either case. The
+tier and `proxy-enforced`; no direct container network exists in either case.
+The
 file is `0600` in a `0700` directory owned by the daemon, so it is mounted
 only where the runtime maps the sandbox user onto the daemon's uid
 (`cli_runner::daemon_owned_mounts_readable`): docker (rootful runs as the
@@ -966,7 +973,7 @@ This is by design: MCP server URLs come from **operator-controlled configuration
 
 ### Sandbox Domain Allowlists
 
-In `proxy` and the default `proxy-enforced` mode, HTTP traffic uses the proxy's domain allowlist. `none` has no egress; `tunnel` bypasses this HTTP allowlist — its reachability is the tunnel's routes/ACLs behind the sidecar's output chain. The proxy allowlist is built from `default_allowlist()` plus additional domains from `SANDBOX_EXTRA_DOMAINS` (comma-separated) or `extra_allowed_domains`.
+In `proxy` and `proxy-enforced` modes, HTTP traffic uses the proxy's domain allowlist. `none` has no egress; `tunnel` bypasses this HTTP allowlist — its reachability is the tunnel's routes/ACLs behind the sidecar's output chain. The proxy allowlist is built from `default_allowlist()` plus additional domains from `SANDBOX_EXTRA_DOMAINS` (comma-separated) or `extra_allowed_domains`.
 
 The WI#537 default set is deliberately limited to development and configured API destinations:
 
@@ -976,6 +983,12 @@ The WI#537 default set is deliberately limited to development and configured API
 - APIs: `api.openai.com`, `api.anthropic.com`, `api.lunarwing.org`
 
 In `proxy-enforced` mode these names are still subject to public-IP validation and DNS pinning; an allowlisted name cannot target host loopback, private networks, another tenant, or cloud metadata.
+
+The allowlist restricts **destinations, not methods**. In particular, HTTPS
+CONNECT hides the method, so GitHub pushes/API writes and `npm publish` are not
+blocked. A prompt-injected process carrying an attacker's token can therefore
+send workspace data to that attacker's account. This is inherent in standard
+egress: operators who need no exfiltration path must select `none`.
 
 **References:** `src/sandbox/config.rs` — `default_allowlist()`; `src/config/sandbox.rs` — sandbox allowlist assembly
 
