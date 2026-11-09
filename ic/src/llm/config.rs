@@ -82,8 +82,8 @@ pub struct LlmConfig {
     /// Maximum retries for transient LLM errors.
     /// Set via `LLM_MAX_RETRIES`, falls back to LunarWing Cloud config value.
     pub max_retries: u32,
-    /// Cumulative reported input-token budget for billed-but-empty retries in
-    /// one logical stream call. Zero disables the budget.
+    /// Cumulative reported input-token budget for billed-but-empty retries at
+    /// one provider leg. Zero disables the budget.
     /// Set via `LLM_EMPTY_STREAM_RETRY_INPUT_TOKEN_BUDGET`.
     pub empty_stream_retry_input_token_budget: u32,
     /// Consecutive failures before circuit breaker opens. None = disabled.
