@@ -99,10 +99,9 @@ async fn assert_firewall_listing() {
             lunarwing::sandbox::SANDBOX_TUNNEL_CONTAINER,
             "nft",
             "list",
-            "chain",
+            "table",
             "inet",
             "lunarwing_sandbox_egress",
-            "input",
         ])
         .stdin(std::process::Stdio::null())
         .output()
@@ -110,12 +109,62 @@ async fn assert_firewall_listing() {
         .expect("nft listing");
     assert!(output.status.success());
     let listing = String::from_utf8_lossy(&output.stdout);
-    assert!(listing.contains("policy drop"), "{listing}");
-    assert!(
-        listing.contains("ct state established,related accept"),
-        "{listing}"
-    );
+    for expected in [
+        "chain input {",
+        "type filter hook input priority filter; policy drop;",
+        "ct state established,related accept",
+        "chain output {",
+        "type filter hook output priority filter; policy drop;",
+        "oifname \"wg0\" accept",
+        "ip daddr 169.254.0.0/16 drop",
+        "meta mark 0x00004c57 accept",
+    ] {
+        assert!(
+            listing.contains(expected),
+            "missing {expected:?} in:\n{listing}"
+        );
+    }
 }
+
+/// Add an accept rule to one of the sidecar's chains from the trusted host,
+/// as an operator mistake or a compromised sidecar would.
+async fn tamper_chain(chain: &str, rule: &[&str]) -> Result<(), String> {
+    let mut args = vec![
+        "exec",
+        lunarwing::sandbox::SANDBOX_TUNNEL_CONTAINER,
+        "nft",
+        "add",
+        "rule",
+        "inet",
+        "lunarwing_sandbox_egress",
+        chain,
+    ];
+    args.extend_from_slice(rule);
+    let status = tokio::process::Command::new("podman")
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map_err(|error| error.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("tampering {chain} failed"))
+    }
+}
+
+/// Runs inside a joined sandbox: the tunnel interface must be visible, the
+/// uplink (public internet, cloud metadata, podman's host alias) must be
+/// unreachable, and DNS to the sidecar's resolvers must still work.
+const JOINED_PROBE: &str = "ip -o link show wg0 >/dev/null && echo LUNARWING-TUNNEL-JOIN-OK; \
+     wget -qO- -T 4 http://1.1.1.1/ >/dev/null 2>&1 && echo LUNARWING-TUNNEL-UPLINK-OPEN; \
+     wget -qO- -T 3 http://169.254.169.254/ >/dev/null 2>&1 && echo LUNARWING-TUNNEL-METADATA-OPEN; \
+     H=$(getent hosts host.containers.internal | cut -d' ' -f1); \
+     if [ -n \"$H\" ] && nc -z -w 2 \"$H\" 22 >/dev/null 2>&1; then echo LUNARWING-TUNNEL-HOST-OPEN; fi; \
+     nslookup example.com >/dev/null 2>&1 && echo LUNARWING-TUNNEL-DNS-OK; \
+     true";
 
 async fn exercise_sidecar(
     sidecar: &TunnelSidecar,
@@ -154,7 +203,7 @@ async fn exercise_sidecar(
     let protected = Vec::<PathBuf>::new();
     let output = runner
         .execute(ExecParams {
-            command: "ip -o link show wg0 >/dev/null && echo LUNARWING-TUNNEL-JOIN-OK",
+            command: JOINED_PROBE,
             working_dir: workdir,
             policy: SandboxPolicy::ReadOnly,
             limits: &limits,
@@ -167,29 +216,56 @@ async fn exercise_sidecar(
         .await
         .map_err(|error| error.to_string())?;
     assert_eq!(output.exit_code, 0, "{}{}", output.stdout, output.stderr);
-    assert!(output.stdout.contains("LUNARWING-TUNNEL-JOIN-OK"));
+    assert!(
+        output.stdout.contains("LUNARWING-TUNNEL-JOIN-OK"),
+        "{}",
+        output.stdout
+    );
+    for open in [
+        "LUNARWING-TUNNEL-UPLINK-OPEN",
+        "LUNARWING-TUNNEL-METADATA-OPEN",
+        "LUNARWING-TUNNEL-HOST-OPEN",
+    ] {
+        assert!(
+            !output.stdout.contains(open),
+            "joined sandbox reached the uplink ({open}):\n{}",
+            output.stdout
+        );
+    }
+    assert!(
+        output.stdout.contains("LUNARWING-TUNNEL-DNS-OK"),
+        "DNS to the sidecar's resolvers must keep working:\n{}{}",
+        output.stdout,
+        output.stderr
+    );
 
-    let tampered = tokio::process::Command::new("podman")
-        .args([
-            "exec",
-            lunarwing::sandbox::SANDBOX_TUNNEL_CONTAINER,
-            "nft",
-            "add",
-            "rule",
-            "inet",
-            "lunarwing_sandbox_egress",
-            "input",
-            "iifname",
-            "\"wg0\"",
-            "accept",
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+    // An extra outbound accept must fail the per-run check, and the next
+    // start must replace the drifted sidecar with a fresh one.
+    tamper_chain("output", &["ip", "daddr", "1.1.1.1", "accept"]).await?;
+    let error = sidecar
+        .ensure_healthy()
+        .await
+        .expect_err("an altered output firewall must fail closed");
+    assert_eq!(error.kind(), "sandbox_unavailable");
+    sidecar
+        .ensure_started()
         .await
         .map_err(|error| error.to_string())?;
-    assert!(tampered.success());
+    let recreated_id = tunnel_container_id()
+        .await
+        .ok_or("missing recreated container id")?;
+    assert_ne!(
+        first_id, recreated_id,
+        "a drifted sidecar must be recreated"
+    );
+    sidecar
+        .ensure_healthy()
+        .await
+        .map_err(|error| error.to_string())?;
+    assert_firewall_listing().await;
+
+    // The same for an extra inbound accept.
+    tamper_chain("input", &["iifname", "\"wg0\"", "accept"]).await?;
     let error = sidecar
         .ensure_healthy()
         .await

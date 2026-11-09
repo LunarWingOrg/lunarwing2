@@ -334,7 +334,16 @@ impl SandboxManager {
                 .ok_or_else(|| SandboxError::TunnelUnavailable {
                     reason: "sidecar is not initialized; refusing sandbox execution".into(),
                 })?;
-            sidecar.ensure_healthy().await?;
+            // A sidecar that died or drifted is recreated once, bounded by its
+            // own startup timeout, before the run is refused.
+            if let Err(error) = sidecar.ensure_healthy().await {
+                tracing::warn!(
+                    error = %error,
+                    "Sandbox tunnel sidecar unhealthy; recreating it once before this run"
+                );
+                sidecar.ensure_started().await?;
+                sidecar.ensure_healthy().await?;
+            }
         }
 
         let proxy_port = if let Some(proxy) = self.proxy.read().await.as_ref() {

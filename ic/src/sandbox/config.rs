@@ -50,8 +50,11 @@ pub enum SandboxNetworkMode {
     ProxyEnforced,
     /// Egress through a health-gated NetBird/WireGuard sidecar (WI#248). Runs
     /// join its network namespace but retain every sandbox hardening flag.
-    /// The sidecar's input-drop firewall permits return traffic only. Tunnel
-    /// routes/ACLs define reachability; a split tunnel retains direct uplink.
+    /// The sidecar's nftables policy drops new inbound flows and every
+    /// outbound flow that does not leave through the tunnel interface, so a
+    /// joined command reaches exactly what the tunnel routes: the overlay
+    /// CIDRs of a split tunnel, or everything through a full-route tunnel.
+    /// The uplink, host loopback, LAN and cloud metadata are unreachable.
     Tunnel,
     /// Hard network isolation: containers run with `--network none`. No
     /// egress at all, kernel-enforced; the proxy is not started.

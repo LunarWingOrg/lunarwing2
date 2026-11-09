@@ -5,7 +5,8 @@
 //!   keeps `--network none` and exposes only a per-execution Unix relay to the
 //!   validating public-only proxy (WI#155); legacy `proxy` mode routes traffic
 //!   through the validating proxy advisory (env-var based); `tunnel` joins a
-//!   NetBird/WireGuard sidecar's network namespace (WI#248)
+//!   NetBird/WireGuard sidecar's network namespace whose nftables policy
+//!   confines egress to the tunnel interface (WI#248)
 //! - **Credential injection**: Secrets are injected by the proxy, never exposed in containers
 //! - **Resource limits**: Memory, CPU, and timeout enforcement
 //!
@@ -102,8 +103,9 @@
 //! - **Network isolation**: `none` removes the network entirely (kernel-enforced);
 //!   `proxy-enforced` keeps `--network none` and exposes only a Unix relay to
 //!   the validating public-only proxy; `tunnel` joins a NetBird/WireGuard
-//!   sidecar's namespace (egress policy is the tunnel's own); legacy `proxy`
-//!   is advisory (env-var based)
+//!   sidecar's namespace whose kernel firewall drops new inbound flows and
+//!   every outbound flow off the tunnel interface; legacy `proxy` is
+//!   advisory (env-var based)
 //! - **Non-root execution**: keep-id userns (rootless podman) or the daemon's
 //!   own UID/GID (rootless docker maps container root to the host user; rootful
 //!   docker maps numeric host UIDs). Writable workspaces fail closed rather

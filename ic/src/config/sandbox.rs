@@ -85,7 +85,10 @@ impl SandboxTunnelModeConfig {
         })
     }
 
-    fn to_tunnel_sidecar_config(&self) -> Result<crate::sandbox::TunnelSidecarConfig, ConfigError> {
+    fn to_tunnel_sidecar_config(
+        &self,
+        auto_pull_image: bool,
+    ) -> Result<crate::sandbox::TunnelSidecarConfig, ConfigError> {
         let provider = self
             .provider
             .as_deref()
@@ -104,6 +107,7 @@ impl SandboxTunnelModeConfig {
             startup_timeout: std::time::Duration::from_secs(
                 self.startup_timeout_secs.unwrap_or(90),
             ),
+            auto_pull_image,
         })
     }
 }
@@ -170,7 +174,7 @@ impl SandboxModeConfig {
             == Ok(crate::sandbox::SandboxNetworkMode::Tunnel)
         {
             tunnel
-                .to_tunnel_sidecar_config()?
+                .to_tunnel_sidecar_config(parse_bool_env("SANDBOX_AUTO_PULL", ss.auto_pull_image)?)?
                 .validate()
                 .map_err(|message| ConfigError::InvalidValue {
                     key: "SANDBOX_TUNNEL_*".to_string(),
@@ -243,7 +247,7 @@ impl SandboxModeConfig {
             crate::sandbox::SandboxNetworkMode::None
         });
         let tunnel = if network == crate::sandbox::SandboxNetworkMode::Tunnel {
-            match self.tunnel.to_tunnel_sidecar_config() {
+            match self.tunnel.to_tunnel_sidecar_config(self.auto_pull_image) {
                 Ok(config) => Some(config),
                 Err(error) => {
                     tracing::error!(error = %error, "Invalid tunnel sidecar configuration");
