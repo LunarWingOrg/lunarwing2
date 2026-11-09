@@ -226,8 +226,59 @@ fi
   && ok "sandbox Dockerfile exists at ic/docker/sandbox.Dockerfile" \
   || bad "sandbox Dockerfile missing: $sandbox_dockerfile"
 
+# WI#537: the managed image carries a reproducible full Python development
+# suite under the same fixed-client HTTPS-snapshot apt contract as the workers.
+python_packages=(
+  'python3=3.11.2-1+b1'
+  'python3-dev=3.11.2-1+b1'
+  'python3-pip=23.0.1+dfsg-1'
+  'python3-venv=3.11.2-1+b1'
+  'python3-setuptools=66.1.1-1+deb12u2'
+  'python3-wheel=0.38.4-2'
+  'python3-build=0.9.0-1'
+  'python3-pytest=7.2.1-2'
+  'python3-pytest-cov=4.0.0-1'
+  'python3-coverage=6.5.0+dfsg1-2+b1'
+  'python3-mypy=1.0.1-1'
+  'black=23.1.0-1'
+  'python3-isort=5.6.4-1'
+  'python3-flake8=5.0.4-4'
+  'pylint=2.16.2-2'
+  'python3-ipython=8.5.0-4'
+  'python3-debugpy=1.6.6+ds-1'
+  'tox=3.28.0-2'
+  'twine=4.0.2-1'
+  'pipx=1.1.0-1'
+  'python3-poetry=1.3.2+dfsg-3'
+)
+missing_python_packages=()
+for package in "${python_packages[@]}"; do
+  grep -Fq "      $package" "$sandbox_dockerfile" \
+    || missing_python_packages+=("$package")
+done
+if [[ "${#missing_python_packages[@]}" -eq 0 ]]; then
+  ok 'sandbox image pins every Python development-suite package'
+else
+  bad "sandbox image is missing Python package pins: ${missing_python_packages[*]}"
+fi
+if [[ "$(grep -c '^ARG DEBIAN_SNAPSHOT=20261105T082236Z$' "$sandbox_dockerfile" || true)" -eq 1 ]] \
+    && [[ "$(grep -c '"deb https://snapshot\.debian\.org/' "$sandbox_dockerfile" || true)" -eq 3 ]] \
+    && ! grep -Fq '"deb http://' "$sandbox_dockerfile"; then
+  ok 'sandbox image uses the fixed Debian snapshot exclusively over HTTPS'
+else
+  bad 'sandbox image Debian snapshot or HTTPS source contract drifted'
+fi
+if [[ "$(grep -c 'Acquire::Retries=0' "$sandbox_dockerfile" || true)" -eq 2 ]] \
+    && [[ "$(grep -c 'Acquire::Retries=3' "$sandbox_dockerfile" || true)" -eq 1 ]] \
+    && grep -Fq 'dpkg --compare-versions "$(dpkg-query -W -f=' "$sandbox_dockerfile" \
+    && grep -Fq "' apt)\" ge 2.6.2;" "$sandbox_dockerfile"; then
+  ok 'sandbox image bootstraps the fixed apt client before bounded retries'
+else
+  bad 'sandbox image apt bootstrap, floor, or retry contract drifted'
+fi
+
 if [[ "$failures" -ne 0 ]]; then
   printf 'RESULT: %d failure(s)\n' "$failures"
   exit 1
 fi
-printf 'RESULT: all WI#223 sandbox image helper tests passed\n'
+printf 'RESULT: all WI#223/WI#537 sandbox image tests passed\n'
