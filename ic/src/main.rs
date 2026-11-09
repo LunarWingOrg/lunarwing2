@@ -377,7 +377,7 @@ async fn async_main() -> anyhow::Result<()> {
         config.sandbox.tenant_logs,
     );
 
-    tracing::debug!("Starting LunarWing...");
+    tracing::info!("Starting LunarWing v{}", env!("CARGO_PKG_VERSION"));
     tracing::debug!("Loaded configuration for agent: {}", config.agent.name);
     tracing::debug!("LLM backend: {}", config.llm.backend);
 
