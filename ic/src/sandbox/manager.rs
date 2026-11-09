@@ -134,8 +134,9 @@ impl SandboxManager {
         let runner =
             Arc::new(CliRunner::detect(self.config.runtime, self.config.image.clone()).await?);
 
-        // Check for / pull the image
-        if !runner.image_exists().await {
+        // Check for / pull the image. Inspection failures are not absence:
+        // rootless podman can fail here when its storage filesystem is full.
+        if !runner.image_exists().await? {
             if self.config.auto_pull_image {
                 runner.pull_image().await?;
             } else {
@@ -928,6 +929,12 @@ mod tests {
         assert!(!super::is_transient_sandbox_error(
             &SandboxError::NetworkBlocked {
                 reason: "policy violation".to_string()
+            }
+        ));
+        assert!(!super::is_transient_sandbox_error(
+            &SandboxError::StorageUnavailable {
+                path: "/var/lib/containers/storage".to_string(),
+                reason: "no space left on device".to_string()
             }
         ));
         assert!(!super::is_transient_sandbox_error(&SandboxError::Config {
