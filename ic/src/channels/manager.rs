@@ -1,6 +1,6 @@
 //! Channel manager for coordinating multiple input channels.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use futures::stream;
@@ -106,17 +106,10 @@ fn knowledge_publish_blocked(channel_name: &str) -> ChannelError {
     }
 }
 
-fn startup_failure_reason(error: &ChannelError) -> String {
-    match error {
-        ChannelError::StartupFailed { reason, .. } => reason.clone(),
-        _ => "channel failed to start; see daemon logs".to_string(),
-    }
-}
-
-fn startup_failure(name: &str, reason: &str) -> ChannelError {
+fn startup_failure(name: &str) -> ChannelError {
     ChannelError::StartupFailed {
         name: name.to_string(),
-        reason: reason.to_string(),
+        reason: "channel failed to start; see daemon logs".to_string(),
     }
 }
 
@@ -126,8 +119,10 @@ fn startup_failure(name: &str, reason: &str) -> ChannelError {
 /// push messages into the agent loop without being a full `Channel` impl.
 pub struct ChannelManager {
     channels: Arc<RwLock<HashMap<String, Arc<dyn Channel>>>>,
-    /// Most recent startup failure reason by channel name.
-    start_failures: RwLock<HashMap<String, String>>,
+    /// Runtime startup failures retain no guest-controlled error text.
+    start_failures: RwLock<HashSet<String>>,
+    /// Host-generated validation errors are safe to show to operators.
+    config_errors: RwLock<HashMap<String, String>>,
     inject_tx: mpsc::Sender<IncomingMessage>,
     /// Taken once in `start_all()` and merged into the stream.
     inject_rx: tokio::sync::Mutex<Option<mpsc::Receiver<IncomingMessage>>>,
@@ -148,7 +143,8 @@ impl ChannelManager {
         let (inject_tx, inject_rx) = mpsc::channel(64);
         Self {
             channels: Arc::new(RwLock::new(HashMap::new())),
-            start_failures: RwLock::new(HashMap::new()),
+            start_failures: RwLock::new(HashSet::new()),
+            config_errors: RwLock::new(HashMap::new()),
             inject_tx,
             inject_rx: tokio::sync::Mutex::new(Some(inject_rx)),
             coordination_status_policy,
@@ -164,25 +160,38 @@ impl ChannelManager {
         self.inject_tx.clone()
     }
 
-    /// Return the most recent startup failure reasons by channel name.
-    pub async fn start_failures(&self) -> HashMap<String, String> {
+    /// Return channels whose latest runtime startup attempt failed.
+    pub async fn start_failures(&self) -> HashSet<String> {
         self.start_failures.read().await.clone()
     }
 
-    /// Record a channel that could not be started, including one rejected before registration.
-    pub async fn record_start_failure(&self, name: String, reason: String) {
-        self.start_failures.write().await.insert(name, reason);
+    /// Return host-generated configuration errors by channel name.
+    pub async fn config_errors(&self) -> HashMap<String, String> {
+        self.config_errors.read().await.clone()
     }
 
-    /// Clear a startup failure after a successful start or configuration refresh.
+    /// Record a runtime startup failure without retaining guest-controlled text.
+    pub async fn record_start_failure(&self, name: String) {
+        self.config_errors.write().await.remove(&name);
+        self.start_failures.write().await.insert(name);
+    }
+
+    /// Record a host-generated validation failure separately from runtime health.
+    pub async fn record_config_error(&self, name: String, reason: String) {
+        self.start_failures.write().await.remove(&name);
+        self.config_errors.write().await.insert(name, reason);
+    }
+
+    /// Clear startup and configuration failures after success or removal.
     pub async fn clear_start_failure(&self, name: &str) {
         self.start_failures.write().await.remove(name);
+        self.config_errors.write().await.remove(name);
     }
 
     /// Add a channel to the manager.
     pub async fn add(&self, channel: Box<dyn Channel>) {
         let name = channel.name().to_string();
-        self.start_failures.write().await.remove(&name);
+        self.clear_start_failure(&name).await;
         self.channels
             .write()
             .await
@@ -207,12 +216,11 @@ impl ChannelManager {
 
         let stream = match channel.start().await {
             Ok(stream) => {
-                self.start_failures.write().await.remove(&name);
+                self.clear_start_failure(&name).await;
                 stream
             }
             Err(error) => {
-                self.record_start_failure(name, startup_failure_reason(&error))
-                    .await;
+                self.record_start_failure(name).await;
                 return Err(error);
             }
         };
@@ -257,13 +265,12 @@ impl ChannelManager {
         for (name, channel) in channels.iter() {
             match channel.start().await {
                 Ok(stream) => {
-                    self.start_failures.write().await.remove(name);
+                    self.clear_start_failure(name).await;
                     tracing::debug!("Started channel: {}", name);
                     streams.push(stream);
                 }
                 Err(error) => {
-                    self.record_start_failure(name.clone(), startup_failure_reason(&error))
-                        .await;
+                    self.record_start_failure(name.clone()).await;
                     tracing::error!("Failed to start channel {}: {}", name, error);
                     // Continue with other channels, don't fail completely
                 }
@@ -448,17 +455,12 @@ impl ChannelManager {
         let mut results = HashMap::new();
 
         for (name, channel) in channels.iter() {
-            let result = if let Some(reason) = start_failures.get(name) {
-                Err(startup_failure(name, reason))
+            let result = if start_failures.contains(name) {
+                Err(startup_failure(name))
             } else {
                 channel.health_check().await
             };
             results.insert(name.clone(), result);
-        }
-        for (name, reason) in start_failures {
-            if !results.contains_key(&name) {
-                results.insert(name.clone(), Err(startup_failure(&name, &reason)));
-            }
         }
 
         results
@@ -705,11 +707,8 @@ mod tests {
             .expect_err("failed startup must make channel unhealthy")
             .to_string();
         assert!(error.contains("failed to start"), "{error}");
-        assert!(error.contains("start() already called"), "{error}");
-        assert_eq!(
-            manager.start_failures().await.get("optional"),
-            Some(&"start() already called".to_string())
-        );
+        assert!(!error.contains("start() already called"), "{error}");
+        assert!(manager.start_failures().await.contains("optional"));
 
         let (replacement, _) = StubChannel::new("optional");
         manager.add(Box::new(replacement)).await;
@@ -718,25 +717,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pre_registration_start_failure_is_actionable_in_health() {
+    async fn pre_registration_config_error_is_separate_from_runtime_health() {
         let manager = ChannelManager::new();
+        manager.record_start_failure("multica".to_string()).await;
         manager
-            .record_start_failure(
+            .record_config_error(
                 "multica".to_string(),
                 "required field 'multica_url' is not configured".to_string(),
             )
             .await;
 
-        let health = manager.health_check_all().await;
-        let error = health["multica"]
-            .as_ref()
-            .expect_err("pre-start rejection must be unhealthy")
-            .to_string();
-        assert!(error.contains("multica_url"), "{error}");
-        assert!(error.contains("failed to start"), "{error}");
+        assert!(manager.start_failures().await.is_empty());
+        assert_eq!(
+            manager.config_errors().await.get("multica"),
+            Some(&"required field 'multica_url' is not configured".to_string())
+        );
+        assert!(manager.health_check_all().await.is_empty());
 
         manager.clear_start_failure("multica").await;
-        assert!(manager.health_check_all().await.is_empty());
+        assert!(manager.config_errors().await.is_empty());
     }
 
     #[tokio::test]
