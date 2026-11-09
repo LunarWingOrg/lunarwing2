@@ -568,6 +568,7 @@ async fn async_main() -> anyhow::Result<()> {
     if config.channels.wasm_channels_enabled && config.channels.wasm_channels_dir.exists() {
         let wasm_result = lunarwing::channels::wasm::setup_wasm_channels(
             &config,
+            &channels,
             &components.secrets_store,
             components.extension_manager.as_ref(),
             components.db.as_ref(),

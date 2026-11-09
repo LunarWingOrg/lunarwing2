@@ -417,21 +417,21 @@ tenant_sandbox_rootless_prereqs_ready() {  # <tenant>
     && [[ "$(stat -c %u "/run/user/$uid" 2>/dev/null)" == "$uid" ]]
 }
 
-# Build the lean generic sandbox image into the admin (root) store. Rootless
+# Build the managed generic sandbox image into the admin (root) store. Rootless
 # tenants get it distributed into their own store by
-# ensure_tenant_sandbox_image. The Dockerfile has no COPY/ADD, so the build
-# context is ic/docker/ rather than ic/: the work item's illustrative command
-# used `ic/` as context, but ic/ carries the 1.3G vendor/ tree (which must
-# stay in-context for Dockerfile.worker's offline cargo build and so cannot be
-# dockerignored), and podman stages the whole context before starting.
+# ensure_tenant_sandbox_image. The Dockerfile has no build-context COPY/ADD
+# (its CA bundle comes from a digest-pinned image), so the context is ic/docker/
+# rather than ic/: ic/ carries the 1.3G vendor/ tree (which must stay in-context
+# for Dockerfile.worker's offline cargo build and so cannot be dockerignored),
+# and podman stages the whole context before starting.
 build_sandbox_image() {
   [[ -f "$SANDBOX_DOCKERFILE" ]] \
     || { say "WARNING: $SANDBOX_DOCKERFILE missing; cannot build sandbox image"; return 1; }
   local runtime
   runtime="$(sandbox_container_runtime "${1:-}")" || return 1
   # On hosts whose Podman bridge cannot reach the host DNS resolver, apt in
-  # the locally built sandbox image cannot resolve deb.debian.org. Match the
-  # worker image builders: host networking is build-only, not sandbox runtime.
+  # the locally built sandbox image cannot resolve snapshot.debian.org. Match
+  # the worker image builders: host networking is build-only, not sandbox runtime.
   local -a network_args=()
   [[ "$runtime" != podman ]] || network_args=(--network=host)
   "$runtime" build "${network_args[@]}" -t "$SANDBOX_IMAGE_TAG" \

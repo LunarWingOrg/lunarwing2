@@ -499,8 +499,9 @@ replace existing paths. Run an immediate pass with
 NetBird or WireGuard overlay through a daemon-owned sidecar whose kernel
 firewall drops new inbound flows and every outbound flow that does not leave
 through the tunnel interface (the uplink, host loopback, other tenants and the
-cloud metadata service stay unreachable). It is opt-in per tenant; the
-multi-tenant default stays `SANDBOX_NETWORK=none`.
+cloud metadata service stay unreachable). It is opt-in per tenant; new
+multi-tenant envs default to `SANDBOX_NETWORK=proxy-enforced` (WI#537), while
+an existing `none`, `proxy-enforced`, `tunnel`, or `proxy` value is preserved.
 
 ```bash
 SANDBOX_NETWORK=tunnel

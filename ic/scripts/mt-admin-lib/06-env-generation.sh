@@ -1391,16 +1391,15 @@ write_tenant_lunarwing_env() {
   orchestrator_self_modify="$(_env_existing "$env_snapshot" ORCHESTRATOR_SELF_MODIFY)"
   orchestrator_self_modify="${orchestrator_self_modify:-true}"
 
-  # Sandbox egress (WI#154): multi-tenant hosts run worker WSS ports, tenant
-  # PostgreSQL, and health endpoints on host loopback, and the proxy egress
-  # mode is advisory (env-var based) — a sandboxed process that ignores proxy
-  # env vars can reach every tenant's loopback services. MT tenants therefore
-  # default to SANDBOX_NETWORK=none (kernel-enforced). An operator-selected
-  # SANDBOX_NETWORK=proxy is preserved on re-render (explicit opt-in for
-  # tenants that genuinely need allowlisted web access).
+  # Sandbox egress (WI#154/155/537): multi-tenant hosts run worker WSS ports,
+  # tenant PostgreSQL, and health endpoints on host loopback. New tenants use
+  # proxy-enforced: the container retains --network none and can egress only
+  # through the public-only allowlist proxy's Unix relay. Every operator-set
+  # value (none, proxy-enforced, tunnel, or legacy advisory proxy) is preserved
+  # verbatim on re-render.
   local sandbox_network
   sandbox_network="$(_env_existing "$env_snapshot" SANDBOX_NETWORK)"
-  sandbox_network="${sandbox_network:-none}"
+  sandbox_network="${sandbox_network:-proxy-enforced}"
 
   # Generic sandbox defaults (WI#223): MT tenants pin the runtime and image so
   # `auto` detection cannot drift away from the host's managed choice, the
@@ -1625,11 +1624,11 @@ ENGINE_V2_MAX_OUTPUT_TOKENS=$engine_v2_max_output_tokens
 # on re-render. Keep disabled on shared gateways with unscoped routine turns.
 ENGINE_V2_STREAM_REASONING=$engine_v2_stream_reasoning
 
-# Generic sandbox egress (WI#154): none by default on multi-tenant hosts —
-# the advisory proxy mode would let a sandboxed process reach host-loopback
-# services (worker WSS/health ports, tenant PostgreSQL, cross-tenant
-# loopback). Set SANDBOX_NETWORK=proxy explicitly for tenants that need
-# allowlisted web access.
+# Generic sandbox egress (WI#537): proxy-enforced by default. The container
+# keeps --network none and reaches only the public-only allowlist proxy through
+# a per-execution Unix relay; host-loopback and cross-tenant services remain
+# unreachable. Set none for no egress, tunnel for overlay egress, or proxy for
+# the legacy advisory mode. Every operator-set value is preserved on re-render.
 SANDBOX_NETWORK=$sandbox_network
 
 # Generic sandbox runtime/image (WI#223): pin podman (the MT-managed runtime;

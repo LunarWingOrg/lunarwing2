@@ -736,10 +736,17 @@ impl CliRunner {
     }
 
     /// Check whether the sandbox image exists in the local store.
-    pub async fn image_exists(&self) -> bool {
-        run_status_isolated(self.runtime.binary(), &["image", "inspect", &self.image])
+    pub async fn image_exists(&self) -> Result<bool> {
+        let output = output_isolated(self.runtime.binary(), &["image", "inspect", &self.image])
             .await
-            .is_some_and(|s| s.success())
+            .map_err(|e| SandboxError::RuntimeNotAvailable {
+                reason: format!("failed to spawn image inspect: {e}"),
+            })?;
+        if output.status.success() {
+            return Ok(true);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        classify_image_inspect_failure(&stderr, &self.image)
     }
 
     /// Pull the sandbox image from its registry.
@@ -756,10 +763,13 @@ impl CliRunner {
             tracing::info!("Successfully pulled sandbox image: {}", self.image);
             Ok(())
         } else {
-            Err(SandboxError::ImageUnavailable {
-                image: self.image.clone(),
-                reason: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            })
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(classify_storage_failure(&stderr).unwrap_or_else(|| {
+                SandboxError::ImageUnavailable {
+                    image: self.image.clone(),
+                    reason: stderr.trim().to_string(),
+                }
+            }))
         }
     }
 
@@ -1127,43 +1137,94 @@ fn fail_if_writable_root_docker(
     Ok(())
 }
 
-/// Map a failed run's stderr to a typed error when it indicates a missing
-/// image (e.g. the image vanished between the initialize-time check and the
-/// run, or auto-pull is off), a relay setup failure (proxy-enforced), or a
-/// runtime setup failure (mount/userns/resource-controller errors reported by
-/// the runtime CLI, exit 125).
+fn image_is_missing(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("image not known")
+        || lower.contains("no such image")
+        || lower.contains("unable to find image")
+        || lower.contains("pull access denied")
+}
+
+fn classify_image_inspect_failure(stderr: &str, image: &str) -> Result<bool> {
+    if let Some(err) = classify_storage_failure(stderr) {
+        return Err(err);
+    }
+    if image_is_missing(stderr) {
+        return Ok(false);
+    }
+    Err(SandboxError::ImageUnavailable {
+        image: image.to_string(),
+        reason: format!("image inspect failed: {}", stderr.trim()),
+    })
+}
+
+fn classify_storage_failure(stderr: &str) -> Option<SandboxError> {
+    let lower = stderr.to_ascii_lowercase();
+    if !lower.contains("no space left on device") && !lower.contains("enospc") {
+        return None;
+    }
+    let path = storage_path_from_stderr(stderr)
+        .unwrap_or_else(|| "container storage (path not reported by runtime)".to_string());
+    Some(SandboxError::StorageUnavailable {
+        path,
+        reason: stderr.trim().to_string(),
+    })
+}
+
+fn storage_path_from_stderr(stderr: &str) -> Option<String> {
+    let lower = stderr.to_ascii_lowercase();
+    let marker = lower
+        .find("no space left on device")
+        .or_else(|| lower.find("enospc"))?;
+    let candidate = stderr[..marker].split_whitespace().last()?;
+    let path = candidate
+        .trim_matches(|c: char| matches!(c, ':' | ';' | ',' | '"' | '\'' | '(' | ')' | '[' | ']'));
+    if !path.starts_with('/') {
+        return None;
+    }
+    if let Some(root) = path.find("/containers/storage") {
+        let end = root + "/containers/storage".len();
+        return Some(path[..end].to_string());
+    }
+    Some(path.to_string())
+}
+
+fn has_runtime_error_prefix(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.starts_with("error:") || lower.starts_with("docker: error")
+    })
+}
+
+/// Map runtime-originated failures to typed errors without attributing a
+/// sandboxed command's own stderr to the host container runtime.
 fn classify_run_failure(stderr: &str, image: &str, exit_code: i64) -> Option<SandboxError> {
     if stderr.contains("lunarwing-proxy-relay:") {
         return Some(SandboxError::ProxyError {
             reason: stderr.trim().into(),
         });
     }
-    let lower = stderr.to_lowercase();
-    let image_missing = lower.contains("image not known")
-        || lower.contains("no such image")
-        || lower.contains("unable to find image")
-        || lower.contains("pull access denied");
-    if image_missing {
+    if exit_code != 125 || !has_runtime_error_prefix(stderr) {
+        return None;
+    }
+    if let Some(err) = classify_storage_failure(stderr) {
+        return Some(err);
+    }
+    if image_is_missing(stderr) {
         return Some(SandboxError::ImageUnavailable {
             image: image.to_string(),
             reason: stderr.trim().to_string(),
         });
     }
-    // Runtime setup failures are sandbox errors, not a successful invocation
-    // with an ordinary command exit code.
-    let runtime_error = exit_code == 125
-        && lower
-            .lines()
-            .any(|line| line.starts_with("error:") || line.starts_with("docker: error"));
-    runtime_error.then(|| SandboxError::ExecutionFailed {
+    Some(SandboxError::ExecutionFailed {
         reason: stderr.trim().into(),
     })
 }
 
-/// Run a quick status probe through the workload spawner (WI#181: image
-/// inspection/pull and cleanup must execute in the same manager-forked
-/// context as `run` — the hardened daemon's context breaks podman's
-/// rootless user-namespace join), returning `None` when spawn fails.
+/// Run a quick status probe through the workload spawner (WI#181: container
+/// lifecycle probes must execute in the same manager-forked context as `run` —
+/// the hardened daemon's context breaks podman's rootless user-namespace
+/// join), returning `None` when spawn fails.
 pub(crate) async fn run_status_isolated(
     bin: &str,
     args: &[&str],
@@ -1760,24 +1821,110 @@ mod tests {
     // ── run failure classification ─────────────────────────────────────
 
     #[test]
-    fn image_failures_classified() {
+    fn image_failures_classified_only_for_runtime_errors() {
         let cases = [
             "Error: lunarwing-worker:latest: image not known",
-            "Unable to find image 'lunarwing-worker:latest' locally",
-            "docker: No such image: lunarwing-worker:latest.",
-            "pull access denied for lunarwing-worker, repository does not exist",
+            "Error: Unable to find image 'lunarwing-worker:latest' locally",
+            "docker: Error response from daemon: No such image: lunarwing-worker:latest.",
+            "Error: pull access denied for lunarwing-worker, repository does not exist",
         ];
         for stderr in cases {
+            let classified = classify_run_failure(stderr, "lunarwing-worker:latest", 125);
+            assert_eq!(
+                classified.as_ref().map(SandboxError::kind),
+                Some("image_unavailable"),
+                "should classify runtime error: {stderr}"
+            );
             assert!(
-                classify_run_failure(stderr, "lunarwing-worker:latest", 125).is_some(),
-                "should classify: {stderr}"
+                classify_run_failure(stderr, "lunarwing-worker:latest", 1).is_none(),
+                "ordinary command output must not be classified: {stderr}"
             );
         }
         assert!(classify_run_failure("sh: foo: command not found", "img", 127).is_none());
         assert!(
             classify_run_failure("Error: command rejected input", "img", 1).is_none(),
-            "exit 125 marker in unrelated contexts must not mask ordinary errors"
+            "runtime prefix without exit 125 must not mask ordinary errors"
         );
+    }
+
+    #[test]
+    fn command_enospc_stderr_is_not_host_storage_failure() {
+        let cases = [
+            (
+                "cp: error writing '/tmp/wheel.tar': No space left on device",
+                1,
+            ),
+            (
+                "pip install failed: [Errno 28] No space left on device: \
+                 '/tmp/pip-unpack-x/torch.whl'",
+                1,
+            ),
+            (
+                "fatal: /home/tenant/.local/share/containers/storage/overlay/x: \
+                 no space left on device",
+                1,
+            ),
+            ("Error: command-provided text: no space left on device", 1),
+            ("cp: /tmp/full: no space left on device", 125),
+        ];
+        for (stderr, exit_code) in cases {
+            assert!(
+                classify_run_failure(stderr, "lunarwing-worker:latest", exit_code).is_none(),
+                "command stderr must remain ordinary ContainerOutput: exit={exit_code}, {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn enospc_precedes_overlay_driver_diagnosis_and_preserves_stderr() {
+        let stderr = "Error: configure storage: kernel does not support overlay fs: kernel returned\n\
+                      unlinkat /home/dwarfstar/.local/share/containers/storage/overlay/compat2795814874/merged/subdir:\n\
+                      no space left on device when we tried to delete an item in the merged directory:\n\
+                      driver not supported";
+        let err = classify_run_failure(stderr, "lunarwing-worker:latest", 125).unwrap();
+        match &err {
+            SandboxError::StorageUnavailable { path, reason } => {
+                assert_eq!(path, "/home/dwarfstar/.local/share/containers/storage");
+                assert_eq!(reason, stderr);
+            }
+            other => panic!("expected storage-unavailable error, got {other:?}"),
+        }
+        let message = err.to_string();
+        assert!(
+            message.starts_with(
+                "Storage volume full: /home/dwarfstar/.local/share/containers/storage\n"
+            )
+        );
+        assert!(message.contains("Underlying container runtime error: Error: configure storage:"));
+        assert!(message.contains("driver not supported"));
+
+        let capability_failure = classify_run_failure(
+            "Error: configure storage: kernel does not support overlay fs: invalid argument",
+            "lunarwing-worker:latest",
+            125,
+        )
+        .unwrap();
+        assert_eq!(capability_failure.kind(), "execution_failed");
+    }
+
+    #[test]
+    fn image_inspection_distinguishes_absence_from_runtime_failure() {
+        assert!(matches!(
+            classify_image_inspect_failure("Error: image not known", "img"),
+            Ok(false)
+        ));
+        let storage = classify_image_inspect_failure(
+            "Error: configure storage: ENOSPC while opening the layer store",
+            "img",
+        )
+        .unwrap_err();
+        assert_eq!(storage.kind(), "storage_unavailable");
+
+        let inspect = classify_image_inspect_failure("Error: storage lock is held", "img")
+            .unwrap_err()
+            .to_string();
+        assert!(inspect.contains("image inspect failed: Error: storage lock is held"));
+        assert!(!inspect.contains("image not found locally"));
     }
 
     #[test]
@@ -1982,9 +2129,13 @@ mod tests {
         let name_probe = uuid::Uuid::new_v4();
         // `image_exists` must pass first or the timeout run itself fails for
         // the wrong reason (missing image).
-        if !runner.image_exists().await {
-            eprintln!("skipping: busybox:latest not in local store");
-            return;
+        match runner.image_exists().await {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!("skipping: busybox:latest not in local store");
+                return;
+            }
+            Err(err) => panic!("busybox image inspection failed: {err}"),
         }
         let err = runner
             .execute_with_name(params, &format!("lunarwing-sandbox-timeout-{name_probe}"))

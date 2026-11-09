@@ -232,9 +232,10 @@ pub struct Thread {
     /// Messages queued while the thread was processing a turn.
     #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
     pub pending_messages: VecDeque<String>,
-    /// Mid-turn steer notes injected via `/steer` while a turn is running.
-    /// Drained by the agentic loop after the current tool call completes and
-    /// injected as a user message without breaking role alternation.
+    /// Steer notes queued for the current or next turn via `/steer`.
+    /// Idle-thread notes are drained while constructing the next turn; notes
+    /// for an active or approval-paused turn are drained at its next iteration
+    /// boundary and injected as a user message.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steer_notes: Vec<String>,
 }
@@ -245,9 +246,9 @@ pub struct Thread {
 /// rapid follow-ups. The drain loop processes them as one newline-delimited turn.
 pub const MAX_PENDING_MESSAGES: usize = 10;
 
-/// Maximum number of unconsumed steer notes held for a running turn. Steer is
-/// an intervention channel, not a conversation queue, so the cap is tight:
-/// notes beyond it are rejected and the sender is told to wait for drain.
+/// Maximum number of unconsumed steer notes held for the current or next turn.
+/// Steer is an intervention channel, not a conversation queue, so the cap is
+/// tight: notes beyond it are rejected and the sender is told to wait for drain.
 pub const MAX_STEER_NOTES: usize = 4;
 
 impl Thread {
@@ -348,10 +349,11 @@ impl Thread {
         self.updated_at = Utc::now();
     }
 
-    /// Record a mid-turn steer note (Hermes-style `/steer`).
+    /// Record a steer note (Hermes-style `/steer`) for the current or next turn.
     ///
-    /// The note is delivered to the running agentic loop after the current
-    /// tool call completes, as a user message injected into the live context.
+    /// Idle-thread notes are prepended to the next turn's initial context.
+    /// Notes for an active or approval-paused turn are injected into its live
+    /// context at the next iteration boundary.
     /// Returns `false` when [`MAX_STEER_NOTES`] notes are already waiting.
     pub fn add_steer_note(&mut self, note: String) -> bool {
         if self.steer_notes.len() >= MAX_STEER_NOTES {

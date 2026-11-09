@@ -142,6 +142,14 @@ oE4="$(run_wd "$e4" WD_CALL_LOG="$e4/calls" \
 assert_contains "$oE4" "no action" "E8: unreachable gateway (curl fail) -> no spurious restart"
 assert_eq "$(restores "$e4")" "0" "E9: unreachable gateway -> zero restarts"
 
+e5="$(sb)"; mk_wd_mock "$e5"; wd_set "$e5" lunarwing started
+printf '%s\n' '{"channel_health":{"xmpp":{"healthy":true}},"channel_config_errors":{"multica":"required field multica_url is not configured"}}' > "$e5/gw.json"
+: > "$e5/calls"
+oE5="$(run_wd "$e5" WD_CALL_LOG="$e5/calls" WD_GATEWAY_JSON="$e5/gw.json" \
+    LUNARWING_WATCHDOG_GATEWAY_URL=http://127.0.0.1:1 LUNARWING_WATCHDOG_GATEWAY_TOKEN=t)"
+assert_contains "$oE5" "no action" "E10: config-only error -> no restart"
+assert_eq "$(restores "$e5")" "0" "E11: config errors never trigger the runtime watchdog"
+
 # ── F: hung status probe is bounded and follows the normal start path ─────────
 echo "=== Section F: wedged rc-service (probe timeout) ==="
 if command -v timeout >/dev/null 2>&1; then

@@ -275,6 +275,18 @@ such as local bridge URLs, policy flags, room lists, or device IDs. Use
 `required_secrets` only for sensitive values that must go through the encrypted
 secrets store.
 
+Every field declared with `"optional": false` must resolve to a non-null,
+non-blank value from setup, an approved setting, an allowed environment source,
+or the manifest's `config` defaults. The host rejects missing values before
+startup or hot activation and reports the field name through extension status
+and the gateway's `channel_config_errors` map. Optional fields may remain null,
+blank, or absent. Config-only errors do not trigger the runtime watchdog.
+
+Do not put secrets or other sensitive values in `on_start` errors. Guest error
+text is retained in daemon logs, but gateway health and extension listings
+intentionally replace it with `channel failed to start; see daemon logs`.
+CLI output strips control characters and bounds gateway-provided text.
+
 ## Building and Deploying
 
 ### Supply Chain Security: No Committed Binaries

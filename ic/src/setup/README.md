@@ -276,14 +276,19 @@ Step 9: Background Tasks (heartbeat)
 
 `--channels-only` mode runs only Step 6, skipping everything else.
 
-Sandbox networking defaults to `none` in v2.1.2.0 (WI#154/155). This is the
-in-code default (including configs with only `[[sandbox.external_workers]]`), so
-existing unconfigured setups are safe. Existing explicit `proxy` or
-`proxy-enforced` env/DB/TOML network settings retain precedence. Tenants that
-need sandboxed web access select `SANDBOX_NETWORK=proxy-enforced` after
-checking the local Linux runtime and a Python-3-equipped image; legacy `proxy`
-remains advisory. See [`NETWORK_SECURITY.md` §5](../NETWORK_SECURITY.md#5-sandbox-http-proxy)
-and the [item-26 rollout record](../../../docs/ops/history/v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md).
+On Linux, sandbox networking defaults to `proxy-enforced` in v2.2.0.0
+(WI#537), including configs with only `[[sandbox.external_workers]]` and new
+mt-admin tenant envs. The container keeps `--network none`; standard web access
+passes only through the local Unix relay to the public-only, DNS-pinned default
+allowlist documented in
+[`NETWORK_SECURITY.md` §5](../NETWORK_SECURITY.md#5-sandbox-http-proxy). Other
+platforms default to `none` because the relay is unsupported. Existing explicit
+`none`, `proxy-enforced`, `tunnel`, or `proxy` env/DB/TOML settings retain
+precedence, and mt-admin preserves them on re-render. Select `none` to disable
+egress. The Linux default requires a local runtime and a Python-3-equipped
+image; the managed sandbox image includes the full Python development suite.
+Enforced mode installs no credential mappings. Legacy `proxy` remains advisory
+and is never a default.
 
 **Personal onboarding** happens conversationally during the user's first interaction
 with the running assistant (not during the wizard). The `## First-Run Bootstrap` block in
@@ -530,6 +535,14 @@ key first, then falls back to the standard env var.
   and persist under `extensions.<channel>.setup_fields`
 - Save each secret via `SecretsContext`
 - Returns `restart_required` if any configured field declares it
+- Before startup or hot activation, the host also validates the resolved config
+  against every non-optional field. Null, blank, and absent values are rejected
+  before `start()`; the named failure appears in extension status and the
+  gateway's separate `channel_config_errors` map instead of leaving the channel
+  apparently active. Config errors do not mark runtime `channel_health`
+  unhealthy or trigger watchdog restarts. Runtime/guest startup details remain
+  in daemon logs; health and listings show only `channel failed to start; see
+  daemon logs` for those failures.
 
 **Bridge-backed WASM channels**:
 - A WASM channel can act as a local adapter instead of owning the protocol
@@ -538,6 +551,10 @@ key first, then falls back to the standard env var.
   it talks to a user-run local `xmpp-bridge` process over loopback HTTP
 - Channel setup fields are used for non-secret bridge/runtime config such as
   `bridge_url`, `xmpp_jid`, policy flags, and persistence directories
+- A no-database install cannot persist the native-XMPP migration's `XMPP_JID`
+  value as `extensions.xmpp.setup_fields`. Such an install must provide a
+  settings store; otherwise installable-XMPP validation rejects startup and
+  names `xmpp_jid` instead of silently starting with incomplete config.
 
 **XMPP special case** (`setup_xmpp`):
 - Validates bot token via XMPP `getMe` API

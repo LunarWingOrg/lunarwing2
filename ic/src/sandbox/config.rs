@@ -34,7 +34,10 @@ impl std::str::FromStr for SandboxRuntime {
 }
 
 /// Network egress mode for sandboxed policies (`ReadOnly`/`WorkspaceWrite`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// The default is `ProxyEnforced` on Linux and `None` elsewhere, where the
+/// local Unix-socket relay is unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxNetworkMode {
     /// Route egress through the validating HTTP proxy (allowlist + credential
     /// injection). Advisory: enforced via `http_proxy`/`https_proxy` env vars
@@ -58,8 +61,32 @@ pub enum SandboxNetworkMode {
     Tunnel,
     /// Hard network isolation: containers run with `--network none`. No
     /// egress at all, kernel-enforced; the proxy is not started.
-    #[default]
     None,
+}
+
+impl SandboxNetworkMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Proxy => "proxy",
+            Self::ProxyEnforced => "proxy-enforced",
+            Self::Tunnel => "tunnel",
+            Self::None => "none",
+        }
+    }
+}
+
+impl Default for SandboxNetworkMode {
+    fn default() -> Self {
+        default_network_for_platform(cfg!(target_os = "linux"))
+    }
+}
+
+const fn default_network_for_platform(is_linux: bool) -> SandboxNetworkMode {
+    if is_linux {
+        SandboxNetworkMode::ProxyEnforced
+    } else {
+        SandboxNetworkMode::None
+    }
 }
 
 impl std::str::FromStr for SandboxNetworkMode {
@@ -146,7 +173,7 @@ pub struct SandboxConfig {
     pub proxy_port: u16,
     /// Container runtime to drive (default: auto — podman preferred).
     pub runtime: SandboxRuntime,
-    /// Network egress mode for sandboxed policies (default: none).
+    /// Network egress mode (default: proxy-enforced on Linux, none elsewhere).
     pub network: SandboxNetworkMode,
     /// Tunnel sidecar settings, consulted only in `Tunnel` mode.
     pub tunnel: Option<crate::sandbox::tunnel_sidecar::TunnelSidecarConfig>,
@@ -178,7 +205,7 @@ impl Default for SandboxConfig {
             auto_pull_image: true,
             proxy_port: 0,
             runtime: SandboxRuntime::Auto,
-            network: SandboxNetworkMode::None,
+            network: SandboxNetworkMode::default(),
             tunnel: None,
             protected_paths: crate::sandbox::mount_guard::resolve_protected_paths(),
             tenant_logs: TenantLogsMode::Info,
@@ -200,10 +227,10 @@ impl Default for SandboxConfig {
 /// └─────────────────┴──────────────────┴────────────────────────────────┘
 /// ```
 ///
-/// For sandboxed policies the egress mode comes from
-/// [`SandboxNetworkMode`]: `None` (default), `ProxyEnforced` (isolated
-/// allowlist web access), `Tunnel` (sidecar overlay egress), or the legacy
-/// advisory `Proxy` mode.
+/// For sandboxed policies the egress mode comes from [`SandboxNetworkMode`]:
+/// `ProxyEnforced` (Linux default; isolated allowlist web access), `None`
+/// (default elsewhere; no egress), `Tunnel` (sidecar overlay egress), or the
+/// legacy advisory `Proxy` mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SandboxPolicy {
     /// Read-only access to workspace, proxied network.
@@ -317,12 +344,12 @@ pub fn default_allowlist() -> Vec<String> {
         "nodejs.org".to_string(),
         "go.dev".to_string(),
         "docs.python.org".to_string(),
-        // Version control (read-only)
+        // Version control (destination-only filtering; methods are not restricted)
         "github.com".to_string(),
         "raw.githubusercontent.com".to_string(),
         "api.github.com".to_string(),
         "codeload.github.com".to_string(),
-        // Common APIs (credentials will be injected by proxy)
+        // Common APIs (only legacy proxy mode injects credentials)
         "api.openai.com".to_string(),
         "api.anthropic.com".to_string(),
         "api.lunarwing.org".to_string(),
@@ -436,10 +463,26 @@ mod tests {
     }
 
     #[test]
+    fn test_default_network_is_platform_aware() {
+        assert_eq!(
+            default_network_for_platform(true),
+            SandboxNetworkMode::ProxyEnforced
+        );
+        assert_eq!(
+            default_network_for_platform(false),
+            SandboxNetworkMode::None
+        );
+    }
+
+    #[test]
     fn test_config_defaults_tiered_network() {
         let config = SandboxConfig::default();
         assert_eq!(config.runtime, SandboxRuntime::Auto);
-        assert_eq!(config.network, SandboxNetworkMode::None);
+        assert_eq!(config.network, SandboxNetworkMode::default());
+        assert_eq!(
+            config.network,
+            default_network_for_platform(cfg!(target_os = "linux"))
+        );
         assert_eq!(config.tenant_logs, TenantLogsMode::Info);
     }
 
