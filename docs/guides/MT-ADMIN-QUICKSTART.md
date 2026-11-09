@@ -18,13 +18,13 @@ repass added the v2.1.4.0 (WI#268) read-only diagnostics verbs `psql` and
 required tenant LLM endpoint in §3 and the (WI#376) OpenRC
 `render-units --all-proxies` fleet migration command in §8; the 2026-10-15
 re-check added the (WI#357) `worker-listeners` exposure audit to §8's
-read-only inspection verbs. **Migration note
-(WI#154/155):** `SANDBOX_NETWORK` defaults to `none` everywhere. Existing
-explicit `proxy` settings are preserved (mt-admin renders `none` only when
-unset). Tenants that need sandboxed web access must opt into `proxy-enforced`
-(enforced; local Linux runtime + Python-3 image required) or the legacy
-advisory `proxy`. See
-[`../ops/history/v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md`](../ops/history/v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md).
+read-only inspection verbs. **Migration note (WI#537):** new tenant envs
+default to `SANDBOX_NETWORK=proxy-enforced`, giving standard web access through
+the enforced public-only allowlist relay (local Linux runtime + Python-3 image
+required). mt-admin fills the value only when unset and preserves an existing
+`none`, `proxy-enforced`, `tunnel`, or legacy advisory `proxy` on re-render.
+Select `none` to disable all egress. See `ic/src/NETWORK_SECURITY.md` §5 for the
+tier table and default allowlist.
 
 For per-tenant instructions and identity editing, use the gateway's
 **Settings → System Prompt** panel. See [Tenant System Prompts](TENANT-SYSTEM-PROMPTS.md)
