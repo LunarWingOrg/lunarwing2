@@ -3,7 +3,7 @@
 # result still matches the committed lockfiles set-wise, and re-verify the
 # vendored set against the RustSec advisory database before merge.
 #
-# Usage: scripts/refresh-vendor.sh [extra cargo-vendor args...]
+# Usage: scripts/refresh-vendor.sh [--prune-removed] [extra cargo-vendor args...]
 #
 # Notes:
 #   - Vendors the ic workspace plus every tracked satellite lockfile root
@@ -23,12 +23,17 @@
 #     wiped. The one case that still fails loudly is a rig-core version bump:
 #     re-apply the patch onto the new sources and commit it first
 #     (LUNARWING-PATCH.md describes the flow).
-#   - The post-vendor set reconciliation compares vendor/ against the committed
-#     Cargo.lock files (the approved pins), never re-resolving them. It prunes
-#     only crate names absent from every lock, which --no-delete cannot remove;
-#     superseded versions of locked crates remain. (.vendor-staging* temp dirs
-#     that an interrupted cargo vendor leaves behind are removed before vendoring.)
+#   - The post-vendor set check compares vendor/ against the committed Cargo.lock
+#     files (the approved pins), never re-resolving them. By default any stray
+#     fails the check. --prune-removed explicitly removes crate names absent
+#     from every lock; superseded versions of locked crates always remain.
 set -euo pipefail
+
+prune_removed=0
+if [[ "${1:-}" == "--prune-removed" ]]; then
+  prune_removed=1
+  shift
+fi
 
 cd "$(dirname "$0")/.."
 
@@ -222,9 +227,9 @@ done
 # Reconcile the set against the committed lockfiles (the approved pins). Cargo's
 # mandatory --no-delete mode preserves superseded versions of crates still in
 # use, but it also leaves crates whose names disappeared from every lockfile.
-# Remove only those wholly unused names here; never re-resolve the locks. Local
-# [patch.crates-io] path dependencies and the pre-vendored path deps are exempt.
-python3 - "$VENDOR_DIR" "${lockfiles[@]}" <<'PYEOF'
+# --prune-removed removes only those wholly unused names; never re-resolve the
+# locks. Local [patch.crates-io] and pre-vendored path dependencies are exempt.
+PRUNE_REMOVED="$prune_removed" python3 - "$VENDOR_DIR" "${lockfiles[@]}" <<'PYEOF'
 import os, shutil, sys, tomllib
 
 vendor_dir = sys.argv[1]
@@ -272,6 +277,15 @@ for d in sorted(os.listdir(vendor_dir)):
         strays.append(d)
         continue
     joints[base] = joints.get(base, 0) + 1
+
+if strays and os.environ["PRUNE_REMOVED"] == "0":
+    print(
+        "refresh-vendor: ERROR vendored dirs outside every synced Cargo.lock "
+        + f"({len(strays)}): {strays[:10]} — fix the locks, or explicitly "
+        + "re-run with --prune-removed after reviewing the removals",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 for d in strays:
     crate_dir = os.path.join(vendor_dir, d)
