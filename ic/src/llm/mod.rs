@@ -344,6 +344,7 @@ pub async fn build_provider_chain(
     // 1. Retry
     let retry_config = RetryConfig {
         max_retries: config.max_retries,
+        empty_stream_retry_input_token_budget: config.empty_stream_retry_input_token_budget,
     };
     let llm: Arc<dyn LlmProvider> = if retry_config.max_retries > 0 {
         tracing::debug!(
@@ -555,6 +556,8 @@ mod tests {
             backend: "lunarwing_cloud".to_string(),
             session: SessionConfig::default(),
             max_retries: lunarwing_cloud.max_retries,
+            empty_stream_retry_input_token_budget:
+                retry::DEFAULT_EMPTY_STREAM_RETRY_INPUT_TOKEN_BUDGET,
             circuit_breaker_threshold: lunarwing_cloud.circuit_breaker_threshold,
             circuit_breaker_recovery_secs: lunarwing_cloud.circuit_breaker_recovery_secs,
             response_cache_enabled: lunarwing_cloud.response_cache_enabled,
@@ -613,7 +616,10 @@ mod tests {
         cheap: Arc<dyn LlmProvider>,
         fallback: Arc<dyn LlmProvider>,
     ) -> (RecordingLlm, Arc<CachedProvider>) {
-        let retry_config = RetryConfig { max_retries: 1 };
+        let retry_config = RetryConfig {
+            max_retries: 1,
+            ..RetryConfig::default()
+        };
         let primary: Arc<dyn LlmProvider> =
             Arc::new(RetryProvider::new(primary, retry_config.clone()));
         let cheap: Arc<dyn LlmProvider> = Arc::new(RetryProvider::new(cheap, retry_config));
