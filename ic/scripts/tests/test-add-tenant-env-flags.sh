@@ -302,7 +302,12 @@ assert_eq "rerun preserves ORCHESTRATOR_SELF_MODIFY" \
   "$(envval ORCHESTRATOR_SELF_MODIFY)" "false"
 assert_eq "rerun preserves ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS" \
   "$(envval ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS)" "4"
-assert_eq "rerun preserves SANDBOX_NETWORK" "$(envval SANDBOX_NETWORK)" "proxy"
+for sandbox_mode in none proxy-enforced tunnel proxy; do
+  sed -i "s/^SANDBOX_NETWORK=.*/SANDBOX_NETWORK=$sandbox_mode/" "$MT_FIXTURE/env/lunarwing.env"
+  write_tenant_lunarwing_env fixture-tenant
+  assert_eq "rerun preserves SANDBOX_NETWORK=$sandbox_mode" \
+    "$(envval SANDBOX_NETWORK)" "$sandbox_mode"
+done
 assert_eq "rerun preserves SANDBOX_RUNTIME" "$(envval SANDBOX_RUNTIME)" "docker"
 assert_eq "rerun preserves SANDBOX_IMAGE" "$(envval SANDBOX_IMAGE)" "custom-sandbox:v2"
 assert_eq "rerun preserves SANDBOX_AUTO_PULL" "$(envval SANDBOX_AUTO_PULL)" "true"
