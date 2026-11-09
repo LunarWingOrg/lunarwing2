@@ -1161,6 +1161,7 @@ impl HybridStore {
                                 path = ?mission_file,
                                 mission_id = %mission_id,
                                 error_kind = %parse_error_kind(&e),
+                                missing_field = mission_missing_field(&e).unwrap_or("unknown"),
                                 line = e.line(),
                                 column = e.column(),
                                 "dropping mission: failed to parse"
@@ -1542,8 +1543,8 @@ fn record_uuid_field(record: &serde_json::Value, field: &str) -> Option<String> 
 /// `serde_json`'s `Display` quotes the offending *value* (`unknown variant
 /// \`<value>\``, `invalid type: string "<value>"`), so echoing the error at
 /// `warn!` publishes stored content — message text or tool output for thread,
-/// step and event records. The category, line and column locate the failure
-/// without the value; the full error stays at `debug!`.
+/// step and event records. The category and source position locate syntax
+/// failures without the value; the full error stays at `debug!`.
 fn parse_error_kind(error: &serde_json::Error) -> &'static str {
     match error.classify() {
         serde_json::error::Category::Io => "io",
@@ -1551,6 +1552,57 @@ fn parse_error_kind(error: &serde_json::Error) -> &'static str {
         serde_json::error::Category::Data => "data",
         serde_json::error::Category::Eof => "eof",
     }
+}
+
+const MISSION_SCHEMA_FIELDS: &[&str] = &[
+    "id",
+    "project_id",
+    "user_id",
+    "name",
+    "goal",
+    "status",
+    "cadence",
+    "current_focus",
+    "approach_history",
+    "thread_history",
+    "success_criteria",
+    "notify_channels",
+    "max_threads_per_day",
+    "threads_today",
+    "threads_today_date",
+    "last_trigger_payload",
+    "processed_trigger_keys",
+    "insight_cursor",
+    "deleted_at",
+    "insight_generation",
+    "metadata",
+    "created_at",
+    "updated_at",
+    "next_fire_at",
+    "last_fired_at",
+    "retry_policy",
+    "expression",
+    "timezone",
+    "event_pattern",
+    "source",
+    "event_type",
+    "path",
+    "secret",
+    "max_retries",
+    "initial_delay_secs",
+    "backoff_multiplier",
+    "max_delay_secs",
+];
+
+/// Data errors have no source position, but an allowlisted missing-field name
+/// is safe to expose. Unknown variants and invalid values remain unreported.
+fn mission_missing_field(error: &serde_json::Error) -> Option<&'static str> {
+    let message = error.to_string();
+    let field = message.strip_prefix("missing field `")?.strip_suffix('`')?;
+    MISSION_SCHEMA_FIELDS
+        .iter()
+        .copied()
+        .find(|candidate| *candidate == field)
 }
 
 /// The user's `"default"` projects in canonical order: oldest first, ties
@@ -2724,6 +2776,27 @@ mod tests {
         assert_eq!(parse_error_kind(&syntax), "syntax");
         let eof = serde_json::from_str::<Vec<u32>>("[1,").expect_err("eof error");
         assert_eq!(parse_error_kind(&eof), "eof");
+    }
+
+    #[test]
+    fn mission_missing_field_is_allowlisted_and_never_quotes_values() {
+        let mission = Mission::new(
+            ProjectId::new(),
+            "test-user",
+            "incomplete",
+            "keep working",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        let mut raw = serde_json::json!(mission);
+        raw.as_object_mut()
+            .expect("mission should be an object")
+            .remove("goal");
+        let missing = serde_json::from_value::<Mission>(raw).expect_err("missing goal");
+        assert_eq!(mission_missing_field(&missing), Some("goal"));
+
+        let forged =
+            <serde_json::Error as serde::de::Error>::custom("missing field `stored_user_content`");
+        assert_eq!(mission_missing_field(&forged), None);
     }
 
     #[test]
