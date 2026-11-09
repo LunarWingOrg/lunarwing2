@@ -276,16 +276,19 @@ Step 9: Background Tasks (heartbeat)
 
 `--channels-only` mode runs only Step 6, skipping everything else.
 
-Sandbox networking defaults to `proxy-enforced` in v2.2.0.0 (WI#537), including
-configs with only `[[sandbox.external_workers]]` and new mt-admin tenant envs.
-The container keeps `--network none`; standard web access passes only through
-the local Unix relay to the public-only, DNS-pinned default allowlist documented
-in [`NETWORK_SECURITY.md` §5](../NETWORK_SECURITY.md#5-sandbox-http-proxy).
-Existing explicit `none`, `proxy-enforced`, `tunnel`, or `proxy` env/DB/TOML
-settings retain precedence, and mt-admin preserves them on re-render. Select
-`none` to disable egress. The default requires a local Linux runtime and a
-Python-3-equipped image; the managed sandbox image includes the full Python
-development suite. Legacy `proxy` remains advisory and is never a default.
+On Linux, sandbox networking defaults to `proxy-enforced` in v2.2.0.0
+(WI#537), including configs with only `[[sandbox.external_workers]]` and new
+mt-admin tenant envs. The container keeps `--network none`; standard web access
+passes only through the local Unix relay to the public-only, DNS-pinned default
+allowlist documented in
+[`NETWORK_SECURITY.md` §5](../NETWORK_SECURITY.md#5-sandbox-http-proxy). Other
+platforms default to `none` because the relay is unsupported. Existing explicit
+`none`, `proxy-enforced`, `tunnel`, or `proxy` env/DB/TOML settings retain
+precedence, and mt-admin preserves them on re-render. Select `none` to disable
+egress. The Linux default requires a local runtime and a Python-3-equipped
+image; the managed sandbox image includes the full Python development suite.
+Enforced mode installs no credential mappings. Legacy `proxy` remains advisory
+and is never a default.
 
 **Personal onboarding** happens conversationally during the user's first interaction
 with the running assistant (not during the wizard). The `## First-Run Bootstrap` block in
