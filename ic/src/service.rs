@@ -959,8 +959,9 @@ fn current_service_identity() -> Result<(String, String)> {
         std::env::var("SUDO_USER").ok().as_deref(),
         std::env::var("USER").ok().as_deref(),
     );
-    ensure_openrc_service_identity(&user, root_service_allowed())?;
-    let group = current_primary_group(&user)?;
+    let allow_root = root_service_allowed();
+    ensure_openrc_service_identity(&user, allow_root)?;
+    let group = current_primary_group(&user, allow_root)?;
     Ok((user, group))
 }
 
@@ -979,7 +980,24 @@ fn root_service_allowed() -> bool {
 }
 
 fn ensure_openrc_service_identity(user: &str, allow_root: bool) -> Result<()> {
-    if user.trim() != "root" || allow_root {
+    if user.trim() != "root" {
+        return Ok(());
+    }
+
+    ensure_openrc_root_allowed(allow_root)
+}
+
+#[cfg(unix)]
+fn ensure_openrc_service_uid(uid: nix::unistd::Uid, allow_root: bool) -> Result<()> {
+    if !uid.is_root() {
+        return Ok(());
+    }
+
+    ensure_openrc_root_allowed(allow_root)
+}
+
+fn ensure_openrc_root_allowed(allow_root: bool) -> Result<()> {
+    if allow_root {
         return Ok(());
     }
 
@@ -991,10 +1009,11 @@ fn ensure_openrc_service_identity(user: &str, allow_root: bool) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn current_primary_group(user: &str) -> Result<String> {
+fn current_primary_group(user: &str, allow_root: bool) -> Result<String> {
     let account = nix::unistd::User::from_name(user)
         .with_context(|| format!("failed to look up service user '{user}'"))?
         .with_context(|| format!("service user '{user}' does not exist"))?;
+    ensure_openrc_service_uid(account.uid, allow_root)?;
     let group = nix::unistd::Group::from_gid(account.gid)
         .with_context(|| format!("failed to look up primary group for service user '{user}'"))?
         .with_context(|| format!("primary group for service user '{user}' does not exist"))?;
@@ -1002,7 +1021,7 @@ fn current_primary_group(user: &str) -> Result<String> {
 }
 
 #[cfg(not(unix))]
-fn current_primary_group(user: &str) -> Result<String> {
+fn current_primary_group(user: &str, _allow_root: bool) -> Result<String> {
     bail!("OpenRC service identity lookup is not supported on this platform for '{user}'")
 }
 
@@ -1254,8 +1273,20 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn openrc_uid_zero_alias_requires_explicit_opt_in() {
+        assert!(ensure_openrc_service_identity("toor", false).is_ok());
+        let err = ensure_openrc_service_uid(nix::unistd::Uid::from_raw(0), false)
+            .expect_err("a uid-0 alias should be refused");
+        assert!(err.to_string().contains("run as root"));
+        assert!(err.to_string().contains("LUNARWING_ALLOW_ROOT_SERVICE=1"));
+        assert!(ensure_openrc_service_uid(nix::unistd::Uid::from_raw(0), true).is_ok());
+        assert!(ensure_openrc_service_uid(nix::unistd::Uid::from_raw(1000), false).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn primary_group_lookup_rejects_unknown_user() {
-        let err = current_primary_group("lunarwing\0invalid")
+        let err = current_primary_group("lunarwing\0invalid", false)
             .expect_err("an invalid service user should not get a same-named group fallback");
         assert!(err.to_string().contains("does not exist"));
     }
