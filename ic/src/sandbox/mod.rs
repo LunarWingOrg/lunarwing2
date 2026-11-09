@@ -63,8 +63,8 @@
 //!
 //! | Policy | Filesystem | Network | Use Case |
 //! |--------|------------|---------|----------|
-//! | `ReadOnly` | Read workspace | Proxy allowlist or none | Explore code, fetch docs |
-//! | `WorkspaceWrite` | Read/write workspace | Proxy allowlist or none | Build software, run tests |
+//! | `ReadOnly` | Read workspace | Selected egress tier | Explore code, fetch docs |
+//! | `WorkspaceWrite` | Read/write workspace | Selected egress tier | Build software, run tests |
 //! | `FullAccess` | Full host | Full | Direct execution (no sandbox) |
 //!
 //! # Example
