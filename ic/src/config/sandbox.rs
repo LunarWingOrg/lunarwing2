@@ -17,8 +17,8 @@ pub struct SandboxModeConfig {
     /// Container runtime CLI: "auto" (podman preferred), "podman", or "docker".
     pub runtime: String,
     /// Network egress mode for sandboxed policies: "none" (default),
-    /// "proxy-enforced" (isolated allowlist web access), or legacy
-    /// advisory "proxy".
+    /// "proxy-enforced" (isolated allowlist web access), "tunnel"
+    /// (egress-only NetBird/WireGuard sidecar), or legacy advisory "proxy".
     pub network: String,
     /// Force sandboxed shell execution even in dev mode (ALLOW_LOCAL_TOOLS).
     /// Default false: dev boxes keep direct host execution.
