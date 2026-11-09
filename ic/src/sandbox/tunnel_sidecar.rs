@@ -106,7 +106,7 @@ impl TunnelSidecarConfig {
             &mut hasher,
             self.netbird_setup_key
                 .as_ref()
-                .map(|key| key.expose_secret().as_str()),
+                .map(|key| key.expose_secret()),
         );
         let wireguard_path = self
             .wireguard_config
