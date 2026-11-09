@@ -530,6 +530,10 @@ key first, then falls back to the standard env var.
   and persist under `extensions.<channel>.setup_fields`
 - Save each secret via `SecretsContext`
 - Returns `restart_required` if any configured field declares it
+- Before startup or hot activation, the host also validates the resolved config
+  against every non-optional field. Null, blank, and absent values are rejected
+  before `start()`; the named failure appears in extension status and gateway
+  channel health instead of leaving the channel apparently active.
 
 **Bridge-backed WASM channels**:
 - A WASM channel can act as a local adapter instead of owning the protocol
