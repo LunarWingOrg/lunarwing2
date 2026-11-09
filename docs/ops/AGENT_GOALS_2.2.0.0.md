@@ -68,7 +68,10 @@ Items 3–4 cover the sandbox theme; items 5–6 cover LunarDepth.
 
 ## Phase 3 — Carried Known-Issues from RELEASE-v2.1.9.0.md (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
 
-7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/573
+7. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/573
+   - **DONE — Rarity, 2026-11-09:** implemented the WI#573 host-side half. Startup and hot activation validate every non-optional channel setup field against resolved overrides and manifest defaults, rejecting null, blank, and absent values before `start()` with the field named. `ChannelManager` now retains `StartupFailed` reasons, including pre-registration validation failures; gateway health and extension listings mark failed channels inactive and expose the reason instead of trusting the loaded-name set.
+   - **Status surfaces:** `lunarwing channels list` and `lunarwing status` now overlay failures from the authenticated gateway health endpoint when it is configured and reachable, while retaining the static configured-state view offline. Extension/tool JSON carries `activation_error`; the web UI's existing failed state is therefore used. Setup, channel-authoring, and Multica operator docs match the new contract.
+   - **Verified:** 34 focused tests passed: channel manager 20/20, required-config regression 1/1, extension-listing regression 1/1 (rerun on the final code), CLI channels 6/6 including a real loopback gateway-health HTTP request, and CLI status 6/6. `cargo fmt --all -- --check` and `taskset -c 0-17 cargo clippy -j18 --all --benches --tests --examples -- -D warnings` passed on the final Rust tree. No live external Multica server was used; the host validation, failure propagation, extension listing, and authenticated CLI HTTP mapping are covered by local regressions.
 
 ## Phase 4 - Documentation and Misc goal items (For goals referencing work items, read comments on work items as well. Also, see linked work items as well)
 
