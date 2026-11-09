@@ -70,9 +70,13 @@ impl NetworkProxyBuilder {
 
     /// Create from a sandbox config.
     pub fn from_config(config: &SandboxConfig) -> Self {
+        let credential_mappings = match config.network {
+            crate::sandbox::SandboxNetworkMode::Proxy => default_credential_mappings(),
+            _ => Vec::new(),
+        };
         Self {
             allowlist: config.network_allowlist.clone(),
-            credential_mappings: default_credential_mappings(),
+            credential_mappings,
             credential_resolver: Arc::new(EnvCredentialResolver),
             // This proxy can serve per-call sandboxed policy overrides even
             // when the manager's default policy is FullAccess. Never relax
