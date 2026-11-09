@@ -167,7 +167,7 @@ sudo ic/scripts/lunarwing-mt-admin.sh build-kimi-worker
 sudo ic/scripts/lunarwing-mt-admin.sh build-vision-sidecar
 ```
 
-Since v2.1.3.0 (WI#223) new tenants default to `SANDBOX_IMAGE=lunarwing-sandbox:latest` with `SANDBOX_RUNTIME=podman` and `SANDBOX_AUTO_PULL=false`. `add-tenant` builds the lean generic sandbox image (from `ic/docker/sandbox.Dockerfile`) into the shared rootful store and distributes it into the tenant's rootless store automatically; if that step failed or the image was later removed, rebuild and redistribute it explicitly (optional tenant name selects that tenant's configured runtime):
+Since v2.1.3.0 (WI#223) new tenants default to `SANDBOX_IMAGE=lunarwing-sandbox:latest` with `SANDBOX_RUNTIME=podman` and `SANDBOX_AUTO_PULL=false`. `add-tenant` builds the managed generic sandbox image (from `ic/docker/sandbox.Dockerfile`, including the WI#537 pinned Python development suite) into the shared rootful store and distributes it into the tenant's rootless store automatically; if that step failed or the image was later removed, rebuild and redistribute it explicitly (optional tenant name selects that tenant's configured runtime):
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh build-sandbox-image [tenant]
