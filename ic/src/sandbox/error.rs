@@ -20,6 +20,10 @@ pub enum SandboxError {
     #[error("Sandbox image unavailable: {image}: {reason}")]
     ImageUnavailable { image: String, reason: String },
 
+    /// The container runtime could not write to its storage filesystem.
+    #[error("Storage volume full: {path}\nUnderlying container runtime error: {reason}")]
+    StorageUnavailable { path: String, reason: String },
+
     /// Failed to create container.
     #[error("Container creation failed: {reason}")]
     ContainerCreationFailed { reason: String },
@@ -98,6 +102,7 @@ impl SandboxError {
             | Self::Docker(_)
             | Self::Io(_) => "sandbox_unavailable",
             Self::ImageUnavailable { .. } => "image_unavailable",
+            Self::StorageUnavailable { .. } => "storage_unavailable",
             Self::ContainerCreationFailed { .. }
             | Self::ContainerStartFailed { .. }
             | Self::ExecutionFailed { .. } => "execution_failed",
@@ -123,6 +128,12 @@ impl SandboxError {
                 "build SANDBOX_IMAGE in the daemon's container store (multi-tenant: \
                  `lunarwing-mt-admin.sh build-sandbox-image <name>` then `start-tenant <name>`), \
                  or use an existing image / enable SANDBOX_AUTO_PULL for registry images",
+            ),
+            Self::StorageUnavailable { .. } => Some(
+                "check free space on the reported storage path with `df`; \
+                 `podman image prune` (dangling images only) is safe as the affected tenant user; \
+                 on multi-tenant hosts use mt-admin and the health tooling (WI#586); \
+                 never use `prune -a`: the sandbox image is built locally",
             ),
             Self::TunnelUnavailable { .. } => Some(
                 "check the SANDBOX_TUNNEL_* settings (netbird management URL/setup key, \
@@ -160,6 +171,13 @@ mod tests {
                     reason: "x".into(),
                 },
                 "image_unavailable",
+            ),
+            (
+                SandboxError::StorageUnavailable {
+                    path: "/var/lib/containers/storage".into(),
+                    reason: "no space left on device".into(),
+                },
+                "storage_unavailable",
             ),
             (
                 SandboxError::ContainerCreationFailed { reason: "x".into() },
@@ -240,6 +258,18 @@ mod tests {
             .remediation_hint()
             .is_some()
         );
+        let storage_hint = SandboxError::StorageUnavailable {
+            path: "/var/lib/containers/storage".into(),
+            reason: "no space left on device".into(),
+        }
+        .remediation_hint()
+        .unwrap();
+        assert!(storage_hint.contains("df"));
+        assert!(storage_hint.contains("podman image prune"));
+        assert!(storage_hint.contains("dangling images only"));
+        assert!(storage_hint.contains("mt-admin"));
+        assert!(storage_hint.contains("never use `prune -a`"));
+        assert!(!storage_hint.contains("podman system prune"));
         assert!(
             SandboxError::TunnelUnavailable { reason: "x".into() }
                 .remediation_hint()
@@ -250,5 +280,21 @@ mod tests {
                 .remediation_hint()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn storage_error_leads_with_disk_space_and_preserves_runtime_detail() {
+        let runtime = "Error: configure storage: no space left on device: driver not supported";
+        let message = SandboxError::StorageUnavailable {
+            path: "/home/tenant/.local/share/containers/storage".into(),
+            reason: runtime.into(),
+        }
+        .to_string();
+
+        assert!(
+            message
+                .starts_with("Storage volume full: /home/tenant/.local/share/containers/storage\n")
+        );
+        assert!(message.contains(runtime));
     }
 }
