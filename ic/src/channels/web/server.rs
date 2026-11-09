@@ -3417,6 +3417,11 @@ async fn gateway_status_handler(
     } else {
         None
     };
+    let channel_config_errors = if let Some(ref cm) = state.channel_manager {
+        Some(cm.config_errors().await)
+    } else {
+        None
+    };
 
     Json(GatewayStatusResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -3435,6 +3440,7 @@ async fn gateway_status_handler(
         skills_max_active: state.active_config.skills_max_active,
         skills_max_context_tokens: state.active_config.skills_max_context_tokens,
         channel_health,
+        channel_config_errors,
     })
 }
 
@@ -3475,6 +3481,8 @@ struct GatewayStatusResponse {
     skills_max_context_tokens: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     channel_health: Option<std::collections::HashMap<String, ChannelHealthEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel_config_errors: Option<std::collections::HashMap<String, String>>,
 }
 
 #[cfg(test)]
