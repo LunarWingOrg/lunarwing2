@@ -869,6 +869,25 @@ rejected entries, and skips missing binaries without downloading. This
 protects telemetry even if an earlier bootstrap step fails before the normal
 sccache verification runs (IZ-1).
 
+Both tool installers try the project's generic package registry before GitHub.
+Publish the exact upstream archives as package `lunarwing-ci-tools`: sccache
+0.17.0 uses version `0.17.0` and file
+`sccache-v0.17.0-x86_64-unknown-linux-musl.tar.gz`; ShellCheck 0.11.0 uses
+version `0.11.0` and file `shellcheck-v0.11.0.linux.x86_64.tar.xz`. CI builds the
+URL from `CI_API_V4_URL` and `CI_PROJECT_ID` and authenticates the default
+registry request with `CI_JOB_TOKEN`; the upstream GitHub request never receives
+that token. Each source uses five retries with a five-second delay, and every
+downloaded archive must still match its checked-in SHA256. A tool bump must
+publish the new archive and update both pins in the same change.
+
+If every sccache source fails, both Rust templates source
+`disable-sccache.sh`, print a warning, unset `RUSTC_WRAPPER` and every exported
+`SCCACHE_*` variable, and continue without the optional compiler cache. A total
+ShellCheck download outage remains fatal and names the registry URL: ShellCheck
+is a correctness gate and must never silently fall back to the older distro
+package. `ic/scripts/tests/test-ci-tool-downloads.sh` covers source order,
+checksum rejection, and both outage paths with stubbed downloads.
+
 **Compiler-cache trust limit (IU-3):** the binary pin does not authenticate
 compiled objects in `.ci-cache/sccache/`. The checked-in pipeline permits
 writes only from `rust-cache-refresh` on protected default-branch pushes;
