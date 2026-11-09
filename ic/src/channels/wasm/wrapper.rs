@@ -1620,6 +1620,7 @@ impl WasmChannel {
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
         let host_credentials = resolve_channel_host_credentials(
+            &self.name,
             &self.capabilities,
             self.secrets_store.as_deref(),
             &self.owner_scope_id,
@@ -1783,6 +1784,7 @@ impl WasmChannel {
         let timeout = self.runtime.config().callback_timeout;
         let credentials = self.get_credentials().await;
         let host_credentials = resolve_channel_host_credentials(
+            &self.name,
             &self.capabilities,
             self.secrets_store.as_deref(),
             &self.owner_scope_id,
@@ -1931,6 +1933,7 @@ impl WasmChannel {
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
         let host_credentials = resolve_channel_host_credentials(
+            &self.name,
             &self.capabilities,
             self.secrets_store.as_deref(),
             &self.owner_scope_id,
@@ -2034,6 +2037,7 @@ impl WasmChannel {
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
         let host_credentials = resolve_channel_host_credentials(
+            &self.name,
             &self.capabilities,
             self.secrets_store.as_deref(),
             &self.owner_scope_id,
@@ -2180,6 +2184,7 @@ impl WasmChannel {
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
         let host_credentials = resolve_channel_host_credentials(
+            &self.name,
             &self.capabilities,
             self.secrets_store.as_deref(),
             &self.owner_scope_id,
@@ -2289,6 +2294,7 @@ impl WasmChannel {
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
         let host_credentials = resolve_channel_host_credentials(
+            &self.name,
             &self.capabilities,
             self.secrets_store.as_deref(),
             &self.owner_scope_id,
@@ -2477,6 +2483,7 @@ impl WasmChannel {
                 // Pre-resolve host credentials once for the lifetime of the repeater.
                 // Channels tokens rarely change, so a snapshot per-repeater is correct.
                 let repeater_host_credentials = resolve_channel_host_credentials(
+                    &self.name,
                     &self.capabilities,
                     self.secrets_store.as_deref(),
                     &self.owner_scope_id,
@@ -2732,7 +2739,8 @@ impl WasmChannel {
                             tracing::debug!(channel = %cn, "Polling tick - calling on_poll");
 
                             let host_credentials =
-                                resolve_channel_host_credentials(&pc, pss.as_deref(), &osi).await;
+                                resolve_channel_host_credentials(&cn, &pc, pss.as_deref(), &osi)
+                                    .await;
 
                             let result = Self::execute_poll(
                                 &cn,
@@ -3915,15 +3923,11 @@ fn should_skip_response_leak_scan(url: &str) -> bool {
 /// The channel will get a 401/403 from the API, which is the expected UX when
 /// auth hasn't been configured yet.
 async fn resolve_channel_host_credentials(
+    channel_name: &str,
     capabilities: &ChannelCapabilities,
     store: Option<&(dyn SecretsStore + Send + Sync)>,
     owner_scope_id: &str,
 ) -> Vec<ResolvedHostCredential> {
-    let store = match store {
-        Some(s) => s,
-        None => return Vec::new(),
-    };
-
     let http_cap = match &capabilities.tool_capabilities.http {
         Some(cap) => cap,
         None => return Vec::new(),
@@ -3944,18 +3948,27 @@ async fn resolve_channel_host_credentials(
             continue;
         }
 
-        let secret = match store
-            .get_decrypted(owner_scope_id, &mapping.secret_name)
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!(
-                    secret_name = %mapping.secret_name,
-                    error = %e,
-                    "Could not resolve credential for WASM channel (auth may not be configured)"
-                );
+        let managed_secret =
+            crate::channels::wasm::managed_channel_secret_env(channel_name, &mapping.secret_name);
+        let secret = if let Some(secret) = managed_secret {
+            secret
+        } else {
+            let Some(store) = store else {
                 continue;
+            };
+            match store
+                .get_decrypted(owner_scope_id, &mapping.secret_name)
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!(
+                        secret_name = %mapping.secret_name,
+                        error = %e,
+                        "Could not resolve credential for WASM channel (auth may not be configured)"
+                    );
+                    continue;
+                }
             }
         };
 
@@ -7167,6 +7180,70 @@ mod tests {
         assert!(needles.contains(&basic_token.as_str()), "{needles:?}");
         assert!(!needles.contains(&"abc"), "{needles:?}");
     }
+
+    #[tokio::test]
+    async fn weechat_host_credential_uses_managed_env_before_stale_store() {
+        use crate::secrets::{CreateSecretParams, SecretsStore};
+
+        let _env_guard = crate::channels::wasm::WEECHAT_MANAGED_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        unsafe {
+            std::env::set_var("RELAY_PASSWORD", "rotated-tenant-secret-pw");
+        }
+
+        let store = crate::testing::credentials::test_secrets_store();
+        store
+            .create(
+                "test-owner",
+                CreateSecretParams::new("weechat_relay_password", "stale-store-secret-pw"),
+            )
+            .await
+            .expect("test relay secret should be stored");
+        let capabilities = ChannelCapabilitiesFile::from_json(
+            r#"{
+                "name": "weechat",
+                "capabilities": {
+                    "http": {
+                        "credentials": {
+                            "weechat_relay": {
+                                "secret_name": "weechat_relay_password",
+                                "location": { "type": "basic", "username": "plain" },
+                                "host_patterns": ["127.0.0.1"]
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("WeeChat test capabilities should parse")
+        .to_capabilities();
+
+        let rotated = super::resolve_channel_host_credentials(
+            "weechat",
+            &capabilities,
+            Some(&store),
+            "test-owner",
+        )
+        .await;
+        assert_eq!(rotated.len(), 1);
+        assert_eq!(rotated[0].secret_value, "rotated-tenant-secret-pw");
+        assert!(rotated[0].headers.contains_key("Authorization"));
+
+        unsafe {
+            std::env::remove_var("RELAY_PASSWORD");
+        }
+        let fallback = super::resolve_channel_host_credentials(
+            "weechat",
+            &capabilities,
+            Some(&store),
+            "test-owner",
+        )
+        .await;
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].secret_value, "stale-store-secret-pw");
+    }
+
     /// Run-143 JQ pins: a raw loopback upstream answers with chosen framing,
     /// and the injected credential must never reach the guest-facing outcome.
     mod credential_echo_pins {

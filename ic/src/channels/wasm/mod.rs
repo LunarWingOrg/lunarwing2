@@ -108,3 +108,20 @@ pub use schema::{
 };
 pub use setup::{WasmChannelSetup, inject_channel_credentials, setup_wasm_channels};
 pub use wrapper::{HttpResponse, SharedWasmChannel, WasmChannel};
+
+pub(crate) fn managed_channel_secret_env(
+    channel_name: &str,
+    secret_name: &str,
+) -> Option<crate::secrets::DecryptedSecret> {
+    let env_var = match (channel_name, secret_name) {
+        ("weechat", "weechat_relay_password") => "RELAY_PASSWORD",
+        _ => return None,
+    };
+    let value = std::env::var(env_var)
+        .ok()
+        .filter(|value| !value.is_empty())?;
+    crate::secrets::DecryptedSecret::from_bytes(value.into_bytes()).ok()
+}
+
+#[cfg(test)]
+pub(crate) static WEECHAT_MANAGED_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
