@@ -851,8 +851,8 @@ pub struct SandboxSettings {
     #[serde(default = "default_sandbox_runtime")]
     pub runtime: String,
 
-    /// Network egress mode for sandboxed policies: "none" (default),
-    /// "proxy-enforced" (isolated allowlist web access), "tunnel"
+    /// Network egress mode for sandboxed policies: "proxy-enforced"
+    /// (default; isolated allowlist web access), "none" (no egress), "tunnel"
     /// (NetBird/WireGuard sidecar namespace, WI#248), or "proxy"
     /// (legacy advisory HTTP proxy).
     #[serde(default = "default_sandbox_network")]
@@ -979,7 +979,7 @@ fn default_sandbox_runtime() -> String {
 }
 
 fn default_sandbox_network() -> String {
-    "none".to_string()
+    "proxy-enforced".to_string()
 }
 
 fn default_sandbox_timeout() -> u64 {
@@ -2519,6 +2519,7 @@ url = "ws://localhost:9090/ws/agent"
         assert_eq!(loaded.agent.name, "partial-bot");
         // Defaults preserved
         assert_eq!(loaded.agent.max_parallel_jobs, 5);
+        assert_eq!(loaded.sandbox.network, "proxy-enforced");
         assert!(!loaded.heartbeat.enabled);
     }
 
