@@ -751,9 +751,16 @@ impl ExtensionManager {
             .map(|rt| Arc::clone(&rt.channel_manager))
     }
 
-    async fn channel_start_failures(&self) -> HashMap<String, String> {
+    async fn channel_start_failures(&self) -> HashSet<String> {
         match self.running_channel_manager().await {
             Some(manager) => manager.start_failures().await,
+            None => HashSet::new(),
+        }
+    }
+
+    async fn channel_config_errors(&self) -> HashMap<String, String> {
+        match self.running_channel_manager().await {
+            Some(manager) => manager.config_errors().await,
             None => HashMap::new(),
         }
     }
@@ -1644,12 +1651,20 @@ impl ExtensionManager {
                     let active_names = self.active_channel_names.read().await;
                     let errors = self.activation_errors.read().await;
                     let start_failures = self.channel_start_failures().await;
+                    let config_errors = self.channel_config_errors().await;
                     for (name, discovered) in channels {
-                        let start_failure = start_failures.get(&name);
-                        let active = start_failure.is_none() && active_names.contains(&name);
+                        let start_failed = start_failures.contains(&name);
+                        let config_error = config_errors.get(&name);
+                        let active =
+                            !start_failed && config_error.is_none() && active_names.contains(&name);
                         let auth_state = self.check_channel_auth_status(&name, user_id).await;
-                        let activation_error = start_failure
+                        let activation_error = config_error
                             .map(|reason| format!("Channel {name} failed to start: {reason}"))
+                            .or_else(|| {
+                                start_failed.then(|| {
+                                    format!("Channel {name} failed to start; see daemon logs")
+                                })
+                            })
                             .or_else(|| errors.get(&name).cloned());
                         let registry_entry = self
                             .registry
@@ -1848,6 +1863,9 @@ impl ExtensionManager {
 
                 // Clear stale activation errors so reinstall starts clean
                 self.activation_errors.write().await.remove(name);
+                if let Some(channel_manager) = self.running_channel_manager().await {
+                    channel_manager.clear_start_failure(name).await;
+                }
 
                 // Delete channel files
                 let wasm_path = self.wasm_channels_dir.join(format!("{}.wasm", name));
@@ -4999,7 +5017,8 @@ impl ExtensionManager {
 
         // Refresh only a channel whose latest start succeeded. A failed startup
         // must go through full activation so corrected config is validated.
-        let start_failed = channel_manager.start_failures().await.contains_key(name);
+        let start_failed = channel_manager.start_failures().await.contains(name)
+            || channel_manager.config_errors().await.contains_key(name);
         if !start_failed && self.active_channel_names.read().await.contains(name) {
             return self.refresh_active_channel(name, user_id).await;
         }
@@ -5037,12 +5056,13 @@ impl ExtensionManager {
             validate_required_channel_config(loaded.capabilities_file.as_ref(), &config_overrides)
         {
             channel_manager
-                .record_start_failure(name.to_string(), reason.clone())
+                .record_config_error(name.to_string(), reason.clone())
                 .await;
             return Err(ExtensionError::ActivationFailed(format!(
                 "Channel {name} failed to start: {reason}"
             )));
         }
+        channel_manager.clear_start_failure(name).await;
         let auth_state = self.check_channel_auth_status(name, user_id).await;
         if auth_state != ToolAuthState::Ready && auth_state != ToolAuthState::NoAuth {
             return Err(ExtensionError::ActivationFailed(format!(
@@ -5114,7 +5134,7 @@ impl ExtensionManager {
                 validate_required_channel_config(loaded.capabilities_file.as_ref(), &config_updates)
             {
                 channel_manager
-                    .record_start_failure(channel_name.clone(), reason.clone())
+                    .record_config_error(channel_name.clone(), reason.clone())
                     .await;
                 return Err(ExtensionError::ActivationFailed(format!(
                     "Channel {channel_name} failed to start: {reason}"
@@ -9303,8 +9323,14 @@ done
         )
     }
 
-    #[tokio::test]
-    async fn wasm_channel_listing_uses_start_failures_not_loaded_names() -> Result<(), String> {
+    async fn manager_with_multica_runtime() -> Result<
+        (
+            ExtensionManager,
+            Arc<crate::channels::ChannelManager>,
+            tempfile::TempDir,
+        ),
+        String,
+    > {
         let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
         let channels_dir = dir.path().join("channels");
         std::fs::create_dir_all(&channels_dir).map_err(|error| error.to_string())?;
@@ -9339,14 +9365,10 @@ done
                 HashMap::new(),
             )
             .await;
-        channels
-            .record_start_failure(
-                "multica".to_string(),
-                "invalid multica config: required field 'multica_url' is not configured"
-                    .to_string(),
-            )
-            .await;
+        Ok((manager, channels, dir))
+    }
 
+    async fn multica_listing_state(manager: &ExtensionManager) -> Result<(bool, String), String> {
         let listed = manager
             .list(Some(ExtensionKind::WasmChannel), false, "test")
             .await
@@ -9355,13 +9377,58 @@ done
             .iter()
             .find(|extension| extension.name == "multica")
             .ok_or_else(|| "multica missing from listing".to_string())?;
-        assert!(!multica.active);
         let error = multica
             .activation_error
-            .as_deref()
+            .clone()
             .ok_or_else(|| "missing startup failure".to_string())?;
+        Ok((multica.active, error))
+    }
+
+    #[tokio::test]
+    async fn wasm_channel_listing_shows_host_config_error() -> Result<(), String> {
+        let (manager, channels, _dir) = manager_with_multica_runtime().await?;
+        channels
+            .record_config_error(
+                "multica".to_string(),
+                "invalid multica config: required field 'multica_url' is not configured"
+                    .to_string(),
+            )
+            .await;
+
+        let (active, error) = multica_listing_state(&manager).await?;
+        assert!(!active);
         assert!(error.contains("failed to start"), "{error}");
         assert!(error.contains("multica_url"), "{error}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wasm_channel_listing_redacts_runtime_error_details() -> Result<(), String> {
+        let (manager, channels, _dir) = manager_with_multica_runtime().await?;
+        manager.activation_errors.write().await.insert(
+            "multica".to_string(),
+            "guest StartupFailed: planted-secret".to_string(),
+        );
+        channels.record_start_failure("multica".to_string()).await;
+
+        let (active, error) = multica_listing_state(&manager).await?;
+        assert!(!active);
+        assert!(error.contains("see daemon logs"), "{error}");
+        assert!(!error.contains("planted-secret"), "{error}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn removing_wasm_channel_clears_runtime_start_failure() -> Result<(), String> {
+        let (manager, channels, _dir) = manager_with_multica_runtime().await?;
+        channels.record_start_failure("multica".to_string()).await;
+
+        manager
+            .remove("multica", "test")
+            .await
+            .map_err(|e| e.to_string())?;
+        assert!(channels.start_failures().await.is_empty());
+        assert!(channels.health_check_all().await.is_empty());
         Ok(())
     }
 
