@@ -275,6 +275,12 @@ such as local bridge URLs, policy flags, room lists, or device IDs. Use
 `required_secrets` only for sensitive values that must go through the encrypted
 secrets store.
 
+Every field declared with `"optional": false` must resolve to a non-null,
+non-blank value from setup, an approved setting, an allowed environment source,
+or the manifest's `config` defaults. The host rejects missing values before
+startup or hot activation and reports the field name through extension status
+and gateway channel health. Optional fields may remain null, blank, or absent.
+
 ## Building and Deploying
 
 ### Supply Chain Security: No Committed Binaries
