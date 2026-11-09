@@ -1,5 +1,5 @@
 {
-  "version": "0.1.8",
+  "version": "0.1.9",
   "wit_version": "0.3.0",
   "description": "Fetch pre-extracted web content from Brave Search for grounding LLM answers. Returns actual page content (text chunks, tables, code) relevant to the query, ready for RAG or fact-checking.",
   "capabilities": {

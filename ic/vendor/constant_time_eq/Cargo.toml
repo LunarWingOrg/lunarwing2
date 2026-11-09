@@ -10,12 +10,12 @@
 # See Cargo.toml.orig for the original contents.
 
 [package]
-edition = "2024"
-rust-version = "1.85.0"
+edition = "2021"
+rust-version = "1.66.0"
 name = "constant_time_eq"
-version = "0.4.2"
+version = "0.6.1"
 authors = ["Cesar Eduardo Barros <cesarb@cesarb.eti.br>"]
-build = false
+build = "build.rs"
 autolib = false
 autobins = false
 autoexamples = false
@@ -30,10 +30,9 @@ categories = [
     "no-std",
 ]
 license = "CC0-1.0 OR MIT-0 OR Apache-2.0"
-repository = "https://github.com/cesarb/constant_time_eq"
+repository = "https://codeberg.org/cesarb/constant_time_eq"
 
 [features]
-count_instructions_test = []
 default = ["std"]
 std = []
 
@@ -44,10 +43,6 @@ path = "src/lib.rs"
 [[test]]
 name = "count_instructions"
 path = "tests/count_instructions.rs"
-
-[[test]]
-name = "count_instructions_classic"
-path = "tests/count_instructions_classic.rs"
 
 [[test]]
 name = "count_instructions_generic"
@@ -63,11 +58,6 @@ path = "benches/bench.rs"
 harness = false
 
 [[bench]]
-name = "bench_classic"
-path = "benches/bench_classic.rs"
-harness = false
-
-[[bench]]
 name = "bench_generic"
 path = "benches/bench_generic.rs"
 harness = false
@@ -76,8 +66,11 @@ harness = false
 version = "0.2.0"
 
 [dev-dependencies.criterion]
-version = "0.5.1"
+version = "0.8.0"
 features = [
     "cargo_bench_support",
     "html_reports",
 ]
+
+[build-dependencies.rustversion]
+version = "1.0.6"

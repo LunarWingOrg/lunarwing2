@@ -2,7 +2,7 @@
   "name": "gotify",
   "display_name": "Gotify Notifications",
   "description": "Send push notifications to a self-hosted Gotify server",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "tools": [
     {
       "name": "gotify",

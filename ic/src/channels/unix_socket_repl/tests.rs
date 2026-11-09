@@ -116,7 +116,7 @@ impl TestClient {
 
 fn legacy_connect() -> ClientFrame {
     ClientFrame::Connect(ConnectFrame {
-        version: "2.1.9".to_string(),
+        version: "2.2.0".to_string(),
         client_info: None,
         protocol: None,
         features: Vec::new(),

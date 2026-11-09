@@ -28,7 +28,7 @@ function info(mode: "legacy" | "current", daemonStart: DaemonStart | null): Serv
   const capabilities =
     mode === "current"
       ? wire.capabilitiesFromChat(
-          { api_version: 1, server_version: "2.1.9", engine: "v2", features: ["status", "attachments", "stream"], limits: {} as never, voice: { provider: null, stt: false, tts: false }, credential: "master" },
+          { api_version: 1, server_version: "2.2.0", engine: "v2", features: ["status", "attachments", "stream"], limits: {} as never, voice: { provider: null, stt: false, tts: false }, credential: "master" },
           null,
         )
       : wire.legacyGatewayCapabilities(null)

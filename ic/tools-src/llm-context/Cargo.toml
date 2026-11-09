@@ -1,6 +1,6 @@
 [package]
 name = "llm-context-tool"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 description = "Brave Search LLM Context tool for LunarWing (WASM component)"
 license = "AGPL-3.0-or-later"
