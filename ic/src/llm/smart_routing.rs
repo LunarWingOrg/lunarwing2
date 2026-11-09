@@ -1996,7 +1996,10 @@ mod tests {
         ));
         let cheap: Arc<dyn LlmProvider> = Arc::new(RetryProvider::new(
             cheap_inner.clone(),
-            RetryConfig { max_retries: 0 },
+            RetryConfig {
+                max_retries: 0,
+                ..RetryConfig::default()
+            },
         ));
         let router = SmartRoutingProvider::new(primary.clone(), cheap, default_config());
 
@@ -2044,7 +2047,10 @@ mod tests {
         ));
         let cheap: Arc<dyn LlmProvider> = Arc::new(RetryProvider::new(
             cheap_inner.clone(),
-            RetryConfig { max_retries: 0 },
+            RetryConfig {
+                max_retries: 0,
+                ..RetryConfig::default()
+            },
         ));
         let router = SmartRoutingProvider::new(primary.clone(), cheap, default_config());
 
@@ -2084,7 +2090,10 @@ mod tests {
         ));
         let cheap: Arc<dyn LlmProvider> = Arc::new(RetryProvider::new(
             cheap_inner.clone(),
-            RetryConfig { max_retries: 0 },
+            RetryConfig {
+                max_retries: 0,
+                ..RetryConfig::default()
+            },
         ));
         let router = SmartRoutingProvider::new(primary.clone(), cheap, default_config());
 
@@ -2128,7 +2137,10 @@ mod tests {
         ));
         let cheap: Arc<dyn LlmProvider> = Arc::new(RetryProvider::new(
             cheap_inner.clone(),
-            RetryConfig { max_retries: 0 },
+            RetryConfig {
+                max_retries: 0,
+                ..RetryConfig::default()
+            },
         ));
         let router = SmartRoutingProvider::new(
             primary.clone(),
@@ -2194,7 +2206,10 @@ mod tests {
         ));
         let cheap: Arc<dyn LlmProvider> = Arc::new(RetryProvider::new(
             cheap_inner.clone(),
-            RetryConfig { max_retries: 0 },
+            RetryConfig {
+                max_retries: 0,
+                ..RetryConfig::default()
+            },
         ));
         let router = SmartRoutingProvider::new(primary.clone(), cheap, default_config())
             .with_telemetry(telemetry);
