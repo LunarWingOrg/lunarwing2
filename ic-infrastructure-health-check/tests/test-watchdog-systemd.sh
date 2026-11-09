@@ -187,6 +187,14 @@ oF4="$(run_wd "$f4" WD_CALL_LOG="$f4/calls" \
 assert_contains "$oF4" "no action" "F8: unreachable gateway (curl fail) -> no spurious restart"
 assert_eq "$(restarts "$f4")" "0" "F9: unreachable gateway -> zero restarts"
 
+f5="$(sb)"; mk_wd_mock "$f5"; wd_set "$f5" lunarwing.service active
+printf '%s\n' '{"channel_health":{"xmpp":{"healthy":true}},"channel_config_errors":{"multica":"required field multica_url is not configured"}}' > "$f5/gw.json"
+: > "$f5/calls"
+oF5="$(run_wd "$f5" WD_CALL_LOG="$f5/calls" WD_GATEWAY_JSON="$f5/gw.json" \
+    LUNARWING_WATCHDOG_GATEWAY_URL=http://127.0.0.1:1 LUNARWING_WATCHDOG_GATEWAY_TOKEN=t)"
+assert_contains "$oF5" "no action" "F10: config-only error -> no restart"
+assert_eq "$(restarts "$f5")" "0" "F11: config errors never trigger the runtime watchdog"
+
 # ── G: user scope routes every systemctl call to the user bus ─────────────────
 echo "=== Section G: systemd user scope ==="
 g="$(sb)"; mk_wd_mock "$g"; wd_set "$g" lunarwing.service inactive
