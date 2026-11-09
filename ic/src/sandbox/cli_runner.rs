@@ -1189,18 +1189,26 @@ fn storage_path_from_stderr(stderr: &str) -> Option<String> {
     Some(path.to_string())
 }
 
-/// Map a failed run's stderr to a typed error when it indicates a full storage
-/// filesystem, a missing image, a relay setup failure (proxy-enforced), or a
-/// runtime setup failure (mount/userns/resource-controller errors reported by
-/// the runtime CLI, exit 125).
+fn has_runtime_error_prefix(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.starts_with("error:") || lower.starts_with("docker: error")
+    })
+}
+
+/// Map runtime-originated failures to typed errors without attributing a
+/// sandboxed command's own stderr to the host container runtime.
 fn classify_run_failure(stderr: &str, image: &str, exit_code: i64) -> Option<SandboxError> {
-    if let Some(err) = classify_storage_failure(stderr) {
-        return Some(err);
-    }
     if stderr.contains("lunarwing-proxy-relay:") {
         return Some(SandboxError::ProxyError {
             reason: stderr.trim().into(),
         });
+    }
+    if exit_code != 125 || !has_runtime_error_prefix(stderr) {
+        return None;
+    }
+    if let Some(err) = classify_storage_failure(stderr) {
+        return Some(err);
     }
     if image_is_missing(stderr) {
         return Some(SandboxError::ImageUnavailable {
@@ -1208,14 +1216,7 @@ fn classify_run_failure(stderr: &str, image: &str, exit_code: i64) -> Option<San
             reason: stderr.trim().to_string(),
         });
     }
-    // Runtime setup failures are sandbox errors, not a successful invocation
-    // with an ordinary command exit code.
-    let lower = stderr.to_ascii_lowercase();
-    let runtime_error = exit_code == 125
-        && lower
-            .lines()
-            .any(|line| line.starts_with("error:") || line.starts_with("docker: error"));
-    runtime_error.then(|| SandboxError::ExecutionFailed {
+    Some(SandboxError::ExecutionFailed {
         reason: stderr.trim().into(),
     })
 }
