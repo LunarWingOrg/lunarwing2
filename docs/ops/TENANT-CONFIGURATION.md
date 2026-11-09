@@ -493,6 +493,32 @@ replace existing paths. Run an immediate pass with
 `refresh-knowledge <name> [--sync-source]`. Full guide:
 [`../guides/TENANT_KNOWLEDGE_SEED.md`](../guides/TENANT_KNOWLEDGE_SEED.md).
 
+## Sandbox Tunnel Networking (WI#248)
+
+`SANDBOX_NETWORK=tunnel` gives the generic shell sandbox outbound access to a
+NetBird or WireGuard overlay through a daemon-owned sidecar whose kernel
+firewall drops new inbound flows and every outbound flow that does not leave
+through the tunnel interface (the uplink, host loopback, other tenants and the
+cloud metadata service stay unreachable). It is opt-in per tenant; the
+multi-tenant default stays `SANDBOX_NETWORK=none`.
+
+```bash
+SANDBOX_NETWORK=tunnel
+SANDBOX_TUNNEL_PROVIDER=netbird                      # netbird (default) | wireguard
+SANDBOX_TUNNEL_IMAGE=localhost/lunarwing-tunnel-netbird:latest   # must include nft + provider tools
+SANDBOX_TUNNEL_NETBIRD_MANAGEMENT_URL=https://netbird.example.com
+SANDBOX_TUNNEL_NETBIRD_SETUP_KEY=<dedicated-setup-key>           # secret
+SANDBOX_TUNNEL_WIREGUARD_CONFIG=/etc/lunarwing/tenants/<tenant>/wg0.conf  # wireguard: mode 0600
+SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS=90
+```
+
+`add-tenant` renders none of these; `upgrade-tenant` and every other
+re-render preserve each operator-set value verbatim, so a tenant that opted in
+keeps starting. With the multi-tenant default `SANDBOX_AUTO_PULL=false` the
+sidecar image must already be in the tenant's container store (build it into
+the store the same way as the sandbox image). Operator guide:
+[`../guides/SANDBOX_TUNNEL_NETWORKING.md`](../guides/SANDBOX_TUNNEL_NETWORKING.md).
+
 ## Runtime Behavior
 
 ```bash

@@ -1422,6 +1422,18 @@ write_tenant_lunarwing_env() {
   local sandbox_tenant_logs
   sandbox_tenant_logs="$(_env_existing "$env_snapshot" SANDBOX_TENANT_LOGS)"
   sandbox_tenant_logs="${sandbox_tenant_logs:-info}"
+  # Sandbox tunnel sidecar (WI#248): the SANDBOX_NETWORK=tunnel knobs are
+  # opt-in, have no rendered defaults, and are preserved verbatim on re-render
+  # (the daemon refuses to start in tunnel mode without them). The setup key
+  # is a secret; the env file is written mode 0600.
+  local sandbox_tunnel_provider sandbox_tunnel_image sandbox_tunnel_netbird_management_url
+  local sandbox_tunnel_netbird_setup_key sandbox_tunnel_wireguard_config sandbox_tunnel_startup_timeout_secs
+  sandbox_tunnel_provider="$(_env_existing "$env_snapshot" SANDBOX_TUNNEL_PROVIDER)"
+  sandbox_tunnel_image="$(_env_existing "$env_snapshot" SANDBOX_TUNNEL_IMAGE)"
+  sandbox_tunnel_netbird_management_url="$(_env_existing "$env_snapshot" SANDBOX_TUNNEL_NETBIRD_MANAGEMENT_URL)"
+  sandbox_tunnel_netbird_setup_key="$(_env_existing "$env_snapshot" SANDBOX_TUNNEL_NETBIRD_SETUP_KEY)"
+  sandbox_tunnel_wireguard_config="$(_env_existing "$env_snapshot" SANDBOX_TUNNEL_WIREGUARD_CONFIG)"
+  sandbox_tunnel_startup_timeout_secs="$(_env_existing "$env_snapshot" SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS)"
 
   # Sensible new-tenant defaults (WI#239): each of these is written into the
   # rendered lunarwing.env with the value below UNLESS the operator has
@@ -1782,6 +1794,24 @@ ENVEOF
       || printf 'KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN=%s\n' "$knowledge_sync_max_records" >> "$staged_env"
     [[ -z "$knowledge_sync_max_bytes" ]] \
       || printf 'KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN=%s\n' "$knowledge_sync_max_bytes" >> "$staged_env"
+  fi
+  # Sandbox tunnel sidecar (WI#248): rendered only when the operator opted in;
+  # every value is carried verbatim so a re-render never leaves a tunnel-mode
+  # tenant without its provider settings.
+  if [[ -n "${sandbox_tunnel_provider}${sandbox_tunnel_image}${sandbox_tunnel_netbird_management_url}${sandbox_tunnel_netbird_setup_key}${sandbox_tunnel_wireguard_config}${sandbox_tunnel_startup_timeout_secs}" ]]; then
+    printf '\n# Sandbox tunnel sidecar (WI#248, SANDBOX_NETWORK=tunnel); preserved on re-render.\n# See docs/guides/SANDBOX_TUNNEL_NETWORKING.md. The setup key is a secret.\n' >> "$staged_env"
+    [[ -z "$sandbox_tunnel_provider" ]] \
+      || printf 'SANDBOX_TUNNEL_PROVIDER=%s\n' "$sandbox_tunnel_provider" >> "$staged_env"
+    [[ -z "$sandbox_tunnel_image" ]] \
+      || printf 'SANDBOX_TUNNEL_IMAGE=%s\n' "$(_quote_env_value "$sandbox_tunnel_image")" >> "$staged_env"
+    [[ -z "$sandbox_tunnel_netbird_management_url" ]] \
+      || printf 'SANDBOX_TUNNEL_NETBIRD_MANAGEMENT_URL=%s\n' "$(_quote_env_value "$sandbox_tunnel_netbird_management_url")" >> "$staged_env"
+    [[ -z "$sandbox_tunnel_netbird_setup_key" ]] \
+      || printf 'SANDBOX_TUNNEL_NETBIRD_SETUP_KEY=%s\n' "$(_quote_env_value "$sandbox_tunnel_netbird_setup_key")" >> "$staged_env"
+    [[ -z "$sandbox_tunnel_wireguard_config" ]] \
+      || printf 'SANDBOX_TUNNEL_WIREGUARD_CONFIG=%s\n' "$(_quote_env_value "$sandbox_tunnel_wireguard_config")" >> "$staged_env"
+    [[ -z "$sandbox_tunnel_startup_timeout_secs" ]] \
+      || printf 'SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS=%s\n' "$sandbox_tunnel_startup_timeout_secs" >> "$staged_env"
   fi
   if ! write_tenant_file_atomic "$name" "$path" 600 <"$staged_env"; then
     rm -f -- "$staged_env" "$env_snapshot" "$vision_snapshot" "$voice_snapshot"
