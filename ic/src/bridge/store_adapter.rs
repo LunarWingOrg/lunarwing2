@@ -2952,6 +2952,74 @@ mod tests {
     #[cfg(feature = "libsql")]
     #[tokio::test]
     #[traced_test]
+    async fn missing_mission_field_warns_with_allowlisted_name_at_boot() {
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("missing-mission-field-warn", db));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let project = Project::new("test-user", "warn project", "test");
+        let mission = Mission::new(
+            project.id,
+            "test-user",
+            "incomplete-mission",
+            "private goal text",
+            lunarwing_engine::MissionCadence::Manual,
+        );
+        store.save_project(&project).await.expect("save project");
+        store.save_mission(&mission).await.expect("save mission");
+        let path = mission_path(
+            &store.project_slug(project.id).await,
+            &mission.name,
+            mission.id,
+        );
+        let mut raw: serde_json::Value = serde_json::from_str(
+            &workspace
+                .read_primary(&path)
+                .await
+                .expect("read mission")
+                .content,
+        )
+        .expect("mission json");
+        raw.as_object_mut()
+            .expect("mission should be an object")
+            .remove("goal");
+        workspace
+            .write(&path, &raw.to_string())
+            .await
+            .expect("write incomplete mission");
+
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded
+            .load_state_from_workspace()
+            .await
+            .expect("reload engine state");
+        assert!(
+            reloaded
+                .load_mission(mission.id)
+                .await
+                .expect("load")
+                .is_none()
+        );
+
+        let mission_id = mission.id.0.to_string();
+        logs_assert(|lines: &[&str]| {
+            assert_logged_at(
+                lines,
+                "WARN",
+                &[
+                    "dropping mission: failed to parse",
+                    &mission_id,
+                    &path,
+                    "error_kind=data",
+                    "missing_field=\"goal\"",
+                ],
+            )?;
+            assert_no_log_carries_at_or_above(lines, "private goal text", "WARN")
+        });
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    #[traced_test]
     async fn non_json_mission_file_warns_instead_of_vanishing() {
         // OA-7: the syntax-error path is distinct from a schema-invalid JSON
         // document and must also warn at boot with its operator-facing path.
