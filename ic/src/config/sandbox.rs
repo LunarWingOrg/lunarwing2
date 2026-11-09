@@ -16,8 +16,8 @@ pub struct SandboxModeConfig {
     pub policy: String,
     /// Container runtime CLI: "auto" (podman preferred), "podman", or "docker".
     pub runtime: String,
-    /// Network egress mode for sandboxed policies: "proxy-enforced"
-    /// (default; isolated allowlist web access), "none" (no egress), "tunnel"
+    /// Network egress mode: "proxy-enforced" (Linux default; isolated
+    /// allowlist web access), "none" (default elsewhere; no egress), "tunnel"
     /// (egress-only NetBird/WireGuard sidecar), or legacy advisory "proxy".
     pub network: String,
     /// Force sandboxed shell execution even in dev mode (ALLOW_LOCAL_TOOLS).
@@ -118,7 +118,9 @@ impl Default for SandboxModeConfig {
             enabled: true,
             policy: "readonly".to_string(),
             runtime: "auto".to_string(),
-            network: "proxy-enforced".to_string(),
+            network: crate::sandbox::SandboxNetworkMode::default()
+                .as_str()
+                .to_string(),
             enforce: false,
             allow_full_access: false,
             timeout_secs: 120,
@@ -943,7 +945,10 @@ mod tests {
         let cfg = SandboxModeConfig::default();
         assert!(cfg.enabled);
         assert_eq!(cfg.policy, "readonly");
-        assert_eq!(cfg.network, "proxy-enforced");
+        assert_eq!(
+            cfg.network,
+            crate::sandbox::SandboxNetworkMode::default().as_str()
+        );
         assert_eq!(cfg.timeout_secs, 120);
         assert_eq!(cfg.memory_limit_mb, 2048);
         assert_eq!(cfg.cpu_shares, 1024);
@@ -1041,7 +1046,7 @@ mod tests {
         let default_cfg = SandboxModeConfig::default().to_sandbox_config();
         assert_eq!(
             default_cfg.network,
-            crate::sandbox::SandboxNetworkMode::ProxyEnforced
+            crate::sandbox::SandboxNetworkMode::default()
         );
 
         let no_egress = SandboxModeConfig {
