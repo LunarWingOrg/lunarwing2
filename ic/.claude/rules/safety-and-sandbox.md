@@ -38,12 +38,13 @@ runtime or image is unavailable, commands error with a structured
 
 ## Network Egress Tiers
 
-- `none`: `--network none` — kernel-enforced isolation, no egress, no proxy.
-- `proxy-enforced` (default; WI#155/537): container keeps `--network none`; the only egress
+- `none` (default off Linux): `--network none` — kernel-enforced isolation, no egress, no proxy.
+- `proxy-enforced` (Linux default; WI#155/537): container keeps `--network none`; the only egress
   path is a per-execution Unix-socket relay to the validating proxy (public-only,
   DNS-pinned, redirect rechecked). Requires a local Linux runtime and Python 3
   in the image; relay setup failures fail closed (`[sandbox:proxy_error]`),
-  never degrade to advisory or direct egress.
+  never degrade to advisory or direct egress. This mode has no credential
+  mappings and must not inject daemon secrets.
 - `tunnel` (WI#248): runs join a NetBird/WireGuard sidecar netns while keeping
   every hardening flag. Mandatory sidecar `nftables` chains drop new inbound
   flows (never an inbound listener) and every outbound flow that does not
@@ -58,10 +59,11 @@ runtime or image is unavailable, commands error with a structured
 - `proxy`: legacy allowlist HTTP proxy + credential injection. **Advisory** —
   enforced via env vars, which a process may ignore.
 
-**Default (WI#537):** the in-code default and new mt-admin-rendered tenants use
-`proxy-enforced`. mt-admin preserves every operator-set value on re-render:
-`none`, `proxy-enforced`, `tunnel`, or legacy advisory `proxy`. Never make
-advisory `proxy` or a bridged network the default. The enforced relay is the
+**Default (WI#537):** on Linux the in-code default and new mt-admin-rendered
+tenants use `proxy-enforced`; other platforms default to `none`. mt-admin
+preserves every operator-set value on re-render: `none`, `proxy-enforced`,
+`tunnel`, or legacy advisory `proxy`. Never make advisory `proxy` or a bridged
+network the default. The enforced relay is the
 only egress path to the public-only proxy; its socket lives under
 `$XDG_RUNTIME_DIR` when available so it stays visible to both a `PrivateTmp`
 daemon and manager-forked workload namespaces.
