@@ -1,13 +1,15 @@
 //! Generic execution sandbox for secure command execution (podman-first).
 //!
 //! This module provides a complete sandboxing solution for running untrusted commands:
-//! - **Network proxy**: `none` (default) disables egress entirely; `proxy-enforced`
-//!   keeps `--network none` and exposes only a per-execution Unix relay to the
-//!   validating public-only proxy (WI#155); legacy `proxy` mode routes traffic
-//!   through the validating proxy advisory (env-var based); `tunnel` joins a
-//!   NetBird/WireGuard sidecar's network namespace whose nftables policy
-//!   confines egress to the tunnel interface (WI#248)
-//! - **Credential injection**: Secrets are injected by the proxy, never exposed in containers
+//! - **Network proxy**: `proxy-enforced` (Linux default) keeps `--network none`
+//!   and exposes only a per-execution Unix relay to the validating public-only
+//!   proxy (WI#155); `none` (default elsewhere) disables egress entirely;
+//!   legacy `proxy` mode routes traffic through the validating proxy advisory
+//!   (env-var based); `tunnel` joins a NetBird/WireGuard sidecar's network
+//!   namespace whose nftables policy confines egress to the tunnel interface
+//!   (WI#248)
+//! - **Credential injection**: only legacy `proxy` mode injects secrets;
+//!   `proxy-enforced` has no credential mappings
 //! - **Resource limits**: Memory, CPU, and timeout enforcement
 //!
 //! # BOUNDARY: generic sandbox vs. orchestrator worker containers

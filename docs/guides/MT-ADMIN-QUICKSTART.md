@@ -18,13 +18,13 @@ repass added the v2.1.4.0 (WI#268) read-only diagnostics verbs `psql` and
 required tenant LLM endpoint in §3 and the (WI#376) OpenRC
 `render-units --all-proxies` fleet migration command in §8; the 2026-10-15
 re-check added the (WI#357) `worker-listeners` exposure audit to §8's
-read-only inspection verbs. **Migration note
-(WI#154/155):** `SANDBOX_NETWORK` defaults to `none` everywhere. Existing
-explicit `proxy` settings are preserved (mt-admin renders `none` only when
-unset). Tenants that need sandboxed web access must opt into `proxy-enforced`
-(enforced; local Linux runtime + Python-3 image required) or the legacy
-advisory `proxy`. See
-[`../ops/history/v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md`](../ops/history/v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md).
+read-only inspection verbs. **Migration note (WI#537):** new tenant envs
+default to `SANDBOX_NETWORK=proxy-enforced`, giving standard web access through
+the enforced public-only allowlist relay (local Linux runtime + Python-3 image
+required). mt-admin fills the value only when unset and preserves an existing
+`none`, `proxy-enforced`, `tunnel`, or legacy advisory `proxy` on re-render.
+Select `none` to disable all egress. See `ic/src/NETWORK_SECURITY.md` §5 for the
+tier table and default allowlist.
 
 For per-tenant instructions and identity editing, use the gateway's
 **Settings → System Prompt** panel. See [Tenant System Prompts](TENANT-SYSTEM-PROMPTS.md)
@@ -167,7 +167,7 @@ sudo ic/scripts/lunarwing-mt-admin.sh build-kimi-worker
 sudo ic/scripts/lunarwing-mt-admin.sh build-vision-sidecar
 ```
 
-Since v2.1.3.0 (WI#223) new tenants default to `SANDBOX_IMAGE=lunarwing-sandbox:latest` with `SANDBOX_RUNTIME=podman` and `SANDBOX_AUTO_PULL=false`. `add-tenant` builds the lean generic sandbox image (from `ic/docker/sandbox.Dockerfile`) into the shared rootful store and distributes it into the tenant's rootless store automatically; if that step failed or the image was later removed, rebuild and redistribute it explicitly (optional tenant name selects that tenant's configured runtime):
+Since v2.1.3.0 (WI#223) new tenants default to `SANDBOX_IMAGE=lunarwing-sandbox:latest` with `SANDBOX_RUNTIME=podman` and `SANDBOX_AUTO_PULL=false`. `add-tenant` builds the managed generic sandbox image (from `ic/docker/sandbox.Dockerfile`, including the WI#537 pinned Python development suite) into the shared rootful store and distributes it into the tenant's rootless store automatically; if that step failed or the image was later removed, rebuild and redistribute it explicitly (optional tenant name selects that tenant's configured runtime):
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh build-sandbox-image [tenant]

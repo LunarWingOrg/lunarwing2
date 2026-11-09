@@ -8,15 +8,17 @@ LAN, the cloud metadata service or the public internet through the sidecar's
 own uplink. Design and alternatives:
 `docs/proposals/PODMAN_SANDBOX_TUNNEL_NETWORKING.md`.
 
-The default remains `none`. Existing `none` / `proxy-enforced` / `proxy`
-behavior and all per-command sandbox hardening are unchanged.
+WI#537 selects `proxy-enforced` as the Linux default; other platforms default
+to `none`, and `tunnel` remains an explicit opt-in. Existing `none` /
+`proxy-enforced` / `proxy` behavior and all per-command sandbox hardening are
+unchanged, and mt-admin preserves every operator-set tier on re-render.
 
 ## Tier selection
 
 | `SANDBOX_NETWORK` | Intended use | Boundary |
 |---|---|---|
-| `none` (default) | no network | kernel-enforced `--network none` |
-| `proxy-enforced` | allowlisted **public** HTTP(S) | network-none plus Unix relay to the validating proxy |
+| `none` (default off Linux) | no network | kernel-enforced `--network none` |
+| `proxy-enforced` (Linux default) | allowlisted **public** HTTP(S) | network-none plus Unix relay to the validating proxy; no credential injection |
 | `tunnel` | NetBird/WireGuard overlay egress | kernel-enforced nftables policy in the sidecar netns: new inbound dropped; outbound only through the tunnel interface, plus the tunnel's own marked control traffic and DNS to the sidecar's resolvers on the uplink |
 | `proxy` | legacy public HTTP(S) | advisory env-var proxy; direct bypass remains possible |
 
