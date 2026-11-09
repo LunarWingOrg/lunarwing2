@@ -42,6 +42,8 @@ impl LlmConfig {
             cheap_model: None,
             smart_routing_cascade: false,
             max_retries: 0,
+            empty_stream_retry_input_token_budget:
+                crate::llm::retry::DEFAULT_EMPTY_STREAM_RETRY_INPUT_TOKEN_BUDGET,
             circuit_breaker_threshold: None,
             circuit_breaker_recovery_secs: 30,
             response_cache_enabled: false,
@@ -211,6 +213,11 @@ impl LlmConfig {
             })?
             .unwrap_or(lunarwing_cloud.max_retries);
 
+        let empty_stream_retry_input_token_budget = parse_optional_env(
+            "LLM_EMPTY_STREAM_RETRY_INPUT_TOKEN_BUDGET",
+            crate::llm::retry::DEFAULT_EMPTY_STREAM_RETRY_INPUT_TOKEN_BUDGET,
+        )?;
+
         let circuit_breaker_threshold = optional_env("LLM_CIRCUIT_BREAKER_THRESHOLD")?
             .map(|s| s.parse::<u32>())
             .transpose()
@@ -272,6 +279,7 @@ impl LlmConfig {
             cheap_model,
             smart_routing_cascade,
             max_retries,
+            empty_stream_retry_input_token_budget,
             circuit_breaker_threshold,
             circuit_breaker_recovery_secs,
             response_cache_enabled,
@@ -980,6 +988,39 @@ mod tests {
         // SAFETY: Under ENV_MUTEX.
         unsafe {
             std::env::remove_var("LLM_MAX_RETRIES");
+        }
+    }
+
+    #[test]
+    fn llm_empty_stream_retry_input_token_budget_is_configurable() {
+        let _guard = lock_env();
+        use_loopback_cloud_urls();
+        const KEY: &str = "LLM_EMPTY_STREAM_RETRY_INPUT_TOKEN_BUDGET";
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::remove_var(KEY);
+        }
+
+        let cfg = LlmConfig::resolve(&Settings::default()).expect("resolve");
+        assert_eq!(cfg.empty_stream_retry_input_token_budget, 100_000);
+
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var(KEY, "250000");
+        }
+        let cfg = LlmConfig::resolve(&Settings::default()).expect("resolve");
+        assert_eq!(cfg.empty_stream_retry_input_token_budget, 250_000);
+
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var(KEY, "not_a_number");
+        }
+        let err = LlmConfig::resolve(&Settings::default()).unwrap_err();
+        assert!(err.to_string().contains(KEY));
+
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::remove_var(KEY);
         }
     }
 
