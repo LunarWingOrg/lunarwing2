@@ -155,14 +155,21 @@ mod tests {
     }
 
     #[test]
-    fn default_enforced_proxy_has_no_credential_mappings() {
-        let config = SandboxConfig::default();
-        assert_eq!(
-            config.network,
-            crate::sandbox::SandboxNetworkMode::ProxyEnforced
-        );
-        let builder = NetworkProxyBuilder::from_config(&config);
-        assert!(builder.credential_mappings.is_empty());
+    fn default_and_enforced_proxies_have_no_credential_mappings() {
+        for network in [
+            crate::sandbox::SandboxNetworkMode::default(),
+            crate::sandbox::SandboxNetworkMode::ProxyEnforced,
+        ] {
+            let config = SandboxConfig {
+                network,
+                ..SandboxConfig::default()
+            };
+            let builder = NetworkProxyBuilder::from_config(&config);
+            assert!(
+                builder.credential_mappings.is_empty(),
+                "{network:?} must not inject daemon credentials"
+            );
+        }
     }
 
     #[test]
