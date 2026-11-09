@@ -405,10 +405,10 @@ Commands:
     --no-cache                     Force a full rebuild without Docker cache
     --with-toolchains              Include Rust/Go/C++ toolchains (default: slim)
 
-  build-sandbox-image [name]       Build the lean generic sandbox image
-                                    (lunarwing-sandbox:latest from
-                                    ic/docker/sandbox.Dockerfile; optional
-                                    tenant selects its configured runtime)
+  build-sandbox-image [name]       Build the managed generic sandbox image
+                                    (lunarwing-sandbox:latest with the pinned
+                                    Python development suite; optional tenant
+                                    selects its configured runtime)
   build-vision-sidecar             Build the LunarVision OCR sidecar Docker image
   configure-vision-external <name> Use an operator-managed remote LunarVision instance
     --url <https-origin>             Base origin routing API and health endpoints
