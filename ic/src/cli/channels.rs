@@ -61,6 +61,7 @@ struct ChannelInfo {
 #[derive(serde::Deserialize)]
 struct GatewayStatusResponse {
     channel_health: Option<std::collections::HashMap<String, ChannelHealthEntry>>,
+    channel_config_errors: Option<std::collections::HashMap<String, String>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -69,46 +70,126 @@ struct ChannelHealthEntry {
     error: Option<String>,
 }
 
-/// Fetch failed runtime channels when the local gateway is configured and reachable.
+#[derive(Debug)]
+pub(crate) enum GatewayChannelState {
+    NotConfigured,
+    Unavailable,
+    Loaded(std::collections::HashMap<String, String>),
+}
+
+impl GatewayChannelState {
+    pub(crate) fn errors(&self) -> Option<&std::collections::HashMap<String, String>> {
+        match self {
+            Self::Loaded(errors) => Some(errors),
+            Self::NotConfigured | Self::Unavailable => None,
+        }
+    }
+
+    pub(crate) fn is_unavailable(&self) -> bool {
+        matches!(self, Self::Unavailable)
+    }
+}
+
+fn sanitize_gateway_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(200)
+        .collect()
+}
+
+fn local_gateway_status_url(host: &str, port: u16) -> Option<String> {
+    let host = host.trim();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    if host.eq_ignore_ascii_case("localhost") {
+        return Some(format!("http://localhost:{port}/api/gateway/status"));
+    }
+
+    let ip = match host.parse::<std::net::IpAddr>().ok()? {
+        std::net::IpAddr::V4(address) if address.is_unspecified() => {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        }
+        std::net::IpAddr::V6(address) if address.is_unspecified() => {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        }
+        address => address,
+    };
+    let host = match ip {
+        std::net::IpAddr::V4(address) if address.is_loopback() => address.to_string(),
+        std::net::IpAddr::V6(address) if address.is_loopback() => format!("[{address}]"),
+        _ => return None,
+    };
+    Some(format!("http://{host}:{port}/api/gateway/status"))
+}
+
+fn failed_channels_from_status(
+    status: GatewayStatusResponse,
+) -> std::collections::HashMap<String, String> {
+    let mut errors: std::collections::HashMap<String, String> = status
+        .channel_health
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, entry)| !entry.healthy)
+        .map(|(name, entry)| {
+            let error = entry
+                .error
+                .unwrap_or_else(|| "channel failed to start; see daemon logs".to_string());
+            (sanitize_gateway_text(&name), sanitize_gateway_text(&error))
+        })
+        .collect();
+    for (name, error) in status.channel_config_errors.unwrap_or_default() {
+        errors.insert(sanitize_gateway_text(&name), sanitize_gateway_text(&error));
+    }
+    errors
+}
+
+/// Fetch failed channels when a loopback gateway is configured and reachable.
 pub(crate) async fn gateway_channel_errors(
     config: &crate::config::ChannelsConfig,
-) -> Option<std::collections::HashMap<String, String>> {
-    let gateway = config.gateway.as_ref()?;
+) -> GatewayChannelState {
+    let Some(gateway) = config.gateway.as_ref() else {
+        return GatewayChannelState::NotConfigured;
+    };
     let token = gateway
         .auth_token
         .as_deref()
         .filter(|token| !token.trim().is_empty())
         .map(str::to_string)
-        .or_else(|| std::env::var("GATEWAY_AUTH_TOKEN").ok())?;
-    let endpoint = format!(
-        "http://{}:{}/api/gateway/status",
-        gateway.host, gateway.port
-    );
-    let response = reqwest::Client::new()
+        .or_else(|| {
+            std::env::var("GATEWAY_AUTH_TOKEN")
+                .ok()
+                .filter(|token| !token.trim().is_empty())
+        });
+    let Some(token) = token else {
+        return GatewayChannelState::NotConfigured;
+    };
+    let Some(endpoint) = local_gateway_status_url(&gateway.host, gateway.port) else {
+        return GatewayChannelState::Unavailable;
+    };
+    let Ok(client) = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    else {
+        return GatewayChannelState::Unavailable;
+    };
+    let response = match client
         .get(endpoint)
         .bearer_auth(token.trim())
         .timeout(std::time::Duration::from_secs(3))
         .send()
         .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
+    {
+        Ok(response) if response.status().is_success() => response,
+        _ => return GatewayChannelState::Unavailable,
+    };
+    match response.json::<GatewayStatusResponse>().await {
+        Ok(status) => GatewayChannelState::Loaded(failed_channels_from_status(status)),
+        Err(_) => GatewayChannelState::Unavailable,
     }
-    let status = response.json::<GatewayStatusResponse>().await.ok()?;
-    Some(
-        status
-            .channel_health
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|(_, entry)| !entry.healthy)
-            .map(|(name, entry)| {
-                let error = entry
-                    .error
-                    .unwrap_or_else(|| "channel failed to start; see daemon logs".to_string());
-                (name, error)
-            })
-            .collect(),
-    )
 }
 
 fn builtin_channels(config: &crate::config::ChannelsConfig) -> Vec<ChannelInfo> {
@@ -207,15 +288,14 @@ async fn cmd_list(
         }
     }
 
-    let runtime_errors = gateway_channel_errors(config).await;
+    let runtime_state = gateway_channel_errors(config).await;
+    let runtime_errors = runtime_state.errors();
 
     if json {
         let entries: Vec<serde_json::Value> = channels
             .iter()
             .map(|channel| {
-                let error = runtime_errors
-                    .as_ref()
-                    .and_then(|errors| errors.get(&channel.name));
+                let error = runtime_errors.and_then(|errors| errors.get(&channel.name));
                 channel_to_json(channel, verbose, error)
             })
             .collect();
@@ -224,7 +304,14 @@ async fn cmd_list(
             serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string())
         );
     } else {
-        print_channels_text(&channels, verbose, runtime_errors.as_ref());
+        print_channels_text(&channels, verbose, runtime_errors);
+    }
+    if runtime_state.is_unavailable() {
+        if json {
+            eprintln!("gateway not reachable; runtime state unknown");
+        } else {
+            println!("\n(gateway not reachable; runtime state unknown)");
+        }
     }
 
     Ok(())
@@ -411,7 +498,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gateway_channel_errors_reads_failed_health_over_http() {
+    async fn gateway_channel_errors_reads_health_and_config_over_http() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test gateway");
@@ -421,11 +508,14 @@ mod tests {
             axum::routing::get(|| async {
                 axum::Json(serde_json::json!({
                     "channel_health": {
-                        "multica": {
+                        "weechat": {
                             "healthy": false,
-                            "error": "Channel multica failed to start: required field 'multica_url' is not configured"
+                            "error": "Channel weechat failed to start; see daemon logs"
                         },
                         "xmpp": { "healthy": true }
+                    },
+                    "channel_config_errors": {
+                        "multica": "invalid multica config: required field 'multica_url' is not configured"
                     }
                 }))
             }),
@@ -459,16 +549,50 @@ mod tests {
             tool_activity: false,
         };
 
-        let errors = gateway_channel_errors(&config)
-            .await
-            .expect("gateway health response");
+        let errors = match gateway_channel_errors(&config).await {
+            GatewayChannelState::Loaded(errors) => errors,
+            state => panic!("expected gateway health response, got {state:?}"),
+        };
         server.abort();
-        assert_eq!(errors.len(), 1);
+        assert_eq!(errors.len(), 2);
         assert!(
             errors["multica"].contains("multica_url"),
             "{}",
             errors["multica"]
         );
+        assert!(errors["weechat"].contains("see daemon logs"));
+    }
+
+    #[test]
+    fn gateway_urls_stay_on_loopback_and_normalize_unspecified_binds() {
+        assert_eq!(
+            local_gateway_status_url("0.0.0.0", 3000).as_deref(),
+            Some("http://127.0.0.1:3000/api/gateway/status")
+        );
+        assert_eq!(
+            local_gateway_status_url("::", 3000).as_deref(),
+            Some("http://[::1]:3000/api/gateway/status")
+        );
+        assert_eq!(
+            local_gateway_status_url("[::1]", 3000).as_deref(),
+            Some("http://[::1]:3000/api/gateway/status")
+        );
+        assert_eq!(
+            local_gateway_status_url("localhost", 3000).as_deref(),
+            Some("http://localhost:3000/api/gateway/status")
+        );
+        assert_eq!(local_gateway_status_url("example.com", 3000), None);
+        assert_eq!(local_gateway_status_url("192.168.1.10", 3000), None);
+        assert_eq!(local_gateway_status_url("2001:db8::1", 3000), None);
+    }
+
+    #[test]
+    fn gateway_text_is_control_free_and_bounded() {
+        let input = format!("prefix\u{1b}[31m\n{}", "x".repeat(220));
+        let sanitized = sanitize_gateway_text(&input);
+        assert_eq!(sanitized.chars().count(), 200);
+        assert!(!sanitized.contains('\u{1b}'));
+        assert!(!sanitized.contains('\n'));
     }
 
     #[test]
