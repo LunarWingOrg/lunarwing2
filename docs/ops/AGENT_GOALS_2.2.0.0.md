@@ -77,7 +77,10 @@ Items 3–4 cover the sandbox theme; items 5–6 cover LunarDepth.
 ## Phase 5 - Misc Operations (ALWAYS READ ALL COMMENTS FOR EACH WORK ITEM WHEN A WORK ITEM IS REFERENCED - ALSO ALWAYS READ LINKED WORK ITEMS FOR EACH WORK ITEM REFERENCED)
 
 9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/577
-10. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/574
+10. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/574
+    - **DONE — Rarity, 2026-11-09:** the OpenRC installer retains the existing account-name fast path and refusal message, then checks the resolved account's uid before primary-group resolution. Any uid-0 alias now requires `LUNARWING_ALLOW_ROOT_SERVICE=1`; non-root accounts and the explicit opt-in remain accepted, and unknown users still fail closed.
+    - **Coverage/docs:** added a pure uid-based regression test for a non-`root` uid-0 alias, its opt-in, and a non-root uid; updated `ic/src/setup/README.md` to describe the uid-0 runtime-identity refusal.
+    - **Verified:** `taskset -c 0-17 cargo test -j18 --locked --lib service:: -- --test-threads=18` passed **24/24**; `taskset -c 0-17 cargo clippy -j18 --locked --lib --tests -- -D warnings`, `cargo fmt --all -- --check`, and the committed-diff whitespace check all passed.
 11. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/587
 12. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/576
 13. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/578
