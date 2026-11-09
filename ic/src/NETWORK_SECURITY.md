@@ -2,7 +2,7 @@
 
 This document catalogs every network-facing surface in LunarWing, its authentication mechanism, bind address, security controls, and known findings. Use this as the authoritative reference during code reviews that touch network-facing code.
 
-**Last updated:** 2026-11-07 (Unix-socket REPL and sandbox socket hardening)
+**Last updated:** 2026-11-09 (egress-only sandbox tunnel networking, WI#248)
 
 ---
 
@@ -401,6 +401,7 @@ Sandboxed policies (`readonly`, `workspace_write`) select an egress mode via
 |------|-----------|-------------|
 | `none` (default) | `--network none` on the container | **Kernel-enforced** — no egress at all; the proxy is not started |
 | `proxy-enforced` (WI#155) | Container keeps `--network none`; egress only through a per-execution **Unix-socket relay** to the allowlist proxy | **Enforced** — no direct egress path exists anywhere (loopback included); the proxy rejects non-public destinations and pins DNS |
+| `tunnel` (WI#248) | Commands join a NetBird/WireGuard sidecar netns; sidecar `nft` input policy drops all non-loopback new inbound flows | **Egress-only** — return traffic and tunnel routes/ACLs only; full-route tunnel confines outbound to the overlay, split tunnel retains direct uplink |
 | `proxy` | HTTP proxy + `http_proxy`/`https_proxy` env vars in the container | **Advisory (legacy)** — a process that ignores proxy env vars can still egress directly |
 
 **Default policy (WI#154/155, v2.1.2.0):** the in-code default and mt-admin
@@ -424,6 +425,29 @@ socket relay to the public-only validating proxy:
   to the resolved public addresses for both HTTP forwarding and CONNECT.
   Redirects are not followed on the host; environment proxies cannot bypass
   DNS pinning.
+
+The opt-in `tunnel` mode (WI#248) is separate from both the gateway's inbound
+`src/tunnel/` abstraction and external-worker exposure. One daemon-owned
+sidecar establishes NetBird or kernel WireGuard; one-shot commands join only
+its network namespace and retain every existing hardening flag. There are no
+published ports or host-network joins. A required sidecar `nftables` input
+chain has policy `drop`, accepts loopback and `established,related` return
+traffic, and is verified to contain no other accept rules before every run.
+Joiners have no `NET_ADMIN` and cannot change it. Thus a sandbox process cannot
+bind an inbound service to the LAN or overlay (WI#357).
+
+The manager health-gates sidecar startup and rechecks provider health,
+configuration hash, and that firewall before each execution. Missing `nft`, an
+unhealthy provider, or an altered/missing chain returns
+`[sandbox:sandbox_unavailable]` without degrading to another tier. NetBird
+management URL/setup key travel through an atomically created mode-0600
+`--env-file`; WireGuard uses a regular non-symlink mode-0600 config mounted
+read-only. Key material never enters argv, joiner filesystems/environments, or
+LunarWing log/error text. Full-route WireGuard `AllowedIPs` or NetBird default
+routes confine outbound traffic to the overlay; split tunnels intentionally
+retain the ordinary uplink for other outbound destinations. See
+`docs/guides/SANDBOX_TUNNEL_NETWORKING.md` and
+`docs/proposals/PODMAN_SANDBOX_TUNNEL_NETWORKING.md`.
 
 The advisory `proxy` mode remains supported for single-node backwards
 compatibility but is no longer any default.
@@ -551,7 +575,7 @@ Containers that the generic sandbox spawns (`podman run`/`docker run`) are confi
 | Seccomp | Runtime default profile (podman/docker default seccomp) — **supported contract**, no custom profile | this document |
 | Workspace mount | Policy-selected `ro`/`rw` + SELinux relabel (`,z`) | `src/sandbox/cli_runner.rs` — `build_run_args()` |
 | Daemon log mount | `/tenant-logs`, **always `ro`**: the daemon's own secret-scrubbed log copy (`<base>/logs/sandbox/`), daemon-chosen and vetted to expose no protected path (WI#287). Mounted only when `SANDBOX_TENANT_LOGS` is not `off` and the runtime maps the sandbox user onto the daemon uid (docker; podman ≥ 5; podman 4.3+ when the daemon uid is 1000). The copy is capped at INFO, or at DEBUG with `SANDBOX_TENANT_LOGS=debug` | `src/sandbox/mount_guard.rs` — `tenant_logs_mount_source()`; `src/sandbox/cli_runner.rs` — `daemon_owned_mounts_readable()`; `src/tracing_fmt.rs` — `SandboxLogWriter`, `sandbox_log_cap()` |
-| Network | Proxy mode (allowlist) or `none` | `src/sandbox/cli_runner.rs`, this document above |
+| Network | `none`, public-only `proxy-enforced`, egress-only `tunnel`, or legacy advisory `proxy` | `src/sandbox/cli_runner.rs`, `src/sandbox/tunnel_sidecar.rs`, this document above |
 | Tmpfs | `/tmp` (512 MB), `/home/sandbox/.cargo/registry` (1 GB) | `src/sandbox/cli_runner.rs` — `build_run_args()` |
 | Auto-remove | `--rm` + kill-by-name on timeout **and on cancellation** (drop guard) + reaper sweep | `src/sandbox/cli_runner.rs` — `run_container()`, `ContainerCleanupGuard`; `src/orchestrator/reaper.rs` |
 | Labels | `lunarwing.sandbox=<RFC3339 created>` for the reaper | `src/sandbox/cli_runner.rs` — `SANDBOX_CONTAINER_LABEL` |
@@ -924,7 +948,7 @@ This is by design: MCP server URLs come from **operator-controlled configuration
 
 ### Sandbox Domain Allowlists
 
-Sandbox containers route all HTTP traffic through the proxy, which enforces a domain allowlist. The allowlist is built from:
+In `proxy` and `proxy-enforced` modes, HTTP traffic uses the proxy's domain allowlist. `none` has no egress; `tunnel` bypasses this HTTP allowlist and uses tunnel routes/ACLs instead. The proxy allowlist is built from:
 
 1. A default set of domains (`src/sandbox/config.rs` — `default_allowlist()`)
 2. Additional domains from `SANDBOX_EXTRA_DOMAINS` env var (comma-separated)
