@@ -61,7 +61,7 @@ The channel setup schema accepts:
 }
 ```
 
-`poll_interval_ms` is clamped to a minimum of `30000`. On startup, the channel persists its scoped configuration, requires `multica_url` and `workspace_id` to be present and non-blank, verifies that `multica_api_token` exists, and polls only when `polling_enabled` is true. If no runtime ID exists, it registers and stores the resulting ID in channel-scoped state.
+`poll_interval_ms` is clamped to a minimum of `30000`. Before startup or hot activation, the host rejects a null, blank, or absent `multica_url` or `workspace_id` and reports the named field in extension status and gateway channel health; the channel does not appear active after a failed start. On startup, the channel persists its scoped configuration, verifies that `multica_api_token` exists, and polls only when `polling_enabled` is true. If no runtime ID exists, it registers and stores the resulting ID in channel-scoped state.
 
 The channel capability confines its workspace files below `channels/multica/`. Do not copy the tool's `config/multica.json` path into that directory manually; use extension setup so the host supplies the channel configuration in the expected shape.
 
@@ -118,7 +118,7 @@ For local protocol checks, use `ic/scripts/multica-local-test-server.sh` and `ic
 
 ## Troubleshooting
 
-- **`invalid multica config: multica_url is not configured` or `invalid multica config: workspace_id is not configured`** — complete the named required channel field. Null placeholders, absent keys, and blank or whitespace-only strings are not usable values; the error names the field instead of reporting only a JSON position.
+- **`invalid multica config: required field 'multica_url' is not configured`, the equivalent `workspace_id` error, or the channel-side `multica_url is not configured` variants** — complete the named required channel field. Null placeholders, absent keys, and blank or whitespace-only strings are not usable values. Extension status marks the channel as failed rather than active, and gateway channel health includes the same startup reason.
 - **`multica_api_token secret not configured`** — complete channel setup or run `lunarwing tool auth multica-bridge`; exporting an environment variable alone does not place a token in the WASM secret store.
 - **`runtime_id not set in config`** — the tool does not persist its registration response; add the returned ID to `config/multica.json`. The channel manages its own runtime state automatically.
 - **Workspace or membership errors** — verify the workspace UUID and that the PAT's user belongs to that workspace.
