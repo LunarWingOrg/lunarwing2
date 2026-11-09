@@ -23,7 +23,7 @@ The daemon already treats external-worker names generically. `create_job(mode: "
 
 The design is based on the current tree and on LunarDepth `master` at `4b8b2f72195cc5a5294c01abf21747cbf87289f1` (2026-11-09). That commit is evidence for the available interfaces, not a permanent source pin.
 
-LunarDepth merge request !23 merged the item-9 compatibility implementation after !20's review. The following behaviors are part of the source contract and must be re-verified at every pin:
+LunarDepth merge request !23 merged the item-9 compatibility implementation after !20's review. Its AL-1 remediation is mandatory: the token is required by the schema and configuration resolver, and even a directly constructed, misconfigured server must reject a bearer upgrade with HTTP 401 rather than hashing an undefined secret and crashing. The following behaviors are part of the source contract and must be re-verified at every pin:
 
 - `dsh --profile lunarwing-worker` loads `@lunardepth/dsh-lunarwing-worker` and its `lunarwing-worker` bundle;
 - the worker serves `/health` and `/ready`, defaults to `127.0.0.1:9090`, and accepts only the exact `/ws/agent` upgrade with a required bearer and `lunarwing-agent-v1`;
