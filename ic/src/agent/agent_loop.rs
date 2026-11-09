@@ -2122,6 +2122,24 @@ impl Agent {
                 //    would produce confusing interleaved output
                 // - `Err(_)`: hard error
                 while let Ok(SubmissionResult::Response { content: outgoing }) = &result {
+                    if suppressed.load(Ordering::SeqCst) {
+                        let (cleared, cleared_steer_notes) = {
+                            let mut sess = session.lock().await;
+                            if let Some(thread) = sess.threads.get_mut(&thread_id) {
+                                discard_suppressed_pending_input(thread)
+                            } else {
+                                (0, 0)
+                            }
+                        };
+                        tracing::debug!(
+                            thread_id = %thread_id,
+                            cleared_remaining = cleared,
+                            cleared_steer_notes,
+                            "Drain loop: response suppressed before drain, discarded queued input"
+                        );
+                        break;
+                    }
+
                     let merged = {
                         let mut sess = session.lock().await;
                         sess.threads
