@@ -41,9 +41,9 @@ When in doubt about where a change belongs, read [`AGENTS.md`](../../AGENTS.md) 
   remote-replica feature gate (WI#331), and the worker credential/
   exposure-policy hardening landed; see
   `docs/releases/RELEASE-v2.1.6.0.md`.
-- The v2.1.9.0 pre-release checklist is being worked through
-  (`docs/ops/AGENT_GOALS_2.1.9.0.md`). The crate/pin state already moved
-  (all LunarWing crates at 2.1.9 per checklist item #1, along with the
+- The v2.2.0.0 pre-release checklist is being worked through
+  (`docs/ops/AGENT_GOALS_2.2.0.0.md`). The crate/pin state already moved
+  (all LunarWing crates at 2.2.0 per checklist item #1, along with the
   XMPP bridge, the four WASM channels, and their registry packages;
   kimi worker 2.5.2, opencode v1 at v1.19.5, and opencode2 at v2.2.6;
   external worker upgrades remain separate from the crate sweep — the v2.0.26
