@@ -69,6 +69,15 @@ fn requires_preexisting_uuid_thread(channel: &str) -> bool {
     matches!(channel, "gateway" | "test")
 }
 
+fn prepend_queued_steer_note(messages: &mut Vec<ChatMessage>, note: &str) {
+    let wrapped = format!(
+        "The user queued this steer note before this turn started. \
+         Apply it together with the user request that follows; it is not a separate turn:\n{note}"
+    );
+    let current_request = messages.len().saturating_sub(1);
+    messages.insert(current_request, ChatMessage::user(wrapped));
+}
+
 impl Agent {
     pub(super) async fn has_tool_always_grant(
         &self,
@@ -605,9 +614,14 @@ impl Agent {
                 .threads
                 .get_mut(&thread_id)
                 .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
+            let queued_steer = thread.drain_steer_notes();
             let turn = thread.start_turn(effective_content);
             turn.image_content_parts = image_parts;
-            thread.messages()
+            let mut messages = thread.messages();
+            if let Some(note) = queued_steer {
+                prepend_queued_steer_note(&mut messages, &note);
+            }
+            messages
         };
 
         // Persist user message to DB immediately so it survives crashes
