@@ -311,7 +311,13 @@ async fn test_flakey_provider_eventually_succeeds() {
     // FlakeyProvider fails 3 times then succeeds.
     // RetryProvider with max_retries=5 should be enough to get through.
     let flakey = Arc::new(FlakeyProvider::new(3, "success after retries"));
-    let retry = RetryProvider::new(flakey.clone(), RetryConfig { max_retries: 5 });
+    let retry = RetryProvider::new(
+        flakey.clone(),
+        RetryConfig {
+            max_retries: 5,
+            ..RetryConfig::default()
+        },
+    );
 
     let result = tokio::time::timeout(Duration::from_secs(30), retry.complete(make_request()))
         .await
@@ -333,7 +339,13 @@ async fn test_flakey_provider_eventually_succeeds() {
 async fn test_flakey_provider_exhausts_retries() {
     // Fails 10 times, but retry allows only 2 retries (3 attempts total).
     let flakey = Arc::new(FlakeyProvider::new(10, "never reached"));
-    let retry = RetryProvider::new(flakey.clone(), RetryConfig { max_retries: 2 });
+    let retry = RetryProvider::new(
+        flakey.clone(),
+        RetryConfig {
+            max_retries: 2,
+            ..RetryConfig::default()
+        },
+    );
 
     let result = retry.complete(make_request()).await;
     assert!(result.is_err(), "should fail when retries are exhausted");
@@ -441,7 +453,13 @@ async fn test_garbage_provider_returns_error_or_empty() {
 #[tokio::test]
 async fn test_garbage_provider_not_retried() {
     let garbage = Arc::new(GarbageProvider::new("garbage-no-retry"));
-    let retry = RetryProvider::new(garbage.clone(), RetryConfig { max_retries: 3 });
+    let retry = RetryProvider::new(
+        garbage.clone(),
+        RetryConfig {
+            max_retries: 3,
+            ..RetryConfig::default()
+        },
+    );
 
     let response = retry.complete(make_request()).await;
     assert!(response.is_ok(), "garbage Ok response should pass through");
@@ -706,7 +724,10 @@ async fn test_retry_plus_circuit_breaker_integration() {
     let flakey = Arc::new(FlakeyProvider::new(2, "stack success"));
     let retry: Arc<dyn LlmProvider> = Arc::new(RetryProvider::new(
         flakey.clone(),
-        RetryConfig { max_retries: 3 },
+        RetryConfig {
+            max_retries: 3,
+            ..RetryConfig::default()
+        },
     ));
     let cb = CircuitBreakerProvider::new(
         retry,
@@ -739,7 +760,10 @@ async fn test_full_chain_retry_failover_circuit_breaker() {
     let flakey = Arc::new(FlakeyProvider::new(5, "not reachable").with_name("flakey-full"));
     let retry_primary: Arc<dyn LlmProvider> = Arc::new(RetryProvider::new(
         flakey.clone(),
-        RetryConfig { max_retries: 2 },
+        RetryConfig {
+            max_retries: 2,
+            ..RetryConfig::default()
+        },
     ));
 
     // Backup: always reliable.
@@ -775,7 +799,10 @@ async fn test_garbage_through_full_chain() {
     let garbage: Arc<dyn LlmProvider> = Arc::new(GarbageProvider::new("garbage-chain"));
     let retry: Arc<dyn LlmProvider> = Arc::new(RetryProvider::new(
         garbage.clone(),
-        RetryConfig { max_retries: 1 },
+        RetryConfig {
+            max_retries: 1,
+            ..RetryConfig::default()
+        },
     ));
     let cb = CircuitBreakerProvider::new(
         retry,
