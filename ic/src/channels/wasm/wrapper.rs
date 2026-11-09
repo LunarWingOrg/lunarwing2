@@ -80,9 +80,9 @@ wasmtime::component::bindgen!({
 
 /// Pre-resolved credential for host-based injection.
 ///
-/// Built before each WASM execution by decrypting secrets from the store.
-/// Applied per-request by matching the URL host against `host_patterns`.
-/// WASM channels never see the raw secret values.
+/// Resolved before each WASM execution from the managed deployment environment
+/// or by decrypting secrets from the store. Applied per-request by matching the
+/// URL host against `host_patterns`, keeping host credentials out of guest-authored requests.
 #[derive(Clone)]
 struct ResolvedHostCredential {
     /// Host patterns this credential applies to (e.g., "api.example.com").
