@@ -12,7 +12,18 @@ set -euo pipefail
 readonly version="0.11.0"
 readonly archive="shellcheck-v${version}.linux.x86_64.tar.xz"
 readonly checksum="8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198"
-readonly url="https://github.com/koalaman/shellcheck/releases/download/v${version}/${archive}"
+readonly url="${SHELLCHECK_URL:-https://github.com/koalaman/shellcheck/releases/download/v${version}/${archive}}"
+if [[ -n "${SHELLCHECK_REGISTRY_URL:-}" ]]; then
+    registry_url="$SHELLCHECK_REGISTRY_URL"
+    registry_auth=()
+else
+    registry_url="${CI_API_V4_URL:-https://git.lunarwing.org/api/v4}/projects/${CI_PROJECT_ID:-35}/packages/generic/lunarwing-ci-tools/${version}/${archive}"
+    registry_auth=()
+    if [[ -n "${CI_JOB_TOKEN:-}" ]]; then
+        registry_auth=(--header "JOB-TOKEN: $CI_JOB_TOKEN")
+    fi
+fi
+readonly registry_url
 
 repo_root=$(git rev-parse --show-toplevel)
 install_dir="$repo_root/.ci-bin"
@@ -31,8 +42,28 @@ for tool in curl sha256sum xz; do
     fi
 done
 
-curl --fail --location --silent --show-error "$url" --output "$temp_dir/$archive"
-printf '%s  %s\n' "$checksum" "$temp_dir/$archive" | sha256sum --check
+download() {
+    local source_url="$1"
+    shift
+    rm -f -- "$temp_dir/$archive"
+    curl --fail --location --silent --show-error \
+        --retry 5 --retry-delay 5 --retry-all-errors \
+        "$@" --output "$temp_dir/$archive" "$source_url"
+}
+
+download_source="$registry_url"
+if ! download "$registry_url" "${registry_auth[@]}"; then
+    echo "WARNING: ShellCheck project registry download failed; trying GitHub fallback" >&2
+    download_source="$url"
+    if ! download "$url"; then
+        echo "ERROR: ShellCheck $version is mandatory; downloads failed from project registry ($registry_url) and GitHub ($url)" >&2
+        exit 1
+    fi
+fi
+if ! printf '%s  %s\n' "$checksum" "$temp_dir/$archive" | sha256sum --check --status; then
+    echo "ERROR: ShellCheck archive checksum mismatch from $download_source" >&2
+    exit 1
+fi
 tar -xJf "$temp_dir/$archive" -C "$temp_dir"
 install -d "$install_dir"
 install -m 0755 "$temp_dir/shellcheck-v${version}/shellcheck" "$install_dir/shellcheck"
