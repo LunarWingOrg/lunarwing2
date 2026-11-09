@@ -683,14 +683,15 @@ job that issued it.
 
 ## Generic shell sandbox network policy (WI#154/155/537)
 
-The generic shell sandbox (`ic/src/sandbox/`) defaults to
+On Linux the generic shell sandbox (`ic/src/sandbox/`) defaults to
 `SANDBOX_NETWORK=proxy-enforced`, in code and in new mt-admin-rendered
 multi-tenant envs. It keeps `--network none` and exposes only a per-execution
 Unix relay to the public-only allowlist proxy — local Linux runtime and a
 Python-3-equipped image are required (the bundled `docker/sandbox.Dockerfile`
-image includes the full Python development suite). `none` disables egress,
-`tunnel` selects the item-3 overlay sidecar, and `proxy` remains the legacy
-advisory mode. mt-admin preserves every operator-set value on re-render.
+image includes the full Python development suite). Other platforms default to
+`none` because this relay is unsupported. `none` disables egress, `tunnel`
+selects the item-3 overlay sidecar, and `proxy` remains the legacy advisory
+mode. mt-admin preserves every operator-set value on re-render.
 
 Rootless podman uses keep-id; rootless docker maps container root onto the
 host user; rootful docker maps numeric UIDs and refuses writable workspaces
@@ -1106,16 +1107,24 @@ Runs as non-root user `sandbox` (UID 1000) in `/workspace`. Entrypoint is the `l
 
 ### Generic sandbox egress default (WI#537)
 
-The generic podman sandbox (`shell` tool, `ic/src/sandbox/`) defaults to
-**`SANDBOX_NETWORK=proxy-enforced`** in code and in new multi-tenant envs.
-mt-admin fills only an unset value and preserves an operator's `none`,
-`proxy-enforced`, `tunnel`, or `proxy` on re-render. The default retains
-`--network none` and provides standard web egress only through the WI#155 Unix
-relay and its public-only, DNS-pinned allowlist proxy. Advisory `proxy` remains
-an explicit legacy choice: a process that ignores its env vars could reach
-worker WSS/health ports, tenant PostgreSQL, and other tenants' loopback
-services, so it must never become the default. See
-`ic/src/NETWORK_SECURITY.md` §5 for the tier table and exact default allowlist.
+On Linux the generic podman sandbox (`shell` tool, `ic/src/sandbox/`) defaults
+to **`SANDBOX_NETWORK=proxy-enforced`** in code and in new multi-tenant envs;
+other platforms default to `none`. mt-admin fills only an unset value and
+preserves an operator's `none`, `proxy-enforced`, `tunnel`, or `proxy` on
+re-render. The Linux default retains `--network none` and provides standard web
+egress only through the WI#155 Unix relay and its public-only, DNS-pinned
+allowlist proxy. It installs no credential mappings, so daemon API keys are
+never injected in this mode. Advisory `proxy` remains an explicit legacy
+choice: a process that ignores its env vars could reach worker WSS/health
+ports, tenant PostgreSQL, and other tenants' loopback services, so it must
+never become the default. See `ic/src/NETWORK_SECURITY.md` §5 for the tier
+table and exact default allowlist.
+
+Existing multi-tenant envs with an explicit `SANDBOX_NETWORK=none` stay on
+`none`; to adopt enforced egress, set `proxy-enforced`, run `patch-env
+<tenant>`, and restart through mt-admin. A single-node Linux install with no
+value set changes from `none` to `proxy-enforced` on upgrade; set `none`
+explicitly before upgrading to retain no-egress behavior.
 
 ### Generic sandbox image + tenant defaults (WI#223/537)
 
@@ -1128,9 +1137,12 @@ Poetry. Every top-level Python package has an explicit version pin. The base
 image is digest-pinned and apt uses the fixed Debian snapshot over HTTPS, a
 fixed-client-first bootstrap, bounded timeouts, and bounded retries
 (WI#559/561). The Podman 5.8.2 verification build grew from 689,767,025 to
-922,670,727 bytes (**+232,903,702 bytes**, about 222.1 MiB). mt-admin renders
-these defaults into every tenant's `lunarwing.env` during `add-tenant`
-(existing values are preserved if that command is explicitly re-run):
+922,670,727 bytes (**+232,903,702 bytes**, about 222.1 MiB). Rootless tenants
+each receive a copy in their own store, so budget roughly 0.92 GB of image size
+per tenant rather than once per host (allocated disk depends on the storage
+driver). mt-admin renders these defaults into every tenant's `lunarwing.env`
+during `add-tenant` (existing values are preserved if that command is
+explicitly re-run):
 
 ```bash
 SANDBOX_RUNTIME=podman
