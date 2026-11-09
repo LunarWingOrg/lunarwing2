@@ -191,8 +191,8 @@ impl Default for SandboxConfig {
 /// ├─────────────────┬──────────────────┬────────────────────────────────┤
 /// │ Policy          │ Filesystem       │ Network                        │
 /// ├─────────────────┼──────────────────┼────────────────────────────────┤
-/// │ ReadOnly        │ /workspace (ro)  │ Proxy allowlist or none        │
-/// │ WorkspaceWrite  │ /workspace (rw)  │ Proxy allowlist or none        │
+/// │ ReadOnly        │ /workspace (ro)  │ Selected egress tier           │
+/// │ WorkspaceWrite  │ /workspace (rw)  │ Selected egress tier           │
 /// │ FullAccess      │ Full host        │ Full network (DANGER)          │
 /// └─────────────────┴──────────────────┴────────────────────────────────┘
 /// ```
