@@ -3177,4 +3177,79 @@ mod tests {
             "steer note is injected as a user message"
         );
     }
+
+    #[tokio::test]
+    async fn idle_steer_precedes_new_request_in_first_llm_call() {
+        use crate::agent::submission::SubmissionResult;
+        use crate::channels::IncomingMessage;
+        use tokio::sync::Mutex;
+
+        let capture = Arc::new(SteerCapture {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            log: std::sync::Mutex::new(Vec::new()),
+        });
+        let session = Arc::new(Mutex::new(Session::new("test-user")));
+        let thread_id = {
+            let mut sess = session.lock().await;
+            let thread = sess.create_thread();
+            assert!(thread.add_steer_note(STEER_MARKER.to_string()));
+            thread.id
+        };
+        let provider = SteerAwareProvider {
+            capture: Arc::clone(&capture),
+            session: Arc::clone(&session),
+            thread_id,
+        };
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register_sync(Arc::new(crate::tools::builtin::EchoTool));
+        let agent = make_test_agent_with_tools(Arc::new(provider), tools, 8);
+        let message = IncomingMessage::new("test", "test-user", "build the thing");
+        let suppressed = std::sync::atomic::AtomicBool::new(false);
+
+        let result = agent
+            .process_user_input(
+                &message,
+                Arc::clone(&session),
+                thread_id,
+                "build the thing",
+                &suppressed,
+            )
+            .await
+            .expect("idle steer turn should complete");
+        assert!(matches!(
+            result,
+            SubmissionResult::Response { content } if content == "steered response"
+        ));
+
+        let log = capture.log.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            log.len(),
+            1,
+            "the first provider call must already contain the queued steer"
+        );
+        let first_request = &log[0];
+        let steer_pos = first_request
+            .iter()
+            .position(|message| message.content.contains(STEER_MARKER))
+            .expect("queued steer must reach the first request");
+        let request_pos = first_request
+            .iter()
+            .position(|message| message.content == "build the thing")
+            .expect("new request must be present");
+        assert!(
+            steer_pos < request_pos,
+            "queued steer must precede the new request: {first_request:?}"
+        );
+        let steer = &first_request[steer_pos].content;
+        assert!(steer.contains("before this turn started"));
+        assert!(!steer.contains("while you were working"));
+        drop(log);
+
+        assert!(
+            session.lock().await.threads[&thread_id]
+                .steer_notes
+                .is_empty(),
+            "turn-start delivery must drain the idle steer queue"
+        );
+    }
 }
