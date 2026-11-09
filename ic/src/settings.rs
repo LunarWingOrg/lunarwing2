@@ -851,8 +851,8 @@ pub struct SandboxSettings {
     #[serde(default = "default_sandbox_runtime")]
     pub runtime: String,
 
-    /// Network egress mode for sandboxed policies: "proxy-enforced"
-    /// (default; isolated allowlist web access), "none" (no egress), "tunnel"
+    /// Network egress mode: "proxy-enforced" (Linux default; isolated
+    /// allowlist web access), "none" (default elsewhere; no egress), "tunnel"
     /// (NetBird/WireGuard sidecar namespace, WI#248), or "proxy"
     /// (legacy advisory HTTP proxy).
     #[serde(default = "default_sandbox_network")]
@@ -979,7 +979,9 @@ fn default_sandbox_runtime() -> String {
 }
 
 fn default_sandbox_network() -> String {
-    "proxy-enforced".to_string()
+    crate::sandbox::SandboxNetworkMode::default()
+        .as_str()
+        .to_string()
 }
 
 fn default_sandbox_timeout() -> u64 {
@@ -2519,7 +2521,7 @@ url = "ws://localhost:9090/ws/agent"
         assert_eq!(loaded.agent.name, "partial-bot");
         // Defaults preserved
         assert_eq!(loaded.agent.max_parallel_jobs, 5);
-        assert_eq!(loaded.sandbox.network, "proxy-enforced");
+        assert_eq!(loaded.sandbox.network, default_sandbox_network());
         assert!(!loaded.heartbeat.enabled);
     }
 
