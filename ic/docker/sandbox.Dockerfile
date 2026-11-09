@@ -69,11 +69,15 @@ RUN set -eu; \
       python3-pytest-cov=4.0.0-1 \
       python3-coverage=6.5.0+dfsg1-2+b1 \
       python3-mypy=1.0.1-1 \
+      mypy=1.0.1-1 \
       black=23.1.0-1 \
       python3-isort=5.6.4-1 \
+      isort=5.6.4-1 \
       python3-flake8=5.0.4-4 \
+      flake8=5.0.4-4 \
       pylint=2.16.2-2 \
       python3-ipython=8.5.0-4 \
+      ipython3=8.5.0-4 \
       python3-debugpy=1.6.6+ds-1 \
       tox=3.28.0-2 \
       twine=4.0.2-1 \
