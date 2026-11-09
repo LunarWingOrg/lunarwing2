@@ -79,7 +79,12 @@ Items 3–4 cover the sandbox theme; items 5–6 cover LunarDepth.
 9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/577
 10. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/574
 11. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/587
-12. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/576
+12. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/576
+    - **DONE — SweetieBot (autonomous), 2026-11-09:** WI#576 legacy mission records now deserialize with defaults for optional state, histories, daily counters and metadata instead of being dropped at every boot. Identity, project, name, goal, status, cadence and creation/update timestamps remain required, so compatibility defaults cannot fabricate or silently reactivate a mission.
+    - **Safe diagnostics:** data-class mission parse warnings now include an allowlisted `missing_field` name. Unknown variants, invalid values and the full Serde error remain excluded from `warn!`; full detail stays at `debug!`, preserving WI#321's secret-safe logging boundary.
+    - **Regressions:** typed tests cover all newly defaulted fields and rejection of every required field. A real `HybridStore` workspace boot reload proves that a `safetylayer-watch` mission missing nine legacy state fields survives and loads with the expected defaults; another test pins the diagnostic allowlist against forged content.
+    - **Verified:** `taskset -c 0-17 cargo test -j18 -p lunarwing_engine types::mission::tests -- --test-threads=18` (15/15), `taskset -c 0-17 cargo test -j18 --lib bridge::store_adapter::tests -- --test-threads=18` (46/46), `taskset -c 0-17 cargo check -j18 --all-targets`, `taskset -c 0-17 cargo clippy -j18 --lib --tests -- -D warnings`, and `cargo fmt --all` all passed.
+    - **Coverage boundary:** the live tenant `safetylayer-watch/mission.json` was not available; verification uses a synthetic legacy document through the same workspace boot loader rather than claiming a live tenant restart.
 13. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/578
 14. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/584
 
