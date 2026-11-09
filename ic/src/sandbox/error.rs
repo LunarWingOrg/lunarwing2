@@ -258,14 +258,18 @@ mod tests {
             .remediation_hint()
             .is_some()
         );
-        assert!(
-            SandboxError::StorageUnavailable {
-                path: "/var/lib/containers/storage".into(),
-                reason: "no space left on device".into()
-            }
-            .remediation_hint()
-            .is_some_and(|hint| hint.contains("df") && hint.contains("podman system prune"))
-        );
+        let storage_hint = SandboxError::StorageUnavailable {
+            path: "/var/lib/containers/storage".into(),
+            reason: "no space left on device".into(),
+        }
+        .remediation_hint()
+        .unwrap();
+        assert!(storage_hint.contains("df"));
+        assert!(storage_hint.contains("podman image prune"));
+        assert!(storage_hint.contains("dangling images only"));
+        assert!(storage_hint.contains("mt-admin"));
+        assert!(storage_hint.contains("never use `prune -a`"));
+        assert!(!storage_hint.contains("podman system prune"));
         assert!(
             SandboxError::TunnelUnavailable { reason: "x".into() }
                 .remediation_hint()
