@@ -3179,7 +3179,7 @@ class PebbleRustLaneTests(unittest.TestCase):
         "before_script": [
             'df -h "$CI_PROJECT_DIR"',
             "bash .gitlab/scripts/bootstrap-rust.sh",
-            "bash .gitlab/scripts/bootstrap-sccache.sh",
+            "bash .gitlab/scripts/bootstrap-sccache.sh || source .gitlab/scripts/disable-sccache.sh",
         ],
     }
 
