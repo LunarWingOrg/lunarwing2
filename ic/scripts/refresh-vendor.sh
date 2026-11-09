@@ -281,8 +281,9 @@ for d in sorted(os.listdir(vendor_dir)):
 if strays and os.environ["PRUNE_REMOVED"] == "0":
     print(
         "refresh-vendor: ERROR vendored dirs outside every synced Cargo.lock "
-        + f"({len(strays)}): {strays[:10]} — fix the locks, or explicitly "
-        + "re-run with --prune-removed after reviewing the removals",
+        + f"({len(strays)}): {strays[:10]} — lockfiles drifted (fix the locks, "
+        + "do not re-resolve) or these crates left every lock (re-run with "
+        + "--prune-removed after reviewing the removals)",
         file=sys.stderr,
     )
     sys.exit(1)

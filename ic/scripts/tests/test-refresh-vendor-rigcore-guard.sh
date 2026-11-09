@@ -4,7 +4,8 @@
 # restore from git, the version-bump refusal and its discard hint, the
 # RIGCORE_MARKER_FILES drift warning (whole crate, not only src/), and the
 # recovery when cargo vendor itself fails or is signalled part-way (rig-core
-# restore even with a dead log reader, stale .vendor-staging* cleanup).
+# restore even with a dead log reader, stale .vendor-staging* cleanup), and
+# the set check's --prune-removed path (item 1 of v2.2.0.0).
 # A stub `cargo` plays `cargo vendor` (re-extracts vendor/rig-core pristine:
 # no markers, no LUNARWING-PATCH.md; a version bump also adds a new file) and
 # a stub replaces the network-bound cargo-deny gate, so the harness is
@@ -306,6 +307,43 @@ printf '[workspace]\n' >"$repo/ic/Cargo.toml"
 run_refresh
 check 'the same dir without a patch entry is still a stray' exited_nonzero
 check 'the stray is reported as lockfile drift' output_has 'lockfiles drifted'
+reset_fixture
+
+# 9. --prune-removed (item 1, v2.2.0.0): a dir that no synced lock names is
+#    removed only when the option is given; the default run still refuses; the
+#    option is consumed by the script, not forwarded to cargo vendor; and the
+#    exempt dirs ([patch.crates-io] crates, the pre-vendored libsignal path
+#    dependencies) survive the prune.
+run_refresh_prune() {
+  : >"$CARGO_CALLS"
+  if out="$(cd "$repo/ic" && PATH="$fixture/bin:$PATH" bash scripts/refresh-vendor.sh --prune-removed 2>&1)"; then
+    status=0
+  else
+    status=$?
+  fi
+}
+mkdir -p "$repo/ic/vendor/patched-crate" "$repo/ic/vendor/libsignal-protocol"
+printf '[package]\nname = "patched-crate"\nversion = "1.0.0"\n' >"$repo/ic/vendor/patched-crate/Cargo.toml"
+printf '[package]\nname = "libsignal-protocol"\nversion = "0.1.0"\n' >"$repo/ic/vendor/libsignal-protocol/Cargo.toml"
+printf '[workspace]\n' >"$repo/ic/Cargo.toml"
+run_refresh
+check 'without --prune-removed the stray still fails the refresh' exited_nonzero
+check 'without --prune-removed the stray dir is left in place' [ -d "$repo/ic/vendor/patched-crate" ]
+run_refresh_prune
+check '--prune-removed completes' exited_ok
+check '--prune-removed reports the removal' \
+  output_has 'removing vendor/patched-crate (absent from every synced Cargo.lock)'
+check '--prune-removed removes the stray dir' [ ! -e "$repo/ic/vendor/patched-crate" ]
+check '--prune-removed keeps the libsignal path dependency' [ -d "$repo/ic/vendor/libsignal-protocol" ]
+check '--prune-removed is not forwarded to cargo vendor' grep -qx 'vendor --locked --no-delete vendor' "$CARGO_CALLS"
+check 'the set check passes after the prune' output_has 'vendor set matches synced Cargo.lock files'
+check 'rig-core is intact after the prune' patch_present
+mkdir -p "$repo/ic/vendor/patched-crate"
+printf '[package]\nname = "patched-crate"\nversion = "1.0.0"\n' >"$repo/ic/vendor/patched-crate/Cargo.toml"
+printf '[workspace]\n\n[patch.crates-io]\npatched-crate = { path = "patches/patched-crate" }\n' >"$repo/ic/Cargo.toml"
+run_refresh_prune
+check '--prune-removed keeps a [patch.crates-io] crate' [ -d "$repo/ic/vendor/patched-crate" ]
+check 'nothing is reported removed for an exempt crate' output_lacks 'removing vendor/'
 reset_fixture
 
 if ((failures > 0)); then
