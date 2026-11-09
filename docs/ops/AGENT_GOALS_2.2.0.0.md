@@ -86,9 +86,13 @@ Items 3–4 cover the sandbox theme; items 5–6 cover LunarDepth.
 ## Phase 6 - Gauntlets (for goals which reference any work items, see comments on those work items in addition to reading full descriptions)
 
 15. [ ] Fix any issues in CI/CD (if any) - See Pipeline for LATEST MASTER pipeline (you can use gitlab mcp) and see if anything is not GREEN. If there are problems, fix them - always check last dozen or so Work Items for TIPS as to why master pipelines are actually red. Kageho is watching and posting WIs with explanations now usually (fairly frequently). If the GitLab MCP pipeline tools are not callable in your session (WI#589), say so in the trail and leave the item open rather than ticking it on local checks alone
+16. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/593
+17. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/592
+18. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/590
+19. [x] work on RESERVED
 
 ## Phase 7 - Advanced Operator Notes
 
-16. [x] (S) RESERVED
+20. [x] (S) RESERVED
 
 ---
