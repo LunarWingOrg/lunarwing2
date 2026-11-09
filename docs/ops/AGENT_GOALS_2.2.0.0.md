@@ -86,7 +86,9 @@ Items 3–4 cover the sandbox theme; items 5–6 cover LunarDepth.
 ## Phase 6 - Gauntlets (for goals which reference any work items, see comments on those work items in addition to reading full descriptions)
 
 15. [ ] Fix any issues in CI/CD (if any) - See Pipeline for LATEST MASTER pipeline (you can use gitlab mcp) and see if anything is not GREEN. If there are problems, fix them - always check last dozen or so Work Items for TIPS as to why master pipelines are actually red. Kageho is watching and posting WIs with explanations now usually (fairly frequently). If the GitLab MCP pipeline tools are not callable in your session (WI#589), say so in the trail and leave the item open rather than ticking it on local checks alone
-16. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/593
+16. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/593
+    - **DONE — Rarity, 2026-11-09:** latest `master` pipeline **7508** on `258c0f30a` is **success**, with all **45/45 current jobs successful**. The original failed jobs from the GitHub release-asset 504 outage succeeded on retry, and the pipeline reached success at 09:21:47Z; no source change was needed for WI#593's red-master report.
+    - **Follow-up boundary:** WI#594 separately tracks first-party asset hosting and sccache/ShellCheck bootstrap hardening. That reliability improvement remains open and is not part of this recovered-master verification.
 17. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/592
 18. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/590
 19. [x] work on RESERVED
