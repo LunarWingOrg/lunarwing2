@@ -5062,12 +5062,15 @@ impl ExtensionManager {
                 "Channel {name} failed to start: {reason}"
             )));
         }
-        channel_manager.clear_start_failure(name).await;
         let auth_state = self.check_channel_auth_status(name, user_id).await;
         if auth_state != ToolAuthState::Ready && auth_state != ToolAuthState::NoAuth {
-            return Err(ExtensionError::ActivationFailed(format!(
+            let reason = format!(
                 "Channel '{name}' requires configuration. Use the setup form to provide credentials."
-            )));
+            );
+            channel_manager
+                .record_config_error(name.to_string(), reason.clone())
+                .await;
+            return Err(ExtensionError::ActivationFailed(reason));
         }
 
         self.complete_loaded_wasm_channel_activation(
