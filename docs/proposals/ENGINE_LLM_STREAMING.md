@@ -189,6 +189,16 @@ a typed `LlmError::EmptyStream` carrying the WI#292 finish classification:
   rephrase or switch models; an output-budget truncation tells them to raise
   the output token limit) instead of the generic request-rejected text.
 
+Billed-empty retries at each provider leg also have a cumulative input-token
+budget (WI#578). `LLM_EMPTY_STREAM_RETRY_INPUT_TOKEN_BUDGET` defaults to
+`100000`: after an empty attempt reports usage that brings the leg's total to
+the budget, the retry layer returns the typed error instead of opening another
+attempt at that leg. Usage is known only when the attempt ends, so the total
+can cross the budget by one attempt; this is a retry threshold, not a provider
+billing refund or a pre-request hard cap. Attempts without reported usage keep
+the ordinary `max_retries` bound. Setting the budget to `0` restores the
+uncapped retry behavior. Failover retains its own independent leg policy.
+
 Empty-stream detection lives in the Retry/Failover decorators, so with
 `max_retries = 0` and no fallback configured the pre-WI#297 behavior remains:
 the integrity layer reports the empty stream as `Aborted{Empty}` and no
