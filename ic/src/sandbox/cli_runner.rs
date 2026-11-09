@@ -241,12 +241,12 @@ impl EmptyMaskDir {
 /// container CLI's mount namespace (daemon + `PrivateTmp=true` + manager-
 /// forked service would hide `/tmp`). Same policy as the proxy relay.
 #[cfg(target_os = "linux")]
-fn shared_mount_source_parent() -> PathBuf {
+pub(crate) fn shared_mount_source_parent() -> PathBuf {
     crate::sandbox::proxy::relay::relay_parent_dir().unwrap_or_else(|_| std::env::temp_dir())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn shared_mount_source_parent() -> PathBuf {
+pub(crate) fn shared_mount_source_parent() -> PathBuf {
     std::env::temp_dir()
 }
 
@@ -480,6 +480,13 @@ pub(crate) fn build_run_args(spec: &RunSpec<'_>) -> Vec<String> {
                 "-e".into(),
                 "no_proxy=".into(),
             ]);
+        }
+        SandboxNetworkMode::Tunnel => {
+            args.push("--network".into());
+            args.push(format!(
+                "container:{}",
+                crate::sandbox::tunnel_sidecar::SANDBOX_TUNNEL_CONTAINER
+            ));
         }
     }
 
@@ -834,7 +841,11 @@ impl CliRunner {
         let tenant_logs =
             tenant_logs_for_run(tenant_logs, self.tenant_logs_readable, protected_paths);
 
-        if network != SandboxNetworkMode::None && proxy_port == 0 {
+        if matches!(
+            network,
+            SandboxNetworkMode::Proxy | SandboxNetworkMode::ProxyEnforced
+        ) && proxy_port == 0
+        {
             return Err(SandboxError::ProxyError {
                 reason: format!("{network:?} network mode requires a running proxy"),
             });
@@ -1153,7 +1164,10 @@ fn classify_run_failure(stderr: &str, image: &str, exit_code: i64) -> Option<San
 /// inspection/pull and cleanup must execute in the same manager-forked
 /// context as `run` — the hardened daemon's context breaks podman's
 /// rootless user-namespace join), returning `None` when spawn fails.
-async fn run_status_isolated(bin: &str, args: &[&str]) -> Option<std::process::ExitStatus> {
+pub(crate) async fn run_status_isolated(
+    bin: &str,
+    args: &[&str],
+) -> Option<std::process::ExitStatus> {
     let spawner = crate::tools::process::workload_spawner().await;
     let mut cmd = spawner.command(bin, args);
     let spec = spawner.prepare_service(&mut cmd);
@@ -1173,12 +1187,15 @@ async fn run_status_isolated(bin: &str, args: &[&str]) -> Option<std::process::E
 
 /// Capture a command's output through the workload spawner (same isolation
 /// rationale as [`run_status_isolated`]).
-async fn output_isolated(bin: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
+pub(crate) async fn output_isolated(
+    bin: &str,
+    args: &[&str],
+) -> std::io::Result<std::process::Output> {
     let spawner = crate::tools::process::workload_spawner().await;
     let mut cmd = spawner.command(bin, args);
     let spec = spawner.prepare_service(&mut cmd);
     cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let child = cmd.spawn()?;
     let mut guard = crate::tools::process::ProcessTreeGuard::for_service(
@@ -1580,6 +1597,40 @@ mod tests {
         assert_eq!(args[idx + 1], "none");
         assert!(!args.iter().any(|a| a.starts_with("http_proxy=")));
         assert!(!args.iter().any(|a| a.starts_with("https_proxy=")));
+    }
+
+    #[test]
+    fn args_tunnel_mode_joins_sidecar_without_relaxing_hardening() {
+        for (runtime, keep_id) in [
+            (ContainerRuntime::Podman, KeepIdMode::UidPinned),
+            (ContainerRuntime::Docker, KeepIdMode::Off),
+        ] {
+            let args = build_run_args(&spec(
+                runtime,
+                keep_id,
+                SandboxPolicy::ReadOnly,
+                SandboxNetworkMode::Tunnel,
+                0,
+            ));
+            let joined = args.join(" ");
+            assert!(joined.contains("--network container:lunarwing-sandbox-tunnel"));
+            for flag in [
+                "--cap-drop=ALL",
+                "--cap-add=CHOWN",
+                "--security-opt=no-new-privileges",
+                "--read-only",
+                "--pids-limit",
+                "--stop-timeout",
+            ] {
+                assert!(joined.contains(flag), "missing {flag}: {joined}");
+            }
+            assert!(!joined.contains("http_proxy="));
+            assert!(!joined.contains("https_proxy="));
+            assert!(!joined.contains("/run/lunarwing-proxy"));
+            assert!(!joined.contains("lunarwing-proxy-relay"));
+            assert!(!joined.contains("--add-host"));
+            assert_eq!(args.last().map(String::as_str), Some("echo hi"));
+        }
     }
 
     #[test]
