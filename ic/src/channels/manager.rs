@@ -462,6 +462,11 @@ impl ChannelManager {
             };
             results.insert(name.clone(), result);
         }
+        for name in start_failures {
+            if !results.contains_key(&name) {
+                results.insert(name.clone(), Err(startup_failure(&name)));
+            }
+        }
 
         results
     }
@@ -689,6 +694,52 @@ mod tests {
         let results = manager.health_check_all().await;
         assert!(results["healthy"].is_ok());
         assert!(results["sick"].is_err());
+    }
+
+    struct SecretStartFailure;
+
+    #[async_trait::async_trait]
+    impl Channel for SecretStartFailure {
+        fn name(&self) -> &str {
+            "multica"
+        }
+
+        async fn start(&self) -> Result<MessageStream, ChannelError> {
+            Err(ChannelError::StartupFailed {
+                name: "multica".to_string(),
+                reason: "guest failed with planted-secret".to_string(),
+            })
+        }
+
+        async fn respond(
+            &self,
+            _msg: &IncomingMessage,
+            _response: OutgoingResponse,
+        ) -> Result<(), ChannelError> {
+            Ok(())
+        }
+
+        async fn health_check(&self) -> Result<(), ChannelError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_failure_health_never_exposes_guest_secret() {
+        let manager = ChannelManager::new();
+        let startup_error = match manager.hot_add(Box::new(SecretStartFailure)).await {
+            Ok(()) => panic!("guest startup must fail"),
+            Err(error) => error,
+        };
+        assert!(startup_error.to_string().contains("planted-secret"));
+
+        let health = manager.health_check_all().await;
+        let health_error = health["multica"]
+            .as_ref()
+            .expect_err("failed hot activation must be unhealthy")
+            .to_string();
+        assert!(health_error.contains("see daemon logs"), "{health_error}");
+        assert!(!health_error.contains("planted-secret"), "{health_error}");
     }
 
     #[tokio::test]
