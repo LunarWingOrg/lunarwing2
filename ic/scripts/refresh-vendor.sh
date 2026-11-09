@@ -23,11 +23,11 @@
 #     wiped. The one case that still fails loudly is a rig-core version bump:
 #     re-apply the patch onto the new sources and commit it first
 #     (LUNARWING-PATCH.md describes the flow).
-#   - The post-vendor set check compares vendor/ against the committed
-#     Cargo.lock files (the approved pins). It must only report drift, never
-#     re-resolve versions: any stray means the lockfiles drifted, so fix the
-#     locks first and re-run. (.vendor-staging* temp dirs that an interrupted
-#     cargo vendor leaves behind are removed before vendoring, not reported.)
+#   - The post-vendor set reconciliation compares vendor/ against the committed
+#     Cargo.lock files (the approved pins), never re-resolving them. It prunes
+#     only crate names absent from every lock, which --no-delete cannot remove;
+#     superseded versions of locked crates remain. (.vendor-staging* temp dirs
+#     that an interrupted cargo vendor leaves behind are removed before vendoring.)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -219,16 +219,13 @@ PYEOF
   fi
 done
 
-# Set check against the committed lockfiles (the approved pins): every registry
-# vendored crate dir must come from one of the synced Cargo.lock files. A stray
-# means a lockfile drifted between vendor runs — fix the lock instead of letting
-# cargo re-resolve. Duplicate version dirs (e.g. hashbrown x5) are expected:
-# each synced lockfile may pin a different version of a shared crate, and the
-# vendor set is their union. Local [patch.crates-io] path dependencies replace
-# registry packages, so their old registry dirs are exempt like pre-vendored
-# path dependencies.
+# Reconcile the set against the committed lockfiles (the approved pins). Cargo's
+# mandatory --no-delete mode preserves superseded versions of crates still in
+# use, but it also leaves crates whose names disappeared from every lockfile.
+# Remove only those wholly unused names here; never re-resolve the locks. Local
+# [patch.crates-io] path dependencies and the pre-vendored path deps are exempt.
 python3 - "$VENDOR_DIR" "${lockfiles[@]}" <<'PYEOF'
-import os, sys, tomllib
+import os, shutil, sys, tomllib
 
 vendor_dir = sys.argv[1]
 lockfiles = sys.argv[2:]
@@ -270,23 +267,22 @@ for d in sorted(os.listdir(vendor_dir)):
         continue
     if d in ("libsignal-protocol", "libsignal-protocol-sys") or d in patched_names:
         continue  # path dependencies are not registry-vendored crates
-    base = next((c for c in base_candidates(d) if c in lock_names), d)
-    joints[base] = joints.get(base, 0) + 1
-    if base == d and d not in lock_names:
+    base = next((c for c in base_candidates(d) if c in lock_names), None)
+    if base is None:
         strays.append(d)
+        continue
+    joints[base] = joints.get(base, 0) + 1
+
+for d in strays:
+    crate_dir = os.path.join(vendor_dir, d)
+    print(f"refresh-vendor: removing {crate_dir} (absent from every synced Cargo.lock)")
+    shutil.rmtree(crate_dir)
 
 top = sorted(joints.items(), key=lambda kv: -kv[1])[:5]
 print(
     f"refresh-vendor: {sum(joints.values())} crate dirs, {len(joints)} unique names; "
     + ", ".join(f"{n}x{c}" for n, c in top)
 )
-if strays:
-    print(
-        "refresh-vendor: ERROR vendored dirs outside every synced Cargo.lock "
-        + f"({len(strays)}): {strays[:10]} — lockfiles drifted; fix locks, do not re-resolve",
-        file=sys.stderr,
-    )
-    sys.exit(1)
 print("refresh-vendor: vendor set matches synced Cargo.lock files")
 PYEOF
 
