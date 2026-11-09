@@ -52,6 +52,14 @@ pub enum SandboxError {
     #[error("Credential injection failed for {domain}: {reason}")]
     CredentialInjectionFailed { domain: String, reason: String },
 
+    /// The tunnel sidecar container could not be established or pass its
+    /// health gate (WI#248, `SANDBOX_NETWORK=tunnel`). Distinct from
+    /// `proxy_error`: nothing about the validating proxy failed — the
+    /// transport the sandbox was configured to egress through is not up.
+    /// Fail-closed: runs never degrade to another egress mode.
+    #[error("Sandbox tunnel unavailable: {reason}")]
+    TunnelUnavailable { reason: String },
+
     /// The requested mount directory is not permitted in the sandbox.
     ///
     /// Raised by the mount guard when an agent-supplied working directory
@@ -98,6 +106,7 @@ impl SandboxError {
             Self::ProxyError { .. } => "proxy_error",
             Self::NetworkBlocked { .. } => "network_blocked",
             Self::CredentialInjectionFailed { .. } => "credential_injection_failed",
+            Self::TunnelUnavailable { .. } => "sandbox_unavailable",
             Self::Config { .. } => "config",
             Self::MountPathDenied { .. } => "mount_path_denied",
         }
@@ -114,6 +123,11 @@ impl SandboxError {
                 "build SANDBOX_IMAGE in the daemon's container store (multi-tenant: \
                  `lunarwing-mt-admin.sh build-sandbox-image <name>` then `start-tenant <name>`), \
                  or use an existing image / enable SANDBOX_AUTO_PULL for registry images",
+            ),
+            Self::TunnelUnavailable { .. } => Some(
+                "check the SANDBOX_TUNNEL_* settings (netbird management URL/setup key, \
+                 wireguard config path and image) and peer readiness; see \
+                 docs/guides/SANDBOX_TUNNEL_NETWORKING.md",
             ),
             _ => None,
         }
@@ -183,6 +197,10 @@ mod tests {
                 "credential_injection_failed",
             ),
             (
+                SandboxError::TunnelUnavailable { reason: "x".into() },
+                "sandbox_unavailable",
+            ),
+            (
                 SandboxError::Io(std::io::Error::other("x")),
                 "sandbox_unavailable",
             ),
@@ -221,6 +239,11 @@ mod tests {
             }
             .remediation_hint()
             .is_some()
+        );
+        assert!(
+            SandboxError::TunnelUnavailable { reason: "x".into() }
+                .remediation_hint()
+                .is_some()
         );
         assert!(
             SandboxError::Timeout(Duration::from_secs(1))
