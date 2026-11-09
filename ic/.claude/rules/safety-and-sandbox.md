@@ -45,6 +45,13 @@ runtime or image is unavailable, commands error with a structured
   DNS-pinned, redirect rechecked). Requires a local Linux runtime and Python 3
   in the image; relay setup failures fail closed (`[sandbox:proxy_error]`),
   never degrade to advisory or direct egress.
+- `tunnel` (WI#248): runs join a NetBird/WireGuard sidecar netns while keeping
+  every hardening flag. A mandatory sidecar `nftables` input-drop chain permits
+  only loopback and established/related return traffic — never an inbound
+  listener. Provider health and the exact firewall are rechecked before every
+  run; failures return `[sandbox:sandbox_unavailable]` and never degrade.
+  NetBird setup keys use an atomic 0600 env-file; WireGuard configs are regular
+  non-symlink 0600 files mounted read-only. Keys must never enter argv or logs.
 - `proxy`: legacy allowlist HTTP proxy + credential injection. **Advisory** —
   enforced via env vars, which a process may ignore.
 
