@@ -78,7 +78,10 @@ Items 3–4 cover the sandbox theme; items 5–6 cover LunarDepth.
 
 9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/577
 10. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/574
-11. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/587
+11. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/587
+    - **DONE — Rarity, 2026-11-09:** added typed `StorageUnavailable` / `storage_unavailable` diagnostics for ENOSPC from image inspection, image pull and container setup. The message leads with the extracted containers-storage path, preserves Podman's full nested error below it, and offers `df` / tenant-user prune remediation instead of image-rebuild advice. Genuine overlay capability failures retain their existing classification.
+    - Image inspection now distinguishes present, genuinely absent and inspection failure, so a storage wall cannot trigger a misleading auto-pull/absence branch. Storage exhaustion is non-transient and is not retried automatically.
+    - **Verified:** `taskset -c 0-17 cargo test -j18 --lib sandbox -- --test-threads=18` (**279 passed, 0 failed**), including the exact multiline WI#587 stderr and shell-envelope regressions; `taskset -c 0-17 cargo clippy -j18 --lib --tests -- -D warnings`; and `taskset -c 0-17 cargo fmt --all -- --check` all pass. No live host-disk fill was performed.
 12. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/576
 13. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/578
 14. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/584
