@@ -128,8 +128,8 @@ receive the setup key or private key.
 
 | Mode | Purpose | Enforcement |
 |------|---------|-------------|
-| `none` | no egress | kernel `--network none` |
-| `proxy-enforced` (WI#537 default) | public web through domain allowlist | network-none + Unix relay + public-only proxy |
+| `none` (default off Linux) | no egress | kernel `--network none` |
+| `proxy-enforced` (WI#537 Linux default) | public web through domain allowlist | network-none + Unix relay + public-only proxy; no credential injection |
 | `tunnel` | private overlay and optionally full-route egress | kernel-enforced sidecar input + output chains; reachability = the tunnel's routes/ACLs |
 | `proxy` (legacy) | public web through env-var proxy | advisory only |
 
@@ -141,10 +141,11 @@ the runtime resolvers. Neither shape is equivalent to the public-only proxy
 allowlist; what is reachable is decided by the tunnel's routes and the overlay's
 ACLs, never by the host's network position.
 
-Item 4 (WI#537) selects `proxy-enforced` as the default and expands the sandbox
-image's Python suite. Item 3 preserves every tier's existing semantics and does
-not edit that image; an operator's `none`, `proxy-enforced`, `tunnel`, or
-`proxy` selection still survives mt-admin re-rendering.
+Item 4 (WI#537) selects `proxy-enforced` as the Linux default and expands the
+sandbox image's Python suite. Other platforms default to `none`. Item 3
+preserves every tier's existing semantics and does not edit that image; an
+operator's `none`, `proxy-enforced`, `tunnel`, or `proxy` selection still
+survives mt-admin re-rendering.
 
 ## Provider requirements
 
@@ -180,7 +181,7 @@ provide `nft` and the provider health tools.
 
 Opt in per tenant with `SANDBOX_NETWORK=tunnel` and `SANDBOX_TUNNEL_*`; mt-admin
 preserves operator-set network values on re-render. The tunnel requires no
-migration and does not change WI#537's `proxy-enforced` default. Unit tests pin
+migration and does not change WI#537's Linux `proxy-enforced` default. Unit tests pin
 argument construction, secret exclusion, validation,
 firewall shape, parsing, and error taxonomy. The double-gated
 `ic/tests/podman_sandbox_tunnel_integration.rs` lane uses real rootless Podman
