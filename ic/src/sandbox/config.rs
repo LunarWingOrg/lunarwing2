@@ -468,7 +468,10 @@ mod tests {
             default_network_for_platform(true),
             SandboxNetworkMode::ProxyEnforced
         );
-        assert_eq!(default_network_for_platform(false), SandboxNetworkMode::None);
+        assert_eq!(
+            default_network_for_platform(false),
+            SandboxNetworkMode::None
+        );
     }
 
     #[test]
