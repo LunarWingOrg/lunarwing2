@@ -309,7 +309,7 @@ pub(crate) fn build_sidecar_args(
                 cfg.image().into(),
                 "/bin/sh".into(),
                 "-c".into(),
-                "wg-quick up /etc/wireguard/wg0.conf && exec sleep infinity".into(),
+                "wg-quick up /etc/wireguard/wg0.conf && exec sleep 2147483647".into(),
             ]);
         }
     }
@@ -739,6 +739,8 @@ mod tests {
         let joined = args.join(" ");
         assert!(joined.contains("/etc/lunarwing/wg0.conf:/etc/wireguard/wg0.conf:ro,z"));
         assert!(joined.contains("wg-quick up /etc/wireguard/wg0.conf"));
+        assert!(joined.contains("exec sleep 2147483647"));
+        assert!(!joined.contains("sleep infinity"));
         assert!(!joined.contains("--device"));
         assert!(!joined.contains("--env-file"));
         assert!(!joined.contains("--network host"));
