@@ -3221,29 +3221,30 @@ mod tests {
             SubmissionResult::Response { content } if content == "steered response"
         ));
 
-        let log = capture.log.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(
-            log.len(),
-            1,
-            "the first provider call must already contain the queued steer"
-        );
-        let first_request = &log[0];
-        let steer_pos = first_request
-            .iter()
-            .position(|message| message.content.contains(STEER_MARKER))
-            .expect("queued steer must reach the first request");
-        let request_pos = first_request
-            .iter()
-            .position(|message| message.content == "build the thing")
-            .expect("new request must be present");
-        assert!(
-            steer_pos < request_pos,
-            "queued steer must precede the new request: {first_request:?}"
-        );
-        let steer = &first_request[steer_pos].content;
-        assert!(steer.contains("before this turn started"));
-        assert!(!steer.contains("while you were working"));
-        drop(log);
+        {
+            let log = capture.log.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                log.len(),
+                1,
+                "the first provider call must already contain the queued steer"
+            );
+            let first_request = &log[0];
+            let steer_pos = first_request
+                .iter()
+                .position(|message| message.content.contains(STEER_MARKER))
+                .expect("queued steer must reach the first request");
+            let request_pos = first_request
+                .iter()
+                .position(|message| message.content == "build the thing")
+                .expect("new request must be present");
+            assert!(
+                steer_pos < request_pos,
+                "queued steer must precede the new request: {first_request:?}"
+            );
+            let steer = &first_request[steer_pos].content;
+            assert!(steer.contains("before this turn started"));
+            assert!(!steer.contains("while you were working"));
+        }
 
         assert!(
             session.lock().await.threads[&thread_id]
