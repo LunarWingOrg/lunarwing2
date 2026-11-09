@@ -197,8 +197,8 @@ assert_eq "default ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS" \
 # chats cannot edit v1 routines, so the rendered comment names the host CLI.
 assert_eq "env comment names the per-routine CLI" \
   "$(grep -c 'routines edit --name <routine> --max-tool-rounds <n>' "$MT_FIXTURE/env/lunarwing.env" || true)" "1"
-# WI#154: MT tenants default to kernel-enforced no-egress sandbox networking.
-assert_eq "default SANDBOX_NETWORK" "$(envval SANDBOX_NETWORK)" "none"
+# WI#537: MT tenants default to kernel-enforced allowlisted web egress.
+assert_eq "default SANDBOX_NETWORK" "$(envval SANDBOX_NETWORK)" "proxy-enforced"
 # WI#223: MT tenants pin the podman runtime, the lean locally-built sandbox
 # image, and no auto-pull (the tag exists only in local stores).
 assert_eq "default SANDBOX_RUNTIME" "$(envval SANDBOX_RUNTIME)" "podman"
@@ -386,7 +386,7 @@ assert_eq "re-run adds ORCHESTRATOR_SELF_MODIFY default" \
   "$(envval ORCHESTRATOR_SELF_MODIFY)" "true"
 assert_eq "re-run adds ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS default" \
   "$(envval ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS)" "6"
-assert_eq "re-run adds SANDBOX_NETWORK default" "$(envval SANDBOX_NETWORK)" "none"
+assert_eq "re-run adds SANDBOX_NETWORK default" "$(envval SANDBOX_NETWORK)" "proxy-enforced"
 assert_eq "re-run adds SANDBOX_RUNTIME default" "$(envval SANDBOX_RUNTIME)" "podman"
 assert_eq "re-run adds SANDBOX_IMAGE default" "$(envval SANDBOX_IMAGE)" "lunarwing-sandbox:latest"
 assert_eq "re-run adds SANDBOX_AUTO_PULL default" "$(envval SANDBOX_AUTO_PULL)" "false"
