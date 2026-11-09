@@ -155,6 +155,30 @@ mod tests {
     }
 
     #[test]
+    fn default_enforced_proxy_has_no_credential_mappings() {
+        let config = SandboxConfig::default();
+        assert_eq!(
+            config.network,
+            crate::sandbox::SandboxNetworkMode::ProxyEnforced
+        );
+        let builder = NetworkProxyBuilder::from_config(&config);
+        assert!(builder.credential_mappings.is_empty());
+    }
+
+    #[test]
+    fn legacy_proxy_retains_credential_mappings() {
+        let config = SandboxConfig {
+            network: crate::sandbox::SandboxNetworkMode::Proxy,
+            ..SandboxConfig::default()
+        };
+        let builder = NetworkProxyBuilder::from_config(&config);
+        assert_eq!(
+            builder.credential_mappings.len(),
+            default_credential_mappings().len()
+        );
+    }
+
+    #[test]
     fn test_builder_with_custom_allowlist() {
         let builder = NetworkProxyBuilder::new()
             .with_allowlist(vec!["custom.com".to_string()])
