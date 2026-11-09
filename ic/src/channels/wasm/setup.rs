@@ -6,6 +6,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::channels::ChannelManager;
 use crate::channels::wasm::{
     LoadedChannel, RegisteredEndpoint, SharedWasmChannel, WasmChannel, WasmChannelLoader,
     WasmChannelRouter, WasmChannelRuntime, WasmChannelRuntimeConfig, create_wasm_channel_router,
@@ -30,6 +31,7 @@ pub struct WasmChannelSetup {
 /// Load WASM channels and register their webhook routes.
 pub async fn setup_wasm_channels(
     config: &Config,
+    channel_manager: &ChannelManager,
     secrets_store: &Option<Arc<dyn SecretsStore + Send + Sync>>,
     extension_manager: Option<&Arc<ExtensionManager>>,
     database: Option<&Arc<dyn Database>>,
@@ -72,16 +74,25 @@ pub async fn setup_wasm_channels(
     let mut channel_names: Vec<String> = Vec::new();
 
     for loaded in results.loaded {
-        let (name, channel) = register_channel(
+        let name = loaded.name().to_string();
+        match register_channel(
             loaded,
             config,
             secrets_store,
             settings_store.as_ref(),
             &wasm_router,
         )
-        .await;
-        channel_names.push(name.clone());
-        channels.push((name, channel));
+        .await
+        {
+            Ok((name, channel)) => {
+                channel_names.push(name.clone());
+                channels.push((name, channel));
+            }
+            Err(reason) => {
+                tracing::error!("Failed to start channel {}: {}", name, reason);
+                channel_manager.record_start_failure(name, reason).await;
+            }
+        }
     }
 
     for (path, err) in &results.errors {
@@ -115,12 +126,20 @@ async fn register_channel(
     secrets_store: &Option<Arc<dyn SecretsStore + Send + Sync>>,
     settings_store: Option<&Arc<dyn crate::db::SettingsStore>>,
     wasm_router: &Arc<WasmChannelRouter>,
-) -> (String, Box<dyn crate::channels::Channel>) {
+) -> Result<(String, Box<dyn crate::channels::Channel>), String> {
     let channel_name = loaded.name().to_string();
     tracing::debug!("Loaded WASM channel: {}", channel_name);
     let owner_actor_id = config
         .channels
         .wasm_channel_owner_actor_id(channel_name.as_str());
+    let setup_field_overrides = load_channel_setup_field_overrides(
+        settings_store,
+        &config.owner_id,
+        &channel_name,
+        loaded.capabilities_file.as_ref(),
+    )
+    .await;
+    validate_required_channel_config(loaded.capabilities_file.as_ref(), &setup_field_overrides)?;
 
     let secret_name = loaded.webhook_secret_name();
     let sig_key_secret_name = loaded.signature_key_secret_name();
@@ -174,15 +193,7 @@ async fn register_channel(
             config_updates.insert("owner_id".to_string(), serde_json::json!(owner_id));
         }
 
-        config_updates.extend(
-            load_channel_setup_field_overrides(
-                settings_store,
-                &config.owner_id,
-                &channel_name,
-                loaded.capabilities_file.as_ref(),
-            )
-            .await,
-        );
+        config_updates.extend(setup_field_overrides);
         // Inject channel-specific secrets into config for channels that need
         // credentials as runtime config values rather than HTTP placeholders
         // (e.g., XMPP password).
@@ -281,7 +292,36 @@ async fn register_channel(
         }
     }
 
-    (channel_name, Box::new(SharedWasmChannel::new(channel_arc)))
+    Ok((channel_name, Box::new(SharedWasmChannel::new(channel_arc))))
+}
+
+/// Validate required setup fields against resolved overrides and manifest defaults.
+pub fn validate_required_channel_config(
+    capabilities_file: Option<&crate::channels::wasm::ChannelCapabilitiesFile>,
+    overrides: &std::collections::HashMap<String, serde_json::Value>,
+) -> Result<(), String> {
+    let Some(cap_file) = capabilities_file else {
+        return Ok(());
+    };
+
+    for field in cap_file
+        .setup
+        .required_fields
+        .iter()
+        .filter(|field| !field.optional)
+    {
+        let value = overrides
+            .get(&field.name)
+            .or_else(|| cap_file.config.get(&field.name));
+        if !value.is_some_and(setting_value_is_present) {
+            return Err(format!(
+                "invalid {} config: required field '{}' is not configured",
+                cap_file.name, field.name
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Inject credentials for a channel based on naming convention.
@@ -566,6 +606,43 @@ mod tests {
             }"#,
         )
         .expect("valid capabilities JSON")
+    }
+
+    #[test]
+    fn required_channel_config_rejects_null_blank_and_absent_values() {
+        let mut caps = ChannelCapabilitiesFile::from_json(
+            r#"{
+                "name": "multica",
+                "setup": {
+                    "required_fields": [
+                        { "name": "multica_url", "prompt": "Multica URL", "optional": false },
+                        { "name": "workspace_id", "prompt": "Workspace", "optional": false }
+                    ]
+                },
+                "config": { "multica_url": null, "workspace_id": "workspace" }
+            }"#,
+        )
+        .expect("valid capabilities JSON");
+        let mut overrides = std::collections::HashMap::new();
+
+        let error = validate_required_channel_config(Some(&caps), &overrides)
+            .expect_err("null required value must be rejected");
+        assert!(error.contains("multica_url"), "{error}");
+
+        caps.config.insert(
+            "multica_url".to_string(),
+            serde_json::Value::String("  ".to_string()),
+        );
+        assert!(validate_required_channel_config(Some(&caps), &overrides).is_err());
+
+        caps.config.remove("multica_url");
+        assert!(validate_required_channel_config(Some(&caps), &overrides).is_err());
+
+        overrides.insert(
+            "multica_url".to_string(),
+            serde_json::Value::String("https://multica.example".to_string()),
+        );
+        assert!(validate_required_channel_config(Some(&caps), &overrides).is_ok());
     }
 
     #[test]
