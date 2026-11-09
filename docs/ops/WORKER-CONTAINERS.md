@@ -1128,7 +1128,7 @@ Poetry. Every top-level Python package has an explicit version pin. The base
 image is digest-pinned and apt uses the fixed Debian snapshot over HTTPS, a
 fixed-client-first bootstrap, bounded timeouts, and bounded retries
 (WI#559/561). The Podman 5.8.2 verification build grew from 689,767,025 to
-922,631,733 bytes (**+232,864,708 bytes**, about 222.1 MiB). mt-admin renders
+922,670,727 bytes (**+232,903,702 bytes**, about 222.1 MiB). mt-admin renders
 these defaults into every tenant's `lunarwing.env` during `add-tenant`
 (existing values are preserved if that command is explicitly re-run):
 
