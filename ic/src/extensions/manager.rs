@@ -15,6 +15,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::channels::ChannelManager;
+use crate::channels::wasm::setup::validate_required_channel_config;
 use crate::channels::wasm::{
     LoadedChannel, RegisteredEndpoint, SharedWasmChannel, WasmChannelLoader, WasmChannelRouter,
     WasmChannelRuntime,
@@ -740,6 +741,21 @@ impl ExtensionManager {
             wasm_channel_owner_actor_ids,
             tool_activity: false,
         });
+    }
+
+    async fn running_channel_manager(&self) -> Option<Arc<ChannelManager>> {
+        self.channel_runtime
+            .read()
+            .await
+            .as_ref()
+            .map(|rt| Arc::clone(&rt.channel_manager))
+    }
+
+    async fn channel_start_failures(&self) -> HashMap<String, String> {
+        match self.running_channel_manager().await {
+            Some(manager) => manager.start_failures().await,
+            None => HashMap::new(),
+        }
     }
 
     /// Set the global `tool_activity` flag for hot-activated WASM channels.
@@ -1627,10 +1643,14 @@ impl ExtensionManager {
                 Ok(channels) => {
                     let active_names = self.active_channel_names.read().await;
                     let errors = self.activation_errors.read().await;
+                    let start_failures = self.channel_start_failures().await;
                     for (name, discovered) in channels {
-                        let active = active_names.contains(&name);
+                        let start_failure = start_failures.get(&name);
+                        let active = start_failure.is_none() && active_names.contains(&name);
                         let auth_state = self.check_channel_auth_status(&name, user_id).await;
-                        let activation_error = errors.get(&name).cloned();
+                        let activation_error = start_failure
+                            .map(|reason| format!("Channel {name} failed to start: {reason}"))
+                            .or_else(|| errors.get(&name).cloned());
                         let registry_entry = self
                             .registry
                             .get_with_kind(&name, Some(ExtensionKind::WasmChannel))
@@ -4951,16 +4971,6 @@ impl ExtensionManager {
         name: &str,
         user_id: &str,
     ) -> Result<ActivateResult, ExtensionError> {
-        // If already active, re-inject credentials and refresh webhook secret.
-        // Handles the case where a channel was loaded at startup before the
-        // user saved secrets via the web UI.
-        {
-            let active = self.active_channel_names.read().await;
-            if active.contains(name) {
-                return self.refresh_active_channel(name, user_id).await;
-            }
-        }
-
         // Verify runtime infrastructure is available and clone Arcs so we don't
         // hold the RwLock guard across awaits.
         let (
@@ -4986,6 +4996,13 @@ impl ExtensionManager {
                 rt.tool_activity,
             )
         };
+
+        // Refresh only a channel whose latest start succeeded. A failed startup
+        // must go through full activation so corrected config is validated.
+        let start_failed = channel_manager.start_failures().await.contains_key(name);
+        if !start_failed && self.active_channel_names.read().await.contains(name) {
+            return self.refresh_active_channel(name, user_id).await;
+        }
 
         // Check auth status first
         let auth_state = self.check_channel_auth_status(name, user_id).await;
@@ -5084,6 +5101,16 @@ impl ExtensionManager {
                 )
                 .await,
             );
+            if let Err(reason) =
+                validate_required_channel_config(loaded.capabilities_file.as_ref(), &config_updates)
+            {
+                channel_manager
+                    .record_start_failure(channel_name.clone(), reason.clone())
+                    .await;
+                return Err(ExtensionError::ActivationFailed(format!(
+                    "Channel {channel_name} failed to start: {reason}"
+                )));
+            }
 
             if !config_updates.is_empty() {
                 channel_arc.update_config(config_updates).await;
@@ -9265,6 +9292,68 @@ done
             db,
             Vec::new(),
         )
+    }
+
+    #[tokio::test]
+    async fn wasm_channel_listing_uses_start_failures_not_loaded_names() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let channels_dir = dir.path().join("channels");
+        std::fs::create_dir_all(&channels_dir).map_err(|error| error.to_string())?;
+        std::fs::write(channels_dir.join("multica.wasm"), b"test")
+            .map_err(|error| error.to_string())?;
+        std::fs::write(
+            channels_dir.join("multica.capabilities.json"),
+            r#"{"name":"multica","type":"channel"}"#,
+        )
+        .map_err(|error| error.to_string())?;
+        let manager = make_manager_custom_dirs(dir.path().join("tools"), channels_dir);
+        manager
+            .active_channel_names
+            .write()
+            .await
+            .insert("multica".to_string());
+
+        let channels = Arc::new(crate::channels::ChannelManager::new());
+        let runtime = Arc::new(
+            crate::channels::wasm::WasmChannelRuntime::new(
+                crate::channels::wasm::WasmChannelRuntimeConfig::default(),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        manager
+            .set_channel_runtime(
+                Arc::clone(&channels),
+                runtime,
+                Arc::new(crate::pairing::PairingStore::new()),
+                Arc::new(crate::channels::wasm::WasmChannelRouter::new()),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .await;
+        channels
+            .record_start_failure(
+                "multica".to_string(),
+                "invalid multica config: required field 'multica_url' is not configured"
+                    .to_string(),
+            )
+            .await;
+
+        let listed = manager
+            .list(Some(ExtensionKind::WasmChannel), false, "test")
+            .await
+            .map_err(|error| error.to_string())?;
+        let multica = listed
+            .iter()
+            .find(|extension| extension.name == "multica")
+            .ok_or_else(|| "multica missing from listing".to_string())?;
+        assert!(!multica.active);
+        let error = multica
+            .activation_error
+            .as_deref()
+            .ok_or_else(|| "missing startup failure".to_string())?;
+        assert!(error.contains("failed to start"), "{error}");
+        assert!(error.contains("multica_url"), "{error}");
+        Ok(())
     }
 
     #[test]
