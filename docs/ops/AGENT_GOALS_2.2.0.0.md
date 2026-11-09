@@ -81,7 +81,11 @@ Items 3–4 cover the sandbox theme; items 5–6 cover LunarDepth.
 
 ## Phase 5 - Misc Operations (ALWAYS READ ALL COMMENTS FOR EACH WORK ITEM WHEN A WORK ITEM IS REFERENCED - ALSO ALWAYS READ LINKED WORK ITEMS FOR EACH WORK ITEM REFERENCED)
 
-9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/577
+9. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/577
+   - **DONE — SweetieBot (autonomous), 2026-11-09:** fixed WI#577's code-confirmed managed-credential drift path. `rotate-relay-password` updates `RELAY_PASSWORD`, but both channel setup and host HTTP credential injection previously preferred an older per-owner store secret. A shared first-party WeeChat resolver now gives the non-empty managed environment value precedence in both paths; the store remains the fallback when it is unset, and XMPP precedence is unchanged.
+   - **Regression coverage and docs:** setup and host-resolver tests both simulate a rotated environment value alongside a stale store secret, verify the rotated value wins, and verify store fallback. The host test also confirms an `Authorization` header is resolved. `docs/ops/WEECHAT-SERVICES.md` now documents the precedence and rotation contract.
+   - **Verified:** the exact setup and host-resolver regressions each passed 1/1; the full WASM setup module passed 7/7, including XMPP environment fallback; `taskset -c 0-17 cargo fmt --all -- --check`; and `taskset -c 0-17 cargo clippy -j18 --lib --tests -- -D warnings` all passed on the final code.
+   - **Deployment boundary:** no live tenant was restarted or probed from this checkout. Affected tenants need the upgraded daemon restarted so setup and per-callback host credentials reload; live confirmation that their `/api/wait` 401 cadence has cleared remains a deployment check.
 10. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/574
 11. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/587
 12. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/576

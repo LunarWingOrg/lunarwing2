@@ -490,10 +490,10 @@ async fn inject_channel_secrets_into_config(
     owner_id: &str,
     config_updates: &mut std::collections::HashMap<String, serde_json::Value>,
 ) {
-    // Map of (config_key, secret_name, env_var) tuples per channel. The
-    // env var is the deployment-time fallback when the secret is not in the
-    // store — e.g. multi-tenant setups inject the WeeChat relay password via
-    // `RELAY_PASSWORD` rather than the per-owner secrets store.
+    // Map of (config_key, secret_name, env_var) tuples per channel. The env
+    // var is normally a deployment-time fallback. For WeeChat it is the
+    // managed rotation source shared with WeeChat and the adapter, so it must
+    // take precedence over an older per-owner store entry.
     let secret_config_mappings: &[(&str, &str, &str)] = match channel_name {
         "xmpp" => &[("xmpp_password", "xmpp_password", "XMPP_PASSWORD")],
         "weechat" => &[("relay_password", "weechat_relay_password", "RELAY_PASSWORD")],
@@ -501,7 +501,22 @@ async fn inject_channel_secrets_into_config(
     };
 
     for &(config_key, secret_name, env_var) in secret_config_mappings {
-        // Prefer the per-owner secrets store when available.
+        if let Some(secret) =
+            crate::channels::wasm::managed_channel_secret_env(channel_name, secret_name)
+        {
+            config_updates.insert(
+                config_key.to_string(),
+                serde_json::Value::String(secret.expose().to_string()),
+            );
+            tracing::debug!(
+                channel = %channel_name,
+                config_key = %config_key,
+                "Injected managed secret from env into channel config"
+            );
+            continue;
+        }
+
+        // Prefer the per-owner secrets store when no managed env value exists.
         if let Some(secrets) = secrets_store
             && let Ok(decrypted) = secrets.get_decrypted(owner_id, secret_name).await
         {
@@ -518,10 +533,10 @@ async fn inject_channel_secrets_into_config(
         }
 
         // Fall back to the environment variable (works without a store).
-        if let Ok(val) = std::env::var(env_var)
-            && !val.is_empty()
+        if let Ok(value) = std::env::var(env_var)
+            && !value.is_empty()
         {
-            config_updates.insert(config_key.to_string(), serde_json::Value::String(val));
+            config_updates.insert(config_key.to_string(), serde_json::Value::String(value));
             tracing::debug!(
                 channel = %channel_name,
                 config_key = %config_key,
@@ -708,25 +723,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn weechat_relay_password_injected_from_env() {
-        // Regression: once the port is correct, the adapter's auth becomes the
-        // next blocker. mt-admin sets a per-tenant RELAY_PASSWORD that must be
-        // injected as `relay_password` so the WASM authenticates to the adapter.
+    async fn weechat_managed_env_password_overrides_stale_store_secret() {
+        // mt-admin rotates RELAY_PASSWORD and restarts WeeChat, the adapter,
+        // and the daemon together. A stale store entry must not override the
+        // rotated value and leave /api/wait returning 401 after every restart.
+        let _env_guard = crate::channels::wasm::WEECHAT_MANAGED_ENV_LOCK.lock().await;
         unsafe {
-            std::env::set_var("RELAY_PASSWORD", "tenant-secret-pw");
+            std::env::set_var("RELAY_PASSWORD", "rotated-tenant-secret-pw");
         }
 
         let no_store: Option<Arc<dyn SecretsStore + Send + Sync>> = None;
         let mut updates = std::collections::HashMap::new();
         inject_channel_secrets_into_config("weechat", &no_store, "test-owner", &mut updates).await;
+        assert_eq!(
+            updates.get("relay_password"),
+            Some(&serde_json::Value::String(
+                "rotated-tenant-secret-pw".to_string()
+            ))
+        );
+
+        let store = Arc::new(crate::testing::credentials::test_secrets_store());
+        store
+            .create(
+                "test-owner",
+                crate::secrets::CreateSecretParams::new(
+                    "weechat_relay_password",
+                    "stale-store-secret-pw",
+                ),
+            )
+            .await
+            .expect("test relay secret should be stored");
+        let store: Option<Arc<dyn SecretsStore + Send + Sync>> = Some(store);
+
+        let mut rotated_updates = std::collections::HashMap::new();
+        inject_channel_secrets_into_config("weechat", &store, "test-owner", &mut rotated_updates)
+            .await;
+        assert_eq!(
+            rotated_updates.get("relay_password"),
+            Some(&serde_json::Value::String(
+                "rotated-tenant-secret-pw".to_string()
+            ))
+        );
 
         unsafe {
             std::env::remove_var("RELAY_PASSWORD");
         }
 
+        let mut fallback_updates = std::collections::HashMap::new();
+        inject_channel_secrets_into_config("weechat", &store, "test-owner", &mut fallback_updates)
+            .await;
         assert_eq!(
-            updates.get("relay_password"),
-            Some(&serde_json::Value::String("tenant-secret-pw".to_string()))
+            fallback_updates.get("relay_password"),
+            Some(&serde_json::Value::String(
+                "stale-store-secret-pw".to_string()
+            ))
         );
     }
 
