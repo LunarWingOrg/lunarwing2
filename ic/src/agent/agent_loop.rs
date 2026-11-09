@@ -2140,25 +2140,24 @@ impl Agent {
 
                     // If response delivery was suppressed (soft timeout fired),
                     // discard the already-drained content and clear any remaining
-                    // queued messages. The user already received a timeout message;
-                    // processing stale queued messages alongside a future retry
-                    // would produce confusing context.
+                    // queued messages and steer notes. The user already received a
+                    // timeout message; processing stale input alongside a future
+                    // retry would produce confusing context.
                     if suppressed.load(Ordering::SeqCst) {
-                        let cleared = {
+                        let (cleared, cleared_steer_notes) = {
                             let mut sess = session.lock().await;
                             if let Some(thread) = sess.threads.get_mut(&thread_id) {
-                                let remaining = thread.pending_messages.len();
-                                thread.pending_messages.clear();
-                                remaining
+                                discard_suppressed_pending_input(thread)
                             } else {
-                                0
+                                (0, 0)
                             }
                         };
                         tracing::debug!(
                             thread_id = %thread_id,
                             discarded_drained_len = next_content.len(),
                             cleared_remaining = cleared,
-                            "Drain loop: response suppressed, discarded queued messages"
+                            cleared_steer_notes,
+                            "Drain loop: response suppressed, discarded queued input"
                         );
                         break;
                     }
@@ -2327,6 +2326,14 @@ fn coordination_activity_is_denied(
     !message.is_internal && gate.is_some_and(|gate| gate.deny_reason(&message.sender_id).is_some())
 }
 
+fn discard_suppressed_pending_input(thread: &mut crate::agent::session::Thread) -> (usize, usize) {
+    let pending_messages = thread.pending_messages.len();
+    let steer_notes = thread.steer_notes.len();
+    thread.pending_messages.clear();
+    thread.steer_notes.clear();
+    (pending_messages, steer_notes)
+}
+
 pub(super) fn coalesced_reply_context(message: &IncomingMessage) -> IncomingMessage {
     IncomingMessage {
         id: message.id,
@@ -2358,8 +2365,9 @@ mod tests {
     use super::Agent;
     use super::{
         MessageLoopControl, abort_and_wait, chat_tool_execution_metadata, coalesced_reply_context,
-        coordination_activity_is_denied, none_result_control, resolve_routine_notification_user,
-        should_fallback_routine_notification, submission_outcome_hint, truncate_for_preview,
+        coordination_activity_is_denied, discard_suppressed_pending_input, none_result_control,
+        resolve_routine_notification_user, should_fallback_routine_notification,
+        submission_outcome_hint, truncate_for_preview,
     };
     use crate::agent::submission::SubmissionResult;
     #[cfg(feature = "libsql")]
@@ -2368,6 +2376,19 @@ mod tests {
     #[cfg(feature = "libsql")]
     use crate::config::AgentConfig;
     use crate::error::ChannelError;
+
+    #[test]
+    fn suppressed_timeout_discards_pending_messages_and_steer_notes() {
+        let mut thread = crate::agent::session::Thread::new(uuid::Uuid::new_v4());
+        assert!(thread.queue_message("queued follow-up".to_string()));
+        assert!(thread.add_steer_note("stale steering".to_string()));
+
+        let discarded = discard_suppressed_pending_input(&mut thread);
+
+        assert_eq!(discarded, (1, 1));
+        assert!(thread.pending_messages.is_empty());
+        assert!(thread.steer_notes.is_empty());
+    }
 
     #[test]
     fn coalesced_reply_context_drops_message_payload() {
