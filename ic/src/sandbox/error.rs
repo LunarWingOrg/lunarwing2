@@ -130,9 +130,10 @@ impl SandboxError {
                  or use an existing image / enable SANDBOX_AUTO_PULL for registry images",
             ),
             Self::StorageUnavailable { .. } => Some(
-                "free space on the reported container storage filesystem (inspect it with `df`; \
-                 as the affected tenant user, prune unused containers/images with \
-                 `podman system prune` or `podman image prune`), then retry",
+                "check free space on the reported storage path with `df`; \
+                 `podman image prune` (dangling images only) is safe as the affected tenant user; \
+                 on multi-tenant hosts use mt-admin and the health tooling (WI#586); \
+                 never use `prune -a`: the sandbox image is built locally",
             ),
             Self::TunnelUnavailable { .. } => Some(
                 "check the SANDBOX_TUNNEL_* settings (netbird management URL/setup key, \
