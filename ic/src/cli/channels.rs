@@ -410,6 +410,67 @@ mod tests {
         assert_eq!(value["enabled"], true);
     }
 
+    #[tokio::test]
+    async fn gateway_channel_errors_reads_failed_health_over_http() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test gateway");
+        let address = listener.local_addr().expect("test gateway address");
+        let app = axum::Router::new().route(
+            "/api/gateway/status",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "channel_health": {
+                        "multica": {
+                            "healthy": false,
+                            "error": "Channel multica failed to start: required field 'multica_url' is not configured"
+                        },
+                        "xmpp": { "healthy": true }
+                    }
+                }))
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve test gateway");
+        });
+        let config = ChannelsConfig {
+            cli: CliConfig { enabled: false },
+            http: None,
+            gateway: Some(GatewayConfig {
+                host: "127.0.0.1".to_string(),
+                port: address.port(),
+                auth_token: Some("test-token".to_string()),
+                user_id: "owner".to_string(),
+                workspace_read_scopes: vec![],
+                memory_layers: vec![],
+                user_tokens: None,
+                mascot_enabled: false,
+                ws_ping_interval_secs: 30,
+                ws_idle_timeout_secs: 120,
+            }),
+            signal: None,
+            xmpp: None,
+            wasm_channels_dir: PathBuf::from("/tmp/channels"),
+            wasm_channels_enabled: true,
+            wasm_channel_owner_ids: HashMap::new(),
+            wasm_channel_owner_actor_ids: HashMap::new(),
+            tool_activity: false,
+        };
+
+        let errors = gateway_channel_errors(&config)
+            .await
+            .expect("gateway health response");
+        server.abort();
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors["multica"].contains("multica_url"),
+            "{}",
+            errors["multica"]
+        );
+    }
+
     #[test]
     fn builtin_channels_do_not_include_xmpp() {
         let config = ChannelsConfig {
