@@ -1802,7 +1802,7 @@ mod tests {
         assert!(cfg.uplink_resolvers("nameserver 169.254.1.1\n").is_empty());
         assert_eq!(
             netbird_cfg().uplink_resolvers("nameserver 169.254.1.1\n"),
-            vec!["169.254.1.1".parse().unwrap()]
+            vec!["169.254.1.1".parse::<IpAddr>().unwrap()]
         );
         let invalid = TunnelSidecarConfig {
             dns: vec!["0.0.0.0".parse().unwrap()],
