@@ -10,8 +10,10 @@
 //! - an `output` chain drops every outbound flow that does not leave through
 //!   the tunnel interface. The uplink (pasta/slirp, or the Docker bridge)
 //!   carries only the tunnel's own control traffic, recognised by the socket
-//!   mark the provider sets on it, and DNS to the resolvers the runtime gave
-//!   the sidecar. Link-local IPv4 (the cloud metadata service and podman's
+//!   mark the provider sets on it and, by default, DNS to the resolvers the
+//!   runtime gave the sidecar. `SANDBOX_TUNNEL_DNS` moves DNS to resolvers
+//!   reachable through the tunnel and removes the uplink DNS allowance.
+//!   Link-local IPv4 (the cloud metadata service and podman's
 //!   `host.containers.internal` alias) is dropped explicitly.
 //!
 //! Joined commands have no `NET_ADMIN`, cannot set socket marks, and therefore
@@ -546,8 +548,8 @@ fn nft_exec_args(nft_args: &[&str], container_name: &str) -> Vec<String> {
 }
 
 /// What the sidecar's `output` chain must let onto the uplink: the provider's
-/// own control traffic (by socket mark) and DNS to the runtime-assigned
-/// resolvers. Everything else leaves through the tunnel interface or is dropped.
+/// own control traffic (by socket mark) and, unless custom tunnel DNS is set,
+/// DNS to the runtime-assigned resolvers. Everything else uses the tunnel or drops.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EgressPolicy {
     pub tunnel_mark: u32,
