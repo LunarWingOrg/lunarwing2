@@ -8,17 +8,12 @@ LunarWing reaches IRC networks through a per-instance WeeChat relay. The current
 
 The adapter-to-WeeChat hop is WebSocket; the sandboxed channel-to-adapter hop is HTTP. See [`../../architecture/WEECHAT-CHANNEL-ARCHITECTURE.md`](../../architecture/WEECHAT-CHANNEL-ARCHITECTURE.md) for the current message flow, configuration precedence, sender principals, latency model, and known limitations.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), 2026-10-10 (v2.1.6.0), and 2026-10-25 (v2.1.7.0).** Source/registry paths,
+**Revalidated against source 2026-11-10 (v2.2.0.0).** The registry manifest is
+`0.2.17` and the WASM channel crate is `2.2.0`. Source/registry paths,
 capability schema, mt-admin bootstrap/recovery commands, and the preflight
-script were re-checked against the current tree; no changes were needed (the
-2.1.2.0 release only bumped the channel crate/registry versions to 0.2.9;
-the 2.1.3.0 release again only bumped them to 0.2.10; the 2.1.4.0 release
-bumped the registry manifest to 0.2.11 and the WASM channel crate to the
-workspace `2.1.4` version; the 2.1.5.0 release bumped the registry manifest
-to 0.2.12 and the WASM channel crate to `2.1.5`; the 2.1.6.0 release bumped
-the registry manifest to 0.2.13 and the WASM channel crate to `2.1.6`; the
-2.1.7.0 release bumped the registry manifest to 0.2.14 and the WASM channel
-crate to `2.1.7`).
+script match the current tree. WI#577 makes a non-empty managed
+`RELAY_PASSWORD` override a stale per-owner store secret during both setup and
+host HTTP credential injection; the store remains the fallback.
 
 ## Source and Registry
 
