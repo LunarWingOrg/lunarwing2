@@ -94,6 +94,17 @@ secret-detection:
   script:
     - bash .gitlab/scripts/scan-secrets.sh
 
+# Exercise the real-scanner history harness before schedule/tag-only scans.
+secret-history-regression:
+  extends: .gitleaks-job
+  stage: security
+  needs: []
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - when: never
+  script:
+    - bash .gitlab/tests/test-secret-history.sh
+
 # Owner: security maintainers. Historical triage: WI#575 / WI#590.
 # Blocking full-history scan; only exact commit-bound fingerprints are ignored.
 secret-history:
