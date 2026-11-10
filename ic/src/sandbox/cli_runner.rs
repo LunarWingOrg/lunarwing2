@@ -297,6 +297,9 @@ impl Drop for EmptyMaskFile {
 pub struct TunnelRunConfig<'a> {
     pub container_name: &'a str,
     pub dns: &'a [IpAddr],
+    /// Owner-only resolver file mounted when `dns` is nonempty. Runtimes reject
+    /// `--dns` together with `--network container`.
+    pub resolv_conf: Option<&'a Path>,
 }
 
 /// Inputs to [`build_run_args`]. Kept as a struct so the arg construction
@@ -493,9 +496,19 @@ pub(crate) fn build_run_args(spec: &RunSpec<'_>) -> Vec<String> {
         SandboxNetworkMode::Tunnel => {
             args.push("--network".into());
             if let Some(tunnel) = spec.tunnel {
-                args.push(format!("container:{}", tunnel.container_name));
-                for resolver in tunnel.dns {
-                    args.extend(["--dns".into(), resolver.to_string()]);
+                let resolver_ready = tunnel.dns.is_empty() || tunnel.resolv_conf.is_some();
+                if resolver_ready {
+                    args.push(format!("container:{}", tunnel.container_name));
+                } else {
+                    args.push("container:".into());
+                }
+                if !tunnel.dns.is_empty()
+                    && let Some(path) = tunnel.resolv_conf
+                {
+                    args.extend([
+                        "-v".into(),
+                        format!("{}:/etc/resolv.conf:ro,Z", path.display()),
+                    ]);
                 }
             } else {
                 // An incomplete direct call must be rejected by the runtime,
@@ -1700,6 +1713,7 @@ mod tests {
                 tunnel: Some(TunnelRunConfig {
                     container_name: "lunarwing-sandbox-tunnel-instance",
                     dns: &dns,
+                    resolv_conf: Some(Path::new("/run/user/1000/tunnel.resolv.conf")),
                 }),
                 ..spec(
                     runtime,
@@ -1711,7 +1725,8 @@ mod tests {
             });
             let joined = args.join(" ");
             assert!(joined.contains("--network container:lunarwing-sandbox-tunnel-instance"));
-            assert!(joined.contains("--dns 100.100.0.53 --dns fd00::53"));
+            assert!(joined.contains("/run/user/1000/tunnel.resolv.conf:/etc/resolv.conf:ro,Z"));
+            assert!(!joined.contains("--dns"));
             for flag in [
                 "--cap-drop=ALL",
                 "--cap-add=CHOWN",
@@ -1747,6 +1762,27 @@ mod tests {
                 .iter()
                 .any(|arg| { arg == "container:lunarwing-sandbox-tunnel" })
         );
+    }
+
+    #[test]
+    fn custom_tunnel_dns_requires_a_resolver_file() {
+        let dns = ["100.100.0.53".parse().unwrap()];
+        let args = build_run_args(&RunSpec {
+            tunnel: Some(TunnelRunConfig {
+                container_name: "lunarwing-sandbox-tunnel-instance",
+                dns: &dns,
+                resolv_conf: None,
+            }),
+            ..spec(
+                ContainerRuntime::Podman,
+                KeepIdMode::UidPinned,
+                SandboxPolicy::ReadOnly,
+                SandboxNetworkMode::Tunnel,
+                0,
+            )
+        });
+        let network = args.iter().position(|arg| arg == "--network").unwrap();
+        assert_eq!(args[network + 1], "container:");
     }
 
     #[test]
