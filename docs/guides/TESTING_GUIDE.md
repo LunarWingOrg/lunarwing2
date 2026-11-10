@@ -2,26 +2,14 @@
 
 Use this checklist for manual release validation. The resource-bounded commands, harness sequence, gateway smoke test, external-worker runner, and browser E2E instructions live in [`../ops/PRE-RELEASE-TESTING.md`](../ops/PRE-RELEASE-TESTING.md).
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19 and 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), 2026-10-05 (v2.1.5.0 item-23 tiers), and 2026-10-14 (v2.1.6.0).**
-Referenced ops runbook,
-`ic/scripts/release-test.sh`, and the channel/worker/multi-tenant tiers were
-re-checked against the current tree. Added the v2.1.2.0 durable cross-channel
-attachment tier below; worker cancellation now exercises the cancel-ack
-handoff (bounded ~3s wait for the worker's terminal `task_result`). The
-2026-09-19 repass updated the sandbox network-mode list for the WI#154/155
-`proxy-enforced` mode (default `none` everywhere) and added the OpenCode 2
-worker lane to the workers checklist (mt-admin `--with-opencode2`). The
-2026-09-27 repass added the v2.1.3.0 WI#223 per-tenant sandbox-image tier
-below (rendered env defaults + tenant rootless store + recovery verb). The
-2026-10-01 repass added v2.1.4.0 tiers below: the tenant system-prompt
-editor (WI#220), opt-in tool runtime-estimate hints (WI#191),
-`routine_history` over Engine V2 missions (WI#265), and the mt-admin
-read-only diagnostics verbs (WI#268). The 2026-10-05 repass added v2.1.5.0
-tiers: the lightweight routine tool-round budget (WI#291) and the
-pending-gates corrupt-file quarantine (WI#299). The 2026-10-14 repass added
-v2.1.6.0 tiers: the daily-log backup generation cap (WI#335), the required
-tenant LLM endpoint at provisioning (WI#330), and the external-worker
-proxied tool surface (WI#324).
+**Revalidated against source 2026-11-10 (v2.2.0.0).** The referenced ops
+runbook, `ic/scripts/release-test.sh`, and channel/worker/multi-tenant tiers
+were checked against the current tree. The checklist now covers the v2.1.9
+response/cache and worker-source baselines plus v2.2 sandbox networking and
+storage diagnostics, Multica startup errors, WeeChat rotation, billed-empty
+retry bounds, legacy steering, and redacted mission-load diagnostics. Older
+versioned entries below remain useful regression tiers, not claims that they
+were rerun for this documentation change.
 
 Record the exact commit, host profile, feature set, database backend, init system, and result for every tier. Never carry a previous release's pass count forward.
 
@@ -64,6 +52,8 @@ For each enabled channel, test inbound and outbound delivery, sender identity, a
 - [ ] **routine_history over Engine V2 missions** (v2.1.4.0, WI#265) — fire an Engine V2 learning mission, then verify `routine_history <mission-name>` resolves the mission and renders recent fires; a not-found error must name both registries and point at `routine_list`/`mission_list`.
 - [ ] **mt-admin read-only diagnostics** (v2.1.4.0, WI#268) — `mt-admin psql <tenant>` runs psql inside the tenant's own PostgreSQL container (operator discipline: SELECTs and fingerprints only — it does not itself enforce read-only, and DB rows can be secret-bearing); `mt-admin daemon-pid <tenant>` prints the validated daemon PID and exits non-zero (treated as uninspected) when the unit is down.
 - [ ] **WeeChat WSS** — connect relay and adapter, exchange messages, then reconnect after a service restart.
+- [ ] **WeeChat coordinated password rotation** (v2.2.0.0, WI#577) — with a deliberately stale `weechat_relay_password` store entry, run `rotate-relay-password <tenant>` through the current start-barrier units; WeeChat, adapter, and daemon must use the rotated managed `RELAY_PASSWORD`, `/api/wait` must not loop on 401, and unsetting the managed value must restore store fallback without printing either secret.
+- [ ] **Multica startup diagnostics** (v2.2.0.0, WI#573) — leave `multica_url` or `workspace_id` null, absent, or blank and confirm extension/CLI status and gateway `channel_config_errors` name only the missing field, the channel is not active, and neither runtime watchdog restarts it. Plant a guest-side startup failure and verify health/listings say only `channel failed to start; see daemon logs`, never the guest text; corrected setup must pass full activation, and removal must clear the failure.
 - [ ] **DarkIRC** — verify the tenant adapter, contact-key boundary, delivery, and health reporting.
 - [ ] **WASM channels** — install, configure, activate, poll, and remove a disposable extension.
 - [ ] **Gotify** — send a real test notification without exposing the application token.
@@ -77,10 +67,15 @@ For each enabled channel, test inbound and outbound delivery, sender identity, a
 - [ ] Enable supervised mode and confirm every tool action is gated, including normally auto-approved tools.
 - [ ] Trigger context compaction and verify the conversation remains usable.
 - [ ] Exercise a model/provider failure and verify bounded retry/failover behavior.
+- [ ] **Response cache and malformed final recovery** (v2.1.9.0, WI#545/WI#572/WI#571/WI#585) — prove model/request metadata separates cache entries, smart-routed/failover and tool calls bypass it, and empty/reasoning-only/corrupt responses miss it; a stream hit preserves finish reason without discarded retry usage. Return an uppercase `FINAL…</arg_value>` pseudo-action and confirm its answer is consumed before lease enforcement while a real `finalize_order` action still executes.
+- [ ] **Billed-empty retry input budget** (v2.2.0.0, WI#578) — script billed-empty responses whose reported inputs cross `LLM_EMPTY_STREAM_RETRY_INPUT_TOKEN_BUDGET`; confirm no further attempt opens at that provider leg and the typed `EmptyStream` retains all usage. Verify `0` restores retry-count-only behavior, usage-less empty responses are unaffected, and a failover leg has an independent budget.
+- [ ] **Legacy idle/interrupted steering** (v2.2.0.0, WI#584) — queue a V1 steer note while idle and inspect the first real provider request: the note precedes the new request with explicit pre-turn framing and is drained. Repeat for approval resume and live iteration-boundary delivery. After a soft timeout, confirm pending messages and steer notes are both discarded, including a steer-only race, rather than leaking into a later turn.
 
 ## Tools, Extensions, and Skills
 
 - [ ] Sandbox policy behavior matches the active runtime (`SANDBOX_RUNTIME` auto/podman/docker) and network mode (`SANDBOX_NETWORK` none/proxy-enforced/tunnel/proxy). Linux defaults to `proxy-enforced`: the container keeps `--network none` and reaches only the validating public-only allowlist proxy through a per-execution Unix-socket relay. Other platforms default to `none`. `none` disables egress, `tunnel` selects the overlay sidecar, and `proxy` is the legacy advisory mode. Verify the platform default, zero credential mappings in enforced mode, and preservation of an operator override.
+- [ ] **Sandbox storage diagnostics** (v2.2.0.0, WI#587) — simulate runtime ENOSPC during image inspect/pull/setup and confirm typed non-transient `storage_unavailable` leads with the real storage path and preserves runtime detail. Ordinary command stderr containing ENOSPC, a forged host path, or missing-image text must remain ordinary output; only the runtime exit-125/error-prefix shape classifies host storage failure. Review remediation: `df`, tenant-user dangling-only `podman image prune`, and never `prune -a` for the locally built image.
+- [ ] **Sandbox tunnel fail-closed boundary** (v2.2.0.0, WI#248) — with a disposable WireGuard sidecar, verify overlay-only egress, no inbound accept, no host/metadata/uplink bypass, stable sidecar reuse, and refusal after injecting firewall drift. Keep provider-specific NetBird interoperability as a separately evidenced tier; do not substitute an argument/unit test for a live overlay claim (see `SANDBOX_TUNNEL_NETWORKING.md`).
 - [ ] HTTP requests obey URL validation, private-address policy, redirects, and capability allowlists.
 - [ ] Memory read, write, tree, and hybrid search preserve workspace semantics.
 - [ ] **Daily-log backup generation cap** (v2.1.6.0, WI#335) — seed the day log, then drive agent `memory_write` replaces (cap is `MAX_DAILY_LOG_BACKUP_GENERATIONS = 8` numbered generations plus the rolling `.bak`): the first nine succeed (the ninth fills `.bak.8`) and the tenth fails closed as a `NotAuthorized` refusal naming the retained generations, nothing is written, no generation is lost, and appends still work; an operator replace through the web memory editor or CLI still succeeds on the same saturated day (see `ic/src/workspace/README.md`).
@@ -113,6 +108,7 @@ Test only workers configured for the release candidate. Nanocode is retired and 
 - [ ] Container boundary: verify secrets are not copied into worker output or environment diagnostics.
 - [ ] Job list, status, events, prompt, and cancel operations agree across CLI/web/tool surfaces.
 - [ ] **External-worker proxied tools** (v2.1.6.0, WI#324) — on a worker with a `tool_allowlist` grant (kimi lane ships the `lunarwing` MCP shim), confirm a permitted proxied call (e.g. `memory_read` of an allowed workspace path) round-trips through the hub, an unlisted tool is absent from the worker's tool catalog, and a denied call returns the hub's sanitized reason; a cron-mode worker gets no worker-level grants on ordinary dispatches (see `../ops/WORKER-CONTAINERS.md`).
+- [ ] **Worker source and egress boundaries** (v2.1.9.0 WI#539/WI#540; WI#424) — build every enabled lane from the operator-selected release ref and clean operator-owned archive; unknown, off-ref, dirty sources and unsafe archive entries must fail before image build. Audit `worker-listeners <tenant>` and `worker-egress <tenant>`: no self-published listener/share path, the per-tenant network and static hosts match configuration, live nftables rules allow only LLM/operator destinations, and a missing `nft` or unproven filter fails closed.
 
 ## Multi-Tenant and Init Coverage
 
@@ -121,6 +117,7 @@ Test only workers configured for the release candidate. Nanocode is retired and 
 - [ ] Run MT admin `status <tenant>` plus host `doctor`; do not substitute bare system-bus `systemctl`.
 - [ ] Verify systemd user-manager behavior on systemd hosts.
 - [ ] Verify OpenRC service rendering and lifecycle on a Gentoo/OpenRC host, or record the tier as deferred.
+- [ ] **OpenRC uid-0 identity refusal** (v2.2.0.0, WI#574) — on a disposable single-node install, verify both literal `root` and a non-root-named uid-0 alias are refused before service files are written unless `LUNARWING_ALLOW_ROOT_SERVICE=1` is explicit; a normal non-root account still installs, and an unknown account fails closed.
 - [ ] Start, stop, restart, build, and remove the disposable tenant through MT admin.
 - [ ] **Required tenant LLM endpoint** (v2.1.6.0, WI#330) — with both fleet vars (`LUNARWING_MT_TENSORZERO_URL`, `LUNARWING_MT_LLM_BASE_URL`) unset, `add-tenant` without `--tensorzero-url`/`--llm-base-url` aborts before creating tenant state; `--enable-proxy` without an upstream aborts; a rendered worker env never carries the baked `.invalid` placeholder (the render dies naming the fix), while a hand-started worker container without `<WORKER>_BASE_URL` refuses to start on the baked `.invalid` config naming the variable to fix; `upgrade-tenant` backfills an inheritable endpoint for enabled workers before rebuilding (see `MT-ADMIN-QUICKSTART.md` §3).
 - [ ] Confirm host health discovery uses the tenant port registry rather than a hardcoded single-node port.
@@ -134,6 +131,8 @@ Test only workers configured for the release candidate. Nanocode is retired and 
 - [ ] Restore the database backup or execute the documented rollback in staging.
 - [ ] Confirm watchdog/self-heal alerts and restart limits behave as documented.
 - [ ] **Pending-gates corrupt-file quarantine** (v2.1.5.0, WI#299) — with a gate paused in `pending-gates.json`, corrupt the file (invalid JSON) and restart the engine: the unparseable file is renamed to `pending-gates.json.corrupt-<unix-millis>` (warn-level log naming both paths), saves proceed against fresh empty state, and the orphaned Waiting threads fail at boot reconciliation. Also confirm temp/lock files are created `0600` and a save replaces the live inode atomically (see `../architecture/ENGINE-V2.md`).
+- [ ] **Redacted mission-load diagnostics** (v2.2.0.0, WI#576) — remove `goal` from a disposable Active mission and restart: it stays dropped, WARN includes its validated id/path, `error_kind=data`, and `missing_field="goal"`, and no goal text appears. Unknown variants, invalid values, forged field names, and full Serde errors must not reach WARN; full detail remains DEBUG-only.
+- [ ] **Startup version evidence** (v2.2.0.0, WI#579) — confirm the first INFO operational log after tracing starts is `Starting LunarWing v<package-version>` and matches the deployed binary, including one systemd-user and one OpenRC installation where available.
 
 ## Cleanup and Sign-Off
 
