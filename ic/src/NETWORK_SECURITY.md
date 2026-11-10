@@ -401,7 +401,7 @@ Sandboxed policies (`readonly`, `workspace_write`) select an egress mode via
 |------|-----------|-------------|
 | `none` (default off Linux) | `--network none` on the container | **Kernel-enforced** — no egress at all; the proxy is not started |
 | `proxy-enforced` (Linux default; WI#155/537) | Container keeps `--network none`; egress only through a per-execution **Unix-socket relay** to the allowlist proxy | **Enforced** — no direct egress path exists anywhere (loopback included); the proxy rejects non-public destinations and pins DNS |
-| `tunnel` (WI#248/592) | Commands join their daemon's NetBird/WireGuard sidecar netns; the sidecar carries an `nft` `input` chain (policy drop) and an `output` chain (policy drop: only `lo`, the tunnel interface, the provider's marked control traffic and, by default, DNS to the runtime's resolvers pass; link-local IPv4 dropped; custom tunnel DNS removes the uplink DNS rules) | **Kernel-enforced egress-only** — joined commands reach exactly what the tunnel routes (overlay CIDRs of a split tunnel, everything through a full-route tunnel); the uplink, host loopback, LAN and cloud metadata are unreachable; new inbound is dropped |
+| `tunnel` (WI#248/592) | Commands join the verified container ID of their daemon's NetBird/WireGuard sidecar netns; `nft` `input`/`output` base chains have policy drop; only loopback, tunnel interfaces, marked provider traffic and, by default, DNS to runtime resolvers pass; link-local IPv4 drops; custom joined-run DNS removes direct uplink DNS rules | **Kernel-enforced egress-only** — joined commands reach what the tunnel routes plus the default DNS residual; non-DNS uplink, host loopback, LAN and cloud metadata are unreachable and new inbound drops. NetBird live interoperability and local-DNS forwarding remain unvalidated in WI#600 |
 | `proxy` | HTTP proxy + `http_proxy`/`https_proxy` env vars in the container | **Advisory (legacy)** — a process that ignores proxy env vars can still egress directly |
 
 **Default policy (WI#537, v2.2.0.0):** on Linux the in-code default and new
@@ -432,14 +432,15 @@ public-only validating proxy:
 
 The opt-in `tunnel` mode (WI#248) is separate from both the gateway's inbound
 `src/tunnel/` abstraction and external-worker exposure. One daemon-owned
-sidecar establishes NetBird or kernel WireGuard; one-shot commands join only
-its network namespace and retain every existing hardening flag. The sidecar
-name and NetBird state volume are derived from `LUNARWING_BASE_DIR`, and an
-instance ownership label prevents one daemon from removing another daemon's
-resources. There are no
-published ports or host-network joins. The sidecar carries a required
-`nftables` table with two base chains, installed after the provider is up and
-verified rule by rule before every run:
+sidecar establishes NetBird or kernel WireGuard; one-shot commands join its
+network namespace with every existing hardening flag. The sidecar name and
+NetBird state volume are instance-scoped from `LUNARWING_BASE_DIR`, and an
+ownership label prevents cross-daemon removal. Recreation is serialized per
+instance and runs join only the exact container ID returned by health/firewall
+verification. There are no published ports or host-network joins. The required
+`nftables` table has two base chains, installed after provider startup and
+verified rule by rule before every run; no healthy ID is available before that
+installation:
 
 - `input`, policy `drop`: accepts loopback and `established,related` return
   traffic only. A sandbox process cannot bind an inbound service reachable
@@ -451,10 +452,16 @@ verified rule by rule before every run:
   WireGuard device fwmark; the sidecar sets `0x4c57` on a device whose config
   left it off). `169.254.0.0/16` (cloud metadata, podman's host alias) is
   dropped before the mark accept. Joiners have no `NET_ADMIN`, so they cannot
-  set a socket mark or alter either chain: what they reach is exactly what
-  the tunnel routes, and the uplink, host loopback, LAN and metadata service
-  are unreachable. `SANDBOX_TUNNEL_DNS` configures overlay resolvers on the
-  sidecar and joined runs and removes every uplink DNS accept.
+  set a socket mark or alter either chain.
+
+The default runtime-resolver DNS allowance is the one residual uplink channel:
+recursive DNS can carry query-based exfiltration even though other uplink,
+host-loopback, LAN, and metadata connections are unreachable.
+`SANDBOX_TUNNEL_DNS` mounts non-secret mode-`0644` overlay resolver files
+`ro,z` into joined runs only and removes every direct uplink DNS accept. The
+sidecar retains runtime DNS to resolve provider endpoints during bootstrap.
+NetBird's local DNS listener may have its own marked upstream path; that and
+live provider interoperability are WI#600 measurements, not claimed closed.
 
 **Shared-loopback decision (WI#592):** concurrent commands of one daemon share
 loopback, listeners, and port space. This is accepted because one daemon/tenant
@@ -467,9 +474,13 @@ between its commands.
 The manager health-gates sidecar startup and rechecks provider health,
 configuration hash and both chains before each execution. Peerless WireGuard
 requires `wg0`; peered WireGuard requires a nonzero handshake no more than 180
-seconds old or a successful operator-configured overlay canary. NetBird's
-default image is the digest-pinned 0.82.0 OCI index, and every start/health
-check hashes the resolved local image ID so tag rotation recreates the sidecar.
+seconds old or a successful operator-configured overlay canary. Without a
+canary, at least one peer must configure `PersistentKeepalive` from 1 through
+60 seconds. DNS/canary validation rejects loopback, link-local, broadcast,
+unspecified, and multicast addresses, and the canary is re-probed after the
+firewall is installed. NetBird's default image is the digest-pinned 0.82.0 OCI
+index; mutable references warn with auto-pull enabled. Every start/health check
+hashes the resolved local image ID so tag rotation recreates the sidecar.
 Missing `nft`, an unhealthy provider, or an altered/missing chain returns
 `[sandbox:sandbox_unavailable]` without degrading to another tier; a dead or
 drifted sidecar is removed and recreated once before the run is refused.
@@ -478,9 +489,12 @@ mode-0600 `--env-file` under the private runtime directory (no `/tmp`
 fallback); WireGuard uses a regular non-symlink mode-0600 config mounted
 read-only with a private SELinux label. Key material never enters argv, joiner
 filesystems/environments, or LunarWing log/error text; the configuration label
-on the container is a salted digest. NetBird's peer identity lives in a named
-volume keyed by that digest, so restarts do not spend setup keys. See
-`docs/guides/SANDBOX_TUNNEL_NETWORKING.md` and
+on the container is a salted digest. NetBird's peer identity volume uses a
+separate salted hash of instance, management URL, and setup key only, so image
+or DNS changes do not spend another setup key. Removal stops the deterministic
+transient helper unit with `--kill-whom=all`; ordinary daemon exit does not
+currently invoke `SandboxManager::shutdown()` and is not documented as cleanup.
+See `docs/guides/SANDBOX_TUNNEL_NETWORKING.md` and
 `docs/proposals/PODMAN_SANDBOX_TUNNEL_NETWORKING.md`.
 
 The advisory `proxy` mode remains supported for single-node backwards
