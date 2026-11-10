@@ -136,6 +136,62 @@ async fn tunnel_container_id(name: &str) -> Option<String> {
     (output.status.success() && !id.is_empty()).then_some(id)
 }
 
+async fn assert_detached_helper_stopped(container_name: &str) {
+    let instance = container_name
+        .strip_prefix("lunarwing-sandbox-tunnel-")
+        .expect("instance-specific sidecar name");
+    let unit = format!("lunarwing-tunnel-{instance}");
+    let manager = tokio::process::Command::new("systemctl")
+        .args(["--user", "show", "--property=Version"])
+        .output()
+        .await;
+    if !matches!(manager, Ok(output) if output.status.success()) {
+        eprintln!("skipping detached-unit check: no systemd user manager");
+        return;
+    }
+    let output = tokio::process::Command::new("systemctl")
+        .args([
+            "--user",
+            "list-units",
+            "--all",
+            "--plain",
+            "--no-legend",
+            "--type=service",
+            "--full",
+        ])
+        .output()
+        .await
+        .expect("list user units");
+    assert!(output.status.success());
+    let listing = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !listing.contains(&format!("{unit}.service")),
+        "detached unit remains:\n{listing}"
+    );
+    for process in std::fs::read_dir("/proc").expect("procfs").flatten() {
+        let path = process.path();
+        if !path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().chars().all(|c| c.is_ascii_digit()))
+        {
+            continue;
+        }
+        let Ok(cmdline) = std::fs::read(path.join("cmdline")) else {
+            continue;
+        };
+        let is_pasta = cmdline
+            .split(|byte| *byte == 0)
+            .next()
+            .is_some_and(|program| program.ends_with(b"pasta"));
+        if is_pasta
+            && std::fs::read_to_string(path.join("cgroup"))
+                .is_ok_and(|cgroup| cgroup.contains(&unit))
+        {
+            panic!("pasta remains in {unit}: {}", path.display());
+        }
+    }
+}
+
 async fn assert_firewall_listing(name: &str, allow_uplink_dns: bool) {
     let output = podman_output(&[
         "exec",
@@ -460,6 +516,8 @@ async fn podman_tunnel_sidecar_wireguard_lifecycle_and_join() {
     .await;
     sidecar.stop().await;
     other.stop().await;
+    assert_detached_helper_stopped(sidecar.container_name()).await;
+    assert_detached_helper_stopped(other.container_name()).await;
     let _ = std::fs::remove_dir_all(&workdir);
     result.expect("real WireGuard sidecar lifecycle and egress-only namespace");
 }
