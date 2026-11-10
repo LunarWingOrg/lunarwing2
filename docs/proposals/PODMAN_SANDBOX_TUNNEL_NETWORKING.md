@@ -125,9 +125,13 @@ not application auth.
   are bounded.
 - On systemd hosts the detached `run -d` client uses a deterministic
   `lunarwing-tunnel-<instance>` transient service with `KillMode=process` so its
-  pasta helper outlives the client. Every sidecar removal/start-failure path
-  stops that unit with `--kill-whom=all`; foreground workload cleanup is
-  unchanged.
+  pasta helper outlives the client. The unit stays loaded while a helper lives
+  and `systemd-run` refuses a loaded unit name, so every sidecar
+  removal/start-failure path frees it once the container is gone: a bounded
+  wait for the helpers to exit, then `systemctl --user kill` (SIGTERM, then
+  SIGKILL) for leftovers. `stop` is not used, because it does nothing to a unit
+  whose client has already exited. Helpers of a container that still exists
+  are never signalled. Foreground workload cleanup is unchanged.
 - `SandboxManager` health-gates initialization and calls `ensure_healthy()`
   before every container run, joining only the returned verified ID. Provider
   failure, a dead sidecar, hash drift, or firewall drift returns

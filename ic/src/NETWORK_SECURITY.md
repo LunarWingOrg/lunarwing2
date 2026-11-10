@@ -491,9 +491,12 @@ read-only with a private SELinux label. Key material never enters argv, joiner
 filesystems/environments, or LunarWing log/error text; the configuration label
 on the container is a salted digest. NetBird's peer identity volume uses a
 separate salted hash of instance, management URL, and setup key only, so image
-or DNS changes do not spend another setup key. Removal stops the deterministic
-transient helper unit with `--kill-whom=all`; ordinary daemon exit does not
-currently invoke `SandboxManager::shutdown()` and is not documented as cleanup.
+or DNS changes do not spend another setup key. After a removal, and only once
+the runtime reports the container gone, the deterministic transient helper unit
+is freed: helpers get up to three seconds to exit, and leftovers are signalled
+with `systemctl --user kill` (SIGTERM, then SIGKILL). Ordinary daemon exit does
+not currently invoke `SandboxManager::shutdown()` and is not documented as
+cleanup.
 See `docs/guides/SANDBOX_TUNNEL_NETWORKING.md` and
 `docs/proposals/PODMAN_SANDBOX_TUNNEL_NETWORKING.md`.
 

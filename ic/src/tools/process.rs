@@ -640,34 +640,164 @@ pub fn stop_unit_background(unit: String, xdg_runtime_dir: Option<&str>) {
 /// Stop a transient workload unit (SIGTERM, then SIGKILL after its
 /// `TimeoutStopSec`). Best-effort: the unit may already be gone.
 async fn stop_workload_unit(unit: &str, xdg_runtime_dir: Option<&str>) {
-    stop_workload_unit_with_options(unit, xdg_runtime_dir, None).await;
-}
-
-/// Stop a detached sidecar unit and every network helper left in its cgroup.
-pub(crate) async fn stop_detached_workload_unit(unit: &str, xdg_runtime_dir: Option<&str>) {
-    stop_workload_unit_with_options(unit, xdg_runtime_dir, Some("all")).await;
-}
-
-async fn stop_workload_unit_with_options(
-    unit: &str,
-    xdg_runtime_dir: Option<&str>,
-    kill_whom: Option<&str>,
-) {
-    let mut stop = Command::new("systemctl");
-    stop.arg("--user");
-    if let Some(kill_whom) = kill_whom {
-        stop.arg(format!("--kill-whom={kill_whom}"));
-    }
-    stop.args(["stop", unit]);
-    if let Some(dir) = xdg_runtime_dir {
-        stop.env("XDG_RUNTIME_DIR", dir);
-    }
-    stop.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
+    let mut stop = user_systemctl(&["stop", unit], xdg_runtime_dir);
+    stop.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     if let Err(e) = stop.status().await {
         debug!(unit = %unit, error = %e, "workload service stop failed");
     }
+}
+
+/// `systemctl --user <args>` against the workload manager, with no stdin.
+fn user_systemctl(args: &[&str], xdg_runtime_dir: Option<&str>) -> Command {
+    let mut cmd = Command::new("systemctl");
+    cmd.arg("--user").args(args);
+    if let Some(dir) = xdg_runtime_dir {
+        cmd.env("XDG_RUNTIME_DIR", dir);
+    }
+    cmd.stdin(std::process::Stdio::null());
+    cmd
+}
+
+/// How long a detached unit gets to unload by itself, and again after each
+/// signal. Rootless network helpers normally leave the cgroup within about
+/// 150 ms of the container's removal.
+const DETACHED_UNIT_SETTLE: Duration = Duration::from_secs(3);
+const DETACHED_UNIT_POLL: Duration = Duration::from_millis(50);
+
+/// What the user manager reports for a detached unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DetachedUnitState {
+    /// Not loaded: the name is free for the next `systemd-run --unit=`.
+    Unloaded,
+    /// The detached client itself is still running; a start is in flight.
+    ClientRunning,
+    /// The client has exited and processes remain in the unit's cgroup.
+    Leftover,
+}
+
+/// Parse `systemctl show --property=LoadState --property=ActiveState`.
+/// Returns `None` when the manager did not answer with a load state.
+pub(crate) fn parse_detached_unit_state(show_output: &str) -> Option<DetachedUnitState> {
+    let value = |key: &str| {
+        show_output
+            .lines()
+            .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+            .map(str::trim)
+    };
+    let load = value("LoadState")?;
+    if load == "not-found" {
+        return Some(DetachedUnitState::Unloaded);
+    }
+    match value("ActiveState") {
+        Some("active" | "activating" | "reloading" | "deactivating") => {
+            Some(DetachedUnitState::ClientRunning)
+        }
+        _ => Some(DetachedUnitState::Leftover),
+    }
+}
+
+/// True when `systemd-run --unit=<name>` failed because the name is taken:
+/// a transient unit stays loaded while any process is in its cgroup.
+pub(crate) fn unit_name_in_use(systemd_run_stderr: &str) -> bool {
+    systemd_run_stderr.contains("already loaded")
+        || systemd_run_stderr.contains("has a fragment file")
+}
+
+async fn detached_unit_state(
+    unit: &str,
+    xdg_runtime_dir: Option<&str>,
+) -> Option<DetachedUnitState> {
+    let mut show = user_systemctl(
+        &[
+            "show",
+            "--property=LoadState",
+            "--property=ActiveState",
+            unit,
+        ],
+        xdg_runtime_dir,
+    );
+    show.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let output = show.output().await.ok()?;
+    parse_detached_unit_state(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Poll until the unit is unloaded or `wait` has passed; returns the last
+/// state seen (`None` when the manager could not be queried).
+async fn wait_detached_unit_unloaded(
+    unit: &str,
+    xdg_runtime_dir: Option<&str>,
+    wait: Duration,
+) -> Option<DetachedUnitState> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let state = detached_unit_state(unit, xdg_runtime_dir).await;
+        if state != Some(DetachedUnitState::Leftover) || tokio::time::Instant::now() >= deadline {
+            return state;
+        }
+        tokio::time::sleep(DETACHED_UNIT_POLL).await;
+    }
+}
+
+/// Signal every process left in a detached unit's cgroup.
+///
+/// `stop` cannot do this: once the detached client has exited the unit is
+/// inactive, so `stop` does nothing, and `--kill-whom` is an option of
+/// `kill` only. `kill` signals all processes by default; the option is left
+/// out because systemd before 252 spells it `--kill-who`.
+fn detached_unit_kill_command(
+    unit: &str,
+    signal: Option<&str>,
+    xdg_runtime_dir: Option<&str>,
+) -> Command {
+    let mut args = vec!["kill"];
+    let signal = signal.map(|signal| format!("--signal={signal}"));
+    if let Some(signal) = &signal {
+        args.push(signal.as_str());
+    }
+    args.push(unit);
+    let mut kill = user_systemctl(&args, xdg_runtime_dir);
+    kill.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    kill
+}
+
+/// Free a detached unit's name once its container is gone.
+///
+/// The unit of a detached container client (`KillMode=process`) stays loaded
+/// for as long as a runtime helper is in its cgroup, and `systemd-run`
+/// refuses a loaded unit name. Helpers normally exit by themselves right
+/// after the container; whatever is still there after a short wait gets
+/// SIGTERM, then SIGKILL. A unit whose client is still running is left
+/// alone. Returns whether the unit is unloaded.
+///
+/// Callers must first make sure the container is gone: this kills the
+/// network helpers a live container depends on.
+pub(crate) async fn release_detached_workload_unit(
+    unit: &str,
+    xdg_runtime_dir: Option<&str>,
+) -> bool {
+    for signal in [None, Some("SIGKILL")] {
+        match wait_detached_unit_unloaded(unit, xdg_runtime_dir, DETACHED_UNIT_SETTLE).await {
+            Some(DetachedUnitState::Unloaded) => return true,
+            Some(DetachedUnitState::Leftover) => {}
+            Some(DetachedUnitState::ClientRunning) | None => return false,
+        }
+        debug!(
+            unit = %unit,
+            signal = signal.unwrap_or("SIGTERM"),
+            "signalling leftover processes of a detached unit"
+        );
+        if let Err(e) = detached_unit_kill_command(unit, signal, xdg_runtime_dir)
+            .status()
+            .await
+        {
+            debug!(unit = %unit, error = %e, "detached unit kill failed");
+        }
+    }
+    wait_detached_unit_unloaded(unit, xdg_runtime_dir, DETACHED_UNIT_SETTLE).await
+        == Some(DetachedUnitState::Unloaded)
 }
 
 /// Reaps an entire workload process tree and, in systemd service mode, stops
@@ -1050,6 +1180,192 @@ mod tests {
             args.iter()
                 .any(|arg| arg == "--unit=lunarwing-tunnel-test-instance")
         );
+    }
+
+    /// WI#601: `stop` does nothing to an inactive unit and `--kill-whom`
+    /// belongs to `kill`, so leftover helpers must be signalled with `kill`.
+    #[test]
+    fn detached_unit_cleanup_uses_systemctl_kill() {
+        let args = |signal| {
+            detached_unit_kill_command("lunarwing-tunnel-test.service", signal, Some("/run/user/1"))
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            args(None),
+            ["--user", "kill", "lunarwing-tunnel-test.service"]
+        );
+        assert_eq!(
+            args(Some("SIGKILL")),
+            [
+                "--user",
+                "kill",
+                "--signal=SIGKILL",
+                "lunarwing-tunnel-test.service"
+            ]
+        );
+        for argv in [args(None), args(Some("SIGKILL"))] {
+            assert!(!argv.iter().any(|arg| arg == "stop"));
+            assert!(!argv.iter().any(|arg| arg.starts_with("--kill-who")));
+        }
+    }
+
+    #[test]
+    fn detached_unit_state_distinguishes_unloaded_running_and_leftover() {
+        use DetachedUnitState::{ClientRunning, Leftover, Unloaded};
+        let parse = parse_detached_unit_state;
+        assert_eq!(
+            parse("LoadState=not-found\nActiveState=inactive\n"),
+            Some(Unloaded)
+        );
+        // The client exited; pasta or conmon keep the unit loaded.
+        assert_eq!(
+            parse("LoadState=loaded\nActiveState=inactive\n"),
+            Some(Leftover)
+        );
+        assert_eq!(
+            parse("ActiveState=failed\nLoadState=loaded\n"),
+            Some(Leftover)
+        );
+        for active in ["active", "activating", "deactivating", "reloading"] {
+            assert_eq!(
+                parse(&format!("LoadState=loaded\nActiveState={active}\n")),
+                Some(ClientRunning),
+                "{active}"
+            );
+        }
+        // No answer from the manager is not "unloaded".
+        assert_eq!(parse(""), None);
+        assert_eq!(parse("ActiveState=inactive\n"), None);
+    }
+
+    #[test]
+    fn unit_name_in_use_matches_the_systemd_run_refusal() {
+        assert!(unit_name_in_use(
+            "Failed to start transient service unit: Unit lunarwing-tunnel-x.service was already loaded or has a fragment file.\n"
+        ));
+        assert!(!unit_name_in_use(
+            "Error: creating container storage: the container name \"x\" is already in use\n"
+        ));
+        assert!(!unit_name_in_use(""));
+    }
+
+    /// WI#601: a process left behind in a detached unit keeps the unit
+    /// loaded, a same-name start fails while it is, and the release kills
+    /// the process and frees the name. Skipped without a user manager.
+    #[tokio::test]
+    async fn release_detached_unit_kills_leftover_and_frees_the_name() {
+        let spawner = workload_spawner().await;
+        if !spawner.uses_systemd_services() {
+            eprintln!("skipping: systemd user transient services unavailable");
+            return;
+        }
+        let xdg = spawner.xdg_runtime_dir();
+        let name = format!(
+            "lunarwing-test-detached-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let unit = format!("{name}.service");
+        // Like `podman run -d`: the client exits and leaves a helper behind.
+        let start = |script: &'static str| {
+            let mut cmd = spawner.command("sh", &["-c", script]);
+            let spec = spawner
+                .prepare_detached_service_with_unit(&mut cmd, Some(&name))
+                .expect("detached service spec");
+            cmd.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped());
+            (cmd, spec)
+        };
+        let (mut cmd, spec) = start("setsid sleep 311 >/dev/null 2>&1 & exit 0");
+        let child = cmd.spawn().expect("spawn detached client");
+        let mut guard = ProcessTreeGuard::for_service(&child, Some(&spec), xdg);
+        let out = child.wait_with_output().await.expect("wait");
+        guard.disarm();
+        assert!(out.status.success(), "client failed: {out:?}");
+        assert_eq!(
+            detached_unit_state(&unit, xdg).await,
+            Some(DetachedUnitState::Leftover)
+        );
+
+        // The pre-fix cleanup: `stop` leaves the helper and the name taken.
+        stop_workload_unit(&unit, xdg).await;
+        assert_eq!(
+            detached_unit_state(&unit, xdg).await,
+            Some(DetachedUnitState::Leftover),
+            "stop must not be what frees a detached unit"
+        );
+        let (mut cmd, spec) = start("exit 0");
+        let child = cmd.spawn().expect("spawn same-name client");
+        let mut guard = ProcessTreeGuard::for_service(&child, Some(&spec), xdg);
+        let out = child.wait_with_output().await.expect("wait");
+        guard.disarm();
+        assert!(!out.status.success(), "same-name start must be refused");
+        assert!(
+            unit_name_in_use(&String::from_utf8_lossy(&out.stderr)),
+            "unexpected refusal: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        assert!(release_detached_workload_unit(&unit, xdg).await);
+        assert_eq!(
+            detached_unit_state(&unit, xdg).await,
+            Some(DetachedUnitState::Unloaded)
+        );
+        let (mut cmd, spec) = start("exit 0");
+        let child = cmd.spawn().expect("spawn after release");
+        let mut guard = ProcessTreeGuard::for_service(&child, Some(&spec), xdg);
+        let out = child.wait_with_output().await.expect("wait");
+        guard.disarm();
+        assert!(
+            out.status.success(),
+            "start after release failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A unit whose client is still running belongs to a start in flight:
+    /// the release must neither signal it nor report the name free.
+    #[tokio::test]
+    async fn release_detached_unit_leaves_a_running_client_alone() {
+        let spawner = workload_spawner().await;
+        if !spawner.uses_systemd_services() {
+            eprintln!("skipping: systemd user transient services unavailable");
+            return;
+        }
+        let xdg = spawner.xdg_runtime_dir();
+        let name = format!(
+            "lunarwing-test-detached-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let unit = format!("{name}.service");
+        let mut cmd = spawner.command("sleep", &["313"]);
+        let spec = spawner
+            .prepare_detached_service_with_unit(&mut cmd, Some(&name))
+            .expect("detached service spec");
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = cmd.spawn().expect("spawn long-running client");
+        let mut guard = ProcessTreeGuard::for_service(&child, Some(&spec), xdg);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while detached_unit_state(&unit, xdg).await != Some(DetachedUnitState::ClientRunning) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "client unit never became active"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!release_detached_workload_unit(&unit, xdg).await);
+        assert_eq!(
+            detached_unit_state(&unit, xdg).await,
+            Some(DetachedUnitState::ClientRunning)
+        );
+        guard.terminate(&mut child).await;
     }
 
     #[test]

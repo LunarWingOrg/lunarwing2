@@ -276,9 +276,16 @@ run joins the exact container ID that passed health and firewall verification;
 if recreation removes that ID first, the run fails instead of joining a new,
 not-yet-filtered namespace.
 
-`SandboxManager::shutdown()` removes only its own sidecar and its deterministic
-`lunarwing-tunnel-<instance>` transient helper unit, killing every remaining
-process in that unit. The normal daemon exit path currently does **not** call
+`SandboxManager::shutdown()` removes only its own sidecar. On systemd hosts it
+then frees the deterministic `lunarwing-tunnel-<instance>` transient helper
+unit: once the runtime reports the container gone, it waits up to three seconds
+for pasta and conmon to exit, and sends anything still in the unit SIGTERM and
+then SIGKILL (`systemctl --user kill`). It never signals the helpers of a
+container that still exists, for example when removal failed because a joined
+run is in flight. A new sidecar reuses the unit name, so a start that finds the
+unit still loaded fails closed and names the unit; the manual remedy is
+`systemctl --user kill lunarwing-tunnel-<instance>.service`. The normal daemon
+exit path currently does **not** call
 `SandboxManager::shutdown()`, so process exit can leave the sidecar running for
 adoption on the next start; do not claim or rely on automatic daemon-exit
 cleanup. Remove the instance container explicitly when that is not wanted. A

@@ -1029,7 +1029,9 @@ impl TunnelSidecar {
             state_volume.as_deref(),
         );
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let detached_unit = format!("lunarwing-tunnel-{}", self.instance_id);
+        // `remove()` ran first: it frees this unit name from a previous
+        // sidecar's helpers once the old container is gone.
+        let detached_unit = self.helper_unit();
         let started = tokio::time::timeout(
             self.cfg.startup_timeout,
             crate::sandbox::cli_runner::output_detached_isolated(
@@ -1057,7 +1059,14 @@ impl TunnelSidecar {
             if self.matching_container_id(hash).await.is_some() {
                 return self.wait_healthy().await;
             }
+            let unit_in_use =
+                crate::tools::process::unit_name_in_use(&String::from_utf8_lossy(&output.stderr));
             self.remove().await;
+            if unit_in_use {
+                return Err(self.unavailable(&format!(
+                    "helper unit {detached_unit}.service of a previous sidecar was still loaded, so the sidecar could not start; retry, and if it persists run `systemctl --user kill {detached_unit}.service`"
+                )));
+            }
             return Err(self.unavailable(
                 "container runtime rejected sidecar start; verify the image and host prerequisites",
             ));
@@ -1403,7 +1412,7 @@ impl TunnelSidecar {
     /// Kill-and-remove only a sidecar carrying this instance's ownership label.
     pub async fn remove(&self) {
         let _ = tokio::time::timeout(CLEANUP_TIMEOUT, self.remove_with_grace(0)).await;
-        self.stop_network_helper().await;
+        self.release_network_helper().await;
     }
 
     /// Stop the sidecar gracefully, then remove it if this instance owns it.
@@ -1418,23 +1427,68 @@ impl TunnelSidecar {
                 "Sandbox tunnel sidecar stopped"
             );
         }
-        self.stop_network_helper().await;
+        self.release_network_helper().await;
         if let Ok(Some(path)) = self.resolv_conf_path() {
             let _ = std::fs::remove_file(path);
         }
     }
 
-    async fn stop_network_helper(&self) {
+    /// Transient unit of the detached `run -d` client. In systemd service
+    /// mode the runtime's network helpers (pasta, conmon) stay in its cgroup.
+    fn helper_unit(&self) -> String {
+        format!("lunarwing-tunnel-{}", self.instance_id)
+    }
+
+    /// Free the helper unit's name once the sidecar container is gone.
+    ///
+    /// The unit stays loaded while a helper lives, and the next start reuses
+    /// its name. The helpers must keep running for as long as the container
+    /// does, so nothing is signalled unless the runtime positively reports
+    /// that no container has the sidecar's name.
+    async fn release_network_helper(&self) {
         let spawner = crate::tools::process::workload_spawner().await;
         if !spawner.uses_systemd_services() {
             return;
         }
-        let unit = format!("lunarwing-tunnel-{}.service", self.instance_id);
-        let _ = tokio::time::timeout(
+        if self.container_absent().await != Some(true) {
+            tracing::debug!(
+                container = %self.container_name,
+                "Sidecar container is present or its state is unknown; leaving its helper unit alone"
+            );
+            return;
+        }
+        let unit = format!("{}.service", self.helper_unit());
+        let released = tokio::time::timeout(
             CLEANUP_TIMEOUT,
-            crate::tools::process::stop_detached_workload_unit(&unit, spawner.xdg_runtime_dir()),
+            crate::tools::process::release_detached_workload_unit(&unit, spawner.xdg_runtime_dir()),
         )
-        .await;
+        .await
+        .unwrap_or(false);
+        if !released {
+            tracing::warn!(
+                unit = %unit,
+                "Sandbox tunnel helper unit is still loaded after cleanup; the next sidecar start may fail"
+            );
+        }
+    }
+
+    /// `Some(true)` only when the runtime positively reports that no
+    /// container has the sidecar's name; `None` when the probe itself failed.
+    async fn container_absent(&self) -> Option<bool> {
+        let output = self
+            .output_probe(&[
+                "container",
+                "inspect",
+                "--format",
+                "{{.Id}}",
+                &self.container_name,
+            ])
+            .await
+            .ok()?;
+        container_absent_from_inspect(
+            output.status.success(),
+            &String::from_utf8_lossy(&output.stderr),
+        )
     }
 
     async fn remove_with_grace(&self, grace_secs: u32) -> bool {
@@ -1490,6 +1544,19 @@ impl TunnelSidecar {
             .map(Some)
             .map_err(|_| self.unavailable("failed to stage the NetBird credential file"))
     }
+}
+
+/// Read a failed `container inspect`: only a "no such container" answer
+/// proves absence. Any other failure (runtime down, timeout, storage lock)
+/// leaves the state unknown.
+fn container_absent_from_inspect(success: bool, stderr: &str) -> Option<bool> {
+    if success {
+        return Some(false);
+    }
+    stderr
+        .to_ascii_lowercase()
+        .contains("no such container")
+        .then_some(true)
 }
 
 /// Runtime-specific removal: podman's `rm` takes `-t`, Docker's does not, so
@@ -2267,6 +2334,36 @@ mod tests {
         assert_eq!(parse_wireguard_fwmark("0x4c57\n"), Some(0x4c57));
         assert_eq!(parse_wireguard_fwmark("0xca6c"), Some(51820));
         assert_eq!(parse_wireguard_fwmark("garbage"), None);
+    }
+
+    /// WI#601: the helper unit may be signalled only when the runtime says
+    /// the container does not exist. A failed probe proves nothing.
+    #[test]
+    fn helper_unit_cleanup_requires_a_positively_absent_container() {
+        assert_eq!(container_absent_from_inspect(true, ""), Some(false));
+        assert_eq!(
+            container_absent_from_inspect(false, "Error: no such container \"tunnel-test\"\n"),
+            Some(true)
+        );
+        assert_eq!(
+            container_absent_from_inspect(
+                false,
+                "Error response from daemon: No such container: tunnel-test\n"
+            ),
+            Some(true)
+        );
+        for stderr in [
+            "",
+            "Error: has dependent containers which must be removed before it\n",
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock.\n",
+            "Failed to start transient service unit: Connection refused\n",
+        ] {
+            assert_eq!(
+                container_absent_from_inspect(false, stderr),
+                None,
+                "{stderr}"
+            );
+        }
     }
 
     #[test]
