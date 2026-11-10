@@ -493,21 +493,22 @@ replace existing paths. Run an immediate pass with
 `refresh-knowledge <name> [--sync-source]`. Full guide:
 [`../guides/TENANT_KNOWLEDGE_SEED.md`](../guides/TENANT_KNOWLEDGE_SEED.md).
 
-## Sandbox Tunnel Networking (WI#248)
+## Sandbox Tunnel Networking (WI#248/592)
 
 `SANDBOX_NETWORK=tunnel` gives the generic shell sandbox outbound access to a
 NetBird or WireGuard overlay through a daemon-owned sidecar whose kernel
-firewall drops new inbound flows and every outbound flow that does not leave
-through the tunnel interface (the uplink, host loopback, other tenants and the
-cloud metadata service stay unreachable). It is opt-in per tenant; new
-multi-tenant envs default to `SANDBOX_NETWORK=proxy-enforced` (WI#537), while
-an existing `none`, `proxy-enforced`, `tunnel`, or `proxy` value is preserved.
+firewall drops new inbound flows and non-tunnel egress. By default, DNS to the
+runtime resolvers remains a residual uplink channel; host loopback, other
+tenants, the LAN, and cloud metadata stay unreachable. It is opt-in per tenant;
+new multi-tenant envs default to `SANDBOX_NETWORK=proxy-enforced` (WI#537),
+while an existing `none`, `proxy-enforced`, `tunnel`, or `proxy` value is
+preserved.
 
 ```bash
 SANDBOX_NETWORK=tunnel
 SANDBOX_TUNNEL_PROVIDER=netbird                      # netbird (default) | wireguard
 SANDBOX_TUNNEL_IMAGE=localhost/lunarwing-tunnel-netbird@sha256:<64-hex-digest>  # nft + provider tools
-SANDBOX_TUNNEL_DNS=100.100.0.53,fd00::53       # optional: tunnel resolvers; disables uplink DNS
+SANDBOX_TUNNEL_DNS=100.100.0.53,fd00::53       # optional joined-run tunnel resolvers; disables direct uplink DNS
 SANDBOX_TUNNEL_NETBIRD_MANAGEMENT_URL=https://netbird.example.com
 SANDBOX_TUNNEL_NETBIRD_SETUP_KEY=<dedicated-setup-key>           # secret
 SANDBOX_TUNNEL_WIREGUARD_CONFIG=/etc/lunarwing/tenants/<tenant>/wg0.conf  # wireguard: mode 0600
@@ -515,15 +516,23 @@ SANDBOX_TUNNEL_WIREGUARD_CANARY=10.231.0.1     # optional ICMP overlay health pr
 SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS=90
 ```
 
+Custom DNS is mounted only into joined runs; the sidecar retains runtime DNS
+for provider bootstrap and hostname endpoints. DNS/canary addresses reject
+loopback, link-local, broadcast, unspecified, and multicast values. Peered
+WireGuard configs need `PersistentKeepalive = 1..=60` on at least one peer or
+an overlay canary, which is re-probed after firewall installation.
+
 `add-tenant` renders none of these; `upgrade-tenant` and every other
 re-render preserve each operator-set value verbatim, so a tenant that opted in
 keeps starting. With the multi-tenant default `SANDBOX_AUTO_PULL=false` the
 sidecar image must already be in the tenant's container store (build it into
 the store the same way as the sandbox image). Prefer digest-pinned references;
-LunarWing also hashes the resolved local image ID so tag rotation cannot reuse
-stale credentials or network state. Sidecar names and NetBird volumes are
-instance-scoped, so one daemon cannot remove another daemon's resources.
-Operator guide:
+mutable references warn with auto-pull enabled. LunarWing also hashes the
+resolved local image ID so tag rotation cannot reuse stale credentials or
+network state. Sidecar names and NetBird volumes are instance-scoped, and the
+NetBird identity volume changes only with its management URL or setup key, not
+with image or DNS changes. NetBird live interoperability and local-DNS
+forwarding remain unvalidated in WI#600. Operator guide:
 [`../guides/SANDBOX_TUNNEL_NETWORKING.md`](../guides/SANDBOX_TUNNEL_NETWORKING.md).
 
 ## Runtime Behavior
