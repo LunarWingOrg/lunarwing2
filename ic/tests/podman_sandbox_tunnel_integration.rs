@@ -26,6 +26,7 @@ const JOINED_PROBE: &str = "cat /etc/resolv.conf; \
      wget -qO- -T 3 http://169.254.169.254/ >/dev/null 2>&1 && echo LUNARWING-TUNNEL-METADATA-OPEN; \
      H=$(getent hosts host.containers.internal | cut -d' ' -f1); \
      if [ -n \"$H\" ] && nc -z -w 2 \"$H\" 22 >/dev/null 2>&1; then echo LUNARWING-TUNNEL-HOST-OPEN; fi; \
+     nslookup example.com 2>&1 || true; \
      nslookup example.com >/dev/null 2>&1 && echo LUNARWING-TUNNEL-DNS-OK; \
      true";
 
@@ -232,7 +233,12 @@ async fn assert_joined_run(
         assert!(!output.stdout.contains(open), "uplink open: {open}");
     }
     if dns.is_empty() {
-        assert!(output.stdout.contains("LUNARWING-TUNNEL-DNS-OK"));
+        assert!(
+            output.stdout.contains("LUNARWING-TUNNEL-DNS-OK"),
+            "default tunnel DNS failed:\n{}{}",
+            output.stdout,
+            output.stderr
+        );
     } else {
         for resolver in dns {
             assert!(output.stdout.contains(&format!("nameserver {resolver}")));
