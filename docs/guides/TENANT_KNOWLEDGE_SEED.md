@@ -12,13 +12,13 @@ a separate additive refresh cadence that imports newly published paths without
 changing existing notes. Existing tenants upgraded to a seed-capable binary are
 neither seeded nor opted in automatically.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-14 (v2.1.6.0).** The seeding and refresh
-flows are unchanged. Note the stale-marking sweep no longer has the v2.1.1
-1,000-note scan cap: `knowledge_list_notes` pages the whole store with a keyset
-cursor (500-row pages, 100k safety ceiling), and the sweep also runs on an
-independent daemon cadence (`KNOWLEDGE_SWEEP_ENABLED`) so multi-tenant hosts —
-where mt-admin renders `HEARTBEAT_ENABLED=false` — still age notes. A seeded
-tenant's full corpus (~1,250 notes) is therefore fully sweepable.
+**Revalidated against source 2026-11-10 (v2.2.0.0).** The seeding and additive
+refresh flows are unchanged. The stale-marking sweep has no 1,000-note scan cap:
+`knowledge_list_notes` pages the whole store with a keyset cursor (500-row
+pages, 100k safety ceiling), and the independent `KNOWLEDGE_SWEEP_ENABLED`
+cadence still runs when mt-admin renders `HEARTBEAT_ENABLED=false`. A seeded
+tenant's full corpus is therefore sweepable; the roughly 1,250-note figure below
+is only the August 2026 snapshot, not a fixed corpus size.
 
 ## What the tenant gets
 
