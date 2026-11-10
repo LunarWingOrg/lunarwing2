@@ -1145,7 +1145,10 @@ mod tests {
         );
         assert_eq!(
             tunnel.dns,
-            vec!["100.100.0.53".parse().unwrap(), "fd00::53".parse().unwrap()]
+            vec![
+                "100.100.0.53".parse::<IpAddr>().unwrap(),
+                "fd00::53".parse::<IpAddr>().unwrap()
+            ]
         );
     }
 
