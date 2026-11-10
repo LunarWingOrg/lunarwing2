@@ -229,14 +229,20 @@ impl TunnelSidecarConfig {
             .iter()
             .any(|address| !valid_tunnel_address(address))
         {
-            return Err("SANDBOX_TUNNEL_DNS addresses must be specified unicast IPs".into());
+            return Err(
+                "SANDBOX_TUNNEL_DNS rejects loopback, link-local, broadcast, unspecified, and multicast addresses"
+                    .into(),
+            );
         }
         if self
             .wireguard_canary
             .as_ref()
             .is_some_and(|address| !valid_tunnel_address(address))
         {
-            return Err("SANDBOX_TUNNEL_WIREGUARD_CANARY must be a specified unicast IP".into());
+            return Err(
+                "SANDBOX_TUNNEL_WIREGUARD_CANARY rejects loopback, link-local, broadcast, unspecified, and multicast addresses"
+                    .into(),
+            );
         }
         if self.provider != TunnelProvider::Wireguard && self.wireguard_canary.is_some() {
             return Err("SANDBOX_TUNNEL_WIREGUARD_CANARY requires the wireguard provider".into());
@@ -290,7 +296,21 @@ impl TunnelSidecarConfig {
 }
 
 fn valid_tunnel_address(address: &IpAddr) -> bool {
-    !address.is_unspecified() && !address.is_multicast()
+    match address {
+        IpAddr::V4(address) => {
+            !address.is_unspecified()
+                && !address.is_loopback()
+                && !address.is_link_local()
+                && !address.is_broadcast()
+                && !address.is_multicast()
+        }
+        IpAddr::V6(address) => {
+            !address.is_unspecified()
+                && !address.is_loopback()
+                && !address.is_unicast_link_local()
+                && !address.is_multicast()
+        }
+    }
 }
 
 fn valid_sha256_hex(value: &str) -> bool {
@@ -993,8 +1013,8 @@ impl TunnelSidecar {
         // The provider must be up before the firewall goes in: wg-quick and
         // the NetBird client resolve and reach their endpoints through the
         // still-open uplink, and the WireGuard device must exist to read or
-        // set its fwmark. No joiner exists yet, so nothing shares the
-        // namespace during this window.
+        // set its fwmark. The manager receives no verified container ID to
+        // join until after firewall installation.
         if let Err(error) = self.wait_provider_ready().await {
             self.remove().await;
             return Err(error);
@@ -1002,6 +1022,12 @@ impl TunnelSidecar {
         if let Err(error) = self.install_egress_firewall().await {
             self.remove().await;
             return Err(error);
+        }
+        if self.cfg.wireguard_canary.is_some() && !self.provider_probe().await {
+            self.remove().await;
+            return Err(
+                self.unavailable("WireGuard canary failed after the egress firewall was installed")
+            );
         }
         tracing::info!(
             container = %self.container_name,
@@ -1908,6 +1934,38 @@ mod tests {
             ..netbird_cfg()
         };
         assert!(misplaced_canary.validate().is_err());
+    }
+
+    #[test]
+    fn tunnel_addresses_reject_local_and_non_unicast_destinations() {
+        for invalid in [
+            "0.0.0.0",
+            "127.0.0.1",
+            "169.254.1.1",
+            "255.255.255.255",
+            "224.0.0.1",
+            "::",
+            "::1",
+            "fe80::1",
+            "ff02::1",
+        ] {
+            let address: IpAddr = invalid.parse().unwrap();
+            assert!(!valid_tunnel_address(&address), "accepted {address}");
+            let dns = TunnelSidecarConfig {
+                dns: vec![address],
+                ..netbird_cfg()
+            };
+            assert!(dns.validate().is_err(), "DNS accepted {address}");
+            let canary = TunnelSidecarConfig {
+                provider: TunnelProvider::Wireguard,
+                wireguard_canary: Some(address),
+                ..TunnelSidecarConfig::default()
+            };
+            assert!(canary.validate().is_err(), "canary accepted {address}");
+        }
+        for valid in ["100.100.0.53", "10.231.0.1", "fd00::53"] {
+            assert!(valid_tunnel_address(&valid.parse().unwrap()));
+        }
     }
 
     #[test]
