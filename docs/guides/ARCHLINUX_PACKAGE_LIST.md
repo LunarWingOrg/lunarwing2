@@ -3,12 +3,11 @@
 Packages needed to run a live LunarWing multi-tenant deployment on **Arch Linux + systemd** via
 `ic/scripts/lunarwing-mt-admin.sh`, including the infra health-check + self-heal pipeline.
 
-**Revalidated 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-14 (v2.1.6.0).** Package set re-checked against the
-current mt-admin prerequisite probes; no changes were needed (the v2.1.2.0
-sandbox rework added no new host packages — podman was already required, the
-v2.1.4.0 read-only diagnostics verbs `psql`/`daemon-pid` reuse existing
-tooling inside the tenant containers, and the v2.1.6.0 OpenRC proxy-unit
-migration and worker-credential work add no new host commands).
+**Revalidated 2026-11-10 (v2.2.0.0).** Package names and mt-admin prerequisite
+probes were re-checked. External-worker egress enforcement (WI#424) requires
+the host `nft` command, so `nftables` is now explicit below. Disk health reuses
+`df`, `stat`, and `timeout` from the already-expected core utilities; no other
+new host package is required.
 
 This is the Arch equivalent of [`GENTOO_PACKAGE_LIST.md`](GENTOO_PACKAGE_LIST.md); the operational
 notes there (port registry, per-tenant rustup, doctor output, etc.) apply unchanged. On Arch the
@@ -42,11 +41,12 @@ Each tenant's PostgreSQL runs as a container, so one runtime is **required**. Po
 preferred:
 
 ```bash
-sudo pacman -S --needed podman   # pulls netavark, aardvark-dns, crun, conmon, ...
+sudo pacman -S --needed podman nftables   # podman pulls netavark, aardvark-dns, crun, conmon, ...
 ```
 
 Unlike Gentoo there is **no USE-flag step**: Arch's `iptables` package is already the
-nftables-based variant that podman needs.
+nftables-based variant that podman needs. The separate `nftables` package supplies `nft`,
+which mt-admin requires to enforce and audit per-tenant external-worker egress allowlists.
 
 `lunarwing-mt-admin.sh` uses the fully-qualified `docker.io/pgvector/pgvector:pg16` image, so no
 `unqualified-search-registries` config is strictly required. If you override to a short name via
@@ -163,7 +163,7 @@ shipped requirements files is the recommended route:
 ```bash
 sudo pacman -S --needed \
   jq git python curl \
-  podman \
+  podman nftables \
   cronie \
   clang \
   weechat tmux \
