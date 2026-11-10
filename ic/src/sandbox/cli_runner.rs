@@ -16,6 +16,7 @@
 //! `ContainerJobManager`.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -291,6 +292,13 @@ impl Drop for EmptyMaskFile {
     }
 }
 
+/// Instance-specific namespace and optional overlay resolvers for one joined run.
+#[derive(Debug, Clone, Copy)]
+pub struct TunnelRunConfig<'a> {
+    pub container_name: &'a str,
+    pub dns: &'a [IpAddr],
+}
+
 /// Inputs to [`build_run_args`]. Kept as a struct so the arg construction
 /// stays a pure function (unit-testable without any runtime installed).
 pub(crate) struct RunSpec<'a> {
@@ -310,6 +318,7 @@ pub(crate) struct RunSpec<'a> {
     pub env: &'a HashMap<String, String>,
     pub network: SandboxNetworkMode,
     pub proxy_port: u16,
+    pub tunnel: Option<TunnelRunConfig<'a>>,
     /// Host directory holding the per-execution proxy relay socket
     /// (proxy-enforced mode only). Bind-mounted read-only at
     /// `/run/lunarwing-proxy`.
@@ -483,10 +492,16 @@ pub(crate) fn build_run_args(spec: &RunSpec<'_>) -> Vec<String> {
         }
         SandboxNetworkMode::Tunnel => {
             args.push("--network".into());
-            args.push(format!(
-                "container:{}",
-                crate::sandbox::tunnel_sidecar::SANDBOX_TUNNEL_CONTAINER
-            ));
+            if let Some(tunnel) = spec.tunnel {
+                args.push(format!("container:{}", tunnel.container_name));
+                for resolver in tunnel.dns {
+                    args.extend(["--dns".into(), resolver.to_string()]);
+                }
+            } else {
+                // An incomplete direct call must be rejected by the runtime,
+                // never fall back to another daemon's legacy shared sidecar.
+                args.push("container:".into());
+            }
         }
     }
 
@@ -669,6 +684,7 @@ pub struct ExecParams<'a> {
     pub env: &'a HashMap<String, String>,
     pub network: SandboxNetworkMode,
     pub proxy_port: u16,
+    pub tunnel: Option<TunnelRunConfig<'a>>,
     /// Directories that must never be readable inside the mount (WI#205).
     pub protected_paths: &'a [std::path::PathBuf],
     /// Whether the daemon's scrubbed log copy may be bound at `/tenant-logs`
@@ -801,6 +817,7 @@ impl CliRunner {
             env,
             network,
             proxy_port,
+            tunnel,
             protected_paths,
             tenant_logs,
         } = params;
@@ -890,6 +907,7 @@ impl CliRunner {
             env,
             network,
             proxy_port,
+            tunnel,
             proxy_dir: proxy_dir_ref,
             pids_limit: default_pids_limit(),
             masked: &masked_destinations,
@@ -1361,6 +1379,7 @@ mod tests {
             env: &EMPTY_ENV,
             network,
             proxy_port,
+            tunnel: None,
             proxy_dir: None,
             pids_limit: 256,
             masked: &[],
@@ -1666,15 +1685,23 @@ mod tests {
             (ContainerRuntime::Podman, KeepIdMode::UidPinned),
             (ContainerRuntime::Docker, KeepIdMode::Off),
         ] {
-            let args = build_run_args(&spec(
-                runtime,
-                keep_id,
-                SandboxPolicy::ReadOnly,
-                SandboxNetworkMode::Tunnel,
-                0,
-            ));
+            let dns = ["100.100.0.53".parse().unwrap(), "fd00::53".parse().unwrap()];
+            let args = build_run_args(&RunSpec {
+                tunnel: Some(TunnelRunConfig {
+                    container_name: "lunarwing-sandbox-tunnel-instance",
+                    dns: &dns,
+                }),
+                ..spec(
+                    runtime,
+                    keep_id,
+                    SandboxPolicy::ReadOnly,
+                    SandboxNetworkMode::Tunnel,
+                    0,
+                )
+            });
             let joined = args.join(" ");
-            assert!(joined.contains("--network container:lunarwing-sandbox-tunnel"));
+            assert!(joined.contains("--network container:lunarwing-sandbox-tunnel-instance"));
+            assert!(joined.contains("--dns 100.100.0.53 --dns fd00::53"));
             for flag in [
                 "--cap-drop=ALL",
                 "--cap-add=CHOWN",
@@ -1692,6 +1719,24 @@ mod tests {
             assert!(!joined.contains("--add-host"));
             assert_eq!(args.last().map(String::as_str), Some("echo hi"));
         }
+    }
+
+    #[test]
+    fn tunnel_mode_without_instance_config_cannot_join_legacy_name() {
+        let args = build_run_args(&spec(
+            ContainerRuntime::Podman,
+            KeepIdMode::UidPinned,
+            SandboxPolicy::ReadOnly,
+            SandboxNetworkMode::Tunnel,
+            0,
+        ));
+        let network = args.iter().position(|arg| arg == "--network").unwrap();
+        assert_eq!(args[network + 1], "container:");
+        assert!(
+            !args
+                .iter()
+                .any(|arg| { arg == "container:lunarwing-sandbox-tunnel" })
+        );
     }
 
     #[test]
@@ -2123,6 +2168,7 @@ mod tests {
             env: &HashMap::new(),
             network: SandboxNetworkMode::None,
             proxy_port: 0,
+            tunnel: None,
             protected_paths: &[],
             tenant_logs: false,
         };
