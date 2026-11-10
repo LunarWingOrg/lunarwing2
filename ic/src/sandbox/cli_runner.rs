@@ -295,7 +295,7 @@ impl Drop for EmptyMaskFile {
 /// Instance-specific namespace and optional overlay resolvers for one joined run.
 #[derive(Debug, Clone, Copy)]
 pub struct TunnelRunConfig<'a> {
-    pub container_name: &'a str,
+    pub container_id: &'a str,
     pub dns: &'a [IpAddr],
     /// World-readable resolver file mounted when `dns` is nonempty so every
     /// keep-id mode can read it. Runtimes reject `--dns` with `--network container`.
@@ -498,7 +498,7 @@ pub(crate) fn build_run_args(spec: &RunSpec<'_>) -> Vec<String> {
             if let Some(tunnel) = spec.tunnel {
                 let resolver_ready = tunnel.dns.is_empty() || tunnel.resolv_conf.is_some();
                 if resolver_ready {
-                    args.push(format!("container:{}", tunnel.container_name));
+                    args.push(format!("container:{}", tunnel.container_id));
                 } else {
                     args.push("container:".into());
                 }
@@ -1751,7 +1751,7 @@ mod tests {
             let dns = ["100.100.0.53".parse().unwrap(), "fd00::53".parse().unwrap()];
             let args = build_run_args(&RunSpec {
                 tunnel: Some(TunnelRunConfig {
-                    container_name: "lunarwing-sandbox-tunnel-instance",
+                    container_id: "lunarwing-sandbox-tunnel-instance",
                     dns: &dns,
                     resolv_conf: Some(Path::new("/run/user/1000/tunnel.resolv.conf")),
                 }),
@@ -1809,7 +1809,7 @@ mod tests {
         let dns = ["100.100.0.53".parse().unwrap()];
         let args = build_run_args(&RunSpec {
             tunnel: Some(TunnelRunConfig {
-                container_name: "lunarwing-sandbox-tunnel-instance",
+                container_id: "lunarwing-sandbox-tunnel-instance",
                 dns: &dns,
                 resolv_conf: None,
             }),

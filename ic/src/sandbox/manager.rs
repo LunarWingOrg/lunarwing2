@@ -335,16 +335,20 @@ impl SandboxManager {
                 .ok_or_else(|| SandboxError::TunnelUnavailable {
                     reason: "sidecar is not initialized; refusing sandbox execution".into(),
                 })?;
-            // A sidecar that died or drifted is recreated once, bounded by its
-            // own startup timeout, before the run is refused.
-            if let Err(error) = sidecar.ensure_healthy().await {
-                tracing::warn!(
-                    error = %error,
-                    "Sandbox tunnel sidecar unhealthy; recreating it once before this run"
-                );
-                sidecar.ensure_started().await?;
-                sidecar.ensure_healthy().await?;
-            }
+            // Join only the exact container ID that passed inspection. If a
+            // concurrent recreation removes it, this run fails instead of
+            // joining a new namespace before its firewall is installed.
+            let container_id = match sidecar.ensure_healthy().await {
+                Ok(id) => id,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "Sandbox tunnel sidecar unhealthy; recreating it once before this run"
+                    );
+                    sidecar.ensure_started().await?;
+                    sidecar.ensure_healthy().await?
+                }
+            };
             let dns = self
                 .config
                 .tunnel
@@ -352,7 +356,7 @@ impl SandboxManager {
                 .map(|config| config.dns.clone())
                 .unwrap_or_default();
             let resolv_conf = sidecar.tunnel_resolv_conf()?;
-            Some((sidecar.container_name().to_string(), dns, resolv_conf))
+            Some((container_id, dns, resolv_conf))
         } else {
             None
         };
@@ -390,8 +394,8 @@ impl SandboxManager {
                 proxy_port,
                 tunnel: tunnel_run
                     .as_ref()
-                    .map(|(name, dns, resolv_conf)| TunnelRunConfig {
-                        container_name: name,
+                    .map(|(id, dns, resolv_conf)| TunnelRunConfig {
+                        container_id: id,
                         dns: dns.as_slice(),
                         resolv_conf: resolv_conf.as_deref(),
                     }),

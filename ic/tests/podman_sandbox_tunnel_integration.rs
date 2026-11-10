@@ -204,6 +204,10 @@ async fn assert_joined_run(
             String::from_utf8_lossy(&sidecar_dns.stderr)
         );
     }
+    let container_id = sidecar
+        .ensure_healthy()
+        .await
+        .map_err(|error| error.to_string())?;
     let runner = CliRunner::detect(SandboxRuntime::Podman, image.to_string())
         .await
         .map_err(|error| error.to_string())?;
@@ -224,7 +228,7 @@ async fn assert_joined_run(
             network: SandboxNetworkMode::Tunnel,
             proxy_port: 0,
             tunnel: Some(TunnelRunConfig {
-                container_name: sidecar.container_name(),
+                container_id: &container_id,
                 dns,
                 resolv_conf: resolv_conf.as_deref(),
             }),

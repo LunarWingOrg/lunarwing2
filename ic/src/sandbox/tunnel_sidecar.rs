@@ -798,6 +798,7 @@ pub struct TunnelSidecar {
     cfg: TunnelSidecarConfig,
     container_name: String,
     instance_id: String,
+    lifecycle: tokio::sync::Mutex<()>,
 }
 
 impl TunnelSidecar {
@@ -816,6 +817,7 @@ impl TunnelSidecar {
             cfg,
             container_name: container_name_for_instance(base_dir),
             instance_id: instance_id_for(base_dir),
+            lifecycle: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -887,12 +889,13 @@ impl TunnelSidecar {
     /// and passes the health gate. A running sidecar that fails the gate (dead
     /// provider, drifted firewall) is removed and recreated once.
     pub async fn ensure_started(&self) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock().await;
         self.cfg
             .validate()
             .map_err(|reason| SandboxError::Config { reason })?;
         let _ = self.tunnel_resolv_conf()?;
         let hash = self.current_hash().await?;
-        if self.reuse_if_matching(&hash).await {
+        if self.matching_container_id(&hash).await.is_some() {
             match self.wait_healthy().await {
                 Ok(()) => return Ok(()),
                 Err(error) => tracing::warn!(
@@ -906,17 +909,19 @@ impl TunnelSidecar {
         self.start_fresh(&hash).await
     }
 
-    /// Recheck the transport and both firewall chains before every run.
-    pub async fn ensure_healthy(&self) -> Result<()> {
+    /// Recheck the transport and both firewall chains before every run, then
+    /// return the exact container ID whose namespace was verified.
+    pub async fn ensure_healthy(&self) -> Result<String> {
         let _ = self.tunnel_resolv_conf()?;
         let hash = self.current_hash().await?;
-        if !self.reuse_if_matching(&hash).await {
+        let Some(container_id) = self.matching_container_id(&hash).await else {
             return Err(self.unavailable("sidecar is not running with the current configuration"));
-        }
+        };
         if !self.provider_probe().await {
             return Err(self.unavailable("sidecar provider health check failed"));
         }
-        self.check_egress_firewall().await
+        self.check_egress_firewall().await?;
+        Ok(container_id)
     }
 
     async fn start_fresh(&self, hash: &str) -> Result<()> {
@@ -958,7 +963,7 @@ impl TunnelSidecar {
         if !output.status.success() {
             // Another manager instance may have won the name race; accept its
             // sidecar only when it matches our configuration and is healthy.
-            if self.reuse_if_matching(hash).await {
+            if self.matching_container_id(hash).await.is_some() {
                 return self.wait_healthy().await;
             }
             self.remove().await;
@@ -1033,16 +1038,17 @@ impl TunnelSidecar {
         }
     }
 
-    async fn reuse_if_matching(&self, hash: &str) -> bool {
-        let Some((running, label, instance)) = self.inspect().await else {
-            return false;
-        };
-        running && label.as_deref() == Some(hash) && instance.as_deref() == Some(&self.instance_id)
+    async fn matching_container_id(&self, hash: &str) -> Option<String> {
+        let (id, running, label, instance) = self.inspect().await?;
+        (running
+            && label.as_deref() == Some(hash)
+            && instance.as_deref() == Some(&self.instance_id))
+        .then_some(id)
     }
 
-    async fn inspect(&self) -> Option<(bool, Option<String>, Option<String>)> {
+    async fn inspect(&self) -> Option<(String, bool, Option<String>, Option<String>)> {
         let format = format!(
-            "{{{{.State.Running}}}}|{{{{index .Config.Labels \"{SANDBOX_TUNNEL_HASH_LABEL}\"}}}}|{{{{index .Config.Labels \"{SANDBOX_TUNNEL_INSTANCE_LABEL}\"}}}}"
+            "{{{{.Id}}}}|{{{{.State.Running}}}}|{{{{index .Config.Labels \"{SANDBOX_TUNNEL_HASH_LABEL}\"}}}}|{{{{index .Config.Labels \"{SANDBOX_TUNNEL_INSTANCE_LABEL}\"}}}}"
         );
         let output = self
             .output_probe(&["inspect", "--format", &format, &self.container_name])
@@ -1052,7 +1058,9 @@ impl TunnelSidecar {
             return None;
         }
         let text = String::from_utf8_lossy(&output.stdout);
-        let mut parts = text.trim().splitn(3, '|');
+        let mut parts = text.trim().splitn(4, '|');
+        let id = parts.next()?.trim();
+        parse_image_id(id)?;
         let running = parts.next()? == "true";
         let label = |value: Option<&str>| {
             value
@@ -1062,7 +1070,7 @@ impl TunnelSidecar {
         };
         let hash = label(parts.next());
         let instance = label(parts.next());
-        Some((running, hash, instance))
+        Some((id.to_string(), running, hash, instance))
     }
 
     fn wireguard_has_peers(&self) -> Option<bool> {
@@ -1318,10 +1326,9 @@ impl TunnelSidecar {
     }
 
     async fn remove_with_grace(&self, grace_secs: u32) -> bool {
-        let owned = self
-            .inspect()
-            .await
-            .is_some_and(|(_, _, instance)| instance.as_deref() == Some(self.instance_id.as_str()));
+        let owned = self.inspect().await.is_some_and(|(_, _, _, instance)| {
+            instance.as_deref() == Some(self.instance_id.as_str())
+        });
         if !owned {
             tracing::debug!(
                 container = %self.container_name,
