@@ -5,8 +5,8 @@
 > preflight, patch-env, render-units, and coordinated-rotation paths. Direct DB
 > updates and deleting channel workspace state are not first-line recovery.
 > Start with the [current troubleshooting guidance](../../../lunarwing_weechat_wss/README.md#troubleshooting),
-> [WeeChat operations](../../../ops/WEECHAT-SERVICES.md), and the
-> [configuration-precedence explanation](../../../architecture/WEECHAT-CHANNEL-ARCHITECTURE.md#4-configuration--precedence).
+> [WeeChat operations](../../../../ops/WEECHAT-SERVICES.md), and the
+> [configuration-precedence explanation](../../../../architecture/WEECHAT-CHANNEL-ARCHITECTURE.md#4-configuration--precedence).
 > The procedures below are retained only for historical diagnosis.
 
 ## Pairing Approval

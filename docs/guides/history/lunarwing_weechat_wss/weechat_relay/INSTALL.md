@@ -4,8 +4,8 @@
 > guide includes manual password/configuration steps that predate managed relay
 > setup, protected env files, coordinated rotation, and the current capability
 > schema. Use the [current channel guide](../../../lunarwing_weechat_wss/README.md)
-> and [WeeChat operations runbook](../../../ops/WEECHAT-SERVICES.md). The
-> [channel architecture](../../../architecture/WEECHAT-CHANNEL-ARCHITECTURE.md)
+> and [WeeChat operations runbook](../../../../ops/WEECHAT-SERVICES.md). The
+> [channel architecture](../../../../architecture/WEECHAT-CHANNEL-ARCHITECTURE.md)
 > explains current precedence. The text below is historical, not an installation
 > procedure.
 
