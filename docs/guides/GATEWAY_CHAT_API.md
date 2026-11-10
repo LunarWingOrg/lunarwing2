@@ -461,9 +461,13 @@ and inserted immediately before the new user request with explicit pre-turn
 framing, so the first provider request contains it in the correct order
 (WI#584). A live V1 turn instead receives it at the next iteration boundary.
 V2 persists idle notes on the conversation for its next foreground turn. After
-a V1 soft timeout, suppressed-response cleanup discards both pending messages
-and steer notes; clients must not replay those notes automatically as though
-the timed-out turn were still active.
+a V1 soft timeout, what happens to queued input depends on how the turn ends.
+If the timed-out turn still completes with a response, suppressed-response
+cleanup discards both pending messages and steer notes. If it hangs past the
+hard-kill grace and is aborted, both queues are kept and delivered to the next
+turn. A client cannot tell the two cases apart from the timeout alone, so it
+must not replay those notes automatically: after a hard abort a replayed note
+would arrive twice.
 
 ## History
 

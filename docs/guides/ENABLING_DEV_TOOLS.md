@@ -37,8 +37,8 @@ The default is an enabled read-only container sandbox. Since v2.1.2.0 the sandbo
 
 | Policy | Filesystem | Network | Execution |
 | --- | --- | --- | --- |
-| `readonly` | workspace mounted read-only | `none` by default; configurable | container |
-| `workspace_write` | workspace mounted read/write | `none` by default; configurable | container |
+| `readonly` | workspace mounted read-only | `proxy-enforced` by default on Linux, `none` elsewhere; configurable | container |
+| `workspace_write` | workspace mounted read/write | `proxy-enforced` by default on Linux, `none` elsewhere; configurable | container |
 | `full_access` | unrestricted host access | unrestricted | direct host shell |
 
 For normal development work, prefer:
@@ -100,7 +100,7 @@ shared-conversation restrictions, and supervised mode still apply. Unknown
 `AGENT_*` / `AUTO_APPROVE_*` keys produce a warning containing only the key name,
 so a misspelled approval setting does not silently look enabled.
 
-Supervised mode (`--supervised` or `AGENT_SUPERVISED_MODE=true`) takes precedence and still gates every tool action.
+Supervised mode (`AGENT_SUPERVISED_MODE=true` in the daemon's process environment) takes precedence and gates every tool action of an Engine V2 foreground thread. The `--supervised` CLI flag has no effect at this revision; see `docs/guides/human-delay-mode.md` for the defect and the scope.
 
 ## Recommended Profiles
 
@@ -109,21 +109,23 @@ Workspace-scoped development:
 ```bash
 ALLOW_LOCAL_TOOLS=true
 SANDBOX_ENABLED=true
+SANDBOX_ENFORCE=true
 SANDBOX_POLICY=workspace_write
 ```
 
-This keeps shell execution in the container, confines writes to the workspace, and retains approval prompts.
+`SANDBOX_ENFORCE=true` is what keeps shell execution in the container here: with `ALLOW_LOCAL_TOOLS=true` and no `SANDBOX_ENFORCE`, the shell tool runs directly on the host and the daemon logs that at startup. With it, shell writes are confined to the workspace and approval prompts are retained. The file tools that `ALLOW_LOCAL_TOOLS` adds (`read_file`, `write_file`, `list_dir`, `apply_patch`) run in the daemon process, not in the container, and the sandbox policy does not confine their paths.
 
 Trusted non-interactive workspace job:
 
 ```bash
 ALLOW_LOCAL_TOOLS=true
 SANDBOX_ENABLED=true
+SANDBOX_ENFORCE=true
 SANDBOX_POLICY=workspace_write
 AGENT_AUTO_APPROVE_TOOLS=true
 ```
 
-Use only with trusted prompts and inputs. Automatic approval increases prompt-injection impact even when filesystem access remains workspace-scoped.
+Use only with trusted prompts and inputs. Automatic approval increases prompt-injection impact even when shell access remains workspace-scoped. Without `SANDBOX_ENFORCE=true` this profile runs auto-approved shell commands on the host, and the file tools are host-side in either case.
 
 Avoid this profile unless direct host execution is specifically required:
 
@@ -146,9 +148,13 @@ image is built locally, not pulled from a registry. Rebuild it with
 `build-sandbox-image <tenant>` after cleanup if necessary.
 
 An ordinary command that prints `No space left on device` is not by itself proof
-that host container storage is full. Run-path classification requires the
-runtime's exit 125 and error prefix, so command stderr and any forged storage
-path remain ordinary sandbox output.
+that host container storage is full. Run-path classification requires exit
+status 125 together with a stderr line that starts with the runtime's error
+prefix (`Error:`), so ordinary command stderr stays ordinary sandbox output.
+That shape is not proof of origin: a sandboxed command can exit 125 and print
+such a line itself, and its output is then classified as a runtime failure,
+storage path included. Confirm with `df` on the host before acting on a
+storage error.
 
 ## Verification
 

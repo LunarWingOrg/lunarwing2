@@ -46,7 +46,8 @@ taskset -c 0-11 cargo build --release -j12 --bin lunarwing
 Build the XMPP bridge or WASM extensions only when the instance uses them:
 
 ```bash
-taskset -c 0-11 cargo build --release -j12 -p xmpp-bridge
+# The bridge is excluded from the ic workspace, so `-p xmpp-bridge` matches nothing.
+taskset -c 0-11 cargo build --release -j12 --manifest-path bridges/xmpp-bridge/Cargo.toml
 scripts/build-wasm-extensions.sh
 ```
 

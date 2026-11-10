@@ -226,7 +226,7 @@ host-key verification stay host-side — the guest never sees key material.
 
 ```bash
 cd ic
-taskset -c 0-17 cargo component build --locked --release -j18 \
+taskset -c 0-11 cargo component build --locked --release -j12 \
   --target wasm32-wasip2 --manifest-path tools-src/ssh/Cargo.toml
 # -> tools-src/ssh/target/wasm32-wasip2/release/ssh_tool.wasm
 # or, registry-driven for all tools: scripts/build-wasm-extensions.sh --tools

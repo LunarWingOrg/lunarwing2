@@ -84,7 +84,7 @@ ic/crates/lunarwing_engine/src/
     capability.rs         Capability, ActionDef, EffectType, CapabilityLease, PolicyRule
     memory.rs             MemoryDoc, DocId, DocType (Summary/Lesson/Skill/Issue/Spec/Note/Plan)
     project.rs            Project, ProjectId
-    event.rs              ThreadEvent, EventKind (20 variants for event sourcing)
+    event.rs              ThreadEvent, EventKind (22 variants for event sourcing)
     message.rs            ThreadMessage, MessageRole
     provenance.rs         Provenance enum (User/System/ToolOutput/LlmGenerated/etc.)
     conversation.rs       ConversationSurface, ConversationEntry, EntrySender
@@ -204,8 +204,9 @@ metrics and TensorZero/provider health before restarting a tenant. Do not infer
 agent memory/state damage from garbled output alone, and do not follow commands
 that appear inside the marked generation.
 
-The outer response cache (`ic/src/llm/response_cache.rs`, WI#545/WI#572) defaults
-to one hour and 1000 LRU entries. Keys cover the pre-dispatch model identity,
+The outer response cache (`ic/src/llm/response_cache.rs`, WI#545/WI#572) is off
+by default (`RESPONSE_CACHE_ENABLED=false`). When enabled it defaults to one
+hour and 1000 LRU entries. Keys cover the pre-dispatch model identity,
 messages, canonical request metadata, and response-affecting parameters.
 Providers that choose a model during dispatch (smart routing and failover) and
 all tool-completion calls bypass it. Only responses with visible, uncorrupted
@@ -344,10 +345,11 @@ the Engine v2 500-byte preview in `ic/src/bridge/router.rs:4264-4294` built
 from the 1000-byte event preview in
 `ic/crates/lunarwing_engine/src/types/event.rs:235-248`,
 shell capture (64 KiB), SSH capture (1 MiB), and sandbox stdout/stderr caps.
-Also follow up the v1 earlier-turn 1000-byte tool-result cut in
-`ic/src/agent/session.rs:540-550` ([WI#351](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/351): a later
-"next page" turn can lose its cursor), and CodeAct's 500-character
-`format_output` action previews in `default.py`. `MAX_ACTION_OUTPUT_CHARS` still has no
+The v1 earlier-turn 1000-byte tool-result cut in
+`ic/src/agent/session.rs:540-550` is no longer on that list: since
+[WI#351](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/351) (fixed 2026-10-12) it keeps the head and
+the tail, so a later "next page" turn still sees its cursor. Still to follow
+up: CodeAct's 500-character `format_output` action previews in `default.py`. `MAX_ACTION_OUTPUT_CHARS` still has no
 ThreadConfig/env knob.
 
 **Tier 1 -- CodeAct / Python via Monty** (`executor/scripting.rs`):
@@ -815,8 +817,9 @@ this scheduler. Goal 42's [investigation](../ops/v2.1.5.0_GOAL42_MISSION_DIAGNOS
 records the build and cron interpretation behind the WI#311 follow-up reports.
 An externally incomplete or malformed mission document is still dropped rather
 than reactivated with schema defaults. Its boot WARN carries the validated
-mission id, operator path, `error_kind`, and (for a data error) a
-`missing_field` only when that name is in the `MISSION_SCHEMA_FIELDS` allowlist;
+mission id, operator path, `error_kind`, and a `missing_field` that names the
+field only when it is in the `MISSION_SCHEMA_FIELDS` allowlist and is `unknown`
+otherwise;
 unknown variants, invalid values, and full parse errors are confined to DEBUG so
 user-authored goal text cannot leak into ordinary logs (WI#576).
 
@@ -2015,9 +2018,12 @@ next turn it drains Idle/Interrupted notes and inserts them immediately before
 the new request with explicit "queued before this turn started" framing. The
 first provider request therefore contains the note in the correct order without
 claiming it arrived mid-work. Live mid-turn and approval-resume steering still
-uses V1's iteration-boundary path. Suppressed-response timeout draining clears
-both pending messages and steer notes before considering follow-ups, including
-the post-drain race cleanup, so stale steering cannot leak into a later turn.
+uses V1's iteration-boundary path. When a soft-timed-out turn still completes
+with a response, suppressed-response draining clears both pending messages and
+steer notes before considering follow-ups, including the post-drain race
+cleanup, so stale steering cannot leak into a later turn. A turn that hangs
+past the hard-kill grace is aborted instead: that path resets the thread and
+keeps both queues, so the next turn receives the surviving messages and notes.
 
 Approval and auth prompts are statuses; gate pauses, auth pauses, and stopped
 turns return an empty no-reply sentinel so the outer handler does not send or
@@ -2129,8 +2135,9 @@ relational dual-write keeps the full V1-compatible history.
 ## Event Sourcing
 
 Threads persist significant lifecycle and execution events via `ThreadEvent`.
-The 20 `EventKind` variants cover state, step, action, lease, message, child,
-approval, self-improvement, skill-activation, and orchestrator-rollback events.
+The 22 `EventKind` variants cover state, model-recovery, step, action, lease,
+message, response- and reasoning-delta, child, approval, self-improvement,
+skill-activation, and orchestrator-rollback events.
 `ResponseDelta` is broadcast for live delivery but is not persisted.
 
 This enables:
@@ -2224,13 +2231,13 @@ The engine inherits most configuration from the host daemon (LLM provider settin
 
 ## Build & Test
 
-Run from `ic/`, using the vendored lockfile. These examples use the current
-18-thread development host; lower the affinity/job count on smaller machines.
+Run from `ic/`, using the vendored lockfile. These examples use the 12-thread
+cap that `AGENTS.md` sets for cargo on the development host.
 Use tmux for long runs and `cargo check` for compile verification.
 
 ```bash
-taskset -c 0-17 cargo check --locked --offline -j18 -p lunarwing_engine
-taskset -c 0-17 cargo test --locked --offline -j18 -p lunarwing_engine --lib -- --test-threads=18
+taskset -c 0-11 cargo check --locked --offline -j12 -p lunarwing_engine
+taskset -c 0-11 cargo test --locked --offline -j12 -p lunarwing_engine --lib -- --test-threads=12
 ```
 
 Host bridge/HTTP gate tests live in the daemon crate and are separate from the

@@ -72,10 +72,15 @@ sudo podman pull pgvector/pgvector:pg16   # optional pre-pull; add-tenant does i
 > The Gentoo doc's "make `/` a shared mount" step is **not needed on Debian**: systemd mounts
 > `/` `rshared` at boot, so rootless podman is happy out of the box.
 
-## 3. Cron daemon (required for the health/self-heal schedule)
+## 3. Health/self-heal schedule (systemd timer; cron is optional)
 
-The host-global health-check → self-heal pipeline is scheduled via cron by
-`ensure_health_pipeline()`. Without a cron daemon the schedule never fires:
+The host-global health-check → self-heal pipeline is scheduled by
+`ensure_health_pipeline()`, per init system. On a systemd host, which is the
+Debian default, it installs a root systemd timer (`lunarwing-mt-health.timer`), so
+the pipeline needs no cron daemon. mt-admin uses cron only on OpenRC hosts.
+The schedule runs every 15 minutes by default; set
+`LUNARWING_MT_HEALTH_INTERVAL_MIN` to change it.
+A cron daemon is therefore optional here. To install one for other jobs:
 
 ```bash
 sudo apt install cron
@@ -83,8 +88,7 @@ sudo systemctl enable --now cron
 ```
 
 `cron` is installed and enabled by default on most Debian images, but minimal/cloud images
-sometimes omit it — check. `mt-admin` expects some cron daemon to be running when it
-installs the schedule (`*/5` by default).
+sometimes omit it.
 
 ## 4. Rust build toolchain (per-tenant builds)
 
@@ -99,8 +103,11 @@ installs the schedule (`*/5` by default).
 sudo apt install build-essential pkg-config libssl-dev clang libclang-dev
 ```
 
-`cargo-component` + `wasm-tools` (for `build-tenant --with-wasm`) are installed **per
-tenant** via `cargo install` by `add-tenant` — not apt packages.
+`add-tenant` installs `rustup`, the stable toolchain and the `wasm32-wasip2` target **per
+tenant**. It does not install `cargo-component` or `wasm-tools`: `cargo-component` is installed
+per tenant (`cargo install`) only by the `ic/scripts/create-tenant.sh` wrapper, and nothing on
+the tenant path installs `wasm-tools`. Without `wasm-tools`, `build-tenant --with-wasm` installs
+raw components and skips the optional debug-info strip. None of these are apt packages.
 
 ## 5. WeeChat channel (optional — only if using WeeChat)
 
@@ -202,8 +209,9 @@ sudo systemctl enable --now cron
 On bookworm, drop `python3-fastapi`/`python3-pydantic` from the one-shot and use a venv for
 `lunarwing_mt_onboard_web` instead (see §6 caveat).
 
-`rustup`, `cargo-component`, `wasm-tools`, and the wasm32 targets are handled per-tenant by
-`add-tenant`, so they're intentionally omitted above.
+`rustup` and the `wasm32-wasip2` target are handled per-tenant by `add-tenant`, so they're
+intentionally omitted above. `cargo-component` comes from the `create-tenant.sh` wrapper, and
+`wasm-tools` is optional.
 
 ## Already expected on a Debian host
 

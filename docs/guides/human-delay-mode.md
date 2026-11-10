@@ -1,34 +1,49 @@
 # Supervised Mode
 
-Supervised mode is LunarWing's global human-in-the-loop setting for tool execution. When enabled, every tool action requires explicit approval, regardless of the tool's normal approval tier or an auto-approve setting.
+Supervised mode is LunarWing's human-in-the-loop setting for tool execution. When enabled, every tool action of an Engine V2 foreground thread requires explicit approval, regardless of the tool's normal approval tier or an auto-approve setting. See [Scope](#scope) for what it does not cover.
 
 The older "Human Delay Mode" phase documents referenced by this file no longer exist. The implemented feature is named **supervised mode** in the CLI, runtime configuration, thread state, Engine V2 gate context, and effect adapter.
 
-**Revalidated against source 2026-11-10 (v2.2.0.0).** The `--supervised` CLI
-flag and `AGENT_SUPERVISED_MODE` runtime override match `ic/src/main.rs` and
-the bridge router; supervised mode still gates every tool action and takes
-precedence over global auto-approval.
+**Revalidated against source 2026-11-10 (v2.2.0.0).** `AGENT_SUPERVISED_MODE`
+in the daemon's process environment is the working switch: the bridge router
+reads it when it creates a foreground thread. The `--supervised` CLI flag does
+**not** enable supervised mode at this revision (see below). Where it applies,
+supervised mode takes precedence over global auto-approval.
 
 ## Enable It
 
-Start LunarWing with the CLI flag:
-
-```bash
-lunarwing --supervised
-```
-
-Or set the startup environment value:
+Set the value in the daemon's process environment:
 
 ```bash
 AGENT_SUPERVISED_MODE=true lunarwing
 ```
 
-The CLI flag installs the same runtime configuration override. Enable it in the service environment when supervised behavior must persist across service restarts.
+`true`, `1`, `yes` and `on` are accepted. For a service, set it in the service
+environment so it persists across restarts. A `.env` file in the daemon's
+working directory or in the LunarWing base directory also works, because both
+are loaded into the process environment at startup.
+
+> **Known defect: `lunarwing --supervised` has no effect.** The flag stores an
+> in-process configuration override (`set_runtime_env` in `ic/src/main.rs`), but
+> the bridge router reads the process environment (`std::env::var` in
+> `ic/src/bridge/router.rs`), and nothing copies the override there. A daemon
+> started with only the flag is not supervised, and it logs no warning. Use the
+> environment variable until the flag is fixed.
+
+## Scope
+
+- Only Engine V2 foreground threads carry the setting.
+- Mission-spawned threads are not supervised: they are built from
+  `ThreadConfig::default()`. One approved `mission_create`, `mission_fire` or
+  `mission_resume` starts runs that execute without per-action approval (see
+  the mission sections of `docs/architecture/ENGINE-V2.md`).
+- The legacy V1 agent loop under `ic/src/agent/` has no supervised handling.
+  Channels that are still served by V1 are not gated by this setting.
 
 ## Behavior
 
-- New thread configuration is marked `supervised_mode` when `AGENT_SUPERVISED_MODE` is `true` or `1`.
-- Every proposed tool action is sent through the approval path, including tools whose normal policy would not require approval.
+- New Engine V2 foreground thread configuration is marked `supervised_mode` when `AGENT_SUPERVISED_MODE` is `true`, `1`, `yes` or `on` in the process environment.
+- Every tool action such a thread proposes is sent through the approval path, including tools whose normal policy would not require approval.
 - Supervised mode takes precedence over global auto-approve behavior.
 - Approving an action authorizes that resolved action; it does not disable supervised mode for later actions.
 - Rejections return through the normal tool-result path so the agent can respond without running the rejected action.

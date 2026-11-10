@@ -69,13 +69,20 @@ LunarWing never calls either init system directly.
 Enroll host outside LunarWing:
 
 ```bash
+umask 077
+${EDITOR:-vi} /root/netbird-setup-key    # one line: the setup key
 netbird up \
   --management-url https://netbird.example.com \
-  --setup-key '<setup-key>'
+  --setup-key-file /root/netbird-setup-key
+rm -f /root/netbird-setup-key
 ```
 
 Protect setup key as a secret. Do not place it in LunarWing settings or service
-environment. Confirm peer readiness:
+environment. Do not pass it as `--setup-key '<setup-key>'` on a shared host:
+command-line arguments are visible in the process list to every local account,
+tenant accounts included, unless `/proc` is mounted with `hidepid`.
+`--setup-key-file` exists in current NetBird clients (0.75.0 has it); check
+`netbird up --help` on older ones. Confirm peer readiness:
 
 ```bash
 netbird status --check startup

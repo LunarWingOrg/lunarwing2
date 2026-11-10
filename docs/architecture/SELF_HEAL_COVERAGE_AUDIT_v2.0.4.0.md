@@ -8,7 +8,7 @@
 ## Current coverage (v2.2.0.0)
 
 `ic-infrastructure-health-check/tests/run-all.sh` registers **21 suites**. The
-current ordered list adds `worker-egress` (WI#424) and `disk` (WI#563) to the 19
+current ordered list adds `worker-egress` (WI#424) and `disk` (WI#586) to the 19
 suites documented before those healthpoints; `gateway` was already registered
 and is included in the total. Run `bash tests/run-all.sh --list` from that
 directory for the authoritative ordered list. The original **435/435** assertion

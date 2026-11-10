@@ -85,9 +85,12 @@ The restore command is intentionally destructive to the **target tenant database
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh stop-tenant <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh start-pg <tenant>
 sudo ic/scripts/lunarwing-mt-admin.sh restore-tenant \
   <tenant> /absolute/path/ironclaw-rehearsal.dump --yes
 ```
+
+`stop-tenant` also stops the tenant's PostgreSQL, and `restore-tenant` refuses to run unless it is up. `start-pg` starts only PostgreSQL; the daemon stays down.
 
 Do not pipe a plain SQL dump into the container or assume a fixed PostgreSQL password. Current tenants use managed credentials, and direct restore commands bypass MT admin's stop check and all-or-nothing restore behavior.
 
@@ -164,7 +167,7 @@ Keep external delivery disabled or isolated during rehearsal so the source and t
 
 1. Stop source message ingress, routines, workers, and IronClaw.
 2. Take and validate a fresh final custom-format dump.
-3. Stop the target tenant and restore the final dump through `restore-tenant ... --yes`.
+3. Stop the target tenant, start only its PostgreSQL with `start-pg <tenant>`, and restore the final dump through `restore-tenant ... --yes`.
 4. Reapply only reviewed filesystem changes made since rehearsal.
 5. Start the target through MT admin and repeat status, doctor, migration, and integration checks.
 6. Keep the old service and database disabled but recoverable until the rollback window closes.

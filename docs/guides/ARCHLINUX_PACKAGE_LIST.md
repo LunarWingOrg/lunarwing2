@@ -65,18 +65,22 @@ sudo podman pull pgvector/pgvector:pg16   # optional pre-pull; add-tenant does i
 > The Gentoo doc's "make `/` a shared mount" step is **not needed on Arch**: systemd mounts `/`
 > `rshared` at boot, so rootless podman is happy out of the box.
 
-## 3. Cron daemon (required for the health/self-heal schedule)
+## 3. Health/self-heal schedule (systemd timer; cron is optional)
 
-The host-global health-check → self-heal pipeline is scheduled via cron by
-`ensure_health_pipeline()`. Without a cron daemon the schedule never fires:
+The host-global health-check → self-heal pipeline is scheduled by
+`ensure_health_pipeline()`, per init system. On a systemd host, which is the
+Arch default, it installs a root systemd timer (`lunarwing-mt-health.timer`), so
+the pipeline needs no cron daemon. mt-admin uses cron only on OpenRC hosts.
+The schedule runs every 15 minutes by default; set
+`LUNARWING_MT_HEALTH_INTERVAL_MIN` to change it.
+A cron daemon is therefore optional here. To install one for other jobs:
 
 ```bash
 sudo pacman -S --needed cronie
 sudo systemctl enable --now cronie
 ```
 
-`cronie` is the standard Arch cron daemon (`fcron` is AUR-only and unnecessary). `mt-admin`
-enables the daemon when it installs the schedule (`*/5` by default).
+`cronie` is the standard Arch cron daemon (`fcron` is AUR-only and unnecessary).
 
 ## 4. Rust build toolchain (per-tenant builds)
 
@@ -85,8 +89,11 @@ enables the daemon when it installs the schedule (`*/5` by default).
 | `rustup` | **Optional on the host** — `add-tenant` auto-installs rustup *per tenant* (via rustup.sh into the tenant's home) and sets the stable toolchain + the `wasm32-wasip2` target. The `doctor` `[FAIL] rustup installed` for the host is therefore harmless. |
 | `clang` | Provides `libclang`, needed by Rust crates that use `bindgen`/`-sys` native bindings during the build. (`gcc` is already in `base-devel`.) |
 
-`cargo-component` + `wasm-tools` (for `build-tenant --with-wasm`) are installed **per tenant** via
-`cargo install` by `add-tenant` — not pacman packages.
+`add-tenant` installs `rustup`, the stable toolchain and the `wasm32-wasip2` target **per
+tenant**. It does not install `cargo-component` or `wasm-tools`: `cargo-component` is installed
+per tenant (`cargo install`) only by the `ic/scripts/create-tenant.sh` wrapper, and nothing on
+the tenant path installs `wasm-tools`. Without `wasm-tools`, `build-tenant --with-wasm` installs
+raw components and skips the optional debug-info strip. None of these are pacman packages.
 
 ## 5. WeeChat channel (optional — only if using WeeChat)
 
@@ -174,8 +181,9 @@ sudo pacman -S --needed \
 sudo systemctl enable --now cronie
 ```
 
-`rustup`, `cargo-component`, `wasm-tools`, and the wasm32 targets are handled per-tenant by
-`add-tenant`, so they're intentionally omitted above.
+`rustup` and the `wasm32-wasip2` target are handled per-tenant by `add-tenant`, so they're
+intentionally omitted above. `cargo-component` comes from the `create-tenant.sh` wrapper, and
+`wasm-tools` is optional.
 
 ## Already expected on an Arch host
 

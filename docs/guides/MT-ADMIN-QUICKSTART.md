@@ -68,8 +68,13 @@ Do not install Python packages into an externally managed system interpreter wit
 Run the script from the checkout and branch that the tenant should follow:
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles \
+  --tensorzero-url 'https://tensorzero.example.com'
 ```
+
+The LLM endpoint is required: without `--tensorzero-url` or `--llm-base-url`,
+and with no fleet default set, `add-tenant` aborts before it creates any tenant
+state (details below).
 
 Useful opt-ins and opt-outs include:
 
@@ -317,10 +322,11 @@ sudo ic/scripts/lunarwing-mt-admin.sh backup-tenant ruffles
 sudo ic/scripts/lunarwing-mt-admin.sh list-backups ruffles
 ```
 
-Restore is destructive to the tenant database and requires the tenant daemon stopped plus explicit `--yes`:
+Restore is destructive to the tenant database and requires the tenant daemon stopped, the tenant's PostgreSQL running, plus explicit `--yes`. `stop-tenant` stops PostgreSQL too, so start it alone with `start-pg` before restoring:
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh stop-tenant ruffles
+sudo ic/scripts/lunarwing-mt-admin.sh start-pg ruffles
 sudo ic/scripts/lunarwing-mt-admin.sh restore-tenant ruffles /absolute/path/backup.dump --yes
 sudo ic/scripts/lunarwing-mt-admin.sh start-tenant ruffles
 ```
