@@ -465,10 +465,6 @@ pub(crate) fn build_sidecar_args(
         "--tmpfs".into(),
         "/run:size=16m".into(),
     ];
-    for resolver in &cfg.dns {
-        args.extend(["--dns".into(), resolver.to_string()]);
-    }
-
     match cfg.provider {
         TunnelProvider::Netbird => {
             args.extend(["--device".into(), "/dev/net/tun".into()]);
@@ -1851,14 +1847,14 @@ mod tests {
     }
 
     #[test]
-    fn custom_dns_configures_sidecar_and_closes_uplink_dns() {
+    fn custom_dns_skips_sidecar_and_closes_uplink_dns() {
         let cfg = TunnelSidecarConfig {
             dns: vec!["100.100.0.53".parse().unwrap(), "fd00::53".parse().unwrap()],
             ..netbird_cfg()
         };
         let args = build_sidecar_args(&cfg, None, "tunnel-test", "test-instance", "deadbeef", None)
             .join(" ");
-        assert!(args.contains("--dns 100.100.0.53 --dns fd00::53"));
+        assert!(!args.contains("--dns"));
         assert!(cfg.uplink_resolvers("nameserver 169.254.1.1\n").is_empty());
         assert_eq!(
             netbird_cfg().uplink_resolvers("nameserver 169.254.1.1\n"),
