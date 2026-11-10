@@ -230,6 +230,24 @@ class FullValidationTests(unittest.TestCase):
                 config.validate_release_gates(merged, self.defaults, errors)
                 self.assertIn("secret-history must run only for schedules and protected release tags", errors)
 
+    def test_secret_history_blocking_full_history_shape_cannot_be_weakened(self):
+        mutations = (
+            ("allow failure", "allow_failure", True),
+            ("shallow checkout", "variables", {"GIT_DEPTH": "20"}),
+            ("scanner bypass", "script", ["gitleaks version"]),
+            ("hook bypass", "before_script", ["exit 0"]),
+        )
+        for name, key, value in mutations:
+            with self.subTest(name=name):
+                merged = copy.deepcopy(self.merged)
+                merged["secret-history"][key] = value
+                errors = []
+                config.validate_release_gates(merged, self.defaults, errors)
+                self.assertIn(
+                    "secret-history job shape differs from its blocking full-history contract",
+                    errors,
+                )
+
     def test_unlocked_cavepony_build_is_rejected(self):
         self.merged["cavepony-wasm"]["script"] = [command.replace(" --locked", "") for command in self.merged["cavepony-wasm"]["script"]]
         errors = []
