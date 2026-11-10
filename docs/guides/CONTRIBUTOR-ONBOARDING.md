@@ -7,7 +7,7 @@ you what *not* to touch right now.
 This is an **onboarding** document. It sits below the canonical policies, not above them:
 
 - **Policy of record:** [`CODE-CONTRIBUTION-POLICY.md`](CODE-CONTRIBUTION-POLICY.md) — style, review, security, and change discipline.
-- **AI-generated code rules:** [`AI-CODE-CONTRIBUTION-POLICY.md`](AI-CODE-CONTRIBUTION-POLICY.md) — **read this before having any model write code for you.** Closed-weight model output is not accepted for source code. Effective 2026-09-15. No exceptions beyond those listed in the policy.
+- **AI-generated code rules:** [`AI-CODE-CONTRIBUTION-POLICY.md`](AI-CODE-CONTRIBUTION-POLICY.md) — **read this before having any model write code for you.** Closed-weight model output is not accepted for source code effective 2026-12-15. Documentation refinement and the other narrow exceptions in the policy still apply.
 - **Agent-facing map:** [`AGENTS.md`](../../AGENTS.md) — where things live, build/test/lint commands, invariants. Human contributors should skim it too; it's the best architecture map in the repo.
 
 If this document and the policy disagree, the policy wins and this document is stale. Please
@@ -28,42 +28,27 @@ When in doubt about where a change belongs, read [`AGENTS.md`](../../AGENTS.md) 
 
 ## 2. What's hot lava right now (freeze status)
 
-**Current state (updated 2026-11-09, target release 2.2.0.0):**
+**Current state (updated 2026-11-10, target release 2.2.0.0):**
 
-- v2.1.5.0 (Bungei Fukkō) shipped 2026-10-10: recovery paths and honest
-  failure messages, the workspace daily-log backup gate, the routine/mission
-  history registry split, and the secrets-tool approval tier landed. Normal
-  review tiers apply to engine internals again — but `ic/src/agent/`,
-  `ic/src/db/`, `ic/src/secrets/`, gateway, sandboxing, and approvals are
-  still Tier 3 by default (§3).
-- v2.1.6.0 (Tsuno) shipped 2026-10-24: the external-worker tool proxy
-  (WI#324), cron missions on external workers (WI#325), the libSQL
-  remote-replica feature gate (WI#331), and the worker credential/
-  exposure-policy hardening landed; see
-  `docs/releases/RELEASE-v2.1.6.0.md`.
-- The v2.2.0.0 pre-release checklist is being worked through
-  (`docs/ops/AGENT_GOALS_2.2.0.0.md`). The crate/pin state already moved
-  (all LunarWing crates at 2.2.0 per checklist item #1, along with the
-  XMPP bridge, the four WASM channels, and their registry packages;
-  kimi worker 2.5.2, opencode v1 at v1.19.5, and opencode2 at v2.2.6;
-  external worker upgrades remain separate from the crate sweep — the v2.0.26
-  OpenTunnel boundary was first crossed at v2.0.32 under the maintainer-approved
-  WI#427, with WI#357's tunnel compile-out and exposure guards retained;
-  see `docs/ops/WORKER-CONTAINERS.md` for verification and rollout). Landed in the v2.1.6.0 cycle: the external-worker
-  control channel (WI#328), external-worker cron mode (WI#325), the
-  harness as an optional external worker (WI#326), worker LLM endpoint
-  handling (WI#330), the libSQL remote-replica feature gate (WI#331),
-  mission credential redaction (WI#359), worker-container credential
-  hygiene (WI#373), the OpenRC proxy-unit migration (WI#376), and the
-  opencode2 exposure-policy controls (WI#357, item #21). Still open —
-  check the checklist before opening MRs there: the external-worker tool
-  proxy (WI#324), WI#336, WI#375, WI#377, WI#390, WI#380, WI#392, WI#393,
-  WI#402, WI#408, WI#410–#412, and the opencode2 exposure-policy
-  follow-ups (WI#357); WI#356 and WI#395 are merged but still open pending
-  maintainer acceptance.
-- **Kawarimi export testing under OpenRC** is being re-worked due to an open-write detection
-  difference vs systemd. OpenRC contributors *with kawarimi export expertise* are welcome →
-  ask in `#lunarwing`.
+- v2.1.9.0 (Kaitei) shipped 2026-11-08 with safer response caching and malformed
+  final-answer recovery, operator-controlled worker source archives, protocol-1
+  REPL hardening, and filesystem health monitoring. See
+  `docs/releases/RELEASE-v2.1.9.0.md` for that compatibility baseline.
+- The v2.2.0.0 pre-release checklist (`docs/ops/AGENT_GOALS_2.2.0.0.md`) is the
+  authoritative freeze list. Owned crates are at 2.2.0; the sandbox now defaults
+  to kernel-enforced `proxy-enforced` on Linux and has an opt-in egress-only
+  tunnel tier; Multica startup diagnostics, relay-password rotation, OpenRC
+  identity checks, storage errors, mission-log redaction, retry budgets, and
+  legacy steering have also landed. These remain Tier 3 areas even after merge.
+- At this review, the LunarDepth design/lane (items 5–6, with item 6 blocked on
+  item 5), the CI gauntlet (item 15), and the WI#592/WI#590 re-attempts
+  (items 17–18) remain open. Do not rely on an older work-item list copied into
+  onboarding text: check the goals file and linked work items before opening an
+  MR in one of those areas.
+- Engine internals, `ic/src/agent/`, `ic/src/db/`, `ic/src/secrets/`, gateway,
+  sandboxing, approvals, external workers, and CI/security controls remain
+  Tier 3 by default (§3). OpenRC and systemd user-manager validation are both
+  first-class contributions.
 
 We'll keep this updated — if the text above looks old, assume it is.
 
@@ -86,7 +71,7 @@ We'll keep this updated — if the text above looks old, assume it is.
 
 - Anything in `ic/src/agent/`, `ic/src/db/`, `ic/src/secrets/`, `ic/src/safety/`, gateway,
   sandboxing, approvals
-- DB schema changes (must dual-implement PostgreSQL + libSQL)
+- DB schema changes (shared trait plus both backends by default; the repository database rules allow a documented PostgreSQL-only exception when libSQL work would be disproportionate)
 - Anything that weakens an invariant listed in §10 of the policy
 
 If you're not sure which tier your idea is: it's Tier 3 until a maintainer says otherwise.
@@ -148,7 +133,7 @@ Code that violates these won't be merged no matter how elegant it is.
 
 - IRC: `#lunarwing` on `irc.libera.chat:6697` (TLS)
 - Architecture specs: `docs/architecture/`
-- Subsystem specs: `src/*/CLAUDE.md` (inside `ic/`)
+- Subsystem specs: `ic/src/*/CLAUDE.md`
 - Testing guide: `docs/guides/TESTING_GUIDE.md`
 
 Ask before you build. We would rather tell you "bad idea" in a 30-second IRC reply than
@@ -156,4 +141,4 @@ have you find out after 6 hours of work.
 
 ---
 
-*Last updated: 2026-11-09 (v2.2.0.0 freeze status). Update §2 whenever freeze status changes.*
+*Last updated: 2026-11-10 (v2.2.0.0 freeze status). Update §2 whenever freeze status changes.*
