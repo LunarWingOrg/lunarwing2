@@ -1310,6 +1310,30 @@ pub(crate) async fn output_isolated(
     output
 }
 
+/// Capture a detached container client's output while allowing its runtime
+/// network helpers to outlive the client (long-lived sidecar startup only).
+pub(crate) async fn output_detached_isolated(
+    bin: &str,
+    args: &[&str],
+) -> std::io::Result<std::process::Output> {
+    let spawner = crate::tools::process::workload_spawner().await;
+    let mut cmd = spawner.command(bin, args);
+    apply_container_runtime_path(&mut cmd);
+    let spec = spawner.prepare_detached_service(&mut cmd);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = cmd.spawn()?;
+    let mut guard = crate::tools::process::ProcessTreeGuard::for_service(
+        &child,
+        spec.as_ref(),
+        spawner.xdg_runtime_dir(),
+    );
+    let output = child.wait_with_output().await;
+    guard.disarm();
+    output
+}
+
 /// Capture the client version without joining or modifying rootless namespaces.
 async fn probe_podman_version() -> Option<(u32, u32)> {
     let output = tokio::process::Command::new("podman")
