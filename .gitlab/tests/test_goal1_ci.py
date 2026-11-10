@@ -248,6 +248,34 @@ class FullValidationTests(unittest.TestCase):
                     errors,
                 )
 
+    def test_secret_history_regression_mr_shape_cannot_be_weakened(self):
+        mutations = (
+            ("allow failure", "allow_failure", True),
+            ("schedule trigger", "rules", [{"if": '$CI_PIPELINE_SOURCE == "schedule"'}]),
+            ("scanner bypass", "script", ["gitleaks version"]),
+            ("stage barrier", "needs", ["secret-detection"]),
+            ("hook bypass", "before_script", ["exit 0"]),
+        )
+        for name, key, value in mutations:
+            with self.subTest(name=name):
+                merged = copy.deepcopy(self.merged)
+                merged["secret-history-regression"][key] = value
+                errors = []
+                config.validate_release_gates(merged, self.defaults, errors)
+                self.assertIn(
+                    "secret-history-regression must run the real-scanner harness only for MRs",
+                    errors,
+                )
+
+        merged = copy.deepcopy(self.merged)
+        del merged["secret-history-regression"]
+        errors = []
+        config.validate_release_gates(merged, self.defaults, errors)
+        self.assertIn(
+            "secret-history-regression must run the real-scanner harness only for MRs",
+            errors,
+        )
+
     def test_unlocked_cavepony_build_is_rejected(self):
         self.merged["cavepony-wasm"]["script"] = [command.replace(" --locked", "") for command in self.merged["cavepony-wasm"]["script"]]
         errors = []
