@@ -130,15 +130,17 @@ Items 3–4 cover the sandbox theme; items 5–6 cover LunarDepth.
 16. [x] Last attempt had REQUEST CHANGES as its verdict. see the review comments on the closed MR and address https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2312 - Original Task: work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/593
     - **DONE 2026-11-10 — Rarity (autonomous):** latest `master` pipeline **7557** on `3457eadc5` is **success**, finishing at 23:05:25Z with all **45/45 current jobs successful**. Release-target pipeline **7560** on `1910f7d65` is also **success** with **36/36 current jobs successful**. The reported red-master condition has recovered without a source change.
     - **!2312 review remediation (YI-1):** original master pipeline **7508** also reached **success** with **45/45 current jobs**, but its nine failed attempts were not all download outages: six were GitHub release-asset **504** bootstrap failures, while `rust-test-lib` and `cavepony-wasm` were `runner_interrupted` and the first `rust-test-libsql` attempt was `no_updates_running`. All nine were superseded by green retries; the trail now distinguishes the six download failures from the three runner-side interruptions
-    - **Follow-up boundary (YI-2/YI-3):** this is a point-in-time recovery verification, not a claim that later master pipelines cannot regress; item 15 remains the catch-all for that case. WI#594 separately tracks first-party asset hosting and bootstrap hardening and remains open; no issue closure or new goals item is claimed here.
+    - **Follow-up boundary (YI-2/YI-3):** this is a point-in-time recovery verification, not a claim that later master pipelines cannot regress; item 15 remains the catch-all for that case. WI#594 separately tracks first-party asset hosting and bootstrap hardening and remains open; no issue closure or new goals item is claimed here
 17. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/592 - last attempt had issues and needs to be re-attempted. closed MR with last attempt can be found at https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2335 and has adversarial review with what is wrong with it in the comments of the MR
 18. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/590 - last attempt had issues and needs to be re-attempted. closed MR with last attempt can be found at https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2334 and has adversarial review with what is wrong with it in the comments of the MR
-19. [x] (RESERVED4LATER) work on RELEASE NOTESs
+19. [x] (H) update rel notes write actual prompt for this later
 20. [ ] update all documentation in docs/architecture and docs/guides
 
 ## Phase 7 - Advanced Operator Notes
 
-21. [x] (S) RESERVED
-22. [x] (S) RESERVED4NOTES
+21. [x] (S) Deploy the stoplight system
+22. [x] (S) Dive back in to LunarDepth and open worker lanes across the fleet for it get it running and up again patches too
+23. [x] (S) RESERVED
+24. [x] (S) RESERVED
 
 ---
