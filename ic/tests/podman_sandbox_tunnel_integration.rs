@@ -543,11 +543,15 @@ async fn podman_tunnel_sidecar_netbird_live() {
         peer.ensure_healthy()
             .await
             .map_err(|error| error.to_string())?;
-        let primary_volume = assert_netbird_restart_identity(&primary).await?;
+        let primary_volume = netbird_volume(&primary).await?;
         let peer_volume = netbird_volume(&peer).await?;
         assert_ne!(primary_volume, peer_volume);
-        volumes.push(primary_volume);
+        volumes.push(primary_volume.clone());
         volumes.push(peer_volume);
+        assert_eq!(
+            primary_volume,
+            assert_netbird_restart_identity(&primary).await?
+        );
         assert_netbird_reconnect(&primary).await?;
         assert_netbird_ingress_denied(&primary, &peer).await
     }
