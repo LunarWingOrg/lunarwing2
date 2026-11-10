@@ -1331,11 +1331,12 @@ pub(crate) async fn output_isolated(
 pub(crate) async fn output_detached_isolated(
     bin: &str,
     args: &[&str],
+    unit_name: &str,
 ) -> std::io::Result<std::process::Output> {
     let spawner = crate::tools::process::workload_spawner().await;
     let mut cmd = spawner.command(bin, args);
     apply_container_runtime_path(&mut cmd);
-    let spec = spawner.prepare_detached_service(&mut cmd);
+    let spec = spawner.prepare_detached_service_with_unit(&mut cmd, Some(unit_name));
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());

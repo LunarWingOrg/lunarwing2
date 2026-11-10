@@ -1020,9 +1020,14 @@ impl TunnelSidecar {
             state_volume.as_deref(),
         );
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let detached_unit = format!("lunarwing-tunnel-{}", self.instance_id);
         let started = tokio::time::timeout(
             self.cfg.startup_timeout,
-            crate::sandbox::cli_runner::output_detached_isolated(self.bin, &arg_refs),
+            crate::sandbox::cli_runner::output_detached_isolated(
+                self.bin,
+                &arg_refs,
+                &detached_unit,
+            ),
         )
         .await;
         drop(env_file);
@@ -1389,6 +1394,7 @@ impl TunnelSidecar {
     /// Kill-and-remove only a sidecar carrying this instance's ownership label.
     pub async fn remove(&self) {
         let _ = tokio::time::timeout(CLEANUP_TIMEOUT, self.remove_with_grace(0)).await;
+        self.stop_network_helper().await;
     }
 
     /// Stop the sidecar gracefully, then remove it if this instance owns it.
@@ -1403,9 +1409,23 @@ impl TunnelSidecar {
                 "Sandbox tunnel sidecar stopped"
             );
         }
+        self.stop_network_helper().await;
         if let Ok(Some(path)) = self.resolv_conf_path() {
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    async fn stop_network_helper(&self) {
+        let spawner = crate::tools::process::workload_spawner().await;
+        if !spawner.uses_systemd_services() {
+            return;
+        }
+        let unit = format!("lunarwing-tunnel-{}.service", self.instance_id);
+        let _ = tokio::time::timeout(
+            CLEANUP_TIMEOUT,
+            crate::tools::process::stop_detached_workload_unit(&unit, spawner.xdg_runtime_dir()),
+        )
+        .await;
     }
 
     async fn remove_with_grace(&self, grace_secs: u32) -> bool {

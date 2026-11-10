@@ -203,19 +203,29 @@ impl WorkloadSpawner {
     /// command is rebuilt, so callers must re-apply stdio configuration
     /// after this call.
     pub fn prepare_service(&self, cmd: &mut Command) -> Option<ServiceSpec> {
-        self.prepare_service_with_kill_mode(cmd, None)
+        self.prepare_service_with_options(cmd, None, None)
     }
 
     /// Prepare a detached container-runtime client. Its network helper must
     /// outlive the client, so only the client's main process is killed on stop.
     pub fn prepare_detached_service(&self, cmd: &mut Command) -> Option<ServiceSpec> {
-        self.prepare_service_with_kill_mode(cmd, Some("process"))
+        self.prepare_detached_service_with_unit(cmd, None)
     }
 
-    fn prepare_service_with_kill_mode(
+    /// Prepare a detached client with a deterministic unit for later cleanup.
+    pub fn prepare_detached_service_with_unit(
+        &self,
+        cmd: &mut Command,
+        unit: Option<&str>,
+    ) -> Option<ServiceSpec> {
+        self.prepare_service_with_options(cmd, Some("process"), unit)
+    }
+
+    fn prepare_service_with_options(
         &self,
         cmd: &mut Command,
         kill_mode: Option<&str>,
+        unit: Option<&str>,
     ) -> Option<ServiceSpec> {
         if !self.uses_systemd_services() {
             return None;
@@ -233,11 +243,13 @@ impl WorkloadSpawner {
             .unwrap_or_else(|| "true".into());
         let args = &wrapper_args[sep + 2..];
 
-        let unit = format!(
-            "lunarwing-workload-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        );
+        let unit = unit.map(str::to_string).unwrap_or_else(|| {
+            format!(
+                "lunarwing-workload-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            )
+        });
         let env_file = write_workload_env_file(cmd, self.xdg_runtime_dir.as_deref());
         let working_dir = cmd
             .as_std()
@@ -628,8 +640,25 @@ pub fn stop_unit_background(unit: String, xdg_runtime_dir: Option<&str>) {
 /// Stop a transient workload unit (SIGTERM, then SIGKILL after its
 /// `TimeoutStopSec`). Best-effort: the unit may already be gone.
 async fn stop_workload_unit(unit: &str, xdg_runtime_dir: Option<&str>) {
+    stop_workload_unit_with_options(unit, xdg_runtime_dir, None).await;
+}
+
+/// Stop a detached sidecar unit and every network helper left in its cgroup.
+pub(crate) async fn stop_detached_workload_unit(unit: &str, xdg_runtime_dir: Option<&str>) {
+    stop_workload_unit_with_options(unit, xdg_runtime_dir, Some("all")).await;
+}
+
+async fn stop_workload_unit_with_options(
+    unit: &str,
+    xdg_runtime_dir: Option<&str>,
+    kill_whom: Option<&str>,
+) {
     let mut stop = Command::new("systemctl");
-    stop.args(["--user", "stop", unit]);
+    stop.arg("--user");
+    if let Some(kill_whom) = kill_whom {
+        stop.arg(format!("--kill-whom={kill_whom}"));
+    }
+    stop.args(["stop", unit]);
     if let Some(dir) = xdg_runtime_dir {
         stop.env("XDG_RUNTIME_DIR", dir);
     }
@@ -1007,15 +1036,20 @@ mod tests {
             manager_env: std::sync::Arc::new(Vec::new()),
         };
         let mut cmd = spawner.command("podman", &["run", "-d", "image"]);
-        let _ = spawner
-            .prepare_detached_service(&mut cmd)
+        let spec = spawner
+            .prepare_detached_service_with_unit(&mut cmd, Some("lunarwing-tunnel-test-instance"))
             .expect("detached service spec");
+        assert_eq!(spec.unit, "lunarwing-tunnel-test-instance");
         let args = cmd
             .as_std()
             .get_args()
             .map(|arg| arg.to_string_lossy())
             .collect::<Vec<_>>();
         assert!(args.iter().any(|arg| arg == "--property=KillMode=process"));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--unit=lunarwing-tunnel-test-instance")
+        );
     }
 
     #[test]
