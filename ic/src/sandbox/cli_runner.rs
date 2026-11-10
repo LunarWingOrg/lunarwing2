@@ -1252,12 +1252,28 @@ fn classify_run_failure(stderr: &str, image: &str, exit_code: i64) -> Option<San
     })
 }
 
-const CONTAINER_RUNTIME_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const DEFAULT_CONTAINER_RUNTIME_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+
+fn container_runtime_path(inherited: &str) -> String {
+    let mut path = inherited.to_string();
+    for directory in ["/usr/local/sbin", "/usr/sbin", "/sbin"] {
+        if !inherited.split(':').any(|part| part == directory) {
+            if !path.is_empty() {
+                path.push(':');
+            }
+            path.push_str(directory);
+        }
+    }
+    path
+}
 
 fn apply_container_runtime_path(cmd: &mut tokio::process::Command) {
     // systemd's default service PATH omits sbin, where Gentoo installs pasta.
-    // Set it before prepare_service so rootless Podman works in service mode.
-    cmd.env("PATH", CONTAINER_RUNTIME_PATH);
+    // Preserve custom runtime locations and add missing system sbin directories
+    // before prepare_service so rootless Podman works in service mode.
+    let inherited =
+        std::env::var("PATH").unwrap_or_else(|_| DEFAULT_CONTAINER_RUNTIME_PATH.to_string());
+    cmd.env("PATH", container_runtime_path(&inherited));
 }
 
 /// Run a quick status probe through the workload spawner (WI#181: container
@@ -2185,6 +2201,9 @@ mod tests {
         for directory in ["/usr/sbin", "/sbin"] {
             assert!(path.split(':').any(|part| part == directory));
         }
+        let custom = container_runtime_path("/custom/bin:/usr/sbin");
+        assert!(custom.starts_with("/custom/bin:/usr/sbin:"));
+        assert_eq!(custom.matches("/usr/sbin").count(), 1);
     }
 
     #[tokio::test]
