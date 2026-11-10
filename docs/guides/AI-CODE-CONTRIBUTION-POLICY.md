@@ -1,7 +1,8 @@
-# Lunarwing2 AI Code Contribution Policy
+# LunarWing AI Code Contribution Policy
 
-**Effective Date:** December 15th, 2026
-**Last Updated:** November 3rd, 2026 *(Added exceptions for documentation and non-generative cybersecurity analysis)*
+**Effective Date:** 2026-12-15
+**Last Policy Update:** 2026-11-03 *(Added exceptions for documentation and non-generative cybersecurity analysis)*
+**Documentation Review:** 2026-11-10 *(Editorial review only; policy dates and rules are unchanged.)*
 
 ## 1. Core Rule: Closed-Weight Models Prohibited for Code Generation
 
