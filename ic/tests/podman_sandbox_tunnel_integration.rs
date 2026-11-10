@@ -337,6 +337,16 @@ async fn assert_joined_run(
     let resolv_conf = sidecar
         .tunnel_resolv_conf()
         .map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    if let Some(path) = resolv_conf.as_deref() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .expect("resolver metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o644);
+    }
     let command = format!("{JOINED_PROBE}\ncat /proc/self/mountinfo\n{old_resolver_probe}\ntrue");
     let output = runner
         .execute(ExecParams {

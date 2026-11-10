@@ -940,6 +940,15 @@ impl TunnelSidecar {
             let _ = std::fs::remove_file(&temp_path);
             return Err(self.unavailable("could not write the tunnel resolver file"));
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o644)).is_err()
+            {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(self.unavailable("could not set tunnel resolver permissions"));
+            }
+        }
         std::fs::rename(&temp_path, &path)
             .map_err(|_| self.unavailable("could not install the tunnel resolver file"))?;
         Ok(Some(path))
