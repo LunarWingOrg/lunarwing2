@@ -31,9 +31,11 @@ use sha2::{Digest, Sha256};
 use crate::sandbox::cli_runner::ContainerRuntime;
 use crate::sandbox::error::{Result, SandboxError};
 
+/// Prefix of the daemon-instance-specific sidecar name.
 pub const SANDBOX_TUNNEL_CONTAINER: &str = "lunarwing-sandbox-tunnel";
 pub const SANDBOX_TUNNEL_CONTAINER_LABEL: &str = "lunarwing.sandbox-tunnel";
 pub const SANDBOX_TUNNEL_HASH_LABEL: &str = "lunarwing.sandbox-tunnel-hash";
+pub const SANDBOX_TUNNEL_INSTANCE_LABEL: &str = "lunarwing.sandbox-tunnel-instance";
 
 /// fwmark the sidecar sets on a WireGuard device whose config left it `off`
 /// (ASCII "LW"). wg-quick's own full-route fwmark (the routing table number)
@@ -60,7 +62,6 @@ const TUNNEL_INTERFACES: [&str; 2] = ["wg0", "wt0"];
 /// `host.containers.internal` alias (169.254.1.2 under pasta) live here.
 const LINK_LOCAL_V4: &str = "169.254.0.0/16";
 const LABEL_SALT_FILE: &str = "lunarwing-sandbox-tunnel.salt";
-const NETBIRD_STATE_VOLUME_PREFIX: &str = "lunarwing-sandbox-tunnel-netbird-";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TunnelProvider {
@@ -178,11 +179,11 @@ impl TunnelSidecarConfig {
     }
 
     /// Named volume holding NetBird's peer identity and config across sidecar
-    /// restarts, keyed by the config hash so a rotated setup key enrols a fresh
-    /// peer and the previous volume is pruned.
-    pub fn netbird_state_volume(&self, hash: &str) -> String {
+    /// restarts, scoped to one daemon instance and keyed by the config hash so
+    /// a rotated setup key enrols a fresh peer and the old volume is pruned.
+    pub fn netbird_state_volume(&self, instance_id: &str, hash: &str) -> String {
         format!(
-            "{NETBIRD_STATE_VOLUME_PREFIX}{}",
+            "{SANDBOX_TUNNEL_CONTAINER}-{instance_id}-netbird-{}",
             hash.get(..16).unwrap_or(hash)
         )
     }
@@ -266,6 +267,18 @@ fn parse_image_id(output: &str) -> Option<&str> {
     valid_sha256_hex(hex).then_some(id)
 }
 
+fn instance_id_for(base_dir: &Path) -> String {
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(base_dir.to_string_lossy().as_bytes())
+    );
+    digest[..16].to_string()
+}
+
+pub fn container_name_for_instance(base_dir: &Path) -> String {
+    format!("{SANDBOX_TUNNEL_CONTAINER}-{}", instance_id_for(base_dir))
+}
+
 fn hash_field(hasher: &mut Sha256, value: &[u8]) {
     hasher.update((value.len() as u64).to_be_bytes());
     hasher.update(value);
@@ -346,6 +359,8 @@ fn has_interface_private_key(content: &str) -> bool {
 pub(crate) fn build_sidecar_args(
     cfg: &TunnelSidecarConfig,
     secret_env_file: Option<&Path>,
+    container_name: &str,
+    instance_id: &str,
     hash: &str,
     netbird_state_volume: Option<&str>,
 ) -> Vec<String> {
@@ -354,13 +369,15 @@ pub(crate) fn build_sidecar_args(
         "-d".into(),
         "--rm".into(),
         "--name".into(),
-        SANDBOX_TUNNEL_CONTAINER.into(),
+        container_name.into(),
         "--label".into(),
         format!(
             "{}={}",
             SANDBOX_TUNNEL_CONTAINER_LABEL,
             cfg.provider.as_str()
         ),
+        "--label".into(),
+        format!("{SANDBOX_TUNNEL_INSTANCE_LABEL}={instance_id}"),
         "--label".into(),
         format!("{SANDBOX_TUNNEL_HASH_LABEL}={hash}"),
         "--cap-drop=ALL".into(),
@@ -420,22 +437,22 @@ pub(crate) fn build_sidecar_args(
     args
 }
 
-fn build_health_args_for(provider: TunnelProvider) -> Vec<String> {
+fn build_health_args_for(provider: TunnelProvider, container_name: &str) -> Vec<String> {
     let probe: &[&str] = match provider {
         TunnelProvider::Netbird => &["netbird", "status", "--check", "startup"],
         TunnelProvider::Wireguard => &["ip", "link", "show", "wg0"],
     };
-    exec_args(probe)
+    exec_args(probe, container_name)
 }
 
-fn exec_args(command: &[&str]) -> Vec<String> {
-    let mut args = vec!["exec".into(), SANDBOX_TUNNEL_CONTAINER.into()];
+fn exec_args(command: &[&str], container_name: &str) -> Vec<String> {
+    let mut args = vec!["exec".into(), container_name.into()];
     args.extend(command.iter().map(|arg| (*arg).into()));
     args
 }
 
-fn nft_exec_args(nft_args: &[&str]) -> Vec<String> {
-    let mut args = vec!["exec".into(), SANDBOX_TUNNEL_CONTAINER.into(), "nft".into()];
+fn nft_exec_args(nft_args: &[&str], container_name: &str) -> Vec<String> {
+    let mut args = vec!["exec".into(), container_name.into(), "nft".into()];
     args.extend(nft_args.iter().map(|arg| (*arg).into()));
     args
 }
@@ -490,7 +507,7 @@ fn chain_header(hook: &str) -> String {
     format!("{{ type filter hook {hook} priority 0; policy drop; }}")
 }
 
-fn firewall_install_commands(policy: &EgressPolicy) -> Vec<Vec<String>> {
+fn firewall_install_commands(policy: &EgressPolicy, container_name: &str) -> Vec<Vec<String>> {
     let input_header = chain_header(NFT_INPUT_CHAIN);
     let output_header = chain_header(NFT_OUTPUT_CHAIN);
     let input_rules = EgressPolicy::input_rules();
@@ -535,11 +552,14 @@ fn firewall_install_commands(policy: &EgressPolicy) -> Vec<Vec<String>> {
             rule.as_str(),
         ]);
     }
-    commands.iter().map(|args| nft_exec_args(args)).collect()
+    commands
+        .iter()
+        .map(|args| nft_exec_args(args, container_name))
+        .collect()
 }
 
-fn firewall_list_args() -> Vec<String> {
-    nft_exec_args(&["list", "table", "inet", NFT_TABLE])
+fn firewall_list_args(container_name: &str) -> Vec<String> {
+    nft_exec_args(&["list", "table", "inet", NFT_TABLE], container_name)
 }
 
 /// Canonical form of one listed nft line: whitespace collapsed, the trailing
@@ -674,15 +694,39 @@ pub struct TunnelSidecar {
     runtime: ContainerRuntime,
     bin: &'static str,
     cfg: TunnelSidecarConfig,
+    container_name: String,
+    instance_id: String,
 }
 
 impl TunnelSidecar {
     pub fn new(runtime: ContainerRuntime, cfg: TunnelSidecarConfig) -> Self {
+        Self::for_instance(runtime, cfg, &crate::bootstrap::lunarwing_base_dir())
+    }
+
+    pub fn for_instance(
+        runtime: ContainerRuntime,
+        cfg: TunnelSidecarConfig,
+        base_dir: &Path,
+    ) -> Self {
         Self {
             runtime,
             bin: runtime.binary(),
             cfg,
+            container_name: container_name_for_instance(base_dir),
+            instance_id: instance_id_for(base_dir),
         }
+    }
+
+    pub fn container_name(&self) -> &str {
+        &self.container_name
+    }
+
+    fn netbird_state_volume(&self, hash: &str) -> String {
+        self.cfg.netbird_state_volume(&self.instance_id, hash)
+    }
+
+    fn netbird_state_volume_prefix(&self) -> String {
+        format!("{SANDBOX_TUNNEL_CONTAINER}-{}-netbird-", self.instance_id)
     }
 
     /// Start the sidecar, or adopt a running one that carries our config hash
@@ -697,7 +741,7 @@ impl TunnelSidecar {
             match self.wait_healthy().await {
                 Ok(()) => return Ok(()),
                 Err(error) => tracing::warn!(
-                    container = SANDBOX_TUNNEL_CONTAINER,
+                    container = %self.container_name,
                     error = %error,
                     "Sandbox tunnel sidecar failed its health gate; recreating"
                 ),
@@ -722,7 +766,7 @@ impl TunnelSidecar {
     async fn start_fresh(&self, hash: &str) -> Result<()> {
         let state_volume = match self.cfg.provider {
             TunnelProvider::Netbird => {
-                let volume = self.cfg.netbird_state_volume(hash);
+                let volume = self.netbird_state_volume(hash);
                 self.prune_stale_netbird_volumes(&volume).await;
                 Some(volume)
             }
@@ -732,6 +776,8 @@ impl TunnelSidecar {
         let args = build_sidecar_args(
             &self.cfg,
             env_file.as_ref().map(SecretEnvFile::as_path),
+            &self.container_name,
+            &self.instance_id,
             hash,
             state_volume.as_deref(),
         );
@@ -765,7 +811,7 @@ impl TunnelSidecar {
             ));
         }
         tracing::info!(
-            container = SANDBOX_TUNNEL_CONTAINER,
+            container = %self.container_name,
             provider = self.cfg.provider.as_str(),
             "Sandbox tunnel sidecar started"
         );
@@ -783,7 +829,7 @@ impl TunnelSidecar {
             return Err(error);
         }
         tracing::info!(
-            container = SANDBOX_TUNNEL_CONTAINER,
+            container = %self.container_name,
             provider = self.cfg.provider.as_str(),
             "Sandbox tunnel sidecar healthy; inbound denied, uplink limited to tunnel traffic"
         );
@@ -832,36 +878,39 @@ impl TunnelSidecar {
     }
 
     async fn reuse_if_matching(&self, hash: &str) -> bool {
-        let Some((running, label)) = self.inspect().await else {
+        let Some((running, label, instance)) = self.inspect().await else {
             return false;
         };
-        running && label.as_deref() == Some(hash)
+        running && label.as_deref() == Some(hash) && instance.as_deref() == Some(&self.instance_id)
     }
 
-    async fn inspect(&self) -> Option<(bool, Option<String>)> {
+    async fn inspect(&self) -> Option<(bool, Option<String>, Option<String>)> {
         let format = format!(
-            "{{{{.State.Running}}}}|{{{{index .Config.Labels \"{SANDBOX_TUNNEL_HASH_LABEL}\"}}}}"
+            "{{{{.State.Running}}}}|{{{{index .Config.Labels \"{SANDBOX_TUNNEL_HASH_LABEL}\"}}}}|{{{{index .Config.Labels \"{SANDBOX_TUNNEL_INSTANCE_LABEL}\"}}}}"
         );
         let output = self
-            .output_probe(&["inspect", "--format", &format, SANDBOX_TUNNEL_CONTAINER])
+            .output_probe(&["inspect", "--format", &format, &self.container_name])
             .await
             .ok()?;
         if !output.status.success() {
             return None;
         }
         let text = String::from_utf8_lossy(&output.stdout);
-        let mut parts = text.trim().splitn(2, '|');
+        let mut parts = text.trim().splitn(3, '|');
         let running = parts.next()? == "true";
-        let hash = parts
-            .next()
-            .map(str::trim)
-            .filter(|hash| !hash.is_empty())
-            .map(str::to_string);
-        Some((running, hash))
+        let label = |value: Option<&str>| {
+            value
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        let hash = label(parts.next());
+        let instance = label(parts.next());
+        Some((running, hash, instance))
     }
 
     async fn provider_probe(&self) -> bool {
-        let args = build_health_args_for(self.cfg.provider);
+        let args = build_health_args_for(self.cfg.provider, &self.container_name);
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         self.status_probe(&refs).await.is_some_and(|s| s.success())
     }
@@ -874,7 +923,7 @@ impl TunnelSidecar {
             TunnelProvider::Netbird => NETBIRD_CONTROL_PLANE_MARK,
             TunnelProvider::Wireguard => self.wireguard_fwmark(set_wireguard_mark).await?,
         };
-        let cat = exec_args(&["cat", "/etc/resolv.conf"]);
+        let cat = exec_args(&["cat", "/etc/resolv.conf"], &self.container_name);
         let cat_refs: Vec<&str> = cat.iter().map(String::as_str).collect();
         let resolv = self
             .output_probe(&cat_refs)
@@ -890,7 +939,7 @@ impl TunnelSidecar {
     }
 
     async fn wireguard_fwmark(&self, set_if_off: bool) -> Result<u32> {
-        let show = exec_args(&["wg", "show", "wg0", "fwmark"]);
+        let show = exec_args(&["wg", "show", "wg0", "fwmark"], &self.container_name);
         let show_refs: Vec<&str> = show.iter().map(String::as_str).collect();
         let output = self
             .output_probe(&show_refs)
@@ -906,7 +955,7 @@ impl TunnelSidecar {
             return Err(self.unavailable("WireGuard device carries no fwmark"));
         }
         let mark = format!("0x{LUNARWING_TUNNEL_FWMARK:x}");
-        let set = exec_args(&["wg", "set", "wg0", "fwmark", &mark]);
+        let set = exec_args(&["wg", "set", "wg0", "fwmark", &mark], &self.container_name);
         let set_refs: Vec<&str> = set.iter().map(String::as_str).collect();
         match self.status_probe(&set_refs).await {
             Some(status) if status.success() => Ok(LUNARWING_TUNNEL_FWMARK),
@@ -916,7 +965,10 @@ impl TunnelSidecar {
 
     async fn install_egress_firewall(&self) -> Result<()> {
         let policy = self.egress_policy(true).await?;
-        for (index, args) in firewall_install_commands(&policy).iter().enumerate() {
+        for (index, args) in firewall_install_commands(&policy, &self.container_name)
+            .iter()
+            .enumerate()
+        {
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let output = self.output_probe(&refs).await.map_err(|_| {
                 self.unavailable("failed to execute nftables in the tunnel sidecar")
@@ -937,7 +989,7 @@ impl TunnelSidecar {
     }
 
     async fn verify_egress_firewall(&self, policy: &EgressPolicy) -> Result<()> {
-        let args = firewall_list_args();
+        let args = firewall_list_args(&self.container_name);
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let output = self
             .output_probe(&refs)
@@ -950,7 +1002,7 @@ impl TunnelSidecar {
         let listing = String::from_utf8_lossy(&output.stdout);
         firewall_matches(&listing, policy).map_err(|reason| {
             tracing::warn!(
-                container = SANDBOX_TUNNEL_CONTAINER,
+                container = %self.container_name,
                 reason = %reason,
                 "Sandbox tunnel firewall does not match the expected policy"
             );
@@ -1010,8 +1062,9 @@ impl TunnelSidecar {
             return;
         }
         let listing = String::from_utf8_lossy(&output.stdout);
+        let prefix = self.netbird_state_volume_prefix();
         for name in listing.lines().map(str::trim) {
-            if name.starts_with(NETBIRD_STATE_VOLUME_PREFIX) && name != keep {
+            if name.starts_with(&prefix) && name != keep {
                 let _ = self.status_probe(&["volume", "rm", name]).await;
             }
         }
@@ -1051,35 +1104,51 @@ impl TunnelSidecar {
         Ok(self.cfg.config_hash(&salt, &image_id))
     }
 
-    /// Kill-and-remove the sidecar at once (`podman rm -f -t 0`; Docker's
-    /// `rm -f` has no timeout flag and kills immediately).
+    /// Kill-and-remove only a sidecar carrying this instance's ownership label.
     pub async fn remove(&self) {
         let _ = tokio::time::timeout(CLEANUP_TIMEOUT, self.remove_with_grace(0)).await;
     }
 
-    /// Stop the sidecar gracefully, then remove it.
+    /// Stop the sidecar gracefully, then remove it if this instance owns it.
     pub async fn stop(&self) {
-        let _ = tokio::time::timeout(CLEANUP_TIMEOUT, self.remove_with_grace(10)).await;
-        tracing::info!(
-            container = SANDBOX_TUNNEL_CONTAINER,
-            "Sandbox tunnel sidecar stopped"
-        );
+        if tokio::time::timeout(CLEANUP_TIMEOUT, self.remove_with_grace(10))
+            .await
+            .ok()
+            == Some(true)
+        {
+            tracing::info!(
+                container = %self.container_name,
+                "Sandbox tunnel sidecar stopped"
+            );
+        }
     }
 
-    async fn remove_with_grace(&self, grace_secs: u32) {
-        for args in removal_commands(self.runtime, grace_secs) {
+    async fn remove_with_grace(&self, grace_secs: u32) -> bool {
+        let owned = self
+            .inspect()
+            .await
+            .is_some_and(|(_, _, instance)| instance.as_deref() == Some(self.instance_id.as_str()));
+        if !owned {
+            tracing::debug!(
+                container = %self.container_name,
+                "Not removing a sidecar without this instance's ownership label"
+            );
+            return false;
+        }
+        for args in removal_commands(self.runtime, grace_secs, &self.container_name) {
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
             if let Some(status) =
                 crate::sandbox::cli_runner::run_status_isolated(self.bin, &refs).await
                 && !status.success()
             {
                 tracing::debug!(
-                    container = SANDBOX_TUNNEL_CONTAINER,
+                    container = %self.container_name,
                     command = refs.join(" "),
                     "Sandbox tunnel sidecar removal command returned non-zero"
                 );
             }
         }
+        true
     }
 
     fn write_secret_env_file(&self) -> Result<Option<SecretEnvFile>> {
@@ -1112,7 +1181,11 @@ impl TunnelSidecar {
 
 /// Runtime-specific removal: podman's `rm` takes `-t`, Docker's does not, so
 /// Docker stops first when a grace period is wanted.
-fn removal_commands(runtime: ContainerRuntime, grace_secs: u32) -> Vec<Vec<String>> {
+fn removal_commands(
+    runtime: ContainerRuntime,
+    grace_secs: u32,
+    container_name: &str,
+) -> Vec<Vec<String>> {
     let grace = grace_secs.to_string();
     let to_strings = |args: &[&str]| args.iter().map(|arg| (*arg).to_string()).collect();
     match runtime {
@@ -1121,19 +1194,14 @@ fn removal_commands(runtime: ContainerRuntime, grace_secs: u32) -> Vec<Vec<Strin
             "-f",
             "-t",
             grace.as_str(),
-            SANDBOX_TUNNEL_CONTAINER,
+            container_name,
         ])],
         ContainerRuntime::Docker => {
             let mut commands = Vec::new();
             if grace_secs > 0 {
-                commands.push(to_strings(&[
-                    "stop",
-                    "-t",
-                    grace.as_str(),
-                    SANDBOX_TUNNEL_CONTAINER,
-                ]));
+                commands.push(to_strings(&["stop", "-t", grace.as_str(), container_name]));
             }
-            commands.push(to_strings(&["rm", "-f", SANDBOX_TUNNEL_CONTAINER]));
+            commands.push(to_strings(&["rm", "-f", container_name]));
             commands
         }
     }
@@ -1311,15 +1379,19 @@ mod tests {
         let args = build_sidecar_args(
             &cfg,
             Some(Path::new("/run/user/1000/lw-env")),
+            "lunarwing-sandbox-tunnel-test",
+            "test-instance",
             "abc123",
-            Some("lunarwing-sandbox-tunnel-netbird-abc123"),
+            Some("lunarwing-sandbox-tunnel-test-instance-netbird-abc123"),
         );
         let joined = args.join("\n");
         assert!(!joined.contains("setup-key-1"));
         assert!(!joined.contains("netbird.example.com"));
         assert!(joined.contains("--env-file\n/run/user/1000/lw-env"));
         assert!(joined.contains("--device\n/dev/net/tun"));
-        assert!(joined.contains("-v\nlunarwing-sandbox-tunnel-netbird-abc123:/var/lib/netbird"));
+        assert!(joined.contains(
+            "-v\nlunarwing-sandbox-tunnel-test-instance-netbird-abc123:/var/lib/netbird"
+        ));
         assert!(!joined.contains("/var/lib/netbird:size="));
         assert!(joined.contains("--cap-drop=ALL"));
         assert!(joined.contains("--cap-add=NET_ADMIN"));
@@ -1340,6 +1412,8 @@ mod tests {
         let args = build_sidecar_args(
             &wireguard_cfg(Some(PathBuf::from("/etc/lunarwing/wg0.conf"))),
             None,
+            "lunarwing-sandbox-tunnel-test",
+            "test-instance",
             "abc123",
             None,
         );
@@ -1358,7 +1432,15 @@ mod tests {
     #[test]
     fn sidecar_preserves_hardening_and_separate_label_namespace() {
         let cfg = netbird_cfg();
-        let joined = build_sidecar_args(&cfg, None, "deadbeef", None).join(" ");
+        let joined = build_sidecar_args(
+            &cfg,
+            None,
+            "lunarwing-sandbox-tunnel-test",
+            "test-instance",
+            "deadbeef",
+            None,
+        )
+        .join(" ");
         for flag in [
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
@@ -1372,8 +1454,26 @@ mod tests {
             assert!(joined.contains(flag), "missing {flag}: {joined}");
         }
         assert!(joined.contains(&format!("{SANDBOX_TUNNEL_CONTAINER_LABEL}=netbird")));
+        assert!(joined.contains(&format!("{SANDBOX_TUNNEL_INSTANCE_LABEL}=test-instance")));
         assert!(joined.contains(&format!("{SANDBOX_TUNNEL_HASH_LABEL}=deadbeef")));
         assert!(!joined.contains("lunarwing.sandbox="));
+    }
+
+    #[test]
+    fn container_names_and_netbird_volumes_are_instance_scoped() {
+        let first = container_name_for_instance(Path::new("/srv/one/state"));
+        let second = container_name_for_instance(Path::new("/srv/two/state"));
+        assert_ne!(first, second);
+        assert!(first.starts_with("lunarwing-sandbox-tunnel-"));
+        assert_eq!(
+            first,
+            container_name_for_instance(Path::new("/srv/one/state"))
+        );
+        let cfg = netbird_cfg();
+        let first_volume = cfg.netbird_state_volume("first-instance", "abcdef");
+        let second_volume = cfg.netbird_state_volume("second-instance", "abcdef");
+        assert_ne!(first_volume, second_volume);
+        assert!(first_volume.starts_with("lunarwing-sandbox-tunnel-first-instance-netbird-"));
     }
 
     #[test]
@@ -1417,11 +1517,14 @@ mod tests {
     #[test]
     fn netbird_state_volume_is_keyed_by_hash() {
         let cfg = netbird_cfg();
-        let volume = cfg.netbird_state_volume("0123456789abcdef0123456789abcdef");
-        assert_eq!(volume, "lunarwing-sandbox-tunnel-netbird-0123456789abcdef");
+        let volume = cfg.netbird_state_volume("test-instance", "0123456789abcdef0123456789abcdef");
+        assert_eq!(
+            volume,
+            "lunarwing-sandbox-tunnel-test-instance-netbird-0123456789abcdef"
+        );
         assert_ne!(
             volume,
-            cfg.netbird_state_volume("fedcba9876543210fedcba9876543210")
+            cfg.netbird_state_volume("test-instance", "fedcba9876543210fedcba9876543210")
         );
     }
 
@@ -1511,18 +1614,18 @@ mod tests {
     #[test]
     fn health_probe_matches_provider() {
         assert_eq!(
-            build_health_args_for(TunnelProvider::Netbird).join(" "),
-            "exec lunarwing-sandbox-tunnel netbird status --check startup"
+            build_health_args_for(TunnelProvider::Netbird, "tunnel-test").join(" "),
+            "exec tunnel-test netbird status --check startup"
         );
         assert_eq!(
-            build_health_args_for(TunnelProvider::Wireguard).join(" "),
-            "exec lunarwing-sandbox-tunnel ip link show wg0"
+            build_health_args_for(TunnelProvider::Wireguard, "tunnel-test").join(" "),
+            "exec tunnel-test ip link show wg0"
         );
     }
 
     #[test]
     fn firewall_install_covers_both_directions() {
-        let commands = firewall_install_commands(&policy());
+        let commands = firewall_install_commands(&policy(), "tunnel-test");
         let joined = commands
             .iter()
             .map(|command| command.join(" "))
@@ -1701,19 +1804,16 @@ mod tests {
 
     #[test]
     fn removal_commands_match_the_runtime() {
-        let podman = removal_commands(ContainerRuntime::Podman, 10);
+        let podman = removal_commands(ContainerRuntime::Podman, 10, "tunnel-test");
         assert_eq!(podman.len(), 1);
-        assert_eq!(podman[0].join(" "), "rm -f -t 10 lunarwing-sandbox-tunnel");
-        let docker_stop = removal_commands(ContainerRuntime::Docker, 10);
+        assert_eq!(podman[0].join(" "), "rm -f -t 10 tunnel-test");
+        let docker_stop = removal_commands(ContainerRuntime::Docker, 10, "tunnel-test");
         assert_eq!(docker_stop.len(), 2);
-        assert_eq!(
-            docker_stop[0].join(" "),
-            "stop -t 10 lunarwing-sandbox-tunnel"
-        );
-        assert_eq!(docker_stop[1].join(" "), "rm -f lunarwing-sandbox-tunnel");
-        let docker_kill = removal_commands(ContainerRuntime::Docker, 0);
+        assert_eq!(docker_stop[0].join(" "), "stop -t 10 tunnel-test");
+        assert_eq!(docker_stop[1].join(" "), "rm -f tunnel-test");
+        let docker_kill = removal_commands(ContainerRuntime::Docker, 0, "tunnel-test");
         assert_eq!(docker_kill.len(), 1);
-        assert_eq!(docker_kill[0].join(" "), "rm -f lunarwing-sandbox-tunnel");
+        assert_eq!(docker_kill[0].join(" "), "rm -f tunnel-test");
         assert!(docker_kill.iter().all(|c| !c.iter().any(|a| a == "-t")));
     }
 
