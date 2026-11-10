@@ -297,8 +297,8 @@ impl Drop for EmptyMaskFile {
 pub struct TunnelRunConfig<'a> {
     pub container_name: &'a str,
     pub dns: &'a [IpAddr],
-    /// Owner-only resolver file mounted when `dns` is nonempty. Runtimes reject
-    /// `--dns` together with `--network container`.
+    /// World-readable resolver file mounted when `dns` is nonempty so every
+    /// keep-id mode can read it. Runtimes reject `--dns` with `--network container`.
     pub resolv_conf: Option<&'a Path>,
 }
 
@@ -507,7 +507,7 @@ pub(crate) fn build_run_args(spec: &RunSpec<'_>) -> Vec<String> {
                 {
                     args.extend([
                         "-v".into(),
-                        format!("{}:/etc/resolv.conf:ro,Z", path.display()),
+                        format!("{}:/etc/resolv.conf:ro,z", path.display()),
                     ]);
                 }
             } else {
@@ -1765,7 +1765,7 @@ mod tests {
             });
             let joined = args.join(" ");
             assert!(joined.contains("--network container:lunarwing-sandbox-tunnel-instance"));
-            assert!(joined.contains("/run/user/1000/tunnel.resolv.conf:/etc/resolv.conf:ro,Z"));
+            assert!(joined.contains("/run/user/1000/tunnel.resolv.conf:/etc/resolv.conf:ro,z"));
             assert!(!joined.contains("--dns"));
             for flag in [
                 "--cap-drop=ALL",
