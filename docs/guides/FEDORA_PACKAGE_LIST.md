@@ -4,12 +4,11 @@ Packages needed to run a live LunarWing multi-tenant deployment on **Fedora (cur
 releases) + systemd** via `ic/scripts/lunarwing-mt-admin.sh`, including the infra
 health-check + self-heal pipeline.
 
-**Revalidated 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-14 (v2.1.6.0).** Package set re-checked against the
-current mt-admin prerequisite probes; no changes were needed (the v2.1.2.0
-sandbox rework added no new host packages — podman was already required, the
-v2.1.4.0 read-only diagnostics verbs `psql`/`daemon-pid` reuse existing
-tooling inside the tenant containers, and the v2.1.6.0 OpenRC proxy-unit
-migration and worker-credential work add no new host commands).
+**Revalidated 2026-11-10 (v2.2.0.0).** Package names and mt-admin prerequisite
+probes were re-checked. External-worker egress enforcement (WI#424) requires
+the host `nft` command, so `nftables` is now explicit below. Disk health reuses
+`df`, `stat`, and `timeout` from the already-expected core utilities; no other
+new host package is required.
 
 This is the Fedora equivalent of [`GENTOO_PACKAGE_LIST.md`](GENTOO_PACKAGE_LIST.md); the
 operational notes there (port registry, per-tenant rustup, doctor output, etc.) apply
@@ -47,11 +46,12 @@ Each tenant's PostgreSQL runs as a container, so one runtime is **required**. Po
 preferred (and is Fedora's native container stack):
 
 ```bash
-sudo dnf install podman fuse-overlayfs   # pulls netavark, aardvark-dns, crun, conmon, passt, ...
+sudo dnf install podman fuse-overlayfs nftables   # podman pulls netavark, aardvark-dns, crun, conmon, passt, ...
 ```
 
 No USE-flag/iptables step is needed: Fedora's firewall stack is already nftables-based,
-which is what podman needs.
+which is what podman needs. Keep `nftables` explicit so the host `nft` command is available
+to mt-admin's per-tenant external-worker egress enforcement and read-only audit.
 
 `lunarwing-mt-admin.sh` uses the fully-qualified `docker.io/pgvector/pgvector:pg16` image, so
 no `unqualified-search-registries` config is strictly required. If you override to a short
@@ -180,7 +180,7 @@ with the shipped requirements files is the recommended route:
 ```bash
 sudo dnf install \
   jq git python3 curl \
-  podman fuse-overlayfs \
+  podman fuse-overlayfs nftables \
   cronie \
   gcc pkgconf-pkg-config openssl-devel clang \
   weechat tmux \
