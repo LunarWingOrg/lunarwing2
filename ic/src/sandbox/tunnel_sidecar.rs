@@ -944,7 +944,7 @@ impl TunnelSidecar {
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let started = tokio::time::timeout(
             self.cfg.startup_timeout,
-            crate::sandbox::cli_runner::output_isolated(self.bin, &arg_refs),
+            crate::sandbox::cli_runner::output_detached_isolated(self.bin, &arg_refs),
         )
         .await;
         drop(env_file);
