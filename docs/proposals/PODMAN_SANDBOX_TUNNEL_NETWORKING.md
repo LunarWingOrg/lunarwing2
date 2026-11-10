@@ -58,9 +58,10 @@ and installs an `inet lunarwing_sandbox_egress` table with two base chains:
   IPv6 neighbour discovery; by default, DNS (`udp`/`tcp` 53) to the resolvers
   in the sidecar's `/etc/resolv.conf`; an explicit drop of `169.254.0.0/16`;
   and, last, packets carrying the provider's socket mark. Everything else is
-  dropped. Setting `SANDBOX_TUNNEL_DNS` passes `--dns` to the sidecar and every
-  joined run and removes all of those uplink DNS rules; the configured
-  resolvers must be reachable through the tunnel.
+  dropped. Setting `SANDBOX_TUNNEL_DNS` passes `--dns` to the sidecar, mounts an
+  atomically replaced owner-only resolver file read-only into every joined run
+  (runtimes reject `--dns` with `--network container`), and removes all uplink
+  DNS rules; the configured resolvers must be reachable through the tunnel.
 
 The mark is how the tunnel's own control plane keeps using the uplink without
 an address allowlist that would have to track management, signal, relay and
