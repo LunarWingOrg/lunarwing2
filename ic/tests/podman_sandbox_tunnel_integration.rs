@@ -194,6 +194,16 @@ async fn assert_joined_run(
     workdir: &Path,
     dns: &[IpAddr],
 ) -> Result<(), String> {
+    if dns.is_empty() {
+        let sidecar_dns =
+            podman_output(&["exec", sidecar.container_name(), "nslookup", "example.com"]).await?;
+        assert!(
+            sidecar_dns.status.success(),
+            "sidecar DNS failed:\n{}{}",
+            String::from_utf8_lossy(&sidecar_dns.stdout),
+            String::from_utf8_lossy(&sidecar_dns.stderr)
+        );
+    }
     let runner = CliRunner::detect(SandboxRuntime::Podman, image.to_string())
         .await
         .map_err(|error| error.to_string())?;
