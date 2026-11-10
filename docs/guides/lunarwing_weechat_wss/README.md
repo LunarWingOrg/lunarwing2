@@ -65,6 +65,20 @@ sudo ic/scripts/lunarwing-mt-admin.sh render-units <tenant>
 sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant <tenant>
 ```
 
+For relay-password rotation on an existing tenant, first render the current
+units so the shared credential start barrier is installed, then use the
+coordinated rotation command:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh rotate-relay-password <tenant>
+```
+
+Do not rotate only the per-owner secret store. The managed `RELAY_PASSWORD`
+now wins in channel setup and host callback authentication, preventing the
+WASM channel from continuing with the old password after WeeChat and the
+adapter restart. See [`../../ops/WEECHAT-SERVICES.md`](../../ops/WEECHAT-SERVICES.md)
+for interruption recovery and the start-barrier contract.
+
 Do not call bare system-bus `systemctl` for tenant units. On systemd hosts they live in the tenant user's user manager; on Gentoo they are OpenRC services.
 
 ## Build or Install the Channel
