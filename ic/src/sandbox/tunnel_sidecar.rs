@@ -55,6 +55,7 @@ const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 const WIREGUARD_HANDSHAKE_MAX_AGE_SECS: u64 = 180;
+const WIREGUARD_KEEPALIVE_MAX_SECS: u64 = 60;
 const MAX_WIREGUARD_CONFIG_BYTES: u64 = 1024 * 1024;
 const NFT_TABLE: &str = "lunarwing_sandbox_egress";
 const NFT_INPUT_CHAIN: &str = "input";
@@ -254,7 +255,7 @@ impl TunnelSidecarConfig {
                     "SANDBOX_TUNNEL_WIREGUARD_CONFIG is required for the wireguard provider"
                         .to_string()
                 })?;
-                validate_wireguard_config(path)
+                validate_wireguard_config(path, self.wireguard_canary.is_some())
             }
         }?;
         if self.startup_timeout.is_zero() {
@@ -369,7 +370,10 @@ fn hash_optional(hasher: &mut Sha256, value: Option<&str>) {
     }
 }
 
-fn validate_wireguard_config(path: &Path) -> std::result::Result<(), String> {
+fn validate_wireguard_config(
+    path: &Path,
+    canary_configured: bool,
+) -> std::result::Result<(), String> {
     let metadata = std::fs::symlink_metadata(path).map_err(|error| {
         format!(
             "SANDBOX_TUNNEL_WIREGUARD_CONFIG {} is unreadable: {error}",
@@ -408,6 +412,15 @@ fn validate_wireguard_config(path: &Path) -> std::result::Result<(), String> {
             path.display()
         ));
     }
+    if wireguard_config_has_peers(&content)
+        && !canary_configured
+        && !wireguard_config_has_suitable_keepalive(&content)
+    {
+        return Err(
+            "peered WireGuard configs require PersistentKeepalive = 1..=60 on at least one peer, or SANDBOX_TUNNEL_WIREGUARD_CANARY"
+                .into(),
+        );
+    }
     Ok(())
 }
 
@@ -441,6 +454,28 @@ fn wireguard_config_has_peers(content: &str) -> bool {
         }
         line.split_once('=').is_some_and(|(key, value)| {
             key.trim().eq_ignore_ascii_case("publickey") && !value.trim().is_empty()
+        })
+    })
+}
+
+fn wireguard_config_has_suitable_keepalive(content: &str) -> bool {
+    let mut in_peer = false;
+    content.lines().any(|raw| {
+        let line = raw.trim();
+        if line.starts_with('[') {
+            in_peer = line.eq_ignore_ascii_case("[peer]");
+            return false;
+        }
+        if !in_peer || line.starts_with('#') || line.starts_with(';') {
+            return false;
+        }
+        line.split_once('=').is_some_and(|(key, value)| {
+            key.trim().eq_ignore_ascii_case("persistentkeepalive")
+                && value
+                    .split_whitespace()
+                    .next()
+                    .and_then(|seconds| seconds.parse::<u64>().ok())
+                    .is_some_and(|seconds| (1..=WIREGUARD_KEEPALIVE_MAX_SECS).contains(&seconds))
         })
     })
 }
@@ -1866,6 +1901,48 @@ mod tests {
             std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
         assert!(wireguard_cfg(Some(config)).validate().is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn peered_wireguard_requires_keepalive_or_canary() {
+        let dir =
+            std::env::temp_dir().join(format!("lw-tunnel-keepalive-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("wg0.conf");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&config, "").unwrap();
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let validate = |keepalive: Option<&str>, canary: bool| {
+            let keepalive = keepalive
+                .map(|value| format!("PersistentKeepalive = {value}\n"))
+                .unwrap_or_default();
+            std::fs::write(
+                &config,
+                format!(
+                    "[Interface]\nPrivateKey = private\n[Peer]\nPublicKey = public\n{keepalive}"
+                ),
+            )
+            .unwrap();
+            TunnelSidecarConfig {
+                provider: TunnelProvider::Wireguard,
+                wireguard_config: Some(config.clone()),
+                wireguard_canary: canary.then(|| "10.231.0.1".parse().unwrap()),
+                ..TunnelSidecarConfig::default()
+            }
+            .validate()
+        };
+        for invalid in [None, Some("0"), Some("61")] {
+            let error = validate(invalid, false).unwrap_err();
+            assert!(error.contains("PersistentKeepalive"), "{error}");
+        }
+        for valid in [Some("1"), Some("25 # seconds"), Some("60")] {
+            assert!(validate(valid, false).is_ok());
+        }
+        assert!(validate(None, true).is_ok());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
