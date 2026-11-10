@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use tokio::sync::RwLock;
 
-use crate::sandbox::cli_runner::{CliRunner, ExecParams};
+use crate::sandbox::cli_runner::{CliRunner, ExecParams, TunnelRunConfig};
 use crate::sandbox::config::{ResourceLimits, SandboxConfig, SandboxNetworkMode, SandboxPolicy};
 use crate::sandbox::error::{Result, SandboxError};
 use crate::sandbox::proxy::{HttpProxy, NetworkProxyBuilder};
@@ -328,7 +328,7 @@ impl SandboxManager {
         let cwd =
             crate::sandbox::mount_guard::validate_mount_dir(cwd, &self.config.protected_paths)?;
 
-        if self.config.network == SandboxNetworkMode::Tunnel {
+        let tunnel_run = if self.config.network == SandboxNetworkMode::Tunnel {
             let tunnel = self.tunnel.read().await;
             let sidecar = tunnel
                 .as_ref()
@@ -345,7 +345,16 @@ impl SandboxManager {
                 sidecar.ensure_started().await?;
                 sidecar.ensure_healthy().await?;
             }
-        }
+            let dns = self
+                .config
+                .tunnel
+                .as_ref()
+                .map(|config| config.dns.clone())
+                .unwrap_or_default();
+            Some((sidecar.container_name().to_string(), dns))
+        } else {
+            None
+        };
 
         let proxy_port = if let Some(proxy) = self.proxy.read().await.as_ref() {
             proxy.addr().await.map(|a| a.port()).unwrap_or(0)
@@ -378,6 +387,10 @@ impl SandboxManager {
                 env: &env,
                 network: self.config.network,
                 proxy_port,
+                tunnel: tunnel_run.as_ref().map(|(name, dns)| TunnelRunConfig {
+                    container_name: name,
+                    dns: dns.as_slice(),
+                }),
                 protected_paths: &self.config.protected_paths,
                 tenant_logs: self.config.tenant_logs.enabled(),
             })
