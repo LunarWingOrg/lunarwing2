@@ -4,9 +4,10 @@ Supervised mode is LunarWing's global human-in-the-loop setting for tool executi
 
 The older "Human Delay Mode" phase documents referenced by this file no longer exist. The implemented feature is named **supervised mode** in the CLI, runtime configuration, thread state, Engine V2 gate context, and effect adapter.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-14 (v2.1.6.0).** The `--supervised` CLI
-flag and `AGENT_SUPERVISED_MODE` runtime override were re-checked against
-`ic/src/main.rs` and the bridge router; no changes were needed.
+**Revalidated against source 2026-11-10 (v2.2.0.0).** The `--supervised` CLI
+flag and `AGENT_SUPERVISED_MODE` runtime override match `ic/src/main.rs` and
+the bridge router; supervised mode still gates every tool action and takes
+precedence over global auto-approval.
 
 ## Enable It
 
