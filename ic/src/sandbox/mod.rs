@@ -129,7 +129,8 @@ pub mod proxy;
 pub mod tunnel_sidecar;
 
 pub use cli_runner::{
-    CliRunner, ContainerRuntime, KeepIdMode, SANDBOX_CONTAINER_LABEL, inflight_sandbox_containers,
+    CliRunner, ContainerRuntime, KeepIdMode, SANDBOX_CONTAINER_LABEL, TunnelRunConfig,
+    inflight_sandbox_containers,
 };
 pub use config::{
     ResourceLimits, SandboxConfig, SandboxNetworkMode, SandboxPolicy, SandboxRuntime,
@@ -146,8 +147,8 @@ pub use proxy::{
     NetworkDecision, NetworkPolicyDecider, NetworkProxyBuilder, NetworkRequest,
 };
 pub use tunnel_sidecar::{
-    SANDBOX_TUNNEL_CONTAINER, SANDBOX_TUNNEL_CONTAINER_LABEL, TunnelProvider, TunnelSidecar,
-    TunnelSidecarConfig,
+    SANDBOX_TUNNEL_CONTAINER, SANDBOX_TUNNEL_CONTAINER_LABEL, SANDBOX_TUNNEL_INSTANCE_LABEL,
+    TunnelProvider, TunnelSidecar, TunnelSidecarConfig, container_name_for_instance,
 };
 
 /// Default allowlist getter (re-export for convenience).
