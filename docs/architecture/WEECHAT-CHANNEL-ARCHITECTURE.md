@@ -4,11 +4,13 @@ How LunarWing connects to IRC through WeeChat: the components, the end-to-end me
 flow, the ingestion/latency model, the configuration-precedence rules (and the trap they
 create), and the known issues with their fix status.
 
-**Source revalidated 2026-11-01 for v2.1.8.0.** The host minimum remains
+**Source revalidated 2026-11-10 for v2.2.0.0.** The host minimum remains
 30,000 ms (`MIN_POLL_INTERVAL_MS`); the guest requests 3 seconds. Long-poll
 delivery is immediate only while a wait is active. `default_dm_policy` is
 `pairing`, the default chunk length is 420, and `tags_allow_ingest` remains the
-shared filter for both ingestion modes.
+shared filter for both ingestion modes. Since v2.2.0.0 (WI#577), a non-empty
+managed `RELAY_PASSWORD` also wins over an older per-owner store secret in both
+channel setup and per-callback host credential injection.
 
 `ic/channels-src/weechat` is a tracked symlink to
 `lunarwing_weechat_wss/weechat_relay`, not a second source copy. The registry
@@ -309,6 +311,12 @@ For each capability `required_field`, the effective value is resolved **highest-
 Resolved overrides are merged on top of the caps `config` block and handed to `on_start`,
 which persists them to channel workspace state (`state/relay_url`, `state/dm_policy`, …).
 
+The relay password is a deliberate exception to the ordinary field table. A non-empty managed
+`RELAY_PASSWORD` is inserted after ordinary setup resolution and overrides a stale per-owner
+`weechat_relay_password` store entry. The same resolver runs at the host HTTP boundary before each
+callback, so adapter authentication uses the rotated managed value as well; the store is only the
+fallback when the managed variable is unset or empty. XMPP credential precedence is unchanged.
+
 The shipped caps default for `dm_policy` is `pairing`: an unpaired sender gets pairing
 instructions and does not execute under owner scope. Operators who want open DMs must set
 `"dm_policy":"open"` explicitly in the adapter config (`weechat_local_config.json`),
@@ -327,15 +335,18 @@ Ports (`relay_url`/`ws_adapter_url`) are **not** refreshed this way — they are
 So the live precedence is:
 
 - **Ports:** `setup_fields` > `setting_path` > `env` > caps defaults (start-time only).
+- **Relay password:** non-empty managed `RELAY_PASSWORD` > per-owner secrets store, at both setup
+  and host HTTP credential injection.
 - **Policy (`dm_policy`/`group_policy`/`allow_from`/`networks`):** adapter `/api/config` (if it
   provides the key) > start-time value (above).
 
 ### ⚠ The shadowing trap
 
 A leftover `extensions.weechat.setup_fields` row **shadows the caps config and the env for
-every field it contains**. The classic symptom: *"I edited the installed `capabilities.json`
+ordinary fields it contains**. The classic symptom: *"I edited the installed `capabilities.json`
 (or the env) and nothing changed."* This caused hours of confusion on `sunburst` — stale
-`dm_policy` and `networks` values in that row overrode every edit.
+`dm_policy` and `networks` values in that row overrode every edit. The managed relay-password
+exception above does not make other deployment fields immune to this trap.
 
 Use mt-admin's tenant-local database entry point; no connection URL needs to be
 copied from the secret-bearing env file. First inspect the owner scope (the
@@ -368,7 +379,7 @@ Then restart the daemon so `on_start` re-resolves.
 | **`poll_interval_ms` ignored** | Configuring the interval did nothing | Caps `config` key was `poll_interval_ms` but the struct field is `poll_interval_seconds` — different name ⇒ value dropped, struct default (3) used. | **Fixed** — caps key renamed to `poll_interval_seconds`. |
 | **First DM in a new buffer swallowed** | First message after a query buffer is created never reaches the agent; the *second* does | A DM/query buffer is created *by* the first message. The **adapter** resolves a line's buffer by `buffer_id` against a cached `buffer_list` that doesn't include the new buffer yet, so it **dropped the first line entirely** — never recorded to `line_buffer` *or* the event log. Nothing downstream (neither the long-poll cursor nor the poll path) can deliver a line the adapter never recorded. (The poll path additionally seed-skipped a new buffer's first batch.) | **Fixed for the normal new-buffer race** — the adapter now refreshes its buffer list **synchronously and retries** before recording, so a resolved new buffer's first line is captured (`record_event`); if the buffer is still unknown after the retry, it is warned and dropped. The long-poll global cursor delivers captured lines immediately (§3). `/api/wait` also replays the post-restart backlog so a DM right after an adapter restart isn't skipped. The poll fallback emits the first batch for new **DM/query** buffers (`is_dm_buffer`). |
 | **Mirror loop (long-poll mode)** | Agent answers its own messages endlessly; `event_cursor` climbs steadily with no human input | The `irc_privmsg`/`self_msg`/`no_log` tag filter lived **only** in `poll_buffer`. `do_longpoll` feeds events straight to `handle_inbound_line`, which had no tag check — so in long-poll mode the agent's own `self_msg` replies were ingested and re-answered, each reply becoming the next event. Shipped in the original long-poll commit; not the adapter work. | **Fixed** — tag filter moved into `handle_inbound_line` (`tags_allow_ingest`), the single choke point **both** ingest paths share; `poll_buffer` keeps its pre-filter. Regression test `test_tags_allow_ingest`. |
-| **Password is the *second* blocker** | After ports are fixed, the adapter returns 401 | The adapter authenticates incoming WASM requests against the per-tenant `RELAY_PASSWORD` (`check_auth`); the WASM must send it. | Handled by the port fix (relay_password injection) — see archived `WEECHAT-MULTITENANT-PORT-BUG.md` in `docs/internal/history/archive/ops/`. |
+| **Password is the *second* blocker** | After ports are fixed, or after rotation, the adapter returns 401 | The adapter authenticates incoming WASM requests against the per-tenant `RELAY_PASSWORD` (`check_auth`); a stale per-owner secret formerly overrode the rotated managed value. | **Fixed** — host injection exists, and WI#577 makes the managed value win in setup and per-callback authentication. See [WeeChat operations](../ops/WEECHAT-SERVICES.md) for the coordinated rotation/restart contract. |
 | **Stale `setup_fields` shadowing** | Caps/env edits "don't take" | Highest-precedence DB layer (§4). | Documented (§4); see §6 for the proposed precedence redesign. |
 
 ### How to actually see what's happening
@@ -417,10 +428,12 @@ Then restart the daemon so `on_start` re-resolves.
 - **P2 — Batched "all new lines" endpoint for the fallback path.** `/api/wait` already returns all
   new lines across buffers in one call, so the long-poll path no longer fans out per buffer; only
   the polling fallback still issues N sequential `/lines` fetches. Low priority now.
-- **P2 — Config-precedence redesign:** make `env`-declared deployment fields win over a stale
-  `setup_fields` row (or have `mt-admin patch-env`/upgrade clear stale weechat `setup_fields`),
-  and extend `ic/scripts/lunarwing-weechat-preflight.sh` to surface the *effective* value
-  (DB `setup_fields` + workspace state), not just the env file.
+- **P2 — Config-precedence redesign for ordinary fields:** consider making other `env`-declared
+  deployment fields win over a stale `setup_fields` row (or have `mt-admin patch-env`/upgrade
+  clear stale WeeChat `setup_fields`), and extend `ic/scripts/lunarwing-weechat-preflight.sh` to
+  surface the *effective* value (DB `setup_fields` + workspace state), not just the env file.
+  WI#577 deliberately solved only the safety-critical managed relay-password case; do not broaden
+  that exception without reviewing every field's ownership.
 
 ---
 
