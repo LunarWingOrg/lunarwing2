@@ -151,10 +151,10 @@ async fn assert_firewall_listing(name: &str, allow_uplink_dns: bool) {
     let listing = String::from_utf8_lossy(&output.stdout);
     for expected in [
         "chain input {",
-        "type filter hook input priority filter; policy drop;",
+        "type filter hook input priority",
         "ct state established,related accept",
         "chain output {",
-        "type filter hook output priority filter; policy drop;",
+        "type filter hook output priority",
         "oifname \"wg0\" accept",
         "ip daddr 169.254.0.0/16 drop",
         "0x00004c57 accept",
@@ -164,6 +164,7 @@ async fn assert_firewall_listing(name: &str, allow_uplink_dns: bool) {
             "missing {expected:?} in:\n{listing}"
         );
     }
+    assert_eq!(listing.matches("policy drop;").count(), 2, "{listing}");
     assert_eq!(
         listing.contains("dport 53"),
         allow_uplink_dns,
