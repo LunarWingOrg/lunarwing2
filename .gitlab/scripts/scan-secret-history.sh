@@ -12,6 +12,13 @@ if [[ ! -f $ignore_path ]]; then
     printf 'secret-history: commit-bound ignore file is missing\n' >&2
     exit 2
 fi
+while IFS= read -r entry; do
+    [[ -z $entry || $entry == \#* ]] && continue
+    if [[ ! $entry =~ ^[0-9a-f]{40}:.+:[^:]+:[0-9]+$ ]]; then
+        printf 'secret-history: ignore entry is not commit-bound\n' >&2
+        exit 2
+    fi
+done <"$ignore_path"
 
 scan_root=$(mktemp -d)
 trap 'rm -rf "$scan_root"' EXIT
