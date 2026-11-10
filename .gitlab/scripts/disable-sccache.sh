@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Source this only after bootstrap reports a total download outage (exit 75).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    echo "ERROR: disable-sccache.sh must be sourced by the Rust job shell" >&2
+    exit 1
+fi
+
+echo "WARNING: sccache is unavailable; continuing without compiler cache (RUSTC_WRAPPER and SCCACHE_* unset)" >&2
+unset RUSTC_WRAPPER
+while IFS= read -r variable; do
+    unset "$variable"
+done < <(compgen -e SCCACHE_)
+return 0
