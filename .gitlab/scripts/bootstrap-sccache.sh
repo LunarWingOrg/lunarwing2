@@ -41,10 +41,16 @@ mkdir -p "$bin_dir"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
+# Bound every attempt: a source that drops packets otherwise holds each
+# attempt for curl's default connect timeout (minutes), and --retry repeats
+# a timeout, so one dead source stalled the job for about a quarter hour
+# before the fallback started.
 download() {
     local source_url="$1"
     rm -f -- "$tmp/sccache.tar.gz"
-    curl -fsSL --retry 5 --retry-delay 5 --retry-connrefused -o "$tmp/sccache.tar.gz" "$source_url"
+    curl -fsSL --connect-timeout 15 --max-time 300 \
+        --retry 5 --retry-delay 5 --retry-connrefused \
+        -o "$tmp/sccache.tar.gz" "$source_url"
 }
 
 download_source="$registry_url"

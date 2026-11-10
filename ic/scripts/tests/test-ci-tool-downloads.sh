@@ -59,7 +59,15 @@ set -euo pipefail
 url="${!#}"
 printf '%s\n' "$url" >>"$CALL_LOG"
 retry_connrefused=0
+connect_timeout=""
+max_time=""
+previous=""
 for arg in "$@"; do
+    case "$previous" in
+        --connect-timeout) connect_timeout="$arg" ;;
+        --max-time) max_time="$arg" ;;
+    esac
+    previous="$arg"
     if [[ "$arg" == "--retry-all-errors" || "$arg" == JOB-TOKEN:* ]]; then
         printf 'unsafe curl argument\n' >>"$POLICY_LOG"
         exit 98
@@ -74,6 +82,16 @@ for arg in "$@"; do
 done
 if [[ "$retry_connrefused" -ne 1 ]]; then
     printf 'missing transient-only retry policy\n' >>"$POLICY_LOG"
+    exit 98
+fi
+# A black-holed source must fail over within minutes, not per-attempt
+# kernel timeouts: both bounds are required, as small positive integers.
+if [[ ! "$connect_timeout" =~ ^[1-9][0-9]?$ || "$connect_timeout" -gt 30 ]]; then
+    printf 'missing or unbounded --connect-timeout\n' >>"$POLICY_LOG"
+    exit 98
+fi
+if [[ ! "$max_time" =~ ^[1-9][0-9]{0,2}$ || "$max_time" -gt 600 ]]; then
+    printf 'missing or unbounded --max-time\n' >>"$POLICY_LOG"
     exit 98
 fi
 if [[ "${FAIL_REGISTRY:-0}" == 1 && "$url" == *registry.invalid* ]]; then exit 22; fi
@@ -230,6 +248,6 @@ run_script "$fixture/install-shellcheck.sh"
 check 'ShellCheck checksum failure remains fatal' status_is 1
 check 'ShellCheck checksum failure installs nothing' test ! -e "$repo/.ci-bin/shellcheck"
 
-check 'downloads never forward tokens or retry permanent HTTP errors' test ! -s "$policy"
+check 'downloads never forward tokens, retry permanent HTTP errors, or run without time bounds' test ! -s "$policy"
 printf 'CI tool download tests: %s failure(s)\n' "$failures"
 [[ "$failures" -eq 0 ]]

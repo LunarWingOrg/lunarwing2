@@ -40,7 +40,10 @@ done
 download() {
     local source_url="$1"
     rm -f -- "$temp_dir/$archive"
+    # Bound every attempt so a source that drops packets fails over quickly
+    # (see bootstrap-sccache.sh).
     curl --fail --location --silent --show-error \
+        --connect-timeout 15 --max-time 300 \
         --retry 5 --retry-delay 5 --retry-connrefused \
         --output "$temp_dir/$archive" "$source_url"
 }

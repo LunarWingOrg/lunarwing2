@@ -880,7 +880,9 @@ URL from `CI_API_V4_URL` and `CI_PROJECT_ID`. Registry and GitHub downloads are
 anonymous, so redirects never forward a CI job token. Each source retries only
 transient failures and refused connections five times with a five-second delay;
 permanent HTTP errors such as a missing registry archive's 404 fall through
-immediately. Every downloaded archive must match its checked-in SHA256. A tool
+immediately. Every attempt is bounded by a 15-second connect timeout and a
+300-second total, so a source that drops packets costs about two minutes before
+the next source is tried, not a quarter of an hour. Every downloaded archive must match its checked-in SHA256. A tool
 bump must publish the new archive and update both pins in the same change.
 
 If every sccache source is unreachable, the installer exits 75 (`EX_TEMPFAIL`)
@@ -891,7 +893,7 @@ failures remain fatal. A total ShellCheck download outage also remains fatal
 and names the registry URL: ShellCheck is a correctness gate and must never
 silently fall back to the older distro package.
 `ic/scripts/tests/test-ci-tool-downloads.sh` covers source order, token and
-retry policy, checksum rejection, and the exact Rust template's outage and
+retry and time-bound policy, checksum rejection, and the exact Rust template's outage and
 integrity-failure paths with stubbed downloads.
 
 **Compiler-cache trust limit (IU-3):** the binary pin does not authenticate
