@@ -165,9 +165,9 @@ async fn assert_firewall_listing(name: &str, allow_uplink_dns: bool) {
         );
     }
     assert_eq!(listing.matches("policy drop;").count(), 2, "{listing}");
+    let has_uplink_dns = listing.contains("dport 53") || listing.contains("dport domain");
     assert_eq!(
-        listing.contains("dport 53"),
-        allow_uplink_dns,
+        has_uplink_dns, allow_uplink_dns,
         "unexpected DNS policy in:\n{listing}"
     );
 }
