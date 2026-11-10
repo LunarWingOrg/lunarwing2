@@ -78,4 +78,9 @@ shallow="$temporary/shallow"
 git clone -q --depth 1 "file://$base" "$shallow"
 run_scan "$shallow" 2 "shallow checkout" "$temporary/shallow.log"
 
-printf 'secret-history: 4 regression tests passed\n'
+path_only="$temporary/path-only"
+git clone -q "$base" "$path_only"
+printf 'fixture.txt:stripe-access-token:1\n' >"$path_only/history.ignore"
+run_scan "$path_only" 2 "path-only ignore" "$temporary/path-only.log"
+
+printf 'secret-history: 5 regression tests passed\n'
