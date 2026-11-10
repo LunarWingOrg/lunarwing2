@@ -4,12 +4,11 @@ Packages needed to run a live LunarWing multi-tenant deployment on **Ubuntu 22.0
 24.04 LTS (or newer) + systemd** via `ic/scripts/lunarwing-mt-admin.sh`, including the
 infra health-check + self-heal pipeline.
 
-**Revalidated 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-14 (v2.1.6.0).** Package set re-checked against the
-current mt-admin prerequisite probes; no changes were needed (the v2.1.2.0
-sandbox rework added no new host packages — podman was already required, the
-v2.1.4.0 read-only diagnostics verbs `psql`/`daemon-pid` reuse existing
-tooling inside the tenant containers, and the v2.1.6.0 OpenRC proxy-unit
-migration and worker-credential work add no new host commands).
+**Revalidated 2026-11-10 (v2.2.0.0).** Package names and mt-admin prerequisite
+probes were re-checked. External-worker egress enforcement (WI#424) requires
+the host `nft` command, so `nftables` is now explicit below. Disk health reuses
+`df`, `stat`, and `timeout` from the already-expected core utilities; no other
+new host package is required.
 
 This is the Ubuntu equivalent of [`GENTOO_PACKAGE_LIST.md`](GENTOO_PACKAGE_LIST.md); the
 operational notes there (port registry, per-tenant rustup, doctor output, etc.) apply
@@ -50,11 +49,12 @@ Each tenant's PostgreSQL runs as a container, so one runtime is **required**. Po
 preferred:
 
 ```bash
-sudo apt install podman uidmap fuse-overlayfs slirp4netns
+sudo apt install podman uidmap fuse-overlayfs slirp4netns nftables
 ```
 
 `uidmap` provides `newuidmap`/`newgidmap` (rootless podman); `fuse-overlayfs` and
-`slirp4netns`/`passt` back rootless storage and networking.
+`slirp4netns`/`passt` back rootless storage and networking. `nftables` provides the host
+`nft` command required for per-tenant external-worker egress enforcement.
 
 > **22.04 (jammy) caveat:** jammy ships Podman 3.4, which is long EOL upstream. It works
 > for the tenant PostgreSQL container, but 24.04+ (Podman 4.9+) is strongly recommended;
@@ -194,7 +194,7 @@ with the shipped requirements files is the recommended route:
 sudo add-apt-repository universe   # for python3-questionary / python3-tenacity, etc.
 sudo apt install \
   jq git python3 curl \
-  podman uidmap fuse-overlayfs slirp4netns \
+  podman uidmap fuse-overlayfs slirp4netns nftables \
   cron \
   build-essential pkg-config libssl-dev clang libclang-dev \
   weechat tmux \
