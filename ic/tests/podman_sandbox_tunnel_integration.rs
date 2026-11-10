@@ -732,7 +732,26 @@ async fn netbird_status_detail(container: &str) -> Result<String, String> {
 
 fn status_has_connected_peer(status: &str, ip: IpAddr) -> bool {
     let ip = ip.to_string();
-    status.contains(&ip) && status.contains("Connected")
+    status.split("\n\n").any(|block| {
+        block.contains(&ip)
+            && block.lines().any(|line| {
+                let line = line.trim_start();
+                line.starts_with("Status:") && line.contains("Connected")
+            })
+    })
+}
+
+#[test]
+fn netbird_peer_status_requires_the_same_peer_block() {
+    let ip: IpAddr = "100.64.0.2".parse().unwrap();
+    assert!(status_has_connected_peer(
+        "Peers:\n  IP: 100.64.0.2\n  Status: Connected\n",
+        ip
+    ));
+    assert!(!status_has_connected_peer(
+        "Peers:\n  IP: 100.64.0.2\n\nManagement:\n  Status: Connected\n",
+        ip
+    ));
 }
 
 async fn assert_netbird_peers_connected(primary: &str, peer: &str) -> Result<(), String> {
