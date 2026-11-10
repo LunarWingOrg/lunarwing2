@@ -190,7 +190,7 @@ background-service installation:
   wizard prints the exact `sudo` command when needed)
 
 OpenRC installation derives the daemon's runtime user from `SUDO_USER`, then
-`USER`, and resolves that account's actual primary group. It refuses a root
+`USER`, and resolves that account's actual primary group. It refuses a uid-0
 runtime identity before writing service files. Run the installer through `sudo`
 from the intended non-root service account; a direct-root or provisioning
 environment that deliberately requires a root daemon must opt in explicitly
