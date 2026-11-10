@@ -493,7 +493,7 @@ async fn podman_tunnel_sidecar_netbird_live() {
         eprintln!("skipping: set both podman and NetBird e2e gates to 1");
         return;
     }
-    let settings = (|| {
+    let settings: Result<(String, String, String, String), String> = (|| {
         Ok((
             required_env("LUNARWING_E2E_NETBIRD_IMAGE")?,
             required_env("NB_MANAGEMENT_URL")?,
