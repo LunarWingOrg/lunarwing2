@@ -27,6 +27,7 @@ class RefreshPlan:
     accepted: set[str]
     unclassified: set[str]
     pending: set[str]
+    refused: set[str]
 
 
 def git(repo: pathlib.Path, *args: str) -> str:
@@ -120,6 +121,7 @@ def plan_refresh(
         accepted=approved,
         unclassified=unclassified,
         pending=blocked,
+        refused=blocked & accepted,
     )
 
 
@@ -185,8 +187,10 @@ def print_refresh(plan: RefreshPlan, output: pathlib.Path) -> None:
         print(f"accepted classified non-vendor fingerprint: {fingerprint}")
     for fingerprint in sorted(plan.unclassified):
         print(f"unclassified non-vendor fingerprint not pinned: {fingerprint}", file=sys.stderr)
-    for fingerprint in sorted(plan.pending):
-        print(f"pending fingerprint refused even if accepted: {fingerprint}", file=sys.stderr)
+    for fingerprint in sorted(plan.pending - plan.refused):
+        print(f"pending fingerprint left unpinned: {fingerprint}", file=sys.stderr)
+    for fingerprint in sorted(plan.refused):
+        print(f"pending fingerprint refused although accepted: {fingerprint}", file=sys.stderr)
 
 
 def main() -> int:
@@ -218,7 +222,9 @@ def main() -> int:
     plan = plan_refresh(existing, scan(repo, command), accepted, pending)
     write_baseline(output, plan.pinned)
     print_refresh(plan, output)
-    return 1 if plan.unclassified or plan.pending else 0
+    # A pending row that nobody tried to accept is the known, tracked state:
+    # reporting it must not hide whether anything new turned up.
+    return 1 if plan.unclassified or plan.refused else 0
 
 
 if __name__ == "__main__":

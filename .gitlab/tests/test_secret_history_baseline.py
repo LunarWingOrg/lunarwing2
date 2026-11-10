@@ -100,6 +100,7 @@ class BaselineTests(unittest.TestCase):
         pending = fingerprint("1", "pending-fixture.txt")
         plan = baseline.plan_refresh(set(), [pending], {pending}, {pending})
         self.assertEqual(plan.pending, {pending})
+        self.assertEqual(plan.refused, {pending})
         self.assertFalse(plan.accepted)
         with tempfile.TemporaryDirectory() as temporary:
             output = pathlib.Path(temporary) / "history.ignore"
@@ -110,6 +111,18 @@ class BaselineTests(unittest.TestCase):
         pending = fingerprint("1", "pending-fixture.txt")
         with self.assertRaisesRegex(ValueError, "already present"):
             baseline.plan_refresh({pending}, [], set(), {pending})
+
+    def test_committed_baseline_pins_no_pending_finding(self):
+        # Only the refresh helper refuses a pending row. A hand edit of the
+        # baseline bypasses it, so the committed files are checked here, on
+        # every merge request.
+        pinned = baseline.read_fingerprint_file(ROOT / ".gitlab/gitleaks-history-ignore")
+        pending = baseline.read_fingerprint_file(ROOT / ".gitlab/gitleaks-history-pending")
+        self.assertTrue(pinned)
+        self.assertFalse(
+            pinned & pending,
+            "a finding awaiting disposition is pinned in the history baseline",
+        )
 
     def test_acceptance_file_requires_commit_bound_fingerprints(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -172,7 +185,36 @@ class BaselineTests(unittest.TestCase):
             self.assertEqual(status, 1)
             self.assertEqual(pinned, existing | {vendor, unclassified})
             self.assertNotIn(pending, pinned)
-            self.assertIn(pending, stderr)
+            self.assertIn(f"refused although accepted: {pending}", stderr)
+
+    def test_cli_status_separates_known_pending_from_new_findings(self):
+        existing = {fingerprint("0", "old-fixture.txt")}
+        unclassified = fingerprint("1", "new-fixture.txt")
+        pending = fingerprint("2", "pending-fixture.txt")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            baseline.write_baseline(root / "history.ignore", sorted(existing))
+            (root / "pending.ignore").write_text(f"{pending}\n", encoding="utf-8")
+
+            # Only the known pending row is in history: nothing new, status 0.
+            status, pinned, _, stderr = self.run_main(root, [pending])
+            self.assertEqual(status, 0)
+            self.assertEqual(pinned, existing)
+            self.assertIn(f"left unpinned: {pending}", stderr)
+
+            # A new unclassified finding next to it must still be loud.
+            status, pinned, _, stderr = self.run_main(root, [pending, unclassified])
+            self.assertEqual(status, 1)
+            self.assertEqual(pinned, existing)
+            self.assertIn(unclassified, stderr)
+
+            # Asking to accept the pending row is refused, and says so.
+            accepted = root / "accepted.ignore"
+            accepted.write_text(f"{pending}\n", encoding="utf-8")
+            status, pinned, _, stderr = self.run_main(root, [pending], accepted)
+            self.assertEqual(status, 1)
+            self.assertEqual(pinned, existing)
+            self.assertIn(f"refused although accepted: {pending}", stderr)
 
 
 if __name__ == "__main__":

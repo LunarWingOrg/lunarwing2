@@ -31,7 +31,7 @@ assert_redacted() {
 
 run_scan() {
     local repo=$1 expected=$2 label=$3 log=$4 rc
-    if (cd "$repo" && bash "$scan_script" "$repo/history.ignore") >"$log" 2>&1; then
+    if (cd "$repo" && bash "$scan_script" "$repo/history.ignore" "$repo/history.pending") >"$log" 2>&1; then
         rc=0
     else
         rc=$?
@@ -53,7 +53,8 @@ git -C "$base" add .
 commit_fixture "$base" "baselined synthetic fixture"
 fingerprint="$(git -C "$base" rev-parse HEAD):fixture.txt:stripe-access-token:1"
 printf '%s\n' "$fingerprint" >"$base/history.ignore"
-git -C "$base" add history.ignore
+printf '# no pending findings\n' >"$base/history.pending"
+git -C "$base" add history.ignore history.pending
 commit_fixture "$base" "pin synthetic fixture fingerprint"
 run_scan "$base" 0 "unchanged history" "$temporary/unchanged.log"
 
@@ -83,4 +84,18 @@ git clone -q "$base" "$path_only"
 printf 'fixture.txt:stripe-access-token:1\n' >"$path_only/history.ignore"
 run_scan "$path_only" 2 "path-only ignore" "$temporary/path-only.log"
 
-printf 'secret-history: 5 regression tests passed\n'
+pinned_pending="$temporary/pinned-pending"
+git clone -q "$base" "$pinned_pending"
+printf '%s\n' "$fingerprint" >"$pinned_pending/history.pending"
+run_scan "$pinned_pending" 2 "pending finding pinned in the baseline" "$temporary/pinned-pending.log"
+if ! grep -Fq 'pending finding is pinned' "$temporary/pinned-pending.log"; then
+    printf 'secret-history test: pinned pending finding was refused for another reason\n' >&2
+    exit 1
+fi
+
+missing_pending="$temporary/missing-pending"
+git clone -q "$base" "$missing_pending"
+rm "$missing_pending/history.pending"
+run_scan "$missing_pending" 2 "missing pending-findings file" "$temporary/missing-pending.log"
+
+printf 'secret-history: 7 regression tests passed\n'

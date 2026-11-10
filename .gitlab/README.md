@@ -714,8 +714,9 @@ cannot suppress the same secret introduced by a new commit. The baseline stores
 no secret values or matched content. `test-secret-history.sh` runs first in the
 same pinned Gitleaks image and proves that unchanged history passes, a new
 synthetic finding fails, a baselined finding repeated at the same path and line
-in a new commit fails, a shallow checkout fails closed, and a path-only ignore
-is rejected before scanning. Test secrets are constructed at runtime and scanner
+in a new commit fails, a shallow checkout fails closed, a path-only ignore is
+rejected before scanning, and a baseline that pins a pending finding, or a
+missing pending-findings file, is refused before scanning. Test secrets are constructed at runtime and scanner
 output is checked for complete redaction. The blocking
 `secret-history-regression` job runs this harness on merge-request pipelines so
 scanner or isolation regressions cannot first appear on a release tag.
@@ -746,7 +747,17 @@ make the helper exit non-zero; safe vendor and explicitly accepted additions are
 still written. `.gitlab/gitleaks-history-pending` lists findings awaiting
 external disposition. The helper refuses those rows even when `--accept` names
 them; remove a pending row only after its evidence is recorded in WI#575 and its
-exact baseline pin is deliberate. Worker-image
+exact baseline pin is deliberate.
+
+The helper's exit status is 1 when a new unclassified finding was left unpinned,
+or when `--accept` named a pending row and was refused. A pending row that is
+merely still in history is reported on stderr and does not change the status, so
+status 0 means "nothing new". The pending list is enforced in two more places,
+because a hand edit of the baseline bypasses the helper:
+`scan-secret-history.sh` exits 2 before scanning when the baseline pins a
+pending row or the pending file is missing, and
+`test_secret_history_baseline.py` asserts on every merge request that the two
+committed files share no fingerprint. Worker-image
 CRITICAL findings that Debian has not fixed for the pinned toolchain
 dependencies are listed by exact CVE with a rationale comment and an expiry
 date in Trivy's own syntax (`CVE-… exp:YYYY-MM-DD`, one entry per line) in
