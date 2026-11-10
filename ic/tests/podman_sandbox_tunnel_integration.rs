@@ -337,7 +337,7 @@ async fn assert_joined_run(
     let resolv_conf = sidecar
         .tunnel_resolv_conf()
         .map_err(|error| error.to_string())?;
-    let command = format!("{JOINED_PROBE}\ncat /proc/self/mountinfo\n{old_resolver_probe}");
+    let command = format!("{JOINED_PROBE}\ncat /proc/self/mountinfo\n{old_resolver_probe}\ntrue");
     let output = runner
         .execute(ExecParams {
             command: &command,
