@@ -653,9 +653,8 @@ fn firewall_list_args(container_name: &str) -> Vec<String> {
 }
 
 /// Canonical form of one listed nft line: whitespace collapsed, the trailing
-/// `# handle N` and any `comment "…"` removed, marks printed as `0x<hex>` (nft
-/// prints `0x00004c57` for a mark given as `0x4c57`) and the named priority
-/// `filter` mapped back to `0`.
+/// `# handle N` and any `comment "…"` removed, `mark` normalized to `meta mark`,
+/// marks printed as `0x<hex>`, and named priority `filter` mapped back to `0`.
 fn canonical_nft_line(line: &str) -> String {
     let no_handle = line.split(" # handle ").next().unwrap_or(line);
     let no_comment = no_handle.split(" comment \"").next().unwrap_or(no_handle);
@@ -667,7 +666,9 @@ fn canonical_nft_line(line: &str) -> String {
         } else {
             ";"
         };
-        if let Some(hex) = trimmed.strip_prefix("0x")
+        if token == "mark" && out.is_empty() {
+            out.extend(["meta".to_string(), "mark".to_string()]);
+        } else if let Some(hex) = trimmed.strip_prefix("0x")
             && let Ok(value) = u32::from_str_radix(hex, 16)
         {
             out.push(format!("0x{value:x}{suffix}"));
@@ -1965,6 +1966,10 @@ mod tests {
     fn canonical_line_normalises_marks_priority_handles_and_comments() {
         assert_eq!(
             canonical_nft_line("\t\tmeta mark 0x00004c57 accept # handle 12"),
+            "meta mark 0x4c57 accept"
+        );
+        assert_eq!(
+            canonical_nft_line("mark 0x00004c57 accept"),
             "meta mark 0x4c57 accept"
         );
         assert_eq!(
