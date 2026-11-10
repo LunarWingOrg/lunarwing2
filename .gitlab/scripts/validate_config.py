@@ -400,8 +400,24 @@ def validate_release_gates(merged: dict, defaults: dict, errors: list[str]) -> N
         {"if": FULL_VALIDATION_RULES[-1]},
         {"when": "never"},
     ]
-    if merged.get("secret-history", {}).get("rules") != expected_history_rules:
+    history_job = merged.get("secret-history", {})
+    if history_job.get("rules") != expected_history_rules:
         errors.append("secret-history must run only for schedules and protected release tags")
+    expected_history_shape = {
+        "extends": ".gitleaks-job",
+        "stage": "security",
+        "needs": [],
+        "variables": {"GIT_DEPTH": "0"},
+        "rules": expected_history_rules,
+        "script": [
+            "bash .gitlab/tests/test-secret-history.sh",
+            "bash .gitlab/scripts/scan-secret-history.sh",
+        ],
+    }
+    if history_job != expected_history_shape:
+        errors.append("secret-history job shape differs from its blocking full-history contract")
+    if resolve_extends(history_job, merged).get("allow_failure"):
+        errors.append("secret-history must not allow failure")
 
 
 def validate_opencode2_exposure_verify(merged: dict, errors: list[str]) -> None:
@@ -855,11 +871,10 @@ def validate_advisory_gates_not_optional(merged: dict, errors: list[str]) -> Non
     rules may carry only `if` (plus the final `when: never`), so the
     equality check cannot inherit a hollowed-out template. The resolved
     tags must be exactly ['$CI_RUST_RUNNER_TAG'] (IF-2): a retagged gate
-    runs on an unpinned runner. secret-history is deliberately
-    allow_failure while historical findings are triaged and is NOT in this
-    set — making another gate optional must stay as visible as that marked
-    exception. Any non-false allow_failure value (including the exit_codes
-    hash form) counts.
+    runs on an unpinned runner. secret-history has a separate blocking
+    contract in validate_release_gates and is not an advisory gate. Any
+    non-false allow_failure value (including the exit_codes hash form)
+    counts.
 
     MR !1665 review IF-2: the EXPECTED_RUNNER_TAGS pin in
     validate_lane_environment_routes covers only the merged top-level
