@@ -200,6 +200,9 @@ async fn assert_joined_run(
         timeout: Duration::from_secs(120),
         ..ResourceLimits::default()
     };
+    let resolv_conf = sidecar
+        .tunnel_resolv_conf()
+        .map_err(|error| error.to_string())?;
     let output = runner
         .execute(ExecParams {
             command: JOINED_PROBE,
@@ -212,6 +215,7 @@ async fn assert_joined_run(
             tunnel: Some(TunnelRunConfig {
                 container_name: sidecar.container_name(),
                 dns,
+                resolv_conf: resolv_conf.as_deref(),
             }),
             protected_paths: &[],
             tenant_logs: false,
