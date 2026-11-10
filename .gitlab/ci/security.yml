@@ -94,17 +94,18 @@ secret-detection:
   script:
     - bash .gitlab/scripts/scan-secrets.sh
 
-# Owner: security maintainers. Historical triage: WI#575.
-# Remove allow_failure when that tracker is complete.
+# Owner: security maintainers. Historical triage: WI#575 / WI#590.
+# Blocking full-history scan; only exact commit-bound fingerprints are ignored.
 secret-history:
-  extends:
-    - .gitleaks-job
-    - .observational-job
+  extends: .gitleaks-job
   stage: security
   needs: []
+  variables:
+    GIT_DEPTH: "0"
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$/ && $CI_COMMIT_REF_PROTECTED == "true"'
     - when: never
   script:
-    - gitleaks git --redact=100 --no-banner --no-color --log-opts="--all" .
+    - bash .gitlab/tests/test-secret-history.sh
+    - bash .gitlab/scripts/scan-secret-history.sh
