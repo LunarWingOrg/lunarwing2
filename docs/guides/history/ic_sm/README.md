@@ -4,7 +4,7 @@
 > referenced here write directly to a database and predate current secret-store
 > invariants. Do not use them on a tenant, share its master key, or assume a
 > daemon restart is unnecessary. Use authenticated extension setup and the
-> built-in secrets tools; see the [repository security rules](../../../AGENTS.md).
+> built-in secrets tools; see the [repository security rules](../../../../AGENTS.md).
 > The [historical scripts](../../../../ic_sm/) are source artifacts, not an
 > operator interface.
 
