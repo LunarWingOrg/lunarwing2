@@ -351,7 +351,8 @@ impl SandboxManager {
                 .as_ref()
                 .map(|config| config.dns.clone())
                 .unwrap_or_default();
-            Some((sidecar.container_name().to_string(), dns))
+            let resolv_conf = sidecar.tunnel_resolv_conf()?;
+            Some((sidecar.container_name().to_string(), dns, resolv_conf))
         } else {
             None
         };
@@ -387,10 +388,13 @@ impl SandboxManager {
                 env: &env,
                 network: self.config.network,
                 proxy_port,
-                tunnel: tunnel_run.as_ref().map(|(name, dns)| TunnelRunConfig {
-                    container_name: name,
-                    dns: dns.as_slice(),
-                }),
+                tunnel: tunnel_run
+                    .as_ref()
+                    .map(|(name, dns, resolv_conf)| TunnelRunConfig {
+                        container_name: name,
+                        dns: dns.as_slice(),
+                        resolv_conf: resolv_conf.as_deref(),
+                    }),
                 protected_paths: &self.config.protected_paths,
                 tenant_logs: self.config.tenant_logs.enabled(),
             })
