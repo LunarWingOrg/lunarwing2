@@ -825,6 +825,58 @@ impl TunnelSidecar {
         &self.container_name
     }
 
+    fn resolv_conf_path(&self) -> Result<Option<PathBuf>> {
+        if self.cfg.dns.is_empty() {
+            return Ok(None);
+        }
+        let dir = secret_dir().map_err(|reason| self.unavailable(&reason))?;
+        Ok(Some(
+            dir.join(format!("{}.resolv.conf", self.container_name)),
+        ))
+    }
+
+    /// Materialize the per-instance resolver file joined containers mount
+    /// read-only because runtimes reject `--dns` with `--network container`.
+    pub fn tunnel_resolv_conf(&self) -> Result<Option<PathBuf>> {
+        let Some(path) = self.resolv_conf_path()? else {
+            return Ok(None);
+        };
+        let contents = self
+            .cfg
+            .dns
+            .iter()
+            .map(|resolver| format!("nameserver {resolver}\n"))
+            .collect::<String>();
+        let temp_path = path.with_file_name(format!(
+            ".{}.{}",
+            path.file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_default(),
+            uuid::Uuid::new_v4()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temp_path)
+            .map_err(|_| self.unavailable("could not create the tunnel resolver file"))?;
+        if file
+            .write_all(contents.as_bytes())
+            .and_then(|()| file.sync_all())
+            .is_err()
+        {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(self.unavailable("could not write the tunnel resolver file"));
+        }
+        std::fs::rename(&temp_path, &path)
+            .map_err(|_| self.unavailable("could not install the tunnel resolver file"))?;
+        Ok(Some(path))
+    }
+
     fn netbird_state_volume(&self, hash: &str) -> String {
         self.cfg.netbird_state_volume(&self.instance_id, hash)
     }
@@ -840,6 +892,7 @@ impl TunnelSidecar {
         self.cfg
             .validate()
             .map_err(|reason| SandboxError::Config { reason })?;
+        let _ = self.tunnel_resolv_conf()?;
         let hash = self.current_hash().await?;
         if self.reuse_if_matching(&hash).await {
             match self.wait_healthy().await {
@@ -857,6 +910,7 @@ impl TunnelSidecar {
 
     /// Recheck the transport and both firewall chains before every run.
     pub async fn ensure_healthy(&self) -> Result<()> {
+        let _ = self.tunnel_resolv_conf()?;
         let hash = self.current_hash().await?;
         if !self.reuse_if_matching(&hash).await {
             return Err(self.unavailable("sidecar is not running with the current configuration"));
@@ -1259,6 +1313,9 @@ impl TunnelSidecar {
                 container = %self.container_name,
                 "Sandbox tunnel sidecar stopped"
             );
+        }
+        if let Ok(Some(path)) = self.resolv_conf_path() {
+            let _ = std::fs::remove_file(path);
         }
     }
 
