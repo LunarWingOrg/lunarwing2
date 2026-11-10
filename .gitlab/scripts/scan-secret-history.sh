@@ -13,7 +13,14 @@ if [[ ! -f $ignore_path ]]; then
     exit 2
 fi
 
-cd "$repo_root"
+scan_root=$(mktemp -d)
+trap 'rm -rf "$scan_root"' EXIT
+git_dir=$(git -C "$repo_root" rev-parse --absolute-git-dir)
+printf 'gitdir: %s\n' "$git_dir" >"$scan_root/.git"
+
+# The current-tree .gitleaksignore deliberately uses path:rule:line pins. Keep
+# it out of this worktree so only commit-bound history fingerprints can suppress.
+cd "$scan_root"
 gitleaks git --redact=100 --no-banner --no-color \
     --gitleaks-ignore-path "$ignore_path" \
     --log-opts="--all" .
