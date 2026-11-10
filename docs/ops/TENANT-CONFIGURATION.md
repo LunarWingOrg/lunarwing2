@@ -506,10 +506,12 @@ an existing `none`, `proxy-enforced`, `tunnel`, or `proxy` value is preserved.
 ```bash
 SANDBOX_NETWORK=tunnel
 SANDBOX_TUNNEL_PROVIDER=netbird                      # netbird (default) | wireguard
-SANDBOX_TUNNEL_IMAGE=localhost/lunarwing-tunnel-netbird:latest   # must include nft + provider tools
+SANDBOX_TUNNEL_IMAGE=localhost/lunarwing-tunnel-netbird@sha256:<64-hex-digest>  # nft + provider tools
+SANDBOX_TUNNEL_DNS=100.100.0.53,fd00::53       # optional: tunnel resolvers; disables uplink DNS
 SANDBOX_TUNNEL_NETBIRD_MANAGEMENT_URL=https://netbird.example.com
 SANDBOX_TUNNEL_NETBIRD_SETUP_KEY=<dedicated-setup-key>           # secret
 SANDBOX_TUNNEL_WIREGUARD_CONFIG=/etc/lunarwing/tenants/<tenant>/wg0.conf  # wireguard: mode 0600
+SANDBOX_TUNNEL_WIREGUARD_CANARY=10.231.0.1     # optional ICMP overlay health probe
 SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS=90
 ```
 
@@ -517,7 +519,11 @@ SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS=90
 re-render preserve each operator-set value verbatim, so a tenant that opted in
 keeps starting. With the multi-tenant default `SANDBOX_AUTO_PULL=false` the
 sidecar image must already be in the tenant's container store (build it into
-the store the same way as the sandbox image). Operator guide:
+the store the same way as the sandbox image). Prefer digest-pinned references;
+LunarWing also hashes the resolved local image ID so tag rotation cannot reuse
+stale credentials or network state. Sidecar names and NetBird volumes are
+instance-scoped, so one daemon cannot remove another daemon's resources.
+Operator guide:
 [`../guides/SANDBOX_TUNNEL_NETWORKING.md`](../guides/SANDBOX_TUNNEL_NETWORKING.md).
 
 ## Runtime Behavior
