@@ -4,12 +4,11 @@ Packages needed to run a live LunarWing multi-tenant deployment on **Debian 12 (
 13 (trixie) + systemd** via `ic/scripts/lunarwing-mt-admin.sh`, including the infra
 health-check + self-heal pipeline.
 
-**Revalidated 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-14 (v2.1.6.0).** Package set re-checked against the
-current mt-admin prerequisite probes; no changes were needed (the v2.1.2.0
-sandbox rework added no new host packages — podman was already required, the
-v2.1.4.0 read-only diagnostics verbs `psql`/`daemon-pid` reuse existing
-tooling inside the tenant containers, and the v2.1.6.0 OpenRC proxy-unit
-migration and worker-credential work add no new host commands).
+**Revalidated 2026-11-10 (v2.2.0.0).** Package names and mt-admin prerequisite
+probes were re-checked. External-worker egress enforcement (WI#424) requires
+the host `nft` command, so `nftables` is now explicit below. Disk health reuses
+`df`, `stat`, and `timeout` from the already-expected core utilities; no other
+new host package is required.
 
 This is the Debian equivalent of [`GENTOO_PACKAGE_LIST.md`](GENTOO_PACKAGE_LIST.md); the
 operational notes there (port registry, per-tenant rustup, doctor output, etc.) apply
@@ -47,12 +46,13 @@ Each tenant's PostgreSQL runs as a container, so one runtime is **required**. Po
 preferred:
 
 ```bash
-sudo apt install podman uidmap fuse-overlayfs slirp4netns
+sudo apt install podman uidmap fuse-overlayfs slirp4netns nftables
 ```
 
 `uidmap` provides `newuidmap`/`newgidmap` (rootless podman); `fuse-overlayfs` and
 `slirp4netns`/`passt` back rootless storage and networking. `apt install podman` pulls most
-of these automatically on trixie, but `uidmap` is worth installing explicitly.
+of these automatically on trixie, but `uidmap` is worth installing explicitly. `nftables`
+provides the host `nft` command required for per-tenant external-worker egress enforcement.
 
 `lunarwing-mt-admin.sh` uses the fully-qualified `docker.io/pgvector/pgvector:pg16` image, so
 no `unqualified-search-registries` config is strictly required. If you override to a short
@@ -187,7 +187,7 @@ with the shipped requirements files is the recommended route:
 ```bash
 sudo apt install \
   jq git python3 curl \
-  podman uidmap fuse-overlayfs slirp4netns \
+  podman uidmap fuse-overlayfs slirp4netns nftables \
   cron \
   build-essential pkg-config libssl-dev clang libclang-dev \
   weechat tmux \
