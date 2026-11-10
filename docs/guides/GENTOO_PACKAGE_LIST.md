@@ -3,14 +3,11 @@
 Packages needed to run a live LunarWing multi-tenant deployment on **Gentoo + OpenRC** via
 `ic/scripts/lunarwing-mt-admin.sh`, including the infra health-check + self-heal pipeline.
 
-**Revalidated 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-14 (v2.1.6.0).** Package set re-checked against the
-current mt-admin prerequisite probes (`require_cmd` set: cargo, chcon, curl,
-flock, git, jq, od, passwd, python3, setpriv, sha256sum, tar, taskset,
-useradd — plus podman/docker); no changes were needed (the v2.1.2.0
-sandbox rework added no new host packages — podman was already required, and
-the v2.1.4.0 read-only diagnostics verbs `psql`/`daemon-pid` and the
-v2.1.6.0 OpenRC proxy-unit migration and worker-credential work reuse
-existing tooling; `flock` was already listed via `sys-apps/util-linux`).
+**Revalidated 2026-11-10 (v2.2.0.0).** The current mt-admin `require_cmd` set
+was re-checked: cargo, chcon, curl, flock, git, jq, nft, od, passwd, python3,
+setpriv, sha256sum, tar, taskset, and useradd, plus podman/docker. WI#424
+worker egress enforcement needs `nft` from `net-firewall/nftables`, now listed
+explicitly below. Disk health reuses existing core utilities.
 
 This list reflects what an actual Gentoo/OpenRC/Podman MT bring-up required. Atoms are Gentoo
 package names; adjust for your profile (e.g. `clang` moved to `llvm-core/` on newer profiles).
@@ -76,8 +73,10 @@ Each tenant's PostgreSQL runs as a container, so one runtime is **required**. Th
 ```bash
 # Podman needs the nftables USE flag on iptables (pulled in by containers-common):
 echo 'net-firewall/iptables nftables' | sudo tee /etc/portage/package.use/lunarwing-mt
-sudo emerge app-containers/podman      # pulls containers-common, netavark, aardvark-dns,
-                                       # crun, conmon, fuse-overlayfs, passt, ...
+sudo emerge app-containers/podman net-firewall/nftables
+# podman pulls containers-common, netavark, aardvark-dns, crun, conmon,
+# fuse-overlayfs and passt; net-firewall/nftables supplies the separate `nft`
+# command required by mt-admin's external-worker egress enforcement.
 ```
 
 Then point Podman's unqualified image search at Docker Hub so the hardcoded
@@ -192,7 +191,7 @@ echo 'net-firewall/iptables nftables' | sudo tee /etc/portage/package.use/lunarw
 echo 'sys-apps/util-linux caps' | sudo tee -a /etc/portage/package.use/lunarwing-mt
 sudo emerge \
   app-misc/jq dev-vcs/git net-misc/curl sys-apps/util-linux \
-  app-containers/podman \
+  app-containers/podman net-firewall/nftables \
   sys-process/fcron \
   sys-devel/clang \
   net-irc/weechat app-misc/tmux \
