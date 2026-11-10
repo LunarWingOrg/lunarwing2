@@ -158,13 +158,24 @@ async fn assert_firewall_listing(name: &str, allow_uplink_dns: bool) {
         "type filter hook output priority",
         "oifname \"wg0\" accept",
         "ip daddr 169.254.0.0/16 drop",
-        "0x00004c57 accept",
     ] {
         assert!(
             listing.contains(expected),
             "missing {expected:?} in:\n{listing}"
         );
     }
+    assert!(
+        listing.lines().map(str::trim).any(|line| {
+            [
+                "meta mark 0x00004c57 accept",
+                "mark 0x00004c57 accept",
+                "meta mark 0x4c57 accept",
+                "mark 0x4c57 accept",
+            ]
+            .contains(&line)
+        }),
+        "missing exact WireGuard mark accept in:\n{listing}"
+    );
     assert_eq!(listing.matches("policy drop;").count(), 2, "{listing}");
     let has_uplink_dns = listing.contains("dport 53") || listing.contains("dport domain");
     assert_eq!(
@@ -188,22 +199,73 @@ async fn tamper_chain(name: &str, chain: &str, rule: &[&str]) -> Result<(), Stri
     podman_success(&args).await
 }
 
+async fn sidecar_resolv_conf(sidecar: &TunnelSidecar) -> Result<String, String> {
+    let output =
+        podman_output(&["exec", sidecar.container_name(), "cat", "/etc/resolv.conf"]).await?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn old_resolver_probe(resolv_conf: &str) -> String {
+    resolv_conf
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            if parts.next() != Some("nameserver") {
+                return None;
+            }
+            let resolver = parts.next()?.parse::<IpAddr>().ok()?;
+            Some(format!(
+                "nslookup example.com {resolver} >/dev/null 2>&1 && echo LUNARWING-OLD-RESOLVER-OPEN;"
+            ))
+        })
+        .collect()
+}
+
+fn assert_read_only_resolver_mount(stdout: &str) {
+    let options = stdout
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            if fields.nth(4) != Some("/etc/resolv.conf") {
+                return None;
+            }
+            fields.next()
+        })
+        .expect("joined-run resolv.conf mountinfo");
+    assert!(
+        options.split(',').any(|option| option == "ro"),
+        "resolver mount is not read-only: {options}"
+    );
+}
+
 async fn assert_joined_run(
     sidecar: &TunnelSidecar,
     image: &str,
     workdir: &Path,
     dns: &[IpAddr],
 ) -> Result<(), String> {
-    if dns.is_empty() {
-        let sidecar_dns =
-            podman_output(&["exec", sidecar.container_name(), "nslookup", "example.com"]).await?;
-        assert!(
-            sidecar_dns.status.success(),
-            "sidecar DNS failed:\n{}{}",
-            String::from_utf8_lossy(&sidecar_dns.stdout),
-            String::from_utf8_lossy(&sidecar_dns.stderr)
-        );
-    }
+    let sidecar_dns =
+        podman_output(&["exec", sidecar.container_name(), "nslookup", "example.com"]).await?;
+    assert!(
+        sidecar_dns.status.success(),
+        "sidecar bootstrap DNS failed:\n{}{}",
+        String::from_utf8_lossy(&sidecar_dns.stdout),
+        String::from_utf8_lossy(&sidecar_dns.stderr)
+    );
+    let sidecar_conf = sidecar_resolv_conf(sidecar).await?;
+    let old_resolver_probe = if dns.is_empty() {
+        String::new()
+    } else {
+        for resolver in dns {
+            assert!(!sidecar_conf.contains(&format!("nameserver {resolver}")));
+        }
+        let probe = old_resolver_probe(&sidecar_conf);
+        assert!(!probe.is_empty(), "sidecar has no former resolver to probe");
+        probe
+    };
     let container_id = sidecar
         .ensure_healthy()
         .await
@@ -218,9 +280,10 @@ async fn assert_joined_run(
     let resolv_conf = sidecar
         .tunnel_resolv_conf()
         .map_err(|error| error.to_string())?;
+    let command = format!("{JOINED_PROBE}\ncat /proc/self/mountinfo\n{old_resolver_probe}");
     let output = runner
         .execute(ExecParams {
-            command: JOINED_PROBE,
+            command: &command,
             working_dir: workdir,
             policy: SandboxPolicy::ReadOnly,
             limits: &limits,
@@ -243,6 +306,7 @@ async fn assert_joined_run(
         "LUNARWING-TUNNEL-UPLINK-OPEN",
         "LUNARWING-TUNNEL-METADATA-OPEN",
         "LUNARWING-TUNNEL-HOST-OPEN",
+        "LUNARWING-OLD-RESOLVER-OPEN",
     ] {
         assert!(!output.stdout.contains(open), "uplink open: {open}");
     }
@@ -254,11 +318,34 @@ async fn assert_joined_run(
             output.stderr
         );
     } else {
+        assert!(output.stdout.contains("# lunarwing-tunnel-dns"));
+        assert_read_only_resolver_mount(&output.stdout);
         for resolver in dns {
             assert!(output.stdout.contains(&format!("nameserver {resolver}")));
         }
     }
     Ok(())
+}
+
+async fn recreate_and_verify(
+    sidecar: &TunnelSidecar,
+    previous_id: &str,
+    allow_uplink_dns: bool,
+) -> Result<String, String> {
+    sidecar
+        .ensure_started()
+        .await
+        .map_err(|error| error.to_string())?;
+    let id = tunnel_container_id(sidecar.container_name())
+        .await
+        .ok_or("missing recreated container id")?;
+    assert_ne!(previous_id, id);
+    sidecar
+        .ensure_healthy()
+        .await
+        .map_err(|error| error.to_string())?;
+    assert_firewall_listing(sidecar.container_name(), allow_uplink_dns).await;
+    Ok(id)
 }
 
 async fn exercise_sidecar(
@@ -296,39 +383,28 @@ async fn exercise_sidecar(
         .await
         .expect_err("an altered output firewall must fail closed");
     assert_eq!(error.kind(), "sandbox_unavailable");
-    sidecar
-        .ensure_started()
-        .await
-        .map_err(|error| error.to_string())?;
-    let recreated_id = tunnel_container_id(name)
-        .await
-        .ok_or("missing recreated container id")?;
-    assert_ne!(first_id, recreated_id);
+    let recreated_id = recreate_and_verify(sidecar, &first_id, dns.is_empty()).await?;
+
     tamper_chain(name, "input", &["iifname", "\"wg0\"", "accept"]).await?;
     let error = sidecar
         .ensure_healthy()
         .await
         .expect_err("an altered input firewall must fail closed");
     assert_eq!(error.kind(), "sandbox_unavailable");
+    let clean_id = recreate_and_verify(sidecar, &recreated_id, dns.is_empty()).await?;
+    assert_joined_run(sidecar, image, workdir, dns).await?;
 
     if image == E2E_IMAGE {
         rotate_tunnel_image(image).await?;
-        sidecar
+        let error = sidecar
             .ensure_healthy()
             .await
             .expect_err("an image-ID change must invalidate the old sidecar");
-        sidecar
-            .ensure_started()
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_ne!(
-            recreated_id,
-            tunnel_container_id(name).await.unwrap_or_default()
+        assert!(
+            error.to_string().contains("current configuration"),
+            "image rotation failed for the wrong reason: {error}"
         );
-        sidecar
-            .ensure_healthy()
-            .await
-            .map_err(|error| error.to_string())?;
+        recreate_and_verify(sidecar, &clean_id, dns.is_empty()).await?;
     }
     Ok(())
 }
@@ -417,6 +493,80 @@ async fn podman_tunnel_sidecar_custom_dns_closes_uplink() {
     sidecar.stop().await;
     let _ = std::fs::remove_dir_all(&workdir);
     result.expect("custom tunnel DNS must remove uplink DNS");
+}
+
+#[tokio::test]
+async fn podman_tunnel_sidecar_hostname_endpoint_reaches_handshake_gate() {
+    if !gate_open("LUNARWING_E2E_PODMAN_TESTS") || !gate_open("LUNARWING_E2E_TUNNEL_TESTS") {
+        eprintln!("skipping: set both podman and tunnel e2e gates to 1");
+        return;
+    }
+    let image = tunnel_image().await.expect("WireGuard-capable image");
+    let private_key = generate_wg_private_key(&image)
+        .await
+        .expect("generate a WireGuard key");
+    let peer_key = generate_wg_private_key(&image)
+        .await
+        .expect("generate a peer key");
+    let workdir = std::env::temp_dir().join(format!("lw-tunnel-peer-{}", std::process::id()));
+    std::fs::create_dir_all(&workdir).expect("workdir");
+    let config = workdir.join("wg0.conf");
+    std::fs::write(
+        &config,
+        format!(
+            "[Interface]\nPrivateKey = {private_key}\nAddress = 10.231.99.1/32\n\
+             [Peer]\nPublicKey = {peer_key}\nEndpoint = localhost:51820\n\
+             AllowedIPs = 10.231.99.2/32\nPersistentKeepalive = 25\n"
+        ),
+    )
+    .expect("write peered config");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod 600");
+    }
+    let sidecar = TunnelSidecar::for_instance(
+        ContainerRuntime::Podman,
+        TunnelSidecarConfig {
+            provider: TunnelProvider::Wireguard,
+            image: Some(image),
+            wireguard_config: Some(config),
+            dns: vec!["10.231.99.53".parse().unwrap()],
+            startup_timeout: Duration::from_secs(6),
+            ..TunnelSidecarConfig::default()
+        },
+        &workdir,
+    );
+    let name = sidecar.container_name().to_string();
+    let start = tokio::spawn(async move { sidecar.ensure_started().await });
+    let mut endpoint_visible = false;
+    for _ in 0..30 {
+        if start.is_finished() {
+            break;
+        }
+        if let Ok(output) = podman_output(&["exec", &name, "wg", "show", "wg0", "endpoints"]).await
+            && output.status.success()
+            && String::from_utf8_lossy(&output.stdout).contains("51820")
+        {
+            endpoint_visible = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let resolver_conf = podman_output(&["exec", &name, "cat", "/etc/resolv.conf"]).await;
+    let result = start.await.expect("sidecar start task");
+    let _ = podman_success(&["rm", "-f", &name]).await;
+    let _ = std::fs::remove_dir_all(&workdir);
+    let error = result.expect_err("an unreachable peer must fail the handshake gate");
+    assert_eq!(error.kind(), "sandbox_unavailable");
+    assert!(
+        endpoint_visible,
+        "wg-quick did not resolve the hostname endpoint and configure the peer"
+    );
+    let resolver_conf = resolver_conf.expect("read bootstrap resolvers");
+    assert!(resolver_conf.status.success());
+    assert!(!String::from_utf8_lossy(&resolver_conf.stdout).contains("10.231.99.53"));
 }
 
 fn required_env(name: &str) -> Result<String, String> {

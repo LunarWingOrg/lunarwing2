@@ -907,11 +907,13 @@ impl TunnelSidecar {
         let Some(path) = self.resolv_conf_path()? else {
             return Ok(None);
         };
-        let contents = self
-            .cfg
-            .dns
-            .iter()
-            .map(|resolver| format!("nameserver {resolver}\n"))
+        let contents = std::iter::once("# lunarwing-tunnel-dns\n".to_string())
+            .chain(
+                self.cfg
+                    .dns
+                    .iter()
+                    .map(|resolver| format!("nameserver {resolver}\n")),
+            )
             .collect::<String>();
         let temp_path = path.with_file_name(format!(
             ".{}.{}",
