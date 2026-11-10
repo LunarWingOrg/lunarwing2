@@ -1239,6 +1239,14 @@ fn classify_run_failure(stderr: &str, image: &str, exit_code: i64) -> Option<San
     })
 }
 
+const CONTAINER_RUNTIME_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+fn apply_container_runtime_path(cmd: &mut tokio::process::Command) {
+    // systemd's default service PATH omits sbin, where Gentoo installs pasta.
+    // Set it before prepare_service so rootless Podman works in service mode.
+    cmd.env("PATH", CONTAINER_RUNTIME_PATH);
+}
+
 /// Run a quick status probe through the workload spawner (WI#181: container
 /// lifecycle probes must execute in the same manager-forked context as `run` —
 /// the hardened daemon's context breaks podman's rootless user-namespace
@@ -1249,6 +1257,7 @@ pub(crate) async fn run_status_isolated(
 ) -> Option<std::process::ExitStatus> {
     let spawner = crate::tools::process::workload_spawner().await;
     let mut cmd = spawner.command(bin, args);
+    apply_container_runtime_path(&mut cmd);
     let spec = spawner.prepare_service(&mut cmd);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -1272,6 +1281,7 @@ pub(crate) async fn output_isolated(
 ) -> std::io::Result<std::process::Output> {
     let spawner = crate::tools::process::workload_spawner().await;
     let mut cmd = spawner.command(bin, args);
+    apply_container_runtime_path(&mut cmd);
     let spec = spawner.prepare_service(&mut cmd);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -2096,6 +2106,27 @@ mod tests {
     /// that `run` uses: a daemon-forked podman call breaks rootless
     /// user-namespace joins under the hardened unit, which would make
     /// `SandboxManager::initialize()` fail on an existing image.
+    #[test]
+    fn isolated_container_path_includes_sbin() {
+        let spawner = crate::tools::process::WorkloadSpawner::direct();
+        let mut cmd = spawner.command("podman", &["--help"]);
+        apply_container_runtime_path(&mut cmd);
+        let path = cmd
+            .as_std()
+            .get_envs()
+            .find_map(|(key, value)| {
+                if key == "PATH" {
+                    value.map(|value| value.to_string_lossy().into_owned())
+                } else {
+                    None
+                }
+            })
+            .expect("container runtime PATH");
+        for directory in ["/usr/sbin", "/sbin"] {
+            assert!(path.split(':').any(|part| part == directory));
+        }
+    }
+
     #[tokio::test]
     async fn image_exists_through_isolated_context() {
         let spawner = crate::tools::process::workload_spawner().await;
