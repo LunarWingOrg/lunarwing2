@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 
+import contextlib
 import importlib.util
+import io
 import json
 import pathlib
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -114,6 +117,62 @@ class BaselineTests(unittest.TestCase):
             accepted.write_text("fixture.txt:generic-api-key:1\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "commit-bound"):
                 baseline.read_fingerprint_file(accepted)
+
+    def run_main(self, root, scanned, accepted=None):
+        output = root / "history.ignore"
+        pending = root / "pending.ignore"
+        arguments = [
+            "refresh-secret-history-baseline.py",
+            "--repo",
+            str(root),
+            "--output",
+            str(output),
+            "--pending",
+            str(pending),
+        ]
+        if accepted is not None:
+            arguments.extend(["--accept", str(accepted)])
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(baseline.sys, "argv", arguments),
+            mock.patch.object(baseline, "validate_mirror"),
+            mock.patch.object(baseline, "scan", return_value=scanned),
+            mock.patch.object(
+                baseline.subprocess,
+                "run",
+                return_value=mock.Mock(stdout="v8.30.1\n"),
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            status = baseline.main()
+        return status, baseline.read_fingerprint_file(output), stdout.getvalue(), stderr.getvalue()
+
+    def test_cli_requires_acceptance_and_never_accepts_pending(self):
+        existing = {fingerprint("0", "old-fixture.txt")}
+        unclassified = fingerprint("1", "new-fixture.txt")
+        pending = fingerprint("2", "pending-fixture.txt")
+        vendor = fingerprint("3", "ic/vendor/example-crate/tests/fixture.txt")
+        scanned = [unclassified, pending, vendor]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            baseline.write_baseline(root / "history.ignore", sorted(existing))
+            (root / "pending.ignore").write_text(f"{pending}\n", encoding="utf-8")
+            status, pinned, stdout, stderr = self.run_main(root, scanned)
+            self.assertEqual(status, 1)
+            self.assertEqual(pinned, existing | {vendor})
+            self.assertIn("example-crate", stdout)
+            self.assertIn(unclassified, stderr)
+            self.assertIn(pending, stderr)
+
+            accepted = root / "accepted.ignore"
+            accepted.write_text(f"{unclassified}\n{pending}\n", encoding="utf-8")
+            status, pinned, _, stderr = self.run_main(root, scanned, accepted)
+            self.assertEqual(status, 1)
+            self.assertEqual(pinned, existing | {vendor, unclassified})
+            self.assertNotIn(pending, pinned)
+            self.assertIn(pending, stderr)
 
 
 if __name__ == "__main__":
