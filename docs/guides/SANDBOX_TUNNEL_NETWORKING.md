@@ -6,7 +6,12 @@ not expose the web gateway, open a host port, or let overlay peers connect
 into the sandbox, and it does not let a sandboxed command reach the host, the
 LAN, the cloud metadata service or the public internet through the sidecar's
 own uplink. Design and alternatives:
-`docs/proposals/PODMAN_SANDBOX_TUNNEL_NETWORKING.md`.
+[`../proposals/PODMAN_SANDBOX_TUNNEL_NETWORKING.md`](../proposals/PODMAN_SANDBOX_TUNNEL_NETWORKING.md).
+
+**Source revalidated 2026-11-10 for v2.2.0.0.** The provider configuration,
+fail-closed health/firewall checks, secret-handling paths, and verification
+commands below match `ic/src/sandbox/tunnel_sidecar.rs` and the gated Podman
+integration test.
 
 WI#537 selects `proxy-enforced` as the Linux default; other platforms default
 to `none`, and `tunnel` remains an explicit opt-in. Existing `none` /
