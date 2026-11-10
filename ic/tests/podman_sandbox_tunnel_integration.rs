@@ -343,6 +343,14 @@ async fn podman_tunnel_sidecar_wireguard_lifecycle_and_join() {
             .await
             .map_err(|error| error.to_string())?;
         sidecar
+            .ensure_started()
+            .await
+            .map_err(|error| error.to_string())?;
+        sidecar
+            .ensure_healthy()
+            .await
+            .map_err(|error| error.to_string())?;
+        other
             .ensure_healthy()
             .await
             .map_err(|error| error.to_string())?;
