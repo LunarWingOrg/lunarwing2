@@ -305,9 +305,10 @@ async fn assert_joined_run(
 ) -> Result<(), String> {
     let sidecar_dns =
         podman_output(&["exec", sidecar.container_name(), "nslookup", "example.com"]).await?;
-    assert!(
+    assert_eq!(
         sidecar_dns.status.success(),
-        "sidecar bootstrap DNS failed:\n{}{}",
+        dns.is_empty(),
+        "sidecar DNS does not match the uplink policy:\n{}{}",
         String::from_utf8_lossy(&sidecar_dns.stdout),
         String::from_utf8_lossy(&sidecar_dns.stderr)
     );
