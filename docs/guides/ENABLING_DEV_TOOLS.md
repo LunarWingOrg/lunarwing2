@@ -6,22 +6,12 @@ LunarWing controls local filesystem and shell tools through three separate layer
 2. **Sandbox policy** limits filesystem and network access.
 3. **Tool permission** decides whether an invocation runs, asks for approval, or is disabled.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19, 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-14 (v2.1.6.0).** `ALLOW_LOCAL_TOOLS`,
-`AGENT_AUTO_APPROVE_TOOLS`, and the `full_access` double opt-in
-(`SANDBOX_ALLOW_FULL_ACCESS`) were re-checked against the config resolver and
-sandbox manager. Updated for the v2.1.2.0 generic podman-first sandbox: new
-`SANDBOX_RUNTIME` / `SANDBOX_NETWORK` / `SANDBOX_ENFORCE` knobs and the
-scrubbed `full_access` child environment (WI#141). The 2026-09-19 pass
-confirmed the approval-behavior section against the goal-31 fixes
-(`AUTO_APPROVE_TOOLS` legacy alias, Engine V2 `UnlessAutoApproved` scope).
-The 2026-09-27 repass added the v2.1.3.0 mt-admin sandbox-image defaults
-(WI#223: `SANDBOX_IMAGE=lunarwing-sandbox:latest`, `SANDBOX_AUTO_PULL=false`,
-`SANDBOX_RUNTIME=podman` for new tenants) and the env-generation note that
-mt-admin now writes only the canonical `AGENT_AUTO_APPROVE_TOOLS` key for new
-tenants, migrating a legacy-only `AUTO_APPROVE_TOOLS` value on re-render.
-The 2026-10-14 repass found the layer unchanged (the `SANDBOX_*` knob set
-still resolves in `ic/src/config/sandbox.rs`; the v2.1.6.0 worker-credential
-strips touch worker containers, not this tenant sandbox layer).
+**Revalidated against source 2026-11-10 (v2.2.0.0).** `ALLOW_LOCAL_TOOLS`,
+`AGENT_AUTO_APPROVE_TOOLS` (including the legacy `AUTO_APPROVE_TOOLS` alias),
+the `full_access` double opt-in, the generic podman-first runtime, the four
+network tiers, and the scrubbed child environment match the config resolver and
+sandbox manager. The Linux network default is now `proxy-enforced`; mt-admin
+preserves every explicit operator choice on re-render.
 
 Use the narrowest access that satisfies the task. `full_access` combined with automatic approval lets model output execute directly on the host with the LunarWing service account's privileges.
 
@@ -143,6 +133,22 @@ SANDBOX_POLICY=full_access
 SANDBOX_ALLOW_FULL_ACCESS=true
 AGENT_AUTO_APPROVE_TOOLS=true
 ```
+
+## Container storage failures
+
+Since v2.2.0.0 (WI#587), image inspection, image pull, and container setup can
+return typed `storage_unavailable` with the extracted containers-storage path
+and the runtime's nested error preserved. This is non-transient: check that path
+with `df`, then use mt-admin and the host health tooling on multi-tenant hosts.
+As the affected tenant user, `podman image prune` removes dangling images only.
+Never use `prune -a` or a broad system prune as a first response: the sandbox
+image is built locally, not pulled from a registry. Rebuild it with
+`build-sandbox-image <tenant>` after cleanup if necessary.
+
+An ordinary command that prints `No space left on device` is not by itself proof
+that host container storage is full. Run-path classification requires the
+runtime's exit 125 and error prefix, so command stderr and any forged storage
+path remain ordinary sandbox output.
 
 ## Verification
 
