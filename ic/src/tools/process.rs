@@ -203,6 +203,20 @@ impl WorkloadSpawner {
     /// command is rebuilt, so callers must re-apply stdio configuration
     /// after this call.
     pub fn prepare_service(&self, cmd: &mut Command) -> Option<ServiceSpec> {
+        self.prepare_service_with_kill_mode(cmd, None)
+    }
+
+    /// Prepare a detached container-runtime client. Its network helper must
+    /// outlive the client, so only the client's main process is killed on stop.
+    pub fn prepare_detached_service(&self, cmd: &mut Command) -> Option<ServiceSpec> {
+        self.prepare_service_with_kill_mode(cmd, Some("process"))
+    }
+
+    fn prepare_service_with_kill_mode(
+        &self,
+        cmd: &mut Command,
+        kill_mode: Option<&str>,
+    ) -> Option<ServiceSpec> {
         if !self.uses_systemd_services() {
             return None;
         }
@@ -255,6 +269,9 @@ impl WorkloadSpawner {
                 "--property=TimeoutStopSec={}",
                 self.timeout_stop_secs
             ));
+        if let Some(kill_mode) = kill_mode {
+            rebuilt.arg(format!("--property=KillMode={kill_mode}"));
+        }
         if let Some(memory_max) = &self.memory_max {
             rebuilt.arg(format!("--property=MemoryMax={memory_max}"));
         }
@@ -977,6 +994,28 @@ mod tests {
         assert!(spawner.prepare_service(&mut cmd).is_none());
         // Command left untouched in process-group mode.
         assert_eq!(cmd.as_std().get_program().to_string_lossy(), "sh");
+    }
+
+    #[test]
+    fn detached_prepare_preserves_runtime_helpers_with_kill_mode_process() {
+        let spawner = WorkloadSpawner {
+            isolation: Isolation::SystemdService,
+            slice: DEFAULT_SLICE.to_string(),
+            memory_max: None,
+            timeout_stop_secs: DEFAULT_TIMEOUT_STOP_SECS,
+            xdg_runtime_dir: None,
+            manager_env: std::sync::Arc::new(Vec::new()),
+        };
+        let mut cmd = spawner.command("podman", &["run", "-d", "image"]);
+        let _ = spawner
+            .prepare_detached_service(&mut cmd)
+            .expect("detached service spec");
+        let args = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert!(args.iter().any(|arg| arg == "--property=KillMode=process"));
     }
 
     #[test]
