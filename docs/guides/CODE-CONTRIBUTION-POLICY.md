@@ -2,6 +2,8 @@
 
 This document is the single canonical reference for how code is contributed to LunarWing. It consolidates conventions that were previously scattered across `AGENTS.md`, the GitLab CI, subsystem specs, and guide documents. When this policy disagrees with an older document, this one wins.
 
+**Documentation reviewed:** 2026-11-10 for v2.2.0.0 against the repository-root and `ic/` agent contracts.
+
 ## 1. Project values
 
 LunarWing is privacy-first, security-first, and self-hosting-first. We prefer open-weight models and local inference, we support user choice, and we do not expose secrets to any model or third-party service. See `MANIFESTO.md` and `README.md` for the full philosophy.
@@ -40,7 +42,7 @@ See [`AI-CODE-CONTRIBUTION-POLICY.md`](./AI-CODE-CONTRIBUTION-POLICY.md) for the
 
 ## 6. Architecture and module discipline
 
-- Keep `src/main.rs` and `src/app.rs` orchestration-focused. Do not move module-owned logic into entrypoints.
+- Keep `ic/src/main.rs` and `ic/src/app.rs` orchestration-focused. Do not move module-owned logic into entrypoints.
 - Module-specific initialization lives behind a public factory/helper in the owning module.
 - Keep feature-flag branching inside the module that owns the abstraction whenever possible.
 - Prefer extending existing traits and registries over hardcoding one-off integration paths.
@@ -52,7 +54,7 @@ See [`AI-CODE-CONTRIBUTION-POLICY.md`](./AI-CODE-CONTRIBUTION-POLICY.md) for the
 - **PostgreSQL** is the primary backend and is far more heavily supported. `libSQL` support is aspirational; do not regress existing `libSQL` coverage when possible.
 - Add new DB operations to the shared DB trait first, then implement both backends.
 - Treat bootstrap config, DB-backed settings, and encrypted secrets as distinct layers.
-- If onboarding or setup behavior changes, update `src/setup/README.md` in the same branch.
+- If onboarding or setup behavior changes, update `ic/src/setup/README.md` in the same branch.
 - Do not break config precedence, bootstrap env loading, DB-backed config reload, or post-secrets LLM re-resolution.
 
 ## 8. Multi-tenancy and service operations
@@ -79,6 +81,8 @@ See [`AI-CODE-CONTRIBUTION-POLICY.md`](./AI-CODE-CONTRIBUTION-POLICY.md) for the
 - Session/thread/turn state matters. Submission parsing happens before normal chat handling.
 - Skills are selected deterministically. Tool approval and auth flows are special paths and must not be mixed into normal chat history carelessly.
 - Persistent memory is the workspace system, not just transcript storage; preserve file-like semantics, chunking/search behavior, and identity/system-prompt loading.
+- External workers must never self-expose through their own tunnel, relay, pairing link, public listener, or third-party share service; daemon job dispatch to the loopback agent API is the only legitimate instruction channel.
+- Keep every worker on its per-tenant egress network and nftables allowlist. Exposure wrappers and audits are defense-in-depth, not a substitute for fail-closed network enforcement.
 
 ## 11. Change discipline
 
