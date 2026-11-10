@@ -716,13 +716,14 @@ same pinned Gitleaks image and proves that unchanged history passes, a new
 synthetic finding fails, a baselined finding repeated at the same path and line
 in a new commit fails, a shallow checkout fails closed, and a path-only ignore
 is rejected before scanning. Test secrets are constructed at runtime and scanner
-output is checked for complete redaction.
+output is checked for complete redaction. The blocking
+`secret-history-regression` job runs this harness on merge-request pipelines so
+scanner or isolation regressions cannot first appear on a release tag.
 
 After `ic/scripts/refresh-vendor.sh` adds or moves vendor fixtures, regenerate
-the history baseline from a non-shallow full mirror; review every new non-vendor
-fingerprint in WI#575 before accepting it. Fetch the complete ref superset, then
-run `.gitlab/scripts/refresh-secret-history-baseline.py` with Gitleaks v8.30.1
-on `PATH` (or set `GITLEAKS_BIN`):
+the history baseline from a non-shallow full mirror. Fetch the complete ref
+superset, then run `.gitlab/scripts/refresh-secret-history-baseline.py` with
+Gitleaks v8.30.1 on `PATH` (or set `GITLEAKS_BIN`):
 
 ```bash
 git fetch origin '+refs/heads/*:refs/remotes/origin/*' \
@@ -731,9 +732,21 @@ python3 .gitlab/scripts/refresh-secret-history-baseline.py
 ```
 
 The helper requires branch, tag, and merge-request refs, performs a fully
-redacted scan without either ignore file, validates every fingerprint, and
-writes only the sorted commit-bound pins. Never suppress new vendor churn by
-adding a path or rule exclusion. Worker-image
+redacted scan without either ignore file, and validates every fingerprint. It
+starts from the committed baseline and preserves every existing pin. New vendor
+pins are added automatically and printed with their exact fingerprints grouped
+by crate; review that crate-grouped list against the refresh-vendor diff before
+committing it. Never suppress new vendor churn by adding a path or rule
+exclusion.
+
+A new non-vendor fingerprint is printed and left unpinned unless an explicit
+`--accept <file>` names its exact commit-bound fingerprint. Record its classified
+disposition in WI#575 before supplying that acceptance file. Unclassified rows
+make the helper exit non-zero; safe vendor and explicitly accepted additions are
+still written. `.gitlab/gitleaks-history-pending` lists findings awaiting
+external disposition. The helper refuses those rows even when `--accept` names
+them; remove a pending row only after its evidence is recorded in WI#575 and its
+exact baseline pin is deliberate. Worker-image
 CRITICAL findings that Debian has not fixed for the pinned toolchain
 dependencies are listed by exact CVE with a rationale comment and an expiry
 date in Trivy's own syntax (`CVE-… exp:YYYY-MM-DD`, one entry per line) in
