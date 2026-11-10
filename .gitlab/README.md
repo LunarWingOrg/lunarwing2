@@ -869,6 +869,31 @@ rejected entries, and skips missing binaries without downloading. This
 protects telemetry even if an earlier bootstrap step fails before the normal
 sccache verification runs (IZ-1).
 
+Both tool installers try the project's generic package registry before GitHub.
+Maintainers must publish the exact upstream archives as package
+`lunarwing-ci-tools`, after verifying them against the checked-in SHA256 pins,
+and protect that package name with a Maintainer-only push rule: sccache 0.17.0
+uses version `0.17.0` and file
+`sccache-v0.17.0-x86_64-unknown-linux-musl.tar.gz`; ShellCheck 0.11.0 uses
+version `0.11.0` and file `shellcheck-v0.11.0.linux.x86_64.tar.xz`. CI builds the
+URL from `CI_API_V4_URL` and `CI_PROJECT_ID`. Registry and GitHub downloads are
+anonymous, so redirects never forward a CI job token. Each source retries only
+transient failures and refused connections five times with a five-second delay;
+permanent HTTP errors such as a missing registry archive's 404 fall through
+immediately. Every downloaded archive must match its checked-in SHA256. A tool
+bump must publish the new archive and update both pins in the same change.
+
+If every sccache source is unreachable, the installer exits 75 (`EX_TEMPFAIL`)
+and both Rust templates source `disable-sccache.sh`, print a warning, unset
+`RUSTC_WRAPPER` and every exported `SCCACHE_*` variable, and continue without
+the optional compiler cache. Checksum mismatches and all other installation
+failures remain fatal. A total ShellCheck download outage also remains fatal
+and names the registry URL: ShellCheck is a correctness gate and must never
+silently fall back to the older distro package.
+`ic/scripts/tests/test-ci-tool-downloads.sh` covers source order, token and
+retry policy, checksum rejection, and the exact Rust template's outage and
+integrity-failure paths with stubbed downloads.
+
 **Compiler-cache trust limit (IU-3):** the binary pin does not authenticate
 compiled objects in `.ci-cache/sccache/`. The checked-in pipeline permits
 writes only from `rust-cache-refresh` on protected default-branch pushes;
