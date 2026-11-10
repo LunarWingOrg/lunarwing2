@@ -133,7 +133,7 @@ Items 3–4 cover the sandbox theme; items 5–6 cover LunarDepth.
     - **Follow-up boundary (YI-2/YI-3):** this is a point-in-time recovery verification, not a claim that later master pipelines cannot regress; item 15 remains the catch-all for that case. WI#594 separately tracks first-party asset hosting and bootstrap hardening and remains open; no issue closure or new goals item is claimed here.
 17. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/592 - last attempt had issues and needs to be re-attempted. closed MR with last attempt can be found at https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2335 and has adversarial review with what is wrong with it in the comments of the MR
 18. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/590 - last attempt had issues and needs to be re-attempted. closed MR with last attempt can be found at https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2334 and has adversarial review with what is wrong with it in the comments of the MR
-19. [x] (RESERVED4LATER) work on RELEASE NOTES
+19. [x] (RESERVED4LATER) work on RELEASE NOTESs
 20. [ ] update all documentation in docs/architecture and docs/guides
 
 ## Phase 7 - Advanced Operator Notes
