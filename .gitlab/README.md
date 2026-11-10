@@ -714,8 +714,9 @@ cannot suppress the same secret introduced by a new commit. The baseline stores
 no secret values or matched content. `test-secret-history.sh` runs first in the
 same pinned Gitleaks image and proves that unchanged history passes, a new
 synthetic finding fails, a baselined finding repeated at the same path and line
-in a new commit fails, and a shallow checkout fails closed. Test secrets are
-constructed at runtime and scanner output is checked for complete redaction.
+in a new commit fails, a shallow checkout fails closed, and a path-only ignore
+is rejected before scanning. Test secrets are constructed at runtime and scanner
+output is checked for complete redaction.
 
 After `ic/scripts/refresh-vendor.sh` adds or moves vendor fixtures, regenerate
 the history baseline from a non-shallow full mirror; review every new non-vendor
