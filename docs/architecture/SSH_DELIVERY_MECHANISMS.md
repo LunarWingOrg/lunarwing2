@@ -1,6 +1,6 @@
 # SSH Delivery Mechanisms
 
-**Status:** As-built; source revalidated 2026-11-01 for v2.1.8.0. Worker socket
+**Status:** As-built; source revalidated 2026-11-10 for v2.2.0.0. Worker socket
 mounts are owned by `ic/scripts/mt-admin-lib/09-worker-config.sh` and generated
 units; direct execution by `ic/src/tools/builtin/{ssh,ssh_git}.rs` and
 `ic/src/bridge/ssh_client.rs`; WASM access by `ic/src/tools/wasm/wrapper.rs`.
