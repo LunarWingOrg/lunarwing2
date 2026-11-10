@@ -107,7 +107,10 @@ not application auth.
   readiness is `wg0` presence; with peers it is a nonzero handshake at most 180
   seconds old, or a successful `SANDBOX_TUNNEL_WIREGUARD_CANARY` ICMP probe
   through the overlay. The firewall is installed after readiness. Probes, start
-  and cleanup are bounded.
+  and cleanup are bounded. On systemd hosts the detached `run -d` client uses a
+  dedicated `KillMode=process` transient service so its pasta network helper
+  outlives the client; foreground workload cleanup is unchanged, and sidecar
+  removal still tears down the container and helper.
 - `SandboxManager` health-gates initialization and calls `ensure_healthy()`
   before every container run. Provider failure, a dead sidecar, hash drift, or
   firewall drift returns `SandboxError::TunnelUnavailable`, mapped to the stable
