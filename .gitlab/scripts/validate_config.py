@@ -809,7 +809,7 @@ ADVISORY_GATE_SCRIPTS = {
 ADVISORY_GATE_BEFORE_SCRIPT = [
     'df -h "$CI_PROJECT_DIR"',
     "bash .gitlab/scripts/bootstrap-rust.sh",
-    "bash .gitlab/scripts/bootstrap-sccache.sh || { rc=$?; [ "$rc" -eq 75 ] || exit "$rc"; source .gitlab/scripts/disable-sccache.sh; }",
+    'bash .gitlab/scripts/bootstrap-sccache.sh || { rc=$?; [ "$rc" -eq 75 ] || exit "$rc"; source .gitlab/scripts/disable-sccache.sh; }',
 ]
 ADVISORY_GATE_EFFECTIVE_KEYS = frozenset({
     "after_script", "before_script", "cache", "image", "needs", "rules",
@@ -1611,7 +1611,7 @@ PEBBLE_RUST_LANE_EFFECTIVE_KEYS = PEBBLE_RUST_LANE_JOB_KEYS | frozenset({
 PEBBLE_RUST_LANE_BEFORE_SCRIPT = (
     'df -h "$CI_PROJECT_DIR"',
     "bash .gitlab/scripts/bootstrap-rust.sh",
-    "bash .gitlab/scripts/bootstrap-sccache.sh || { rc=$?; [ "$rc" -eq 75 ] || exit "$rc"; source .gitlab/scripts/disable-sccache.sh; }",
+    'bash .gitlab/scripts/bootstrap-sccache.sh || { rc=$?; [ "$rc" -eq 75 ] || exit "$rc"; source .gitlab/scripts/disable-sccache.sh; }',
 )
 PEBBLE_RUST_LANE_SCRIPT = (
     "bash .gitlab/scripts/cargo-ci.sh test -j2 --locked "
