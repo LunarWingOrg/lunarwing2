@@ -419,6 +419,22 @@ def validate_release_gates(merged: dict, defaults: dict, errors: list[str]) -> N
     if resolve_extends(history_job, merged).get("allow_failure"):
         errors.append("secret-history must not allow failure")
 
+    history_regression = merged.get("secret-history-regression", {})
+    expected_regression_shape = {
+        "extends": ".gitleaks-job",
+        "stage": "security",
+        "needs": [],
+        "rules": [
+            {"if": '$CI_PIPELINE_SOURCE == "merge_request_event"'},
+            {"when": "never"},
+        ],
+        "script": ["bash .gitlab/tests/test-secret-history.sh"],
+    }
+    if history_regression != expected_regression_shape:
+        errors.append("secret-history-regression must run the real-scanner harness only for MRs")
+    if resolve_extends(history_regression, merged).get("allow_failure"):
+        errors.append("secret-history-regression must not allow failure")
+
 
 def validate_opencode2_exposure_verify(merged: dict, errors: list[str]) -> None:
     job = merged.get("worker-opencode2-exposure-verify")
