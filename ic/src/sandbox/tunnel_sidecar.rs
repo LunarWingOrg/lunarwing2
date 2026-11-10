@@ -52,6 +52,7 @@ const SIDECAR_PIDS_LIMIT: u32 = 64;
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
+const WIREGUARD_HANDSHAKE_MAX_AGE_SECS: u64 = 180;
 const MAX_WIREGUARD_CONFIG_BYTES: u64 = 1024 * 1024;
 const NFT_TABLE: &str = "lunarwing_sandbox_egress";
 const NFT_INPUT_CHAIN: &str = "input";
@@ -119,6 +120,11 @@ pub struct TunnelSidecarConfig {
     pub netbird_management_url: Option<String>,
     pub netbird_setup_key: Option<SecretString>,
     pub wireguard_config: Option<PathBuf>,
+    /// Optional resolver addresses reachable through the tunnel. When nonempty,
+    /// joined runs use them and no DNS traffic is allowed onto the uplink.
+    pub dns: Vec<IpAddr>,
+    /// Optional ICMP canary reachable only through WireGuard.
+    pub wireguard_canary: Option<IpAddr>,
     pub startup_timeout: Duration,
     /// Mirrors `SANDBOX_AUTO_PULL`: when false the sidecar image must already
     /// be present in the local store, otherwise the start fails closed instead
@@ -134,6 +140,8 @@ impl Default for TunnelSidecarConfig {
             netbird_management_url: None,
             netbird_setup_key: None,
             wireguard_config: None,
+            dns: Vec::new(),
+            wireguard_canary: None,
             startup_timeout: Duration::from_secs(90),
             auto_pull_image: true,
         }
@@ -158,6 +166,11 @@ impl TunnelSidecarConfig {
         hash_field(&mut hasher, self.provider.as_str().as_bytes());
         hash_field(&mut hasher, self.image().as_bytes());
         hash_field(&mut hasher, image_id.as_bytes());
+        for resolver in &self.dns {
+            hash_field(&mut hasher, resolver.to_string().as_bytes());
+        }
+        let canary = self.wireguard_canary.map(|address| address.to_string());
+        hash_optional(&mut hasher, canary.as_deref());
         hash_optional(&mut hasher, self.netbird_management_url.as_deref());
         hash_optional(
             &mut hasher,
@@ -188,8 +201,33 @@ impl TunnelSidecarConfig {
         )
     }
 
+    fn uplink_resolvers(&self, resolv_conf: &str) -> Vec<IpAddr> {
+        if self.dns.is_empty() {
+            parse_resolvers(resolv_conf)
+        } else {
+            Vec::new()
+        }
+    }
+
     pub fn validate(&self) -> std::result::Result<(), String> {
         validate_image_reference(self.image())?;
+        if self
+            .dns
+            .iter()
+            .any(|address| !valid_tunnel_address(address))
+        {
+            return Err("SANDBOX_TUNNEL_DNS addresses must be specified unicast IPs".into());
+        }
+        if self
+            .wireguard_canary
+            .as_ref()
+            .is_some_and(|address| !valid_tunnel_address(address))
+        {
+            return Err("SANDBOX_TUNNEL_WIREGUARD_CANARY must be a specified unicast IP".into());
+        }
+        if self.provider != TunnelProvider::Wireguard && self.wireguard_canary.is_some() {
+            return Err("SANDBOX_TUNNEL_WIREGUARD_CANARY requires the wireguard provider".into());
+        }
         match self.provider {
             TunnelProvider::Netbird => self.validate_netbird(),
             TunnelProvider::Wireguard => {
@@ -236,6 +274,10 @@ impl TunnelSidecarConfig {
         }
         Ok(())
     }
+}
+
+fn valid_tunnel_address(address: &IpAddr) -> bool {
+    !address.is_unspecified() && !address.is_multicast()
 }
 
 fn valid_sha256_hex(value: &str) -> bool {
@@ -353,6 +395,23 @@ fn has_interface_private_key(content: &str) -> bool {
     })
 }
 
+fn wireguard_config_has_peers(content: &str) -> bool {
+    let mut in_peer = false;
+    content.lines().any(|raw| {
+        let line = raw.trim();
+        if line.starts_with('[') {
+            in_peer = line.eq_ignore_ascii_case("[peer]");
+            return false;
+        }
+        if !in_peer || line.starts_with('#') || line.starts_with(';') {
+            return false;
+        }
+        line.split_once('=').is_some_and(|(key, value)| {
+            key.trim().eq_ignore_ascii_case("publickey") && !value.trim().is_empty()
+        })
+    })
+}
+
 /// The runtime arguments that start the sidecar. `hash` is the salted config
 /// hash published as a label; `netbird_state_volume` is the named volume that
 /// keeps NetBird's peer identity across restarts.
@@ -404,6 +463,9 @@ pub(crate) fn build_sidecar_args(
         "--tmpfs".into(),
         "/run:size=16m".into(),
     ];
+    for resolver in &cfg.dns {
+        args.extend(["--dns".into(), resolver.to_string()]);
+    }
 
     match cfg.provider {
         TunnelProvider::Netbird => {
@@ -437,12 +499,38 @@ pub(crate) fn build_sidecar_args(
     args
 }
 
-fn build_health_args_for(provider: TunnelProvider, container_name: &str) -> Vec<String> {
-    let probe: &[&str] = match provider {
-        TunnelProvider::Netbird => &["netbird", "status", "--check", "startup"],
-        TunnelProvider::Wireguard => &["ip", "link", "show", "wg0"],
+fn build_health_args_for(
+    provider: TunnelProvider,
+    container_name: &str,
+    wireguard_has_peers: bool,
+    wireguard_canary: Option<IpAddr>,
+) -> Vec<String> {
+    let probe: Vec<String> = match provider {
+        TunnelProvider::Netbird => ["netbird", "status", "--check", "startup"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        TunnelProvider::Wireguard => match (wireguard_has_peers, wireguard_canary) {
+            (_, Some(address)) => vec![
+                "ping".into(),
+                "-c".into(),
+                "1".into(),
+                "-W".into(),
+                "2".into(),
+                address.to_string(),
+            ],
+            (true, None) => ["wg", "show", "wg0", "latest-handshakes"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            (false, None) => ["ip", "link", "show", "wg0"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        },
     };
-    exec_args(probe, container_name)
+    let refs: Vec<&str> = probe.iter().map(String::as_str).collect();
+    exec_args(&refs, container_name)
 }
 
 fn exec_args(command: &[&str], container_name: &str) -> Vec<String> {
@@ -690,6 +778,19 @@ pub(crate) fn parse_wireguard_fwmark(output: &str) -> Option<u32> {
     u32::from_str_radix(hex, 16).ok()
 }
 
+fn wireguard_handshake_is_recent(output: &str, now_unix: u64) -> bool {
+    output.lines().any(|line| {
+        line.split_whitespace()
+            .nth(1)
+            .and_then(|timestamp| timestamp.parse::<u64>().ok())
+            .is_some_and(|timestamp| {
+                timestamp > 0
+                    && now_unix >= timestamp
+                    && now_unix - timestamp <= WIREGUARD_HANDSHAKE_MAX_AGE_SECS
+            })
+    })
+}
+
 pub struct TunnelSidecar {
     runtime: ContainerRuntime,
     bin: &'static str,
@@ -909,9 +1010,42 @@ impl TunnelSidecar {
         Some((running, hash, instance))
     }
 
+    fn wireguard_has_peers(&self) -> Option<bool> {
+        let path = self.cfg.wireguard_config.as_deref()?;
+        let content = std::fs::read_to_string(path).ok()?;
+        Some(wireguard_config_has_peers(&content))
+    }
+
     async fn provider_probe(&self) -> bool {
-        let args = build_health_args_for(self.cfg.provider, &self.container_name);
+        let has_peers = if self.cfg.provider == TunnelProvider::Wireguard {
+            let Some(has_peers) = self.wireguard_has_peers() else {
+                return false;
+            };
+            has_peers
+        } else {
+            false
+        };
+        let args = build_health_args_for(
+            self.cfg.provider,
+            &self.container_name,
+            has_peers,
+            self.cfg.wireguard_canary,
+        );
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        if self.cfg.provider == TunnelProvider::Wireguard
+            && has_peers
+            && self.cfg.wireguard_canary.is_none()
+        {
+            let Ok(output) = self.output_probe(&refs).await else {
+                return false;
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0);
+            return output.status.success()
+                && wireguard_handshake_is_recent(&String::from_utf8_lossy(&output.stdout), now);
+        }
         self.status_probe(&refs).await.is_some_and(|s| s.success())
     }
 
@@ -934,7 +1068,9 @@ impl TunnelSidecar {
         }
         Ok(EgressPolicy {
             tunnel_mark,
-            resolvers: parse_resolvers(&String::from_utf8_lossy(&resolv.stdout)),
+            resolvers: self
+                .cfg
+                .uplink_resolvers(&String::from_utf8_lossy(&resolv.stdout)),
         })
     }
 
@@ -1612,15 +1748,70 @@ mod tests {
     }
 
     #[test]
-    fn health_probe_matches_provider() {
+    fn health_probe_matches_provider_and_wireguard_peers() {
         assert_eq!(
-            build_health_args_for(TunnelProvider::Netbird, "tunnel-test").join(" "),
+            build_health_args_for(TunnelProvider::Netbird, "tunnel-test", false, None).join(" "),
             "exec tunnel-test netbird status --check startup"
         );
         assert_eq!(
-            build_health_args_for(TunnelProvider::Wireguard, "tunnel-test").join(" "),
+            build_health_args_for(TunnelProvider::Wireguard, "tunnel-test", false, None).join(" "),
             "exec tunnel-test ip link show wg0"
         );
+        assert_eq!(
+            build_health_args_for(TunnelProvider::Wireguard, "tunnel-test", true, None).join(" "),
+            "exec tunnel-test wg show wg0 latest-handshakes"
+        );
+        assert_eq!(
+            build_health_args_for(
+                TunnelProvider::Wireguard,
+                "tunnel-test",
+                true,
+                Some("10.231.0.1".parse().unwrap()),
+            )
+            .join(" "),
+            "exec tunnel-test ping -c 1 -W 2 10.231.0.1"
+        );
+        assert!(wireguard_config_has_peers(
+            "[Interface]\nPrivateKey = private\n[Peer]\nPublicKey = public\n"
+        ));
+        assert!(!wireguard_config_has_peers(
+            "[Interface]\nPrivateKey = private\nPublicKey = not-a-peer\n"
+        ));
+        assert!(wireguard_handshake_is_recent("peer-a 1000\n", 1180));
+        assert!(wireguard_handshake_is_recent(
+            "peer-a 0\npeer-b 999\n",
+            1000
+        ));
+        assert!(!wireguard_handshake_is_recent("peer-a 0\n", 1000));
+        assert!(!wireguard_handshake_is_recent("peer-a 819\n", 1000));
+        assert!(!wireguard_handshake_is_recent("peer-a 1001\n", 1000));
+        assert!(!wireguard_handshake_is_recent("garbage\n", 1000));
+    }
+
+    #[test]
+    fn custom_dns_configures_sidecar_and_closes_uplink_dns() {
+        let cfg = TunnelSidecarConfig {
+            dns: vec!["100.100.0.53".parse().unwrap(), "fd00::53".parse().unwrap()],
+            ..netbird_cfg()
+        };
+        let args = build_sidecar_args(&cfg, None, "tunnel-test", "test-instance", "deadbeef", None)
+            .join(" ");
+        assert!(args.contains("--dns 100.100.0.53 --dns fd00::53"));
+        assert!(cfg.uplink_resolvers("nameserver 169.254.1.1\n").is_empty());
+        assert_eq!(
+            netbird_cfg().uplink_resolvers("nameserver 169.254.1.1\n"),
+            vec!["169.254.1.1".parse().unwrap()]
+        );
+        let invalid = TunnelSidecarConfig {
+            dns: vec!["0.0.0.0".parse().unwrap()],
+            ..netbird_cfg()
+        };
+        assert!(invalid.validate().is_err());
+        let misplaced_canary = TunnelSidecarConfig {
+            wireguard_canary: Some("10.0.0.1".parse().unwrap()),
+            ..netbird_cfg()
+        };
+        assert!(misplaced_canary.validate().is_err());
     }
 
     #[test]
