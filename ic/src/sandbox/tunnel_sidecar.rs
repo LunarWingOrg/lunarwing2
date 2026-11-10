@@ -962,6 +962,12 @@ impl TunnelSidecar {
         self.cfg
             .validate()
             .map_err(|reason| SandboxError::Config { reason })?;
+        if self.cfg.auto_pull_image && !self.cfg.image().contains("@sha256:") {
+            tracing::warn!(
+                provider = self.cfg.provider.as_str(),
+                "Sandbox tunnel image is not digest-pinned and auto-pull is enabled; pin image@sha256:<digest>"
+            );
+        }
         let _ = self.tunnel_resolv_conf()?;
         let hash = self.current_hash().await?;
         if self.matching_container_id(&hash).await.is_some() {
