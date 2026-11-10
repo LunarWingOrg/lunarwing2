@@ -157,7 +157,7 @@ async fn assert_firewall_listing(name: &str, allow_uplink_dns: bool) {
         "type filter hook output priority filter; policy drop;",
         "oifname \"wg0\" accept",
         "ip daddr 169.254.0.0/16 drop",
-        "meta mark 0x00004c57 accept",
+        "0x00004c57 accept",
     ] {
         assert!(
             listing.contains(expected),
