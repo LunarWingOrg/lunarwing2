@@ -79,7 +79,11 @@ impl TunnelProvider {
 
     pub fn default_image(self) -> &'static str {
         match self {
-            Self::Netbird => "docker.io/netbirdio/netbird:latest",
+            // NetBird 0.82.0, OCI multi-architecture index. Keep the version in
+            // this comment and the digest in sync when upgrading the client.
+            Self::Netbird => {
+                "docker.io/netbirdio/netbird@sha256:eca5b274c635bfbb04ec6724a0712d1146190dd450eea199eeb83916fdd94965"
+            }
             Self::Wireguard => "localhost/lunarwing-tunnel-wireguard:latest",
         }
     }
@@ -145,13 +149,14 @@ impl TunnelSidecarConfig {
     /// A stable drift marker, never an authentication value. The salt is a
     /// random per-user secret kept in the private runtime directory, so the
     /// label published on the container is not a plain digest of the setup key
-    /// or of the WireGuard private key. WireGuard file contents are included so
-    /// rotating a private key recreates the sidecar.
-    pub fn config_hash(&self, salt: &[u8]) -> String {
+    /// or of the WireGuard private key. WireGuard file contents and the resolved
+    /// image ID are included so credential or image rotation recreates the sidecar.
+    pub fn config_hash(&self, salt: &[u8], image_id: &str) -> String {
         let mut hasher = Sha256::new();
         hash_field(&mut hasher, salt);
         hash_field(&mut hasher, self.provider.as_str().as_bytes());
         hash_field(&mut hasher, self.image().as_bytes());
+        hash_field(&mut hasher, image_id.as_bytes());
         hash_optional(&mut hasher, self.netbird_management_url.as_deref());
         hash_optional(
             &mut hasher,
@@ -183,9 +188,7 @@ impl TunnelSidecarConfig {
     }
 
     pub fn validate(&self) -> std::result::Result<(), String> {
-        if self.image().trim().is_empty() {
-            return Err("SANDBOX_TUNNEL_IMAGE must not be empty".into());
-        }
+        validate_image_reference(self.image())?;
         match self.provider {
             TunnelProvider::Netbird => self.validate_netbird(),
             TunnelProvider::Wireguard => {
@@ -232,6 +235,35 @@ impl TunnelSidecarConfig {
         }
         Ok(())
     }
+}
+
+fn valid_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_image_reference(image: &str) -> std::result::Result<(), String> {
+    if image.is_empty() || image.trim() != image {
+        return Err(
+            "SANDBOX_TUNNEL_IMAGE must not be empty or surround the reference with whitespace"
+                .into(),
+        );
+    }
+    if let Some((name, digest)) = image.split_once('@') {
+        let valid_digest = digest.strip_prefix("sha256:").is_some_and(valid_sha256_hex);
+        if name.is_empty() || !valid_digest {
+            return Err(
+                "SANDBOX_TUNNEL_IMAGE digest references must use image@sha256:<64 hex characters>"
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn parse_image_id(output: &str) -> Option<&str> {
+    let id = output.trim();
+    let hex = id.strip_prefix("sha256:").unwrap_or(id);
+    valid_sha256_hex(hex).then_some(id)
 }
 
 fn hash_field(hasher: &mut Sha256, value: &[u8]) {
@@ -660,7 +692,7 @@ impl TunnelSidecar {
         self.cfg
             .validate()
             .map_err(|reason| SandboxError::Config { reason })?;
-        let hash = self.label_hash()?;
+        let hash = self.current_hash().await?;
         if self.reuse_if_matching(&hash).await {
             match self.wait_healthy().await {
                 Ok(()) => return Ok(()),
@@ -677,7 +709,7 @@ impl TunnelSidecar {
 
     /// Recheck the transport and both firewall chains before every run.
     pub async fn ensure_healthy(&self) -> Result<()> {
-        let hash = self.label_hash()?;
+        let hash = self.current_hash().await?;
         if !self.reuse_if_matching(&hash).await {
             return Err(self.unavailable("sidecar is not running with the current configuration"));
         }
@@ -688,7 +720,6 @@ impl TunnelSidecar {
     }
 
     async fn start_fresh(&self, hash: &str) -> Result<()> {
-        self.ensure_image_available().await?;
         let state_volume = match self.cfg.provider {
             TunnelProvider::Netbird => {
                 let volume = self.cfg.netbird_state_volume(hash);
@@ -928,18 +959,42 @@ impl TunnelSidecar {
     }
 
     async fn ensure_image_available(&self) -> Result<()> {
-        if self.cfg.auto_pull_image {
+        if self
+            .status_probe(&["image", "inspect", self.cfg.image()])
+            .await
+            .is_some_and(|status| status.success())
+        {
             return Ok(());
         }
-        match self
-            .status_probe(&["image", "exists", self.cfg.image()])
-            .await
-        {
-            Some(status) if status.success() => Ok(()),
-            _ => Err(self.unavailable(
+        if !self.cfg.auto_pull_image {
+            return Err(self.unavailable(
                 "sidecar image is not present locally and SANDBOX_AUTO_PULL is false",
-            )),
+            ));
         }
+        let pulled = tokio::time::timeout(
+            self.cfg.startup_timeout,
+            crate::sandbox::cli_runner::output_isolated(self.bin, &["pull", self.cfg.image()]),
+        )
+        .await;
+        match pulled {
+            Ok(Ok(output)) if output.status.success() => Ok(()),
+            Ok(Ok(_)) => Err(self.unavailable("could not pull the sidecar image")),
+            Ok(Err(_)) => Err(self.unavailable("failed to execute the image pull")),
+            Err(_) => Err(self.unavailable("sidecar image pull exceeded the startup timeout")),
+        }
+    }
+
+    async fn resolve_image_id(&self) -> Result<String> {
+        let output = self
+            .output_probe(&["image", "inspect", "--format", "{{.Id}}", self.cfg.image()])
+            .await
+            .map_err(|_| self.unavailable("could not inspect the sidecar image"))?;
+        if !output.status.success() {
+            return Err(self.unavailable("could not inspect the sidecar image"));
+        }
+        parse_image_id(&String::from_utf8_lossy(&output.stdout))
+            .map(str::to_string)
+            .ok_or_else(|| self.unavailable("the runtime returned an invalid sidecar image ID"))
     }
 
     /// Remove NetBird state volumes left by earlier configurations (a rotated
@@ -987,11 +1042,13 @@ impl TunnelSidecar {
         }
     }
 
-    fn label_hash(&self) -> Result<String> {
+    async fn current_hash(&self) -> Result<String> {
+        self.ensure_image_available().await?;
+        let image_id = self.resolve_image_id().await?;
         let dir = secret_dir().map_err(|reason| self.unavailable(&reason))?;
         let salt = read_or_create_label_salt(&dir)
             .map_err(|_| self.unavailable("could not read or create the label salt"))?;
-        Ok(self.cfg.config_hash(&salt))
+        Ok(self.cfg.config_hash(&salt, &image_id))
     }
 
     /// Kill-and-remove the sidecar at once (`podman rm -f -t 0`; Docker's
@@ -1173,6 +1230,7 @@ mod tests {
     use super::*;
 
     const SALT: &[u8] = b"test-salt";
+    const IMAGE_ID: &str = "sha256:image-one";
 
     fn netbird_cfg() -> TunnelSidecarConfig {
         TunnelSidecarConfig {
@@ -1235,7 +1293,7 @@ mod tests {
         assert!("openvpn".parse::<TunnelProvider>().is_err());
         assert_eq!(
             TunnelProvider::Netbird.default_image(),
-            "docker.io/netbirdio/netbird:latest"
+            "docker.io/netbirdio/netbird@sha256:eca5b274c635bfbb04ec6724a0712d1146190dd450eea199eeb83916fdd94965"
         );
         assert_eq!(
             TunnelProvider::Wireguard.default_image(),
@@ -1271,7 +1329,9 @@ mod tests {
         // The image entrypoint runs `netbird up` itself; no dead argument.
         assert_eq!(
             args.last().map(String::as_str),
-            Some("docker.io/netbirdio/netbird:latest")
+            Some(
+                "docker.io/netbirdio/netbird@sha256:eca5b274c635bfbb04ec6724a0712d1146190dd450eea199eeb83916fdd94965"
+            )
         );
     }
 
@@ -1317,26 +1377,39 @@ mod tests {
     }
 
     #[test]
-    fn config_hash_is_salted_and_covers_rotation_and_wireguard_contents() {
+    fn config_hash_is_salted_and_covers_rotation_image_and_wireguard_contents() {
         let base = netbird_cfg();
         let rotated = TunnelSidecarConfig {
             netbird_setup_key: Some(SecretString::from("setup-key-2")),
             ..base.clone()
         };
-        assert_ne!(base.config_hash(SALT), rotated.config_hash(SALT));
-        assert_eq!(base.config_hash(SALT), netbird_cfg().config_hash(SALT));
-        assert_ne!(base.config_hash(SALT), base.config_hash(b"other-salt"));
+        assert_ne!(
+            base.config_hash(SALT, IMAGE_ID),
+            rotated.config_hash(SALT, IMAGE_ID)
+        );
+        assert_eq!(
+            base.config_hash(SALT, IMAGE_ID),
+            netbird_cfg().config_hash(SALT, IMAGE_ID)
+        );
+        assert_ne!(
+            base.config_hash(SALT, IMAGE_ID),
+            base.config_hash(b"other-salt", IMAGE_ID)
+        );
+        assert_ne!(
+            base.config_hash(SALT, IMAGE_ID),
+            base.config_hash(SALT, "sha256:image-two")
+        );
         // The published label is not a plain digest of the key material.
         let plain = format!("{:x}", Sha256::digest(b"setup-key-1"));
-        assert_ne!(base.config_hash(SALT), plain);
+        assert_ne!(base.config_hash(SALT, IMAGE_ID), plain);
 
         let dir = std::env::temp_dir().join(format!("lw-tunnel-hash-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("wg0.conf");
         std::fs::write(&path, "[Interface]\nPrivateKey = first\n").unwrap();
-        let first = wireguard_cfg(Some(path.clone())).config_hash(SALT);
+        let first = wireguard_cfg(Some(path.clone())).config_hash(SALT, IMAGE_ID);
         std::fs::write(&path, "[Interface]\nPrivateKey = second\n").unwrap();
-        let second = wireguard_cfg(Some(path)).config_hash(SALT);
+        let second = wireguard_cfg(Some(path)).config_hash(SALT, IMAGE_ID);
         assert_ne!(first, second);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1375,6 +1448,36 @@ mod tests {
             ..netbird_cfg()
         };
         assert!(missing.validate().unwrap_err().contains("SETUP_KEY"));
+    }
+
+    #[test]
+    fn image_digest_references_and_runtime_ids_are_validated() {
+        assert!(netbird_cfg().validate().is_ok());
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let pinned = TunnelSidecarConfig {
+            image: Some(format!("registry.example/netbird@{digest}")),
+            ..netbird_cfg()
+        };
+        assert!(pinned.validate().is_ok());
+        assert_eq!(parse_image_id(&digest), Some(digest.as_str()));
+        assert_eq!(
+            parse_image_id(&"b".repeat(64)),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        for invalid in [
+            "",
+            " netbird:latest",
+            "netbird@sha256:abc",
+            "netbird@sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            let cfg = TunnelSidecarConfig {
+                image: Some(invalid.into()),
+                ..netbird_cfg()
+            };
+            assert!(cfg.validate().is_err(), "accepted {invalid:?}");
+        }
+        assert_eq!(parse_image_id("not-an-image-id"), None);
     }
 
     #[test]
