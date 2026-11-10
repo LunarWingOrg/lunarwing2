@@ -194,12 +194,23 @@ impl TunnelSidecarConfig {
     }
 
     /// Named volume holding NetBird's peer identity and config across sidecar
-    /// restarts, scoped to one daemon instance and keyed by the config hash so
-    /// a rotated setup key enrols a fresh peer and the old volume is pruned.
-    pub fn netbird_state_volume(&self, instance_id: &str, hash: &str) -> String {
+    /// restarts. Only instance, management URL, or setup-key rotation enrols a
+    /// fresh peer; image, DNS, canary, and WireGuard changes retain the volume.
+    pub fn netbird_state_volume(&self, instance_id: &str, salt: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hash_field(&mut hasher, salt);
+        hash_field(&mut hasher, instance_id.as_bytes());
+        hash_optional(&mut hasher, self.netbird_management_url.as_deref());
+        hash_optional(
+            &mut hasher,
+            self.netbird_setup_key
+                .as_ref()
+                .map(|key| key.expose_secret()),
+        );
+        let identity = format!("{:x}", hasher.finalize());
         format!(
             "{SANDBOX_TUNNEL_CONTAINER}-{instance_id}-netbird-{}",
-            hash.get(..16).unwrap_or(hash)
+            identity.get(..16).unwrap_or(&identity)
         )
     }
 
@@ -877,8 +888,11 @@ impl TunnelSidecar {
         Ok(Some(path))
     }
 
-    fn netbird_state_volume(&self, hash: &str) -> String {
-        self.cfg.netbird_state_volume(&self.instance_id, hash)
+    fn netbird_state_volume(&self) -> Result<String> {
+        let dir = secret_dir().map_err(|reason| self.unavailable(&reason))?;
+        let salt = read_or_create_label_salt(&dir)
+            .map_err(|_| self.unavailable("could not read or create the label salt"))?;
+        Ok(self.cfg.netbird_state_volume(&self.instance_id, &salt))
     }
 
     fn netbird_state_volume_prefix(&self) -> String {
@@ -927,7 +941,7 @@ impl TunnelSidecar {
     async fn start_fresh(&self, hash: &str) -> Result<()> {
         let state_volume = match self.cfg.provider {
             TunnelProvider::Netbird => {
-                let volume = self.netbird_state_volume(hash);
+                let volume = self.netbird_state_volume()?;
                 self.prune_stale_netbird_volumes(&volume).await;
                 Some(volume)
             }
@@ -1671,8 +1685,8 @@ mod tests {
             container_name_for_instance(Path::new("/srv/one/state"))
         );
         let cfg = netbird_cfg();
-        let first_volume = cfg.netbird_state_volume("first-instance", "abcdef");
-        let second_volume = cfg.netbird_state_volume("second-instance", "abcdef");
+        let first_volume = cfg.netbird_state_volume("first-instance", SALT);
+        let second_volume = cfg.netbird_state_volume("second-instance", SALT);
         assert_ne!(first_volume, second_volume);
         assert!(first_volume.starts_with("lunarwing-sandbox-tunnel-first-instance-netbird-"));
     }
@@ -1716,17 +1730,34 @@ mod tests {
     }
 
     #[test]
-    fn netbird_state_volume_is_keyed_by_hash() {
+    fn netbird_state_volume_tracks_only_peer_identity() {
         let cfg = netbird_cfg();
-        let volume = cfg.netbird_state_volume("test-instance", "0123456789abcdef0123456789abcdef");
+        let volume = cfg.netbird_state_volume("test-instance", SALT);
+        assert!(volume.starts_with("lunarwing-sandbox-tunnel-test-instance-netbird-"));
+        let runtime_change = TunnelSidecarConfig {
+            image: Some("localhost/netbird:rotated".into()),
+            dns: vec!["100.100.0.53".parse().unwrap()],
+            ..cfg.clone()
+        };
         assert_eq!(
             volume,
-            "lunarwing-sandbox-tunnel-test-instance-netbird-0123456789abcdef"
+            runtime_change.netbird_state_volume("test-instance", SALT)
         );
-        assert_ne!(
-            volume,
-            cfg.netbird_state_volume("test-instance", "fedcba9876543210fedcba9876543210")
-        );
+        for identity_change in [
+            TunnelSidecarConfig {
+                netbird_management_url: Some("https://other.example.com".into()),
+                ..cfg.clone()
+            },
+            TunnelSidecarConfig {
+                netbird_setup_key: Some(SecretString::from("setup-key-2")),
+                ..cfg.clone()
+            },
+        ] {
+            assert_ne!(
+                volume,
+                identity_change.netbird_state_volume("test-instance", SALT)
+            );
+        }
     }
 
     #[test]
