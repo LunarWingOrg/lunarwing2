@@ -2,11 +2,11 @@
 
 This runbook moves one PostgreSQL-backed IronClaw instance into a tenant managed by `ic/scripts/lunarwing-mt-admin.sh`. Rehearse with a dump and copied state before the final cutover.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-27 (v2.1.3.0), 2026-10-01 (v2.1.4.0), 2026-10-04 (v2.1.5.0), and 2026-10-14 (v2.1.6.0).** Every referenced
+**Revalidated against source 2026-11-10 (v2.2.0.0).** Every referenced
 mt-admin subcommand (`add-tenant`, `list-tenants`, `status`, `stop-tenant`,
 `restore-tenant`, `build-tenant`, `start-tenant`, `doctor`, `restart-tenant`)
-was re-checked against the current script; the guarded restore path, state
-directory layout, and ports-registry guidance are current.
+matches the current script. The guarded restore path, required tenant LLM
+endpoint, state directory layout, and ports-registry guidance are current.
 
 For a single-instance target, see [`MIGRATE_IRONCLAW_TO_LUNARWING.md`](MIGRATE_IRONCLAW_TO_LUNARWING.md). For a libSQL source, see [`MIGRATE_IRONCLAW_LIBSQL_TO_MT.md`](MIGRATE_IRONCLAW_LIBSQL_TO_MT.md).
 
@@ -41,8 +41,14 @@ Create the target with the desired identity and feature flags. For example:
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <tenant> \
-  --xmpp-jid '<existing-or-new-jid>'
+  --xmpp-jid '<existing-or-new-jid>' \
+  --tensorzero-url 'https://tensorzero.example.com'
 ```
+
+Replace the example endpoint with the rehearsal tenant's reachable TensorZero
+gateway, or use `--llm-base-url <url>` / the documented fleet environment
+variables. Since v2.1.6.0 (WI#330), provisioning refuses to create tenant state
+without an explicit LLM endpoint; do not copy an older endpoint-free example.
 
 The docker/podman group is never added by default: rootless podman (the MT
 runtime) needs no group membership. Pass `--docker-group` in the command above
