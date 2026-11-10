@@ -214,9 +214,13 @@ dropped rather than routed. `wg-quick` policy routing, MTU, endpoint
 reachability and DNS remain operator responsibilities: `DNS =` in the config
 needs `openresolv` in the image. Without `SANDBOX_TUNNEL_DNS`, joined commands
 resolve names through the sidecar's runtime resolvers over the uplink (port 53
-only). Setting `SANDBOX_TUNNEL_DNS` passes `--dns` to both the sidecar and every
-joined run and removes the uplink DNS allowance entirely; use resolvers reachable
-through `wg0`, including for management/name resolution after reconnection.
+only). Setting `SANDBOX_TUNNEL_DNS` passes `--dns` to the sidecar and installs an
+atomically replaced, owner-only resolver file in the private runtime directory.
+Every joined run mounts that file read-only at `/etc/resolv.conf` because Podman
+and Docker reject `--dns` together with `--network container`. The file is
+refreshed on start and every health check and removed on shutdown. All uplink
+DNS rules are removed; use resolvers reachable through `wg0`, including for
+management/name resolution after reconnection.
 
 ## Rotation and lifecycle
 
