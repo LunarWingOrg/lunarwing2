@@ -1255,15 +1255,15 @@ fn classify_run_failure(stderr: &str, image: &str, exit_code: i64) -> Option<San
 const DEFAULT_CONTAINER_RUNTIME_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
 fn container_runtime_path(inherited: &str) -> String {
-    let mut path = inherited.to_string();
-    for directory in ["/usr/local/sbin", "/usr/sbin", "/sbin"] {
-        if !inherited.split(':').any(|part| part == directory) {
-            if !path.is_empty() {
-                path.push(':');
-            }
-            path.push_str(directory);
-        }
+    let missing = ["/usr/local/sbin", "/usr/sbin", "/sbin"]
+        .into_iter()
+        .filter(|directory| !inherited.split(':').any(|part| part == *directory))
+        .collect::<Vec<_>>();
+    let mut path = missing.join(":");
+    if !path.is_empty() && !inherited.is_empty() {
+        path.push(':');
     }
+    path.push_str(inherited);
     path
 }
 
@@ -2202,8 +2202,12 @@ mod tests {
             assert!(path.split(':').any(|part| part == directory));
         }
         let custom = container_runtime_path("/custom/bin:/usr/sbin");
-        assert!(custom.starts_with("/custom/bin:/usr/sbin:"));
+        assert_eq!(custom, "/usr/local/sbin:/sbin:/custom/bin:/usr/sbin");
         assert_eq!(custom.matches("/usr/sbin").count(), 1);
+        assert_eq!(
+            container_runtime_path("/usr/local/sbin:/usr/sbin:/sbin"),
+            "/usr/local/sbin:/usr/sbin:/sbin"
+        );
     }
 
     #[tokio::test]
