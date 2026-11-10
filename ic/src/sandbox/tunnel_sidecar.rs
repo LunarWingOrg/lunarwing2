@@ -672,6 +672,8 @@ fn canonical_nft_line(line: &str) -> String {
             && let Ok(value) = u32::from_str_radix(hex, 16)
         {
             out.push(format!("0x{value:x}{suffix}"));
+        } else if token == "domain" && out.last().map(String::as_str) == Some("dport") {
+            out.push("53".to_string());
         } else if token == "filter;" && out.last().map(String::as_str) == Some("priority") {
             out.push("0;".to_string());
         } else {
@@ -2028,6 +2030,10 @@ mod tests {
         assert_eq!(
             canonical_nft_line("mark 0x00004c57 accept"),
             "meta mark 0x4c57 accept"
+        );
+        assert_eq!(
+            canonical_nft_line("ip daddr 169.254.1.1 udp dport domain accept"),
+            "ip daddr 169.254.1.1 udp dport 53 accept"
         );
         assert_eq!(
             canonical_nft_line("type filter hook output priority filter; policy drop;"),
