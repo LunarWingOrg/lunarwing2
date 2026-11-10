@@ -8,6 +8,12 @@ lifecycle events, the capabilities document, image validation, Engine V2
 generated images and the `/quit` refusal. Client tokens (M2b) are not part of
 this version; every authenticated request uses the master credential.
 
+**Source revalidated 2026-11-10 for v2.2.0.0.** Capabilities, event names and
+wire limits match the current server and golden fixture. Live provider
+reasoning remains opt-in through `ENGINE_V2_STREAM_REASONING`; idle/interrupted
+V1 steer notes now arrive before the next request with explicit pre-turn
+framing (WI#584), as detailed below.
+
 Source anchors (locate by name; line numbers drift):
 
 | Area | Source |
@@ -449,6 +455,15 @@ too: the action's effects stand, the thread is not resumed, and the
 continuation finishes `interrupted`. Steer with
 `/steer <note>`; its acknowledgement is a `response` under the steer's id.
 Both count against the chat rate limit.
+
+On V1, an idle or interrupted note is drained while the next turn is constructed
+and inserted immediately before the new user request with explicit pre-turn
+framing, so the first provider request contains it in the correct order
+(WI#584). A live V1 turn instead receives it at the next iteration boundary.
+V2 persists idle notes on the conversation for its next foreground turn. After
+a V1 soft timeout, suppressed-response cleanup discards both pending messages
+and steer notes; clients must not replay those notes automatically as though
+the timed-out turn were still active.
 
 ## History
 
