@@ -156,7 +156,7 @@ hkdf = "0.12"
 hmac = "0.12"
 
 # SSH client (pure Rust, async)
-russh = { version = "0.62", default-features = false, features = ["flate2", "ring", "rsa"] }
+russh = { version = "0.62", default-features = false, features = ["flate2", "ring"] }
 
 # Cryptography utilities
 sha2 = "0.10"

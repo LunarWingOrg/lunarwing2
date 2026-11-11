@@ -61,8 +61,14 @@ pub(crate) fn parse_key(creds: &SSHCredentials) -> Result<PrivateKey> {
     let passphrase = creds.passphrase.as_ref().map(|s| s.expose_secret());
 
     // Use the internal format decoder - it's public in the crate root
-    russh::keys::decode_secret_key(&key_str, passphrase)
-        .map_err(|e| SshBridgeError::InvalidKeyFormat(format!("Key parse error: {}", e)))
+    let key = russh::keys::decode_secret_key(&key_str, passphrase)
+        .map_err(|e| SshBridgeError::InvalidKeyFormat(format!("Key parse error: {}", e)))?;
+    if matches!(key.algorithm(), russh::keys::Algorithm::Rsa { .. }) {
+        return Err(SshBridgeError::InvalidKeyFormat(
+            "RSA keys are not supported (use Ed25519 or ECDSA)".to_string(),
+        ));
+    }
+    Ok(key)
 }
 
 impl Agent for SshAgent {
@@ -256,9 +262,47 @@ impl SshAgentServer {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tempfile::TempDir;
+    use zeroize::Zeroizing;
+
+    const RSA_TEST_KEY: &str = concat!(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n", // no-secret-scan: upstream test fixture, not a credential; gitleaks:allow
+        "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\n",
+        "-----END OPENSSH PRIVATE KEY-----"
+    );
+
+    pub(crate) fn rsa_test_credentials() -> SSHCredentials {
+        SSHCredentials {
+            key_data: Zeroizing::new(RSA_TEST_KEY.as_bytes().to_vec()),
+            passphrase: None,
+        }
+    }
 
     #[tokio::test]
     async fn test_agent_server_start_stop() {
@@ -292,5 +336,18 @@ mod tests {
         }
         drop(server);
         assert!(!socket_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_agent_rejects_valid_rsa_key() {
+        let agent = SshAgent::new();
+        let result = agent
+            .add_key("rsa.example".to_string(), rsa_test_credentials())
+            .await;
+        assert!(
+            matches!(result, Err(SshBridgeError::InvalidKeyFormat(_))),
+            "got {result:?}"
+        );
+        assert!(agent.list_keys().await.is_empty());
     }
 }
