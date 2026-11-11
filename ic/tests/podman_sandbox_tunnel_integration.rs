@@ -762,6 +762,8 @@ async fn podman_tunnel_dead_peer_fails_fast_through_manager() {
         std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
             .expect("chmod 700");
     }
+    let previous_base_dir = std::env::var_os("LUNARWING_BASE_DIR");
+    let previous_runtime_dir = std::env::var_os("XDG_RUNTIME_DIR");
     // SAFETY: this gated binary runs its live tests serially; no other thread
     // reads these process-wide overrides while the manager is constructed.
     unsafe {
@@ -823,6 +825,20 @@ async fn podman_tunnel_dead_peer_fails_fast_through_manager() {
     }
     .await;
     manager.shutdown().await;
+    // SAFETY: restoration uses the same serial-live-test boundary as the
+    // overrides above, and runs before later Podman cases.
+    unsafe {
+        if let Some(value) = previous_base_dir {
+            std::env::set_var("LUNARWING_BASE_DIR", value);
+        } else {
+            std::env::remove_var("LUNARWING_BASE_DIR");
+        }
+        if let Some(value) = previous_runtime_dir {
+            std::env::set_var("XDG_RUNTIME_DIR", value);
+        } else {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+    }
     let _ = std::fs::remove_dir_all(&workdir);
     result.expect("dead-peer manager recovery, back-off, retry, and cancelled-start cleanup");
 }
