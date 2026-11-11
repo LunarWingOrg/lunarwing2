@@ -35,6 +35,8 @@ worker_task_health_command() {
     opencode|opencode2) printf '/usr/local/bin/bun --cwd /app /app/scripts/task_runner.ts --healthcheck %s\n' \
       /run/lunarwing-shared/runner/task-runner.sock ;;
     pebble) printf '/usr/local/bin/pebble4lunarwing task-runner-ping /run/lunarwing-shared/runner/task-runner.sock\n' ;;
+    lunardepth) printf '/usr/local/bin/node /app/scripts/lunardepth_task_runner.js --healthcheck %s\n' \
+      /run/lunarwing-shared/runner/task-runner.sock ;;
     *) die "unsupported external worker '$1'" ;;
   esac
 }
@@ -45,6 +47,7 @@ worker_bridge_uid() {
     kimi) printf '%s\n' "$KIMI_BRIDGE_UID" ;;
     opencode2) printf '%s\n' "$OPENCODE2_BRIDGE_UID" ;;
     pebble) printf '%s\n' "$PEBBLE_BRIDGE_UID" ;;
+    lunardepth) printf '%s\n' "$LUNARDEPTH_BRIDGE_UID" ;;
     *) die "unsupported external worker '$1'" ;;
   esac
 }
@@ -55,6 +58,7 @@ worker_task_uid() {
     kimi) printf '%s\n' "$KIMI_CONTAINER_UID" ;;
     opencode2) printf '%s\n' "$OPENCODE2_CONTAINER_UID" ;;
     pebble) printf '%s\n' "$PEBBLE_CONTAINER_UID" ;;
+    lunardepth) printf '%s\n' "$LUNARDEPTH_CONTAINER_UID" ;;
     *) die "unsupported external worker '$1'" ;;
   esac
 }
@@ -74,7 +78,7 @@ write_worker_task_runtime_env() {
 
 prepare_worker_task_study_mounts() {
   local name="$1" worker="$2"
-  [[ "$worker" == "opencode" || "$worker" == "opencode2" ]] || return 0
+  [[ "$worker" == "opencode" || "$worker" == "opencode2" || "$worker" == "lunardepth" ]] || return 0
   local home state allow_write
   home="$(tenant_study_notes_home "$name")"
   if [[ -n "$home" ]]; then
@@ -123,14 +127,24 @@ prepare_worker_task_launch() {
       kimi) TASK_USERNS_ARGS=(--userns "$KIMI_USERNS") ;;
       opencode2) TASK_USERNS_ARGS=(--userns "$OPENCODE2_USERNS") ;;
       pebble) TASK_USERNS_ARGS=(--userns "$PEBBLE_USERNS") ;;
+      lunardepth) TASK_USERNS_ARGS=(--userns "$LUNARDEPTH_USERNS") ;;
     esac
   fi
   TASK_RESTART_ARG=()
   [[ "$MT_ROOTLESS" == "true" ]] || TASK_RESTART_ARG=(--restart unless-stopped)
   TASK_ENV_FLAGS=()
   TASK_MOUNTS=()
+  WORKER_TASK_LAUNCH_CONTRACT=""
 
-  if [[ "$worker" == "kimi" ]]; then
+  if [[ "$worker" == "lunardepth" ]]; then
+    task_env="$env_dir/lunardepth-task.env"
+    [[ -f "$task_env" ]] || die "LunarDepth task env is missing; run configure-lunardepth $name first"
+    TASK_ENV_FLAGS=(--env-file "$task_env")
+    [[ -n "${LUNARDEPTH_OVERLAY_FILE:-}" && -f "$LUNARDEPTH_OVERLAY_FILE" ]] \
+      || die "LunarDepth effective overlay is missing; run configure-lunardepth $name first"
+    TASK_MOUNTS+=(-v "$LUNARDEPTH_OVERLAY_FILE:/run/lunardepth-config/lunarwing-lane.patch.yml:ro,z")
+    WORKER_TASK_LAUNCH_CONTRACT="overlay=$(sha256sum "$LUNARDEPTH_OVERLAY_FILE" | cut -d' ' -f1);task-env=$(sha256sum "$task_env" | cut -d' ' -f1);lunardepth-split-v1"
+  elif [[ "$worker" == "kimi" ]]; then
     runtime_env="$(write_kimi_runtime_env "$name")" || return 1
     task_env="$(write_worker_task_runtime_env "$name" "$runtime_env" "$env_dir/kimi-task-runtime.env")" || return 1
     TASK_ENV_FLAGS=(--env-file "$task_env")
@@ -154,7 +168,7 @@ prepare_worker_task_launch() {
     TASK_ENV_FLAGS+=(--env-file "$task_env")
   fi
 
-  if [[ "$worker" != "kimi" ]]; then
+  if [[ "$worker" != "kimi" && "$worker" != "lunardepth" ]]; then
     ssh_agent_dir="$(tenant_run_dir "$name")/ssh-agent"
     TASK_MOUNTS+=(-v "${ssh_agent_dir}:/tmp/ssh-agent:ro,z" -e SSH_AUTH_SOCK=/tmp/ssh-agent/ssh-agent.sock)
   fi
@@ -178,8 +192,11 @@ start_worker_task_container() {
   if _openrc_podman_uses_init_health; then
     health_args=(--no-healthcheck)
   fi
-  launch_contract="$(_worker_launch_contract "$name" "$image" "non-root-split-v2-runner-ping")"
+  local base_launch_contract="non-root-split-v2-runner-ping"
+  [[ -z "${WORKER_TASK_LAUNCH_CONTRACT:-}" ]] || base_launch_contract="$WORKER_TASK_LAUNCH_CONTRACT"
+  launch_contract="$(_worker_launch_contract "$name" "$image" "$base_launch_contract")"
   env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
+  [[ "$worker" != "lunardepth" ]] || env_file_for_hash="$(tenant_env_dir "$name")/lunardepth-task.env"
   worker_egress_reconcile_container "$name" "$task_container"
 
   if _ctr_inspect "$name" "$task_container" &>/dev/null; then
@@ -201,6 +218,8 @@ start_worker_task_container() {
 
   local -a mode_args=(--mode websocket)
   [[ "$worker" != "pebble" ]] || mode_args=()
+  local -a role_env=(-e LUNARWING_CONTAINER_ROLE=split-task -e WORKSPACE_ROOT=/workspace)
+  [[ "$worker" == "lunardepth" ]] || role_env+=(-e LUNARWING_TOOL_PROXY_DIR=/run/lunarwing-shared/tool-proxy)
   say "creating $worker task container $task_container"
   _ctr "$name" run -d \
     --name "$task_container" \
@@ -209,9 +228,7 @@ start_worker_task_container() {
     --user "${task_uid}:${task_gid}" \
     --security-opt no-new-privileges \
     --cap-drop ALL \
-    -e LUNARWING_CONTAINER_ROLE=split-task \
-    -e WORKSPACE_ROOT=/workspace \
-    -e LUNARWING_TOOL_PROXY_DIR=/run/lunarwing-shared/tool-proxy \
+    "${role_env[@]}" \
     "${env_ref[@]}" \
     "${mounts_ref[@]}" \
     "${TASK_WORKSPACE_ARGS[@]}" \
@@ -680,7 +697,7 @@ upgrade_external_worker_timeout() {
 # preserving the same untrusted-path boundary as the other config migrations.
 upgrade_external_worker_credentials() {
   local name="$1" worker="$2" config_path="$3" staged_in staged_out edit_status=0
-  [[ "$worker" == "opencode" || "$worker" == "opencode2" ]] || return 0
+  [[ "$worker" == "opencode" || "$worker" == "opencode2" || "$worker" == "lunardepth" ]] || return 0
   staged_in="$(mktemp)" || return 2
   if ! tenant_cat "$name" "$config_path" >"$staged_in"; then
     rm -f -- "$staged_in"
@@ -771,6 +788,10 @@ ensure_external_worker_config() {
   fi
   if [[ "$worker" == "opencode2" ]] && ! tenant_worker_enabled "$name" opencode2; then
     say "opencode2 worker not selected for $name (skipping external-worker config)"
+    return 0
+  fi
+  if [[ "$worker" == "lunardepth" ]] && ! tenant_worker_enabled "$name" lunardepth; then
+    say "LunarDepth worker not selected for $name (skipping external-worker config)"
     return 0
   fi
   state_dir="$(tenant_state_dir "$name")"
@@ -868,7 +889,7 @@ HDR
       printf 'auth_token = "%s"\n' "$auth_token"
     fi
     printf 'timeout_ms = %s\n' "$default_timeout_ms"
-    if [[ "$worker" == "opencode" || "$worker" == "opencode2" ]]; then
+    if [[ "$worker" == "opencode" || "$worker" == "opencode2" || "$worker" == "lunardepth" ]]; then
       printf 'supports_credentials = false\n'
     fi
   } >>"$staged_cfg"
