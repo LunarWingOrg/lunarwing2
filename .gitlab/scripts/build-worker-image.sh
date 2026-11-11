@@ -463,7 +463,7 @@ print_first_layer_file_diff() {
         return 0
     fi
     echo "INFO: first differing layer file hashes (at most 200 diff lines)" >&2
-    diff -u "$_file_tmp/candidate-files" "$_file_tmp/rebuild-files" | sed -n '1,200p' || true
+    diff -u "$_file_tmp/candidate-files" "$_file_tmp/rebuild-files" | sed -n '1,200p' >&2 || true
 }
 
 # Best-effort layer-level diagnosis for a candidate/rebuild digest mismatch
