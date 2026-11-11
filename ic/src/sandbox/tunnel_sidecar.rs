@@ -1006,6 +1006,36 @@ impl RecoveryState {
     }
 }
 
+#[derive(Default)]
+struct TunnelLifecycle {
+    state: tokio::sync::Mutex<RecoveryState>,
+    operation: tokio::sync::Mutex<()>,
+}
+
+static TUNNEL_LIFECYCLES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<TunnelLifecycle>>>,
+> = std::sync::OnceLock::new();
+
+fn lifecycle_for_container(container_name: &str) -> std::sync::Arc<TunnelLifecycle> {
+    let registry =
+        TUNNEL_LIFECYCLES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(lifecycle) = registry
+        .get(container_name)
+        .and_then(std::sync::Weak::upgrade)
+    {
+        return lifecycle;
+    }
+    let lifecycle = std::sync::Arc::new(TunnelLifecycle::default());
+    registry.insert(
+        container_name.to_string(),
+        std::sync::Arc::downgrade(&lifecycle),
+    );
+    lifecycle
+}
+
 #[derive(Clone)]
 pub struct TunnelSidecar {
     runtime: ContainerRuntime,
@@ -1015,7 +1045,9 @@ pub struct TunnelSidecar {
     runtime_dir: Option<PathBuf>,
     container_name: String,
     instance_id: String,
-    lifecycle: std::sync::Arc<tokio::sync::Mutex<RecoveryState>>,
+    lifecycle: std::sync::Arc<TunnelLifecycle>,
+    #[cfg(test)]
+    test_runtime: Option<crate::sandbox::cli_runner::TestRuntime>,
 }
 
 impl TunnelSidecar {
@@ -1051,16 +1083,29 @@ impl TunnelSidecar {
         base_dir: &Path,
         runtime_dir: Option<PathBuf>,
     ) -> Self {
+        let container_name = container_name_for_instance(base_dir);
+        let lifecycle = lifecycle_for_container(&container_name);
         Self {
             runtime,
             bin: runtime.binary(),
             cfg,
             base_dir: base_dir.to_path_buf(),
             runtime_dir,
-            container_name: container_name_for_instance(base_dir),
+            container_name,
             instance_id: instance_id_for(base_dir),
-            lifecycle: std::sync::Arc::new(tokio::sync::Mutex::new(RecoveryState::default())),
+            lifecycle,
+            #[cfg(test)]
+            test_runtime: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_runtime(
+        mut self,
+        runtime: crate::sandbox::cli_runner::TestRuntime,
+    ) -> Self {
+        self.test_runtime = Some(runtime);
+        self
     }
 
     pub fn container_name(&self) -> &str {
@@ -1192,7 +1237,7 @@ impl TunnelSidecar {
                         self.cfg.provider.as_str()
                     ),
                 };
-                self.lifecycle.lock().await.record(&error);
+                self.lifecycle.state.lock().await.record(&error);
                 Err(error.into_sandbox())
             }
         }
@@ -1208,7 +1253,7 @@ impl TunnelSidecar {
             .validate()
             .map_err(|reason| SandboxError::Config { reason })?;
         let receiver = {
-            let mut lifecycle = self.lifecycle.lock().await;
+            let mut lifecycle = self.lifecycle.state.lock().await;
             if let Some(reason) = lifecycle.cached_reason(tokio::time::Instant::now()) {
                 return Err(self.unavailable(&reason));
             }
@@ -1240,6 +1285,10 @@ impl TunnelSidecar {
         }
         let sidecar = self.clone();
         drop(tokio::spawn(async move {
+            // Keep the operation lock through completion. A cancellation cleanup
+            // queued by the dropped attempt is therefore ahead of the next start
+            // in this fair mutex's queue, never behind it.
+            let _operation = sidecar.lifecycle.operation.lock().await;
             let attempt = sidecar.start_or_adopt(reprobe_timeout, provider_timeout);
             let result = match budget {
                 Some(budget) => match tokio::time::timeout(budget, attempt).await {
@@ -1252,7 +1301,7 @@ impl TunnelSidecar {
                 None => attempt.await,
             };
             let result = result.map_err(|error| RecoveryError::from_sandbox(&error));
-            sidecar.lifecycle.lock().await.complete(&result);
+            sidecar.lifecycle.state.lock().await.complete(&result);
             sender.send_replace(Some(result));
         }));
     }
@@ -1290,7 +1339,7 @@ impl TunnelSidecar {
                 ),
             }
         }
-        self.remove().await;
+        self.remove_unlocked().await;
         self.start_fresh(&hash, provider_timeout).await
     }
 
@@ -1298,7 +1347,7 @@ impl TunnelSidecar {
     /// return the exact container ID whose namespace was verified.
     pub async fn ensure_healthy(&self) -> Result<String> {
         let (cached, recovering) = {
-            let lifecycle = self.lifecycle.lock().await;
+            let lifecycle = self.lifecycle.state.lock().await;
             (
                 lifecycle.cached_reason(tokio::time::Instant::now()),
                 lifecycle.active.is_some(),
@@ -1390,11 +1439,7 @@ impl TunnelSidecar {
         let start_timeout = self.cfg.startup_timeout.min(provider_timeout);
         let started = tokio::time::timeout(
             start_timeout,
-            crate::sandbox::cli_runner::output_detached_isolated(
-                self.bin,
-                &arg_refs,
-                &detached_unit,
-            ),
+            self.runtime_detached(&arg_refs, &detached_unit),
         )
         .await;
         drop(env_file);
@@ -1430,7 +1475,7 @@ impl TunnelSidecar {
         cleanup: &mut SidecarStartCleanup,
         error: SandboxError,
     ) -> SandboxError {
-        self.remove().await;
+        self.remove_unlocked().await;
         cleanup.disarm();
         error
     }
@@ -1466,7 +1511,7 @@ impl TunnelSidecar {
                     return match self.check_egress_firewall().await {
                         Ok(()) => Ok(()),
                         Err(error) => {
-                            self.remove().await;
+                            self.remove_unlocked().await;
                             Err(error)
                         }
                     };
@@ -1474,7 +1519,7 @@ impl TunnelSidecar {
                 Err(error) => error,
             };
             if tokio::time::Instant::now() >= deadline {
-                self.remove().await;
+                self.remove_unlocked().await;
                 return Err(self.error_with_context(
                     error,
                     &format!("sidecar remained unhealthy for {}s", timeout.as_secs()),
@@ -1696,7 +1741,7 @@ impl TunnelSidecar {
         }
         let pulled = tokio::time::timeout(
             self.cfg.startup_timeout,
-            crate::sandbox::cli_runner::output_isolated(self.bin, &["pull", self.cfg.image()]),
+            self.runtime_output(&["pull", self.cfg.image()], None),
         )
         .await;
         match pulled {
@@ -1741,23 +1786,66 @@ impl TunnelSidecar {
         }
     }
 
+    async fn runtime_status(&self, args: &[&str]) -> Option<std::process::ExitStatus> {
+        #[cfg(test)]
+        if let Some(runtime) = &self.test_runtime {
+            return runtime
+                .output(args, None)
+                .await
+                .ok()
+                .map(|output| output.status);
+        }
+        crate::sandbox::cli_runner::run_status_isolated(self.bin, args).await
+    }
+
+    async fn runtime_output(
+        &self,
+        args: &[&str],
+        stdin: Option<&[u8]>,
+    ) -> std::io::Result<std::process::Output> {
+        #[cfg(test)]
+        if let Some(runtime) = &self.test_runtime {
+            return runtime.output(args, stdin).await;
+        }
+        match stdin {
+            Some(input) => {
+                crate::sandbox::cli_runner::output_isolated_with_stdin(self.bin, args, input).await
+            }
+            None => crate::sandbox::cli_runner::output_isolated(self.bin, args).await,
+        }
+    }
+
+    async fn runtime_detached(
+        &self,
+        args: &[&str],
+        unit_name: &str,
+    ) -> std::io::Result<std::process::Output> {
+        #[cfg(test)]
+        if let Some(runtime) = &self.test_runtime {
+            return runtime.output(args, None).await;
+        }
+        crate::sandbox::cli_runner::output_detached_isolated(self.bin, args, unit_name).await
+    }
+
     async fn status_probe(&self, args: &[&str]) -> Option<std::process::ExitStatus> {
-        tokio::time::timeout(
-            PROBE_TIMEOUT,
-            crate::sandbox::cli_runner::run_status_isolated(self.bin, args),
-        )
-        .await
-        .ok()
-        .flatten()
+        tokio::time::timeout(PROBE_TIMEOUT, self.runtime_status(args))
+            .await
+            .ok()
+            .flatten()
     }
 
     async fn output_probe(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
-        tokio::time::timeout(
-            PROBE_TIMEOUT,
-            crate::sandbox::cli_runner::output_isolated(self.bin, args),
-        )
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "probe timed out"))?
+        self.output_probe_with_stdin(args, None).await
+    }
+
+    async fn output_probe_with_stdin(
+        &self,
+        args: &[&str],
+        stdin: Option<&[u8]>,
+    ) -> std::io::Result<std::process::Output> {
+        tokio::time::timeout(PROBE_TIMEOUT, self.runtime_output(args, stdin))
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "probe timed out"))?
     }
 
     fn unavailable(&self, detail: &str) -> SandboxError {
@@ -1777,12 +1865,22 @@ impl TunnelSidecar {
 
     /// Kill-and-remove only a sidecar carrying this instance's ownership label.
     pub async fn remove(&self) {
+        let _operation = self.lifecycle.operation.lock().await;
+        self.remove_unlocked().await;
+    }
+
+    async fn remove_unlocked(&self) {
         let _ = tokio::time::timeout(CLEANUP_TIMEOUT, self.remove_with_grace(0)).await;
         self.release_network_helper().await;
     }
 
     /// Stop the sidecar gracefully, then remove it if this instance owns it.
     pub async fn stop(&self) {
+        let _operation = self.lifecycle.operation.lock().await;
+        self.stop_unlocked().await;
+    }
+
+    async fn stop_unlocked(&self) {
         if tokio::time::timeout(CLEANUP_TIMEOUT, self.remove_with_grace(10))
             .await
             .ok()
@@ -1870,8 +1968,7 @@ impl TunnelSidecar {
         }
         for args in removal_commands(self.runtime, grace_secs, &self.container_name) {
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            if let Some(status) =
-                crate::sandbox::cli_runner::run_status_isolated(self.bin, &refs).await
+            if let Some(status) = self.runtime_status(&refs).await
                 && !status.success()
             {
                 tracing::debug!(
