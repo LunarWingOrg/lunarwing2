@@ -8,7 +8,7 @@ _lunardepth_renderer() {
 }
 
 _lunardepth_route() {
-  local name="$1" env_dir key
+  local name="$1" env_dir
   env_dir="$(tenant_env_dir "$name")"
   LUNARDEPTH_BASE_URL_RESOLVED="$(read_tenant_env_value "$name" "$env_dir/lunardepth.env" LUNARDEPTH_BASE_URL)"
   LUNARDEPTH_MODEL_RESOLVED="$(read_tenant_env_value "$name" "$env_dir/lunardepth.env" LUNARDEPTH_MODEL)"
@@ -172,7 +172,7 @@ build_lunardepth_worker() {
 }
 
 _verify_lunardepth_image_out_of_band() (
-  local image_ref="$1" source_root="$2" tmp cid archive config
+  local image_ref="$1" source_root="$2" tmp cid archive config _status
   tmp="$(mktemp -d /var/tmp/lw-lunardepth-oob.XXXXXX)" || return 1
   cid=''
   trap '_status=$?; [[ -z "$cid" ]] || "$CONTAINER_RT" rm -f "$cid" >/dev/null 2>&1 || true; rm -rf "$tmp"; exit "$_status"' EXIT
@@ -259,7 +259,8 @@ _start_lunardepth_imperative() {
   fi
   worker_egress_reconcile_container "$name" "$container_name"
   if _ctr_inspect "$name" "$container_name" &>/dev/null; then
-    local env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
+    local env_file_for_hash
+    env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
     if _container_config_changed "$name" "$container_name" "$env_file_for_hash" "$launch_contract"; then
       _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
       _ctr "$name" rm -f "$container_name" >/dev/null 2>&1 || true
@@ -284,7 +285,9 @@ _start_lunardepth_imperative() {
 _create_lunardepth_bridge() {
   local name="$1" launch_contract="$2" wss_port="$3"
   shift 3
-  local tenant_env_path="$(tenant_env_dir "$name")/lunarwing.env" worker_env_path="$(tenant_env_dir "$name")/lunardepth.env"
+  local tenant_env_path worker_env_path
+  tenant_env_path="$(tenant_env_dir "$name")/lunarwing.env"
+  worker_env_path="$(tenant_env_dir "$name")/lunardepth.env"
   local -a env_flags=() restart_arg=() health_publish=()
   local agent_token
   agent_token="$(resolve_worker_auth_token "$name" "$tenant_env_path")" || die "could not resolve the scoped worker credential"
@@ -323,7 +326,8 @@ _create_lunardepth_bridge() {
 }
 
 stop_tenant_lunardepth() {
-  local name="$1" container_name="lunarwing-lunardepth-$name"
+  local name="$1"
+  local container_name="lunarwing-lunardepth-$name"
   ensure_container_runtime
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "openrc" && -f "$OPENRC_INITD_DIR/${container_name}" ]]; then
