@@ -2533,6 +2533,11 @@ mod tests {
             "[Peer]\nPublicKey = public\nPrivateKey = wrong-section\n[Interface]\nAddress = 10.0.0.2/32\n",
         )
         .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let error = wireguard_cfg(Some(config.clone())).validate().unwrap_err();
         assert!(
             error.contains("needs a non-empty PrivateKey in [Interface]"),
