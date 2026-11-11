@@ -40,6 +40,7 @@ setpriv --reuid=10005 --regid=10005 --clear-groups --ambient-caps=-all --inh-cap
   LUNARDEPTH_BASE_URL=http://127.0.0.1:18080/openai/v1 \
   LUNARDEPTH_MODEL=tensormoon::function_name::lunarwing \
   LUNARDEPTH_API_KEY=lunardepth-build-smoke-only-not-a-secret \
+  LUNARDEPTH_EFFECTIVE_OVERLAY_SHA256="$(sha256sum /run/lunardepth-config/lunarwing-lane.patch.yml | cut -d' ' -f1)" \
   LUNARDEPTH_IMAGE_REVISION=da06c33b2091546dc38c61b95452ce27a4ce32d5 \
   /app/entrypoint.sh &
 TASK_PID=$!

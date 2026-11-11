@@ -33,14 +33,23 @@ verify_root_file() {
   [[ "$(stat -c '%u:%a' "$path")" == "0:$mode" ]] || die "unexpected owner/mode on $path"
 }
 
-verify_root_file "$OVERLAY" 444
+verify_effective_overlay() {
+  local expected="${LUNARDEPTH_EFFECTIVE_OVERLAY_SHA256:-}" actual
+  [[ -f "$OVERLAY" && ! -L "$OVERLAY" ]] || die "effective overlay must be a regular non-symlink file"
+  [[ "$(stat -c '%a' "$OVERLAY")" == "444" ]] || die "effective overlay must be mode 0444"
+  [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || die "effective overlay SHA-256 launch contract is required"
+  actual="$(sha256sum "$OVERLAY" | cut -d' ' -f1)"
+  [[ "$actual" == "$expected" ]] || die "effective overlay digest differs from its launch contract"
+}
+
+verify_effective_overlay
 verify_root_file "$APP_DIR/config/lunarwing-lane.patch.yml" 444
 verify_root_file "$APP_DIR/config/home-cordis.patch.yml" 444
 verify_root_file "$APP_DIR/config/home.env" 444
 verify_root_file "$TEMPLATE_ROOT/profiles/lunarwing-worker/package.json" 444
 verify_root_file "$TEMPLATE_ROOT/profiles/lunarwing-worker/cordis.patch.yml" 444
 verify_root_file "$TEMPLATE_ROOT/profiles/lunarwing-worker/pnpm-workspace.yaml" 444
-[[ "$(stat -c '%u:%a' "$(dirname "$OVERLAY")")" == "0:555" ]] || die "overlay directory must be root-owned mode 0555"
+[[ "$(stat -c '%a' "$(dirname "$OVERLAY")")" == "555" ]] || die "overlay directory must be mode 0555"
 [[ "$(stat -c '%u:%a' "$HOME")" == "0:555" ]] || die "harness HOME must be root-owned mode 0555"
 [[ -z "$(find "$HOME" -mindepth 1 -maxdepth 1 -print -quit)" ]] || die "harness HOME must remain empty"
 

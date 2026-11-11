@@ -42,6 +42,8 @@ class OverlayTests(unittest.TestCase):
             MODULE.validate_route("https://example.test/openai/v1", "other-model", False)
         with self.assertRaisesRegex(ValueError, "API root"):
             MODULE.validate_route("https://example.test/openai/v1/chat/completions", "tensormoon::x::lunarwing", False)
+        with self.assertRaisesRegex(ValueError, "whitespace or control"):
+            MODULE.validate_route("https://example.test/openai/v1\nPLANTED=value", "tensormoon::x::lunarwing", False)
 
     def test_atomic_mode_and_drift_check(self):
         with tempfile.TemporaryDirectory() as directory:

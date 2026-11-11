@@ -18,6 +18,8 @@ MODEL_PATTERN = re.compile(r"^tensormoon::[A-Za-z0-9_-]+::lunarwing$")
 def validate_route(base_url: str, model: str, allow_insecure: bool) -> None:
     if not MODEL_PATTERN.fullmatch(model):
         raise ValueError("model must have the tensormoon::<function_name>::lunarwing form")
+    if any(ord(character) < 0x21 or ord(character) == 0x7F for character in base_url):
+        raise ValueError("base URL must not contain whitespace or control characters")
     parsed = urlsplit(base_url)
     if parsed.scheme not in {"https", "http"} or not parsed.hostname:
         raise ValueError("base URL must be an absolute HTTP(S) URL")

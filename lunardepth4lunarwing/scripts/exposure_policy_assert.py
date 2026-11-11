@@ -51,6 +51,7 @@ def source_policy(root: Path) -> None:
         "LUNARDEPTH_MODEL_ROUTING_REF=8c610180c84a2f4c27fb2958e6e7dab9e48d476b",
         "LUNARDEPTH_PROFILE_SCHEMA_VERSION=unversioned", "DEBIAN_SNAPSHOT=20261105T082236Z",
         "build-exe-for-python-sdk.ts --deploy-to=/opt/lunardepth", "profile_template.js",
+        "musl-tools", "pnpm exec tsx native/system/scripts/build.ts", "--probe | grep -q 'fully enforced'",
         "RUN --network=none LUNARDEPTH_BUILD_SMOKE=1", "USER 10005:10005",
     ], "Dockerfile")
     if "USER 0:0" in dockerfile or "pnpm@9" in dockerfile:
@@ -61,9 +62,13 @@ def source_policy(root: Path) -> None:
         "export TMPDIR=/tmp TMP=/tmp TEMP=/tmp", "export WS_NO_BUFFER_UTIL=1 WS_NO_UTF_8_VALIDATE=1",
         "sessions|storages|attachments", "cp -a \"$TEMPLATE_ROOT/profiles/lunarwing-worker\"",
         "secrets.token_hex(32)", "render_overlay.py", "unset NODE_OPTIONS",
+        "LUNARDEPTH_EFFECTIVE_OVERLAY_SHA256", "effective overlay digest differs from its launch contract",
     ], "task setup")
     split = (root / "entrypoint-split.sh").read_text()
-    require(split, ["10005:10005", "10105:10005", "post-ready", "LUNARWING_WORKSPACE_ID"], "split entrypoint")
+    require(split, [
+        "10005:10005", "10105:10005", "post-ready", "LUNARWING_WORKSPACE_ID",
+        ". \"$APP_DIR/entrypoint-task-setup.sh\"",
+    ], "split entrypoint")
     bridge = (root / "scripts/lunarwing_bridge.ts").read_text()
     require(bridge, ["capabilities: []", "LUNARDEPTH_API_KEY", "LUNARDEPTH_LOCAL_AUTH_TOKEN"], "bridge")
     if "tool_proxy" in bridge or "tool-proxy" in bridge:
