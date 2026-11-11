@@ -1981,9 +1981,10 @@ impl TunnelSidecar {
             .unwrap_or_default();
         crate::tracing_fmt::register_log_secret(key);
         // NB_LOG_FILE=console: the image default also names a file under
-        // /var/log, which the read-only rootfs cannot hold.
+        // /var/log, which the read-only rootfs cannot hold. NetBird's own
+        // firewall would insert wt0 accepts into LunarWing's exact chains.
         let contents = SecretString::from(format!(
-            "NB_MANAGEMENT_URL={url}\nNB_SETUP_KEY={key}\nNB_LOG_FILE=console\n"
+            "NB_MANAGEMENT_URL={url}\nNB_SETUP_KEY={key}\nNB_LOG_FILE=console\nNB_DISABLE_FIREWALL=true\n"
         ));
         let dir = self.runtime_dir()?;
         SecretEnvFile::write(&dir, &contents)
