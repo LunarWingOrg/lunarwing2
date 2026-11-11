@@ -38,10 +38,9 @@ use crate::error::ConfigError;
 use crate::settings::Settings;
 
 // Re-export all public types so `crate::config::FooConfig` continues to work.
-pub(crate) use self::agent::clamp_pending_gate_expiry_secs;
+pub(crate) use self::agent::{clamp_pending_gate_expiry_secs, set_supervised_cli_override};
 pub use self::agent::{
     AgentConfig, LorebookConfig, ReflexConfig, SupervisedModeConfig, SupervisedModeSource,
-    set_supervised_cli_override,
 };
 pub use self::builder::BuilderModeConfig;
 pub use self::channels::{
