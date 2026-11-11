@@ -21,7 +21,7 @@ function packageManifest(path: string): Required<PackageManifest> {
 }
 
 function addLockedKey(key: string, allowed: Set<string>): void {
-  const normalized = key.replace(/^\//, "").split("(", 1)[0]
+  const normalized = key.replace(/^\//, "").split("(", 1)[0] ?? ""
   const separator = normalized.startsWith("@") ? normalized.indexOf("@", 1) : normalized.indexOf("@")
   if (separator <= 0) return
   const name = normalized.slice(0, separator)
