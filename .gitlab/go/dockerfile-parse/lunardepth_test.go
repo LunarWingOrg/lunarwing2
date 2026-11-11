@@ -52,8 +52,9 @@ func TestLunardepthStructuralFailures(t *testing.T) {
 		{"builder only smoke", strings.Replace(replaceLunardepthSmoke(t, valid, ""), "FROM docker.io/library/node:22.23.4-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS runtime", lunardepthSmoke+"\nFROM docker.io/library/node:22.23.4-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS runtime", 1), "final stage"},
 		{"shadowed source arg", strings.Replace(valid, "ARG LUNARDEPTH_REF\n", "ARG LUNARDEPTH_REF=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", 1), "stage ARG"},
 		{"deleted head provenance", strings.Replace(valid, "test \"$(git -C /src rev-parse HEAD)\" = \"$LUNARDEPTH_REF\"; \\\n", "", 1), "required input or assertion"},
-		{"ignored ownership assertion", strings.Replace(valid, "test -z \"$(find -L /app /opt/lunardepth /opt/lunardepth-templates \\( ! -uid 0 -o -perm /222 \\) -print)\"", "test -z \"$(find -L /app /opt/lunardepth /opt/lunardepth-templates \\( ! -uid 0 -o -perm /222 \\) -print)\" || true", 1), "forbidden value"},
+		{"ignored ownership assertion", strings.Replace(valid, "test -z \"$(find -L /app /opt/lunardepth /opt/lunardepth-templates \\( ! -uid 0 -o -perm /6222 \\) -print)\"", "test -z \"$(find -L /app /opt/lunardepth /opt/lunardepth-templates \\( ! -uid 0 -o -perm /6222 \\) -print)\" || true", 1), "forbidden value"},
 		{"unexpected shell", strings.Replace(valid, "SHELL [\"/bin/bash\", \"-o\", \"pipefail\", \"-c\"]", "SHELL [\"/bin/sh\", \"-c\"]", 1), "must pin bash pipefail"},
+		{"weakened ownership assertion", strings.Replace(valid, "-perm /6222", "-perm /222", 1), "required input or assertion"},
 		{"missing ownership assertion", strings.Replace(valid, "test -z \"$(find -L", "test -n \"$(find -L", 1), "required input or assertion"},
 	}
 	for _, test := range cases {
