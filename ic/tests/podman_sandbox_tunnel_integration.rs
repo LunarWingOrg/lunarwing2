@@ -1491,6 +1491,28 @@ async fn assert_netbird_peers_connected(primary: &str, peer: &str) -> Result<(),
     for _ in 0..30 {
         let primary_ip = netbird_ipv4(primary).await?;
         let peer_ip = netbird_ipv4(peer).await?;
+        let _ = podman_success(&[
+            "exec",
+            primary,
+            "ping",
+            "-c",
+            "1",
+            "-W",
+            "1",
+            &peer_ip.to_string(),
+        ])
+        .await;
+        let _ = podman_success(&[
+            "exec",
+            peer,
+            "ping",
+            "-c",
+            "1",
+            "-W",
+            "1",
+            &primary_ip.to_string(),
+        ])
+        .await;
         let primary_status = netbird_status_detail(primary).await?;
         let peer_status = netbird_status_detail(peer).await?;
         if status_has_connected_peer(&primary_status, peer_ip)
