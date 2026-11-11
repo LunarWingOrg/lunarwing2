@@ -241,5 +241,19 @@ These items come out of the 2026-11-10 reviews of items 5, 15, 17, 18 and 20. Ea
 
 28. [x] (S) Deploy the stoplight system for IRC
 29. [x] (S) Dive back in to LunarDepth and open worker lanes across the fleet for it get it running and up again patches too
+30. [x] (S) unassigned work items assign them
+31. [x] (S) RESERVED
+32. [x] (S) RESERVED
+33. [x] (S) RESERVED
+34. [x] (S) RESERVED
+35. [x] (S) RESERVED
+36. [x] (S) RESERVED
+37. [x] (S) RESERVED
+38. [x] (S) RESERVED
+39. [x] (S) RESERVED
+40. [x] (S) RESERVED
+41. [x] (S) RESERVED
+42. [x] (S) RESERVED
+
 
 ---
