@@ -529,10 +529,15 @@ sidecar image must already be in the tenant's container store (build it into
 the store the same way as the sandbox image). Prefer digest-pinned references;
 mutable references warn with auto-pull enabled. LunarWing also hashes the
 resolved local image ID so tag rotation cannot reuse stale credentials or
-network state. Sidecar names and NetBird volumes are instance-scoped, and the
-NetBird identity volume changes only with its management URL or setup key, not
-with image or DNS changes. NetBird live interoperability and local-DNS
-forwarding remain unvalidated in WI#600. Operator guide:
+network state. Sidecar names and NetBird volumes are instance-scoped. The
+NetBird identity hash uses a persistent 32-byte mode-`0600` salt at
+`<tenant-state>/sandbox-tunnel-identity.salt`, not the runtime-directory label
+salt, so host reboots, image changes, and DNS changes retain the peer;
+management URL or setup-key rotation changes it. The first start after the
+WI#602 fix re-enrols once under a new persistent-salt volume name and prunes the
+old instance-scoped volume, so plan one valid setup-key use and revoke the old
+peer. NetBird live interoperability and local-DNS forwarding remain unvalidated
+in WI#600. Operator guide:
 [`../guides/SANDBOX_TUNNEL_NETWORKING.md`](../guides/SANDBOX_TUNNEL_NETWORKING.md).
 
 ## Runtime Behavior
