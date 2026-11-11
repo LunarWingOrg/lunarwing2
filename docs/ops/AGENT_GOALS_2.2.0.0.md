@@ -77,7 +77,7 @@ Items 3, 4, 17, 25 and 26 cover the sandbox theme; items 5, 6 and 24 cover Lunar
     - **Design coverage:** immutable source provenance, Node `22.23.4` / pnpm `11.7.0` and the shared Debian snapshot; non-root `10005`/`10105` bridge/task identities; daemon → bridge → runner → task-loopback dispatch; explicit TensorMoon-compatible routing; WI#357 exposure and per-tenant egress controls; v18 ports; mt-admin build/start/upgrade/rollback on both init systems; protected candidate/verify/scan/promote jobs; and unit, image, CI, and gated live acceptance tests.
     - **Verified:** the purpose-built design audit passed **27 assertions**; Markdown fences, all eight referenced subsections, whitespace, and final newline passed; `python3 .gitlab/scripts/validate_config.py` passed **8 GitLab CI YAML files and local helper references**; and the proposal's committed diff passed `git diff HEAD^ --check`. No Rust build was needed for this docs-only item. No lane build, deployment, live confinement/inference, push, or new MR pipeline is claimed; those implementation and CI gates remain part 2.
     - **Merged 2026-11-11 via !2339 (`46811bae1`), recorded by the review session.** Before the merge, the review findings (ZC-1 to ZC-5, note 15301) and WI#605 were folded into the design as §2.3 (`9790773ca`). WI#605 is closed; its build half is WI#606 (item 24).
-6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/316, part 2: implement the LunarDepth worker lane per the design merged in item 5. Do not start before item 5 is merged and LunarDepth's own compatibility item (its item 9) has landed on its `master`. Exit criteria: the lane builds reproducibly at a pinned LunarDepth ref, passes `worker-exposure-policy-guard` and its own candidate and scan jobs in a green MR pipeline, and `docs/ops/WORKER-CONTAINERS.md` gains a LunarDepth section - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2329
+6. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/316, part 2: implement the LunarDepth worker lane per the design merged in item 5. Do not start before item 5 is merged and LunarDepth's own compatibility item (its item 9) has landed on its `master`. Exit criteria: the lane builds reproducibly at a pinned LunarDepth ref, passes `worker-exposure-policy-guard` and its own candidate and scan jobs in a green MR pipeline, and `docs/ops/WORKER-CONTAINERS.md` gains a LunarDepth section - last attempt was on https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/2329
    - **UNBLOCKED 2026-11-11, recorded by the review session.** Both prerequisites are met: item 5's design is on the target (`docs/proposals/LUNARDEPTH_WORKER_LANE.md`, !2339, merge `46811bae1`), and LunarDepth's compatibility item 9 landed on its `master` (`17aef23e0`, an ancestor of `da06c33b2`).
    - **Read first:** the design's §2.3, where the review findings (ZC-1 to ZC-5) and WI#605 are folded in. The design leaves three choices to this item, and each must be recorded: `tool-fs-search` disabled or the key exposure accepted (§7), the temp layout (§5.3), and the profile template produced at image build or at every start (§5.2). WI#606 (item 24) is part of this build.
    - **History:** BLOCKED twice on 2026-11-09 (SweetieBot), because the design was not merged and the compatibility item had not landed. !2338 held a third BLOCKED record and was closed on 2026-11-11 once the design merged. No lane code exists yet.
@@ -179,7 +179,7 @@ Items 3, 4, 17, 25 and 26 cover the sandbox theme; items 5, 6 and 24 cover Lunar
 
 These items come out of the 2026-11-10 reviews of items 5, 15, 17, 18 and 20. Each work item carries the evidence, the fix and its acceptance boxes; the specs below only say how the item fits with the others.
 
-21. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/368 (RUSTSEC-2023-0071, the `rsa` Marvin advisory accepted in `ic/deny.toml`)
+21. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/368 (RUSTSEC-2023-0071, the `rsa` Marvin advisory accepted in `ic/deny.toml`)
     - **Spec: scope.** Take one of the three options in the work item. Item 2's audit found that `rsa` 0.10.0 is now marked patched while `russh` 0.65.1 still pins `=0.10.0-rc.18`, so first check whether a newer `russh` has dropped that pin.
     - **Spec: if a bump is possible.** Go through `ic/scripts/refresh-vendor.sh`, remove the `ic/deny.toml` ignore, and keep every advisory gate green.
     - **Spec: if it is not.** Either an enforced RSA policy in the ssh tool, with tests, or a re-justified acceptance with a named owner and a re-check date. Do not widen the acceptance. Low priority: no RSA SSH keys are in use.
@@ -187,6 +187,7 @@ These items come out of the 2026-11-10 reviews of items 5, 15, 17, 18 and 20. Ea
     - **Policy and regressions:** feature removal alone still parsed a valid RSA OpenSSH fixture, so `parse_key` now rejects `Algorithm::Rsa` explicitly. The agent cannot insert RSA identities; built-in/WASM clients reject even mislabeled RSA material before connecting, which also closes worker/`ssh_git` exposure. Valid-key agent and pre-connect client regressions join the existing label guard. SSH architecture docs and `docs/ops/v2.2.0.0_CARGO_DENY_AUDIT.md` record the new uniform policy.
     - **Verified:** 38/38 bridge SSH and 19/19 built-in SSH/`ssh_git` tests; broader RSA filter 80/80; locked default `--all-targets` and `--all-features` checks; default clippy `-D warnings`; rustfmt; vendor-artifact guard; main cargo-deny, default-graph, and lockfile-only gates; policy/gate suites 23/23, 15/15, and 5/5; CI-pinned Gitleaks non-vendor and vendor scans all green. Initial auxiliary-suite failures were the host's `noexec` `/tmp`; rerunning with `TMPDIR` on the executable repo filesystem passed.
     - **BLOCKED BY:** today's advisory-db `31cf5a8673e10d3a4d7d829ad5095f47ed419049` adds unrelated RUSTSEC-2026-0486. `check-satellite-advisories.sh` has 25 roots green but fails frozen upstream `pebble/Cargo.lock` on `rustix 1.1.5` (patched 1.1.6); the pinned override separately has 1.1.4. This item does not rewrite Pebble-ref contracts or hide the finding with a new ignore. The checkbox deliberately remains unticked until that separate Pebble advisory is handled and the all-roots satellite gate is green.
+    - **TICKED 2026-11-11 by the review session, at the maintainer's order:** the blocker named above is cleared. `1700ba8d6` moved `rustix` to 1.1.6 in `pebble/Cargo.lock` (WI#610, part 1), and `satellite-advisory-sweep` is green again on target pipeline 7635 and on master pipeline 7640. !2356 merged as `9a69e8675`, and WI#368 is closed (note 15557). Follow-ups: item 48 (WI#616, RSA-only host keys) and item 45 (the rest of WI#610).
 22. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/575 and https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/590 (secret-history: what is left after item 18)
     - **Spec: state.** Item 18's implementation is on the target (!2343, `ffe2ce1c8`): `secret-history` is blocking, the baseline is commit-bound, and the scan script and `ci-config` enforce the pending list.
     - **Spec: scope.** The review findings still open on !2343 (note 15386): ZF-4, where new `ic/vendor/` findings are pinned by path prefix alone, and ZF-5. The checksum comparison the review first suggested for ZF-4 does not work, because an in-place vendor patch updates `.cargo-checksum.json` too; choose a policy and say why. Then go through the open acceptance boxes of both work items and record on each which are met.
@@ -241,5 +242,65 @@ These items come out of the 2026-11-10 reviews of items 5, 15, 17, 18 and 20. Ea
 
 28. [x] (S) Deploy the stoplight system for IRC
 29. [x] (S) Dive back in to LunarDepth and open worker lanes across the fleet for it get it running and up again patches too
+30. [x] (S) unassigned work items assign them
+31. [x] (S) RESERVED
+32. [x] (S) RESERVED
+33. [x] (S) RESERVED
+34. [x] (S) RESERVED
+35. [x] (S) RESERVED
+36. [x] (S) RESERVED
+37. [x] (S) RESERVED
+38. [x] (S) RESERVED
+39. [x] (S) RESERVED
+40. [x] (S) RESERVED
+41. [x] (S) RESERVED
+42. [x] (S) RESERVED
+
+
+## Phase 9 - Work items that had no goals line (ALWAYS READ ALL COMMENTS FOR EACH WORK ITEM WHEN A WORK ITEM IS REFERENCED - ALSO ALWAYS READ LINKED WORK ITEMS FOR EACH WORK ITEM REFERENCED)
+
+These twelve work items were open without a goals line on 2026-11-11. Nine were filed that day, most of them from reviews and CI; three are older. Each work item carries the evidence, the fix and its acceptance boxes; the specs below only say how the item fits with the others. Items 31 to 42 stay reserved.
+
+43. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/614 (sandbox tunnel: two first commands at once start two sidecars, and the firewall is reinstalled under a running command; Medium, security)
+    - **Spec: scope.** The fix steps in the work item: one start at a time in the manager, one lifecycle lock per container name, the firewall replaced in a single `nft -f` transaction, and no reinstall of a table that already verifies. Unit tests with a counting fake runtime.
+    - **Spec: fits with item 25.** WI#604's open point ZN-6 (cleanup by name, outside the lock) needs the same lock. Take it along, and say on WI#604 which of its points this MR closed.
+    - **Spec: care.** This is the sandbox's egress control. Run clippy with and without `--all-features`. The gated tunnel e2e needs a live rootless podman: record exactly what ran and what did not.
+44. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/596 (`upgrade-tenant` never rebuilds the managed sandbox image; Medium)
+    - **Spec: scope.** `upgrade-tenant` must bring a changed `ic/docker/sandbox.Dockerfile` to the tenant: rebuild when the inputs changed, do nothing when they did not, and leave the tenant on its previous image when the build fails. All three are acceptance points.
+    - **Spec: one decision.** The image tag is shared by every managed tenant on the host. Accept that and document it, or move to one tag per release: the work item gives both options (point 6). Record the choice on the work item.
+    - **Spec: both init systems.** systemd and OpenRC, through `ic/scripts/lunarwing-mt-admin.sh` only. Extend `ic/scripts/tests/test-mt-admin-sandbox-image.sh` and the upgrade harnesses, as the work item lists. Run a changed harness once in the image of CI's `shell-harnesses` job, as root, before the push: a pass on a developer host is not enough.
+45. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/610 (`satellite-advisory-sweep` and `rustix`: what is left after the `pebble/Cargo.lock` fix; Medium)
+    - **Spec: state.** Part 1 is on the target (`1700ba8d6`): `pebble/Cargo.lock` has `rustix` 1.1.6, and the sweep is green.
+    - **Spec: scope.** What the work item still lists: `rustix` 1.1.6 in `pebble4lunarwing/upstream/Cargo.lock`, with `rustix` and `fd-lock` in `ALLOWED_PACKAGES` and a new `PEBBLE_LOCK_SHA256`; the sweep prints the whole output of a failing root; and a decision on an advisory check for the override lock.
+    - **Spec: proof.** `ci-config` checks the digest and the allowlist on the MR. The locked Pebble build runs on protected refs only, so the first proof of the override is the master pipeline after the merge.
+46. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/618 (secret history: the baseline helper at a vendor bump; Low)
+    - **Spec: scope.** ZH-1 to ZH-4 in the work item: group unclassified vendor rows by crate and rule and write a draft accept file; one history scan for the two-step flow; a reminder in `ic/scripts/refresh-vendor.sh` and `AGENTS.md`; a scheduled `secret-history` run, or the reason why not; a durable place for dispositions.
+    - **Spec: confidentiality and order.** WI#575 is confidential: copy nothing from it into a file, a commit message or a public note. Do not pin or remove a pending row before item 27 has a result.
+47. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/615 (sandbox tunnel: a half-written identity salt file keeps the tunnel down; Low)
+    - **Spec: scope.** Write the salt to a temporary file, sync it and link it to the final name, so that the final name never holds a partial file. Open once without following symlinks and check on the handle. Name the file and the reason in the error. A damaged file stays refused: say in the guide how to recover and what it costs.
+    - **Spec: builds on item 26** (!2353, `22b42f580`). The three identity tests must still pass.
+48. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/616 (ssh tools: a server with only an RSA host key fails as `WrongServerSig`; Low)
+    - **Spec: scope.** Stop offering RSA host key algorithms in the client configuration, map the negotiation failure to an error that names the host key type, and say in both SSH documents and in the release notes that RSA host keys are not supported.
+    - **Spec: builds on item 21** (!2356, `9a69e8675`). `rsa` stays out of `ic/Cargo.lock`, and the advisory gates stay green. Low priority: no RSA SSH keys are in use.
+49. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/613 (`lunarwing service install`: no root refusal on systemd and launchd; Low)
+    - **Spec: scope.** One shared check for every install path: as root the installer stops unless `LUNARWING_ALLOW_ROOT_SERVICE=1`, on systemd and launchd as it already does on OpenRC. The setup wizard must not offer an install that would be refused. Decide the primary-gid-0 case for OpenRC.
+    - **Spec: both init systems stay first-class.** The OpenRC behaviour must not change except for the gid decision. Update `ic/src/setup/README.md` in the same MR.
+50. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/617 (supervised mode: no test covers the last hop to the foreground thread; Low)
+    - **Spec: scope.** A test that fails if the router passes anything but the resolved supervised-mode value to the foreground thread, or a builder that reads the value itself. The tests must leave the process environment and the CLI flag as they found them.
+    - **Spec: two decisions.** The work item carries two proposals left open on WI#607: an audit of other readers that use the bare environment, and a start-up warning for an override that nobody reads. Record a decision on each: done, a follow-up item, or declined with the reason.
+    - **Spec: care.** This is the approval control. Run clippy with and without `--all-features`.
+51. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/597 (Study Notes staleness sweep flags the same notes every day)
+    - **Spec: read note 15369 first.** It says the mechanism in the work item is not the cause and gives another: a note that is already stale is flagged again on every sweep, and nothing retires it.
+    - **Spec: scope.** Part of the fix belongs to the Study Notes MCP repository, not to this one. Fix what belongs here, and record on the work item what is left for the other repository. If nothing here has to change, say so there and recommend closing.
+52. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/612 (process tool: the test for the service-mode environment scrub cannot pass on any host; Low)
+    - **Spec: scope.** In `service_mode_workload_gets_exact_allowlisted_environment`, call `prepare_service()` before the stdio set-up and run `env` directly, not `sh -c env`. Give `podman_works_from_transient_service` the same order. Do not loosen the exact comparison.
+    - **Spec: where it runs.** CI has no systemd user manager and skips the test. Make the result visible: a variable that turns the skip into a failure plus a line in the testing guide, or a CI job with a user manager.
+53. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/595 (empty-stream retry budget counts the first attempt; Low)
+    - **Spec: scope.** Choose what happens to a billed-empty first attempt at or above the budget. Implement it, or decline it on the work item with the reason, and state it in `docs/proposals/ENGINE_LLM_STREAMING.md`. YH-3 and YH-4 are addressed or declined in the same change. Tests go in `ic/src/llm/retry.rs`.
+54. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/609 (worker upstream upgrades: kimi-code 2.5.3 and opencode v2.2.7)
+    - **Spec: timing.** Wait 24 hours after an upstream release before a lane switches to it. Both releases in the work item are from 2026-11-10, so that wait is over. Check first whether a newer stable has appeared since; if one has, the wait starts again for that release.
+    - **Spec: scope.** Both lanes in the work item. Re-verify every lane gate against the new upstream source; WI#582 is the worked example. Record that opencode v1 was checked again and is current.
+    - **Spec: proof.** `worker-exposure-policy-guard` and the MR pipeline on the MR; the protected candidate and scan jobs only after the merge.
+
 
 ---

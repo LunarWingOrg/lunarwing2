@@ -263,8 +263,9 @@ diff -u "$expected" "$calls"
 )
 
 # The verifier itself must start in isolated mode, where the script directory
-# is not on the import path.
-env -i PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 python3 -I \
+# is not on the import path. The interpreter is named by its full path, as
+# mt-admin does: the cleared PATH need not contain it (CI's is in /usr/local/bin).
+env -i PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 "$(command -v python3)" -I \
   "$SCRIPT_DIR/../../lunardepth4lunarwing/scripts/verify_exposure_out_of_band.py" --help >/dev/null
 
 # ── Kernel floor: full Landlock enforcement needs ABI 5, Linux 6.10 ──────────
