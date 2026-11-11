@@ -15,7 +15,9 @@
 # Licenses/sources policy stays with the ic workspace gate. The manifest-less
 # pebble4lunarwing/upstream lock is skipped here; its reviewed override delta
 # is gated by
-# pebble4lunarwing/scripts/verify_upstream_lock.py.
+# pebble4lunarwing/scripts/verify_upstream_lock.py. cargo-deny cannot audit a
+# lock without a manifest, so the override's own advisory scan is a tracked
+# follow-up (WI#626), not part of this sweep.
 set -euo pipefail
 
 repo_root=$(git rev-parse --show-toplevel)
