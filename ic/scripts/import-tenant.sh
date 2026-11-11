@@ -53,6 +53,8 @@ IMPORT_LUNARWING_KEYS=(
   XMPP_OMEMO_DEVICE_ID LLM_API_KEY LLM_MODEL NANOCODE_MODEL OPENCODE_MODEL KIMI_MODEL
   KIMI_API_KEY GOTIFY_URL GATEWAY_HOST MASCOT_ENABLED HTTP_HOST LLM_BASE_URL NANOCODE_BASE_URL
   OPENCODE_BASE_URL KIMI_BASE_URL
+  LUNARDEPTH_BASE_URL LUNARDEPTH_MODEL LUNARDEPTH_ALLOW_INSECURE_HTTP
+  LUNARDEPTH_ALLOW_PLACEHOLDER_KEY LUNARDEPTH_API_KEY
 )
 IMPORT_BRIDGE_KEYS=(
   XMPP_JID XMPP_PASSWORD XMPP_DM_POLICY XMPP_ALLOW_FROM_JSON
@@ -70,6 +72,13 @@ WITH_DOCKER_GROUP=false
 WITH_PEBBLE=false
 WITH_OPENCODE=false
 WITH_KIMI=false
+WITH_LUNARDEPTH=false
+LUNARDEPTH_MODEL=""
+LUNARDEPTH_BASE_URL=""
+LUNARDEPTH_API_KEY=""
+LUNARDEPTH_API_KEY_FILE=""
+LUNARDEPTH_ALLOW_INSECURE=false
+LUNARDEPTH_ALLOW_PLACEHOLDER=false
 WITH_TOOLCHAINS=false
 WITH_VISION=false
 OWNER_SCOPE=""
@@ -92,6 +101,12 @@ while [[ $# -gt 0 ]]; do
     --with-pebble)   WITH_PEBBLE=true; shift ;;
     --with-opencode)   WITH_OPENCODE=true; shift ;;
     --with-kimi)       WITH_KIMI=true; shift ;;
+    --with-lunardepth) WITH_LUNARDEPTH=true; shift ;;
+    --lunardepth-model) LUNARDEPTH_MODEL="$2"; shift 2 ;;
+    --lunardepth-base-url) LUNARDEPTH_BASE_URL="$2"; shift 2 ;;
+    --lunardepth-api-key-file) LUNARDEPTH_API_KEY_FILE="$2"; LUNARDEPTH_API_KEY="$(_read_secret_file "$2" "LunarDepth API key")"; shift 2 ;;
+    --lunardepth-allow-insecure-http) LUNARDEPTH_ALLOW_INSECURE=true; shift ;;
+    --lunardepth-allow-unauthenticated-gateway) LUNARDEPTH_ALLOW_PLACEHOLDER=true; shift ;;
     --with-toolchains) WITH_TOOLCHAINS=true; shift ;;
     --with-vision)     WITH_VISION=true; shift ;;
     --owner-scope)      OWNER_SCOPE="$2"; shift 2 ;;
@@ -106,6 +121,13 @@ done
 
 say()    { printf '%s\n' "$*"; }
 die()    { printf 'error: %s\n' "$*" >&2; exit 1; }
+_read_secret_file() {
+  local path="$1" value
+  [[ -f "$path" && ! -L "$path" ]] || die "secret file must be a regular non-symlink file: $2"
+  value="$(<"$path")"
+  [[ -n "$value" && "$value" != *$'\n'* && "$value" != *$'\r'* ]] || die "secret file must contain one nonempty line: $2"
+  printf '%s' "$value"
+}
 banner() { printf '\n========== %s ==========\n' "$*"; }
 note()   { printf '  · %s\n' "$*"; }
 confirm() { $AUTO_YES && return 0; local a; read -r -p "$1 [y/N] " a; [[ "$a" == y || "$a" == Y ]]; }
@@ -1008,6 +1030,12 @@ OPENCODE_BASE_URL="$(manifest_value OPENCODE_BASE_URL)"
 KIMI_MODEL="$(manifest_value KIMI_MODEL)"
 KIMI_BASE_URL="$(manifest_value KIMI_BASE_URL)"
 GOTIFY_URL="$(manifest_value GOTIFY_URL)"
+if $WITH_LUNARDEPTH; then
+  [[ -n "$LUNARDEPTH_BASE_URL" && -n "$LUNARDEPTH_MODEL" ]] \
+    || die "--with-lunardepth requires --lunardepth-base-url and --lunardepth-model"
+  [[ -n "$LUNARDEPTH_API_KEY" || "$LUNARDEPTH_ALLOW_PLACEHOLDER" == "true" ]] \
+    || die "--with-lunardepth requires --lunardepth-api-key-file or explicit --lunardepth-allow-unauthenticated-gateway"
+fi
 
 confirm "Stage tenant '$TENANT' on THIS host from the bundle?" || die "aborted by user"
 
@@ -1036,6 +1064,10 @@ $DARKIRC_ENABLED && add_args+=(--enable-darkirc --darkirc-scope-id "$DARKIRC_SCO
 $WITH_PEBBLE  && add_args+=(--with-pebble)
 $WITH_OPENCODE && add_args+=(--with-opencode)
 $WITH_KIMI && add_args+=(--with-kimi)
+$WITH_LUNARDEPTH && add_args+=(--with-lunardepth --lunardepth-model "$LUNARDEPTH_MODEL" --lunardepth-base-url "$LUNARDEPTH_BASE_URL")
+[[ -z "$LUNARDEPTH_API_KEY_FILE" ]] || add_args+=(--lunardepth-api-key-file "$LUNARDEPTH_API_KEY_FILE")
+[[ "$LUNARDEPTH_ALLOW_INSECURE" != "true" ]] || add_args+=(--lunardepth-allow-insecure-http)
+[[ "$LUNARDEPTH_ALLOW_PLACEHOLDER" != "true" ]] || add_args+=(--lunardepth-allow-unauthenticated-gateway)
 if $RESUME; then
   note "trusted matching partial import found; skipping add-tenant"
 else
@@ -1059,6 +1091,7 @@ build_args=(build-tenant "$TENANT" --with-wasm)
 $WITH_PEBBLE  && build_args+=(--with-pebble)
 $WITH_OPENCODE && build_args+=(--with-opencode)
 $WITH_KIMI && build_args+=(--with-kimi)
+$WITH_LUNARDEPTH && build_args+=(--with-lunardepth)
 $WITH_TOOLCHAINS && build_args+=(--with-toolchains)
 run "$MT" "${build_args[@]}"
 $WITH_VISION && run "$MT" build-vision-sidecar

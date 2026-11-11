@@ -60,7 +60,7 @@ fi
 if ! tenants="$(jq -er '
   .tenants // {} | to_entries[]
   | select((.value.workers.pebble == true) or (.value.workers.opencode == true)
-      or (.value.workers.opencode2 == true) or (.value.workers.kimi == true))
+      or (.value.workers.opencode2 == true) or (.value.workers.kimi == true) or (.value.workers.lunardepth == true))
   | .key
 ' "$TENANTS_FILE" 2>/dev/null)"; then
   issues+=("tenant registry is invalid; worker egress coverage is unknown")
@@ -193,7 +193,8 @@ running_worker_containers() {  # <tenant> — prints each running managed worker
   for container in "lunarwing-pebble-$tenant" "lunarwing-opencode-$tenant" \
                    "lunarwing-opencode2-$tenant" "lunarwing-kimi-$tenant" \
                    "lunarwing-pebble-task-$tenant" "lunarwing-opencode-task-$tenant" \
-                   "lunarwing-opencode2-task-$tenant" "lunarwing-kimi-task-$tenant"; do
+                   "lunarwing-opencode2-task-$tenant" "lunarwing-kimi-task-$tenant" \
+                   "lunarwing-lunardepth-$tenant" "lunarwing-lunardepth-task-$tenant"; do
     state="$(runtime_read "$tenant" inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" || continue
     [[ "$state" == "true" ]] && printf '%s\n' "$container"
   done

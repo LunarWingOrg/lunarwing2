@@ -1,0 +1,172 @@
+- id: lunarwing-worker
+  name: '@lunardepth/dsh-lunarwing-worker'
+  disabled: false
+  config:
+    host: 127.0.0.1
+    port: 19091
+    path: /ws/agent
+    authToken: !!js process.env.LUNARDEPTH_LOCAL_AUTH_TOKEN
+    workerId: lunardepth
+    workspaceRoot: /workspace
+    provider: tensormoon
+    model: tensormoon::function_name::lunarwing
+    maxFrameBytes: 16777216
+    maxOutputBytes: 15728640
+    maxProgressBytes: 65536
+    maxContextMessages: 12
+    maxContextCharsPerMessage: 2000
+    maxContextTotalChars: 12000
+    shutdownTimeoutMs: 10000
+
+- id: llm-pi-ai
+  name: '@lunardepth/dsh-llm-pi-ai'
+  disabled: false
+  config:
+    providers:
+      tensormoon:
+        displayName: TensorMoon
+        apiKeyEnv: LUNARDEPTH_API_KEY
+        api: openai-completions
+        baseURL: https://set-lunardepth-base-url.invalid/openai/v1
+        allowInsecureHTTP: false
+        models:
+          - id: tensormoon::function_name::lunarwing
+            name: LunarWing
+
+- id: agent-default-model
+  name: '@lunardepth/dsh-agent-default-model'
+  disabled: false
+  config:
+    provider: tensormoon
+    model: tensormoon::function_name::lunarwing
+
+- id: permission
+  name: '@lunardepth/dsh-permission-presets'
+  disabled: false
+  config:
+    presets:
+      workspace-write:
+        sandbox: workspace-write
+        approval: ask
+        name: workspace-write
+        description: Write inside the real task workspace and /tmp; wider retries require unavailable approval and fail closed.
+    defaultPreset: workspace-write
+
+- id: sandbox
+  name: '@lunardepth/dsh-sandbox-local'
+  disabled: false
+  config:
+    runnerCommand: []
+    runnerFailureSignatures: []
+    probeTimeoutMs: 5000
+
+- id: sandbox-policy
+  name: '@lunardepth/dsh-sandbox-policy'
+  disabled: false
+  config:
+    mode: workspace-write
+    workspaceRoot: /workspace
+
+- id: bash-sandbox
+  name: '@lunardepth/dsh-bash-sandbox'
+  disabled: false
+  config:
+    timeoutMs: 60000
+
+- id: approval
+  name: '@lunardepth/dsh-user-approval'
+  disabled: false
+  config:
+    policy: ask
+
+- id: tool-bash
+  name: '@lunardepth/dsh-tool-bash'
+  disabled: false
+
+- id: tool-fs
+  name: '@lunardepth/dsh-tool-fs'
+  disabled: false
+
+- id: fs-sandbox
+  name: '@lunardepth/dsh-fs-sandbox'
+  disabled: false
+
+- id: tool-fs-search
+  name: '@lunardepth/dsh-tool-fs-search'
+  disabled: true
+
+- id: ptc-runtime
+  name: '@lunardepth/dsh-ptc-runtime-node'
+  disabled: true
+
+- id: workflow-ptc
+  name: '@lunardepth/dsh-workflow-ptc'
+  disabled: true
+
+- id: session-title-llm
+  name: '@lunardepth/dsh-session-title-first-prompt-llm'
+  disabled: true
+
+- id: hmr
+  name: '@lunardepth/dsh-hmr'
+  disabled: true
+
+- id: plugin-manager
+  name: '@lunardepth/dsh-plugin-manager'
+  disabled: true
+
+- id: tool-plugin-manager
+  name: '@lunardepth/dsh-plugin-manager/tools'
+  disabled: true
+
+- id: settings
+  name: '@lunardepth/dsh-settings'
+  disabled: true
+
+- id: config-editor
+  name: '@lunardepth/dsh-config-editor'
+  disabled: true
+
+- id: session-telemetry-otel
+  name: '@lunardepth/dsh-session-telemetry-otel'
+  disabled: true
+
+- id: llm-deepseek
+  name: '@lunardepth/dsh-llm-deepseek-api-key'
+  disabled: true
+
+- id: deepseek-llm-api-extensions
+  name: '@lunardepth/dsh-deepseek-llm-api-extensions'
+  disabled: true
+
+- id: session-log-deepseek
+  name: '@lunardepth/dsh-session-log-deepseek'
+  disabled: true
+
+- id: plugin-package-inventory-deepseek
+  name: '@lunardepth/dsh-plugin-package-inventory-deepseek'
+  disabled: true
+
+- id: web
+  name: '@lunardepth/dsh-web'
+  disabled: true
+
+- id: web-search-deepseek
+  name: '@lunardepth/dsh-web-search-deepseek'
+  disabled: true
+
+- id: web-fetch-http
+  name: '@lunardepth/dsh-web-fetch-http'
+  disabled: true
+
+- id: tool-web
+  name: '@lunardepth/dsh-tool-web'
+  disabled: true
+
+- id: tool-subagent
+  name: '@lunardepth/dsh-tool-subagent'
+  disabled: true
+
+- id: tool-subagent-fork
+  name: '@lunardepth/dsh-tool-subagent'
+  disabled: true

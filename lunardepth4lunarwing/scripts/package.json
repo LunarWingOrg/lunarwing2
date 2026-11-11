@@ -1,0 +1,22 @@
+{
+  "name": "lunardepth4lunarwing-scripts",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "LunarWing split bridge and task runner for LunarDepth",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test --test-timeout=120000 effective_config_assert_test.js lunardepth_task_runner_test.js lunarwing_bridge_test.js lunarwing_runtime_test.js workspace_path_test.js"
+  },
+  "dependencies": {
+    "ws": "8.21.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}

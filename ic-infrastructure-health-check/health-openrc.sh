@@ -170,6 +170,7 @@ unit_tenant() {
         nanocode-*)          rest="${rest#nanocode-}" ;;
         opencode-*)          rest="${rest#opencode-}"; rest="${rest%-sup}" ;;
         opencode2-*)         rest="${rest#opencode2-}"; rest="${rest%-sup}" ;;
+        lunardepth-*)        rest="${rest#lunardepth-}"; rest="${rest%-sup}" ;;
         kimi-*)              rest="${rest#kimi-}"; rest="${rest%-sup}" ;;
         pebble-*)            rest="${rest#pebble-}"; rest="${rest%-sup}" ;;
         vision-*)            rest="${rest#vision-}"; rest="${rest%-sup}" ;;
@@ -235,6 +236,7 @@ worker_unit_intentionally_stopped() {
     lunarwing-pebble-*)    worker="pebble"; tenant="${svc#lunarwing-pebble-}" ;;
     lunarwing-opencode-*)  worker="opencode"; tenant="${svc#lunarwing-opencode-}" ;;
     lunarwing-opencode2-*) worker="opencode2"; tenant="${svc#lunarwing-opencode2-}" ;;
+    lunarwing-lunardepth-*) worker="lunardepth"; tenant="${svc#lunarwing-lunardepth-}" ;;
     lunarwing-kimi-*)      worker="kimi"; tenant="${svc#lunarwing-kimi-}" ;;
     *) return 1 ;;
   esac
