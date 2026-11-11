@@ -149,36 +149,7 @@ impl SandboxManager {
 
         *self.runner.write().await = Some(runner);
 
-        // Tunnel sidecar (WI#248): health-gated start before any run can join
-        // its namespace. Keep the handle after a failed start so its back-off
-        // also covers later commands; no run can join without a healthy gate.
-        let tunnel_start = if self.config.network == SandboxNetworkMode::Tunnel {
-            let tunnel_cfg = self
-                .config
-                .tunnel
-                .clone()
-                .ok_or_else(|| SandboxError::Config {
-                    reason: "SANDBOX_NETWORK=tunnel requires SANDBOX_TUNNEL_* settings \
-                         (see docs/guides/SANDBOX_TUNNEL_NETWORKING.md)"
-                        .to_string(),
-                })?;
-            let sidecar = TunnelSidecar::new(
-                self.runner
-                    .read()
-                    .await
-                    .as_ref()
-                    .map(|r| r.runtime())
-                    .ok_or_else(|| SandboxError::RuntimeNotAvailable {
-                        reason: "container runtime not initialized".to_string(),
-                    })?,
-                tunnel_cfg,
-            );
-            let startup = sidecar.recover_for_run().await;
-            *self.tunnel.write().await = Some(sidecar);
-            Some(startup)
-        } else {
-            None
-        };
+        let tunnel_start = self.initialize_tunnel().await;
 
         // Start the network proxy for the proxy-backed egress modes —
         // advisory and enforced both need the validating proxy. The tunnel
@@ -199,9 +170,7 @@ impl SandboxManager {
 
         self.initialized
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Some(startup) = tunnel_start {
-            startup?;
-        }
+        tunnel_start?;
 
         // Resolve the runtime name before the macro: the read guard's await
         // inside `tracing::info!` field position would make the future !Send.
@@ -214,6 +183,43 @@ impl SandboxManager {
             .unwrap_or("unknown");
         tracing::info!(runtime = runtime_bin, "Sandbox initialized");
         Ok(())
+    }
+
+    async fn initialize_tunnel(&self) -> Result<()> {
+        if self.config.network != SandboxNetworkMode::Tunnel {
+            return Ok(());
+        }
+        let sidecar = {
+            let mut tunnel = self.tunnel.write().await;
+            match tunnel.as_ref() {
+                Some(sidecar) => sidecar.clone(),
+                None => {
+                    let config =
+                        self.config
+                            .tunnel
+                            .clone()
+                            .ok_or_else(|| SandboxError::Config {
+                                reason:
+                                    "SANDBOX_NETWORK=tunnel requires SANDBOX_TUNNEL_* settings \
+                                 (see docs/guides/SANDBOX_TUNNEL_NETWORKING.md)"
+                                        .to_string(),
+                            })?;
+                    let runtime = self
+                        .runner
+                        .read()
+                        .await
+                        .as_ref()
+                        .map(|runner| runner.runtime())
+                        .ok_or_else(|| SandboxError::RuntimeNotAvailable {
+                            reason: "container runtime not initialized".to_string(),
+                        })?;
+                    let sidecar = TunnelSidecar::new(runtime, config);
+                    *tunnel = Some(sidecar.clone());
+                    sidecar
+                }
+            }
+        };
+        sidecar.ensure_started().await
     }
 
     /// Shutdown the sandbox (stop proxy and tunnel sidecar, clean up).
@@ -343,17 +349,7 @@ impl SandboxManager {
             // Join only the exact container ID that passed inspection. If a
             // concurrent recreation removes it, this run fails instead of
             // joining a new namespace before its firewall is installed.
-            let container_id = match sidecar.ensure_healthy().await {
-                Ok(id) => id,
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "Sandbox tunnel sidecar unhealthy; recreating it once before this run"
-                    );
-                    sidecar.recover_for_run().await?;
-                    sidecar.ensure_healthy().await?
-                }
-            };
+            let container_id = sidecar.container_for_run().await?;
             let dns = self
                 .config
                 .tunnel

@@ -931,9 +931,42 @@ fn wireguard_handshake_status(output: &str, now_unix: u64) -> std::result::Resul
     }
 }
 
+type RecoveryResult = std::result::Result<(), RecoveryError>;
+type RecoveryCompletion = Option<RecoveryResult>;
+
+#[derive(Clone, Debug)]
+enum RecoveryError {
+    Config { reason: String },
+    Unavailable { reason: String },
+}
+
+impl RecoveryError {
+    fn from_sandbox(error: &SandboxError) -> Self {
+        match error {
+            SandboxError::Config { reason } => Self::Config {
+                reason: reason.clone(),
+            },
+            SandboxError::TunnelUnavailable { reason } => Self::Unavailable {
+                reason: reason.clone(),
+            },
+            other => Self::Unavailable {
+                reason: other.to_string(),
+            },
+        }
+    }
+
+    fn into_sandbox(self) -> SandboxError {
+        match self {
+            Self::Config { reason } => SandboxError::Config { reason },
+            Self::Unavailable { reason } => SandboxError::TunnelUnavailable { reason },
+        }
+    }
+}
+
 #[derive(Default)]
 struct RecoveryState {
     last_failure: Option<RecoveryFailure>,
+    active: Option<tokio::sync::watch::Receiver<RecoveryCompletion>>,
 }
 
 struct RecoveryFailure {
@@ -955,12 +988,20 @@ impl RecoveryState {
         ))
     }
 
-    fn record(&mut self, error: &SandboxError) {
-        if let SandboxError::TunnelUnavailable { reason } = error {
+    fn record(&mut self, error: &RecoveryError) {
+        if let RecoveryError::Unavailable { reason } = error {
             self.last_failure = Some(RecoveryFailure {
                 failed_at: tokio::time::Instant::now(),
                 reason: reason.clone(),
             });
+        }
+    }
+
+    fn complete(&mut self, result: &RecoveryResult) {
+        self.active = None;
+        match result {
+            Ok(()) => self.last_failure = None,
+            Err(error) => self.record(error),
         }
     }
 }
@@ -1108,55 +1149,128 @@ impl TunnelSidecar {
     }
 
     /// Start the sidecar, or adopt a running one that carries our config hash
-    /// and passes the health gate. Explicit lifecycle operations retain the
-    /// configured startup budget; manager runs use `recover_for_run` instead.
+    /// and passes the health gate. Cold starts retain the configured budget.
     pub async fn ensure_started(&self) -> Result<()> {
         let timeout = self.cfg.startup_timeout;
-        self.ensure_started_with_timeouts(timeout, timeout).await
+        self.start_recovery(timeout, timeout, None).await
     }
 
-    /// Bounded recovery for a command path. A dropped start has its own cleanup
-    /// guard, and a failed attempt suppresses repeated container churn for 30s.
+    /// Bounded recovery for a command path. The sidecar owns the attempt, so a
+    /// cancelled caller cannot cancel its cleanup or lose the failure back-off.
     pub async fn recover_for_run(&self) -> Result<()> {
         let provider_timeout = self.cfg.startup_timeout.min(RUN_PROVIDER_READY_TIMEOUT);
-        let recovery =
-            self.ensure_started_with_timeouts(RUN_RECOVERY_REPROBE_TIMEOUT, provider_timeout);
-        match tokio::time::timeout(RUN_RECOVERY_BUDGET, recovery).await {
+        self.start_recovery(
+            RUN_RECOVERY_REPROBE_TIMEOUT,
+            provider_timeout,
+            Some(RUN_RECOVERY_BUDGET),
+        )
+        .await
+    }
+
+    /// Bound the initial health check, any recovery, and the final verification
+    /// together so image and runtime probes cannot add a second budget.
+    pub async fn container_for_run(&self) -> Result<String> {
+        let attempt = async {
+            match self.ensure_healthy().await {
+                Ok(container_id) => Ok(container_id),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "Sandbox tunnel sidecar unhealthy; using bounded recovery before this run"
+                    );
+                    self.recover_for_run().await?;
+                    self.ensure_healthy().await
+                }
+            }
+        };
+        match tokio::time::timeout(RUN_RECOVERY_BUDGET, attempt).await {
             Ok(result) => result,
             Err(_) => {
-                let error = self.unavailable(
-                    "sidecar recovery exceeded the 60s per-run budget while waiting for provider health or firewall verification",
-                );
+                let error = RecoveryError::Unavailable {
+                    reason: format!(
+                        "{} sidecar: health check and recovery exceeded the 60s per-run budget during image, runtime, provider, or firewall probes",
+                        self.cfg.provider.as_str()
+                    ),
+                };
                 self.lifecycle.lock().await.record(&error);
-                Err(error)
+                Err(error.into_sandbox())
             }
         }
     }
 
-    async fn ensure_started_with_timeouts(
+    async fn start_recovery(
         &self,
         reprobe_timeout: Duration,
         provider_timeout: Duration,
+        budget: Option<Duration>,
     ) -> Result<()> {
         self.cfg
             .validate()
             .map_err(|reason| SandboxError::Config { reason })?;
-        let mut lifecycle = self.lifecycle.lock().await;
-        if let Some(reason) = lifecycle.cached_reason(tokio::time::Instant::now()) {
-            return Err(self.unavailable(&reason));
-        }
-        lifecycle.last_failure = None;
+        let receiver = {
+            let mut lifecycle = self.lifecycle.lock().await;
+            if let Some(reason) = lifecycle.cached_reason(tokio::time::Instant::now()) {
+                return Err(self.unavailable(&reason));
+            }
+            if let Some(active) = &lifecycle.active {
+                active.clone()
+            } else {
+                lifecycle.last_failure = None;
+                let (sender, receiver) = tokio::sync::watch::channel(None);
+                lifecycle.active = Some(receiver.clone());
+                self.spawn_recovery(sender, reprobe_timeout, provider_timeout, budget);
+                receiver
+            }
+        };
+        self.await_recovery(receiver).await
+    }
+
+    fn spawn_recovery(
+        &self,
+        sender: tokio::sync::watch::Sender<RecoveryCompletion>,
+        reprobe_timeout: Duration,
+        provider_timeout: Duration,
+        budget: Option<Duration>,
+    ) {
         if self.cfg.auto_pull_image && !self.cfg.image().contains("@sha256:") {
             tracing::warn!(
                 provider = self.cfg.provider.as_str(),
                 "Sandbox tunnel image is not digest-pinned and auto-pull is enabled; pin image@sha256:<digest>"
             );
         }
-        let result = self.start_or_adopt(reprobe_timeout, provider_timeout).await;
-        if let Err(error) = &result {
-            lifecycle.record(error);
+        let sidecar = self.clone();
+        drop(tokio::spawn(async move {
+            let attempt = sidecar.start_or_adopt(reprobe_timeout, provider_timeout);
+            let result = match budget {
+                Some(budget) => match tokio::time::timeout(budget, attempt).await {
+                    Ok(result) => result,
+                    Err(_) => Err(sidecar.unavailable(&format!(
+                        "sidecar recovery exceeded the {}s per-run budget during image inspection/pull, runtime start, provider health, or firewall verification",
+                        budget.as_secs()
+                    ))),
+                },
+                None => attempt.await,
+            };
+            let result = result.map_err(|error| RecoveryError::from_sandbox(&error));
+            sidecar.lifecycle.lock().await.complete(&result);
+            sender.send_replace(Some(result));
+        }));
+    }
+
+    async fn await_recovery(
+        &self,
+        mut receiver: tokio::sync::watch::Receiver<RecoveryCompletion>,
+    ) -> Result<()> {
+        let completion = receiver
+            .wait_for(Option::is_some)
+            .await
+            .ok()
+            .and_then(|result| result.as_ref().cloned());
+        match completion {
+            Some(Ok(())) => Ok(()),
+            Some(Err(error)) => Err(error.into_sandbox()),
+            None => Err(self.unavailable("sidecar recovery ended without a result")),
         }
-        result
     }
 
     async fn start_or_adopt(
@@ -1183,13 +1297,18 @@ impl TunnelSidecar {
     /// Recheck the transport and both firewall chains before every run, then
     /// return the exact container ID whose namespace was verified.
     pub async fn ensure_healthy(&self) -> Result<String> {
-        let cached = self
-            .lifecycle
-            .lock()
-            .await
-            .cached_reason(tokio::time::Instant::now());
+        let (cached, recovering) = {
+            let lifecycle = self.lifecycle.lock().await;
+            (
+                lifecycle.cached_reason(tokio::time::Instant::now()),
+                lifecycle.active.is_some(),
+            )
+        };
         if let Some(reason) = cached {
             return Err(self.unavailable(&reason));
+        }
+        if recovering {
+            return Err(self.unavailable("sidecar recovery is in progress"));
         }
         let _ = self.tunnel_resolv_conf()?;
         let hash = self.current_hash().await?;
@@ -1324,10 +1443,16 @@ impl TunnelSidecar {
                 Err(error) => error,
             };
             if tokio::time::Instant::now() >= deadline {
-                return Err(self.error_with_context(
-                    error,
-                    &format!("provider remained unhealthy for {}s", timeout.as_secs()),
-                ));
+                let context = if timeout < self.cfg.startup_timeout {
+                    format!(
+                        "provider remained unhealthy for the {}s per-run cap; configured startup timeout is {}s",
+                        timeout.as_secs(),
+                        self.cfg.startup_timeout.as_secs()
+                    )
+                } else {
+                    format!("provider remained unhealthy for {}s", timeout.as_secs())
+                };
+                return Err(self.error_with_context(error, &context));
             }
             tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
         }
@@ -2617,7 +2742,7 @@ mod tests {
     #[test]
     fn recovery_backoff_preserves_the_probe_reason_and_expires() {
         let mut state = RecoveryState::default();
-        state.record(&SandboxError::TunnelUnavailable {
+        state.record(&RecoveryError::Unavailable {
             reason: "WireGuard handshake is 181s old".into(),
         });
         let failed_at = state.last_failure.as_ref().unwrap().failed_at;
@@ -2630,10 +2755,39 @@ mod tests {
         assert!(state.cached_reason(failed_at + RECOVERY_BACKOFF).is_none());
 
         let mut config_state = RecoveryState::default();
-        config_state.record(&SandboxError::Config {
+        config_state.record(&RecoveryError::Config {
             reason: "invalid configuration".into(),
         });
         assert!(config_state.cached_reason(failed_at).is_none());
+    }
+
+    #[tokio::test]
+    async fn recovery_completion_is_recorded_before_waiters_are_notified() {
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        let mut waiting = receiver.clone();
+        let mut state = RecoveryState::default();
+        state.active = Some(receiver);
+        let result = Err(RecoveryError::Unavailable {
+            reason: "dead peer".into(),
+        });
+
+        state.complete(&result);
+        assert!(state.active.is_none());
+        assert!(
+            state
+                .cached_reason(tokio::time::Instant::now())
+                .is_some_and(|reason| reason.contains("dead peer"))
+        );
+        sender.send_replace(Some(result));
+        let completed = waiting
+            .wait_for(Option::is_some)
+            .await
+            .ok()
+            .and_then(|result| result.as_ref().cloned());
+        assert!(matches!(
+            completed,
+            Some(Err(RecoveryError::Unavailable { reason })) if reason == "dead peer"
+        ));
     }
 
     #[test]
