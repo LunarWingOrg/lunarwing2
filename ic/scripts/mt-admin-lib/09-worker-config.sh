@@ -78,7 +78,7 @@ write_worker_task_runtime_env() {
 
 prepare_worker_task_study_mounts() {
   local name="$1" worker="$2"
-  [[ "$worker" == "opencode" || "$worker" == "opencode2" || "$worker" == "lunardepth" ]] || return 0
+  [[ "$worker" == "opencode" || "$worker" == "opencode2" ]] || return 0
   local home state allow_write
   home="$(tenant_study_notes_home "$name")"
   if [[ -n "$home" ]]; then
@@ -142,8 +142,13 @@ prepare_worker_task_launch() {
     TASK_ENV_FLAGS=(--env-file "$task_env")
     [[ -n "${LUNARDEPTH_OVERLAY_FILE:-}" && -f "$LUNARDEPTH_OVERLAY_FILE" ]] \
       || die "LunarDepth effective overlay is missing; run configure-lunardepth $name first"
-    TASK_MOUNTS+=(-v "$LUNARDEPTH_OVERLAY_FILE:/run/lunardepth-config/lunarwing-lane.patch.yml:ro,z")
-    WORKER_TASK_LAUNCH_CONTRACT="overlay=$(sha256sum "$LUNARDEPTH_OVERLAY_FILE" | cut -d' ' -f1);task-env=$(sha256sum "$task_env" | cut -d' ' -f1);lunardepth-split-v1"
+    local overlay_hash
+    overlay_hash="$(sha256sum "$LUNARDEPTH_OVERLAY_FILE" | cut -d' ' -f1)"
+    TASK_MOUNTS+=(
+      -v "$LUNARDEPTH_OVERLAY_FILE:/run/lunardepth-config/lunarwing-lane.patch.yml:ro,z"
+      -e "LUNARDEPTH_EFFECTIVE_OVERLAY_SHA256=$overlay_hash"
+    )
+    WORKER_TASK_LAUNCH_CONTRACT="overlay=$overlay_hash;task-env=$(sha256sum "$task_env" | cut -d' ' -f1);lunardepth-split-v1"
   elif [[ "$worker" == "kimi" ]]; then
     runtime_env="$(write_kimi_runtime_env "$name")" || return 1
     task_env="$(write_worker_task_runtime_env "$name" "$runtime_env" "$env_dir/kimi-task-runtime.env")" || return 1
@@ -2447,6 +2452,10 @@ prepare_worker_workspace() {
     pebble)
       container_uid="$PEBBLE_CONTAINER_UID"
       container_gid="$PEBBLE_CONTAINER_GID"
+      ;;
+    lunardepth)
+      container_uid="$LUNARDEPTH_CONTAINER_UID"
+      container_gid="$LUNARDEPTH_CONTAINER_GID"
       ;;
     *) die "unsupported private worker workspace: $worker" ;;
   esac
