@@ -121,6 +121,15 @@ pub struct Cli {
     pub supervised: bool,
 }
 
+impl Cli {
+    pub fn apply_agent_overrides(&self) {
+        if self.auto_approve {
+            crate::config::set_runtime_env("AGENT_AUTO_APPROVE_TOOLS", "true");
+        }
+        crate::config::set_supervised_cli_override(self.supervised);
+    }
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Run the agent (default if no subcommand given)
