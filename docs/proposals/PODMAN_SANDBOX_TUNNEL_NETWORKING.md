@@ -145,8 +145,14 @@ not application auth.
   directory, so the label is not a plain digest of key material.
   Credential/content/image rotation recreates the sidecar.
 - NetBird's peer identity volume uses a separate salted hash of only instance,
-  management URL, and setup key. Image and DNS changes retain the peer; URL/key
-  rotation enrols a fresh peer and prunes only that instance's previous volume.
+  management URL, and setup key. Its 32-byte identity salt is created
+  atomically as a regular, non-symlink mode-0600 file at
+  `<base>/sandbox-tunnel-identity.salt`; read/create failure is unavailable,
+  with no runtime-directory fallback. Image, DNS, runtime-directory, and host
+  reboot changes retain the peer; URL/key rotation enrols a fresh peer and
+  prunes only that instance's previous volume. Moving from the old runtime salt
+  computes a new name once, so upgrade requires one deliberate re-enrolment and
+  old-peer revocation rather than guessing how to adopt the old volume.
 - `SandboxManager::shutdown()` removes only the sidecar carrying this instance's
   ownership label (podman `rm -f -t`, Docker `stop` then `rm -f`). The normal
   daemon exit path does not call it, so docs do not claim automatic exit
