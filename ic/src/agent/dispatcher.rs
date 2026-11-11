@@ -2651,7 +2651,7 @@ mod tests {
                     max_actions_per_hour: None,
                     max_tool_iterations: max_iter,
                     auto_approve_tools: true,
-                supervised_mode: crate::config::SupervisedModeConfig::default(),
+                    supervised_mode: crate::config::SupervisedModeConfig::default(),
                     default_timezone: "UTC".to_string(),
                     max_tokens_per_job: 0,
                     handle_message_timeout: test_handle_message_timeout(),
