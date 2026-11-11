@@ -44,13 +44,20 @@ import tomllib
 # only its version/checksum lines change (same recipe as the rows above).
 # 2026-11-02: 0.13.6 fixes RUSTSEC-2026-0433 (quadratic parsing of nested
 # image wikilinks with ENABLE_WIKILINKS), with the same package-only delta.
+# 2026-11-11 (WI#610): rustix 1.1.4 -> 1.1.6 clears RUSTSEC-2026-0486
+# (xattr functions mark unwritten bytes as initialized when given a
+# zero-length buffer; affected >= 1.0.0, < 1.1.6). Re-pointing the `rustix`
+# edge also changes fd-lock's whole record, so both names join the allowlist;
+# no other package moves.
 ALLOWED_PACKAGES = {
     "chacha20",
     "clipboard-win",
+    "fd-lock",
     "pulldown-cmark",
     "quinn",
     "quinn-proto",
     "quinn-udp",
+    "rustix",
     "rustls",
     "rustls-webpki",
     "tokio",
