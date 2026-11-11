@@ -78,6 +78,7 @@ RUN set -eu; \
     pnpm exec tsx /build/scripts/verify_deployed_closure.ts /src/deepseek-harness /opt/lunardepth | tail -n 1 > /build/deployed-packages.sha256; \
     grep -Eq '^[0-9a-f]{64}$' /build/deployed-packages.sha256; \
     sed -i '/^  "prunedAt":/d' /opt/lunardepth/node_modules/.modules.yaml; \
+    sed -i '/^  "lastValidatedTimestamp":/d' /opt/lunardepth/node_modules/.pnpm-workspace-state-v1.json; \
     landlock="$(node -e "const {createRequire}=require('module'); const {dirname,join}=require('path'); const r=createRequire('/opt/lunardepth/node_modules/@lunardepth/dsh/package.json'); const pkg=r.resolve('@lunardepth/node-addon-system-linux-x64/package.json'); process.stdout.write(join(dirname(pkg),'bin','landlock-run'))")"; \
     test -x "$landlock"; \
     "$landlock" --probe | grep -q 'fully enforced'
