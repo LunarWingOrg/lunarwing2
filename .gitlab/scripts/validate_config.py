@@ -30,6 +30,7 @@ OPENCODE2_DOCKERFILE = ROOT / "opencode2.4lunarwing" / "Dockerfile"
 KIMI_DOCKERFILE = ROOT / "kimicode4lunarwing" / "Dockerfile"
 KIMI_CLI_LOCK = ROOT / "kimicode4lunarwing" / "kimi-cli" / "package-lock.json"
 PEBBLE_DOCKERFILE = ROOT / "pebble4lunarwing" / "Dockerfile"
+LUNARDEPTH_DOCKERFILE = ROOT / "lunardepth4lunarwing" / "Dockerfile"
 WORKER_BUILD_SCRIPT = ROOT / ".gitlab" / "scripts" / "build-worker-image.sh"
 DELIVERABLES = ROOT / ".gitlab" / "deliverables.json"
 TRIVY_IGNORE = ROOT / ".gitlab" / "trivy-ignore"
@@ -168,7 +169,7 @@ FULL_VALIDATION_JOBS = (
     "cargo-deny",
     "satellite-advisory-sweep",
 )
-WORKER_NAMES = ("pebble", "opencode", "opencode2", "kimi")
+WORKER_NAMES = ("pebble", "opencode", "opencode2", "kimi", "lunardepth")
 OPENCODE_BUILD_CONTEXTS = {
     "opencode": "opencode4lunarwing",
     "opencode2": "opencode2.4lunarwing",
@@ -488,6 +489,44 @@ def validate_opencode2_exposure_verify(merged: dict, errors: list[str]) -> None:
         errors.append("worker-opencode2-promote must hard-need the non-optional verify job")
 
 
+def validate_lunardepth_exposure_verify(merged: dict, errors: list[str]) -> None:
+    job = merged.get("worker-lunardepth-exposure-verify")
+    if not isinstance(job, dict):
+        errors.append("worker-lunardepth-exposure-verify is missing")
+        return
+    expected_image = image_name(merged.get(".worker-promotion", {}).get("image"))
+    if image_name(job.get("image")) != expected_image:
+        errors.append("worker-lunardepth-exposure-verify must use the promotion's pinned image")
+    if job.get("tags") != ["container-build"]:
+        errors.append("worker-lunardepth-exposure-verify must use the container-build runner")
+    if job.get("interruptible") is not False or job.get("retry") != 0:
+        errors.append("worker-lunardepth-exposure-verify must be non-interruptible with retry: 0")
+    if "allow_failure" in job and job["allow_failure"] is not False:
+        errors.append("worker-lunardepth-exposure-verify must never be optional")
+    rules = job.get("rules")
+    if not isinstance(rules, list) or len(rules) != 3 or rules[-1] != {"when": "never"}:
+        errors.append("worker-lunardepth-exposure-verify needs two protected rules and a final never")
+    if job.get("needs") != [{"job": "worker-lunardepth-candidate", "artifacts": True}]:
+        errors.append("worker-lunardepth-exposure-verify must download its exact candidate artifacts")
+    expected_script = [
+        "set -a; . ./worker-image.env; set +a",
+        "cd lunardepth4lunarwing/scripts",
+        "npm ci --ignore-scripts",
+        "npx tsc -p tsconfig.json",
+        "npm test",
+        "cd ../..",
+        "python3 .gitlab/scripts/verify-lunardepth-exposure-out-of-band.py",
+    ]
+    script = job.get("script")
+    if not isinstance(script, list) or len(script) != 8 or "lunardepth-rootfs.tar" not in script[0] or script[1:] != expected_script:
+        errors.append("worker-lunardepth-exposure-verify script drifted from its pinned checks")
+    candidate = merged.get("worker-lunardepth-candidate", {}).get("artifacts", {})
+    if "lunardepth-rootfs.tar" not in candidate.get("paths", []):
+        errors.append("worker-lunardepth-candidate must publish lunardepth-rootfs.tar")
+    if candidate.get("reports", {}).get("dotenv") != "worker-image.env":
+        errors.append("worker-lunardepth-candidate must retain its dotenv artifact")
+
+
 def validate_worker_publication(merged: dict, errors: list[str]) -> None:
     candidate = merged.get(".worker-candidate", {})
     promotion = merged.get(".worker-promotion", {})
@@ -537,7 +576,7 @@ def validate_worker_publication(merged: dict, errors: list[str]) -> None:
         ):
             if fragment not in helper_text:
                 errors.append(f"worker candidate helper lacks reproducibility control {fragment}")
-    for worker_dir in ("pebble4lunarwing", "opencode4lunarwing", "opencode2.4lunarwing", "kimicode4lunarwing"):
+    for worker_dir in ("pebble4lunarwing", "opencode4lunarwing", "opencode2.4lunarwing", "kimicode4lunarwing", "lunardepth4lunarwing"):
         dockerfile = (ROOT / worker_dir / "Dockerfile").read_text(encoding="utf-8")
         if "ARG SOURCE_REVISION" not in dockerfile or (
             'org.opencontainers.image.revision="${SOURCE_REVISION}"' not in dockerfile
@@ -579,6 +618,15 @@ def validate_worker_publication(merged: dict, errors: list[str]) -> None:
             expected_needs.add("worker-buildkit-parser-policy-guard")
             if {"job": "worker-buildkit-parser-policy-guard", "artifacts": False} not in needs:
                 errors.append("worker-opencode2-promote must hard-need the BuildKit parser guard")
+        if worker == "lunardepth":
+            expected_needs.update((
+                "worker-lunardepth-exposure-verify",
+                "worker-exposure-policy-guard",
+                "worker-buildkit-parser-policy-guard",
+            ))
+            for required in ("worker-exposure-policy-guard", "worker-buildkit-parser-policy-guard"):
+                if {"job": required, "artifacts": False} not in needs:
+                    errors.append(f"worker-lunardepth-promote must hard-need {required}")
         if needed_jobs != expected_needs:
             errors.append(f"{promotion_name} must need its exact candidate and scan")
         if not extends_template(merged.get(candidate_name), ".worker-candidate"):
@@ -590,6 +638,7 @@ def validate_worker_publication(merged: dict, errors: list[str]) -> None:
         ]:
             errors.append(f"{scan_name} must download artifacts from its exact candidate")
     validate_opencode2_exposure_verify(merged, errors)
+    validate_lunardepth_exposure_verify(merged, errors)
 
 
 def validate_buildkit_parser_go_version(job: dict, errors: list[str]) -> None:
@@ -670,6 +719,7 @@ def validate_buildkit_parser_guard(merged: dict, errors: list[str]) -> None:
             'test -z "$(gofmt -l main.go main_test.go)"',
             "go test ./...",
             "go run . ../../../opencode2.4lunarwing/Dockerfile",
+            "go run . ../../../lunardepth4lunarwing/Dockerfile",
         ],
     }
     for key, value in expected.items():
@@ -1361,6 +1411,23 @@ WORKER_TS_LANE_SCRIPTS = {
             "npm ci --ignore-scripts",
             "npx tsc -p tsconfig.json",
             "npm test",
+        ),
+    ),
+    "worker-lunardepth-ts": (
+        "$CI_NODE_IMAGE",
+        (
+            "mkdir -p /etc/ssl/certs",
+            "node -e 'require(\"fs\").writeFileSync(\"/etc/ssl/certs/ca-certificates.crt\", require(\"tls\").rootCertificates.join(\"\\n\") + \"\\n\")'",
+            "rm -f /etc/apt/sources.list.d/debian.sources",
+            "printf '%s\\n' \"deb https://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm main\" \"deb https://snapshot.debian.org/archive/debian/${CI_DEBIAN_SNAPSHOT}/ bookworm-updates main\" \"deb https://snapshot.debian.org/archive/debian-security/${CI_DEBIAN_SNAPSHOT}/ bookworm-security main\" > /etc/apt/sources.list",
+            "sh .gitlab/scripts/ci-apt-with-retry.sh ca-certificates python3",
+            "cd lunardepth4lunarwing/scripts",
+            "npm ci --ignore-scripts",
+            "npx tsc -p tsconfig.json",
+            "npm test",
+            "cd ..",
+            "python3 -m unittest discover -s scripts -p '*_test.py'",
+            "python3 health_server_test.py",
         ),
     ),
     "worker-opencode-ts": (
@@ -2257,6 +2324,49 @@ def validate_worker_versions(errors: list[str]) -> None:
             )
 
 
+def validate_lunardepth_versions(errors: list[str]) -> None:
+    dockerfile = LUNARDEPTH_DOCKERFILE.read_text(encoding="utf-8")
+    build_script = WORKER_BUILD_SCRIPT.read_text(encoding="utf-8")
+    block = worker_case_blocks(build_script).get("lunardepth")
+    expected = {
+        "LUNARDEPTH_REPOSITORY": "https://git.lunarwing.org/lunarwing/lunardepth.git",
+        "LUNARDEPTH_REF": "da06c33b2091546dc38c61b95452ce27a4ce32d5",
+        "LUNARDEPTH_COMPATIBILITY_REF": "17aef23e05cc074c8621d38d159d77d25cb348ca",
+        "LUNARDEPTH_MODEL_ROUTING_REF": "8c610180c84a2f4c27fb2958e6e7dab9e48d476b",
+        "LUNARDEPTH_PROFILE_SCHEMA_VERSION": "unversioned",
+    }
+    for name, value in expected.items():
+        if f"ARG {name}={value}" not in dockerfile:
+            errors.append(f"LunarDepth Dockerfile must declare {name}={value}")
+        if block is None or f"{name}={value}" not in block:
+            errors.append(f"build-worker-image.sh LunarDepth block must carry {name}={value}")
+    if block is None or "source_ref=da06c33b2091546dc38c61b95452ce27a4ce32d5" not in block:
+        errors.append("build-worker-image.sh LunarDepth source_ref must equal LUNARDEPTH_REF")
+    if "pnpm@11.7.0" not in dockerfile or "22.23.4-bookworm-slim" not in dockerfile:
+        errors.append("LunarDepth Node/pnpm pins drifted")
+    if "RUN --network=none LUNARDEPTH_BUILD_SMOKE=1" not in dockerfile:
+        errors.append("LunarDepth network-isolated split-role smoke is missing")
+    if "USER 10005:10005" not in dockerfile or "USER 0:0" in dockerfile:
+        errors.append("LunarDepth final identity must be non-root 10005:10005")
+    if not block:
+        return
+    input_match = re.search(r"input_files='([^']*)'", block, re.DOTALL)
+    if input_match is None:
+        errors.append("build-worker-image.sh LunarDepth input inventory is missing")
+        return
+    inputs = input_match.group(1).splitlines()
+    for path in inputs:
+        if not (ROOT / path).is_file():
+            errors.append(f"LunarDepth build input {path} is missing")
+    listed = set(inputs)
+    for path in (ROOT / "lunardepth4lunarwing/scripts").glob("*.ts"):
+        relative = path.relative_to(ROOT).as_posix()
+        if relative not in listed:
+            errors.append(f"LunarDepth TypeScript input {relative} is not in the build inventory")
+    if "lunardepth-rootfs.tar" not in build_script:
+        errors.append("LunarDepth candidate must export its rootfs")
+
+
 def proxy_tool_names_from_rust(text: str) -> set[str] | None:
     """Extract the daemon's PROXY_TOOL_ALLOWLIST entries; None when the const
     is not declared in the pinned shape (fail closed). Line comments inside
@@ -2739,7 +2849,7 @@ def validate_worker_snapshots(variables: dict[str, str], errors: list[str]) -> N
     if snapshot < minimum_snapshot:
         errors.append("CI_DEBIAN_SNAPSHOT predates the CVE-2026-109518 APT fixes")
     for dockerfile in (
-        KIMI_DOCKERFILE, PEBBLE_DOCKERFILE, OPENCODE_DOCKERFILE, OPENCODE2_DOCKERFILE,
+        KIMI_DOCKERFILE, PEBBLE_DOCKERFILE, OPENCODE_DOCKERFILE, OPENCODE2_DOCKERFILE, LUNARDEPTH_DOCKERFILE,
     ):
         if not dockerfile.is_file():
             errors.append(f"{dockerfile} missing; cannot cross-check CI_DEBIAN_SNAPSHOT")
@@ -2794,6 +2904,10 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
     cross_check_image_digest(
         variables, "CI_NODE_IMAGE", KIMI_DOCKERFILE, "library/node",
         "kimicode4lunarwing/Dockerfile", errors,
+    )
+    cross_check_image_digest(
+        variables, "CI_NODE_IMAGE", LUNARDEPTH_DOCKERFILE, "library/node",
+        "lunardepth4lunarwing/Dockerfile", errors,
     )
 
     # The worker-kimi-ts lane installs its python3 apt prerequisite inside
@@ -3089,6 +3203,7 @@ def main() -> int:
     validate_pebble_rust_lane(merged_config, errors)
     validate_cache_trust(merged_config, errors)
     validate_worker_versions(errors)
+    validate_lunardepth_versions(errors)
     validate_proxy_tool_set_sync(errors)
     validate_worker_input_manifest(errors)
     validate_trivy_ignore(errors)
