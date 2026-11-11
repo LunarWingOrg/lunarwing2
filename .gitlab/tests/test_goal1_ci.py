@@ -33,7 +33,7 @@ class WorkerSnapshotSecurityTests(unittest.TestCase):
             name: self.root / f"{name}.Dockerfile"
             for name in (
                 "KIMI_DOCKERFILE", "PEBBLE_DOCKERFILE",
-                "OPENCODE_DOCKERFILE", "OPENCODE2_DOCKERFILE",
+                "OPENCODE_DOCKERFILE", "OPENCODE2_DOCKERFILE", "LUNARDEPTH_DOCKERFILE",
             )
         }
         for path in self.dockerfiles.values():
@@ -1162,6 +1162,12 @@ class BunImageTieTests(unittest.TestCase):
             f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST} AS builder\n",
             encoding="utf-8",
         )
+        self.lunardepth_dockerfile = self.root / "Dockerfile.lunardepth"
+        self.lunardepth_dockerfile.write_text(
+            "ARG DEBIAN_SNAPSHOT=20260906T000000Z\n"
+            f"FROM docker.io/library/node:22-bookworm-slim@sha256:{self.OTHER_DIGEST} AS builder\n",
+            encoding="utf-8",
+        )
         pin = f"docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST}"
         self.variables = {
             "CI_LINT_IMAGE": f"docker.io/library/python:3.12@sha256:{self.OTHER_DIGEST}",
@@ -1190,6 +1196,7 @@ class BunImageTieTests(unittest.TestCase):
             OPENCODE_DOCKERFILE=self.dockerfile,
             OPENCODE2_DOCKERFILE=self.opencode2_dockerfile,
             KIMI_DOCKERFILE=self.kimi_dockerfile,
+            LUNARDEPTH_DOCKERFILE=self.lunardepth_dockerfile,
         ):
             config.validate_ci_tool_image_pins(self.merged, self.variables, errors)
         return errors
@@ -1294,6 +1301,12 @@ class NodeImageTieTests(unittest.TestCase):
             f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST} AS builder\n",
             encoding="utf-8",
         )
+        self.lunardepth_dockerfile = self.root / "Dockerfile.lunardepth"
+        self.lunardepth_dockerfile.write_text(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            f"FROM docker.io/library/node:22-bookworm-slim@sha256:{self.NODE_DIGEST} AS builder\n",
+            encoding="utf-8",
+        )
         self.variables = {
             "CI_LINT_IMAGE": f"docker.io/library/python:3.12@sha256:{self.OTHER_DIGEST}",
             "CI_RUST_IMAGE": f"docker.io/library/rust:1.96.1@sha256:{self.OTHER_DIGEST}",
@@ -1323,6 +1336,7 @@ class NodeImageTieTests(unittest.TestCase):
             OPENCODE_DOCKERFILE=self.opencode_dockerfile,
             OPENCODE2_DOCKERFILE=self.opencode2_dockerfile,
             KIMI_DOCKERFILE=self.dockerfile,
+            LUNARDEPTH_DOCKERFILE=self.lunardepth_dockerfile,
         ):
             config.validate_ci_tool_image_pins(self.merged, self.variables, errors)
         return errors
@@ -1439,6 +1453,12 @@ class DebianSnapshotTieTests(unittest.TestCase):
             f"FROM docker.io/oven/bun:debian@sha256:{self.BUN_DIGEST} AS builder\n",
             encoding="utf-8",
         )
+        self.lunardepth_dockerfile = self.root / "Dockerfile.lunardepth"
+        self.lunardepth_dockerfile.write_text(
+            f"ARG DEBIAN_SNAPSHOT={self.SNAPSHOT}\n"
+            f"FROM docker.io/library/node:22-bookworm-slim@sha256:{self.NODE_DIGEST} AS builder\n",
+            encoding="utf-8",
+        )
         self.variables = {
             "CI_LINT_IMAGE": f"docker.io/library/python:3.12@sha256:{self.OTHER_DIGEST}",
             "CI_RUST_IMAGE": f"docker.io/library/rust:1.96.1@sha256:{self.OTHER_DIGEST}",
@@ -1469,6 +1489,7 @@ class DebianSnapshotTieTests(unittest.TestCase):
             OPENCODE_DOCKERFILE=self.opencode_dockerfile,
             OPENCODE2_DOCKERFILE=self.opencode2_dockerfile,
             KIMI_DOCKERFILE=self.dockerfile,
+            LUNARDEPTH_DOCKERFILE=self.lunardepth_dockerfile,
         ):
             config.validate_ci_tool_image_pins(self.merged, self.variables, errors)
         return errors
