@@ -78,6 +78,7 @@ func lunardepthInputPolicy(lines []parsedLine, text string) error {
 		"test \"$(git -C /src rev-parse HEAD)\" = \"$LUNARDEPTH_REF\"",
 		"git -C /src merge-base --is-ancestor \"$LUNARDEPTH_COMPATIBILITY_REF\" \"$LUNARDEPTH_REF\"",
 		"git -C /src merge-base --is-ancestor \"$LUNARDEPTH_MODEL_ROUTING_REF\" \"$LUNARDEPTH_REF\"",
+		"grep -q 'tensormoon' /src/deepseek-harness/packages/bundle/base/cordis.patch.yml",
 		"pnpm exec tsx native/system/scripts/build.ts",
 		"build-exe-for-python-sdk.ts --deploy-to=/opt/lunardepth",
 		"profile_template.js /opt/lunardepth /opt/lunardepth-templates",

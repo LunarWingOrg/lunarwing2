@@ -44,12 +44,13 @@ RUN set -eu; \
     git -C /src merge-base --is-ancestor "$LUNARDEPTH_MODEL_ROUTING_REF" "$LUNARDEPTH_REF"; \
     for path in scripts/check-toolchain.mjs deepseek-harness/package.json deepseek-harness/pnpm-lock.yaml \
       deepseek-harness/scripts/build-exe-for-python-sdk.ts deepseek-harness/packages/api/lunarwing-worker \
-      deepseek-harness/packages/bundle/lunarwing-worker deepseek-harness/packages/llm/llm-pi-ai/src/config.ts; do \
+      deepseek-harness/packages/bundle/lunarwing-worker deepseek-harness/packages/llm/llm-pi-ai/src/config.ts \
+      deepseek-harness/packages/bundle/base/cordis.patch.yml; do \
       test -e "/src/$path"; \
     done; \
     test "$(node -p "require('/src/deepseek-harness/package.json').packageManager")" = "pnpm@11.7.0"; \
     grep -q 'allowInsecureHTTP' /src/deepseek-harness/packages/llm/llm-pi-ai/src/config.ts; \
-    grep -q 'tensormoon' /src/deepseek-harness/packages/llm/llm-pi-ai/src/config.ts; \
+    grep -q 'tensormoon' /src/deepseek-harness/packages/bundle/base/cordis.patch.yml; \
     corepack enable; \
     corepack prepare pnpm@11.7.0 --activate; \
     test "$(pnpm --version)" = "11.7.0"; \
