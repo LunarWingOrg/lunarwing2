@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 use crate::config::helpers::{optional_env, parse_bool_env, parse_optional_env, parse_string_env};
@@ -62,7 +63,34 @@ pub struct SandboxTunnelModeConfig {
     pub netbird_management_url: Option<String>,
     pub netbird_setup_key: Option<SecretString>,
     pub wireguard_config: Option<PathBuf>,
+    pub dns: Vec<IpAddr>,
+    pub wireguard_canary: Option<IpAddr>,
     pub startup_timeout_secs: Option<u64>,
+}
+
+fn parse_ip_value(key: &str, value: &str) -> Result<IpAddr, ConfigError> {
+    value.parse().map_err(|_| ConfigError::InvalidValue {
+        key: key.to_string(),
+        message: "must contain only valid IPv4 or IPv6 addresses".to_string(),
+    })
+}
+
+fn parse_optional_ip_env(key: &str) -> Result<Option<IpAddr>, ConfigError> {
+    optional_env(key)?
+        .map(|value| parse_ip_value(key, &value))
+        .transpose()
+}
+
+fn parse_ip_list_env(key: &str) -> Result<Vec<IpAddr>, ConfigError> {
+    optional_env(key)?
+        .map(|value| {
+            value
+                .split(',')
+                .map(|entry| parse_ip_value(key, entry.trim()))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()
+        .map(Option::unwrap_or_default)
 }
 
 impl SandboxTunnelModeConfig {
@@ -74,6 +102,8 @@ impl SandboxTunnelModeConfig {
             netbird_setup_key: optional_env("SANDBOX_TUNNEL_NETBIRD_SETUP_KEY")?
                 .map(SecretString::from),
             wireguard_config: optional_env("SANDBOX_TUNNEL_WIREGUARD_CONFIG")?.map(PathBuf::from),
+            dns: parse_ip_list_env("SANDBOX_TUNNEL_DNS")?,
+            wireguard_canary: parse_optional_ip_env("SANDBOX_TUNNEL_WIREGUARD_CANARY")?,
             startup_timeout_secs: optional_env("SANDBOX_TUNNEL_STARTUP_TIMEOUT_SECS")?
                 .map(|value| {
                     value.parse::<u64>().map_err(|_| ConfigError::InvalidValue {
@@ -104,6 +134,8 @@ impl SandboxTunnelModeConfig {
             netbird_management_url: self.netbird_management_url.clone(),
             netbird_setup_key: self.netbird_setup_key.clone(),
             wireguard_config: self.wireguard_config.clone(),
+            dns: self.dns.clone(),
+            wireguard_canary: self.wireguard_canary,
             startup_timeout: std::time::Duration::from_secs(
                 self.startup_timeout_secs.unwrap_or(90),
             ),
@@ -1075,6 +1107,8 @@ mod tests {
                 "SANDBOX_NETWORK",
                 "SANDBOX_TUNNEL_PROVIDER",
                 "SANDBOX_TUNNEL_IMAGE",
+                "SANDBOX_TUNNEL_DNS",
+                "SANDBOX_TUNNEL_WIREGUARD_CANARY",
                 "SANDBOX_TUNNEL_NETBIRD_MANAGEMENT_URL",
                 "SANDBOX_TUNNEL_NETBIRD_SETUP_KEY",
                 "SANDBOX_TUNNEL_WIREGUARD_CONFIG",
@@ -1097,6 +1131,7 @@ mod tests {
                 "https://nb.example.com",
             );
             std::env::set_var("SANDBOX_TUNNEL_NETBIRD_SETUP_KEY", "key-1");
+            std::env::set_var("SANDBOX_TUNNEL_DNS", "100.100.0.53, fd00::53");
         }
         let config = SandboxModeConfig::resolve(&crate::settings::Settings::default())
             .expect("valid tunnel config")
@@ -1104,7 +1139,36 @@ mod tests {
         assert_eq!(config.network, crate::sandbox::SandboxNetworkMode::Tunnel);
         let tunnel = config.tunnel.expect("tunnel settings");
         assert_eq!(tunnel.provider, crate::sandbox::TunnelProvider::Netbird);
-        assert_eq!(tunnel.image(), "docker.io/netbirdio/netbird:latest");
+        assert_eq!(
+            tunnel.image(),
+            "docker.io/netbirdio/netbird@sha256:eca5b274c635bfbb04ec6724a0712d1146190dd450eea199eeb83916fdd94965"
+        );
+        assert_eq!(
+            tunnel.dns,
+            vec![
+                "100.100.0.53".parse::<IpAddr>().unwrap(),
+                "fd00::53".parse::<IpAddr>().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn tunnel_ip_settings_are_strictly_parsed() {
+        let _guard = crate::config::helpers::lock_env();
+        clear_tunnel_env();
+        // SAFETY: Under ENV_MUTEX, no concurrent env access.
+        unsafe {
+            std::env::set_var("SANDBOX_TUNNEL_DNS", "100.100.0.53,not-an-ip");
+            std::env::set_var("SANDBOX_TUNNEL_WIREGUARD_CANARY", "10.231.0.1");
+        }
+        assert!(parse_ip_list_env("SANDBOX_TUNNEL_DNS").is_err());
+        assert_eq!(
+            parse_optional_ip_env("SANDBOX_TUNNEL_WIREGUARD_CANARY").unwrap(),
+            Some("10.231.0.1".parse().unwrap())
+        );
+        // SAFETY: Under ENV_MUTEX, no concurrent env access.
+        unsafe { std::env::set_var("SANDBOX_TUNNEL_WIREGUARD_CANARY", "not-an-ip") };
+        assert!(parse_optional_ip_env("SANDBOX_TUNNEL_WIREGUARD_CANARY").is_err());
     }
 
     #[test]

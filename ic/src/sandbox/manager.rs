@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use tokio::sync::RwLock;
 
-use crate::sandbox::cli_runner::{CliRunner, ExecParams};
+use crate::sandbox::cli_runner::{CliRunner, ExecParams, TunnelRunConfig};
 use crate::sandbox::config::{ResourceLimits, SandboxConfig, SandboxNetworkMode, SandboxPolicy};
 use crate::sandbox::error::{Result, SandboxError};
 use crate::sandbox::proxy::{HttpProxy, NetworkProxyBuilder};
@@ -328,24 +328,38 @@ impl SandboxManager {
         let cwd =
             crate::sandbox::mount_guard::validate_mount_dir(cwd, &self.config.protected_paths)?;
 
-        if self.config.network == SandboxNetworkMode::Tunnel {
+        let tunnel_run = if self.config.network == SandboxNetworkMode::Tunnel {
             let tunnel = self.tunnel.read().await;
             let sidecar = tunnel
                 .as_ref()
                 .ok_or_else(|| SandboxError::TunnelUnavailable {
                     reason: "sidecar is not initialized; refusing sandbox execution".into(),
                 })?;
-            // A sidecar that died or drifted is recreated once, bounded by its
-            // own startup timeout, before the run is refused.
-            if let Err(error) = sidecar.ensure_healthy().await {
-                tracing::warn!(
-                    error = %error,
-                    "Sandbox tunnel sidecar unhealthy; recreating it once before this run"
-                );
-                sidecar.ensure_started().await?;
-                sidecar.ensure_healthy().await?;
-            }
-        }
+            // Join only the exact container ID that passed inspection. If a
+            // concurrent recreation removes it, this run fails instead of
+            // joining a new namespace before its firewall is installed.
+            let container_id = match sidecar.ensure_healthy().await {
+                Ok(id) => id,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "Sandbox tunnel sidecar unhealthy; recreating it once before this run"
+                    );
+                    sidecar.ensure_started().await?;
+                    sidecar.ensure_healthy().await?
+                }
+            };
+            let dns = self
+                .config
+                .tunnel
+                .as_ref()
+                .map(|config| config.dns.clone())
+                .unwrap_or_default();
+            let resolv_conf = sidecar.tunnel_resolv_conf()?;
+            Some((container_id, dns, resolv_conf))
+        } else {
+            None
+        };
 
         let proxy_port = if let Some(proxy) = self.proxy.read().await.as_ref() {
             proxy.addr().await.map(|a| a.port()).unwrap_or(0)
@@ -378,6 +392,13 @@ impl SandboxManager {
                 env: &env,
                 network: self.config.network,
                 proxy_port,
+                tunnel: tunnel_run
+                    .as_ref()
+                    .map(|(id, dns, resolv_conf)| TunnelRunConfig {
+                        container_id: id,
+                        dns: dns.as_slice(),
+                        resolv_conf: resolv_conf.as_deref(),
+                    }),
                 protected_paths: &self.config.protected_paths,
                 tenant_logs: self.config.tenant_logs.enabled(),
             })

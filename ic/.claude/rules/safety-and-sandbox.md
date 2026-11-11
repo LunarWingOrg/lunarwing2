@@ -45,13 +45,16 @@ runtime or image is unavailable, commands error with a structured
   in the image; relay setup failures fail closed (`[sandbox:proxy_error]`),
   never degrade to advisory or direct egress. This mode has no credential
   mappings and must not inject daemon secrets.
-- `tunnel` (WI#248): runs join a NetBird/WireGuard sidecar netns while keeping
-  every hardening flag. Mandatory sidecar `nftables` chains drop new inbound
-  flows (never an inbound listener) and every outbound flow that does not
-  leave through the tunnel interface: the uplink carries only the provider's
-  marked control traffic and DNS to the runtime resolvers, link-local IPv4
-  (cloud metadata, host alias) is dropped. Provider health and both chains are
-  rechecked rule by rule before every run; failures return
+- `tunnel` (WI#248/592): runs join their daemon instance's verified NetBird/
+  WireGuard sidecar container ID while keeping every hardening flag. Mandatory
+  sidecar `nftables` chains drop new inbound flows (never an inbound listener)
+  and non-tunnel egress, except for marked provider traffic and, by default, DNS
+  to runtime resolvers. That default DNS is a residual uplink/exfiltration
+  channel. `SANDBOX_TUNNEL_DNS` mounts overlay resolvers into joined runs only
+  and removes direct uplink DNS; provider bootstrap keeps runtime DNS. NetBird
+  local-DNS forwarding and live interoperability remain unvalidated (WI#600).
+  Link-local IPv4 (cloud metadata, host alias) is dropped. Provider health and
+  both chains are rechecked rule by rule before every run; failures return
   `[sandbox:sandbox_unavailable]` and never degrade. NetBird setup keys use an
   atomic 0600 env-file in the private runtime dir; WireGuard configs are
   regular non-symlink 0600 files mounted read-only. Keys must never enter argv
