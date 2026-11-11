@@ -1014,18 +1014,21 @@ mod tests {
         args: &[String],
         stdin: Option<Vec<u8>>,
     ) -> std::process::Output {
-        match args.get(2).map(String::as_str) {
+        let interactive = args.get(1).map(String::as_str) == Some("-i");
+        let command_index = if interactive { 3 } else { 2 };
+        match args.get(command_index).map(String::as_str) {
             Some("netbird") => fake_output(state.started, String::new(), String::new()),
             Some("cat") => fake_output(true, "nameserver 9.9.9.9\n".into(), String::new()),
-            Some("nft") if args.get(3).map(String::as_str) == Some("-f") => {
+            Some("nft") if args.get(command_index + 1).map(String::as_str) == Some("-f") => {
                 state.installs += 1;
                 let script = stdin.and_then(|input| String::from_utf8(input).ok());
-                let valid = script.as_ref().is_some_and(|script| {
-                    script.starts_with(
-                        "add table inet lunarwing_sandbox_egress\ndelete table inet lunarwing_sandbox_egress\n",
-                    ) && script.contains("chain input {")
-                        && script.contains("chain output {")
-                });
+                let valid = interactive
+                    && script.as_ref().is_some_and(|script| {
+                        script.starts_with(
+                            "add table inet lunarwing_sandbox_egress\ndelete table inet lunarwing_sandbox_egress\n",
+                        ) && script.contains("chain input {")
+                            && script.contains("chain output {")
+                    });
                 if valid {
                     state.listing =
                         script.map(|script| script.lines().skip(2).collect::<Vec<_>>().join("\n"));
