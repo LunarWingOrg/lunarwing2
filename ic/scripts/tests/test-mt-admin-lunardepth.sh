@@ -51,5 +51,39 @@ if LUNARDEPTH_RANGE_START=10000 PORTS_REGISTRY="$registry" bash "$SCRIPT_DIR/mig
   exit 1
 fi
 [[ "$checksum" == "$(sha256sum "$registry")" ]]
+PORTS_REGISTRY="$registry" bash "$SCRIPT_DIR/migrate-ports-v18.sh" >/dev/null
 
-echo "test-mt-admin-lunardepth: registry v18 migration checks passed"
+# The shared lifecycle dispatcher must accept the new lane as well as its
+# dedicated start_tenant_lunardepth function.
+# shellcheck source=../lunarwing-mt-admin.sh
+source "$SCRIPT_DIR/lunarwing-mt-admin.sh"
+PORTS_REGISTRY="$registry"
+[[ "$(prepare_worker_lifecycle demo lunardepth)" == "demo lunardepth" ]]
+if (prepare_worker_lifecycle demo not-a-worker) >/dev/null 2>&1; then
+  echo "unknown worker unexpectedly accepted" >&2
+  exit 1
+fi
+
+calls="$TMP/lifecycle.calls"
+: >"$calls"
+(
+  sanitize_name() { printf '%s' "$1"; }
+  tenant_worker_enabled() { return 0; }
+  ensure_init_system() { INIT_SYSTEM=openrc; }
+  ensure_container_runtime() { :; }
+  ports_set_worker_desired_running() { printf 'desired:%s:%s\n' "$2" "$3" >>"$calls"; }
+  start_tenant_lunardepth() { printf 'start:%s\n' "$1" >>"$calls"; }
+  _ctr_inspect() { return 1; }
+  openrc_worker_stop_disable() { printf 'stop:%s:%s\n' "$1" "$2" >>"$calls"; }
+  stop_worker_task_container() { printf 'stop-task:%s:%s\n' "$1" "$2" >>"$calls"; }
+  say() { :; }
+  start_worker demo lunardepth
+  stop_worker demo lunardepth
+)
+expected="$TMP/lifecycle.expected"
+printf '%s\n' \
+  'desired:lunardepth:true' 'start:demo' \
+  'desired:lunardepth:false' 'stop:demo:lunardepth' 'stop-task:demo:lunardepth' >"$expected"
+diff -u "$expected" "$calls"
+
+echo "test-mt-admin-lunardepth: registry v18 migration and lifecycle validation checks passed"

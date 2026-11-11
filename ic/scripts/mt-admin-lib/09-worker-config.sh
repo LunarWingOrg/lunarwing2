@@ -3038,8 +3038,8 @@ stop_tenant_pebble() {
 require_worker_name() {
   case "${1:-}" in
     nanocode) die "Nanocode worker is retired" ;;
-    pebble|opencode|kimi|opencode2) ;;
-    *) die "unknown worker '${1:-}'; expected pebble, opencode, kimi, or opencode2" ;;
+    pebble|opencode|kimi|opencode2|lunardepth) ;;
+    *) die "unknown worker '${1:-}'; expected pebble, opencode, kimi, opencode2, or lunardepth" ;;
   esac
 }
 
