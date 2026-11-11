@@ -79,13 +79,14 @@ export function parseEnvelope(text: string): Envelope {
       !isRecord(value.payload)) {
     throw new Error("message must be a LunarWing envelope")
   }
-  return value as Envelope
+  return { id: value.id, type: value.type, timestamp: value.timestamp, payload: value.payload }
 }
 
 export function bearerTokenMatches(header: string | undefined, expected: string): boolean {
   const match = header === undefined ? null : /^Bearer ([^\s]+)$/.exec(header)
-  if (match === null || expected.length === 0) return false
-  const supplied = createHash("sha256").update(match[1], "utf8").digest()
+  const token = match?.[1]
+  if (token === undefined || expected.length === 0) return false
+  const supplied = createHash("sha256").update(token, "utf8").digest()
   const wanted = createHash("sha256").update(expected, "utf8").digest()
   return timingSafeEqual(supplied, wanted)
 }
