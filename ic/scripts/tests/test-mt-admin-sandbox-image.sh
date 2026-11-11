@@ -227,7 +227,7 @@ sandbox_runtime_mock() {
 }
 podman() { sandbox_runtime_mock podman "$@"; }
 docker() { sandbox_runtime_mock docker "$@"; }
-_ctr() { local name="$1"; shift; "$CONTAINER_RT" "$@"; }
+_ctr() { shift; "$CONTAINER_RT" "$@"; }
 
 printf 'SANDBOX_IMAGE=%s\n' "$SANDBOX_IMAGE_TAG" >"$(tenant_env_dir tenant-a)/lunarwing.env"
 current_digest="$(sandbox_image_input_digest "$candidate_source")"
@@ -353,6 +353,7 @@ else
   bad "Docker candidate path used the wrong store or network: ${CALLS[*]}"
 fi
 
+# shellcheck disable=SC2034  # read by sandbox_debian_snapshot in sourced mt-admin
 LUNARWING_MT_SANDBOX_DEBIAN_SNAPSHOT=20260101T000000Z
 if [[ "$(sandbox_image_input_digest "$candidate_source")" != "$current_digest" ]]; then
   ok 'Debian snapshot override changes the managed input digest'
