@@ -186,7 +186,7 @@ console.log(JSON.stringify({ role: "assistant", content: "done" }))
       task_id: "cron-first", prompt: "tick", timeout_ms: 10000,
       context: { project_dir: "missions/pr-digest", cron_tick: { event: "cron.tick" } },
     }}))
-    assert.equal((await result).status, "success")
+    assert.equal((await withTimeout(result, "the cron task result")).status, "success")
     assert.equal(readFileSync(join(root, "missions/pr-digest/state"), "utf8"), "first tick")
   } finally {
     ws?.close()
@@ -320,7 +320,7 @@ setTimeout(() => {
     ws.send(JSON.stringify({ type: "task_request", payload: {
       task_id: "proxy-task", prompt: "read a note", timeout_ms: 30000,
     }}))
-    const result = await done
+    const result = await withTimeout(done, "the tool-proxy task result")
     assert.equal(result.status, "success")
     assert.match(String(result.output), /tool:proxied-content/)
   } finally {
@@ -458,7 +458,10 @@ conn.on("data", (d) => {
     handleProtocols: (protocols: Set<string>): string | false =>
       protocols.has(SUBPROTOCOL) ? SUBPROTOCOL : false,
   })
-  await new Promise<void>((resolve) => hub.once("listening", resolve))
+  await withTimeout(
+    new Promise<void>((resolve) => hub.once("listening", resolve)),
+    "the client-role hub listener",
+  )
   const child = startBridge(await freePort(), "client-drop-token", {
     WS_ROLE: "client",
     WS_URL: `ws://127.0.0.1:${hubPort}/kimi`,
@@ -555,7 +558,7 @@ for (const m of messages) process.stdout.write(JSON.stringify(m) + "\\n")
     await waitForListening(child)
     const ws = await connect(bridgePort, "runner-bridge-token")
     try {
-      const resultLine = await new Promise<Record<string, unknown>>((resolve, reject) => {
+      const resultLine = await withTimeout(new Promise<Record<string, unknown>>((resolve, reject) => {
         ws.on("message", (data) => {
           const message = JSON.parse(data.toString()) as Record<string, unknown>
           if (message.type === "task_result") resolve(message as Record<string, unknown>)
@@ -564,7 +567,7 @@ for (const m of messages) process.stdout.write(JSON.stringify(m) + "\\n")
         ws.send(JSON.stringify({ type: "task_request", payload: {
           task_id: "delegate-1", prompt: "do the work", timeout_ms: 30000,
         }}))
-      })
+      }), "the runner task result")
       const payload = resultLine.payload as Record<string, unknown>
       assert.equal(payload.task_id, "delegate-1")
       assert.equal(payload.status, "success", JSON.stringify(payload))
@@ -597,7 +600,7 @@ test("a runner-socket bridge maps a dead runner socket to an error task_result (
     await waitForListening(child)
     const ws = await connect(bridgePort, "runner-dead-token")
     try {
-      const resultLine = await new Promise<Record<string, unknown>>((resolve, reject) => {
+      const resultLine = await withTimeout(new Promise<Record<string, unknown>>((resolve, reject) => {
         ws.on("message", (data) => {
           const message = JSON.parse(data.toString()) as Record<string, unknown>
           if (message.type === "task_result") resolve(message as Record<string, unknown>)
@@ -606,7 +609,7 @@ test("a runner-socket bridge maps a dead runner socket to an error task_result (
         ws.send(JSON.stringify({ type: "task_request", payload: {
           task_id: "dead-runner-1", prompt: "doomed", timeout_ms: 30000,
         }}))
-      })
+      }), "the runner task result")
       const payload = resultLine.payload as Record<string, unknown>
       assert.equal(payload.task_id, "dead-runner-1")
       assert.equal(payload.status, "error")
