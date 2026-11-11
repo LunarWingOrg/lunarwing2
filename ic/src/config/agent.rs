@@ -36,7 +36,7 @@ pub struct SupervisedModeConfig {
     pub source: SupervisedModeSource,
 }
 
-pub fn set_supervised_cli_override(enabled: bool) {
+pub(crate) fn set_supervised_cli_override(enabled: bool) {
     CLI_SUPERVISED_MODE.store(enabled, Ordering::Relaxed);
 }
 
