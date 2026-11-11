@@ -51,8 +51,16 @@ export function bridgeStartupRefusal(env: NodeJS.ProcessEnv, uid: number | null)
   return null
 }
 
+// The caller must already have an "error" listener on the socket: once Node has
+// emitted "upgrade", nothing else listens, and a peer that resets the connection
+// while the refusal is written would otherwise end the process.
 function rejectUpgrade(socket: Duplex, status: string): void {
-  socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`, () => socket.destroy())
+  if (socket.destroyed) return
+  try {
+    socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`, () => socket.destroy())
+  } catch {
+    socket.destroy()
+  }
 }
 
 export class BridgeServer {
@@ -91,6 +99,11 @@ export class BridgeServer {
   }
 
   private upgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
+    // First statement, before any reply and before authentication: after "upgrade"
+    // the HTTP server no longer listens on this socket, so a reset from an
+    // unauthenticated peer must not become an unhandled "error" event.
+    const dropOnError = (): void => { socket.destroy() }
+    socket.on("error", dropOnError)
     const authenticated = bearerTokenMatches(request.headers.authorization, this.options.token)
     if (!authenticated) {
       rejectUpgrade(socket, "401 Unauthorized")
@@ -114,7 +127,11 @@ export class BridgeServer {
       return
     }
     try {
-      this.webSockets.handleUpgrade(request, socket, head, webSocket => this.webSockets.emit("connection", webSocket))
+      this.webSockets.handleUpgrade(request, socket, head, webSocket => {
+        // The WebSocket owns the socket now and has its own error handling.
+        socket.removeListener("error", dropOnError)
+        this.webSockets.emit("connection", webSocket)
+      })
     } catch {
       if (!socket.destroyed) rejectUpgrade(socket, "400 Bad Request")
     }

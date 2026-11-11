@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { randomBytes } from "node:crypto"
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs"
 import { connect, createServer, type Server } from "node:net"
 import { tmpdir } from "node:os"
@@ -11,6 +12,15 @@ import { createEnvelope, type Envelope, SUBPROTOCOL } from "./lunarwing_runtime.
 
 const TOKEN = "test-only-hub-token-0123456789abcdef0123456789abcdef"
 
+// The handshake nonce is made per request. A literal one, even the RFC 6455
+// sample, reads as a credential to the secret scanner.
+function upgradeRequest(port: number, path: string, authorization: string, protocol: string | null = SUBPROTOCOL): string {
+  return `GET ${path} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n` +
+    `Sec-WebSocket-Key: ${randomBytes(16).toString("base64")}\r\nSec-WebSocket-Version: 13\r\n` +
+    (protocol === null ? "" : `Sec-WebSocket-Protocol: ${protocol}\r\n`) +
+    `Authorization: ${authorization}\r\n\r\n`
+}
+
 async function rawUpgrade(port: number, path: string, authorization: string): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     const socket = connect({ host: "127.0.0.1", port })
@@ -19,11 +29,7 @@ async function rawUpgrade(port: number, path: string, authorization: string): Pr
       socket.destroy()
       reject(new Error("timed out waiting for raw upgrade response"))
     })
-    socket.on("connect", () => socket.write(
-      `GET ${path} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n` +
-      `Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n` +
-      `Sec-WebSocket-Protocol: ${SUBPROTOCOL}\r\nAuthorization: ${authorization}\r\n\r\n`,
-    ))
+    socket.on("connect", () => socket.write(upgradeRequest(port, path, authorization)))
     socket.on("data", data => {
       response += data.toString()
       if (response.includes("\r\n\r\n")) {
@@ -33,6 +39,18 @@ async function rawUpgrade(port: number, path: string, authorization: string): Pr
     })
     socket.on("end", () => resolve(response))
     socket.on("error", reject)
+  })
+}
+
+// Sends one upgrade request and resets the connection as soon as the request has
+// left, so the bridge's refusal meets a dead socket.
+async function upgradeThenReset(port: number, path: string, authorization: string, protocol: string | null = SUBPROTOCOL): Promise<void> {
+  await new Promise<void>(resolve => {
+    const socket = connect({ host: "127.0.0.1", port })
+    socket.on("error", () => undefined)
+    socket.on("close", () => resolve())
+    socket.setTimeout(2_000, () => socket.destroy())
+    socket.on("connect", () => socket.write(upgradeRequest(port, path, authorization, protocol), () => socket.resetAndDestroy()))
   })
 }
 
@@ -134,6 +152,41 @@ test("malformed upgrade targets are rejected without stopping the bridge", async
     const messages: Envelope[] = []
     socket.on("message", data => messages.push(JSON.parse(data.toString()) as Envelope))
     await new Promise<void>(resolve => socket.once("open", resolve))
+    socket.send(JSON.stringify(createEnvelope("ping", {})))
+    await waitFor(messages, "pong")
+    socket.close()
+  } finally {
+    await current.bridge.close()
+    current.runner.close()
+    rmSync(current.root, { recursive: true, force: true })
+  }
+})
+
+test("a peer that resets during a refused upgrade does not stop the bridge", async () => {
+  const current = await fixture()
+  const port = current.bridge.port
+  try {
+    // One refusal path per row: no valid token (401), a malformed target (400),
+    // an unknown path (404) and a missing subprotocol (400). The first row needs
+    // no credential at all.
+    const rows: [string, string, string | null][] = [
+      ["/ws/agent", "Bearer wrong", SUBPROTOCOL],
+      ["//", `Bearer ${TOKEN}`, SUBPROTOCOL],
+      ["/not-the-agent-path", `Bearer ${TOKEN}`, SUBPROTOCOL],
+      ["/ws/agent", `Bearer ${TOKEN}`, null],
+    ]
+    for (const [path, authorization, protocol] of rows) {
+      for (let round = 0; round < 25; round += 1) await upgradeThenReset(port, path, authorization, protocol)
+    }
+    // Let any late socket error surface before the bridge is used again.
+    await new Promise(resolve => setTimeout(resolve, 50))
+    const socket = new WebSocket(current.url, SUBPROTOCOL, { headers: { Authorization: `Bearer ${TOKEN}` } })
+    const messages: Envelope[] = []
+    socket.on("message", data => messages.push(JSON.parse(data.toString()) as Envelope))
+    await new Promise<void>((resolve, reject) => {
+      socket.once("open", () => resolve())
+      socket.once("error", reject)
+    })
     socket.send(JSON.stringify(createEnvelope("ping", {})))
     await waitFor(messages, "pong")
     socket.close()
