@@ -8,7 +8,7 @@ See [`NANOCODE-REMOVAL.md`](NANOCODE-REMOVAL.md) for upgrade behavior.
 ## Brotli security refresh (WI#514, 2026-10-29)
 
 Master pipeline 6719's four worker scans each found CVE-2026-111497 in
-`libbrotli1`. All four Dockerfiles and `CI_DEBIAN_SNAPSHOT` now use
+`libbrotli1`. The four original Dockerfiles and `CI_DEBIAN_SNAPSHOT` now use
 `20261105T082236Z`: bookworm selects `1.0.9-2+deb12u1`, trixie
 `1.1.0-2+deb13u1`. The validator binds every worker's snapshot to CI and
 rejects older snapshots. The three existing scan suppressions were re-checked
@@ -66,8 +66,9 @@ opencode2 exposure verifier remain the image acceptance gates.
 
 [CVE-2026-109518](https://ubuntu.com/security/CVE-2026-109518) requires an
 on-path attacker, redirect handling, and non-zero `Acquire::Retries`; APT's
-retry hard-link reuse can otherwise replace an already verified package. All
-24 worker `deb` source lines and the three `worker-kimi-ts` lines now use
+retry hard-link reuse can otherwise replace an already verified package. The
+original 24 worker `deb` source lines, LunarDepth's additional six, and the
+three `worker-kimi-ts` lines now use
 `https://snapshot.debian.org` with normal certificate verification. There is
 no `Verify-Peer=false` or plain-HTTP fallback. Both snapshot hosts were
 checked over HTTPS on 2026-11-05: each returned its pinned content after an
@@ -86,7 +87,7 @@ mt-admin builds have no outer ladder: the small bootstrap still fails fast,
 but transient fetches for all remaining packages get the fixed client's three
 bounded attempts instead of making the whole build fragile to one response.
 
-The four Dockerfiles and `CI_DEBIAN_SNAPSHOT` use `20261105T082236Z`. Its
+All five worker Dockerfiles and `CI_DEBIAN_SNAPSHOT` use `20261105T082236Z`. Its
 Bookworm security archive serves `apt_2.6.2_amd64.deb`; its Trixie security
 `InRelease` is byte-identical to the index whose package list was checked for
 APT `3.0.4`. Every builder/runtime installs `apt` alone before its other
@@ -109,9 +110,9 @@ errors close the APT behavior where failed index downloads can otherwise
 return success. The validator ties every worker snapshot ARG to CI and applies
 its robust HTTPS source parser to Kimi; `test_worker_reproducibility` enforces
 HTTPS, bootstrap-only retry suppression, version floors, and strict updates on
-all four lanes.
+all five lanes.
 
-The inventory is limited to the four worker Dockerfiles plus
+The current inventory covers five worker Dockerfiles plus
 `.gitlab/ci/validate.yml`; mt-admin renders those same lane Dockerfiles and
 has no independent mirror recipe. Independent second-host SHA-256 verification
 (WI#561 lane C) is not implemented. Rebuild every worker image and recreate
@@ -128,7 +129,7 @@ the gateway bearer remains a loudly warned last resort when the worker env
 file is unwritable. A leaked token would let a job impersonate the daemon
 toward every worker WebSocket port of that tenant.
 
-All four lanes use two non-root containers under different identities
+All five lanes use two non-root containers under different identities
 (WI#454). The bridge writes its token to a private `0400` file under its own
 home, removes the environment variable, and exports only the file pointer to
 the bridge process. The task container has neither that home nor the bridge
@@ -353,7 +354,7 @@ image's numeric uid/gid. Do not pass the bridge credential to a one-shot CLI
 container. Recreate both services after image/env changes; do not reuse old
 IPC volumes.
 
-**Host-side workspace prep (WI#453, the WI#446 closeout):** all four lane
+**Host-side workspace prep (WI#453, the WI#446 closeout):** all five lane
 workspace directories live inside the
 tenant-controlled `~/lunarwing` tree, so the historical root `mkdir -p` +
 unbounded `chown -R` is gone. `prepare_worker_workspace`
@@ -370,8 +371,8 @@ between the pre-`cd` path checks and `cd`; it then chowns only the top node
 on first creation (not `-R`, since the directory is empty), and when
 content exists, walks with `find -mindepth 1` skipping regular files with
 a link count above 1 (a tenant-planted hard link to an outside file keeps
-its owner). Every caller (quadlet render and all three imperative lanes)
-makes a refusal fatal.
+its owner). Every Quadlet renderer and imperative workspace caller makes a
+refusal fatal.
 
 The leaf-uid gate accepts exactly two owners: the tenant root's uid
 (provisioned tenant-owned by `create_tenant_user`, and what every rootless
@@ -1534,7 +1535,7 @@ on master 6708; the binary cause remains open, not proven fixed by those
 passes. Never mask bytes or weaken the whole-image digest contract.
 
 Master 6708 exposed a third cause: candidate and rebuild crossed UTC midnight,
-changing the account-creation layer's `/etc/shadow` last-change day. **All four
+changing the account-creation layer's `/etc/shadow` last-change day. **All five
 worker Dockerfiles now declare `ARG SOURCE_DATE_EPOCH=0` before runtime
 `useradd` and assert in the same `RUN` that the account's shadow day equals
 `SOURCE_DATE_EPOCH / 86400`.** Keep both the stage-local ARG and the assertion;
@@ -1543,12 +1544,13 @@ the source commit epoch; plain builds default to day zero. Shadow-utils encodes
 day zero as an empty last-change field; the assertion treats that as zero but
 still refuses a missing shadow entry. BuildKit's `rewrite-timestamp` normalizes
 metadata, not this file content. The regression
-suite `.gitlab/tests/test_worker_reproducibility.py` checks all four scopes,
-executes the shadow assertions with epoch-boundary/incorrect-day fixtures,
-and ties every snapshot to CI. Protected whole-image candidate/rebuild,
-scan and exposure verification on the changed tree remain required.
+suite `.gitlab/tests/test_worker_reproducibility.py` checks all five scopes and
+both task/bridge accounts, executes the shadow assertions with
+epoch-boundary/incorrect-day fixtures, and ties every snapshot to CI.
+Protected whole-image candidate/rebuild, scan and exposure verification on the
+changed tree remain required.
 
-The four `DEBIAN_SNAPSHOT` defaults and `CI_DEBIAN_SNAPSHOT` now use
+All five `DEBIAN_SNAPSHOT` defaults and `CI_DEBIAN_SNAPSHOT` now use
 `20261105T082236Z`: its security indexes supply patched `libbrotli1`
 `1.0.9-2+deb12u1` (Bookworm) and `1.1.0-2+deb13u1` (Trixie), fixing
 CVE-2026-111497 without a new Trivy ignore. The three existing dated ignores
@@ -2667,7 +2669,7 @@ Delivery is **at-most-once** and honest about it: the daemon's per-job control q
 
 From the agent side this is surfaced through `job_prompt`, which routes `external:`-mode jobs with a live task handle to the control channel instead of rejecting them — note that an "Always allow" approval grant on `job_prompt` now also reaches credentialed external workers, not just local sandbox jobs. From the browser side, `POST /api/jobs/{id}/prompt` routes the same way and job detail reports `can_prompt: true` only for running external jobs whose worker advertised the capability.
 
-Worker support today: the **opencode** worker (`opencode4lunarwing`) consumes `task_prompt` — it validates frames bridge-side (positive integer seq, non-empty 16 KiB NUL-free prompt, per-task queue bound, seq dedupe), binds every queue to the connection that owns the task (a foreign socket's prompt or cancel is refused), injects queued follow-ups into the same opencode session at the turn boundary (session idle, gated against stale idle replays) framed as `FOLLOW-UP INSTRUCTION (seq=N) from the orchestrator`, closes the queue the moment a `done: true` prompt is accepted (the injected turn is the wrap-up turn), and closes it on every error/cancel/finish path so late frames are acked `accepted: false`. Its final `task_result` output accumulates every turn's canonical text — or the turn's streamed tool/text output when the assistant produced none — and a follow-up turn that fails or times out after the main turn banked completed output resolves as `success` with a `[control] follow-up seq=N failed/timed out` note (without completed output the failure/timeout stands — control notes alone cannot manufacture success), so a late "status?" can never turn finished work into Failed/TimedOut or replace the deliverable. The kimi, opencode2, and pebble bridges do not advertise the capability (pebble runs its CLI one-shot with no session to inject into) and therefore reject prompts explicitly.
+Worker support today: the **opencode** worker (`opencode4lunarwing`) consumes `task_prompt` — it validates frames bridge-side (positive integer seq, non-empty 16 KiB NUL-free prompt, per-task queue bound, seq dedupe), binds every queue to the connection that owns the task (a foreign socket's prompt or cancel is refused), injects queued follow-ups into the same opencode session at the turn boundary (session idle, gated against stale idle replays) framed as `FOLLOW-UP INSTRUCTION (seq=N) from the orchestrator`, closes the queue the moment a `done: true` prompt is accepted (the injected turn is the wrap-up turn), and closes it on every error/cancel/finish path so late frames are acked `accepted: false`. Its final `task_result` output accumulates every turn's canonical text — or the turn's streamed tool/text output when the assistant produced none — and a follow-up turn that fails or times out after the main turn banked completed output resolves as `success` with a `[control] follow-up seq=N failed/timed out` note (without completed output the failure/timeout stands — control notes alone cannot manufacture success), so a late "status?" can never turn finished work into Failed/TimedOut or replace the deliverable. The kimi, opencode2, pebble, and lunardepth bridges do not advertise the capability (pebble runs its CLI one-shot with no session to inject into) and therefore reject prompts explicitly.
 
 `closed` seals **admission**, not consumption: already accepted prompts drain
 in FIFO order through the final `done=true` turn. Any terminal failure, timeout
@@ -2723,14 +2725,14 @@ a Mode column fed from the same field.
 
 ### Rebuilt image rollout (image-ID contract)
 
-A worker container is bound to the image ID it was created from. `start-tenant` refreshes the tenant's rootless store with a rebuilt image (`_ensure_tenant_image`), but on OpenRC and the non-Quadlet fallback it then only `podman start`s an existing container, and an already-active Quadlet unit is not restarted, so a rebuilt image did not reach a running worker: the old container kept serving the old image until an operator removed it by hand (`restart-tenant` helped only on Quadlet hosts, where the unit re-runs `podman run`). This is how the kimi 2.2.0 image stayed in service without the WI#411/WI#412 fixes. Every worker lane (`pebble`, `opencode`, `opencode2`, `kimi`) now hashes the tenant-store image ID into its container contract (`_worker_launch_contract`, the same mechanism as the LunarVision/LunarVoice sidecar contracts), so `start-tenant` and `restart-tenant` force-recreate the container whenever the image ID differs from the one it was created from, on both init systems. The procedure after any worker change is therefore:
+A worker container is bound to the image ID it was created from. `start-tenant` refreshes the tenant's rootless store with a rebuilt image (`_ensure_tenant_image`), but on OpenRC and the non-Quadlet fallback it then only `podman start`s an existing container, and an already-active Quadlet unit is not restarted, so a rebuilt image did not reach a running worker: the old container kept serving the old image until an operator removed it by hand (`restart-tenant` helped only on Quadlet hosts, where the unit re-runs `podman run`). This is how the kimi 2.2.0 image stayed in service without the WI#411/WI#412 fixes. Every worker lane (`pebble`, `opencode`, `opencode2`, `kimi`, `lunardepth`) now hashes the tenant-store image ID into its container contract (`_worker_launch_contract`, the same mechanism as the LunarVision/LunarVoice sidecar contracts), so `start-tenant` and `restart-tenant` force-recreate the container whenever the image ID differs from the one it was created from, on both init systems. The procedure after any worker change is therefore:
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh build-kimi-worker        # or build-<worker>-worker / build-tenant --with-<worker>
 sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant <tenant>  # logs "config changed for lunarwing-kimi-<tenant>; force-recreating"
 ```
 
-Rollout note: the first `start-tenant` after upgrading mt-admin to this version recreates every worker container once, because the stored contract hash gains the image segment. The replaced image stays in the tenant store until the next rebuild's prune. `ic/scripts/tests/test-mt-admin-worker-image-contract.sh` pins the behaviour for all four lanes on both paths.
+Rollout note: the first `start-tenant` after upgrading mt-admin to this version recreates every worker container once, because the stored contract hash gains the image segment. The replaced image stays in the tenant store until the next rebuild's prune. `ic/scripts/tests/test-mt-admin-worker-image-contract.sh` pins the behaviour for all five lanes on both paths.
 
 mt-admin builds also stamp `org.opencontainers.image.revision` with the source checkout's commit (the `SOURCE_REVISION` build-arg every worker Dockerfile declares and CI already passed; mt-admin builds left it `unknown`). Standalone per-lane builds retain the live operator-checkout behavior: `-dirty` is appended when the worker directory has uncommitted or untracked changes and `unknown` is kept outside a git checkout, so a deployed image can be traced to a target commit:
 
@@ -2738,7 +2740,7 @@ mt-admin builds also stamp `org.opencontainers.image.revision` with the source c
 podman image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' lunarwing-worker-kimi:latest
 ```
 
-For all four lanes, `build-tenant`, `build-all`, and pre-stop upgrade candidate
+For all five lanes, `build-tenant`, `build-all`, and pre-stop upgrade candidate
 builds resolve the tenant checkout's HEAD as its owner and require the selected
 worker directory to be clean. That SHA is the image's `SOURCE_REVISION`, but it
 is a provenance identifier, not a trust boundary. The commit must already be an
