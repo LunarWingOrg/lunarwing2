@@ -137,7 +137,7 @@ class BaselineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "commit-bound"):
                 baseline.read_fingerprint_file(accepted)
 
-    def run_main(self, root, scanned, accepted=None):
+    def run_main(self, root, scanned, accepted=None, draft=None):
         output = root / "history.ignore"
         pending = root / "pending.ignore"
         arguments = [
@@ -148,14 +148,19 @@ class BaselineTests(unittest.TestCase):
             str(output),
             "--pending",
             str(pending),
+            "--cache",
+            str(root / "scan-cache.json"),
         ]
         if accepted is not None:
             arguments.extend(["--accept", str(accepted)])
+        if draft is not None:
+            arguments.extend(["--draft-accept", str(draft)])
         stdout = io.StringIO()
         stderr = io.StringIO()
         with (
             mock.patch.object(baseline.sys, "argv", arguments),
             mock.patch.object(baseline, "validate_mirror"),
+            mock.patch.object(baseline, "mirror_refs_key", return_value=json.dumps(scanned)),
             mock.patch.object(baseline, "scan", return_value=scanned),
             mock.patch.object(
                 baseline.subprocess,
@@ -173,6 +178,7 @@ class BaselineTests(unittest.TestCase):
         unclassified = fingerprint("1", "new-fixture.txt")
         pending = fingerprint("2", "pending-fixture.txt")
         vendor = fingerprint("3", "ic/vendor/example-crate/tests/fixture.txt")
+        unmatched = fingerprint("4", "not-in-scan.txt")
         scanned = [unclassified, pending, vendor]
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -185,18 +191,81 @@ class BaselineTests(unittest.TestCase):
             self.assertIn(unclassified, stderr)
             self.assertIn(vendor, stderr)
             self.assertIn(pending, stderr)
+            self.assertIn("example-crate / generic-api-key (1):", stderr)
 
             accepted = root / "accepted.ignore"
             accepted.write_text(
-                f"{unclassified}\n{pending}\n{vendor}\n", encoding="utf-8"
+                f"{unclassified}\n{pending}\n{vendor}\n{unmatched}\n",
+                encoding="utf-8",
             )
             status, pinned, stdout, stderr = self.run_main(root, scanned, accepted)
             self.assertEqual(status, 1)
             self.assertEqual(pinned, existing | {vendor, unclassified})
             self.assertNotIn(pending, pinned)
             self.assertIn("accepted classified vendor", stdout)
-            self.assertIn("example-crate", stdout)
+            self.assertIn("example-crate / generic-api-key (1):", stdout)
             self.assertIn(f"refused although accepted: {pending}", stderr)
+            self.assertIn(f"matched no scanned row: {unmatched}", stderr)
+
+    def test_cli_groups_vendor_rows_and_writes_a_draft_without_pending(self):
+        existing = {fingerprint("0", "old-fixture.txt")}
+        first = fingerprint("1", "ic/vendor/example-crate/tests/first.txt")
+        second = fingerprint("2", "ic/vendor/example-crate/tests/second.txt")
+        private_key = f"{'3' * 40}:ic/vendor/example-crate/tests/key.txt:private-key:1"
+        other_crate = fingerprint("4", "ic/vendor/other-crate/tests/fixture.txt")
+        non_vendor = fingerprint("5", "new-fixture.txt")
+        pending = fingerprint("6", "pending-fixture.txt")
+        scanned = [first, second, private_key, other_crate, non_vendor, pending]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            baseline.write_baseline(root / "history.ignore", sorted(existing))
+            (root / "pending.ignore").write_text(f"{pending}\n", encoding="utf-8")
+            draft = root / "draft.ignore"
+            status, pinned, stdout, stderr = self.run_main(root, scanned, draft=draft)
+            self.assertEqual(status, 1)
+            self.assertEqual(pinned, existing)
+            self.assertEqual(
+                baseline.read_fingerprint_file(draft),
+                {first, second, private_key, other_crate, non_vendor},
+            )
+            self.assertNotIn(pending, baseline.read_fingerprint_file(draft))
+            self.assertIn("example-crate / generic-api-key (2):", stderr)
+            self.assertIn("example-crate / private-key (1):", stderr)
+            self.assertIn("other-crate / generic-api-key (1):", stderr)
+            self.assertIn("wrote 5 unclassified fingerprints to draft", stdout)
+
+    def test_scan_cache_reuses_one_scan_only_while_refs_are_unchanged(self):
+        scanned = [fingerprint("1", "ic/vendor/example-crate/tests/fixture.txt")]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            cache = root / "scan-cache.json"
+            with (
+                mock.patch.object(baseline, "mirror_refs_key", return_value="refs-a"),
+                mock.patch.object(baseline, "scan", return_value=scanned) as scanner,
+            ):
+                first = baseline.scan_with_cache(root, ["gitleaks"], "v8.30.1", cache)
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    second = baseline.scan_with_cache(root, ["gitleaks"], "v8.30.1", cache)
+                self.assertEqual(first, scanned)
+                self.assertEqual(second, scanned)
+                self.assertEqual(scanner.call_count, 1)
+                self.assertIn("reusing 1 redacted fingerprints", stdout.getvalue())
+                self.assertIn("unchanged mirror refs", stdout.getvalue())
+
+            with (
+                mock.patch.object(baseline, "mirror_refs_key", return_value="refs-b"),
+                mock.patch.object(baseline, "scan", return_value=scanned) as scanner,
+            ):
+                baseline.scan_with_cache(root, ["gitleaks"], "v8.30.1", cache)
+                self.assertEqual(scanner.call_count, 1)
+            self.assertEqual(
+                baseline.load_scan_cache(cache, "refs-b", ["different"], "v8.30.1"),
+                None,
+            )
+            cache_text = cache.read_text(encoding="utf-8")
+            self.assertNotIn("Secret", cache_text)
+            self.assertNotIn("Match", cache_text)
 
     def test_cli_status_separates_known_pending_from_new_findings(self):
         existing = {fingerprint("0", "old-fixture.txt")}
