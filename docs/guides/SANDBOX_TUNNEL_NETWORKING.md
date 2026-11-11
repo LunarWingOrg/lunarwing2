@@ -412,9 +412,12 @@ required.
    bounded first failure, sub-second cached failure, retry after back-off, and
    cleanup plus a recorded failure after caller cancellation. A delayed-provider
    image takes about 25 seconds to become ready and proves that a cold start can
-   use a longer configured budget than the 20-second per-run recovery cap. The
-   peerless config still does not test peer encryption or NetBird's control
-   plane.
+   use a longer configured budget than the 20-second per-run recovery cap. A
+   dual-interface WireGuard case completes a real `wg0`/`wg1` handshake over
+   loopback, disables the peer until the handshake ages out, and keeps the
+   recreated peer dead while checking the 6-second re-probe, 20-second fresh
+   provider cap, and sub-second cached failure through the manager. The peerless
+   config still does not test peer encryption or NetBird's control plane.
 5. The NetBird lane requires an isolated throwaway management deployment, one
    dedicated reusable setup key, and an image containing NetBird, `nft`, `nc`,
    and `wget`. The lane starts its own plain second peer with that key. Store
