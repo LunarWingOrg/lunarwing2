@@ -1856,3 +1856,148 @@ async fn podman_tunnel_sidecar_netbird_live() {
     let _ = std::fs::remove_dir_all(&workdir);
     result.expect("live NetBird connectivity, joined-run, reconnect, identity, and ingress checks");
 }
+
+async fn assert_netbird_custom_dns_joined_run(
+    sidecar: &TunnelSidecar,
+    image: &str,
+    workdir: &Path,
+    resolver: IpAddr,
+) -> Result<(), String> {
+    let container_id = sidecar
+        .ensure_healthy()
+        .await
+        .map_err(|error| error.to_string())?;
+    let resolv_conf = sidecar
+        .tunnel_resolv_conf()
+        .map_err(|error| error.to_string())?;
+    let runner = CliRunner::detect(SandboxRuntime::Podman, image.to_string())
+        .await
+        .map_err(|error| error.to_string())?;
+    let limits = ResourceLimits {
+        timeout: Duration::from_secs(120),
+        ..ResourceLimits::default()
+    };
+    let output = runner
+        .execute(ExecParams {
+            command: "cat /etc/resolv.conf; \
+                 nslookup www.example.com >/dev/null 2>&1 \
+                 && echo LUNARWING-NETBIRD-CUSTOM-DNS-OK; true",
+            working_dir: workdir,
+            policy: SandboxPolicy::ReadOnly,
+            limits: &limits,
+            env: &HashMap::new(),
+            network: SandboxNetworkMode::Tunnel,
+            proxy_port: 0,
+            tunnel: Some(TunnelRunConfig {
+                container_id: &container_id,
+                dns: &[resolver],
+                resolv_conf: resolv_conf.as_deref(),
+            }),
+            protected_paths: &[],
+            tenant_logs: false,
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    assert_eq!(output.exit_code, 0, "{}{}", output.stdout, output.stderr);
+    assert!(
+        output.stdout.contains("LUNARWING-NETBIRD-CUSTOM-DNS-OK"),
+        "custom NetBird DNS lookup failed: {}{}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        output.stdout.contains(&format!("nameserver {resolver}")),
+        "joined run used the wrong resolver: {}",
+        output.stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn podman_tunnel_sidecar_netbird_custom_dns_live() {
+    if !gate_open("LUNARWING_E2E_PODMAN_TESTS")
+        || !gate_open("LUNARWING_E2E_TUNNEL_TESTS")
+        || !gate_open("LUNARWING_E2E_NETBIRD_TESTS")
+    {
+        eprintln!("skipping: set podman, tunnel, and NetBird e2e gates to 1");
+        return;
+    }
+    let settings: Result<(String, String, String), String> = (|| {
+        Ok((
+            required_env("LUNARWING_E2E_NETBIRD_IMAGE")?,
+            required_env("LUNARWING_E2E_NETBIRD_MANAGEMENT_URL")?,
+            required_netbird_setup_key()?,
+        ))
+    })();
+    let (image, management_url, setup_key) = settings.expect("NetBird live settings");
+    let workdir = std::env::temp_dir().join(format!("lw-netbird-dns-live-{}", std::process::id()));
+    let primary_dir = workdir.join("primary");
+    let runtime_dir = workdir.join("runtime");
+    std::fs::create_dir_all(&primary_dir).expect("primary instance dir");
+    std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("private runtime dir");
+    }
+    let mut config = TunnelSidecarConfig {
+        provider: TunnelProvider::Netbird,
+        image: Some(image.clone()),
+        netbird_management_url: Some(management_url.clone()),
+        netbird_setup_key: Some(SecretString::from(setup_key.clone())),
+        startup_timeout: Duration::from_secs(120),
+        ..TunnelSidecarConfig::default()
+    };
+    let primary = TunnelSidecar::for_instance_with_runtime_dir(
+        ContainerRuntime::Podman,
+        config.clone(),
+        &primary_dir,
+        &runtime_dir,
+    );
+    let volume_prefix = format!("{}-netbird-", primary.container_name());
+    let result = async {
+        primary
+            .ensure_started()
+            .await
+            .map_err(|error| error.to_string())?;
+        let resolver = netbird_ipv4(primary.container_name()).await?;
+        let first_volume = netbird_volume(&primary).await?;
+        primary.stop().await;
+        config.dns = vec![resolver];
+        let primary = TunnelSidecar::for_instance_with_runtime_dir(
+            ContainerRuntime::Podman,
+            config.clone(),
+            &primary_dir,
+            &runtime_dir,
+        );
+        primary
+            .ensure_started()
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(resolver, netbird_ipv4(primary.container_name()).await?);
+        assert_eq!(first_volume, netbird_volume(&primary).await?);
+        assert_netbird_mark_rule(&primary).await?;
+        let rules = podman_output(&[
+            "exec",
+            primary.container_name(),
+            "nft",
+            "list",
+            "table",
+            "inet",
+            "lunarwing_sandbox_egress",
+        ])
+        .await?;
+        let listing = String::from_utf8_lossy(&rules.stdout);
+        assert!(
+            !listing.contains("dport 53"),
+            "custom DNS retained an uplink resolver rule:\n{listing}"
+        );
+        assert_netbird_custom_dns_joined_run(&primary, &image, &workdir, resolver).await
+    }
+    .await;
+    primary.stop().await;
+    remove_netbird_volumes(&volume_prefix).await;
+    let _ = std::fs::remove_dir_all(&workdir);
+    result.expect("live NetBird custom-DNS resolution and identity checks");
+}
