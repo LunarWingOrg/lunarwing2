@@ -48,7 +48,12 @@ while IFS= read -r lock; do
         --workspace --all-features \
         check advisories bans --hide-inclusion-graph 2>&1) || {
         echo "FAIL $root"
-        echo "$out" | tail -n 20
+        # WI#610: name each failing advisory up front. cargo-deny puts its
+        # error block above the advisory-not-detected warnings for ignore
+        # entries that do not apply to this root, so the old tail -n 20 hid
+        # the advisory ID and the crate. Print the whole output as well.
+        grep -E '^error(\[|: )' <<<"$out" | sed 's/^/  /' || true
+        printf '%s\n' "$out"
         failed=1
         continue
     }
