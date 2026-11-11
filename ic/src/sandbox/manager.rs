@@ -102,6 +102,14 @@ impl SandboxManager {
         }
     }
 
+    /// Create with an instance-scoped tunnel sidecar for deterministic integration tests.
+    #[doc(hidden)]
+    pub fn new_with_tunnel_sidecar(config: SandboxConfig, sidecar: TunnelSidecar) -> Self {
+        let mut manager = Self::new(config);
+        manager.tunnel = RwLock::new(Some(sidecar));
+        manager
+    }
+
     /// Create with default configuration.
     pub fn with_defaults() -> Self {
         Self::new(SandboxConfig::default())

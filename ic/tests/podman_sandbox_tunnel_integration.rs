@@ -130,6 +130,18 @@ fn write_wireguard_config(workdir: &Path, private_key: &str) -> PathBuf {
     config
 }
 
+fn private_runtime_dir(workdir: &Path) -> PathBuf {
+    let runtime_dir = workdir.join("runtime");
+    std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod 700");
+    }
+    runtime_dir
+}
+
 async fn tunnel_container_id(name: &str) -> Option<String> {
     let output = podman_output(&["inspect", "--format", "{{.Id}}", name])
         .await
@@ -156,7 +168,7 @@ async fn assert_no_unfiltered_sidecar(name: &str) -> Result<(), String> {
 }
 
 async fn wait_container_absent(name: &str) -> Result<(), String> {
-    for _ in 0..75 {
+    for _ in 0..225 {
         if tunnel_container_id(name).await.is_none() {
             return Ok(());
         }
@@ -540,10 +552,20 @@ async fn podman_tunnel_sidecar_wireguard_lifecycle_and_join() {
         startup_timeout: Duration::from_secs(60),
         ..TunnelSidecarConfig::default()
     };
-    let sidecar =
-        TunnelSidecar::for_instance(ContainerRuntime::Podman, tunnel_config.clone(), &workdir);
+    let runtime_dir = private_runtime_dir(&workdir);
+    let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
+        ContainerRuntime::Podman,
+        tunnel_config.clone(),
+        &workdir,
+        &runtime_dir,
+    );
     let other_dir = workdir.join("other-instance");
-    let other = TunnelSidecar::for_instance(ContainerRuntime::Podman, tunnel_config, &other_dir);
+    let other = TunnelSidecar::for_instance_with_runtime_dir(
+        ContainerRuntime::Podman,
+        tunnel_config,
+        &other_dir,
+        &runtime_dir,
+    );
     assert_ne!(sidecar.container_name(), other.container_name());
     let result = async {
         other
@@ -591,7 +613,8 @@ async fn podman_tunnel_sidecar_custom_dns_closes_uplink() {
     let workdir = std::env::temp_dir().join(format!("lw-tunnel-dns-{}", std::process::id()));
     let config = write_wireguard_config(&workdir, &private_key);
     let dns = vec!["10.231.99.53".parse().unwrap()];
-    let sidecar = TunnelSidecar::for_instance(
+    let runtime_dir = private_runtime_dir(&workdir);
+    let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
         ContainerRuntime::Podman,
         TunnelSidecarConfig {
             provider: TunnelProvider::Wireguard,
@@ -602,6 +625,7 @@ async fn podman_tunnel_sidecar_custom_dns_closes_uplink() {
             ..TunnelSidecarConfig::default()
         },
         &workdir,
+        &runtime_dir,
     );
     let result = exercise_sidecar(&sidecar, &image, &workdir, &dns).await;
     sidecar.stop().await;
@@ -640,7 +664,8 @@ async fn podman_tunnel_sidecar_hostname_endpoint_reaches_handshake_gate() {
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600))
             .expect("chmod 600");
     }
-    let sidecar = TunnelSidecar::for_instance(
+    let runtime_dir = private_runtime_dir(&workdir);
+    let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
         ContainerRuntime::Podman,
         TunnelSidecarConfig {
             provider: TunnelProvider::Wireguard,
@@ -651,6 +676,7 @@ async fn podman_tunnel_sidecar_hostname_endpoint_reaches_handshake_gate() {
             ..TunnelSidecarConfig::default()
         },
         &workdir,
+        &runtime_dir,
     );
     let name = sidecar.container_name().to_string();
     let start = tokio::spawn(async move { sidecar.ensure_started().await });
@@ -687,8 +713,20 @@ async fn assert_cancelled_start_cleans_up(
     config: TunnelSidecarConfig,
     instance_dir: &Path,
 ) -> Result<(), String> {
-    std::fs::create_dir_all(instance_dir).map_err(|error| error.to_string())?;
-    let sidecar = TunnelSidecar::for_instance(ContainerRuntime::Podman, config, instance_dir);
+    let runtime_dir = instance_dir.join("runtime");
+    std::fs::create_dir_all(&runtime_dir).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
+    }
+    let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
+        ContainerRuntime::Podman,
+        config,
+        instance_dir,
+        &runtime_dir,
+    );
     let name = sidecar.container_name().to_string();
     let task_sidecar = sidecar.clone();
     let start = tokio::spawn(async move { task_sidecar.recover_for_run().await });
@@ -713,8 +751,19 @@ async fn assert_cancelled_start_cleans_up(
     start.abort();
     let _ = start.await;
     let cleaned = wait_container_absent(&name).await;
+    let cached_started = std::time::Instant::now();
+    let cached = sidecar.recover_for_run().await;
+    let cached_elapsed = cached_started.elapsed();
     sidecar.stop().await;
     cleaned?;
+    let cached = cached.expect_err("the cancelled recovery must retain its failure");
+    if cached_elapsed >= Duration::from_secs(1)
+        || !cached.to_string().contains("previous recovery failed")
+    {
+        return Err(format!(
+            "cancelled recovery did not use its recorded back-off ({cached_elapsed:?}): {cached}"
+        ));
+    }
     assert_no_unfiltered_sidecar(&name).await
 }
 
@@ -762,43 +811,38 @@ async fn podman_tunnel_dead_peer_fails_fast_through_manager() {
         std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
             .expect("chmod 700");
     }
-    let previous_base_dir = std::env::var_os("LUNARWING_BASE_DIR");
-    let previous_runtime_dir = std::env::var_os("XDG_RUNTIME_DIR");
-    // SAFETY: this gated binary runs its live tests serially; no other thread
-    // reads these process-wide overrides while the manager is constructed.
-    unsafe {
-        std::env::set_var("LUNARWING_BASE_DIR", &instance_dir);
-        std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
-    }
     let tunnel_config = TunnelSidecarConfig {
         provider: TunnelProvider::Wireguard,
         image: Some(image.clone()),
         wireguard_config: Some(config),
-        startup_timeout: Duration::from_secs(90),
+        startup_timeout: Duration::from_secs(20),
         ..TunnelSidecarConfig::default()
     };
-    let name = TunnelSidecar::for_instance(
+    let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
         ContainerRuntime::Podman,
         tunnel_config.clone(),
         &instance_dir,
-    )
-    .container_name()
-    .to_string();
-    let manager = SandboxManager::new(SandboxConfig {
-        image,
-        runtime: SandboxRuntime::Podman,
-        network: SandboxNetworkMode::Tunnel,
-        tunnel: Some(tunnel_config.clone()),
-        protected_paths: Vec::new(),
-        tenant_logs: TenantLogsMode::Off,
-        ..SandboxConfig::default()
-    });
+        &runtime_dir,
+    );
+    let name = sidecar.container_name().to_string();
+    let manager = SandboxManager::new_with_tunnel_sidecar(
+        SandboxConfig {
+            image,
+            runtime: SandboxRuntime::Podman,
+            network: SandboxNetworkMode::Tunnel,
+            tunnel: Some(tunnel_config.clone()),
+            protected_paths: Vec::new(),
+            tenant_logs: TenantLogsMode::Off,
+            ..SandboxConfig::default()
+        },
+        sidecar,
+    );
     let result = async {
         let (first, first_elapsed) = manager_command_error(&manager, &workspace).await?;
         if first.kind() != "sandbox_unavailable" || !first.to_string().contains("handshake") {
             return Err(format!("first failure missed the handshake gate: {first}"));
         }
-        if first_elapsed >= Duration::from_secs(90) {
+        if first_elapsed >= Duration::from_secs(60) {
             return Err(format!(
                 "first failure exceeded the bounded recovery: {first_elapsed:?}"
             ));
@@ -825,22 +869,95 @@ async fn podman_tunnel_dead_peer_fails_fast_through_manager() {
     }
     .await;
     manager.shutdown().await;
-    // SAFETY: restoration uses the same serial-live-test boundary as the
-    // overrides above, and runs before later Podman cases.
-    unsafe {
-        if let Some(value) = previous_base_dir {
-            std::env::set_var("LUNARWING_BASE_DIR", value);
-        } else {
-            std::env::remove_var("LUNARWING_BASE_DIR");
-        }
-        if let Some(value) = previous_runtime_dir {
-            std::env::set_var("XDG_RUNTIME_DIR", value);
-        } else {
-            std::env::remove_var("XDG_RUNTIME_DIR");
-        }
-    }
     let _ = std::fs::remove_dir_all(&workdir);
     result.expect("dead-peer manager recovery, back-off, retry, and cancelled-start cleanup");
+}
+
+async fn build_delayed_tunnel_image(base: &str) -> Result<String, String> {
+    let dir = std::env::temp_dir().join(format!("lw-tunnel-slow-image-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let image = format!("localhost/lw-tunnel-slow-e2e:{}", std::process::id());
+    let containerfile = format!(
+        "FROM {base}\n\
+         RUN WG_QUICK=\"$(command -v wg-quick)\" && \\\n\
+             mv \"$WG_QUICK\" /usr/local/bin/wg-quick-real && \\\n\
+             printf '#!/bin/sh\\nsleep 25\\nexec /usr/local/bin/wg-quick-real \"$@\"\\n' > \"$WG_QUICK\" && \\\n\
+             chmod 0755 \"$WG_QUICK\"\n"
+    );
+    std::fs::write(dir.join("Containerfile"), containerfile).map_err(|error| error.to_string())?;
+    let result = podman_success(&["build", "-t", &image, dir.to_string_lossy().as_ref()]).await;
+    let _ = std::fs::remove_dir_all(&dir);
+    result.map(|()| image)
+}
+
+#[tokio::test]
+async fn podman_tunnel_cold_start_uses_the_configured_provider_budget() {
+    if !gate_open("LUNARWING_E2E_PODMAN_TESTS") || !gate_open("LUNARWING_E2E_TUNNEL_TESTS") {
+        eprintln!("skipping: set both podman and tunnel e2e gates to 1");
+        return;
+    }
+    let sandbox_image = tunnel_image().await.expect("WireGuard-capable image");
+    let delayed_image = build_delayed_tunnel_image(&sandbox_image)
+        .await
+        .expect("build delayed provider image");
+    let private_key = generate_wg_private_key(&sandbox_image)
+        .await
+        .expect("generate a WireGuard key");
+    let workdir = std::env::temp_dir().join(format!("lw-tunnel-slow-start-{}", std::process::id()));
+    let instance_dir = workdir.join("instance");
+    let workspace = workdir.join("workspace");
+    let runtime_dir = workdir.join("runtime");
+    std::fs::create_dir_all(&instance_dir).expect("instance dir");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod 700");
+    }
+    let config = write_wireguard_config(&workdir, &private_key);
+    let tunnel_config = TunnelSidecarConfig {
+        provider: TunnelProvider::Wireguard,
+        image: Some(delayed_image.clone()),
+        wireguard_config: Some(config),
+        startup_timeout: Duration::from_secs(35),
+        ..TunnelSidecarConfig::default()
+    };
+    let sidecar = TunnelSidecar::for_instance_with_runtime_dir(
+        ContainerRuntime::Podman,
+        tunnel_config.clone(),
+        &instance_dir,
+        &runtime_dir,
+    );
+    let manager = SandboxManager::new_with_tunnel_sidecar(
+        SandboxConfig {
+            image: sandbox_image,
+            runtime: SandboxRuntime::Podman,
+            network: SandboxNetworkMode::Tunnel,
+            tunnel: Some(tunnel_config),
+            protected_paths: Vec::new(),
+            tenant_logs: TenantLogsMode::Off,
+            ..SandboxConfig::default()
+        },
+        sidecar,
+    );
+    let started = std::time::Instant::now();
+    let result = manager.execute("true", &workspace, HashMap::new()).await;
+    let elapsed = started.elapsed();
+    manager.shutdown().await;
+    let _ = podman_success(&["image", "rm", "-f", &delayed_image]).await;
+    let _ = std::fs::remove_dir_all(&workdir);
+    let output = result.expect("a provider taking about 25 seconds must start");
+    assert_eq!(output.exit_code, 0, "{}{}", output.stdout, output.stderr);
+    assert!(
+        elapsed >= Duration::from_secs(20),
+        "the delayed provider did not exercise the old 20s cap: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(45),
+        "cold start did not retain its configured 35s budget: {elapsed:?}"
+    );
 }
 
 fn required_env(name: &str) -> Result<String, String> {
