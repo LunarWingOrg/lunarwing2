@@ -63,7 +63,7 @@ def source_policy(root: Path) -> None:
         "secrets.token_hex(32)", "render_overlay.py", "unset NODE_OPTIONS",
     ], "task setup")
     split = (root / "entrypoint-split.sh").read_text()
-    require(split, ["10005:10005", "10105:10005", "post-ready", "LUNARDEPTH_WORKSPACE_ID"], "split entrypoint")
+    require(split, ["10005:10005", "10105:10005", "post-ready", "LUNARWING_WORKSPACE_ID"], "split entrypoint")
     bridge = (root / "scripts/lunarwing_bridge.ts").read_text()
     require(bridge, ["capabilities: []", "LUNARDEPTH_API_KEY", "LUNARDEPTH_LOCAL_AUTH_TOKEN"], "bridge")
     if "tool_proxy" in bridge or "tool-proxy" in bridge:
