@@ -1635,8 +1635,8 @@ _upgrade_checkout() {  # <name> <lw_root> <ref-name> <commit> <create-branch:tru
   fi
 }
 
-# Discard this run's candidate worker images. Best effort: a stale candidate
-# never affects the running lanes, which still point at :latest.
+# Discard this run's candidate worker and managed sandbox images. Best effort:
+# a stale candidate never affects the running lanes, which still use :latest.
 cleanup_candidate_workers() {  # <name>
   local name="$1" lane candidate_ref rc=0
   local -a lanes=() kept=()
