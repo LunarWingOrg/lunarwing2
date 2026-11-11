@@ -3208,7 +3208,7 @@ worker_listeners() {  # <tenant>
   local findings=0 lane container wss_port bindings bad listeners report rc
   local inspect_out state pid
   local health_port role
-  local -a lanes=(pebble opencode opencode2 kimi)
+  local -a lanes=(pebble opencode opencode2 kimi lunardepth)
   for lane in "${lanes[@]}"; do
     for role in bridge task; do
     container="lunarwing-${lane}-${name}"
