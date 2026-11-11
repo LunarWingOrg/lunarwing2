@@ -91,6 +91,16 @@ MAX_STATE_BYTES="${KAWARIMI_MAX_STATE_BYTES:-107374182400}"
 MAX_STATE_ENTRIES="${KAWARIMI_MAX_STATE_ENTRIES:-1000000}"
 IMPORT_STAGE_ROOT="${KAWARIMI_IMPORT_STAGE_ROOT:-/var/lib/lunarwing-import-stage}"
 
+say()    { printf '%s\n' "$*"; }
+die()    { printf 'error: %s\n' "$*" >&2; exit 1; }
+_read_secret_file() {
+  local path="$1" value
+  [[ -f "$path" && ! -L "$path" ]] || die "secret file must be a regular non-symlink file: $2"
+  value="$(<"$path")"
+  [[ -n "$value" && "$value" != *$'\n'* && "$value" != *$'\r'* ]] || die "secret file must contain one nonempty line: $2"
+  printf '%s' "$value"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --name)          NAME_OVERRIDE="$2"; shift 2 ;;
@@ -119,15 +129,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-say()    { printf '%s\n' "$*"; }
-die()    { printf 'error: %s\n' "$*" >&2; exit 1; }
-_read_secret_file() {
-  local path="$1" value
-  [[ -f "$path" && ! -L "$path" ]] || die "secret file must be a regular non-symlink file: $2"
-  value="$(<"$path")"
-  [[ -n "$value" && "$value" != *$'\n'* && "$value" != *$'\r'* ]] || die "secret file must contain one nonempty line: $2"
-  printf '%s' "$value"
-}
 banner() { printf '\n========== %s ==========\n' "$*"; }
 note()   { printf '  · %s\n' "$*"; }
 confirm() { $AUTO_YES && return 0; local a; read -r -p "$1 [y/N] " a; [[ "$a" == y || "$a" == Y ]]; }
