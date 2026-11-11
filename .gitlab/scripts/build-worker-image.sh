@@ -11,7 +11,7 @@ set -eu
 : "${CI_REGISTRY_USER:?}"
 
 if [ "$#" -ne 1 ]; then
-    echo "usage: build-worker-image.sh pebble|opencode|opencode2|kimi" >&2
+    echo "usage: build-worker-image.sh pebble|opencode|opencode2|kimi|lunardepth" >&2
     exit 2
 fi
 
@@ -191,6 +191,63 @@ kimicode4lunarwing/scripts/task_prompt_test.ts
 kimicode4lunarwing/scripts/workspace_path.ts'
         source_ref=2.5.2
         build_args="KIMI_CODE_VERSION=2.5.2
+WITH_TOOLCHAINS=false
+SOURCE_REVISION=$CI_COMMIT_SHA"
+        ;;
+    lunardepth)
+        image_name=worker-lunardepth
+        context=.
+        dockerfile_dir=lunardepth4lunarwing
+        input_files='lunardepth4lunarwing/AGENTS.md
+lunardepth4lunarwing/README.md
+lunardepth4lunarwing/Dockerfile
+lunardepth4lunarwing/docker-compose.yml
+lunardepth4lunarwing/.env.example
+lunardepth4lunarwing/agent_comm_protocol.json
+lunardepth4lunarwing/entrypoint.sh
+lunardepth4lunarwing/entrypoint-split.sh
+lunardepth4lunarwing/entrypoint-task-setup.sh
+lunardepth4lunarwing/health_server.py
+lunardepth4lunarwing/health_server_test.py
+lunardepth4lunarwing/config/lunarwing-lane.patch.yml
+lunardepth4lunarwing/config/home-cordis.patch.yml
+lunardepth4lunarwing/config/home.env
+lunardepth4lunarwing/scripts/package.json
+lunardepth4lunarwing/scripts/package-lock.json
+lunardepth4lunarwing/scripts/tsconfig.json
+lunardepth4lunarwing/scripts/lunarwing_runtime.ts
+lunardepth4lunarwing/scripts/lunarwing_runtime_test.ts
+lunardepth4lunarwing/scripts/lunarwing_bridge.ts
+lunardepth4lunarwing/scripts/lunarwing_bridge_test.ts
+lunardepth4lunarwing/scripts/lunardepth_task_runner.ts
+lunardepth4lunarwing/scripts/lunardepth_task_runner_test.ts
+lunardepth4lunarwing/scripts/task_runner_client.ts
+lunardepth4lunarwing/scripts/workspace_path.ts
+lunardepth4lunarwing/scripts/workspace_path_test.ts
+lunardepth4lunarwing/scripts/effective_config_assert.ts
+lunardepth4lunarwing/scripts/effective_config_assert_test.ts
+lunardepth4lunarwing/scripts/profile_template.ts
+lunardepth4lunarwing/scripts/sandbox_smoke.ts
+lunardepth4lunarwing/scripts/smoke_test.ts
+lunardepth4lunarwing/scripts/render_overlay.py
+lunardepth4lunarwing/scripts/render_overlay_test.py
+lunardepth4lunarwing/scripts/exposure_policy_assert.py
+lunardepth4lunarwing/scripts/exposure_policy_assert_test.py
+lunardepth4lunarwing/scripts/image_config_policy.py
+lunardepth4lunarwing/scripts/image_config_policy_test.py
+lunardepth4lunarwing/scripts/runtime_smoke.py
+lunardepth4lunarwing/scripts/runtime_smoke_test.py
+lunardepth4lunarwing/scripts/runtime_smoke_entrypoint.sh
+lunardepth4lunarwing/scripts/dsh-exposure-guard.sh
+lunardepth4lunarwing/scripts/verify_exposure_out_of_band.py
+lunardepth4lunarwing/scripts/verify_exposure_out_of_band_test.py'
+        source_ref=da06c33b2091546dc38c61b95452ce27a4ce32d5
+        build_args="LUNARDEPTH_REPOSITORY=https://git.lunarwing.org/lunarwing/lunardepth.git
+LUNARDEPTH_REF=da06c33b2091546dc38c61b95452ce27a4ce32d5
+LUNARDEPTH_COMPATIBILITY_REF=17aef23e05cc074c8621d38d159d77d25cb348ca
+LUNARDEPTH_MODEL_ROUTING_REF=8c610180c84a2f4c27fb2958e6e7dab9e48d476b
+LUNARDEPTH_PROFILE_SCHEMA_VERSION=unversioned
+DEBIAN_SNAPSHOT=$CI_DEBIAN_SNAPSHOT
 WITH_TOOLCHAINS=false
 SOURCE_REVISION=$CI_COMMIT_SHA"
         ;;
@@ -439,8 +496,18 @@ print_reproducibility_diagnosis() {
 # WI#425: export the opencode2 candidate's final filesystem as tar, preserving
 # the uid/gid/mode headers that BuildKit's local directory exporter rewrites.
 # The verify job checks those headers and the checkout-owned bytes out of band.
-if [ "$1" = opencode2 ]; then
-    export_file="$CI_PROJECT_DIR/opencode2-rootfs.tar"
+case "$1" in
+    opencode2)
+        export_file="$CI_PROJECT_DIR/opencode2-rootfs.tar"
+        ;;
+    lunardepth)
+        export_file="$CI_PROJECT_DIR/lunardepth-rootfs.tar"
+        ;;
+    *)
+        export_file=""
+        ;;
+esac
+if [ -n "$export_file" ]; then
     rm -f "$export_file"
     build_image_extra_output="type=tar,dest=$export_file"
 fi
@@ -452,8 +519,8 @@ case "$digest" in
     *) echo "BuildKit did not report a valid image digest" >&2; exit 1 ;;
 esac
 build_image_extra_output=""
-if [ "$1" = opencode2 ] && [ ! -s "$export_file" ]; then
-    echo "BuildKit tar export did not produce a filesystem archive (WI#425)" >&2
+if [ -n "$export_file" ] && [ ! -s "$export_file" ]; then
+    echo "BuildKit tar export did not produce a filesystem archive" >&2
     exit 1
 fi
 
